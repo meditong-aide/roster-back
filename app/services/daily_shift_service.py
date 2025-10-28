@@ -85,7 +85,6 @@ def get_or_init_month(db: Session, office_id: str, group_id: str, year: int, mon
         )
         .all()
     )
-
     if not rows:
         print("[daily_shift] 월 데이터 없음 → shift_manage 기반으로 초기화")
         days = _get_month_days(year, month)

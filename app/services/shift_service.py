@@ -19,8 +19,8 @@ def get_shifts_service(current_user, db: Session):
     """
     if not current_user:
         raise Exception("Not authenticated")
-    
     shifts = db.query(Shift).filter(Shift.group_id == current_user.group_id).order_by(Shift.sequence.asc()).all()
+    print('sfhits', [s.__dict__ for s in shifts])
     if shifts:
         return [
             {

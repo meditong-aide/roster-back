@@ -2,6 +2,8 @@ import logging
 import os
 from contextlib import contextmanager
 from typing import Generator, Any
+import dotenv
+dotenv.load_dotenv()
 
 import pymssql
 import pymysql
@@ -153,3 +155,61 @@ class MariaDatabasemanager:
 # 전역 마리아DB 매니저 인스턴스
 mariadb_manager = MariaDatabasemanager()
 
+
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine, func
+_MSSQL_SESSION_MAKER: sessionmaker | None = None
+
+
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+import dotenv
+
+dotenv.load_dotenv()
+
+DB_HOST = os.getenv("MS_DB_HOST")
+DB_PORT = os.getenv("MS_DB_PORT")
+DB_USER = os.getenv("MS_DB_USER")
+DB_PASSWORD = os.getenv("MS_DB_PASSWORD")
+DB_NAME = os.getenv("MS_DB_NAME")
+
+DATABASE_URL = f"mssql+pymssql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close() 
+
+
+# def _get_mssql_session() -> Session:
+#     """MSSQL 전용 SQLAlchemy 세션을 반환합니다. .env의 MS_DB_* 값을 사용합니다."""
+#     global _MSSQL_SESSION_MAKER
+#     if _MSSQL_SESSION_MAKER is None:
+#         host = os.getenv("MS_DB_HOST")
+#         port = os.getenv("MS_DB_PORT")
+#         dbname = os.getenv("MS_DB_NAME")
+#         user = os.getenv("MS_DB_USER")
+#         password = os.getenv("MS_DB_PASSWORD")
+#         database_url = f"mssql+pymssql://{user}:{password}@{host}:{port}/{dbname}"
+#         engine = create_engine(database_url, pool_pre_ping=True)
+#         _MSSQL_SESSION_MAKER = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+#     return _MSSQL_SESSION_MAKER()
+
+# engine = create_engine(DATABASE_URL)
+# SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Base = declarative_base()
+
+# def get_db():
+#     db = _MSSQL_SESSION_MAKER()
+#     try:
+#         yield db
+#     finally:
+#         db.close() 

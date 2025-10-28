@@ -2,8 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import Dict
 
-from db.client import get_db
-# from db.client2 import _get_mssql_session
+from db.client2 import get_db
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from schemas.daily_shift_schema import (
@@ -36,9 +35,8 @@ async def get_month(
     try:
         if not current_user:
             raise HTTPException(status_code=401, detail="인증 필요")
+        # return {get_or_init_month(db, office_id, group_id, year, month)}
         return get_or_init_month(db, office_id, group_id, year, month)
-    except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"월 데이터 조회 실패: {e}")
 

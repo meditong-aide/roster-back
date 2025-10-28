@@ -5,8 +5,6 @@ import os
 import datetime as _dt
 
 from db.models import Shift, Nurse, Group, Office, ScheduleEntry
-# from db.client2 import _get_mssql_session
-from db.client import get_db
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine, func
 _MSSQL_SESSION_MAKER: sessionmaker | None = None
@@ -36,7 +34,7 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
     if not current_user:
         raise Exception("Not authenticated")
 
-    session = get_db()
+    session = db
     try:
         # 1) 조회
         shifts = (
@@ -65,7 +63,7 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
             ]
 
         # 2) 기본값 생성 (오피스/그룹은 존재한다고 가정; 없으면 office_id=None로 저장)
-        print('기본값 생성')
+        # 기본값 생성
         office_id = None
         group = session.query(Group).filter(Group.group_id == current_user.group_id).first()
         if group and group.office_id:
@@ -93,7 +91,6 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
                 sequence=seq,
                 default_shift=default_shift,
             )
-        print('디폴트')
         defaults = [
             # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence, default_shift
             ("O", "Off", "#ffa0d2", None, None, "휴무", 1, 1, None, 4, "O"),
@@ -111,7 +108,6 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
             .order_by(Shift.sequence.asc())
             .all()
         )
-        print('들어간다')
         return [
             {
                 "shift_id": s.shift_id,
@@ -130,7 +126,7 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
             for s in shifts
         ]
     finally:
-        session.close()
+        pass
 
 
 def add_shift_service(req, current_user, db: Session | None = None):
@@ -138,7 +134,7 @@ def add_shift_service(req, current_user, db: Session | None = None):
     if not current_user or not current_user.is_head_nurse:
         raise Exception("Permission denied")
 
-    session = get_db()
+    session = db
     try:
         nurse = session.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
         if not nurse or not nurse.group:
@@ -182,7 +178,7 @@ def add_shift_service(req, current_user, db: Session | None = None):
             }
         }
     finally:
-        session.close()
+        pass
 
 
 def update_shift_service(req, current_user, db: Session | None = None):
@@ -190,8 +186,7 @@ def update_shift_service(req, current_user, db: Session | None = None):
     if not current_user or not current_user.is_head_nurse:
         raise Exception("Permission denied")
 
-    session = get_db()
-    print('들어옴11')
+    session = db
     try:
         existing_shift = session.query(Shift).filter(
             Shift.id == req.id,
@@ -222,7 +217,7 @@ def update_shift_service(req, current_user, db: Session | None = None):
             }
         }
     finally:
-        session.close()
+        pass
 
 
 def remove_shift_service(req, current_user, db: Session | None = None):
@@ -230,7 +225,7 @@ def remove_shift_service(req, current_user, db: Session | None = None):
     if not current_user or not current_user.is_head_nurse:
         raise Exception("Permission denied")
 
-    session = get_db()
+    session = db
     try:
         existing_shift = session.query(Shift).filter(
             Shift.shift_id == req.shift_id,
@@ -254,7 +249,7 @@ def remove_shift_service(req, current_user, db: Session | None = None):
         session.commit()
         return {"message": "근무코드가 성공적으로 삭제되었습니다."}
     finally:
-        session.close()
+        pass
 
 
 def move_shift_service(req, current_user, db: Session | None = None):
@@ -262,7 +257,7 @@ def move_shift_service(req, current_user, db: Session | None = None):
     if not current_user or not current_user.is_head_nurse:
         raise Exception("Permission denied")
 
-    session = get_db()
+    session = db
     try:
         shift_to_move = session.query(Shift).filter(
             Shift.shift_id == req.shift_id,
@@ -292,4 +287,4 @@ def move_shift_service(req, current_user, db: Session | None = None):
         session.commit()
         return {"message": "근무코드 순서가 성공적으로 변경되었습니다."}
     finally:
-        session.close() 
+        pass

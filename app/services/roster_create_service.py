@@ -4,7 +4,7 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Nurse, ShiftPreference, RosterConfig, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage, Schedule, NurseShiftRequest, NursePairRequest, WantedRequest
+from db.models import Nurse, ShiftPreference, RosterConfig, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage, Schedule, NurseShiftRequest, NursePairRequest, WantedRequest, DailyShift
 from schemas.roster_schema import RosterRequest
 from routers.utils import get_days_in_month, Timer
 from datetime import date
@@ -44,24 +44,24 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
-
     nurse_ids = [n.nurse_id for n in nurses_in_group]
     month_str = f"{req.year}-{req.month:02d}"
     preferences = []
-
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     for nurse_id in nurse_ids:
-        submitted_wr = (
-            db.query(WantedRequest)
-            .filter(
-                WantedRequest.nurse_id == nurse_id,
-                WantedRequest.month == month_str,
-                WantedRequest.is_submitted == True
+        try:
+            submitted_wr = (
+                db.query(WantedRequest)
+                .filter(
+                    WantedRequest.nurse_id == nurse_id,
+                    WantedRequest.month == month_str,
+                    WantedRequest.is_submitted == True
+                )
+                .order_by(WantedRequest.submitted_at.desc())
+                .first()
             )
-            .order_by(WantedRequest.submitted_at.desc())
-            .first()
-        )
-
+        except Exception as e:
+            print(f"error: {e}")
         target_wr = submitted_wr or (
             db.query(WantedRequest)
             .filter(
@@ -71,7 +71,6 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             .order_by(WantedRequest.created_at.asc())
             .first()
         )
-
         if not target_wr:
             continue  # 기록이 없는 간호사는 건너뜀
 
@@ -85,14 +84,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             )
             .all()
         )
-
         shift_data = {"D": {}, "E": {}, "N": {}, "O": {}}
         for s in shift_rows:
             shift_type = s.shift.upper()
             day = str(int(str(s.shift_date).split("-")[-1]))
             if shift_type in shift_data:
                 shift_data[shift_type][day] = int(s.score) if s.score is not None else 0
-
         # 4️⃣ pair 데이터 수집
         pair_rows = (
             db.query(NursePairRequest)
@@ -102,7 +99,6 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             )
             .all()
         )
-
         pair_data = [{"id": p.target_id, "weight": p.score} for p in pair_rows]
 
         # 5️⃣ data JSON 구성
@@ -111,7 +107,6 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             "shift": {k: v for k, v in shift_data.items() if v},
             "preference": pair_data,
         }
-
         # 6️⃣ 기존 ShiftPreference 포맷으로 append
         preferences.append({
             "nurse_id": nurse_id,
@@ -122,7 +117,6 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             "submitted_at": target_wr.submitted_at,
             "data": data_json,
         })
-
     # 7️⃣ 기존 함수와 동일하게 반환
     print("preferences", nurses_in_group, preferences)
     return nurses_in_group, preferences
@@ -186,7 +180,7 @@ def _fetch_latest_config(db: Session, req: RosterRequest, current_user):
     return latest_config
 
 
-def _build_shift_manage_and_requirements(db: Session, current_user, latest_config):
+def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
     shift_manages = (
         db.query(ShiftManage)
@@ -206,8 +200,27 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         #     for code in sm.codes:
         # daily_shift_requirements[sm.main_code.strip()] = sm.manpower
         daily_shift_requirements[sm.main_code] = sm.manpower
-
-    return shift_manage_data, daily_shift_requirements
+    # ── DailyShift 일자별 요구치 조회 및 정규화 ──
+    days_in_month = get_days_in_month(req.year, req.month)
+    try:
+        rows = (
+            db.query(DailyShift)
+            .filter(
+                DailyShift.office_id == current_user.office_id,
+                DailyShift.group_id == current_user.group_id,
+                DailyShift.year == req.year,
+                DailyShift.month == req.month,
+            )
+            .order_by(DailyShift.day.asc())
+            .all()
+        )
+    except Exception as e:
+        print(f"error: {e}")
+    # day→counts 맵 구성 후 리스트로 변환(0-index)
+    by_day = {r.day: {'D': int(r.d_count or 0), 'E': int(r.e_count or 0), 'N': int(r.n_count or 0)} for r in rows}
+    daily_shift_requirements_by_day = [by_day.get(d, {'D': daily_shift_requirements.get('D', 0), 'E': daily_shift_requirements.get('E', 0), 'N': daily_shift_requirements.get('N', 0)}) for d in range(1, days_in_month + 1)]
+    print(11)
+    return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day
 
 def _normalize_to_main(code: str, code2main: dict) -> str:
     """세부 근무코드를 메인코드로 정규화한다."""
@@ -524,7 +537,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     """
     if not current_user or not current_user.is_head_nurse:
         raise Exception("Permission denied")
-
     wanted = (
         db.query(Wanted)
         .filter(
@@ -534,24 +546,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         )
         .first()
     )
-
     if not wanted:
         raise Exception("해당 월의 wanted 작성을 먼저 요청해주세요.")
-
     schedule = request_schedule_service(req, current_user, db)
     nurses_in_group, preferences = _collect_nurses_and_preferences(db, req, current_user)
-
     latest_config = _fetch_latest_config(db, req, current_user)
-
-    shift_manage_data, daily_shift_requirements = _build_shift_manage_and_requirements(
-        db, current_user, latest_config
+    shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day = _build_shift_manage_and_requirements(
+        db, current_user, latest_config, req
     )
-
     # daily_shift_requirements를 config에 주입해서 엔진 호출
     config_dict = latest_config.__dict__ if latest_config else {}
-    print('daily_shift_requirements!!', daily_shift_requirements)
     config_dict['daily_shift_requirements'] = daily_shift_requirements
-    print('latest_config', latest_config.daily_shift_requirements)
+    # 일자별 요구치 우선 적용
+    config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──
     
     _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])

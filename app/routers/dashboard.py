@@ -5,7 +5,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from db.client import get_db
+from db.client2 import get_db
 from schemas.auth_schema import User
 from routers.auth import get_current_user_from_cookie
 from services.dashboard_service import (

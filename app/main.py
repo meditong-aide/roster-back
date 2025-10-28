@@ -3,7 +3,7 @@ from fastapi.staticfiles import StaticFiles
 import sys, os
 from fastapi.middleware.cors import CORSMiddleware
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from routers import roster, auth, nurses, dates, wanted, preferences, roster_create, shifts, health, dashboard, legacy, token
+from routers import roster, auth, nurses, dates, wanted, preferences, roster_create, shifts, health, dashboard, legacy, token, teams
 from routers.message import message_router
 from routers.sticker import sticker_router
 from routers.setting import setting_router
@@ -12,6 +12,7 @@ import uvicorn
 import warnings
 from starlette.responses import RedirectResponse
 from starlette import status
+from routers import daily_shift as daily_shift_router
 
 app = FastAPI()
 
@@ -50,6 +51,8 @@ app.include_router(shifts.router)
 app.include_router(health.router)
 app.include_router(dashboard.router)
 app.include_router(legacy.router)
+app.include_router(daily_shift_router.router)
+app.include_router(teams.router)
 
 
 

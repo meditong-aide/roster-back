@@ -36,6 +36,18 @@ router = APIRouter(
 )
 
 templates = Jinja2Templates(directory="templates")
+# This was trying to read from the header, but we are using httpOnly cookies
+# oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 def get_user(db: Session, account_id: str):
     return db.query(Nurse).options(joinedload(Nurse.group)).filter(Nurse.account_id == account_id).first()

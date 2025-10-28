@@ -7,7 +7,7 @@ from datetime import datetime
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest
 from pydantic import BaseModel
-from db.client import get_db
+from db.client2 import get_db
 from db.models import Nurse, ShiftPreference, RosterConfig, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage
 from routers.utils import get_days_in_month
 from routers.auth import get_current_user_from_cookie
@@ -17,6 +17,10 @@ from routers.utils import Timer
 from datetime import date
 import uuid
 from services.roster_create_service import generate_roster_service, request_schedule_service, generate_roster_service_with_fixed_cells
+import boto3
+import os
+import json
+import dotenv
 
 # CP-SAT 기반 엔진들 import
 try:
@@ -49,6 +53,32 @@ class HoldGenerateRequest(BaseModel):
     month: int
     fixed_cells: List[Dict[str, Any]]
     config_id: Optional[int] = None
+
+
+dotenv.load_dotenv()
+
+sqs = boto3.client("sqs", region_name="ap-northeast-2")
+QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+
+@router.post("/roster_create/async")
+def roster_create_async(
+    req: RosterRequest,
+    db: Session = Depends(get_db),
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+):
+    """
+    근무표 생성 비동기 요청 → SQS로 job 전송
+    """
+    job_body = {
+        "job_id": f"job-{current_user.account_id}-{req.year}{req.month}",
+        "nurse_id": current_user.account_id,
+        "params": req.dict(),
+    }
+
+    sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(job_body))
+
+    return {"message": "✅ Job submitted to SQS", "job": job_body}
+
 
 # [Roster] - 근무표 생성
 @router.post("/roster_create/generate")
