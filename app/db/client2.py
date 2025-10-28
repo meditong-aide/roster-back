@@ -173,9 +173,9 @@ DB_HOST = os.getenv("MS_DB_HOST")
 DB_PORT = os.getenv("MS_DB_PORT")
 DB_USER = os.getenv("MS_DB_USER")
 DB_PASSWORD = os.getenv("MS_DB_PASSWORD")
-DB_NAME = os.getenv("MS_DB_NAME")
+EUN_DB_NAME = os.getenv("EUN_DB_NAME")
 
-DATABASE_URL = f"mssql+pymssql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DATABASE_URL = f"mssql+pymssql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{EUN_DB_NAME}"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
