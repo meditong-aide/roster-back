@@ -1,0 +1,15 @@
+.env
+__pycache__
+*.mdc
+test_folder/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+
+*.log
+
+*.ipynb
+*.xlsx
