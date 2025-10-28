@@ -1,0 +1,1690 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>근무표 설정</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+    <style>
+        .config-container {
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+        .config-section {
+            background: #fff;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+        }
+        .config-section.disabled {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        .config-section h2 {
+            margin-top: 0;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #eee;
+        }
+        .config-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 15px 0;
+            border-bottom: 1px solid #f2f2f2;
+        }
+        .config-item:last-child {
+            border-bottom: none;
+        }
+        .config-item .label {
+            font-size: 16px;
+            color: #333;
+        }
+        .config-item .sub-label {
+            font-size: 14px;
+            color: #777;
+            padding-left: 20px;
+        }
+        .config-item .control {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        /* Tab styles */
+        .tab-container {
+            margin-bottom: 30px;
+        }
+        .tab-buttons {
+            display: flex;
+            border-bottom: 1px solid #ddd;
+            margin-bottom: 20px;
+        }
+        .tab-button {
+            padding: 15px 30px;
+            background: none;
+            border: none;
+            border-bottom: 3px solid transparent;
+            cursor: pointer;
+            font-size: 16px;
+            color: #666;
+            transition: all 0.3s ease;
+        }
+        .tab-button.active {
+            color: #2196F3;
+            border-bottom-color: #2196F3;
+        }
+        .tab-button:hover {
+            color: #2196F3;
+            background-color: #f8f9fa;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Shift codes table */
+        .shift-codes-section {
+            background: #fff;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+        }
+        .add-shift-btn {
+            background: #2196F3;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+        .add-shift-btn:hover {
+            background: #1976D2;
+        }
+        .shifts-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        .shifts-table th,
+        .shifts-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        .shifts-table th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+        }
+        .shift-color-box {
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            display: inline-block;
+            border: 1px solid #ddd;
+        }
+
+        /* Modal styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        .modal-content {
+            background-color: #fefefe;
+            margin: 5% auto;
+            padding: 30px;
+            border-radius: 10px;
+            width: 80%;
+            max-width: 600px;
+            position: relative;
+        }
+        .close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .close:hover {
+            color: black;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        .radio-group {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        .radio-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .time-inputs {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .time-inputs input {
+            width: 120px;
+        }
+        .modal-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 30px;
+        }
+        .modal-buttons button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .btn-save {
+            background: #2196F3;
+            color: white;
+        }
+        .btn-cancel {
+            background: #f5f5f5;
+            color: #333;
+        }
+
+        .edit-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .edit-btn:hover {
+            background: #218838;
+        }
+
+        .delete-btn {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 5px;
+        }
+        .delete-btn:hover {
+            background: #c82333;
+        }
+
+        /* Drag and drop styles */
+        .shifts-table tbody tr {
+            cursor: move;
+        }
+        .shifts-table tbody tr:hover {
+            background-color: #f8f9fa;
+        }
+        .shifts-table tbody tr.sortable-ghost {
+            opacity: 0.4;
+        }
+        .shifts-table tbody tr.sortable-chosen {
+            background-color: #e3f2fd;
+        }
+        .drag-handle {
+            cursor: grab;
+            color: #666;
+            padding: 0 5px;
+        }
+        .drag-handle:active {
+            cursor: grabbing;
+        }
+
+        /* Toggle Switch */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 24px;
+        }
+        .toggle-switch input { display: none; }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 24px;
+        }
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px; width: 18px;
+            left: 3px; bottom: 3px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+        input:checked + .slider { background-color: #2196F3; }
+        input:disabled + .slider { background-color: #e0e0e0; cursor: not-allowed; }
+        input:checked + .slider:before { transform: translateX(26px); }
+
+        /* Input Number */
+        input[type="number"], input[type="text"], input[type="range"] {
+            width: 80px;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            text-align: right;
+        }
+        input[type="range"] {
+            width: 150px;
+            text-align: left;
+        }
+        .range-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .save-btn-container {
+            margin-top: 30px;
+            display: flex;
+            justify-content: flex-end;
+        }
+        .save-btn-container button {
+            width: 150px;
+        }
+
+        /* Shift Class Tabs */
+        .shift-class-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #ddd;
+        }
+        .shift-class-tab {
+            padding: 10px 20px;
+            background: none;
+            border: none;
+            border-bottom: 3px solid transparent;
+            cursor: pointer;
+            font-size: 16px;
+            color: #666;
+            transition: all 0.3s ease;
+        }
+        .shift-class-tab.active {
+            color: #2196F3;
+            border-bottom-color: #2196F3;
+        }
+        .shift-class-tab:hover {
+            color: #2196F3;
+            background-color: #f8f9fa;
+        }
+        .shift-class-tab.disabled {
+            color: #ccc;
+            pointer-events: none;
+        }
+
+        /* Shift Slots Container */
+        .shift-slots-container {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        /* Shift Codes Panel */
+        .shift-codes-panel {
+            background: #fff;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+            margin-top: 20px;
+        }
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #eee;
+        }
+        .panel-header h3 {
+            margin-top: 0;
+            margin-bottom: 0;
+        }
+        .close-panel-btn {
+            background: none;
+            border: none;
+            font-size: 24px;
+            color: #aaa;
+            cursor: pointer;
+            transition: color 0.3s ease;
+        }
+        .close-panel-btn:hover {
+            color: black;
+        }
+        .available-shifts {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .available-shifts .shift-color-box {
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            display: inline-block;
+            border: 1px solid #ddd;
+        }
+
+        /* Shift Slot Styling */
+        .shift-slot {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 15px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            background: #f8f9fa;
+            transition: all 0.3s ease;
+        }
+        .shift-slot:hover {
+            border-color: #2196F3;
+            background: #e3f2fd;
+        }
+        .shift-slot.active {
+            border-color: #2196F3;
+            background: #e3f2fd;
+        }
+        .slot-label {
+            font-weight: 600;
+            min-width: 80px;
+        }
+        .main-code-display {
+            padding: 8px 16px;
+            border-radius: 12px;
+            font-weight: bold;
+            color: white;
+            min-width: 40px;
+            text-align: center;
+            cursor: pointer;
+            border: 2px dashed transparent;
+            transition: all 0.3s ease;
+        }
+        .main-code-display:hover {
+            border-color: #2196F3;
+        }
+        .main-code-display.drag-over {
+            border-color: #2196F3;
+            background-color: #e3f2fd !important;
+        }
+        .expand-toggle {
+            background: none;
+            border: none;
+            font-size: 16px;
+            cursor: pointer;
+            padding: 5px;
+            border-radius: 3px;
+            transition: background 0.2s ease;
+        }
+        .expand-toggle:hover {
+            background: rgba(0,0,0,0.1);
+        }
+        .codes-container {
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+            padding: 10px;
+            border: 1px dashed #ccc;
+            border-radius: 4px;
+            background: white;
+            margin: 10px 0;
+            width: 100%;
+        }
+        .codes-container.expanded {
+            display: flex;
+        }
+        .codes-area {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            min-height: 40px;
+            padding: 8px;
+            border: 1px dashed #ccc;
+            border-radius: 4px;
+            background: #f8f9fa;
+            cursor: pointer;
+        }
+        .codes-area.drag-over {
+            border-color: #2196F3;
+            background: #e3f2fd;
+        }
+        .shift-code-chip {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            color: white;
+            cursor: move;
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .shift-code-chip .delete-chip {
+            background: rgba(255,255,255,0.3);
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+        .shift-code-chip .delete-chip:hover {
+            background: rgba(255,255,255,0.5);
+        }
+        .slot-manpower {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .slot-manpower input {
+            width: 60px;
+            padding: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .available-shift-item {
+            padding: 8px 12px;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: bold;
+            color: white;
+            cursor: grab;
+            transition: transform 0.2s ease;
+        }
+        .available-shift-item:hover {
+            transform: scale(1.05);
+        }
+        .available-shift-item:active {
+            cursor: grabbing;
+        }
+        .empty-slot-text {
+            font-style: italic;
+            color: #999;
+            padding: 10px;
+        }
+
+        /* Toggle Switch */
+    </style>
+</head>
+<body>
+    <div id="mySidebar" class="sidebar">
+        <button class="sidebar-toggle-btn" onclick="toggleNav()"><i class="fa-solid fa-angles-left"></i></button>
+        <a href="/">Wanted 작성</a>
+        <a href="/roster-view">근무표 보기</a>
+        {% if user.is_head_nurse %}
+        <a href="/head-nurse-management">부서원 관리</a>
+        <a href="/roster-create">근무표 생성</a>
+        <a href="/roster-configure" class="active">근무표 설정</a>
+        {% endif %}
+        <a href="javascript:void(0);" onclick="logout()">로그아웃</a>
+    </div>
+
+    <div id="main">
+        <div class="container">
+            <h1>근무표 환경설정</h1>
+            
+            <!-- Config Version Selector -->
+            <div class="config-version-selector" style="margin-bottom: 20px;">
+                <label for="configVersion" style="font-weight: 600; margin-right: 10px;">설정 버전:</label>
+                <select id="configVersion" style="padding: 8px; border: 1px solid #ddd; border-radius: 5px; min-width: 200px;">
+                    <option value="">로딩 중...</option>
+                </select>
+            </div>
+            
+            <!-- Tab Container -->
+            <div class="tab-container">
+                <div class="tab-buttons">
+                    <button class="tab-button active" onclick="showTab('shift-codes')">근무코드 설정하기</button>
+                    <button class="tab-button" onclick="showTab('roster-config')">근무표 설정하기</button>
+                </div>
+
+                <!-- 근무코드 설정하기 Tab -->
+                <div id="shift-codes" class="tab-content active">
+                    <div class="shift-codes-section">
+                        <h2>근무코드 관리</h2>
+                        <button class="add-shift-btn" onclick="openAddShiftModal()">
+                            <i class="fa fa-plus"></i> 근무코드 추가하기
+                        </button>
+                        
+                        <table class="shifts-table" id="shiftsTable">
+                            <thead>
+                                <tr>
+                                    <th style="width: 40px;">순서</th>
+                                    <th>근무코드</th>
+                                    <th>이름</th>
+                                    <th>색상</th>
+                                    <th>시간 설정</th>
+                                    <th>타입</th>
+                                    <th>스케줄 포함</th>
+                                    <th>관리</th>
+                                </tr>
+                            </thead>
+                            <tbody id="shiftsTableBody">
+                                <!-- 동적으로 생성됨 -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 근무표 설정하기 Tab -->
+                <div id="roster-config" class="tab-content">
+                    <form id="configForm">
+                        <div class="config-container">
+                            <!-- Shift 관리 -->
+                            <section class="config-section">
+                                <h2>Shift 관리</h2>
+                                
+                                <!-- 시프트 클래스 탭 -->
+                                <div class="shift-class-tabs">
+                                    <button class="shift-class-tab active" data-class="RN" onclick="showShiftClass('RN')">RN</button>
+                                    <button class="shift-class-tab disabled" data-class="AN" onclick="showShiftClass('AN')">AN</button>
+                                    <button class="shift-class-tab disabled" data-class="보조" onclick="showShiftClass('보조')">보조</button>
+                                </div>
+                                
+                                <!-- 시프트 슬롯 관리 영역 -->
+                                <div class="shift-slots-container" id="shiftSlotsContainer">
+                                    <!-- 동적으로 생성됨 -->
+                                </div>
+                                
+                                <!-- 시프트 코드 선택 영역 -->
+                                <div class="shift-codes-panel" id="shiftCodesPanel" style="display: none;">
+                                    <div class="panel-header">
+                                        <h3>근무코드 선택</h3>
+                                        <button onclick="closeShiftCodesPanel()" class="close-panel-btn">×</button>
+                                    </div>
+                                    <div class="available-shifts" id="availableShifts">
+                                        <!-- 동적으로 생성됨 -->
+                                    </div>
+                                </div>
+                            </section>
+                            
+                            <!-- 법규 (하드 제약) 셋팅 -->
+                            <section class="config-section">
+                                <h2>법규 (하드 제약) 셋팅</h2>
+                                <div class="config-item">
+                                    <span class="label">최대 연속 근무일 수</span>
+                                    <input type="number" name="max_conseq_work" value="{{ config.max_conseq_work if config else 5 }}">
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">E → D 근무 금지</span>
+                                    <label class="toggle-switch"><input type="checkbox" name="banned_day_after_eve" {% if config is none or config.banned_day_after_eve %}checked{% endif %}><span class="slider"></span></label>
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">N 연속 3회 허용</span>
+                                    <label class="toggle-switch"><input type="checkbox" id="n3-allow" name="three_seq_nig" {% if config is none or config.three_seq_nig %}checked{% endif %} onchange="toggleN3Off()"><span class="slider"></span></label>
+                                </div>
+                                <div class="config-item">
+                                    <span class="label sub-label">N 3회 후 OFF 2회</span>
+                                    <label class="toggle-switch"><input type="checkbox" id="n3-off" name="two_offs_after_three_nig" {% if config is none or config.two_offs_after_three_nig %}checked{% endif %}><span class="slider"></span></label>
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">N 2회 후 OFF 2회</span>
+                                    <label class="toggle-switch"><input type="checkbox" name="two_offs_after_two_nig" {% if config is none or config.two_offs_after_two_nig %}checked{% endif %}><span class="slider"></span></label>
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">월 최대 N 근무 수</span>
+                                    <input type="number" name="max_nig_per_month" value="{{ config.max_nig_per_month if config else 15 }}">
+                                </div>
+                            </section>
+                            
+                            <!-- 병원 내규 (소프트 제약) 셋팅 -->
+                            <section class="config-section">
+                                <h2>🏢 병원 내규 (소프트 제약) 셋팅</h2>
+                                <div class="config-item">
+                                    <span class="label">Shift 내 책임 최소 경력 (년차)</span>
+                                    <input type="number" name="min_exp_per_shift" value="{{ config.min_exp_per_shift if config else 3 }}">
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">책임 간호 인원 (명)</span>
+                                    <input type="number" name="req_exp_nurses" value="{{ config.req_exp_nurses if config else 1 }}">
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">주 2회 이상 OFF</span>
+                                    <div class="control">
+                                        <label class="toggle-switch"><input type="checkbox" name="two_offs_per_week" {% if config is none or config.two_offs_per_week %}checked{% endif %}><span class="slider"></span></label>
+                                    </div>
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">OFF 연속 배정</span>
+                                    <div class="control">
+                                        <label class="toggle-switch"><input type="checkbox" name="sequential_offs" {% if config is none or (config and config.sequential_offs) %}checked{% endif %}><span class="slider"></span></label>
+                                    </div>
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">N 개수 균등 배정</span>
+                                    <div class="control">
+                                        <label class="toggle-switch"><input type="checkbox" name="even_nights" {% if config is none or (config and config.even_nights) %}checked{% endif %}><span class="slider"></span></label>
+                                    </div>
+                                </div>
+                            </section>
+                            
+                            <!-- 기타 설정 -->
+                            <section class="config-section">
+                                <h2>기타 설정</h2>
+                                <div class="config-item">
+                                    <span class="label">설정 버전 *</span>
+                                    <input type="text" name="config_version" placeholder="예: v1.0, 2024년 설정" value="{{ config.config_version if config else '' }}" required style="width: 200px;">
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">병동 환자수</span>
+                                    <input type="number" name="patient_amount" value="{{ config.patient_amount if config else 40 }}">
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">월 OFF 수</span>
+                                    <input type="number" name="off_days" value="{{ config.off_days if config else 8 }}">
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">주말 비중</span>
+                                    <div class="control"><input type="number" name="weekend_shift_ratio" value="{{ config.weekend_shift_ratio if config else 1.0 }}" step="0.1"></div>
+                                </div>
+                                <div class="config-item">
+                                    <span class="label">근무 요구사항 우선순위 지수</span>
+                                    <div class="range-container">
+                                        <input type="range" id="shift_priority" name="shift_priority" min="0" max="1" value="{{ config.shift_priority if config else 0.5 }}" step="0.1" oninput="this.nextElementSibling.value = this.value">
+                                        <output>{{ config.shift_priority if config else 0.5 }}</output>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                        <div class="save-btn-container">
+                            <button type="submit">저장하기</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Shift Modal -->
+    <div id="addShiftModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeAddShiftModal()">&times;</span>
+            <h2>근무코드 추가하기</h2>
+            <form id="addShiftForm">
+                <div class="form-group">
+                    <label for="shiftId">근무코드 *</label>
+                    <input type="text" id="shiftId" name="shift_id" required maxlength="10">
+                </div>
+                
+                <div class="form-group">
+                    <label for="shiftName">근무코드 이름 *</label>
+                    <input type="text" id="shiftName" name="name" required maxlength="20">
+                </div>
+
+                <div class="form-group">
+                    <label for="shiftColor">색상 *</label>
+                    <input type="color" id="shiftColor" name="color" value="#87CEEB" required>
+                </div>
+
+                <div class="form-group">
+                    <label>시간 설정 *</label>
+                    <div class="radio-group">
+                        <div class="radio-item">
+                            <input type="radio" id="timeRange" name="time_type" value="range" checked>
+                            <label for="timeRange">시간 범위</label>
+                        </div>
+                        <div class="radio-item">
+                            <input type="radio" id="allDay" name="time_type" value="allday">
+                            <label for="allDay">종일</label>
+                        </div>
+                        <div class="radio-item">
+                            <input type="radio" id="customHours" name="time_type" value="hours">
+                            <label for="customHours">시간 지정</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-group" id="timeRangeInputs">
+                    <label>시작 시간 ~ 종료 시간</label>
+                    <div class="time-inputs">
+                        <input type="time" id="startTime" name="start_time" value="09:00">
+                        <span>~</span>
+                        <input type="time" id="endTime" name="end_time" value="18:00">
+                    </div>
+                </div>
+
+                <div class="form-group" id="hoursInput" style="display: none;">
+                    <label for="hours">근무 시간 (시간)</label>
+                    <input type="number" id="hours" name="hours" min="1" max="24" value="8">
+                </div>
+
+                <div class="form-group">
+                    <label>타입 *</label>
+                    <div class="radio-group">
+                        <div class="radio-item">
+                            <input type="radio" id="workType" name="shift_type" value="work" checked>
+                            <label for="workType">근무</label>
+                        </div>
+                        <div class="radio-item">
+                            <input type="radio" id="offType" name="shift_type" value="off">
+                            <label for="offType">휴무</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>스케줄 생성시 포함하기</label>
+                    <div class="control">
+                        <label class="toggle-switch">
+                            <input type="checkbox" name="auto_schedule" checked>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="modal-buttons">
+                    <button type="button" class="btn-cancel" onclick="closeAddShiftModal()">취소</button>
+                    <button type="submit" class="btn-save">저장하기</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            document.getElementById("mySidebar").style.width = "250px";
+            document.getElementById("main").style.marginLeft = "250px";
+            toggleN3Off();
+            loadShifts();
+            loadShiftManage('RN'); // Load RN shift management data
+            loadConfigVersions(); // Load config versions
+        });
+
+        // Tab management
+        function showTab(tabName) {
+            // Hide all tab contents
+            const tabContents = document.querySelectorAll('.tab-content');
+            tabContents.forEach(content => content.classList.remove('active'));
+            
+            // Remove active class from all tab buttons
+            const tabButtons = document.querySelectorAll('.tab-button');
+            tabButtons.forEach(button => button.classList.remove('active'));
+            
+            // Show selected tab content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to clicked button
+            event.target.classList.add('active');
+        }
+
+        // Load shifts data
+        async function loadShifts() {
+            try {
+                const response = await fetch('/shifts');
+                const shifts = await response.json();
+                
+                const tbody = document.getElementById('shiftsTableBody');
+                tbody.innerHTML = '';
+                
+                // Sort by sequence to ensure correct order
+                shifts.sort((a, b) => a.sequence - b.sequence);
+                
+                shifts.forEach(shift => {
+                    const row = document.createElement('tr');
+                    row.setAttribute('data-shift-id', shift.shift_id);
+                    row.setAttribute('data-sequence', shift.sequence);
+                    row.innerHTML = `
+                        <td class="drag-handle">
+                            <i class="fa fa-grip-vertical"></i>
+                        </td>
+                        <td>${shift.shift_id}</td>
+                        <td>${shift.name}</td>
+                        <td><div class="shift-color-box" style="background-color: ${shift.color}"></div></td>
+                        <td>${shift.time_display || '정보 없음'}</td>
+                        <td>${shift.type || '정보 없음'}</td>
+                        <td>${shift.auto_schedule ? '예' : '아니오'}</td>
+                        <td>
+                            <button class="edit-btn" onclick="openEditShiftModal('${shift.shift_id}')">
+                                <i class="fa fa-edit"></i> 수정
+                            </button>
+                            <button class="delete-btn" onclick="deleteShift('${shift.shift_id}')">
+                                <i class="fa fa-trash"></i> 삭제
+                            </button>
+                        </td>
+                    `;
+                    tbody.appendChild(row);
+                });
+
+                // Initialize drag and drop functionality
+                initializeDragAndDrop();
+            } catch (error) {
+                console.error('근무코드 로딩 실패:', error);
+            }
+        }
+
+        // Initialize drag and drop functionality
+        function initializeDragAndDrop() {
+            const tbody = document.getElementById('shiftsTableBody');
+            new Sortable(tbody, {
+                animation: 150,
+                ghostClass: 'sortable-ghost',
+                chosenClass: 'sortable-chosen',
+                handle: '.drag-handle',
+                onEnd: function(evt) {
+                    const shiftId = evt.item.getAttribute('data-shift-id');
+                    const newIndex = evt.newIndex;
+                    
+                    // Calculate new sequence (1-based)
+                    const newSequence = newIndex + 1;
+                    
+                    // Update sequence on server
+                    updateShiftSequence(shiftId, newSequence);
+                }
+            });
+        }
+
+        // Update shift sequence on server
+        async function updateShiftSequence(shiftId, newSequence) {
+            try {
+                const response = await fetch('/shifts/move', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        shift_id: shiftId,
+                        new_sequence: newSequence
+                    })
+                });
+
+                if (response.ok) {
+                    // Reload shifts to reflect new order
+                    loadShifts();
+                } else {
+                    const error = await response.json();
+                    alert('순서 변경에 실패했습니다: ' + (error.detail || '알 수 없는 오류'));
+                    // Reload to revert changes
+                    loadShifts();
+                }
+            } catch (error) {
+                console.error('Error updating sequence:', error);
+                alert('순서 변경에 실패했습니다.');
+                // Reload to revert changes
+                loadShifts();
+            }
+        }
+
+        // Delete shift function
+        async function deleteShift(shiftId) {
+            if (!confirm('정말로 이 근무코드를 삭제하시겠습니까?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/shifts/remove', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ shift_id: shiftId })
+                });
+
+                if (response.ok) {
+                    alert('근무코드가 삭제되었습니다.');
+                    loadShifts(); // Reload shifts table
+                } else {
+                    const error = await response.json();
+                    alert('삭제에 실패했습니다: ' + (error.detail || '알 수 없는 오류'));
+                }
+            } catch (error) {
+                console.error('Error deleting shift:', error);
+                alert('삭제에 실패했습니다.');
+            }
+        }
+
+        // Modal management
+        function openAddShiftModal() {
+            document.getElementById('addShiftModal').style.display = 'block';
+            document.getElementById('addShiftForm').reset();
+            document.querySelector('#addShiftModal h2').textContent = '근무코드 추가하기';
+            document.querySelector('#addShiftModal .btn-save').textContent = '저장하기';
+        }
+
+        function openEditShiftModal(shiftId) {
+            // Load shift data for editing
+            fetch('/shifts')
+                .then(response => response.json())
+                .then(shifts => {
+                    const shift = shifts.find(s => s.shift_id === shiftId);
+                    if (shift) {
+                        // Populate form with existing data
+                        document.getElementById('shiftId').value = shift.shift_id;
+                        document.getElementById('shiftId').readOnly = true; // Can't change shift_id
+                        document.getElementById('shiftName').value = shift.name;
+                        document.getElementById('shiftColor').value = shift.color;
+                        
+                        // Set time type
+                        if (shift.allday) {
+                            document.getElementById('allDay').checked = true;
+                        } else if (shift.duration) {
+                            document.getElementById('customHours').checked = true;
+                            document.getElementById('hours').value = shift.duration;
+                        } else {
+                            document.getElementById('timeRange').checked = true;
+                            document.getElementById('startTime').value = shift.start_time || '09:00';
+                            document.getElementById('endTime').value = shift.end_time || '18:00';
+                        }
+                        
+                        // Set shift type
+                        if (shift.type === 'off') {
+                            document.getElementById('offType').checked = true;
+                        } else {
+                            document.getElementById('workType').checked = true;
+                        }
+                        
+                        // Set auto_schedule
+                        document.querySelector('input[name="auto_schedule"]').checked = shift.auto_schedule === 1;
+                        
+                        // Update modal title and button
+                        document.querySelector('#addShiftModal h2').textContent = '근무코드 수정하기';
+                        document.querySelector('#addShiftModal .btn-save').textContent = '수정하기';
+                        
+                        // Show modal
+                        document.getElementById('addShiftModal').style.display = 'block';
+                        
+                        // Trigger time type change to show correct inputs
+                        const checkedTimeType = document.querySelector('input[name="time_type"]:checked');
+                        if (checkedTimeType) {
+                            checkedTimeType.dispatchEvent(new Event('change'));
+                        }
+                    }
+                })
+                .catch(error => {
+                    console.error('근무코드 로딩 실패:', error);
+                    alert('근무코드 정보를 불러오는데 실패했습니다.');
+                });
+        }
+
+        function closeAddShiftModal() {
+            document.getElementById('addShiftModal').style.display = 'none';
+            document.getElementById('addShiftForm').reset();
+            document.getElementById('shiftId').readOnly = false; // Reset readonly
+            document.querySelector('#addShiftModal h2').textContent = '근무코드 추가하기';
+            document.querySelector('#addShiftModal .btn-save').textContent = '저장하기';
+        }
+
+        // Handle time type change
+        document.addEventListener('change', function(e) {
+            if (e.target.name === 'time_type') {
+                const timeRangeInputs = document.getElementById('timeRangeInputs');
+                const hoursInput = document.getElementById('hoursInput');
+                
+                if (e.target.value === 'range') {
+                    timeRangeInputs.style.display = 'block';
+                    hoursInput.style.display = 'none';
+                } else if (e.target.value === 'hours') {
+                    timeRangeInputs.style.display = 'none';
+                    hoursInput.style.display = 'block';
+                } else {
+                    timeRangeInputs.style.display = 'none';
+                    hoursInput.style.display = 'none';
+                }
+            }
+        });
+
+        // Add shift form submission
+        document.getElementById('addShiftForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const data = {};
+            for (let [key, value] of formData.entries()) {
+                data[key] = value;
+            }
+            
+            // Handle auto_schedule checkbox
+            data.auto_schedule = document.querySelector('input[name="auto_schedule"]').checked ? 1 : 0;
+
+            const isEdit = document.getElementById('shiftId').readOnly;
+            const url = isEdit ? '/shifts/update' : '/shifts/add';
+            const method = 'POST';
+
+            try {
+                const response = await fetch(url, {
+                    method: method,
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(data)
+                });
+
+                if (response.ok) {
+                    const message = isEdit ? '근무코드가 수정되었습니다.' : '근무코드가 추가되었습니다.';
+                    alert(message);
+                    closeAddShiftModal();
+                    loadShifts(); // Reload shifts table
+                } else {
+                    const error = await response.json();
+                    alert((isEdit ? '수정' : '추가') + '에 실패했습니다: ' + (error.detail || '알 수 없는 오류'));
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert((isEdit ? '수정' : '추가') + '에 실패했습니다.');
+            }
+        });
+
+        function toggleN3Off() {
+            const n3Allow = document.getElementById('n3-allow');
+            const n3Off = document.getElementById('n3-off');
+            const n3OffSwitch = n3Off.closest('.toggle-switch');
+            if (n3Allow.checked) {
+                n3Off.disabled = false;
+                if (n3OffSwitch) n3OffSwitch.classList.remove('disabled');
+            } else {
+                n3Off.disabled = true;
+                n3Off.checked = false;
+                 if (n3OffSwitch) n3OffSwitch.classList.add('disabled');
+            }
+        }
+
+        function toggleNav() {
+            const sidebar = document.getElementById("mySidebar");
+            const main = document.getElementById("main");
+            const toggleBtn = document.querySelector(".sidebar-toggle-btn i");
+
+            const isOpen = sidebar.style.width === "250px";
+            if (isOpen) {
+                sidebar.style.width = "0";
+                main.style.marginLeft = "0";
+                toggleBtn.classList.remove('fa-angles-left');
+                toggleBtn.classList.add('fa-angles-right');
+            } else {
+                sidebar.style.width = "250px";
+                main.style.marginLeft = "250px";
+                toggleBtn.classList.remove('fa-angles-right');
+                toggleBtn.classList.add('fa-angles-left');
+            }
+        }
+        
+        async function logout() {
+            await fetch('/auth/logout', { method: 'POST' });
+            window.location.href = '/login';
+        }
+
+        document.getElementById('configForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            // First save shift manage data
+            await saveShiftManage();
+            
+            const formData = new FormData(this);
+            const data = {};
+            
+            // Process form data
+            for (let [key, value] of formData.entries()) {
+                if (value === 'on') { // Handle checkboxes
+                    data[key] = true;
+                } else {
+                    data[key] = value;
+                }
+            }
+            
+            // Explicitly handle all checkbox fields to ensure they are included
+            const checkboxFields = [
+                'two_offs_per_week', 'three_seq_nig', 'two_offs_after_three_nig', 
+                'two_offs_after_two_nig', 'banned_day_after_eve', 'sequential_offs', 'even_nights'
+            ];
+            
+            checkboxFields.forEach(field => {
+                const checkbox = this.querySelector(`input[name="${field}"]`);
+                if (checkbox) {
+                    data[field] = checkbox.checked;
+                }
+            });
+
+            // Add config_version from dropdown
+            const configVersionSelect = document.getElementById('configVersion');
+            if (configVersionSelect && configVersionSelect.value) {
+                data.config_version = configVersionSelect.value;
+            }
+
+            console.log('저장될 데이터:', data); // 디버깅용
+
+            const response = await fetch('/roster/config/save', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            });
+
+            if (response.ok) {
+                alert('설정이 저장되었습니다.');
+                // Reload config versions instead of full page reload
+                loadConfigVersions();
+            } else {
+                alert('저장에 실패했습니다.');
+            }
+        });
+
+        // Shift Management Functions
+        let currentShiftClass = 'RN';
+        let shiftManageData = {};
+        let availableShifts = [];
+
+        // Show shift class tab
+        function showShiftClass(className) {
+            if (className !== 'RN') return; // Only RN is enabled for now
+            
+            // Update tab appearance
+            document.querySelectorAll('.shift-class-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelector(`[data-class="${className}"]`).classList.add('active');
+            
+            currentShiftClass = className;
+            loadShiftManage(className);
+        }
+
+        // Load shift manage data for specific class
+        async function loadShiftManage(className) {
+            try {
+                // Get current config version
+                const configVersionSelect = document.getElementById('configVersion');
+                const configVersion = configVersionSelect ? configVersionSelect.value : null;
+                
+                // configVersion이 없으면 기본 슬롯만 표시
+                if (!configVersion) {
+                    const defaultSlots = [
+                        { shift_slot: 1, main_code: 'D', codes: [], manpower: 3 },
+                        { shift_slot: 2, main_code: 'E', codes: [], manpower: 3 },
+                        { shift_slot: 3, main_code: 'N', codes: [], manpower: 2 }
+                    ];
+                    shiftManageData[className] = defaultSlots;
+                    renderShiftSlots(defaultSlots);
+                    return;
+                }
+                
+                console.log(`Loading shift manage for class: ${className}, config_version: ${configVersion}`);
+                const response = await fetch(`/shift-manage/${className}?config_version=${configVersion}`);
+                const data = await response.json();
+                console.log('Shift manage data loaded:', data);
+                
+                shiftManageData[className] = data;
+                renderShiftSlots(data);
+            } catch (error) {
+                console.error('시프트 관리 데이터 로딩 실패:', error);
+                // If no data exists, create default slots
+                const defaultSlots = [
+                    { shift_slot: 1, main_code: 'D', codes: [], manpower: 3 },
+                    { shift_slot: 2, main_code: 'E', codes: [], manpower: 3 },
+                    { shift_slot: 3, main_code: 'N', codes: [], manpower: 2 }
+                ];
+                shiftManageData[className] = defaultSlots;
+                renderShiftSlots(defaultSlots);
+            }
+        }
+
+        // Render shift slots
+        function renderShiftSlots(slots) {
+            const container = document.getElementById('shiftSlotsContainer');
+            container.innerHTML = '';
+            
+            const shiftNames = {1: '교대 1', 2: '교대 2', 3: '교대 3'};
+            
+            slots.forEach(slot => {
+                const slotDiv = document.createElement('div');
+                slotDiv.className = 'shift-slot';
+                slotDiv.setAttribute('data-slot', slot.shift_slot);
+                
+                slotDiv.innerHTML = `
+                    <div class="slot-label">${shiftNames[slot.shift_slot] || '교대 ' + slot.shift_slot}</div>
+                    <div class="main-code-display" style="background-color: ${getShiftColor(slot.main_code)}" 
+                         data-slot="${slot.shift_slot}">
+                        ${slot.main_code || '미설정'}
+                    </div>
+                    <div class="slot-manpower">
+                        <span>인력:</span>
+                        <input type="number" value="${slot.manpower}" min="0" max="20" 
+                               onchange="updateManpower(${slot.shift_slot}, this.value)" onclick="event.stopPropagation()">
+                    </div>
+                `;
+                
+                // Add codes container (visible by default)
+                const codesContainer = document.createElement('div');
+                codesContainer.className = 'codes-container expanded'; // Show by default
+                codesContainer.id = `codes-container-${slot.shift_slot}`;
+                codesContainer.innerHTML = `
+                    <div class="codes-area" data-slot="${slot.shift_slot}">
+                        ${slot.codes.map(code => `
+                            <div class="shift-code-chip" style="background-color: ${getShiftColor(code)}" 
+                                 draggable="true" ondragstart="dragStart(event, '${code}', ${slot.shift_slot})">
+                                ${code}
+                                <span class="delete-chip" onclick="removeShiftCodeFromSlot(event, '${code}', ${slot.shift_slot})">×</span>
+                            </div>
+                        `).join('')}
+                        ${slot.codes.length === 0 ? '<span class="empty-slot-text">여기에 근무코드를 드래그하거나 클릭하세요</span>' : ''}
+                    </div>
+                `;
+                
+                slotDiv.appendChild(codesContainer);
+                
+                // Add drag and drop events for main code
+                const mainCodeDiv = slotDiv.querySelector('.main-code-display');
+                mainCodeDiv.addEventListener('dragover', handleDragOver);
+                mainCodeDiv.addEventListener('drop', (e) => handleMainCodeDrop(e, slot.shift_slot));
+                mainCodeDiv.addEventListener('dragenter', handleMainCodeDragEnter);
+                mainCodeDiv.addEventListener('dragleave', handleMainCodeDragLeave);
+                mainCodeDiv.addEventListener('click', () => showAvailableShiftsForMainCode(slot.shift_slot));
+                
+                // Add drop event listeners to codes-area
+                const codesArea = codesContainer.querySelector('.codes-area');
+                codesArea.addEventListener('dragover', handleDragOver);
+                codesArea.addEventListener('drop', (e) => handleDrop(e, slot.shift_slot));
+                codesArea.addEventListener('dragenter', handleDragEnter);
+                codesArea.addEventListener('dragleave', handleDragLeave);
+                codesArea.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    showAvailableShiftsForCodes(slot.shift_slot);
+                });
+                
+                container.appendChild(slotDiv);
+            });
+        }
+
+        // Get shift color by code
+        function getShiftColor(code) {
+            const shift = availableShifts.find(s => s.shift_id === code);
+            return shift ? shift.color : '#ccc';
+        }
+
+        // Update manpower
+        function updateManpower(slotNumber, value) {
+            const slotData = shiftManageData[currentShiftClass].find(s => s.shift_slot === slotNumber);
+            if (slotData) {
+                slotData.manpower = parseInt(value);
+            }
+        }
+
+        // Drag and drop functions
+        function dragStart(event, shiftCode, fromSlot) {
+            // Check if the click is on the delete button
+            if (event.target.classList.contains('delete-chip')) {
+                event.preventDefault();
+                return false;
+            }
+            
+            event.dataTransfer.setData('text/plain', shiftCode);
+            event.dataTransfer.setData('application/json', JSON.stringify({
+                shiftCode: shiftCode,
+                fromSlot: fromSlot,
+                source: 'slot'
+            }));
+        }
+
+        function dragStartFromPanel(event, shiftCode) {
+            event.dataTransfer.setData('text/plain', shiftCode);
+            event.dataTransfer.setData('application/json', JSON.stringify({
+                shiftCode: shiftCode,
+                source: 'panel'
+            }));
+        }
+
+        function handleDragOver(event) {
+            event.preventDefault();
+        }
+
+        function handleDragEnter(event) {
+            event.preventDefault();
+            event.currentTarget.classList.add('drag-over');
+        }
+
+        function handleDragLeave(event) {
+            event.currentTarget.classList.remove('drag-over');
+        }
+
+        function handleDrop(event, toSlot) {
+            event.preventDefault();
+            event.currentTarget.classList.remove('drag-over');
+            
+            const dragData = JSON.parse(event.dataTransfer.getData('application/json'));
+            const shiftCode = dragData.shiftCode;
+            
+            // Remove from source slot if moving from another slot
+            if (dragData.source === 'slot' && dragData.fromSlot) {
+                removeShiftCodeFromAllSlots(shiftCode, toSlot);
+            }
+            
+            // Add to target slot codes (not main_code)
+            const toSlotData = shiftManageData[currentShiftClass].find(s => s.shift_slot === toSlot);
+            if (toSlotData && !toSlotData.codes.includes(shiftCode)) {
+                toSlotData.codes.push(shiftCode);
+            }
+            
+            // Re-render slots
+            renderShiftSlots(shiftManageData[currentShiftClass]);
+        }
+
+        // Handle main code drop
+        function handleMainCodeDrop(event, toSlot) {
+            event.preventDefault();
+            event.currentTarget.classList.remove('drag-over');
+
+            const dragData = JSON.parse(event.dataTransfer.getData('application/json'));
+            const shiftCode = dragData.shiftCode;
+            
+            // Remove from source if moving from another slot
+            if (dragData.source === 'slot' && dragData.fromSlot) {
+                removeShiftCodeFromAllSlots(shiftCode, dragData.fromSlot);
+            }
+            
+            // Set as main code
+            const toSlotData = shiftManageData[currentShiftClass].find(s => s.shift_slot === toSlot);
+            if (toSlotData) {
+                // Remove from all other main codes first
+                shiftManageData[currentShiftClass].forEach(slot => {
+                    if (slot.main_code === shiftCode && slot.shift_slot !== toSlot) {
+                        slot.main_code = null;
+                    }
+                });
+                
+                toSlotData.main_code = shiftCode;
+            }
+            
+            renderShiftSlots(shiftManageData[currentShiftClass]);
+        }
+
+        function handleMainCodeDragEnter(event) {
+            event.preventDefault();
+            event.currentTarget.classList.add('drag-over');
+        }
+
+        function handleMainCodeDragLeave(event) {
+            event.currentTarget.classList.remove('drag-over');
+        }
+
+        // Show available shifts for main code selection
+        async function showAvailableShiftsForMainCode(slotNumber) {
+            await loadAvailableShifts();
+            
+            // Render available shifts for main code
+            const availableShiftsDiv = document.getElementById('availableShifts');
+            availableShiftsDiv.innerHTML = getUsedShifts().length > 0 ? 
+                '<h4>사용 가능한 근무코드:</h4>' : '';
+            
+            availableShifts.forEach(shift => {
+                const isUsed = isShiftUsed(shift.shift_id);
+                const shiftElement = document.createElement('div');
+                shiftElement.className = 'available-shift-item';
+                shiftElement.style.backgroundColor = shift.color;
+                shiftElement.style.opacity = isUsed ? '0.5' : '1';
+                shiftElement.draggable = true;
+                shiftElement.innerHTML = `${shift.shift_id} - ${shift.name}${isUsed ? ' (사용중)' : ''}`;
+                
+                shiftElement.addEventListener('dragstart', (e) => {
+                    e.dataTransfer.setData('text/plain', shift.shift_id);
+                    e.dataTransfer.setData('application/json', JSON.stringify({
+                        shiftCode: shift.shift_id,
+                        source: 'panel'
+                    }));
+                });
+                
+                availableShiftsDiv.appendChild(shiftElement);
+            });
+            
+            document.getElementById('shiftCodesPanel').style.display = 'block';
+        }
+
+        // Show available shifts for codes area
+        async function showAvailableShiftsForCodes(slotNumber) {
+            await loadAvailableShifts();
+            
+            // Render available shifts for codes
+            const availableShiftsDiv = document.getElementById('availableShifts');
+            availableShiftsDiv.innerHTML = '<h4>보조 근무코드 추가:</h4>';
+            
+            availableShifts.forEach(shift => {
+                const shiftElement = document.createElement('div');
+                shiftElement.className = 'available-shift-item';
+                shiftElement.style.backgroundColor = shift.color;
+                shiftElement.draggable = true;
+                shiftElement.innerHTML = `${shift.shift_id} - ${shift.name}`;
+                
+                shiftElement.addEventListener('dragstart', (e) => {
+                    e.dataTransfer.setData('text/plain', shift.shift_id);
+                    e.dataTransfer.setData('application/json', JSON.stringify({
+                        shiftCode: shift.shift_id,
+                        source: 'panel'
+                    }));
+                });
+                
+                availableShiftsDiv.appendChild(shiftElement);
+            });
+            
+            document.getElementById('shiftCodesPanel').style.display = 'block';
+        }
+
+        // Load available shifts
+        async function loadAvailableShifts() {
+            if (availableShifts.length === 0) {
+                try {
+                    const response = await fetch('/shifts');
+                    availableShifts = await response.json();
+                } catch (error) {
+                    console.error('근무코드 로딩 실패:', error);
+                }
+            }
+        }
+
+        // Check if shift is used anywhere
+        function isShiftUsed(shiftCode) {
+            return shiftManageData[currentShiftClass].some(slot => 
+                slot.main_code === shiftCode || 
+                (slot.codes && slot.codes.includes(shiftCode))
+            );
+        }
+
+        // Get all used shifts
+        function getUsedShifts() {
+            const used = [];
+            shiftManageData[currentShiftClass].forEach(slot => {
+                if (slot.main_code) used.push(slot.main_code);
+                if (slot.codes) used.push(...slot.codes);
+            });
+            return [...new Set(used)]; // Remove duplicates
+        }
+
+        // Remove shift code from all slots except specified one
+        function removeShiftCodeFromAllSlots(shiftCode, exceptSlot = null) {
+            shiftManageData[currentShiftClass].forEach(slot => {
+                if (slot.shift_slot !== exceptSlot) {
+                    if (slot.main_code === shiftCode) {
+                        slot.main_code = null;
+                    }
+                    if (slot.codes) {
+                        slot.codes = slot.codes.filter(code => code !== shiftCode);
+                    }
+                }
+            });
+        }
+
+        // Remove shift code from slot
+        function removeShiftCodeFromSlot(event, shiftCode, slotNumber) {
+            event.stopPropagation(); // Prevent drag event
+            const slotData = shiftManageData[currentShiftClass].find(s => s.shift_slot === slotNumber);
+            if (slotData) {
+                slotData.codes = slotData.codes.filter(code => code !== shiftCode);
+                renderShiftSlots(shiftManageData[currentShiftClass]);
+            }
+        }
+
+        // Save shift manage data
+        async function saveShiftManage() {
+            try {
+                // Get current config version
+                const configVersionSelect = document.getElementById('configVersion');
+                const configVersion = configVersionSelect ? configVersionSelect.value : null;
+                
+                if (!configVersion) {
+                    alert('설정 버전을 먼저 선택해주세요.');
+                    return;
+                }
+                
+                const response = await fetch(`/shift-manage/save?config_version=${configVersion}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        class_name: currentShiftClass,
+                        slots: shiftManageData[currentShiftClass].map(slot => ({
+                            shift_slot: slot.shift_slot,
+                            main_code: slot.main_code,
+                            codes: slot.codes,
+                            manpower: slot.manpower
+                        }))
+                    })
+                });
+
+                if (response.ok) {
+                    alert('시프트 관리 설정이 저장되었습니다.');
+                } else {
+                    const error = await response.json();
+                    alert('저장에 실패했습니다: ' + (error.detail || '알 수 없는 오류'));
+                }
+            } catch (error) {
+                console.error('Error saving shift manage:', error);
+                alert('저장에 실패했습니다.');
+            }
+        }
+
+        // Load config versions
+        async function loadConfigVersions() {
+            try {
+                const response = await fetch('/roster/config/versions');
+                const versions = await response.json();
+                
+                const select = document.getElementById('configVersion');
+                select.innerHTML = '';
+                
+                if (versions.length === 0) {
+                    select.innerHTML = '<option value="">설정 버전이 없습니다</option>';
+                    return;
+                }
+                
+                versions.forEach(version => {
+                    const option = document.createElement('option');
+                    option.value = version.config_version;
+                    option.textContent = version.config_version;
+                    select.appendChild(option);
+                });
+                
+                // Select the latest version by default
+                if (versions.length > 0) {
+                    select.value = versions[0].config_version;
+                    loadConfigByVersion(versions[0].config_version);
+                } else {
+                    // No versions available, load default shift manage data
+                    loadShiftManage(currentShiftClass);
+                }
+                
+                // Add change event listener
+                select.addEventListener('change', function() {
+                    loadConfigByVersion(this.value);
+                    // Switch to roster-config tab when version is selected
+                    showTab('roster-config');
+                });
+                
+            } catch (error) {
+                console.error('설정 버전 로딩 실패:', error);
+            }
+        }
+
+        // Load config by version
+        async function loadConfigByVersion(configVersion) {
+            if (!configVersion) return;
+            
+            try {
+                const response = await fetch(`/roster/config/version/${configVersion}`);
+                const config = await response.json();
+                
+                if (config) {
+                    // Populate form fields with config data
+                    populateConfigForm(config);
+                    // Reload shift manage data for the selected config version
+                    loadShiftManage(currentShiftClass);
+                }
+            } catch (error) {
+                console.error('설정 로딩 실패:', error);
+            }
+        }
+
+        // Populate config form with data
+        function populateConfigForm(config) {
+            // Populate all form fields
+            const form = document.getElementById('configForm');
+            
+            // Set input values
+            if (config.max_conseq_work) form.querySelector('input[name="max_conseq_work"]').value = config.max_conseq_work;
+            if (config.max_nig_per_month) form.querySelector('input[name="max_nig_per_month"]').value = config.max_nig_per_month;
+            if (config.min_exp_per_shift) form.querySelector('input[name="min_exp_per_shift"]').value = config.min_exp_per_shift;
+            if (config.req_exp_nurses) form.querySelector('input[name="req_exp_nurses"]').value = config.req_exp_nurses;
+            if (config.patient_amount) form.querySelector('input[name="patient_amount"]').value = config.patient_amount;
+            if (config.off_days) form.querySelector('input[name="off_days"]').value = config.off_days;
+            if (config.weekend_shift_ratio) form.querySelector('input[name="weekend_shift_ratio"]').value = config.weekend_shift_ratio;
+            if (config.config_version) form.querySelector('input[name="config_version"]').value = config.config_version;
+            if (config.shift_priority) {
+                const priorityInput = form.querySelector('input[name="shift_priority"]');
+                const priorityOutput = priorityInput.nextElementSibling;
+                priorityInput.value = config.shift_priority;
+                priorityOutput.value = config.shift_priority;
+            }
+            
+            // Set checkbox values
+            const checkboxes = [
+                'two_offs_per_week', 'three_seq_nig', 'two_offs_after_three_nig', 
+                'two_offs_after_two_nig', 'banned_day_after_eve', 'sequential_offs', 'even_nights'
+            ];
+            
+            checkboxes.forEach(field => {
+                const checkbox = form.querySelector(`input[name="${field}"]`);
+                if (checkbox) {
+                    checkbox.checked = config[field] === true;
+                }
+            });
+            
+            // Trigger toggleN3Off to update dependent fields
+            toggleN3Off();
+        }
+    </script>
+</body>
+</html> 

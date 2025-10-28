@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+<ul>
+    <li>
+        <a href="/setting/division_download/{{ filename }}" download="{{ filename }}">
+            {{ filename }}
+        </a>
+    </li>
+</ul>
+
+ <form action="/setting/division_upload" method="post" enctype="multipart/form-data">
+        <label for="file">파일 선택:</label>
+        <input type="file" name="file" id="file" required>
+        <button type="submit">업로드</button>
+    </form>
+</body>
+</html>

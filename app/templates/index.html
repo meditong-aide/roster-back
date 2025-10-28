@@ -1,0 +1,2441 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>간호사 근무 희망사항 제출</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .page-status-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+        }
+        .page-status-overlay h2 {
+            padding: 20px;
+            background: #e9ecef;
+            border-radius: 10px;
+        }
+        #result-display {
+            display: flex;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .result-table {
+            flex: 1;
+            border-collapse: collapse;
+        }
+        .result-table th, .result-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        .result-table th {
+            background-color: #f2f2f2;
+        }
+        .submit-container {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+        }
+        .submit-container button {
+            width: auto;
+            padding: 15px 25px;
+            font-size: 16px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        .content-wrapper {
+            display: flex;
+        }
+        .bookmarks-container {
+            width: 200px;
+            padding-right: 20px;
+        }
+        .bookmark {
+            padding: 8px 16px;
+            margin: 0 4px;
+            background: #e3f2fd;
+            border: 1px solid #2196f3;
+            border-radius: 20px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: all 0.2s ease;
+            font-size: 0.9em;
+        }
+        .bookmark:hover {
+            background: #bbdefb;
+            transform: translateY(-2px);
+        }
+        .bookmark.active {
+            background: #2196f3;
+            color: white;
+        }
+        .bookmark.closed {
+            background: #f5f5f5;
+            border-color: #9e9e9e;
+            color: #757575;
+            opacity: 0.7;
+        }
+        .bookmark.closed:hover {
+            background: #eeeeee;
+            transform: none;
+        }
+        .main-content {
+            flex: 1;
+        }
+        
+        /* 귀여운 간호사 로딩 화면 */
+        .cute-loader {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+            border-radius: 10px;
+        }
+        
+        .nurse-character {
+            width: 200px;
+            height: 200px;
+            margin-bottom: 20px;
+            position: relative;
+        }
+        
+        /* 고양이 몸통 */
+        .cat-body {
+            width: 100px;
+            height: 120px;
+            background: #f8f8f8;
+            border-radius: 50px 50px 30px 30px;
+            position: absolute;
+            left: 50%;
+            top: 60px;
+            transform: translateX(-50%);
+            border: 3px solid #ff6b9d;
+            z-index: 1;
+        }
+        
+        /* 고양이 머리 */
+        .cat-head {
+            width: 90px;
+            height: 80px;
+            background: #ffeaa7;
+            border-radius: 45px;
+            position: absolute;
+            left: 50%;
+            top: 30px;
+            transform: translateX(-50%);
+            border: 3px solid #ff6b9d;
+            z-index: 2;
+        }
+        
+        /* 고양이 귀 */
+        .cat-ear {
+            width: 25px;
+            height: 30px;
+            background: #ffeaa7;
+            border-radius: 15px 15px 0 0;
+            position: absolute;
+            top: 25px;
+            border: 2px solid #ff6b9d;
+            border-bottom: none;
+        }
+        
+        .cat-ear.left {
+            left: 20px;
+            transform: rotate(-15deg);
+        }
+        
+        .cat-ear.right {
+            right: 20px;
+            transform: rotate(15deg);
+        }
+        
+        .cat-ear::after {
+            content: '';
+            position: absolute;
+            top: 5px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 12px;
+            height: 15px;
+            background: #fd79a8;
+            border-radius: 8px 8px 0 0;
+        }
+        
+        /* 간호사 모자 */
+        .nurse-cap {
+            width: 50px;
+            height: 20px;
+            background: white;
+            border-radius: 25px 25px 0 0;
+            position: absolute;
+            left: 50%;
+            top: 20px;
+            transform: translateX(-50%);
+            border: 2px solid #ff6b9d;
+            border-bottom: none;
+            z-index: 3;
+        }
+        
+        .nurse-cap::after {
+            content: '+';
+            position: absolute;
+            top: 3px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #e84393;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        
+        /* 고양이 얼굴 */
+        .cat-face {
+            position: absolute;
+            top: 45px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 3;
+        }
+        
+        .cat-eyes {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 8px;
+            justify-content: center;
+        }
+        
+        .cat-eye {
+            width: 12px;
+            height: 12px;
+            background: #2d3436;
+            border-radius: 50%;
+            position: relative;
+            animation: cat-blink 3s infinite;
+        }
+        
+        .cat-eye::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 4px;
+            height: 4px;
+            background: white;
+            border-radius: 50%;
+        }
+        
+        .cat-nose {
+            width: 8px;
+            height: 6px;
+            background: #fd79a8;
+            border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+            margin: 0 auto 5px;
+        }
+        
+        .cat-mouth {
+            width: 20px;
+            height: 10px;
+            border: 2px solid #2d3436;
+            border-top: none;
+            border-radius: 0 0 15px 15px;
+            margin: 0 auto;
+        }
+        
+        .cat-whiskers {
+            position: absolute;
+            top: 50px;
+            left: 50%;
+            transform: translateX(-50%);
+        }
+        
+        .whisker {
+            position: absolute;
+            width: 20px;
+            height: 1px;
+            background: #2d3436;
+        }
+        
+        .whisker.left-1 { left: -25px; top: 0; transform: rotate(-10deg); }
+        .whisker.left-2 { left: -25px; top: 5px; transform: rotate(10deg); }
+        .whisker.right-1 { right: -25px; top: 0; transform: rotate(10deg); }
+        .whisker.right-2 { right: -25px; top: 5px; transform: rotate(-10deg); }
+        
+        /* 고양이 팔 */
+        .cat-arms {
+            position: absolute;
+            top: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 2;
+        }
+        
+        .cat-arm {
+            width: 25px;
+            height: 40px;
+            background: #ffeaa7;
+            border-radius: 15px;
+            position: absolute;
+            border: 2px solid #ff6b9d;
+        }
+        
+        .cat-arm.left {
+            left: -20px;
+            transform-origin: center top;
+        }
+        
+        .cat-arm.right {
+            right: -20px;
+            transform-origin: center top;
+        }
+        
+        /* 고양이 꼬리 */
+        .cat-tail {
+            width: 15px;
+            height: 60px;
+            background: #ffeaa7;
+            border-radius: 8px;
+            position: absolute;
+            right: -25px;
+            top: 100px;
+            border: 2px solid #ff6b9d;
+            transform-origin: center top;
+            animation: tail-wag 2s ease-in-out infinite;
+        }
+        
+        /* 조사하는 애니메이션 */
+        .investigating .cat-arm.left {
+            animation: cat-investigate-left 1.5s ease-in-out infinite;
+        }
+        
+        .investigating .cat-arm.right {
+            animation: cat-investigate-right 1.5s ease-in-out infinite;
+        }
+        
+        .investigating .magnifying-glass {
+            position: absolute;
+            top: 95px;
+            right: -35px;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #74b9ff;
+            border-radius: 50%;
+            animation: magnify 1.5s ease-in-out infinite;
+            z-index: 4;
+        }
+        
+        .investigating .magnifying-glass::after {
+            content: '';
+            position: absolute;
+            top: 15px;
+            right: -8px;
+            width: 3px;
+            height: 12px;
+            background: #74b9ff;
+            border-radius: 2px;
+            transform: rotate(45deg);
+        }
+        
+        /* 문서 정리하는 애니메이션 */
+        .organizing .cat-arm.left {
+            animation: cat-organize-left 1.2s ease-in-out infinite;
+        }
+        
+        .organizing .cat-arm.right {
+            animation: cat-organize-right 1.2s ease-in-out infinite;
+        }
+        
+        .organizing .papers {
+            position: absolute;
+            top: 110px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 4;
+        }
+        
+        .paper {
+            width: 12px;
+            height: 16px;
+            background: white;
+            border: 1px solid #ddd;
+            position: absolute;
+            border-radius: 2px;
+        }
+        
+        .paper:nth-child(1) {
+            left: -8px;
+            animation: paper-shuffle-1 1.2s ease-in-out infinite;
+        }
+        
+        .paper:nth-child(2) {
+            left: 0px;
+            animation: paper-shuffle-2 1.2s ease-in-out infinite;
+        }
+        
+        .paper:nth-child(3) {
+            left: 8px;
+            animation: paper-shuffle-3 1.2s ease-in-out infinite;
+        }
+        
+        .loading-message {
+            font-size: 24px;
+            color: #ff6b9d;
+            font-weight: bold;
+            margin-bottom: 10px;
+            animation: pulse-text 1s ease-in-out infinite;
+        }
+        
+        .loading-subtitle {
+            font-size: 16px;
+            color: #666;
+            animation: fade-in-out 2s ease-in-out infinite;
+        }
+        
+        /* 키프레임 애니메이션들 */
+        @keyframes cat-blink {
+            0%, 90%, 100% { height: 12px; }
+            95% { height: 2px; }
+        }
+        
+        @keyframes tail-wag {
+            0%, 100% { transform: rotate(0deg); }
+            25% { transform: rotate(15deg); }
+            75% { transform: rotate(-10deg); }
+        }
+        
+        @keyframes cat-investigate-left {
+            0%, 100% { transform: rotate(-20deg); }
+            50% { transform: rotate(-35deg); }
+        }
+        
+        @keyframes cat-investigate-right {
+            0%, 100% { transform: rotate(45deg); }
+            50% { transform: rotate(25deg); }
+        }
+        
+        @keyframes magnify {
+            0%, 100% { transform: scale(1) rotate(0deg); }
+            50% { transform: scale(1.1) rotate(5deg); }
+        }
+        
+        @keyframes cat-organize-left {
+            0%, 100% { transform: rotate(-10deg) translateY(0); }
+            50% { transform: rotate(-20deg) translateY(-5px); }
+        }
+        
+        @keyframes cat-organize-right {
+            0%, 100% { transform: rotate(10deg) translateY(0); }
+            50% { transform: rotate(20deg) translateY(-5px); }
+        }
+        
+        @keyframes paper-shuffle-1 {
+            0%, 100% { transform: translateY(0) rotate(0deg); }
+            50% { transform: translateY(-5px) rotate(-5deg); }
+        }
+        
+        @keyframes paper-shuffle-2 {
+            0%, 100% { transform: translateY(0) rotate(0deg); }
+            25% { transform: translateY(-3px) rotate(2deg); }
+            75% { transform: translateY(-3px) rotate(-2deg); }
+        }
+        
+        @keyframes paper-shuffle-3 {
+            0%, 100% { transform: translateY(0) rotate(0deg); }
+            50% { transform: translateY(-4px) rotate(3deg); }
+        }
+        
+        @keyframes pulse-text {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        @keyframes fade-in-out {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+        }
+        
+        /* 탭 네비게이션 스타일 */
+        .tab-container {
+            width: 100%;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .tab-navigation {
+            display: flex;
+            border-bottom: 2px solid #e0e0e0;
+            margin-bottom: 20px;
+            background: white;
+            border-radius: 8px 8px 0 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .tab-button {
+            flex: 1;
+            padding: 15px 20px;
+            background: #f5f5f5;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            color: #666;
+            transition: all 0.3s ease;
+            border-radius: 8px 8px 0 0;
+            position: relative;
+        }
+        
+        .tab-button:first-child {
+            border-right: 1px solid #e0e0e0;
+        }
+        
+        .tab-button.active {
+            background: #007bff;
+            color: white;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,123,255,0.3);
+        }
+        
+        .tab-button:hover:not(.active) {
+            background: #e9ecef;
+            color: #495057;
+        }
+        
+        .tab-content {
+            display: flex;
+            width: 200%;
+            transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        .tab-pane {
+            width: 50%;
+            flex-shrink: 0;
+            padding: 0 10px;
+        }
+        
+        .tab-content.slide-to-second {
+            transform: translateX(-50%);
+        }
+        
+        /* 희망 근무 현황 테이블 스타일 */
+        .wish-status-container {
+            display: block;
+            width: 100%;
+            min-height: calc(100vh - 200px);
+        }
+        
+        .wish-table-container {
+            width: 100%;
+            background: white;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+            overflow: hidden;
+            min-height: calc(100vh - 250px);
+        }
+        
+        .wish-table-header {
+            background: #f8f9fa;
+            padding: 15px 20px;
+            border-bottom: 1px solid #dee2e6;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .wish-table-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #495057;
+            margin: 0;
+        }
+        
+        .wish-legend {
+            display: flex;
+            gap: 15px;
+            font-size: 12px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 3px;
+            border: 1px solid #ccc;
+        }
+        
+        .wish-table-wrapper {
+            height: calc(100vh - 320px);
+            overflow: auto;
+            padding: 20px;
+        }
+        
+        .wish-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            min-width: 800px;
+        }
+        
+        .wish-table th {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 10px 8px;
+            text-align: center;
+            font-weight: 600;
+            color: #495057;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            min-width: 35px;
+        }
+        
+        .wish-table th:first-child {
+            width: 120px;
+            min-width: 120px;
+            left: 0;
+            z-index: 11;
+            text-align: left;
+            padding-left: 15px;
+        }
+        
+        .wish-table td {
+            border: 1px solid #dee2e6;
+            padding: 0;
+            text-align: center;
+            height: 40px;
+            min-width: 35px;
+            position: relative;
+            background: black;
+        }
+        
+        .wish-table td:first-child {
+            background: #f8f9fa;
+            padding: 12px 15px;
+            font-weight: 500;
+            color: #495057;
+            width: 120px;
+            min-width: 120px;
+            position: sticky;
+            left: 0;
+            z-index: 10;
+            text-align: left;
+            white-space: nowrap;
+        }
+        
+        .wish-cell {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            background: black;
+        }
+
+        .wish-cell.off-weighted {
+            background: repeating-linear-gradient(
+                45deg,
+                #FF8C00,
+                #FF8C00 3px,
+                #FFA500 3px,
+                #FFA500 6px
+            );
+        }
+
+        .shift-marker {
+            width: 12px;
+            height: 12px;
+            margin: 1px;
+            border-radius: 2px;
+            position: relative;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+
+        .shift-marker.diagonal {
+            background: repeating-linear-gradient(
+                45deg,
+                transparent,
+                transparent 2px,
+                rgba(255,255,255,0.2) 2px,
+                rgba(255,255,255,0.2) 4px
+            );
+        }
+
+        /* 시프트 컬러 정의 */
+        .shift-D { background-color: #87CEEB; }
+        .shift-E { background-color: #DDA0DD; }
+        .shift-N { background-color: #4169E1; }
+        .shift-OFF { background-color: #90EE90; }
+        .shift-custom { background-color: #FFB6C1; }
+
+        /* 빈 셀은 검은색 유지 */
+        .wish-cell:empty {
+            background: black;
+        }
+
+        .loading-status {
+            text-align: center;
+            padding: 40px;
+            color: #6c757d;
+            font-style: italic;
+        }
+        
+        /* 캘린더 스타일 */
+        .calendar-container {
+            background: white;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+            padding: 20px;
+            margin: 20px 0;
+            display: none;
+        }
+        
+        .calendar-header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        
+        .calendar-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #495057;
+            margin: 0 0 15px 0;
+        }
+        
+        .shift-selector {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 15px;
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        
+        .shift-selector-label {
+            font-weight: 500;
+            margin-right: 10px;
+            align-self: center;
+            color: #495057;
+        }
+        
+        .shift-btn {
+            padding: 6px 12px;
+            border: 2px solid transparent;
+            background: white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s ease;
+            min-width: 40px;
+            font-size: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .shift-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+        }
+        
+        .shift-btn.selected {
+            border-color: #007bff;
+            background: #007bff;
+            color: white;
+        }
+        
+        .calendar-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+        }
+        
+        .calendar-table th,
+        .calendar-table td {
+            border: 1px solid #dee2e6;
+            text-align: center;
+            vertical-align: middle;
+            height: 40px;
+            min-width: 40px;
+        }
+        
+        .calendar-table th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #495057;
+            font-size: 12px;
+        }
+        
+        .calendar-table td {
+            position: relative;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        
+        .calendar-table td:hover {
+            background: #e9ecef;
+        }
+        
+        .calendar-table td.other-month {
+            color: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .calendar-table td.other-month:hover {
+            background: transparent;
+        }
+        
+        .calendar-date {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+        }
+        
+        .calendar-shift-marker {
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            font-size: 8px;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+        }
+        
+        .calendar-submit-btn {
+            width: 100%;
+            padding: 10px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        
+        .calendar-submit-btn:hover {
+            background: #218838;
+        }
+        
+        .calendar-submit-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        /* 모달 스타일 */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        
+        .modal-content {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            max-width: 400px;
+            width: 90%;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+        
+        .modal-header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #495057;
+            margin: 0;
+        }
+        
+        .modal-body {
+            margin-bottom: 20px;
+        }
+        
+        .modal-shifts {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        
+        .modal-shift-btn {
+            padding: 8px 16px;
+            border: 2px solid transparent;
+            background: white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s ease;
+            font-size: 14px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .modal-shift-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+        }
+        
+        .modal-shift-btn.selected {
+            border-color: #007bff;
+            background: #007bff;
+            color: white;
+        }
+        
+        .reason-section {
+            margin-top: 20px;
+        }
+        
+        .reason-option {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .reason-option input[type="radio"] {
+            margin-right: 8px;
+        }
+        
+        .reason-option label {
+            font-weight: 500;
+            color: #495057;
+            cursor: pointer;
+        }
+        
+        .reason-input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            margin-top: 8px;
+            resize: vertical;
+            min-height: 60px;
+        }
+        
+        .reason-input:disabled {
+            background: #e9ecef;
+            cursor: not-allowed;
+        }
+        
+        .modal-footer {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .modal-btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background-color 0.2s ease;
+        }
+        
+        .modal-btn.cancel {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .modal-btn.cancel:hover {
+            background: #545b62;
+        }
+        
+        .modal-btn.confirm {
+            background: #007bff;
+            color: white;
+        }
+        
+        .modal-btn.confirm:hover {
+            background: #0056b3;
+        }
+        
+        .modal-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        /* 주말·공휴일 강조 */
+        .weekend-cell,          /* 데이터 셀 */
+        .weekend-header {       /* 헤더 셀(날짜 번호) */
+        box-shadow: inset 0 0 0 2px #ff4d4d;   /* 빨간 안쪽 테두리 */
+        }
+        /* holiday-cell 정의를 이것으로 교체 */
+        .wish-table td.holiday-cell{
+        border: 2px solid #e74c3c;        /* 빨간 굵은 테두리 */
+        box-sizing: border-box;           /* 내용이 눌리지 않게 */
+        }
+
+</style>
+
+    <script src="/static/js/prefs_utils.js"></script>
+</head>
+<body>
+    <div id="mySidebar" class="sidebar">
+        <button class="sidebar-toggle-btn" onclick="toggleNav()"><i class="fa-solid fa-angles-left"></i></button>
+        <a href="/" class="active">Wanted 작성</a>
+        <a href="/roster-view">근무표 보기</a>
+        {% if user.is_head_nurse %}
+        <a href="/head-nurse-management">부서원 관리</a>
+        <a href="/roster-create">근무표 생성</a>
+        <a href="/roster-configure">근무표 설정</a>
+        {% endif %}
+        <a href="javascript:void(0);" onclick="logout()">로그아웃</a>
+    </div>
+
+    <div id="main">
+        <div class="container" style="position: relative;">
+            <div id="page-status" class="page-status-overlay" style="display: none;">
+                <h2 id="status-message"></h2>
+            </div>
+
+            <h1>간호사 근무 희망사항</h1>
+
+            <div class="content-wrapper">
+                <div id="bookmarks-container" class="bookmarks-container">
+                    <!-- Bookmarks will be inserted here -->
+                </div>
+                <div class="main-content">
+                    <div class="tab-container">
+                        <div class="tab-navigation">
+                            <button class="tab-button active" onclick="switchTab(0)">내 희망사항 작성</button>
+                            <button class="tab-button" onclick="switchTab(1)">전체 희망사항 현황</button>
+                        </div>
+                        
+                        <div class="tab-content" id="tab-content">
+                            <!-- 첫 번째 탭: 기존 희망사항 작성 -->
+                            <div class="tab-pane">
+                                <div id="nurse-view">
+                                    <div class="form-group">
+                                        <label for="wanted-input">희망 근무 내용 (Wanted)</label>
+                                        <textarea id="wanted-input" placeholder="예: 주말 출근은 최대한 N으로 하고싶어요."></textarea>
+                                    </div>
+                                    <button onclick="submitRequest()">근무 희망 초안 저장 및 분석</button>
+                                </div>
+                    
+                                <!-- 귀여운 간호사 로딩 화면 -->
+                                <div class="cute-loader" id="cute-loader" style="display: none;">
+                                    <div class="nurse-character" id="nurse-character">
+                                        <div class="cat-body"></div>
+                                        <div class="cat-head">
+                                            <div class="cat-ear left"></div>
+                                            <div class="cat-ear right"></div>
+                                        </div>
+                                        <div class="nurse-cap"></div>
+                                        <div class="cat-face">
+                                            <div class="cat-eyes">
+                                                <div class="cat-eye"></div>
+                                                <div class="cat-eye"></div>
+                                            </div>
+                                            <div class="cat-nose"></div>
+                                            <div class="cat-mouth"></div>
+                                        </div>
+                                        <div class="cat-whiskers">
+                                            <div class="whisker left-1"></div>
+                                            <div class="whisker left-2"></div>
+                                            <div class="whisker right-1"></div>
+                                            <div class="whisker right-2"></div>
+                                        </div>
+                                        <div class="cat-arms">
+                                            <div class="cat-arm left"></div>
+                                            <div class="cat-arm right"></div>
+                                        </div>
+                                        <div class="cat-tail"></div>
+                                    </div>
+                                    <div class="loading-message" id="loading-message">요청 분석중...</div>
+                                    <div class="loading-subtitle" id="loading-subtitle">열심히 분석하고 있어요! 🔍</div>
+                                </div>
+                    
+                                <div id="result-container" style="display: none; position: relative;">
+                                    <h2>처리 결과</h2>
+                                    <div id="result-display"></div>
+                                </div>
+                            </div>
+                            
+                            <!-- 두 번째 탭: 전체 희망사항 현황 -->
+                            <div class="tab-pane">
+                                <div class="wish-status-container">
+                                    <div class="wish-table-container">
+                                        <div class="wish-table-header">
+                                            <h3 class="wish-table-title" id="wish-table-title">전체 희망사항 현황</h3>
+                                            <div class="wish-legend">
+                                                <div class="legend-item">
+                                                    <div class="legend-color shift-D"></div>
+                                                    <span>Day</span>
+                                                </div>
+                                                <div class="legend-item">
+                                                    <div class="legend-color shift-E"></div>
+                                                    <span>Evening</span>
+                                                </div>
+                                                <div class="legend-item">
+                                                    <div class="legend-color shift-N"></div>
+                                                    <span>Night</span>
+                                                </div>
+                                                <div class="legend-item">
+                                                    <div class="legend-color shift-OFF"></div>
+                                                    <span>OFF</span>
+                                                </div>
+                                                <div class="legend-item">
+                                                    <div class="legend-color off-weighted"></div>
+                                                    <span>OFF 가중</span>
+                                                </div>
+                                                <div class="legend-item">
+                                                    <div class="legend-color shift-custom"></div>
+                                                    <span>기타</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="wish-table-wrapper">
+                                            <div id="wish-table-content">
+                                                <div class="loading-status">
+                                                    월을 선택하면 해당 월의 전체 희망사항 현황을 확인할 수 있습니다.
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="submit-section" class="submit-container" style="display: none;">
+                 <button id="final-submit-btn" onclick="finalSubmit()">최종 제출</button>
+            </div>
+            
+            <!-- 캘린더 컨테이너 -->
+            <div id="calendar-container" class="calendar-container">
+                <div class="calendar-header">
+                    <h3 id="calendar-title" class="calendar-title">희망 근무 캘린더</h3>
+                    
+                    <!-- 근무 코드 선택기 -->
+                    <div class="shift-selector">
+                        <span class="shift-selector-label">근무 코드:</span>
+                        <div id="shift-buttons-container">
+                            <!-- 동적으로 생성됨 -->
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 캘린더 테이블 -->
+                <table class="calendar-table">
+                    <thead>
+                        <tr>
+                            <th>일</th>
+                            <th>월</th>
+                            <th>화</th>
+                            <th>수</th>
+                            <th>목</th>
+                            <th>금</th>
+                            <th>토</th>
+                        </tr>
+                    </thead>
+                    <tbody id="calendar-body">
+                        <!-- 동적으로 생성됨 -->
+                    </tbody>
+                </table>
+                
+                <!-- 희망 내용 반영하기 버튼 -->
+                <button id="calendar-submit-btn" class="calendar-submit-btn" onclick="submitCalendarData()">
+                    희망 내용 반영하기
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 모달 오버레이 -->
+    <div id="modal-overlay" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title" class="modal-title">날짜 선택</h3>
+            </div>
+            <div class="modal-body">
+                <!-- 근무 코드 선택 -->
+                <div class="modal-shifts" id="modal-shifts">
+                    <!-- 동적으로 생성됨 -->
+                </div>
+                
+                <!-- 사유 선택 -->
+                <div class="reason-section">
+                    <div class="reason-option">
+                        <input type="radio" id="reason-direct" name="reason-type" value="direct" checked>
+                        <label for="reason-direct">사유 직접 입력하기</label>
+                    </div>
+                    <textarea id="reason-input" class="reason-input" placeholder="희망 사유를 입력해주세요..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn cancel" onclick="closeModal()">취소</button>
+                <button id="modal-confirm-btn" class="modal-btn confirm" onclick="confirmModal()">입력</button>
+            </div>
+        </div>
+    </div>
+    <script>
+        let fullNurseSchema = [];
+        let wantedList = [];
+        let activeYear, activeMonth;
+        
+        // 캘린더 관련 변수들
+        let availableShifts = [];
+        let selectedShift = null;
+        let calendarData = {}; // {date: {shift: 'D', reason: 'text'}}
+        let modalSelectedDate = null;
+        let modalSelectedShift = null;
+
+        /* ✅ 새 전역 변수 */
+        let holidayDates = [];          // ISO 문자열 리스트 ["2025-06-06", …]
+
+        /* ✅ 휴일/주말 날짜를 서버에서 받아오는 함수  */
+        async function loadHolidayDates(year, month) {
+                try {
+                    const res = await fetch(`/dates/holidays?year=${year}&month=${month}`);
+                    if (!res.ok) throw new Error('휴일 정보를 가져오지 못했습니다.');
+                    /* 리스트 → Set  (전역) */
+                    holidayDates = new Set(await res.json());       // ⬅️ 이 한 줄
+                    console.log('🟥 holidayDates =', holidayDates);
+                } catch (err) {
+                    console.error(err);
+                    holidayDates = new Set();                       // 실패 시 비워 두기
+                }
+                }
+
+
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            console.log('DOM 로드 완료, 초기화 시작');
+            
+            // Setup sidebar and basic listeners
+            document.getElementById("mySidebar").style.width = "250px";
+            document.getElementById("main").style.marginLeft = "250px";
+            document.getElementById('wanted-input').addEventListener('keydown', handleKeydown);
+            
+            try {
+                console.log('간호사 스키마 로드 시작');
+                await fetchNurseSchema();
+                console.log('간호사 스키마 로드 완료');
+                
+                // console.log('shifts 데이터 로드 시작');
+                // await loadShifts();
+                // console.log('shifts 데이터 로드 완료');
+                
+                console.log('북마크 초기화 시작');
+                await initializeBookmarks();
+                console.log('북마크 초기화 완료');
+            } catch (error) {
+                console.error('초기화 중 오류 발생:', error);
+                const statusMessage = document.getElementById('status-message');
+                const pageStatusDiv = document.getElementById('page-status');
+                statusMessage.textContent = '초기화 중 오류가 발생했습니다: ' + error.message;
+                pageStatusDiv.style.display = 'flex';
+            }
+        });
+
+        function handleKeydown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                submitRequest();
+            }
+        }
+
+        async function initializeBookmarks() {
+            const pageStatusDiv = document.getElementById('page-status');
+            const statusMessage = document.getElementById('status-message');
+            const bookmarksContainer = document.getElementById('bookmarks-container');
+            
+            try {
+                console.log('wanted 데이터를 불러오는 중...');
+                
+                // 모든 wanted 데이터를 가져옴
+                const wantedResponse = await fetch('/wanted/all');
+                console.log('Wanted API 응답 상태:', wantedResponse.status, wantedResponse.statusText);
+                
+                if (!wantedResponse.ok) {
+                    const errorText = await wantedResponse.text();
+                    console.error('Wanted API 에러 응답:', errorText);
+                    throw new Error('Wanted 목록을 불러올 수 없습니다: ' + wantedResponse.status);
+                }
+                
+                wantedList = await wantedResponse.json();
+                console.log('불러온 wanted 목록:', wantedList);
+
+                if (wantedList.length === 0) {
+                    console.log('wanted 목록이 비어있음');
+                    statusMessage.textContent = 'wanted 작성 요청 전입니다. 수간호사에게 요청해주세요.';
+                    pageStatusDiv.style.display = 'flex';
+                    bookmarksContainer.innerHTML = '';
+                    return;
+                }
+
+                console.log('북마크 렌더링 시작');
+                // 북마크 렌더링
+                pageStatusDiv.style.display = 'none';
+                renderBookmarks();
+                
+                // 첫 번째 wanted 자동 선택
+                if (wantedList.length > 0) {
+                    console.log('첫 번째 스케줄 선택:', wantedList[0]);
+                    await switchActiveSchedule(wantedList[0].year, wantedList[0].month);
+                }
+            } catch (error) {
+                console.error('initializeBookmarks 오류:', error);
+                statusMessage.textContent = '오류가 발생했습니다: ' + error.message;
+                pageStatusDiv.style.display = 'flex';
+            }
+        }
+
+        function renderBookmarks() {
+            const bookmarksContainer = document.getElementById('bookmarks-container');
+            bookmarksContainer.innerHTML = '';
+            
+            wantedList.forEach(wanted => {
+                const bookmark = document.createElement('div');
+                bookmark.className = 'bookmark';
+                bookmark.textContent = `${wanted.year}년 ${wanted.month}월`;
+                bookmark.dataset.year = wanted.year;
+                bookmark.dataset.month = wanted.month;
+                
+                // wanted 상태에 따른 스타일링
+                if (wanted.status === 'closed') {
+                    bookmark.classList.add('closed');
+                    bookmark.title = 'wanted 작성이 마감되었습니다.';
+                }
+                
+                bookmark.onclick = () => switchActiveSchedule(wanted.year, wanted.month);
+                bookmarksContainer.appendChild(bookmark);
+            });
+        }
+
+        async function switchActiveSchedule(year, month) {
+            activeYear = year;
+            activeMonth = month;
+            
+            // Update active class on bookmarks
+            document.querySelectorAll('.bookmark').forEach(bm => {
+                if (bm.dataset.year == year && bm.dataset.month == month) {
+                    bm.classList.add('active');
+                } else {
+                    bm.classList.remove('active');
+                }
+            });
+
+            await checkWantedStatus();
+            
+            // 현재 두 번째 탭이 활성화되어 있으면 희망사항 현황도 업데이트
+            const secondTabButton = document.querySelectorAll('.tab-button')[1];
+            if (secondTabButton && secondTabButton.classList.contains('active')) {
+                loadWishStatus();
+            }
+            
+            // 캘린더 업데이트
+            await updateCalendar();
+        }
+
+        async function checkWantedStatus() {
+            const statusMessage = document.getElementById('status-message');
+            const pageStatusDiv = document.getElementById('page-status');
+            
+            if (!activeYear || !activeMonth) {
+                statusMessage.textContent = '년도와 월을 선택해주세요.';
+                pageStatusDiv.style.display = 'flex';
+                return;
+            }
+
+            try {
+                // 전역 wantedList 사용 (initializeBookmarks에서 이미 로드됨)
+                const currentWanted = wantedList.find(w => w.year === activeYear && w.month === activeMonth);
+                
+                if (!currentWanted) {
+                    statusMessage.textContent = 'wanted 작성 요청 전입니다. 수간호사에게 요청해주세요.';
+                    pageStatusDiv.style.display = 'flex';
+                    return;
+                }
+
+                if (currentWanted.status === 'closed') {
+                    // wanted가 마감된 경우: 폼은 비활성화하되, 다른 북마크는 활성화 유지
+                    setClosedState();
+                    return;
+                }
+
+                // wanted 상태가 'requested'인 경우 최신 preference 상태 확인
+                pageStatusDiv.style.display = 'none';
+                
+                // 최신 선호도 데이터 조회
+                const response = await fetch(`/preferences/latest?year=${activeYear}&month=${activeMonth}`);
+                if (!response.ok) throw new Error('선호도 상태를 확인할 수 없습니다.');
+                const statusData = await response.json();
+
+                const isSubmitted = statusData.is_submitted;
+
+                if (isSubmitted) {
+                    setSubmittedState(statusData.preference_data, statusData.created_at, statusData.submitted_at);
+                } else {
+                    setDraftState(statusData.preference_data, statusData.created_at);
+                }
+            } catch (error) {
+                console.error(error);
+                statusMessage.textContent = '오류가 발생했습니다: ' + error.message;
+                pageStatusDiv.style.display = 'flex';
+            }
+        }
+
+        function setSubmittedState(preferenceData, createdAt, submittedAt) {
+            // closed-notice 숨기기
+            const closedNotice = document.getElementById('closed-notice');
+            if (closedNotice) {
+                closedNotice.style.display = 'none';
+            }
+            
+            // 입력 필드 비활성화
+            document.getElementById('wanted-input').disabled = true;
+            document.getElementById('wanted-input').placeholder = '제출된 희망 근무 내용 (수정하려면 수정하기 버튼을 누르세요)';
+            
+            // 희망사항 확인 버튼 비활성화
+            const confirmBtn = document.querySelector('#nurse-view button');
+            confirmBtn.disabled = true;
+            confirmBtn.textContent = '제출 완료';
+            
+            // 결과 컨테이너 표시
+            document.getElementById('result-container').style.display = 'block';
+            
+            // 최종 제출 버튼을 수정하기 버튼으로 변경
+            const submitBtn = document.getElementById('final-submit-btn');
+            submitBtn.textContent = '수정하기';
+            submitBtn.onclick = retractSubmission;
+            document.getElementById('submit-section').style.display = 'block';
+            
+            // 제출 정보 표시
+            const submitSection = document.getElementById('submit-section');
+            let submitInfo = document.getElementById('submit-info');
+            if (!submitInfo) {
+                submitInfo = document.createElement('div');
+                submitInfo.id = 'submit-info';
+                submitInfo.style.cssText = `
+                    background: #d4edda;
+                    border: 1px solid #c3e6cb;
+                    color: #155724;
+                    padding: 10px;
+                    border-radius: 5px;
+                    margin-bottom: 10px;
+                    font-size: 14px;
+                `;
+                submitSection.insertBefore(submitInfo, submitBtn);
+            }
+            submitInfo.textContent = `제출 완료 (${new Date(submittedAt).toLocaleString('ko-KR')})`;
+            submitInfo.style.display = 'block';
+            
+            // 데이터 표시
+            if (preferenceData) {
+                document.getElementById('wanted-input').value = preferenceData.request || '';
+                displayResults(preferenceData);
+            } else {
+                displayResults(null);
+            }
+        }
+
+        function setDraftState(preferenceData, createdAt) {
+            // closed-notice 숨기기
+            const closedNotice = document.getElementById('closed-notice');
+            if (closedNotice) {
+                closedNotice.style.display = 'none';
+            }
+            
+            // 제출 정보 숨기기
+            const submitInfo = document.getElementById('submit-info');
+            if (submitInfo) {
+                submitInfo.style.display = 'none';
+            }
+            
+            // 입력 필드 활성화
+            document.getElementById('wanted-input').disabled = false;
+            document.getElementById('wanted-input').placeholder = '희망 근무 내용을 입력하세요';
+            
+            // 희망사항 확인 버튼 활성화
+            const confirmBtn = document.querySelector('#nurse-view button');
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = '희망사항 확인';
+
+            // 최종 제출 버튼으로 변경
+            const submitBtn = document.getElementById('final-submit-btn');
+            submitBtn.textContent = '최종 제출';
+            submitBtn.onclick = finalSubmit;
+            document.getElementById('submit-section').style.display = 'block';
+
+            // 데이터 표시
+            if (preferenceData) {
+                document.getElementById('wanted-input').value = preferenceData.request || '';
+                displayResults(preferenceData);
+                document.getElementById('result-container').style.display = 'block';
+                
+                // Draft 정보 표시
+                if (createdAt) {
+                    const submitSection = document.getElementById('submit-section');
+                    let draftInfo = document.getElementById('draft-info');
+                    if (!draftInfo) {
+                        draftInfo = document.createElement('div');
+                        draftInfo.id = 'draft-info';
+                        draftInfo.style.cssText = `
+                            background: #fff3cd;
+                            border: 1px solid #ffeaa7;
+                            color: #856404;
+                            padding: 10px;
+                            border-radius: 5px;
+                            margin-bottom: 10px;
+                            font-size: 14px;
+                        `;
+                        submitSection.insertBefore(draftInfo, submitBtn);
+                    }
+                    draftInfo.textContent = `임시 저장됨 (${new Date(createdAt).toLocaleString('ko-KR')})`;
+                    draftInfo.style.display = 'block';
+                }
+            } else {
+                document.getElementById('wanted-input').value = '';
+                document.getElementById('result-container').style.display = 'none';
+                
+                // Draft 정보 숨기기
+                const draftInfo = document.getElementById('draft-info');
+                if (draftInfo) {
+                    draftInfo.style.display = 'none';
+                }
+            }
+        }
+
+        function setClosedState() {
+            // 페이지 오버레이는 숨기고, 폼만 비활성화
+            const pageStatusDiv = document.getElementById('page-status');
+            pageStatusDiv.style.display = 'none';
+            
+            // 폼 영역 비활성화
+            document.getElementById('wanted-input').disabled = true;
+            document.getElementById('wanted-input').value = '';
+            document.getElementById('wanted-input').placeholder = `${activeYear}년 ${activeMonth}월 wanted 작성이 마감되었습니다.`;
+            
+            const button = document.querySelector('#nurse-view button');
+            if (button) {
+                button.disabled = true;
+                button.textContent = '마감됨';
+            }
+            
+            // 결과 컨테이너와 제출 섹션 숨기기
+            document.getElementById('result-container').style.display = 'none';
+            document.getElementById('submit-section').style.display = 'none';
+            
+            // 안내 메시지 표시 (오버레이 없이)
+            const mainContent = document.querySelector('.main-content');
+            let closedNotice = document.getElementById('closed-notice');
+            if (!closedNotice) {
+                closedNotice = document.createElement('div');
+                closedNotice.id = 'closed-notice';
+                closedNotice.style.cssText = `
+                    background: #fff3cd;
+                    border: 1px solid #ffeaa7;
+                    color: #856404;
+                    padding: 15px;
+                    border-radius: 8px;
+                    margin: 20px 0;
+                    text-align: center;
+                    font-weight: 500;
+                `;
+                mainContent.insertBefore(closedNotice, mainContent.firstChild);
+            }
+            closedNotice.textContent = `${activeYear}년 ${activeMonth}월 wanted 작성이 마감되었습니다. 다른 월을 선택해주세요.`;
+            closedNotice.style.display = 'block';
+        }
+
+        async function fetchNurseSchema() {
+             try {
+                console.log('간호사 스키마 API 호출 중...');
+                const response = await fetch('/nurses');
+                console.log('간호사 API 응답 상태:', response.status, response.statusText);
+                
+                 if (!response.ok) {
+                    if (response.status === 401) {
+                        console.log('인증 실패, 로그인 페이지로 리다이렉트');
+                        window.location.href = '/login';
+                        return;
+                    }
+                    throw new Error('간호사 정보를 불러오는데 실패했습니다.');
+                }
+                fullNurseSchema = await response.json();
+                console.log('불러온 간호사 스키마:', fullNurseSchema);
+            } catch(error) {
+                console.error('fetchNurseSchema 오류:', error);
+                throw error;  // 상위로 오류 전파
+            }
+        }
+
+        async function submitRequest() {
+            const wantedInput = document.getElementById('wanted-input').value;
+            const loader = document.getElementById('cute-loader');
+            const resultContainer = document.getElementById('result-container');
+            const nurseCharacter = document.getElementById('nurse-character');
+            const loadingMessage = document.getElementById('loading-message');
+            const loadingSubtitle = document.getElementById('loading-subtitle');
+            
+            if (!wantedInput) {
+                alert('희망 근무 내용을 입력해주세요.');
+                return;
+            }
+
+            const payload = { request: wantedInput, schema: fullNurseSchema, case: null };
+            
+            // result-container를 먼저 표시하고 그 안에 로딩 표시
+            resultContainer.style.display = 'block';
+            loader.style.display = 'flex';
+            
+            // 1단계: 요청 분석중... (조사하는 애니메이션)
+            nurseCharacter.className = 'nurse-character investigating';
+            loadingMessage.textContent = '요청 분석중...';
+            loadingSubtitle.textContent = '고양이 간호사가 꼼꼼히 분석하고 있어요! 🔍';
+            
+            // 돋보기 추가
+            const magnifyingGlass = document.createElement('div');
+            magnifyingGlass.className = 'magnifying-glass';
+            nurseCharacter.appendChild(magnifyingGlass);
+
+            try {
+                // 3초 후 2단계로 전환
+                setTimeout(() => {
+                    // 돋보기 제거
+                    const oldMagnifyingGlass = nurseCharacter.querySelector('.magnifying-glass');
+                    if (oldMagnifyingGlass) {
+                        oldMagnifyingGlass.remove();
+                    }
+                    
+                    // 2단계: 요청 정리중... (문서 정리하는 애니메이션)
+                    nurseCharacter.className = 'nurse-character organizing';
+                    loadingMessage.textContent = '요청 정리중...';
+                    loadingSubtitle.textContent = '고양이 간호사가 깔끔하게 정리하고 있어요! 📋';
+                    
+                    // 서류 추가
+                    const papers = document.createElement('div');
+                    papers.className = 'papers';
+                    papers.innerHTML = '<div class="paper"></div><div class="paper"></div><div class="paper"></div>';
+                    nurseCharacter.appendChild(papers);
+                }, 3000);
+
+                const response = await fetch('/wanted/invoke', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'API 요청에 실패했습니다.');
+
+                console.log('activeYear:', activeYear, 'activeMonth:', activeMonth);
+                console.log('API 응답 데이터:', data);
+
+                if (!activeYear || !activeMonth) {
+                    throw new Error('년도와 월 정보가 없습니다. 먼저 스케줄을 선택해주세요.');
+                }
+
+                const preferencePayload = {
+                    year: activeYear,
+                    month: activeMonth,
+                    data: { ...data.response, request: wantedInput } // Save the original text request as well
+                };
+
+                console.log('전송할 데이터:', JSON.stringify(preferencePayload, null, 2));
+
+                const saveResponse = await fetch('/preferences', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(preferencePayload)
+                });
+
+                if (!saveResponse.ok) {
+                    const errorData = await saveResponse.json();
+                    console.error('저장 에러:', errorData);
+                    throw new Error(`저장 실패: ${errorData.detail || saveResponse.statusText}`);
+                }
+
+                // 로딩 숨기고 결과 표시
+                loader.style.display = 'none';
+                displayResults(preferencePayload.data);
+
+            } catch (error) {
+                console.error('Error:', error);
+                loader.style.display = 'none';
+                document.getElementById('result-display').textContent = `오류가 발생했습니다: ${error.message}`;
+            } finally {
+                // 애니메이션 정리
+                setTimeout(() => {
+                    // 모든 추가 요소 제거
+                    const magnifyingGlass = nurseCharacter.querySelector('.magnifying-glass');
+                    const papers = nurseCharacter.querySelector('.papers');
+                    if (magnifyingGlass) magnifyingGlass.remove();
+                    if (papers) papers.remove();
+                    
+                    // 클래스 초기화
+                    nurseCharacter.className = 'nurse-character';
+                }, 500);
+            }
+        }
+
+        function displayResults(data) {
+            const resultDisplay = document.getElementById('result-display');
+            resultDisplay.innerHTML = '';
+
+            if (!data) {
+                resultDisplay.innerHTML = '표시할 결과가 없습니다.';
+                return;
+            }
+            
+            let shiftHtml = '<div><h3>희망 근무</h3><table class="result-table"><tr><th>Shift</th><th>날짜</th></tr>';
+            if (data.shift && Object.keys(data.shift).length > 0) {
+                for (const [shift, dates] of Object.entries(data.shift)) {
+                    // Dates can be an object or an array from different versions
+                    const dateKeys = Array.isArray(dates) ? dates : Object.keys(dates);
+                    for (const date of dateKeys) {
+                         shiftHtml += `<tr><td>${shift}</td><td>${date}</td></tr>`;
+                    }
+                }
+            } else {
+                shiftHtml += '<tr><td colspan="2">없음</td></tr>';
+            }
+            shiftHtml += '</table></div>';
+
+            let prefHtml = '<div><h3>동료 선호</h3><table class="result-table"><tr><th>간호사</th><th>선호도</th></tr>';
+            if (data.preference && data.preference.length > 0) {
+                 data.preference.forEach(p => {
+                    // 스키마에 존재하는 간호사인지 확인
+                    const nurse = fullNurseSchema.find(n => n.nurse_id === p.id);
+                    if (nurse && p.id) { // 유효한 간호사이고 ID가 존재할 때만 표시
+                        const preference = p.weight > 0 ? '선호' : '비선호';
+                        prefHtml += `<tr><td>${nurse.name}</td><td>${preference}</td></tr>`;
+                    }
+                });
+                
+                // 유효한 선호 데이터가 하나도 없으면 "없음" 표시
+                const validPreferences = data.preference.filter(p => {
+                    const nurse = fullNurseSchema.find(n => n.nurse_id === p.id);
+                    return nurse && p.id;
+                });
+                
+                if (validPreferences.length === 0) {
+                    prefHtml += '<tr><td colspan="2">없음</td></tr>';
+                }
+            } else {
+                prefHtml += '<tr><td colspan="2">없음</td></tr>';
+            }
+            prefHtml += '</table></div>';
+
+            resultDisplay.innerHTML = shiftHtml + prefHtml;
+        }
+
+        async function finalSubmit() {
+            if (!confirm('최종 제출하시겠습니까?')) return;
+            
+            // 현재 최신 데이터 확인
+            const latestResponse = await fetch(`/preferences/latest?year=${activeYear}&month=${activeMonth}`);
+            const latestData = await latestResponse.json();
+
+            let endpoint = '/preferences/submit';
+            let body = JSON.stringify({ year: activeYear, month: activeMonth });
+
+            if (!latestData.preference_data) {
+                endpoint = '/preferences/submit/empty';
+            }
+
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: body
+                });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || '제출에 실패했습니다.');
+                }
+                
+                alert('성공적으로 제출되었습니다.');
+                
+                // 리다이렉트 대신 현재 상태를 업데이트하여 데이터 유지
+                await checkWantedStatus();
+                
+            } catch (error) {
+                alert('제출에 실패했습니다: ' + error.message);
+            }
+        }
+
+        async function retractSubmission() {
+            if (!confirm('제출을 철회하고 수정하시겠습니까?')) return;
+            
+            try {
+                const response = await fetch('/preferences/retract', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ year: activeYear, month: activeMonth })
+                });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || '철회에 실패했습니다.');
+                }
+                
+                alert('제출이 철회되었습니다. 다시 수정할 수 있습니다.');
+                
+                // 현재 상태를 업데이트하여 편집 모드로 전환
+                await checkWantedStatus();
+                
+            } catch (error) {
+                alert('철회에 실패했습니다: ' + error.message);
+            }
+        }
+
+        async function logout() {
+            await fetch('/auth/logout', { method: 'POST' });
+            window.location.href = '/login';
+        }
+
+        // 탭 전환 기능
+        function switchTab(tabIndex) {
+            const tabButtons = document.querySelectorAll('.tab-button');
+            const tabContent = document.getElementById('tab-content');
+            
+            // 탭 버튼 활성화 상태 업데이트
+            tabButtons.forEach((button, index) => {
+                if (index === tabIndex) {
+                    button.classList.add('active');
+                } else {
+                    button.classList.remove('active');
+                }
+            });
+            
+            // 탭 내용 슬라이딩
+            if (tabIndex === 0) {
+                tabContent.classList.remove('slide-to-second');
+            } else {
+                tabContent.classList.add('slide-to-second');
+                // 두 번째 탭이 활성화될 때 희망사항 현황 로드
+                if (activeYear && activeMonth) {
+                    loadWishStatus();
+                }
+            }
+        }
+
+        // 희망사항 현황 로드
+        async function loadWishStatus() {
+            if (!activeYear || !activeMonth) {
+                document.getElementById('wish-table-content').innerHTML = 
+                    '<div class="loading-status">월을 선택하면 해당 월의 전체 희망사항 현황을 확인할 수 있습니다.</div>';
+                return;
+            }
+
+            try {
+                // 제목 업데이트
+                document.getElementById('wish-table-title').textContent = 
+                    `${activeYear}년 ${activeMonth}월 전체 희망사항 현황`;
+
+                // 로딩 상태 표시
+                document.getElementById('wish-table-content').innerHTML = 
+                    '<div class="loading-status">희망사항 현황을 불러오는 중...</div>';
+
+                // 희망사항 데이터 로드
+                const wishResponse = await fetch(`/preferences/all?year=${activeYear}&month=${activeMonth}`);
+                if (!wishResponse.ok) {
+                    throw new Error('희망사항 데이터를 불러올 수 없습니다.');
+                }
+                const wishData = await wishResponse.json();
+                /* ✅ (2) 휴일 데이터 */
+                await loadHolidayDates(activeYear, activeMonth);
+                // 테이블 생성
+                renderWishTable(wishData);
+
+            } catch (error) {
+                console.error('희망사항 현황 로드 오류:', error);
+                document.getElementById('wish-table-content').innerHTML = 
+                    `<div class="loading-status" style="color: #dc3545;">오류: ${error.message}</div>`;
+            }
+        }
+/* 공휴일 Set ↩︎  ex) '2025-10-03' */
+function getKoreanHolidays(year) {
+  const hd = new Holidays('KR');           // ISO-3166 KR
+  //   ①  양·음력 모두 포함
+  //   ②  'substitutes': 대체휴일 포함 여부 → default = true
+  const list = hd.getHolidays(year);
+
+  // hd.getHolidays(year) 는
+  //   [{date:'2025-01-01', type:'public', name:'신정', ...}, ...]
+  return new Set(list.map(o => o.date));   // Set<YYYY-MM-DD>
+}
+
+// /* 주말 또는 공휴일 여부 */
+// function isWeekendOrHoliday(dateObj, holidaySet) {
+//   if ([0,6].includes(dateObj.getDay())) return true;             // 토·일
+//   return holidaySet.has(dateObj.toISOString().slice(0,10));      // 공휴일
+// }
+
+
+/* ───────── renderWishTable  ───────── */
+async function renderWishTable() {
+  const container = document.getElementById('wish-table-content');
+
+  /* 0) 이번 달 전체 wishData를 한 번만 가져오기 */
+  const res = await fetch(`/preferences/all?year=${activeYear}&month=${activeMonth}`);
+  if (!res.ok) {
+    container.innerHTML = '<div class="loading-status">희망사항을 불러올 수 없습니다.</div>';
+    return;
+  }
+  const wishDataArr = await res.json();               // [{nurse_id, preference_data:{shift:{...}}}, …]
+  
+  /* 1) nurse_id → OFF-날짜[] 맵 만들기 (공통 유틸 재사용) */
+  const offMap = (window.PrefsUtils && window.PrefsUtils.buildOffDateMap)
+    ? window.PrefsUtils.buildOffDateMap(wishDataArr, activeYear, activeMonth)
+    : (function(){
+        const m = new Map();
+        wishDataArr.forEach(w => {
+          const shifts = w.data?.shift ?? {};
+          const offRaw  = shifts.O;
+          if (!offRaw) return;
+          let list = Array.isArray(offRaw) ? offRaw : Object.keys(offRaw);
+          list = list.map(d => d.includes('-') ? d : `${activeYear}-${String(activeMonth).padStart(2,'0')}-${String(d).padStart(2,'0')}`);
+          m.set(w.nurse_id, list);
+        });
+        return m;
+      })();
+
+  /* 2) 테이블 뼈대 */
+  const daysInMonth = new Date(activeYear, activeMonth, 0).getDate();
+  let html = '<table class="wish-table"><thead><tr><th>간호사</th>';
+  for (let d = 1; d <= daysInMonth; d++) html += `<th>${d}</th>`;
+  html += '</tr></thead><tbody>';
+
+  /* 3) 간호사 행 */
+  fullNurseSchema.forEach(nurse => {
+    const offDates = offMap.get(nurse.nurse_id) || []; // 없으면 빈 배열
+
+    html += `<tr>
+               <td>${nurse.name}<br><small style="color:#6c757d;">${nurse.experience}년차</small></td>`;
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateStr = `${activeYear}-${String(activeMonth).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      const isOff = offDates.includes(dateStr);
+      const isHol  = holidayDates.has(dateStr);         // 🆕 휴일·주말?
+      const cellClass = isHol ? 'holiday-cell' : '';    // 🆕
+      html += `<td class="${cellClass}">${
+        isOff
+          ? `<div class="wish-cell off-weighted">
+                 <div class="shift-marker shift-OFF diagonal" title="OFF"></div>
+             </div>`
+          : '<div class="wish-cell"></div>'
+      }</td>`;
+    }
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+        // shift 타입에 따른 CSS 클래스 반환
+        function getShiftClass(shiftType) {
+            const upperShift = shiftType.toUpperCase();
+            switch(upperShift) {
+                case 'D':
+                case 'DAY':
+                    return 'shift-D';
+                case 'E':
+                case 'EVENING':
+                    return 'shift-E';
+                case 'N':
+                case 'NIGHT':
+                    return 'shift-N';
+                case 'O':
+                    return 'shift-O';
+                default:
+                    return 'shift-custom';
+            }
+        }
+
+
+        
+        // 캘린더 업데이트
+        async function updateCalendar() {
+            if (!activeYear || !activeMonth) {
+                document.getElementById('calendar-container').style.display = 'none';
+                return;
+            }
+            
+            // shifts 데이터 먼저 로드
+            await loadShifts();
+            
+            // 캘린더 항상 표시하도록 변경 (기존 조건 제거)
+            try {
+                await loadCalendarData();
+                renderShiftSelector();
+                renderCalendar();
+                document.getElementById('calendar-container').style.display = 'block';
+            } catch (error) {
+                console.error('캘린더 업데이트 오류:', error);
+                document.getElementById('calendar-container').style.display = 'none';
+            }
+        }
+        
+        // Shifts 데이터 로드 함수 추가
+        async function loadShifts() {
+            try {
+                const response = await fetch('/shifts');
+                if (!response.ok) {
+                    throw new Error('Shifts 데이터를 가져올 수 없습니다.');
+                }
+                availableShifts = await response.json();
+                console.log('로드된 shifts:', availableShifts);
+            } catch (error) {
+                console.error('Shifts 로딩 실패:', error);
+                // 기본 shifts로 fallback
+                availableShifts = [
+                    {shift_id: 'D', name: 'Day', color: '#87CEEB'},
+                    {shift_id: 'E', name: 'Evening', color: '#DDA0DD'},
+                    {shift_id: 'N', name: 'Night', color: '#4169E1'},
+                    {shift_id: 'O', name: 'Off', color: '#90EE90'}
+                ];
+            }
+        }
+        
+        // 캘린더 초기화
+        async function initializeCalendar() {
+            // loadShifts는 updateCalendar에서 이미 호출되므로 중복 제거
+            console.log('캘린더 초기화 시작');
+            await loadCalendarData();
+            renderShiftSelector();
+            renderCalendar();
+            console.log('캘린더 초기화 완료');
+        }
+        
+        // 기존 선호도 데이터를 캘린더 데이터로 변환
+        async function loadCalendarData() {
+            calendarData = {};
+            
+            try {
+                const response = await fetch(`/preferences/latest?year=${activeYear}&month=${activeMonth}`);
+                if (!response.ok) {
+                    console.log('선호도 데이터가 없습니다.');
+                    return;
+                }
+                
+                const data = await response.json();
+                if (!data.preference_data || !data.preference_data.shift) {
+                    console.log('shift 데이터가 없습니다.');
+                    return;
+                }
+                
+                // 기존 shift 데이터를 캘린더 형식으로 변환
+                const shifts = data.preference_data.shift;
+                for (const [shiftType, dates] of Object.entries(shifts)) {
+                    const dateList = Array.isArray(dates) ? dates : Object.keys(dates);
+                    for (const dateStr of dateList) {
+                        // 날짜 형식 처리 개선
+                        let formattedDate;
+                        if (dateStr.includes('-')) {
+                            // 이미 YYYY-MM-DD 형식인 경우
+                            formattedDate = dateStr;
+                        } else {
+                            // 단순 일자인 경우 (예: "15")
+                            const day = parseInt(dateStr);
+                            formattedDate = `${activeYear}-${String(activeMonth).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                        }
+                        console.log('🟡 formattedDate =', formattedDate);
+                        console.log('🟡 shiftType =', shiftType);
+                        calendarData[formattedDate] = {
+                            shift: shiftType,
+                            reason: '기존 데이터에서 로드됨'
+                        };
+                    }
+                }
+                console.log('로드된 캘린더 데이터:', calendarData);
+            } catch (error) {
+                console.error('캘린더 데이터 로드 오류:', error);
+            }
+        }
+        
+        // Shift 선택기 렌더링
+        function renderShiftSelector() {
+            const container = document.getElementById('shift-buttons-container');
+            container.innerHTML = '';
+            
+            availableShifts.forEach(shift => {
+                const btn = document.createElement('button');
+                btn.className = 'shift-btn';
+                btn.textContent = shift.shift_id;
+                btn.style.background = shift.color;
+                btn.style.color = isLightColor(shift.color) ? '#000' : '#fff';
+                btn.onclick = () => selectShift(shift.shift_id);
+                
+                if (selectedShift === shift.shift_id) {
+                    btn.classList.add('selected');
+                }
+                
+                container.appendChild(btn);
+            });
+        }
+        
+        // 색상이 밝은지 판단
+        function isLightColor(color) {
+            const rgb = parseInt(color.slice(1), 16);
+            const r = (rgb >> 16) & 0xff;
+            const g = (rgb >>  8) & 0xff;
+            const b = (rgb >>  0) & 0xff;
+            const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+            return brightness > 155;
+        }
+        
+        // Shift 선택
+        function selectShift(shiftId) {
+            selectedShift = shiftId;
+            renderShiftSelector(); // 버튼 상태 업데이트
+        }
+        
+        // 캘린더 렌더링
+        function renderCalendar() {
+            const title = document.getElementById('calendar-title');
+            const tbody = document.getElementById('calendar-body');
+            
+            title.textContent = `${activeYear}년 ${activeMonth}월 희망 근무 캘린더`;
+            tbody.innerHTML = '';
+            
+            const firstDay = new Date(activeYear, activeMonth - 1, 1);
+            const lastDay = new Date(activeYear, activeMonth, 0);
+            const daysInMonth = lastDay.getDate();
+            const startDay = firstDay.getDay();
+            
+            let week = [];
+            let currentWeek = document.createElement('tr');
+            
+            // 이전 달 날짜들로 첫 주 채우기
+            for (let i = 0; i < startDay; i++) {
+                const td = document.createElement('td');
+                td.className = 'other-month';
+                const prevDate = new Date(firstDay);
+                prevDate.setDate(prevDate.getDate() - (startDay - i));
+                td.innerHTML = `<div class="calendar-date">${prevDate.getDate()}</div>`;
+                currentWeek.appendChild(td);
+            }
+            
+            // 현재 달 날짜들
+            for (let day = 1; day <= daysInMonth; day++) {
+                const td = document.createElement('td');
+                const dateStr = `${activeYear}-${String(activeMonth).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                
+                td.innerHTML = `<div class="calendar-date">${day}</div>`;
+                td.onclick = () => openModal(dateStr, day);
+                
+                // 기존 데이터가 있으면 표시
+                if (calendarData[dateStr]) {
+                    const shift = availableShifts.find(s => s.shift_id === calendarData[dateStr].shift);
+                    if (shift) {
+                        const marker = document.createElement('div');
+                        marker.className = 'calendar-shift-marker';
+                        marker.textContent = shift.shift_id;
+                        marker.style.background = shift.color;
+                        marker.style.color = isLightColor(shift.color) ? '#000' : '#fff';
+                        marker.title = calendarData[dateStr].reason;
+                        td.querySelector('.calendar-date').appendChild(marker);
+                    }
+                }
+                
+                currentWeek.appendChild(td);
+                
+                // 주 완성시 테이블에 추가
+                if (currentWeek.children.length === 7) {
+                    tbody.appendChild(currentWeek);
+                    currentWeek = document.createElement('tr');
+                }
+            }
+            
+            // 다음 달 날짜들로 마지막 주 채우기
+            const remainingCells = 7 - currentWeek.children.length;
+            for (let i = 1; i <= remainingCells; i++) {
+                const td = document.createElement('td');
+                td.className = 'other-month';
+                td.innerHTML = `<div class="calendar-date">${i}</div>`;
+                currentWeek.appendChild(td);
+            }
+            
+            if (currentWeek.children.length > 0) {
+                tbody.appendChild(currentWeek);
+            }
+        }
+        
+        // 모달 열기
+        function openModal(dateStr, day) {
+            modalSelectedDate = dateStr;
+            modalSelectedShift = null;
+            
+            document.getElementById('modal-title').textContent = `${activeYear}년 ${activeMonth}월 ${day}일`;
+            
+            // 모달 shift 버튼들 렌더링
+            renderModalShifts();
+            
+            // 기존 데이터가 있으면 설정
+            if (calendarData[dateStr]) {
+                modalSelectedShift = calendarData[dateStr].shift;
+                document.getElementById('reason-input').value = calendarData[dateStr].reason || '';
+                renderModalShifts(); // 선택 상태 업데이트
+            } else {
+                document.getElementById('reason-input').value = '';
+            }
+            
+            document.getElementById('modal-overlay').style.display = 'flex';
+        }
+        
+        // 모달 shift 버튼들 렌더링
+        function renderModalShifts() {
+            const container = document.getElementById('modal-shifts');
+            container.innerHTML = '';
+            
+            availableShifts.forEach(shift => {
+                const btn = document.createElement('button');
+                btn.className = 'modal-shift-btn';
+                btn.textContent = shift.name;
+                btn.style.background = shift.color;
+                btn.style.color = isLightColor(shift.color) ? '#000' : '#fff';
+                btn.onclick = () => selectModalShift(shift.shift_id);
+                
+                if (modalSelectedShift === shift.shift_id) {
+                    btn.classList.add('selected');
+                }
+                
+                container.appendChild(btn);
+            });
+        }
+        
+        // 모달에서 shift 선택
+        function selectModalShift(shiftId) {
+            modalSelectedShift = shiftId;
+            renderModalShifts(); // 버튼 상태 업데이트
+        }
+        
+        // 모달 닫기
+        function closeModal() {
+            document.getElementById('modal-overlay').style.display = 'none';
+            modalSelectedDate = null;
+            modalSelectedShift = null;
+        }
+        
+        // 모달 확인
+        function confirmModal() {
+            if (!modalSelectedShift) {
+                alert('근무 코드를 선택해주세요.');
+                return;
+            }
+            
+            const reason = document.getElementById('reason-input').value.trim();
+            if (!reason) {
+                alert('사유를 입력해주세요.');
+                return;
+            }
+            
+            // 캘린더 데이터에 저장
+            calendarData[modalSelectedDate] = {
+                shift: modalSelectedShift,
+                reason: reason
+            };
+            
+            // 캘린더 다시 렌더링
+            renderCalendar();
+            
+            // 모달 닫기
+            closeModal();
+        }
+        
+        // 캘린더 데이터 제출
+        async function submitCalendarData() {
+            if (Object.keys(calendarData).length === 0) {
+                alert('선택된 날짜가 없습니다.');
+                return;
+            }
+            
+            // case와 request 배열 구성
+            const cases = [];
+            const requests = [];
+            
+            for (const [dateStr, data] of Object.entries(calendarData)) {
+                const date = new Date(dateStr);
+                const day = date.getDate();
+                
+                cases.push({
+                    date: dateStr,
+                    shift: data.shift
+                });
+                
+                requests.push(`${day}일은 ${data.shift}를 원하며 이유는 ${data.reason}입니다`);
+            }
+            
+            // 전체 요청 텍스트 구성
+            // const fullRequest = requests.join('. ');
+            const fullRequest = requests;
+            
+            // submitRequest와 유사한 로직으로 처리
+            const loader = document.getElementById('cute-loader');
+            const resultContainer = document.getElementById('result-container');
+            const nurseCharacter = document.getElementById('nurse-character');
+            const loadingMessage = document.getElementById('loading-message');
+            const loadingSubtitle = document.getElementById('loading-subtitle');
+            
+            const payload = { 
+                request: fullRequest, 
+                schema: fullNurseSchema, 
+                case: cases 
+            };
+            
+            // result-container를 먼저 표시하고 그 안에 로딩 표시
+            resultContainer.style.display = 'block';
+            loader.style.display = 'flex';
+            
+            // 1단계: 요청 분석중... (조사하는 애니메이션)
+            nurseCharacter.className = 'nurse-character investigating';
+            loadingMessage.textContent = '캘린더 데이터 분석중...';
+            loadingSubtitle.textContent = '고양이 간호사가 일정을 정리하고 있어요! 📅';
+            
+            // 돋보기 추가
+            const magnifyingGlass = document.createElement('div');
+            magnifyingGlass.className = 'magnifying-glass';
+            nurseCharacter.appendChild(magnifyingGlass);
+
+            try {
+                // 3초 후 2단계로 전환
+                setTimeout(() => {
+                    // 돋보기 제거
+                    const oldMagnifyingGlass = nurseCharacter.querySelector('.magnifying-glass');
+                    if (oldMagnifyingGlass) {
+                        oldMagnifyingGlass.remove();
+                    }
+                    
+                    // 2단계: 요청 정리중... (문서 정리하는 애니메이션)
+                    nurseCharacter.className = 'nurse-character organizing';
+                    loadingMessage.textContent = '요청 정리중...';
+                    loadingSubtitle.textContent = '고양이 간호사가 깔끔하게 정리하고 있어요! 📋';
+                    
+                    // 서류 추가
+                    const papers = document.createElement('div');
+                    papers.className = 'papers';
+                    papers.innerHTML = '<div class="paper"></div><div class="paper"></div><div class="paper"></div>';
+                    nurseCharacter.appendChild(papers);
+                }, 3000);
+
+                const response = await fetch('/wanted/invoke', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'API 요청에 실패했습니다.');
+
+                console.log('activeYear:', activeYear, 'activeMonth:', activeMonth);
+                console.log('API 응답 데이터:', data);
+
+                if (!activeYear || !activeMonth) {
+                    throw new Error('년도와 월 정보가 없습니다. 먼저 스케줄을 선택해주세요.');
+                }
+
+                const preferencePayload = {
+                    year: activeYear,
+                    month: activeMonth,
+                    data: { ...data.response, request: fullRequest }
+                };
+
+                console.log('전송할 데이터:', JSON.stringify(preferencePayload, null, 2));
+
+                const saveResponse = await fetch('/preferences', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(preferencePayload)
+                });
+
+                if (!saveResponse.ok) {
+                    const errorData = await saveResponse.json();
+                    console.error('저장 에러:', errorData);
+                    throw new Error(`저장 실패: ${errorData.detail || saveResponse.statusText}`);
+                }
+
+                // 로딩 숨기고 결과 표시
+                loader.style.display = 'none';
+                displayResults(preferencePayload.data);
+                
+                // 텍스트 입력 필드도 업데이트
+                document.getElementById('wanted-input').value = fullRequest;
+                
+                alert('캘린더 데이터가 성공적으로 반영되었습니다.');
+
+            } catch (error) {
+                console.error('Error:', error);
+                loader.style.display = 'none';
+                document.getElementById('result-display').textContent = `오류가 발생했습니다: ${error.message}`;
+                alert('오류가 발생했습니다: ' + error.message);
+            } finally {
+                // 애니메이션 정리
+                setTimeout(() => {
+                    // 모든 추가 요소 제거
+                    const magnifyingGlass = nurseCharacter.querySelector('.magnifying-glass');
+                    const papers = nurseCharacter.querySelector('.papers');
+                    if (magnifyingGlass) magnifyingGlass.remove();
+                    if (papers) papers.remove();
+                    
+                    // 클래스 초기화
+                    nurseCharacter.className = 'nurse-character';
+                }, 500);
+            }
+        }
+    </script>
+    <script>
+        function toggleNav() {
+            const sidebar = document.getElementById("mySidebar");
+            const main = document.getElementById("main");
+            const toggleBtn = document.querySelector(".sidebar-toggle-btn i");
+
+            const isOpen = sidebar.style.width === "250px";
+            if (isOpen) {
+                sidebar.style.width = "0";
+                main.style.marginLeft = "0";
+                toggleBtn.classList.remove('fa-angles-left');
+                toggleBtn.classList.add('fa-angles-right');
+            } else {
+                sidebar.style.width = "250px";
+                main.style.marginLeft = "250px";
+                toggleBtn.classList.remove('fa-angles-right');
+                toggleBtn.classList.add('fa-angles-left');
+            }
+        }
+    </script>
+</body>
+</html>

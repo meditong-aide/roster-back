@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>아이디 찾기</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .auth-container {
+            max-width: 500px;
+            margin: 100px auto;
+            padding: 30px;
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        /* 초기에는 동적 인증 필드를 모두 숨김 */
+        .auth-fields {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="auth-container">
+        <h2 class="mb-4 text-center text-primary">아이디 찾기</h2>
+
+        <form method="POST" action="/auth/find_id">
+
+            <div class="mb-3">
+            <div class="mb-3">
+                <label for="auth_method" class="form-label fw-bold">인증 방식 선택</label>
+                <select class="form-select" id="auth_method" name="auth_method" onchange="toggleAuthFields(this.value)" required>
+                    <option value="" disabled selected>인증 방식을 선택해 주세요</option>
+                    <option value="bio">이름 + 생년월일 + 성별</option>
+                    <option value="phone">이름 + 휴대폰 번호</option>
+                    <option value="email">이름 + 이메일 주소</option>
+                </select>
+            </div>
+
+            <div class="mb-3">
+                <label for="name" class="form-label fw-bold">이름</label>
+                <input type="text" class="form-control" id="EmployeeName" name="EmployeeName" placeholder="이름을 입력하세요" required>
+            </div>
+
+            <div id="auth_bio" class="auth-fields">
+                <h5 class="mt-4 mb-3 border-bottom pb-1">생년월일/성별 인증</h5>
+
+                <div class="mb-3">
+                    <label for="birth_date" class="form-label">생년월일</label>
+                    <input type="date" class="form-control" id="DateOfBirth" name="DateOfBirth">
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label">성별</label>
+                    <div class="d-flex">
+                        <div class="form-check me-4">
+                            <input class="form-check-input" type="radio" name="gender" id="gender_male" value="Y">
+                            <label class="form-check-label" for="gender_male">남</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="gender" id="gender_female" value="N">
+                            <label class="form-check-label" for="gender_female">여</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="auth_phone" class="auth-fields">
+                <h5 class="mt-4 mb-3 border-bottom pb-1">휴대폰 번호 인증</h5>
+                <div class="mb-3">
+                    <label for="phone_number" class="form-label">휴대폰 번호</label>
+                    <input type="tel" class="form-control" id="PortableTel" name="PortableTel" placeholder="예: 010-1234-5678">
+                </div>
+            </div>
+
+            <div id="auth_email" class="auth-fields">
+                <h5 class="mt-4 mb-3 border-bottom pb-1">이메일 주소 인증</h5>
+                <div class="mb-3">
+                    <label for="email_address" class="form-label">이메일 주소</label>
+                    <input type="email" class="form-control" id="Email" name="Email" placeholder="예: user@example.com">
+                </div>
+            </div>
+
+            <div class="d-grid mt-5">
+                <button type="submit" class="btn btn-primary btn-lg">아이디 찾기</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+    /**
+     * 선택된 인증 방식에 따라 해당 입력 필드 그룹만 보이도록 처리합니다.
+     */
+    function toggleAuthFields(method) {
+        // 모든 인증 필드 그룹을 숨깁니다.
+        document.querySelectorAll('.auth-fields').forEach(div => {
+            div.style.display = 'none';
+            // 필수 필드 속성을 일시적으로 해제하여 제출 시 오류가 나지 않도록 합니다.
+            div.querySelectorAll('input, select').forEach(input => {
+                input.removeAttribute('required');
+            });
+        });
+
+        const targetId = 'auth_' + method;
+        const targetDiv = document.getElementById(targetId);
+
+        if (targetDiv) {
+            // 선택된 인증 필드 그룹만 보이게 합니다.
+            targetDiv.style.display = 'block';
+
+            // 해당 그룹의 입력 필드에 required 속성을 추가합니다.
+            targetDiv.querySelectorAll('input, select').forEach(input => {
+                input.setAttribute('required', 'required');
+            });
+        }
+    }
+
+    // 페이지 로드 시, 혹시 모를 상황을 대비하여 기본적으로 숨김 처리
+    document.addEventListener('DOMContentLoaded', () => {
+        toggleAuthFields('');
+    });
+</script>
+</body>
+</html>

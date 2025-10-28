@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>패스워드 찾기</title>
+    <style>
+        /* 기본적인 스타일 초기화 */
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+
+        /* 폼 컨테이너 스타일 */
+        #findPasswordForm {
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 400px; /* 폼의 최대 너비 설정 */
+        }
+
+        /* 폼 내부의 <h1> 태그 스타일 */
+        #findPasswordForm h1 {
+            text-align: center;
+            color: #333;
+            margin-top: 0;
+            margin-bottom: 25px;
+            font-size: 24px;
+        }
+
+        /* 입력 필드 그룹 스타일 */
+        #findPasswordForm > div {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+
+        /* 🚨 수정: Select Box 스타일 추가 및 기존 input 스타일 통일 */
+        input[type="text"],
+        input[type="tel"],
+        input[type="email"],
+        select {
+            width: 95%;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-sizing: border-box;
+            -webkit-appearance: none; /* iOS 및 Chrome 기본 스타일 제거 */
+            -moz-appearance: none;    /* Firefox 기본 스타일 제거 */
+            appearance: none;         /* 기본 스타일 제거 */
+            background-color: white;  /* 배경색 유지 */
+        }
+
+        /* Select focus 스타일 */
+        select:focus {
+            border-color: #007bff;
+            outline: none;
+            box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25);
+        }
+
+        /* 기존 라디오/체크박스 스타일 제거 */
+        /* .inline-label, .auth-method-container, .auth-method-group 스타일은 Select Box 사용으로 인해 불필요해져 제거하거나 아래처럼 통합함 */
+
+        /* 버튼 스타일 */
+        button[type="submit"] {
+            width: 100%;
+            padding: 12px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+
+        button[type="submit"]:hover {
+            background-color: #0056b3;
+        }
+
+        hr {
+            border: 0;
+            border-top: 1px solid #eee;
+            margin: 20px 0;
+        }
+
+        /* 숨김 처리 클래스 */
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <form id="findPasswordForm" method="POST" action="/auth/find_pw">
+        <h1>패스워드 찾기</h1>
+
+        <div>
+            <label for="auth_method_select">인증 방식 선택:</label>
+            <select id="auth_method_select" name="auth_method" onchange="toggleAuthFields()">
+                <option value="phone" selected>휴대폰 인증</option>
+                <option value="email">이메일 인증</option>
+            </select>
+        </div>
+
+        <hr>
+
+        <div>
+            <label for="memberID">아이디:</label>
+            <input type="text" id="memberID" name="memberID" required>
+        </div>
+        <div>
+            <label for="EmployeeName">이름:</label>
+            <input type="text" id="EmployeeName" name="EmployeeName" required>
+        </div>
+
+        <hr>
+
+        <div id="phone_fields">
+            <div>
+                <label for="receivenum">휴대폰 번호:</label>
+                <input type="tel" id="receivenum" name="receivenum" pattern="[0-9]{3}-[0-9]{3,4}-[0-9]{4}" placeholder="예: 010-1234-5678" required>
+            </div>
+        </div>
+
+        <div id="email_fields" class="hidden">
+            <div>
+                <label for="email">이메일 주소:</label>
+                <input type="email" id="email" name="email" required disabled>
+            </div>
+        </div>
+
+        <hr>
+
+        <div>
+            <button type="submit">인증 및 비밀번호 찾기</button>
+        </div>
+    </form>
+
+    <script>
+        // 🚨 변경: Select Box 기반으로 동작하도록 JavaScript 수정
+        function toggleAuthFields() {
+            const selectElement = document.getElementById('auth_method_select');
+            const selectedValue = selectElement.value; // 선택된 option의 value (phone 또는 email)
+
+            const phoneFields = document.getElementById('phone_fields');
+            const phoneNumberInput = document.getElementById('receivenum');
+
+            const emailFields = document.getElementById('email_fields');
+            const emailAddressInput = document.getElementById('email');
+
+            if (selectedValue === 'phone') {
+                // 휴대폰 인증 선택 시
+                phoneFields.classList.remove('hidden');
+                phoneNumberInput.required = true;
+                phoneNumberInput.disabled = false;
+
+                emailFields.classList.add('hidden');
+                emailAddressInput.required = false;
+                emailAddressInput.disabled = true;
+            } else if (selectedValue === 'email') {
+                // 이메일 인증 선택 시
+                phoneFields.classList.add('hidden');
+                phoneNumberInput.required = false;
+                phoneNumberInput.disabled = true;
+
+                emailFields.classList.remove('hidden');
+                emailAddressInput.required = true;
+                emailAddressInput.disabled = false;
+            }
+        }
+
+        // 페이지 로드 시 초기 상태 설정
+        document.addEventListener('DOMContentLoaded', toggleAuthFields);
+    </script>
+</body>
+</html>

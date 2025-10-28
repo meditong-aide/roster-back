@@ -1,0 +1,281 @@
+{% extends "layout.html" %}
+ {% block content %}
+            <main class="c_main__container">
+                <div class="w_tabContainer w_tabContainer--viewPage">
+                    <div class="comp_sec_margin comp_dateUIContainer comp_dateUIContainer--viewPage"
+                        style="margin-top: 0px;">
+                        <div class="d_dateUI"><button type="button"
+                                class="d_btn_changeDate d_btn_changeDate--prev"></button>
+                            <div class="d_dateWrap">
+                                <div class="d_date">2025년 11월</div>
+                                <div class="d_date_version">25.08.26_V6</div>
+                            </div><button type="button" class="d_btn_changeDate d_btn_changeDate--next"
+                                disabled=""></button>
+                        </div>
+                        <div class="d_shiftSummary">
+                            <div class="d_shiftSummaryCard">
+                                <div class="d_shiftSummary_shift" style="background-color: rgb(89, 219, 215);">D</div>
+                                <div class="d_shiftSummary_count">15</div>
+                            </div>
+                            <div class="d_shiftSummaryCard">
+                                <div class="d_shiftSummary_shift" style="background-color: rgb(114, 191, 255);">E</div>
+                                <div class="d_shiftSummary_count">2</div>
+                            </div>
+                            <div class="d_shiftSummaryCard">
+                                <div class="d_shiftSummary_shift" style="background-color: rgb(186, 176, 240);">N</div>
+                                <div class="d_shiftSummary_count">3</div>
+                            </div>
+                            <div class="d_shiftSummaryCard">
+                                <div class="d_shiftSummary_shift" style="background-color: rgb(255, 160, 210);">O</div>
+                                <div class="d_shiftSummary_count">10</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="view_calendarContainer">
+                        <div class="comp_calendar view_myRosterCalendar">
+                            <div class="view_myRosterCalendar_rowTemplate">
+                                <div class="view_myRosterCalendar_th">월</div>
+                                <div class="view_myRosterCalendar_th">화</div>
+                                <div class="view_myRosterCalendar_th">수</div>
+                                <div class="view_myRosterCalendar_th">목</div>
+                                <div class="view_myRosterCalendar_th">금</div>
+                                <div class="view_myRosterCalendar_th comp_calendar_date--sat">토</div>
+                                <div class="view_myRosterCalendar_th comp_calendar_date--sun">일</div>
+                            </div>
+                            <div class="view_myRosterCalendar_tbody">
+                                <div class="view_myRosterCalendar_rowTemplate">
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">27</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">28</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">29</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">30</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">31</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sat">1</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sun">2</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                </div>
+                                <div class="view_myRosterCalendar_rowTemplate">
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">3</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">4</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">5</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">6</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">7</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sat">8</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sun">9</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(114, 191, 255);">E</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                </div>
+                                <div class="view_myRosterCalendar_rowTemplate">
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">10</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(114, 191, 255);">E</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">11</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">12</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(186, 176, 240);">N</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">13</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">14</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sat">15</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sun">16</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                </div>
+                                <div class="view_myRosterCalendar_rowTemplate">
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">17</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">18</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">19</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(186, 176, 240);">N</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">20</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">21</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sat">22</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(186, 176, 240);">N</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sun">23</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                </div>
+                                <div class="view_myRosterCalendar_rowTemplate">
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">24</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">25</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">26</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">27</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date ">28</div><button type="button"
+                                            class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sat">29</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(89, 219, 215);">D</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td">
+                                        <div class="comp_calendar_date comp_calendar_date--sun">30</div><button
+                                            type="button" class="view_myRoster_shiftMarker "
+                                            style="background-color: rgb(255, 160, 210);">O</button>
+                                        <div class="view_myRoster_sticker view_sticker_image--00"></div>
+                                    </div>
+                                </div>
+                                <div class="view_myRosterCalendar_rowTemplate">
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">1</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">2</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">3</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">4</div>
+                                    </div>
+                                    <div class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth ">
+                                        <div class="comp_calendar_date">5</div>
+                                    </div>
+                                    <div
+                                        class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth comp_calendar_date--sat">
+                                        <div class="comp_calendar_date">6</div>
+                                    </div>
+                                    <div
+                                        class="view_myRosterCalendar_td view_myRosterCalendar_td--otherMonth comp_calendar_date--sun">
+                                        <div class="comp_calendar_date">7</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+{% endblock %}
