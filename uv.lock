@@ -81,6 +81,9 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/21/28/9b3f50ce0e048515135495f198351908d99540d69bfdc8c1d15b73dc55ce/blinker-1.9.0.tar.gz", hash = "sha256:b4ce2265a7abece45e7cc896e98dbebe6cead56bcf805a3d23136d145f5445bf", size = 22460 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/cb/f2ad4230dc2eb1a74edf38f1a38b9b52277f75bef262d8908e60d957e13c/blinker-1.9.0-py3-none-any.whl", hash = "sha256:ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc", size = 8458 },
+]
+
+[[package]]
 name = "boto3"
 version = "1.40.50"
 source = { registry = "https://pypi.org/simple" }
@@ -1056,8 +1059,6 @@ dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "fastapi-mail" },
     { name = "boto3" },
-    { name = "cryptography" },
-    { name = "fastapi", extra = ["standard"] },
     { name = "google-genai" },
     { name = "holidays" },
     { name = "langchain-anthropic" },
@@ -1073,7 +1074,6 @@ dependencies = [
     { name = "pandas" },
     { name = "passlib" },
     { name = "psutil" },
-    { name = "psutil" },
     { name = "pymssql" },
     { name = "pymysql" },
     { name = "python-jose" },
@@ -1085,12 +1085,10 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cryptography", specifier = ">=45.0.5" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115.12" },
     { name = "fastapi-mail", specifier = ">=1.5.2" },
     { name = "boto3", specifier = ">=1.40.50" },
     { name = "cryptography", specifier = ">=45.0.5" },
-    { name = "fastapi", extras = ["standard"], specifier = ">=0.115.12" },
     { name = "google-genai", specifier = ">=1.19.0" },
     { name = "holidays", specifier = ">=0.76" },
     { name = "langchain-anthropic", specifier = ">=0.3.17" },
@@ -1105,7 +1103,6 @@ requires-dist = [
     { name = "ortools", specifier = ">=9.12.4544" },
     { name = "pandas", specifier = ">=2.2.3" },
     { name = "passlib", specifier = ">=1.7.4" },
-    { name = "psutil", specifier = ">=7.0.0" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pymssql", specifier = ">=2.3.8" },
     { name = "pymysql", specifier = ">=1.1.1" },

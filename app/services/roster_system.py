@@ -304,8 +304,20 @@ class RosterSystem:
             for day in range(self.num_days):
                 # ── 2‑A. 야간 제약 3종 🔄
 
-                # Check shift requirements
-                for shift, required in self.config.daily_shift_requirements.items():
+                # Check shift requirements (일자별 요구치 우선 적용)
+                if (hasattr(self.config, 'daily_shift_requirements_by_day') and
+                    isinstance(self.config.daily_shift_requirements_by_day, list) and
+                    day < len(self.config.daily_shift_requirements_by_day)):
+                    need_map = self.config.daily_shift_requirements_by_day[day]
+                    # print('need_map1', need_map)
+                else:
+                    need_map = self.config.daily_shift_requirements
+                    # print('need_map2', need_map)
+
+                for shift, required in need_map.items():
+                    if shift not in self.config.shift_types:
+                        # print('컨티뉴')
+                        continue
                     shift_idx = self.config.shift_types.index(shift)
                     actual = np.sum(self.roster[:, day, shift_idx])
                     if actual < required:  # 필요 인원보다 적을 때만 위반으로 처리
