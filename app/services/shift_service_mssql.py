@@ -36,7 +36,6 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
 
     session = db
     try:
-        print(1)
         # 1) 조회
         shifts = (
             session.query(Shift)
@@ -44,7 +43,6 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
             .order_by(Shift.sequence.asc())
             .all()
         )
-        print(2)
         if shifts:
             return [
                 {
@@ -63,23 +61,20 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
                 }
                 for s in shifts
             ]
-        print(3)    
+
         # 2) 기본값 생성 (오피스/그룹은 존재한다고 가정; 없으면 office_id=None로 저장)
         # 기본값 생성
         office_id = None
-        print(4, 'current_user', current_user.__dict__)
-        # group = session.query(Group).filter(Group.group_id == current_user.group_id).first()
-        if current_user and current_user.office_id:
-            office_id = current_user.office_id
-            print(5, 'office_id', office_id)
+        group = session.query(Group).filter(Group.group_id == current_user.group_id).first()
+        if group and group.office_id:
+            office_id = group.office_id
         elif getattr(current_user, "office_id", None):
             office_id = current_user.office_id
-            print(6, 'office_id', office_id)
-        # else:
-        #     nurse = session.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-        #     if nurse and nurse.group and nurse.group.office_id:
-        #         office_id = nurse.group.office_id
-        #         print(7, 'office_id', office_id)
+        else:
+            nurse = session.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+            if nurse and nurse.group and nurse.group.office_id:
+                office_id = nurse.group.office_id
+
         def _mk(shift_id: str, name: str, color: str, st: str | None, et: str | None, typ: str, allday: int, auto_s: int, dur: int | None, seq: int, default_shift: str) -> Shift:
             return Shift(
                 shift_id=shift_id,
@@ -103,20 +98,16 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
             ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N"),
             ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D"),
         ]
-        print(8 , '\n')
-        import pprint
-        pprint.pprint([_mk(*args).__dict__ for args in defaults])
         for args in defaults:
             session.add(_mk(*args))
         session.commit()
-        print(9)
+
         shifts = (
             session.query(Shift)
             .filter(Shift.group_id == current_user.group_id)
             .order_by(Shift.sequence.asc())
             .all()
         )
-        print(10)
         return [
             {
                 "shift_id": s.shift_id,

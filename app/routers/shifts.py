@@ -3,7 +3,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from db.client2 import get_db
-from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig
+from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie
 from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest
@@ -36,17 +36,29 @@ load_dotenv()
 # [Shifts] - 모든 시프트 정보 조회
 @router.get("/shifts")
 async def get_shifts(
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)   
 ):
+    print('진입1')
+    print('current_user', current_user)
+    print('group_id', group_id)
     try:
         backend = os.getenv("DB_BACKEND", "mysql").lower()
-        backend = 'mssql'
+        override_gid = None
+        if group_id:
+            if not current_user or not getattr(current_user, 'is_master_admin', False):
+                raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 조회가 가능합니다.")
+            g = db.query(Group).filter(Group.group_id == group_id).first()
+            if not g or g.office_id != current_user.office_id:
+                raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
+            override_gid = group_id
+        # backend = 'mssql'
         if backend == "mssql":
             print('여기')
             shifts = get_shifts_service_mssql(current_user, db)
         else:
-            shifts = get_shifts_service_mysql(current_user, db)
+            shifts = get_shifts_service_mysql(current_user, db, override_gid)
         for shift in shifts:
             shift["start_time"] = convert_time(shift["start_time"])
             shift["end_time"] = convert_time(shift["end_time"])
@@ -117,21 +129,35 @@ async def move_shift(
 async def get_shift_manage(
     class_name: str,
     # config_version: Optional[str] = None,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+    print('진입')
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     # Get current user's office_id
-    nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-    if not nurse or not nurse.group:
-        raise HTTPException(status_code=404, detail="User group information not found")
+    # 대상 그룹/오피스 결정
+    if group_id:
+        if not current_user or not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 조회가 가능합니다.")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g or g.office_id != current_user.office_id:
+            raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
+        office_id = g.office_id
+        target_group_id = g.group_id
+    else:
+        nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+        if not nurse or not nurse.group:
+            raise HTTPException(status_code=404, detail="User group information not found")
+        office_id = nurse.group.office_id
+        target_group_id = current_user.group_id
     
     
     # 해당 클래스의 shift_manage 데이터 조회
     shift_manages = db.query(ShiftManage).filter(
-        ShiftManage.office_id == nurse.group.office_id,
-        ShiftManage.group_id == current_user.group_id,
+        ShiftManage.office_id == office_id,
+        ShiftManage.group_id == target_group_id,
         ShiftManage.nurse_class == class_name,
         # ShiftManage.config_version == config_version
     ).order_by(ShiftManage.shift_slot.asc()).all()
@@ -143,11 +169,12 @@ async def get_shift_manage(
             {"shift_slot": 2, "main_code": "E", "codes": [], "manpower": 3},
             {"shift_slot": 3, "main_code": "N", "codes": [], "manpower": 2}
         ]
+
         # DB에 기본 슬롯 저장
         for slot_data in default_slots:
             shift_manage = ShiftManage(
-                office_id=nurse.group.office_id,
-                group_id=current_user.group_id,
+                office_id=office_id,
+                group_id=target_group_id,
                 nurse_class=class_name,
                 shift_slot=slot_data["shift_slot"],
                 main_code=slot_data["main_code"],
@@ -160,8 +187,8 @@ async def get_shift_manage(
 
         # 다시 조회해서 반환
         shift_manages = db.query(ShiftManage).filter(
-            ShiftManage.office_id == nurse.group.office_id,
-            ShiftManage.group_id == current_user.group_id,
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == target_group_id,
             ShiftManage.nurse_class == class_name,
             # ShiftManage.config_version == config_version
         ).order_by(ShiftManage.shift_slot.asc()).all()
@@ -180,6 +207,7 @@ async def get_shift_manage(
 async def save_shift_manage(
     req: ShiftManageSaveRequest,
     # config_version: Optional[str] = None,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
@@ -187,14 +215,25 @@ async def save_shift_manage(
         raise HTTPException(status_code=403, detail="Permission denied")
     
     # Get current user's office_id
-    nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-    if not nurse or not nurse.group:
-        raise HTTPException(status_code=404, detail="User group information not found")
+    if group_id:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 저장이 가능합니다.")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g or g.office_id != current_user.office_id:
+            raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
+        office_id = g.office_id
+        target_group_id = g.group_id
+    else:
+        nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+        if not nurse or not nurse.group:
+            raise HTTPException(status_code=404, detail="User group information not found")
+        office_id = nurse.group.office_id
+        target_group_id = current_user.group_id
     
     # 기존 데이터 삭제 (특정 클래스의 모든 슬롯)
     db.query(ShiftManage).filter(
-        ShiftManage.office_id == nurse.group.office_id,
-        ShiftManage.group_id == current_user.group_id,
+        ShiftManage.office_id == office_id,
+        ShiftManage.group_id == target_group_id,
         ShiftManage.nurse_class == req.class_name,
         # ShiftManage.config_version == config_version
     ).delete()
@@ -202,8 +241,8 @@ async def save_shift_manage(
     # 새 데이터 저장
     for slot_data in req.slots:
         shift_manage = ShiftManage(
-            office_id=nurse.group.office_id,
-            group_id=current_user.group_id,
+            office_id=office_id,
+            group_id=target_group_id,
             nurse_class=req.class_name,
             shift_slot=slot_data["shift_slot"],
             main_code=slot_data.get("main_code"),

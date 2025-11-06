@@ -36,15 +36,19 @@ class Team(Base):
     )
 class Nurse(Base):
     __tablename__ = "nurses"
-
+    # office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'), nullable=True)
     nurse_id = Column(VARCHAR(50), primary_key=True)
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
+    # 관리자(ADM) 계정처럼 group_id가 없을 수 있으므로 office_id를 실컬럼으로 보유
+    office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'), nullable=True)
     account_id = Column(VARCHAR(50), unique=True, nullable=False)
     name = Column(VARCHAR(50), nullable=False)
     experience = Column(SMALLINT)
     role = Column(VARCHAR(20))
     level_ = Column(VARCHAR(20))
     is_head_nurse = Column(BOOLEAN, default=False)
+    # 마스터 관리자 구분 코드(ADM/HDN/...) - 실제 컬럼명 EmpAuthGbn 매핑
+    emp_auth_gbn = Column(VARCHAR(3), name='EmpAuthGbn', nullable=True)
     is_night_nurse = Column(SMALLINT, default=0)
     personal_off_adjustment = Column(TINYINT, default=0)
     preceptor_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"))

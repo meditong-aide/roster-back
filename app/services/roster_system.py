@@ -34,7 +34,6 @@ class RosterSystem:
         
         self.nurses = nurses
         self.config = config
-        
         # target_month 설정 (하위 호환성을 위해)
         if target_month is not None:
             self.target_month = target_month

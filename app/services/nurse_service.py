@@ -4,7 +4,7 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Nurse as NurseModel
+from db.models import Nurse as NurseModel, Group
 from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional
@@ -40,6 +40,21 @@ def get_nurses_in_group_service(current_user, db: Session):
         .order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc())
         .all()
     )
+    return nurses
+def get_nurses_filtered_service(current_user, db: Session, office_id: str | None = None, group_id: str | None = None):
+    """ADM 전용 필터 조회: office_id 또는 group_id 기준으로 간호사 목록 조회"""
+    if not current_user:
+        raise Exception("Not authenticated")
+    if not getattr(current_user, 'is_master_admin', False):
+        raise Exception("Permission denied")
+
+    q = db.query(NurseModel)
+    if group_id:
+        q = q.filter(NurseModel.group_id == group_id)
+    elif office_id:
+        # 그룹 조인 후 office_id 매칭
+        q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == office_id)
+    nurses = q.order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc()).all()
     return nurses
 
 
@@ -77,22 +92,34 @@ def move_nurse_with_active_service(nurse_id: str, new_sequence: int, target_acti
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not current_user.is_head_nurse:
+    # 수간호사 또는 마스터관리자만 허용
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
 
-    nurse = (
-        db.query(NurseModel)
-        .filter(NurseModel.group_id == current_user.group_id, NurseModel.nurse_id == nurse_id)
-        .first()
-    )
+    # ADM은 group_id가 없을 수 있으므로 nurse_id만으로 조회 후 대상 그룹을 결정
+    if getattr(current_user, 'is_master_admin', False) and not getattr(current_user, 'group_id', None):
+        nurse = (
+            db.query(NurseModel)
+            .select_from(NurseModel)
+            .filter(NurseModel.nurse_id == nurse_id)
+            .first()
+        )
+        target_group_id = nurse.group_id if nurse else None
+    else:
+        nurse = (
+            db.query(NurseModel)
+            .filter(NurseModel.group_id == current_user.group_id, NurseModel.nurse_id == nurse_id)
+            .first()
+        )
+        target_group_id = getattr(current_user, 'group_id', None)
     if not nurse:
         raise Exception("간호사를 찾을 수 없습니다.")
 
-    group_id = current_user.group_id
+    group_id = target_group_id
     old_active = nurse.active
 
     if target_active is None or target_active == old_active:
-        # 같은 상태 내 재배치
+        # 같은 상태 내 재배치   
         lst = _get_nurses_by_active(group_id, old_active, db)
         # 해당 간호사 제외
         lst = [n for n in lst if n.nurse_id != nurse.nurse_id]
@@ -105,7 +132,6 @@ def move_nurse_with_active_service(nurse_id: str, new_sequence: int, target_acti
         old_list = _get_nurses_by_active(group_id, old_active, db)
         old_list = [n for n in old_list if n.nurse_id != nurse.nurse_id]
         _reindex_contiguously(old_list)
-
         # 새 리스트로 이동하여 삽입
         nurse.active = target_active
         new_list = _get_nurses_by_active(group_id, target_active, db)
@@ -153,60 +179,57 @@ def reorder_nurses_service(active_order: List[str], inactive_order: List[str], c
     db.commit()
     return {"message": "일괄 재정렬 완료", "active_count": len(active_order), "inactive_count": len(inactive_order)}
 
-def bulk_update_nurses_service(nurses_data, current_user, db: Session):
+def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_group_id: str | None = None):
     """
     간호사 일괄 업데이트 서비스 함수
     """
+    import pprint
+    pprint.pprint(nurses_data)
     if not current_user:
         raise Exception("Not authenticated")
-    if not current_user.is_head_nurse:
+    # HDN 또는 ADM만 허용
+    if not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
     if not any(n.is_head_nurse for n in nurses_data):
         raise Exception("At least one head nurse must be assigned.")
-    print(f"[DEBUG] nurses_data:")
-    pprint(nurses_data)
-    db_nurses_dict = {n.nurse_id: n for n in db.query(NurseModel).filter(NurseModel.group_id == current_user.group_id).all()}
-    
+    target_group_id = override_group_id or current_user.group_id
+    db_nurses_dict = {n.nurse_id: n for n in db.query(NurseModel).filter(NurseModel.group_id == target_group_id).all()}
+    pprint.pprint([n.nurse_id for n in nurses_data])
     for nurse_data in nurses_data:
         db_nurse = db_nurses_dict.get(nurse_data.nurse_id)
         if db_nurse:
-            if db_nurse.group_id != current_user.group_id:
+            if db_nurse.group_id != target_group_id:
                 continue
-            
             # active 상태가 변경되는 경우 sequence 재조정
             old_active = db_nurse.active
             update_data = nurse_data.dict(exclude_unset=True)
             new_active = update_data.get('active', old_active)
-            
             # active 상태 변경 시 해당 상태의 마지막 sequence로 이동
             if old_active != new_active and 'active' in update_data:
-                update_data['sequence'] = get_next_sequence_for_active_status(
-                    current_user.group_id, new_active, db
-                )
-                print(f"[DEBUG] 간호사 {db_nurse.name} active 변경: {old_active} → {new_active}, sequence: {update_data['sequence']}")
+                update_data['sequence'] = get_next_sequence_for_active_status(target_group_id, new_active, db)
             
             for key, value in update_data.items():
                 setattr(db_nurse, key, value)
         else:
             nurse_dict = nurse_data.dict()
             nurse_dict.pop('group_id', None)
-            
             # 신규 생성 시 active 상태에 따른 sequence 설정
             active_status = nurse_dict.get('active', 1)  # 기본값은 활성(1)
             if 'sequence' not in nurse_dict or nurse_dict['sequence'] is None:
                 nurse_dict['sequence'] = get_next_sequence_for_active_status(
                     current_user.group_id, active_status, db
                 )
-                print(f"[DEBUG] 신규 간호사 sequence 설정: active={active_status}, sequence={nurse_dict['sequence']}")
-            
-            new_nurse = NurseModel(**nurse_dict, group_id=current_user.group_id)
-            db.add(new_nurse)
-    
+            pprint.pprint(nurse_dict)
+            try:
+                new_nurse = NurseModel(**nurse_dict, group_id=target_group_id)
+                db.add(new_nurse)
+            except Exception as e:
+                print(f"[DEBUG] 신규 간호사 생성 실패: {e}")
+                continue
     client_nurse_ids = {n.nurse_id for n in nurses_data}
     for db_nurse_id, db_nurse in db_nurses_dict.items():
         if db_nurse_id not in client_nurse_ids:
             db.delete(db_nurse)
-    
     db.commit()
     return {"message": "Nurses updated successfully"} 
 

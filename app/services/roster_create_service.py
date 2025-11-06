@@ -44,24 +44,24 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
+
     nurse_ids = [n.nurse_id for n in nurses_in_group]
     month_str = f"{req.year}-{req.month:02d}"
     preferences = []
+
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     for nurse_id in nurse_ids:
-        try:
-            submitted_wr = (
-                db.query(WantedRequest)
-                .filter(
-                    WantedRequest.nurse_id == nurse_id,
-                    WantedRequest.month == month_str,
-                    WantedRequest.is_submitted == True
-                )
-                .order_by(WantedRequest.submitted_at.desc())
-                .first()
+        submitted_wr = (
+            db.query(WantedRequest)
+            .filter(
+                WantedRequest.nurse_id == nurse_id,
+                WantedRequest.month == month_str,
+                WantedRequest.is_submitted == True
             )
-        except Exception as e:
-            print(f"error: {e}")
+            .order_by(WantedRequest.submitted_at.desc())
+            .first()
+        )
+
         target_wr = submitted_wr or (
             db.query(WantedRequest)
             .filter(
@@ -219,7 +219,6 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
     # day→counts 맵 구성 후 리스트로 변환(0-index)
     by_day = {r.day: {'D': int(r.d_count or 0), 'E': int(r.e_count or 0), 'N': int(r.n_count or 0)} for r in rows}
     daily_shift_requirements_by_day = [by_day.get(d, {'D': daily_shift_requirements.get('D', 0), 'E': daily_shift_requirements.get('E', 0), 'N': daily_shift_requirements.get('N', 0)}) for d in range(1, days_in_month + 1)]
-    print(11)
     return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day
 
 def _normalize_to_main(code: str, code2main: dict) -> str:

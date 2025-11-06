@@ -19,13 +19,16 @@ from services.nurse_service import (
     move_nurse_service,
     move_nurse_with_active_service,
     reorder_nurses_service,
+    get_nurses_filtered_service,
 )
 from services.excel_service import (
     create_nurse_template, 
     process_excel_upload, 
     validate_excel_data,
     save_excel_data,
-    create_groups_and_save_data
+    create_groups_and_save_data,
+    create_nurse_template2,
+    process_excel_upload2,
 )
 from pydantic import BaseModel, Field
 
@@ -37,10 +40,17 @@ router = APIRouter(
 
 @router.get("", response_model=List[NurseProfile])
 async def get_nurses_in_group(
+    office_id: Optional[str] = None,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     try:
+        # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
+        if office_id or group_id:
+            if not current_user or not current_user.is_master_admin:
+                raise HTTPException(status_code=403, detail="마스터 관리자만 필터 조회가 가능합니다.")
+            return get_nurses_filtered_service(current_user, db, office_id=office_id, group_id=group_id)
         return get_nurses_in_group_service(current_user, db)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 목록 조회 실패: {str(e)}")
@@ -90,11 +100,13 @@ async def reorder_nurses(
 @router.post("/bulk-update")
 async def bulk_update_nurses(
     nurses_data: List[NurseProfile],
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     try:
-        return bulk_update_nurses_service(nurses_data, current_user, db)
+        # ADM이 group_id를 지정하면 해당 병동을 대상으로 업데이트 허용
+        return bulk_update_nurses_service(nurses_data, current_user, db, override_group_id=group_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 일괄 업데이트 실패: {str(e)}") 
 
@@ -106,7 +118,6 @@ async def download_template(
     try:
         if not current_user or not current_user.is_head_nurse:
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
-        
         template_path = create_nurse_template()
         return FileResponse(
             path=template_path,
@@ -115,6 +126,23 @@ async def download_template(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"템플릿 생성 실패: {str(e)}")
+
+@router.get("/template2-download")
+async def download_template2(
+    current_user: UserSchema = Depends(get_current_user_from_cookie)
+):
+    """신규 엑셀 템플릿2 (계정ID/이름만) 다운로드 - ADM 전용"""
+    try:
+        if not current_user or not current_user.is_master_admin:
+            raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+        template_path = create_nurse_template2()
+        return FileResponse(
+            path=template_path,
+            filename="간호사_업로드2_템플릿.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"템플릿2 생성 실패: {str(e)}")
 
 @router.post("/upload-excel")
 async def upload_excel(
@@ -126,30 +154,47 @@ async def upload_excel(
     try:
         if not current_user or not current_user.is_head_nurse:
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
-        
-        # 파일 크기 및 형식 검증
-        if file.size > 10 * 1024 * 1024:  # 10MB
+        if file.size and file.size > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="파일 크기는 10MB를 초과할 수 없습니다.")
-        
         if not file.filename.lower().endswith(('.xlsx', '.xls')):
             raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다. (.xlsx, .xls만 지원)")
-        
-        # 임시 파일 저장
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             content = await file.read()
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
-        
         try:
-            # 엑셀 데이터 파싱 및 검증
             result = process_excel_upload(tmp_file_path, current_user, db)
             return result
         finally:
-            # 임시 파일 삭제
             os.unlink(tmp_file_path)
-            
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"엑셀 업로드 실패: {str(e)}")
+
+@router.post("/upload2-excel")
+async def upload_excel2(
+    file: UploadFile = File(...),
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """엑셀 업로드2: mdt_temp에서 account_id 존재 여부를 office_id 기준으로 검증 - ADM 전용"""
+    try:
+        if not current_user or not current_user.is_master_admin:
+            raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+        if file.size and file.size > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="파일 크기는 10MB를 초과할 수 없습니다.")
+        if not file.filename.lower().endswith(('.xlsx', '.xls')):
+            raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다. (.xlsx, .xls만 지원)")
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_file_path = tmp_file.name
+        try:
+            result = process_excel_upload2(tmp_file_path, current_user, db)
+            return result
+        finally:
+            os.unlink(tmp_file_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"엑셀 업로드2 실패: {str(e)}")
 
 @router.post("/validate-excel")
 async def validate_excel_data_endpoint(
@@ -161,7 +206,6 @@ async def validate_excel_data_endpoint(
     try:
         if not current_user or not current_user.is_head_nurse:
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
-        
         result = validate_excel_data(request.data, current_user, db)
         return result
     except Exception as e:
@@ -177,19 +221,14 @@ async def confirm_upload(
     try:
         if not current_user or not current_user.is_head_nurse:
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
-        
-        # 포함할 행만 필터링
         filtered_data = [
             data for i, data in enumerate(request.data) 
             if i < len(request.include_rows) and request.include_rows[i]
         ]
-        
-        # 새 그룹 생성이 필요한 경우
         if request.new_groups_to_create:
             result = create_groups_and_save_data(filtered_data, request.new_groups_to_create, current_user, db)
         else:
             result = save_excel_data(filtered_data, current_user, db)
-            
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 저장 실패: {str(e)}") 

@@ -35,7 +35,6 @@ router = APIRouter(
     tags=["auth"]
 )
 
-templates = Jinja2Templates(directory="templates")
 # This was trying to read from the header, but we are using httpOnly cookies
 # oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 

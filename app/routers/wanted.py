@@ -24,11 +24,29 @@ templates = Jinja2Templates(directory="app/templates")
 @router.post("/request")
 async def request_wanted_shifts(
     payload: WantedDeadlineRequest,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        override_gid = None
+    else:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        from db.models import Group
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        override_gid = g.group_id
     try:
-        return request_wanted_shifts_service(payload, current_user, db)
+        return request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Wanted 작성 요청 실패: {str(e)}")
 
@@ -36,14 +54,31 @@ async def request_wanted_shifts(
 @router.get("/status")
 async def get_wanted_status(
     year: int, month: int,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        from db.models import Group
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
     wanted = db.query(Wanted).filter(
-        Wanted.group_id == current_user.group_id,
+        Wanted.group_id == target_group_id,
         Wanted.year == year,
         Wanted.month == month
     ).first()
@@ -62,14 +97,31 @@ async def get_wanted_status(
 @router.get("/{year}/{month}/submissions")
 async def get_submission_statuses(
     year: int, month: int,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    if not current_user or not current_user.is_head_nurse:
-        raise HTTPException(status_code=403, detail="Permission denied")
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Get all nurses in the current user's group
-    nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == current_user.group_id).all()
+    # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        from db.models import Group
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    # Get all nurses in the target group
+    nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     nurse_ids_in_group = {n[0] for n in nurses_in_group}
 
     # 각 간호사의 최신 제출 상태 확인
@@ -94,14 +146,31 @@ async def get_submission_statuses(
 # [Wanted] - 현재 그룹의 모든 wanted 데이터 조회
 @router.get("/all")
 async def get_all_wanted(
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        from db.models import Group
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
     wanted_list = db.query(Wanted).filter(
-        Wanted.group_id == current_user.group_id
+        Wanted.group_id == target_group_id
     ).order_by(Wanted.year.desc(), Wanted.month.desc()).all()
 
     return [{
@@ -116,14 +185,30 @@ async def get_all_wanted(
 @router.patch("/close")
 async def close_wanted_request(
     year: int, month: int,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        from db.models import Group
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
     wanted = db.query(Wanted).filter(
-        Wanted.group_id == current_user.group_id,
+        Wanted.group_id == target_group_id,
         Wanted.year == year,
         Wanted.month == month
     ).first()
@@ -140,14 +225,30 @@ async def close_wanted_request(
 @router.patch("/deadline")
 async def update_wanted_deadline(
     req: WantedDeadlineRequest,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        from db.models import Group
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
     wanted = db.query(Wanted).filter(
-        Wanted.group_id == current_user.group_id,
+        Wanted.group_id == target_group_id,
         Wanted.year == req.year,
         Wanted.month == req.month
     ).first()

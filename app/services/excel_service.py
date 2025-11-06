@@ -57,6 +57,23 @@ def create_nurse_template() -> str:
             cell.font = cell.font.copy(italic=True, color="666666")
     
     return template_path
+def create_nurse_template2() -> str:
+    """엑셀 템플릿2: 계정ID/이름 두 컬럼만 포함."""
+    template_data = {
+        '계정 ID': ['nurse001', 'nurse002', '(영문숫자조합)'],
+        '이름': ['김간호', '이수간', '(한글이름)'],
+    }
+    df = pd.DataFrame(template_data)
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+        template_path = tmp_file.name
+    with pd.ExcelWriter(template_path, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='업로드2', index=False)
+        ws = writer.sheets['업로드2']
+        for col in range(1, len(df.columns) + 1):
+            cell = ws.cell(row=1, column=col)
+            cell.font = cell.font.copy(bold=True)
+    return template_path
+
 
 
 def get_or_create_group(group_name: str, user: UserSchema, db: Session) -> Tuple[Optional[str], bool, List[str]]:
@@ -189,7 +206,19 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
             raise ValueError(f"필수 컬럼이 누락되었습니다: {', '.join(missing_korean)}")
             
         # 병동명별 그룹 정보 수집
-        unique_groups = df[get_excel_column_by_field('group_name', flexible_mapping)].dropna().unique()
+        # 동일한 병동명이 여러 병원(office)에서 존재할 수 있으므로, 엑셀에 오피스/지점 컬럼이 존재하는 경우
+        # 먼저 현재 사용자 office_id와 일치하는 행으로 필터링한다.
+        office_col = None
+        for c in ['office_id', 'Office ID', '오피스ID', '병원ID', '병원코드', '기관ID', '지점ID']:
+            if c in df.columns:
+                office_col = c
+                break
+        if office_col:
+            df_filtered = df[df[office_col].astype(str).str.strip() == str(user.office_id)]
+        else:
+            df_filtered = df
+
+        unique_groups = df_filtered[get_excel_column_by_field('group_name', flexible_mapping)].dropna().unique()
         group_info = {}
         new_groups_needed = []
         
@@ -234,10 +263,11 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
                 sequence = group_sequence_counters.get(group_id, 0)
                 group_sequence_counters[group_id] = sequence + 1
                 
-                # 기본 데이터 변환
+                # 기본 데이터 변환 (nurses.office_id 함께 저장)
                 nurse_data = {
                     # 'group_name': group_name,
                     'group_id': group_id,
+                    'office_id': user.office_id,
                     'nurse_id': str(uuid.uuid4()) if pd.isna(row.get('식별코드')) or str(row.get('식별코드')).strip() == 'UUID자동생성' else str(row.get('식별코드')),
                     'account_id': str(row[get_excel_column_by_field('account_id', flexible_mapping)]).strip(),
                     'name': str(row[get_excel_column_by_field('name', flexible_mapping)]).strip(),
@@ -307,6 +337,61 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
             'new_groups_needed': [],
             'summary': {'total': 0, 'valid': 0, 'error': 0, 'overwrite': 0, 'new_groups': 0}
         }
+
+
+def process_excel_upload2(file_path: str, user: UserSchema, db: Session) -> Dict[str, Any]:
+    """엑셀 업로드2: 각 행의 account_id를 현재 사용자 office_id와 함께 mdt_temp에서 검증.
+
+    검증 규칙:
+    - account_id 필수, 영숫자만 허용
+    - mdt_temp에 (office_id=current_user.office_id, account_id=행.account_id) 존재해야 OK
+    - 성공/오류 카운트와 오류 목록 반환
+    """
+    try:
+        df = pd.read_excel(file_path, sheet_name=0)
+        df = df.dropna(how='all')
+        if len(df) > 2000:
+            raise ValueError("최대 2000행까지만 업로드 가능합니다.")
+        # 컬럼 추출(유연 매핑)
+        def find_col(candidates: list[str]) -> str:
+            for c in df.columns:
+                cc = str(c).strip()
+                if cc in candidates:
+                    return c
+            raise ValueError(f"필수 컬럼 누락: {candidates}")
+        col_acc = find_col(['계정 ID','ID','아이디','account_id'])
+        col_name = find_col(['이름','성명','name'])
+
+        office_id = user.office_id
+        success = 0
+        errors: list[dict] = []
+        rows_out: list[dict] = []
+
+        for i, row in df.iterrows():
+            ridx = int(i) + 2  # 헤더 포함 행 번호
+            account_id = str(row.get(col_acc, '')).strip()
+            name = str(row.get(col_name, '')).strip()
+            if not account_id or not re.match(r'^[A-Za-z0-9]+$', account_id):
+                errors.append({"row": ridx, "reason": "invalid account_id"})
+                continue
+            # mdt_temp 존재 검사
+            try:
+                cnt = db.execute(
+                    "SELECT COUNT(1) AS c FROM mdt_temp WHERE office_id=:o AND account_id=:a",
+                    {"o": office_id, "a": account_id}
+                ).scalar() or 0
+            except Exception as e:
+                errors.append({"row": ridx, "reason": f"lookup failed: {e}"})
+                continue
+            if int(cnt) <= 0:
+                errors.append({"row": ridx, "reason": "account_id not found in mdt_temp"})
+                continue
+            success += 1
+            rows_out.append({"account_id": account_id, "name": name})
+
+        return {"success": success, "errors": errors, "rows": rows_out}
+    except Exception as e:
+        return {"success": 0, "errors": [{"row": 0, "reason": str(e)}], "rows": []}
 
 
 def get_excel_column_by_field(field: str, mapping: Dict[str, str]) -> str:
@@ -517,7 +602,7 @@ def create_groups_and_save_data(data: List[Dict[str, Any]], new_groups_to_create
         } 
 
 
-def export_schedule_excel_bytes(schedule_id: str, current_user, db) -> bytes:
+def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group_id: str) -> bytes:
     """지정된 schedule_id의 근무표를 엑셀(xlsx) 바이트로 생성하여 반환합니다.
     
     요약: schedules, schedule_entries, nurses, shifts, shift_manage 정보를 조회하여
@@ -545,7 +630,7 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db) -> bytes:
     # ───────── 1) 데이터 로드 ─────────
     schedule = db.query(Schedule).filter(
         Schedule.schedule_id == schedule_id,
-        Schedule.group_id == current_user.group_id,
+        Schedule.group_id == target_group_id,
         Schedule.dropped == False
     ).first()
     if not schedule:
@@ -555,15 +640,15 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db) -> bytes:
 
     # 간호사 목록(경력 desc, nurse_id asc)
     nurses = db.query(Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence).filter(
-        Nurse.group_id == current_user.group_id
+        Nurse.group_id == target_group_id
     ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
 
     # 엔트리
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
 
     # 시프트(색상 등은 엑셀에서는 텍스트 표기 중심으로 사용)
-    shifts_db = db.query(Shift).all()
-    known_shift_ids = {s.shift_id for s in shifts_db}
+    shifts_db = db.query(Shift).filter(Shift.group_id == target_group_id).all()
+    # known_shift_ids = {s.shift_id for s in shifts_db}
 
     # # config_version → ShiftManage 별칭 맵 작성
     # if schedule.config_id:
@@ -576,7 +661,7 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db) -> bytes:
     # if config_version:
     sm_rows = db.query(ShiftManage).filter(
         ShiftManage.office_id == current_user.office_id,
-        ShiftManage.group_id == current_user.group_id,
+        ShiftManage.group_id == target_group_id,
         # ShiftManage.config_version == config_version
     ).all()
     for row in sm_rows:
@@ -614,7 +699,6 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db) -> bytes:
     by_nurse: dict[str, dict[int, str]] = {}
     for e in entries:
         by_nurse.setdefault(e.nurse_id, {})[e.work_date.day] = e.shift_id
-
     # ───────── 2) 워크북/시트 ─────────
     wb = Workbook()
     ws = wb.active

@@ -14,24 +14,40 @@ from sqlalchemy import func
 import uuid
 
 
-def save_roster_config_service(config_data: RosterConfigCreate, user, db: Session):
+def save_roster_config_service(
+    config_data: RosterConfigCreate,
+    user,
+    db: Session,
+    override_group_id: str | None = None,
+):
     """
-    근무표 설정 저장 서비스 함수
+    근무표 설정 저장 서비스 함수.
+
+    관리자(ADM) 사용자의 경우 `override_group_id`를 통해 저장 대상 그룹을 지정합니다.
     """
     try:
-        nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
-        if not nurse or not nurse.group:
-            raise Exception("User group information not found")
-        # config_version을 사용하여 ShiftManage 조회
-        # config_version = config_data.config_version
-        # if not config_version:
-        #     config_version = f"v{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
+        # 1) 저장 대상 그룹/오피스 결정
+        target_group_id: str
+        target_office_id: str
+
+        if override_group_id:
+            group_row = db.query(Group).filter(Group.group_id == override_group_id).first()
+            if not group_row:
+                raise Exception("지정한 그룹을 찾을 수 없습니다.")
+            target_group_id = group_row.group_id
+            target_office_id = group_row.office_id
+        else:
+            nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
+            if not nurse or not nurse.group:
+                raise Exception("User group information not found")
+            target_group_id = user.group_id
+            target_office_id = nurse.group.office_id
+
+        # 2) ShiftManage 기준으로 기본 일/저/야 요구 인원 계산
         shift_manages = db.query(ShiftManage).filter(
-            ShiftManage.office_id == nurse.group.office_id,
-            ShiftManage.group_id == user.group_id,
+            ShiftManage.office_id == target_office_id,
+            ShiftManage.group_id == target_group_id,
             ShiftManage.nurse_class == 'RN',
-            # ShiftManage.config_version == config_version
         ).all()
         day_req = eve_req = nig_req = 0
         if shift_manages:
@@ -44,20 +60,19 @@ def save_roster_config_service(config_data: RosterConfigCreate, user, db: Sessio
                     nig_req = sm.manpower or 0
         else:
             day_req = eve_req = nig_req = 3
+
+        # 3) 설정 저장
         config_dict = config_data.model_dump()
         config_dict.update({
             'day_req': day_req,
             'eve_req': eve_req,
             'nig_req': nig_req
         })
-        
-        ## config_version이 None이면 기본값 설정
-        # if not config_dict.get('config_version'):
-        #     config_dict['config_version'] = f"v{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
         db_config = RosterConfigModel(
             **config_dict,
-            office_id=user.office_id,
-            group_id=user.group_id
+            office_id=target_office_id,
+            group_id=target_group_id,
         )
         db.add(db_config)
         db.commit()
@@ -68,14 +83,23 @@ def save_roster_config_service(config_data: RosterConfigCreate, user, db: Sessio
         db.rollback()
         raise
 
-def get_latest_schedule_service(current_user, db: Session):
+def get_latest_schedule_service(current_user, db: Session, override_group_id: str | None = None):
     """
-    최신 스케줄 정보 조회 서비스 함수
+    최신 스케줄 정보 조회 서비스 함수.
+
+    관리자(ADM)는 `override_group_id`로 대상 그룹을 지정할 수 있습니다.
     """
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user:
+        raise Exception("Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
+
+    target_group_id = override_group_id or current_user.group_id
+    if not target_group_id:
+        raise Exception("대상 그룹이 없습니다.")
+
     latest_schedule = db.query(Schedule).filter(
-        Schedule.group_id == current_user.group_id,
+        Schedule.group_id == target_group_id,
         Schedule.dropped == False
     ).order_by(
         Schedule.year.desc(),
@@ -92,30 +116,45 @@ def get_latest_schedule_service(current_user, db: Session):
         "schedule_id": latest_schedule.schedule_id
     }
 
-def get_issued_schedules_service(current_user, db: Session):
+def get_issued_schedules_service(current_user, db: Session, override_group_id: str | None = None):
     """
-    발행된(issued) 모든 스케줄 정보 조회 서비스 함수
+    발행된(issued) 모든 스케줄 정보 조회 서비스 함수.
+
+    관리자(ADM)는 `override_group_id`로 대상 그룹을 지정할 수 있습니다.
     """
     if not current_user:
         raise Exception("Not authenticated")
-    
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise Exception("Permission denied")
+
+    target_group_id = override_group_id or current_user.group_id
+    if not target_group_id:
+        raise Exception("대상 그룹이 없습니다.")
+
     schedules_query = db.query(Schedule.schedule_id, Schedule.year, Schedule.month).filter(
-        Schedule.group_id == current_user.group_id,
+        Schedule.group_id == target_group_id,
         Schedule.status == 'issued',
         Schedule.dropped == False
     ).distinct().order_by(Schedule.year.desc(), Schedule.month.desc()).all()
     schedules = [{"year": r.year, "month": r.month, "schedule_id": r.schedule_id} for r in schedules_query]
     return schedules
 
-def get_schedule_status_service(year: int, month: int, current_user, db: Session):
+def get_schedule_status_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
     """
-    특정 월의 스케줄 상태 조회 서비스 함수
+    특정 월의 스케줄 상태 조회 서비스 함수.
+
+    관리자(ADM)는 `override_group_id`로 대상 그룹을 지정할 수 있습니다.
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if current_user.is_head_nurse:
+
+    # HN/ADM 그룹 요약
+    if getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False):
+        target_group_id = override_group_id or current_user.group_id
+        if not target_group_id:
+            raise Exception("대상 그룹이 없습니다.")
         schedules = db.query(Schedule).filter(
-            Schedule.group_id == current_user.group_id,
+            Schedule.group_id == target_group_id,
             Schedule.year == year,
             Schedule.month == month,
             Schedule.dropped == False
@@ -127,6 +166,8 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
             "latest_status": latest_status,
             "schedule_count": len(schedules)
         }
+
+    # 일반 간호사 개인 선호도/상태
     schedule = db.query(Schedule).filter(
         Schedule.group_id == current_user.group_id,
         Schedule.year == year,

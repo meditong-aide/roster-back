@@ -608,21 +608,35 @@ async def invoke_and_persist_wanted_service(
     return result
 
 
-def request_wanted_shifts_service(req: WantedDeadlineRequest, current_user, db: Session):
+def request_wanted_shifts_service(
+    req: WantedDeadlineRequest,
+    current_user,
+    db: Session,
+    override_group_id: str | None = None,
+):
     """
-    Wanted 작성 요청 생성 서비스 함수
+    Wanted 작성 요청 생성 서비스 함수.
+
+    관리자(ADM)의 경우 `override_group_id`로 대상 그룹을 지정합니다.
     """
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user:
+        raise Exception("Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
+
+    target_group_id = override_group_id or current_user.group_id
+    if not target_group_id:
+        raise Exception("대상 그룹이 없습니다.")
+
     existing_wanted = db.query(Wanted).filter(
-        Wanted.group_id == current_user.group_id,
+        Wanted.group_id == target_group_id,
         Wanted.year == req.year,
         Wanted.month == req.month
     ).first()
     if existing_wanted:
         raise Exception("이미 해당 월의 요청이 존재합니다.")
     new_wanted = Wanted(
-        group_id=current_user.group_id,
+        group_id=target_group_id,
         year=req.year,
         month=req.month,
         exp_date=req.exp_date,

@@ -272,22 +272,28 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
 #     }
 
 
-def get_all_preferences_service(year: int, month: int, current_user, db: Session):
+def get_all_preferences_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
     """
     모든 간호사의 최신 선호도 데이터 조회 서비스 함수 (새 구조 기반)
     - WantedRequest, NurseShiftRequest, NursePairRequest 조합
     - Output은 기존 ShiftPreference.data 구조와 동일하게 유지
+
+    관리자(ADM)는 `override_group_id`로 대상 그룹을 지정할 수 있습니다.
     """
     if not current_user:
         raise Exception("Not authenticated")
 
     month_str = f"{year}-{month:02d}"
 
+    target_group_id = override_group_id or current_user.group_id
+    if not target_group_id:
+        raise Exception("대상 그룹이 없습니다.")
+
     # ✅ 1️⃣ 그룹 내 간호사 목록 가져오기
     nurse_ids = [
         n.nurse_id
         for n in db.query(Nurse.nurse_id)
-        .filter(Nurse.group_id == current_user.group_id)
+        .filter(Nurse.group_id == target_group_id)
         .all()
     ]
     # ✅ 2️⃣ 각 간호사별 최신 요청(WantedRequest) 찾기

@@ -119,6 +119,8 @@ class RosterConfig(RosterConfigBase):
         from_attributes = True
 
 class NurseProfile(BaseModel):
+    office_id: str
+    # EmpAuthGbn: Optional[str] = None
     nurse_id: str
     group_id: str
     account_id: str
