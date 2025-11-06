@@ -1,0 +1,123 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Cookie
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session, joinedload
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from typing import Optional
+
+from db.client import get_db
+from db.models import Nurse, Group, Office
+from schemas.auth_schema import User as UserSchema, TokenData
+
+# Configuration
+SECRET_KEY = "a_very_secret_key"  # In production, use a strong, securely stored key
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
+
+router = APIRouter(
+    prefix="/auth",
+    tags=["auth"]
+)
+
+# This was trying to read from the header, but we are using httpOnly cookies
+# oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_user(db: Session, account_id: str):
+    return db.query(Nurse).options(joinedload(Nurse.group)).filter(Nurse.account_id == account_id).first()
+
+@router.post("/login")
+async def login_for_access_token(
+    response: Response, 
+    form_data: OAuth2PasswordRequestForm = Depends(), 
+    db: Session = Depends(get_db)
+):
+    try:
+        user = get_user(db, form_data.username)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect account ID",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # (선택) 비밀번호 무시하는 경우는 그냥 통과,
+        # 비밀번호 검증하려면 user.password 해시 비교 넣어야 함
+
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.account_id}, expires_delta=access_token_expires
+        )
+
+        response.set_cookie(
+            key="access_token", 
+            value=f"Bearer {access_token}", 
+            httponly=True, 
+            samesite="lax"
+        )
+        return {"message": "Login successful", "account_id": user.account_id}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+
+
+@router.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie(key="access_token")
+    return {"message": "Logout successful"}
+
+
+async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias="access_token"), db: Session = Depends(get_db)):
+    if token is None:
+        return None
+
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        token = token.replace("Bearer ", "")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        account_id: str = payload.get("sub")
+        
+        if account_id is None:
+            return None
+        token_data = TokenData(account_id=account_id)
+    except JWTError:
+        return None # If token is invalid, treat as not logged in
+    
+    user = get_user(db, token_data.account_id)
+    if user is None:
+        return None
+    print('user.office_id', user.office_id)
+    # Manually construct UserSchema to avoid from_orm issues
+    return UserSchema(
+        nurse_id=user.nurse_id,
+        account_id=user.account_id,
+        office_id=user.office_id,  # This should now work with eager loading
+        group_id=user.group_id,
+        is_head_nurse=user.is_head_nurse,
+        name = user.name,
+        # emp_auth_gbn=getattr(user, 'emp_auth_gbn', None),
+        is_master_admin=(getattr(user, 'emp_auth_gbn', None) == 'ADM')
+    )
+
+@router.get("/me", response_model=UserSchema)
+async def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated"
+        )
+    return current_user 
