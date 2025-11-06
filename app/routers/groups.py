@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from typing import List
 import uuid
 
-from db.client import get_db
+from db.client2 import get_db
 from db.models import Group as GroupModel, Office as OfficeModel
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie

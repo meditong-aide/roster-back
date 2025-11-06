@@ -53,7 +53,7 @@ async def get_shifts(
             if not g or g.office_id != current_user.office_id:
                 raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
             override_gid = group_id
-        # backend = 'mssql'
+        backend = 'mssql'
         if backend == "mssql":
             print('여기')
             shifts = get_shifts_service_mssql(current_user, db)
@@ -127,16 +127,29 @@ async def move_shift(
 # [Shift Management] - 시프트 관리 데이터 조회
 @router.get("/shift-manage/{class_name}")
 async def get_shift_manage(
-    class_name: str,
+    class_name: Optional[str] = None,
     # config_version: Optional[str] = None,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+    """
+    시프트 관리 데이터 조회 엔드포인트.
+
+    - class_name이 없거나 'null'/'undefined'인 경우에도 동작하도록 처리합니다.
+    - ADM 등 간호사 레코드가 없는 사용자에 대해서는 토큰의 office_id/group_id를 우선 사용합니다.
+
+    매개변수
+    - class_name: 조회할 간호사 클래스명. 예: 'RN'. None/'null'인 경우 전체 조회.
+    - group_id: 특정 병동으로 오버라이드할 때 사용.
+
+    반환
+    - 슬롯 목록: [{ shift_slot, main_code, codes, manpower }]
+    """
     print('진입')
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # Get current user's office_id
+
     # 대상 그룹/오피스 결정
     if group_id:
         if not current_user or not getattr(current_user, 'is_master_admin', False):
@@ -147,30 +160,39 @@ async def get_shift_manage(
         office_id = g.office_id
         target_group_id = g.group_id
     else:
-        nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-        if not nurse or not nurse.group:
-            raise HTTPException(status_code=404, detail="User group information not found")
-        office_id = nurse.group.office_id
-        target_group_id = current_user.group_id
-    
-    
-    # 해당 클래스의 shift_manage 데이터 조회
-    shift_manages = db.query(ShiftManage).filter(
+        # 토큰 정보 우선 활용(ADM과 같이 Nurse 레코드가 없는 경우 대비)
+        if getattr(current_user, 'office_id', None) and getattr(current_user, 'group_id', None):
+            office_id = current_user.office_id
+            target_group_id = current_user.group_id
+        else:
+            nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+            if not nurse or not nurse.group:
+                raise HTTPException(status_code=404, detail="User group information not found")
+            office_id = nurse.group.office_id
+            target_group_id = current_user.group_id
+
+    # class_name 정규화: '', 'null', 'undefined'를 미지정으로 간주
+    raw_class = class_name.strip().lower() if isinstance(class_name, str) else None
+    has_class_filter = bool(raw_class) and raw_class not in ("null", "undefined")
+
+    # 조회 쿼리 구성
+    query = db.query(ShiftManage).filter(
         ShiftManage.office_id == office_id,
         ShiftManage.group_id == target_group_id,
-        ShiftManage.nurse_class == class_name,
-        # ShiftManage.config_version == config_version
-    ).order_by(ShiftManage.shift_slot.asc()).all()
-    # 데이터가 없으면 기본 슬롯 생성
-    
-    if not shift_manages:
+    )
+    if has_class_filter:
+        query = query.filter(ShiftManage.nurse_class == class_name)
+
+    shift_manages = query.order_by(ShiftManage.shift_slot.asc()).all()
+
+    # 데이터가 없을 때 기본 슬롯 생성: 클래스가 지정된 경우에만 생성
+    if not shift_manages and has_class_filter:
         default_slots = [
             {"shift_slot": 1, "main_code": "D", "codes": [], "manpower": 3},
             {"shift_slot": 2, "main_code": "E", "codes": [], "manpower": 3},
             {"shift_slot": 3, "main_code": "N", "codes": [], "manpower": 2}
         ]
 
-        # DB에 기본 슬롯 저장
         for slot_data in default_slots:
             shift_manage = ShiftManage(
                 office_id=office_id,
@@ -180,18 +202,12 @@ async def get_shift_manage(
                 main_code=slot_data["main_code"],
                 codes=slot_data["codes"],
                 manpower=slot_data["manpower"],
-                # config_version=config_version
             )
             db.add(shift_manage)
         db.commit()
 
-        # 다시 조회해서 반환
-        shift_manages = db.query(ShiftManage).filter(
-            ShiftManage.office_id == office_id,
-            ShiftManage.group_id == target_group_id,
-            ShiftManage.nurse_class == class_name,
-            # ShiftManage.config_version == config_version
-        ).order_by(ShiftManage.shift_slot.asc()).all()
+        shift_manages = query.order_by(ShiftManage.shift_slot.asc()).all()
+
     return [
         {
             "shift_slot": sm.shift_slot,

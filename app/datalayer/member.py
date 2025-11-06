@@ -34,6 +34,7 @@ class Member:
                 , CONVERT(VARCHAR(10), a.DateOfBirth, 23)as DateOfBirth
                 , a.JoinDate, a.Tel, a.PortableTel
                 , isnull(A.EmpAuthGbn,'') as EmpAuthGbn
+                , CASE WHEN ISNULL(a.EmpAuthGbn, '') = 'ADM' THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS is_master_admin
                 , isnull(A.Email,'') as Email
                 , isnull(A.mb_part,'') as mb_part
                 ,  a.zipcode, a.Address1, a.Address2

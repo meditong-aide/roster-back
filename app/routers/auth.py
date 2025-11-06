@@ -15,8 +15,8 @@ from sqlalchemy.orm import Session, joinedload
 from starlette.status import HTTP_301_MOVED_PERMANENTLY
 
 from datalayer.member import Member
-from db.client import get_db
-from db.client2 import msdb_manager
+# from db.client import get_db
+from db.client2 import get_db, msdb_manager
 from db.models import Nurse
 from schemas.auth_schema import User as UserSchema, TokenData
 from utils.email import email_sender, EmailSchema
@@ -112,11 +112,13 @@ async def login_for_access_token(
             # nurse_id = row['nurse_id']
             group_id = row['group_id']
             is_head_nurse = row['is_head_nurse']
+        # ADM 여부는 EmpAuthGbn으로 판정
+        is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_login_token(
-            data={"office_id": office_id, "account_id": account_id, "EmpAuthGbn": EmpAuthGbn
-                  , "nurse_id": nurse_id, "group_id": group_id, "is_head_nurse": is_head_nurse, "name": name}, expires_delta=access_token_expires
+            data={"office_id": office_id, "account_id": account_id, "EmpAuthGbn": EmpAuthGbn, "is_master_admin": is_master_admin,
+                  "nurse_id": nurse_id, "group_id": group_id, "is_head_nurse": is_head_nurse, "name": name}, expires_delta=access_token_expires
         )
 
         response.set_cookie(
@@ -165,6 +167,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         group_id: str = payload.get("group_id")
         is_head_nurse: str = payload.get("is_head_nurse")
         name: str = payload.get("name")
+        is_master_admin = payload.get("is_master_admin")
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
@@ -191,6 +194,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         office_id=office_id,  # This should now work with eager loading
         group_id=group_id,
         is_head_nurse=is_head_nurse,
+        is_master_admin= (bool(is_master_admin) if is_master_admin is not None else (str(EmpAuthGbn).upper() == 'ADM')),
         name = name,
         # EmpSeqNo = EmpSeqNo,
         EmpAuthGbn = EmpAuthGbn
