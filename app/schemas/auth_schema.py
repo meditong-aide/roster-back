@@ -7,12 +7,11 @@ class TokenData(BaseModel):
 class User(BaseModel):
     nurse_id: str
     account_id: str
-    #office_id: Optional[str] = None
-    OfficeCode: str
+    office_id: str
     group_id: str
     is_head_nurse: str
     name: str
-    EmpSeqNo: str = None
+    # EmpSeqNo: str = None
     EmpAuthGbn: str = None
 
     class Config:

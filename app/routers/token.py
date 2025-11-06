@@ -60,7 +60,7 @@ async def login_for_access_token(response: Response, request: Request, token: st
                 )
 
             for row in users:
-                OfficeCode = row['OfficeCode']
+                office_id = row['office_id'] if 'office_id' in row else row.get('OfficeCode')
                 EmpSeqNo = row['EmpSeqNo']
                 account_id = row['account_id']
                 EmpAuthGbn = row['EmpAuthGbn']
@@ -71,8 +71,8 @@ async def login_for_access_token(response: Response, request: Request, token: st
 
             access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
             access_token = create_login_token(
-                data={"OfficeCode": OfficeCode, "EmpSeqNo": EmpSeqNo, "account_id": account_id, "EmpAuthGbn": EmpAuthGbn
-                    , "nurse_id": EmpSeqNo, "group_id": group_id, "is_head_nurse": is_head_nurse, "name": name},
+                data={"office_id": office_id, "EmpSeqNo": EmpSeqNo, "account_id": account_id, "EmpAuthGbn": EmpAuthGbn,
+                      "nurse_id": EmpSeqNo, "group_id": group_id, "is_head_nurse": is_head_nurse, "name": name},
                 expires_delta=access_token_expires
             )
 

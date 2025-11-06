@@ -54,16 +54,17 @@ def get_user(db: Session, account_id: str):
 
 def mworks_get_user (account_id: str, password: str, client_ip: str) :
     rows = msdb_manager.fetch_all(Member.login_check(), params=(password, account_id))
-
+    print('rows', rows)
     for row in rows :
+        
        IsPWCorrect = row['IsPWCorrect']
        EmpSeqNo = row['EmpSeqNo']
-       OfficeCode = row['OfficeCode']
+       office_id = row['OfficeCode']
     LogType = 'W'
     RegDate = datetime.now()
 
 
-    params = (account_id, RegDate, client_ip, EmpSeqNo, OfficeCode, LogType)
+    params = (account_id, RegDate, client_ip, EmpSeqNo, office_id, LogType)
     if not IsPWCorrect :
         raise HTTPException(status_code=500, detail=f"Login failed")
 
@@ -104,19 +105,19 @@ async def login_for_access_token(
             )
 
         for row in users:
-            OfficeCode = row['OfficeCode']
-            EmpSeqNo = row['EmpSeqNo']
+            office_id = row['office_id']
+            nurse_id = row['nurse_id']
             account_id = row['account_id']
             EmpAuthGbn = row['EmpAuthGbn']
             name = row['name']
-            nurse_id = row['nurse_id']
+            # nurse_id = row['nurse_id']
             group_id = row['group_id']
             is_head_nurse = row['is_head_nurse']
 
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_login_token(
-            data={"OfficeCode": OfficeCode, "EmpSeqNo": EmpSeqNo, "account_id": account_id, "EmpAuthGbn": EmpAuthGbn
-                  , "nurse_id": EmpSeqNo, "group_id": group_id, "is_head_nurse": is_head_nurse, "name": name}, expires_delta=access_token_expires
+            data={"office_id": office_id, "account_id": account_id, "EmpAuthGbn": EmpAuthGbn
+                  , "nurse_id": nurse_id, "group_id": group_id, "is_head_nurse": is_head_nurse, "name": name}, expires_delta=access_token_expires
         )
 
         response.set_cookie(
@@ -157,7 +158,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
     try:
         token = token.replace("Bearer ", "")
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        OfficeCode: str = payload.get("OfficeCode")
+        office_id: str = payload.get("office_id")
         EmpSeqNo: str = payload.get("EmpSeqNo")
         account_id: str = payload.get("account_id")
         EmpAuthGbn: str = payload.get("EmpAuthGbn")
@@ -165,10 +166,10 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         group_id: str = payload.get("group_id")
         is_head_nurse: str = payload.get("is_head_nurse")
         name: str = payload.get("name")
-
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
+        print('token_data', group_id)
     except JWTError:
         return None # If token is invalid, treat as not logged in
     
@@ -186,13 +187,13 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
     #     name = user.name
 
     return UserSchema(
-        nurse_id= EmpSeqNo,
+        nurse_id= nurse_id,
         account_id=account_id,
-        OfficeCode=OfficeCode,  # This should now work with eager loading
+        office_id=office_id,  # This should now work with eager loading
         group_id=group_id,
         is_head_nurse=is_head_nurse,
         name = name,
-        EmpSeqNo = EmpSeqNo,
+        # EmpSeqNo = EmpSeqNo,
         EmpAuthGbn = EmpAuthGbn
     )
 

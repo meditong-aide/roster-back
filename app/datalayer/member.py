@@ -26,10 +26,8 @@ class Member:
 
     def member_view() :
         _queryString = """
-        Select A.OfficeCode as OfficeCode
-                , C.OfficeID as office_id
+        Select A.OfficeCode as office_id
                 , C.OfficeName as office_name
-                , A.EmpSeqNo
                 , B.MemberID as account_id
                 , A.EmployeeName as name
                 , a.gender
