@@ -31,15 +31,20 @@ def save_roster_config_service(
         target_office_id: str
 
         if override_group_id:
+            print(1)
             group_row = db.query(Group).filter(Group.group_id == override_group_id).first()
             if not group_row:
                 raise Exception("지정한 그룹을 찾을 수 없습니다.")
             target_group_id = group_row.group_id
             target_office_id = group_row.office_id
         else:
+            
             nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
-            if not nurse or not nurse.group:
-                raise Exception("User group information not found")
+
+            # if not nurse or not nurse.group:
+            #     raise Exception("User group information not found")
+            print('user', user)
+            print('nurse', nurse)
             target_group_id = user.group_id
             target_office_id = nurse.group.office_id
 

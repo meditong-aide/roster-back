@@ -28,9 +28,13 @@ from services.excel_service import (
     save_excel_data,
     create_groups_and_save_data,
     create_nurse_template2,
-    process_excel_upload2,
+    # process_excel_upload2,
+    upload2_validate,
+    upload2_confirm,
+    export_members_excel_bytes,
 )
 from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse, Response
 
 
 router = APIRouter(
@@ -45,6 +49,9 @@ async def get_nurses_in_group(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+
+    print('group_id', group_id)
+    print('current_user.group_id', current_user.group_id)
     try:
         # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
         if office_id or group_id:
@@ -53,7 +60,8 @@ async def get_nurses_in_group(
             return get_nurses_filtered_service(current_user, db, office_id=office_id, group_id=group_id)
         return get_nurses_in_group_service(current_user, db)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"간호사 목록 조회 실패: {str(e)}")
+        print('error', e)
+        # raise HTTPException(status_code=500, detail=f"간호사 목록 조회 실패: {str(e)}")
 
 @router.get("/personnel-basic-info")
 async def get_personnel_basic_info(
@@ -105,9 +113,11 @@ async def bulk_update_nurses(
     db: Session = Depends(get_db)
 ):
     try:
+
         # ADM이 group_id를 지정하면 해당 병동을 대상으로 업데이트 허용
         return bulk_update_nurses_service(nurses_data, current_user, db, override_group_id=group_id)
     except Exception as e:
+        print('error1', e)
         raise HTTPException(status_code=500, detail=f"간호사 일괄 업데이트 실패: {str(e)}") 
 
 @router.get("/template-download")
@@ -170,31 +180,111 @@ async def upload_excel(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"엑셀 업로드 실패: {str(e)}")
 
-@router.post("/upload2-excel")
-async def upload_excel2(
+# @router.post("/upload2-excel")
+# async def upload_excel2(
+#     file: UploadFile = File(...),
+#     current_user: UserSchema = Depends(get_current_user_from_cookie),
+#     db: Session = Depends(get_db),
+#     group_id: Optional[str] = None,
+# ):
+#     print('[/upload2-excel] group_id', group_id)
+#     """엑셀 업로드2: mdt_temp에서 account_id 존재 여부를 office_id 기준으로 검증 - ADM 전용"""
+#     try:
+#         if not current_user or not current_user.is_master_admin:
+#             raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+#         if file.size and file.size > 10 * 1024 * 1024:
+#             raise HTTPException(status_code=400, detail="파일 크기는 10MB를 초과할 수 없습니다.")
+#         if not file.filename.lower().endswith(('.xlsx', '.xls')):
+#             raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다. (.xlsx, .xls만 지원)")
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+#             content = await file.read()
+#             tmp_file.write(content)
+#             tmp_file_path = tmp_file.name
+#         print('group_id11', group_id)
+#         try:
+#             result = process_excel_upload2(tmp_file_path, current_user, db, target_group_id=group_id)
+#             return result
+#         finally:
+#             os.unlink(tmp_file_path)
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"엑셀 업로드2 실패: {str(e)}")
+
+
+class Upload2ConfirmRequest(BaseModel):
+    rows: List[dict]
+    group_id: Optional[str] = None
+
+
+@router.post("/upload2-validate")
+async def upload2_validate_endpoint(
     file: UploadFile = File(...),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """엑셀 업로드2: mdt_temp에서 account_id 존재 여부를 office_id 기준으로 검증 - ADM 전용"""
+    """업로드2 - 검증 전용. 오류 목록과 정규화된 행을 반환한다."""
     try:
         if not current_user or not current_user.is_master_admin:
             raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
-        if file.size and file.size > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="파일 크기는 10MB를 초과할 수 없습니다.")
-        if not file.filename.lower().endswith(('.xlsx', '.xls')):
-            raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다. (.xlsx, .xls만 지원)")
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             content = await file.read()
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
         try:
-            result = process_excel_upload2(tmp_file_path, current_user, db)
+            result = upload2_validate(tmp_file_path, current_user, db)
             return result
         finally:
             os.unlink(tmp_file_path)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"엑셀 업로드2 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
+
+
+@router.post("/upload2-confirm")
+async def upload2_confirm_endpoint(
+    payload: Upload2ConfirmRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """업로드2 - 검증 통과 후 저장. 오류가 있는 행은 건너뜀."""
+    try:
+        if not current_user or not current_user.is_master_admin:
+            raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+        target_group_id = payload.group_id or current_user.group_id
+        result = upload2_confirm(payload.rows, current_user, db, target_group_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
+
+
+@router.get("/export-members")
+async def export_members(
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+):
+    """ADM 전용: 현재 오피스 전체 인원 정보를 엑셀로 내려받기."""
+    try:
+        if not current_user or not current_user.is_master_admin:
+            raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+
+        print(f"[DEBUG] current_user={current_user}")
+        print(f"[DEBUG] current_user.office_id={getattr(current_user, 'office_id', None)}")
+
+        content = export_members_excel_bytes(current_user.office_id)
+        print(f"[DEBUG] export result type={type(content)} size={len(content) if content else 0}")
+
+        filename = f"구성원_목록_{current_user.office_id}.xlsx"
+        import urllib.parse
+        encoded_filename = urllib.parse.quote(filename)
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+            },
+        )
+
+    except Exception as e:
+        print("[ERROR] export_members_excel error:", e)
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @router.post("/validate-excel")
 async def validate_excel_data_endpoint(

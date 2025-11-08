@@ -118,6 +118,7 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
     """
     시프트 등록 서비스 함수
     """
+    print('----------------------------------[add_shift_service] group_id', override_group_id)
     if not current_user or not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
     target_group_id = override_group_id or current_user.group_id

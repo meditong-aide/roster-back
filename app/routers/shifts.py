@@ -40,9 +40,7 @@ async def get_shifts(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)   
 ):
-    print('진입1')
-    print('current_user', current_user)
-    print('group_id', group_id)
+
     try:
         backend = os.getenv("DB_BACKEND", "mysql").lower()
         override_gid = None
@@ -56,7 +54,7 @@ async def get_shifts(
         backend = 'mssql'
         if backend == "mssql":
             print('여기')
-            shifts = get_shifts_service_mssql(current_user, db)
+            shifts = get_shifts_service_mssql(current_user, db, override_gid)
         else:
             shifts = get_shifts_service_mysql(current_user, db, override_gid)
         for shift in shifts:
@@ -80,11 +78,13 @@ def _format_time_display(shift):
 @router.post("/shifts/add")
 async def add_shift(
     req: ShiftAddRequest,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     try:
-        result = add_shift_service(req, current_user, db)
+        print('----------------------------------[shifts/add] group_id', group_id)
+        result = add_shift_service(req, current_user, db, group_id)
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"근무코드 추가 실패: {str(e)}")
@@ -92,11 +92,13 @@ async def add_shift(
 @router.post("/shifts/update")
 async def update_shift(
     req: ShiftUpdateRequest,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     try:
-        result = update_shift_service(req, current_user, db)
+        print('[shifts/update] group_id', group_id)
+        result = update_shift_service(req, current_user, db, group_id)
         return result
     except Exception as e:
         print('error', e)
@@ -104,22 +106,25 @@ async def update_shift(
 @router.post("/shifts/remove")
 async def remove_shift(
     req: RemoveShiftRequest,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     try:
-        return remove_shift_service(req, current_user, db)
+        return remove_shift_service(req, current_user, db, group_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"근무코드 삭제 실패: {str(e)}")
 
 @router.post("/shifts/move")
 async def move_shift(
     req: MoveShiftRequest,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     try:
-        return move_shift_service(req, current_user, db)
+        print('[shifts/move] group_id', group_id)
+        return move_shift_service(req, current_user, db, group_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"근무코드 순서 변경 실패: {str(e)}")
 
@@ -227,7 +232,8 @@ async def save_shift_manage(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    if not current_user or not current_user.is_head_nurse:
+    print('current_user', current_user)
+    if not current_user and not current_user.is_head_nurse and not current_user.is_master_admin:
         raise HTTPException(status_code=403, detail="Permission denied")
     
     # Get current user's office_id

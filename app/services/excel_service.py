@@ -9,11 +9,13 @@ import os
 import re
 from typing import List, Dict, Any, Tuple, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
 from datetime import datetime
 
 from db.models import Nurse as NurseModel, Group as GroupModel, Office as OfficeModel
 from schemas.auth_schema import User as UserSchema
+from db.client2 import msdb_manager
+from datalayer.member import Member
 
 
 def create_nurse_template() -> str:
@@ -60,8 +62,15 @@ def create_nurse_template() -> str:
 def create_nurse_template2() -> str:
     """엑셀 템플릿2: 계정ID/이름 두 컬럼만 포함."""
     template_data = {
-        '계정 ID': ['nurse001', 'nurse002', '(영문숫자조합)'],
-        '이름': ['김간호', '이수간', '(한글이름)'],
+        '사번(필수)': ['1001', '1002', '1003', '(영문숫자조합)'],
+        '계정 ID(필수)': ['nurse001', 'nurse002', 'nurse003', '(영문숫자조합)'],
+        '직원명(필수)': ['김수간', '이간호', '최간호', '(한글이름)'],
+        '직무(필수)': ['HN', 'AN', 'RN', ('직무코드')],
+        '경력(필수)': [25, 15, 1, ('경력년수')],
+        '수간호사여부(필수)': ['Y', 'N', 'N', ('수간호사여부 정보')],
+        '입사일(선택)': ['2025-01-03', '', '', ('입사일 정보')],
+        '적용해제일(선택)': ['2025-01-25', '', '', ('근무 표 적용해제일 정보')],
+
     }
     df = pd.DataFrame(template_data)
     with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
@@ -339,59 +348,421 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
         }
 
 
-def process_excel_upload2(file_path: str, user: UserSchema, db: Session) -> Dict[str, Any]:
-    """엑셀 업로드2: 각 행의 account_id를 현재 사용자 office_id와 함께 mdt_temp에서 검증.
+# def process_excel_upload2(file_path: str, user: UserSchema, db: Session, target_group_id: Optional[str] = None) -> Dict[str, Any]:
+#     """
+#     엑셀 업로드2 처리 함수.
 
-    검증 규칙:
-    - account_id 필수, 영숫자만 허용
-    - mdt_temp에 (office_id=current_user.office_id, account_id=행.account_id) 존재해야 OK
-    - 성공/오류 카운트와 오류 목록 반환
+#     요약: 한 번의 MSSQL 조회로 해당 오피스의 허용 계정 목록을 가져온 뒤,
+#     엑셀의 각 `account_id`를 검증하고, 통과 시 `nurses`에 등록/업데이트합니다.
+
+#     인자
+#     - file_path: 업로드된 엑셀 임시 경로
+#     - user: 현재 사용자
+#     - db: 세션
+#     - target_group_id: ADM이 선택한 대상 그룹 ID (없으면 user.group_id 사용)
+
+#     반환
+#     - { success: int, errors: [{row, reason}], rows: [{account_id, name}] }
+
+#     예시: 허용 문자 제약 정규식은 r'^[A-Za-z0-9]+$' (예: 'nurse01' OK, 'nurse_01' X)
+#     """
+#     try:
+#         df = pd.read_excel(file_path, sheet_name=0)
+#         df = df.dropna(how='all')
+#         if len(df) > 2000:
+#             raise ValueError("최대 2000행까지만 업로드 가능합니다.")
+#         # 컬럼 추출(유연 매핑)
+#         def find_col(candidates: list[str]) -> str:
+#             for c in df.columns:
+#                 cc = str(c).strip()
+#                 if cc in candidates:
+#                     return c
+#             raise ValueError(f"필수 컬럼 누락: {candidates}")
+#         def find_col_optional(candidates: list[str]) -> Optional[str]:
+#             for c in df.columns:
+#                 cc = str(c).strip()
+#                 if cc in candidates:
+#                     return c
+#             return None
+
+#         # 신규 템플릿2 컬럼 매핑
+#         col_empnum = find_col(['사번(필수)','사번','EmpNum','emp_num'])
+#         col_acc = find_col(['계정 ID(필수)','계정 ID','ID','아이디','account_id'])
+#         col_name = find_col(['직원명(필수)','이름','성명','name'])
+#         col_role = find_col(['직무(필수)','직무','role'])
+#         col_exp = find_col(['경력(필수)','경력','experience'])
+#         col_head = find_col(['수간호사여부(필수)','수간호사여부','is_head_nurse'])
+#         col_join = find_col_optional(['입사일(선택)','입사일','joining_date'])
+#         col_resi = find_col_optional(['적용해제일(선택)','적용해제일','퇴사일','resignation_date'])
+
+#         office_id = user.office_id
+#         print('office_id', office_id)
+#         print('target_group_id', target_group_id)
+#         # 대상 그룹 결정: 파라미터 우선, 없으면 현재 사용자 그룹
+#         group_id_for_insert = (target_group_id or getattr(user, 'group_id', None))
+#         if not group_id_for_insert:
+#             return {"success": 0, "errors": [{"row": 0, "reason": "group_id가 필요합니다. ADM은 선택한 병동의 group_id를 쿼리로 전달하세요."}], "rows": []}
+
+#         # 1) 허용 계정 목록을 한 번에 조회(성능 개선)
+#         rows = msdb_manager.fetch_all(Member.member_accounts_by_office(), params=(str(office_id),))
+#         # account_id → (name, EmpAuthGbn)
+#         allowed: dict[str, tuple[str, str | None]] = {}
+#         for r in rows or []:
+#             acc = str(r.get('account_id', '')).strip()
+#             nm = str(r.get('name', '')).strip()
+#             auth = r.get('EmpAuthGbn')
+#             if acc:
+#                 allowed[acc] = (nm, auth)
+#         success = 0
+#         errors: list[dict] = []
+#         rows_out: list[dict] = []
+
+#         # 2) 행별 검증 및 누적 등록
+#         for i, row in df.iterrows():
+#             ridx = int(i) + 2  # 헤더 포함 행 번호
+#             emp_num = str(row.get(col_empnum, '')).strip()
+#             account_id = str(row.get(col_acc, '')).strip()
+#             # 이름은 엑셀 값 우선, 없으면 DB조회값 사용
+#             name = str(row.get(col_name, '')).strip()
+#             # nurse_id = str(row.get(col_nurse_id, '')).strip()
+#             role = str(row.get(col_role, '')).strip()
+#             # 경험치는 숫자 변환
+#             try:
+#                 experience_val = int(float(str(row.get(col_exp, '')).strip()))
+#             except Exception:
+#                 experience_val = None
+#             head_raw = str(row.get(col_head, '')).strip().upper()
+#             head_bool = True if head_raw in ['Y','YES','1','TRUE','T'] else False
+#             # 날짜 파싱
+#             def parse_dt(v):
+#                 try:
+#                     if pd.isna(v) or str(v).strip() == '':
+#                         return None
+#                     return pd.to_datetime(v, errors='coerce').to_pydatetime()
+#                 except Exception:
+#                     return None
+#             joining_dt = parse_dt(row.get(col_join)) if col_join else None
+#             resignation_dt = parse_dt(row.get(col_resi)) if col_resi else None
+#             if not account_id:
+#                 errors.append({"row": ridx, "reason": "계정 ID 누락"})
+#                 continue
+#             # 공백 제외 모든 문자 허용(최대 50자) → DB 컬럼 VARCHAR(50) 기준
+#             if not re.match(r'^\S{1,50}$', account_id):
+#                 errors.append({"row": ridx, "reason": "계정 ID 형식 오류: 공백 제외 최대 50자까지 허용됩니다."})
+#                 continue
+#             # 허용 계정 존재 검사 (사전 조회 결과 사용)
+#             if account_id not in allowed:
+#                 errors.append({"row": ridx, "reason": f"허용되지 않은 계정 또는 오피스 불일치: office_id={office_id}, account_id={account_id}"})
+#                 continue
+#             db_name, db_auth = allowed[account_id]
+#             final_name = name or db_name
+#             if not final_name:
+#                 errors.append({"row": ridx, "reason": "이름을 확인할 수 없습니다. 엑셀 또는 원장(member)에서 이름이 필요합니다."})
+#                 continue
+
+#             # 이미 존재하는 nurse 여부 확인 (account_id 기준)
+#             existing = db.query(NurseModel).filter(NurseModel.account_id == account_id).first()
+#             if existing:
+#                 # 최소 업데이트: 이름만 동기화
+#                 if final_name and existing.name != final_name:
+#                     existing.name = final_name
+#                 # 확장 필드 업데이트
+#                 # emp_num/role 기본값 처리
+#                 setattr(existing, 'emp_num', (emp_num if emp_num is not None else ''))
+#                 existing.role = (role if role is not None else '')
+#                 if experience_val is not None:
+#                     existing.experience = experience_val
+#                 existing.is_head_nurse = head_bool
+#                 # office_id는 ADM의 office로 통일
+#                 try:
+#                     existing.office_id = user.office_id
+#                 except Exception:
+#                     pass
+#                 if joining_dt:
+#                     existing.joining_date = joining_dt
+#                 if resignation_dt:
+#                     existing.resignation_date = resignation_dt
+#                 # 그룹 이동은 업로드2의 범위를 넘으므로 변경하지 않음
+#             else:
+#                 # 신규 생성: 최소 필수값 채우기
+#                 print('col_nurse_id', col_nurse_id)
+#                 print('uuid.uuid4()', str(row.get(col_nurse_id, uuid.uuid4())).strip())
+#                 seq_next = get_next_sequence(group_id_for_insert, 1, db)
+#                 new_nurse = NurseModel(
+#                     # nurse_id=str(uuid.uuid4()),
+#                     nurse_id=str(row.get(col_nurse_id, uuid.uuid4())).strip(),
+#                     group_id=group_id_for_insert,
+#                     office_id=user.office_id,
+#                     emp_num=(emp_num if emp_num is not None else ''),
+#                     account_id=account_id,
+#                     name=final_name or account_id,
+#                     experience=(experience_val if experience_val is not None else 1),
+#                     role=(role if role is not None else ''),
+#                     level_='일반',
+#                     is_head_nurse=head_bool,
+#                     emp_auth_gbn=db_auth,
+#                     is_night_nurse=0,
+#                     personal_off_adjustment=0,
+#                     preceptor_id=None,
+#                     joining_date=joining_dt,
+#                     resignation_date=resignation_dt,
+#                     sequence=seq_next,
+#                     active=1,
+#                 )
+#                 db.add(new_nurse)
+
+#             success += 1
+#             rows_out.append({"account_id": account_id, "name": final_name or db_name})
+
+#         # 3) 저장
+#         try:
+#             db.commit()
+#         except Exception as e:
+#             db.rollback()
+#             errors.append({"row": 0, "reason": f"DB 커밋 실패: {str(e)}"})
+
+#         return {"success": success, "errors": errors, "rows": rows_out}
+#     except Exception as e:
+#         return {"success": 0, "errors": [{"row": 0, "reason": str(e)}], "rows": []}
+
+
+def upload2_validate(file_path: str, user: UserSchema, db: Session) -> Dict[str, Any]:
+    """업로드2: 파일을 검증만 수행하고, 정규화된 행과 오류를 반환한다.
+
+    - 행별 오류: 포맷/타입/허용 계정/필수값 등
+    - 전역 오류: 수간호사 최소 1명, DB 중복 계정 등
     """
     try:
         df = pd.read_excel(file_path, sheet_name=0)
         df = df.dropna(how='all')
         if len(df) > 2000:
             raise ValueError("최대 2000행까지만 업로드 가능합니다.")
-        # 컬럼 추출(유연 매핑)
+
         def find_col(candidates: list[str]) -> str:
             for c in df.columns:
                 cc = str(c).strip()
                 if cc in candidates:
                     return c
             raise ValueError(f"필수 컬럼 누락: {candidates}")
-        col_acc = find_col(['계정 ID','ID','아이디','account_id'])
-        col_name = find_col(['이름','성명','name'])
+        def find_col_optional(candidates: list[str]) -> Optional[str]:
+            for c in df.columns:
+                cc = str(c).strip()
+                if cc in candidates:
+                    return c
+            return None
 
+        col_empnum = find_col(['사번(필수)','사번','EmpNum','emp_num'])
+        col_acc = find_col(['계정 ID(필수)','계정 ID','ID','아이디','account_id'])
+        col_name = find_col(['직원명(필수)','이름','성명','name'])
+        col_role = find_col(['직무(필수)','직무','role'])
+        col_exp = find_col(['경력(필수)','경력','experience'])
+        col_head = find_col(['수간호사여부(필수)','수간호사여부','is_head_nurse'])
+        col_join = find_col_optional(['입사일(선택)','입사일','joining_date'])
+        col_resi = find_col_optional(['적용해제일(선택)','적용해제일','퇴사일','resignation_date'])
+        
         office_id = user.office_id
-        success = 0
+        rows_allowed = msdb_manager.fetch_all(Member.member_accounts_by_office(), params=(str(office_id),))
+        allowed: dict[str, tuple[str, str | None]] = {}
+        for r in rows_allowed or []:
+            acc = str(r.get('account_id', '')).strip()
+            nm = str(r.get('name', '')).strip()
+            auth = r.get('EmpAuthGbn')
+            nurse_id = str(r.get('nurse_id', uuid.uuid4())).strip()
+            if acc:
+                allowed[acc] = (nm, auth, nurse_id)
+        normalized: list[dict] = []
         errors: list[dict] = []
-        rows_out: list[dict] = []
+        head_count = 0
+        acc_in_file: set[str] = set()
+
+        def parse_dt(v):
+            try:
+                if pd.isna(v) or str(v).strip() == '':
+                    return None
+                return pd.to_datetime(v, errors='coerce').to_pydatetime()
+            except Exception:
+                return None
 
         for i, row in df.iterrows():
-            ridx = int(i) + 2  # 헤더 포함 행 번호
+            ridx = int(i) + 2
+            row_errs: list[str] = []
+            emp_num = str(row.get(col_empnum, '')).strip()
             account_id = str(row.get(col_acc, '')).strip()
             name = str(row.get(col_name, '')).strip()
-            if not account_id or not re.match(r'^[A-Za-z0-9]+$', account_id):
-                errors.append({"row": ridx, "reason": "invalid account_id"})
-                continue
-            # mdt_temp 존재 검사
-            try:
-                cnt = db.execute(
-                    "SELECT COUNT(1) AS c FROM mdt_temp WHERE office_id=:o AND account_id=:a",
-                    {"o": office_id, "a": account_id}
-                ).scalar() or 0
-            except Exception as e:
-                errors.append({"row": ridx, "reason": f"lookup failed: {e}"})
-                continue
-            if int(cnt) <= 0:
-                errors.append({"row": ridx, "reason": "account_id not found in mdt_temp"})
-                continue
-            success += 1
-            rows_out.append({"account_id": account_id, "name": name})
+            role = str(row.get(col_role, 'RN')).strip()
 
-        return {"success": success, "errors": errors, "rows": rows_out}
+            # experience: 비어있으면 None 허용, 값이 있으면 숫자만 허용
+            exp_val = None
+            raw_exp_val = row.get(col_exp, 1)
+            # print('raw_exp_val', raw_exp_val)
+            import math
+            # NaN/None/빈문자/문자 'nan' 전부 필터링
+            if raw_exp_val not in ['', None] and not (isinstance(raw_exp_val, float) and math.isnan(raw_exp_val)) and str(raw_exp_val).lower() != 'nan':
+                try:
+                    exp_val = int(float(str(raw_exp_val).strip()))
+                except Exception:
+                    # print('raw_exp_val', raw_exp_val)
+                    row_errs.append("경력은 숫자여야 합니다. 예: 1, 3, 10")
+
+            head_raw = str(row.get(col_head, '')).strip().upper()
+            is_head = True if head_raw in ['Y','YES','1','TRUE','T'] else False
+            if is_head:
+                head_count += 1
+
+            joining_raw = row.get(col_join) if col_join else None
+            resignation_raw = row.get(col_resi) if col_resi else None
+            # 날짜: None 허용, 숫자 허용, 문자열인 경우에만 YYYY-MM-DD 형식 검증
+            joining_dt = parse_dt(joining_raw) if col_join else None
+            if isinstance(joining_raw, str) and joining_raw.strip() and not re.match(r'^\d{4}-\d{2}-\d{2}$', joining_raw.strip()):
+                row_errs.append("입사일 형식이 올바르지 않습니다. 예: 2025-10-10")
+            resignation_dt = parse_dt(resignation_raw) if col_resi else None
+            if isinstance(resignation_raw, str) and resignation_raw.strip() and not re.match(r'^\d{4}-\d{2}-\d{2}$', resignation_raw.strip()):
+                row_errs.append("적용해제일 형식이 올바르지 않습니다. 예: 2025-10-10")
+
+            if not account_id:
+                row_errs.append("계정 ID 누락")
+            elif not re.match(r'^\S{1,50}$', account_id):
+                row_errs.append("계정 ID 형식 오류: 공백 제외 최대 50자까지 허용됩니다.")
+            elif account_id not in allowed:
+                row_errs.append(f"허용되지 않은 계정 또는 오피스 불일치: office_id={office_id}, account_id={account_id}")
+
+            if not name:
+                # 원장에서 이름 보강
+                name = (allowed.get(account_id, ("", None))[0] if account_id in allowed else "")
+                if not name:
+                    row_errs.append("직원명 누락")
+
+            if not role:
+                row_errs.append("직무 누락")
+
+            if account_id in acc_in_file:
+                row_errs.append("엑셀 내 중복 계정 ID")
+            else:
+                acc_in_file.add(account_id)
+
+            normalized.append({
+                'row': ridx,
+                'emp_num': emp_num or None,
+                'account_id': account_id,
+                'name': name,
+                'role': role,
+                'experience': exp_val,
+                'is_head_nurse': is_head,
+                'joining_date': joining_dt.isoformat() if joining_dt else None,
+                'resignation_date': resignation_dt.isoformat() if resignation_dt else None,
+                'nurse_id': allowed[account_id][2],
+            })
+            if row_errs:
+                errors.append({'row': ridx, 'reason': '; '.join(row_errs)})
+
+        # 전역 검증: 수간호사 최소 1명
+        if head_count == 0:
+            errors.append({'row': 0, 'reason': '수간호사는 최소 1명 이상이어야 합니다.'})
+
+        # 전역 검증: DB 중복 계정
+        if acc_in_file:
+            existing = db.query(NurseModel.account_id).filter(NurseModel.account_id.in_(list(acc_in_file))).all()
+            if existing:
+                for (acc,) in existing:
+                    errors.append({'row': 0, 'reason': f'이미 존재하는 계정 ID: {acc}'})
+
+        return {
+            'success': 0 if errors else len(normalized),
+            'errors': errors,
+            'rows': normalized,
+            'summary': {
+                'total': len(normalized),
+                'head_nurses': head_count,
+                'error_count': len(errors),
+            }
+        }
     except Exception as e:
-        return {"success": 0, "errors": [{"row": 0, "reason": str(e)}], "rows": []}
+        return {"success": 0, "errors": [{"row": 0, "reason": str(e)}], "rows": [], 'summary': {'total': 0, 'head_nurses': 0, 'error_count': 1}}
+
+
+def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, target_group_id: str) -> Dict[str, Any]:
+    """업로드2: 검증된 행을 저장한다. 오류 포함 행은 건너뜀."""
+    try:
+        if not target_group_id:
+            return {"success": 0, "errors": [{"row": 0, "reason": "group_id가 필요합니다."}]}
+        print('[/upload2_confirm] target_group_id', target_group_id)
+        print('[/upload2_confirm] rows', rows)
+        saved = 0
+        updated = 0
+        for item in rows:
+            if not item or item.get('error'):
+                continue
+            print('이리옴', item.get('nurse_id'))
+            account_id = item.get('account_id')
+            name = item.get('name')
+            role = item.get('role')
+            exp_val = item.get('experience')
+            nurse_id = item.get('nurse_id').strip()
+            is_head = bool(item.get('is_head_nurse', False))
+            emp_num = item.get('emp_num')
+            jd = item.get('joining_date')
+            rd = item.get('resignation_date')
+            joining_dt = pd.to_datetime(jd).to_pydatetime() if jd else None
+            resignation_dt = pd.to_datetime(rd).to_pydatetime() if rd else None
+
+            existing = db.query(NurseModel).filter(NurseModel.account_id == account_id).first()
+            print(1)
+            if existing:
+                if name and existing.name != name:
+                    existing.name = name
+                setattr(existing, 'emp_num', (emp_num if emp_num is not None else ''))
+                existing.role = (role if role is not None else '')
+                if isinstance(exp_val, int):
+                    existing.experience = exp_val
+                existing.is_head_nurse = is_head
+                try:
+                    existing.office_id = user.office_id
+                except Exception:
+                    pass
+                if joining_dt:
+                    existing.joining_date = joining_dt
+                if resignation_dt:
+                    existing.resignation_date = resignation_dt
+                updated += 1
+                continue
+            print(2)
+            seq_next = get_next_sequence(target_group_id, 1, db)
+            print(3)
+            new_nurse = NurseModel(
+                nurse_id= nurse_id,
+                group_id=target_group_id,
+                office_id=user.office_id,
+                emp_num=(emp_num if emp_num is not None else ''),
+                account_id=account_id,
+                name=name or account_id,
+                experience=(exp_val if isinstance(exp_val, int) else 1),
+                role=(role if role is not None else ''),
+                level_='일반',
+                is_head_nurse=is_head,
+                is_night_nurse=0,
+                personal_off_adjustment=0,
+                preceptor_id=None,
+                joining_date=joining_dt,
+                resignation_date=resignation_dt,
+                sequence=seq_next,
+                active=1,
+            )
+            print(4)
+            import pprint
+            pprint.pprint(new_nurse.__dict__)
+            db.add(new_nurse)
+            saved += 1
+
+        print(5)
+        db.commit()
+        print(6)
+        return {"success": saved + updated, "saved": saved, "updated": updated, "errors": []}
+    except Exception as e:
+        print(7)
+        print('error', e)
+        db.rollback()
+        print(8)
+        return {"success": 0, "errors": [{"row": 0, "reason": f"저장 실패: {str(e)}"}]}
 
 
 def get_excel_column_by_field(field: str, mapping: Dict[str, str]) -> str:
@@ -427,8 +798,8 @@ def validate_single_row(group_name: str, nurse_data: Dict[str, Any], user: UserS
     # 필수 필드 검증
     if not nurse_data.get('account_id'):
         errors.append("계정 ID는 필수입니다.")
-    elif not re.match(r'^[a-zA-Z0-9]+$', nurse_data['account_id']):
-        errors.append("계정 ID는 영문과 숫자만 사용 가능합니다.")
+    elif not re.match(r'^\S{1,50}$', nurse_data['account_id']):
+        errors.append("계정 ID 형식 오류: 공백 제외 최대 50자까지 허용됩니다.")
     
     if not nurse_data.get('name'):
         errors.append("이름은 필수입니다.")
@@ -837,3 +1208,78 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     wb.save(bio)
     bio.seek(0)
     return bio.read() 
+
+
+def export_members_excel_bytes(office_id: str) -> bytes:
+    """ADM용 멤버 목록 엑셀 생성.
+
+    - 입력: office_id
+    - 컬럼: 대분류, 중분류, 소분류, 부서명, 사번, 직원명, 계정 ID, 직무, 경력, 수간호사여부
+    - 반환: 생성된 xlsx 바이트
+    """
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+
+    rows = msdb_manager.fetch_all(Member.member_export_by_office(), params=(str(office_id),)) or []
+
+    headers = [
+        ("big_kind_name", "대분류"),
+        ("middle_kind_name", "중분류"),
+        ("small_kind_name", "소분류"),
+        ("mb_part_name", "부서명"),
+        ("OfficeEmpNum", "사번"),
+        ("MemberID", "계정 ID"),
+        ("EmployeeName", "직원명"),
+        ("duty", "직무"),
+        ("career", "경력"),
+        ("headnurse", "수간호사여부"),
+    ]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "구성원"
+
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+    header_font = Font(bold=True)
+    gray = PatternFill("solid", fgColor="DEE2E6")
+    thin = Side(style="thin", color="000000")
+    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # 안내 문구 (맨 윗줄, 노란색 배경)
+    guide_text = '사번 컬럼부터 우측으로 필요한 정보를 복사해 템플릿에 그룹(병동)별로 추가하여 업로드 하시면 됩니다'
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    gcell = ws.cell(row=1, column=1, value=guide_text)
+    gcell.alignment = left
+    gcell.fill = PatternFill("solid", fgColor="FFF59D")  # 연노랑
+    gcell.border = border_all
+
+    # 헤더 (2행부터)
+    for i, (_, label) in enumerate(headers, start=1):
+        cell = ws.cell(row=2, column=i, value=label)
+        cell.font = header_font
+        cell.alignment = center
+        cell.fill = gray
+        cell.border = border_all
+
+    # 데이터 (3행부터)
+    for r_idx, row in enumerate(rows, start=3):
+        for c_idx, (key, _) in enumerate(headers, start=1):
+            # pyodbc.Row 또는 dict 형태 지원
+            try:
+                val = row[key]
+            except Exception:
+                val = row.get(key) if hasattr(row, 'get') else None
+            cell = ws.cell(row=r_idx, column=c_idx, value=val)
+            cell.alignment = left
+            cell.border = border_all
+
+    # 약간의 폭 조정
+    for col in range(1, len(headers) + 1):
+        ws.column_dimensions[chr(64 + col)].width = 16
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.read()

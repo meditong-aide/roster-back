@@ -68,6 +68,7 @@ async def save_roster_config(
     is_admin = bool(getattr(user, 'is_master_admin', False))
 
     # 권한/대상 그룹 결정
+    print('user.group_id', user.group_id)
     override_gid: Optional[str] = None
     if user.is_head_nurse and user.group_id:
         override_gid = None  # HN은 본인 그룹 저장
@@ -163,7 +164,6 @@ async def get_config_by_version(
             raise HTTPException(status_code=403, detail="Group does not belong to your office")
         target_group_id = g.group_id
         target_office_id = g.office_id
-
     # load latest config for target
     config = db.query(RosterConfigModel).filter(
         RosterConfigModel.office_id == target_office_id,
@@ -204,8 +204,11 @@ async def get_config_by_version(
                 preceptor_gauge=getattr(cfg, 'preceptor_gauge', 5),
             )
             db.add(new_config)
+
             db.commit()
+
             db.refresh(new_config)
+
             return {
                 "config_id": new_config.config_id,
                 # "config_version": new_config.config_version,
@@ -265,6 +268,7 @@ async def get_config_by_version(
                 "preceptor_gauge" : config.preceptor_gauge,
             }
     except Exception as e:
+        print('error', e)
         raise HTTPException(status_code=500, detail=f"Failed to get config: {str(e)}")
     
 

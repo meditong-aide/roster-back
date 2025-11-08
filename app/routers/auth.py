@@ -38,6 +38,28 @@ router = APIRouter(
 # This was trying to read from the header, but we are using httpOnly cookies
 # oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
+def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
+    """간단 조회: nurses 테이블에서 토큰에 보강할 필드를 가져온다.
+
+    인자
+    - account_id: 조회할 계정 ID
+
+    반환
+    - {'office_id', 'account_id', 'is_head_nurse', 'group_id'} 중 존재하는 값만 담은 dict
+    """
+    try:
+        nurse = db.query(Nurse).filter(Nurse.account_id == account_id).first()
+        if not nurse:
+            return {}
+        return {
+            "office_id": getattr(nurse, "office_id", None),
+            "account_id": getattr(nurse, "account_id", None),
+            "is_head_nurse": bool(getattr(nurse, "is_head_nurse", False)),
+            "group_id": getattr(nurse, "group_id", None),
+        }
+    except Exception:
+        return {}
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
@@ -116,9 +138,26 @@ async def login_for_access_token(
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        
+        # nurses 테이블의 값으로 보강/덮어쓰기
+        extra_data = get_extra_data_from_nurses(db, account_id)
+        office_id = extra_data.get("office_id") or office_id
+        group_id = extra_data.get("group_id") or group_id
+        if "is_head_nurse" in extra_data:
+            is_head_nurse = extra_data["is_head_nurse"]
+
         access_token = create_login_token(
-            data={"office_id": office_id, "account_id": account_id, "EmpAuthGbn": EmpAuthGbn, "is_master_admin": is_master_admin,
-                  "nurse_id": nurse_id, "group_id": group_id, "is_head_nurse": is_head_nurse, "name": name}, expires_delta=access_token_expires
+            data={
+                "office_id": office_id,
+                "account_id": account_id,
+                "EmpAuthGbn": EmpAuthGbn,
+                "is_master_admin": is_master_admin,
+                "nurse_id": nurse_id,
+                "group_id": group_id,
+                "is_head_nurse": is_head_nurse,
+                "name": name,
+            },
+            expires_delta=access_token_expires,
         )
 
         response.set_cookie(

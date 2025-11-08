@@ -9,7 +9,7 @@ class User(BaseModel):
     account_id: str
     office_id: str
     group_id: str
-    is_head_nurse: str
+    is_head_nurse: bool = False
     is_master_admin: bool = False
     name: str
     # EmpSeqNo: str = None

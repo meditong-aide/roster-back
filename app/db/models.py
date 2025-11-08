@@ -40,8 +40,9 @@ class Nurse(Base):
     nurse_id = Column(VARCHAR(50), primary_key=True)
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
     # 관리자(ADM) 계정처럼 group_id가 없을 수 있으므로 office_id를 실컬럼으로 보유
-    office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'), nullable=True)
+    office_id = Column(VARCHAR(50), nullable=True)
     account_id = Column(VARCHAR(50), unique=True, nullable=False)
+    emp_num = Column(VARCHAR(50), nullable=True)
     name = Column(VARCHAR(50), nullable=False)
     experience = Column(SMALLINT)
     role = Column(VARCHAR(20))
@@ -67,9 +68,7 @@ class Nurse(Base):
     # teams와의 조인 키를 명시 (group_id, team_id)
     team = relationship("Team", primaryjoin="and_(Nurse.group_id==Team.group_id, Nurse.team_id==Team.team_id)", overlaps="group")
 
-    @property
-    def office_id(self) -> str | None:
-        return self.group.office_id if self.group else None 
+    # office_id는 컬럼으로 관리
 class Schedule(Base):
     __tablename__ = "schedules"
     schedule_id = Column(CHAR(12), primary_key=True)

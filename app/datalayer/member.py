@@ -45,7 +45,7 @@ class Member:
                 , '' as group_id
                 , isnull(a.career,'') as career
                 , isnull(a.duty,'') as duty
-                , isnull(a.headnurse,'') as is_head_nurse
+                , isnull(a.headnurse, 0) as is_head_nurse
                 , isnull(a.nightkeep,'') as nightkeep
             From bizwiz20db.Member A
             Inner Join bizwiz20db.Member_Login B On A.OfficeCode=B.OfficeCode And A.EmpSeqNo=B.EmpSeqNo
@@ -140,4 +140,35 @@ class Member:
              where empseqno = %s
             """
 
+        return _queryString
+
+    def member_accounts_by_office():
+        _queryString = """
+        SELECT 
+            i.MemberID AS account_id,
+            m.EmployeeName AS name,
+            m.EmpAuthGbn AS EmpAuthGbn,
+            m.EmpSeqNo AS nurse_id
+        FROM bizwiz20db.member_login AS i
+        LEFT JOIN bizwiz20db.member AS m 
+            ON i.EmpSeqNo = m.EmpSeqNo 
+        WHERE m.OfficeCode = %s
+          AND m.EmpAuthGbn IN ('ADM','MEM')
+        """
+        return _queryString
+
+    def member_export_by_office():
+        _queryString = """
+        select a.EmpSeqNo, c.big_kind
+             , isnull((select name from bizwiz20db.T_Team where OfficeCode = c.OfficeCode and big_kind = c.big_kind and depth = '1'), '') as big_kind_name
+             , c.middle_kind
+             , isnull((select name from bizwiz20db.T_Team where OfficeCode = c.OfficeCode and big_kind = c.big_kind and middle_kind = c.middle_kind and depth = '2'), '') as middle_kind_name
+             , c.small_kind
+             , isnull((select name from bizwiz20db.T_Team where OfficeCode = c.OfficeCode and big_kind = c.big_kind and middle_kind = c.middle_kind and small_kind = c.small_kind and depth = '3'), '') as small_kind_name
+             , c.mb_part, c.name as mb_part_name, a.OfficeEmpNum, a.EmployeeName, b.MemberID, a.duty, a.career, a.headnurse
+          from bizwiz20db.Member a
+               Inner Join bizwiz20db.Member_Login b On a.OfficeCode=b.OfficeCode And a.EmpSeqNo=b.EmpSeqNo
+               Left Join bizwiz20db.T_Team c On a.mb_part=c.mb_part And a.OfficeCode=c.OfficeCode
+         where b.officecode = %s and a.EmpAuthGbn in ('ADM','MEM')
+        """
         return _queryString

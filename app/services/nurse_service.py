@@ -47,13 +47,13 @@ def get_nurses_filtered_service(current_user, db: Session, office_id: str | None
         raise Exception("Not authenticated")
     if not getattr(current_user, 'is_master_admin', False):
         raise Exception("Permission denied")
-
     q = db.query(NurseModel)
-    if group_id:
-        q = q.filter(NurseModel.group_id == group_id)
-    elif office_id:
+    # 제공 여부 기준으로 분기: 비어있는 문자열도 필터로 적용되어 []를 반환하게 함
+    if group_id is not None:
+        q = q.filter(NurseModel.group_id == group_id, NurseModel.office_id == current_user.office_id)
+    elif office_id is not None:
         # 그룹 조인 후 office_id 매칭
-        q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == office_id)
+        q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == current_user.office_id)
     nurses = q.order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc()).all()
     return nurses
 
@@ -191,10 +191,10 @@ def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_
     if not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
     if not any(n.is_head_nurse for n in nurses_data):
+        print('n.is_head_nurse', [n.is_head_nurse for n in nurses_data])
         raise Exception("At least one head nurse must be assigned.")
     target_group_id = override_group_id or current_user.group_id
     db_nurses_dict = {n.nurse_id: n for n in db.query(NurseModel).filter(NurseModel.group_id == target_group_id).all()}
-    pprint.pprint([n.nurse_id for n in nurses_data])
     for nurse_data in nurses_data:
         db_nurse = db_nurses_dict.get(nurse_data.nurse_id)
         if db_nurse:
@@ -226,7 +226,9 @@ def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_
             except Exception as e:
                 print(f"[DEBUG] 신규 간호사 생성 실패: {e}")
                 continue
+    
     client_nurse_ids = {n.nurse_id for n in nurses_data}
+    print('client_nurse_ids', client_nurse_ids)
     for db_nurse_id, db_nurse in db_nurses_dict.items():
         if db_nurse_id not in client_nurse_ids:
             db.delete(db_nurse)

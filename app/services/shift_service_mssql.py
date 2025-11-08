@@ -25,7 +25,7 @@ def _to_time_str(value: Any) -> str | None:
     return s
 
 
-def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str, Any]]:
+def get_shifts_service(current_user, db: Session | None = None, override_group_id: str | None = None) -> List[Dict[str, Any]]:
     """MSSQL 전용 ORM 기반 시프트 조회 서비스.
     - 항상 MSSQL 세션을 사용합니다(파라미터 db 무시).
     - 존재하면 반환, 없으면 기본 4개(O,E,N,D) 생성 후 반환
@@ -33,13 +33,16 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
     """
     if not current_user:
         raise Exception("Not authenticated")
-
     session = db
     try:
         # 1) 조회
+        if override_group_id:
+            group_id = override_group_id
+        else:
+            group_id = current_user.group_id
         shifts = (
             session.query(Shift)
-            .filter(Shift.group_id == current_user.group_id)
+            .filter(Shift.office_id == current_user.office_id, Shift.group_id == group_id)
             .order_by(Shift.sequence.asc())
             .all()
         )
@@ -65,7 +68,7 @@ def get_shifts_service(current_user, db: Session | None = None) -> List[Dict[str
         # 2) 기본값 생성 (오피스/그룹은 존재한다고 가정; 없으면 office_id=None로 저장)
         # 기본값 생성
         office_id = None
-        group = session.query(Group).filter(Group.group_id == current_user.group_id).first()
+        group = session.query(Group).filter(Group.group_id == group_id).first()
         if group and group.office_id:
             office_id = group.office_id
         elif getattr(current_user, "office_id", None):
