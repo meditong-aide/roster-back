@@ -586,10 +586,12 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session) -> Dict[str,
         for i, row in df.iterrows():
             ridx = int(i) + 2
             row_errs: list[str] = []
-            emp_num = str(row.get(col_empnum, '')).strip()
+            emp_num_val = row.get(col_empnum)
+            emp_num = '' if pd.isna(emp_num_val) else str(emp_num_val).strip()
             account_id = str(row.get(col_acc, '')).strip()
             name = str(row.get(col_name, '')).strip()
-            role = str(row.get(col_role, 'RN')).strip()
+            role_val = row.get(col_role)
+            role = 'RN' if pd.isna(role_val) or not str(role_val).strip() else str(role_val).strip()
 
             # experience: 비어있으면 None 허용, 값이 있으면 숫자만 허용
             exp_val = None
@@ -692,14 +694,14 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
         for item in rows:
             if not item or item.get('error'):
                 continue
-            print('이리옴', item.get('nurse_id'))
+            
             account_id = item.get('account_id')
             name = item.get('name')
-            role = item.get('role')
-            exp_val = item.get('experience')
+            role = item.get('role', 'RN')
+            exp_val = item.get('experience', 1)
             nurse_id = item.get('nurse_id').strip()
             is_head = bool(item.get('is_head_nurse', False))
-            emp_num = item.get('emp_num')
+            emp_num = item.get('emp_num', '')
             jd = item.get('joining_date')
             rd = item.get('resignation_date')
             joining_dt = pd.to_datetime(jd).to_pydatetime() if jd else None

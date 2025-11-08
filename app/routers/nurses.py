@@ -143,8 +143,8 @@ async def download_template2(
 ):
     """신규 엑셀 템플릿2 (계정ID/이름만) 다운로드 - ADM 전용"""
     try:
-        if not current_user or not current_user.is_master_admin:
-            raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+        # if not current_user or not current_user.is_master_admin:
+        #     raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
         template_path = create_nurse_template2()
         return FileResponse(
             path=template_path,
@@ -152,6 +152,7 @@ async def download_template2(
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     except Exception as e:
+        print('error', e)
         raise HTTPException(status_code=500, detail=f"템플릿2 생성 실패: {str(e)}")
 
 @router.post("/upload-excel")
@@ -223,8 +224,8 @@ async def upload2_validate_endpoint(
 ):
     """업로드2 - 검증 전용. 오류 목록과 정규화된 행을 반환한다."""
     try:
-        if not current_user or not current_user.is_master_admin:
-            raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+        # if not current_user or not current_user.is_master_admin:
+        #     raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             content = await file.read()
             tmp_file.write(content)
@@ -246,8 +247,8 @@ async def upload2_confirm_endpoint(
 ):
     """업로드2 - 검증 통과 후 저장. 오류가 있는 행은 건너뜀."""
     try:
-        if not current_user or not current_user.is_master_admin:
-            raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+        # if not current_user or not current_user.is_master_admin:
+        #     raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
         target_group_id = payload.group_id or current_user.group_id
         result = upload2_confirm(payload.rows, current_user, db, target_group_id)
         return result
