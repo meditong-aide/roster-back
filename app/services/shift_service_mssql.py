@@ -34,6 +34,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
     if not current_user:
         raise Exception("Not authenticated")
     session = db
+    print('override_group_id', override_group_id)
     try:
         # 1) 조회
         if override_group_id:
@@ -46,7 +47,9 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
             .order_by(Shift.sequence.asc())
             .all()
         )
+        print('shifts', [s.shift_id for s in shifts])
         if shifts:
+            print('shifts 있음')
             return [
                 {
                     "shift_id": s.shift_id,
@@ -64,11 +67,13 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 }
                 for s in shifts
             ]
-
+        print('shifts 없음')
         # 2) 기본값 생성 (오피스/그룹은 존재한다고 가정; 없으면 office_id=None로 저장)
         # 기본값 생성
         office_id = None
         group = session.query(Group).filter(Group.group_id == group_id).first()
+        print('group', group)
+        print('group_id', group_id)
         if group and group.office_id:
             office_id = group.office_id
         elif getattr(current_user, "office_id", None):
@@ -84,7 +89,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 name=name,
                 office_id=office_id,
                 color=color,
-                group_id=current_user.group_id,
+                group_id=group_id,
                 start_time=st,
                 end_time=et,
                 type=typ,
@@ -107,7 +112,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
 
         shifts = (
             session.query(Shift)
-            .filter(Shift.group_id == current_user.group_id)
+            .filter(Shift.group_id == group_id)
             .order_by(Shift.sequence.asc())
             .all()
         )
