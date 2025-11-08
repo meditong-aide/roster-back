@@ -157,20 +157,23 @@ async def get_all_wanted(
     if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
         target_group_id = current_user.group_id
     else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        # if not getattr(current_user, 'is_master_admin', False):
+        #     raise HTTPException(status_code=403, detail="Permission denied")
+        # if not group_id:
+        #     raise HTTPException(status_code=400, detail="group_id is required for admin")
         from db.models import Group
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
-
+        
+        # g = db.query(Group).filter(Group.group_id == group_id).first()
+        # print('g', g)
+        # if not g:
+        #     print('여기임')
+        #     raise HTTPException(status_code=404, detail="Group not found")
+        # if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+        #     raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        # target_group_id = g.group_id
+    
     wanted_list = db.query(Wanted).filter(
-        Wanted.group_id == target_group_id
+        Wanted.group_id == current_user.group_id
     ).order_by(Wanted.year.desc(), Wanted.month.desc()).all()
 
     return [{

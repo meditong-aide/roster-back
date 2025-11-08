@@ -286,6 +286,7 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
     month_str = f"{year}-{month:02d}"
 
     target_group_id = override_group_id or current_user.group_id
+    print('target_group_id', target_group_id)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
 

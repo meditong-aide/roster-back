@@ -68,7 +68,6 @@ async def save_roster_config(
     is_admin = bool(getattr(user, 'is_master_admin', False))
 
     # 권한/대상 그룹 결정
-    print('user.group_id', user.group_id)
     override_gid: Optional[str] = None
     if user.is_head_nurse and user.group_id:
         override_gid = None  # HN은 본인 그룹 저장
@@ -499,6 +498,7 @@ async def get_schedule_versions(
     if current_user.is_head_nurse and current_user.group_id:
         target_group_id = current_user.group_id
     else:
+        print()
         if not getattr(current_user, 'is_master_admin', False):
             raise HTTPException(status_code=403, detail="Permission denied")
         if not group_id:
@@ -540,8 +540,8 @@ async def get_roster_for_month(
     if current_user.is_head_nurse and current_user.group_id:
         target_group_id = current_user.group_id
     else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
+        # if not getattr(current_user, 'is_master_admin', False):
+        #     raise HTTPException(status_code=403, detail="Permission denied")
         if not group_id:
             raise HTTPException(status_code=400, detail="group_id is required for admin")
         g = db.query(Group).filter(Group.group_id == group_id).first()
@@ -550,7 +550,7 @@ async def get_roster_for_month(
         if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
             raise HTTPException(status_code=403, detail="Group does not belong to your office")
         target_group_id = g.group_id
-    print('target_group_id', target_group_id)
+    print('target_group_id1', target_group_id)
     # Get latest issued schedule for the month
     schedule_info = db.query(Schedule).filter(
         Schedule.group_id == target_group_id,
