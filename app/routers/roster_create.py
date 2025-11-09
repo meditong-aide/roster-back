@@ -117,6 +117,7 @@ async def hold_generate_roster_endpoint(
         # 고정된 셀 정보를 포함하여 근무표 생성 서비스 호출
         return generate_roster_service_with_fixed_cells(req, current_user, db)
     except Exception as e:
+        print('error', e)
         raise HTTPException(status_code=500, detail=f"고정 후 근무표 생성 실패: {str(e)}")
 
 

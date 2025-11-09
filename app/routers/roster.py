@@ -311,27 +311,27 @@ async def get_issued_schedules(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+    print('[/issued] group_id', group_id)
     try:
-        override_gid: Optional[str] = None
+        # override_gid: Optional[str] = None
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        if current_user.is_head_nurse and current_user.group_id:
-            override_gid = None
-        else:
-            if not getattr(current_user, 'is_master_admin', False):
-                raise HTTPException(status_code=403, detail="Permission denied")
-            if not group_id:
-                raise HTTPException(status_code=400, detail="group_id is required for admin")
-            g = db.query(Group).filter(Group.group_id == group_id).first()
-            if not g:
-                raise HTTPException(status_code=404, detail="Group not found")
-            if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-                raise HTTPException(status_code=403, detail="Group does not belong to your office")
-            override_gid = g.group_id
-        return get_issued_schedules_service(current_user, db, override_group_id=override_gid)
-    except HTTPException:
-        raise
+        # if current_user.is_head_nurse and current_user.group_id:
+        #     override_gid = None
+        # else:
+        #     # if not getattr(current_user, 'is_master_admin', False):
+        #     #     raise HTTPException(status_code=403, detail="Permission denied")
+        #     # if not group_id:
+        #     #     raise HTTPException(status_code=400, detail="group_id is required for admin")
+        #     g = db.query(Group).filter(Group.group_id == group_id).first()
+        #     if not g:
+        #         raise HTTPException(status_code=404, detail="Group not found")
+        #     # if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+        #     #     raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        #     override_gid = g.group_id
+        return get_issued_schedules_service(current_user, db)
     except Exception as e:
+        print('[/issued] error', e)
         raise HTTPException(status_code=500, detail=f"Failed to get issued schedules: {str(e)}")
 
 
@@ -657,11 +657,12 @@ async def publish_roster(
     is_first_issue = not existing_issued
     
     # Get next sequence number
+    print('target_group_id', target_group_id)
     max_seq = db.query(func.max(IssuedRoster.seq_no)).filter(
         IssuedRoster.group_id == target_group_id,
         IssuedRoster.office_id == office_id
     ).scalar() or 0
-    
+    print('max_seq', max_seq)
     # Set all other schedules in this month to draft
     db.query(Schedule).filter(
         Schedule.group_id == target_group_id,
@@ -690,7 +691,7 @@ async def publish_roster(
     
     return {
         "message": "근무표가 성공적으로 발행되었습니다.",
-        "seq_no": issued_roster.seq_no,
+        # "seq_no": issued_roster.seq_no,
         "is_first_issue": is_first_issue
     } 
 

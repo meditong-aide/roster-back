@@ -610,20 +610,20 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
 
     nurses_in_group, preferences = _collect_nurses_and_preferences(db, req, current_user)
     latest_config = _fetch_latest_config(db, req, current_user)
-    shift_manage_data, daily_shift_requirements = _build_shift_manage_and_requirements(
-        db, current_user, latest_config
+    shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day = _build_shift_manage_and_requirements(
+        db, current_user, latest_config, req
     )
-
     # fixed_cells 및 요구인원 설정 반영
     config_dict = latest_config.__dict__ if latest_config else {}
     config_dict['daily_shift_requirements'] = daily_shift_requirements
+    # 일자별 요구치 우선 적용
+    config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 (고정 생성에도 동일 적용) ──
     _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
     # 경계 제약 기능 기본값 및 충돌 정책(hold는 기본 차단)
     config_dict.setdefault('cross_month_hard_rules_enable', True)
     config_dict.setdefault('cross_month_lookback_days', 6)
     config_dict.setdefault('allow_override_by_law', False)
-
     print("cp_sat_basic 엔진으로 고정 셀 반영 근무표 생성 시작")
     generated, satisfaction_data, roster_system = _run_cp_sat_basic(
         db,
@@ -637,23 +637,22 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
         time_limit_seconds=300,
         config_override=config_dict,
     )
-
     _persist_entries(db, schedule, generated, req)
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
+    # print(7)
+    # # 기존 로직 유지: 대시보드 분석 데이터 저장 시도 (있으면 사용)
+    # try:
+    #     from services.dashboard_service import save_roster_analytics
+    #     if roster_system:
+    #         print("CP-SAT 엔진 결과를 사용하여 대시보드 분석 데이터 저장 중...")
+    #         save_roster_analytics(schedule.schedule_id, roster_system, db)
+    #         print("대시보드 분석 데이터 저장 완료")
+    # except ImportError as e:
+    #     print(f"대시보드 서비스를 찾을 수 없습니다: {e}")
+    # except Exception as e:
+    #     print(f"대시보드 분석 데이터 저장 실패: {e}")
 
-    # 기존 로직 유지: 대시보드 분석 데이터 저장 시도 (있으면 사용)
-    try:
-        from services.dashboard_service import save_roster_analytics
-        if roster_system:
-            print("CP-SAT 엔진 결과를 사용하여 대시보드 분석 데이터 저장 중...")
-            save_roster_analytics(schedule.schedule_id, roster_system, db)
-            print("대시보드 분석 데이터 저장 완료")
-    except ImportError as e:
-        print(f"대시보드 서비스를 찾을 수 없습니다: {e}")
-    except Exception as e:
-        print(f"대시보드 분석 데이터 저장 실패: {e}")
-
-    print(f"고정된 셀을 반영한 근무표 생성 완료: {len(fixed_cells)}개 셀 고정")
+    # print(f"고정된 셀을 반영한 근무표 생성 완료: {len(fixed_cells)}개 셀 고정")
     return roster_data
 
 

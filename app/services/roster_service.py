@@ -129,10 +129,10 @@ def get_issued_schedules_service(current_user, db: Session, override_group_id: s
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
-        raise Exception("Permission denied")
+    # if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    #     raise Exception("Permission denied")
 
-    target_group_id = override_group_id or current_user.group_id
+    target_group_id =  current_user.group_id
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
 
