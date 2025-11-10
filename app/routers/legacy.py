@@ -5,7 +5,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User
-from db.client import get_db
+# from db.client import get_db
 from db.models import RosterConfig as RosterConfigModel
 from schemas.auth_schema import User as UserSchema
 

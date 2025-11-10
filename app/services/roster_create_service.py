@@ -11,7 +11,7 @@ from datetime import date
 import uuid
 from sqlalchemy import func
 from collections import defaultdict
-from db.client import get_db
+from db.client2 import get_db
 # from db.client2 import _get_mssql_session
 
 

@@ -13,7 +13,7 @@ from sqlalchemy import (
     ForeignKey, TEXT, Index, func, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
-from db.client import Base
+from db.client2 import Base
 
 
 class Permission(Base):

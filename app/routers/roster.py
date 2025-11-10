@@ -8,7 +8,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from db.client import get_db
+# from db.client import get_db
 from db.models import RosterConfig as RosterConfigModel
 from db.models import Schedule, ShiftPreference, Nurse, ScheduleEntry, Shift, IssuedRoster
 from db.nurse_config import Nurse as NurseEngine

@@ -195,16 +195,16 @@ jobs:
               echo "[INFO] Generating PROD .env"
               cat > /home/ubuntu/app/.env <<EOF
             ENVIRONMENT=production
-            MS_DB_HOST=${{ secrets.MS_DB_HOST }}
-            MS_DB_PORT=${{ secrets.MS_DB_PORT }}
-            MS_DB_NAME=${{ secrets.MS_DB_NAME }}
-            MS_DB_USER=${{ secrets.MS_DB_USER }}
-            MS_DB_PASSWORD=${{ secrets.MS_DB_PASSWORD }}
-            EUN_DB_NAME=${{ secrets.EUN_DB_NAME }}
-            CLIENT_ID=${{ secrets.CLIENT_ID }}
-            CLIENT_SECRET=${{ secrets.CLIENT_SECRET }}
-            SECRET_KEY=${{ secrets.SECRET_KEY }}
-            ALGORITHM=${{ secrets.ALGORITHM }}
+            MS_DB_HOST=${{ secrets.PROD_MS_DB_HOST }}
+            MS_DB_PORT=${{ secrets.PROD_MS_DB_PORT }}
+            MS_DB_NAME=${{ secrets.PROD_MS_DB_NAME }}
+            MS_DB_USER=${{ secrets.PROD_MS_DB_USER }}
+            MS_DB_PASSWORD=${{ secrets.PROD_MS_DB_PASSWORD }}
+            EUN_DB_NAME=${{ secrets.PROD_EUN_DB_NAME }}
+            CLIENT_ID=${{ secrets.PROD_CLIENT_ID }}
+            CLIENT_SECRET=${{ secrets.PROD_CLIENT_SECRET }}
+            SECRET_KEY=${{ secrets.PROD_SECRET_KEY }}
+            ALGORITHM=${{ secrets.PROD_ALGORITHM }}
             EOF
               else
                 echo "[INFO] Generating DEV .env"
