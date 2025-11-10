@@ -27,7 +27,6 @@ jobs:
             echo "ENV=prod" >> $GITHUB_ENV
             echo "ECR_REPO=aide-backend-prod" >> $GITHUB_ENV
             echo "EC2_HOST=${{ secrets.PROD_EC2_HOST }}" >> $GITHUB_ENV
-            echo "EC2_SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_ENV
             echo "DB_NAME=${{ secrets.PROD_DB_NAME }}" >> $GITHUB_ENV
             echo "DB_USER=${{ secrets.PROD_DB_USER }}" >> $GITHUB_ENV
             echo "DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}" >> $GITHUB_ENV
@@ -41,7 +40,6 @@ jobs:
             echo "ENV=dev" >> $GITHUB_ENV
             echo "ECR_REPO=aide-backend-dev" >> $GITHUB_ENV
             echo "EC2_HOST=${{ secrets.DEV_EC2_HOST }}" >> $GITHUB_ENV
-            echo "EC2_SSH_KEY=${{ secrets.DEV_EC2_SSH_KEY }}" >> $GITHUB_ENV
             echo "DB_NAME=${{ secrets.DEV_DB_NAME }}" >> $GITHUB_ENV
             echo "DB_USER=${{ secrets.DEV_DB_USER }}" >> $GITHUB_ENV
             echo "DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}" >> $GITHUB_ENV
