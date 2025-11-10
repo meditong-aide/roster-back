@@ -83,23 +83,23 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 5) Docker 이미지 빌드/푸시
-      - name: Build Docker image
-        run: |
-          docker build \
-            --build-arg ENV=${{ env.ENVIRONMENT }} \
-            --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
-            --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
-            --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
-            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
+      # # 5) Docker 이미지 빌드/푸시
+      # - name: Build Docker image
+      #   run: |
+      #     docker build \
+      #       --build-arg ENV=${{ env.ENVIRONMENT }} \
+      #       --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
+      #       --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
+      #       --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
+      #       -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
 
-      - name: Push Docker image to ECR
-        run: |
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
+      # - name: Push Docker image to ECR
+      #   run: |
+      #     docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
 
-      - name: Export image uri
-        run: |
-          echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
+      # - name: Export image uri
+      #   run: |
+      #     echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
 
       # 5-0) ECR Lifecycle Policy 적용 (untagged 즉시 삭제, 태그된 건 최근 10개 유지)
       - name: Apply ECR lifecycle policy (idempotent)
@@ -184,40 +184,41 @@ jobs:
       - name: Write .env on EC2
         uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ env.EC2_HOST }}
+          host: ${{ secrets.PROD_EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          envs: ENV
           script: |
-            set -e
-            mkdir -p /home/ubuntu/app
-            if [[ "${{ env.ENV }}" == "prod" ]]; then
-              echo "[INFO] Generating PROD .env"
-              cat > /home/ubuntu/app/.env <<'EOF'
-              ENVIRONMENT=production
-              MS_DB_HOST=${{ secrets.PROD_MS_DB_HOST }}
-              MS_DB_PORT=${{ secrets.PROD_MS_DB_PORT }}
-              MS_DB_NAME=${{ secrets.PROD_MS_DB_NAME }}
-              MS_DB_USER=${{ secrets.PROD_MS_DB_USER }}
-              MS_DB_PASSWORD=${{ secrets.PROD_MS_DB_PASSWORD }}
-              EUN_DB_NAME=${{ secrets.PROD_EUN_DB_NAME }}
-              CLIENT_ID=${{ secrets.PROD_CLIENT_ID }}
-              CLIENT_SECRET=${{ secrets.PROD_CLIENT_SECRET }}
-              SECRET_KEY=${{ secrets.PROD_SECRET_KEY }}
-              ALGORITHM=${{ secrets.PROD_ALGORITHM }}
-              EOF
+  set -e
+  mkdir -p /home/ubuntu/app
+  if [[ "${{ env.ENV }}" == "prod" ]]; then
+    echo "[INFO] Generating PROD .env"
+    cat > /home/ubuntu/app/.env <<'EOF'
+ENVIRONMENT=production
+MS_DB_HOST=${{ secrets.MS_DB_HOST }}
+MS_DB_PORT=${{ secrets.MS_DB_PORT }}
+MS_DB_NAME=${{ secrets.MS_DB_NAME }}
+MS_DB_USER=${{ secrets.MS_DB_USER }}
+MS_DB_PASSWORD=${{ secrets.MS_DB_PASSWORD }}
+EUN_DB_NAME=${{ secrets.EUN_DB_NAME }}
+CLIENT_ID=${{ secrets.CLIENT_ID }}
+CLIENT_SECRET=${{ secrets.CLIENT_SECRET }}
+SECRET_KEY=${{ secrets.SECRET_KEY }}
+ALGORITHM=${{ secrets.ALGORITHM }}
+EOF
+  else
+    echo "[INFO] Generating DEV .env"
+    cat > /home/ubuntu/app/.env <<'EOF'
+ENVIRONMENT=development
+DB_HOST=${{ secrets.DEV_DB_HOST }}
+DB_PORT=${{ secrets.DEV_DB_PORT }}
+DB_NAME=${{ secrets.DEV_DB_NAME }}
+DB_USER=${{ secrets.DEV_DB_USER }}
+DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}
+EOF
+  fi
 
-            else
-              echo "[INFO] Generating DEV .env"
-              cat > /home/ubuntu/app/.env <<'EOF'
-              ENVIRONMENT=development
-              DB_HOST=${{ secrets.DEV_DB_HOST }}
-              DB_PORT=${{ secrets.DEV_DB_PORT }}
-              DB_NAME=${{ secrets.DEV_DB_NAME }}
-              DB_USER=${{ secrets.DEV_DB_USER }}
-              DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}
-              EOF
-            fi
-            echo "✅ /home/ubuntu/app/.env created for ${{ env.ENV }}"
+  echo "✅ /home/ubuntu/app/.env created for ${{ env.ENV }}"
       # 5-5) 컨테이너 실행 (env-file + host-gateway)
       - name: Run container
         uses: appleboy/ssh-action@v1.0.0
