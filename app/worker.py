@@ -14,7 +14,7 @@ import traceback
 from sqlalchemy.orm import Session
 
 # app/ 디렉토리가 sys.path에 있으므로 db, schemas 직접 import 가능
-from db.client import SessionLocal
+from db.client2 import SessionLocal
 from db.models import Nurse, RosterConfig
 from schemas.roster_schema import RosterRequest
 from schemas.auth_schema import User as UserSchema

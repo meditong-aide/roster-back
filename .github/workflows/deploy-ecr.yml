@@ -83,23 +83,23 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      # # 5) Docker 이미지 빌드/푸시
-      # - name: Build Docker image
-      #   run: |
-      #     docker build \
-      #       --build-arg ENV=${{ env.ENVIRONMENT }} \
-      #       --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
-      #       --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
-      #       --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
-      #       -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
+      # 5) Docker 이미지 빌드/푸시
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg ENV=${{ env.ENVIRONMENT }} \
+            --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
+            --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
+            --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
 
-      # - name: Push Docker image to ECR
-      #   run: |
-      #     docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
 
-      # - name: Export image uri
-      #   run: |
-      #     echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
+      - name: Export image uri
+        run: |
+          echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
 
       # 5-0) ECR Lifecycle Policy 적용 (untagged 즉시 삭제, 태그된 건 최근 10개 유지)
       - name: Apply ECR lifecycle policy (idempotent)
@@ -193,7 +193,7 @@ jobs:
             mkdir -p /home/ubuntu/app
             if [[ "${{ env.ENV }}" == "prod" ]]; then
               echo "[INFO] Generating PROD .env"
-              cat > /home/ubuntu/app/.env <<'EOF'
+              cat > /home/ubuntu/app/.env <<EOF
             ENVIRONMENT=production
             MS_DB_HOST=${{ secrets.MS_DB_HOST }}
             MS_DB_PORT=${{ secrets.MS_DB_PORT }}
@@ -208,7 +208,7 @@ jobs:
             EOF
               else
                 echo "[INFO] Generating DEV .env"
-                cat > /home/ubuntu/app/.env <<'EOF'
+                cat > /home/ubuntu/app/.env <<EOF
             ENVIRONMENT=development
             DB_HOST=${{ secrets.DEV_DB_HOST }}
             DB_PORT=${{ secrets.DEV_DB_PORT }}
