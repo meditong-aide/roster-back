@@ -65,175 +65,176 @@ jobs:
           echo "EC2_HOST=${{ env.EC2_HOST }}"
           echo "ECR_REPO=${{ env.ECR_REPO }}"
 
-      # - name: Log Environment (safe)
-      #   run: |
-      #     echo "ENVIRONMENT=${{ env.ENVIRONMENT }}"
-      #     echo "DOCKER_TAG=${{ env.DOCKER_TAG }}"
+      - name: Log Environment (safe)
+        run: |
+          echo "ENVIRONMENT=${{ env.ENVIRONMENT }}"
+          echo "DOCKER_TAG=${{ env.DOCKER_TAG }}"
 
-      # # 3) AWS 자격 구성
-      # - name: Configure AWS credentials (AccessKey)
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #     aws-region: ${{ secrets.AWS_REGION }}
+      # 3) AWS 자격 구성
+      - name: Configure AWS credentials (AccessKey)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      # # 4) ECR 로그인
-      # - name: Login to Amazon ECR
-      #   id: ecr-login
-      #   uses: aws-actions/amazon-ecr-login@v2
+      # 4) ECR 로그인
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # # 5) Docker 이미지 빌드/푸시
-      # - name: Build Docker image
-      #   run: |
-      #     docker build \
-      #       --build-arg ENV=${{ env.ENVIRONMENT }} \
-      #       --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
-      #       --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
-      #       --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
-      #       -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
+      # 5) Docker 이미지 빌드/푸시
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg ENV=${{ env.ENVIRONMENT }} \
+            --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
+            --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
+            --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
 
-      # - name: Push Docker image to ECR
-      #   run: |
-      #     docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
 
-      # - name: Export image uri
-      #   run: |
-      #     echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
+      - name: Export image uri
+        run: |
+          echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
 
-      # # 5-0) ECR Lifecycle Policy 적용 (untagged 즉시 삭제, 태그된 건 최근 10개 유지)
-      # - name: Apply ECR lifecycle policy (idempotent)
-      #   run: |
-      #     cat > policy.json <<'JSON'
-      #     {
-      #       "rules": [
-      #         {
-      #           "rulePriority": 1,
-      #           "description": "Expire untagged images quickly",
-      #           "selection": {
-      #             "tagStatus": "untagged",
-      #             "countType": "sinceImagePushed",
-      #             "countNumber": 1,
-      #             "countUnit": "days"
-      #           },
-      #           "action": { "type": "expire" }
-      #         },
-      #         {
-      #           "rulePriority": 2,
-      #           "description": "Keep only the last 10 tagged images",
-      #           "selection": {
-      #             "tagStatus": "any",
-      #             "countType": "imageCountMoreThan",
-      #             "countNumber": 10
-      #           },
-      #           "action": { "type": "expire" }
-      #         }
-      #       ]
-      #     }
-      #     JSON
-      #     aws ecr put-lifecycle-policy \
-      #       --repository-name ${{ env.ECR_REPO }} \
-      #       --lifecycle-policy-text file://policy.json \
-      #       --region ${{ secrets.AWS_REGION }}
+      # 5-0) ECR Lifecycle Policy 적용 (untagged 즉시 삭제, 태그된 건 최근 10개 유지)
+      - name: Apply ECR lifecycle policy (idempotent)
+        run: |
+          cat > policy.json <<'JSON'
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images quickly",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countNumber": 1,
+                  "countUnit": "days"
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the last 10 tagged images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+          JSON
+          aws ecr put-lifecycle-policy \
+            --repository-name ${{ env.ECR_REPO }} \
+            --lifecycle-policy-text file://policy.json \
+            --region ${{ secrets.AWS_REGION }}
 
-      # # 5-1) EC2 → ECR 로그인
-      # - name: ECR login from EC2
-      #   uses: appleboy/ssh-action@v1.0.0
-      #   with:
-      #     host: ${{ env.EC2_HOST }}
-      #     username: ubuntu
-      #     key: ${{ env.EC2_SSH_KEY }}
-      #     script: |
-      #       set -e
-      #       aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
-      #         | sudo docker login \
-      #           --username AWS \
-      #           --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+      # 5-1) EC2 → ECR 로그인
+      - name: ECR login from EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          script: |
+            set -e
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+              | sudo docker login \
+                --username AWS \
+                --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
 
-      #       echo "ECR login on EC2 done"
+                
+            echo "ECR login on EC2 done"
 
-      # # 5-2) EC2: 로컬 컨테이너/이미지 정리 (볼륨 유지)
-      # - name: Stop & prune on EC2 (keep volumes)
-      #   uses: appleboy/ssh-action@v1.0.0
-      #   with:
-      #     host: ${{ env.EC2_HOST }}
-      #     username: ubuntu
-      #     key: ${{ env.EC2_SSH_KEY }}
-      #     script: |
-      #       set -e
-      #       sudo docker ps -q | xargs -r sudo docker stop
-      #       sudo docker ps -a -q | xargs -r sudo docker rm
-      #       sudo docker images -q | xargs -r sudo docker rmi
-      #       sudo docker system prune -af
+      # 5-2) EC2: 로컬 컨테이너/이미지 정리 (볼륨 유지)
+      - name: Stop & prune on EC2 (keep volumes)
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          script: |
+            set -e
+            sudo docker ps -q | xargs -r sudo docker stop
+            sudo docker ps -a -q | xargs -r sudo docker rm
+            sudo docker images -q | xargs -r sudo docker rmi
+            sudo docker system prune -af
 
-      # # 5-3) EC2: 새 이미지 Pull
-      # - name: Pull new image on EC2
-      #   uses: appleboy/ssh-action@v1.0.0
-      #   with:
-      #     host: ${{ env.EC2_HOST }}
-      #     username: ubuntu
-      #     key: ${{ env.EC2_SSH_KEY }}
-      #     envs: IMAGE_URI
-      #     script: |
-      #       set -e
-      #       echo "docker pull ${IMAGE_URI}"
-      #       sudo docker pull "${IMAGE_URI}"
+      # 5-3) EC2: 새 이미지 Pull
+      - name: Pull new image on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          envs: IMAGE_URI
+          script: |
+            set -e
+            echo "docker pull ${IMAGE_URI}"
+            sudo docker pull "${IMAGE_URI}"
 
-      # # 5-4) EC2: .env 작성/갱신
-      # - name: Write .env on EC2
-      #   uses: appleboy/ssh-action@v1.0.0
-      #   with:
-      #     host: ${{ env.EC2_HOST }}
-      #     username: ubuntu
-      #     key: ${{ env.EC2_SSH_KEY }}
-      #     script: |
-      #       set -e
-      #       mkdir -p /home/ubuntu/app
-      #       if [[ "${{ env.ENV }}" == "prod" ]]; then
-      #         echo "[INFO] Generating PROD .env"
-      #         cat > /home/ubuntu/app/.env <<'EOF'
-      #         ENVIRONMENT=production
-      #         MS_DB_HOST=${{ secrets.PROD_MS_DB_HOST }}
-      #         MS_DB_PORT=${{ secrets.PROD_MS_DB_PORT }}
-      #         MS_DB_NAME=${{ secrets.PROD_MS_DB_NAME }}
-      #         MS_DB_USER=${{ secrets.PROD_MS_DB_USER }}
-      #         MS_DB_PASSWORD=${{ secrets.PROD_MS_DB_PASSWORD }}
-      #         EUN_DB_NAME=${{ secrets.PROD_EUN_DB_NAME }}
-      #         CLIENT_ID=${{ secrets.PROD_CLIENT_ID }}
-      #         CLIENT_SECRET=${{ secrets.PROD_CLIENT_SECRET }}
-      #         SECRET_KEY=${{ secrets.PROD_SECRET_KEY }}
-      #         ALGORITHM=${{ secrets.PROD_ALGORITHM }}
-      #         EOF
+      # 5-4) EC2: .env 작성/갱신
+      - name: Write .env on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          script: |
+            set -e
+            mkdir -p /home/ubuntu/app
+            if [[ "${{ env.ENV }}" == "prod" ]]; then
+              echo "[INFO] Generating PROD .env"
+              cat > /home/ubuntu/app/.env <<'EOF'
+              ENVIRONMENT=production
+              MS_DB_HOST=${{ secrets.PROD_MS_DB_HOST }}
+              MS_DB_PORT=${{ secrets.PROD_MS_DB_PORT }}
+              MS_DB_NAME=${{ secrets.PROD_MS_DB_NAME }}
+              MS_DB_USER=${{ secrets.PROD_MS_DB_USER }}
+              MS_DB_PASSWORD=${{ secrets.PROD_MS_DB_PASSWORD }}
+              EUN_DB_NAME=${{ secrets.PROD_EUN_DB_NAME }}
+              CLIENT_ID=${{ secrets.PROD_CLIENT_ID }}
+              CLIENT_SECRET=${{ secrets.PROD_CLIENT_SECRET }}
+              SECRET_KEY=${{ secrets.PROD_SECRET_KEY }}
+              ALGORITHM=${{ secrets.PROD_ALGORITHM }}
+              EOF
 
-      #       else
-      #         echo "[INFO] Generating DEV .env"
-      #         cat > /home/ubuntu/app/.env <<'EOF'
-      #         ENVIRONMENT=development
-      #         DB_HOST=${{ secrets.DEV_DB_HOST }}
-      #         DB_PORT=${{ secrets.DEV_DB_PORT }}
-      #         DB_NAME=${{ secrets.DEV_DB_NAME }}
-      #         DB_USER=${{ secrets.DEV_DB_USER }}
-      #         DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}
-      #         EOF
-      #       fi
-      #       echo "✅ /home/ubuntu/app/.env created for ${{ env.ENV }}"
-      # # 5-5) 컨테이너 실행 (env-file + host-gateway)
-      # - name: Run container
-      #   uses: appleboy/ssh-action@v1.0.0
-      #   with:
-      #     host: ${{ env.EC2_HOST }}
-      #     username: ubuntu
-      #     key: ${{ env.EC2_SSH_KEY }}
-      #     envs: IMAGE_URI
-      #     script: |
-      #       set -e
-      #       sudo docker stop aide-server || true
-      #       sudo docker rm   aide-server || true
-      #       sudo docker run -d \
-      #         --name aide-server \
-      #         -p 8000:8000 \
-      #         --env-file /home/ubuntu/app/.env \
-      #         --add-host=host.docker.internal:host-gateway \
-      #         --restart unless-stopped \
-      #         "${IMAGE_URI}"
-      #       echo "Started: http://$HOSTNAME:8000/health"
+            else
+              echo "[INFO] Generating DEV .env"
+              cat > /home/ubuntu/app/.env <<'EOF'
+              ENVIRONMENT=development
+              DB_HOST=${{ secrets.DEV_DB_HOST }}
+              DB_PORT=${{ secrets.DEV_DB_PORT }}
+              DB_NAME=${{ secrets.DEV_DB_NAME }}
+              DB_USER=${{ secrets.DEV_DB_USER }}
+              DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}
+              EOF
+            fi
+            echo "✅ /home/ubuntu/app/.env created for ${{ env.ENV }}"
+      # 5-5) 컨테이너 실행 (env-file + host-gateway)
+      - name: Run container
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          envs: IMAGE_URI
+          script: |
+            set -e
+            sudo docker stop aide-server || true
+            sudo docker rm   aide-server || true
+            sudo docker run -d \
+              --name aide-server \
+              -p 8000:8000 \
+              --env-file /home/ubuntu/app/.env \
+              --add-host=host.docker.internal:host-gateway \
+              --restart unless-stopped \
+              "${IMAGE_URI}"
+            echo "Started: http://$HOSTNAME:8000/health"
