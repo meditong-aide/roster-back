@@ -1,7 +1,7 @@
 from sqlalchemy import Column, VARCHAR, SMALLINT, BOOLEAN, DATETIME, func, ForeignKey, JSON, CHAR, INTEGER, FLOAT, Index, ForeignKeyConstraint, UniqueConstraint
 from sqlalchemy.dialects.mysql import TINYINT 
 from sqlalchemy.orm import relationship
-from db.client import Base
+from db.client2 import Base
 from sqlalchemy import DATE, DECIMAL, TEXT
 
 class Group(Base):
