@@ -231,7 +231,7 @@ jobs:
             sudo docker stop aide-server || true
             sudo docker rm   aide-server || true
             sudo docker run -d \
-              --name aide-server-prod \
+              --name aide-server \
               -p 8000:8000 \
               --env-file /home/ubuntu/app/.env \
               --add-host=host.docker.internal:host-gateway \
