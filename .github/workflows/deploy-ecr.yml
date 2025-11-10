@@ -237,5 +237,5 @@ jobs:
               --env-file /home/ubuntu/app/.env \
               --add-host=host.docker.internal:host-gateway \
               --restart unless-stopped \
-              "${IMAGE_URI}"
+              "702166530338.dkr.ecr.ap-northeast-2.amazonaws.com/aide-backend-prod:prod-26350952feb298da7a0f08df0eb506e1aee98559"
             echo "Started: http://$HOSTNAME:8000/health"
