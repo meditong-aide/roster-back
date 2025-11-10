@@ -177,8 +177,8 @@ jobs:
           envs: IMAGE_URI
           script: |
             set -e
-            echo "docker pull ${ env.IMAGE_URI }"
-            sudo docker pull "${ env.IMAGE_URI }"
+            echo "docker pull ${IMAGE_URI}"
+            sudo docker pull "${IMAGE_URI}"
 
       # 5-4) EC2: .env 작성/갱신
       - name: Write .env on EC2
