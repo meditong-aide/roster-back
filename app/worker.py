@@ -23,14 +23,14 @@ from services.roster_create_service import generate_roster_service
 # =========================================================
 # 사용자 로딩 함수
 # =========================================================
-def load_current_user_by_account_id(db: Session, account_id: str) -> UserSchema:
+def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
     """
-    워커에선 쿠키가 없으므로, account_id로 Nurse를 조회해 UserSchema를 구성.
+    워커에선 쿠키가 없으므로, nurse_id로 Nurse를 조회해 UserSchema를 구성.
     generate_roster_service가 요구하는 필드를 맞춰 반환.
     """
-    nurse = db.query(Nurse).filter(Nurse.account_id == account_id).first()
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse:
-        raise RuntimeError(f"해당 account_id에 대한 사용자 없음: account_id={account_id}")
+        raise RuntimeError(f"해당 nurse_id에 대한 사용자 없음: nurse_id={nurse_id}")
 
     # office_id 보강: Nurse.office_id가 없으면 group.office_id 사용
     group_id = getattr(nurse, "group_id", None)
@@ -67,7 +67,7 @@ def main():
     params   = payload.get("params", {})
 
     if not nurse_id:
-        print("[worker] nurse_id(account_id) 값이 필요합니다", file=sys.stderr)
+        print("[worker] nurse_id 값이 필요합니다", file=sys.stderr)
         sys.exit(2)
 
     # params로 RosterRequest 구성 (모델 필드: year, month, config_id, preceptor_gauge 등)
@@ -79,13 +79,14 @@ def main():
 
     db: Session = SessionLocal()
     try:
-        current_user = load_current_user_by_account_id(db, nurse_id)
-        print(f"[worker] 작업 시작 job_id={job_id}, account_id={nurse_id}, req={req}")
+        current_user = load_current_user_by_nurse_id(db, nurse_id)
+        print(f"[worker] 작업 시작 job_id={job_id}, nurse_id={nurse_id}, req={req}")
 
         # 사전 검사: 설정 존재 여부 확인 (없으면 서비스 내부에서 충돌 가능)
         latest_config = None
         if getattr(req, "config_id", None):
-            latest_config = db.query(RosterConfig).filter(RosterConfig.config_id == req.config_id).first()
+            latest_config = db.query(RosterConfig).filter(RosterConfig.config_id == req.config_id, RosterConfig.year == req.year, RosterConfig.month == req.month).first()
+            print('최종 config 정보', latest_config.__dict__)
         else:
             # 간단한 최신 설정 조회 (group 기준)
             latest_config = (
