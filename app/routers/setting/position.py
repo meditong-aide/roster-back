@@ -105,8 +105,8 @@ async def create_upload_file(current_user: UserSchema = Depends(get_current_user
 
             if rows_affected is not None:
                 # 토큰 발행
-                _clientId = os.getenv("CLINET_ID")
-                _clientSecret = os.getenv("CLINET_SECRET")
+                _clientId = os.getenv("CLIENT_ID")
+                _clientSecret = os.getenv("CLIENT_SECRET")
                 token = create_access_token(data={"clientSecret": _clientSecret, "clientId": _clientId})
 
                 # API 호출 (엠웍스)

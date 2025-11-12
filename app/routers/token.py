@@ -24,8 +24,8 @@ async def get_token(response: Response, clientId: str, clientSecret: str):
     """
         토큰은 1일 단위로 생성되며, 중복 호출 시 DB에 저장된 값으로 반환함.
     """
-    _clientId = os.getenv("CLINET_ID")
-    _clientSecret = os.getenv("CLINET_SECRET")
+    _clientId = os.getenv("CLIENT_ID")
+    _clientSecret = os.getenv("CLIENT_SECRET")
 
     if clientId == _clientId and clientSecret == _clientSecret :
         token = create_access_token(data={"clientSecret": clientSecret, "clientId": clientId})
@@ -38,8 +38,8 @@ async def login_for_access_token(response: Response, request: Request, token: st
         redirectUrl이 있는 경우 처리하고 값이 없는 경우 결과값과 아이디 반환
     """
 
-    clientId = os.getenv("CLINET_ID")
-    clientSecret = os.getenv("CLINET_SECRET")
+    clientId = os.getenv("CLIENT_ID")
+    clientSecret = os.getenv("CLIENT_SECRET")
     today = date.today()
     current_date = today.strftime('%Y-%m-%d')
 
