@@ -164,7 +164,8 @@ async def login_for_access_token(
             key="access_token", 
             value=f"Bearer {access_token}", 
             httponly=True, 
-            samesite="lax"
+            samesite="None",
+            secure=True,
         )
         return {"message": "Login successful", "account_id": account_id}
     except Exception as e:
@@ -242,6 +243,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
 @router.get("/me", response_model=UserSchema)
 async def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
     if current_user is None:
+        print('[/me]: 유저 없음')
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated"

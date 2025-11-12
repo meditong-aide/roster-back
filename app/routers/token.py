@@ -80,7 +80,8 @@ async def login_for_access_token(response: Response, request: Request, token: st
                 key="access_token",
                 value=f"Bearer {access_token}",
                 httponly=True,
-                samesite="lax"
+                samesite="None",
+                secure=True,
             )
 
             if redirectUrl :

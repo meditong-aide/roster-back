@@ -152,9 +152,13 @@ async def get_shift_manage(
     - 슬롯 목록: [{ shift_slot, main_code, codes, manpower }]
     """
     print('진입')
-    if not current_user:
+    try:
+        if not current_user:
+            print('[/shift-manage/{class_name}]: 유저 없음')
+            raise HTTPException(status_code=401, detail="Not authenticated")
+    except Exception as e:
+        print('[/shift-manage/{class_name}]:', e)
         raise HTTPException(status_code=401, detail="Not authenticated")
-
     # 대상 그룹/오피스 결정
     if group_id:
         if not current_user or not getattr(current_user, 'is_master_admin', False):
