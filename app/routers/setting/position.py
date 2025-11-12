@@ -22,8 +22,8 @@ DOWNLOAD_FOLDER = "downloads"
 # 메세지 리스트 조회 : mariadb_manager
 @router.get("/position_upload", summary="직위 엑셀 업로드 화면을 출력합니다.")
 def excelupload_form(request: Request, current_user: UserSchema = Depends(get_current_user_from_cookie)):
-    OfficeCode = current_user.OfficeCode
-    EmpSeqNo = current_user.EmpSeqNo
+    OfficeCode = current_user.office_id
+    EmpSeqNo = current_user.nurse_id
 
     nurse_id = current_user.nurse_id
     account_id = current_user.account_id
@@ -60,8 +60,8 @@ async def create_upload_file(current_user: UserSchema = Depends(get_current_user
     """
 
     # 쿠키값에서 가져오도록 수정
-    OfficeCode = current_user.OfficeCode
-    EmpSeqNo = current_user.EmpSeqNo
+    OfficeCode = current_user.office_id
+    EmpSeqNo = current_user.nurse_id
     RegDate = datetime.datetime.now()
 
     # excel type을 확인해서 pandas로 변환해주는 함수 : excel_to_pandas

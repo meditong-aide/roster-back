@@ -46,8 +46,8 @@ def set_message(current_user: UserSchema = Depends(get_current_user_from_cookie)
     반환값 : result, message
            result : success -> 성공, fail -> 실패
     """
-    OfficeCode = current_user.OfficeCode
-    sendempseqno = current_user.EmpSeqNo
+    OfficeCode = current_user.office_id
+    sendempseqno = current_user.nurse_id
 
     if not receptionid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효한 수신자가 선택되지 않았습니다.")

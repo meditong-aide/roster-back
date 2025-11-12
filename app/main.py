@@ -3,7 +3,8 @@ from fastapi.staticfiles import StaticFiles
 import sys, os
 from fastapi.middleware.cors import CORSMiddleware
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from routers import roster, auth, nurses, dates, wanted, preferences, roster_create, shifts, health, dashboard, legacy, token, teams, groups
+from routers import roster, auth, nurses, dates, wanted, preferences, roster_create, shifts, health, dashboard, legacy, token, teams, groups, push
+from routers.contact import contact_router
 from routers.message import message_router
 from routers.sticker import sticker_router
 from routers.setting import setting_router
@@ -34,10 +35,12 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
+app.include_router(contact_router)
 app.include_router(message_router)
 app.include_router(sticker_router)
 app.include_router(setting_router)
 app.include_router(member_router)
+app.include_router(push.router)
 app.include_router(token.router)
 app.include_router(auth.router)
 app.include_router(nurses.router)

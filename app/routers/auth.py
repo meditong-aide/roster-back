@@ -159,7 +159,6 @@ async def login_for_access_token(
             },
             expires_delta=access_token_expires,
         )
-
         response.set_cookie(
             key="access_token", 
             value=f"Bearer {access_token}", 
@@ -207,6 +206,8 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         is_head_nurse: str = payload.get("is_head_nurse")
         name: str = payload.get("name")
         is_master_admin = payload.get("is_master_admin")
+        mb_part: str = payload.get("mb_part")
+
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
@@ -236,7 +237,8 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         is_master_admin= (bool(is_master_admin) if is_master_admin is not None else (str(EmpAuthGbn).upper() == 'ADM')),
         name = name,
         # EmpSeqNo = EmpSeqNo,
-        EmpAuthGbn = EmpAuthGbn
+        EmpAuthGbn = EmpAuthGbn,
+        mb_part = mb_part
     )
 
 @router.get("/me", response_model=UserSchema)

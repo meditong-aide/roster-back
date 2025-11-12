@@ -60,9 +60,9 @@ async def update_member_info(current_user: UserSchema = Depends(get_current_user
         is_head_nurse: str = Form(None),
         nightkeep: str = Form(None),
 ):
-    OfficeCode = current_user.OfficeCode
+    OfficeCode = current_user.office_id
 
-    if not current_user.EmpSeqNo:
+    if not current_user.account_id:
        return HTTPException(status_code=500, detail=f"Internal Server Error")
 
     if not CurMemberPass:

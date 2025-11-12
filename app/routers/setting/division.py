@@ -37,8 +37,8 @@ async def create_upload_file(current_user: UserSchema = Depends(get_current_user
     - 중복체크 하여 첫번째 내용을 제외하고 나머지는 제거
     """
     # 쿠키값에서 가져오도록 수정
-    OfficeCode = current_user.OfficeCode
-    EmpSeqNo = current_user.EmpSeqNo
+    OfficeCode = current_user.office_id
+    EmpSeqNo = current_user.nurse_id
     RegDate = datetime.datetime.now()
 
     #print("OfficeCode : ", OfficeCode)

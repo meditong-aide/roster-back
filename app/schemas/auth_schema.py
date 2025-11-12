@@ -14,6 +14,7 @@ class User(BaseModel):
     name: str
     # EmpSeqNo: str = None
     EmpAuthGbn: str = None
+    mb_part: Optional[str] = None
 
     class Config:
         from_attributes = True  

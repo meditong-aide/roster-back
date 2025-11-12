@@ -16,7 +16,7 @@ def message_view(list_type: str, current_user: UserSchema = Depends(get_current_
     호출방식 : /message/listcnt?list_type=send
     리턴값 : total_count
     """
-    EmpSeqNo = current_user.EmpSeqNo
+    EmpSeqNo = current_user.nurse_id
     if not list_type: list_type = "send"
 
     rows = msdb_manager.fetch_all(Message.get_message_list_cnt(list_type), params=EmpSeqNo)
@@ -38,7 +38,7 @@ def message_view(page: int, pagesize: int, list_type: str, current_user: UserSch
 
     호출방식 : /message/list?page=1&pagesize=10&list_type=send
     """
-    EmpSeqNo = current_user.EmpSeqNo
+    EmpSeqNo = current_user.nurse_id
     # if not page: page = 1
     # if not pagesize: pagesize = 10
     if not list_type: list_type = "send"
