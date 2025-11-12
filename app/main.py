@@ -21,12 +21,17 @@ origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://192.168.0.162:5173",
-    # "http://192.168.0.162:8000",
+    "http://192.168.0.162:8000",
+    "http://52.79.220.92:8000",
+    "https://aide-om.meditong.com",
+    "https://m-aide-om.meditong.com",
+    "http://aide-om.meditong.com",
+    "http://m-aide-om.meditong.com"
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # "*" 쓰지 말 것 (credentials 쓰면 불가)
+    allow_origins=origins,         # "*" 쓰지 말 것 (credentials 쓰면 불가)
     allow_credentials=True,        # 쿠키/세션 쓰면 True
     allow_methods=["*"],           # 또는 ["POST","GET","OPTIONS",...]
     allow_headers=["*"],           # Authorization, Content-Type 등 허용

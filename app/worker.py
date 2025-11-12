@@ -85,7 +85,7 @@ def main():
         # 사전 검사: 설정 존재 여부 확인 (없으면 서비스 내부에서 충돌 가능)
         latest_config = None
         if getattr(req, "config_id", None):
-            latest_config = db.query(RosterConfig).filter(RosterConfig.config_id == req.config_id, RosterConfig.year == req.year, RosterConfig.month == req.month).first()
+            latest_config = db.query(RosterConfig).filter(RosterConfig.config_id == req.config_id).first()
             print('최종 config 정보', latest_config.__dict__)
         else:
             # 간단한 최신 설정 조회 (group 기준)
