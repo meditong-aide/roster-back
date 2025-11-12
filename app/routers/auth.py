@@ -133,7 +133,7 @@ async def login_for_access_token(
             name = row['name']
             # nurse_id = row['nurse_id']
             group_id = row['group_id']
-            is_head_nurse = row['is_head_nurse']
+            is_head_nurse = str(row['is_head_nurse'])
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 

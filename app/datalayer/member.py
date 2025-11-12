@@ -3,9 +3,9 @@ class Member:
 
     def login_check():
         _queryString = """
-        select pwdcompare(%s,a.MemberPassEncrypt) as IsPWCorrect, EmpSeqNo, OfficeCode, EmpAuthGbn
-          from bizwiz20db.Member_Login a
-         where a.MemberID = %s and a.EmpAuthGbn !='DEL'
+         select pwdcompare(%s,a.MemberPassEncrypt) as IsPWCorrect, a.EmpSeqNo, a.OfficeCode, a.EmpAuthGbn, isnull(mo.ade_sch,'N') as aiuseyn
+          from bizwiz20db.Member_Login a inner join bizwiz20db.M_Office mo on a.OfficeCode = mo.OfficeCode 
+         where a.MemberID = %s and a.EmpAuthGbn in ('ADM', 'MEM')
         """
         return _queryString
 
