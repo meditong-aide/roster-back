@@ -162,6 +162,7 @@ async def login_for_access_token(
 
         response.set_cookie(
             key="access_token", 
+            domain=".meditong.com",
             value=f"Bearer {access_token}", 
             httponly=True, 
             samesite="None",
