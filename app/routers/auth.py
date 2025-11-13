@@ -169,11 +169,9 @@ async def login_for_access_token(
 
         response.set_cookie(
             key="access_token", 
-            domain=".meditong.com",
             value=f"Bearer {access_token}", 
             httponly=True, 
-            samesite="None",
-            secure=True,
+            samesite="lax"
         )
         return {"message": "Login successful", "account_id": account_id}
     except Exception as e:

@@ -11,6 +11,7 @@ from datalayer.token import Token
 # from db.client import get_db
 from db.client2 import get_db, msdb_manager
 from db.models import Nurse
+from schemas.auth_schema import User as UserSchema
 from utils.security import create_access_token
 from utils.security import create_login_token
 
@@ -141,7 +142,21 @@ async def login_for_access_token(response: Response,
                 samesite="lax"
             )
 
-            return {"result": "succeed", "message": "Login successful", "account_id": MemberID}
+            return UserSchema(
+                nurse_id=nurse_id,
+                account_id=account_id,
+                office_id=office_id,  # This should now work with eager loading
+                group_id=group_id,
+                is_head_nurse=is_head_nurse,
+                is_master_admin=(
+                    bool(is_master_admin) if is_master_admin is not None else (str(EmpAuthGbn).upper() == 'ADM')),
+                name=name,
+                EmpSeqNo=EmpSeqNo,
+                EmpAuthGbn=EmpAuthGbn,
+                mb_part=mb_part,
+            )
+
+            # return {"result": "succeed", "message": "Login successful", "account_id": MemberID}
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Invalid login : {str(e)}")
