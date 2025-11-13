@@ -50,7 +50,7 @@ class Message:
 
         _queryString = _queryString + "order by a.idx desc "
         # _queryString = _queryString + "OFFSET " + str((page - 1) * pagesize) + " ROWS "
-        _queryString = _queryString + "OFFSET " + str(page) + " ROWS "
+        _queryString = _queryString + "OFFSET " + page + " ROWS "
         _queryString = _queryString + "FETCH NEXT  " + str(pagesize) + " ROW ONLY "
 
         return _queryString
