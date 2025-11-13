@@ -42,26 +42,29 @@ class Member:
                 , isnull(D.name,'') As mb_partName
                 , isnull(E.name,'') As OfficialTitleName
                 , A.EmpSeqNo as nurse_id
+                , A.EmpSeqNo
                 , '' as group_id
                 , isnull(a.career,'') as career
                 , isnull(a.duty,'') as duty
                 , isnull(a.headnurse, 0) as is_head_nurse
                 , isnull(a.nightkeep,'') as nightkeep
+                , isnull(F.no,'') as manageno
             From bizwiz20db.Member A
             Inner Join bizwiz20db.Member_Login B On A.OfficeCode=B.OfficeCode And A.EmpSeqNo=B.EmpSeqNo
             Inner Join bizwiz20db.M_Office C On A.OfficeCode=C.OfficeCode
             Left Join bizwiz20db.T_Team D On A.mb_part=D.mb_part And A.OfficeCode=D.OfficeCode
             Left Join bizwiz20db.T_Part E On A.OfficialTitleCode=E.code And A.OfficeCode=E.OfficeCode
-            Where B.MemberID = %s AND a.EmpAuthGbn !='DEL'
+            left join bizwiz20db.Manage_Office F on A.OfficeCode = F.OfficeCode 
+            Where B.MemberID = %s AND a.EmpAuthGbn !='DEL' and C.ade_sch = 'Y'
         
         """
         return _queryString
 
     def login_check_token():
         _queryString = """
-        select EmpSeqNo, OfficeCode, EmpAuthGbn
-          from bizwiz20db.Member_Login a
-         where a.MemberID = %s and a.EmpAuthGbn !='DEL'
+        select a.EmpSeqNo, a.OfficeCode, a.EmpAuthGbn, isnull(mo.ade_sch,'N') as aiuseyn
+          from bizwiz20db.Member_Login a inner join bizwiz20db.M_Office mo on a.OfficeCode = mo.OfficeCode 
+         where a.MemberID = %s and a.EmpAuthGbn in ('ADM', 'MEM')
         """
         return _queryString
 

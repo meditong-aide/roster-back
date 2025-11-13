@@ -6,7 +6,8 @@ from pydantic import BaseModel, EmailStr
 
 class EmailSchema(BaseModel):
     email: List[EmailStr]
-    body: Dict[str, Any] = {"name": "User", "pwd": "pwd", "message": "Hello!"}
+    # body: Dict[str, Any] = {"name": "User", "pwd": "pwd", "message": "message"}
+    body: Dict[str, Any] = {"message": "message"}
 
 class EmailSender:
     def __init__(self):
@@ -29,10 +30,7 @@ class EmailSender:
         return f"""
         <html>
             <body>
-                <h1>{data.get('name', 'User')}님</h1>
-                <h1>임시비밀번호 : {data.get('pwd', 'pwd')}</h1>
-                <p>{data.get('message', 'No message provided.')}</p>
-                <p>감사합니다.</p>
+                {data.get('message', 'message')}
             </body>
         </html>
         """

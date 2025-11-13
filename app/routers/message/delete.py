@@ -8,10 +8,9 @@ router = APIRouter()
 @router.get("/delete", summary="메세지 삭제")
 def message_view(idx: int):
     """
-    idx: 메시지 시퀀스
-
-    반환값 : result, message
-           result : success -> 성공, fail -> 실패
+    * idx: 메시지 시퀀스
+    * 반환값 : result, message
+    *       result : success -> 성공, fail -> 실패
     """
     if not idx:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="잘못된 접근입니다.")

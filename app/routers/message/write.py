@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Literal
 
 from fastapi import APIRouter, Depends, Request, Form, HTTPException, status
 from fastapi.templating import Jinja2Templates
@@ -10,16 +10,40 @@ from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = Jinja2Templates(directory="templates")
+
+# 메세지 등록 사용자 목록
+@router.get("/memberlist", summary="메세지등록 조직인원")
+def message_write_form(current_user: UserSchema = Depends(get_current_user_from_cookie), deptyn : Literal['Y','N'] | None = 'N'):
+    """
+    <option value="EmpSeqNo">name-> 팀명, EmployeeName->이름, part_name -> 직위</option>
+    """
+    OfficeCode = current_user.office_id
+    mb_part = current_user.mb_part
+
+    if deptyn == 'Y':
+        params = (OfficeCode, mb_part)
+    else:
+        params = OfficeCode
+
+    all_users = msdb_manager.fetch_all(Common.get_organization_member(deptyn), params=params)
+
+    return all_users
 
 # 메세지 화면 출력
 @router.get("/write", summary="메세지등록 화면처리", description="메세지등록 화면처리")
 def message_write_form(request: Request,current_user: UserSchema = Depends(get_current_user_from_cookie)):
+    # print("current_user : ", current_user)
+    deptyn = "Y"
+    OfficeCode = current_user.office_id
+    mb_part = current_user.mb_part
 
-    OfficeCode = current_user.OfficeCode
+    if deptyn == 'Y':
+        params = (OfficeCode, mb_part)
+    else:
+        params = OfficeCode
 
-    all_users = msdb_manager.fetch_all(Common.get_organization_member(), params=OfficeCode)
-
+    all_users = msdb_manager.fetch_all(Common.get_organization_member(deptyn), params=params)
     return templates.TemplateResponse("message_write.html", {"request": request, "all_users": all_users})
 
 @router.post("/write", summary="메세지등록")
@@ -30,18 +54,15 @@ def set_message(current_user: UserSchema = Depends(get_current_user_from_cookie)
         messageimg: str = Form(None)
 ):
     """
-    recipient_ids: 수신자 empseqno, 다중선택 가능 전달을 List 형태로 전달
-                   테스트는 멀티셀렉트 박스로 진행함
-    message: 메세지내용
-    messageimg: 메세지 이미지
-
-    반환값 : result, message
-           result : success -> 성공, fail -> 실패
+    * recipient_ids: 수신자 empseqno, 다중선택 가능 전달을 List 형태로 전달 [테스트는 멀티셀렉트 박스로 진행함]
+    * message: 메세지내용
+    * messageimg: 메세지 이미지
+    * 반환값 : result, message
+    *       result : success -> 성공, fail -> 실패
     """
-    OfficeCode = current_user.OfficeCode
-    sendempseqno = current_user.EmpSeqNo
 
-    print("message : ", message)
+    OfficeCode = current_user.office_id
+    sendempseqno = current_user.EmpSeqNo
 
     if not recipient_ids:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효한 수신자가 선택되지 않았습니다.")

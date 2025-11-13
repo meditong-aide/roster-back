@@ -1,8 +1,6 @@
-from typing import List
-
 from fastapi import APIRouter, Depends, Request, Form, HTTPException, status
 from fastapi.templating import Jinja2Templates
-
+from typing import List
 from datalayer.common import Common
 from datalayer.message import Message
 from db.client2 import msdb_manager
@@ -18,7 +16,7 @@ def message_write_form(idx:int, request: Request,current_user: UserSchema = Depe
     if not idx:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="잘못된 접근 입니다.")
 
-    OfficeCode = current_user.OfficeCode
+    OfficeCode = current_user.office_id
     rows = msdb_manager.fetch_all(Message.get_message_view(), params=idx)
 
     print("rows : ", rows)
@@ -39,14 +37,13 @@ def set_message(current_user: UserSchema = Depends(get_current_user_from_cookie)
         messageimg: str = Form(None)
 ):
     """
-    receptionid : 이전 메세지 전송자 empseqno
-    message : 메세지 내용
-    messageimg : 메세지 이미지
-
-    반환값 : result, message
-           result : success -> 성공, fail -> 실패
+    * receptionid : 이전 메세지 전송자 empseqno
+    * message : 메세지 내용
+    * messageimg : 메세지 이미지
+    * 반환값 : result, message
+    *       result : success -> 성공, fail -> 실패
     """
-    OfficeCode = current_user.OfficeCode
+    OfficeCode = current_user.office_id
     sendempseqno = current_user.EmpSeqNo
 
     if not receptionid:
@@ -58,6 +55,9 @@ def set_message(current_user: UserSchema = Depends(get_current_user_from_cookie)
     try:
         row = msdb_manager.execute(Message.set_message(), params=(OfficeCode, sendempseqno, receptionid, message, messageimg))
 
-        return {"result": "success", "message": "답변 메세지가 전송되었습니다."}
+        if not row or row == 0:
+            return {"result": "fail", "message": "오류가 발생하였습니다."}
+        else:
+            return {"result": "success", "message": "답변 메세지가 전송되었습니다."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing email request: {e}")

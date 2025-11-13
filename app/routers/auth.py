@@ -8,7 +8,6 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Cookie, Request, Form, BackgroundTasks
 from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.templating import Jinja2Templates
 from fastapi_mail import MessageType  # MessageType도 필요합니다.
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session, joinedload
@@ -75,15 +74,17 @@ def get_user(db: Session, account_id: str):
 
 def mworks_get_user (account_id: str, password: str, client_ip: str) :
     rows = msdb_manager.fetch_all(Member.login_check(), params=(password, account_id))
-    print('rows', rows)
+
     for row in rows :
-        
        IsPWCorrect = row['IsPWCorrect']
        EmpSeqNo = row['EmpSeqNo']
        office_id = row['OfficeCode']
+       aiuseyn = row['aiuseyn']
     LogType = 'W'
     RegDate = datetime.now()
 
+    if aiuseyn.upper() != 'Y' :
+        raise HTTPException(status_code=500, detail=f"AI근무표 서비스에 가입되지 않았습니다.")
 
     params = (account_id, RegDate, client_ip, EmpSeqNo, office_id, LogType)
     if not IsPWCorrect :
@@ -101,6 +102,7 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
 
     try :
         user_info = msdb_manager.fetch_all(Member.member_view(), params=(account_id))
+
         return user_info
 
     except Exception as e:
@@ -127,13 +129,16 @@ async def login_for_access_token(
 
         for row in users:
             office_id = row['office_id']
+            EmpSeqNo = row['EmpSeqNo']
             nurse_id = row['nurse_id']
             account_id = row['account_id']
             EmpAuthGbn = row['EmpAuthGbn']
             name = row['name']
             # nurse_id = row['nurse_id']
             group_id = row['group_id']
-            is_head_nurse = str(row['is_head_nurse'])
+            is_head_nurse = row['is_head_nurse']
+            mb_part = row['mb_part']
+
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
@@ -149,6 +154,7 @@ async def login_for_access_token(
         access_token = create_login_token(
             data={
                 "office_id": office_id,
+                "EmpSeqNo": EmpSeqNo,
                 "account_id": account_id,
                 "EmpAuthGbn": EmpAuthGbn,
                 "is_master_admin": is_master_admin,
@@ -156,6 +162,7 @@ async def login_for_access_token(
                 "group_id": group_id,
                 "is_head_nurse": is_head_nurse,
                 "name": name,
+                "mb_part": mb_part,
             },
             expires_delta=access_token_expires,
         )
@@ -209,10 +216,12 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         is_head_nurse: str = payload.get("is_head_nurse")
         name: str = payload.get("name")
         is_master_admin = payload.get("is_master_admin")
+        mb_part: str = payload.get("mb_part")
+
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
-        print('token_data', group_id)
+
     except JWTError:
         return None # If token is invalid, treat as not logged in
     
@@ -237,8 +246,9 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         is_head_nurse=is_head_nurse,
         is_master_admin= (bool(is_master_admin) if is_master_admin is not None else (str(EmpAuthGbn).upper() == 'ADM')),
         name = name,
-        # EmpSeqNo = EmpSeqNo,
-        EmpAuthGbn = EmpAuthGbn
+        EmpSeqNo = EmpSeqNo,
+        EmpAuthGbn = EmpAuthGbn,
+        mb_part = mb_part,
     )
 
 @router.get("/me", response_model=UserSchema)
@@ -251,11 +261,6 @@ async def read_users_me(current_user: UserSchema = Depends(get_current_user_from
         )
     return current_user
 
-
-@router.get("/find_id", summary="ID 찾기")
-def get_id_find_form(request: Request):
-
-    return templates.TemplateResponse("id_find.html", {"request": request})
 
 @router.post("/find_id")
 async def handle_find_id_request(
@@ -292,11 +297,6 @@ async def handle_find_id_request(
         return {"result": "succeed", "memberid" :  member_row[0]['memberid'] }
     else:
         return {"result": "fail", "message" : "일치하는 회원정보가 없습니다." }
-
-@router.get("/find_pw", summary="PW 찾기")
-def get_pw_find_form(request: Request):
-
-    return templates.TemplateResponse("pw_find.html", {"request": request})
 
 @router.post("/find_pw")
 async def handle_find_pw_request(
@@ -335,7 +335,7 @@ async def handle_find_pw_request(
             return {"result": "fail", "message": "email이 일치하지 않습니다."}
 
     # 패스워드 변경
-    pwd_reset_result = msdb_manager.execute(Member.member_pwd_reset(), params=(new_password, new_password, mpseqno))
+    pwd_reset_result = msdb_manager.execute(Member.member_pwd_reset(), params=(new_password, new_password, empseqno))
 
     if not pwd_reset_result or pwd_reset_result == 0:
         return {"result": "fail", "message": "오류가 발생하였습니다."}
@@ -354,10 +354,15 @@ async def handle_find_pw_request(
         if not sms_result or sms_result['result'] == 'fail':
             return {"result": "fail", "message": "오류가 발생하였습니다."}
     else:
+        message = f"""
+                        <h1>{EmployeeName}님</h1>
+                        <h1>임시비밀번호 : {new_password}</h1>
+                        <p>로그인 후 패스워드를 변경해 주세요</p>
+                        <p>감사합니다.</p>
+                """
+
         body_data = {
-            "name": EmployeeName,
-            "pwd": new_password,
-            "message": "로그인 후 패스워드를 변경해 주세요"
+            "message": message
         }
         email_object = EmailSchema(
             email=[email],

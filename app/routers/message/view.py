@@ -8,21 +8,20 @@ router = APIRouter()
 @router.get("/view", summary="메세지 상세보기")
 def message_view(idx: int):
     """
-    idx : 메세지 시퀀스 번호
-    호출방식 : /message/view?idx=1
+    * idx : 메세지 시퀀스 번호
+    * 호출방식 : /message/view?idx=1
 
-    [반환값]
-    "idx": 메세지 번호
-    "sendername": 보내는사람명
-    "senderduty": 보내는사람 직무
-    "receptionname": 받는사람명
-    "receptionduty": 받는사람 직무
-    "message": 메세지
-    "messageimg": 이미지
-    "readyn": Y - 읽음, N -  않읽음
-    "regdate": 메세지 등록일
-    "readdate": 읽은 시간
-
+    * [반환값]
+    * idx: 메세지 번호
+    * sendername: 보내는사람명
+    * senderduty: 보내는사람 직무
+    * receptionname: 받는사람명
+    * receptionduty: 받는사람 직무
+    * message: 메세지
+    * messageimg: 이미지
+    * readyn: Y - 읽음, N -  않읽음
+    * regdate: 메세지 등록일
+    * readdate: 읽은 시간
     """
     if not idx:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="잘못된 접근입니다.")
@@ -41,8 +40,10 @@ def message_view(idx: int):
 
     return [{
         "idx": row['idx'],
+        "sendempseqno": row['sendempseqno'],
         "sendername": row['sendername'],
         "senderduty": row['senderduty'],
+        "receptionempseqno": row['receptionempseqno'],
         "receptionname": row['receptionname'],
         "receptionduty": row['receptionduty'],
         "message": row['message'],

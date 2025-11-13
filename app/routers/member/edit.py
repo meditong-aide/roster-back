@@ -1,18 +1,21 @@
-from fastapi import APIRouter, Depends, Request, Form, HTTPException, BackgroundTasks
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import APIRouter, BackgroundTasks
+from fastapi import Request, File, UploadFile, Form, HTTPException, Depends
 from fastapi.templating import Jinja2Templates
+from fastapi_mail import MessageType  # MessageType도 필요합니다.
+from starlette.responses import HTMLResponse
+from starlette.responses import JSONResponse
 
 from datalayer.member import Member
 from db.client2 import msdb_manager
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
-from datetime import datetime
-
 # EmailSender 클래스 인스턴스를 import
 from utils.email import email_sender, EmailSchema
-from fastapi_mail import MessageType # MessageType도 필요합니다.
-from starlette.responses import JSONResponse
-
-from utils.utils import set_mlink_push, set_app_push, set_sms
+from utils.utils import set_mlink_push, set_app_push, set_sms, save_uploaded_files, delete_files, download_file
 
 router = APIRouter()
 
@@ -60,7 +63,7 @@ async def update_member_info(current_user: UserSchema = Depends(get_current_user
         is_head_nurse: str = Form(None),
         nightkeep: str = Form(None),
 ):
-    OfficeCode = current_user.OfficeCode
+    OfficeCode = current_user.office_id
 
     if not current_user.EmpSeqNo:
        return HTTPException(status_code=500, detail=f"Internal Server Error")
@@ -161,7 +164,7 @@ async def send_mlink_message():
     return message_result
 
 
-# 링크 메세지 테스트
+# 푸시 메세지 테스트
 @router.post("/send-push-message", status_code=202)
 async def send_push_message():
     empseqno = '430461'
@@ -193,3 +196,82 @@ async def send_sms_message():
     sms_result = set_sms(userPhoneNumber, sendPhoneNumber, smsMessage)
     return sms_result
 
+#첨부파일 테스트
+@router.get("/file-upload", status_code=202)
+async def get_upload_form(request: Request):
+    """파일 업로드 폼을 렌더링"""
+    return templates.TemplateResponse("upload_form.html", {"request": request})
+
+
+# 파일 업로드를 처리하는 POST 라우터
+@router.post("/file-upload", response_class=HTMLResponse)
+async def handle_file_upload(
+        request: Request,
+        current_user: UserSchema = Depends(get_current_user_from_cookie),
+        files: Optional[List[UploadFile]] = File(None)
+):
+    """
+    업로드된 파일을 save_uploaded_files 함수를 이용하여 처리
+    """
+    officecode = current_user.office_id
+    GLOBAL_UPLOAD_ROOT = 'downloads/' + officecode + '/board'
+    use_size_limit = 100*1024*1024 #100MB
+
+    uploaded_files = []
+    storage_path = ""
+
+    # 폼에서 파일이 첨부되었는지 확인
+    if files and files[0].filename:
+        try:
+            # 파일 저장
+            storage_path, uploaded_files = await save_uploaded_files(
+                files=files,
+                root_upload_dir=GLOBAL_UPLOAD_ROOT,
+                file_type='all',
+                use_size_limit=use_size_limit
+            )
+
+            message = f"파일 {len(uploaded_files)}개 업로드 성공!"
+            error = None
+
+        except HTTPException as e:
+            # 파일 처리 중 발생한 HTTPException 반환
+            message = None
+            error = e.detail
+            uploaded_files = None
+            storage_path = None
+        except Exception as e:
+            # 기타 예상치 못한 오류
+            message = None
+            error = f"파일 처리 중 예상치 못한 오류 발생: {e}"
+            uploaded_files = None
+            storage_path = None
+    else:
+        # 파일이 첨부되지 않았을 경우
+        message = f"첨부 파일 없음."
+        error = None
+
+    # #파일 삭제
+    # deletion_result = delete_files(
+    #     file_names=["easysetting_division (1)_1761790614728.xls"],
+    #     root_upload_dir=GLOBAL_UPLOAD_ROOT
+    # )
+
+    # 결과를 템플릿에 전달하여 폼과 함께 표시 파일업로드, 삭제에서 활용
+    return templates.TemplateResponse(
+        "upload_form.html",
+        {
+            "request": request,
+            "message": message,
+            "error": error,
+            "uploaded_files": uploaded_files,
+            "storage_path": storage_path
+        }
+    )
+
+    # 파일 다운로드 테스트를 위해서 처리
+    # return download_file(
+    #     stored_file_name="easysetting_position_1761790759835.xls",
+    #     root_upload_dir=GLOBAL_UPLOAD_ROOT,
+    #     download_as="original"
+    # )

@@ -12,8 +12,10 @@ class User(BaseModel):
     is_head_nurse: bool = False
     is_master_admin: bool = False
     name: str
-    # EmpSeqNo: str = None
+    EmpSeqNo: str = None
     EmpAuthGbn: str = None
+    mb_part: str
+
 
     class Config:
         from_attributes = True  

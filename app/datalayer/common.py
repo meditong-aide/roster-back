@@ -74,16 +74,47 @@ class Common:
         return _queryString
 
     @staticmethod
-    def get_organization_member():
+    def get_organization_member(deptyn: str):
         _queryString = """
         select a.num, a.name, a.big_kind, a.middle_kind, a.small_kind, a.mb_part, a.[depth], a.sort, a.ref_num, b.EmpSeqNo, c.MemberID, b.EmployeeName, d.name as part_name, e.name as position_name, e.name as rank_name
           from bizwiz20db.T_Team a
                inner join bizwiz20db.member b on a.OfficeCode = b.OfficeCode and a.mb_part = b.mb_part and b.EmpAuthGbn in ('MEM','ADM')
                left join bizwiz20db.member_login c on b.OfficeCode = c.OfficeCode and b.EmpSeqNo = c.EmpSeqNo 
-               left join bizwiz20db.T_Part d on a.OfficeCode = d.OfficeCode and b.OfficialTitleCode  = d.code 
-               left join bizwiz20db.T_Position e on a.OfficeCode = e.OfficeCode and b.OfficialPositionCode   = e.code
-               left join bizwiz20db.T_rank f on a.OfficeCode = f.OfficeCode and b.OfficialRankCode    = f.code
+               left join bizwiz20db.T_Part d on a.OfficeCode = d.OfficeCode and b.OfficialTitleCode = d.code 
+               left join bizwiz20db.T_Position e on a.OfficeCode = e.OfficeCode and b.OfficialPositionCode = e.code
+               left join bizwiz20db.T_rank f on a.OfficeCode = f.OfficeCode and b.OfficialRankCode = f.code
          where a.OfficeCode  = %s and a.t_use = 'Y'
-         order by a.sort 
+        """
+        if deptyn == 'Y' :
+            _queryString = _queryString + " and a.mb_part = %s "
+            _queryString = _queryString + " order by d.name, b.EmployeeName "
+        else:
+            _queryString = _queryString + " order  by a.sort "
+
+        return _queryString
+
+    @staticmethod
+    def get_push_cnt():
+        _queryString = """
+        Select a.PushCode, COUNT(*) As PushCnt
+          From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
+         Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
+         Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N' 
+           And b.ReadYN='N' And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01' 
+        Group By a.PushCode
+        """
+        return _queryString
+
+    @staticmethod
+    def get_push_list():
+        _queryString = """
+        Select top %s 
+               a.pushcode, a.pushsubcode, a.officecode, a.EmpSeqNo as senderEmpSeqNo, c.EmployeeName as sendername, a.Message, Convert(VarChar(10), b.RegDate, 120) as regdate, b.ReadYN
+          From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
+         Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
+         Inner Join bizwiz20db.Member c WITH(NOLOCK) On a.officeCode = c.officeCode and a.EmpSeqNo=c.EmpSeqNo
+          Left Join bizwiz20db.T_Part d WITH(NOLOCK) On c.OfficialTitleCode=d.code And d.OfficeCode=a.OfficeCode
+         Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N' And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
+         order by a.Idx desc
         """
         return _queryString
