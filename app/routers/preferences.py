@@ -113,4 +113,5 @@ async def get_all_preferences(
         #     override_gid = g.group_id
         return get_all_preferences_service(year, month, current_user, db, override_group_id=group_id)
     except Exception as e:
+        print('[preferences.py] error', e)
         raise HTTPException(status_code=500, detail=f"전체 선호도 조회 실패: {str(e)}")

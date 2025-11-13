@@ -31,4 +31,5 @@ dependencies = [
     "sqlalchemy>=2.0.41",
     "timer>=0.3.0",
     "uvicorn>=0.34.2",
+    "xlrd>=2.0.2",
 ]

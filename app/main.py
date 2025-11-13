@@ -18,7 +18,7 @@ from routers import roster, auth, nurses, dates, wanted, preferences, roster_cre
 from routers.contact import contact_router
 from routers.message import message_router
 from routers.sticker import sticker_router
-from routers.setting import setting_router
+from routers.setting import router as setting_router
 from routers.member import member_router
 import uvicorn
 import warnings
