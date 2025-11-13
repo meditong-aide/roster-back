@@ -143,7 +143,7 @@ async def create_upload_file(current_user: UserSchema = Depends(get_current_user
                 # 결과 내용 확인
                 print("test : ", response.text)
                 if response.status_code == 200:
-                    json_string = '{"result": succeed}'
+                    json_string = '{"result": "succeed"}'
                 else:
                     json_string = '{"result": tmp inserted}'
             else:
