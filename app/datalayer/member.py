@@ -43,6 +43,9 @@ class Member:
                 , isnull(E.name,'') As OfficialTitleName
                 , A.EmpSeqNo as nurse_id
                 , A.EmpSeqNo
+                , isnull(c.OfficeName,'') as office_name
+                , isnull(c.UseOption,'N') as gw_useYN
+                , isnull(c.UseQpisOption,'N') as qpis_useYN
                 , '' as group_id
                 , isnull(a.career,'') as career
                 , isnull(a.duty,'') as duty
@@ -55,7 +58,7 @@ class Member:
             Left Join bizwiz20db.T_Team D On A.mb_part=D.mb_part And A.OfficeCode=D.OfficeCode
             Left Join bizwiz20db.T_Part E On A.OfficialTitleCode=E.code And A.OfficeCode=E.OfficeCode
             left join bizwiz20db.Manage_Office F on A.OfficeCode = F.OfficeCode 
-            Where B.MemberID = %s AND a.EmpAuthGbn !='DEL' and C.ade_sch = 'Y'
+            Where B.MemberID = %s AND a.EmpAuthGbn in ('ADM','MEM') and C.ade_sch = 'Y'
         
         """
         return _queryString

@@ -140,7 +140,8 @@ async def login_for_access_token(
             group_id = row['group_id']
             is_head_nurse = row['is_head_nurse']
             mb_part = row['mb_part']
-
+            gw_useYN = row['gw_useYN']
+            qpis_useYN = row['qpis_useYN']
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
@@ -167,6 +168,8 @@ async def login_for_access_token(
                 "mb_part": mb_part,
                 "office_name": office_name,
                 "mb_part_name": mb_part_name,
+                "gw_useYN": gw_useYN,
+                "qpis_useYN": qpis_useYN,
             },
             expires_delta=access_token_expires,
         )
@@ -221,10 +224,12 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         mb_part: str = payload.get("mb_part")
         office_name: str = payload.get("office_name")
         mb_part_name: str = payload.get("mb_part_name")
+        gw_useYN: str = payload.get("gw_useYN")
+        qpis_useYN: str = payload.get("qpis_useYN")
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
-
+    
     except JWTError:
         return None # If token is invalid, treat as not logged in
     
@@ -254,6 +259,8 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         mb_part = mb_part,
         office_name = office_name,
         mb_part_name = mb_part_name,
+        gw_useYN = gw_useYN,
+        qpis_useYN = qpis_useYN,
     )
 
 @router.get("/me", response_model=UserSchema)
