@@ -105,7 +105,8 @@ async def login_for_access_token(response: Response,
                 group_id = row['group_id']
                 is_head_nurse = row['is_head_nurse']
                 mb_part = row['mb_part']
-
+                office_name = row['office_name']
+                mb_part_name = row['mb_partName']
             # ADM 여부는 EmpAuthGbn으로 판정
             is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
@@ -131,6 +132,8 @@ async def login_for_access_token(response: Response,
                     "is_head_nurse": is_head_nurse,
                     "name": name,
                     "mb_part": mb_part,
+                    "office_name": office_name,
+                    "mb_part_name": mb_part_name,
                 },
                 expires_delta=access_token_expires,
             )
@@ -154,6 +157,8 @@ async def login_for_access_token(response: Response,
                 EmpSeqNo=EmpSeqNo,
                 EmpAuthGbn=EmpAuthGbn,
                 mb_part=mb_part,
+                office_name=office_name,
+                mb_part_name=mb_part_name,
             )
 
             # return {"result": "succeed", "message": "Login successful", "account_id": MemberID}

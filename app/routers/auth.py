@@ -134,6 +134,8 @@ async def login_for_access_token(
             account_id = row['account_id']
             EmpAuthGbn = row['EmpAuthGbn']
             name = row['name']
+            office_name = row['office_name']
+            mb_part_name = row['mb_partName']
             # nurse_id = row['nurse_id']
             group_id = row['group_id']
             is_head_nurse = row['is_head_nurse']
@@ -163,6 +165,8 @@ async def login_for_access_token(
                 "is_head_nurse": is_head_nurse,
                 "name": name,
                 "mb_part": mb_part,
+                "office_name": office_name,
+                "mb_part_name": mb_part_name,
             },
             expires_delta=access_token_expires,
         )
@@ -215,7 +219,8 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         name: str = payload.get("name")
         is_master_admin = payload.get("is_master_admin")
         mb_part: str = payload.get("mb_part")
-
+        office_name: str = payload.get("office_name")
+        mb_part_name: str = payload.get("mb_part_name")
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
@@ -247,6 +252,8 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         EmpSeqNo = EmpSeqNo,
         EmpAuthGbn = EmpAuthGbn,
         mb_part = mb_part,
+        office_name = office_name,
+        mb_part_name = mb_part_name,
     )
 
 @router.get("/me", response_model=UserSchema)
