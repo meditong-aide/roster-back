@@ -1304,8 +1304,10 @@ async def export_schedule_excel(
             target_group_id = current_user.group_id
         data = export_schedule_excel_bytes(schedule_id, current_user, db, target_group_id)
         filename = f"roster_{schedule.year}_{schedule.month}_v{schedule.version}.xlsx"
+        from io import BytesIO
+        output = BytesIO(data)
         return StreamingResponse(
-            iter([data]),
+            output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
                 "Content-Disposition": f"attachment; filename=\"{filename}\""
