@@ -458,7 +458,8 @@ async def get_roster_by_schedule_id(
         "schedule_id": schedule_id,
         "days_in_month": get_days_in_month(schedule.year, schedule.month),
         "shift_colors": shift_colors,
-        "nurses": []
+        "nurses": [],
+        "memo": schedule.memo,
     }
     # Structure data by nurse
     entries_by_nurse = {}
@@ -795,7 +796,7 @@ async def save_roster(
     month = roster_data.get('month')
     schedule_id = roster_data.get('schedule_id')
     roster = roster_data.get('roster')
-    
+    memo = roster_data.get('memo') 
     if not all([year, month, schedule_id, roster]):
         raise HTTPException(status_code=400, detail="Missing required fields: year, month, schedule_id, roster")
 
@@ -822,7 +823,7 @@ async def save_roster(
     
     if not schedule:
         raise HTTPException(status_code=404, detail="No schedule found for this month")
-
+    schedule.memo = memo
     # Clear existing roster entries
     db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).delete()
     

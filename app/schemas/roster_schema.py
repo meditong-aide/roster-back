@@ -155,3 +155,8 @@ class ExcelConfirmRequest(BaseModel):
     data: List[dict]
     include_rows: List[bool]
     new_groups_to_create: List[str] = []
+
+class ScheduleMemoUpdate(BaseModel):
+    schedule_id: str
+    memo: str | None = None
+    group_id: str | None = None 

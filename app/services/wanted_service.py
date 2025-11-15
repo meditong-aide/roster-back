@@ -513,7 +513,7 @@ async def invoke_and_persist_wanted_service(
     # ======================================================================
     # 2. 새 wanted_request 생성
     # ======================================================================
-        new_request_id = _persist_wanted_request(db, nurse_id, month_str, old_wr.request if old_wr else '캘린더 선택')
+        new_request_id = _persist_wanted_request(db, nurse_id, month_str, old_wr.request if old_wr else '')
         print(f'new_request_id, {new_request_id}')
         
         # 3-3. 기존 데이터가 있으면 필터링해서 복사

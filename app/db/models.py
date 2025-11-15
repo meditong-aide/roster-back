@@ -85,6 +85,8 @@ class Schedule(Base):
     dropped = Column(BOOLEAN, nullable=False, default=False)
     name = Column(VARCHAR(50))
     # violations = Column(JSON, nullable=True) # 임시로 주석 처리 - DB 스키마 업데이트 후 활성화 예정
+    memo = Column(TEXT, nullable=True)
+
 
     roster_config = relationship("RosterConfig")
 
