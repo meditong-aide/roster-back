@@ -11,27 +11,6 @@ from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
 from datetime import datetime
 
-
-# def save_preference_draft_service(pref_data: PreferenceData, current_user, db: Session):
-#     """
-#     선호도 초안 저장 서비스 함수
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     current_time = datetime.now().replace(microsecond=0)
-#     preference = ShiftPreference(
-#         nurse_id=current_user.nurse_id,
-#         year=pref_data.year,
-#         month=pref_data.month,
-#         data=pref_data.data,
-#         is_submitted=False,
-#         created_at=current_time,
-#     )
-#     db.add(preference)
-#     db.commit()
-#     db.refresh(preference)
-#     return {"message": "Preference draft saved successfully"}
-
 def submit_preferences_service(req: PreferenceSubmit, current_user, db: Session):
     """
     선호도 최종 제출 서비스 함수
@@ -49,25 +28,6 @@ def submit_preferences_service(req: PreferenceSubmit, current_user, db: Session)
     preference.submitted_at = datetime.utcnow()
     db.commit()
     return {"message": "Preferences submitted successfully"}
-
-# def submit_preferences_service(req: PreferenceSubmit, current_user, db: Session):
-#     """
-#     선호도 최종 제출 서비스 함수
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     preference = db.query(ShiftPreference).filter(
-#         ShiftPreference.nurse_id == current_user.nurse_id,
-#         ShiftPreference.year == req.year,
-#         ShiftPreference.month == req.month,
-#         ShiftPreference.is_submitted == False
-#     ).order_by(ShiftPreference.created_at.desc()).first()
-#     if not preference:
-#         raise Exception("No preference draft found to submit")
-#     preference.is_submitted = True
-#     preference.submitted_at = datetime.utcnow()
-#     db.commit()
-#     return {"message": "Preferences submitted successfully"}
 
 def submit_empty_preferences_service(req: PreferenceSubmit, current_user, db: Session):
     """
@@ -106,25 +66,6 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
     db.commit()
     return {"message": "Submission retracted successfully"}
 
-# def retract_submission_service(req: PreferenceSubmit, current_user, db: Session):
-#     """
-#     선호도 제출 철회 서비스 함수
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     preference = db.query(ShiftPreference).filter(
-#         ShiftPreference.nurse_id == current_user.nurse_id,
-#         ShiftPreference.year == req.year,
-#         ShiftPreference.month == req.month,
-#         ShiftPreference.is_submitted == True
-#     ).order_by(ShiftPreference.submitted_at.desc()).first()
-#     if not preference:
-#         raise Exception("No submitted preference found to retract")
-#     preference.is_submitted = False
-#     preference.submitted_at = None
-#     db.commit()
-#     return {"message": "Submission retracted successfully"}
-
 def get_latest_preference_service(year: int, month: int, current_user, db: Session):
     """
     최신 선호도 데이터 조회 서비스 함수 (WantedRequest 기반)
@@ -132,10 +73,8 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
     """
     if not current_user:
         raise Exception("Not authenticated")
-
     nurse_id = current_user.nurse_id
     month_str = f"{year}-{month:02d}"
-
     # 1️⃣ 제출된 요청 중 최신 데이터
     submitted_wr = (
         db.query(WantedRequest)
@@ -147,7 +86,6 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         .order_by(WantedRequest.submitted_at.desc())
         .first()
     )
-
     # 2️⃣ 없으면 가장 오래된(created_at.asc) 임시 요청 선택
     target_wr = submitted_wr or (
         db.query(WantedRequest)
@@ -158,7 +96,6 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         .order_by(WantedRequest.created_at.desc())
         .first()
     )
-
     if not target_wr:
         # 아무 데이터도 없을 때
         return {
@@ -167,18 +104,17 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
             "created_at": None,
             "submitted_at": None,
         }
-
     # 3️⃣ 해당 request_id로 shift / pair 데이터 가져오기
     shift_rows = (
         db.query(NurseShiftRequest)
         .filter(
             NurseShiftRequest.nurse_id == nurse_id,
             NurseShiftRequest.request_id == target_wr.request_id,
-            # cast(NurseShiftRequest.shift_date, String).like(f"{month_str}-%"),
+            cast(NurseShiftRequest.shift_date, String).like(f"{month_str}-%"),
         )
         .all()
     )
-    # print('shift_rows', shift_rows)
+
     pair_rows = (
         db.query(NursePairRequest)
         .filter(
@@ -187,7 +123,6 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         )
         .all()
     )
-
     # 4️⃣ shift 데이터 구조화 -> 여기만 나중에 바꿀것
     # 예: {'N': {'1': {'request': '주말은 N로 줘', 'score': 1.7}}, 'O': {...}}
     shift_data = {}
@@ -210,67 +145,18 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
             "request": p.partial_request,
             "weight": float(p.score) if p.score is not None else 0.0,
         })
-
     # 6️⃣ 최종 JSON 구성 (Front 기대 형식)
     preference_data = {
         "request": target_wr.request,  # 상위 텍스트 그대로
         "shift": shift_data,
         "preference": pair_data,
     }
-    # pprint.pprint({'preference_data': preference_data,
-    #      'is_submitted': bool(target_wr.is_submitted),
-    #       'created_at': target_wr.created_at,
-    #        'submitted_at': target_wr.submitted_at})
     return {
         "preference_data": preference_data,
         "is_submitted": bool(target_wr.is_submitted),
         "created_at": target_wr.created_at,
         "submitted_at": target_wr.submitted_at,
     }
-
-# def get_latest_preference_service(year: int, month: int, current_user, db: Session):
-#     """
-#     최신 선호도 데이터 조회 서비스 함수
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     submitted_preference = db.query(ShiftPreference).filter(
-#         ShiftPreference.nurse_id == current_user.nurse_id,
-#         ShiftPreference.year == year,
-#         ShiftPreference.month == month,
-#         ShiftPreference.is_submitted == True
-#     ).order_by(ShiftPreference.submitted_at.desc()).first()
-#     if submitted_preference:
-#         return {
-#             "preference_data": submitted_preference.data,
-#             "is_submitted": True,
-#             "created_at": submitted_preference.created_at,
-#             "submitted_at": submitted_preference.submitted_at
-#         }
-#     draft_preference = db.query(ShiftPreference).filter(
-#         ShiftPreference.nurse_id == current_user.nurse_id,
-#         ShiftPreference.year == year,
-#         ShiftPreference.month == month,
-#         ShiftPreference.is_submitted == False
-#     ).order_by(ShiftPreference.created_at.desc()).first()
-#     if draft_preference:
-#         pprint.pprint({'preference_data': draft_preference.data,
-#          'is_submitted': False,
-#           'created_at': draft_preference.created_at,
-#            'submitted_at': None})
-#         return {
-#             "preference_data": draft_preference.data,
-#             "is_submitted": False,
-#             "created_at": draft_preference.created_at,
-#             "submitted_at": None
-#         }
-#     return {
-#         "preference_data": None,
-#         "is_submitted": False,
-#         "created_at": None,
-#         "submitted_at": None
-#     }
-
 
 def get_all_preferences_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
     """
@@ -282,14 +168,11 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
     """
     if not current_user:
         raise Exception("Not authenticated")
-
     month_str = f"{year}-{month:02d}"
 
     target_group_id = override_group_id or current_user.group_id
-    print('target_group_id', target_group_id)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
-
     # ✅ 1️⃣ 그룹 내 간호사 목록 가져오기
     nurse_ids = [
         n.nurse_id
@@ -362,28 +245,4 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             "submitted_at": wr.submitted_at,
             "data": data_json,
         })
-
     return results
-
-# def get_all_preferences_service(year: int, month: int, current_user, db: Session):
-#     """
-#     모든 간호사의 최신 선호도 데이터 조회 서비스 함수
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     print('들어옴')
-#     preferences = db.query(ShiftPreference).filter(
-#         ShiftPreference.year == year,
-#         ShiftPreference.month == month,
-#         ShiftPreference.is_submitted == True
-#     ).join(Nurse, ShiftPreference.nurse_id == Nurse.nurse_id).filter(
-#         Nurse.group_id == current_user.group_id
-#     ).order_by(ShiftPreference.submitted_at.desc()).all()
-#     print('preferences', [s.__dict__ for s in preferences])
-#     latest_prefs = {}
-#     for pref in preferences:
-#         if pref.nurse_id not in latest_prefs:
-#             latest_prefs[pref.nurse_id] = pref
-#     print('latest_prefs')
-#     pprint.pprint([s.__dict__ for s in latest_prefs.values()])
-#     return list(latest_prefs.values()) 

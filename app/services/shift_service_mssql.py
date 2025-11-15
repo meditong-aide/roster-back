@@ -19,9 +19,6 @@ def _to_time_str(value: Any) -> str | None:
     if isinstance(value, _dt.time):
         return value.strftime("%H:%M")
     s = str(value)
-    # if len(s) == 5:
-    #     return f"{s}:00"
-    # print(s)
     return s
 
 
@@ -34,7 +31,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
     if not current_user:
         raise Exception("Not authenticated")
     session = db
-    print('override_group_id', override_group_id)
+    
     try:
         # 1) 조회
         if override_group_id:
@@ -49,7 +46,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
         )
         print('shifts', [s.shift_id for s in shifts])
         if shifts:
-            print('shifts 있음')
+            
             return [
                 {
                     "shift_id": s.shift_id,
@@ -67,13 +64,12 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 }
                 for s in shifts
             ]
-        print('shifts 없음')
+        
         # 2) 기본값 생성 (오피스/그룹은 존재한다고 가정; 없으면 office_id=None로 저장)
         # 기본값 생성
         office_id = None
         group = session.query(Group).filter(Group.group_id == group_id).first()
-        print('group', group)
-        print('group_id', group_id)
+        print('[get_shifts_service_mssql] group_id', group_id)
         if group and group.office_id:
             office_id = group.office_id
         elif getattr(current_user, "office_id", None):

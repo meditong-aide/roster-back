@@ -28,10 +28,6 @@ async def save_preference_draft(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    # try:
-    #     return save_preference_draft_service(pref_data, current_user, db)
-    # except Exception as e:
-    #     raise HTTPException(status_code=500, detail=f"선호도 초안 저장 실패: {str(e)}")
     return
 
 # [Preferences] - 선호도 최종 제출
@@ -94,23 +90,6 @@ async def get_all_preferences(
     db: Session = Depends(get_db)
 ):
     try:
-        # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
-        # override_gid = None
-        # if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        #     override_gid = None
-        # else:
-        #     print('아님여긴가?', group_id)
-        #     # if not getattr(current_user, 'is_master_admin', False):
-        #     #     raise HTTPException(status_code=403, detail="Permission denied")
-        #     # if not group_id:
-        #     #     raise HTTPException(status_code=400, detail="group_id is required for admin")
-        #     from db.models import Group
-        #     g = db.query(Group).filter(Group.group_id == group_id).first()
-        #     # if not g:
-        #     #     raise HTTPException(status_code=404, detail="Group not found")
-        #     # if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-        #     #     raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        #     override_gid = g.group_id
         return get_all_preferences_service(year, month, current_user, db, override_group_id=group_id)
     except Exception as e:
         print('[preferences.py] error', e)

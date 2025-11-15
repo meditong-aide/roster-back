@@ -4,6 +4,7 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from db.models import Wanted, Nurse, ShiftPreference
 from schemas.roster_schema import WantedInvokeRequest, WantedDeadlineRequest
 from schemas.auth_schema import User as UserSchema
@@ -11,7 +12,7 @@ from datetime import datetime, date
 from typing import Dict, Any, List, Tuple
 from db.models import WantedRequest, NurseShiftRequest, NursePairRequest
 from services.graph_service import graph_service
-
+from dateutil.relativedelta import relativedelta
 
 def _yyyymm(year: int, month: int) -> str:
     """연/월을 'YYYY-MM' 문자열로 변환합니다.
@@ -106,7 +107,7 @@ def _persist_wanted_request(db: Session, nurse_id: str, month_str: str, request:
     return request_id
 
 
-def _next_detailed_request_id(db: Session, nurse_id: str, request_id: int, *, table: str) -> int:
+def _next_detailed_request_id(db: Session, nurse_id: str, request_id: int, *, table: str, month_str: str) -> int:
     """해당 (nurse_id, request_id) 범위에서 다음 detailed_request_id 를 생성합니다.
 
     인자:
@@ -118,18 +119,27 @@ def _next_detailed_request_id(db: Session, nurse_id: str, request_id: int, *, ta
     반환:
         다음 detailed_request_id (최초면 1)
     """
+    # 다음달 1일 계산
+    start = datetime.strptime(month_str, "%Y-%m")
+    end = start + relativedelta(months=1)
     if table == "shift":
         q = db.query(NurseShiftRequest.detailed_request_id).filter(
             NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.shift_date >= start,
+            NurseShiftRequest.shift_date < end,
             NurseShiftRequest.request_id == request_id,
         )
     elif table == "pair":
         q = db.query(NursePairRequest.detailed_request_id).filter(
             NursePairRequest.nurse_id == nurse_id,
             NursePairRequest.request_id == request_id,
+            NursePairRequest.shift_date >= start,
+            NursePairRequest.shift_date < end,
         )
     else:
         raise ValueError("table 인자는 'shift' 또는 'pair' 여야 합니다.")
+    # ✔ q가 정의된 시점에서만 사용해야 함
+
     row = q.order_by((NurseShiftRequest.detailed_request_id if table == "shift" else NursePairRequest.detailed_request_id).desc()).first()
     return (row[0] + 1) if row else 1
 
@@ -140,6 +150,7 @@ def _persist_shift_results(
     request_id: int,
     year: int,
     month: int,
+    month_str: str,
     shift_map: Dict[str, Dict[int, float]],
 ) -> None:
     """shift 결과를 nurse_shift_requests 테이블에 저장합니다.
@@ -155,7 +166,7 @@ def _persist_shift_results(
         detailed_request_id는 기존 데이터 다음 순번부터 시작
     """
     # detailed_request_id 는 (nurse_id, request_id) 내에서 기존 데이터 다음부터 증가
-    detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="shift")
+    detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="shift", month_str=month_str)
     rows = 0
     print(f'shift_map (저장 시작, detailed_id={detailed_id}): {shift_map}')
     try:
@@ -200,7 +211,7 @@ def _persist_pair_results(
     Notes:
         detailed_request_id는 기존 데이터 다음 순번부터 시작
     """
-    detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="pair")
+    detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="pair", month_str=month_str)
     rows = 0
     for item in pairs or []:
         try:
@@ -364,11 +375,15 @@ def _copy_existing_requests_to_new(
         case_filter가 있으면 해당 (day, shift)만 복사 (캘린더에서 지운 항목 제외)
     """
     # 1. 기존 shift 데이터 복사
+    start = datetime.strptime(month_str, "%Y-%m")
+    end = start + relativedelta(months=1)
     old_shift_rows = (
         db.query(NurseShiftRequest)
         .filter(
             NurseShiftRequest.nurse_id == nurse_id,
             NurseShiftRequest.request_id == old_request_id,
+            NurseShiftRequest.shift_date >= start,
+            NurseShiftRequest.shift_date < end,
         )
         .all()
     )
@@ -498,7 +513,7 @@ async def invoke_and_persist_wanted_service(
             case_filter.add((day, shift_type))
         
         print(f"case_filter (유지할 항목): {case_filter}")
-        
+        print('여봐라', nurse_id, month_str)
         # 3-2. 기존 request 찾기
         old_wr = (
             db.query(WantedRequest)
@@ -509,7 +524,7 @@ async def invoke_and_persist_wanted_service(
             .order_by(WantedRequest.request_id.desc())
             .first()
         )
-    
+        
     # ======================================================================
     # 2. 새 wanted_request 생성
     # ======================================================================
@@ -518,6 +533,7 @@ async def invoke_and_persist_wanted_service(
         
         # 3-3. 기존 데이터가 있으면 필터링해서 복사
         if old_wr:
+            print(f'old_wr', old_wr.__dict__)
             print(f"기존 데이터 발견: request_id={old_wr.request_id}, 복사 시작")
             try:
                 _copy_existing_requests_to_new(
@@ -551,6 +567,7 @@ async def invoke_and_persist_wanted_service(
                 request_id=new_request_id,
                 year=req.year,
                 month=req.month,
+                month_str=month_str,
                 shift_map=shift_parsed,
             )
     
@@ -576,6 +593,7 @@ async def invoke_and_persist_wanted_service(
                 request_id=new_request_id,
                 year=req.year,
                 month=req.month,
+                month_str=month_str,
                 shift_map=shift_parsed,
             )
 

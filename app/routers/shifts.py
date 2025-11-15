@@ -53,7 +53,7 @@ async def get_shifts(
             override_gid = group_id
         backend = 'mssql'
         if backend == "mssql":
-            print('여기')
+            
             shifts = get_shifts_service_mssql(current_user, db, override_gid)
         else:
             shifts = get_shifts_service_mysql(current_user, db, override_gid)
