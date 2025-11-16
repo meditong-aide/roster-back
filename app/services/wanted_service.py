@@ -355,6 +355,7 @@ def _copy_existing_requests_to_new(
     new_request_id: int,
     year: int,
     month: int,
+    month_str: str,
     case_filter: set = None,
 ) -> Tuple[int, int]:
     """기존 request_id의 데이터를 새 request_id로 복사합니다.
@@ -543,6 +544,7 @@ async def invoke_and_persist_wanted_service(
                     new_request_id=new_request_id,
                     year=req.year,
                     month=req.month,
+                    month_str=month_str,
                     case_filter=case_filter,  # 필터 전달
                 )
             except Exception as e:
