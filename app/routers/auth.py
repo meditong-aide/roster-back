@@ -142,6 +142,11 @@ async def login_for_access_token(
             mb_part = row['mb_part']
             gw_useYN = row['gw_useYN']
             qpis_useYN = row['qpis_useYN']
+
+            print('[/login] office_name', office_name)
+            print('[/login] mb_part_name', mb_part_name)
+            print('[/login] gw_useYN', gw_useYN)
+            print('[/login] qpis_useYN', qpis_useYN)
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
@@ -233,18 +238,6 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
     except JWTError:
         return None # If token is invalid, treat as not logged in
     
-    # user = get_user(db, token_data.account_id)
-    # if user is None:
-    #     return None
-    
-    # Manually construct UserSchema to avoid from_orm issues
-    # return UserSchema(
-    #     nurse_id=user.nurse_id,
-    #     account_id=user.account_id,
-    #     office_id=user.office_id,  # This should now work with eager loading
-    #     group_id=user.group_id,
-    #     is_head_nurse=user.is_head_nurse,
-    #     name = user.name
 
     return UserSchema(
         nurse_id= nurse_id,
@@ -271,6 +264,11 @@ async def read_users_me(current_user: UserSchema = Depends(get_current_user_from
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated"
         )
+    print('[/me] office_name', current_user.office_name)
+    print('[/me] mb_part_name', current_user.mb_part_name)
+    print('[/me] gw_useYN', current_user.gw_useYN)
+    print('[/me] qpis_useYN', current_user.qpis_useYN)
+        
     return current_user
 
 
