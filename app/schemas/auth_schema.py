@@ -15,6 +15,10 @@ class User(BaseModel):
     EmpSeqNo: str = None
     EmpAuthGbn: str = None
     mb_part: str
+    office_name: str
+    mb_part_name: str
+    gw_useYN: str
+    qpis_useYN: str
 
 
     class Config:

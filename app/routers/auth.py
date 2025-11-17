@@ -142,11 +142,6 @@ async def login_for_access_token(
             mb_part = row['mb_part']
             gw_useYN = row['gw_useYN']
             qpis_useYN = row['qpis_useYN']
-
-            print('[/login] office_name', office_name)
-            print('[/login] mb_part_name', mb_part_name)
-            print('[/login] gw_useYN', gw_useYN)
-            print('[/login] qpis_useYN', qpis_useYN)
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
@@ -264,10 +259,6 @@ async def read_users_me(current_user: UserSchema = Depends(get_current_user_from
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated"
         )
-    print('[/me] office_name', current_user.office_name)
-    print('[/me] mb_part_name', current_user.mb_part_name)
-    print('[/me] gw_useYN', current_user.gw_useYN)
-    print('[/me] qpis_useYN', current_user.qpis_useYN)
         
     return current_user
 
