@@ -65,22 +65,6 @@ async def create_upload_file(file : UploadFile, upload_directory : str):
 
 def clean_non_printable_chars(df: pd.DataFrame) -> pd.DataFrame:
     """
-    비표시 문자를 찾는 정규 표현식:
-    [^] - (Not)
-    \x20-\x7E - 일반적인 인쇄 가능한 ASCII 문자 (공백부터 틸데까지)
-    \t\n\r - 탭, 개행, 캐리지 리턴 (일반적으로 유지하고 싶은 문자)
-    따라서, 이 범위에 속하지 않는 모든 문자를 찾습니다.
-
-    좀 더 엄격하게 비표시 문자를 제거하려면, \p{C}에 해당하는 유니코드 범위를 사용합니다.
-    일반적으로 [^\x00-\x7F] (확장 ASCII 및 유니코드) 또는
-    [\x00-\x1F\x7F] (ASCII 제어 문자)를 제거하는 방법을 사용합니다.
-
-    널리 사용되는 방법: ASCII 제어 문자 제거 (유지하고 싶은 \t, \n, \r 제외)
-    \x00-\x08 (NULL, SOH, STX, ETX, EOT, ENQ, ACK, BEL, BS)
-    \x0B-\x0C (VT, FF)
-    \x0E-\x1F (SO, SI, DLE, DC1, DC2, DC3, DC4, NAK, SYN, ETB, CAN, EM, SUB, ESC, FS, GS, RS, US)
-    \x7F (DEL)
-
     간단하게, 일반적으로 사용되지 않는 ASCII 제어 문자를 모두 제거합니다.
     """
     # 1단계: 제거할 제어 문자 (Null Byte 포함)

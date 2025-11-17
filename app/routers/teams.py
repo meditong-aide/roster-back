@@ -26,7 +26,7 @@ async def put_teams(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user or (not current_user.is_head_nurse and not current_user.is_master_admin):
         raise HTTPException(status_code=403, detail="권한 없음")
     try:
         payload = [t.dict() for t in body.teams]

@@ -1228,6 +1228,7 @@ def export_members_excel_bytes(office_id: str) -> bytes:
         ("duty", "직무"),
         ("career", "경력"),
         ("headnurse", "수간호사여부"),
+        ("joindate", "입사일"),
     ]
 
     wb = Workbook()
