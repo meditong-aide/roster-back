@@ -19,11 +19,13 @@ def submit_preferences_service(req: PreferenceSubmit, current_user, db: Session)
         raise Exception("Not authenticated")
     print('current_user', current_user.__dict__)
     print('req', req.__dict__)
+    month_str = f"{req.year}-{req.month:02d}"
     preference = db.query(WantedRequest).filter(
         WantedRequest.nurse_id == current_user.nurse_id,
-        WantedRequest.month == str(req.year) + '-' + str(req.month),
+        WantedRequest.month == month_str,
         WantedRequest.is_submitted == False
     ).order_by(WantedRequest.created_at.desc()).first()
+    print('preference', preference.__dict__)
     if not preference:
         raise Exception("No preference draft found to submit")
     preference.is_submitted = True
