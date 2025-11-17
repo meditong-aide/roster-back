@@ -1021,14 +1021,6 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
 
     # 시프트(색상 등은 엑셀에서는 텍스트 표기 중심으로 사용)
     shifts_db = db.query(Shift).filter(Shift.group_id == target_group_id).all()
-    # known_shift_ids = {s.shift_id for s in shifts_db}
-
-    # # config_version → ShiftManage 별칭 맵 작성
-    # if schedule.config_id:
-    #     rc = db.query(RosterConfig).filter(RosterConfig.config_id == schedule.config_id).first()
-    # else:
-    #     rc = db.query(RosterConfig).filter(RosterConfig.group_id == current_user.group_id).order_by(RosterConfig.created_at.desc()).first()
-    # config_version = rc.config_version if rc else None
 
     alias_map: dict[str, str] = {}
     # if config_version:
@@ -1209,7 +1201,7 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return bio.read() 
+    return bio.getvalue() 
 
 
 def export_members_excel_bytes(office_id: str) -> bytes:

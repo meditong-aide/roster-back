@@ -24,7 +24,7 @@ from services.roster_system import RosterSystem
 
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -1259,7 +1259,7 @@ async def update_schedule_name(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"이름 업데이트 실패: {str(e)}")
 
-@router.get("/schedule/{schedule_id}/export", response_class=StreamingResponse)
+@router.get("/schedule/{schedule_id}/export", response_class=FileResponse)
 async def export_schedule_excel(
     schedule_id: str,
     group_id: Optional[str] = None,
@@ -1270,24 +1270,8 @@ async def export_schedule_excel(
         - 근무표 엑셀 내보내기
         - 파일명: roster_{year}_{month}_v{version}.xlsx
     """
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user or (not current_user.is_head_nurse and not current_user.is_master_admin):
         raise HTTPException(status_code=403, detail="Permission denied")
-    print('group_id', group_id)
-    # 스케줄 정보 확인(파일명에 사용)
-    # # 대상 그룹 확인
-    # if current_user.is_head_nurse and current_user.group_id:
-    #     target_group_id = current_user.group_id
-    # else:
-    #     if not getattr(current_user, 'is_master_admin', False):
-    #         raise HTTPException(status_code=403, detail="Permission denied")
-    #     if not group_id:
-    #         raise HTTPException(status_code=400, detail="group_id is required for admin")
-    #     g = db.query(Group).filter(Group.group_id == group_id).first()
-    #     if not g:
-    #         raise HTTPException(status_code=404, detail="Group not found")
-    #     if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-    #         raise HTTPException(status_code=403, detail="Group does not belong to your office")
-    #     target_group_id = g.group_id
 
     
     schedule = db.query(Schedule).filter(
