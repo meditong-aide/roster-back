@@ -1270,8 +1270,6 @@ async def export_schedule_excel(
         - 근무표 엑셀 내보내기
         - 파일명: roster_{year}_{month}_v{version}.xlsx
     """
-    if not current_user or (not current_user.is_head_nurse and not current_user.is_master_admin):
-        raise HTTPException(status_code=403, detail="Permission denied")
 
     schedule = db.query(Schedule).filter(
         Schedule.schedule_id == schedule_id,
