@@ -1126,9 +1126,11 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     # ───────── 5) 본문: 간호사별 스케줄 ─────────
     start_row = header_row + 1
     daily_counts = {d: {'D': 0, 'E': 0, 'N': 0, 'O': 0} for d in range(1, days_in_month + 1)}
-
+    # 하이라이트 색상 (노랑)
+    highlight_fill = PatternFill("solid", fgColor="FFFACD")
     for idx, n in enumerate(nurses, start=1):
         r = start_row + idx - 1
+        is_current_user = (str(n.nurse_id) == str(current_user.nurse_id))
         # 번호/구분(간단 분류: HN/RN/AN 추정 불가 → RN로 표기)/이름
         ws.cell(row=r, column=1, value=idx)
         ws.cell(row=r, column=2, value="RN")
@@ -1137,7 +1139,9 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         for c in range(1, static_cols + 1):
             cell = ws.cell(row=r, column=c)
             cell.alignment = center; cell.border = border_all
-
+            # 🔥 현재 유저면 하이라이트 적용
+            if is_current_user:
+                cell.fill = highlight_fill
         # 일자별
         row_counts = {'D': 0, 'E': 0, 'N': 0, 'O': 0}
         schedule_map = by_nurse.get(n.nurse_id, {})
@@ -1149,13 +1153,16 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
             if base in row_counts:
                 row_counts[base] += 1
                 daily_counts[d][base] += 1
-
+            if is_current_user:
+                cell.fill = highlight_fill
         # 합계(D/E/N/O)
         for i, lab in enumerate(tail_labels):
             col = tail_start_col + i
             cell = ws.cell(row=r, column=col, value=row_counts.get(lab, 0))
             cell.alignment = center; cell.border = border_all
-
+            cell.border = border_all
+            if is_current_user:
+                cell.fill = highlight_fill
     last_row = start_row + len(nurses) - 1
 
     # ───────── 6) 일일 근무 현황(풋터) ─────────

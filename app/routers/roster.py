@@ -1273,7 +1273,6 @@ async def export_schedule_excel(
     if not current_user or (not current_user.is_head_nurse and not current_user.is_master_admin):
         raise HTTPException(status_code=403, detail="Permission denied")
 
-    
     schedule = db.query(Schedule).filter(
         Schedule.schedule_id == schedule_id,
         # Schedule.group_id == target_group_id,
@@ -1283,10 +1282,10 @@ async def export_schedule_excel(
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
     try:
         from services.excel_service import export_schedule_excel_bytes
-        if group_id:
-            target_group_id = group_id
-        else:
+        if group_id in [None, "", "null", "undefined", "None"]:
             target_group_id = current_user.group_id
+        else:
+            target_group_id = group_id
         data = export_schedule_excel_bytes(schedule_id, current_user, db, target_group_id)
         filename = f"roster_{schedule.year}_{schedule.month}_v{schedule.version}.xlsx"
         from io import BytesIO
@@ -1299,4 +1298,5 @@ async def export_schedule_excel(
             }
         )
     except Exception as e:
+        print(f"[export_schedule_excel] 오류: {e}")
         raise HTTPException(status_code=500, detail=f"엑셀 생성 실패: {str(e)}")
