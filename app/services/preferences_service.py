@@ -17,6 +17,8 @@ def submit_preferences_service(req: PreferenceSubmit, current_user, db: Session)
     """
     if not current_user:
         raise Exception("Not authenticated")
+    print('current_user', current_user.__dict__)
+    print('req', req.__dict__)
     preference = db.query(WantedRequest).filter(
         WantedRequest.nurse_id == current_user.nurse_id,
         WantedRequest.month == str(req.year) + '-' + str(req.month),

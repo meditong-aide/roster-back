@@ -133,8 +133,6 @@ def _next_detailed_request_id(db: Session, nurse_id: str, request_id: int, *, ta
         q = db.query(NursePairRequest.detailed_request_id).filter(
             NursePairRequest.nurse_id == nurse_id,
             NursePairRequest.request_id == request_id,
-            NursePairRequest.shift_date >= start,
-            NursePairRequest.shift_date < end,
         )
     else:
         raise ValueError("table 인자는 'shift' 또는 'pair' 여야 합니다.")
@@ -198,6 +196,7 @@ def _persist_pair_results(
     db: Session,
     nurse_id: str,
     request_id: int,
+    month_str: str,
     pairs: List[Dict[str, float]],
 ) -> None:
     """pair 결과를 nurse_pair_requests 테이블에 저장합니다.
@@ -343,7 +342,9 @@ def _parse_preferences(response: List[List[Dict[str, Any]]], schema: List[Dict[s
                         continue
                     seen.add(key)
                     parsed.append({"id": _id_str, "weight": weight_float, "request": request})
-                except (ValueError, TypeError):
+                except Exception as e:
+                    print('여기 오류 ㅠ')
+                    print(f'e', e)
                     continue
     return parsed
 
@@ -601,11 +602,13 @@ async def invoke_and_persist_wanted_service(
 
         try:
             pref_parsed = _parse_preferences(response, req.schema)
+
             if pref_parsed:
                 _persist_pair_results(
                     db=db,
                     nurse_id=nurse_id,
                     request_id=new_request_id,
+                    month_str=month_str,
                     pairs=pref_parsed,
                 )
         except Exception as e:
