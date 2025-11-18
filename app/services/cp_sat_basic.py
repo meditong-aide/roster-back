@@ -936,6 +936,8 @@ class CPSATBasicEngine:
             # if seed is None:
             #     # 매 실행마다 다르게: 시간+랜덤믹스
             #     seed = (int(time.time()*1000) ^ random.getrandbits(31)) & 0x7fffffff
+            if run_seed is None:
+                run_seed = random.randint(1, 1_000_000_000)
             solver.parameters.randomize_search = True
             solver.parameters.random_seed = (run_seed ^ 0x9E3779B1) & 0x7fffffff
             solver.parameters.solution_pool_size = 10
