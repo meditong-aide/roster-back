@@ -73,6 +73,10 @@ class NurseRosterConfig:
     # 근무 요구사항 우선순위 (0~1) - 1에 가까울수록 더 강하게 근무 요구사항 강제
     shift_requirement_priority: float = 0.8  # 근무 요구사항 우선순위
     
+    # --- Oversupply(여유 인원) 균등화 제어 ---
+    oversupply_equalize_enable: bool = True  # 일별 D/E/N 초과 인원(L1) 균등화 활성화
+    oversupply_equalize_weight: int = 120    # L1 차이 패널티 가중치(클수록 균등화 강함)
+    
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
