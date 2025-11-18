@@ -108,7 +108,10 @@ class CPSATBasicEngine:
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
-            max_extra_off_days=int(config_data.get('max_extra_off_days', 2))
+            max_extra_off_days=int(config_data.get('max_extra_off_days', 2)),
+            # 여유 인원 균등화 제어
+            oversupply_equalize_enable=bool(config_data.get('oversupply_equalize_enable', True)),
+            oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120))
         )
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
@@ -640,6 +643,7 @@ class CPSATBasicEngine:
 
             # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
             short_terms, over_terms = [], []
+            over_vars_by_day = {}
             for d in range(D):
                 if hasattr(cfg, 'daily_shift_requirements_by_day') and isinstance(cfg.daily_shift_requirements_by_day, list) and d < len(cfg.daily_shift_requirements_by_day):
                     need_map = cfg.daily_shift_requirements_by_day[d]
@@ -663,6 +667,7 @@ class CPSATBasicEngine:
                     m.Add(assigned + sh - ov == need)
                     short_terms.append(sh)
                     over_terms.append(ov)
+                    over_vars_by_day.setdefault(d, {})[code] = ov
 
             # 2) 안전/법규 위반(정량 슬랙) 구성
             safety = {
@@ -858,6 +863,22 @@ class CPSATBasicEngine:
                         shortage = m.NewIntVar(0, cfg.required_experienced_nurses, f'expShort_fb_{d}_{code}')
                         m.Add(shortage >= cfg.required_experienced_nurses - exp_assigned)
                         obj.append(-100 * shortage)
+                # 여유 인원 L1 균등화(일별 D/E/N): |ov_d,c1 - ov_d,c2| 최소화
+                try:
+                    if bool(getattr(cfg, 'oversupply_equalize_enable', True)):
+                        w_eq = int(getattr(cfg, 'oversupply_equalize_weight', 120))
+                        for d, code2ov in over_vars_by_day.items():
+                            work_codes = [code for code in code2ov.keys() if code in roster_system.config.daily_shift_requirements.keys()]
+                            for i in range(len(work_codes)):
+                                for j in range(i + 1, len(work_codes)):
+                                    c1, c2 = work_codes[i], work_codes[j]
+                                    ov1, ov2 = code2ov[c1], code2ov[c2]
+                                    diff = m.NewIntVar(0, N, f'ov_diff_fb_{d}_{c1}_{c2}')
+                                    m.Add(diff >= ov1 - ov2)
+                                    m.Add(diff >= ov2 - ov1)
+                                    obj.append(-w_eq * diff)
+                except Exception:
+                    pass
                 m.Maximize(sum(obj))
 
             return m, X, short_terms, over_terms, safety
@@ -1181,6 +1202,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     # ───────────── 2-C. Shift requirements (per-day, slack 허용) ───
     coverage_shortage_vars = []
+    over_vars_by_day = {}
     cfg = rs.config
     for d in range(D):
         # 일자별 요구치 우선 사용
@@ -1203,6 +1225,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             sh = m.NewIntVar(0, N, f'short_{d}_{code}')
             m.Add(sh >= need - assigned)
             coverage_shortage_vars.append((sh, code))
+            # oversupply 추적: 추가 투입 인원 수 ov ≥ assigned - need
+            ov = m.NewIntVar(0, N, f'over_{d}_{code}')
+            m.Add(ov >= assigned - need)
+            over_vars_by_day.setdefault(d, {})[code] = ov
 
     # shorthand indices
     idx = {c:rs.config.shift_types.index(c) for c in ('D','E','N','O')}
@@ -1342,6 +1368,24 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if code == 'N':
                 w = int(base * 1.2)
             obj.append(-w * sh)
+    except Exception:
+        pass
+
+    # (4-8) 여유 인원 L1 균등화: 동일 날짜의 D/E/N 간 초과 인원 차이를 최소화
+    try:
+        if bool(getattr(cfg, 'oversupply_equalize_enable', True)):
+            w_eq = int(getattr(cfg, 'oversupply_equalize_weight', 120))
+            for d, code2ov in over_vars_by_day.items():
+                # 실제 근무 코드만 사용('O' 제외)
+                work_codes = [code for code in code2ov.keys() if code in rs.config.daily_shift_requirements.keys()]
+                for i in range(len(work_codes)):
+                    for j in range(i + 1, len(work_codes)):
+                        c1, c2 = work_codes[i], work_codes[j]
+                        ov1, ov2 = code2ov[c1], code2ov[c2]
+                        diff = m.NewIntVar(0, N, f'ov_diff_{d}_{c1}_{c2}')
+                        m.Add(diff >= ov1 - ov2)
+                        m.Add(diff >= ov2 - ov1)
+                        obj.append(-w_eq * diff)
     except Exception:
         pass
 
