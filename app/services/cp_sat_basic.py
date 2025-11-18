@@ -106,7 +106,9 @@ class CPSATBasicEngine:
             preceptor_strength_multiplier=config_data.get('preceptor_strength_multiplier', 1.0),
             preceptor_top_days=config_data.get('preceptor_top_days', 12),
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
-            preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None)
+            preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
+            # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
+            max_extra_off_days=int(config_data.get('max_extra_off_days', 2))
         )
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
@@ -804,6 +806,12 @@ class CPSATBasicEngine:
                         miss = m.NewIntVar(0, D, f'min_off_miss_{n}')
                         m.Add(miss >= min_off_required - offs)
                         safety['min_off_missing'].append(miss)
+                    # 월 최대 OFF 상한(하드): 최소 필요 OFF + 허용 초과 일수
+                    extra_allowed = int(getattr(cfg, 'max_extra_off_days', 0))
+                    if extra_allowed >= 0:
+                        max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
+                        offs2 = sum(X(n, d, off_idx) for d in range(T0, T1 + 1))
+                        m.Add(offs2 <= max_off_allowed)
             except Exception:
                 pass
 
@@ -1238,6 +1246,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             min_off_required = min(base_min_off, T1 - T0 + 1)
             if min_off_required > 0:
                 m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) >= min_off_required)
+            # 월 최대 OFF 상한: 최소 필요 OFF + 허용 초과 일수
+            extra_allowed = int(getattr(cfg, 'max_extra_off_days', 0))
+            if extra_allowed >= 0:
+                max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
+                m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) <= max_off_allowed)
         except Exception:
             pass
 
