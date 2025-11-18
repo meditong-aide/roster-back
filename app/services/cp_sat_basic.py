@@ -134,6 +134,23 @@ class CPSATBasicEngine:
     def create_nurses_from_db(self, nurses_data: List[dict]) -> List[Nurse]:
         """DB에서 가져온 간호사 데이터를 Nurse 객체 리스트로 변환"""
         # sequence 기준 정렬(없으면 0) → 알고리즘 입력 순서 일관화
+        def _to_date(x):
+            if x is None:
+                return None
+            if isinstance(x, datetime):
+                return x.date()
+            if isinstance(x, date):
+                return x
+            if isinstance(x, str):
+                # 날짜/시간 모두 허용
+                try:
+                    return datetime.strptime(x, "%Y-%m-%d").date()
+                except:
+                    try:
+                        return datetime.fromisoformat(x).date()
+                    except:
+                        return None
+            return None
         sorted_rows = sorted(nurses_data, key=lambda r: (r.get('sequence', 0), -int(r.get('experience', 0) or 0), str(r.get('nurse_id'))))
         nurses = []
         for i, nurse_data in enumerate(sorted_rows):
@@ -147,18 +164,18 @@ class CPSATBasicEngine:
                 'is_night_nurse': nurse_data.get('is_night_nurse', 0),
                 'personal_off_adjustment': nurse_data.get('personal_off_adjustment', 0),
                 'remaining_off_days': 0,  # 초기화, 나중에 계산됨
-                'joining_date': nurse_data.get('joining_date', None),
-                'resignation_date': nurse_data.get('resignation_date', None)
+                'joining_date': _to_date(nurse_data.get('joining_date')),
+                'resignation_date': _to_date(nurse_data.get('resignation_date')),
             }
             
-            # resignation_date 처리
-            if nurse_data.get('resignation_date'):
-                if isinstance(nurse_data['resignation_date'], str):
-                    nurse_dict['resignation_date'] = datetime.strptime(
-                        nurse_data['resignation_date'], '%Y-%m-%d'
-                    ).date()
-                else:
-                    nurse_dict['resignation_date'] = nurse_data['resignation_date']
+            # # resignation_date 처리
+            # if nurse_data.get('resignation_date'):
+            #     if isinstance(nurse_data['resignation_date'], str):
+            #         nurse_dict['resignation_date'] = datetime.strptime(
+            #             nurse_data['resignation_date'], '%Y-%m-%d'
+            #         ).date()
+            #     else:
+            #         nurse_dict['resignation_date'] = nurse_data['resignation_date']
             
             nurses.append(Nurse(**nurse_dict))
         
