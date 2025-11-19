@@ -496,20 +496,7 @@ async def get_schedule_versions(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        print()
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    target_group_id = current_user.group_id
 
     schedules = db.query(Schedule).filter(
         Schedule.group_id == target_group_id,
