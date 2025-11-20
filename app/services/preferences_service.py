@@ -60,9 +60,10 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
         raise Exception("Not authenticated")
     print('current_user', current_user.__dict__)
     print('req', req.__dict__)
+    month_str = f"{req.year}-{req.month:02d}"
     preference = db.query(WantedRequest).filter(
         WantedRequest.nurse_id == current_user.nurse_id,
-        WantedRequest.month == str(req.year) + '-' + str(req.month),
+        WantedRequest.month == month_str,
         WantedRequest.is_submitted == True
     ).order_by(WantedRequest.submitted_at.desc()).first()
     if not preference:
