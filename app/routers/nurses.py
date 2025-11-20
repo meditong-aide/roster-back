@@ -49,15 +49,17 @@ async def get_nurses_in_group(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-
-    print('group_id', group_id)
-    print('current_user.group_id', current_user.group_id)
+    if current_user.is_master_admin:
+        target_group_id = group_id
+    else:
+        target_group_id = current_user.group_id
+    print('[nurses.py - get_nurses_in_group] target_group_id', target_group_id)
     try:
         # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
         if office_id or group_id:
             if not current_user or not current_user.is_master_admin:
                 raise HTTPException(status_code=403, detail="마스터 관리자만 필터 조회가 가능합니다.")
-            return get_nurses_filtered_service(current_user, db, office_id=office_id, group_id=group_id)
+            return get_nurses_filtered_service(current_user, db, office_id=office_id, group_id=target_group_id)
         return get_nurses_in_group_service(current_user, db)
     except Exception as e:
         print('error', e)

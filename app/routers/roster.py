@@ -495,9 +495,11 @@ async def get_schedule_versions(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-
-    target_group_id = current_user.group_id
-
+    if current_user.is_master_admin:
+        target_group_id = group_id
+    else:
+        target_group_id = current_user.group_id
+    
     schedules = db.query(Schedule).filter(
         Schedule.group_id == target_group_id,
         Schedule.year == year,
