@@ -504,7 +504,9 @@ async def get_schedule_versions(
         Schedule.month == month,
         Schedule.dropped == False
     ).order_by(Schedule.version.desc()).all()
-    
+    print('[roster.py - get_schedule_versions] target_group_id', target_group_id)
+    print('[roster.py - get_schedule_versions] schedules', [s.__dict__ for s in schedules if s is not None])
+
     return [{
         "schedule_id": schedule.schedule_id,
         "version": schedule.version,
@@ -1156,15 +1158,15 @@ async def validate_roster(
                     'nurse_name': nurse_name,
                     'day': v['day']+1
                 })
-            elif v['type'] == 'night_nd':
-                nurse_name = system.nurses[v['nurse_idx']].name
-                violation_messages.add(f"{nurse_name}: 야간 근무 후 주간 근무 위반")
-                detailed_violations.append({
-                    'type': 'night_nd',
-                    'nurse_idx': v['nurse_idx'],
-                    'nurse_name': nurse_name,
-                    'day': v['day']
-                })
+            # elif v['type'] == 'night_nd':
+            #     nurse_name = system.nurses[v['nurse_idx']].name
+            #     violation_messages.add(f"{nurse_name}: 야간 근무 후 주간 근무 위반")
+            #     detailed_violations.append({
+            #         'type': 'night_nd',
+            #         'nurse_idx': v['nurse_idx'],
+            #         'nurse_name': nurse_name,
+            #         'day': v['day']
+            #     })
             elif v['type'] == 'night_month_limit':
                 nurse_name = system.nurses[v['nurse_idx']].name
                 violation_messages.add(f"{nurse_name}: 월 야간 근무 초과 위반")
