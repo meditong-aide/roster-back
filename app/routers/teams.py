@@ -13,7 +13,7 @@ router = APIRouter(prefix="/teams", tags=["teams"])
 @router.get("", response_model=list[TeamWithMembers])
 async def get_teams(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
-    group_id: str,
+    group_id: str | None = None,
     db: Session = Depends(get_db),
 ):
     if not current_user:
