@@ -13,11 +13,18 @@ router = APIRouter(prefix="/teams", tags=["teams"])
 @router.get("", response_model=list[TeamWithMembers])
 async def get_teams(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
+    group_id: str,
     db: Session = Depends(get_db),
 ):
     if not current_user:
+        print('[teams.py] current_user is None')
         raise HTTPException(status_code=401, detail="인증 필요")
-    return list_teams_with_members(db, current_user.office_id, current_user.group_id)
+    if current_user.is_master_admin:
+        group_id = group_id
+    else:
+        group_id = current_user.group_id
+    print('[teams.py - get_teams] group_id', group_id)
+    return list_teams_with_members(db, current_user.office_id, group_id)
 
 
 @router.put("", response_model=list[TeamWithMembers])
