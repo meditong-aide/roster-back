@@ -64,6 +64,7 @@ async def retract_submission(
     try:
         return retract_submission_service(req, current_user, db)
     except Exception as e:
+        print('[preferences.py] error', e)
         raise HTTPException(status_code=500, detail=f"제출 철회 실패: {str(e)}")
 
 # [Preferences] - 최신 선호도 데이터 조회
