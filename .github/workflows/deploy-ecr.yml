@@ -292,7 +292,7 @@ jobs:
 
             # 5) 기존 프로세스 종료
             echo "➡️ 기존 uvicorn 종료"
-            pkill -f "uvicorn" 2>/dev/null || true
+            pkill -TERM -f uvicorn >/dev/null 2>&1 || true
             echo "uvicorn terminated safely" || true
 
             # 6) 서버 실행
