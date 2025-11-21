@@ -297,4 +297,3 @@ jobs:
 
             echo "🚀 DEV 서버 배포 완료!"
             echo "👉 http://${{ env.EC2_HOST }}:8000/health"
-            exit 0
