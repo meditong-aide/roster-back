@@ -276,16 +276,17 @@ jobs:
             echo "➡️ DEV .env 생성"
             cat > /home/ubuntu/aide-backend-dev/.env <<EOF
             ENVIRONMENT=development
-            DB_HOST=${{ secrets.DEV_DB_HOST }}
-            DB_PORT=${{ secrets.DEV_DB_PORT }}
-            DB_NAME=${{ secrets.DEV_DB_NAME }}
-            DB_USER=${{ secrets.DEV_DB_USER }}
-            DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}
+            MS_DB_HOST=${{ secrets.DEV_MS_DB_HOST }}
+            MS_DB_PORT=${{ secrets.DEV_MS_DB_PORT }}
+            MS_DB_NAME=${{ secrets.DEV_MS_DB_NAME }}
+            MS_DB_USER=${{ secrets.DEV_MS_DB_USER }}
+            MS_DB_PASSWORD=${{ secrets.DEV_MS_DB_PASSWORD }}
             EUN_DB_NAME=${{ secrets.DEV_EUN_DB_NAME }}
             CLIENT_ID=${{ secrets.DEV_CLIENT_ID }}
             CLIENT_SECRET=${{ secrets.DEV_CLIENT_SECRET }}
             SECRET_KEY=${{ secrets.DEV_SECRET_KEY }}
             ALGORITHM=${{ secrets.DEV_ALGORITHM }}
+            SQS_QUEUE_URL=https://sqs.ap-northeast-2.amazonaws.com/702166530338/roster-job-queue
             EOF
 
             # 5) 기존 프로세스 종료
