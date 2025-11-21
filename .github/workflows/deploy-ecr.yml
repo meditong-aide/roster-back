@@ -208,7 +208,7 @@ jobs:
             EOF
               fi
 
-              echo "✅ /home/ubuntu/app/.env created for ${{ env.ENV }}"
+              echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
       # 5-5) 컨테이너 실행 (env-file + host-gateway)
       - name: Run container
         if: github.ref_name == 'main'
