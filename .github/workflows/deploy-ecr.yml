@@ -290,26 +290,10 @@ jobs:
             SQS_QUEUE_URL=https://sqs.ap-northeast-2.amazonaws.com/702166530338/roster-job-queue
             EOF
 
-            # 5) 기존 프로세스 종료
-            echo "➡️ 기존 uvicorn 종료"
-
-            PID=$(pgrep -f "uvicorn main:app")
-            if [ -n "$PID" ]; then
-              echo "uvicorn PID=$PID → 종료"
-              kill -TERM $PID >/dev/null 2>&1
-              sleep 1
-            else
-              echo "uvicorn 실행중 아님"
-            fi
-
-            echo "uvicorn terminated safely"
-
-            # 6) 서버 실행
-            echo "➡️ uvicorn 서버 실행"
-            nohup /home/ubuntu/aide-backend-dev/venv/bin/uvicorn main:app \
-              --host 0.0.0.0 \
-              --port 8000 \
-              > uvicorn.log 2>&1 &
+            # 4) EC2의 start.sh 실행
+            echo "➡️ start.sh 실행"
+            chmod +x /home/ubuntu/aide-backend-dev/start.sh
+            /home/ubuntu/aide-backend-dev/start.sh
 
             echo "🚀 DEV 서버 배포 완료!"
             echo "👉 http://${{ env.EC2_HOST }}:8000/health"
