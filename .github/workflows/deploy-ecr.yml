@@ -244,7 +244,7 @@ jobs:
           username: ubuntu
           key: ${{ secrets.DEV_EC2_SSH_KEY }}
           script: |
-            set -e
+            set +e
 
             echo "🔵 DEV 배포 시작 (Docker 미사용)"
 
