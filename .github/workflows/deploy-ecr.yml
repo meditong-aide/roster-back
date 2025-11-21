@@ -243,6 +243,7 @@ jobs:
           host: ${{ env.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.DEV_EC2_SSH_KEY }}
+          script_stop: false
           script: |
             set +e
 
