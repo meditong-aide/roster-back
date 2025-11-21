@@ -27,10 +27,10 @@ jobs:
             echo "ENV=prod" >> $GITHUB_ENV
             echo "ECR_REPO=aide-backend-prod" >> $GITHUB_ENV
             echo "EC2_HOST=${{ secrets.PROD_EC2_HOST }}" >> $GITHUB_ENV
-            echo "DB_NAME=${{ secrets.PROD_DB_NAME }}" >> $GITHUB_ENV
-            echo "DB_USER=${{ secrets.PROD_DB_USER }}" >> $GITHUB_ENV
-            echo "DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}" >> $GITHUB_ENV
-            echo "DB_HOST=${{ secrets.PROD_DB_HOST }}" >> $GITHUB_ENV
+            echo "PROD_DB_NAME=${{ secrets.PROD_DB_NAME }}" >> $GITHUB_ENV
+            echo "PROD_DB_USER=${{ secrets.PROD_DB_USER }}" >> $GITHUB_ENV
+            echo "PROD_DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}" >> $GITHUB_ENV
+            echo "PROD_DB_HOST=${{ secrets.PROD_DB_HOST }}" >> $GITHUB_ENV
             echo "ENVIRONMENT=production" >> $GITHUB_ENV
             echo "DOCKER_TAG=prod-${{ github.sha }}" >> $GITHUB_ENV
             echo "ANTHROPIC_API_KEY=${{ secrets.PROD_ENV_ANTHROPIC }}" >> $GITHUB_ENV
@@ -38,32 +38,25 @@ jobs:
             echo "OPENAI_API_KEY=${{ secrets.PROD_ENV_OPENAI }}" >> $GITHUB_ENV
           elif [[ "${{ github.ref_name }}" == "dev" ]]; then
             echo "ENV=dev" >> $GITHUB_ENV
-            echo "ECR_REPO=aide-backend-dev" >> $GITHUB_ENV
+            echo "DEV_REPO=aide-backend-dev" >> $GITHUB_ENV
             echo "EC2_HOST=${{ secrets.DEV_EC2_HOST }}" >> $GITHUB_ENV
-            echo "DB_NAME=${{ secrets.DEV_DB_NAME }}" >> $GITHUB_ENV
-            echo "DB_USER=${{ secrets.DEV_DB_USER }}" >> $GITHUB_ENV
-            echo "DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}" >> $GITHUB_ENV
-            echo "DB_HOST=${{ secrets.DEV_DB_HOST }}" >> $GITHUB_ENV
+            echo "DEV_DB_NAME=${{ secrets.DEV_DB_NAME }}" >> $GITHUB_ENV
+            echo "DEV_DB_USER=${{ secrets.DEV_DB_USER }}" >> $GITHUB_ENV
+            echo "DEV_DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}" >> $GITHUB_ENV
+            echo "DEV_DB_HOST=${{ secrets.DEV_DB_HOST }}" >> $GITHUB_ENV
             echo "ENVIRONMENT=development" >> $GITHUB_ENV
-            echo "DOCKER_TAG=dev-${{ github.sha }}" >> $GITHUB_ENV
             echo "ANTHROPIC_API_KEY=${{ secrets.DEV_ENV_ANTHROPIC }}" >> $GITHUB_ENV
             echo "GOOGLE_API_KEY=${{ secrets.DEV_ENV_GOOGLE }}" >> $GITHUB_ENV
             echo "OPENAI_API_KEY=${{ secrets.DEV_ENV_OPENAI }}" >> $GITHUB_ENV
-          else
-            echo "ENVIRONMENT=local" >> $GITHUB_ENV
-            echo "DOCKER_TAG=${{ github.ref_name }}-${{ github.sha }}" >> $GITHUB_ENV
-            echo "ANTHROPIC_API_KEY=${{ secrets.LOCAL_ENV_ANTHROPIC }}" >> $GITHUB_ENV
-            echo "GOOGLE_API_KEY=${{ secrets.LOCAL_ENV_GOOGLE }}" >> $GITHUB_ENV
-            echo "OPENAI_API_KEY=${{ secrets.LOCAL_ENV_OPENAI }}" >> $GITHUB_ENV
-            echo ""
-
           fi
 
       - name: Debug env
         run: |
           echo "Branch: ${{ github.ref_name }}"
           echo "EC2_HOST=${{ env.EC2_HOST }}"
-          echo "ECR_REPO=${{ env.ECR_REPO }}"
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "ECR_REPO=${{ env.ECR_REPO }}"
+          fi
 
       - name: Log Environment (safe)
         run: |
@@ -80,11 +73,13 @@ jobs:
 
       # 4) ECR 로그인
       - name: Login to Amazon ECR
+        if: github.ref_name == 'main'
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       # 5) Docker 이미지 빌드/푸시
       - name: Build Docker image
+        if: github.ref_name == 'main'
         run: |
           docker build \
             --build-arg ENV=${{ env.ENVIRONMENT }} \
@@ -94,15 +89,18 @@ jobs:
             -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
 
       - name: Push Docker image to ECR
+        if: github.ref_name == 'main'
         run: |
           docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
 
       - name: Export image uri
+        if: github.ref_name == 'main'
         run: |
           echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
 
       # 5-0) ECR Lifecycle Policy 적용 (untagged 즉시 삭제, 태그된 건 최근 10개 유지)
       - name: Apply ECR lifecycle policy (idempotent)
+        if: github.ref_name == 'main'
         run: |
           cat > policy.json <<'JSON'
           {
@@ -138,6 +136,7 @@ jobs:
 
       # 5-1) EC2 → ECR 로그인
       - name: ECR login from EC2
+        if: github.ref_name == 'main'
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ env.EC2_HOST }}
@@ -169,6 +168,7 @@ jobs:
 
       # 5-3) EC2: 새 이미지 Pull
       - name: Pull new image on EC2
+        if: github.ref_name == 'main'
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ env.EC2_HOST }}
@@ -206,21 +206,12 @@ jobs:
             SECRET_KEY=${{ secrets.PROD_SECRET_KEY }}
             ALGORITHM=${{ secrets.PROD_ALGORITHM }}
             EOF
-              else
-                echo "[INFO] Generating DEV .env"
-                cat > /home/ubuntu/app/.env <<EOF
-            ENVIRONMENT=development
-            DB_HOST=${{ secrets.DEV_DB_HOST }}
-            DB_PORT=${{ secrets.DEV_DB_PORT }}
-            DB_NAME=${{ secrets.DEV_DB_NAME }}
-            DB_USER=${{ secrets.DEV_DB_USER }}
-            DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}
-            EOF
               fi
 
               echo "✅ /home/ubuntu/app/.env created for ${{ env.ENV }}"
       # 5-5) 컨테이너 실행 (env-file + host-gateway)
       - name: Run container
+        if: github.ref_name == 'main'
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ env.EC2_HOST }}
@@ -243,3 +234,70 @@ jobs:
               -p 8000:8000 \
               "${IMAGE_URI}"
             echo "Started: http://$HOSTNAME:8000/health"
+
+      # 6) DEV 전용: Docker 없이 EC2에서 직접 실행
+      - name: Deploy to DEV EC2 (non-Docker)
+        if: github.ref_name == 'dev'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.DEV_EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "🔵 DEV 배포 시작 (Docker 미사용)"
+
+            # 1) 프로젝트 폴더 준비
+            mkdir -p /home/ubuntu/aide-backend-dev
+            cd /home/ubuntu/aide-backend-dev
+
+            # 2) 저장소 업데이트 (첫 배포면 clone)
+            if [ -d ".git" ]; then
+              echo "➡️ git pull 실행"
+              git fetch origin dev
+              git checkout dev
+              git pull origin dev
+            else
+              echo "➡️ repo clone 실행"
+              git clone -b dev ${{ secrets.REPO_URL }} .
+            fi
+
+            # 3) Python 환경 준비
+            echo "➡️ Python venv 준비"
+            python3 -m venv venv
+            source venv/bin/activate
+
+            echo "➡️ pip install 실행"
+            pip install --upgrade pip
+            pip install -r requirements.txt
+
+            # 4) DEV용 .env 생성
+            echo "➡️ DEV .env 생성"
+            cat > /home/ubuntu/aide-backend-dev/.env <<EOF
+            ENVIRONMENT=development
+            DB_HOST=${{ secrets.DEV_DB_HOST }}
+            DB_PORT=${{ secrets.DEV_DB_PORT }}
+            DB_NAME=${{ secrets.DEV_DB_NAME }}
+            DB_USER=${{ secrets.DEV_DB_USER }}
+            DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}
+            EUN_DB_NAME=${{ secrets.DEV_EUN_DB_NAME }}
+            CLIENT_ID=${{ secrets.DEV_CLIENT_ID }}
+            CLIENT_SECRET=${{ secrets.DEV_CLIENT_SECRET }}
+            SECRET_KEY=${{ secrets.DEV_SECRET_KEY }}
+            ALGORITHM=${{ secrets.DEV_ALGORITHM }}
+            EOF
+
+            # 5) 기존 프로세스 종료
+            echo "➡️ 기존 uvicorn 종료"
+            pkill -f "uvicorn" || true
+
+            # 6) 서버 실행
+            echo "➡️ uvicorn 서버 실행"
+            nohup /home/ubuntu/aide-backend-dev/venv/bin/uvicorn main:app \
+              --host 0.0.0.0 \
+              --port 8000 \
+              > uvicorn.log 2>&1 &
+
+            echo "🚀 DEV 서버 배포 완료!"
+            echo "👉 http://${{ env.EC2_HOST }}:8000/health"
