@@ -247,7 +247,7 @@ jobs:
           script: |
             set +e
 
-            echo "🔵 DEV 배포 시작 (Docker 미사용)"
+            echo "DEV 배포 시작 (Docker 미사용)"
 
             # 1) 프로젝트 폴더 준비
             mkdir -p /home/ubuntu/aide-backend-dev
@@ -255,26 +255,26 @@ jobs:
 
             # 2) 저장소 업데이트 (첫 배포면 clone)
             if [ -d ".git" ]; then
-              echo "➡️ git pull 실행"
+              echo "git pull 실행"
               git fetch origin dev
               git checkout dev
               git pull origin dev
             else
-              echo "➡️ repo clone 실행"
+              echo "repo clone 실행"
               git clone -b dev ${{ secrets.REPO_URL }} .
             fi
 
             # 3) Python 환경 준비
-            echo "➡️ Python venv 준비"
+            echo "Python venv 준비"
             python3 -m venv venv
             source venv/bin/activate
 
-            echo "➡️ pip install 실행"
+            echo "pip install 실행"
             pip install --upgrade pip
             pip install -r requirements.txt
 
             # 4) DEV용 .env 생성
-            echo "➡️ DEV .env 생성"
+            echo "DEV .env 생성"
             cat > /home/ubuntu/aide-backend-dev/.env <<EOF
             ENVIRONMENT=development
             MS_DB_HOST=${{ secrets.DEV_MS_DB_HOST }}
