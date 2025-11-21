@@ -291,7 +291,8 @@ jobs:
 
             # 5) 기존 프로세스 종료
             echo "➡️ 기존 uvicorn 종료"
-            pkill -f "uvicorn" || true
+            pkill -f "uvicorn" 2>/dev/null || true
+            echo "uvicorn terminated safely" || true
 
             # 6) 서버 실행
             echo "➡️ uvicorn 서버 실행"
@@ -302,3 +303,4 @@ jobs:
 
             echo "🚀 DEV 서버 배포 완료!"
             echo "👉 http://${{ env.EC2_HOST }}:8000/health"
+            exit 0
