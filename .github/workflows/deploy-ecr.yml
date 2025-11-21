@@ -292,8 +292,17 @@ jobs:
 
             # 5) 기존 프로세스 종료
             echo "➡️ 기존 uvicorn 종료"
-            pkill -TERM -f uvicorn >/dev/null 2>&1 || true
-            echo "uvicorn terminated safely" || true
+
+            PID=$(pgrep -f "uvicorn main:app")
+            if [ -n "$PID" ]; then
+              echo "uvicorn PID=$PID → 종료"
+              kill -TERM $PID >/dev/null 2>&1
+              sleep 1
+            else
+              echo "uvicorn 실행중 아님"
+            fi
+
+            echo "uvicorn terminated safely"
 
             # 6) 서버 실행
             echo "➡️ uvicorn 서버 실행"
