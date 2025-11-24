@@ -336,9 +336,16 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     code2main['O'] = 'O'; code2main['O'] = 'O'
 
     # 이전 달 최신 스케줄 조회 → 마지막 N일 시퀀스
-    prev_sid = _query_prev_month_schedule_id(db, current_user.group_id, req.year, req.month)
-    last_map = _get_last_days_map(db, prev_sid, lookback, code2main) if prev_sid else {}
-
+    try:
+        prev_sid = _query_prev_month_schedule_id(db, current_user.group_id, req.year, req.month)
+    except Exception as e:
+        print("[ERR] _query_prev_month_schedule_id:", e)
+        raise
+    try:
+        last_map = _get_last_days_map(db, prev_sid, lookback, code2main) if prev_sid else {}
+    except Exception as e:
+        print("[ERR] _get_last_days_map:", e)
+        raise    
     forced_off = defaultdict(list)
     forbidden = defaultdict(lambda: defaultdict(list))
 
