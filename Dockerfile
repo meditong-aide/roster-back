@@ -2,6 +2,10 @@
 # Python 3.13 slim (공식) ─ ARM/AMD 모두 OK
 FROM python:3.12
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+RUN apt-get update && apt-get install -y tzdata
+RUN ln -fs /usr/share/zoneinfo/Asia/Seoul /etc/localtime && dpkg-reconfigure -f noninteractive tzdata
+
 # 작업 디렉토리 설정
 WORKDIR /app
 
@@ -24,6 +28,10 @@ ENV OPENAI_API_KEY=${OPENAI_API_KEY}
 # pip 업그레이드 및 requirements.lock 설치 (해시 옵션 제거)
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
+
+
+    
+
 
 # ───────── 런타임 환경 변수 ─────────
 ENV PYTHONUNBUFFERED=1 \
