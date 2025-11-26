@@ -216,13 +216,18 @@ class IssuedRosterSnapshot(Base):
     snapshot_id = Column(INTEGER, primary_key=True, autoincrement=True)
     office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'), nullable=False)
     group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    year = Column(SMALLINT, nullable=True)
+    month = Column(TINYINT, nullable=True)
     schedule_id = Column(CHAR(12), ForeignKey('schedules.schedule_id'), nullable=False)
     version = Column(TINYINT, nullable=False)
     created_at = Column(DATETIME, default=func.now())
+    is_active_issued = Column(BOOLEAN, nullable=False, default=True)
 
     meta_json = Column(JSON, nullable=True)
     config_json = Column(JSON, nullable=True)
     nurses_json = Column(JSON, nullable=True)
+    shifts_json = Column(JSON, nullable=True)
+    shift_manage_json = Column(JSON, nullable=True)
     roster_json = Column(JSON, nullable=True)
     violations_json = Column(JSON, nullable=True)
 

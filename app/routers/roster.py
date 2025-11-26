@@ -47,6 +47,7 @@ from services.roster_service import (
     get_issued_schedules_service,
     get_schedule_status_service,
     create_issued_roster_snapshot,
+    get_issued_roster_snapshot_service,
 )
 import uuid
 import pprint
@@ -312,11 +313,59 @@ async def get_issued_schedules(
     try:
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        return get_issued_schedules_service(current_user, db)
+        if current_user.is_master_admin:
+            target_group_id = group_id
+        else:
+            target_group_id = current_user.group_id
+        return get_issued_schedules_service(current_user, db, target_group_id=target_group_id)
     except Exception as e:
         print('[/issued] error', e)
         raise HTTPException(status_code=500, detail=f"Failed to get issued schedules: {str(e)}")
 
+
+@router.get("/issued_roster")
+async def get_issued_roster_snapshot(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """
+    특정 연월의 활성 발행본 근무표 스냅샷을 조회합니다.
+
+    - 수간호사: 자신의 그룹 기준
+    - ADM: 쿼리 파라미터 group_id 로 대상 그룹 지정
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        # 대상 그룹 결정
+        if current_user.is_master_admin:
+            target_group_id = group_id
+        else:
+            target_group_id = current_user.group_id
+
+        snapshot = get_issued_roster_snapshot_service(
+            year=year,
+            month=month,
+            current_user=current_user,
+            db=db,
+            target_group_id=target_group_id,
+        )
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Issued snapshot not found")
+        return snapshot
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[/issued_roster] error", e)
+        print("[/issued_roster] target_group_id", target_group_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get issued roster snapshot: {str(e)}",
+        )
 
 # [Schedules] - 현재 그룹의 특정 월에 대한 스케줄 상태 확인
 @router.get("/status")
@@ -671,6 +720,8 @@ async def publish_roster(
     # 발행 시점 스냅샷 레코드 생성
     snapshot = create_issued_roster_snapshot(
         schedule=schedule,
+        year=schedule.year,
+        month=schedule.month,
         current_user=current_user,
         office_id=office_id,
         group_id=target_group_id,
