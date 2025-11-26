@@ -670,4 +670,46 @@ def request_wanted_shifts_service(
     db.refresh(new_wanted)
     return {"message": "Wanted 작성 요청이 성공적으로 생성되었습니다."}
 
-# ... (다른 서비스 함수도 동일하게 분리하여 추가 예정) ... 
+def close_expired_wanted(db: Session) -> int:
+    """
+    exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경합니다.
+
+    인자:
+        db: DB 세션 객체
+
+    반환:
+        int: 'requested' 상태에서 'closed'로 변경된 Wanted 건수.
+             예를 들어 만료된 건이 3건이면 3을 반환합니다.
+    """
+    now = datetime.now()
+
+    # exp_date가 설정되어 있고 현재 시각보다 과거이며,
+    # 아직 'requested' 상태인 Wanted만 조회합니다.
+    query = (
+        db.query(Wanted)
+        .filter(
+            Wanted.status == 'requested',
+            Wanted.exp_date.isnot(None),
+            Wanted.exp_date < now,
+        )
+    )
+
+    updated_count = 0
+    try:
+        for wanted in query:
+            wanted.status = 'closed'
+            updated_count += 1
+
+        if updated_count > 0:
+            db.commit()
+            print(f"Wanted 자동 마감 완료: {updated_count}건 (기준 시각: {now.isoformat()})")
+        else:
+            # 변경 사항이 없으면 굳이 커밋하지 않아도 되지만,
+            # 세션 상태를 명확히 하기 위해 flush만 보장하는 수준으로 둡니다.
+            db.flush()
+    except Exception as exc:
+        db.rollback()
+        print(f"Wanted 자동 마감 중 오류 발생: {exc}")
+        raise
+
+    return updated_count
