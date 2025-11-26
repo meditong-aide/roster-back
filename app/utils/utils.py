@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime
 import io
 import os
 import random
@@ -18,7 +18,7 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_404_NOT_FOUND
 
 from datalayer.common import Common
 from db.client2 import msdb_manager
-
+from datalayer.setting import Setting
 async def excel_to_pandas (file : UploadFile) -> pd.DataFrame:
     if file.content_type not in ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                   "application/vnd.ms-excel"]:
@@ -44,7 +44,7 @@ async def create_upload_file(file : UploadFile, upload_directory : str):
 
     # 중복 파일명 처리 로직
     # 현재 타임스탬프를 'YYYYMMDD_HHMMSS' 형식으로 생성
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # 새로운 파일명 생성 (원본 파일명 + 타임스탬프)
     unique_filename = f"{file_name}_{timestamp}{file_extension}"
@@ -181,23 +181,26 @@ def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
         # data = {}
         # data["message"] = pushMessage
         # data["param"] = "code"
-
         receive_empseq_no = receiveEmpSeqNo.split(',')
         device_keys = []
-
         for emp_seq_no in receive_empseq_no:
             # 받는사람 저장
             params = (max_idx, officeCode, emp_seq_no)
             push_user_result = msdb_manager.execute(Common.set_push_receiver(), params=params)
-
             if not push_user_result:
                 return {"result": "fail", "message": "user 입력 오류"}
-
             # 받는사람 로그인 아이디 찾기
             receive_member_id = msdb_manager.fetch_one(Common.set_push_receiver_member_id(), params=emp_seq_no)
-
             if receive_member_id:
                 push_setting_result = msdb_manager.fetch_all(Common.set_push_receiver_pushyn(),
+                                                             params=receive_member_id)
+                if not push_setting_result:
+                    reg_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    msdb_manager.execute(
+                        Setting.insert_mobile_user_setting_list(),
+                        params=(receive_member_id, reg_date),
+                    )
+                    push_setting_result = msdb_manager.fetch_all(Common.set_push_receiver_pushyn(),
                                                              params=receive_member_id)
 
                 for push_setting in push_setting_result:
@@ -210,25 +213,19 @@ def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
                 push_time_yn = 'N'
                 stime = ''
                 etime = ''
-
-            # print("stime : ", stime)
-            # print("etime : ", etime)
-
+        
+        
             if stime and etime and push_yn == "Y" and push_time_yn == "Y":
                 try:
                     # stime/etime을 사용하여 시작 시간 객체 생성
                     start_time_obj = datetime.strptime(f"{stime}:00:00", "%H:%M:%S").time()
-
                     # etime을 사용하여 종료 시간 객체 생성
                     temp_end_dt = datetime.strptime(f"{etime}:00:00", "%H:%M:%S")
-
                     # 1초 빼기 (EndTime을 1초 뺀 값으로 설정)
                     end_time_adjusted_dt = temp_end_dt - datetime.timedelta(seconds=1)
                     end_time_obj = end_time_adjusted_dt.time()
-
                     # 현재 시간을 time 객체로 변환 (실제 사용 시에는 datetime.now().time() 사용 권장)
                     current_time_obj = datetime.now().time()
-
                     # 4. 시간 비교 (If currentTimeValue >= startTimeValue AND currentTimeValue <= endTimeValue)
                     if start_time_obj <= current_time_obj <= end_time_obj:
                         # 시간이 시간대 내에 있으면 PushYN은 'Y'를 유지
@@ -236,35 +233,29 @@ def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
                     else:
                         # Else
                         push_yn = "N"
-
                 except ValueError as e:
                     # stime 또는 etime 형식이 잘못된 경우 처리
-                    print(f"시간 형식 오류 발생: {e}")
                     push_yn = "N"
-
-            # print("start_time_obj : ", start_time_obj)
-            # print("end_time_obj : ", end_time_obj)
-
+        
+        
             if push_yn == "Y":
                 # 받는사람 스마트 기기 Key값 가져오기
                 user_device_key = msdb_manager.fetch_one(Common.get_user_device_key(), params=receive_member_id)
-
                 if user_device_key:
                     device_keys.append(user_device_key)
-
         if device_keys:
             for gcm_id in device_keys:
                 if gcm_id:
                     m_status = 'N'
                     params = (sendEmpSeqNo, officeCode, pushMessage, gcm_id, max_idx, pushCode, pushSubCode, m_status)
-                    # print("sendEmpSeqNo : ", sendEmpSeqNo)
-                    # print("officeCode : ", officeCode)
-                    # print("pushMessage : ", pushMessage)
-                    # print("gcm_id : ", gcm_id)
-                    # print("max_idx : ", max_idx)
-                    # print("pushCode : ", pushCode)
-                    # print("pushSubCode : ", pushSubCode)
-                    # print("m_status : ", m_status)
+                
+                
+                
+                
+                
+                
+                
+                
 
                     # push FCM 테이블에 데이터 입력
                     set_push_result = msdb_manager.execute(Common.set_push_message(), params=params)
@@ -277,7 +268,7 @@ def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
 def set_sms(userPhoneNumber: str, sendPhoneNumber: str, smsMessage: str):
     # Unique key create
     random_part = random.randint(10000, 99999)
-    now = datetime.datetime.now()
+    now = datetime.now()
     date_time_part = (
         f"{now.year}"
         f"{now.month}"

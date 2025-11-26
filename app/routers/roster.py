@@ -49,6 +49,7 @@ from services.roster_service import (
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
 )
+from utils.utils import set_app_push
 import uuid
 import pprint
 router = APIRouter(
@@ -656,18 +657,6 @@ async def publish_roster(
         print('[DEBUG] [roster.py - publish_roster] group_id', group_id)
         print('[DEBUG] [roster.py - publish_roster] error', e)
         raise HTTPException(status_code=500, detail=f"근무표 발행 실패: {e}")
-    # else:
-    #     if not getattr(current_user, 'is_master_admin', False):
-    #         raise HTTPException(status_code=403, detail="Permission denied")
-    #     if not group_id:
-    #         raise HTTPException(status_code=400, detail="group_id is required for admin")
-    #     g = db.query(Group).filter(Group.group_id == group_id).first()
-    #     if not g:
-    #         raise HTTPException(status_code=404, detail="Group not found")
-    #     if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-    #         raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        # office_id = g.office_id
-        # target_group_id = g.group_id
 
     # Get schedule to publish
     schedule = db.query(Schedule).filter(
@@ -727,6 +716,36 @@ async def publish_roster(
         group_id=target_group_id,
         db=db,
     )
+    nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
+    print('[DEBUG] [roster.py - publish_roster] nurses_in_group', nurses_in_group)
+    receiveEmpSeqNo = [nurse.nurse_id for nurse in nurses_in_group]
+    # print('[DEBUG] [roster.py - publish_roster] receiveEmpSeqNo', receiveEmpSeqNo)
+    pushCode = 'P30'
+    pushSubCode = 'S01' # 01 근무표 마감
+    officeCode = office_id
+    sendEmpSeqNo = current_user.nurse_id
+    sendMemberId = current_user.account_id
+    receiveEmpSeqNo = ",".join(receiveEmpSeqNo)
+    print('[DEBUG] [roster.py - publish_roster] receiveEmpSeqNo', receiveEmpSeqNo)
+    pushMessage = f"[Test발송]{schedule.year}년 {schedule.month}월 근무표가 공유되었습니다. 지금 확인해보세요!"
+    orgPushMessage = f"근무표가 공유되었습니다. {schedule.year}년 {schedule.month}월 "
+    linkUrl = ""
+    linkCode = ""
+    message_result = set_app_push(
+        pushCode=pushCode, 
+        pushSubCode=pushSubCode, 
+        officeCode=officeCode, 
+        sendEmpSeqNo=sendEmpSeqNo, 
+        sendMemberId=sendMemberId, 
+        receiveEmpSeqNo=receiveEmpSeqNo, 
+        pushMessage=pushMessage, 
+        orgPushMessage=orgPushMessage, 
+        linkUrl=linkUrl, 
+        linkCode=linkCode)
+    
+    return message_result
+
+
 
     db.add(issued_roster)
     db.add(snapshot)

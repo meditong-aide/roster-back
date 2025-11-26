@@ -312,6 +312,8 @@ def get_issued_roster_snapshot_service(
 def create_issued_roster_snapshot(
     schedule: Schedule,
     current_user,
+    year: int,
+    month: int,
     office_id: str,
     group_id: str,
     db: Session,
