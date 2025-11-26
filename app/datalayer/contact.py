@@ -5,7 +5,7 @@ class Contact:
             INSERT INTO bizwiz20db.Manage_Work
             (ManageNo, WriteDate, Writer, WriterID, Feedback, NextManager, Category,EmpSeqName, Tel , context , UsingTime, Filename,Route,CategorySub,CateType,Manager,JobState,JobDate,Info,BoardFile,Comment,wEmail, title) 
             VALUES
-            (%s, %s, %s, %s, 0, 0, %s, %s, %s, %s, 0, %s, 5, '상담문의', '문의', '', '접수', '', '', '', '', %s, %s) ;
+            (%s, %s, %s, %s, 0, 0, %s, %s, %s, %s, 0, %s, 5, '이용문의', '문의', '', '접수', '', '', '', '', %s, %s) ;
             """
         return _queryString
 
