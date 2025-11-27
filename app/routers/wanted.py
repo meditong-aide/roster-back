@@ -15,6 +15,7 @@ from db.models import Nurse, ShiftPreference
 from services.wanted_service import request_wanted_shifts_service
 from services.wanted_service import invoke_and_persist_wanted_service
 from db.models import Group
+from datetime import datetime, timedelta, timezone
 router = APIRouter(
     prefix="/wanted",
     tags=["wanted"]
@@ -380,3 +381,50 @@ def parse_preferences(
                     continue
 
     return parsed
+
+
+@router.post("/close-expired")
+def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """
+    현재 KST 기준으로 exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경하는 엔드포인트입니다.
+
+    인자:
+        db: FastAPI DI로 주입되는 DB 세션 객체.
+
+    반환:
+        dict: {"now_kst": "...", "updated": n} 형태의 결과를 반환합니다.
+              예: now_kst="2025-01-01T00:00:00", updated=3 이면
+              2025-01-01 00:00 (KST) 기준으로 3건의 Wanted가 'closed'로 변경된 것입니다.
+    """
+    # UTC 기준 현재 시각을 구한 뒤 +9시간을 더해 KST 현재 시각을 계산합니다.
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now_kst = (utc_now + timedelta(hours=9)).replace(tzinfo=None)
+
+    query = (
+        db.query(Wanted)
+        .filter(
+            Wanted.status == "requested",
+            Wanted.exp_date.isnot(None),
+            Wanted.exp_date < now_kst,
+        )
+    )
+
+    updated_count = 0
+    try:
+        for wanted in query:
+            wanted.status = "closed"
+            updated_count += 1
+
+        if updated_count > 0:
+            db.commit()
+            print(
+                f"Wanted 수동 마감 완료(KST 기준): {updated_count}건, now_kst={now_kst.isoformat()}"
+            )
+        else:
+            db.flush()
+    except Exception as exc:
+        db.rollback()
+        print(f"Wanted 수동 마감 중 오류: {exc}")
+        raise
+
+    return {"now_kst": now_kst.isoformat(), "updated": updated_count}
