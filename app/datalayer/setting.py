@@ -117,12 +117,18 @@ class Setting:
         select name as positionTitle from bizwiz20db.T_Part where officecode = %s;
         """
         return _queryString
+    @staticmethod
+    def insert_mobile_user_setting_list():
+        _queryString = """
+        INSERT INTO bizwiz20db.TB_Mobile_User_Setting_List(MemberID, AutoYN, WifiYN, PushYN, DeviceKey, RegDate) VALUES (%s, 'Y', 'Y', 'Y', '', %s);
+        """
+        return _queryString
 
     @staticmethod
     def delete_position():
         _queryString = """
                        delete \
-                       from bizwiz20db.TB_EasySetting_Position_Tmp \
+                       from bizwiz20db.TB_EasySetting_Position_Tmp  \
                        where OfficeCode = %s \
                          and EmpSeqNo = %s; \
                        """
