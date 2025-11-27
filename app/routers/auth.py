@@ -2,7 +2,7 @@ import logging
 import os
 import random
 import string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Cookie, Request, Form, BackgroundTasks
@@ -59,12 +59,17 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
     except Exception:
         return {}
 
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    KST = timezone(timedelta(hours=9))
     to_encode = data.copy()
+    now_kst = datetime.now(KST)
+    now_utc = now_kst.astimezone(timezone.utc)
+
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = now_utc + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=60*24)
+        expire = now_utc + timedelta(hours=24)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
