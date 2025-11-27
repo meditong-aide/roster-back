@@ -10,7 +10,6 @@ from routers import daily_shift as daily_shift_router
 import os
 import sys
 
-from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -92,46 +91,6 @@ app.include_router(dashboard.router)
 app.include_router(daily_shift_router.router)
 app.include_router(teams.router)
 app.include_router(groups.router)
-
-def close_expired_wanted_job() -> None:
-    """
-    APScheduler에서 주기적으로 호출되어 만료된 Wanted 상태를 'closed'로 변경합니다.
-
-    exp_date가 현재 서버 시각보다 과거인 모든 Wanted 레코드를 찾아
-    status를 'requested'에서 'closed'로 일괄 변경합니다.
-    예를 들어 만료된 건이 5건이면 한 번의 실행에서 5건이 갱신됩니다.
-    """
-    db = SessionLocal()
-    try:
-        updated = close_expired_wanted(db)
-        print(
-            f"[{datetime.now().isoformat()}] Wanted 자동 마감 작업 실행, "
-            f"갱신 건수: {updated}"
-        )
-    except Exception as exc:
-        print(f"[{datetime.now().isoformat()}] Wanted 자동 마감 작업 오류: {exc}")
-    finally:
-        db.close()
-
-
-@app.on_event("startup")
-def start_scheduler() -> None:
-    """
-    FastAPI 앱 시작 시 APScheduler를 초기화하고 Wanted 자동 마감 잡을 등록합니다.
-
-    현재 설정은 매일 00:00 서버 시각에 `close_expired_wanted_job`을 실행합니다.
-    예를 들어 서버 시간이 2025-11-26 00:00이 되면 그 시점 기준으로 exp_date가 지난
-    Wanted 들이 모두 'closed'로 변경됩니다.
-    """
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        close_expired_wanted_job,
-        "cron",
-        hour=0,
-        minute=0,
-    )
-    scheduler.start()
-
 
 import uvicorn
 

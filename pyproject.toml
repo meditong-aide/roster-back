@@ -32,5 +32,4 @@ dependencies = [
     "timer>=0.3.0",
     "uvicorn>=0.34.2",
     "xlrd>=2.0.2",
-    "apscheduler>=3.11.1",
 ]
