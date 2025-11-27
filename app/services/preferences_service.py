@@ -9,12 +9,13 @@ from sqlalchemy import String, cast, extract
 from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 def submit_preferences_service(req: PreferenceSubmit, current_user, db: Session):
     """
     선호도 최종 제출 서비스 함수
     """
+    KST = timezone(timedelta(hours=9))
     if not current_user:
         raise Exception("Not authenticated")
     print('current_user', current_user.__dict__)
@@ -29,7 +30,7 @@ def submit_preferences_service(req: PreferenceSubmit, current_user, db: Session)
     if not preference:
         raise Exception("No preference draft found to submit")
     preference.is_submitted = True
-    preference.submitted_at = datetime.utcnow()
+    preference.submitted_at = datetime.now(KST).replace(tzinfo=None)
     db.commit()
     return {"message": "Preferences submitted successfully"}
 
@@ -37,6 +38,7 @@ def submit_empty_preferences_service(req: PreferenceSubmit, current_user, db: Se
     """
     빈 선호도 최종 제출 서비스 함수
     """
+    KST = timezone(timedelta(hours=9))
     if not current_user:
         raise Exception("Not authenticated")
     empty_data = {"shift": {}, "preference": []}
@@ -46,7 +48,7 @@ def submit_empty_preferences_service(req: PreferenceSubmit, current_user, db: Se
         month=req.month,
         data=empty_data,
         is_submitted=True,
-        submitted_at=datetime.utcnow()
+        submitted_at=datetime.now(KST).replace(tzinfo=None)
     )
     db.add(preference)
     db.commit()
