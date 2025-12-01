@@ -282,7 +282,7 @@ jobs:
             pip install --upgrade pip
             pip install -r requirements.txt
 
-            # PROD 환경 변수 구성
+            # PROD 환경 변수 구성.
             cat > /home/ubuntu/aide-backend-prod/.env <<EOF
             ENVIRONMENT=production
             MS_DB_HOST=${{ secrets.PROD_MS_DB_HOST }}
