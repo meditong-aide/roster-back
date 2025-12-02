@@ -14,11 +14,12 @@ from db.client2 import msdb_manager
 # 오늘 날짜 객체 가져오기
 today = date.today()
 current_date = today.strftime('%Y-%m-%d')
+print('current_date', current_date)
 
 # Configuration
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTES = 3600
+ACCESS_TOKEN_EXPIRE_MINUTES = 60*24
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
