@@ -15,7 +15,7 @@ class GraphService:
         Returns:
             dict: 그래프 실행 결과
         """
-
+ 
         response = await self._graph.ainvoke({"request": request, "schema": schema, "case": case, "year": year, "month": month})        
         response = [response['shift_results'], response['preference_results']]
         import pprint

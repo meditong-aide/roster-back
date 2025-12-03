@@ -49,20 +49,16 @@ async def get_nurses_in_group(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    if current_user.is_master_admin:
-        target_group_id = group_id
-    else:
-        target_group_id = current_user.group_id
-    print('[nurses.py - get_nurses_in_group] target_group_id', target_group_id)
     try:
         # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
-        if office_id or group_id:
-            if not current_user or not current_user.is_master_admin:
-                raise HTTPException(status_code=403, detail="마스터 관리자만 필터 조회가 가능합니다.")
-            return get_nurses_filtered_service(current_user, db, office_id=office_id, group_id=target_group_id)
+        if current_user.is_master_admin:
+            return get_nurses_filtered_service(current_user, db, office_id=office_id, group_id=group_id)
         return get_nurses_in_group_service(current_user, db)
     except Exception as e:
-        print('error', e)
+        print('[DEBUG] [nurses.py - get_nurses_in_group] office_id', office_id)
+        print('[DEBUG] [nurses.py - get_nurses_in_group] group_id', group_id)
+        print('[DEBUG] [nurses.py - get_nurses_in_group] current_user', current_user.__dict__)
+        print('[DEBUG] [nurses.py - get_nurses_in_group] error', e)
         # raise HTTPException(status_code=500, detail=f"간호사 목록 조회 실패: {str(e)}")
 
 @router.get("/personnel-basic-info")
@@ -183,36 +179,6 @@ async def upload_excel(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"엑셀 업로드 실패: {str(e)}")
 
-# @router.post("/upload2-excel")
-# async def upload_excel2(
-#     file: UploadFile = File(...),
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db),
-#     group_id: Optional[str] = None,
-# ):
-#     print('[/upload2-excel] group_id', group_id)
-#     """엑셀 업로드2: mdt_temp에서 account_id 존재 여부를 office_id 기준으로 검증 - ADM 전용"""
-#     try:
-#         if not current_user or not current_user.is_master_admin:
-#             raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
-#         if file.size and file.size > 10 * 1024 * 1024:
-#             raise HTTPException(status_code=400, detail="파일 크기는 10MB를 초과할 수 없습니다.")
-#         if not file.filename.lower().endswith(('.xlsx', '.xls')):
-#             raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다. (.xlsx, .xls만 지원)")
-#         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-#             content = await file.read()
-#             tmp_file.write(content)
-#             tmp_file_path = tmp_file.name
-#         print('group_id11', group_id)
-#         try:
-#             result = process_excel_upload2(tmp_file_path, current_user, db, target_group_id=group_id)
-#             return result
-#         finally:
-#             os.unlink(tmp_file_path)
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"엑셀 업로드2 실패: {str(e)}")
-
-
 class Upload2ConfirmRequest(BaseModel):
     rows: List[dict]
     group_id: Optional[str] = None
@@ -226,8 +192,6 @@ async def upload2_validate_endpoint(
 ):
     """업로드2 - 검증 전용. 오류 목록과 정규화된 행을 반환한다."""
     try:
-        # if not current_user or not current_user.is_master_admin:
-        #     raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             content = await file.read()
             tmp_file.write(content)

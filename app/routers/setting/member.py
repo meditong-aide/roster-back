@@ -152,6 +152,10 @@ async def create_upload_file(
     rows = msdb_manager.bulk_execute(Setting.insert_member(), data_to_insert)
     if not rows:
         return {"result": "insert_fail"}
+    # 모바일 설정 정보 저장
+    member_ids = df["MemberID"].astype(str).tolist()
+    mobile_setting_params = [(member_id, RegDate) for member_id in member_ids]
+    msdb_manager.bulk_execute(Setting.insert_mobile_user_setting_list(), mobile_setting_params)
     # ===== 외부 API 호출 =====
     token = create_access_token(data={"clientSecret": os.getenv("CLIENT_SECRET"), "clientId": os.getenv("CLIENT_ID")})
     response = requests.post("https://gw.meditong.com/bizadmin/setting/member_excel_ai_ok.asp",

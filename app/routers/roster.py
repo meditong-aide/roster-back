@@ -41,7 +41,15 @@ from routers.utils import get_days_in_month
 from db.nurse_config import Nurse as NurseEngine
 from services.roster_system import RosterSystem
 from datetime import date
-from services.roster_service import save_roster_config_service, get_latest_schedule_service, get_issued_schedules_service, get_schedule_status_service
+from services.roster_service import (
+    save_roster_config_service,
+    get_latest_schedule_service,
+    get_issued_schedules_service,
+    get_schedule_status_service,
+    create_issued_roster_snapshot,
+    get_issued_roster_snapshot_service,
+)
+from utils.utils import set_app_push
 import uuid
 import pprint
 router = APIRouter(
@@ -279,28 +287,19 @@ async def get_latest_schedule(
     db: Session = Depends(get_db)
 ):
     try:
-        override_gid: Optional[str] = None
+        
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        if current_user.is_head_nurse and current_user.group_id:
-            override_gid = None
+        if current_user.is_master_admin:
+            target_group_id = group_id
         else:
-            print('group_id', group_id)
-            if not getattr(current_user, 'is_master_admin', False):
-                raise HTTPException(status_code=403, detail="Permission denied")
-            if not group_id:
-                print('!!!!!!!!!!!!!!!!!!!!group_id is required for admin')
-                raise HTTPException(status_code=400, detail="group_id is required for admin")
-            g = db.query(Group).filter(Group.group_id == group_id).first()
-            if not g:
-                raise HTTPException(status_code=404, detail="Group not found")
-            if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-                raise HTTPException(status_code=403, detail="Group does not belong to your office")
-            override_gid = g.group_id
-        return get_latest_schedule_service(current_user, db, override_group_id=override_gid)
-    except HTTPException:
-        raise
+            target_group_id = current_user.group_id
+        print('[/latest] target_group_id', target_group_id)
+        return get_latest_schedule_service(current_user, db, override_group_id=target_group_id)
     except Exception as e:
+        print('[DEBUG] [roster.py - get_latest_schedule] current_user', current_user.__dict__)
+        print('[DEBUG] [roster.py - get_latest_schedule] group_id', group_id)
+        print('[DEBUG] [roster.py - get_latest_schedule] error', e)
         raise HTTPException(status_code=500, detail=f"Failed to get latest schedule: {str(e)}")
 
 
@@ -313,27 +312,61 @@ async def get_issued_schedules(
 ):
     print('[/issued] group_id', group_id)
     try:
-        # override_gid: Optional[str] = None
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        # if current_user.is_head_nurse and current_user.group_id:
-        #     override_gid = None
-        # else:
-        #     # if not getattr(current_user, 'is_master_admin', False):
-        #     #     raise HTTPException(status_code=403, detail="Permission denied")
-        #     # if not group_id:
-        #     #     raise HTTPException(status_code=400, detail="group_id is required for admin")
-        #     g = db.query(Group).filter(Group.group_id == group_id).first()
-        #     if not g:
-        #         raise HTTPException(status_code=404, detail="Group not found")
-        #     # if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-        #     #     raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        #     override_gid = g.group_id
-        return get_issued_schedules_service(current_user, db)
+        if current_user.is_master_admin:
+            target_group_id = group_id
+        else:
+            target_group_id = current_user.group_id
+        return get_issued_schedules_service(current_user, db, target_group_id=target_group_id)
     except Exception as e:
         print('[/issued] error', e)
         raise HTTPException(status_code=500, detail=f"Failed to get issued schedules: {str(e)}")
 
+
+@router.get("/issued_roster")
+async def get_issued_roster_snapshot(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """
+    특정 연월의 활성 발행본 근무표 스냅샷을 조회합니다.
+
+    - 수간호사: 자신의 그룹 기준
+    - ADM: 쿼리 파라미터 group_id 로 대상 그룹 지정
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        # 대상 그룹 결정
+        if current_user.is_master_admin:
+            target_group_id = group_id
+        else:
+            target_group_id = current_user.group_id
+
+        snapshot = get_issued_roster_snapshot_service(
+            year=year,
+            month=month,
+            current_user=current_user,
+            db=db,
+            target_group_id=target_group_id,
+        )
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Issued snapshot not found")
+        return snapshot
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[/issued_roster] error", e)
+        print("[/issued_roster] target_group_id", target_group_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get issued roster snapshot: {str(e)}",
+        )
 
 # [Schedules] - 현재 그룹의 특정 월에 대한 스케줄 상태 확인
 @router.get("/status")
@@ -611,30 +644,25 @@ async def publish_roster(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹/오피스 결정
-    if current_user.is_head_nurse and current_user.group_id:
+    try:
+        # 대상 간호사/그룹/오피스 결정 (현재는 수간호사 기준)
         nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
         if not nurse:
             raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
+
         office_id = nurse.group.office_id
         target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        office_id = g.office_id
-        target_group_id = g.group_id
+    except Exception as e:
+        print('[DEBUG] [roster.py - publish_roster] current_user', current_user.__dict__)
+        print('[DEBUG] [roster.py - publish_roster] group_id', group_id)
+        print('[DEBUG] [roster.py - publish_roster] error', e)
+        raise HTTPException(status_code=500, detail=f"근무표 발행 실패: {e}")
 
     # Get schedule to publish
     schedule = db.query(Schedule).filter(
         Schedule.schedule_id == req.schedule_id,
-        Schedule.group_id == target_group_id
+        Schedule.group_id == target_group_id,
+        Schedule.dropped == False,
     ).first()
     
     if not schedule:
@@ -649,12 +677,12 @@ async def publish_roster(
     is_first_issue = not existing_issued
     
     # Get next sequence number
-    print('target_group_id', target_group_id)
+    
     max_seq = db.query(func.max(IssuedRoster.seq_no)).filter(
         IssuedRoster.group_id == target_group_id,
         IssuedRoster.office_id == office_id
     ).scalar() or 0
-    print('max_seq', max_seq)
+    print('[DEBUG] [roster.py - publish_roster] max_seq', max_seq)
     # Set all other schedules in this month to draft
     db.query(Schedule).filter(
         Schedule.group_id == target_group_id,
@@ -677,8 +705,50 @@ async def publish_roster(
         issue_cmmt=req.issue_comment if not is_first_issue else "첫 발행",
         schedule_id=req.schedule_id
     )
+
+    # 발행 시점 스냅샷 레코드 생성
+    snapshot = create_issued_roster_snapshot(
+        schedule=schedule,
+        year=schedule.year,
+        month=schedule.month,
+        current_user=current_user,
+        office_id=office_id,
+        group_id=target_group_id,
+        db=db,
+    )
+    nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
+    print('[DEBUG] [roster.py - publish_roster] nurses_in_group', nurses_in_group)
+    receiveEmpSeqNo = [nurse.nurse_id for nurse in nurses_in_group]
+    # print('[DEBUG] [roster.py - publish_roster] receiveEmpSeqNo', receiveEmpSeqNo)
+    pushCode = 'P30'
+    pushSubCode = 'S01' # 01 근무표 마감
+    officeCode = office_id
+    sendEmpSeqNo = current_user.nurse_id
+    sendMemberId = current_user.account_id
+    receiveEmpSeqNo = ",".join(receiveEmpSeqNo)
+    print('[DEBUG] [roster.py - publish_roster] receiveEmpSeqNo', receiveEmpSeqNo)
+    pushMessage = f"[Test발송]{schedule.year}년 {schedule.month}월 근무표가 공유되었습니다. 지금 확인해보세요!"
+    orgPushMessage = f"근무표가 공유되었습니다. {schedule.year}년 {schedule.month}월 "
+    linkUrl = ""
+    linkCode = ""
+    message_result = set_app_push(
+        pushCode=pushCode, 
+        pushSubCode=pushSubCode, 
+        officeCode=officeCode, 
+        sendEmpSeqNo=sendEmpSeqNo, 
+        sendMemberId=sendMemberId, 
+        receiveEmpSeqNo=receiveEmpSeqNo, 
+        pushMessage=pushMessage, 
+        orgPushMessage=orgPushMessage, 
+        linkUrl=linkUrl, 
+        linkCode=linkCode)
     
+    return message_result
+
+
+
     db.add(issued_roster)
+    db.add(snapshot)
     db.commit()
     
     return {

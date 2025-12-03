@@ -1,5 +1,6 @@
 import sys, os
 import sys
+from datetime import datetime
 
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -14,7 +15,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from routers import roster, auth, nurses, dates, wanted, preferences, roster_create, shifts, health, dashboard, token, teams, groups, push
+from routers import (
+    roster,
+    auth,
+    nurses,
+    dates,
+    wanted,
+    preferences,
+    roster_create,
+    shifts,
+    health,
+    dashboard,
+    token,
+    teams,
+    groups,
+    push,
+)
 from routers.contact import contact_router
 from routers.message import message_router
 from routers.sticker import sticker_router
@@ -24,6 +40,9 @@ import uvicorn
 import warnings
 from starlette.responses import RedirectResponse
 from starlette import status
+
+from db.client2 import SessionLocal
+from services.wanted_service import close_expired_wanted
 
 app = FastAPI()
 
@@ -72,8 +91,6 @@ app.include_router(dashboard.router)
 app.include_router(daily_shift_router.router)
 app.include_router(teams.router)
 app.include_router(groups.router)
-
-
 
 import uvicorn
 
