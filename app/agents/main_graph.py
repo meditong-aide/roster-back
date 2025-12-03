@@ -61,23 +61,7 @@ def GraphGenerate():
         query_analyzer → shift/preference analyzer (병렬) → collector 순서로 실행
         case_results가 있으면 shift_analyzer에서 LLM 호출 없이 바로 반환
     """
-    graph = StateGraph(ContextAnalyticsState, 
-    initial_state={
-        "request": None,
-        "schema": None,
-        "query_shift": [],
-        "query_preference": [],
-        "query_chat": [],
-        "query_others": [],
-        "shift_results": [],
-        "preference_results": [],
-        "model": None,
-        "case": None,
-        "case_results": None,
-        "year": None,
-        "month": None
-    }
-    )
+    graph = StateGraph(ContextAnalyticsState)
     graph.add_node('query_analyzer', query_analyzer)
     graph.add_node('create_shift_analyzer', create_shift_analyzer)
     graph.add_node('create_preference_analyzer', create_preference_analyzer)
