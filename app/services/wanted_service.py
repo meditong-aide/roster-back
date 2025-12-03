@@ -488,7 +488,11 @@ async def invoke_and_persist_wanted_service(
     # 1. 그래프 실행
     # ======================================================================
     print('degug: 1')
-    response = await graph_service.invoke(req.request, req.schema, req.case, req.year, req.month)
+    try:
+        response = await graph_service.invoke(req.request, req.schema, req.case, req.year, req.month)
+    except Exception as e:
+        print(f"graph_service.invoke 오류: {e}")
+        raise e
     print('degug: 2', response)
     # ======================================================================
     # 2. 새 wanted_request 생성
