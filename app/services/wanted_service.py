@@ -488,7 +488,7 @@ async def invoke_and_persist_wanted_service(
     # ======================================================================
     # 1. 그래프 실행
     # ======================================================================
-    print('degug: 1')
+    print('degug: 1', req.year, req.month)
     try:
         response = await graph_service.invoke(request= req.request, schema= req.schema, case= req.case, year= req.year, month= req.month)
     except Exception as e:
