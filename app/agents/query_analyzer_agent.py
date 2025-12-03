@@ -208,6 +208,8 @@ class queryAnalyzerPrompt:
 
 
 async def query_analyzer(state):
+    print('state', state)
+    print('state', state.__dict__)
     context = state['request']
     year = state['year']
     month = state['month']

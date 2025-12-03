@@ -43,10 +43,11 @@ class ContextAnalyticsState(TypedDict):
     shift_results: Annotated[list, operator.add]
     preference_results: Annotated[list, operator.add]
     model: object
+    year: int | None
+    month: int | None
     case: List[Dict[str, Any]] | None
     case_results: List[Dict[str, Any]] | None
-    year: int
-    month: int
+
     
 
 def GraphGenerate():
