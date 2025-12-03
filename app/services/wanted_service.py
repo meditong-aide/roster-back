@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Tuple
 from db.models import WantedRequest, NurseShiftRequest, NursePairRequest
 from services.graph_service import graph_service
 from dateutil.relativedelta import relativedelta
+import traceback
 
 def _yyyymm(year: int, month: int) -> str:
     """연/월을 'YYYY-MM' 문자열로 변환합니다.
