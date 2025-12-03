@@ -209,9 +209,7 @@ class queryAnalyzerPrompt:
 
 async def query_analyzer(state):
     context = state['request']
-    print('여긴가?')
     year = state['year']
-    print('year', year)
     month = state['month']
     query_analyzer_prompt = queryAnalyzerPrompt(context, year, month)
     
