@@ -490,7 +490,7 @@ async def invoke_and_persist_wanted_service(
     # ======================================================================
     print('degug: 1')
     try:
-        response = await graph_service.invoke(req.request, req.schema, req.case, req.year, req.month)
+        response = await graph_service.invoke(request= req.request, schema= req.schema, case= req.case, year= req.year, month= req.month)
     except Exception as e:
         print(f"graph_service.invoke 오류: {e}")
         traceback.print_exc()
