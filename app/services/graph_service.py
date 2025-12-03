@@ -16,7 +16,13 @@ class GraphService:
             dict: 그래프 실행 결과
         """
         print(f'year: {year}, month: {month}')
-        response = await self._graph.ainvoke({"request": request, "schema": schema, "case": case, "year": year, "month": month})        
+        response = await self._graph.ainvoke({
+            "request": request,
+            "schema": schema,
+            "case": case,
+            "year": year,
+            "month": month
+        })     
         response = [response['shift_results'], response['preference_results']]
         print('degug: 3', response)
         import pprint
