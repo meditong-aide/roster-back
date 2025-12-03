@@ -359,7 +359,7 @@ jobs:
             EOF
 
             # 4) EC2의 start.sh 실행
-            echo "start.sh 실행!"
+            echo "start.sh 실행!!"
             chmod +x /home/ubuntu/aide-backend-dev/start.sh
             /home/ubuntu/aide-backend-dev/start.sh
 
