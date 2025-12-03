@@ -15,7 +15,7 @@ class GraphService:
         Returns:
             dict: 그래프 실행 결과
         """
-        print(f'year: {year}, month: {month}')
+        print(f'year1: {year}, month1: {month}')
         response = await self._graph.ainvoke({
             "request": request,
             "schema": schema,
