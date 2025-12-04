@@ -135,7 +135,7 @@ jobs:
             --region ${{ secrets.AWS_REGION }}
 
       # 5-1) EC2 → ECR 로그인
-      - name: ECR login from EC2
+      - name: ECR login from EC2!
         if: github.ref_name == 'main'
         uses: appleboy/ssh-action@v1.0.0
         with:
