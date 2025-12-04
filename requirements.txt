@@ -2,7 +2,6 @@
 # uvicorn
 # google-genai
 # langchain-mcp-adapters
-# langgraph
 # numpy
 # openpyxl
 # ortools
@@ -28,7 +27,6 @@ langchain-anthropic>=0.3.17
 langchain-google-genai>=2.1.5
 langchain-mcp-adapters>=0.1.7
 langchain-openai>=0.3.27
-langgraph>=0.4.8
 matplotlib>=3.10.3
 numpy[standard]>=2.2.5
 openpyxl>=3.1.5
@@ -53,7 +51,6 @@ langchain-anthropic>=0.3.17,
 langchain-google-genai>=2.1.5,
 langchain-mcp-adapters>=0.1.7,
 langchain-openai>=0.3.27,
-langgraph>=0.4.8,
 matplotlib>=3.10.3,
 numpy[standard]>=2.2.5,
 openpyxl>=3.1.5,
@@ -72,6 +69,10 @@ fastapi-mail>=1.5.2
 pymssql>=2.3.8
 passlib>=1.7.4
 xlrd>=2.0.1
+langgraph==1.0.4
+langgraph-sdk==0.2.12
+langgraph-checkpoint==3.0.1
+langgraph-prebuilt==1.0.5
 # psutil>=5.9.0
 # cryptography>=45.0.5
 # fastapi[standard]>=0.115.12
@@ -81,7 +82,6 @@ xlrd>=2.0.1
 # langchain-google-genai>=2.1.5
 # langchain-mcp-adapters>=0.1.7
 # langchain-openai>=0.3.27
-# langgraph>=0.4.8
 # matplotlib>=3.10.3
 # numpy[standard]>=2.2.5
 # openpyxl>=3.1.5
