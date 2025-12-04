@@ -26,6 +26,8 @@ class queryAnalyzer(BaseModel):
     Preference: List[str]
     Except: List[str]
     Others: List[str] 
+    year: int
+    month: int
 
 
 # ------------------------------
