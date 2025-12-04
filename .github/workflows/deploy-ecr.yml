@@ -15,7 +15,6 @@ jobs:
       id-token: write
 
     steps:
-      # 1) 저장소 체크아웃
       - name: Checkout code
         uses: actions/checkout@v3
 
