@@ -176,6 +176,8 @@ class RosterConfig(Base):
     nod_noe = Column(BOOLEAN)
     created_at = Column(DATETIME, default=func.now())
     preceptor_gauge = Column(INTEGER, nullable=False, default=5)
+    team_balance_enable = Column(BOOLEAN, nullable=False, default=False)
+    team_balance_gauge = Column(INTEGER, nullable=False, default=0)
 
     office = relationship("Office")
     group = relationship("Group")

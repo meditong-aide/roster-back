@@ -61,6 +61,13 @@ class NurseRosterConfig:
     preceptor_min_pair_weight: float = 5.0          # 쌍 가중치 하한 필터
     preceptor_focus_shifts: Optional[List[str]] = None  # 특정 교대만 고려(e.g., ['N','E'])
     
+    # ── 팀 균등 분배 옵션 ──
+    team_balance_enable: bool = False               # 팀 단위 균등화 기능 사용 여부
+    team_balance_gauge: int = 0                     # UI에서 설정한 게이지(0~10)
+    team_balance_weight: int = 0                    # 팀 보너스 항 기본 가중치
+    team_balance_top_days: int = 0                  # 각 팀-쌍별로 고려할 상위 일수
+    team_balance_focus_shifts: Optional[List[str]] = None  # 특정 교대만 고려
+    
     # --- 신규 Hard Constraint 제어 파라미터 ---
     enforce_seniority_pairing: bool = True # 시니어-주니어 동반 근무 규칙 강제 여부
     junior_pairing_max_experience: int = 2 # 주니어로 간주할 최대 연차
@@ -80,6 +87,17 @@ class NurseRosterConfig:
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
+        # 게이지 기반 기본 가중치 보정
+        gauge = max(0, min(10, int(self.team_balance_gauge or 0)))
+        if not self.team_balance_enable or gauge == 0:
+            self.team_balance_weight = 0
+            self.team_balance_top_days = 0
+        else:
+            if not self.team_balance_weight:
+                base = 40 + (gauge * 12)
+                self.team_balance_weight = int(base)
+            if not self.team_balance_top_days:
+                self.team_balance_top_days = int(6 + (30 - 6) * (gauge / 10.0))
             
     @property
     def shift_types(self) -> List[str]:

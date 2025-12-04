@@ -104,6 +104,8 @@ class RosterConfigBase(BaseModel):
     sequential_offs: bool
     nod_noe: bool
     preceptor_gauge: float
+    team_balance_enable: bool = Field(default=False)
+    team_balance_gauge: int = Field(default=0, ge=0, le=10)
 
 class RosterConfigCreate(RosterConfigBase):
     config_version: Optional[str] = None

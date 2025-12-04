@@ -73,6 +73,19 @@ class CPSATBasicEngine:
             'N': 7.0,  # Night Keep은 더 높은 가중치
             'O': 10.0
         })
+        # team_balance_enable = bool(config_data.get('team_balance_enable', False))
+        team_balance_enable = True
+        team_balance_gauge = int(config_data.get('team_balance_gauge', 0) or 0)
+        team_balance_weight = int(config_data.get('team_balance_weight', 0) or 0)
+        team_balance_top_days = int(config_data.get('team_balance_top_days', 0) or 0)
+        team_balance_focus = config_data.get('team_balance_focus_shifts')
+        print('\n\n\n\n\n\n')
+        print('team_balance_enable', team_balance_enable)
+        print('team_balance_gauge', team_balance_gauge)
+        print('team_balance_weight', team_balance_weight)
+        print('team_balance_top_days', team_balance_top_days)
+        print('team_balance_focus', team_balance_focus)
+        print('\n\n\n\n\n\n')
         cfg = NurseRosterConfig(
             daily_shift_requirements = config_data['daily_shift_requirements'],
             # daily_shift_requirements={
@@ -107,6 +120,11 @@ class CPSATBasicEngine:
             preceptor_top_days=config_data.get('preceptor_top_days', 12),
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
+            team_balance_enable=team_balance_enable,
+            team_balance_gauge=team_balance_gauge,
+            team_balance_weight=team_balance_weight,
+            team_balance_top_days=team_balance_top_days,
+            team_balance_focus_shifts=team_balance_focus,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
             max_extra_off_days=int(config_data.get('max_extra_off_days', 2)),
             # 여유 인원 균등화 제어
@@ -171,6 +189,7 @@ class CPSATBasicEngine:
                 'remaining_off_days': 0,  # 초기화, 나중에 계산됨
                 'joining_date': _to_date(nurse_data.get('joining_date')),
                 'resignation_date': _to_date(nurse_data.get('resignation_date')),
+            'team_id': nurse_data.get('team_id'),
             }
             
             # # resignation_date 처리
@@ -1358,6 +1377,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # (4-6) 프리셉터 보너스 항 모듈화
     if include_pair_objective:
         obj.extend(_add_preceptor_objective_terms(m, rs, X, join, leave))
+        obj.extend(_add_team_balance_objective_terms(m, rs, X, join, leave))
 
     # (4-7) 커버리지 부족 패널티(메인 경로 slack 허용) – 날짜별 요구치 기반
     try:
@@ -1548,6 +1568,75 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
             _added += 1
     _dt = _t.time()-_t0
     print(f"[CP-SAT-Basic] 프리셉터 항: 쌍 {len(pairs)}개, 변수 {_added}개, {_dt:.2f}s, 강도 {strength}x, K={K_default}, shifts={focus_codes}")
+    return obj_terms
+
+
+def _add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave):
+    """같은 팀 간호사들이 동일 교대를 함께 하도록 유도하는 soft objective."""
+    obj_terms = []
+    cfg = rs.config
+    if not getattr(cfg, "team_balance_enable", False):
+        return obj_terms
+    weight = int(getattr(cfg, "team_balance_weight", 0) or 0)
+    if weight <= 0:
+        return obj_terms
+    top_days = int(getattr(cfg, "team_balance_top_days", 0) or 0)
+    if top_days <= 0:
+        top_days = 8
+    focus_codes = getattr(cfg, "team_balance_focus_shifts", None)
+    if focus_codes:
+        shift_codes = [code for code in focus_codes if code in rs.config.daily_shift_requirements.keys()]
+    else:
+        shift_codes = list(rs.config.daily_shift_requirements.keys())
+    shift_indices = [rs.config.shift_types.index(code) for code in shift_codes if code in rs.config.shift_types]
+    if not shift_indices:
+        return obj_terms
+
+    team_members: dict[str, list[int]] = {}
+    for idx, nurse in enumerate(rs.nurses):
+        team_id = getattr(nurse, "team_id", None)
+        if team_id in (None, "", 0):
+            continue
+        team_members.setdefault(str(team_id), []).append(idx)
+
+    if not team_members:
+        return obj_terms
+
+    pref = rs.preference_matrix
+    pref_threshold = 0.5
+    for team_id, members in team_members.items():
+        if len(members) < 2:
+            continue
+        members = sorted(members)
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                n1, n2 = members[i], members[j]
+                overlap_start = max(join[n1], join[n2])
+                overlap_end = min(leave[n1], leave[n2])
+                if overlap_start > overlap_end:
+                    continue
+                scored: list[tuple[float, int, int]] = []
+                for d in range(overlap_start, overlap_end + 1):
+                    best_score = None
+                    best_shift = None
+                    for s in shift_indices:
+                        score = pref[n1, d, s] + pref[n2, d, s]
+                        if score <= pref_threshold:
+                            continue
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_shift = s
+                    if best_score is None:
+                        continue
+                    scored.append((best_score, d, best_shift))
+                if not scored:
+                    continue
+                limit = min(top_days, len(scored))
+                for _, d, s in sorted(scored, reverse=True)[:limit]:
+                    z = m.NewBoolVar(f"team_pair_{team_id}_{n1}_{n2}_{d}_{s}")
+                    m.Add(z <= X(n1, d, s))
+                    m.Add(z <= X(n2, d, s))
+                    obj_terms.append(weight * z)
     return obj_terms
 
 
