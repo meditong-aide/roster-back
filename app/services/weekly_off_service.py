@@ -290,7 +290,6 @@ def update_nurses_weekly_off_service(
             created_at=now
         )
         db.add(setting)
-    print('setting', setting.base_year, setting.base_month, setting.updated_at)
     # 기준 시점 갱신 (현재 저장하는 시점의 연/월이 기준이 됨)
     setting.base_year = now.year
     setting.base_month = now.month
@@ -298,12 +297,12 @@ def update_nurses_weekly_off_service(
     
     # 간호사 업데이트
     update_map = {item.nurse_id: item for item in payload.items}
-    print('update_map', update_map)
+
     nurses = db.query(Nurse).filter(
         Nurse.group_id == target_group_id,
-        Nurse.nurse_id.in_(update_map.keys())
+        Nurse.nurse_id.in_([n for n in update_map.keys()])
     ).all()
-    print('nurses', [n.__dict__ for n in nurses])
+
     updated_count = 0
     for n in nurses:
         data = update_map[n.nurse_id]
