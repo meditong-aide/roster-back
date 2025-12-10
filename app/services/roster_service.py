@@ -326,8 +326,8 @@ def create_issued_roster_snapshot(
         .filter(
             IssuedRosterSnapshot.office_id == office_id,
             IssuedRosterSnapshot.group_id == group_id,
-            Schedule.year == schedule.year,
-            Schedule.month == schedule.month,
+            IssuedRosterSnapshot.year == schedule.year,
+            IssuedRosterSnapshot.month == schedule.month,
             IssuedRosterSnapshot.is_active_issued == True,
         )
         .update(
