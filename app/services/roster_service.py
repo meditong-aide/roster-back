@@ -531,5 +531,7 @@ def create_issued_roster_snapshot(
         shift_manage_json=shift_manage_json,
         roster_json=roster_json,
         violations_json=violations_json,
+        year=schedule.year,
+        month=schedule.month,
     )
     return snapshot
