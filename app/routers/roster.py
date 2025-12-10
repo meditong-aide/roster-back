@@ -716,6 +716,9 @@ async def publish_roster(
         group_id=target_group_id,
         db=db,
     )
+    db.add(issued_roster)
+    db.add(snapshot)
+    db.commit()
     nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     print('[DEBUG] [roster.py - publish_roster] nurses_in_group', nurses_in_group)
     receiveEmpSeqNo = [nurse.nurse_id for nurse in nurses_in_group]
@@ -743,13 +746,8 @@ async def publish_roster(
         linkUrl=linkUrl, 
         linkCode=linkCode)
     
-    return message_result
+    # return message_result
 
-
-
-    db.add(issued_roster)
-    db.add(snapshot)
-    db.commit()
     
     return {
         "message": "근무표가 성공적으로 발행되었습니다.",
