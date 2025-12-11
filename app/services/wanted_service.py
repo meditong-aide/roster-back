@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Tuple
 from db.models import WantedRequest, NurseShiftRequest, NursePairRequest
 from services.graph_service import graph_service
 from dateutil.relativedelta import relativedelta
+import traceback
 
 def _yyyymm(year: int, month: int) -> str:
     """연/월을 'YYYY-MM' 문자열로 변환합니다.
@@ -476,6 +477,7 @@ async def invoke_and_persist_wanted_service(
     print("그래프 실행 및 DB 저장을 시작합니다.")
     
     nurse_id = current_user.nurse_id
+    print('request:', req.__dict__)
     month_str = _yyyymm(req.year, req.month)
     
     # ======================================================================
@@ -486,8 +488,14 @@ async def invoke_and_persist_wanted_service(
     # ======================================================================
     # 1. 그래프 실행
     # ======================================================================
-    response = await graph_service.invoke(req.request, req.schema, req.case, req.year, req.month)
-    
+    print('degug: 1', req.year, req.month)
+    try:
+        response = await graph_service.invoke(request= req.request, schema= req.schema, case= req.case, year= req.year, month= req.month)
+    except Exception as e:
+        print(f"graph_service.invoke 오류: {e}")
+        traceback.print_exc()
+        raise e
+    print('degug: 2', response)
     # ======================================================================
     # 2. 새 wanted_request 생성
     # ======================================================================

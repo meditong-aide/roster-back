@@ -61,6 +61,11 @@ class Nurse(Base):
     sequence = Column(INTEGER, nullable=False, default=0)
     active = Column(INTEGER, default=1)
     team_id = Column(INTEGER, nullable=True)
+    
+    # 주휴 관련 추가 컬럼
+    weekly_off_enabled = Column(TINYINT, default=0)  # 주휴 대상 여부
+    weekly_off_weekday = Column(TINYINT, nullable=True)  # 기준 월에서의 주휴 요일 (0:월~6:일)
+    
     group = relationship("Group")
     __table_args__ = (
         ForeignKeyConstraint(['group_id', 'team_id'], ['teams.group_id', 'teams.team_id'], name='fk_nurses_team_group', ondelete='SET NULL', onupdate='CASCADE'),
@@ -114,6 +119,7 @@ class Shift(Base):
     duration = Column(INTEGER, nullable=True)  # for time_type='hours'
     sequence = Column(INTEGER, nullable=False, default=0)  # 순서 관리용
     default_shift = Column(VARCHAR(10), nullable=True)  # 기본 근무코드
+    is_weekly_off = Column(TINYINT, nullable=False, default=0)  # 주휴 여부
     id = Column(INTEGER, primary_key=True, nullable=False, autoincrement=True)
 
     office = relationship("Office")
@@ -335,3 +341,36 @@ class DailyShift(Base):
 
     office = relationship("Office")
     group = relationship("Group")
+
+
+class WeeklyOffSetting(Base):
+    __tablename__ = 'weekly_off_settings'
+    
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'), nullable=False)
+    group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    
+    activate = Column(TINYINT, nullable=False, default=0)
+    use_variable_cycle = Column(TINYINT, nullable=False, default=0)
+    cycle_type = Column(VARCHAR(10), nullable=True, default='month')  # 'month' or 'week'
+    
+    # 기준 시점 (설정 변경 시점의 연/월)
+    base_year = Column(INTEGER, nullable=True)
+    base_month = Column(INTEGER, nullable=True)
+    
+    # 주 단위 주기 기준일
+    cycle_start_date = Column(DATE, nullable=True)
+    
+    cycle_interval = Column(INTEGER, nullable=True, default=1)
+    shift_variation = Column(SMALLINT, nullable=False, default=-1)
+    
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('office_id', 'group_id', name='ux_weekly_off_settings_office_group'),
+    )
+
+    office = relationship("Office")
+    group = relationship("Group")
+

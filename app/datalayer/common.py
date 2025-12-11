@@ -43,18 +43,28 @@ class Common:
         return _queryString
 
     @staticmethod
-    def set_push_receiver_member_id():
-        _queryString = "Select MemberID From eun_gw.bizwiz20db.Member_Login Where EmpSeqNo= %s "
-        return _queryString
-
-    @staticmethod
-    def set_push_receiver_pushyn():
-        _queryString = " Select Top 1 PushYN,pushTimeYn,stime,etime From eun_gw.bizwiz20db.TB_Mobile_User_Setting_List Where MemberID = %s Order By RegDate Desc "
-        return _queryString
-
-    @staticmethod
-    def get_user_device_key():
-        _queryString = " Select top 1 DeviceKey From eun_gw.bizwiz20db.TB_Mobile_User_Device_List Where MemberID = %s Order By Idx Desc"
+    def get_user_device_key(receiveEmpSeqNo: str):
+        _queryString = f"""
+        select distinct z.DeviceKey
+          from (
+                select a.MemberID, b.PushYN, b.pushTimeYn, c.DeviceKey
+                  from bizwiz20db.Member_Login a left join eun_gw.bizwiz20db.TB_Mobile_User_Setting_List b on a.MemberID = b.MemberID
+                       left join eun_gw.bizwiz20db.TB_Mobile_User_Device_List c on a.MemberID = c.MemberID
+                where a.EmpSeqNo in ({receiveEmpSeqNo})
+                  and b.PushYN = 'Y' and ((b.stime is null or b.stime = '') and (b.etime is null or b.etime = ''))
+        
+                Union all
+        
+                select a.MemberID, b.PushYN, b.pushTimeYn, c.DeviceKey
+                  from bizwiz20db.Member_Login a left join eun_gw.bizwiz20db.TB_Mobile_User_Setting_List b on a.MemberID = b.MemberID
+                       left join eun_gw.bizwiz20db.TB_Mobile_User_Device_List c on a.MemberID = c.MemberID
+                where a.EmpSeqNo in ({receiveEmpSeqNo})
+                  and b.PushYN = 'Y' and b.PushTimeYN = 'Y' and (b.stime is not null and b.stime <> '') and (b.etime is not null and b.etime <> '')
+                  and CONVERT(time, b.stime + ':00') <= CONVERT(time, GETDATE()) 
+                  and CONVERT(time, b.etime + ':00') >= CONVERT(time, GETDATE())
+               ) z
+        where z.DeviceKey is not null and z.DeviceKey <> ''
+        """
         return _queryString
 
     @staticmethod

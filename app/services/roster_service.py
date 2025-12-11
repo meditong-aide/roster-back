@@ -49,7 +49,6 @@ def save_roster_config_service(
         target_office_id: str
 
         if override_group_id:
-            print(1)
             group_row = db.query(Group).filter(Group.group_id == override_group_id).first()
             if not group_row:
                 raise Exception("지정한 그룹을 찾을 수 없습니다.")
@@ -61,8 +60,6 @@ def save_roster_config_service(
 
             # if not nurse or not nurse.group:
             #     raise Exception("User group information not found")
-            print('user', user)
-            print('nurse', nurse)
             target_group_id = user.group_id
             target_office_id = nurse.group.office_id
 
@@ -162,7 +159,6 @@ def get_issued_schedules_service(current_user, db: Session, target_group_id: str
         print('[get_issued_schedules_service] error', e)
         print('[get_issued_schedules_service] target_group_id', target_group_id)
         raise HTTPException(status_code=500, detail=f"Failed to get issued schedules: {str(e)}")
-    print('\n\n\n[get_issued_schedules_service] ',   schedules, '\n\n\n')
     return schedules
 
 def get_schedule_status_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
@@ -329,8 +325,8 @@ def create_issued_roster_snapshot(
         .filter(
             IssuedRosterSnapshot.office_id == office_id,
             IssuedRosterSnapshot.group_id == group_id,
-            Schedule.year == schedule.year,
-            Schedule.month == schedule.month,
+            IssuedRosterSnapshot.year == schedule.year,
+            IssuedRosterSnapshot.month == schedule.month,
             IssuedRosterSnapshot.is_active_issued == True,
         )
         .update(
@@ -534,5 +530,7 @@ def create_issued_roster_snapshot(
         shift_manage_json=shift_manage_json,
         roster_json=roster_json,
         violations_json=violations_json,
+        year=schedule.year,
+        month=schedule.month,
     )
     return snapshot
