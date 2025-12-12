@@ -104,6 +104,7 @@ class RosterConfigBase(BaseModel):
     sequential_offs: bool
     nod_noe: bool
     preceptor_gauge: float
+    weekly_off_group: bool = Field(default=False)
 
 class RosterConfigCreate(RosterConfigBase):
     config_version: Optional[str] = None
