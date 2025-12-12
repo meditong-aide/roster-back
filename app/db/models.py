@@ -61,10 +61,10 @@ class Nurse(Base):
     sequence = Column(INTEGER, nullable=False, default=0)
     active = Column(INTEGER, default=1)
     team_id = Column(INTEGER, nullable=True)
-    
     # 주휴 관련 추가 컬럼
     weekly_off_enabled = Column(TINYINT, default=0)  # 주휴 대상 여부
     weekly_off_weekday = Column(TINYINT, nullable=True)  # 기준 월에서의 주휴 요일 (0:월~6:일)
+    nurse_memo = Column(TEXT, nullable=True)
     
     group = relationship("Group")
     __table_args__ = (

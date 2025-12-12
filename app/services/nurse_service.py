@@ -215,7 +215,7 @@ def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_
                 nurse_dict['sequence'] = get_next_sequence_for_active_status(
                     current_user.group_id, active_status, db
                 )
-            pprint.pprint(nurse_dict)
+            
             try:
                 new_nurse = NurseModel(**nurse_dict, group_id=target_group_id)
                 db.add(new_nurse)
