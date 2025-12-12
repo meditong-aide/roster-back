@@ -182,6 +182,7 @@ class RosterConfig(Base):
     nod_noe = Column(BOOLEAN)
     created_at = Column(DATETIME, default=func.now())
     preceptor_gauge = Column(INTEGER, nullable=False, default=5)
+    weekly_off_group = Column(BOOLEAN)
 
     office = relationship("Office")
     group = relationship("Group")
