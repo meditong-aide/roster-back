@@ -183,17 +183,13 @@ def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_
     """
     간호사 일괄 업데이트 서비스 함수
     """
-    import pprint
-    pprint.pprint(nurses_data)
     if not current_user:
         raise Exception("Not authenticated")
     # HDN 또는 ADM만 허용
-    if not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
-        raise Exception("Permission denied")
-    if not any(n.is_head_nurse for n in nurses_data):
-        print('n.is_head_nurse', [n.is_head_nurse for n in nurses_data])
-        raise Exception("At least one head nurse must be assigned.")
-    target_group_id = override_group_id or current_user.group_id
+    if current_user.is_master_admin:
+        target_group_id = override_group_id
+    else:
+        target_group_id = current_user.group_id
     db_nurses_dict = {n.nurse_id: n for n in db.query(NurseModel).filter(NurseModel.group_id == target_group_id).all()}
     for nurse_data in nurses_data:
         db_nurse = db_nurses_dict.get(nurse_data.nurse_id)
@@ -228,7 +224,7 @@ def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_
                 continue
     
     client_nurse_ids = {n.nurse_id for n in nurses_data}
-    print('client_nurse_ids', client_nurse_ids)
+    
     for db_nurse_id, db_nurse in db_nurses_dict.items():
         if db_nurse_id not in client_nurse_ids:
             db.delete(db_nurse)

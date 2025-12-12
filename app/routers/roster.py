@@ -209,6 +209,7 @@ async def get_config_by_version(
                 even_nights=getattr(cfg, 'even_nights', True),
                 nod_noe=False,
                 preceptor_gauge=getattr(cfg, 'preceptor_gauge', 5),
+                weekly_off_group=getattr(cfg, 'weekly_off_group', False),
             )
             db.add(new_config)
 
@@ -240,6 +241,7 @@ async def get_config_by_version(
                 "created_at": new_config.created_at.isoformat() if new_config.created_at else None,
                 "nod_noe": new_config.nod_noe,
                 "preceptor_gauge" : new_config.preceptor_gauge,
+                "weekly_off_group" : new_config.weekly_off_group,
             }
         else:
             config = db.query(RosterConfigModel).filter(
@@ -273,6 +275,7 @@ async def get_config_by_version(
                 "created_at": config.created_at.isoformat() if config.created_at else None,
                 "nod_noe": config.nod_noe,
                 "preceptor_gauge" : config.preceptor_gauge,
+                "weekly_off_group" : config.weekly_off_group,
             }
     except Exception as e:
         print('error', e)
