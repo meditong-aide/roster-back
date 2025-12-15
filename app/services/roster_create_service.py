@@ -550,9 +550,20 @@ def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
     enable = enable_flag and g > 0
     config_dict["team_balance_gauge"] = g
     config_dict["team_balance_enable"] = enable
+
+    # 정규화된 팀 보너스 강도(soft) 매핑:
+    # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
+    # 식: weight = round(cap * (g/10)^p)
+    # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
+    cap = int(config_dict.get("team_balance_weight_cap", 240) or 240)
+    power = float(config_dict.get("team_balance_weight_power", 1.7) or 1.7)
+    cap = max(0, min(500, cap))  # 안전 상한(임의 폭주 방지)
+    power = max(0.5, min(3.0, power))
+
     if enable:
-        config_dict["team_balance_weight"] = int(40 + 12 * g)
-        config_dict["team_balance_top_days"] = int(6 + (30 - 6) * (g / 10.0))
+        g_norm = g / 10.0
+        config_dict["team_balance_weight"] = int(round(cap * (g_norm ** power)))
+        config_dict["team_balance_top_days"] = int(6 + (30 - 6) * g_norm)
     else:
         config_dict["team_balance_weight"] = 0
         config_dict["team_balance_top_days"] = 0
@@ -560,6 +571,16 @@ def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
         config_dict["team_balance_focus_shifts"] = None
     if "team_balance_mode" not in config_dict:
         config_dict["team_balance_mode"] = "balanced"
+
+    # 모드별 교대 가중치가 비어있으면 기본값을 채운다.
+    if not config_dict.get("team_balance_shift_weights"):
+        mode = str(config_dict.get("team_balance_mode", "balanced") or "balanced").lower()
+        if mode == "focus_d":
+            config_dict["team_balance_shift_weights"] = {"D": 1.5, "E": 0.6, "N": 0.3}
+        elif mode == "focus_de":
+            config_dict["team_balance_shift_weights"] = {"D": 1.2, "E": 1.2, "N": 0.5}
+        else:
+            config_dict["team_balance_shift_weights"] = {"D": 1.0, "E": 1.0, "N": 1.0}
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 

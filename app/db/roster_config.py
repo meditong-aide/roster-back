@@ -95,8 +95,14 @@ class NurseRosterConfig:
             self.team_balance_top_days = 0
         else:
             if not self.team_balance_weight:
-                base = 40 + (gauge * 12)
-                self.team_balance_weight = int(base)
+                # 정규화된 팀 보너스 강도(soft) 매핑:
+                # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
+                # 식: weight = round(cap * (g/10)^p)
+                # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
+                cap = 240
+                power = 1.7
+                g_norm = gauge / 10.0
+                self.team_balance_weight = int(round(cap * (g_norm ** power)))
             if not self.team_balance_top_days:
                 self.team_balance_top_days = int(6 + (30 - 6) * (gauge / 10.0))
         # 모드 기반 shift weight 설정 (없을 때만 세팅)

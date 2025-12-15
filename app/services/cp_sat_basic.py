@@ -115,10 +115,10 @@ class CPSATBasicEngine:
             preceptor_top_days=config_data.get('preceptor_top_days', 12),
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
-            team_balance_enable=team_balance_enable,
-            # team_balance_enable=True, # test
-            # team_balance_gauge=10, # test
-            team_balance_gauge=team_balance_gauge,
+            # team_balance_enable=team_balance_enable,
+            team_balance_enable=True, # test
+            team_balance_gauge=5, # test
+            # team_balance_gauge=team_balance_gauge,
             team_balance_weight=team_balance_weight,
             # team_balance_weight=100, # test
             team_balance_top_days=team_balance_top_days,
@@ -489,67 +489,53 @@ class CPSATBasicEngine:
         seed: int | None = None
     )->bool:
         from ortools.sat.python import cp_model
-        if randomize:
-            run_seed = seed if seed is not None else ((int(time.time()*1000) ^ random.getrandbits(31)) & 0x7fffffff)
+        # randomize=False 여도 run_seed는 항상 정의되어야 한다.
+        # (e.g., 테스트/재현성 평가 스크립트에서 seed 고정 실행)
+        run_seed = seed if seed is not None else ((int(time.time() * 1000) ^ random.getrandbits(31)) & 0x7fffffff)
         # ① 0.3× time_limit 으로 “전체 모델” 한번 돌려 feasible 확보
-        print(1)
-        base_tl = max(5, int(time_limit_seconds*0.3))
+        # time_limit_seconds가 작을 때도(테스트/평가) 입력된 제한을 존중한다.
+        # 예: time_limit_seconds=10이면 base_tl은 최대 3초 정도로 제한.
+        base_tl = max(1, int(time_limit_seconds * 0.3))
+        base_tl = min(base_tl, max(1, int(time_limit_seconds)))
         feasible = self._quick_initial_solve(
             roster_system, base_tl, grouped, run_seed)
-        print(2)
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
             'shift_requirement', 'max_consecutive_night',
             'max_consecutive_work', 'night_after_limit',
             'day_after_evening', 'night_monthly_limit'
         }
-        print(3)
         def hard_violation_cnt():
             return sum(1 for v in roster_system._find_violations()
                        if v['type'] in HARD_TYPES)
-        print(4)
         best_viol = hard_violation_cnt()
-        print(5)
         best_roster = roster_system.roster.copy()
-        print(6)
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
                                       roster_system.num_days)
-        print(7)
         remaining = time_limit_seconds - base_tl
-        per_iter  = 8          # neighbourhood solve 8 초
-        max_iter  = max(1, remaining // per_iter)
-        print(8)
+        per_iter = 8          # neighbourhood solve 8 초
+        # remaining이 per_iter보다 작으면 반복은 0회로 끝내야 총 시간이 늘어나지 않는다.
+        max_iter = max(0, remaining // per_iter)
         if max_iter==0:
-            print(9)
             return best_viol==0
-        print(10)
         for it in range(max_iter):
             try:
                 n_sel, d_sel = policy.select()
-                print(11)
                 ok = _solve_neighbourhood(roster_system, n_sel, d_sel,
                                       per_iter, grouped, run_seed, it = it)
-                print(12)
             except Exception as e:
                 print(e)
             if not ok: policy.update(False, n_sel, d_sel); continue
             curr_viol = hard_violation_cnt()
-            print(13)
             improved  = curr_viol < best_viol
-            print(14)
             if improved:
                 best_viol = curr_viol;  best_roster = roster_system.roster.copy()
-                print(15)
             else:  # rollback
-                print(16)
                 roster_system.roster = best_roster.copy()
             policy.update(improved, n_sel, d_sel)
-            print(17)
             if best_viol==0: break
-        print(18)
         roster_system.roster = best_roster
-        print(19)
         return best_viol==0
 
 
@@ -889,6 +875,17 @@ class CPSATBasicEngine:
                                     m.Add(diff >= ov1 - ov2)
                                     m.Add(diff >= ov2 - ov1)
                                     obj.append(-w_eq * diff)
+                except Exception:
+                    pass
+
+                # 팀/프리셉터 soft objective를 폴백(3단계)에서도 반영한다.
+                # - 폴백이 타는 케이스가 많으면, 여기 반영이 없을 경우 gauge가 "먹지 않는" 것처럼 보인다.
+                try:
+                    obj.extend(_add_preceptor_objective_terms(m, roster_system, X, join, leave))
+                except Exception:
+                    pass
+                try:
+                    obj.extend(_add_team_balance_objective_terms(m, roster_system, X, join, leave))
                 except Exception:
                     pass
                 m.Maximize(sum(obj))
@@ -1572,25 +1569,20 @@ def _add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave):
     또한 대표 교대(Y)의 월간 분포가 전체 요구량 비율을 따르도록 편차 패널티를 추가합니다.
     (→ "비율에 따라 포커싱할 shift를 결정" + "결정된 shift로 팀원들이 같은 shift가 되도록")
     """
-    print('add_team_balance_objective_terms!!!')
     obj_terms: list = []
     cfg = rs.config
     if not getattr(cfg, "team_balance_enable", False):
-        print('no proceeded!!!')
         return obj_terms
-    # weight = int(getattr(cfg, "team_balance_weight", 0) or 0)
-    weight = 10
+    weight = int(getattr(cfg, "team_balance_weight", 0) or 0)
     if weight <= 0:
         return obj_terms
 
     # 사용할 교대 집합(OFF 제외)
     focus_codes = getattr(cfg, "team_balance_focus_shifts", None)
     if focus_codes:
-        print('focus_codes!!!', focus_codes)
         shift_codes = [c for c in focus_codes if c in rs.config.daily_shift_requirements.keys()]
     else:
         shift_codes = list(rs.config.daily_shift_requirements.keys())
-        print('shift_codes!!!', shift_codes)
     shift_codes = [c for c in shift_codes if c in rs.config.shift_types and c != "O"]
     if not shift_codes:
         return obj_terms
@@ -1621,7 +1613,6 @@ def _add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave):
             total_required[code] = int(cfg.daily_shift_requirements.get(code, 0)) * rs.num_days
     sum_required = max(1, sum(total_required.values()))
     ratio = {code: (total_required[code] / sum_required) for code in shift_codes}
-    print('ratio!!!', ratio)
     # 가중치 분리: 정렬 보너스(같은 shift)와 분포 패널티(비율)
     align_w = int(weight)
     dist_w = max(1, int(weight * 0.6))
