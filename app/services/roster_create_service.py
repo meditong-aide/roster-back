@@ -401,6 +401,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
 
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
+    cp_sat_result = None
     try:
         nurses_dict = [n.__dict__ for n in nurses_in_group]
         # prefs_dict = [p.__dict__ for p in preferences]
@@ -415,6 +416,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             config_dict['fixed_cells'] = fixed_cells
     except Exception as e:
         print(f"error: {e}")
+        raise
     # cross-month 경계 제약 생성 및 주입
     try:
         initial_constraints = build_cross_month_constraints(
@@ -436,6 +438,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
     except Exception as e:
         print(f"error: {e}")
+        raise
     if isinstance(cp_sat_result, dict) and "roster" in cp_sat_result:
         return (
             cp_sat_result["roster"],
@@ -536,26 +539,18 @@ def _apply_preceptor_gauge(config_dict: dict, gauge: int | None) -> None:
     print(f"[프리셉터 게이지] g={g} → strength={strength}x, top_k={top_k}, min_w={min_w}")
 
 
-def _apply_team_balance_gauge(
-    config_dict: dict,
-    gauge: int | None,
-) -> None:
+def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
     """
-    팀 균등 분배 게이지(0~10)를 엔진 설정 파라미터로 매핑합니다.
-
-    Args:
-        config_dict: 엔진에 전달할 설정 딕셔너리 (in-place 수정)
-        gauge: 프론트에서 전달한 게이지 값(0~10). None이면 기존 값을 사용
+    팀 균등/집중 보너스 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
+    - enable이 False이면 weight/top_days를 0으로 초기화
     """
     enable_flag = bool(config_dict.get("team_balance_enable", False))
     g = gauge if gauge is not None else config_dict.get("team_balance_gauge", 0)
-    g = 10
     g = max(0, min(10, int(g or 0)))
     enable = enable_flag and g > 0
     config_dict["team_balance_gauge"] = g
     config_dict["team_balance_enable"] = enable
     if enable:
-        strength = 0.4 + 0.12 * g
         config_dict["team_balance_weight"] = int(40 + 12 * g)
         config_dict["team_balance_top_days"] = int(6 + (30 - 6) * (g / 10.0))
     else:
@@ -563,6 +558,8 @@ def _apply_team_balance_gauge(
         config_dict["team_balance_top_days"] = 0
     if "team_balance_focus_shifts" not in config_dict:
         config_dict["team_balance_focus_shifts"] = None
+    if "team_balance_mode" not in config_dict:
+        config_dict["team_balance_mode"] = "balanced"
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 

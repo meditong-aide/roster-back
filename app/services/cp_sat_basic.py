@@ -73,19 +73,14 @@ class CPSATBasicEngine:
             'N': 7.0,  # Night Keep은 더 높은 가중치
             'O': 10.0
         })
-        # team_balance_enable = bool(config_data.get('team_balance_enable', False))
-        team_balance_enable = True
+        team_balance_enable = bool(config_data.get('team_balance_enable', False))
         team_balance_gauge = int(config_data.get('team_balance_gauge', 0) or 0)
         team_balance_weight = int(config_data.get('team_balance_weight', 0) or 0)
         team_balance_top_days = int(config_data.get('team_balance_top_days', 0) or 0)
         team_balance_focus = config_data.get('team_balance_focus_shifts')
-        print('\n\n\n\n\n\n')
-        print('team_balance_enable', team_balance_enable)
-        print('team_balance_gauge', team_balance_gauge)
-        print('team_balance_weight', team_balance_weight)
-        print('team_balance_top_days', team_balance_top_days)
-        print('team_balance_focus', team_balance_focus)
-        print('\n\n\n\n\n\n')
+        team_balance_mode = config_data.get('team_balance_mode', 'balanced')
+        team_balance_shift_weights = config_data.get('team_balance_shift_weights') or {}
+
         cfg = NurseRosterConfig(
             daily_shift_requirements = config_data['daily_shift_requirements'],
             # daily_shift_requirements={
@@ -121,10 +116,17 @@ class CPSATBasicEngine:
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
             team_balance_enable=team_balance_enable,
+            # team_balance_enable=True, # test
+            # team_balance_gauge=10, # test
             team_balance_gauge=team_balance_gauge,
             team_balance_weight=team_balance_weight,
+            # team_balance_weight=100, # test
             team_balance_top_days=team_balance_top_days,
+            # team_balance_top_days=30, # test
             team_balance_focus_shifts=team_balance_focus,
+            # team_balance_focus_shifts=['D', 'E', 'N'], # test
+            team_balance_mode=team_balance_mode,
+            team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
             max_extra_off_days=int(config_data.get('max_extra_off_days', 2)),
             # 여유 인원 균등화 제어
@@ -189,18 +191,9 @@ class CPSATBasicEngine:
                 'remaining_off_days': 0,  # 초기화, 나중에 계산됨
                 'joining_date': _to_date(nurse_data.get('joining_date')),
                 'resignation_date': _to_date(nurse_data.get('resignation_date')),
-            'team_id': nurse_data.get('team_id'),
+                'team_id': nurse_data.get('team_id'),
             }
-            
-            # # resignation_date 처리
-            # if nurse_data.get('resignation_date'):
-            #     if isinstance(nurse_data['resignation_date'], str):
-            #         nurse_dict['resignation_date'] = datetime.strptime(
-            #             nurse_data['resignation_date'], '%Y-%m-%d'
-            #         ).date()
-            #     else:
-            #         nurse_dict['resignation_date'] = nurse_data['resignation_date']
-            
+
             nurses.append(Nurse(**nurse_dict))
         
         return nurses
@@ -1374,7 +1367,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.Add(iso <= 1-X(n,d+1,off))
             obj.append(-100*iso)
  
-    # (4-6) 프리셉터 보너스 항 모듈화
+    # (4-6) 프리셉터/팀 보너스 항 모듈화
     if include_pair_objective:
         obj.extend(_add_preceptor_objective_terms(m, rs, X, join, leave))
         obj.extend(_add_team_balance_objective_terms(m, rs, X, join, leave))
@@ -1572,73 +1565,111 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
 
 
 def _add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave):
-    """같은 팀 간호사들이 동일 교대를 함께 하도록 유도하는 soft objective."""
-    obj_terms = []
+    """
+    옵션 A 구현: 팀별 '대표 교대'를 일자 단위로 선택하고(Y),
+    팀원들이 해당 교대로 최대한 정렬되도록(Z=AND(X,Y)) 보너스를 부여합니다.
+
+    또한 대표 교대(Y)의 월간 분포가 전체 요구량 비율을 따르도록 편차 패널티를 추가합니다.
+    (→ "비율에 따라 포커싱할 shift를 결정" + "결정된 shift로 팀원들이 같은 shift가 되도록")
+    """
+    print('add_team_balance_objective_terms!!!')
+    obj_terms: list = []
     cfg = rs.config
     if not getattr(cfg, "team_balance_enable", False):
+        print('no proceeded!!!')
         return obj_terms
-    weight = int(getattr(cfg, "team_balance_weight", 0) or 0)
+    # weight = int(getattr(cfg, "team_balance_weight", 0) or 0)
+    weight = 10
     if weight <= 0:
         return obj_terms
-    top_days = int(getattr(cfg, "team_balance_top_days", 0) or 0)
-    if top_days <= 0:
-        top_days = 8
+
+    # 사용할 교대 집합(OFF 제외)
     focus_codes = getattr(cfg, "team_balance_focus_shifts", None)
     if focus_codes:
-        shift_codes = [code for code in focus_codes if code in rs.config.daily_shift_requirements.keys()]
+        print('focus_codes!!!', focus_codes)
+        shift_codes = [c for c in focus_codes if c in rs.config.daily_shift_requirements.keys()]
     else:
         shift_codes = list(rs.config.daily_shift_requirements.keys())
-    shift_indices = [rs.config.shift_types.index(code) for code in shift_codes if code in rs.config.shift_types]
-    if not shift_indices:
+        print('shift_codes!!!', shift_codes)
+    shift_codes = [c for c in shift_codes if c in rs.config.shift_types and c != "O"]
+    if not shift_codes:
         return obj_terms
+    shift_indices = [rs.config.shift_types.index(c) for c in shift_codes]
 
+    # 모드 기반 교대 가중치 (없으면 balanced)
+    shift_weights = getattr(cfg, "team_balance_shift_weights", {}) or {"D": 1.0, "E": 1.0, "N": 1.0}
+
+    # 팀 구성
     team_members: dict[str, list[int]] = {}
     for idx, nurse in enumerate(rs.nurses):
         team_id = getattr(nurse, "team_id", None)
         if team_id in (None, "", 0):
             continue
         team_members.setdefault(str(team_id), []).append(idx)
-
     if not team_members:
         return obj_terms
 
-    pref = rs.preference_matrix
-    pref_threshold = 0.5
-    for team_id, members in team_members.items():
-        if len(members) < 2:
-            continue
-        members = sorted(members)
-        for i in range(len(members)):
-            for j in range(i + 1, len(members)):
-                n1, n2 = members[i], members[j]
-                overlap_start = max(join[n1], join[n2])
-                overlap_end = min(leave[n1], leave[n2])
-                if overlap_start > overlap_end:
-                    continue
-                scored: list[tuple[float, int, int]] = []
-                for d in range(overlap_start, overlap_end + 1):
-                    best_score = None
-                    best_shift = None
-                    for s in shift_indices:
-                        score = pref[n1, d, s] + pref[n2, d, s]
-                        if score <= pref_threshold:
-                            continue
-                        if best_score is None or score > best_score:
-                            best_score = score
-                            best_shift = s
-                    if best_score is None:
-                        continue
-                    scored.append((best_score, d, best_shift))
-                if not scored:
-                    continue
-                limit = min(top_days, len(scored))
-                for _, d, s in sorted(scored, reverse=True)[:limit]:
-                    z = m.NewBoolVar(f"team_pair_{team_id}_{n1}_{n2}_{d}_{s}")
-                    m.Add(z <= X(n1, d, s))
-                    m.Add(z <= X(n2, d, s))
-                    obj_terms.append(weight * z)
-    return obj_terms
+    # 전체 요구량 비율 계산(월간)
+    total_required = {code: 0 for code in shift_codes}
+    ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+    if isinstance(ds_by_day, list) and ds_by_day:
+        for dm in ds_by_day:
+            for code in shift_codes:
+                total_required[code] += int(dm.get(code, cfg.daily_shift_requirements.get(code, 0)))
+    else:
+        for code in shift_codes:
+            total_required[code] = int(cfg.daily_shift_requirements.get(code, 0)) * rs.num_days
+    sum_required = max(1, sum(total_required.values()))
+    ratio = {code: (total_required[code] / sum_required) for code in shift_codes}
+    print('ratio!!!', ratio)
+    # 가중치 분리: 정렬 보너스(같은 shift)와 분포 패널티(비율)
+    align_w = int(weight)
+    dist_w = max(1, int(weight * 0.6))
 
+    # 1) 팀-일자 대표 교대 선택 변수 Y(team, day, shift)
+    # 2) 팀원 정렬 변수 Z = AND(X, Y) 로 보너스 부여
+    for team_id, members in team_members.items():
+        if not members:
+            continue
+
+        # Y 생성 및 일자별 ExactlyOne
+        Y: dict[tuple[int, int], object] = {}
+        for d in range(rs.num_days):
+            ys = []
+            for s in shift_indices:
+                y = m.NewBoolVar(f"y_{team_id}_{d}_{s}")
+                Y[(d, s)] = y
+                ys.append(y)
+            m.AddExactlyOne(ys)
+
+        # 분포 패널티: 월간 Y 분포가 ratio를 따르도록
+        for code in shift_codes:
+            s_idx = rs.config.shift_types.index(code)
+            cnt = m.NewIntVar(0, rs.num_days, f"yCnt_{team_id}_{code}")
+            m.Add(cnt == sum(Y[(d, s_idx)] for d in range(rs.num_days)))
+            target = int(round(rs.num_days * ratio.get(code, 0.0)))
+            dev_pos = m.NewIntVar(0, rs.num_days, f"yDevP_{team_id}_{code}")
+            dev_neg = m.NewIntVar(0, rs.num_days, f"yDevN_{team_id}_{code}")
+            m.Add(dev_pos - dev_neg == cnt - target)
+            w_code = float(shift_weights.get(code, 1.0))
+            obj_terms.append(-int(dist_w * w_code) * dev_pos)
+            obj_terms.append(-int(dist_w * w_code) * dev_neg)
+
+        # 정렬 보너스: 팀원들이 대표 교대 Y를 따라가도록 Z=AND(X,Y) 보너스
+        for n in members:
+            for d in range(join[n], leave[n] + 1):
+                for code in shift_codes:
+                    s = rs.config.shift_types.index(code)
+                    y = Y[(d, s)]
+                    z = m.NewBoolVar(f"tz_{team_id}_{n}_{d}_{s}")
+                    # z == X(n,d,s) AND y
+                    m.Add(z <= X(n, d, s))
+                    m.Add(z <= y)
+                    m.Add(z >= X(n, d, s) + y - 1)
+                    w_code = float(shift_weights.get(code, 1.0))
+                    obj_terms.append(int(align_w * w_code) * z)
+
+    return obj_terms
 
 cp_sat_engine = CPSATBasicEngine()
 

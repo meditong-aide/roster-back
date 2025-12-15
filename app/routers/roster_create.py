@@ -90,6 +90,7 @@ async def generate_roster_endpoint(
     try:
         return generate_roster_service(req, current_user, db)
     except Exception as e:
+        print('error', e)
         raise HTTPException(status_code=500, detail=f"근무표 생성 실패: {str(e)}")
 
 
