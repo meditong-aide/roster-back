@@ -105,30 +105,19 @@ async def get_config_versions(
     """현재 대상 그룹의 설정 버전 목록 조회 (HN/ADM)."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-
-    # 대상 그룹/오피스 결정
-    if current_user.is_head_nurse and current_user.group_id:
-        office_id = current_user.office_id
-        target_group_id = current_user.group_id
+    if current_user.is_master_admin:
+        target_group_id = group_id
+        target_office_id = current_user.office_id
     else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        office_id = g.office_id
-        target_group_id = g.group_id
+        target_group_id = current_user.group_id
+        target_office_id = current_user.office_id
     
     try:
         versions = db.query(
             RosterConfigModel.config_id,
             func.max(RosterConfigModel.created_at).label('latest_created_at')
         ).filter(
-            RosterConfigModel.office_id == office_id,
+            RosterConfigModel.office_id == target_office_id,
             RosterConfigModel.group_id == target_group_id,
             RosterConfigModel.config_id.isnot(None)
         ).group_by(RosterConfigModel.config_id).order_by(
@@ -146,31 +135,17 @@ async def get_config_by_version(
     db: Session = Depends(get_db)
 ):
     """Get the latest config for a specific version"""
+    print('[/config/version/{config_version}] group_id', group_id)
+    print('[/config/version/{config_version}] current_user', current_user.__dict__)
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-
-    is_admin = bool(getattr(current_user, 'is_master_admin', False))
-
-    # Resolve target office/group based on role and optional query param
-    target_office_id: Optional[str] = None
-    target_group_id: Optional[str] = None
-
-    if current_user.is_head_nurse and current_user.group_id:
+    if current_user.is_master_admin:
+        target_group_id = group_id
         target_office_id = current_user.office_id
-        target_group_id = current_user.group_id
     else:
-        if not is_admin:
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        # Optional safety: ensure admin belongs to same office if present
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
-        target_office_id = g.office_id
+        target_group_id = current_user.group_id
+        target_office_id = current_user.office_id
+
     # load latest config for target
     config = db.query(RosterConfigModel).filter(
         RosterConfigModel.office_id == target_office_id,
@@ -179,16 +154,13 @@ async def get_config_by_version(
     try:
         if not config:
             # Use resolved target identifiers (HN: own group, ADM: provided group_id)
-            office_id = target_office_id
-            gid = target_group_id
-            if office_id is None or gid is None:
-                raise HTTPException(status_code=400, detail="group_id (and office_id) required")
+
             cfg = DEFAULT_CONFIG
             # DEFAULT 설정으로 RosterConfig 레코드 생성 및 저장
             new_config = RosterConfigModel(
                 # config_version="default",
-                office_id=office_id,
-                group_id=gid,
+                office_id=target_office_id,
+                group_id=target_group_id,
                 # day_req=cfg.daily_shift_requirements.get('D', 3),
                 # eve_req=cfg.daily_shift_requirements.get('E', 3),
                 # nig_req=cfg.daily_shift_requirements.get('N', 2),

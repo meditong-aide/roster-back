@@ -728,6 +728,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
 
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
+    cp_sat_result = None
     try:
         nurses_dict = [n.__dict__ for n in nurses_in_group]
         # prefs_dict = [p.__dict__ for p in preferences]
@@ -758,6 +759,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             config_dict['fixed_cells'] = norm_fixed
     except Exception as e:
         print(f"error: {e}")
+        raise
     # cross-month 경계 제약 생성 및 주입
     try:
         initial_constraints = build_cross_month_constraints(
@@ -779,6 +781,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
     except Exception as e:
         print(f"error: {e}")
+        raise
     if isinstance(cp_sat_result, dict) and "roster" in cp_sat_result:
         return (
             cp_sat_result["roster"],
@@ -878,6 +881,50 @@ def _apply_preceptor_gauge(config_dict: dict, gauge: int | None) -> None:
     # print(f"[프리셉터 게이지] g={g} → strength={strength}x, top_k={top_k}, min_w={min_w}, focus={config_dict['preceptor_focus_shifts']}")
     print(f"[프리셉터 게이지] g={g} → strength={strength}x, top_k={top_k}, min_w={min_w}")
 
+
+def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
+    """
+    팀 균등/집중 보너스 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
+    - enable이 False이면 weight/top_days를 0으로 초기화
+    """
+    enable_flag = bool(config_dict.get("team_balance_enable", False))
+    g = gauge if gauge is not None else config_dict.get("team_balance_gauge", 0)
+    g = max(0, min(10, int(g or 0)))
+    enable = enable_flag and g > 0
+    config_dict["team_balance_gauge"] = g
+    config_dict["team_balance_enable"] = enable
+
+    # 정규화된 팀 보너스 강도(soft) 매핑:
+    # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
+    # 식: weight = round(cap * (g/10)^p)
+    # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
+    cap = int(config_dict.get("team_balance_weight_cap", 240) or 240)
+    power = float(config_dict.get("team_balance_weight_power", 1.7) or 1.7)
+    cap = max(0, min(500, cap))  # 안전 상한(임의 폭주 방지)
+    power = max(0.5, min(3.0, power))
+
+    if enable:
+        g_norm = g / 10.0
+        config_dict["team_balance_weight"] = int(round(cap * (g_norm ** power)))
+        config_dict["team_balance_top_days"] = int(6 + (30 - 6) * g_norm)
+    else:
+        config_dict["team_balance_weight"] = 0
+        config_dict["team_balance_top_days"] = 0
+    if "team_balance_focus_shifts" not in config_dict:
+        config_dict["team_balance_focus_shifts"] = None
+    if "team_balance_mode" not in config_dict:
+        config_dict["team_balance_mode"] = "balanced"
+
+    # 모드별 교대 가중치가 비어있으면 기본값을 채운다.
+    if not config_dict.get("team_balance_shift_weights"):
+        mode = str(config_dict.get("team_balance_mode", "balanced") or "balanced").lower()
+        if mode == "focus_d":
+            config_dict["team_balance_shift_weights"] = {"D": 1.5, "E": 0.6, "N": 0.3}
+        elif mode == "focus_de":
+            config_dict["team_balance_shift_weights"] = {"D": 1.2, "E": 1.2, "N": 0.5}
+        else:
+            config_dict["team_balance_shift_weights"] = {"D": 1.0, "E": 1.0, "N": 1.0}
+
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
 def generate_roster_service(req: RosterRequest, current_user, db: Session):
@@ -911,6 +958,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──
     
     _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
+    _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
     # 경계 제약 기능 기본값
     config_dict.setdefault('cross_month_hard_rules_enable', True)
     config_dict.setdefault('cross_month_lookback_days', 6)
@@ -1013,6 +1061,7 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 (고정 생성에도 동일 적용) ──
     _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
+    _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
     # 경계 제약 기능 기본값 및 충돌 정책(hold는 기본 차단)
     config_dict.setdefault('cross_month_hard_rules_enable', True)
     config_dict.setdefault('cross_month_lookback_days', 6)

@@ -76,10 +76,44 @@ class NurseRosterConfig:
     # --- Oversupply(여유 인원) 균등화 제어 ---
     oversupply_equalize_enable: bool = True  # 일별 D/E/N 초과 인원(L1) 균등화 활성화
     oversupply_equalize_weight: int = 120    # L1 차이 패널티 가중치(클수록 균등화 강함)
+    # --- 팀 균등/집중 분배 옵션 ---
+    team_balance_enable: bool = False               # 팀 보너스 활성화
+    team_balance_gauge: int = 0                     # 0~10 게이지
+    team_balance_weight: int = 0                    # 계산된 기본 가중치
+    team_balance_top_days: int = 0                  # 동일 교대 보너스에서 고려할 상위 일수
+    team_balance_focus_shifts: Optional[List[str]] = None  # 교대 제한 (없으면 D/E/N)
+    team_balance_mode: str = "balanced"             # balanced | focus_D | focus_DE
+    team_balance_shift_weights: Dict[str, float] = field(default_factory=dict)  # 모드별 파생 가중치
     
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
+        # 팀 게이지 → 가중치/탑K
+        gauge = max(0, min(10, int(self.team_balance_gauge or 0)))
+        if not self.team_balance_enable or gauge == 0:
+            self.team_balance_weight = 0
+            self.team_balance_top_days = 0
+        else:
+            if not self.team_balance_weight:
+                # 정규화된 팀 보너스 강도(soft) 매핑:
+                # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
+                # 식: weight = round(cap * (g/10)^p)
+                # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
+                cap = 240
+                power = 1.7
+                g_norm = gauge / 10.0
+                self.team_balance_weight = int(round(cap * (g_norm ** power)))
+            if not self.team_balance_top_days:
+                self.team_balance_top_days = int(6 + (30 - 6) * (gauge / 10.0))
+        # 모드 기반 shift weight 설정 (없을 때만 세팅)
+        if not self.team_balance_shift_weights:
+            mode = (self.team_balance_mode or "balanced").lower()
+            if mode == "focus_d":
+                self.team_balance_shift_weights = {"D": 1.5, "E": 0.6, "N": 0.3}
+            elif mode == "focus_de":
+                self.team_balance_shift_weights = {"D": 1.2, "E": 1.2, "N": 0.5}
+            else:
+                self.team_balance_shift_weights = {"D": 1.0, "E": 1.0, "N": 1.0}
             
     @property
     def shift_types(self) -> List[str]:
