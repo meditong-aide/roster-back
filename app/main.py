@@ -30,6 +30,7 @@ from routers import (
     teams,
     groups,
     push,
+    grade,
 )
 from routers.contact import contact_router
 from routers.message import message_router
@@ -91,6 +92,7 @@ app.include_router(dashboard.router)
 app.include_router(daily_shift_router.router)
 app.include_router(teams.router)
 app.include_router(groups.router)
+app.include_router(grade.router)
 
 import uvicorn
 

@@ -180,6 +180,23 @@ class RosterConfig(Base):
     office = relationship("Office")
     group = relationship("Group")
 
+
+class RosterGradeConfig(Base):
+    __tablename__ = 'roster_grade_config'
+
+    config_id = Column(INTEGER, primary_key=True, autoincrement=True)
+    office_id = Column(VARCHAR(50), nullable=False)
+    group_id = Column(VARCHAR(50), nullable=False)
+    null_grade_policy = Column(VARCHAR(20), nullable=False, default='LOWEST')
+    constraints_json = Column(JSON, nullable=True)
+    use_dynamic_scaling = Column(TINYINT, nullable=False, default=1)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('office_id', 'group_id', name='ux_grade_config_office_group'),
+    )
+
 class Wanted(Base):
     __tablename__ = 'wanted'
     group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), primary_key=True)
