@@ -55,8 +55,9 @@ class ShiftAddRequest(BaseModel):
 class RosterRequest(BaseModel):
     year: int
     month: int
-    algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
+    # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
+    grade_strategy: str = "GRADE"  # "GRADE" 또는 "TEAM"
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
 
 class PreferenceSubmit(BaseModel):
