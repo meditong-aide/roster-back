@@ -551,6 +551,7 @@ async def get_schedule_versions(
         "status": schedule.status,
         "created_at": schedule.created_at.isoformat() if schedule.created_at else None,
         "created_by": schedule.created_by,
+        "updated_at": schedule.updated_at.isoformat() if schedule.updated_at else None,
         "name": schedule.name
     } for schedule in schedules]
 
