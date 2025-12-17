@@ -314,6 +314,14 @@ class CPSATBasicEngine:
             roster_system = RosterSystem(nurses, target_month, config)
             # 고정된 셀 정보 처리
             fixed_cells = list(config_data.get('fixed_cells', []) or [])
+            # 주휴 등 휴무류 코드는 엔진에서 'O'로만 취급한다. (shift_types=['D','E','N','O'])
+            for c in fixed_cells:
+                try:
+                    shift_code = str(c.get('shift') or '').upper()
+                except Exception:
+                    shift_code = ''
+                if shift_code in ('OFF', '주'):
+                    c['shift'] = 'O'
             # ── 경계 제약(강제 OFF/금지) 병합 ──
             initial_constraints = config_data.get('initial_constraints') or {}
             allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
@@ -480,64 +488,46 @@ class CPSATBasicEngine:
         if randomize:
             run_seed = seed if seed is not None else ((int(time.time()*1000) ^ random.getrandbits(31)) & 0x7fffffff)
         # ① 0.3× time_limit 으로 “전체 모델” 한번 돌려 feasible 확보
-        print(1)
         base_tl = max(5, int(time_limit_seconds*0.3))
         feasible = self._quick_initial_solve(
             roster_system, base_tl, grouped, run_seed)
-        print(2)
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
             'shift_requirement', 'max_consecutive_night',
             'max_consecutive_work', 'night_after_limit',
             'day_after_evening', 'night_monthly_limit'
         }
-        print(3)
         def hard_violation_cnt():
             return sum(1 for v in roster_system._find_violations()
                        if v['type'] in HARD_TYPES)
-        print(4)
         best_viol = hard_violation_cnt()
-        print(5)
         best_roster = roster_system.roster.copy()
-        print(6)
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
                                       roster_system.num_days)
-        print(7)
         remaining = time_limit_seconds - base_tl
         per_iter  = 8          # neighbourhood solve 8 초
         max_iter  = max(1, remaining // per_iter)
-        print(8)
         if max_iter==0:
-            print(9)
             return best_viol==0
-        print(10)
         for it in range(max_iter):
             try:
                 n_sel, d_sel = policy.select()
-                print(11)
                 ok = _solve_neighbourhood(roster_system, n_sel, d_sel,
                                       per_iter, grouped, run_seed, it = it)
-                print(12)
             except Exception as e:
-                print(e)
+                print(f"{self.logger_prefix} 근무표 생성 중 오류: {e}")
+                raise e
             if not ok: policy.update(False, n_sel, d_sel); continue
             curr_viol = hard_violation_cnt()
-            print(13)
             improved  = curr_viol < best_viol
-            print(14)
             if improved:
                 best_viol = curr_viol;  best_roster = roster_system.roster.copy()
-                print(15)
             else:  # rollback
-                print(16)
                 roster_system.roster = best_roster.copy()
             policy.update(improved, n_sel, d_sel)
-            print(17)
             if best_viol==0: break
-        print(18)
         roster_system.roster = best_roster
-        print(19)
         return best_viol==0
 
 

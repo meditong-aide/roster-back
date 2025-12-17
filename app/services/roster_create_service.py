@@ -3,14 +3,18 @@
 - DB 쿼리, 데이터 가공, 엔진 호출 등 라우터에서 분리
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
+from __future__ import annotations
+
 from sqlalchemy.orm import Session
 from db.models import Nurse, ShiftPreference, RosterConfig, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage, Schedule, NurseShiftRequest, NursePairRequest, WantedRequest, DailyShift
 from schemas.roster_schema import RosterRequest
 from routers.utils import get_days_in_month, Timer
-from datetime import date
+from datetime import date, datetime, timedelta
 import uuid
 from sqlalchemy import func
 from collections import defaultdict
+import calendar
+from sqlalchemy import text
 from db.client2 import get_db
 # from db.client2 import _get_mssql_session
 
@@ -226,7 +230,8 @@ def _normalize_to_main(code: str, code2main: dict) -> str:
     if not code:
         return '-'
     c = str(code).upper()
-    if c in ('O', 'OFF'):
+    # 주휴('주')는 엔진/검증/제약에서 휴무(O)로 동일 취급한다.
+    if c in ('O', 'OFF', '주'):
         return 'O'
     return code2main.get(c, c)
 
@@ -235,6 +240,328 @@ def _get_prev_year_month(year: int, month: int) -> tuple[int, int]:
     if month > 1:
         return year, month - 1
     return year - 1, 12
+
+
+def _calc_months_diff(base_year: int, base_month: int, target_year: int, target_month: int) -> int:
+    """기준 연월에서 대상 연월까지의 월 차이를 반환한다.
+
+    Args:
+        base_year: 기준 연도
+        base_month: 기준 월(1~12)
+        target_year: 대상 연도
+        target_month: 대상 월(1~12)
+
+    Returns:
+        월 차이(음수 가능)
+    """
+    return (target_year - base_year) * 12 + (target_month - base_month)
+
+
+def _calc_weekly_off_weekday_by_month(
+    base_weekday: int,
+    shift_variation: int,
+    base_year: int,
+    base_month: int,
+    target_year: int,
+    target_month: int,
+) -> int:
+    """월 단위 weekday rolling(shift rotation)으로 타깃 월의 주휴 요일을 계산한다.
+
+    수식:
+        weekday = (base_weekday + months_diff * shift_variation) % 7
+        (예: base=수(2), shift_variation=-1, months_diff=2 → 월(0))
+
+    Args:
+        base_weekday: 기준 월의 요일(0=월..6=일)
+        shift_variation: 누적 이동 값(예: -1)
+        base_year: 기준 연도
+        base_month: 기준 월
+        target_year: 대상 연도
+        target_month: 대상 월
+
+    Returns:
+        대상 월에 적용될 주휴 요일(0~6)
+    """
+    months_diff = _calc_months_diff(base_year, base_month, target_year, target_month)
+    return (base_weekday + months_diff * shift_variation) % 7
+
+
+def _calc_weekly_off_weekday_by_week(
+    base_weekday: int,
+    shift_variation: int,
+    cycle_start_date: date,
+    target_date: date,
+    cycle_interval_weeks: int,
+) -> int:
+    """주 단위 weekday rolling(shift rotation)으로 타깃 날짜가 속한 주의 주휴 요일을 계산한다.
+
+    - ISO week 기준이 아니라 **cycle_start_date 기준 N*7일 경과**로 계산한다.
+    - target_date < cycle_start_date 인 경우 days_diff/steps가 음수가 될 수 있으나,
+      modulo 7에 의해 요일은 수학적으로 정상 순환한다.
+
+    Args:
+        base_weekday: 기준 요일(0=월..6=일)
+        shift_variation: 누적 이동 값
+        cycle_start_date: 주기 기준 시작일
+        target_date: 대상 날짜
+        cycle_interval_weeks: 주기 간격(주). 1 이상만 유효.
+
+    Returns:
+        대상 주에 적용될 주휴 요일(0~6)
+    """
+    interval = max(1, int(cycle_interval_weeks or 1))
+    days_diff = (target_date - cycle_start_date).days
+    weeks_diff = days_diff // 7
+    steps = weeks_diff // interval
+    return (base_weekday + steps * shift_variation) % 7
+
+
+def _table_exists(db: Session, table_name: str) -> bool:
+    """MSSQL 기준으로 테이블 존재 여부를 확인한다."""
+    try:
+        row = db.execute(
+            text(
+                "SELECT 1 AS ok FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = :t"
+            ),
+            {"t": table_name},
+        ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _column_exists(db: Session, table_name: str, column_name: str) -> bool:
+    """MSSQL 기준으로 컬럼 존재 여부를 확인한다."""
+    try:
+        row = db.execute(
+            text(
+                "SELECT 1 AS ok FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = :t AND COLUMN_NAME = :c"
+            ),
+            {"t": table_name, "c": column_name},
+        ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _weekday_dates_in_month(year: int, month: int, weekday: int) -> list[int]:
+    """해당 월에서 특정 요일(0=월..6=일)에 해당하는 day_idx(0-based) 목록을 반환한다."""
+    days = calendar.monthrange(year, month)[1]
+    result: list[int] = []
+    for d in range(1, days + 1):
+        if date(year, month, d).weekday() == weekday:
+            result.append(d - 1)
+    return result
+
+
+def _compute_weekly_off_day_indices_for_month(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+) -> tuple[dict[str, set[int]], list[dict]]:
+    """주휴 설정을 기반으로 대상 월의 주휴 날짜를 계산한다.
+
+    Returns:
+        (nurse_id_to_day_indices, warnings)
+
+    주의:
+        - weekly_off_settings/nurses 컬럼이 실제 DB에 없으면 빈 결과를 반환한다(기능 비활성).
+        - 엔진에는 OFF('O')로 고정 셀을 넣고, 저장 시 해당 날짜만 '주'로 마킹하는 방식이 안전하다.
+    """
+    warnings: list[dict] = []
+    nurse_to_days: dict[str, set[int]] = {}
+
+    if not _table_exists(db, "weekly_off_settings"):
+        return nurse_to_days, warnings
+
+    # nurses 테이블에 주휴 컬럼이 없으면 기능을 스킵(런타임 안전)
+    if not _column_exists(db, "nurses", "weekly_off_weekday"):
+        return nurse_to_days, warnings
+
+    # 설정 조회
+    try:
+        setting = db.execute(
+            text(
+                "SELECT TOP 1 "
+                "activate, use_variable_cycle, cycle_type, base_year, base_month, "
+                "cycle_start_date, cycle_interval, shift_variation "
+                "FROM weekly_off_settings "
+                "WHERE office_id = :office_id AND group_id = :group_id"
+            ),
+            {"office_id": office_id, "group_id": group_id},
+        ).fetchone()
+    except Exception as e:
+        warnings.append({"type": "settings_query_failed", "detail": str(e)})
+        return nurse_to_days, warnings
+
+    if not setting:
+        return nurse_to_days, warnings
+
+    activate = bool(setting.activate)
+    if not activate:
+        return nurse_to_days, warnings
+
+    use_variable_cycle = bool(getattr(setting, "use_variable_cycle", False))
+    cycle_type = (getattr(setting, "cycle_type", "month") or "month").lower()
+    base_year = int(getattr(setting, "base_year", 0) or 0)
+    base_month = int(getattr(setting, "base_month", 0) or 0)
+    cycle_start_date = getattr(setting, "cycle_start_date", None)
+    cycle_interval = int(getattr(setting, "cycle_interval", 1) or 1)
+    shift_variation = int(getattr(setting, "shift_variation", -1) or -1)
+
+    # base_year/base_month가 비어있으면 안전하게 '대상 월'로 잡는다(누적 이동 0)
+    if base_year < 1 or base_month < 1:
+        base_year, base_month = year, month
+
+    # 간호사 주휴 요일 조회
+    # weekly_off_enabled 컬럼은 선택(없어도 weekday null 여부로 판단)
+    has_enabled_col = _column_exists(db, "nurses", "weekly_off_enabled")
+    try:
+        if has_enabled_col:
+            rows = db.execute(
+                text(
+                    "SELECT nurse_id, weekly_off_enabled, weekly_off_weekday "
+                    "FROM nurses WHERE group_id = :group_id AND active = 1"
+                ),
+                {"group_id": group_id},
+            ).fetchall()
+        else:
+            rows = db.execute(
+                text(
+                    "SELECT nurse_id, weekly_off_weekday "
+                    "FROM nurses WHERE group_id = :group_id AND active = 1"
+                ),
+                {"group_id": group_id},
+            ).fetchall()
+    except Exception as e:
+        warnings.append({"type": "nurses_query_failed", "detail": str(e)})
+        return nurse_to_days, warnings
+
+    for r in rows:
+        nurse_id = str(r.nurse_id)
+        enabled = True
+        if has_enabled_col:
+            enabled = bool(getattr(r, "weekly_off_enabled", 0))
+
+        base_weekday = getattr(r, "weekly_off_weekday", None)
+        if not enabled or base_weekday is None:
+            continue
+        base_weekday = int(base_weekday)
+
+        # 계산
+        if not use_variable_cycle:
+            # 변동 주기 OFF → 기준 요일을 그대로 사용
+            month_weekday = base_weekday % 7
+            day_indices = set(_weekday_dates_in_month(year, month, month_weekday))
+            nurse_to_days[nurse_id] = day_indices
+            continue
+
+        if cycle_type == "month":
+            month_weekday = _calc_weekly_off_weekday_by_month(
+                base_weekday=base_weekday,
+                shift_variation=shift_variation,
+                base_year=base_year,
+                base_month=base_month,
+                target_year=year,
+                target_month=month,
+            )
+            nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, month_weekday))
+            continue
+
+        if cycle_type == "week" and cycle_start_date:
+            # 주 단위는 월 전체가 아니라 "주차별"로 요일이 달라질 수 있으므로, 주차 단위로 주휴를 찍는다.
+            # - 각 주(월~일)를 대표하는 기준일을 월요일로 보고, 그 주의 주휴 요일을 계산한다.
+            days = calendar.monthrange(year, month)[1]
+            day_set: set[int] = set()
+            for d in range(1, days + 1):
+                cur = date(year, month, d)
+                # 주 시작일(월요일)
+                week_start = cur - timedelta(days=cur.weekday())
+                w = _calc_weekly_off_weekday_by_week(
+                    base_weekday=base_weekday,
+                    shift_variation=shift_variation,
+                    cycle_start_date=cycle_start_date,
+                    target_date=week_start,
+                    cycle_interval_weeks=cycle_interval,
+                )
+                if cur.weekday() == w:
+                    day_set.add(d - 1)
+            nurse_to_days[nurse_id] = day_set
+            continue
+
+        # 설정이 불완전하면 기준 요일 유지
+        month_weekday = base_weekday % 7
+        nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, month_weekday))
+
+    return nurse_to_days, warnings
+
+
+def _build_engine_nurse_index_map(nurses_in_group: list[Nurse]) -> dict[str, int]:
+    """cp_sat_basic.create_nurses_from_db의 정렬 규칙을 그대로 재현하여 nurse_id→engine_index 맵을 만든다."""
+    rows = []
+    for n in nurses_in_group:
+        rows.append(
+            {
+                "nurse_id": n.nurse_id,
+                "sequence": getattr(n, "sequence", 0) or 0,
+                "experience": getattr(n, "experience", 0) or 0,
+            }
+        )
+    sorted_rows = sorted(
+        rows,
+        key=lambda r: (
+            r.get("sequence", 0),
+            -int(r.get("experience", 0) or 0),
+            str(r.get("nurse_id")),
+        ),
+    )
+    return {r["nurse_id"]: i for i, r in enumerate(sorted_rows)}
+
+
+def _merge_fixed_cells_with_weekly_off(
+    fixed_cells: list[dict] | None,
+    weekly_off_cells: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """고정 셀 리스트를 병합하되, 주휴 고정 셀을 항상 우선 적용한다.
+
+    Returns:
+        (merged_fixed_cells, conflicts)
+    """
+    fixed_cells = list(fixed_cells or [])
+    merged: dict[tuple[int, int], dict] = {}
+    conflicts: list[dict] = []
+
+    def _is_off(code: str | None) -> bool:
+        c = (code or "").upper()
+        return c in ("O", "OFF", "주")
+
+    # 1) 기존 고정 셀을 먼저 적재
+    for c in fixed_cells:
+        key = (c.get("nurse_index"), c.get("day_index"))
+        if key[0] is None or key[1] is None:
+            continue
+        merged[key] = c
+
+    # 2) 주휴 고정 셀로 덮어쓰기(최우선)
+    for wc in weekly_off_cells:
+        key = (wc.get("nurse_index"), wc.get("day_index"))
+        if key[0] is None or key[1] is None:
+            continue
+        prev = merged.get(key)
+        if prev and not _is_off(prev.get("shift")):
+            conflicts.append(
+                {
+                    "nurse_index": key[0],
+                    "day_index": key[1],
+                    "overridden_shift": prev.get("shift"),
+                }
+            )
+        merged[key] = wc
+
+    return list(merged.values()), conflicts
 
 def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: int) -> str | None:
     """이전 달의 최종(issued 우선) schedule_id를 조회한다."""
@@ -411,8 +738,24 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         # ShiftManage 요구인원은 호출부에서 주입한다
 
         # fixed_cells 는 옵션
+        # - '주' 등 휴무류 코드는 엔진에서 'O'로 정규화해야 한다(shift_types=['D','E','N','O']).
         if fixed_cells:
-            config_dict['fixed_cells'] = fixed_cells
+            norm_fixed = []
+            for c in fixed_cells:
+                try:
+                    shift_code = str(c.get('shift') or '').upper()
+                except Exception:
+                    shift_code = ''
+                if shift_code in ('OFF', 'O', '주'):
+                    shift_code = 'O'
+                norm_fixed.append(
+                    {
+                        'nurse_index': c.get('nurse_index'),
+                        'day_index': c.get('day_index'),
+                        'shift': shift_code,
+                    }
+                )
+            config_dict['fixed_cells'] = norm_fixed
     except Exception as e:
         print(f"error: {e}")
     # cross-month 경계 제약 생성 및 주입
@@ -573,6 +916,33 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict.setdefault('cross_month_lookback_days', 6)
     config_dict.setdefault('allow_override_by_law', False)
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
+
+    # ── 주휴 고정 셀(최우선) 계산 후 엔진에 OFF(O)로 주입 ──
+    weekly_off_warnings: list[dict] = []
+    weekly_off_conflicts: list[dict] = []
+    weekly_off_map: dict[str, set[int]] = {}
+    weekly_off_fixed_cells: list[dict] = []
+    try:
+        weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
+            db=db,
+            office_id=current_user.office_id,
+            group_id=current_user.group_id,
+            year=req.year,
+            month=req.month,
+        )
+        if weekly_off_map:
+            nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+            for nurse_id, day_set in weekly_off_map.items():
+                n_idx = nurse_idx_map.get(nurse_id)
+                if n_idx is None:
+                    continue
+                for d in sorted(day_set):
+                    weekly_off_fixed_cells.append(
+                        {"nurse_index": n_idx, "day_index": d, "shift": "O"}
+                    )
+    except Exception as e:
+        weekly_off_warnings.append({"type": "weekly_off_failed", "detail": str(e)})
+
     generated, satisfaction_data, roster_system = _run_cp_sat_basic(
         db,
         current_user,
@@ -581,12 +951,28 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         latest_config,
         req,
         shift_manage_data,
-        fixed_cells=None,
+        fixed_cells=weekly_off_fixed_cells if weekly_off_fixed_cells else None,
         time_limit_seconds=60,
         config_override=config_dict,
     )
+
+    # ── 저장 시 주휴 날짜만 '주'로 마킹(표시용) ──
+    try:
+        if weekly_off_map and isinstance(generated, dict):
+            for nurse_id, day_set in weekly_off_map.items():
+                shifts = generated.get(nurse_id)
+                if not shifts:
+                    continue
+                for d in day_set:
+                    if 0 <= d < len(shifts):
+                        shifts[d] = "주"
+    except Exception as e:
+        weekly_off_warnings.append({"type": "weekly_off_mark_failed", "detail": str(e)})
+
     _persist_entries(db, schedule, generated, req)
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
+    roster_data["weekly_off_conflicts"] = weekly_off_conflicts
+    roster_data["weekly_off_warnings"] = weekly_off_warnings
     return roster_data
 
 
@@ -632,6 +1018,38 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
     config_dict.setdefault('cross_month_lookback_days', 6)
     config_dict.setdefault('allow_override_by_law', False)
     print("cp_sat_basic 엔진으로 고정 셀 반영 근무표 생성 시작")
+
+    # ── 주휴 고정 셀(최우선) 계산 + 기존 고정 셀과 병합 ──
+    weekly_off_warnings: list[dict] = []
+    weekly_off_conflicts: list[dict] = []
+    weekly_off_map: dict[str, set[int]] = {}
+    weekly_off_fixed_cells: list[dict] = []
+    merged_fixed_cells = fixed_cells
+    try:
+        weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
+            db=db,
+            office_id=current_user.office_id,
+            group_id=current_user.group_id,
+            year=req.year,
+            month=req.month,
+        )
+        if weekly_off_map:
+            nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+            for nurse_id, day_set in weekly_off_map.items():
+                n_idx = nurse_idx_map.get(nurse_id)
+                if n_idx is None:
+                    continue
+                for d in sorted(day_set):
+                    weekly_off_fixed_cells.append(
+                        {"nurse_index": n_idx, "day_index": d, "shift": "O"}
+                    )
+            merged_fixed_cells, weekly_off_conflicts = _merge_fixed_cells_with_weekly_off(
+                fixed_cells=fixed_cells,
+                weekly_off_cells=weekly_off_fixed_cells,
+            )
+    except Exception as e:
+        weekly_off_warnings.append({"type": "weekly_off_failed", "detail": str(e)})
+
     generated, satisfaction_data, roster_system = _run_cp_sat_basic(
         db,
         current_user,
@@ -640,12 +1058,28 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
         latest_config,
         req,
         shift_manage_data,
-        fixed_cells=fixed_cells,
+        fixed_cells=merged_fixed_cells,
         time_limit_seconds=300,
         config_override=config_dict,
     )
+
+    # ── 저장 시 주휴 날짜만 '주'로 마킹(표시용) ──
+    try:
+        if weekly_off_map and isinstance(generated, dict):
+            for nurse_id, day_set in weekly_off_map.items():
+                shifts = generated.get(nurse_id)
+                if not shifts:
+                    continue
+                for d in day_set:
+                    if 0 <= d < len(shifts):
+                        shifts[d] = "주"
+    except Exception as e:
+        weekly_off_warnings.append({"type": "weekly_off_mark_failed", "detail": str(e)})
+
     _persist_entries(db, schedule, generated, req)
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
+    roster_data["weekly_off_conflicts"] = weekly_off_conflicts
+    roster_data["weekly_off_warnings"] = weekly_off_warnings
     # print(7)
     # # 기존 로직 유지: 대시보드 분석 데이터 저장 시도 (있으면 사용)
     # try:

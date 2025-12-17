@@ -1118,6 +1118,21 @@ async def validate_roster(
         # OFF(휴무) 도 항상 포함시킴
         alias_map.setdefault('OFF', 'O')
         alias_map.setdefault('O',   'O')
+        # 주휴(표시용)도 휴무(O)로 동일 취급한다.
+        alias_map.setdefault('주', 'O')
+        # Shift 테이블에 휴무 타입이 더 있으면 모두 O로 정규화(예: 병원별 OFF 코드, 주휴 코드 등)
+        try:
+            off_shift_ids = (
+                db.query(Shift.shift_id)
+                .filter(Shift.office_id == office_id, Shift.group_id == target_group_id)
+                .filter(Shift.type.in_(["휴무", "off", "OFF"]))
+                .all()
+            )
+            for (sid,) in off_shift_ids:
+                if sid:
+                    alias_map.setdefault(str(sid).upper(), 'O')
+        except Exception as e:
+            print(f"[validate_roster] 휴무 shift 정규화 로딩 실패: {e}")
         # ──────────────────────── 2. 근무표 설정(인원/제약) 불러오기 ────────────────────────
         latest_config_db = db.query(RosterConfigModel).filter(
             RosterConfigModel.office_id == office_id,
