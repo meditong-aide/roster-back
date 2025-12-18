@@ -216,6 +216,10 @@ async def get_shift_manage(
         db.commit()
 
         shift_manages = query.order_by(ShiftManage.shift_slot.asc()).all()
+        # default_shift에 '주'가 포함된 shift를 shifts 테이블에서 찾아서 shift_manages에 추가
+        shifts = db.query(Shift).filter(Shift.default_shift.like('%주%')).all()
+        for shift in shifts:
+            shift_manages.append({'shift_slot': 4, 'main_code': 'O', 'codes': [shift.default_shift], 'manpower': 0})
 
     return [
         {

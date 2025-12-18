@@ -543,7 +543,6 @@ async def get_schedule_versions(
         Schedule.dropped == False
     ).order_by(Schedule.version.desc()).all()
     print('[roster.py - get_schedule_versions] target_group_id', target_group_id)
-    print('[roster.py - get_schedule_versions] schedules', [s.__dict__ for s in schedules if s is not None])
 
     return [{
         "schedule_id": schedule.schedule_id,
@@ -1126,7 +1125,7 @@ async def validate_roster(
             off_shift_ids = (
                 db.query(Shift.shift_id)
                 .filter(Shift.office_id == office_id, Shift.group_id == target_group_id)
-                .filter(Shift.type.in_(["휴무", "off", "OFF"]))
+                .filter(Shift.type.in_(["휴무"]))
                 .all()
             )
             for (sid,) in off_shift_ids:
