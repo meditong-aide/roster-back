@@ -780,19 +780,33 @@ class CPSATBasicEngine:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
                     for d in range(T0 + 2, T1 - 1):
-                        sum_n = sum(X(n, d - t, night_idx) for t in (0, 1, 2))
-                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)
+                        # (N_d-2 ∧ N_d-1 ∧ N_d)일 때, 다음 2일 OFF 부족량(0~2)을 패널티로 둔다.
+                        xn0 = X(n, d, night_idx)
+                        xn1 = X(n, d - 1, night_idx)
+                        xn2 = X(n, d - 2, night_idx)
+                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)  # 0..2
                         miss = m.NewIntVar(0, 2, f'rec3n2o_{n}_{d}')
-                        m.Add(miss >= sum_n - 2 - need)
+                        # 연속 3N이 아니면 miss=0 (패널티 없음)
+                        m.Add(miss == 0).OnlyEnforceIf(xn0.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn1.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn2.Not())
+                        # 연속 3N이면 miss == 2 - need
+                        m.Add(miss == 2 - need).OnlyEnforceIf([xn0, xn1, xn2])
                         safety['rec_3n2o'].append(miss)
             if cfg.two_offs_after_two_nig:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
                     for d in range(T0 + 1, T1 - 1):
-                        sum_n = sum(X(n, d - t, night_idx) for t in (0, 1))
-                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)
+                        # (N_d-1 ∧ N_d)일 때, 다음 2일 OFF 부족량(0~2)을 패널티로 둔다.
+                        xn0 = X(n, d, night_idx)
+                        xn1 = X(n, d - 1, night_idx)
+                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)  # 0..2
                         miss = m.NewIntVar(0, 2, f'rec2n2o_{n}_{d}')
-                        m.Add(miss >= sum_n - 1 - need)
+                        # 연속 2N이 아니면 miss=0 (패널티 없음)
+                        m.Add(miss == 0).OnlyEnforceIf(xn0.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn1.Not())
+                        # 연속 2N이면 miss == 2 - need
+                        m.Add(miss == 2 - need).OnlyEnforceIf([xn0, xn1])
                         safety['rec_2n2o'].append(miss)
 
             # 금지 패턴 N-O-D/E
@@ -1299,14 +1313,20 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             pass
 
         # N2/3→2OFF
+        # 주의: "N 2회/3회 후 OFF 2회"는 다음 2일이 모두 OFF여야 한다.
+        # 기존 구현은 (sum_n - 1 <= off1 + off2) 형태여서 연속 N일 때 OFF 1개만 허용되는 버그가 있었다.
         if cfg.two_offs_after_three_nig:
-            for d in range(T0+2,T1-1):
-                m.Add(sum(X(n,d-t,night) for t in (0,1,2))-2
-                      <= X(n,d+1,off)+X(n,d+2,off))
+            for d in range(T0 + 2, T1 - 1):
+                # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
+                m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
+                    [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
+                )
         if cfg.two_offs_after_two_nig:
-            for d in range(T0+1,T1-1):
-                m.Add(sum(X(n,d-t,night) for t in (0,1))-1
-                      <= X(n,d+1,off)+X(n,d+2,off))
+            for d in range(T0 + 1, T1 - 1):
+                # (N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
+                m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
+                    [X(n, d, night), X(n, d - 1, night)]
+                )
 
     # ───────────── 4. Soft (패널티 변수) ───────
     obj=[]
