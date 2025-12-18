@@ -44,7 +44,6 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
             .order_by(Shift.sequence.asc())
             .all()
         )
-        print('shifts', [s.shift_id for s in shifts])
         if shifts:
             
             return [

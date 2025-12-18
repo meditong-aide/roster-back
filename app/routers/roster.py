@@ -297,7 +297,6 @@ async def get_latest_schedule(
             target_group_id = group_id
         else:
             target_group_id = current_user.group_id
-        print('[/latest] target_group_id', target_group_id)
         return get_latest_schedule_service(current_user, db, override_group_id=target_group_id)
     except Exception as e:
         print('[DEBUG] [roster.py - get_latest_schedule] current_user', current_user.__dict__)
