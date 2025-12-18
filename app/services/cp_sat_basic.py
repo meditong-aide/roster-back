@@ -73,6 +73,14 @@ class CPSATBasicEngine:
             'N': 7.0,  # Night Keep은 더 높은 가중치
             'O': 10.0
         })
+        team_balance_enable = bool(config_data.get('team_balance_enable', False))
+        team_balance_gauge = int(config_data.get('team_balance_gauge', 0) or 0)
+        # team_balance_weight = int(config_data.get('team_balance_weight', 0) or 0)
+        # team_balance_top_days = int(config_data.get('team_balance_top_days', 0) or 0)
+        team_balance_focus = config_data.get('team_balance_focus_shifts')
+        team_balance_mode = config_data.get('team_balance_mode', 'balanced')
+        team_balance_shift_weights = config_data.get('team_balance_shift_weights') or {}
+
         cfg = NurseRosterConfig(
             daily_shift_requirements = config_data['daily_shift_requirements'],
             # daily_shift_requirements={
@@ -107,6 +115,19 @@ class CPSATBasicEngine:
             preceptor_top_days=config_data.get('preceptor_top_days', 12),
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
+            # team_balance_enable=team_balance_enable,
+            team_balance_enable=True, # test
+            team_balance_gauge=10, # test
+            # team_balance_gauge=team_balance_gauge,
+            # team_balance_weight=team_balance_weight,
+            # team_balance_weight=100, # test
+            # team_balance_top_days=team_balance_top_days,
+            team_balance_top_days=30,
+            # team_balance_top_days=30, # test
+            team_balance_focus_shifts=team_balance_focus,
+            # team_balance_focus_shifts=['D', 'E', 'N'], # test
+            team_balance_mode=team_balance_mode,
+            team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
             max_extra_off_days=int(config_data.get('max_extra_off_days', 2)),
             # 여유 인원 균등화 제어
@@ -171,17 +192,9 @@ class CPSATBasicEngine:
                 'remaining_off_days': 0,  # 초기화, 나중에 계산됨
                 'joining_date': _to_date(nurse_data.get('joining_date')),
                 'resignation_date': _to_date(nurse_data.get('resignation_date')),
+                'team_id': nurse_data.get('team_id'),
             }
-            
-            # # resignation_date 처리
-            # if nurse_data.get('resignation_date'):
-            #     if isinstance(nurse_data['resignation_date'], str):
-            #         nurse_dict['resignation_date'] = datetime.strptime(
-            #             nurse_data['resignation_date'], '%Y-%m-%d'
-            #         ).date()
-            #     else:
-            #         nurse_dict['resignation_date'] = nurse_data['resignation_date']
-            
+
             nurses.append(Nurse(**nurse_dict))
         
         return nurses
@@ -485,10 +498,14 @@ class CPSATBasicEngine:
         seed: int | None = None
     )->bool:
         from ortools.sat.python import cp_model
-        if randomize:
-            run_seed = seed if seed is not None else ((int(time.time()*1000) ^ random.getrandbits(31)) & 0x7fffffff)
+        # randomize=False 여도 run_seed는 항상 정의되어야 한다.
+        # (e.g., 테스트/재현성 평가 스크립트에서 seed 고정 실행)
+        run_seed = seed if seed is not None else ((int(time.time() * 1000) ^ random.getrandbits(31)) & 0x7fffffff)
         # ① 0.3× time_limit 으로 “전체 모델” 한번 돌려 feasible 확보
-        base_tl = max(5, int(time_limit_seconds*0.3))
+        # time_limit_seconds가 작을 때도(테스트/평가) 입력된 제한을 존중한다.
+        # 예: time_limit_seconds=10이면 base_tl은 최대 3초 정도로 제한.
+        base_tl = max(1, int(time_limit_seconds * 0.3))
+        base_tl = min(base_tl, max(1, int(time_limit_seconds)))
         feasible = self._quick_initial_solve(
             roster_system, base_tl, grouped, run_seed)
         # hard 위반 수 세는 헬퍼
@@ -506,8 +523,9 @@ class CPSATBasicEngine:
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
                                       roster_system.num_days)
         remaining = time_limit_seconds - base_tl
-        per_iter  = 8          # neighbourhood solve 8 초
-        max_iter  = max(1, remaining // per_iter)
+        per_iter = 8          # neighbourhood solve 8 초
+        # remaining이 per_iter보다 작으면 반복은 0회로 끝내야 총 시간이 늘어나지 않는다.
+        max_iter = max(0, remaining // per_iter)
         if max_iter==0:
             return best_viol==0
         for it in range(max_iter):
@@ -763,19 +781,33 @@ class CPSATBasicEngine:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
                     for d in range(T0 + 2, T1 - 1):
-                        sum_n = sum(X(n, d - t, night_idx) for t in (0, 1, 2))
-                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)
+                        # (N_d-2 ∧ N_d-1 ∧ N_d)일 때, 다음 2일 OFF 부족량(0~2)을 패널티로 둔다.
+                        xn0 = X(n, d, night_idx)
+                        xn1 = X(n, d - 1, night_idx)
+                        xn2 = X(n, d - 2, night_idx)
+                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)  # 0..2
                         miss = m.NewIntVar(0, 2, f'rec3n2o_{n}_{d}')
-                        m.Add(miss >= sum_n - 2 - need)
+                        # 연속 3N이 아니면 miss=0 (패널티 없음)
+                        m.Add(miss == 0).OnlyEnforceIf(xn0.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn1.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn2.Not())
+                        # 연속 3N이면 miss == 2 - need
+                        m.Add(miss == 2 - need).OnlyEnforceIf([xn0, xn1, xn2])
                         safety['rec_3n2o'].append(miss)
             if cfg.two_offs_after_two_nig:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
                     for d in range(T0 + 1, T1 - 1):
-                        sum_n = sum(X(n, d - t, night_idx) for t in (0, 1))
-                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)
+                        # (N_d-1 ∧ N_d)일 때, 다음 2일 OFF 부족량(0~2)을 패널티로 둔다.
+                        xn0 = X(n, d, night_idx)
+                        xn1 = X(n, d - 1, night_idx)
+                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)  # 0..2
                         miss = m.NewIntVar(0, 2, f'rec2n2o_{n}_{d}')
-                        m.Add(miss >= sum_n - 1 - need)
+                        # 연속 2N이 아니면 miss=0 (패널티 없음)
+                        m.Add(miss == 0).OnlyEnforceIf(xn0.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn1.Not())
+                        # 연속 2N이면 miss == 2 - need
+                        m.Add(miss == 2 - need).OnlyEnforceIf([xn0, xn1])
                         safety['rec_2n2o'].append(miss)
 
             # 금지 패턴 N-O-D/E
@@ -867,6 +899,17 @@ class CPSATBasicEngine:
                                     m.Add(diff >= ov1 - ov2)
                                     m.Add(diff >= ov2 - ov1)
                                     obj.append(-w_eq * diff)
+                except Exception:
+                    pass
+
+                # 팀/프리셉터 soft objective를 폴백(3단계)에서도 반영한다.
+                # - 폴백이 타는 케이스가 많으면, 여기 반영이 없을 경우 gauge가 "먹지 않는" 것처럼 보인다.
+                try:
+                    obj.extend(_add_preceptor_objective_terms(m, roster_system, X, join, leave))
+                except Exception:
+                    pass
+                try:
+                    obj.extend(_add_team_balance_objective_terms(m, roster_system, X, join, leave))
                 except Exception:
                     pass
                 m.Maximize(sum(obj))
@@ -1271,14 +1314,20 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             pass
 
         # N2/3→2OFF
+        # 주의: "N 2회/3회 후 OFF 2회"는 다음 2일이 모두 OFF여야 한다.
+        # 기존 구현은 (sum_n - 1 <= off1 + off2) 형태여서 연속 N일 때 OFF 1개만 허용되는 버그가 있었다.
         if cfg.two_offs_after_three_nig:
-            for d in range(T0+2,T1-1):
-                m.Add(sum(X(n,d-t,night) for t in (0,1,2))-2
-                      <= X(n,d+1,off)+X(n,d+2,off))
+            for d in range(T0 + 2, T1 - 1):
+                # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
+                m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
+                    [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
+                )
         if cfg.two_offs_after_two_nig:
-            for d in range(T0+1,T1-1):
-                m.Add(sum(X(n,d-t,night) for t in (0,1))-1
-                      <= X(n,d+1,off)+X(n,d+2,off))
+            for d in range(T0 + 1, T1 - 1):
+                # (N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
+                m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
+                    [X(n, d, night), X(n, d - 1, night)]
+                )
 
     # ───────────── 4. Soft (패널티 변수) ───────
     obj=[]
@@ -1345,9 +1394,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.Add(iso <= 1-X(n,d+1,off))
             obj.append(-100*iso)
  
-    # (4-6) 프리셉터 보너스 항 모듈화
+    # (4-6) 프리셉터/팀 보너스 항 모듈화
     if include_pair_objective:
         obj.extend(_add_preceptor_objective_terms(m, rs, X, join, leave))
+        obj.extend(_add_team_balance_objective_terms(m, rs, X, join, leave))
 
     # (4-7) 커버리지 부족 패널티(메인 경로 slack 허용) – 날짜별 요구치 기반
     try:
@@ -1540,6 +1590,107 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
     print(f"[CP-SAT-Basic] 프리셉터 항: 쌍 {len(pairs)}개, 변수 {_added}개, {_dt:.2f}s, 강도 {strength}x, K={K_default}, shifts={focus_codes}")
     return obj_terms
 
+
+def _add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave):
+    """
+    옵션 A 구현: 팀별 '대표 교대'를 일자 단위로 선택하고(Y),
+    팀원들이 해당 교대로 최대한 정렬되도록(Z=AND(X,Y)) 보너스를 부여합니다.
+
+    또한 대표 교대(Y)의 월간 분포가 전체 요구량 비율을 따르도록 편차 패널티를 추가합니다.
+    (→ "비율에 따라 포커싱할 shift를 결정" + "결정된 shift로 팀원들이 같은 shift가 되도록")
+    """
+    obj_terms: list = []
+    cfg = rs.config
+    if not getattr(cfg, "team_balance_enable", False):
+        return obj_terms
+    weight = int(getattr(cfg, "team_balance_weight", 0) or 0)
+    if weight <= 0:
+        return obj_terms
+
+    # 사용할 교대 집합(OFF 제외)
+    focus_codes = getattr(cfg, "team_balance_focus_shifts", None)
+    if focus_codes:
+        shift_codes = [c for c in focus_codes if c in rs.config.daily_shift_requirements.keys()]
+    else:
+        shift_codes = list(rs.config.daily_shift_requirements.keys())
+    shift_codes = [c for c in shift_codes if c in rs.config.shift_types and c != "O"]
+    if not shift_codes:
+        return obj_terms
+    shift_indices = [rs.config.shift_types.index(c) for c in shift_codes]
+
+    # 모드 기반 교대 가중치 (없으면 balanced)
+    shift_weights = getattr(cfg, "team_balance_shift_weights", {}) or {"D": 1.0, "E": 1.0, "N": 1.0}
+
+    # 팀 구성
+    team_members: dict[str, list[int]] = {}
+    for idx, nurse in enumerate(rs.nurses):
+        team_id = getattr(nurse, "team_id", None)
+        if team_id in (None, "", 0):
+            continue
+        team_members.setdefault(str(team_id), []).append(idx)
+    if not team_members:
+        return obj_terms
+
+    # 전체 요구량 비율 계산(월간)
+    total_required = {code: 0 for code in shift_codes}
+    ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+    if isinstance(ds_by_day, list) and ds_by_day:
+        for dm in ds_by_day:
+            for code in shift_codes:
+                total_required[code] += int(dm.get(code, cfg.daily_shift_requirements.get(code, 0)))
+    else:
+        for code in shift_codes:
+            total_required[code] = int(cfg.daily_shift_requirements.get(code, 0)) * rs.num_days
+    sum_required = max(1, sum(total_required.values()))
+    ratio = {code: (total_required[code] / sum_required) for code in shift_codes}
+    # 가중치 분리: 정렬 보너스(같은 shift)와 분포 패널티(비율)
+    align_w = int(weight)
+    dist_w = max(1, int(weight * 0.6))
+
+    # 1) 팀-일자 대표 교대 선택 변수 Y(team, day, shift)
+    # 2) 팀원 정렬 변수 Z = AND(X, Y) 로 보너스 부여
+    for team_id, members in team_members.items():
+        if not members:
+            continue
+
+        # Y 생성 및 일자별 ExactlyOne
+        Y: dict[tuple[int, int], object] = {}
+        for d in range(rs.num_days):
+            ys = []
+            for s in shift_indices:
+                y = m.NewBoolVar(f"y_{team_id}_{d}_{s}")
+                Y[(d, s)] = y
+                ys.append(y)
+            m.AddExactlyOne(ys)
+
+        # 분포 패널티: 월간 Y 분포가 ratio를 따르도록
+        for code in shift_codes:
+            s_idx = rs.config.shift_types.index(code)
+            cnt = m.NewIntVar(0, rs.num_days, f"yCnt_{team_id}_{code}")
+            m.Add(cnt == sum(Y[(d, s_idx)] for d in range(rs.num_days)))
+            target = int(round(rs.num_days * ratio.get(code, 0.0)))
+            dev_pos = m.NewIntVar(0, rs.num_days, f"yDevP_{team_id}_{code}")
+            dev_neg = m.NewIntVar(0, rs.num_days, f"yDevN_{team_id}_{code}")
+            m.Add(dev_pos - dev_neg == cnt - target)
+            w_code = float(shift_weights.get(code, 1.0))
+            obj_terms.append(-int(dist_w * w_code) * dev_pos)
+            obj_terms.append(-int(dist_w * w_code) * dev_neg)
+
+        # 정렬 보너스: 팀원들이 대표 교대 Y를 따라가도록 Z=AND(X,Y) 보너스
+        for n in members:
+            for d in range(join[n], leave[n] + 1):
+                for code in shift_codes:
+                    s = rs.config.shift_types.index(code)
+                    y = Y[(d, s)]
+                    z = m.NewBoolVar(f"tz_{team_id}_{n}_{d}_{s}")
+                    # z == X(n,d,s) AND y
+                    m.Add(z <= X(n, d, s))
+                    m.Add(z <= y)
+                    m.Add(z >= X(n, d, s) + y - 1)
+                    w_code = float(shift_weights.get(code, 1.0))
+                    obj_terms.append(int(align_w * w_code) * z)
+
+    return obj_terms
 
 cp_sat_engine = CPSATBasicEngine()
 

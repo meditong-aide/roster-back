@@ -106,6 +106,9 @@ class RosterConfigBase(BaseModel):
     nod_noe: bool
     preceptor_gauge: float
     weekly_off_group: bool = Field(default=False)
+    team_balance_enable: bool = Field(default=False)
+    team_balance_gauge: int = Field(default=0, ge=0, le=10)
+    team_balance_mode: str = Field(default="balanced")
 
 class RosterConfigCreate(RosterConfigBase):
     config_version: Optional[str] = None

@@ -20,6 +20,7 @@ class Nurse:
     experience_years: float
     db_id: str  # 데이터베이스의 원래 ID
     grade: Optional[int] = None  # 역량 등급(1~3), 미지정은 None
+    team_id: Optional[int] = None
     is_night_nurse: int = 0
     is_head_nurse: bool = False
     remaining_off_days: int = 0
@@ -36,11 +37,12 @@ class Nurse:
             name=db_nurse.name,
             experience_years=db_nurse.experience,
             grade=getattr(db_nurse, "grade", None),
+            team_id=getattr(db_nurse, "team_id", None),
             is_night_nurse=db_nurse.is_night_nurse,
             is_head_nurse=db_nurse.is_head_nurse,
             personal_off_adjustment=db_nurse.personal_off_adjustment,
             resignation_date=db_nurse.resignation_date if db_nurse.resignation_date else None,
-            joining_date=db_nurse.joining_date if db_nurse.joining_date else None
+            joining_date=db_nurse.joining_date if db_nurse.joining_date else None,
         )
 
     def __post_init__(self):
