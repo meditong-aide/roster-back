@@ -2,7 +2,7 @@ from typing import Dict, Any
 
 from sqlalchemy.orm import Session
 
-from db.models import Group, RosterGradeConfig, Shift
+from db.models import Group, RosterGradeConfig
 from schemas.grade_schema import GradeConfigUpsert, GradeConfigResponse
 
 
@@ -54,10 +54,8 @@ def upsert_grade_config_service(
     if group.office_id != office_id:
         raise ValueError("그룹과 오피스가 일치하지 않습니다.")
 
-    allowed_shifts = {
-        s.shift_id for s in db.query(Shift.shift_id).filter(Shift.group_id == group_id).all()
-    }
-    _validate_constraints(payload.constraints, allowed_shifts)
+    # Grade 제약은 메인 코드(D/E/N)만 지원한다(사용자 합의).
+    _validate_constraints(payload.constraints)
 
     config = (
         db.query(RosterGradeConfig)
@@ -91,16 +89,20 @@ def upsert_grade_config_service(
     )
 
 
-def _validate_constraints(constraints: Dict[str, Dict[int, int]], allowed_shifts: set[str]) -> None:
-    """Shift/Grade 키와 값의 유효성을 검증합니다."""
+def _validate_constraints(constraints: Dict[str, Dict[int, int]]) -> None:
+    """Shift/Grade 키와 값의 유효성을 검증합니다.
+
+    - Shift 키는 'D','E','N'만 허용합니다.
+    - Grade 키는 1~3만 허용합니다.
+    """
     if not constraints:
         return
 
-    # Shift 코드 검증
-    if allowed_shifts:
-        invalid_shifts = [s for s in constraints.keys() if s not in allowed_shifts]
-        if invalid_shifts:
-            raise ValueError(f"허용되지 않은 Shift 코드: {invalid_shifts}")
+    # Shift 코드 검증 (D/E/N만)
+    allowed = {"D", "E", "N"}
+    invalid_shifts = [s for s in constraints.keys() if str(s).upper() not in allowed]
+    if invalid_shifts:
+        raise ValueError(f"허용되지 않은 Shift 코드(허용: D/E/N): {invalid_shifts}")
 
     for shift_code, grades_map in constraints.items():
         if not isinstance(grades_map, dict):

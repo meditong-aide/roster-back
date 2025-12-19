@@ -6,7 +6,23 @@
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
-from db.models import Nurse, ShiftPreference, RosterConfig, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage, Schedule, NurseShiftRequest, NursePairRequest, WantedRequest, DailyShift
+from db.models import (
+    DailyShift,
+    Group,
+    IssuedRoster,
+    Nurse,
+    NursePairRequest,
+    NurseShiftRequest,
+    RosterConfig,
+    RosterGradeConfig,
+    Schedule,
+    ScheduleEntry,
+    Shift,
+    ShiftManage,
+    ShiftPreference,
+    Wanted,
+    WantedRequest,
+)
 from schemas.roster_schema import RosterRequest
 from routers.utils import get_days_in_month, Timer
 from datetime import date, datetime, timedelta
@@ -183,6 +199,98 @@ def _fetch_latest_config(db: Session, req: RosterRequest, current_user):
         )
     return latest_config
 
+
+def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict:
+    """그룹의 Grade 설정을 엔진 전달용 dict로 구성한다.
+
+    Notes:
+        - DB에 설정이 없으면 기본값을 반환한다.
+        - Grade 제약은 `cp_sat_basic`에서 grade_strategy="GRADE"일 때만 적용된다.
+    """
+    config = (
+        db.query(RosterGradeConfig)
+        .filter(RosterGradeConfig.office_id == office_id, RosterGradeConfig.group_id == group_id)
+        .first()
+    )
+    if not config:
+        return {
+            "null_grade_policy": "LOWEST",
+            "use_dynamic_scaling": True,
+            "constraints_json": {},
+        }
+    return {
+        "null_grade_policy": config.null_grade_policy or "LOWEST",
+        "use_dynamic_scaling": bool(config.use_dynamic_scaling),
+        "constraints_json": config.constraints_json or {},
+    }
+
+
+def _fetch_grade_strategy_from_roster_config(db: Session, config_id: int | None) -> str | None:
+    """roster_config 테이블에서 grade_strategy 값을 조회한다(있으면).
+
+    Notes:
+        - DB에 컬럼이 없을 수 있으므로 INFORMATION_SCHEMA로 확인 후 조회한다.
+        - 값이 없거나 비어있으면 None을 반환한다.
+    """
+    if not config_id:
+        return None
+    if not _column_exists(db, "roster_config", "grade_strategy"):
+        return None
+    try:
+        row = db.execute(
+            text("SELECT grade_strategy FROM roster_config WHERE config_id = :cid"),
+            {"cid": int(config_id)},
+        ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    val = getattr(row, "grade_strategy", None)
+    if val is None:
+        try:
+            val = row[0]
+        except Exception:
+            val = None
+    if not val:
+        return None
+    return str(val).upper()
+
+
+def _resolve_grade_strategy(
+    db: Session,
+    config_dict: dict,
+    office_id: str,
+    group_id: str,
+    roster_config_id: int | None,
+) -> tuple[str, dict | None]:
+    """TEAM/GRADE/BASE 전략을 단순하게 결정하고, 필요한 경우 grade_config를 함께 반환한다.
+
+    우선순위:
+        1) roster_config.grade_strategy 컬럼이 있으면 그 값을 최우선 사용한다.
+        2) 없으면(구버전 호환):
+            - team_balance_enable == 1 → TEAM
+            - roster_grade_config.constraints_json이 비어있지 않음 → GRADE
+            - 그 외 → BASE
+
+    Returns:
+        (grade_strategy, grade_config_or_none)
+    """
+    # 1) DB 컬럼 우선
+    s = _fetch_grade_strategy_from_roster_config(db, roster_config_id)
+    if s in ("BASE", "TEAM", "GRADE"):
+        if s == "GRADE":
+            gc = _fetch_grade_config_dict(db, office_id, group_id)
+            return s, gc
+        return s, None
+
+    # 2) 구버전 폴백(요청 바디 말고 config_dict 기반)
+    if bool(config_dict.get("team_balance_enable", False)):
+        return "TEAM", None
+
+    gc = _fetch_grade_config_dict(db, office_id, group_id)
+    if bool((gc or {}).get("constraints_json") or {}):
+        return "GRADE", gc
+    return "BASE", None
 
 def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
@@ -770,6 +878,16 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         print(f"이전 월 경계 제약 생성 실패: {e}")
     try:
         print("cp_sat_basic 엔진 호출 준비 완료")
+        # 전략은 요청 바디가 아니라 "DB(roster_config.grade_strategy) → 없으면 config_dict 기반 폴백"만 사용한다.
+        grade_strategy, grade_config = _resolve_grade_strategy(
+            db=db,
+            config_dict=config_dict,
+            office_id=current_user.office_id,
+            group_id=current_user.group_id,
+            roster_config_id=getattr(latest_config, "config_id", None),
+        )
+        # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
+        config_dict["grade_strategy"] = grade_strategy
         cp_sat_result = generate_roster_cp_sat(
             nurses_dict,
             prefs_dict,
@@ -778,6 +896,8 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             req.month,
             shift_manage_data,
             time_limit_seconds=time_limit_seconds,
+            grade_strategy=grade_strategy,
+            grade_config=grade_config,
         )
     except Exception as e:
         print(f"error: {e}")

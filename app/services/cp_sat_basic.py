@@ -8,6 +8,8 @@ from services.roster_system import RosterSystem
 import numpy as np
 from collections import defaultdict
 import random
+from services.constraints.grade_constraints import add_grade_constraints
+from services.objectives.team_objective import add_team_balance_objective_terms
 # ─────────────────────────────  RL Neighborhood  ─────────────────────────
 class RLNeighborhoodPolicy:
     """아주 가벼운 ε-greedy 정책"""
@@ -186,6 +188,8 @@ class CPSATBasicEngine:
                 'db_id': nurse_data['nurse_id'],  # DB ID
                 'name': nurse_data['name'],
                 'experience_years': nurse_data.get('experience', 0),
+                # Grade(1~3): None 허용. 변환 정책은 Grade 제약 모듈에서 처리한다.
+                'grade': nurse_data.get('grade'),
                 'is_head_nurse': nurse_data.get('is_head_nurse', False),
                 'is_night_nurse': nurse_data.get('is_night_nurse', 0),
                 'personal_off_adjustment': nurse_data.get('personal_off_adjustment', 0),
@@ -234,55 +238,6 @@ class CPSATBasicEngine:
                         pair_preferences["work_together"].append({"nurse_1":nurse_id, "nurse_2":d['id'], "weight": d['weight']}) 
         return shift_preferences, off_requests, pair_preferences
 
-    # def parse_preferences_from_db(self, prefs_data: List[dict]) -> Tuple[Dict, Dict, Dict]:
-    #     """
-    #     DB에서 가져온 선호도 데이터를 main_v3.py 형식으로 변환
-        
-    #     Returns:
-    #         Tuple[shift_preferences, off_requests, pair_preferences]
-    #     """
-    #         # 결과 초기화
-    #     shift_preferences = defaultdict(lambda: defaultdict(list))
-    #     off_requests = defaultdict(list)
-    #     pair_preferences = {"work_together": [], "work_apart": []}
-
-    #     # 1️⃣ 근무 선호도 (ShiftRequest)
-    #     shift_rows = db.query(NurseShiftRequest).all()
-    #     for row in shift_rows:
-    #         nurse_id = row.nurse_id
-    #         shift_type = row.shift.upper()
-    #         day = int(str(row.shift_date).split('-')[-1])  # 날짜만 추출 (예: 2025-11-05 → 5)
-    #         score = getattr(row, "score", None)
-
-    #         # OFF는 별도로 저장
-    #         if shift_type == "O":
-    #             off_requests[nurse_id].append(day)
-    #         elif shift_type in ["D", "E", "N"]:
-    #             shift_preferences[nurse_id][shift_type].append(day)
-    #         else:
-    #             # 예외적인 shift_type 존재 시 무시하거나 로그
-    #             continue
-
-    #     # 2️⃣ 근무자 선호도 (PairRequest)
-    #     pair_rows = db.query(NursePairRequest).all()
-    #     for row in pair_rows:
-    #         nurse_1 = row.nurse_id
-    #         nurse_2 = row.target_nurse_id
-    #         weight = getattr(row, "weight", 0)
-
-    #         pref_dict = {"nurse_1": nurse_1, "nurse_2": nurse_2, "weight": weight}
-    #         if weight > 0:
-    #             pair_preferences["work_together"].append(pref_dict)
-    #         elif weight < 0:
-    #             pair_preferences["work_apart"].append(pref_dict)
-    #         # weight == 0은 무시
-
-    #     # dict로 변환 (defaultdict → dict)
-    #     shift_preferences = {nid: dict(shifts) for nid, shifts in shift_preferences.items()}
-    #     off_requests = dict(off_requests)
-
-    #     return shift_preferences, off_requests, pair_preferences
-    
     def generate_roster(
         self, 
         nurses_data: List[dict], 
@@ -291,6 +246,8 @@ class CPSATBasicEngine:
         year: int, 
         month: int,
         grouped: List[dict],
+        grade_strategy: str = "BASE",
+        grade_config: dict | None = None,
         time_limit_seconds: int = 60,
         randomize: bool = True,           # ← 추가
         seed: int | None = None           # ← 추가 (재현 원하면 지정)
@@ -325,6 +282,10 @@ class CPSATBasicEngine:
         # 4. 근무표 시스템 생성
         with Timer("근무표 시스템 초기화"):
             roster_system = RosterSystem(nurses, target_month, config)
+            # Grade/Team/BASE 전략(모델 빌더에서 참조)
+            # - 상위 서비스(roster_create_service)에서 roster_config 기반으로 결정된 값을 전달받는다.
+            setattr(roster_system, "grade_strategy", str(grade_strategy or "BASE").upper())
+            setattr(roster_system, "grade_config", grade_config)
             # 고정된 셀 정보 처리
             fixed_cells = list(config_data.get('fixed_cells', []) or [])
             # 주휴 등 휴무류 코드는 엔진에서 'O'로만 취급한다. (shift_types=['D','E','N','O'])
@@ -649,6 +610,18 @@ class CPSATBasicEngine:
                         continue
                     m.AddExactlyOne(X(n, d, s) for s in range(S))
 
+            # Grade 제약(하드): grade_strategy="GRADE"일 때만 적용
+            # - 폴백(서열)에서도 동일 제약을 유지해야 해 공간/평가가 안정적이다.
+            add_grade_constraints(
+                m=m,
+                rs=roster_system,
+                X=X,
+                join=join,
+                leave=leave,
+                grade_strategy=str(getattr(roster_system, "grade_strategy", "BASE")),
+                grade_config=getattr(roster_system, "grade_config", None),
+            )
+
             # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
             short_terms, over_terms = [], []
             over_vars_by_day = {}
@@ -908,8 +881,14 @@ class CPSATBasicEngine:
                     obj.extend(_add_preceptor_objective_terms(m, roster_system, X, join, leave))
                 except Exception:
                     pass
+                # 전략:
+                # - GRADE: Team OFF
+                # - TEAM : Team ON
+                # - BASE : Team OFF
                 try:
-                    obj.extend(_add_team_balance_objective_terms(m, roster_system, X, join, leave))
+                    grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+                    if grade_strategy == "TEAM":
+                        obj.extend(add_team_balance_objective_terms(m, roster_system, X, join, leave))
                 except Exception:
                     pass
                 m.Maximize(sum(obj))
@@ -1397,7 +1376,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # (4-6) 프리셉터/팀 보너스 항 모듈화
     if include_pair_objective:
         obj.extend(_add_preceptor_objective_terms(m, rs, X, join, leave))
-        obj.extend(_add_team_balance_objective_terms(m, rs, X, join, leave))
+        # 전략:
+        # - GRADE: Team OFF
+        # - TEAM : Team ON
+        # - BASE : Team OFF
+        grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        # grade_strategy = "TEAM"
+        if grade_strategy == "TEAM":
+            obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))
 
     # (4-7) 커버리지 부족 패널티(메인 경로 slack 허용) – 날짜별 요구치 기반
     try:
@@ -1430,6 +1416,18 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         pass
 
     m.Maximize(sum(obj))
+
+    # Grade 제약(하드): grade_strategy="GRADE"일 때만 적용
+    add_grade_constraints(
+        m=m,
+        rs=rs,
+        X=X,
+        join=join,
+        leave=leave,
+        grade_strategy=str(getattr(rs, "grade_strategy", "BASE")),
+        grade_config=getattr(rs, "grade_config", None),
+    )
+
     return m,X,join,leave,fixed
 
 
@@ -1591,110 +1589,21 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
     return obj_terms
 
 
-def _add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave):
-    """
-    옵션 A 구현: 팀별 '대표 교대'를 일자 단위로 선택하고(Y),
-    팀원들이 해당 교대로 최대한 정렬되도록(Z=AND(X,Y)) 보너스를 부여합니다.
-
-    또한 대표 교대(Y)의 월간 분포가 전체 요구량 비율을 따르도록 편차 패널티를 추가합니다.
-    (→ "비율에 따라 포커싱할 shift를 결정" + "결정된 shift로 팀원들이 같은 shift가 되도록")
-    """
-    obj_terms: list = []
-    cfg = rs.config
-    if not getattr(cfg, "team_balance_enable", False):
-        return obj_terms
-    weight = int(getattr(cfg, "team_balance_weight", 0) or 0)
-    if weight <= 0:
-        return obj_terms
-
-    # 사용할 교대 집합(OFF 제외)
-    focus_codes = getattr(cfg, "team_balance_focus_shifts", None)
-    if focus_codes:
-        shift_codes = [c for c in focus_codes if c in rs.config.daily_shift_requirements.keys()]
-    else:
-        shift_codes = list(rs.config.daily_shift_requirements.keys())
-    shift_codes = [c for c in shift_codes if c in rs.config.shift_types and c != "O"]
-    if not shift_codes:
-        return obj_terms
-    shift_indices = [rs.config.shift_types.index(c) for c in shift_codes]
-
-    # 모드 기반 교대 가중치 (없으면 balanced)
-    shift_weights = getattr(cfg, "team_balance_shift_weights", {}) or {"D": 1.0, "E": 1.0, "N": 1.0}
-
-    # 팀 구성
-    team_members: dict[str, list[int]] = {}
-    for idx, nurse in enumerate(rs.nurses):
-        team_id = getattr(nurse, "team_id", None)
-        if team_id in (None, "", 0):
-            continue
-        team_members.setdefault(str(team_id), []).append(idx)
-    if not team_members:
-        return obj_terms
-
-    # 전체 요구량 비율 계산(월간)
-    total_required = {code: 0 for code in shift_codes}
-    ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
-    if isinstance(ds_by_day, list) and ds_by_day:
-        for dm in ds_by_day:
-            for code in shift_codes:
-                total_required[code] += int(dm.get(code, cfg.daily_shift_requirements.get(code, 0)))
-    else:
-        for code in shift_codes:
-            total_required[code] = int(cfg.daily_shift_requirements.get(code, 0)) * rs.num_days
-    sum_required = max(1, sum(total_required.values()))
-    ratio = {code: (total_required[code] / sum_required) for code in shift_codes}
-    # 가중치 분리: 정렬 보너스(같은 shift)와 분포 패널티(비율)
-    align_w = int(weight)
-    dist_w = max(1, int(weight * 0.6))
-
-    # 1) 팀-일자 대표 교대 선택 변수 Y(team, day, shift)
-    # 2) 팀원 정렬 변수 Z = AND(X, Y) 로 보너스 부여
-    for team_id, members in team_members.items():
-        if not members:
-            continue
-
-        # Y 생성 및 일자별 ExactlyOne
-        Y: dict[tuple[int, int], object] = {}
-        for d in range(rs.num_days):
-            ys = []
-            for s in shift_indices:
-                y = m.NewBoolVar(f"y_{team_id}_{d}_{s}")
-                Y[(d, s)] = y
-                ys.append(y)
-            m.AddExactlyOne(ys)
-
-        # 분포 패널티: 월간 Y 분포가 ratio를 따르도록
-        for code in shift_codes:
-            s_idx = rs.config.shift_types.index(code)
-            cnt = m.NewIntVar(0, rs.num_days, f"yCnt_{team_id}_{code}")
-            m.Add(cnt == sum(Y[(d, s_idx)] for d in range(rs.num_days)))
-            target = int(round(rs.num_days * ratio.get(code, 0.0)))
-            dev_pos = m.NewIntVar(0, rs.num_days, f"yDevP_{team_id}_{code}")
-            dev_neg = m.NewIntVar(0, rs.num_days, f"yDevN_{team_id}_{code}")
-            m.Add(dev_pos - dev_neg == cnt - target)
-            w_code = float(shift_weights.get(code, 1.0))
-            obj_terms.append(-int(dist_w * w_code) * dev_pos)
-            obj_terms.append(-int(dist_w * w_code) * dev_neg)
-
-        # 정렬 보너스: 팀원들이 대표 교대 Y를 따라가도록 Z=AND(X,Y) 보너스
-        for n in members:
-            for d in range(join[n], leave[n] + 1):
-                for code in shift_codes:
-                    s = rs.config.shift_types.index(code)
-                    y = Y[(d, s)]
-                    z = m.NewBoolVar(f"tz_{team_id}_{n}_{d}_{s}")
-                    # z == X(n,d,s) AND y
-                    m.Add(z <= X(n, d, s))
-                    m.Add(z <= y)
-                    m.Add(z >= X(n, d, s) + y - 1)
-                    w_code = float(shift_weights.get(code, 1.0))
-                    obj_terms.append(int(align_w * w_code) * z)
-
-    return obj_terms
-
 cp_sat_engine = CPSATBasicEngine()
 
-def generate_roster_cp_sat(nurses_data, prefs_data, config_data, year, month,  shift_manage_data, time_limit_seconds=60, randomize=True, seed=None):
+def generate_roster_cp_sat(
+    nurses_data,
+    prefs_data,
+    config_data,
+    year,
+    month,
+    shift_manage_data,
+    time_limit_seconds=60,
+    randomize=True,
+    seed=None,
+    grade_strategy: str = "BASE",
+    grade_config: dict | None = None,
+):
     """
     기존 roster_engine.generate_roster 함수와 호환되는 인터페이스
     
@@ -1710,5 +1619,15 @@ def generate_roster_cp_sat(nurses_data, prefs_data, config_data, year, month,  s
         Dict[nurse_id, List[shift]]: 간호사별 일일 근무 배정
     """
     return cp_sat_engine.generate_roster(
-        nurses_data, prefs_data, config_data, year, month, shift_manage_data, time_limit_seconds, randomize=randomize, seed=seed
+        nurses_data,
+        prefs_data,
+        config_data,
+        year,
+        month,
+        shift_manage_data,
+        grade_strategy=grade_strategy,
+        grade_config=grade_config,
+        time_limit_seconds=time_limit_seconds,
+        randomize=randomize,
+        seed=seed,
     ) 
