@@ -22,7 +22,7 @@ def add_grade_constraints(
     leave: list[int],
     grade_strategy: str | None,
     grade_config: dict[str, Any] | None,
-) -> None:
+) -> list:
     """Grade 최소 인원 제약을 모델에 추가한다.
 
     문서 기준 처리:
@@ -49,16 +49,16 @@ def add_grade_constraints(
     print('grade_strategy', grade_strategy)
     print('grade_config', grade_config)
     if str(grade_strategy or "").upper() != "GRADE":
-        return
+        return []
     if grade_config is None:
-        return
+        return []
 
     constraints_map, policy, scaling = _parse_grade_config(grade_config)
     print('constraints_map', constraints_map)
     grade_values = _extract_grade_values_from_constraints(constraints_map)
     print('grade_values', grade_values)
     if not grade_values:
-        return
+        return []
 
     by_grade, is_night_only = _build_grade_groups(
         rs=rs,
@@ -71,6 +71,7 @@ def add_grade_constraints(
     ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
     apply_shifts = {"D", "E", "N"}
 
+    obj_terms: list = []
     for d in range(rs.num_days):
         need_map = _get_need_map_for_day(cfg, ds_by_day, d)
         for shift_code, base in (constraints_map or {}).items():
@@ -111,16 +112,20 @@ def add_grade_constraints(
             print('available', available)
             _clamp_targets_to_available(target, available, day_idx=d, shift_code=s_code, req=req)
             print('target', target)
-            _add_minimum_constraints(
-                m,
-                X,
-                by_grade,
-                d,
-                rs.config.shift_types.index(s_code),
-                target,
-                allow_soft_fallback=scaling["allow_soft_fallback"],
+            obj_terms.extend(
+                _add_minimum_constraints(
+                    m,
+                    X,
+                    by_grade,
+                    d,
+                    rs.config.shift_types.index(s_code),
+                    target,
+                    allow_soft_fallback=scaling["allow_soft_fallback"],
+                    penalty_weight=scaling["grade_penalty_weight"],
+                )
             )
             print('target', target)
+    return obj_terms
 
 
 def _normalize_grade_int(value: Any) -> int | None:
@@ -276,6 +281,7 @@ def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict]
         "min_leader_keep": bool(grade_config.get("min_leader_keep", True)),
         "min_ratio_floor": min_ratio_floor,
         "allow_soft_fallback": bool(grade_config.get("allow_soft_fallback", True)),
+        "grade_penalty_weight": int(grade_config.get("grade_penalty_weight", 500)),
     }
     return constraints_map, policy, scaling
 
@@ -411,12 +417,14 @@ def _add_minimum_constraints(
     shift_idx: int,
     target: dict[int, int],
     allow_soft_fallback: bool,
-) -> None:
+    penalty_weight: int,
+) -> list:
     """모델에 grade 최소 인원 제약을 추가한다.
 
     allow_soft_fallback=True 이면 slack을 허용하여 infeasible을 방지하고,
     False이면 기존처럼 하드 제약을 유지한다.
     """
+    obj_terms: list = []
     for g, t in target.items():
         if int(t) <= 0:
             continue
@@ -425,7 +433,9 @@ def _add_minimum_constraints(
             # 부족분만큼 slack 허용 (0~t). 패널티는 상위 목적함수에서 추가 가능.
             slack = m.NewIntVar(0, int(t), f"grade_slack_d{day_idx}_s{shift_idx}_g{g}")
             m.Add(vars_sum + slack >= int(t))
+            obj_terms.append(-penalty_weight * slack)
         else:
             m.Add(vars_sum >= int(t))
+    return obj_terms
 
 

@@ -612,18 +612,6 @@ class CPSATBasicEngine:
                         continue
                     m.AddExactlyOne(X(n, d, s) for s in range(S))
 
-            # Grade 제약(하드): grade_strategy="GRADE"일 때만 적용
-            # - 폴백(서열)에서도 동일 제약을 유지해야 해 공간/평가가 안정적이다.
-            add_grade_constraints(
-                m=m,
-                rs=roster_system,
-                X=X,
-                join=join,
-                leave=leave,
-                grade_strategy=str(getattr(roster_system, "grade_strategy", "BASE")),
-                grade_config=getattr(roster_system, "grade_config", None),
-            )
-
             # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
             short_terms, over_terms = [], []
             over_vars_by_day = {}
@@ -638,7 +626,6 @@ class CPSATBasicEngine:
                     s = roster_system.config.shift_types.index(code)
                     need = int(req) - fixed_cnt[d][s]
                     if need <= 0:
-                        # 고정으로 이미 충분한 경우는 oversupply만 억제 대상에서 제외
                         continue
                     assigned = sum(
                         X(n, d, s)
@@ -647,7 +634,9 @@ class CPSATBasicEngine:
                     )
                     sh = m.NewIntVar(0, N, f'short_{d}_{code}')
                     ov = m.NewIntVar(0, N, f'over_{d}_{code}')
-                    m.Add(assigned + sh - ov == need)
+                    # Coverage 우선: assigned + shortage >= need (hard), oversupply 추적은 선택
+                    m.Add(assigned + sh >= need)
+                    m.Add(assigned - ov <= need)
                     short_terms.append(sh)
                     over_terms.append(ov)
                     over_vars_by_day.setdefault(d, {})[code] = ov
@@ -819,8 +808,8 @@ class CPSATBasicEngine:
 
             # stage별 목적/고정
             if stage == 1:
-                # 커버리지: shortage 우선, over는 약벌
-                m.Minimize(1000 * sum(short_terms) + sum(over_terms))
+                # 커버리지: shortage를 압도적으로 최소화 (coverage-first)
+                m.Minimize(100000 * sum(short_terms) + sum(over_terms))
             elif stage == 2:
                 # 1단계 최솟값 고정 + over 상한 유지
                 if coverage_eq is not None:
@@ -899,6 +888,24 @@ class CPSATBasicEngine:
                     print('team_balance_objective_terms 예외 발생')
                     print('e', e)
                     pass
+
+                # Grade 제약을 soft penalty로 추가 (distribution 전용)
+                try:
+                    grade_terms = add_grade_constraints(
+                        m=m,
+                        rs=roster_system,
+                        X=X,
+                        join=join,
+                        leave=leave,
+                        grade_strategy=str(getattr(roster_system, "grade_strategy", "BASE")),
+                        grade_config=getattr(roster_system, "grade_config", None),
+                    )
+                    obj.extend(grade_terms or [])
+                except Exception as e:
+                    print('grade_constraints 예외 발생')
+                    print('e', e)
+                    pass
+
                 m.Maximize(sum(obj))
 
             return m, X, short_terms, over_terms, safety
@@ -1432,18 +1439,6 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         pass
     
     m.Maximize(sum(obj))
-
-    # Grade 제약(하드): grade_strategy="GRADE"일 때만 적용
-    add_grade_constraints(
-        m=m,
-        rs=rs,
-        X=X,
-        join=join,
-        leave=leave,
-        grade_strategy=str(getattr(rs, "grade_strategy", "BASE")),
-        # grade_strategy="GRADE",
-        grade_config=getattr(rs, "grade_config", None),
-    )
 
     return m,X,join,leave,fixed
 
