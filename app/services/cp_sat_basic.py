@@ -444,6 +444,15 @@ class CPSATBasicEngine:
             print(f"{self.logger_prefix} 대시보드 서비스를 찾을 수 없습니다.")
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
+
+        # Grade 배치 요약 출력/CSV 저장 (GRADE 전략일 때만)
+        try:
+            grade_strategy_norm = str(grade_strategy or "BASE").upper()
+            if grade_strategy_norm == "GRADE" and grade_config:
+                _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
+        except Exception as e:
+            print(f"{self.logger_prefix} Grade 요약 출력 중 오류: {e}")
+
         return {
             "roster": result,
             "satisfaction_data": satisfaction_data,
@@ -1599,6 +1608,109 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
     _dt = _t.time()-_t0
     print(f"[CP-SAT-Basic] 프리셉터 항: 쌍 {len(pairs)}개, 변수 {_added}개, {_dt:.2f}s, 강도 {strength}x, K={K_default}, shifts={focus_codes}")
     return obj_terms
+
+
+# ─────────────────────────────────────────────────────────────
+# Grade 배치 요약/CSV 덤프
+# ─────────────────────────────────────────────────────────────
+import csv
+import os
+import hashlib
+
+
+def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_prefix: str = "[CP-SAT-Basic]"):
+    """일자/교대별 Grade 배치 현황과 요구치 대비 비율을 출력하고 CSV로 저장한다."""
+    constraints_map = grade_config.get("constraints") or grade_config.get("constraints_json") or {}
+    if not constraints_map:
+        print(f"{logger_prefix} Grade 요약: constraints 없음, 스킵")
+        return
+
+    shift_types = rs.config.shift_types
+    # 추출된 grade 값 정의역
+    grades = set()
+    for _, gmap in constraints_map.items():
+        if not isinstance(gmap, dict):
+            continue
+        for k in gmap.keys():
+            try:
+                grades.add(int(k))
+            except Exception:
+                continue
+    grade_values = sorted(grades) or [1, 2, 3]
+
+    # NULL Grade 처리 정책
+    null_policy = str(grade_config.get("null_grade_policy") or "LOWEST").upper()
+    valid_grades = [n.grade for n in nurses if getattr(n, "grade", None) is not None]
+    avg_grade = round(sum(valid_grades) / len(valid_grades)) if valid_grades else max(grade_values)
+
+    def _resolve_grade(nurse):
+        g = getattr(nurse, "grade", None)
+        if g is not None:
+            try:
+                gi = int(g)
+                if gi in grade_values:
+                    return gi
+            except Exception:
+                pass
+        if null_policy == "AVERAGE":
+            return avg_grade if avg_grade in grade_values else max(grade_values)
+        if null_policy == "RANDOM":
+            h = hashlib.md5(str(getattr(nurse, "db_id", nurse.name)).encode()).hexdigest()
+            return grade_values[int(h[:8], 16) % len(grade_values)]
+        # LOWEST
+        return max(grade_values)
+
+    nurse_grades = [ _resolve_grade(n) for n in nurses ]
+
+    rows = []
+    for d in range(rs.num_days):
+        for shift_code, gmap in constraints_map.items():
+            s_code = str(shift_code or "").upper()
+            if s_code not in shift_types:
+                continue
+            s_idx = shift_types.index(s_code)
+            # 배정된 간호사/grade 카운트
+            assigned_by_grade = {g: 0 for g in grade_values}
+            for n_idx in range(len(nurses)):
+                # roster는 one-hot
+                if int(rs.roster[n_idx, d, s_idx]) == 1:
+                    g = nurse_grades[n_idx]
+                    assigned_by_grade[g] = assigned_by_grade.get(g, 0) + 1
+            # 요구치
+            req_by_grade = {}
+            for k, v in (gmap or {}).items():
+                try:
+                    gi = int(k)
+                    req_by_grade[gi] = int(v)
+                except Exception:
+                    continue
+
+            # 비율 계산 및 로그/CSV
+            for g in grade_values:
+                req = req_by_grade.get(g, 0)
+                got = assigned_by_grade.get(g, 0)
+                ratio = (got / req) if req > 0 else None
+                rows.append({
+                    "day": d + 1,
+                    "shift": s_code,
+                    "grade": g,
+                    "required": req,
+                    "assigned": got,
+                    "ratio": ratio if ratio is not None else "",
+                })
+
+    # 로그 요약 (상위 몇 개)
+    print(f"{logger_prefix} Grade 배치 요약 (일부)")
+    for r in rows[: min(15, len(rows))]:
+        print(f"  day={r['day']:2}, shift={r['shift']}, grade={r['grade']}: req={r['required']}, got={r['assigned']}, ratio={r['ratio']}")
+
+    # CSV 저장
+    out_path = os.path.join("/tmp", "grade_summary.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["day", "shift", "grade", "required", "assigned", "ratio"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"{logger_prefix} Grade 요약 CSV 저장: {out_path}")
 
 
 cp_sat_engine = CPSATBasicEngine()
