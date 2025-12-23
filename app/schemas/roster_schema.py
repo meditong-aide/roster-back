@@ -144,6 +144,8 @@ class NurseProfile(BaseModel):
     # weekly_off_enabled: int = Field(default=0)
     weekly_off_weekday: Optional[int] = None
     nurse_memo: Optional[str] = None
+    grade: Optional[int] = None
+    emp_num: Optional[str] = None
 
     class Config:
         from_attributes = True
