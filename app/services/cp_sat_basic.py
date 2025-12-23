@@ -467,8 +467,10 @@ class CPSATBasicEngine:
         # 예: time_limit_seconds=10이면 base_tl은 최대 3초 정도로 제한.
         base_tl = max(1, int(time_limit_seconds * 0.3))
         base_tl = min(base_tl, max(1, int(time_limit_seconds)))
+        roster_system.is_quick_phase = True
         feasible = self._quick_initial_solve(
             roster_system, base_tl, grouped, run_seed)
+        roster_system.is_quick_phase = False
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
             'shift_requirement', 'max_consecutive_night',
@@ -879,7 +881,9 @@ class CPSATBasicEngine:
                 # - 폴백이 타는 케이스가 많으면, 여기 반영이 없을 경우 gauge가 "먹지 않는" 것처럼 보인다.
                 try:
                     obj.extend(_add_preceptor_objective_terms(m, roster_system, X, join, leave))
-                except Exception:
+                except Exception as e:
+                    print('preceptor_objective_terms 예외 발생')
+                    print('e', e)
                     pass
                 # 전략:
                 # - GRADE: Team OFF
@@ -887,9 +891,13 @@ class CPSATBasicEngine:
                 # - BASE : Team OFF
                 try:
                     grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+                    # print('grade_strategy', grade_strategy)
+                    # grade_strategy = "TEAM"
                     if grade_strategy == "TEAM":
                         obj.extend(add_team_balance_objective_terms(m, roster_system, X, join, leave))
-                except Exception:
+                except Exception as e:
+                    print('team_balance_objective_terms 예외 발생')
+                    print('e', e)
                     pass
                 m.Maximize(sum(obj))
 
@@ -1381,6 +1389,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # - TEAM : Team ON
         # - BASE : Team OFF
         grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        # print('grade_strategy', grade_strategy)
         # grade_strategy = "TEAM"
         if grade_strategy == "TEAM":
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))

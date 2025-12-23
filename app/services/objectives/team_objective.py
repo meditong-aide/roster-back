@@ -75,8 +75,15 @@ def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> lis
     ratio = {code: (total_required[code] / sum_required) for code in shift_codes}
 
     # 가중치 분리: 정렬 보너스(같은 shift)와 분포 패널티(비율)
-    align_w = int(weight)
-    dist_w = max(1, int(weight * 0.6))
+    # align_w = int(weight)
+    # dist_w = max(1, int(weight * 0.6))
+
+    if getattr(rs, "is_quick_phase", False):
+        align_w = int(weight * 2.5)
+        dist_w  = 0
+    else:
+        align_w = int(weight)
+        dist_w = max(1, int(weight * 0.6))
 
     for team_id, members in team_members.items():
         if not members:
@@ -92,6 +99,12 @@ def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> lis
                 ys.append(y)
             m.AddExactlyOne(ys)
 
+        for d in range(rs.num_days - 1):
+            for s in shift_indices:
+                diff = m.NewBoolVar(f"y_diff_{team_id}_{d}_{s}")
+                m.Add(diff >= Y[(d, s)] - Y[(d+1, s)])
+                m.Add(diff >= Y[(d+1, s)] - Y[(d, s)])
+                obj_terms.append(-int(align_w * 0.3) * diff)
         # 분포 패널티: 월간 Y 분포가 ratio를 따르도록
         for code in shift_codes:
             s_idx = rs.config.shift_types.index(code)
@@ -117,6 +130,17 @@ def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> lis
                     m.Add(z >= X(n, d, s) + y - 1)
                     w_code = float(shift_weights.get(code, 1.0))
                     obj_terms.append(int(align_w * w_code) * z)
+        # 팀원 간 직접 정렬 (부분 적용)
+        for i in range(len(members)):
+            for j in range(i+1, len(members)):
+                ni, nj = members[i], members[j]
+                for d in range(join[ni], leave[ni] + 1):
+                    for s in shift_indices:
+                        z2 = m.NewBoolVar(f"tpair_{team_id}_{ni}_{nj}_{d}_{s}")
+                        m.Add(z2 <= X(ni, d, s))
+                        m.Add(z2 <= X(nj, d, s))
+                        m.Add(z2 >= X(ni, d, s) + X(nj, d, s) - 1)
+                        obj_terms.append(int(align_w * 0.4) * z2)
 
     return obj_terms
 
