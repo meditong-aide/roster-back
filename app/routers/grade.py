@@ -70,7 +70,7 @@ def upsert_grade_config(
     print('[DEBUG] [grade.py - upsert_grade_config] current_user', current_user)
     try:
         target_group_id, office_id = _resolve_group_and_office(db, current_user, group_id)
-        return upsert_grade_config_service(db, office_id, target_group_id, req)
+        return upsert_grade_config_service(db, office_id, target_group_id, req, current_user.name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

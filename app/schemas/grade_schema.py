@@ -33,7 +33,7 @@ class GradeConfigResponse(GradeConfigBase):
     group_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-
+    updated_by: Optional[str] = None
     class Config:
         from_attributes = True
 

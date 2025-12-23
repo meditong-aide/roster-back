@@ -65,6 +65,7 @@ class Nurse(Base):
     weekly_off_enabled = Column(TINYINT, default=0)  # 주휴 대상 여부
     weekly_off_weekday = Column(TINYINT, nullable=True)  # 기준 월에서의 주휴 요일 (0:월~6:일)
     nurse_memo = Column(TEXT, nullable=True)
+    grade = Column(INTEGER, nullable=True)
     
     group = relationship("Group")
     __table_args__ = (
@@ -202,6 +203,7 @@ class RosterGradeConfig(Base):
     use_dynamic_scaling = Column(TINYINT, nullable=False, default=1)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+    updated_by = Column(VARCHAR(50), nullable=True)
 
     __table_args__ = (
         UniqueConstraint('office_id', 'group_id', name='ux_grade_config_office_group'),

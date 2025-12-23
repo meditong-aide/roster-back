@@ -46,13 +46,17 @@ def add_grade_constraints(
     Raises:
         ValueError: 설정이 명백히 불가능한 경우(예: 필요 인원>0인데 해당 grade 가용이 0인데도 강제되는 케이스)
     """
+    print('grade_strategy', grade_strategy)
+    print('grade_config', grade_config)
     if str(grade_strategy or "").upper() != "GRADE":
         return
     if grade_config is None:
         return
 
     constraints_map, policy, scaling = _parse_grade_config(grade_config)
+    print('constraints_map', constraints_map)
     grade_values = _extract_grade_values_from_constraints(constraints_map)
+    print('grade_values', grade_values)
     if not grade_values:
         return
 
@@ -61,7 +65,8 @@ def add_grade_constraints(
         grade_values=grade_values,
         null_grade_policy=policy["null_grade_policy"],
     )
-
+    print('by_grade', by_grade)
+    print('is_night_only', is_night_only)
     cfg = rs.config
     ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
     apply_shifts = {"D", "E", "N"}
@@ -102,8 +107,20 @@ def add_grade_constraints(
                 join=join,
                 leave=leave,
             )
+            print('target', target)
+            print('available', available)
             _clamp_targets_to_available(target, available, day_idx=d, shift_code=s_code, req=req)
-            _add_minimum_constraints(m, X, by_grade, d, rs.config.shift_types.index(s_code), target)
+            print('target', target)
+            _add_minimum_constraints(
+                m,
+                X,
+                by_grade,
+                d,
+                rs.config.shift_types.index(s_code),
+                target,
+                allow_soft_fallback=scaling["allow_soft_fallback"],
+            )
+            print('target', target)
 
 
 def _normalize_grade_int(value: Any) -> int | None:
@@ -258,6 +275,7 @@ def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict]
         "use_dynamic_scaling": bool(grade_config.get("use_dynamic_scaling", True)),
         "min_leader_keep": bool(grade_config.get("min_leader_keep", True)),
         "min_ratio_floor": min_ratio_floor,
+        "allow_soft_fallback": bool(grade_config.get("allow_soft_fallback", True)),
     }
     return constraints_map, policy, scaling
 
@@ -269,8 +287,9 @@ def _build_grade_groups(
 ) -> tuple[dict[int, list[int]], list[bool]]:
     """간호사 grade를 정의역(grade_values)에 맞게 매핑하고, grade별 인덱스 그룹을 만든다."""
     raw_grades = [_normalize_grade_int(getattr(n, "grade", None)) for n in rs.nurses]
+    print('raw_grades', raw_grades)
     avg_grade = _average_grade_or_lowest(raw_grades, fallback=max(grade_values))
-
+    print('avg_grade', avg_grade)
     mapped: list[int] = []
     for i, g in enumerate(raw_grades):
         if g in grade_values:
@@ -391,11 +410,22 @@ def _add_minimum_constraints(
     day_idx: int,
     shift_idx: int,
     target: dict[int, int],
+    allow_soft_fallback: bool,
 ) -> None:
-    """모델에 grade 최소 인원 제약(sum(X) >= target)을 추가한다."""
+    """모델에 grade 최소 인원 제약을 추가한다.
+
+    allow_soft_fallback=True 이면 slack을 허용하여 infeasible을 방지하고,
+    False이면 기존처럼 하드 제약을 유지한다.
+    """
     for g, t in target.items():
         if int(t) <= 0:
             continue
-        m.Add(sum(X(n, day_idx, shift_idx) for n in by_grade.get(g, [])) >= int(t))
+        vars_sum = sum(X(n, day_idx, shift_idx) for n in by_grade.get(g, []))
+        if allow_soft_fallback:
+            # 부족분만큼 slack 허용 (0~t). 패널티는 상위 목적함수에서 추가 가능.
+            slack = m.NewIntVar(0, int(t), f"grade_slack_d{day_idx}_s{shift_idx}_g{g}")
+            m.Add(vars_sum + slack >= int(t))
+        else:
+            m.Add(vars_sum >= int(t))
 
 

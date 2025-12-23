@@ -996,6 +996,11 @@ class CPSATBasicEngine:
         from ortools.sat.python import cp_model
         try:
             model,X,j,l,fixed = _build_full_model(rs,grouped)
+            # print('model', model)
+            print('X', X)
+            print('j', j)
+            print('l', l)
+            print('fixed', fixed)
             solver=cp_model.CpSolver()
             # ▼▼ 랜덤화 추가 ▼▼
             # seed = getattr(rs.config, 'random_seed', None)
@@ -1013,6 +1018,7 @@ class CPSATBasicEngine:
             solver.parameters.num_search_workers=2
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
+            print('stat', stat)
             if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE): return False
             rs.roster.fill(0)
             N,D,S=len(rs.nurses),rs.num_days,rs.config.num_shifts
@@ -1421,9 +1427,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         m.Add(diff >= ov1 - ov2)
                         m.Add(diff >= ov2 - ov1)
                         obj.append(-w_eq * diff)
+            
     except Exception:
         pass
-
+    
     m.Maximize(sum(obj))
 
     # Grade 제약(하드): grade_strategy="GRADE"일 때만 적용
@@ -1434,6 +1441,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         join=join,
         leave=leave,
         grade_strategy=str(getattr(rs, "grade_strategy", "BASE")),
+        # grade_strategy="GRADE",
         grade_config=getattr(rs, "grade_config", None),
     )
 
