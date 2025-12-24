@@ -134,7 +134,7 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    is_night_nurse: list[int] = Field(default=[])
+    is_night_nurse: List[str] = Field(default=[], max_items = 2)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
@@ -146,6 +146,10 @@ class NurseProfile(BaseModel):
     nurse_memo: Optional[str] = None
     grade: Optional[int] = None
     emp_num: Optional[str] = None
+    # Side-Profile 추가 컬럼
+    birth_date: Optional[str] = None
+    phone_number: Optional[str] = None
+    age: Optional[int] = None # 나이
 
     class Config:
         from_attributes = True

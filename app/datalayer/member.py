@@ -172,6 +172,8 @@ class Member:
              , c.small_kind
              , isnull((select name from bizwiz20db.T_Team where OfficeCode = c.OfficeCode and big_kind = c.big_kind and middle_kind = c.middle_kind and small_kind = c.small_kind and depth = '3'), '') as small_kind_name
              , c.mb_part, c.name as mb_part_name, a.OfficeEmpNum, a.EmployeeName, b.MemberID, a.duty, a.career, a.headnurse, a.joindate
+             , LEFT(CONVERT(VARCHAR(10), a.DateOfBirth, 23), 10) as DateOfBirth
+             , a.PortableTel
           from bizwiz20db.Member a
                Inner Join bizwiz20db.Member_Login b On a.OfficeCode=b.OfficeCode And a.EmpSeqNo=b.EmpSeqNo
                Left Join bizwiz20db.T_Team c On a.mb_part=c.mb_part And a.OfficeCode=c.OfficeCode

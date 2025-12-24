@@ -9,6 +9,9 @@ from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional
 from pprint import pprint
+from datetime import date
+from dateutil.parser import parse as parse_date
+import logging
 
 def get_personnel_basic_info_service(current_user, db: Session):
     """
@@ -28,35 +31,205 @@ def get_personnel_basic_info_service(current_user, db: Session):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 기본 정보 조회 실패: {str(e)}")
 
-def get_nurses_in_group_service(current_user, db: Session):
+# def get_nurses_in_group_service(current_user, db: Session):
+#     """
+#     그룹 내 간호사 목록 조회 서비스 함수
+#     """
+#     if not current_user:
+#         raise Exception("Not authenticated")
+#     nurses = (
+#         db.query(NurseModel)
+#         .filter(NurseModel.group_id == current_user.group_id)
+#         .order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc())
+#         .all()
+#     )
+#     return nurses
+
+def get_nurses_in_group_service(
+    current_user,
+    db: Session,
+    nurse_id: Optional[str] = None
+):
     """
     그룹 내 간호사 목록 조회 서비스 함수
+    특정 nurse_id가 제공되면 해당 간호사만 반환, 그렇지 않으면 그룹 내 모든 간호사 반환
+    birth_date (VARCHAR)를 파싱하여 만 나이를 age로 추가
     """
     if not current_user:
         raise Exception("Not authenticated")
+    
+    query = db.query(NurseModel)
+    
+    # 그룹 ID 필터링
+    if current_user.group_id:
+        query = query.filter(NurseModel.group_id == current_user.group_id)
+    
+    # 특정 nurse_id 필터링
+    if nurse_id:
+        query = query.filter(NurseModel.nurse_id == nurse_id)
+    
+    # 정렬: active DESC, sequence ASC, experience DESC, nurse_id ASC
     nurses = (
-        db.query(NurseModel)
-        .filter(NurseModel.group_id == current_user.group_id)
-        .order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc())
-        .all()
+        query.order_by(
+            NurseModel.active.desc(),
+            NurseModel.sequence.asc(),
+            NurseModel.experience.desc(),
+            NurseModel.nurse_id.asc()
+        ).all()
     )
-    return nurses
-def get_nurses_filtered_service(current_user, db: Session, office_id: str | None = None, group_id: str | None = None):
-    """ADM 전용 필터 조회: office_id 또는 group_id 기준으로 간호사 목록 조회"""
+    
+    # nurse_id로 필터링했는데 결과가 없으면 예외
+    if nurse_id and not nurses:
+        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+    
+    # 만 나이 계산
+    current_date = date.today()
+    
+    def calculate_age(birth_date_str: str) -> Optional[int]:
+        if not birth_date_str:
+            return None
+        try:
+            birth_date = parse_date(birth_date_str).date()
+            current_year = current_date.year
+            birth_year = birth_date.year
+            age = current_year - birth_year
+            if (current_date.month, current_date.day) < (birth_date.month, birth_date.day):
+                age -= 1
+            return age
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Invalid birth_date format: {birth_date_str}, error: {e}")
+            return None
+    
+    # 결과 변환: NurseProfile과 호환
+    result = []
+    for nurse in nurses:
+        nurse_dict = {
+            "nurse_id": nurse.nurse_id,
+            "group_id": nurse.group_id,
+            "office_id": nurse.office_id,
+            "emp_num": nurse.emp_num,
+            "account_id": nurse.account_id,
+            "name": nurse.name,
+            "experience": nurse.experience,
+            "role": nurse.role,
+            "level_": nurse.level_,
+            "is_head_nurse": nurse.is_head_nurse,
+            "is_night_nurse": nurse.is_night_nurse or [],  # None일 경우 []
+            "personal_off_adjustment": nurse.personal_off_adjustment,
+            "preceptor_id": nurse.preceptor_id,
+            "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
+            "resignation_date": nurse.resignation_date.isoformat() if nurse.resignation_date else None,
+            "sequence": nurse.sequence,
+            "active": nurse.active,
+            "birth_date": nurse.birth_date,  # VARCHAR
+            "phone_number": nurse.phone_number,
+            "age": calculate_age(nurse.birth_date)
+        }
+        result.append(nurse_dict)
+    
+    return result
+
+# def get_nurses_filtered_service(current_user, db: Session, office_id: str | None = None, group_id: str | None = None):
+#     """ADM 전용 필터 조회: office_id 또는 group_id 기준으로 간호사 목록 조회"""
+#     if not current_user:
+#         raise Exception("Not authenticated")
+#     if not getattr(current_user, 'is_master_admin', False):
+#         raise Exception("Permission denied")
+#     q = db.query(NurseModel)
+#     # 제공 여부 기준으로 분기: 비어있는 문자열도 필터로 적용되어 []를 반환하게 함
+#     if group_id is not None:
+#         q = q.filter(NurseModel.group_id == group_id, NurseModel.office_id == current_user.office_id)
+#     elif office_id is not None:
+#         # 그룹 조인 후 office_id 매칭
+#         q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == current_user.office_id)
+#     nurses = q.order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc()).all()
+#     return nurses
+
+def get_nurses_filtered_service(
+    current_user,
+    db: Session,
+    office_id: Optional[str] = None,
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None
+):
+    """ADM 전용 필터 조회: office_id, group_id, nurse_id 기준으로 간호사 목록 조회"""
     if not current_user:
         raise Exception("Not authenticated")
     if not getattr(current_user, 'is_master_admin', False):
         raise Exception("Permission denied")
+    
     q = db.query(NurseModel)
-    # 제공 여부 기준으로 분기: 비어있는 문자열도 필터로 적용되어 []를 반환하게 함
+    
+    # 필터링: nurse_id
+    if nurse_id is not None:
+        q = q.filter(NurseModel.nurse_id == nurse_id)
+    
+    # 필터링: group_id
     if group_id is not None:
         q = q.filter(NurseModel.group_id == group_id, NurseModel.office_id == current_user.office_id)
+    
+    # 필터링: office_id
     elif office_id is not None:
-        # 그룹 조인 후 office_id 매칭
         q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == current_user.office_id)
-    nurses = q.order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc()).all()
-    return nurses
-
+    
+    # 정렬: active DESC, sequence ASC, experience DESC, nurse_id ASC
+    nurses = q.order_by(
+        NurseModel.active.desc(),
+        NurseModel.sequence.asc(),
+        NurseModel.experience.desc(),
+        NurseModel.nurse_id.asc()
+    ).all()
+    
+    # nurse_id로 필터링했는데 결과가 없으면 예외
+    if nurse_id is not None and not nurses:
+        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+    
+    # 만 나이 계산
+    current_date = date.today()
+    
+    def calculate_age(birth_date_str: str) -> Optional[int]:
+        if not birth_date_str:
+            return None
+        try:
+            birth_date = parse_date(birth_date_str).date()
+            current_year = current_date.year
+            birth_year = birth_date.year
+            age = current_year - birth_year
+            if (current_date.month, current_date.day) < (birth_date.month, birth_date.day):
+                age -= 1
+            return age
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Invalid birth_date format: {birth_date_str}, error: {e}")
+            return None
+    
+    # 결과 변환: NurseProfile과 호환
+    result = []
+    for nurse in nurses:
+        nurse_dict = {
+            "nurse_id": nurse.nurse_id,
+            "group_id": nurse.group_id,
+            "office_id": nurse.office_id,
+            "emp_num": nurse.emp_num,
+            "account_id": nurse.account_id,
+            "name": nurse.name,
+            "experience": nurse.experience,
+            "role": nurse.role,
+            "level_": nurse.level_,
+            "is_head_nurse": nurse.is_head_nurse,
+            "is_night_nurse": nurse.is_night_nurse or [],  # None일 경우 []
+            "personal_off_adjustment": nurse.personal_off_adjustment,
+            "preceptor_id": nurse.preceptor_id,
+            "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
+            "resignation_date": nurse.resignation_date.isoformat() if nurse.resignation_date else None,
+            "sequence": nurse.sequence,
+            "active": nurse.active,
+            "birth_date": nurse.birth_date,  # VARCHAR
+            "phone_number": nurse.phone_number,
+            "age": calculate_age(nurse.birth_date)
+        }
+        result.append(nurse_dict)
+    
+    return result
 
 
 def get_next_sequence_for_active_status(group_id: str, active_status: int, db: Session) -> int:

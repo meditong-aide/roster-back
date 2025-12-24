@@ -66,6 +66,9 @@ class Nurse(Base):
     weekly_off_weekday = Column(TINYINT, nullable=True)  # 기준 월에서의 주휴 요일 (0:월~6:일)
     nurse_memo = Column(TEXT, nullable=True)
     grade = Column(INTEGER, nullable=True)
+    # 사이드 프로필 관련 추가 컬럼
+    birth_date = Column(VARCHAR(10), nullable=True)
+    phone_number = Column(VARCHAR(20), nullable=True)
     
     group = relationship("Group")
     __table_args__ = (
