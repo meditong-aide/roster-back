@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import hashlib
+from datetime import timedelta
 from typing import Any, Dict, List, Tuple
 import numpy as np
 
@@ -323,10 +324,23 @@ def _compute_join_leave(rs):
     join, leave = [], []
     first_day = rs.target_month
     D = rs.num_days
+    last_day = first_day + timedelta(days=D - 1)
     for nu in rs.nurses:
         j = (nu.joining_date - first_day).days if getattr(nu, "joining_date", None) else 0
-        l = (nu.resignation_date - first_day).days if getattr(nu, "resignation_date", None) else D - 1
-        join.append(max(j, 0))
-        leave.append(min(l, D - 1))
+        if getattr(nu, "resignation_date", None):
+            if nu.resignation_date < first_day:
+                # 이번 달 이전에 퇴사한 경우: 변수 생성을 막기 위해 범위를 비워둔다.
+                join.append(1)
+                leave.append(0)
+                continue
+            l = (nu.resignation_date - first_day).days
+            if nu.resignation_date > last_day:
+                l = D - 1
+        else:
+            l = D - 1
+        j = max(j, 0)
+        l = min(l, D - 1)
+        join.append(j)
+        leave.append(l)
     return join, leave
 

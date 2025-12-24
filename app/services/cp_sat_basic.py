@@ -579,12 +579,25 @@ class CPSATBasicEngine:
         day_idx, eve_idx, night_idx, off_idx = idx['D'], idx['E'], idx['N'], idx['O']
 
         first_day = roster_system.target_month
+        last_day = first_day + timedelta(days=D - 1)
         join, leave = [], []
         for nu in roster_system.nurses:
             j = (nu.joining_date - first_day).days if nu.joining_date else 0
-            l = (nu.resignation_date - first_day).days if nu.resignation_date else D - 1
-            join.append(max(j, 0))
-            leave.append(min(l, D - 1))
+            if nu.resignation_date:
+                if nu.resignation_date < first_day:
+                    # 이번 달에 근무하지 않는 인원은 범위 밖으로 설정하여 변수 생성을 건너뛴다.
+                    join.append(1)
+                    leave.append(0)
+                    continue
+                l = (nu.resignation_date - first_day).days
+                if nu.resignation_date > last_day:
+                    l = D - 1
+            else:
+                l = D - 1
+            j = max(j, 0)
+            l = min(l, D - 1)
+            join.append(j)
+            leave.append(l)
 
         # 고정셀(메인코드 정규화)
         code2main = {c: r['main_code'] for r in (grouped or []) for c in r['codes']}
@@ -613,9 +626,12 @@ class CPSATBasicEngine:
                 for d in range(join[n], leave[n] + 1):
                     for s in range(S):
                         Xv[n, d, s] = m.NewBoolVar(f'x_{n}_{d}_{s}')
-
+            active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
             # 고정 셀
             for (n, d), s_idx in fixed.items():
+                if (n, d) not in active_days:
+                    print(f"{self.logger_prefix} 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
+                    continue
                 m.Add(X(n, d, s_idx) == 1)
                 for s in range(S):
                     if s != s_idx:
@@ -629,6 +645,9 @@ class CPSATBasicEngine:
                             if code not in roster_system.config.shift_types:
                                 continue
                             s_idx = roster_system.config.shift_types.index(code)
+                            if (n, d) not in active_days:
+                                print(f"{self.logger_prefix} 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
+                                continue
                             if (n, d) in fixed and fixed[(n, d)] == s_idx:
                                 print(f"{self.logger_prefix} 경계 금지-고정 충돌 무시: n={n}, d={d+1}, code={code}")
                                 continue
@@ -1262,9 +1281,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for s in range(S):
                 Xv[n,d,s]=m.NewBoolVar(f'x_{n}_{d}_{s}')
     def X(n,d,s):  return Xv.get((n,d,s),0)
+    active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
     
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
+        if (n, d) not in active_days:
+            print(f"[CP-SAT-Basic] 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
+            continue
         m.Add(X(n,d,s_idx)==1)
         for s in range(S):
             if s!=s_idx: m.Add(X(n,d,s)==0)
@@ -1276,6 +1299,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if code not in rs.config.shift_types:
                         continue
                     s_idx = rs.config.shift_types.index(code)
+                    if (n, d) not in active_days:
+                        print(f"[CP-SAT-Basic] 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
+                        continue
                     if (n,d) in fixed and fixed[(n,d)] == s_idx:
                         print(f"[CP-SAT-Basic] 경고: 초기 금지와 고정 충돌 (n={n}, d={d+1}, code={code})")
                     m.Add(X(n,d,s_idx)==0)
