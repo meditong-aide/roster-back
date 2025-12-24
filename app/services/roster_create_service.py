@@ -463,6 +463,31 @@ def _weekday_dates_in_month(year: int, month: int, weekday: int) -> list[int]:
     return result
 
 
+def _active_range_in_month(nurse: Nurse, month_start: date, days_in_month: int) -> tuple[int, int] | None:
+    """한 달 기준 간호사의 근무 가능 day_idx 구간을 반환합니다."""
+    month_end = month_start + timedelta(days=days_in_month - 1)
+    resign = getattr(nurse, "resignation_date", None)
+    join = getattr(nurse, "joining_date", None)
+    join_date = join.date() if join else None
+    resign_date = resign.date() if resign else None
+    # ❌ 월과 겹치지 않으면 바로 제외
+    if resign_date and resign_date < month_start:
+        return None
+    if join_date and join_date > month_end:
+        return None
+    # ✅ 실제 근무 가능 날짜 범위
+    start_date = max(join_date, month_start) if join_date else month_start
+    end_date = min(resign_date, month_end) if resign_date else month_end
+
+    if start_date > end_date:
+        return None
+
+    start_idx = (start_date - month_start).days
+    end_idx = (end_date - month_start).days
+
+    return start_idx, end_idx
+
+
 def _compute_weekly_off_day_indices_for_month(
     db: Session,
     office_id: str,
@@ -1090,6 +1115,14 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     weekly_off_conflicts: list[dict] = []
     weekly_off_map: dict[str, set[int]] = {}
     weekly_off_fixed_cells: list[dict] = []
+    month_start = date(req.year, req.month, 1)
+    days_in_month = calendar.monthrange(req.year, req.month)[1]
+    active_range_map = {
+        str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
+        for n in nurses_in_group
+    }
+
+    print('active_range_map', active_range_map)
     try:
         weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
             db=db,
@@ -1098,6 +1131,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             year=req.year,
             month=req.month,
         )
+        if weekly_off_map:
+            filtered_map: dict[str, set[int]] = {}
+            for nurse_id, day_set in weekly_off_map.items():
+                rng = active_range_map.get(str(nurse_id))
+                if not rng:
+                    continue
+                start_idx, end_idx = rng
+                clipped = {d for d in day_set if start_idx <= d <= end_idx}
+                if clipped:
+                    filtered_map[str(nurse_id)] = clipped
+            weekly_off_map = filtered_map
         if weekly_off_map:
             nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
             for nurse_id, day_set in weekly_off_map.items():
@@ -1132,7 +1176,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 if not shifts:
                     continue
                 for d in day_set:
-                    if 0 <= d < len(shifts):
+                    if start_idx <= d <= end_idx and 0 <= d < len(shifts):
                         shifts[d] = "주"
     except Exception as e:
         weekly_off_warnings.append({"type": "weekly_off_mark_failed", "detail": str(e)})

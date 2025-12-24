@@ -444,6 +444,37 @@ class CPSATBasicEngine:
             print(f"{self.logger_prefix} 대시보드 서비스를 찾을 수 없습니다.")
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
+
+        # Grade 배치 요약 출력/CSV 저장 (GRADE 전략일 때만)
+        try:
+            grade_strategy_norm = str(grade_strategy or "BASE").upper()
+            if grade_strategy_norm == "GRADE" and grade_config:
+                _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
+        except Exception as e:
+            print(f"{self.logger_prefix} Grade 요약 출력 중 오류: {e}")
+
+        # Grade-aware Local Repair (Phase 3)
+        try:
+            grade_strategy_norm = str(grade_strategy or "BASE").upper()
+            if grade_strategy_norm == "GRADE" and grade_config:
+                from services.repairs.grade_repair import grade_local_repair
+                updated_roster, repair_log = grade_local_repair(
+                    roster_system,
+                    grade_config,
+                    max_iterations=100,
+                    max_moves_per_nurse=1,
+                )
+                roster_system.roster = updated_roster
+                # repair 로그 간단 출력
+                if repair_log:
+                    print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
+                    for r in repair_log[:10]:
+                        print(f"{self.logger_prefix} [REPAIR] {r}")
+                # repair 이후 결과로 DB 변환 갱신
+                result = self._convert_result_to_db_format(roster_system, nurses)
+        except Exception as e:
+            print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
+
         return {
             "roster": result,
             "satisfaction_data": satisfaction_data,
@@ -548,12 +579,25 @@ class CPSATBasicEngine:
         day_idx, eve_idx, night_idx, off_idx = idx['D'], idx['E'], idx['N'], idx['O']
 
         first_day = roster_system.target_month
+        last_day = first_day + timedelta(days=D - 1)
         join, leave = [], []
         for nu in roster_system.nurses:
             j = (nu.joining_date - first_day).days if nu.joining_date else 0
-            l = (nu.resignation_date - first_day).days if nu.resignation_date else D - 1
-            join.append(max(j, 0))
-            leave.append(min(l, D - 1))
+            if nu.resignation_date:
+                if nu.resignation_date < first_day:
+                    # 이번 달에 근무하지 않는 인원은 범위 밖으로 설정하여 변수 생성을 건너뛴다.
+                    join.append(1)
+                    leave.append(0)
+                    continue
+                l = (nu.resignation_date - first_day).days
+                if nu.resignation_date > last_day:
+                    l = D - 1
+            else:
+                l = D - 1
+            j = max(j, 0)
+            l = min(l, D - 1)
+            join.append(j)
+            leave.append(l)
 
         # 고정셀(메인코드 정규화)
         code2main = {c: r['main_code'] for r in (grouped or []) for c in r['codes']}
@@ -582,9 +626,12 @@ class CPSATBasicEngine:
                 for d in range(join[n], leave[n] + 1):
                     for s in range(S):
                         Xv[n, d, s] = m.NewBoolVar(f'x_{n}_{d}_{s}')
-
+            active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
             # 고정 셀
             for (n, d), s_idx in fixed.items():
+                if (n, d) not in active_days:
+                    print(f"{self.logger_prefix} 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
+                    continue
                 m.Add(X(n, d, s_idx) == 1)
                 for s in range(S):
                     if s != s_idx:
@@ -598,6 +645,9 @@ class CPSATBasicEngine:
                             if code not in roster_system.config.shift_types:
                                 continue
                             s_idx = roster_system.config.shift_types.index(code)
+                            if (n, d) not in active_days:
+                                print(f"{self.logger_prefix} 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
+                                continue
                             if (n, d) in fixed and fixed[(n, d)] == s_idx:
                                 print(f"{self.logger_prefix} 경계 금지-고정 충돌 무시: n={n}, d={d+1}, code={code}")
                                 continue
@@ -611,18 +661,6 @@ class CPSATBasicEngine:
                     if (n, d) in fixed:
                         continue
                     m.AddExactlyOne(X(n, d, s) for s in range(S))
-
-            # Grade 제약(하드): grade_strategy="GRADE"일 때만 적용
-            # - 폴백(서열)에서도 동일 제약을 유지해야 해 공간/평가가 안정적이다.
-            add_grade_constraints(
-                m=m,
-                rs=roster_system,
-                X=X,
-                join=join,
-                leave=leave,
-                grade_strategy=str(getattr(roster_system, "grade_strategy", "BASE")),
-                grade_config=getattr(roster_system, "grade_config", None),
-            )
 
             # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
             short_terms, over_terms = [], []
@@ -638,7 +676,6 @@ class CPSATBasicEngine:
                     s = roster_system.config.shift_types.index(code)
                     need = int(req) - fixed_cnt[d][s]
                     if need <= 0:
-                        # 고정으로 이미 충분한 경우는 oversupply만 억제 대상에서 제외
                         continue
                     assigned = sum(
                         X(n, d, s)
@@ -647,7 +684,9 @@ class CPSATBasicEngine:
                     )
                     sh = m.NewIntVar(0, N, f'short_{d}_{code}')
                     ov = m.NewIntVar(0, N, f'over_{d}_{code}')
-                    m.Add(assigned + sh - ov == need)
+                    # Coverage 우선: assigned + shortage >= need (hard), oversupply 추적은 선택
+                    m.Add(assigned + sh >= need)
+                    m.Add(assigned - ov <= need)
                     short_terms.append(sh)
                     over_terms.append(ov)
                     over_vars_by_day.setdefault(d, {})[code] = ov
@@ -819,8 +858,8 @@ class CPSATBasicEngine:
 
             # stage별 목적/고정
             if stage == 1:
-                # 커버리지: shortage 우선, over는 약벌
-                m.Minimize(1000 * sum(short_terms) + sum(over_terms))
+                # 커버리지: shortage를 압도적으로 최소화 (coverage-first)
+                m.Minimize(100000 * sum(short_terms) + sum(over_terms))
             elif stage == 2:
                 # 1단계 최솟값 고정 + over 상한 유지
                 if coverage_eq is not None:
@@ -891,7 +930,7 @@ class CPSATBasicEngine:
                 # - BASE : Team OFF
                 try:
                     grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
-                    # print('grade_strategy', grade_strategy)
+                    print('grade_strategy', grade_strategy)
                     # grade_strategy = "TEAM"
                     if grade_strategy == "TEAM":
                         obj.extend(add_team_balance_objective_terms(m, roster_system, X, join, leave))
@@ -899,6 +938,24 @@ class CPSATBasicEngine:
                     print('team_balance_objective_terms 예외 발생')
                     print('e', e)
                     pass
+
+                # Grade 제약을 soft penalty로 추가 (distribution 전용)
+                try:
+                    grade_terms = add_grade_constraints(
+                        m=m,
+                        rs=roster_system,
+                        X=X,
+                        join=join,
+                        leave=leave,
+                        grade_strategy=str(getattr(roster_system, "grade_strategy", "BASE")),
+                        grade_config=getattr(roster_system, "grade_config", None),
+                    )
+                    obj.extend(grade_terms or [])
+                except Exception as e:
+                    print('grade_constraints 예외 발생')
+                    print('e', e)
+                    pass
+
                 m.Maximize(sum(obj))
 
             return m, X, short_terms, over_terms, safety
@@ -1176,12 +1233,36 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     m = cp_model.CpModel()
     N,D,S = len(rs.nurses), rs.num_days, rs.config.num_shifts
     # join / leave index
-    join, leave = [],[]
+    join, leave = [], []
     first_day = rs.target_month
+    last_day = first_day + timedelta(days=D-1)
+
     for nu in rs.nurses:
-        j = (nu.joining_date-first_day).days if nu.joining_date else 0
-        l = (nu.resignation_date-first_day).days if nu.resignation_date else D-1
-        join.append(max(j,0)); leave.append(min(l,D-1))
+        # join
+        if nu.joining_date:
+            j = (nu.joining_date - first_day).days
+        else:
+            j = 0
+
+        # leave
+        if nu.resignation_date:
+            if nu.resignation_date < first_day:
+                # 이번 달 이전 퇴사 → 이번 달 근무 대상 아님
+                join.append(1)      # dummy
+                leave.append(0)     # join > leave → 아래에서 제외 처리
+                continue
+            elif nu.resignation_date > last_day:
+                l = D-1
+            else:
+                l = (nu.resignation_date - first_day).days
+        else:
+            l = D-1
+
+        j = max(j, 0)
+        l = min(l, D-1)
+
+        join.append(j)
+        leave.append(l)
     # 고정 셀 (수간호사 등)
     code2main = {c:r['main_code']
                  for r in (grouped or []) for c in r['codes']}
@@ -1200,9 +1281,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for s in range(S):
                 Xv[n,d,s]=m.NewBoolVar(f'x_{n}_{d}_{s}')
     def X(n,d,s):  return Xv.get((n,d,s),0)
+    active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
     
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
+        if (n, d) not in active_days:
+            print(f"[CP-SAT-Basic] 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
+            continue
         m.Add(X(n,d,s_idx)==1)
         for s in range(S):
             if s!=s_idx: m.Add(X(n,d,s)==0)
@@ -1214,6 +1299,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if code not in rs.config.shift_types:
                         continue
                     s_idx = rs.config.shift_types.index(code)
+                    if (n, d) not in active_days:
+                        print(f"[CP-SAT-Basic] 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
+                        continue
                     if (n,d) in fixed and fixed[(n,d)] == s_idx:
                         print(f"[CP-SAT-Basic] 경고: 초기 금지와 고정 충돌 (n={n}, d={d+1}, code={code})")
                     m.Add(X(n,d,s_idx)==0)
@@ -1395,8 +1483,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # - TEAM : Team ON
         # - BASE : Team OFF
         grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        # print('grade_strategy', grade_strategy)
         # grade_strategy = "TEAM"
+        print('grade_strategy', grade_strategy)
         if grade_strategy == "TEAM":
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))
 
@@ -1432,18 +1520,6 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         pass
     
     m.Maximize(sum(obj))
-
-    # Grade 제약(하드): grade_strategy="GRADE"일 때만 적용
-    add_grade_constraints(
-        m=m,
-        rs=rs,
-        X=X,
-        join=join,
-        leave=leave,
-        grade_strategy=str(getattr(rs, "grade_strategy", "BASE")),
-        # grade_strategy="GRADE",
-        grade_config=getattr(rs, "grade_config", None),
-    )
 
     return m,X,join,leave,fixed
 
@@ -1604,6 +1680,109 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
     _dt = _t.time()-_t0
     print(f"[CP-SAT-Basic] 프리셉터 항: 쌍 {len(pairs)}개, 변수 {_added}개, {_dt:.2f}s, 강도 {strength}x, K={K_default}, shifts={focus_codes}")
     return obj_terms
+
+
+# ─────────────────────────────────────────────────────────────
+# Grade 배치 요약/CSV 덤프
+# ─────────────────────────────────────────────────────────────
+import csv
+import os
+import hashlib
+
+
+def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_prefix: str = "[CP-SAT-Basic]"):
+    """일자/교대별 Grade 배치 현황과 요구치 대비 비율을 출력하고 CSV로 저장한다."""
+    constraints_map = grade_config.get("constraints") or grade_config.get("constraints_json") or {}
+    if not constraints_map:
+        print(f"{logger_prefix} Grade 요약: constraints 없음, 스킵")
+        return
+
+    shift_types = rs.config.shift_types
+    # 추출된 grade 값 정의역
+    grades = set()
+    for _, gmap in constraints_map.items():
+        if not isinstance(gmap, dict):
+            continue
+        for k in gmap.keys():
+            try:
+                grades.add(int(k))
+            except Exception:
+                continue
+    grade_values = sorted(grades) or [1, 2, 3]
+
+    # NULL Grade 처리 정책
+    null_policy = str(grade_config.get("null_grade_policy") or "LOWEST").upper()
+    valid_grades = [n.grade for n in nurses if getattr(n, "grade", None) is not None]
+    avg_grade = round(sum(valid_grades) / len(valid_grades)) if valid_grades else max(grade_values)
+
+    def _resolve_grade(nurse):
+        g = getattr(nurse, "grade", None)
+        if g is not None:
+            try:
+                gi = int(g)
+                if gi in grade_values:
+                    return gi
+            except Exception:
+                pass
+        if null_policy == "AVERAGE":
+            return avg_grade if avg_grade in grade_values else max(grade_values)
+        if null_policy == "RANDOM":
+            h = hashlib.md5(str(getattr(nurse, "db_id", nurse.name)).encode()).hexdigest()
+            return grade_values[int(h[:8], 16) % len(grade_values)]
+        # LOWEST
+        return max(grade_values)
+
+    nurse_grades = [ _resolve_grade(n) for n in nurses ]
+
+    rows = []
+    for d in range(rs.num_days):
+        for shift_code, gmap in constraints_map.items():
+            s_code = str(shift_code or "").upper()
+            if s_code not in shift_types:
+                continue
+            s_idx = shift_types.index(s_code)
+            # 배정된 간호사/grade 카운트
+            assigned_by_grade = {g: 0 for g in grade_values}
+            for n_idx in range(len(nurses)):
+                # roster는 one-hot
+                if int(rs.roster[n_idx, d, s_idx]) == 1:
+                    g = nurse_grades[n_idx]
+                    assigned_by_grade[g] = assigned_by_grade.get(g, 0) + 1
+            # 요구치
+            req_by_grade = {}
+            for k, v in (gmap or {}).items():
+                try:
+                    gi = int(k)
+                    req_by_grade[gi] = int(v)
+                except Exception:
+                    continue
+
+            # 비율 계산 및 로그/CSV
+            for g in grade_values:
+                req = req_by_grade.get(g, 0)
+                got = assigned_by_grade.get(g, 0)
+                ratio = (got / req) if req > 0 else None
+                rows.append({
+                    "day": d + 1,
+                    "shift": s_code,
+                    "grade": g,
+                    "required": req,
+                    "assigned": got,
+                    "ratio": ratio if ratio is not None else "",
+                })
+
+    # 로그 요약 (상위 몇 개)
+    print(f"{logger_prefix} Grade 배치 요약 (일부)")
+    for r in rows[: min(15, len(rows))]:
+        print(f"  day={r['day']:2}, shift={r['shift']}, grade={r['grade']}: req={r['required']}, got={r['assigned']}, ratio={r['ratio']}")
+
+    # CSV 저장
+    out_path = os.path.join("/tmp", "grade_summary.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["day", "shift", "grade", "required", "assigned", "ratio"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"{logger_prefix} Grade 요약 CSV 저장: {out_path}")
 
 
 cp_sat_engine = CPSATBasicEngine()
