@@ -453,6 +453,28 @@ class CPSATBasicEngine:
         except Exception as e:
             print(f"{self.logger_prefix} Grade 요약 출력 중 오류: {e}")
 
+        # Grade-aware Local Repair (Phase 3)
+        try:
+            grade_strategy_norm = str(grade_strategy or "BASE").upper()
+            if grade_strategy_norm == "GRADE" and grade_config:
+                from services.repairs.grade_repair import grade_local_repair
+                updated_roster, repair_log = grade_local_repair(
+                    roster_system,
+                    grade_config,
+                    max_iterations=100,
+                    max_moves_per_nurse=1,
+                )
+                roster_system.roster = updated_roster
+                # repair 로그 간단 출력
+                if repair_log:
+                    print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
+                    for r in repair_log[:10]:
+                        print(f"{self.logger_prefix} [REPAIR] {r}")
+                # repair 이후 결과로 DB 변환 갱신
+                result = self._convert_result_to_db_format(roster_system, nurses)
+        except Exception as e:
+            print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
+
         return {
             "roster": result,
             "satisfaction_data": satisfaction_data,
@@ -889,7 +911,7 @@ class CPSATBasicEngine:
                 # - BASE : Team OFF
                 try:
                     grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
-                    # print('grade_strategy', grade_strategy)
+                    print('grade_strategy', grade_strategy)
                     # grade_strategy = "TEAM"
                     if grade_strategy == "TEAM":
                         obj.extend(add_team_balance_objective_terms(m, roster_system, X, join, leave))
@@ -1192,12 +1214,36 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     m = cp_model.CpModel()
     N,D,S = len(rs.nurses), rs.num_days, rs.config.num_shifts
     # join / leave index
-    join, leave = [],[]
+    join, leave = [], []
     first_day = rs.target_month
+    last_day = first_day + timedelta(days=D-1)
+
     for nu in rs.nurses:
-        j = (nu.joining_date-first_day).days if nu.joining_date else 0
-        l = (nu.resignation_date-first_day).days if nu.resignation_date else D-1
-        join.append(max(j,0)); leave.append(min(l,D-1))
+        # join
+        if nu.joining_date:
+            j = (nu.joining_date - first_day).days
+        else:
+            j = 0
+
+        # leave
+        if nu.resignation_date:
+            if nu.resignation_date < first_day:
+                # 이번 달 이전 퇴사 → 이번 달 근무 대상 아님
+                join.append(1)      # dummy
+                leave.append(0)     # join > leave → 아래에서 제외 처리
+                continue
+            elif nu.resignation_date > last_day:
+                l = D-1
+            else:
+                l = (nu.resignation_date - first_day).days
+        else:
+            l = D-1
+
+        j = max(j, 0)
+        l = min(l, D-1)
+
+        join.append(j)
+        leave.append(l)
     # 고정 셀 (수간호사 등)
     code2main = {c:r['main_code']
                  for r in (grouped or []) for c in r['codes']}
@@ -1411,8 +1457,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # - TEAM : Team ON
         # - BASE : Team OFF
         grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        # print('grade_strategy', grade_strategy)
         # grade_strategy = "TEAM"
+        print('grade_strategy', grade_strategy)
         if grade_strategy == "TEAM":
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))
 
