@@ -46,17 +46,29 @@ router = APIRouter(
 async def get_nurses_in_group(
     office_id: Optional[str] = None,
     group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None, # 신규 파라미터
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     try:
         # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
         if current_user.is_master_admin:
-            return get_nurses_filtered_service(current_user, db, office_id=office_id, group_id=group_id)
-        return get_nurses_in_group_service(current_user, db)
+            return get_nurses_filtered_service(
+                current_user, 
+                db, 
+                office_id=office_id, 
+                group_id=group_id, 
+                nurse_id=nurse_id   # nurse_id 전달
+            )
+        return get_nurses_in_group_service(
+            current_user, 
+            db,
+            nurse_id=nurse_id   # nurse_id 전달
+        )
     except Exception as e:
         print('[DEBUG] [nurses.py - get_nurses_in_group] office_id', office_id)
         print('[DEBUG] [nurses.py - get_nurses_in_group] group_id', group_id)
+        print('[DEBUG] [nurses.py - get_nurses_in_group] nurse_id', nurse_id)
         print('[DEBUG] [nurses.py - get_nurses_in_group] current_user', current_user.__dict__)
         print('[DEBUG] [nurses.py - get_nurses_in_group] error', e)
         # raise HTTPException(status_code=500, detail=f"간호사 목록 조회 실패: {str(e)}")

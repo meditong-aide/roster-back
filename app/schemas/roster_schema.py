@@ -147,6 +147,10 @@ class NurseProfile(BaseModel):
     nurse_memo: Optional[str] = None
     grade: Optional[int] = None
     emp_num: Optional[str] = None
+    # Side-Profile 추가 컬럼
+    birth_date: Optional[str] = None
+    phone_number: Optional[str] = None
+    age: Optional[int] = None # 나이
 
     class Config:
         from_attributes = True

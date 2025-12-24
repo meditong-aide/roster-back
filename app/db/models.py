@@ -52,7 +52,7 @@ class Nurse(Base):
     emp_auth_gbn = Column(VARCHAR(3), name='EmpAuthGbn', nullable=True)
     # is_night_nurse = Column(SMALLINT, default=0)
     # is_night_nurse 컬럼 변경
-    is_night_nurse = Column(JSON, nullable=True)  # 코드 리스트
+    is_night_nurse = Column(JSON, nullable=False, default=[])  # 코드 리스트
     personal_off_adjustment = Column(TINYINT, default=0)
     preceptor_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"))
     joining_date = Column(DATETIME, nullable=True)
@@ -68,6 +68,9 @@ class Nurse(Base):
     weekly_off_weekday = Column(TINYINT, nullable=True)  # 기준 월에서의 주휴 요일 (0:월~6:일)
     nurse_memo = Column(TEXT, nullable=True)
     grade = Column(INTEGER, nullable=True)
+    # 사이드 프로필 관련 추가 컬럼
+    birth_date = Column(VARCHAR(10), nullable=True)
+    phone_number = Column(VARCHAR(20), nullable=True)
     
     group = relationship("Group")
     __table_args__ = (
