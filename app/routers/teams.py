@@ -21,9 +21,6 @@ async def get_teams(
             target_group_id = group_id
         else:
             target_group_id = current_user.group_id
-
-        print('[DEBUG] [teams.py - get_teams] target_group_id', target_group_id)
-        print('[DEBUG] [teams.py - get_teams] current_user', current_user.__dict__)
         return list_teams_with_members(db, current_user.office_id, target_group_id)
     except Exception as e:
         print('[DEBUG] [teams.py - get_teams] office_id', current_user.office_id)

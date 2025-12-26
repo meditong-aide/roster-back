@@ -105,30 +105,19 @@ async def get_config_versions(
     """현재 대상 그룹의 설정 버전 목록 조회 (HN/ADM)."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-
-    # 대상 그룹/오피스 결정
-    if current_user.is_head_nurse and current_user.group_id:
-        office_id = current_user.office_id
-        target_group_id = current_user.group_id
+    if current_user.is_master_admin:
+        target_group_id = group_id
+        target_office_id = current_user.office_id
     else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        office_id = g.office_id
-        target_group_id = g.group_id
+        target_group_id = current_user.group_id
+        target_office_id = current_user.office_id
     
     try:
         versions = db.query(
             RosterConfigModel.config_id,
             func.max(RosterConfigModel.created_at).label('latest_created_at')
         ).filter(
-            RosterConfigModel.office_id == office_id,
+            RosterConfigModel.office_id == target_office_id,
             RosterConfigModel.group_id == target_group_id,
             RosterConfigModel.config_id.isnot(None)
         ).group_by(RosterConfigModel.config_id).order_by(
@@ -146,31 +135,17 @@ async def get_config_by_version(
     db: Session = Depends(get_db)
 ):
     """Get the latest config for a specific version"""
+    print('[/config/version/{config_version}] group_id', group_id)
+    print('[/config/version/{config_version}] current_user', current_user.__dict__)
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-
-    is_admin = bool(getattr(current_user, 'is_master_admin', False))
-
-    # Resolve target office/group based on role and optional query param
-    target_office_id: Optional[str] = None
-    target_group_id: Optional[str] = None
-
-    if current_user.is_head_nurse and current_user.group_id:
+    if current_user.is_master_admin:
+        target_group_id = group_id
         target_office_id = current_user.office_id
-        target_group_id = current_user.group_id
     else:
-        if not is_admin:
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        # Optional safety: ensure admin belongs to same office if present
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
-        target_office_id = g.office_id
+        target_group_id = current_user.group_id
+        target_office_id = current_user.office_id
+
     # load latest config for target
     config = db.query(RosterConfigModel).filter(
         RosterConfigModel.office_id == target_office_id,
@@ -179,16 +154,13 @@ async def get_config_by_version(
     try:
         if not config:
             # Use resolved target identifiers (HN: own group, ADM: provided group_id)
-            office_id = target_office_id
-            gid = target_group_id
-            if office_id is None or gid is None:
-                raise HTTPException(status_code=400, detail="group_id (and office_id) required")
+
             cfg = DEFAULT_CONFIG
             # DEFAULT 설정으로 RosterConfig 레코드 생성 및 저장
             new_config = RosterConfigModel(
                 # config_version="default",
-                office_id=office_id,
-                group_id=gid,
+                office_id=target_office_id,
+                group_id=target_group_id,
                 # day_req=cfg.daily_shift_requirements.get('D', 3),
                 # eve_req=cfg.daily_shift_requirements.get('E', 3),
                 # nig_req=cfg.daily_shift_requirements.get('N', 2),
@@ -209,6 +181,7 @@ async def get_config_by_version(
                 even_nights=getattr(cfg, 'even_nights', True),
                 nod_noe=False,
                 preceptor_gauge=getattr(cfg, 'preceptor_gauge', 5),
+                weekly_off_group=getattr(cfg, 'weekly_off_group', False),
             )
             db.add(new_config)
 
@@ -240,6 +213,7 @@ async def get_config_by_version(
                 "created_at": new_config.created_at.isoformat() if new_config.created_at else None,
                 "nod_noe": new_config.nod_noe,
                 "preceptor_gauge" : new_config.preceptor_gauge,
+                "weekly_off_group" : new_config.weekly_off_group,
             }
         else:
             config = db.query(RosterConfigModel).filter(
@@ -273,6 +247,7 @@ async def get_config_by_version(
                 "created_at": config.created_at.isoformat() if config.created_at else None,
                 "nod_noe": config.nod_noe,
                 "preceptor_gauge" : config.preceptor_gauge,
+                "weekly_off_group" : config.weekly_off_group,
             }
     except Exception as e:
         print('error', e)
@@ -294,7 +269,6 @@ async def get_latest_schedule(
             target_group_id = group_id
         else:
             target_group_id = current_user.group_id
-        print('[/latest] target_group_id', target_group_id)
         return get_latest_schedule_service(current_user, db, override_group_id=target_group_id)
     except Exception as e:
         print('[DEBUG] [roster.py - get_latest_schedule] current_user', current_user.__dict__)
@@ -540,7 +514,6 @@ async def get_schedule_versions(
         Schedule.dropped == False
     ).order_by(Schedule.version.desc()).all()
     print('[roster.py - get_schedule_versions] target_group_id', target_group_id)
-    print('[roster.py - get_schedule_versions] schedules', [s.__dict__ for s in schedules if s is not None])
 
     return [{
         "schedule_id": schedule.schedule_id,
@@ -548,6 +521,7 @@ async def get_schedule_versions(
         "status": schedule.status,
         "created_at": schedule.created_at.isoformat() if schedule.created_at else None,
         "created_by": schedule.created_by,
+        "updated_at": schedule.updated_at.isoformat() if schedule.updated_at else None,
         "name": schedule.name
     } for schedule in schedules]
 
@@ -1115,6 +1089,21 @@ async def validate_roster(
         # OFF(휴무) 도 항상 포함시킴
         alias_map.setdefault('OFF', 'O')
         alias_map.setdefault('O',   'O')
+        # 주휴(표시용)도 휴무(O)로 동일 취급한다.
+        alias_map.setdefault('주', 'O')
+        # Shift 테이블에 휴무 타입이 더 있으면 모두 O로 정규화(예: 병원별 OFF 코드, 주휴 코드 등)
+        try:
+            off_shift_ids = (
+                db.query(Shift.shift_id)
+                .filter(Shift.office_id == office_id, Shift.group_id == target_group_id)
+                .filter(Shift.type.in_(["휴무"]))
+                .all()
+            )
+            for (sid,) in off_shift_ids:
+                if sid:
+                    alias_map.setdefault(str(sid).upper(), 'O')
+        except Exception as e:
+            print(f"[validate_roster] 휴무 shift 정규화 로딩 실패: {e}")
         # ──────────────────────── 2. 근무표 설정(인원/제약) 불러오기 ────────────────────────
         latest_config_db = db.query(RosterConfigModel).filter(
             RosterConfigModel.office_id == office_id,

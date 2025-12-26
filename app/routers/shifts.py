@@ -151,7 +151,6 @@ async def get_shift_manage(
     반환
     - 슬롯 목록: [{ shift_slot, main_code, codes, manpower }]
     """
-    print('진입')
     try:
         if not current_user:
             print('[/shift-manage/{class_name}]: 유저 없음')
@@ -216,8 +215,9 @@ async def get_shift_manage(
         db.commit()
 
         shift_manages = query.order_by(ShiftManage.shift_slot.asc()).all()
-
-    return [
+    # for shift in shifts:
+    #     shift_manages.append({'shift_slot': 4, 'main_code': 'O', 'codes': [shift.default_shift], 'manpower': 0})
+    response = [
         {
             "shift_slot": sm.shift_slot,
             "main_code": sm.main_code,
@@ -226,6 +226,11 @@ async def get_shift_manage(
         }
         for sm in shift_manages
     ]
+    # default_shift에 '주'가 포함된 shift를 shifts 테이블에서 찾아서 shift_manages에 추가
+    shifts = db.query(Shift).filter(Shift.default_shift.like('%주%')).all()
+    shift_codes = [shift.default_shift for shift in shifts]
+    response.append({'shift_slot': 4, 'main_code': 'O', 'codes': shift_codes, 'manpower': ''})
+    return response
 
 
 @router.post("/shift-manage/save")

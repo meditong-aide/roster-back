@@ -44,7 +44,6 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
             .order_by(Shift.sequence.asc())
             .all()
         )
-        print('shifts', [s.shift_id for s in shifts])
         if shifts:
             
             return [
@@ -101,6 +100,9 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
             ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E"),
             ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N"),
             ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D"),
+            # 주휴(표시용): 엔진/검증에서는 O로 정규화하여 휴무로 카운트한다.
+            # sequence는 중복을 피하기 위해 기본 4개 뒤로 배치한다.
+            ("주", "주휴", "#ff977b", None, None, "휴무", 1, 0, None, 5, "주"),
         ]
         for args in defaults:
             session.add(_mk(*args))

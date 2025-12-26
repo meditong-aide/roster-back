@@ -25,6 +25,7 @@ from db.models import (
     IssuedRoster,
     ShiftManage,
     IssuedRosterSnapshot,
+    WeeklyOffSetting,
 )
 from db.roster_config import NurseRosterConfig
 from db.nurse_config import Nurse as NurseEngine
@@ -58,8 +59,6 @@ def save_roster_config_service(
             
             nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
 
-            # if not nurse or not nurse.group:
-            #     raise Exception("User group information not found")
             target_group_id = user.group_id
             target_office_id = nurse.group.office_id
 
@@ -94,6 +93,16 @@ def save_roster_config_service(
             office_id=target_office_id,
             group_id=target_group_id,
         )
+        weekly_off_group = config_dict.get('weekly_off_group')
+        db.query(WeeklyOffSetting).filter(
+            WeeklyOffSetting.office_id == target_office_id,
+            WeeklyOffSetting.group_id == target_group_id,
+        ).update(
+            {
+                'activate': 1 if weekly_off_group else 0
+            }
+        )
+        
         db.add(db_config)
         db.commit()
         db.refresh(db_config)

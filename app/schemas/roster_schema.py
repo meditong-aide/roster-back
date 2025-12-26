@@ -55,8 +55,9 @@ class ShiftAddRequest(BaseModel):
 class RosterRequest(BaseModel):
     year: int
     month: int
-    algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
+    # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
+    grade_strategy: str = "BASE"  # "BASE" | "TEAM" | "GRADE"
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
 
 class PreferenceSubmit(BaseModel):
@@ -105,6 +106,9 @@ class RosterConfigBase(BaseModel):
     nod_noe: bool
     preceptor_gauge: float
     weekly_off_group: bool = Field(default=False)
+    team_balance_enable: bool = Field(default=False)
+    team_balance_gauge: int = Field(default=0, ge=0, le=10)
+    team_balance_mode: str = Field(default="balanced")
 
 class RosterConfigCreate(RosterConfigBase):
     config_version: Optional[str] = None
@@ -130,13 +134,22 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    is_night_nurse: int = Field(default=0)
+    is_night_nurse: List[str] = Field(default=[], max_items = 2)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
     resignation_date: Optional[datetime] = None
     sequence: Optional[int] = 0
     active: int = 1
+    # weekly_off_enabled: int = Field(default=0)
+    weekly_off_weekday: Optional[int] = None
+    nurse_memo: Optional[str] = None
+    grade: Optional[int] = None
+    emp_num: Optional[str] = None
+    # Side-Profile 추가 컬럼
+    birth_date: Optional[str] = None
+    phone_number: Optional[str] = None
+    age: Optional[int] = None # 나이
 
     class Config:
         from_attributes = True
