@@ -76,7 +76,7 @@ jobs:
 
       - name: Login to Amazon ECR
         if: github.ref_name == 'dev'
-        id: ecr-login
+        id: ecr-login-dev
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
