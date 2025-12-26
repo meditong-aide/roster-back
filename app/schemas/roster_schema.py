@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from enum import IntEnum
+from enum import StrEnum
 
 class ShiftManageSaveRequest(BaseModel):
     class_name: str
@@ -124,10 +124,10 @@ class RosterConfig(RosterConfigBase):
     class Config:
         from_attributes = True
 
-class CodeMapp(IntEnum):
-    D = 1
-    E = 2
-    N = 3
+class CodeMapp(StrEnum):
+    D = "D"
+    E = "E"
+    N = "N"
 
 class NurseProfile(BaseModel):
     office_id: str
@@ -140,7 +140,7 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    is_night_nurse: List[CodeMapp] = Field(default=[], max_items = 2)
+    is_night_nurse: List[CodeMapp] = Field(default_facotry=list, max_items = 2)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None

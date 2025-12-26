@@ -108,9 +108,9 @@ def get_nurses_in_group_service(
         try:
             # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
             is_night_nurse = [
-                CodeMapp[code].value
+                str(code)
                 for code in is_night_nurse
-                if code in CodeMapp.__members__
+                if code in CodeMapp.__members__.values()
             ]
         except (ValueError, TypeError, KeyError) as e:
             logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
@@ -228,9 +228,9 @@ def get_nurses_filtered_service(
         try:
             # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
             is_night_nurse = [
-                CodeMapp[code].value
+                str(code)
                 for code in is_night_nurse
-                if code in CodeMapp.__members__
+                if code in CodeMapp.__members__.values()
             ]
         except (ValueError, TypeError, KeyError) as e:
             logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
