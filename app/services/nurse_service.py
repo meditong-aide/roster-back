@@ -5,7 +5,7 @@
 """
 from sqlalchemy.orm import Session
 from db.models import Nurse as NurseModel, Group
-from schemas.roster_schema import NurseProfile
+from schemas.roster_schema import NurseProfile, CodeMapp
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional
 from pprint import pprint
@@ -103,6 +103,19 @@ def get_nurses_in_group_service(
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
+        # is_night_nurse를 Enum 값으로 변환 (데이터 베이스 : JSON)
+        is_night_nurse = nurse.is_night_nurse or []
+        try:
+            # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
+            is_night_nurse = [
+                CodeMapp[code].value
+                for code in is_night_nurse
+                if code in CodeMapp.__members__
+            ]
+        except (ValueError, TypeError, KeyError) as e:
+            logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
+            is_night_nurse = []
+        
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
             "group_id": nurse.group_id,
@@ -114,7 +127,7 @@ def get_nurses_in_group_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": nurse.is_night_nurse or [],  # None일 경우 []
+            "is_night_nurse": is_night_nurse,  # List[CodeMapp]
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
@@ -128,7 +141,8 @@ def get_nurses_in_group_service(
             "team_id": nurse.team_id,
             "weekly_off_enabled": nurse.weekly_off_enabled,
             "weekly_off_weekday": nurse.weekly_off_weekday,
-            "age": calculate_age(nurse.birth_date)
+            "age": calculate_age(nurse.birth_date),
+            "gender": nurse.gender,
         }
         result.append(nurse_dict)
     
@@ -209,6 +223,19 @@ def get_nurses_filtered_service(
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
+        # is_night_nurse를 Enum 값으로 변환 (데이터 베이스 : JSON)
+        is_night_nurse = nurse.is_night_nurse or []
+        try:
+            # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
+            is_night_nurse = [
+                CodeMapp[code].value
+                for code in is_night_nurse
+                if code in CodeMapp.__members__
+            ]
+        except (ValueError, TypeError, KeyError) as e:
+            logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
+            is_night_nurse = []
+            
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
             "group_id": nurse.group_id,
@@ -220,7 +247,7 @@ def get_nurses_filtered_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": nurse.is_night_nurse or [],  # None일 경우 []
+            "is_night_nurse": is_night_nurse,  # None일 경우 []
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
@@ -234,7 +261,8 @@ def get_nurses_filtered_service(
             "team_id": nurse.team_id,
             "weekly_off_enabled": nurse.weekly_off_enabled,
             "weekly_off_weekday": nurse.weekly_off_weekday,
-            "age": calculate_age(nurse.birth_date)
+            "age": calculate_age(nurse.birth_date),
+            "gender": nurse.gender,
         }
         result.append(nurse_dict)
     

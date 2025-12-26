@@ -50,7 +50,7 @@ class Nurse(Base):
     is_head_nurse = Column(BOOLEAN, default=False)
     # 마스터 관리자 구분 코드(ADM/HDN/...) - 실제 컬럼명 EmpAuthGbn 매핑
     emp_auth_gbn = Column(VARCHAR(3), name='EmpAuthGbn', nullable=True)
-    is_night_nurse = Column(JSON, nullable=True, default=[])
+    is_night_nurse = Column(JSON, nullable=True, default=list)
     personal_off_adjustment = Column(TINYINT, default=0)
     preceptor_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"))
     joining_date = Column(DATETIME, nullable=True)
@@ -69,6 +69,7 @@ class Nurse(Base):
     # 사이드 프로필 관련 추가 컬럼
     birth_date = Column(VARCHAR(10), nullable=True)
     phone_number = Column(VARCHAR(20), nullable=True)
+    gender = Column(VARCHAR(3), nullable=True)
     
     group = relationship("Group")
     __table_args__ = (

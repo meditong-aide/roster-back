@@ -72,6 +72,7 @@ def create_nurse_template2() -> str:
         '적용해제일(선택)': ['2025-01-25', '', '', ('근무 표 적용해제일 정보')],
         '생년월일(필수)': ['1999-01-01', '', '', ('생년월일 정보')],
         '연락처(필수)': ['010-0000-0000', '', '', ('연락처 정보')],
+        '성별(필수)': ['남', '', '', ('성별 정보')],
 
     }
     df = pd.DataFrame(template_data)
@@ -185,7 +186,8 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
             '직책': 'level_',
             '수간호사여부': 'is_head_nurse',
             '생년월일': 'birth_date',
-            '연락처': 'phone_number'
+            '연락처': 'phone_number',
+            '성별': 'gender'
         }
         # 컬럼명 유연 매핑 (유사한 이름 인식)
         flexible_mapping = {}
@@ -199,11 +201,12 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
                     excel_col_clean in ['년차', '경력년수'] and standard_col == '경력' or
                     excel_col_clean in ['수간호사', '헤드너스'] and standard_col == '수간호사여부' or
                     excel_col_clean in ['출생일', 'Birthday', '생일'] and standard_col == '생년월일' or
-                    excel_col_clean in ['전화번호', 'Phone', '휴대폰'] and standard_col == '연락처'):
+                    excel_col_clean in ['전화번호', 'Phone', '휴대폰'] and standard_col == '연락처' or
+                    excel_col_clean in ['성별', 'Gender', '남/여'] and standard_col == '성별'):
                     flexible_mapping[excel_col] = db_field
                     break
         # 필수 컬럼 확인
-        required_fields = ['group_name', 'account_id', 'name', 'experience', 'role', 'level_', 'is_head_nurse', 'birth_date', 'phone_number']
+        required_fields = ['group_name', 'account_id', 'name', 'experience', 'role', 'level_', 'is_head_nurse', 'birth_date', 'phone_number', 'gneder']
         missing_fields = [field for field in required_fields if field not in flexible_mapping.values()]
         if missing_fields:
             missing_korean = []
@@ -216,7 +219,8 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
                 'level_': '직책',
                 'is_head_nurse': '수간호사여부',
                 'birth_date': '셍냔월일',
-                'phone_number': '연락처'
+                'phone_number': '연락처',
+                'gender': '성별'
             }
             for field in missing_fields:
                 missing_korean.append(field_korean_map.get(field, field))
@@ -301,7 +305,8 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
                     'sequence': sequence,
                     'active': 1,  # 엑셀 업로드는 기본적으로 활성 상태
                     'birth_date': str(row[get_excel_column_by_field('birth_date', flexible_mapping)]).strip() if get_excel_column_by_field('birth_date', flexible_mapping) in row and pd.notna(row[get_excel_column_by_field('birth_date', flexible_mapping)]) else None,  # 신규 컬럼: 생년월일
-                    'phone_number': str(row[get_excel_column_by_field('phone_number', flexible_mapping)]).strip() if get_excel_column_by_field('phone_number', flexible_mapping) in row and pd.notna(row[get_excel_column_by_field('phone_number', flexible_mapping)]) else None  # 신규 컬럼: 연락처
+                    'phone_number': str(row[get_excel_column_by_field('phone_number', flexible_mapping)]).strip() if get_excel_column_by_field('phone_number', flexible_mapping) in row and pd.notna(row[get_excel_column_by_field('phone_number', flexible_mapping)]) else None,  # 신규 컬럼: 연락처
+                    'gneder': str(row[get_excel_column_by_field('gneder', flexible_mapping)]).strip() if get_excel_column_by_field('gneder', flexible_mapping) in row and pd.notna(row[get_excel_column_by_field('gneder', flexible_mapping)]) else None  # 신규 컬럼: 연락처
                 }
                 
                 # 개별 행 검증
@@ -572,6 +577,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session) -> Dict[str,
         col_resi = find_col_optional(['적용해제일(선택)','적용해제일','퇴사일','resignation_date'])
         col_birth = find_col(['생년월일(필수)', '생년월일', 'birth_date'])
         col_phone = find_col(['연락처(필수)', '연락처', 'phone_number'])
+        col_gender = find_col(['성별(필수)', '성별', 'gender'])
         
         office_id = user.office_id
         rows_allowed = msdb_manager.fetch_all(Member.member_accounts_by_office(), params=(str(office_id),))
@@ -607,6 +613,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session) -> Dict[str,
             role = 'RN' if pd.isna(role_val) or not str(role_val).strip() else str(role_val).strip()
             birth_date = row.get(col_birth)
             phone_num = row.get(col_phone)
+            gender = row.get(col_gender)
 
             # experience: 비어있으면 None 허용, 값이 있으면 숫자만 허용
             exp_val = None
@@ -670,7 +677,8 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session) -> Dict[str,
                 'nurse_id': allowed[account_id][2],
                 'birth_date': birth_date,
                 'phone_number': phone_num,
-                'is_night_nurse': []
+                'is_night_nurse': [],
+                'gender': gender
             })
             if row_errs:
                 errors.append({'row': ridx, 'reason': '; '.join(row_errs)})
@@ -727,6 +735,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
             birth_dt = item.get('birth_date')
             phone_number = item.get('phone_number')
             is_night_nurse = item.get('is_night_nurse', [])
+            gender = item.get('gender')
 
             existing = db.query(NurseModel).filter(NurseModel.account_id == account_id).first()
             print(1)
@@ -749,6 +758,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                 existing.birth_date = birth_dt  # 신규 컬럼
                 existing.phone_number = phone_number  # 신규 컬럼
                 existing.is_night_nurse = is_night_nurse # 디폴트 []
+                existing.gender = gender # 신규 컬럼
                 updated += 1
                 continue
             print(2)
@@ -774,6 +784,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                 active=1,
                 birth_date=birth_dt, # 신규 컬럼
                 phone_number=phone_number, # 신규 컬럼
+                gender=gender, # 신규 컬럼
             )
             print(4)
             import pprint
@@ -1241,7 +1252,7 @@ def export_members_excel_bytes(office_id: str) -> bytes:
     """ADM용 멤버 목록 엑셀 생성.
 
     - 입력: office_id
-    - 컬럼: 대분류, 중분류, 소분류, 부서명, 사번, 직원명, 계정 ID, 직무, 경력, 수간호사여부, 입사일, 생년월일, 연락처
+    - 컬럼: 대분류, 중분류, 소분류, 부서명, 사번, 직원명, 계정 ID, 직무, 경력, 수간호사여부, 입사일, 생년월일, 연락처, 성별
     - 반환: 생성된 xlsx 바이트
     """
     from io import BytesIO
@@ -1264,6 +1275,7 @@ def export_members_excel_bytes(office_id: str) -> bytes:
         ("joindate", "입사일"),
         ("DateOfBirth", "생년월일"),
         ("PortableTel", "연락처"),
+        ("Gender", "성별"),
     ]
 
     wb = Workbook()
