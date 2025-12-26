@@ -74,6 +74,11 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Login to Amazon ECR
+        if: github.ref_name == 'dev'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Build Docker image
         if: github.ref_name == 'main'
         run: |
