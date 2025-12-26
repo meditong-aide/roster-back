@@ -123,6 +123,11 @@ def get_nurses_in_group_service(
             "active": nurse.active,
             "birth_date": nurse.birth_date,  # VARCHAR
             "phone_number": nurse.phone_number,
+            "nurse_memo": nurse.nurse_memo,
+            "grade": nurse.grade,
+            "team_id": nurse.team_id,
+            "weekly_off_enabled": nurse.weekly_off_enabled,
+            "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date)
         }
         result.append(nurse_dict)
@@ -179,7 +184,6 @@ def get_nurses_filtered_service(
         NurseModel.experience.desc(),
         NurseModel.nurse_id.asc()
     ).all()
-    
     # nurse_id로 필터링했는데 결과가 없으면 예외
     if nurse_id is not None and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
@@ -225,6 +229,11 @@ def get_nurses_filtered_service(
             "active": nurse.active,
             "birth_date": nurse.birth_date,  # VARCHAR
             "phone_number": nurse.phone_number,
+            "nurse_memo": nurse.nurse_memo,
+            "grade": nurse.grade,
+            "team_id": nurse.team_id,
+            "weekly_off_enabled": nurse.weekly_off_enabled,
+            "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date)
         }
         result.append(nurse_dict)

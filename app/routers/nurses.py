@@ -53,13 +53,14 @@ async def get_nurses_in_group(
     try:
         # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
         if current_user.is_master_admin:
-            return get_nurses_filtered_service(
+            response = get_nurses_filtered_service(
                 current_user, 
                 db, 
                 office_id=office_id, 
                 group_id=group_id, 
                 nurse_id=nurse_id   # nurse_id 전달
             )
+            return response
         return get_nurses_in_group_service(
             current_user, 
             db,
