@@ -24,19 +24,20 @@ jobs:
           if [[ "${{ github.ref_name }}" == "main" ]]; then
             echo "ENV=prod" >> $GITHUB_ENV
             echo "ECR_REPO=aide-backend-prod" >> $GITHUB_ENV
+            echo "DOCKER_TAG=prod-${{ github.sha }}" >> $GITHUB_ENV
             echo "EC2_HOST=${{ secrets.PROD_EC2_HOST }}" >> $GITHUB_ENV
             echo "PROD_DB_NAME=${{ secrets.PROD_DB_NAME }}" >> $GITHUB_ENV
             echo "PROD_DB_USER=${{ secrets.PROD_DB_USER }}" >> $GITHUB_ENV
             echo "PROD_DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}" >> $GITHUB_ENV
             echo "PROD_DB_HOST=${{ secrets.PROD_DB_HOST }}" >> $GITHUB_ENV
             echo "ENVIRONMENT=production" >> $GITHUB_ENV
-            echo "DOCKER_TAG=prod-${{ github.sha }}" >> $GITHUB_ENV
             echo "ANTHROPIC_API_KEY=${{ secrets.PROD_ENV_ANTHROPIC }}" >> $GITHUB_ENV
             echo "GOOGLE_API_KEY=${{ secrets.PROD_ENV_GOOGLE }}" >> $GITHUB_ENV
             echo "OPENAI_API_KEY=${{ secrets.PROD_ENV_OPENAI }}" >> $GITHUB_ENV
           elif [[ "${{ github.ref_name }}" == "dev" ]]; then
             echo "ENV=dev" >> $GITHUB_ENV
-            echo "DEV_REPO=aide-backend-dev" >> $GITHUB_ENV
+            echo "ECR_REPO=aide-backend-dev" >> $GITHUB_ENV
+            echo "DOCKER_TAG=dev-${{ github.sha }}" >> $GITHUB_ENV
             echo "EC2_HOST=${{ secrets.DEV_EC2_HOST }}" >> $GITHUB_ENV
             echo "DEV_DB_NAME=${{ secrets.DEV_DB_NAME }}" >> $GITHUB_ENV
             echo "DEV_DB_USER=${{ secrets.DEV_DB_USER }}" >> $GITHUB_ENV
@@ -83,8 +84,23 @@ jobs:
             --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
             -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
 
+      - name: Build Docker image (dev)
+        if: github.ref_name == 'dev'
+        run: |
+          docker build \
+            --build-arg ENV=${{ env.ENVIRONMENT }} \
+            --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
+            --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
+            --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
+
       - name: Push Docker image to ECR
         if: github.ref_name == 'main'
+        run: |
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
+
+      - name: Push Docker image to ECR (dev)
+        if: github.ref_name == 'dev'
         run: |
           docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
 
@@ -93,8 +109,48 @@ jobs:
         run: |
           echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
 
+      - name: Export image uri (dev)
+        if: github.ref_name == 'dev'
+        run: |
+          echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
+
       - name: Apply ECR lifecycle policy (idempotent)
         if: github.ref_name == 'main'
+        run: |
+          cat > policy.json <<'JSON'
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images quickly",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countNumber": 1,
+                  "countUnit": "days"
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the last 10 tagged images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+          JSON
+          aws ecr put-lifecycle-policy \
+            --repository-name ${{ env.ECR_REPO }} \
+            --lifecycle-policy-text file://policy.json \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Apply ECR lifecycle policy (dev, idempotent)
+        if: github.ref_name == 'dev'
         run: |
           cat > policy.json <<'JSON'
           {
@@ -144,6 +200,22 @@ jobs:
 
             echo "ECR login on EC2 done"
 
+      - name: ECR login from EC2 (dev)
+        if: github.ref_name == 'dev'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.DEV_EC2_SSH_KEY }}
+          script: |
+            set -e
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+              | sudo docker login \
+                --username AWS \
+                --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+            echo "ECR login on EC2 done (dev)"
+
       - name: Stop & prune on EC2 (keep volumes)
         uses: appleboy/ssh-action@v1.0.0
         with:
@@ -170,10 +242,23 @@ jobs:
             echo "docker pull ${IMAGE_URI}"
             sudo docker pull "${IMAGE_URI}"
 
+      - name: Pull new image on EC2 (dev)
+        if: github.ref_name == 'dev'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.DEV_EC2_SSH_KEY }}
+          envs: IMAGE_URI
+          script: |
+            set -e
+            echo "docker pull ${IMAGE_URI}"
+            sudo docker pull "${IMAGE_URI}"
+
       - name: Write .env on EC2
         uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ secrets.PROD_EC2_HOST }}
+          host: ${{ env.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.PROD_EC2_SSH_KEY }}
           envs: ENV
@@ -198,6 +283,34 @@ jobs:
               fi
 
               echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
+
+      - name: Write .env on EC2 (dev)
+        if: github.ref_name == 'dev'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.DEV_EC2_SSH_KEY }}
+          envs: ENV
+          script: |
+            set -e
+            mkdir -p /home/ubuntu/app
+            echo "[INFO] Generating DEV .env"
+            cat > /home/ubuntu/app/.env <<EOF
+            ENVIRONMENT=development
+            MS_DB_HOST=${{ secrets.DEV_MS_DB_HOST }}
+            MS_DB_PORT=${{ secrets.DEV_MS_DB_PORT }}
+            MS_DB_NAME=${{ secrets.DEV_MS_DB_NAME }}
+            MS_DB_USER=${{ secrets.DEV_MS_DB_USER }}
+            MS_DB_PASSWORD=${{ secrets.DEV_MS_DB_PASSWORD }}
+            EUN_DB_NAME=${{ secrets.DEV_EUN_DB_NAME }}
+            CLIENT_ID=${{ secrets.DEV_CLIENT_ID }}
+            CLIENT_SECRET=${{ secrets.DEV_CLIENT_SECRET }}
+            SECRET_KEY=${{ secrets.DEV_SECRET_KEY }}
+            ALGORITHM=${{ secrets.DEV_ALGORITHM }}
+            EOF
+            echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
+
       - name: Run container
         if: github.ref_name == 'main'
         uses: appleboy/ssh-action@v1.0.0
@@ -222,6 +335,31 @@ jobs:
               -p 8000:8000 \
               "${IMAGE_URI}"
             echo "Started: http://$HOSTNAME:8000/health"
+
+      - name: Run container (dev)
+        if: github.ref_name == 'dev'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.DEV_EC2_SSH_KEY }}
+          envs: IMAGE_URI
+          script: |
+            set -e
+            sudo docker stop aide-server-dev || true
+            sudo docker rm   aide-server-dev || true
+            sudo docker run -d \
+              --name aide-server-dev \
+              --env-file /home/ubuntu/app/.env \
+              --network host \
+              --restart unless-stopped \
+              --log-opt awslogs-create-group=true \
+              --log-opt awslogs-region=ap-northeast-2 \
+              --log-opt awslogs-group=/ecs/aide-server-dev \
+              --log-opt awslogs-stream=aide-server-dev \
+              -p 8000:8000 \
+              "${IMAGE_URI}"
+            echo "Started: http://$HOSTNAME:8000/health (dev)"
       # PROD 전용: EC2에서 직접 FastAPI 실행
       # - name: Deploy to PROD EC2 (non-Docker)
       #   if: github.ref_name == 'main'
@@ -275,65 +413,65 @@ jobs:
 
       #       echo "PROD 배포 완료!"
 
-      # 6) DEV 전용: Docker 없이 EC2에서 직접 실행
-      - name: Deploy to DEV EC2 (non-Docker)
-        if: github.ref_name == 'dev'
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.DEV_EC2_SSH_KEY }}
-          script_stop: false
-          script: |
-            set +e
+      # # 6) DEV 전용: Docker 없이 EC2에서 직접 실행
+      # - name: Deploy to DEV EC2 (non-Docker)
+      #   if: github.ref_name == 'dev'
+      #   uses: appleboy/ssh-action@v1.0.0
+      #   with:
+      #     host: ${{ env.EC2_HOST }}
+      #     username: ubuntu
+      #     key: ${{ secrets.DEV_EC2_SSH_KEY }}
+      #     script_stop: false
+      #     script: |
+      #       set +e
 
-            echo "DEV 배포 시작 (Docker 미사용)"
+      #       echo "DEV 배포 시작 (Docker 미사용)"
 
-            # 1) 프로젝트 폴더 준비
-            mkdir -p /home/ubuntu/aide-backend-dev
-            cd /home/ubuntu/aide-backend-dev
+      #       # 1) 프로젝트 폴더 준비
+      #       mkdir -p /home/ubuntu/aide-backend-dev
+      #       cd /home/ubuntu/aide-backend-dev
 
-            # 2) 저장소 업데이트 (첫 배포면 clone)
-            if [ -d ".git" ]; then
-              echo "git pull 실행"
-              git fetch origin dev
-              git checkout dev
-              git pull origin dev
-            else
-              echo "repo clone 실행"
-              git clone -b dev ${{ secrets.REPO_URL }} .
-            fi
+      #       # 2) 저장소 업데이트 (첫 배포면 clone)
+      #       if [ -d ".git" ]; then
+      #         echo "git pull 실행"
+      #         git fetch origin dev
+      #         git checkout dev
+      #         git pull origin dev
+      #       else
+      #         echo "repo clone 실행"
+      #         git clone -b dev ${{ secrets.REPO_URL }} .
+      #       fi
 
-            # 3) Python 환경 준비
-            echo "Python venv 준비"
-            python3 -m venv venv
-            source venv/bin/activate
+      #       # 3) Python 환경 준비
+      #       echo "Python venv 준비"
+      #       python3 -m venv venv
+      #       source venv/bin/activate
 
-            echo "pip install 실행"
-            pip install --upgrade pip
-            pip install -r requirements.txt
+      #       echo "pip install 실행"
+      #       pip install --upgrade pip
+      #       pip install -r requirements.txt
 
-            # 4) DEV용 .env 생성
-            echo "DEV .env 생성"
-            cat > /home/ubuntu/aide-backend-dev/.env <<EOF
-            ENVIRONMENT=development
-            MS_DB_HOST=${{ secrets.DEV_MS_DB_HOST }}
-            MS_DB_PORT=${{ secrets.DEV_MS_DB_PORT }}
-            MS_DB_NAME=${{ secrets.DEV_MS_DB_NAME }}
-            MS_DB_USER=${{ secrets.DEV_MS_DB_USER }}
-            MS_DB_PASSWORD=${{ secrets.DEV_MS_DB_PASSWORD }}
-            EUN_DB_NAME=${{ secrets.DEV_EUN_DB_NAME }}
-            CLIENT_ID=${{ secrets.DEV_CLIENT_ID }}
-            CLIENT_SECRET=${{ secrets.DEV_CLIENT_SECRET }}
-            SECRET_KEY=${{ secrets.DEV_SECRET_KEY }}
-            ALGORITHM=${{ secrets.DEV_ALGORITHM }}
-            SQS_QUEUE_URL=https://sqs.ap-northeast-2.amazonaws.com/702166530338/roster-job-queue
-            EOF
+      #       # 4) DEV용 .env 생성
+      #       echo "DEV .env 생성"
+      #       cat > /home/ubuntu/aide-backend-dev/.env <<EOF
+      #       ENVIRONMENT=development
+      #       MS_DB_HOST=${{ secrets.DEV_MS_DB_HOST }}
+      #       MS_DB_PORT=${{ secrets.DEV_MS_DB_PORT }}
+      #       MS_DB_NAME=${{ secrets.DEV_MS_DB_NAME }}
+      #       MS_DB_USER=${{ secrets.DEV_MS_DB_USER }}
+      #       MS_DB_PASSWORD=${{ secrets.DEV_MS_DB_PASSWORD }}
+      #       EUN_DB_NAME=${{ secrets.DEV_EUN_DB_NAME }}
+      #       CLIENT_ID=${{ secrets.DEV_CLIENT_ID }}
+      #       CLIENT_SECRET=${{ secrets.DEV_CLIENT_SECRET }}
+      #       SECRET_KEY=${{ secrets.DEV_SECRET_KEY }}
+      #       ALGORITHM=${{ secrets.DEV_ALGORITHM }}
+      #       SQS_QUEUE_URL=https://sqs.ap-northeast-2.amazonaws.com/702166530338/roster-job-queue
+      #       EOF
 
-            # 4) EC2의 start.sh 실행
-            echo "start.sh 실행!"
-            chmod +x /home/ubuntu/aide-backend-dev/start.sh
-            /home/ubuntu/aide-backend-dev/start.sh
+      #       # 4) EC2의 start.sh 실행
+      #       echo "start.sh 실행!"
+      #       chmod +x /home/ubuntu/aide-backend-dev/start.sh
+      #       /home/ubuntu/aide-backend-dev/start.sh
 
-            echo "DEV 서버 배포 완료!"
-            echo "http://${{ env.EC2_HOST }}:8000/health"
+      #       echo "DEV 서버 배포 완료!"
+      #       echo "http://${{ env.EC2_HOST }}:8000/health"
