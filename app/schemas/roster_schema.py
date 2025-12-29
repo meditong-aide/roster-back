@@ -140,7 +140,7 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    is_night_nurse: List[CodeMapp] = Field(default_facotry=list, max_items = 2)
+    is_night_nurse: List[CodeMapp] = Field(default_factory=list, max_items = 2)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
