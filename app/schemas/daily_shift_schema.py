@@ -55,3 +55,10 @@ class DailyShiftDailyUpdate(BaseModel):
     D: List[int]
     E: List[int]
     N: List[int]
+
+
+class CalendarUpdateRequest(BaseModel):
+    office_id: str
+    group_id: str
+    years: Dict[str, Dict[str, List[Dict[str, int]]]]  # {year: {month: [{day, d_count, e_count, n_count}]}, ...}
+    comment: str | None = None  # 선택적 필드 추가

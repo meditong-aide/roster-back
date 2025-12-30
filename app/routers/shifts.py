@@ -19,10 +19,26 @@ import os
 from services.shift_service_mssql import get_shifts_service as get_shifts_service_mssql
 from datetime import timedelta, datetime
 
+# def convert_time(value):
+#     if isinstance(value, str):  # '06:00' → timedelta
+#         h, m = map(int, value.split(":"))
+#         return timedelta(hours=h, minutes=m)
+#     return value
+
+
 def convert_time(value):
-    if isinstance(value, str):  # '06:00' → timedelta
-        h, m = map(int, value.split(":"))
-        return timedelta(hours=h, minutes=m)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            parts = value.split(":")
+            if len(parts) >= 2:
+                h, m = map(int, parts[:2])
+                return timedelta(hours=h, minutes=m)
+            raise ValueError("Invalid time format")
+        except Exception as e:
+            print(f"convert_time error: {str(e)}, value: {value}")
+            return None
     return value
 
 
