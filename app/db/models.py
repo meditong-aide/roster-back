@@ -2,7 +2,7 @@ from sqlalchemy import Column, VARCHAR, SMALLINT, BOOLEAN, DATETIME, func, Forei
 from sqlalchemy.dialects.mysql import TINYINT 
 from sqlalchemy.orm import relationship
 from db.client2 import Base
-from sqlalchemy import DATE, DECIMAL, TEXT
+from sqlalchemy import DATE, DECIMAL, TEXT, Time
 
 class Group(Base):
     __tablename__ = 'groups'
@@ -115,8 +115,10 @@ class Shift(Base):
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
     name = Column(VARCHAR(20), nullable=False)
     color = Column(VARCHAR(10), nullable=False)
-    start_time = Column(VARCHAR(5), nullable=True)  # HH:MM format
-    end_time = Column(VARCHAR(5), nullable=True)    # HH:MM format
+    # start_time = Column(VARCHAR(5), nullable=True)  # HH:MM format
+    start_time = Column(Time, nullable=True)  # TIME 타입
+    # end_time = Column(VARCHAR(5), nullable=True)    # HH:MM format
+    end_time = Column(Time, nullable=True)    # TIME 타입
     type = Column(VARCHAR(10), nullable=False, default='근무')  # 'work' or 'off'
     allday = Column(INTEGER, nullable=False, default=0)
     auto_schedule = Column(INTEGER, nullable=False, default=1)
