@@ -921,7 +921,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             req.month,
             shift_manage_data,
             time_limit_seconds=time_limit_seconds,
-            grade_strategy=grade_strategy,
+            grade_strategy=req.grade_strategy,
             grade_config=grade_config,
         )
     except Exception as e:

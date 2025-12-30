@@ -475,6 +475,9 @@ class CPSATBasicEngine:
         except Exception as e:
             print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
 
+        # 13. 최종 근무표 로그 출력
+        self._log_final_roster(nurses, result)
+
         return {
             "roster": result,
             "satisfaction_data": satisfaction_data,
@@ -1115,6 +1118,21 @@ class CPSATBasicEngine:
                     nurse_schedule.append('-')
             result[nurse.db_id] = nurse_schedule
         return result
+
+    def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
+        """최종 근무표를 간호사별로 출력합니다.
+
+        Args:
+            nurses: 간호사 객체 리스트
+            roster_map: DB ID를 키로 하는 간호사별 근무표
+        """
+        try:
+            for nurse in nurses:
+                schedule = roster_map.get(nurse.db_id, [])
+                schedule_str = " ".join(schedule) if schedule else "-"
+                print(f"{self.logger_prefix} 배정표 {nurse.name}({nurse.db_id}): {schedule_str}")
+        except Exception as exc:
+            print(f"{self.logger_prefix} 근무표 출력 중 오류: {exc}")
     
     def _print_optimization_results(self, roster_system: RosterSystem, preceptor_pairs=None):
         """최적화 결과 출력 및 만족도 데이터 반환"""
