@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi import UploadFile, File
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 import uuid
 import tempfile
@@ -9,6 +10,7 @@ import os
 
 from db.client2 import get_db
 from db.models import Nurse as NurseModel
+from db.models import Office as OfficeModel
 from schemas.roster_schema import NurseProfile, MoveNurseRequest
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -42,6 +44,43 @@ router = APIRouter(
     tags=["nurses"]
 )
 
+
+def _ensure_office_exists(db: Session, office_id: Optional[str], office_name: Optional[str]) -> None:
+    """
+    오피스 ID가 있는데 DB `offices` 테이블에 레코드가 없으면 생성합니다.
+
+    - 인자:
+        - db(Session): SQLAlchemy 세션
+        - office_id(Optional[str]): 오피스 ID
+        - office_name(Optional[str]): 오피스명(미입력 시 생성하지 않음)
+    - 반환: 없음
+    - 예외:
+        - sqlalchemy.exc.IntegrityError: 동시 생성 레이스 컨디션 등으로 중복 삽입이 발생한 경우
+    - 예시:
+        - office_id="A1", office_name="서울병원" → offices에 (A1, 서울병원) 레코드가 없으면 생성
+    """
+    print('여기다', office_id, office_name)
+    if not office_id:
+        return
+    if not office_name:
+        return
+
+    exists = (
+        db.query(OfficeModel.office_id)
+        .filter(OfficeModel.office_id == office_id)
+        .first()
+    )
+    if exists:
+        return
+
+    try:
+        db.add(OfficeModel(office_id=office_id, office_name=office_name))
+        db.commit()
+    except IntegrityError:
+        # 동시 요청 등으로 이미 생성된 경우를 대비
+        db.rollback()
+
+
 @router.get("", response_model=List[NurseProfile])
 async def get_nurses_in_group(
     office_id: Optional[str] = None,
@@ -50,6 +89,9 @@ async def get_nurses_in_group(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+
+    _ensure_office_exists(db, getattr(current_user, "office_id", None), getattr(current_user, "office_name", None))
+    print('current_user', current_user.nurse_id, current_user.group_id, current_user.office_id)
     try:
         # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
         if current_user.is_master_admin:

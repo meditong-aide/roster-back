@@ -9,14 +9,14 @@ class Group(Base):
     group_id = Column(VARCHAR(50), primary_key=True)
     office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'))
     group_name = Column(VARCHAR(50), nullable=False)
-    office = relationship("Office", back_populates="groups") 
+    # office = relationship("Office", back_populates="groups") 
 class Office(Base):
     __tablename__ = 'offices'
     office_id = Column(VARCHAR(50), primary_key=True)
-    name = Column(VARCHAR(100), nullable=False)
-    address = Column(VARCHAR(255))
-    contact_number = Column(VARCHAR(30))
-    groups = relationship("Group", back_populates="office") 
+    office_name = Column(VARCHAR(100), nullable=False)
+    # address = Column(VARCHAR(255))
+    # contact_number = Column(VARCHAR(30))
+    # groups = relationship("Group", back_populates="office") 
 
 class Team(Base):
     __tablename__ = 'teams'
