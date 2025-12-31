@@ -306,12 +306,27 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         .all()
     )
     shift_manage_data = [s.__dict__ for s in shift_manages]
-    daily_shift_requirements = {}
+
+    def _normalize_main_code(code: str | None) -> str:
+        """ShiftManage의 main_code를 엔진 기준 메인코드(D/E/N/O)로 정규화한다.
+
+        Notes:
+            - 요구치 키가 'D','E','N'으로 들어오지 않으면 커버리지 제약이 약해져 OFF로 쏠릴 수 있다.
+            - 예: " d " → "D"
+        """
+        if code is None:
+            return ""
+        c = str(code).strip().upper()
+        if c in {"OFF", "O", "주"}:
+            return "O"
+        return c
+
+    # 엔진은 요구치 키를 'D','E','N'으로 기대한다.
+    daily_shift_requirements: dict[str, int] = {"D": 0, "E": 0, "N": 0}
     for sm in shift_manages:
-        # if sm.codes:
-        #     for code in sm.codes:
-        # daily_shift_requirements[sm.main_code.strip()] = sm.manpower
-        daily_shift_requirements[sm.main_code] = sm.manpower
+        main = _normalize_main_code(getattr(sm, "main_code", None))
+        if main in {"D", "E", "N"}:
+            daily_shift_requirements[main] = int(getattr(sm, "manpower", 0) or 0)
     # ── DailyShift 일자별 요구치 조회 및 정규화 ──
     days_in_month = get_days_in_month(req.year, req.month)
     try:
@@ -331,6 +346,15 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
     # day→counts 맵 구성 후 리스트로 변환(0-index)
     by_day = {r.day: {'D': int(r.d_count or 0), 'E': int(r.e_count or 0), 'N': int(r.n_count or 0)} for r in rows}
     daily_shift_requirements_by_day = [by_day.get(d, {'D': daily_shift_requirements.get('D', 0), 'E': daily_shift_requirements.get('E', 0), 'N': daily_shift_requirements.get('N', 0)}) for d in range(1, days_in_month + 1)]
+
+    # 안전장치: 요구치가 전부 0이면 엔진은 OFF로 쏠릴 확률이 높다.
+    if sum(daily_shift_requirements.values()) <= 0 and all(
+        sum(day_req.values()) <= 0 for day_req in daily_shift_requirements_by_day
+    ):
+        raise ValueError(
+            "일별/기본 근무 요구치(D/E/N)가 모두 0입니다. "
+            "ShiftManage.main_code 또는 DailyShift 설정을 확인해주세요."
+        )
     return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day
 
 def _normalize_to_main(code: str, code2main: dict) -> str:

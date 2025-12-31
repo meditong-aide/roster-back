@@ -32,6 +32,7 @@ class NurseRosterConfig:
     global_monthly_off_days: int = 3  # 모든 간호사에게 적용되는 전체 휴무일(공휴일, 특별 휴무일)
     standard_personal_off_days: int = 8  # 간호사별 표준 개인 휴무일 수
     max_extra_off_days: int = 3  # 월 최소 휴무 기준 대비 허용되는 추가 OFF 상한(n)
+    extra_off_penalty_weight: int = 80  # 추가 OFF(여유 OFF)를 기피하는 목적함수 패널티 가중치
     
     # 교대 배정 비율 - 각 교대 유형에 대한 선호도 가중치 제어
     day_shift_ratio: float = 1.0  # 주간 근무 비율

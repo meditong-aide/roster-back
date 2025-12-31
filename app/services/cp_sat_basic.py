@@ -51,7 +51,12 @@ class CPSATBasicEngine:
         self.logger_prefix = "[CP-SAT-Basic]"
     
     def create_config_from_db(self, config_data: dict) -> NurseRosterConfig:
-        """DB에서 가져온 설정 데이터를 NurseRosterConfig 객체로 변환"""
+        """DB에서 가져온 설정 데이터를 NurseRosterConfig 객체로 변환한다.
+
+        Notes:
+            - 엔진의 커버리지 제약은 `daily_shift_requirements`(및 by_day)를 기반으로 동작한다.
+              이 값이 비어있거나 키가 D/E/N으로 정규화되지 않으면 OFF로 쏠릴 수 있다.
+        """
         print('config_data', config_data.get('shift_priority'))
         # 법규 제약사항 (Hard Constraints)
         max_conseq_work = config_data.get('max_conseq_work', 5)
@@ -83,8 +88,41 @@ class CPSATBasicEngine:
         team_balance_mode = config_data.get('team_balance_mode', 'balanced')
         team_balance_shift_weights = config_data.get('team_balance_shift_weights') or {}
 
+        def _normalize_requirements(req_map: dict | None) -> dict[str, int]:
+            """요구 인력 맵을 D/E/N 기준으로 정규화한다.
+
+            Args:
+                req_map: 원본 요구치 맵(키가 대소문자/공백/다른 표기일 수 있음)
+
+            Returns:
+                'D','E','N' 키만을 갖는 정수 요구치 맵
+            """
+            base = {"D": 0, "E": 0, "N": 0}
+            if not isinstance(req_map, dict):
+                return base
+            for k, v in req_map.items():
+                key = str(k).strip().upper()
+                if key in {"D", "E", "N"}:
+                    try:
+                        base[key] = int(v or 0)
+                    except Exception:
+                        base[key] = 0
+            return base
+
+        # 요구치(기본) 방어 처리: 없으면 구 필드(day_req/eve_req/nig_req)에서 폴백
+        raw_daily_req = config_data.get("daily_shift_requirements")
+        if not raw_daily_req:
+            raw_daily_req = {
+                "D": config_data.get("day_req", 0),
+                "E": config_data.get("eve_req", 0),
+                "N": config_data.get("nig_req", 0),
+            }
+        daily_req = _normalize_requirements(raw_daily_req)
+        if sum(daily_req.values()) <= 0:
+            raise ValueError("daily_shift_requirements(D/E/N)가 비어있습니다. 설정을 확인해주세요.")
+
         cfg = NurseRosterConfig(
-            daily_shift_requirements = config_data['daily_shift_requirements'],
+            daily_shift_requirements=daily_req,
             # daily_shift_requirements={
             #     'D': config_data.get('day_req', 3),
             #     'E': config_data.get('eve_req', 3), 
@@ -131,7 +169,9 @@ class CPSATBasicEngine:
             team_balance_mode=team_balance_mode,
             team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
-            max_extra_off_days=int(config_data.get('max_extra_off_days', 2)),
+            max_extra_off_days=int(config_data.get('max_extra_off_days', 0)),
+            # 추가 OFF 기피(여유 인원은 D/E/N으로 분배 유도)
+            extra_off_penalty_weight=int(config_data.get("extra_off_penalty_weight", 80) or 0),
             # 여유 인원 균등화 제어
             oversupply_equalize_enable=bool(config_data.get('oversupply_equalize_enable', True)),
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120))
@@ -140,7 +180,18 @@ class CPSATBasicEngine:
         try:
             ds_by_day = config_data.get('daily_shift_requirements_by_day')
             if isinstance(ds_by_day, list) and len(ds_by_day) > 0:
-                setattr(cfg, 'daily_shift_requirements_by_day', ds_by_day)
+                norm_list = []
+                for day_map in ds_by_day:
+                    if not isinstance(day_map, dict):
+                        norm_list.append(daily_req)
+                        continue
+                    m = _normalize_requirements(day_map)
+                    # 일부 키가 누락된 경우 기본 요구치로 보완
+                    for kk in ("D", "E", "N"):
+                        if kk not in m:
+                            m[kk] = daily_req.get(kk, 0)
+                    norm_list.append(m)
+                setattr(cfg, 'daily_shift_requirements_by_day', norm_list)
         except Exception:
             pass
         return cfg
@@ -892,6 +943,16 @@ class CPSATBasicEngine:
                     for d in range(join[n], leave[n] + 1):
                         for s in range(S):
                             obj.append(int(P[n, d, s] * 100) * X(n, d, s))
+
+                # 추가 OFF(여유 OFF) 기피: 가능한 한 off_days 이상으로 OFF를 늘리지 않도록 유도
+                try:
+                    off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
+                    if off_penalty > 0:
+                        for n in range(N):
+                            for d in range(join[n], leave[n] + 1):
+                                obj.append(-off_penalty * X(n, d, off_idx))
+                except Exception:
+                    pass
                 # 경력자 부족 약벌
                 for d in range(D):
                     for code in ('D', 'E', 'N'):
@@ -1435,6 +1496,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         for d in range(join[n], leave[n]+1):
             for s in range(S):
                 obj.append(int(P[n,d,s]*100)*X(n,d,s))
+
+    # (4-0) 추가 OFF(여유 OFF) 기피: off_days만큼은 하드로 만족시키되, 남는 인원은 D/E/N으로 분배 유도
+    try:
+        off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
+        if off_penalty > 0:
+            for n in range(N):
+                for d in range(join[n], leave[n] + 1):
+                    obj.append(-off_penalty * X(n, d, off))
+    except Exception:
+        pass
 
     # (4-1) 경력자 부족
     for d in range(D):
