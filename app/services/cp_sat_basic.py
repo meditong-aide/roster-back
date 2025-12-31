@@ -169,9 +169,15 @@ class CPSATBasicEngine:
             team_balance_mode=team_balance_mode,
             team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
-            max_extra_off_days=int(config_data.get('max_extra_off_days', 0)),
+            # - 빡빡하게 off_days에 맞추다 보면 연속근무가 길어지는 현상이 생길 수 있어,
+            #   기본값은 +1 정도의 여유를 두고(필요하면 0으로 낮출 수 있음),
+            #   대신 extra_off_penalty_weight로 "불필요한 추가 OFF"는 억제한다.
+            max_extra_off_days=int(config_data.get('max_extra_off_days', 1)),
             # 추가 OFF 기피(여유 인원은 D/E/N으로 분배 유도)
             extra_off_penalty_weight=int(config_data.get("extra_off_penalty_weight", 80) or 0),
+            # 연속근무 소프트 상한(없으면 hard와 동일)
+            soft_max_consecutive_work_days=int(config_data.get("soft_max_consecutive_work_days", max_conseq_work) or max_conseq_work),
+            soft_consecutive_work_penalty_weight=int(config_data.get("soft_consecutive_work_penalty_weight", 180) or 0),
             # 여유 인원 균등화 제어
             oversupply_equalize_enable=bool(config_data.get('oversupply_equalize_enable', True)),
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120))
@@ -953,6 +959,21 @@ class CPSATBasicEngine:
                                 obj.append(-off_penalty * X(n, d, off_idx))
                 except Exception:
                     pass
+
+                # 연속근무 소프트 상한(폴백 3단계에서도 동일하게 적용)
+                try:
+                    soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
+                    w_soft = int(getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0)
+                    if soft_k > 0 and w_soft > 0:
+                        for n in range(N):
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - soft_k + 1):
+                                sum_off = sum(X(n, d0 + t, off_idx) for t in range(soft_k + 1))
+                                miss = m.NewIntVar(0, 1, f"soft_cwork_miss_fb_{n}_{d0}")
+                                m.Add(miss >= 1 - sum_off)
+                                obj.append(-w_soft * miss)
+                except Exception:
+                    pass
                 # 경력자 부족 약벌
                 for d in range(D):
                     for code in ('D', 'E', 'N'):
@@ -1504,6 +1525,23 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for n in range(N):
                 for d in range(join[n], leave[n] + 1):
                     obj.append(-off_penalty * X(n, d, off))
+    except Exception:
+        pass
+
+    # (4-0b) 연속근무 소프트 상한: hard 제약은 유지하면서, "가능하면 더 짧게" 끊도록 유도한다.
+    # - 창 크기 (soft_k + 1) 안에 OFF가 1개도 없으면 miss=1 → 패널티.
+    # - 예: soft_k=5 이면 6연속근무(OFF 0) 창이 생길 때마다 패널티가 붙는다.
+    try:
+        soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
+        w_soft = int(getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0)
+        if soft_k > 0 and w_soft > 0:
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                for d0 in range(T0, T1 - soft_k + 1):
+                    sum_off = sum(X(n, d0 + t, off) for t in range(soft_k + 1))
+                    miss = m.NewIntVar(0, 1, f"soft_cwork_miss_{n}_{d0}")
+                    m.Add(miss >= 1 - sum_off)
+                    obj.append(-w_soft * miss)
     except Exception:
         pass
 

@@ -33,6 +33,8 @@ class NurseRosterConfig:
     standard_personal_off_days: int = 8  # 간호사별 표준 개인 휴무일 수
     max_extra_off_days: int = 3  # 월 최소 휴무 기준 대비 허용되는 추가 OFF 상한(n)
     extra_off_penalty_weight: int = 80  # 추가 OFF(여유 OFF)를 기피하는 목적함수 패널티 가중치
+    soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
+    soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
     
     # 교대 배정 비율 - 각 교대 유형에 대한 선호도 가중치 제어
     day_shift_ratio: float = 1.0  # 주간 근무 비율
@@ -89,6 +91,8 @@ class NurseRosterConfig:
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
+        if self.soft_max_consecutive_work_days is None:
+            self.soft_max_consecutive_work_days = int(self.max_consecutive_work_days)
         # 팀 게이지 → 가중치/탑K
         gauge = max(0, min(10, int(self.team_balance_gauge or 0)))
         if not self.team_balance_enable or gauge == 0:
