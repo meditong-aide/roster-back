@@ -927,6 +927,29 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         print(f"이전 월 경계 제약 생성 실패: {e}")
     try:
         print("cp_sat_basic 엔진 호출 준비 완료")
+        # ── 실행 초기에 정책 파라미터가 어떻게 적용됐는지 반드시 로그로 남긴다(추후 유지보수용) ──
+        try:
+            mode = str(config_dict.get("distribution_mode", "hybrid"))
+            og = config_dict.get("oversupply_balance_gauge")
+            mg = config_dict.get("monthly_preference_gauge")
+            ow = config_dict.get("oversupply_equalize_weight")
+            oe = config_dict.get("oversupply_equalize_enable")
+            mw = config_dict.get("monthly_preference_weight")
+            mp_cnt = len((config_dict.get("monthly_shift_preferences") or {}) if isinstance(config_dict.get("monthly_shift_preferences"), dict) else {})
+            max_extra = config_dict.get("max_extra_off_days")
+            off_pen = config_dict.get("extra_off_penalty_weight")
+            soft_k = config_dict.get("soft_max_consecutive_work_days")
+            soft_w = config_dict.get("soft_consecutive_work_penalty_weight")
+            print(
+                "[ShiftDistributionPolicy] "
+                f"mode={mode}, oversupply_gauge={og}, monthly_pref_gauge={mg}, "
+                f"oversupply_equalize=({oe},{ow}), monthly_pref_weight={mw}, "
+                f"monthly_pref_cnt={mp_cnt}, "
+                f"max_extra_off_days={max_extra}, extra_off_penalty_weight={off_pen}, "
+                f"soft_cwork=(k={soft_k},w={soft_w})"
+            )
+        except Exception as _log_exc:
+            print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")
         # 전략은 요청 바디가 아니라 "DB(roster_config.grade_strategy) → 없으면 config_dict 기반 폴백"만 사용한다.
         grade_strategy, grade_config = _resolve_grade_strategy(
             db=db,
@@ -1094,6 +1117,70 @@ def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
         else:
             config_dict["team_balance_shift_weights"] = {"D": 1.0, "E": 1.0, "N": 1.0}
 
+def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
+    """req(임시 UI 대체)로 전달된 분배 정책 파라미터를 config_dict에 반영한다.
+
+    목표:
+        - oversupply(여유 인원)가 D로만 쏠리지 않도록 "일별 균등 분배" 목적함수를 활성화한다.
+        - Wanted(날짜 지정형 선호)는 기존 경로(강한 선호)로 반영하고,
+          월단위 선호(개인 입력)는 잔여 자유도에서 약하게 유도한다.
+
+    Args:
+        config_dict: 엔진에 넘길 설정 dict(최종적으로 cp_sat_basic에 전달됨)
+        req: `RosterRequest` 또는 hold_generate 요청 모델
+    """
+    # ── 모드 정규화 ──
+    mode = str(getattr(req, "distribution_mode", None) or config_dict.get("distribution_mode") or "hybrid").lower()
+    if mode == "auto":
+        mode = "hybrid"
+    if mode not in {"hybrid", "balanced", "preference", "off"}:
+        mode = "hybrid"
+    config_dict["distribution_mode"] = mode
+
+    # ── 게이지(0~10) ──
+    og = getattr(req, "oversupply_balance_gauge", None)
+    mg = getattr(req, "monthly_preference_gauge", None)
+    og = max(0, min(10, int(og if og is not None else 6)))
+    mg = max(0, min(10, int(mg if mg is not None else 3)))
+    config_dict["oversupply_balance_gauge"] = og
+    config_dict["monthly_preference_gauge"] = mg
+
+    # ── 게이지 → weight 매핑 ──
+    # 기존 파라미터(oversupply_equalize_weight)를 그대로 사용하되, 게이지를 통해 일관되게 제어한다.
+    def _g2w(g: int, cap: int, power: float = 1.7) -> int:
+        g_norm = g / 10.0
+        return int(round(cap * (g_norm ** power)))
+
+    oversupply_w = _g2w(og, cap=220)
+    monthly_w = _g2w(mg, cap=140)
+
+    # ── 모드별 on/off ──
+    if mode == "off":
+        config_dict["oversupply_equalize_enable"] = False
+        config_dict["oversupply_equalize_weight"] = 0
+        config_dict["monthly_preference_weight"] = 0
+    elif mode == "balanced":
+        config_dict["oversupply_equalize_enable"] = og > 0
+        config_dict["oversupply_equalize_weight"] = oversupply_w
+        config_dict["monthly_preference_weight"] = 0
+    elif mode == "preference":
+        # 선호 우선: 균등은 최소 가드레일만 남긴다(일별 D 쏠림 방지)
+        config_dict["oversupply_equalize_enable"] = og > 0
+        config_dict["oversupply_equalize_weight"] = min(oversupply_w, 60)
+        config_dict["monthly_preference_weight"] = monthly_w
+    else:
+        # hybrid
+        config_dict["oversupply_equalize_enable"] = og > 0
+        config_dict["oversupply_equalize_weight"] = oversupply_w
+        config_dict["monthly_preference_weight"] = monthly_w
+
+    # ── 월단위 선호 payload(개인 입력) ──
+    msp = getattr(req, "monthly_shift_preferences", None)
+    if isinstance(msp, dict):
+        config_dict["monthly_shift_preferences"] = msp
+    else:
+        config_dict.setdefault("monthly_shift_preferences", {})
+
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
 def generate_roster_service(req: RosterRequest, current_user, db: Session):
@@ -1128,6 +1215,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     
     _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
     _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
+    _apply_distribution_policy_from_req(config_dict, req)
     # 경계 제약 기능 기본값
     config_dict.setdefault('cross_month_hard_rules_enable', True)
     config_dict.setdefault('cross_month_lookback_days', 6)
@@ -1250,6 +1338,7 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 (고정 생성에도 동일 적용) ──
     _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
     _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
+    _apply_distribution_policy_from_req(config_dict, req)
     # 경계 제약 기능 기본값 및 충돌 정책(hold는 기본 차단)
     config_dict.setdefault('cross_month_hard_rules_enable', True)
     config_dict.setdefault('cross_month_lookback_days', 6)

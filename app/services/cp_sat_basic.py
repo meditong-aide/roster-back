@@ -178,6 +178,9 @@ class CPSATBasicEngine:
             # 연속근무 소프트 상한(없으면 hard와 동일)
             soft_max_consecutive_work_days=int(config_data.get("soft_max_consecutive_work_days", max_conseq_work) or max_conseq_work),
             soft_consecutive_work_penalty_weight=int(config_data.get("soft_consecutive_work_penalty_weight", 180) or 0),
+            # 분배 정책 모드/월단위 선호 가중치
+            distribution_mode=str(config_data.get("distribution_mode", "hybrid") or "hybrid"),
+            monthly_preference_weight=int(config_data.get("monthly_preference_weight", 60) or 0),
             # 여유 인원 균등화 제어
             oversupply_equalize_enable=bool(config_data.get('oversupply_equalize_enable', True)),
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120))
@@ -339,6 +342,14 @@ class CPSATBasicEngine:
         # 4. 근무표 시스템 생성
         with Timer("근무표 시스템 초기화"):
             roster_system = RosterSystem(nurses, target_month, config)
+            # 월단위 선호(개인 입력) - dict 형태로 전달됨을 가정
+            # 예: {"441172": {"shift": "D", "strength": 7}, ...}
+            try:
+                msp = config_data.get("monthly_shift_preferences") or {}
+                if isinstance(msp, dict):
+                    setattr(roster_system, "monthly_shift_preferences", msp)
+            except Exception:
+                pass
             # Grade/Team/BASE 전략(모델 빌더에서 참조)
             # - 상위 서비스(roster_create_service)에서 roster_config 기반으로 결정된 값을 전달받는다.
             setattr(roster_system, "grade_strategy", str(grade_strategy or "BASE").upper())
@@ -960,6 +971,32 @@ class CPSATBasicEngine:
                 except Exception:
                     pass
 
+                # 월단위 선호(개인 입력) 유도: 폴백 3단계에서도 동일하게 반영
+                try:
+                    msp = getattr(roster_system, "monthly_shift_preferences", None)
+                    base_w = int(getattr(cfg, "monthly_preference_weight", 0) or 0)
+                    if base_w > 0 and isinstance(msp, dict) and msp:
+                        for n, nu in enumerate(roster_system.nurses):
+                            pref = msp.get(str(getattr(nu, "db_id", ""))) or msp.get(getattr(nu, "db_id", ""))
+                            if not isinstance(pref, dict):
+                                continue
+                            code = str(pref.get("shift") or "").strip().upper()
+                            if code not in {"D", "E", "N"}:
+                                continue
+                            try:
+                                strength = int(pref.get("strength", 5) or 0)
+                            except Exception:
+                                strength = 5
+                            strength = max(0, min(10, strength))
+                            w = int(round(base_w * (strength / 10.0)))
+                            if w <= 0:
+                                continue
+                            s_idx = cfg.shift_types.index(code)
+                            for d in range(join[n], leave[n] + 1):
+                                obj.append(w * X(n, d, s_idx))
+                except Exception:
+                    pass
+
                 # 연속근무 소프트 상한(폴백 3단계에서도 동일하게 적용)
                 try:
                     soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
@@ -1525,6 +1562,33 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for n in range(N):
                 for d in range(join[n], leave[n] + 1):
                     obj.append(-off_penalty * X(n, d, off))
+    except Exception:
+        pass
+
+    # (4-0a) 월단위 선호(개인 입력) 유도: 선호 교대에 소프트 보너스 부여
+    # - Wanted(날짜 지정형)와 달리 "약한 선호"로 간주하며, weight는 req 게이지로 조절한다.
+    try:
+        msp = getattr(rs, "monthly_shift_preferences", None)
+        base_w = int(getattr(cfg, "monthly_preference_weight", 0) or 0)
+        if base_w > 0 and isinstance(msp, dict) and msp:
+            for n, nu in enumerate(rs.nurses):
+                pref = msp.get(str(getattr(nu, "db_id", ""))) or msp.get(getattr(nu, "db_id", ""))
+                if not isinstance(pref, dict):
+                    continue
+                code = str(pref.get("shift") or "").strip().upper()
+                if code not in {"D", "E", "N"}:
+                    continue
+                try:
+                    strength = int(pref.get("strength", 5) or 0)
+                except Exception:
+                    strength = 5
+                strength = max(0, min(10, strength))
+                w = int(round(base_w * (strength / 10.0)))
+                if w <= 0:
+                    continue
+                s_idx = cfg.shift_types.index(code)
+                for d in range(join[n], leave[n] + 1):
+                    obj.append(w * X(n, d, s_idx))
     except Exception:
         pass
 
