@@ -883,6 +883,188 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     print(f"강제 OFF {off_cnt}건, 금지 셀 {forb_cnt}건 적용")
     return {'forced_off': forced_off, 'forbidden': forbidden}
 
+
+def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, str]:
+    """ShiftManage의 codes → main_code 정규화 맵을 만든다.
+
+    Returns:
+        code2main: 예) {"D": "D", "D1": "D", "E": "E", "N": "N", "O": "O"}
+    """
+    code2main: dict[str, str] = {}
+    for row in (shift_manage_data or []):
+        main = str(row.get("main_code") or "").strip().upper()
+        if not main:
+            continue
+        for code in (row.get("codes") or []):
+            c = str(code).strip().upper()
+            if c:
+                code2main[c] = main
+    # 휴무는 항상 O로 통일
+    code2main["OFF"] = "O"
+    code2main["주"] = "O"
+    code2main["O"] = "O"
+    return code2main
+
+
+def _normalize_allowed_shift_types(raw_value: object) -> set[str]:
+    """간호사 row의 '허용 근무유형(D/E/N) 리스트'를 정규화한다.
+
+    정책:
+        - [] 또는 None: 제한 없음(= D/E/N 모두 가능)
+        - ["N"], ["D","E"], ["D","N"] 등: 해당 코드만 가능
+        - 기존 레거시 int/boolean 기반 night 전담 값은 **무시**한다.
+
+    Args:
+        raw_value: DB에 저장된 값(JSON). 기대 형태는 List[str] 또는 None.
+
+    Returns:
+        허용 코드 집합. 빈 집합이면 "제한 없음"을 의미한다.
+
+    Raises:
+        ValueError: 리스트에 D/E/N 이외의 코드가 섞여있을 때
+    """
+    if raw_value is None:
+        return set()
+    # 레거시 타입은 무시(요구사항: 기존 is_night_nurse 의미는 무시)
+    if isinstance(raw_value, (int, float, bool)):
+        return set()
+    if not isinstance(raw_value, list):
+        return set()
+
+    allowed: set[str] = set()
+    invalid: set[str] = set()
+    for item in raw_value:
+        code = str(item).strip().upper()
+        if not code:
+            continue
+        if code in {"D", "E", "N"}:
+            allowed.add(code)
+        else:
+            invalid.add(code)
+    if invalid:
+        raise ValueError(f"허용 근무유형 값이 올바르지 않습니다: {sorted(invalid)} (허용: D/E/N)")
+    return allowed
+
+
+def _normalize_shift_to_main(shift_code: object, code2main: dict[str, str]) -> str:
+    """고정 셀의 shift 코드를 엔진 기준 메인코드(D/E/N/O)로 정규화한다."""
+    code = str(shift_code or "").strip().upper()
+    if code in {"OFF", "주"}:
+        return "O"
+    if code in {"D", "E", "N", "O"}:
+        return code
+    return str(code2main.get(code, code)).strip().upper()
+
+
+def build_allowed_shift_type_constraints(
+    nurses_in_group: list,
+    year: int,
+    month: int,
+    shift_manage_data: list[dict] | None,
+    fixed_cells: list[dict] | None,
+) -> dict:
+    """간호사별 허용 근무유형(D/E/N) 하드 제약을 forbidden 형태로 생성한다.
+
+    목표:
+        - 간호사 row에 저장된 허용 목록에 따라, 허용되지 않은 D/E/N 배정을 전일(day_idx 전체)에 대해 금지한다.
+        - OFF(O)는 항상 가능하도록 금지 대상에서 제외한다.
+        - fixed_cells(고정셀)과 충돌 시 옵션 A 정책으로 즉시 실패한다.
+
+    Returns:
+        {"forced_off": {}, "forbidden": {nurse_id: {day_idx: ["D","E"]}}}
+
+    Raises:
+        ValueError: 고정셀이 허용 근무유형과 충돌할 때(옵션 A)
+    """
+    days_in_month = int(get_days_in_month(year, month))
+    if days_in_month <= 0:
+        return {"forced_off": {}, "forbidden": {}}
+
+    code2main = _build_code_to_main_map(shift_manage_data)
+    nurse_id_to_allowed: dict[str, set[str]] = {}
+
+    for n in nurses_in_group:
+        nurse_id = str(getattr(n, "nurse_id", "") or "")
+        if not nurse_id:
+            continue
+        allowed = _normalize_allowed_shift_types(getattr(n, "is_night_nurse", None))
+        nurse_id_to_allowed[nurse_id] = allowed
+
+    # ── 옵션 A: 고정셀 충돌은 즉시 실패 ──
+    if fixed_cells:
+        nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+        idx_to_nurse_id = {idx: nid for nid, idx in nurse_idx_map.items()}
+        for c in fixed_cells:
+            try:
+                n_idx = int(c.get("nurse_index"))
+                day_idx = int(c.get("day_index"))
+            except Exception:
+                continue
+            fixed_main = _normalize_shift_to_main(c.get("shift"), code2main)
+            if fixed_main not in {"D", "E", "N"}:
+                continue  # O는 항상 가능
+            nurse_id = idx_to_nurse_id.get(n_idx)
+            if not nurse_id:
+                continue
+            allowed = nurse_id_to_allowed.get(nurse_id, set())
+            if not allowed:
+                continue  # 제한 없음
+            if fixed_main not in allowed:
+                allowed_sorted = sorted(allowed)
+                raise ValueError(
+                    "허용 근무유형 충돌: "
+                    f"nurse_id={nurse_id}, day={day_idx + 1}, fixed={fixed_main}, "
+                    f"allowed={allowed_sorted}"
+                )
+
+    forbidden: dict[str, dict[int, list[str]]] = {}
+    all_codes = {"D", "E", "N"}
+    for nurse_id, allowed in nurse_id_to_allowed.items():
+        if not allowed:
+            continue  # 제한 없음
+        disallowed = sorted(all_codes - set(allowed))
+        if not disallowed:
+            continue
+        day_map: dict[int, list[str]] = {}
+        for d in range(days_in_month):
+            day_map[d] = disallowed
+        forbidden[nurse_id] = day_map
+
+    forb_cnt = sum(len(v) * len(next(iter(v.values()), [])) for v in forbidden.values())
+    if forbidden:
+        print(f"[AllowedShiftTypes] 금지 셀(월 전체) 적용: nurses={len(forbidden)}, approx_cnt={forb_cnt}")
+    return {"forced_off": {}, "forbidden": forbidden}
+
+
+def _merge_initial_constraints(base: dict | None, extra: dict | None) -> dict:
+    """initial_constraints 딕셔너리를 안전하게 병합한다(금지/강제OFF는 합집합)."""
+    base = base if isinstance(base, dict) else {}
+    extra = extra if isinstance(extra, dict) else {}
+
+    merged_forced_off: dict[str, list[int]] = {}
+    for src in (base.get("forced_off") or {}, extra.get("forced_off") or {}):
+        for nurse_id, day_list in (src or {}).items():
+            merged_forced_off.setdefault(str(nurse_id), set()).update({int(d) for d in (day_list or [])})
+    merged_forced_off_out = {k: sorted(v) for k, v in merged_forced_off.items()}
+
+    merged_forbidden: dict[str, dict[int, set[str]]] = {}
+    for src in (base.get("forbidden") or {}, extra.get("forbidden") or {}):
+        for nurse_id, day_map in (src or {}).items():
+            nid = str(nurse_id)
+            merged_forbidden.setdefault(nid, {})
+            for day_idx, codes in (day_map or {}).items():
+                try:
+                    d = int(day_idx)
+                except Exception:
+                    continue
+                merged_forbidden[nid].setdefault(d, set()).update({str(c).strip().upper() for c in (codes or [])})
+
+    merged_forbidden_out: dict[str, dict[int, list[str]]] = {}
+    for nurse_id, day_map in merged_forbidden.items():
+        merged_forbidden_out[nurse_id] = {d: sorted(codes) for d, codes in day_map.items()}
+
+    return {"forced_off": merged_forced_off_out, "forbidden": merged_forbidden_out}
+
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
@@ -917,14 +1099,30 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     except Exception as e:
         print(f"error: {e}")
         raise
-    # cross-month 경계 제약 생성 및 주입
+
+    # ── 1) 허용 근무유형(D/E/N) 하드 제약 생성(월 전체) + 고정셀 충돌 검증(옵션 A) ──
+    allowed_constraints = build_allowed_shift_type_constraints(
+        nurses_in_group=nurses_in_group,
+        year=req.year,
+        month=req.month,
+        shift_manage_data=shift_manage_data,
+        fixed_cells=config_dict.get("fixed_cells"),
+    )
+
+    # ── 2) cross-month 경계 제약 생성 ──
+    cross_month_constraints: dict = {"forced_off": {}, "forbidden": {}}
     try:
-        initial_constraints = build_cross_month_constraints(
+        cross_month_constraints = build_cross_month_constraints(
             db, req, current_user, shift_manage_data, config_dict, [n.nurse_id for n in nurses_in_group]
         )
-        config_dict['initial_constraints'] = initial_constraints
     except Exception as e:
         print(f"이전 월 경계 제약 생성 실패: {e}")
+
+    # ── 3) 병합 후 주입(금지/강제OFF 합집합) ──
+    config_dict["initial_constraints"] = _merge_initial_constraints(
+        base=cross_month_constraints,
+        extra=allowed_constraints,
+    )
     try:
         print("cp_sat_basic 엔진 호출 준비 완료")
         # ── 실행 초기에 정책 파라미터가 어떻게 적용됐는지 반드시 로그로 남긴다(추후 유지보수용) ──
