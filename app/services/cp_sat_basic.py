@@ -251,6 +251,8 @@ class CPSATBasicEngine:
                 # Grade(1~3): None 허용. 변환 정책은 Grade 제약 모듈에서 처리한다.
                 'grade': nurse_data.get('grade'),
                 'is_head_nurse': nurse_data.get('is_head_nurse', False),
+                # 주말 고정 휴무(True)이면 토/일은 OFF('O')만 허용(하드 제약은 모델 빌더에서 적용)
+                'is_weekend_off': bool(nurse_data.get('is_weekend_off', False)),
                 'is_night_nurse': nurse_data.get('is_night_nurse', 0),
                 'personal_off_adjustment': nurse_data.get('personal_off_adjustment', 0),
                 'remaining_off_days': 0,  # 초기화, 나중에 계산됨
@@ -651,6 +653,7 @@ class CPSATBasicEngine:
 
         first_day = roster_system.target_month
         last_day = first_day + timedelta(days=D - 1)
+        weekend_days = {d for d in range(D) if (first_day + timedelta(days=d)).weekday() >= 5}
         join, leave = [], []
         for nu in roster_system.nurses:
             j = (nu.joining_date - first_day).days if nu.joining_date else 0
@@ -814,6 +817,20 @@ class CPSATBasicEngine:
                 for s in range(S):
                     if s != s_idx:
                         m.Add(X(n, d, s) == 0)
+
+            # 주말 고정 휴무(하드): is_weekend_off=True인 인원은 토/일에 OFF만 허용
+            for n, nu in enumerate(roster_system.nurses):
+                if not bool(getattr(nu, "is_weekend_off", False)):
+                    continue
+                for d in range(join[n], leave[n] + 1):
+                    if d not in weekend_days:
+                        continue
+                    if (n, d) in fixed and fixed[(n, d)] != off_idx:
+                        raise ValueError(
+                            f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
+                            f"fixed_shift={cfg.shift_types[fixed[(n, d)]]}, required=O"
+                        )
+                    m.Add(X(n, d, off_idx) == 1)
 
             # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
             try:
@@ -1637,6 +1654,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # shorthand indices
     idx = {c:rs.config.shift_types.index(c) for c in ('D','E','N','O')}
     day,eve,night,off = idx['D'],idx['E'],idx['N'],idx['O']
+    # 주말(토/일) day_idx 집합(0-based)
+    weekend_days = {d for d in range(D) if (rs.target_month + timedelta(days=d)).weekday() >= 5}
 
     # ───────────── 3. Hard 법규 ───────────────
     cfg = rs.config
@@ -1645,6 +1664,18 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     for n,nu in enumerate(rs.nurses):
         T0,T1 = join[n], leave[n]
+        # 주말 고정 휴무(하드): 토/일은 OFF만 허용
+        if bool(getattr(nu, "is_weekend_off", False)):
+            for d in range(T0, T1 + 1):
+                if d not in weekend_days:
+                    continue
+                # 고정 셀과 충돌하면 명확히 실패
+                if (n, d) in fixed and fixed[(n, d)] != off:
+                    raise ValueError(
+                        f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
+                        f"fixed_shift={rs.config.shift_types[fixed[(n, d)]]}, required=O"
+                    )
+                m.Add(X(n, d, off) == 1)
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):
             m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)

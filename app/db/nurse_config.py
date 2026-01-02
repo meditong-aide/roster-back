@@ -23,6 +23,7 @@ class Nurse:
     team_id: Optional[int] = None
     is_night_nurse: int = 0
     is_head_nurse: bool = False
+    is_weekend_off: bool = False
     remaining_off_days: int = 0
     personal_off_adjustment: int = 0  # 이전 달에서 이월된 조정치(음수 또는 양수 가능)
     resignation_date: Optional[date] = None
@@ -40,6 +41,7 @@ class Nurse:
             team_id=getattr(db_nurse, "team_id", None),
             is_night_nurse=db_nurse.is_night_nurse,
             is_head_nurse=db_nurse.is_head_nurse,
+            is_weekend_off=bool(getattr(db_nurse, "is_weekend_off", False)),
             personal_off_adjustment=db_nurse.personal_off_adjustment,
             resignation_date=db_nurse.resignation_date if db_nurse.resignation_date else None,
             joining_date=db_nurse.joining_date if db_nurse.joining_date else None,

@@ -487,6 +487,12 @@ def _weekday_dates_in_month(year: int, month: int, weekday: int) -> list[int]:
     return result
 
 
+def _weekday_to_korean(weekday: int) -> str:
+    """요일 번호(0=월..6=일)를 한글 요일명으로 변환한다."""
+    weekday_names = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+    return weekday_names[weekday % 7]
+
+
 def _active_range_in_month(nurse: Nurse, month_start: date, days_in_month: int) -> tuple[int, int] | None:
     """한 달 기준 간호사의 근무 가능 day_idx 구간을 반환합니다."""
     month_end = month_start + timedelta(days=days_in_month - 1)
@@ -526,7 +532,8 @@ def _compute_weekly_off_day_indices_for_month(
 
     주의:
         - weekly_off_settings/nurses 컬럼이 실제 DB에 없으면 빈 결과를 반환한다(기능 비활성).
-        - 엔진에는 OFF('O')로 고정 셀을 넣고, 저장 시 해당 날짜만 '주'로 마킹하는 방식이 안전하다.
+        - 엔진/저장/응답에서는 휴무 코드를 항상 'O'로 통일한다(주휴도 'O').
+        - 주휴 요일이 주말(토/일)이 아니면 즉시 예외를 발생시킨다.
     """
     warnings: list[dict] = []
     nurse_to_days: dict[str, set[int]] = {}
@@ -576,32 +583,55 @@ def _compute_weekly_off_day_indices_for_month(
     # 간호사 주휴 요일 조회
     # weekly_off_enabled 컬럼은 선택(없어도 weekday null 여부로 판단)
     has_enabled_col = _column_exists(db, "nurses", "weekly_off_enabled")
+    has_weekend_off_col = _column_exists(db, "nurses", "is_weekend_off")
     try:
         if has_enabled_col:
-            rows = db.execute(
-                text(
-                    "SELECT nurse_id, weekly_off_enabled, weekly_off_weekday "
-                    "FROM nurses WHERE group_id = :group_id AND active = 1"
-                ),
-                {"group_id": group_id},
-            ).fetchall()
+            if has_weekend_off_col:
+                rows = db.execute(
+                    text(
+                        "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday, is_weekend_off "
+                        "FROM nurses WHERE group_id = :group_id AND active = 1"
+                    ),
+                    {"group_id": group_id},
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    text(
+                        "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday "
+                        "FROM nurses WHERE group_id = :group_id AND active = 1"
+                    ),
+                    {"group_id": group_id},
+                ).fetchall()
         else:
-            rows = db.execute(
-                text(
-                    "SELECT nurse_id, weekly_off_weekday "
-                    "FROM nurses WHERE group_id = :group_id AND active = 1"
-                ),
-                {"group_id": group_id},
-            ).fetchall()
+            if has_weekend_off_col:
+                rows = db.execute(
+                    text(
+                        "SELECT nurse_id, name, weekly_off_weekday, is_weekend_off "
+                        "FROM nurses WHERE group_id = :group_id AND active = 1"
+                    ),
+                    {"group_id": group_id},
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    text(
+                        "SELECT nurse_id, name, weekly_off_weekday "
+                        "FROM nurses WHERE group_id = :group_id AND active = 1"
+                    ),
+                    {"group_id": group_id},
+                ).fetchall()
     except Exception as e:
         warnings.append({"type": "nurses_query_failed", "detail": str(e)})
         return nurse_to_days, warnings
 
     for r in rows:
         nurse_id = str(r.nurse_id)
+        name = str(r.name)
         enabled = True
         if has_enabled_col:
             enabled = bool(getattr(r, "weekly_off_enabled", 0))
+        # 주말 고정 휴무 대상일 때만 "주휴 요일은 주말"을 강제한다.
+        # - 컬럼이 없으면(레거시 DB) False로 간주하여 기존 동작(에러 없음)을 유지한다.
+        is_weekend_off = bool(getattr(r, "is_weekend_off", 0)) if has_weekend_off_col else False
 
         base_weekday = getattr(r, "weekly_off_weekday", None)
         if not enabled or base_weekday is None:
@@ -612,6 +642,11 @@ def _compute_weekly_off_day_indices_for_month(
         if not use_variable_cycle:
             # 변동 주기 OFF → 기준 요일을 그대로 사용
             month_weekday = base_weekday % 7
+            if is_weekend_off and month_weekday not in (5, 6):
+                raise ValueError(
+                    f"주휴 요일은 주말(토/일)만 허용됩니다. "
+                    f"간호사={name}, 당월 주휴는 {_weekday_to_korean(month_weekday)}입니다."
+                )
             day_indices = set(_weekday_dates_in_month(year, month, month_weekday))
             nurse_to_days[nurse_id] = day_indices
             continue
@@ -625,6 +660,11 @@ def _compute_weekly_off_day_indices_for_month(
                 target_year=year,
                 target_month=month,
             )
+            if is_weekend_off and int(month_weekday) not in (5, 6):
+                raise ValueError(
+                    f"주휴 요일은 주말(토/일)만 허용됩니다. "
+                    f"간호사={name}, 당월 주휴는 {_weekday_to_korean(int(month_weekday))}입니다."
+                )
             nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, month_weekday))
             continue
 
@@ -644,6 +684,11 @@ def _compute_weekly_off_day_indices_for_month(
                     target_date=week_start,
                     cycle_interval_weeks=cycle_interval,
                 )
+                if is_weekend_off and int(w) not in (5, 6):
+                    raise ValueError(
+                        f"주휴 요일은 주말(토/일)만 허용됩니다. "
+                        f"간호사={name}, 당월 주휴는 {_weekday_to_korean(int(w))}입니다."
+                    )
                 if cur.weekday() == w:
                     day_set.add(d - 1)
             nurse_to_days[nurse_id] = day_set
@@ -651,6 +696,11 @@ def _compute_weekly_off_day_indices_for_month(
 
         # 설정이 불완전하면 기준 요일 유지
         month_weekday = base_weekday % 7
+        if is_weekend_off and month_weekday not in (5, 6):
+            raise ValueError(
+                f"주휴 요일은 주말(토/일)만 허용됩니다. "
+                f"간호사={name}, 당월 주휴는 {_weekday_to_korean(month_weekday)}입니다."
+            )
         nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, month_weekday))
 
     return nurse_to_days, warnings
@@ -1070,6 +1120,25 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     cp_sat_result = None
     try:
         nurses_dict = [n.__dict__ for n in nurses_in_group]
+        # is_weekend_off는 ORM 컬럼 유무와 무관하게, DB에 컬럼이 있으면 직접 조회해서 엔진 입력에 주입한다.
+        # - 이유: ORM 모델/스키마가 아직 확장되지 않은 환경에서도 fallback/하드 제약이 동작해야 한다.
+        try:
+            if _column_exists(db, "nurses", "is_weekend_off"):
+                rows = db.execute(
+                    text(
+                        "SELECT nurse_id, is_weekend_off "
+                        "FROM nurses WHERE group_id = :group_id AND active = 1"
+                    ),
+                    {"group_id": current_user.group_id},
+                ).fetchall()
+                id_to_weekend_off = {str(r.nurse_id): bool(getattr(r, "is_weekend_off", 0)) for r in rows}
+                for nd in nurses_dict:
+                    nid = str(nd.get("nurse_id") or nd.get("db_id") or "")
+                    if not nid:
+                        continue
+                    nd["is_weekend_off"] = bool(id_to_weekend_off.get(nid, False))
+        except Exception as e:
+            print(f"[WeeklyOff] is_weekend_off 주입 실패(무시): {e}")
         # prefs_dict = [p.__dict__ for p in preferences]
         prefs_dict = preferences
 
@@ -1433,37 +1502,32 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     }
 
     print('active_range_map', active_range_map)
-    try:
-        weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
-            db=db,
-            office_id=current_user.office_id,
-            group_id=current_user.group_id,
-            year=req.year,
-            month=req.month,
-        )
-        if weekly_off_map:
-            filtered_map: dict[str, set[int]] = {}
-            for nurse_id, day_set in weekly_off_map.items():
-                rng = active_range_map.get(str(nurse_id))
-                if not rng:
-                    continue
-                start_idx, end_idx = rng
-                clipped = {d for d in day_set if start_idx <= d <= end_idx}
-                if clipped:
-                    filtered_map[str(nurse_id)] = clipped
-            weekly_off_map = filtered_map
-        if weekly_off_map:
-            nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
-            for nurse_id, day_set in weekly_off_map.items():
-                n_idx = nurse_idx_map.get(nurse_id)
-                if n_idx is None:
-                    continue
-                for d in sorted(day_set):
-                    weekly_off_fixed_cells.append(
-                        {"nurse_index": n_idx, "day_index": d, "shift": "O"}
-                    )
-    except Exception as e:
-        weekly_off_warnings.append({"type": "weekly_off_failed", "detail": str(e)})
+    weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
+        db=db,
+        office_id=current_user.office_id,
+        group_id=current_user.group_id,
+        year=req.year,
+        month=req.month,
+    )
+    if weekly_off_map:
+        filtered_map: dict[str, set[int]] = {}
+        for nurse_id, day_set in weekly_off_map.items():
+            rng = active_range_map.get(str(nurse_id))
+            if not rng:
+                continue
+            start_idx, end_idx = rng
+            clipped = {d for d in day_set if start_idx <= d <= end_idx}
+            if clipped:
+                filtered_map[str(nurse_id)] = clipped
+        weekly_off_map = filtered_map
+    if weekly_off_map:
+        nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+        for nurse_id, day_set in weekly_off_map.items():
+            n_idx = nurse_idx_map.get(nurse_id)
+            if n_idx is None:
+                continue
+            for d in sorted(day_set):
+                weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
 
     generated, satisfaction_data, roster_system = _run_cp_sat_basic(
         db,
@@ -1486,7 +1550,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 if not shifts:
                     continue
                 for d in day_set:
-                    if start_idx <= d <= end_idx and 0 <= d < len(shifts):
+                    if 0 <= d < len(shifts):
                         shifts[d] = "주"
     except Exception as e:
         weekly_off_warnings.append({"type": "weekly_off_mark_failed", "detail": str(e)})
@@ -1549,30 +1613,25 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
     weekly_off_map: dict[str, set[int]] = {}
     weekly_off_fixed_cells: list[dict] = []
     merged_fixed_cells = fixed_cells
-    try:
-        weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
-            db=db,
-            office_id=current_user.office_id,
-            group_id=current_user.group_id,
-            year=req.year,
-            month=req.month,
+    weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
+        db=db,
+        office_id=current_user.office_id,
+        group_id=current_user.group_id,
+        year=req.year,
+        month=req.month,
+    )
+    if weekly_off_map:
+        nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+        for nurse_id, day_set in weekly_off_map.items():
+            n_idx = nurse_idx_map.get(nurse_id)
+            if n_idx is None:
+                continue
+            for d in sorted(day_set):
+                weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
+        merged_fixed_cells, weekly_off_conflicts = _merge_fixed_cells_with_weekly_off(
+            fixed_cells=fixed_cells,
+            weekly_off_cells=weekly_off_fixed_cells,
         )
-        if weekly_off_map:
-            nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
-            for nurse_id, day_set in weekly_off_map.items():
-                n_idx = nurse_idx_map.get(nurse_id)
-                if n_idx is None:
-                    continue
-                for d in sorted(day_set):
-                    weekly_off_fixed_cells.append(
-                        {"nurse_index": n_idx, "day_index": d, "shift": "O"}
-                    )
-            merged_fixed_cells, weekly_off_conflicts = _merge_fixed_cells_with_weekly_off(
-                fixed_cells=fixed_cells,
-                weekly_off_cells=weekly_off_fixed_cells,
-            )
-    except Exception as e:
-        weekly_off_warnings.append({"type": "weekly_off_failed", "detail": str(e)})
 
     generated, satisfaction_data, roster_system = _run_cp_sat_basic(
         db,
