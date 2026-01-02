@@ -42,6 +42,16 @@ def convert_time(value):
     return value
 
 
+def format_timedelta(td):
+    if td is None:
+        return None
+    seconds = int(td.total_seconds())
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 router = APIRouter(
     tags=["shifts"]
 )
@@ -76,6 +86,10 @@ async def get_shifts(
         for shift in shifts:
             shift["start_time"] = convert_time(shift["start_time"])
             shift["end_time"] = convert_time(shift["end_time"])
+            if isinstance(shift["start_time"], timedelta):
+                shift["start_time"] = format_timedelta(shift["start_time"])
+            if isinstance(shift["end_time"], timedelta):
+                shift["end_time"] = format_timedelta(shift["end_time"])
         return shifts
     except Exception as e:
         print(e)
