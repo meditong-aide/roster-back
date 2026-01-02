@@ -78,6 +78,9 @@ class NurseRosterConfig:
     # 근무 요구사항 우선순위 (0~1) - 1에 가까울수록 더 강하게 근무 요구사항 강제
     shift_requirement_priority: float = 0.8  # 근무 요구사항 우선순위
     
+    # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제(평일 O 금지)
+    weekend_off_only_enable: bool = True  # 주말 휴무 제약 활성화 여부(기본 True)
+    
     # --- Oversupply(여유 인원) 균등화 제어 ---
     oversupply_equalize_enable: bool = True  # 일별 D/E/N 초과 인원(L1) 균등화 활성화
     oversupply_equalize_weight: int = 120    # L1 차이 패널티 가중치(클수록 균등화 강함)

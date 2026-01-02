@@ -183,7 +183,9 @@ class CPSATBasicEngine:
             monthly_preference_weight=int(config_data.get("monthly_preference_weight", 60) or 0),
             # 여유 인원 균등화 제어
             oversupply_equalize_enable=bool(config_data.get('oversupply_equalize_enable', True)),
-            oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120))
+            oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
+            # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
+            weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True))
         )
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
@@ -818,19 +820,28 @@ class CPSATBasicEngine:
                     if s != s_idx:
                         m.Add(X(n, d, s) == 0)
 
-            # 주말 고정 휴무(하드): is_weekend_off=True인 인원은 토/일에 OFF만 허용
-            for n, nu in enumerate(roster_system.nurses):
-                if not bool(getattr(nu, "is_weekend_off", False)):
-                    continue
-                for d in range(join[n], leave[n] + 1):
-                    if d not in weekend_days:
+            # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
+            if getattr(cfg, 'weekend_off_only_enable', True):
+                for n, nu in enumerate(roster_system.nurses):
+                    if not bool(getattr(nu, "is_weekend_off", False)):
                         continue
-                    if (n, d) in fixed and fixed[(n, d)] != off_idx:
-                        raise ValueError(
-                            f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
-                            f"fixed_shift={cfg.shift_types[fixed[(n, d)]]}, required=O"
-                        )
-                    m.Add(X(n, d, off_idx) == 1)
+                    for d in range(join[n], leave[n] + 1):
+                        if d in weekend_days:
+                            # 주말(토/일): OFF만 허용
+                            if (n, d) in fixed and fixed[(n, d)] != off_idx:
+                                raise ValueError(
+                                    f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
+                                    f"fixed_shift={cfg.shift_types[fixed[(n, d)]]}, required=O"
+                                )
+                            m.Add(X(n, d, off_idx) == 1)
+                        else:
+                            # 평일(월~금): OFF 금지(D/E/N만 가능)
+                            if (n, d) in fixed and fixed[(n, d)] == off_idx:
+                                raise ValueError(
+                                    f"주말 휴무 대상 간호사는 평일에 휴무를 받을 수 없습니다. "
+                                    f"nurse_index={n}, day={d+1}"
+                                )
+                            m.Add(X(n, d, off_idx) == 0)
 
             # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
             try:
@@ -1664,18 +1675,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     for n,nu in enumerate(rs.nurses):
         T0,T1 = join[n], leave[n]
-        # 주말 고정 휴무(하드): 토/일은 OFF만 허용
-        if bool(getattr(nu, "is_weekend_off", False)):
+        # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
+        if bool(getattr(nu, "is_weekend_off", False)) and getattr(cfg, 'weekend_off_only_enable', True):
             for d in range(T0, T1 + 1):
-                if d not in weekend_days:
-                    continue
-                # 고정 셀과 충돌하면 명확히 실패
-                if (n, d) in fixed and fixed[(n, d)] != off:
-                    raise ValueError(
-                        f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
-                        f"fixed_shift={rs.config.shift_types[fixed[(n, d)]]}, required=O"
-                    )
-                m.Add(X(n, d, off) == 1)
+                if d in weekend_days:
+                    # 주말(토/일): OFF만 허용
+                    if (n, d) in fixed and fixed[(n, d)] != off:
+                        raise ValueError(
+                            f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
+                            f"fixed_shift={rs.config.shift_types[fixed[(n, d)]]}, required=O"
+                        )
+                    m.Add(X(n, d, off) == 1)
+                else:
+                    # 평일(월~금): OFF 금지(D/E/N만 가능)
+                    if (n, d) in fixed and fixed[(n, d)] == off:
+                        raise ValueError(
+                            f"주말 휴무 대상 간호사는 평일에 휴무를 받을 수 없습니다. "
+                            f"nurse_index={n}, day={d+1}"
+                        )
+                    m.Add(X(n, d, off) == 0)
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):
             m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)

@@ -635,7 +635,11 @@ def _compute_weekly_off_day_indices_for_month(
 
         base_weekday = getattr(r, "weekly_off_weekday", None)
         if not enabled or base_weekday is None:
+            if enabled and base_weekday is None:
+                print(f"[WeeklyOff] 간호사 {name}({nurse_id}): 주휴 활성화되었으나 weekly_off_weekday 없음 (스킵)")
             continue
+        # 주말 휴무 대상(is_weekend_off=True)인 간호사도 주휴를 계산하되, 주휴가 주말인 경우에만 추가
+        # (주말 휴무 제약으로 주말에 자동으로 휴무를 받지만, '주' 표시를 위해 주휴 정보는 유지)
         base_weekday = int(base_weekday)
 
         # 계산
@@ -797,6 +801,7 @@ def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict
     반환: { nurse_id: ['E','N','O','D','N','O'] } (최대 길이 days, 과거→현재 순)
     """
     if not schedule_id:
+        print(f"[CrossMonth] 이전 달 스케줄 ID 없음, 빈 맵 반환")
         return {}
     # 해당 스케줄의 모든 엔트리 로딩
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
@@ -810,11 +815,22 @@ def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict
     result = {}
     start = max(1, max_day - days + 1)
     tail_days = list(range(start, max_day + 1))
+    print(f"[CrossMonth] 이전 달 마지막 {days}일 조회: day {start}~{max_day} (총 {len(tail_days)}일)")
     for nurse_id, daymap in by_nurse.items():
         seq = []
         for d in tail_days:
             seq.append(daymap.get(d, '-'))
         result[nurse_id] = seq
+        # 간호사별 꼬리 시퀀스 출력 (간략하게 상위 5명만)
+        if len([k for k in result.keys() if k < nurse_id]) < 5:
+            seq_str = ' '.join(seq)
+            print(f"  간호사 {nurse_id}: {seq_str}")
+    # 간호사 0이 될 가능성이 있는 간호사(첫 번째 간호사)의 꼬리 패턴도 출력
+    if result:
+        first_nurse_id = min(result.keys(), key=lambda x: (x,))
+        if first_nurse_id not in [k for k in result.keys() if k < first_nurse_id][:5]:
+            seq_str = ' '.join(result[first_nurse_id])
+            print(f"  간호사 {first_nurse_id} (첫 번째, nurse_index=0 가능): {seq_str}")
     return result
 
 def _calc_tail_metrics(seq: list[str]) -> dict:
@@ -872,11 +888,14 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     # 이전 달 최신 스케줄 조회 → 마지막 N일 시퀀스
     try:
         prev_sid = _query_prev_month_schedule_id(db, current_user.group_id, req.year, req.month)
+        prev_year, prev_month = _get_prev_year_month(req.year, req.month)
+        print(f"[CrossMonth] 이전 달 조회: {prev_year}년 {prev_month}월, schedule_id={prev_sid}, lookback={lookback}일")
     except Exception as e:
         print("[ERR] _query_prev_month_schedule_id:", e)
         raise
     try:
         last_map = _get_last_days_map(db, prev_sid, lookback, code2main) if prev_sid else {}
+        print(f"[CrossMonth] 이전 달 꼬리 패턴 조회 완료: {len(last_map)}명")
     except Exception as e:
         print("[ERR] _get_last_days_map:", e)
         raise    
@@ -890,6 +909,28 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     banned_E_to_D = bool(config_dict.get('banned_day_after_eve'))
     L = int(config_dict.get('max_consecutive_nights') or 0)
 
+    # 간호사별 is_weekend_off 정보 조회 (주말 휴무 대상자 필터링용)
+    weekend_off_nurse_ids: set[str] = set()
+    try:
+        from db.models import Nurse as NurseModel
+        from sqlalchemy import text
+        weekend_off_rows = db.execute(
+            text("SELECT nurse_id FROM nurses WHERE group_id = :group_id AND active = 1 AND is_weekend_off = 1"),
+            {"group_id": current_user.group_id}
+        ).fetchall()
+        weekend_off_nurse_ids = {str(row.nurse_id) for row in weekend_off_rows}
+        if weekend_off_nurse_ids:
+            print(f"[CrossMonth] 주말 휴무 대상 간호사: {sorted(weekend_off_nurse_ids)}")
+    except Exception as e:
+        print(f"[CrossMonth] 주말 휴무 대상 간호사 조회 실패 (무시): {e}")
+    
+    # 대상 월의 주말 day_idx 계산 (필터링용)
+    from datetime import date, timedelta
+    target_month = date(req.year, req.month, 1)
+    days_in_month = calendar.monthrange(req.year, req.month)[1]
+    weekend_day_indices = {d for d in range(days_in_month) if (target_month + timedelta(days=d)).weekday() >= 5}
+    print(f"[CrossMonth] 대상 월({req.year}년 {req.month}월) 주말 day_idx: {sorted(weekend_day_indices)}")
+
     for nurse_id in nurse_ids:
         tail = last_map.get(nurse_id, [])
         metrics = _calc_tail_metrics(tail)
@@ -897,11 +938,15 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         cons_n = metrics['consecutive_night_tail']
         last_shift = metrics['last_day_shift']
         offs_after = metrics['offs_after_tail_nights']
+        
+        # 디버깅: 이전 달 꼬리 패턴과 계산된 메트릭 출력 (강제 OFF가 생성되는 경우만)
+        forced_off_before = len(forced_off.get(nurse_id, []))
 
         # (a) 연속 근무 K
         if K and cons_work == K:
             forced_off[nurse_id].append(0)
-            print(f"간호사 {nurse_id}: 연속근무={cons_work} → day1 OFF")
+            tail_str = ' '.join(tail) if tail else '(없음)'
+            print(f"[CrossMonth] 간호사 {nurse_id}: 연속근무={cons_work} (꼬리: {tail_str}) → day0(1일) OFF 강제")
 
         # (b) N2/3 → 2OFF
         req_offs = 0
@@ -913,7 +958,22 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         for d in range(min(2, rem)):
             forced_off[nurse_id].append(d)
         if rem > 0:
-            print(f"간호사 {nurse_id}: N tail={cons_n}, offs_after={offs_after} → day1..{rem} OFF")
+            tail_str = ' '.join(tail) if tail else '(없음)'
+            print(f"[CrossMonth] 간호사 {nurse_id}: N tail={cons_n}, offs_after={offs_after}, req_offs={req_offs}, rem={rem} (꼬리: {tail_str}) → day0..{rem-1}(1일..{rem}일) OFF 강제")
+        
+        # 강제 OFF가 추가된 경우 상세 정보 출력
+        forced_off_after = len(forced_off.get(nurse_id, []))
+        if forced_off_after > forced_off_before:
+            final_days = sorted(set(forced_off.get(nurse_id, [])))
+            print(f"[CrossMonth] 간호사 {nurse_id} 최종 강제 OFF day_idx: {final_days}")
+            
+            # 주말 휴무 대상 간호사의 경우 평일 OFF 필터링
+            if nurse_id in weekend_off_nurse_ids:
+                filtered_days = [d for d in final_days if d in weekend_day_indices]
+                removed_days = [d for d in final_days if d not in weekend_day_indices]
+                if removed_days:
+                    print(f"[CrossMonth] ⚠️ 간호사 {nurse_id} (주말 휴무 대상): 평일 OFF 제거 day_idx={removed_days}, 주말만 유지 day_idx={filtered_days}")
+                    forced_off[nurse_id] = filtered_days
 
         # (c) E→D, N→D 금지
         if last_shift == 'E' and banned_E_to_D:
@@ -1522,11 +1582,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         weekly_off_map = filtered_map
     if weekly_off_map:
         nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+        print(f"[WeeklyOff] 주휴 고정 셀 생성: {len(weekly_off_map)}명")
         for nurse_id, day_set in weekly_off_map.items():
             n_idx = nurse_idx_map.get(nurse_id)
             if n_idx is None:
+                print(f"[WeeklyOff] ⚠️ 간호사 {nurse_id}: nurse_index 매핑 실패 (주휴 무시)")
                 continue
-            for d in sorted(day_set):
+            nurse_name = next((n.name for n in nurses_in_group if str(n.nurse_id) == str(nurse_id)), nurse_id)
+            day_list = sorted(day_set)
+            print(f"[WeeklyOff] 간호사 {nurse_name}({nurse_id}, index={n_idx}): 주휴 day_idx={day_list} (실제 날짜: {[d+1 for d in day_list]})")
+            for d in day_list:
                 weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
 
     generated, satisfaction_data, roster_system = _run_cp_sat_basic(
