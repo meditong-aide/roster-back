@@ -634,6 +634,26 @@ def _compute_weekly_off_day_indices_for_month(
         is_weekend_off = bool(getattr(r, "is_weekend_off", 0)) if has_weekend_off_col else False
 
         base_weekday = getattr(r, "weekly_off_weekday", None)
+        # ── 주말 휴무 대상 처리(백그라운드 강제 정책) ──
+        # 요구사항:
+        # - is_weekend_off=True인 인력은 "설정된 주휴 요일"을 무시하고,
+        #   대상 월의 "일요일(6)"을 주휴로 강제한다.
+        # - 이 경우 주휴 계산(변동 주기) 및 주말 검증 로직을 수행하지 않는다.
+        #
+        # 적용 조건(누락 방지):
+        # - weekly_off_enabled 컬럼이 있으면 enabled=True일 때만 적용
+        # - weekly_off_enabled 컬럼이 없으면(레거시) weekly_off_weekday가 설정되어 있는 경우에만 적용
+        if is_weekend_off:
+            if has_enabled_col:
+                if not enabled:
+                    continue
+            else:
+                # 레거시: weekly_off_weekday 자체가 없으면 주휴 자체를 쓰지 않는 것으로 간주
+                if base_weekday is None:
+                    continue
+            nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, 6))
+            continue
+
         if not enabled or base_weekday is None:
             if enabled and base_weekday is None:
                 print(f"[WeeklyOff] 간호사 {name}({nurse_id}): 주휴 활성화되었으나 weekly_off_weekday 없음 (스킵)")
