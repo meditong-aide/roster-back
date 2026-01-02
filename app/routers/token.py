@@ -109,6 +109,7 @@ async def login_for_access_token(response: Response,
                 mb_part_name = row['mb_partName']
                 gw_useYN = row['gw_useYN']
                 qpis_useYN = row['qpis_useYN']
+                official_title_name = row['OfficialTitleName']  # 추가 필드 추출
             # ADM 여부는 EmpAuthGbn으로 판정
             is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
@@ -138,6 +139,7 @@ async def login_for_access_token(response: Response,
                     "mb_part_name": mb_part_name,
                     "gw_useYN": gw_useYN,
                     "qpis_useYN": qpis_useYN,
+                    "official_title_name": official_title_name,  # 추가 필드
                 },
                 expires_delta=access_token_expires,
             )
@@ -165,6 +167,7 @@ async def login_for_access_token(response: Response,
                 mb_part_name=mb_part_name,
                 gw_useYN=gw_useYN,
                 qpis_useYN=qpis_useYN,
+                official_title_name=official_title_name,  # 추가 필드
             )
 
             # return {"result": "succeed", "message": "Login successful", "account_id": MemberID}
