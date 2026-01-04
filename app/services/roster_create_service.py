@@ -145,6 +145,8 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
 
 # def _collect_nurses_and_preferences(db: Session, req: RosterRequest, current_user):
 #     """그룹 내 간호사 목록과 선호도(제출본 우선)를 수집한다."""
+# def _collect_nurses_and_preferences(db: Session, req: RosterRequest, current_user):
+#     """그룹 내 간호사 목록과 선호도(제출본 우선)를 수집한다."""
 #     nurses_in_group = (
 #         db.query(Nurse)
 #         .filter(Nurse.group_id == current_user.group_id)
@@ -183,6 +185,18 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
 #             if draft_pref:
 #                 preferences.append(draft_pref)
 #     return nurses_in_group, preferences
+
+
+def _load_shift_lookup(db: Session, office_id: str, group_id: str) -> dict[str, Shift]:
+    """해당 office/group의 shifts를 로드해 shift_id→Shift 매핑을 반환합니다."""
+    shifts = (
+        db.query(Shift)
+        .filter(Shift.office_id == office_id, Shift.group_id == group_id)
+        .all()
+    )
+    lookup = {str(s.shift_id).upper(): s for s in shifts}
+    print(f"[FixedShift] shift_lookup 로드: {len(lookup)}건")
+    return lookup
 
 
 def _fetch_latest_config(db: Session, req: RosterRequest, current_user):
@@ -549,6 +563,7 @@ def _build_fixed_shift_roster(
     month: int,
     weekday_off_code: str = "O",
     sunday_code: str = "주",
+    shift_lookup: dict[str, Shift] | None = None,
 ) -> dict[str, list[str]]:
     """고정 근무 간호사의 월간 스케줄을 생성합니다.
 
@@ -567,6 +582,12 @@ def _build_fixed_shift_roster(
             continue
         start_idx, end_idx = active_range
         fixed_code = str(getattr(nurse, "fixed_shift", "") or "").upper()
+        if shift_lookup is not None:
+            if fixed_code not in shift_lookup:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"fixed_shift가 shifts에 없습니다: nurse={getattr(nurse, 'name', '?')}({getattr(nurse, 'nurse_id', '?')}), code={fixed_code}",
+                )
         try:
             print(
                 f"[FixedShift] 적용: {getattr(nurse, 'name', '?')}({getattr(nurse, 'nurse_id', '?')}) "
@@ -1400,18 +1421,30 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
 def _persist_entries(db: Session, schedule, generated, req):
     """생성된 근무표를 ScheduleEntry로 저장한다."""
     db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).delete()
+    # 저장 시 shift_id 정규화를 위해 해당 그룹의 유효 shift_id 집합을 로드한다.
+    shift_ids = {
+        s.shift_id
+        for s in db.query(Shift)
+        .filter(Shift.group_id == schedule.group_id, Shift.office_id == schedule.office_id)
+        .all()
+    }
     for nurse_id, shifts in generated.items():
         for day_index, shift_id in enumerate(shifts):
             if shift_id != '-':
                 work_date = date(req.year, req.month, day_index + 1)
+                norm_shift = _normalize_shift_id_for_save(str(shift_id), shift_ids)
                 entry = ScheduleEntry(
                     entry_id=str(uuid.uuid4().hex)[:16],
                     schedule_id=schedule.schedule_id,
                     nurse_id=nurse_id,
                     work_date=work_date,
-                    shift_id=shift_id.upper(),
+                    shift_id=norm_shift,
                 )
                 db.add(entry)
+        try:
+            print(f"[PersistRoster] nurse={nurse_id}, saved_shifts={shifts}")
+        except Exception:
+            pass
     db.commit()
 
 
@@ -1437,6 +1470,14 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
             entries_by_nurse[entry.nurse_id] = {}
         entries_by_nurse[entry.nurse_id][entry.work_date.day] = entry.shift_id
 
+    try:
+        debug_counts = {
+            nid: {d: code for d, code in day_map.items()} for nid, day_map in entries_by_nurse.items()
+        }
+        print(f"[RosterResponse] schedule_id={schedule.schedule_id}, entries_by_nurse={debug_counts}")
+    except Exception:
+        pass
+
     for nurse in nurses_in_group:
         nurse_schedule = [
             entries_by_nurse.get(nurse.nurse_id, {}).get(d, '-')
@@ -1453,6 +1494,25 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
             }
         )
     return roster_data
+
+
+def _normalize_shift_id_for_save(raw_shift: str, valid_shift_ids: set[str]) -> str:
+    """Shift ID를 저장 시 안전하게 정규화합니다.
+
+    - raw_shift 그대로가 유효하면 그대로 사용
+    - 대문자 변환본이 유효하면 대문자로 사용
+    - 대소문자 무시 매칭이 되면 DB에 존재하는 원본 케이스를 보존
+    - 둘 다 없으면 원본을 반환(최후 fallback)
+    """
+    if raw_shift in valid_shift_ids:
+        return raw_shift
+    upper = raw_shift.upper()
+    if upper in valid_shift_ids:
+        return upper
+    for sid in valid_shift_ids:
+        if sid.upper() == upper:
+            return sid
+    return raw_shift
 def _apply_preceptor_gauge(config_dict: dict, gauge: int | None) -> None:
     """프리셉터 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
 
@@ -1729,6 +1789,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         req.month,
         weekday_off_code="O",
         sunday_code="주",
+        shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
     )
     if isinstance(generated, dict):
         generated.update(fixed_roster)
@@ -1859,6 +1920,7 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
         req.month,
         weekday_off_code="O",
         sunday_code="주",
+        shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
     )
     if isinstance(generated, dict):
         generated.update(fixed_roster)

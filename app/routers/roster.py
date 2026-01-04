@@ -471,6 +471,7 @@ async def get_roster_by_schedule_id(
     # Structure data by nurse
     entries_by_nurse = {}
     for entry in entries:
+
         if entry.nurse_id not in entries_by_nurse:
             entries_by_nurse[entry.nurse_id] = {}
         # entries_by_nurse[entry.nurse_id][entry.work_date.day] = entry.shift_id.shift()
@@ -479,6 +480,7 @@ async def get_roster_by_schedule_id(
     violations = []  # 임시로 빈 리스트
 
     for nurse in nurses_in_group:
+        # print('nurse', nurse.name)
         nurse_schedule = [entries_by_nurse.get(nurse.nurse_id, {}).get(d, '-') for d in range(1, roster_data["days_in_month"] + 1)]
         
         counts = {shift: nurse_schedule.count(shift) for shift in shift_colors.keys()}
@@ -490,6 +492,7 @@ async def get_roster_by_schedule_id(
             "schedule": nurse_schedule,
             "counts": counts
         })
+    # print('roster_data', roster_data['nurses'])
     roster_data["violations"] = violations
     return roster_data
 # [Schedules] - 특정 월의 모든 버전 목록 조회 (수간호사용)
@@ -860,8 +863,23 @@ async def save_roster(
     # Clear existing roster entries
     db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).delete()
     
-    # Save new roster entries
-    
+    # Save new roster entries (케이스 보존을 위해 유효 shift_id 기반 정규화)
+    valid_shift_ids = {
+        s.shift_id
+        for s in db.query(Shift)
+        .filter(Shift.group_id == target_group_id, Shift.office_id == getattr(current_user, "office_id", None))
+        .all()
+    }
+
+    def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
+        if raw_shift in valid_shift_ids:
+            return raw_shift
+        upper = raw_shift.upper()
+        if upper in valid_shift_ids:
+            return upper
+        match = next((sid for sid in valid_shift_ids if sid.upper() == upper), raw_shift)
+        return match
+
     for nurse in roster:
         nurse_id = nurse.get('nurse_id') or nurse.get('id')  # 둘 다 체크
         if not nurse_id:
@@ -871,12 +889,13 @@ async def save_roster(
         for day_index, shift_id in enumerate(schedule_data):
             if shift_id and shift_id.strip():  # 빈 값이 아닌 경우만
                 work_date = date(year, month, day_index + 1)
+                norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
                 entry = ScheduleEntry(
                     entry_id=str(uuid.uuid4().hex)[:16],
                     schedule_id=schedule.schedule_id,
                     nurse_id=nurse_id,
                     work_date=work_date,
-                    shift_id=shift_id.upper()
+                    shift_id=norm_shift
                 )
                 db.add(entry)
 

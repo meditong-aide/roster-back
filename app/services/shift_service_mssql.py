@@ -62,7 +62,9 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
             .order_by(Shift.sequence.asc())
             .all()
         )
+        
         if shifts:
+            print('shifts', [s.__dict__ for s in shifts])
             
             return [
                 {
