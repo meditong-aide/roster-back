@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
+from fastapi import HTTPException
 from db.models import (
     DailyShift,
     Group,
@@ -516,6 +517,71 @@ def _active_range_in_month(nurse: Nurse, month_start: date, days_in_month: int) 
     end_idx = (end_date - month_start).days
 
     return start_idx, end_idx
+
+
+def _split_fixed_nurses(nurses_in_group: list[Nurse]) -> tuple[list[Nurse], list[Nurse]]:
+    """고정 근무 지정 여부로 간호사 목록을 분리합니다.
+
+    Returns:
+        (fixed_nurses, engine_nurses)
+    """
+    fixed: list[Nurse] = []
+    engine: list[Nurse] = []
+    for nurse in nurses_in_group:
+        if getattr(nurse, "fixed_shift", None):
+            fixed.append(nurse)
+        else:
+            engine.append(nurse)
+    try:
+        fixed_info = [
+            f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')}): fixed_shift={getattr(n, 'fixed_shift', None)}"
+            for n in fixed
+        ]
+        print(f"[FixedShift] 고정 근무 간호사 {len(fixed)}명 분리됨 → {fixed_info}")
+    except Exception as e:
+        print(f"[FixedShift] 분리 로깅 실패: {e}")
+    return fixed, engine
+
+
+def _build_fixed_shift_roster(
+    fixed_nurses: list[Nurse],
+    year: int,
+    month: int,
+    weekday_off_code: str = "O",
+    sunday_code: str = "주",
+) -> dict[str, list[str]]:
+    """고정 근무 간호사의 월간 스케줄을 생성합니다.
+
+    - 평일(월~금): fixed_shift 코드 배정
+    - 토요일: weekday_off_code
+    - 일요일: sunday_code
+    """
+    days_in_month = calendar.monthrange(year, month)[1]
+    month_start = date(year, month, 1)
+    result: dict[str, list[str]] = {}
+    for nurse in fixed_nurses:
+        shifts = ["-" for _ in range(days_in_month)]
+        active_range = _active_range_in_month(nurse, month_start, days_in_month)
+        if active_range is None:
+            result[str(nurse.nurse_id)] = shifts
+            continue
+        start_idx, end_idx = active_range
+        fixed_code = str(getattr(nurse, "fixed_shift", "") or "").upper()
+        try:
+            print(
+                f"[FixedShift] 적용: {getattr(nurse, 'name', '?')}({getattr(nurse, 'nurse_id', '?')}) "
+                f"코드={fixed_code}, 범위={start_idx + 1}~{end_idx + 1}일"
+            )
+        except Exception as e:
+            print(f"[FixedShift] 로그 실패: {e}")
+        for day_idx in range(start_idx, end_idx + 1):
+            weekday = (month_start + timedelta(days=day_idx)).weekday()
+            if weekday >= 5:
+                shifts[day_idx] = sunday_code if weekday == 6 else weekday_off_code
+            else:
+                shifts[day_idx] = fixed_code
+        result[str(nurse.nurse_id)] = shifts
+    return result
 
 
 def _compute_weekly_off_day_indices_for_month(
@@ -1549,6 +1615,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         raise Exception("해당 월의 wanted 작성을 먼저 요청해주세요.")
     schedule = request_schedule_service(req, current_user, db)
     nurses_in_group, preferences = _collect_nurses_and_preferences(db, req, current_user)
+    fixed_nurses, engine_nurses = _split_fixed_nurses(nurses_in_group)
+    print('fixed_nurses', [n.__dict__ for n in fixed_nurses])
+    # 고정 근무는 주말 휴무 대상만 허용
+    invalid = [n for n in fixed_nurses if not bool(getattr(n, "is_weekend_off", False))]
+    print('invalid', [n.__dict__ for n in invalid])
+    if invalid:
+        raise HTTPException(status_code=400, detail="주말 휴무 true만 고정 shift설정이 가능하다")
+    engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
+    preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
+    nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day = _build_shift_manage_and_requirements(
         db, current_user, latest_config, req
@@ -1578,7 +1654,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     days_in_month = calendar.monthrange(req.year, req.month)[1]
     active_range_map = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
-        for n in nurses_in_group
+        for n in nurses_for_engine
     }
 
     print('active_range_map', active_range_map)
@@ -1589,6 +1665,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         year=req.year,
         month=req.month,
     )
+    weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
     if weekly_off_map:
         filtered_map: dict[str, set[int]] = {}
         for nurse_id, day_set in weekly_off_map.items():
@@ -1601,7 +1678,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 filtered_map[str(nurse_id)] = clipped
         weekly_off_map = filtered_map
     if weekly_off_map:
-        nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+        nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
         print(f"[WeeklyOff] 주휴 고정 셀 생성: {len(weekly_off_map)}명")
         for nurse_id, day_set in weekly_off_map.items():
             n_idx = nurse_idx_map.get(nurse_id)
@@ -1614,18 +1691,23 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             for d in day_list:
                 weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
 
-    generated, satisfaction_data, roster_system = _run_cp_sat_basic(
-        db,
-        current_user,
-        nurses_in_group,
-        preferences,
-        latest_config,
-        req,
-        shift_manage_data,
-        fixed_cells=weekly_off_fixed_cells if weekly_off_fixed_cells else None,
-        time_limit_seconds=60,
-        config_override=config_dict,
-    )
+    generated: dict[str, list[str]] = {}
+    satisfaction_data = {}
+    roster_system = None
+
+    if nurses_for_engine:
+        generated, satisfaction_data, roster_system = _run_cp_sat_basic(
+            db,
+            current_user,
+            nurses_for_engine,
+            preferences,
+            latest_config,
+            req,
+            shift_manage_data,
+            fixed_cells=weekly_off_fixed_cells if weekly_off_fixed_cells else None,
+            time_limit_seconds=60,
+            config_override=config_dict,
+        )
 
     # ── 저장 시 주휴 날짜만 '주'로 마킹(표시용) ──
     try:
@@ -1639,6 +1721,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                         shifts[d] = "주"
     except Exception as e:
         weekly_off_warnings.append({"type": "weekly_off_mark_failed", "detail": str(e)})
+
+    # 고정 근무 간호사 스케줄 병합 (평일 fixed_shift, 주말 OFF/주)
+    fixed_roster = _build_fixed_shift_roster(
+        fixed_nurses,
+        req.year,
+        req.month,
+        weekday_off_code="O",
+        sunday_code="주",
+    )
+    if isinstance(generated, dict):
+        generated.update(fixed_roster)
+    else:
+        generated = fixed_roster
 
     _persist_entries(db, schedule, generated, req)
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
@@ -1673,6 +1768,15 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
     schedule = request_schedule_service(req, current_user, db)
 
     nurses_in_group, preferences = _collect_nurses_and_preferences(db, req, current_user)
+    fixed_nurses, engine_nurses = _split_fixed_nurses(nurses_in_group)
+    print('fixed_nurses', fixed_nurses)
+    invalid = [n for n in fixed_nurses if not bool(getattr(n, "is_weekend_off", False))]
+    print('invalid', invalid)
+    if invalid:
+        raise HTTPException(status_code=400, detail="주말 휴무 true만 고정 shift설정이 가능하다")
+    engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
+    preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
+    nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day = _build_shift_manage_and_requirements(
         db, current_user, latest_config, req
@@ -1705,8 +1809,9 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
         year=req.year,
         month=req.month,
     )
+    weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
     if weekly_off_map:
-        nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+        nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
         for nurse_id, day_set in weekly_off_map.items():
             n_idx = nurse_idx_map.get(nurse_id)
             if n_idx is None:
@@ -1718,18 +1823,22 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
             weekly_off_cells=weekly_off_fixed_cells,
         )
 
-    generated, satisfaction_data, roster_system = _run_cp_sat_basic(
-        db,
-        current_user,
-        nurses_in_group,
-        preferences,
-        latest_config,
-        req,
-        shift_manage_data,
-        fixed_cells=merged_fixed_cells,
-        time_limit_seconds=300,
-        config_override=config_dict,
-    )
+    generated: dict[str, list[str]] = {}
+    satisfaction_data = {}
+    roster_system = None
+    if nurses_for_engine:
+        generated, satisfaction_data, roster_system = _run_cp_sat_basic(
+            db,
+            current_user,
+            nurses_for_engine,
+            preferences,
+            latest_config,
+            req,
+            shift_manage_data,
+            fixed_cells=merged_fixed_cells,
+            time_limit_seconds=300,
+            config_override=config_dict,
+        )
 
     # ── 저장 시 주휴 날짜만 '주'로 마킹(표시용) ──
     try:
@@ -1743,6 +1852,18 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
                         shifts[d] = "주"
     except Exception as e:
         weekly_off_warnings.append({"type": "weekly_off_mark_failed", "detail": str(e)})
+
+    fixed_roster = _build_fixed_shift_roster(
+        fixed_nurses,
+        req.year,
+        req.month,
+        weekday_off_code="O",
+        sunday_code="주",
+    )
+    if isinstance(generated, dict):
+        generated.update(fixed_roster)
+    else:
+        generated = fixed_roster
 
     _persist_entries(db, schedule, generated, req)
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)

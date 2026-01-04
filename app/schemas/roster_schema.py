@@ -164,6 +164,7 @@ class NurseProfile(BaseModel):
     resignation_date: Optional[datetime] = None
     sequence: Optional[int] = 0
     active: int = 1
+    fixed_shift: Optional[str] = None
     # weekly_off_enabled: int = Field(default=0)
     weekly_off_weekday: Optional[int] = None
     nurse_memo: Optional[str] = None

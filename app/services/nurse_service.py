@@ -139,6 +139,7 @@ def get_nurses_in_group_service(
             "nurse_memo": nurse.nurse_memo,
             "grade": nurse.grade,
             "team_id": nurse.team_id,
+            "fixed_shift": nurse.fixed_shift,
             "weekly_off_enabled": nurse.weekly_off_enabled,
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),

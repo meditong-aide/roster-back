@@ -64,12 +64,15 @@ class Nurse(Base):
     # 주휴 관련 추가 컬럼
     weekly_off_enabled = Column(TINYINT, default=0)  # 주휴 대상 여부
     weekly_off_weekday = Column(TINYINT, nullable=True)  # 기준 월에서의 주휴 요일 (0:월~6:일)
+    # 고정 근무 코드(해당 병동의 shifts.shift_id)
+    fixed_shift = Column(VARCHAR(20), nullable=True)
     nurse_memo = Column(TEXT, nullable=True)
     grade = Column(INTEGER, nullable=True)
     # 사이드 프로필 관련 추가 컬럼
     birth_date = Column(VARCHAR(10), nullable=True)
     phone_number = Column(VARCHAR(20), nullable=True)
     gender = Column(VARCHAR(3), nullable=True)
+    is_weekend_off = Column(BOOLEAN, default=False)
     
     group = relationship("Group")
     __table_args__ = (
