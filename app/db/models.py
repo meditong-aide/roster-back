@@ -118,6 +118,7 @@ class Shift(Base):
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
     name = Column(VARCHAR(20), nullable=False)
     color = Column(VARCHAR(10), nullable=False)
+    shift_gb = Column(VARCHAR(5), nullable=True)
     # start_time = Column(VARCHAR(5), nullable=True)  # HH:MM format
     start_time = Column(Time, nullable=True)  # TIME 타입
     # end_time = Column(VARCHAR(5), nullable=True)    # HH:MM format
