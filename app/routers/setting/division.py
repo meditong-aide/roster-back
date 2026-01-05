@@ -89,20 +89,22 @@ async def division_upload(
         mask_exist = df['mb_partName'].isin(exist_df['mb_partName'])
         add_error(df[mask_exist], "already_exist")
     # ---------------------------------------------------
-    # 6) Depth1 DB 중복 체크
-    depth1_db = [x['depth1'] for x in msdb_manager.fetch_all(Setting.select_division_depth1(), params=OfficeCode)]
-    mask_depth1_exist = df['Depth1'].isin(depth1_db)
-    add_error(df[mask_depth1_exist], "depth1_exist")
-    # ---------------------------------------------------
-    # 7) Depth2 DB 중복 체크
-    depth2_db = [x['depth2'] for x in msdb_manager.fetch_all(Setting.select_division_depth2(), params=OfficeCode)]
-    mask_depth2_exist = (df['Depth2'] != '') & (df['Depth2'].isin(depth2_db))
-    add_error(df[mask_depth2_exist], "depth2_exist")
-    # ---------------------------------------------------
-    # 8) Depth3 DB 중복 체크
-    depth3_db = [x['depth3'] for x in msdb_manager.fetch_all(Setting.select_division_depth3(), params=OfficeCode)]
-    mask_depth3_exist = (df['Depth3'] != '') & (df['Depth3'].isin(depth3_db))
-    add_error(df[mask_depth3_exist], "depth3_exist")
+    # 하위 작업으로 인해, 기존에 존재하는 1~2Depth 데이터에 대해서는 신규 하위 Depth의 내역이 업데이트가 되지 않음
+    # 해당 내역 주석 처리 하여 처리
+    # # 6) Depth1 DB 중복 체크
+    # depth1_db = [x['depth1'] for x in msdb_manager.fetch_all(Setting.select_division_depth1(), params=OfficeCode)]
+    # mask_depth1_exist = df['Depth1'].isin(depth1_db)
+    # add_error(df[mask_depth1_exist], "depth1_exist")
+    # # ---------------------------------------------------
+    # # 7) Depth2 DB 중복 체크
+    # depth2_db = [x['depth2'] for x in msdb_manager.fetch_all(Setting.select_division_depth2(), params=OfficeCode)]
+    # mask_depth2_exist = (df['Depth2'] != '') & (df['Depth2'].isin(depth2_db))
+    # add_error(df[mask_depth2_exist], "depth2_exist")
+    # # ---------------------------------------------------
+    # # 8) Depth3 DB 중복 체크
+    # depth3_db = [x['depth3'] for x in msdb_manager.fetch_all(Setting.select_division_depth3(), params=OfficeCode)]
+    # mask_depth3_exist = (df['Depth3'] != '') & (df['Depth3'].isin(depth3_db))
+    # add_error(df[mask_depth3_exist], "depth3_exist")
     # ---------------------------------------------------
     # 9) 오류가 있다면 반환
     if error_rows:

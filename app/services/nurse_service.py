@@ -139,6 +139,7 @@ def get_nurses_in_group_service(
             "nurse_memo": nurse.nurse_memo,
             "grade": nurse.grade,
             "team_id": nurse.team_id,
+            "fixed_shift": nurse.fixed_shift,
             "weekly_off_enabled": nurse.weekly_off_enabled,
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
@@ -188,7 +189,7 @@ def get_nurses_filtered_service(
         q = q.filter(NurseModel.group_id == group_id, NurseModel.office_id == current_user.office_id)
     
     # 필터링: office_id
-    elif office_id is not None:
+    elif current_user.office_id is not None:
         q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == current_user.office_id)
     
     # 정렬: active DESC, sequence ASC, experience DESC, nurse_id ASC

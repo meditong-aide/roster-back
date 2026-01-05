@@ -12,14 +12,32 @@ _MSSQL_SESSION_MAKER: sessionmaker | None = None
 
 
 
+# def _to_time_str(value: Any) -> str | None:
+#     """TIME 컬럼값을 HH:MM:SS 문자열로 변환합니다."""
+#     if value is None:
+#         return None
+#     if isinstance(value, _dt.time):
+#         return value.strftime("%H:%M")
+#     s = str(value)
+#     return s
+
+
 def _to_time_str(value: Any) -> str | None:
-    """TIME 컬럼값을 HH:MM:SS 문자열로 변환합니다."""
+    """TIME 컬럼값을 HH:MM 문자열로 변환합니다."""
     if value is None:
         return None
     if isinstance(value, _dt.time):
         return value.strftime("%H:%M")
-    s = str(value)
-    return s
+    if isinstance(value, str):
+        try:
+            parts = value.split(":")
+            if len(parts) >= 2:
+                return f"{parts[0]}:{parts[1]}"  # HH:MM:SS → HH:MM
+        except Exception as e:
+            print(f"_to_time_str error: {str(e)}, value: {value}")
+            return None
+    print(f"_to_time_str unexpected type: {type(value)}, value: {value}")
+    return None  # 안전하게 None 반환
 
 
 def get_shifts_service(current_user, db: Session | None = None, override_group_id: str | None = None) -> List[Dict[str, Any]]:
@@ -44,7 +62,9 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
             .order_by(Shift.sequence.asc())
             .all()
         )
+        
         if shifts:
+            print('shifts', [s.__dict__ for s in shifts])
             
             return [
                 {
@@ -119,8 +139,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 "shift_id": s.shift_id,
                 "name": s.name,
                 "color": s.color,
-                "start_time": s.start_time,
-                "end_time": s.end_time,
+                "start_time": _to_time_str(s.start_time),
+                "end_time": _to_time_str(s.end_time),
                 "type": s.type,
                 "allday": s.allday,
                 "auto_schedule": s.auto_schedule,

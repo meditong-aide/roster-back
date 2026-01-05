@@ -4,8 +4,9 @@ from typing import List, Dict, Tuple
 from calendar import monthrange
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, update
+from datetime import datetime
 
-from db.models import DailyShift, ShiftManage, Nurse
+from db.models import DailyShift, ShiftManage, Nurse, Wanted
 
 
 def _get_month_days(year: int, month: int) -> int:
@@ -233,3 +234,168 @@ def update_daily(
             )
     db.commit()
     return {"updated": True, "days_affected": days} 
+
+
+# Daily-Shift 작업
+def is_month_closed(db: Session, office_id: str, group_id: str, year: int, month: int) -> bool:
+    """Wanted 테이블을 기준으로 월이 마감되었는지 확인합니다.
+    - 기준 날짜: 시스템 현재 날짜 (datetime.now())
+    - 마감 조건:
+      - status가 'closed'면 무조건 마감.
+      - status가 'requested'이고 exp_date가 현재 날짜 이전이면 마감.
+      - exp_date가 None이거나 현재 날짜 이후면 미마감.
+    - 반환: bool (True=마감, False=미마감)
+    """
+    current_date = datetime.now()  # 시스템 현재 날짜로 동적 설정
+    wanted = (
+        db.query(Wanted)
+        .filter(
+            Wanted.group_id == group_id,
+            Wanted.year == year,
+            Wanted.month == month
+        )
+        .first()
+    )
+    if not wanted:
+        return False  # Wanted 데이터가 없으면 미마감으로 간주
+    if wanted.status == "closed":
+        return True
+    if wanted.exp_date and wanted.exp_date < current_date:
+        return True
+    return False
+
+
+def format_shift_calendar(
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    rows: List[DailyShift],
+    db: Session,  # db 파라미터 추가
+) -> Dict:
+    """DailyShift 데이터를 캘린더 응답 포맷으로 변환합니다.
+    - month_summary는 1일차 값을 사용합니다.
+    - editable 필드 추가, 마감된 월은 editable=False.
+    """
+    rows_sorted = sorted(rows, key=lambda r: r.day)
+    first_day = rows_sorted[0] if rows_sorted else None
+    month_summary = {
+        "D_count": first_day.d_count if first_day else 0,
+        "E_count": first_day.e_count if first_day else 0,
+        "N_count": first_day.n_count if first_day else 0,
+    }
+    daily_shifts = [
+        {
+            "day": r.day,
+            "d_count": r.d_count,
+            "e_count": r.e_count,
+            "n_count": r.n_count,
+            "editable": not is_month_closed(db, office_id, group_id, year, month)  # 정확한 파라미터 전달
+        }
+        for r in rows_sorted
+    ]
+    return {
+        "office_id": office_id,
+        "group_id": group_id,
+        "year": year,
+        "month": month,
+        "month_summary": month_summary,
+        "daily_shifts": daily_shifts
+    }
+
+
+def manage_month_data(db: Session, office_id: str, group_id: str, year: int, month: int, initialize: bool = False) -> Dict:
+    """월 단위 데이터를 조회하거나 초기화합니다.
+    - Wanted 테이블을 기준으로 마감된 데이터(현재 날짜 이전 또는 closed)와 미마감 최소값 월 데이터만 포함.
+    - initialize=True면 shift_manage 기반으로 초기화.
+    - 기준 날짜: 시스템 현재 날짜 (datetime.now())
+    - 반환: {years: {year: {month: {...}}}}
+    """
+    current_date = datetime.now()  # 시스템 현재 날짜로 동적 설정
+
+    # 모든 연도 및 월 데이터 조회
+    all_years = (
+        db.query(DailyShift.year)
+        .filter(
+            DailyShift.office_id == office_id,
+            DailyShift.group_id == group_id
+        )
+        .distinct()
+        .all()
+    )
+
+    result = {
+        "office_id": office_id,
+        "group_id": group_id,
+        "years": {}
+    }
+
+    # 미마감 최소값 연월 추적 (초기값은 None으로 설정)
+    earliest_unclosed_year = None
+    earliest_unclosed_month = None
+
+    for y in [row[0] for row in all_years]:
+        result["years"][y] = {}  # 초기화 추가
+        all_months = (
+            db.query(DailyShift.month)
+            .filter(
+                DailyShift.office_id == office_id,
+                DailyShift.group_id == group_id,
+                DailyShift.year == y
+            )
+            .group_by(DailyShift.month)
+            .all()
+        )
+        for m in [row[0] for row in all_months]:
+            rows = (
+                db.query(DailyShift)
+                .filter(
+                    DailyShift.office_id == office_id,
+                    DailyShift.group_id == group_id,
+                    DailyShift.year == y,
+                    DailyShift.month == m
+                )
+                .all()
+            )
+
+            if not rows and initialize and y == year and m == month:
+                print(f"[daily_shift] {y}/{m} 데이터 없음 → shift_manage 기반으로 초기화")
+                days = _get_month_days(y, m)
+                d, e, n = _read_template_from_shift_manage(db, office_id, group_id)
+                for day_idx in range(1, days + 1):
+                    db.add(
+                        DailyShift(
+                            office_id=office_id,
+                            group_id=group_id,
+                            year=y,
+                            month=m,
+                            day=day_idx,
+                            d_count=d,
+                            e_count=e,
+                            n_count=n
+                        )
+                    )
+                db.commit()
+                rows = (
+                    db.query(DailyShift)
+                    .filter(
+                        DailyShift.office_id == office_id,
+                        DailyShift.group_id == group_id,
+                        DailyShift.year == y,
+                        DailyShift.month == m
+                    )
+                    .all()
+                )
+
+            if rows:
+                if is_month_closed(db, office_id, group_id, y, m):
+                    result["years"][y][m] = format_shift_calendar(office_id, group_id, y, m, rows, db)  # 마감된 데이터 포함
+                else:
+                    # 미마감 월 중 최소값 추적
+                    if earliest_unclosed_year is None or (y < earliest_unclosed_year) or (y == earliest_unclosed_year and m < earliest_unclosed_month):
+                        earliest_unclosed_year = y
+                        earliest_unclosed_month = m
+                    if y == earliest_unclosed_year and m == earliest_unclosed_month:
+                        result["years"][y][m] = format_shift_calendar(office_id, group_id, y, m, rows, db)  # 최소 미마감 월 포함
+
+    return result

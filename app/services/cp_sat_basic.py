@@ -51,7 +51,12 @@ class CPSATBasicEngine:
         self.logger_prefix = "[CP-SAT-Basic]"
     
     def create_config_from_db(self, config_data: dict) -> NurseRosterConfig:
-        """DB에서 가져온 설정 데이터를 NurseRosterConfig 객체로 변환"""
+        """DB에서 가져온 설정 데이터를 NurseRosterConfig 객체로 변환한다.
+
+        Notes:
+            - 엔진의 커버리지 제약은 `daily_shift_requirements`(및 by_day)를 기반으로 동작한다.
+              이 값이 비어있거나 키가 D/E/N으로 정규화되지 않으면 OFF로 쏠릴 수 있다.
+        """
         print('config_data', config_data.get('shift_priority'))
         # 법규 제약사항 (Hard Constraints)
         max_conseq_work = config_data.get('max_conseq_work', 5)
@@ -83,8 +88,41 @@ class CPSATBasicEngine:
         team_balance_mode = config_data.get('team_balance_mode', 'balanced')
         team_balance_shift_weights = config_data.get('team_balance_shift_weights') or {}
 
+        def _normalize_requirements(req_map: dict | None) -> dict[str, int]:
+            """요구 인력 맵을 D/E/N 기준으로 정규화한다.
+
+            Args:
+                req_map: 원본 요구치 맵(키가 대소문자/공백/다른 표기일 수 있음)
+
+            Returns:
+                'D','E','N' 키만을 갖는 정수 요구치 맵
+            """
+            base = {"D": 0, "E": 0, "N": 0}
+            if not isinstance(req_map, dict):
+                return base
+            for k, v in req_map.items():
+                key = str(k).strip().upper()
+                if key in {"D", "E", "N"}:
+                    try:
+                        base[key] = int(v or 0)
+                    except Exception:
+                        base[key] = 0
+            return base
+
+        # 요구치(기본) 방어 처리: 없으면 구 필드(day_req/eve_req/nig_req)에서 폴백
+        raw_daily_req = config_data.get("daily_shift_requirements")
+        if not raw_daily_req:
+            raw_daily_req = {
+                "D": config_data.get("day_req", 0),
+                "E": config_data.get("eve_req", 0),
+                "N": config_data.get("nig_req", 0),
+            }
+        daily_req = _normalize_requirements(raw_daily_req)
+        if sum(daily_req.values()) <= 0:
+            raise ValueError("daily_shift_requirements(D/E/N)가 비어있습니다. 설정을 확인해주세요.")
+
         cfg = NurseRosterConfig(
-            daily_shift_requirements = config_data['daily_shift_requirements'],
+            daily_shift_requirements=daily_req,
             # daily_shift_requirements={
             #     'D': config_data.get('day_req', 3),
             #     'E': config_data.get('eve_req', 3), 
@@ -131,16 +169,40 @@ class CPSATBasicEngine:
             team_balance_mode=team_balance_mode,
             team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
-            max_extra_off_days=int(config_data.get('max_extra_off_days', 2)),
+            # - 빡빡하게 off_days에 맞추다 보면 연속근무가 길어지는 현상이 생길 수 있어,
+            #   기본값은 +1 정도의 여유를 두고(필요하면 0으로 낮출 수 있음),
+            #   대신 extra_off_penalty_weight로 "불필요한 추가 OFF"는 억제한다.
+            max_extra_off_days=int(config_data.get('max_extra_off_days', 1)),
+            # 추가 OFF 기피(여유 인원은 D/E/N으로 분배 유도)
+            extra_off_penalty_weight=int(config_data.get("extra_off_penalty_weight", 80) or 0),
+            # 연속근무 소프트 상한(없으면 hard와 동일)
+            soft_max_consecutive_work_days=int(config_data.get("soft_max_consecutive_work_days", max_conseq_work) or max_conseq_work),
+            soft_consecutive_work_penalty_weight=int(config_data.get("soft_consecutive_work_penalty_weight", 180) or 0),
+            # 분배 정책 모드/월단위 선호 가중치
+            distribution_mode=str(config_data.get("distribution_mode", "hybrid") or "hybrid"),
+            monthly_preference_weight=int(config_data.get("monthly_preference_weight", 60) or 0),
             # 여유 인원 균등화 제어
             oversupply_equalize_enable=bool(config_data.get('oversupply_equalize_enable', True)),
-            oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120))
+            oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
+            # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
+            weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True))
         )
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
             ds_by_day = config_data.get('daily_shift_requirements_by_day')
             if isinstance(ds_by_day, list) and len(ds_by_day) > 0:
-                setattr(cfg, 'daily_shift_requirements_by_day', ds_by_day)
+                norm_list = []
+                for day_map in ds_by_day:
+                    if not isinstance(day_map, dict):
+                        norm_list.append(daily_req)
+                        continue
+                    m = _normalize_requirements(day_map)
+                    # 일부 키가 누락된 경우 기본 요구치로 보완
+                    for kk in ("D", "E", "N"):
+                        if kk not in m:
+                            m[kk] = daily_req.get(kk, 0)
+                    norm_list.append(m)
+                setattr(cfg, 'daily_shift_requirements_by_day', norm_list)
         except Exception:
             pass
         return cfg
@@ -191,6 +253,8 @@ class CPSATBasicEngine:
                 # Grade(1~3): None 허용. 변환 정책은 Grade 제약 모듈에서 처리한다.
                 'grade': nurse_data.get('grade'),
                 'is_head_nurse': nurse_data.get('is_head_nurse', False),
+                # 주말 고정 휴무(True)이면 토/일은 OFF('O')만 허용(하드 제약은 모델 빌더에서 적용)
+                'is_weekend_off': bool(nurse_data.get('is_weekend_off', False)),
                 'is_night_nurse': nurse_data.get('is_night_nurse', 0),
                 'personal_off_adjustment': nurse_data.get('personal_off_adjustment', 0),
                 'remaining_off_days': 0,  # 초기화, 나중에 계산됨
@@ -282,6 +346,14 @@ class CPSATBasicEngine:
         # 4. 근무표 시스템 생성
         with Timer("근무표 시스템 초기화"):
             roster_system = RosterSystem(nurses, target_month, config)
+            # 월단위 선호(개인 입력) - dict 형태로 전달됨을 가정
+            # 예: {"441172": {"shift": "D", "strength": 7}, ...}
+            try:
+                msp = config_data.get("monthly_shift_preferences") or {}
+                if isinstance(msp, dict):
+                    setattr(roster_system, "monthly_shift_preferences", msp)
+            except Exception:
+                pass
             # Grade/Team/BASE 전략(모델 빌더에서 참조)
             # - 상위 서비스(roster_create_service)에서 roster_config 기반으로 결정된 값을 전달받는다.
             setattr(roster_system, "grade_strategy", str(grade_strategy or "BASE").upper())
@@ -475,6 +547,9 @@ class CPSATBasicEngine:
         except Exception as e:
             print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
 
+        # 13. 최종 근무표 로그 출력
+        self._log_final_roster(nurses, result)
+
         return {
             "roster": result,
             "satisfaction_data": satisfaction_data,
@@ -580,6 +655,7 @@ class CPSATBasicEngine:
 
         first_day = roster_system.target_month
         last_day = first_day + timedelta(days=D - 1)
+        weekend_days = {d for d in range(D) if (first_day + timedelta(days=d)).weekday() >= 5}
         join, leave = [], []
         for nu in roster_system.nurses:
             j = (nu.joining_date - first_day).days if nu.joining_date else 0
@@ -612,11 +688,118 @@ class CPSATBasicEngine:
         # 초기 금지(경계) 맵
         initial_forbidden = getattr(roster_system, 'initial_forbidden', {}) if isinstance(getattr(roster_system, 'initial_forbidden', {}), dict) else {}
 
+        # ── 폴백 사전 진단 로그(불가능 원인 빠른 파악용) ──
+        try:
+            # 월간 N 총 요구(고정셀로 이미 채워진 N은 제외)
+            total_need_n = 0
+            for d in range(D):
+                if hasattr(cfg, 'daily_shift_requirements_by_day') and isinstance(cfg.daily_shift_requirements_by_day, list) and d < len(cfg.daily_shift_requirements_by_day):
+                    need_map = cfg.daily_shift_requirements_by_day[d]
+                else:
+                    need_map = cfg.daily_shift_requirements
+                need_n = int((need_map or {}).get("N", 0) or 0)
+                need_n = max(0, need_n - int(fixed_cnt[d][night_idx] or 0))
+                total_need_n += need_n
+
+            # 간호사별 N 가능 여부(허용 근무유형 기반: []=제한없음, ['N']=N전담)
+            n_allowed_indices: list[int] = []
+            n_only_cnt = 0
+            for i, nu in enumerate(roster_system.nurses):
+                raw = getattr(nu, "is_night_nurse", None)
+                if isinstance(raw, list):
+                    allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                    # [] => 제한 없음 (N 가능)
+                    if not allowed:
+                        n_allowed_indices.append(i)
+                        continue
+                    if "N" in allowed:
+                        n_allowed_indices.append(i)
+                        if allowed == {"N"}:
+                            n_only_cnt += 1
+                        continue
+                    # N이 없으면 N 불가
+                else:
+                    # 레거시 타입(int/bool/None 등)은 허용 제약에서 무시했으므로 "N 가능"으로 간주
+                    n_allowed_indices.append(i)
+
+            # N 용량 상한(1) 단순: 개인 월 상한 + 재직일수(입/퇴사) 클램프
+            cap_basic = 0
+            cap_recovery = 0
+            for n in n_allowed_indices:
+                T0, T1 = join[n], leave[n]
+                avail_days = max(0, int(T1 - T0 + 1))
+                cap_basic += min(int(cfg.max_night_shifts_per_month), avail_days)
+                # 2N→2OFF hard가 켜지면, 한 사람의 N은 대략 2일 중 1일 수준(최대 0.5 비율)로 제한되는 경향이 있다.
+                # 예) avail_days=30 이면 (30+1)//2 = 15 가 상한 근사치.
+                cap_recovery += min(int(cfg.max_night_shifts_per_month), int((avail_days + 1) // 2))
+
+            # 일별 N 요구 최대값(피크 일자 확인용)
+            max_daily_need_n = 0
+            for d in range(D):
+                if hasattr(cfg, 'daily_shift_requirements_by_day') and isinstance(cfg.daily_shift_requirements_by_day, list) and d < len(cfg.daily_shift_requirements_by_day):
+                    need_map = cfg.daily_shift_requirements_by_day[d]
+                else:
+                    need_map = cfg.daily_shift_requirements
+                need_n = int((need_map or {}).get("N", 0) or 0)
+                need_n = max(0, need_n - int(fixed_cnt[d][night_idx] or 0))
+                max_daily_need_n = max(max_daily_need_n, need_n)
+
+            print(
+                f"{self.logger_prefix} [FallbackFeasibility] "
+                f"need_N(total)={total_need_n}, need_N(daily_max)={max_daily_need_n}, "
+                f"N_allowed_nurses={len(n_allowed_indices)}/{N}, N_only={n_only_cnt}, "
+                f"cap_N_basic≈{cap_basic}, "
+                f"cap_N_2N2OFF≈{cap_recovery if cfg.two_offs_after_two_nig else 'n/a'}, "
+                f"maxN={cfg.max_night_shifts_per_month}, two_offs_after_two_nig={bool(cfg.two_offs_after_two_nig)}"
+            )
+            if total_need_n > cap_basic:
+                print(
+                    f"{self.logger_prefix} [FallbackFeasibility][WARN] "
+                    f"월간 N 요구({total_need_n})가 단순 상한(cap≈{cap_basic})을 초과합니다. "
+                    f"→ 하드 상한을 강제하면 infeasible 가능성이 큽니다."
+                )
+            if bool(cfg.two_offs_after_two_nig) and total_need_n > cap_recovery:
+                print(
+                    f"{self.logger_prefix} [FallbackFeasibility][WARN] "
+                    f"2N→2OFF 기준 상한(cap≈{cap_recovery})도 초과합니다. "
+                    f"→ 2N→2OFF를 hard로 두면 폴백1부터 infeasible 가능성이 큽니다."
+                )
+            # 핵심: 일별 피크 요구 vs N 가능 인원 비교(2N→2OFF 하드가 있으면 특정 날짜에서 N 배정 가능 인원이 급감할 수 있음)
+            if bool(cfg.two_offs_after_two_nig) and max_daily_need_n > len(n_allowed_indices) * 0.5:
+                print(
+                    f"{self.logger_prefix} [FallbackFeasibility][WARN] "
+                    f"일별 N 피크 요구({max_daily_need_n})가 N 가능 인원({len(n_allowed_indices)})의 절반 이상입니다. "
+                    f"→ 2N→2OFF 하드 + 다른 제약(주2OFF/연속근무K 등)과 겹치면 특정 날짜에서 N 배정 불가능할 수 있습니다."
+                )
+            # 월 최대 OFF 상한 vs 2N→2OFF 강제 OFF 충돌 확인
+            try:
+                base_min_off = int(getattr(cfg, 'global_monthly_off_days', 0) + getattr(cfg, 'standard_personal_off_days', 0))
+                extra_allowed = int(getattr(cfg, 'max_extra_off_days', 1) or 1)
+                max_off_allowed_per_person = base_min_off + extra_allowed
+                # 2N→2OFF가 켜지면, N 가능 인원이 N을 배정받을 때마다 "연속 2N → 다음 2일 OFF"가 강제됨
+                # 대략: N 1회당 추가 OFF 1일 정도로 근사 (2N→2OFF가 강제하는 OFF의 평균)
+                # 예: 월간 N 요구가 높으면 (특히 N-only 간호사), 2N→2OFF가 강제하는 OFF가 많아져 월 최대 OFF 상한을 초과할 수 있음
+                if bool(cfg.two_offs_after_two_nig) and max_off_allowed_per_person < base_min_off + 5:
+                    # N_only 간호사가 많거나 N 요구가 높으면 2N→2OFF가 강제하는 OFF가 많아질 수 있음
+                    est_extra_off_from_2n2o = int(total_need_n / len(n_allowed_indices) * 0.5) if n_allowed_indices else 0
+                    if est_extra_off_from_2n2o > extra_allowed:
+                        print(
+                            f"{self.logger_prefix} [FallbackFeasibility][WARN] "
+                            f"2N→2OFF 하드가 예상 강제 OFF({est_extra_off_from_2n2o})가 월 최대 OFF 여유({extra_allowed})를 초과할 수 있습니다. "
+                            f"(min_off={base_min_off}, max_allowed={max_off_allowed_per_person}) "
+                            f"→ 2N→2OFF 하드 + 월 최대 OFF 상한 하드가 충돌하여 infeasible 가능성이 큽니다."
+                        )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"{self.logger_prefix} [FallbackFeasibility] 진단 로그 실패: {e}")
+
         # 모델 빌더: stage에 따라 목적 및 고정 제약 선택, 안전 위반 변수 구조도 반환
         def build_model(stage: int,
                         coverage_eq: Optional[int] = None,
                         over_le: Optional[int] = None,
-                        stage2_zero_locks: Optional[Dict[str, list]] = None):
+                        stage2_zero_locks: Optional[Dict[str, list]] = None,
+                        relax_level: int = 0):
             m = cp_model.CpModel()
             Xv = {}
             def X(n, d, s):
@@ -636,6 +819,29 @@ class CPSATBasicEngine:
                 for s in range(S):
                     if s != s_idx:
                         m.Add(X(n, d, s) == 0)
+
+            # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
+            if getattr(cfg, 'weekend_off_only_enable', True):
+                for n, nu in enumerate(roster_system.nurses):
+                    if not bool(getattr(nu, "is_weekend_off", False)):
+                        continue
+                    for d in range(join[n], leave[n] + 1):
+                        if d in weekend_days:
+                            # 주말(토/일): OFF만 허용
+                            if (n, d) in fixed and fixed[(n, d)] != off_idx:
+                                raise ValueError(
+                                    f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
+                                    f"fixed_shift={cfg.shift_types[fixed[(n, d)]]}, required=O"
+                                )
+                            m.Add(X(n, d, off_idx) == 1)
+                        else:
+                            # 평일(월~금): OFF 금지(D/E/N만 가능)
+                            if (n, d) in fixed and fixed[(n, d)] == off_idx:
+                                raise ValueError(
+                                    f"주말 휴무 대상 간호사는 평일에 휴무를 받을 수 없습니다. "
+                                    f"nurse_index={n}, day={d+1}"
+                                )
+                            m.Add(X(n, d, off_idx) == 0)
 
             # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
             try:
@@ -762,9 +968,8 @@ class CPSATBasicEngine:
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 sum_m = sum(X(n, d, night_idx) for d in range(T0, T1 + 1))
-                exc = m.NewIntVar(0, D, f'mnight_exc_{n}')
-                m.Add(exc >= sum_m - cfg.max_night_shifts_per_month)
-                safety['mnight_excess'].append(exc)
+                # 법정 필수(요청): 폴백에서도 하드로 강제
+                m.Add(sum_m <= cfg.max_night_shifts_per_month)
 
             # 야간전담의 D/E 금지 위반(OR: D or E)
             for n, nu in enumerate(roster_system.nurses):
@@ -812,17 +1017,12 @@ class CPSATBasicEngine:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
                     for d in range(T0 + 1, T1 - 1):
-                        # (N_d-1 ∧ N_d)일 때, 다음 2일 OFF 부족량(0~2)을 패널티로 둔다.
+                        # 법정 필수(요청): 폴백에서도 하드로 강제
                         xn0 = X(n, d, night_idx)
                         xn1 = X(n, d - 1, night_idx)
-                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)  # 0..2
-                        miss = m.NewIntVar(0, 2, f'rec2n2o_{n}_{d}')
-                        # 연속 2N이 아니면 miss=0 (패널티 없음)
-                        m.Add(miss == 0).OnlyEnforceIf(xn0.Not())
-                        m.Add(miss == 0).OnlyEnforceIf(xn1.Not())
-                        # 연속 2N이면 miss == 2 - need
-                        m.Add(miss == 2 - need).OnlyEnforceIf([xn0, xn1])
-                        safety['rec_2n2o'].append(miss)
+                        m.Add(X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2).OnlyEnforceIf(
+                            [xn0, xn1]
+                        )
 
             # 금지 패턴 N-O-D/E
             if getattr(cfg, 'nod_noe', True):
@@ -840,6 +1040,16 @@ class CPSATBasicEngine:
             try:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
+                    # N 전담 간호사 여부 확인 (월 최대 OFF 상한 적용 제외용)
+                    nu = roster_system.nurses[n]
+                    is_n_only = False
+                    raw = getattr(nu, "is_night_nurse", None)
+                    if isinstance(raw, list):
+                        allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                        is_n_only = (allowed == {"N"})
+                    elif raw == 3 or (raw is not None and raw != 0 and raw != False):
+                        is_n_only = True
+                    
                     base_min_off = int(getattr(cfg, 'global_monthly_off_days', 0) + getattr(cfg, 'standard_personal_off_days', 0))
                     min_off_required = min(base_min_off, T1 - T0 + 1)
                     if min_off_required > 0:
@@ -848,11 +1058,21 @@ class CPSATBasicEngine:
                         m.Add(miss >= min_off_required - offs)
                         safety['min_off_missing'].append(miss)
                     # 월 최대 OFF 상한(하드): 최소 필요 OFF + 허용 초과 일수
+                    # N 전담 간호사는 OFF 상한을 동적으로 계산: 해당월 날짜수 - 최대 근무 가능일(15일)
+                    # relax_level > 0이면 점진적으로 완화 (hard 충돌 해소용)
                     extra_allowed = int(getattr(cfg, 'max_extra_off_days', 0))
                     if extra_allowed >= 0:
-                        max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
-                        offs2 = sum(X(n, d, off_idx) for d in range(T0, T1 + 1))
-                        m.Add(offs2 <= max_off_allowed)
+                        if is_n_only:
+                            # N 전담: 실제 근무 가능 일수(T1-T0+1)에서 최대 N 근무(15일)을 뺀 값
+                            # 예) 28일 월 → 28-15=13, 30일 월 → 30-15=15, 31일 월 → 31-15=16
+                            avail_days = T1 - T0 + 1
+                            max_off_allowed_n_only = max(0, avail_days - 15) + relax_level
+                            offs2 = sum(X(n, d, off_idx) for d in range(T0, T1 + 1))
+                            m.Add(offs2 <= max_off_allowed_n_only)
+                        else:
+                            max_off_allowed = min(min_off_required + extra_allowed + relax_level, T1 - T0 + 1)
+                            offs2 = sum(X(n, d, off_idx) for d in range(T0, T1 + 1))
+                            m.Add(offs2 <= max_off_allowed)
             except Exception:
                 pass
 
@@ -886,9 +1106,74 @@ class CPSATBasicEngine:
                 obj = []
                 P = roster_system.preference_matrix
                 for n in range(N):
+                    nu = roster_system.nurses[n]
+                    # N 전담 간호사 여부 확인
+                    is_n_only = False
+                    raw = getattr(nu, "is_night_nurse", None)
+                    if isinstance(raw, list):
+                        allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                        is_n_only = (allowed == {"N"})
+                    elif raw == 3 or (raw is not None and raw != 0 and raw != False):
+                        is_n_only = True
+                    
                     for d in range(join[n], leave[n] + 1):
                         for s in range(S):
-                            obj.append(int(P[n, d, s] * 100) * X(n, d, s))
+                            base_score = int(P[n, d, s] * 100)
+                            # N 전담 간호사가 N을 배정받으면 높은 보너스 (N 우선 배정 유도)
+                            if is_n_only and s == night_idx:
+                                base_score += 500  # N 전담의 N 근무에 큰 보너스
+                            obj.append(base_score * X(n, d, s))
+
+                # 추가 OFF(여유 OFF) 기피: 가능한 한 off_days 이상으로 OFF를 늘리지 않도록 유도
+                try:
+                    off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
+                    if off_penalty > 0:
+                        for n in range(N):
+                            for d in range(join[n], leave[n] + 1):
+                                obj.append(-off_penalty * X(n, d, off_idx))
+                except Exception:
+                    pass
+
+                # 월단위 선호(개인 입력) 유도: 폴백 3단계에서도 동일하게 반영
+                try:
+                    msp = getattr(roster_system, "monthly_shift_preferences", None)
+                    base_w = int(getattr(cfg, "monthly_preference_weight", 0) or 0)
+                    if base_w > 0 and isinstance(msp, dict) and msp:
+                        for n, nu in enumerate(roster_system.nurses):
+                            pref = msp.get(str(getattr(nu, "db_id", ""))) or msp.get(getattr(nu, "db_id", ""))
+                            if not isinstance(pref, dict):
+                                continue
+                            code = str(pref.get("shift") or "").strip().upper()
+                            if code not in {"D", "E", "N"}:
+                                continue
+                            try:
+                                strength = int(pref.get("strength", 5) or 0)
+                            except Exception:
+                                strength = 5
+                            strength = max(0, min(10, strength))
+                            w = int(round(base_w * (strength / 10.0)))
+                            if w <= 0:
+                                continue
+                            s_idx = cfg.shift_types.index(code)
+                            for d in range(join[n], leave[n] + 1):
+                                obj.append(w * X(n, d, s_idx))
+                except Exception:
+                    pass
+
+                # 연속근무 소프트 상한(폴백 3단계에서도 동일하게 적용)
+                try:
+                    soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
+                    w_soft = int(getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0)
+                    if soft_k > 0 and w_soft > 0:
+                        for n in range(N):
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - soft_k + 1):
+                                sum_off = sum(X(n, d0 + t, off_idx) for t in range(soft_k + 1))
+                                miss = m.NewIntVar(0, 1, f"soft_cwork_miss_fb_{n}_{d0}")
+                                m.Add(miss >= 1 - sum_off)
+                                obj.append(-w_soft * miss)
+                except Exception:
+                    pass
                 # 경력자 부족 약벌
                 for d in range(D):
                     for code in ('D', 'E', 'N'):
@@ -960,24 +1245,42 @@ class CPSATBasicEngine:
 
             return m, X, short_terms, over_terms, safety
 
-        # ───── 1단계: 커버리지 ─────
-        with Timer("폴백 1단계: 커버리지 부족 최소화"):
-            m1, X1, short1, over1, safety1 = build_model(stage=1)
-            s1 = cp_model.CpSolver()
-            s1.parameters.max_time_in_seconds = tl1
-            s1.parameters.num_search_workers = 8
-            s1.parameters.relative_gap_limit = 0.15
-            st = s1.Solve(m1)
-            if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                print(f"{self.logger_prefix} 폴백1 실패: 모델 불가능")
-                return False
-            best_short = int(s1.Value(sum(short1)))
-            best_over = int(s1.Value(sum(over1)))
-            print(f"{self.logger_prefix} 최소 커버리지 부족: {best_short}, 과잉: {best_over}")
+        # ───── 1단계: 커버리지 (완화 재시도 포함) ─────
+        m1, X1, short1, over1, safety1 = None, None, None, None, None
+        s1 = None
+        best_short, best_over = None, None
+        used_relax_level = 0  # 1단계에서 성공한 완화 레벨
+        max_relax_attempts = 5  # 최대 5회까지 완화 재시도
+        time_per_attempt = max(3, tl1 // max_relax_attempts)  # 각 시도당 시간 (최소 3초)
+        
+        for relax_level in range(max_relax_attempts):
+            with Timer(f"폴백 1단계: 커버리지 부족 최소화 (완화레벨={relax_level})"):
+                m1, X1, short1, over1, safety1 = build_model(stage=1, relax_level=relax_level)
+                s1 = cp_model.CpSolver()
+                s1.parameters.max_time_in_seconds = time_per_attempt
+                s1.parameters.num_search_workers = 8
+                s1.parameters.relative_gap_limit = 0.15
+                st = s1.Solve(m1)
+                if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    best_short = int(s1.Value(sum(short1)))
+                    best_over = int(s1.Value(sum(over1)))
+                    used_relax_level = relax_level
+                    if relax_level > 0:
+                        print(f"{self.logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 (월 최대 OFF 상한 +{relax_level})")
+                    print(f"{self.logger_prefix} 최소 커버리지 부족: {best_short}, 과잉: {best_over}")
+                    break
+                else:
+                    if relax_level < max_relax_attempts - 1:
+                        print(f"{self.logger_prefix} 폴백1 실패 (완화레벨={relax_level}): 재시도...")
+                    else:
+                        print(f"{self.logger_prefix} 폴백1 최종 실패: 모든 완화 시도 실패")
+        
+        if best_short is None or best_over is None:
+            return False
 
         # ───── 2단계: 안전/법규 ─────
         with Timer("폴백 2단계: 안전/법규 위반 최소화"):
-            m2, X2, short2, over2, safety2 = build_model(stage=2, coverage_eq=best_short, over_le=best_over)
+            m2, X2, short2, over2, safety2 = build_model(stage=2, coverage_eq=best_short, over_le=best_over, relax_level=used_relax_level)
             s2 = cp_model.CpSolver()
             s2.parameters.max_time_in_seconds = tl2
             s2.parameters.num_search_workers = 8
@@ -1010,7 +1313,7 @@ class CPSATBasicEngine:
 
         # ───── 3단계: 선호/공정성 ─────
         with Timer("폴백 3단계: 선호/공정성 최대화"):
-            m3, X3, short3, over3, safety3 = build_model(stage=3, coverage_eq=best_short, over_le=best_over, stage2_zero_locks=stage2_zero_locks)
+            m3, X3, short3, over3, safety3 = build_model(stage=3, coverage_eq=best_short, over_le=best_over, stage2_zero_locks=stage2_zero_locks, relax_level=used_relax_level)
             # 합계 동일성(위반 재배치 억제): 각 카테고리 합은 stage2와 동일하게 유지
             for k in safety3.keys():
                 m3.Add(sum(safety3[k]) == sum(safety2[k]))
@@ -1044,6 +1347,18 @@ class CPSATBasicEngine:
                 for s in range(S):
                     if s3.Value(X3(n, d, s)):
                         roster_system.roster[n, d, s] = 1
+        # 후처리: 불필요한 O 재배치로 연속근무 완화
+        try:
+            print(f"{self.logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
+            before_viol = len(roster_system._find_violations())
+            self._postprocess_rebalance_off(roster_system)
+            after_viol = len(roster_system._find_violations())
+            print(
+                f"{self.logger_prefix} [PostOff] 종료: viol {before_viol}->{after_viol} "
+                f"(감소={before_viol - after_viol})"
+            )
+        except Exception as exc:
+            print(f"{self.logger_prefix} [PostOff] 후처리 실패: {exc}")
 
         print(f"{self.logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
         return best_short == 0 and best_safe_sum == 0
@@ -1115,6 +1430,153 @@ class CPSATBasicEngine:
                     nurse_schedule.append('-')
             result[nurse.db_id] = nurse_schedule
         return result
+
+    def _postprocess_rebalance_off(
+        self,
+        roster_system: RosterSystem,
+        max_attempts: int = 30,
+    ) -> None:
+        """후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다.
+
+        수식(연속근무 길이): run_len = work_days 연속 길이 (예: DDDDDEE → run_len=6)
+
+        전략:
+            - 한 간호사 내에서 O가 있는 다른 날짜와 장시간 연속근무 구간의 근무를 교환
+            - 밤근무(N)는 2N2O/야간 연속 규칙을 해치지 않도록 스왑 대상에서 제외
+            - 하드 제약 위반 수가 늘어나면 롤백
+
+        Args:
+            roster_system: 근무표 시스템
+            max_attempts: 최대 스왑 시도 횟수
+        """
+        cfg = roster_system.config
+        off_idx = cfg.shift_types.index('O') if 'O' in cfg.shift_types else None
+        night_idx = cfg.shift_types.index('N') if 'N' in cfg.shift_types else None
+        if off_idx is None:
+            return
+
+        fixed_cells = {(c['nurse_index'], c['day_index']) for c in (getattr(roster_system, 'fixed_cells', []) or [])}
+        K = getattr(cfg, "max_consecutive_work_days", None)
+        if not isinstance(K, int) or K <= 0:
+            return
+
+        def _max_run(n_idx: int) -> tuple[int, int, int] | None:
+            """가장 긴 연속근무 구간(start, end, length)을 반환."""
+            best = None
+            run_start = None
+            run_len = 0
+            D = roster_system.num_days
+            for d in range(D):
+                is_off = roster_system.roster[n_idx, d, off_idx] == 1
+                if is_off:
+                    if run_len > 0 and (best is None or run_len > best[2]):
+                        best = (run_start, d - 1, run_len)
+                    run_start, run_len = None, 0
+                else:
+                    if run_start is None:
+                        run_start = d
+                    run_len += 1
+            if run_len > 0 and (best is None or run_len > best[2]):
+                best = (run_start, D - 1, run_len)
+            return best
+
+        def _swap_off(n_idx: int, work_day: int, off_day: int, shift_idx: int) -> None:
+            roster_system.roster[n_idx, work_day, shift_idx] = 0
+            roster_system.roster[n_idx, work_day, off_idx] = 1
+            roster_system.roster[n_idx, off_day, off_idx] = 0
+            roster_system.roster[n_idx, off_day, shift_idx] = 1
+
+        def _find_shift_idx(n_idx: int, day: int) -> int | None:
+            vec = roster_system.roster[n_idx, day]
+            ones = np.where(vec == 1)[0]
+            if len(ones) == 1:
+                return int(ones[0])
+            return None
+
+        base_viol = len(roster_system._find_violations())
+        accepted = 0
+        N = len(roster_system.nurses)
+
+        for n_idx in range(N):
+            if accepted >= max_attempts:
+                break
+            best_run = _max_run(n_idx)
+            if not best_run or best_run[2] <= K:
+                continue
+            start, end, run_len = best_run
+            # 연속근무 중앙부부터 완화 시도
+            target_days = list(range(start, end + 1))
+            target_days.sort(key=lambda x: abs(x - (start + end) // 2))
+
+            # O 후보: 동일 간호사의 O 날짜 중 고정 아닌 날
+            off_candidates = [
+                d for d in range(roster_system.num_days)
+                if roster_system.roster[n_idx, d, off_idx] == 1 and (n_idx, d) not in fixed_cells
+            ]
+            if not off_candidates:
+                continue
+
+            for work_day in target_days:
+                if (n_idx, work_day) in fixed_cells:
+                    continue
+                shift_idx = _find_shift_idx(n_idx, work_day)
+                if shift_idx is None or shift_idx == off_idx:
+                    continue
+                # N 이동은 2N2O 리스크가 크므로 제외
+                if night_idx is not None and shift_idx == night_idx:
+                    continue
+
+                for off_day in off_candidates:
+                    if off_day == work_day:
+                        continue
+                    if (n_idx, off_day) in fixed_cells:
+                        continue
+
+                    # 스왑 적용
+                    _swap_off(n_idx, work_day, off_day, shift_idx)
+                    new_run = _max_run(n_idx)
+                    new_viol = len(roster_system._find_violations())
+
+                    ok = True
+                    if new_run and new_run[2] > K:
+                        ok = False
+                    if new_viol > base_viol:
+                        ok = False
+
+                    if ok:
+                        accepted += 1
+                        base_viol = new_viol
+                        print(
+                            f"{self.logger_prefix} [PostOff] swap accepted n={n_idx}, "
+                            f"work_day={work_day+1}→O, off_day={off_day+1}→{cfg.shift_types[shift_idx]}, "
+                            f"max_run {run_len}->{new_run[2] if new_run else 0}, viol {new_viol}"
+                        )
+                        break
+                    else:
+                        # 롤백
+                        _swap_off(n_idx, off_day, work_day, shift_idx)
+                if accepted >= max_attempts:
+                    break
+        final_viol = len(roster_system._find_violations())
+        print(
+            f"{self.logger_prefix} [PostOff] 완료: 수용 스왑 {accepted}건, "
+            f"위반 {base_viol}->{final_viol}, max_attempts={max_attempts}"
+        )
+
+    def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
+        """최종 근무표를 간호사별로 출력합니다.
+
+        Args:
+            nurses: 간호사 객체 리스트
+            roster_map: DB ID를 키로 하는 간호사별 근무표
+        """
+        try:
+            for nurse in nurses:
+                schedule = roster_map.get(nurse.db_id, [])
+                schedule_str = " ".join(schedule) if schedule else "-"
+                print(f"{self.logger_prefix} 배정표 {nurse.name}({nurse.db_id}): {schedule_str}")
+        except Exception as exc:
+            print(f"{self.logger_prefix} 근무표 출력 중 오류: {exc}")
     
     def _print_optimization_results(self, roster_system: RosterSystem, preceptor_pairs=None):
         """최적화 결과 출력 및 만족도 데이터 반환"""
@@ -1347,6 +1809,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # shorthand indices
     idx = {c:rs.config.shift_types.index(c) for c in ('D','E','N','O')}
     day,eve,night,off = idx['D'],idx['E'],idx['N'],idx['O']
+    # 주말(토/일) day_idx 집합(0-based)
+    weekend_days = {d for d in range(D) if (rs.target_month + timedelta(days=d)).weekday() >= 5}
 
     # ───────────── 3. Hard 법규 ───────────────
     cfg = rs.config
@@ -1355,6 +1819,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     for n,nu in enumerate(rs.nurses):
         T0,T1 = join[n], leave[n]
+        # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
+        if bool(getattr(nu, "is_weekend_off", False)) and getattr(cfg, 'weekend_off_only_enable', True):
+            for d in range(T0, T1 + 1):
+                if d in weekend_days:
+                    # 주말(토/일): OFF만 허용
+                    if (n, d) in fixed and fixed[(n, d)] != off:
+                        raise ValueError(
+                            f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
+                            f"fixed_shift={rs.config.shift_types[fixed[(n, d)]]}, required=O"
+                        )
+                    m.Add(X(n, d, off) == 1)
+                else:
+                    # 평일(월~금): OFF 금지(D/E/N만 가능)
+                    if (n, d) in fixed and fixed[(n, d)] == off:
+                        raise ValueError(
+                            f"주말 휴무 대상 간호사는 평일에 휴무를 받을 수 없습니다. "
+                            f"nurse_index={n}, day={d+1}"
+                        )
+                    m.Add(X(n, d, off) == 0)
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):
             m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)
@@ -1366,8 +1849,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
                 m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
 
-        # Night-전담
-        if nu.is_night_nurse == 3:
+        # Night-전담 (레거시 + 새로운 방식 모두 고려)
+        raw = getattr(nu, "is_night_nurse", None)
+        is_n_only = False
+        if isinstance(raw, list):
+            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+            is_n_only = (allowed == {"N"})  # ["N"]만 허용 = N 전담
+        elif raw == 3 or (raw is not None and raw != 0 and raw != False):
+            # 레거시: is_night_nurse == 3도 N 전담으로 간주
+            is_n_only = True
+        if is_n_only:
             for d in range(T0,T1+1):
                 m.Add(X(n,d,day)==0); m.Add(X(n,d,eve)==0)
 
@@ -1387,10 +1878,18 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if min_off_required > 0:
                 m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) >= min_off_required)
             # 월 최대 OFF 상한: 최소 필요 OFF + 허용 초과 일수
+            # N 전담 간호사는 OFF 상한을 동적으로 계산: 해당월 날짜수 - 최대 근무 가능일(15일)
             extra_allowed = int(getattr(cfg, 'max_extra_off_days', 0))
             if extra_allowed >= 0:
-                max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
-                m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) <= max_off_allowed)
+                if is_n_only:
+                    # N 전담: 실제 근무 가능 일수(T1-T0+1)에서 최대 N 근무(15일)을 뺀 값
+                    # 예) 28일 월 → 28-15=13, 30일 월 → 30-15=15, 31일 월 → 31-15=16
+                    avail_days = T1 - T0 + 1
+                    max_off_allowed_n_only = max(0, avail_days - 15)
+                    m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) <= max_off_allowed_n_only)
+                else:
+                    max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
+                    m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) <= max_off_allowed)
         except Exception:
             pass
 
@@ -1414,9 +1913,77 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     obj=[]
     P = rs.preference_matrix
     for n in range(N):
+        nu = rs.nurses[n]
+        # N 전담 간호사 여부 확인
+        is_n_only = False
+        raw = getattr(nu, "is_night_nurse", None)
+        if isinstance(raw, list):
+            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+            is_n_only = (allowed == {"N"})
+        elif raw == 3 or (raw is not None and raw != 0 and raw != False):
+            is_n_only = True
+        
         for d in range(join[n], leave[n]+1):
             for s in range(S):
-                obj.append(int(P[n,d,s]*100)*X(n,d,s))
+                base_score = int(P[n,d,s]*100)
+                # N 전담 간호사가 N을 배정받으면 높은 보너스 (N 우선 배정 유도)
+                if is_n_only and s == night:
+                    base_score += 500  # N 전담의 N 근무에 큰 보너스
+                obj.append(base_score * X(n,d,s))
+
+    # (4-0) 추가 OFF(여유 OFF) 기피: off_days만큼은 하드로 만족시키되, 남는 인원은 D/E/N으로 분배 유도
+    try:
+        off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
+        if off_penalty > 0:
+            for n in range(N):
+                for d in range(join[n], leave[n] + 1):
+                    obj.append(-off_penalty * X(n, d, off))
+    except Exception:
+        pass
+
+    # (4-0a) 월단위 선호(개인 입력) 유도: 선호 교대에 소프트 보너스 부여
+    # - Wanted(날짜 지정형)와 달리 "약한 선호"로 간주하며, weight는 req 게이지로 조절한다.
+    try:
+        msp = getattr(rs, "monthly_shift_preferences", None)
+        base_w = int(getattr(cfg, "monthly_preference_weight", 0) or 0)
+        if base_w > 0 and isinstance(msp, dict) and msp:
+            for n, nu in enumerate(rs.nurses):
+                pref = msp.get(str(getattr(nu, "db_id", ""))) or msp.get(getattr(nu, "db_id", ""))
+                if not isinstance(pref, dict):
+                    continue
+                code = str(pref.get("shift") or "").strip().upper()
+                if code not in {"D", "E", "N"}:
+                    continue
+                try:
+                    strength = int(pref.get("strength", 5) or 0)
+                except Exception:
+                    strength = 5
+                strength = max(0, min(10, strength))
+                w = int(round(base_w * (strength / 10.0)))
+                if w <= 0:
+                    continue
+                s_idx = cfg.shift_types.index(code)
+                for d in range(join[n], leave[n] + 1):
+                    obj.append(w * X(n, d, s_idx))
+    except Exception:
+        pass
+
+    # (4-0b) 연속근무 소프트 상한: hard 제약은 유지하면서, "가능하면 더 짧게" 끊도록 유도한다.
+    # - 창 크기 (soft_k + 1) 안에 OFF가 1개도 없으면 miss=1 → 패널티.
+    # - 예: soft_k=5 이면 6연속근무(OFF 0) 창이 생길 때마다 패널티가 붙는다.
+    try:
+        soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
+        w_soft = int(getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0)
+        if soft_k > 0 and w_soft > 0:
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                for d0 in range(T0, T1 - soft_k + 1):
+                    sum_off = sum(X(n, d0 + t, off) for t in range(soft_k + 1))
+                    miss = m.NewIntVar(0, 1, f"soft_cwork_miss_{n}_{d0}")
+                    m.Add(miss >= 1 - sum_off)
+                    obj.append(-w_soft * miss)
+    except Exception:
+        pass
 
     # (4-1) 경력자 부족
     for d in range(D):

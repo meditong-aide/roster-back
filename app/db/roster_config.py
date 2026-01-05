@@ -32,6 +32,11 @@ class NurseRosterConfig:
     global_monthly_off_days: int = 3  # 모든 간호사에게 적용되는 전체 휴무일(공휴일, 특별 휴무일)
     standard_personal_off_days: int = 8  # 간호사별 표준 개인 휴무일 수
     max_extra_off_days: int = 3  # 월 최소 휴무 기준 대비 허용되는 추가 OFF 상한(n)
+    extra_off_penalty_weight: int = 80  # 추가 OFF(여유 OFF)를 기피하는 목적함수 패널티 가중치
+    soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
+    soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
+    distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off
+    monthly_preference_weight: int = 60  # 월단위 선호(개인 입력) 보너스 가중치(soft)
     
     # 교대 배정 비율 - 각 교대 유형에 대한 선호도 가중치 제어
     day_shift_ratio: float = 1.0  # 주간 근무 비율
@@ -73,6 +78,9 @@ class NurseRosterConfig:
     # 근무 요구사항 우선순위 (0~1) - 1에 가까울수록 더 강하게 근무 요구사항 강제
     shift_requirement_priority: float = 0.8  # 근무 요구사항 우선순위
     
+    # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제(평일 O 금지)
+    weekend_off_only_enable: bool = True  # 주말 휴무 제약 활성화 여부(기본 True)
+    
     # --- Oversupply(여유 인원) 균등화 제어 ---
     oversupply_equalize_enable: bool = True  # 일별 D/E/N 초과 인원(L1) 균등화 활성화
     oversupply_equalize_weight: int = 120    # L1 차이 패널티 가중치(클수록 균등화 강함)
@@ -88,6 +96,8 @@ class NurseRosterConfig:
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
+        if self.soft_max_consecutive_work_days is None:
+            self.soft_max_consecutive_work_days = int(self.max_consecutive_work_days)
         # 팀 게이지 → 가중치/탑K
         gauge = max(0, min(10, int(self.team_balance_gauge or 0)))
         if not self.team_balance_enable or gauge == 0:

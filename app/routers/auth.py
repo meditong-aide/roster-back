@@ -113,7 +113,7 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
-@router.post("/login")
+@router.post("/login", response_model=UserSchema)
 async def login_for_access_token(
     request: Request,
     response: Response, 
@@ -147,6 +147,7 @@ async def login_for_access_token(
             mb_part = row['mb_part']
             gw_useYN = row['gw_useYN']
             qpis_useYN = row['qpis_useYN']
+            official_title_name = row['OfficialTitleName']  # 추가 필드
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
@@ -175,6 +176,7 @@ async def login_for_access_token(
                 "mb_part_name": mb_part_name,
                 "gw_useYN": gw_useYN,
                 "qpis_useYN": qpis_useYN,
+                "official_title_name": official_title_name,  # 추가 필드
             },
             expires_delta=access_token_expires,
         )
@@ -185,7 +187,23 @@ async def login_for_access_token(
             httponly=True, 
             samesite="lax"
         )
-        return {"message": "Login successful", "account_id": account_id}
+        return UserSchema(
+            nurse_id=nurse_id,
+            account_id=account_id,
+            office_id=office_id,
+            group_id=group_id,
+            is_head_nurse=is_head_nurse,
+            is_master_admin=is_master_admin,
+            name=name,
+            EmpSeqNo=EmpSeqNo,
+            EmpAuthGbn=EmpAuthGbn,
+            mb_part=mb_part,
+            office_name=office_name,
+            mb_part_name=mb_part_name,
+            gw_useYN=gw_useYN,
+            qpis_useYN=qpis_useYN,
+            official_title_name=official_title_name,  # 추가 필드
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -231,6 +249,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         mb_part_name: str = payload.get("mb_part_name")
         gw_useYN: str = payload.get("gw_useYN")
         qpis_useYN: str = payload.get("qpis_useYN")
+        official_title_name: str = payload.get("official_title_name")  # 추가 필드
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
@@ -254,6 +273,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         mb_part_name = mb_part_name,
         gw_useYN = gw_useYN,
         qpis_useYN = qpis_useYN,
+        official_title_name=official_title_name,  # 추가 필드
     )
 
 @router.get("/me", response_model=UserSchema)

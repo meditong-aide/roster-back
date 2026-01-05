@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from db.client2 import get_db
 from db.models import Nurse, ShiftPreference, RosterConfig, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage
 from routers.utils import get_days_in_month
@@ -53,6 +53,11 @@ class HoldGenerateRequest(BaseModel):
     month: int
     fixed_cells: List[Dict[str, Any]]
     config_id: Optional[int] = None
+    # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
+    distribution_mode: str = "hybrid"
+    oversupply_balance_gauge: Optional[int] = Field(default=6, ge=0, le=10)
+    monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
+    monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 dotenv.load_dotenv()

@@ -19,6 +19,7 @@ class User(BaseModel):
     mb_part_name: str
     gw_useYN: str
     qpis_useYN: str
+    official_title_name: str | None  # 추가 필드
 
 
     class Config:

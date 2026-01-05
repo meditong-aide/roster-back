@@ -12,17 +12,33 @@ from services.shift_service import (
     add_shift_service,
     update_shift_service,
     remove_shift_service,
-    move_shift_service
+    move_shift_service,
 )
-from typing import Optional
+from typing import Optional, Any
 import os
 from services.shift_service_mssql import get_shifts_service as get_shifts_service_mssql
 from datetime import timedelta, datetime
 
+# def convert_time(value):
+#     if isinstance(value, str):  # '06:00' → timedelta
+#         h, m = map(int, value.split(":"))
+#         return timedelta(hours=h, minutes=m)
+#     return value
+
+
 def convert_time(value):
-    if isinstance(value, str):  # '06:00' → timedelta
-        h, m = map(int, value.split(":"))
-        return timedelta(hours=h, minutes=m)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            parts = value.split(":")
+            if len(parts) >= 2:
+                h, m = map(int, parts[:2])
+                return timedelta(hours=h, minutes=m)
+            raise ValueError("Invalid time format")
+        except Exception as e:
+            print(f"convert_time error: {str(e)}, value: {value}")
+            return None
     return value
 
 
@@ -74,6 +90,16 @@ def _format_time_display(shift):
         return f'{shift.start_time} ~ {shift.end_time}'
     elif shift.type:
         return shift.type
+
+
+def _is_weekly_off_slot(slot_data: dict[str, Any]) -> bool:
+    """
+    프론트 표시용 주휴 슬롯(main_code='O', shift_slot=4, codes에 '주') 여부를 판별합니다.
+    """
+    main_code = slot_data.get("main_code")
+    shift_slot = slot_data.get("shift_slot")
+    codes = slot_data.get("codes") or []
+    return main_code == "O" and shift_slot == 4 and any(code == "주" for code in codes)
 
 @router.post("/shifts/add")
 async def add_shift(
@@ -227,7 +253,7 @@ async def get_shift_manage(
         for sm in shift_manages
     ]
     # default_shift에 '주'가 포함된 shift를 shifts 테이블에서 찾아서 shift_manages에 추가
-    shifts = db.query(Shift).filter(Shift.default_shift.like('%주%')).all()
+    shifts = db.query(Shift).filter(Shift.office_id == current_user.office_id, Shift.default_shift.like('주'), Shift.group_id == target_group_id).all()
     shift_codes = [shift.default_shift for shift in shifts]
     response.append({'shift_slot': 4, 'main_code': 'O', 'codes': shift_codes, 'manpower': ''})
     return response
@@ -241,47 +267,60 @@ async def save_shift_manage(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+    """
+    시프트 관리 슬롯을 저장합니다.
+
+    - 프론트에서 합산해주는 주휴 슬롯(shift_slot=4, main_code='O')은 DB에 저장하지 않고 무시합니다.
+    """
     print('current_user', current_user)
-    if not current_user and not current_user.is_head_nurse and not current_user.is_master_admin:
-        raise HTTPException(status_code=403, detail="Permission denied")
-    
-    # Get current user's office_id
-    if group_id:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 저장이 가능합니다.")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g or g.office_id != current_user.office_id:
-            raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
-        office_id = g.office_id
-        target_group_id = g.group_id
-    else:
-        nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-        if not nurse or not nurse.group:
-            raise HTTPException(status_code=404, detail="User group information not found")
-        office_id = nurse.group.office_id
-        target_group_id = current_user.group_id
-    
-    # 기존 데이터 삭제 (특정 클래스의 모든 슬롯)
-    db.query(ShiftManage).filter(
-        ShiftManage.office_id == office_id,
-        ShiftManage.group_id == target_group_id,
-        ShiftManage.nurse_class == req.class_name,
-        # ShiftManage.config_version == config_version
-    ).delete()
-    
-    # 새 데이터 저장
-    for slot_data in req.slots:
-        shift_manage = ShiftManage(
-            office_id=office_id,
-            group_id=target_group_id,
-            nurse_class=req.class_name,
-            shift_slot=slot_data["shift_slot"],
-            main_code=slot_data.get("main_code"),
-            codes=slot_data["codes"],
-            manpower=slot_data["manpower"],
-            # config_version=config_version
-        )
-        db.add(shift_manage)
-    
-    db.commit()
+    try:
+        if not current_user or (not current_user.is_head_nurse and not getattr(current_user, "is_master_admin", False)):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        
+        # Get current user's office_id
+        if group_id:
+            if not getattr(current_user, 'is_master_admin', False):
+                raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 저장이 가능합니다.")
+            g = db.query(Group).filter(Group.group_id == group_id).first()
+            if not g or g.office_id != current_user.office_id:
+                raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
+            office_id = g.office_id
+            target_group_id = g.group_id
+        else:
+            nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+            if not nurse or not nurse.group:
+                raise HTTPException(status_code=404, detail="User group information not found")
+            office_id = nurse.group.office_id
+            target_group_id = current_user.group_id
+        print(1)
+        # 기존 데이터 삭제 (특정 클래스의 모든 슬롯)
+        db.query(ShiftManage).filter(
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == target_group_id,
+            ShiftManage.nurse_class == req.class_name,
+            # ShiftManage.config_version == config_version
+        ).delete()
+        print(2)
+        slots_to_save = [
+            slot_data for slot_data in req.slots
+            if not _is_weekly_off_slot(slot_data)
+        ]
+        # 새 데이터 저장
+        for slot_data in slots_to_save:
+            shift_manage = ShiftManage(
+                office_id=office_id,
+                group_id=target_group_id,
+                nurse_class=req.class_name,
+                shift_slot=slot_data["shift_slot"],
+                main_code=slot_data.get("main_code"),
+                codes=slot_data.get("codes") or [],
+                manpower=slot_data.get("manpower") or 0,
+                # config_version=config_version
+            )
+            db.add(shift_manage)
+        print(3)
+        db.commit()
+    except Exception as e:
+        print('error', e)
+        raise HTTPException(status_code=500, detail=f"시프트 관리 설정 저장 실패: {str(e)}")
     return {"message": "시프트 관리 설정이 저장되었습니다."}

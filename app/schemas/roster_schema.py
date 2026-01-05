@@ -54,12 +54,29 @@ class ShiftAddRequest(BaseModel):
     # id: int
 
 class RosterRequest(BaseModel):
+    """근무표 생성 요청(임시: UI 미구현 상태에서 req로 정책 파라미터를 주입하기 위한 모델).
+
+    Notes:
+        - `preceptor_gauge` 등 기존 게이지와 동일하게, 분배 정책도 req로 주입받아 실행마다 조절한다.
+        - 월단위 선호는 개인 입력값(간호사별)이고, 반영 강도/모드는 수간호사(생성 요청자)가 선택한다.
+    """
     year: int
     month: int
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
     grade_strategy: str = "BASE"  # "BASE" | "TEAM" | "GRADE"
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
+    # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
+    # mode:
+    # - auto/hybrid: 균등 + 월선호를 함께 고려(기본)
+    # - balanced: 균등 분배만 강화
+    # - preference: 월단위 선호를 상대적으로 강화
+    # - off: 기존처럼 분배 정책 항을 끈다(디버깅/레거시)
+    distribution_mode: str = Field(default="hybrid")
+    oversupply_balance_gauge: Optional[int] = Field(default=6, ge=0, le=10)
+    monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
+    # 월단위 선호(개인 입력): nurse_id -> {"shift": "D|E|N", "strength": 0~10}
+    monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
 
 class PreferenceSubmit(BaseModel):
     year: int
@@ -140,13 +157,14 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    is_night_nurse: List[CodeMapp] = Field(default_facotry=list, max_items = 2)
+    is_night_nurse: List[CodeMapp] = Field(default_factory=list, max_items = 2)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
     resignation_date: Optional[datetime] = None
     sequence: Optional[int] = 0
     active: int = 1
+    fixed_shift: Optional[str] = None
     # weekly_off_enabled: int = Field(default=0)
     weekly_off_weekday: Optional[int] = None
     nurse_memo: Optional[str] = None

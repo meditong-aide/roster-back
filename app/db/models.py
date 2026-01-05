@@ -2,21 +2,21 @@ from sqlalchemy import Column, VARCHAR, SMALLINT, BOOLEAN, DATETIME, func, Forei
 from sqlalchemy.dialects.mysql import TINYINT 
 from sqlalchemy.orm import relationship
 from db.client2 import Base
-from sqlalchemy import DATE, DECIMAL, TEXT
+from sqlalchemy import DATE, DECIMAL, TEXT, Time
 
 class Group(Base):
     __tablename__ = 'groups'
     group_id = Column(VARCHAR(50), primary_key=True)
     office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'))
     group_name = Column(VARCHAR(50), nullable=False)
-    office = relationship("Office", back_populates="groups") 
+    # office = relationship("Office", back_populates="groups") 
 class Office(Base):
     __tablename__ = 'offices'
     office_id = Column(VARCHAR(50), primary_key=True)
-    name = Column(VARCHAR(100), nullable=False)
-    address = Column(VARCHAR(255))
-    contact_number = Column(VARCHAR(30))
-    groups = relationship("Group", back_populates="office") 
+    office_name = Column(VARCHAR(100), nullable=False)
+    # address = Column(VARCHAR(255))
+    # contact_number = Column(VARCHAR(30))
+    # groups = relationship("Group", back_populates="office") 
 
 class Team(Base):
     __tablename__ = 'teams'
@@ -64,12 +64,15 @@ class Nurse(Base):
     # 주휴 관련 추가 컬럼
     weekly_off_enabled = Column(TINYINT, default=0)  # 주휴 대상 여부
     weekly_off_weekday = Column(TINYINT, nullable=True)  # 기준 월에서의 주휴 요일 (0:월~6:일)
+    # 고정 근무 코드(해당 병동의 shifts.shift_id)
+    fixed_shift = Column(VARCHAR(20), nullable=True)
     nurse_memo = Column(TEXT, nullable=True)
     grade = Column(INTEGER, nullable=True)
     # 사이드 프로필 관련 추가 컬럼
     birth_date = Column(VARCHAR(10), nullable=True)
     phone_number = Column(VARCHAR(20), nullable=True)
     gender = Column(VARCHAR(3), nullable=True)
+    is_weekend_off = Column(BOOLEAN, default=False)
     
     group = relationship("Group")
     __table_args__ = (
@@ -115,8 +118,10 @@ class Shift(Base):
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
     name = Column(VARCHAR(20), nullable=False)
     color = Column(VARCHAR(10), nullable=False)
-    start_time = Column(VARCHAR(5), nullable=True)  # HH:MM format
-    end_time = Column(VARCHAR(5), nullable=True)    # HH:MM format
+    # start_time = Column(VARCHAR(5), nullable=True)  # HH:MM format
+    start_time = Column(Time, nullable=True)  # TIME 타입
+    # end_time = Column(VARCHAR(5), nullable=True)    # HH:MM format
+    end_time = Column(Time, nullable=True)    # TIME 타입
     type = Column(VARCHAR(10), nullable=False, default='근무')  # 'work' or 'off'
     allday = Column(INTEGER, nullable=False, default=0)
     auto_schedule = Column(INTEGER, nullable=False, default=1)
