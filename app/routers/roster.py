@@ -1179,9 +1179,24 @@ async def validate_roster(
         shift_map = {s: i for i, s in enumerate(system.config.shift_types)}
         system.roster.fill(0)                                # 3-D 배열 0으로 초기화
         # ──────────────────────── 4. 프론트에서 넘어온 근무표 → 엔진 포맷 변환 ────────────────────────
-        for nurse_idx, nurse_data in enumerate(roster):
-            if nurse_idx >= len(system.nurses):
+        nurse_idx_map: dict[str, int] = {
+            str(n.db_id): idx for idx, n in enumerate(system.nurses)
+        }
+
+        for nurse_data in roster:
+            nurse_identifier = (
+                nurse_data.get('nurse_id')
+                or nurse_data.get('id')
+                or nurse_data.get('db_id')
+            )
+            if nurse_identifier is None:
                 continue
+
+            target_idx = nurse_idx_map.get(str(nurse_identifier))
+            if target_idx is None:
+                # 매핑 실패 시 해당 간호사는 건너뜀
+                continue
+
             schedule = nurse_data.get('schedule', [])
             for day_idx, raw_shift in enumerate(schedule):
                 if day_idx >= system.num_days:
@@ -1195,7 +1210,7 @@ async def validate_roster(
                 # ③ 엔진 shift index 찾기
                 shift_idx = shift_map.get(base_shift)
                 if shift_idx is not None:
-                    system.roster[nurse_idx, day_idx, shift_idx] = 1
+                    system.roster[target_idx, day_idx, shift_idx] = 1
                 # else: 알 수 없는 코드 → 무시
         # ──────────────────────── 5. 위반사항 탐색 & 포매팅 ────────────────────────
         violation_details = system._find_violations()
