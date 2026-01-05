@@ -22,56 +22,22 @@ _MSSQL_SESSION_MAKER: sessionmaker | None = None
 #     return s
 
 
-# def _to_time_str(value: Any) -> str | None:
-#     """TIME 컬럼값을 HH:MM 문자열로 변환합니다."""
-#     if value is None:
-#         return None
-#     if isinstance(value, _dt.time):
-#         return value.strftime("%H:%M")
-#     if isinstance(value, str):
-#         try:
-#             parts = value.split(":")
-#             if len(parts) >= 2:
-#                 return f"{parts[0]}:{parts[1]}"  # HH:MM:SS → HH:MM
-#         except Exception as e:
-#             print(f"_to_time_str error: {str(e)}, value: {value}")
-#             return None
-#     print(f"_to_time_str unexpected type: {type(value)}, value: {value}")
-#     return None  # 안전하게 None 반환
-
-
 def _to_time_str(value: Any) -> str | None:
-    """TIME 컬럼값을 HH:MM:SS 문자열로 변환합니다."""
+    """TIME 컬럼값을 HH:MM 문자열로 변환합니다."""
     if value is None:
         return None
-    
-    # datetime.time 객체 처리: HH:MM:SS 형식으로 변환
     if isinstance(value, _dt.time):
-        return value.strftime("%H:%M:%S")
-    
-    # datetime.datetime 객체 처리: 시간 부분만 추출해 HH:MM:SS 형식으로 변환
-    if isinstance(value, _dt.datetime):
-        return value.time().strftime("%H:%M:%S")
-    
-    # 문자열 처리: :로 분리해 HH:MM:SS 형식으로 변환, 초가 없으면 00 추가
+        return value.strftime("%H:%M")
     if isinstance(value, str):
         try:
             parts = value.split(":")
             if len(parts) >= 2:
-                hours = parts[0].zfill(2)  # 시간 2자리로 맞춤 (예: "6" → "06")
-                minutes = parts[1].zfill(2)  # 분 2자리로 맞춤
-                seconds = parts[2].zfill(2) if len(parts) > 2 else "00"  # 초 없으면 00
-                return f"{hours}:{minutes}:{seconds}"
-            else:
-                print(f"_to_time_str invalid format: {value}")
-                return None
+                return f"{parts[0]}:{parts[1]}"  # HH:MM:SS → HH:MM
         except Exception as e:
             print(f"_to_time_str error: {str(e)}, value: {value}")
             return None
-    
-    # 예상치 못한 타입 처리: 디버깅 로그 추가 후 None 반환
     print(f"_to_time_str unexpected type: {type(value)}, value: {value}")
-    return None
+    return None  # 안전하게 None 반환
 
 
 def _append_shift_manage_code(
