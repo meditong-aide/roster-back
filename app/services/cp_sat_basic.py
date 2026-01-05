@@ -1347,6 +1347,18 @@ class CPSATBasicEngine:
                 for s in range(S):
                     if s3.Value(X3(n, d, s)):
                         roster_system.roster[n, d, s] = 1
+        # 후처리: 불필요한 O 재배치로 연속근무 완화
+        try:
+            print(f"{self.logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
+            before_viol = len(roster_system._find_violations())
+            self._postprocess_rebalance_off(roster_system)
+            after_viol = len(roster_system._find_violations())
+            print(
+                f"{self.logger_prefix} [PostOff] 종료: viol {before_viol}->{after_viol} "
+                f"(감소={before_viol - after_viol})"
+            )
+        except Exception as exc:
+            print(f"{self.logger_prefix} [PostOff] 후처리 실패: {exc}")
 
         print(f"{self.logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
         return best_short == 0 and best_safe_sum == 0
@@ -1418,6 +1430,138 @@ class CPSATBasicEngine:
                     nurse_schedule.append('-')
             result[nurse.db_id] = nurse_schedule
         return result
+
+    def _postprocess_rebalance_off(
+        self,
+        roster_system: RosterSystem,
+        max_attempts: int = 30,
+    ) -> None:
+        """후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다.
+
+        수식(연속근무 길이): run_len = work_days 연속 길이 (예: DDDDDEE → run_len=6)
+
+        전략:
+            - 한 간호사 내에서 O가 있는 다른 날짜와 장시간 연속근무 구간의 근무를 교환
+            - 밤근무(N)는 2N2O/야간 연속 규칙을 해치지 않도록 스왑 대상에서 제외
+            - 하드 제약 위반 수가 늘어나면 롤백
+
+        Args:
+            roster_system: 근무표 시스템
+            max_attempts: 최대 스왑 시도 횟수
+        """
+        cfg = roster_system.config
+        off_idx = cfg.shift_types.index('O') if 'O' in cfg.shift_types else None
+        night_idx = cfg.shift_types.index('N') if 'N' in cfg.shift_types else None
+        if off_idx is None:
+            return
+
+        fixed_cells = {(c['nurse_index'], c['day_index']) for c in (getattr(roster_system, 'fixed_cells', []) or [])}
+        K = getattr(cfg, "max_consecutive_work_days", None)
+        if not isinstance(K, int) or K <= 0:
+            return
+
+        def _max_run(n_idx: int) -> tuple[int, int, int] | None:
+            """가장 긴 연속근무 구간(start, end, length)을 반환."""
+            best = None
+            run_start = None
+            run_len = 0
+            D = roster_system.num_days
+            for d in range(D):
+                is_off = roster_system.roster[n_idx, d, off_idx] == 1
+                if is_off:
+                    if run_len > 0 and (best is None or run_len > best[2]):
+                        best = (run_start, d - 1, run_len)
+                    run_start, run_len = None, 0
+                else:
+                    if run_start is None:
+                        run_start = d
+                    run_len += 1
+            if run_len > 0 and (best is None or run_len > best[2]):
+                best = (run_start, D - 1, run_len)
+            return best
+
+        def _swap_off(n_idx: int, work_day: int, off_day: int, shift_idx: int) -> None:
+            roster_system.roster[n_idx, work_day, shift_idx] = 0
+            roster_system.roster[n_idx, work_day, off_idx] = 1
+            roster_system.roster[n_idx, off_day, off_idx] = 0
+            roster_system.roster[n_idx, off_day, shift_idx] = 1
+
+        def _find_shift_idx(n_idx: int, day: int) -> int | None:
+            vec = roster_system.roster[n_idx, day]
+            ones = np.where(vec == 1)[0]
+            if len(ones) == 1:
+                return int(ones[0])
+            return None
+
+        base_viol = len(roster_system._find_violations())
+        accepted = 0
+        N = len(roster_system.nurses)
+
+        for n_idx in range(N):
+            if accepted >= max_attempts:
+                break
+            best_run = _max_run(n_idx)
+            if not best_run or best_run[2] <= K:
+                continue
+            start, end, run_len = best_run
+            # 연속근무 중앙부부터 완화 시도
+            target_days = list(range(start, end + 1))
+            target_days.sort(key=lambda x: abs(x - (start + end) // 2))
+
+            # O 후보: 동일 간호사의 O 날짜 중 고정 아닌 날
+            off_candidates = [
+                d for d in range(roster_system.num_days)
+                if roster_system.roster[n_idx, d, off_idx] == 1 and (n_idx, d) not in fixed_cells
+            ]
+            if not off_candidates:
+                continue
+
+            for work_day in target_days:
+                if (n_idx, work_day) in fixed_cells:
+                    continue
+                shift_idx = _find_shift_idx(n_idx, work_day)
+                if shift_idx is None or shift_idx == off_idx:
+                    continue
+                # N 이동은 2N2O 리스크가 크므로 제외
+                if night_idx is not None and shift_idx == night_idx:
+                    continue
+
+                for off_day in off_candidates:
+                    if off_day == work_day:
+                        continue
+                    if (n_idx, off_day) in fixed_cells:
+                        continue
+
+                    # 스왑 적용
+                    _swap_off(n_idx, work_day, off_day, shift_idx)
+                    new_run = _max_run(n_idx)
+                    new_viol = len(roster_system._find_violations())
+
+                    ok = True
+                    if new_run and new_run[2] > K:
+                        ok = False
+                    if new_viol > base_viol:
+                        ok = False
+
+                    if ok:
+                        accepted += 1
+                        base_viol = new_viol
+                        print(
+                            f"{self.logger_prefix} [PostOff] swap accepted n={n_idx}, "
+                            f"work_day={work_day+1}→O, off_day={off_day+1}→{cfg.shift_types[shift_idx]}, "
+                            f"max_run {run_len}->{new_run[2] if new_run else 0}, viol {new_viol}"
+                        )
+                        break
+                    else:
+                        # 롤백
+                        _swap_off(n_idx, off_day, work_day, shift_idx)
+                if accepted >= max_attempts:
+                    break
+        final_viol = len(roster_system._find_violations())
+        print(
+            f"{self.logger_prefix} [PostOff] 완료: 수용 스왑 {accepted}건, "
+            f"위반 {base_viol}->{final_viol}, max_attempts={max_attempts}"
+        )
 
     def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
         """최종 근무표를 간호사별로 출력합니다.
