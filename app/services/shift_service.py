@@ -4,10 +4,49 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Shift, Nurse, Group
+from db.models import Shift, Nurse, Group, ShiftManage
 from schemas.auth_schema import User as UserSchema
 from sqlalchemy import func
 from db.models import ScheduleEntry
+
+
+def _append_shift_manage_code(
+    db: Session,
+    office_id: str | None,
+    group_id: str,
+    shift_id: str,
+    shift_gb: str | None,
+) -> None:
+    """
+    shift_manage.codes에 근무코드를 중복 없이 추가합니다.
+
+    - shift_gb가 D/E/N일 때만 동작하며, slot은 1/2/3에 매핑됩니다.
+    - 기존에 코드가 있으면 추가하지 않습니다.
+    """
+    slot_map = {"D": 1, "E": 2, "N": 3}
+    if shift_gb not in slot_map or not office_id:
+        return
+
+    target_slot = slot_map[shift_gb]
+    shift_manages = (
+        db.query(ShiftManage)
+        .filter(
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == group_id,
+            ShiftManage.shift_slot == target_slot,
+            ShiftManage.main_code == shift_gb,
+        )
+        .all()
+    )
+    updated = False
+    for shift_manage in shift_manages:
+        codes = shift_manage.codes or []
+        if shift_id not in codes:
+            shift_manage.codes = codes + [shift_id]
+            updated = True
+
+    if updated:
+        db.commit()
 
 
 def get_shifts_service(current_user, db: Session, override_group_id: str | None = None):
@@ -35,6 +74,7 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
                 "auto_schedule": shift.auto_schedule,
                 "duration": shift.duration,
                 "sequence": shift.sequence,
+                "shift_gb": getattr(shift, "shift_gb", None),
                 "default_shift" : shift.default_shift,
                 "id": shift.id,
                 # time_display는 라우터에서 포맷팅 함수로 처리할 수 있음
@@ -67,15 +107,15 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
             return t
 
         defaults = [
-            # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence
-            ("O", "Off", "#ffa0d2", None, None, "휴무", 1, 1, None, 4, "O"),
-            ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E"),
-            ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N"),
-            ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D"),
+            # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence, shift_gb
+            ("O", "Off", "#ffa0d2", None, None, "휴무", 1, 1, None, 4, "O", "O"),
+            ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E", "E"),
+            ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N", "N"),
+            ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D", "D"),
         ]
 
         created = []
-        for sid, name, color, st, et, typ, allday, auto_s, dur, seq, default_shift in defaults:
+        for sid, name, color, st, et, typ, allday, auto_s, dur, seq, default_shift, shift_gb in defaults:
             new_shift = Shift(
                 shift_id=sid,
                 office_id=office_id,
@@ -90,10 +130,19 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
                 duration=dur,
                 sequence=seq,
                 default_shift=default_shift,
+                shift_gb=shift_gb,
             )
             db.add(new_shift)
             created.append(new_shift)
         db.commit()
+        for shift in created:
+            _append_shift_manage_code(
+                db=db,
+                office_id=office_id,
+                group_id=group_id,
+                shift_id=shift.shift_id,
+                shift_gb=getattr(shift, "shift_gb", None),
+            )
         # 정렬된 결과 반환
         created_sorted = db.query(Shift).filter(Shift.group_id == group_id).order_by(Shift.sequence.asc()).all()
         return [
@@ -108,6 +157,7 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
                 "auto_schedule": shift.auto_schedule,
                 "duration": shift.duration,
                 "sequence": shift.sequence,
+                "shift_gb": getattr(shift, "shift_gb", None),
                 "default_shift": shift.default_shift,
             }
             for shift in created_sorted
@@ -151,11 +201,19 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         duration=req.duration,
         allday=req.allday,
         auto_schedule=req.auto_schedule,
-        sequence=max_sequence + 1
+        sequence=max_sequence + 1,
+        shift_gb=req.shift_gb,
     )
     db.add(new_shift)
     db.commit()
     db.refresh(new_shift)
+    _append_shift_manage_code(
+        db=db,
+        office_id=office_id,
+        group_id=target_group_id,
+        shift_id=new_shift.shift_id,
+        shift_gb=req.shift_gb,
+    )
     return {
         "message": "근무코드가 성공적으로 추가되었습니다.",
         "shift": {
@@ -163,6 +221,7 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
             "name": new_shift.name,
             "color": new_shift.color,
             "sequence": new_shift.sequence,
+            "shift_gb": new_shift.shift_gb,
         }
     }
 
@@ -189,9 +248,17 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     existing_shift.duration = req.duration
     existing_shift.allday = req.allday
     existing_shift.auto_schedule = req.auto_schedule
+    existing_shift.shift_gb = req.shift_gb
 
     db.commit()
     db.refresh(existing_shift)
+    _append_shift_manage_code(
+        db=db,
+        office_id=existing_shift.office_id,
+        group_id=target_group_id,
+        shift_id=existing_shift.shift_id,
+        shift_gb=req.shift_gb,
+    )
     return {
         "message": "근무코드가 성공적으로 수정되었습니다.",
         "shift": {
@@ -199,6 +266,7 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
             "name": existing_shift.name,
             "color": existing_shift.color,
             "sequence": existing_shift.sequence,
+            "shift_gb": existing_shift.shift_gb,
         }
     }
 

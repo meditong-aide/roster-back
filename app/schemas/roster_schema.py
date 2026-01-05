@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import StrEnum
 
@@ -13,6 +13,7 @@ class WantedDeadlineRequest(BaseModel):
     exp_date: Optional[datetime] = None
 
 class MoveShiftRequest(BaseModel):
+    """시프트 순서 이동 요청 모델."""
     shift_id: str
     new_sequence: int
 
@@ -22,11 +23,16 @@ class MoveNurseRequest(BaseModel):
 
 
 class RemoveShiftRequest(BaseModel):
+    """시프트 삭제 요청 모델."""
     shift_id: str
 
 
 class ShiftUpdateRequest(BaseModel):
+    """시프트 수정 요청 모델."""
     default_shift: Optional[str] = None
+    shift_gb: Optional[Literal["D", "E", "N", "O"]] = Field(
+        default=None, description="근무 분류(D/E/N/O). null 허용"
+    )
     shift_id: str
     name: str
     color: str
@@ -40,7 +46,11 @@ class ShiftUpdateRequest(BaseModel):
     id: int
 
 class ShiftAddRequest(BaseModel):
+    """시프트 등록 요청 모델."""
     default_shift: Optional[str] = None
+    shift_gb: Optional[Literal["D", "E", "N", "O"]] = Field(
+        default=None, description="근무 분류(D/E/N/O). null 허용"
+    )
     shift_id: str
     name: str
     color: str
