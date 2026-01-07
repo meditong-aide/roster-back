@@ -1,7 +1,7 @@
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from routers.auth import get_current_user_from_cookie
 from db.client2 import get_db
-from db.models import ShiftPreference, Nurse
+from db.models import ShiftPreference, Nurse, Shift
 from schemas.auth_schema import User as UserSchema
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -38,7 +38,29 @@ async def submit_preferences(
     db: Session = Depends(get_db)
 ):
     try:
+        # 빈 제출이 아니고 preferences가 있을 때만 검증
+        if req.preferences and len(req.preferences) > 0:
+            allowed_shifts = {
+                row[0] for row in db.query(Shift.shift_id).filter(
+                    Shift.group_id == current_user.group_id,
+                    Shift.show_in_preference == True
+                ).all()
+            }
+            
+            invalid_shifts = [
+                pref.shift_id for pref in req.preferences
+                if pref.shift_id not in allowed_shifts
+            ]
+            
+            if invalid_shifts:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"허용되지 않은 근무코드가 포함되어 있습니다: {', '.join(set(invalid_shifts))}"
+                )
+                
         return submit_preferences_service(req, current_user, db)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"선호도 최종 제출 실패: {str(e)}")
 
