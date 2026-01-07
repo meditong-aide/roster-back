@@ -45,7 +45,7 @@ class ShiftUpdateRequest(BaseModel):
     auto_schedule: Optional[int] = 1
     id: int
     # 추가
-    show_in_preeference: Optional[bool] = None # None이면 기존 값 유지
+    show_in_preference: Optional[bool] = None # None이면 기존 값 유지
 
 class ShiftAddRequest(BaseModel):
     """시프트 등록 요청 모델."""

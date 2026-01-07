@@ -5,7 +5,7 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 """
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from db.models import Wanted, Nurse, ShiftPreference
+from db.models import Wanted, Nurse, ShiftPreference, Shift
 from schemas.roster_schema import WantedInvokeRequest, WantedDeadlineRequest
 from schemas.auth_schema import User as UserSchema
 from datetime import datetime, date
@@ -475,10 +475,19 @@ async def invoke_and_persist_wanted_service(
         - case가 없으면: LLM 결과만 저장 (원래 동작)
     """
     print("그래프 실행 및 DB 저장을 시작합니다.")
-    
+
     nurse_id = current_user.nurse_id
     print('request:', req.__dict__)
     month_str = _yyyymm(req.year, req.month)
+
+    # 추가: 허용 근무코드 조회
+    allowed_shifts_query = db.query(Shift.shift_id).filter(
+        Shift.group_id == current_user.group_id,
+        Shift.show_in_preference == True
+    ).all()
+    allowed_shifts_list = [row[0] for row in allowed_shifts_query]
+    allowed_shifts_str = ", ".join(allowed_shifts_list) if allowed_shifts_list else "없음"
+    print(f"허용 근무 코드: {allowed_shifts_str}")
     
     # ======================================================================
     # case 여부 확인
@@ -490,7 +499,15 @@ async def invoke_and_persist_wanted_service(
     # ======================================================================
     print('degug: 1', req.year, req.month)
     try:
-        response = await graph_service.invoke(request= req.request, schema= req.schema, case= req.case, year= req.year, month= req.month)
+        response = await graph_service.invoke(
+            request= req.request, 
+            schema= req.schema, 
+            case= req.case, 
+            year= req.year, 
+            month= req.month,
+            # 추가 전달 내역
+            allowed_shifts=allowed_shifts_str
+        )
     except Exception as e:
         print(f"graph_service.invoke 오류: {e}")
         traceback.print_exc()

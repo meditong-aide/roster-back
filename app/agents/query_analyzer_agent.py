@@ -117,9 +117,10 @@ def _compute_cost(prompt_tokens: int, completion_tokens: int, model_name: str) -
 
 
 class queryAnalyzerPrompt:
-    def __init__(self, context, year, month):
+    def __init__(self, context, year, month, allowed_shifts: str = ''):
         """
         프롬프트 클래스
+        allowed_shifts 추가
         """
         self.system = f"""
         ## GOAL:
@@ -151,6 +152,32 @@ class queryAnalyzerPrompt:
                 - Others ― requests not fitting the above
                 * Empty categories must remain [].
                 * Element order must follow the input sequence.
+
+        ## ==================== 병동 정책 강제 적용 (신규 추가) ====================
+        ## 허용 근무코드 제한 (반드시 준수!)
+        - 간호사가 희망근무로 선택 가능한 근무코드는 **오직 다음만** 허용됩니다:
+          **{allowed_shifts}** (예: D, E, N, O, D2, E2, N2, M)
+        - **절대 Shift 카테고리에 포함 금지**:
+          - 연차(연), 경조(경), 병가(병), 결근(결), 생리휴가(생), 교육(교후, 교전, 교), 주휴(주, 주휴) 등
+        - 위 목록에 없는 코드를 사용자가 요청하면:
+          → **Shift: []** (빈 배열)
+          → **Others에 해당 요청 원문 기록** + 이유 설명
+        - 예시:
+          입력: "5/12 연차 써도 돼요"
+          출력:
+          {{
+            "processor": "연차는 show_in_preference=false로 희망근무 선택 불가 → Others 처리",
+            "Shift": [],
+            "Others": ["연차는 희망근무 선택 불가합니다"]
+          }}
+          
+          입력: "5/12 D로 해주세요, 그리고 연차도"
+          출력:
+          {{
+            "processor": "D는 허용, 연차는 불가 → 연차 부분 Others 처리",
+            "Shift": ["5/12 D로 해주세요"],
+            "Others": ["연차는 희망근무 선택 불가합니다"]
+          }}
 
         ## 2. Mandatory Rules
             | Expression | Conversion Example |
@@ -215,6 +242,8 @@ async def query_analyzer(state):
     context = state['request']
     year = state['year']
     month = state['month']
+    # 추가 항목
+    allowed_shifts = state.get('allowed_shifts', '')
     query_analyzer_prompt = queryAnalyzerPrompt(context, year, month)
     
     # 백업 모델들 순서대로 시도

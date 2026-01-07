@@ -47,6 +47,8 @@ class ContextAnalyticsState(TypedDict):
     month: int
     case: List[Dict[str, Any]] | None
     case_results: List[Dict[str, Any]] | None
+    # 신규 추가
+    allowed_shifts: str | None # "D, E, N, O, D2, E2..."
 
     
 

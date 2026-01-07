@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -242,6 +242,7 @@ class Upload2ConfirmRequest(BaseModel):
 @router.post("/upload2-validate")
 async def upload2_validate_endpoint(
     file: UploadFile = File(...),
+    group_id: str = Query(..., description="병동 그룹 ID (필수)"), # 추가
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
@@ -252,7 +253,7 @@ async def upload2_validate_endpoint(
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
         try:
-            result = upload2_validate(tmp_file_path, current_user, db)
+            result = upload2_validate(tmp_file_path, current_user, db, group_id=group_id)
             return result
         finally:
             os.unlink(tmp_file_path)
