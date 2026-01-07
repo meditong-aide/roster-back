@@ -44,6 +44,8 @@ class ShiftUpdateRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     id: int
+    # 추가
+    show_in_preeference: Optional[bool] = None # None이면 기존 값 유지
 
 class ShiftAddRequest(BaseModel):
     """시프트 등록 요청 모델."""
@@ -62,6 +64,8 @@ class ShiftAddRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     # id: int
+    # 추가 내역
+    show_in_preference: Optional[bool] = False # 기본 False, 프론트에서 안 보내면 자동 숨김
 
 class RosterRequest(BaseModel):
     """근무표 생성 요청(임시: UI 미구현 상태에서 req로 정책 파라미터를 주입하기 위한 모델).

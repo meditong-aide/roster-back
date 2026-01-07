@@ -238,6 +238,8 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         auto_schedule=req.auto_schedule,
         sequence=max_sequence + 1,
         shift_gb=req.shift_gb,
+        # 추가
+        show_in_prefereence=getattr(req, "show_in_preference", False) # 프론트 미 전송 시 False
     )
     db.add(new_shift)
     db.commit()
@@ -286,6 +288,10 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     existing_shift.allday = req.allday
     existing_shift.auto_schedule = req.auto_schedule
     existing_shift.shift_gb = req.shift_gb
+
+    # 원티드 페이지 노출 여부 업데이트
+    if hasattr(req, "show_in_preference") and req.show_in_preference is not None:
+        existing_shift.show_in_preference = req.show_in_preference
 
     db.commit()
     db.refresh(existing_shift)
