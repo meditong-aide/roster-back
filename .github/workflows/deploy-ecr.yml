@@ -284,6 +284,7 @@ jobs:
             CLIENT_SECRET=${{ secrets.PROD_CLIENT_SECRET }}
             SECRET_KEY=${{ secrets.PROD_SECRET_KEY }}
             ALGORITHM=${{ secrets.PROD_ALGORITHM }}
+            SQS_QUEUE_URL=${{ secrets.PROD_SQS_QUEUE_URL }}
             EOF
               fi
 
@@ -313,6 +314,7 @@ jobs:
             CLIENT_SECRET=${{ secrets.DEV_CLIENT_SECRET }}
             SECRET_KEY=${{ secrets.DEV_SECRET_KEY }}
             ALGORITHM=${{ secrets.DEV_ALGORITHM }}
+            SQS_QUEUE_URL=${{ secrets.DEV_SQS_QUEUE_URL }}
             EOF
             echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
 

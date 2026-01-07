@@ -2,6 +2,7 @@ import json
 import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import boto3
@@ -55,8 +56,8 @@ class HoldGenerateRequest(BaseModel):
     monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
 
-
-dotenv.load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent.parent
+dotenv.load_dotenv(BASE_DIR / ".env")
 
 sqs = boto3.client("sqs", region_name="ap-northeast-2")
 QUEUE_URL = os.getenv("SQS_QUEUE_URL")
