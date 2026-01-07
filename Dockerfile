@@ -24,7 +24,7 @@ ENV ENV=${ENV} \
     OPENAI_API_KEY=${OPENAI_API_KEY} \
     PYTHONUNBUFFERED=1 \
     PORT=8000 \
-    ROLE=api   # 기본은 API
+    ROLE=api
 
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
