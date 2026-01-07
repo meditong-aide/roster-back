@@ -539,7 +539,7 @@ def process_excel_upload(file_path: str, user: UserSchema, db: Session) -> Dict[
 #         return {"success": 0, "errors": [{"row": 0, "reason": str(e)}], "rows": []}
 
 
-def upload2_validate(file_path: str, user: UserSchema, db: Session) -> Dict[str, Any]:
+def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: str) -> Dict[str, Any]:
     """업로드2: 파일을 검증만 수행하고, 정규화된 행과 오류를 반환한다.
 
     - 행별 오류: 포맷/타입/허용 계정/필수값 등
@@ -680,9 +680,12 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session) -> Dict[str,
             if row_errs:
                 errors.append({'row': ridx, 'reason': '; '.join(row_errs)})
 
+        if str(user.group_id) != group_id:
+            pass
+
         existing_head_nurses = db.query(NurseModel).filter(
             NurseModel.office_id == user.office_id,
-            NurseModel.group_id == user.group_id,
+            NurseModel.group_id == group_id,
             NurseModel.is_head_nurse == 1
         ).count()
 
