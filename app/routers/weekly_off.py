@@ -78,10 +78,17 @@ async def update_nurses_weekly_off(
 async def get_my_weekly_off(
     year: int,
     month: int,
+    nurse_id: Optional[str] = None, # 추가: 옵션 파라미터
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """
     로그인한 간호사 본인의 주휴일정만 조회
     """
-    return get_my_weekly_off_service(year, month, current_user, db)
+    return get_my_weekly_off_service(
+        year=year, 
+        month=month, 
+        current_user=current_user, 
+        db=db,
+        target_nurse_id=nurse_id # 추가인자
+    )
