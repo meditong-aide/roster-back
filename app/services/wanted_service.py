@@ -492,166 +492,158 @@ async def invoke_and_persist_wanted_service(
     # ======================================================================
     # case 여부 확인
     # ======================================================================
-    has_case = req.case is not None and len(req.case) > 0
-    print(f'has_case, {has_case}')
+    original_has_case = req.case is not None and len(req.case) > 0
+    has_case = original_has_case
+    print(f'original has_case: {original_has_case}')
+
     # ======================================================================
-    # 1. 그래프 실행
+    # 0. case 없으면 과거 데이터 자동 로드 (기존 선택 유지)
     # ======================================================================
-    print('degug: 1', req.year, req.month)
+    if not has_case:
+        print("case 없음 -> 과거 최신 데이터 자동 로드 시도")
+        latest_wr = (
+            db.query(WantedRequest)
+            .filter(
+                WantedRequest.nurse_id == nurse_id,
+                WantedRequest.month == month_str,
+            )
+            .order_by(WantedRequest.created_at.desc())
+            .first()
+        )
+        
+        if latest_wr:
+            print(f"과거 데이터 발견 (request_id={latest_wr.request_id}) -> 자동 case로 설정")
+            shift_rows = (
+                db.query(NurseShiftRequest)
+                .filter(
+                    NurseShiftRequest.nurse_id == nurse_id,
+                    NurseShiftRequest.request_id == latest_wr.request_id
+                )
+                .all()
+            )
+            
+            auto_case = [
+                {
+                    "date": str(row.shift_date),
+                    "shift": row.shift
+                }
+                for row in shift_rows
+            ]
+            
+            req.case = auto_case
+            has_case = True
+            print(f"자동 case 생성 완료 ({len(auto_case)}개 항목)")
+        else:
+            print("과거 데이터 없음 -> 완전 새로 생성")
+
+    # ======================================================================
+    # 1. 그래프 실행 (case 포함)
+    # ======================================================================
     try:
         response = await graph_service.invoke(
-            request= req.request, 
-            schema= req.schema, 
-            case= req.case, 
-            year= req.year, 
-            month= req.month,
-            # 추가 전달 내역
+            request=req.request,
+            schema=req.schema,
+            case=req.case,  # 자동 case 포함
+            year=req.year,
+            month=req.month,
             allowed_shifts=allowed_shifts_str
         )
     except Exception as e:
         print(f"graph_service.invoke 오류: {e}")
         traceback.print_exc()
         raise e
-    print('degug: 2', response)
+
     # ======================================================================
     # 2. 새 wanted_request 생성
     # ======================================================================
-    # new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
-    # print(f'new_request_id, {new_request_id}')
-    
+    new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
+    print(f'new_request_id, {new_request_id}')
+
     # ======================================================================
-    # 3. case가 있는 경우: 기존 데이터 복사 + 새 데이터 추가
+    # 3. 최종 데이터 병합 및 저장 (기존 선택 + 새 AIDE 추천)
     # ======================================================================
+    final_shift_map = {}
+
+    # 1. 기존 선택 (case) 먼저 넣기
     if has_case:
-        print("case 감지 - 기존 데이터 복사 모드")
-        
-        # 3-1. case에서 유지할 날짜/shift 파악 (캘린더에서 지운 항목 제외)
-        case_filter = set()
+        print("기존 선택(case) 데이터 병합 시작")
         for item in req.case:
             date_str = item.get('date', '')
             shift_type = item.get('shift', '')
+            if not date_str or not shift_type:
+                continue
             
-            # date를 day로 변환
             if isinstance(date_str, str) and '-' in date_str:
                 day = int(date_str.split('-')[2])
             else:
                 day = int(date_str)
             
-            case_filter.add((day, shift_type))
-        
-        print(f"case_filter (유지할 항목): {case_filter}")
-        print('여봐라', nurse_id, month_str)
-        # 3-2. 기존 request 찾기
-        old_wr = (
-            db.query(WantedRequest)
-            .filter(
-                WantedRequest.nurse_id == nurse_id,
-                WantedRequest.month == month_str,
-            )
-            .order_by(WantedRequest.request_id.desc())
-            .first()
-        )
-        
-    # ======================================================================
-    # 2. 새 wanted_request 생성
-    # ======================================================================
-        new_request_id = _persist_wanted_request(db, nurse_id, month_str, old_wr.request if old_wr else '')
-        print(f'new_request_id, {new_request_id}')
-        
-        # 3-3. 기존 데이터가 있으면 필터링해서 복사
-        if old_wr:
-            print(f'old_wr', old_wr.__dict__)
-            print(f"기존 데이터 발견: request_id={old_wr.request_id}, 복사 시작")
-            try:
-                _copy_existing_requests_to_new(
-                    db=db,
-                    nurse_id=nurse_id,
-                    old_request_id=old_wr.request_id,
-                    new_request_id=new_request_id,
-                    year=req.year,
-                    month=req.month,
-                    month_str=month_str,
-                    case_filter=case_filter,  # 필터 전달
-                )
-            except Exception as e:
-                print(f"기존 데이터 복사 오류: {e}")
-                raise e
-        else:
-            print("복사할 기존 데이터 없음")
-        
-        # 3-3. case_results 추가 (뒷 순번으로)
-        try:
-            print(f'response',response)
-            shift_parsed = _parse_shift_results(response)
-            print(f'shift_parsed (case_results), {shift_parsed}')
-        except Exception as e:
-            print(f"shift_parsed 파싱 오류: {e}")
-            raise e
-        
-        if shift_parsed:
-            _persist_shift_results(
-                db=db,
-                nurse_id=nurse_id,
-                request_id=new_request_id,
-                year=req.year,
-                month=req.month,
-                month_str=month_str,
-                shift_map=shift_parsed,
-            )
+            final_shift_map[day] = {
+                'score': 1.0,
+                'request': '기존 선택 유지'
+            }
+
+    # 2. AIDE 새 추천 결과 병합 (새 요청 우선)
+    shift_parsed = _parse_shift_results(response)
+    print(f'AIDE 추천 결과: {shift_parsed}')
     
-    # ======================================================================
-    # 4. case가 없는 경우: 원래대로 LLM 결과만 저장
-    # ======================================================================
-    else:
-    # ======================================================================
-    # 2. 새 wanted_request 생성
-    # ======================================================================
-        new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
-        print(f'new_request_id, {new_request_id}')
+    if shift_parsed:
+        for shift_id, days_info in shift_parsed.items():
+            for day, info in days_info.items():
+                final_shift_map[day] = {
+                    'score': info.get('score', 1.0),
+                    'request': info.get('request', 'AIDE 추천')
+                }
+    
+    print(f"최종 병합 결과 (shift_map): {final_shift_map}")
 
-        print("일반 LLM 모드 - 새 데이터만 저장")
-        print(f'response',response)
-        shift_parsed = _parse_shift_results(response)
-        print(f'shift_parsed (LLM 결과), {shift_parsed}')
-        
-        if shift_parsed:
-            _persist_shift_results(
+    # 3. 최종 데이터 저장
+    if final_shift_map:
+        _persist_shift_results(
+            db=db,
+            nurse_id=nurse_id,
+            request_id=new_request_id,
+            year=req.year,
+            month=req.month,
+            month_str=month_str,
+            shift_map=final_shift_map
+        )
+
+    # 인원 선호도 처리 (기존 로직 유지)
+    try:
+        pref_parsed = _parse_preferences(response, req.schema)
+        if pref_parsed:
+            _persist_pair_results(
                 db=db,
                 nurse_id=nurse_id,
                 request_id=new_request_id,
-                year=req.year,
-                month=req.month,
                 month_str=month_str,
-                shift_map=shift_parsed,
+                pairs=pref_parsed,
             )
+    except Exception as e:
+        print(f"pref_parsed 파싱 오류: {e}")
+        raise e
 
-        try:
-            pref_parsed = _parse_preferences(response, req.schema)
-
-            if pref_parsed:
-                _persist_pair_results(
-                    db=db,
-                    nurse_id=nurse_id,
-                    request_id=new_request_id,
-                    month_str=month_str,
-                    pairs=pref_parsed,
-                )
-        except Exception as e:
-            print(f"pref_parsed 파싱 오류: {e}")
-            raise e
     # ======================================================================
     # 5. 결과 반환
     # ======================================================================
-    shift_parsed = _parse_shift_results(response)
-    pref_parsed = _parse_preferences(response, req.schema)
-    
     result: Dict[str, Any] = {}
-    if shift_parsed:
-        result["shift"] = shift_parsed
+    if final_shift_map:
+        # 반환 형식은 기존과 호환되도록 shift_parsed 형태로
+        result["shift"] = {}
+        for day, info in final_shift_map.items():
+            shift = list(info.keys())[0] if isinstance(info, dict) else "D"  # 임시
+            # 실제로는 shift_parsed 형식으로 변환 필요시 별도 처리
+            # 현재는 프론트가 shift_results 형태 기대 → 기존 _parse_shift_results(response) 반환
+        result["shift"] = shift_parsed  # 프론트 호환 위해 기존 반환
+    
+    pref_parsed = _parse_preferences(response, req.schema)
     if pref_parsed:
         result["preference"] = pref_parsed
+    
     if not result:
         result = ["근무 희망사항이 없습니다."]
+    
     print("그래프 실행 및 DB 저장을 완료했습니다.")
     return result
 

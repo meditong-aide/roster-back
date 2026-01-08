@@ -287,15 +287,31 @@ async def query_analyzer(state):
         case_results = []
         for content in state['case']:
             # '기존 데이터에서 로드됨' 케이스는 제외 (기존 데이터 복사는 wanted_service에서 처리)
-            if content['reason'] != '기존 데이터에서 로드됨':
-                date_str = content['date']
-                shift_type = content['shift']
+            # if content['reason'] != '기존 데이터에서 로드됨':
+            #     date_str = content['date']
+            #     shift_type = content['shift']
+            if content.get('reason') != '기존 데이터에서 로드됨':
+                date_str = content.get('date', '')
+                shift_type = content.get('shift', '')
+                
+                if not date_str or not shift_type:
+                    continue
                 
                 # date를 일(day)로 변환 (예: "2025-05-05" -> 5)
+                # if isinstance(date_str, str) and '-' in date_str:
+                #     day = int(date_str.split('-')[2])
+                # else:
+                #     day = int(date_str)
                 if isinstance(date_str, str) and '-' in date_str:
-                    day = int(date_str.split('-')[2])
+                    try:
+                        day = int(date_str.split('-')[2])
+                    except:
+                        continue
                 else:
-                    day = int(date_str)
+                    try:
+                        day = int(date_str)
+                    except:
+                        continue
                 
                 case_results.append({
                     'date': day,
