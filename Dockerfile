@@ -23,8 +23,7 @@ ENV ENV=${ENV} \
     ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
     OPENAI_API_KEY=${OPENAI_API_KEY} \
     PYTHONUNBUFFERED=1 \
-    PORT=8000 \
-    ROLE=api
+    PORT=8000
 
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
