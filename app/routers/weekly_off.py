@@ -88,7 +88,7 @@ async def get_my_weekly_off(
     return get_my_weekly_off_service(
         year=year, 
         month=month, 
-        current_user=current_user, 
+        user=current_user, 
         db=db,
         target_nurse_id=nurse_id # 추가인자
     )

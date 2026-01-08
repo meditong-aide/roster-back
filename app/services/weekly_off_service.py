@@ -419,6 +419,16 @@ def get_my_weekly_off_service(
 
     else:
         # 본인 조회
+        if is_master_admin:
+            # 관리자는 본인 주휴 없음 → 빈 결과 반환하거나 에러
+            return MyWeeklyOffResponse(
+                year=year,
+                month=month,
+                my_weekly_off_dates=[],
+                my_weekly_off_weekday=None,
+                my_weekly_off_label=None
+            )
+        
         nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
         if not nurse:
             raise HTTPException(status_code=404, detail="Nurse not found")
