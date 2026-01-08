@@ -1,5 +1,5 @@
 from typing import List, Optional
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from fastapi import HTTPException
@@ -10,7 +10,8 @@ from schemas.weekly_off_schema import (
     WeeklyOffSettingResponse,
     WeeklyOffNurseUpdatePayload,
     WeeklyOffNurseListResponse,
-    NurseWeeklyOffItem
+    NurseWeeklyOffItem,
+    MyWeeklyOffResponse
 )
 from schemas.auth_schema import User as UserSchema
 
@@ -319,4 +320,64 @@ def update_nurses_weekly_off_service(
     }
 
 
-
+def get_my_weekly_off_service(
+    year: int,
+    month: int,
+    user: UserSchema,
+    db: Session
+) -> MyWeeklyOffResponse:
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
+    if not nurse:
+        raise HTTPException(status_code=404, detail="Nurse not found")
+    
+    setting = db.query(WeeklyOffSetting).filter(
+        WeeklyOffSetting.group_id == user.group_id
+    ).first()
+    
+    if not nurse.weekly_off_enabled or nurse.weekly_off_weekday is None:
+        return MyWeeklyOffResponse(
+            year=year,
+            month=month,
+            my_weekly_off_dates=[],
+            my_weekly_off_weekday=None,
+            my_weekly_off_label=None
+        )
+    
+    preview_weekday = nurse.weekly_off_weekday  # 기본값
+    if setting and setting.use_variable_cycle:
+        # 변동 계산 로직 (기존과 동일)
+        if setting.cycle_type == 'month' and setting.base_year and setting.base_month:
+            preview_weekday = calc_weekly_off_weekday_by_month(
+                base_weekday=nurse.weekly_off_weekday,
+                shift_variation=setting.shift_variation,
+                base_year=setting.base_year,
+                base_month=setting.base_month,
+                target_year=year,
+                target_month=month
+            )
+        elif setting.cycle_type == 'week' and setting.cycle_start_date:
+            target_date = date(year, month, 1)
+            preview_weekday = calc_weekly_off_weekday_by_week(
+                base_weekday=nurse.weekly_off_weekday,
+                shift_variation=setting.shift_variation,
+                cycle_start_date=setting.cycle_start_date,
+                target_date=target_date,
+                cycle_interval_weeks=setting.cycle_interval
+            )
+    
+    dates = []
+    current = date(year, month, 1)
+    while current.month == month:
+        if current.weekday() == preview_weekday:
+            dates.append(current.isoformat())
+        current += timedelta(days=1)
+    
+    dates.sort()
+    
+    return MyWeeklyOffResponse(
+        year=year,
+        month=month,
+        my_weekly_off_dates=dates,
+        my_weekly_off_weekday=preview_weekday,
+        my_weekly_off_label=get_weekday_label(preview_weekday)
+    )

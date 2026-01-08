@@ -51,5 +51,9 @@ class NurseWeeklyOffUpdateItem(BaseModel):
 class WeeklyOffNurseUpdatePayload(BaseModel):
     items: List[NurseWeeklyOffUpdateItem]
 
-
-
+class MyWeeklyOffResponse(BaseModel):
+    year: int
+    month: int
+    my_weekly_off_dates: List[str] = []        # ["2027-08-03", "2027-08-10", ...]
+    my_weekly_off_weekday: Optional[int] = None  # 0~6 (월~일)
+    my_weekly_off_label: Optional[str] = None    # "목"

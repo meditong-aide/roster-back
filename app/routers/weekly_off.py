@@ -15,7 +15,8 @@ from services.weekly_off_service import (
     get_weekly_off_settings_service,
     update_weekly_off_settings_service,
     get_nurses_weekly_off_service,
-    update_nurses_weekly_off_service
+    update_nurses_weekly_off_service,
+    get_my_weekly_off_service
 )
 
 router = APIRouter(
@@ -73,4 +74,14 @@ async def update_nurses_weekly_off(
     return update_nurses_weekly_off_service(payload, current_user, db, group_id)
 
 
-
+@router.get("/my")
+async def get_my_weekly_off(
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    로그인한 간호사 본인의 주휴일정만 조회
+    """
+    return get_my_weekly_off_service(year, month, current_user, db)
