@@ -51,6 +51,8 @@ def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
 # 핵심 워커 실행
 # =========================================================
 def main():
+    print("ENV KEYS:", os.environ.keys())
+    print("JOB_JSON RAW:", os.getenv("JOB_JSON"))
     job_json = os.getenv("JOB_JSON")
     if not job_json:
         print("[worker] JOB_JSON 환경변수가 없습니다", file=sys.stderr)
