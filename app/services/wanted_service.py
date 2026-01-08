@@ -451,36 +451,216 @@ def _copy_existing_requests_to_new(
     return shift_count, pair_count
 
 
+# async def invoke_and_persist_wanted_service(
+#     req: WantedInvokeRequest,
+#     current_user: UserSchema,
+#     db: Session,
+# ) -> Dict[str, Any]:
+#     """Wanted 그래프 실행 후 결과를 신규 테이블에 저장하고, 기존 응답 구조를 반환합니다.
+
+#     인자:
+#         req: WantedInvokeRequest (프론트 입력과 동일)
+#         current_user: 현재 로그인 사용자 (간호사)
+#         db: DB 세션
+
+#     반환:
+#         Dict: 기존 라우터가 반환하던 구조와 호환되는 응답
+
+#     예시:
+#         입력: request="5/5 OFF, 5/6 E", year=2025, month=9
+#         처리: wanted_requests 1건 + nurse_shift_requests N건 + nurse_pair_requests M건 저장
+        
+#     Notes:
+#         - case가 있으면: 기존 데이터 복사 + case_results 추가
+#         - case가 없으면: LLM 결과만 저장 (원래 동작)
+#     """
+#     print("그래프 실행 및 DB 저장을 시작합니다.")
+
+#     nurse_id = current_user.nurse_id
+#     print('request:', req.__dict__)
+#     month_str = _yyyymm(req.year, req.month)
+
+#     # 추가: 허용 근무코드 조회
+#     allowed_shifts_query = db.query(Shift.shift_id).filter(
+#         Shift.group_id == current_user.group_id,
+#         Shift.show_in_preference == True
+#     ).all()
+#     allowed_shifts_list = [row[0] for row in allowed_shifts_query]
+#     allowed_shifts_str = ", ".join(allowed_shifts_list) if allowed_shifts_list else "없음"
+#     print(f"허용 근무 코드: {allowed_shifts_str}")
+    
+#     # ======================================================================
+#     # case 여부 확인
+#     # ======================================================================
+#     original_has_case = req.case is not None and len(req.case) > 0
+#     has_case = original_has_case
+#     print(f'original has_case: {original_has_case}')
+
+#     # ======================================================================
+#     # 0. case 없으면 과거 데이터 자동 로드 (기존 선택 유지)
+#     # ======================================================================
+#     if not has_case:
+#         print("case 없음 -> 과거 최신 데이터 자동 로드 시도")
+#         latest_wr = (
+#             db.query(WantedRequest)
+#             .filter(
+#                 WantedRequest.nurse_id == nurse_id,
+#                 WantedRequest.month == month_str,
+#             )
+#             .order_by(WantedRequest.created_at.desc())
+#             .first()
+#         )
+        
+#         if latest_wr:
+#             print(f"과거 데이터 발견 (request_id={latest_wr.request_id}) -> 자동 case로 설정")
+#             shift_rows = (
+#                 db.query(NurseShiftRequest)
+#                 .filter(
+#                     NurseShiftRequest.nurse_id == nurse_id,
+#                     NurseShiftRequest.request_id == latest_wr.request_id
+#                 )
+#                 .all()
+#             )
+            
+#             auto_case = [
+#                 {
+#                     "date": str(row.shift_date),
+#                     "shift": row.shift
+#                 }
+#                 for row in shift_rows
+#             ]
+            
+#             req.case = auto_case
+#             has_case = True
+#             print(f"자동 case 생성 완료 ({len(auto_case)}개 항목)")
+#         else:
+#             print("과거 데이터 없음 -> 완전 새로 생성")
+
+#     # ======================================================================
+#     # 1. 그래프 실행 (case 포함)
+#     # ======================================================================
+#     try:
+#         response = await graph_service.invoke(
+#             request=req.request,
+#             schema=req.schema,
+#             case=req.case,  # 자동 case 포함
+#             year=req.year,
+#             month=req.month,
+#             allowed_shifts=allowed_shifts_str
+#         )
+#     except Exception as e:
+#         print(f"graph_service.invoke 오류: {e}")
+#         traceback.print_exc()
+#         raise e
+
+#     # ======================================================================
+#     # 2. 새 wanted_request 생성
+#     # ======================================================================
+#     new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
+#     print(f'new_request_id, {new_request_id}')
+
+#     # ======================================================================
+#     # 3. 최종 데이터 병합 및 저장 (기존 선택 + 새 AIDE 추천)
+#     # ======================================================================
+#     final_shift_map = {}
+
+#     # 1. 기존 선택 (case) 먼저 넣기
+#     if has_case:
+#         print("기존 선택(case) 데이터 병합 시작")
+#         for item in req.case:
+#             date_str = item.get('date', '')
+#             shift_type = item.get('shift', '')
+#             if not date_str or not shift_type:
+#                 continue
+            
+#             if '-' in date_str:
+#                 day = int(date_str.split('-')[2])
+#             else:
+#                 day = int(date_str)
+            
+#             final_shift_map[day] = {
+#                 'score': 1.0,
+#                 'request': '기존 선택 유지'
+#             }
+
+#     # 2. AIDE 새 추천 결과 병합 (새 요청 우선)
+#     shift_parsed = _parse_shift_results(response)
+#     print(f'AIDE 추천 결과: {shift_parsed}')
+    
+#     if shift_parsed:
+#         for shift_id, days_info in shift_parsed.items():
+#             for day, info in days_info.items():
+#                 final_shift_map[day] = {
+#                     'score': info.get('score', 1.0),
+#                     'request': info.get('request', 'AIDE 추천')
+#                 }
+    
+#     print(f"최종 병합 결과 (shift_map): {final_shift_map}")
+
+#     # 3. 최종 데이터 저장
+#     if final_shift_map:
+#         _persist_shift_results(
+#             db=db,
+#             nurse_id=nurse_id,
+#             request_id=new_request_id,
+#             year=req.year,
+#             month=req.month,
+#             month_str=month_str,
+#             shift_map=final_shift_map
+#         )
+
+#     # 인원 선호도 처리 (기존 로직 유지)
+#     try:
+#         pref_parsed = _parse_preferences(response, req.schema)
+#         if pref_parsed:
+#             _persist_pair_results(
+#                 db=db,
+#                 nurse_id=nurse_id,
+#                 request_id=new_request_id,
+#                 month_str=month_str,
+#                 pairs=pref_parsed,
+#             )
+#     except Exception as e:
+#         print(f"pref_parsed 파싱 오류: {e}")
+#         raise e
+
+#     # ======================================================================
+#     # 5. 결과 반환
+#     # ======================================================================
+#     result: Dict[str, Any] = {}
+#     if final_shift_map:
+#         # 반환 형식은 기존과 호환되도록 shift_parsed 형태로
+#         result["shift"] = {}
+#         for day, info in final_shift_map.items():
+#             shift = list(info.keys())[0] if isinstance(info, dict) else "D"  # 임시
+#             # 실제로는 shift_parsed 형식으로 변환 필요시 별도 처리
+#             # 현재는 프론트가 shift_results 형태 기대 → 기존 _parse_shift_results(response) 반환
+#         result["shift"] = shift_parsed  # 프론트 호환 위해 기존 반환
+    
+#     pref_parsed = _parse_preferences(response, req.schema)
+#     if pref_parsed:
+#         result["preference"] = pref_parsed
+    
+#     if not result:
+#         result = ["근무 희망사항이 없습니다."]
+    
+#     print("그래프 실행 및 DB 저장을 완료했습니다.")
+#     return result
+
+
 async def invoke_and_persist_wanted_service(
     req: WantedInvokeRequest,
     current_user: UserSchema,
     db: Session,
 ) -> Dict[str, Any]:
-    """Wanted 그래프 실행 후 결과를 신규 테이블에 저장하고, 기존 응답 구조를 반환합니다.
-
-    인자:
-        req: WantedInvokeRequest (프론트 입력과 동일)
-        current_user: 현재 로그인 사용자 (간호사)
-        db: DB 세션
-
-    반환:
-        Dict: 기존 라우터가 반환하던 구조와 호환되는 응답
-
-    예시:
-        입력: request="5/5 OFF, 5/6 E", year=2025, month=9
-        처리: wanted_requests 1건 + nurse_shift_requests N건 + nurse_pair_requests M건 저장
-        
-    Notes:
-        - case가 있으면: 기존 데이터 복사 + case_results 추가
-        - case가 없으면: LLM 결과만 저장 (원래 동작)
-    """
+    """Wanted 그래프 실행 후 결과를 신규 테이블에 저장하고, 기존 응답 구조를 반환합니다."""
     print("그래프 실행 및 DB 저장을 시작합니다.")
 
     nurse_id = current_user.nurse_id
     print('request:', req.__dict__)
     month_str = _yyyymm(req.year, req.month)
 
-    # 추가: 허용 근무코드 조회
+    # 허용 근무코드 조회
     allowed_shifts_query = db.query(Shift.shift_id).filter(
         Shift.group_id == current_user.group_id,
         Shift.show_in_preference == True
@@ -562,6 +742,11 @@ async def invoke_and_persist_wanted_service(
     # ======================================================================
     # 3. 최종 데이터 병합 및 저장 (기존 선택 + 새 AIDE 추천)
     # ======================================================================
+    # shift_parsed를 기존 형식으로 변환: {shift_id: {day: {score, request}}}
+    shift_parsed = _parse_shift_results(response)
+    print(f'AIDE 추천 결과 (shift_parsed): {shift_parsed}')
+
+    # 최종 저장용 shift_map 생성 (기존 선택 + 새 추천)
     final_shift_map = {}
 
     # 1. 기존 선택 (case) 먼저 넣기
@@ -573,29 +758,32 @@ async def invoke_and_persist_wanted_service(
             if not date_str or not shift_type:
                 continue
             
-            if isinstance(date_str, str) and '-' in date_str:
+            if '-' in date_str:
                 day = int(date_str.split('-')[2])
             else:
                 day = int(date_str)
             
-            final_shift_map[day] = {
+            # 기존 선택은 score 1.0, request '기존 선택 유지'
+            if shift_type not in final_shift_map:
+                final_shift_map[shift_type] = {}
+            final_shift_map[shift_type][day] = {
                 'score': 1.0,
                 'request': '기존 선택 유지'
             }
 
-    # 2. AIDE 새 추천 결과 병합 (새 요청 우선)
-    shift_parsed = _parse_shift_results(response)
-    print(f'AIDE 추천 결과: {shift_parsed}')
-    
+    # 2. AIDE 새 추천 결과 병합 (새 요청 우선 → 덮어쓰기)
     if shift_parsed:
-        for shift_id, days_info in shift_parsed.items():
-            for day, info in days_info.items():
-                final_shift_map[day] = {
+        for shift_id, days_dict in shift_parsed.items():
+            if shift_id not in final_shift_map:
+                final_shift_map[shift_id] = {}
+            for day_str, info in days_dict.items():
+                day = int(day_str)
+                final_shift_map[shift_id][day] = {
                     'score': info.get('score', 1.0),
                     'request': info.get('request', 'AIDE 추천')
                 }
-    
-    print(f"최종 병합 결과 (shift_map): {final_shift_map}")
+
+    print(f"최종 병합 결과 (final_shift_map): {final_shift_map}")
 
     # 3. 최종 데이터 저장
     if final_shift_map:
@@ -625,23 +813,15 @@ async def invoke_and_persist_wanted_service(
         raise e
 
     # ======================================================================
-    # 5. 결과 반환
+    # 5. 결과 반환 (프론트 호환을 위해 기존 shift_parsed 반환)
     # ======================================================================
     result: Dict[str, Any] = {}
-    if final_shift_map:
-        # 반환 형식은 기존과 호환되도록 shift_parsed 형태로
-        result["shift"] = {}
-        for day, info in final_shift_map.items():
-            shift = list(info.keys())[0] if isinstance(info, dict) else "D"  # 임시
-            # 실제로는 shift_parsed 형식으로 변환 필요시 별도 처리
-            # 현재는 프론트가 shift_results 형태 기대 → 기존 _parse_shift_results(response) 반환
-        result["shift"] = shift_parsed  # 프론트 호환 위해 기존 반환
-    
+    result["shift"] = shift_parsed  # 프론트가 기대하는 기존 형식 반환
     pref_parsed = _parse_preferences(response, req.schema)
     if pref_parsed:
         result["preference"] = pref_parsed
     
-    if not result:
+    if not result.get("shift") and not result.get("preference"):
         result = ["근무 희망사항이 없습니다."]
     
     print("그래프 실행 및 DB 저장을 완료했습니다.")
