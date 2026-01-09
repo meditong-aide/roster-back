@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from db.client2 import get_db
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
-from services.job_status_service import get_job_record, get_latest_job_record
+from services.job_status_service import get_latest_job_record
 
 router = APIRouter(tags=["jobs"])
 
