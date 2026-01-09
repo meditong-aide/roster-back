@@ -73,6 +73,8 @@ class Nurse(Base):
     phone_number = Column(VARCHAR(20), nullable=True)
     gender = Column(VARCHAR(3), nullable=True)
     is_weekend_off = Column(BOOLEAN, default=False)
+    # 추가
+    work_shifts = Column(JSON, nullable=True, default=list, server_default='[]')
     
     group = relationship("Group")
     __table_args__ = (
@@ -132,6 +134,13 @@ class Shift(Base):
     default_shift = Column(VARCHAR(10), nullable=True)  # 기본 근무코드
     is_weekly_off = Column(TINYINT, nullable=False, default=0)  # 주휴 여부
     id = Column(INTEGER, primary_key=True, nullable=False, autoincrement=True)
+    # DB에서 BIT 타입이라 BOOLEAN으로 매핑
+    show_in_preference = Column(
+        BOOLEAN,
+        nullable=False,
+        server_default="0" , # MSSQL에서 0 (False)
+        default=False
+    )
 
     office = relationship("Office")
     group = relationship("Group")

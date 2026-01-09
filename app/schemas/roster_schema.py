@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, ValidationInfo
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import StrEnum
@@ -44,6 +44,8 @@ class ShiftUpdateRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     id: int
+    # 추가
+    show_in_preference: Optional[bool] = None # None이면 기존 값 유지
 
 class ShiftAddRequest(BaseModel):
     """시프트 등록 요청 모델."""
@@ -62,6 +64,8 @@ class ShiftAddRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     # id: int
+    # 추가 내역
+    show_in_preference: Optional[bool] = False # 기본 False, 프론트에서 안 보내면 자동 숨김
 
 class RosterRequest(BaseModel):
     """근무표 생성 요청(임시: UI 미구현 상태에서 req로 정책 파라미터를 주입하기 위한 모델).
@@ -185,6 +189,25 @@ class NurseProfile(BaseModel):
     phone_number: Optional[str] = None
     age: Optional[int] = None # 나이
     gender: Optional[str] = None
+    # 추가
+    team_id: Optional[int] = None
+    is_weekend_off: bool = Field(default=False)  # 주말 휴무 여부
+    # 추가
+    work_shifts: Optional[List[str]] = Field(
+        default_factory=list,
+        description="근무 가능 형태 배열. 예: ['D', 'E2', 'N1', 'MD'] 또는 ['D', 'N']"
+    )
+    
+    @field_validator('fixed_shift')
+    @classmethod
+    def check_fixed_shift_with_weekend_off(cls, v: Any, info: ValidationInfo) -> Any:
+        # info.data 에서 이미 검증된 다른 필드 값들을 가져옴
+        is_weekend_off = info.data.get('is_weekend_off', False) if info.data else False
+        if not is_weekend_off:
+            return None  # 주말 휴무 미적용 시 fixed_shift는 None으로 강제
+        if v in ('M', 'D', None, ''):
+            return None if v in ('', None) else v
+        raise ValueError('fixed_shift는 주말 휴무 적용 시 "M", "D" 또는 없음만 가능합니다.')
 
     class Config:
         from_attributes = True
@@ -209,3 +232,7 @@ class ScheduleMemoUpdate(BaseModel):
     schedule_id: str
     memo: str | None = None
     group_id: str | None = None 
+
+class IntegratedRegisterRequest(BaseModel):
+    group_id: str
+    members: List[Dict[str, Any]]  # 한국어 키로 입력

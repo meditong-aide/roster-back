@@ -155,6 +155,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                     "shift_gb": getattr(s, "shift_gb", None),
                     "default_shift": getattr(s, "default_shift", s.shift_id),
                     "id": getattr(s, "id", None),
+                    # 추가
+                    "show_in_preference": s.show_in_preference, # True/False 또는 1/0
                 }
                 for s in shifts
             ]
@@ -189,6 +191,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 sequence=seq,
                 default_shift=default_shift,
                 shift_gb=shift_gb,
+                # 추가
+                show_in_preference=True if shift_id in ["D","E","N","O"] else False # 기본 4개만 노출
             )
         defaults = [
             # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence, default_shift, shift_gb
@@ -233,6 +237,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 "shift_gb": getattr(s, "shift_gb", None),
                 "default_shift": getattr(s, "default_shift", s.shift_id),
                 "id": getattr(s, "id", None),
+                # 추가
+                "show_in_preference": s.show_in_preference,
             }
             for s in shifts
         ]

@@ -4,7 +4,7 @@ class GraphService:
     def __init__(self):
         self._graph = GraphGenerate()
 
-    async def invoke(self, request: str | list[str], schema: str, case: object | None, year: int, month: int):
+    async def invoke(self, request: str | list[str], schema: str, case: object | None, year: int, month: int, allowed_shifts: str = None):
         """
         주어진 요청과 스키마로 그래프를 실행합니다.
 
@@ -15,13 +15,15 @@ class GraphService:
         Returns:
             dict: 그래프 실행 결과
         """
-        print(f'year1: {year}, month1: {month}')
+        print(f'year1: {year}, month1: {month}, allowed_shifts: {allowed_shifts}')
         response = await self._graph.ainvoke({
             "request": request,
             "schema": schema,
             "case": case,
             "year": year,
-            "month": month
+            "month": month,
+            # 추가 반영
+            "allowed_shifts":allowed_shifts
         })     
         response = [response['shift_results'], response['preference_results']]
         print('degug: 3', response)
