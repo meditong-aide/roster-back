@@ -73,6 +73,8 @@ class Nurse(Base):
     phone_number = Column(VARCHAR(20), nullable=True)
     gender = Column(VARCHAR(3), nullable=True)
     is_weekend_off = Column(BOOLEAN, default=False)
+    # 추가
+    work_shifts = Column(JSON, nullable=True, default=list, server_default='[]')
     
     group = relationship("Group")
     __table_args__ = (

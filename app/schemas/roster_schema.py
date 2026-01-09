@@ -192,6 +192,11 @@ class NurseProfile(BaseModel):
     # 추가
     team_id: Optional[int] = None
     is_weekend_off: bool = Field(default=False)  # 주말 휴무 여부
+    # 추가
+    work_shifts: Optional[List[str]] = Field(
+        default_factory=list,
+        description="근무 가능 형태 배열. 예: ['D', 'E2', 'N1', 'MD'] 또는 ['D', 'N']"
+    )
     
     @field_validator('fixed_shift')
     @classmethod
