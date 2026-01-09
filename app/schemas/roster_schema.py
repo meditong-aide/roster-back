@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import StrEnum
@@ -192,6 +192,15 @@ class NurseProfile(BaseModel):
     # 추가
     team_id: Optional[int] = None
     is_weekend_off: bool = Field(default=False)  # 주말 휴무 여부
+    
+    @field_validator('fixed_shift')
+    def check_fixed_shift_with_weekend_off(cls, v, values):
+        is_weekend_off = values.get('is_weekend_off', False)
+        if not is_weekend_off:
+            return None  # 미적용 시 무조건 None
+        if v in ('M', 'D', None, ''):
+            return None if v in ('', None) else v
+        raise ValueError('fixed_shift는 주말 휴무 적용 시 "M", "D" 또는 없음만 가능합니다.')
 
     class Config:
         from_attributes = True
@@ -216,3 +225,7 @@ class ScheduleMemoUpdate(BaseModel):
     schedule_id: str
     memo: str | None = None
     group_id: str | None = None 
+
+class IntegratedRegisterRequest(BaseModel):
+    group_id: str
+    members: List[Dict[str, Any]]  # 한국어 키로 입력
