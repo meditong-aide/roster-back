@@ -191,6 +191,7 @@ class NurseProfile(BaseModel):
     gender: Optional[str] = None
     # 추가
     team_id: Optional[int] = None
+    is_weekend_off: bool = Field(default=False)  # 주말 휴무 여부
 
     class Config:
         from_attributes = True

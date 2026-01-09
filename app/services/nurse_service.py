@@ -144,6 +144,8 @@ def get_nurses_in_group_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
+            # 추가
+            "is_weekend_off": nurse.is_weekend_off,
         }
         result.append(nurse_dict)
     
@@ -264,6 +266,8 @@ def get_nurses_filtered_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
+            # 추가
+            "is_weekend_off": nurse.is_weekend_off,
         }
         result.append(nurse_dict)
     
