@@ -97,5 +97,6 @@ def get_latest_job_status(
         progress=job.progress,
         result_roster_id=job.result_roster_id,
         error_message=job.error_message,
+        updated_at=job.updated_at,
     )
 
