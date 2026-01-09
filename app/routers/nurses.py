@@ -11,7 +11,7 @@ import os
 from db.client2 import get_db
 from db.models import Nurse as NurseModel
 from db.models import Office as OfficeModel
-from schemas.roster_schema import NurseProfile, MoveNurseRequest
+from schemas.roster_schema import NurseProfile, MoveNurseRequest, IntegratedRegisterRequest
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import ExcelValidationRequest, NurseSequenceUpdate, ReorderPayload, ExcelConfirmRequest
@@ -34,6 +34,7 @@ from services.excel_service import (
     upload2_validate,
     upload2_confirm,
     export_members_excel_bytes,
+    integrated_member_and_nurse_register,
 )
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse, Response
@@ -261,20 +262,60 @@ async def upload2_validate_endpoint(
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
 
 
+# @router.post("/upload2-confirm")
+# async def upload2_confirm_endpoint(
+#     payload: Upload2ConfirmRequest,
+#     current_user: UserSchema = Depends(get_current_user_from_cookie),
+#     db: Session = Depends(get_db)
+# ):
+#     """업로드2 - 검증 통과 후 저장. 오류가 있는 행은 건너뜀."""
+#     try:
+#         # if not current_user or not current_user.is_master_admin:
+#         #     raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
+#         target_group_id = payload.group_id or current_user.group_id
+#         result = upload2_confirm(payload.rows, current_user, db, target_group_id)
+#         return result
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
+
+
 @router.post("/upload2-confirm")
 async def upload2_confirm_endpoint(
     payload: Upload2ConfirmRequest,
+    group_id: str = Query(..., description="대상 병동 group_id (필수)"),  # ← 반드시 URL에 ?group_id=... 포함
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """업로드2 - 검증 통과 후 저장. 오류가 있는 행은 건너뜀."""
     try:
-        # if not current_user or not current_user.is_master_admin:
-        #     raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
-        target_group_id = payload.group_id or current_user.group_id
+        print(f"[DEBUG] 라우터 - 받은 쿼리 group_id: {group_id}")
+        print(f"[DEBUG] current_user: nurse_id={current_user.nurse_id}, "
+              f"group_id={getattr(current_user, 'group_id', '없음')}, "
+              f"is_master_admin={current_user.is_master_admin}")
+
+        # 1. 쿼리 파라미터가 있으면 무조건 그걸 우선 사용 (가장 안전)
+        target_group_id = group_id
+
+        # 2. 만약 쿼리가 비어있으면 (미래 안전장치) current_user fallback
+        if not target_group_id:
+            target_group_id = getattr(current_user, 'group_id', None)
+
+        # 3. 그래도 없으면 → 에러
+        if not target_group_id:
+            raise HTTPException(
+                status_code=400,
+                detail="group_id가 필요합니다. URL에 ?group_id=... 를 반드시 포함해주세요."
+            )
+
+        # ADM인 경우: group_id가 쿼리로 왔는지 로그로 확인 (디버깅용)
+        if current_user.is_master_admin:
+            print(f"[ADM 모드] 관리자 업로드 - 선택된 병동 group_id: {target_group_id}")
+
         result = upload2_confirm(payload.rows, current_user, db, target_group_id)
         return result
+
     except Exception as e:
+        print(f"[ERROR] upload2-confirm 엔드포인트 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
 
 
@@ -345,3 +386,27 @@ async def confirm_upload(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 저장 실패: {str(e)}") 
+
+
+@router.post("/integrated-register")
+async def integrated_register(
+    payload: IntegratedRegisterRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    직접 입력으로 신규 직원 계정 생성 + 근무자 등록 (통합)
+    """
+    try:
+        if not current_user.is_master_admin:
+            raise HTTPException(status_code=403, detail="관리자 권한 필요")
+
+        result = integrated_member_and_nurse_register(
+            payload.members,
+            current_user,
+            db,
+            payload.group_id  # 프론트에서 반드시 보내야 함
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"통합 등록 실패: {str(e)}")

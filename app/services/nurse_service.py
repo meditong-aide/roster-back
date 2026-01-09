@@ -146,6 +146,7 @@ def get_nurses_in_group_service(
             "gender": nurse.gender,
             # 추가
             "is_weekend_off": nurse.is_weekend_off,
+            "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
         }
         result.append(nurse_dict)
     
@@ -268,6 +269,7 @@ def get_nurses_filtered_service(
             "gender": nurse.gender,
             # 추가
             "is_weekend_off": nurse.is_weekend_off,
+            "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
         }
         result.append(nurse_dict)
     
