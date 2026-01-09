@@ -189,6 +189,8 @@ class NurseProfile(BaseModel):
     phone_number: Optional[str] = None
     age: Optional[int] = None # 나이
     gender: Optional[str] = None
+    # 추가
+    team_id: Optional[int] = None
 
     class Config:
         from_attributes = True
