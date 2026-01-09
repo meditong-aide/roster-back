@@ -592,14 +592,6 @@ def bulk_update_nurses_service(
 
             # 변경된 필드만 추출
             update_data = profile.dict(exclude_unset=True)
-            
-            # === DEBUG: 어떤 nurse_id가 업데이트되는지 + work_shifts 값 확인 ===
-            print(f"[DEBUG] Updating nurse_id={profile.nurse_id} ({db_nurse.name if db_nurse.name else 'No name'})")
-            if 'work_shifts' in update_data:
-                print(f"[DEBUG] work_shifts received: {update_data['work_shifts']} (type: {type(update_data['work_shifts'])})")
-            else:
-                print(f"[DEBUG] work_shifts NOT in update_data (keys: {list(update_data.keys())})")
-            # ==================================================
 
             # active 변경 시 sequence 자동 조정
             old_active = db_nurse.active
