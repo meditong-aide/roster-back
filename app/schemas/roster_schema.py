@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ValidationInfo
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import StrEnum
@@ -194,10 +194,12 @@ class NurseProfile(BaseModel):
     is_weekend_off: bool = Field(default=False)  # 주말 휴무 여부
     
     @field_validator('fixed_shift')
-    def check_fixed_shift_with_weekend_off(cls, v, values):
-        is_weekend_off = values.get('is_weekend_off', False)
+    @classmethod
+    def check_fixed_shift_with_weekend_off(cls, v: Any, info: ValidationInfo) -> Any:
+        # info.data 에서 이미 검증된 다른 필드 값들을 가져옴
+        is_weekend_off = info.data.get('is_weekend_off', False) if info.data else False
         if not is_weekend_off:
-            return None  # 미적용 시 무조건 None
+            return None  # 주말 휴무 미적용 시 fixed_shift는 None으로 강제
         if v in ('M', 'D', None, ''):
             return None if v in ('', None) else v
         raise ValueError('fixed_shift는 주말 휴무 적용 시 "M", "D" 또는 없음만 가능합니다.')
