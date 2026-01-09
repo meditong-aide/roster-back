@@ -97,17 +97,49 @@ def update_job_record(
     return job
 
 
-def get_job_record(db: Session, job_id: str) -> Optional[RosterJob]:
+# def get_job_record(db: Session, job_id: str) -> Optional[RosterJob]:
+#     """
+#     Job 레코드를 조회한다.
+
+#     인자:
+#         db: DB 세션.
+#         job_id: 작업 식별자.
+#     반환:
+#         RosterJob | None: 조회 결과.
+#     예시:
+#         job_id="job-123" → 상태/결과 반환.
+#     """
+#     return db.query(RosterJob).filter(RosterJob.job_id == job_id).first()
+
+
+def get_latest_job_record(
+    db: Session,
+    *,
+    office_id: Optional[str],
+    group_id: Optional[str],
+    nurse_id: Optional[str],
+) -> Optional[RosterJob]:
     """
-    Job 레코드를 조회한다.
+    office/group/nurse 기준으로 가장 최신 Job 레코드를 조회한다.
 
     인자:
         db: DB 세션.
-        job_id: 작업 식별자.
+        office_id: 병원 ID.
+        group_id: 그룹/병동 ID.
+        nurse_id: 요청 간호사 ID.
     반환:
         RosterJob | None: 조회 결과.
     예시:
-        job_id="job-123" → 상태/결과 반환.
+        최신 생성 요청의 상태 확인 용도.
     """
-    return db.query(RosterJob).filter(RosterJob.job_id == job_id).first()
+    query = (
+        db.query(RosterJob)
+        .filter(
+            RosterJob.office_id == office_id,
+            RosterJob.group_id == group_id,
+            RosterJob.nurse_id == nurse_id,
+        )
+        .order_by(RosterJob.created_at.desc())
+    )
+    return query.first()
 
