@@ -1682,6 +1682,24 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     print('invalid', [n.__dict__ for n in invalid])
     if invalid:
         raise HTTPException(status_code=400, detail="주말 휴무 true만 고정 shift설정이 가능하다")
+    month_start = date(req.year, req.month, 1)
+    days_in_month = calendar.monthrange(req.year, req.month)[1]
+    active_range_candidates = {
+        str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
+        for n in engine_nurses
+    }
+    excluded_engine_nurses = [
+        n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is None
+    ]
+    if excluded_engine_nurses:
+        excluded_names = [
+            f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')})"
+            for n in excluded_engine_nurses
+        ]
+        print(f"[JoinDate] 대상 월 기준 활동 불가 간호사 제외: {excluded_names}")
+    engine_nurses = [
+        n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is not None
+    ]
     engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
     preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
     nurses_for_engine = engine_nurses
@@ -1710,8 +1728,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     weekly_off_conflicts: list[dict] = []
     weekly_off_map: dict[str, set[int]] = {}
     weekly_off_fixed_cells: list[dict] = []
-    month_start = date(req.year, req.month, 1)
-    days_in_month = calendar.monthrange(req.year, req.month)[1]
     active_range_map = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in nurses_for_engine
