@@ -25,8 +25,17 @@ from services.roster_create_service import generate_roster_service
 # =========================================================
 def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
     """
-    워커에선 쿠키가 없으므로, nurse_id로 Nurse를 조회해 UserSchema를 구성.
-    generate_roster_service가 요구하는 필드를 맞춰 반환.
+    nurse_id로 간호사를 조회해 생성 엔진이 필요한 최소 UserSchema를 구성한다.
+
+    인자:
+        db: DB 세션.
+        nurse_id: 간호사 ID.
+    반환:
+        UserSchema: 엔진 실행에 필요한 필드만 채운 사용자 정보.
+    예외:
+        RuntimeError: 대상 간호사가 없을 때.
+    예시:
+        nurse_id="438390" → office_id, group_id, is_head_nurse 포함한 스키마 반환.
     """
     nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse:
@@ -38,6 +47,7 @@ def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
     is_head_nurse = getattr(nurse, "is_head_nurse", False)
     name = getattr(nurse, "name", "")
 
+    # 엔진에 불필요한 필드는 기본값으로 채워 ValidationError만 방지한다.
     return UserSchema(
         nurse_id=nurse.nurse_id,
         account_id=nurse.account_id,
@@ -45,6 +55,12 @@ def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
         group_id=group_id,
         is_head_nurse=is_head_nurse,
         name=name,
+        mb_part=getattr(nurse, "mb_part", "") or "",
+        office_name=getattr(getattr(nurse, "group", None), "office_name", "") or getattr(nurse, "office_name", "") or "",
+        mb_part_name=getattr(nurse, "mb_part_name", "") or "",
+        gw_useYN=str(getattr(nurse, "gw_useYN", "") or "N"),
+        qpis_useYN=str(getattr(nurse, "qpis_useYN", "") or "N"),
+        official_title_name=getattr(nurse, "official_title_name", None),
     )
 
 # =========================================================
