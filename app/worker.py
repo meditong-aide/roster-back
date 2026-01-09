@@ -19,6 +19,12 @@ from db.models import Nurse, RosterConfig
 from schemas.roster_schema import RosterRequest
 from schemas.auth_schema import User as UserSchema
 from services.roster_create_service import generate_roster_service
+from services.job_status_service import (
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    STATUS_SUCCESS,
+    update_job_record,
+)
 
 # =========================================================
 # 사용자 로딩 함수
@@ -80,9 +86,9 @@ def main():
         print("[worker] JOB_JSON JSON 파싱 실패", file=sys.stderr)
         sys.exit(2)
 
-    job_id   = payload.get("job_id")
-    nurse_id  = payload.get("nurse_id")  # ⬅ account_id 로 사용한다고 가정
-    params   = payload.get("params", {})
+    job_id = payload.get("job_id")
+    nurse_id = payload.get("nurse_id")  # ⬅ account_id 로 사용한다고 가정
+    params = payload.get("params", {})
 
     if not nurse_id:
         print("[worker] nurse_id 값이 필요합니다", file=sys.stderr)
@@ -99,6 +105,12 @@ def main():
     try:
         current_user = load_current_user_by_nurse_id(db, nurse_id)
         print(f"[worker] 작업 시작 job_id={job_id}, nurse_id={nurse_id}, req={req}")
+
+        try:
+            update_job_record(db, job_id, status=STATUS_RUNNING, progress=10)
+        except Exception as exc:
+            print(f"[worker] Job 상태 업데이트 실패(RUNNING): {exc}", file=sys.stderr)
+            raise
 
         # 사전 검사: 설정 존재 여부 확인 (없으면 서비스 내부에서 충돌 가능)
         latest_config = None
@@ -119,6 +131,16 @@ def main():
 
         # 핵심: 엔드포인트가 하던 것을 그대로 서비스로 호출
         roster_data = generate_roster_service(req, current_user, db)
+        result_id = None
+        if isinstance(roster_data, dict):
+            result_id = roster_data.get("schedule_id") or roster_data.get("schedule")
+        update_job_record(
+            db,
+            job_id,
+            status=STATUS_SUCCESS,
+            progress=100,
+            result_roster_id=result_id,
+        )
 
         # 필요하면 jobs 테이블에 DONE/요약 기록 (선택)
         # update_job_status(db, job_id, "DONE", meta=...)
@@ -128,6 +150,16 @@ def main():
 
     except Exception:
         traceback.print_exc()
+        try:
+            update_job_record(
+                db,
+                job_id,
+                status=STATUS_FAILED,
+                progress=100,
+                error_message=str(sys.exc_info()[1]),
+            )
+        except Exception as exc2:
+            print(f"[worker] Job 상태 업데이트 실패(FAILED): {exc2}", file=sys.stderr)
         # update_job_status(db, job_id, "FAILED")  # 선택
         sys.exit(1)
 

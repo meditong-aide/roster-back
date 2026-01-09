@@ -21,6 +21,7 @@ from services.roster_create_service import (
     generate_roster_service_with_fixed_cells,
     request_schedule_service,
 )
+from services.job_status_service import create_job_record
 
 router = APIRouter(tags=["roster_create"])
 
@@ -153,6 +154,18 @@ async def roster_create_async(
         "params": req.dict(),
         "requested_at": datetime.utcnow().isoformat(),
     }
+
+    # 상태 테이블에 Job 생성(QUEUED)
+    try:
+        create_job_record(
+            db=_db,
+            job_id=job_body["job_id"],
+            office_id=current_user.office_id,
+            group_id=current_user.group_id,
+            nurse_id=current_user.nurse_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Job 생성 실패: {exc}") from exc
 
     response = await _send_sqs_job(job_body)
 

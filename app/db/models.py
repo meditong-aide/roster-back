@@ -136,6 +136,29 @@ class Shift(Base):
     office = relationship("Office")
     group = relationship("Group")
 
+
+
+# ───────────────────────────── Job Status ─────────────────────────────
+
+
+class RosterJob(Base):
+    __tablename__ = "roster_jobs"
+
+    job_id = Column(VARCHAR(100), primary_key=True)
+    office_id = Column(VARCHAR(50), nullable=True)
+    group_id = Column(VARCHAR(50), nullable=True)
+    nurse_id = Column(VARCHAR(50), nullable=True)
+    status = Column(VARCHAR(20), nullable=False)  # QUEUED | RUNNING | SUCCESS | FAILED
+    progress = Column(SMALLINT, nullable=True)
+    result_roster_id = Column(VARCHAR(100), nullable=True)
+    error_message = Column(TEXT, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_roster_jobs_group_created", "group_id", "created_at"),
+    )
+
 class ShiftManage(Base):
     __tablename__ = "shift_manage"
     # ── 복합 PRIMARY KEY ──────────────────────────────
