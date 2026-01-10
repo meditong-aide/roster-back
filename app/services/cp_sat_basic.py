@@ -968,6 +968,8 @@ class CPSATBasicEngine:
             # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
             short_terms, over_terms = [], []
             over_vars_by_day = {}
+            short_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
+            over_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
             for d in range(D):
                 if hasattr(cfg, 'daily_shift_requirements_by_day') and isinstance(cfg.daily_shift_requirements_by_day, list) and d < len(cfg.daily_shift_requirements_by_day):
                     need_map = cfg.daily_shift_requirements_by_day[d]
@@ -993,6 +995,8 @@ class CPSATBasicEngine:
                     short_terms.append(sh)
                     over_terms.append(ov)
                     over_vars_by_day.setdefault(d, {})[code] = ov
+                    short_vars_by_day_code[(d, code)] = sh
+                    over_vars_by_day_code[(d, code)] = ov
 
             # 2) 안전/법규 위반(정량 슬랙) 구성
             safety = {
@@ -1354,10 +1358,12 @@ class CPSATBasicEngine:
 
                 m.Maximize(sum(obj))
 
-            return m, X, short_terms, over_terms, safety
+            return m, X, short_terms, over_terms, safety, short_vars_by_day_code, over_vars_by_day_code
 
         # ───── 1단계: 커버리지 (완화 재시도 포함) ─────
         m1, X1, short1, over1, safety1 = None, None, None, None, None
+        short_map1 = {}
+        over_map1 = {}
         s1 = None
         best_short, best_over = None, None
         used_relax_level = 0  # 1단계에서 성공한 완화 레벨
@@ -1366,7 +1372,7 @@ class CPSATBasicEngine:
         
         for relax_level in range(max_relax_attempts):
             with Timer(f"폴백 1단계: 커버리지 부족 최소화 (완화레벨={relax_level})"):
-                m1, X1, short1, over1, safety1 = build_model(stage=1, relax_level=relax_level)
+                m1, X1, short1, over1, safety1, short_map1, over_map1 = build_model(stage=1, relax_level=relax_level)
                 s1 = cp_model.CpSolver()
                 s1.parameters.max_time_in_seconds = time_per_attempt
                 s1.parameters.num_search_workers = 8
@@ -1379,6 +1385,26 @@ class CPSATBasicEngine:
                     if relax_level > 0:
                         print(f"{self.logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 (월 최대 OFF 상한 +{relax_level})")
                     print(f"{self.logger_prefix} 최소 커버리지 부족: {best_short}, 과잉: {best_over}")
+                    # 일/교대별 부족·과잉 상세 로그
+                    try:
+                        short_items = []
+                        for (d, code), var in short_map1.items():
+                            val = s1.Value(var)
+                            if val > 0:
+                                short_items.append((d, code, val))
+                        if short_items:
+                            short_items.sort()
+                            print(f"{self.logger_prefix} [Stage1 부족 상세] day,shift,shortage =", short_items)
+                        over_items = []
+                        for (d, code), var in over_map1.items():
+                            val = s1.Value(var)
+                            if val > 0:
+                                over_items.append((d, code, val))
+                        if over_items:
+                            over_items.sort()
+                            print(f"{self.logger_prefix} [Stage1 과잉 상세] day,shift,over =", over_items)
+                    except Exception as exc:
+                        print(f"{self.logger_prefix} [Stage1 상세로그 실패]: {exc}")
                     break
                 else:
                     if relax_level < max_relax_attempts - 1:
@@ -1391,7 +1417,7 @@ class CPSATBasicEngine:
 
         # ───── 2단계: 안전/법규 ─────
         with Timer("폴백 2단계: 안전/법규 위반 최소화"):
-            m2, X2, short2, over2, safety2 = build_model(stage=2, coverage_eq=best_short, over_le=best_over, relax_level=used_relax_level)
+            m2, X2, short2, over2, safety2, short_map2, over_map2 = build_model(stage=2, coverage_eq=best_short, over_le=best_over, relax_level=used_relax_level)
             s2 = cp_model.CpSolver()
             s2.parameters.max_time_in_seconds = tl2
             s2.parameters.num_search_workers = 8
@@ -1421,10 +1447,25 @@ class CPSATBasicEngine:
                         best_safe_sum += int(val)
                 stage2_zero_locks[k] = zeros
             print(f"{self.logger_prefix} 최소 안전 위반 합: {best_safe_sum}")
+            # 안전 위반 카테고리별 합계 로그
+            try:
+                for k, arr in safety2.items():
+                    total_k = sum(int(s2.Value(v)) for v in arr)
+                    if total_k > 0:
+                        print(f"{self.logger_prefix} [Stage2 위반] {k} = {total_k}")
+                # 부족·과잉은 stage1과 동일하게 고정되므로 참조 로그만 표시
+                short_items = [(d, code, int(s2.Value(var))) for (d, code), var in short_map2.items() if int(s2.Value(var)) > 0]
+                over_items = [(d, code, int(s2.Value(var))) for (d, code), var in over_map2.items() if int(s2.Value(var)) > 0]
+                if short_items:
+                    print(f"{self.logger_prefix} [Stage2 부족 참고] day,shift,shortage =", sorted(short_items))
+                if over_items:
+                    print(f"{self.logger_prefix} [Stage2 과잉 참고] day,shift,over =", sorted(over_items))
+            except Exception as exc:
+                print(f"{self.logger_prefix} [Stage2 상세로그 실패]: {exc}")
 
         # ───── 3단계: 선호/공정성 ─────
         with Timer("폴백 3단계: 선호/공정성 최대화"):
-            m3, X3, short3, over3, safety3 = build_model(stage=3, coverage_eq=best_short, over_le=best_over, stage2_zero_locks=stage2_zero_locks, relax_level=used_relax_level)
+            m3, X3, short3, over3, safety3, short_map3, over_map3 = build_model(stage=3, coverage_eq=best_short, over_le=best_over, stage2_zero_locks=stage2_zero_locks, relax_level=used_relax_level)
             # 합계 동일성(위반 재배치 억제): 각 카테고리 합은 stage2와 동일하게 유지
             for k in safety3.keys():
                 m3.Add(sum(safety3[k]) == sum(safety2[k]))
@@ -1450,6 +1491,20 @@ class CPSATBasicEngine:
                             if s2.Value(X2(n, d, s)):
                                 roster_system.roster[n, d, s] = 1
                 return best_short == 0 and best_safe_sum == 0
+            # 선호 단계 상세 로그
+            try:
+                short_items = [(d, code, int(s3.Value(var))) for (d, code), var in short_map3.items() if int(s3.Value(var)) > 0]
+                over_items = [(d, code, int(s3.Value(var))) for (d, code), var in over_map3.items() if int(s3.Value(var)) > 0]
+                if short_items:
+                    print(f"{self.logger_prefix} [Stage3 부족 참고] day,shift,shortage =", sorted(short_items))
+                if over_items:
+                    print(f"{self.logger_prefix} [Stage3 과잉 참고] day,shift,over =", sorted(over_items))
+                for k, arr in safety3.items():
+                    total_k = sum(int(s3.Value(v)) for v in arr)
+                    if total_k > 0:
+                        print(f"{self.logger_prefix} [Stage3 위반] {k} = {total_k}")
+            except Exception as exc:
+                print(f"{self.logger_prefix} [Stage3 상세로그 실패]: {exc}")
 
         # stage3 해 반영
         roster_system.roster.fill(0)
@@ -1757,27 +1812,27 @@ class CPSATBasicEngine:
                 print("  - 개인별 페어링 만족도:")
                 for nurse_id, info in individual_satisfaction.items():
                     pair_req_cnt = info.get('pair_request_count', 0)
-                    if pair_req_cnt == 0:
-                        print(f"    • {info['name']}({info['nurse_id']}): -")
-                    else:
-                        print(f"    • {info['name']}({info['nurse_id']}): {info['pair_satisfaction']:.2f}%")
+                    # if pair_req_cnt == 0:
+                    #     print(f"    • {info['name']}({info['nurse_id']}): -")
+                    # else:
+                    #     print(f"    • {info['name']}({info['nurse_id']}): {info['pair_satisfaction']:.2f}%")
 
             # 개인별 선호 휴무일/근무 유형 만족도 출력
             print("  - 개인별 선호 휴무일 만족도:")
             for nurse_id, info in individual_satisfaction.items():
                 off_req_cnt = info.get('off_request_count', 0)
-                if off_req_cnt == 0:
-                    print(f"    • {info['name']}({info['nurse_id']}): -")
-                else:
-                    print(f"    • {info['name']}({info['nurse_id']}): {info['off_satisfaction']:.2f}%")
+                # if off_req_cnt == 0:
+                #     print(f"    • {info['name']}({info['nurse_id']}): -")
+                # else:
+                #     print(f"    • {info['name']}({info['nurse_id']}): {info['off_satisfaction']:.2f}%")
             
             print("  - 개인별 근무 유형 선호도 만족도:")
             for nurse_id, info in individual_satisfaction.items():
                 shift_req_cnt = info.get('shift_request_count', 0)
-                if shift_req_cnt == 0:
-                    print(f"    • {info['name']}({info['nurse_id']}): -")
-                else:
-                    print(f"    • {info['name']}({info['nurse_id']}): {info['shift_satisfaction']:.2f}%")
+                # if shift_req_cnt == 0:
+                #     print(f"    • {info['name']}({info['nurse_id']}): -")
+                # else:
+                #     print(f"    • {info['name']}({info['nurse_id']}): {info['shift_satisfaction']:.2f}%")
             
             # 상세 요청 분석
             detailed_analysis = roster_system.calculate_detailed_request_analysis()
@@ -1811,7 +1866,7 @@ class CPSATBasicEngine:
                     rate = (same_shift_days / both_worked_days * 100.0) if both_worked_days > 0 else 0.0
                     mentee_name = next((n.name for n in roster_system.nurses if n.id == n1), str(mentee_dbid))
                     preceptor_name = next((n.name for n in roster_system.nurses if n.id == n2), str(preceptor_dbid))
-                    print(f"    • {mentee_name}({mentee_dbid}) - {preceptor_name}({preceptor_dbid}): 같은 근무 {same_shift_days}일 / 동시근무 {both_worked_days}일 ({rate:.2f}%)")
+                    # print(f"    • {mentee_name}({mentee_dbid}) - {preceptor_name}({preceptor_dbid}): 같은 근무 {same_shift_days}일 / 동시근무 {both_worked_days}일 ({rate:.2f}%)")
                 # 만족도 데이터에 요약 저장
                 satisfaction_data.setdefault("preceptor_overlap", {})
                 satisfaction_data["preceptor_overlap"]["note"] = "같은 교대 배정일수 / 두 사람 모두 근무한 일수 기준"
