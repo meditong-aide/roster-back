@@ -8,6 +8,7 @@ from db.client2 import get_db
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from services.job_status_service import get_latest_job_record
+from datetime import datetime
 
 router = APIRouter(tags=["jobs"])
 
@@ -33,6 +34,7 @@ class JobStatusResponse(BaseModel):
     progress: Optional[int] = None
     result_roster_id: Optional[str] = None
     error_message: Optional[str] = None
+    updated_at: Optional[datetime] = None
 
 
 # @router.get("/jobs/{job_id}/status", response_model=JobStatusResponse)
@@ -88,6 +90,7 @@ def get_latest_job_status(
         group_id=current_user.group_id,
         nurse_id=current_user.nurse_id,
     )
+    print('job')
     if not job:
         raise HTTPException(status_code=404, detail="해당 사용자/그룹의 Job이 없습니다.")
 
