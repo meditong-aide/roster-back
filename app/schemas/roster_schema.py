@@ -137,6 +137,7 @@ class RosterConfigBase(BaseModel):
     even_nights: bool
     sequential_offs: bool
     nod_noe: bool
+    not_one_night: bool = Field(default=False, description="야간 단발성(1N) 금지 여부")
     preceptor_gauge: float
     weekly_off_group: bool = Field(default=False)
     team_balance_enable: bool = Field(default=False)

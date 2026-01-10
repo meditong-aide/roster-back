@@ -191,6 +191,8 @@ class CPSATBasicEngine:
             # 법규 제약사항 (Hard Constraints)
             max_night_shifts_per_month=max_nig_per_month,
             max_consecutive_nights=3 if three_seq_nig else 2,
+            # not_one_night=bool(config_data.get("not_one_night", False)),
+            not_one_night=True,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
             banned_day_after_eve=banned_day_after_eve,
@@ -1036,6 +1038,20 @@ class CPSATBasicEngine:
                         m.AddImplication(b_ne, xn)
                         m.AddImplication(b_ne, xe2)
                         safety['trans_ne'].append(b_ne)
+
+            # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
+            if bool(getattr(cfg, "not_one_night", False)):
+                for n in range(N):
+                    T0, T1 = join[n], leave[n]
+                    for d in range(T0, T1 + 1):
+                        neighbors = []
+                        if d - 1 >= T0:
+                            neighbors.append(X(n, d - 1, night_idx))
+                        if d + 1 <= T1:
+                            neighbors.append(X(n, d + 1, night_idx))
+                        if not neighbors:
+                            continue
+                        m.Add(X(n, d, night_idx) <= sum(neighbors))
 
             # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 부족량 정량화
             K = cfg.max_consecutive_work_days
@@ -1977,6 +1993,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if is_n_only:
             for d in range(T0,T1+1):
                 m.Add(X(n,d,day)==0); m.Add(X(n,d,eve)==0)
+
+        # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
+        # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
+        if bool(getattr(cfg, "not_one_night", False)):
+            for d in range(T0, T1 + 1):
+                neighbors = []
+                if d - 1 >= T0:
+                    neighbors.append(X(n, d - 1, night))
+                if d + 1 <= T1:
+                    neighbors.append(X(n, d + 1, night))
+                if not neighbors:
+                    continue
+                m.Add(X(n, d, night) <= sum(neighbors))
 
         # 연속 Night
         for d0 in range(T0, T1-L+1):

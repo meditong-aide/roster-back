@@ -1013,6 +1013,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     K = int(config_dict.get('max_conseq_work') or 0)
     two_after_three = bool(config_dict.get('two_offs_after_three_nig'))
     two_after_two = bool(config_dict.get('two_offs_after_two_nig'))
+    not_one_night = bool(config_dict.get("not_one_night", False))
     banned_E_to_D = bool(config_dict.get('banned_day_after_eve'))
     L = int(config_dict.get('max_consecutive_nights') or 0)
 
@@ -1082,11 +1083,21 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
             tail_str = ' '.join(tail) if tail else '(없음)'
             print(f"[CrossMonth] 간호사 {nurse_id}: 연속근무={cons_work} (꼬리: {tail_str}) → day0(1일) OFF 강제")
 
+        # (b-0) 1N 금지: 꼬리 N이 1개라면 다음 달 day0을 N으로 강제
+        if not_one_night and cons_n == 1:
+            if 0 in forced_off.get(nurse_id, []):
+                forced_off[nurse_id] = [d for d in forced_off.get(nurse_id, []) if d != 0]
+            forbidden[nurse_id][0].extend(['D', 'E', 'O'])
+            tail_str = ' '.join(tail) if tail else '(없음)'
+            print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail 감지 → day0 N 강제(forbidden D/E/O), tail={tail_str}")
+
         # (b) N2/3 → 2OFF
         req_offs = 0
-        if two_after_three and cons_n >= 3:
+        two_after_two_effective = two_after_two or not_one_night
+        two_after_three_effective = two_after_three
+        if two_after_three_effective and cons_n >= 3:
             req_offs = 2
-        elif two_after_two and cons_n >= 2:
+        elif two_after_two_effective and cons_n >= 2:
             req_offs = 2
         rem = max(0, req_offs - offs_after)
         for d in range(min(2, rem)):

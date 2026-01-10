@@ -223,6 +223,7 @@ class RosterConfig(Base):
     sequential_offs = Column(BOOLEAN)
     even_nights = Column(BOOLEAN)
     nod_noe = Column(BOOLEAN)
+    not_one_night = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
     preceptor_gauge = Column(INTEGER, nullable=False, default=5)
     weekly_off_group = Column(BOOLEAN)
