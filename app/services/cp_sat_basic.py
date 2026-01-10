@@ -43,6 +43,62 @@ class Timer:
     def __exit__(self,*a): print(f"{self.msg} 완료: {time.time()-self.t0:.2f}s")
 
 
+def _build_shift_normalizer(shift_defs: list[dict] | None) -> tuple[dict[str, str], dict[str, str]]:
+    """Shift ID를 알고리즘용 메인 코드(D/E/N/O)로 정규화하는 매핑을 생성한다.
+
+    Args:
+        shift_defs: shift_id, default_shift, shift_gb를 포함한 사전 리스트
+
+    Returns:
+        (id_to_main, main_to_id):
+            - id_to_main: shift_id(대문자) → 메인 코드(D/E/N/O)
+            - main_to_id: 메인 코드 → 대표 shift_id(초기값은 자기 자신, 매핑되면 우선 적용)
+    """
+    canonical = {"D", "E", "N", "O", "주"}
+    id_to_main: dict[str, str] = {}
+    main_to_id: dict[str, str] = {c: c for c in canonical}
+
+    for row in shift_defs or []:
+        raw_id = str(row.get("shift_id") or "").strip()
+        if not raw_id:
+            continue
+        sid_upper = raw_id.upper()
+        raw_default = str(row.get("default_shift") or "").strip().upper()
+        raw_gb = str(row.get("shift_gb") or "").strip().upper()
+
+        if sid_upper in {"OFF"}:
+            sid_upper = "O"
+
+        main_code = None
+        if raw_default in canonical:
+            main_code = raw_default
+        elif raw_gb in canonical:
+            main_code = raw_gb
+        elif sid_upper in canonical:
+            main_code = sid_upper
+
+        if not main_code:
+            continue
+
+        id_to_main[sid_upper] = main_code
+        current = main_to_id.get(main_code)
+        if current in {None, main_code} or sid_upper == main_code:
+            main_to_id[main_code] = raw_id
+
+    return id_to_main, main_to_id
+
+
+def _normalize_shift_code(raw_code: object, id_to_main: dict[str, str]) -> str | None:
+    """입력 근무코드를 메인 코드(D/E/N/O)로 정규화한다."""
+    code = str(raw_code or "").strip()
+    upper = code.upper()
+    if upper in {"OFF"}:
+        return "O"
+    if upper in {"D", "E", "N", "O", "주"}:
+        return upper
+    return id_to_main.get(upper)
+
+
 
 class CPSATBasicEngine:
     """CP-SAT 기반 근무표 생성 엔진"""
@@ -266,40 +322,45 @@ class CPSATBasicEngine:
             nurses.append(Nurse(**nurse_dict))
         
         return nurses
-    def parse_preferences_from_db(self, prefs_data: List[dict]) -> Tuple[Dict, Dict, Dict]: 
-        """ 
-        DB에서 가져온 선호도 데이터를 main_v3.py 형식으로 변환 
-        Returns: 
-            Tuple[shift_preferences, off_requests, pair_preferences] 
-        """ 
-        shift_preferences = {} 
-        off_requests = {} 
-        pair_preferences = {"work_together": [], "work_apart": []} 
-        for pref in prefs_data: 
-            nurse_id = pref['nurse_id'] 
-            data = pref.get('data', {}) 
-            if not data: 
-                continue 
-            
-            # 근무 유형 선호도 파싱
-            if 'shift' in data: 
-                shift_prefs = {} 
-                for shift_type, dates in data['shift'].items(): 
-                    if shift_type.upper() in ['D', 'E', 'N']: 
-                        shift_prefs[shift_type.upper()] = dates 
-                if shift_prefs: 
-                    shift_preferences[nurse_id] = shift_prefs 
-            # 휴무 요청 파싱 
-            if 'O' in data['shift']: 
-                off_requests[nurse_id] = data['shift']['O'] 
-            # preference 파싱 
-            if 'preference' in data and data['preference']: 
-                print(data['preference']) 
-                for d in data['preference']: 
-                    if d['weight'] <0: 
-                        pair_preferences["work_apart"].append({"nurse_1":nurse_id, "nurse_2": d['id'], "weight": d['weight']}) 
-                    elif d['weight'] >0: 
-                        pair_preferences["work_together"].append({"nurse_1":nurse_id, "nurse_2":d['id'], "weight": d['weight']}) 
+    def parse_preferences_from_db(
+        self,
+        prefs_data: List[dict],
+        shift_id_to_main: dict[str, str] | None = None,
+    ) -> Tuple[Dict, Dict, Dict]:
+        """DB 선호도 데이터를 메인 코드(D/E/N/O) 기준으로 정규화한다."""
+        shift_preferences: dict = {}
+        off_requests: dict = {}
+        pair_preferences = {"work_together": [], "work_apart": []}
+        shift_id_to_main = shift_id_to_main or {}
+
+        for pref in prefs_data:
+            nurse_id = pref["nurse_id"]
+            data = pref.get("data", {})
+            if not data:
+                continue
+
+            if "shift" in data:
+                shift_prefs = {}
+                for shift_type, dates in data["shift"].items():
+                    normalized = _normalize_shift_code(shift_type, shift_id_to_main)
+                    if normalized in {"D", "E", "N"}:
+                        shift_prefs[normalized] = dates
+                    elif normalized == "O":
+                        off_requests[nurse_id] = dates
+                if shift_prefs:
+                    shift_preferences[nurse_id] = shift_prefs
+
+            if "preference" in data and data["preference"]:
+                print(data["preference"])
+                for d in data["preference"]:
+                    if d["weight"] < 0:
+                        pair_preferences["work_apart"].append(
+                            {"nurse_1": nurse_id, "nurse_2": d["id"], "weight": d["weight"]}
+                        )
+                    elif d["weight"] > 0:
+                        pair_preferences["work_together"].append(
+                            {"nurse_1": nurse_id, "nurse_2": d["id"], "weight": d["weight"]}
+                        )
         return shift_preferences, off_requests, pair_preferences
 
     def generate_roster(
@@ -336,6 +397,10 @@ class CPSATBasicEngine:
         # 1. 설정 객체 생성
         with Timer("설정 생성"):
             config = self.create_config_from_db(config_data)
+        shift_defs = config_data.get("shift_definitions") if isinstance(config_data, dict) else None
+        shift_id_to_main, main_to_shift_id = _build_shift_normalizer(shift_defs)
+        canonical_to_shift_id = main_to_shift_id or {"D": "D", "E": "E", "N": "N", "O": "O"}
+        fixed_original_shift_map: dict[tuple[int, int], str] = {}
         # 2. 대상 월 설정
         target_month = date(year, month, 1)
         # 3. 간호사 객체 생성
@@ -363,11 +428,24 @@ class CPSATBasicEngine:
             # 주휴 등 휴무류 코드는 엔진에서 'O'로만 취급한다. (shift_types=['D','E','N','O'])
             for c in fixed_cells:
                 try:
-                    shift_code = str(c.get('shift') or '').upper()
+                    original_shift = str(c.get('shift') or '').strip()
                 except Exception:
-                    shift_code = ''
-                if shift_code in ('OFF', '주'):
-                    c['shift'] = 'O'
+                    original_shift = ''
+                normalized_shift = _normalize_shift_code(original_shift, shift_id_to_main)
+                if not normalized_shift:
+                    print(
+                        f"{self.logger_prefix} 고정 셀 무시: 알 수 없는 근무코드 shift={original_shift}, "
+                        f"nurse_index={c.get('nurse_index')}, day_index={c.get('day_index')}"
+                    )
+                    continue
+                if original_shift and normalized_shift and normalized_shift != original_shift:
+                    try:
+                        n_idx = int(c.get('nurse_index'))
+                        d_idx = int(c.get('day_index'))
+                        fixed_original_shift_map[(n_idx, d_idx)] = original_shift
+                    except Exception:
+                        pass
+                c['shift'] = normalized_shift
             # ── 경계 제약(강제 OFF/금지) 병합 ──
             initial_constraints = config_data.get('initial_constraints') or {}
             allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
@@ -410,11 +488,18 @@ class CPSATBasicEngine:
                             d = int(d_str)
                         except Exception:
                             d = d_str
-                        init_forb.setdefault((n_idx, d), set()).update(codes)
+                        normalized_codes = []
+                        for code in (codes or []):
+                            norm_code = _normalize_shift_code(code, shift_id_to_main)
+                            if norm_code:
+                                normalized_codes.append(norm_code)
+                        init_forb.setdefault((n_idx, d), set()).update(normalized_codes)
                 roster_system.initial_forbidden = init_forb
         # 5. 선호도 데이터 파싱 및 적용
         with Timer("선호도 데이터 파싱"):
-            shift_preferences, off_requests, pair_preferences = self.parse_preferences_from_db(prefs_data)
+            shift_preferences, off_requests, pair_preferences = self.parse_preferences_from_db(
+                prefs_data, shift_id_to_main
+            )
         # ────────────────────────────── 프리셉터 페어링 반영 ──────────────────────────────
         # nurses_data 내 preceptor_id 를 사용해 자동으로 함께 근무 선호를 추가한다.
         try:
@@ -482,7 +567,12 @@ class CPSATBasicEngine:
                 self._optimize_fallback_lex_hard_first(roster_system, time_limit_seconds=time_limit_seconds, grouped=grouped)
         # 10. 결과 변환
         with Timer("결과 변환"):
-            result = self._convert_result_to_db_format(roster_system, nurses)
+            result = self._convert_result_to_db_format(
+                roster_system,
+                nurses,
+                canonical_to_shift_id=canonical_to_shift_id,
+                fixed_original_shift_map=fixed_original_shift_map,
+            )
         
         # 11. 최적화 결과 출력 및 만족도 데이터 수집
         # 프리셉터 쌍 수집 (DB id 기준)
@@ -543,7 +633,12 @@ class CPSATBasicEngine:
                     for r in repair_log[:10]:
                         print(f"{self.logger_prefix} [REPAIR] {r}")
                 # repair 이후 결과로 DB 변환 갱신
-                result = self._convert_result_to_db_format(roster_system, nurses)
+                result = self._convert_result_to_db_format(
+                    roster_system,
+                    nurses,
+                    canonical_to_shift_id=canonical_to_shift_id,
+                    fixed_original_shift_map=fixed_original_shift_map,
+                )
         except Exception as e:
             print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
 
@@ -1403,9 +1498,26 @@ class CPSATBasicEngine:
             return False
         return True
     
-    def _convert_result_to_db_format(self, roster_system: RosterSystem, nurses: List[Nurse]) -> Dict[str, List[str]]:
-        """RosterSystem 결과를 DB 형식으로 변환 (고정된 셀은 원래 값으로 반환)"""
+    def _convert_result_to_db_format(
+        self,
+        roster_system: RosterSystem,
+        nurses: List[Nurse],
+        canonical_to_shift_id: dict[str, str] | None = None,
+        fixed_original_shift_map: dict[tuple[int, int], str] | None = None,
+    ) -> Dict[str, List[str]]:
+        """RosterSystem 결과를 DB 형식으로 변환한다.
+
+        Args:
+            roster_system: 계산이 완료된 RosterSystem
+            nurses: 간호사 객체 리스트
+            canonical_to_shift_id: 메인 코드(D/E/N/O) → 실제 shift_id 매핑
+            fixed_original_shift_map: 고정 셀의 원본 shift_id 매핑
+        """
         result = {}
+        canonical_map = {k.upper(): v for k, v in (canonical_to_shift_id or {}).items() if v}
+        if not canonical_map:
+            canonical_map = {"D": "D", "E": "E", "N": "N", "O": "O", "주": "주"}
+        fixed_original_shift_map = fixed_original_shift_map or {}
         shift_map = {i: s for i, s in enumerate(roster_system.config.shift_types)}
         fixed = getattr(roster_system, 'fixed_cells', None)
         fixed_lookup = {}
@@ -1417,15 +1529,19 @@ class CPSATBasicEngine:
             for day_idx in range(roster_system.num_days):
                 # 고정된 셀은 원래 값으로 반환
                 if (n_idx, day_idx) in fixed_lookup:
-                    nurse_schedule.append(fixed_lookup[(n_idx, day_idx)])
+                    original = fixed_original_shift_map.get((n_idx, day_idx))
+                    if original:
+                        nurse_schedule.append(original)
+                        continue
+                    fixed_shift = fixed_lookup[(n_idx, day_idx)]
+                    nurse_schedule.append(canonical_map.get(str(fixed_shift).upper(), fixed_shift))
                     continue
                 shift_vector = roster_system.roster[n_idx, day_idx]
                 shift_idx = np.where(shift_vector == 1)[0]
                 if len(shift_idx) > 0:
                     shift_id = shift_map[shift_idx[0]]
-                    # if shift_id == 'OFF':
-                    #     shift_id = 'O'
-                    nurse_schedule.append(shift_id)
+                    mapped = canonical_map.get(str(shift_id).upper(), shift_id)
+                    nurse_schedule.append(mapped)
                 else:
                     nurse_schedule.append('-')
             result[nurse.db_id] = nurse_schedule

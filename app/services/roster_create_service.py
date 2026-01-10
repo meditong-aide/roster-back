@@ -1362,6 +1362,23 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
         # ShiftManage 요구인원은 호출부에서 주입한다
 
+        try:
+            shift_lookup = _load_shift_lookup(db, current_user.office_id, current_user.group_id)
+            shift_defs = []
+            for shift in shift_lookup.values():
+                shift_defs.append(
+                    {
+                        "shift_id": getattr(shift, "shift_id", None),
+                        "default_shift": getattr(shift, "default_shift", None) or getattr(shift, "shift_id", None),
+                        "shift_gb": getattr(shift, "shift_gb", None),
+                    }
+                )
+            print(f"[ShiftMapping] shift_defs: {shift_defs}")
+            if shift_defs:
+                config_dict["shift_definitions"] = shift_defs
+        except Exception as e:
+            print(f"[ShiftMapping] shift_definitions 구성 실패(무시): {e}")
+
         # fixed_cells 는 옵션
         # - '주' 등 휴무류 코드는 엔진에서 'O'로 정규화해야 한다(shift_types=['D','E','N','O']).
         if fixed_cells:
@@ -1562,6 +1579,7 @@ def _normalize_shift_id_for_save(raw_shift: str, valid_shift_ids: set[str]) -> s
         if sid.upper() == upper:
             return sid
     return raw_shift
+
 def _apply_preceptor_gauge(config_dict: dict, gauge: int | None) -> None:
     """프리셉터 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
 
@@ -1791,6 +1809,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         month=req.month,
     )
     weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
+
     if weekly_off_map:
         filtered_map: dict[str, set[int]] = {}
         for nurse_id, day_set in weekly_off_map.items():
@@ -1943,7 +1962,7 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
             if n_idx is None:
                 continue
             for d in sorted(day_set):
-                weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
+                weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": weekly_off_display_code})
         merged_fixed_cells, weekly_off_conflicts = _merge_fixed_cells_with_weekly_off(
             fixed_cells=fixed_cells,
             weekly_off_cells=weekly_off_fixed_cells,
