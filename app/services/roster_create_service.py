@@ -1487,18 +1487,16 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
 def _persist_entries(db: Session, schedule, generated, req):
     """생성된 근무표를 ScheduleEntry로 저장한다."""
     db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).delete()
-    # 저장 시 shift_id 정규화를 위해 해당 그룹의 유효 shift_id 집합을 로드한다.
-    shift_ids = {
-        s.shift_id
-        for s in db.query(Shift)
-        .filter(Shift.group_id == schedule.group_id, Shift.office_id == schedule.office_id)
-        .all()
-    }
+    shift_ids, default_map = _load_shift_mappings(db, schedule)
     for nurse_id, shifts in generated.items():
         for day_index, shift_id in enumerate(shifts):
             if shift_id != '-':
                 work_date = date(req.year, req.month, day_index + 1)
-                norm_shift = _normalize_shift_id_for_save(str(shift_id), shift_ids)
+                main_code = str(shift_id).strip().upper()
+                if main_code == "OFF":
+                    main_code = "O"
+                mapped_shift = default_map.get(main_code, shift_id)
+                norm_shift = _normalize_shift_id_for_save(str(mapped_shift), shift_ids)
                 entry = ScheduleEntry(
                     entry_id=str(uuid.uuid4().hex)[:16],
                     schedule_id=schedule.schedule_id,
@@ -1579,6 +1577,50 @@ def _normalize_shift_id_for_save(raw_shift: str, valid_shift_ids: set[str]) -> s
         if sid.upper() == upper:
             return sid
     return raw_shift
+
+
+def _load_shift_mappings(db: Session, schedule) -> tuple[set[str], dict[str, str]]:
+    """office/group의 Shift 정보를 불러와 저장용 매핑을 생성한다.
+
+    Args:
+        db: DB 세션
+        schedule: 현재 스케줄 객체(office_id, group_id 참조)
+
+    Returns:
+        (shift_ids, default_map):
+            - shift_ids: 유효한 shift_id 집합
+            - default_map: 메인코드(D/E/N/O/주) → shift_id 매핑
+    """
+    shifts_db = (
+        db.query(Shift)
+        .filter(Shift.group_id == schedule.group_id, Shift.office_id == schedule.office_id)
+        .all()
+    )
+    shift_ids = {s.shift_id for s in shifts_db}
+    default_map = _build_default_shift_mapping(shifts_db)
+    return shift_ids, default_map
+
+
+def _build_default_shift_mapping(shifts: list[Shift]) -> dict[str, str]:
+    """Shift.default_shift를 메인코드(D/E/N/O/주)로 삼아 실제 shift_id 매핑을 구성한다.
+
+    Args:
+        shifts: 해당 그룹/오피스의 Shift 레코드 목록
+
+    Returns:
+        메인코드(D/E/N/O/주) → shift_id 매핑
+    """
+    mapping: dict[str, str] = {}
+    for s in shifts:
+        default_code = str(getattr(s, "default_shift", "") or "").strip().upper()
+        if default_code == "OFF":
+            default_code = "O"
+        if default_code not in {"D", "E", "N", "O", "주"}:
+            continue
+        if default_code not in mapping:
+            mapping[default_code] = str(s.shift_id)
+    return mapping
+
 
 def _apply_preceptor_gauge(config_dict: dict, gauge: int | None) -> None:
     """프리셉터 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
