@@ -116,160 +116,244 @@ def _compute_cost(prompt_tokens: int, completion_tokens: int, model_name: str) -
     }
 
 
+def parse_allowed_shifts(shift_data: str) -> str:
+    """
+    shifts 테이블 문자열에서 show_in_preference=1인 shift_id만 추출
+    """
+    allowed = []
+    lines = shift_data.strip().split("\n")
+    for line in lines:
+        columns = line.split()
+        if len(columns) < 18:
+            continue
+        shift_id = columns[0]
+        show_in_preference = columns[-1]
+        if show_in_preference == "1":
+            allowed.append(shift_id)
+    
+    allowed_str = ", ".join(sorted(set(allowed)))
+    return allowed_str if allowed_str else "없음"
+
+
 class queryAnalyzerPrompt:
-    def __init__(self, context, year, month, allowed_shifts: str = ''):
+    def __init__(self, context: str, year: int, month: int, 
+                 allowed_shifts: str = '', 
+                 shift_data: str = '', 
+                 allowed_shift_map: dict = None):  # 새로 추가: shift_id -> name 매핑
         """
-        프롬프트 클래스
-        allowed_shifts 추가
+        allowed_shift_map 예시: {'D': 'Day', '생': '생리휴가(무급)', '경': '경조휴가', ...}
         """
+        # 1. allowed_shifts 파싱 (기존 로직 유지)
+        raw_allowed = parse_allowed_shifts(shift_data) if shift_data else allowed_shifts
+        self.allowed_list = [s.strip() for s in raw_allowed.split(",") if s.strip()]
+        self.allowed_str = raw_allowed if raw_allowed else "없음"
+
+        # allowed_shift_map이 없으면 빈 딕셔너리 (호환성 유지)
+        self.allowed_shift_map = allowed_shift_map or {}
+
+        # 2. 동적 매핑 규칙 + Few-Shot 예시 생성
+        mapping_rules = []
+        few_shot_examples = []
+
+        # 기본 근무 코드 매핑 (항상 고정 - 병원 공통)
+        base_mappings = {
+            "D": ["데이", "day", "D", "아침근무", "오전근무", "데이근무"],
+            "E": ["이브닝", "evening", "E", "오후근무", "이브닝근무"],
+            "N": ["나이트", "night", "N", "야간", "밤근무", "나이트근무"],
+            "O": ["오프", "off", "O", "휴무", "쉬고", "쉬", "off"],
+        }
+
+        # D/E/N/O에 대한 기본 규칙 + 예시 생성 (항상 포함)
+        for code, synonyms in base_mappings.items():
+            if code in self.allowed_list:  # 허용된 경우만
+                examples = ", ".join(synonyms)
+                mapping_rules.append(f'- "{examples}" → "{code}" 코드로 변환')
+                few_shot_examples.append(f"""
+                # CONTEXT:
+                    "15일 {synonyms[0]}로 해주세요"
+                # OUTPUT:
+                    {{"processor": "기본 근무 코드 '{code}' 매핑", "Chat": [], "Shift": ["15일은 {code}로 줘"], "Preference": [], "Except": [], "Others": []}}
+                """)
+
+        # ===== 동적 특수 코드 처리 (핵심!) =====
+        # D/E/N/O를 제외한 모든 허용 코드에 대해 자동 생성
+        special_codes = [code for code in self.allowed_list if code not in base_mappings]
+
+        for code in special_codes:
+            name = self.allowed_shift_map.get(code, code)  # name 있으면 사용, 없으면 코드 자체
+            # 자연어 표현 추정: "생리휴가(무급)" → "생리휴가", "경조휴가" → "경조휴가" 등
+            # 괄호 제거하고 주요 키워드 추출 (간단하게)
+            display_name = name.split('(')[0].strip()  # "생리휴가(무급)" → "생리휴가"
+
+            mapping_rules.append(f'- "{display_name}", "{name}", "{code}" 등이 언급되면 → 반드시 "{code}" 코드로 변환 (절대 D/E/N/O로 바꾸지 말 것)')
+
+            # Few-shot 예시 1: 일반 요청
+            few_shot_examples.append(f"""
+            # CONTEXT:
+                "16일에 {display_name} 부탁드려요"
+            # OUTPUT:
+                {{"processor": "특수 코드 '{code}' ({name}) 요청 감지 → Shift 처리", "Chat": [], "Shift": ["16일은 {code}로 줘"], "Preference": [], "Except": [], "Others": []}}
+            """)
+
+            # Few-shot 예시 2: 변형 표현
+            few_shot_examples.append(f"""
+            # CONTEXT:
+                "이번 달 10일에 {name} 써도 될까요?"
+            # OUTPUT:
+                {{"processor": "특수 코드 '{code}' 요청 → 정확히 '{code}' 유지", "Chat": [], "Shift": ["10일은 {code}로 줘"], "Preference": [], "Except": [], "Others": []}}
+            """)
+
+        # 불허용 코드 처리 규칙 (기존 유지)
+        disallow_rule = """
+        - 허용 목록에 없는 코드를 요청하면 → Shift에 포함 금지
+        - 대신 Others에 원문 기록 + "희망근무 선택 불가합니다. 수간호사에게 문의하세요" 설명 추가
+        """
+
+        # 문자열화 (토큰 절약 위해 few_shot은 최대 8개 제한)
+        dynamic_rules = "\n".join(mapping_rules)
+        dynamic_few_shots = "\n".join(few_shot_examples[:8])
+
+        # 3. 전체 system 프롬프트 조합
         self.system = f"""
         ## GOAL:
-            You are the "Nurse Preference Preprocessor."  
-            Convert Korean natural language input ➜ into a categorized List (JSON), decomposed and normalized.
+            You are the "Nurse Preference Preprocessor."
+            Convert Korean natural language input into categorized JSON.
 
-        ## 1. Task Objectives
-            1. If multiple dates, shifts, preferences, and except are mixed in a single sentence, split them into separate items by meaning.
-            2. Each element in the Shift / Preference / Except / Others category must contain only a single piece of content.  
-            예)  
-            - "5/5는 쉬고 싶고, 5/6은 E로 줘" →  
-                `"Shift": ["5/5은 OFF로 줘", "5/6은 E로 줘"]`
-            3. If a date is omitted in an instruction ("그 외엔…"), supplement with the previous date to avoid loss of information.  
-            예) "5/5는 N, 그 외엔 E" →  
-                `"Shift": ["5/5은 N로 줘", "5/5 제외 나머지는 E로 줘"]`
-            4. Repetitive/pattern requests (e.g., "주말엔 쉬고 싶다", "매주 수요일은 OFF")  
-            must never be expanded into all dates; record as **one rule-based item**.  
-            - 예) "주말엔 쉬고 싶다" → `"Shift": ["매주 주말은 O로 줘"]`  
-            - 예) "수요일은 OFF" → `"Shift": ["매주 수요일은 O로 줘"]`  
-            - 예) "평일엔 D, 주말엔 O" → `"Shift": ["평일은 D로 줘", "주말은 O로 줘"]`
-            - 예) "10일은 D 말고" → `"Except": ["10일은 D 말고"]`
-            - 예) "수요일은 E 빼줘" → `"Except": ["수요일은 E 빼줘"]`
-            5. Absolutely no duplication/mixing: do not put OFF and E together in one element.
-            6. Final JSON Keys:
-                - Chat ― small talk unrelated to scheduling
-                - Shift ― requests for dates/shifts/OFF
-                - Preference ― coworker together/avoid preferences
-                - Except ― negative/exclusion requests (e.g., 말고, 빼고, 제외, 안 돼)
-                - Others ― requests not fitting the above
-                * Empty categories must remain [].
-                * Element order must follow the input sequence.
+        ## 이번 달 허용 근무코드 (가장 중요! 반드시 준수!)
+        - 허용 코드: {self.allowed_str}
+        - 이 목록에 있는 코드만 Shift 카테고리에 포함 가능합니다.
+        - 특수 코드(예: 생, 경, 연, 교후 등)는 절대 D/E/N/O로 변환하지 말고 그대로 유지하세요.
 
-        ## ==================== 병동 정책 강제 적용 (신규 추가) ====================
-        ## 허용 근무코드 제한 (반드시 준수!)
-        - 간호사가 희망근무로 선택 가능한 근무코드는 **오직 다음만** 허용됩니다:
-          **{allowed_shifts}** (예: D, E, N, O, D2, E2, N2, M)
-        - **절대 Shift 카테고리에 포함 금지**:
-          - 연차(연), 경조(경), 병가(병), 결근(결), 생리휴가(생), 교육(교후, 교전, 교), 주휴(주, 주휴) 등
-        - 위 목록에 없는 코드를 사용자가 요청하면:
-          → **Shift: []** (빈 배열)
-          → **Others에 해당 요청 원문 기록** + 이유 설명
-        - 예시:
-          입력: "5/12 연차 써도 돼요"
-          출력:
-          {{
-            "processor": "연차는 show_in_preference=false로 희망근무 선택 불가 → Others 처리",
-            "Shift": [],
-            "Others": ["연차는 희망근무 선택 불가합니다"]
-          }}
-          
-          입력: "5/12 D로 해주세요, 그리고 연차도"
-          출력:
-          {{
-            "processor": "D는 허용, 연차는 불가 → 연차 부분 Others 처리",
-            "Shift": ["5/12 D로 해주세요"],
-            "Others": ["연차는 희망근무 선택 불가합니다"]
-          }}
+        ## 자연어 → 코드 변환 규칙 (이번 그룹 정책 기반 동적 생성)
+        {dynamic_rules}
+        {disallow_rule}
 
-        ## 2. Mandatory Rules
-            | Expression | Conversion Example |
-            | - | - |
-            | Day shift | "D" |
-            | Evening   | "E" |
-            | Night     | "N" |
-            | Off/휴무    | "O" |
-            | Date formats | `M/D` or `M월 D일` are all allowed, but keep the original form in output |
-            | Periodic expressions | "매주", "주말", "평일", "격주" etc. remain as rule-based items |
+        ## 처리 규칙
+        1. 하나의 문장에 여러 요청이 섞여 있으면 의미 단위로 분리
+        2. Shift 배열의 각 요소는 하나의 요청만 포함
+        3. 패턴 요청("주말은 쉬고", "매주 수요일 OFF")은 날짜 확장 금지
+        4. 기존 희망과 새 요청 충돌 시 새 요청 우선
+        5. 모호하거나 불허용 요청은 Others로 이동
+        6. 빈 배열은 [] 유지
 
-        ## 3. Processing Guidelines
-            * Keep periodic expressions like "매주/주말/평일" exactly as in the original text, never expand into dates.
-            * Uninterpretable sentences or ambiguous expressions must be placed in Others.
+        ## 동적 Few-Shot 예시 (현재 허용 코드 기반)
+        {dynamic_few_shots}
 
-            
-            # CONTEXT:
-                "5/5는 쉬고 싶고, 5/19는 나이트 후 OFF, 그리고 정간호사, 문지영이는 좀 꺼졌으면 좋겠어"
-
-            # OUTPUT:
-                {{
-                "processor": "5/5는 쉬고싶다 했으므로 O, 5/19는 나이트, 그리고 그 후 OFF 달라고 했으니 5/20은 O로 처리, 정간호사, 문지영 관련은 preference로 처리하되, 순화적용",
-                "Chat": [],
-                "Shift": [
-                    "5/5은 쉬고 싶고",
-                    "5/19는 N,
-                    "5/20은 O"
-                ],
-                "Preference": [
-                    "정간호사랑은 겹치기 싫어요", "문지영이랑은 겹치기 싫어요"
-                ],
-                "Except": [],
-                "Others": []
-                }}
-            
-            # CONTEXT:
-                "8,9일은 데이 빼줘. 주말은 쉬고싶어"
-
-            # OUTPUT:
-                {{
-                "processor": "8, 9일은 데이 빼달라고 했으므로 제외규칙 상 Others로 처리, 주말은 쉬고싶어는 shift로 처리",
-                "Chat": [],
-                "Shift": ["주말은 쉬고싶어"],
-                "Preference": [],
-                "Except": ["8, 9일은 데이 빼줘"],
-                "Others": []
-                }}
-
+        ## 참고 예시
+        # CONTEXT:
+            "5/5는 쉬고 싶고, 5/19는 나이트 후 OFF"
+        # OUTPUT:
+            {{"processor": "...", "Shift": ["5/5은 O로 줘", "5/19는 N로 줘", "5/20은 O로 줘"], ...}}
         """
-        
-        self.human=f"""
-            # CONTEXT: 
-            {year}년 {month}월의 근무표를 짜기 위해서 다음과 같은 요청을 받았습니다.
-            {context}
-            # OUTPUT:
+
+        self.human = f"""
+        # CONTEXT: 
+        {year}년 {month}월의 근무 희망 요청입니다.
+        {context}
+        # OUTPUT:
         """
 
 
 async def query_analyzer(state):
-    print('state', state)
-    # print('state', state.__dict__)
+    print('state keys:', state.keys())  # 디버깅용
+
     context = state['request']
     year = state['year']
     month = state['month']
-    # 추가 항목
-    allowed_shifts = state.get('allowed_shifts', '')
-    query_analyzer_prompt = queryAnalyzerPrompt(context, year, month)
-    
-    # 백업 모델들 순서대로 시도
+
+    # 기존 전달 방식 유지 (호환성)
+    allowed_shifts = state.get('allowed_shifts', '없음')
+    shift_data = state.get('shift_data', '')
+
+    # 새로 추가: DB에서 가져온 shift_id → name 매핑 (wanted_service.py에서 전달해야 함)
+    allowed_shift_map = state.get('allowed_shift_map', {})  # 예: {'생': '생리휴가(무급)', '경': '경조휴가', ...}
+
+    # 백업 모델들 (기존 유지)
     models_to_try = [
-        # 1차: OpenAI (기본)
         ChatOpenAI(
             model="gpt-4.1-mini-2025-04-14",
             openai_api_key=os.getenv("OPENAI_API_KEY"),
         ),
-        # 2차: Anthropic (백업)
         ChatAnthropic(
             model="claude-3-7-sonnet-20250219",
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
         ),
-        # 3차: Google Gemini (최종 백업)
         ChatGoogleGenerativeAI(
             model="gemini-2.0-flash",
             google_api_key=os.getenv("GOOGLE_API_KEY"),
         )
     ]
-    
+
+    # ===== case 처리 로직 (기존과 동일) =====
+    enhanced_context = None
+    if state.get('case') is not None:
+        if context:  # 새 요청 있음 → 기존 case와 병합해서 LLM에 전달
+            print("case 존재 + 새로운 요청 있음 → LLM으로 병합 처리")
+            existing_cases = []
+            for c in state['case']:
+                if c.get('reason') != '기존 데이터에서 로드됨':
+                    date_str = c.get('date', '')
+                    if '-' in date_str:
+                        day = date_str.split('-')[2].lstrip('0')
+                    else:
+                        day = date_str
+                    shift = c.get('shift', '')
+                    if day and shift:
+                        existing_cases.append(f"{day}일: {shift}")
+
+            enhanced_context = f"""
+            [기존 희망 근무 - 변경하지 말고 유지하세요. 새 요청과 충돌 시 새 요청을 우선 적용하세요]
+            {', '.join(existing_cases) if existing_cases else '없음'}
+
+            [새로운 요청 - 반드시 반영하세요]
+            {context}
+            """
+        else:  # 새 요청 없음 → 과거 case 그대로 반환 (LLM 호출 생략)
+            print("case만 존재 → 과거 데이터 그대로 반환")
+            case_results = []
+            for c in state['case']:
+                if c.get('reason') != '기존 데이터에서 로드됨':
+                    date_str = c.get('date', '')
+                    try:
+                        if '-' in date_str:
+                            day = int(date_str.split('-')[2])
+                        else:
+                            day = int(date_str)
+                    except:
+                        continue
+                    shift = c.get('shift', '')
+                    if day and shift:
+                        case_results.append({
+                            'date': day,
+                            'shift': shift,
+                            'score': 1.0,
+                            'request': '단순 희망'
+                        })
+            return {
+                "case_results": case_results,
+                "query_chat": [],
+                'query_shift': [],
+                'query_preference': [],
+                'model': models_to_try[0]
+            }
+    # ===== case 처리 끝 =====
+
+    # 프롬프트 생성 (enhanced_context 있으면 그걸 사용)
+    final_context = enhanced_context or context
+    query_analyzer_prompt = queryAnalyzerPrompt(
+        final_context,
+        year,
+        month,
+        allowed_shifts=allowed_shifts,
+        shift_data=shift_data,
+        allowed_shift_map=allowed_shift_map  # 핵심 추가!
+    )
+
     messages = [
         SystemMessage(content=query_analyzer_prompt.system),
         HumanMessage(content=query_analyzer_prompt.human)
     ]
-    
+
     chat = []
     shift = []
     preference = []
@@ -277,88 +361,33 @@ async def query_analyzer(state):
     others = []
     used_model_name = ""
 
-    # ======================================================================
-    # case 기반 수동 경로 (모델 미사용)
-    # 기존 DB에서 로드된 case가 있는 경우, case_results 설정
-    # ======================================================================
-    if state['case'] != None:
-        print('case', state['case'], '\n\n\nrequest', state['request'])
-        
-        case_results = []
-        for content in state['case']:
-            # '기존 데이터에서 로드됨' 케이스는 제외 (기존 데이터 복사는 wanted_service에서 처리)
-            # if content['reason'] != '기존 데이터에서 로드됨':
-            #     date_str = content['date']
-            #     shift_type = content['shift']
-            if content.get('reason') != '기존 데이터에서 로드됨':
-                date_str = content.get('date', '')
-                shift_type = content.get('shift', '')
-                
-                if not date_str or not shift_type:
-                    continue
-                
-                # date를 일(day)로 변환 (예: "2025-05-05" -> 5)
-                # if isinstance(date_str, str) and '-' in date_str:
-                #     day = int(date_str.split('-')[2])
-                # else:
-                #     day = int(date_str)
-                if isinstance(date_str, str) and '-' in date_str:
-                    try:
-                        day = int(date_str.split('-')[2])
-                    except:
-                        continue
-                else:
-                    try:
-                        day = int(date_str)
-                    except:
-                        continue
-                
-                case_results.append({
-                    'date': day,
-                    'shift': shift_type,
-                    'score': 1.0,
-                    'request': '단순 희망'
-                })
-        
-        print(f"Query Analyzer (case 처리): case_results={case_results}")
-        
-        # case_results를 state에 설정
-        return {
-            "case_results": case_results,
-            "query_chat": [],
-            'query_shift': [],
-            'query_preference': [],
-            'model': models_to_try[0]
-        }
-
+    # LLM 호출 루프 (기존과 동일)
     for i, client in enumerate(models_to_try):
         try:
-            print(f"Query Analyzer: {i+1}차 모델 시도 중..., 모델: {client}")
-            
+            print(f"Query Analyzer: {i+1}차 모델 시도 중..., 모델: {client.model if hasattr(client, 'model') else client}")
+
             llm = client.with_structured_output(queryAnalyzer)
             response = await llm.ainvoke(messages)
-            used_model_name = getattr(client, "model", "") or used_model_name
+            used_model_name = getattr(client, "model_name", "") or getattr(client, "model", "") or used_model_name
+
             print("\n\n\nresponse", response, "\n\n\n")
-            # 성공 시 데이터 추출
+
             chat = response.Chat
             shift = response.Shift
             preference = response.Preference
             except_ = response.Except
             others = response.Others
-            
+
             print(f"Query Analyzer: {i+1}차 모델 성공!", response)
-            
             break
-            
+
         except Exception as e:
             error_msg = str(e).lower()
             print(f"Query Analyzer: {i+1}차 모델 오류 - {e}")
-            
-            # 429 (Rate limit) 또는 529 (Service unavailable) 에러인지 확인
-            if ("429" in error_msg or "rate" in error_msg or 
+
+            if ("429" in error_msg or "rate" in error_msg or
                 "529" in error_msg or "service unavailable" in error_msg or
                 "quota" in error_msg or "limit" in error_msg):
-                
                 if i < len(models_to_try) - 1:
                     print(f"Query Analyzer: {i+2}차 백업 모델로 재시도...")
                     continue
@@ -366,7 +395,6 @@ async def query_analyzer(state):
                     print("Query Analyzer: 모든 백업 모델 실패, 기본값 사용")
                     break
             else:
-                # 다른 에러는 즉시 백업 모델로 시도
                 if i < len(models_to_try) - 1:
                     print(f"Query Analyzer: 예상치 못한 오류, {i+2}차 백업 모델로 재시도...")
                     continue
@@ -374,7 +402,7 @@ async def query_analyzer(state):
                     print("Query Analyzer: 모든 모델 실패, 기본값 사용")
                     break
 
-    # 토큰/비용 계산
+    # 토큰/비용 계산 (기존 유지)
     model_name_for_calc = used_model_name or (getattr(models_to_try[0], "model", "") or "")
     prompt_tokens = _count_messages_tokens([query_analyzer_prompt.system, query_analyzer_prompt.human], model_name_for_calc)
     completion_json = json.dumps({
@@ -389,6 +417,7 @@ async def query_analyzer(state):
 
     print(f"Query Analyzer 답변: query_chat: {chat}, query_shift: {shift}, query_preference: {preference}, query_except: {except_}, query_others: {others}")
     print(f"토큰 사용량: {cost_info['usage']}, 비용(USD/KRW): {cost_info['cost_usd']} / {cost_info['cost_krw']}")
+
     return {
         "query_chat": chat,
         'query_shift': shift,
@@ -397,6 +426,3 @@ async def query_analyzer(state):
         'query_others': others,
         'model': models_to_try[0]
     }
-
-
-
