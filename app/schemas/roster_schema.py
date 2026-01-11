@@ -99,7 +99,8 @@ class PreferenceSubmit(BaseModel):
 class PreferenceData(BaseModel):
     year: int
     month: int
-    data: dict
+    # data: dict
+    data: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PublishRequest(BaseModel):

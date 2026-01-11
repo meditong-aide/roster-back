@@ -21,14 +21,7 @@ router = APIRouter(
     tags=["preferences"]
 )
 
-# [Preferences] - 간호사 개인의 선호도 초안 저장
-# @router.post("")
-# async def save_preference_draft(
-#     pref_data: PreferenceData,
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db)
-# ):
-#     return
+
 @router.post("")
 async def save_preference_draft(
     req: PreferenceData,
@@ -43,40 +36,6 @@ async def save_preference_draft(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"임시 저장 실패: {str(e)}")
 
-# [Preferences] - 선호도 최종 제출
-# @router.post("/submit")
-# async def submit_preferences(
-#     req: PreferenceSubmit,
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db)
-# ):
-#     try:
-#         # 빈 제출이 아니고 preferences가 있을 때만 검증
-#         if req.preferences and len(req.preferences) > 0:
-#             allowed_shifts = {
-#                 row[0] for row in db.query(Shift.shift_id).filter(
-#                     Shift.group_id == current_user.group_id,
-#                     Shift.show_in_preference == True
-#                 ).all()
-#             }
-            
-#             invalid_shifts = [
-#                 pref.shift_id for pref in req.preferences
-#                 if pref.shift_id not in allowed_shifts
-#             ]
-            
-#             if invalid_shifts:
-#                 raise HTTPException(
-#                     status_code=400,
-#                     detail=f"허용되지 않은 근무코드가 포함되어 있습니다: {', '.join(set(invalid_shifts))}"
-#                 )
-                
-#         return submit_preferences_service(req, current_user, db)
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"선호도 최종 제출 실패: {str(e)}")
-
 
 @router.post("/submit")
 async def submit_preferences(
@@ -86,6 +45,7 @@ async def submit_preferences(
 ):
     try:
         # 허용 근무코드 검증
+        print('req', )
         preferences = [shift_id for shift_id in req.data.values() if shift_id]
         if preferences:
             allowed_shifts = {

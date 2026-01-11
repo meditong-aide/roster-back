@@ -1,6 +1,6 @@
 import operator
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated, List, Dict, Any
+from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from agents.query_analyzer_agent import query_analyzer
 from agents.shift_analyzer_agent import create_shift_analyzer
 from agents.preference_analyzer_agent import create_preference_analyzer
@@ -48,34 +48,46 @@ class ContextAnalyticsState(TypedDict):
     case: List[Dict[str, Any]] | None
     case_results: List[Dict[str, Any]] | None
     # 신규 추가
-    allowed_shifts: str | None # "D, E, N, O, D2, E2..."
-
+    # allowed_shifts: str | None # "D, E, N, O, D2, E2..."
+    # 기존: 허용 코드 문자열 (기존 코드 호환용)
+    allowed_shifts: Optional[str]
     
+    # 핵심 추가: shift_id → name 매핑 (동적 Few-shot 생성용)
+    allowed_shift_map: Optional[Dict[str, str]]
+
 
 def GraphGenerate():
     """
     근무 희망 분석 그래프 생성
-    
+
     Returns:
         CompiledGraph: 컴파일된 그래프 객체
-    
+
     Notes:
         query_analyzer → shift/preference analyzer (병렬) → collector 순서로 실행
         case_results가 있으면 shift_analyzer에서 LLM 호출 없이 바로 반환
+        allowed_shift_map이 state에 포함되어 하위 agent에서 사용 가능
     """
     graph = StateGraph(ContextAnalyticsState)
+
+    # 노드 등록
     graph.add_node('query_analyzer', query_analyzer)
     graph.add_node('create_shift_analyzer', create_shift_analyzer)
     graph.add_node('create_preference_analyzer', create_preference_analyzer)
     graph.add_node('collector', collector)
 
+    # 실행 흐름 정의
     graph.set_entry_point('query_analyzer')
+
+    # query_analyzer에서 병렬로 shift/preference 분석기 호출
     graph.add_edge('query_analyzer', 'create_shift_analyzer')
     graph.add_edge('query_analyzer', 'create_preference_analyzer')
 
+    # 두 분석기 결과 → collector로 수집
     graph.add_edge('create_shift_analyzer', "collector")
-    graph.add_edge('create_preference_analyzer', 'collector')
+    graph.add_edge('create_preference_analyzer', "collector")
 
+    # 최종 종료
     graph.add_edge('collector', END)
 
     app = graph.compile()

@@ -9,7 +9,7 @@ from services.graph_service import graph_service
 from pydantic import BaseModel
 from routers.auth import get_current_user_from_cookie
 from db.client2 import get_db
-from db.models import Wanted
+from db.models import Wanted, NurseShiftRequest
 from schemas.auth_schema import User as UserSchema
 from db.models import Nurse, ShiftPreference
 from services.wanted_service import request_wanted_shifts_service
@@ -260,18 +260,34 @@ async def update_wanted_deadline(
     return {"message": "마감일이 성공적으로 변경되었습니다."}
 
 
-@router.post("/invoke", response_model=WantedInvokeResponse)
+# @router.post("/invoke", response_model=WantedInvokeResponse)
+@router.post("/invoke")
 async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = Depends(get_current_user_from_cookie), db: Session = Depends(get_db)):
     """
     그래프를 실행하여 로스터 관련 요청을 처리합니다.
     """
     
     try:
+        
+        import uuid
+        trace_id = str(uuid.uuid4())[:8]
+        print(f"[INVOKE START] trace_id={trace_id} | nurse_id={current_user.nurse_id} | request={request.request}")
         result = await invoke_and_persist_wanted_service(request, current_user, db)
-        return WantedInvokeResponse(response=result)
+        
+        # 서비스 끝난 후 강제 commit + flush
+        db.flush()  # 변경 사항 즉시 반영
+        db.commit() # 한번 더 강제 commit
+        
+        print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
+        # return WantedInvokeResponse(response=result)
+        return result
     except Exception as e:
+        db.rollback()
         print(f'error', e)
         raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        pass
 
     
 def parse_shift_results(

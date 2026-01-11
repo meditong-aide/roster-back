@@ -138,7 +138,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
         )
         
         if shifts:
-            print('shifts', [s.__dict__ for s in shifts])
+            # print('shifts', [s.__dict__ for s in shifts])
             
             return [
                 {
