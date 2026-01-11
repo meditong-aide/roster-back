@@ -64,30 +64,30 @@ def _next_request_id(db: Session, nurse_id: str, month_str: str) -> int:
 
 
 def _persist_wanted_request(db: Session, nurse_id: str, month_str: str, request: str | List[str]) -> int:
-    """wanted_requests 레코드를 저장하고 request_id 를 반환합니다.
-
-    인자:
-        db: DB 세션
-        nurse_id: 간호사 ID
-        month_str: 'YYYY-MM'
-        request: 요청 텍스트 (문자열 또는 리스트)
-
-    반환:
-        새로 생성된 request_id
-    
-    Notes:
-        request가 리스트인 경우 '\n'로 join하여 문자열로 변환
-    """
+    """wanted_requests 레코드를 저장하고 request_id 를 반환합니다."""
     request_id = _next_request_id(db, nurse_id, month_str)
     
-    # request가 리스트면 문자열로 변환
+    def clean_text(text: Any) -> str:
+        if not text:
+            return ''
+        s = str(text).strip()
+        # 빈 줄 완전 제거 + 연속 개행 → 단일 개행
+        lines = [line.strip() for line in s.splitlines() if line.strip()]
+        return '\n'.join(lines)
+
     if isinstance(request, list):
-        # '기존 데이터에서 로드됨' 제외하고 join
-        filtered_requests = [r for r in request if r != '기존 데이터에서 로드됨']
-        request_text = '\n'.join(filtered_requests) if filtered_requests else ''
+        cleaned = []
+        for item in request:
+            cleaned_item = clean_text(item)
+            if cleaned_item and cleaned_item != '기존 데이터에서 로드됨':
+                cleaned.append(cleaned_item)
+        request_text = '\n'.join(cleaned)
     else:
-        request_text = (request or '').strip()
-    print(f'request_text, {request_text}')
+        request_text = clean_text(request)
+
+    # 디버깅용 (나중에 지워도 됨)
+    print(f"[DEBUG] 저장할 request_text (repr): {repr(request_text)}")
+
     wr = WantedRequest(
         nurse_id=nurse_id,
         request_id=request_id,
@@ -233,11 +233,7 @@ def _persist_pair_results(
 def _parse_shift_results(
     response: List[List[Dict[str, Any]]]
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
-    """
-    그래프 결과에서 shift_result를 모아
-    {'E': {4: {'score': 1.9, 'request': '4일은 E로 주세요'}}, ...}
-    형태로 변환합니다.
-    """
+    """그래프 결과에서 shift_result를 정리합니다."""
     parsed: Dict[str, Dict[int, Dict[str, Any]]] = {}
 
     if not isinstance(response, list):
@@ -253,7 +249,6 @@ def _parse_shift_results(
                 continue
 
             for sr in shift_results:
-                # nested 구조 평탄화
                 record = (
                     sr["result"]
                     if isinstance(sr, dict) and "result" in sr and isinstance(sr["result"], dict)
@@ -270,9 +265,9 @@ def _parse_shift_results(
 
                 if not isinstance(dates, list) or not isinstance(scores, list):
                     continue
+
                 if not isinstance(requests, list):
-                    # 단일 문자열로 들어오면 리스트로 감싸기
-                    requests = [requests]
+                    requests = [requests] if requests else []
 
                 n = min(len(dates), len(scores), len(requests) if requests else len(dates))
 
@@ -281,11 +276,22 @@ def _parse_shift_results(
                     try:
                         d = int(dates[i])
                         s = float(scores[i])
+
+                        # request 값 청소 (핵심)
                         req = requests[i] if i < len(requests) else None
+                        if req is not None:
+                            req_str = str(req).strip()
+                            cleaned_lines = [line.strip() for line in req_str.splitlines() if line.strip()]
+                            req_cleaned = '\n'.join(cleaned_lines)
+                            if not req_cleaned:
+                                req_cleaned = None
+                        else:
+                            req_cleaned = None
+
                     except (TypeError, ValueError):
                         continue
 
-                    bucket[d] = {"score": s, "request": req}
+                    bucket[d] = {"score": s, "request": req_cleaned}
 
     return parsed
 
@@ -443,12 +449,28 @@ def _copy_existing_requests_to_new(
 
 
 def normalize_request_text(value: Any) -> str:
-    if value is None:
+    """모든 입력값을 깔끔하게 정리해서 반환합니다."""
+    if value is None or value == '':
         return '기존 데이터 업데이트'
+
+    def clean(text: Any) -> str:
+        if not text:
+            return ''
+        s = str(text).strip()
+        lines = [line.strip() for line in s.splitlines() if line.strip()]
+        return '\n'.join(lines)
+
     if isinstance(value, list):
-        filtered = [r for r in value if r and r != '기존 데이터에서 로드됨']
-        return '\n'.join(filtered) if filtered else '기존 데이터 업데이트'
-    return str(value).strip() or '기존 데이터 업데이트'
+        cleaned = []
+        for v in value:
+            c = clean(v)
+            if c and c != '기존 데이터에서 로드됨':
+                cleaned.append(c)
+        result = '\n'.join(cleaned)
+    else:
+        result = clean(value)
+
+    return result or '기존 데이터 업데이트'
 
 
 def cleanup_previous_requests(db: Session, nurse_id: str, month_str: str, current_request_id: int):
