@@ -30,9 +30,7 @@ class RemoveShiftRequest(BaseModel):
 class ShiftUpdateRequest(BaseModel):
     """시프트 수정 요청 모델."""
     default_shift: Optional[str] = None
-    shift_gb: Optional[Literal["D", "E", "N", "O"]] = Field(
-        default=None, description="근무 분류(D/E/N/O). null 허용"
-    )
+    shift_gb: Optional[str] = None
     shift_id: str
     name: str
     color: str
@@ -44,16 +42,13 @@ class ShiftUpdateRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     id: int
-    shift_gb: Optional[str] = None
     # 추가
     show_in_preference: Optional[bool] = None # None이면 기존 값 유지
 
 class ShiftAddRequest(BaseModel):
     """시프트 등록 요청 모델."""
     default_shift: Optional[str] = None
-    shift_gb: Optional[Literal["D", "E", "N", "O"]] = Field(
-        default=None, description="근무 분류(D/E/N/O). null 허용"
-    )
+    shift_gb: Optional[str] = None
     shift_id: str
     name: str
     color: str
