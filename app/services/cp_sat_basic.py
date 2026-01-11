@@ -689,8 +689,8 @@ class CPSATBasicEngine:
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
                                       roster_system.num_days)
         remaining = time_limit_seconds - base_tl
-        per_iter = 3
-        max_iter = remaining // per_iter
+        per_iter = 8
+        max_iter = max(0, remaining // per_iter)
 
         if max_iter==0:
             return best_viol==0
@@ -2373,10 +2373,7 @@ def _solve_neighbourhood(rs, n_set, d_set, tl, grouped, run_seed: int | None = N
         solver.parameters.random_seed = (run_seed ^ tweak) & 0x7fffffff
         solver.parameters.solution_pool_size = 10
     solver.parameters.max_time_in_seconds=tl
-    solver.parameters.num_search_workers = min(
-    os.cpu_count(),
-    6  # CP-SAT 경험상 sweet spot
-    )
+    solver.parameters.num_search_workers = 10
     solver.parameters.relative_gap_limit = 0.1
     st=solver.Solve(model)
     if st not in (cp_model.OPTIMAL,cp_model.FEASIBLE): return False
