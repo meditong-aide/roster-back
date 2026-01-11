@@ -272,6 +272,7 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
 
     target_group_id = override_group_id or current_user.group_id
     existing_shift = db.query(Shift).filter(Shift.id == req.id, Shift.group_id == target_group_id).first()
+    print('existing_shift.shift_gb before', existing_shift.shift_gb)
     if not existing_shift:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
     old_shift_id = existing_shift.shift_id
@@ -289,7 +290,7 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     # 원티드 페이지 노출 여부 업데이트
     if hasattr(req, "show_in_preference") and req.show_in_preference is not None:
         existing_shift.show_in_preference = req.show_in_preference
-
+    print('existing_shift.shift_gb after', existing_shift.shift_gb)
     db.commit()
     db.refresh(existing_shift)
     _append_shift_manage_code(

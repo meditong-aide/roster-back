@@ -201,16 +201,16 @@ class NurseProfile(BaseModel):
         description="근무 가능 형태 배열. 예: ['D', 'E2', 'N1', 'MD'] 또는 ['D', 'N']"
     )
     
-    @field_validator('fixed_shift')
-    @classmethod
-    def check_fixed_shift_with_weekend_off(cls, v: Any, info: ValidationInfo) -> Any:
-        # info.data 에서 이미 검증된 다른 필드 값들을 가져옴
-        is_weekend_off = info.data.get('is_weekend_off', False) if info.data else False
-        if not is_weekend_off:
-            return None  # 주말 휴무 미적용 시 fixed_shift는 None으로 강제
-        if v in ('M', 'D', None, ''):
-            return None if v in ('', None) else v
-        raise ValueError('fixed_shift는 주말 휴무 적용 시 "M", "D" 또는 없음만 가능합니다.')
+    # @field_validator('fixed_shift')
+    # @classmethod
+    # def check_fixed_shift_with_weekend_off(cls, v: Any, info: ValidationInfo) -> Any:
+    #     # info.data 에서 이미 검증된 다른 필드 값들을 가져옴
+    #     is_weekend_off = info.data.get('is_weekend_off', False) if info.data else False
+    #     if not is_weekend_off:
+    #         return None  # 주말 휴무 미적용 시 fixed_shift는 None으로 강제
+    #     if v in ('M', 'D', None, ''):
+    #         return None if v in ('', None) else v
+    #     raise ValueError('fixed_shift는 주말 휴무 적용 시 "M", "D" 또는 없음만 가능합니다.')
 
     class Config:
         from_attributes = True

@@ -574,7 +574,7 @@ def bulk_update_nurses_service(
 
     if not target_group_id:
         raise Exception("그룹 ID를 확인할 수 없습니다.")
-
+    # print('nurses_data', [(n.name, n.fixed_shift) for n in nurses_data])
     # 그룹 내 모든 간호사 미리 로드 (효율성)
     db_nurses_dict = {
         n.nurse_id: n for n in db.query(NurseModel)
@@ -594,7 +594,7 @@ def bulk_update_nurses_service(
 
             # 변경된 필드만 추출
             update_data = profile.dict(exclude_unset=True)
-
+            # print('update_data', update_data)
             # active 변경 시 sequence 자동 조정
             old_active = db_nurse.active
             new_active = update_data.get('active', old_active)
@@ -603,23 +603,23 @@ def bulk_update_nurses_service(
                     target_group_id, new_active, db
                 )
 
-            # === 주말 휴무 + 고정 근무 연동 로직 (기존 유지 + 약간 개선) ===
-            requested_is_weekend_off = update_data.get('is_weekend_off', db_nurse.is_weekend_off)
-            requested_fixed_shift = update_data.get('fixed_shift')
+            # # === 주말 휴무 + 고정 근무 연동 로직 (기존 유지 + 약간 개선) ===
+            # requested_is_weekend_off = update_data.get('is_weekend_off', db_nurse.is_weekend_off)
+            # requested_fixed_shift = update_data.get('fixed_shift')
 
-            db_nurse.is_weekend_off = requested_is_weekend_off
+            # db_nurse.is_weekend_off = requested_is_weekend_off
 
-            if requested_is_weekend_off:
-                if requested_fixed_shift in ('M', 'D', None, ''):
-                    db_nurse.fixed_shift = requested_fixed_shift if requested_fixed_shift else None
-                else:
-                    logging.warning(
-                        f"[INVALID FIXED_SHIFT] nurse_id={db_nurse.nurse_id} ({db_nurse.name}) "
-                        f"tried invalid fixed_shift='{requested_fixed_shift}' with is_weekend_off=True → forced to None"
-                    )
-                    db_nurse.fixed_shift = None
-            else:
-                db_nurse.fixed_shift = None
+            # if requested_is_weekend_off:
+            #     if requested_fixed_shift in ('M', 'D', None, ''):
+            #         db_nurse.fixed_shift = requested_fixed_shift if requested_fixed_shift else None
+            #     else:
+            #         logging.warning(
+            #             f"[INVALID FIXED_SHIFT] nurse_id={db_nurse.nurse_id} ({db_nurse.name}) "
+            #             f"tried invalid fixed_shift='{requested_fixed_shift}' with is_weekend_off=True → forced to None"
+            #         )
+            #         db_nurse.fixed_shift = None
+            # else:
+            #     db_nurse.fixed_shift = None
 
             # === ★★★ 새로 추가: work_shifts 처리 ★★★ ===
             if 'work_shifts' in update_data:
@@ -627,45 +627,45 @@ def bulk_update_nurses_service(
                 # None이 오면 빈 배열로 초기화
                 db_nurse.work_shifts = update_data['work_shifts'] if update_data['work_shifts'] is not None else []
 
-            # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
-            for key, value in update_data.items():
-                if key in ('is_weekend_off', 'fixed_shift', 'work_shifts'):
-                    continue  # 위에서 별도 처리
-                if hasattr(db_nurse, key):
-                    setattr(db_nurse, key, value)
+            # # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
+            # for key, value in update_data.items():
+            #     if key in ('is_weekend_off', 'fixed_shift', 'work_shifts'):
+            #         continue  # 위에서 별도 처리
+            #     if hasattr(db_nurse, key):
+            #         setattr(db_nurse, key, value)
 
-            updated_count += 1
+            # updated_count += 1
 
-        # === 신규 간호사 생성 ===
-        else:
-            nurse_dict = profile.dict()
-            nurse_dict.pop('group_id', None)
+        # # === 신규 간호사 생성 ===
+        # else:
+        #     nurse_dict = profile.dict()
+        #     nurse_dict.pop('group_id', None)
 
-            # 신규 생성 시 주말 휴무 연동
-            if nurse_dict.get('is_weekend_off'):
-                if nurse_dict.get('fixed_shift') not in ('M', 'D', None, ''):
-                    nurse_dict['fixed_shift'] = None
-            else:
-                nurse_dict['fixed_shift'] = None
+        #     # 신규 생성 시 주말 휴무 연동
+        #     if nurse_dict.get('is_weekend_off'):
+        #         if nurse_dict.get('fixed_shift') not in ('M', 'D', None, ''):
+        #             nurse_dict['fixed_shift'] = None
+        #     else:
+        #         nurse_dict['fixed_shift'] = None
 
-            # 신규 생성 시 work_shifts 기본값 처리
-            if 'work_shifts' not in nurse_dict or nurse_dict['work_shifts'] is None:
-                nurse_dict['work_shifts'] = []
+        #     # 신규 생성 시 work_shifts 기본값 처리
+        #     if 'work_shifts' not in nurse_dict or nurse_dict['work_shifts'] is None:
+        #         nurse_dict['work_shifts'] = []
 
-            # sequence 자동 설정
-            active_status = nurse_dict.get('active', 1)
-            if 'sequence' not in nurse_dict or nurse_dict['sequence'] is None:
-                nurse_dict['sequence'] = get_next_sequence_for_active_status(
-                    target_group_id, active_status, db
-                )
+        #     # sequence 자동 설정
+        #     active_status = nurse_dict.get('active', 1)
+        #     if 'sequence' not in nurse_dict or nurse_dict['sequence'] is None:
+        #         nurse_dict['sequence'] = get_next_sequence_for_active_status(
+        #             target_group_id, active_status, db
+        #         )
 
-            try:
-                new_nurse = NurseModel(**nurse_dict, group_id=target_group_id)
-                db.add(new_nurse)
-                updated_count += 1
-            except Exception as e:
-                logging.error(f"신규 간호사 생성 실패 (nurse_id={profile.nurse_id}): {e}")
-                continue
+        #     try:
+        #         new_nurse = NurseModel(**nurse_dict, group_id=target_group_id)
+        #         db.add(new_nurse)
+        #         updated_count += 1
+        #     except Exception as e:
+        #         logging.error(f"신규 간호사 생성 실패 (nurse_id={profile.nurse_id}): {e}")
+        #         continue
 
     # === 클라이언트에서 제외된 간호사 삭제 ===
     client_nurse_ids = {profile.nurse_id for profile in nurses_data}
