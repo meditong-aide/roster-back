@@ -128,6 +128,7 @@ class CPSATBasicEngine:
         two_offs_per_week = config_data.get('two_offs_per_week', True)
         sequential_offs = config_data.get('sequential_offs', True)
         even_nights = config_data.get('even_nights', True)
+        off_placement_mode = int(config_data.get('off_placement_mode', 0) or 0)
         
         # 가중치 설정 - Night Keep은 E와 차별화
         shift_weights = config_data.get('shift_preference_weights', {
@@ -243,7 +244,8 @@ class CPSATBasicEngine:
             oversupply_equalize_enable=bool(config_data.get('oversupply_equalize_enable', True)),
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
-            weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True))
+            weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
+            off_placement_mode=1,
         )
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
@@ -452,6 +454,26 @@ class CPSATBasicEngine:
             initial_constraints = config_data.get('initial_constraints') or {}
             allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
             rs_dbid_to_idx = {n.db_id: n.id for n in nurses}
+            config.off_placement_mode = int(getattr(config, "off_placement_mode", 0) or 0)
+            weekly_off_map_raw = config_data.get("weekly_off_map") or {}
+            weekly_off_by_idx: dict[int, list[int]] = {}
+            for dbid, day_list in (weekly_off_map_raw or {}).items():
+                n_idx = rs_dbid_to_idx.get(str(dbid))
+                if n_idx is None:
+                    continue
+                try:
+                    weekly_off_by_idx[n_idx] = sorted({int(d) for d in day_list})
+                except Exception:
+                    continue
+            roster_system.weekly_off_by_idx = weekly_off_by_idx
+            prev_last_off_raw = config_data.get("prev_month_last_is_off") or {}
+            prev_last_off_by_idx: dict[int, bool] = {}
+            for dbid, flag in (prev_last_off_raw or {}).items():
+                n_idx = rs_dbid_to_idx.get(str(dbid))
+                if n_idx is None:
+                    continue
+                prev_last_off_by_idx[n_idx] = bool(flag)
+            roster_system.prev_month_last_is_off = prev_last_off_by_idx
             # forced_off: { nurse_db_id: [day_idx,...] }
             forced_off = initial_constraints.get('forced_off') or {}
             if forced_off:
@@ -939,6 +961,56 @@ class CPSATBasicEngine:
                                     f"nurse_index={n}, day={d+1}"
                                 )
                             m.Add(X(n, d, off_idx) == 0)
+
+            off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
+            weekly_off_by_idx = (
+                getattr(roster_system, "weekly_off_by_idx", {})
+                if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
+                else {}
+            )
+            prev_month_last_is_off = (
+                getattr(roster_system, "prev_month_last_is_off", {})
+                if isinstance(getattr(roster_system, "prev_month_last_is_off", {}), dict)
+                else {}
+            )
+            if off_placement_mode > 0 and weekly_off_by_idx:
+                for n, day_list in weekly_off_by_idx.items():
+                    if n >= len(join):
+                        continue
+                    T0, T1 = join[n], leave[n]
+                    for d_raw in day_list or []:
+                        try:
+                            d = int(d_raw)
+                        except Exception:
+                            continue
+                        if d < T0 or d > T1:
+                            continue
+                        if d == D - 1:
+                            continue
+                        if d == 0:
+                            if bool(prev_month_last_is_off.get(n, False)):
+                                continue
+                            if d + 1 <= T1:
+                                m.Add(X(n, d + 1, off_idx) == 1)
+                            continue
+                        if off_placement_mode == 1:
+                            print('주휴 앞 O!!!!!!!!')
+                            neighbours = []
+                            if d - 1 >= T0:
+                                neighbours.append(X(n, d - 1, off_idx))
+                            if d + 1 <= T1:
+                                neighbours.append(X(n, d + 1, off_idx))
+                            if not neighbours:
+                                continue
+                            if len(neighbours) == 1:
+                                m.Add(neighbours[0] == 1)
+                            else:
+                                m.Add(sum(neighbours) >= 1)
+                        else:
+                            if d - 1 >= T0:
+                                m.Add(X(n, d - 1, off_idx) == 1)
+                            elif d + 1 <= T1:
+                                m.Add(X(n, d + 1, off_idx) == 1)
 
             # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
             try:

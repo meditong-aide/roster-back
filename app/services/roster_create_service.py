@@ -1005,7 +1005,13 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         print(f"[CrossMonth] 이전 달 꼬리 패턴 조회 완료: {len(last_map)}명")
     except Exception as e:
         print("[ERR] _get_last_days_map:", e)
-        raise    
+        raise
+    prev_month_last_main: dict[str, str | None] = {}
+    prev_month_last_is_off: dict[str, bool] = {}
+    for nurse_id, seq in last_map.items():
+        last_code = seq[-1] if seq else None
+        prev_month_last_main[nurse_id] = last_code
+        prev_month_last_is_off[nurse_id] = bool(last_code == "O")
     forced_off = defaultdict(list)
     forbidden = defaultdict(lambda: defaultdict(list))
 
@@ -1158,7 +1164,12 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     off_cnt = sum(len(v) for v in forced_off.values())
     forb_cnt = sum(len(ss) for v in forbidden.values() for ss in v.values())
     print(f"강제 OFF {off_cnt}건, 금지 셀 {forb_cnt}건 적용")
-    return {'forced_off': forced_off, 'forbidden': forbidden}
+    return {
+        'forced_off': forced_off,
+        'forbidden': forbidden,
+        'prev_month_last_main': prev_month_last_main,
+        'prev_month_last_is_off': prev_month_last_is_off,
+    }
 
 
 def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, str]:
@@ -1430,6 +1441,9 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
     except Exception as e:
         print(f"이전 월 경계 제약 생성 실패: {e}")
+    prev_month_last_is_off = cross_month_constraints.get("prev_month_last_is_off") or {}
+    if prev_month_last_is_off:
+        config_dict["prev_month_last_is_off"] = prev_month_last_is_off
 
     # ── 3) 병합 후 주입(금지/강제OFF 합집합) ──
     config_dict["initial_constraints"] = _merge_initial_constraints(
@@ -1887,6 +1901,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             print(f"[WeeklyOff] 간호사 {nurse_name}({nurse_id}, index={n_idx}): 주휴 day_idx={day_list} (실제 날짜: {[d+1 for d in day_list]})")
             for d in day_list:
                 weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
+    config_dict["weekly_off_map"] = {k: sorted(list(v)) for k, v in weekly_off_map.items()}
 
     generated: dict[str, list[str]] = {}
     satisfaction_data = {}
@@ -2020,6 +2035,7 @@ def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
             fixed_cells=fixed_cells,
             weekly_off_cells=weekly_off_fixed_cells,
         )
+    config_dict["weekly_off_map"] = {k: sorted(list(v)) for k, v in weekly_off_map.items()}
 
     generated: dict[str, list[str]] = {}
     satisfaction_data = {}
