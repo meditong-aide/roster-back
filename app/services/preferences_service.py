@@ -12,98 +12,6 @@ from schemas.auth_schema import User as UserSchema
 from datetime import datetime, timezone, timedelta
 
 
-# def submit_preferences_service(
-#     req: PreferenceData, 
-#     current_user: UserSchema, 
-#     db: Session,
-#     is_draft: bool = False  # ← 신규 파라미터 (True: 임시 저장, False: 제출)
-# ):
-#     """
-#     희망근무 저장/제출 통합 서비스
-#     - is_draft=True: 임시 저장
-#     - is_draft=False: 최종 제출
-#     """
-#     month_str = f"{req.year}-{req.month:02d}"
-    
-#     # draft 찾기/생성 (기존 로직)
-#     draft = db.query(WantedRequest).filter(
-#         WantedRequest.nurse_id == current_user.nurse_id,
-#         WantedRequest.month == month_str,
-#         WantedRequest.is_submitted == False
-#     ).first()
-    
-#     if draft:
-#         request_id = draft.request_id
-#     else:
-#         draft = WantedRequest(
-#             nurse_id=current_user.nurse_id,
-#             month=month_str,
-#             request="",
-#             is_submitted=False,
-#             created_at=datetime.now()
-#         )
-#         db.add(draft)
-#         db.flush()
-#         request_id = draft.request_id
-    
-#     # 기존 상세 데이터 삭제
-#     # db.query(NurseShiftRequest).filter(
-#     #     NurseShiftRequest.nurse_id == current_user.nurse_id,
-#     #     NurseShiftRequest.request_id == request_id
-#     # ).delete()
-#     if not is_draft:  # 최종 제출일 때만 이전 데이터 지우기
-#         db.query(NurseShiftRequest).filter(
-#             NurseShiftRequest.nurse_id == current_user.nurse_id,
-#             NurseShiftRequest.request_id == request_id
-#         ).delete()
-#         db.query(NursePairRequest).filter(
-#             NursePairRequest.nurse_id == current_user.nurse_id,
-#             NursePairRequest.request_id == request_id
-#         ).delete()
-    
-#     # ==================== 핵심: AIDE 응답 형식 호환 ====================
-#     data_to_save = {}
-    
-#     if isinstance(req.data, dict):
-#         # AIDE 응답 형식 (shift 객체 포함)
-#         shift_data = req.data.get("shift", {})
-#         if isinstance(shift_data, dict):
-#             for shift_id, days in shift_data.items():
-#                 if isinstance(days, dict):
-#                     for day_str in days.keys():
-#                         full_date = f"{req.year}-{req.month:02d}-{int(day_str):02d}"
-#                         data_to_save[full_date] = shift_id
-#         # 직접 입력 형식 ({ "2027-08-14": "D" })
-#         else:
-#             data_to_save = req.data
-    
-#     # ==================== 상세 데이터 저장 ====================
-#     detailed_id = 1
-#     for date_str, shift_id in data_to_save.items():
-#         if shift_id:
-#             db.add(NurseShiftRequest(
-#                 nurse_id=current_user.nurse_id,
-#                 request_id=request_id,
-#                 detailed_request_id=detailed_id,
-#                 shift_date=date_str,
-#                 shift=shift_id,
-#                 score=1.0,
-#                 partial_request=""
-#             ))
-#             detailed_id += 1
-    
-#     # 제출 처리
-#     if not is_draft:
-#         draft.is_submitted = True
-#         draft.submitted_at = datetime.now()
-    
-#     db.commit()
-    
-#     return {
-#         "message": "임시 저장되었습니다." if is_draft else "제출이 완료되었습니다."
-#     }
-
-
 def submit_preferences_service(
     req: PreferenceData, 
     current_user: UserSchema, 
@@ -123,7 +31,7 @@ def submit_preferences_service(
         WantedRequest.nurse_id == current_user.nurse_id,
         WantedRequest.month == month_str,
         WantedRequest.is_submitted == False
-    ).first()
+    ).order_by(WantedRequest.created_at.desc()).first()
     
     if draft:
         request_id = draft.request_id
@@ -139,18 +47,7 @@ def submit_preferences_service(
         db.flush()
         request_id = draft.request_id
     
-    # 최종 제출 시에만 이전 데이터 삭제
-    if not is_draft:
-        db.query(NurseShiftRequest).filter(
-            NurseShiftRequest.nurse_id == current_user.nurse_id,
-            NurseShiftRequest.request_id == request_id
-        ).delete()
-        db.query(NursePairRequest).filter(
-            NursePairRequest.nurse_id == current_user.nurse_id,
-            NursePairRequest.request_id == request_id
-        ).delete()
-    
-    # ==================== 핵심: 데이터 처리 ====================
+    # ==================== 핵심: 항상 data_to_save 초기화 (에러 방지) ====================
     data_to_save = {}
     
     if isinstance(preference_data, dict):
@@ -165,10 +62,21 @@ def submit_preferences_service(
                             full_date = f"{req.year}-{req.month:02d}-{day_num:02d}"
                             data_to_save[full_date] = shift_id
                         except (ValueError, TypeError):
-                            continue  # 잘못된 키 무시
+                            continue
         else:
             # 평평한 {날짜: shift} 형식
             data_to_save = preference_data
+    
+    # 최종 제출 시에만 이전 데이터 삭제 (data_to_save가 있을 때만)
+    if not is_draft and data_to_save:  # ← 이제 안전하게 참조 가능
+        db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.nurse_id == current_user.nurse_id,
+            NurseShiftRequest.request_id == request_id
+        ).delete()
+        db.query(NursePairRequest).filter(
+            NursePairRequest.nurse_id == current_user.nurse_id,
+            NursePairRequest.request_id == request_id
+        ).delete()
     
     # ==================== 상세 데이터 저장 ====================
     detailed_id = 1
