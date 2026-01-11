@@ -1563,9 +1563,9 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
             work_shifts = item.get('work_shifts', []) or []
 
             nurse_id = item.get('nurse_id')
-            if not nurse_id or not isinstance(nurse_id, str) or len(str(nurse_id).strip()) < 8:
-                nurse_id = str(uuid.uuid4())
-                print(f"   → nurse_id 자동 생성: {nurse_id}")
+            # if not nurse_id or not isinstance(nurse_id, str) or len(str(nurse_id).strip()) < 8:
+            #     nurse_id = str(uuid.uuid4())
+            print(f"   → nurse_id 자동 생성: {nurse_id}")
 
             existing = db.query(NurseModel).filter(
                 NurseModel.account_id == account_id

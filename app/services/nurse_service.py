@@ -626,10 +626,13 @@ def bulk_update_nurses_service(
                 # 프론트에서 List[str]로 오면 그대로 JSON 컬럼에 저장 (SQLAlchemy가 자동 변환)
                 # None이 오면 빈 배열로 초기화
                 db_nurse.work_shifts = update_data['work_shifts'] if update_data['work_shifts'] is not None else []
-
+            if 'weekly_off_weekday' in update_data and update_data['weekly_off_weekday'] is not None:
+                db_nurse.weekly_off_enabled = 1
+            else:
+                db_nurse.weekly_off_enabled = 0
             # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
             for key, value in update_data.items():
-                if key in ('work_shifts',):
+                if key in ('work_shifts'):
                     continue
                 if hasattr(db_nurse, key):
                     setattr(db_nurse, key, value)
