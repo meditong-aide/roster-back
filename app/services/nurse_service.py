@@ -627,12 +627,12 @@ def bulk_update_nurses_service(
                 # None이 오면 빈 배열로 초기화
                 db_nurse.work_shifts = update_data['work_shifts'] if update_data['work_shifts'] is not None else []
 
-            # # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
-            # for key, value in update_data.items():
-            #     if key in ('is_weekend_off', 'fixed_shift', 'work_shifts'):
-            #         continue  # 위에서 별도 처리
-            #     if hasattr(db_nurse, key):
-            #         setattr(db_nurse, key, value)
+            # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
+            for key, value in update_data.items():
+                if key in ('work_shifts',):
+                    continue
+                if hasattr(db_nurse, key):
+                    setattr(db_nurse, key, value)
 
             # updated_count += 1
 
