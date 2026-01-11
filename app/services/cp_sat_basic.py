@@ -192,7 +192,6 @@ class CPSATBasicEngine:
             # 법규 제약사항 (Hard Constraints)
             max_night_shifts_per_month=max_nig_per_month,
             max_consecutive_nights=3 if three_seq_nig else 2,
-            # not_one_night=bool(config_data.get("not_one_night", False)),
             not_one_night=True,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
@@ -994,7 +993,7 @@ class CPSATBasicEngine:
                                 m.Add(X(n, d + 1, off_idx) == 1)
                             continue
                         if off_placement_mode == 1:
-                            print('주휴 앞 O!!!!!!!!')
+                            # print('주휴 앞 O!!!!!!!!')
                             neighbours = []
                             if d - 1 >= T0:
                                 neighbours.append(X(n, d - 1, off_idx))
@@ -1204,12 +1203,19 @@ class CPSATBasicEngine:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
                     for d in range(T0 + 1, T1 - 1):
-                        # 법정 필수(요청): 폴백에서도 하드로 강제
-                        xn0 = X(n, d, night_idx)
-                        xn1 = X(n, d - 1, night_idx)
-                        m.Add(X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2).OnlyEnforceIf(
-                            [xn0, xn1]
-                        )
+                        # 블록이 2N 이상이고, d가 블록의 끝일 때만 회복 부족량을 계상 (3N 내부는 0)
+                        xn_prev = X(n, d - 1, night_idx)
+                        xn_curr = X(n, d, night_idx)
+                        xn_next = X(n, d + 1, night_idx)
+                        end_block = m.NewBoolVar(f'end_2n_soft_{n}_{d}')
+                        m.Add(end_block == xn_next.Not())
+                        need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)  # 0..2
+                        miss = m.NewIntVar(0, 2, f'rec2n2o_{n}_{d}')
+                        m.Add(miss == 0).OnlyEnforceIf(end_block.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn_prev.Not())
+                        m.Add(miss == 0).OnlyEnforceIf(xn_curr.Not())
+                        m.Add(miss == 2 - need).OnlyEnforceIf([xn_prev, xn_curr, end_block])
+                        safety['rec_2n2o'].append(miss)
 
             # 금지 패턴 N-O-D/E
             if getattr(cfg, 'nod_noe', True):
@@ -2176,9 +2182,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
         if cfg.two_offs_after_two_nig:
             for d in range(T0 + 1, T1 - 1):
-                # (N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
+                # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
+                xn_prev = X(n, d - 1, night)
+                xn_curr = X(n, d, night)
+                xn_next = X(n, d + 1, night)
+                end_block = m.NewBoolVar(f'end_2n_main_{n}_{d}')
+                m.Add(end_block == xn_next.Not())
                 m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
-                    [X(n, d, night), X(n, d - 1, night)]
+                    [xn_prev, xn_curr, end_block]
                 )
 
     # ───────────── 4. Soft (패널티 변수) ───────
