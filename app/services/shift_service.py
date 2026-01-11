@@ -239,7 +239,7 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         sequence=max_sequence + 1,
         shift_gb=req.shift_gb,
         # 추가
-        show_in_prefereence=getattr(req, "show_in_preference", False) # 프론트 미 전송 시 False
+        show_in_preference=getattr(req, "show_in_preference", False) # 프론트 미 전송 시 False
     )
     db.add(new_shift)
     db.commit()
@@ -269,11 +269,9 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     """
     if not current_user or not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
-    print('req! ', req)
 
     target_group_id = override_group_id or current_user.group_id
     existing_shift = db.query(Shift).filter(Shift.id == req.id, Shift.group_id == target_group_id).first()
-    
     if not existing_shift:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
     old_shift_id = existing_shift.shift_id
@@ -288,7 +286,6 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     existing_shift.allday = req.allday
     existing_shift.auto_schedule = req.auto_schedule
     existing_shift.shift_gb = req.shift_gb
-
     # 원티드 페이지 노출 여부 업데이트
     if hasattr(req, "show_in_preference") and req.show_in_preference is not None:
         existing_shift.show_in_preference = req.show_in_preference

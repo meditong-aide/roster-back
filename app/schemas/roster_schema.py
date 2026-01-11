@@ -44,6 +44,7 @@ class ShiftUpdateRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     id: int
+    shift_gb: Optional[str] = None
     # 추가
     show_in_preference: Optional[bool] = None # None이면 기존 값 유지
 
