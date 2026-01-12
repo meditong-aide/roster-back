@@ -583,7 +583,7 @@ def bulk_update_nurses_service(
     }
 
     updated_count = 0
-
+    print('db_nurses_dict', nurses_data)
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
 
@@ -674,7 +674,8 @@ def bulk_update_nurses_service(
     client_nurse_ids = {profile.nurse_id for profile in nurses_data}
     for db_nurse_id, db_nurse in list(db_nurses_dict.items()):
         if db_nurse_id not in client_nurse_ids:
-            db.delete(db_nurse)
+            print('제외된 간호사 for test:', db_nurse_id)
+    #         db.delete(db_nurse)
 
     db.commit()
 

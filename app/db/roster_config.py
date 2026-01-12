@@ -36,7 +36,7 @@ class NurseRosterConfig:
     extra_off_penalty_weight: int = 80  # 추가 OFF(여유 OFF)를 기피하는 목적함수 패널티 가중치
     soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
     soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
-    off_placement_mode: int = 0  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)
+    off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)
     distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off
     monthly_preference_weight: int = 60  # 월단위 선호(개인 입력) 보너스 가중치(soft)
     
