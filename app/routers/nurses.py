@@ -486,37 +486,44 @@ async def get_personnel_basic_info(
                 work_place = team.team_name
         
         # Member 테이블에서 이메일 + PortableTel 보강
-        member_row = msdb_manager.fetch_one(
+        member_raw = msdb_manager.fetch_one(
             Member.member_view(),
             params=(current_user.account_id,)
         )
         
-        if member_row is None:
-            email = ''
-            member_phone = ''
-        elif isinstance(member_row, dict):
-            # 정상적인 딕셔너리 경우
-            email = member_row.get('Email', '')
-            member_phone = member_row.get('PortableTel', '') or member_row.get('Tel', '')
-        elif isinstance(member_row, tuple):
-            # 튜플로 반환되는 경우 (컬럼 순서대로 매핑)
-            # member_view() 쿼리의 컬럼 순서를 보고 매핑해야 함
-            # 현재 쿼리 기준으로 대략적인 인덱스 매핑 (필요 시 정확히 조정)
-            email = member_row[9] if len(member_row) > 9 else ''          # Email 위치
-            portable_tel = member_row[7] if len(member_row) > 7 else ''   # PortableTel
-            tel = member_row[6] if len(member_row) > 6 else ''            # Tel
-            member_phone = portable_tel or tel
-        elif isinstance(member_row, str):
-            # 문자열로 오는 경우 (최악의 경우) → 로그 찍고 기본값
-            print(f"[WARNING] fetch_one returned string: {member_row}")
-            email = ''
-            member_phone = ''
-        else:
-            print(f"[WARNING] Unexpected fetch_one type: {type(member_row)}")
-            email = ''
-            member_phone = ''
+        member_rows = msdb_manager.fetch_all(
+            Member.member_view(),
+            params=(current_user.account_id,)
+        )
         
-        # return get_personnel_basic_info_service(current_user, db)
+        email = ""
+        member_phone = ""
+        
+        if member_rows and len(member_rows) > 0:
+            # fetch_all 결과가 리스트라고 가정
+            first_row = member_rows[0]
+            
+            if isinstance(first_row, dict):
+                # 딕셔너리면 안전하게 get
+                email = first_row.get('Email', '')
+                member_phone = first_row.get('PortableTel', '') or first_row.get('Tel', '')
+            elif isinstance(first_row, tuple):
+                # 튜플이면 인덱스로 매핑 (member_view 쿼리 순서 기준)
+                if len(first_row) > 11:
+                    email = first_row[11] or ''          # Email (인덱스 11)
+                if len(first_row) > 8:
+                    portable_tel = first_row[8] or ''    # PortableTel (인덱스 8)
+                    tel = first_row[7] or ''             # Tel (인덱스 7)
+                    member_phone = portable_tel or tel
+            elif isinstance(first_row, str):
+                # 문자열이면 (현재 상황처럼) office_id만 온 것으로 간주
+                print(f"[WARNING] fetch_all 첫 행이 문자열: {first_row}")
+                # 이 경우 추가 쿼리 필요하거나 email 빈 값 유지
+            else:
+                print(f"[ERROR] 예상치 못한 fetch_all 행 타입: {type(first_row)}")
+        else:
+            print("[WARNING] member_view 결과 없음")
+        
         return {
             "nurse_id": nurse.nurse_id,
             "name": nurse.name,
