@@ -22,6 +22,7 @@ from services.nurse_service import (
     move_nurse_with_active_service,
     reorder_nurses_service,
     get_nurses_filtered_service,
+    get_personnel_basic_info_service,
 )
 from services.excel_service import (
     create_nurse_template, 
