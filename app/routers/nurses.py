@@ -11,6 +11,7 @@ import random
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import traceback
+import string
 
 from db.client2 import get_db, msdb_manager
 from db.models import Nurse as NurseModel
