@@ -417,6 +417,10 @@ class CPSATBasicEngine:
         # 1. 설정 객체 생성
         with Timer("설정 생성"):
             config = self.create_config_from_db(config_data)
+            try:
+                setattr(config, "off_exception_cells", config_data.get("off_exception_cells", []) if isinstance(config_data, dict) else [])
+            except Exception:
+                setattr(config, "off_exception_cells", [])
         shift_defs = config_data.get("shift_definitions") if isinstance(config_data, dict) else None
         shift_id_to_main, main_to_shift_id = _build_shift_normalizer(shift_defs)
         canonical_to_shift_id = main_to_shift_id or {"D": "D", "E": "E", "N": "N", "O": "O"}
@@ -445,6 +449,24 @@ class CPSATBasicEngine:
             setattr(roster_system, "grade_config", grade_config)
             # 고정된 셀 정보 처리
             fixed_cells = list(config_data.get('fixed_cells', []) or [])
+            # 고정 O/주/휴가/공가를 예외 셀로 확장
+            try:
+                off_ex = set(getattr(config, "off_exception_cells", []) or [])
+                for c in fixed_cells:
+                    try:
+                        n_idx = c.get("nurse_index")
+                        d_idx = c.get("day_index")
+                        raw_shift = str(c.get("shift") or "").strip().upper()
+                        raw_type = str(c.get("shift_type") or "").strip()
+                    except Exception:
+                        continue
+                    if n_idx is None or d_idx is None:
+                        continue
+                    if raw_shift in {"O", "OFF", "주"} or raw_type in {"휴가", "공가"}:
+                        off_ex.add((n_idx, d_idx))
+                setattr(config, "off_exception_cells", sorted(list(off_ex)))
+            except Exception:
+                pass
             # 주휴 등 휴무류 코드는 엔진에서 'O'로만 취급한다. (shift_types=['D','E','N','O'])
             for c in fixed_cells:
                 try:
@@ -806,6 +828,7 @@ class CPSATBasicEngine:
         day_idx, eve_idx, night_idx, off_idx = idx['D'], idx['E'], idx['N'], idx['O']
         has_w = "W" in roster_system.config.shift_types
         w_idx = roster_system.config.shift_types.index("W") if has_w else None
+        off_exception_cells = set(getattr(roster_system.config, "off_exception_cells", []) or [])
 
         first_day = roster_system.target_month
         last_day = first_day + timedelta(days=D - 1)
@@ -980,6 +1003,32 @@ class CPSATBasicEngine:
                         if (n, d) in fixed and fixed[(n, d)] == w_idx:
                             continue
                         m.Add(X(n, d, w_idx) == 0)
+            # 순수 O 4연속 금지 (예외 셀 포함 시 스킵, fixed로 이미 4O면 경고만 남기고 스킵)
+            if off_idx is not None:
+                for n in range(N):
+                    for d in range(join[n], leave[n] - 2):
+                        if d + 3 > leave[n]:
+                            continue
+                        window = {(n, d), (n, d + 1), (n, d + 2), (n, d + 3)}
+                        if off_exception_cells and window & off_exception_cells:
+                            continue
+                        fixed_o_cnt = sum(
+                            1
+                            for (fn, fd), fs_idx in fixed.items()
+                            if fn == n and fd in {d, d + 1, d + 2, d + 3} and fs_idx == off_idx
+                        )
+                        if fixed_o_cnt >= 4:
+                            print(
+                                f"{self.logger_prefix} [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
+                            )
+                            continue
+                        m.Add(
+                            X(n, d, off_idx)
+                            + X(n, d + 1, off_idx)
+                            + X(n, d + 2, off_idx)
+                            + X(n, d + 3, off_idx)
+                            <= 3
+                        )
 
             # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
             if getattr(cfg, 'weekend_off_only_enable', True):
@@ -1015,6 +1064,13 @@ class CPSATBasicEngine:
                 if isinstance(getattr(roster_system, "prev_month_last_is_off", {}), dict)
                 else {}
             )
+            forced_off_cells: set[tuple[int, int]] = set(
+                (n_idx, d_idx)
+                for (n_idx, d_idx), s_idx in fixed.items()
+                if s_idx == off_idx
+            )
+            forced_off_cells.update(off_exception_cells)
+            forced_off_cells.update(off_exception_cells)
             if off_placement_mode > 0 and weekly_off_by_idx:
                 for n, day_list in weekly_off_by_idx.items():
                     if n >= len(join):
@@ -1034,14 +1090,17 @@ class CPSATBasicEngine:
                                 continue
                             if d + 1 <= T1:
                                 m.Add(X(n, d + 1, off_idx) == 1)
+                                forced_off_cells.add((n, d + 1))
                             continue
                         if off_placement_mode == 1:
                             # print('주휴 앞 O!!!!!!!!')
                             neighbours = []
                             if d - 1 >= T0:
                                 neighbours.append(X(n, d - 1, off_idx))
+                                forced_off_cells.add((n, d - 1))
                             if d + 1 <= T1:
                                 neighbours.append(X(n, d + 1, off_idx))
+                                forced_off_cells.add((n, d + 1))
                             if not neighbours:
                                 continue
                             if len(neighbours) == 1:
@@ -1051,8 +1110,10 @@ class CPSATBasicEngine:
                         else:
                             if d - 1 >= T0:
                                 m.Add(X(n, d - 1, off_idx) == 1)
+                                forced_off_cells.add((n, d - 1))
                             elif d + 1 <= T1:
                                 m.Add(X(n, d + 1, off_idx) == 1)
+                                forced_off_cells.add((n, d + 1))
 
             # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
             try:
@@ -1369,6 +1430,111 @@ class CPSATBasicEngine:
                                 obj.append(-off_penalty * X(n, d, off_idx))
                 except Exception:
                     pass
+
+                # 주휴 양옆 낭비 O 패널티 (fixed/예외/강제 OFF 제외)
+                try:
+                    w_adj = int(getattr(cfg, "weekly_off_adjacent_off_penalty", 14) or 0)
+                    if w_adj > 0 and weekly_off_by_idx:
+                        for n, day_list in weekly_off_by_idx.items():
+                            if n >= len(join):
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d in day_list or []:
+                                if d < T0 or d > T1:
+                                    continue
+                                left = d - 1
+                                right = d + 1
+                                if left < T0 or right > T1:
+                                    continue
+                                if (n, left) in forced_off_cells or (n, left) in off_exception_cells:
+                                    continue
+                                if (n, right) in forced_off_cells or (n, right) in off_exception_cells:
+                                    continue
+                                v = m.NewBoolVar(f"wo_adj_{n}_{d}")
+                                # v == 1 → 양옆 모두 O
+                                m.Add(v <= X(n, left, off_idx))
+                                m.Add(v <= X(n, right, off_idx))
+                                m.Add(v >= X(n, left, off_idx) + X(n, right, off_idx) - 1)
+                                obj.append(-w_adj * v)
+                except Exception as exc:
+                    print(f"{self.logger_prefix} [WARN] weekly_off_adjacent_off_penalty 적용 실패: {exc}")
+
+                # 주휴 이후 꼬리 O 패널티 (주휴/강제/예외 제외, 주휴 다음 날 이후부터 적용)
+                try:
+                    w_tail = int(getattr(cfg, "weekly_off_tail_penalty", 8) or 0)
+                    w_tail_trip = int(getattr(cfg, "weekly_off_tail_triplet_penalty", 12) or 0)
+                    if (w_tail > 0 or w_tail_trip > 0) and weekly_off_by_idx:
+                        forced_off_cells_set = set(forced_off_cells)
+                        for n, day_list in weekly_off_by_idx.items():
+                            if n >= len(join):
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d in day_list or []:
+                                if d < T0 or d > T1:
+                                    continue
+                                # pair: (d+1, d+2)
+                                if w_tail > 0:
+                                    t1, t2 = d + 1, d + 2
+                                    if t2 <= T1:
+                                        cells = {(n, t1), (n, t2)}
+                                        if not (cells & forced_off_cells_set or cells & off_exception_cells):
+                                            v = m.NewBoolVar(f"wo_tail2_{n}_{d}")
+                                            m.Add(v <= X(n, t1, off_idx))
+                                            m.Add(v <= X(n, t2, off_idx))
+                                            m.Add(v >= X(n, t1, off_idx) + X(n, t2, off_idx) - 1)
+                                            obj.append(-w_tail * v)
+                                # triplet: (d+1, d+2, d+3)
+                                if w_tail_trip > 0:
+                                    t1, t2, t3 = d + 1, d + 2, d + 3
+                                    if t3 <= T1:
+                                        cells3 = {(n, t1), (n, t2), (n, t3)}
+                                        if not (cells3 & forced_off_cells_set or cells3 & off_exception_cells):
+                                            v3 = m.NewBoolVar(f"wo_tail3_{n}_{d}")
+                                            m.Add(v3 <= X(n, t1, off_idx))
+                                            m.Add(v3 <= X(n, t2, off_idx))
+                                            m.Add(v3 <= X(n, t3, off_idx))
+                                            m.Add(v3 >= X(n, t1, off_idx) + X(n, t2, off_idx) + X(n, t3, off_idx) - 2)
+                                            obj.append(-w_tail_trip * v3)
+                except Exception as exc:
+                    print(f"{self.logger_prefix} [WARN] weekly_off_tail penalties 적용 실패: {exc}")
+
+                # 자유 O 연속 패널티 (주휴/강제/예외 제외)
+                try:
+                    w_free_pair = int(getattr(cfg, "free_off_pair_penalty", 6) or 0)
+                    w_free_trip = int(getattr(cfg, "free_off_triplet_penalty", 10) or 0)
+                    if w_free_pair > 0 or w_free_trip > 0:
+                        forced_off_cells_set = set(forced_off_cells)
+                        for n in range(N):
+                            T0, T1 = join[n], leave[n]
+                            # 길이 2
+                            if w_free_pair > 0:
+                                for d in range(T0, T1):
+                                    if d + 1 > T1:
+                                        continue
+                                    cells = {(n, d), (n, d + 1)}
+                                    if cells & forced_off_cells_set or cells & off_exception_cells:
+                                        continue
+                                    v = m.NewBoolVar(f"free_o2_{n}_{d}")
+                                    m.Add(v <= X(n, d, off_idx))
+                                    m.Add(v <= X(n, d + 1, off_idx))
+                                    m.Add(v >= X(n, d, off_idx) + X(n, d + 1, off_idx) - 1)
+                                    obj.append(-w_free_pair * v)
+                            # 길이 3
+                            if w_free_trip > 0:
+                                for d in range(T0, T1 - 1):
+                                    if d + 2 > T1:
+                                        continue
+                                    cells3 = {(n, d), (n, d + 1), (n, d + 2)}
+                                    if cells3 & forced_off_cells_set or cells3 & off_exception_cells:
+                                        continue
+                                    v3 = m.NewBoolVar(f"free_o3_{n}_{d}")
+                                    m.Add(v3 <= X(n, d, off_idx))
+                                    m.Add(v3 <= X(n, d + 1, off_idx))
+                                    m.Add(v3 <= X(n, d + 2, off_idx))
+                                    m.Add(v3 >= X(n, d, off_idx) + X(n, d + 1, off_idx) + X(n, d + 2, off_idx) - 2)
+                                    obj.append(-w_free_trip * v3)
+                except Exception as exc:
+                    print(f"{self.logger_prefix} [WARN] free_off penalties 적용 실패: {exc}")
 
                 # 월단위 선호(개인 입력) 유도: 폴백 3단계에서도 동일하게 반영
                 try:
@@ -2006,6 +2172,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     join, leave = [], []
     has_w = "W" in rs.config.shift_types
     w_idx = rs.config.shift_types.index("W") if has_w else None
+    off_exception_cells = set(getattr(rs.config, "off_exception_cells", []) or [])
+    off_idx_full = rs.config.shift_types.index("O") if "O" in rs.config.shift_types else None
+    weekly_off_by_idx = getattr(rs, "weekly_off_by_idx", {}) if isinstance(getattr(rs, "weekly_off_by_idx", {}), dict) else {}
     first_day = rs.target_month
     last_day = first_day + timedelta(days=D-1)
 
@@ -2035,7 +2204,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
         join.append(j)
         leave.append(l)
-    # 고정 셀 (수간호사 등)
+        off_exception_cells = set(getattr(rs.config, "off_exception_cells", []) or [])
+        # 고정 셀 (수간호사 등)
     code2main = {c:r['main_code']
                  for r in (grouped or []) for c in r['codes']}
     fixed, fixed_cnt = {}, [[0]*S for _ in range(D)]
@@ -2044,6 +2214,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         s_main = code2main.get(c['shift'], c['shift'])
         s_idx  = rs.config.shift_types.index(s_main)
         fixed[(n,d)] = s_idx; fixed_cnt[d][s_idx]+=1
+    forced_off_cells: set[tuple[int, int]] = set()
+    if off_idx_full is not None:
+        forced_off_cells.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
+    forced_off_cells.update(off_exception_cells)
 
 
     # 변수
@@ -2070,6 +2244,41 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 if (n, d) in fixed and fixed[(n, d)] == w_idx:
                     continue
                 m.Add(X(n, d, w_idx) == 0)
+    # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
+    if off_idx_full is not None:
+        off_or_weekly = set(off_exception_cells)
+        off_or_weekly.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
+        # weekly_off_by_idx 를 off_or_weekly에 포함
+        try:
+            for n, day_list in (weekly_off_by_idx or {}).items():
+                for d in day_list or []:
+                    off_or_weekly.add((n, d))
+        except Exception:
+            pass
+        for n in range(N):
+            for d in range(join[n], leave[n] - 2):
+                if d + 3 > leave[n]:
+                    continue
+                window = {(n, d), (n, d + 1), (n, d + 2), (n, d + 3)}
+                # 예외 포함 윈도우는 스킵
+                if window & off_exception_cells:
+                    continue
+                fixed_o_cnt = sum(
+                    1
+                    for (fn, fd), fs_idx in fixed.items()
+                    if fn == n and fd in {d, d + 1, d + 2, d + 3} and fs_idx == off_idx_full
+                )
+                if fixed_o_cnt >= 4:
+                    print(
+                        f"{self.logger_prefix} [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
+                    )
+                    continue
+                # off_or_weekly 기준 4개 모두 O/주면 금지
+                m.Add(
+                    sum(X(n, d + k, off_idx_full) for k in range(4))
+                    + sum(1 for k in range(4) if (n, d + k) in off_or_weekly)
+                    <= 3
+                )
     # ───────────── 2-A2. 초기 금지 셀(경계 제약) ─────────────
     try:
         if hasattr(rs, 'initial_forbidden') and isinstance(rs.initial_forbidden, dict):

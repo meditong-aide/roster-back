@@ -2003,6 +2003,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         days_in_month=days_in_month,
     )
     _inject_special_work_code(config_dict, has_special_working)
+    # OFF 상한/패널티 기본값 보정 (None 방지)
+    if config_dict.get("max_extra_off_days") is None:
+        config_dict["max_extra_off_days"] = 1
+    if config_dict.get("extra_off_penalty_weight") is None:
+        config_dict["extra_off_penalty_weight"] = 80
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──
     
     _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
@@ -2069,6 +2074,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         combined_fixed_cells.extend(weekly_off_fixed_cells)
     if special_fixed_cells:
         combined_fixed_cells.extend(special_fixed_cells)
+    off_exception_cells = set()
+    for c in combined_fixed_cells:
+        try:
+            n_idx = c.get("nurse_index")
+            d_idx = c.get("day_index")
+            shift_code = str(c.get("shift") or "").upper()
+            shift_type = str(c.get("shift_type") or "").strip()
+        except Exception:
+            continue
+        if n_idx is None or d_idx is None:
+            continue
+        if shift_code in {"O", "OFF", "주"} or shift_type in {"휴가", "공가"}:
+            off_exception_cells.add((n_idx, d_idx))
+    if off_exception_cells:
+        config_dict["off_exception_cells"] = sorted(list(off_exception_cells))
 
     if nurses_for_engine:
         generated, satisfaction_data, roster_system = _run_cp_sat_basic(
