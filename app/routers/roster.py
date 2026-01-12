@@ -1550,10 +1550,6 @@ async def create_empty_roster(
 
     new_schedule_id = str(uuid.uuid4().hex)[:12]
 
-    latest_config = db.query(RosterConfigModel).filter(
-        RosterConfigModel.group_id == target_group_id
-    ).order_by(RosterConfigModel.created_at.desc()).first()
-
     new_schedule = Schedule(
         schedule_id=new_schedule_id,
         office_id=current_user.office_id,
