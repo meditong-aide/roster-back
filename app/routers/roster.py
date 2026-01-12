@@ -3,14 +3,14 @@ import uuid
 from datetime import date
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Body
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 # from db.client import get_db
 from db.models import RosterConfig as RosterConfigModel
-from db.models import Schedule, ShiftPreference, Nurse, ScheduleEntry, Shift, IssuedRoster
+from db.models import Schedule, ShiftPreference, Nurse, ScheduleEntry, Shift, IssuedRoster, Group
 from db.nurse_config import Nurse as NurseEngine
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
 from routers.auth import get_current_user_from_cookie
@@ -1380,3 +1380,219 @@ async def export_schedule_excel(
     except Exception as e:
         print(f"[export_schedule_excel] 오류: {e}")
         raise HTTPException(status_code=500, detail=f"엑셀 생성 실패: {str(e)}")
+
+
+def _get_target_group_id(
+    current_user: UserSchema,
+    group_id_param: Optional[str],
+    db: Session
+) -> str:
+    """대상 그룹 결정 로직 (기존 코드 재사용)"""
+    if current_user.is_head_nurse and current_user.group_id:
+        return current_user.group_id
+
+    if not getattr(current_user, 'is_master_admin', False):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    if not group_id_param:
+        raise HTTPException(status_code=400, detail="group_id is required for admin")
+
+    g = db.query(Group).filter(Group.group_id == group_id_param).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+        raise HTTPException(status_code=403, detail="Group does not belong to your office")
+
+    return g.group_id
+
+
+def _get_next_version(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int
+) -> int:
+    """같은 연/월 내 최대 version + 1"""
+    max_ver = db.query(func.max(Schedule.version)).filter(
+        Schedule.group_id == group_id,
+        Schedule.year == year,
+        Schedule.month == month,
+        Schedule.dropped == False
+    ).scalar() or 0
+    return max_ver + 1
+
+
+@router.post("/copy/{source_schedule_id}")
+async def copy_schedule_to_new_version(
+    source_schedule_id: str,
+    request: dict = Body({}),
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    if not current_user or not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise HTTPException(status_code=403, detail="권한이 없습니다.")
+
+    target_group_id = _get_target_group_id(current_user, group_id, db)
+
+    # 원본 조회 + 디버깅 로그
+    source = db.query(Schedule).filter(
+        Schedule.schedule_id == source_schedule_id,
+        Schedule.group_id == target_group_id,
+        Schedule.dropped == False
+    ).first()
+
+    if not source:
+        raise HTTPException(status_code=404, detail="복사할 근무표를 찾을 수 없습니다.")
+
+    print(f"[COPY DEBUG] 원본 schedule_id: {source.schedule_id}")
+    print(f"[COPY DEBUG] 원본 version: {source.version}, name: {source.name}")
+
+    if request.get("year") is not None or request.get("month") is not None:
+        raise HTTPException(status_code=400, detail="다른 연/월 복사는 지원되지 않습니다.")
+
+    target_year = source.year
+    target_month = source.month
+
+    new_version = _get_next_version(db, target_group_id, target_year, target_month)
+
+    original_name = source.name or f"{target_month}월 근무표 VER{source.version}"
+    new_name = request.get("new_name", f"복사 - {original_name}").strip()
+
+    new_schedule_id = str(uuid.uuid4().hex)[:12]
+
+    new_schedule = Schedule(
+        schedule_id=new_schedule_id,
+        office_id=source.office_id,
+        group_id=target_group_id,
+        year=target_year,
+        month=target_month,
+        version=new_version,
+        config_id=source.config_id,
+        created_by=current_user.account_id,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        status="draft",
+        dropped=False,
+        name=new_name,
+        memo=source.memo,
+    )
+    db.add(new_schedule)
+
+    # ScheduleEntry 복사 - 여기서 디버깅 핵심
+    entries = db.query(ScheduleEntry).filter(
+        ScheduleEntry.schedule_id == source.schedule_id
+    ).all()
+
+    print(f"[COPY DEBUG] 복사 대상 entries 수: {len(entries)}")
+    if len(entries) == 0:
+        print(f"[COPY WARNING] 원본 schedule_id '{source.schedule_id}' 에 배정 데이터가 없습니다! 빈 복사 발생")
+        print(f"[COPY WARNING] DB 직접 확인 필요: SELECT COUNT(*) FROM schedule_entries WHERE schedule_id = '{source.schedule_id}'")
+    else:
+        print(f"[COPY DEBUG] 첫 entry 예시: nurse_id={entries[0].nurse_id}, work_date={entries[0].work_date}, shift={entries[0].shift_id}")
+
+    for entry in entries:
+        db.add(ScheduleEntry(
+            entry_id=str(uuid.uuid4().hex)[:16],
+            schedule_id=new_schedule_id,
+            nurse_id=entry.nurse_id,
+            work_date=entry.work_date,  # 그대로 복사 (DATETIME 유지)
+            shift_id=entry.shift_id,
+        ))
+
+    try:
+        db.commit()
+        db.refresh(new_schedule)
+        print(f"[COPY SUCCESS] 새 schedule_id: {new_schedule_id}, version: {new_version}")
+    except Exception as e:
+        db.rollback()
+        print(f"[COPY ERROR] 커밋 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"복사 실패: {str(e)}")
+
+    return {
+        "message": "새 버전으로 복사 완료",
+        "new_schedule_id": new_schedule.schedule_id,
+        "new_version": new_version,
+        "new_name": new_name,
+        "year": target_year,
+        "month": target_month,
+        "status": "draft",
+        "entries_copied": len(entries)  # 추가: 몇 개 복사됐는지 반환
+    }
+
+
+@router.post("/create-empty")
+async def create_empty_roster(
+    request: dict = Body(...),  # { "year": 2027, "month": 8, "name": "새 빈 버전" }
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    빈 근무표(모든 셀 -)를 신규 버전으로 생성합니다.
+    - 연/월은 request에 필수로 전달
+    - ScheduleEntry는 생성하지 않음 (빈 상태)
+    """
+    if not current_user or not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise HTTPException(status_code=403, detail="권한이 없습니다.")
+
+    target_group_id = _get_target_group_id(current_user, group_id, db)
+
+    year = request.get("year")
+    month = request.get("month")
+    custom_name = request.get("name")
+
+    if not all([year, month]):
+        raise HTTPException(status_code=400, detail="year와 month는 필수입니다.")
+
+    # 새 버전 번호 계산
+    new_version = _get_next_version(db, target_group_id, year, month)
+
+    # 이름 자동 생성 (입력 없으면 기본값)
+    name = custom_name or f"{month}월 근무표 VER{new_version} (빈 버전)"
+
+    new_schedule_id = str(uuid.uuid4().hex)[:12]
+
+    # Schedule만 생성 (config_id는 최신 사용 또는 NULL)
+    latest_config = db.query(RosterConfigModel).filter(
+        RosterConfigModel.group_id == target_group_id
+    ).order_by(RosterConfigModel.created_at.desc()).first()
+
+    new_schedule = Schedule(
+        schedule_id=new_schedule_id,
+        office_id=current_user.office_id,
+        group_id=target_group_id,
+        year=year,
+        month=month,
+        version=new_version,
+        config_id=latest_config.config_id if latest_config else None,
+        created_by=current_user.account_id,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        status="draft",
+        dropped=False,
+        name=name,
+        memo=None,
+    )
+    db.add(new_schedule)
+
+    # ScheduleEntry는 의도적으로 생성하지 않음 → 빈 근무표
+
+    try:
+        db.commit()
+        db.refresh(new_schedule)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"빈 근무표 생성 실패: {str(e)}")
+
+    return {
+        "message": "빈 신규 버전 생성 완료",
+        "new_schedule_id": new_schedule.schedule_id,
+        "new_version": new_version,
+        "name": name,
+        "year": year,
+        "month": month,
+        "status": "draft",
+        "entries_copied": 0  # 빈 상태임을 명시
+    }
