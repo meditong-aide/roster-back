@@ -605,6 +605,23 @@ class CPSATBasicEngine:
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
                 self._optimize_fallback_lex_hard_first(roster_system, time_limit_seconds=time_limit_seconds, grouped=grouped)
+        # W 배정 디버그 로그
+        try:
+            if "W" in roster_system.config.shift_types:
+                w_idx = roster_system.config.shift_types.index("W")
+                w_cells = []
+                for n_idx, nurse in enumerate(nurses):
+                    for d in range(roster_system.num_days):
+                        if int(roster_system.roster[n_idx, d, w_idx]) == 1:
+                            original = fixed_original_shift_map.get((n_idx, d))
+                            label = original or "W"
+                            w_cells.append({"nurse_id": nurse.db_id, "day": d + 1, "shift": label})
+                if w_cells:
+                    print(f"{self.logger_prefix} W 배정 {len(w_cells)}건: {w_cells}")
+                else:
+                    print(f"{self.logger_prefix} W 배정 없음")
+        except Exception as e:
+            print(f"{self.logger_prefix} W 배정 로그 실패: {e}")
         # 10. 결과 변환
         with Timer("결과 변환"):
             result = self._convert_result_to_db_format(
@@ -787,6 +804,8 @@ class CPSATBasicEngine:
         # 공통 인덱스/구간
         idx = {c: roster_system.config.shift_types.index(c) for c in ('D', 'E', 'N', 'O')}
         day_idx, eve_idx, night_idx, off_idx = idx['D'], idx['E'], idx['N'], idx['O']
+        has_w = "W" in roster_system.config.shift_types
+        w_idx = roster_system.config.shift_types.index("W") if has_w else None
 
         first_day = roster_system.target_month
         last_day = first_day + timedelta(days=D - 1)
@@ -954,6 +973,13 @@ class CPSATBasicEngine:
                 for s in range(S):
                     if s != s_idx:
                         m.Add(X(n, d, s) == 0)
+            # W(특별 근무)는 고정 셀 외에는 전부 금지
+            if has_w and w_idx is not None:
+                for n in range(N):
+                    for d in range(join[n], leave[n] + 1):
+                        if (n, d) in fixed and fixed[(n, d)] == w_idx:
+                            continue
+                        m.Add(X(n, d, w_idx) == 0)
 
             # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
             if getattr(cfg, 'weekend_off_only_enable', True):
@@ -1978,6 +2004,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     N,D,S = len(rs.nurses), rs.num_days, rs.config.num_shifts
     # join / leave index
     join, leave = [], []
+    has_w = "W" in rs.config.shift_types
+    w_idx = rs.config.shift_types.index("W") if has_w else None
     first_day = rs.target_month
     last_day = first_day + timedelta(days=D-1)
 
@@ -2035,6 +2063,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         m.Add(X(n,d,s_idx)==1)
         for s in range(S):
             if s!=s_idx: m.Add(X(n,d,s)==0)
+    # W(특별 근무)는 고정 셀 외에는 전부 금지
+    if has_w and w_idx is not None:
+        for n in range(N):
+            for d in range(join[n], leave[n] + 1):
+                if (n, d) in fixed and fixed[(n, d)] == w_idx:
+                    continue
+                m.Add(X(n, d, w_idx) == 0)
     # ───────────── 2-A2. 초기 금지 셀(경계 제약) ─────────────
     try:
         if hasattr(rs, 'initial_forbidden') and isinstance(rs.initial_forbidden, dict):
