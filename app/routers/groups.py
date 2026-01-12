@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 from typing import List
 import uuid
 
@@ -17,30 +16,6 @@ router = APIRouter(
 )
 
 
-# @router.get("")
-# async def list_groups(
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db)
-# ):
-#     """관리자 전용 병동(그룹) 리스트 조회."""
-#     if not current_user or not current_user.is_master_admin:
-#         raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
-
-#     rows = (
-#         db.query(GroupModel).filter(GroupModel.office_id == current_user.office_id)
-#         .all()
-#     )
-#     print('office_id', current_user.office_id)
-#     return [
-#         {
-#             "group_id": g.group_id,
-#             "group_name": g.group_name,
-#             "office_id": g.office_id,
-#         }
-#         for g in rows
-#     ]
-
-
 @router.get("")
 async def list_groups(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -50,34 +25,18 @@ async def list_groups(
     if not current_user or not current_user.is_master_admin:
         raise HTTPException(status_code=403, detail="마스터 관리자만 접근 가능합니다.")
 
-    # ORM 대신 raw SQL + CAST 사용으로 인코딩 문제 우회
-    result = db.execute(
-        text("""
-            SELECT 
-                group_id, 
-                office_id, 
-                CAST(group_name AS NVARCHAR(100)) AS group_name 
-            FROM groups 
-            WHERE office_id = :oid
-            ORDER BY group_name  -- 필요시 정렬 기준 변경 가능
-        """),
-        {"oid": current_user.office_id}
-    ).fetchall()
-
-    # 디버깅용 로그 (필요시 주석 처리)
-    if result:
-        first_name = result[0][2]  # group_name 위치
-        print("DEBUG - 첫 번째 group_name (CAST 후):", repr(first_name))
-        print("DEBUG - 행 개수:", len(result))
-
-    # Row 객체 → dict로 변환
+    rows = (
+        db.query(GroupModel).filter(GroupModel.office_id == current_user.office_id)
+        .all()
+    )
+    
     data = [
         {
-            "group_id": str(row[0]),     # group_id
-            "group_name": str(row[2]),   # CAST된 group_name
-            "office_id": str(row[1]),    # office_id
+            "group_id": str(g.group_id),
+            "group_name": str(g.group_name),    # 이제 str()만으로도 정상일 가능성 높음
+            "office_id": str(g.office_id),
         }
-        for row in result
+        for g in rows
     ]
 
     return JSONResponse(
