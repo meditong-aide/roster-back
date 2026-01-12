@@ -263,6 +263,10 @@ class CPSATBasicEngine:
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
             off_placement_mode=1,
         )
+        # 월말 자연스러운 종료를 유도하기 위한 그림자 커버리지(소프트) 기본값
+        setattr(cfg, "shadow_coverage_lookback_days", int(config_data.get("shadow_coverage_lookback_days", 6) or 0))
+        setattr(cfg, "shadow_coverage_need_ratio", float(config_data.get("shadow_coverage_need_ratio", 0.6) or 0.0))
+        setattr(cfg, "shadow_coverage_penalty_weight", int(config_data.get("shadow_coverage_penalty_weight", 6) or 0))
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
             ds_by_day = config_data.get('daily_shift_requirements_by_day')
@@ -1070,7 +1074,22 @@ class CPSATBasicEngine:
                 if s_idx == off_idx
             )
             forced_off_cells.update(off_exception_cells)
-            forced_off_cells.update(off_exception_cells)
+            # 예상 커버리지 부족일 계산(단순 근사): 필요한 총 인원 > (활성 인원 - 고정 OFF)
+            shortage_days: set[int] = set()
+            try:
+                for d in range(D):
+                    if hasattr(cfg, 'daily_shift_requirements_by_day') and isinstance(cfg.daily_shift_requirements_by_day, list) and d < len(cfg.daily_shift_requirements_by_day):
+                        need_map = cfg.daily_shift_requirements_by_day[d]
+                    else:
+                        need_map = cfg.daily_shift_requirements
+                    total_need = sum(int(v) for v in (need_map or {}).values())
+                    active_cnt = sum(1 for n in range(N) if join[n] <= d <= leave[n])
+                    fixed_off_cnt = fixed_cnt[d][off_idx] if off_idx is not None else 0
+                    avail_eff = max(0, active_cnt - fixed_off_cnt)
+                    if avail_eff < total_need:
+                        shortage_days.add(d)
+            except Exception:
+                shortage_days = set()
             if off_placement_mode > 0 and weekly_off_by_idx:
                 for n, day_list in weekly_off_by_idx.items():
                     if n >= len(join):
@@ -1093,27 +1112,41 @@ class CPSATBasicEngine:
                                 forced_off_cells.add((n, d + 1))
                             continue
                         if off_placement_mode == 1:
-                            # print('주휴 앞 O!!!!!!!!')
                             neighbours = []
-                            if d - 1 >= T0:
-                                neighbours.append(X(n, d - 1, off_idx))
-                                forced_off_cells.add((n, d - 1))
-                            if d + 1 <= T1:
-                                neighbours.append(X(n, d + 1, off_idx))
-                                forced_off_cells.add((n, d + 1))
+                            left_pos = d - 1
+                            right_pos = d + 1
+                            if left_pos >= T0 and left_pos not in shortage_days:
+                                neighbours.append(("left", X(n, left_pos, off_idx)))
+                            if right_pos <= T1 and right_pos not in shortage_days:
+                                neighbours.append(("right", X(n, right_pos, off_idx)))
+                            # 둘 다 부족일이면 스킵
                             if not neighbours:
                                 continue
-                            if len(neighbours) == 1:
-                                m.Add(neighbours[0] == 1)
+                            vars_only = [v for _, v in neighbours]
+                            if len(vars_only) == 1:
+                                m.Add(vars_only[0] == 1)
                             else:
-                                m.Add(sum(neighbours) >= 1)
+                                m.Add(sum(vars_only) >= 1)
+                            for direction, var in neighbours:
+                                if direction == "left":
+                                    forced_off_cells.add((n, left_pos))
+                                else:
+                                    forced_off_cells.add((n, right_pos))
                         else:
-                            if d - 1 >= T0:
-                                m.Add(X(n, d - 1, off_idx) == 1)
-                                forced_off_cells.add((n, d - 1))
-                            elif d + 1 <= T1:
-                                m.Add(X(n, d + 1, off_idx) == 1)
-                                forced_off_cells.add((n, d + 1))
+                            left_pos = d - 1
+                            right_pos = d + 1
+                            placed = False
+                            if left_pos >= T0 and left_pos not in shortage_days:
+                                m.Add(X(n, left_pos, off_idx) == 1)
+                                forced_off_cells.add((n, left_pos))
+                                placed = True
+                            elif right_pos <= T1 and right_pos not in shortage_days:
+                                m.Add(X(n, right_pos, off_idx) == 1)
+                                forced_off_cells.add((n, right_pos))
+                                placed = True
+                            # 둘 다 부족일이면 스킵 (커버리지 우선)
+                            if not placed:
+                                continue
 
             # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
             try:
@@ -1430,6 +1463,38 @@ class CPSATBasicEngine:
                                 obj.append(-off_penalty * X(n, d, off_idx))
                 except Exception:
                     pass
+
+                # 월말 자연스러운 종료 유도: 그림자 커버리지(소프트) 페널티
+                try:
+                    shadow_days = int(getattr(cfg, "shadow_coverage_lookback_days", 0) or 0)
+                    shadow_ratio = float(getattr(cfg, "shadow_coverage_need_ratio", 0.0) or 0.0)
+                    shadow_weight = int(getattr(cfg, "shadow_coverage_penalty_weight", 0) or 0)
+                    if shadow_days > 0 and shadow_ratio > 0.0 and shadow_weight > 0:
+                        start_day = max(0, D - shadow_days)
+                        if hasattr(cfg, "daily_shift_requirements_by_day") and isinstance(cfg.daily_shift_requirements_by_day, list) and len(cfg.daily_shift_requirements_by_day) > 0:
+                            shadow_need_map = cfg.daily_shift_requirements_by_day[0] or {}
+                        else:
+                            shadow_need_map = cfg.daily_shift_requirements or {}
+                        for code, s_idx in (("D", day_idx), ("E", eve_idx), ("N", night_idx)):
+                            need_val = int((shadow_need_map or {}).get(code, 0) or 0)
+                            target = int(need_val * shadow_ratio + 0.999)
+                            if target <= 0:
+                                continue
+                            fixed_base = sum(fixed_cnt[d][s_idx] for d in range(start_day, D))
+                            terms = []
+                            for d in range(start_day, D):
+                                for n in range(N):
+                                    if d < join[n] or d > leave[n]:
+                                        continue
+                                    terms.append(X(n, d, s_idx))
+                            if not terms and fixed_base >= target:
+                                continue
+                            total_expr = sum(terms) + fixed_base if terms else fixed_base
+                            slack = m.NewIntVar(0, target, f"shadow_cov_{code}_{start_day}")
+                            m.Add(slack >= target - total_expr)
+                            obj.append(-shadow_weight * slack)
+                except Exception as exc:
+                    print(f"{self.logger_prefix} [WARN] shadow coverage penalty 적용 실패: {exc}")
 
                 # 주휴 양옆 낭비 O 패널티 (fixed/예외/강제 OFF 제외)
                 try:

@@ -1277,27 +1277,29 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         if L and cons_n == L:
             forbidden[nurse_id][0].append('N')
 
-    # day0 강제 OFF 과밀을 완화: 요구치 기반 cap 적용 후 day1/2로 분산
-    day0_all = [nid for nid, days in forced_off.items() if 0 in days]
-    day0_locked = [nid for nid in day0_all if nid in weekend_off_nurse_ids]  # 주말휴무 전담은 이동하지 않음
-    movable = [nid for nid in day0_all if nid not in weekend_off_nurse_ids]
-    allow_movable = max(0, day0_cap - len(day0_locked))
-    if len(movable) > allow_movable:
-        overflow = movable[allow_movable:]
-        for nid in overflow:
-            days = forced_off.get(nid, [])
-            days = [d for d in days if d != 0]
-            placed = False
-            for target in (1, 2):
-                if target not in days:
-                    days.append(target)
-                    placed = True
-                    break
-            forced_off[nid] = sorted(set(days)) if placed else sorted(set(days + [0]))
-        print(
-            f"[CrossMonth] day0 강제 OFF cap 적용: cap={day0_cap}, "
-            f"locked={len(day0_locked)}, moved={len(overflow)}, total_before={len(day0_all)}"
-        )
+    # day0 강제 OFF 과밀 완화(cap 이동)는 기본 비활성화
+    enable_day0_cap = bool(config_dict.get("cross_month_day0_cap_enable", False))
+    if enable_day0_cap:
+        day0_all = [nid for nid, days in forced_off.items() if 0 in days]
+        day0_locked = [nid for nid in day0_all if nid in weekend_off_nurse_ids]  # 주말휴무 전담은 이동하지 않음
+        movable = [nid for nid in day0_all if nid not in weekend_off_nurse_ids]
+        allow_movable = max(0, day0_cap - len(day0_locked))
+        if len(movable) > allow_movable:
+            overflow = movable[allow_movable:]
+            for nid in overflow:
+                days = forced_off.get(nid, [])
+                days = [d for d in days if d != 0]
+                placed = False
+                for target in (1, 2):
+                    if target not in days:
+                        days.append(target)
+                        placed = True
+                        break
+                forced_off[nid] = sorted(set(days)) if placed else sorted(set(days + [0]))
+            print(
+                f"[CrossMonth] day0 강제 OFF cap 적용: cap={day0_cap}, "
+                f"locked={len(day0_locked)}, moved={len(overflow)}, total_before={len(day0_all)}"
+            )
 
     # 중복 제거/정렬
     forced_off = {k: sorted(set(v)) for k, v in forced_off.items()}
