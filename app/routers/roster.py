@@ -1545,6 +1545,11 @@ async def create_empty_roster(
     # year/month는 쿼리로 받음 (FastAPI가 자동 검증)
     new_version = _get_next_version(db, target_group_id, year, month)
 
+    latest_config = db.query(RosterConfigModel).filter(
+        RosterConfigModel.group_id == target_group_id,
+        RosterConfigModel.office_id == current_user.office_id,
+    ).order_by(RosterConfigModel.created_at.desc()).first()
+
     # 이름 결정
     created_name = name or f"{month}월 근무표 VER{new_version}"
 
