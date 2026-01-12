@@ -28,7 +28,7 @@ from schemas.roster_schema import RosterRequest
 from routers.utils import get_days_in_month, Timer
 from datetime import date, datetime, timedelta
 import uuid
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from collections import defaultdict
 import calendar
 from sqlalchemy import text
@@ -66,18 +66,22 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
         - shift_gb IS NULL
         - type ∈ {'근무','휴가','공가'}
     """
+    
     rows = (
         db.query(Shift)
         .filter(
             Shift.group_id == group_id,
             Shift.office_id == office_id,
-            Shift.show_in_preference == True,
-            Shift.shift_gb == None,
+            Shift.show_in_preference == 1,
             Shift.type.in_(["근무", "휴가", "공가"]),
-            Shift.default_shift.notin_(["D", "E", "N", "O", "주"]),
+            or_(
+                Shift.default_shift.is_(None),
+                Shift.default_shift.notin_(["D", "E", "N", "O", "주"]),
+            ),
         )
         .all()
     )
+    print('\n\n\n\n\nrows', rows, '\n\n\n\n\n')
     return {
         str(r.shift_id).upper(): {
             "shift_id": r.shift_id,
@@ -90,19 +94,24 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
 def _collect_nurses_and_preferences(db: Session, req, current_user):
     """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (WantedRequest 기반)"""
     # 1️⃣ 그룹 내 간호사 목록
+    print('collect_nurses_and_preferences 진입')
     nurses_in_group = (
         db.query(Nurse)
         .filter(Nurse.group_id == current_user.group_id)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
-
+    # print(1)
     nurse_ids = [n.nurse_id for n in nurses_in_group]
+    # print(2)
     month_str = f"{req.year}-{req.month:02d}"
+    # print(3)
     preferences = []
+    # print(4)
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
+    # print(5)
     special_fixed_requests: list[dict] = []
-
+    print('\n\n\n\n\nspecial_shift_map', special_shift_map, '\n\n\n\n\n')
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     for nurse_id in nurse_ids:
         submitted_wr = (
@@ -164,6 +173,8 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                         "shift_type": special_shift_map[shift_code]["type"],
                     }
                 )
+        print(f'\n\n\n\n\nspecial_fixed_requests {special_fixed_requests}\n\n\n\n\n')
+        print(6)
         # 4️⃣ pair 데이터 수집
         pair_rows = (
             db.query(NursePairRequest)
@@ -2107,163 +2118,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     return roster_data
 
 
-def generate_roster_service_with_fixed_cells(req, current_user, db: Session):
-    """
-    고정된 셀을 반영한 근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
-    req: ex. year=2027 month=3 fixed_cells=[{'nurse_index': 0, 'day_index': 11, 'shift': 'D'}]
-    """
-    if not current_user or not current_user.is_head_nurse:
-        raise Exception("Permission denied")
-
-    fixed_cells = req.fixed_cells
-    print(f"고정된 셀 개수: {len(fixed_cells)}")
-
-    wanted = (
-        db.query(Wanted)
-        .filter(
-            Wanted.group_id == current_user.group_id,
-            Wanted.year == req.year,
-            Wanted.month == req.month,
-        )
-        .first()
-    )
-    if not wanted:
-        raise Exception("해당 월의 wanted 작성을 먼저 요청해주세요.")
-
-    schedule = request_schedule_service(req, current_user, db)
-
-    (
-        nurses_in_group,
-        preferences,
-        special_shift_requests,
-        special_shift_map,
-    ) = _collect_nurses_and_preferences(db, req, current_user)
-    fixed_nurses, engine_nurses = _split_fixed_nurses(nurses_in_group)
-    print('fixed_nurses', fixed_nurses)
-    invalid = [n for n in fixed_nurses if not bool(getattr(n, "is_weekend_off", False))]
-    print('invalid', invalid)
-    if invalid:
-        raise HTTPException(status_code=400, detail="주말 휴무 true만 고정 shift설정이 가능하다")
-    engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
-    preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
-    nurses_for_engine = engine_nurses
-    latest_config = _fetch_latest_config(db, req, current_user)
-    shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day = _build_shift_manage_and_requirements(
-        db, current_user, latest_config, req
-    )
-    # fixed_cells 및 요구인원 설정 반영
-    config_dict = latest_config.__dict__ if latest_config else {}
-    config_dict['daily_shift_requirements'] = daily_shift_requirements
-    # 일자별 요구치 우선 적용
-    config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
-    special_fixed_cells, has_special_working = _build_special_fixed_cells(
-        requests=special_shift_requests,
-        nurse_idx_map=_build_engine_nurse_index_map(engine_nurses),
-        special_shift_map=special_shift_map,
-        active_range_map=None,
-        days_in_month=get_days_in_month(req.year, req.month),
-    )
-    _inject_special_work_code(config_dict, has_special_working)
-    # ── 프리셉터 게이지(0~10) → 파라미터 매핑 (고정 생성에도 동일 적용) ──
-    _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
-    _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
-    _apply_distribution_policy_from_req(config_dict, req)
-    # 경계 제약 기능 기본값 및 충돌 정책(hold는 기본 차단)
-    config_dict.setdefault('cross_month_hard_rules_enable', True)
-    config_dict.setdefault('cross_month_lookback_days', 6)
-    config_dict.setdefault('allow_override_by_law', False)
-    print("cp_sat_basic 엔진으로 고정 셀 반영 근무표 생성 시작")
-
-    # ── 주휴 고정 셀(최우선) 계산 + 기존 고정 셀과 병합 ──
-    weekly_off_warnings: list[dict] = []
-    weekly_off_conflicts: list[dict] = []
-    weekly_off_map: dict[str, set[int]] = {}
-    weekly_off_fixed_cells: list[dict] = []
-    merged_fixed_cells = (fixed_cells or []) + special_fixed_cells
-    weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
-        db=db,
-        office_id=current_user.office_id,
-        group_id=current_user.group_id,
-        year=req.year,
-        month=req.month,
-    )
-    weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
-    if weekly_off_map:
-        nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
-        for nurse_id, day_set in weekly_off_map.items():
-            n_idx = nurse_idx_map.get(nurse_id)
-            if n_idx is None:
-                continue
-            for d in sorted(day_set):
-                weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": weekly_off_display_code})
-        merged_fixed_cells, weekly_off_conflicts = _merge_fixed_cells_with_weekly_off(
-            fixed_cells=fixed_cells,
-            weekly_off_cells=weekly_off_fixed_cells,
-        )
-    config_dict["weekly_off_map"] = {k: sorted(list(v)) for k, v in weekly_off_map.items()}
-
-    generated: dict[str, list[str]] = {}
-    satisfaction_data = {}
-    roster_system = None
-    if nurses_for_engine:
-        generated, satisfaction_data, roster_system = _run_cp_sat_basic(
-            db,
-            current_user,
-            nurses_for_engine,
-            preferences,
-            latest_config,
-            req,
-            shift_manage_data,
-            fixed_cells=merged_fixed_cells,
-            time_limit_seconds=300,
-            config_override=config_dict,
-        )
-
-    # ── 저장 시 주휴 날짜만 '주'로 마킹(표시용) ──
-    try:
-        if weekly_off_map and isinstance(generated, dict):
-            for nurse_id, day_set in weekly_off_map.items():
-                shifts = generated.get(nurse_id)
-                if not shifts:
-                    continue
-                for d in day_set:
-                    if 0 <= d < len(shifts):
-                        shifts[d] = "주"
-    except Exception as e:
-        weekly_off_warnings.append({"type": "weekly_off_mark_failed", "detail": str(e)})
-
-    fixed_roster = _build_fixed_shift_roster(
-        fixed_nurses,
-        req.year,
-        req.month,
-        weekday_off_code="O",
-        sunday_code="주",
-        shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
-    )
-    if isinstance(generated, dict):
-        generated.update(fixed_roster)
-    else:
-        generated = fixed_roster
-
-    _persist_entries(db, schedule, generated, req)
-    roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
-    roster_data["weekly_off_conflicts"] = weekly_off_conflicts
-    roster_data["weekly_off_warnings"] = weekly_off_warnings
-    # print(7)
-    # # 기존 로직 유지: 대시보드 분석 데이터 저장 시도 (있으면 사용)
-    # try:
-    #     from services.dashboard_service import save_roster_analytics
-    #     if roster_system:
-    #         print("CP-SAT 엔진 결과를 사용하여 대시보드 분석 데이터 저장 중...")
-    #         save_roster_analytics(schedule.schedule_id, roster_system, db)
-    #         print("대시보드 분석 데이터 저장 완료")
-    # except ImportError as e:
-    #     print(f"대시보드 서비스를 찾을 수 없습니다: {e}")
-    # except Exception as e:
-    #     print(f"대시보드 분석 데이터 저장 실패: {e}")
-
-    # print(f"고정된 셀을 반영한 근무표 생성 완료: {len(fixed_cells)}개 셀 고정")
-    return roster_data
+# 
 
 
 def request_schedule_service(req: RosterRequest, current_user, db: Session):

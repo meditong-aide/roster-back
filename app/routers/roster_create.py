@@ -18,7 +18,7 @@ from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest
 from services.roster_create_service import (
     generate_roster_service,
-    generate_roster_service_with_fixed_cells,
+    # generate_roster_service_with_fixed_cells,
     request_schedule_service,
 )
 from services.job_status_service import create_job_record
@@ -182,6 +182,7 @@ async def generate_roster_endpoint(
     req: RosterRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
+
 ):
     """
     동기 방식으로 근무표를 생성한다.

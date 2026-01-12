@@ -71,6 +71,7 @@ def _build_shift_normalizer(shift_defs: list[dict] | None) -> tuple[dict[str, st
             sid_upper = "O"
 
         main_code = None
+        skip_main_to_id = False
         if raw_default in canonical:
             main_code = raw_default
         elif raw_gb in canonical:
@@ -79,16 +80,21 @@ def _build_shift_normalizer(shift_defs: list[dict] | None) -> tuple[dict[str, st
             main_code = sid_upper
         elif shift_type in {"휴가", "공가"}:
             main_code = "O"
+            if sid_upper != "O":
+                skip_main_to_id = True  # 휴가/공가가 canonical O를 덮어쓰지 않도록 방지
         elif shift_type == "근무":
             main_code = "W"
+            if sid_upper != "W":
+                skip_main_to_id = True  # 근무형은 가상 코드 W만 사용
 
         if not main_code:
             continue
 
         id_to_main[sid_upper] = main_code
-        current = main_to_id.get(main_code)
-        if current in {None, main_code} or sid_upper == main_code:
-            main_to_id[main_code] = raw_id
+        if not skip_main_to_id:
+            current = main_to_id.get(main_code)
+            if current in {None, main_code} or sid_upper == main_code:
+                main_to_id[main_code] = raw_id
 
     return id_to_main, main_to_id
 
