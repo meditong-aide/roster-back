@@ -631,6 +631,13 @@ class CPSATBasicEngine:
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
                 self._optimize_fallback_lex_hard_first(roster_system, time_limit_seconds=time_limit_seconds, grouped=grouped)
+        # 9-1. 불필요 OFF 정리 (N-only 제외)
+        try:
+            with Timer("불필요 OFF 정리"):
+                trimmed = self._postprocess_trim_extra_offs(roster_system, max_changes=80, prefer_shortage=True)
+                print(f"{self.logger_prefix} 불필요 OFF 교체 {trimmed}건")
+        except Exception as exc:
+            print(f"{self.logger_prefix} 불필요 OFF 후처리 실패: {exc}")
         # W 배정 디버그 로그
         try:
             if "W" in roster_system.config.shift_types:
@@ -2101,6 +2108,228 @@ class CPSATBasicEngine:
             f"{self.logger_prefix} [PostOff] 완료: 수용 스왑 {accepted}건, "
             f"위반 {base_viol}->{final_viol}, max_attempts={max_attempts}"
         )
+
+    def _postprocess_trim_extra_offs(
+        self,
+        roster_system: RosterSystem,
+        max_changes: int = 80,
+        prefer_shortage: bool = True,
+    ) -> int:
+        """필수/강제 OFF를 보존하면서 불필요한 OFF를 근무로 교체한다.
+
+        Notes:
+            - N-only 간호사는 제외한다.
+            - 개인 OFF 상한은 `global_monthly_off_days + standard_personal_off_days + max_extra_off_days`
+              를 기본으로 하되, 가능한 10을 넘지 않도록 클램프한다.
+            - 회복 OFF(2N/3N→2O), 고정/예외/주휴 OFF는 건드리지 않는다.
+        """
+        cfg = roster_system.config
+        if "O" not in cfg.shift_types:
+            return 0
+
+        off_idx = cfg.shift_types.index("O")
+        day_idx = cfg.shift_types.index("D") if "D" in cfg.shift_types else None
+        eve_idx = cfg.shift_types.index("E") if "E" in cfg.shift_types else None
+        night_idx = cfg.shift_types.index("N") if "N" in cfg.shift_types else None
+        work_shift_indices = [i for i, code in enumerate(cfg.shift_types) if code != "O"]
+        if not work_shift_indices:
+            return 0
+
+        # 현재 로스터 스냅샷을 보존하여 회복 OFF(2N/3N→2O)를 안전하게 식별한다.
+        roster_snapshot = roster_system.roster.copy()
+
+        num_days = roster_system.num_days
+        weekend_days = {
+            d
+            for d in range(num_days)
+            if (roster_system.target_month + timedelta(days=d)).weekday() >= 5
+        }
+
+        fixed_cells = getattr(roster_system, "fixed_cells", []) or []
+        fixed_off_cells = {
+            (c.get("nurse_index"), c.get("day_index"))
+            for c in fixed_cells
+            if str(c.get("shift", "")).upper() == "O"
+        }
+        off_exception_cells = set(getattr(cfg, "off_exception_cells", []) or [])
+        weekly_off_map = (
+            getattr(roster_system, "weekly_off_by_idx", {})
+            if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
+            else {}
+        )
+        weekly_off_cells = {(n, d) for n, days in weekly_off_map.items() for d in (days or [])}
+
+        pref_matrix = getattr(roster_system, "preference_matrix", None)
+
+        base_min_off = int(
+            getattr(cfg, "global_monthly_off_days", 0) + getattr(cfg, "standard_personal_off_days", 0)
+        )
+        extra_off = int(getattr(cfg, "max_extra_off_days", 0))
+        target_cap_global = max(base_min_off, min(base_min_off + extra_off, 10))
+
+        def is_n_only(nurse: Nurse) -> bool:
+            raw = getattr(nurse, "is_night_nurse", None)
+            if isinstance(raw, list):
+                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                return allowed == {"N"}
+            return raw == 3 or (raw is not None and raw != 0 and raw is not False)
+
+        def min_off_required() -> int:
+            return min(base_min_off, num_days)
+
+        def max_off_allowed(nurse: Nurse) -> int:
+            return max(base_min_off, min(base_min_off + extra_off, target_cap_global))
+
+        def build_recovery_off_cells() -> set[tuple[int, int]]:
+            cells: set[tuple[int, int]] = set()
+            if night_idx is None:
+                return cells
+            for n_idx, _n in enumerate(roster_system.nurses):
+                # 밤 연속 블록을 스냅샷 기준으로 스캔
+                d = 0
+                while d < num_days:
+                    if roster_snapshot[n_idx, d, night_idx] != 1:
+                        d += 1
+                        continue
+                    start = d
+                    while d + 1 < num_days and roster_snapshot[n_idx, d + 1, night_idx] == 1:
+                        d += 1
+                    end = d
+                    length = end - start + 1
+                    if cfg.two_offs_after_three_nig and length >= 3:
+                        for off_d in (end + 1, end + 2):
+                            if off_d < num_days:
+                                cells.add((n_idx, off_d))
+                    if cfg.two_offs_after_two_nig and length >= 2:
+                        for off_d in (end + 1, end + 2):
+                            if off_d < num_days:
+                                cells.add((n_idx, off_d))
+                    d += 1
+            return cells
+
+        recovery_off_cells = build_recovery_off_cells()
+
+        def is_recovery_off(n_idx: int, d_idx: int) -> bool:
+            return (n_idx, d_idx) in recovery_off_cells
+
+        def day_deficits() -> dict[int, dict[int, int]]:
+            deficits: dict[int, dict[int, int]] = {}
+            for d_idx in range(num_days):
+                if (
+                    hasattr(cfg, "daily_shift_requirements_by_day")
+                    and isinstance(cfg.daily_shift_requirements_by_day, list)
+                    and d_idx < len(cfg.daily_shift_requirements_by_day)
+                ):
+                    need_map = cfg.daily_shift_requirements_by_day[d_idx]
+                else:
+                    need_map = cfg.daily_shift_requirements
+                for code, req in (need_map or {}).items():
+                    if code not in cfg.shift_types or code == "O":
+                        continue
+                    s_idx = cfg.shift_types.index(code)
+                    assigned = int(np.sum(roster_system.roster[:, d_idx, s_idx]))
+                    need = int(req or 0)
+                    if assigned < need:
+                        deficits.setdefault(d_idx, {})[s_idx] = need - assigned
+            return deficits
+
+        deficits_by_day = day_deficits()
+        base_viol = len(roster_system._find_violations())
+        changes = 0
+
+        def is_off_like(n_idx: int, d_idx: int) -> bool:
+            if d_idx < 0 or d_idx >= num_days:
+                return False
+            if roster_system.roster[n_idx, d_idx, off_idx] == 1:
+                return True
+            if (n_idx, d_idx) in fixed_off_cells or (n_idx, d_idx) in off_exception_cells or (n_idx, d_idx) in weekly_off_cells:
+                return True
+            if is_recovery_off(n_idx, d_idx):
+                return True
+            return False
+
+        for n_idx, nurse in enumerate(roster_system.nurses):
+            if is_n_only(nurse):
+                continue
+
+            current_off = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+            max_allowed = max_off_allowed(nurse)
+            if current_off <= max_allowed:
+                continue
+
+            required_min = min_off_required()
+            # 후보 O 셀을 모아 “징검다리”(양옆 OFF) 우선 회피
+            candidates: list[tuple[int, int, float, int]] = []
+            for d_idx in range(num_days):
+                if roster_system.roster[n_idx, d_idx, off_idx] != 1:
+                    continue
+                if (n_idx, d_idx) in fixed_off_cells:
+                    continue
+                if (n_idx, d_idx) in off_exception_cells or (n_idx, d_idx) in weekly_off_cells:
+                    continue
+                if is_recovery_off(n_idx, d_idx):
+                    continue
+                if bool(getattr(nurse, "is_weekend_off", False)) and d_idx in weekend_days:
+                    continue
+
+                adj_off = int(is_off_like(n_idx, d_idx - 1)) + int(is_off_like(n_idx, d_idx + 1))
+                has_deficit = int(d_idx in deficits_by_day and bool(deficits_by_day[d_idx]))
+                best_pref = 0.0
+                if pref_matrix is not None:
+                    best_pref = max(pref_matrix[n_idx, d_idx, s_idx] for s_idx in work_shift_indices)
+
+                candidates.append((adj_off, -has_deficit, -best_pref, d_idx))
+
+            # 징검다리(양옆 OFF=2)인 경우는 가장 마지막에 처리되도록 정렬
+            candidates.sort()
+
+            for _, _, _, d_idx in candidates:
+                if changes >= max_changes:
+                    break
+
+                target_shift_idx = None
+                if prefer_shortage and d_idx in deficits_by_day and deficits_by_day[d_idx]:
+                    target_shift_idx = max(deficits_by_day[d_idx].items(), key=lambda x: x[1])[0]
+                else:
+                    best_score = None
+                    for s_idx in work_shift_indices:
+                        if s_idx == off_idx:
+                            continue
+                        score = pref_matrix[n_idx, d_idx, s_idx] if pref_matrix is not None else 0
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            target_shift_idx = s_idx
+                if target_shift_idx is None:
+                    continue
+
+                # 교체 시뮬레이션
+                roster_system.roster[n_idx, d_idx, off_idx] = 0
+                roster_system.roster[n_idx, d_idx, target_shift_idx] = 1
+                new_off = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+                new_viol = len(roster_system._find_violations())
+
+                if new_off < required_min or new_viol > base_viol:
+                    roster_system.roster[n_idx, d_idx, target_shift_idx] = 0
+                    roster_system.roster[n_idx, d_idx, off_idx] = 1
+                    continue
+
+                changes += 1
+                base_viol = new_viol
+                current_off = new_off
+
+                if d_idx in deficits_by_day and target_shift_idx in deficits_by_day[d_idx]:
+                    deficits_by_day[d_idx][target_shift_idx] = max(
+                        0, deficits_by_day[d_idx][target_shift_idx] - 1
+                    )
+                    if deficits_by_day[d_idx][target_shift_idx] == 0:
+                        deficits_by_day[d_idx].pop(target_shift_idx, None)
+                    if not deficits_by_day[d_idx]:
+                        deficits_by_day.pop(d_idx, None)
+
+                if current_off <= max_allowed:
+                    break
+
+        return changes
 
     def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
         """최종 근무표를 간호사별로 출력합니다.
