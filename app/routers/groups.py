@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 from typing import List
 import uuid
@@ -28,14 +30,27 @@ async def list_groups(
         .all()
     )
     print('office_id', current_user.office_id)
-    return [
+    # return [
+    #     {
+    #         "group_id": g.group_id,
+    #         "group_name": g.group_name,
+    #         "office_id": g.office_id,
+    #     }
+    #     for g in rows
+    # ]
+    data = [
         {
-            "group_id": g.group_id,
-            "group_name": g.group_name,
-            "office_id": g.office_id,
+            "group_id": str(g.group_id),
+            "group_name": str(g.group_name),
+            "office_id": str(g.office_id),
         }
         for g in rows
     ]
+    
+    return JSONResponse(
+        content=jsonable_encoder(data),
+        media_type="application/json; charset=utf-8"
+    )
 
 
 @router.post("")
