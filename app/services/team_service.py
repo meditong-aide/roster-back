@@ -71,7 +71,7 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
         db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.team_id.in_(delete_team_ids)).update({Nurse.team_id: None}, synchronize_session=False)
         db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id, Team.team_id.in_(delete_team_ids)).delete(synchronize_session=False)
 
-    # db.commit()
+    db.commit()
     return list_teams_with_members(db, office_id, group_id)
 
 
