@@ -54,7 +54,7 @@ def _build_shift_normalizer(shift_defs: list[dict] | None) -> tuple[dict[str, st
             - id_to_main: shift_id(대문자) → 메인 코드(D/E/N/O)
             - main_to_id: 메인 코드 → 대표 shift_id(초기값은 자기 자신, 매핑되면 우선 적용)
     """
-    canonical = {"D", "E", "N", "O", "주"}
+    canonical = {"D", "E", "N", "O", "주", "W"}
     id_to_main: dict[str, str] = {}
     main_to_id: dict[str, str] = {c: c for c in canonical}
 
@@ -65,6 +65,7 @@ def _build_shift_normalizer(shift_defs: list[dict] | None) -> tuple[dict[str, st
         sid_upper = raw_id.upper()
         raw_default = str(row.get("default_shift") or "").strip().upper()
         raw_gb = str(row.get("shift_gb") or "").strip().upper()
+        shift_type = str(row.get("type") or "").strip()
 
         if sid_upper in {"OFF"}:
             sid_upper = "O"
@@ -76,6 +77,10 @@ def _build_shift_normalizer(shift_defs: list[dict] | None) -> tuple[dict[str, st
             main_code = raw_gb
         elif sid_upper in canonical:
             main_code = sid_upper
+        elif shift_type in {"휴가", "공가"}:
+            main_code = "O"
+        elif shift_type == "근무":
+            main_code = "W"
 
         if not main_code:
             continue
@@ -94,7 +99,7 @@ def _normalize_shift_code(raw_code: object, id_to_main: dict[str, str]) -> str |
     upper = code.upper()
     if upper in {"OFF"}:
         return "O"
-    if upper in {"D", "E", "N", "O", "주"}:
+    if upper in {"D", "E", "N", "O", "주", "W"}:
         return upper
     return id_to_main.get(upper)
 
@@ -152,14 +157,20 @@ class CPSATBasicEngine:
                 req_map: 원본 요구치 맵(키가 대소문자/공백/다른 표기일 수 있음)
 
             Returns:
-                'D','E','N' 키만을 갖는 정수 요구치 맵
+                'D','E','N'(필요 시 'W') 키만을 갖는 정수 요구치 맵
             """
-            base = {"D": 0, "E": 0, "N": 0}
+            base_keys = {"D", "E", "N"}
+            if isinstance(req_map, dict):
+                for k in req_map.keys():
+                    if str(k).strip().upper() == "W":
+                        base_keys.add("W")
+                        break
+            base = {k: 0 for k in base_keys}
             if not isinstance(req_map, dict):
                 return base
             for k, v in req_map.items():
                 key = str(k).strip().upper()
-                if key in {"D", "E", "N"}:
+                if key in base:
                     try:
                         base[key] = int(v or 0)
                     except Exception:
