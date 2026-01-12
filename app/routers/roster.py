@@ -3,7 +3,7 @@ import uuid
 from datetime import date
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Depends, Body
+from fastapi import APIRouter, HTTPException, Depends, Body, Query
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -1524,37 +1524,32 @@ async def copy_schedule_to_new_version(
 
 @router.post("/create-empty")
 async def create_empty_roster(
-    request: dict = Body(...),  # { "year": 2027, "month": 8, "name": "새 빈 버전" }
+    year: int = Query(..., description="생성할 연도 (현재 탭 연도)"),
+    month: int = Query(..., description="생성할 월 (현재 탭 월)"),
+    name: Optional[str] = Query(None, description="새 버전 이름 (생략 시 자동 생성)"),
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """
-    빈 근무표(모든 셀 -)를 신규 버전으로 생성합니다.
-    - 연/월은 request에 필수로 전달
-    - ScheduleEntry는 생성하지 않음 (빈 상태)
+    현재 보고 있는 연/월에 빈 신규 버전 생성
+    - year/month: 쿼리 파라미터로 현재 탭 값 전달 (필수)
+    - name: 옵션 (없으면 자동)
+    - ScheduleEntry 생성 X → 완전 빈 근무표
     """
     if not current_user or not (current_user.is_head_nurse or current_user.is_master_admin):
         raise HTTPException(status_code=403, detail="권한이 없습니다.")
 
     target_group_id = _get_target_group_id(current_user, group_id, db)
 
-    year = request.get("year")
-    month = request.get("month")
-    custom_name = request.get("name")
-
-    if not all([year, month]):
-        raise HTTPException(status_code=400, detail="year와 month는 필수입니다.")
-
-    # 새 버전 번호 계산
+    # year/month는 쿼리로 받음 (FastAPI가 자동 검증)
     new_version = _get_next_version(db, target_group_id, year, month)
 
-    # 이름 자동 생성 (입력 없으면 기본값)
-    name = custom_name or f"{month}월 근무표 VER{new_version} (빈 버전)"
+    # 이름 결정
+    created_name = name or f"{month}월 근무표 VER{new_version}"
 
     new_schedule_id = str(uuid.uuid4().hex)[:12]
 
-    # Schedule만 생성 (config_id는 최신 사용 또는 NULL)
     latest_config = db.query(RosterConfigModel).filter(
         RosterConfigModel.group_id == target_group_id
     ).order_by(RosterConfigModel.created_at.desc()).first()
@@ -1572,12 +1567,12 @@ async def create_empty_roster(
         updated_at=datetime.now(),
         status="draft",
         dropped=False,
-        name=name,
+        name=created_name,
         memo=None,
     )
     db.add(new_schedule)
 
-    # ScheduleEntry는 의도적으로 생성하지 않음 → 빈 근무표
+    # 빈 근무표 → ScheduleEntry 생성 안 함
 
     try:
         db.commit()
@@ -1590,9 +1585,9 @@ async def create_empty_roster(
         "message": "빈 신규 버전 생성 완료",
         "new_schedule_id": new_schedule.schedule_id,
         "new_version": new_version,
-        "name": name,
+        "name": created_name,
         "year": year,
         "month": month,
         "status": "draft",
-        "entries_copied": 0  # 빈 상태임을 명시
+        "entries_copied": 0
     }
