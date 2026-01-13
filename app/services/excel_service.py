@@ -1202,29 +1202,14 @@ def create_groups_and_save_data(data: List[Dict[str, Any]], new_groups_to_create
 
 
 def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group_id: str) -> bytes:
-    """지정된 schedule_id의 근무표를 엑셀(xlsx) 바이트로 생성하여 반환합니다.
-    
-    요약: schedules, schedule_entries, nurses, shifts, shift_manage 정보를 조회하여
-    example.html과 유사한 표 형태(상단 제목, 일자 헤더, 간호사별 행, D/E/N/O 합계, 일일 현황)를 구성합니다.
-    
-    Args:
-        schedule_id: 스케줄 식별자
-        current_user: 요청 사용자(권한/그룹 필터용)
-        db: SQLAlchemy 세션
-    
-    Returns:
-        bytes: 생성된 엑셀 파일의 바이트 데이터
-    
-    예시:
-        - 2025년 9월 → "2025년 9월 근무표" 제목 표시.
-        - 일수 30일이면 1~30 열 생성.
-    """
+    """지정된 schedule_id의 근무표를 엑셀(xlsx) 바이트로 생성하여 반환합니다."""
     from io import BytesIO
     from datetime import date
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
     from db.models import Schedule, ScheduleEntry, Nurse, Shift, RosterConfig, ShiftManage
+    import calendar
 
     # ───────── 1) 데이터 로드 ─────────
     schedule = db.query(Schedule).filter(
@@ -1236,24 +1221,19 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         raise ValueError("스케줄을 찾을 수 없습니다.")
 
     year, month = schedule.year, schedule.month
+    days_in_month = calendar.monthrange(year, month)[1]
 
-    # 간호사 목록(경력 desc, nurse_id asc)
     nurses = db.query(Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence).filter(
         Nurse.group_id == target_group_id
     ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
 
-    # 엔트리
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
 
-    # 시프트(색상 등은 엑셀에서는 텍스트 표기 중심으로 사용)
-    shifts_db = db.query(Shift).filter(Shift.group_id == target_group_id).all()
-
+    # alias_map 생성
     alias_map: dict[str, str] = {}
-    # if config_version:
     sm_rows = db.query(ShiftManage).filter(
         ShiftManage.office_id == current_user.office_id,
         ShiftManage.group_id == target_group_id,
-        # ShiftManage.config_version == config_version
     ).all()
     for row in sm_rows:
         if not row.main_code:
@@ -1263,7 +1243,8 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         if row.codes:
             for c in row.codes:
                 alias_map[str(c).upper()] = base
-    alias_map.setdefault('OFF', 'O'); alias_map.setdefault('O', 'O')
+    alias_map.setdefault('OFF', 'O')
+    alias_map.setdefault('O', 'O')
 
     def to_base(code: str) -> str:
         if not code:
@@ -1271,26 +1252,31 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         u = code.upper()
         if u in alias_map:
             return alias_map[u]
-        # 휴리스틱 (미등록 코드)
-        if u.startswith('D'):
-            return 'D'
-        if u.startswith('E'):
-            return 'E'
-        if u.startswith('N'):
-            return 'N'
-        if u in ('O', 'OFF'):
-            return 'O'
+        if u.startswith('D'): return 'D'
+        if u.startswith('E'): return 'E'
+        if u.startswith('N'): return 'N'
+        if u in ('O', 'OFF'): return 'O'
         return u
 
-    # 일 수
-    import calendar
-    days_in_month = calendar.monthrange(year, month)[1]
+    # ───────── 2) 실제 사용된 모든 base 코드 수집 ─────────
+    used_codes = set()
+    for e in entries:
+        if e.shift_id:
+            base = to_base(e.shift_id)
+            if base != '-':
+                used_codes.add(base)
 
-    # nurse별 일자→shift 매핑
+    core_codes = ['D', 'E', 'N', 'O']
+    extra_codes = sorted(used_codes - set(core_codes))
+    tail_labels = core_codes + extra_codes
+    summary_cols = len(tail_labels)
+
+    # nurse별 매핑
     by_nurse: dict[str, dict[int, str]] = {}
     for e in entries:
         by_nurse.setdefault(e.nurse_id, {})[e.work_date.day] = e.shift_id
-    # ───────── 2) 워크북/시트 ─────────
+
+    # ───────── 3) 워크북/시트 ─────────
     wb = Workbook()
     ws = wb.active
     ws.title = "근무표"
@@ -1302,139 +1288,146 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     thin = Side(style="thin", color="000000")
     border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
     gray_fill = PatternFill("solid", fgColor="DEE2E6")
+    highlight_fill = PatternFill("solid", fgColor="FFFACD")
 
-    # ───────── 3) 제목 영역 ─────────
+    # ───────── 4) 제목 영역 ─────────
     title = f"{year}년 {month}월 근무표"
-    # 열 구성: [번호, 구분, 이름] + days + [spacer] + [D,E,N,O]
     static_cols = 4
-    spacer_cols = 1
-    summary_cols = 4
+    spacer_cols = 2
     total_cols = static_cols + days_in_month + spacer_cols + summary_cols
-    # 제목을 스케줄 전체 폭(1..total_cols)으로 병합
+
     ws.merge_cells(start_row=2, start_column=1, end_row=3, end_column=total_cols)
     ws.cell(row=2, column=1, value=title).font = title_font
     ws.cell(row=2, column=1).alignment = center
 
-    # ───────── 4) 헤더 행 ─────────
+    # ───────── 5) 헤더 행 ─────────
     header_row = 7
     ws.cell(row=header_row, column=1, value="번호").font = header_font
     ws.cell(row=header_row, column=2, value="구분").font = header_font
     ws.cell(row=header_row, column=3, value="경력").font = header_font
     ws.cell(row=header_row, column=4, value="이름").font = header_font
+
     for c in range(1, static_cols + 1):
         cell = ws.cell(row=header_row, column=c)
-        cell.alignment = center; cell.border = border_all; cell.fill = gray_fill
+        cell.alignment = center
+        cell.border = border_all
+        cell.fill = gray_fill
 
     for d in range(1, days_in_month + 1):
         col = static_cols + d
         cell = ws.cell(row=header_row, column=col, value=d)
-        cell.font = header_font; cell.alignment = center; cell.border = border_all; cell.fill = gray_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border_all
+        cell.fill = gray_fill
 
-    tail_labels = ['D', 'E', 'N', 'O']
-    tail_start_col = static_cols + days_in_month + 1 + spacer_cols
+    tail_start_col = static_cols + days_in_month + spacer_cols + 1
     for i, lab in enumerate(tail_labels):
         col = tail_start_col + i
         cell = ws.cell(row=header_row, column=col, value=lab)
-        cell.font = header_font; cell.alignment = center; cell.border = border_all; cell.fill = gray_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border_all
+        cell.fill = gray_fill
 
-    # 열 너비 조정
+    # 열 너비
     ws.column_dimensions['A'].width = 5
     ws.column_dimensions['B'].width = 6
     ws.column_dimensions['C'].width = 6
     ws.column_dimensions['D'].width = 12
     for d in range(1, days_in_month + 1):
         ws.column_dimensions[get_column_letter(static_cols + d)].width = 4
-    # spacer 열 너비
-    ws.column_dimensions[get_column_letter(static_cols + days_in_month + 1)].width = 3
-    for i in range(summary_cols):
-        ws.column_dimensions[get_column_letter(tail_start_col + i)].width = 5
+    for s in range(spacer_cols):
+        ws.column_dimensions[get_column_letter(static_cols + days_in_month + 1 + s)].width = 3
+    for i, lab in enumerate(tail_labels):
+        col_letter = get_column_letter(tail_start_col + i)
+        ws.column_dimensions[col_letter].width = 6 if len(lab) > 1 else 5
 
-    # ───────── 5) 본문: 간호사별 스케줄 ─────────
+    # ───────── 6) 본문 ─────────
     start_row = header_row + 1
-    daily_counts = {d: {'D': 0, 'E': 0, 'N': 0, 'O': 0} for d in range(1, days_in_month + 1)}
-    # 하이라이트 색상 (노랑)
-    highlight_fill = PatternFill("solid", fgColor="FFFACD")
+    daily_counts = {d: {code: 0 for code in tail_labels} for d in range(1, days_in_month + 1)}
+
     for idx, n in enumerate(nurses, start=1):
         r = start_row + idx - 1
         is_current_user = (str(n.nurse_id) == str(current_user.nurse_id))
-        # 번호/구분(간단 분류: HN/RN/AN 추정 불가 → RN로 표기)/이름
+
         ws.cell(row=r, column=1, value=idx)
         ws.cell(row=r, column=2, value="RN")
         ws.cell(row=r, column=3, value=n.experience)
         ws.cell(row=r, column=4, value=n.name)
+
         for c in range(1, static_cols + 1):
             cell = ws.cell(row=r, column=c)
-            cell.alignment = center; cell.border = border_all
-            # 🔥 현재 유저면 하이라이트 적용
+            cell.alignment = center
+            cell.border = border_all
             if is_current_user:
                 cell.fill = highlight_fill
-        # 일자별
-        row_counts = {'D': 0, 'E': 0, 'N': 0, 'O': 0}
+
+        row_counts = {code: 0 for code in tail_labels}
         schedule_map = by_nurse.get(n.nurse_id, {})
+
         for d in range(1, days_in_month + 1):
             shift_code = schedule_map.get(d, '-')
             cell = ws.cell(row=r, column=static_cols + d, value=shift_code)
-            cell.alignment = center; cell.border = border_all
+            cell.alignment = center
+            cell.border = border_all
+            if is_current_user:
+                cell.fill = highlight_fill
+
             base = to_base(shift_code)
             if base in row_counts:
                 row_counts[base] += 1
                 daily_counts[d][base] += 1
-            if is_current_user:
-                cell.fill = highlight_fill
-        # 합계(D/E/N/O)
+
+        # 요약 열: 0도 그대로 표시 (빈칸 → 0)
         for i, lab in enumerate(tail_labels):
             col = tail_start_col + i
-            cell = ws.cell(row=r, column=col, value=row_counts.get(lab, 0))
-            cell.alignment = center; cell.border = border_all
+            value = row_counts[lab]
+            cell = ws.cell(row=r, column=col, value=value)  # ← 변경: value 그대로
+            cell.alignment = center
             cell.border = border_all
             if is_current_user:
                 cell.fill = highlight_fill
+
     last_row = start_row + len(nurses) - 1
 
-    # ───────── 6) 일일 근무 현황(풋터) ─────────
+    # ───────── 7) 풋터 ─────────
     footer_start = last_row + 2
     ws.cell(row=footer_start, column=2, value="일일 근무 현황").font = header_font
 
     def write_footer_row(label: str, values: list[int], row_idx: int):
         ws.cell(row=row_idx, column=3, value=label).font = header_font
         for c in range(1, static_cols):
-            cell = ws.cell(row=row_idx, column=c)
-            cell.border = border_all
-        # days
+            ws.cell(row=row_idx, column=c).border = border_all
+
         for d in range(1, days_in_month + 1):
             val = values[d - 1]
-            cell = ws.cell(row=row_idx, column=static_cols + d, value=val)
-            cell.alignment = center; cell.border = border_all
-        # spacer + tail 4칸 비움(border 유지)
-        for i in range(spacer_cols + summary_cols):
-            col = static_cols + days_in_month + 1 + i
-            cell = ws.cell(row=row_idx, column=col)
+            cell = ws.cell(row=row_idx, column=static_cols + d, value=val)  # ← 변경: val 그대로 (0도 표시)
+            cell.alignment = center
             cell.border = border_all
 
-    d_vals = [daily_counts[d]['D'] for d in range(1, days_in_month + 1)]
-    e_vals = [daily_counts[d]['E'] for d in range(1, days_in_month + 1)]
-    n_vals = [daily_counts[d]['N'] for d in range(1, days_in_month + 1)]
-    o_vals = [daily_counts[d]['O'] for d in range(1, days_in_month + 1)]
+        for i in range(spacer_cols + summary_cols):
+            col = static_cols + days_in_month + 1 + i
+            ws.cell(row=row_idx, column=col).border = border_all
 
-    write_footer_row('D', d_vals, footer_start + 1)
-    write_footer_row('E', e_vals, footer_start + 2)
-    write_footer_row('N', n_vals, footer_start + 3)
-    write_footer_row('O', o_vals, footer_start + 4)
+    for i, lab in enumerate(tail_labels):
+        row_idx = footer_start + 1 + i
+        vals = [daily_counts[d][lab] for d in range(1, days_in_month + 1)]
+        write_footer_row(lab, vals, row_idx)
 
-    # 테두리/정렬 마감 및 첫 행 스타일 약간 보정
-    for row in ws.iter_rows(min_row=header_row, max_row=footer_start + 4, min_col=1, max_col=total_cols):
+    # ───────── 8) 테두리 보정 ─────────
+    max_col = tail_start_col + len(tail_labels) - 1
+    for row in ws.iter_rows(min_row=header_row, max_row=footer_start + len(tail_labels) + 1,
+                            min_col=1, max_col=max_col):
         for cell in row:
-            if cell.value is None:
-                continue
-            # 이미 지정된 것 외 공통 보더
-            if cell.border is None or cell.border.left.style is None:
+            if cell.value is not None and (cell.border is None or cell.border.left.style is None):
                 cell.border = border_all
 
-    # 바이트로 저장
+    # ───────── 저장 ─────────
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return bio.getvalue() 
+    return bio.getvalue()
 
 
 def export_members_excel_bytes(office_id: str) -> bytes:
