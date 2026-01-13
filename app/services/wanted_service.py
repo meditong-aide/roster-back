@@ -206,7 +206,7 @@ def _persist_pair_results(
     Notes:
         detailed_request_id는 기존 데이터 다음 순번부터 시작
     """
-    detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="pair", month_str=month_str)
+    detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="pair")
     rows = 0
     for item in pairs or []:
         try:
@@ -372,7 +372,7 @@ def _copy_existing_requests_to_new(
     for old_row in old_shift_rows:
         day = old_row.shift_date.day
         shift = old_row.shift
-        if case_filter and (day, shift) not in case_filter:
+        if case_filter is not None and (day, shift) not in case_filter:
             continue
 
         new_row = NurseShiftRequest(
@@ -591,7 +591,7 @@ async def invoke_and_persist_wanted_service(
 
     # case가 주어졌다면, 사용자가 남긴 (day, shift)만 복사하여 삭제한 항목은 제외
     case_filter: set[tuple[int, str]] | None = None
-    if has_case and req.case:
+    if has_case:
         case_filter = set()
         for item in req.case or []:
             try:
