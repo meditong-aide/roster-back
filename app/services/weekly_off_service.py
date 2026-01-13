@@ -2,7 +2,7 @@ from typing import List, Optional
 from datetime import date, datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 
 from db.models import WeeklyOffSetting, Nurse, Team, Group
 from schemas.weekly_off_schema import (
@@ -84,6 +84,23 @@ def get_weekday_label(weekday: Optional[int]) -> Optional[str]:
         return None
     labels = ["월", "화", "수", "목", "금", "토", "일"]
     return labels[weekday % 7]
+
+
+def resolve_weekly_off_base_weekday(nurse: Nurse) -> Optional[int]:
+    """
+    주말 휴무 플래그를 반영해 기준 주휴 요일을 반환합니다.
+    
+    Args:
+        nurse (Nurse): 주휴 요일을 조회할 간호사 객체
+        
+    Returns:
+        Optional[int]: is_weekend_off가 1이면 6(일요일), 아니면 저장된 주휴 요일
+    """
+    if nurse is None:
+        return None
+    if bool(getattr(nurse, "is_weekend_off", False)):
+        return 6
+    return nurse.weekly_off_weekday
 
 
 # ------------------------------------------------------------------
@@ -206,12 +223,15 @@ def get_nurses_weekly_off_service(
     
     items = []
     for n, team_name in nurses:
-        base_weekday = n.weekly_off_weekday
+        base_weekday = resolve_weekly_off_base_weekday(n)
+        is_weekend_off = bool(getattr(n, "is_weekend_off", False))
         preview_weekday = None
         
         # 미리보기 계산
-        if n.weekly_off_enabled and base_weekday is not None and setting:
-            if setting.use_variable_cycle:
+        if n.weekly_off_enabled and base_weekday is not None:
+            if is_weekend_off:
+                preview_weekday = base_weekday
+            elif setting and setting.use_variable_cycle:
                 # 1. 월 단위
                 if setting.cycle_type == 'month' and setting.base_year and setting.base_month:
                     preview_weekday = calc_weekly_off_weekday_by_month(
@@ -239,7 +259,7 @@ def get_nurses_weekly_off_service(
                     # 변동 설정이 불완전하면 base 유지
                     preview_weekday = base_weekday
             else:
-                # 변동 안 함
+                # 변동 안 함 또는 설정 없음
                 preview_weekday = base_weekday
         
         items.append(NurseWeeklyOffItem(
@@ -438,7 +458,8 @@ def get_my_weekly_off_service(
         WeeklyOffSetting.group_id == nurse.group_id
     ).first()
 
-    if not nurse.weekly_off_enabled or nurse.weekly_off_weekday is None:
+    base_weekday = resolve_weekly_off_base_weekday(nurse)
+    if not nurse.weekly_off_enabled or base_weekday is None:
         return MyWeeklyOffResponse(
             year=year,
             month=month,
@@ -447,11 +468,12 @@ def get_my_weekly_off_service(
             my_weekly_off_label=None
         )
 
-    preview_weekday = nurse.weekly_off_weekday
-    if setting and setting.use_variable_cycle:
+    preview_weekday = base_weekday
+    is_weekend_off = bool(getattr(nurse, "is_weekend_off", False))
+    if not is_weekend_off and setting and setting.use_variable_cycle:
         if setting.cycle_type == 'month' and setting.base_year and setting.base_month:
             preview_weekday = calc_weekly_off_weekday_by_month(
-                base_weekday=nurse.weekly_off_weekday,
+                base_weekday=base_weekday,
                 shift_variation=setting.shift_variation,
                 base_year=setting.base_year,
                 base_month=setting.base_month,
@@ -461,7 +483,7 @@ def get_my_weekly_off_service(
         elif setting.cycle_type == 'week' and setting.cycle_start_date:
             target_date = date(year, month, 1)
             preview_weekday = calc_weekly_off_weekday_by_week(
-                base_weekday=nurse.weekly_off_weekday,
+                base_weekday=base_weekday,
                 shift_variation=setting.shift_variation,
                 cycle_start_date=setting.cycle_start_date,
                 target_date=target_date,
