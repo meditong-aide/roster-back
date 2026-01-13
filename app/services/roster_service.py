@@ -99,6 +99,14 @@ def save_roster_config_service(
                 'activate': 1 if weekly_off_group else 0
             }
         )
+        if weekly_off_group is not None:
+            new_enabled = 1 if weekly_off_group else 0
+            db.query(Nurse).filter(
+                Nurse.group_id == target_group_id
+            ).update(
+                {Nurse.weekly_off_enabled: new_enabled},
+                synchronize_session=False
+            )
         db.add(db_config)
         db.commit()
         db.refresh(db_config)
