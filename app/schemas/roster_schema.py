@@ -104,7 +104,7 @@ class PublishRequest(BaseModel):
     issue_comment: str = None
 
 class WantedInvokeRequest(BaseModel):
-    request: str| List[str]
+    request: str | List[str] | None = None
     schema: List[Dict[str, Any]]
     case: object | None = None
     year: int
