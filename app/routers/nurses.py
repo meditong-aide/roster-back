@@ -1,20 +1,36 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import UploadFile, File, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
 import tempfile
 import os
+import random
+from datetime import date, datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import traceback
+import string
 
-from db.client2 import get_db
+from db.client2 import get_db, msdb_manager
 from db.models import Nurse as NurseModel
 from db.models import Office as OfficeModel
-from schemas.roster_schema import NurseProfile, MoveNurseRequest, IntegratedRegisterRequest
+from db.models import Team as TeamModel
+from schemas.roster_schema import (
+    NurseProfile, 
+    MoveNurseRequest, 
+    IntegratedRegisterRequest, 
+    ExcelValidationRequest, 
+    NurseSequenceUpdate, 
+    ReorderPayload, 
+    ExcelConfirmRequest,
+    PersonnelUpdate,
+    PasswordChangeRequest,
+    PhoneChangeRequest
+)
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
-from schemas.roster_schema import ExcelValidationRequest, NurseSequenceUpdate, ReorderPayload, ExcelConfirmRequest
 from services.nurse_service import (
     get_nurses_in_group_service,
     bulk_update_nurses_service,
@@ -22,6 +38,7 @@ from services.nurse_service import (
     move_nurse_with_active_service,
     reorder_nurses_service,
     get_nurses_filtered_service,
+    get_personnel_basic_info_service,
 )
 from services.excel_service import (
     create_nurse_template, 
@@ -36,8 +53,10 @@ from services.excel_service import (
     export_members_excel_bytes,
     integrated_member_and_nurse_register,
 )
+from datalayer.member import Member
 from pydantic import BaseModel, Field
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
+from utils.utils import set_sms
 
 
 router = APIRouter(
@@ -117,15 +136,15 @@ async def get_nurses_in_group(
         print('[DEBUG] [nurses.py - get_nurses_in_group] error', e)
         # raise HTTPException(status_code=500, detail=f"간호사 목록 조회 실패: {str(e)}")
 
-@router.get("/personnel-basic-info")
-async def get_personnel_basic_info(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db)
-):
-    try:
-        return get_personnel_basic_info_service(current_user, db)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"간호사 기본 정보 조회 실패: {str(e)}")
+# @router.get("/personnel-basic-info")
+# async def get_personnel_basic_info(
+#     current_user: UserSchema = Depends(get_current_user_from_cookie),
+#     db: Session = Depends(get_db)
+# ):
+#     try:
+#         return get_personnel_basic_info_service(current_user, db)
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"간호사 기본 정보 조회 실패: {str(e)}")
 
 
 
@@ -410,3 +429,265 @@ async def integrated_register(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"통합 등록 실패: {str(e)}")
+
+
+
+
+# 마이 페이지 테스트
+# 인증번호 임시 저장소 (프로덕션에서는 Redis로 교체 권장)
+verification_cache: Dict[str, Dict] = {}  # {nurse_id: {'code': str, 'expires': datetime, 'new_phone': str or None, 'new_password': str or None}}
+
+
+@router.get("/personnel-basic-info")
+async def get_personnel_basic_info(
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    try:
+        nurse = db.query(NurseModel).filter(
+            NurseModel.group_id == current_user.group_id,
+            NurseModel.nurse_id == current_user.nurse_id
+        ).first()
+        
+        if not nurse:
+            raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
+        
+        # 재직기간 계산
+        tenure_display = "미등록"
+        if nurse.joining_date:
+            today = date.today()
+            join_date = nurse.joining_date.date() if hasattr(nurse.joining_date, 'date') else nurse.joining_date
+            if join_date <= today:
+                delta = relativedelta(today, join_date)
+                tenure_display = f"{delta.years}년 {delta.months}개월"
+        
+        age = None
+        if nurse.birth_date:
+            try:
+                # birth_date가 "YYYY-MM-DD" 형식 문자열이라고 가정
+                birth_date = datetime.strptime(nurse.birth_date, "%Y-%m-%d").date()
+                today = date.today()
+                age = today.year - birth_date.year
+                if (today.month, today.day) < (birth_date.month, birth_date.day):
+                    age -= 1
+                # 음수 방지 (미래 생일 등)
+                age = max(0, age)
+            except ValueError:
+                # 날짜 형식이 잘못된 경우 무시
+                age = None
+        
+        work_place = "미등록"
+        if nurse.group_id and nurse.office_id:
+            team = db.query(TeamModel).filter(
+                TeamModel.group_id == nurse.group_id,
+                TeamModel.office_id == nurse.office_id
+            ).first()
+            
+            if team and team.team_name:
+                work_place = team.team_name
+        
+        # Member 테이블에서 이메일 + PortableTel 보강
+        member_raw = msdb_manager.fetch_one(
+            Member.member_view(),
+            params=(current_user.account_id,)
+        )
+        
+        member_rows = msdb_manager.fetch_all(
+            Member.member_view(),
+            params=(current_user.account_id,)
+        )
+        
+        email = ""
+        member_phone = ""
+        
+        if member_rows and len(member_rows) > 0:
+            # fetch_all 결과가 리스트라고 가정
+            first_row = member_rows[0]
+            
+            if isinstance(first_row, dict):
+                # 딕셔너리면 안전하게 get
+                email = first_row.get('Email', '')
+                member_phone = first_row.get('PortableTel', '') or first_row.get('Tel', '')
+            elif isinstance(first_row, tuple):
+                # 튜플이면 인덱스로 매핑 (member_view 쿼리 순서 기준)
+                if len(first_row) > 11:
+                    email = first_row[11] or ''          # Email (인덱스 11)
+                if len(first_row) > 8:
+                    portable_tel = first_row[8] or ''    # PortableTel (인덱스 8)
+                    tel = first_row[7] or ''             # Tel (인덱스 7)
+                    member_phone = portable_tel or tel
+            elif isinstance(first_row, str):
+                # 문자열이면 (현재 상황처럼) office_id만 온 것으로 간주
+                print(f"[WARNING] fetch_all 첫 행이 문자열: {first_row}")
+                # 이 경우 추가 쿼리 필요하거나 email 빈 값 유지
+            else:
+                print(f"[ERROR] 예상치 못한 fetch_all 행 타입: {type(first_row)}")
+        else:
+            print("[WARNING] member_view 결과 없음")
+        
+        return {
+            "nurse_id": nurse.nurse_id,
+            "name": nurse.name,
+            "account_id": nurse.account_id,
+            "emp_num": nurse.emp_num,
+            "gender": nurse.gender,
+            "birth_date": nurse.birth_date,
+            "age": age,
+            "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
+            "experience": nurse.experience,
+            "phone_number": nurse.phone_number or member_phone,
+            "email": email,
+            "role": nurse.role,
+            "level_": nurse.level_,
+            "is_head_nurse": nurse.is_head_nurse,
+            "tenure": tenure_display,
+            "work_place": work_place
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"간호사 기본 정보 조회 실패: {str(e)}")
+
+
+@router.patch("/personnel-basic-info")
+async def partial_update_personnel_basic_info(
+    update_data: PersonnelUpdate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    nurse = db.query(NurseModel).filter(
+        NurseModel.nurse_id == current_user.nurse_id
+    ).first()
+
+    if not nurse:
+        raise HTTPException(404, "간호사 정보 없음")
+
+    updated = False
+
+    if update_data.experience is not None:
+        nurse.experience = update_data.experience
+        updated = True
+
+    if updated:
+        db.commit()
+        db.refresh(nurse)
+
+    if update_data.email is not None:
+        msdb_manager.execute(
+            "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s",
+            (update_data.email, current_user.nurse_id)
+        )
+
+    return {"message": "정보가 성공적으로 수정되었습니다"}
+
+
+@router.put("/change-password")
+async def change_password(
+    payload: PasswordChangeRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    nurse_id = current_user.nurse_id
+    print(f"[DEBUG] change-password 요청 - nurse_id: {nurse_id}")
+    print(f"[DEBUG] payload: {payload.dict()}")
+
+    # 1. 새 비밀번호와 확인 비밀번호 일치 여부 체크
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(400, "새 비밀번호와 확인 비밀번호가 일치하지 않습니다")
+
+    # 2. 기존 비밀번호와 새 비밀번호가 동일한지 체크 (보안상 금지)
+    if payload.new_password == payload.current_password:
+        raise HTTPException(400, "기존 비밀번호와 동일한 비밀번호는 사용할 수 없습니다")
+
+    # 3. 기존 비밀번호가 맞는지 확인 (pwdcompare 사용)
+    print("[DEBUG] 기존 비밀번호 검증 시작")
+    result = msdb_manager.fetch_one(
+        "SELECT pwdcompare(%s, MemberPassEncrypt) AS IsCorrect FROM bizwiz20db.Member_Login WHERE EmpSeqNo = %s",
+        (payload.current_password, nurse_id)
+    )
+    print(f"[DEBUG] pwdcompare 결과: {result}")
+
+    # result가 정수로 나오는 경우 (기존 문제 해결)
+    is_correct = result if isinstance(result, int) else result.get('IsCorrect') if isinstance(result, dict) else None
+
+    if is_correct != 1:
+        raise HTTPException(401, "기존 비밀번호가 올바르지 않습니다")
+
+    # 4. 비밀번호 업데이트
+    print("[DEBUG] 비밀번호 업데이트 시작")
+    update_result = msdb_manager.execute(
+        Member.member_pwd_update(),
+        (payload.new_password, payload.new_password, current_user.office_id, nurse_id)
+    )
+    print(f"[DEBUG] 업데이트 결과: {update_result}")
+
+    return {"message": "비밀번호가 성공적으로 변경되었습니다"}
+
+
+@router.post("/change-phone/send-code")
+async def send_phone_verification_code(
+    payload: PhoneChangeRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    nurse_id = current_user.nurse_id
+    code = ''.join(random.choices(string.digits, k=6))
+
+    verification_cache[nurse_id] = {
+        'code': code,
+        'expires': datetime.now() + timedelta(minutes=3),
+        'new_phone': payload.new_phone_number
+    }
+
+    sendPhoneNumber = "0269593214"
+
+    # nurses 테이블에서 phone_number 가져오기
+    userPhoneNumber = payload.new_phone_number.replace('-', '')
+
+    # 번호 형식 간단 검증 (선택사항)
+    if not userPhoneNumber.startswith('010') or len(userPhoneNumber) != 11 or not userPhoneNumber.isdigit():
+        raise HTTPException(400, "유효한 휴대폰 번호를 입력해주세요 (010으로 시작하는 11자리 숫자)")
+
+    smsMessage = f'[메디통] 휴대폰 번호 변경 인증번호: {code} (3분 이내 입력)'
+
+    from utils.utils import set_sms
+    sms_result = set_sms(userPhoneNumber, sendPhoneNumber, smsMessage)
+
+    print(f"[DEBUG] SMS 발송 요청 - 새 번호: {userPhoneNumber}, 결과: {sms_result}")
+
+    if sms_result.get('result') == 'fail':
+        raise HTTPException(500, "인증번호 발송에 실패했습니다")
+
+    return {"message": "인증번호가 입력하신 새 번호로 발송되었습니다"}
+
+
+@router.put("/change-phone/verify")
+async def verify_and_update_phone(
+    payload: PhoneChangeRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    nurse_id = current_user.nurse_id
+    cached = verification_cache.get(nurse_id)
+
+    if not cached:
+        raise HTTPException(400, "인증 정보가 없거나 만료되었습니다")
+
+    if datetime.now() > cached['expires']:
+        del verification_cache[nurse_id]
+        raise HTTPException(410, "인증 시간이 초과되었습니다")
+
+    if payload.verification_code != cached['code']:
+        raise HTTPException(400, "인증번호가 올바르지 않습니다")
+
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    if nurse:
+        nurse.phone_number = cached['new_phone']
+        db.commit()
+
+    msdb_manager.execute(
+        "UPDATE bizwiz20db.Member SET PortableTel = %s WHERE EmpSeqNo = %s",
+        (cached['new_phone'], nurse_id)
+    )
+
+    del verification_cache[nurse_id]
+
+    return {"message": "휴대폰 번호가 성공적으로 변경되었습니다"}

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, ValidationInfo
+from pydantic import BaseModel, Field, field_validator, ValidationInfo, EmailStr
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import StrEnum
@@ -234,3 +234,23 @@ class ScheduleMemoUpdate(BaseModel):
 class IntegratedRegisterRequest(BaseModel):
     group_id: str
     members: List[Dict[str, Any]]  # 한국어 키로 입력
+
+
+
+# 마이 페이지 테스트
+class PersonnelUpdate(BaseModel):
+    """마이페이지 기본 정보 수정 (이메일 + 총경력만 허용)"""
+    email: Optional[EmailStr] = Field(None, description="이메일 주소")
+    experience: Optional[int] = Field(None, ge=0, description="총 경력(년)")
+
+class PasswordChangeRequest(BaseModel):
+    """비밀번호 변경 요청 (SMS 인증 후 사용)"""
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8)
+    confirm_password: str = Field(..., min_length=8)
+    verification_code: Optional[str] = Field(None, description="SMS 인증번호 (최초 요청 시 생략)")
+
+class PhoneChangeRequest(BaseModel):
+    """휴대폰 번호 변경 요청"""
+    new_phone_number: str = Field(..., pattern=r"^01[0-9]{8,9}$", description="새 휴대폰 번호")
+    verification_code: Optional[str] = Field(None, description="인증번호 (검증 단계에서만 사용)")
