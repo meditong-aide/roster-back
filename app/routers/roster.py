@@ -49,7 +49,7 @@ from services.roster_service import (
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
 )
-from utils.utils import set_app_push
+from utils.utils import send_roster_publish_push
 import uuid
 import pprint
 router = APIRouter(
@@ -698,30 +698,16 @@ async def publish_roster(
     db.commit()
     nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     print('[DEBUG] [roster.py - publish_roster] nurses_in_group', nurses_in_group)
-    receiveEmpSeqNo = [nurse.nurse_id for nurse in nurses_in_group]
-    # print('[DEBUG] [roster.py - publish_roster] receiveEmpSeqNo', receiveEmpSeqNo)
-    pushCode = 'P30'
-    pushSubCode = 'S01' # 01 근무표 마감
-    officeCode = office_id
-    sendEmpSeqNo = current_user.nurse_id
-    sendMemberId = current_user.account_id
-    receiveEmpSeqNo = ",".join(receiveEmpSeqNo)
-    print('[DEBUG] [roster.py - publish_roster] receiveEmpSeqNo', receiveEmpSeqNo)
-    pushMessage = f"[Test발송]{schedule.year}년 {schedule.month}월 근무표가 공유되었습니다. 지금 확인해보세요!"
-    orgPushMessage = f"근무표가 공유되었습니다. {schedule.year}년 {schedule.month}월 "
-    linkUrl = ""
-    linkCode = ""
-    message_result = set_app_push(
-        pushCode=pushCode, 
-        pushSubCode=pushSubCode, 
-        officeCode=officeCode, 
-        sendEmpSeqNo=sendEmpSeqNo, 
-        sendMemberId=sendMemberId, 
-        receiveEmpSeqNo=receiveEmpSeqNo, 
-        pushMessage=pushMessage, 
-        orgPushMessage=orgPushMessage, 
-        linkUrl=linkUrl, 
-        linkCode=linkCode)
+    receive_emp_seq_no = [nurse.nurse_id for nurse in nurses_in_group]
+
+    send_roster_publish_push(
+        year=schedule.year,
+        month=schedule.month,
+        recipients=receive_emp_seq_no,
+        office_code=office_id,
+        sender_emp_seq_no=current_user.nurse_id,
+        sender_member_id=current_user.account_id,
+    )
     
     # return message_result
 

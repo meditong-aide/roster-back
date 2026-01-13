@@ -211,6 +211,101 @@ def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
 
 
 
+def send_roster_publish_push(
+    year: int,
+    month: int,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+    test_prefix: str = "[Test발송]",
+):
+    """
+    근무표 발행 시 공용 푸시 메시지를 전송합니다.
+
+    - 인자: year(int, 예: 2024), month(int, 예: 5), recipients(List[str]), office_code(str),
+      sender_emp_seq_no(str), sender_member_id(str), test_prefix(str)
+    - 반환: set_app_push 결과 딕셔너리
+    - 예외: 없음
+    - 예시: send_roster_publish_push(2024, 5, ["11", "22"], "OFF01", "900", "admin01")
+    """
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+
+    receive_emp_seq_no = ",".join(map(str, recipients))
+    push_code = "P30"
+    push_sub_code = "S01"
+    push_message = (
+        f"{year}년 {month}월 근무표 마감"
+    )
+    org_push_message = f"{year}년 {month}월 근무표 마감"
+
+    return set_app_push(
+        pushCode=push_code,
+        pushSubCode=push_sub_code,
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=receive_emp_seq_no,
+        pushMessage=push_message,
+        orgPushMessage=org_push_message,
+        linkUrl="",
+        linkCode="",
+    )
+
+
+def send_wanted_request_push(
+    year: int,
+    month: int,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+    deadline: datetime.datetime | None = None,
+    test_prefix: str = "[Test발송]",
+):
+    """
+    근무 희망(원티드) 작성 요청 발생 시 공용 푸시 메시지를 전송합니다.
+
+    - 인자: year(int, 예: 2024), month(int, 예: 9), recipients(List[str]), office_code(str),
+      sender_emp_seq_no(str), sender_member_id(str), deadline(datetime|None), test_prefix(str)
+    - 반환: set_app_push 결과 딕셔너리
+    - 예외: 없음
+    - 예시: send_wanted_request_push(2024, 9, ["11", "22"], "OFF01", "900", "admin01")
+    """
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+
+    deadline_text = (
+        f" (마감 {deadline.strftime('%Y-%m-%d')})" if deadline else ""
+    )
+    print('deadline : ', deadline)
+    receive_emp_seq_no = ",".join(map(str, recipients))
+    push_code = "P30"
+    push_sub_code = "S02"
+    month_deadline = deadline.strftime('%m') if deadline else ""
+    day_deadline = deadline.strftime('%d') if deadline else ""
+    push_message = (
+        f"{year}년 {month}월 원티드 요청 ({month_deadline}월 {day_deadline}일 까지)"
+    )
+    org_push_message = (
+        f"{year}년 {month}월 원티드 요청 ({month_deadline}월 {day_deadline}일 까지)"
+    )
+
+    return set_app_push(
+        pushCode=push_code,
+        pushSubCode=push_sub_code,
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=receive_emp_seq_no,
+        pushMessage=push_message,
+        orgPushMessage=org_push_message,
+        linkUrl="",
+        linkCode="",
+    )
+
+
 def set_sms(userPhoneNumber: str, sendPhoneNumber: str, smsMessage: str):
     # Unique key create
     random_part = random.randint(10000, 99999)

@@ -5,7 +5,7 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 """
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from db.models import Wanted, Nurse, ShiftPreference, Shift
+from db.models import Wanted, Nurse, ShiftPreference, Shift, Group
 from schemas.roster_schema import WantedInvokeRequest, WantedDeadlineRequest
 from schemas.auth_schema import User as UserSchema
 from datetime import datetime, date, timedelta
@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Tuple
 from db.models import WantedRequest, NurseShiftRequest, NursePairRequest
 from services.graph_service import graph_service
 from dateutil.relativedelta import relativedelta
+from utils.utils import send_wanted_request_push
 import traceback
 
 def _yyyymm(year: int, month: int) -> str:
@@ -770,6 +771,25 @@ def request_wanted_shifts_service(
     db.add(new_wanted)
     db.commit()
     db.refresh(new_wanted)
+
+    # 근무 희망 작성 요청 푸시 알림
+    group_row = db.query(Group).filter(Group.group_id == target_group_id).first()
+    office_id = group_row.office_id if group_row and group_row.office_id else current_user.office_id
+    nurse_rows = (
+        db.query(Nurse.nurse_id)
+        .filter(Nurse.group_id == target_group_id)
+        .all()
+    )
+    recipients = [row.nurse_id for row in nurse_rows]
+    send_wanted_request_push(
+        year=req.year,
+        month=req.month,
+        recipients=recipients,
+        office_code=office_id,
+        sender_emp_seq_no=current_user.nurse_id,
+        sender_member_id=current_user.account_id,
+        deadline=req.exp_date,
+    )
     return {"message": "Wanted 작성 요청이 성공적으로 생성되었습니다."}
 
 def close_expired_wanted(db: Session) -> int:
