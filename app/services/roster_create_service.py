@@ -81,7 +81,6 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
         )
         .all()
     )
-    print('\n\n\n\n\nrows', rows, '\n\n\n\n\n')
     return {
         str(r.shift_id).upper(): {
             "shift_id": r.shift_id,
@@ -110,17 +109,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         "[RosterCreate] 그룹 간호사 로드: total="
         f"{len(nurses_in_group)}, inactive={len(inactive_nurses)} → {inactive_nurses}"
     )
-    # print(1)
     nurse_ids = [n.nurse_id for n in nurses_in_group]
-    # print(2)
     month_str = f"{req.year}-{req.month:02d}"
-    # print(3)
     preferences = []
-    # print(4)
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
-    # print(5)
     special_fixed_requests: list[dict] = []
-    print('\n\n\n\n\nspecial_shift_map', special_shift_map, '\n\n\n\n\n')
+    # print('\n\n\n\n\nspecial_shift_map', special_shift_map, '\n\n\n\n\n')
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     for nurse_id in nurse_ids:
         submitted_wr = (
@@ -182,8 +176,8 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                         "shift_type": special_shift_map[shift_code]["type"],
                     }
                 )
-        print(f'\n\n\n\n\nspecial_fixed_requests {special_fixed_requests}\n\n\n\n\n')
-        print(6)
+        # print(f'\n\n\n\n\nspecial_fixed_requests {special_fixed_requests}\n\n\n\n\n')
+        # print(6)
         # 4️⃣ pair 데이터 수집
         pair_rows = (
             db.query(NursePairRequest)
@@ -676,6 +670,52 @@ def _build_fixed_shift_roster(
                 shifts[day_idx] = fixed_code
         result[str(nurse.nurse_id)] = shifts
     return result
+
+
+def _overlay_fixed_roster_with_special_requests(
+    fixed_roster: dict[str, list[str]],
+    requests: list[dict],
+    year: int,
+    month: int,
+) -> dict[str, list[str]]:
+    """고정 근무자 스케줄에 휴가·교육 등 특수 요청을 덮어씌웁니다.
+
+    Args:
+        fixed_roster: 고정 근무자 기본 스케줄(nurse_id → 일자별 코드 리스트)
+        requests: 고정 근무자가 제출한 특수 요청 목록
+        year: 대상 연도
+        month: 대상 월
+
+    Returns:
+        특수 요청이 반영된 고정 근무자 스케줄
+    """
+    if not fixed_roster or not requests:
+        return fixed_roster
+    days_in_month = calendar.monthrange(year, month)[1]
+    for req in requests:
+        try:
+            nurse_id = str(req.get("nurse_id"))
+            day = int(req.get("day", 0))
+            shift_id = str(req.get("shift_id") or "").strip()
+            shift_type = str(req.get("shift_type") or "").strip()
+        except Exception:
+            continue
+        if day <= 0 or day > days_in_month:
+            continue
+        if nurse_id not in fixed_roster:
+            continue
+        day_idx = day - 1
+        row = fixed_roster.get(nurse_id) or []
+        if day_idx >= len(row):
+            continue
+        # 휴가/공가는 표시용으로 shift_id를 우선 사용하고, 없으면 OFF 처리
+        if shift_type in {"휴가", "공가"}:
+            code = shift_id or "O"
+        else:
+            code = shift_id or row[day_idx]
+        row[day_idx] = code
+        fixed_roster[nurse_id] = row
+    return fixed_roster
 
 
 def _compute_weekly_off_day_indices_for_month(
@@ -2005,9 +2045,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict['daily_shift_requirements'] = daily_shift_requirements
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
+    fixed_nurse_ids = {str(n.nurse_id) for n in fixed_nurses}
+    engine_special_shift_requests = [
+        r
+        for r in special_shift_requests
+        if str(r.get("nurse_id")) in engine_nurse_ids
+    ]
+    fixed_special_shift_requests = [
+        r for r in special_shift_requests if str(r.get("nurse_id")) in fixed_nurse_ids
+    ]
     # 특별 근무(근무형) shift 코드 주입
     special_fixed_cells, has_special_working = _build_special_fixed_cells(
-        requests=special_shift_requests,
+        requests=engine_special_shift_requests,
         nurse_idx_map=_build_engine_nurse_index_map(engine_nurses),
         special_shift_map=special_shift_map,
         active_range_map=active_range_candidates,
@@ -2136,6 +2185,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         weekday_off_code="O",
         sunday_code="주",
         shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
+    )
+    fixed_roster = _overlay_fixed_roster_with_special_requests(
+        fixed_roster=fixed_roster,
+        requests=fixed_special_shift_requests,
+        year=req.year,
+        month=req.month,
     )
     if isinstance(generated, dict):
         generated.update(fixed_roster)
