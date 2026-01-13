@@ -101,6 +101,15 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
+    inactive_nurses = [
+        f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')})"
+        for n in nurses_in_group
+        if getattr(n, "active", 1) == 0
+    ]
+    print(
+        "[RosterCreate] 그룹 간호사 로드: total="
+        f"{len(nurses_in_group)}, inactive={len(inactive_nurses)} → {inactive_nurses}"
+    )
     # print(1)
     nurse_ids = [n.nurse_id for n in nurses_in_group]
     # print(2)

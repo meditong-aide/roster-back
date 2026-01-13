@@ -302,7 +302,11 @@ class CPSATBasicEngine:
         return shift_manage
 
     def create_nurses_from_db(self, nurses_data: List[dict]) -> List[Nurse]:
-        """DB에서 가져온 간호사 데이터를 Nurse 객체 리스트로 변환"""
+        """DB에서 가져온 간호사 데이터를 Nurse 객체 리스트로 변환한다.
+
+        Notes:
+            - active=0(비활성) 인력은 엔진 대상에서 제외한다.
+        """
         # sequence 기준 정렬(없으면 0) → 알고리즘 입력 순서 일관화
         def _to_date(x):
             if x is None:
@@ -324,6 +328,17 @@ class CPSATBasicEngine:
         sorted_rows = sorted(nurses_data, key=lambda r: (r.get('sequence', 0), -int(r.get('experience', 0) or 0), str(r.get('nurse_id'))))
         nurses = []
         for i, nurse_data in enumerate(sorted_rows):
+            active_raw = nurse_data.get("active", 1)
+            try:
+                active_flag = int(active_raw)
+            except Exception:
+                active_flag = 1 if active_raw else 0
+            if active_flag == 0:
+                print(
+                    f"{self.logger_prefix} 비활성 간호사 제외: "
+                    f"{nurse_data.get('name', '?')}({nurse_data.get('nurse_id', '?')}) active={active_raw}"
+                )
+                continue
             # DB 모델을 Nurse 객체로 변환
             nurse_dict = {
                 'id': i,  # 엔진에서 사용할 인덱스 ID
