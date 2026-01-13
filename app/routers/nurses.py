@@ -582,13 +582,18 @@ async def partial_update_personnel_basic_info(
 @router.put("/change-password")
 async def change_password(
     payload: PasswordChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie)
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
 ):
     nurse_id = current_user.nurse_id
+    print(f"[DEBUG] change-password 요청 - nurse_id: {nurse_id}")
+    print(f"[DEBUG] payload: {payload.dict()}")
 
     # 인증번호가 없으면 → 발송 단계
     if not payload.verification_code:
+        print("[DEBUG] 인증번호 발송 단계 진입")
         code = ''.join(random.choices(string.digits, k=6))
+        print(f"[DEBUG] 생성된 인증번호: {code}")
 
         verification_cache[nurse_id] = {
             'code': code,
@@ -596,16 +601,28 @@ async def change_password(
             'new_password': payload.new_password,
             'confirm_password': payload.confirm_password
         }
+        print(f"[DEBUG] 캐시 저장 완료: {verification_cache.get(nurse_id)}")
 
         sendPhoneNumber = "0269593214"
-        userPhoneNumber = current_user.phone_number.replace('-', '') if current_user.phone_number else ''
-        if not userPhoneNumber:
-            raise HTTPException(400, "등록된 휴대폰 번호가 없습니다")
+
+        # nurses 테이블에서 phone_number 가져오기
+        nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+        
+        if not nurse or not nurse.phone_number:
+            raise HTTPException(
+                status_code=400,
+                detail="등록된 휴대폰 번호가 없습니다. 먼저 프로필에서 연락처를 등록해주세요."
+            )
+        
+        userPhoneNumber = nurse.phone_number.replace('-', '')  # ← 핵심 수정
+        print(f"[DEBUG] userPhoneNumber: {userPhoneNumber}")
 
         smsMessage = f'[메디통] 비밀번호 변경 인증번호: {code} (3분 이내 입력)'
+        print(f"[DEBUG] SMS 발송 시도 - 번호: {userPhoneNumber}, 메시지: {smsMessage}")
 
         from utils.utils import set_sms
         sms_result = set_sms(userPhoneNumber, sendPhoneNumber, smsMessage)
+        print(f"[DEBUG] set_sms 결과: {sms_result}")
 
         if sms_result.get('result') == 'fail':
             raise HTTPException(500, "인증번호 발송 실패")
@@ -613,7 +630,10 @@ async def change_password(
         return {"message": "인증번호가 휴대폰으로 발송되었습니다"}
 
     # 인증번호 검증 단계
+    print("[DEBUG] 인증번호 검증 단계 진입")
     cached = verification_cache.get(nurse_id)
+    print(f"[DEBUG] 캐시 데이터: {cached}")
+
     if not cached:
         raise HTTPException(400, "인증 정보가 없거나 만료되었습니다")
 
@@ -624,24 +644,30 @@ async def change_password(
     if payload.verification_code != cached['code']:
         raise HTTPException(400, "인증번호가 올바르지 않습니다")
 
+    print("[DEBUG] 인증번호 일치 확인 완료")
+
     if payload.new_password != payload.confirm_password:
         raise HTTPException(400, "새 비밀번호와 확인 비밀번호가 일치하지 않습니다")
 
     if payload.new_password == payload.current_password:
         raise HTTPException(400, "기존 비밀번호와 동일한 비밀번호는 사용할 수 없습니다")
 
+    print("[DEBUG] 기존 비밀번호 검증 시작")
     result = msdb_manager.fetch_one(
         "SELECT pwdcompare(%s, MemberPassEncrypt) AS IsCorrect FROM bizwiz20db.Member_Login WHERE EmpSeqNo = %s",
         (payload.current_password, nurse_id)
     )
+    print(f"[DEBUG] pwdcompare 결과: {result}")
 
-    if not result or result['IsCorrect'] != 1:
+    if not result or result != 1:
         raise HTTPException(401, "기존 비밀번호가 올바르지 않습니다")
 
-    msdb_manager.execute(
+    print("[DEBUG] 비밀번호 업데이트 시작")
+    update_result = msdb_manager.execute(
         Member.member_pwd_update(),
         (payload.new_password, payload.new_password, current_user.office_id, nurse_id)
     )
+    print(f"[DEBUG] 업데이트 결과: {update_result}")
 
     del verification_cache[nurse_id]
 
@@ -651,7 +677,8 @@ async def change_password(
 @router.post("/change-phone/send-code")
 async def send_phone_verification_code(
     payload: PhoneChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie)
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
 ):
     nurse_id = current_user.nurse_id
     code = ''.join(random.choices(string.digits, k=6))
@@ -663,14 +690,25 @@ async def send_phone_verification_code(
     }
 
     sendPhoneNumber = "0269593214"
-    userPhoneNumber = payload.new_phone_number.replace('-', '')
+
+    # nurses 테이블에서 phone_number 가져오기
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    
+    if not nurse or not nurse.phone_number:
+        raise HTTPException(
+            status_code=400,
+            detail="등록된 휴대폰 번호가 없습니다. 먼저 프로필에서 연락처를 등록해주세요."
+        )
+    
+    userPhoneNumber = nurse.phone_number.replace('-', '')  # ← 핵심: 문자열 필드만 사용
+
     smsMessage = f'[메디통] 휴대폰 번호 변경 인증번호: {code} (3분 이내 입력)'
 
     from utils.utils import set_sms
     sms_result = set_sms(userPhoneNumber, sendPhoneNumber, smsMessage)
 
     if sms_result.get('result') == 'fail':
-        raise HTTPException(500, "인증번호 발송 실패")
+        raise HTTPException(500, "인증번호 발송에 실패했습니다")
 
     return {"message": "인증번호가 발송되었습니다"}
 
