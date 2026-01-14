@@ -33,6 +33,8 @@ class RosterSystem:
         start_time = time.time()
         
         self.nurses = nurses
+        # DB ID → 내부 인덱스 매핑 (연속하지 않은 ID를 안전하게 처리)
+        self.dbid_to_idx = {n.db_id: idx for idx, n in enumerate(nurses)}
         self.config = config
         # target_month 설정 (하위 호환성을 위해)
         if target_month is not None:
@@ -182,14 +184,17 @@ class RosterSystem:
             
             if not valid_days:
                 continue
-            nurse = next((n for n in self.nurses if n.db_id == target_nurse_id), None)
 
 
             # ★ 가중치 반영
             for d in valid_days:
                 day_idx = d-1
                 delta   = day_map[str(d)]
-                self.preference_matrix[nurse.id, day_idx, off_idx] = base_weight + delta
+                n_idx = self.dbid_to_idx.get(target_nurse_id)
+                if n_idx is None:
+                    print(f"경고: 휴무 요청 대상 간호사(ID={target_nurse_id})를 찾을 수 없어 건너뜁니다.")
+                    break
+                self.preference_matrix[n_idx, day_idx, off_idx] = base_weight + delta
             
     def apply_shift_preferences(self, shift_preferences: Dict[str, Dict[str, Dict[str, float]]]):
         """
@@ -217,12 +222,15 @@ class RosterSystem:
                 
                 shift_idx = self.config.shift_types.index(shift_type)
                 default_weight = self.config.shift_preference_weights.get(shift_type, 5.0)
-                nurse = next((n for n in self.nurses if n.db_id == target_nurse_id), None)
                 for day_str, delta in day_weight_map.items():
                     day = int(day_str)
                     if 1 <= day <= self.num_days:
                         day_idx = day - 1
-                        self.preference_matrix[nurse.id, day_idx, shift_idx] = default_weight + delta
+                        n_idx = self.dbid_to_idx.get(target_nurse_id)
+                        if n_idx is None:
+                            print(f"경고: 근무 유형 선호 대상 간호사(ID={target_nurse_id})를 찾을 수 없어 건너뜁니다.")
+                            break
+                        self.preference_matrix[n_idx, day_idx, shift_idx] = default_weight + delta
         print("근무 유형 선호도 적용 완료")
         
     def apply_pair_preferences(self, pair_preferences: Dict[str, List[Dict[str, Union[int, float]]]]):
@@ -256,8 +264,8 @@ class RosterSystem:
                 nurse_2_id = pair["nurse_2"]
                 weight = pair.get("weight", self.config.pair_preference_weight)
                 source = pair.get("source")
-                nurse_1_idx = next((n.id for n in self.nurses if n.db_id == nurse_1_id), None)
-                nurse_2_idx = next((n.id for n in self.nurses if n.db_id == nurse_2_id), None)
+                nurse_1_idx = self.dbid_to_idx.get(nurse_1_id)
+                nurse_2_idx = self.dbid_to_idx.get(nurse_2_id)
                 
                 if nurse_1_idx is not None and nurse_2_idx is not None:
                     self.pair_matrix["together"][nurse_1_idx, nurse_2_idx] = weight
@@ -277,8 +285,8 @@ class RosterSystem:
                 nurse_1_id = pair["nurse_1"]
                 nurse_2_id = pair["nurse_2"]
                 weight = pair.get("weight", self.config.pair_preference_weight)
-                nurse_1_idx = next((n.id for n in self.nurses if n.db_id == nurse_1_id), None)
-                nurse_2_idx = next((n.id for n in self.nurses if n.db_id == nurse_2_id), None)
+                nurse_1_idx = self.dbid_to_idx.get(nurse_1_id)
+                nurse_2_idx = self.dbid_to_idx.get(nurse_2_id)
                 
                 if nurse_1_idx is not None and nurse_2_idx is not None:
                     self.pair_matrix["apart"][nurse_1_idx, nurse_2_idx] = weight
