@@ -206,7 +206,15 @@ def _persist_pair_results(
     Notes:
         detailed_request_id는 기존 데이터 다음 순번부터 시작
     """
-    detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="pair")
+    # 중복 누적 방지: 동일 nurse_id + request_id 레코드를 먼저 삭제
+    deleted = db.query(NursePairRequest).filter(
+        NursePairRequest.nurse_id == nurse_id,
+        NursePairRequest.request_id == request_id,
+    ).delete()
+    if deleted:
+        print(f"[pair] 기존 레코드 {deleted}건 삭제 후 재삽입")
+
+    detailed_id = 1
     rows = 0
     for item in pairs or []:
         try:
@@ -226,12 +234,12 @@ def _persist_pair_results(
             score=weight,
             partial_request=request,
         )
-        db.merge(row)
+        db.add(row)
         rows += 1
         detailed_id += 1
     
     db.commit()
-    print(f"nurse_pair_requests 저장 완료: 시작 detailed_request_id={detailed_id - rows}, 종료={detailed_id - 1}, 저장 rows={rows}")
+    print(f"nurse_pair_requests 저장 완료: 시작 detailed_request_id={1 if rows else 0}, 종료={detailed_id - 1 if rows else 0}, 저장 rows={rows}")
 
 
 def _parse_shift_results(
