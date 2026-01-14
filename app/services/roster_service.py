@@ -32,7 +32,6 @@ from db.nurse_config import Nurse as NurseEngine
 from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequest
 from services.roster_system import RosterSystem
 from services.shift_service_mssql import _to_time_str
-
 def save_roster_config_service(
     config_data: RosterConfigCreate,
     user,
@@ -58,9 +57,8 @@ def save_roster_config_service(
         else:
             
             nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
-
             target_group_id = user.group_id
-            target_office_id = nurse.group.office_id
+            target_office_id = nurse.office_id
 
         # 2) ShiftManage 기준으로 기본 일/저/야 요구 인원 계산
         shift_manages = db.query(ShiftManage).filter(
@@ -87,7 +85,6 @@ def save_roster_config_service(
             'eve_req': eve_req,
             'nig_req': nig_req
         })
-
         db_config = RosterConfigModel(
             **config_dict,
             office_id=target_office_id,
@@ -102,7 +99,14 @@ def save_roster_config_service(
                 'activate': 1 if weekly_off_group else 0
             }
         )
-        
+        if weekly_off_group is not None:
+            new_enabled = 1 if weekly_off_group else 0
+            db.query(Nurse).filter(
+                Nurse.group_id == target_group_id
+            ).update(
+                {Nurse.weekly_off_enabled: new_enabled},
+                synchronize_session=False
+            )
         db.add(db_config)
         db.commit()
         db.refresh(db_config)

@@ -14,6 +14,7 @@ def list_teams_with_members(db: Session, office_id: str, group_id: str) -> List[
             'team_name': t.team_name,
             'team_members': [m[0] for m in members]
         })
+        print('result', result)
     return result
 
 
@@ -22,7 +23,7 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
     existing = db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id).all()
     by_id = {t.team_id: t for t in existing}
     by_name = {t.team_name: t for t in existing if t.active == 1}
-
+    print('payload', payload)
     # 1) 팀별 ops 처리
     for item in payload:
         team_id = item.get('team_id')
@@ -55,14 +56,17 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
 
         # add: 타깃 팀으로 이동(원팀 자동 해제)
         if add_ids:
+            print('add_ids', add_ids)
             db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(add_ids)).update({Nurse.team_id: team.team_id}, synchronize_session=False)
 
         # remove: 미배정 처리
         if remove_ids:
+            print('remove_ids', remove_ids)
             db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(remove_ids)).update({Nurse.team_id: None}, synchronize_session=False)
 
     # 2) 팀 삭제(soft) + 멤버 해제
     if delete_team_ids:
+        print('delete_team_ids', delete_team_ids)
         # 멤버 해제 후 팀 행 삭제(하드 삭제)
         db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.team_id.in_(delete_team_ids)).update({Nurse.team_id: None}, synchronize_session=False)
         db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id, Team.team_id.in_(delete_team_ids)).delete(synchronize_session=False)

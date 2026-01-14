@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, ValidationInfo, EmailStr
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import StrEnum
@@ -30,9 +30,7 @@ class RemoveShiftRequest(BaseModel):
 class ShiftUpdateRequest(BaseModel):
     """시프트 수정 요청 모델."""
     default_shift: Optional[str] = None
-    shift_gb: Optional[Literal["D", "E", "N", "O"]] = Field(
-        default=None, description="근무 분류(D/E/N/O). null 허용"
-    )
+    shift_gb: Optional[str] = None
     shift_id: str
     name: str
     color: str
@@ -44,13 +42,13 @@ class ShiftUpdateRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     id: int
+    # 추가
+    show_in_preference: Optional[bool] = None # None이면 기존 값 유지
 
 class ShiftAddRequest(BaseModel):
     """시프트 등록 요청 모델."""
     default_shift: Optional[str] = None
-    shift_gb: Optional[Literal["D", "E", "N", "O"]] = Field(
-        default=None, description="근무 분류(D/E/N/O). null 허용"
-    )
+    shift_gb: Optional[str] = None
     shift_id: str
     name: str
     color: str
@@ -62,6 +60,8 @@ class ShiftAddRequest(BaseModel):
     allday: Optional[int] = 0
     auto_schedule: Optional[int] = 1
     # id: int
+    # 추가 내역
+    show_in_preference: Optional[bool] = False # 기본 False, 프론트에서 안 보내면 자동 숨김
 
 class RosterRequest(BaseModel):
     """근무표 생성 요청(임시: UI 미구현 상태에서 req로 정책 파라미터를 주입하기 위한 모델).
@@ -95,7 +95,8 @@ class PreferenceSubmit(BaseModel):
 class PreferenceData(BaseModel):
     year: int
     month: int
-    data: dict
+    # data: dict
+    data: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PublishRequest(BaseModel):
@@ -103,7 +104,7 @@ class PublishRequest(BaseModel):
     issue_comment: str = None
 
 class WantedInvokeRequest(BaseModel):
-    request: str| List[str]
+    request: str | List[str] | None = None
     schema: List[Dict[str, Any]]
     case: object | None = None
     year: int
@@ -132,6 +133,7 @@ class RosterConfigBase(BaseModel):
     even_nights: bool
     sequential_offs: bool
     nod_noe: bool
+    not_one_night: bool = Field(default=False, description="야간 단발성(1N) 금지 여부")
     preceptor_gauge: float
     weekly_off_group: bool = Field(default=False)
     team_balance_enable: bool = Field(default=False)
@@ -185,6 +187,25 @@ class NurseProfile(BaseModel):
     phone_number: Optional[str] = None
     age: Optional[int] = None # 나이
     gender: Optional[str] = None
+    # 추가
+    team_id: Optional[int] = None
+    is_weekend_off: bool = Field(default=False)  # 주말 휴무 여부
+    # 추가
+    work_shifts: Optional[List[str]] = Field(
+        default_factory=list,
+        description="근무 가능 형태 배열. 예: ['D', 'E2', 'N1', 'MD'] 또는 ['D', 'N']"
+    )
+    
+    # @field_validator('fixed_shift')
+    # @classmethod
+    # def check_fixed_shift_with_weekend_off(cls, v: Any, info: ValidationInfo) -> Any:
+    #     # info.data 에서 이미 검증된 다른 필드 값들을 가져옴
+    #     is_weekend_off = info.data.get('is_weekend_off', False) if info.data else False
+    #     if not is_weekend_off:
+    #         return None  # 주말 휴무 미적용 시 fixed_shift는 None으로 강제
+    #     if v in ('M', 'D', None, ''):
+    #         return None if v in ('', None) else v
+    #     raise ValueError('fixed_shift는 주말 휴무 적용 시 "M", "D" 또는 없음만 가능합니다.')
 
     class Config:
         from_attributes = True
@@ -209,3 +230,27 @@ class ScheduleMemoUpdate(BaseModel):
     schedule_id: str
     memo: str | None = None
     group_id: str | None = None 
+
+class IntegratedRegisterRequest(BaseModel):
+    group_id: str
+    members: List[Dict[str, Any]]  # 한국어 키로 입력
+
+
+
+# 마이 페이지 테스트
+class PersonnelUpdate(BaseModel):
+    """마이페이지 기본 정보 수정 (이메일 + 총경력만 허용)"""
+    email: Optional[EmailStr] = Field(None, description="이메일 주소")
+    experience: Optional[int] = Field(None, ge=0, description="총 경력(년)")
+
+class PasswordChangeRequest(BaseModel):
+    """비밀번호 변경 요청 (SMS 인증 후 사용)"""
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8)
+    confirm_password: str = Field(..., min_length=8)
+    verification_code: Optional[str] = Field(None, description="SMS 인증번호 (최초 요청 시 생략)")
+
+class PhoneChangeRequest(BaseModel):
+    """휴대폰 번호 변경 요청"""
+    new_phone_number: str = Field(..., pattern=r"^01[0-9]{8,9}$", description="새 휴대폰 번호")
+    verification_code: Optional[str] = Field(None, description="인증번호 (검증 단계에서만 사용)")

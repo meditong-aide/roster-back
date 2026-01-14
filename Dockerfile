@@ -1,47 +1,38 @@
 # ───────── 베이스 이미지 ─────────
-# Python 3.13 slim (공식) ─ ARM/AMD 모두 OK
 FROM python:3.12
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-RUN apt-get update && apt-get install -y tzdata
-RUN ln -fs /usr/share/zoneinfo/Asia/Seoul /etc/localtime && dpkg-reconfigure -f noninteractive tzdata
+RUN apt-get update && apt-get install -y tzdata \
+ && ln -fs /usr/share/zoneinfo/Asia/Seoul /etc/localtime \
+ && dpkg-reconfigure -f noninteractive tzdata
 
-# 작업 디렉토리 설정
 WORKDIR /app
 
-# 소스 코드 복사
+# 소스 코드
 COPY app ./app
 COPY requirements.txt .
 
-# ───────── 빌드 인자 (워크플로우에서 주입) ─────────
+# ───────── 빌드 인자 ─────────
 ARG ENV=dev
 ARG GOOGLE_API_KEY
 ARG ANTHROPIC_API_KEY
 ARG OPENAI_API_KEY
 
-# 환경 변수 설정 진행
-ENV ENV=${ENV}
-ENV GOOGLE_API_KEY=${GOOGLE_API_KEY}
-ENV ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-ENV OPENAI_API_KEY=${OPENAI_API_KEY}
-
-# pip 업그레이드 및 requirements.lock 설치 (해시 옵션 제거)
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
-
-
-    
-
-
-# ───────── 런타임 환경 변수 ─────────
-ENV PYTHONUNBUFFERED=1 \
+ENV ENV=${ENV} \
+    GOOGLE_API_KEY=${GOOGLE_API_KEY} \
+    ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
+    OPENAI_API_KEY=${OPENAI_API_KEY} \
+    PYTHONUNBUFFERED=1 \
     PORT=8000
+
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 8000
 
-# # ───────── 헬스체크 (ALB 용) ─────────
-# HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-#   CMD curl -fs http://localhost:${PORT}/health/alb || exit 1
+# ───────── 엔트리포인트 스크립트 ─────────
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# ───────── 컨테이너 시작 CMD ─────────
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

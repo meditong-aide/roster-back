@@ -1,54 +1,52 @@
-from fastapi import APIRouter, HTTPException, Request, Depends
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, RedirectResponse
-from typing import Optional, List, Dict, Any
-from sqlalchemy.orm import Session
+import json
+import os
+import uuid
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import boto3
+import dotenv
+from anyio import to_thread
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from db.client2 import get_db
+from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest
-from pydantic import BaseModel, Field
-from db.client2 import get_db
-from db.models import Nurse, ShiftPreference, RosterConfig, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage
-from routers.utils import get_days_in_month
-from routers.auth import get_current_user_from_cookie
-from sqlalchemy import func, and_
-from db.models import Schedule, Shift
-from routers.utils import Timer
-from datetime import date
-import uuid
-from services.roster_create_service import generate_roster_service, request_schedule_service, generate_roster_service_with_fixed_cells
-import boto3
-import os
-import json
-import dotenv
+from services.roster_create_service import (
+    generate_roster_service,
+    # generate_roster_service_with_fixed_cells,
+    request_schedule_service,
+)
+from services.job_status_service import create_job_record
 
-# CP-SAT 기반 엔진들 import
-try:
-    from services.random_sampling import generate_roster
-    from services.cp_sat_basic import generate_roster_cp_sat
-    from services.cp_sat_main_v3 import generate_roster_cp_sat_main_v3
-    from services.cp_sat_main_v2 import generate_roster_cp_sat_main_v2
-    from services.cp_sat_adaptive import generate_roster_cp_sat_adaptive
-    CPSAT_AVAILABLE = True
-    CPSAT_MAIN_V3_AVAILABLE = True
-    CPSAT_MAIN_V2_AVAILABLE = True
-    CPSAT_ADAPTIVE_AVAILABLE = True
-    print("CP-SAT 엔진들이 사용 가능합니다.")
-except ImportError as e:
-    print(f"CP-SAT 엔진 import 실패: {e}")
-    CPSAT_AVAILABLE = False
-    CPSAT_MAIN_V3_AVAILABLE = False
-    CPSAT_MAIN_V2_AVAILABLE = False
-    CPSAT_ADAPTIVE_AVAILABLE = False
-
-
-
-router = APIRouter(
-    tags=["roster_create"])
-templates = Jinja2Templates(directory="app/templates")
+router = APIRouter(tags=["roster_create"])
 
 
 class HoldGenerateRequest(BaseModel):
+    """
+    고정 셀 정보를 포함한 근무표 생성 요청 모델.
+
+    인자:
+        year: 대상 연도 (예: 2025).
+        month: 대상 월 (예: 3).
+        fixed_cells: 미리 확정한 셀 목록.
+        config_id: 사용 설정 ID.
+        distribution_mode: 근무 배분 모드.
+        oversupply_balance_gauge: 과잉 공급 균형 지표(0~10, 예: 6).
+        monthly_preference_gauge: 월 선호도 반영 지표(0~10, 예: 3).
+        monthly_shift_preferences: 개인별 월간 선호 근무 설정.
+    반환:
+        BaseModel: Pydantic 검증을 거친 요청 데이터.
+    예외:
+        ValidationError: 필드 검증 실패 시 발생.
+    예시:
+        year=2025, month=3, oversupply_balance_gauge=6 → 검증 통과.
+    """
+
     year: int
     month: int
     fixed_cells: List[Dict[str, Any]]
@@ -59,30 +57,123 @@ class HoldGenerateRequest(BaseModel):
     monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
 
-
-dotenv.load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent.parent
+dotenv.load_dotenv(BASE_DIR / ".env")
 
 sqs = boto3.client("sqs", region_name="ap-northeast-2")
 QUEUE_URL = os.getenv("SQS_QUEUE_URL")
 
+
+async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    SQS에 근무표 생성 작업 메시지를 전송한다.
+
+    인자:
+        job_body: 직렬화될 작업 본문.
+    반환:
+        dict: SQS 전송 응답 메타데이터.
+    예외:
+        HTTPException: 환경 변수 미설정(500) 또는 전송 실패(502).
+    예시:
+        job_id가 "job-1-202503-abc12345"인 메시지 전송.
+    """
+
+    if not QUEUE_URL:
+        print('QUEUE_URL', QUEUE_URL)
+        raise HTTPException(status_code=500, detail="SQS_QUEUE_URL이 설정되지 않았습니다.")
+
+    try:
+        message_body = json.dumps(job_body, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        print('message_body', message_body)
+        raise HTTPException(status_code=400, detail=f"잘못된 메시지 본문: {exc}") from exc
+
+    try:
+        from functools import partial
+        response = await to_thread.run_sync(
+            partial(
+                sqs.send_message,
+                QueueUrl=QUEUE_URL,
+                MessageBody=message_body,
+            )
+        )
+    except Exception as exc:  # boto3 예외 타입 다양
+        # print('response', response)
+        print('exc', exc)
+        raise HTTPException(status_code=502, detail=f"SQS 전송 실패: {exc}") from exc
+
+    return response
+
+
 @router.post("/roster_create/async")
-def roster_create_async(
+async def roster_create_async(
     req: RosterRequest,
-    db: Session = Depends(get_db),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
+    _db: Session = Depends(get_db),
+    wait_for_result: bool = False,
 ):
     """
-    근무표 생성 비동기 요청 → SQS로 job 전송
+    근무표 생성 작업을 SQS로 위임하여 비동기로 처리한다.
+
+    인자:
+        req: 근무표 생성 요청 DTO.
+        db: DB 세션 (현재는 인증/권한 검증을 위한 의존성).
+        current_user: 로그인 사용자 정보.
+        wait_for_result: True일 때 동기 처리로 즉시 결과 반환.
+    반환:
+        dict: 생성된 job 정보와 SQS 응답 메타데이터 또는 동기 생성 결과.
+    예외:
+        HTTPException: 큐 전송 실패 시 502, 환경 변수 미설정 시 500.
+    예시:
+        year=2025, month=3 요청, wait_for_result=False → job-<user>-202503-<uuid> 전송.
+        year=2025, month=3 요청, wait_for_result=True → 동기 생성 결과 반환.
     """
-    job_body = {
-        "job_id": f"job-{current_user.account_id}-{req.year}{req.month}",
-        "nurse_id": current_user.account_id,
+
+    if wait_for_result:
+        # 동기로 바로 생성(레거시/테스트 용). CPU 부하는 EC2에 남습니다.
+        try:
+            return {
+                "mode": "sync",
+                "result": generate_roster_service(req, current_user, _db),
+            }
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"근무표 생성 실패: {exc}"
+            ) from exc
+
+    job_body: Dict[str, Any] = {
+        "job_id": (
+            f"job-{current_user.nurse_id}-"
+            f"{req.year:04d}{req.month:02d}-"
+            f"{uuid.uuid4().hex[:8]}"
+        ),
+        "nurse_id": current_user.nurse_id,
+        "account_id": current_user.account_id,
+        "office_id": current_user.office_id,
+        "group_id": current_user.group_id,
         "params": req.dict(),
+        "requested_at": datetime.utcnow().isoformat(),
     }
 
-    sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(job_body))
+    # 상태 테이블에 Job 생성(QUEUED)
+    try:
+        create_job_record(
+            db=_db,
+            job_id=job_body["job_id"],
+            office_id=current_user.office_id,
+            group_id=current_user.group_id,
+            nurse_id=current_user.nurse_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Job 생성 실패: {exc}") from exc
 
-    return {"message": "✅ Job submitted to SQS", "job": job_body}
+    response = await _send_sqs_job(job_body)
+
+    return {
+        "message": "✅ Job submitted to SQS",
+        "job": job_body,
+        "sqs_message_id": response.get("MessageId"),
+    }
 
 
 # [Roster] - 근무표 생성
@@ -91,7 +182,22 @@ async def generate_roster_endpoint(
     req: RosterRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
+
 ):
+    """
+    동기 방식으로 근무표를 생성한다.
+
+    인자:
+        req: 근무표 생성 요청 DTO.
+        current_user: 로그인 사용자 정보.
+        db: DB 세션.
+    반환:
+        dict: 생성된 근무표 데이터.
+    예외:
+        HTTPException: 내부 오류 발생 시 500.
+    예시:
+        year=2025, month=3 요청 시 동기 생성 결과 반환.
+    """
     try:
         return generate_roster_service(req, current_user, db)
     except Exception as e:
@@ -106,6 +212,20 @@ async def request_schedule(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+    """
+    수간호사 근무표 생성 요청을 기록하고 처리한다.
+
+    인자:
+        req: 근무표 생성 요청 DTO.
+        current_user: 로그인 사용자 정보.
+        db: DB 세션.
+    반환:
+        dict: 요청 등록 결과.
+    예외:
+        HTTPException: 처리 실패 시 500.
+    예시:
+        year=2025, month=3 요청 등록 후 상태 반환.
+    """
     try:
         return request_schedule_service(req, current_user, db)
     except Exception as e:
@@ -119,6 +239,20 @@ async def hold_generate_roster_endpoint(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
+    """
+    고정된 셀 정보를 반영해 근무표를 생성한다.
+
+    인자:
+        req: 고정 셀 포함 근무표 생성 요청 DTO.
+        current_user: 로그인 사용자 정보.
+        db: DB 세션.
+    반환:
+        dict: 생성된 근무표 데이터.
+    예외:
+        HTTPException: 내부 오류 발생 시 500.
+    예시:
+        fixed_cells를 포함한 year=2025, month=3 요청 처리.
+    """
     try:
         # 고정된 셀 정보를 포함하여 근무표 생성 서비스 호출
         return generate_roster_service_with_fixed_cells(req, current_user, db)

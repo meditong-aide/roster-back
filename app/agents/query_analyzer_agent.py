@@ -210,148 +210,83 @@ class queryAnalyzerPrompt:
 
 
 async def query_analyzer(state):
-    print('state', state)
-    # print('state', state.__dict__)
+    print('[query_analyzer] 입력 state:', state)
     context = state['request']
     year = state['year']
     month = state['month']
-    query_analyzer_prompt = queryAnalyzerPrompt(context, year, month)
-    
-    # 백업 모델들 순서대로 시도
-    models_to_try = [
-        # 1차: OpenAI (기본)
-        ChatOpenAI(
-            model="gpt-4.1-mini-2025-04-14",
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-        ),
-        # 2차: Anthropic (백업)
-        ChatAnthropic(
-            model="claude-3-7-sonnet-20250219",
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
-        ),
-        # 3차: Google Gemini (최종 백업)
-        ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            google_api_key=os.getenv("GOOGLE_API_KEY"),
-        )
-    ]
-    
-    messages = [
-        SystemMessage(content=query_analyzer_prompt.system),
-        HumanMessage(content=query_analyzer_prompt.human)
-    ]
-    
-    chat = []
-    shift = []
-    preference = []
-    except_ = []
-    others = []
-    used_model_name = ""
+    prompt = queryAnalyzerPrompt(context, year, month)
 
-    # ======================================================================
-    # case 기반 수동 경로 (모델 미사용)
-    # 기존 DB에서 로드된 case가 있는 경우, case_results 설정
-    # ======================================================================
-    if state['case'] != None:
-        print('case', state['case'], '\n\n\nrequest', state['request'])
-        
+    models_to_try = [
+        ChatOpenAI(model="gpt-4.1-mini-2025-04-14", openai_api_key=os.getenv("OPENAI_API_KEY")),
+        ChatAnthropic(model="claude-3-7-sonnet-20250219", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")),
+        ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
+    ]
+
+    messages = [
+        SystemMessage(content=prompt.system),
+        HumanMessage(content=prompt.human)
+    ]
+
+    chat = shift = preference = except_ = others = []
+    used_model = ""
+    case_results = None
+
+    # case 처리 (항상 수행, 하지만 LLM 호출은 무조건)
+    if state.get('case'):
+        print('[case 감지] case_results 생성 시작')
         case_results = []
-        for content in state['case']:
-            # '기존 데이터에서 로드됨' 케이스는 제외 (기존 데이터 복사는 wanted_service에서 처리)
-            if content['reason'] != '기존 데이터에서 로드됨':
-                date_str = content['date']
-                shift_type = content['shift']
-                
-                # date를 일(day)로 변환 (예: "2025-05-05" -> 5)
-                if isinstance(date_str, str) and '-' in date_str:
-                    day = int(date_str.split('-')[2])
-                else:
-                    day = int(date_str)
-                
+        for c in state['case']:
+            reason = c.get('reason')
+            if reason == '기존 데이터에서 로드됨':
+                continue
+            date_str = c.get('date')
+            shift_type = c.get('shift')
+            if not date_str or not shift_type:
+                continue
+            try:
+                day = int(str(date_str).split('-')[2]) if '-' in str(date_str) else int(date_str)
                 case_results.append({
                     'date': day,
                     'shift': shift_type,
                     'score': 1.0,
                     'request': '단순 희망'
                 })
-        
-        print(f"Query Analyzer (case 처리): case_results={case_results}")
-        
-        # case_results를 state에 설정
-        return {
-            "case_results": case_results,
-            "query_chat": [],
-            'query_shift': [],
-            'query_preference': [],
-            'model': models_to_try[0]
-        }
+            except:
+                continue
+        print(f'[case 처리 완료] {len(case_results)}건')
 
-    for i, client in enumerate(models_to_try):
+    # LLM 호출 → case 유무 상관없이 항상 실행 (새 요청 처리 보장)
+    for idx, client in enumerate(models_to_try, 1):
         try:
-            print(f"Query Analyzer: {i+1}차 모델 시도 중..., 모델: {client}")
-            
+            print(f'[LLM 시도 {idx}] {client.model_name}')
             llm = client.with_structured_output(queryAnalyzer)
-            response = await llm.ainvoke(messages)
-            used_model_name = getattr(client, "model", "") or used_model_name
-            print("\n\n\nresponse", response, "\n\n\n")
-            # 성공 시 데이터 추출
-            chat = response.Chat
-            shift = response.Shift
-            preference = response.Preference
-            except_ = response.Except
-            others = response.Others
-            
-            print(f"Query Analyzer: {i+1}차 모델 성공!", response)
-            
+            resp = await llm.ainvoke(messages)
+            used_model = client.model_name
+            chat, shift, preference, except_, others = resp.Chat, resp.Shift, resp.Preference, resp.Except, resp.Others
+            print(f'[LLM 성공] Shift: {shift}')
             break
-            
         except Exception as e:
-            error_msg = str(e).lower()
-            print(f"Query Analyzer: {i+1}차 모델 오류 - {e}")
-            
-            # 429 (Rate limit) 또는 529 (Service unavailable) 에러인지 확인
-            if ("429" in error_msg or "rate" in error_msg or 
-                "529" in error_msg or "service unavailable" in error_msg or
-                "quota" in error_msg or "limit" in error_msg):
-                
-                if i < len(models_to_try) - 1:
-                    print(f"Query Analyzer: {i+2}차 백업 모델로 재시도...")
-                    continue
-                else:
-                    print("Query Analyzer: 모든 백업 모델 실패, 기본값 사용")
-                    break
-            else:
-                # 다른 에러는 즉시 백업 모델로 시도
-                if i < len(models_to_try) - 1:
-                    print(f"Query Analyzer: 예상치 못한 오류, {i+2}차 백업 모델로 재시도...")
-                    continue
-                else:
-                    print("Query Analyzer: 모든 모델 실패, 기본값 사용")
-                    break
+            print(f'[LLM 실패 {idx}] {e}')
+            if idx == len(models_to_try):
+                print('[모든 LLM 실패] 기본값 사용')
 
-    # 토큰/비용 계산
-    model_name_for_calc = used_model_name or (getattr(models_to_try[0], "model", "") or "")
-    prompt_tokens = _count_messages_tokens([query_analyzer_prompt.system, query_analyzer_prompt.human], model_name_for_calc)
-    completion_json = json.dumps({
-        "Chat": chat,
-        "Shift": shift,
-        "Preference": preference,
-        "Except": except_,
-        "Others": others
-    }, ensure_ascii=False)
-    completion_tokens = _count_tokens(completion_json, model_name_for_calc)
-    cost_info = _compute_cost(prompt_tokens, completion_tokens, model_name_for_calc)
+    # 토큰 계산
+    model_name = used_model or models_to_try[0].model_name
+    pt = _count_messages_tokens([prompt.system, prompt.human], model_name)
+    ct_json = json.dumps({"Chat": chat, "Shift": shift, "Preference": preference, "Except": except_, "Others": others}, ensure_ascii=False)
+    ct = _count_tokens(ct_json, model_name)
+    cost = _compute_cost(pt, ct, model_name)
+    print(f'[토큰] {cost["usage"]} / {cost["cost_krw"]["total"]}원')
 
-    print(f"Query Analyzer 답변: query_chat: {chat}, query_shift: {shift}, query_preference: {preference}, query_except: {except_}, query_others: {others}")
-    print(f"토큰 사용량: {cost_info['usage']}, 비용(USD/KRW): {cost_info['cost_usd']} / {cost_info['cost_krw']}")
-    return {
+    ret = {
         "query_chat": chat,
-        'query_shift': shift,
-        'query_preference': preference,
-        'query_except': except_,
-        'query_others': others,
-        'model': models_to_try[0]
+        "query_shift": shift,
+        "query_preference": preference,
+        "query_except": except_,
+        "query_others": others,
+        "model": models_to_try[0]
     }
+    if case_results:
+        ret["case_results"] = case_results
 
-
-
+    return ret

@@ -46,36 +46,71 @@ def _append_shift_manage_code(
     group_id: str,
     shift_id: str,
     shift_gb: str | None,
+    old_shift_id: str | None = None,
+    old_shift_gb: str | None = None,
 ) -> None:
     """
     shift_manage.codes에 근무코드를 중복 없이 추가합니다.
 
     - shift_gb가 D/E/N일 때만 슬롯(1/2/3)에 매핑합니다.
     - 이미 존재하면 추가하지 않습니다.
+    - update 시 shift_id 또는 shift_gb가 바뀌면 기존 슬롯에서 제거 후 새 슬롯에 추가합니다.
     """
     slot_map = {"D": 1, "E": 2, "N": 3}
-    if shift_gb not in slot_map or not office_id:
+    if not office_id:
         return
 
-    target_slot = slot_map[shift_gb]
-    shift_manages = (
-        session.query(ShiftManage)
-        .filter(
-            ShiftManage.office_id == office_id,
-            ShiftManage.group_id == group_id,
-            ShiftManage.shift_slot == target_slot,
-            ShiftManage.main_code == shift_gb,
+    def _remove(target_gb: str | None, target_id: str | None) -> bool:
+        if target_gb not in slot_map or not target_id:
+            return False
+        target_slot = slot_map[target_gb]
+        shift_manages = (
+            session.query(ShiftManage)
+            .filter(
+                ShiftManage.office_id == office_id,
+                ShiftManage.group_id == group_id,
+                ShiftManage.shift_slot == target_slot,
+                ShiftManage.main_code == target_gb,
+            )
+            .all()
         )
-        .all()
-    )
-    updated = False
-    for shift_manage in shift_manages:
-        codes = shift_manage.codes or []
-        if shift_id not in codes:
-            shift_manage.codes = codes + [shift_id]
-            updated = True
+        removed = False
+        for shift_manage in shift_manages:
+            codes = shift_manage.codes or []
+            if target_id in codes:
+                shift_manage.codes = [code for code in codes if code != target_id]
+                removed = True
+        return removed
 
-    if updated:
+    def _append(target_gb: str | None, target_id: str) -> bool:
+        if target_gb not in slot_map:
+            return False
+        target_slot = slot_map[target_gb]
+        shift_manages = (
+            session.query(ShiftManage)
+            .filter(
+                ShiftManage.office_id == office_id,
+                ShiftManage.group_id == group_id,
+                ShiftManage.shift_slot == target_slot,
+                ShiftManage.main_code == target_gb,
+            )
+            .all()
+        )
+        added = False
+        for shift_manage in shift_manages:
+            codes = shift_manage.codes or []
+            if shift_id not in codes:
+                shift_manage.codes = codes + [shift_id]
+                added = True
+        return added
+
+    removed_any = False
+    if old_shift_id and (old_shift_id != shift_id or old_shift_gb != shift_gb):
+        removed_any = _remove(old_shift_gb, old_shift_id)
+
+    added_any = _append(shift_gb, shift_id)
+
+    if removed_any or added_any:
         session.commit()
 
 
@@ -103,7 +138,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
         )
         
         if shifts:
-            print('shifts', [s.__dict__ for s in shifts])
+            # print('shifts', [s.__dict__ for s in shifts])
             
             return [
                 {
@@ -120,6 +155,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                     "shift_gb": getattr(s, "shift_gb", None),
                     "default_shift": getattr(s, "default_shift", s.shift_id),
                     "id": getattr(s, "id", None),
+                    # 추가
+                    "show_in_preference": s.show_in_preference, # True/False 또는 1/0
                 }
                 for s in shifts
             ]
@@ -154,6 +191,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 sequence=seq,
                 default_shift=default_shift,
                 shift_gb=shift_gb,
+                # 추가
+                show_in_preference=True if shift_id in ["D","E","N","O"] else False # 기본 4개만 노출
             )
         defaults = [
             # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence, default_shift, shift_gb
@@ -198,6 +237,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 "shift_gb": getattr(s, "shift_gb", None),
                 "default_shift": getattr(s, "default_shift", s.shift_id),
                 "id": getattr(s, "id", None),
+                # 추가
+                "show_in_preference": s.show_in_preference,
             }
             for s in shifts
         ]
@@ -279,6 +320,8 @@ def update_shift_service(req, current_user, db: Session | None = None):
         ).first()
         if not existing_shift:
             raise Exception("해당 근무코드를 찾을 수 없습니다.")
+        old_shift_id = existing_shift.shift_id
+        old_shift_gb = getattr(existing_shift, "shift_gb", None)
 
         existing_shift.shift_id = req.shift_id
         existing_shift.name = req.name
@@ -299,6 +342,8 @@ def update_shift_service(req, current_user, db: Session | None = None):
         group_id=current_user.group_id,
         shift_id=existing_shift.shift_id,
         shift_gb=req.shift_gb,
+        old_shift_id=old_shift_id,
+        old_shift_gb=old_shift_gb,
     )
         return {
             "message": "근무코드가 성공적으로 수정되었습니다.",

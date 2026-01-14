@@ -73,6 +73,8 @@ class Nurse(Base):
     phone_number = Column(VARCHAR(20), nullable=True)
     gender = Column(VARCHAR(3), nullable=True)
     is_weekend_off = Column(BOOLEAN, default=False)
+    # 추가
+    work_shifts = Column(JSON, nullable=True, default=list, server_default='[]')
     
     group = relationship("Group")
     __table_args__ = (
@@ -132,9 +134,39 @@ class Shift(Base):
     default_shift = Column(VARCHAR(10), nullable=True)  # 기본 근무코드
     is_weekly_off = Column(TINYINT, nullable=False, default=0)  # 주휴 여부
     id = Column(INTEGER, primary_key=True, nullable=False, autoincrement=True)
+    # DB에서 BIT 타입이라 BOOLEAN으로 매핑
+    show_in_preference = Column(
+        BOOLEAN,
+        nullable=False,
+        server_default="0" , # MSSQL에서 0 (False)
+        default=False
+    )
 
     office = relationship("Office")
     group = relationship("Group")
+
+
+
+# ───────────────────────────── Job Status ─────────────────────────────
+
+
+class RosterJob(Base):
+    __tablename__ = "roster_jobs"
+
+    job_id = Column(VARCHAR(100), primary_key=True)
+    office_id = Column(VARCHAR(50), nullable=True)
+    group_id = Column(VARCHAR(50), nullable=True)
+    nurse_id = Column(VARCHAR(50), nullable=True)
+    status = Column(VARCHAR(20), nullable=False)  # QUEUED | RUNNING | SUCCESS | FAILED
+    progress = Column(SMALLINT, nullable=True)
+    result_roster_id = Column(VARCHAR(100), nullable=True)
+    error_message = Column(TEXT, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_roster_jobs_group_created", "group_id", "created_at"),
+    )
 
 class ShiftManage(Base):
     __tablename__ = "shift_manage"
@@ -191,6 +223,7 @@ class RosterConfig(Base):
     sequential_offs = Column(BOOLEAN)
     even_nights = Column(BOOLEAN)
     nod_noe = Column(BOOLEAN)
+    not_one_night = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
     preceptor_gauge = Column(INTEGER, nullable=False, default=5)
     weekly_off_group = Column(BOOLEAN)

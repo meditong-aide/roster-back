@@ -19,14 +19,29 @@ from db.models import Nurse, RosterConfig
 from schemas.roster_schema import RosterRequest
 from schemas.auth_schema import User as UserSchema
 from services.roster_create_service import generate_roster_service
+from services.job_status_service import (
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    STATUS_SUCCESS,
+    update_job_record,
+)
 
 # =========================================================
 # 사용자 로딩 함수
 # =========================================================
 def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
     """
-    워커에선 쿠키가 없으므로, nurse_id로 Nurse를 조회해 UserSchema를 구성.
-    generate_roster_service가 요구하는 필드를 맞춰 반환.
+    nurse_id로 간호사를 조회해 생성 엔진이 필요한 최소 UserSchema를 구성한다.
+
+    인자:
+        db: DB 세션.
+        nurse_id: 간호사 ID.
+    반환:
+        UserSchema: 엔진 실행에 필요한 필드만 채운 사용자 정보.
+    예외:
+        RuntimeError: 대상 간호사가 없을 때.
+    예시:
+        nurse_id="438390" → office_id, group_id, is_head_nurse 포함한 스키마 반환.
     """
     nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse:
@@ -38,6 +53,7 @@ def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
     is_head_nurse = getattr(nurse, "is_head_nurse", False)
     name = getattr(nurse, "name", "")
 
+    # 엔진에 불필요한 필드는 기본값으로 채워 ValidationError만 방지한다.
     return UserSchema(
         nurse_id=nurse.nurse_id,
         account_id=nurse.account_id,
@@ -45,12 +61,20 @@ def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
         group_id=group_id,
         is_head_nurse=is_head_nurse,
         name=name,
+        mb_part=getattr(nurse, "mb_part", "") or "",
+        office_name=getattr(getattr(nurse, "group", None), "office_name", "") or getattr(nurse, "office_name", "") or "",
+        mb_part_name=getattr(nurse, "mb_part_name", "") or "",
+        gw_useYN=str(getattr(nurse, "gw_useYN", "") or "N"),
+        qpis_useYN=str(getattr(nurse, "qpis_useYN", "") or "N"),
+        official_title_name=getattr(nurse, "official_title_name", None),
     )
 
 # =========================================================
 # 핵심 워커 실행
 # =========================================================
 def main():
+    print("ENV KEYS:", os.environ.keys())
+    print("JOB_JSON RAW:", os.getenv("JOB_JSON"))
     job_json = os.getenv("JOB_JSON")
     if not job_json:
         print("[worker] JOB_JSON 환경변수가 없습니다", file=sys.stderr)
@@ -62,9 +86,9 @@ def main():
         print("[worker] JOB_JSON JSON 파싱 실패", file=sys.stderr)
         sys.exit(2)
 
-    job_id   = payload.get("job_id")
-    nurse_id  = payload.get("nurse_id")  # ⬅ account_id 로 사용한다고 가정
-    params   = payload.get("params", {})
+    job_id = payload.get("job_id")
+    nurse_id = payload.get("nurse_id")  # ⬅ account_id 로 사용한다고 가정
+    params = payload.get("params", {})
 
     if not nurse_id:
         print("[worker] nurse_id 값이 필요합니다", file=sys.stderr)
@@ -81,6 +105,12 @@ def main():
     try:
         current_user = load_current_user_by_nurse_id(db, nurse_id)
         print(f"[worker] 작업 시작 job_id={job_id}, nurse_id={nurse_id}, req={req}")
+
+        try:
+            update_job_record(db, job_id, status=STATUS_RUNNING, progress=10)
+        except Exception as exc:
+            print(f"[worker] Job 상태 업데이트 실패(RUNNING): {exc}", file=sys.stderr)
+            raise
 
         # 사전 검사: 설정 존재 여부 확인 (없으면 서비스 내부에서 충돌 가능)
         latest_config = None
@@ -101,6 +131,16 @@ def main():
 
         # 핵심: 엔드포인트가 하던 것을 그대로 서비스로 호출
         roster_data = generate_roster_service(req, current_user, db)
+        result_id = None
+        if isinstance(roster_data, dict):
+            result_id = roster_data.get("schedule_id") or roster_data.get("schedule")
+        update_job_record(
+            db,
+            job_id,
+            status=STATUS_SUCCESS,
+            progress=100,
+            result_roster_id=result_id,
+        )
 
         # 필요하면 jobs 테이블에 DONE/요약 기록 (선택)
         # update_job_status(db, job_id, "DONE", meta=...)
@@ -110,6 +150,16 @@ def main():
 
     except Exception:
         traceback.print_exc()
+        try:
+            update_job_record(
+                db,
+                job_id,
+                status=STATUS_FAILED,
+                progress=100,
+                error_message=str(sys.exc_info()[1]),
+            )
+        except Exception as exc2:
+            print(f"[worker] Job 상태 업데이트 실패(FAILED): {exc2}", file=sys.stderr)
         # update_job_status(db, job_id, "FAILED")  # 선택
         sys.exit(1)
 
