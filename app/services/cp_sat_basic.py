@@ -267,6 +267,10 @@ class CPSATBasicEngine:
         setattr(cfg, "shadow_coverage_lookback_days", int(config_data.get("shadow_coverage_lookback_days", 6) or 0))
         setattr(cfg, "shadow_coverage_need_ratio", float(config_data.get("shadow_coverage_need_ratio", 0.6) or 0.0))
         setattr(cfg, "shadow_coverage_penalty_weight", int(config_data.get("shadow_coverage_penalty_weight", 6) or 0))
+        # 전이 금지 하드 제약 설정 (기본: 모두 금지)
+        setattr(cfg, "ban_e_to_d", bool(config_data.get("ban_e_to_d", True)))
+        setattr(cfg, "ban_n_to_e", bool(config_data.get("ban_n_to_e", True)))
+        setattr(cfg, "ban_d_to_n", bool(config_data.get("ban_d_to_n", True)))
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
             ds_by_day = config_data.get('daily_shift_requirements_by_day')
@@ -1258,27 +1262,33 @@ class CPSATBasicEngine:
                 for d in range(T0 + 1, T1 + 1):
                     xn = X(n, d - 1, night_idx)
                     xd = X(n, d, day_idx)
-                    b_nd = m.NewBoolVar(f'viol_nd_{n}_{d}')
-                    # (N∧D) → b_nd, b_nd → N, b_nd → D
-                    m.AddBoolOr([b_nd, xn.Not(), xd.Not()])
-                    m.AddImplication(b_nd, xn)
-                    m.AddImplication(b_nd, xd)
-                    safety['trans_nd'].append(b_nd)
-                    if cfg.banned_day_after_eve:
+                    if getattr(cfg, "ban_n_to_d", True):
+                        b_nd = m.NewBoolVar(f'viol_nd_{n}_{d}')
+                        m.AddBoolOr([b_nd, xn.Not(), xd.Not()])
+                        m.AddImplication(b_nd, xn)
+                        m.AddImplication(b_nd, xd)
+                        safety['trans_nd'].append(b_nd)
+                    if getattr(cfg, "ban_e_to_d", True):
                         xe = X(n, d - 1, eve_idx)
                         b_ed = m.NewBoolVar(f'viol_ed_{n}_{d}')
                         m.AddBoolOr([b_ed, xe.Not(), xd.Not()])
                         m.AddImplication(b_ed, xe)
                         m.AddImplication(b_ed, xd)
                         safety['trans_ed'].append(b_ed)
-                        
-                        # N→E 금지 추가
+                    if getattr(cfg, "ban_n_to_e", True):
                         xe2 = X(n, d, eve_idx)
                         b_ne = m.NewBoolVar(f'viol_ne_{n}_{d}')
                         m.AddBoolOr([b_ne, xn.Not(), xe2.Not()])
                         m.AddImplication(b_ne, xn)
                         m.AddImplication(b_ne, xe2)
                         safety['trans_ne'].append(b_ne)
+                    if getattr(cfg, "ban_d_to_n", True):
+                        xd_prev = X(n, d - 1, day_idx)
+                        b_dn = m.NewBoolVar(f'viol_dn_{n}_{d}')
+                        m.AddBoolOr([b_dn, xd_prev.Not(), xn.Not()])
+                        m.AddImplication(b_dn, xd_prev)
+                        m.AddImplication(b_dn, xn)
+                        safety.setdefault('trans_dn', []).append(b_dn)
 
             # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
             if bool(getattr(cfg, "not_one_night", False)):
@@ -2317,7 +2327,18 @@ class CPSATBasicEngine:
         day_idx = cfg.shift_types.index("D") if "D" in cfg.shift_types else None
         eve_idx = cfg.shift_types.index("E") if "E" in cfg.shift_types else None
         night_idx = cfg.shift_types.index("N") if "N" in cfg.shift_types else None
-        work_shift_indices = [i for i, code in enumerate(cfg.shift_types) if code != "O"]
+        # W를 후처리 교체 대상에서 제외하고, 커버리지 코드(D/E/N 등)만 사용
+        work_codes = [
+            code
+            for code in (cfg.daily_shift_requirements or {}).keys()
+            if code in cfg.shift_types and code not in {"O", "W"}
+        ]
+        work_shift_indices = [cfg.shift_types.index(code) for code in work_codes]
+        if not work_shift_indices:
+            # fallback: shift_types에서 O/W 제외
+            work_shift_indices = [
+                i for i, code in enumerate(cfg.shift_types) if code not in {"O", "W"}
+            ]
         if not work_shift_indices:
             return 0
 
@@ -2346,6 +2367,9 @@ class CPSATBasicEngine:
         weekly_off_cells = {(n, d) for n, days in weekly_off_map.items() for d in (days or [])}
 
         pref_matrix = getattr(roster_system, "preference_matrix", None)
+        grade_config = getattr(roster_system, "grade_config", None)
+        grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+        team_map = {n_idx: getattr(n, "team_id", None) for n_idx, n in enumerate(roster_system.nurses)}
 
         base_min_off = int(
             getattr(cfg, "global_monthly_off_days", 0) + getattr(cfg, "standard_personal_off_days", 0)
@@ -2423,6 +2447,48 @@ class CPSATBasicEngine:
         base_viol = len(roster_system._find_violations())
         changes = 0
 
+        def team_shift_count(d_idx: int, s_idx: int, team_id) -> int:
+            if team_id is None:
+                return 0
+            cnt = 0
+            for n_i, nurse in enumerate(roster_system.nurses):
+                if getattr(nurse, "team_id", None) != team_id:
+                    continue
+                if roster_system.roster[n_i, d_idx, s_idx] == 1:
+                    cnt += 1
+            return cnt
+
+        def grade_bonus(n_idx: int, d_idx: int, s_idx: int) -> float:
+            """GRADE 전략 시 소프트 보너스(가벼운 휴리스틱)."""
+            if grade_strategy != "GRADE" or not isinstance(grade_config, dict):
+                return 0.0
+            grade_val = getattr(roster_system.nurses[n_idx], "grade", None)
+            try:
+                grade_int = int(grade_val) if grade_val is not None else None
+            except Exception:
+                grade_int = None
+            constraints_map = (
+                grade_config.get("constraints")
+                or grade_config.get("constraints_json")
+                or {}
+            )
+            shift_code = cfg.shift_types[s_idx]
+            req_map = constraints_map.get(shift_code) if isinstance(constraints_map, dict) else None
+            if not isinstance(req_map, dict) or grade_int is None:
+                return 0.0
+            # 요구 대비 현재 배정 카운트 계산
+            need = int(req_map.get(str(grade_int), 0) or 0)
+            if need <= 0:
+                return 0.0
+            assigned = 0
+            for n_i, _ in enumerate(roster_system.nurses):
+                if int(getattr(roster_system.nurses[n_i], "grade", grade_int) or grade_int) != grade_int:
+                    continue
+                if roster_system.roster[n_i, d_idx, s_idx] == 1:
+                    assigned += 1
+            gap = need - assigned
+            return 0.5 if gap > 0 else 0.0
+
         def is_off_like(n_idx: int, d_idx: int) -> bool:
             if d_idx < 0 or d_idx >= num_days:
                 return False
@@ -2432,6 +2498,45 @@ class CPSATBasicEngine:
                 return True
             if is_recovery_off(n_idx, d_idx):
                 return True
+            return False
+
+        def assigned_shift_idx(n_idx: int, d_idx: int) -> int | None:
+            if d_idx < 0 or d_idx >= num_days:
+                return None
+            vec = roster_system.roster[n_idx, d_idx]
+            ones = np.where(vec == 1)[0]
+            return int(ones[0]) if len(ones) == 1 else None
+
+        def violates_transition(n_idx: int, d_idx: int, s_idx: int) -> bool:
+            """E→D, N→E, D→N, N→D 금지 설정을 양옆 모두에서 검사."""
+            ban_n_to_d = bool(getattr(cfg, "ban_n_to_d", True))
+            ban_e_to_d = bool(getattr(cfg, "ban_e_to_d", True))
+            ban_n_to_e = bool(getattr(cfg, "ban_n_to_e", True))
+            ban_d_to_n = bool(getattr(cfg, "ban_d_to_n", True))
+
+            prev_idx = assigned_shift_idx(n_idx, d_idx - 1)
+            next_idx = assigned_shift_idx(n_idx, d_idx + 1)
+
+            # prev -> current
+            if prev_idx is not None:
+                if ban_e_to_d and prev_idx == eve_idx and s_idx == day_idx:
+                    return True
+                if ban_n_to_e and prev_idx == night_idx and s_idx == eve_idx:
+                    return True
+                if ban_n_to_d and prev_idx == night_idx and s_idx == day_idx:
+                    return True
+                if ban_d_to_n and prev_idx == day_idx and s_idx == night_idx:
+                    return True
+            # current -> next
+            if next_idx is not None:
+                if ban_e_to_d and s_idx == eve_idx and next_idx == day_idx:
+                    return True
+                if ban_n_to_e and s_idx == night_idx and next_idx == eve_idx:
+                    return True
+                if ban_n_to_d and s_idx == night_idx and next_idx == day_idx:
+                    return True
+                if ban_d_to_n and s_idx == day_idx and next_idx == night_idx:
+                    return True
             return False
 
         for n_idx, nurse in enumerate(roster_system.nurses):
@@ -2482,10 +2587,20 @@ class CPSATBasicEngine:
                         if s_idx == off_idx:
                             continue
                         score = pref_matrix[n_idx, d_idx, s_idx] if pref_matrix is not None else 0
+                        # 전략별 보너스
+                        if grade_strategy == "TEAM":
+                            team_id = team_map.get(n_idx)
+                            score += 0.2 * team_shift_count(d_idx, s_idx, team_id)
+                        elif grade_strategy == "GRADE":
+                            score += grade_bonus(n_idx, d_idx, s_idx)
                         if best_score is None or score > best_score:
                             best_score = score
                             target_shift_idx = s_idx
                 if target_shift_idx is None:
+                    continue
+
+                # 전이 금지 체크 (양옆)
+                if violates_transition(n_idx, d_idx, target_shift_idx):
                     continue
 
                 # 교체 시뮬레이션
@@ -2850,10 +2965,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):
-            m.Add(X(n,d,day)+X(n,d-1,night)<=1)  # N→D 금지
-            if cfg.banned_day_after_eve:
+            if getattr(cfg, "ban_n_to_d", True):
+                m.Add(X(n,d,day)+X(n,d-1,night)<=1)  # N→D 금지
+            if getattr(cfg, "ban_e_to_d", True):
                 m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
+            if getattr(cfg, "ban_n_to_e", True):
                 m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
+            if getattr(cfg, "ban_d_to_n", True):
+                m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         raw = getattr(nu, "is_night_nurse", None)

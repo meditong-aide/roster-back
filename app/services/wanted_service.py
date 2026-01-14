@@ -594,25 +594,41 @@ async def invoke_and_persist_wanted_service(
     has_case = (req.case is not None and len(req.case) > 0) or (''.join(req.request) is "" and ''.join(req.case) is "")
     print(f"has_case: {has_case}")
 
-    # if not has_case:
-    #     print("case 없음 → 과거 데이터 자동 로드 시도")
-    #     latest_wr = db.query(WantedRequest).filter(
-    #         WantedRequest.nurse_id == nurse_id,
-    #         WantedRequest.month == month_str,
-    #     ).order_by(WantedRequest.created_at.desc()).first()
+    if not has_case:
+        print("case 없음 → 과거 최신 데이터 자동 로드 시도")
+        latest_wr = (
+            db.query(WantedRequest)
+            .filter(
+                WantedRequest.nurse_id == nurse_id,
+                WantedRequest.month == month_str,
+                WantedRequest.is_submitted == True
+            )
+            .order_by(WantedRequest.created_at.desc())
+            .first()
+        )
         
-    #     if latest_wr and latest_wr.request != normalize_request_text(req.request):
-    #         print(f"과거 데이터 발견 (request_id={latest_wr.request_id}) → case 자동 생성")
-    #         shift_rows = db.query(NurseShiftRequest).filter(
-    #             NurseShiftRequest.nurse_id == nurse_id,
-    #             NurseShiftRequest.request_id == latest_wr.request_id
-    #         ).all()
+        if latest_wr:
+            print(f"이번 달 제출된 과거 데이터 발견 (request_id={latest_wr.request_id}) → 자동 case 설정")
             
-    #         req.case = [{"date": str(row.shift_date), "shift": row.shift} for row in shift_rows]
-    #         has_case = True
-    #         print(f"자동 case 생성: {len(req.case)}건")
-    #     else:
-    #         print("과거 데이터 없거나 동일 요청 → 새로 생성")
+            # 날짜 범위 강제 제한 (다른 달 데이터 못 들어오게)
+            start_date = datetime.strptime(month_str + "-01", "%Y-%m-%d").date()
+            end_date = (start_date + relativedelta(months=1)).date()
+            
+            shift_rows = db.query(NurseShiftRequest).filter(
+                NurseShiftRequest.nurse_id == nurse_id,
+                NurseShiftRequest.request_id == latest_wr.request_id,
+                NurseShiftRequest.shift_date >= start_date,
+                NurseShiftRequest.shift_date < end_date
+            ).all()
+            
+            req.case = [
+                {"date": str(row.shift_date), "shift": row.shift}
+                for row in shift_rows
+            ]
+            has_case = True
+            print(f"자동 case 생성 완료 ({len(req.case)}건)")
+        else:
+            print("이번 달에 제출된 데이터 없음 → case 자동 생성 포기")
 
     # 그래프 실행 여부
     print('req.request!!', req.request)
