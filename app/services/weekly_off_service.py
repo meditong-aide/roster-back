@@ -185,6 +185,15 @@ def update_weekly_off_settings_service(
     setting.cycle_interval = payload.cycle_interval
     setting.shift_variation = payload.shift_variation
     
+    # 추가
+    now = datetime.now()
+    if setting.use_variable_cycle and setting.cycle_type == "month":
+        # base_year / base_month가 아직 없으면 현재 시점으로 초기화
+        if setting.base_year is None:
+            setting.base_year = now.year
+        if setting.base_month is None:
+            setting.base_month = now.month
+    
     # base_year/base_month 가 없는 상태에서 최초 활성화 시, 현재 시점을 기준으로 잡을 수도 있음.
     # 여기서는 명시적 업데이트가 없으면 그대로 둠 (간호사 설정 시점에 갱신됨)
     
