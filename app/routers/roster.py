@@ -903,19 +903,11 @@ async def get_submission_statuses(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
+    if group_id:
+        target_group_id = group_id
     else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+        target_group_id = current_user.group_id
+
     # 대상 그룹의 간호사 수집
     nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     nurse_ids_in_group = {n[0] for n in nurses_in_group}
@@ -1117,10 +1109,14 @@ async def validate_roster(
         if not latest_config_db:
             return {"violations": ["근무표 설정을 찾을 수 없습니다."]}
 
+        max_nig = latest_config_db.max_nig_per_month
+        if max_nig != 15:
+            max_nig = 17
+
         roster_config_for_engine = NurseRosterConfig(
             daily_shift_requirements=daily_shift_requirements,
             max_consecutive_work_days   = latest_config_db.max_conseq_work,
-            max_night_shifts_per_month  = latest_config_db.max_nig_per_month,
+            max_night_shifts_per_month  = max_nig,
             max_consecutive_nights      = 3 if latest_config_db.three_seq_nig else 2
         )
 

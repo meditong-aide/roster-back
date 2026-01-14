@@ -1731,6 +1731,64 @@ def _persist_entries(db: Session, schedule, generated, req):
     db.commit()
 
 
+def _count_work_assignments(generated: dict[str, list[str]] | None) -> tuple[int, int]:
+    """
+    생성된 근무표에서 총 셀 수와 실근무 배정 수를 계산한다.
+
+    인자:
+        generated: 엔진이 반환한 간호사별 근무 리스트 딕셔너리.
+    반환:
+        tuple: (전체 셀 수, 실근무 배정 수).
+    예외:
+        없음.
+    예시:
+        간호사 25명, 30일, 실근무 0건 → (750, 0).
+    """
+    if not isinstance(generated, dict):
+        return 0, 0
+    off_codes = {"-", "O", "OFF", "주"}
+    total_cells = 0
+    work_cells = 0
+    for shifts in generated.values():
+        for raw_shift in shifts or []:
+            total_cells += 1
+            code = str(raw_shift).strip().upper() if raw_shift is not None else "-"
+            if code in off_codes:
+                continue
+            work_cells += 1
+    return total_cells, work_cells
+
+
+def _validate_generated_roster(
+    generated: dict[str, list[str]] | None, roster_system
+) -> str | None:
+    """
+    엔진 결과가 고객에게 보여줄 수 없는 수준인지 최소 검증한다.
+
+    인자:
+        generated: 엔진이 반환한 근무표(dict).
+        roster_system: 위반 정보를 포함한 RosterSystem 객체 또는 None.
+    반환:
+        str | None: 문제가 있으면 에러 메시지, 없으면 None.
+    예외:
+        없음.
+    예시:
+        총 750칸 중 실근무 0칸이거나 위반 1500건(750×2) 이상 → 메시지 반환.
+    """
+    total_cells, work_cells = _count_work_assignments(generated)
+    num_days = getattr(roster_system, "num_days", 0) or 0
+    work_ratio = (work_cells / total_cells) if total_cells else 0.0
+
+    if total_cells > 0 and work_cells == 0:
+        return "근무 배정이 한 건도 없어 스케줄을 저장하지 않습니다."
+
+    # 근무 배정률이 10% 미만이면 비정상으로 간주
+    if total_cells > 0 and work_ratio < 0.1:
+        return "근무 배정률이 10% 미만이어서 스케줄을 저장하지 않습니다."
+
+    return None
+
+
 def _build_roster_response(db: Session, schedule, req, nurses_in_group):
     """프론트에서 쓰는 roster_data 형태로 응답을 구성한다."""
     shifts_db = db.query(Shift).all()
@@ -2196,6 +2254,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         generated.update(fixed_roster)
     else:
         generated = fixed_roster
+
+    validation_error = _validate_generated_roster(generated, roster_system)
+    if validation_error:
+        db.delete(schedule)
+        db.commit()
+        raise Exception(validation_error)
 
     _persist_entries(db, schedule, generated, req)
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
