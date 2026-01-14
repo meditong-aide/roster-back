@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, ValidationInfo, EmailStr
+from pydantic import BaseModel, Field, field_validator, ValidationInfo, EmailStr, field_validator
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import StrEnum
@@ -44,6 +44,16 @@ class ShiftUpdateRequest(BaseModel):
     id: int
     # 추가
     show_in_preference: Optional[bool] = None # None이면 기존 값 유지
+    
+    @field_validator('shift_id', 'shift_gb', 'name', mode='before')
+    @classmethod
+    def strip_shift_codes(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            cleaned = v.strip()
+            return cleaned if cleaned else None
+        return v
 
 class ShiftAddRequest(BaseModel):
     """시프트 등록 요청 모델."""
@@ -62,6 +72,16 @@ class ShiftAddRequest(BaseModel):
     # id: int
     # 추가 내역
     show_in_preference: Optional[bool] = False # 기본 False, 프론트에서 안 보내면 자동 숨김
+    
+    @field_validator('shift_id', 'shift_gb', 'name', mode='before')
+    @classmethod
+    def strip_shift_codes(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            cleaned = v.strip()
+            return cleaned if cleaned else None
+        return v
 
 class RosterRequest(BaseModel):
     """근무표 생성 요청(임시: UI 미구현 상태에서 req로 정책 파라미터를 주입하기 위한 모델).
