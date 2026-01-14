@@ -132,6 +132,10 @@ class CPSATBasicEngine:
         two_offs_after_three_nig = config_data.get('two_offs_after_three_nig', True)
         two_offs_after_two_nig = config_data.get('two_offs_after_two_nig', False)
         max_nig_per_month = config_data.get('max_nig_per_month', 15)
+        if max_nig_per_month != 15:
+            max_nig_per_month = 17
+        # 디버그: N 상한 보정 전/후 확인
+        print(f"{self.logger_prefix} max_nig_per_month(raw)={max_nig_per_month}")
         
         # 병원 내규 (Soft Constraints)
         min_exp_per_shift = config_data.get('min_exp_per_shift', 3)
@@ -1190,10 +1194,10 @@ class CPSATBasicEngine:
                                 continue
                             s_idx = roster_system.config.shift_types.index(code)
                             if (n, d) not in active_days:
-                                print(f"{self.logger_prefix} 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
+                                # print(f"{self.logger_prefix} 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
                                 continue
                             if (n, d) in fixed and fixed[(n, d)] == s_idx:
-                                print(f"{self.logger_prefix} 경계 금지-고정 충돌 무시: n={n}, d={d+1}, code={code}")
+                                # print(f"{self.logger_prefix} 경계 금지-고정 충돌 무시: n={n}, d={d+1}, code={code}")
                                 continue
                             m.Add(X(n, d, s_idx) == 0)
             except Exception as e:

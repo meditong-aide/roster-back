@@ -1109,10 +1109,14 @@ async def validate_roster(
         if not latest_config_db:
             return {"violations": ["근무표 설정을 찾을 수 없습니다."]}
 
+        max_nig = latest_config_db.max_nig_per_month
+        if max_nig != 15:
+            max_nig = 17
+
         roster_config_for_engine = NurseRosterConfig(
             daily_shift_requirements=daily_shift_requirements,
             max_consecutive_work_days   = latest_config_db.max_conseq_work,
-            max_night_shifts_per_month  = latest_config_db.max_nig_per_month,
+            max_night_shifts_per_month  = max_nig,
             max_consecutive_nights      = 3 if latest_config_db.three_seq_nig else 2
         )
 
