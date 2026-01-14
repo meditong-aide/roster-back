@@ -5,13 +5,17 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 """
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from db.models import Wanted, Nurse, ShiftPreference, Shift, Group
+from db.models import Wanted, Nurse, ShiftPreference, Shift, Group, WeeklyOffSetting
 from schemas.roster_schema import WantedInvokeRequest, WantedDeadlineRequest
 from schemas.auth_schema import User as UserSchema
 from datetime import datetime, date, timedelta
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Set
 from db.models import WantedRequest, NurseShiftRequest, NursePairRequest
 from services.graph_service import graph_service
+from services.weekly_off_service import (
+    calc_weekly_off_weekday_by_month,
+    calc_weekly_off_weekday_by_week,
+)
 from dateutil.relativedelta import relativedelta
 from utils.utils import send_wanted_request_push
 import traceback
@@ -122,6 +126,83 @@ def _next_detailed_request_id(db: Session, nurse_id: str, request_id: int, *, ta
     next_id = max_id + 1
     print(f"[{table}] 다음 detailed_request_id 계산: request_id={request_id} → {next_id}")
     return next_id
+
+
+def _compute_weekly_off_days(
+    db: Session,
+    nurse_id: str,
+    group_id: str | None,
+    year: int,
+    month: int,
+) -> Set[int]:
+    """주휴 사용 간호사의 주휴 일자(day set)를 계산합니다.
+
+    인자:
+        db: DB 세션
+        nurse_id: 간호사 ID
+        group_id: 그룹 ID (주휴 설정 조회용)
+        year: 대상 연도
+        month: 대상 월
+
+    반환:
+        주휴 요일에 해당하는 day 집합(1~31). 예: {3, 10, 17, 24}
+    """
+    nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    if not nurse_row or not getattr(nurse_row, "weekly_off_enabled", False) or nurse_row.weekly_off_weekday is None:
+        return set()
+
+    setting = None
+    if group_id:
+        setting = db.query(WeeklyOffSetting).filter(WeeklyOffSetting.group_id == group_id).first()
+
+    preview_weekday = nurse_row.weekly_off_weekday
+    if setting and setting.use_variable_cycle:
+        if setting.cycle_type == "month" and setting.base_year and setting.base_month:
+            preview_weekday = calc_weekly_off_weekday_by_month(
+                base_weekday=nurse_row.weekly_off_weekday,
+                shift_variation=setting.shift_variation,
+                base_year=setting.base_year,
+                base_month=setting.base_month,
+                target_year=year,
+                target_month=month,
+            )
+        elif setting.cycle_type == "week" and setting.cycle_start_date:
+            target_date = date(year, month, 1)
+            preview_weekday = calc_weekly_off_weekday_by_week(
+                base_weekday=nurse_row.weekly_off_weekday,
+                shift_variation=setting.shift_variation,
+                cycle_start_date=setting.cycle_start_date,
+                target_date=target_date,
+                cycle_interval_weeks=setting.cycle_interval,
+            )
+
+    weekly_off_days: Set[int] = set()
+    current = date(year, month, 1)
+    while current.month == month:
+        if current.weekday() == preview_weekday:
+            weekly_off_days.add(current.day)
+        current += timedelta(days=1)
+
+    return weekly_off_days
+
+
+def _drop_weekly_off_from_shift_map(
+    shift_map: Dict[str, Dict[int, Dict[str, Any]]],
+    weekly_off_days: Set[int],
+) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    """주휴일과 겹치는 shift_map 엔트리를 제거합니다."""
+    if not weekly_off_days or not shift_map:
+        return shift_map
+
+    for shift_code, days_map in list(shift_map.items()):
+        for day in list(days_map.keys()):
+            if day in weekly_off_days:
+                print(f"[weekly_off 필터] {day}일 {shift_code} → 주휴로 제거")
+                del days_map[day]
+        if not days_map:
+            del shift_map[shift_code]
+
+    return shift_map
 
 
 def _persist_shift_results(
@@ -720,6 +801,33 @@ async def invoke_and_persist_wanted_service(
 
     # 최종 shift_map 로그 (디버깅용)
     print(f"최종 shift_map: {shift_map}")
+
+    # 주휴 필터링: weekly_off_enabled 간호사의 주휴일에 겹치는 희망 근무 제거
+    weekly_off_days = _compute_weekly_off_days(
+        db=db,
+        nurse_id=nurse_id,
+        group_id=current_user.group_id,
+        year=req.year,
+        month=req.month,
+    )
+    shift_map = _drop_weekly_off_from_shift_map(shift_map, weekly_off_days)
+
+    # 주휴와 겹치는 기존 복사본(이미 DB에 올라간 행)도 제거
+    if weekly_off_days:
+        deleted_weekly_off = (
+            db.query(NurseShiftRequest)
+            .filter(
+                NurseShiftRequest.nurse_id == nurse_id,
+                NurseShiftRequest.request_id == new_request_id,
+                NurseShiftRequest.shift_date.in_(
+                    [_ymd(req.year, req.month, d) for d in weekly_off_days]
+                ),
+            )
+            .delete(synchronize_session=False)
+        )
+        if deleted_weekly_off:
+            print(f"[weekly_off 삭제] DB 기존 복사본 {deleted_weekly_off}건 제거")
+
     # 저장
     if shift_map:
         _persist_shift_results(
