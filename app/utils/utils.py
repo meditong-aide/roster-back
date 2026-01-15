@@ -276,21 +276,23 @@ def send_wanted_request_push(
     if not recipients:
         return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
 
-    deadline_text = (
-        f" (마감 {deadline.strftime('%Y-%m-%d')})" if deadline else ""
-    )
+    if deadline:
+        deadline_text = f" (마감 {deadline.strftime('%Y-%m-%d')})"
+        deadline_part = f"{deadline.strftime('%m')}월 {deadline.strftime('%d')}일 까지"
+    else:
+        deadline_text = ""
+        deadline_part = "마감일 없음"
+
     print('deadline : ', deadline)
+    
     receive_emp_seq_no = ",".join(map(str, recipients))
     push_code = "P30"
     push_sub_code = "S02"
-    month_deadline = deadline.strftime('%m') if deadline else ""
-    day_deadline = deadline.strftime('%d') if deadline else ""
+    
     push_message = (
-        f"{year}년 {month}월 원티드 요청 ({month_deadline}월 {day_deadline}일 까지)"
+        f"{year}년 {month}월 원티드 요청 ({deadline_part})"
     )
-    org_push_message = (
-        f"{year}년 {month}월 원티드 요청 ({month_deadline}월 {day_deadline}일 까지)"
-    )
+    org_push_message = push_message
 
     return set_app_push(
         pushCode=push_code,
