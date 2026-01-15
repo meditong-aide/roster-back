@@ -48,7 +48,8 @@ async def request_wanted_shifts(
             raise HTTPException(status_code=403, detail="Group does not belong to your office")
         override_gid = g.group_id
     try:
-        return request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
+        result = request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Wanted 작성 요청 실패: {str(e)}")
 
@@ -254,10 +255,22 @@ async def update_wanted_deadline(
     if wanted.status == 'closed':
         raise HTTPException(status_code=400, detail="마감된 wanted 요청의 마감일은 변경할 수 없습니다.")
     
-    wanted.exp_date = req.exp_date
-    db.commit()
+    payload = req.model_dump(exclude_unset=True)
+    if "exp_date" in payload:
+        wanted.exp_date = req.exp_date
+        db.commit()
+        db.refresh(wanted)
+        message = "마감일이 제거되었습니다. (마감일 없음)" if req.exp_date is None else "마감일이 성공적으로 변경되었습니다."
+    else:
+        message = "마감일 변경 요청이 없어 기존 값이 유지됩니다."
     
-    return {"message": "마감일이 성공적으로 변경되었습니다."}
+    display_exp_date = "마감일 없음" if wanted.exp_date is None else wanted.exp_date.strftime("%Y-%m-%d")
+    
+    return {
+        "message": message,
+        "current_exp_date": wanted.exp_date.isoformat() if wanted.exp_date else None,
+        "display_exp_date": display_exp_date
+    }
 
 
 # @router.post("/invoke", response_model=WantedInvokeResponse)

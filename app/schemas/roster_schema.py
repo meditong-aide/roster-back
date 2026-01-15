@@ -10,7 +10,11 @@ class ShiftManageSaveRequest(BaseModel):
 class WantedDeadlineRequest(BaseModel):
     year: int
     month: int
-    exp_date: Optional[datetime] = None
+    # exp_date: Optional[datetime] = None
+    exp_date: Optional[datetime] = Field(
+        None,
+        description="마감일 (선택). null 또는 생략 시 '마감일 없음'으로 처리됩니다."
+    )
 
 class MoveShiftRequest(BaseModel):
     """시프트 순서 이동 요청 모델."""

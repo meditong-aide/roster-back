@@ -896,7 +896,14 @@ def request_wanted_shifts_service(
         sender_member_id=current_user.account_id,
         deadline=req.exp_date,
     )
-    return {"message": "Wanted 작성 요청이 성공적으로 생성되었습니다."}
+    
+    display_exp_date = "마감일 없음" if new_wanted.exp_date is None else new_wanted.exp_date.strftime("%Y-%m-%d")
+    
+    return {
+        "message": "Wanted 작성 요청이 성공적으로 생성되었습니다.",
+        "current_exp_date": new_wanted.exp_date.isoformat() if new_wanted.exp_date else None,
+        "display_exp_date": display_exp_date
+    }
 
 def close_expired_wanted(db: Session) -> int:
     """
