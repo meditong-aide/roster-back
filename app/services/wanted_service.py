@@ -3,23 +3,35 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 - DB 쿼리, 데이터 가공 등 라우터에서 분리
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
-from sqlalchemy.orm import Session
+import json
+import traceback
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Set, Tuple
+
+from dateutil.relativedelta import relativedelta
 from sqlalchemy import func
-from db.models import Wanted, Nurse, ShiftPreference, Shift, Group, WeeklyOffSetting
-from schemas.roster_schema import WantedInvokeRequest, WantedDeadlineRequest
+from sqlalchemy.orm import Session
+
+from db.models import (
+    Group,
+    Nurse,
+    NursePairRequest,
+    NurseShiftRequest,
+    Shift,
+    ShiftPreference,
+    Wanted,
+    WantedRequest,
+    WeeklyOffSetting,
+)
 from schemas.auth_schema import User as UserSchema
-from datetime import datetime, date, timedelta
-from typing import Dict, Any, List, Tuple, Set
-from db.models import WantedRequest, NurseShiftRequest, NursePairRequest
+from schemas.roster_schema import WantedDeadlineRequest, WantedInvokeRequest
 from services.graph_service import graph_service
 from services.weekly_off_service import (
     calc_weekly_off_weekday_by_month,
     calc_weekly_off_weekday_by_week,
 )
-from dateutil.relativedelta import relativedelta
 from utils.utils import send_wanted_request_push
-import traceback
-from collections import defaultdict
 
 def _yyyymm(year: int, month: int) -> str:
     """연/월을 'YYYY-MM' 문자열로 변환합니다.
@@ -203,6 +215,125 @@ def _drop_weekly_off_from_shift_map(
             del shift_map[shift_code]
 
     return shift_map
+
+
+def _parse_case_date(
+    date_value: Any,
+    req_year: int,
+    req_month: int,
+    override_year: int | None = None,
+    override_month: int | None = None,
+) -> date | None:
+    """case 항목의 날짜를 현재 요청 연/월 기준으로 파싱합니다.
+
+    인자:
+        date_value: 원본 날짜 값(YYYY-MM-DD/일자/숫자 등)
+        req_year: 요청 연도
+        req_month: 요청 월
+        override_year: case가 제공하는 연도(없으면 요청 연도 사용)
+        override_month: case가 제공하는 월(없으면 요청 월 사용)
+
+    반환:
+        요청 연/월과 일치하는 date 객체 또는 None.
+        예: req_year=2025, req_month=9, date_value='2025-09-26' → date(2025, 9, 26)
+    """
+    target_year = override_year or req_year
+    target_month = override_month or req_month
+
+    parsed: date | None = None
+
+    if isinstance(date_value, date):
+        parsed = date_value
+    elif isinstance(date_value, str):
+        try:
+            parsed = datetime.strptime(date_value, "%Y-%m-%d").date()
+        except Exception:
+            if date_value.isdigit():
+                try:
+                    parsed = date(req_year, req_month, int(date_value))
+                except Exception:
+                    parsed = None
+    elif isinstance(date_value, int):
+        try:
+            parsed = date(req_year, req_month, int(date_value))
+        except Exception:
+            parsed = None
+
+    if not parsed:
+        return None
+
+    if parsed.year != target_year or parsed.month != target_month:
+        return None
+
+    return parsed
+
+
+def _normalize_case_items(
+    case_raw: Any,
+    req_year: int,
+    req_month: int,
+    allowed_shift_map: Dict[str, str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """case 목록을 현재 요청 연/월에 맞춰 정규화합니다.
+
+    인자:
+        case_raw: 원본 case 목록
+        req_year: 요청 연도
+        req_month: 요청 월
+        allowed_shift_map: 허용되는 근무 코드 맵
+
+    반환:
+        (normalized, ignored) 튜플.
+        normalized: {'date': date, 'shift': str} 리스트
+        ignored: 무시된 항목 로그 리스트
+    """
+    normalized: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+    allowed_shifts = set(allowed_shift_map.keys()) if allowed_shift_map else None
+
+    for item in case_raw or []:
+        try:
+            payload = item.dict() if hasattr(item, "dict") else dict(item)
+        except Exception:
+            try:
+                payload = item.__dict__
+            except Exception:
+                ignored.append({"reason": "형식 오류", "item": str(item)})
+                continue
+
+        shift_raw = payload.get("shift")
+        date_raw = payload.get("date")
+        item_year = payload.get("year")
+        item_month = payload.get("month")
+
+        if not shift_raw:
+            ignored.append({"reason": "shift 누락", "item": payload})
+            continue
+
+        shift = str(shift_raw).strip().upper()
+        if not shift:
+            ignored.append({"reason": "shift 공백", "item": payload})
+            continue
+
+        if allowed_shifts and shift not in allowed_shifts:
+            ignored.append({"reason": "허용되지 않는 shift", "item": payload})
+            continue
+
+        parsed_date = _parse_case_date(
+            date_value=date_raw,
+            req_year=req_year,
+            req_month=req_month,
+            override_year=item_year,
+            override_month=item_month,
+        )
+
+        if not parsed_date:
+            ignored.append({"reason": "날짜 불일치/파싱 실패", "item": payload})
+            continue
+
+        normalized.append({"date": parsed_date, "shift": shift})
+
+    return normalized, ignored
 
 
 def _persist_shift_results(
@@ -573,6 +704,20 @@ async def invoke_and_persist_wanted_service(
     allowed_shifts_str = ", ".join(allowed_shift_map.keys()) if allowed_shift_map else "없음"
     print(f"허용 근무 코드: {allowed_shifts_str}")
 
+    normalized_case, ignored_case = _normalize_case_items(
+        case_raw=req.case,
+        req_year=req.year,
+        req_month=req.month,
+        allowed_shift_map=allowed_shift_map,
+    )
+    has_case = bool(normalized_case)
+    if ignored_case:
+        print(f"[case 경고] 현재 월/연도와 불일치하거나 파싱 실패한 항목 {len(ignored_case)}건 무시됨")
+    graph_case_payload = [
+        {"date": item["date"].isoformat(), "shift": item["shift"]}
+        for item in normalized_case
+    ]
+
     # # 중복 방지
     # recent_duplicate = db.query(WantedRequest).filter(
     #     WantedRequest.nurse_id == nurse_id,
@@ -591,7 +736,6 @@ async def invoke_and_persist_wanted_service(
     #     }
 
     # case 확인 및 자동 로드
-    has_case = (req.case is not None and len(req.case) > 0) or (''.join(req.request) is "" and ''.join(req.case) is "")
     print(f"has_case: {has_case}")
 
     if not has_case:
@@ -622,10 +766,26 @@ async def invoke_and_persist_wanted_service(
             ).all()
             
             req.case = [
-                {"date": str(row.shift_date), "shift": row.shift}
+                {
+                    "date": str(row.shift_date),
+                    "shift": row.shift,
+                    "year": row.shift_date.year,
+                    "month": row.shift_date.month,
+                }
                 for row in shift_rows
             ]
-            has_case = True
+            normalized_case, ignored_auto_case = _normalize_case_items(
+                case_raw=req.case,
+                req_year=req.year,
+                req_month=req.month,
+                allowed_shift_map=allowed_shift_map,
+            )
+            ignored_case.extend(ignored_auto_case)
+            has_case = bool(normalized_case)
+            graph_case_payload = [
+                {"date": item["date"].isoformat(), "shift": item["shift"]}
+                for item in normalized_case
+            ]
             print(f"자동 case 생성 완료 ({len(req.case)}건)")
         else:
             print("이번 달에 제출된 데이터 없음 → case 자동 생성 포기")
@@ -650,7 +810,7 @@ async def invoke_and_persist_wanted_service(
             raw_response = await graph_service.invoke(
                 request=req.request,
                 schema=req.schema,
-                case=req.case,
+                case=graph_case_payload,
                 year=req.year,
                 month=req.month,
                 allowed_shifts=allowed_shifts_str,
@@ -698,18 +858,10 @@ async def invoke_and_persist_wanted_service(
     case_filter: set[tuple[int, str]] | None = None
     if has_case:
         case_filter = set()
-        for item in req.case or []:
-            try:
-                date_str = item.get("date")
-                shift_type = item.get("shift")
-                if not date_str or not shift_type:
-                    continue
-                day = int(str(date_str).split("-")[2]) if "-" in str(date_str) else int(date_str)
-                if not 1 <= day <= 31:
-                    continue
-                case_filter.add((day, str(shift_type)))
-            except Exception:
-                continue
+        for item in normalized_case:
+            target_date: date = item["date"]
+            shift_type = item["shift"]
+            case_filter.add((target_date.day, shift_type))
 
     if latest_wr:
         print(
@@ -746,24 +898,10 @@ async def invoke_and_persist_wanted_service(
     # 1. case 병합 (score 1.0 고정 + 사용자 직접 선택 플래그)
     if has_case:
         print("case 병합 시작")
-        for item in req.case or []:
-            print('item!!', item)
-            date_str = item.get('date')
-            shift_type = item.get('shift')
-            if not date_str or not shift_type:
-                continue
-            try:
-                # 날짜 파싱 (YYYY-MM-DD 또는 단순 일자 모두 허용)
-                if '-' in str(date_str):
-                    day = int(str(date_str).split('-')[2])
-                else:
-                    day = int(date_str)
-                if not 1 <= day <= 31:
-                    continue
-            except:
-                continue
-
-            target_date = _ymd(req.year, req.month, day)
+        for item in normalized_case:
+            target_date: date = item["date"]
+            day = target_date.day
+            shift_type = item["shift"]
             # 기존 복사/LLM 데이터가 있으면 덮어쓰지 않고 유지
             if (target_date, shift_type) in existing_index:
                 print(f"[case 스킵] 기존 데이터 유지: {shift_type} {day}일 (partial_request 보존)")

@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, field_validator, ValidationInfo, EmailStr
 from typing import List, Dict, Any, Optional, Literal
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 class ShiftManageSaveRequest(BaseModel):
@@ -103,10 +103,27 @@ class PublishRequest(BaseModel):
     schedule_id: str
     issue_comment: str = None
 
+
+class CaseItem(BaseModel):
+    """Wanted case 항목 스키마입니다.
+
+    날짜는 YYYY-MM-DD 문자열 또는 date로 받으며,
+    year/month가 함께 들어오면 월 검증에 활용합니다.
+    """
+
+    date: date | int | str
+    shift: str
+    year: int | None = None
+    month: int | None = None
+
+    class Config:
+        extra = "allow"
+
+
 class WantedInvokeRequest(BaseModel):
     request: str | List[str] | None = None
     schema: List[Dict[str, Any]]
-    case: object | None = None
+    case: List[CaseItem | Dict[str, Any]] | None = None
     year: int
     month: int
 
