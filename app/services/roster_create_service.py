@@ -1786,6 +1786,55 @@ def _validate_generated_roster(
     if total_cells > 0 and work_ratio < 0.1:
         return "근무 배정률이 10% 미만이어서 스케줄을 저장하지 않습니다."
 
+    # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
+    try:
+        cfg = getattr(roster_system, "config", None)
+        num_days = getattr(roster_system, "num_days", 0) or 0
+        shift_types = list(getattr(cfg, "shift_types", []) or [])
+        off_alias = {"-", "O", "OFF", "주"}
+
+        def _required_by_day(day_idx: int) -> dict[str, int]:
+            if isinstance(getattr(cfg, "daily_shift_requirements_by_day", None), list):
+                by_day = cfg.daily_shift_requirements_by_day
+                if day_idx < len(by_day) and isinstance(by_day[day_idx], dict):
+                    return {str(k).upper(): int(v or 0) for k, v in by_day[day_idx].items()}
+            if isinstance(getattr(cfg, "daily_shift_requirements", None), dict):
+                return {str(k).upper(): int(v or 0) for k, v in cfg.daily_shift_requirements.items()}
+            return {}
+
+        if cfg and shift_types and generated:
+            for d in range(num_days):
+                req_raw = _required_by_day(d)
+                req = {
+                    k: v
+                    for k, v in req_raw.items()
+                    if k in shift_types and k not in {"O"}
+                }
+                total_req = sum(req.values())
+                if total_req <= 0:
+                    continue
+
+                actual = {k: 0 for k in req}
+                for shifts in generated.values():
+                    if not isinstance(shifts, list) or d >= len(shifts):
+                        continue
+                    code = str(shifts[d]).strip().upper() if shifts[d] is not None else "-"
+                    if code == "주":
+                        code = "O"
+                    if code in actual:
+                        actual[code] += 1
+
+                total_actual = sum(actual.values())
+                if total_actual == 0:
+                    req_msg = ", ".join(f"{k}={v}" for k, v in req.items())
+                    return (
+                        f"{d + 1}일에 필수 근무 인원이 모두 미배정되었습니다. "
+                        f"(요구 인원: {req_msg})"
+                    )
+    except Exception:
+        # 검증 로직이 실패해도 저장을 막지 않고, 기존 최소 검증 결과만 사용
+        pass
+
     return None
 
 
