@@ -1087,11 +1087,9 @@ class CPSATBasicEngine:
                             m.Add(X(n, d, off_idx) == 1)
                         else:
                             # 평일(월~금): OFF 금지(D/E/N만 가능)
+                            # 단, 사용자 고정 OFF는 예외로 허용하고 별도 제약을 걸지 않는다.
                             if (n, d) in fixed and fixed[(n, d)] == off_idx:
-                                raise ValueError(
-                                    f"주말 휴무 대상 간호사는 평일에 휴무를 받을 수 없습니다. "
-                                    f"nurse_index={n}, day={d+1}"
-                                )
+                                continue
                             m.Add(X(n, d, off_idx) == 0)
 
             off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
@@ -2957,11 +2955,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     m.Add(X(n, d, off) == 1)
                 else:
                     # 평일(월~금): OFF 금지(D/E/N만 가능)
+                    # 사용자 고정 OFF는 예외로 허용
                     if (n, d) in fixed and fixed[(n, d)] == off:
-                        raise ValueError(
-                            f"주말 휴무 대상 간호사는 평일에 휴무를 받을 수 없습니다. "
-                            f"nurse_index={n}, day={d+1}"
-                        )
+                        continue
                     m.Add(X(n, d, off) == 0)
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):
