@@ -99,7 +99,9 @@ def _persist_wanted_request(db: Session, nurse_id: str, month_str: str, request:
     #     request_text = clean_text(request)
 
     # print(f"[DEBUG] 저장할 request_text (repr): {repr(request_text)}")
-    request_text = ''.join(request)
+    request_text = ''.join(request) if isinstance(request, list) else request
+    request_text = request_text.strip()
+    
     wr = WantedRequest(
         nurse_id=nurse_id,
         request_id=request_id,
@@ -259,10 +261,7 @@ def _parse_case_date(
         except Exception:
             parsed = None
 
-    if not parsed:
-        return None
-
-    if parsed.year != target_year or parsed.month != target_month:
+    if not parsed or parsed.year != target_year or parsed.month != target_month:
         return None
 
     return parsed
@@ -295,11 +294,8 @@ def _normalize_case_items(
         try:
             payload = item.dict() if hasattr(item, "dict") else dict(item)
         except Exception:
-            try:
-                payload = item.__dict__
-            except Exception:
-                ignored.append({"reason": "형식 오류", "item": str(item)})
-                continue
+            ignored.append({"reason": "형식 오류", "item": str(item)})
+            continue
 
         shift_raw = payload.get("shift")
         date_raw = payload.get("date")
@@ -311,11 +307,7 @@ def _normalize_case_items(
             continue
 
         shift = str(shift_raw).strip().upper()
-        if not shift:
-            ignored.append({"reason": "shift 공백", "item": payload})
-            continue
-
-        if allowed_shifts and shift not in allowed_shifts:
+        if not shift or (allowed_shifts and shift not in allowed_shifts):
             ignored.append({"reason": "허용되지 않는 shift", "item": payload})
             continue
 
@@ -355,18 +347,16 @@ def _persist_shift_results(
     for shift_code, by_day in (shift_map or {}).items():
         for day, info in (by_day or {}).items():
             if not isinstance(day, int) or not 1 <= day <= 31:
-                print(f"잘못된 day 값 무시됨: {day}")
                 continue
 
             score = float(info.get("score", 1.0))
-            score = max(0.0, min(5.0, score))  # 범위 제한 재확인
+            score = max(0.0, min(10.0, score))  # case 우선순위 반영 위해 범위 확대
 
             request_val = info.get("request", original_request or "AIDE 추천")
             partial_request = normalize_request_text(request_val)
 
             target_date = _ymd(year, month, day)
 
-            # 이미 존재하는 레코드 → UPDATE
             existing = db.query(NurseShiftRequest).filter(
                 NurseShiftRequest.nurse_id == nurse_id,
                 NurseShiftRequest.request_id == request_id,
@@ -374,7 +364,6 @@ def _persist_shift_results(
             ).first()
 
             if existing:
-                print(f"기존 레코드 업데이트: {shift_code} {day}일")
                 existing.shift = shift_code
                 existing.score = score
                 existing.partial_request = partial_request
@@ -389,15 +378,10 @@ def _persist_shift_results(
                     partial_request=partial_request,
                 ))
                 detailed_id += 1
-
             rows += 1
 
-    try:
-        db.flush()
-        print(f"[FLUSH] shift {rows}건 flush 완료")
-    except Exception as e:
-        print(f"[ERROR] shift 저장 중 flush 실패: {str(e)}")
-        raise
+    db.flush()
+    print(f"[shift 저장] {rows}건 flush 완료")
 
 
 def _persist_pair_results(
@@ -419,39 +403,31 @@ def _persist_pair_results(
         detailed_request_id는 기존 데이터 다음 순번부터 시작
     """
     # 중복 누적 방지: 동일 nurse_id + request_id 레코드를 먼저 삭제
-    deleted = db.query(NursePairRequest).filter(
+    db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id == request_id,
     ).delete()
-    if deleted:
-        print(f"[pair] 기존 레코드 {deleted}건 삭제 후 재삽입")
 
     detailed_id = 1
-    rows = 0
     for item in pairs or []:
-        try:
-            target_id = item.get("id") if item.get("id") is not None else None
-            weight = float(item.get("weight")) if item.get("weight") is not None else None
-            request = item.get("request")
-        except Exception as e:
-            print(f'pair 데이터 파싱 오류: {e}')
-            continue
+        target_id = item.get("id")
+        weight = item.get("weight")
+        request_text = item.get("request")
         if target_id is None or weight is None:
             continue
-        row = NursePairRequest(
+
+        db.add(NursePairRequest(
             nurse_id=nurse_id,
             request_id=request_id,
             detailed_request_id=detailed_id,
-            target_id=target_id,
-            score=weight,
-            partial_request=request,
-        )
-        db.add(row)
-        rows += 1
+            target_id=str(target_id),
+            score=float(weight),
+            partial_request=normalize_request_text(request_text),
+        ))
         detailed_id += 1
-    
+
     db.commit()
-    print(f"nurse_pair_requests 저장 완료: 시작 detailed_request_id={1 if rows else 0}, 종료={detailed_id - 1 if rows else 0}, 저장 rows={rows}")
+    print(f"[pair 저장] {detailed_id-1}건 완료")
 
 
 def _parse_shift_results(
@@ -463,19 +439,12 @@ def _parse_shift_results(
     - 같은 날짜 + 같은 shift만 중복으로 간주하고 하나만 남김
     """
     parsed: Dict[str, Dict[int, Dict[str, Any]]] = {}
-    seen_per_day: Dict[int, Set[str]] = defaultdict(set)  # day → 이미 본 shift 집합
+    seen_per_day: Dict[int, Set[str]] = defaultdict(set)
 
     for sub in response:
-        if not isinstance(sub, list):
-            continue
-
         for entry in sub:
             shift_results = entry.get("shift_result", [])
-            if not isinstance(shift_results, list):
-                continue
-
             for sr in shift_results:
-                # result 키가 있으면 그 안으로, 없으면 그대로 사용
                 record = sr.get("result", sr) if isinstance(sr, dict) else sr
                 if not isinstance(record, dict) or "shift" not in record:
                     continue
@@ -488,46 +457,26 @@ def _parse_shift_results(
                 scores = record.get("score", [])
                 requests = record.get("request", [""]) * len(dates)
 
-                for i in range(min(len(dates), len(scores))):
+                for i, day_str in enumerate(dates):
                     try:
-                        day = int(dates[i])
+                        day = int(day_str)
                         if not 1 <= day <= 31:
                             continue
-                    except (ValueError, TypeError):
+                    except:
                         continue
+
+                    if shift in seen_per_day.get(day, set()):
+                        continue
+                    seen_per_day[day].add(shift)
 
                     score = float(scores[i]) if i < len(scores) else 1.0
                     req = str(requests[i] if i < len(requests) else "").strip()
 
-                    # 중복 체크: 같은 날짜에 같은 shift가 이미 있으면 skip
-                    if day in seen_per_day and shift in seen_per_day[day]:
-                        print(f"[중복 제거] {day}일 {shift} 이미 처리됨 → skip")
-                        continue
-
-                    # 기록
-                    seen_per_day[day].add(shift)
-
-                    bucket = parsed.setdefault(shift, {})
-                    # 같은 날짜에 이미 다른 shift가 있으면 경고 로그만 남김 (덮어쓰지 않음)
-                    if day in bucket:
-                        existing_shift = bucket[day].get("shift", "알수없음")
-                        print(f"[경고] {day}일에 이미 {existing_shift} 존재 → 새 shift {shift} 추가됨")
-
-                    bucket[day] = {
+                    parsed.setdefault(shift, {})[day] = {
                         "score": score,
                         "request": normalize_request_text(req),
-                        # shift 정보도 명시적으로 저장 (디버깅/나중 사용 편의)
                         "shift": shift
                     }
-                    print("[DEBUG] raw shift_result:", response)
-
-    # 디버깅용: 최종 파싱 결과 로그
-    if parsed:
-        print("[parse_shift_results 완료] 파싱된 shift 데이터:")
-        for shift, days in parsed.items():
-            print(f"  {shift}: {list(days.keys())}일")
-    else:
-        print("[parse_shift_results] 파싱 결과가 비어있음")
 
     return parsed
 
@@ -540,28 +489,25 @@ def _parse_preferences(response: List[List[Dict[str, Any]]], schema=None) -> Lis
     valid_ids = {str(n['nurse_id']) for n in (schema or []) if 'nurse_id' in n} if schema else None
 
     for sub in response:
-        if not isinstance(sub, list):
-            continue
         for entry in sub:
             pref_list = entry.get("preference_result", [])
             for pr in pref_list if isinstance(pref_list, list) else []:
-                _id = pr.get("id")
+                _id = str(pr.get("id"))
                 weight = pr.get("weight")
                 req = pr.get("request")
-                if _id is None or weight is None:
+                if _id == "None" or weight is None:
                     continue
-                _id_str = str(_id)
-                if valid_ids and _id_str not in valid_ids:
+                if valid_ids and _id not in valid_ids:
                     continue
                 try:
                     w = float(weight)
-                    key = (_id_str, w, req)
+                    key = (_id, w, req)
                     if key in seen:
                         continue
                     seen.add(key)
-                    parsed.append({"id": _id_str, "weight": w, "request": normalize_request_text(req)})
-                except Exception as e:
-                    print(f"preference 파싱 오류: {e}")
+                    parsed.append({"id": _id, "weight": w, "request": normalize_request_text(req)})
+                except:
+                    pass
     return parsed
 
 
@@ -573,15 +519,32 @@ def _copy_existing_requests_to_new(
     year: int,
     month: int,
     month_str: str,
-    case_filter: set = None,
+    case_filter: set | None = None,
 ) -> Tuple[int, int]:
-    """기존 데이터를 새 request_id로 복사 (필요 시 case_filter 적용)"""
-    start = datetime.strptime(month_str, "%Y-%m")
-    end = start + relativedelta(months=1)
+    """기존 데이터를 새 request_id로 복사 (필요 시 case_filter 적용)
+
+    Args:
+        db: DB 세션
+        nurse_id: 간호사 ID
+        old_request_id: 복사할 원본 request_id
+        new_request_id: 복사 대상 request_id
+        year, month, month_str: 대상 연월
+        case_filter: {(day, shift), ...} 형태의 set. 이 조합에 해당하는 것만 복사
+
+    Returns:
+        (복사된 shift 건수, 복사된 pair 건수)
+    """
+    # 이번 달 시작일과 다음 달 1일 계산 (12월 넘김 처리 포함)
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1)
+    else:
+        end = date(year, month + 1, 1)
 
     shift_count = 0
-    detailed_id = 1
+    detailed_id_shift = 1
 
+    # shift 데이터 복사
     old_shift_rows = db.query(NurseShiftRequest).filter(
         NurseShiftRequest.nurse_id == nurse_id,
         NurseShiftRequest.request_id == old_request_id,
@@ -592,57 +555,58 @@ def _copy_existing_requests_to_new(
     for old_row in old_shift_rows:
         day = old_row.shift_date.day
         shift = old_row.shift
+
+        # case_filter가 있으면 해당 (day, shift) 조합만 복사
         if case_filter is not None and (day, shift) not in case_filter:
             continue
 
-        new_row = NurseShiftRequest(
+        db.merge(NurseShiftRequest(
             nurse_id=nurse_id,
             request_id=new_request_id,
-            detailed_request_id=detailed_id,
+            detailed_request_id=detailed_id_shift,
             shift_date=old_row.shift_date,
             shift=shift,
             score=old_row.score,
             partial_request=old_row.partial_request,
-        )
-        db.merge(new_row)
+        ))
         shift_count += 1
-        detailed_id += 1
+        detailed_id_shift += 1
 
-    if shift_count > 0:
-        db.commit()
-        print(f"기존 shift 복사 완료: {shift_count}건")
-
-    # pair 복사
+    # pair 데이터 복사
     pair_count = 0
-    detailed_id = 1
+    detailed_id_pair = 1
+
     old_pair_rows = db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id == old_request_id,
     ).all()
 
     for old_row in old_pair_rows:
-        new_row = NursePairRequest(
+        db.merge(NursePairRequest(
             nurse_id=nurse_id,
             request_id=new_request_id,
-            detailed_request_id=detailed_id,
+            detailed_request_id=detailed_id_pair,
             target_id=old_row.target_id,
             score=old_row.score,
             partial_request=old_row.partial_request or '기존 데이터에서 로드됨',
-        )
-        db.merge(new_row)
+        ))
         pair_count += 1
-        detailed_id += 1
+        detailed_id_pair += 1
 
-    if pair_count > 0:
+    # 실제 변경이 있었다면 commit
+    if shift_count > 0 or pair_count > 0:
         db.commit()
-        print(f"기존 pair 복사 완료: {pair_count}건")
+        print(f"[복사 완료] shift: {shift_count}건, pair: {pair_count}건 "
+              f"(old_request_id={old_request_id} → new_request_id={new_request_id})")
+    else:
+        print("[복사 스킵] 복사할 데이터 없음")
 
     return shift_count, pair_count
 
 
 def normalize_request_text(value: Any) -> str:
     """입력값을 정리해서 반환"""
-    if value is None or value == '':
+    if not value:
         return '기존 데이터 업데이트'
 
     def clean(text: Any) -> str:
@@ -655,8 +619,7 @@ def normalize_request_text(value: Any) -> str:
     if isinstance(value, list):
         cleaned = [clean(v) for v in value if clean(v) and clean(v) != '기존 데이터에서 로드됨']
         return '\n'.join(cleaned) or '기존 데이터 업데이트'
-    else:
-        return clean(value) or '기존 데이터 업데이트'
+    return clean(value) or '기존 데이터 업데이트'
 
 
 def cleanup_previous_requests(db: Session, nurse_id: str, month_str: str, current_request_id: int):
@@ -685,25 +648,23 @@ async def invoke_and_persist_wanted_service(
 ) -> Dict[str, Any]:
     """
     Wanted 그래프 실행 후 DB 저장 + 응답 반환
-    - case 있으면 복사 스킵 (case에 과거 데이터 포함됨)
-    - 새 요청은 무조건 병합
+    주요 개선:
+    - case가 있으면 case 없는 날짜의 기존 shift 기록 삭제 → 잔여 이력 방지
+    - request가 '기존 데이터' 계열이면 복사 스킵
+    - case가 충분히 많으면 전체 재작성으로 간주
     """
-    print("그래프 실행 및 DB 저장 시작", req.__dict__)
-
     nurse_id = current_user.nurse_id
-    print('request:', req.__dict__)
     month_str = _yyyymm(req.year, req.month)
+    print(f"invoke_and_persist_wanted_service 시작: nurse={nurse_id}, {month_str}")
 
-    # 허용 근무코드
+    # 허용 근무코드 조회
     allowed_shifts_query = db.query(Shift.shift_id, Shift.name).filter(
         Shift.group_id == current_user.group_id,
         Shift.show_in_preference == True
     ).all()
-    
     allowed_shift_map = {row.shift_id: row.name for row in allowed_shifts_query}
-    allowed_shifts_str = ", ".join(allowed_shift_map.keys()) if allowed_shift_map else "없음"
-    print(f"허용 근무 코드: {allowed_shifts_str}")
 
+    # case 정규화
     normalized_case, ignored_case = _normalize_case_items(
         case_raw=req.case,
         req_year=req.year,
@@ -711,101 +672,33 @@ async def invoke_and_persist_wanted_service(
         allowed_shift_map=allowed_shift_map,
     )
     has_case = bool(normalized_case)
-    if ignored_case:
-        print(f"[case 경고] 현재 월/연도와 불일치하거나 파싱 실패한 항목 {len(ignored_case)}건 무시됨")
     graph_case_payload = [
         {"date": item["date"].isoformat(), "shift": item["shift"]}
         for item in normalized_case
     ]
 
-    # # 중복 방지
-    # recent_duplicate = db.query(WantedRequest).filter(
-    #     WantedRequest.nurse_id == nurse_id,
-    #     WantedRequest.month == month_str,
-    #     WantedRequest.request == normalize_request_text(req.request),
-    #     WantedRequest.created_at > datetime.now() - timedelta(seconds=30)
-    # ).order_by(WantedRequest.created_at.desc()).first()
-    
-    # if recent_duplicate:
-    #     print(f"중복 요청 감지 - 기존 request_id={recent_duplicate.request_id}")
-    #     return {
-    #         "message": "이미 저장 처리 중입니다.",
-    #         "request_id": recent_duplicate.request_id,
-    #         "shift": {},
-    #         "preference": []
-    #     }
+    # request 텍스트 정제 (더미 텍스트 감지용)
+    cleaned_request = normalize_request_text(req.request)
+    is_dummy_request = not cleaned_request.strip() or '기존 데이터' in cleaned_request
 
-    # case 확인 및 자동 로드
-    print(f"has_case: {has_case}")
+    # 전체 재작성 판단 (조건 강화)
+    days_in_month = 31  # 대략적
+    is_full_reset = (
+        has_case
+        and len(normalized_case) >= 10  # ← 10개 이상이면 전체 재작성으로 간주 (조정 가능)
+        and not is_dummy_request
+    )
 
-    if not has_case:
-        print("case 없음 → 과거 최신 데이터 자동 로드 시도")
-        latest_wr = (
-            db.query(WantedRequest)
-            .filter(
-                WantedRequest.nurse_id == nurse_id,
-                WantedRequest.month == month_str,
-                WantedRequest.is_submitted == True
-            )
-            .order_by(WantedRequest.created_at.desc())
-            .first()
-        )
-        
-        if latest_wr:
-            print(f"이번 달 제출된 과거 데이터 발견 (request_id={latest_wr.request_id}) → 자동 case 설정")
-            
-            # 날짜 범위 강제 제한 (다른 달 데이터 못 들어오게)
-            start_date = datetime.strptime(month_str + "-01", "%Y-%m-%d").date()
-            end_date = (start_date + relativedelta(months=1)).date()
-            
-            shift_rows = db.query(NurseShiftRequest).filter(
-                NurseShiftRequest.nurse_id == nurse_id,
-                NurseShiftRequest.request_id == latest_wr.request_id,
-                NurseShiftRequest.shift_date >= start_date,
-                NurseShiftRequest.shift_date < end_date
-            ).all()
-            
-            req.case = [
-                {
-                    "date": str(row.shift_date),
-                    "shift": row.shift,
-                    "year": row.shift_date.year,
-                    "month": row.shift_date.month,
-                }
-                for row in shift_rows
-            ]
-            normalized_case, ignored_auto_case = _normalize_case_items(
-                case_raw=req.case,
-                req_year=req.year,
-                req_month=req.month,
-                allowed_shift_map=allowed_shift_map,
-            )
-            ignored_case.extend(ignored_auto_case)
-            has_case = bool(normalized_case)
-            graph_case_payload = [
-                {"date": item["date"].isoformat(), "shift": item["shift"]}
-                for item in normalized_case
-            ]
-            print(f"자동 case 생성 완료 ({len(req.case)}건)")
-        else:
-            print("이번 달에 제출된 데이터 없음 → case 자동 생성 포기")
+    print(f"has_case={has_case}, case 건수={len(normalized_case)}, "
+          f"is_dummy_request={is_dummy_request}, is_full_reset={is_full_reset}")
 
     # 그래프 실행 여부
-    print('req.request!!', req.request)
-    should_run_graph = True
-    if isinstance(req.request, (list, str)):
-        cleaned = [str(r).strip() for r in (req.request if isinstance(req.request, list) else [req.request]) if str(r).strip()]
-        if not cleaned:
-            should_run_graph = False
-            print("request 입력 없음 → 그래프 스킵")
-
-    print(f"[DEBUG] should_run_graph: {should_run_graph}")
-
-    response = None
+    should_run_graph = not is_dummy_request
+    response = [[], []]
     shift_parsed = {}
+    pref_parsed = []
 
     if should_run_graph:
-        print("[DEBUG] 그래프 실행 시작")
         try:
             raw_response = await graph_service.invoke(
                 request=req.request,
@@ -813,190 +706,129 @@ async def invoke_and_persist_wanted_service(
                 case=graph_case_payload,
                 year=req.year,
                 month=req.month,
-                allowed_shifts=allowed_shifts_str,
+                allowed_shifts=", ".join(allowed_shift_map.keys()),
                 allowed_shift_map=allowed_shift_map
             )
+            if isinstance(raw_response, str):
+                raw_response = json.loads(raw_response)
+            response = raw_response if isinstance(raw_response, list) and len(raw_response) == 2 else [[], []]
+
+            shift_parsed = _parse_shift_results(response)
+            pref_parsed = _parse_preferences(response, req.schema)
         except Exception as e:
             print(f"그래프 호출 실패: {e}")
             traceback.print_exc()
-            raw_response = None
-
-        print(f"[FORCE] raw_response 타입: {type(raw_response)}")
-
-        if isinstance(raw_response, str):
-            try:
-                raw_response = json.loads(raw_response)
-                print("[FORCE] JSON 복구 성공")
-            except:
-                raw_response = [[], []]
-
-        response = raw_response if isinstance(raw_response, list) and len(raw_response) == 2 else [[], []]
-
-        try:
-            shift_parsed = _parse_shift_results(response)
-            print(f"[FORCE] shift_parsed: {shift_parsed}")
-        except Exception as e:
-            print(f"_parse_shift_results 실패: {e}")
-            shift_parsed = {}
-
-    else:
-        print("[DEBUG] 그래프 스킵 → 빈 결과")
-        response = [[], []]
 
     # 새 request_id 생성
     new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
-    print(f"new_request_id: {new_request_id}")
 
-    # 과거 데이터 복사 → case가 있어도 이전 LLM 결과를 초기값으로 가져옴
+    # 과거 데이터 복사 여부 결정
     copied_shift, copied_pair = 0, 0
-    latest_wr = db.query(WantedRequest).filter(
-        WantedRequest.nurse_id == nurse_id,
-        WantedRequest.month == month_str,
-    ).order_by(WantedRequest.created_at.desc()).offset(1).first()
+    if not is_full_reset and not is_dummy_request:
+        latest_wr = db.query(WantedRequest).filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+        ).order_by(WantedRequest.created_at.desc()).offset(1).first()
 
-    # case가 주어졌다면, 사용자가 남긴 (day, shift)만 복사하여 삭제한 항목은 제외
-    case_filter: set[tuple[int, str]] | None = None
-    if has_case:
-        case_filter = set()
-        for item in normalized_case:
-            target_date: date = item["date"]
-            shift_type = item["shift"]
-            case_filter.add((target_date.day, shift_type))
-
-    if latest_wr:
-        print(
-            f"과거 데이터 복사: old={latest_wr.request_id} → new={new_request_id} "
-            f"(case_filter 적용: {bool(case_filter)})"
-        )
-        copied_shift, copied_pair = _copy_existing_requests_to_new(
-            db,
-            nurse_id,
-            latest_wr.request_id,
-            new_request_id,
-            req.year,
-            req.month,
-            month_str,
-            case_filter=case_filter,
-        )
+        if latest_wr:
+            print(f"과거 데이터 복사 시도: old={latest_wr.request_id} → new={new_request_id}")
+            case_filter = {(item["date"].day, item["shift"]) for item in normalized_case} if has_case else None
+            copied_shift, copied_pair = _copy_existing_requests_to_new(
+                db, nurse_id, latest_wr.request_id, new_request_id,
+                req.year, req.month, month_str, case_filter=case_filter
+            )
     else:
-        print("최초 요청 → 복사 스킵")
+        print("전체 재작성 또는 더미 request → 과거 데이터 복사 스킵")
 
     # shift_map 구성
-    shift_map = {}
-    original_request_text = normalize_request_text(req.request)
+    shift_map: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    original_request_text = cleaned_request or "AIDE 추천"
 
-    # 현재 new_request_id에 이미 복사된 레코드(기존 LLM 결과) 수집 → case가 덮어쓰지 않도록 보호
-    existing_rows = db.query(NurseShiftRequest).filter(
-        NurseShiftRequest.nurse_id == nurse_id,
-        NurseShiftRequest.request_id == new_request_id,
-    ).all()
-    existing_index = {
-        (_ymd(row.shift_date.year, row.shift_date.month, row.shift_date.day), row.shift): row
-        for row in existing_rows
-    }
-
-    # 1. case 병합 (score 1.0 고정 + 사용자 직접 선택 플래그)
+    # 1. case 강제 우선 적용 (score 높게)
     if has_case:
-        print("case 병합 시작")
         for item in normalized_case:
-            target_date: date = item["date"]
-            day = target_date.day
-            shift_type = item["shift"]
-            # 기존 복사/LLM 데이터가 있으면 덮어쓰지 않고 유지
-            if (target_date, shift_type) in existing_index:
-                print(f"[case 스킵] 기존 데이터 유지: {shift_type} {day}일 (partial_request 보존)")
-                continue
-
-            shift_map.setdefault(shift_type, {})[day] = {
-                'score': 1.0,
-                'request': '사용자 직접 선택',
-                'shift': shift_type  # 명시적으로 저장
+            day = item["date"].day
+            shift = item["shift"]
+            shift_map.setdefault(shift, {})[day] = {
+                "score": 10.0,
+                "request": "사용자 직접 입력 (최우선)",
+                "shift": shift
             }
 
-    # 2. AIDE 결과 병합 (case 보호 조건 완화)
-    if shift_parsed:
-        print("AIDE 결과 병합 시작")
-        for shift_id, days_dict in shift_parsed.items():
-            for day_str, info in days_dict.items():
-                try:
-                    day_int = int(day_str)
-                    if not 1 <= day_int <= 31:
-                        continue
-                except:
+    # 2. AIDE 결과 병합 (case 없는 날만 반영)
+    for shift_id, days_dict in shift_parsed.items():
+        for day_str, info in days_dict.items():
+            try:
+                day_int = int(day_str)
+                if not 1 <= day_int <= 31:
                     continue
+            except:
+                continue
 
-                score = float(info.get('score', 1.0))
-                score = max(0.0, min(5.0, score))  # 범위 제한
+            score = float(info.get("score", 1.0))
+            req_text = info.get("request", original_request_text)
 
-                req_text = info.get('request', original_request_text or 'AIDE 추천')
+            # case로 지정된 조합이면 스킵
+            if any(d == day_int and s == shift_id for d, s in
+                   ((item["date"].day, item["shift"]) for item in normalized_case)):
+                print(f"AIDE 스킵 (case 우선): {shift_id} {day_int}일")
+                continue
 
-                current = shift_map.get(shift_id, {}).get(day_int)
+            current = shift_map.get(shift_id, {}).get(day_int)
+            if current is None or score > current["score"]:
+                shift_map.setdefault(shift_id, {})[day_int] = {
+                    "score": score,
+                    "request": req_text,
+                    "shift": shift_id
+                }
 
-                # case 보호 로직 완화
-                if current:
-                    if current.get('request') == '사용자 직접 선택':
-                        # 같은 shift면 보호, 다른 shift면 AIDE 우선 적용 허용
-                        current_shift = current.get('shift')
-                        if current_shift == shift_id:
-                            print(f"case 보호 (같은 shift): {shift_id} {day_int}일 유지")
-                            continue
-                        else:
-                            print(f"[AIDE 우선 적용] {day_int}일 case({current_shift}) → AIDE({shift_id})")
-                            # 여기서 계속 진행 → 아래에서 업데이트됨
-
-                # 기존 값 없거나 score가 더 높으면 업데이트
-                if current is None or score > current['score']:
-                    shift_map.setdefault(shift_id, {})[day_int] = {
-                        'score': score,
-                        'request': req_text,
-                        'shift': shift_id
-                    }
-                    print(f"업데이트: {shift_id} {day_int}일 score={score}")
-
-    # 최종 shift_map 로그 (디버깅용)
-    print(f"최종 shift_map: {shift_map}")
-
-    # 주휴 필터링: weekly_off_enabled 간호사의 주휴일에 겹치는 희망 근무 제거
+    # 주휴 필터링
     weekly_off_days = _compute_weekly_off_days(
-        db=db,
-        nurse_id=nurse_id,
-        group_id=current_user.group_id,
-        year=req.year,
-        month=req.month,
+        db, nurse_id, current_user.group_id, req.year, req.month
     )
     shift_map = _drop_weekly_off_from_shift_map(shift_map, weekly_off_days)
 
-    # 주휴와 겹치는 기존 복사본(이미 DB에 올라간 행)도 제거
-    if weekly_off_days:
-        deleted_weekly_off = (
-            db.query(NurseShiftRequest)
-            .filter(
-                NurseShiftRequest.nurse_id == nurse_id,
-                NurseShiftRequest.request_id == new_request_id,
-                NurseShiftRequest.shift_date.in_(
-                    [_ymd(req.year, req.month, d) for d in weekly_off_days]
-                ),
-            )
-            .delete(synchronize_session=False)
-        )
-        if deleted_weekly_off:
-            print(f"[weekly_off 삭제] DB 기존 복사본 {deleted_weekly_off}건 제거")
+    # case가 하나라도 있으면 → case 없는 날짜의 기존 shift 기록 삭제 (잔여 이력 방지 핵심)
+    if has_case:
+        case_days = {item["date"].day for item in normalized_case}
+        start_date = date(req.year, req.month, 1)
+        end_date = date(req.year, req.month + 1, 1) if req.month < 12 else date(req.year + 1, 1, 1)
 
-    # 저장
+        deleted = db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.request_id == new_request_id,
+            NurseShiftRequest.shift_date >= start_date,
+            NurseShiftRequest.shift_date < end_date,
+            ~NurseShiftRequest.shift_date.in_(
+                [date(req.year, req.month, d) for d in case_days]
+            )
+        ).delete(synchronize_session=False)
+
+        if deleted:
+            print(f"[case 제한] case에 없는 날짜의 기존 shift {deleted}건 삭제")
+
+    # 주휴일 DB 레코드 삭제
+    if weekly_off_days:
+        deleted_weekly = db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.request_id == new_request_id,
+            NurseShiftRequest.shift_date.in_(
+                [date(req.year, req.month, d) for d in weekly_off_days]
+            )
+        ).delete(synchronize_session=False)
+        if deleted_weekly:
+            print(f"[weekly_off] DB에서 {deleted_weekly}건 제거")
+
+    # shift 저장
     if shift_map:
         _persist_shift_results(
             db, nurse_id, new_request_id, req.year, req.month, month_str,
             shift_map, original_request_text
         )
 
-    # preference 저장
-    try:
-        pref_parsed = _parse_preferences(response, req.schema)
-        if pref_parsed:
-            _persist_pair_results(db, nurse_id, new_request_id, month_str, pref_parsed)
-    except Exception as e:
-        print(f"preference 처리 오류: {e}")
-        traceback.print_exc()
+    # pair 저장
+    if pref_parsed:
+        _persist_pair_results(db, nurse_id, new_request_id, month_str, pref_parsed)
 
     # 최종 커밋
     try:
@@ -1008,12 +840,10 @@ async def invoke_and_persist_wanted_service(
         traceback.print_exc()
         raise
 
-    result = {
+    return {
         "shift": shift_parsed,
-        "preference": pref_parsed or []
+        "preference": pref_parsed
     }
-    print("그래프 실행 및 DB 저장 완료")
-    return result
 
 
 def request_wanted_shifts_service(
@@ -1027,22 +857,20 @@ def request_wanted_shifts_service(
 
     관리자(ADM)의 경우 `override_group_id`로 대상 그룹을 지정합니다.
     """
-    if not current_user:
-        raise Exception("Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not current_user or not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
 
     target_group_id = override_group_id or current_user.group_id
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
 
-    existing_wanted = db.query(Wanted).filter(
+    if db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == req.year,
         Wanted.month == req.month
-    ).first()
-    if existing_wanted:
+    ).first():
         raise Exception("이미 해당 월의 요청이 존재합니다.")
+
     new_wanted = Wanted(
         group_id=target_group_id,
         year=req.year,
@@ -1054,19 +882,15 @@ def request_wanted_shifts_service(
     db.commit()
     db.refresh(new_wanted)
 
-    # 근무 희망 작성 요청 푸시 알림
+    # 푸시 알림
     group_row = db.query(Group).filter(Group.group_id == target_group_id).first()
     office_id = group_row.office_id if group_row and group_row.office_id else current_user.office_id
-    nurse_rows = (
-        db.query(Nurse.nurse_id)
-        .filter(Nurse.group_id == target_group_id)
-        .all()
-    )
-    recipients = [row.nurse_id for row in nurse_rows]
+    nurse_ids = [row.nurse_id for row in db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()]
+
     send_wanted_request_push(
         year=req.year,
         month=req.month,
-        recipients=recipients,
+        recipients=nurse_ids,
         office_code=office_id,
         sender_emp_seq_no=current_user.nurse_id,
         sender_member_id=current_user.account_id,
@@ -1086,34 +910,18 @@ def close_expired_wanted(db: Session) -> int:
              예를 들어 만료된 건이 3건이면 3을 반환합니다.
     """
     now = datetime.now()
-
-    # exp_date가 설정되어 있고 현재 시각보다 과거이며,
-    # 아직 'requested' 상태인 Wanted만 조회합니다.
-    query = (
-        db.query(Wanted)
-        .filter(
-            Wanted.status == 'requested',
-            Wanted.exp_date.isnot(None),
-            Wanted.exp_date < now,
-        )
+    query = db.query(Wanted).filter(
+        Wanted.status == 'requested',
+        Wanted.exp_date.isnot(None),
+        Wanted.exp_date < now,
     )
 
     updated_count = 0
-    try:
-        for wanted in query:
-            wanted.status = 'closed'
-            updated_count += 1
+    for wanted in query:
+        wanted.status = 'closed'
+        updated_count += 1
 
-        if updated_count > 0:
-            db.commit()
-            print(f"Wanted 자동 마감 완료: {updated_count}건 (기준 시각: {now.isoformat()})")
-        else:
-            # 변경 사항이 없으면 굳이 커밋하지 않아도 되지만,
-            # 세션 상태를 명확히 하기 위해 flush만 보장하는 수준으로 둡니다.
-            db.flush()
-    except Exception as exc:
-        db.rollback()
-        print(f"Wanted 자동 마감 중 오류 발생: {exc}")
-        raise
-
+    if updated_count > 0:
+        db.commit()
+        print(f"Wanted 자동 마감 완료: {updated_count}건")
     return updated_count
