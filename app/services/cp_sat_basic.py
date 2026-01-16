@@ -1019,9 +1019,90 @@ class CPSATBasicEngine:
                         stage2_zero_locks: Optional[Dict[str, list]] = None,
                         relax_level: int = 0):
             m = cp_model.CpModel()
+            soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
+            coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
+            coverage_soft_weight = int(getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000)
             Xv = {}
             def X(n, d, s):
                 return Xv.get((n, d, s), 0)
+
+            # ── 하드 모순 사전 점검: 커버리지 cap / 강제 OFF 상한 ──
+            try:
+                # (1) 교대별 최대 가능 인원(cap) 대비 need 초과 여부
+                if hasattr(cfg, 'daily_shift_requirements') and cfg.daily_shift_requirements:
+                    forbidden = initial_forbidden if initial_forbidden else {}
+                    shift_allow_map = getattr(roster_system, "shift_codes_by_nurse", None)
+                    for d in range(D):
+                        if hasattr(cfg, 'daily_shift_requirements_by_day') and isinstance(cfg.daily_shift_requirements_by_day, list) and d < len(cfg.daily_shift_requirements_by_day):
+                            need_map = cfg.daily_shift_requirements_by_day[d]
+                        else:
+                            need_map = cfg.daily_shift_requirements
+                        for code, req in (need_map or {}).items():
+                            if code not in roster_system.config.shift_types:
+                                continue
+                            s_idx = roster_system.config.shift_types.index(code)
+                            need = int(req) - fixed_cnt[d][s_idx]
+                            if need <= 0:
+                                continue
+                            cap = 0
+                            blocked = {"forced_off": 0, "weekend_off_only": 0, "forbidden": 0, "not_allowed": 0}
+                            for n in range(N):
+                                if not (join[n] <= d <= leave[n]):
+                                    continue
+                                if (n, d) in fixed:
+                                    continue  # 다른 교대로 이미 고정
+                                if (n, d) in forced_off_cells:
+                                    blocked["forced_off"] += 1
+                                    continue
+                                if d in weekend_days and getattr(cfg, 'weekend_off_only_enable', True) and bool(getattr(roster_system.nurses[n], "is_weekend_off", False)) and s_idx != off_idx:
+                                    blocked["weekend_off_only"] += 1
+                                    continue
+                                if (n, d) in forbidden:
+                                    forbid_codes = [c for c in forbidden[(n, d)] if c in roster_system.config.shift_types]
+                                    forbid_idx = {roster_system.config.shift_types.index(c) for c in forbid_codes}
+                                    if s_idx in forbid_idx:
+                                        blocked["forbidden"] += 1
+                                        continue
+                                if shift_allow_map and isinstance(shift_allow_map, dict):
+                                    allowed_codes = shift_allow_map.get(n, None)
+                                    if allowed_codes and roster_system.config.shift_types[s_idx] not in allowed_codes:
+                                        blocked["not_allowed"] += 1
+                                        continue
+                                cap += 1
+                            if need > cap:
+                                print(
+                                    f"[HardCheck] day={d+1}, shift={code}, need={need}, cap={cap}, blocked={blocked}"
+                                )
+
+                # (2) 강제/고정 OFF로 개인 OFF 상한 초과 여부
+                try:
+                    base_min_off = int(getattr(cfg, 'global_monthly_off_days', 0) + getattr(cfg, 'standard_personal_off_days', 0))
+                    extra_allowed = int(getattr(cfg, 'max_extra_off_days', 0))
+                    for n in range(N):
+                        T0, T1 = join[n], leave[n]
+                        avail_days = T1 - T0 + 1
+                        forced_off_cnt = sum(1 for d in range(T0, T1 + 1) if (n, d) in forced_off_cells)
+                        nu = roster_system.nurses[n]
+                        raw = getattr(nu, "is_night_nurse", None)
+                        is_n_only = False
+                        if isinstance(raw, list):
+                            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                            is_n_only = (allowed == {"N"})
+                        elif raw == 3 or (raw is not None and raw != 0 and raw != False):
+                            is_n_only = True
+                        if is_n_only:
+                            max_off_allowed = max(0, avail_days - 15) + relax_level
+                        else:
+                            max_off_allowed = min(base_min_off + extra_allowed + relax_level, avail_days)
+                        if forced_off_cnt > max_off_allowed:
+                            print(
+                                f"[HardCheck] nurse_idx={n}, forced_off={forced_off_cnt}, "
+                                f"max_off_allowed={max_off_allowed} → OFF 상한 초과(모순 가능)"
+                            )
+                except Exception:
+                    pass
+            except Exception as exc:
+                print(f"{self.logger_prefix} [HardCheck] precheck 실패: {exc}")
 
             for n in range(N):
                 for d in range(join[n], leave[n] + 1):
