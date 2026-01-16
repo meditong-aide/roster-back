@@ -476,9 +476,10 @@ class CPSATBasicEngine:
             setattr(roster_system, "grade_config", grade_config)
             # 고정된 셀 정보 처리
             fixed_cells = list(config_data.get('fixed_cells', []) or [])
-            # 고정 O/주/휴가/공가를 예외 셀로 확장
+            # 고정 O/주/휴가/공가를 예외 셀로 확장하되, 휴가/공가는 별도 표기로 보관
             try:
                 off_ex = set(getattr(config, "off_exception_cells", []) or [])
+                off_ex_vac = set(getattr(config, "off_exception_vacation_cells", []) or [])
                 for c in fixed_cells:
                     try:
                         n_idx = c.get("nurse_index")
@@ -491,7 +492,10 @@ class CPSATBasicEngine:
                         continue
                     if raw_shift in {"O", "OFF", "주"} or raw_type in {"휴가", "공가"}:
                         off_ex.add((n_idx, d_idx))
+                    if raw_type in {"휴가", "공가"}:
+                        off_ex_vac.add((n_idx, d_idx))
                 setattr(config, "off_exception_cells", sorted(list(off_ex)))
+                setattr(config, "off_exception_vacation_cells", sorted(list(off_ex_vac)))
             except Exception:
                 pass
             # 주휴 등 휴무류 코드는 엔진에서 'O'로만 취급한다. (shift_types=['D','E','N','O'])
@@ -870,6 +874,7 @@ class CPSATBasicEngine:
         has_w = "W" in roster_system.config.shift_types
         w_idx = roster_system.config.shift_types.index("W") if has_w else None
         off_exception_cells = set(getattr(roster_system.config, "off_exception_cells", []) or [])
+        off_exception_vacation_cells = set(getattr(roster_system.config, "off_exception_vacation_cells", []) or [])
 
         first_day = roster_system.target_month
         last_day = first_day + timedelta(days=D - 1)
@@ -895,13 +900,16 @@ class CPSATBasicEngine:
 
         # 고정셀(메인코드 정규화)
         code2main = {c: r['main_code'] for r in (grouped or []) for c in r['codes']}
+        code2type = {c: r.get('type') for r in (grouped or []) for c in r['codes']}
         fixed, fixed_cnt = {}, [[0] * S for _ in range(D)]
+        fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
         for c in getattr(roster_system, 'fixed_cells', []) or []:
             n, d = c['nurse_index'], c['day_index']
             s_main = code2main.get(c['shift'], c['shift'])
             s_idx = roster_system.config.shift_types.index(s_main)
             fixed[(n, d)] = s_idx
             fixed_cnt[d][s_idx] += 1
+            fixed_type_by_cell[(n, d)] = code2type.get(c['shift'])
 
         # 초기 금지(경계) 맵
         initial_forbidden = getattr(roster_system, 'initial_forbidden', {}) if isinstance(getattr(roster_system, 'initial_forbidden', {}), dict) else {}
@@ -1025,13 +1033,27 @@ class CPSATBasicEngine:
             per_nurse_off_cap_override: dict[int, int] = {}
             # 강제 OFF 집합을 미리 구성 (프리체크에서 사용)
             forced_off_cells: set[tuple[int, int]] = set()
+            forced_off_for_cap: set[tuple[int, int]] = set()
             if off_idx is not None:
                 forced_off_cells.update(
                     (n_idx, d_idx)
                     for (n_idx, d_idx), s_idx in fixed.items()
                     if s_idx == off_idx
                 )
+                # cap 계산에서 휴가/공가는 제외
+                vacation_types = {"휴가", "공가"}
+                for (n_idx, d_idx), s_idx in fixed.items():
+                    if s_idx != off_idx:
+                        continue
+                    cell_type = fixed_type_by_cell.get((n_idx, d_idx))
+                    if cell_type in vacation_types:
+                        continue
+                    forced_off_for_cap.add((n_idx, d_idx))
             forced_off_cells.update(off_exception_cells)
+            # 휴가/공가는 상한 계산에서 제외
+            forced_off_for_cap.update(
+                {(n_idx, d_idx) for (n_idx, d_idx) in off_exception_cells if (n_idx, d_idx) not in off_exception_vacation_cells}
+            )
             if stage == 1 and relax_level == 0:
                 try:
                     mapping_logs = []
@@ -1116,7 +1138,7 @@ class CPSATBasicEngine:
                     for n in range(N):
                         T0, T1 = join[n], leave[n]
                         avail_days = T1 - T0 + 1
-                        forced_off_cnt = sum(1 for d in range(T0, T1 + 1) if (n, d) in forced_off_cells)
+                        forced_off_cnt = sum(1 for d in range(T0, T1 + 1) if (n, d) in forced_off_for_cap)
                         nu = roster_system.nurses[n]
                         raw = getattr(nu, "is_night_nurse", None)
                         is_n_only = False
@@ -1566,11 +1588,19 @@ class CPSATBasicEngine:
                             # 예) 28일 월 → 28-15=13, 30일 월 → 30-15=15, 31일 월 → 31-15=16
                             avail_days = T1 - T0 + 1
                             max_off_allowed_n_only = max(0, avail_days - 15) + relax_level
-                            offs2 = sum(X(n, d, off_idx) for d in range(T0, T1 + 1))
+                            offs2 = sum(
+                                X(n, d, off_idx)
+                                for d in range(T0, T1 + 1)
+                                if (n, d) not in forced_off_cap_excluded
+                            )
                             m.Add(offs2 <= max_off_allowed_n_only)
                         else:
                             max_off_allowed = min(min_off_required + extra_allowed + relax_level, T1 - T0 + 1)
-                            offs2 = sum(X(n, d, off_idx) for d in range(T0, T1 + 1))
+                            offs2 = sum(
+                                X(n, d, off_idx)
+                                for d in range(T0, T1 + 1)
+                                if (n, d) not in forced_off_cap_excluded
+                            )
                             m.Add(offs2 <= max_off_allowed)
             except Exception:
                 pass
@@ -2898,6 +2928,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     has_w = "W" in rs.config.shift_types
     w_idx = rs.config.shift_types.index("W") if has_w else None
     off_exception_cells = set(getattr(rs.config, "off_exception_cells", []) or [])
+    off_exception_vacation_cells = set(getattr(rs.config, "off_exception_vacation_cells", []) or [])
     off_idx_full = rs.config.shift_types.index("O") if "O" in rs.config.shift_types else None
     weekly_off_by_idx = getattr(rs, "weekly_off_by_idx", {}) if isinstance(getattr(rs, "weekly_off_by_idx", {}), dict) else {}
     first_day = rs.target_month
@@ -2933,16 +2964,27 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 고정 셀 (수간호사 등)
     code2main = {c:r['main_code']
                  for r in (grouped or []) for c in r['codes']}
+    code2type = {c: r.get('type') for r in (grouped or []) for c in r['codes']}
     fixed, fixed_cnt = {}, [[0]*S for _ in range(D)]
+    fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
     for c in getattr(rs,'fixed_cells',[]) or []:
         n,d = c['nurse_index'], c['day_index']
         s_main = code2main.get(c['shift'], c['shift'])
         s_idx  = rs.config.shift_types.index(s_main)
         fixed[(n,d)] = s_idx; fixed_cnt[d][s_idx]+=1
+        fixed_type_by_cell[(n, d)] = code2type.get(c['shift'])
     forced_off_cells: set[tuple[int, int]] = set()
+    forced_off_cap_excluded: set[tuple[int, int]] = set()
     if off_idx_full is not None:
         forced_off_cells.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
+        vacation_types = {"휴가", "공가"}
+        for (n, d), s_idx in fixed.items():
+            if s_idx != off_idx_full:
+                continue
+            if fixed_type_by_cell.get((n, d)) in vacation_types:
+                forced_off_cap_excluded.add((n, d))
     forced_off_cells.update(off_exception_cells)
+    forced_off_cap_excluded.update(off_exception_vacation_cells)
 
 
     # 변수
@@ -3152,10 +3194,24 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     # 예) 28일 월 → 28-15=13, 30일 월 → 30-15=15, 31일 월 → 31-15=16
                     avail_days = T1 - T0 + 1
                     max_off_allowed_n_only = max(0, avail_days - 15)
-                    m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) <= max_off_allowed_n_only)
+                    m.Add(
+                        sum(
+                            X(n, d, off)
+                            for d in range(T0, T1 + 1)
+                            if (n, d) not in forced_off_cap_excluded
+                        )
+                        <= max_off_allowed_n_only
+                    )
                 else:
                     max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
-                    m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) <= max_off_allowed)
+                    m.Add(
+                        sum(
+                            X(n, d, off)
+                            for d in range(T0, T1 + 1)
+                            if (n, d) not in forced_off_cap_excluded
+                        )
+                        <= max_off_allowed
+                    )
         except Exception:
             pass
 
