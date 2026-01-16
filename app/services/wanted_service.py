@@ -166,28 +166,31 @@ def _compute_weekly_off_days(
         return set()
 
     setting = None
-    if group_id:
-        setting = db.query(WeeklyOffSetting).filter(WeeklyOffSetting.group_id == group_id).first()
+    if nurse_row.is_weekend_off:
+        preview_weekday = 6
+    else:
+        if group_id:
+            setting = db.query(WeeklyOffSetting).filter(WeeklyOffSetting.group_id == group_id).first()
 
-    preview_weekday = nurse_row.weekly_off_weekday
-    if setting and setting.use_variable_cycle:
-        if setting.cycle_type == "month" and setting.base_year and setting.base_month:
-            preview_weekday = calc_weekly_off_weekday_by_month(
-                base_weekday=nurse_row.weekly_off_weekday,
-                shift_variation=setting.shift_variation,
-                base_year=setting.base_year,
-                base_month=setting.base_month,
-                target_year=year,
-                target_month=month,
-            )
-        elif setting.cycle_type == "week" and setting.cycle_start_date:
-            target_date = date(year, month, 1)
-            preview_weekday = calc_weekly_off_weekday_by_week(
-                base_weekday=nurse_row.weekly_off_weekday,
-                shift_variation=setting.shift_variation,
-                cycle_start_date=setting.cycle_start_date,
-                target_date=target_date,
-                cycle_interval_weeks=setting.cycle_interval,
+        preview_weekday = nurse_row.weekly_off_weekday
+        if setting and setting.use_variable_cycle:
+            if setting.cycle_type == "month" and setting.base_year and setting.base_month:
+                preview_weekday = calc_weekly_off_weekday_by_month(
+                    base_weekday=nurse_row.weekly_off_weekday,
+                    shift_variation=setting.shift_variation,
+                    base_year=setting.base_year,
+                    base_month=setting.base_month,
+                    target_year=year,
+                    target_month=month,
+                )
+            elif setting.cycle_type == "week" and setting.cycle_start_date:
+                target_date = date(year, month, 1)
+                preview_weekday = calc_weekly_off_weekday_by_week(
+                    base_weekday=nurse_row.weekly_off_weekday,
+                    shift_variation=setting.shift_variation,
+                    cycle_start_date=setting.cycle_start_date,
+                    target_date=target_date,
+                    cycle_interval_weeks=setting.cycle_interval,
             )
 
     weekly_off_days: Set[int] = set()
