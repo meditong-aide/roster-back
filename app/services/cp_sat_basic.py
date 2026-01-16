@@ -1022,6 +1022,15 @@ class CPSATBasicEngine:
             soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
             coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
             coverage_soft_weight = int(getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000)
+            # 강제 OFF 집합을 미리 구성 (프리체크에서 사용)
+            forced_off_cells: set[tuple[int, int]] = set()
+            if off_idx is not None:
+                forced_off_cells.update(
+                    (n_idx, d_idx)
+                    for (n_idx, d_idx), s_idx in fixed.items()
+                    if s_idx == off_idx
+                )
+            forced_off_cells.update(off_exception_cells)
             Xv = {}
             def X(n, d, s):
                 return Xv.get((n, d, s), 0)
@@ -1184,12 +1193,6 @@ class CPSATBasicEngine:
                 if isinstance(getattr(roster_system, "prev_month_last_is_off", {}), dict)
                 else {}
             )
-            forced_off_cells: set[tuple[int, int]] = set(
-                (n_idx, d_idx)
-                for (n_idx, d_idx), s_idx in fixed.items()
-                if s_idx == off_idx
-            )
-            forced_off_cells.update(off_exception_cells)
             # 예상 커버리지 부족일 계산(단순 근사): 필요한 총 인원 > (활성 인원 - 고정 OFF)
             shortage_days: set[int] = set()
             try:
