@@ -6,7 +6,7 @@
 import pprint
 from sqlalchemy.orm import Session
 from sqlalchemy import String, cast, extract
-from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference
+from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
 from datetime import datetime, timezone, timedelta
@@ -290,12 +290,30 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             )
             .all()
         )
-        shift_data = {"D": {}, "E": {}, "N": {}, "O": {}}
+        
+        allowed_shifts = {
+            row[0].upper()
+            for row in db.query(Shift.shift_id).filter(
+                Shift.group_id == target_group_id,
+                Shift.show_in_preference == True
+            ).all()
+        }
+        
+        shift_data = {}
+        
         for s in shift_rows:
-            shift_type = s.shift.upper()
-            day = str(int(str(s.shift_date).split("-")[-1]))  # 날짜만 추출 (문자열 키)
-            if shift_type in shift_data:
-                shift_data[shift_type][day] = int(s.score) if s.score is not None else 0
+            shift_type = (s.shift or "").upper().strip()
+            if not shift_type or shift_type not in allowed_shifts:
+                continue
+            
+            day = str(s.shift_date.day).lstrip("0")
+            
+            if shift_type not in shift_data:
+                shift_data[shift_type] = {}
+            
+            shift_data[shift_type][day] = (
+                int(s.score) if s.score is not None else 1
+            )
 
         # pair 요청들
         pair_rows = (
