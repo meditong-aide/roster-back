@@ -1022,6 +1022,41 @@ class CPSATBasicEngine:
             soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
             coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
             coverage_soft_weight = int(getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000)
+            per_nurse_off_cap_override: dict[int, int] = {}
+            # 강제 OFF 집합을 미리 구성 (프리체크에서 사용)
+            forced_off_cells: set[tuple[int, int]] = set()
+            if off_idx is not None:
+                forced_off_cells.update(
+                    (n_idx, d_idx)
+                    for (n_idx, d_idx), s_idx in fixed.items()
+                    if s_idx == off_idx
+                )
+            forced_off_cells.update(off_exception_cells)
+            if stage == 1 and relax_level == 0:
+                try:
+                    mapping_logs = []
+                    for idx, nu in enumerate(roster_system.nurses):
+                        mapping_logs.append(
+                            f"{idx}:{getattr(nu, 'nurse_id', '?')}/"
+                            f"{getattr(nu, 'name', '?')}/"
+                            f"{getattr(nu, 'account_id', '?')}"
+                        )
+                    print(f"[NurseIndexMap] " + ", ".join(mapping_logs))
+                    if off_exception_cells:
+                        exc_map = {}
+                        for n_idx, d_idx in off_exception_cells:
+                            exc_map.setdefault(n_idx, []).append(d_idx + 1)
+                        exc_logs = []
+                        for n_idx, days in sorted(exc_map.items()):
+                            nu = roster_system.nurses[n_idx]
+                            exc_logs.append(
+                                f"{n_idx}:{getattr(nu, 'nurse_id', '?')}/"
+                                f"{getattr(nu, 'name', '?')}/"
+                                f"{getattr(nu, 'account_id', '?')} -> {sorted(days)}"
+                            )
+                        print("[OffExceptionCells] " + "; ".join(exc_logs))
+                except Exception:
+                    pass
             Xv = {}
             def X(n, d, s):
                 return Xv.get((n, d, s), 0)
@@ -1095,9 +1130,21 @@ class CPSATBasicEngine:
                         else:
                             max_off_allowed = min(base_min_off + extra_allowed + relax_level, avail_days)
                         if forced_off_cnt > max_off_allowed:
+                            per_nurse_off_cap_override[n] = forced_off_cnt
+                            forced_days = [
+                                d_idx + 1
+                                for d_idx in range(T0, T1 + 1)
+                                if (n, d_idx) in forced_off_cells
+                            ]
+                            nurse_id = getattr(nu, "nurse_id", "?")
+                            nurse_name = getattr(nu, "name", "?")
+                            account_id = getattr(nu, "account_id", "?")
                             print(
-                                f"[HardCheck] nurse_idx={n}, forced_off={forced_off_cnt}, "
-                                f"max_off_allowed={max_off_allowed} → OFF 상한 초과(모순 가능)"
+                                "[HardCheck] "
+                                f"nurse_idx={n}, nurse_id={nurse_id}, name={nurse_name}, "
+                                f"account_id={account_id}, forced_off={forced_off_cnt}, "
+                                f"max_off_allowed={max_off_allowed}, forced_off_days={forced_days} "
+                                "→ OFF 상한 초과(모순 가능)"
                             )
                 except Exception:
                     pass
