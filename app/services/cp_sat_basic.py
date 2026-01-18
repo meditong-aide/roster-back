@@ -10,6 +10,30 @@ from collections import defaultdict
 import random
 from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
+from services.cp_sat.shift_normalizer import (
+    build_shift_normalizer as build_shift_normalizer_impl,
+    normalize_shift_code as normalize_shift_code_impl,
+)
+from services.cp_sat.result_mapping import convert_result_to_db_format as _convert_result_to_db_format_impl
+from services.cp_sat.work_shift_overrides import (
+    apply_work_shift_overrides as _apply_work_shift_overrides_impl,
+)
+from services.cp_sat.postprocess_off import (
+    postprocess_rebalance_off as _postprocess_rebalance_off_impl,
+    postprocess_trim_extra_offs as _postprocess_trim_extra_offs_impl,
+)
+from services.cp_sat.hardcoded_weights import (
+    EXPERIENCE_SHORT_PENALTY,
+    FALLBACK_COVERAGE_SHORT_WEIGHT,
+    FALLBACK_EXPERIENCE_SHORT_PENALTY,
+    ISOLATED_OFF_PENALTY,
+    NIGHT_DEVIATION_PENALTY,
+    NOD_NOE_PENALTY,
+    N_ONLY_NIGHT_BONUS,
+    PREFERENCE_SCORE_SCALE,
+    WEEK_OFF_SHORT_PENALTY,
+)
+from services.cp_sat.objective_terms import build_main_objective_terms
 # ─────────────────────────────  RL Neighborhood  ─────────────────────────
 class RLNeighborhoodPolicy:
     """아주 가벼운 ε-greedy 정책"""
@@ -44,70 +68,13 @@ class Timer:
 
 
 def _build_shift_normalizer(shift_defs: list[dict] | None) -> tuple[dict[str, str], dict[str, str]]:
-    """Shift ID를 알고리즘용 메인 코드(D/E/N/O)로 정규화하는 매핑을 생성한다.
-
-    Args:
-        shift_defs: shift_id, default_shift, shift_gb를 포함한 사전 리스트
-
-    Returns:
-        (id_to_main, main_to_id):
-            - id_to_main: shift_id(대문자) → 메인 코드(D/E/N/O)
-            - main_to_id: 메인 코드 → 대표 shift_id(초기값은 자기 자신, 매핑되면 우선 적용)
-    """
-    canonical = {"D", "E", "N", "O", "주", "W"}
-    id_to_main: dict[str, str] = {}
-    main_to_id: dict[str, str] = {c: c for c in canonical}
-
-    for row in shift_defs or []:
-        raw_id = str(row.get("shift_id") or "").strip()
-        if not raw_id:
-            continue
-        sid_upper = raw_id.upper()
-        raw_default = str(row.get("default_shift") or "").strip().upper()
-        raw_gb = str(row.get("shift_gb") or "").strip().upper()
-        shift_type = str(row.get("type") or "").strip()
-
-        if sid_upper in {"OFF"}:
-            sid_upper = "O"
-
-        main_code = None
-        skip_main_to_id = False
-        if raw_default in canonical:
-            main_code = raw_default
-        elif raw_gb in canonical:
-            main_code = raw_gb
-        elif sid_upper in canonical:
-            main_code = sid_upper
-        elif shift_type in {"휴가", "공가"}:
-            main_code = "O"
-            if sid_upper != "O":
-                skip_main_to_id = True  # 휴가/공가가 canonical O를 덮어쓰지 않도록 방지
-        elif shift_type == "근무":
-            main_code = "W"
-            if sid_upper != "W":
-                skip_main_to_id = True  # 근무형은 가상 코드 W만 사용
-
-        if not main_code:
-            continue
-
-        id_to_main[sid_upper] = main_code
-        if not skip_main_to_id:
-            current = main_to_id.get(main_code)
-            if current in {None, main_code} or sid_upper == main_code:
-                main_to_id[main_code] = raw_id
-
-    return id_to_main, main_to_id
+    """(호환) shift_definitions 기반의 정규화 매핑을 생성한다."""
+    return build_shift_normalizer_impl(shift_defs)
 
 
 def _normalize_shift_code(raw_code: object, id_to_main: dict[str, str]) -> str | None:
-    """입력 근무코드를 메인 코드(D/E/N/O)로 정규화한다."""
-    code = str(raw_code or "").strip()
-    upper = code.upper()
-    if upper in {"OFF"}:
-        return "O"
-    if upper in {"D", "E", "N", "O", "주", "W"}:
-        return upper
-    return id_to_main.get(upper)
+    """(호환) 입력 근무코드를 메인 코드로 정규화한다."""
+    return normalize_shift_code_impl(raw_code, id_to_main)
 
 
 
@@ -1714,7 +1681,7 @@ class CPSATBasicEngine:
             # stage별 목적/고정
             if stage == 1:
                 # 커버리지: shortage를 압도적으로 최소화 (coverage-first)
-                m.Minimize(100000 * sum(short_terms) + sum(over_terms))
+                m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))
             elif stage == 2:
                 # 1단계 최솟값 고정 + over 상한 유지
                 if coverage_eq is not None:
@@ -1753,10 +1720,10 @@ class CPSATBasicEngine:
                     
                     for d in range(join[n], leave[n] + 1):
                         for s in range(S):
-                            base_score = int(P[n, d, s] * 100)
+                            base_score = int(P[n, d, s] * PREFERENCE_SCORE_SCALE)
                             # N 전담 간호사가 N을 배정받으면 높은 보너스 (N 우선 배정 유도)
                             if is_n_only and s == night_idx:
-                                base_score += 500  # N 전담의 N 근무에 큰 보너스
+                                base_score += N_ONLY_NIGHT_BONUS  # N 전담의 N 근무 보너스(고정값)
                             obj.append(base_score * X(n, d, s))
 
                 # 추가 OFF(여유 OFF) 기피: 가능한 한 off_days 이상으로 OFF를 늘리지 않도록 유도
@@ -1955,7 +1922,7 @@ class CPSATBasicEngine:
                                            if join[n] <= d <= leave[n] and nu.experience_years >= cfg.min_experience_per_shift)
                         shortage = m.NewIntVar(0, cfg.required_experienced_nurses, f'expShort_fb_{d}_{code}')
                         m.Add(shortage >= cfg.required_experienced_nurses - exp_assigned)
-                        obj.append(-100 * shortage)
+                        obj.append(-FALLBACK_EXPERIENCE_SHORT_PENALTY * shortage)
                 # 여유 인원 L1 균등화(일별 D/E/N): |ov_d,c1 - ov_d,c2| 최소화
                 try:
                     if bool(getattr(cfg, 'oversupply_equalize_enable', True)):
@@ -2233,47 +2200,13 @@ class CPSATBasicEngine:
         canonical_to_shift_id: dict[str, str] | None = None,
         fixed_original_shift_map: dict[tuple[int, int], str] | None = None,
     ) -> Dict[str, List[str]]:
-        """RosterSystem 결과를 DB 형식으로 변환한다.
-
-        Args:
-            roster_system: 계산이 완료된 RosterSystem
-            nurses: 간호사 객체 리스트
-            canonical_to_shift_id: 메인 코드(D/E/N/O) → 실제 shift_id 매핑
-            fixed_original_shift_map: 고정 셀의 원본 shift_id 매핑
-        """
-        result = {}
-        canonical_map = {k.upper(): v for k, v in (canonical_to_shift_id or {}).items() if v}
-        if not canonical_map:
-            canonical_map = {"D": "D", "E": "E", "N": "N", "O": "O", "주": "주"}
-        fixed_original_shift_map = fixed_original_shift_map or {}
-        shift_map = {i: s for i, s in enumerate(roster_system.config.shift_types)}
-        fixed = getattr(roster_system, 'fixed_cells', None)
-        fixed_lookup = {}
-        if fixed:
-            for cell in fixed:
-                fixed_lookup[(cell['nurse_index'], cell['day_index'])] = cell['shift']
-        for n_idx, nurse in enumerate(nurses):
-            nurse_schedule = []
-            for day_idx in range(roster_system.num_days):
-                # 고정된 셀은 원래 값으로 반환
-                if (n_idx, day_idx) in fixed_lookup:
-                    original = fixed_original_shift_map.get((n_idx, day_idx))
-                    if original:
-                        nurse_schedule.append(original)
-                        continue
-                    fixed_shift = fixed_lookup[(n_idx, day_idx)]
-                    nurse_schedule.append(canonical_map.get(str(fixed_shift).upper(), fixed_shift))
-                    continue
-                shift_vector = roster_system.roster[n_idx, day_idx]
-                shift_idx = np.where(shift_vector == 1)[0]
-                if len(shift_idx) > 0:
-                    shift_id = shift_map[shift_idx[0]]
-                    mapped = canonical_map.get(str(shift_id).upper(), shift_id)
-                    nurse_schedule.append(mapped)
-                else:
-                    nurse_schedule.append('-')
-            result[nurse.db_id] = nurse_schedule
-        return result
+        """(호환) RosterSystem 결과를 DB 형식으로 변환한다."""
+        return _convert_result_to_db_format_impl(
+            roster_system,
+            nurses,
+            canonical_to_shift_id=canonical_to_shift_id,
+            fixed_original_shift_map=fixed_original_shift_map,
+        )
 
     def _apply_work_shift_overrides(
         self,
@@ -2281,294 +2214,23 @@ class CPSATBasicEngine:
         nurses_data: List[dict],
         shift_definitions: list[dict] | None,
     ) -> Dict[str, List[str]]:
-        """work_shifts 설정을 사용해 간호사별 근무 코드를 맞춤 대체한다.
-
-        Args:
-            roster_map: 간호사별 최종 근무표(shift_id 또는 메인 코드).
-            nurses_data: DB에서 가져온 간호사 원본 데이터 목록.
-            shift_definitions: shifts 테이블에서 가져온 정의 목록.
-
-        Returns:
-            간호사별 work_shifts 우선순위를 반영한 근무표 사전.
-        """
-        if not roster_map or not nurses_data or not shift_definitions:
-            return roster_map
-
-        def _normalize_shift_token(token: str) -> str | None:
-            """shift_id/shift_gb 문자열을 메인 코드(D/E/N/O)로 환산한다."""
-            raw = str(token or "").strip()
-            if not raw:
-                return None
-            upper = raw.upper()
-            compact = upper.replace(" ", "")
-            direct_map = {
-                "D": "D",
-                "E": "E",
-                "N": "N",
-                "O": "O",
-                "OFF": "O",
-                "주": "O",
-                "W": "W",
-            }
-            if upper in direct_map:
-                return direct_map[upper]
-            if compact.startswith("D"):
-                return "D"
-            if compact.startswith("E"):
-                return "E"
-            if compact.startswith("N"):
-                return "N"
-            ko_map = {
-                "데이": "D",
-                "이브닝": "E",
-                "나이트": "N",
-            }
-            return ko_map.get(raw) or ko_map.get(compact.lower())
-
-        shift_meta_index: dict[str, list[dict[str, str | None]]] = {}
-        main_by_shift_id: dict[str, str] = {}
-        for row in shift_definitions or []:
-            shift_id_raw = str(row.get("shift_id") or "").strip()
-            if not shift_id_raw:
-                continue
-            shift_id_key = shift_id_raw.upper()
-            main_code = None
-            for candidate in (
-                row.get("default_shift"),
-                row.get("shift_gb"),
-                row.get("shift_id"),
-            ):
-                main_code = _normalize_shift_token(candidate)
-                if main_code:
-                    break
-            if main_code:
-                main_by_shift_id[shift_id_key] = main_code
-            meta = {
-                "shift_id": shift_id_raw,
-                "main_code": main_code,
-                "office_id": row.get("office_id"),
-                "group_id": row.get("group_id"),
-            }
-            shift_meta_index.setdefault(shift_id_key, []).append(meta)
-
-        if not shift_meta_index:
-            return roster_map
-
-        def _select_shift_meta(
-            shift_id_key: str, nurse_office: str | None, nurse_group: str | None
-        ) -> dict[str, str | None] | None:
-            """office/group이 일치하는 shift 정의를 우선 선택한다."""
-            candidates = shift_meta_index.get(shift_id_key) or []
-            if not candidates:
-                return None
-            for meta in candidates:
-                office_ok = (
-                    not meta.get("office_id")
-                    or not nurse_office
-                    or str(meta["office_id"]) == nurse_office
-                )
-                group_ok = (
-                    not meta.get("group_id")
-                    or not nurse_group
-                    or str(meta["group_id"]) == nurse_group
-                )
-                if office_ok and group_ok:
-                    return meta
-            return candidates[0]
-
-        for nurse_row in nurses_data:
-            nurse_id_raw = nurse_row.get("nurse_id") or nurse_row.get("db_id")
-            if nurse_id_raw is None:
-                continue
-            roster_key = (
-                nurse_id_raw
-                if nurse_id_raw in roster_map
-                else str(nurse_id_raw)
-                if str(nurse_id_raw) in roster_map
-                else None
-            )
-            if roster_key is None:
-                continue
-            work_shifts = nurse_row.get("work_shifts") or []
-            if not isinstance(work_shifts, list) or not work_shifts:
-                continue
-            nurse_office = (
-                str(nurse_row.get("office_id")).strip()
-                if nurse_row.get("office_id") is not None
-                else None
-            )
-            nurse_group = (
-                str(nurse_row.get("group_id")).strip()
-                if nurse_row.get("group_id") is not None
-                else None
-            )
-            target_by_main: dict[str, str] = {}
-            for ws in work_shifts:
-                ws_raw = str(ws or "").strip()
-                if not ws_raw:
-                    continue
-                ws_key = ws_raw.upper()
-                meta = _select_shift_meta(ws_key, nurse_office, nurse_group)
-                if not meta:
-                    continue
-                main_code = meta.get("main_code") or _normalize_shift_token(ws_raw)
-                if main_code not in {"D", "E", "N"}:
-                    continue
-                # 첫 번째로 매칭된 shift_id를 우선 적용한다.
-                target_by_main.setdefault(main_code, ws_raw)
-
-            if not target_by_main:
-                continue
-
-            updated_schedule: list[str] = []
-            for entry in roster_map.get(roster_key, []):
-                entry_str = str(entry)
-                entry_key = entry_str.upper()
-                entry_main = None
-                if entry_key in {"D", "E", "N"}:
-                    entry_main = entry_key
-                elif entry_key in main_by_shift_id:
-                    entry_main = main_by_shift_id[entry_key]
-                else:
-                    entry_main = _normalize_shift_token(entry_str)
-                if entry_main and entry_main in target_by_main:
-                    updated_schedule.append(target_by_main[entry_main])
-                else:
-                    updated_schedule.append(entry)
-            roster_map[roster_key] = updated_schedule
-
-        return roster_map
+        """(호환) work_shifts 설정을 사용해 간호사별 근무 코드를 맞춤 대체한다."""
+        return _apply_work_shift_overrides_impl(
+            roster_map=roster_map,
+            nurses_data=nurses_data,
+            shift_definitions=shift_definitions,
+        )
 
     def _postprocess_rebalance_off(
         self,
         roster_system: RosterSystem,
         max_attempts: int = 30,
     ) -> None:
-        """후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다.
-
-        수식(연속근무 길이): run_len = work_days 연속 길이 (예: DDDDDEE → run_len=6)
-
-        전략:
-            - 한 간호사 내에서 O가 있는 다른 날짜와 장시간 연속근무 구간의 근무를 교환
-            - 밤근무(N)는 2N2O/야간 연속 규칙을 해치지 않도록 스왑 대상에서 제외
-            - 하드 제약 위반 수가 늘어나면 롤백
-
-        Args:
-            roster_system: 근무표 시스템
-            max_attempts: 최대 스왑 시도 횟수
-        """
-        cfg = roster_system.config
-        off_idx = cfg.shift_types.index('O') if 'O' in cfg.shift_types else None
-        night_idx = cfg.shift_types.index('N') if 'N' in cfg.shift_types else None
-        if off_idx is None:
-            return
-
-        fixed_cells = {(c['nurse_index'], c['day_index']) for c in (getattr(roster_system, 'fixed_cells', []) or [])}
-        K = getattr(cfg, "max_consecutive_work_days", None)
-        if not isinstance(K, int) or K <= 0:
-            return
-
-        def _max_run(n_idx: int) -> tuple[int, int, int] | None:
-            """가장 긴 연속근무 구간(start, end, length)을 반환."""
-            best = None
-            run_start = None
-            run_len = 0
-            D = roster_system.num_days
-            for d in range(D):
-                is_off = roster_system.roster[n_idx, d, off_idx] == 1
-                if is_off:
-                    if run_len > 0 and (best is None or run_len > best[2]):
-                        best = (run_start, d - 1, run_len)
-                    run_start, run_len = None, 0
-                else:
-                    if run_start is None:
-                        run_start = d
-                    run_len += 1
-            if run_len > 0 and (best is None or run_len > best[2]):
-                best = (run_start, D - 1, run_len)
-            return best
-
-        def _swap_off(n_idx: int, work_day: int, off_day: int, shift_idx: int) -> None:
-            roster_system.roster[n_idx, work_day, shift_idx] = 0
-            roster_system.roster[n_idx, work_day, off_idx] = 1
-            roster_system.roster[n_idx, off_day, off_idx] = 0
-            roster_system.roster[n_idx, off_day, shift_idx] = 1
-
-        def _find_shift_idx(n_idx: int, day: int) -> int | None:
-            vec = roster_system.roster[n_idx, day]
-            ones = np.where(vec == 1)[0]
-            if len(ones) == 1:
-                return int(ones[0])
-            return None
-
-        base_viol = len(roster_system._find_violations())
-        accepted = 0
-        N = len(roster_system.nurses)
-
-        for n_idx in range(N):
-            if accepted >= max_attempts:
-                break
-            best_run = _max_run(n_idx)
-            if not best_run or best_run[2] <= K:
-                continue
-            start, end, run_len = best_run
-            # 연속근무 중앙부부터 완화 시도
-            target_days = list(range(start, end + 1))
-            target_days.sort(key=lambda x: abs(x - (start + end) // 2))
-
-            # O 후보: 동일 간호사의 O 날짜 중 고정 아닌 날
-            off_candidates = [
-                d for d in range(roster_system.num_days)
-                if roster_system.roster[n_idx, d, off_idx] == 1 and (n_idx, d) not in fixed_cells
-            ]
-            if not off_candidates:
-                continue
-
-            for work_day in target_days:
-                if (n_idx, work_day) in fixed_cells:
-                    continue
-                shift_idx = _find_shift_idx(n_idx, work_day)
-                if shift_idx is None or shift_idx == off_idx:
-                    continue
-                # N 이동은 2N2O 리스크가 크므로 제외
-                if night_idx is not None and shift_idx == night_idx:
-                    continue
-
-                for off_day in off_candidates:
-                    if off_day == work_day:
-                        continue
-                    if (n_idx, off_day) in fixed_cells:
-                        continue
-
-                    # 스왑 적용
-                    _swap_off(n_idx, work_day, off_day, shift_idx)
-                    new_run = _max_run(n_idx)
-                    new_viol = len(roster_system._find_violations())
-
-                    ok = True
-                    if new_run and new_run[2] > K:
-                        ok = False
-                    if new_viol > base_viol:
-                        ok = False
-
-                    if ok:
-                        accepted += 1
-                        base_viol = new_viol
-                        print(
-                            f"{self.logger_prefix} [PostOff] swap accepted n={n_idx}, "
-                            f"work_day={work_day+1}→O, off_day={off_day+1}→{cfg.shift_types[shift_idx]}, "
-                            f"max_run {run_len}->{new_run[2] if new_run else 0}, viol {new_viol}"
-                        )
-                        break
-                    else:
-                        # 롤백
-                        _swap_off(n_idx, off_day, work_day, shift_idx)
-                if accepted >= max_attempts:
-                    break
-        final_viol = len(roster_system._find_violations())
-        print(
-            f"{self.logger_prefix} [PostOff] 완료: 수용 스왑 {accepted}건, "
-            f"위반 {base_viol}->{final_viol}, max_attempts={max_attempts}"
+        """(호환) 후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다."""
+        _postprocess_rebalance_off_impl(
+            roster_system=roster_system,
+            logger_prefix=self.logger_prefix,
+            max_attempts=max_attempts,
         )
 
     def _postprocess_trim_extra_offs(
@@ -2577,326 +2239,13 @@ class CPSATBasicEngine:
         max_changes: int = 80,
         prefer_shortage: bool = True,
     ) -> int:
-        """필수/강제 OFF를 보존하면서 불필요한 OFF를 근무로 교체한다.
-
-        Notes:
-            - N-only 간호사는 제외한다.
-            - 개인 OFF 상한은 `global_monthly_off_days + standard_personal_off_days + max_extra_off_days`
-              를 기본으로 하되, 가능한 10을 넘지 않도록 클램프한다.
-            - 회복 OFF(2N/3N→2O), 고정/예외/주휴 OFF는 건드리지 않는다.
-        """
-        cfg = roster_system.config
-        if "O" not in cfg.shift_types:
-            return 0
-
-        off_idx = cfg.shift_types.index("O")
-        day_idx = cfg.shift_types.index("D") if "D" in cfg.shift_types else None
-        eve_idx = cfg.shift_types.index("E") if "E" in cfg.shift_types else None
-        night_idx = cfg.shift_types.index("N") if "N" in cfg.shift_types else None
-        # W를 후처리 교체 대상에서 제외하고, 커버리지 코드(D/E/N 등)만 사용
-        work_codes = [
-            code
-            for code in (cfg.daily_shift_requirements or {}).keys()
-            if code in cfg.shift_types and code not in {"O", "W"}
-        ]
-        work_shift_indices = [cfg.shift_types.index(code) for code in work_codes]
-        if not work_shift_indices:
-            # fallback: shift_types에서 O/W 제외
-            work_shift_indices = [
-                i for i, code in enumerate(cfg.shift_types) if code not in {"O", "W"}
-            ]
-        if not work_shift_indices:
-            return 0
-
-        # 현재 로스터 스냅샷을 보존하여 회복 OFF(2N/3N→2O)를 안전하게 식별한다.
-        roster_snapshot = roster_system.roster.copy()
-
-        num_days = roster_system.num_days
-        weekend_days = {
-            d
-            for d in range(num_days)
-            if (roster_system.target_month + timedelta(days=d)).weekday() >= 5
-        }
-
-        fixed_cells = getattr(roster_system, "fixed_cells", []) or []
-        fixed_off_cells = {
-            (c.get("nurse_index"), c.get("day_index"))
-            for c in fixed_cells
-            if str(c.get("shift", "")).upper() == "O"
-        }
-        off_exception_cells = set(getattr(cfg, "off_exception_cells", []) or [])
-        weekly_off_map = (
-            getattr(roster_system, "weekly_off_by_idx", {})
-            if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
-            else {}
+        """(호환) 필수/강제 OFF를 보존하면서 불필요한 OFF를 근무로 교체한다."""
+        return _postprocess_trim_extra_offs_impl(
+            roster_system=roster_system,
+            logger_prefix=self.logger_prefix,
+            max_changes=max_changes,
+            prefer_shortage=prefer_shortage,
         )
-        weekly_off_cells = {(n, d) for n, days in weekly_off_map.items() for d in (days or [])}
-
-        pref_matrix = getattr(roster_system, "preference_matrix", None)
-        grade_config = getattr(roster_system, "grade_config", None)
-        grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
-        team_map = {n_idx: getattr(n, "team_id", None) for n_idx, n in enumerate(roster_system.nurses)}
-
-        base_min_off = int(
-            getattr(cfg, "global_monthly_off_days", 0) + getattr(cfg, "standard_personal_off_days", 0)
-        )
-        extra_off = int(getattr(cfg, "max_extra_off_days", 0))
-        target_cap_global = max(base_min_off, min(base_min_off + extra_off, 10))
-
-        def is_n_only(nurse: Nurse) -> bool:
-            raw = getattr(nurse, "is_night_nurse", None)
-            if isinstance(raw, list):
-                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                return allowed == {"N"}
-            return raw == 3 or (raw is not None and raw != 0 and raw is not False)
-
-        def min_off_required() -> int:
-            return min(base_min_off, num_days)
-
-        def max_off_allowed(nurse: Nurse) -> int:
-            return max(base_min_off, min(base_min_off + extra_off, target_cap_global))
-
-        def build_recovery_off_cells() -> set[tuple[int, int]]:
-            cells: set[tuple[int, int]] = set()
-            if night_idx is None:
-                return cells
-            for n_idx, _n in enumerate(roster_system.nurses):
-                # 밤 연속 블록을 스냅샷 기준으로 스캔
-                d = 0
-                while d < num_days:
-                    if roster_snapshot[n_idx, d, night_idx] != 1:
-                        d += 1
-                        continue
-                    start = d
-                    while d + 1 < num_days and roster_snapshot[n_idx, d + 1, night_idx] == 1:
-                        d += 1
-                    end = d
-                    length = end - start + 1
-                    if cfg.two_offs_after_three_nig and length >= 3:
-                        for off_d in (end + 1, end + 2):
-                            if off_d < num_days:
-                                cells.add((n_idx, off_d))
-                    if cfg.two_offs_after_two_nig and length >= 2:
-                        for off_d in (end + 1, end + 2):
-                            if off_d < num_days:
-                                cells.add((n_idx, off_d))
-                    d += 1
-            return cells
-
-        recovery_off_cells = build_recovery_off_cells()
-
-        def is_recovery_off(n_idx: int, d_idx: int) -> bool:
-            return (n_idx, d_idx) in recovery_off_cells
-
-        def day_deficits() -> dict[int, dict[int, int]]:
-            deficits: dict[int, dict[int, int]] = {}
-            for d_idx in range(num_days):
-                if (
-                    hasattr(cfg, "daily_shift_requirements_by_day")
-                    and isinstance(cfg.daily_shift_requirements_by_day, list)
-                    and d_idx < len(cfg.daily_shift_requirements_by_day)
-                ):
-                    need_map = cfg.daily_shift_requirements_by_day[d_idx]
-                else:
-                    need_map = cfg.daily_shift_requirements
-                for code, req in (need_map or {}).items():
-                    if code not in cfg.shift_types or code == "O":
-                        continue
-                    s_idx = cfg.shift_types.index(code)
-                    assigned = int(np.sum(roster_system.roster[:, d_idx, s_idx]))
-                    need = int(req or 0)
-                    if assigned < need:
-                        deficits.setdefault(d_idx, {})[s_idx] = need - assigned
-            return deficits
-
-        deficits_by_day = day_deficits()
-        base_viol = len(roster_system._find_violations())
-        changes = 0
-
-        def team_shift_count(d_idx: int, s_idx: int, team_id) -> int:
-            if team_id is None:
-                return 0
-            cnt = 0
-            for n_i, nurse in enumerate(roster_system.nurses):
-                if getattr(nurse, "team_id", None) != team_id:
-                    continue
-                if roster_system.roster[n_i, d_idx, s_idx] == 1:
-                    cnt += 1
-            return cnt
-
-        def grade_bonus(n_idx: int, d_idx: int, s_idx: int) -> float:
-            """GRADE 전략 시 소프트 보너스(가벼운 휴리스틱)."""
-            if grade_strategy != "GRADE" or not isinstance(grade_config, dict):
-                return 0.0
-            grade_val = getattr(roster_system.nurses[n_idx], "grade", None)
-            try:
-                grade_int = int(grade_val) if grade_val is not None else None
-            except Exception:
-                grade_int = None
-            constraints_map = (
-                grade_config.get("constraints")
-                or grade_config.get("constraints_json")
-                or {}
-            )
-            shift_code = cfg.shift_types[s_idx]
-            req_map = constraints_map.get(shift_code) if isinstance(constraints_map, dict) else None
-            if not isinstance(req_map, dict) or grade_int is None:
-                return 0.0
-            # 요구 대비 현재 배정 카운트 계산
-            need = int(req_map.get(str(grade_int), 0) or 0)
-            if need <= 0:
-                return 0.0
-            assigned = 0
-            for n_i, _ in enumerate(roster_system.nurses):
-                if int(getattr(roster_system.nurses[n_i], "grade", grade_int) or grade_int) != grade_int:
-                    continue
-                if roster_system.roster[n_i, d_idx, s_idx] == 1:
-                    assigned += 1
-            gap = need - assigned
-            return 0.5 if gap > 0 else 0.0
-
-        def is_off_like(n_idx: int, d_idx: int) -> bool:
-            if d_idx < 0 or d_idx >= num_days:
-                return False
-            if roster_system.roster[n_idx, d_idx, off_idx] == 1:
-                return True
-            if (n_idx, d_idx) in fixed_off_cells or (n_idx, d_idx) in off_exception_cells or (n_idx, d_idx) in weekly_off_cells:
-                return True
-            if is_recovery_off(n_idx, d_idx):
-                return True
-            return False
-
-        def assigned_shift_idx(n_idx: int, d_idx: int) -> int | None:
-            if d_idx < 0 or d_idx >= num_days:
-                return None
-            vec = roster_system.roster[n_idx, d_idx]
-            ones = np.where(vec == 1)[0]
-            return int(ones[0]) if len(ones) == 1 else None
-
-        def violates_transition(n_idx: int, d_idx: int, s_idx: int) -> bool:
-            """E→D, N→E, D→N, N→D 금지 설정을 양옆 모두에서 검사."""
-            ban_n_to_d = bool(getattr(cfg, "ban_n_to_d", True))
-            ban_e_to_d = bool(getattr(cfg, "ban_e_to_d", True))
-            ban_n_to_e = bool(getattr(cfg, "ban_n_to_e", True))
-            ban_d_to_n = bool(getattr(cfg, "ban_d_to_n", True))
-
-            prev_idx = assigned_shift_idx(n_idx, d_idx - 1)
-            next_idx = assigned_shift_idx(n_idx, d_idx + 1)
-
-            # prev -> current
-            if prev_idx is not None:
-                if ban_e_to_d and prev_idx == eve_idx and s_idx == day_idx:
-                    return True
-                if ban_n_to_e and prev_idx == night_idx and s_idx == eve_idx:
-                    return True
-                if ban_n_to_d and prev_idx == night_idx and s_idx == day_idx:
-                    return True
-                if ban_d_to_n and prev_idx == day_idx and s_idx == night_idx:
-                    return True
-            # current -> next
-            if next_idx is not None:
-                if ban_e_to_d and s_idx == eve_idx and next_idx == day_idx:
-                    return True
-                if ban_n_to_e and s_idx == night_idx and next_idx == eve_idx:
-                    return True
-                if ban_n_to_d and s_idx == night_idx and next_idx == day_idx:
-                    return True
-                if ban_d_to_n and s_idx == day_idx and next_idx == night_idx:
-                    return True
-            return False
-
-        for n_idx, nurse in enumerate(roster_system.nurses):
-            if is_n_only(nurse):
-                continue
-
-            current_off = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
-            max_allowed = max_off_allowed(nurse)
-            if current_off <= max_allowed:
-                continue
-
-            required_min = min_off_required()
-            # 후보 O 셀을 모아 “징검다리”(양옆 OFF) 우선 회피
-            candidates: list[tuple[int, int, float, int]] = []
-            for d_idx in range(num_days):
-                if roster_system.roster[n_idx, d_idx, off_idx] != 1:
-                    continue
-                if (n_idx, d_idx) in fixed_off_cells:
-                    continue
-                if (n_idx, d_idx) in off_exception_cells or (n_idx, d_idx) in weekly_off_cells:
-                    continue
-                if is_recovery_off(n_idx, d_idx):
-                    continue
-                if bool(getattr(nurse, "is_weekend_off", False)) and d_idx in weekend_days:
-                    continue
-
-                adj_off = int(is_off_like(n_idx, d_idx - 1)) + int(is_off_like(n_idx, d_idx + 1))
-                has_deficit = int(d_idx in deficits_by_day and bool(deficits_by_day[d_idx]))
-                best_pref = 0.0
-                if pref_matrix is not None:
-                    best_pref = max(pref_matrix[n_idx, d_idx, s_idx] for s_idx in work_shift_indices)
-
-                candidates.append((adj_off, -has_deficit, -best_pref, d_idx))
-
-            # 징검다리(양옆 OFF=2)인 경우는 가장 마지막에 처리되도록 정렬
-            candidates.sort()
-
-            for _, _, _, d_idx in candidates:
-                if changes >= max_changes:
-                    break
-
-                target_shift_idx = None
-                if prefer_shortage and d_idx in deficits_by_day and deficits_by_day[d_idx]:
-                    target_shift_idx = max(deficits_by_day[d_idx].items(), key=lambda x: x[1])[0]
-                else:
-                    best_score = None
-                    for s_idx in work_shift_indices:
-                        if s_idx == off_idx:
-                            continue
-                        score = pref_matrix[n_idx, d_idx, s_idx] if pref_matrix is not None else 0
-                        # 전략별 보너스
-                        if grade_strategy == "TEAM":
-                            team_id = team_map.get(n_idx)
-                            score += 0.2 * team_shift_count(d_idx, s_idx, team_id)
-                        elif grade_strategy == "GRADE":
-                            score += grade_bonus(n_idx, d_idx, s_idx)
-                        if best_score is None or score > best_score:
-                            best_score = score
-                            target_shift_idx = s_idx
-                if target_shift_idx is None:
-                    continue
-
-                # 전이 금지 체크 (양옆)
-                if violates_transition(n_idx, d_idx, target_shift_idx):
-                    continue
-
-                # 교체 시뮬레이션
-                roster_system.roster[n_idx, d_idx, off_idx] = 0
-                roster_system.roster[n_idx, d_idx, target_shift_idx] = 1
-                new_off = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
-                new_viol = len(roster_system._find_violations())
-
-                if new_off < required_min or new_viol > base_viol:
-                    roster_system.roster[n_idx, d_idx, target_shift_idx] = 0
-                    roster_system.roster[n_idx, d_idx, off_idx] = 1
-                    continue
-
-                changes += 1
-                base_viol = new_viol
-                current_off = new_off
-
-                if d_idx in deficits_by_day and target_shift_idx in deficits_by_day[d_idx]:
-                    deficits_by_day[d_idx][target_shift_idx] = max(
-                        0, deficits_by_day[d_idx][target_shift_idx] - 1
-                    )
-                    if deficits_by_day[d_idx][target_shift_idx] == 0:
-                        deficits_by_day[d_idx].pop(target_shift_idx, None)
-                    if not deficits_by_day[d_idx]:
-                        deficits_by_day.pop(d_idx, None)
-
-                if current_off <= max_allowed:
-                    break
-
-        return changes
 
     def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
         """최종 근무표를 간호사별로 출력합니다.
@@ -3375,182 +2724,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
 
     # ───────────── 4. Soft (패널티 변수) ───────
-    obj=[]
-    P = rs.preference_matrix
-    for n in range(N):
-        nu = rs.nurses[n]
-        # N 전담 간호사 여부 확인
-        is_n_only = False
-        raw = getattr(nu, "is_night_nurse", None)
-        if isinstance(raw, list):
-            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-            is_n_only = (allowed == {"N"})
-        elif raw == 3 or (raw is not None and raw != 0 and raw != False):
-            is_n_only = True
-        
-        for d in range(join[n], leave[n]+1):
-            for s in range(S):
-                base_score = int(P[n,d,s]*100)
-                # N 전담 간호사가 N을 배정받으면 높은 보너스 (N 우선 배정 유도)
-                if is_n_only and s == night:
-                    base_score += 500  # N 전담의 N 근무에 큰 보너스
-                obj.append(base_score * X(n,d,s))
-
-    # (4-0) 추가 OFF(여유 OFF) 기피: off_days만큼은 하드로 만족시키되, 남는 인원은 D/E/N으로 분배 유도
-    try:
-        off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
-        if off_penalty > 0:
-            for n in range(N):
-                for d in range(join[n], leave[n] + 1):
-                    obj.append(-off_penalty * X(n, d, off))
-    except Exception:
-        pass
-
-    # (4-0a) 월단위 선호(개인 입력) 유도: 선호 교대에 소프트 보너스 부여
-    # - Wanted(날짜 지정형)와 달리 "약한 선호"로 간주하며, weight는 req 게이지로 조절한다.
-    try:
-        msp = getattr(rs, "monthly_shift_preferences", None)
-        base_w = int(getattr(cfg, "monthly_preference_weight", 0) or 0)
-        if base_w > 0 and isinstance(msp, dict) and msp:
-            for n, nu in enumerate(rs.nurses):
-                pref = msp.get(str(getattr(nu, "db_id", ""))) or msp.get(getattr(nu, "db_id", ""))
-                if not isinstance(pref, dict):
-                    continue
-                code = str(pref.get("shift") or "").strip().upper()
-                if code not in {"D", "E", "N"}:
-                    continue
-                try:
-                    strength = int(pref.get("strength", 5) or 0)
-                except Exception:
-                    strength = 5
-                strength = max(0, min(10, strength))
-                w = int(round(base_w * (strength / 10.0)))
-                if w <= 0:
-                    continue
-                s_idx = cfg.shift_types.index(code)
-                for d in range(join[n], leave[n] + 1):
-                    obj.append(w * X(n, d, s_idx))
-    except Exception:
-        pass
-
-    # (4-0b) 연속근무 소프트 상한: hard 제약은 유지하면서, "가능하면 더 짧게" 끊도록 유도한다.
-    # - 창 크기 (soft_k + 1) 안에 OFF가 1개도 없으면 miss=1 → 패널티.
-    # - 예: soft_k=5 이면 6연속근무(OFF 0) 창이 생길 때마다 패널티가 붙는다.
-    try:
-        soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
-        w_soft = int(getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0)
-        if soft_k > 0 and w_soft > 0:
-            for n in range(N):
-                T0, T1 = join[n], leave[n]
-                for d0 in range(T0, T1 - soft_k + 1):
-                    sum_off = sum(X(n, d0 + t, off) for t in range(soft_k + 1))
-                    miss = m.NewIntVar(0, 1, f"soft_cwork_miss_{n}_{d0}")
-                    m.Add(miss >= 1 - sum_off)
-                    obj.append(-w_soft * miss)
-    except Exception:
-        pass
-
-    # (4-1) 경력자 부족
-    for d in range(D):
-        for code in ('D','E','N'):
-            s=rs.config.shift_types.index(code)
-            exp_assigned = sum(X(n,d,s)
-                               for n,nu in enumerate(rs.nurses)
-                               if join[n]<=d<=leave[n] and
-                               nu.experience_years>=cfg.min_experience_per_shift)
-            shortage = m.NewIntVar(0, cfg.required_experienced_nurses, f'expShort_{d}_{code}')
-            m.Add(shortage >= cfg.required_experienced_nurses - exp_assigned)
-            obj.append(-200*shortage)
-
-    # (4-2) 주 2 OFF
-    if cfg.enforce_two_offs_per_week:
-        weeks=D//7
-        for n in range(N):
-            for w in range(weeks):
-                d0,d1=w*7,min(w*7+7,D)
-                offs=sum(X(n,d,off) for d in range(d0,d1)
-                         if join[n]<=d<=leave[n])
-                slack = m.NewIntVar(0,2,f'weekSlack_{n}_{w}')
-                m.Add(slack >= 2-offs); obj.append(-300*slack)
-
-    # (4-3) 야간 균등 (편차에 선형 패널티)
-    if cfg.even_nights:
-        normals=[i for i,nu in enumerate(rs.nurses) if nu.is_night_nurse != 3]
-        if normals:
-            total_req=sum(cfg.daily_shift_requirements['N'] for _ in range(D))
-            target=total_req//len(normals)
-            for n in normals:
-                totN=sum(X(n,d,night) for d in range(join[n],leave[n]+1))
-                devP=m.NewIntVar(0,D,f'devP_{n}')
-                devN=m.NewIntVar(0,D,f'devN_{n}')
-                m.Add(devP-devN==totN-target)
-                obj.extend([-50*devP,-50*devN])
-
-    # (4-4) N-O-D/E 패터
-    if getattr(cfg, 'nod_noe', True):
-        for n in range(N):
-            for d in range(join[n], leave[n]-2):
-                pat=m.NewIntVar(0,1,f'NOD_{n}_{d}')
-                m.Add(pat >= X(n,d,night)+X(n,d+1,off)+X(n,d+2,day)-2)
-                obj.append(-100*pat)
-                pat2=m.NewIntVar(0,1,f'NOE_{n}_{d}')
-                m.Add(pat2 >= X(n,d,night)+X(n,d+1,off)+X(n,d+2,eve)-2)
-                obj.append(-100*pat2)
-
-    # (4-5) 고립 OFF
-    for n in range(N):
-        for d in range(join[n], leave[n]+1):
-            iso=m.NewIntVar(0,1,f'iso_{n}_{d}')
-            m.Add(iso >= X(n,d,off)-X(n,d-1,off)-X(n,d+1,off))
-            m.Add(iso <= X(n,d,off))
-            m.Add(iso <= 1-X(n,d-1,off))
-            m.Add(iso <= 1-X(n,d+1,off))
-            obj.append(-100*iso)
- 
-    # (4-6) 프리셉터/팀 보너스 항 모듈화
-    if include_pair_objective:
-        obj.extend(_add_preceptor_objective_terms(m, rs, X, join, leave))
-        # 전략:
-        # - GRADE: Team OFF
-        # - TEAM : Team ON
-        # - BASE : Team OFF
-        grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        # grade_strategy = "TEAM"
-        print('grade_strategy', grade_strategy)
-        if grade_strategy == "TEAM":
-            obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))
-
-    # (4-7) 커버리지 부족 패널티(메인 경로 slack 허용) – 날짜별 요구치 기반
-    try:
-        pr = float(getattr(cfg, 'shift_requirement_priority', 0.8))
-        base = int(1000 * max(0.05, min(1.0, pr)))
-        for sh, code in coverage_shortage_vars:
-            w = base
-            if code == 'N':
-                w = int(base * 1.2)
-            obj.append(-w * sh)
-    except Exception:
-        pass
-
-    # (4-8) 여유 인원 L1 균등화: 동일 날짜의 D/E/N 간 초과 인원 차이를 최소화
-    try:
-        if bool(getattr(cfg, 'oversupply_equalize_enable', True)):
-            w_eq = int(getattr(cfg, 'oversupply_equalize_weight', 120))
-            for d, code2ov in over_vars_by_day.items():
-                # 실제 근무 코드만 사용('O' 제외)
-                work_codes = [code for code in code2ov.keys() if code in rs.config.daily_shift_requirements.keys()]
-                for i in range(len(work_codes)):
-                    for j in range(i + 1, len(work_codes)):
-                        c1, c2 = work_codes[i], work_codes[j]
-                        ov1, ov2 = code2ov[c1], code2ov[c2]
-                        diff = m.NewIntVar(0, N, f'ov_diff_{d}_{c1}_{c2}')
-                        m.Add(diff >= ov1 - ov2)
-                        m.Add(diff >= ov2 - ov1)
-                        obj.append(-w_eq * diff)
-            
-    except Exception:
-        pass
-    
+    obj = build_main_objective_terms(
+        m=m,
+        rs=rs,
+        X=X,
+        join=join,
+        leave=leave,
+        over_vars_by_day=over_vars_by_day,
+        coverage_shortage_vars=coverage_shortage_vars,
+        include_pair_objective=include_pair_objective,
+        preceptor_terms_fn=_add_preceptor_objective_terms,
+    )
     m.Maximize(sum(obj))
 
     return m,X,join,leave,fixed
