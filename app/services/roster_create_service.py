@@ -624,6 +624,19 @@ def _split_fixed_nurses(nurses_in_group: list[Nurse]) -> tuple[list[Nurse], list
     return fixed, engine
 
 
+# def _debug_log(stage: str, info: dict | None = None) -> None:
+#     """디버깅용 단계별 로그를 출력합니다.
+
+#     Args:
+#         stage: 현재 단계 라벨
+#         info: 추가 정보(dict) (예: {"count": 3})
+#     """
+#     try:
+#         print(f"[DebugStage] {stage} | info={info}")
+#     except Exception:
+#         pass
+
+
 def _build_fixed_shift_roster(
     fixed_nurses: list[Nurse],
     year: int,
@@ -2115,7 +2128,22 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         special_shift_requests,
         special_shift_map,
     ) = _collect_nurses_and_preferences(db, req, current_user)
+    # _debug_log(
+    #     "collect_done",
+    #     {
+    #         "nurses_total": len(nurses_in_group),
+    #         "preferences": len(preferences),
+    #     },
+    # )
     fixed_nurses, engine_nurses = _split_fixed_nurses(nurses_in_group)
+    # _debug_log(
+    #     "nurse_split",
+    #     {
+    #         "total": len(nurses_in_group),
+    #         "fixed": len(fixed_nurses),
+    #         "engine": len(engine_nurses),
+    #     },
+    # )
     print('fixed_nurses', [n.__dict__ for n in fixed_nurses])
     # 고정 근무는 주말 휴무 대상만 허용
     invalid = [n for n in fixed_nurses if not bool(getattr(n, "is_weekend_off", False))]
@@ -2185,6 +2213,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict.setdefault('cross_month_lookback_days', 6)
     config_dict.setdefault('allow_override_by_law', False)
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
+    # _debug_log(
+    #     "config_ready",
+    #     {
+    #         "weekly_off_group": config_dict.get("weekly_off_group"),
+    #         "weekend_off_only_enable": config_dict.get("weekend_off_only_enable"),
+    #         "max_extra_off_days": config_dict.get("max_extra_off_days"),
+    #         "extra_off_penalty_weight": config_dict.get("extra_off_penalty_weight"),
+    #     },
+    # )
 
     # ── 주휴 고정 셀(최우선) 계산 후 엔진에 OFF(O)로 주입 ──
     weekly_off_warnings: list[dict] = []
@@ -2231,6 +2268,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             for d in day_list:
                 weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
     config_dict["weekly_off_map"] = {k: sorted(list(v)) for k, v in weekly_off_map.items()}
+    # _debug_log(
+    #     "weekly_off_built",
+    #     {
+    #         "weekly_off_enabled": bool(config_dict.get("weekly_off_group", False)),
+    #         "map_count": len(weekly_off_map),
+    #         "fixed_cells": len(weekly_off_fixed_cells),
+    #         "warnings": len(weekly_off_warnings),
+    #     },
+    # )
 
     generated: dict[str, list[str]] = {}
     satisfaction_data = {}
@@ -2257,7 +2303,66 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     if off_exception_cells:
         config_dict["off_exception_cells"] = sorted(list(off_exception_cells))
 
+    # # ── 디버그: 특정 간호사/일자 기준 OFF 현황 확인 ──
+    # try:
+    #     watch_nurse_ids = {"442918"}  # 박지은
+    #     watch_day_indices = {16, 17}  # 17일(0-based 16), 18일(0-based 17)
+    #     nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
+    #     idx_to_id = {v: k for k, v in nurse_idx_map.items()}
+    #     off_days_by_nurse: dict[str, list[int]] = {}
+    #     for n_idx, d_idx in off_exception_cells:
+    #         nurse_id = idx_to_id.get(n_idx)
+    #         if not nurse_id:
+    #             continue
+    #         off_days_by_nurse.setdefault(nurse_id, []).append(d_idx)
+    #     for nurse_id in watch_nurse_ids:
+    #         weekly_days = sorted(list(weekly_off_map.get(nurse_id, set())))
+    #         exception_days = sorted(off_days_by_nurse.get(nurse_id, []))
+    #         _debug_log(
+    #             "watch_off_days",
+    #             {
+    #                 "nurse_id": nurse_id,
+    #                 "weekly_off_days": [d + 1 for d in weekly_days],
+    #                 "off_exception_days": [d + 1 for d in exception_days],
+    #             },
+    #         )
+
+    #     fixed_day_counts: dict[int, int] = {}
+    #     exception_day_counts: dict[int, int] = {}
+    #     for c in combined_fixed_cells:
+    #         try:
+    #             d_idx = int(c.get("day_index"))
+    #         except Exception:
+    #             continue
+    #         fixed_day_counts[d_idx] = fixed_day_counts.get(d_idx, 0) + 1
+    #     for _, d_idx in off_exception_cells:
+    #         exception_day_counts[d_idx] = exception_day_counts.get(d_idx, 0) + 1
+    #     _debug_log(
+    #         "watch_day_counts",
+    #         {
+    #             "days": {
+    #                 str(d + 1): {
+    #                     "fixed_cells": fixed_day_counts.get(d, 0),
+    #                     "off_exception_cells": exception_day_counts.get(d, 0),
+    #                 }
+    #                 for d in sorted(watch_day_indices)
+    #             }
+    #         },
+    #     )
+    # except Exception:
+    #     pass
+
     if nurses_for_engine:
+        # _debug_log(
+        #     "cp_sat_start",
+        #     {
+        #         "weekly_off_enabled": bool(config_dict.get("weekly_off_group", False)),
+        #         "weekly_off_cells": len(weekly_off_fixed_cells),
+        #         "special_fixed_cells": len(special_fixed_cells),
+        #         "combined_fixed_cells": len(combined_fixed_cells),
+        #         "engine_nurses": len(nurses_for_engine),
+        #     },
+        # )
         generated, satisfaction_data, roster_system = _run_cp_sat_basic(
             db,
             current_user,
@@ -2270,6 +2375,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             time_limit_seconds=60,
             config_override=config_dict,
         )
+        # _debug_log(
+        #     "cp_sat_end",
+        #     {
+        #         "generated_keys": len(generated) if isinstance(generated, dict) else None,
+        #         "roster_system_ready": roster_system is not None,
+        #     },
+        # )
 
     # ── 저장 시 주휴 날짜만 '주'로 마킹(표시용) ──
     try:

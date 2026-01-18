@@ -380,6 +380,18 @@ class CPSATBasicEngine:
         pair_preferences = {"work_together": [], "work_apart": []}
         shift_id_to_main = shift_id_to_main or {}
 
+        # # 디버깅 대상 간호사 ID
+        # watch_ids = {
+        #     "442921",
+        #     "442931",
+        #     "442934",
+        #     "442926",
+        #     "442919",
+        #     "442924",
+        #     "442918",
+        #     "442920",
+        # }
+
         for pref in prefs_data:
             nurse_id = pref["nurse_id"]
             data = pref.get("data", {})
@@ -408,6 +420,45 @@ class CPSATBasicEngine:
                         pair_preferences["work_together"].append(
                             {"nurse_1": nurse_id, "nurse_2": d["id"], "weight": d["weight"]}
                         )
+        # # ── 디버그: 특정 간호사 선호 요약 ──
+        # def _count_dates(obj: dict | list | None) -> int:
+        #     if obj is None:
+        #         return 0
+        #     if isinstance(obj, dict):
+        #         total = 0
+        #         for v in obj.values():
+        #             if isinstance(v, dict):
+        #                 total += len(v)
+        #             elif isinstance(v, list):
+        #                 total += len(v)
+        #             else:
+        #                 total += 1
+        #         return total
+        #     if isinstance(obj, list):
+        #         return len(obj)
+        #     return 0
+
+        # debug_rows = []
+        # for wid in watch_ids:
+        #     shift_pref = shift_preferences.get(wid)
+        #     off_req = off_requests.get(wid)
+        #     together = [p for p in pair_preferences["work_together"] if p.get("nurse_1") == wid or p.get("nurse_2") == wid]
+        #     apart = [p for p in pair_preferences["work_apart"] if p.get("nurse_1") == wid or p.get("nurse_2") == wid]
+        #     debug_rows.append(
+        #         {
+        #             "nurse_id": wid,
+        #             "shift_pref_types": list(shift_pref.keys()) if shift_pref else [],
+        #             "shift_pref_cnt": _count_dates(shift_pref),
+        #             "off_cnt": _count_dates(off_req),
+        #             "pair_together": len(together),
+        #             "pair_apart": len(apart),
+        #         }
+        #     )
+        # try:
+        #     print(f"[PrefDebug] watch_ids summary: {debug_rows}")
+        # except Exception:
+        #     pass
+
         return shift_preferences, off_requests, pair_preferences
 
     def generate_roster(
@@ -451,6 +502,15 @@ class CPSATBasicEngine:
         shift_defs = config_data.get("shift_definitions") if isinstance(config_data, dict) else None
         shift_id_to_main, main_to_shift_id = _build_shift_normalizer(shift_defs)
         canonical_to_shift_id = main_to_shift_id or {"D": "D", "E": "E", "N": "N", "O": "O"}
+        shift_id_to_type: dict[str, str] = {}
+        for row in shift_defs or []:
+            try:
+                sid = str(row.get("shift_id") or "").strip().upper()
+                stype = str(row.get("type") or "").strip()
+            except Exception:
+                continue
+            if sid and stype:
+                shift_id_to_type[sid] = stype
         fixed_original_shift_map: dict[tuple[int, int], str] = {}
         # 2. 대상 월 설정
         target_month = date(year, month, 1)
@@ -486,10 +546,16 @@ class CPSATBasicEngine:
                         d_idx = c.get("day_index")
                         raw_shift = str(c.get("shift") or "").strip().upper()
                         raw_type = str(c.get("shift_type") or "").strip()
-                    except Exception:
+                        print(f"{self.logger_prefix} 고정 셀: 간호사 {n_idx}, 날짜 {d_idx+1}, 근무 {raw_shift}, 타입 {raw_type}")
+                    except Exception as e:
+                        print('error!', e)
                         continue
                     if n_idx is None or d_idx is None:
                         continue
+                    if not raw_type:
+                        inferred = shift_id_to_type.get(raw_shift)
+                        if inferred:
+                            raw_type = inferred
                     if raw_shift in {"O", "OFF", "주"} or raw_type in {"휴가", "공가"}:
                         off_ex.add((n_idx, d_idx))
                     if raw_type in {"휴가", "공가"}:
@@ -519,6 +585,39 @@ class CPSATBasicEngine:
                     except Exception:
                         pass
                 c['shift'] = normalized_shift
+            # # 디버그: 특정 간호사 고정 셀/휴가 인식 확인
+            # try:
+            #     watch_ids = {"442918", "442924"}  # 박지은, 임윤아
+            #     watch_days = {15, 16, 17, 18}  # 16~19일(0-based)
+            #     id_to_idx = {n.db_id: n.id for n in nurses}
+            #     idx_to_id = {n.id: n.db_id for n in nurses}
+            #     watch_indices = {id_to_idx.get(nid) for nid in watch_ids if id_to_idx.get(nid) is not None}
+            #     if watch_indices:
+            #         off_ex = set(getattr(config, "off_exception_cells", []) or [])
+            #         off_ex_vac = set(getattr(config, "off_exception_vacation_cells", []) or [])
+            #         watch_rows = []
+            #         for c in fixed_cells:
+            #             n_idx = c.get("nurse_index")
+            #             d_idx = c.get("day_index")
+            #             if n_idx not in watch_indices:
+            #                 continue
+            #             if d_idx not in watch_days:
+            #                 continue
+            #             watch_rows.append(
+            #                 {
+            #                     "nurse_id": idx_to_id.get(n_idx),
+            #                     "day": d_idx + 1,
+            #                     "shift": c.get("shift"),
+            #                     "original_shift": fixed_original_shift_map.get((n_idx, d_idx)),
+            #                     "shift_type": c.get("shift_type"),
+            #                     "off_exception": (n_idx, d_idx) in off_ex,
+            #                     "off_exception_vac": (n_idx, d_idx) in off_ex_vac,
+            #                 }
+            #             )
+            #         if watch_rows:
+            #             print(f"{self.logger_prefix} [WatchFixedCells] {watch_rows}")
+            # except Exception:
+            #     pass
             # ── 경계 제약(강제 OFF/금지) 병합 ──
             initial_constraints = config_data.get('initial_constraints') or {}
             allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
@@ -1071,10 +1170,17 @@ class CPSATBasicEngine:
                         exc_logs = []
                         for n_idx, days in sorted(exc_map.items()):
                             nu = roster_system.nurses[n_idx]
+                            # vac_days = sorted(
+                            #     d_idx + 1
+                            #     for d_idx in range(D)
+                            #     if (n_idx, d_idx) in off_exception_vacation_cells
+                            # )
+                            # vac_info = f", vac={vac_days}" if vac_days else ""
                             exc_logs.append(
                                 f"{n_idx}:{getattr(nu, 'nurse_id', '?')}/"
                                 f"{getattr(nu, 'name', '?')}/"
                                 f"{getattr(nu, 'account_id', '?')} -> {sorted(days)}"
+                                # f"{getattr(nu, 'account_id', '?')} -> {sorted(days)}{vac_info}"
                             )
                         print("[OffExceptionCells] " + "; ".join(exc_logs))
                 except Exception:
@@ -3194,6 +3300,22 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     # 예) 28일 월 → 28-15=13, 30일 월 → 30-15=15, 31일 월 → 31-15=16
                     avail_days = T1 - T0 + 1
                     max_off_allowed_n_only = max(0, avail_days - 15)
+                    if getattr(nu, "db_id", None) in {"442918", "442924"}:
+                        fixed_off_cnt = sum(
+                            1 for (fn, fd), s_idx in fixed.items()
+                            if fn == n and s_idx == off
+                        )
+                        fixed_off_cnt_excl_vac = sum(
+                            1 for (fn, fd), s_idx in fixed.items()
+                            if fn == n and s_idx == off and (fn, fd) not in forced_off_cap_excluded
+                        )
+                        print(
+                            f"{self.logger_prefix} [WatchOffCap] nurse_id={nu.db_id}, "
+                            f"fixed_off={fixed_off_cnt}, "
+                            f"fixed_off_excl_vac={fixed_off_cnt_excl_vac}, "
+                            f"min_off_required={min_off_required}, "
+                            f"max_off_allowed={max_off_allowed_n_only}"
+                        )
                     m.Add(
                         sum(
                             X(n, d, off)
@@ -3204,6 +3326,22 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                 else:
                     max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
+                    # if getattr(nu, "db_id", None) in {"442918", "442924"}:
+                    #     fixed_off_cnt = sum(
+                    #         1 for (fn, fd), s_idx in fixed.items()
+                    #         if fn == n and s_idx == off
+                    #     )
+                    #     fixed_off_cnt_excl_vac = sum(
+                    #         1 for (fn, fd), s_idx in fixed.items()
+                    #         if fn == n and s_idx == off and (fn, fd) not in forced_off_cap_excluded
+                    #     )
+                    #     print(
+                    #         f"{self.logger_prefix} [WatchOffCap] nurse_id={nu.db_id}, "
+                    #         f"fixed_off={fixed_off_cnt}, "
+                    #         f"fixed_off_excl_vac={fixed_off_cnt_excl_vac}, "
+                    #         f"min_off_required={min_off_required}, "
+                    #         f"max_off_allowed={max_off_allowed}"
+                    #     )
                     m.Add(
                         sum(
                             X(n, d, off)
