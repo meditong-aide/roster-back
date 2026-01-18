@@ -420,44 +420,44 @@ class CPSATBasicEngine:
                         pair_preferences["work_together"].append(
                             {"nurse_1": nurse_id, "nurse_2": d["id"], "weight": d["weight"]}
                         )
-        # # ── 디버그: 특정 간호사 선호 요약 ──
-        # def _count_dates(obj: dict | list | None) -> int:
-        #     if obj is None:
-        #         return 0
-        #     if isinstance(obj, dict):
-        #         total = 0
-        #         for v in obj.values():
-        #             if isinstance(v, dict):
-        #                 total += len(v)
-        #             elif isinstance(v, list):
-        #                 total += len(v)
-        #             else:
-        #                 total += 1
-        #         return total
-        #     if isinstance(obj, list):
-        #         return len(obj)
-        #     return 0
+        # ── 디버그: 특정 간호사 선호 요약 ──
+        def _count_dates(obj: dict | list | None) -> int:
+            if obj is None:
+                return 0
+            if isinstance(obj, dict):
+                total = 0
+                for v in obj.values():
+                    if isinstance(v, dict):
+                        total += len(v)
+                    elif isinstance(v, list):
+                        total += len(v)
+                    else:
+                        total += 1
+                return total
+            if isinstance(obj, list):
+                return len(obj)
+            return 0
 
-        # debug_rows = []
-        # for wid in watch_ids:
-        #     shift_pref = shift_preferences.get(wid)
-        #     off_req = off_requests.get(wid)
-        #     together = [p for p in pair_preferences["work_together"] if p.get("nurse_1") == wid or p.get("nurse_2") == wid]
-        #     apart = [p for p in pair_preferences["work_apart"] if p.get("nurse_1") == wid or p.get("nurse_2") == wid]
-        #     debug_rows.append(
-        #         {
-        #             "nurse_id": wid,
-        #             "shift_pref_types": list(shift_pref.keys()) if shift_pref else [],
-        #             "shift_pref_cnt": _count_dates(shift_pref),
-        #             "off_cnt": _count_dates(off_req),
-        #             "pair_together": len(together),
-        #             "pair_apart": len(apart),
-        #         }
-        #     )
-        # try:
-        #     print(f"[PrefDebug] watch_ids summary: {debug_rows}")
-        # except Exception:
-        #     pass
+        debug_rows = []
+        for wid in {pref['nurse_id'] for pref in prefs_data}:
+            shift_pref = shift_preferences.get(wid)
+            off_req = off_requests.get(wid)
+            together = [p for p in pair_preferences["work_together"] if p.get("nurse_1") == wid or p.get("nurse_2") == wid]
+            apart = [p for p in pair_preferences["work_apart"] if p.get("nurse_1") == wid or p.get("nurse_2") == wid]
+            debug_rows.append(
+                {
+                    "nurse_id": wid,
+                    "shift_pref_types": list(shift_pref.keys()) if shift_pref else [],
+                    "shift_pref_cnt": _count_dates(shift_pref),
+                    "off_cnt": _count_dates(off_req),
+                    "pair_together": len(together),
+                    "pair_apart": len(apart),
+                }
+            )
+        try:
+            print(f"[PrefDebug] watch_ids summary: {debug_rows}")
+        except Exception:
+            pass
 
         return shift_preferences, off_requests, pair_preferences
 
