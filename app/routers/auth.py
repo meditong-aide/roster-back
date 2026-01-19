@@ -165,7 +165,10 @@ async def login_for_access_token(
             Nurse.account_id == account_id
         ).first()
         
-        is_nurse_registered = nurse_record is not None
+        if is_master_admin:
+            is_nurse_registered = True
+        else:
+            is_nurse_registered = nurse_record is not None
 
         access_token = create_login_token(
             data={
