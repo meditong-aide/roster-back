@@ -404,6 +404,73 @@ def postprocess_trim_extra_offs(
                 return True
         return False
 
+    def would_create_single_night(n_idx: int, d_idx: int, s_idx: int) -> bool:
+        """후처리에서 N 배정 시 1N 금지를 위반하는지 검사한다.
+
+        수식: 1N 금지 → N(d) ≤ N(d-1) + N(d+1) (예: d=5이면 N5 ≤ N4+N6)
+        수식 예시: N5=1, N4=0, N6=0 → 1 ≤ 0+0(불가)
+        """
+        if not bool(getattr(cfg, "not_one_night", False)):
+            return False
+        if "N" not in cfg.shift_types:
+            return False
+        night_idx_local = cfg.shift_types.index("N")
+        if s_idx != night_idx_local:
+            return False
+        prev_is_n = d_idx - 1 >= 0 and roster_system.roster[n_idx, d_idx - 1, night_idx_local] == 1
+        next_is_n = (
+            d_idx + 1 < num_days and roster_system.roster[n_idx, d_idx + 1, night_idx_local] == 1
+        )
+        return not (prev_is_n or next_is_n)
+
+    def would_violate_recovery_off(n_idx: int, d_idx: int, s_idx: int) -> bool:
+        """후처리에서 N 배정 시 2N/3N→2OFF 규칙을 위반하는지 검사한다.
+
+        규칙:
+            - 2N→2OFF: 연속 N이 2일 이상이면, 마지막 N 다음 2일은 O여야 함.
+            - 3N→2OFF: 연속 N이 3일 이상이면, 마지막 N 다음 2일은 O여야 함.
+        """
+        if "N" not in cfg.shift_types:
+            return False
+        night_idx_local = cfg.shift_types.index("N")
+        if s_idx != night_idx_local:
+            return False
+        if not bool(getattr(cfg, "two_offs_after_two_nig", False)) and not bool(
+            getattr(cfg, "two_offs_after_three_nig", False)
+        ):
+            return False
+
+        def is_n(d_idx_check: int) -> bool:
+            if d_idx_check < 0 or d_idx_check >= num_days:
+                return False
+            if d_idx_check == d_idx:
+                return True
+            return roster_system.roster[n_idx, d_idx_check, night_idx_local] == 1
+
+        # 연속 N 블록 길이 계산 (가상으로 d_idx에 N을 배치한 상태)
+        start = d_idx
+        while start - 1 >= 0 and is_n(start - 1):
+            start -= 1
+        end = d_idx
+        while end + 1 < num_days and is_n(end + 1):
+            end += 1
+        length = end - start + 1
+
+        need_two_off = False
+        if bool(getattr(cfg, "two_offs_after_three_nig", False)) and length >= 3:
+            need_two_off = True
+        if bool(getattr(cfg, "two_offs_after_two_nig", False)) and length >= 2:
+            need_two_off = True
+        if not need_two_off:
+            return False
+
+        for off_d in (end + 1, end + 2):
+            if off_d >= num_days:
+                continue
+            if not is_off_like(n_idx, off_d):
+                return True
+        return False
+
     for n_idx, nurse in enumerate(roster_system.nurses):
         if is_n_only(nurse):
             continue
@@ -463,6 +530,10 @@ def postprocess_trim_extra_offs(
             if target_shift_idx is None:
                 continue
 
+            if would_create_single_night(n_idx, d_idx, target_shift_idx):
+                continue
+            if would_violate_recovery_off(n_idx, d_idx, target_shift_idx):
+                continue
             if violates_transition(n_idx, d_idx, target_shift_idx):
                 continue
 

@@ -97,12 +97,12 @@ def _log_weekend_work_assignments(
         nurse_id = getattr(nu, "nurse_id", "?")
         nurse_name = getattr(nu, "name", "?")
         is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
-        if weekend_work or is_weekend_off:
-            print(
-                f"{logger_prefix} [WeekendOff][Work] nurse_idx={n}, "
-                f"nurse_id={nurse_id}, name={nurse_name}, "
-                f"is_weekend_off={int(is_weekend_off)}, weekend_work={weekend_work}"
-            )
+        # if weekend_work or is_weekend_off:
+        #     print(
+        #         f"{logger_prefix} [WeekendOff][Work] nurse_idx={n}, "
+        #         f"nurse_id={nurse_id}, name={nurse_name}, "
+        #         f"is_weekend_off={int(is_weekend_off)}, weekend_work={weekend_work}"
+        #     )
 
 
 def optimize_fallback_lex_hard_first(
