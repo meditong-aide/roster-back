@@ -1364,6 +1364,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 forced_off_cap_excluded.add((n, d))
     forced_off_cells.update(off_exception_cells)
     forced_off_cap_excluded.update(off_exception_vacation_cells)
+    # 주말 휴무 간호사: off_exception_cells는 OFF 상한에서 제외
+    for n_idx, nurse in enumerate(rs.nurses):
+        if bool(getattr(nurse, "is_weekend_off", False)):
+            forced_off_cap_excluded.update(
+                (n_idx, d_idx) for (n_idx, d_idx) in off_exception_cells
+            )
 
     # N 금지 간호사 판별(모든 근무일에 N이 금지된 경우)
     n_forbid_n: set[int] = set()
@@ -1634,6 +1640,24 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             try:
                 weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
                 weekend_cnt = len(weekend_in_range)
+                off_exception_days = sorted(
+                    d + 1
+                    for (n_idx, d) in off_exception_cells
+                    if n_idx == n and T0 <= d <= T1
+                )
+                fixed_off_days = sorted(
+                    d + 1
+                    for (n_idx, d) in forced_off_cells
+                    if n_idx == n and T0 <= d <= T1
+                )
+                cap_excluded_days = sorted(
+                    d + 1
+                    for (n_idx, d) in forced_off_cap_excluded
+                    if n_idx == n and T0 <= d <= T1
+                )
+                weekly_off_days = sorted(
+                    d + 1 for d in (weekly_off_by_idx.get(n, []) or []) if T0 <= d <= T1
+                )
                 base_min_off = int(
                     getattr(cfg, "global_monthly_off_days", 0)
                     + getattr(cfg, "standard_personal_off_days", 0)
@@ -1651,6 +1675,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     f"K={K}, forbid_n={int(n in n_forbid_n)}, "
                     f"two_offs_after_two_nig={int(bool(getattr(cfg, 'two_offs_after_two_nig', False)))}, "
                     f"two_offs_after_three_nig={int(bool(getattr(cfg, 'two_offs_after_three_nig', False)))}"
+                )
+                print(
+                    f"[WeekendOff][HardCheck][OFF-DETAIL] "
+                    f"weekend_days={[(d + 1) for d in weekend_in_range]}, "
+                    f"weekly_off_days={weekly_off_days}, "
+                    f"off_exception_days={off_exception_days}, "
+                    f"fixed_off_days={fixed_off_days}, "
+                    f"cap_excluded_days={cap_excluded_days}"
                 )
                 if weekend_cnt < min_off_required:
                     print(
