@@ -2180,6 +2180,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict['daily_shift_requirements'] = daily_shift_requirements
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
+    # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
+    if getattr(req, "not_one_night", None) is not None:
+        config_dict["not_one_night"] = bool(req.not_one_night)
     fixed_nurse_ids = {str(n.nurse_id) for n in fixed_nurses}
     engine_special_shift_requests = [
         r

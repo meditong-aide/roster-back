@@ -182,7 +182,7 @@ class CPSATBasicEngine:
             # 법규 제약사항 (Hard Constraints)
             max_night_shifts_per_month=max_nig_per_month,
             max_consecutive_nights=3 if three_seq_nig else 2,
-            not_one_night=1,
+            not_one_night=not_one_night,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
             banned_day_after_eve=banned_day_after_eve,

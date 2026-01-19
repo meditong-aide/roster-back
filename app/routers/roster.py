@@ -182,6 +182,8 @@ async def get_config_by_version(
                 nod_noe=False,
                 preceptor_gauge=getattr(cfg, 'preceptor_gauge', 5),
                 weekly_off_group=getattr(cfg, 'weekly_off_group', False),
+                off_placement_mode=getattr(cfg, 'off_placement_mode', 0),
+                not_one_night=getattr(cfg, 'not_one_night', False),
             )
             db.add(new_config)
 
@@ -214,6 +216,8 @@ async def get_config_by_version(
                 "nod_noe": new_config.nod_noe,
                 "preceptor_gauge" : new_config.preceptor_gauge,
                 "weekly_off_group" : new_config.weekly_off_group,
+                "off_placement_mode" : new_config.off_placement_mode,
+                "not_one_night" : new_config.not_one_night,
             }
         else:
             config = db.query(RosterConfigModel).filter(
@@ -248,6 +252,8 @@ async def get_config_by_version(
                 "nod_noe": config.nod_noe,
                 "preceptor_gauge" : config.preceptor_gauge,
                 "weekly_off_group" : config.weekly_off_group,
+                "off_placement_mode" : config.off_placement_mode,
+                "not_one_night" : config.not_one_night,
             }
     except Exception as e:
         print('error', e)

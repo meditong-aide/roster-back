@@ -90,6 +90,7 @@ def save_roster_config_service(
             office_id=target_office_id,
             group_id=target_group_id,
         )
+        print('db_config', db_config.__dict__)
         weekly_off_group = config_dict.get('weekly_off_group')
         db.query(WeeklyOffSetting).filter(
             WeeklyOffSetting.office_id == target_office_id,

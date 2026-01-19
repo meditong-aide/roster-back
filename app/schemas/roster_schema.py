@@ -91,6 +91,7 @@ class RosterRequest(BaseModel):
     monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
     # 월단위 선호(개인 입력): nurse_id -> {"shift": "D|E|N", "strength": 0~10}
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
+    not_one_night: Optional[bool] = Field(default=None, description="야간 단발성(1N) 금지 여부")
 
 class PreferenceSubmit(BaseModel):
     year: int
