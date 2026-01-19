@@ -182,7 +182,7 @@ class CPSATBasicEngine:
             # 법규 제약사항 (Hard Constraints)
             max_night_shifts_per_month=max_nig_per_month,
             max_consecutive_nights=3 if three_seq_nig else 2,
-            not_one_night=not_one_night,
+            not_one_night=1,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
             banned_day_after_eve=banned_day_after_eve,
@@ -234,7 +234,7 @@ class CPSATBasicEngine:
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
-            off_placement_mode=1,
+            off_placement_mode=0,
         )
         # 월말 자연스러운 종료를 유도하기 위한 그림자 커버리지(소프트) 기본값
         setattr(cfg, "shadow_coverage_lookback_days", int(config_data.get("shadow_coverage_lookback_days", 6) or 0))
@@ -601,17 +601,25 @@ class CPSATBasicEngine:
             initial_constraints = config_data.get('initial_constraints') or {}
             allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
             rs_dbid_to_idx = {n.db_id: n.id for n in nurses}
-            config.off_placement_mode = int(getattr(config, "off_placement_mode", 0) or 0)
             weekly_off_map_raw = config_data.get("weekly_off_map") or {}
-            weekly_off_by_idx: dict[int, list[int]] = {}
-            for dbid, day_list in (weekly_off_map_raw or {}).items():
-                n_idx = rs_dbid_to_idx.get(str(dbid))
-                if n_idx is None:
-                    continue
-                try:
-                    weekly_off_by_idx[n_idx] = sorted({int(d) for d in day_list})
-                except Exception:
-                    continue
+            # weekly_off_settings의 activate가 0이면 weekly_off_map이 비어있음
+            # 이 경우 off_placement_mode도 효력이 없도록 설정
+            weekly_off_settings_activate = bool(config_data.get("weekly_off_settings_activate", False))
+            if not weekly_off_settings_activate or not weekly_off_map_raw:
+                # activate가 0이거나 weekly_off_map이 비어있으면 주휴 관련 옵션 비활성화
+                config.off_placement_mode = 1
+                weekly_off_by_idx: dict[int, list[int]] = {}
+            else:
+                config.off_placement_mode = int(config_data.get("off_placement_mode", 0) or 0)
+                weekly_off_by_idx: dict[int, list[int]] = {}
+                for dbid, day_list in (weekly_off_map_raw or {}).items():
+                    n_idx = rs_dbid_to_idx.get(str(dbid))
+                    if n_idx is None:
+                        continue
+                    try:
+                        weekly_off_by_idx[n_idx] = sorted({int(d) for d in day_list})
+                    except Exception:
+                        continue
             roster_system.weekly_off_by_idx = weekly_off_by_idx
             prev_last_off_raw = config_data.get("prev_month_last_is_off") or {}
             prev_last_off_by_idx: dict[int, bool] = {}
@@ -1271,7 +1279,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
                 if fixed_o_cnt >= 4:
                     print(
-                        f"{self.logger_prefix} [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
+                        f"[CP-SAT-Basic] [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
                     )
                     continue
                 # off_or_weekly 기준 4개 모두 O/주면 금지
@@ -1280,6 +1288,74 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     + sum(1 for k in range(4) if (n, d + k) in off_or_weekly)
                     <= 3
                 )
+    
+    # ───────────── 2-A3. 주휴 근처 OFF 배치 제약 (off_placement_mode) ─────────────
+    off_placement_mode = int(getattr(rs.config, "off_placement_mode", 0) or 0)
+    prev_month_last_is_off = getattr(rs, "prev_month_last_is_off", {}) if isinstance(getattr(rs, "prev_month_last_is_off", {}), dict) else {}
+    
+    if off_placement_mode > 0 and weekly_off_by_idx:
+        # 커버리지 부족일 계산 (fallback_lex.py와 동일한 로직)
+        shortage_days: set[int] = set()
+        try:
+            for d in range(D):
+                if (
+                    hasattr(rs.config, "daily_shift_requirements_by_day")
+                    and isinstance(rs.config.daily_shift_requirements_by_day, list)
+                    and d < len(rs.config.daily_shift_requirements_by_day)
+                ):
+                    need_map = rs.config.daily_shift_requirements_by_day[d]
+                else:
+                    need_map = rs.config.daily_shift_requirements
+                total_need = sum(int(v) for v in (need_map or {}).values())
+                active_cnt = sum(1 for n in range(N) if join[n] <= d <= leave[n])
+                fixed_off_cnt = fixed_cnt[d][off_idx_full] if off_idx_full is not None else 0
+                avail_eff = max(0, active_cnt - fixed_off_cnt)
+                if avail_eff < total_need:
+                    shortage_days.add(d)
+        except Exception:
+            shortage_days = set()
+        
+        for n, day_list in weekly_off_by_idx.items():
+            if n >= len(join):
+                continue
+            T0, T1 = join[n], leave[n]
+            for d_raw in day_list or []:
+                try:
+                    d = int(d_raw)
+                except Exception:
+                    continue
+                if d < T0 or d > T1:
+                    continue
+                if d == D - 1:
+                    continue
+                if d == 0:
+                    if bool(prev_month_last_is_off.get(n, False)):
+                        continue
+                    if d + 1 <= T1:
+                        m.Add(X(n, d + 1, off_idx_full) == 1)
+                    continue
+                
+                if off_placement_mode == 1:
+                    # 모드 1: 앞/뒤 중 하나에 O 배치
+                    neighbours = []
+                    left_pos = d - 1
+                    right_pos = d + 1
+                    if left_pos >= T0 and left_pos not in shortage_days:
+                        neighbours.append(X(n, left_pos, off_idx_full))
+                    if right_pos <= T1 and right_pos not in shortage_days:
+                        neighbours.append(X(n, right_pos, off_idx_full))
+                    if not neighbours:
+                        continue
+                    if len(neighbours) == 1:
+                        m.Add(neighbours[0] == 1)
+                    else:
+                        m.Add(sum(neighbours) >= 1)
+                elif off_placement_mode == 2:
+                    # 모드 2: 앞에만 O 배치
+                    left_pos = d - 1
+                    if left_pos >= T0 and left_pos not in shortage_days:
+                        m.Add(X(n, left_pos, off_idx_full) == 1)
+    
     # ───────────── 2-A2. 초기 금지 셀(경계 제약) ─────────────
     try:
         if hasattr(rs, 'initial_forbidden') and isinstance(rs.initial_forbidden, dict):

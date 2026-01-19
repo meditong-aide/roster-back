@@ -160,6 +160,7 @@ class RosterConfigBase(BaseModel):
     team_balance_enable: bool = Field(default=False)
     team_balance_gauge: int = Field(default=0, ge=0, le=10)
     team_balance_mode: str = Field(default="balanced")
+    off_placement_mode: int = Field(default=1, description="주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)")
 
 class RosterConfigCreate(RosterConfigBase):
     config_version: Optional[str] = None

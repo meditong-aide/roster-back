@@ -190,6 +190,20 @@ def build_main_objective_terms(
             m.Add(iso <= 1 - X(n, d + 1, off))
             obj.append(-ISOLATED_OFF_PENALTY * iso)
 
+    # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
+    if getattr(cfg, "sequential_offs", True):
+        SEQUENTIAL_OFF_BONUS = 15  # 연속 휴무 보너스 가중치
+        for n in range(N):
+            T0, T1 = join[n], leave[n]
+            for d in range(T0, T1):
+                # 연속된 OFF에 보너스 부여
+                consecutive_bonus = m.NewBoolVar(f"seq_off_{n}_{d}")
+                # X(n, d, off) == 1 AND X(n, d+1, off) == 1 이면 consecutive_bonus == 1
+                m.Add(consecutive_bonus <= X(n, d, off))
+                m.Add(consecutive_bonus <= X(n, d + 1, off))
+                m.Add(consecutive_bonus >= X(n, d, off) + X(n, d + 1, off) - 1)
+                obj.append(SEQUENTIAL_OFF_BONUS * consecutive_bonus)
+
     # (4-6) 프리셉터/팀 보너스 항
     if include_pair_objective:
         try:

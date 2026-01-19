@@ -230,6 +230,7 @@ class RosterConfig(Base):
     team_balance_enable = Column(BOOLEAN, nullable=False, default=False)
     team_balance_gauge = Column(INTEGER, nullable=False, default=0)
     team_balance_mode = Column(VARCHAR(20), nullable=False, default="balanced")
+    off_placement_mode = Column(INTEGER, nullable=False, default=0)
 
     office = relationship("Office")
     group = relationship("Group")

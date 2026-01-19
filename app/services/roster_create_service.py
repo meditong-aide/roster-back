@@ -2241,6 +2241,25 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         year=req.year,
         month=req.month,
     )
+    # weekly_off_settings의 activate 값을 config_dict에 추가
+    try:
+        if _table_exists(db, "weekly_off_settings"):
+            setting = db.execute(
+                text(
+                    "SELECT TOP 1 activate "
+                    "FROM weekly_off_settings "
+                    "WHERE office_id = :office_id AND group_id = :group_id"
+                ),
+                {"office_id": current_user.office_id, "group_id": current_user.group_id},
+            ).fetchone()
+            if setting:
+                config_dict["weekly_off_settings_activate"] = bool(setting.activate)
+            else:
+                config_dict["weekly_off_settings_activate"] = False
+        else:
+            config_dict["weekly_off_settings_activate"] = False
+    except Exception:
+        config_dict["weekly_off_settings_activate"] = False
     weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
 
     if weekly_off_map:
