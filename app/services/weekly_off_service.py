@@ -185,12 +185,24 @@ def update_weekly_off_settings_service(
     setting.cycle_interval = payload.cycle_interval
     setting.shift_variation = payload.shift_variation
     
+    # 추가
+    if payload.cycle_start_date is not None:
+        setting.base_year = payload.cycle_start_date.year
+        setting.base_month = payload.cycle_start_date.month
     # base_year/base_month 가 없는 상태에서 최초 활성화 시, 현재 시점을 기준으로 잡을 수도 있음.
     # 여기서는 명시적 업데이트가 없으면 그대로 둠 (간호사 설정 시점에 갱신됨)
+    
+    print("[UPDATE SETTINGS] cycle_start_date:", payload.cycle_start_date)
+    if payload.cycle_start_date:
+        print("  → year:", payload.cycle_start_date.year, "month:", payload.cycle_start_date.month)
+    
+    print("[BEFORE COMMIT] base_year:", setting.base_year, "base_month:", setting.base_month)
     
     setting.updated_at = datetime.now()
     db.commit()
     db.refresh(setting)
+    print("[AFTER REFRESH] base_year:", setting.base_year, "base_month:", setting.base_month)
+    
     return setting
 
 
