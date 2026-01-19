@@ -1414,6 +1414,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     day,eve,night,off = idx['D'],idx['E'],idx['N'],idx['O']
     # 주말(토/일) day_idx 집합(0-based)
     weekend_days = {d for d in range(D) if (rs.target_month + timedelta(days=d)).weekday() >= 5}
+    try:
+        weekend_off_list = [
+            f"{getattr(nu, 'name', '?')}({getattr(nu, 'nurse_id', '?')})"
+            for nu in rs.nurses
+            if bool(getattr(nu, "is_weekend_off", False))
+        ]
+        print(
+            f"[WeekendOff][CP-SAT] 대상 간호사 수={len(weekend_off_list)} "
+            f"weekend_days={sorted(weekend_days)} "
+            f"list={weekend_off_list}"
+        )
+    except Exception as e:
+        print(f"[WeekendOff][CP-SAT] 로깅 실패: {e}")
 
     # ───────────── 3. Hard 법규 ───────────────
     cfg = rs.config
