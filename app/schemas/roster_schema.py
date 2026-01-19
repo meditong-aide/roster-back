@@ -91,6 +91,7 @@ class RosterRequest(BaseModel):
     monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
     # 월단위 선호(개인 입력): nurse_id -> {"shift": "D|E|N", "strength": 0~10}
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
+    not_one_night: Optional[bool] = Field(default=None, description="야간 단발성(1N) 금지 여부")
 
 class PreferenceSubmit(BaseModel):
     year: int
@@ -160,6 +161,7 @@ class RosterConfigBase(BaseModel):
     team_balance_enable: bool = Field(default=False)
     team_balance_gauge: int = Field(default=0, ge=0, le=10)
     team_balance_mode: str = Field(default="balanced")
+    off_placement_mode: int = Field(default=1, description="주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)")
 
 class RosterConfigCreate(RosterConfigBase):
     config_version: Optional[str] = None

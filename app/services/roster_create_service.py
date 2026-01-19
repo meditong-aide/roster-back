@@ -2180,6 +2180,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict['daily_shift_requirements'] = daily_shift_requirements
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
+    # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
+    if getattr(req, "not_one_night", None) is not None:
+        config_dict["not_one_night"] = bool(req.not_one_night)
     fixed_nurse_ids = {str(n.nurse_id) for n in fixed_nurses}
     engine_special_shift_requests = [
         r
@@ -2241,6 +2244,25 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         year=req.year,
         month=req.month,
     )
+    # weekly_off_settings의 activate 값을 config_dict에 추가
+    try:
+        if _table_exists(db, "weekly_off_settings"):
+            setting = db.execute(
+                text(
+                    "SELECT TOP 1 activate "
+                    "FROM weekly_off_settings "
+                    "WHERE office_id = :office_id AND group_id = :group_id"
+                ),
+                {"office_id": current_user.office_id, "group_id": current_user.group_id},
+            ).fetchone()
+            if setting:
+                config_dict["weekly_off_settings_activate"] = bool(setting.activate)
+            else:
+                config_dict["weekly_off_settings_activate"] = False
+        else:
+            config_dict["weekly_off_settings_activate"] = False
+    except Exception:
+        config_dict["weekly_off_settings_activate"] = False
     weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
 
     if weekly_off_map:
