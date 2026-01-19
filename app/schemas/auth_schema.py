@@ -20,6 +20,9 @@ class User(BaseModel):
     gw_useYN: str
     qpis_useYN: str
     official_title_name: str | None  # 추가 필드
+    
+    # 추가
+    is_nurse_registered: bool = False
 
 
     class Config:

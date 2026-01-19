@@ -159,6 +159,13 @@ async def login_for_access_token(
         group_id = extra_data.get("group_id") or group_id
         if "is_head_nurse" in extra_data:
             is_head_nurse = extra_data["is_head_nurse"]
+            
+        # 추가
+        nurse_record = db.query(Nurse).filter(
+            Nurse.account_id == account_id
+        ).first()
+        
+        is_nurse_registered = nurse_record is not None
 
         access_token = create_login_token(
             data={
@@ -177,6 +184,8 @@ async def login_for_access_token(
                 "gw_useYN": gw_useYN,
                 "qpis_useYN": qpis_useYN,
                 "official_title_name": official_title_name,  # 추가 필드
+                # 일단은 토큰에는 추가 안함
+                # "is_nurse_registered": is_nurse_registered,
             },
             expires_delta=access_token_expires,
         )
@@ -203,6 +212,8 @@ async def login_for_access_token(
             gw_useYN=gw_useYN,
             qpis_useYN=qpis_useYN,
             official_title_name=official_title_name,  # 추가 필드
+            # 추가 필드
+            is_nurse_registered=is_nurse_registered
         )
     except Exception as e:
         import traceback
