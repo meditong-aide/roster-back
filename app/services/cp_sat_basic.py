@@ -78,6 +78,95 @@ def _normalize_shift_code(raw_code: object, id_to_main: dict[str, str]) -> str |
     return normalize_shift_code_impl(raw_code, id_to_main)
 
 
+def _cp_sat_status_to_text(status: int) -> str:
+    """CP-SAT 상태 코드를 사람이 읽을 수 있는 문자열로 변환한다."""
+    from ortools.sat.python import cp_model
+
+    mapping = {
+        cp_model.OPTIMAL: "OPTIMAL",
+        cp_model.FEASIBLE: "FEASIBLE",
+        cp_model.INFEASIBLE: "INFEASIBLE",
+        cp_model.MODEL_INVALID: "MODEL_INVALID",
+        cp_model.UNKNOWN: "UNKNOWN",
+    }
+    return mapping.get(status, f"UNKNOWN({status})")
+
+
+def _log_weekend_off_enforcement_once(
+    rs: RosterSystem,
+    join: list[int],
+    leave: list[int],
+    weekend_days: set[int],
+    fixed: dict[tuple[int, int], int],
+    off_idx: int | None,
+    logger_prefix: str,
+) -> None:
+    """주말 OFF 강제 제약 적용 내역을 1회만 출력한다."""
+    if getattr(rs, "_weekend_off_enforcement_logged", False):
+        return
+    setattr(rs, "_weekend_off_enforcement_logged", True)
+    if not getattr(rs.config, "weekend_off_only_enable", True):
+        return
+    if off_idx is None:
+        return
+    for n, nu in enumerate(rs.nurses):
+        if not bool(getattr(nu, "is_weekend_off", False)):
+            continue
+        t0, t1 = join[n], leave[n]
+        weekend_in_range = [d for d in sorted(weekend_days) if t0 <= d <= t1]
+        weekend_days_1based = [d + 1 for d in weekend_in_range]
+        forced_days = []
+        skipped_fixed_days = []
+        for d in weekend_in_range:
+            if (n, d) in fixed and fixed[(n, d)] != off_idx:
+                skipped_fixed_days.append(d + 1)
+            else:
+                forced_days.append(d + 1)
+        nurse_id = getattr(nu, "nurse_id", "?")
+        nurse_name = getattr(nu, "name", "?")
+        print(
+            f"{logger_prefix} [WeekendOff][Enforce] nurse_idx={n}, "
+            f"nurse_id={nurse_id}, name={nurse_name}, "
+            f"weekend_days={weekend_days_1based}, "
+            f"forced_off_days={forced_days}, "
+            f"skipped_fixed_days={skipped_fixed_days}"
+        )
+
+
+def _log_weekend_work_summary(rs: RosterSystem, logger_prefix: str) -> None:
+    """간호사별 주말 근무 배정 여부를 요약 출력한다."""
+    shift_types = rs.config.shift_types
+    if "O" not in shift_types:
+        off_code = None
+    else:
+        off_code = shift_types[shift_types.index("O")]
+    first_day = rs.target_month
+    weekend_days = {
+        d for d in range(rs.num_days) if (first_day + timedelta(days=d)).weekday() >= 5
+    }
+    for n, nu in enumerate(rs.nurses):
+        weekend_work = []
+        for d in sorted(weekend_days):
+            assigned_code = None
+            for s_idx, code in enumerate(shift_types):
+                if int(rs.roster[n, d, s_idx]) == 1:
+                    assigned_code = code
+                    break
+            if assigned_code is None:
+                continue
+            if off_code is not None and assigned_code == off_code:
+                continue
+            weekend_work.append(f"{d + 1}:{assigned_code}")
+        nurse_id = getattr(nu, "nurse_id", "?")
+        nurse_name = getattr(nu, "name", "?")
+        is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
+        print(
+            f"{logger_prefix} [WeekendOff][Work] nurse_idx={n}, "
+            f"nurse_id={nurse_id}, name={nurse_name}, "
+            f"is_weekend_off={int(is_weekend_off)}, weekend_work={weekend_work}"
+        )
+
+
 
 class CPSATBasicEngine:
     """CP-SAT 기반 근무표 생성 엔진"""
@@ -525,7 +614,7 @@ class CPSATBasicEngine:
                         d_idx = c.get("day_index")
                         raw_shift = str(c.get("shift") or "").strip().upper()
                         raw_type = str(c.get("shift_type") or "").strip()
-                        print(f"{self.logger_prefix} 고정 셀: 간호사 {n_idx}, 날짜 {d_idx+1}, 근무 {raw_shift}, 타입 {raw_type}")
+                        # print(f"{self.logger_prefix} 고정 셀: 간호사 {n_idx}, 날짜 {d_idx+1}, 근무 {raw_shift}, 타입 {raw_type}")
                     except Exception as e:
                         print('error!', e)
                         continue
@@ -541,13 +630,15 @@ class CPSATBasicEngine:
                         off_ex_vac.add((n_idx, d_idx))
                 setattr(config, "off_exception_cells", sorted(list(off_ex)))
                 setattr(config, "off_exception_vacation_cells", sorted(list(off_ex_vac)))
-            except Exception:
+            except Exception as e:
+                print('[line 634] error!!!!!!!', e)
                 pass
             # 주휴 등 휴무류 코드는 엔진에서 'O'로만 취급한다. (shift_types=['D','E','N','O'])
             for c in fixed_cells:
                 try:
                     original_shift = str(c.get('shift') or '').strip()
-                except Exception:
+                except Exception as e:
+                    print('[line 641] error!!!!!!!', e)
                     original_shift = ''
                 normalized_shift = _normalize_shift_code(original_shift, shift_id_to_main)
                 if not normalized_shift:
@@ -561,7 +652,8 @@ class CPSATBasicEngine:
                         n_idx = int(c.get('nurse_index'))
                         d_idx = int(c.get('day_index'))
                         fixed_original_shift_map[(n_idx, d_idx)] = original_shift
-                    except Exception:
+                    except Exception as e:
+                        print('[line 655] error!!!!!!!', e)
                         pass
                 c['shift'] = normalized_shift
             # # 디버그: 특정 간호사 고정 셀/휴가 인식 확인
@@ -607,9 +699,11 @@ class CPSATBasicEngine:
             weekly_off_settings_activate = bool(config_data.get("weekly_off_settings_activate", False))
             if not weekly_off_settings_activate or not weekly_off_map_raw:
                 # activate가 0이거나 weekly_off_map이 비어있으면 주휴 관련 옵션 비활성화
-                config.off_placement_mode = 1
+                config.off_placement_mode = 0
                 weekly_off_by_idx: dict[int, list[int]] = {}
+                print('weekly_off_by_idx 없는걸로', weekly_off_by_idx)
             else:
+                # 각 nurse 별 주휴 담기
                 config.off_placement_mode = int(config_data.get("off_placement_mode", 0) or 0)
                 weekly_off_by_idx: dict[int, list[int]] = {}
                 for dbid, day_list in (weekly_off_map_raw or {}).items():
@@ -618,9 +712,11 @@ class CPSATBasicEngine:
                         continue
                     try:
                         weekly_off_by_idx[n_idx] = sorted({int(d) for d in day_list})
-                    except Exception:
+                    except Exception as e:
+                        print('[line 715] error!!!!!!!', e)
                         continue
             roster_system.weekly_off_by_idx = weekly_off_by_idx
+            # 전월 달에 따른 휴무 담기 
             prev_last_off_raw = config_data.get("prev_month_last_is_off") or {}
             prev_last_off_by_idx: dict[int, bool] = {}
             for dbid, flag in (prev_last_off_raw or {}).items():
@@ -631,6 +727,7 @@ class CPSATBasicEngine:
             roster_system.prev_month_last_is_off = prev_last_off_by_idx
             # forced_off: { nurse_db_id: [day_idx,...] }
             forced_off = initial_constraints.get('forced_off') or {}
+            # print('forced_off!!!!!', forced_off)
             if forced_off:
                 for dbid, day_list in forced_off.items():
                     n_idx = rs_dbid_to_idx.get(dbid)
@@ -647,13 +744,15 @@ class CPSATBasicEngine:
                             # override: 기존 고정 무시
                             fixed_cells = [c for c in fixed_cells if not (c.get('nurse_index')==n_idx and c.get('day_index')==d)]
                         fixed_cells.append({'nurse_index': n_idx, 'day_index': d, 'shift': 'O'})
+            # print('fixed_cells!!!!!', fixed_cells)
             if fixed_cells:
                 print(f"{self.logger_prefix} 고정된 셀 {len(fixed_cells)}개 처리 중...")
                 roster_system.fixed_cells = fixed_cells
-                for fixed_cell in fixed_cells:
-                    print(f"{self.logger_prefix} 고정 셀: 간호사 {fixed_cell['nurse_index']}, 날짜 {fixed_cell['day_index']+1}, 근무 {fixed_cell['shift']}")
+                # for fixed_cell in fixed_cells:
+                #     print(f"{self.logger_prefix} 고정 셀: 간호사 {fixed_cell['nurse_index']}, 날짜 {fixed_cell['day_index']+1}, 근무 {fixed_cell['shift']}")
             # forbidden: { nurse_db_id: { day_idx: [codes...] } }
             forbidden = initial_constraints.get('forbidden') or {}
+            # print('forbidden!!!!!', forbidden)
             if forbidden:
                 # 내부 인덱스 매핑 구조로 저장
                 init_forb = {}
@@ -668,7 +767,7 @@ class CPSATBasicEngine:
                         except Exception:
                             d = d_str
                         normalized_codes = []
-                        for code in (codes or []):
+                        for code in (codes or []): # codes: ['D', 'E', 'N']
                             norm_code = _normalize_shift_code(code, shift_id_to_main)
                             if norm_code:
                                 normalized_codes.append(norm_code)
@@ -854,6 +953,7 @@ class CPSATBasicEngine:
 
         # 13. 최종 근무표 로그 출력
         self._log_final_roster(nurses, result)
+        _log_weekend_work_summary(roster_system, self.logger_prefix)
 
         return {
             "roster": result,
@@ -878,10 +978,15 @@ class CPSATBasicEngine:
         # 예: time_limit_seconds=10이면 base_tl은 최대 3초 정도로 제한.
         base_tl = max(1, int(time_limit_seconds * 0.3))
         base_tl = min(base_tl, max(1, int(time_limit_seconds)))
+        print(
+            f"{self.logger_prefix} [Progress] base_tl={base_tl}s, "
+            f"remaining={time_limit_seconds - base_tl}s"
+        )
         roster_system.is_quick_phase = True
         feasible = self._quick_initial_solve(
             roster_system, base_tl, grouped, run_seed)
         roster_system.is_quick_phase = False
+        print(f"{self.logger_prefix} [Progress] 초기해={int(bool(feasible))}")
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
             'shift_requirement', 'max_consecutive_night',
@@ -900,17 +1005,32 @@ class CPSATBasicEngine:
         per_iter = 8
         max_iter = max(0, remaining // per_iter)
 
-        if max_iter==0:
-            return best_viol==0
+        if max_iter == 0:
+            print(
+                f"{self.logger_prefix} [Progress] 반복 없음: "
+                f"best_viol={best_viol}, remaining={remaining}s"
+            )
+            return best_viol == 0
         for it in range(max_iter):
             try:
                 n_sel, d_sel = policy.select()
-                ok = _solve_neighbourhood(roster_system, n_sel, d_sel,
-                                      per_iter, grouped, run_seed, it = it)
+                print(
+                    f"{self.logger_prefix} [Progress] iter={it + 1}/{max_iter}, "
+                    f"n_sel={len(n_sel)}, d_sel={len(d_sel)}"
+                )
+                ok, status_text = _solve_neighbourhood(
+                    roster_system, n_sel, d_sel, per_iter, grouped, run_seed, it=it
+                )
             except Exception as e:
                 print(f"{self.logger_prefix} 근무표 생성 중 오류: {e}")
                 raise e
-            if not ok: policy.update(False, n_sel, d_sel); continue
+            if not ok:
+                print(
+                    f"{self.logger_prefix} [Progress] iter={it + 1} 실패: "
+                    f"status={status_text}"
+                )
+                policy.update(False, n_sel, d_sel)
+                continue
             curr_viol = hard_violation_cnt()
             improved  = curr_viol < best_viol
             if improved:
@@ -918,9 +1038,21 @@ class CPSATBasicEngine:
             else:  # rollback
                 roster_system.roster = best_roster.copy()
             policy.update(improved, n_sel, d_sel)
-            if best_viol==0: break
+            print(
+                f"{self.logger_prefix} [Progress] iter={it + 1} "
+                f"status={status_text}, curr_viol={curr_viol}, "
+                f"best_viol={best_viol}, improved={int(improved)}"
+            )
+            if best_viol == 0:
+                print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
+                break
         roster_system.roster = best_roster
-        return best_viol==0
+        if best_viol > 0:
+            print(
+                f"{self.logger_prefix} [Progress] 종료: best_viol={best_viol}, "
+                f"max_iter={max_iter}, per_iter={per_iter}s"
+            )
+        return best_viol == 0
 
 
     # ────────────────────────────────────────────────────────────────────
@@ -1171,6 +1303,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     w_idx = rs.config.shift_types.index("W") if has_w else None
     off_exception_cells = set(getattr(rs.config, "off_exception_cells", []) or [])
     off_exception_vacation_cells = set(getattr(rs.config, "off_exception_vacation_cells", []) or [])
+    initial_forbidden = (
+        getattr(rs, "initial_forbidden", {})
+        if isinstance(getattr(rs, "initial_forbidden", {}), dict)
+        else {}
+    )
     off_idx_full = rs.config.shift_types.index("O") if "O" in rs.config.shift_types else None
     weekly_off_by_idx = getattr(rs, "weekly_off_by_idx", {}) if isinstance(getattr(rs, "weekly_off_by_idx", {}), dict) else {}
     first_day = rs.target_month
@@ -1203,7 +1340,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         join.append(j)
         leave.append(l)
         off_exception_cells = set(getattr(rs.config, "off_exception_cells", []) or [])
-        # 고정 셀 (수간호사 등)
+    # 고정 셀 (수간호사 등)
     code2main = {c:r['main_code']
                  for r in (grouped or []) for c in r['codes']}
     code2type = {c: r.get('type') for r in (grouped or []) for c in r['codes']}
@@ -1227,6 +1364,46 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 forced_off_cap_excluded.add((n, d))
     forced_off_cells.update(off_exception_cells)
     forced_off_cap_excluded.update(off_exception_vacation_cells)
+
+    # N 금지 간호사 판별(모든 근무일에 N이 금지된 경우)
+    n_forbid_n: set[int] = set()
+    if initial_forbidden:
+        try:
+            n_idx_night = rs.config.shift_types.index("N")
+        except ValueError:
+            n_idx_night = None
+        fixed_n_by_nurse: dict[int, set[int]] = {}
+        if n_idx_night is not None:
+            for (n_idx, d_idx), s_idx in fixed.items():
+                if s_idx == n_idx_night:
+                    fixed_n_by_nurse.setdefault(n_idx, set()).add(d_idx)
+        for n in range(N):
+            t0, t1 = join[n], leave[n]
+            if t0 > t1:
+                continue
+            if n_idx_night is not None and fixed_n_by_nurse.get(n):
+                continue
+            active_days = range(t0, t1 + 1)
+            n_forbid_cnt = sum(
+                1
+                for d in active_days
+                if "N" in initial_forbidden.get((n, d), set())
+            )
+            if n_forbid_cnt == (t1 - t0 + 1):
+                n_forbid_n.add(n)
+    if n_forbid_n:
+        try:
+            n_forbid_list = [
+                f"{getattr(rs.nurses[n], 'name', '?')}({getattr(rs.nurses[n], 'nurse_id', '?')})"
+                for n in sorted(n_forbid_n)
+                if n < len(rs.nurses)
+            ]
+            print(
+                f"[N-Forbid] N 전일 금지 간호사 수={len(n_forbid_n)} "
+                f"list={n_forbid_list}"
+            )
+        except Exception as e:
+            print(f"[N-Forbid] 로깅 실패: {e}")
 
 
     # 변수
@@ -1317,6 +1494,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         
         for n, day_list in weekly_off_by_idx.items():
             if n >= len(join):
+                continue
+            # 주말 휴무 대상자는 주휴 인접 OFF 배치를 적용하지 않는다.
+            if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
                 continue
             T0, T1 = join[n], leave[n]
             for d_raw in day_list or []:
@@ -1433,24 +1613,81 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     K   = cfg.max_consecutive_work_days
     L   = cfg.max_consecutive_nights
 
+    _log_weekend_off_enforcement_once(
+        rs=rs,
+        join=join,
+        leave=leave,
+        weekend_days=weekend_days,
+        fixed=fixed,
+        off_idx=off,
+        logger_prefix="[CP-SAT-Basic]",
+    )
     for n,nu in enumerate(rs.nurses):
         T0,T1 = join[n], leave[n]
-        # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
-        if bool(getattr(nu, "is_weekend_off", False)) and getattr(cfg, 'weekend_off_only_enable', True):
+        # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
+        # 평일(월~금)에는 OFF를 금지한다.
+        #
+        # 예외:
+        # - 특정 날짜가 '고정 셀(fixed_cells)'로 이미 근무(D/E/N/W 등)로 지정된 경우,
+        #   기존 고정이 우선이며 주말 OFF 강제를 덮어쓰지 않는다.
+        if bool(getattr(nu, "is_weekend_off", False)) and getattr(cfg, "weekend_off_only_enable", True):
+            try:
+                weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
+                weekend_cnt = len(weekend_in_range)
+                base_min_off = int(
+                    getattr(cfg, "global_monthly_off_days", 0)
+                    + getattr(cfg, "standard_personal_off_days", 0)
+                )
+                min_off_required = min(base_min_off, T1 - T0 + 1)
+                extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
+                max_off_allowed = min(
+                    min_off_required + max(0, extra_allowed), T1 - T0 + 1
+                )
+                print(
+                    f"[WeekendOff][HardCheck] nurse_idx={n}, "
+                    f"nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                    f"range={T0+1}~{T1+1}, weekend_cnt={weekend_cnt}, "
+                    f"min_off_required={min_off_required}, max_off_allowed={max_off_allowed}, "
+                    f"K={K}, forbid_n={int(n in n_forbid_n)}, "
+                    f"two_offs_after_two_nig={int(bool(getattr(cfg, 'two_offs_after_two_nig', False)))}, "
+                    f"two_offs_after_three_nig={int(bool(getattr(cfg, 'two_offs_after_three_nig', False)))}"
+                )
+                if weekend_cnt < min_off_required:
+                    print(
+                        f"[WeekendOff][HardCheck][WARN] weekend_cnt({weekend_cnt}) < "
+                        f"min_off_required({min_off_required}) → 평일 OFF 필요"
+                    )
+                if weekend_cnt > max_off_allowed:
+                    print(
+                        f"[WeekendOff][HardCheck][WARN] weekend_cnt({weekend_cnt}) > "
+                        f"max_off_allowed({max_off_allowed}) → OFF 상한 충돌"
+                    )
+            except Exception as e:
+                print(f"[WeekendOff][HardCheck] 로깅 실패: {e}")
+            # print('nu!!!!!', nu.__dict__)
             for d in range(T0, T1 + 1):
                 if d in weekend_days:
-                    # 주말(토/일): OFF만 허용
+                    # 주말(토/일): 기본 OFF 강제
+                    # 단, 고정 셀이 근무로 지정되어 있으면(예: 특수 근무/교육 등) 고정이 우선이다.
                     if (n, d) in fixed and fixed[(n, d)] != off:
-                        raise ValueError(
-                            f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
-                            f"fixed_shift={rs.config.shift_types[fixed[(n, d)]]}, required=O"
+                        try:
+                            fixed_code = rs.config.shift_types[fixed[(n, d)]]
+                        except Exception:
+                            fixed_code = str(fixed.get((n, d)))
+                        print(
+                            f"[WeekendOff][CP-SAT] 주말 OFF 강제 스킵(고정 우선): "
+                            f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                         )
+                        continue
+                    print('주말휴무 강제 간호사:', nu.name, '날짜:', d+1)
+                    
                     m.Add(X(n, d, off) == 1)
                 else:
                     # 평일(월~금): OFF 금지(D/E/N만 가능)
                     # 사용자 고정 OFF는 예외로 허용
                     if (n, d) in fixed and fixed[(n, d)] == off:
                         continue
+                    print('평일휴무 금지 간호사:', nu.name, '날짜:', d+1)
                     m.Add(X(n, d, off) == 0)
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):
@@ -1480,26 +1717,27 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for d in range(T0,T1+1):
                 m.Add(X(n,d,day)==0); m.Add(X(n,d,eve)==0)
 
-        # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
-        # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
-        if bool(getattr(cfg, "not_one_night", False)):
-            for d in range(T0, T1 + 1):
-                neighbors = []
-                if d - 1 >= T0:
-                    neighbors.append(X(n, d - 1, night))
-                if d + 1 <= T1:
-                    neighbors.append(X(n, d + 1, night))
-                if not neighbors:
-                    continue
-                m.Add(X(n, d, night) <= sum(neighbors))
+        if n not in n_forbid_n:
+            # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
+            # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
+            if bool(getattr(cfg, "not_one_night", False)):
+                for d in range(T0, T1 + 1):
+                    neighbors = []
+                    if d - 1 >= T0:
+                        neighbors.append(X(n, d - 1, night))
+                    if d + 1 <= T1:
+                        neighbors.append(X(n, d + 1, night))
+                    if not neighbors:
+                        continue
+                    m.Add(X(n, d, night) <= sum(neighbors))
 
-        # 연속 Night
-        for d0 in range(T0, T1-L+1):
-            m.Add(sum(X(n,d0+t,night) for t in range(L+1)) <= L)
+            # 연속 Night
+            for d0 in range(T0, T1-L+1):
+                m.Add(sum(X(n,d0+t,night) for t in range(L+1)) <= L)
 
-        # 월 Night 상한
-        m.Add(sum(X(n,d,night) for d in range(T0,T1+1))
-              <= cfg.max_night_shifts_per_month)
+            # 월 Night 상한
+            m.Add(sum(X(n,d,night) for d in range(T0,T1+1))
+                  <= cfg.max_night_shifts_per_month)
 
         # 월 최소 OFF 일수 하드 제약 (프론트 전달 off_days를 최소값으로 해석)
         try:
@@ -1573,13 +1811,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # N2/3→2OFF
         # 주의: "N 2회/3회 후 OFF 2회"는 다음 2일이 모두 OFF여야 한다.
         # 기존 구현은 (sum_n - 1 <= off1 + off2) 형태여서 연속 N일 때 OFF 1개만 허용되는 버그가 있었다.
-        if cfg.two_offs_after_three_nig:
+        if cfg.two_offs_after_three_nig and n not in n_forbid_n:
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
                 m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
                     [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
                 )
-        if cfg.two_offs_after_two_nig:
+        if cfg.two_offs_after_two_nig and n not in n_forbid_n:
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)
@@ -1611,7 +1849,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 # ─────────────────────────────────────────────────────────────
 #           Neighbourhood solver  (전역 변수·제약 그대로)     │
 # ─────────────────────────────────────────────────────────────
-def _solve_neighbourhood(rs, n_set, d_set, tl, grouped, run_seed: int | None = None, it:int=0):
+def _solve_neighbourhood(
+    rs,
+    n_set,
+    d_set,
+    tl,
+    grouped,
+    run_seed: int | None = None,
+    it: int = 0,
+) -> tuple[bool, str]:
+    """선택된 이웃(n_set, d_set)만 재탐색하여 해를 갱신한다."""
     from ortools.sat.python import cp_model
     model,X,j,l,fixed=_build_full_model(rs,grouped, include_pair_objective=False)
 
@@ -1692,15 +1939,17 @@ def _solve_neighbourhood(rs, n_set, d_set, tl, grouped, run_seed: int | None = N
     solver.parameters.max_time_in_seconds=tl
     solver.parameters.num_search_workers = 10
     solver.parameters.relative_gap_limit = 0.1
-    st=solver.Solve(model)
-    if st not in (cp_model.OPTIMAL,cp_model.FEASIBLE): return False
+    st = solver.Solve(model)
+    status_text = _cp_sat_status_to_text(st)
+    if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return False, status_text
 
     # 반영
     for n in n_set:
         for d in d_set:
             for s in range(S):
                 rs.roster[n,d,s]=1 if solver.Value(X(n,d,s)) else 0
-    return True
+    return True, status_text
 
 
 def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
