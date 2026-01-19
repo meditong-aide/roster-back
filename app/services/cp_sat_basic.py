@@ -99,6 +99,7 @@ class CPSATBasicEngine:
         three_seq_nig = config_data.get('three_seq_nig', True)
         two_offs_after_three_nig = config_data.get('two_offs_after_three_nig', True)
         two_offs_after_two_nig = config_data.get('two_offs_after_two_nig', False)
+        not_one_night = config_data.get('not_one_night', False)
         max_nig_per_month = config_data.get('max_nig_per_month', 15)
         if max_nig_per_month != 15:
             max_nig_per_month = 17
@@ -181,7 +182,7 @@ class CPSATBasicEngine:
             # 법규 제약사항 (Hard Constraints)
             max_night_shifts_per_month=max_nig_per_month,
             max_consecutive_nights=3 if three_seq_nig else 2,
-            not_one_night=True,
+            not_one_night=not_one_night,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
             banned_day_after_eve=banned_day_after_eve,
@@ -240,9 +241,19 @@ class CPSATBasicEngine:
         setattr(cfg, "shadow_coverage_need_ratio", float(config_data.get("shadow_coverage_need_ratio", 0.6) or 0.0))
         setattr(cfg, "shadow_coverage_penalty_weight", int(config_data.get("shadow_coverage_penalty_weight", 6) or 0))
         # 전이 금지 하드 제약 설정 (기본: 모두 금지)
-        setattr(cfg, "ban_e_to_d", bool(config_data.get("ban_e_to_d", True)))
-        setattr(cfg, "ban_n_to_e", bool(config_data.get("ban_n_to_e", True)))
-        setattr(cfg, "ban_d_to_n", bool(config_data.get("ban_d_to_n", True)))
+        ban_e_to_d = bool(config_data.get("ban_e_to_d", True))
+        ban_n_to_e = bool(config_data.get("ban_n_to_e", True))
+        ban_d_to_n = bool(config_data.get("ban_d_to_n", True))
+        ban_n_to_d = bool(config_data.get("ban_n_to_d", True))
+        if not banned_day_after_eve:
+            ban_e_to_d = False
+            ban_n_to_e = False
+            ban_d_to_n = False
+            ban_n_to_d = False
+        setattr(cfg, "ban_e_to_d", ban_e_to_d)
+        setattr(cfg, "ban_n_to_e", ban_n_to_e)
+        setattr(cfg, "ban_d_to_n", ban_d_to_n)
+        setattr(cfg, "ban_n_to_d", ban_n_to_d)
         # 일자별 요구치가 있으면 구성에 부가 속성으로 저장
         try:
             ds_by_day = config_data.get('daily_shift_requirements_by_day')
