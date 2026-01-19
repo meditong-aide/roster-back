@@ -953,7 +953,7 @@ class CPSATBasicEngine:
 
         # 13. 최종 근무표 로그 출력
         self._log_final_roster(nurses, result)
-        _log_weekend_work_summary(roster_system, self.logger_prefix)
+        # _log_weekend_work_summary(roster_system, self.logger_prefix)
 
         return {
             "roster": result,
@@ -1711,7 +1711,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                         )
                         continue
-                    print('주말휴무 강제 간호사:', nu.name, '날짜:', d+1)
+                    # print('주말휴무 강제 간호사:', nu.name, '날짜:', d+1)
                     
                     m.Add(X(n, d, off) == 1)
                 else:
@@ -1719,7 +1719,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     # 사용자 고정 OFF는 예외로 허용
                     if (n, d) in fixed and fixed[(n, d)] == off:
                         continue
-                    print('평일휴무 금지 간호사:', nu.name, '날짜:', d+1)
+                    # print('평일휴무 금지 간호사:', nu.name, '날짜:', d+1)
                     m.Add(X(n, d, off) == 0)
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):

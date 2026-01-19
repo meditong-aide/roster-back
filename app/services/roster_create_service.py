@@ -1844,10 +1844,10 @@ def _persist_entries(db: Session, schedule, generated, req):
                     shift_id=norm_shift,
                 )
                 db.add(entry)
-        try:
-            print(f"[PersistRoster] nurse={nurse_id}, saved_shifts={shifts}")
-        except Exception:
-            pass
+        # try:
+        #     print(f"[PersistRoster] nurse={nurse_id}, saved_shifts={shifts}")
+        # except Exception:
+        #     pass
     db.commit()
 
 
@@ -1984,7 +1984,7 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
         debug_counts = {
             nid: {d: code for d, code in day_map.items()} for nid, day_map in entries_by_nurse.items()
         }
-        print(f"[RosterResponse] schedule_id={schedule.schedule_id}, entries_by_nurse={debug_counts}")
+        # print(f"[RosterResponse] schedule_id={schedule.schedule_id}, entries_by_nurse={debug_counts}")
     except Exception:
         pass
 
