@@ -779,6 +779,7 @@ def _compute_weekly_off_day_indices_for_month(
 
     activate = bool(setting.activate)
     if not activate:
+        print("[WeeklyOff] 주휴 설정 비활성화(activate=0) → 주휴 고정 셀 미적용")
         return nurse_to_days, warnings
 
     use_variable_cycle = bool(getattr(setting, "use_variable_cycle", False))
@@ -864,6 +865,10 @@ def _compute_weekly_off_day_indices_for_month(
                 # 레거시: weekly_off_weekday 자체가 없으면 주휴 자체를 쓰지 않는 것으로 간주
                 if base_weekday is None:
                     continue
+            print(
+                f"[WeeklyOff] 주말 휴무 대상 강제: {name}({nurse_id}) "
+                f"weekly_off_weekday={base_weekday} → 일요일(6)"
+            )
             nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, 6))
             continue
 
@@ -879,6 +884,12 @@ def _compute_weekly_off_day_indices_for_month(
         if not use_variable_cycle:
             # 변동 주기 OFF → 기준 요일을 그대로 사용
             month_weekday = base_weekday % 7
+            if month_weekday not in (5, 6):
+                print(
+                    f"[WeeklyOff] ⚠️ 평일 주휴: {name}({nurse_id}) "
+                    f"weekday={_weekday_to_korean(month_weekday)} "
+                    f"is_weekend_off={int(is_weekend_off)}"
+                )
             if is_weekend_off and month_weekday not in (5, 6):
                 raise ValueError(
                     f"주휴 요일은 주말(토/일)만 허용됩니다. "
@@ -897,6 +908,12 @@ def _compute_weekly_off_day_indices_for_month(
                 target_year=year,
                 target_month=month,
             )
+            if int(month_weekday) not in (5, 6):
+                print(
+                    f"[WeeklyOff] ⚠️ 평일 주휴: {name}({nurse_id}) "
+                    f"weekday={_weekday_to_korean(int(month_weekday))} "
+                    f"is_weekend_off={int(is_weekend_off)}"
+                )
             if is_weekend_off and int(month_weekday) not in (5, 6):
                 raise ValueError(
                     f"주휴 요일은 주말(토/일)만 허용됩니다. "
@@ -921,6 +938,12 @@ def _compute_weekly_off_day_indices_for_month(
                     target_date=week_start,
                     cycle_interval_weeks=cycle_interval,
                 )
+                if int(w) not in (5, 6):
+                    print(
+                        f"[WeeklyOff] ⚠️ 평일 주휴: {name}({nurse_id}) "
+                        f"weekday={_weekday_to_korean(int(w))} "
+                        f"is_weekend_off={int(is_weekend_off)}"
+                    )
                 if is_weekend_off and int(w) not in (5, 6):
                     raise ValueError(
                         f"주휴 요일은 주말(토/일)만 허용됩니다. "
@@ -940,6 +963,13 @@ def _compute_weekly_off_day_indices_for_month(
             )
         nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, month_weekday))
 
+    weekend_off_only = {
+        str(r.nurse_id)
+        for r in rows
+        if has_weekend_off_col and bool(getattr(r, "is_weekend_off", 0))
+    }
+    if weekend_off_only:
+        print(f"[WeeklyOff] 주말 휴무 대상 간호사 수={len(weekend_off_only)}")
     return nurse_to_days, warnings
 
 
@@ -2150,6 +2180,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     print('invalid', [n.__dict__ for n in invalid])
     if invalid:
         raise HTTPException(status_code=400, detail="주말 휴무 true만 고정 shift설정이 가능하다")
+    try:
+        weekend_off_names = [
+            f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')})"
+            for n in nurses_in_group
+            if bool(getattr(n, "is_weekend_off", False))
+        ]
+        print(f"[WeekendOff] 대상 간호사({len(weekend_off_names)}명): {weekend_off_names}")
+    except Exception as e:
+        print(f"[WeekendOff] 대상 간호사 로깅 실패: {e}")
     month_start = date(req.year, req.month, 1)
     days_in_month = calendar.monthrange(req.year, req.month)[1]
     active_range_candidates = {
