@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 # from db.client import get_db
 from db.models import RosterConfig as RosterConfigModel
-from db.models import Schedule, ShiftPreference, Nurse, ScheduleEntry, Shift, IssuedRoster, Group
+from db.models import Schedule, ShiftPreference, Nurse, ScheduleEntry, Shift, IssuedRoster, Group, WantedRequest
 from db.nurse_config import Nurse as NurseEngine
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
 from routers.auth import get_current_user_from_cookie
@@ -913,14 +913,15 @@ async def get_submission_statuses(
     nurse_ids_in_group = {n[0] for n in nurses_in_group}
     # 각 간호사의 최신 제출 상태 확인
     submitted_nurse_ids = set()
+    month_str = f"{year:04d}-{month:02d}"
     for nurse_id in nurse_ids_in_group:
         # 해당 간호사의 최신 제출된 선호도가 있는지 확인
-        latest_submitted = db.query(ShiftPreference).filter(
-            ShiftPreference.nurse_id == nurse_id,
-            ShiftPreference.year == year,
-            ShiftPreference.month == month,
-            ShiftPreference.is_submitted == True
-        ).order_by(ShiftPreference.submitted_at.desc()).first()
+        latest_submitted = db.query(WantedRequest).filter(
+            WantedRequest.nurse_id == nurse_id,
+            # ShiftPreference.year == year,
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True
+        ).order_by(WantedRequest.submitted_at.desc()).first()
         if latest_submitted:
             submitted_nurse_ids.add(nurse_id)
     return {
