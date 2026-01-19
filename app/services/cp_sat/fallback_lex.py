@@ -20,6 +20,91 @@ from services.cp_sat.hardcoded_weights import (
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
 
 
+def _cp_sat_status_to_text(status: int) -> str:
+    """CP-SAT 상태 코드를 사람이 읽을 수 있는 문자열로 변환한다."""
+    mapping = {
+        cp_model.OPTIMAL: "OPTIMAL",
+        cp_model.FEASIBLE: "FEASIBLE",
+        cp_model.INFEASIBLE: "INFEASIBLE",
+        cp_model.MODEL_INVALID: "MODEL_INVALID",
+        cp_model.UNKNOWN: "UNKNOWN",
+    }
+    return mapping.get(status, f"UNKNOWN({status})")
+
+
+def _log_weekend_off_enforcement(
+    roster_system,
+    join: list[int],
+    leave: list[int],
+    weekend_days: set[int],
+    fixed: dict[tuple[int, int], int],
+    off_idx: int | None,
+    logger_prefix: str,
+) -> None:
+    """주말 OFF 강제 제약 적용 내역을 간호사별로 출력한다."""
+    if not getattr(roster_system.config, "weekend_off_only_enable", True):
+        return
+    if off_idx is None:
+        return
+    for n, nu in enumerate(roster_system.nurses):
+        if not bool(getattr(nu, "is_weekend_off", False)):
+            continue
+        t0, t1 = join[n], leave[n]
+        weekend_in_range = [d for d in sorted(weekend_days) if t0 <= d <= t1]
+        weekend_days_1based = [d + 1 for d in weekend_in_range]
+        forced_days = []
+        skipped_fixed_days = []
+        for d in weekend_in_range:
+            if (n, d) in fixed and fixed[(n, d)] != off_idx:
+                skipped_fixed_days.append(d + 1)
+            else:
+                forced_days.append(d + 1)
+        nurse_id = getattr(nu, "nurse_id", "?")
+        nurse_name = getattr(nu, "name", "?")
+        print(
+            f"{logger_prefix} [WeekendOff][Enforce] nurse_idx={n}, "
+            f"nurse_id={nurse_id}, name={nurse_name}, "
+            f"weekend_days={weekend_days_1based}, "
+            f"forced_off_days={forced_days}, "
+            f"skipped_fixed_days={skipped_fixed_days}"
+        )
+
+
+def _log_weekend_work_assignments(
+    roster_system,
+    weekend_days: set[int],
+    off_idx: int | None,
+    logger_prefix: str,
+) -> None:
+    """주말 근무 배정 여부를 간호사별로 출력한다."""
+    shift_types = roster_system.config.shift_types
+    off_code = shift_types[off_idx] if off_idx is not None else None
+    for n, nu in enumerate(roster_system.nurses):
+        weekend_work = []
+        for d in sorted(weekend_days):
+            if d < 0 or d >= roster_system.num_days:
+                continue
+            assigned_code = None
+            for s_idx, code in enumerate(shift_types):
+                if int(roster_system.roster[n, d, s_idx]) == 1:
+                    assigned_code = code
+                    break
+            if assigned_code is None:
+                continue
+            if off_code is not None and assigned_code == off_code:
+                continue
+            weekend_work.append(f"{d + 1}:{assigned_code}")
+        nurse_id = getattr(nu, "nurse_id", "?")
+        nurse_name = getattr(nu, "name", "?")
+        is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
+        if weekend_work or is_weekend_off:
+            print(
+                f"{logger_prefix} [WeekendOff][Work] nurse_idx={n}, "
+                f"nurse_id={nurse_id}, name={nurse_name}, "
+                f"is_weekend_off={int(is_weekend_off)}, weekend_work={weekend_work}"
+            )
+
+
 def optimize_fallback_lex_hard_first(
     *,
     roster_system,
@@ -431,7 +516,7 @@ def optimize_fallback_lex_hard_first(
         # 고정 셀
         for (n, d), s_idx in fixed.items():
             if (n, d) not in active_days:
-                print(f"{logger_prefix} 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
+                # print(f"{logger_prefix} 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
                 continue
             m.Add(X(n, d, s_idx) == 1)
             for s in range(S):
@@ -473,19 +558,40 @@ def optimize_fallback_lex_hard_first(
                         <= 3
                     )
 
-        # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말에만 휴무, 평일에는 휴무 금지
+        # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
+        # 평일(월~금)에는 OFF를 금지한다.
+        #
+        # 예외:
+        # - 특정 날짜가 '고정 셀(fixed_cells)'로 이미 근무(D/E/N/W 등)로 지정된 경우,
+        #   기존 고정이 우선이며 주말 OFF 강제를 덮어쓰지 않는다.
         if getattr(cfg, "weekend_off_only_enable", True):
+            if stage == 1:
+                _log_weekend_off_enforcement(
+                    roster_system=roster_system,
+                    join=join,
+                    leave=leave,
+                    weekend_days=weekend_days,
+                    fixed=fixed,
+                    off_idx=off_idx,
+                    logger_prefix=logger_prefix,
+                )
             for n, nu in enumerate(roster_system.nurses):
                 if not bool(getattr(nu, "is_weekend_off", False)):
                     continue
                 for d in range(join[n], leave[n] + 1):
                     if d in weekend_days:
-                        # 주말(토/일): OFF만 허용
+                        # 주말(토/일): 기본 OFF 강제
+                        # 단, 고정 셀이 근무로 지정되어 있으면(예: 특수 근무/교육 등) 고정이 우선이다.
                         if (n, d) in fixed and fixed[(n, d)] != off_idx:
-                            raise ValueError(
-                                f"주말 고정 휴무 충돌: nurse_index={n}, day={d+1}, "
-                                f"fixed_shift={cfg.shift_types[fixed[(n, d)]]}, required=O"
+                            try:
+                                fixed_code = cfg.shift_types[fixed[(n, d)]]
+                            except Exception:
+                                fixed_code = str(fixed.get((n, d)))
+                            print(
+                                f"{logger_prefix} [WeekendOff] 주말 OFF 강제 스킵(고정 우선): "
+                                f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                             )
+                            continue
                         m.Add(X(n, d, off_idx) == 1)
                     else:
                         # 평일(월~금): OFF 금지(D/E/N만 가능)
@@ -927,6 +1033,10 @@ def optimize_fallback_lex_hard_first(
             s1.parameters.num_search_workers = 8
             s1.parameters.relative_gap_limit = 0.15
             st = s1.Solve(m1)
+            print(
+                f"{logger_prefix} 폴백1 결과: relax_level={relax_level}, "
+                f"status={_cp_sat_status_to_text(st)}"
+            )
             if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 best_short = int(s1.Value(sum(short1)))
                 best_over = int(s1.Value(sum(over1)))
@@ -968,6 +1078,7 @@ def optimize_fallback_lex_hard_first(
                 print(f"{logger_prefix} 폴백1 최종 실패: 모든 완화 시도 실패")
 
     if best_short is None or best_over is None:
+        print(f"{logger_prefix} 폴백 중단: 1단계 해를 찾지 못함")
         return False
 
     # ───── 2단계: 안전/법규 ─────
@@ -983,6 +1094,7 @@ def optimize_fallback_lex_hard_first(
         s2.parameters.num_search_workers = 8
         s2.parameters.relative_gap_limit = 0.15
         st2 = s2.Solve(m2)
+        print(f"{logger_prefix} 폴백2 결과: status={_cp_sat_status_to_text(st2)}")
         if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백2 실패: 단계 불가능 → 1단계 해 사용")
             roster_system.roster.fill(0)
@@ -991,6 +1103,12 @@ def optimize_fallback_lex_hard_first(
                     for s in range(S):
                         if s1.Value(X1(n, d, s)):
                             roster_system.roster[n, d, s] = 1
+            _log_weekend_work_assignments(
+                roster_system=roster_system,
+                weekend_days=weekend_days,
+                off_idx=off_idx,
+                logger_prefix=logger_prefix,
+            )
             return best_short == 0
         stage2_zero_locks = {}
         best_safe_sum = 0
@@ -1048,6 +1166,7 @@ def optimize_fallback_lex_hard_first(
         s3.parameters.num_search_workers = 8
         s3.parameters.relative_gap_limit = 0.05
         st3 = s3.Solve(m3)
+        print(f"{logger_prefix} 폴백3 결과: status={_cp_sat_status_to_text(st3)}")
         if st3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백3 실패: 선호 단계 불가능 → 2단계 해 사용")
             roster_system.roster.fill(0)
@@ -1056,6 +1175,12 @@ def optimize_fallback_lex_hard_first(
                     for s in range(S):
                         if s2.Value(X2(n, d, s)):
                             roster_system.roster[n, d, s] = 1
+            _log_weekend_work_assignments(
+                roster_system=roster_system,
+                weekend_days=weekend_days,
+                off_idx=off_idx,
+                logger_prefix=logger_prefix,
+            )
             return best_short == 0 and best_safe_sum == 0
         try:
             short_items = [
@@ -1097,6 +1222,12 @@ def optimize_fallback_lex_hard_first(
     except Exception as exc:
         print(f"{logger_prefix} [PostOff] 후처리 실패: {exc}")
 
+    _log_weekend_work_assignments(
+        roster_system=roster_system,
+        weekend_days=weekend_days,
+        off_idx=off_idx,
+        logger_prefix=logger_prefix,
+    )
     print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
     return best_short == 0 and best_safe_sum == 0
 

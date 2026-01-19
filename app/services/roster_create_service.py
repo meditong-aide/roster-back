@@ -1038,7 +1038,74 @@ def _build_special_fixed_cells(
                 "shift_type": shift_type,
             }
         )
+    # for f in fixed_cells:
+    #     if f['nurse_index'] == 21:
+    #         print('fixed_cells!!!!!', f)
     return fixed_cells, has_working
+
+
+def _summarize_off_fixed_cells(
+    weekly_off_fixed_cells: list[dict] | None,
+    special_fixed_cells: list[dict] | None,
+    nurses_in_group: list[Nurse],
+) -> dict[str, dict[str, list[int]]]:
+    """주휴/특수요청 기반의 고정 OFF 셀을 간호사별로 요약한다.
+
+    Args:
+        weekly_off_fixed_cells: 주휴로 생성된 고정 OFF 셀 목록
+        special_fixed_cells: 특수 요청 기반 고정 셀 목록
+        nurses_in_group: 간호사 객체 목록(이름 매핑용)
+
+    Returns:
+        간호사 ID → {"name": str, "weekly_off_days": [int], "special_off_days": [int]}
+    """
+    nurse_idx_to_id: dict[int, str] = {}
+    nurse_id_to_name: dict[str, str] = {}
+    for n in nurses_in_group:
+        try:
+            nurse_idx_to_id[int(n.id)] = str(n.nurse_id)
+            nurse_id_to_name[str(n.nurse_id)] = str(n.name)
+        except Exception:
+            continue
+
+    result: dict[str, dict[str, list[int]]] = {}
+
+    for c in weekly_off_fixed_cells or []:
+        n_idx = c.get("nurse_index")
+        d_idx = c.get("day_index")
+        if n_idx is None or d_idx is None:
+            continue
+        nurse_id = nurse_idx_to_id.get(int(n_idx))
+        if not nurse_id:
+            continue
+        entry = result.setdefault(
+            nurse_id,
+            {"name": nurse_id_to_name.get(nurse_id, nurse_id), "weekly_off_days": [], "special_off_days": []},
+        )
+        entry["weekly_off_days"].append(int(d_idx))
+
+    for c in special_fixed_cells or []:
+        n_idx = c.get("nurse_index")
+        d_idx = c.get("day_index")
+        if n_idx is None or d_idx is None:
+            continue
+        shift_code = str(c.get("shift") or "").strip().upper()
+        shift_type = str(c.get("shift_type") or "").strip()
+        if shift_code not in {"O", "OFF", "주"} and shift_type not in {"휴가", "공가"}:
+            continue
+        nurse_id = nurse_idx_to_id.get(int(n_idx))
+        if not nurse_id:
+            continue
+        entry = result.setdefault(
+            nurse_id,
+            {"name": nurse_id_to_name.get(nurse_id, nurse_id), "weekly_off_days": [], "special_off_days": []},
+        )
+        entry["special_off_days"].append(int(d_idx))
+
+    for v in result.values():
+        v["weekly_off_days"] = sorted(set(v["weekly_off_days"]))
+        v["special_off_days"] = sorted(set(v["special_off_days"]))
+    return result
 
 
 def _inject_special_work_code(config_dict: dict, enabled: bool) -> None:
@@ -1491,13 +1558,10 @@ def build_allowed_shift_type_constraints(
     목표:
         - 간호사 row에 저장된 허용 목록에 따라, 허용되지 않은 D/E/N 배정을 전일(day_idx 전체)에 대해 금지한다.
         - OFF(O)는 항상 가능하도록 금지 대상에서 제외한다.
-        - fixed_cells(고정셀)과 충돌 시 옵션 A 정책으로 즉시 실패한다.
+        - fixed_cells(고정셀)가 허용 목록과 충돌하면 해당 날짜만 예외로 두고 진행한다.
 
     Returns:
         {"forced_off": {}, "forbidden": {nurse_id: {day_idx: ["D","E"]}}}
-
-    Raises:
-        ValueError: 고정셀이 허용 근무유형과 충돌할 때(옵션 A)
     """
     days_in_month = int(get_days_in_month(year, month))
     if days_in_month <= 0:
@@ -1513,7 +1577,8 @@ def build_allowed_shift_type_constraints(
         allowed = _normalize_allowed_shift_types(getattr(n, "is_night_nurse", None))
         nurse_id_to_allowed[nurse_id] = allowed
 
-    # ── 옵션 A: 고정셀 충돌은 즉시 실패 ──
+    # ── 고정셀 충돌은 예외 처리(고정 우선) ──
+    override_days_by_nurse: dict[str, set[int]] = {}
     if fixed_cells:
         nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
         idx_to_nurse_id = {idx: nid for nid, idx in nurse_idx_map.items()}
@@ -1533,11 +1598,19 @@ def build_allowed_shift_type_constraints(
             if not allowed:
                 continue  # 제한 없음
             if fixed_main not in allowed:
+                override_days_by_nurse.setdefault(nurse_id, set()).add(day_idx)
                 allowed_sorted = sorted(allowed)
-                raise ValueError(
-                    "허용 근무유형 충돌: "
+                print(
+                    "[AllowedShiftTypes] 고정 근무형 우선 적용: "
                     f"nurse_id={nurse_id}, day={day_idx + 1}, fixed={fixed_main}, "
                     f"allowed={allowed_sorted}"
+                )
+        if override_days_by_nurse:
+            for nurse_id, days in override_days_by_nurse.items():
+                day_list = [d + 1 for d in sorted(days)]
+                print(
+                    "[AllowedShiftTypes] 고정 근무형 예외 일자: "
+                    f"nurse_id={nurse_id}, days={day_list}"
                 )
 
     forbidden: dict[str, dict[int, list[str]]] = {}
@@ -1549,7 +1622,10 @@ def build_allowed_shift_type_constraints(
         if not disallowed:
             continue
         day_map: dict[int, list[str]] = {}
+        override_days = override_days_by_nurse.get(nurse_id, set())
         for d in range(days_in_month):
+            if d in override_days:
+                continue
             day_map[d] = disallowed
         forbidden[nurse_id] = day_map
 
@@ -1605,6 +1681,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                     {"group_id": current_user.group_id},
                 ).fetchall()
                 id_to_weekend_off = {str(r.nurse_id): bool(getattr(r, "is_weekend_off", 0)) for r in rows}
+                print('id_to_weekend_off!!!!!', id_to_weekend_off)
                 for nd in nurses_dict:
                     nid = str(nd.get("nurse_id") or nd.get("db_id") or "")
                     if not nid:
@@ -1632,7 +1709,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                         "show_in_preference": getattr(shift, "show_in_preference", None),
                     }
                 )
-            print(f"[ShiftMapping] shift_defs: {shift_defs}")
+            # print(f"[ShiftMapping] shift_defs: {shift_defs}")
             if shift_defs:
                 config_dict["shift_definitions"] = shift_defs
         except Exception as e:
@@ -2177,7 +2254,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     print('fixed_nurses', [n.__dict__ for n in fixed_nurses])
     # 고정 근무는 주말 휴무 대상만 허용
     invalid = [n for n in fixed_nurses if not bool(getattr(n, "is_weekend_off", False))]
-    print('invalid', [n.__dict__ for n in invalid])
+    # print('invalid', [n.__dict__ for n in invalid])
     if invalid:
         raise HTTPException(status_code=400, detail="주말 휴무 true만 고정 shift설정이 가능하다")
     try:
@@ -2222,6 +2299,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
+    if bool(config_dict.get("two_offs_after_two_nig")) or bool(config_dict.get("two_offs_after_three_nig")):
+        print(
+            "[OffReason] N연속 후 2OFF 하드 활성화: "
+            f"2N→2O={bool(config_dict.get('two_offs_after_two_nig'))}, "
+            f"3N→2O={bool(config_dict.get('two_offs_after_three_nig'))}"
+        )
     fixed_nurse_ids = {str(n.nurse_id) for n in fixed_nurses}
     engine_special_shift_requests = [
         r
@@ -2275,7 +2358,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         for n in nurses_for_engine
     }
 
-    print('active_range_map', active_range_map)
+    # print('active_range_map', active_range_map)
     weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
         db=db,
         office_id=current_user.office_id,
@@ -2348,6 +2431,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         combined_fixed_cells.extend(weekly_off_fixed_cells)
     if special_fixed_cells:
         combined_fixed_cells.extend(special_fixed_cells)
+    off_fixed_summary = _summarize_off_fixed_cells(
+        weekly_off_fixed_cells=weekly_off_fixed_cells,
+        special_fixed_cells=special_fixed_cells,
+        nurses_in_group=nurses_in_group,
+    )
+    if off_fixed_summary:
+        print("[OffReason] 고정 OFF 요약(주휴/특수요청)")
+        for nurse_id, info in off_fixed_summary.items():
+            weekly_days = [d + 1 for d in info.get("weekly_off_days", [])]
+            special_days = [d + 1 for d in info.get("special_off_days", [])]
+            total = len(weekly_days) + len(special_days)
+            print(
+                f"[OffReason] {info.get('name', nurse_id)}({nurse_id}) "
+                f"weekly_off={weekly_days}, special_off={special_days}, total_fixed_off={total}"
+            )
     off_exception_cells = set()
     for c in combined_fixed_cells:
         try:
