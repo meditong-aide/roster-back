@@ -710,6 +710,8 @@ class CPSATBasicEngine:
                     n_idx = rs_dbid_to_idx.get(str(dbid))
                     if n_idx is None:
                         continue
+                    if bool(getattr(nurses[n_idx], "is_weekend_off", False)):
+                        continue
                     try:
                         weekly_off_by_idx[n_idx] = sorted({int(d) for d in day_list})
                     except Exception as e:
@@ -1420,7 +1422,6 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 Xv[n,d,s]=m.NewBoolVar(f'x_{n}_{d}_{s}')
     def X(n,d,s):  return Xv.get((n,d,s),0)
     active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
-    
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
         if (n, d) not in active_days:
@@ -1588,8 +1589,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 if join[n] <= d <= leave[n] and (n, d) not in fixed
             )
             sh = m.NewIntVar(0, N, f'short_{d}_{code}')
+            # print('need!!!!!', need)
+            # print('assigned!!!!!', assigned)
+            # print('sh!!!!!', sh)
             m.Add(sh >= need - assigned)
             coverage_shortage_vars.append((sh, code))
+            # print('coverage_shortage_vars!!!!!', coverage_shortage_vars)
             # oversupply 추적: 추가 투입 인원 수 ov ≥ assigned - need
             ov = m.NewIntVar(0, N, f'over_{d}_{code}')
             m.Add(ov >= assigned - need)
@@ -1658,20 +1663,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 weekly_off_days = sorted(
                     d + 1 for d in (weekly_off_by_idx.get(n, []) or []) if T0 <= d <= T1
                 )
+                is_weekend_only = bool(getattr(nu, "is_weekend_off", False))
                 base_min_off = int(
                     getattr(cfg, "global_monthly_off_days", 0)
                     + getattr(cfg, "standard_personal_off_days", 0)
                 )
                 min_off_required = min(base_min_off, T1 - T0 + 1)
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
+                weekend_off_bonus = int(getattr(cfg, "weekend_off_extra_off_days", 2) or 2)
                 max_off_allowed = min(
                     min_off_required + max(0, extra_allowed), T1 - T0 + 1
                 )
+                weekend_in_range = (
+                    [d for d in weekend_days if T0 <= d <= T1] if is_weekend_only else []
+                )
+                weekend_cnt = len(weekend_in_range)
+                weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
                 print(
                     f"[WeekendOff][HardCheck] nurse_idx={n}, "
                     f"nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
                     f"range={T0+1}~{T1+1}, weekend_cnt={weekend_cnt}, "
                     f"min_off_required={min_off_required}, max_off_allowed={max_off_allowed}, "
+                    f"weekday_off_cap={weekday_off_cap}, "
                     f"K={K}, forbid_n={int(n in n_forbid_n)}, "
                     f"two_offs_after_two_nig={int(bool(getattr(cfg, 'two_offs_after_two_nig', False)))}, "
                     f"two_offs_after_three_nig={int(bool(getattr(cfg, 'two_offs_after_three_nig', False)))}"
@@ -1689,7 +1702,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         f"[WeekendOff][HardCheck][WARN] weekend_cnt({weekend_cnt}) < "
                         f"min_off_required({min_off_required}) → 평일 OFF 필요"
                     )
-                if weekend_cnt > max_off_allowed:
+                if not is_weekend_only and weekend_cnt > max_off_allowed:
                     print(
                         f"[WeekendOff][HardCheck][WARN] weekend_cnt({weekend_cnt}) > "
                         f"max_off_allowed({max_off_allowed}) → OFF 상한 충돌"
@@ -1829,14 +1842,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     #         f"min_off_required={min_off_required}, "
                     #         f"max_off_allowed={max_off_allowed}"
                     #     )
-                    m.Add(
-                        sum(
-                            X(n, d, off)
-                            for d in range(T0, T1 + 1)
-                            if (n, d) not in forced_off_cap_excluded
+                    if bool(getattr(nu, "is_weekend_off", False)):
+                        weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
+                        m.Add(
+                            sum(
+                                X(n, d, off)
+                                for d in range(T0, T1 + 1)
+                                if (n, d) not in forced_off_cap_excluded and d not in weekend_days
+                            )
+                            <= weekday_off_cap
                         )
-                        <= max_off_allowed
-                    )
+                    else:
+                        m.Add(
+                            sum(
+                                X(n, d, off)
+                                for d in range(T0, T1 + 1)
+                                if (n, d) not in forced_off_cap_excluded
+                            )
+                            <= max_off_allowed
+                        )
         except Exception:
             pass
 

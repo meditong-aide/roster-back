@@ -248,7 +248,22 @@ def postprocess_trim_extra_offs(
         return min(base_min_off, num_days)
 
     def max_off_allowed(_nurse: Nurse) -> int:
-        return max(base_min_off, min(base_min_off + extra_off, target_cap_global))
+        """후처리에서 적용할 개인별 OFF 상한(주말 휴무자는 평일만 제한)."""
+        base_cap = max(base_min_off, min(base_min_off + extra_off, target_cap_global))
+        if bool(getattr(_nurse, "is_weekend_off", False)):
+            weekend_cnt = sum(1 for d in weekend_days if 0 <= d < num_days)
+            return max(0, base_cap - weekend_cnt)
+        return base_cap
+
+    def current_off_count(n_idx: int, _nurse: Nurse) -> int:
+        """후처리 기준으로 OFF 개수를 계산한다."""
+        if bool(getattr(_nurse, "is_weekend_off", False)):
+            return sum(
+                1
+                for d in range(num_days)
+                if roster_system.roster[n_idx, d, off_idx] == 1 and d not in weekend_days
+            )
+        return int(np.sum(roster_system.roster[n_idx, :, off_idx]))
 
     def build_recovery_off_cells() -> set[tuple[int, int]]:
         cells: set[tuple[int, int]] = set()
@@ -475,7 +490,7 @@ def postprocess_trim_extra_offs(
         if is_n_only(nurse):
             continue
 
-        current_off = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+        current_off = current_off_count(n_idx, nurse)
         max_allowed = max_off_allowed(nurse)
         if current_off <= max_allowed:
             continue
@@ -539,7 +554,7 @@ def postprocess_trim_extra_offs(
 
             roster_system.roster[n_idx, d_idx, off_idx] = 0
             roster_system.roster[n_idx, d_idx, target_shift_idx] = 1
-            new_off = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+            new_off = current_off_count(n_idx, nurse)
             new_viol = len(roster_system._find_violations())
 
             if new_off < required_min or new_viol > base_viol:
