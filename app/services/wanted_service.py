@@ -648,6 +648,7 @@ async def invoke_and_persist_wanted_service(
     req: WantedInvokeRequest,
     current_user: UserSchema,
     db: Session,
+    group_id: str = None
 ) -> Dict[str, Any]:
     """
     Wanted 그래프 실행 후 DB 저장 + 응답 반환
@@ -659,10 +660,20 @@ async def invoke_and_persist_wanted_service(
     nurse_id = current_user.nurse_id
     month_str = _yyyymm(req.year, req.month)
     print(f"invoke_and_persist_wanted_service 시작: nurse={nurse_id}, {month_str}")
+    
+    nurse = db.query(Nurse).filter(
+        Nurse.nurse_id == nurse_id
+    ).first()
+    if not nurse:
+        raise ValueError(f"간호사 ID {nurse_id}를 찾을 수 없습니다.")
+    
+    final_group_id = group_id or nurse.group_id or current_user.group_id
+    if not final_group_id:
+        raise ValueError("group_id를 알 수 없습니다. (current_user.group_id 또는 인자 전달 필요)")
 
     # 허용 근무코드 조회
     allowed_shifts_query = db.query(Shift.shift_id, Shift.name).filter(
-        Shift.group_id == current_user.group_id,
+        Shift.group_id == final_group_id,
         Shift.show_in_preference == True
     ).all()
     allowed_shift_map = {row.shift_id: row.name for row in allowed_shifts_query}
@@ -710,8 +721,11 @@ async def invoke_and_persist_wanted_service(
                 year=req.year,
                 month=req.month,
                 allowed_shifts=", ".join(allowed_shift_map.keys()),
-                allowed_shift_map=allowed_shift_map
+                allowed_shift_map=allowed_shift_map,
+                db=db,
+                group_id=final_group_id
             )
+            
             if isinstance(raw_response, str):
                 raw_response = json.loads(raw_response)
             response = raw_response if isinstance(raw_response, list) and len(raw_response) == 2 else [[], []]

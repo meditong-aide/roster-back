@@ -19,6 +19,9 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_404_NOT_FOUND
 from datalayer.common import Common
 from db.client2 import msdb_manager
 
+from sqlalchemy.orm import Session
+from db.models import Shift
+
 async def excel_to_pandas (file : UploadFile) -> pd.DataFrame:
     if file.content_type not in ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                   "application/vnd.ms-excel"]:
@@ -552,3 +555,24 @@ def download_file(
         filename=download_name,
         media_type='application/octet-stream'  # 일반적인 파일 다운로드에 사용
     )
+
+
+def get_preference_shifts_info(db: Session, group_id: str):
+    shifts = db.query(Shift).filter(
+        Shift.group_id == group_id,
+        Shift.show_in_preference == True
+    ).all()
+    
+    return [
+        {
+            "code": s.shift_id,
+            "name": s.name,
+            # description 제거 → 없으므로 생략
+            "examples": [  # 예시 문장도 name 기반으로만
+                f"{s.name}로 해주세요",
+                f"{s.name} 부탁드려요",
+                f"가능하면 {s.name} 주세요"
+            ]
+        }
+        for s in shifts
+    ]

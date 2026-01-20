@@ -285,7 +285,14 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
         import uuid
         trace_id = str(uuid.uuid4())[:8]
         print(f"[INVOKE START] trace_id={trace_id} | nurse_id={current_user.nurse_id} | request={request.request}")
-        result = await invoke_and_persist_wanted_service(request, current_user, db)
+
+        # group_id 결정 (current_user에서 가져오거나, 필요 시 쿼리)
+        group_id = current_user.group_id
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id가 필요합니다.")
+
+        # invoke_and_persist_wanted_service에 db와 group_id 전달 (기존 함수 수정 반영)
+        result = await invoke_and_persist_wanted_service(request, current_user, db, group_id=group_id)
         
         # 서비스 끝난 후 강제 commit + flush
         db.flush()  # 변경 사항 즉시 반영
@@ -304,7 +311,9 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
 
     
 def parse_shift_results(
-    response: List[List[Dict[str, Any]]]
+    response: List[List[Dict[str, Any]]],
+    db: Session = None,
+    group_id: Optional[str] = None
 ) -> Dict[str, Dict[int, float]]:
     """
     2-중 리스트 구조의 shift_result → {shift: {date: score}} 형태로 통합.
@@ -313,12 +322,24 @@ def parse_shift_results(
     ----------
     response : List[List[Dict[str, Any]]]
         create_shift_analyzer 가 돌려준 전체 응답.
+    db : Session, optional
+        SQLAlchemy 세션 (show_in_preference=True shift만 필터링 시 필요)
+    group_id : str, optional
+        그룹 ID (shifts 테이블 필터링 시 사용)
 
     Returns
     -------
     Dict[str, Dict[int, float]]
         {'D': {7: 0.0}, 'N': {10: 0.0}, ...}
     """
+    # show_in_preference=True인 shift 목록 쿼리 (DB 제공 시)
+    valid_shifts = set()
+    if db and group_id:
+        valid_shifts = {s.shift_id for s in db.query(Shift).filter(
+            Shift.group_id == group_id,
+            Shift.show_in_preference == True
+        ).all()}
+
     parsed: Dict[str, Dict[int, float]] = {}
 
     # ── 1. 최상위는 여러 agent 그룹이 List 로 묶여있음 ─────────────────────
@@ -348,6 +369,11 @@ def parse_shift_results(
                 scores = record.get("score", [])
 
                 if not shift or not isinstance(dates, list) or not isinstance(scores, list):
+                    continue
+
+                # 유효 shift만 처리 (valid_shifts 비어있으면 모두 허용)
+                if valid_shifts and shift not in valid_shifts:
+                    print(f"[PARSE SHIFT] 무효 shift '{shift}' 필터링됨 (group_id={group_id})")
                     continue
 
                 bucket = parsed.setdefault(shift, {})
