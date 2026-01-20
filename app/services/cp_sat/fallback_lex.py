@@ -485,7 +485,9 @@ def optimize_fallback_lex_hard_first(
                     if is_n_only:
                         max_off_allowed = max(0, avail_days - 15) + relax_level
                     else:
-                        max_off_allowed = min(base_min_off + extra_allowed + relax_level, avail_days)
+                        max_off_allowed = min(
+                            base_min_off + extra_allowed + relax_level, avail_days
+                        )
                     if forced_off_cnt > max_off_allowed:
                         per_nurse_off_cap_override[n] = forced_off_cnt
                         forced_days = [
@@ -963,12 +965,23 @@ def optimize_fallback_lex_hard_first(
                         max_off_allowed = min(
                             min_off_required + extra_allowed + relax_level, T1 - T0 + 1
                         )
-                        offs2 = sum(
-                            X(n, d, off_idx)
-                            for d in range(T0, T1 + 1)
-                            if (n, d) not in forced_off_cap_excluded
-                        )
-                        m.Add(offs2 <= max_off_allowed)
+                        if bool(getattr(nu, "is_weekend_off", False)):
+                            weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
+                            weekend_cnt = len(weekend_in_range)
+                            weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
+                            offs2 = sum(
+                                X(n, d, off_idx)
+                                for d in range(T0, T1 + 1)
+                                if (n, d) not in forced_off_cap_excluded and d not in weekend_days
+                            )
+                            m.Add(offs2 <= weekday_off_cap)
+                        else:
+                            offs2 = sum(
+                                X(n, d, off_idx)
+                                for d in range(T0, T1 + 1)
+                                if (n, d) not in forced_off_cap_excluded
+                            )
+                            m.Add(offs2 <= max_off_allowed)
         except Exception:
             pass
 
