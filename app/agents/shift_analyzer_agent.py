@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
 import os
 from langchain_core.messages import SystemMessage, HumanMessage
 import dotenv
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import operator
 from services.holiday_pack import tool_get_weekends, tool_get_holidays
 try:
@@ -159,13 +159,24 @@ class shiftAnalyzerPrompt:
         rules += "- importance: '법정', '필수', '보수', '생리' 등 포함 시 5점 고정\n"
         rules += "- 날짜는 입력 그대로 사용. {month}월 범위 내이면 무조건 result에 넣으세요.\n"
         rules += "- result=None 절대 금지. shift가 인식되면 무조건 result 출력.\n"
+        
+        # 패턴 변환 지시 추가
+        rules += """
+        - '매주', '매월', '격주', '주말', '평일' 같은 반복 패턴이 나오면:
+            - date: [] 로 두지 말고, **현재 {month}월의 해당 요일/조건에 맞는 모든 날짜 리스트**를 채워서 반환하세요.
+            - 예: "매주 수요일은 D" → date: [수요일인 날짜들, 예: 5, 12, 19, 26]
+            - "주말은 OFF" → date: [주말 날짜들]
+            - "평일 E" → date: [평일 날짜들]
+        - date 리스트는 반드시 1~31 사이의 정수 리스트로, 빈 리스트 [] 금지 (패턴이면 월 전체 적용)
+        - 날짜 계산 시 윤년/월 말일 고려, 정확히 계산하세요.
+        """
 
         # 4. 동적 Few-shot (코드 직접 언급 케이스 강조)
         few_shots = "## Few-shot Examples\n"
         for code, name in allowed_shift_map.items():
             few_shots += f'- "10일 {code}로 줘" → {{"shift": "{code}", "date": [10], "score": [5.0]}}\n'
             few_shots += f'- "{name} 15일 신청" → {{"shift": "{code}", "date": [15], "score": [4.0]}}\n'
-            few_shots += f'- "매주 {code}" → {{"shift": "{code}", "date": [], "score": []}}\n'
+            few_shots += f'- "매주 {code}" → {{"shift": "{code}", "date": [월의 해당 요일 날짜들], "score": [5.0] * n}}\n'
 
         self.system = f"""
 # ROLE
@@ -276,31 +287,53 @@ async def shift_analyzer(state):
 
             print(f"Shift Analyzer 응답: {json_answer}")
 
-            # ★★★ 후처리: LLM이 잘못된 shift 코드를 출력한 경우 보정 ★★★
-            if json_answer["result"] and json_answer["result"].get("shift"):
-                extracted_shift = json_answer["result"]["shift"]
+            # ★★★ 패턴 후처리: date가 []이면 서버에서 요일 계산 ★★★
+            if json_answer["result"] and json_answer["result"].get("date") == []:
+                request_text_lower = request_text.lower()
+                year = state['year']
+                month = state['month']
 
-                # 1. 원본 텍스트에 shift 코드가 직접 포함되어 있는지
-                for code in allowed_shift_map:
-                    if code in request_text:
-                        if extracted_shift != code:
-                            print(f"[POST-FIX] '{extracted_shift}' → '{code}' (코드 직접 언급 보정)")
-                            json_answer["result"]["shift"] = code
-                        break
-                else:
-                    # 2. shift 이름이 포함되어 있는지
-                    for code, name in allowed_shift_map.items():
-                        if name in request_text or name.replace(" ", "") in request_text.replace(" ", ""):
-                            if extracted_shift != code:
-                                print(f"[POST-FIX] '{extracted_shift}' → '{code}' (이름 '{name}' 감지 보정)")
-                                json_answer["result"]["shift"] = code
+                try:
+                    first_day = date(year, month, 1)
+                    next_month = month + 1 if month < 12 else 1
+                    next_year = year if month < 12 else year + 1
+                    last_day = (date(next_year, next_month, 1) - timedelta(days=1)).day
+
+                    weekday_map = {
+                        '월요일': 0, '월': 0,
+                        '화요일': 1, '화': 1,
+                        '수요일': 2, '수': 2,
+                        '목요일': 3, '목': 3,
+                        '금요일': 4, '금': 4,
+                        '토요일': 5, '토': 5,
+                        '일요일': 6, '일': 6,
+                        '주말': [5, 6],
+                        '평일': [0, 1, 2, 3, 4]
+                    }
+
+                    target_weekdays = None
+                    for kw, wd in weekday_map.items():
+                        if kw in request_text_lower:
+                            target_weekdays = wd if isinstance(wd, list) else [wd]
+                            print(f"[POST-FIX] 패턴 감지: '{kw}' → weekday {target_weekdays}")
                             break
 
-                # 3. 'O'로 잘못 바뀐 경우 마지막 보정
-                if json_answer["result"]["shift"] == 'O' and extracted_shift != 'O':
-                    print(f"[POST-FIX] 'O' → '{extracted_shift}' 보정 (의심 케이스)")
+                    if target_weekdays is not None:
+                        filled_dates = []
+                        current = first_day
+                        while current.month == month:
+                            if current.weekday() in target_weekdays:
+                                filled_dates.append(current.day)
+                            current += timedelta(days=1)
 
-            break  # 성공 시 루프 탈출
+                        if filled_dates:
+                            json_answer["result"]["date"] = filled_dates
+                            json_answer["result"]["score"] = [5.0] * len(filled_dates)
+                            print(f"[POST-FIX] date [] → {filled_dates} (패턴 '{request_text}' 처리)")
+                except Exception as e:
+                    print(f"[POST-FIX] 날짜 계산 오류: {e}")
+
+            break
 
         except Exception as e:
             error_msg = str(e).lower()
@@ -419,6 +452,7 @@ async def create_shift_analyzer(parent_state):
                 "year": year,
                 "month": month,
                 "weekend_holiday": weekend_holiday,
+                "allowed_shift_map": parent_state.get('allowed_shift_map', {})
             })
             new_shift_results = result.get('shift_results', [{}])[0].get('shift_result', [])
         except Exception as e:
@@ -494,6 +528,7 @@ async def create_shift_analyzer(parent_state):
             def create_shift_node(n):
                 async def wrapped_shift(state):
                     state['phase'] = n
+                    state['allowed_shift_map'] = parent_state.get('allowed_shift_map', {})
                     return await shift_analyzer(state)
                 return wrapped_shift
             graph.add_node(f'shift_analyzer{n}', create_shift_node(n))
