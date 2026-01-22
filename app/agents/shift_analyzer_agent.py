@@ -150,25 +150,18 @@ class shiftAnalyzerPrompt:
             keywords = f'"{code}", "{name}", "{name}로", "{name} 신청", "{name} 줘"'
             table += f"| {code} | {name} | {keywords} |\n"
 
-        # 3. 강력한 규칙
-        rules = "## 절대 지켜야 할 규칙\n"
-        rules += "- 위 테이블의 코드나 이름/키워드가 1개라도 나오면 **무조건 해당 shift 코드**로 출력하세요.\n"
-        rules += "- '로 줘', '신청해', '하고 싶어' 같은 표현 뒤에 코드/이름이 붙으면 100% shift로 인식\n"
-        rules += "- '생로 줘' → '생', '법로 줘' → '법' 등 코드 직접 나오면 그대로 사용\n"
-        rules += "- '휴가', '쉬고', 'Off'가 있어도 shift 이름/코드가 우선 (절대 'O'로 바꾸지 마세요)\n"
-        rules += "- importance: '법정', '필수', '보수', '생리' 등 포함 시 5점 고정\n"
-        rules += "- 날짜는 입력 그대로 사용. {month}월 범위 내이면 무조건 result에 넣으세요.\n"
-        rules += "- result=None 절대 금지. shift가 인식되면 무조건 result 출력.\n"
-        
-        # 패턴 변환 지시 추가
-        rules += """
-        - '매주', '매월', '격주', '주말', '평일' 같은 반복 패턴이 나오면:
-            - date: [] 로 두지 말고, **현재 {month}월의 해당 요일/조건에 맞는 모든 날짜 리스트**를 채워서 반환하세요.
-            - 예: "매주 수요일은 D" → date: [수요일인 날짜들, 예: 5, 12, 19, 26]
-            - "주말은 OFF" → date: [주말 날짜들]
-            - "평일 E" → date: [평일 날짜들]
-        - date 리스트는 반드시 1~31 사이의 정수 리스트로, 빈 리스트 [] 금지 (패턴이면 월 전체 적용)
-        - 날짜 계산 시 윤년/월 말일 고려, 정확히 계산하세요.
+        # 3. 핵심 규칙
+        rules = """
+        ## 절대 지켜야 할 규칙
+            - 위 테이블의 코드나 이름/키워드가 1개라도 나오면 **무조건 해당 shift 코드**로 출력하세요.
+            - '로 줘', '신청해', '하고 싶어' 같은 표현 뒤에 코드/이름이 붙으면 100% shift로 인식
+            - 코드 직접 나오면 그대로 사용 (생로 줘 → '생', 법로 줘 → '법')
+            - '휴가', '쉬고', 'Off'가 있어도 shift 이름/코드가 우선 (절대 'O'로 바꾸지 마세요)
+            - 날짜는 입력 그대로 사용. {month}월 범위 내이면 무조건 result에 넣으세요.
+            - result=None 절대 금지. shift가 인식되면 무조건 result 출력.
+            - '매주', '매월', '격주', '주말', '평일' 같은 반복 패턴 → 빈 리스트 [] 금지
+            → {month}월 내 해당 조건에 맞는 모든 날짜 리스트로 채움 (윤년·월말일 정확히 계산)
+            - "말고", "빼고", "제외" 등 부정 표현 → 대체 shift 추론 금지
         """
 
         # 4. 동적 Few-shot (코드 직접 언급 케이스 강조)
@@ -179,42 +172,67 @@ class shiftAnalyzerPrompt:
             few_shots += f'- "매주 {code}" → {{"shift": "{code}", "date": [월의 해당 요일 날짜들], "score": [5.0] * n}}\n'
 
         self.system = f"""
-# ROLE
-You are a strict, no-hallucination shift preference parser for nurses.
-사용자 입력을 위 규칙에 따라 **정확히** 구조화하세요.
+        # GOLE
+        You are a strict, no-hallucination shift preference parser for nurses.
+        사용자 입력을 위 규칙에 따라 **정확히** 구조화하세요.
 
-{table}
+        {table}
 
-{rules}
+        {rules}
 
-{few_shots}
+        ## 1. Request Type (Weight Modifier)
+        | Type    | Description                          | Modifier |
+        |---------|--------------------------------------|----------|
+        | off     | Forced OFF                           | × 2      |
+        | shift   | Specific Shift assignment            | × 1.9    |
+        | keep    | Recurring request (weekly, etc.)     | × 1.8    |
+        | pattern | Rules like "DD→N", "N followed by O" | × 1.7    |
+        | other   | Non-policy items                     | –        |
 
-## OUTPUT
-- result.shift는 테이블의 코드 중 **정확히 하나**만 사용
-- score: 0~10 (의무/법정 관련 5 이상)
-- result=None 금지 (shift 인식되면 무조건 출력)
+        ## 2. Request Importance (Base Weight)
+        | Score | Priority/Reason              | Allowed Type             |
+        |-------|------------------------------|--------------------------|
+        | 5     | Legal/Hospital mandatory     | shift/keep/off           |
+        | 4     | Life/Health crisis           | off/shift                |
+        | 3     | Social/Family duties         | off/shift/pattern        |
+        | 2     | Important personal plans     | off/shift/keep/pattern   |
+        | 1     | Preference/Convenience       | keep/pattern             |
+        | 0     | Out of policy/unsupported    | other                    |
 
-## SCHEMA
-{{
-  "processor": str,
-  "request_type": str|null,
-  "request_type_reason": str,
-  "request_importance": int|null,
-  "request_importance_reason": str,
-  "result": {{"shift": str, "date": list[int], "score": list[float]}} | null
-}}
-"""
+        Final weight = Importance Score × Type Modifier
+
+        ## 3. Mandatory Mapping Rules
+        - "Day shift" → "D", "Evening" → "E", "Night" → "N", "Off" → "O"
+        - Negative expressions ("말고", "빼고", "제외") → do NOT infer alternatives
+
+        {few_shots}
+
+        ## 4. Output JSON Schema
+        {{
+        "processor": "string",
+        "request_type": "off|shift|keep|pattern|other|null",
+        "request_type_reason": "string",
+        "request_importance": "0-5 or null",
+        "request_importance_reason": "string",
+        "result": {{
+            "shift": "string",
+            "date": [int],
+            "score": [float]
+        }} or null
+        }}
+        """
 
         weekends_json = json.dumps((weekend_holiday or {}).get("weekends", []), ensure_ascii=False)
         holidays_json = json.dumps((weekend_holiday or {}).get("holidays", []), ensure_ascii=False)
+        
         self.human = f"""
-# CONTEXT ({year}년 {month}월)
-주말: {weekends_json}
-공휴일: {holidays_json}
-사용자 요청: {context}
+        # CONTEXT ({year}년 {month}월)
+        주말: {weekends_json}
+        공휴일: {holidays_json}
+        사용자 요청: {context}
 
-정확히 파싱하세요. shift 인식되면 result에 반드시 넣으세요.
-"""
+        정확히 파싱하세요. shift 인식되면 result에 반드시 넣으세요.
+        """
 
 
 async def shift_analyzer(state):
