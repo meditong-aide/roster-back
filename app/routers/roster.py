@@ -49,6 +49,7 @@ from services.roster_service import (
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
 )
+from services.weekly_off_service import get_nurses_weekly_off_service
 from utils.utils import send_roster_publish_push
 import uuid
 import pprint
@@ -1580,4 +1581,137 @@ async def create_empty_roster(
         "month": month,
         "status": "draft",
         "entries_copied": 0
+    }
+
+
+@router.post("/create-with-weekly-off")
+async def create_roster_with_weekly_off(
+    year: int = Query(..., description="생성할 연도 (현재 탭 연도)"),
+    month: int = Query(..., description="생성할 월 (현재 탭 월)"),
+    name: Optional[str] = Query(None, description="새 버전 이름 (생략 시 자동 생성)"),
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    현재 보고 있는 연/월에 주휴일만 포함된 신규 빈 근무표 생성
+    """
+    if not current_user or not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise HTTPException(status_code=403, detail="권한이 없습니다.")
+
+    target_group_id = _get_target_group_id(current_user, group_id, db)
+
+    new_version = _get_next_version(db, target_group_id, year, month)
+
+    latest_config = db.query(RosterConfigModel).filter(
+        RosterConfigModel.group_id == target_group_id,
+        RosterConfigModel.office_id == current_user.office_id,
+    ).order_by(RosterConfigModel.created_at.desc()).first()
+
+    created_name = name or f"{month}월 근무표 VER{new_version} (주휴 포함)"
+
+    new_schedule_id = str(uuid.uuid4().hex)[:12]
+
+    new_schedule = Schedule(
+        schedule_id=new_schedule_id,
+        office_id=current_user.office_id,
+        group_id=target_group_id,
+        year=year,
+        month=month,
+        version=new_version,
+        config_id=latest_config.config_id if latest_config else None,
+        created_by=current_user.account_id,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        status="draft",
+        dropped=False,
+        name=created_name,
+        memo="주휴일 자동 포함 버전",
+    )
+    db.add(new_schedule)
+
+    weekly_off_data = get_nurses_weekly_off_service(
+        year=year,
+        month=month,
+        user=current_user,
+        db=db,
+        group_id=target_group_id
+    )
+
+    created_entries = 0
+
+    nurses = []
+    if isinstance(weekly_off_data, dict):
+        nurses = weekly_off_data.get("items", [])
+    elif hasattr(weekly_off_data, "items"):
+        nurses = weekly_off_data.items
+
+    print(f"[DEBUG] 추출된 nurses 수: {len(nurses)}")
+
+    from datetime import date, timedelta
+
+    for idx, nurse in enumerate(nurses):
+        # Pydantic 모델이므로 속성 접근 사용
+        nurse_id = getattr(nurse, "nurse_id", None)
+        name = getattr(nurse, "name", "이름없음")
+        enabled = getattr(nurse, "weekly_off_enabled", False)
+        preview_wd = getattr(nurse, "preview_weekday", None)
+        base_wd = getattr(nurse, "base_weekday", None)
+        label = getattr(nurse, "preview_weekday_label", "")
+
+        print(f"[DEBUG] {idx+1}번째 간호사: {name} (id:{nurse_id}) enabled={enabled}, preview={preview_wd}, base={base_wd}, label={label}")
+
+        if not nurse_id or not enabled:
+            print(f"[DEBUG] 스킵 - enabled=False 또는 id 없음: {name}")
+            continue
+
+        wd = preview_wd if preview_wd is not None else base_wd
+        if wd is None:
+            print(f"[DEBUG] 스킵 - 요일 없음: {name} (preview={preview_wd}, base={base_wd})")
+            continue
+
+        print(f"[DEBUG] {name} 주휴 적용 시작 - 요일 {wd} ({label})")
+
+        first_day = date(year, month, 1)
+        current = first_day
+        # 월 마지막 날 계산
+        month_end = (first_day.replace(day=28) + timedelta(days=10)).replace(day=1) - timedelta(days=1)
+
+        count_for_this_nurse = 0
+        while current <= month_end:
+            if current.weekday() == wd:
+                entry = ScheduleEntry(
+                    entry_id=str(uuid.uuid4().hex)[:12],
+                    schedule_id=new_schedule.schedule_id,
+                    nurse_id=nurse_id,
+                    work_date=current,
+                    shift_id="주",
+                )
+                db.add(entry)
+                created_entries += 1
+                count_for_this_nurse += 1
+                print(f"[DEBUG] 생성됨: {name} → {current} (weekday {wd})")
+
+            current += timedelta(days=1)
+
+        print(f"[DEBUG] {name} 주휴 총 생성: {count_for_this_nurse}개")
+
+    try:
+        db.commit()
+        db.refresh(new_schedule)
+        print(f"[DEBUG] 전체 주휴 엔트리 생성 완료: {created_entries}개")
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] commit 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"주휴 포함 근무표 생성 실패: {str(e)}")
+
+    return {
+        "message": "주휴일이 포함된 신규 빈 버전 생성 완료",
+        "new_schedule_id": new_schedule.schedule_id,
+        "new_version": new_version,
+        "name": created_name,
+        "year": year,
+        "month": month,
+        "status": "draft",
+        "entries_created": created_entries
     }
