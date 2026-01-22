@@ -117,10 +117,24 @@ def _compute_cost(prompt_tokens: int, completion_tokens: int, model_name: str) -
 
 
 class queryAnalyzerPrompt:
-    def __init__(self, context, year, month):
+    def __init__(self, context, year, month, allowed_shift_map: dict = None):
         """
         프롬프트 클래스
         """
+        allowed_shift_map = allowed_shift_map or {}
+        
+        # 동적 Few-shot 예시 생성
+        dynamic_shift_examples = ""
+        if allowed_shift_map:
+            dynamic_shift_examples = "## 지원되는 shift 코드 매핑 (반드시 이 코드로 변환하세요)\n"
+            dynamic_shift_examples += "사용자가 아래 shift 이름을 언급하면 반드시 해당 shift_id로 변환하여 Shift 리스트에 넣으세요.\n\n"
+            for code, name in allowed_shift_map.items():
+                dynamic_shift_examples += f'- "{name}", "{name} 신청", "{name}로 해줘", "{name} 하고 싶어" → Shift: ["{code}"]\n'
+            dynamic_shift_examples += "\n예시:\n"
+            dynamic_shift_examples += '- "10일 생리휴가" → Shift: ["10일은 생로 줘"]\n'
+            dynamic_shift_examples += '- "15일 법정교육" → Shift: ["15일은 법로 줘"]\n'
+            dynamic_shift_examples += '- "20일 필수교육 빼줘" → Except: ["20일은 필 말고"], Shift: []\n'
+        
         self.system = f"""
         ## GOAL:
             You are the "Nurse Preference Preprocessor."  
@@ -153,6 +167,8 @@ class queryAnalyzerPrompt:
                 * Element order must follow the input sequence.
 
         ## 2. Mandatory Rules
+            {dynamic_shift_examples}
+            
             | Expression | Conversion Example |
             | - | - |
             | Day shift | "D" |
@@ -161,6 +177,12 @@ class queryAnalyzerPrompt:
             | Off/휴무    | "O" |
             | Date formats | `M/D` or `M월 D일` are all allowed, but keep the original form in output |
             | Periodic expressions | "매주", "주말", "평일", "격주" etc. remain as rule-based items |
+        
+        ## 필수 규칙 재강조
+            - show_in_preference=True인 shift 이름(생리휴가, 법정교육, 필수교육, 휴가, 공가, 보수교육 등)은 **반드시** 해당 shift_id("생", "법", "필", "휴", "공", "보" 등)로 변환하여 Shift에 넣으세요.
+            - Shift 요청이 명확하면 **절대 빈 리스트로 반환하지 마세요**.
+            - "생리휴가", "법정교육" 같은 단어가 나오면 무조건 Shift 카테고리로 분류하세요.
+            - 날짜 + shift 이름 조합은 Shift에 우선 배치하세요.
 
         ## 3. Processing Guidelines
             * Keep periodic expressions like "매주/주말/평일" exactly as in the original text, never expand into dates.
@@ -214,7 +236,15 @@ async def query_analyzer(state):
     context = state['request']
     year = state['year']
     month = state['month']
-    prompt = queryAnalyzerPrompt(context, year, month)
+    
+    allowed_shift_map = state.get('allowed_shift_map', {})
+    
+    prompt = queryAnalyzerPrompt(
+        context=context, 
+        year=year, 
+        month=month,
+        allowed_shift_map=allowed_shift_map
+    )
 
     models_to_try = [
         ChatOpenAI(model="gpt-4.1-mini-2025-04-14", openai_api_key=os.getenv("OPENAI_API_KEY")),
@@ -269,6 +299,12 @@ async def query_analyzer(state):
             print(f'[LLM 실패 {idx}] {e}')
             if idx == len(models_to_try):
                 print('[모든 LLM 실패] 기본값 사용')
+    
+    # elqjrlddyd fhrm
+    print("[QUERY ANALYZER 최종 출력]")
+    print(f"query_shift: {shift}")
+    print(f"query_others: {others}")
+    print(f"query_chat: {chat}")
 
     # 토큰 계산
     model_name = used_model or models_to_try[0].model_name

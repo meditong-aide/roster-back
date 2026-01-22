@@ -652,7 +652,8 @@ async def invoke_and_persist_wanted_service(
     """
     Wanted 그래프 실행 후 DB 저장 + 응답 반환
     주요 개선:
-    - case가 있으면 case 없는 날짜의 기존 shift 기록 삭제 → 잔여 이력 방지
+    - case 정규화를 함수 초반으로 이동 → NameError 방지
+    - case가 없어도 안전하게 graph 호출
     - request가 '기존 데이터' 계열이면 복사 스킵
     - case가 충분히 많으면 전체 재작성으로 간주
     """
@@ -660,14 +661,14 @@ async def invoke_and_persist_wanted_service(
     month_str = _yyyymm(req.year, req.month)
     print(f"invoke_and_persist_wanted_service 시작: nurse={nurse_id}, {month_str}")
 
-    # 허용 근무코드 조회
-    allowed_shifts_query = db.query(Shift.shift_id, Shift.name).filter(
+    # 허용 근무코드 조회 (show_in_preference=True)
+    allowed_shifts_query = db.query(Shift).filter(
         Shift.group_id == current_user.group_id,
         Shift.show_in_preference == True
     ).all()
     allowed_shift_map = {row.shift_id: row.name for row in allowed_shifts_query}
 
-    # case 정규화
+    # ★★★ 핵심: case 정규화를 함수 초반으로 이동 ★★★
     normalized_case, ignored_case = _normalize_case_items(
         case_raw=req.case,
         req_year=req.year,
@@ -675,20 +676,22 @@ async def invoke_and_persist_wanted_service(
         allowed_shift_map=allowed_shift_map,
     )
     has_case = bool(normalized_case)
+
+    # graph에 전달할 case 포맷 (isoformat 처리)
     graph_case_payload = [
         {"date": item["date"].isoformat(), "shift": item["shift"]}
         for item in normalized_case
-    ]
+    ] if has_case else []
 
-    # request 텍스트 정제 (더미 텍스트 감지용)
+    # request 텍스트 정제
     cleaned_request = normalize_request_text(req.request)
     is_dummy_request = not cleaned_request.strip() or '기존 데이터' in cleaned_request
 
-    # 전체 재작성 판단 (조건 강화)
+    # 전체 재작성 판단
     days_in_month = 31  # 대략적
     is_full_reset = (
         has_case
-        and len(normalized_case) >= 10  # ← 10개 이상이면 전체 재작성으로 간주 (조정 가능)
+        and len(normalized_case) >= 10
         and not is_dummy_request
     )
 
@@ -696,17 +699,16 @@ async def invoke_and_persist_wanted_service(
           f"is_dummy_request={is_dummy_request}, is_full_reset={is_full_reset}")
 
     # 그래프 실행 여부
-    should_run_graph = not is_dummy_request
     response = [[], []]
     shift_parsed = {}
     pref_parsed = []
 
-    if should_run_graph:
+    if not is_dummy_request:
         try:
             raw_response = await graph_service.invoke(
                 request=req.request,
                 schema=req.schema,
-                case=graph_case_payload,
+                case=graph_case_payload,                    # ← 이제 안전하게 전달
                 year=req.year,
                 month=req.month,
                 allowed_shifts=", ".join(allowed_shift_map.keys()),
@@ -791,7 +793,7 @@ async def invoke_and_persist_wanted_service(
     )
     shift_map = _drop_weekly_off_from_shift_map(shift_map, weekly_off_days)
 
-    # case가 하나라도 있으면 → case 없는 날짜의 기존 shift 기록 삭제 (잔여 이력 방지 핵심)
+    # case가 하나라도 있으면 → case 없는 날짜의 기존 shift 기록 삭제
     if has_case:
         case_days = {item["date"].day for item in normalized_case}
         start_date = date(req.year, req.month, 1)
