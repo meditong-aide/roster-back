@@ -226,6 +226,34 @@ def postprocess_trim_extra_offs(
     )
     weekly_off_cells = {(n, d) for n, days in weekly_off_map.items() for d in (days or [])}
 
+    # 주휴 인접 OFF 셀 식별 (off_placement_mode가 활성화된 경우)
+    weekly_off_adjacent_cells: set[tuple[int, int]] = set()
+    off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
+    if off_placement_mode > 0 and weekly_off_map:
+        for n_idx, day_list in weekly_off_map.items():
+            if n_idx >= len(roster_system.nurses):
+                continue
+            if bool(getattr(roster_system.nurses[n_idx], "is_weekend_off", False)):
+                continue
+            for d_raw in day_list or []:
+                try:
+                    d = int(d_raw)
+                except Exception:
+                    continue
+                if 0 <= d < num_days:
+                    # 주휴 앞/뒤 OFF 셀 보호
+                    if off_placement_mode == 1:  # 앞/뒤
+                        if d - 1 >= 0:
+                            weekly_off_adjacent_cells.add((n_idx, d - 1))
+                        if d + 1 < num_days:
+                            weekly_off_adjacent_cells.add((n_idx, d + 1))
+                    elif off_placement_mode == 2:  # 앞만
+                        if d - 1 >= 0:
+                            weekly_off_adjacent_cells.add((n_idx, d - 1))
+
+    # 휴가 코드 식별 (생, 휴 등)
+    vacation_codes = {code for code in cfg.shift_types if code not in {"D", "E", "N", "O", "W"} and code in {"생", "휴"}}
+
     pref_matrix = getattr(roster_system, "preference_matrix", None)
     grade_config = getattr(roster_system, "grade_config", None)
     grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
@@ -244,6 +272,21 @@ def postprocess_trim_extra_offs(
             return allowed == {"N"}
         return raw == 3 or (raw is not None and raw != 0 and raw is not False)
 
+    def count_vacation_days(n_idx: int) -> int:
+        """휴가 일수를 카운트한다."""
+        if not vacation_codes:
+            return 0
+        count = 0
+        for d in range(num_days):
+            vec = roster_system.roster[n_idx, d]
+            for vac_code in vacation_codes:
+                if vac_code in cfg.shift_types:
+                    vac_idx = cfg.shift_types.index(vac_code)
+                    if vec[vac_idx] == 1:
+                        count += 1
+                        break
+        return count
+
     def min_off_required() -> int:
         return min(base_min_off, num_days)
 
@@ -256,14 +299,19 @@ def postprocess_trim_extra_offs(
         return base_cap
 
     def current_off_count(n_idx: int, _nurse: Nurse) -> int:
-        """후처리 기준으로 OFF 개수를 계산한다."""
+        """후처리 기준으로 OFF 개수를 계산한다 (휴가 포함)."""
+        off_count = 0
         if bool(getattr(_nurse, "is_weekend_off", False)):
-            return sum(
+            off_count = sum(
                 1
                 for d in range(num_days)
                 if roster_system.roster[n_idx, d, off_idx] == 1 and d not in weekend_days
             )
-        return int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+        else:
+            off_count = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+        # 휴가 일수도 포함
+        vacation_cnt = count_vacation_days(n_idx)
+        return off_count + vacation_cnt
 
     def build_recovery_off_cells() -> set[tuple[int, int]]:
         cells: set[tuple[int, int]] = set()
@@ -504,6 +552,8 @@ def postprocess_trim_extra_offs(
                 continue
             if (n_idx, d_idx) in off_exception_cells or (n_idx, d_idx) in weekly_off_cells:
                 continue
+            if (n_idx, d_idx) in weekly_off_adjacent_cells:
+                continue  # 주휴 인접 OFF 보호
             if is_recovery_off(n_idx, d_idx):
                 continue
             if bool(getattr(nurse, "is_weekend_off", False)) and d_idx in weekend_days:

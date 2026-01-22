@@ -192,7 +192,7 @@ def build_main_objective_terms(
 
     # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
     if getattr(cfg, "sequential_offs", True):
-        SEQUENTIAL_OFF_BONUS = 15  # 연속 휴무 보너스 가중치
+        SEQUENTIAL_OFF_BONUS = 150000  # 연속 휴무 보너스 가중치
         for n in range(N):
             T0, T1 = join[n], leave[n]
             for d in range(T0, T1):
