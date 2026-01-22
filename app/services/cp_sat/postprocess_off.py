@@ -287,7 +287,28 @@ def postprocess_trim_extra_offs(
                         break
         return count
 
-    def min_off_required() -> int:
+    def min_off_required(n_idx: int = None) -> int:
+        """최소 주휴일(O) 개수를 반환한다.
+        
+        Args:
+            n_idx: 간호사 인덱스. None이면 기본값 반환, 지정되면 해당 간호사의 휴가를 고려.
+        
+        Returns:
+            최소 주휴일 개수. 휴가가 많은 경우에도 최소 주휴일은 보장되어야 함.
+        """
+        if n_idx is None:
+            return min(base_min_off, num_days)
+        # 개인별 휴가 일수 고려
+        vacation_cnt = count_vacation_days(n_idx)
+        # 최소 주휴일 = base_min_off (휴가는 별도로 계산되므로 O는 항상 base_min_off 이상이어야 함)
+        return min(base_min_off, num_days)
+
+    def min_o_required(n_idx: int) -> int:
+        """최소 주휴일(O) 개수를 반환한다. 휴가는 별도로 계산되므로 O는 항상 base_min_off 이상이어야 함.
+        
+        휴가가 많아도 최소 주휴일(O)은 base_min_off 이상이어야 함.
+        예: base_min_off=8, 휴가=4개 → 최소 O=8개 (총 휴무일=12개)
+        """
         return min(base_min_off, num_days)
 
     def max_off_allowed(_nurse: Nurse) -> int:
@@ -312,6 +333,16 @@ def postprocess_trim_extra_offs(
         # 휴가 일수도 포함
         vacation_cnt = count_vacation_days(n_idx)
         return off_count + vacation_cnt
+    
+    def current_o_count(n_idx: int, _nurse: Nurse) -> int:
+        """후처리 기준으로 주휴일(O) 개수만 계산한다 (휴가 제외)."""
+        if bool(getattr(_nurse, "is_weekend_off", False)):
+            return sum(
+                1
+                for d in range(num_days)
+                if roster_system.roster[n_idx, d, off_idx] == 1 and d not in weekend_days
+            )
+        return int(np.sum(roster_system.roster[n_idx, :, off_idx]))
 
     def build_recovery_off_cells() -> set[tuple[int, int]]:
         cells: set[tuple[int, int]] = set()
@@ -543,7 +574,10 @@ def postprocess_trim_extra_offs(
         if current_off <= max_allowed:
             continue
 
-        required_min = min_off_required()
+        # 최소 주휴일(O) 개수 체크 (휴가는 별도로 계산되므로 O는 항상 base_min_off 이상이어야 함)
+        required_min_o = min_o_required(n_idx)
+        current_o = current_o_count(n_idx, nurse)
+        
         candidates: list[tuple[int, int, float, int]] = []
         for d_idx in range(num_days):
             if roster_system.roster[n_idx, d_idx, off_idx] != 1:
@@ -605,9 +639,11 @@ def postprocess_trim_extra_offs(
             roster_system.roster[n_idx, d_idx, off_idx] = 0
             roster_system.roster[n_idx, d_idx, target_shift_idx] = 1
             new_off = current_off_count(n_idx, nurse)
+            new_o = current_o_count(n_idx, nurse)
             new_viol = len(roster_system._find_violations())
 
-            if new_off < required_min or new_viol > base_viol:
+            # 최소 주휴일(O) 개수 체크: 휴가가 많아도 최소 주휴일(O)은 보장되어야 함
+            if new_o < required_min_o or new_viol > base_viol:
                 roster_system.roster[n_idx, d_idx, target_shift_idx] = 0
                 roster_system.roster[n_idx, d_idx, off_idx] = 1
                 continue
