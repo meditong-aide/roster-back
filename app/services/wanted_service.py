@@ -304,6 +304,7 @@ def _normalize_case_items(
         date_raw = payload.get("date")
         item_year = payload.get("year")
         item_month = payload.get("month")
+        comment_raw = payload.get("comment") # 사유작성
 
         if not shift_raw:
             ignored.append({"reason": "shift 누락", "item": payload})
@@ -326,7 +327,11 @@ def _normalize_case_items(
             ignored.append({"reason": "날짜 불일치/파싱 실패", "item": payload})
             continue
 
-        normalized.append({"date": parsed_date, "shift": shift})
+        normalized.append({
+            "date": parsed_date, 
+            "shift": shift,
+            "comment": comment_raw # 사유작성
+        })
 
     return normalized, ignored
 
@@ -351,12 +356,17 @@ def _persist_shift_results(
         for day, info in (by_day or {}).items():
             if not isinstance(day, int) or not 1 <= day <= 31:
                 continue
+            
+            print(f"[DEBUG-4] 저장 시도: {year}-{month:02d}-{day:02d} {shift_code} | "
+                  f"request={info.get('request')!r}, comment={info.get('comment')!r}")
 
             score = float(info.get("score", 1.0))
             score = max(0.0, min(10.0, score))  # case 우선순위 반영 위해 범위 확대
 
             request_val = info.get("request", original_request or "AIDE 추천")
             partial_request = normalize_request_text(request_val)
+            
+            comment = info.get("comment", "") # 사유작성
 
             target_date = _ymd(year, month, day)
 
@@ -370,6 +380,7 @@ def _persist_shift_results(
                 existing.shift = shift_code
                 existing.score = score
                 existing.partial_request = partial_request
+                existing.comment = comment # 사유작성
             else:
                 db.add(NurseShiftRequest(
                     nurse_id=nurse_id,
@@ -379,6 +390,7 @@ def _persist_shift_results(
                     shift=shift_code,
                     score=score,
                     partial_request=partial_request,
+                    comment=comment, # 사유작성
                 ))
                 detailed_id += 1
             rows += 1
@@ -571,6 +583,7 @@ def _copy_existing_requests_to_new(
             shift=shift,
             score=old_row.score,
             partial_request=old_row.partial_request,
+            comment=old_row.comment # 사유작성
         ))
         shift_count += 1
         detailed_id_shift += 1
@@ -676,6 +689,11 @@ async def invoke_and_persist_wanted_service(
         allowed_shift_map=allowed_shift_map,
     )
     has_case = bool(normalized_case)
+    
+    print("[DEBUG-1] normalized_case 전체 내용 : ", normalized_case)
+    for idx, item in enumerate(normalized_case):
+        print(f"[DEBUG-1] case[{idx}]: date={item.get('date')}, shift={item.get('shift')}, "
+              f"comment={item.get('comment')!r} (type={type(item.get('comment'))})")
 
     # graph에 전달할 case 포맷 (isoformat 처리)
     graph_case_payload = [
@@ -754,11 +772,19 @@ async def invoke_and_persist_wanted_service(
         for item in normalized_case:
             day = item["date"].day
             shift = item["shift"]
+            comment = item.get("comment", "") # 사유작성
+            
             shift_map.setdefault(shift, {})[day] = {
                 "score": 10.0,
                 "request": "사용자 직접 입력 (최우선)",
+                "comment": comment, # 사유작성
                 "shift": shift
             }
+    
+    print("[DEBUG-2] case 처리 완료 후 shift_map : ", shift_map)
+    for shift_code, days in shift_map.items():
+        for day, info in days.items():
+            print(f"[DEBUG-2]   {shift_code} {day}일 → comment={info.get('comment')!r}")
 
     # 2. AIDE 결과 병합 (case 없는 날만 반영)
     for shift_id, days_dict in shift_parsed.items():
@@ -784,8 +810,10 @@ async def invoke_and_persist_wanted_service(
                 shift_map.setdefault(shift_id, {})[day_int] = {
                     "score": score,
                     "request": req_text,
+                    "comment": req_text, # AIDE 결과는 partial_request와 동일하게
                     "shift": shift_id
                 }
+    print("[DEBUG-3] AIDE 병합 완료 후 shift_map : ", shift_map)
 
     # 주휴 필터링
     weekly_off_days = _compute_weekly_off_days(

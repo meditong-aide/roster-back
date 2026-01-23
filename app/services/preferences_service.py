@@ -82,6 +82,13 @@ def submit_preferences_service(
     detailed_id = 1
     for date_str, shift_id in data_to_save.items():
         if shift_id:  # 빈 값은 저장하지 않음
+            # 사유작성
+            comment = ""
+            item = preference_data.get(date_str)
+            if isinstance(item, dict):
+                comment = item.get("comment", "")
+            elif isinstance(item, str):
+                pass
             db.add(NurseShiftRequest(
                 nurse_id=current_user.nurse_id,
                 request_id=request_id,
@@ -89,7 +96,8 @@ def submit_preferences_service(
                 shift_date=date_str,
                 shift=shift_id,
                 score=1.0,
-                partial_request=""
+                partial_request="",
+                comment=comment # 사유작성
             ))
             detailed_id += 1
     
@@ -214,6 +222,7 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         shift_data[shift_code][day] = {
             "request": s.partial_request,
             "score": float(s.score) if s.score is not None else None,
+            "comment": s.comment # 사유작성
         }
     
     # 5️⃣ pair 데이터 구조화 -> 여기만 나중에 바꿀것
@@ -311,9 +320,13 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             if shift_type not in shift_data:
                 shift_data[shift_type] = {}
             
-            shift_data[shift_type][day] = (
-                int(s.score) if s.score is not None else 1
-            )
+            # shift_data[shift_type][day] = (
+            #     int(s.score) if s.score is not None else 1
+            # )
+            shift_data[shift_type][day] = {
+                "score": float(s.score) if s.score is not None else 1.0,
+                "comment": s.comment # 사유작성
+            }
 
         # pair 요청들
         pair_rows = (
