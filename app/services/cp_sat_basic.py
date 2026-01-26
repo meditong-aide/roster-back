@@ -410,8 +410,8 @@ class CPSATBasicEngine:
             even_nights=even_nights,
             nod_noe=config_data.get('nod_noe', True),
             global_monthly_off_days=0,
-            # standard_personal_off_days=config_data.get('off_days', 8),
-            standard_personal_off_days=15,
+            standard_personal_off_days=config_data.get('off_days', 8),
+            # standard_personal_off_days=,
             # 수정
             shift_requirement_priority = max(0.05, config_data.get('shift_priority', 0.7)),
             shift_preference_weights=shift_weights,
