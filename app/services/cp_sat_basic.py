@@ -92,6 +92,135 @@ def _cp_sat_status_to_text(status: int) -> str:
     return mapping.get(status, f"UNKNOWN({status})")
 
 
+def _log_fixed_cells_off_trace(
+    *,
+    logger_prefix: str,
+    nurses: list[Nurse],
+    fixed_cells: list[dict],
+    fixed_original_shift_map: dict[tuple[int, int], str],
+    off_exception_cells: set[tuple[int, int]],
+    off_exception_vacation_cells: set[tuple[int, int]],
+    shift_id_to_type: dict[str, str],
+    watch_db_ids: set[str],
+) -> None:
+    """고정 셀에서 휴무류가 어떻게 정규화/예외 처리되는지 추적 로그를 출력한다.
+
+    이 프로젝트는 휴가/공가/주휴/주말강제OFF 등 '휴무류'를 모델 내부에서는 모두 `O`로 취급한다.
+    다만 결과 변환 시에는 고정 셀의 원본 shift_id(`휴`, `생`, `법` 등)를 복원할 수 있어,
+    화면에서 보이는 문자 `O` 개수와 "모델이 카운트한 OFF" 개수가 달라질 수 있다.
+
+    Args:
+        logger_prefix: 로그 접두사
+        nurses: 간호사 리스트(인덱스 → db_id/name 매핑 용도)
+        fixed_cells: 입력 고정 셀 리스트(정규화 이후 값이 들어있을 수 있음)
+        fixed_original_shift_map: (nurse_index, day_index) → 원본 shift_id
+        off_exception_cells: 휴무류 예외 셀(OFF 상한/특수 처리 제외용)
+        off_exception_vacation_cells: 휴가/공가 셀(별도 추적용)
+        shift_id_to_type: shift_id(대문자) → type(예: '휴가', '공가', '근무' 등)
+        watch_db_ids: 추적 대상 nurse.db_id 집합
+    """
+    try:
+        idx_to_dbid = {i: str(n.db_id) for i, n in enumerate(nurses)}
+        idx_to_name = {i: str(getattr(n, "name", "?")) for i, n in enumerate(nurses)}
+        rows: dict[str, list[dict]] = {}
+
+        for c in fixed_cells or []:
+            n_idx = c.get("nurse_index")
+            d_idx = c.get("day_index")
+            if n_idx is None or d_idx is None:
+                continue
+            db_id = idx_to_dbid.get(int(n_idx))
+            if not db_id or db_id not in watch_db_ids:
+                continue
+            original = fixed_original_shift_map.get((int(n_idx), int(d_idx)))
+            normalized = str(c.get("shift") or "").strip()
+            shift_type = str(c.get("shift_type") or "").strip()
+            if not shift_type:
+                probe = original or normalized
+                shift_type = shift_id_to_type.get(str(probe).strip().upper(), "")
+            rows.setdefault(db_id, []).append(
+                {
+                    "day": int(d_idx) + 1,
+                    "name": idx_to_name.get(int(n_idx), "?"),
+                    "original_shift": original,
+                    "normalized_shift": normalized,
+                    "shift_type": shift_type,
+                    "off_exception": (int(n_idx), int(d_idx)) in off_exception_cells,
+                    "vac_exception": (int(n_idx), int(d_idx)) in off_exception_vacation_cells,
+                }
+            )
+
+        for db_id, items in rows.items():
+            items_sorted = sorted(items, key=lambda x: x["day"])
+            print(f"{logger_prefix} [WatchFixedCells] nurse_id={db_id} rows={items_sorted}")
+    except Exception as exc:
+        print(f"{logger_prefix} [WatchFixedCells] 로그 실패: {exc}")
+
+
+def _log_off_count_trace(
+    *,
+    logger_prefix: str,
+    nurse: Nurse,
+    schedule: list[str],
+    shift_id_to_main: dict[str, str],
+    shift_id_to_type: dict[str, str],
+    weekly_off_days_0based: list[int] | None = None,
+) -> None:
+    """최종 결과에서 '보이는 O'와 '모델 기준 OFF' 차이를 추적 출력한다.
+
+    - 보이는 O: 결과 배열에서 값이 'O'/'OFF'인 셀 개수
+    - 모델 기준 OFF: 해당 shift_id를 정규화했을 때 메인 코드가 'O'로 판정되는 셀 개수
+      (예: '휴'가 휴가로 정의되어 있으면 정규화 결과는 'O'가 되어 OFF로 카운트됨)
+
+    Args:
+        logger_prefix: 로그 접두사
+        nurse: 대상 간호사
+        schedule: DB 저장용 shift_id 리스트(최종 결과)
+        shift_id_to_main: shift_id → 메인 코드 매핑(build_shift_normalizer 결과)
+        shift_id_to_type: shift_id → type 매핑(예: '휴가', '공가')
+        weekly_off_days_0based: 주휴(0-based day index) 리스트
+    """
+    weekly_set = set(int(x) for x in (weekly_off_days_0based or []))
+    literal_o_cnt = 0
+    off_like_cnt = 0
+    vacation_cnt = 0
+    off_like_but_not_o: list[dict] = []
+
+    for day1, shift_id in enumerate(schedule, start=1):
+        sid = str(shift_id or "").strip()
+        sid_upper = sid.upper()
+        is_literal_o = sid_upper in {"O", "OFF"}
+        main = _normalize_shift_code(sid, shift_id_to_main)
+        is_off_like = main == "O"
+        stype = shift_id_to_type.get(sid_upper, "")
+        is_vac = stype in {"휴가", "공가"}
+
+        if is_literal_o:
+            literal_o_cnt += 1
+        if is_off_like:
+            off_like_cnt += 1
+        if is_vac:
+            vacation_cnt += 1
+        if is_off_like and not is_literal_o:
+            off_like_but_not_o.append(
+                {
+                    "day": day1,
+                    "shift": sid,
+                    "type": stype,
+                    "weekly_off": (day1 - 1) in weekly_set,
+                }
+            )
+
+    print(
+        f"{logger_prefix} [WatchOffCount] nurse_id={getattr(nurse, 'db_id', '?')}, "
+        f"name={getattr(nurse, 'name', '?')}, "
+        f"visible_O={literal_o_cnt}, off_like_total={off_like_cnt}, vacation={vacation_cnt}, "
+        f"weekly_off={len(weekly_set)}"
+    )
+    if off_like_but_not_o:
+        print(f"{logger_prefix} [WatchOffCount][OffLikeButNotO] {off_like_but_not_o}")
+
+
 def _log_weekend_off_enforcement_once(
     rs: RosterSystem,
     join: list[int],
@@ -580,6 +709,17 @@ class CPSATBasicEngine:
             if sid and stype:
                 shift_id_to_type[sid] = stype
         fixed_original_shift_map: dict[tuple[int, int], str] = {}
+        watch_db_ids: set[str] = {"442934"}  # 김지우 기본 추적(필요 시 config_data로 확장)
+        try:
+            extra_watch = (
+                config_data.get("debug_watch_nurse_ids", [])
+                if isinstance(config_data, dict)
+                else []
+            )
+            if isinstance(extra_watch, list):
+                watch_db_ids |= {str(x) for x in extra_watch if str(x).strip()}
+        except Exception:
+            pass
         # 2. 대상 월 설정
         target_month = date(year, month, 1)
         # 3. 간호사 객체 생성
@@ -656,6 +796,23 @@ class CPSATBasicEngine:
                         print('[line 655] error!!!!!!!', e)
                         pass
                 c['shift'] = normalized_shift
+            # 디버그: 고정 셀(휴가/공가/주휴/기타 휴무류) 정규화/예외 처리 확인
+            try:
+                off_ex = set(getattr(config, "off_exception_cells", []) or [])
+                off_ex_vac = set(getattr(config, "off_exception_vacation_cells", []) or [])
+                if watch_db_ids:
+                    _log_fixed_cells_off_trace(
+                        logger_prefix=self.logger_prefix,
+                        nurses=nurses,
+                        fixed_cells=fixed_cells,
+                        fixed_original_shift_map=fixed_original_shift_map,
+                        off_exception_cells=off_ex,
+                        off_exception_vacation_cells=off_ex_vac,
+                        shift_id_to_type=shift_id_to_type,
+                        watch_db_ids=watch_db_ids,
+                    )
+            except Exception:
+                pass
             # # 디버그: 특정 간호사 고정 셀/휴가 인식 확인
             # try:
             #     watch_ids = {"442918", "442924"}  # 박지은, 임윤아
@@ -952,6 +1109,30 @@ class CPSATBasicEngine:
             nurses_data=nurses_data,
             shift_definitions=shift_defs,
         )
+
+        # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
+        try:
+            weekly_off_by_idx = (
+                getattr(roster_system, "weekly_off_by_idx", {})
+                if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
+                else {}
+            )
+            for nu in nurses:
+                if str(getattr(nu, "db_id", "")) not in watch_db_ids:
+                    continue
+                sched = result.get(str(nu.db_id), [])
+                n_idx = getattr(nu, "id", None)
+                weekly = weekly_off_by_idx.get(int(n_idx), []) if n_idx is not None else []
+                _log_off_count_trace(
+                    logger_prefix=self.logger_prefix,
+                    nurse=nu,
+                    schedule=sched,
+                    shift_id_to_main=shift_id_to_main,
+                    shift_id_to_type=shift_id_to_type,
+                    weekly_off_days_0based=weekly,
+                )
+        except Exception as exc:
+            print(f"{self.logger_prefix} [WatchOffCount] 로그 실패: {exc}")
 
         # 13. 최종 근무표 로그 출력
         self._log_final_roster(nurses, result)
