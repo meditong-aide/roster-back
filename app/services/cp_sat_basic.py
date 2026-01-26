@@ -1439,7 +1439,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(X(n, d, w_idx) == 0)
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
     if off_idx_full is not None:
-        off_or_weekly = set(off_exception_cells)
+        # off_or_weekly = set(off_exception_cells)
+        off_or_weekly = set(
+        (n, d)
+        for (n, d) in off_exception_cells
+        if (n, d) not in forced_off_cap_excluded
+        )   
         off_or_weekly.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
         # weekly_off_by_idx 를 off_or_weekly에 포함
         try:
