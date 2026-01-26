@@ -770,6 +770,8 @@ class CPSATBasicEngine:
                         off_ex_vac.add((n_idx, d_idx))
                 setattr(config, "off_exception_cells", sorted(list(off_ex)))
                 setattr(config, "off_exception_vacation_cells", sorted(list(off_ex_vac)))
+                # print('off_ex!!!!!!', off_ex)
+                # print('off_ex_vac!!!!!!', off_ex_vac)
             except Exception as e:
                 print('[line 634] error!!!!!!!', e)
                 pass
@@ -1001,7 +1003,12 @@ class CPSATBasicEngine:
             success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
-                self._optimize_fallback_lex_hard_first(roster_system, time_limit_seconds=time_limit_seconds, grouped=grouped)
+                self._optimize_fallback_lex_hard_first(
+                    roster_system,
+                    time_limit_seconds=time_limit_seconds,
+                    grouped=grouped,
+                    shift_type_map=shift_id_to_type,
+                )
         # 9-1. 불필요 OFF 정리 (N-only 제외)
         try:
             with Timer("불필요 OFF 정리"):
@@ -1241,12 +1248,19 @@ class CPSATBasicEngine:
     # ────────────────────────────────────────────────────────────────────
     #                    ※ 아래는 helper 들 – 모두 완전판               │
     # ────────────────────────────────────────────────────────────────────
-    def _optimize_fallback_lex_hard_first(self, roster_system: RosterSystem, time_limit_seconds: int, grouped=None) -> bool:
+    def _optimize_fallback_lex_hard_first(
+        self,
+        roster_system: RosterSystem,
+        time_limit_seconds: int,
+        grouped=None,
+        shift_type_map: dict[str, str] | None = None,
+    ) -> bool:
         """(호환) 폴백(서열) 최적화는 별도 모듈로 분리되었다."""
         return optimize_fallback_lex_hard_first(
             roster_system=roster_system,
             time_limit_seconds=time_limit_seconds,
             grouped=grouped,
+            shift_type_map=shift_type_map,
             logger_prefix=self.logger_prefix,
             timer_cls=Timer,
             add_preceptor_terms_fn=_add_preceptor_objective_terms,
