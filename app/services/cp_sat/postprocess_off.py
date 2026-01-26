@@ -319,20 +319,29 @@ def postprocess_trim_extra_offs(
             return max(0, base_cap - weekend_cnt)
         return base_cap
 
-    def current_off_count(n_idx: int, _nurse: Nurse) -> int:
-        """후처리 기준으로 OFF 개수를 계산한다 (휴가 포함)."""
-        off_count = 0
-        if bool(getattr(_nurse, "is_weekend_off", False)):
-            off_count = sum(
-                1
-                for d in range(num_days)
-                if roster_system.roster[n_idx, d, off_idx] == 1 and d not in weekend_days
-            )
-        else:
-            off_count = int(np.sum(roster_system.roster[n_idx, :, off_idx]))
-        # 휴가 일수도 포함
-        vacation_cnt = count_vacation_days(n_idx)
-        return off_count + vacation_cnt
+    # def current_off_count(n_idx: int, _nurse: Nurse) -> int:
+    #     """후처리 기준으로 OFF 개수를 계산한다."""
+    #     if bool(getattr(_nurse, "is_weekend_off", False)):
+    #         return sum(
+    #             1
+    #             for d in range(num_days)
+    #             if roster_system.roster[n_idx, d, off_idx] == 1 and d not in weekend_days
+    #         )
+    #     return int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+
+    def current_off_count(n_idx: int, nurse: Nurse) -> int:
+        cnt = 0
+        for d in range(num_days):
+            # 순수 O
+            if roster_system.roster[n_idx, d, off_idx] == 1:
+                # 휴가/공가/생리는 OFF 아님
+                if (n_idx, d) in off_exception_cells:
+                    continue
+                cnt += 1
+            # 주휴는 OFF로 포함
+            elif (n_idx, d) in weekly_off_cells:
+                cnt += 1
+        return cnt
     
     def current_o_count(n_idx: int, _nurse: Nurse) -> int:
         """후처리 기준으로 주휴일(O) 개수만 계산한다 (휴가 제외)."""
@@ -343,6 +352,7 @@ def postprocess_trim_extra_offs(
                 if roster_system.roster[n_idx, d, off_idx] == 1 and d not in weekend_days
             )
         return int(np.sum(roster_system.roster[n_idx, :, off_idx]))
+
 
     def build_recovery_off_cells() -> set[tuple[int, int]]:
         cells: set[tuple[int, int]] = set()
@@ -648,6 +658,14 @@ def postprocess_trim_extra_offs(
                 roster_system.roster[n_idx, d_idx, off_idx] = 1
                 continue
 
+            print(
+                f"{logger_prefix} [TrimExtraOff] move n={n_idx}, "
+                f"name={getattr(nurse, 'name', '?')}, "
+                f"day={d_idx + 1}, O->"
+                f"{cfg.shift_types[target_shift_idx]}, "
+                f"reason={move_reason}, off={current_off}->{new_off}, "
+                f"viol={base_viol}->{new_viol}"
+            )
             changes += 1
             base_viol = new_viol
             current_off = new_off
