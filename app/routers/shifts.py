@@ -253,9 +253,20 @@ async def get_shift_manage(
         for sm in shift_manages
     ]
     # default_shift에 '주'가 포함된 shift를 shifts 테이블에서 찾아서 shift_manages에 추가
-    shifts = db.query(Shift).filter(Shift.office_id == current_user.office_id, Shift.default_shift.like('O'), Shift.group_id == target_group_id).all()
-    shift_codes = [shift.default_shift for shift in shifts]
-    response.append({'shift_slot': 4, 'main_code': 'O', 'codes': shift_codes, 'manpower': ''})
+    # shifts = db.query(Shift).filter(Shift.office_id == current_user.office_id, Shift.default_shift.like('O'), Shift.group_id == target_group_id).all()
+    # shift_codes = [shift.default_shift for shift in shifts]
+    # response.append({'shift_slot': 4, 'main_code': 'O', 'codes': shift_codes, 'manpower': ''})
+    # 기존 shift_manage에 shift_slot = 4 인 내역이 프론트에 중복 append 되어 전송되는 내역 수정
+    has_weekly_off_slot = any(sm.shift_slot == 4 for sm in shift_manages)
+    if not has_weekly_off_slot:
+        shifts = db.query(Shift).filter(
+            Shift.office_id == current_user.office_id,
+            Shift.default_shift.like('O'),
+            Shift.group_id == target_group_id
+        ).all()
+        shift_codes = [shift.default_shift for shift in shifts]
+        response.append({'shift_slot': 4, 'main_code': 'O', 'codes': shift_codes, 'manpower': 0})
+        
     return response
 
 
