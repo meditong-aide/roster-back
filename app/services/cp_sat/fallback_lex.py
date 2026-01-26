@@ -841,7 +841,13 @@ def optimize_fallback_lex_hard_first(
             "pattern_nod": [],  # N-O-D 패턴(Int)
             "pattern_noe": [],  # N-O-E 패턴(Int)
             "min_off_missing": [],  # 월 최소 OFF 부족(Int)
+            "off_quota_short": [],  # 개인별 O 할당(주휴 제외) 부족 슬랙(Int)
+            "off_quota_excess": [],  # 개인별 O 초과 슬랙(Int)
         }
+        off_quota_short_by_n: dict[int, cp_model.IntVar] = {}
+        off_quota_excess_by_n: dict[int, cp_model.IntVar] = {}
+        min_off_miss_by_n: dict[int, cp_model.IntVar] = {}
+        target_o_by_n: dict[int, int] = {}
 
         # 전이 위반: 정확한 reification (iff)
         for n in range(N):
@@ -1000,6 +1006,49 @@ def optimize_fallback_lex_hard_first(
 
         # 월 최소 OFF 부족량(가능일수 클램프)
         try:
+            # 개인별 O 정량 할당(나이트 전담 제외, 주휴 제외한 순수 O 목표)
+            try:
+                std_personal_off = int(getattr(cfg, "standard_personal_off_days", 0))
+                print('std_personal_off!!!!!!', std_personal_off)
+            except Exception:
+                std_personal_off = 0
+            if off_idx is not None and std_personal_off > 0:
+                for n in range(N):
+                    nu = roster_system.nurses[n]
+                    raw = getattr(nu, "is_night_nurse", None)
+                    is_n_only = False
+                    if isinstance(raw, list):
+                        allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                        is_n_only = (allowed == {"N"})
+                    elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
+                        is_n_only = True
+                    if is_n_only:
+                        continue
+                    weekly_target = (
+                        len(weekly_off_by_idx.get(n, []))
+                        if isinstance(weekly_off_by_idx, dict)
+                        else 0
+                    )
+                    target_o = max(0, std_personal_off - weekly_target)
+                    if target_o <= 0:
+                        continue
+                    assigned_o = sum(
+                        X(n, d, off_idx) for d in range(join[n], leave[n] + 1)
+                    )
+                    slack_short = m.NewIntVar(0, D, f"off_quota_short_{n}")
+                    slack_excess = m.NewIntVar(0, D, f"off_quota_excess_{n}")
+                    m.Add(target_o - assigned_o <= slack_short)
+                    m.Add(assigned_o - target_o <= slack_excess)
+                    safety["off_quota_short"].append(slack_short)
+                    safety["off_quota_excess"].append(slack_excess)
+                    off_quota_short_by_n[n] = slack_short
+                    off_quota_excess_by_n[n] = slack_excess
+                    target_o_by_n[n] = target_o
+                    print(
+                        f"{logger_prefix} [OffCap][force] n={n}, "
+                        f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                        f"target_O={target_o}, weekly_off_target={weekly_target}"
+                    )
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 nu = roster_system.nurses[n]
@@ -1033,6 +1082,7 @@ def optimize_fallback_lex_hard_first(
                     miss = m.NewIntVar(0, D, f"min_off_miss_{n}")
                     m.Add(miss >= min_off_required - offs)
                     safety["min_off_missing"].append(miss)
+                    min_off_miss_by_n[n] = miss
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 if extra_allowed >= 0:
                     pure_offs = sum(
@@ -1317,12 +1367,28 @@ def optimize_fallback_lex_hard_first(
                     assigned_off = sum(
                         int(s3.Value(X3(n, d, off_idx))) for d in range(join[n], leave[n] + 1)
                     )
-                    vac_cnt = sum(1 for d in range(join[n], leave[n] + 1) if (n, d) in vacation_off_cells)
+                    vac_cnt = sum(
+                        1
+                        for d in range(join[n], leave[n] + 1)
+                        if (n, d) in off_exception_vacation_cells
+                    )
                     weekly_target = len(weekly_off_by_idx.get(n, []) if isinstance(weekly_off_by_idx, dict) else [])
+                    target_o = target_o_by_n.get(n)
+                    slack_short_val = (
+                        s3.Value(off_quota_short_by_n[n]) if n in off_quota_short_by_n else None
+                    )
+                    slack_excess_val = (
+                        s3.Value(off_quota_excess_by_n[n]) if n in off_quota_excess_by_n else None
+                    )
+                    min_off_miss_val = (
+                        s3.Value(min_off_miss_by_n[n]) if n in min_off_miss_by_n else None
+                    )
                     print(
                         f"{logger_prefix} [OffCount][final] n={n}, "
                         f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
-                        f"assigned_O={assigned_off}, vacation={vac_cnt}, weekly_off_target={weekly_target}"
+                        f"assigned_O={assigned_off}, vacation={vac_cnt}, weekly_off_target={weekly_target}, "
+                        f"target_O={target_o}, slack_short={slack_short_val}, slack_excess={slack_excess_val}, "
+                        f"min_off_miss={min_off_miss_val}"
                     )
         except Exception as exc:
             print(f"{logger_prefix} [Stage3 상세로그 실패]: {exc}")
