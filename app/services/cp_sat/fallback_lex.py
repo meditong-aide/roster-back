@@ -628,7 +628,6 @@ def optimize_fallback_lex_hard_first(
                         + X(n, d + 3, off_idx)
                         <= 3
                     )
-
         # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
         # 평일(월~금)에는 OFF를 금지한다.
         #
@@ -843,11 +842,37 @@ def optimize_fallback_lex_hard_first(
             "min_off_missing": [],  # 월 최소 OFF 부족(Int)
             "off_quota_short": [],  # 개인별 O 할당(주휴 제외) 부족 슬랙(Int)
             "off_quota_excess": [],  # 개인별 O 초과 슬랙(Int)
+            "isolated_off_slack": [],  # 고립 OFF 허용 슬랙(가중치 포함)
         }
         off_quota_short_by_n: dict[int, cp_model.IntVar] = {}
         off_quota_excess_by_n: dict[int, cp_model.IntVar] = {}
         min_off_miss_by_n: dict[int, cp_model.IntVar] = {}
         target_o_by_n: dict[int, int] = {}
+
+        # 고립 OFF 금지(슬랙 허용): 붙어있지 않은 O는 slack을 태워 큰 비용으로 최소화
+        # if off_idx is not None and bool(getattr(cfg, "enforce_clustered_offs", False)):
+    
+        slack_penalty = int(getattr(cfg, "isolated_off_slack_penalty", 300000) or 0)
+        for n in range(N):
+            print('고립!!!!!')
+            t0, t1 = join[n], leave[n]
+            for d in range(t0, t1 + 1):
+                neighbours = []
+                if d - 1 >= t0:
+                    neighbours.append(X(n, d - 1, off_idx))
+                if d + 1 <= t1:
+                    neighbours.append(X(n, d + 1, off_idx))
+                slack = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
+                if neighbours:
+                    m.Add(X(n, d, off_idx) <= sum(neighbours) + slack)
+                else:
+                    m.Add(X(n, d, off_idx) <= slack)
+                if slack_penalty > 0:
+                    scaled = m.NewIntVar(0, slack_penalty, f"iso_off_cost_{n}_{d}")
+                    m.Add(scaled == slack * slack_penalty)
+                    safety["isolated_off_slack"].append(scaled)
+                else:
+                    safety["isolated_off_slack"].append(slack)
 
         # 전이 위반: 정확한 reification (iff)
         for n in range(N):

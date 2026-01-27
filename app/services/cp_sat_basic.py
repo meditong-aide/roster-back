@@ -330,6 +330,8 @@ class CPSATBasicEngine:
         two_offs_per_week = config_data.get('two_offs_per_week', True)
         sequential_offs = config_data.get('sequential_offs', True)
         even_nights = config_data.get('even_nights', True)
+        enforce_clustered_offs = bool(config_data.get("enforce_clustered_offs", False))
+        isolated_off_slack_penalty = int(config_data.get("isolated_off_slack_penalty", 300000) or 0)
         off_placement_mode = int(config_data.get('off_placement_mode', 0) or 0)
         
         # 가중치 설정 - Night Keep은 E와 차별화
@@ -409,6 +411,8 @@ class CPSATBasicEngine:
             sequential_offs=sequential_offs,
             even_nights=even_nights,
             nod_noe=config_data.get('nod_noe', True),
+            enforce_clustered_offs=enforce_clustered_offs,
+            isolated_off_slack_penalty=isolated_off_slack_penalty,
             global_monthly_off_days=0,
             standard_personal_off_days=config_data.get('off_days', 8),
             # standard_personal_off_days=,
@@ -1618,6 +1622,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 Xv[n,d,s]=m.NewBoolVar(f'x_{n}_{d}_{s}')
     def X(n,d,s):  return Xv.get((n,d,s),0)
     active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
+    isolated_off_slacks: list = []
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
         if (n, d) not in active_days:
@@ -1673,6 +1678,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     + sum(1 for k in range(4) if (n, d + k) in off_or_weekly)
                     <= 3
                 )
+
+    # ───────────── 2-A2. 고립 OFF 금지(슬랙 허용) ─────────────
+    enforce_clustered_offs = bool(getattr(rs.config, "enforce_clustered_offs", False))
+    if enforce_clustered_offs and off_idx_full is not None:
+        slack_penalty = int(getattr(rs.config, "isolated_off_slack_penalty", 300000) or 0)
+        for n in range(N):
+            t0, t1 = join[n], leave[n]
+            for d in range(t0, t1 + 1):
+                neighbours = []
+                if d - 1 >= t0:
+                    neighbours.append(X(n, d - 1, off_idx_full))
+                if d + 1 <= t1:
+                    neighbours.append(X(n, d + 1, off_idx_full))
+                slack_var = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
+                isolated_off_slacks.append((slack_var, slack_penalty))
+                if neighbours:
+                    m.Add(X(n, d, off_idx_full) <= sum(neighbours) + slack_var)
+                else:
+                    m.Add(X(n, d, off_idx_full) <= slack_var)
     
     # ───────────── 2-A3. 주휴 근처 OFF 배치 제약 (off_placement_mode) ─────────────
     off_placement_mode = int(getattr(rs.config, "off_placement_mode", 0) or 0)
@@ -2101,6 +2125,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         include_pair_objective=include_pair_objective,
         preceptor_terms_fn=_add_preceptor_objective_terms,
     )
+    # 고립 OFF 슬랙 패널티(강제 불가 시에만 허용)
+    for slack_var, w in isolated_off_slacks:
+        if w > 0:
+            obj.append(-w * slack_var)
     m.Maximize(sum(obj))
 
     return m,X,join,leave,fixed
