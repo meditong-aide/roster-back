@@ -849,29 +849,32 @@ def optimize_fallback_lex_hard_first(
         min_off_miss_by_n: dict[int, cp_model.IntVar] = {}
         target_o_by_n: dict[int, int] = {}
 
-        # 고립 OFF 금지(슬랙 허용): 붙어있지 않은 O는 slack을 태워 큰 비용으로 최소화
-        # if off_idx is not None and bool(getattr(cfg, "enforce_clustered_offs", False)):
-    
-        slack_penalty = int(getattr(cfg, "isolated_off_slack_penalty", 300000) or 0)
-        for n in range(N):
-            t0, t1 = join[n], leave[n]
-            for d in range(t0, t1 + 1):
-                neighbours = []
-                if d - 1 >= t0:
-                    neighbours.append(X(n, d - 1, off_idx))
-                if d + 1 <= t1:
-                    neighbours.append(X(n, d + 1, off_idx))
-                slack = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
-                if neighbours:
-                    m.Add(X(n, d, off_idx) <= sum(neighbours) + slack)
-                else:
-                    m.Add(X(n, d, off_idx) <= slack)
-                if slack_penalty > 0:
-                    scaled = m.NewIntVar(0, slack_penalty, f"iso_off_cost_{n}_{d}")
-                    m.Add(scaled == slack * slack_penalty)
-                    safety["isolated_off_slack"].append(scaled)
-                else:
-                    safety["isolated_off_slack"].append(slack)
+        # 고립 OFF 금지(슬랙 허용): sequential_offs 활성 + 옵션 켜졌을 때만 적용
+        if (
+            # off_idx is not None
+            bool(getattr(cfg, "sequential_offs", True))
+            # and bool(getattr(cfg, "enforce_clustered_offs", False))
+        ):
+            slack_penalty = int(getattr(cfg, "isolated_off_slack_penalty", 300000) or 0)
+            for n in range(N):
+                t0, t1 = join[n], leave[n]
+                for d in range(t0, t1 + 1):
+                    neighbours = []
+                    if d - 1 >= t0:
+                        neighbours.append(X(n, d - 1, off_idx))
+                    if d + 1 <= t1:
+                        neighbours.append(X(n, d + 1, off_idx))
+                    slack = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
+                    if neighbours:
+                        m.Add(X(n, d, off_idx) <= sum(neighbours) + slack)
+                    else:
+                        m.Add(X(n, d, off_idx) <= slack)
+                    if slack_penalty > 0:
+                        scaled = m.NewIntVar(0, slack_penalty, f"iso_off_cost_{n}_{d}")
+                        m.Add(scaled == slack * slack_penalty)
+                        safety["isolated_off_slack"].append(scaled)
+                    else:
+                        safety["isolated_off_slack"].append(slack)
 
         # 전이 위반: 정확한 reification (iff)
         for n in range(N):
