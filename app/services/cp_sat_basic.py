@@ -1121,7 +1121,6 @@ class CPSATBasicEngine:
             nurses_data=nurses_data,
             shift_definitions=shift_defs,
         )
-
         # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
         try:
             weekly_off_by_idx = (
@@ -1553,7 +1552,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         s_main = code2main.get(c['shift'], c['shift'])
         s_idx  = rs.config.shift_types.index(s_main)
         fixed[(n,d)] = s_idx; fixed_cnt[d][s_idx]+=1
-        fixed_type_by_cell[(n, d)] = code2type.get(c['shift'])
+        # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
+        fixed_type_by_cell[(n, d)] = code2type.get(c["shift"]) or code2type.get(s_main)
+        # print('이미 있음 cpsat- fixed_type_by_cell', fixed_type_by_cell)
     forced_off_cells: set[tuple[int, int]] = set()
     forced_off_cap_excluded: set[tuple[int, int]] = set()
     if off_idx_full is not None:
@@ -1647,6 +1648,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if (n, d) not in forced_off_cap_excluded
         )   
         off_or_weekly.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
+        vac_cells = set(getattr(rs.config, "off_exception_vacation_cells", []) or [])
         # weekly_off_by_idx 를 off_or_weekly에 포함
         try:
             for n, day_list in (weekly_off_by_idx or {}).items():
@@ -1659,13 +1661,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 if d + 3 > leave[n]:
                     continue
                 window = {(n, d), (n, d + 1), (n, d + 2), (n, d + 3)}
-                # 예외 포함 윈도우는 스킵
-                if window & off_exception_cells:
-                    continue
+                vacation_types = {"휴가", "공가", "휴무"}
                 fixed_o_cnt = sum(
                     1
                     for (fn, fd), fs_idx in fixed.items()
-                    if fn == n and fd in {d, d + 1, d + 2, d + 3} and fs_idx == off_idx_full
+                    if fn == n
+                    and fd in {d, d + 1, d + 2, d + 3}
+                    and fs_idx == off_idx_full
+                    and (fn, fd) not in vac_cells
                 )
                 if fixed_o_cnt >= 4:
                     print(

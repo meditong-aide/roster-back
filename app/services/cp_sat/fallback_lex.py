@@ -159,6 +159,7 @@ def optimize_fallback_lex_hard_first(
     off_exception_vacation_cells = set(
         getattr(roster_system.config, "off_exception_vacation_cells", []) or []              # (n, d) 튜플 집합 e.g. {(0, 1), (1, 2)}
     )
+    vac_cells = set(off_exception_vacation_cells)
     # print('이미 있음 W', w_idx)
     # print('이미 있음 off_exception_cells', off_exception_cells)
     # print('이미 있음 off_exception_vacation_cells', off_exception_vacation_cells)
@@ -190,12 +191,7 @@ def optimize_fallback_lex_hard_first(
     if shift_type_map:
         code2type.update(shift_type_map)
     code2type.update({c: r.get("type") for r in (grouped or []) for c in r["codes"]})
-    # print('이미 있음 code2main', code2main)
-    # if code2type:
-    print('이미 있음 code2type', code2type)
     fixed, fixed_cnt = {}, [[0] * S for _ in range(D)]
-    # print('이미 있음 fixed', fixed)
-    # print('이미 있음 fixed_cnt', fixed_cnt)
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
     # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
     for c in getattr(roster_system, "fixed_cells", []) or []:
@@ -206,7 +202,11 @@ def optimize_fallback_lex_hard_first(
         # print('이미 있음 c', c, s_idx)
         fixed[(n, d)] = s_idx
         fixed_cnt[d][s_idx] += 1
-        fixed_type_by_cell[(n, d)] = code2type.get(c["shift"])
+        # print('fallback fixed', fixed)
+        # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
+        fixed_type_by_cell[(n, d)] = code2type.get(c["shift"]) or code2type.get(s_main)
+
+        # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
         # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
 
     # 초기 금지(경계) 맵
@@ -453,6 +453,12 @@ def optimize_fallback_lex_hard_first(
         def X(n, d, s):
             return Xv.get((n, d, s), 0)
 
+        def is_pure_o(n: int, d: int):
+            """휴가/공가(예외 휴무) 좌표는 제외한 순수 O만 반환합니다."""
+            if (n, d) in vac_cells:
+                return 0
+            return X(n, d, off_idx)
+
         # ── 하드 모순 사전 점검: 커버리지 cap / 강제 OFF 상한 ──
         try:
             # (1) 교대별 최대 가능 인원(cap) 대비 need 초과 여부
@@ -600,14 +606,12 @@ def optimize_fallback_lex_hard_first(
                     if (n, d) in fixed and fixed[(n, d)] == w_idx:
                         continue
                     m.Add(X(n, d, w_idx) == 0)
-        # 순수 O 4연속 금지 (예외 셀 포함 시 스킵, fixed로 이미 4O면 경고만 남기고 스킵)
+        # 순수 O 4연속 금지 (fixed로 이미 4O면 경고만 남기고 스킵)
         if off_idx is not None:
+            vac_cells = set(off_exception_vacation_cells)
             for n in range(N):
                 for d in range(join[n], leave[n] - 2):
                     if d + 3 > leave[n]:
-                        continue
-                    window = {(n, d), (n, d + 1), (n, d + 2), (n, d + 3)}
-                    if off_exception_cells and window & off_exception_cells:
                         continue
                     fixed_o_cnt = sum(
                         1
@@ -615,17 +619,20 @@ def optimize_fallback_lex_hard_first(
                         if fn == n
                         and fd in {d, d + 1, d + 2, d + 3}
                         and fs_idx == off_idx
+                        and (fn, fd) not in vac_cells
                     )
+                    # print('fixed.items()', fixed.items())
+                    # print('이미 있음 fixed_o_cnt', fixed_o_cnt)
                     if fixed_o_cnt >= 4:
                         print(
                             f"{logger_prefix} [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
                         )
                         continue
                     m.Add(
-                        X(n, d, off_idx)
-                        + X(n, d + 1, off_idx)
-                        + X(n, d + 2, off_idx)
-                        + X(n, d + 3, off_idx)
+                        is_pure_o(n, d)
+                        + is_pure_o(n, d + 1)
+                        + is_pure_o(n, d + 2)
+                        + is_pure_o(n, d + 3)
                         <= 3
                     )
         # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
