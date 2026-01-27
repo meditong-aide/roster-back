@@ -1894,7 +1894,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 is_weekend_only = bool(getattr(nu, "is_weekend_off", False))
                 base_min_off = int(
                     getattr(cfg, "global_monthly_off_days", 0)
-                    + getattr(cfg, "standard_personal_off_days", 0)
+                    + getattr(cfg, "standard_personal_off_days", 8)
                 )
 
                 min_off_required = min(base_min_off, T1 - T0 + 1)

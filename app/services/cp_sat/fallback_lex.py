@@ -931,7 +931,7 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, night_idx) <= sum(neighbors))
 
-        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 부족량 정량화
+        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약
         K = cfg.max_consecutive_work_days
         for n in range(N):
             T0, T1 = join[n], leave[n]
@@ -939,9 +939,8 @@ def optimize_fallback_lex_hard_first(
                 pass
             for d0 in range(T0, T1 - K + 1):
                 sum_off = sum(X(n, d0 + t, off_idx) for t in range(K + 1))
-                miss = m.NewIntVar(0, K + 1, f"cwork_miss_{n}_{d0}")
-                m.Add(miss >= 1 - sum_off)
-                safety["cwork_missing"].append(miss)
+                # 최소 1일 OFF를 강제하여 슬랙 없이 안전 제약으로 처리
+                m.Add(sum_off >= 1)
 
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
