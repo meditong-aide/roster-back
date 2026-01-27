@@ -261,8 +261,45 @@ class Wanted(Base):
     exp_date = Column(DATETIME, nullable=True)  # 마감일
     status = Column(VARCHAR(10), default='requested')  # requested, closed
     created_at = Column(DATETIME, default=func.now())
-    
+
     group = relationship("Group")
+
+class WantedConfig(Base):
+    __tablename__ = 'wanted_config'
+
+    config_id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    config_type = Column(VARCHAR(20), nullable=False)  # 'GLOBAL', 'NURSE_LIMIT', 'DAILY_LIMIT'
+
+    # 간호사별 제한 (NURSE_LIMIT)
+    nurse_id = Column(VARCHAR(50), ForeignKey('nurses.nurse_id'), nullable=True)
+    year = Column(SMALLINT, nullable=True)
+    month = Column(TINYINT, nullable=True)
+    max_requests = Column(INTEGER, nullable=True)
+
+    # 일자별 제한 (DAILY_LIMIT)
+    target_date = Column(DATE, nullable=True)
+    shift_type = Column(CHAR(1), nullable=True)
+
+    # 전역 설정 (GLOBAL)
+    is_enabled = Column(BOOLEAN, nullable=True, default=True)
+    default_deadline_days = Column(INTEGER, nullable=True)
+    allow_edit_after_submit = Column(BOOLEAN, nullable=True, default=True)
+    auto_close_on_deadline = Column(BOOLEAN, nullable=True, default=True)
+    send_reminder = Column(BOOLEAN, nullable=True, default=True)
+    reminder_days_before = Column(INTEGER, nullable=True, default=3)
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    group = relationship("Group")
+    nurse = relationship("Nurse")
+
+    __table_args__ = (
+        Index('idx_wanted_config_global', 'group_id', 'config_type', unique=True),
+        Index('idx_wanted_config_nurse', 'group_id', 'nurse_id', 'year', 'month', unique=True),
+        Index('idx_wanted_config_daily', 'group_id', 'target_date', 'shift_type', unique=True),
+    )
 
 class IssuedRoster(Base):
     __tablename__ = 'issued_roster'

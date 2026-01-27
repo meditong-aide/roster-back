@@ -23,6 +23,7 @@ from db.models import (
     Wanted,
     WantedRequest,
     WeeklyOffSetting,
+    WantedConfig,
 )
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import WantedDeadlineRequest, WantedInvokeRequest
@@ -659,11 +660,38 @@ async def invoke_and_persist_wanted_service(
     """
     nurse_id = current_user.nurse_id
     month_str = _yyyymm(req.year, req.month)
+    group_id = current_user.group_id
     print(f"invoke_and_persist_wanted_service 시작: nurse={nurse_id}, {month_str}")
+
+    # ========== WantedConfig 검증 시작 ==========
+
+    # 1. GLOBAL 설정 확인
+    global_config = get_wanted_config(db, group_id, 'GLOBAL')
+
+    # 1-1. is_enabled 확인 (원티드 기능 활성화 여부)
+    if global_config and global_config.is_enabled == False:
+        print(f"[검증 실패] 원티드 기능이 비활성화됨: group_id={group_id}")
+        raise Exception("원티드 기능이 현재 비활성화되어 있습니다.")
+
+    # 2. 재제출 여부 확인
+    existing_request = db.query(WantedRequest).filter(
+        WantedRequest.nurse_id == nurse_id,
+        WantedRequest.month == month_str
+    ).first()
+
+    is_resubmit = existing_request is not None
+
+    # 2-1. allow_edit_after_submit 확인 (재제출 허용 여부)
+    if is_resubmit and global_config and global_config.allow_edit_after_submit == False:
+        print(f"[검증 실패] 제출 후 수정 불가: nurse_id={nurse_id}, month={month_str}")
+        raise Exception("제출 후 수정이 불가능합니다.")
+
+    print(f"[검증 통과] GLOBAL 설정 확인 완료: is_enabled={global_config.is_enabled if global_config else 'None'}, "
+          f"is_resubmit={is_resubmit}, allow_edit={global_config.allow_edit_after_submit if global_config else 'None'}")
 
     # 허용 근무코드 조회 (show_in_preference=True)
     allowed_shifts_query = db.query(Shift).filter(
-        Shift.group_id == current_user.group_id,
+        Shift.group_id == group_id,
         Shift.show_in_preference == True
     ).all()
     allowed_shift_map = {row.shift_id: row.name for row in allowed_shifts_query}
@@ -676,6 +704,98 @@ async def invoke_and_persist_wanted_service(
         allowed_shift_map=allowed_shift_map,
     )
     has_case = bool(normalized_case)
+
+    # 3. NURSE_LIMIT 검증 (간호사별 월단위 요청 개수 제한)
+    nurse_limit_config = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.config_type == 'NURSE_LIMIT',
+        WantedConfig.nurse_id == nurse_id,
+        WantedConfig.year == req.year,
+        WantedConfig.month == req.month
+    ).first()
+
+    if nurse_limit_config and nurse_limit_config.max_requests is not None:
+        # 현재 간호사의 해당 월 요청 개수 확인
+        start_date = date(req.year, req.month, 1)
+        if req.month == 12:
+            end_date = date(req.year + 1, 1, 1)
+        else:
+            end_date = date(req.year, req.month + 1, 1)
+
+        nurse_current_count = db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.shift_date >= start_date,
+            NurseShiftRequest.shift_date < end_date
+        ).count()
+
+        # case에 포함된 날짜 수를 추가 요청으로 계산
+        additional_count = len(normalized_case) if has_case else 0
+        total_count = nurse_current_count + additional_count
+
+        if total_count > nurse_limit_config.max_requests:
+            print(f"[검증 실패] NURSE_LIMIT 초과: nurse_id={nurse_id}, "
+                  f"현재={nurse_current_count}, 추가={additional_count}, "
+                  f"제한={nurse_limit_config.max_requests}")
+            raise Exception(
+                f"간호사별 최대 요청 개수를 초과했습니다. "
+                f"(현재: {nurse_current_count}개, 추가: {additional_count}개, 제한: {nurse_limit_config.max_requests}개)"
+            )
+
+        print(f"[검증 통과] NURSE_LIMIT: 현재={nurse_current_count}, 추가={additional_count}, "
+              f"제한={nurse_limit_config.max_requests}")
+
+    # 4. DAILY_LIMIT 검증 (날짜별 그룹 전체 요청 개수 제한)
+    if has_case:
+        # case에 포함된 날짜들에 대해 DAILY_LIMIT 확인
+        case_dates = {item["date"] for item in normalized_case}
+
+        # 해당 월의 DAILY_LIMIT 설정 조회 (shift_type=None인 전체 날짜 제한)
+        daily_limit_configs = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.config_type == 'DAILY_LIMIT',
+            WantedConfig.target_date.in_(case_dates),
+            WantedConfig.shift_type.is_(None)
+        ).all()
+
+        daily_limit_map = {config.target_date: config.max_requests for config in daily_limit_configs}
+
+        if daily_limit_map:
+            # 그룹 내 모든 간호사 ID 조회
+            group_nurse_ids = [n[0] for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+
+            # 제한 초과 날짜 수집
+            exceeded_dates = []
+            for check_date in case_dates:
+                if check_date in daily_limit_map:
+                    daily_limit = daily_limit_map[check_date]
+
+                    # 해당 날짜의 그룹 전체 요청 개수
+                    daily_current_count = db.query(NurseShiftRequest).filter(
+                        NurseShiftRequest.nurse_id.in_(group_nurse_ids),
+                        NurseShiftRequest.shift_date == check_date
+                    ).count()
+
+                    # 제한 초과 확인 (현재 요청도 카운트에 포함)
+                    if daily_current_count >= daily_limit:
+                        exceeded_dates.append({
+                            "date": check_date.strftime('%Y-%m-%d'),
+                            "current": daily_current_count,
+                            "limit": daily_limit
+                        })
+
+            if exceeded_dates:
+                exceeded_info = ", ".join([
+                    f"{d['date']}({d['current']}/{d['limit']})"
+                    for d in exceeded_dates
+                ])
+                print(f"[검증 실패] DAILY_LIMIT 초과: {exceeded_info}")
+                raise Exception(
+                    f"다음 날짜의 일자별 최대 요청 개수를 초과했습니다: {exceeded_info}"
+                )
+
+            print(f"[검증 통과] DAILY_LIMIT: case 날짜 {len(case_dates)}개 확인 완료")
+
+    # ========== WantedConfig 검증 종료 ==========
 
     # graph에 전달할 case 포맷 (isoformat 처리)
     graph_case_payload = [
@@ -876,11 +996,21 @@ def request_wanted_shifts_service(
     ).first():
         raise Exception("이미 해당 월의 요청이 존재합니다.")
 
+    # GLOBAL 설정에서 default_deadline_days 확인
+    final_exp_date = req.exp_date
+    if final_exp_date is None:
+        global_config = get_wanted_config(db, target_group_id, 'GLOBAL')
+        if global_config and global_config.default_deadline_days is not None:
+            # 현재 시각 + default_deadline_days로 자동 계산
+            final_exp_date = datetime.now() + timedelta(days=global_config.default_deadline_days)
+            print(f"[자동 마감일 설정] default_deadline_days={global_config.default_deadline_days}, "
+                  f"계산된 마감일={final_exp_date.strftime('%Y-%m-%d %H:%M')}")
+
     new_wanted = Wanted(
         group_id=target_group_id,
         year=req.year,
         month=req.month,
-        exp_date=req.exp_date,
+        exp_date=final_exp_date,
         status='requested'
     )
     db.add(new_wanted)
@@ -899,7 +1029,7 @@ def request_wanted_shifts_service(
         office_code=office_id,
         sender_emp_seq_no=current_user.nurse_id,
         sender_member_id=current_user.account_id,
-        deadline=req.exp_date,
+        deadline=final_exp_date,
     )
     
     display_exp_date = "마감일 없음" if new_wanted.exp_date is None else new_wanted.exp_date.strftime("%Y-%m-%d")
@@ -912,7 +1042,8 @@ def request_wanted_shifts_service(
 
 def close_expired_wanted(db: Session) -> int:
     """
-    exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경합니다.
+    exp_date가 지난 Wanted 요청의 status를  'closed'로 일괄 변경합니다.
+    각 그룹의 WantedConfig.auto_close_on_deadline 설정을 확인하여 자동 마감 여부를 결정합니다.
 
     인자:
         db: DB 세션 객체
@@ -929,11 +1060,338 @@ def close_expired_wanted(db: Session) -> int:
     )
 
     updated_count = 0
+    skipped_count = 0
+
     for wanted in query:
+        # 해당 그룹의 GLOBAL 설정 확인
+        global_config = get_wanted_config(db, wanted.group_id, 'GLOBAL')
+
+        # auto_close_on_deadline이 False면 자동 마감 스킵
+        if global_config and global_config.auto_close_on_deadline == False:
+            skipped_count += 1
+            print(f"[자동 마감 스킵] group_id={wanted.group_id}, year={wanted.year}, month={wanted.month} "
+                  f"(auto_close_on_deadline=False)")
+            continue
+
         wanted.status = 'closed'
         updated_count += 1
 
     if updated_count > 0:
         db.commit()
-        print(f"Wanted 자동 마감 완료: {updated_count}건")
+        print(f"Wanted 자동 마감 완료: {updated_count}건 (스킵: {skipped_count}건)")
+    elif skipped_count > 0:
+        print(f"Wanted 자동 마감: 모두 스킵됨 ({skipped_count}건)")
+
     return updated_count
+
+
+# WantedConfig 관련 서비스 함수 생성 - 과연 delete 함수가 필요할까? 해당 여부 고려좀 해야함
+def get_wanted_config(db: Session, group_id: str, config_type: str, filters: dict = None):
+    """원티드 설정 조회 (통합)
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        config_type: 'GLOBAL', 'NURSE_LIMIT', 'DAILY_LIMIT'
+        filters: 추가 필터 조건 (예: {'nurse_id': 'xxx', 'year': 2026, 'month': 11})
+
+    반환:
+        - GLOBAL: WantedConfig 1개 또는 None
+        - NURSE_LIMIT: List[WantedConfig]
+        - DAILY_LIMIT: List[WantedConfig]
+    """
+
+    query = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.config_type == config_type
+    )
+
+    # 추가 필터 적용
+    if filters:
+        if config_type == 'NURSE_LIMIT':
+            if 'nurse_id' in filters:
+                query = query.filter(WantedConfig.nurse_id == filters['nurse_id'])
+            if 'year' in filters:
+                query = query.filter(WantedConfig.year == filters['year'])
+            if 'month' in filters:
+                query = query.filter(WantedConfig.month == filters['month'])
+
+        elif config_type == 'DAILY_LIMIT':
+            if 'year' in filters and 'month' in filters:
+                # 해당 월의 범위로 필터링
+                year = filters['year']
+                month = filters['month']
+                start_date = date(year, month, 1)
+                if month == 12:
+                    end_date = date(year + 1, 1, 1)
+                else:
+                    end_date = date(year, month + 1, 1)
+                query = query.filter(
+                    WantedConfig.target_date >= start_date,
+                    WantedConfig.target_date < end_date
+                )
+            if 'target_date' in filters:
+                target_date = filters['target_date']
+                if isinstance(target_date, str):
+                    target_date = datetime.strptime(target_date, '%Y-%m-%d').date()
+                query = query.filter(WantedConfig.target_date == target_date)
+            if 'shift_type' in filters:
+                query = query.filter(WantedConfig.shift_type == filters['shift_type'])
+
+    # GLOBAL은 단일 반환, 나머지는 리스트 반환
+    if config_type == 'GLOBAL':
+        return query.first()
+    else:
+        return query.all()
+
+
+def upsert_wanted_config(db: Session, group_id: str, config_data: dict):
+    """원티드 설정 생성/수정 (통합)
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        config_data: 설정 데이터 (config_type 필수 포함)
+            GLOBAL: is_enabled, default_deadline_days, ...
+            NURSE_LIMIT: nurse_id, year, month, max_requests
+            DAILY_LIMIT: target_date, shift_type, max_requests
+
+    반환:
+        WantedConfig
+    """
+
+    config_type = config_data.get('config_type')
+    if not config_type:
+        raise ValueError("config_type은 필수입니다.")
+
+    # 기존 설정 조회
+    if config_type == 'GLOBAL':
+        existing = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.config_type == 'GLOBAL'
+        ).first()
+
+        if existing:
+            # 수정
+            if 'is_enabled' in config_data:
+                existing.is_enabled = config_data['is_enabled']
+            if 'default_deadline_days' in config_data:
+                existing.default_deadline_days = config_data['default_deadline_days']
+            if 'allow_edit_after_submit' in config_data:
+                existing.allow_edit_after_submit = config_data['allow_edit_after_submit']
+            if 'auto_close_on_deadline' in config_data:
+                existing.auto_close_on_deadline = config_data['auto_close_on_deadline']
+            if 'send_reminder' in config_data:
+                existing.send_reminder = config_data['send_reminder']
+            if 'reminder_days_before' in config_data:
+                existing.reminder_days_before = config_data['reminder_days_before']
+            config = existing
+        else:
+            # 생성
+            config = WantedConfig(
+                group_id=group_id,
+                config_type='GLOBAL',
+                is_enabled=config_data.get('is_enabled', True),
+                default_deadline_days=config_data.get('default_deadline_days'),
+                allow_edit_after_submit=config_data.get('allow_edit_after_submit', True),
+                auto_close_on_deadline=config_data.get('auto_close_on_deadline', True),
+                send_reminder=config_data.get('send_reminder', True),
+                reminder_days_before=config_data.get('reminder_days_before', 3)
+            )
+            db.add(config)
+
+    elif config_type == 'NURSE_LIMIT':
+        nurse_id = config_data.get('nurse_id')
+        year = config_data.get('year')
+        month = config_data.get('month')
+
+        if not all([nurse_id, year, month]):
+            raise ValueError("NURSE_LIMIT는 nurse_id, year, month가 필수입니다.")
+
+        existing = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.config_type == 'NURSE_LIMIT',
+            WantedConfig.nurse_id == nurse_id,
+            WantedConfig.year == year,
+            WantedConfig.month == month
+        ).first()
+
+        if existing:
+            existing.max_requests = config_data.get('max_requests', 0)
+            config = existing
+        else:
+            config = WantedConfig(
+                group_id=group_id,
+                config_type='NURSE_LIMIT',
+                nurse_id=nurse_id,
+                year=year,
+                month=month,
+                max_requests=config_data.get('max_requests', 0)
+            )
+            db.add(config)
+
+    elif config_type == 'DAILY_LIMIT':
+        target_date_str = config_data.get('target_date')
+        if not target_date_str:
+            raise ValueError("DAILY_LIMIT는 target_date가 필수입니다.")
+
+        # 문��열을 date로 변환
+        if isinstance(target_date_str, str):
+            target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+        else:
+            target_date = target_date_str
+
+        shift_type = config_data.get('shift_type')
+
+        existing = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.config_type == 'DAILY_LIMIT',
+            WantedConfig.target_date == target_date,
+            WantedConfig.shift_type == shift_type
+        ).first()
+
+        if existing:
+            existing.max_requests = config_data.get('max_requests', 0)
+            config = existing
+        else:
+            config = WantedConfig(
+                group_id=group_id,
+                config_type='DAILY_LIMIT',
+                target_date=target_date,
+                shift_type=shift_type,
+                max_requests=config_data.get('max_requests', 0)
+            )
+            db.add(config)
+    else:
+        raise ValueError(f"지원하지 않는 config_type: {config_type}")
+
+    db.commit()
+    db.refresh(config)
+    print(f"[{config_type}] 설정 저장 완료: group_id={group_id}")
+    return config
+
+
+def delete_wanted_config(db: Session, group_id: str, config_type: str, filters: dict = None) -> int:
+    """원티드 설정 삭제 (통합)
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        config_type: 'GLOBAL', 'NURSE_LIMIT', 'DAILY_LIMIT'
+        filters: 삭제 조건 (NURSE_LIMIT, DAILY_LIMIT에서 필요)
+
+    반환:
+        삭제된 레코드 수
+    """
+
+    query = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.config_type == config_type
+    )
+
+    # 추가 필터 적용
+    if filters:
+        if config_type == 'NURSE_LIMIT':
+            if 'nurse_id' in filters:
+                query = query.filter(WantedConfig.nurse_id == filters['nurse_id'])
+            if 'year' in filters:
+                query = query.filter(WantedConfig.year == filters['year'])
+            if 'month' in filters:
+                query = query.filter(WantedConfig.month == filters['month'])
+
+        elif config_type == 'DAILY_LIMIT':
+            if 'target_date' in filters:
+                target_date_str = filters['target_date']
+                if isinstance(target_date_str, str):
+                    target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+                else:
+                    target_date = target_date_str
+                query = query.filter(WantedConfig.target_date == target_date)
+            if 'shift_type' in filters:
+                query = query.filter(WantedConfig.shift_type == filters['shift_type'])
+
+    deleted = query.delete()
+    db.commit()
+    print(f"[{config_type}] 설정 삭제: group_id={group_id}, deleted={deleted}")
+    return deleted
+
+
+def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int, month: int, shift_date: date) -> dict:
+    """원티드 요청 제한 검증
+
+    인자:
+        db: DB 세션
+        nurse_id: 간호사 ID
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+        shift_date: 근무 날짜
+
+    반환:
+        {
+            "valid": bool,
+            "errors": List[str],
+            "nurse_limit": int | None,
+            "nurse_current": int,
+            "daily_limit": int | None,
+            "daily_current": int
+        }
+    """
+
+    errors = []
+
+    # 1. 간호사별 제한 확인
+    nurse_config = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.config_type == 'NURSE_LIMIT',
+        WantedConfig.nurse_id == nurse_id,
+        WantedConfig.year == year,
+        WantedConfig.month == month
+    ).first()
+
+    nurse_limit = nurse_config.max_requests if nurse_config else None
+
+    # 현재 간호사의 요청 개수
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1)
+    else:
+        end_date = date(year, month + 1, 1)
+
+    nurse_current = db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id == nurse_id,
+        NurseShiftRequest.shift_date >= start_date,
+        NurseShiftRequest.shift_date < end_date
+    ).count()
+
+    if nurse_limit is not None and nurse_current >= nurse_limit:
+        errors.append(f"간호사별 최대 요청 개수({nurse_limit}개)를 초과했습니다.")
+
+    # 2. 일자별 제한 확인
+    daily_config = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.config_type == 'DAILY_LIMIT',
+        WantedConfig.target_date == shift_date,
+        WantedConfig.shift_type.is_(None)
+    ).first()
+
+    daily_limit = daily_config.max_requests if daily_config else None
+
+    # 해당 날짜의 그룹 전체 요청 개수
+    nurse_ids = [n[0] for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+    daily_current = db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id.in_(nurse_ids),
+        NurseShiftRequest.shift_date == shift_date
+    ).count()
+
+    if daily_limit is not None and daily_current >= daily_limit:
+        errors.append(f"{shift_date.strftime('%Y-%m-%d')} 일자별 최대 요청 개수({daily_limit}개)를 초과했습니다.")
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "nurse_limit": nurse_limit,
+        "nurse_current": nurse_current,
+        "daily_limit": daily_limit,
+        "daily_current": daily_current
+    }

@@ -3,19 +3,29 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
-from datetime import datetime
-from schemas.roster_schema import WantedInvokeRequest, WantedInvokeResponse, WantedDeadlineRequest
+from datetime import datetime, timedelta, timezone, date
+from schemas.roster_schema import (
+    WantedInvokeRequest,
+    WantedInvokeResponse,
+    WantedDeadlineRequest,
+    WantedConfigCreate,
+    WantedConfig as WantedConfigSchema
+)
 from services.graph_service import graph_service
 from pydantic import BaseModel
 from routers.auth import get_current_user_from_cookie
 from db.client2 import get_db
-from db.models import Wanted, NurseShiftRequest
+from db.models import Wanted, NurseShiftRequest, WantedConfig
 from schemas.auth_schema import User as UserSchema
-from db.models import Nurse, ShiftPreference
-from services.wanted_service import request_wanted_shifts_service
-from services.wanted_service import invoke_and_persist_wanted_service
-from db.models import Group
-from datetime import datetime, timedelta, timezone
+from db.models import Nurse, ShiftPreference, Group
+from services.wanted_service import (
+    request_wanted_shifts_service,
+    invoke_and_persist_wanted_service,
+    get_wanted_config,
+    upsert_wanted_config,
+    delete_wanted_config,
+    validate_wanted_limits
+)
 router = APIRouter(
     prefix="/wanted",
     tags=["wanted"]
@@ -457,3 +467,232 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
         raise
 
     return {"now_kst": now_kst.isoformat(), "updated": updated_count}
+
+
+# WantedConfig 관련 엔드포인트
+@router.get("/config")
+async def get_wanted_config_endpoint(
+    config_type: str,
+    nurse_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    target_date: Optional[str] = None,
+    shift_type: Optional[str] = None,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """원티드 설정 조회 (통합)
+
+    Query Parameters:
+        - config_type: 'GLOBAL' | 'NURSE_LIMIT' | 'DAILY_LIMIT' (필수)
+        - NURSE_LIMIT: nurse_id, year, month (선택)
+        - DAILY_LIMIT: year, month, target_date, shift_type (선택)
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 권한 확인 (수간호사 또는 관리자만)
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    # 필터 구성
+    filters = {}
+    if config_type == 'NURSE_LIMIT':
+        if nurse_id:
+            filters['nurse_id'] = nurse_id
+        if year:
+            filters['year'] = year
+        if month:
+            filters['month'] = month
+    elif config_type == 'DAILY_LIMIT':
+        if year and month:
+            filters['year'] = year
+            filters['month'] = month
+        if target_date:
+            filters['target_date'] = target_date
+        if shift_type:
+            filters['shift_type'] = shift_type
+
+    try:
+        result = get_wanted_config(db, target_group_id, config_type, filters)
+
+        if config_type == 'GLOBAL':
+            if result:
+                return WantedConfigSchema.model_validate(result)
+            else:
+                return None
+        else:
+            return [WantedConfigSchema.model_validate(r) for r in result]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")
+
+
+@router.post("/config")
+async def upsert_wanted_config_endpoint(
+    config_data: WantedConfigCreate,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """원티드 설정 생성/수정 (통합)
+
+    Body:
+        - config_type: 'GLOBAL' | 'NURSE_LIMIT' | 'DAILY_LIMIT' (필수)
+        - GLOBAL: is_enabled, default_deadline_days, allow_edit_after_submit, ...
+        - NURSE_LIMIT: nurse_id, year, month, max_requests
+        - DAILY_LIMIT: target_date, shift_type, max_requests
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 권한 확인 (수간호사 또는 관리자만)
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        config_dict = config_data.model_dump(exclude_unset=True)
+        result = upsert_wanted_config(db, target_group_id, config_dict)
+        return WantedConfigSchema.model_validate(result)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 저장 실패: {str(e)}")
+
+
+@router.delete("/config")
+async def delete_wanted_config_endpoint(
+    config_type: str,
+    nurse_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    target_date: Optional[str] = None,
+    shift_type: Optional[str] = None,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """원티드 설정 삭제 (통합)
+
+    Query Parameters:
+        - config_type: 'GLOBAL' | 'NURSE_LIMIT' | 'DAILY_LIMIT' (필수)
+        - NURSE_LIMIT: nurse_id, year, month (선택)
+        - DAILY_LIMIT: target_date, shift_type (선택)
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 권한 확인 (수간호사 또는 관리자만)
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    # 필터 구성
+    filters = {}
+    if config_type == 'NURSE_LIMIT':
+        if nurse_id:
+            filters['nurse_id'] = nurse_id
+        if year:
+            filters['year'] = year
+        if month:
+            filters['month'] = month
+    elif config_type == 'DAILY_LIMIT':
+        if target_date:
+            filters['target_date'] = target_date
+        if shift_type:
+            filters['shift_type'] = shift_type
+
+    try:
+        deleted_count = delete_wanted_config(db, target_group_id, config_type, filters)
+        return {
+            "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
+
+
+@router.post("/validate-limits")
+async def validate_wanted_limits_endpoint(
+    nurse_id: str,
+    year: int,
+    month: int,
+    shift_date_str: str,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """원티드 요청 제한 검증
+
+    Body:
+        - nurse_id: 간호사 ID (필수)
+        - year: 연도 (필수)
+        - month: 월 (필수)
+        - shift_date_str: 근무 날짜 'YYYY-MM-DD' (필수)
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        # 문자열 날짜를 date 객체로 변환
+        shift_date = datetime.strptime(shift_date_str, '%Y-%m-%d').date()
+
+        result = validate_wanted_limits(db, nurse_id, target_group_id, year, month, shift_date)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"날짜 형식 오류: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
