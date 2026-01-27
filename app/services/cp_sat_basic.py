@@ -856,7 +856,17 @@ class CPSATBasicEngine:
             # ── 경계 제약(강제 OFF/금지) 병합 ──
             initial_constraints = config_data.get('initial_constraints') or {}
             allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
-            rs_dbid_to_idx = {n.db_id: n.id for n in nurses}
+            # ID 매핑을 문자열 기반으로 통일(입력 dict 키가 str이므로 불일치 방지)
+            rs_dbid_to_idx = {str(n.db_id): n.id for n in nurses}
+            # 보조: int 키로도 접근 가능하도록 추가
+            rs_dbid_to_idx.update({n.db_id: n.id for n in nurses})
+            def _get_nurse_idx(dbid):
+                if dbid in rs_dbid_to_idx:
+                    return rs_dbid_to_idx[dbid]
+                try:
+                    return rs_dbid_to_idx.get(str(dbid))
+                except Exception:
+                    return None
             weekly_off_map_raw = config_data.get("weekly_off_map") or {}
             # weekly_off_settings의 activate가 0이면 weekly_off_map이 비어있음
             # 이 경우 off_placement_mode도 효력이 없도록 설정
@@ -886,11 +896,32 @@ class CPSATBasicEngine:
             prev_last_off_raw = config_data.get("prev_month_last_is_off") or {}
             prev_last_off_by_idx: dict[int, bool] = {}
             for dbid, flag in (prev_last_off_raw or {}).items():
-                n_idx = rs_dbid_to_idx.get(str(dbid))
+                n_idx = _get_nurse_idx(dbid)
                 if n_idx is None:
                     continue
                 prev_last_off_by_idx[n_idx] = bool(flag)
             roster_system.prev_month_last_is_off = prev_last_off_by_idx
+            # 꼬리 연속근무 보정용 OFF 윈도우 (월초 0..K-w 구간 OFF≥1)
+            off_window_raw = config_data.get("off_window_constraints") or {}
+            off_window_by_idx: dict[int, list[tuple[int, int]]] = {}
+            for dbid, win_list in (off_window_raw or {}).items():
+                n_idx = _get_nurse_idx(dbid)
+                if n_idx is None:
+                    continue
+                normalized: list[tuple[int, int]] = []
+                for win in (win_list or []):
+                    if not isinstance(win, (list, tuple)) or len(win) < 2:
+                        continue
+                    try:
+                        start = int(win[0]); end = int(win[1])
+                    except Exception:
+                        continue
+                    if start < 0 or end < start:
+                        continue
+                    normalized.append((start, end))
+                if normalized:
+                    off_window_by_idx[n_idx] = normalized
+            roster_system.off_window_constraints = off_window_by_idx
             # forced_off: { nurse_db_id: [day_idx,...] }
             forced_off = initial_constraints.get('forced_off') or {}
             # print('forced_off!!!!!', forced_off)
@@ -1963,6 +1994,18 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     # print('평일휴무 금지 간호사:', nu.name, '날짜:', d+1)
                     m.Add(X(n, d, off) == 0)
+        # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
+        try:
+            off_windows = getattr(rs, "off_window_constraints", {}) or {}
+            if off_idx_full is not None:
+                for (w_start, w_end) in off_windows.get(n, []) or []:
+                    left = max(T0, w_start)
+                    right = min(T1, w_end)
+                    if left > right:
+                        continue
+                    m.Add(sum(X(n, d, off_idx_full) for d in range(left, right + 1)) >= 1)
+        except Exception as e:
+            print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):
             m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)

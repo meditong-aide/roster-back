@@ -931,6 +931,21 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, night_idx) <= sum(neighbors))
 
+        # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
+        try:
+            off_windows = getattr(roster_system, "off_window_constraints", {}) or {}
+            if off_idx is not None:
+                for n in range(N):
+                    T0, T1 = join[n], leave[n]
+                    for (w_start, w_end) in off_windows.get(n, []) or []:
+                        left = max(T0, w_start)
+                        right = min(T1, w_end)
+                        if left > right:
+                            continue
+                        m.Add(sum(X(n, d, off_idx) for d in range(left, right + 1)) >= 1)
+        except Exception as e:
+            print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
+
         # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약
         K = cfg.max_consecutive_work_days
         for n in range(N):
