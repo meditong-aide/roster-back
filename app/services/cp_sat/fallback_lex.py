@@ -854,7 +854,6 @@ def optimize_fallback_lex_hard_first(
     
         slack_penalty = int(getattr(cfg, "isolated_off_slack_penalty", 300000) or 0)
         for n in range(N):
-            print('고립!!!!!')
             t0, t1 = join[n], leave[n]
             for d in range(t0, t1 + 1):
                 neighbours = []

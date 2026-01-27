@@ -2013,8 +2013,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 월 최소 OFF 일수 하드 제약 (프론트 전달 off_days를 최소값으로 해석)
         try:
             base_min_off = int(getattr(cfg, 'global_monthly_off_days', 0) + getattr(cfg, 'standard_personal_off_days', 0))
-            print('base_min_off!!!!!!', base_min_off)
-            print('global_monthly_off_days!!!!!!', getattr(cfg, 'global_monthly_off_days', 0))
+
             # 근무 가능 일수보다 클 수 있으므로 클램프
             min_off_required = min(base_min_off, T1 - T0 + 1)
             if min_off_required > 0:
