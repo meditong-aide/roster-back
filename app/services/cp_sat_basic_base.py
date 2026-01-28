@@ -1124,6 +1124,9 @@ def _build_full_model(rs: RosterSystem, grouped):
             pat2=m.NewIntVar(0,1,f'NOE_{n}_{d}')
             m.Add(pat2 >= X(n,d,night)+X(n,d+1,off)+X(n,d+2,eve)-2)
             obj.append(-100*pat2)
+            pat3=m.NewIntVar(0,1,f'EOD_{n}_{d}')
+            m.Add(pat3 >= X(n,d,eve)+X(n,d+1,off)+X(n,d+2,day)-2)
+            obj.append(-100*pat3)
 
     # (4-5) 고립 OFF
     for n in range(N):
