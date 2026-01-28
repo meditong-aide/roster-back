@@ -535,9 +535,16 @@ class CPSATBasicEngine:
                     except:
                         return None
             return None
-        sorted_rows = sorted(nurses_data, key=lambda r: (r.get('sequence', 0), -int(r.get('experience', 0) or 0), str(r.get('nurse_id'))))
-        nurses = []
-        for i, nurse_data in enumerate(sorted_rows):
+        sorted_rows = sorted(
+            nurses_data,
+            key=lambda r: (
+                r.get('sequence', 0),
+                -int(r.get('experience', 0) or 0),
+                str(r.get('nurse_id')),
+            ),
+        )
+        nurses: list[Nurse] = []
+        for nurse_data in sorted_rows:
             active_raw = nurse_data.get("active", 1)
             try:
                 active_flag = int(active_raw)
@@ -549,9 +556,10 @@ class CPSATBasicEngine:
                     f"{nurse_data.get('name', '?')}({nurse_data.get('nurse_id', '?')}) active={active_raw}"
                 )
                 continue
+            nurse_idx = len(nurses)
             # DB 모델을 Nurse 객체로 변환
             nurse_dict = {
-                'id': i,  # 엔진에서 사용할 인덱스 ID
+                'id': nurse_idx,  # 엔진에서 사용할 인덱스 ID
                 'db_id': nurse_data['nurse_id'],  # DB ID
                 'name': nurse_data['name'],
                 'experience_years': nurse_data.get('experience', 0),
