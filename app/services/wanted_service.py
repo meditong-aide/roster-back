@@ -655,7 +655,7 @@ async def invoke_and_persist_wanted_service(
     주요 개선:
     - case 정규화를 함수 초반으로 이동 → NameError 방지
     - case가 없어도 안전하게 graph 호출
-    - request가 '기존 데이터' 계열���면 복사 스킵
+    - request가 '기존 데이터' 계열 복사 스킵
     - case가 충분히 많으면 전체 재작성으로 간주
     """
     nurse_id = current_user.nurse_id
@@ -729,7 +729,7 @@ async def invoke_and_persist_wanted_service(
 
     # 4. DAILY_LIMIT 검증 (날짜별 그룹 전체 요청 개수 제한)
     # if has_case:
-        # case에 포함된 날짜들��� 대해 DAILY_LIMIT 확인
+        # case에 포함된 날짜들 DAILY_LIMIT 확인
     # case_dates = {item["date"] for item in normalized_case}
 
         # 해당 월의 DAILY_LIMIT 설정 조회 (shift_type=None인 전체 날짜 제한)
@@ -1021,12 +1021,12 @@ def request_wanted_shifts_service(
 
 def close_expired_wanted(db: Session) -> int:
     """
-    exp_date�� 지난 Wanted 요청의 status를 'closed'로 일괄 변경합니다.
+    exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경합니다.
 
     인자:
-        db: DB ��션 객체
+        db: DB 세션 객체
 
-    반��:
+    반환:
         int: 'requested' 상태에서 'closed'로 변경된 Wanted 건수.
              예를 들어 만료된 건이 3건이면 3을 반환합니다.
     """

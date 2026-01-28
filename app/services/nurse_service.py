@@ -393,7 +393,7 @@ def reorder_nurses_service(active_order: List[str], inactive_order: List[str], c
         n.active = 1
         n.sequence = idx
 
-    # 비활성 정��� 적용
+    # 비활성 정렬 적용
     for idx, nid in enumerate(inactive_order, start=1):
         n = id_to_nurse.get(nid)
         if not n:
