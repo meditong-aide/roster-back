@@ -936,6 +936,9 @@ def optimize_fallback_lex_hard_first(
             off_windows = getattr(roster_system, "off_window_constraints", {}) or {}
             if off_idx is not None:
                 for n in range(N):
+                    nu = roster_system.nurses[n]
+                    if bool(getattr(nu, "is_weekend_off", False)):
+                        continue
                     T0, T1 = join[n], leave[n]
                     for (w_start, w_end) in off_windows.get(n, []) or []:
                         left = max(T0, w_start)

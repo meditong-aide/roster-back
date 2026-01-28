@@ -1999,6 +1999,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             off_windows = getattr(rs, "off_window_constraints", {}) or {}
             if off_idx_full is not None:
                 for (w_start, w_end) in off_windows.get(n, []) or []:
+                    nu = rs.nurses[n]
+                    if bool(getattr(nu, "is_weekend_off", False)):
+                        continue
                     left = max(T0, w_start)
                     right = min(T1, w_end)
                     if left > right:
