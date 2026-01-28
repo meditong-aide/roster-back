@@ -668,10 +668,10 @@ async def invoke_and_persist_wanted_service(
     # 1. GLOBAL 설정 확인
     global_config = get_wanted_config(db, group_id, 'GLOBAL')
 
-    # 1-1. is_enabled 확인 (원티드 기능 활성화 여부)
-    if global_config and global_config.is_enabled == False:
-        print(f"[검증 실패] 원티드 기능이 비활성화됨: group_id={group_id}")
-        raise Exception("원티드 기능이 현재 비활성화되어 있습니다.")
+    # 1-1. enable_aide 확인 (AIDE 기능 활성화 여부)
+    if global_config and global_config.enable_aide == False:
+        print(f"[검증 실패] AIDE 기능이 비활성화됨: group_id={group_id}")
+        raise Exception("AIDE 기능이 현재 비활성화되어 있습니다.")
 
     # 2. 재제출 여부 확인
     existing_request = db.query(WantedRequest).filter(
@@ -681,13 +681,8 @@ async def invoke_and_persist_wanted_service(
 
     is_resubmit = existing_request is not None
 
-    # 2-1. allow_edit_after_submit 확인 (재제출 허용 여부)
-    if is_resubmit and global_config and global_config.allow_edit_after_submit == False:
-        print(f"[검증 실패] 제출 후 수정 불가: nurse_id={nurse_id}, month={month_str}")
-        raise Exception("제출 후 수정이 불가능합니다.")
-
-    print(f"[검증 통과] GLOBAL 설정 확인 완료: is_enabled={global_config.is_enabled if global_config else 'None'}, "
-          f"is_resubmit={is_resubmit}, allow_edit={global_config.allow_edit_after_submit if global_config else 'None'}")
+    print(f"[검증 통과] GLOBAL 설정 확인 완료: enable_aide={global_config.enable_aide if global_config else 'None'}, "
+          f"is_resubmit={is_resubmit}")
 
     # 허용 근무코드 조회 (show_in_preference=True)
     allowed_shifts_query = db.query(Shift).filter(
@@ -746,7 +741,7 @@ async def invoke_and_persist_wanted_service(
 
     # 4. DAILY_LIMIT 검증 (날짜별 그룹 전체 요청 개수 제한)
     if has_case:
-        # case에 포함된 날짜들에 대해 DAILY_LIMIT 확인
+        # case에 포함된 날짜들��� 대해 DAILY_LIMIT 확인
         case_dates = {item["date"] for item in normalized_case}
 
         # 해당 월의 DAILY_LIMIT 설정 조회 (shift_type=None인 전체 날짜 제한)
@@ -953,7 +948,11 @@ async def invoke_and_persist_wanted_service(
 
     # pair 저장
     if pref_parsed:
-        _persist_pair_results(db, nurse_id, new_request_id, month_str, pref_parsed)
+        # enable_nurse_pair_preference 확인 (시크릿 기능 활성화 여부)
+        if global_config and global_config.enable_nurse_pair_preference == False:
+            print(f"[경고] 선호 간호사 기능이 비활성화됨: pair 데이터는 저장되지 않습니다. group_id={group_id}")
+        else:
+            _persist_pair_results(db, nurse_id, new_request_id, month_str, pref_parsed)
 
     # 최종 커밋
     try:
@@ -996,21 +995,12 @@ def request_wanted_shifts_service(
     ).first():
         raise Exception("이미 해당 월의 요청이 존재합니다.")
 
-    # GLOBAL 설정에서 default_deadline_days 확인
-    final_exp_date = req.exp_date
-    if final_exp_date is None:
-        global_config = get_wanted_config(db, target_group_id, 'GLOBAL')
-        if global_config and global_config.default_deadline_days is not None:
-            # 현재 시각 + default_deadline_days로 자동 계산
-            final_exp_date = datetime.now() + timedelta(days=global_config.default_deadline_days)
-            print(f"[자동 마감일 설정] default_deadline_days={global_config.default_deadline_days}, "
-                  f"계산된 마감일={final_exp_date.strftime('%Y-%m-%d %H:%M')}")
-
+    # 마감일은 요청에서 전달된 값 사용 (향후 default_deadline_days 자동 계산 기능 추가 예정)
     new_wanted = Wanted(
         group_id=target_group_id,
         year=req.year,
         month=req.month,
-        exp_date=final_exp_date,
+        exp_date=req.exp_date,
         status='requested'
     )
     db.add(new_wanted)
@@ -1029,7 +1019,7 @@ def request_wanted_shifts_service(
         office_code=office_id,
         sender_emp_seq_no=current_user.nurse_id,
         sender_member_id=current_user.account_id,
-        deadline=final_exp_date,
+        deadline=new_wanted.exp_date,
     )
     
     display_exp_date = "마감일 없음" if new_wanted.exp_date is None else new_wanted.exp_date.strftime("%Y-%m-%d")
@@ -1042,45 +1032,27 @@ def request_wanted_shifts_service(
 
 def close_expired_wanted(db: Session) -> int:
     """
-    exp_date가 지난 Wanted 요청의 status를  'closed'로 일괄 변경합니다.
-    각 그룹의 WantedConfig.auto_close_on_deadline 설정을 확인하여 자동 마감 여부를 결정합니다.
+    exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경합니다.
 
     인자:
         db: DB 세션 객체
 
-    반환:
+    반��:
         int: 'requested' 상태에서 'closed'로 변경된 Wanted 건수.
              예를 들어 만료된 건이 3건이면 3을 반환합니다.
     """
     now = datetime.now()
-    query = db.query(Wanted).filter(
+    updated_count = db.query(Wanted).filter(
         Wanted.status == 'requested',
         Wanted.exp_date.isnot(None),
         Wanted.exp_date < now,
-    )
-
-    updated_count = 0
-    skipped_count = 0
-
-    for wanted in query:
-        # 해당 그룹의 GLOBAL 설정 확인
-        global_config = get_wanted_config(db, wanted.group_id, 'GLOBAL')
-
-        # auto_close_on_deadline이 False면 자동 마감 스킵
-        if global_config and global_config.auto_close_on_deadline == False:
-            skipped_count += 1
-            print(f"[자동 마감 스킵] group_id={wanted.group_id}, year={wanted.year}, month={wanted.month} "
-                  f"(auto_close_on_deadline=False)")
-            continue
-
-        wanted.status = 'closed'
-        updated_count += 1
+    ).update({'status': 'closed'}, synchronize_session=False)
 
     if updated_count > 0:
         db.commit()
-        print(f"Wanted 자동 마감 완료: {updated_count}건 (스킵: {skipped_count}건)")
-    elif skipped_count > 0:
-        print(f"Wanted 자동 마감: 모두 스킵됨 ({skipped_count}건)")
+        print(f"Wanted 자동 마감 완료: {updated_count}건")
+    else:
+        print("Wanted 자동 마감: 만료된 항목 없음")
 
     return updated_count
 
@@ -1152,7 +1124,7 @@ def upsert_wanted_config(db: Session, group_id: str, config_data: dict):
         db: DB 세션
         group_id: 그룹 ID
         config_data: 설정 데이터 (config_type 필수 포함)
-            GLOBAL: is_enabled, default_deadline_days, ...
+            GLOBAL: enable_nurse_pair_preference, enable_aide
             NURSE_LIMIT: nurse_id, year, month, max_requests
             DAILY_LIMIT: target_date, shift_type, max_requests
 
@@ -1173,30 +1145,18 @@ def upsert_wanted_config(db: Session, group_id: str, config_data: dict):
 
         if existing:
             # 수정
-            if 'is_enabled' in config_data:
-                existing.is_enabled = config_data['is_enabled']
-            if 'default_deadline_days' in config_data:
-                existing.default_deadline_days = config_data['default_deadline_days']
-            if 'allow_edit_after_submit' in config_data:
-                existing.allow_edit_after_submit = config_data['allow_edit_after_submit']
-            if 'auto_close_on_deadline' in config_data:
-                existing.auto_close_on_deadline = config_data['auto_close_on_deadline']
-            if 'send_reminder' in config_data:
-                existing.send_reminder = config_data['send_reminder']
-            if 'reminder_days_before' in config_data:
-                existing.reminder_days_before = config_data['reminder_days_before']
+            if 'enable_nurse_pair_preference' in config_data:
+                existing.enable_nurse_pair_preference = config_data['enable_nurse_pair_preference']
+            if 'enable_aide' in config_data:
+                existing.enable_aide = config_data['enable_aide']
             config = existing
         else:
             # 생성
             config = WantedConfig(
                 group_id=group_id,
                 config_type='GLOBAL',
-                is_enabled=config_data.get('is_enabled', True),
-                default_deadline_days=config_data.get('default_deadline_days'),
-                allow_edit_after_submit=config_data.get('allow_edit_after_submit', True),
-                auto_close_on_deadline=config_data.get('auto_close_on_deadline', True),
-                send_reminder=config_data.get('send_reminder', True),
-                reminder_days_before=config_data.get('reminder_days_before', 3)
+                enable_nurse_pair_preference=config_data.get('enable_nurse_pair_preference', True),
+                enable_aide=config_data.get('enable_aide', True)
             )
             db.add(config)
 

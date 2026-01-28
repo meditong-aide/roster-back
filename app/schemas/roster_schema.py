@@ -140,13 +140,15 @@ class WantedConfigBase(BaseModel):
     """원티드 설정 기본 스키마 (config_type에 따라 사용되는 필드가 다름)"""
     config_type: Literal["GLOBAL", "NURSE_LIMIT", "DAILY_LIMIT"]
 
-    # 전역 설정 (GLOBAL)
-    is_enabled: Optional[bool] = None
+    # 전역 설정 (GLOBAL) - 사용하지 않지만 유지하는 필드 (향후 확장용)
     default_deadline_days: Optional[int] = None
     allow_edit_after_submit: Optional[bool] = None
     auto_close_on_deadline: Optional[bool] = None
     send_reminder: Optional[bool] = None
     reminder_days_before: Optional[int] = None
+    # 전역 설정 (GLOBAL) - 실제 사용하는 필드
+    enable_nurse_pair_preference: Optional[bool] = None
+    enable_aide: Optional[bool] = None
 
     # 간호사별 제한 (NURSE_LIMIT)
     nurse_id: Optional[str] = None

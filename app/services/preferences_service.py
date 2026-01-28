@@ -78,11 +78,6 @@ def submit_preferences_service(
             WantedConfig.config_type == 'GLOBAL'
         ).first()
 
-        # 1-1. is_enabled 확인 (원티드 기능 활성화 여부)
-        if global_config and global_config.is_enabled == False:
-            print(f"[검증 실패] 원티드 기능이 비활성화됨: group_id={group_id}")
-            raise Exception("원티드 기능이 현재 비활성화되어 있습니다.")
-
         # 2. Wanted 테이블 상태 확인 (해당 월의 원티드 요청이 생성되었는지, 마감되었는지)
         wanted = db.query(Wanted).filter(
             Wanted.group_id == group_id,
@@ -120,13 +115,7 @@ def submit_preferences_service(
 
         is_resubmit = existing_submitted is not None
 
-        # 3-1. allow_edit_after_submit 확인 (재제출 허용 여부)
-        if is_resubmit and global_config and global_config.allow_edit_after_submit == False:
-            print(f"[검증 실패] 제출 후 수정 불가: nurse_id={nurse_id}, month={month_str}")
-            raise Exception("제출 후 수정이 불가능합니다.")
-
-        print(f"[검증 통과] GLOBAL 설정 확인 완료: is_enabled={global_config.is_enabled if global_config else 'None'}, "
-              f"is_resubmit={is_resubmit}, allow_edit={global_config.allow_edit_after_submit if global_config else 'None'}")
+        print(f"[검증 통과] GLOBAL 설정 확인 완료: is_resubmit={is_resubmit}")
 
         # 4. NURSE_LIMIT 검증 (간호사별 월단위 요청 개수 제한)
         nurse_limit_config = db.query(WantedConfig).filter(

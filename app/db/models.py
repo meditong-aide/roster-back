@@ -282,12 +282,15 @@ class WantedConfig(Base):
     shift_type = Column(CHAR(1), nullable=True)
 
     # 전역 설정 (GLOBAL)
-    is_enabled = Column(BOOLEAN, nullable=True, default=True)
+    # 사용하지 않지만 유지하는 컬럼 (향후 확장용)
     default_deadline_days = Column(INTEGER, nullable=True)
     allow_edit_after_submit = Column(BOOLEAN, nullable=True, default=True)
     auto_close_on_deadline = Column(BOOLEAN, nullable=True, default=True)
     send_reminder = Column(BOOLEAN, nullable=True, default=True)
     reminder_days_before = Column(INTEGER, nullable=True, default=3)
+    # 실제 사용하는 컬럼
+    enable_nurse_pair_preference = Column(BOOLEAN, nullable=True, default=True)
+    enable_aide = Column(BOOLEAN, nullable=True, default=True)
 
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())

@@ -552,7 +552,7 @@ async def upsert_wanted_config_endpoint(
 
     Body:
         - config_type: 'GLOBAL' | 'NURSE_LIMIT' | 'DAILY_LIMIT' (필수)
-        - GLOBAL: is_enabled, default_deadline_days, allow_edit_after_submit, ...
+        - GLOBAL: enable_nurse_pair_preference, enable_aide
         - NURSE_LIMIT: nurse_id, year, month, max_requests
         - DAILY_LIMIT: target_date, shift_type, max_requests
     """
