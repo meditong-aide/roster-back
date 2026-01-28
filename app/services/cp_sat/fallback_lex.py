@@ -846,6 +846,7 @@ def optimize_fallback_lex_hard_first(
             "rec_2n2o": [],  # N2→2O 회복 부족(Int)
             "pattern_nod": [],  # N-O-D 패턴(Int)
             "pattern_noe": [],  # N-O-E 패턴(Int)
+            "pattern_eod": [],  # E-O-D 패턴(Int)
             "min_off_missing": [],  # 월 최소 OFF 부족(Int)
             "off_quota_short": [],  # 개인별 O 할당(주휴 제외) 부족 슬랙(Int)
             "off_quota_excess": [],  # 개인별 O 초과 슬랙(Int)
@@ -1054,6 +1055,15 @@ def optimize_fallback_lex_hard_first(
                         - 2
                     )
                     safety["pattern_noe"].append(v2)
+                    v3 = m.NewIntVar(0, 1, f"eod_{n}_{d}")
+                    m.Add(
+                        v3
+                        >= X(n, d, eve_idx)
+                        + X(n, d + 1, off_idx)
+                        + X(n, d + 2, day_idx)
+                        - 2
+                    )
+                    safety["pattern_eod"].append(v3)
 
         # 월 최소 OFF 부족량(가능일수 클램프)
         try:
