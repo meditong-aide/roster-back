@@ -644,12 +644,13 @@ def _build_fixed_shift_roster(
     weekday_off_code: str = "O",
     sunday_code: str = "주",
     shift_lookup: dict[str, Shift] | None = None,
+    weekly_off_active: bool = True,
 ) -> dict[str, list[str]]:
     """고정 근무 간호사의 월간 스케줄을 생성합니다.
 
     - 평일(월~금): fixed_shift 코드 배정
     - 토요일: weekday_off_code
-    - 일요일: sunday_code
+    - 일요일: weekly_off_active이고 간호사 weekly_off_enabled가 1일 때만 sunday_code
     """
     days_in_month = calendar.monthrange(year, month)[1]
     month_start = date(year, month, 1)
@@ -662,6 +663,9 @@ def _build_fixed_shift_roster(
             continue
         start_idx, end_idx = active_range
         fixed_code = str(getattr(nurse, "fixed_shift", "") or "").upper()
+        weekly_off_enabled = weekly_off_active and bool(
+            getattr(nurse, "weekly_off_enabled", False)
+        )
         if shift_lookup is not None:
             if fixed_code not in shift_lookup:
                 raise HTTPException(
@@ -678,7 +682,8 @@ def _build_fixed_shift_roster(
         for day_idx in range(start_idx, end_idx + 1):
             weekday = (month_start + timedelta(days=day_idx)).weekday()
             if weekday >= 5:
-                shifts[day_idx] = sunday_code if weekday == 6 else weekday_off_code
+                is_sunday_weekly_off = weekday == 6 and weekly_off_enabled
+                shifts[day_idx] = sunday_code if is_sunday_weekly_off else weekday_off_code
             else:
                 shifts[day_idx] = fixed_code
         result[str(nurse.nurse_id)] = shifts
@@ -2596,6 +2601,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         weekday_off_code="O",
         sunday_code="주",
         shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
+        weekly_off_active=bool(config_dict.get("weekly_off_settings_activate", False)),
     )
     fixed_roster = _overlay_fixed_roster_with_special_requests(
         fixed_roster=fixed_roster,
