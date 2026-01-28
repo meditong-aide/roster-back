@@ -264,46 +264,37 @@ def build_fallback_stage3_objective_terms(
     # 야간 균등화(편차 패널티)
     try:
         if bool(getattr(cfg, "even_nights", False)):
-            print('야간 균등화 적용')
             night_idx = cfg.shift_types.index("N")
             normals: list[int] = []
             for i, nu in enumerate(roster_system.nurses):
                 is_n_only = False
                 raw = getattr(nu, "is_night_nurse", None)
                 if isinstance(raw, list):
-                    print(1)
                     allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
                     is_n_only = allowed == {"N"}
-                    print('is_n_only', is_n_only)
                 elif raw == 3 or (raw is not None and raw not in (0, False)):
-                    print(2)
                     is_n_only = True
                 if not is_n_only:
                     normals.append(i)
-                    print(3)
             if normals:
                 if (
                     hasattr(cfg, "daily_shift_requirements_by_day")
                     and isinstance(cfg.daily_shift_requirements_by_day, list)
                     and len(cfg.daily_shift_requirements_by_day) == D
                 ):
-                    print(4)
                     daily_need_n = [
                         int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
                         for d in range(D)
                     ]
                 else:
-                    print(5)
                     base_n = int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
                     daily_need_n = [base_n for _ in range(D)]
-                    print(6)
                 total_need_n = 0
                 for d in range(D):
                     need = max(0, daily_need_n[d] - int(fixed_cnt[d][night_idx] or 0))
                     total_need_n += need
 
                 if total_need_n > 0:
-                    print(7)
                     target = total_need_n // len(normals)
                     for n in normals:
                         tot_nights = sum(

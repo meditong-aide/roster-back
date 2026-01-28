@@ -739,9 +739,13 @@ def optimize_fallback_lex_hard_first(
                         neighbours = []
                         left_pos = d - 1
                         right_pos = d + 1
-                        if left_pos >= T0 and left_pos not in shortage_days:
+                        # if left_pos >= T0 and left_pos not in shortage_days:
+                        allow_shortage_off = relax_level >= 3
+
+                        if left_pos >= T0 and (allow_shortage_off or left_pos not in shortage_days):
                             neighbours.append(("left", X(n, left_pos, off_idx)))
-                        if right_pos <= T1 and right_pos not in shortage_days:
+                        # if right_pos <= T1 and right_pos not in shortage_days:
+                        if right_pos <= T1 and (allow_shortage_off or right_pos not in shortage_days):
                             neighbours.append(("right", X(n, right_pos, off_idx)))
                         # 둘 다 부족일이면 스킵
                         if not neighbours:
@@ -1093,8 +1097,11 @@ def optimize_fallback_lex_hard_first(
                     target_o = max(0, std_personal_off - weekly_target)
                     if target_o <= 0:
                         continue
+                    # 휴가/공가는 개인 O 목표 충족에서 제외
                     assigned_o = sum(
-                        X(n, d, off_idx) for d in range(join[n], leave[n] + 1)
+                        X(n, d, off_idx)
+                        for d in range(join[n], leave[n] + 1)
+                        if (n, d) not in vacation_off_cells
                     )
                     slack_short = m.NewIntVar(0, D, f"off_quota_short_{n}")
                     slack_excess = m.NewIntVar(0, D, f"off_quota_excess_{n}")
@@ -1139,11 +1146,19 @@ def optimize_fallback_lex_hard_first(
                     f"vacation={vacation_cnt}, min_off_required={min_off_required}"
                 )
                 if min_off_required > 0:
-                    offs = sum(X(n, d, off_idx) for d in range(T0, T1 + 1))
+                    # 휴가/공가는 최소 OFF 충족에서 제외
+                    offs = sum(
+                        X(n, d, off_idx)
+                        for d in range(T0, T1 + 1)
+                        if (n, d) not in vacation_off_cells
+                    )
+                    # relax_level에 따라 부분 하드: relax_level=0이면 완전 하드, 1이면 1일 부족 허용 …
+                    hard_lower = max(0, min_off_required - relax_level)
+                    m.Add(offs >= hard_lower)
                     miss = m.NewIntVar(0, D, f"min_off_miss_{n}")
                     m.Add(miss >= min_off_required - offs)
-                    safety["min_off_missing"].append(miss)
                     min_off_miss_by_n[n] = miss
+                    safety["min_off_missing"].append(miss)
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 if extra_allowed >= 0:
                     pure_offs = sum(
@@ -1241,7 +1256,7 @@ def optimize_fallback_lex_hard_first(
     s1 = None
     best_short, best_over = None, None
     used_relax_level = 0  # 1단계에서 성공한 완화 레벨
-    max_relax_attempts = 5  # 최대 5회까지 완화 재시도
+    max_relax_attempts = 10  # 최대 10회까지 완화 재시도
     time_per_attempt = max(3, tl1 // max_relax_attempts)  # 각 시도당 시간 (최소 3초)
 
     for relax_level in range(max_relax_attempts):
