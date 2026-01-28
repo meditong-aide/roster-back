@@ -92,6 +92,8 @@ class RosterRequest(BaseModel):
     # 월단위 선호(개인 입력): nurse_id -> {"shift": "D|E|N", "strength": 0~10}
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
     not_one_night: Optional[bool] = Field(default=None, description="야간 단발성(1N) 금지 여부")
+    # 확정 원티드 사용 여부 (True: FixedWantedEntry 사용, False: 기존 WantedRequest 사용)
+    use_fixed_wanted: bool = Field(default=False, description="확정 원티드 사용 여부")
 
 class PreferenceSubmit(BaseModel):
     year: int
@@ -277,3 +279,106 @@ class PhoneChangeRequest(BaseModel):
     """휴대폰 번호 변경 요청"""
     new_phone_number: str = Field(..., pattern=r"^01[0-9]{8,9}$", description="새 휴대폰 번호")
     verification_code: Optional[str] = Field(None, description="인증번호 (검증 단계에서만 사용)")
+
+
+# ───────────────────────────── Fixed Wanted (확정 원티드) 스키마 ─────────────────────────────
+
+class FixedWantedEntryCreate(BaseModel):
+    """확정 원티드 항목 생성 요청"""
+    nurse_id: str
+    shift_date: date
+    shift_id: str
+    is_applied: bool = True
+    source_type: str = Field(..., description="'original' | 'added' | 'modified'")
+    original_shift_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class FixedWantedCreate(BaseModel):
+    """확정 원티드 저장 요청"""
+    year: int
+    month: int
+    entries: List[FixedWantedEntryCreate]
+
+
+class WantedBoardEntry(BaseModel):
+    """원티드 관리보드 - 개별 항목"""
+    date: date
+    shift: str
+    shift_id: str
+    has_reason: bool
+    reason: Optional[str] = None
+    score: Optional[float] = None
+
+
+class WantedBoardNurse(BaseModel):
+    """원티드 관리보드 - 간호사별 데이터"""
+    nurse_id: str
+    name: str
+    is_submitted: bool
+    entries: List[WantedBoardEntry]
+
+
+class WantedBoardSummary(BaseModel):
+    """원티드 관리보드 - 요약 통계"""
+    total_nurses: int
+    submitted_count: int
+    with_reason_count: int
+
+
+class WantedBoardResponse(BaseModel):
+    """원티드 관리보드 조회 응답"""
+    nurses: List[WantedBoardNurse]
+    summary: WantedBoardSummary
+
+
+class FixedWantedEntryResponse(BaseModel):
+    """확정 원티드 항목 응답"""
+    id: int
+    group_id: str
+    year: int
+    month: int
+    nurse_id: str
+    shift_date: date
+    shift_id: str
+    is_applied: bool
+    source_type: str
+    original_shift_id: Optional[str] = None
+    reason: Optional[str] = None
+    created_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AdjustmentNurse(BaseModel):
+    """원티드 조정판 - 간호사별 데이터"""
+    nurse_id: str
+    name: str
+    entries: List[FixedWantedEntryResponse]
+    monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, ...}
+
+
+class AdjustmentResponse(BaseModel):
+    """원티드 조정판 조회 응답"""
+    nurses: List[AdjustmentNurse]
+    has_fixed_wanted: bool = False  # 저장된 확정 원티드 존재 여부
+
+
+class FixedWantedListResponse(BaseModel):
+    """확정 원티드 목록 조회 응답 (근무표 생성용)"""
+    group_id: str
+    year: int
+    month: int
+    entries: List[FixedWantedEntryResponse]
+    total_count: int
+
+    class Config:
+        from_attributes = True
+
+
+class ToggleEntryResponse(BaseModel):
+    """항목 토글 응답"""
+    id: int
+    is_applied: bool
+    message: str

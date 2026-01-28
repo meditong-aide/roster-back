@@ -441,3 +441,33 @@ class WeeklyOffSetting(Base):
     office = relationship("Office")
     group = relationship("Group")
 
+
+# ───────────────────────────── Fixed Wanted (확정 원티드) ─────────────────────────────
+
+class FixedWantedEntry(Base):
+    """확정 원티드 테이블 - 수간호사가 조정/확정한 간호사별, 날짜별 근무 희망 (단일 테이블 구조)"""
+    __tablename__ = 'fixed_wanted_entries'
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    nurse_id = Column(VARCHAR(50), ForeignKey('nurses.nurse_id'), nullable=False)
+    shift_date = Column(DATE, nullable=False)
+    shift_id = Column(VARCHAR(10), nullable=False)  # 근무코드 (D, E, N, O 등)
+    is_applied = Column(BOOLEAN, default=True)  # 적용/미적용 여부
+    source_type = Column(VARCHAR(20), nullable=False)  # 'original' | 'added' | 'modified'
+    original_shift_id = Column(VARCHAR(10), nullable=True)  # 원본 근무코드 (수정된 경우)
+    reason = Column(TEXT, nullable=True)  # 사유 (원본에서 복사 또는 신규 입력)
+    created_by = Column(VARCHAR(50), ForeignKey('nurses.nurse_id'), nullable=True)  # 생성자
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    group = relationship("Group")
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    creator = relationship("Nurse", foreign_keys=[created_by])
+
+    __table_args__ = (
+        Index('idx_fixed_entry_group_ym', 'group_id', 'year', 'month'),
+        Index('idx_fixed_entry_nurse_date', 'group_id', 'year', 'month', 'nurse_id', 'shift_date'),
+    )
