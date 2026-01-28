@@ -141,7 +141,7 @@ class WantedConfigBase(BaseModel):
     """일자별 원티드 제한 설정 기본 스키마 (DAILY_LIMIT 전용)"""
     year: Optional[int] = None
     month: Optional[int] = None
-    max_requests: Optional[int] = None  # 해당 일자��� 최대 요청 개수
+    max_requests: Optional[int] = None  # 해당 일자 최대 요청 개수
     target_date: Optional[str] = None  # 특정 일자 (YYYY-MM-DD)
     shift_type: Optional[str] = None  # 근무 타입 (휴무/휴가)
 
