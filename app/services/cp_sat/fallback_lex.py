@@ -980,6 +980,9 @@ def optimize_fallback_lex_hard_first(
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
                 exc = m.NewIntVar(0, L + 1, f"cnight_exc_{n}_{d0}")
                 m.Add(exc >= sum_n - L)
+                # three_seq_nig가 켜져 있으면 연속 N은 하드로 L개를 넘지 못하도록 한다.
+                if bool(getattr(cfg, "three_seq_nig", True)):
+                    m.Add(sum_n <= L)
                 safety["cnight_excess"].append(exc)
 
         # 월 Night 상한 초과량
