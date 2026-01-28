@@ -553,6 +553,13 @@ def optimize_fallback_lex_hard_first(
                         is_n_only = (allowed == {"N"})
                     # elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
                     #     is_n_only = True
+                    # 디버그: 강제 OFF 개수 로그
+                    print(
+                        f"{logger_prefix} [HardCheck][ForcedOffCnt] "
+                        f"nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                        f"name={getattr(nu, 'name', '?')}, forced_off_cnt={forced_off_cnt}, "
+                        f"avail_days={avail_days}"
+                    )
                     if is_n_only:
                         max_off_allowed = max(0, avail_days - 15) + relax_level
                         # print(f'is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
@@ -1140,11 +1147,11 @@ def optimize_fallback_lex_hard_first(
                     1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells
                 )
                 min_off_required = max(0, min(base_min_off, avail_days - vacation_cnt))
-                print(
-                    f"{logger_prefix} [OffCap][vac] n={n}, id={nurse_id}, name={nurse_name}, "
-                    f"base_min_off={base_min_off}, avail_days={avail_days}, "
-                    f"vacation={vacation_cnt}, min_off_required={min_off_required}"
-                )
+                # print(
+                #     f"{logger_prefix} [OffCap][vac] n={n}, id={nurse_id}, name={nurse_name}, "
+                #     f"base_min_off={base_min_off}, avail_days={avail_days}, "
+                #     f"vacation={vacation_cnt}, min_off_required={min_off_required}"
+                # )
                 if min_off_required > 0:
                     # 휴가/공가는 최소 OFF 충족에서 제외
                     offs = sum(
@@ -1185,12 +1192,12 @@ def optimize_fallback_lex_hard_first(
                         else:
                             pure_cap_effective = max_off_allowed
                             m.Add(pure_offs <= pure_cap_effective)
-                    print(
-                        f"{logger_prefix} [OffCap][pure] n={n}, id={nurse_id}, name={nurse_name}, "
-                        f"pure_off_cap={MAX_PURE_OFF}, effective_cap={pure_cap_effective}, "
-                        f"extra_allowed={extra_allowed}, vacation={vacation_cnt}, "
-                        f"is_n_only={int(is_n_only)}, weekend_off={int(is_weekend_off)}"
-                    )
+                    # print(
+                    #     f"{logger_prefix} [OffCap][pure] n={n}, id={nurse_id}, name={nurse_name}, "
+                    #     f"pure_off_cap={MAX_PURE_OFF}, effective_cap={pure_cap_effective}, "
+                    #     f"extra_allowed={extra_allowed}, vacation={vacation_cnt}, "
+                    #     f"is_n_only={int(is_n_only)}, weekend_off={int(is_weekend_off)}"
+                    # )
         except Exception as e:
             print('예외데쇼!!', e)
             pass
