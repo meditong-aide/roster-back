@@ -1104,7 +1104,22 @@ def optimize_fallback_lex_hard_first(
                         if isinstance(weekly_off_by_idx, dict)
                         else 0
                     )
-                    target_o = max(0, std_personal_off - weekly_target)
+                    weekend_forced = 0
+                    if bool(getattr(nu, "is_weekend_off", False)):
+                        try:
+                            weekend_forced = sum(
+                                1
+                                for d in weekend_days
+                                if join[n] <= d <= leave[n]
+                                and not (
+                                    (n, d) in fixed
+                                    and fixed.get((n, d)) is not None
+                                    and fixed.get((n, d)) != off_idx
+                                )
+                            )
+                        except Exception:
+                            weekend_forced = 0
+                    target_o = max(0, std_personal_off - (weekly_target + weekend_forced))
                     if target_o <= 0:
                         continue
                     # 휴가/공가는 개인 O 목표 충족에서 제외

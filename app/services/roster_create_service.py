@@ -2273,6 +2273,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         special_shift_requests,
         special_shift_map,
     ) = _collect_nurses_and_preferences(db, req, current_user)
+    active_nurses_in_group = [
+        n for n in nurses_in_group if getattr(n, "active", 1) != 0
+    ]
+    if len(active_nurses_in_group) != len(nurses_in_group):
+        excluded_names = [
+            f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')})"
+            for n in nurses_in_group
+            if getattr(n, "active", 1) == 0
+        ]
+        print(f"[RosterCreate] 비활성 간호사 엔진 제외: {excluded_names}")
+    nurses_in_group = active_nurses_in_group
     # _debug_log(
     #     "collect_done",
     #     {
