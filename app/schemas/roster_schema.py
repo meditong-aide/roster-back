@@ -142,7 +142,8 @@ class WantedConfigBase(BaseModel):
     year: Optional[int] = None
     month: Optional[int] = None
     max_requests: Optional[int] = None  # 해당 일자 최대 요청 개수
-    target_date: Optional[str] = None  # 특정 일자 (YYYY-MM-DD)
+    # target_date: Optional[str] = None  # 특정 일자 (YYYY-MM-DD)
+    target_date: Optional[date] = None
     shift_type: Optional[str] = None  # 근무 타입 (휴무/휴가)
 
 class WantedConfigCreate(WantedConfigBase):
