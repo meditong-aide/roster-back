@@ -135,30 +135,15 @@ class WantedInvokeRequest(BaseModel):
 class WantedInvokeResponse(BaseModel):
     response: Any
 
-# Wanted Config 관련 스키마
+# Wanted Config 관련 스키마 (DAILY_LIMIT 전용)
+# - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
 class WantedConfigBase(BaseModel):
-    """원티드 설정 기본 스키마 (config_type에 따라 사용되는 필드가 다름)"""
-    config_type: Literal["GLOBAL", "NURSE_LIMIT", "DAILY_LIMIT"]
-
-    # 전역 설정 (GLOBAL) - 사용하지 않지만 유지하는 필드 (향후 확장용)
-    default_deadline_days: Optional[int] = None
-    allow_edit_after_submit: Optional[bool] = None
-    auto_close_on_deadline: Optional[bool] = None
-    send_reminder: Optional[bool] = None
-    reminder_days_before: Optional[int] = None
-    # 전역 설정 (GLOBAL) - 실제 사용하는 필드
-    enable_nurse_pair_preference: Optional[bool] = None
-    enable_aide: Optional[bool] = None
-
-    # 간호사별 제한 (NURSE_LIMIT)
-    nurse_id: Optional[str] = None
+    """일자별 원티드 제한 설정 기본 스키마 (DAILY_LIMIT 전용)"""
     year: Optional[int] = None
     month: Optional[int] = None
-    max_requests: Optional[int] = None
-
-    # 일자별 제한 (DAILY_LIMIT)
-    target_date: Optional[str] = None
-    shift_type: Optional[str] = None
+    max_requests: Optional[int] = None  # 해당 일자��� 최대 요청 개수
+    target_date: Optional[str] = None  # 특정 일자 (YYYY-MM-DD)
+    shift_type: Optional[str] = None  # 근무 타입 (휴무/휴가)
 
 class WantedConfigCreate(WantedConfigBase):
     """원티드 설정 생성/수정 요청 스키마"""
@@ -257,7 +242,11 @@ class NurseProfile(BaseModel):
         default_factory=list,
         description="근무 가능 형태 배열. 예: ['D', 'E2', 'N1', 'MD'] 또는 ['D', 'N']"
     )
-    
+    # 원티드 설정 (간호사별 개별 설정)
+    enable_nurse_pair_preference: Optional[bool] = None  # 시크릿 기능 활성화
+    enable_aide: Optional[bool] = None  # AIDE 기능 활성화
+    wanted_max_requests: Optional[int] = None  # 원티드 요청 개수 제한 (휴무/휴가)
+
     # @field_validator('fixed_shift')
     # @classmethod
     # def check_fixed_shift_with_weekend_off(cls, v: Any, info: ValidationInfo) -> Any:

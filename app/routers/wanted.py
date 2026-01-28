@@ -469,11 +469,10 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
     return {"now_kst": now_kst.isoformat(), "updated": updated_count}
 
 
-# WantedConfig 관련 엔드포인트
+# WantedConfig 관련 엔드포인트 (DAILY_LIMIT 전용)
+# - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
 @router.get("/config")
 async def get_wanted_config_endpoint(
-    config_type: str,
-    nurse_id: Optional[str] = None,
     year: Optional[int] = None,
     month: Optional[int] = None,
     target_date: Optional[str] = None,
@@ -482,12 +481,12 @@ async def get_wanted_config_endpoint(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """원티드 설정 조회 (통합)
+    """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용)
 
     Query Parameters:
-        - config_type: 'GLOBAL' | 'NURSE_LIMIT' | 'DAILY_LIMIT' (필수)
-        - NURSE_LIMIT: nurse_id, year, month (선택)
-        - DAILY_LIMIT: year, month, target_date, shift_type (선택)
+        - year, month: 해당 월의 설정 조회 (선택)
+        - target_date: 특정 일자 조회 (선택)
+        - shift_type: 근무 타입 필터 (선택)
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -511,32 +510,17 @@ async def get_wanted_config_endpoint(
 
     # 필터 구성
     filters = {}
-    if config_type == 'NURSE_LIMIT':
-        if nurse_id:
-            filters['nurse_id'] = nurse_id
-        if year:
-            filters['year'] = year
-        if month:
-            filters['month'] = month
-    elif config_type == 'DAILY_LIMIT':
-        if year and month:
-            filters['year'] = year
-            filters['month'] = month
-        if target_date:
-            filters['target_date'] = target_date
-        if shift_type:
-            filters['shift_type'] = shift_type
+    if year and month:
+        filters['year'] = year
+        filters['month'] = month
+    if target_date:
+        filters['target_date'] = target_date
+    if shift_type:
+        filters['shift_type'] = shift_type
 
     try:
-        result = get_wanted_config(db, target_group_id, config_type, filters)
-
-        if config_type == 'GLOBAL':
-            if result:
-                return WantedConfigSchema.model_validate(result)
-            else:
-                return None
-        else:
-            return [WantedConfigSchema.model_validate(r) for r in result]
+        result = get_wanted_config(db, target_group_id, filters)
+        return [WantedConfigSchema.model_validate(r) for r in result]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")
 
@@ -548,13 +532,14 @@ async def upsert_wanted_config_endpoint(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """원티드 설정 생성/수정 (통합)
+    """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용)
 
     Body:
-        - config_type: 'GLOBAL' | 'NURSE_LIMIT' | 'DAILY_LIMIT' (필수)
-        - GLOBAL: enable_nurse_pair_preference, enable_aide
-        - NURSE_LIMIT: nurse_id, year, month, max_requests
-        - DAILY_LIMIT: target_date, shift_type, max_requests
+        - year: 연도
+        - month: 월
+        - target_date: 특정 일자 (YYYY-MM-DD)
+        - shift_type: 근무 타입 (휴무/휴가)
+        - max_requests: 최대 요청 개수
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -588,22 +573,17 @@ async def upsert_wanted_config_endpoint(
 
 @router.delete("/config")
 async def delete_wanted_config_endpoint(
-    config_type: str,
-    nurse_id: Optional[str] = None,
-    year: Optional[int] = None,
-    month: Optional[int] = None,
     target_date: Optional[str] = None,
     shift_type: Optional[str] = None,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """원티드 설정 삭제 (통합)
+    """일자별 원티드 제한 설정 삭제 (DAILY_LIMIT 전용)
 
     Query Parameters:
-        - config_type: 'GLOBAL' | 'NURSE_LIMIT' | 'DAILY_LIMIT' (필수)
-        - NURSE_LIMIT: nurse_id, year, month (선택)
-        - DAILY_LIMIT: target_date, shift_type (선택)
+        - target_date: 특정 일자 (선택)
+        - shift_type: 근무 타입 (선택)
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -627,21 +607,13 @@ async def delete_wanted_config_endpoint(
 
     # 필터 구성
     filters = {}
-    if config_type == 'NURSE_LIMIT':
-        if nurse_id:
-            filters['nurse_id'] = nurse_id
-        if year:
-            filters['year'] = year
-        if month:
-            filters['month'] = month
-    elif config_type == 'DAILY_LIMIT':
-        if target_date:
-            filters['target_date'] = target_date
-        if shift_type:
-            filters['shift_type'] = shift_type
+    if target_date:
+        filters['target_date'] = target_date
+    if shift_type:
+        filters['shift_type'] = shift_type
 
     try:
-        deleted_count = delete_wanted_config(db, target_group_id, config_type, filters)
+        deleted_count = delete_wanted_config(db, target_group_id, filters)
         return {
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count

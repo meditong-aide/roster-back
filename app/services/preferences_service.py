@@ -72,11 +72,11 @@ def submit_preferences_service(
         group_id = current_user.group_id
         nurse_id = current_user.nurse_id
 
-        # 1. GLOBAL 설정 확인
-        global_config = db.query(WantedConfig).filter(
-            WantedConfig.group_id == group_id,
-            WantedConfig.config_type == 'GLOBAL'
-        ).first()
+        # # 1. GLOBAL 설정 확인 - 더 이상 사용하지 않음 (nurses 테이블로 이동됨)
+        # global_config = db.query(WantedConfig).filter(
+        #     WantedConfig.group_id == group_id,
+        #     WantedConfig.config_type == 'GLOBAL'
+        # ).first()
 
         # 2. Wanted 테이블 상태 확인 (해당 월의 원티드 요청이 생성되었는지, 마감되었는지)
         wanted = db.query(Wanted).filter(
@@ -117,116 +117,96 @@ def submit_preferences_service(
 
         print(f"[검증 통과] GLOBAL 설정 확인 완료: is_resubmit={is_resubmit}")
 
-        # 4. NURSE_LIMIT 검증 (간호사별 월단위 요청 개수 제한)
-        nurse_limit_config = db.query(WantedConfig).filter(
-            WantedConfig.group_id == group_id,
-            WantedConfig.config_type == 'NURSE_LIMIT',
-            WantedConfig.nurse_id == nurse_id,
-            WantedConfig.year == req.year,
-            WantedConfig.month == req.month
-        ).first()
+        # # 4. NURSE_LIMIT 검증 - 프론트에서 검증, nurses 테이블로 이동됨
+        # nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+        # if nurse and nurse.wanted_max_requests is not None:
+        #     start_date = date(req.year, req.month, 1)
+        #     if req.month == 12:
+        #         end_date = date(req.year + 1, 1, 1)
+        #     else:
+        #         end_date = date(req.year, req.month + 1, 1)
+        #
+        #     query = db.query(NurseShiftRequest).filter(
+        #         NurseShiftRequest.nurse_id == nurse_id,
+        #         NurseShiftRequest.shift_date >= start_date,
+        #         NurseShiftRequest.shift_date < end_date
+        #     )
+        #     if is_resubmit and existing_submitted:
+        #         query = query.filter(NurseShiftRequest.request_id != existing_submitted.request_id)
+        #
+        #     nurse_current_count = query.count()
+        #     additional_count = len(data_to_save)
+        #     total_count = nurse_current_count + additional_count
+        #
+        #     if total_count > nurse.wanted_max_requests:
+        #         print(f"[검증 실패] NURSE_LIMIT 초과: nurse_id={nurse_id}, "
+        #               f"현재={nurse_current_count}, 추가={additional_count}, "
+        #               f"제한={nurse.wanted_max_requests}")
+        #         raise Exception(
+        #             f"간호사별 최대 요청 개수를 초과했습니다. "
+        #             f"(현재: {nurse_current_count}개, 추가: {additional_count}개, 제한: {nurse.wanted_max_requests}개)"
+        #         )
+        #
+        #     print(f"[검증 통과] NURSE_LIMIT: 현재={nurse_current_count}, 추가={additional_count}, "
+        #           f"제한={nurse.wanted_max_requests}")
 
-        if nurse_limit_config and nurse_limit_config.max_requests is not None:
-            # 현재 간호사의 해당 월 기존 요청 개수 확인 (재제출인 경우 기존 요청 제외)
-            start_date = date(req.year, req.month, 1)
-            if req.month == 12:
-                end_date = date(req.year + 1, 1, 1)
-            else:
-                end_date = date(req.year, req.month + 1, 1)
-
-            query = db.query(NurseShiftRequest).filter(
-                NurseShiftRequest.nurse_id == nurse_id,
-                NurseShiftRequest.shift_date >= start_date,
-                NurseShiftRequest.shift_date < end_date
-            )
-
-            # 재제출인 경우 현재 request_id 제외
-            if is_resubmit and existing_submitted:
-                query = query.filter(NurseShiftRequest.request_id != existing_submitted.request_id)
-
-            nurse_current_count = query.count()
-
-            # 새로 제출할 요청 개수
-            additional_count = len(data_to_save)
-            total_count = nurse_current_count + additional_count
-
-            if total_count > nurse_limit_config.max_requests:
-                print(f"[검증 실패] NURSE_LIMIT 초과: nurse_id={nurse_id}, "
-                      f"현재={nurse_current_count}, 추가={additional_count}, "
-                      f"제한={nurse_limit_config.max_requests}")
-                raise Exception(
-                    f"간호사별 최대 요청 개수를 초과했습니다. "
-                    f"(현재: {nurse_current_count}개, 추가: {additional_count}개, 제한: {nurse_limit_config.max_requests}개)"
-                )
-
-            print(f"[검증 통과] NURSE_LIMIT: 현재={nurse_current_count}, 추가={additional_count}, "
-                  f"제한={nurse_limit_config.max_requests}")
-
-        # 5. DAILY_LIMIT 검증 (날짜별 그룹 전체 요청 개수 제한)
-        # data_to_save의 날짜들을 date 객체로 변환
-        case_dates = set()
-        for date_str in data_to_save.keys():
-            try:
-                parsed_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                case_dates.add(parsed_date)
-            except ValueError:
-                continue
-
-        if case_dates:
-            # 해당 날짜들의 DAILY_LIMIT 설정 조회
-            daily_limit_configs = db.query(WantedConfig).filter(
-                WantedConfig.group_id == group_id,
-                WantedConfig.config_type == 'DAILY_LIMIT',
-                WantedConfig.target_date.in_(case_dates),
-                WantedConfig.shift_type.is_(None)
-            ).all()
-
-            daily_limit_map = {config.target_date: config.max_requests for config in daily_limit_configs}
-
-            if daily_limit_map:
-                # 그룹 내 모든 간호사 ID 조회
-                group_nurse_ids = [n[0] for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
-
-                # 제한 초과 날짜 수집
-                exceeded_dates = []
-                for check_date in case_dates:
-                    if check_date in daily_limit_map:
-                        daily_limit = daily_limit_map[check_date]
-
-                        # 해당 날짜의 그룹 전체 요청 개수
-                        query = db.query(NurseShiftRequest).filter(
-                            NurseShiftRequest.nurse_id.in_(group_nurse_ids),
-                            NurseShiftRequest.shift_date == check_date
-                        )
-
-                        # 재제출인 경우 현재 간호사의 기존 요청 제외
-                        if is_resubmit and existing_submitted:
-                            query = query.filter(
-                                ~((NurseShiftRequest.nurse_id == nurse_id) &
-                                  (NurseShiftRequest.request_id == existing_submitted.request_id))
-                            )
-
-                        daily_current_count = query.count()
-
-                        # 제한 초과 확인 (새 요청 1개 추가 고려)
-                        if daily_current_count + 1 > daily_limit:
-                            exceeded_dates.append({
-                                "date": check_date.strftime('%Y-%m-%d'),
-                                "current": daily_current_count,
-                                "limit": daily_limit
-                            })
-
-                if exceeded_dates:
-                    exceeded_info = ", ".join([
-                        f"{d['date']}({d['current']}/{d['limit']})"
-                        for d in exceeded_dates
-                    ])
-                    print(f"[검증 실패] DAILY_LIMIT 초과: {exceeded_info}")
-                    raise Exception(
-                        f"다음 날짜의 일자별 최대 요청 개수를 초과했습니다: {exceeded_info}"
-                    )
-
-                print(f"[검증 통과] DAILY_LIMIT: case 날짜 {len(case_dates)}개 확인 완료")
+        # # 5. DAILY_LIMIT 검증 - 프론트에서 검증
+        # case_dates = set()
+        # for date_str in data_to_save.keys():
+        #     try:
+        #         parsed_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        #         case_dates.add(parsed_date)
+        #     except ValueError:
+        #         continue
+        #
+        # if case_dates:
+        #     daily_limit_configs = db.query(WantedConfig).filter(
+        #         WantedConfig.group_id == group_id,
+        #         WantedConfig.target_date.in_(case_dates),
+        #         WantedConfig.shift_type.is_(None)
+        #     ).all()
+        #
+        #     daily_limit_map = {config.target_date: config.max_requests for config in daily_limit_configs}
+        #
+        #     if daily_limit_map:
+        #         group_nurse_ids = [n[0] for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+        #
+        #         exceeded_dates = []
+        #         for check_date in case_dates:
+        #             if check_date in daily_limit_map:
+        #                 daily_limit = daily_limit_map[check_date]
+        #
+        #                 query = db.query(NurseShiftRequest).filter(
+        #                     NurseShiftRequest.nurse_id.in_(group_nurse_ids),
+        #                     NurseShiftRequest.shift_date == check_date
+        #                 )
+        #
+        #                 if is_resubmit and existing_submitted:
+        #                     query = query.filter(
+        #                         ~((NurseShiftRequest.nurse_id == nurse_id) &
+        #                           (NurseShiftRequest.request_id == existing_submitted.request_id))
+        #                     )
+        #
+        #                 daily_current_count = query.count()
+        #
+        #                 if daily_current_count + 1 > daily_limit:
+        #                     exceeded_dates.append({
+        #                         "date": check_date.strftime('%Y-%m-%d'),
+        #                         "current": daily_current_count,
+        #                         "limit": daily_limit
+        #                     })
+        #
+        #         if exceeded_dates:
+        #             exceeded_info = ", ".join([
+        #                 f"{d['date']}({d['current']}/{d['limit']})"
+        #                 for d in exceeded_dates
+        #             ])
+        #             print(f"[검증 실패] DAILY_LIMIT 초과: {exceeded_info}")
+        #             raise Exception(
+        #                 f"다음 날짜의 일자별 최대 요청 개수를 초과했습니다: {exceeded_info}"
+        #             )
+        #
+        #         print(f"[검증 통과] DAILY_LIMIT: case 날짜 {len(case_dates)}개 확인 완료")
 
     # 최종 제출 시에만 이전 데이터 삭제 (data_to_save가 있을 때만)
     if not is_draft and data_to_save:  # ← 이제 안전하게 참조 가능

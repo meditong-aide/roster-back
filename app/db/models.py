@@ -75,7 +75,11 @@ class Nurse(Base):
     is_weekend_off = Column(BOOLEAN, default=False)
     # 추가
     work_shifts = Column(JSON, nullable=True, default=list, server_default='[]')
-    
+    # 원티드 설정 (간호사별 개별 설정)
+    enable_nurse_pair_preference = Column(BOOLEAN, nullable=True, default=True)  # 시크릿 기능 활성화
+    enable_aide = Column(BOOLEAN, nullable=True, default=True)  # AIDE 기능 활성화
+    wanted_max_requests = Column(INTEGER, nullable=True)  # 원티드 요청 개수 제한 (휴무/휴가)
+
     group = relationship("Group")
     __table_args__ = (
         ForeignKeyConstraint(['group_id', 'team_id'], ['teams.group_id', 'teams.team_id'], name='fk_nurses_team_group', ondelete='SET NULL', onupdate='CASCADE'),
@@ -265,42 +269,27 @@ class Wanted(Base):
     group = relationship("Group")
 
 class WantedConfig(Base):
+    """일자별 원티드 제한 설정 (DAILY_LIMIT 전용)
+
+    - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
+    - 이 테이블은 특정 일자의 특정 근무타입에 대한 제한만 관리
+    """
     __tablename__ = 'wanted_config'
 
     config_id = Column(INTEGER, primary_key=True, autoincrement=True)
     group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
-    config_type = Column(VARCHAR(20), nullable=False)  # 'GLOBAL', 'NURSE_LIMIT', 'DAILY_LIMIT'
-
-    # 간호사별 제한 (NURSE_LIMIT)
-    nurse_id = Column(VARCHAR(50), ForeignKey('nurses.nurse_id'), nullable=True)
     year = Column(SMALLINT, nullable=True)
     month = Column(TINYINT, nullable=True)
-    max_requests = Column(INTEGER, nullable=True)
-
-    # 일자별 제한 (DAILY_LIMIT)
-    target_date = Column(DATE, nullable=True)
-    shift_type = Column(CHAR(1), nullable=True)
-
-    # 전역 설정 (GLOBAL)
-    # 사용하지 않지만 유지하는 컬럼 (향후 확장용)
-    default_deadline_days = Column(INTEGER, nullable=True)
-    allow_edit_after_submit = Column(BOOLEAN, nullable=True, default=True)
-    auto_close_on_deadline = Column(BOOLEAN, nullable=True, default=True)
-    send_reminder = Column(BOOLEAN, nullable=True, default=True)
-    reminder_days_before = Column(INTEGER, nullable=True, default=3)
-    # 실제 사용하는 컬럼
-    enable_nurse_pair_preference = Column(BOOLEAN, nullable=True, default=True)
-    enable_aide = Column(BOOLEAN, nullable=True, default=True)
+    max_requests = Column(INTEGER, nullable=True)  # 해당 일자의 최대 요청 개수
+    target_date = Column(DATE, nullable=True)  # 특정 일자
+    shift_type = Column(CHAR(1), nullable=True)  # 근무 타입 (휴무/휴가)
 
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 
     group = relationship("Group")
-    nurse = relationship("Nurse")
 
     __table_args__ = (
-        Index('idx_wanted_config_global', 'group_id', 'config_type', unique=True),
-        Index('idx_wanted_config_nurse', 'group_id', 'nurse_id', 'year', 'month', unique=True),
         Index('idx_wanted_config_daily', 'group_id', 'target_date', 'shift_type', unique=True),
     )
 
