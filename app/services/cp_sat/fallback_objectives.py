@@ -6,6 +6,7 @@ from ortools.sat.python import cp_model
 
 from services.cp_sat.hardcoded_weights import (
     FALLBACK_EXPERIENCE_SHORT_PENALTY,
+    NIGHT_DEVIATION_PENALTY,
     N_ONLY_NIGHT_BONUS,
     PREFERENCE_SCORE_SCALE,
 )
@@ -259,6 +260,67 @@ def build_fallback_stage3_objective_terms(
                     obj.append(w * X(n, d, s_idx))
     except Exception:
         pass
+
+    # 야간 균등화(편차 패널티)
+    try:
+        if bool(getattr(cfg, "even_nights", False)):
+            print('야간 균등화 적용')
+            night_idx = cfg.shift_types.index("N")
+            normals: list[int] = []
+            for i, nu in enumerate(roster_system.nurses):
+                is_n_only = False
+                raw = getattr(nu, "is_night_nurse", None)
+                if isinstance(raw, list):
+                    print(1)
+                    allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                    is_n_only = allowed == {"N"}
+                    print('is_n_only', is_n_only)
+                elif raw == 3 or (raw is not None and raw not in (0, False)):
+                    print(2)
+                    is_n_only = True
+                if not is_n_only:
+                    normals.append(i)
+                    print(3)
+            if normals:
+                if (
+                    hasattr(cfg, "daily_shift_requirements_by_day")
+                    and isinstance(cfg.daily_shift_requirements_by_day, list)
+                    and len(cfg.daily_shift_requirements_by_day) == D
+                ):
+                    print(4)
+                    daily_need_n = [
+                        int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
+                        for d in range(D)
+                    ]
+                else:
+                    print(5)
+                    base_n = int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
+                    daily_need_n = [base_n for _ in range(D)]
+                    print(6)
+                total_need_n = 0
+                for d in range(D):
+                    need = max(0, daily_need_n[d] - int(fixed_cnt[d][night_idx] or 0))
+                    total_need_n += need
+
+                if total_need_n > 0:
+                    print(7)
+                    target = total_need_n // len(normals)
+                    for n in normals:
+                        tot_nights = sum(
+                            X(n, d, night_idx) for d in range(join[n], leave[n] + 1)
+                        )
+                        dev_pos = m.NewIntVar(0, D, f"night_devP_fb_{n}")
+                        dev_neg = m.NewIntVar(0, D, f"night_devN_fb_{n}")
+                        m.Add(dev_pos - dev_neg == tot_nights - target)
+                        obj.extend(
+                            [
+                                -NIGHT_DEVIATION_PENALTY * dev_pos,
+                                -NIGHT_DEVIATION_PENALTY * dev_neg,
+                            ]
+                        )
+                    print(8)
+    except Exception as exc:
+        print(f"{logger_prefix} [WARN] even_nights penalty 적용 실패: {exc}")
 
     # 연속근무 소프트 상한
     try:
