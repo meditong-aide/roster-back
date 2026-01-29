@@ -120,6 +120,8 @@ class CaseItem(BaseModel):
     shift: str
     year: int | None = None
     month: int | None = None
+    # 사유작성
+    comment: Optional[str] = Field(None)
 
     class Config:
         extra = "allow"

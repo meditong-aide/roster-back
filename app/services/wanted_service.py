@@ -153,13 +153,13 @@ def _compute_weekly_off_days(
 
     인자:
         db: DB 세션
-        nurse_id: 간호사 ID
+        nurse_id: ���호사 ID
         group_id: 그룹 ID (주휴 설정 조회용)
         year: 대상 연도
         month: 대상 월
 
     반환:
-        주휴 요일에 해당하는 day 집합(1~31). 예: {3, 10, 17, 24}
+        주휴 요일에 해당����는 day 집합(1~31). 예: {3, 10, 17, 24}
     """
     nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse_row or not getattr(nurse_row, "weekly_off_enabled", False) or nurse_row.weekly_off_weekday is None:
@@ -304,6 +304,7 @@ def _normalize_case_items(
         date_raw = payload.get("date")
         item_year = payload.get("year")
         item_month = payload.get("month")
+        comment_raw = payload.get("comment") # 사유작성
 
         if not shift_raw:
             ignored.append({"reason": "shift 누락", "item": payload})
@@ -326,7 +327,11 @@ def _normalize_case_items(
             ignored.append({"reason": "날짜 불일치/파싱 실패", "item": payload})
             continue
 
-        normalized.append({"date": parsed_date, "shift": shift})
+        normalized.append({
+            "date": parsed_date, 
+            "shift": shift,
+            "comment": comment_raw # 사유작성
+        })
 
     return normalized, ignored
 
@@ -351,12 +356,17 @@ def _persist_shift_results(
         for day, info in (by_day or {}).items():
             if not isinstance(day, int) or not 1 <= day <= 31:
                 continue
+            
+            print(f"[DEBUG-4] 저장 시도: {year}-{month:02d}-{day:02d} {shift_code} | "
+                  f"request={info.get('request')!r}, comment={info.get('comment')!r}")
 
             score = float(info.get("score", 1.0))
             score = max(0.0, min(10.0, score))  # case 우선순위 반영 위해 범위 확대
 
             request_val = info.get("request", original_request or "AIDE 추천")
             partial_request = normalize_request_text(request_val)
+            
+            comment = info.get("comment", "") # 사유작성
 
             target_date = _ymd(year, month, day)
 
@@ -370,6 +380,7 @@ def _persist_shift_results(
                 existing.shift = shift_code
                 existing.score = score
                 existing.partial_request = partial_request
+                existing.comment = comment # 사유작성
             else:
                 db.add(NurseShiftRequest(
                     nurse_id=nurse_id,
@@ -379,6 +390,7 @@ def _persist_shift_results(
                     shift=shift_code,
                     score=score,
                     partial_request=partial_request,
+                    comment=comment, # 사유작성
                 ))
                 detailed_id += 1
             rows += 1
@@ -522,9 +534,9 @@ def _copy_existing_requests_to_new(
     year: int,
     month: int,
     month_str: str,
-    case_filter: set | None = None,
+    case_exclude: set | None = None,
 ) -> Tuple[int, int]:
-    """기존 데이터를 새 request_id로 복사 (필요 시 case_filter 적용)
+    """기존 데이터를 새 request_id로 복사 (새로 입력된 case는 제외)
 
     Args:
         db: DB 세션
@@ -532,7 +544,7 @@ def _copy_existing_requests_to_new(
         old_request_id: 복사할 원본 request_id
         new_request_id: 복사 대상 request_id
         year, month, month_str: 대상 연월
-        case_filter: {(day, shift), ...} 형태의 set. 이 조합에 해당하는 것만 복사
+        case_exclude: {(day, shift), ...} 형태의 set. 이 조합은 복사에서 제외 (새로 저장할 것이므로)
 
     Returns:
         (복사된 shift 건수, 복사된 pair 건수)
@@ -559,8 +571,9 @@ def _copy_existing_requests_to_new(
         day = old_row.shift_date.day
         shift = old_row.shift
 
-        # case_filter가 있으면 해당 (day, shift) 조합만 복사
-        if case_filter is not None and (day, shift) not in case_filter:
+        # case_exclude가 있으면 해당 (day, shift) 조합은 복사에서 제외 (새로 저장할 것이므로)
+        if case_exclude is not None and (day, shift) in case_exclude:
+            print(f"[복사 제외] {day}일 {shift} → 새로 입력된 case")
             continue
 
         db.merge(NurseShiftRequest(
@@ -571,6 +584,7 @@ def _copy_existing_requests_to_new(
             shift=shift,
             score=old_row.score,
             partial_request=old_row.partial_request,
+            comment=old_row.comment # 사유작성
         ))
         shift_count += 1
         detailed_id_shift += 1
@@ -591,7 +605,7 @@ def _copy_existing_requests_to_new(
             detailed_request_id=detailed_id_pair,
             target_id=old_row.target_id,
             score=old_row.score,
-            partial_request=old_row.partial_request or '기존 데이터에서 로드됨',
+            partial_request=old_row.partial_request or '기존 데이터에��� 로드됨',
         ))
         pair_count += 1
         detailed_id_pair += 1
@@ -676,6 +690,11 @@ async def invoke_and_persist_wanted_service(
         allowed_shift_map=allowed_shift_map,
     )
     has_case = bool(normalized_case)
+    
+    print("[DEBUG-1] normalized_case 전체 내용 : ", normalized_case)
+    for idx, item in enumerate(normalized_case):
+        print(f"[DEBUG-1] case[{idx}]: date={item.get('date')}, shift={item.get('shift')}, "
+              f"comment={item.get('comment')!r} (type={type(item.get('comment'))})")
 
     # graph에 전달할 case 포맷 (isoformat 처리)
     graph_case_payload = [
@@ -728,8 +747,9 @@ async def invoke_and_persist_wanted_service(
     new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
 
     # 과거 데이터 복사 여부 결정
+    # has_case=True면 부분 업데이트이므로 기존 데이터 복사 필요
     copied_shift, copied_pair = 0, 0
-    if not is_full_reset and not is_dummy_request:
+    if not is_full_reset and (not is_dummy_request or has_case):
         latest_wr = db.query(WantedRequest).filter(
             WantedRequest.nurse_id == nurse_id,
             WantedRequest.month == month_str,
@@ -737,13 +757,14 @@ async def invoke_and_persist_wanted_service(
 
         if latest_wr:
             print(f"과거 데이터 복사 시도: old={latest_wr.request_id} → new={new_request_id}")
-            case_filter = {(item["date"].day, item["shift"]) for item in normalized_case} if has_case else None
+            # 새로 입력된 case는 복사에서 제외 (새로 저장할 것이므로)
+            case_exclude = {(item["date"].day, item["shift"]) for item in normalized_case} if has_case else None
             copied_shift, copied_pair = _copy_existing_requests_to_new(
                 db, nurse_id, latest_wr.request_id, new_request_id,
-                req.year, req.month, month_str, case_filter=case_filter
+                req.year, req.month, month_str, case_exclude=case_exclude
             )
     else:
-        print("전체 재작성 또는 더미 request → 과거 데이터 복사 스킵")
+        print("전체 재작성(is_full_reset) → 과거 데이터 복사 스킵")
 
     # shift_map 구성
     shift_map: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -754,11 +775,19 @@ async def invoke_and_persist_wanted_service(
         for item in normalized_case:
             day = item["date"].day
             shift = item["shift"]
+            comment = item.get("comment", "") # 사유작성
+            
             shift_map.setdefault(shift, {})[day] = {
                 "score": 10.0,
                 "request": "사용자 직접 입력 (최우선)",
+                "comment": comment, # 사유작성
                 "shift": shift
             }
+    
+    print("[DEBUG-2] case 처리 완료 후 shift_map : ", shift_map)
+    for shift_code, days in shift_map.items():
+        for day, info in days.items():
+            print(f"[DEBUG-2]   {shift_code} {day}일 → comment={info.get('comment')!r}")
 
     # 2. AIDE 결과 병합 (case 없는 날만 반영)
     for shift_id, days_dict in shift_parsed.items():
@@ -776,7 +805,7 @@ async def invoke_and_persist_wanted_service(
             # case로 지정된 조합이면 스킵
             if any(d == day_int and s == shift_id for d, s in
                    ((item["date"].day, item["shift"]) for item in normalized_case)):
-                print(f"AIDE 스킵 (case 우선): {shift_id} {day_int}일")
+                print(f"AIDE ���킵 (case 우선): {shift_id} {day_int}일")
                 continue
 
             current = shift_map.get(shift_id, {}).get(day_int)
@@ -784,8 +813,10 @@ async def invoke_and_persist_wanted_service(
                 shift_map.setdefault(shift_id, {})[day_int] = {
                     "score": score,
                     "request": req_text,
+                    "comment": req_text, # AIDE 결과는 partial_request와 동일하게
                     "shift": shift_id
                 }
+    print("[DEBUG-3] AIDE 병합 완료 후 shift_map : ", shift_map)
 
     # 주휴 필터링
     weekly_off_days = _compute_weekly_off_days(
@@ -793,8 +824,9 @@ async def invoke_and_persist_wanted_service(
     )
     shift_map = _drop_weekly_off_from_shift_map(shift_map, weekly_off_days)
 
-    # case가 하나라도 있으면 → case 없는 날짜의 기존 shift 기록 삭제
-    if has_case:
+    # 전체 재작성(is_full_reset)일 때만 case 없는 날짜의 기존 shift 기록 삭제
+    # 부분 업데이트(is_dummy_request && has_case)일 때는 기존 데이터 유지
+    if is_full_reset and has_case:
         case_days = {item["date"].day for item in normalized_case}
         start_date = date(req.year, req.month, 1)
         end_date = date(req.year, req.month + 1, 1) if req.month < 12 else date(req.year + 1, 1, 1)
@@ -810,7 +842,7 @@ async def invoke_and_persist_wanted_service(
         ).delete(synchronize_session=False)
 
         if deleted:
-            print(f"[case 제한] case에 없는 날짜의 기존 shift {deleted}건 삭제")
+            print(f"[전체 재작성] case에 없는 날짜의 기존 shift {deleted}건 삭제")
 
     # 주휴일 DB 레코드 삭제
     if weekly_off_days:
