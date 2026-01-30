@@ -1020,13 +1020,13 @@ def get_wanted_adjustment_service(
                 if fe.is_applied:
                     monthly_summary[fe.shift_id] += 1
         else:
-            # NurseShiftRequest에서 조회 (기존 원티드 데이터)
+            # NurseShiftRequest에서 조회 (최종 request_id 기준 제출 여부 확인)
             latest_wr = db.query(WantedRequest).filter(
                 WantedRequest.nurse_id == nurse.nurse_id,
                 WantedRequest.month == month_str,
             ).order_by(WantedRequest.request_id.desc()).first()
 
-            if latest_wr:
+            if latest_wr and latest_wr.is_submitted:
                 shift_requests = db.query(NurseShiftRequest).filter(
                     NurseShiftRequest.nurse_id == nurse.nurse_id,
                     NurseShiftRequest.request_id == latest_wr.request_id,
