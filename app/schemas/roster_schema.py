@@ -291,9 +291,10 @@ class FixedWantedEntryCreate(BaseModel):
     shift_date: date
     shift_id: str
     is_applied: bool = True
-    source_type: str = Field(..., description="'original' | 'added' | 'modified'")
-    original_shift_id: Optional[str] = None
+    source_type: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
+    original_shift_id: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
     reason: Optional[str] = None
+    head_nurse_memo: Optional[str] = None
 
 
 class FixedWantedCreate(BaseModel):
@@ -317,6 +318,7 @@ class FixedWantedEntryResponse(BaseModel):
     source_type: str
     original_shift_id: Optional[str] = None
     reason: Optional[str] = None
+    head_nurse_memo: Optional[str] = None
     created_by: Optional[str] = None
 
     class Config:
@@ -324,7 +326,7 @@ class FixedWantedEntryResponse(BaseModel):
 
 
 class AdjustmentNurse(BaseModel):
-    """원티드 조정판 - 간호사별 데이터"""
+    """원티드 조��판 - 간호사별 데이터"""
     nurse_id: str
     name: str
     entries: List[FixedWantedEntryResponse]

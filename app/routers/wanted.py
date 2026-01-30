@@ -565,6 +565,7 @@ async def save_fixed_wanted(
                     source_type=e.source_type,
                     original_shift_id=e.original_shift_id,
                     reason=e.reason,
+                    head_nurse_memo=e.head_nurse_memo,
                     created_by=e.created_by,
                 ) for e in entries
             ],

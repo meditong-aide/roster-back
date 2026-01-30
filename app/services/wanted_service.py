@@ -91,7 +91,7 @@ def _next_request_id(db: Session, nurse_id: str, month_str: str) -> int:
 
 
 def _persist_wanted_request(db: Session, nurse_id: str, month_str: str, request: str | List[str]) -> int:
-    """wanted_requests 레코드를 저장하고 request_id 를 반환합니다."""
+    """wanted_requests 레코드를 저���하고 request_id 를 반환합니다."""
     request_id = _next_request_id(db, nurse_id, month_str)
     
     # def clean_text(text: Any) -> str:
@@ -1047,6 +1047,7 @@ def get_wanted_adjustment_service(
                     source_type=fe.source_type,
                     original_shift_id=fe.original_shift_id,
                     reason=fe.reason,
+                    head_nurse_memo=fe.head_nurse_memo,
                     created_by=fe.created_by,
                 ))
                 if fe.is_applied:
@@ -1079,6 +1080,7 @@ def get_wanted_adjustment_service(
                         source_type='original',
                         original_shift_id=None,
                         reason=sr.comment if sr.comment else None,
+                        head_nurse_memo=None,
                         created_by=None,
                     ))
                     monthly_summary[sr.shift] += 1
@@ -1106,6 +1108,7 @@ def save_fixed_wanted_service(
     확정 원티드 저장 서비스 (단일 테이블 구조)
     - 기존 데이터가 있으면 삭제 후 재생성
     - 없으면 새로 생성
+    - source_type / original_shift_id를 원본 NurseShiftRequest와 비교하여 자동 감지
 
     인자:
         db: DB 세션
@@ -1116,7 +1119,37 @@ def save_fixed_wanted_service(
     반환:
         List[FixedWantedEntry]: 생성된 엔트리 목록
     """
-    # 기존 데이터 삭제
+    month_str = _yyyymm(req.year, req.month)
+    start_date = date(req.year, req.month, 1)
+    end_date = date(req.year, req.month + 1, 1) if req.month < 12 else date(req.year + 1, 1, 1)
+
+    # ── 원본 NurseShiftRequest 맵 구축: {(nurse_id, shift_date_iso): shift_code} ──
+    nurses_in_group = db.query(Nurse.nurse_id).filter(
+        Nurse.group_id == group_id,
+        Nurse.active == 1,
+    ).all()
+    nurse_ids = [n.nurse_id for n in nurses_in_group]
+
+    original_map: Dict[Tuple[str, str], str] = {}
+    for nid in nurse_ids:
+        latest_wr = db.query(WantedRequest).filter(
+            WantedRequest.nurse_id == nid,
+            WantedRequest.month == month_str,
+        ).order_by(WantedRequest.request_id.desc()).first()
+
+        if latest_wr and latest_wr.is_submitted:
+            shift_requests = db.query(NurseShiftRequest).filter(
+                NurseShiftRequest.nurse_id == nid,
+                NurseShiftRequest.request_id == latest_wr.request_id,
+                NurseShiftRequest.shift_date >= start_date,
+                NurseShiftRequest.shift_date < end_date,
+            ).all()
+            for sr in shift_requests:
+                original_map[(nid, sr.shift_date.isoformat())] = sr.shift
+
+    print(f"원본 맵 구축 완료: {len(original_map)}건")
+
+    # ── 기존 FixedWantedEntry 삭제 ──
     deleted_count = db.query(FixedWantedEntry).filter(
         FixedWantedEntry.group_id == group_id,
         FixedWantedEntry.year == req.year,
@@ -1126,9 +1159,29 @@ def save_fixed_wanted_service(
     if deleted_count > 0:
         print(f"기존 FixedWantedEntry 삭제: {deleted_count}건")
 
-    # 새 엔트리 추가
+    # ── 새 엔트리 추가 (source_type / original_shift_id 자동 감지) ──
     new_entries: List[FixedWantedEntry] = []
     for entry in req.entries:
+        key = (entry.nurse_id, entry.shift_date.isoformat())
+        original_shift = original_map.get(key)
+
+        # source_type 자동 감지 (프론트가 명시적으로 보낸 경우 그 값 우선)
+        if entry.source_type:
+            resolved_source_type = entry.source_type
+            resolved_original_shift_id = entry.original_shift_id
+        elif original_shift is None:
+            # 원본에 없는 날짜/간호사 → 수간호사가 추가
+            resolved_source_type = 'added'
+            resolved_original_shift_id = None
+        elif original_shift != entry.shift_id:
+            # 원본과 근무코드가 다름 → 수간호사가 변경
+            resolved_source_type = 'modified'
+            resolved_original_shift_id = original_shift
+        else:
+            # 원본과 동일 → 원본 그대로
+            resolved_source_type = 'original'
+            resolved_original_shift_id = None
+
         new_entry = FixedWantedEntry(
             group_id=group_id,
             year=req.year,
@@ -1137,9 +1190,10 @@ def save_fixed_wanted_service(
             shift_date=entry.shift_date,
             shift_id=entry.shift_id,
             is_applied=entry.is_applied,
-            source_type=entry.source_type,
-            original_shift_id=entry.original_shift_id,
+            source_type=resolved_source_type,
+            original_shift_id=resolved_original_shift_id,
             reason=entry.reason,
+            head_nurse_memo=entry.head_nurse_memo,
             created_by=nurse_id,
         )
         db.add(new_entry)
