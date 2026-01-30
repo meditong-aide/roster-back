@@ -9,7 +9,6 @@ from schemas.roster_schema import (
     WantedInvokeResponse,
     WantedDeadlineRequest,
     FixedWantedCreate,
-    WantedBoardResponse,
     AdjustmentResponse,
     FixedWantedListResponse,
     FixedWantedEntryResponse,
@@ -25,7 +24,6 @@ from db.models import Nurse, ShiftPreference
 from services.wanted_service import (
     request_wanted_shifts_service,
     invoke_and_persist_wanted_service,
-    get_wanted_board_service,
     get_wanted_adjustment_service,
     save_fixed_wanted_service,
     toggle_fixed_wanted_entry_service,
@@ -479,44 +477,6 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
 
 # ───────────────────────────── Fixed Wanted (확정 원티드) API ─────────────────────────────
 
-@router.get("/board/{year}/{month}", response_model=WantedBoardResponse)
-async def get_wanted_board(
-    year: int,
-    month: int,
-    group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db)
-):
-    """
-    원티드 관리보드 조회 API
-    - 제출 완료된 원티드들을 한번에 확인
-    - 사유가 작성된 내역에 대해 강조 표현
-    """
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
-        raise HTTPException(status_code=403, detail="Permission denied")
-
-    # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
-
-    try:
-        result = get_wanted_board_service(db, target_group_id, year, month)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"원티드 관리보드 조회 실패: {str(e)}")
-
-
 @router.get("/adjustment/{year}/{month}", response_model=AdjustmentResponse)
 async def get_wanted_adjustment(
     year: int,
@@ -651,7 +611,7 @@ async def get_fixed_wanted(
     db: Session = Depends(get_db)
 ):
     """
-    확정 원티드 조회 API (근무표 생성용) - 단일 테이블 구조
+    확정 원티드 조회 API (근무표 생성��) - 단일 테이블 구조
     - is_applied=True인 항목만 반환
     """
     if not current_user:

@@ -31,10 +31,6 @@ from schemas.roster_schema import (
     WantedInvokeRequest,
     FixedWantedCreate,
     FixedWantedEntryCreate,
-    WantedBoardEntry,
-    WantedBoardNurse,
-    WantedBoardSummary,
-    WantedBoardResponse,
     AdjustmentNurse,
     AdjustmentResponse,
     FixedWantedEntryResponse,
@@ -953,98 +949,6 @@ def close_expired_wanted(db: Session) -> int:
 
 
 # ───────────────────────────── Fixed Wanted (확정 원티드) 서비스 ─────────────────────────────
-
-def get_wanted_board_service(
-    db: Session,
-    group_id: str,
-    year: int,
-    month: int,
-) -> WantedBoardResponse:
-    """
-    원티드 관리보드 조회 서비스
-    - 제출된 원티드들을 한번에 확인
-    - 사유가 작성된 내역에 대해 강조 표시
-
-    인자:
-        db: DB 세션
-        group_id: 그룹 ID
-        year: 연도
-        month: 월
-
-    반환:
-        WantedBoardResponse: 간호사별 원티드 목록 + 요약 통계
-    """
-    month_str = _yyyymm(year, month)
-    start_date = date(year, month, 1)
-    end_date = date(year, month + 1, 1) if month < 12 else date(year + 1, 1, 1)
-
-    # 그룹 내 간호사 목록 조회
-    nurses = db.query(Nurse).filter(
-        Nurse.group_id == group_id,
-        Nurse.active == 1
-    ).order_by(Nurse.sequence).all()
-
-    # 각 간호사별 최신 WantedRequest 조회
-    nurse_data_list: List[WantedBoardNurse] = []
-    with_reason_count = 0
-    submitted_count = 0
-
-    for nurse in nurses:
-        # 최신 request_id 조회
-        latest_wr = db.query(WantedRequest).filter(
-            WantedRequest.nurse_id == nurse.nurse_id,
-            WantedRequest.month == month_str,
-        ).order_by(WantedRequest.request_id.desc()).first()
-
-        entries: List[WantedBoardEntry] = []
-        is_submitted = False
-
-        if latest_wr:
-            is_submitted = bool(latest_wr.is_submitted)
-            if is_submitted:
-                submitted_count += 1
-
-            # NurseShiftRequest 조회
-            shift_requests = db.query(NurseShiftRequest).filter(
-                NurseShiftRequest.nurse_id == nurse.nurse_id,
-                NurseShiftRequest.request_id == latest_wr.request_id,
-                NurseShiftRequest.shift_date >= start_date,
-                NurseShiftRequest.shift_date < end_date,
-            ).all()
-
-            for sr in shift_requests:
-                has_reason = bool(sr.partial_request and sr.partial_request.strip()
-                                  and sr.partial_request not in ['기존 데이터 업데이트', 'AIDE 추천', '기존 데이터에서 로드됨'])
-                if has_reason:
-                    with_reason_count += 1
-
-                entries.append(WantedBoardEntry(
-                    date=sr.shift_date,
-                    shift=sr.shift,
-                    shift_id=sr.shift,
-                    has_reason=has_reason,
-                    reason=sr.partial_request if has_reason else None,
-                    score=float(sr.score) if sr.score else None,
-                ))
-
-        nurse_data_list.append(WantedBoardNurse(
-            nurse_id=nurse.nurse_id,
-            name=nurse.name,
-            is_submitted=is_submitted,
-            entries=entries,
-        ))
-
-    summary = WantedBoardSummary(
-        total_nurses=len(nurses),
-        submitted_count=submitted_count,
-        with_reason_count=with_reason_count,
-    )
-
-    return WantedBoardResponse(
-        nurses=nurse_data_list,
-        summary=summary,
-    )
-
 
 def get_wanted_adjustment_service(
     db: Session,

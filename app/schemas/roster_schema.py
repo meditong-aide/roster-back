@@ -301,39 +301,9 @@ class FixedWantedCreate(BaseModel):
     entries: List[FixedWantedEntryCreate]
 
 
-class WantedBoardEntry(BaseModel):
-    """원티드 관리보드 - 개별 항목"""
-    date: date
-    shift: str
-    shift_id: str
-    has_reason: bool
-    reason: Optional[str] = None
-    score: Optional[float] = None
-
-
-class WantedBoardNurse(BaseModel):
-    """원티드 관리보드 - 간호사별 데이터"""
-    nurse_id: str
-    name: str
-    is_submitted: bool
-    entries: List[WantedBoardEntry]
-
-
-class WantedBoardSummary(BaseModel):
-    """원티드 관리보드 - 요약 통계"""
-    total_nurses: int
-    submitted_count: int
-    with_reason_count: int
-
-
-class WantedBoardResponse(BaseModel):
-    """원티드 관리보드 조회 응답"""
-    nurses: List[WantedBoardNurse]
-    summary: WantedBoardSummary
-
 
 class FixedWantedEntryResponse(BaseModel):
-    """확정 원티드 항목 응답"""
+    """확정 원티드 항목 응��"""
     id: int
     group_id: str
     year: int
