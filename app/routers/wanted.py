@@ -527,20 +527,19 @@ async def get_wanted_config_endpoint(
 
 @router.post("/config")
 async def upsert_wanted_config_endpoint(
-    config_data: WantedConfigCreate,
+    config_data: List[WantedConfigCreate],
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용, 여러 일자 한번에 처리)
 
-    Body:
-        - configs: 설정 리스트
-            - year: 연도
-            - month: 월
-            - target_date: 특정 일자 (YYYY-MM-DD)
-            - shift_type: 근무 타입 (휴무/휴가)
-            - max_requests: 최대 요청 개수
+    Body: List[WantedConfigCreate]
+        - year: 연도
+        - month: 월
+        - target_date: 특정 일자 (YYYY-MM-DD)
+        - shift_type: 근무 타입 (휴무/휴가)
+        - max_requests: 최대 요청 개수
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -563,7 +562,7 @@ async def upsert_wanted_config_endpoint(
         target_group_id = g.group_id
 
     try:
-        configs_list = [c.model_dump(exclude_unset=True) for c in config_data.configs]
+        configs_list = [c.model_dump(exclude_unset=True) for c in config_data]
         results = upsert_wanted_config(db, target_group_id, configs_list)
         return [WantedConfigSchema.model_validate(r) for r in results]
     except ValueError as e:

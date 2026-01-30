@@ -146,9 +146,9 @@ class WantedConfigBase(BaseModel):
     target_date: Optional[date] = None
     shift_type: Optional[str] = None  # 근무 타입 (휴무/휴가)
 
-class WantedConfigCreate(BaseModel):
-    """원티드 설정 생성/수정 요청 스키마 (여러 일자 한번에 처리)"""
-    configs: List[WantedConfigBase]
+class WantedConfigCreate(WantedConfigBase):
+    """원티드 설정 생성/수정 요청 스키마"""
+    pass
 
 class WantedConfig(WantedConfigBase):
     """원티드 설정 조회 응답 스키마"""
