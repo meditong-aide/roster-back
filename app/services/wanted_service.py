@@ -14,6 +14,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from db.models import (
+    FixedWantedEntry,
     Group,
     Nurse,
     NursePairRequest,
@@ -25,7 +26,15 @@ from db.models import (
     WeeklyOffSetting,
 )
 from schemas.auth_schema import User as UserSchema
-from schemas.roster_schema import WantedDeadlineRequest, WantedInvokeRequest
+from schemas.roster_schema import (
+    WantedDeadlineRequest,
+    WantedInvokeRequest,
+    FixedWantedCreate,
+    FixedWantedEntryCreate,
+    AdjustmentNurse,
+    AdjustmentResponse,
+    FixedWantedEntryResponse,
+)
 from services.graph_service import graph_service
 from services.weekly_off_service import (
     calc_weekly_off_weekday_by_month,
@@ -969,3 +978,310 @@ def close_expired_wanted(db: Session) -> int:
         db.commit()
         print(f"Wanted 자동 마감 완료: {updated_count}건")
     return updated_count
+
+
+# ───────────────────────────── Fixed Wanted (확정 원티드) 서비스 ─────────────────────────────
+
+def get_wanted_adjustment_service(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+) -> AdjustmentResponse:
+    """
+    원티드 조정판 데이터 조회 서비스
+    - 기존 근무표 만들기와 동일한 구성
+    - 각 간호사의 원티드 제출한 코드 내역들의 한달치 총 합 실시간 노출
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+
+    반환:
+        AdjustmentResponse: 간호사별 원티드 + 월간 집계 + 확정 원티드 존재 여부
+    """
+    month_str = _yyyymm(year, month)
+    start_date = date(year, month, 1)
+    end_date = date(year, month + 1, 1) if month < 12 else date(year + 1, 1, 1)
+
+    # 기존 FixedWantedEntry 조회 (단일 테이블)
+    fixed_entries_exist = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
+    ).first() is not None
+
+    # 그룹 내 간호사 목록
+    nurses = db.query(Nurse).filter(
+        Nurse.group_id == group_id,
+        Nurse.active == 1
+    ).order_by(Nurse.sequence).all()
+
+    nurse_data_list: List[AdjustmentNurse] = []
+
+    for nurse in nurses:
+        entries: List[FixedWantedEntryResponse] = []
+        monthly_summary: Dict[str, int] = defaultdict(int)
+
+        if fixed_entries_exist:
+            # FixedWantedEntry에서 조회 (단일 테이블)
+            fixed_entries = db.query(FixedWantedEntry).filter(
+                FixedWantedEntry.group_id == group_id,
+                FixedWantedEntry.year == year,
+                FixedWantedEntry.month == month,
+                FixedWantedEntry.nurse_id == nurse.nurse_id,
+            ).all()
+
+            for fe in fixed_entries:
+                entries.append(FixedWantedEntryResponse(
+                    id=fe.id,
+                    group_id=fe.group_id,
+                    year=fe.year,
+                    month=fe.month,
+                    nurse_id=fe.nurse_id,
+                    shift_date=fe.shift_date,
+                    shift_id=fe.shift_id,
+                    is_applied=fe.is_applied,
+                    source_type=fe.source_type,
+                    original_shift_id=fe.original_shift_id,
+                    reason=fe.reason,
+                    created_by=fe.created_by,
+                ))
+                if fe.is_applied:
+                    monthly_summary[fe.shift_id] += 1
+        else:
+            # NurseShiftRequest에서 조회 (최종 request_id 기준 제출 여부 확인)
+            latest_wr = db.query(WantedRequest).filter(
+                WantedRequest.nurse_id == nurse.nurse_id,
+                WantedRequest.month == month_str,
+            ).order_by(WantedRequest.request_id.desc()).first()
+
+            if latest_wr and latest_wr.is_submitted:
+                shift_requests = db.query(NurseShiftRequest).filter(
+                    NurseShiftRequest.nurse_id == nurse.nurse_id,
+                    NurseShiftRequest.request_id == latest_wr.request_id,
+                    NurseShiftRequest.shift_date >= start_date,
+                    NurseShiftRequest.shift_date < end_date,
+                ).all()
+
+                for idx, sr in enumerate(shift_requests):
+                    entries.append(FixedWantedEntryResponse(
+                        id=idx,  # 임시 ID (아직 FixedWantedEntry에 저장 전)
+                        group_id=group_id,
+                        year=year,
+                        month=month,
+                        nurse_id=sr.nurse_id,
+                        shift_date=sr.shift_date,
+                        shift_id=sr.shift,
+                        is_applied=True,
+                        source_type='original',
+                        original_shift_id=None,
+                        reason=sr.partial_request if sr.partial_request and sr.partial_request not in ['기존 데이터 업데이트', 'AIDE 추천'] else None,
+                        created_by=None,
+                    ))
+                    monthly_summary[sr.shift] += 1
+
+        nurse_data_list.append(AdjustmentNurse(
+            nurse_id=nurse.nurse_id,
+            name=nurse.name,
+            entries=entries,
+            monthly_summary=dict(monthly_summary),
+        ))
+
+    return AdjustmentResponse(
+        nurses=nurse_data_list,
+        has_fixed_wanted=fixed_entries_exist,
+    )
+
+
+def save_fixed_wanted_service(
+    db: Session,
+    group_id: str,
+    nurse_id: str,
+    req: FixedWantedCreate,
+) -> List[FixedWantedEntry]:
+    """
+    확정 원티드 저장 서비스 (단일 테이블 구조)
+    - 기존 데이터가 있으면 삭제 후 재생성
+    - 없으면 새로 생성
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        nurse_id: 생성자 간호사 ID
+        req: FixedWantedCreate 요청
+
+    반환:
+        List[FixedWantedEntry]: 생성된 엔트리 목록
+    """
+    # 기존 데이터 삭제
+    deleted_count = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == req.year,
+        FixedWantedEntry.month == req.month,
+    ).delete()
+
+    if deleted_count > 0:
+        print(f"기존 FixedWantedEntry 삭제: {deleted_count}건")
+
+    # 새 엔트리 추가
+    new_entries: List[FixedWantedEntry] = []
+    for entry in req.entries:
+        new_entry = FixedWantedEntry(
+            group_id=group_id,
+            year=req.year,
+            month=req.month,
+            nurse_id=entry.nurse_id,
+            shift_date=entry.shift_date,
+            shift_id=entry.shift_id,
+            is_applied=entry.is_applied,
+            source_type=entry.source_type,
+            original_shift_id=entry.original_shift_id,
+            reason=entry.reason,
+            created_by=nurse_id,
+        )
+        db.add(new_entry)
+        new_entries.append(new_entry)
+
+    db.commit()
+
+    # ID 확보를 위해 refresh
+    for entry in new_entries:
+        db.refresh(entry)
+
+    print(f"FixedWantedEntry 저장 완료: group={group_id}, {req.year}-{req.month}, entries={len(new_entries)}건")
+
+    return new_entries
+
+
+def toggle_fixed_wanted_entry_service(
+    db: Session,
+    entry_id: int,
+) -> FixedWantedEntry:
+    """
+    확정 원티드 개별 항목 적용/미적용 토글 서비스
+
+    인자:
+        db: DB 세션
+        entry_id: FixedWantedEntry ID
+
+    반환:
+        FixedWantedEntry: 토글된 엔트리 객체
+
+    예외:
+        ValueError: 엔트리를 찾을 수 없는 경우
+    """
+    entry = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.id == entry_id
+    ).first()
+
+    if not entry:
+        raise ValueError(f"Entry not found: {entry_id}")
+
+    entry.is_applied = not entry.is_applied
+    db.commit()
+    db.refresh(entry)
+
+    print(f"FixedWantedEntry 토글: id={entry_id}, is_applied={entry.is_applied}")
+    return entry
+
+
+def reset_fixed_wanted_service(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+) -> AdjustmentResponse:
+    """
+    확정 원티드 재설정 서비스
+    - FixedWantedEntry 해당 group/year/month 데이터 전체 삭제
+    - 원본 WantedRequest + NurseShiftRequest 기반 데이터를 AdjustmentResponse로 반환
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+
+    반환:
+        AdjustmentResponse: 원본 원티드 데이터 기반 조정판 응답 (has_fixed_wanted=False)
+    """
+    deleted_count = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
+    ).delete()
+    db.commit()
+
+    print(f"FixedWantedEntry 재설정: group={group_id}, {year}-{month:02d}, 삭제={deleted_count}건")
+
+    return get_wanted_adjustment_service(db, group_id, year, month)
+
+
+def get_fixed_wanted_for_roster_service(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+) -> List[Dict[str, Any]]:
+    """
+    근무표 생성용 확정 원티드 조회 서비스 (단일 테이블 구조)
+    - is_applied=True인 항목만 반환
+    - NurseShiftRequest와 호환되는 형식으로 반환
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+
+    반환:
+        List[Dict]: 확정된 원티드 목록 (근무표 생성에 사용할 형식)
+        [{"nurse_id": str, "shift_date": date, "shift": str, "score": float, "reason": str}, ...]
+    """
+    entries = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
+        FixedWantedEntry.is_applied == True,
+    ).all()
+
+    result = []
+    for entry in entries:
+        result.append({
+            "nurse_id": entry.nurse_id,
+            "shift_date": entry.shift_date,
+            "shift": entry.shift_id,
+            "score": 10.0,  # 확정 원티드는 최고 우선순위
+            "reason": entry.reason,
+        })
+
+    print(f"FixedWantedEntry 조회 (근무표 생성용): group={group_id}, {year}-{month}, entries={len(result)}건")
+    return result
+
+
+def get_fixed_wanted_entries_service(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+) -> List[FixedWantedEntry]:
+    """
+    확정 원티드 엔트리 목록 조회 서비스 (단일 테이블 구조)
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+
+    반환:
+        FixedWantedEntry 목록
+    """
+    return db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
+    ).all()
