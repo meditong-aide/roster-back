@@ -154,13 +154,13 @@ def _compute_weekly_off_days(
 
     인자:
         db: DB 세션
-        nurse_id: ���호사 ID
+        nurse_id: 간호사 ID
         group_id: 그룹 ID (주휴 설정 조회용)
         year: 대상 연도
         month: 대상 월
 
     반환:
-        주휴 요일에 해당����는 day 집합(1~31). 예: {3, 10, 17, 24}
+        주휴 요일에 해당하는 day 집합(1~31). 예: {3, 10, 17, 24}
     """
     nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse_row or not getattr(nurse_row, "weekly_off_enabled", False) or nurse_row.weekly_off_weekday is None:
@@ -606,7 +606,7 @@ def _copy_existing_requests_to_new(
             detailed_request_id=detailed_id_pair,
             target_id=old_row.target_id,
             score=old_row.score,
-            partial_request=old_row.partial_request or '기존 데이터에��� 로드됨',
+            partial_request=old_row.partial_request or '기존 데이터에서 로드됨',
         ))
         pair_count += 1
         detailed_id_pair += 1
@@ -908,7 +908,7 @@ async def invoke_and_persist_wanted_service(
             # case로 지정된 조합이면 스킵
             if any(d == day_int and s == shift_id for d, s in
                    ((item["date"].day, item["shift"]) for item in normalized_case)):
-                print(f"AIDE ���킵 (case 우선): {shift_id} {day_int}일")
+                print(f"AIDE 스킵 (case 우선): {shift_id} {day_int}일")
                 continue
 
             current = shift_map.get(shift_id, {}).get(day_int)
