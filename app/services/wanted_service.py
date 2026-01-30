@@ -1093,65 +1093,73 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
     return query.all()
 
 
-def upsert_wanted_config(db: Session, group_id: str, config_data: dict):
+def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
     """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용)
 
     - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
     - 이 함수는 DAILY_LIMIT만 처리
+    - 여러 일자에 대한 설정을 한번에 처리
 
     인자:
         db: DB 세션
         group_id: 그룹 ID
-        config_data: 설정 데이터
-            - year: 연도
-            - month: 월
+        configs_data: 설정 데이터 리스트. 각 항목:
             - target_date: 특정 일자 (YYYY-MM-DD)
             - shift_type: 근무 타입 (휴무/휴가)
             - max_requests: 최대 요청 개수
+            - year: 연도 (선택)
+            - month: 월 (선택)
 
     반환:
-        WantedConfig
+        List[WantedConfig]
     """
-    target_date_str = config_data.get('target_date')
-    if not target_date_str:
-        raise ValueError("target_date가 필수입니다.")
+    if not configs_data:
+        raise ValueError("설정 목록이 비어있습니다.")
 
-    # 문자열을 date로 변환
-    if isinstance(target_date_str, str):
-        target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
-    else:
-        target_date = target_date_str
+    results = []
+    for config_data in configs_data:
+        target_date_str = config_data.get('target_date')
+        if not target_date_str:
+            raise ValueError("각 설정에 target_date가 필수입니다.")
 
-    year = config_data.get('year', target_date.year)
-    month = config_data.get('month', target_date.month)
-    shift_type = config_data.get('shift_type')
+        # 문자열을 date로 변환
+        if isinstance(target_date_str, str):
+            target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+        else:
+            target_date = target_date_str
 
-    existing = db.query(WantedConfig).filter(
-        WantedConfig.group_id == group_id,
-        WantedConfig.target_date == target_date,
-        WantedConfig.shift_type == shift_type
-    ).first()
+        year = config_data.get('year', target_date.year)
+        month = config_data.get('month', target_date.month)
+        shift_type = config_data.get('shift_type')
 
-    if existing:
-        existing.max_requests = config_data.get('max_requests', 0)
-        existing.year = year
-        existing.month = month
-        config = existing
-    else:
-        config = WantedConfig(
-            group_id=group_id,
-            year=year,
-            month=month,
-            target_date=target_date,
-            shift_type=shift_type,
-            max_requests=config_data.get('max_requests', 0)
-        )
-        db.add(config)
+        existing = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.target_date == target_date,
+            WantedConfig.shift_type == shift_type
+        ).first()
+
+        if existing:
+            existing.max_requests = config_data.get('max_requests', 0)
+            existing.year = year
+            existing.month = month
+            results.append(existing)
+        else:
+            config = WantedConfig(
+                group_id=group_id,
+                year=year,
+                month=month,
+                target_date=target_date,
+                shift_type=shift_type,
+                max_requests=config_data.get('max_requests', 0)
+            )
+            db.add(config)
+            results.append(config)
 
     db.commit()
-    db.refresh(config)
-    print(f"[DAILY_LIMIT] 설정 저장 완료: group_id={group_id}, date={target_date}")
-    return config
+    for r in results:
+        db.refresh(r)
+    print(f"[DAILY_LIMIT] 설정 저장 완료: group_id={group_id}, count={len(results)}")
+    return results
 
 
 def delete_wanted_config(db: Session, group_id: str, filters: dict = None) -> int:
