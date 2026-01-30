@@ -749,7 +749,7 @@ async def invoke_and_persist_wanted_service(
             shift_parsed = _parse_shift_results(response)
             pref_parsed = _parse_preferences(response, req.schema)
         except Exception as e:
-            print(f"그래프 호출 실패: {e}")
+            print(f"그래프 호출 ��패: {e}")
             traceback.print_exc()
 
     # 새 request_id 생성
@@ -1078,7 +1078,7 @@ def get_wanted_adjustment_service(
                         is_applied=True,
                         source_type='original',
                         original_shift_id=None,
-                        reason=sr.partial_request if sr.partial_request and sr.partial_request not in ['기존 데이터 업데이트', 'AIDE 추천'] else None,
+                        reason=sr.comment if sr.comment else None,
                         created_by=None,
                     ))
                     monthly_summary[sr.shift] += 1
