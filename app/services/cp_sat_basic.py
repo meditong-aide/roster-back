@@ -92,6 +92,135 @@ def _cp_sat_status_to_text(status: int) -> str:
     return mapping.get(status, f"UNKNOWN({status})")
 
 
+def _log_fixed_cells_off_trace(
+    *,
+    logger_prefix: str,
+    nurses: list[Nurse],
+    fixed_cells: list[dict],
+    fixed_original_shift_map: dict[tuple[int, int], str],
+    off_exception_cells: set[tuple[int, int]],
+    off_exception_vacation_cells: set[tuple[int, int]],
+    shift_id_to_type: dict[str, str],
+    watch_db_ids: set[str],
+) -> None:
+    """고정 셀에서 휴무류가 어떻게 정규화/예외 처리되는지 추적 로그를 출력한다.
+
+    이 프로젝트는 휴가/공가/주휴/주말강제OFF 등 '휴무류'를 모델 내부에서는 모두 `O`로 취급한다.
+    다만 결과 변환 시에는 고정 셀의 원본 shift_id(`휴`, `생`, `법` 등)를 복원할 수 있어,
+    화면에서 보이는 문자 `O` 개수와 "모델이 카운트한 OFF" 개수가 달라질 수 있다.
+
+    Args:
+        logger_prefix: 로그 접두사
+        nurses: 간호사 리스트(인덱스 → db_id/name 매핑 용도)
+        fixed_cells: 입력 고정 셀 리스트(정규화 이후 값이 들어있을 수 있음)
+        fixed_original_shift_map: (nurse_index, day_index) → 원본 shift_id
+        off_exception_cells: 휴무류 예외 셀(OFF 상한/특수 처리 제외용)
+        off_exception_vacation_cells: 휴가/공가 셀(별도 추적용)
+        shift_id_to_type: shift_id(대문자) → type(예: '휴가', '공가', '근무' 등)
+        watch_db_ids: 추적 대상 nurse.db_id 집합
+    """
+    try:
+        idx_to_dbid = {i: str(n.db_id) for i, n in enumerate(nurses)}
+        idx_to_name = {i: str(getattr(n, "name", "?")) for i, n in enumerate(nurses)}
+        rows: dict[str, list[dict]] = {}
+
+        for c in fixed_cells or []:
+            n_idx = c.get("nurse_index")
+            d_idx = c.get("day_index")
+            if n_idx is None or d_idx is None:
+                continue
+            db_id = idx_to_dbid.get(int(n_idx))
+            if not db_id or db_id not in watch_db_ids:
+                continue
+            original = fixed_original_shift_map.get((int(n_idx), int(d_idx)))
+            normalized = str(c.get("shift") or "").strip()
+            shift_type = str(c.get("shift_type") or "").strip()
+            if not shift_type:
+                probe = original or normalized
+                shift_type = shift_id_to_type.get(str(probe).strip().upper(), "")
+            rows.setdefault(db_id, []).append(
+                {
+                    "day": int(d_idx) + 1,
+                    "name": idx_to_name.get(int(n_idx), "?"),
+                    "original_shift": original,
+                    "normalized_shift": normalized,
+                    "shift_type": shift_type,
+                    "off_exception": (int(n_idx), int(d_idx)) in off_exception_cells,
+                    "vac_exception": (int(n_idx), int(d_idx)) in off_exception_vacation_cells,
+                }
+            )
+
+        for db_id, items in rows.items():
+            items_sorted = sorted(items, key=lambda x: x["day"])
+            print(f"{logger_prefix} [WatchFixedCells] nurse_id={db_id} rows={items_sorted}")
+    except Exception as exc:
+        print(f"{logger_prefix} [WatchFixedCells] 로그 실패: {exc}")
+
+
+def _log_off_count_trace(
+    *,
+    logger_prefix: str,
+    nurse: Nurse,
+    schedule: list[str],
+    shift_id_to_main: dict[str, str],
+    shift_id_to_type: dict[str, str],
+    weekly_off_days_0based: list[int] | None = None,
+) -> None:
+    """최종 결과에서 '보이는 O'와 '모델 기준 OFF' 차이를 추적 출력한다.
+
+    - 보이는 O: 결과 배열에서 값이 'O'/'OFF'인 셀 개수
+    - 모델 기준 OFF: 해당 shift_id를 정규화했을 때 메인 코드가 'O'로 판정되는 셀 개수
+      (예: '휴'가 휴가로 정의되어 있으면 정규화 결과는 'O'가 되어 OFF로 카운트됨)
+
+    Args:
+        logger_prefix: 로그 접두사
+        nurse: 대상 간호사
+        schedule: DB 저장용 shift_id 리스트(최종 결과)
+        shift_id_to_main: shift_id → 메인 코드 매핑(build_shift_normalizer 결과)
+        shift_id_to_type: shift_id → type 매핑(예: '휴가', '공가')
+        weekly_off_days_0based: 주휴(0-based day index) 리스트
+    """
+    weekly_set = set(int(x) for x in (weekly_off_days_0based or []))
+    literal_o_cnt = 0
+    off_like_cnt = 0
+    vacation_cnt = 0
+    off_like_but_not_o: list[dict] = []
+
+    for day1, shift_id in enumerate(schedule, start=1):
+        sid = str(shift_id or "").strip()
+        sid_upper = sid.upper()
+        is_literal_o = sid_upper in {"O", "OFF"}
+        main = _normalize_shift_code(sid, shift_id_to_main)
+        is_off_like = main == "O"
+        stype = shift_id_to_type.get(sid_upper, "")
+        is_vac = stype in {"휴가", "공가"}
+
+        if is_literal_o:
+            literal_o_cnt += 1
+        if is_off_like:
+            off_like_cnt += 1
+        if is_vac:
+            vacation_cnt += 1
+        if is_off_like and not is_literal_o:
+            off_like_but_not_o.append(
+                {
+                    "day": day1,
+                    "shift": sid,
+                    "type": stype,
+                    "weekly_off": (day1 - 1) in weekly_set,
+                }
+            )
+
+    print(
+        f"{logger_prefix} [WatchOffCount] nurse_id={getattr(nurse, 'db_id', '?')}, "
+        f"name={getattr(nurse, 'name', '?')}, "
+        f"visible_O={literal_o_cnt}, off_like_total={off_like_cnt}, vacation={vacation_cnt}, "
+        f"weekly_off={len(weekly_set)}"
+    )
+    if off_like_but_not_o:
+        print(f"{logger_prefix} [WatchOffCount][OffLikeButNotO] {off_like_but_not_o}")
+
+
 def _log_weekend_off_enforcement_once(
     rs: RosterSystem,
     join: list[int],
@@ -201,6 +330,8 @@ class CPSATBasicEngine:
         two_offs_per_week = config_data.get('two_offs_per_week', True)
         sequential_offs = config_data.get('sequential_offs', True)
         even_nights = config_data.get('even_nights', True)
+        enforce_clustered_offs = bool(config_data.get("enforce_clustered_offs", False))
+        isolated_off_slack_penalty = int(config_data.get("isolated_off_slack_penalty", 300000) or 0)
         off_placement_mode = int(config_data.get('off_placement_mode', 0) or 0)
         
         # 가중치 설정 - Night Keep은 E와 차별화
@@ -280,8 +411,11 @@ class CPSATBasicEngine:
             sequential_offs=sequential_offs,
             even_nights=even_nights,
             nod_noe=config_data.get('nod_noe', True),
-            global_monthly_off_days=2,
-            standard_personal_off_days=config_data.get('off_days', 8) - 2 if config_data.get('off_days', 8) > 2 else 0,
+            enforce_clustered_offs=enforce_clustered_offs,
+            isolated_off_slack_penalty=isolated_off_slack_penalty,
+            global_monthly_off_days=0,
+            standard_personal_off_days=config_data.get('off_days', 8),
+            # standard_personal_off_days=,
             # 수정
             shift_requirement_priority = max(0.05, config_data.get('shift_priority', 0.7)),
             shift_preference_weights=shift_weights,
@@ -401,9 +535,16 @@ class CPSATBasicEngine:
                     except:
                         return None
             return None
-        sorted_rows = sorted(nurses_data, key=lambda r: (r.get('sequence', 0), -int(r.get('experience', 0) or 0), str(r.get('nurse_id'))))
-        nurses = []
-        for i, nurse_data in enumerate(sorted_rows):
+        sorted_rows = sorted(
+            nurses_data,
+            key=lambda r: (
+                r.get('sequence', 0),
+                -int(r.get('experience', 0) or 0),
+                str(r.get('nurse_id')),
+            ),
+        )
+        nurses: list[Nurse] = []
+        for nurse_data in sorted_rows:
             active_raw = nurse_data.get("active", 1)
             try:
                 active_flag = int(active_raw)
@@ -415,9 +556,10 @@ class CPSATBasicEngine:
                     f"{nurse_data.get('name', '?')}({nurse_data.get('nurse_id', '?')}) active={active_raw}"
                 )
                 continue
+            nurse_idx = len(nurses)
             # DB 모델을 Nurse 객체로 변환
             nurse_dict = {
-                'id': i,  # 엔진에서 사용할 인덱스 ID
+                'id': nurse_idx,  # 엔진에서 사용할 인덱스 ID
                 'db_id': nurse_data['nurse_id'],  # DB ID
                 'name': nurse_data['name'],
                 'experience_years': nurse_data.get('experience', 0),
@@ -580,6 +722,17 @@ class CPSATBasicEngine:
             if sid and stype:
                 shift_id_to_type[sid] = stype
         fixed_original_shift_map: dict[tuple[int, int], str] = {}
+        watch_db_ids: set[str] = {"442934"}  # 김지우 기본 추적(필요 시 config_data로 확장)
+        try:
+            extra_watch = (
+                config_data.get("debug_watch_nurse_ids", [])
+                if isinstance(config_data, dict)
+                else []
+            )
+            if isinstance(extra_watch, list):
+                watch_db_ids |= {str(x) for x in extra_watch if str(x).strip()}
+        except Exception:
+            pass
         # 2. 대상 월 설정
         target_month = date(year, month, 1)
         # 3. 간호사 객체 생성
@@ -630,6 +783,8 @@ class CPSATBasicEngine:
                         off_ex_vac.add((n_idx, d_idx))
                 setattr(config, "off_exception_cells", sorted(list(off_ex)))
                 setattr(config, "off_exception_vacation_cells", sorted(list(off_ex_vac)))
+                # print('off_ex!!!!!!', off_ex)
+                # print('off_ex_vac!!!!!!', off_ex_vac)
             except Exception as e:
                 print('[line 634] error!!!!!!!', e)
                 pass
@@ -656,6 +811,23 @@ class CPSATBasicEngine:
                         print('[line 655] error!!!!!!!', e)
                         pass
                 c['shift'] = normalized_shift
+            # 디버그: 고정 셀(휴가/공가/주휴/기타 휴무류) 정규화/예외 처리 확인
+            try:
+                off_ex = set(getattr(config, "off_exception_cells", []) or [])
+                off_ex_vac = set(getattr(config, "off_exception_vacation_cells", []) or [])
+                if watch_db_ids:
+                    _log_fixed_cells_off_trace(
+                        logger_prefix=self.logger_prefix,
+                        nurses=nurses,
+                        fixed_cells=fixed_cells,
+                        fixed_original_shift_map=fixed_original_shift_map,
+                        off_exception_cells=off_ex,
+                        off_exception_vacation_cells=off_ex_vac,
+                        shift_id_to_type=shift_id_to_type,
+                        watch_db_ids=watch_db_ids,
+                    )
+            except Exception:
+                pass
             # # 디버그: 특정 간호사 고정 셀/휴가 인식 확인
             # try:
             #     watch_ids = {"442918", "442924"}  # 박지은, 임윤아
@@ -692,7 +864,17 @@ class CPSATBasicEngine:
             # ── 경계 제약(강제 OFF/금지) 병합 ──
             initial_constraints = config_data.get('initial_constraints') or {}
             allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
-            rs_dbid_to_idx = {n.db_id: n.id for n in nurses}
+            # ID 매핑을 문자열 기반으로 통일(입력 dict 키가 str이므로 불일치 방지)
+            rs_dbid_to_idx = {str(n.db_id): n.id for n in nurses}
+            # 보조: int 키로도 접근 가능하도록 추가
+            rs_dbid_to_idx.update({n.db_id: n.id for n in nurses})
+            def _get_nurse_idx(dbid):
+                if dbid in rs_dbid_to_idx:
+                    return rs_dbid_to_idx[dbid]
+                try:
+                    return rs_dbid_to_idx.get(str(dbid))
+                except Exception:
+                    return None
             weekly_off_map_raw = config_data.get("weekly_off_map") or {}
             # weekly_off_settings의 activate가 0이면 weekly_off_map이 비어있음
             # 이 경우 off_placement_mode도 효력이 없도록 설정
@@ -722,11 +904,32 @@ class CPSATBasicEngine:
             prev_last_off_raw = config_data.get("prev_month_last_is_off") or {}
             prev_last_off_by_idx: dict[int, bool] = {}
             for dbid, flag in (prev_last_off_raw or {}).items():
-                n_idx = rs_dbid_to_idx.get(str(dbid))
+                n_idx = _get_nurse_idx(dbid)
                 if n_idx is None:
                     continue
                 prev_last_off_by_idx[n_idx] = bool(flag)
             roster_system.prev_month_last_is_off = prev_last_off_by_idx
+            # 꼬리 연속근무 보정용 OFF 윈도우 (월초 0..K-w 구간 OFF≥1)
+            off_window_raw = config_data.get("off_window_constraints") or {}
+            off_window_by_idx: dict[int, list[tuple[int, int]]] = {}
+            for dbid, win_list in (off_window_raw or {}).items():
+                n_idx = _get_nurse_idx(dbid)
+                if n_idx is None:
+                    continue
+                normalized: list[tuple[int, int]] = []
+                for win in (win_list or []):
+                    if not isinstance(win, (list, tuple)) or len(win) < 2:
+                        continue
+                    try:
+                        start = int(win[0]); end = int(win[1])
+                    except Exception:
+                        continue
+                    if start < 0 or end < start:
+                        continue
+                    normalized.append((start, end))
+                if normalized:
+                    off_window_by_idx[n_idx] = normalized
+            roster_system.off_window_constraints = off_window_by_idx
             # forced_off: { nurse_db_id: [day_idx,...] }
             forced_off = initial_constraints.get('forced_off') or {}
             # print('forced_off!!!!!', forced_off)
@@ -844,7 +1047,12 @@ class CPSATBasicEngine:
             success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
-                self._optimize_fallback_lex_hard_first(roster_system, time_limit_seconds=time_limit_seconds, grouped=grouped)
+                self._optimize_fallback_lex_hard_first(
+                    roster_system,
+                    time_limit_seconds=time_limit_seconds,
+                    grouped=grouped,
+                    shift_type_map=shift_id_to_type,
+                )
         # 9-1. 불필요 OFF 정리 (N-only 제외)
         try:
             with Timer("불필요 OFF 정리"):
@@ -952,6 +1160,29 @@ class CPSATBasicEngine:
             nurses_data=nurses_data,
             shift_definitions=shift_defs,
         )
+        # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
+        try:
+            weekly_off_by_idx = (
+                getattr(roster_system, "weekly_off_by_idx", {})
+                if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
+                else {}
+            )
+            for nu in nurses:
+                if str(getattr(nu, "db_id", "")) not in watch_db_ids:
+                    continue
+                sched = result.get(str(nu.db_id), [])
+                n_idx = getattr(nu, "id", None)
+                weekly = weekly_off_by_idx.get(int(n_idx), []) if n_idx is not None else []
+                _log_off_count_trace(
+                    logger_prefix=self.logger_prefix,
+                    nurse=nu,
+                    schedule=sched,
+                    shift_id_to_main=shift_id_to_main,
+                    shift_id_to_type=shift_id_to_type,
+                    weekly_off_days_0based=weekly,
+                )
+        except Exception as exc:
+            print(f"{self.logger_prefix} [WatchOffCount] 로그 실패: {exc}")
 
         # 13. 최종 근무표 로그 출력
         self._log_final_roster(nurses, result)
@@ -1060,12 +1291,19 @@ class CPSATBasicEngine:
     # ────────────────────────────────────────────────────────────────────
     #                    ※ 아래는 helper 들 – 모두 완전판               │
     # ────────────────────────────────────────────────────────────────────
-    def _optimize_fallback_lex_hard_first(self, roster_system: RosterSystem, time_limit_seconds: int, grouped=None) -> bool:
+    def _optimize_fallback_lex_hard_first(
+        self,
+        roster_system: RosterSystem,
+        time_limit_seconds: int,
+        grouped=None,
+        shift_type_map: dict[str, str] | None = None,
+    ) -> bool:
         """(호환) 폴백(서열) 최적화는 별도 모듈로 분리되었다."""
         return optimize_fallback_lex_hard_first(
             roster_system=roster_system,
             time_limit_seconds=time_limit_seconds,
             grouped=grouped,
+            shift_type_map=shift_type_map,
             logger_prefix=self.logger_prefix,
             timer_cls=Timer,
             add_preceptor_terms_fn=_add_preceptor_objective_terms,
@@ -1353,7 +1591,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         s_main = code2main.get(c['shift'], c['shift'])
         s_idx  = rs.config.shift_types.index(s_main)
         fixed[(n,d)] = s_idx; fixed_cnt[d][s_idx]+=1
-        fixed_type_by_cell[(n, d)] = code2type.get(c['shift'])
+        # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
+        fixed_type_by_cell[(n, d)] = code2type.get(c["shift"]) or code2type.get(s_main)
+        # print('이미 있음 cpsat- fixed_type_by_cell', fixed_type_by_cell)
     forced_off_cells: set[tuple[int, int]] = set()
     forced_off_cap_excluded: set[tuple[int, int]] = set()
     if off_idx_full is not None:
@@ -1422,6 +1662,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 Xv[n,d,s]=m.NewBoolVar(f'x_{n}_{d}_{s}')
     def X(n,d,s):  return Xv.get((n,d,s),0)
     active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
+    isolated_off_slacks: list = []
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
         if (n, d) not in active_days:
@@ -1439,8 +1680,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(X(n, d, w_idx) == 0)
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
     if off_idx_full is not None:
-        off_or_weekly = set(off_exception_cells)
+        # off_or_weekly = set(off_exception_cells)
+        off_or_weekly = set(
+        (n, d)
+        for (n, d) in off_exception_cells
+        if (n, d) not in forced_off_cap_excluded
+        )   
         off_or_weekly.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
+        vac_cells = set(getattr(rs.config, "off_exception_vacation_cells", []) or [])
         # weekly_off_by_idx 를 off_or_weekly에 포함
         try:
             for n, day_list in (weekly_off_by_idx or {}).items():
@@ -1453,13 +1700,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 if d + 3 > leave[n]:
                     continue
                 window = {(n, d), (n, d + 1), (n, d + 2), (n, d + 3)}
-                # 예외 포함 윈도우는 스킵
-                if window & off_exception_cells:
-                    continue
+                vacation_types = {"휴가", "공가", "휴무"}
                 fixed_o_cnt = sum(
                     1
                     for (fn, fd), fs_idx in fixed.items()
-                    if fn == n and fd in {d, d + 1, d + 2, d + 3} and fs_idx == off_idx_full
+                    if fn == n
+                    and fd in {d, d + 1, d + 2, d + 3}
+                    and fs_idx == off_idx_full
+                    and (fn, fd) not in vac_cells
                 )
                 if fixed_o_cnt >= 4:
                     print(
@@ -1472,6 +1720,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     + sum(1 for k in range(4) if (n, d + k) in off_or_weekly)
                     <= 3
                 )
+
+    # ───────────── 2-A2. 고립 OFF 금지(슬랙 허용) ─────────────
+    enforce_clustered_offs = bool(getattr(rs.config, "enforce_clustered_offs", False))
+    if enforce_clustered_offs and off_idx_full is not None:
+        slack_penalty = int(getattr(rs.config, "isolated_off_slack_penalty", 300000) or 0)
+        for n in range(N):
+            t0, t1 = join[n], leave[n]
+            for d in range(t0, t1 + 1):
+                neighbours = []
+                if d - 1 >= t0:
+                    neighbours.append(X(n, d - 1, off_idx_full))
+                if d + 1 <= t1:
+                    neighbours.append(X(n, d + 1, off_idx_full))
+                slack_var = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
+                isolated_off_slacks.append((slack_var, slack_penalty))
+                if neighbours:
+                    m.Add(X(n, d, off_idx_full) <= sum(neighbours) + slack_var)
+                else:
+                    m.Add(X(n, d, off_idx_full) <= slack_var)
     
     # ───────────── 2-A3. 주휴 근처 OFF 배치 제약 (off_placement_mode) ─────────────
     off_placement_mode = int(getattr(rs.config, "off_placement_mode", 0) or 0)
@@ -1666,8 +1933,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 is_weekend_only = bool(getattr(nu, "is_weekend_off", False))
                 base_min_off = int(
                     getattr(cfg, "global_monthly_off_days", 0)
-                    + getattr(cfg, "standard_personal_off_days", 0)
+                    + getattr(cfg, "standard_personal_off_days", 8)
                 )
+
                 min_off_required = min(base_min_off, T1 - T0 + 1)
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 weekend_off_bonus = int(getattr(cfg, "weekend_off_extra_off_days", 2) or 2)
@@ -1734,6 +2002,21 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     # print('평일휴무 금지 간호사:', nu.name, '날짜:', d+1)
                     m.Add(X(n, d, off) == 0)
+        # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
+        try:
+            off_windows = getattr(rs, "off_window_constraints", {}) or {}
+            if off_idx_full is not None:
+                for (w_start, w_end) in off_windows.get(n, []) or []:
+                    nu = rs.nurses[n]
+                    if bool(getattr(nu, "is_weekend_off", False)):
+                        continue
+                    left = max(T0, w_start)
+                    right = min(T1, w_end)
+                    if left > right:
+                        continue
+                    m.Add(sum(X(n, d, off_idx_full) for d in range(left, right + 1)) >= 1)
+        except Exception as e:
+            print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
         # 연속 근무 K+1 중 OFF ≥1
         for d0 in range(T0, T1-K+1):
             m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)
@@ -1787,6 +2070,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 월 최소 OFF 일수 하드 제약 (프론트 전달 off_days를 최소값으로 해석)
         try:
             base_min_off = int(getattr(cfg, 'global_monthly_off_days', 0) + getattr(cfg, 'standard_personal_off_days', 0))
+
             # 근무 가능 일수보다 클 수 있으므로 클램프
             min_off_required = min(base_min_off, T1 - T0 + 1)
             if min_off_required > 0:
@@ -1897,6 +2181,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         include_pair_objective=include_pair_objective,
         preceptor_terms_fn=_add_preceptor_objective_terms,
     )
+    # 고립 OFF 슬랙 패널티(강제 불가 시에만 허용)
+    for slack_var, w in isolated_off_slacks:
+        if w > 0:
+            obj.append(-w * slack_var)
     m.Maximize(sum(obj))
 
     return m,X,join,leave,fixed

@@ -644,12 +644,13 @@ def _build_fixed_shift_roster(
     weekday_off_code: str = "O",
     sunday_code: str = "주",
     shift_lookup: dict[str, Shift] | None = None,
+    weekly_off_active: bool = True,
 ) -> dict[str, list[str]]:
     """고정 근무 간호사의 월간 스케줄을 생성합니다.
 
     - 평일(월~금): fixed_shift 코드 배정
     - 토요일: weekday_off_code
-    - 일요일: sunday_code
+    - 일요일: weekly_off_active이고 간호사 weekly_off_enabled가 1일 때만 sunday_code
     """
     days_in_month = calendar.monthrange(year, month)[1]
     month_start = date(year, month, 1)
@@ -662,6 +663,9 @@ def _build_fixed_shift_roster(
             continue
         start_idx, end_idx = active_range
         fixed_code = str(getattr(nurse, "fixed_shift", "") or "").upper()
+        weekly_off_enabled = weekly_off_active and bool(
+            getattr(nurse, "weekly_off_enabled", False)
+        )
         if shift_lookup is not None:
             if fixed_code not in shift_lookup:
                 raise HTTPException(
@@ -678,7 +682,8 @@ def _build_fixed_shift_roster(
         for day_idx in range(start_idx, end_idx + 1):
             weekday = (month_start + timedelta(days=day_idx)).weekday()
             if weekday >= 5:
-                shifts[day_idx] = sunday_code if weekday == 6 else weekday_off_code
+                is_sunday_weekly_off = weekday == 6 and weekly_off_enabled
+                shifts[day_idx] = sunday_code if is_sunday_weekly_off else weekday_off_code
             else:
                 shifts[day_idx] = fixed_code
         result[str(nurse.nurse_id)] = shifts
@@ -1308,6 +1313,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         raise
     prev_month_last_main: dict[str, str | None] = {}
     prev_month_last_is_off: dict[str, bool] = {}
+    off_window_constraints: dict[str, list[list[int]]] = {}
     for nurse_id, seq in last_map.items():
         last_code = seq[-1] if seq else None
         prev_month_last_main[nurse_id] = last_code
@@ -1315,8 +1321,20 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     forced_off = defaultdict(list)
     forbidden = defaultdict(lambda: defaultdict(list))
 
-    # 설정값 활용
-    K = int(config_dict.get('max_conseq_work') or 0)
+    # 설정값 활용 (max_conseq_work 기본값은 엔진과 동일하게 5로 폴백)
+    def _safe_int(val, default=None):
+        try:
+            if val is None or (isinstance(val, str) and not val.strip()):
+                return default
+            return int(val)
+        except Exception:
+            return default
+
+    K = _safe_int(config_dict.get('max_conseq_work'), None)
+    if K is None:
+        K = _safe_int(config_dict.get('max_consecutive_work_days'), None)
+    if K is None:
+        K = 5
     two_after_three = bool(config_dict.get('two_offs_after_three_nig'))
     two_after_two = bool(config_dict.get('two_offs_after_two_nig'))
     not_one_night = bool(config_dict.get("not_one_night", False))
@@ -1372,6 +1390,9 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     day0_cap = max(min_cap, base_cap)
     day0_cap = min(day0_cap, len(nurse_ids))
 
+    # 대상 월 일수 계산 (월초 구간 제약 범위 산정용)
+    days_in_month = calendar.monthrange(req.year, req.month)[1]
+
     for nurse_id in nurse_ids:
         tail = last_map.get(nurse_id, [])
         metrics = _calc_tail_metrics(tail)
@@ -1389,6 +1410,19 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
             tail_str = ' '.join(tail) if tail else '(없음)'
             print(f"[CrossMonth] 간호사 {nurse_id}: 연속근무={cons_work} (꼬리: {tail_str}) → day0(1일) OFF 강제")
 
+        # (a-1) 꼬리 연속근무 보정: 월초 0..(K-w) 구간에 OFF ≥ 1
+        # - w(=cons_work)가 0보다 크면 첫 (K-w+1)일 안에 최소 1일 OFF를 요구하여 총 연속근무가 K를 넘지 않도록 한다.
+        if K > 0 and cons_work > 0:
+            window_end = max(0, K - cons_work)
+            window_end = min(window_end, days_in_month - 1)
+            if window_end >= 0:
+                off_window_constraints.setdefault(nurse_id, []).append([0, window_end])
+                tail_str = ' '.join(tail) if tail else '(없음)'
+                print(
+                    f"[CrossMonth] 간호사 {nurse_id}: 꼬리 연속근무 w={cons_work}, "
+                    f"K={K} → 월초 0..{window_end}(1~{window_end+1}일) 구간 OFF≥1 제약 추가 "
+                    f"(꼬리: {tail_str})"
+                )
         # (b-0) 1N 금지: 꼬리 N이 1개라면 다음 달 day0을 N으로 강제
         if not_one_night and cons_n == 1:
             if 0 in forced_off.get(nurse_id, []):
@@ -1471,6 +1505,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         'forbidden': forbidden,
         'prev_month_last_main': prev_month_last_main,
         'prev_month_last_is_off': prev_month_last_is_off,
+        'off_window_constraints': off_window_constraints,
     }
 
 
@@ -1758,7 +1793,10 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     prev_month_last_is_off = cross_month_constraints.get("prev_month_last_is_off") or {}
     if prev_month_last_is_off:
         config_dict["prev_month_last_is_off"] = prev_month_last_is_off
-
+    off_window_constraints = cross_month_constraints.get("off_window_constraints") or {}
+    if off_window_constraints:
+        config_dict["off_window_constraints"] = off_window_constraints
+    print('prev_month_last_is_off', prev_month_last_is_off)
     # ── 3) 병합 후 주입(금지/강제OFF 합집합) ──
     config_dict["initial_constraints"] = _merge_initial_constraints(
         base=cross_month_constraints,
@@ -2235,6 +2273,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         special_shift_requests,
         special_shift_map,
     ) = _collect_nurses_and_preferences(db, req, current_user)
+    active_nurses_in_group = [
+        n for n in nurses_in_group if getattr(n, "active", 1) != 0
+    ]
+    if len(active_nurses_in_group) != len(nurses_in_group):
+        excluded_names = [
+            f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')})"
+            for n in nurses_in_group
+            if getattr(n, "active", 1) == 0
+        ]
+        print(f"[RosterCreate] 비활성 간호사 엔진 제외: {excluded_names}")
+    nurses_in_group = active_nurses_in_group
     # _debug_log(
     #     "collect_done",
     #     {
@@ -2563,6 +2612,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         weekday_off_code="O",
         sunday_code="주",
         shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
+        weekly_off_active=bool(config_dict.get("weekly_off_settings_activate", False)),
     )
     fixed_roster = _overlay_fixed_roster_with_special_requests(
         fixed_roster=fixed_roster,
