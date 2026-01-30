@@ -29,6 +29,7 @@ from services.wanted_service import (
     toggle_fixed_wanted_entry_service,
     get_fixed_wanted_for_roster_service,
     get_fixed_wanted_entries_service,
+    reset_fixed_wanted_service,
 )
 from db.models import Group
 from datetime import datetime, timedelta, timezone
@@ -103,7 +104,7 @@ async def get_wanted_status(
     ).first()
 
     if not wanted:
-        return {"status": None, "message": "wanted 작성 요청 전"}
+        return {"status": None, "message": "wanted 작�� 요청 전"}
     
     return {
         "status": wanted.status,
@@ -600,6 +601,45 @@ async def toggle_fixed_wanted_entry(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"토글 실패: {str(e)}")
+
+
+@router.post("/adjustment/{year}/{month}/reset", response_model=AdjustmentResponse)
+async def reset_fixed_wanted(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    확정 원티드 재설정 API
+    - FixedWantedEntry 해당 월 데이터 전체 삭제
+    - 원본 WantedRequest + NurseShiftRequest 기반 데이터로 복원하여 반환
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        result = reset_fixed_wanted_service(db, target_group_id, year, month)
+        return result
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
 
 
 @router.get("/fixed/{year}/{month}")

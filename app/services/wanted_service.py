@@ -1156,6 +1156,38 @@ def toggle_fixed_wanted_entry_service(
     return entry
 
 
+def reset_fixed_wanted_service(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+) -> AdjustmentResponse:
+    """
+    확정 원티드 재설정 서비스
+    - FixedWantedEntry 해당 group/year/month 데이터 전체 삭제
+    - 원본 WantedRequest + NurseShiftRequest 기반 데이터를 AdjustmentResponse로 반환
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+
+    반환:
+        AdjustmentResponse: 원본 원티드 데이터 기반 조정판 응답 (has_fixed_wanted=False)
+    """
+    deleted_count = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
+    ).delete()
+    db.commit()
+
+    print(f"FixedWantedEntry 재설정: group={group_id}, {year}-{month:02d}, 삭제={deleted_count}건")
+
+    return get_wanted_adjustment_service(db, group_id, year, month)
+
+
 def get_fixed_wanted_for_roster_service(
     db: Session,
     group_id: str,
