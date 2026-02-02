@@ -190,7 +190,11 @@ def submit_preferences_service(
         print(f"[pair 저장] preference 배열 기반 {pair_detailed_id - 1}건 저장 (request_id={request_id})")
     else:
         # preference 배열이 없는 경우 → 이전 request_id에서 pair 데이터 carry-forward
-        _carry_forward_pair_data(db, current_user.nurse_id, request_id, month_str)
+        # 초기화 시 carry-forward 스킵
+        if data_to_save or preference_list: # shift나 preference가 있으면 carry-forward 진행
+            _carry_forward_pair_data(db, current_user.nurse_id, request_id, month_str)
+        else:
+            print(f"[pair 초기화] 빈 데이터로 인해 carry-forward 스킵 (request_id={request_id})")
 
     # 제출 처리
     if not is_draft:
