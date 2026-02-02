@@ -8,6 +8,7 @@ from ortools.sat.python import cp_model
 
 from services.cp_sat.hardcoded_weights import (
     EXPERIENCE_SHORT_PENALTY,
+    FALLBACK_COVERAGE_SHORT_WEIGHT,
     ISOLATED_OFF_PENALTY,
     NIGHT_DEVIATION_PENALTY,
     NOD_NOE_PENALTY,
@@ -58,6 +59,10 @@ def build_main_objective_terms(
     S = cfg.num_shifts
     idx = {c: cfg.shift_types.index(c) for c in ("D", "E", "N", "O")}
     day, eve, night, off = idx["D"], idx["E"], idx["N"], idx["O"]
+
+    # (0) 커버리지 부족 패널티(강하게): shortage 변수에 큰 음수 가중치 적용
+    for sh, code in coverage_shortage_vars:
+        obj.append(-FALLBACK_COVERAGE_SHORT_WEIGHT * sh)
 
     for n in range(N):
         nu = rs.nurses[n]

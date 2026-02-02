@@ -1045,14 +1045,14 @@ class CPSATBasicEngine:
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
             success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
-            # if not success:
-            #     print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
-            #     self._optimize_fallback_lex_hard_first(
-            #         roster_system,
-            #         time_limit_seconds=time_limit_seconds,
-            #         grouped=grouped,
-            #         shift_type_map=shift_id_to_type,
-            #     )
+            if not success:
+                print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
+                self._optimize_fallback_lex_hard_first(
+                    roster_system,
+                    time_limit_seconds=time_limit_seconds,
+                    grouped=grouped,
+                    shift_type_map=shift_id_to_type,
+                )
         # 9-1. 불필요 OFF 정리 (N-only 제외)
         try:
             with Timer("불필요 OFF 정리"):
@@ -1318,10 +1318,10 @@ class CPSATBasicEngine:
         try:
             model,X,j,l,fixed = _build_full_model(rs,grouped)
             # print('model', model)
-            print('X', X)
-            print('j', j)
-            print('l', l)
-            print('fixed', fixed)
+            # print('X', X)
+            # print('j', j)
+            # print('l', l)
+            # print('fixed', fixed)
             solver=cp_model.CpSolver()
             # ▼▼ 랜덤화 추가 ▼▼
             # seed = getattr(rs.config, 'random_seed', None)
@@ -1870,14 +1870,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 for n in range(N)
                 if join[n] <= d <= leave[n] and (n, d) not in fixed
             )
-            sh = m.NewIntVar(0, N, f'short_{d}_{code}')
-            # print('need!!!!!', need)
-            # print('assigned!!!!!', assigned)
-            # print('sh!!!!!', sh)
-            m.Add(sh >= need - assigned)
-            coverage_shortage_vars.append((sh, code))
-            # print('coverage_shortage_vars!!!!!', coverage_shortage_vars)
-            # oversupply 추적: 추가 투입 인원 수 ov ≥ assigned - need
+            # 커버리지를 하드로 강제: assigned ≥ need
+            m.Add(assigned >= need)
+            # oversupply 추적은 유지
             ov = m.NewIntVar(0, N, f'over_{d}_{code}')
             m.Add(ov >= assigned - need)
             over_vars_by_day.setdefault(d, {})[code] = ov
@@ -1927,6 +1922,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             try:
                 weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
                 weekend_cnt = len(weekend_in_range)
+                vac_cnt_in_range = sum(1 for d in weekend_in_range if (n, d) in vacation_off_cells)
                 off_exception_days = sorted(
                     d + 1
                     for (n_idx, d) in off_exception_cells
@@ -1950,8 +1946,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     getattr(cfg, "global_monthly_off_days", 0)
                     + getattr(cfg, "standard_personal_off_days", 8)
                 )
-
-                min_off_required = min(base_min_off, T1 - T0 + 1)
+                # 휴가/공가는 최소 OFF에서 제외 (coverage 혼동 방지)
+                min_off_required = max(0, min(base_min_off, (T1 - T0 + 1) - vac_cnt_in_range))
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 weekend_off_bonus = int(getattr(cfg, "weekend_off_extra_off_days", 2) or 2)
                 max_off_allowed = min(
@@ -1965,8 +1961,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 print(
                     f"[WeekendOff][HardCheck] nurse_idx={n}, "
                     f"nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
-                    f"range={T0+1}~{T1+1}, weekend_cnt={weekend_cnt}, "
-                    f"min_off_required={min_off_required}, max_off_allowed={max_off_allowed}, "
+                    f"range={T0+1}~{T1+1}, weekend_cnt={weekend_cnt}, vac_in_range={vac_cnt_in_range}, "
+                    f"min_off_required(excl_vac)={min_off_required}, max_off_allowed(excl_vac)={max_off_allowed}, "
                     f"weekday_off_cap={weekday_off_cap}, "
                     f"K={K}, forbid_n={int(n in n_forbid_n)}, "
                     f"two_offs_after_two_nig={int(bool(getattr(cfg, 'two_offs_after_two_nig', False)))}, "
@@ -2112,6 +2108,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         <= max_off_allowed_n_only
                     )
+                    print(
+                        f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                        f"is_n_only=1, vac_cnt={vacation_cnt}, "
+                        f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
+                    )
                 else:
                     max_off_allowed = min(min_off_required + extra_allowed, avail_days)
                     effective_cap = max_off_allowed
@@ -2128,6 +2129,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             )
                             <= weekday_off_cap
                         )
+                        print(
+                            f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                            f"is_weekend_off=1, vac_cnt={vacation_cnt}, "
+                            f"min_off={min_off_required}, max_off={effective_cap}, "
+                            f"weekday_off_cap={weekday_off_cap}, weekend_cnt={weekend_cnt}"
+                        )
                     else:
                         m.Add(
                             sum(
@@ -2136,6 +2143,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 if (n, d) not in vacation_off_cells
                             )
                             <= effective_cap
+                        )
+                        print(
+                            f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                            f"is_weekend_off=0, vac_cnt={vacation_cnt}, "
+                            f"min_off={min_off_required}, max_off={effective_cap}"
                         )
         except Exception:
             pass
