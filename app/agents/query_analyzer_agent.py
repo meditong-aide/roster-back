@@ -184,6 +184,23 @@ class queryAnalyzerPrompt:
             - "생리휴가", "법정교육" 같은 단어가 나오면 무조건 Shift 카테고리로 분류하세요.
             - 날짜 + shift 이름 조합은 Shift에 우선 배치하세요.
 
+        ## Preference(선호/비선호 동료) 분류 원칙
+            **핵심 원칙: 특정 동료의 이름(또는 호칭)이 언급되고, 그 사람에 대한 어떠한 감정·의견·평가·요청이 함께 표현되면 무조건 Preference로 분류합니다.**
+
+            - "이름/호칭"의 형태: 성명, 이름만, "~간호사", "~쌤", "~씨", "~이/~랑/~한테" 등 사람을 지칭하는 모든 표현
+            - "감정/의견"의 형태: 제한 없음. 긍정·부정·중립, 구어·문어, 존댓말·반말, 직접적·간접적 표현 모두 포함
+            - 여러 사람이 한 문장에 나오면 **각각 개별 Preference 항목으로 분리**
+            - Shift/날짜 요청과 섞여 있어도 사람에 대한 부분은 반드시 Preference로 분리
+            - **절대로 사람에 대한 감정/의견/관계 표현을 Chat이나 Others로 분류하지 마세요**
+
+            분류 판단 기준:
+            | 입력에 포함된 요소 | 분류 |
+            | - | - |
+            | 사람 이름 + 어떤 감정/의견/평가/관계 표현 | **Preference** |
+            | 사람 이름 + 같이/따로 근무 요청 | **Preference** |
+            | 사람 이름 없이 일반 대화 | Chat |
+            | 사람 이름 없이 근무/날짜 요청 | Shift / Except |
+
         ## 3. Processing Guidelines
             * Keep periodic expressions like "매주/주말/평일" exactly as in the original text, never expand into dates.
             * Uninterpretable sentences or ambiguous expressions must be placed in Others.
@@ -218,6 +235,81 @@ class queryAnalyzerPrompt:
                 "Shift": ["주말은 쉬고싶어"],
                 "Preference": [],
                 "Except": ["8, 9일은 데이 빼줘"],
+                "Others": []
+                }}
+
+            # CONTEXT:
+                "유지민 권은비 너무좋아"
+
+            # OUTPUT:
+                {{
+                "processor": "유지민, 권은비에 대한 긍정적 감정 표현이므로 각각 Preference로 분류",
+                "Chat": [],
+                "Shift": [],
+                "Preference": [
+                    "유지민이랑 같이 근무하고 싶어요", "권은비랑 같이 근무하고 싶어요"
+                ],
+                "Except": [],
+                "Others": []
+                }}
+
+            # CONTEXT:
+                "5일은 D 넣어주고 박서준 간호사는 되도록 안 겹쳤으면, 이수현이는 괜찮아"
+
+            # OUTPUT:
+                {{
+                "processor": "5일 D는 Shift, 박서준은 비선호 Preference, 이수현은 선호 Preference로 분류",
+                "Chat": [],
+                "Shift": ["5일은 D로 줘"],
+                "Preference": [
+                    "박서준 간호사랑은 안 겹쳤으면 좋겠어요", "이수현이랑은 같이 근무해도 괜찮아요"
+                ],
+                "Except": [],
+                "Others": []
+                }}
+
+            # CONTEXT:
+                "홍길동 선호 김영희 비선호"
+
+            # OUTPUT:
+                {{
+                "processor": "홍길동 선호, 김영희 비선호 각각 Preference로 분류",
+                "Chat": [],
+                "Shift": [],
+                "Preference": [
+                    "홍길동이랑 같이 근무하고 싶어요", "김영희랑은 겹치기 싫어요"
+                ],
+                "Except": [],
+                "Others": []
+                }}
+
+            # CONTEXT:
+                "최지은이랑 일하면 힘들어서 좀 빼줬으면.. 그리고 주말은 쉬고싶어"
+
+            # OUTPUT:
+                {{
+                "processor": "최지은에 대한 부정적 의견은 Preference, 주말 쉬고싶은 건 Shift로 분류",
+                "Chat": [],
+                "Shift": ["주말은 쉬고싶어"],
+                "Preference": [
+                    "최지은이랑은 겹치기 싫어요"
+                ],
+                "Except": [],
+                "Others": []
+                }}
+
+            # CONTEXT:
+                "10일 N 주세요. 아 그리고 정민아 쌤이랑 같은 날 되면 좋겠고, 한서연은 좀 피하고 싶어요"
+
+            # OUTPUT:
+                {{
+                "processor": "10일 N은 Shift, 정민아 쌤 선호와 한서연 비선호는 각각 Preference로 분류",
+                "Chat": [],
+                "Shift": ["10일은 N으로 줘"],
+                "Preference": [
+                    "정민아 쌤이랑 같은 날 되면 좋겠어요", "한서연이랑은 피하고 싶어요"
+                ],
+                "Except": [],
                 "Others": []
                 }}
 
