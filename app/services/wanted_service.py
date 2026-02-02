@@ -486,6 +486,7 @@ def _parse_shift_results(
                 dates = record.get("date", [])
                 scores = record.get("score", [])
                 requests = record.get("request", [""]) * len(dates)
+                comments = record.get("comment", [None] * len(dates))
 
                 for i, day_str in enumerate(dates):
                     try:
@@ -501,11 +502,13 @@ def _parse_shift_results(
 
                     score = float(scores[i]) if i < len(scores) else 1.0
                     req = str(requests[i] if i < len(requests) else "").strip()
+                    comment = comments[i] if i < len(comments) else None
 
                     parsed.setdefault(shift, {})[day] = {
                         "score": score,
                         "request": normalize_request_text(req),
-                        "shift": shift
+                        "shift": shift,
+                        "comment": comment or ""  # 사유 추가 (None이면 빈 문자열)
                     }
 
     return parsed
@@ -828,7 +831,7 @@ async def invoke_and_persist_wanted_service(
                 shift_map.setdefault(shift_id, {})[day_int] = {
                     "score": score,
                     "request": req_text,
-                    "comment": req_text, # AIDE 결과는 partial_request와 동일하게
+                    "comment": info.get("comment", ""),  # AIDE에서 파싱한 사유 사용
                     "shift": shift_id
                 }
     print("[DEBUG-3] AIDE 병합 완료 후 shift_map : ", shift_map)

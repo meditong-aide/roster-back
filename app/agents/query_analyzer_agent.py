@@ -19,13 +19,20 @@ except Exception:
 
 dotenv.load_dotenv()
 
+
+class ShiftItem(BaseModel):
+    """Shift 요청 항목 (텍스트 + 사유)"""
+    text: str  # 날짜+코드 형태의 요청 텍스트
+    comment: str | None  # 사유 (없으면 null)
+
+
 class queryAnalyzer(BaseModel):
     processor: str
-    Chat: List[str] 
-    Shift: List[str] 
+    Chat: List[str]
+    Shift: List[ShiftItem]  # {text, comment} 구조로 변경
     Preference: List[str]
     Except: List[str]
-    Others: List[str] 
+    Others: List[str]
     year: int
     month: int
 
@@ -122,7 +129,7 @@ class queryAnalyzerPrompt:
         프롬프트 클래스
         """
         allowed_shift_map = allowed_shift_map or {}
-        
+
         # 동적 Few-shot 예시 생성
         dynamic_shift_examples = ""
         if allowed_shift_map:
@@ -130,36 +137,50 @@ class queryAnalyzerPrompt:
             dynamic_shift_examples += "사용자가 아래 shift 이름을 언급하면 반드시 해당 shift_id로 변환하여 Shift 리스트에 넣으세요.\n\n"
             for code, name in allowed_shift_map.items():
                 dynamic_shift_examples += f'- "{name}", "{name} 신청", "{name}로 해줘", "{name} 하고 싶어" → Shift: ["{code}"]\n'
-            dynamic_shift_examples += "\n예시:\n"
-            dynamic_shift_examples += '- "10일 생리휴가" → Shift: ["10일은 생로 줘"]\n'
-            dynamic_shift_examples += '- "15일 법정교육" → Shift: ["15일은 법로 줘"]\n'
-            dynamic_shift_examples += '- "20일 필수교육 빼줘" → Except: ["20일은 필 말고"], Shift: []\n'
-        
+
+            # 동적 예시 (allowed_shift_map 기반)
+            dynamic_shift_examples += "\n### 동적 Few-shot 예시:\n"
+            example_codes = list(allowed_shift_map.items())[:3]  # 처음 3개만 사용
+            for i, (code, name) in enumerate(example_codes):
+                day = 10 + i * 5
+                dynamic_shift_examples += f'- "{day}일 {name}" → Shift: [{{"text": "{day}일은 {code}로 줘", "comment": null}}]\n'
+
+            # 사유 포함 동적 예시
+            dynamic_shift_examples += "\n### 사유 포함 예시 (존댓말 형식):\n"
+            reason_examples = [
+                ("지방 출장", "지방 출장��� 있습니다"),
+                ("가족 행사", "가족 행사가 있습니다"),
+                ("병원 진료", "병원 진료가 있습니다"),
+            ]
+            for i, ((code, name), (reason_short, reason_polite)) in enumerate(zip(example_codes, reason_examples)):
+                day = 3 + i * 2
+                dynamic_shift_examples += f'- "{day}일 {reason_short}으로 {name}" → Shift: [{{"text": "{day}일은 {code}로 줘", "comment": "{reason_polite}"}}]\n'
+
         self.system = f"""
         ## GOAL:
-            You are the "Nurse Preference Preprocessor."  
+            You are the "Nurse Preference Preprocessor."
             Convert Korean natural language input ➜ into a categorized List (JSON), decomposed and normalized.
 
         ## 1. Task Objectives
             1. If multiple dates, shifts, preferences, and except are mixed in a single sentence, split them into separate items by meaning.
-            2. Each element in the Shift / Preference / Except / Others category must contain only a single piece of content.  
-            예)  
-            - "5/5는 쉬고 싶고, 5/6은 E로 줘" →  
-                `"Shift": ["5/5은 OFF로 줘", "5/6은 E로 줘"]`
-            3. If a date is omitted in an instruction ("그 외엔…"), supplement with the previous date to avoid loss of information.  
-            예) "5/5는 N, 그 외엔 E" →  
-                `"Shift": ["5/5은 N로 줘", "5/5 제외 나머지는 E로 줘"]`
-            4. Repetitive/pattern requests (e.g., "주말엔 쉬고 싶다", "매주 수요일은 OFF")  
-            must never be expanded into all dates; record as **one rule-based item**.  
-            - 예) "주말엔 쉬고 싶다" → `"Shift": ["매주 주말은 O로 줘"]`  
-            - 예) "수요일은 OFF" → `"Shift": ["매주 수요일은 O로 줘"]`  
-            - 예) "평일엔 D, 주말엔 O" → `"Shift": ["평일은 D로 줘", "주말은 O로 줘"]`
+            2. Each element in the Shift / Preference / Except / Others category must contain only a single piece of content.
+            예)
+            - "5/5는 쉬고 싶고, 5/6은 E로 줘" →
+                `"Shift": [{{"text": "5/5은 OFF로 줘", "comment": null}}, {{"text": "5/6은 E로 줘", "comment": null}}]`
+            3. If a date is omitted in an instruction ("그 외엔…"), supplement with the previous date to avoid loss of information.
+            예) "5/5는 N, 그 외엔 E" →
+                `"Shift": [{{"text": "5/5은 N로 줘", "comment": null}}, {{"text": "5/5 제외 나머지는 E로 줘", "comment": null}}]`
+            4. Repetitive/pattern requests (e.g., "주말엔 쉬고 싶다", "매주 수요일은 OFF")
+            must never be expanded into all dates; record as **one rule-based item**.
+            - 예) "주말엔 쉬고 싶다" → `"Shift": [{{"text": "매주 주말은 O로 줘", "comment": null}}]`
+            - 예) "수요일은 OFF" → `"Shift": [{{"text": "매주 수요일은 O로 줘", "comment": null}}]`
+            - 예) "평일엔 D, 주말엔 O" → `"Shift": [{{"text": "평일은 D로 줘", "comment": null}}, {{"text": "주말은 O로 줘", "comment": null}}]`
             - 예) "10일은 D 말고" → `"Except": ["10일은 D 말고"]`
             - 예) "수요일은 E 빼줘" → `"Except": ["수요일은 E 빼줘"]`
             5. Absolutely no duplication/mixing: do not put OFF and E together in one element.
             6. Final JSON Keys:
                 - Chat ― small talk unrelated to scheduling
-                - Shift ― requests for dates/shifts/OFF
+                - Shift ― requests for dates/shifts/OFF (각 항목은 {{"text": "...", "comment": "..."}} 형태)
                 - Preference ― coworker together/avoid preferences
                 - Except ― negative/exclusion requests (e.g., 말고, 빼고, 제외, 안 돼)
                 - Others ― requests not fitting the above
@@ -168,7 +189,7 @@ class queryAnalyzerPrompt:
 
         ## 2. Mandatory Rules
             {dynamic_shift_examples}
-            
+
             | Expression | Conversion Example |
             | - | - |
             | Day shift | "D" |
@@ -177,7 +198,7 @@ class queryAnalyzerPrompt:
             | Off/휴무    | "O" |
             | Date formats | `M/D` or `M월 D일` are all allowed, but keep the original form in output |
             | Periodic expressions | "매주", "주말", "평일", "격주" etc. remain as rule-based items |
-        
+
         ## 필수 규칙 재강조
             - show_in_preference=True인 shift 이름(생리휴가, 법정교육, 필수교육, 휴가, 공가, 보수교육 등)은 **반드시** 해당 shift_id("생", "법", "필", "휴", "공", "보" 등)로 변환하여 Shift에 넣으세요.
             - Shift 요청이 명확하면 **절대 빈 리스트로 반환하지 마세요**.
@@ -200,41 +221,75 @@ class queryAnalyzerPrompt:
             | 사람 이름 + 같이/따로 근무 요청 | **Preference** |
             | 사람 이름 없이 일반 대화 | Chat |
             | 사람 이름 없이 근무/날짜 요청 | Shift / Except |
+        ## 의도 파악 규칙 (중요! — 반드시 번호 순서대로 우선 적용)
+            **1. "근무" 키워드가 있으면 → 해당 shift 요청**
+            - "아침근무", "오전근무" → Day(D)
+            - "저녁근무" → Evening(E)
+            - "밤근무", "야간근무" → Night(N)
+
+            **2. 명시적 shift 코드 + 사유/이유 → 하나의 Shift 항목, 사유는 comment [최우선 규칙]**
+            - 사용자가 특정 shift 코드(D, E, N, O 또는 allowed_shift_map의 코드)를 **명시적으로** 요청하면서
+              같은 문맥에서 사유·이유·상황을 함께 언급한 경우,
+              **절대로 사유를 별도의 Shift 항목(예: O)으로 분리하지 말고**, 해당 shift 항목의 comment에 넣으세요.
+            - 이 규칙은 아래 3번(일정→Off) 규칙보다 **항상 우선**합니다.
+            - 판별 기준: 한 문장 또는 연속 문장에서 shift 코드가 이미 특정되어 있고,
+              뒤이어 나오는 내용이 새로운 날짜·shift 코드 없이 사유/이유만 설명하면 → comment로 처리
+            - 예시:
+              * "수요일 N주세요. 아침에 치과 치료있어요"
+                → Shift: [{{"text": "매주 수요일은 N로 줘", "comment": "아침에 치과 치료가 있습니다"}}]
+                (❌ 절대 O 요청으로 분리 금지!)
+              * "10일 E로 넣어줘. 오후에 병원 가야해"
+                → Shift: [{{"text": "10일은 E로 줘", "comment": "오후에 병원 방문이 있습니다"}}]
+                (❌ 절대 O 요청으로 분리 금지!)
+              * "매주 금요일 D줘. 아이 등원시켜야해서"
+                → Shift: [{{"text": "매주 금요일은 D로 줘", "comment": "아이 등원이 있습니다"}}]
+
+            **3. 일정/약속 키워드가 있고, shift 코드 지정이 없으면 → Off(O)**
+            - "외래 방문", "병원", "진료", "면접", "약속", "행사" 등 → 근무 불가 상황
+            - **단, 위 2번에 해당하면(shift 코드가 이미 명시된 경우) 이 규칙 적용 금지!**
+            - 예시 (shift 코드 명시 없이 일정만 언급한 경우에만 O):
+              * "24일 아침 외래 방문" → 24일은 O로 (shift 코드 언급 없음)
+              * "10일 저녁 약속 있어요" → 10일은 O로 (shift 코드 언급 없음)
+
+        ## 사유(comment) 추출 규칙 (중요!)
+            - Shift의 각 항목은 {{"text": "...", "comment": "..."}} 형태입니다.
+            - text: 날짜+코드 형태로 정규화된 요청
+            - comment: 날짜/코드를 제외한 사유 (없으면 null)
+
+            ### comment 변환 원칙 (필수!)
+            **원칙 1: 순화** - 민감하거나 사적인 내용은 "개인 사정이 있습니다"로 일반화
+            **원칙 2: 존댓말** - 단어/반말은 "~입니다", "~가 있습니다" 형태로 문장화
+            **원칙 3: 간결함** - 핵심 사유만 남기고 불필요한 디테일 제거
+
+            ### 변환 예시
+            | 원본 | comment |
+            |------|---------|
+            | "밤에 업소 나가서" | "저녁에 개인 일정이 있습니다" |
+            | "생일이라" | "생일입니다" |
+            | "아이 병원 진료가 있어요" | 그대로 유지 |
+            | 사유 없음 | null |
 
         ## 3. Processing Guidelines
             * Keep periodic expressions like "매주/주말/평일" exactly as in the original text, never expand into dates.
             * Uninterpretable sentences or ambiguous expressions must be placed in Others.
 
-            
+
             # CONTEXT:
-                "5/5는 쉬고 싶고, 5/19는 나이트 후 OFF, 그리고 정간호사, 문지영이는 좀 꺼졌으면 좋겠어"
+                "5/5는 쉬고 싶고, 5/19는 나이트 후 OFF, 8일은 데이 빼줘, 그리고 정간호사, 문지영이는 좀 꺼졌으면 좋겠어"
 
             # OUTPUT:
                 {{
-                "processor": "5/5는 쉬고싶다 했으므로 O, 5/19는 나이트, 그리고 그 후 OFF 달라고 했으니 5/20은 O로 처리, 정간호사, 문지영 관련은 preference로 처리하되, 순화적용",
+                "processor": "5/5는 쉬고싶다 했으므로 O, 5/19는 나이트, 그 후 OFF 달라고 했으니 5/20은 O로 처리, 8일 데이 제외는 Except, 정간호사/문지영 관련은 preference로 순화 처리",
                 "Chat": [],
                 "Shift": [
-                    "5/5은 쉬고 싶고",
-                    "5/19는 N,
-                    "5/20은 O"
+                    {{"text": "5/5은 O로 줘", "comment": "쉬고 싶어서요"}},
+                    {{"text": "5/19는 N로 줘", "comment": null}},
+                    {{"text": "5/20은 O로 줘", "comment": null}}
                 ],
                 "Preference": [
                     "정간호사랑은 겹치기 싫어요", "문지영이랑은 겹치기 싫어요"
                 ],
-                "Except": [],
-                "Others": []
-                }}
-            
-            # CONTEXT:
-                "8,9일은 데이 빼줘. 주말은 쉬고싶어"
-
-            # OUTPUT:
-                {{
-                "processor": "8, 9일은 데이 빼달라고 했으므로 제외규칙 상 Others로 처리, 주말은 쉬고싶어는 shift로 처리",
-                "Chat": [],
-                "Shift": ["주말은 쉬고싶어"],
-                "Preference": [],
-                "Except": ["8, 9일은 데이 빼줘"],
+                "Except": ["8일은 D 빼줘"],
                 "Others": []
                 }}
 
@@ -260,7 +315,7 @@ class queryAnalyzerPrompt:
                 {{
                 "processor": "5일 D는 Shift, 박서준은 비선호 Preference, 이수현은 선호 Preference로 분류",
                 "Chat": [],
-                "Shift": ["5일은 D로 줘"],
+                "Shift": [{{"text": "5일은 D로 줘", "comment": null}}],
                 "Preference": [
                     "박서준 간호사랑은 안 겹쳤으면 좋겠어요", "이수현이랑은 같이 근무해도 괜찮아요"
                 ],
@@ -290,7 +345,7 @@ class queryAnalyzerPrompt:
                 {{
                 "processor": "최지은에 대한 부정적 의견은 Preference, 주말 쉬고싶은 건 Shift로 분류",
                 "Chat": [],
-                "Shift": ["주말은 쉬고싶어"],
+                "Shift": [{{"text": "매주 주말은 O로 줘", "comment": null}}],
                 "Preference": [
                     "최지은이랑은 겹치기 싫어요"
                 ],
@@ -305,7 +360,7 @@ class queryAnalyzerPrompt:
                 {{
                 "processor": "10일 N은 Shift, 정민아 쌤 선호와 한서연 비선호는 각각 Preference로 분류",
                 "Chat": [],
-                "Shift": ["10일은 N으로 줘"],
+                "Shift": [{{"text": "10일은 N으로 줘", "comment": null}}],
                 "Preference": [
                     "정민아 쌤이랑 같은 날 되면 좋겠어요", "한서연이랑은 피하고 싶어요"
                 ],
@@ -313,10 +368,36 @@ class queryAnalyzerPrompt:
                 "Others": []
                 }}
 
+            # CONTEXT:
+                "매주 수요일 N주세요. 아침에 치과 치료있어요"
+
+            # OUTPUT:
+                {{
+                "processor": "매주 수요일 N 요청 + 아침 치과 치료는 N의 사유(comment)로 처리. 별도 O로 분리하지 않음 (의도 파악 규칙 2번 적용)",
+                "Chat": [],
+                "Shift": [{{"text": "매주 수요일은 N로 줘", "comment": "아침에 치과 치료가 있습니다"}}],
+                "Preference": [],
+                "Except": [],
+                "Others": []
+                }}
+
+            # CONTEXT:
+                "15일 E로 해주세요. 오후에 아이 병원 데려가야해요"
+
+            # OUTPUT:
+                {{
+                "processor": "15일 E 요청 + 오후 아이 병원은 E의 사유(comment)로 처리. 별도 O로 분리하지 않음 (의도 파악 규칙 2번 적용)",
+                "Chat": [],
+                "Shift": [{{"text": "15일은 E로 줘", "comment": "오후에 아이 병원 진료가 있습니다"}}],
+                "Preference": [],
+                "Except": [],
+                "Others": []
+                }}
+
         """
-        
+
         self.human=f"""
-            # CONTEXT: 
+            # CONTEXT:
             {year}년 {month}월의 근무표를 짜기 위해서 다음과 같은 요청을 받았습니다.
             {context}
             # OUTPUT:
@@ -328,12 +409,12 @@ async def query_analyzer(state):
     context = state['request']
     year = state['year']
     month = state['month']
-    
+
     allowed_shift_map = state.get('allowed_shift_map', {})
-    
+
     prompt = queryAnalyzerPrompt(
-        context=context, 
-        year=year, 
+        context=context,
+        year=year,
         month=month,
         allowed_shift_map=allowed_shift_map
     )
@@ -349,7 +430,11 @@ async def query_analyzer(state):
         HumanMessage(content=prompt.human)
     ]
 
-    chat = shift = preference = except_ = others = []
+    chat = []
+    shift = []
+    preference = []
+    except_ = []
+    others = []
     used_model = ""
     case_results = None
 
@@ -384,15 +469,19 @@ async def query_analyzer(state):
             llm = client.with_structured_output(queryAnalyzer)
             resp = await llm.ainvoke(messages)
             used_model = client.model_name
-            chat, shift, preference, except_, others = resp.Chat, resp.Shift, resp.Preference, resp.Except, resp.Others
+            chat = resp.Chat
+            shift = resp.Shift  # List[ShiftItem]
+            preference = resp.Preference
+            except_ = resp.Except
+            others = resp.Others
             print(f'[LLM 성공] Shift: {shift}')
             break
         except Exception as e:
             print(f'[LLM 실패 {idx}] {e}')
             if idx == len(models_to_try):
                 print('[모든 LLM 실패] 기본값 사용')
-    
-    # elqjrlddyd fhrm
+
+    # 디버깅 출력
     print("[QUERY ANALYZER 최종 출력]")
     print(f"query_shift: {shift}")
     print(f"query_others: {others}")
@@ -401,14 +490,23 @@ async def query_analyzer(state):
     # 토큰 계산
     model_name = used_model or models_to_try[0].model_name
     pt = _count_messages_tokens([prompt.system, prompt.human], model_name)
-    ct_json = json.dumps({"Chat": chat, "Shift": shift, "Preference": preference, "Except": except_, "Others": others}, ensure_ascii=False)
+
+    # ShiftItem을 dict로 변환하여 JSON 직렬화
+    shift_for_json = [{"text": s.text, "comment": s.comment} for s in shift] if shift else []
+    ct_json = json.dumps({"Chat": chat, "Shift": shift_for_json, "Preference": preference, "Except": except_, "Others": others}, ensure_ascii=False)
     ct = _count_tokens(ct_json, model_name)
     cost = _compute_cost(pt, ct, model_name)
     print(f'[토큰] {cost["usage"]} / {cost["cost_krw"]["total"]}원')
 
+    # shift를 {text, comment} 형태로 변환하여 반환
+    # shift_analyzer에 전달할 형태: texts와 comments 분리
+    shift_texts = [s.text for s in shift] if shift else []
+    shift_comments = [s.comment for s in shift] if shift else []
+
     ret = {
         "query_chat": chat,
-        "query_shift": shift,
+        "query_shift": shift_texts,  # 기존 호환성 유지
+        "query_shift_comments": shift_comments,  # 새로 추가: 사유 리스트
         "query_preference": preference,
         "query_except": except_,
         "query_others": others,
