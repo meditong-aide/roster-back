@@ -80,6 +80,9 @@ def get_user(db: Session, account_id: str):
 def mworks_get_user (account_id: str, password: str, client_ip: str) :
     rows = msdb_manager.fetch_all(Member.login_check(), params=(password, account_id))
 
+    if not rows:
+        raise HTTPException(status_code=501, detail="존재하지 않는 계정입니다.")
+
     for row in rows :
        IsPWCorrect = row['IsPWCorrect']
        EmpSeqNo = row['EmpSeqNo']
