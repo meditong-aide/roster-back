@@ -102,6 +102,7 @@ class PreferenceData(BaseModel):
     month: int
     # data: dict
     data: Dict[str, Any] = Field(default_factory=dict)
+    preference: Optional[List[Dict[str, Any]]] = None
 
 
 class PublishRequest(BaseModel):

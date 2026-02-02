@@ -162,7 +162,10 @@ def submit_preferences_service(
             detailed_id += 1
     
     # ==================== pair(선호/비선호) 데이터 처리 ====================
+    # data 내부 또는 top-level 어디에든 preference가 있으면 인식
     preference_list = preference_data.get("preference", None) if isinstance(preference_data, dict) else None
+    if preference_list is None and req.preference is not None:
+        preference_list = req.preference
 
     if preference_list is not None and isinstance(preference_list, list):
         # 프론트에서 preference 배열을 명시적으로 보낸 경우 → 해당 항목만 저장
