@@ -93,7 +93,7 @@ class RosterRequest(BaseModel):
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
     not_one_night: Optional[bool] = Field(default=None, description="야간 단발성(1N) 금지 여부")
     # 확정 원티드 사용 여부 (True: FixedWantedEntry 사용, False: 기존 WantedRequest 사용)
-    use_fixed_wanted: bool = Field(default=False, description="확정 원티드 사용 여부")
+    use_fixed_wanted: bool = Field(default=False, description="(미사용) 확정 원티드가 존재하면 자동 적용됨")
 
 class PreferenceSubmit(BaseModel):
     year: int

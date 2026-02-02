@@ -92,7 +92,7 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
     }
 
 def _collect_nurses_and_preferences(db: Session, req, current_user):
-    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (use_fixed_wanted=True일 때만 FixedWantedEntry 사용)"""
+    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (FixedWantedEntry 존재 시 자동 사용)"""
     # 1️⃣ 그룹 내 간호사 목록
     print('collect_nurses_and_preferences 진입')
     nurses_in_group = (
@@ -116,19 +116,13 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
     special_fixed_requests: list[dict] = []
 
-    # use_fixed_wanted 옵션 확인 (기본값: False)
-    use_fixed_wanted = getattr(req, 'use_fixed_wanted', False)
-
     # FixedWantedEntry 존재 여부 확인 (단일 테이블 구조)
-    has_fixed_wanted = False
-    if use_fixed_wanted:
-        has_fixed_wanted = db.query(FixedWantedEntry).filter(
-            FixedWantedEntry.group_id == current_user.group_id,
-            FixedWantedEntry.year == req.year,
-            FixedWantedEntry.month == req.month,
-        ).first() is not None
-        if not has_fixed_wanted:
-            print(f"[RosterCreate] use_fixed_wanted=True지만 FixedWantedEntry 없음, WantedRequest 사용")
+    # → 해당 년/월에 확정 원티드가 존재하면 자동으로 사용 (프론트에서 플래그 전달 불필요)
+    has_fixed_wanted = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == current_user.group_id,
+        FixedWantedEntry.year == req.year,
+        FixedWantedEntry.month == req.month,
+    ).first() is not None
 
     if has_fixed_wanted:
         print(f"[RosterCreate] FixedWantedEntry 사용 (단일 테이블)")
@@ -210,11 +204,8 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         print(f"[RosterCreate] FixedWantedEntry 기반 preferences 수집 완료: {len(preferences)}건")
         return nurses_in_group, preferences, special_fixed_requests, special_shift_map
 
-    # use_fixed_wanted=False이거나 FixedWantedEntry가 없으면 기존 WantedRequest 기반으로 수집
-    if not use_fixed_wanted:
-        print("[RosterCreate] use_fixed_wanted=False, WantedRequest 기반 수집")
-    else:
-        print("[RosterCreate] FixedWantedEntry 없음, WantedRequest 기반 수집")
+    # FixedWantedEntry가 없으면 기존 WantedRequest 기반으로 수집
+    print("[RosterCreate] FixedWantedEntry 없음, WantedRequest 기반 수집")
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     for nurse_id in nurse_ids:
         submitted_wr = (
