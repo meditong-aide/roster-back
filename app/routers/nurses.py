@@ -42,7 +42,7 @@ from services.nurse_service import (
 )
 from services.excel_service import (
     create_nurse_template, 
-    process_excel_upload, 
+    # process_excel_upload, 
     validate_excel_data,
     save_excel_data,
     create_groups_and_save_data,
@@ -51,7 +51,6 @@ from services.excel_service import (
     upload2_validate,
     upload2_confirm,
     export_members_excel_bytes,
-    integrated_member_and_nurse_register,
 )
 from datalayer.member import Member
 from pydantic import BaseModel, Field
@@ -228,31 +227,31 @@ async def download_template2(
         print('error', e)
         raise HTTPException(status_code=500, detail=f"템플릿2 생성 실패: {str(e)}")
 
-@router.post("/upload-excel")
-async def upload_excel(
-    file: UploadFile = File(...),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db)
-):
-    """엑셀 파일 업로드 및 검증"""
-    try:
-        if not current_user or not current_user.is_head_nurse:
-            raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
-        if file.size and file.size > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="파일 크기는 10MB를 초과할 수 없습니다.")
-        if not file.filename.lower().endswith(('.xlsx', '.xls')):
-            raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다. (.xlsx, .xls만 지원)")
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-            content = await file.read()
-            tmp_file.write(content)
-            tmp_file_path = tmp_file.name
-        try:
-            result = process_excel_upload(tmp_file_path, current_user, db)
-            return result
-        finally:
-            os.unlink(tmp_file_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"엑셀 업로드 실패: {str(e)}")
+# @router.post("/upload-excel")
+# async def upload_excel(
+#     file: UploadFile = File(...),
+#     current_user: UserSchema = Depends(get_current_user_from_cookie),
+#     db: Session = Depends(get_db)
+# ):
+#     """엑셀 파일 업로드 및 검증"""
+#     try:
+#         if not current_user or not current_user.is_head_nurse:
+#             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
+#         if file.size and file.size > 10 * 1024 * 1024:
+#             raise HTTPException(status_code=400, detail="파일 크기는 10MB를 초과할 수 없습니다.")
+#         if not file.filename.lower().endswith(('.xlsx', '.xls')):
+#             raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다. (.xlsx, .xls만 지원)")
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+#             content = await file.read()
+#             tmp_file.write(content)
+#             tmp_file_path = tmp_file.name
+#         try:
+#             result = process_excel_upload(tmp_file_path, current_user, db)
+#             return result
+#         finally:
+#             os.unlink(tmp_file_path)
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"엑셀 업로드 실패: {str(e)}")
 
 class Upload2ConfirmRequest(BaseModel):
     rows: List[dict]
