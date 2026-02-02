@@ -382,6 +382,8 @@ class NurseShiftRequest(Base):
     shift = Column(CHAR(1), nullable=False)  # 'D','E','N','O'
     score = Column(DECIMAL(3, 1), nullable=False)
     partial_request = Column(TEXT, nullable=True)
+    # 사유작성
+    comment = Column(TEXT, nullable=True)
 
 
 class NursePairRequest(Base):

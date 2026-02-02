@@ -102,6 +102,7 @@ class PreferenceData(BaseModel):
     month: int
     # data: dict
     data: Dict[str, Any] = Field(default_factory=dict)
+    preference: Optional[List[Dict[str, Any]]] = None
 
 
 class PublishRequest(BaseModel):
@@ -120,6 +121,8 @@ class CaseItem(BaseModel):
     shift: str
     year: int | None = None
     month: int | None = None
+    # 사유작성
+    comment: Optional[str] = Field(None)
 
     class Config:
         extra = "allow"

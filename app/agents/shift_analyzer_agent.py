@@ -108,6 +108,7 @@ def _compute_cost(prompt_tokens: int, completion_tokens: int, model_name: str) -
 
 class ShiftSubgraph(TypedDict):
     requests: List[str]
+    comments: List[str | None]  # query_analyzer에서 전달받은 사유 리스트
     n_requests: int
     phase: int
     shift_result: Annotated[list, operator.add]
@@ -377,11 +378,20 @@ async def shift_analyzer(state):
     # 최종 shift_result 형태로 반환 (기존 코드와 호환)
     shift_result = []
     if json_answer["result"]:
+        dates = json_answer["result"]["date"]
+        # query_analyzer에서 전달받은 comment 사용
+        comments_list = state.get('comments', [])
+        phase = state.get('phase', 0)
+        comment_from_query = comments_list[phase] if phase < len(comments_list) else None
+        # 각 날짜에 동일한 comment 적용
+        comments = [comment_from_query] * len(dates) if comment_from_query else [None] * len(dates)
+
         shift_result.append({
             "shift": json_answer["result"]["shift"],
-            "date": json_answer["result"]["date"],
+            "date": dates,
             "score": json_answer["result"]["score"],
-            "request": [request_text]  # 원본 텍스트 기록
+            "request": [request_text],  # 원본 텍스트 기록
+            "comment": comments  # 사유 추가
         })
 
     return {"shift_result": shift_result}
@@ -396,6 +406,7 @@ async def create_shift_analyzer(parent_state):
     """
     case_results = parent_state.get('case_results')
     requests = parent_state.get('query_shift', [])
+    comments = parent_state.get('query_shift_comments', [])  # 사유 리스트
     year = parent_state['year']
     month = parent_state['month']
 
@@ -466,6 +477,7 @@ async def create_shift_analyzer(parent_state):
         try:
             result = await graph_app.ainvoke({
                 "requests": requests,
+                "comments": comments,  # 사유 리스트 전달
                 "model": llm,
                 "year": year,
                 "month": month,
@@ -483,16 +495,19 @@ async def create_shift_analyzer(parent_state):
         for group in [new_shift_results, case_shift_result]:
             for item in group:
                 shift = item['shift']
-                for d, s, r in zip(item['date'], item['score'], item['request']):
+                item_comments = item.get('comment', [None] * len(item['date']))
+                for i, (d, s, r) in enumerate(zip(item['date'], item['score'], item['request'])):
                     key = (shift, d)
                     if key in seen:
                         continue
                     seen.add(key)
+                    c = item_comments[i] if i < len(item_comments) else None
                     combined.append({
                         'shift': shift,
                         'date': [d],
                         'score': [s],
-                        'request': [r]
+                        'request': [r],
+                        'comment': [c]  # 사유 추가
                     })
 
         print(f"[병합 완료] 총 {len(combined)}건 (중복 제거 후)")
@@ -559,6 +574,7 @@ async def create_shift_analyzer(parent_state):
         try:
             result = await graph_app.ainvoke({
                 "requests": requests,
+                "comments": comments,  # 사유 리스트 전달
                 "model": llm,
                 "year": year,
                 "month": month,
