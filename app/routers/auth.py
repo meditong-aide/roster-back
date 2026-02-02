@@ -80,6 +80,9 @@ def get_user(db: Session, account_id: str):
 def mworks_get_user (account_id: str, password: str, client_ip: str) :
     rows = msdb_manager.fetch_all(Member.login_check(), params=(password, account_id))
 
+    if not rows:
+        raise HTTPException(status_code=501, detail="존재하지 않는 계정입니다.")
+
     for row in rows :
        IsPWCorrect = row['IsPWCorrect']
        EmpSeqNo = row['EmpSeqNo']
@@ -151,24 +154,35 @@ async def login_for_access_token(
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
+        # 관리자가 아닌 경우 nurses 테이블 존재 여부 확인
+        if not is_master_admin:
+            try:
+                nurse_record = db.query(Nurse).filter(
+                    Nurse.account_id == account_id
+                ).first()
+                if nurse_record is None:
+                    raise HTTPException(
+                        status_code=501,
+                        detail="등록되지 않은 사용자입니다.",
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=501,
+                    detail=f"사용자 확인 중 오류가 발생했습니다: {str(e)}",
+                )
+
+        is_nurse_registered = True
+
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        
+
         # nurses 테이블의 값으로 보강/덮어쓰기
         extra_data = get_extra_data_from_nurses(db, account_id)
         office_id = extra_data.get("office_id") or office_id
         group_id = extra_data.get("group_id") or group_id
         if "is_head_nurse" in extra_data:
             is_head_nurse = extra_data["is_head_nurse"]
-            
-        # 추가
-        nurse_record = db.query(Nurse).filter(
-            Nurse.account_id == account_id
-        ).first()
-        
-        if is_master_admin:
-            is_nurse_registered = True
-        else:
-            is_nurse_registered = nurse_record is not None
 
         access_token = create_login_token(
             data={
@@ -218,6 +232,8 @@ async def login_for_access_token(
             # 추가 필드
             is_nurse_registered=is_nurse_registered
         )
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
