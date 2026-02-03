@@ -326,7 +326,7 @@ class FixedWantedEntryResponse(BaseModel):
 
 
 class AdjustmentNurse(BaseModel):
-    """원티드 조��판 - 간호사별 데이터"""
+    """원티드 조정판 - 간호사별 데이터"""
     nurse_id: str
     name: str
     entries: List[FixedWantedEntryResponse]
