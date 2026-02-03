@@ -187,7 +187,7 @@ def mworks_access_token (account_id: str, client_ip: str) :
     LogType = 'W'
     RegDate = datetime.now()
 
-    if aiuseyn != 'Y' :
+    if aiuseyn != 'Y' and str(EmpAuthGbn).upper() != 'ADM':
         raise HTTPException(status_code=500, detail=f"AI근무표 서비스에 가입되지 않았습니다.")
 
     params = (account_id, RegDate, client_ip, EmpSeqNo, OfficeCode, LogType)

@@ -58,7 +58,7 @@ class Member:
             Left Join bizwiz20db.T_Team D On A.mb_part=D.mb_part And A.OfficeCode=D.OfficeCode
             Left Join bizwiz20db.T_Part E On A.OfficialTitleCode=E.code And A.OfficeCode=E.OfficeCode
             left join bizwiz20db.Manage_Office F on A.OfficeCode = F.OfficeCode 
-            Where B.MemberID = %s AND a.EmpAuthGbn in ('ADM','MEM') and C.ade_sch = 'Y'
+            Where B.MemberID = %s AND a.EmpAuthGbn in ('ADM','MEM') and (C.ade_sch = 'Y' OR a.EmpAuthGbn = 'ADM')
         
         """
         return _queryString

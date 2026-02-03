@@ -87,11 +87,12 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
        IsPWCorrect = row['IsPWCorrect']
        EmpSeqNo = row['EmpSeqNo']
        office_id = row['OfficeCode']
+       EmpAuthGbn = row['EmpAuthGbn']
        aiuseyn = row['aiuseyn']
     LogType = 'W'
     RegDate = datetime.now()
 
-    if aiuseyn.upper() != 'Y' :
+    if aiuseyn.upper() != 'Y' and str(EmpAuthGbn).upper() != 'ADM':
         raise HTTPException(status_code=500, detail=f"AI근무표 서비스에 가입되지 않았습니다.")
 
     params = (account_id, RegDate, client_ip, EmpSeqNo, office_id, LogType)
@@ -398,7 +399,7 @@ async def handle_find_pw_request(
     else:
         pwd_reset_history_result = msdb_manager.execute(Member.member_pwd_reset_history(user_pw_reset), params=empseqno)
         if not pwd_reset_history_result or pwd_reset_result == 0:
-            return {"result": "fail", "message": "오류가 발생하였습니다."}
+            return {"result": "fail", "message": "오류가 발��하였습니다."}
 
     if auth_method == 'phone':
         sendPhoneNumber = "0269593214"
