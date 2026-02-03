@@ -104,7 +104,7 @@ async def get_wanted_status(
     ).first()
 
     if not wanted:
-        return {"status": None, "message": "wanted 작�� 요청 전"}
+        return {"status": None, "message": "wanted 작성 요청 전"}
     
     return {
         "status": wanted.status,
@@ -652,7 +652,7 @@ async def get_fixed_wanted(
     db: Session = Depends(get_db)
 ):
     """
-    확정 원티드 조회 API (근무표 생성��) - 단일 테이블 구조
+    확정 원티드 조회 API (근무표 생성) - 단일 테이블 구조
     - is_applied=True인 항목만 반환
     """
     if not current_user:

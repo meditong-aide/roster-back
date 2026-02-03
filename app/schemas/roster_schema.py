@@ -306,7 +306,7 @@ class FixedWantedCreate(BaseModel):
 
 
 class FixedWantedEntryResponse(BaseModel):
-    """확정 원티드 항목 응��"""
+    """확정 원티드 항목"""
     id: int
     group_id: str
     year: int
