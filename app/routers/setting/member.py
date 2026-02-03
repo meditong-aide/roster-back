@@ -9,6 +9,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.responses import FileResponse
 
 from datalayer.setting import Setting
+from datalayer.member import Member
 from db.client2 import msdb_manager
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -162,6 +163,31 @@ async def create_upload_file(
                              data=f"officeCode={OfficeCode}&EmpSeqNo={EmpSeqNo}&Token={token}",
                              headers={'Content-Type': 'application/x-www-form-urlencoded'})
     if response.status_code == 200:
+        print(f"[초기 비밀번호 변경 시작] {len(df)} 명")
+        for member_id in df['MemberID'].dropna().astype(str).str.strip():
+            if not member_id:
+                continue
+            emp_info = msdb_manager.fetch_one(
+                "SELECT EmpSeqNo FROM bizwiz20db.Member_Login WHERE OfficeCode = %s AND MemberID = %s",
+                (OfficeCode, member_id)
+            )
+            emp_seq_no = None
+            if emp_info:
+                if isinstance(emp_info, dict):
+                    emp_seq_no = emp_info.get('EmpSeqNo')
+                elif isinstance(emp_info, (tuple, list)):
+                    emp_seq_no = emp_info[0] if emp_info else None
+                elif isinstance(emp_info, (int, str)):
+                    emp_seq_no = emp_info
+                else:
+                    print(f"타입오류 {type(emp_info)} > {emp_info}")
+            if emp_seq_no:
+                new_password = member_id + "*"
+                msdb_manager.execute(
+                    Member.member_pwd_reset(),
+                    (new_password, new_password, emp_seq_no)
+                )
+                print(f"비밀번호 초기화 완료")
         return {"result": "succeed"}
     return {"result": "external_api_fail"}
 
