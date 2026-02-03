@@ -261,6 +261,10 @@ class IntegratedRegisterRequest(BaseModel):
     group_id: str
     members: List[Dict[str, Any]]  # 한국어 키로 입력
 
+class AddToGroupRequest(BaseModel):
+    nurse_ids: List[str]
+    group_id: str
+
 
 
 # 마이 페이지 테스트
