@@ -6,7 +6,7 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 import json
 import traceback
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Set, Tuple
 
 from dateutil.relativedelta import relativedelta
@@ -919,12 +919,42 @@ def request_wanted_shifts_service(
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
 
-    if db.query(Wanted).filter(
+    # if db.query(Wanted).filter(
+    #     Wanted.group_id == target_group_id,
+    #     Wanted.year == req.year,
+    #     Wanted.month == req.month
+    # ).first():
+    #     raise Exception("이미 해당 월의 요청이 존재합니다.")
+    existing = db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == req.year,
         Wanted.month == req.month
-    ).first():
-        raise Exception("이미 해당 월의 요청이 존재합니다.")
+    ).first()
+    if existing:
+        existing.exp_date = req.exp_date
+        db.commit()
+        db.refresh(existing)
+        close_expired_wanted(db)
+        db.refresh(existing)
+        # 마감 연장 푸시 알림
+        group_row = db.query(Group).filter(Group.group_id == target_group_id).first()
+        office_id = group_row.office_id if group_row and group_row.office_id else current_user.office_id
+        nurse_ids = [row.nurse_id for row in db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()]
+        send_wanted_request_push(
+            year=req.year,
+            month=req.month,
+            recipients=nurse_ids,
+            office_code=office_id,
+            sender_emp_seq_no=current_user.nurse_id,
+            sender_member_id=current_user.account_id,
+            deadline=req.exp_date,
+        )
+        display_exp_date = "마감일 없음" if existing.exp_date is None else existing.exp_date.strftime("%Y-%m-%d")
+        return {
+            "message": "마감일이 성공적으로 변경되었습니다.",
+            "current_exp_date": existing.exp_date.isoformat() if existing.exp_date else None,
+            "display_exp_date": display_exp_date
+        }
 
     new_wanted = Wanted(
         group_id=target_group_id,
@@ -970,20 +1000,56 @@ def close_expired_wanted(db: Session) -> int:
     반환:
         int: 'requested' 상태에서 'closed'로 변경된 Wanted 건수.
              예를 들어 만료된 건이 3건이면 3을 반환합니다.
+    추가 사항:
+    Wanted 테이블의 status 값을 exp_date와 현재 시간 비교해서 유기적으로 처리
+    1. exp_date > now 인 경우 status = 'requested' 처리
+    2. exp_date <= now 인 경우 status = 'closed' 처리
+    3. exp_date is Null 인 경우 status = 'requested' 처리 (무기한)
+    반환:
+        상태가 변경된 Wanted 레코드 수
     """
-    now = datetime.now()
-    query = db.query(Wanted).filter(
-        Wanted.status == 'requested',
-        Wanted.exp_date.isnot(None),
-        Wanted.exp_date < now,
-    )
-
+    # now = datetime.now()
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now + timedelta(hours=9)
     updated_count = 0
-    for wanted in query:
-        wanted.status = 'closed'
-        updated_count += 1
+    
+    # query = db.query(Wanted).filter(
+    #     Wanted.status == 'requested',
+    #     Wanted.exp_date.isnot(None),
+    #     Wanted.exp_date < now,
+    # )
 
+    # updated_count = 0
+    # for wanted in query:
+    #     wanted.status = 'closed'
+    #     updated_count += 1
+
+    # if updated_count > 0:
+    #     db.commit()
+    #     print(f"Wanted 자동 마감 완료: {updated_count}건")
+    # return updated_count
+    
+    wanted_list = db.query(Wanted).all()
+    
+    for wanted in wanted_list:
+        old_status = wanted.status
+        new_status = None
+        
+        if wanted.exp_date is None:
+            new_status = 'requested'
+        elif wanted.exp_date > now:
+            new_status = 'requested'
+        else:
+            new_status = 'closed'
+        
+        if new_status != old_status:
+            wanted.status = new_status
+            updated_count += 1
+            print(f"[STATUS UPDATE] {wanted.year}-{wanted.month} | {wanted.group_id} : {old_status} > {new_status} | (exp_date={wanted.exp_date.isoformat() if wanted.exp_date else 'None'})")
+    
     if updated_count > 0:
         db.commit()
-        print(f"Wanted 자동 마감 완료: {updated_count}건")
+        print(f"[STATUS UPDATE] Wanted 테이블 status 업데이트 완료")
+    else:
+        print(f"[STATUS UPDATE] Wanted 테이블 status 변경 내역 없음")
     return updated_count

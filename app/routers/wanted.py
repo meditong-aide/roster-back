@@ -14,6 +14,7 @@ from schemas.auth_schema import User as UserSchema
 from db.models import Nurse, ShiftPreference
 from services.wanted_service import request_wanted_shifts_service
 from services.wanted_service import invoke_and_persist_wanted_service
+from services.wanted_service import close_expired_wanted
 from db.models import Group
 from datetime import datetime, timedelta, timezone
 router = APIRouter(
@@ -32,6 +33,10 @@ async def request_wanted_shifts(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    # 추가
+    close_expired_wanted(db)
+    
     # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
     if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
         override_gid = None
@@ -80,6 +85,9 @@ async def get_wanted_status(
             raise HTTPException(status_code=403, detail="Group does not belong to your office")
         target_group_id = g.group_id
 
+    # 추가
+    close_expired_wanted(db)
+    
     wanted = db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == year,
@@ -155,6 +163,9 @@ async def get_all_wanted(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    # 추가
+    close_expired_wanted(db)
 
     # 대상 그룹 결정
     if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
@@ -203,6 +214,9 @@ async def close_wanted_request(
             raise HTTPException(status_code=403, detail="Group does not belong to your office")
         target_group_id = g.group_id
 
+    # 추가
+    close_expired_wanted(db)
+    
     wanted = db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == year,
@@ -212,8 +226,16 @@ async def close_wanted_request(
     if not wanted:
         raise HTTPException(status_code=404, detail="해당 월의 wanted 요청을 찾을 수 없습니다.")
     
+    # if wanted.status == 'closed':
+    #     raise HTTPException(status_cdoe=400, detail="이미 마감된 wanted 입니다.")
+    
+    # 수동 마감 추가 : exp_date 현재 시점으로 설정 및 status : closed 로 업데이트
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now + timedelta(hours=9)
+    wanted.exp_date = now
     wanted.status = 'closed'
     db.commit()
+    db.refresh(wanted)
     
     return {"message": "Wanted 요청이 마감되었습니다."}
 
@@ -252,14 +274,15 @@ async def update_wanted_deadline(
     if not wanted:
         raise HTTPException(status_code=404, detail="해당 월의 wanted 요청을 찾을 수 없습니다.")
     
-    if wanted.status == 'closed':
-        raise HTTPException(status_code=400, detail="마감된 wanted 요청의 마감일은 변경할 수 없습니다.")
+    # if wanted.status == 'closed':
+    #     raise HTTPException(status_code=400, detail="마감된 wanted 요청의 마감일은 변경할 수 없습니다.")
     
     payload = req.model_dump(exclude_unset=True)
     if "exp_date" in payload:
         wanted.exp_date = req.exp_date
         db.commit()
         db.refresh(wanted)
+        close_expired_wanted(db)
         message = "마감일이 제거되었습니다. (마감일 없음)" if req.exp_date is None else "마감일이 성공적으로 변경되었습니다."
     else:
         message = "마감일 변경 요청이 없어 기존 값이 유지됩니다."
@@ -279,6 +302,8 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
     """
     그래프를 실행하여 로스터 관련 요청을 처리합니다.
     """
+    # 추가
+    close_expired_wanted(db)
     
     try:
         
