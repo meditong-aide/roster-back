@@ -742,3 +742,47 @@ def move_nurse_service(req, current_user, db: Session):
     
     db.commit()
     return {"message": "간호사 순서 변경 완료"}
+
+
+def delete_nurse_service(
+    nurse_id: str,
+    current_user: UserSchema,
+    db: Session
+):
+    """
+    특정 간호사 삭제 서비스 함수
+    - HDN 또는 ADM만 허용
+    - 삭제 후 재정렬(선택: 필요 시 _reindex_contiguously 호출)
+    """
+    if not current_user:
+        raise Exception("Not authenticated")
+    
+    # 권한 체크
+    if not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise Exception("Permission denied")
+    
+    # 대상 간호사 조회
+    db_nurse = db.query(NurseModel).filter(
+        NurseModel.nurse_id == nurse_id,
+        NurseModel.group_id == current_user.group_id if not current_user.is_master_admin else True
+    ).first()
+    
+    if not db_nurse:
+        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+    
+    try:
+        # 삭제
+        db.delete(db_nurse)
+        db.commit()
+        
+        # 삭제 후 active 상태별 재정렬 (선택: 순서가 중요하다면)
+        active_nurses = _get_nurses_by_active(db_nurse.group_id, 1, db)
+        _reindex_contiguously(active_nurses)
+        inactive_nurses = _get_nurses_by_active(db_nurse.group_id, 0, db)
+        _reindex_contiguously(inactive_nurses)
+        db.commit()
+        
+        return {"message": f"Nurse {nurse_id} deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise Exception(f"Deletion failed: {str(e)}")

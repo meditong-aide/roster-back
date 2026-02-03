@@ -39,6 +39,7 @@ from services.nurse_service import (
     reorder_nurses_service,
     get_nurses_filtered_service,
     get_personnel_basic_info_service,
+    delete_nurse_service,
 )
 from services.excel_service import (
     create_nurse_template, 
@@ -690,3 +691,20 @@ async def verify_and_update_phone(
     del verification_cache[nurse_id]
 
     return {"message": "휴대폰 번호가 성공적으로 변경되었습니다"}
+
+
+@router.delete("/{nurse_id}")
+async def delete_nurse(
+    nurse_id: str,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    특정 간호사 삭제 API
+    - 프론트에서 휴지통 아이콘 클릭 시 호출
+    """
+    try:
+        result = delete_nurse_service(nurse_id, current_user, db)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")
