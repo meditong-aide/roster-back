@@ -584,6 +584,7 @@ def bulk_update_nurses_service(
 
     updated_count = 0
     print('db_nurses_dict', nurses_data)
+    ALL_SHIFTS = {"D","E","N"}
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
 
@@ -620,6 +621,12 @@ def bulk_update_nurses_service(
             #         db_nurse.fixed_shift = None
             # else:
             #     db_nurse.fixed_shift = None
+            if 'is_night_nurse' in update_data:
+                night_shifts = update_data['is_night_nurse']
+                if isinstance(night_shifts, list) and set(night_shifts) == ALL_SHIFTS:
+                    db_nurse.is_night_nurse = []
+                else:
+                    db_nurse.is_night_nurse = night_shifts if night_shifts is not None else []
 
             # === ★★★ 새로 추가: work_shifts 처리 ★★★ ===
             if 'work_shifts' in update_data:
@@ -632,12 +639,12 @@ def bulk_update_nurses_service(
                 db_nurse.weekly_off_enabled = 0
             # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
             for key, value in update_data.items():
-                if key in ('work_shifts'):
+                if key in ('is_night_nurse', 'work_shifts'):
                     continue
                 if hasattr(db_nurse, key):
                     setattr(db_nurse, key, value)
 
-            # updated_count += 1
+            updated_count += 1
 
         # # === 신규 간호사 생성 ===
         # else:
