@@ -469,8 +469,7 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
     return {"now_kst": now_kst.isoformat(), "updated": updated_count}
 
 
-# WantedConfig 관련 엔드포인트 (DAILY_LIMIT 전용)
-# - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
+# WantedConfig 관련 엔드포인트
 @router.get("/config")
 async def get_wanted_config_endpoint(
     year: Optional[int] = None,
@@ -481,32 +480,24 @@ async def get_wanted_config_endpoint(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용)
-
-    Query Parameters:
-        - year, month: 해당 월의 설정 조회 (선택)
-        - target_date: 특정 일자 조회 (선택)
-        - shift_type: 근무 타입 필터 (선택)
+    """
+    일자별 원티드 제한 설정 조회
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 권한 확인 (수간호사 또는 관리자만)
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
-        raise HTTPException(status_code=403, detail="Permission denied")
-
     # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
+    if getattr(current_user, 'is_master_admin', False) and group_id:
         g = db.query(Group).filter(Group.group_id == group_id).first()
         if not g:
             raise HTTPException(status_code=404, detail="Group not found")
         if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
             raise HTTPException(status_code=403, detail="Group does not belong to your office")
         target_group_id = g.group_id
+    elif current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        raise HTTPException(status_code=400, detail="소속 그룹이 없습니다. group_id를 지정해주세요.")
 
     # 필터 구성
     filters = {}
@@ -532,14 +523,8 @@ async def upsert_wanted_config_endpoint(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용, 여러 일자 한번에 처리)
-
-    Body: List[WantedConfigCreate]
-        - year: 연도
-        - month: 월
-        - target_date: 특정 일자 (YYYY-MM-DD)
-        - shift_type: 근무 타입 (휴무/휴가)
-        - max_requests: 최대 요청 개수
+    """
+    일자별 원티드 제한 설정 생성/수정
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -579,11 +564,8 @@ async def delete_wanted_config_endpoint(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """일자별 원티드 제한 설정 삭제 (DAILY_LIMIT 전용)
-
-    Query Parameters:
-        - target_date: 특정 일자 (선택)
-        - shift_type: 근무 타입 (선택)
+    """
+    일자별 원티드 제한 설정 삭제
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -632,13 +614,8 @@ async def validate_wanted_limits_endpoint(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """원티드 요청 제한 검증
-
-    Body:
-        - nurse_id: 간호사 ID (필수)
-        - year: 연도 (필수)
-        - month: 월 (필수)
-        - shift_date_str: 근무 날짜 'YYYY-MM-DD' (필수)
+    """
+    원티드 요청 제한 검증
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
