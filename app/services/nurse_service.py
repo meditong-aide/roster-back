@@ -5,7 +5,7 @@
 """
 from sqlalchemy.orm import Session
 from db.models import Nurse as NurseModel, Group
-from schemas.roster_schema import NurseProfile, CodeMapp
+from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional
 from pprint import pprint
@@ -105,16 +105,16 @@ def get_nurses_in_group_service(
     for nurse in nurses:
         # is_night_nurse를 Enum 값으로 변환 (데이터 베이스 : JSON)
         is_night_nurse = nurse.is_night_nurse or []
-        try:
-            # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
-            is_night_nurse = [
-                str(code)
-                for code in is_night_nurse
-                if code in CodeMapp.__members__.values()
-            ]
-        except (ValueError, TypeError, KeyError) as e:
-            logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
-            is_night_nurse = []
+        # try:
+        #     # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
+        #     is_night_nurse = [
+        #         str(code)
+        #         for code in is_night_nurse
+        #         if code in CodeMapp.__members__.values()
+        #     ]
+        # except (ValueError, TypeError, KeyError) as e:
+        #     logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
+        #     is_night_nurse = []
         
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
