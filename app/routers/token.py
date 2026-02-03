@@ -10,7 +10,7 @@ from datalayer.member import Member
 from datalayer.token import Token
 # from db.client import get_db
 from db.client2 import get_db, msdb_manager
-from db.models import Nurse
+from db.models import Nurse, Group
 from schemas.auth_schema import User as UserSchema
 from utils.security import create_access_token
 from utils.security import create_login_token
@@ -36,12 +36,18 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
         nurse = db.query(Nurse).filter(Nurse.account_id == account_id).first()
         if not nurse:
             return {}
-        return {
+        result = {
             "office_id": getattr(nurse, "office_id", None),
             "account_id": getattr(nurse, "account_id", None),
             "is_head_nurse": bool(getattr(nurse, "is_head_nurse", False)),
             "group_id": getattr(nurse, "group_id", None),
         }
+        # group_id 기준으로 groups 테이블에서 group_name 조회
+        if result["group_id"]:
+            group = db.query(Group).filter(Group.group_id == result["group_id"]).first()
+            if group:
+                result["group_name"] = group.group_name
+        return result
     except Exception:
         return {}
 
@@ -119,6 +125,7 @@ async def login_for_access_token(response: Response,
             extra_data = get_extra_data_from_nurses(db, account_id)
             office_id = extra_data.get("office_id") or office_id
             group_id = extra_data.get("group_id") or group_id
+            mb_part_name = extra_data.get("group_name") or mb_part_name
             if "is_head_nurse" in extra_data:
                 is_head_nurse = extra_data["is_head_nurse"]
 
