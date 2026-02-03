@@ -5,7 +5,7 @@
 """
 from sqlalchemy.orm import Session
 from db.models import Nurse as NurseModel, Group
-from schemas.roster_schema import NurseProfile, CodeMapp
+from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional
 from pprint import pprint
@@ -105,16 +105,16 @@ def get_nurses_in_group_service(
     for nurse in nurses:
         # is_night_nurse를 Enum 값으로 변환 (데이터 베이스 : JSON)
         is_night_nurse = nurse.is_night_nurse or []
-        try:
-            # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
-            is_night_nurse = [
-                str(code)
-                for code in is_night_nurse
-                if code in CodeMapp.__members__.values()
-            ]
-        except (ValueError, TypeError, KeyError) as e:
-            logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
-            is_night_nurse = []
+        # try:
+        #     # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
+        #     is_night_nurse = [
+        #         str(code)
+        #         for code in is_night_nurse
+        #         if code in CodeMapp.__members__.values()
+        #     ]
+        # except (ValueError, TypeError, KeyError) as e:
+        #     logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
+        #     is_night_nurse = []
         
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
@@ -584,6 +584,7 @@ def bulk_update_nurses_service(
 
     updated_count = 0
     print('db_nurses_dict', nurses_data)
+    ALL_SHIFTS = {"D","E","N"}
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
 
@@ -620,6 +621,12 @@ def bulk_update_nurses_service(
             #         db_nurse.fixed_shift = None
             # else:
             #     db_nurse.fixed_shift = None
+            if 'is_night_nurse' in update_data:
+                night_shifts = update_data['is_night_nurse']
+                if isinstance(night_shifts, list) and set(night_shifts) == ALL_SHIFTS:
+                    db_nurse.is_night_nurse = []
+                else:
+                    db_nurse.is_night_nurse = night_shifts if night_shifts is not None else []
 
             # === ★★★ 새로 추가: work_shifts 처리 ★★★ ===
             if 'work_shifts' in update_data:
@@ -632,12 +639,12 @@ def bulk_update_nurses_service(
                 db_nurse.weekly_off_enabled = 0
             # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
             for key, value in update_data.items():
-                if key in ('work_shifts'):
+                if key in ('is_night_nurse', 'work_shifts'):
                     continue
                 if hasattr(db_nurse, key):
                     setattr(db_nurse, key, value)
 
-            # updated_count += 1
+            updated_count += 1
 
         # # === 신규 간호사 생성 ===
         # else:
