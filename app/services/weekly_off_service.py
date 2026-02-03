@@ -516,5 +516,6 @@ def get_my_weekly_off_service(
         month=month,
         my_weekly_off_dates=dates,
         my_weekly_off_weekday=preview_weekday,
+        my_weekly_off_weekday_base=base_weekday,
         my_weekly_off_label=get_weekday_label(preview_weekday)
     )
