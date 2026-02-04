@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -511,7 +512,10 @@ async def get_wanted_adjustment(
 
     try:
         result = get_wanted_adjustment_service(db, target_group_id, year, month)
-        return result
+        return JSONResponse(
+            content=jsonable_encoder(result),
+            media_type="application/json; charset=utf-8"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"원티드 조정판 조회 실패: {str(e)}")
 
@@ -640,7 +644,7 @@ async def reset_fixed_wanted(
         return result
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실���: {str(e)}")
 
 
 @router.get("/fixed/{year}/{month}")
