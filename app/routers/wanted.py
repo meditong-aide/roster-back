@@ -644,7 +644,7 @@ async def reset_fixed_wanted(
         return result
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실���: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
 
 
 @router.get("/fixed/{year}/{month}")
