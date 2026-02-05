@@ -1026,9 +1026,9 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     # ───────── 5) 헤더 행 ─────────
     header_row = 7
     ws.cell(row=header_row, column=1, value="번호").font = header_font
-    ws.cell(row=header_row, column=2, value="구분").font = header_font
-    ws.cell(row=header_row, column=3, value="경력").font = header_font
-    ws.cell(row=header_row, column=4, value="이름").font = header_font
+    ws.cell(row=header_row, column=2, value="이름").font = header_font
+    ws.cell(row=header_row, column=3, value="구분").font = header_font
+    ws.cell(row=header_row, column=4, value="경력").font = header_font
 
     for c in range(1, static_cols + 1):
         cell = ws.cell(row=header_row, column=c)
@@ -1055,9 +1055,9 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
 
     # 열 너비
     ws.column_dimensions['A'].width = 5
-    ws.column_dimensions['B'].width = 6
+    ws.column_dimensions['B'].width = 12
     ws.column_dimensions['C'].width = 6
-    ws.column_dimensions['D'].width = 12
+    ws.column_dimensions['D'].width = 6
     for d in range(1, days_in_month + 1):
         ws.column_dimensions[get_column_letter(static_cols + d)].width = 4
     for s in range(spacer_cols):
@@ -1075,9 +1075,9 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         is_current_user = (str(n.nurse_id) == str(current_user.nurse_id))
 
         ws.cell(row=r, column=1, value=idx)
-        ws.cell(row=r, column=2, value="RN")
-        ws.cell(row=r, column=3, value=n.experience)
-        ws.cell(row=r, column=4, value=n.name)
+        ws.cell(row=r, column=2, value=n.name)
+        ws.cell(row=r, column=3, value="RN")
+        ws.cell(row=r, column=4, value=n.experience)
 
         for c in range(1, static_cols + 1):
             cell = ws.cell(row=r, column=c)
