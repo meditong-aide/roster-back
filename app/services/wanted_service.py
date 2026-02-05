@@ -1059,12 +1059,6 @@ def get_wanted_adjustment_service(
                 WantedRequest.month == month_str,
             ).order_by(WantedRequest.request_id.desc()).first()
 
-            # 디버깅 로그
-            if latest_wr:
-                print(f"[DEBUG] {nurse.name}({nurse.nurse_id}): WantedRequest found - request_id={latest_wr.request_id}, is_submitted={latest_wr.is_submitted}")
-            else:
-                print(f"[DEBUG] {nurse.name}({nurse.nurse_id}): WantedRequest NOT found for month={month_str}")
-
             if latest_wr and latest_wr.is_submitted:
                 shift_requests = db.query(NurseShiftRequest).filter(
                     NurseShiftRequest.nurse_id == nurse.nurse_id,
@@ -1072,8 +1066,6 @@ def get_wanted_adjustment_service(
                     NurseShiftRequest.shift_date >= start_date,
                     NurseShiftRequest.shift_date < end_date,
                 ).all()
-
-                print(f"[DEBUG] {nurse.name}({nurse.nurse_id}): NurseShiftRequest count={len(shift_requests)}")
 
                 for idx, sr in enumerate(shift_requests):
                     entries.append(FixedWantedEntryResponse(
