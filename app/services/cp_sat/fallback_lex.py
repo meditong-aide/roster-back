@@ -614,11 +614,15 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, w_idx) == 0)
         # 순수 O 4연속 금지 (fixed로 이미 4O면 경고만 남기고 스킵)
+        # cfg.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3)
         if off_idx is not None:
             vac_cells = set(off_exception_vacation_cells)
+            skip_4o_hard_first_days = int(getattr(cfg, "skip_4o_hard_first_days", 3) or 0)
             for n in range(N):
                 for d in range(join[n], leave[n] - 2):
                     if d + 3 > leave[n]:
+                        continue
+                    if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
                         continue
                     fixed_o_cnt = sum(
                         1

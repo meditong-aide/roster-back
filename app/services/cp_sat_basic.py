@@ -1700,12 +1700,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     continue
                 m.Add(X(n, d, w_idx) == 0)
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
+    # config.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3 → 1~3일 시작 윈도우는 4연속 O 허용)
     if off_idx_full is not None:
         vac_cells = set(vacation_off_cells)
         off_or_weekly = {cell for cell in structural_off_cells if cell not in vac_cells}
+        skip_4o_hard_first_days = int(getattr(rs.config, "skip_4o_hard_first_days", 3) or 0)
         for n in range(N):
             for d in range(join[n], leave[n] - 2):
                 if d + 3 > leave[n]:
+                    continue
+                if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
                     continue
                 fixed_o_cnt = sum(
                     1
