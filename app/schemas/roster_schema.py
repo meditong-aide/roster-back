@@ -330,7 +330,7 @@ class AdjustmentNurse(BaseModel):
     nurse_id: str
     name: str
     entries: List[FixedWantedEntryResponse]
-    monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, ...}
+    monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, "주": 4, ...}
 
 
 class AdjustmentResponse(BaseModel):

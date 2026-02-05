@@ -1059,6 +1059,12 @@ def get_wanted_adjustment_service(
                 WantedRequest.month == month_str,
             ).order_by(WantedRequest.request_id.desc()).first()
 
+            # 디버깅 로그
+            if latest_wr:
+                print(f"[DEBUG] {nurse.name}({nurse.nurse_id}): WantedRequest found - request_id={latest_wr.request_id}, is_submitted={latest_wr.is_submitted}")
+            else:
+                print(f"[DEBUG] {nurse.name}({nurse.nurse_id}): WantedRequest NOT found for month={month_str}")
+
             if latest_wr and latest_wr.is_submitted:
                 shift_requests = db.query(NurseShiftRequest).filter(
                     NurseShiftRequest.nurse_id == nurse.nurse_id,
@@ -1066,6 +1072,8 @@ def get_wanted_adjustment_service(
                     NurseShiftRequest.shift_date >= start_date,
                     NurseShiftRequest.shift_date < end_date,
                 ).all()
+
+                print(f"[DEBUG] {nurse.name}({nurse.nurse_id}): NurseShiftRequest count={len(shift_requests)}")
 
                 for idx, sr in enumerate(shift_requests):
                     entries.append(FixedWantedEntryResponse(
@@ -1084,6 +1092,34 @@ def get_wanted_adjustment_service(
                         created_by=None,
                     ))
                     monthly_summary[sr.shift] += 1
+
+        # 주휴 일자 계산 및 entries에 추가
+        weekly_off_enabled = getattr(nurse, "weekly_off_enabled", False) or False
+        weekly_off_days: List[int] = []
+        if weekly_off_enabled:
+            weekly_off_days = sorted(_compute_weekly_off_days(
+                db, nurse.nurse_id, group_id, year, month
+            ))
+            # 주휴 일자를 entries에 추가 (source_type: "weekly_off")
+            if weekly_off_days:
+                for day in weekly_off_days:
+                    weekly_off_date = date(year, month, day)
+                    entries.append(FixedWantedEntryResponse(
+                        id=-day,  # 음수 ID로 주휴 구분 (실제 DB ID가 아님)
+                        group_id=group_id,
+                        year=year,
+                        month=month,
+                        nurse_id=nurse.nurse_id,
+                        shift_date=weekly_off_date,
+                        shift_id="주",
+                        is_applied=True,  # 주휴는 항상 적용됨 (토글 불가)
+                        source_type="weekly_off",
+                        original_shift_id=None,
+                        reason=None,
+                        head_nurse_memo=None,
+                        created_by=None,
+                    ))
+                monthly_summary["주"] = len(weekly_off_days)
 
         nurse_data_list.append(AdjustmentNurse(
             nurse_id=nurse.nurse_id,
@@ -1159,9 +1195,34 @@ def save_fixed_wanted_service(
     if deleted_count > 0:
         print(f"기존 FixedWantedEntry 삭제: {deleted_count}건")
 
+    # ── 간호사별 주휴 일자 계산 (주휴일은 저장에서 제외) ──
+    nurse_weekly_off_map: Dict[str, Set[int]] = {}
+    for nid in nurse_ids:
+        nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nid).first()
+        if nurse_row and getattr(nurse_row, "weekly_off_enabled", False):
+            weekly_off_days = _compute_weekly_off_days(db, nid, group_id, req.year, req.month)
+            if weekly_off_days:
+                nurse_weekly_off_map[nid] = weekly_off_days
+                print(f"[주휴 필터] {nid}: 주휴일 {sorted(weekly_off_days)}")
+
     # ── 새 엔트리 추가 (source_type / original_shift_id 자동 감지) ──
     new_entries: List[FixedWantedEntry] = []
+    skipped_weekly_off_count = 0
     for entry in req.entries:
+        # source_type이 weekly_off인 경우 저장에서 제외 (주휴는 저장하지 않음)
+        if entry.source_type == "weekly_off":
+            skipped_weekly_off_count += 1
+            print(f"[주휴 필터] {entry.nurse_id}: {entry.shift_date} ({entry.shift_id}) → source_type=weekly_off이므로 저장 제외")
+            continue
+
+        # 주휴일인 경우 저장에서 제외 (날짜 기반 백업 필터)
+        entry_day = entry.shift_date.day
+        nurse_weekly_off_days = nurse_weekly_off_map.get(entry.nurse_id, set())
+        if entry_day in nurse_weekly_off_days:
+            skipped_weekly_off_count += 1
+            print(f"[주휴 필터] {entry.nurse_id}: {entry.shift_date} ({entry.shift_id}) → 주휴일이므로 저장 제외")
+            continue
+
         key = (entry.nurse_id, entry.shift_date.isoformat())
         original_shift = original_map.get(key)
 
@@ -1205,7 +1266,7 @@ def save_fixed_wanted_service(
     for entry in new_entries:
         db.refresh(entry)
 
-    print(f"FixedWantedEntry 저장 완료: group={group_id}, {req.year}-{req.month}, entries={len(new_entries)}건")
+    print(f"FixedWantedEntry 저장 완료: group={group_id}, {req.year}-{req.month}, entries={len(new_entries)}건 (주휴일 제외: {skipped_weekly_off_count}건)")
 
     return new_entries
 
