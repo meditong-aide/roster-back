@@ -2044,8 +2044,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
             if getattr(cfg, "ban_n_to_e", True):
                 m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
-            if getattr(cfg, "ban_d_to_n", True):
-                m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
+            # if getattr(cfg, "ban_d_to_n", True):
+            #     m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         raw = getattr(nu, "is_night_nurse", None)
