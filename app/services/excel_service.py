@@ -946,7 +946,7 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     year, month = schedule.year, schedule.month
     days_in_month = calendar.monthrange(year, month)[1]
 
-    nurses = db.query(Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence).filter(
+    nurses = db.query(Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role).filter(
         Nurse.group_id == target_group_id
     ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
 
@@ -1076,7 +1076,7 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
 
         ws.cell(row=r, column=1, value=idx)
         ws.cell(row=r, column=2, value=n.name)
-        ws.cell(row=r, column=3, value="RN")
+        ws.cell(row=r, column=3, value=n.role)
         ws.cell(row=r, column=4, value=n.experience)
 
         for c in range(1, static_cols + 1):
