@@ -122,7 +122,11 @@ def get_nurses_in_group_service(
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
             "is_weekend_off": nurse.is_weekend_off,
-            "work_shifts": nurse.work_shifts or [],
+            "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
+            # 원티드 설정 (간호사별 개별 설정)
+            "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
+            "enable_aide": nurse.enable_aide,
+            "wanted_max_requests": nurse.wanted_max_requests,
         }
         result.append(nurse_dict)
 
@@ -217,7 +221,11 @@ def get_nurses_filtered_service(
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
             "is_weekend_off": nurse.is_weekend_off,
-            "work_shifts": nurse.work_shifts or [],
+            "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
+            # 원티드 설정 (간호사별 개별 설정)
+            "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
+            "enable_aide": nurse.enable_aide,
+            "wanted_max_requests": nurse.wanted_max_requests,
         }
         result.append(nurse_dict)
 

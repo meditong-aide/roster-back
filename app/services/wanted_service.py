@@ -23,6 +23,7 @@ from db.models import (
     Wanted,
     WantedRequest,
     WeeklyOffSetting,
+    WantedConfig,
 )
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import WantedDeadlineRequest, WantedInvokeRequest
@@ -153,13 +154,13 @@ def _compute_weekly_off_days(
 
     인자:
         db: DB 세션
-        nurse_id: ���호사 ID
+        nurse_id: 간호사 ID
         group_id: 그룹 ID (주휴 설정 조회용)
         year: 대상 연도
         month: 대상 월
 
     반환:
-        주휴 요일에 해당����는 day 집합(1~31). 예: {3, 10, 17, 24}
+        주휴 요일에 해당하는 day 집합(1~31). 예: {3, 10, 17, 24}
     """
     nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse_row or not getattr(nurse_row, "weekly_off_enabled", False) or nurse_row.weekly_off_weekday is None:
@@ -623,7 +624,7 @@ def _copy_existing_requests_to_new(
             detailed_request_id=detailed_id_pair,
             target_id=old_row.target_id,
             score=old_row.score,
-            partial_request=old_row.partial_request or '기존 데이터에��� 로드됨',
+            partial_request=old_row.partial_request or '기존 데이터에서 로드됨',
         ))
         pair_count += 1
         detailed_id_pair += 1
@@ -686,16 +687,35 @@ async def invoke_and_persist_wanted_service(
     주요 개선:
     - case 정규화를 함수 초반으로 이동 → NameError 방지
     - case가 없어도 안전하게 graph 호출
-    - request가 '기존 데이터' 계열이면 복사 스킵
+    - request가 '기존 데이터' 계열 복사 스킵
     - case가 충분히 많으면 전체 재작성으로 간주
     """
     nurse_id = current_user.nurse_id
     month_str = _yyyymm(req.year, req.month)
+    group_id = current_user.group_id
     print(f"invoke_and_persist_wanted_service 시작: nurse={nurse_id}, {month_str}")
+
+    # ========== WantedConfig 검증 (프론트에서 검증, 백엔드는 주석 처리) ==========
+
+    # # 1. GLOBAL 설정 확인 - nurses 테이블로 이동됨
+    # global_config = get_wanted_config(db, group_id, 'GLOBAL')
+
+    # # 1-1. enable_aide 확인 (AIDE 기능 활성화 여부) - nurses 테이블에서 확인
+    # nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    # if nurse and nurse.enable_aide == False:
+    #     print(f"[검증 실패] AIDE 기능이 비활성화됨: nurse_id={nurse_id}")
+    #     raise Exception("AIDE 기능이 현재 비활성화되어 있습니다.")
+
+    # # 2. 재제출 여부 확인
+    # existing_request = db.query(WantedRequest).filter(
+    #     WantedRequest.nurse_id == nurse_id,
+    #     WantedRequest.month == month_str
+    # ).first()
+    # is_resubmit = existing_request is not None
 
     # 허용 근무코드 조회 (show_in_preference=True)
     allowed_shifts_query = db.query(Shift).filter(
-        Shift.group_id == current_user.group_id,
+        Shift.group_id == group_id,
         Shift.show_in_preference == True
     ).all()
     allowed_shift_map = {row.shift_id: row.name for row in allowed_shifts_query}
@@ -713,6 +733,89 @@ async def invoke_and_persist_wanted_service(
     for idx, item in enumerate(normalized_case):
         print(f"[DEBUG-1] case[{idx}]: date={item.get('date')}, shift={item.get('shift')}, "
               f"comment={item.get('comment')!r} (type={type(item.get('comment'))})")
+
+    # # 3. NURSE_LIMIT 검증 (간호사별 월단위 요청 개수 제한) - 프론트에서 검증, nurses 테이블로 이동됨
+    # nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    # if nurse and nurse.wanted_max_requests is not None:
+    #     start_date = date(req.year, req.month, 1)
+    #     if req.month == 12:
+    #         end_date = date(req.year + 1, 1, 1)
+    #     else:
+    #         end_date = date(req.year, req.month + 1, 1)
+    #
+    #     nurse_current_count = db.query(NurseShiftRequest).filter(
+    #         NurseShiftRequest.nurse_id == nurse_id,
+    #         NurseShiftRequest.shift_date >= start_date,
+    #         NurseShiftRequest.shift_date < end_date
+    #     ).count()
+    #
+    #     additional_count = len(normalized_case) if has_case else 0
+    #     total_count = nurse_current_count + additional_count
+    #
+    #     if total_count > nurse.wanted_max_requests:
+    #         print(f"[검증 실패] NURSE_LIMIT 초과: nurse_id={nurse_id}, "
+    #               f"현재={nurse_current_count}, 추가={additional_count}, "
+    #               f"제한={nurse.wanted_max_requests}")
+    #         raise Exception(
+    #             f"간호사별 최대 요청 개수를 초과했습니다. "
+    #             f"(현재: {nurse_current_count}개, 추가: {additional_count}개, 제한: {nurse.wanted_max_requests}개)"
+    #         )
+    #
+    #     print(f"[검증 통과] NURSE_LIMIT: 현재={nurse_current_count}, 추가={additional_count}, "
+    #           f"제한={nurse.wanted_max_requests}")
+
+    # 4. DAILY_LIMIT 검증 (날짜별 그룹 전체 요청 개수 제한)
+    # if has_case:
+        # case에 포함된 날짜들 DAILY_LIMIT 확인
+    # case_dates = {item["date"] for item in normalized_case}
+
+        # 해당 월의 DAILY_LIMIT 설정 조회 (shift_type=None인 전체 날짜 제한)
+    # daily_limit_configs = db.query(WantedConfig).filter(
+    # WantedConfig.group_id == group_id,
+    # WantedConfig.config_type == 'DAILY_LIMIT',
+    # WantedConfig.target_date.in_(case_dates),
+    # WantedConfig.shift_type.is_(None)
+    # ).all()
+
+    # daily_limit_map = {config.target_date: config.max_requests for config in daily_limit_configs}
+
+    # if daily_limit_map:
+            # 그룹 내 모든 간호사 ID 조회
+    # group_nurse_ids = [n[0] for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+
+            # 제한 초과 날짜 수집
+    # exceeded_dates = []
+    # for check_date in case_dates:
+    # if check_date in daily_limit_map:
+    # daily_limit = daily_limit_map[check_date]
+
+                    # 해당 날짜의 그룹 전체 요청 개수
+    # daily_current_count = db.query(NurseShiftRequest).filter(
+    # NurseShiftRequest.nurse_id.in_(group_nurse_ids),
+    # NurseShiftRequest.shift_date == check_date
+    # ).count()
+
+                    # 제한 초과 확인 (현재 요청도 카운트에 포함)
+    # if daily_current_count >= daily_limit:
+    # exceeded_dates.append({
+    # "date": check_date.strftime('%Y-%m-%d'),
+    # "current": daily_current_count,
+    # "limit": daily_limit
+    # })
+
+    # if exceeded_dates:
+    # exceeded_info = ", ".join([
+    # f"{d['date']}({d['current']}/{d['limit']})"
+    # for d in exceeded_dates
+    # ])
+    # print(f"[검증 실패] DAILY_LIMIT 초과: {exceeded_info}")
+    # raise Exception(
+    # f"다음 날짜의 일자별 최대 요청 개수를 초과했습니다: {exceeded_info}"
+    # )
+
+    # print(f"[검증 통과] DAILY_LIMIT: case 날짜 {len(case_dates)}개 확인 완료")
+
+    # ========== WantedConfig 검증 종료 ==========
 
     # graph에 전달할 case 포맷 (isoformat 처리)
     graph_case_payload = [
@@ -823,7 +926,7 @@ async def invoke_and_persist_wanted_service(
             # case로 지정된 조합이면 스킵
             if any(d == day_int and s == shift_id for d, s in
                    ((item["date"].day, item["shift"]) for item in normalized_case)):
-                print(f"AIDE ���킵 (case 우선): {shift_id} {day_int}일")
+                print(f"AIDE 스킵 (case 우선): {shift_id} {day_int}일")
                 continue
 
             current = shift_map.get(shift_id, {}).get(day_int)
@@ -883,6 +986,11 @@ async def invoke_and_persist_wanted_service(
 
     # pair 저장
     if pref_parsed:
+        # enable_nurse_pair_preference 확인 (시크릿 기능 활성화 여부) - 프론트에서 검증
+        # nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+        # if nurse and nurse.enable_nurse_pair_preference == False:
+        #     print(f"[경고] 선호 간호사 기능이 비활성화됨: pair 데이터는 저장되지 않습니다. nurse_id={nurse_id}")
+        # else:
         _persist_pair_results(db, nurse_id, new_request_id, month_str, pref_parsed)
 
     # 최종 커밋
@@ -926,6 +1034,7 @@ def request_wanted_shifts_service(
     ).first():
         raise Exception("이미 해당 월의 요청이 존재합니다.")
 
+    # 마감일은 요청에서 전달된 값 사용 (향후 default_deadline_days 자동 계산 기능 추가 예정)
     new_wanted = Wanted(
         group_id=target_group_id,
         year=req.year,
@@ -949,7 +1058,7 @@ def request_wanted_shifts_service(
         office_code=office_id,
         sender_emp_seq_no=current_user.nurse_id,
         sender_member_id=current_user.account_id,
-        deadline=req.exp_date,
+        deadline=new_wanted.exp_date,
     )
     
     display_exp_date = "마감일 없음" if new_wanted.exp_date is None else new_wanted.exp_date.strftime("%Y-%m-%d")
@@ -972,18 +1081,245 @@ def close_expired_wanted(db: Session) -> int:
              예를 들어 만료된 건이 3건이면 3을 반환합니다.
     """
     now = datetime.now()
-    query = db.query(Wanted).filter(
+    updated_count = db.query(Wanted).filter(
         Wanted.status == 'requested',
         Wanted.exp_date.isnot(None),
         Wanted.exp_date < now,
-    )
-
-    updated_count = 0
-    for wanted in query:
-        wanted.status = 'closed'
-        updated_count += 1
+    ).update({'status': 'closed'}, synchronize_session=False)
 
     if updated_count > 0:
         db.commit()
         print(f"Wanted 자동 마감 완료: {updated_count}건")
+    else:
+        print("Wanted 자동 마감: 만료된 항목 없음")
+
     return updated_count
+
+
+# WantedConfig 관련 서비스 함수 생성 - 과연 delete 함수가 필요할까? 해당 여부 고려좀 해야함
+def get_wanted_config(db: Session, group_id: str, filters: dict = None):
+    """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용)
+
+    - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        filters: 추가 필터 조건
+            - year, month: 해당 월의 설정 조회
+            - target_date: 특정 일자 조회
+            - shift_type: 근무 타입 필터
+
+    반환:
+        List[WantedConfig]
+    """
+    query = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id
+    )
+
+    # 추가 필터 적용
+    if filters:
+        if 'year' in filters and 'month' in filters:
+            # 해당 월의 범위로 필터링
+            year = filters['year']
+            month = filters['month']
+            start_date = date(year, month, 1)
+            if month == 12:
+                end_date = date(year + 1, 1, 1)
+            else:
+                end_date = date(year, month + 1, 1)
+            query = query.filter(
+                WantedConfig.target_date >= start_date,
+                WantedConfig.target_date < end_date
+            )
+        if 'target_date' in filters:
+            target_date = filters['target_date']
+            if isinstance(target_date, str):
+                target_date = datetime.strptime(target_date, '%Y-%m-%d').date()
+            query = query.filter(WantedConfig.target_date == target_date)
+        if 'shift_type' in filters:
+            query = query.filter(WantedConfig.shift_type == filters['shift_type'])
+
+    return query.all()
+
+
+def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
+    """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용)
+
+    - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
+    - 이 함수는 DAILY_LIMIT만 처리
+    - 여러 일자에 대한 설정을 한번에 처리
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        configs_data: 설정 데이터 리스트. 각 항목:
+            - target_date: 특정 일자 (YYYY-MM-DD)
+            - shift_type: 근무 타입 (휴무/휴가)
+            - max_requests: 최대 요청 개수
+            - year: 연도 (선택)
+            - month: 월 (선택)
+
+    반환:
+        List[WantedConfig]
+    """
+    if not configs_data:
+        raise ValueError("설정 목록이 비어있습니다.")
+
+    results = []
+    for config_data in configs_data:
+        target_date_str = config_data.get('target_date')
+        if not target_date_str:
+            raise ValueError("각 설정에 target_date가 필수입니다.")
+
+        # 문자열을 date로 변환
+        if isinstance(target_date_str, str):
+            target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+        else:
+            target_date = target_date_str
+
+        year = config_data.get('year', target_date.year)
+        month = config_data.get('month', target_date.month)
+        shift_type = config_data.get('shift_type')
+
+        existing = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.target_date == target_date,
+            WantedConfig.shift_type == shift_type
+        ).first()
+
+        if existing:
+            existing.max_requests = config_data.get('max_requests', 0)
+            existing.year = year
+            existing.month = month
+            results.append(existing)
+        else:
+            config = WantedConfig(
+                group_id=group_id,
+                year=year,
+                month=month,
+                target_date=target_date,
+                shift_type=shift_type,
+                max_requests=config_data.get('max_requests', 0)
+            )
+            db.add(config)
+            results.append(config)
+
+    db.commit()
+    for r in results:
+        db.refresh(r)
+    print(f"[DAILY_LIMIT] 설정 저장 완료: group_id={group_id}, count={len(results)}")
+    return results
+
+
+def delete_wanted_config(db: Session, group_id: str, filters: dict = None) -> int:
+    """일자별 원티드 제한 설정 삭제 (DAILY_LIMIT 전용)
+
+    - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        filters: 삭제 조건
+            - target_date: 특정 일자 (YYYY-MM-DD)
+            - shift_type: 근무 타입
+
+    반환:
+        삭제된 레코드 수
+    """
+    query = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id
+    )
+
+    # 추가 필터 적용
+    if filters:
+        if 'target_date' in filters:
+            target_date_str = filters['target_date']
+            if isinstance(target_date_str, str):
+                target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+            else:
+                target_date = target_date_str
+            query = query.filter(WantedConfig.target_date == target_date)
+        if 'shift_type' in filters:
+            query = query.filter(WantedConfig.shift_type == filters['shift_type'])
+
+    deleted = query.delete()
+    db.commit()
+    print(f"[DAILY_LIMIT] 설정 삭제: group_id={group_id}, deleted={deleted}")
+    return deleted
+
+
+def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int, month: int, shift_date: date) -> dict:
+    """원티드 요청 제한 검증
+
+    - NURSE_LIMIT: nurses 테이블의 wanted_max_requests 컬럼에서 조회
+    - DAILY_LIMIT: wanted_config 테이블에서 조회 (config_type 컬럼 제거됨)
+
+    인자:
+        db: DB 세션
+        nurse_id: 간호사 ID
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+        shift_date: 근무 날짜
+
+    반환:
+        {
+            "valid": bool,
+            "errors": List[str],
+            "nurse_limit": int | None,
+            "nurse_current": int,
+            "daily_limit": int | None,
+            "daily_current": int
+        }
+    """
+
+    errors = []
+
+    # 1. 간호사별 제한 확인 (nurses 테이블에서 조회)
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    nurse_limit = nurse.wanted_max_requests if nurse else None
+
+    # 현재 간호사의 요청 개수
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1)
+    else:
+        end_date = date(year, month + 1, 1)
+
+    nurse_current = db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id == nurse_id,
+        NurseShiftRequest.shift_date >= start_date,
+        NurseShiftRequest.shift_date < end_date
+    ).count()
+
+    if nurse_limit is not None and nurse_current >= nurse_limit:
+        errors.append(f"간호사별 최대 요청 개수({nurse_limit}개)를 초과했습니다.")
+
+    # 2. 일자별 제한 확인 (wanted_config 테이블, DAILY_LIMIT 전용)
+    daily_config = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.target_date == shift_date,
+        WantedConfig.shift_type.is_(None)
+    ).first()
+
+    daily_limit = daily_config.max_requests if daily_config else None
+
+    # 해당 날짜의 그룹 전체 요청 개수
+    nurse_ids = [n[0] for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+    daily_current = db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id.in_(nurse_ids),
+        NurseShiftRequest.shift_date == shift_date
+    ).count()
+
+    if daily_limit is not None and daily_current >= daily_limit:
+        errors.append(f"{shift_date.strftime('%Y-%m-%d')} 일자별 최대 요청 개수({daily_limit}개)를 초과했습니다.")
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "nurse_limit": nurse_limit,
+        "nurse_current": nurse_current,
+        "daily_limit": daily_limit,
+        "daily_current": daily_current
+    }

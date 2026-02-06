@@ -75,7 +75,11 @@ class Nurse(Base):
     is_weekend_off = Column(BOOLEAN, default=False)
     # 추가
     work_shifts = Column(JSON, nullable=True, default=list, server_default='[]')
-    
+    # 원티드 설정 (간호사별 개별 설정)
+    enable_nurse_pair_preference = Column(BOOLEAN, nullable=True, default=True)  # 시크릿 기능 활성화
+    enable_aide = Column(BOOLEAN, nullable=True, default=True)  # AIDE 기능 활성화
+    wanted_max_requests = Column(INTEGER, nullable=True)  # 원티드 요청 개수 제한 (휴무/휴가)
+
     group = relationship("Group")
     __table_args__ = (
         ForeignKeyConstraint(['group_id', 'team_id'], ['teams.group_id', 'teams.team_id'], name='fk_nurses_team_group', ondelete='SET NULL', onupdate='CASCADE'),
@@ -261,8 +265,33 @@ class Wanted(Base):
     exp_date = Column(DATETIME, nullable=True)  # 마감일
     status = Column(VARCHAR(10), default='requested')  # requested, closed
     created_at = Column(DATETIME, default=func.now())
-    
+
     group = relationship("Group")
+
+class WantedConfig(Base):
+    """일자별 원티드 제한 설정 (DAILY_LIMIT 전용)
+
+    - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
+    - 이 테이블은 특정 일자의 특정 근무타입에 대한 제한만 관리
+    """
+    __tablename__ = 'wanted_config'
+
+    config_id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    year = Column(SMALLINT, nullable=True)
+    month = Column(TINYINT, nullable=True)
+    max_requests = Column(INTEGER, nullable=True)  # 해당 일자의 최대 요청 개수
+    target_date = Column(DATE, nullable=True)  # 특정 일자
+    shift_type = Column(CHAR(1), nullable=True)  # 근무 타입 (휴무/휴가)
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    group = relationship("Group")
+
+    __table_args__ = (
+        Index('idx_wanted_config_daily', 'group_id', 'target_date', 'shift_type', unique=True),
+    )
 
 class IssuedRoster(Base):
     __tablename__ = 'issued_roster'
