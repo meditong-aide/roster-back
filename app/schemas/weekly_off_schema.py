@@ -55,5 +55,6 @@ class MyWeeklyOffResponse(BaseModel):
     year: int
     month: int
     my_weekly_off_dates: List[str] = []        # ["2027-08-03", "2027-08-10", ...]
-    my_weekly_off_weekday: Optional[int] = None  # 0~6 (월~일)
+    my_weekly_off_weekday: Optional[int] = None  # 0~6 (월~일) — 변동 주기 적용된 당월 주휴 요일
+    my_weekly_off_weekday_base: Optional[int] = None  # 0~6 (월~일) — DB 원본 기준 요일 (bulk-update용)
     my_weekly_off_label: Optional[str] = None    # "목"
