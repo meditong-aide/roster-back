@@ -1,4 +1,4 @@
-from sqlalchemy import Column, VARCHAR, SMALLINT, BOOLEAN, DATETIME, func, ForeignKey, JSON, CHAR, INTEGER, FLOAT, Index, ForeignKeyConstraint, UniqueConstraint
+from sqlalchemy import Column, VARCHAR, NVARCHAR, SMALLINT, BOOLEAN, DATETIME, func, ForeignKey, JSON, CHAR, INTEGER, FLOAT, Index, ForeignKeyConstraint, UniqueConstraint
 from sqlalchemy.dialects.mysql import TINYINT 
 from sqlalchemy.orm import relationship
 from db.client2 import Base
@@ -71,7 +71,7 @@ class Nurse(Base):
     # 사이드 프로필 관련 추가 컬럼
     birth_date = Column(VARCHAR(10), nullable=True)
     phone_number = Column(VARCHAR(20), nullable=True)
-    gender = Column(VARCHAR(3), nullable=True)
+    gender = Column(NVARCHAR(3), nullable=True)
     is_weekend_off = Column(BOOLEAN, default=False)
     # 추가
     work_shifts = Column(JSON, nullable=True, default=list, server_default='[]')
