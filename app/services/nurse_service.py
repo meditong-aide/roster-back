@@ -5,7 +5,7 @@
 """
 from sqlalchemy.orm import Session
 from db.models import Nurse as NurseModel, Group, DeletedNurseHistory
-from schemas.roster_schema import NurseProfile, CodeMapp
+from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any
 from pprint import pprint
