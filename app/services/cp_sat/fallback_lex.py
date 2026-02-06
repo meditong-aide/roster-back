@@ -964,15 +964,14 @@ def optimize_fallback_lex_hard_first(
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
-        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약
+        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
         K = cfg.max_consecutive_work_days
         for n in range(N):
+            if bool(getattr(roster_system.nurses[n], "is_weekend_off", False)):
+                continue
             T0, T1 = join[n], leave[n]
-            for d0 in range(T0, max(T0, T1 - K + 1)):
-                pass
             for d0 in range(T0, T1 - K + 1):
                 sum_off = sum(X(n, d0 + t, off_idx) for t in range(K + 1))
-                # 최소 1일 OFF를 강제하여 슬랙 없이 안전 제약으로 처리
                 m.Add(sum_off >= 1)
 
         # 연속 Night 상한 L → 초과량 정량화

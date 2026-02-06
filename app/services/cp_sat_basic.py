@@ -2032,9 +2032,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     m.Add(sum(X(n, d, off_idx_full) for d in range(left, right + 1)) >= 1)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
-        # 연속 근무 K+1 중 OFF ≥1
-        for d0 in range(T0, T1-K+1):
-            m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)
+        # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        if not bool(getattr(nu, "is_weekend_off", False)):
+            for d0 in range(T0, T1-K+1):
+                m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)
 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):
