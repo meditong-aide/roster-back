@@ -174,9 +174,9 @@ class Member:
              , c.mb_part, c.name as mb_part_name, a.OfficeEmpNum, a.EmployeeName, b.MemberID, a.duty, a.career, a.headnurse, a.joindate
              , LEFT(CONVERT(VARCHAR(10), a.DateOfBirth, 23), 10) as DateOfBirth
              , a.PortableTel
-             , CASE WHEN UPPER(TRIM(COALESCE(NULLIF(GENDER, ' '),'기타'))) IN ('남','Y') THEN '남'
-                    WHEN UPPER(TRIM(COALESCE(NULLIF(GENDER, ' '),'기타'))) IN ('여','N') THEN '여'
-                    ELSE TRIM(COALESCE(NULLIF(GENDER, ' '),'기타'))
+             , CASE WHEN UPPER(TRIM(COALESCE(NULLIF(GENDER, N' '),N'기타'))) IN (N'남',N'Y') THEN N'남'
+                    WHEN UPPER(TRIM(COALESCE(NULLIF(GENDER, N' '),N'기타'))) IN (N'여',N'N') THEN N'여'
+                    ELSE TRIM(COALESCE(NULLIF(GENDER, N' '),N'기타'))
                      END Gender
           from bizwiz20db.Member a
                Inner Join bizwiz20db.Member_Login b On a.OfficeCode=b.OfficeCode And a.EmpSeqNo=b.EmpSeqNo

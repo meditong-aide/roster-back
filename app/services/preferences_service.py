@@ -12,6 +12,66 @@ from schemas.auth_schema import User as UserSchema
 from datetime import datetime, timezone, timedelta, date
 
 
+def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int, month_str: str):
+    """
+    이전 request_id의 pair(선호/비선호) 데이터를 현재 request_id로 복사합니다.
+    현재 request_id에 pair 데이터가 이미 있으면 복사하지 않습니다.
+
+    인자:
+        db: DB 세션
+        nurse_id: 간호사 ID
+        current_request_id: 현재(새) request_id
+        month_str: 'YYYY-MM'
+
+    반환:
+        복사된 pair 건수
+    """
+    # 현재 request_id에 이미 pair 데이터가 있으면 복사 불필요
+    existing_count = db.query(NursePairRequest).filter(
+        NursePairRequest.nurse_id == nurse_id,
+        NursePairRequest.request_id == current_request_id,
+    ).count()
+    if existing_count > 0:
+        print(f"[pair carry-forward] 현재 request_id={current_request_id}에 이미 {existing_count}건 존재 → 스킵")
+        return 0
+
+    # 같은 nurse_id/month에서 현재보다 작은 request_id 중 pair 데이터가 있는 가장 큰 것을 찾기
+    prev_request_ids = (
+        db.query(WantedRequest.request_id)
+        .filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+            WantedRequest.request_id < current_request_id,
+        )
+        .order_by(WantedRequest.request_id.desc())
+        .all()
+    )
+
+    for (prev_rid,) in prev_request_ids:
+        pair_rows = db.query(NursePairRequest).filter(
+            NursePairRequest.nurse_id == nurse_id,
+            NursePairRequest.request_id == prev_rid,
+        ).all()
+
+        if pair_rows:
+            detailed_id = 1
+            for row in pair_rows:
+                db.add(NursePairRequest(
+                    nurse_id=nurse_id,
+                    request_id=current_request_id,
+                    detailed_request_id=detailed_id,
+                    target_id=row.target_id,
+                    score=row.score,
+                    partial_request=row.partial_request,
+                ))
+                detailed_id += 1
+            print(f"[pair carry-forward] request_id {prev_rid} → {current_request_id}: {detailed_id - 1}건 복사 완료")
+            return detailed_id - 1
+
+    print(f"[pair carry-forward] 복사할 이전 pair 데이터 없음 (nurse_id={nurse_id}, month={month_str})")
+    return 0
+
+
 def submit_preferences_service(
     req: PreferenceData, 
     current_user: UserSchema, 
@@ -242,13 +302,51 @@ def submit_preferences_service(
             ))
             detailed_id += 1
     
+    # ==================== pair(선호/비선호) 데이터 처리 ====================
+    # data 내부 또는 top-level 어디에든 preference가 있으면 인식
+    preference_list = preference_data.get("preference", None) if isinstance(preference_data, dict) else None
+    if preference_list is None and req.preference is not None:
+        preference_list = req.preference
+
+    if preference_list is not None and isinstance(preference_list, list):
+        # 프론트에서 preference 배열을 명시적으로 보낸 경우 → 해당 항목만 저장
+        # (제거된 항목은 배열에 미포함되어 자연스럽게 새 request_id에 저장되지 않음)
+        db.query(NursePairRequest).filter(
+            NursePairRequest.nurse_id == current_user.nurse_id,
+            NursePairRequest.request_id == request_id,
+        ).delete()
+
+        pair_detailed_id = 1
+        for pair in preference_list:
+            target_id = pair.get("id")
+            weight = pair.get("weight")
+            if target_id is None or weight is None:
+                continue
+            db.add(NursePairRequest(
+                nurse_id=current_user.nurse_id,
+                request_id=request_id,
+                detailed_request_id=pair_detailed_id,
+                target_id=str(target_id),
+                score=float(weight),
+                partial_request=pair.get("request", ""),
+            ))
+            pair_detailed_id += 1
+        print(f"[pair 저장] preference 배열 기반 {pair_detailed_id - 1}건 저장 (request_id={request_id})")
+    else:
+        # preference 배열이 없는 경우 → 이전 request_id에서 pair 데이터 carry-forward
+        # 초기화 시 carry-forward 스킵
+        if data_to_save or preference_list: # shift나 preference가 있으면 carry-forward 진행
+            _carry_forward_pair_data(db, current_user.nurse_id, request_id, month_str)
+        else:
+            print(f"[pair 초기화] 빈 데이터로 인해 carry-forward 스킵 (request_id={request_id})")
+
     # 제출 처리
     if not is_draft:
         draft.is_submitted = True
         draft.submitted_at = datetime.now()
-    
+
     db.commit()
-    
+
     return {
         "message": "임시 저장되었습니다." if is_draft else "제출이 완료되었습니다."
     }

@@ -102,6 +102,7 @@ class PreferenceData(BaseModel):
     month: int
     # data: dict
     data: Dict[str, Any] = Field(default_factory=dict)
+    preference: Optional[List[Dict[str, Any]]] = None
 
 
 class PublishRequest(BaseModel):
@@ -203,10 +204,10 @@ class RosterConfig(RosterConfigBase):
     class Config:
         from_attributes = True
 
-class CodeMapp(StrEnum):
-    D = "D"
-    E = "E"
-    N = "N"
+# class CodeMapp(StrEnum):
+#     D = "D"
+#     E = "E"
+#     N = "N"
 
 class NurseProfile(BaseModel):
     office_id: str
@@ -219,7 +220,8 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    is_night_nurse: List[CodeMapp] = Field(default_factory=list, max_items = 2)
+    # is_night_nurse: List[CodeMapp] = Field(default_factory=list, max_items = 2)
+    is_night_nurse: List[str] = Field(default_factory=list)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
@@ -288,6 +290,10 @@ class ScheduleMemoUpdate(BaseModel):
 class IntegratedRegisterRequest(BaseModel):
     group_id: str
     members: List[Dict[str, Any]]  # 한국어 키로 입력
+
+class AddToGroupRequest(BaseModel):
+    nurse_ids: List[str]
+    group_id: str
 
 
 

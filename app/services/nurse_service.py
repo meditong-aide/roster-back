@@ -1,16 +1,18 @@
 """
-간호사 정보 관리 관련 서비스 로직 모듈
+간호사 정보 관리 관련 서���스 로직 모듈
 - DB 쿼리, 데이터 가공 등 라우터에서 분리
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Nurse as NurseModel, Group
+from db.models import Nurse as NurseModel, Group, DeletedNurseHistory
 from schemas.roster_schema import NurseProfile, CodeMapp
 from schemas.auth_schema import User as UserSchema
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pprint import pprint
 from datetime import date
 from dateutil.parser import parse as parse_date
+from db.client2 import msdb_manager
+from datalayer.member import Member
 import logging
 
 def get_personnel_basic_info_service(current_user, db: Session):
@@ -31,20 +33,6 @@ def get_personnel_basic_info_service(current_user, db: Session):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 기본 정보 조회 실패: {str(e)}")
 
-# def get_nurses_in_group_service(current_user, db: Session):
-#     """
-#     그룹 내 간호사 목록 조회 서비스 함수
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     nurses = (
-#         db.query(NurseModel)
-#         .filter(NurseModel.group_id == current_user.group_id)
-#         .order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc())
-#         .all()
-#     )
-#     return nurses
-
 def get_nurses_in_group_service(
     current_user,
     db: Session,
@@ -57,17 +45,17 @@ def get_nurses_in_group_service(
     """
     if not current_user:
         raise Exception("Not authenticated")
-    
+
     query = db.query(NurseModel)
-    
+
     # 그룹 ID 필터링
     if current_user.group_id:
         query = query.filter(NurseModel.group_id == current_user.group_id)
-    
+
     # 특정 nurse_id 필터링
     if nurse_id:
         query = query.filter(NurseModel.nurse_id == nurse_id)
-    
+
     # 정렬: active DESC, sequence ASC, experience DESC, nurse_id ASC
     nurses = (
         query.order_by(
@@ -77,14 +65,14 @@ def get_nurses_in_group_service(
             NurseModel.nurse_id.asc()
         ).all()
     )
-    
+
     # nurse_id로 필터링했는데 결과가 없으면 예외
     if nurse_id and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
-    
+
     # 만 나이 계산
     current_date = date.today()
-    
+
     def calculate_age(birth_date_str: str) -> Optional[int]:
         if not birth_date_str:
             return None
@@ -99,23 +87,12 @@ def get_nurses_in_group_service(
         except (ValueError, TypeError) as e:
             logging.warning(f"Invalid birth_date format: {birth_date_str}, error: {e}")
             return None
-    
+
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
-        # is_night_nurse를 Enum 값으로 변환 (데이터 베이스 : JSON)
         is_night_nurse = nurse.is_night_nurse or []
-        try:
-            # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
-            is_night_nurse = [
-                str(code)
-                for code in is_night_nurse
-                if code in CodeMapp.__members__.values()
-            ]
-        except (ValueError, TypeError, KeyError) as e:
-            logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
-            is_night_nurse = []
-        
+
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
             "group_id": nurse.group_id,
@@ -127,14 +104,14 @@ def get_nurses_in_group_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": is_night_nurse,  # List[CodeMapp]
+            "is_night_nurse": is_night_nurse,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
             "resignation_date": nurse.resignation_date.isoformat() if nurse.resignation_date else None,
             "sequence": nurse.sequence,
             "active": nurse.active,
-            "birth_date": nurse.birth_date,  # VARCHAR
+            "birth_date": nurse.birth_date,
             "phone_number": nurse.phone_number,
             "nurse_memo": nurse.nurse_memo,
             "grade": nurse.grade,
@@ -144,7 +121,6 @@ def get_nurses_in_group_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
-            # 추가
             "is_weekend_off": nurse.is_weekend_off,
             "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
@@ -155,22 +131,6 @@ def get_nurses_in_group_service(
         result.append(nurse_dict)
 
     return result
-
-# def get_nurses_filtered_service(current_user, db: Session, office_id: str | None = None, group_id: str | None = None):
-#     """ADM 전용 필터 조회: office_id 또는 group_id 기준으로 간호사 목록 조회"""
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     if not getattr(current_user, 'is_master_admin', False):
-#         raise Exception("Permission denied")
-#     q = db.query(NurseModel)
-#     # 제공 여부 기준으로 분기: 비어있는 문자열도 필터로 적용되어 []를 반환하게 함
-#     if group_id is not None:
-#         q = q.filter(NurseModel.group_id == group_id, NurseModel.office_id == current_user.office_id)
-#     elif office_id is not None:
-#         # 그룹 조인 후 office_id 매칭
-#         q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == current_user.office_id)
-#     nurses = q.order_by(NurseModel.active.desc(), NurseModel.sequence.asc(), NurseModel.experience.desc(), NurseModel.nurse_id.asc()).all()
-#     return nurses
 
 def get_nurses_filtered_service(
     current_user,
@@ -184,21 +144,21 @@ def get_nurses_filtered_service(
         raise Exception("Not authenticated")
     if not getattr(current_user, 'is_master_admin', False):
         raise Exception("Permission denied")
-    
+
     q = db.query(NurseModel)
-    
+
     # 필터링: nurse_id
     if nurse_id is not None:
         q = q.filter(NurseModel.nurse_id == nurse_id)
-    
+
     # 필터링: group_id
     if group_id is not None:
         q = q.filter(NurseModel.group_id == group_id, NurseModel.office_id == current_user.office_id)
-    
+
     # 필터링: office_id
     elif current_user.office_id is not None:
         q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == current_user.office_id)
-    
+
     # 정렬: active DESC, sequence ASC, experience DESC, nurse_id ASC
     nurses = q.order_by(
         NurseModel.active.desc(),
@@ -209,10 +169,10 @@ def get_nurses_filtered_service(
     # nurse_id로 필터링했는데 결과가 없으면 예외
     if nurse_id is not None and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
-    
+
     # 만 나이 계산
     current_date = date.today()
-    
+
     def calculate_age(birth_date_str: str) -> Optional[int]:
         if not birth_date_str:
             return None
@@ -227,23 +187,12 @@ def get_nurses_filtered_service(
         except (ValueError, TypeError) as e:
             logging.warning(f"Invalid birth_date format: {birth_date_str}, error: {e}")
             return None
-    
+
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
-        # is_night_nurse를 Enum 값으로 변환 (데이터 베이스 : JSON)
         is_night_nurse = nurse.is_night_nurse or []
-        try:
-            # 문자열 "D", "E", "N"을 CodeMapp 값으로 매핑
-            is_night_nurse = [
-                str(code)
-                for code in is_night_nurse
-                if code in CodeMapp.__members__.values()
-            ]
-        except (ValueError, TypeError, KeyError) as e:
-            logging.warning(f"Invalid is_night_nurse value: {is_night_nurse}, error: {e}")
-            is_night_nurse = []
-            
+
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
             "group_id": nurse.group_id,
@@ -255,14 +204,14 @@ def get_nurses_filtered_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": is_night_nurse,  # None일 경우 []
+            "is_night_nurse": is_night_nurse,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
             "resignation_date": nurse.resignation_date.isoformat() if nurse.resignation_date else None,
             "sequence": nurse.sequence,
             "active": nurse.active,
-            "birth_date": nurse.birth_date,  # VARCHAR
+            "birth_date": nurse.birth_date,
             "phone_number": nurse.phone_number,
             "nurse_memo": nurse.nurse_memo,
             "grade": nurse.grade,
@@ -271,7 +220,6 @@ def get_nurses_filtered_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
-            # 추가
             "is_weekend_off": nurse.is_weekend_off,
             "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
@@ -292,7 +240,7 @@ def get_next_sequence_for_active_status(group_id: str, active_status: int, db: S
         NurseModel.group_id == group_id,
         NurseModel.active == active_status
     ).order_by(NurseModel.sequence.desc()).first()
-    
+
     return (max_sequence[0] + 1) if max_sequence and max_sequence[0] is not None else 1
 
 def _get_nurses_by_active(group_id: str, active_status: int, db: Session) -> List[NurseModel]:
@@ -344,7 +292,7 @@ def move_nurse_with_active_service(nurse_id: str, new_sequence: int, target_acti
     old_active = nurse.active
 
     if target_active is None or target_active == old_active:
-        # 같은 상태 내 재배치   
+        # 같은 상태 내 재배치
         lst = _get_nurses_by_active(group_id, old_active, db)
         # 해당 간호사 제외
         lst = [n for n in lst if n.nurse_id != nurse.nurse_id]
@@ -404,162 +352,6 @@ def reorder_nurses_service(active_order: List[str], inactive_order: List[str], c
     db.commit()
     return {"message": "일괄 재정렬 완료", "active_count": len(active_order), "inactive_count": len(inactive_order)}
 
-# def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_group_id: str | None = None):
-#     """
-#     간호사 일괄 업데이트 서비스 함수
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     # HDN 또는 ADM만 허용
-#     if current_user.is_master_admin:
-#         target_group_id = override_group_id
-#     else:
-#         target_group_id = current_user.group_id
-#     db_nurses_dict = {n.nurse_id: n for n in db.query(NurseModel).filter(NurseModel.group_id == target_group_id).all()}
-#     for nurse_data in nurses_data:
-#         db_nurse = db_nurses_dict.get(nurse_data.nurse_id)
-#         if db_nurse:
-#             if db_nurse.group_id != target_group_id:
-#                 continue
-#             # active 상태가 변경되는 경우 sequence 재조정
-#             old_active = db_nurse.active
-#             update_data = nurse_data.dict(exclude_unset=True)
-#             new_active = update_data.get('active', old_active)
-#             # active 상태 변경 시 해당 상태의 마지막 sequence로 이동
-#             if old_active != new_active and 'active' in update_data:
-#                 update_data['sequence'] = get_next_sequence_for_active_status(target_group_id, new_active, db)
-            
-#             for key, value in update_data.items():
-#                 setattr(db_nurse, key, value)
-#         else:
-#             nurse_dict = nurse_data.dict()
-#             nurse_dict.pop('group_id', None)
-#             # 신규 생성 시 active 상태에 따른 sequence 설정
-#             active_status = nurse_dict.get('active', 1)  # 기본값은 활성(1)
-#             if 'sequence' not in nurse_dict or nurse_dict['sequence'] is None:
-#                 nurse_dict['sequence'] = get_next_sequence_for_active_status(
-#                     current_user.group_id, active_status, db
-#                 )
-            
-#             try:
-#                 new_nurse = NurseModel(**nurse_dict, group_id=target_group_id)
-#                 db.add(new_nurse)
-#             except Exception as e:
-#                 print(f"[DEBUG] 신규 간호사 생성 실패: {e}")
-#                 continue
-    
-#     client_nurse_ids = {n.nurse_id for n in nurses_data}
-    
-#     for db_nurse_id, db_nurse in db_nurses_dict.items():
-#         if db_nurse_id not in client_nurse_ids:
-#             db.delete(db_nurse)
-#     db.commit()
-#     return {"message": "Nurses updated successfully"} 
-
-# def bulk_update_nurses_service(nurses_data, current_user, db: Session, override_group_id: str | None = None):
-#     """
-#     간호사 일괄 업데이트 서비스 함수
-#     - is_weekend_off와 fixed_shift 연동 로직 추가
-#     """
-#     if not current_user:
-#         raise Exception("Not authenticated")
-#     # HDN 또는 ADM만 허용
-#     if current_user.is_master_admin:
-#         target_group_id = override_group_id
-#     else:
-#         target_group_id = current_user.group_id
-    
-#     # 그룹 내 모든 간호사 미리 로드
-#     db_nurses_dict = {n.nurse_id: n for n in db.query(NurseModel).filter(NurseModel.group_id == target_group_id).all()}
-    
-#     updated_count = 0
-    
-#     for nurse_data in nurses_data:
-#         db_nurse = db_nurses_dict.get(nurse_data.nurse_id)
-#         if not db_nurse:
-#             # 신규 생성 로직은 기존 유지 (아래에 있음)
-#             continue
-#         if db_nurse.group_id != target_group_id:
-#             continue
-
-#         # active 상태 변경 시 sequence 재조정 (기존 로직 유지)
-#         old_active = db_nurse.active
-#         update_data = nurse_data.dict(exclude_unset=True)
-#         new_active = update_data.get('active', old_active)
-#         if old_active != new_active and 'active' in update_data:
-#             update_data['sequence'] = get_next_sequence_for_active_status(target_group_id, new_active, db)
-
-#         # --- 핵심 추가: 주말 휴무(is_weekend_off) + 고정 근무형태(fixed_shift) 연동 ---
-#         requested_is_weekend_off = update_data.get('is_weekend_off', db_nurse.is_weekend_off)
-#         requested_fixed_shift = update_data.get('fixed_shift')  # unset이면 기존값 유지
-
-#         # 주말 휴무 여부는 자유롭게 업데이트
-#         db_nurse.is_weekend_off = requested_is_weekend_off
-
-#         # 고정 근무형태 처리
-#         if requested_is_weekend_off:
-#             # 주말 휴무 적용된 경우: M, D, None만 허용
-#             if requested_fixed_shift in ('M', 'D'):
-#                 db_nurse.fixed_shift = requested_fixed_shift
-#             elif requested_fixed_shift in ('', None):
-#                 db_nurse.fixed_shift = None
-#             else:
-#                 # 잘못된 값 (예: 'E', 'D6', 'N' 등) → 강제로 None 처리 + 경고 로그
-#                 logging.warning(
-#                     f"[INVALID FIXED_SHIFT] nurse_id={db_nurse.nurse_id} ({db_nurse.name}) "
-#                     f"tried to set fixed_shift='{requested_fixed_shift}' while is_weekend_off=True → reset to None"
-#                 )
-#                 db_nurse.fixed_shift = None
-#         else:
-#             # 주말 휴무 미적용 → fixed_shift 강제로 None
-#             db_nurse.fixed_shift = None
-
-#         # --- 나머지 필드들 일반 업데이트 (is_weekend_off, fixed_shift 제외하고) ---
-#         # 이미 처리된 두 필드는 제외하고 나머지만 setattr
-#         for key, value in update_data.items():
-#             if key in ('is_weekend_off', 'fixed_shift'):
-#                 continue  # 위에서 별도 처리했음
-#             setattr(db_nurse, key, value)
-
-#         updated_count += 1
-
-#     # === 신규 간호사 생성 로직 (기존 코드 유지) ===
-#     for nurse_data in nurses_data:
-#         if nurse_data.nurse_id in db_nurses_dict:
-#             continue  # 이미 업데이트된 경우 스킵
-#         nurse_dict = nurse_data.dict()
-#         nurse_dict.pop('group_id', None)
-        
-#         # 신규 생성 시 is_weekend_off에 따라 fixed_shift 정제
-#         if nurse_dict.get('is_weekend_off'):
-#             if nurse_dict.get('fixed_shift') not in ('M', 'D'):
-#                 nurse_dict['fixed_shift'] = None
-#         else:
-#             nurse_dict['fixed_shift'] = None
-
-#         active_status = nurse_dict.get('active', 1)
-#         if 'sequence' not in nurse_dict or nurse_dict['sequence'] is None:
-#             nurse_dict['sequence'] = get_next_sequence_for_active_status(
-#                 target_group_id, active_status, db
-#             )
-        
-#         try:
-#             new_nurse = NurseModel(**nurse_dict, group_id=target_group_id)
-#             db.add(new_nurse)
-#             updated_count += 1
-#         except Exception as e:
-#             logging.error(f"[DEBUG] 신규 간호사 생성 실패: {e}")
-#             continue
-
-#     # === 클라이언트에서 제외된 간호사 삭제 (기존 로직 유지) ===
-#     client_nurse_ids = {n.nurse_id for n in nurses_data}
-#     for db_nurse_id, db_nurse in list(db_nurses_dict.items()):
-#         if db_nurse_id not in client_nurse_ids:
-#             db.delete(db_nurse)
-
-#     db.commit()
-#     return {"message": "Nurses updated successfully", "updated": updated_count}
-
 def bulk_update_nurses_service(
     nurses_data: List[NurseProfile],
     current_user: UserSchema,
@@ -568,8 +360,6 @@ def bulk_update_nurses_service(
 ):
     """
     간호사 일괄 업데이트 서비스 함수
-    - is_weekend_off와 fixed_shift 연동 로직 유지
-    - ★★★ 새로 추가: work_shifts (JSON 배열) 업데이트 지원 ★★★
     """
     if not current_user:
         raise Exception("Not authenticated")
@@ -582,7 +372,7 @@ def bulk_update_nurses_service(
 
     if not target_group_id:
         raise Exception("그룹 ID를 확인할 수 없습니다.")
-    # print('nurses_data', [(n.name, n.fixed_shift) for n in nurses_data])
+
     # 그룹 내 모든 간호사 미리 로드 (효율성)
     db_nurses_dict = {
         n.nurse_id: n for n in db.query(NurseModel)
@@ -591,7 +381,8 @@ def bulk_update_nurses_service(
     }
 
     updated_count = 0
-    print('db_nurses_dict', nurses_data)
+    ALL_SHIFTS = {"D","E","N"}
+
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
 
@@ -602,7 +393,7 @@ def bulk_update_nurses_service(
 
             # 변경된 필드만 추출
             update_data = profile.dict(exclude_unset=True)
-            # print('update_data', update_data)
+
             # active 변경 시 sequence 자동 조정
             old_active = db_nurse.active
             new_active = update_data.get('active', old_active)
@@ -611,79 +402,30 @@ def bulk_update_nurses_service(
                     target_group_id, new_active, db
                 )
 
-            # # === 주말 휴무 + 고정 근무 연동 로직 (기존 유지 + 약간 개선) ===
-            # requested_is_weekend_off = update_data.get('is_weekend_off', db_nurse.is_weekend_off)
-            # requested_fixed_shift = update_data.get('fixed_shift')
-
-            # db_nurse.is_weekend_off = requested_is_weekend_off
-
-            # if requested_is_weekend_off:
-            #     if requested_fixed_shift in ('M', 'D', None, ''):
-            #         db_nurse.fixed_shift = requested_fixed_shift if requested_fixed_shift else None
-            #     else:
-            #         logging.warning(
-            #             f"[INVALID FIXED_SHIFT] nurse_id={db_nurse.nurse_id} ({db_nurse.name}) "
-            #             f"tried invalid fixed_shift='{requested_fixed_shift}' with is_weekend_off=True → forced to None"
-            #         )
-            #         db_nurse.fixed_shift = None
-            # else:
-            #     db_nurse.fixed_shift = None
-
-            # === ★★★ 새로 추가: work_shifts 처리 ★★★ ===
-            if 'work_shifts' in update_data:
-                # 프론트에서 List[str]로 오면 그대로 JSON 컬럼에 저장 (SQLAlchemy가 자동 변환)
-                # None이 오면 빈 배열로 초기화
-                db_nurse.work_shifts = update_data['work_shifts'] if update_data['work_shifts'] is not None else []
-            if 'weekly_off_weekday' in update_data and update_data['weekly_off_weekday'] is not None:
-                db_nurse.weekly_off_enabled = 1
-            else:
-                db_nurse.weekly_off_enabled = 0
-            # === 나머지 일반 필드 업데이트 (이미 처리된 필드 제외) ===
+            # === 프론트에서 보내준 값으로 일괄 업데이트 ===
             for key, value in update_data.items():
-                if key in ('work_shifts'):
-                    continue
                 if hasattr(db_nurse, key):
                     setattr(db_nurse, key, value)
 
-            # updated_count += 1
+            # === 후처리: is_night_nurse (3개 전체 선택 시 빈 배열) ===
+            if 'is_night_nurse' in update_data:
+                night_shifts = update_data['is_night_nurse']
+                if isinstance(night_shifts, list) and set(night_shifts) == ALL_SHIFTS:
+                    db_nurse.is_night_nurse = []
+                elif night_shifts is None:
+                    db_nurse.is_night_nurse = []
 
-        # # === 신규 간호사 생성 ===
-        # else:
-        #     nurse_dict = profile.dict()
-        #     nurse_dict.pop('group_id', None)
+            # === 후처리: work_shifts (None → 빈 배열) ===
+            if 'work_shifts' in update_data and update_data['work_shifts'] is None:
+                db_nurse.work_shifts = []
 
-        #     # 신규 생성 시 주말 휴무 연동
-        #     if nurse_dict.get('is_weekend_off'):
-        #         if nurse_dict.get('fixed_shift') not in ('M', 'D', None, ''):
-        #             nurse_dict['fixed_shift'] = None
-        #     else:
-        #         nurse_dict['fixed_shift'] = None
+            updated_count += 1
 
-        #     # 신규 생성 시 work_shifts 기본값 처리
-        #     if 'work_shifts' not in nurse_dict or nurse_dict['work_shifts'] is None:
-        #         nurse_dict['work_shifts'] = []
-
-        #     # sequence 자동 설정
-        #     active_status = nurse_dict.get('active', 1)
-        #     if 'sequence' not in nurse_dict or nurse_dict['sequence'] is None:
-        #         nurse_dict['sequence'] = get_next_sequence_for_active_status(
-        #             target_group_id, active_status, db
-        #         )
-
-        #     try:
-        #         new_nurse = NurseModel(**nurse_dict, group_id=target_group_id)
-        #         db.add(new_nurse)
-        #         updated_count += 1
-        #     except Exception as e:
-        #         logging.error(f"신규 간호사 생성 실패 (nurse_id={profile.nurse_id}): {e}")
-        #         continue
-
-    # === 클라이언트에서 제외된 간호사 삭제 ===
+    # === 클라이언트에서 제외된 간호사 확인 ===
     client_nurse_ids = {profile.nurse_id for profile in nurses_data}
     for db_nurse_id, db_nurse in list(db_nurses_dict.items()):
         if db_nurse_id not in client_nurse_ids:
             print('제외된 간호사 for test:', db_nurse_id)
-    #         db.delete(db_nurse)
 
     db.commit()
 
@@ -700,53 +442,280 @@ def move_nurse_service(req, current_user, db: Session):
         raise Exception("Not authenticated")
     if not current_user.is_head_nurse:
         raise Exception("Permission denied")
-    
+
     nurse_to_move = db.query(NurseModel).filter(
-        NurseModel.nurse_id == req.nurse_id, 
+        NurseModel.nurse_id == req.nurse_id,
         NurseModel.group_id == current_user.group_id
     ).first()
-    
+
     if not nurse_to_move:
         raise Exception("해당 간호사를 찾을 수 없습니다.")
-    
+
     old_sequence = nurse_to_move.sequence
     new_sequence = req.new_sequence
     active_status = nurse_to_move.active
-    
+
     print(f"[DEBUG] 순서 이동: {nurse_to_move.name} (active={active_status}) {old_sequence} → {new_sequence}")
-    
+
     if old_sequence == new_sequence:
         return {"message": "변경사항이 없습니다."}
-    
+
     # 같은 active 상태의 간호사들만 대상으로 sequence 재조정
     if old_sequence < new_sequence:
-        # 위로 이동: 기존 위치와 새 위치 사이의 간호사들을 앞으로 이동
         affected_nurses = db.query(NurseModel).filter(
             NurseModel.group_id == current_user.group_id,
             NurseModel.active == active_status,
             NurseModel.sequence > old_sequence,
             NurseModel.sequence <= new_sequence
         ).all()
-        
+
         for nurse in affected_nurses:
             nurse.sequence -= 1
             print(f"[DEBUG] {nurse.name} sequence: {nurse.sequence + 1} → {nurse.sequence}")
     else:
-        # 아래로 이동: 새 위치와 기존 위치 사이의 간호사들을 뒤로 이동
         affected_nurses = db.query(NurseModel).filter(
             NurseModel.group_id == current_user.group_id,
             NurseModel.active == active_status,
             NurseModel.sequence >= new_sequence,
             NurseModel.sequence < old_sequence
         ).all()
-        
+
         for nurse in affected_nurses:
             nurse.sequence += 1
             print(f"[DEBUG] {nurse.name} sequence: {nurse.sequence - 1} → {nurse.sequence}")
-    
+
     # 이동할 간호사의 sequence 업데이트
     nurse_to_move.sequence = new_sequence
     print(f"[DEBUG] {nurse_to_move.name} 최종 sequence: {new_sequence}")
-    
+
     db.commit()
     return {"message": "간호사 순서 변경 완료"}
+
+
+def get_available_members_service(
+    office_id: str,
+    group_id: str,
+    db: Session
+) -> List[Dict[str, Any]]:
+    """
+    동일 오피스의 전체 멤버 중 현재 그룹에 속하지 않은 멤버 목록 반환.
+    - MSSQL Member 테이블에서 오피스 전체 멤버 조회
+    - MySQL nurses 테이블에서 해당 group_id에 이미 등록된 nurse_id 조회
+    - 이미 등록된 멤버를 제외한 나머지 반환
+    """
+    # 1. MSSQL에서 오피스 전체 멤버 조회 (export-members와 동일 쿼리)
+    all_members = msdb_manager.fetch_all(
+        Member.member_export_by_office(),
+        params=(str(office_id),)
+    ) or []
+
+    # 2. 현재 group_id에 이미 등록된 간호사의 nurse_id 집합
+    existing_nurse_ids = set(
+        row[0] for row in db.query(NurseModel.nurse_id)
+        .filter(NurseModel.group_id == group_id)
+        .all()
+    )
+
+    # 3. 이미 등록된 멤버 제외
+    available = []
+    for row in all_members:
+        emp_seq_no = row.get('EmpSeqNo') if isinstance(row, dict) else getattr(row, 'EmpSeqNo', None)
+        if emp_seq_no and str(emp_seq_no) not in existing_nurse_ids:
+            member_dict = {
+                "nurse_id": str(emp_seq_no),
+                "emp_num": row.get('OfficeEmpNum') if isinstance(row, dict) else getattr(row, 'OfficeEmpNum', None),
+                "account_id": row.get('MemberID') if isinstance(row, dict) else getattr(row, 'MemberID', None),
+                "name": row.get('EmployeeName') if isinstance(row, dict) else getattr(row, 'EmployeeName', None),
+                "duty": row.get('duty') if isinstance(row, dict) else getattr(row, 'duty', None),
+                "career": row.get('career') if isinstance(row, dict) else getattr(row, 'career', None),
+                "is_head_nurse": row.get('headnurse') if isinstance(row, dict) else getattr(row, 'headnurse', None),
+                "joining_date": row.get('joindate') if isinstance(row, dict) else getattr(row, 'joindate', None),
+                "birth_date": row.get('DateOfBirth') if isinstance(row, dict) else getattr(row, 'DateOfBirth', None),
+                "phone_number": row.get('PortableTel') if isinstance(row, dict) else getattr(row, 'PortableTel', None),
+                "gender": row.get('Gender') if isinstance(row, dict) else getattr(row, 'Gender', None),
+                "big_kind_name": row.get('big_kind_name') if isinstance(row, dict) else getattr(row, 'big_kind_name', None),
+                "middle_kind_name": row.get('middle_kind_name') if isinstance(row, dict) else getattr(row, 'middle_kind_name', None),
+                "small_kind_name": row.get('small_kind_name') if isinstance(row, dict) else getattr(row, 'small_kind_name', None),
+                "mb_part_name": row.get('mb_part_name') if isinstance(row, dict) else getattr(row, 'mb_part_name', None),
+            }
+            available.append(member_dict)
+
+    return available
+
+
+def add_nurses_to_group_service(
+    nurse_ids: List[str],
+    group_id: str,
+    office_id: str,
+    db: Session
+) -> Dict[str, Any]:
+    """
+    선택된 멤버를 현재 그룹에 추가.
+    - nurses 테이블에 이미 존재하는 경우: group_id만 변경
+    - nurses 테이블에 없는 경우: MSSQL에서 멤버 정보 조회 후 신규 생성
+    """
+    if not nurse_ids:
+        return {"added": 0, "updated": 0, "errors": []}
+
+    added = 0
+    updated = 0
+    errors = []
+
+    # MSSQL에서 오피스 전체 멤버 조회 (신규 생성 시 참조)
+    all_members = msdb_manager.fetch_all(
+        Member.member_export_by_office(),
+        params=(str(office_id),)
+    ) or []
+    member_map = {}
+    for row in all_members:
+        emp_seq = row.get('EmpSeqNo') if isinstance(row, dict) else getattr(row, 'EmpSeqNo', None)
+        if emp_seq:
+            member_map[str(emp_seq)] = row
+
+    for nid in nurse_ids:
+        try:
+            # nurses 테이블에서 해당 nurse_id 조회 (group_id 무관)
+            existing_nurse = db.query(NurseModel).filter(
+                NurseModel.nurse_id == str(nid)
+            ).first()
+
+            if existing_nurse:
+                # 이미 nurses 테이블에 존재 → group_id만 변경
+                existing_nurse.group_id = group_id
+                # sequence는 현재 그룹 활성 목록의 마지막으로 배치
+                next_seq = get_next_sequence_for_active_status(group_id, existing_nurse.active, db)
+                existing_nurse.sequence = next_seq
+                updated += 1
+            else:
+                # nurses 테이블에 없음 → MSSQL 멤버 정보로 신규 생성
+                member_data = member_map.get(str(nid))
+                if not member_data:
+                    errors.append({"nurse_id": nid, "reason": "MSSQL 멤버 정보를 찾을 수 없습니다."})
+                    continue
+
+                _get = lambda key: member_data.get(key) if isinstance(member_data, dict) else getattr(member_data, key, None)
+
+                # 경력 변환
+                career_val = _get('career')
+                experience = None
+                if career_val is not None and str(career_val).strip():
+                    try:
+                        experience = int(career_val)
+                    except (ValueError, TypeError):
+                        experience = None
+
+                # 수간호사 여부 변환
+                headnurse_val = _get('headnurse')
+                is_head_nurse = False
+                if headnurse_val is not None:
+                    is_head_nurse = str(headnurse_val).strip().upper() in ('Y', '1', 'TRUE')
+
+                # 입사일 변환
+                join_val = _get('joindate')
+                joining_date = None
+                if join_val:
+                    try:
+                        joining_date = parse_date(str(join_val))
+                    except (ValueError, TypeError):
+                        joining_date = None
+
+                next_seq = get_next_sequence_for_active_status(group_id, 1, db)
+
+                new_nurse = NurseModel(
+                    nurse_id=str(nid),
+                    group_id=group_id,
+                    office_id=office_id,
+                    account_id=str(_get('MemberID') or ''),
+                    emp_num=str(_get('OfficeEmpNum') or '') if _get('OfficeEmpNum') else None,
+                    name=str(_get('EmployeeName') or ''),
+                    experience=experience,
+                    role=str(_get('duty') or '') if _get('duty') else None,
+                    is_head_nurse=is_head_nurse,
+                    joining_date=joining_date,
+                    birth_date=str(_get('DateOfBirth') or '') if _get('DateOfBirth') else None,
+                    phone_number=str(_get('PortableTel') or '') if _get('PortableTel') else None,
+                    gender=str(_get('Gender') or '') if _get('Gender') else None,
+                    sequence=next_seq,
+                    active=1,
+                )
+                db.add(new_nurse)
+                added += 1
+
+        except Exception as e:
+            logging.error(f"[add_nurses_to_group] nurse_id={nid} 처리 실패: {e}")
+            errors.append({"nurse_id": nid, "reason": str(e)})
+            continue
+
+    db.commit()
+    return {"added": added, "updated": updated, "errors": errors}
+def delete_nurse_service(
+    nurse_id: str,
+    current_user: UserSchema,
+    db: Session
+):
+    """
+    특정 간호사 삭제 서비스 함수
+    - HDN 또는 ADM만 허용
+    - 삭제 전 deleted_nurse_history 테이블에 이력 저장
+    - 삭제 후 재정렬(선택: 필요 시 _reindex_contiguously 호출)
+    """
+    if not current_user:
+        raise Exception("Not authenticated")
+    
+    # 권한 체크
+    if not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise Exception("Permission denied")
+    
+    # 대상 간호사 조회
+    db_nurse = db.query(NurseModel).filter(
+        NurseModel.nurse_id == nurse_id,
+        NurseModel.group_id == current_user.group_id if not current_user.is_master_admin else True
+    ).first()
+    
+    if not db_nurse:
+        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+    
+    try:
+        # 삭제 수행자 정보 조회
+        deleter = db.query(NurseModel).filter(
+            NurseModel.nurse_id == current_user.nurse_id
+        ).first()
+
+        # 삭제 이력 저장 (deleted_nurse_history)
+        history = DeletedNurseHistory(
+            target_nurse_id=db_nurse.nurse_id,
+            office_id=db_nurse.office_id,
+            group_id=db_nurse.group_id,
+            emp_num=db_nurse.emp_num,
+            account_id=db_nurse.account_id,
+            name=db_nurse.name,
+            role=db_nurse.role,
+            experience=db_nurse.experience,
+            is_head_nurse=db_nurse.is_head_nurse,
+            joining_date=db_nurse.joining_date,
+            birth_date=db_nurse.birth_date,
+            phone_number=db_nurse.phone_number,
+            gender=db_nurse.gender,
+            deleted_by_nurse_id=current_user.nurse_id,
+            deleted_by_account_id=current_user.account_id,
+            deleted_by_name=deleter.name if deleter else None,
+            deleted_by_role=current_user.EmpAuthGbn,
+        )
+        db.add(history)
+
+        # 삭제
+        group_id = db_nurse.group_id
+        db.delete(db_nurse)
+        db.commit()
+
+        # 삭제 후 active 상태별 재정렬
+        active_nurses = _get_nurses_by_active(group_id, 1, db)
+        _reindex_contiguously(active_nurses)
+        inactive_nurses = _get_nurses_by_active(group_id, 0, db)
+        _reindex_contiguously(inactive_nurses)
+        db.commit()
+
+        return {"message": f"Nurse {nurse_id} deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise Exception(f"Deletion failed: {str(e)}")

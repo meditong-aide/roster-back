@@ -407,24 +407,28 @@ def _persist_pair_results(
     month_str: str,
     pairs: List[Dict[str, float]],
 ) -> None:
-    """pair 결과를 nurse_pair_requests 테이블에 저장합니다.
+    """pair 결과를 nurse_pair_requests 테이블에 저장합니다 (병합 방식).
+
+    기존 pair 데이터를 유지하면서, 새로운 pair를 추가하거나 동일 target_id가
+    이미 존재하면 업데이트합니다.
 
     인자:
         db: DB 세션
         nurse_id: 간호사 ID
         request_id: 상위 wanted_requests.request_id
         pairs: [{"id": "12", "weight": -1.5, "request": "..."}, ...]
-    
-    Notes:
-        detailed_request_id는 기존 데이터 다음 순번부터 시작
     """
-    # 중복 누적 방지: 동일 nurse_id + request_id 레코드를 먼저 삭제
-    db.query(NursePairRequest).filter(
+    # 기존 pair 데이터 조회
+    existing_rows = db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id == request_id,
-    ).delete()
+    ).all()
+    existing_map = {row.target_id: row for row in existing_rows}
 
-    detailed_id = 1
+    updated = 0
+    added = 0
+    next_detailed_id = max((row.detailed_request_id for row in existing_rows), default=0) + 1
+
     for item in pairs or []:
         target_id = item.get("id")
         weight = item.get("weight")
@@ -432,18 +436,29 @@ def _persist_pair_results(
         if target_id is None or weight is None:
             continue
 
-        db.add(NursePairRequest(
-            nurse_id=nurse_id,
-            request_id=request_id,
-            detailed_request_id=detailed_id,
-            target_id=str(target_id),
-            score=float(weight),
-            partial_request=normalize_request_text(request_text),
-        ))
-        detailed_id += 1
+        target_id_str = str(target_id)
+
+        if target_id_str in existing_map:
+            # 동일 target_id가 이미 존재 → 업데이트
+            existing_row = existing_map[target_id_str]
+            existing_row.score = float(weight)
+            existing_row.partial_request = normalize_request_text(request_text)
+            updated += 1
+        else:
+            # 새로운 target_id → 추가
+            db.add(NursePairRequest(
+                nurse_id=nurse_id,
+                request_id=request_id,
+                detailed_request_id=next_detailed_id,
+                target_id=target_id_str,
+                score=float(weight),
+                partial_request=normalize_request_text(request_text),
+            ))
+            next_detailed_id += 1
+            added += 1
 
     db.commit()
-    print(f"[pair 저장] {detailed_id-1}건 완료")
+    print(f"[pair 저장] 기존 유지={len(existing_map) - updated}건, 업데이트={updated}건, 신규={added}건 완료")
 
 
 def _parse_shift_results(
@@ -472,6 +487,7 @@ def _parse_shift_results(
                 dates = record.get("date", [])
                 scores = record.get("score", [])
                 requests = record.get("request", [""]) * len(dates)
+                comments = record.get("comment", [None] * len(dates))
 
                 for i, day_str in enumerate(dates):
                     try:
@@ -487,11 +503,13 @@ def _parse_shift_results(
 
                     score = float(scores[i]) if i < len(scores) else 1.0
                     req = str(requests[i] if i < len(requests) else "").strip()
+                    comment = comments[i] if i < len(comments) else None
 
                     parsed.setdefault(shift, {})[day] = {
                         "score": score,
                         "request": normalize_request_text(req),
-                        "shift": shift
+                        "shift": shift,
+                        "comment": comment or ""  # 사유 추가 (None이면 빈 문자열)
                     }
 
     return parsed
@@ -916,7 +934,7 @@ async def invoke_and_persist_wanted_service(
                 shift_map.setdefault(shift_id, {})[day_int] = {
                     "score": score,
                     "request": req_text,
-                    "comment": req_text, # AIDE 결과는 partial_request와 동일하게
+                    "comment": info.get("comment", ""),  # AIDE에서 파싱한 사유 사용
                     "shift": shift_id
                 }
     print("[DEBUG-3] AIDE 병합 완료 후 shift_map : ", shift_map)

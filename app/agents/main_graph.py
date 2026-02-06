@@ -37,6 +37,7 @@ class ContextAnalyticsState(TypedDict):
     request: str | None
     schema: object
     query_shift: List[str]
+    query_shift_comments: List[str | None]  # query_analyzer에서 추출한 사유 리스트
     query_preference: List[str]
     query_chat: List[str]
     query_others: List[str]

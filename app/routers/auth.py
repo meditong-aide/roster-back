@@ -16,7 +16,7 @@ from starlette.status import HTTP_301_MOVED_PERMANENTLY
 from datalayer.member import Member
 # from db.client import get_db
 from db.client2 import get_db, msdb_manager
-from db.models import Nurse
+from db.models import Nurse, Group
 from schemas.auth_schema import User as UserSchema, TokenData
 from utils.email import email_sender, EmailSchema
 from utils.security import create_login_token
@@ -50,12 +50,18 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
         nurse = db.query(Nurse).filter(Nurse.account_id == account_id).first()
         if not nurse:
             return {}
-        return {
+        result = {
             "office_id": getattr(nurse, "office_id", None),
             "account_id": getattr(nurse, "account_id", None),
             "is_head_nurse": bool(getattr(nurse, "is_head_nurse", False)),
             "group_id": getattr(nurse, "group_id", None),
         }
+        # group_id 기준으로 groups 테이블에서 group_name 조회
+        if result["group_id"]:
+            group = db.query(Group).filter(Group.group_id == result["group_id"]).first()
+            if group:
+                result["group_name"] = group.group_name
+        return result
     except Exception:
         return {}
 
@@ -79,6 +85,9 @@ def get_user(db: Session, account_id: str):
 
 def mworks_get_user (account_id: str, password: str, client_ip: str) :
     rows = msdb_manager.fetch_all(Member.login_check(), params=(password, account_id))
+
+    if not rows:
+        raise HTTPException(status_code=501, detail="존재하지 않는 계정입니다.")
 
     for row in rows :
        IsPWCorrect = row['IsPWCorrect']
@@ -151,24 +160,36 @@ async def login_for_access_token(
         # ADM 여부는 EmpAuthGbn으로 판정
         is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
+        # 관리자가 아닌 경우 nurses 테이블 존재 여부 확인
+        if not is_master_admin:
+            try:
+                nurse_record = db.query(Nurse).filter(
+                    Nurse.account_id == account_id
+                ).first()
+                if nurse_record is None:
+                    raise HTTPException(
+                        status_code=501,
+                        detail="등록되지 않은 사용자입니다.",
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=501,
+                    detail=f"사용자 확인 중 오류가 발생했습니다: {str(e)}",
+                )
+
+        is_nurse_registered = True
+
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        
+
         # nurses 테이블의 값으로 보강/덮어쓰기
         extra_data = get_extra_data_from_nurses(db, account_id)
         office_id = extra_data.get("office_id") or office_id
         group_id = extra_data.get("group_id") or group_id
+        mb_part_name = extra_data.get("group_name") or mb_part_name
         if "is_head_nurse" in extra_data:
             is_head_nurse = extra_data["is_head_nurse"]
-            
-        # 추가
-        nurse_record = db.query(Nurse).filter(
-            Nurse.account_id == account_id
-        ).first()
-        
-        if is_master_admin:
-            is_nurse_registered = True
-        else:
-            is_nurse_registered = nurse_record is not None
 
         access_token = create_login_token(
             data={
@@ -218,6 +239,8 @@ async def login_for_access_token(
             # 추가 필드
             is_nurse_registered=is_nurse_registered
         )
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -372,7 +395,7 @@ async def handle_find_pw_request(
             return {"result": "fail", "message": "휴대폰번호가 일치하지 않습니다."}
     else:
         if email != email_chk :
-            return {"result": "fail", "message": "email이 일치하지 않습니다."}
+            return {"result": "fail", "message": "email이 일치하��� 않습니다."}
 
     # 패스워드 변경
     pwd_reset_result = msdb_manager.execute(Member.member_pwd_reset(), params=(new_password, new_password, empseqno))
