@@ -4,8 +4,8 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Nurse as NurseModel, Group
-from schemas.roster_schema import NurseProfile
+from db.models import Nurse as NurseModel, Group, DeletedNurseHistory
+from schemas.roster_schema import NurseProfile, CodeMapp
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional
 from pprint import pprint
@@ -480,3 +480,76 @@ def move_nurse_service(req, current_user, db: Session):
 
     db.commit()
     return {"message": "간호사 순서 변경 완료"}
+
+
+def delete_nurse_service(
+    nurse_id: str,
+    current_user: UserSchema,
+    db: Session
+):
+    """
+    특정 간호사 삭제 서비스 함수
+    - HDN 또는 ADM만 허용
+    - 삭제 전 deleted_nurse_history 테이블에 이력 저장
+    - 삭제 후 재정렬(선택: 필요 시 _reindex_contiguously 호출)
+    """
+    if not current_user:
+        raise Exception("Not authenticated")
+    
+    # 권한 체크
+    if not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise Exception("Permission denied")
+    
+    # 대상 간호사 조회
+    db_nurse = db.query(NurseModel).filter(
+        NurseModel.nurse_id == nurse_id,
+        NurseModel.group_id == current_user.group_id if not current_user.is_master_admin else True
+    ).first()
+    
+    if not db_nurse:
+        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+    
+    try:
+        # 삭제 수행자 정보 조회
+        deleter = db.query(NurseModel).filter(
+            NurseModel.nurse_id == current_user.nurse_id
+        ).first()
+
+        # 삭제 이력 저장 (deleted_nurse_history)
+        history = DeletedNurseHistory(
+            target_nurse_id=db_nurse.nurse_id,
+            office_id=db_nurse.office_id,
+            group_id=db_nurse.group_id,
+            emp_num=db_nurse.emp_num,
+            account_id=db_nurse.account_id,
+            name=db_nurse.name,
+            role=db_nurse.role,
+            experience=db_nurse.experience,
+            is_head_nurse=db_nurse.is_head_nurse,
+            joining_date=db_nurse.joining_date,
+            birth_date=db_nurse.birth_date,
+            phone_number=db_nurse.phone_number,
+            gender=db_nurse.gender,
+            deleted_by_nurse_id=current_user.nurse_id,
+            deleted_by_account_id=current_user.account_id,
+            deleted_by_name=deleter.name if deleter else None,
+            deleted_by_role=current_user.EmpAuthGbn,
+        )
+        db.add(history)
+
+        # 삭제
+        group_id = db_nurse.group_id
+        db.delete(db_nurse)
+        db.commit()
+
+        # 삭제 후 active 상태별 재정렬
+        active_nurses = _get_nurses_by_active(group_id, 1, db)
+        _reindex_contiguously(active_nurses)
+        inactive_nurses = _get_nurses_by_active(group_id, 0, db)
+        _reindex_contiguously(inactive_nurses)
+        db.commit()
+
+        return {"message": f"Nurse {nurse_id} deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise Exception(f"Deletion failed: {str(e)}")

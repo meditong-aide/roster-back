@@ -412,6 +412,37 @@ class DailyShift(Base):
     group = relationship("Group")
 
 
+class DeletedNurseHistory(Base):
+    """간호사 삭제 이력 테이블 – 삭제된 간호사의 기초 정보와 삭제 수행자를 기록"""
+    __tablename__ = 'deleted_nurse_history'
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+
+    # 삭제된 간호사 기초 정보
+    target_nurse_id = Column(VARCHAR(50), nullable=False)
+    office_id = Column(VARCHAR(50), nullable=True)
+    group_id = Column(VARCHAR(50), nullable=True)
+    emp_num = Column(VARCHAR(50), nullable=True)
+    account_id = Column(VARCHAR(50), nullable=False)
+    name = Column(VARCHAR(50), nullable=False)
+    role = Column(VARCHAR(20), nullable=True)
+    experience = Column(SMALLINT, nullable=True)
+    is_head_nurse = Column(BOOLEAN, nullable=True)
+    joining_date = Column(DATETIME, nullable=True)
+    birth_date = Column(VARCHAR(10), nullable=True)
+    phone_number = Column(VARCHAR(20), nullable=True)
+    gender = Column(VARCHAR(3), nullable=True)
+
+    # 삭제 수행자 정보
+    deleted_by_nurse_id = Column(VARCHAR(50), nullable=False)
+    deleted_by_account_id = Column(VARCHAR(50), nullable=False)
+    deleted_by_name = Column(VARCHAR(50), nullable=True)
+    deleted_by_role = Column(VARCHAR(3), nullable=True)   # ADM / HDN
+
+    # 삭제 시각
+    deleted_at = Column(DATETIME, nullable=False, default=func.now())
+
+
 class WeeklyOffSetting(Base):
     __tablename__ = 'weekly_off_settings'
     
