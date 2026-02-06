@@ -1189,11 +1189,16 @@ def _merge_fixed_cells_with_weekly_off(
 def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: int) -> str | None:
     """이전 달의 최종(issued 우선) schedule_id를 조회한다."""
     py, pm = _get_prev_year_month(year, month)
-    # 1) IssuedRoster 우선
+    # 1) IssuedRoster 우선 (is_active=True인 것만)
     issued = (
         db.query(IssuedRoster)
         .join(Schedule, IssuedRoster.schedule_id == Schedule.schedule_id)
-        .filter(Schedule.group_id == group_id, Schedule.year == py, Schedule.month == pm)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == py,
+            Schedule.month == pm,
+            IssuedRoster.is_active == True
+        )
         .order_by(IssuedRoster.issued_at.desc())
         .first()
     )
@@ -1354,7 +1359,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         if weekend_off_nurse_ids:
             print(f"[CrossMonth] 주말 휴무 대상 간호사: {sorted(weekend_off_nurse_ids)}")
     except Exception as e:
-        print(f"[CrossMonth] 주말 휴무 대상 간호사 조회 실패 (무시): {e}")
+        print(f"[CrossMonth] 주말 ��무 대상 간호사 조회 실패 (무시): {e}")
     
     # 대상 월의 주말 day_idx 계산 (필터링용)
     from datetime import date, timedelta
@@ -1857,7 +1862,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             cp_sat_result.get("satisfaction_data", {}),
             cp_sat_result.get("roster_system"),
         )
-    # 구형 반환 형식 호환
+    # 구형 반환 ���식 호환
     return cp_sat_result, {}, None
 
 

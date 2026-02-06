@@ -35,7 +35,7 @@ from schemas.auth_schema import User
 from db.client2 import get_db
 from db.models import RosterConfig as RosterConfigModel
 from schemas.auth_schema import User as UserSchema
-from db.models import Schedule, ShiftPreference, Nurse, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, ShiftManage, DailyShift
+from db.models import Schedule, ShiftPreference, Nurse, ScheduleEntry, Shift, Group, RosterConfig, Wanted, IssuedRoster, IssuedRosterSnapshot, ShiftManage, DailyShift
 from sqlalchemy import func, and_
 from routers.utils import get_days_in_month
 from db.nurse_config import Nurse as NurseEngine
@@ -724,6 +724,76 @@ async def publish_roster(
         # "seq_no": issued_roster.seq_no,
         "is_first_issue": is_first_issue
     } 
+
+
+
+# [Roster] - 근무표 발행 취소 (마감 철회)
+@router.post("/unpublish")
+async def unpublish_roster(
+    schedule_id: str,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    발행된 근무표를 draft 상태로 되돌립니다.
+    - Schedule.status: 'issued' → 'draft'
+    - IssuedRoster.is_active: True → False
+    - IssuedRosterSnapshot.is_active_issued: True → False
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    # 스케줄 조회
+    schedule = db.query(Schedule).filter(
+        Schedule.schedule_id == schedule_id,
+        Schedule.group_id == target_group_id,
+        Schedule.dropped == False
+    ).first()
+
+    if not schedule:
+        raise HTTPException(status_code=404, detail="해당 스케줄을 찾을 수 없습니다.")
+
+    if schedule.status != 'issued':
+        raise HTTPException(status_code=400, detail="발행되지 않은 스케줄은 발행 취소할 수 없습니다.")
+
+    # 1) Schedule status를 draft로 변경
+    schedule.status = 'draft'
+
+    # 2) IssuedRoster의 is_active를 False로 변경
+    db.query(IssuedRoster).filter(
+        IssuedRoster.schedule_id == schedule_id,
+        IssuedRoster.group_id == target_group_id
+    ).update({"is_active": False})
+
+    # 3) IssuedRosterSnapshot의 is_active_issued를 False로 변경
+    db.query(IssuedRosterSnapshot).filter(
+        IssuedRosterSnapshot.schedule_id == schedule_id,
+        IssuedRosterSnapshot.group_id == target_group_id
+    ).update({"is_active_issued": False})
+
+    db.commit()
+
+    return {
+        "message": "근무표 발행이 취소되었습니다.",
+        "schedule_id": schedule_id,
+        "new_status": "draft"
+    }
 
 
 # [Roster] - 특정 월의 근무표 조회

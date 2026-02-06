@@ -276,11 +276,12 @@ class IssuedRoster(Base):
     v_name = Column(VARCHAR(100), nullable=True)  # 버전 명
     issue_cmmt = Column(VARCHAR(500), nullable=True)  # 발행 코멘트
     schedule_id = Column(CHAR(12), ForeignKey('schedules.schedule_id'), nullable=False)
-    
+    is_active = Column(BOOLEAN, nullable=False, default=True)  # 발행 취소 시 False
+
     office = relationship("Office")
     group = relationship("Group")
     nurse = relationship("Nurse")
-    schedule = relationship("Schedule") 
+    schedule = relationship("Schedule")
 
 
 class IssuedRosterSnapshot(Base):
