@@ -1709,8 +1709,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for d in range(join[n], leave[n] - 2):
                 if d + 3 > leave[n]:
                     continue
-                if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
-                    continue
+                # if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
+                #     continue
                 fixed_o_cnt = sum(
                     1
                     for (fn, fd), fs_idx in fixed.items()
@@ -1724,11 +1724,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         f"[CP-SAT-Basic] [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
                     )
                     continue
-                m.Add(
-                    sum(countable_off(n, d + k) for k in range(4))
-                    + sum(1 for k in range(4) if (n, d + k) in off_or_weekly)
-                    <= 3
-                )
+                # off_or_weekly(주휴·주말휴무 등)와 countable_off(X) 중복 카운팅 방지:
+                # structural OFF는 이미 X=1로 고정되므로 countable_off만 사용
+                off_like = [
+                    1 if (n, d + k) in off_or_weekly else countable_off(n, d + k)
+                    for k in range(4)
+                ]
+                m.Add(sum(off_like) <= 3)
 
     # ───────────── 2-A2. 고립 OFF 금지(슬랙 허용) ─────────────
     enforce_clustered_offs = bool(getattr(rs.config, "enforce_clustered_offs", False))
@@ -2007,15 +2009,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                         )
                         continue
-                    # print('주말휴무 강제 간호사:', nu.name, '날짜:', d+1)
-                    
+                    wd = (rs.target_month + timedelta(days=d)).weekday()
+                    print(
+                        f"[WeekendOff][HardDebug] X(n,d,off)==1 추가: "
+                        f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                        f"d={d+1}, weekday={wd}(토5/일6)"
+                    )
                     m.Add(X(n, d, off) == 1)
                 else:
                     # 평일(월~금): OFF 금지(D/E/N만 가능)
                     # 사용자 고정 OFF는 예외로 허용
                     if (n, d) in fixed and fixed[(n, d)] == off:
+                        print(
+                            f"[WeekendOff][HardDebug] 평일 OFF 금지 스킵(고정 OFF): "
+                            f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
+                        )
                         continue
-                    # print('평일휴무 금지 간호사:', nu.name, '날짜:', d+1)
+                    wd = (rs.target_month + timedelta(days=d)).weekday()
+                    print(
+                        f"[WeekendOff][HardDebug] X(n,d,off)==0 추가: "
+                        f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                        f"d={d+1}, weekday={wd}(월0~금4)"
+                    )
                     m.Add(X(n, d, off) == 0)
         # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
         try:
@@ -2075,6 +2090,21 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     m.Add(X(n, d, night) <= sum(neighbors))
 
+            # 주말 휴무자 N 요일 제한: forbid_n 아니고 2N 2O 켜진 경우 목금만 N 허용 (2O가 주말에 자연 달성)
+            is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
+            if (
+                is_weekend_off
+                and n not in n_forbid_n
+                and bool(getattr(cfg, "two_offs_after_two_nig", False))
+            ):
+                allowed_wd = {3, 4}  # 목금 (weekday: Mon=0 .. Fri=4)
+                for d in range(T0, T1 + 1):
+                    if (n, d) in fixed and fixed[(n, d)] == night:
+                        continue
+                    wd = (rs.target_month + timedelta(days=d)).weekday()
+                    if wd not in allowed_wd:
+                        m.Add(X(n, d, night) == 0)
+
             # 연속 Night
             for d0 in range(T0, T1-L+1):
                 m.Add(sum(X(n,d0+t,night) for t in range(L+1)) <= L)
@@ -2083,76 +2113,55 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.Add(sum(X(n,d,night) for d in range(T0,T1+1))
                   <= cfg.max_night_shifts_per_month)
 
-        # 월 최소 OFF 일수 하드 제약 (프론트 전달 off_days를 최소값으로 해석)
+        # 월 최소 OFF 일수 하드 제약 (주말 휴무자는 제외: 주말 전부 OFF로 이미 충분)
         try:
-            base_min_off = int(
-                getattr(cfg, "global_monthly_off_days", 0)
-                + getattr(cfg, "standard_personal_off_days", 0)
-            )
-            avail_days = T1 - T0 + 1
-            vacation_cnt = sum(1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells)
-            min_off_required = max(0, min(base_min_off, avail_days - vacation_cnt))
-            if min_off_required > 0:
-                m.Add(
-                    sum(
-                        X(n, d, off)
-                        for d in range(T0, T1 + 1)
-                        if (n, d) not in vacation_off_cells
-                    )
-                    >= min_off_required
+            if not bool(getattr(nu, "is_weekend_off", False)):
+                base_min_off = int(
+                    getattr(cfg, "global_monthly_off_days", 0)
+                    + getattr(cfg, "standard_personal_off_days", 0)
                 )
-            extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
-            if extra_allowed >= 0:
-                if is_n_only:
-                    max_off_allowed_n_only = max(0, avail_days - 15)
+                avail_days = T1 - T0 + 1
+                vacation_cnt = sum(1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells)
+                min_off_required = max(0, min(base_min_off, avail_days - vacation_cnt))
+                if min_off_required > 0:
                     m.Add(
                         sum(
                             X(n, d, off)
                             for d in range(T0, T1 + 1)
                             if (n, d) not in vacation_off_cells
                         )
-                        <= max_off_allowed_n_only
+                        >= min_off_required
                     )
-                    print(
-                        f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                        f"is_n_only=1, vac_cnt={vacation_cnt}, "
-                        f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
-                    )
-                else:
-                    max_off_allowed = min(min_off_required + extra_allowed, avail_days)
-                    effective_cap = max_off_allowed
-                    if bool(getattr(nu, "is_weekend_off", False)):
-                        weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
-                        weekend_cnt = len(weekend_in_range)
-                        weekday_off_cap = max(0, effective_cap - weekend_cnt)
-                        effective_cap = weekday_off_cap + weekend_cnt
-                        m.Add(
-                            sum(
-                                X(n, d, off)
-                                for d in range(T0, T1 + 1)
-                                if (n, d) not in vacation_off_cells and d not in weekend_days
-                            )
-                            <= weekday_off_cap
-                        )
-                        print(
-                            f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"is_weekend_off=1, vac_cnt={vacation_cnt}, "
-                            f"min_off={min_off_required}, max_off={effective_cap}, "
-                            f"weekday_off_cap={weekday_off_cap}, weekend_cnt={weekend_cnt}"
-                        )
-                    else:
+                extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
+                if extra_allowed >= 0:
+                    if is_n_only:
+                        max_off_allowed_n_only = max(0, avail_days - 15)
                         m.Add(
                             sum(
                                 X(n, d, off)
                                 for d in range(T0, T1 + 1)
                                 if (n, d) not in vacation_off_cells
                             )
-                            <= effective_cap
+                            <= max_off_allowed_n_only
                         )
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"is_weekend_off=0, vac_cnt={vacation_cnt}, "
-                            f"min_off={min_off_required}, max_off={effective_cap}"
+                            f"is_n_only=1, vac_cnt={vacation_cnt}, "
+                            f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
+                        )
+                    else:
+                        max_off_allowed = min(min_off_required + extra_allowed, avail_days)
+                        m.Add(
+                            sum(
+                                X(n, d, off)
+                                for d in range(T0, T1 + 1)
+                                if (n, d) not in vacation_off_cells
+                            )
+                            <= max_off_allowed
+                        )
+                        print(
+                            f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                            f"vac_cnt={vacation_cnt}, min_off={min_off_required}, max_off={max_off_allowed}"
                         )
         except Exception:
             pass

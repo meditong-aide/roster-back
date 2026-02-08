@@ -946,6 +946,21 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, night_idx) <= sum(neighbors))
 
+        # # 주말 휴무자 N 요일 제한: 2N 2O 켜진 경우 목금만 N 허용 (2O가 주말에 자연 달성)
+        # if bool(getattr(cfg, "two_offs_after_two_nig", False)):
+        #     allowed_wd = {3, 4}  # 목금 (weekday: Mon=0 .. Fri=4)
+        #     for n in range(N):
+        #         nu = roster_system.nurses[n]
+        #         if not bool(getattr(nu, "is_weekend_off", False)):
+        #             continue
+        #         T0, T1 = join[n], leave[n]
+        #         for d in range(T0, T1 + 1):
+        #             if (n, d) in fixed and fixed[(n, d)] == night_idx:
+        #                 continue
+        #             wd = (first_day + timedelta(days=d)).weekday()
+        #             if wd not in allowed_wd:
+        #                 m.Add(X(n, d, night_idx) == 0)
+
         # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
         try:
             off_windows = getattr(roster_system, "off_window_constraints", {}) or {}
@@ -1172,7 +1187,7 @@ def optimize_fallback_lex_hard_first(
                 #     f"base_min_off={base_min_off}, avail_days={avail_days}, "
                 #     f"vacation={vacation_cnt}, min_off_required={min_off_required}"
                 # )
-                if min_off_required > 0:
+                if min_off_required > 0 and not is_weekend_off:
                     # 휴가/공가는 최소 OFF 충족에서 제외
                     offs = sum(
                         X(n, d, off_idx)
