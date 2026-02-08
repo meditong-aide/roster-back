@@ -2201,6 +2201,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         coverage_shortage_vars=coverage_shortage_vars,
         include_pair_objective=include_pair_objective,
         preceptor_terms_fn=_add_preceptor_objective_terms,
+        fixed_cnt=fixed_cnt,
     )
     # 고립 OFF 슬랙 패널티(강제 불가 시에만 허용)
     for slack_var, w in isolated_off_slacks:

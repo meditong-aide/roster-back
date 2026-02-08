@@ -30,6 +30,7 @@ def build_main_objective_terms(
     coverage_shortage_vars: list[tuple[cp_model.IntVar, str]],
     include_pair_objective: bool,
     preceptor_terms_fn: Callable[..., Iterable],
+    fixed_cnt: list[list[int]] | None = None,
 ) -> list:
     """메인 모델의 목적 함수 항들을 생성한다.
 
@@ -43,6 +44,7 @@ def build_main_objective_terms(
         coverage_shortage_vars: (short_var, code) 목록
         include_pair_objective: 페어/팀 항 포함 여부
         preceptor_terms_fn: 프리셉터 보너스 항 생성 함수
+        fixed_cnt: 날짜×교대별 고정 셀 카운트 (even_nights용, None이면 미사용)
 
     Returns:
         목적 함수 항 리스트
@@ -156,23 +158,52 @@ def build_main_objective_terms(
                 m.Add(slack >= 2 - offs)
                 obj.append(-WEEK_OFF_SHORT_PENALTY * slack)
 
-    # (4-3) 야간 균등 (편차에 선형 패널티)
-    if cfg.even_nights:
-        normals = [i for i, nu in enumerate(rs.nurses) if nu.is_night_nurse != 3]
+    # (4-3) 야간 균등 (편차에 선형 패널티) - fallback과 동일 방식
+    if getattr(cfg, "even_nights", False):
+        normals: list[int] = []
+        for i, nu in enumerate(rs.nurses):
+            is_n_only = False
+            raw = getattr(nu, "is_night_nurse", None)
+            if isinstance(raw, list):
+                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                is_n_only = allowed == {"N"}
+            elif raw == 3 or (raw is not None and raw not in (0, False)):
+                is_n_only = True
+            if not is_n_only:
+                normals.append(i)
         if normals:
-            total_req = sum(cfg.daily_shift_requirements["N"] for _ in range(D))
-            target = total_req // len(normals)
-            for n in normals:
-                totN = sum(X(n, d, night) for d in range(join[n], leave[n] + 1))
-                devP = m.NewIntVar(0, D, f"devP_{n}")
-                devN = m.NewIntVar(0, D, f"devN_{n}")
-                m.Add(devP - devN == totN - target)
-                obj.extend(
-                    [
-                        -NIGHT_DEVIATION_PENALTY * devP,
-                        -NIGHT_DEVIATION_PENALTY * devN,
-                    ]
-                )
+            if (
+                hasattr(cfg, "daily_shift_requirements_by_day")
+                and isinstance(cfg.daily_shift_requirements_by_day, list)
+                and len(cfg.daily_shift_requirements_by_day) == D
+            ):
+                daily_need_n = [
+                    int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
+                    for d in range(D)
+                ]
+            else:
+                base_n = int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
+                daily_need_n = [base_n for _ in range(D)]
+            fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+            total_need_n = 0
+            for d in range(D):
+                need = max(0, daily_need_n[d] - int(fc[d][night] if d < len(fc) else 0))
+                total_need_n += need
+            if total_need_n > 0:
+                target = total_need_n // len(normals)
+                for n in normals:
+                    tot_nights = sum(
+                        X(n, d, night) for d in range(join[n], leave[n] + 1)
+                    )
+                    dev_pos = m.NewIntVar(0, D, f"devP_{n}")
+                    dev_neg = m.NewIntVar(0, D, f"devN_{n}")
+                    m.Add(dev_pos - dev_neg == tot_nights - target)
+                    obj.extend(
+                        [
+                            -NIGHT_DEVIATION_PENALTY * dev_pos,
+                            -NIGHT_DEVIATION_PENALTY * dev_neg,
+                        ]
+                    )
 
     # (4-4) N-O-D/E 패턴
     if getattr(cfg, "nod_noe", True):
