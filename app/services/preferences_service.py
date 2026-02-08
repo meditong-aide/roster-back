@@ -308,6 +308,11 @@ def submit_preferences_service(
     if preference_list is None and req.preference is not None:
         preference_list = req.preference
 
+    # 초기화 모드 감지: shift 데이터가 비어있으면 preference도 초기화 (저장하지 않음)
+    if not data_to_save:
+        print(f"[pair 초기화] shift 데이터가 비어있어 preference도 초기화 (request_id={request_id})")
+        preference_list = None  # preference 저장 스킵
+
     if preference_list is not None and isinstance(preference_list, list):
         # 프론트에서 preference 배열을 명시적으로 보낸 경우 → 해당 항목만 저장
         # (제거된 항목은 배열에 미포함되어 자연스럽게 새 request_id에 저장되지 않음)
