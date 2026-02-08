@@ -622,8 +622,8 @@ def optimize_fallback_lex_hard_first(
                 for d in range(join[n], leave[n] - 2):
                     if d + 3 > leave[n]:
                         continue
-                    if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
-                        continue
+                    # if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
+                    #     continue
                     fixed_o_cnt = sum(
                         1
                         for (fn, fd), fs_idx in fixed.items()
