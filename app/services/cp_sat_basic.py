@@ -1119,11 +1119,14 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
 
-        # Grade 배치 요약 출력/CSV 저장 (GRADE 전략일 때만)
+        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE 전략일 때만)
         try:
             grade_strategy_norm = str(grade_strategy or "BASE").upper()
             if grade_strategy_norm == "GRADE" and grade_config:
                 _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
+                _log_grade_result(
+                    roster_system, nurses, grade_config, self.logger_prefix, label="solve 직후"
+                )
         except Exception as e:
             print(f"{self.logger_prefix} Grade 요약 출력 중 오류: {e}")
 
@@ -1139,6 +1142,9 @@ class CPSATBasicEngine:
                     max_moves_per_nurse=1,
                 )
                 roster_system.roster = updated_roster
+                _log_grade_result(
+                    roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
+                )
                 # repair 로그 간단 출력
                 if repair_log:
                     print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
@@ -2482,6 +2488,122 @@ def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_pre
         writer.writeheader()
         writer.writerows(rows)
     print(f"{logger_prefix} Grade 요약 CSV 저장: {out_path}")
+
+
+def _log_grade_result(
+    rs: RosterSystem,
+    nurses,
+    grade_config: dict,
+    logger_prefix: str = "[CP-SAT-Basic]",
+    label: str = "최종",
+):
+    """Grade 처리 적용 여부를 확인하고, 일자별 D/E/N 필요·확보, Grade별 배치·달성%를 가독성 있게 로그한다."""
+    constraints_map = grade_config.get("constraints") or grade_config.get("constraints_json") or {}
+    if not constraints_map:
+        return
+
+    shift_types = rs.config.shift_types
+    cfg = rs.config
+    ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+    apply_shifts = ("D", "E", "N")
+
+    # grade 정의역 및 간호사별 grade 매핑 (_dump_grade_summary와 동일)
+    _grades = set()
+    for _, gmap in constraints_map.items():
+        if not isinstance(gmap, dict):
+            continue
+        for k in gmap:
+            try:
+                _grades.add(int(k))
+            except (TypeError, ValueError):
+                continue
+    grade_values = sorted(_grades) if _grades else [1, 2, 3]
+    null_policy = str(grade_config.get("null_grade_policy") or "LOWEST").upper()
+    valid_grades = [getattr(n, "grade", None) for n in nurses if getattr(n, "grade", None) is not None]
+    avg_grade = round(sum(valid_grades) / len(valid_grades)) if valid_grades else max(grade_values)
+
+    def _resolve_grade(nurse):
+        g = getattr(nurse, "grade", None)
+        if g is not None:
+            try:
+                gi = int(g)
+                if gi in grade_values:
+                    return gi
+            except Exception:
+                pass
+        if null_policy == "AVERAGE":
+            return avg_grade if avg_grade in grade_values else max(grade_values)
+        if null_policy == "RANDOM":
+            h = hashlib.md5(str(getattr(nurse, "db_id", getattr(nurse, "name", ""))).encode()).hexdigest()
+            return grade_values[int(h[:8], 16) % len(grade_values)]
+        return max(grade_values)
+
+    nurse_grades = [_resolve_grade(n) for n in nurses]
+
+    def _need_for_day(day_idx: int) -> dict:
+        if isinstance(ds_by_day, list) and day_idx < len(ds_by_day) and isinstance(ds_by_day[day_idx], dict):
+            return ds_by_day[day_idx]
+        return getattr(cfg, "daily_shift_requirements", {}) or {}
+
+    # ---------- 1) Grade 처리 적용 확인 ----------
+    print(f"{logger_prefix} ========== [Grade] Grade 처리 적용됨 ({label}) ==========")
+
+    # ---------- 2) 일자별 D, E, N 필요 수 / 확보 수 ----------
+    print(f"{logger_prefix} --- 일자별 교대(D/E/N) 필요 수 · 확보 수 ---")
+    for d in range(rs.num_days):
+        need_map = _need_for_day(d)
+        parts = []
+        for code in apply_shifts:
+            if code not in shift_types:
+                continue
+            s_idx = shift_types.index(code)
+            need = int(need_map.get(code, 0) or 0)
+            secured = int(sum(1 for n in range(len(nurses)) if int(rs.roster[n, d, s_idx]) == 1))
+            parts.append(f"{code} 필요 {need} 확보 {secured}")
+        if parts:
+            print(f"{logger_prefix}   일자 {d + 1:2d}:  {' | '.join(parts)}")
+
+    # ---------- 3) Grade별 목표·배치·달성% ----------
+    total_target_by_grade = {g: 0 for g in grade_values}
+    total_assigned_by_grade = {g: 0 for g in grade_values}
+
+    for d in range(rs.num_days):
+        need_map = _need_for_day(d)
+        for shift_code, base in (constraints_map or {}).items():
+            s_code = str(shift_code or "").upper()
+            if s_code not in apply_shifts or s_code not in shift_types:
+                continue
+            req = int(need_map.get(s_code, 0) or 0)
+            if req <= 0:
+                continue
+            base_min = {g: 0 for g in grade_values}
+            if isinstance(base, dict):
+                for k, v in base.items():
+                    try:
+                        gi = int(k)
+                        if gi in grade_values:
+                            base_min[gi] = max(0, int(v or 0))
+                    except Exception:
+                        pass
+            sum_base = sum(base_min.values())
+            if sum_base <= 0:
+                continue
+            s_idx = shift_types.index(s_code)
+            for g in grade_values:
+                t = (req * base_min.get(g, 0) + sum_base - 1) // sum_base if sum_base else 0
+                total_target_by_grade[g] += min(t, req)
+            for n_idx in range(len(nurses)):
+                if int(rs.roster[n_idx, d, s_idx]) == 1:
+                    g = nurse_grades[n_idx]
+                    total_assigned_by_grade[g] = total_assigned_by_grade.get(g, 0) + 1
+
+    print(f"{logger_prefix} --- Grade별 목표 대비 배치 현황 ---")
+    for g in sorted(grade_values):
+        target = total_target_by_grade.get(g, 0)
+        assigned = total_assigned_by_grade.get(g, 0)
+        pct = (100.0 * assigned / target) if target > 0 else (100.0 if assigned == 0 else 0)
+        print(f"{logger_prefix}   Grade {g}: 목표 {target}명, 배치 {assigned}명 → 달성 {pct:.1f}%")
+    print(f"{logger_prefix} ========================================")
 
 
 cp_sat_engine = CPSATBasicEngine()

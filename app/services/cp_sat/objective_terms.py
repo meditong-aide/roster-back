@@ -16,6 +16,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
     WEEK_OFF_SHORT_PENALTY,
 )
+from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
 
 
@@ -254,6 +255,23 @@ def build_main_objective_terms(
         print("grade_strategy", grade_strategy)
         if grade_strategy == "TEAM":
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))
+
+    # (4-6a) Grade 분배 목적 항 (fallback Stage3와 동일)
+    try:
+        _gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        if _gs == "GRADE":
+            grade_terms = add_grade_constraints(
+                m=m,
+                rs=rs,
+                X=X,
+                join=join,
+                leave=leave,
+                grade_strategy=_gs,
+                grade_config=getattr(rs, "grade_config", None),
+            )
+            obj.extend(grade_terms or [])
+    except Exception:
+        pass
 
     # (4-7) 커버리지 부족 패널티 (shift_requirement_priority 기반)
     try:
