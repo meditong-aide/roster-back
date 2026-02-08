@@ -274,7 +274,7 @@ def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict]
         "min_leader_keep": bool(grade_config.get("min_leader_keep", True)),
         "min_ratio_floor": min_ratio_floor,
         "allow_soft_fallback": bool(grade_config.get("allow_soft_fallback", True)),
-        "grade_penalty_weight": int(grade_config.get("grade_penalty_weight", 500)),
+        "grade_penalty_weight": int(grade_config.get("grade_penalty_weight", 160000)),
     }
     return constraints_map, policy, scaling
 
