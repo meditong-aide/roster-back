@@ -2090,20 +2090,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     m.Add(X(n, d, night) <= sum(neighbors))
 
-            # 주말 휴무자 N 요일 제한: forbid_n 아니고 2N 2O 켜진 경우 목금만 N 허용 (2O가 주말에 자연 달성)
-            is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
-            if (
-                is_weekend_off
-                and n not in n_forbid_n
-                and bool(getattr(cfg, "two_offs_after_two_nig", False))
-            ):
-                allowed_wd = {3, 4}  # 목금 (weekday: Mon=0 .. Fri=4)
-                for d in range(T0, T1 + 1):
-                    if (n, d) in fixed and fixed[(n, d)] == night:
-                        continue
-                    wd = (rs.target_month + timedelta(days=d)).weekday()
-                    if wd not in allowed_wd:
-                        m.Add(X(n, d, night) == 0)
+            # # 주말 휴무자 N 요일 제한: forbid_n 아니고 2N/3N 2O 켜진 경우 2O가 주말에 자연 달성되도록 제한
+            # # 2N→2O만: 목금만 N 허용. 3N→2O도 켜진 경우: 수목금 N 허용 (3N 블록이 금요일 끝나면 2O=토일)
+            # is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
+            # two_n = bool(getattr(cfg, "two_offs_after_two_nig", False))
+            # three_n = bool(getattr(cfg, "two_offs_after_three_nig", False))
+            # if is_weekend_off and n not in n_forbid_n and (two_n or three_n):
+            #     allowed_wd = {2, 3, 4} if three_n else {3, 4}  # 수목금 vs 목금
+            #     for d in range(T0, T1 + 1):
+            #         if (n, d) in fixed and fixed[(n, d)] == night:
+            #             continue
+            #         wd = (rs.target_month + timedelta(days=d)).weekday()
+            #         if wd not in allowed_wd:
+            #             m.Add(X(n, d, night) == 0)
 
             # 연속 Night
             for d0 in range(T0, T1-L+1):
