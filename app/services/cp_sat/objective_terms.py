@@ -219,15 +219,16 @@ def build_main_objective_terms(
                 m.Add(pat3 >= X(n, d, eve) + X(n, d + 1, off) + X(n, d + 2, day) - 2)
                 obj.append(-NOD_NOE_PENALTY * pat3)
 
-    # (4-5) 고립 OFF
-    for n in range(N):
-        for d in range(join[n], leave[n] + 1):
-            iso = m.NewIntVar(0, 1, f"iso_{n}_{d}")
-            m.Add(iso >= X(n, d, off) - X(n, d - 1, off) - X(n, d + 1, off))
-            m.Add(iso <= X(n, d, off))
-            m.Add(iso <= 1 - X(n, d - 1, off))
-            m.Add(iso <= 1 - X(n, d + 1, off))
-            obj.append(-ISOLATED_OFF_PENALTY * iso)
+    # (4-5) 고립 OFF (sequential_offs ON일 때만, fallback과 동일)
+    if getattr(cfg, "sequential_offs", True):
+        for n in range(N):
+            for d in range(join[n], leave[n] + 1):
+                iso = m.NewIntVar(0, 1, f"iso_{n}_{d}")
+                m.Add(iso >= X(n, d, off) - X(n, d - 1, off) - X(n, d + 1, off))
+                m.Add(iso <= X(n, d, off))
+                m.Add(iso <= 1 - X(n, d - 1, off))
+                m.Add(iso <= 1 - X(n, d + 1, off))
+                obj.append(-ISOLATED_OFF_PENALTY * iso)
 
     # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
     if getattr(cfg, "sequential_offs", True):
