@@ -30,6 +30,7 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
     existing_count = db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id == current_request_id,
+        NursePairRequest.month == month_str,
     ).count()
     if existing_count > 0:
         print(f"[pair carry-forward] 현재 request_id={current_request_id}에 이미 {existing_count}건 존재 → 스킵")
@@ -51,6 +52,7 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
         pair_rows = db.query(NursePairRequest).filter(
             NursePairRequest.nurse_id == nurse_id,
             NursePairRequest.request_id == prev_rid,
+            NursePairRequest.month == month_str,
         ).all()
 
         if pair_rows:
@@ -59,6 +61,7 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
                 db.add(NursePairRequest(
                     nurse_id=nurse_id,
                     request_id=current_request_id,
+                    month=month_str,
                     detailed_request_id=detailed_id,
                     target_id=row.target_id,
                     score=row.score,
@@ -163,7 +166,7 @@ def submit_preferences_service(
                 f"{req.year}년 {req.month}월 원티드 마감일({wanted.exp_date.strftime('%Y-%m-%d %H:%M')})이 지났습니다."
             )
 
-        print(f"[검증 통과] Wanted 상태 확인: status={wanted.status}, "
+        print(f"[검증 통���] Wanted 상태 확인: status={wanted.status}, "
               f"exp_date={wanted.exp_date.strftime('%Y-%m-%d %H:%M') if wanted.exp_date else 'None'}")
 
         # 3. 재제출 여부 확인
@@ -314,6 +317,7 @@ def submit_preferences_service(
         db.query(NursePairRequest).filter(
             NursePairRequest.nurse_id == current_user.nurse_id,
             NursePairRequest.request_id == request_id,
+            NursePairRequest.month == month_str,
         ).delete()
 
         pair_detailed_id = 1
@@ -325,6 +329,7 @@ def submit_preferences_service(
             db.add(NursePairRequest(
                 nurse_id=current_user.nurse_id,
                 request_id=request_id,
+                month=month_str,
                 detailed_request_id=pair_detailed_id,
                 target_id=str(target_id),
                 score=float(weight),
@@ -447,6 +452,7 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         .filter(
             NursePairRequest.nurse_id == nurse_id,
             NursePairRequest.request_id == target_wr.request_id,
+            NursePairRequest.month == month_str,
         )
         .all()
     )
@@ -573,6 +579,7 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             .filter(
                 NursePairRequest.nurse_id == nurse_id,
                 NursePairRequest.request_id == wr.request_id,
+                NursePairRequest.month == month_str,
             )
             .all()
         )

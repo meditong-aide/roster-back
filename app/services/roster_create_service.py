@@ -184,6 +184,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             .filter(
                 NursePairRequest.nurse_id == nurse_id,
                 NursePairRequest.request_id == target_wr.request_id,
+                NursePairRequest.month == month_str,
             )
             .all()
         )
