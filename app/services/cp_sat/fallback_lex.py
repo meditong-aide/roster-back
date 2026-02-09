@@ -614,12 +614,16 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, w_idx) == 0)
         # 순수 O 4연속 금지 (fixed로 이미 4O면 경고만 남기고 스킵)
+        # cfg.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3)
         if off_idx is not None:
             vac_cells = set(off_exception_vacation_cells)
+            skip_4o_hard_first_days = int(getattr(cfg, "skip_4o_hard_first_days", 3) or 0)
             for n in range(N):
                 for d in range(join[n], leave[n] - 2):
                     if d + 3 > leave[n]:
                         continue
+                    # if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
+                    #     continue
                     fixed_o_cnt = sum(
                         1
                         for (fn, fd), fs_idx in fixed.items()
@@ -902,32 +906,31 @@ def optimize_fallback_lex_hard_first(
                 xn = X(n, d - 1, night_idx)
                 xd = X(n, d, day_idx)
                 if getattr(cfg, "ban_n_to_d", True):
-                    b_nd = m.NewBoolVar(f"viol_nd_{n}_{d}")
-                    m.AddBoolOr([b_nd, xn.Not(), xd.Not()])
-                    m.AddImplication(b_nd, xn)
-                    m.AddImplication(b_nd, xd)
-                    safety["trans_nd"].append(b_nd)
+                    # b_nd = m.NewBoolVar(f"viol_nd_{n}_{d}")
+                    # m.AddBoolOr([b_nd, xn.Not(), xd.Not()])
+                    # m.AddImplication(b_nd, xn)
+                    # m.AddImplication(b_nd, xd)
+                    # safety["trans_nd"].append(b_nd)
+                    m.Add(xn + xd <= 1)
                 if getattr(cfg, "ban_e_to_d", True):
                     xe = X(n, d - 1, eve_idx)
-                    b_ed = m.NewBoolVar(f"viol_ed_{n}_{d}")
-                    m.AddBoolOr([b_ed, xe.Not(), xd.Not()])
-                    m.AddImplication(b_ed, xe)
-                    m.AddImplication(b_ed, xd)
-                    safety["trans_ed"].append(b_ed)
+                    # E→D: 하드 제약으로 처리 (E 다음날 D 금지)
+                    m.Add(xe + xd <= 1)
                 if getattr(cfg, "ban_n_to_e", True):
                     xe2 = X(n, d, eve_idx)
-                    b_ne = m.NewBoolVar(f"viol_ne_{n}_{d}")
-                    m.AddBoolOr([b_ne, xn.Not(), xe2.Not()])
-                    m.AddImplication(b_ne, xn)
-                    m.AddImplication(b_ne, xe2)
-                    safety["trans_ne"].append(b_ne)
-                if getattr(cfg, "ban_d_to_n", True):
-                    xd_prev = X(n, d - 1, day_idx)
-                    b_dn = m.NewBoolVar(f"viol_dn_{n}_{d}")
-                    m.AddBoolOr([b_dn, xd_prev.Not(), xn.Not()])
-                    m.AddImplication(b_dn, xd_prev)
-                    m.AddImplication(b_dn, xn)
-                    safety.setdefault("trans_dn", []).append(b_dn)
+                    # b_ne = m.NewBoolVar(f"viol_ne_{n}_{d}")
+                    # m.AddBoolOr([b_ne, xn.Not(), xe2.Not()])
+                    # m.AddImplication(b_ne, xn)
+                    # m.AddImplication(b_ne, xe2)
+                    # safety["trans_ne"].append(b_ne)
+                    m.Add(xn + xe2 <= 1)
+                # if getattr(cfg, "ban_d_to_n", True):
+                #     xd_prev = X(n, d - 1, day_idx)
+                #     b_dn = m.NewBoolVar(f"viol_dn_{n}_{d}")
+                #     m.AddBoolOr([b_dn, xd_prev.Not(), xn.Not()])
+                #     m.AddImplication(b_dn, xd_prev)
+                #     m.AddImplication(b_dn, xn)
+                #     safety.setdefault("trans_dn", []).append(b_dn)
 
         # 1N 금지
         if bool(getattr(cfg, "not_one_night", False)):
@@ -942,6 +945,21 @@ def optimize_fallback_lex_hard_first(
                     if not neighbors:
                         continue
                     m.Add(X(n, d, night_idx) <= sum(neighbors))
+
+        # # 주말 휴무자 N 요일 제한: 2N 2O 켜진 경우 목금만 N 허용 (2O가 주말에 자연 달성)
+        # if bool(getattr(cfg, "two_offs_after_two_nig", False)):
+        #     allowed_wd = {3, 4}  # 목금 (weekday: Mon=0 .. Fri=4)
+        #     for n in range(N):
+        #         nu = roster_system.nurses[n]
+        #         if not bool(getattr(nu, "is_weekend_off", False)):
+        #             continue
+        #         T0, T1 = join[n], leave[n]
+        #         for d in range(T0, T1 + 1):
+        #             if (n, d) in fixed and fixed[(n, d)] == night_idx:
+        #                 continue
+        #             wd = (first_day + timedelta(days=d)).weekday()
+        #             if wd not in allowed_wd:
+        #                 m.Add(X(n, d, night_idx) == 0)
 
         # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
         try:
@@ -961,15 +979,14 @@ def optimize_fallback_lex_hard_first(
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
-        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약
+        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
         K = cfg.max_consecutive_work_days
         for n in range(N):
+            if bool(getattr(roster_system.nurses[n], "is_weekend_off", False)):
+                continue
             T0, T1 = join[n], leave[n]
-            for d0 in range(T0, max(T0, T1 - K + 1)):
-                pass
             for d0 in range(T0, T1 - K + 1):
                 sum_off = sum(X(n, d0 + t, off_idx) for t in range(K + 1))
-                # 최소 1일 OFF를 강제하여 슬랙 없이 안전 제약으로 처리
                 m.Add(sum_off >= 1)
 
         # 연속 Night 상한 L → 초과량 정량화
@@ -1170,7 +1187,7 @@ def optimize_fallback_lex_hard_first(
                 #     f"base_min_off={base_min_off}, avail_days={avail_days}, "
                 #     f"vacation={vacation_cnt}, min_off_required={min_off_required}"
                 # )
-                if min_off_required > 0:
+                if min_off_required > 0 and not is_weekend_off:
                     # 휴가/공가는 최소 OFF 충족에서 제외
                     offs = sum(
                         X(n, d, off_idx)

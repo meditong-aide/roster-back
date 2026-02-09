@@ -8,6 +8,7 @@ from ortools.sat.python import cp_model
 
 from services.cp_sat.hardcoded_weights import (
     EXPERIENCE_SHORT_PENALTY,
+    FALLBACK_COVERAGE_SHORT_WEIGHT,
     ISOLATED_OFF_PENALTY,
     NIGHT_DEVIATION_PENALTY,
     NOD_NOE_PENALTY,
@@ -15,6 +16,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
     WEEK_OFF_SHORT_PENALTY,
 )
+from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
 
 
@@ -29,6 +31,7 @@ def build_main_objective_terms(
     coverage_shortage_vars: list[tuple[cp_model.IntVar, str]],
     include_pair_objective: bool,
     preceptor_terms_fn: Callable[..., Iterable],
+    fixed_cnt: list[list[int]] | None = None,
 ) -> list:
     """메인 모델의 목적 함수 항들을 생성한다.
 
@@ -42,6 +45,7 @@ def build_main_objective_terms(
         coverage_shortage_vars: (short_var, code) 목록
         include_pair_objective: 페어/팀 항 포함 여부
         preceptor_terms_fn: 프리셉터 보너스 항 생성 함수
+        fixed_cnt: 날짜×교대별 고정 셀 카운트 (even_nights용, None이면 미사용)
 
     Returns:
         목적 함수 항 리스트
@@ -58,6 +62,10 @@ def build_main_objective_terms(
     S = cfg.num_shifts
     idx = {c: cfg.shift_types.index(c) for c in ("D", "E", "N", "O")}
     day, eve, night, off = idx["D"], idx["E"], idx["N"], idx["O"]
+
+    # (0) 커버리지 부족 패널티(강하게): shortage 변수에 큰 음수 가중치 적용
+    for sh, code in coverage_shortage_vars:
+        obj.append(-FALLBACK_COVERAGE_SHORT_WEIGHT * sh)
 
     for n in range(N):
         nu = rs.nurses[n]
@@ -151,23 +159,52 @@ def build_main_objective_terms(
                 m.Add(slack >= 2 - offs)
                 obj.append(-WEEK_OFF_SHORT_PENALTY * slack)
 
-    # (4-3) 야간 균등 (편차에 선형 패널티)
-    if cfg.even_nights:
-        normals = [i for i, nu in enumerate(rs.nurses) if nu.is_night_nurse != 3]
+    # (4-3) 야간 균등 (편차에 선형 패널티) - fallback과 동일 방식
+    if getattr(cfg, "even_nights", False):
+        normals: list[int] = []
+        for i, nu in enumerate(rs.nurses):
+            is_n_only = False
+            raw = getattr(nu, "is_night_nurse", None)
+            if isinstance(raw, list):
+                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                is_n_only = allowed == {"N"}
+            elif raw == 3 or (raw is not None and raw not in (0, False)):
+                is_n_only = True
+            if not is_n_only:
+                normals.append(i)
         if normals:
-            total_req = sum(cfg.daily_shift_requirements["N"] for _ in range(D))
-            target = total_req // len(normals)
-            for n in normals:
-                totN = sum(X(n, d, night) for d in range(join[n], leave[n] + 1))
-                devP = m.NewIntVar(0, D, f"devP_{n}")
-                devN = m.NewIntVar(0, D, f"devN_{n}")
-                m.Add(devP - devN == totN - target)
-                obj.extend(
-                    [
-                        -NIGHT_DEVIATION_PENALTY * devP,
-                        -NIGHT_DEVIATION_PENALTY * devN,
-                    ]
-                )
+            if (
+                hasattr(cfg, "daily_shift_requirements_by_day")
+                and isinstance(cfg.daily_shift_requirements_by_day, list)
+                and len(cfg.daily_shift_requirements_by_day) == D
+            ):
+                daily_need_n = [
+                    int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
+                    for d in range(D)
+                ]
+            else:
+                base_n = int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
+                daily_need_n = [base_n for _ in range(D)]
+            fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+            total_need_n = 0
+            for d in range(D):
+                need = max(0, daily_need_n[d] - int(fc[d][night] if d < len(fc) else 0))
+                total_need_n += need
+            if total_need_n > 0:
+                target = total_need_n // len(normals)
+                for n in normals:
+                    tot_nights = sum(
+                        X(n, d, night) for d in range(join[n], leave[n] + 1)
+                    )
+                    dev_pos = m.NewIntVar(0, D, f"devP_{n}")
+                    dev_neg = m.NewIntVar(0, D, f"devN_{n}")
+                    m.Add(dev_pos - dev_neg == tot_nights - target)
+                    obj.extend(
+                        [
+                            -NIGHT_DEVIATION_PENALTY * dev_pos,
+                            -NIGHT_DEVIATION_PENALTY * dev_neg,
+                        ]
+                    )
 
     # (4-4) N-O-D/E 패턴
     if getattr(cfg, "nod_noe", True):
@@ -183,15 +220,16 @@ def build_main_objective_terms(
                 m.Add(pat3 >= X(n, d, eve) + X(n, d + 1, off) + X(n, d + 2, day) - 2)
                 obj.append(-NOD_NOE_PENALTY * pat3)
 
-    # (4-5) 고립 OFF
-    for n in range(N):
-        for d in range(join[n], leave[n] + 1):
-            iso = m.NewIntVar(0, 1, f"iso_{n}_{d}")
-            m.Add(iso >= X(n, d, off) - X(n, d - 1, off) - X(n, d + 1, off))
-            m.Add(iso <= X(n, d, off))
-            m.Add(iso <= 1 - X(n, d - 1, off))
-            m.Add(iso <= 1 - X(n, d + 1, off))
-            obj.append(-ISOLATED_OFF_PENALTY * iso)
+    # (4-5) 고립 OFF (sequential_offs ON일 때만, fallback과 동일)
+    if getattr(cfg, "sequential_offs", True):
+        for n in range(N):
+            for d in range(join[n], leave[n] + 1):
+                iso = m.NewIntVar(0, 1, f"iso_{n}_{d}")
+                m.Add(iso >= X(n, d, off) - X(n, d - 1, off) - X(n, d + 1, off))
+                m.Add(iso <= X(n, d, off))
+                m.Add(iso <= 1 - X(n, d - 1, off))
+                m.Add(iso <= 1 - X(n, d + 1, off))
+                obj.append(-ISOLATED_OFF_PENALTY * iso)
 
     # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
     if getattr(cfg, "sequential_offs", True):
@@ -217,6 +255,23 @@ def build_main_objective_terms(
         print("grade_strategy", grade_strategy)
         if grade_strategy == "TEAM":
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))
+
+    # (4-6a) Grade 분배 목적 항 (fallback Stage3와 동일)
+    try:
+        _gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        if _gs == "GRADE":
+            grade_terms = add_grade_constraints(
+                m=m,
+                rs=rs,
+                X=X,
+                join=join,
+                leave=leave,
+                grade_strategy=_gs,
+                grade_config=getattr(rs, "grade_config", None),
+            )
+            obj.extend(grade_terms or [])
+    except Exception:
+        pass
 
     # (4-7) 커버리지 부족 패널티 (shift_requirement_priority 기반)
     try:

@@ -1837,6 +1837,12 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
         # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
         config_dict["grade_strategy"] = grade_strategy
+        # 요청 바디에서 GRADE일 때는 DB에서 grade_config를 조회해 엔진에 전달
+        engine_grade_config = grade_config
+        if str(getattr(req, "grade_strategy", "") or "").upper() == "GRADE":
+            engine_grade_config = _fetch_grade_config_dict(
+                db, current_user.office_id, current_user.group_id
+            )
         cp_sat_result = generate_roster_cp_sat(
             nurses_dict,
             prefs_dict,
@@ -1846,7 +1852,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             shift_manage_data,
             time_limit_seconds=time_limit_seconds,
             grade_strategy=req.grade_strategy,
-            grade_config=grade_config,
+            grade_config=engine_grade_config,
         )
     except Exception as e:
         print(f"error: {e}")
@@ -2374,7 +2380,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     _inject_special_work_code(config_dict, has_special_working)
     # OFF 상한/패널티 기본값 보정 (None 방지)
     if config_dict.get("max_extra_off_days") is None:
-        config_dict["max_extra_off_days"] = 1
+        config_dict["max_extra_off_days"] = 3
     if config_dict.get("extra_off_penalty_weight") is None:
         config_dict["extra_off_penalty_weight"] = 80
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──

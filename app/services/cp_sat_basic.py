@@ -1119,11 +1119,14 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
 
-        # Grade 배치 요약 출력/CSV 저장 (GRADE 전략일 때만)
+        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE 전략일 때만)
         try:
             grade_strategy_norm = str(grade_strategy or "BASE").upper()
             if grade_strategy_norm == "GRADE" and grade_config:
                 _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
+                _log_grade_result(
+                    roster_system, nurses, grade_config, self.logger_prefix, label="solve 직후"
+                )
         except Exception as e:
             print(f"{self.logger_prefix} Grade 요약 출력 중 오류: {e}")
 
@@ -1139,6 +1142,9 @@ class CPSATBasicEngine:
                     max_moves_per_nurse=1,
                 )
                 roster_system.roster = updated_roster
+                _log_grade_result(
+                    roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
+                )
                 # repair 로그 간단 출력
                 if repair_log:
                     print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
@@ -1318,10 +1324,10 @@ class CPSATBasicEngine:
         try:
             model,X,j,l,fixed = _build_full_model(rs,grouped)
             # print('model', model)
-            print('X', X)
-            print('j', j)
-            print('l', l)
-            print('fixed', fixed)
+            # print('X', X)
+            # print('j', j)
+            # print('l', l)
+            # print('fixed', fixed)
             solver=cp_model.CpSolver()
             # ▼▼ 랜덤화 추가 ▼▼
             # seed = getattr(rs.config, 'random_seed', None)
@@ -1542,7 +1548,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     has_w = "W" in rs.config.shift_types
     w_idx = rs.config.shift_types.index("W") if has_w else None
     off_exception_cells = set(getattr(rs.config, "off_exception_cells", []) or [])
-    off_exception_vacation_cells = set(getattr(rs.config, "off_exception_vacation_cells", []) or [])
+    off_exception_vacation_cells = set(
+        getattr(rs.config, "off_exception_vacation_cells", []) or []
+    )
     initial_forbidden = (
         getattr(rs, "initial_forbidden", {})
         if isinstance(getattr(rs, "initial_forbidden", {}), dict)
@@ -1595,7 +1603,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         fixed_type_by_cell[(n, d)] = code2type.get(c["shift"]) or code2type.get(s_main)
         # print('이미 있음 cpsat- fixed_type_by_cell', fixed_type_by_cell)
     forced_off_cells: set[tuple[int, int]] = set()
-    forced_off_cap_excluded: set[tuple[int, int]] = set()
+    vacation_off_cells: set[tuple[int, int]] = set(off_exception_vacation_cells)
+    structural_off_cells: set[tuple[int, int]] = set()
     if off_idx_full is not None:
         forced_off_cells.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
         vacation_types = {"휴가", "공가"}
@@ -1603,15 +1612,24 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if s_idx != off_idx_full:
                 continue
             if fixed_type_by_cell.get((n, d)) in vacation_types:
-                forced_off_cap_excluded.add((n, d))
-    forced_off_cells.update(off_exception_cells)
-    forced_off_cap_excluded.update(off_exception_vacation_cells)
-    # 주말 휴무 간호사: off_exception_cells는 OFF 상한에서 제외
+                vacation_off_cells.add((n, d))
+            else:
+                structural_off_cells.add((n, d))
+    # 예외 OFF 중 휴가가 아닌 것만 구조적 OFF로 분류
+    structural_off_cells.update({cell for cell in off_exception_cells if cell not in vacation_off_cells})
+    # 주휴(weekly_off)와 주말 전용 OFF를 구조적 OFF에 포함
+    for n_idx, day_list in (weekly_off_by_idx or {}).items():
+        for d in day_list or []:
+            structural_off_cells.add((n_idx, d))
+    weekend_days = {d for d in range(D) if (first_day + timedelta(days=d)).weekday() >= 5}
     for n_idx, nurse in enumerate(rs.nurses):
         if bool(getattr(nurse, "is_weekend_off", False)):
-            forced_off_cap_excluded.update(
-                (n_idx, d_idx) for (n_idx, d_idx) in off_exception_cells
-            )
+            for d_idx in weekend_days:
+                # 해당 날짜가 이미 다른 고정 근무라면 제외
+                if (n_idx, d_idx) in fixed and fixed[(n_idx, d_idx)] != off_idx_full:
+                    continue
+                structural_off_cells.add((n_idx, d_idx))
+    forced_off_cap_excluded: set[tuple[int, int]] = set(vacation_off_cells)
 
     # N 금지 간호사 판별(모든 근무일에 N이 금지된 경우)
     n_forbid_n: set[int] = set()
@@ -1660,7 +1678,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         for d in range(join[n], leave[n]+1):
             for s in range(S):
                 Xv[n,d,s]=m.NewBoolVar(f'x_{n}_{d}_{s}')
-    def X(n,d,s):  return Xv.get((n,d,s),0)
+    def X(n, d, s):
+        return Xv.get((n, d, s), 0)
+
+    def countable_off(n: int, d: int) -> int:
+        """vacation_off_cells를 제외한 O 변수만 반환한다."""
+        if off_idx_full is None:
+            return 0
+        if (n, d) in vacation_off_cells:
+            return 0
+        return X(n, d, off_idx_full)
     active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
     isolated_off_slacks: list = []
     # ───────────── 2-A. 고정 셀  ─────────────
@@ -1679,28 +1706,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     continue
                 m.Add(X(n, d, w_idx) == 0)
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
+    # config.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3 → 1~3일 시작 윈도우는 4연속 O 허용)
     if off_idx_full is not None:
-        # off_or_weekly = set(off_exception_cells)
-        off_or_weekly = set(
-        (n, d)
-        for (n, d) in off_exception_cells
-        if (n, d) not in forced_off_cap_excluded
-        )   
-        off_or_weekly.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
-        vac_cells = set(getattr(rs.config, "off_exception_vacation_cells", []) or [])
-        # weekly_off_by_idx 를 off_or_weekly에 포함
-        try:
-            for n, day_list in (weekly_off_by_idx or {}).items():
-                for d in day_list or []:
-                    off_or_weekly.add((n, d))
-        except Exception:
-            pass
+        vac_cells = set(vacation_off_cells)
+        off_or_weekly = {cell for cell in structural_off_cells if cell not in vac_cells}
+        skip_4o_hard_first_days = int(getattr(rs.config, "skip_4o_hard_first_days", 3) or 0)
         for n in range(N):
             for d in range(join[n], leave[n] - 2):
                 if d + 3 > leave[n]:
                     continue
-                window = {(n, d), (n, d + 1), (n, d + 2), (n, d + 3)}
-                vacation_types = {"휴가", "공가", "휴무"}
+                # if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
+                #     continue
                 fixed_o_cnt = sum(
                     1
                     for (fn, fd), fs_idx in fixed.items()
@@ -1714,12 +1730,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         f"[CP-SAT-Basic] [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
                     )
                     continue
-                # off_or_weekly 기준 4개 모두 O/주면 금지
-                m.Add(
-                    sum(X(n, d + k, off_idx_full) for k in range(4))
-                    + sum(1 for k in range(4) if (n, d + k) in off_or_weekly)
-                    <= 3
-                )
+                # off_or_weekly(주휴·주말휴무 등)와 countable_off(X) 중복 카운팅 방지:
+                # structural OFF는 이미 X=1로 고정되므로 countable_off만 사용
+                off_like = [
+                    1 if (n, d + k) in off_or_weekly else countable_off(n, d + k)
+                    for k in range(4)
+                ]
+                m.Add(sum(off_like) <= 3)
 
     # ───────────── 2-A2. 고립 OFF 금지(슬랙 허용) ─────────────
     enforce_clustered_offs = bool(getattr(rs.config, "enforce_clustered_offs", False))
@@ -1730,15 +1747,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for d in range(t0, t1 + 1):
                 neighbours = []
                 if d - 1 >= t0:
-                    neighbours.append(X(n, d - 1, off_idx_full))
+                    neighbours.append(countable_off(n, d - 1))
                 if d + 1 <= t1:
-                    neighbours.append(X(n, d + 1, off_idx_full))
+                    neighbours.append(countable_off(n, d + 1))
                 slack_var = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
                 isolated_off_slacks.append((slack_var, slack_penalty))
                 if neighbours:
-                    m.Add(X(n, d, off_idx_full) <= sum(neighbours) + slack_var)
+                    m.Add(countable_off(n, d) <= sum(neighbours) + slack_var)
                 else:
-                    m.Add(X(n, d, off_idx_full) <= slack_var)
+                    m.Add(countable_off(n, d) <= slack_var)
     
     # ───────────── 2-A3. 주휴 근처 OFF 배치 제약 (off_placement_mode) ─────────────
     off_placement_mode = int(getattr(rs.config, "off_placement_mode", 0) or 0)
@@ -1759,7 +1776,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     need_map = rs.config.daily_shift_requirements
                 total_need = sum(int(v) for v in (need_map or {}).values())
                 active_cnt = sum(1 for n in range(N) if join[n] <= d <= leave[n])
-                fixed_off_cnt = fixed_cnt[d][off_idx_full] if off_idx_full is not None else 0
+                fixed_off_cnt = (
+                    sum(
+                        1
+                        for (fn, fd), s_idx in fixed.items()
+                        if s_idx == off_idx_full
+                        and fd == d
+                        and (fn, fd) not in vacation_off_cells
+                    )
+                    if off_idx_full is not None
+                    else 0
+                )
                 avail_eff = max(0, active_cnt - fixed_off_cnt)
                 if avail_eff < total_need:
                     shortage_days.add(d)
@@ -1786,7 +1813,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if bool(prev_month_last_is_off.get(n, False)):
                         continue
                     if d + 1 <= T1:
-                        m.Add(X(n, d + 1, off_idx_full) == 1)
+                        m.Add(countable_off(n, d + 1) == 1)
                     continue
                 
                 if off_placement_mode == 1:
@@ -1795,9 +1822,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     left_pos = d - 1
                     right_pos = d + 1
                     if left_pos >= T0 and left_pos not in shortage_days:
-                        neighbours.append(X(n, left_pos, off_idx_full))
+                        neighbours.append(countable_off(n, left_pos))
                     if right_pos <= T1 and right_pos not in shortage_days:
-                        neighbours.append(X(n, right_pos, off_idx_full))
+                        neighbours.append(countable_off(n, right_pos))
                     if not neighbours:
                         continue
                     if len(neighbours) == 1:
@@ -1808,7 +1835,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     # 모드 2: 앞에만 O 배치
                     left_pos = d - 1
                     if left_pos >= T0 and left_pos not in shortage_days:
-                        m.Add(X(n, left_pos, off_idx_full) == 1)
+                        m.Add(countable_off(n, left_pos) == 1)
     
     # ───────────── 2-A2. 초기 금지 셀(경계 제약) ─────────────
     try:
@@ -1855,14 +1882,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 for n in range(N)
                 if join[n] <= d <= leave[n] and (n, d) not in fixed
             )
-            sh = m.NewIntVar(0, N, f'short_{d}_{code}')
-            # print('need!!!!!', need)
-            # print('assigned!!!!!', assigned)
-            # print('sh!!!!!', sh)
-            m.Add(sh >= need - assigned)
-            coverage_shortage_vars.append((sh, code))
-            # print('coverage_shortage_vars!!!!!', coverage_shortage_vars)
-            # oversupply 추적: 추가 투입 인원 수 ov ≥ assigned - need
+            # 커버리지를 하드로 강제: assigned ≥ need
+            m.Add(assigned >= need)
+            # oversupply 추적은 유지
             ov = m.NewIntVar(0, N, f'over_{d}_{code}')
             m.Add(ov >= assigned - need)
             over_vars_by_day.setdefault(d, {})[code] = ov
@@ -1912,6 +1934,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             try:
                 weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
                 weekend_cnt = len(weekend_in_range)
+                vac_cnt_in_range = sum(1 for d in weekend_in_range if (n, d) in vacation_off_cells)
                 off_exception_days = sorted(
                     d + 1
                     for (n_idx, d) in off_exception_cells
@@ -1935,8 +1958,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     getattr(cfg, "global_monthly_off_days", 0)
                     + getattr(cfg, "standard_personal_off_days", 8)
                 )
-
-                min_off_required = min(base_min_off, T1 - T0 + 1)
+                # 휴가/공가는 최소 OFF에서 제외 (coverage 혼동 방지)
+                min_off_required = max(0, min(base_min_off, (T1 - T0 + 1) - vac_cnt_in_range))
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 weekend_off_bonus = int(getattr(cfg, "weekend_off_extra_off_days", 2) or 2)
                 max_off_allowed = min(
@@ -1950,8 +1973,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 print(
                     f"[WeekendOff][HardCheck] nurse_idx={n}, "
                     f"nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
-                    f"range={T0+1}~{T1+1}, weekend_cnt={weekend_cnt}, "
-                    f"min_off_required={min_off_required}, max_off_allowed={max_off_allowed}, "
+                    f"range={T0+1}~{T1+1}, weekend_cnt={weekend_cnt}, vac_in_range={vac_cnt_in_range}, "
+                    f"min_off_required(excl_vac)={min_off_required}, max_off_allowed(excl_vac)={max_off_allowed}, "
                     f"weekday_off_cap={weekday_off_cap}, "
                     f"K={K}, forbid_n={int(n in n_forbid_n)}, "
                     f"two_offs_after_two_nig={int(bool(getattr(cfg, 'two_offs_after_two_nig', False)))}, "
@@ -1992,15 +2015,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                         )
                         continue
-                    # print('주말휴무 강제 간호사:', nu.name, '날짜:', d+1)
-                    
+                    wd = (rs.target_month + timedelta(days=d)).weekday()
+                    print(
+                        f"[WeekendOff][HardDebug] X(n,d,off)==1 추가: "
+                        f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                        f"d={d+1}, weekday={wd}(토5/일6)"
+                    )
                     m.Add(X(n, d, off) == 1)
                 else:
                     # 평일(월~금): OFF 금지(D/E/N만 가능)
                     # 사용자 고정 OFF는 예외로 허용
                     if (n, d) in fixed and fixed[(n, d)] == off:
+                        print(
+                            f"[WeekendOff][HardDebug] 평일 OFF 금지 스킵(고정 OFF): "
+                            f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
+                        )
                         continue
-                    # print('평일휴무 금지 간호사:', nu.name, '날짜:', d+1)
+                    wd = (rs.target_month + timedelta(days=d)).weekday()
+                    print(
+                        f"[WeekendOff][HardDebug] X(n,d,off)==0 추가: "
+                        f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                        f"d={d+1}, weekday={wd}(월0~금4)"
+                    )
                     m.Add(X(n, d, off) == 0)
         # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
         try:
@@ -2017,9 +2053,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     m.Add(sum(X(n, d, off_idx_full) for d in range(left, right + 1)) >= 1)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
-        # 연속 근무 K+1 중 OFF ≥1
-        for d0 in range(T0, T1-K+1):
-            m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)
+        # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        if not bool(getattr(nu, "is_weekend_off", False)):
+            for d0 in range(T0, T1-K+1):
+                m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)
 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):
@@ -2029,8 +2066,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
             if getattr(cfg, "ban_n_to_e", True):
                 m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
-            if getattr(cfg, "ban_d_to_n", True):
-                m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
+            # if getattr(cfg, "ban_d_to_n", True):
+            #     m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         raw = getattr(nu, "is_night_nurse", None)
@@ -2059,6 +2096,20 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     m.Add(X(n, d, night) <= sum(neighbors))
 
+            # # 주말 휴무자 N 요일 제한: forbid_n 아니고 2N/3N 2O 켜진 경우 2O가 주말에 자연 달성되도록 제한
+            # # 2N→2O만: 목금만 N 허용. 3N→2O도 켜진 경우: 수목금 N 허용 (3N 블록이 금요일 끝나면 2O=토일)
+            # is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
+            # two_n = bool(getattr(cfg, "two_offs_after_two_nig", False))
+            # three_n = bool(getattr(cfg, "two_offs_after_three_nig", False))
+            # if is_weekend_off and n not in n_forbid_n and (two_n or three_n):
+            #     allowed_wd = {2, 3, 4} if three_n else {3, 4}  # 수목금 vs 목금
+            #     for d in range(T0, T1 + 1):
+            #         if (n, d) in fixed and fixed[(n, d)] == night:
+            #             continue
+            #         wd = (rs.target_month + timedelta(days=d)).weekday()
+            #         if wd not in allowed_wd:
+            #             m.Add(X(n, d, night) == 0)
+
             # 연속 Night
             for d0 in range(T0, T1-L+1):
                 m.Add(sum(X(n,d0+t,night) for t in range(L+1)) <= L)
@@ -2067,83 +2118,55 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.Add(sum(X(n,d,night) for d in range(T0,T1+1))
                   <= cfg.max_night_shifts_per_month)
 
-        # 월 최소 OFF 일수 하드 제약 (프론트 전달 off_days를 최소값으로 해석)
+        # 월 최소 OFF 일수 하드 제약 (주말 휴무자는 제외: 주말 전부 OFF로 이미 충분)
         try:
-            base_min_off = int(getattr(cfg, 'global_monthly_off_days', 0) + getattr(cfg, 'standard_personal_off_days', 0))
-
-            # 근무 가능 일수보다 클 수 있으므로 클램프
-            min_off_required = min(base_min_off, T1 - T0 + 1)
-            if min_off_required > 0:
-                m.Add(sum(X(n,d,off) for d in range(T0, T1+1)) >= min_off_required)
-            # 월 최대 OFF 상한: 최소 필요 OFF + 허용 초과 일수
-            # N 전담 간호사는 OFF 상한을 동적으로 계산: 해당월 날짜수 - 최대 근무 가능일(15일)
-            extra_allowed = int(getattr(cfg, 'max_extra_off_days', 0))
-            if extra_allowed >= 0:
-                if is_n_only:
-                    # N 전담: 실제 근무 가능 일수(T1-T0+1)에서 최대 N 근무(15일)을 뺀 값
-                    # 예) 28일 월 → 28-15=13, 30일 월 → 30-15=15, 31일 월 → 31-15=16
-                    avail_days = T1 - T0 + 1
-                    max_off_allowed_n_only = max(0, avail_days - 15)
-                    if getattr(nu, "db_id", None) in {"442918", "442924"}:
-                        fixed_off_cnt = sum(
-                            1 for (fn, fd), s_idx in fixed.items()
-                            if fn == n and s_idx == off
-                        )
-                        fixed_off_cnt_excl_vac = sum(
-                            1 for (fn, fd), s_idx in fixed.items()
-                            if fn == n and s_idx == off and (fn, fd) not in forced_off_cap_excluded
-                        )
-                        print(
-                            f"{self.logger_prefix} [WatchOffCap] nurse_id={nu.db_id}, "
-                            f"fixed_off={fixed_off_cnt}, "
-                            f"fixed_off_excl_vac={fixed_off_cnt_excl_vac}, "
-                            f"min_off_required={min_off_required}, "
-                            f"max_off_allowed={max_off_allowed_n_only}"
-                        )
+            if not bool(getattr(nu, "is_weekend_off", False)):
+                base_min_off = int(
+                    getattr(cfg, "global_monthly_off_days", 0)
+                    + getattr(cfg, "standard_personal_off_days", 0)
+                )
+                avail_days = T1 - T0 + 1
+                vacation_cnt = sum(1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells)
+                min_off_required = max(0, min(base_min_off, avail_days - vacation_cnt))
+                if min_off_required > 0:
                     m.Add(
                         sum(
                             X(n, d, off)
                             for d in range(T0, T1 + 1)
-                            if (n, d) not in forced_off_cap_excluded
+                            if (n, d) not in vacation_off_cells
                         )
-                        <= max_off_allowed_n_only
+                        >= min_off_required
                     )
-                else:
-                    max_off_allowed = min(min_off_required + extra_allowed, T1 - T0 + 1)
-                    # if getattr(nu, "db_id", None) in {"442918", "442924"}:
-                    #     fixed_off_cnt = sum(
-                    #         1 for (fn, fd), s_idx in fixed.items()
-                    #         if fn == n and s_idx == off
-                    #     )
-                    #     fixed_off_cnt_excl_vac = sum(
-                    #         1 for (fn, fd), s_idx in fixed.items()
-                    #         if fn == n and s_idx == off and (fn, fd) not in forced_off_cap_excluded
-                    #     )
-                    #     print(
-                    #         f"{self.logger_prefix} [WatchOffCap] nurse_id={nu.db_id}, "
-                    #         f"fixed_off={fixed_off_cnt}, "
-                    #         f"fixed_off_excl_vac={fixed_off_cnt_excl_vac}, "
-                    #         f"min_off_required={min_off_required}, "
-                    #         f"max_off_allowed={max_off_allowed}"
-                    #     )
-                    if bool(getattr(nu, "is_weekend_off", False)):
-                        weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
+                extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
+                if extra_allowed >= 0:
+                    if is_n_only:
+                        max_off_allowed_n_only = max(0, avail_days - 15)
                         m.Add(
                             sum(
                                 X(n, d, off)
                                 for d in range(T0, T1 + 1)
-                                if (n, d) not in forced_off_cap_excluded and d not in weekend_days
+                                if (n, d) not in vacation_off_cells
                             )
-                            <= weekday_off_cap
+                            <= max_off_allowed_n_only
+                        )
+                        print(
+                            f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                            f"is_n_only=1, vac_cnt={vacation_cnt}, "
+                            f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
                         )
                     else:
+                        max_off_allowed = min(min_off_required + extra_allowed, avail_days)
                         m.Add(
                             sum(
                                 X(n, d, off)
                                 for d in range(T0, T1 + 1)
-                                if (n, d) not in forced_off_cap_excluded
+                                if (n, d) not in vacation_off_cells
                             )
                             <= max_off_allowed
+                        )
+                        print(
+                            f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                            f"vac_cnt={vacation_cnt}, min_off={min_off_required}, max_off={max_off_allowed}"
                         )
         except Exception:
             pass
@@ -2154,7 +2177,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if cfg.two_offs_after_three_nig and n not in n_forbid_n:
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
-                m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
+                m.Add(
+                    countable_off(n, d + 1) + countable_off(n, d + 2) == 2
+                ).OnlyEnforceIf(
                     [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
                 )
         if cfg.two_offs_after_two_nig and n not in n_forbid_n:
@@ -2165,7 +2190,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 xn_next = X(n, d + 1, night)
                 end_block = m.NewBoolVar(f'end_2n_main_{n}_{d}')
                 m.Add(end_block == xn_next.Not())
-                m.Add(X(n, d + 1, off) + X(n, d + 2, off) == 2).OnlyEnforceIf(
+                m.Add(
+                    countable_off(n, d + 1) + countable_off(n, d + 2) == 2
+                ).OnlyEnforceIf(
                     [xn_prev, xn_curr, end_block]
                 )
 
@@ -2180,6 +2207,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         coverage_shortage_vars=coverage_shortage_vars,
         include_pair_objective=include_pair_objective,
         preceptor_terms_fn=_add_preceptor_objective_terms,
+        fixed_cnt=fixed_cnt,
     )
     # 고립 OFF 슬랙 패널티(강제 불가 시에만 허용)
     for slack_var, w in isolated_off_slacks:
@@ -2460,6 +2488,122 @@ def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_pre
         writer.writeheader()
         writer.writerows(rows)
     print(f"{logger_prefix} Grade 요약 CSV 저장: {out_path}")
+
+
+def _log_grade_result(
+    rs: RosterSystem,
+    nurses,
+    grade_config: dict,
+    logger_prefix: str = "[CP-SAT-Basic]",
+    label: str = "최종",
+):
+    """Grade 처리 적용 여부를 확인하고, 일자별 D/E/N 필요·확보, Grade별 배치·달성%를 가독성 있게 로그한다."""
+    constraints_map = grade_config.get("constraints") or grade_config.get("constraints_json") or {}
+    if not constraints_map:
+        return
+
+    shift_types = rs.config.shift_types
+    cfg = rs.config
+    ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+    apply_shifts = ("D", "E", "N")
+
+    # grade 정의역 및 간호사별 grade 매핑 (_dump_grade_summary와 동일)
+    _grades = set()
+    for _, gmap in constraints_map.items():
+        if not isinstance(gmap, dict):
+            continue
+        for k in gmap:
+            try:
+                _grades.add(int(k))
+            except (TypeError, ValueError):
+                continue
+    grade_values = sorted(_grades) if _grades else [1, 2, 3]
+    null_policy = str(grade_config.get("null_grade_policy") or "LOWEST").upper()
+    valid_grades = [getattr(n, "grade", None) for n in nurses if getattr(n, "grade", None) is not None]
+    avg_grade = round(sum(valid_grades) / len(valid_grades)) if valid_grades else max(grade_values)
+
+    def _resolve_grade(nurse):
+        g = getattr(nurse, "grade", None)
+        if g is not None:
+            try:
+                gi = int(g)
+                if gi in grade_values:
+                    return gi
+            except Exception:
+                pass
+        if null_policy == "AVERAGE":
+            return avg_grade if avg_grade in grade_values else max(grade_values)
+        if null_policy == "RANDOM":
+            h = hashlib.md5(str(getattr(nurse, "db_id", getattr(nurse, "name", ""))).encode()).hexdigest()
+            return grade_values[int(h[:8], 16) % len(grade_values)]
+        return max(grade_values)
+
+    nurse_grades = [_resolve_grade(n) for n in nurses]
+
+    def _need_for_day(day_idx: int) -> dict:
+        if isinstance(ds_by_day, list) and day_idx < len(ds_by_day) and isinstance(ds_by_day[day_idx], dict):
+            return ds_by_day[day_idx]
+        return getattr(cfg, "daily_shift_requirements", {}) or {}
+
+    # ---------- 1) Grade 처리 적용 확인 ----------
+    print(f"{logger_prefix} ========== [Grade] Grade 처리 적용됨 ({label}) ==========")
+
+    # ---------- 2) 일자별 D, E, N 필요 수 / 확보 수 ----------
+    print(f"{logger_prefix} --- 일자별 교대(D/E/N) 필요 수 · 확보 수 ---")
+    for d in range(rs.num_days):
+        need_map = _need_for_day(d)
+        parts = []
+        for code in apply_shifts:
+            if code not in shift_types:
+                continue
+            s_idx = shift_types.index(code)
+            need = int(need_map.get(code, 0) or 0)
+            secured = int(sum(1 for n in range(len(nurses)) if int(rs.roster[n, d, s_idx]) == 1))
+            parts.append(f"{code} 필요 {need} 확보 {secured}")
+        if parts:
+            print(f"{logger_prefix}   일자 {d + 1:2d}:  {' | '.join(parts)}")
+
+    # ---------- 3) Grade별 목표·배치·달성% ----------
+    total_target_by_grade = {g: 0 for g in grade_values}
+    total_assigned_by_grade = {g: 0 for g in grade_values}
+
+    for d in range(rs.num_days):
+        need_map = _need_for_day(d)
+        for shift_code, base in (constraints_map or {}).items():
+            s_code = str(shift_code or "").upper()
+            if s_code not in apply_shifts or s_code not in shift_types:
+                continue
+            req = int(need_map.get(s_code, 0) or 0)
+            if req <= 0:
+                continue
+            base_min = {g: 0 for g in grade_values}
+            if isinstance(base, dict):
+                for k, v in base.items():
+                    try:
+                        gi = int(k)
+                        if gi in grade_values:
+                            base_min[gi] = max(0, int(v or 0))
+                    except Exception:
+                        pass
+            sum_base = sum(base_min.values())
+            if sum_base <= 0:
+                continue
+            s_idx = shift_types.index(s_code)
+            for g in grade_values:
+                t = (req * base_min.get(g, 0) + sum_base - 1) // sum_base if sum_base else 0
+                total_target_by_grade[g] += min(t, req)
+            for n_idx in range(len(nurses)):
+                if int(rs.roster[n_idx, d, s_idx]) == 1:
+                    g = nurse_grades[n_idx]
+                    total_assigned_by_grade[g] = total_assigned_by_grade.get(g, 0) + 1
+
+    print(f"{logger_prefix} --- Grade별 목표 대비 배치 현황 ---")
+    for g in sorted(grade_values):
+        target = total_target_by_grade.get(g, 0)
+        assigned = total_assigned_by_grade.get(g, 0)
+        pct = (100.0 * assigned / target) if target > 0 else (100.0 if assigned == 0 else 0)
+        print(f"{logger_prefix}   Grade {g}: 목표 {target}명, 배치 {assigned}명 → 달성 {pct:.1f}%")
+    print(f"{logger_prefix} ========================================")
 
 
 cp_sat_engine = CPSATBasicEngine()
