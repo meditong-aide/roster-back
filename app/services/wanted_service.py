@@ -555,9 +555,9 @@ def _copy_existing_requests_to_new(
     year: int,
     month: int,
     month_str: str,
-    case_filter: set | None = None,
+    skip_shift_copy: bool = False,
 ) -> Tuple[int, int]:
-    """기존 데이터를 새 request_id로 복사 (필요 시 case_filter 적용)
+    """기존 데이터를 새 request_id로 복사
 
     Args:
         db: DB 세션
@@ -565,7 +565,7 @@ def _copy_existing_requests_to_new(
         old_request_id: 복사할 원본 request_id
         new_request_id: 복사 대상 request_id
         year, month, month_str: 대상 연월
-        case_filter: {(day, shift), ...} 형태의 set. 이 조합에 해당하는 것만 복사
+        skip_shift_copy: True이면 shift 데이터 복사 스킵 (case가 전체 상태를 나타낼 때)
 
     Returns:
         (복사된 shift 건수, 복사된 pair 건수)
@@ -578,38 +578,34 @@ def _copy_existing_requests_to_new(
         end = date(year, month + 1, 1)
 
     shift_count = 0
-    detailed_id_shift = 1
 
-    # shift 데이터 복사
-    old_shift_rows = db.query(NurseShiftRequest).filter(
-        NurseShiftRequest.nurse_id == nurse_id,
-        NurseShiftRequest.request_id == old_request_id,
-        NurseShiftRequest.shift_date >= start,
-        NurseShiftRequest.shift_date < end,
-    ).all()
+    if not skip_shift_copy:
+        detailed_id_shift = 1
+        # shift 데이터 복사
+        old_shift_rows = db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.request_id == old_request_id,
+            NurseShiftRequest.shift_date >= start,
+            NurseShiftRequest.shift_date < end,
+        ).all()
 
-    for old_row in old_shift_rows:
-        day = old_row.shift_date.day
-        shift = old_row.shift
+        for old_row in old_shift_rows:
+            db.merge(NurseShiftRequest(
+                nurse_id=nurse_id,
+                request_id=new_request_id,
+                detailed_request_id=detailed_id_shift,
+                shift_date=old_row.shift_date,
+                shift=old_row.shift,
+                score=old_row.score,
+                partial_request=old_row.partial_request,
+                comment=old_row.comment
+            ))
+            shift_count += 1
+            detailed_id_shift += 1
+    else:
+        print("[복사] shift 복사 스킵 (case가 전체 캘린더 상태)")
 
-        # case_filter가 있으면 해당 (day, shift) 조합만 복사
-        if case_filter is not None and (day, shift) not in case_filter:
-            continue
-
-        db.merge(NurseShiftRequest(
-            nurse_id=nurse_id,
-            request_id=new_request_id,
-            detailed_request_id=detailed_id_shift,
-            shift_date=old_row.shift_date,
-            shift=shift,
-            score=old_row.score,
-            partial_request=old_row.partial_request,
-            comment=old_row.comment # 사유작성
-        ))
-        shift_count += 1
-        detailed_id_shift += 1
-
-    # pair 데이터 복사
+    # pair 데이터 복사 (항상)
     pair_count = 0
     detailed_id_pair = 1
 
@@ -641,6 +637,60 @@ def _copy_existing_requests_to_new(
         print("[복사 스킵] 복사할 데이터 없음")
 
     return shift_count, pair_count
+
+
+def _get_off_shift_ids(db: Session, group_id: str) -> list[str]:
+    """
+    근무 타입이 아닌 모든 shift_id 목록 반환 (휴무, 휴가 등 제한 대상)
+    """
+    return [
+        row[0] for row in db.query(Shift.shift_id).filter(
+            Shift.group_id == group_id,
+            Shift.type != '근무'
+        ).all()
+    ]
+
+
+def _count_existing_off_requests(
+    db: Session,
+    nurse_id: str,
+    year: int,
+    month: int,
+    group_id: str,
+) -> int:
+    """
+    해당 간호사의 해당 월에 **이미 저장된** 휴무/휴가 요청 개수 (draft + submitted 모두 포함)
+    """
+    
+    month_str = f"{year}-{month:02d}"
+    start_date = date(year, month, 1)
+    end_date = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    
+    latest_request = (
+        db.query(WantedRequest).filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+        ).order_by(WantedRequest.request_id.desc()).first()
+    )
+    
+    if not latest_request:
+        return 0
+    
+    latest_request_id = latest_request.request_id
+
+    off_shift_ids = _get_off_shift_ids(db, group_id)
+    if not off_shift_ids:
+        return 0
+
+    count = db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id == nurse_id,
+        NurseShiftRequest.request_id == latest_request_id,
+        NurseShiftRequest.shift_date >= start_date,
+        NurseShiftRequest.shift_date < end_date,
+        NurseShiftRequest.shift.in_(off_shift_ids),
+    ).count()
+
+    return count
 
 
 def normalize_request_text(value: Any) -> str:
@@ -881,10 +931,11 @@ async def invoke_and_persist_wanted_service(
 
         if latest_wr:
             print(f"과거 데이터 복사 시도: old={latest_wr.request_id} → new={new_request_id}")
-            case_filter = {(item["date"].day, item["shift"]) for item in normalized_case} if has_case else None
+            # has_case=True이면 case가 현재 캘린더 전체 상태 → shift 복사 불필요 (pair만 복사)
+            # has_case=False이면 AIDE 텍스트만 있는 경우 → 기존 shift 데이터 유지 필요
             copied_shift, copied_pair = _copy_existing_requests_to_new(
                 db, nurse_id, latest_wr.request_id, new_request_id,
-                req.year, req.month, month_str, case_filter=case_filter
+                req.year, req.month, month_str, skip_shift_copy=has_case
             )
     else:
         print("전체 재작성 또는 더미 request → 과거 데이터 복사 스킵")
@@ -977,7 +1028,79 @@ async def invoke_and_persist_wanted_service(
         ).delete(synchronize_session=False)
         if deleted_weekly:
             print(f"[weekly_off] DB에서 {deleted_weekly}건 제거")
+    
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    max_requests = nurse.wanted_max_requests if nurse else None
+    
+    excluded_off_dates = []
+    off_shift_ids_set = set(_get_off_shift_ids(db, group_id))
+    
+    if max_requests is not None:
+        # 복사된 데이터에서 휴무/휴가 날짜 조회 (new_request_id 기준)
+        start_date = date(req.year, req.month, 1)
+        end_date = date(req.year + 1, 1, 1) if req.month == 12 else date(req.year, req.month + 1, 1)
+        copied_off_rows = db.query(NurseShiftRequest.shift_date).filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.request_id == new_request_id,
+            NurseShiftRequest.shift_date >= start_date,
+            NurseShiftRequest.shift_date < end_date,
+            NurseShiftRequest.shift.in_(list(off_shift_ids_set)),
+        ).all()
+        copied_off_days = {row[0].day for row in copied_off_rows}
 
+        # shift_map에서 휴무/휴가 날짜
+        candidate_off_days = set()
+        for shift_id, days_map in shift_map.items():
+            if shift_id in off_shift_ids_set:
+                candidate_off_days.update(days_map.keys())
+
+        # 합집합으로 실제 총 개수 계산 (이중 카운트 방지)
+        all_off_days = copied_off_days | candidate_off_days
+        potential_total = len(all_off_days)
+
+        print(f"[AIDE OFF LIMIT] 복사된 휴무/휴가={len(copied_off_days)}개, "
+              f"shift_map 휴무/휴가={len(candidate_off_days)}개, "
+              f"합집합 총={potential_total}개, 제한={max_requests}")
+
+        if potential_total > max_requests:
+            allowable_total = max_requests
+            # 복사된 off 날짜는 우선 유지, shift_map 항목 중 초과분 제거
+            # 복사 전용 off 날짜 수 (shift_map과 겹치지 않는 것)
+            copy_only_off = copied_off_days - candidate_off_days
+            remaining_slots = max(0, allowable_total - len(copy_only_off))
+
+            kept_days = set()
+            excluded_items = []  # (day, shift_id) 쌍으로 추적
+
+            for shift_id, days_map in list(shift_map.items()):
+                if shift_id not in off_shift_ids_set:
+                    continue
+
+                for day in sorted(days_map.keys()):
+                    if len(kept_days) < remaining_slots:
+                        kept_days.add(day)
+                    else:
+                        excluded_items.append((day, shift_id))
+                        del days_map[day]
+                if not days_map:
+                    del shift_map[shift_id]
+
+            excluded_off_dates = sorted(set(d for d, _ in excluded_items))
+
+            # 프론트에 전달할 명확한 메시지
+            excluded_detail = ", ".join(
+                f"{req.month}/{d}일({s})" for d, s in excluded_items
+            )
+            warn_msg = (
+                f"휴무/휴가 요청 가능 수({max_requests}개) 초과로 "
+                f"다음 요청이 제외되었습니다: {excluded_detail}"
+            )
+            print(f"[AIDE OFF LIMIT PARTIAL] {warn_msg}")
+
+        else:
+            print(f"[AIDE OFF LIMIT OK] 복사={len(copied_off_days)}, "
+                  f"추가={len(candidate_off_days)}, 합집합={potential_total}, 제한={max_requests}")
+        
     # shift 저장
     if shift_map:
         _persist_shift_results(
@@ -1003,11 +1126,30 @@ async def invoke_and_persist_wanted_service(
         print(f"최종 commit 실패: {e}")
         traceback.print_exc()
         raise
-
-    return {
+    
+    result = {
         "shift": shift_parsed,
-        "preference": pref_parsed
+        "preference": pref_parsed,
+        "warning": None
     }
+    
+    if excluded_off_dates:
+        result["warning"] = {
+            "message": warn_msg,
+            "excluded_items": [
+                {"day": d, "shift": s, "date": f"{req.year}-{req.month:02d}-{d:02d}"}
+                for d, s in excluded_items
+            ],
+            "existing_off_count": len(copied_off_days),
+            "excluded_count": len(excluded_items),
+            "limit": max_requests
+        }
+
+    # return {
+    #     "shift": shift_parsed,
+    #     "preference": pref_parsed
+    # }
+    return result
 
 
 def request_wanted_shifts_service(
