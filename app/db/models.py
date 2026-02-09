@@ -419,6 +419,7 @@ class NursePairRequest(Base):
     __tablename__ = 'nurse_pair_requests'
     nurse_id = Column(VARCHAR(50), primary_key=True)
     request_id = Column(INTEGER, primary_key=True)
+    month = Column(CHAR(7), primary_key=True)  # 'YYYY-MM'
     detailed_request_id = Column(INTEGER, primary_key=True)
     target_id = Column(VARCHAR(50), primary_key=True)
     score = Column(DECIMAL(3, 1), nullable=False)

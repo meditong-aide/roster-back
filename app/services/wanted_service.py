@@ -422,6 +422,7 @@ def _persist_pair_results(
     existing_rows = db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id == request_id,
+        NursePairRequest.month == month_str,
     ).all()
     existing_map = {row.target_id: row for row in existing_rows}
 
@@ -449,6 +450,7 @@ def _persist_pair_results(
             db.add(NursePairRequest(
                 nurse_id=nurse_id,
                 request_id=request_id,
+                month=month_str,
                 detailed_request_id=next_detailed_id,
                 target_id=target_id_str,
                 score=float(weight),
@@ -614,12 +616,14 @@ def _copy_existing_requests_to_new(
     old_pair_rows = db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id == old_request_id,
+        NursePairRequest.month == month_str,
     ).all()
 
     for old_row in old_pair_rows:
         db.merge(NursePairRequest(
             nurse_id=nurse_id,
             request_id=new_request_id,
+            month=month_str,
             detailed_request_id=detailed_id_pair,
             target_id=old_row.target_id,
             score=old_row.score,
@@ -653,7 +657,7 @@ def normalize_request_text(value: Any) -> str:
 
     if isinstance(value, list):
         cleaned = [clean(v) for v in value if clean(v) and clean(v) != '기존 데이터에서 로드됨']
-        return '\n'.join(cleaned) or '기존 데이터 업데이트'
+        return '\n'.join(cleaned) or '기존 데이터 ��데이트'
     return clean(value) or '기존 데이터 업데이트'
 
 
@@ -669,6 +673,7 @@ def cleanup_previous_requests(db: Session, nurse_id: str, month_str: str, curren
     deleted_pair = db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id < current_request_id,
+        NursePairRequest.month == month_str,
     ).delete()
     
     if deleted_shift or deleted_pair:
