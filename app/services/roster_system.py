@@ -335,7 +335,7 @@ class RosterSystem:
                             'required': required,
                             'actual': actual
                         })
-                    violations.append({'type': 'shift_requirements', 'nurse_idx': n_idx, 'day': day})
+                        violations.append({'type': 'shift_requirements', 'nurse_idx': n_idx, 'day': day})
                 if not self._check_consecutive_night_limit(n_idx, day):
                     violations.append({'type': 'night_consecutive', 'nurse_idx': n_idx, 'day': day})
                 if not self._check_day_after_night(n_idx, day):
