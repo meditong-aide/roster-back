@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
@@ -34,6 +35,8 @@ from collections import defaultdict
 import calendar
 from sqlalchemy import text
 from db.client2 import get_db
+
+logger = logging.getLogger(__name__)
 # from db.client2 import _get_mssql_session
 
 
@@ -1086,6 +1089,56 @@ def _compute_weekly_off_day_indices_for_month(
     if weekend_off_only:
         print(f"[WeeklyOff] 주말 휴무 대상 간호사 수={len(weekend_off_only)}")
     return nurse_to_days, warnings
+
+
+def _compute_lookahead_weekly_off_cells(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    nurses_for_engine: list,
+    D_phys: int,
+    K_lookahead: int,
+) -> set[tuple[int, int]]:
+    """룩어헤드 구간(다음 달 1~K일)에 해당하는 주휴 고정 OFF 셀을 계산한다.
+
+    weekly_off_by_idx는 당월 D_phys에서만 의미 있는 day index이므로,
+    룩어헤드 구간의 주휴는 다음 달 실제 날짜(요일/주차 규칙)로 재계산한 별도 집합만 사용한다.
+
+    Returns:
+        (n_idx, d) 집합. d는 0-based 확장 일자(D_phys ~ D_phys+K_lookahead-1).
+    """
+    if K_lookahead <= 0:
+        return set()
+    next_year = year if month < 12 else year + 1
+    next_month = month + 1 if month < 12 else 1
+    nurse_to_days, _ = _compute_weekly_off_day_indices_for_month(
+        db=db,
+        office_id=office_id,
+        group_id=group_id,
+        year=next_year,
+        month=next_month,
+    )
+    nurse_id_to_idx = {str(n.nurse_id): i for i, n in enumerate(nurses_for_engine)}
+    cells: set[tuple[int, int]] = set()
+    for nurse_id, day_set in nurse_to_days.items():
+        n_idx = nurse_id_to_idx.get(str(nurse_id))
+        if n_idx is None:
+            continue
+        for t in range(K_lookahead):
+            if t in day_set:
+                d = D_phys + t
+                cells.add((n_idx, d))
+    if cells:
+        logger.info(
+            "[Lookahead] 룩어헤드 주휴 셀: 다음 달 %s-%s 1~%s일 기준 %s건 (nurse×day)",
+            next_year,
+            next_month,
+            K_lookahead,
+            len(cells),
+        )
+    return cells
 
 
 def _build_engine_nurse_index_map(nurses_in_group: list[Nurse]) -> dict[str, int]:
@@ -2504,9 +2557,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
     _apply_distribution_policy_from_req(config_dict, req)
     # 경계 제약 기능 기본값
-    config_dict.setdefault('cross_month_hard_rules_enable', True)
-    config_dict.setdefault('cross_month_lookback_days', 6)
-    config_dict.setdefault('allow_override_by_law', False)
+    config_dict.setdefault("cross_month_hard_rules_enable", True)
+    config_dict.setdefault("cross_month_lookback_days", 6)
+    config_dict.setdefault("allow_override_by_law", False)
+    config_dict.setdefault("lookahead_days", 0)
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
     # _debug_log(
     #     "config_ready",
@@ -2582,6 +2636,37 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             for d in day_list:
                 weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
     config_dict["weekly_off_map"] = {k: sorted(list(v)) for k, v in weekly_off_map.items()}
+
+    # 룩어헤드: 다음 달 1~K일 주휴 고정 OFF 셀(당월 weekly_off_by_idx와 별도로 재계산)
+    K_lookahead = int(config_dict.get("lookahead_days") or 0)
+    if K_lookahead > 0:
+        logger.info(
+            "[Lookahead] K=%s 적용 (lookahead_days), 다음 달 1~%s일 구간 사용",
+            K_lookahead,
+            K_lookahead,
+        )
+        try:
+            config_dict["lookahead_weekly_off_cells"] = _compute_lookahead_weekly_off_cells(
+                db=db,
+                office_id=current_user.office_id,
+                group_id=current_user.group_id,
+                year=req.year,
+                month=req.month,
+                nurses_for_engine=nurses_for_engine,
+                D_phys=days_in_month,
+                K_lookahead=K_lookahead,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Lookahead] 룩어헤드 주휴 셀 계산 실패(비활성화): %s",
+                e,
+                exc_info=True,
+            )
+            config_dict["lookahead_weekly_off_cells"] = set()
+    else:
+        logger.info("[Lookahead] lookahead_days=0 → 룩어헤드 비활성화")
+        config_dict["lookahead_weekly_off_cells"] = set()
+
     # _debug_log(
     #     "weekly_off_built",
     #     {
