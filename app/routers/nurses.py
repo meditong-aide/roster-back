@@ -310,7 +310,7 @@ async def upload2_confirm_endpoint(
 ):
     """업로드2 - 검증 통과 후 저장. 오류가 있는 행은 건너뜀."""
     try:
-        print(f"[DEBUG] 라우터 - ��은 쿼리 group_id: {group_id}")
+        print(f"[DEBUG] 라우터 - 받은 쿼리 group_id: {group_id}")
         print(f"[DEBUG] current_user: nurse_id={current_user.nurse_id}, "
               f"group_id={getattr(current_user, 'group_id', '없음')}, "
               f"is_master_admin={current_user.is_master_admin}")

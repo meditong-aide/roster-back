@@ -166,7 +166,7 @@ def submit_preferences_service(
                 f"{req.year}년 {req.month}월 원티드 마감일({wanted.exp_date.strftime('%Y-%m-%d %H:%M')})이 지났습니다."
             )
 
-        print(f"[검증 통���] Wanted 상태 확인: status={wanted.status}, "
+        print(f"[검증 통과] Wanted 상태 확인: status={wanted.status}, "
               f"exp_date={wanted.exp_date.strftime('%Y-%m-%d %H:%M') if wanted.exp_date else 'None'}")
 
         # 3. 재제출 여부 확인

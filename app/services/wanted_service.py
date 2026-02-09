@@ -707,7 +707,7 @@ def normalize_request_text(value: Any) -> str:
 
     if isinstance(value, list):
         cleaned = [clean(v) for v in value if clean(v) and clean(v) != '기존 데이터에서 로드됨']
-        return '\n'.join(cleaned) or '기존 데이터 ��데이트'
+        return '\n'.join(cleaned) or '기존 데이터 업데이트'
     return clean(value) or '기존 데이터 업데이트'
 
 

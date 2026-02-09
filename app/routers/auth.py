@@ -395,7 +395,7 @@ async def handle_find_pw_request(
             return {"result": "fail", "message": "휴대폰번호가 일치하지 않습니다."}
     else:
         if email != email_chk :
-            return {"result": "fail", "message": "email이 일치하��� 않습니다."}
+            return {"result": "fail", "message": "email이 일치하지 않습니다."}
 
     # 패스워드 변경
     pwd_reset_result = msdb_manager.execute(Member.member_pwd_reset(), params=(new_password, new_password, empseqno))
