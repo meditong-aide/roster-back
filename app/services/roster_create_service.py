@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
     DailyShift,
+    FixedWantedEntry,
     Group,
     IssuedRoster,
     Nurse,
@@ -91,7 +92,7 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
     }
 
 def _collect_nurses_and_preferences(db: Session, req, current_user):
-    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (WantedRequest 기반)"""
+    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (FixedWantedEntry 존재 시 자동 사용)"""
     # 1️⃣ 그룹 내 간호사 목록
     print('collect_nurses_and_preferences 진입')
     nurses_in_group = (
@@ -114,7 +115,97 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     preferences = []
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
     special_fixed_requests: list[dict] = []
-    # print('\n\n\n\n\nspecial_shift_map', special_shift_map, '\n\n\n\n\n')
+
+    # FixedWantedEntry 존재 여부 확인 (단일 테이블 구조)
+    # → 해당 년/월에 확정 원티드가 존재하면 자동으로 사용 (프론트에서 플래그 전달 불필요)
+    has_fixed_wanted = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == current_user.group_id,
+        FixedWantedEntry.year == req.year,
+        FixedWantedEntry.month == req.month,
+    ).first() is not None
+
+    if has_fixed_wanted:
+        print(f"[RosterCreate] FixedWantedEntry 사용 (단일 테이블)")
+        # FixedWantedEntry 기반으로 선호도 수집
+        for nurse_id in nurse_ids:
+            # FixedWantedEntry에서 해당 간호사의 항목 조회 (is_applied=True만)
+            fixed_entries = db.query(FixedWantedEntry).filter(
+                FixedWantedEntry.group_id == current_user.group_id,
+                FixedWantedEntry.year == req.year,
+                FixedWantedEntry.month == req.month,
+                FixedWantedEntry.nurse_id == nurse_id,
+                FixedWantedEntry.is_applied == True,
+            ).all()
+
+            if not fixed_entries:
+                continue  # 해당 간호사의 확정 원티드가 없으면 건너뜀
+
+            shift_data = {"D": {}, "E": {}, "N": {}, "O": {}}
+            first_entry = fixed_entries[0] if fixed_entries else None
+            for fe in fixed_entries:
+                shift_code_raw = str(fe.shift_id or "").strip()
+                shift_code = shift_code_raw.upper()
+                day_str = str(fe.shift_date.day)
+
+                if shift_code in shift_data:
+                    # 확정 원티드는 최고 우선순위 (score=10)
+                    shift_data[shift_code][day_str] = 10
+                    continue
+
+                # 특별 근무(휴가/공가 등) 처리
+                if (
+                    shift_code in special_shift_map
+                    and fe.shift_date.year == req.year
+                    and fe.shift_date.month == req.month
+                ):
+                    try:
+                        day_int = int(day_str)
+                    except Exception:
+                        continue
+                    special_fixed_requests.append(
+                        {
+                            "nurse_id": nurse_id,
+                            "day": day_int,
+                            "shift_id": shift_code_raw,
+                            "shift_type": special_shift_map[shift_code]["type"],
+                        }
+                    )
+
+            # pair 데이터는 기존 WantedRequest에서 가져옴 (FixedWantedEntry에는 pair 없음)
+            pair_data = []
+            latest_wr = db.query(WantedRequest).filter(
+                WantedRequest.nurse_id == nurse_id,
+                WantedRequest.month == month_str,
+            ).order_by(WantedRequest.request_id.desc()).first()
+
+            if latest_wr:
+                pair_rows = db.query(NursePairRequest).filter(
+                    NursePairRequest.nurse_id == nurse_id,
+                    NursePairRequest.request_id == latest_wr.request_id,
+                ).all()
+                pair_data = [{"id": p.target_id, "weight": p.score} for p in pair_rows]
+
+            data_json = {
+                "request": "확정 원티드 적용",
+                "shift": {k: v for k, v in shift_data.items() if v},
+                "preference": pair_data,
+            }
+
+            preferences.append({
+                "nurse_id": nurse_id,
+                "year": req.year,
+                "month": req.month,
+                "is_submitted": True,
+                "created_at": first_entry.created_at if first_entry else None,
+                "submitted_at": first_entry.updated_at if first_entry else None,
+                "data": data_json,
+            })
+
+        print(f"[RosterCreate] FixedWantedEntry 기반 preferences 수집 완료: {len(preferences)}건")
+        return nurses_in_group, preferences, special_fixed_requests, special_shift_map
+
+    # FixedWantedEntry가 없으면 기존 WantedRequest 기반으로 수집
+    print("[RosterCreate] FixedWantedEntry 없음, WantedRequest 기반 수집")
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     for nurse_id in nurse_ids:
         submitted_wr = (
@@ -184,6 +275,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             .filter(
                 NursePairRequest.nurse_id == nurse_id,
                 NursePairRequest.request_id == target_wr.request_id,
+                NursePairRequest.month == month_str,
             )
             .all()
         )
@@ -1189,11 +1281,16 @@ def _merge_fixed_cells_with_weekly_off(
 def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: int) -> str | None:
     """이전 달의 최종(issued 우선) schedule_id를 조회한다."""
     py, pm = _get_prev_year_month(year, month)
-    # 1) IssuedRoster 우선
+    # 1) IssuedRoster 우선 (is_active=True인 것만)
     issued = (
         db.query(IssuedRoster)
         .join(Schedule, IssuedRoster.schedule_id == Schedule.schedule_id)
-        .filter(Schedule.group_id == group_id, Schedule.year == py, Schedule.month == pm)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == py,
+            Schedule.month == pm,
+            IssuedRoster.is_active == True
+        )
         .order_by(IssuedRoster.issued_at.desc())
         .first()
     )

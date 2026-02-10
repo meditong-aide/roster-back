@@ -4,13 +4,15 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Nurse as NurseModel, Group
+from db.models import Nurse as NurseModel, Group, DeletedNurseHistory
 from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pprint import pprint
 from datetime import date
 from dateutil.parser import parse as parse_date
+from db.client2 import msdb_manager
+from datalayer.member import Member
 import logging
 
 def get_personnel_basic_info_service(current_user, db: Session):
@@ -120,7 +122,11 @@ def get_nurses_in_group_service(
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
             "is_weekend_off": nurse.is_weekend_off,
-            "work_shifts": nurse.work_shifts or [],
+            "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
+            # 원티드 설정 (간호사별 개별 설정)
+            "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
+            "enable_aide": nurse.enable_aide,
+            "wanted_max_requests": nurse.wanted_max_requests,
         }
         result.append(nurse_dict)
 
@@ -215,7 +221,11 @@ def get_nurses_filtered_service(
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
             "is_weekend_off": nurse.is_weekend_off,
-            "work_shifts": nurse.work_shifts or [],
+            "work_shifts": nurse.work_shifts or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
+            # 원티드 설정 (간호사별 개별 설정)
+            "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
+            "enable_aide": nurse.enable_aide,
+            "wanted_max_requests": nurse.wanted_max_requests,
         }
         result.append(nurse_dict)
 
@@ -480,3 +490,232 @@ def move_nurse_service(req, current_user, db: Session):
 
     db.commit()
     return {"message": "간호사 순서 변경 완료"}
+
+
+def get_available_members_service(
+    office_id: str,
+    group_id: str,
+    db: Session
+) -> List[Dict[str, Any]]:
+    """
+    동일 오피스의 전체 멤버 중 현재 그룹에 속하지 않은 멤버 목록 반환.
+    - MSSQL Member 테이블에서 오피스 전체 멤버 조회
+    - MySQL nurses 테이블에서 해당 group_id에 이미 등록된 nurse_id 조회
+    - 이미 등록된 멤버를 제외한 나머지 반환
+    """
+    # 1. MSSQL에서 오피스 전체 멤버 조회 (export-members와 동일 쿼리)
+    all_members = msdb_manager.fetch_all(
+        Member.member_export_by_office(),
+        params=(str(office_id),)
+    ) or []
+
+    # 2. 현재 group_id에 이미 등록된 간호사의 nurse_id 집합
+    existing_nurse_ids = set(
+        row[0] for row in db.query(NurseModel.nurse_id)
+        .filter(NurseModel.group_id == group_id)
+        .all()
+    )
+
+    # 3. 이미 등록된 멤버 제외
+    available = []
+    for row in all_members:
+        emp_seq_no = row.get('EmpSeqNo') if isinstance(row, dict) else getattr(row, 'EmpSeqNo', None)
+        if emp_seq_no and str(emp_seq_no) not in existing_nurse_ids:
+            member_dict = {
+                "nurse_id": str(emp_seq_no),
+                "emp_num": row.get('OfficeEmpNum') if isinstance(row, dict) else getattr(row, 'OfficeEmpNum', None),
+                "account_id": row.get('MemberID') if isinstance(row, dict) else getattr(row, 'MemberID', None),
+                "name": row.get('EmployeeName') if isinstance(row, dict) else getattr(row, 'EmployeeName', None),
+                "duty": row.get('duty') if isinstance(row, dict) else getattr(row, 'duty', None),
+                "career": row.get('career') if isinstance(row, dict) else getattr(row, 'career', None),
+                "is_head_nurse": row.get('headnurse') if isinstance(row, dict) else getattr(row, 'headnurse', None),
+                "joining_date": row.get('joindate') if isinstance(row, dict) else getattr(row, 'joindate', None),
+                "birth_date": row.get('DateOfBirth') if isinstance(row, dict) else getattr(row, 'DateOfBirth', None),
+                "phone_number": row.get('PortableTel') if isinstance(row, dict) else getattr(row, 'PortableTel', None),
+                "gender": row.get('Gender') if isinstance(row, dict) else getattr(row, 'Gender', None),
+                "big_kind_name": row.get('big_kind_name') if isinstance(row, dict) else getattr(row, 'big_kind_name', None),
+                "middle_kind_name": row.get('middle_kind_name') if isinstance(row, dict) else getattr(row, 'middle_kind_name', None),
+                "small_kind_name": row.get('small_kind_name') if isinstance(row, dict) else getattr(row, 'small_kind_name', None),
+                "mb_part_name": row.get('mb_part_name') if isinstance(row, dict) else getattr(row, 'mb_part_name', None),
+            }
+            available.append(member_dict)
+
+    return available
+
+
+def add_nurses_to_group_service(
+    nurse_ids: List[str],
+    group_id: str,
+    office_id: str,
+    db: Session
+) -> Dict[str, Any]:
+    """
+    선택된 멤버를 현재 그룹에 추가.
+    - nurses 테이블에 이미 존재하는 경우: group_id만 변경
+    - nurses 테이블에 없는 경우: MSSQL에서 멤버 정보 조회 후 신규 생성
+    """
+    if not nurse_ids:
+        return {"added": 0, "updated": 0, "errors": []}
+
+    added = 0
+    updated = 0
+    errors = []
+
+    # MSSQL에서 오피스 전체 멤버 조회 (신규 생성 시 참조)
+    all_members = msdb_manager.fetch_all(
+        Member.member_export_by_office(),
+        params=(str(office_id),)
+    ) or []
+    member_map = {}
+    for row in all_members:
+        emp_seq = row.get('EmpSeqNo') if isinstance(row, dict) else getattr(row, 'EmpSeqNo', None)
+        if emp_seq:
+            member_map[str(emp_seq)] = row
+
+    for nid in nurse_ids:
+        try:
+            # nurses 테이블에서 해당 nurse_id 조회 (group_id 무관)
+            existing_nurse = db.query(NurseModel).filter(
+                NurseModel.nurse_id == str(nid)
+            ).first()
+
+            if existing_nurse:
+                # 이미 nurses 테이블에 존재 → group_id만 변경
+                existing_nurse.group_id = group_id
+                # sequence는 현재 그룹 활성 목록의 마지막으로 배치
+                next_seq = get_next_sequence_for_active_status(group_id, existing_nurse.active, db)
+                existing_nurse.sequence = next_seq
+                updated += 1
+            else:
+                # nurses 테이블에 없음 → MSSQL 멤버 정보로 신규 생성
+                member_data = member_map.get(str(nid))
+                if not member_data:
+                    errors.append({"nurse_id": nid, "reason": "MSSQL 멤버 정보를 찾을 수 없습니다."})
+                    continue
+
+                _get = lambda key: member_data.get(key) if isinstance(member_data, dict) else getattr(member_data, key, None)
+
+                # 경력 변환
+                career_val = _get('career')
+                experience = None
+                if career_val is not None and str(career_val).strip():
+                    try:
+                        experience = int(career_val)
+                    except (ValueError, TypeError):
+                        experience = None
+
+                # 수간호사 여부 변환
+                headnurse_val = _get('headnurse')
+                is_head_nurse = False
+                if headnurse_val is not None:
+                    is_head_nurse = str(headnurse_val).strip().upper() in ('Y', '1', 'TRUE')
+
+                # 입사일 변환
+                join_val = _get('joindate')
+                joining_date = None
+                if join_val:
+                    try:
+                        joining_date = parse_date(str(join_val))
+                    except (ValueError, TypeError):
+                        joining_date = None
+
+                next_seq = get_next_sequence_for_active_status(group_id, 1, db)
+
+                new_nurse = NurseModel(
+                    nurse_id=str(nid),
+                    group_id=group_id,
+                    office_id=office_id,
+                    account_id=str(_get('MemberID') or ''),
+                    emp_num=str(_get('OfficeEmpNum') or '') if _get('OfficeEmpNum') else None,
+                    name=str(_get('EmployeeName') or ''),
+                    experience=experience,
+                    role=str(_get('duty') or '') if _get('duty') else None,
+                    is_head_nurse=is_head_nurse,
+                    joining_date=joining_date,
+                    birth_date=str(_get('DateOfBirth') or '') if _get('DateOfBirth') else None,
+                    phone_number=str(_get('PortableTel') or '') if _get('PortableTel') else None,
+                    gender=str(_get('Gender') or '') if _get('Gender') else None,
+                    sequence=next_seq,
+                    active=1,
+                )
+                db.add(new_nurse)
+                added += 1
+
+        except Exception as e:
+            logging.error(f"[add_nurses_to_group] nurse_id={nid} 처리 실패: {e}")
+            errors.append({"nurse_id": nid, "reason": str(e)})
+            continue
+
+    db.commit()
+    return {"added": added, "updated": updated, "errors": errors}
+def delete_nurse_service(
+    nurse_id: str,
+    current_user: UserSchema,
+    db: Session
+):
+    """
+    특정 간호사 삭제 서비스 함수
+    - HDN 또는 ADM만 허용
+    - 삭제 전 deleted_nurse_history 테이블에 이력 저장
+    - 삭제 후 재정렬(선택: 필요 시 _reindex_contiguously 호출)
+    """
+    if not current_user:
+        raise Exception("Not authenticated")
+    
+    # 권한 체크
+    if not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise Exception("Permission denied")
+    
+    # 대상 간호사 조회
+    db_nurse = db.query(NurseModel).filter(
+        NurseModel.nurse_id == nurse_id,
+        NurseModel.group_id == current_user.group_id if not current_user.is_master_admin else True
+    ).first()
+    
+    if not db_nurse:
+        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+    
+    try:
+        # 삭제 수행자 정보 조회
+        deleter = db.query(NurseModel).filter(
+            NurseModel.nurse_id == current_user.nurse_id
+        ).first()
+
+        # 삭제 이력 저장 (deleted_nurse_history)
+        history = DeletedNurseHistory(
+            target_nurse_id=db_nurse.nurse_id,
+            office_id=db_nurse.office_id,
+            group_id=db_nurse.group_id,
+            emp_num=db_nurse.emp_num,
+            account_id=db_nurse.account_id,
+            name=db_nurse.name,
+            role=db_nurse.role,
+            experience=db_nurse.experience,
+            is_head_nurse=db_nurse.is_head_nurse,
+            joining_date=db_nurse.joining_date,
+            birth_date=db_nurse.birth_date,
+            phone_number=db_nurse.phone_number,
+            gender=db_nurse.gender,
+            deleted_by_nurse_id=current_user.nurse_id,
+            deleted_by_account_id=current_user.account_id,
+            deleted_by_name=deleter.name if deleter else None,
+            deleted_by_role=current_user.EmpAuthGbn,
+        )
+        db.add(history)
+
+        # 삭제
+        group_id = db_nurse.group_id
+        db.delete(db_nurse)
+        db.commit()
+
+        # 삭제 후 active 상태별 재정렬
+        active_nurses = _get_nurses_by_active(group_id, 1, db)
+        _reindex_contiguously(active_nurses)
+        inactive_nurses = _get_nurses_by_active(group_id, 0, db)
+        _reindex_contiguously(inactive_nurses)
+        db.commit()
+
+        return {"message": f"Nurse {nurse_id} deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise Exception(f"Deletion failed: {str(e)}")

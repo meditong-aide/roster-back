@@ -6,10 +6,10 @@
 import pprint
 from sqlalchemy.orm import Session
 from sqlalchemy import String, cast, extract
-from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift
+from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 
 def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int, month_str: str):
@@ -30,6 +30,7 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
     existing_count = db.query(NursePairRequest).filter(
         NursePairRequest.nurse_id == nurse_id,
         NursePairRequest.request_id == current_request_id,
+        NursePairRequest.month == month_str,
     ).count()
     if existing_count > 0:
         print(f"[pair carry-forward] 현재 request_id={current_request_id}에 이미 {existing_count}건 존재 → 스킵")
@@ -51,6 +52,7 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
         pair_rows = db.query(NursePairRequest).filter(
             NursePairRequest.nurse_id == nurse_id,
             NursePairRequest.request_id == prev_rid,
+            NursePairRequest.month == month_str,
         ).all()
 
         if pair_rows:
@@ -59,6 +61,7 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
                 db.add(NursePairRequest(
                     nurse_id=nurse_id,
                     request_id=current_request_id,
+                    month=month_str,
                     detailed_request_id=detailed_id,
                     target_id=row.target_id,
                     score=row.score,
@@ -126,7 +129,148 @@ def submit_preferences_service(
         else:
             # 평평한 {날짜: shift} 형식
             data_to_save = preference_data
-    
+
+    # ==================== WantedConfig 검증 (최종 제출 시에만) ====================
+    if not is_draft and data_to_save:
+        group_id = current_user.group_id
+        nurse_id = current_user.nurse_id
+
+        # # 1. GLOBAL 설정 확인 - 더 이상 사용하지 않음 (nurses 테이블로 이동됨)
+        # global_config = db.query(WantedConfig).filter(
+        #     WantedConfig.group_id == group_id,
+        #     WantedConfig.config_type == 'GLOBAL'
+        # ).first()
+
+        # 2. Wanted 테이블 상태 확인 (해당 월의 원티드 요청이 생성되었는지, 마감되었는지)
+        wanted = db.query(Wanted).filter(
+            Wanted.group_id == group_id,
+            Wanted.year == req.year,
+            Wanted.month == req.month
+        ).first()
+
+        # 2-1. Wanted가 존재하지 않으면 (수간호사가 아직 원티드 요청을 생성하지 않음)
+        if not wanted:
+            print(f"[검증 실패] Wanted 요청이 생성되지 않음: group_id={group_id}, {req.year}-{req.month:02d}")
+            raise Exception(f"{req.year}년 {req.month}월 원티드 요청이 아직 생성되지 않았습니다.")
+
+        # 2-2. status가 'closed'인 경우 (이미 마감됨)
+        if wanted.status == 'closed':
+            print(f"[검증 실패] Wanted가 이미 마감됨: group_id={group_id}, {req.year}-{req.month:02d}")
+            raise Exception(f"{req.year}년 {req.month}월 원티드가 이미 마감되었습니다.")
+
+        # 2-3. exp_date가 지난 경우 (마감일 경과)
+        if wanted.exp_date and wanted.exp_date < datetime.now():
+            print(f"[검증 실패] Wanted 마감일 경과: group_id={group_id}, {req.year}-{req.month:02d}, "
+                  f"마감일={wanted.exp_date.strftime('%Y-%m-%d %H:%M')}")
+            raise Exception(
+                f"{req.year}년 {req.month}월 원티드 마감일({wanted.exp_date.strftime('%Y-%m-%d %H:%M')})이 지났습니다."
+            )
+
+        print(f"[검증 통과] Wanted 상태 확인: status={wanted.status}, "
+              f"exp_date={wanted.exp_date.strftime('%Y-%m-%d %H:%M') if wanted.exp_date else 'None'}")
+
+        # 3. 재제출 여부 확인
+        existing_submitted = db.query(WantedRequest).filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True
+        ).first()
+
+        is_resubmit = existing_submitted is not None
+
+        print(f"[검증 통과] GLOBAL 설정 확인 완료: is_resubmit={is_resubmit}")
+
+        # # 4. NURSE_LIMIT 검증 - 프론트에서 검증, nurses 테이블로 이동됨
+        # nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+        # if nurse and nurse.wanted_max_requests is not None:
+        #     start_date = date(req.year, req.month, 1)
+        #     if req.month == 12:
+        #         end_date = date(req.year + 1, 1, 1)
+        #     else:
+        #         end_date = date(req.year, req.month + 1, 1)
+        #
+        #     query = db.query(NurseShiftRequest).filter(
+        #         NurseShiftRequest.nurse_id == nurse_id,
+        #         NurseShiftRequest.shift_date >= start_date,
+        #         NurseShiftRequest.shift_date < end_date
+        #     )
+        #     if is_resubmit and existing_submitted:
+        #         query = query.filter(NurseShiftRequest.request_id != existing_submitted.request_id)
+        #
+        #     nurse_current_count = query.count()
+        #     additional_count = len(data_to_save)
+        #     total_count = nurse_current_count + additional_count
+        #
+        #     if total_count > nurse.wanted_max_requests:
+        #         print(f"[검증 실패] NURSE_LIMIT 초과: nurse_id={nurse_id}, "
+        #               f"현재={nurse_current_count}, 추가={additional_count}, "
+        #               f"제한={nurse.wanted_max_requests}")
+        #         raise Exception(
+        #             f"간호사별 최대 요청 개수를 초과했습니다. "
+        #             f"(현재: {nurse_current_count}개, 추가: {additional_count}개, 제한: {nurse.wanted_max_requests}개)"
+        #         )
+        #
+        #     print(f"[검증 통과] NURSE_LIMIT: 현재={nurse_current_count}, 추가={additional_count}, "
+        #           f"제한={nurse.wanted_max_requests}")
+
+        # # 5. DAILY_LIMIT 검증 - 프론트에서 검증
+        # case_dates = set()
+        # for date_str in data_to_save.keys():
+        #     try:
+        #         parsed_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        #         case_dates.add(parsed_date)
+        #     except ValueError:
+        #         continue
+        #
+        # if case_dates:
+        #     daily_limit_configs = db.query(WantedConfig).filter(
+        #         WantedConfig.group_id == group_id,
+        #         WantedConfig.target_date.in_(case_dates),
+        #         WantedConfig.shift_type.is_(None)
+        #     ).all()
+        #
+        #     daily_limit_map = {config.target_date: config.max_requests for config in daily_limit_configs}
+        #
+        #     if daily_limit_map:
+        #         group_nurse_ids = [n[0] for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+        #
+        #         exceeded_dates = []
+        #         for check_date in case_dates:
+        #             if check_date in daily_limit_map:
+        #                 daily_limit = daily_limit_map[check_date]
+        #
+        #                 query = db.query(NurseShiftRequest).filter(
+        #                     NurseShiftRequest.nurse_id.in_(group_nurse_ids),
+        #                     NurseShiftRequest.shift_date == check_date
+        #                 )
+        #
+        #                 if is_resubmit and existing_submitted:
+        #                     query = query.filter(
+        #                         ~((NurseShiftRequest.nurse_id == nurse_id) &
+        #                           (NurseShiftRequest.request_id == existing_submitted.request_id))
+        #                     )
+        #
+        #                 daily_current_count = query.count()
+        #
+        #                 if daily_current_count + 1 > daily_limit:
+        #                     exceeded_dates.append({
+        #                         "date": check_date.strftime('%Y-%m-%d'),
+        #                         "current": daily_current_count,
+        #                         "limit": daily_limit
+        #                     })
+        #
+        #         if exceeded_dates:
+        #             exceeded_info = ", ".join([
+        #                 f"{d['date']}({d['current']}/{d['limit']})"
+        #                 for d in exceeded_dates
+        #             ])
+        #             print(f"[검증 실패] DAILY_LIMIT 초과: {exceeded_info}")
+        #             raise Exception(
+        #                 f"다음 날짜의 일자별 최대 요청 개수를 초과했습니다: {exceeded_info}"
+        #             )
+        #
+        #         print(f"[검증 통과] DAILY_LIMIT: case 날짜 {len(case_dates)}개 확인 완료")
+
     # 최종 제출 시에만 이전 데이터 삭제 (data_to_save가 있을 때만)
     if not is_draft and data_to_save:  # ← 이제 안전하게 참조 가능
         db.query(NurseShiftRequest).filter(
@@ -173,6 +317,7 @@ def submit_preferences_service(
         db.query(NursePairRequest).filter(
             NursePairRequest.nurse_id == current_user.nurse_id,
             NursePairRequest.request_id == request_id,
+            NursePairRequest.month == month_str,
         ).delete()
 
         pair_detailed_id = 1
@@ -184,6 +329,7 @@ def submit_preferences_service(
             db.add(NursePairRequest(
                 nurse_id=current_user.nurse_id,
                 request_id=request_id,
+                month=month_str,
                 detailed_request_id=pair_detailed_id,
                 target_id=str(target_id),
                 score=float(weight),
@@ -306,6 +452,7 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         .filter(
             NursePairRequest.nurse_id == nurse_id,
             NursePairRequest.request_id == target_wr.request_id,
+            NursePairRequest.month == month_str,
         )
         .all()
     )
@@ -432,6 +579,7 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             .filter(
                 NursePairRequest.nurse_id == nurse_id,
                 NursePairRequest.request_id == wr.request_id,
+                NursePairRequest.month == month_str,
             )
             .all()
         )

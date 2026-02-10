@@ -27,7 +27,8 @@ from schemas.roster_schema import (
     ExcelConfirmRequest,
     PersonnelUpdate,
     PasswordChangeRequest,
-    PhoneChangeRequest
+    PhoneChangeRequest,
+    AddToGroupRequest,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -39,6 +40,9 @@ from services.nurse_service import (
     reorder_nurses_service,
     get_nurses_filtered_service,
     get_personnel_basic_info_service,
+    get_available_members_service,
+    add_nurses_to_group_service,
+    delete_nurse_service,
 )
 from services.excel_service import (
     create_nurse_template, 
@@ -335,6 +339,72 @@ async def upload2_confirm_endpoint(
     except Exception as e:
         print(f"[ERROR] upload2-confirm 엔드포인트 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
+
+
+
+
+@router.get("/available-members")
+async def get_available_members(
+    group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    현재 그룹에 속하지 않은 동일 오피스 멤버 목록 조회.
+    - 근무자 등록 모달에서 사용
+    - MSSQL 전체 멤버 중 현재 group_id에 이미 등록된 간호사를 제외하고 반환
+    """
+    try:
+        office_id = current_user.office_id
+        if not office_id:
+            raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
+
+        result = get_available_members_service(office_id, group_id, db)
+        if isinstance(result, list) and result:
+            unique_nurse_ids = set(item.get("nurse_id") for item in result if item.get("nurse_id"))
+            unique_count = len(unique_nurse_ids)
+            print(f"[DEBUG] available-members 조회 성공 - 총 {len(result)}건, 고유 nurse_id {unique_count}개, group_id = {group_id}")
+        else:
+            print(f"[DEBUG] available-members 조회 성고 - 빈 리스트 반환, group_id = {group_id}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] available-members 조회 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"멤버 목록 조회 실패: {str(e)}")
+
+
+@router.post("/add-to-group")
+async def add_nurses_to_group(
+    payload: AddToGroupRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    선택된 멤버를 현재 그룹에 근무자로 추가.
+    - nurses 테이블에 이미 존재 (다른 group_id): group_id만 변경
+    - nurses 테이블에 미존재: MSSQL 멤버 정보로 신규 생성
+    """
+    try:
+        if not current_user.is_head_nurse and not current_user.is_master_admin:
+            raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 접근 가능합니다.")
+
+        office_id = current_user.office_id
+        if not office_id:
+            raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
+
+        result = add_nurses_to_group_service(
+            payload.nurse_ids,
+            payload.group_id,
+            office_id,
+            db
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] add-to-group 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"근무자 추가 실패: {str(e)}")
 
 
 @router.get("/export-members")
@@ -690,3 +760,20 @@ async def verify_and_update_phone(
     del verification_cache[nurse_id]
 
     return {"message": "휴대폰 번호가 성공적으로 변경되었습니다"}
+
+
+@router.delete("/{nurse_id}")
+async def delete_nurse(
+    nurse_id: str,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    특정 간호사 삭제 API
+    - 프론트에서 휴지통 아이콘 클릭 시 호출
+    """
+    try:
+        result = delete_nurse_service(nurse_id, current_user, db)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")

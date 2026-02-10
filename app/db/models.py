@@ -1,15 +1,19 @@
-from sqlalchemy import Column, VARCHAR, SMALLINT, BOOLEAN, DATETIME, func, ForeignKey, JSON, CHAR, INTEGER, FLOAT, Index, ForeignKeyConstraint, UniqueConstraint
+from sqlalchemy import Column, VARCHAR, NVARCHAR, SMALLINT, BOOLEAN, DATETIME, func, ForeignKey, JSON, CHAR, INTEGER, FLOAT, Index, ForeignKeyConstraint, UniqueConstraint
 from sqlalchemy.dialects.mysql import TINYINT 
 from sqlalchemy.orm import relationship
 from db.client2 import Base
 from sqlalchemy import DATE, DECIMAL, TEXT, Time
+
 
 class Group(Base):
     __tablename__ = 'groups'
     group_id = Column(VARCHAR(50), primary_key=True)
     office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'))
     group_name = Column(VARCHAR(50), nullable=False)
-    # office = relationship("Office", back_populates="groups") 
+    hn_id = Column(JSON, nullable=True, default=list)  # 그룹 관리자 nurse_id 리스트
+    # office = relationship("Office", back_populates="groups")
+
+
 class Office(Base):
     __tablename__ = 'offices'
     office_id = Column(VARCHAR(50), primary_key=True)
@@ -17,6 +21,7 @@ class Office(Base):
     # address = Column(VARCHAR(255))
     # contact_number = Column(VARCHAR(30))
     # groups = relationship("Group", back_populates="office") 
+
 
 class Team(Base):
     __tablename__ = 'teams'
@@ -34,6 +39,8 @@ class Team(Base):
         Index('ux_teams_group_name', 'group_id', 'team_name', unique=True),
         UniqueConstraint('group_id', 'team_id', name='ux_teams_group_teamid'),
     )
+
+
 class Nurse(Base):
     __tablename__ = "nurses"
     # office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'), nullable=True)
@@ -71,11 +78,17 @@ class Nurse(Base):
     # 사이드 프로필 관련 추가 컬럼
     birth_date = Column(VARCHAR(10), nullable=True)
     phone_number = Column(VARCHAR(20), nullable=True)
-    gender = Column(VARCHAR(3), nullable=True)
+    gender = Column(NVARCHAR(3), nullable=True)
     is_weekend_off = Column(BOOLEAN, default=False)
     # 추가
     work_shifts = Column(JSON, nullable=True, default=list, server_default='[]')
-    
+    # 원티드 설정 (간호사별 개별 설정)
+    enable_nurse_pair_preference = Column(BOOLEAN, nullable=True, default=True)  # 시크릿 기능 활성화
+    enable_aide = Column(BOOLEAN, nullable=True, default=True)  # AIDE 기능 활성화
+    wanted_max_requests = Column(INTEGER, nullable=True)  # 원티드 요청 개수 제한 (휴무/휴가)
+    # 그룹 관리자(HN) 권한 구분 — 'HN' 또는 null
+    hn_auth = Column(VARCHAR(3), nullable=True)
+
     group = relationship("Group")
     __table_args__ = (
         ForeignKeyConstraint(['group_id', 'team_id'], ['teams.group_id', 'teams.team_id'], name='fk_nurses_team_group', ondelete='SET NULL', onupdate='CASCADE'),
@@ -84,6 +97,8 @@ class Nurse(Base):
     team = relationship("Team", primaryjoin="and_(Nurse.group_id==Team.group_id, Nurse.team_id==Team.team_id)", overlaps="group")
 
     # office_id는 컬럼으로 관리
+
+
 class Schedule(Base):
     __tablename__ = "schedules"
     schedule_id = Column(CHAR(12), primary_key=True)
@@ -105,6 +120,7 @@ class Schedule(Base):
 
     roster_config = relationship("RosterConfig")
 
+
 class ScheduleEntry(Base):
     __tablename__ = "schedule_entries"
     entry_id = Column(VARCHAR(16), primary_key=True)
@@ -112,6 +128,7 @@ class ScheduleEntry(Base):
     nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"))
     work_date = Column(DATETIME, nullable=False)
     shift_id = Column(VARCHAR(10), ForeignKey("shifts.shift_id")) # D, E, N, O, etc.
+
 
 class Shift(Base):
     __tablename__ = "shifts"
@@ -146,7 +163,6 @@ class Shift(Base):
     group = relationship("Group")
 
 
-
 # ───────────────────────────── Job Status ─────────────────────────────
 
 
@@ -168,6 +184,7 @@ class RosterJob(Base):
         Index("idx_roster_jobs_group_created", "group_id", "created_at"),
     )
 
+
 class ShiftManage(Base):
     __tablename__ = "shift_manage"
     # ── 복합 PRIMARY KEY ──────────────────────────────
@@ -183,6 +200,7 @@ class ShiftManage(Base):
     office = relationship("Office")
     group = relationship("Group")
 
+
 class ShiftPreference(Base):
     __tablename__ = "shift_preferences"
     nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), primary_key=True)
@@ -197,6 +215,7 @@ class ShiftPreference(Base):
     # __table_args__ = (
     #     Index('idx_nurse_year_month_created', 'nurse_id', 'year', 'month', 'created_at'),
     # )
+
 
 class RosterConfig(Base):
     __tablename__ = 'roster_config'
@@ -253,6 +272,7 @@ class RosterGradeConfig(Base):
         UniqueConstraint('office_id', 'group_id', name='ux_grade_config_office_group'),
     )
 
+
 class Wanted(Base):
     __tablename__ = 'wanted'
     group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), primary_key=True)
@@ -261,8 +281,35 @@ class Wanted(Base):
     exp_date = Column(DATETIME, nullable=True)  # 마감일
     status = Column(VARCHAR(10), default='requested')  # requested, closed
     created_at = Column(DATETIME, default=func.now())
-    
+
     group = relationship("Group")
+
+
+class WantedConfig(Base):
+    """일자별 원티드 제한 설정 (DAILY_LIMIT 전용)
+
+    - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
+    - 이 테이블은 특정 일자의 특정 근무타입에 대한 제한만 관리
+    """
+    __tablename__ = 'wanted_config'
+
+    config_id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    year = Column(SMALLINT, nullable=True)
+    month = Column(TINYINT, nullable=True)
+    max_requests = Column(INTEGER, nullable=True)  # 해당 일자의 최대 요청 개수
+    target_date = Column(DATE, nullable=True)  # 특정 일자
+    shift_type = Column(CHAR(1), nullable=True)  # 근무 타입 (휴무/휴가)
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    group = relationship("Group")
+
+    __table_args__ = (
+        Index('idx_wanted_config_daily', 'group_id', 'target_date', 'shift_type', unique=True),
+    )
+
 
 class IssuedRoster(Base):
     __tablename__ = 'issued_roster'
@@ -276,11 +323,12 @@ class IssuedRoster(Base):
     v_name = Column(VARCHAR(100), nullable=True)  # 버전 명
     issue_cmmt = Column(VARCHAR(500), nullable=True)  # 발행 코멘트
     schedule_id = Column(CHAR(12), ForeignKey('schedules.schedule_id'), nullable=False)
-    
+    is_active = Column(BOOLEAN, nullable=False, default=True)  # 발행 취소 시 False
+
     office = relationship("Office")
     group = relationship("Group")
     nurse = relationship("Nurse")
-    schedule = relationship("Schedule") 
+    schedule = relationship("Schedule")
 
 
 class IssuedRosterSnapshot(Base):
@@ -307,6 +355,7 @@ class IssuedRosterSnapshot(Base):
     office = relationship("Office")
     group = relationship("Group")
     schedule = relationship("Schedule")
+
 
 class RosterAnalytics(Base):
     __tablename__ = 'roster_analytics'
@@ -338,6 +387,7 @@ class RosterAnalytics(Base):
     # 관계 설정
     schedule = relationship("Schedule")
     nurse = relationship("Nurse")
+
 
 class RosterRequestDetails(Base):
     __tablename__ = 'roster_request_details'
@@ -390,10 +440,13 @@ class NursePairRequest(Base):
     __tablename__ = 'nurse_pair_requests'
     nurse_id = Column(VARCHAR(50), primary_key=True)
     request_id = Column(INTEGER, primary_key=True)
+    month = Column(CHAR(7), primary_key=True)  # 'YYYY-MM'
     detailed_request_id = Column(INTEGER, primary_key=True)
     target_id = Column(VARCHAR(50), primary_key=True)
     score = Column(DECIMAL(3, 1), nullable=False)
     partial_request = Column(TEXT, nullable=True)
+
+
 class DailyShift(Base):
     __tablename__ = 'daily_shift'
 
@@ -410,6 +463,37 @@ class DailyShift(Base):
 
     office = relationship("Office")
     group = relationship("Group")
+
+
+class DeletedNurseHistory(Base):
+    """간호사 삭제 이력 테이블 – 삭제된 간호사의 기초 정보와 삭제 수행자를 기록"""
+    __tablename__ = 'deleted_nurse_history'
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+
+    # 삭제된 간호사 기초 정보
+    target_nurse_id = Column(VARCHAR(50), nullable=False)
+    office_id = Column(VARCHAR(50), nullable=True)
+    group_id = Column(VARCHAR(50), nullable=True)
+    emp_num = Column(VARCHAR(50), nullable=True)
+    account_id = Column(VARCHAR(50), nullable=False)
+    name = Column(VARCHAR(50), nullable=False)
+    role = Column(VARCHAR(20), nullable=True)
+    experience = Column(SMALLINT, nullable=True)
+    is_head_nurse = Column(BOOLEAN, nullable=True)
+    joining_date = Column(DATETIME, nullable=True)
+    birth_date = Column(VARCHAR(10), nullable=True)
+    phone_number = Column(VARCHAR(20), nullable=True)
+    gender = Column(VARCHAR(3), nullable=True)
+
+    # 삭제 수행자 정보
+    deleted_by_nurse_id = Column(VARCHAR(50), nullable=False)
+    deleted_by_account_id = Column(VARCHAR(50), nullable=False)
+    deleted_by_name = Column(VARCHAR(50), nullable=True)
+    deleted_by_role = Column(VARCHAR(3), nullable=True)   # ADM / HDN
+
+    # 삭제 시각
+    deleted_at = Column(DATETIME, nullable=False, default=func.now())
 
 
 class WeeklyOffSetting(Base):
@@ -443,3 +527,33 @@ class WeeklyOffSetting(Base):
     office = relationship("Office")
     group = relationship("Group")
 
+
+# Fixed Wanted (확정 원티드)
+class FixedWantedEntry(Base):
+    """확정 원티드 테이블 - 수간호사가 조정/확정한 간호사별, 날짜별 근무 희망 (단일 테이블 구조)"""
+    __tablename__ = 'fixed_wanted_entries'
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    nurse_id = Column(VARCHAR(50), ForeignKey('nurses.nurse_id'), nullable=False)
+    shift_date = Column(DATE, nullable=False)
+    shift_id = Column(NVARCHAR(10), nullable=False)  # 근무코드 (D, E, N, O 등)
+    is_applied = Column(BOOLEAN, default=True)  # 적용/미적용 여부
+    source_type = Column(VARCHAR(20), nullable=False)  # 'original' | 'added' | 'modified'
+    original_shift_id = Column(NVARCHAR(10), nullable=True)  # 원본 근무코드 (수정된 경우)
+    reason = Column(TEXT, nullable=True)  # 사유 (원본에서 복사 또는 신규 입력)
+    head_nurse_memo = Column(TEXT, nullable=True)  # 수간호사 메모 (반려 사유, 조정 코멘트 등)
+    created_by = Column(VARCHAR(50), ForeignKey('nurses.nurse_id'), nullable=True)  # 생성자
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    group = relationship("Group")
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    creator = relationship("Nurse", foreign_keys=[created_by])
+
+    __table_args__ = (
+        Index('idx_fixed_entry_group_ym', 'group_id', 'year', 'month'),
+        Index('idx_fixed_entry_nurse_date', 'group_id', 'year', 'month', 'nurse_id', 'shift_date'),
+    )

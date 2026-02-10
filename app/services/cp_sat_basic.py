@@ -2016,6 +2016,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         continue
                     wd = (rs.target_month + timedelta(days=d)).weekday()
+                    
                     print(
                         f"[WeekendOff][HardDebug] X(n,d,off)==1 추가: "
                         f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "

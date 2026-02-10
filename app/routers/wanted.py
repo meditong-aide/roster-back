@@ -1,26 +1,60 @@
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
-from datetime import datetime
-from schemas.roster_schema import WantedInvokeRequest, WantedInvokeResponse, WantedDeadlineRequest
+from datetime import datetime, timedelta, timezone, date
+import uuid
+
+from schemas.roster_schema import (
+    WantedInvokeRequest,
+    WantedInvokeResponse,
+    WantedDeadlineRequest,
+    WantedConfigCreate,
+    WantedConfig as WantedConfigSchema,
+    FixedWantedCreate,
+    AdjustmentResponse,
+    FixedWantedListResponse,
+    FixedWantedEntryResponse,
+    ToggleEntryResponse,
+)
 from services.graph_service import graph_service
-from pydantic import BaseModel
 from routers.auth import get_current_user_from_cookie
 from db.client2 import get_db
-from db.models import Wanted, NurseShiftRequest
+from db.models import (
+    Wanted,
+    NurseShiftRequest,
+    WantedConfig,
+    Nurse,
+    ShiftPreference,
+    Group
+)
 from schemas.auth_schema import User as UserSchema
-from db.models import Nurse, ShiftPreference
-from services.wanted_service import request_wanted_shifts_service
-from services.wanted_service import invoke_and_persist_wanted_service
-from db.models import Group
-from datetime import datetime, timedelta, timezone
+from services.wanted_service import (
+    request_wanted_shifts_service,
+    invoke_and_persist_wanted_service,
+    get_wanted_config,
+    upsert_wanted_config,
+    delete_wanted_config,
+    validate_wanted_limits,
+    get_over_limit_nurses,
+    delete_excess_off_requests,
+    get_wanted_adjustment_service,
+    save_fixed_wanted_service,
+    toggle_fixed_wanted_entry_service,
+    get_fixed_wanted_for_roster_service,
+    get_fixed_wanted_entries_service,
+    reset_fixed_wanted_service,
+)
+
 router = APIRouter(
     prefix="/wanted",
     tags=["wanted"]
 )
+
 templates = Jinja2Templates(directory="app/templates")
+
 
 # [Wanted] - Wanted 작성 요청 생성 (수간호사용)
 @router.post("/request")
@@ -52,6 +86,7 @@ async def request_wanted_shifts(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Wanted 작성 요청 실패: {str(e)}")
+
 
 # [Wanted] - 특정 그룹의 Wanted 상태 조회
 @router.get("/status")
@@ -162,13 +197,6 @@ async def get_all_wanted(
     wanted_list = db.query(Wanted).filter(
         Wanted.group_id == current_user.group_id
     ).order_by(Wanted.year.desc(), Wanted.month.desc()).all()
-    # print([{
-    #     "year": wanted.year,
-    #     "month": wanted.month,
-    #     "status": wanted.status,
-    #     "exp_date": wanted.exp_date.isoformat() if wanted.exp_date else None,
-    #     "created_at": wanted.created_at.isoformat() if wanted.created_at else None
-    # } for wanted in wanted_list])
     return [{
         "year": wanted.year,
         "month": wanted.month,
@@ -176,6 +204,7 @@ async def get_all_wanted(
         "exp_date": wanted.exp_date.isoformat() if wanted.exp_date else None,
         "created_at": wanted.created_at.isoformat() if wanted.created_at else None
     } for wanted in wanted_list]
+
 
 # [Wanted] - Wanted 상태를 closed로 변경
 @router.patch("/close")
@@ -216,6 +245,7 @@ async def close_wanted_request(
     db.commit()
     
     return {"message": "Wanted 요청이 마감되었습니다."}
+
 
 # [Wanted] - Wanted 마감일 변경
 @router.patch("/deadline")
@@ -292,7 +322,6 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
         db.commit() # 한번 더 강제 commit
         
         print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
-        # return WantedInvokeResponse(response=result)
         return result
     except Exception as e:
         db.rollback()
@@ -302,7 +331,7 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
     finally:
         pass
 
-    
+
 def parse_shift_results(
     response: List[List[Dict[str, Any]]]
 ) -> Dict[str, Dict[int, float]]:
@@ -355,6 +384,7 @@ def parse_shift_results(
                     bucket[d] = float(s)
 
     return parsed
+
 
 def parse_preferences(
     response: List[List[Dict[str, Any]]],
@@ -412,20 +442,12 @@ def parse_preferences(
     return parsed
 
 
+# [Wanted] - 만료된 Wanted 자동 마감 처리
 @router.post("/close-expired")
 def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     현재 KST 기준으로 exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경하는 엔드포인트입니다.
-
-    인자:
-        db: FastAPI DI로 주입되는 DB 세션 객체.
-
-    반환:
-        dict: {"now_kst": "...", "updated": n} 형태의 결과를 반환합니다.
-              예: now_kst="2025-01-01T00:00:00", updated=3 이면
-              2025-01-01 00:00 (KST) 기준으로 3건의 Wanted가 'closed'로 변경된 것입니다.
     """
-    # UTC 기준 현재 시각을 구한 뒤 +9시간을 더해 KST 현재 시각을 계산합니다.
     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
     now_kst = (utc_now + timedelta(hours=9)).replace(tzinfo=None)
 
@@ -457,3 +479,443 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
         raise
 
     return {"now_kst": now_kst.isoformat(), "updated": updated_count}
+
+
+# WantedConfig 관련 엔드포인트
+@router.get("/config")
+async def get_wanted_config_endpoint(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    target_date: Optional[str] = None,
+    shift_type: Optional[str] = None,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    일자별 원티드 제한 설정 조회
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_master_admin', False) and group_id:
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+    elif current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        raise HTTPException(status_code=400, detail="소속 그룹이 없습니다. group_id를 지정해주세요.")
+
+    # 필터 구성
+    filters = {}
+    if year and month:
+        filters['year'] = year
+        filters['month'] = month
+    if target_date:
+        filters['target_date'] = target_date
+    if shift_type:
+        filters['shift_type'] = shift_type
+
+    try:
+        result = get_wanted_config(db, target_group_id, filters)
+        return [WantedConfigSchema.model_validate(r) for r in result]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")
+
+
+@router.post("/config")
+async def upsert_wanted_config_endpoint(
+    config_data: List[WantedConfigCreate],
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    일자별 원티드 제한 설정 생성/수정
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 권한 확인 (수간호사 또는 관리자만)
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        configs_list = [c.model_dump(exclude_unset=True) for c in config_data]
+        results = upsert_wanted_config(db, target_group_id, configs_list)
+        return [WantedConfigSchema.model_validate(r) for r in results]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 저장 실패: {str(e)}")
+
+
+@router.delete("/config")
+async def delete_wanted_config_endpoint(
+    target_date: Optional[str] = None,
+    shift_type: Optional[str] = None,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    일자별 원티드 제한 설정 삭제
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 권한 확인 (수간호사 또는 관리자만)
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    # 필터 구성
+    filters = {}
+    if target_date:
+        filters['target_date'] = target_date
+    if shift_type:
+        filters['shift_type'] = shift_type
+
+    try:
+        deleted_count = delete_wanted_config(db, target_group_id, filters)
+        return {
+            "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
+
+
+@router.post("/validate-limits")
+async def validate_wanted_limits_endpoint(
+    nurse_id: str,
+    year: int,
+    month: int,
+    shift_date_str: str,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    원티드 요청 제한 검증
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        # 문자열 날짜를 date 객체로 변환
+        shift_date = datetime.strptime(shift_date_str, '%Y-%m-%d').date()
+
+        result = validate_wanted_limits(db, nurse_id, target_group_id, year, month, shift_date)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"날짜 형식 오류: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
+
+
+# 간호사 원티드 개수 제한 초과분인 경우에 대한 조회 및 무조건적인 삭제 기능 서비스 함수
+@router.get("/over-limit-nurses")
+async def get_over_limit_nurses_api(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    # 관리자 권한 체크
+    if not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise HTTPException(403, "권한이 없습니다.")
+
+    result = get_over_limit_nurses(db, year, month, group_id)
+    return {"data": result, "count": len(result)}
+
+
+@router.post("/delete-excess-off/{nurse_id}")
+async def delete_excess_off_api(
+    nurse_id: str,
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_master_admin:
+        pass
+    elif current_user.is_head_nurse and current_user.group_id:
+        target_nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+        if not target_nurse or target_nurse.group_id != current_user.group_id:
+            raise HTTPException(403, "현재 속한 병동 내 간호사가 아닙니다.")
+    else:
+        raise HTTPException(403, "권한이 없습니다.")
+
+    result = delete_excess_off_requests(db, nurse_id, year, month)
+    return result
+
+
+# Fixed Wanted 관련 엔드포인트
+@router.get("/adjustment/{year}/{month}", response_model=AdjustmentResponse)
+async def get_wanted_adjustment(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    원티드 조정판 데이터 조회 API
+    - 기존 근무표 만들기와 동일한 구성
+    - 각 간호사의 원티드 제출한 코드 내역들의 한달치 총 합 실시간 노출
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        result = get_wanted_adjustment_service(db, target_group_id, year, month)
+        return JSONResponse(
+            content=jsonable_encoder(result),
+            media_type="application/json; charset=utf-8"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"원티드 조정판 조회 실패: {str(e)}")
+
+
+@router.post("/adjustment", response_model=FixedWantedListResponse)
+async def save_fixed_wanted(
+    req: FixedWantedCreate,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    확정 원티드 저장 API (단일 테이블 구조)
+    - 원티드 조정판에서 수정 후 저장하기 클릭시 호출
+    - fixed_wanted_entries 테이블에 저장
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        entries = save_fixed_wanted_service(db, target_group_id, current_user.nurse_id, req)
+        return FixedWantedListResponse(
+            group_id=target_group_id,
+            year=req.year,
+            month=req.month,
+            entries=[
+                FixedWantedEntryResponse(
+                    id=e.id,
+                    group_id=e.group_id,
+                    year=e.year,
+                    month=e.month,
+                    nurse_id=e.nurse_id,
+                    shift_date=e.shift_date,
+                    shift_id=e.shift_id,
+                    is_applied=e.is_applied,
+                    source_type=e.source_type,
+                    original_shift_id=e.original_shift_id,
+                    reason=e.reason,
+                    head_nurse_memo=e.head_nurse_memo,
+                    created_by=e.created_by,
+                ) for e in entries
+            ],
+            total_count=len(entries),
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"확정 원티드 저장 실패: {str(e)}")
+
+
+@router.patch("/adjustment/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
+async def toggle_fixed_wanted_entry(
+    entry_id: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    확정 원티드 개별 항목 적용/미적용 토글 API
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    try:
+        entry = toggle_fixed_wanted_entry_service(db, entry_id)
+        return ToggleEntryResponse(
+            id=entry.id,
+            is_applied=entry.is_applied,
+            message=f"항목이 {'적용' if entry.is_applied else '미적용'}으로 변경되었습니다."
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"토글 실패: {str(e)}")
+
+
+@router.post("/adjustment/{year}/{month}/reset", response_model=AdjustmentResponse)
+async def reset_fixed_wanted(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    확정 원티드 재설정 API
+    - FixedWantedEntry 해당 월 데이터 전체 삭제
+    - 원본 WantedRequest + NurseShiftRequest 기반 데이터로 복원하여 반환
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        result = reset_fixed_wanted_service(db, target_group_id, year, month)
+        return result
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
+
+
+@router.get("/fixed/{year}/{month}")
+async def get_fixed_wanted(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    확정 원티드 조회 API (근무표 생성) - 단일 테이블 구조
+    - is_applied=True인 항목만 반환
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        # 엔트리 목록 조회 (단일 테이블)
+        all_entries = get_fixed_wanted_entries_service(db, target_group_id, year, month)
+        if not all_entries:
+            return {"exists": False, "entries": [], "total_count": 0}
+
+        # 근무표 생성용 형식으로 변환 (is_applied=True만)
+        entries = get_fixed_wanted_for_roster_service(db, target_group_id, year, month)
+
+        # 첫 번째 엔트리에서 메타 정보 추출
+        first_entry = all_entries[0] if all_entries else None
+        return {
+            "exists": True,
+            "group_id": target_group_id,
+            "year": year,
+            "month": month,
+            "created_at": first_entry.created_at.isoformat() if first_entry and first_entry.created_at else None,
+            "updated_at": first_entry.updated_at.isoformat() if first_entry and first_entry.updated_at else None,
+            "entries": entries,
+            "total_count": len(all_entries),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"확정 원티드 조회 실패: {str(e)}")
