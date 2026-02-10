@@ -24,7 +24,9 @@ from services.wanted_service import (
     get_wanted_config,
     upsert_wanted_config,
     delete_wanted_config,
-    validate_wanted_limits
+    validate_wanted_limits,
+    get_over_limit_nurses,
+    delete_excess_off_requests,
 )
 router = APIRouter(
     prefix="/wanted",
@@ -645,3 +647,41 @@ async def validate_wanted_limits_endpoint(
         raise HTTPException(status_code=400, detail=f"날짜 형식 오류: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
+
+
+# 간호사 원티드 개수 제한 초과분인 경우에 대한 조회 및 무조건적인 삭제 기능 서비스 함수
+@router.get("/over-limit-nurses")
+async def get_over_limit_nurses_api(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    # 관리자 권한 체크
+    if not (current_user.is_head_nurse or current_user.is_master_admin):
+        raise HTTPException(403, "권한이 없습니다.")
+
+    result = get_over_limit_nurses(db, year, month, group_id)
+    return {"data": result, "count": len(result)}
+
+
+@router.post("/delete-excess-off/{nurse_id}")
+async def delete_excess_off_api(
+    nurse_id: str,
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_master_admin:
+        pass
+    elif current_user.is_head_nurse and current_user.group_id:
+        target_nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+        if not target_nurse or target_nurse.group_id != current_user.group_id:
+            raise HTTPException(403, "현재 속한 병동 내 간호사가 아닙니다.")
+    else:
+        raise HTTPException(403, "권한이 없습니다.")
+
+    result = delete_excess_off_requests(db, nurse_id, year, month)
+    return result

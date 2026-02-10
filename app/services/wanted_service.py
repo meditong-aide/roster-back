@@ -1466,3 +1466,140 @@ def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int,
         "daily_limit": daily_limit,
         "daily_current": daily_current
     }
+
+
+# 간호사 원티드 개수 제한 초과분인 경우에 대한 조회 및 무조건적인 삭제 기능 서비스 함수
+def get_over_limit_nurses(
+    db: Session,
+    year: int,
+    month: int,
+    group_id: str | None = None
+) -> List[dict]:
+    """
+    wanted_max_requests 보다 많은 휴무/휴가 요청을 사전에 제출한 간호사 목록 반환
+    """
+    month_str = f"{year}-{month:02d}"
+    start_date = date(year, month, 1)
+    end_date = date(year + 1, 1, 1) if month == 12 else date(year, month +1, 1)
+    
+    off_shift_ids = _get_off_shift_ids(db, group_id) if group_id else []
+    
+    query = (
+        db.query(
+            Nurse.nurse_id,
+            Nurse.name,
+            Nurse.wanted_max_requests,
+            func.count(NurseShiftRequest.detailed_request_id).label("current_count")
+        )
+        .join(WantedRequest, WantedRequest.nurse_id == Nurse.nurse_id)
+        .join(NurseShiftRequest,
+              (NurseShiftRequest.nurse_id == WantedRequest.nurse_id) &
+              (NurseShiftRequest.request_id == WantedRequest.request_id))
+        .filter(
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True,
+            NurseShiftRequest.shift_date >= start_date,
+            NurseShiftRequest.shift_date < end_date,
+            NurseShiftRequest.shift.in_(off_shift_ids),
+            Nurse.wanted_max_requests.isnot(None)
+        )
+    )
+    
+    if group_id:
+        query = query.filter(Nurse.group_id == group_id)
+        
+    results = (
+        query.group_by(
+            Nurse.nurse_id, Nurse.name, Nurse.wanted_max_requests
+        )
+        .having(func.count(NurseShiftRequest.detailed_request_id) > Nurse.wanted_max_requests)
+        .all()
+    )
+    
+    return [
+        {
+            "nurse_id": r.nurse_id,
+            "name": r.name,
+            "wanted_max_requests": r.wanted_max_requests,
+            "current_count": r.current_count,
+            "excess_count": r.current_count - r.wanted_max_requests,
+            "month": month_str
+        }
+        for r in results
+    ]
+
+
+def delete_excess_off_requests(
+    db: Session,
+    nurse_id: str,
+    year: int,
+    month: int,
+    force_delet: bool = False
+) -> dict:
+    """
+    해당 간호사의 초과된 휴무/휴가 요청삭제
+    - score 기준 낮은 순으로 삭제
+    """
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    if not nurse or nurse.wanted_max_requests is None:
+        return {"deleted" : 0, "message" : "제한값이 설정되지 않았습니다."}
+    
+    month_str = f"{year}-{month:02d}"
+    off_shift_ids = _get_off_shift_ids(db, nurse.group_id)
+    
+    latest_request = (
+        db.query(WantedRequest).filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True
+        )
+        .order_by(WantedRequest.request_id.desc())
+        .first()
+    )
+    
+    if not latest_request:
+        return {"deleted" : 0, "message" : "제출된 요청이 없습니다."}
+    
+    current_count = db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id == nurse_id,
+        NurseShiftRequest.request_id == latest_request.request_id,
+        NurseShiftRequest.shift.in_(off_shift_ids)
+    ).count()
+    
+    if current_count <= nurse.wanted_max_requests:
+        return {"deleted" : 0, "message" : "초과된 요청이 없습니다."}
+    
+    excess = current_count - nurse.wanted_max_requests
+    
+    to_delete = (
+        db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.request_id == latest_request.request_id,
+            NurseShiftRequest.shift.in_(off_shift_ids)
+        )
+        .order_by(NurseShiftRequest.shift_date.desc())
+        .limit(excess)
+        .all()
+    )
+    
+    deleted_count = 0
+    deleted_dates = []
+    
+    for row in to_delete:
+        deleted_dates.append({
+            "date": row.shift_date.strftime("%Y-%m-%d"),
+            "shift": row.shift,
+            "score": float(row.score)
+        })
+        db.delete(row)
+        deleted_count += 1
+        
+    db.commit()
+    
+    return {
+        "deleted": deleted_count,
+        "excess": excess,
+        "remaining": nurse.wanted_max_requests,
+        "deleted_items": deleted_dates,
+        "request_id": latest_request.request_id
+    }
