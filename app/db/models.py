@@ -10,7 +10,8 @@ class Group(Base):
     group_id = Column(VARCHAR(50), primary_key=True)
     office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'))
     group_name = Column(VARCHAR(50), nullable=False)
-    # office = relationship("Office", back_populates="groups") 
+    hn_id = Column(JSON, nullable=True, default=list)  # 그룹 관리자 nurse_id 리스트
+    # office = relationship("Office", back_populates="groups")
 
 
 class Office(Base):
@@ -85,6 +86,8 @@ class Nurse(Base):
     enable_nurse_pair_preference = Column(BOOLEAN, nullable=True, default=True)  # 시크릿 기능 활성화
     enable_aide = Column(BOOLEAN, nullable=True, default=True)  # AIDE 기능 활성화
     wanted_max_requests = Column(INTEGER, nullable=True)  # 원티드 요청 개수 제한 (휴무/휴가)
+    # 그룹 관리자(HN) 권한 구분 — 'HN' 또는 null
+    hn_auth = Column(VARCHAR(3), nullable=True)
 
     group = relationship("Group")
     __table_args__ = (
