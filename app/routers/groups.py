@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from typing import List
 import uuid
 
@@ -223,6 +224,7 @@ async def update_hn_admin(
                 current_hn_ids.remove(target_nurse_id)
 
         group.hn_id = current_hn_ids
+        flag_modified(group, "hn_id")
 
     # 간호사의 hn_auth 업데이트
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == target_nurse_id).first()
