@@ -55,6 +55,7 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
             "account_id": getattr(nurse, "account_id", None),
             "is_head_nurse": bool(getattr(nurse, "is_head_nurse", False)),
             "group_id": getattr(nurse, "group_id", None),
+            "hn_auth": getattr(nurse, "hn_auth", None),
         }
         # group_id 기준으로 groups 테이블에서 group_name 조회
         if result["group_id"]:
@@ -190,6 +191,7 @@ async def login_for_access_token(
         mb_part_name = extra_data.get("group_name") or mb_part_name
         if "is_head_nurse" in extra_data:
             is_head_nurse = extra_data["is_head_nurse"]
+        hn_auth = extra_data.get("hn_auth")  # 그룹 관리자 권한
 
         access_token = create_login_token(
             data={
@@ -208,6 +210,7 @@ async def login_for_access_token(
                 "gw_useYN": gw_useYN,
                 "qpis_useYN": qpis_useYN,
                 "official_title_name": official_title_name,  # 추가 필드
+                "hn_auth": hn_auth,  # 그룹 관리자 권한
                 # 일단은 토큰에는 추가 안함
                 # "is_nurse_registered": is_nurse_registered,
             },
@@ -237,7 +240,8 @@ async def login_for_access_token(
             qpis_useYN=qpis_useYN,
             official_title_name=official_title_name,  # 추가 필드
             # 추가 필드
-            is_nurse_registered=is_nurse_registered
+            is_nurse_registered=is_nurse_registered,
+            hn_auth=hn_auth,  # 그룹 관리자 권한
         )
     except HTTPException:
         raise
@@ -287,13 +291,14 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         gw_useYN: str = payload.get("gw_useYN")
         qpis_useYN: str = payload.get("qpis_useYN")
         official_title_name: str = payload.get("official_title_name")  # 추가 필드
+        hn_auth: str = payload.get("hn_auth")  # 그룹 관리자 권한
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
-    
+
     except JWTError:
         return None # If token is invalid, treat as not logged in
-    
+
 
     return UserSchema(
         nurse_id= nurse_id,
@@ -311,6 +316,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         gw_useYN = gw_useYN,
         qpis_useYN = qpis_useYN,
         official_title_name=official_title_name,  # 추가 필드
+        hn_auth=hn_auth,  # 그룹 관리자 권한
     )
 
 @router.get("/me", response_model=UserSchema)
@@ -323,6 +329,95 @@ async def read_users_me(current_user: UserSchema = Depends(get_current_user_from
         )
         
     return current_user
+
+
+@router.post("/switch-group")
+async def switch_group(
+    payload: dict,
+    response: Response,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    HN(그룹 관리자) 사용자가 다른 그룹으로 전환 시 새 JWT 발행.
+    - 해당 그룹의 hn_id에 현재 사용자의 nurse_id가 포함되어 있거나
+    - 자신의 원래 그룹이거나
+    - ADM인 경우 허용
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+    target_group_id = (payload or {}).get("target_group_id")
+    if not target_group_id:
+        raise HTTPException(status_code=400, detail="target_group_id가 필요합니다.")
+
+    # 대상 그룹 조회 (같은 office 내)
+    target_group = (
+        db.query(Group)
+        .filter(Group.group_id == target_group_id, Group.office_id == current_user.office_id)
+        .first()
+    )
+    if not target_group:
+        raise HTTPException(status_code=404, detail="해당 그룹을 찾을 수 없습니다.")
+
+    # 권한 검증: ADM / 자기 그룹 / hn_id에 포함
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+    is_own_group = nurse and nurse.group_id == target_group_id
+    is_in_hn_list = current_user.nurse_id in (target_group.hn_id or [])
+
+    if not (current_user.is_master_admin or is_own_group or is_in_hn_list):
+        raise HTTPException(status_code=403, detail="해당 그룹에 대한 접근 권한이 없습니다.")
+
+    # 대상 그룹의 mb_part 조회: T_Team 테이블에서 group_name + office_id로 직접 조회
+    target_mb_part = current_user.mb_part
+    target_mb_part_name = target_group.group_name
+    try:
+        team_rows = msdb_manager.fetch_all(
+            Member.team_by_name_and_office(),
+            params=(current_user.office_id, target_group.group_name)
+        )
+        if team_rows:
+            target_mb_part = team_rows[0].get('mb_part', current_user.mb_part)
+            target_mb_part_name = team_rows[0].get('mb_partName', target_group.group_name)
+    except Exception:
+        pass  # MSSQL 조회 실패 시 기본값 유지
+
+    # 새 JWT 발행 (group_id, mb_part, mb_part_name 변경)
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_login_token(
+        data={
+            "office_id": current_user.office_id,
+            "EmpSeqNo": current_user.EmpSeqNo,
+            "account_id": current_user.account_id,
+            "EmpAuthGbn": current_user.EmpAuthGbn,
+            "is_master_admin": current_user.is_master_admin,
+            "nurse_id": current_user.nurse_id,
+            "group_id": target_group_id,
+            "is_head_nurse": current_user.is_head_nurse,
+            "name": current_user.name,
+            "mb_part": target_mb_part,
+            "office_name": current_user.office_name,
+            "mb_part_name": target_mb_part_name,
+            "gw_useYN": current_user.gw_useYN,
+            "qpis_useYN": current_user.qpis_useYN,
+            "official_title_name": current_user.official_title_name,
+            "hn_auth": current_user.hn_auth,  # 그룹 관리자 권한 유지
+        },
+        expires_delta=access_token_expires,
+    )
+
+    response.set_cookie(
+        key="access_token",
+        value=f"Bearer {access_token}",
+        httponly=True,
+        samesite="lax"
+    )
+
+    return {
+        "message": "그룹이 전환되었습니다.",
+        "group_id": target_group_id,
+        "group_name": target_group.group_name,
+    }
 
 
 @router.post("/find_id")

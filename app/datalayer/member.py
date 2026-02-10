@@ -148,6 +148,14 @@ class Member:
 
         return _queryString
 
+    def team_by_name_and_office():
+        _queryString = """
+        SELECT mb_part, name AS mb_partName
+          FROM bizwiz20db.T_Team
+         WHERE OfficeCode = %s AND name = %s
+        """
+        return _queryString
+
     def member_accounts_by_office():
         _queryString = """
         SELECT 
