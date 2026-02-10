@@ -1281,11 +1281,16 @@ def _merge_fixed_cells_with_weekly_off(
 def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: int) -> str | None:
     """이전 달의 최종(issued 우선) schedule_id를 조회한다."""
     py, pm = _get_prev_year_month(year, month)
-    # 1) IssuedRoster 우선
+    # 1) IssuedRoster 우선 (is_active=True인 것만)
     issued = (
         db.query(IssuedRoster)
         .join(Schedule, IssuedRoster.schedule_id == Schedule.schedule_id)
-        .filter(Schedule.group_id == group_id, Schedule.year == py, Schedule.month == pm)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == py,
+            Schedule.month == pm,
+            IssuedRoster.is_active == True
+        )
         .order_by(IssuedRoster.issued_at.desc())
         .first()
     )
