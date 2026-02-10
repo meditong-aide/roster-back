@@ -368,7 +368,21 @@ async def switch_group(
     if not (current_user.is_master_admin or is_own_group or is_in_hn_list):
         raise HTTPException(status_code=403, detail="해당 그룹에 대한 접근 권한이 없습니다.")
 
-    # 새 JWT 발행 (group_id, mb_part_name만 변경)
+    # 대상 그룹의 mb_part 조회: T_Team 테이블에서 group_name + office_id로 직접 조회
+    target_mb_part = current_user.mb_part
+    target_mb_part_name = target_group.group_name
+    try:
+        team_rows = msdb_manager.fetch_all(
+            Member.team_by_name_and_office(),
+            params=(current_user.office_id, target_group.group_name)
+        )
+        if team_rows:
+            target_mb_part = team_rows[0].get('mb_part', current_user.mb_part)
+            target_mb_part_name = team_rows[0].get('mb_partName', target_group.group_name)
+    except Exception:
+        pass  # MSSQL 조회 실패 시 기본값 유지
+
+    # 새 JWT 발행 (group_id, mb_part, mb_part_name 변경)
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_login_token(
         data={
@@ -381,9 +395,9 @@ async def switch_group(
             "group_id": target_group_id,
             "is_head_nurse": current_user.is_head_nurse,
             "name": current_user.name,
-            "mb_part": current_user.mb_part,
+            "mb_part": target_mb_part,
             "office_name": current_user.office_name,
-            "mb_part_name": target_group.group_name,
+            "mb_part_name": target_mb_part_name,
             "gw_useYN": current_user.gw_useYN,
             "qpis_useYN": current_user.qpis_useYN,
             "official_title_name": current_user.official_title_name,
