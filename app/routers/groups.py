@@ -226,14 +226,16 @@ async def update_hn_admin(
         group.hn_id = current_hn_ids
         flag_modified(group, "hn_id")
 
-    # 간호사의 hn_auth 업데이트
+    # 간호사의 hn_auth + is_head_nurse 업데이트
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == target_nurse_id).first()
     if nurse:
         if len(target_group_ids) > 0:
             nurse.hn_auth = 'HN'
+            nurse.is_head_nurse = True
         else:
             # 그룹 관리자 해제 시 hn_auth를 null로 복원 + 모든 그룹 hn_id에서 제거
             nurse.hn_auth = None
+            nurse.is_head_nurse = False
 
     db.commit()
 
