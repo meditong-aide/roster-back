@@ -18,6 +18,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
 )
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
+from services.cp_sat.night_distribution_log import log_n_even_distribution
 
 
 def _cp_sat_status_to_text(status: int) -> str:
@@ -1517,6 +1518,7 @@ def optimize_fallback_lex_hard_first(
             for s in range(S):
                 if s3.Value(X3(n, d, s)):
                     roster_system.roster[n, d, s] = 1
+    log_n_even_distribution(roster_system, logger_prefix, join=join, leave=leave)
     try:
         print(f"{logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
         before_viol = len(roster_system._find_violations())

@@ -10,6 +10,7 @@ from services.cp_sat.hardcoded_weights import (
     N_ONLY_NIGHT_BONUS,
     PREFERENCE_SCORE_SCALE,
 )
+from services.cp_sat.objective_terms import _n_forbid_n_set
 
 
 def build_fallback_stage3_objective_terms(
@@ -261,7 +262,7 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
-    # 야간 균등화(편차 패널티)
+    # 야간 균등화(편차 패널티) - N 전일 금지 간호사는 대상에서 제외
     try:
         if bool(getattr(cfg, "even_nights", False)):
             night_idx = cfg.shift_types.index("N")
@@ -276,7 +277,9 @@ def build_fallback_stage3_objective_terms(
                     is_n_only = True
                 if not is_n_only:
                     normals.append(i)
-            if normals:
+            n_forbid_n = _n_forbid_n_set(roster_system, join, leave)
+            normals_can_n = [n for n in normals if n not in n_forbid_n]
+            if normals_can_n:
                 if (
                     hasattr(cfg, "daily_shift_requirements_by_day")
                     and isinstance(cfg.daily_shift_requirements_by_day, list)
@@ -295,8 +298,14 @@ def build_fallback_stage3_objective_terms(
                     total_need_n += need
 
                 if total_need_n > 0:
-                    target = total_need_n // len(normals)
-                    for n in normals:
+                    target = total_need_n // len(normals_can_n)
+                    print(
+                        f"{logger_prefix} [N균등] even_nights 적용(폴백 Stage3): "
+                        f"normals_can_N={len(normals_can_n)}, n_forbid_N={len(n_forbid_n)}, "
+                        f"target_N_per_nurse={target}, total_need_n={total_need_n}, "
+                        f"penalty_weight={NIGHT_DEVIATION_PENALTY}"
+                    )
+                    for n in normals_can_n:
                         tot_nights = sum(
                             X(n, d, night_idx) for d in range(join[n], leave[n] + 1)
                         )
@@ -309,7 +318,13 @@ def build_fallback_stage3_objective_terms(
                                 -NIGHT_DEVIATION_PENALTY * dev_neg,
                             ]
                         )
-                    print(8)
+                else:
+                    print(f"{logger_prefix} [N균등] even_nights 켜짐 but total_need_n=0 → 패널티 미적용")
+            else:
+                print(
+                    f"{logger_prefix} [N균등] even_nights 켜짐 but "
+                    "normals_can_N(비야간전담·N가능)=0 → 스킵"
+                )
     except Exception as exc:
         print(f"{logger_prefix} [WARN] even_nights penalty 적용 실패: {exc}")
 

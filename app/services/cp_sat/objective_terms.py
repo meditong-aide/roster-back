@@ -20,6 +20,26 @@ from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
 
 
+def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
+    """N 전일 금지 간호사 인덱스 집합. initial_forbidden에서 모든 근무일에 N이 금지된 n만 반환."""
+    n_forbid_n: set[int] = set()
+    initial_forbidden = getattr(rs, "initial_forbidden", None)
+    if not isinstance(initial_forbidden, dict):
+        return n_forbid_n
+    for n in range(len(rs.nurses)):
+        t0, t1 = join[n], leave[n]
+        if t0 > t1:
+            continue
+        n_days = t1 - t0 + 1
+        forbid_cnt = sum(
+            1 for d in range(t0, t1 + 1)
+            if "N" in initial_forbidden.get((n, d), set())
+        )
+        if forbid_cnt == n_days:
+            n_forbid_n.add(n)
+    return n_forbid_n
+
+
 def build_main_objective_terms(
     *,
     m: cp_model.CpModel,
@@ -159,7 +179,7 @@ def build_main_objective_terms(
                 m.Add(slack >= 2 - offs)
                 obj.append(-WEEK_OFF_SHORT_PENALTY * slack)
 
-    # (4-3) 야간 균등 (편차에 선형 패널티) - fallback과 동일 방식
+    # (4-3) 야간 균등 (편차에 선형 패널티) - N 전일 금지 간호사는 대상에서 제외
     if getattr(cfg, "even_nights", False):
         normals: list[int] = []
         for i, nu in enumerate(rs.nurses):
@@ -172,7 +192,9 @@ def build_main_objective_terms(
                 is_n_only = True
             if not is_n_only:
                 normals.append(i)
-        if normals:
+        n_forbid_n = _n_forbid_n_set(rs, join, leave)
+        normals_can_n = [n for n in normals if n not in n_forbid_n]
+        if normals_can_n:
             if (
                 hasattr(cfg, "daily_shift_requirements_by_day")
                 and isinstance(cfg.daily_shift_requirements_by_day, list)
@@ -191,8 +213,14 @@ def build_main_objective_terms(
                 need = max(0, daily_need_n[d] - int(fc[d][night] if d < len(fc) else 0))
                 total_need_n += need
             if total_need_n > 0:
-                target = total_need_n // len(normals)
-                for n in normals:
+                target = total_need_n // len(normals_can_n)
+                print(
+                    "[objective_terms] [N균등] even_nights 적용(메인): "
+                    f"normals_can_N={len(normals_can_n)}, n_forbid_N={len(n_forbid_n)}, "
+                    f"target_N_per_nurse={target}, total_need_n={total_need_n}, "
+                    f"penalty_weight={NIGHT_DEVIATION_PENALTY}"
+                )
+                for n in normals_can_n:
                     tot_nights = sum(
                         X(n, d, night) for d in range(join[n], leave[n] + 1)
                     )
@@ -205,6 +233,13 @@ def build_main_objective_terms(
                             -NIGHT_DEVIATION_PENALTY * dev_neg,
                         ]
                     )
+            else:
+                print("[objective_terms] [N균등] even_nights 켜짐 but total_need_n=0 → 패널티 미적용")
+        else:
+            print(
+                "[objective_terms] [N균등] even_nights 켜짐 but "
+                "normals_can_N(비야간전담·N가능)=0 → 스킵"
+            )
 
     # (4-4) N-O-D/E 패턴
     if getattr(cfg, "nod_noe", True):

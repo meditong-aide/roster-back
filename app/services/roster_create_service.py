@@ -2477,7 +2477,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     _inject_special_work_code(config_dict, has_special_working)
     # OFF 상한/패널티 기본값 보정 (None 방지)
     if config_dict.get("max_extra_off_days") is None:
-        config_dict["max_extra_off_days"] = 3
+        config_dict["max_extra_off_days"] = 1
     if config_dict.get("extra_off_penalty_weight") is None:
         config_dict["extra_off_penalty_weight"] = 80
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──
