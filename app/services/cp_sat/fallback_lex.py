@@ -934,7 +934,9 @@ def optimize_fallback_lex_hard_first(
                 #     safety.setdefault("trans_dn", []).append(b_dn)
 
         # 1N 금지
-        if bool(getattr(cfg, "not_one_night", False)):
+        not_one_night_val = getattr(cfg, "not_one_night", False)
+        print(f"{logger_prefix} [1N금지] not_one_night={not_one_night_val!r} (type={type(not_one_night_val).__name__})")
+        if bool(not_one_night_val):
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
@@ -998,9 +1000,8 @@ def optimize_fallback_lex_hard_first(
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
                 exc = m.NewIntVar(0, L + 1, f"cnight_exc_{n}_{d0}")
                 m.Add(exc >= sum_n - L)
-                # three_seq_nig가 켜져 있으면 연속 N은 하드로 L개를 넘지 못하도록 한다.
-                if bool(getattr(cfg, "three_seq_nig", True)):
-                    m.Add(sum_n <= L)
+                # 연속 N 상한 L 하드: three_seq_nig False면 L=2(3N 금지), True면 L=3(3N 허용)
+                m.Add(sum_n <= L)
                 safety["cnight_excess"].append(exc)
 
         # 월 Night 상한 초과량
@@ -1009,17 +1010,32 @@ def optimize_fallback_lex_hard_first(
             sum_m = sum(X(n, d, night_idx) for d in range(T0, T1 + 1))
             m.Add(sum_m <= cfg.max_night_shifts_per_month)
 
-        # 야간전담의 D/E 금지 위반(OR: D or E)
+        # N 전담: D/E 하드 금지 (메인 모델과 동일)
         for n, nu in enumerate(roster_system.nurses):
-            if nu.is_night_nurse != 0:
-                continue
-            T0, T1 = join[n], leave[n]
-            for d in range(T0, T1 + 1):
-                v = m.NewIntVar(0, 1, f"nonly_de_{n}_{d}")
-                m.Add(v >= X(n, d, day_idx))
-                m.Add(v >= X(n, d, eve_idx))
-                m.Add(v <= X(n, d, day_idx) + X(n, d, eve_idx))
-                safety["night_only_de"].append(v)
+            raw = getattr(nu, "is_night_nurse", None)
+            is_n_only = False
+            if isinstance(raw, list):
+                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                is_n_only = allowed == {"N"}
+            elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
+                is_n_only = True
+            if is_n_only:
+                T0, T1 = join[n], leave[n]
+                for d in range(T0, T1 + 1):
+                    m.Add(X(n, d, day_idx) == 0)
+                    m.Add(X(n, d, eve_idx) == 0)
+
+        # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
+        # for n, nu in enumerate(roster_system.nurses):
+        #     if nu.is_night_nurse != 0:
+        #         continue
+        #     T0, T1 = join[n], leave[n]
+        #     for d in range(T0, T1 + 1):
+        #         v = m.NewIntVar(0, 1, f"nonly_de_{n}_{d}")
+        #         m.Add(v >= X(n, d, day_idx))
+        #         m.Add(v >= X(n, d, eve_idx))
+        #         m.Add(v <= X(n, d, day_idx) + X(n, d, eve_idx))
+        #         safety["night_only_de"].append(v)
 
         # 주별 2OFF 부족량
         if cfg.enforce_two_offs_per_week:

@@ -239,6 +239,15 @@ def _compute_shortages(rs, roster, nurse_grades, constraints_map, grade_values, 
     return shortages
 
 
+def _is_night_only(nurse) -> bool:
+    """N 전담 여부. 리스트 ['N'] 또는 레거시 3과 동일하게 판별."""
+    raw = getattr(nurse, "is_night_nurse", None)
+    if isinstance(raw, list):
+        allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+        return allowed == {"N"}
+    return raw == 3 or (raw is not None and raw != 0 and raw is not False)
+
+
 def _available_grade(rs, nurse_grades, day_idx, shift_code, g, join, leave):
     shift_types = rs.config.shift_types
     s_idx = shift_types.index(shift_code)
@@ -248,7 +257,7 @@ def _available_grade(rs, nurse_grades, day_idx, shift_code, g, join, leave):
             continue
         if not (join[n_idx] <= day_idx <= leave[n_idx]):
             continue
-        if shift_code in ("D", "E") and getattr(rs.nurses[n_idx], "is_night_nurse", 0) == 3:
+        if shift_code in ("D", "E") and _is_night_only(rs.nurses[n_idx]):
             continue
         # fixed 셀 제외
         if hasattr(rs, "fixed_cells"):
@@ -270,7 +279,7 @@ def _find_candidates(rs, roster, nurse_grades, day_idx, shift_code, g, move_coun
             continue
         if not (join[n_idx] <= day_idx <= leave[n_idx]):
             continue
-        if shift_code in ("D", "E") and getattr(rs.nurses[n_idx], "is_night_nurse", 0) == 3:
+        if shift_code in ("D", "E") and _is_night_only(rs.nurses[n_idx]):
             continue
         # 이미 해당 shift에 배정되어 있으면 skip
         if int(roster[n_idx, day_idx, s_idx]) == 1:
