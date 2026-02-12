@@ -35,6 +35,7 @@ from services.cp_sat.hardcoded_weights import (
 )
 from services.cp_sat.objective_terms import build_main_objective_terms
 from services.cp_sat.fallback_lex import optimize_fallback_lex_hard_first
+from services.cp_sat.night_distribution_log import log_n_even_distribution
 # ─────────────────────────────  RL Neighborhood  ─────────────────────────
 class RLNeighborhoodPolicy:
     """아주 가벼운 ε-greedy 정책"""
@@ -1286,6 +1287,7 @@ class CPSATBasicEngine:
                 print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
                 break
         roster_system.roster = best_roster
+        log_n_even_distribution(roster_system, self.logger_prefix)
         if best_viol > 0:
             print(
                 f"{self.logger_prefix} [Progress] 종료: best_viol={best_viol}, "
@@ -1353,6 +1355,7 @@ class CPSATBasicEngine:
                 for d in range(j[n],l[n]+1):
                     for s in range(S):
                         if solver.Value(X(n,d,s)): rs.roster[n,d,s]=1
+            log_n_even_distribution(rs, self.logger_prefix, join=j, leave=l)
         except Exception as e:
             print(f"[ERR] _quick_initial_solve:", e)
             return False
