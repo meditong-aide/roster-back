@@ -95,6 +95,13 @@ def grade_local_repair(
                 if violations:
                     continue
 
+                # 1N/NONON 금지 시: N 관련 이동 후 해당 간호사에게 1N 또는 NONON 생기면 reject
+                if getattr(rs.config, "not_one_night", False) and (
+                    s_code == "N" or (src_shift_idx is not None and shift_types[src_shift_idx] == "N")
+                ):
+                    if _has_1n_or_nonon(rs, new_roster, n_idx, join, leave):
+                        continue
+
                 # Grade 개선도 평가
                 before_short = item["short"]
                 after_short = max(0, target - (_assigned_grade(new_roster, nurse_grades, d, s_idx, g)))
@@ -296,6 +303,43 @@ def _find_candidates(rs, roster, nurse_grades, day_idx, shift_code, g, move_coun
                 break
         candidates.append((n_idx, src_idx))
     return candidates
+
+
+def _has_1n_or_nonon(rs, roster, n_idx: int, join: List[int], leave: List[int]) -> bool:
+    """해당 간호사의 roster에 1N(홀N) 또는 NONON(5일 창 N-O-N-O-N)이 있으면 True.
+
+    not_one_night 설정일 때만 의미 있음; 미설정이면 False 반환.
+    """
+    if not getattr(rs.config, "not_one_night", False):
+        return False
+    shift_types = rs.config.shift_types
+    if "N" not in shift_types:
+        return False
+    night_idx = shift_types.index("N")
+    off_idx = shift_types.index("O") if "O" in shift_types else None
+    T0, T1 = join[n_idx], leave[n_idx]
+
+    # 1N: N인데 좌우 모두 N이 아님
+    for d in range(T0, T1 + 1):
+        if int(roster[n_idx, d, night_idx]) != 1:
+            continue
+        left_n = int(roster[n_idx, d - 1, night_idx]) == 1 if d - 1 >= T0 else False
+        right_n = int(roster[n_idx, d + 1, night_idx]) == 1 if d + 1 <= T1 else False
+        if not left_n and not right_n:
+            return True
+
+    # NONON: 5일 창 [d0..d0+4]가 N,O,N,O,N
+    if off_idx is not None and T1 - T0 >= 4:
+        for d0 in range(T0, T1 - 4 + 1):
+            if (
+                int(roster[n_idx, d0, night_idx]) == 1
+                and int(roster[n_idx, d0 + 1, off_idx]) == 1
+                and int(roster[n_idx, d0 + 2, night_idx]) == 1
+                and int(roster[n_idx, d0 + 3, off_idx]) == 1
+                and int(roster[n_idx, d0 + 4, night_idx]) == 1
+            ):
+                return True
+    return False
 
 
 def _breaks_coverage(rs, new_roster, day_idx, shift_types):
