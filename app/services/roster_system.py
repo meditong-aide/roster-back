@@ -118,11 +118,53 @@ class RosterSystem:
         return not (self.roster[nurse_idx, day-1, night_idx] == 1 and
                     self.roster[nurse_idx, day,   day_idx]   == 1)
 
+    def _check_night_before_evening(self, nurse_idx: int, day: int) -> bool:
+        """전날 Night 근무 후 당일 Evening 근무 여부(N→E 금지). 위반 시 False."""
+        if day == 0:
+            return True
+        night_idx = self.config.shift_types.index('N')
+        eve_idx   = self.config.shift_types.index('E')
+        return not (self.roster[nurse_idx, day - 1, night_idx] == 1 and
+                    self.roster[nurse_idx, day, eve_idx] == 1)
+
+    def _check_eve_before_day(self, nurse_idx: int, day: int) -> bool:
+        """전날 Evening 근무 후 당일 Day 근무 여부(E→D 금지). 위반 시 False."""
+        if day == 0:
+            return True
+        eve_idx = self.config.shift_types.index('E')
+        day_idx = self.config.shift_types.index('D')
+        return not (self.roster[nurse_idx, day - 1, eve_idx] == 1 and
+                    self.roster[nurse_idx, day, day_idx] == 1)
+
     def _check_monthly_night_limit(self, nurse_idx: int, day: int) -> bool:
         """월 누적 야간 근무 제한 초과 여부"""
         night_idx = self.config.shift_types.index('N')
         total_nights = np.sum(self.roster[nurse_idx, :day+1, night_idx])
         return total_nights <= self.config.max_night_shifts_per_month
+
+    def _check_two_offs_after_three_night(self, nurse_idx: int, end_day: int) -> bool:
+        """3연속 N 끝(end_day) 다음 2일이 모두 OFF인지(3N→2O). 위반 시 False."""
+        if end_day < 2 or end_day + 2 >= self.num_days:
+            return True
+        night_idx = self.config.shift_types.index('N')
+        off_idx = self.config.shift_types.index('O')
+        r = self.roster[nurse_idx]
+        if r[end_day - 2, night_idx] != 1 or r[end_day - 1, night_idx] != 1 or r[end_day, night_idx] != 1:
+            return True
+        return r[end_day + 1, off_idx] == 1 and r[end_day + 2, off_idx] == 1
+
+    def _check_two_offs_after_two_night(self, nurse_idx: int, end_day: int) -> bool:
+        """2연속 N 끝(end_day)이고 다음 날이 N이 아닐 때, 그 다음 2일이 모두 OFF인지(2N→2O). 위반 시 False."""
+        if end_day < 1 or end_day + 2 >= self.num_days:
+            return True
+        night_idx = self.config.shift_types.index('N')
+        off_idx = self.config.shift_types.index('O')
+        r = self.roster[nurse_idx]
+        if r[end_day - 1, night_idx] != 1 or r[end_day, night_idx] != 1:
+            return True
+        if r[end_day + 1, night_idx] == 1:
+            return True  # 블록이 2N으로 끝나지 않음(다음 날도 N)
+        return r[end_day + 1, off_idx] == 1 and r[end_day + 2, off_idx] == 1
 
     # ───────── 3. 연속 근무일 함수 리네이밍·정돈 🔄 ─────────
     def _check_max_consecutive_work_days(self, nurse_idx: int, day: int) -> bool:
@@ -340,12 +382,28 @@ class RosterSystem:
                     violations.append({'type': 'night_consecutive', 'nurse_idx': n_idx, 'day': day})
                 if not self._check_day_after_night(n_idx, day):
                     violations.append({'type': 'night_nd', 'nurse_idx': n_idx, 'day': day})
+                if getattr(self.config, 'ban_n_to_e', True) and not self._check_night_before_evening(n_idx, day):
+                    violations.append({'type': 'night_ne', 'nurse_idx': n_idx, 'day': day})
+                if getattr(self.config, 'ban_e_to_d', True) and not self._check_eve_before_day(n_idx, day):
+                    violations.append({'type': 'eve_ed', 'nurse_idx': n_idx, 'day': day})
                 if not self._check_monthly_night_limit(n_idx, day):
                     violations.append({'type': 'night_month_limit', 'nurse_idx': n_idx, 'day': day})
 
                 # ── 2‑B. 연속 근무일 🔄
                 if not self._check_max_consecutive_work_days(n_idx, day):
                     violations.append({'type': 'consecutive_work', 'nurse_idx': n_idx, 'day': day})
+
+        # ── 2‑A2. 3N→2O, 2N→2O (회복 OFF, nurse·end_day 기준 1회씩) 🔄
+        if getattr(self.config, 'two_offs_after_three_nig', False):
+            for n_idx in range(len(self.nurses)):
+                for end_d in range(2, self.num_days - 2):
+                    if not self._check_two_offs_after_three_night(n_idx, end_d):
+                        violations.append({'type': 'rec_3n2o', 'nurse_idx': n_idx, 'day': end_d})
+        if getattr(self.config, 'two_offs_after_two_nig', False):
+            for n_idx in range(len(self.nurses)):
+                for end_d in range(1, self.num_days - 2):
+                    if not self._check_two_offs_after_two_night(n_idx, end_d):
+                        violations.append({'type': 'rec_2n2o', 'nurse_idx': n_idx, 'day': end_d})
 
         return violations
 
