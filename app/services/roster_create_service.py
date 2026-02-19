@@ -2550,6 +2550,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             if clipped:
                 filtered_map[str(nurse_id)] = clipped
         weekly_off_map = filtered_map
+
+    # ── 프리셉티 주휴 처리 (preceptee_on=True 일 때) ──
+    # 프리셉티는 프리셉터를 100% 팔로우하므로 별도 주휴 고정 셀이 불필요.
+    # 고정 셀이 있으면 result_mapping에서 fixed_lookup이 우선하여 "주" 코드가 그대로 노출됨.
+    # → 프리셉티를 weekly_off_map에서 제거하여 고정 셀 미생성 + 팔로우 동기화로 OFF 처리.
+    if config_dict.get('preceptee_on', False):
+        for nurse in nurses_for_engine:
+            nid = str(nurse.nurse_id)
+            pid = getattr(nurse, 'preceptor_id', None)
+            if not pid:
+                continue
+            if nid in weekly_off_map:
+                print(f"[WeeklyOff] 프리셉티 {nurse.name}({nid}) → 주휴 고정 셀 제거 (프리셉터 팔로우로 대체)")
+                weekly_off_map.pop(nid, None)
+
     if weekly_off_map:
         nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
         print(f"[WeeklyOff] 주휴 고정 셀 생성: {len(weekly_off_map)}명")

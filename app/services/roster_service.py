@@ -396,6 +396,8 @@ def create_issued_roster_snapshot(
                 "even_nights": cfg.even_nights,
                 "nod_noe": cfg.nod_noe,
                 "preceptor_gauge": cfg.preceptor_gauge,
+                "preceptee_on": cfg.preceptee_on,
+                "preceptee_shift_count": cfg.preceptee_shift_count,
                 "created_at": cfg.created_at.isoformat()
                 if getattr(cfg, "created_at", None)
                 else None,

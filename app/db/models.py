@@ -245,6 +245,8 @@ class RosterConfig(Base):
     not_one_night = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
     preceptor_gauge = Column(INTEGER, nullable=False, default=5)
+    preceptee_on = Column(BOOLEAN, nullable=False, default=False)
+    preceptee_shift_count = Column(BOOLEAN, nullable=False, default=True)
     weekly_off_group = Column(BOOLEAN)
     team_balance_enable = Column(BOOLEAN, nullable=False, default=False)
     team_balance_gauge = Column(INTEGER, nullable=False, default=0)

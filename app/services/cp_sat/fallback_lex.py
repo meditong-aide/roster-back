@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Dict, Optional
 
+import numpy as np
 from ortools.sat.python import cp_model
 
 from services.cp_sat.hardcoded_weights import (
@@ -214,6 +215,25 @@ def optimize_fallback_lex_hard_first(
     initial_forbidden = (
         getattr(roster_system, "initial_forbidden", {})
         if isinstance(getattr(roster_system, "initial_forbidden", {}), dict)
+        else {}
+    )
+
+    # ── 프리셉티 인덱스 사전 계산 (fallback에서도 follow 모드 지원) ──
+    preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
+    preceptee_indices: set[int] = set()
+    if preceptee_follow:
+        _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+        for n, nu in enumerate(roster_system.nurses):
+            pid = getattr(nu, 'preceptor_id', None)
+            if pid and pid in _fb_id_to_idx:
+                preceptee_indices.add(n)
+        if preceptee_indices:
+            print(f"{logger_prefix} [Fallback] 프리셉티 면제 대상: {len(preceptee_indices)}명")
+    exclude_preceptee_from_den = preceptee_follow and not getattr(cfg, 'preceptee_shift_count', True)
+    # 외부 스코프에서 로깅용으로 사용 (build_model 내부에서도 별도 정의)
+    weekly_off_by_idx = (
+        getattr(roster_system, "weekly_off_by_idx", {})
+        if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
         else {}
     )
     # print('이미 있음 initial_forbidden', initial_forbidden)
@@ -601,7 +621,8 @@ def optimize_fallback_lex_hard_first(
         # 고정 셀
         for (n, d), s_idx in fixed.items():
             if (n, d) not in active_days:
-                # print(f"{logger_prefix} 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
+                continue
+            if preceptee_follow and n in preceptee_indices:
                 continue
             m.Add(X(n, d, s_idx) == 1)
             for s in range(S):
@@ -610,6 +631,8 @@ def optimize_fallback_lex_hard_first(
         # W(특별 근무)는 고정 셀 외에는 전부 금지
         if has_w and w_idx is not None:
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 for d in range(join[n], leave[n] + 1):
                     if (n, d) in fixed and fixed[(n, d)] == w_idx:
                         continue
@@ -620,6 +643,8 @@ def optimize_fallback_lex_hard_first(
             vac_cells = set(off_exception_vacation_cells)
             skip_4o_hard_first_days = int(getattr(cfg, "skip_4o_hard_first_days", 3) or 0)
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 for d in range(join[n], leave[n] - 2):
                     if d + 3 > leave[n]:
                         continue
@@ -665,6 +690,8 @@ def optimize_fallback_lex_hard_first(
                     logger_prefix=logger_prefix,
                 )
             for n, nu in enumerate(roster_system.nurses):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 if not bool(getattr(nu, "is_weekend_off", False)):
                     continue
                 for d in range(join[n], leave[n] + 1):
@@ -730,6 +757,8 @@ def optimize_fallback_lex_hard_first(
             for n, day_list in weekly_off_by_idx.items():
                 if n >= len(join):
                     continue
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 T0, T1 = join[n], leave[n]
                 for d_raw in day_list or []:
                     try:
@@ -792,6 +821,8 @@ def optimize_fallback_lex_hard_first(
         try:
             if initial_forbidden:
                 for (n, d), code_list in initial_forbidden.items():
+                    if preceptee_follow and n in preceptee_indices:
+                        continue
                     for code in (code_list or []):
                         if code not in roster_system.config.shift_types:
                             continue
@@ -807,9 +838,37 @@ def optimize_fallback_lex_hard_first(
         # exactly-one
         for n in range(N):
             for d in range(join[n], leave[n] + 1):
-                if (n, d) in fixed:
+                if (n, d) in fixed and not (preceptee_follow and n in preceptee_indices):
                     continue
                 m.AddExactlyOne(X(n, d, s) for s in range(S))
+
+        # 프리셉티 팔로우 제약 (fallback)
+        if preceptee_follow and preceptee_indices:
+            _fb_id_map = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+            for n in sorted(preceptee_indices):
+                nu = roster_system.nurses[n]
+                pid = getattr(nu, 'preceptor_id', None)
+                if not pid or pid not in _fb_id_map:
+                    continue
+                p = _fb_id_map[pid]
+                d_start = max(join[n], join[p])
+                d_end = min(leave[n], leave[p])
+                for d in range(d_start, d_end + 1):
+                    for s in range(S):
+                        xn = X(n, d, s)
+                        xp = X(p, d, s)
+                        if isinstance(xn, int) or isinstance(xp, int):
+                            continue
+                        m.Add(xn == xp)
+
+        # DEN 커버리지에서 프리셉티 제외 시 fixed_cnt 보정
+        if exclude_preceptee_from_den:
+            _fb_fixed_cnt_adj = [[0] * S for _ in range(D)]
+            for (n2, d2), s_idx in fixed.items():
+                if n2 not in preceptee_indices:
+                    _fb_fixed_cnt_adj[d2][s_idx] += 1
+        else:
+            _fb_fixed_cnt_adj = fixed_cnt
 
         # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
         short_terms, over_terms = [], []
@@ -829,13 +888,14 @@ def optimize_fallback_lex_hard_first(
                 if code not in roster_system.config.shift_types:
                     continue
                 s = roster_system.config.shift_types.index(code)
-                need = int(req) - fixed_cnt[d][s]
+                need = int(req) - _fb_fixed_cnt_adj[d][s]
                 if need <= 0:
                     continue
                 assigned = sum(
                     X(n, d, s)
                     for n in range(N)
                     if join[n] <= d <= leave[n] and (n, d) not in fixed
+                    and (not exclude_preceptee_from_den or n not in preceptee_indices)
                 )
                 sh = m.NewIntVar(0, N, f"short_{d}_{code}")
                 ov = m.NewIntVar(0, N, f"over_{d}_{code}")
@@ -875,12 +935,12 @@ def optimize_fallback_lex_hard_first(
 
         # 고립 OFF 금지(슬랙 허용): sequential_offs 활성 + 옵션 켜졌을 때만 적용
         if (
-            # off_idx is not None
             bool(getattr(cfg, "sequential_offs", True))
-            # and bool(getattr(cfg, "enforce_clustered_offs", False))
         ):
             slack_penalty = int(getattr(cfg, "isolated_off_slack_penalty", 300000) or 0)
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 t0, t1 = join[n], leave[n]
                 for d in range(t0, t1 + 1):
                     neighbours = []
@@ -902,6 +962,8 @@ def optimize_fallback_lex_hard_first(
 
         # 전이 위반: 정확한 reification (iff)
         for n in range(N):
+            if preceptee_follow and n in preceptee_indices:
+                continue
             T0, T1 = join[n], leave[n]
             for d in range(T0 + 1, T1 + 1):
                 xn = X(n, d - 1, night_idx)
@@ -938,6 +1000,8 @@ def optimize_fallback_lex_hard_first(
         print(f"{logger_prefix} [1N금지] not_one_night={not_one_night_val!r} (type={type(not_one_night_val).__name__})")
         if bool(not_one_night_val):
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
                     neighbors = []
@@ -969,6 +1033,8 @@ def optimize_fallback_lex_hard_first(
             off_windows = getattr(roster_system, "off_window_constraints", {}) or {}
             if off_idx is not None:
                 for n in range(N):
+                    if preceptee_follow and n in preceptee_indices:
+                        continue
                     nu = roster_system.nurses[n]
                     if bool(getattr(nu, "is_weekend_off", False)):
                         continue
@@ -985,6 +1051,8 @@ def optimize_fallback_lex_hard_first(
         # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
         K = cfg.max_consecutive_work_days
         for n in range(N):
+            if preceptee_follow and n in preceptee_indices:
+                continue
             if bool(getattr(roster_system.nurses[n], "is_weekend_off", False)):
                 continue
             T0, T1 = join[n], leave[n]
@@ -995,6 +1063,8 @@ def optimize_fallback_lex_hard_first(
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
         for n in range(N):
+            if preceptee_follow and n in preceptee_indices:
+                continue
             T0, T1 = join[n], leave[n]
             for d0 in range(T0, T1 - L + 1):
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
@@ -1006,12 +1076,16 @@ def optimize_fallback_lex_hard_first(
 
         # 월 Night 상한 초과량
         for n in range(N):
+            if preceptee_follow and n in preceptee_indices:
+                continue
             T0, T1 = join[n], leave[n]
             sum_m = sum(X(n, d, night_idx) for d in range(T0, T1 + 1))
             m.Add(sum_m <= cfg.max_night_shifts_per_month)
 
         # N 전담: D/E 하드 금지 (메인 모델과 동일)
         for n, nu in enumerate(roster_system.nurses):
+            if preceptee_follow and n in preceptee_indices:
+                continue
             raw = getattr(nu, "is_night_nurse", None)
             is_n_only = False
             if isinstance(raw, list):
@@ -1041,6 +1115,8 @@ def optimize_fallback_lex_hard_first(
         if cfg.enforce_two_offs_per_week:
             weeks = D // 7
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 for w in range(weeks):
                     d0, d1 = w * 7, min(w * 7 + 7, D)
                     offs = sum(X(n, d, off_idx) for d in range(d0, d1) if join[n] <= d <= leave[n])
@@ -1051,6 +1127,8 @@ def optimize_fallback_lex_hard_first(
         # 회복 규칙: N3→2O, N2→2O 부족량
         if cfg.two_offs_after_three_nig:
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0 + 2, T1 - 1):
                     xn0 = X(n, d, night_idx)
@@ -1065,6 +1143,8 @@ def optimize_fallback_lex_hard_first(
                     safety["rec_3n2o"].append(miss)
         if cfg.two_offs_after_two_nig:
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0 + 1, T1 - 1):
                     xn_prev = X(n, d - 1, night_idx)
@@ -1083,6 +1163,8 @@ def optimize_fallback_lex_hard_first(
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 - 2):
                     v1 = m.NewIntVar(0, 1, f"nod_{n}_{d}")
@@ -1123,6 +1205,8 @@ def optimize_fallback_lex_hard_first(
                 std_personal_off = 0
             if off_idx is not None and std_personal_off > 0:
                 for n in range(N):
+                    if preceptee_follow and n in preceptee_indices:
+                        continue
                     nu = roster_system.nurses[n]
                     raw = getattr(nu, "is_night_nurse", None)
                     is_n_only = False
@@ -1177,6 +1261,8 @@ def optimize_fallback_lex_hard_first(
                         f"target_O={target_o}, weekly_off_target={weekly_target}"
                     )
             for n in range(N):
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 T0, T1 = join[n], leave[n]
                 nu = roster_system.nurses[n]
                 is_n_only = False
@@ -1546,6 +1632,37 @@ def optimize_fallback_lex_hard_first(
         )
     except Exception as exc:
         print(f"{logger_prefix} [PostOff] 후처리 실패: {exc}")
+
+    # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
+    # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
+    #       프리셉터의 특수코드(W 등) → 프리셉티는 OFF
+    if preceptee_follow and preceptee_indices:
+        _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+        _fb_shift_types = cfg.shift_types
+        _fb_off_idx = _fb_shift_types.index('O') if 'O' in _fb_shift_types else None
+        _fb_standard = {'D', 'E', 'N', 'O'}
+        synced = 0
+        special_converted = 0
+        for pte_idx in preceptee_indices:
+            pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
+            if not pid or pid not in _fb_id_to_idx:
+                continue
+            ptr_idx = _fb_id_to_idx[pid]
+            roster_system.roster[pte_idx] = roster_system.roster[ptr_idx].copy()
+            # 특수코드 일자는 프리셉티를 OFF로 전환
+            if _fb_off_idx is not None:
+                for d in range(roster_system.num_days):
+                    _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
+                    if len(_idx_arr) > 0 and _fb_shift_types[int(_idx_arr[0])] not in _fb_standard:
+                        roster_system.roster[pte_idx, d, :] = 0
+                        roster_system.roster[pte_idx, d, _fb_off_idx] = 1
+                        special_converted += 1
+            synced += 1
+        if synced:
+            msg = f"{logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
+            if special_converted:
+                msg += f" (특수코드→OFF 전환: {special_converted}건)"
+            print(msg)
 
     _log_weekend_work_assignments(
         roster_system=roster_system,

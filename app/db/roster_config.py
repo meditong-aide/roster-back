@@ -69,7 +69,10 @@ class NurseRosterConfig:
     preceptor_top_days: int = 30                    # 쌍별 상위 일수 K
     preceptor_min_pair_weight: float = 5.0          # 쌍 가중치 하한 필터
     preceptor_focus_shifts: Optional[List[str]] = None  # 특정 교대만 고려(e.g., ['N','E'])
-    
+    # ── 프리셉티 팔로우/커버리지 제어 ──
+    preceptee_on: bool = False                          # 프리셉티 팔로우 모드 (ON 시 프리셉티는 프리셉터 근무 따라감)
+    preceptee_shift_count: bool = True                  # 프리셉티 커버리지 포함 여부 (ON: DEN에 포함, OFF: DEN에서 제외, preceptee_on=True일 때만 유효)
+
     # --- 신규 Hard Constraint 제어 파라미터 ---
     enforce_seniority_pairing: bool = True # 시니어-주니어 동반 근무 규칙 강제 여부
     junior_pairing_max_experience: int = 2 # 주니어로 간주할 최대 연차

@@ -200,6 +200,8 @@ class RosterConfigBase(BaseModel):
     nod_noe: bool
     not_one_night: bool = Field(default=False, description="야간 단발성(1N) 금지 여부")
     preceptor_gauge: float
+    preceptee_on: bool = Field(default=False, description="프리셉티 팔로우 모드 (ON 시 프리셉터 근무 따라감)")
+    preceptee_shift_count: bool = Field(default=True, description="프리셉티 커버리지 포함 여부 (ON: DEN 포함, OFF: DEN 제외, preceptee_on=True일 때만 유효)")
     weekly_off_group: bool = Field(default=False)
     team_balance_enable: bool = Field(default=False)
     team_balance_gauge: int = Field(default=0, ge=0, le=10)
