@@ -211,10 +211,6 @@ class ShiftPreference(Base):
     is_submitted = Column(BOOLEAN, nullable=False, default=False)
     submitted_at = Column(DATETIME, nullable=True)
     
-    # # 복합 인덱스 추가 (성능 향상)
-    # __table_args__ = (
-    #     Index('idx_nurse_year_month_created', 'nurse_id', 'year', 'month', 'created_at'),
-    # )
 
 
 class RosterConfig(Base):
