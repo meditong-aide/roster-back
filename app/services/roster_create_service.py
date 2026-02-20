@@ -127,6 +127,9 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     if has_fixed_wanted:
         print(f"[RosterCreate] FixedWantedEntry 사용 (단일 테이블)")
         # FixedWantedEntry 기반으로 선호도 수집
+        _fw_deno_count = 0      # DENO 선호도 반영 건수
+        _fw_special_count = 0   # 특수코드 하드 고정 건수
+        _fw_other_count = 0     # 미분류(DENO/특수 어디에도 해당 안 됨) 건수
         for nurse_id in nurse_ids:
             # FixedWantedEntry에서 해당 간호사의 항목 조회 (is_applied=True만)
             fixed_entries = db.query(FixedWantedEntry).filter(
@@ -150,6 +153,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                 if shift_code in shift_data:
                     # 확정 원티드는 최고 우선순위 (score=10)
                     shift_data[shift_code][day_str] = 10
+                    _fw_deno_count += 1
                     continue
 
                 # 특별 근무(휴가/공가 등) 처리
@@ -170,6 +174,11 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                             "shift_type": special_shift_map[shift_code]["type"],
                         }
                     )
+                    _fw_special_count += 1
+                    continue
+
+                # DENO도 아니고 special_shift_map에도 없는 코드 (D2, E2 등)
+                _fw_other_count += 1
 
             # pair 데이터는 기존 WantedRequest에서 가져옴 (FixedWantedEntry에는 pair 없음)
             pair_data = []
@@ -201,12 +210,20 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                 "data": data_json,
             })
 
-        print(f"[RosterCreate] FixedWantedEntry 기반 preferences 수집 완료: {len(preferences)}건")
+        print(
+            f"[RosterCreate] FixedWantedEntry 수집 완료: "
+            f"DENO 선호도={_fw_deno_count}건, "
+            f"특수코드 하드고정={_fw_special_count}건, "
+            f"미분류(D2/E2 등)={_fw_other_count}건, "
+            f"preferences={len(preferences)}건"
+        )
         return nurses_in_group, preferences, special_fixed_requests, special_shift_map
 
     # FixedWantedEntry가 없으면 기존 WantedRequest 기반으로 수집
-    print("[RosterCreate] FixedWantedEntry 없음, WantedRequest 기반 수집")
+    print("[RosterCreate] FixedWantedEntry 없음 → WantedRequest 기반 수집")
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
+    _wr_deno_count = 0
+    _wr_special_count = 0
     for nurse_id in nurse_ids:
         submitted_wr = (
             db.query(WantedRequest)
@@ -248,6 +265,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             day_str = str(int(str(s.shift_date).split("-")[-1]))
             if shift_code in shift_data:
                 shift_data[shift_code][day_str] = int(s.score) if s.score is not None else 0
+                _wr_deno_count += 1
                 continue
             if (
                 shift_code in special_shift_map
@@ -267,6 +285,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                         "shift_type": special_shift_map[shift_code]["type"],
                     }
                 )
+                _wr_special_count += 1
         # print(f'\n\n\n\n\nspecial_fixed_requests {special_fixed_requests}\n\n\n\n\n')
         # print(6)
         # 4️⃣ pair 데이터 수집
@@ -298,7 +317,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             "data": data_json,
         })
     # 7️⃣ 기존 함수와 동일하게 반환
-    print("preferences", nurses_in_group, preferences)
+    print(
+        f"[RosterCreate] WantedRequest 수집 완료: "
+        f"DENO 선호도={_wr_deno_count}건, "
+        f"특수코드 하드고정={_wr_special_count}건, "
+        f"preferences={len(preferences)}건"
+    )
     return nurses_in_group, preferences, special_fixed_requests, special_shift_map
 
 
@@ -2598,6 +2622,72 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         combined_fixed_cells.extend(weekly_off_fixed_cells)
     if special_fixed_cells:
         combined_fixed_cells.extend(special_fixed_cells)
+
+    # ── fixed_wanted_use_yn 설정에 따른 확정 원티드 하드 고정 처리 ──
+    _fw_use_yn = bool(getattr(latest_config, 'fixed_wanted_use_yn', False))
+    _fw_source = "FixedWantedEntry" if db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == current_user.group_id,
+        FixedWantedEntry.year == req.year,
+        FixedWantedEntry.month == req.month,
+    ).first() is not None else "WantedRequest"
+    print(f"[RosterCreate] fixed_wanted_use_yn={_fw_use_yn}, 데이터 출처={_fw_source}")
+    if _fw_use_yn:
+        all_fixed_entries = db.query(FixedWantedEntry).filter(
+            FixedWantedEntry.group_id == current_user.group_id,
+            FixedWantedEntry.year == req.year,
+            FixedWantedEntry.month == req.month,
+            FixedWantedEntry.is_applied == True,
+        ).all()
+        fw_nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
+        fw_fixed_cells = []
+        _fw_skip_special = 0
+        _fw_skip_nurse = 0
+        _fw_skip_range = 0
+        _fw_code_counts: dict[str, int] = {}
+        for fe in all_fixed_entries:
+            shift_code_raw = str(fe.shift_id or "").strip()
+            shift_code = shift_code_raw.upper()
+            # special_shift_map 에 있는 코드는 이미 special_fixed_cells 에서 처리됨
+            if shift_code in special_shift_map:
+                _fw_skip_special += 1
+                continue
+            nurse_id = str(fe.nurse_id)
+            n_idx = fw_nurse_idx_map.get(nurse_id)
+            if n_idx is None:
+                _fw_skip_nurse += 1
+                continue
+            day_idx = fe.shift_date.day - 1
+            if day_idx < 0 or day_idx >= days_in_month:
+                continue
+            if active_range_candidates:
+                rng = active_range_candidates.get(nurse_id)
+                if rng:
+                    start_idx, end_idx = rng
+                    if day_idx < start_idx or day_idx > end_idx:
+                        _fw_skip_range += 1
+                        continue
+            fw_fixed_cells.append({
+                "nurse_index": n_idx,
+                "day_index": day_idx,
+                "shift": shift_code_raw,
+                "shift_type": "근무",
+            })
+            _fw_code_counts[shift_code] = _fw_code_counts.get(shift_code, 0) + 1
+        if fw_fixed_cells:
+            combined_fixed_cells.extend(fw_fixed_cells)
+        print(
+            f"[RosterCreate] fixed_wanted_use_yn=True 결과: "
+            f"총 조회={len(all_fixed_entries)}건, "
+            f"하드 고정={len(fw_fixed_cells)}건 {dict(_fw_code_counts)}, "
+            f"스킵(특수코드 중복={_fw_skip_special}, 엔진 미포함 간호사={_fw_skip_nurse}, 활동범위 밖={_fw_skip_range})"
+        )
+    else:
+        print(
+            f"[RosterCreate] fixed_wanted_use_yn=False: "
+            f"특수코드만 하드 고정={len(special_fixed_cells) if special_fixed_cells else 0}건 (출처: {_fw_source}), "
+            f"DENO/기타는 선호도로 반영"
+        )
+
     off_fixed_summary = _summarize_off_fixed_cells(
         weekly_off_fixed_cells=weekly_off_fixed_cells,
         special_fixed_cells=special_fixed_cells,
