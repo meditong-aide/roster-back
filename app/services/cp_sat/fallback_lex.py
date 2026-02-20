@@ -1650,10 +1650,24 @@ def optimize_fallback_lex_hard_first(
             ptr_idx = _fb_id_to_idx[pid]
             roster_system.roster[pte_idx] = roster_system.roster[ptr_idx].copy()
             # 특수코드 일자는 프리셉티를 OFF로 전환
+            # 단, type=근무 + shift_gb=D/E/N 계열 하위코드는 근무이므로 그대로 유지
+            _fb_work_sub = getattr(roster_system, '_work_sub_ids', set())
+            _fb_orig_map = getattr(roster_system, '_fixed_original_shift_map', {})
             if _fb_off_idx is not None:
                 for d in range(roster_system.num_days):
-                    _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
-                    if len(_idx_arr) > 0 and _fb_shift_types[int(_idx_arr[0])] not in _fb_standard:
+                    _fb_need = False
+                    _fb_orig = _fb_orig_map.get((ptr_idx, d))
+                    if _fb_orig:
+                        _fb_ou = _fb_orig.upper()
+                        if _fb_ou not in _fb_standard and _fb_ou not in _fb_work_sub:
+                            _fb_need = True
+                    else:
+                        _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
+                        if len(_idx_arr) > 0:
+                            _fb_sc = _fb_shift_types[int(_idx_arr[0])]
+                            if _fb_sc not in _fb_standard and _fb_sc.upper() not in _fb_work_sub:
+                                _fb_need = True
+                    if _fb_need:
                         roster_system.roster[pte_idx, d, :] = 0
                         roster_system.roster[pte_idx, d, _fb_off_idx] = 1
                         special_converted += 1

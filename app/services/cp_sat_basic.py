@@ -728,6 +728,20 @@ class CPSATBasicEngine:
                 continue
             if sid and stype:
                 shift_id_to_type[sid] = stype
+        # type='근무' + shift_gb가 DEN 계열인 하위코드 집합 (프리셉티 동기화에서 근무로 취급)
+        _WORK_GB = {"D", "E", "N", "데이", "이브닝", "나이트"}
+        _work_sub_ids: set[str] = set()
+        for row in shift_defs or []:
+            try:
+                _sid = str(row.get("shift_id") or "").strip().upper()
+                _sgb = str(row.get("shift_gb") or "").strip()
+                _stype = str(row.get("type") or "").strip()
+            except Exception:
+                continue
+            if _stype == "근무" and (_sgb in _WORK_GB or _sgb.upper() in _WORK_GB):
+                _work_sub_ids.add(_sid)
+        if _work_sub_ids:
+            print(f"{self.logger_prefix} [ShiftDef] 근무 하위코드: {_work_sub_ids}")
         fixed_original_shift_map: dict[tuple[int, int], str] = {}
         watch_db_ids: set[str] = {"442934"}  # 김지우 기본 추적(필요 시 config_data로 확장)
         try:
@@ -957,6 +971,8 @@ class CPSATBasicEngine:
                             fixed_cells = [c for c in fixed_cells if not (c.get('nurse_index')==n_idx and c.get('day_index')==d)]
                         fixed_cells.append({'nurse_index': n_idx, 'day_index': d, 'shift': 'O'})
             # print('fixed_cells!!!!!', fixed_cells)
+            roster_system._work_sub_ids = _work_sub_ids  # fallback 등에서 참조
+            roster_system._fixed_original_shift_map = fixed_original_shift_map  # fallback 동기화에서 참조
             if fixed_cells:
                 print(f"{self.logger_prefix} 고정된 셀 {len(fixed_cells)}개 처리 중...")
                 roster_system.fixed_cells = fixed_cells
@@ -1090,18 +1106,19 @@ class CPSATBasicEngine:
                 if _off_s_idx is not None:
                     for d in range(roster_system.num_days):
                         need_off = False
-                        # (a) roster 상 shift가 DEN/O가 아닌 경우 (W 등)
-                        _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
-                        if len(_idx_arr) > 0:
-                            _s_code = _shift_types[int(_idx_arr[0])]
-                            if _s_code not in _standard:
-                                need_off = True
-                        # (b) 프리셉터의 원본 코드가 DEN과 무관한 특수코드인 경우
                         _original = fixed_original_shift_map.get((ptr_idx, d))
                         if _original:
-                            _main = shift_id_to_main.get(_original.upper())
-                            if _main not in {'D', 'E', 'N'}:
+                            # 원본 코드 존재 → 원본 기준으로만 판정 (엔진 정규화 코드 무시)
+                            _ou = _original.upper()
+                            if _ou not in _standard and _ou not in _work_sub_ids:
                                 need_off = True
+                        else:
+                            # 원본 없으면 roster 코드 기준
+                            _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
+                            if len(_idx_arr) > 0:
+                                _s_code = _shift_types[int(_idx_arr[0])]
+                                if _s_code not in _standard and _s_code.upper() not in _work_sub_ids:
+                                    need_off = True
                         if need_off:
                             roster_system.roster[n, d, :] = 0
                             roster_system.roster[n, d, _off_s_idx] = 1
@@ -1254,12 +1271,17 @@ class CPSATBasicEngine:
                         if _oi is not None:
                             for _d in range(roster_system.num_days):
                                 _need = False
-                                _ia = np.where(roster_system.roster[_pi, _d] == 1)[0]
-                                if len(_ia) > 0 and _st[int(_ia[0])] not in _std:
-                                    _need = True
                                 _orig = fixed_original_shift_map.get((_pi, _d))
-                                if _orig and shift_id_to_main.get(_orig.upper()) not in {'D', 'E', 'N'}:
-                                    _need = True
+                                if _orig:
+                                    _ou2 = _orig.upper()
+                                    if _ou2 not in _std and _ou2 not in _work_sub_ids:
+                                        _need = True
+                                else:
+                                    _ia = np.where(roster_system.roster[_pi, _d] == 1)[0]
+                                    if len(_ia) > 0:
+                                        _sc2 = _st[int(_ia[0])]
+                                        if _sc2 not in _std and _sc2.upper() not in _work_sub_ids:
+                                            _need = True
                                 if _need:
                                     roster_system.roster[_n, _d, :] = 0
                                     roster_system.roster[_n, _d, _oi] = 1
@@ -1290,6 +1312,39 @@ class CPSATBasicEngine:
             nurses_data=nurses_data,
             shift_definitions=shift_defs,
         )
+        # 프리셉티 최종 결과를 프리셉터 결과로 직접 동기화
+        # (roster 레벨은 엔진 정규화 코드(W 등)를 사용하므로, 최종 result 문자열 기준으로 덮어쓴다)
+        if bool(getattr(roster_system.config, 'preceptee_on', False)):
+            _off_code = canonical_to_shift_id.get('O', 'O')
+            _id2i_final = {nu.db_id: n for n, nu in enumerate(nurses)}
+            _synced_final = 0
+            for nu in nurses:
+                _pid_f = getattr(nu, 'preceptor_id', None)
+                if not _pid_f or _pid_f not in _id2i_final:
+                    continue
+                ptr_sched = result.get(_pid_f, [])
+                pte_sched = result.get(nu.db_id, [])
+                if not ptr_sched or not pte_sched:
+                    continue
+                changed = False
+                for d_i in range(min(len(ptr_sched), len(pte_sched))):
+                    ptr_code = str(ptr_sched[d_i]).strip()
+                    ptr_u = ptr_code.upper()
+                    if ptr_u in {'D', 'E', 'N', 'O'} or ptr_u in _work_sub_ids:
+                        # DEN/O 또는 근무 하위코드 → 프리셉터와 동일
+                        if pte_sched[d_i] != ptr_code:
+                            pte_sched[d_i] = ptr_code
+                            changed = True
+                    else:
+                        # 특수코드(휴가/공가 등) → 프리셉티는 OFF
+                        if str(pte_sched[d_i]).upper() != _off_code.upper():
+                            pte_sched[d_i] = _off_code
+                            changed = True
+                if changed:
+                    result[nu.db_id] = pte_sched
+                    _synced_final += 1
+            if _synced_final:
+                print(f"{self.logger_prefix} [PrecepteeSync] 최종 result 동기화: {_synced_final}명")
         # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
         try:
             weekly_off_by_idx = (
