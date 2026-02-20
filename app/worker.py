@@ -29,13 +29,18 @@ from services.job_status_service import (
 # =========================================================
 # 사용자 로딩 함수
 # =========================================================
-def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
+def load_current_user_by_nurse_id(
+    db: Session, nurse_id: str, override_group_id: str | None = None,
+) -> UserSchema:
     """
     nurse_id로 간호사를 조회해 생성 엔진이 필요한 최소 UserSchema를 구성한다.
 
     인자:
         db: DB 세션.
         nurse_id: 간호사 ID.
+        override_group_id: SQS payload 등에서 전달된 대상 그룹 ID.
+            그룹 관리자가 타 그룹 근무표를 생성할 때, 관리자 본인의 group_id가
+            아닌 실제 대상 그룹 ID를 사용해야 하므로 이 값이 우선한다.
     반환:
         UserSchema: 엔진 실행에 필요한 필드만 채운 사용자 정보.
     예외:
@@ -47,11 +52,18 @@ def load_current_user_by_nurse_id(db: Session, nurse_id: str) -> UserSchema:
     if not nurse:
         raise RuntimeError(f"해당 nurse_id에 대한 사용자 없음: nurse_id={nurse_id}")
 
+    # override_group_id가 있으면 SQS payload의 대상 그룹을 우선 사용
+    group_id = override_group_id or getattr(nurse, "group_id", None)
     # office_id 보강: Nurse.office_id가 없으면 group.office_id 사용
-    group_id = getattr(nurse, "group_id", None)
     office_id = getattr(nurse, "office_id", None) or (getattr(getattr(nurse, "group", None), "office_id", None))
     is_head_nurse = getattr(nurse, "is_head_nurse", False)
     name = getattr(nurse, "name", "")
+
+    if override_group_id and override_group_id != getattr(nurse, "group_id", None):
+        print(
+            f"[worker] group_id override 적용: "
+            f"nurse 원본={getattr(nurse, 'group_id', None)} → 대상={override_group_id}"
+        )
 
     # 엔진에 불필요한 필드는 기본값으로 채워 ValidationError만 방지한다.
     return UserSchema(
@@ -88,6 +100,7 @@ def main():
 
     job_id = payload.get("job_id")
     nurse_id = payload.get("nurse_id")  # ⬅ account_id 로 사용한다고 가정
+    job_group_id = payload.get("group_id")  # 그룹 전환 시 실제 대상 그룹 ID
     params = payload.get("params", {})
 
     if not nurse_id:
@@ -103,8 +116,8 @@ def main():
 
     db: Session = SessionLocal()
     try:
-        current_user = load_current_user_by_nurse_id(db, nurse_id)
-        print(f"[worker] 작업 시작 job_id={job_id}, nurse_id={nurse_id}, req={req}")
+        current_user = load_current_user_by_nurse_id(db, nurse_id, override_group_id=job_group_id)
+        print(f"[worker] 작업 시작 job_id={job_id}, nurse_id={nurse_id}, group_id={current_user.group_id}, req={req}")
 
         try:
             update_job_record(db, job_id, status=STATUS_RUNNING, progress=10)
