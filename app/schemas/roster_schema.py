@@ -73,6 +73,12 @@ class ShiftAddRequest(BaseModel):
     show_in_preference: Optional[bool] = False # 기본 False, 프론트에서 안 보내면 자동 숨김
 
 
+class ShiftUploadConfirmRequest(BaseModel):
+    """근무코드 엑셀 업로드 확정 요청 모델."""
+    rows: List[dict]
+    group_id: Optional[str] = None
+
+
 class RosterRequest(BaseModel):
     """근무표 생성 요청(임시: UI 미구현 상태에서 req로 정책 파라미터를 주입하기 위한 모델).
 
