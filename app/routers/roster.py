@@ -188,6 +188,7 @@ async def get_config_by_version(
                 off_placement_mode=getattr(cfg, 'off_placement_mode', 0),
                 not_one_night=getattr(cfg, 'not_one_night', False),
                 use_mid=False,
+                fixed_wanted_use_yn=getattr(cfg, 'fixed_wanted_use_yn', False),
             )
             db.add(new_config)
 
@@ -225,6 +226,7 @@ async def get_config_by_version(
                 "off_placement_mode" : new_config.off_placement_mode,
                 "not_one_night" : new_config.not_one_night,
                 "use_mid": bool(getattr(new_config, "use_mid", False)),
+                "fixed_wanted_use_yn" : new_config.fixed_wanted_use_yn,
             }
         else:
             config = db.query(RosterConfigModel).filter(
@@ -264,6 +266,7 @@ async def get_config_by_version(
                 "off_placement_mode" : config.off_placement_mode,
                 "not_one_night" : config.not_one_night,
                 "use_mid": bool(getattr(config, "use_mid", False)),
+                "fixed_wanted_use_yn" : config.fixed_wanted_use_yn,
             }
     except Exception as e:
         print('error', e)
