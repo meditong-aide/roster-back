@@ -57,6 +57,15 @@
 - If implementation behavior diverges from this AGENTS system, update the nearest `AGENTS.md` in the same change.
 - If a lower-level AGENTS rule conflicts with root policy, follow the lower-level file only for its scoped directory.
 
+### Documentation Policy (Mandatory)
+- Any feature/fix/refactor change MUST include or update a development note in `docs/`.
+- If DB behavior or schema is touched, the note MUST include a `DB Changes` section.
+- `DB Changes` section MUST contain SQL fenced code blocks (`sql`):
+  1) Apply SQL (when schema/data migration exists)
+  2) Verification SQL
+- If no DB change exists, the note MUST still include a SQL fenced block for "no schema change" verification checks.
+- Missing `DB Changes` section for DB-related changes is treated as incomplete work.
+
 ## Context Map (Action-Based Routing)
 
 - **[FastAPI entrypoint and app wiring](./app/AGENTS.md)** — API lifecycle, router registration, middleware, and app-level conventions.
@@ -66,3 +75,4 @@
 - **[LLM/graph analyzers](./app/agents/AGENTS.md)** — LangGraph state flow and analyzer-specific constraints.
 - **[Operational and evaluation scripts](./scripts/AGENTS.md)** — One-off analysis scripts and execution patterns.
 - **[RL mini project sandbox](./rl_mini_project/AGENTS.md)** — Experimental RL scheduling code isolated from production API paths.
+- **[Documentation standards and templates](./docs/AGENTS.md)** — Dev-note format, DB SQL block requirements, and naming conventions.
