@@ -819,3 +819,153 @@ def shift_upload_confirm(
             )
 
     return {"success": saved, "saved": saved, "errors": errors}
+
+
+# ──────────────────────────────────────────────────────────────
+# 타 병동 근무코드 가져오기
+# ──────────────────────────────────────────────────────────────
+
+def get_available_shifts_for_import(
+    office_id: str,
+    target_group_id: str,
+    db: Session,
+) -> List[Dict[str, Any]]:
+    """동일 오피스 내 다른 그룹의 근무코드 중 현재 그룹에 없는 것만 반환."""
+    other_group_ids = [
+        g.group_id for g in
+        db.query(Group.group_id)
+        .filter(Group.office_id == office_id, Group.group_id != target_group_id)
+        .all()
+    ]
+    if not other_group_ids:
+        return []
+
+    existing_shift_ids: Set[str] = set(
+        row[0] for row in
+        db.query(Shift.shift_id).filter(Shift.group_id == target_group_id).all()
+    )
+
+    candidates = (
+        db.query(Shift, Group.group_name)
+        .join(Group, Shift.group_id == Group.group_id)
+        .filter(
+            Shift.group_id.in_(other_group_ids),
+            Shift.office_id == office_id,
+        )
+        .order_by(Group.group_name, Shift.sequence)
+        .all()
+    )
+
+    seen: Set[str] = set()
+    result: List[Dict[str, Any]] = []
+    for shift, group_name in candidates:
+        if shift.shift_id in seen or shift.shift_id in existing_shift_ids:
+            continue
+        seen.add(shift.shift_id)
+        result.append({
+            "shift_id": shift.shift_id,
+            "name": shift.name,
+            "color": shift.color,
+            "shift_gb": shift.shift_gb,
+            "type": shift.type,
+            "start_time": shift.start_time.strftime("%H:%M") if shift.start_time else None,
+            "end_time": shift.end_time.strftime("%H:%M") if shift.end_time else None,
+            "allday": shift.allday,
+            "auto_schedule": shift.auto_schedule,
+            "duration": shift.duration,
+            "is_weekly_off": shift.is_weekly_off,
+            "show_in_preference": shift.show_in_preference,
+            "source_group_id": shift.group_id,
+            "source_group_name": group_name,
+        })
+    return result
+
+
+def import_shifts_to_group(
+    shift_ids: List[str],
+    target_group_id: str,
+    office_id: str,
+    db: Session,
+) -> Dict[str, Any]:
+    """선택된 근무코드를 다른 그룹에서 현재 그룹으로 복사."""
+    if not shift_ids:
+        return {"imported": 0, "skipped": 0, "errors": []}
+
+    existing_ids: Set[str] = set(
+        row[0] for row in
+        db.query(Shift.shift_id).filter(Shift.group_id == target_group_id).all()
+    )
+    max_seq = (
+        db.query(func.max(Shift.sequence))
+        .filter(Shift.group_id == target_group_id)
+        .scalar() or 0
+    )
+    other_group_ids = [
+        g.group_id for g in
+        db.query(Group.group_id)
+        .filter(Group.office_id == office_id, Group.group_id != target_group_id)
+        .all()
+    ]
+
+    imported = 0
+    skipped = 0
+    errors: List[Dict[str, Any]] = []
+    saved_items: List[Dict[str, str]] = []
+
+    for sid in shift_ids:
+        if sid in existing_ids:
+            skipped += 1
+            continue
+
+        source = (
+            db.query(Shift)
+            .filter(
+                Shift.shift_id == sid,
+                Shift.group_id.in_(other_group_ids),
+                Shift.office_id == office_id,
+            )
+            .first()
+        )
+        if not source:
+            errors.append({"shift_id": sid, "reason": "원본 근무코드를 찾을 수 없습니다."})
+            continue
+
+        max_seq += 1
+
+        new_shift = Shift(
+            shift_id=sid,
+            office_id=office_id,
+            group_id=target_group_id,
+            name=source.name,
+            color=source.color,
+            shift_gb=source.shift_gb,
+            start_time=source.start_time,
+            end_time=source.end_time,
+            type=source.type,
+            allday=source.allday,
+            auto_schedule=source.auto_schedule,
+            duration=source.duration,
+            sequence=max_seq,
+            default_shift=None,
+            is_weekly_off=source.is_weekly_off,
+            show_in_preference=source.show_in_preference,
+        )
+        db.add(new_shift)
+        existing_ids.add(sid)
+        imported += 1
+        saved_items.append({"shift_id": sid, "shift_gb": source.shift_gb})
+
+    db.commit()
+
+    for item in saved_items:
+        slot_code = SHIFT_GB_TO_SLOT_CODE.get(item["shift_gb"] or "")
+        if slot_code:
+            _append_shift_manage_code(
+                db=db,
+                office_id=office_id,
+                group_id=target_group_id,
+                shift_id=item["shift_id"],
+                shift_gb=slot_code,
+            )
+
+    return {"imported": imported, "skipped": skipped, "errors": errors}
