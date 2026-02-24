@@ -243,6 +243,7 @@ class RosterConfig(Base):
     even_nights = Column(BOOLEAN)
     nod_noe = Column(BOOLEAN)
     not_one_night = Column(BOOLEAN, nullable=False, default=False)
+    use_mid = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
     preceptor_gauge = Column(INTEGER, nullable=False, default=5)
     weekly_off_group = Column(BOOLEAN)
@@ -458,6 +459,7 @@ class DailyShift(Base):
     d_count = Column(SMALLINT, nullable=False, default=0)
     e_count = Column(SMALLINT, nullable=False, default=0)
     n_count = Column(SMALLINT, nullable=False, default=0)
+    m_count = Column(SMALLINT, nullable=False, default=0)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 

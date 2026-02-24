@@ -64,6 +64,7 @@ async def put_monthly(
             day_cnt=body.day,
             eve_cnt=body.evening,
             nig_cnt=body.night,
+            mid_cnt=body.mid,
             apply_globally=body.apply_globally,
         )
         return result
@@ -92,6 +93,7 @@ async def put_daily(
             d_list=body.D,
             e_list=body.E,
             n_list=body.N,
+            m_list=body.M if body.M else [0] * len(body.D),
         )
         return result
     except ValueError as ve:
@@ -144,6 +146,8 @@ async def save_calendar(
 
         office_id = request.office_id
         group_id = request.group_id
+        year: int | None = None
+        month: int | None = None
 
         for y, months_data in request.years.items():
             year = int(y)
@@ -159,6 +163,7 @@ async def save_calendar(
                     d_count = shift.get("d_count", 0)
                     e_count = shift.get("e_count", 0)
                     n_count = shift.get("n_count", 0)
+                    m_count = shift.get("m_count", 0)
 
                     existing = (
                         db.query(DailyShift)
@@ -175,6 +180,7 @@ async def save_calendar(
                         existing.d_count = max(0, d_count)
                         existing.e_count = max(0, e_count)
                         existing.n_count = max(0, n_count)
+                        existing.m_count = max(0, m_count)
                     else:
                         db.add(
                             DailyShift(
@@ -185,10 +191,13 @@ async def save_calendar(
                                 day=day,
                                 d_count=d_count,
                                 e_count=e_count,
-                                n_count=n_count
+                                n_count=n_count,
+                                m_count=m_count,
                             )
                         )
         db.commit()
+        if year is None or month is None:
+            raise HTTPException(status_code=400, detail="저장할 캘린더 데이터가 없습니다.")
         return manage_month_data(db, office_id, group_id, year, month)
     except HTTPException as e:
         raise e

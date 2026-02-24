@@ -132,7 +132,7 @@ def _append_shift_manage_code(
     - 기존에 코드가 있으면 추가하지 않습니다.
     - update 시 shift_id 또는 shift_gb가 바뀌면 이전 슬롯에서 제거한 뒤 새 슬롯에 추가합니다.
     """
-    slot_map = {"D": 1, "E": 2, "N": 3, "M": 4, "데이": 1, "이브닝": 2, "나이트": 3, "미드": 4}
+    slot_map = {"D": 1, "E": 2, "N": 3, "M": 5, "데이": 1, "이브닝": 2, "나이트": 3, "미드": 5}
     # shift_gb 한글 → ShiftManage.main_code 영문 변환
     _gb_to_main = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
     if not office_id:
@@ -210,6 +210,47 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
     target_group_id = override_group_id or current_user.group_id
     shifts = db.query(Shift).filter(Shift.group_id == target_group_id).order_by(Shift.sequence.asc()).all()
     if shifts:
+        has_mid = any(str(getattr(s, "default_shift", "") or "").upper() == "M" for s in shifts)
+        if not has_mid:
+            if override_group_id:
+                g = db.query(Group).filter(Group.group_id == override_group_id).first()
+                if not g:
+                    raise Exception("Group not found")
+                office_id = g.office_id
+                group_id = override_group_id
+            else:
+                nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+                if not nurse or not nurse.group:
+                    raise Exception("User group information not found")
+                office_id = nurse.group.office_id
+                group_id = current_user.group_id
+
+            mid_shift = Shift(
+                shift_id="M",
+                office_id=office_id,
+                group_id=group_id,
+                name="미드",
+                color="#E6A817",
+                start_time="09:00",
+                end_time="17:00",
+                type="근무",
+                allday=0,
+                auto_schedule=1,
+                duration=None,
+                sequence=5,
+                default_shift="M",
+                shift_gb="미드",
+            )
+            db.add(mid_shift)
+            db.commit()
+            _append_shift_manage_code(
+                db=db,
+                office_id=office_id,
+                group_id=group_id,
+                shift_id="M",
+                shift_gb="미드",
+            )
+            shifts = db.query(Shift).filter(Shift.group_id == target_group_id).order_by(Shift.sequence.asc()).all()
         return [
             {
                 "shift_id": shift.shift_id,
@@ -260,6 +301,7 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
             ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E", "이브닝"),
             ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N", "나이트"),
             ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D", "데이"),
+            ("M", "미드", "#E6A817", "09:00:00", "17:00:00", "근무", 0, 1, None, 5, "M", "미드"),
         ]
 
         created = []

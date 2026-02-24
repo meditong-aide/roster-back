@@ -495,11 +495,12 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
             return "O"
         return c
 
-    # 엔진은 요구치 키를 'D','E','N'으로 기대한다.
-    daily_shift_requirements: dict[str, int] = {"D": 0, "E": 0, "N": 0}
+    use_mid = bool(getattr(latest_config, "use_mid", False))
+    base_keys = ["D", "E", "N"] + (["M"] if use_mid else [])
+    daily_shift_requirements: dict[str, int] = {k: 0 for k in base_keys}
     for sm in shift_manages:
         main = _normalize_main_code(getattr(sm, "main_code", None))
-        if main in {"D", "E", "N"}:
+        if main in daily_shift_requirements:
             daily_shift_requirements[main] = int(getattr(sm, "manpower", 0) or 0)
     # ── DailyShift 일자별 요구치 조회 및 정규화 ──
     days_in_month = get_days_in_month(req.year, req.month)
@@ -517,9 +518,26 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         )
     except Exception as e:
         print(f"error: {e}")
+        rows = []
+
+    def _row_to_day_counts(row: DailyShift) -> dict[str, int]:
+        counts = {
+            'D': int(getattr(row, 'd_count', 0) or 0),
+            'E': int(getattr(row, 'e_count', 0) or 0),
+            'N': int(getattr(row, 'n_count', 0) or 0),
+        }
+        if use_mid:
+            counts['M'] = int(getattr(row, 'm_count', 0) or 0)
+        return counts
+
     # day→counts 맵 구성 후 리스트로 변환(0-index)
-    by_day = {r.day: {'D': int(r.d_count or 0), 'E': int(r.e_count or 0), 'N': int(r.n_count or 0)} for r in rows}
-    daily_shift_requirements_by_day = [by_day.get(d, {'D': daily_shift_requirements.get('D', 0), 'E': daily_shift_requirements.get('E', 0), 'N': daily_shift_requirements.get('N', 0)}) for d in range(1, days_in_month + 1)]
+    by_day: dict[int, dict[str, int]] = {}
+    for row in rows:
+        by_day[int(getattr(row, 'day', 0) or 0)] = _row_to_day_counts(row)
+    daily_shift_requirements_by_day = [
+        by_day.get(d, dict(daily_shift_requirements))
+        for d in range(1, days_in_month + 1)
+    ]
 
     # 안전장치: 요구치가 전부 0이면 엔진은 OFF로 쏠릴 확률이 높다.
     if sum(daily_shift_requirements.values()) <= 0 and all(

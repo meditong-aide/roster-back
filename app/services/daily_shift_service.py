@@ -18,10 +18,10 @@ def _get_month_days(year: int, month: int) -> int:
     return monthrange(year, month)[1]
 
 
-def _read_template_from_shift_manage(db: Session, office_id: str, group_id: str) -> Tuple[int, int, int]:
-    """shift_manage에서 RN 클래스의 슬롯(1:D,2:E,3:N)별 manpower를 읽어옵니다.
-    - 반환: (day, evening, night)
-    - 예시: (3,2,2)
+def _read_template_from_shift_manage(db: Session, office_id: str, group_id: str) -> Tuple[int, int, int, int]:
+    """shift_manage에서 RN 클래스의 슬롯(1:D,2:E,3:N,5:M)별 manpower를 읽어옵니다.
+    - 반환: (day, evening, night, mid)
+    - 예시: (3,2,2,0)
     """
     slots = (
         db.query(ShiftManage)
@@ -29,14 +29,22 @@ def _read_template_from_shift_manage(db: Session, office_id: str, group_id: str)
             ShiftManage.office_id == office_id,
             ShiftManage.group_id == group_id,
             ShiftManage.nurse_class == 'RN',
-            ShiftManage.shift_slot.in_([1, 2, 3]),
+            ShiftManage.shift_slot.in_([1, 2, 3, 5]),
         )
         .all()
     )
     if not slots or len(slots) < 3:
         raise ValueError("shift_manage 템플릿(RN)이 없습니다.")
-    slot_to_value = {s.shift_slot: s.manpower for s in slots}
-    return slot_to_value.get(1, 0), slot_to_value.get(2, 0), slot_to_value.get(3, 0)
+    slot_to_value: Dict[int, int] = {}
+    for s in slots:
+        slot_no = int(getattr(s, "shift_slot", 0) or 0)
+        slot_to_value[slot_no] = int(getattr(s, "manpower", 0) or 0)
+    return (
+        slot_to_value.get(1, 0),
+        slot_to_value.get(2, 0),
+        slot_to_value.get(3, 0),
+        slot_to_value.get(5, 0),
+    )
 
 
 def _to_response(
@@ -53,10 +61,12 @@ def _to_response(
     d_list = [r.d_count for r in rows_sorted]
     e_list = [r.e_count for r in rows_sorted]
     n_list = [r.n_count for r in rows_sorted]
+    m_list = [int(getattr(r, "m_count", 0) or 0) for r in rows_sorted]
     month_summary = {
         "D_count": d_list[0] if d_list else 0,
         "E_count": e_list[0] if e_list else 0,
         "N_count": n_list[0] if n_list else 0,
+        "M_count": m_list[0] if m_list else 0,
     }
     return {
         "office_id": office_id,
@@ -68,6 +78,7 @@ def _to_response(
             "D_count": d_list,
             "E_count": e_list,
             "N_count": n_list,
+            "M_count": m_list,
         },
     }
 
@@ -89,7 +100,7 @@ def get_or_init_month(db: Session, office_id: str, group_id: str, year: int, mon
     if not rows:
         print("[daily_shift] 월 데이터 없음 → shift_manage 기반으로 초기화")
         days = _get_month_days(year, month)
-        d, e, n = _read_template_from_shift_manage(db, office_id, group_id)
+        d, e, n, mid_cnt = _read_template_from_shift_manage(db, office_id, group_id)
         for day_idx in range(1, days + 1):
             db.add(
                 DailyShift(
@@ -101,6 +112,7 @@ def get_or_init_month(db: Session, office_id: str, group_id: str, year: int, mon
                     d_count=d,
                     e_count=e,
                     n_count=n,
+                    m_count=mid_cnt,
                 )
             )
         db.commit()
@@ -126,6 +138,7 @@ def update_monthly(
     day_cnt: int,
     eve_cnt: int,
     nig_cnt: int,
+    mid_cnt: int = 0,
     apply_globally: bool = True,
 ) -> Dict:
     """월 전체 일괄 업데이트를 수행합니다.
@@ -136,7 +149,7 @@ def update_monthly(
 
     if apply_globally:
         # RN, slot 1~3 업데이트
-        for slot, value in [(1, day_cnt), (2, eve_cnt), (3, nig_cnt)]:
+        for slot, value in [(1, day_cnt), (2, eve_cnt), (3, nig_cnt), (5, mid_cnt)]:
             db.query(ShiftManage).filter(
                 ShiftManage.office_id == office_id,
                 ShiftManage.group_id == group_id,
@@ -167,6 +180,7 @@ def update_monthly(
                     d_count=day_cnt,
                     e_count=eve_cnt,
                     n_count=nig_cnt,
+                    m_count=mid_cnt,
                 )
             )
     else:
@@ -175,6 +189,7 @@ def update_monthly(
             r.d_count = int(day_cnt)
             r.e_count = int(eve_cnt)
             r.n_count = int(nig_cnt)
+            r.m_count = int(mid_cnt)
 
     db.commit()
     return {"updated": True, "days_affected": days}
@@ -189,13 +204,14 @@ def update_daily(
     d_list: List[int],
     e_list: List[int],
     n_list: List[int],
+    m_list: List[int],
 ) -> Dict:
     """일자별 배열을 그대로 저장합니다.
     - 리스트 길이는 해당 월의 일수와 같아야 합니다.
     - 예시: D=[1,3,3], E=[2,2,3], N=[2,2,2]
     """
     days = _get_month_days(year, month)
-    if not (len(d_list) == len(e_list) == len(n_list) == days):
+    if not (len(d_list) == len(e_list) == len(n_list) == len(m_list) == days):
         raise ValueError("리스트 길이가 월의 일수와 다릅니다.")
 
     # 기존 행 조회
@@ -209,7 +225,9 @@ def update_daily(
         )
         .all()
     )
-    rows_map = {r.day: r for r in rows}
+    rows_map: Dict[int, DailyShift] = {}
+    for r in rows:
+        rows_map[int(getattr(r, "day", 0) or 0)] = r
 
     # upsert
     for idx in range(days):
@@ -219,6 +237,7 @@ def update_daily(
             r.d_count = int(d_list[idx])
             r.e_count = int(e_list[idx])
             r.n_count = int(n_list[idx])
+            r.m_count = int(m_list[idx])
         else:
             db.add(
                 DailyShift(
@@ -230,6 +249,7 @@ def update_daily(
                     d_count=int(d_list[idx]),
                     e_count=int(e_list[idx]),
                     n_count=int(n_list[idx]),
+                    m_count=int(m_list[idx]),
                 )
             )
     db.commit()
@@ -283,6 +303,7 @@ def format_shift_calendar(
         "D_count": first_day.d_count if first_day else 0,
         "E_count": first_day.e_count if first_day else 0,
         "N_count": first_day.n_count if first_day else 0,
+        "M_count": int(getattr(first_day, "m_count", 0) or 0) if first_day else 0,
     }
     daily_shifts = [
         {
@@ -290,6 +311,7 @@ def format_shift_calendar(
             "d_count": r.d_count,
             "e_count": r.e_count,
             "n_count": r.n_count,
+            "m_count": int(getattr(r, "m_count", 0) or 0),
             "editable": not is_month_closed(db, office_id, group_id, year, month)  # 정확한 파라미터 전달
         }
         for r in rows_sorted
@@ -361,7 +383,7 @@ def manage_month_data(db: Session, office_id: str, group_id: str, year: int, mon
             if not rows and initialize and y == year and m == month:
                 print(f"[daily_shift] {y}/{m} 데이터 없음 → shift_manage 기반으로 초기화")
                 days = _get_month_days(y, m)
-                d, e, n = _read_template_from_shift_manage(db, office_id, group_id)
+                d, e, n, mid_cnt = _read_template_from_shift_manage(db, office_id, group_id)
                 for day_idx in range(1, days + 1):
                     db.add(
                         DailyShift(
@@ -372,7 +394,8 @@ def manage_month_data(db: Session, office_id: str, group_id: str, year: int, mon
                             day=day_idx,
                             d_count=d,
                             e_count=e,
-                            n_count=n
+                            n_count=n,
+                            m_count=mid_cnt,
                         )
                     )
                 db.commit()
@@ -392,7 +415,12 @@ def manage_month_data(db: Session, office_id: str, group_id: str, year: int, mon
                     result["years"][y][m] = format_shift_calendar(office_id, group_id, y, m, rows, db)  # 마감된 데이터 포함
                 else:
                     # 미마감 월 중 최소값 추적
-                    if earliest_unclosed_year is None or (y < earliest_unclosed_year) or (y == earliest_unclosed_year and m < earliest_unclosed_month):
+                    if (
+                        earliest_unclosed_year is None
+                        or earliest_unclosed_month is None
+                        or (y < earliest_unclosed_year)
+                        or (y == earliest_unclosed_year and m < earliest_unclosed_month)
+                    ):
                         earliest_unclosed_year = y
                         earliest_unclosed_month = m
                     if y == earliest_unclosed_year and m == earliest_unclosed_month:

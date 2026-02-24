@@ -297,7 +297,8 @@ async def get_shift_manage(
         default_slots = [
             {"shift_slot": 1, "main_code": "D", "codes": [], "manpower": 3},
             {"shift_slot": 2, "main_code": "E", "codes": [], "manpower": 3},
-            {"shift_slot": 3, "main_code": "N", "codes": [], "manpower": 2}
+            {"shift_slot": 3, "main_code": "N", "codes": [], "manpower": 2},
+            {"shift_slot": 5, "main_code": "M", "codes": [], "manpower": 0},
         ]
 
         for slot_data in default_slots:

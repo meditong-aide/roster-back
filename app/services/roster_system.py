@@ -191,7 +191,7 @@ class RosterSystem:
         """각 교대에 대한 경력 요구사항이 충족되는지 확인합니다."""
         experienced_nurses = [n for n in self.nurses if n.experience_years >= self.config.min_experience_per_shift]
         
-        for shift in ['D', 'E', 'N']:
+        for shift in self.config.daily_shift_requirements.keys():
             shift_idx = self.config.shift_types.index(shift)
             exp_count = sum(
                 1 for n_idx, nurse in enumerate(experienced_nurses)
@@ -427,7 +427,7 @@ class RosterSystem:
         
         for day in range(self.num_days):
             # Check staffing requirements
-            for shift in ['D', 'E', 'N']:
+            for shift in self.config.daily_shift_requirements.keys():
                 shift_idx = self.config.shift_types.index(shift)
                 assigned = np.sum(self.roster[:, day, shift_idx])
                 required = self.config.daily_shift_requirements[shift]
@@ -437,7 +437,7 @@ class RosterSystem:
                     
             # Check experience requirements
             exp_violations = 0
-            for shift in ['D', 'E', 'N']:
+            for shift in self.config.daily_shift_requirements.keys():
                 shift_idx = self.config.shift_types.index(shift)
                 exp_nurses = sum(
                     1 for n_idx, nurse in enumerate(self.nurses)
@@ -790,7 +790,7 @@ class RosterSystem:
         # 4. Add experience requirements - 소프트 제약으로 구현
         exp_penalty_vars = []
         for day in range(self.num_days):
-            for shift in ['D', 'E', 'N']:
+            for shift in self.config.daily_shift_requirements.keys():
                 s_idx = self.config.shift_types.index(shift)
                 # Sum of experienced nurses assigned to this shift
                 exp_nurses_assigned = sum(
@@ -1799,7 +1799,7 @@ class RosterSystem:
         # 3. Experience requirements (SOFT)
         exp_penalty_vars = []
         for day in range(self.num_days):
-            for shift in ['D', 'E', 'N']:
+            for shift in self.config.daily_shift_requirements.keys():
                 s_idx = self.config.shift_types.index(shift)
                 exp_nurses_assigned = sum(
                     x[n_idx, day, s_idx] 

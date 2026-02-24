@@ -185,6 +185,7 @@ async def get_config_by_version(
                 weekly_off_group=getattr(cfg, 'weekly_off_group', False),
                 off_placement_mode=getattr(cfg, 'off_placement_mode', 0),
                 not_one_night=getattr(cfg, 'not_one_night', False),
+                use_mid=False,
             )
             db.add(new_config)
 
@@ -219,6 +220,7 @@ async def get_config_by_version(
                 "weekly_off_group" : new_config.weekly_off_group,
                 "off_placement_mode" : new_config.off_placement_mode,
                 "not_one_night" : new_config.not_one_night,
+                "use_mid": bool(getattr(new_config, "use_mid", False)),
             }
         else:
             config = db.query(RosterConfigModel).filter(
@@ -255,6 +257,7 @@ async def get_config_by_version(
                 "weekly_off_group" : config.weekly_off_group,
                 "off_placement_mode" : config.off_placement_mode,
                 "not_one_night" : config.not_one_night,
+                "use_mid": bool(getattr(config, "use_mid", False)),
             }
     except Exception as e:
         print('error', e)

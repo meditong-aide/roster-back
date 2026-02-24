@@ -357,14 +357,18 @@ class CPSATBasicEngine:
                 req_map: 원본 요구치 맵(키가 대소문자/공백/다른 표기일 수 있음)
 
             Returns:
-                'D','E','N'(필요 시 'W') 키만을 갖는 정수 요구치 맵
+                'D','E','N'(필요 시 'M','W') 키만을 갖는 정수 요구치 맵
             """
             base_keys = {"D", "E", "N"}
+            if bool(config_data.get("use_mid", False)):
+                base_keys.add("M")
             if isinstance(req_map, dict):
                 for k in req_map.keys():
-                    if str(k).strip().upper() == "W":
+                    key = str(k).strip().upper()
+                    if key == "W":
                         base_keys.add("W")
-                        break
+                    elif key == "M":
+                        base_keys.add("M")
             base = {k: 0 for k in base_keys}
             if not isinstance(req_map, dict):
                 return base
@@ -489,7 +493,7 @@ class CPSATBasicEngine:
                         continue
                     m = _normalize_requirements(day_map)
                     # 일부 키가 누락된 경우 기본 요구치로 보완
-                    for kk in ("D", "E", "N"):
+                    for kk in daily_req.keys():
                         if kk not in m:
                             m[kk] = daily_req.get(kk, 0)
                     norm_list.append(m)
@@ -1893,8 +1897,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             over_vars_by_day.setdefault(d, {})[code] = ov
 
     # shorthand indices
-    idx = {c:rs.config.shift_types.index(c) for c in ('D','E','N','O')}
+    idx = {c: rs.config.shift_types.index(c) for c in ('D', 'E', 'N', 'O')}
     day,eve,night,off = idx['D'],idx['E'],idx['N'],idx['O']
+    mid = rs.config.shift_types.index('M') if 'M' in rs.config.shift_types else None
     # 주말(토/일) day_idx 집합(0-based)
     weekend_days = {d for d in range(D) if (rs.target_month + timedelta(days=d)).weekday() >= 5}
     try:
@@ -2070,6 +2075,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
             if getattr(cfg, "ban_n_to_e", True):
                 m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
+            if mid is not None:
+                m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
             # if getattr(cfg, "ban_d_to_n", True):
             #     m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
 

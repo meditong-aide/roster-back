@@ -154,6 +154,7 @@ def optimize_fallback_lex_hard_first(
     # 공통 인덱스/구간
     idx = {c: roster_system.config.shift_types.index(c) for c in ("D", "E", "N", "O")}
     day_idx, eve_idx, night_idx, off_idx = idx["D"], idx["E"], idx["N"], idx["O"]
+    mid_idx = roster_system.config.shift_types.index("M") if "M" in roster_system.config.shift_types else None
     has_w = "W" in roster_system.config.shift_types
     w_idx = roster_system.config.shift_types.index("W") if has_w else None                      # O 인덱스 e.g. 2
     off_exception_cells = set(getattr(roster_system.config, "off_exception_cells", []) or [])  # (n, d) 튜플 집합 e.g. {(0, 1), (1, 2)}
@@ -925,6 +926,8 @@ def optimize_fallback_lex_hard_first(
                     # m.AddImplication(b_ne, xe2)
                     # safety["trans_ne"].append(b_ne)
                     m.Add(xn + xe2 <= 1)
+                if mid_idx is not None:
+                    m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
                 # if getattr(cfg, "ban_d_to_n", True):
                 #     xd_prev = X(n, d - 1, day_idx)
                 #     b_dn = m.NewBoolVar(f"viol_dn_{n}_{d}")
@@ -1555,5 +1558,4 @@ def optimize_fallback_lex_hard_first(
     )
     print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
     return best_short == 0 and best_safe_sum == 0
-
 
