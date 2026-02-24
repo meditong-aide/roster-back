@@ -1455,7 +1455,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     lookback = int(config_dict.get('cross_month_lookback_days', 6))
     if not enable or lookback <= 0:
         print("이전 월 경계 제약 비활성화 또는 조회일수 0")
-        return {'forced_off': {}, 'forbidden': {}}
+        return {'forced_off': {}, 'forbidden': {}, 'day0_n_fixed_nurse_ids': []}
 
     # 코드 정규화 맵 구성
     code2main = {}
@@ -1488,6 +1488,10 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         prev_month_last_is_off[nurse_id] = bool(last_code == "O")
     forced_off = defaultdict(list)
     forbidden = defaultdict(lambda: defaultdict(list))
+    day0_n_fixed_nurse_ids: list[str] = []
+    # 1N 시 day0 주휴 여부: 주휴면 forbidden만, 아니면 day0=N 고정 + 2N2O 시 forced_off [1,2]
+    weekly_off_map = config_dict.get("weekly_off_map") or {}
+    day0_weekly_off_nurse_ids = {str(nid) for nid, days in weekly_off_map.items() if 0 in (days if isinstance(days, (list, set)) else [])}
 
     # 설정값 활용 (max_conseq_work 기본값은 엔진과 동일하게 5로 폴백)
     def _safe_int(val, default=None):
@@ -1591,13 +1595,21 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
                     f"K={K} → 월초 0..{window_end}(1~{window_end+1}일) 구간 OFF≥1 제약 추가 "
                     f"(꼬리: {tail_str})"
                 )
-        # (b-0) 1N 금지: 꼬리 N이 1개라면 다음 달 day0을 N으로 강제
+        # (b-0) 1N 금지: 꼬리 N이 1개라면 day0 N 고정 또는 forbidden
+        # day0이 주휴면 forbidden만(주휴 우선). 아니면 day0=N 고정 + 2N2O 시 day1,2 OFF 강제.
         if not_one_night and cons_n == 1:
             if 0 in forced_off.get(nurse_id, []):
                 forced_off[nurse_id] = [d for d in forced_off.get(nurse_id, []) if d != 0]
-            forbidden[nurse_id][0].extend(['D', 'E', 'O'])
             tail_str = ' '.join(tail) if tail else '(없음)'
-            print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail 감지 → day0 N 강제(forbidden D/E/O), tail={tail_str}")
+            if nurse_id in day0_weekly_off_nurse_ids:
+                forbidden[nurse_id][0].extend(['D', 'E', 'O'])
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/O), tail={tail_str}")
+            else:
+                day0_n_fixed_nurse_ids.append(nurse_id)
+                two_after_two_effective = two_after_two or not_one_night
+                if two_after_two_effective:
+                    forced_off[nurse_id].extend([1, 2])
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail → day0 N 고정" + (", day1,2 OFF(2N2O)" if two_after_two_effective else "") + f", tail={tail_str}")
 
         # (b) N2/3 → 2OFF
         req_offs = 0
@@ -1667,13 +1679,14 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     forbidden = {k: {d: sorted(set(ss)) for d, ss in v.items()} for k, v in forbidden.items()}
     off_cnt = sum(len(v) for v in forced_off.values())
     forb_cnt = sum(len(ss) for v in forbidden.values() for ss in v.values())
-    print(f"강제 OFF {off_cnt}건, 금지 셀 {forb_cnt}건 적용")
+    print(f"강제 OFF {off_cnt}건, 금지 셀 {forb_cnt}건 적용, 1N day0 N 고정 {len(day0_n_fixed_nurse_ids)}명")
     return {
         'forced_off': forced_off,
         'forbidden': forbidden,
         'prev_month_last_main': prev_month_last_main,
         'prev_month_last_is_off': prev_month_last_is_off,
         'off_window_constraints': off_window_constraints,
+        'day0_n_fixed_nurse_ids': day0_n_fixed_nurse_ids,
     }
 
 
@@ -1958,6 +1971,16 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
     except Exception as e:
         print(f"이전 월 경계 제약 생성 실패: {e}")
+    # 1N day0 N 고정 셀 병합 (고정 근무 최우선이므로 기존 fixed_cells에 추가)
+    day0_n_fixed_nurse_ids = cross_month_constraints.get("day0_n_fixed_nurse_ids") or []
+    if day0_n_fixed_nurse_ids:
+        fixed_list = config_dict.get("fixed_cells") or []
+        nurse_idx_map = _build_engine_nurse_index_map(nurses_in_group)
+        for nurse_id in day0_n_fixed_nurse_ids:
+            n_idx = nurse_idx_map.get(str(nurse_id))
+            if n_idx is not None:
+                fixed_list.append({"nurse_index": n_idx, "day_index": 0, "shift": "N"})
+        config_dict["fixed_cells"] = fixed_list
     prev_month_last_is_off = cross_month_constraints.get("prev_month_last_is_off") or {}
     if prev_month_last_is_off:
         config_dict["prev_month_last_is_off"] = prev_month_last_is_off

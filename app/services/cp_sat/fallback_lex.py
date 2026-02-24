@@ -936,13 +936,15 @@ def optimize_fallback_lex_hard_first(
                 #     m.AddImplication(b_dn, xn)
                 #     safety.setdefault("trans_dn", []).append(b_dn)
 
-        # 1N 금지
+        # 1N 금지 (day0 N 고정인 경우 해당일만 스킵)
         not_one_night_val = getattr(cfg, "not_one_night", False)
         print(f"{logger_prefix} [1N금지] not_one_night={not_one_night_val!r} (type={type(not_one_night_val).__name__})")
         if bool(not_one_night_val):
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
+                    if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night_idx:
+                        continue
                     neighbors = []
                     if d - 1 >= T0:
                         neighbors.append(X(n, d - 1, night_idx))
@@ -1558,4 +1560,3 @@ def optimize_fallback_lex_hard_first(
     )
     print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
     return best_short == 0 and best_safe_sum == 0
-

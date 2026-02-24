@@ -2149,6 +2149,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
             if bool(getattr(cfg, "not_one_night", False)):
                 for d in range(T0, T1 + 1):
+                    if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night:
+                        continue  # 1N day0 N 고정(경계) 시 해당일 1N 제약 스킵
                     neighbors = []
                     if d - 1 >= T0:
                         neighbors.append(X(n, d - 1, night))
