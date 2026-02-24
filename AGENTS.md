@@ -65,6 +65,10 @@
   2) Verification SQL
 - If no DB change exists, the note MUST still include a SQL fenced block for "no schema change" verification checks.
 - Missing `DB Changes` section for DB-related changes is treated as incomplete work.
+- Daily development journal updates MUST be written in Notion under the parent page `개발일지` (`https://www.notion.so/311879e089a581e5bfc2e3cfadb7d824`).
+- For daily journal updates: if today's child page does not exist, create it; if it exists, append/update that same page.
+- Daily journal content MUST be derived from commits made today (branch-aware), and summarize feature-level work plus key sub-tasks without commit hashes.
+- Daily journal writing MUST use clear bullet points and plain, non-technical wording that non-developers can understand.
 
 ## Context Map (Action-Based Routing)
 

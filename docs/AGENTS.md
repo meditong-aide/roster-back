@@ -54,3 +54,35 @@ WHERE TABLE_SCHEMA = 'dbo'
 - Include concrete API paths, model fields, and config keys when relevant.
 - Avoid ambiguous terms; use exact code identifiers in backticks.
 - Keep checklists action-oriented and verifiable.
+
+## Daily Development Journal (Notion)
+
+### Target location (Mandatory)
+- Parent page: `개발일지` (`https://www.notion.so/311879e089a581e5bfc2e3cfadb7d824`).
+- Journal unit: one child page per date.
+
+### Update workflow (Mandatory)
+1. Check whether today's child page already exists under `개발일지`.
+2. If missing, create today's page. If present, update that same page.
+3. Collect today's commits with branch context (focus on commits authored today on the current working branch path).
+4. Convert commit intent into user-facing work summary (feature-level + key sub-tasks).
+5. Write/update the Notion entry using bullet points only; do not include commit hashes.
+
+### Writing format (Mandatory)
+- Use short bullet points that describe:
+  - What feature or improvement was worked on today
+  - What key sub-tasks were done to complete that work
+  - What user-visible or operational effect is expected
+- Keep wording plain and intuitive so non-developers can understand it quickly.
+- Avoid low-level implementation detail unless it changes business behavior.
+
+### Example skeleton
+- `오늘 진행한 기능`
+  - 예약/스케줄 관련 어떤 기능을 개선했는지 한 줄 요약
+- `세부 작업`
+  - 데이터 검증/권한 처리/응답 개선 등 핵심 작업 항목
+- `기대 효과`
+  - 현장 사용자가 체감하는 변화 또는 운영상 이점
+
+### Operational checklist
+- Use `docs/DAILY_JOURNAL_CHECKLIST.md` when creating or updating the daily Notion journal entry.
