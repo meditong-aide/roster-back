@@ -31,6 +31,7 @@ class Nurse:
     joining_date: Optional[date] = None
     head_nurse_off_pattern: Optional[str] = None  # 'weekend', 'mixed', 'normal'
     is_weekend_off: bool = False
+    preceptor_id: Optional[str] = None  # 프리셉터 nurse_id (프리셉티인 경우 설정됨)
 
     @classmethod
     def from_db_model(cls, db_nurse, index: int):

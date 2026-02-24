@@ -99,7 +99,7 @@ def build_main_objective_terms(
 
         for d in range(join[n], leave[n] + 1):
             for s in range(S):
-                base_score = int(P[n, d, s] * PREFERENCE_SCORE_SCALE)
+                base_score = int(P[n, d, s] * PREFERENCE_SCORE_SCALE) if d < D else 0
                 if is_n_only and s == night:
                     base_score += N_ONLY_NIGHT_BONUS
                 obj.append(base_score * X(n, d, s))
@@ -342,5 +342,4 @@ def build_main_objective_terms(
         pass
 
     return obj
-
 

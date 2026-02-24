@@ -342,7 +342,29 @@ def update_nurses_weekly_off_service(
         n.weekly_off_enabled = 1 if data.weekly_off_enabled else 0
         n.weekly_off_weekday = data.weekly_off_weekday if data.weekly_off_enabled else None
         updated_count += 1
-        
+
+    # ── 프리셉티 주휴 자동 동기화: 프리셉터의 주휴가 변경되면 프리셉티도 동일하게 ──
+    updated_preceptor_ids = set(update_map.keys())
+    preceptees = db.query(Nurse).filter(
+        Nurse.group_id == target_group_id,
+        Nurse.preceptor_id.in_(list(updated_preceptor_ids)),
+        Nurse.active == 1,
+    ).all()
+    if preceptees:
+        # 프리셉터 nurse_id → 최신 주휴 설정 매핑
+        preceptor_map = {n.nurse_id: n for n in nurses}
+        synced = 0
+        for pte in preceptees:
+            ptr = preceptor_map.get(pte.preceptor_id)
+            if not ptr:
+                continue
+            pte.weekly_off_enabled = ptr.weekly_off_enabled
+            pte.weekly_off_weekday = ptr.weekly_off_weekday
+            synced += 1
+        if synced:
+            print(f"[WeeklyOff] 프리셉티 주휴 동기화: {synced}명 (프리셉터 주휴 따라감)")
+            updated_count += synced
+
     db.commit()
     return {
         "updated_nurses": updated_count,

@@ -279,8 +279,12 @@ def _find_candidates(rs, roster, nurse_grades, day_idx, shift_code, g, move_coun
     shift_types = rs.config.shift_types
     s_idx = shift_types.index(shift_code)
     candidates = []
+    _preceptee_on = bool(getattr(rs.config, 'preceptee_on', False))
     for n_idx, ng in enumerate(nurse_grades):
         if ng != g:
+            continue
+        # 프리셉티는 프리셉터를 따라가므로 독립 이동 금지
+        if _preceptee_on and getattr(rs.nurses[n_idx], 'preceptor_id', None):
             continue
         if move_count.get(n_idx, 0) >= max_moves_per_nurse:
             continue

@@ -445,6 +445,8 @@ class CPSATBasicEngine:
             preceptor_top_days=config_data.get('preceptor_top_days', 12),
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
+            preceptee_on=bool(config_data.get('preceptee_on', False)),
+            preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
             # team_balance_enable=team_balance_enable,
             team_balance_enable=True, # test
             team_balance_gauge=10, # test
@@ -482,6 +484,9 @@ class CPSATBasicEngine:
         setattr(cfg, "shadow_coverage_lookback_days", int(config_data.get("shadow_coverage_lookback_days", 6) or 0))
         setattr(cfg, "shadow_coverage_need_ratio", float(config_data.get("shadow_coverage_need_ratio", 0.6) or 0.0))
         setattr(cfg, "shadow_coverage_penalty_weight", int(config_data.get("shadow_coverage_penalty_weight", 6) or 0))
+        print("=== DEBUG: 최종 cfg 값 확인 ===")
+        print("oversupply_equalize_weight:", cfg.oversupply_equalize_weight)
+        print("extra_off_penalty_weight:", cfg.extra_off_penalty_weight)
         # 전이 금지 하드 제약 설정 (기본: 모두 금지)
         ban_e_to_d = bool(config_data.get("ban_e_to_d", True))
         ban_n_to_e = bool(config_data.get("ban_n_to_e", True))
@@ -599,6 +604,7 @@ class CPSATBasicEngine:
                 'joining_date': _to_date(nurse_data.get('joining_date')),
                 'resignation_date': _to_date(nurse_data.get('resignation_date')),
                 'team_id': nurse_data.get('team_id'),
+                'preceptor_id': nurse_data.get('preceptor_id'),
             }
 
             nurses.append(Nurse(**nurse_dict))
@@ -746,6 +752,20 @@ class CPSATBasicEngine:
                 continue
             if sid and stype:
                 shift_id_to_type[sid] = stype
+        # type='근무' + shift_gb가 DEN 계열인 하위코드 집합 (프리셉티 동기화에서 근무로 취급)
+        _WORK_GB = {"D", "E", "N", "데이", "이브닝", "나이트"}
+        _work_sub_ids: set[str] = set()
+        for row in shift_defs or []:
+            try:
+                _sid = str(row.get("shift_id") or "").strip().upper()
+                _sgb = str(row.get("shift_gb") or "").strip()
+                _stype = str(row.get("type") or "").strip()
+            except Exception:
+                continue
+            if _stype == "근무" and (_sgb in _WORK_GB or _sgb.upper() in _WORK_GB):
+                _work_sub_ids.add(_sid)
+        if _work_sub_ids:
+            print(f"{self.logger_prefix} [ShiftDef] 근무 하위코드: {_work_sub_ids}")
         fixed_original_shift_map: dict[tuple[int, int], str] = {}
         watch_db_ids: set[str] = {"442934"}  # 김지우 기본 추적(필요 시 config_data로 확장)
         try:
@@ -983,6 +1003,8 @@ class CPSATBasicEngine:
                             fixed_cells = [c for c in fixed_cells if not (c.get('nurse_index')==n_idx and c.get('day_index')==d)]
                         fixed_cells.append({'nurse_index': n_idx, 'day_index': d, 'shift': 'O'})
             # print('fixed_cells!!!!!', fixed_cells)
+            roster_system._work_sub_ids = _work_sub_ids  # fallback 등에서 참조
+            roster_system._fixed_original_shift_map = fixed_original_shift_map  # fallback 동기화에서 참조
             if fixed_cells:
                 print(f"{self.logger_prefix} 고정된 셀 {len(fixed_cells)}개 처리 중...")
                 roster_system.fixed_cells = fixed_cells
@@ -1093,6 +1115,95 @@ class CPSATBasicEngine:
                 print(f"{self.logger_prefix} 불필요 OFF 교체 {trimmed}건")
         except Exception as exc:
             print(f"{self.logger_prefix} 불필요 OFF 후처리 실패: {exc}")
+
+        # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
+        # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
+        #       프리셉터의 특수코드(법,생,휴 등 원티드) → 프리셉티는 OFF
+        preceptee_follow = bool(getattr(roster_system.config, 'preceptee_on', False))
+        if preceptee_follow and hasattr(roster_system, 'nurses'):
+            _shift_types = roster_system.config.shift_types
+            _off_s_idx = _shift_types.index('O') if 'O' in _shift_types else None
+            _standard = {'D', 'E', 'N', 'O'}
+            id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+            synced = 0
+            special_converted = 0
+            for n, nu in enumerate(roster_system.nurses):
+                pid = getattr(nu, 'preceptor_id', None)
+                if not pid or pid not in id_to_idx:
+                    continue
+                ptr_idx = id_to_idx[pid]
+                # 1단계: 프리셉터 roster 전체 복사
+                roster_system.roster[n] = roster_system.roster[ptr_idx].copy()
+                # 2단계: 특수코드 일자는 프리셉티를 OFF로 전환
+                if _off_s_idx is not None:
+                    for d in range(roster_system.num_days):
+                        need_off = False
+                        _original = fixed_original_shift_map.get((ptr_idx, d))
+                        if _original:
+                            # 원본 코드 존재 → 원본 기준으로만 판정 (엔진 정규화 코드 무시)
+                            _ou = _original.upper()
+                            if _ou not in _standard and _ou not in _work_sub_ids:
+                                need_off = True
+                        else:
+                            # 원본 없으면 roster 코드 기준
+                            _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
+                            if len(_idx_arr) > 0:
+                                _s_code = _shift_types[int(_idx_arr[0])]
+                                if _s_code not in _standard and _s_code.upper() not in _work_sub_ids:
+                                    need_off = True
+                        if need_off:
+                            roster_system.roster[n, d, :] = 0
+                            roster_system.roster[n, d, _off_s_idx] = 1
+                            special_converted += 1
+                            
+                            # 디버깅용
+                            # preceptor_code = _shift_types[int(np.where(roster_system.roster[ptr_idx, d] == 1)[0][0])]
+                            # original_code = fixed_original_shift_map.get((ptr_idx, d), '없음')
+                            # print(f"  → [{nu.name} <- {roster_system.nurses[ptr_idx].name}] {d+1}일차 : "
+                            #       f"preceptor={preceptor_code}, original={original_code} → OFF")
+                synced += 1
+            if synced:
+                msg = f"{self.logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
+                if special_converted:
+                    msg += f" (특수코드→OFF 전환: {special_converted}건)"
+                print(msg)
+                
+            # 추가: 프리셉티의 fixed_cells를 프리셉터 값으로 강제 덮어쓰기
+            if preceptee_follow and synced > 0:
+                fixed_cells = getattr(roster_system, "fixed_cells", []) or []
+                new_fixed = []
+                preceptor_fixed = {}  # preceptor별 fixed 캐시
+
+                for cell in fixed_cells:
+                    n_idx = cell.get("nurse_index")
+                    if n_idx in id_to_idx:
+                        nu = roster_system.nurses[n_idx]
+                        if getattr(nu, 'preceptor_id', None):
+                            # 프리셉티 fixed는 스킵 (아래에서 새로 만듦)
+                            continue
+                        key = (n_idx, cell.get("day_index"))
+                        preceptor_fixed[key] = cell
+
+                for n, nu in enumerate(roster_system.nurses):
+                    pid = getattr(nu, 'preceptor_id', None)
+                    if not pid or pid not in id_to_idx:
+                        # 프리셉티 아닌 경우 기존 유지
+                        for cell in fixed_cells:
+                            if cell.get("nurse_index") == n:
+                                new_fixed.append(cell)
+                        continue
+
+                    ptr_idx = id_to_idx[pid]
+                    for d in range(roster_system.num_days):
+                        key = (ptr_idx, d)
+                        if key in preceptor_fixed:
+                            copied = preceptor_fixed[key].copy()
+                            copied["nurse_index"] = n
+                            new_fixed.append(copied)
+
+                roster_system.fixed_cells = new_fixed
+                print(f"[PrecepteeSync-Fixed] fixed_cells 프리셉터 동기화 완료: {len(new_fixed)}개")
+
         # W 배정 디버그 로그
         try:
             if "W" in roster_system.config.shift_types:
@@ -1175,6 +1286,40 @@ class CPSATBasicEngine:
                     max_moves_per_nurse=1,
                 )
                 roster_system.roster = updated_roster
+                # Grade Repair 이후 프리셉티 재동기화
+                _pf = bool(getattr(roster_system.config, 'preceptee_on', False))
+                if _pf and hasattr(roster_system, 'nurses'):
+                    _st = roster_system.config.shift_types
+                    _oi = _st.index('O') if 'O' in _st else None
+                    _std = {'D', 'E', 'N', 'O'}
+                    _id2i = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+                    _sc = 0
+                    for _n, _nu in enumerate(roster_system.nurses):
+                        _pid = getattr(_nu, 'preceptor_id', None)
+                        if not _pid or _pid not in _id2i:
+                            continue
+                        _pi = _id2i[_pid]
+                        roster_system.roster[_n] = roster_system.roster[_pi].copy()
+                        if _oi is not None:
+                            for _d in range(roster_system.num_days):
+                                _need = False
+                                _orig = fixed_original_shift_map.get((_pi, _d))
+                                if _orig:
+                                    _ou2 = _orig.upper()
+                                    if _ou2 not in _std and _ou2 not in _work_sub_ids:
+                                        _need = True
+                                else:
+                                    _ia = np.where(roster_system.roster[_pi, _d] == 1)[0]
+                                    if len(_ia) > 0:
+                                        _sc2 = _st[int(_ia[0])]
+                                        if _sc2 not in _std and _sc2.upper() not in _work_sub_ids:
+                                            _need = True
+                                if _need:
+                                    roster_system.roster[_n, _d, :] = 0
+                                    roster_system.roster[_n, _d, _oi] = 1
+                        _sc += 1
+                    if _sc:
+                        print(f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명")
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
                 )
@@ -1199,6 +1344,39 @@ class CPSATBasicEngine:
             nurses_data=nurses_data,
             shift_definitions=shift_defs,
         )
+        # 프리셉티 최종 결과를 프리셉터 결과로 직접 동기화
+        # (roster 레벨은 엔진 정규화 코드(W 등)를 사용하므로, 최종 result 문자열 기준으로 덮어쓴다)
+        if bool(getattr(roster_system.config, 'preceptee_on', False)):
+            _off_code = canonical_to_shift_id.get('O', 'O')
+            _id2i_final = {nu.db_id: n for n, nu in enumerate(nurses)}
+            _synced_final = 0
+            for nu in nurses:
+                _pid_f = getattr(nu, 'preceptor_id', None)
+                if not _pid_f or _pid_f not in _id2i_final:
+                    continue
+                ptr_sched = result.get(_pid_f, [])
+                pte_sched = result.get(nu.db_id, [])
+                if not ptr_sched or not pte_sched:
+                    continue
+                changed = False
+                for d_i in range(min(len(ptr_sched), len(pte_sched))):
+                    ptr_code = str(ptr_sched[d_i]).strip()
+                    ptr_u = ptr_code.upper()
+                    if ptr_u in {'D', 'E', 'N', 'O'} or ptr_u in _work_sub_ids:
+                        # DEN/O 또는 근무 하위코드 → 프리셉터와 동일
+                        if pte_sched[d_i] != ptr_code:
+                            pte_sched[d_i] = ptr_code
+                            changed = True
+                    else:
+                        # 특수코드(휴가/공가 등) → 프리셉티는 OFF
+                        if str(pte_sched[d_i]).upper() != _off_code.upper():
+                            pte_sched[d_i] = _off_code
+                            changed = True
+                if changed:
+                    result[nu.db_id] = pte_sched
+                    _synced_final += 1
+            if _synced_final:
+                print(f"{self.logger_prefix} [PrecepteeSync] 최종 result 동기화: {_synced_final}명")
         # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
         try:
             weekly_off_by_idx = (
@@ -1383,11 +1561,12 @@ class CPSATBasicEngine:
             if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE): return False
             rs.roster.fill(0)
             N,D,S=len(rs.nurses),rs.num_days,rs.config.num_shifts
+            leave_phys = [min(int(x), D - 1) for x in l]
             for n in range(N):
-                for d in range(j[n],l[n]+1):
+                for d in range(j[n], leave_phys[n] + 1):
                     for s in range(S):
                         if solver.Value(X(n,d,s)): rs.roster[n,d,s]=1
-            log_n_even_distribution(rs, self.logger_prefix, join=j, leave=l)
+            log_n_even_distribution(rs, self.logger_prefix, join=j, leave=leave_phys)
         except Exception as e:
             print(f"[ERR] _quick_initial_solve:", e)
             return False
@@ -1588,7 +1767,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         D,
     )
     N, S = len(rs.nurses), rs.config.num_shifts
-    # join / leave index (leave는 당월 물리 마지막일만 사용; 룩어헤드 변수 범위는 leave_ext)
+    # join / leave index (leave는 당월 물리 마지막일만 사용; 룩어헤드 변수 범위는 leave)
     join, leave = [], []
     has_w = "W" in rs.config.shift_types
     w_idx = rs.config.shift_types.index("W") if has_w else None
@@ -1632,10 +1811,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         join.append(j)
         leave.append(l)
         off_exception_cells = set(getattr(rs.config, "off_exception_cells", []) or [])
-    leave_ext = compute_leave_ext(leave, D_phys, D) if K_lookahead > 0 else list(leave)
+    leave = compute_leave_ext(leave, D_phys, D) if K_lookahead > 0 else list(leave)
     if K_lookahead > 0:
         logger.info(
-            "[Lookahead] leave_ext 적용 (당월 퇴사자 제외, 룩어헤드 구간 d=%s~%s 포함)",
+            "[Lookahead] leave 적용 (당월 퇴사자 제외, 룩어헤드 구간 d=%s~%s 포함)",
             D_phys,
             D - 1,
         )
@@ -1727,10 +1906,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             print(f"[N-Forbid] 로깅 실패: {e}")
 
 
-    # 변수 (룩어헤드 시 leave_ext까지 생성)
+    # 변수 (룩어헤드 시 leave까지 생성)
     Xv = {}
     for n in range(N):
-        for d in range(join[n], leave_ext[n] + 1):
+        for d in range(join[n], leave[n] + 1):
             for s in range(S):
                 Xv[n, d, s] = m.NewBoolVar(f"x_{n}_{d}_{s}")
     def X(n, d, s):
@@ -1743,12 +1922,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if (n, d) in vacation_off_cells:
             return 0
         return X(n, d, off_idx_full)
-    active_days = {(n, d) for n in range(N) for d in range(join[n], leave_ext[n] + 1)}
+    active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
     isolated_off_slacks: list = []
+
+    # ── 프리셉티 인덱스 사전 계산 (고정 셀 적용 전에 계산해야 면제 가능) ──
+    preceptee_follow = bool(getattr(rs.config, 'preceptee_on', False))
+    preceptee_indices: set[int] = set()
+    if preceptee_follow:
+        _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
+        for n, nu in enumerate(rs.nurses):
+            pid = getattr(nu, 'preceptor_id', None)
+            if pid and pid in _id_to_idx_pre:
+                preceptee_indices.add(n)
+        preceptee_indices = set(preceptee_indices)
+        print(f"[FIX] 프리셉티 면제 로직 완전 제거 → 모든 프리셉티에 팔로우 제약 적용 (면제 대상: {len(preceptee_indices)}명)")
+
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
         if (n, d) not in active_days:
             print(f"[CP-SAT-Basic] 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
+            continue
+        # 프리셉티는 고정 셀 스킵 (프리셉터의 스케줄을 따라감)
+        if preceptee_follow and n in preceptee_indices:
             continue
         m.Add(X(n,d,s_idx)==1)
         for s in range(S):
@@ -1756,10 +1951,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # W(특별 근무)는 고정 셀 외에는 전부 금지
     if has_w and w_idx is not None:
         for n in range(N):
-            for d in range(join[n], leave_ext[n] + 1):
+            if preceptee_follow and n in preceptee_indices:
+                continue
+            for d in range(join[n], leave[n] + 1):
                 if (n, d) in fixed and fixed[(n, d)] == w_idx:
                     continue
                 m.Add(X(n, d, w_idx) == 0)
+
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
     # config.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3 → 1~3일 시작 윈도우는 4연속 O 허용)
     if off_idx_full is not None:
@@ -1767,8 +1965,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         off_or_weekly = {cell for cell in structural_off_cells if cell not in vac_cells}
         skip_4o_hard_first_days = int(getattr(rs.config, "skip_4o_hard_first_days", 3) or 0)
         for n in range(N):
-            for d in range(join[n], leave_ext[n] - 2):
-                if d + 3 > leave_ext[n]:
+            if preceptee_follow and n in preceptee_indices:
+                continue
+            for d in range(join[n], leave[n] - 2):
+                if d + 3 > leave[n]:
                     continue
                 # if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
                 #     continue
@@ -1798,7 +1998,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     if enforce_clustered_offs and off_idx_full is not None:
         slack_penalty = int(getattr(rs.config, "isolated_off_slack_penalty", 300000) or 0)
         for n in range(N):
-            t0, t1 = join[n], leave_ext[n]
+            if preceptee_follow and n in preceptee_indices:
+                continue
+            t0, t1 = join[n], leave[n]
             for d in range(t0, t1 + 1):
                 neighbours = []
                 if d - 1 >= t0:
@@ -1830,7 +2032,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 else:
                     need_map = rs.config.daily_shift_requirements
                 total_need = sum(int(v) for v in (need_map or {}).values())
-                active_cnt = sum(1 for n in range(N) if join[n] <= d <= leave_ext[n])
+                active_cnt = sum(1 for n in range(N) if join[n] <= d <= leave[n])
                 fixed_off_cnt = (
                     sum(
                         1
@@ -1850,6 +2052,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         
         for n, day_list in weekly_off_by_idx.items():
             if n >= len(join):
+                continue
+            if preceptee_follow and n in preceptee_indices:
                 continue
             # 주말 휴무 대상자는 주휴 인접 OFF 배치를 적용하지 않는다.
             if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
@@ -1896,6 +2100,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     try:
         if hasattr(rs, 'initial_forbidden') and isinstance(rs.initial_forbidden, dict):
             for (n, d), code_list in rs.initial_forbidden.items():
+                # 프리셉티는 AllowedShiftTypes 금지 면제 (프리셉터 스케줄 따라감)
+                if preceptee_follow and n in preceptee_indices:
+                    continue
                 for code in (code_list or []):
                     if code not in rs.config.shift_types:
                         continue
@@ -1911,10 +2118,60 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     # ───────────── 2-B. Exactly-one ──────────
     for n in range(N):
-        for d in range(join[n], leave_ext[n] + 1):
-            if (n, d) in fixed:
+        for d in range(join[n], leave[n]+1):
+            # 프리셉티는 고정 셀 스킵되었으므로 ExactlyOne 필요
+            if (n,d) in fixed and not (preceptee_follow and n in preceptee_indices):
                 continue
-            m.AddExactlyOne(X(n, d, s) for s in range(S))
+            m.AddExactlyOne(X(n,d,s) for s in range(S))
+
+    # ───────────── 2-B-2. 프리셉티 팔로우 제약 추가 (preceptee_on=True 일 때) ──────────
+    # preceptee_follow, preceptee_indices 는 위(2-A1 직전)에서 이미 계산됨
+    print(f"[CP-SAT-Basic] preceptee_on={getattr(rs.config, 'preceptee_on', 'MISSING')}, "
+          f"preceptee_shift_count={getattr(rs.config, 'preceptee_shift_count', 'MISSING')}, "
+          f"preceptee_follow={preceptee_follow}, preceptee_indices={len(preceptee_indices)}명")
+    if preceptee_follow and preceptee_indices:
+        id_to_idx = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
+        constraint_count = 0
+        for n in sorted(preceptee_indices):
+            nu = rs.nurses[n]
+            pid = getattr(nu, 'preceptor_id', None)
+            if not pid or pid not in id_to_idx:
+                continue
+            p = id_to_idx[pid]
+            preceptor_nurse = rs.nurses[p]
+            d_start = max(join[n], join[p])
+            d_end = min(leave[n], leave[p])
+            # print(f"[CP-SAT-Basic] 프리셉티 팔로우: {nu.name}(idx={n}) → {preceptor_nurse.name}(idx={p}), "
+            #       f"days={d_start}~{d_end}")
+            # 하드 제약: 프리셉티(n)의 근무 = 프리셉터(p)의 근무
+            for d in range(d_start, d_end + 1):
+                # print(f"[DEBUG] 팔로우 제약 추가: 프리셉티 n={n}, 프리셉터 p={p}, day={d+1}")
+                for s in range(S):
+                    xn = X(n, d, s)
+                    xp = X(p, d, s)
+                    if isinstance(xn, int) or isinstance(xp, int):
+                        continue
+                    m.Add(xn == xp)
+                    constraint_count += 1
+        print(f"[CP-SAT-Basic] 프리셉티 팔로우 모드: {len(preceptee_indices)}명, "
+              f"제약 {constraint_count}개 추가, 개별 하드제약 면제 적용")
+
+    # preceptee_shift_count=False 이면 DEN 하드제약에서 프리셉티 제외
+    _pte_shift_count = getattr(rs.config, 'preceptee_shift_count', True)
+    exclude_preceptee_from_den = preceptee_follow and not _pte_shift_count
+    _pte_cnt = len(preceptee_indices)
+    if exclude_preceptee_from_den:
+        print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=False → 프리셉티 {_pte_cnt}명 제외, DEN 대상: {N - _pte_cnt}명/{N}명")
+    elif preceptee_follow:
+        print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=True → 프리셉티 {_pte_cnt}명 포함, DEN 대상: {N}명/{N}명")
+    # 프리셉티 제외 시 fixed_cnt도 재계산
+    if exclude_preceptee_from_den:
+        fixed_cnt_adj = [[0] * S for _ in range(D)]
+        for (n2, d2), s_idx in fixed.items():
+            if n2 not in preceptee_indices:
+                fixed_cnt_adj[d2][s_idx] += 1
+    else:
+        fixed_cnt_adj = fixed_cnt
 
     # ───────────── 2-C. Shift requirements (per-day, slack 허용) ───
     coverage_shortage_vars = []
@@ -1933,13 +2190,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if code not in rs.config.shift_types:
                 continue
             s = rs.config.shift_types.index(code)
-            need = int(req) - fixed_cnt[d][s]
+            need = int(req) - fixed_cnt_adj[d][s]
             if need <= 0:
                 continue
             assigned = sum(
                 X(n, d, s)
                 for n in range(N)
-                if join[n] <= d <= leave_ext[n] and (n, d) not in fixed
+                if join[n] <= d <= leave[n] and (n, d) not in fixed
+                and (not exclude_preceptee_from_den or n not in preceptee_indices)
             )
             m.Add(assigned >= need)
             ov = m.NewIntVar(0, N, f"over_{d}_{code}")
@@ -1980,9 +2238,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         off_idx=off,
         logger_prefix="[CP-SAT-Basic]",
     )
-    for n, nu in enumerate(rs.nurses):
-        T0, T1 = join[n], leave_ext[n]
-        T1_phys = min(leave[n], D_phys - 1)
+    for n,nu in enumerate(rs.nurses):
+        T0,T1 = join[n], leave[n]
+        # 프리셉티는 프리셉터의 일정을 그대로 따르므로 개별 하드제약 면제
+        if preceptee_follow and n in preceptee_indices:
+            continue
         # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
         # 평일(월~금)에는 OFF를 금지한다.
         #
@@ -2290,7 +2550,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             D_phys=D_phys,
             D_ext=D,
             join=join,
-            leave_ext=leave_ext,
+            leave_ext=leave,
             off_idx=off_idx_full,
             get_need_for_day=_get_need_for_day,
             fixed_off_cells_lookahead=fixed_off_lookahead,
@@ -2326,7 +2586,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         obj.extend(
             add_lookahead_distribution_penalty_terms(
                 m, X, N, D_phys, D,
-                join, leave_ext, off_idx_full,
+                join, leave, off_idx_full,
                 {(n, d) for (n, d) in structural_off_cells if d >= D_phys},
                 weight=lookahead_dist_weight,
             )
