@@ -56,10 +56,11 @@ def get_nurses_in_group_service(
     if nurse_id:
         query = query.filter(NurseModel.nurse_id == nurse_id)
 
-    # 정렬: active DESC, sequence ASC, experience DESC, nurse_id ASC
+    # 정렬: active DESC, role DESC(RN→AN), sequence ASC, experience DESC, nurse_id ASC
     nurses = (
         query.order_by(
             NurseModel.active.desc(),
+            NurseModel.role.desc(),
             NurseModel.sequence.asc(),
             NurseModel.experience.desc(),
             NurseModel.nurse_id.asc()
@@ -159,9 +160,10 @@ def get_nurses_filtered_service(
     elif current_user.office_id is not None:
         q = q.join(Group, Group.group_id == NurseModel.group_id).filter(Group.office_id == current_user.office_id)
 
-    # 정렬: active DESC, sequence ASC, experience DESC, nurse_id ASC
+    # 정렬: active DESC, role DESC(RN→AN), sequence ASC, experience DESC, nurse_id ASC
     nurses = q.order_by(
         NurseModel.active.desc(),
+        NurseModel.role.desc(),
         NurseModel.sequence.asc(),
         NurseModel.experience.desc(),
         NurseModel.nurse_id.asc()
@@ -247,7 +249,7 @@ def _get_nurses_by_active(group_id: str, active_status: int, db: Session) -> Lis
     return (
         db.query(NurseModel)
         .filter(NurseModel.group_id == group_id, NurseModel.active == active_status)
-        .order_by(NurseModel.sequence.asc(), NurseModel.nurse_id.asc())
+        .order_by(NurseModel.role.desc(), NurseModel.sequence.asc(), NurseModel.nurse_id.asc())
         .all()
     )
 
@@ -308,6 +310,8 @@ def move_nurse_with_active_service(nurse_id: str, new_sequence: int, target_acti
         # 새 리스트로 이동하여 삽입
         nurse.active = target_active
         new_list = _get_nurses_by_active(group_id, target_active, db)
+        # autoflush로 인해 nurse가 이미 new_list에 포함될 수 있으므로 제거 후 삽입
+        new_list = [n for n in new_list if n.nurse_id != nurse.nurse_id]
         insert_idx = max(0, min(new_sequence - 1, len(new_list)))
         new_list.insert(insert_idx, nurse)
         _reindex_contiguously(new_list)
@@ -426,6 +430,13 @@ def bulk_update_nurses_service(
     for db_nurse_id, db_nurse in list(db_nurses_dict.items()):
         if db_nurse_id not in client_nurse_ids:
             print('제외된 간호사 for test:', db_nurse_id)
+
+    # === active 상태별 sequence 재정렬 (갭/중복 방지) ===
+    # autoflush=False 환경이므로 in-memory 변경사항을 DB에 반영 후 쿼리
+    db.flush()
+    for active_status in (1, 0):
+        nurses_in_status = _get_nurses_by_active(target_group_id, active_status, db)
+        _reindex_contiguously(nurses_in_status)
 
     db.commit()
 
