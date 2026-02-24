@@ -6,7 +6,7 @@ from db.client2 import get_db
 from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie
-from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest
+from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
 from services.shift_service import (
     get_shifts_service as get_shifts_service_mysql,
     add_shift_service,
@@ -16,6 +16,8 @@ from services.shift_service import (
     create_shift_template,
     shift_upload_validate,
     shift_upload_confirm,
+    get_available_shifts_for_import,
+    import_shifts_to_group,
 )
 from typing import Optional, Any, List
 import os
@@ -226,6 +228,53 @@ async def shift_upload_confirm_endpoint(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
+
+
+# [Shifts] - 타 병동 근무코드 가져오기
+@router.get("/shifts/available-imports")
+async def get_available_shift_imports(
+    group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """현재 그룹에 없는 동일 오피스 내 다른 병동 근무코드 목록 조회"""
+    try:
+        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+            raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
+
+        office_id = getattr(current_user, "office_id", None)
+        if not office_id:
+            raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
+
+        result = get_available_shifts_for_import(office_id, group_id, db)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"조회 실패: {str(e)}")
+
+
+@router.post("/shifts/import-to-group")
+async def import_shifts_to_group_endpoint(
+    payload: ShiftImportRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """선택된 근무코드를 동일 오피스 내 다른 병동에서 현재 그룹으로 가져오기"""
+    try:
+        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+            raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
+
+        office_id = getattr(current_user, "office_id", None)
+        if not office_id:
+            raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
+
+        result = import_shifts_to_group(payload.shift_ids, payload.group_id, office_id, db)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"가져오기 실패: {str(e)}")
 
 
 # [Shift Management] - 시프트 관리 데이터 조회

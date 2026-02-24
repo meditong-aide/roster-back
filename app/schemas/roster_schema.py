@@ -328,8 +328,9 @@ class AddToGroupRequest(BaseModel):
     group_id: str
 
 
-class AddToGroupRequest(BaseModel):
-    nurse_ids: List[str]
+class ShiftImportRequest(BaseModel):
+    """근무코드 타 병동 가져오기 요청"""
+    shift_ids: List[str]
     group_id: str
 
 
