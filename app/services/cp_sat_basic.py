@@ -333,10 +333,7 @@ class CPSATBasicEngine:
         two_offs_after_three_nig = config_data.get('two_offs_after_three_nig', True)
         two_offs_after_two_nig = config_data.get('two_offs_after_two_nig', False)
         not_one_night = config_data.get('not_one_night', False)
-        max_nig_per_month = config_data.get('max_nig_per_month', 15)
-        if max_nig_per_month != 15:
-            max_nig_per_month = 17
-        # 디버그: N 상한 보정 전/후 확인
+        max_nig_per_month = int(config_data.get('max_nig_per_month', 15) or 15)
         print(f"{self.logger_prefix} max_nig_per_month(raw)={max_nig_per_month}")
         
         # 병원 내규 (Soft Constraints)
@@ -358,6 +355,7 @@ class CPSATBasicEngine:
         })
         team_balance_enable = bool(config_data.get('team_balance_enable', False))
         team_balance_gauge = int(config_data.get('team_balance_gauge', 0) or 0)
+        team_balance_top_days = int(config_data.get('team_balance_top_days', 0) or 0)
         # team_balance_weight = int(config_data.get('team_balance_weight', 0) or 0)
         # team_balance_top_days = int(config_data.get('team_balance_top_days', 0) or 0)
         team_balance_focus = config_data.get('team_balance_focus_shifts')
@@ -447,15 +445,11 @@ class CPSATBasicEngine:
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
             preceptee_on=bool(config_data.get('preceptee_on', False)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
-            # team_balance_enable=team_balance_enable,
-            team_balance_enable=True, # test
-            team_balance_gauge=10, # test
-            # team_balance_gauge=team_balance_gauge,
+            team_balance_enable=team_balance_enable,
+            team_balance_gauge=team_balance_gauge,
             # team_balance_weight=team_balance_weight,
             # team_balance_weight=100, # test
-            # team_balance_top_days=team_balance_top_days,
-            team_balance_top_days=30,
-            # team_balance_top_days=30, # test
+            team_balance_top_days=team_balance_top_days,
             team_balance_focus_shifts=team_balance_focus,
             # team_balance_focus_shifts=['D', 'E', 'N'], # test
             team_balance_mode=team_balance_mode,
@@ -478,7 +472,7 @@ class CPSATBasicEngine:
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
-            off_placement_mode=0,
+            off_placement_mode=off_placement_mode,
         )
         # 월말 자연스러운 종료를 유도하기 위한 그림자 커버리지(소프트) 기본값
         setattr(cfg, "shadow_coverage_lookback_days", int(config_data.get("shadow_coverage_lookback_days", 6) or 0))

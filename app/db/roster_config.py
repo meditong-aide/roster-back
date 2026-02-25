@@ -99,6 +99,10 @@ class NurseRosterConfig:
     team_balance_focus_shifts: Optional[List[str]] = None  # 교대 제한 (없으면 D/E/N)
     team_balance_mode: str = "balanced"             # balanced | focus_D | focus_DE
     team_balance_shift_weights: Dict[str, float] = field(default_factory=dict)  # 모드별 파생 가중치
+    surplus_policy_preset: str = "balanced"
+    surplus_smoothing: str = "standard"
+    surplus_policy_version: int = 1
+    surplus_overrides_json: Optional[Dict[str, str]] = None
     
     def __post_init__(self):
         if self.daily_shift_requirements is None:

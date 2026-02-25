@@ -2032,13 +2032,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             off_pen = config_dict.get("extra_off_penalty_weight")
             soft_k = config_dict.get("soft_max_consecutive_work_days")
             soft_w = config_dict.get("soft_consecutive_work_penalty_weight")
+            surplus_preset = config_dict.get("surplus_policy_preset")
+            surplus_smoothing = config_dict.get("surplus_smoothing")
+            surplus_version = config_dict.get("surplus_policy_version")
             print(
                 "[ShiftDistributionPolicy] "
                 f"mode={mode}, oversupply_gauge={og}, monthly_pref_gauge={mg}, "
                 f"oversupply_equalize=({oe},{ow}), monthly_pref_weight={mw}, "
                 f"monthly_pref_cnt={mp_cnt}, "
                 f"max_extra_off_days={max_extra}, extra_off_penalty_weight={off_pen}, "
-                f"soft_cwork=(k={soft_k},w={soft_w})"
+                f"soft_cwork=(k={soft_k},w={soft_w}), "
+                f"surplus=({surplus_preset},{surplus_smoothing},v={surplus_version})"
             )
         except Exception as _log_exc:
             print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")
@@ -2414,9 +2418,103 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
     Args:
         config_dict: 엔진에 넘길 설정 dict(최종적으로 cp_sat_basic에 전달됨)
-        req: `RosterRequest` 또는 hold_generate 요청 모델
+        req: `RosterRequest` 요청 모델
     """
-    # ── 모드 정규화 ──
+    def _normalize_surplus_preset(raw: object) -> str:
+        val = str(raw or "").strip().lower()
+        if val in {"balanced", "min_surplus", "fair_spread"}:
+            return val
+        return "balanced"
+
+    def _normalize_surplus_smoothing(raw: object) -> str:
+        val = str(raw or "").strip().lower()
+        if val in {"off", "standard", "strong"}:
+            return val
+        return "standard"
+
+    def _normalize_surplus_overrides(raw: object) -> dict[str, str] | None:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        allowed = {"avoid", "neutral", "prefer"}
+        normalized: dict[str, str] = {}
+        for k, v in raw.items():
+            nurse_id = str(k).strip()
+            mode = str(v or "").strip().lower()
+            if not nurse_id or mode not in allowed:
+                continue
+            normalized[nurse_id] = mode
+        return normalized or None
+
+    def _compile_surplus_policy(preset: str, smoothing: str) -> None:
+        if preset == "min_surplus":
+            config_dict["oversupply_equalize_enable"] = True
+            config_dict["oversupply_equalize_weight"] = 60
+            config_dict["max_extra_off_days"] = 0
+            config_dict["extra_off_penalty_weight"] = 120
+            config_dict["monthly_preference_weight"] = 0
+            config_dict["team_balance_enable"] = False
+            config_dict["team_balance_gauge"] = 0
+        elif preset == "fair_spread":
+            config_dict["oversupply_equalize_enable"] = True
+            config_dict["oversupply_equalize_weight"] = 180
+            config_dict["max_extra_off_days"] = 1
+            config_dict["extra_off_penalty_weight"] = 60
+            config_dict["monthly_preference_weight"] = 70
+            config_dict["team_balance_enable"] = True
+            config_dict["team_balance_gauge"] = max(6, int(config_dict.get("team_balance_gauge", 0) or 0))
+        else:
+            config_dict["oversupply_equalize_enable"] = True
+            config_dict["oversupply_equalize_weight"] = 120
+            config_dict["max_extra_off_days"] = 1
+            config_dict["extra_off_penalty_weight"] = 80
+            config_dict["monthly_preference_weight"] = 50
+            config_dict["team_balance_enable"] = True
+            config_dict["team_balance_gauge"] = max(4, int(config_dict.get("team_balance_gauge", 0) or 0))
+
+        if smoothing == "off":
+            config_dict["team_balance_enable"] = False
+            config_dict["team_balance_gauge"] = 0
+        elif smoothing == "strong":
+            config_dict["oversupply_equalize_weight"] = int(round(int(config_dict.get("oversupply_equalize_weight", 120) or 120) * 1.25))
+            config_dict["monthly_preference_weight"] = int(round(int(config_dict.get("monthly_preference_weight", 50) or 50) * 1.2))
+            config_dict["team_balance_enable"] = True
+            config_dict["team_balance_gauge"] = max(6, int(config_dict.get("team_balance_gauge", 0) or 0))
+
+    req_fields = set(getattr(req, "model_fields_set", set()) or set())
+    preset_in_req = "surplus_policy_preset" in req_fields
+    smoothing_in_req = "surplus_smoothing" in req_fields
+    overrides_in_req = "surplus_overrides_json" in req_fields
+    legacy_mode_in_req = bool({"distribution_mode", "oversupply_balance_gauge", "monthly_preference_gauge"} & req_fields)
+
+    preset = _normalize_surplus_preset(
+        getattr(req, "surplus_policy_preset", None)
+        if preset_in_req
+        else config_dict.get("surplus_policy_preset")
+    )
+    smoothing = _normalize_surplus_smoothing(
+        getattr(req, "surplus_smoothing", None)
+        if smoothing_in_req
+        else config_dict.get("surplus_smoothing")
+    )
+    config_dict["surplus_policy_preset"] = preset
+    config_dict["surplus_smoothing"] = smoothing
+    config_dict["surplus_policy_version"] = int(config_dict.get("surplus_policy_version", 1) or 1)
+    if overrides_in_req:
+        config_dict["surplus_overrides_json"] = _normalize_surplus_overrides(
+            getattr(req, "surplus_overrides_json", None)
+        )
+    else:
+        config_dict["surplus_overrides_json"] = _normalize_surplus_overrides(
+            config_dict.get("surplus_overrides_json")
+        )
+
+    _compile_surplus_policy(preset, smoothing)
+
     mode = str(getattr(req, "distribution_mode", None) or config_dict.get("distribution_mode") or "hybrid").lower()
     if mode == "auto":
         mode = "hybrid"
@@ -2441,25 +2539,25 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
     oversupply_w = _g2w(og, cap=220)
     monthly_w = _g2w(mg, cap=140)
 
-    # ── 모드별 on/off ──
-    if mode == "off":
-        config_dict["oversupply_equalize_enable"] = False
-        config_dict["oversupply_equalize_weight"] = 0
-        config_dict["monthly_preference_weight"] = 0
-    elif mode == "balanced":
-        config_dict["oversupply_equalize_enable"] = og > 0
-        config_dict["oversupply_equalize_weight"] = oversupply_w
-        config_dict["monthly_preference_weight"] = 0
-    elif mode == "preference":
-        # 선호 우선: 균등은 최소 가드레일만 남긴다(일별 D 쏠림 방지)
-        config_dict["oversupply_equalize_enable"] = og > 0
-        config_dict["oversupply_equalize_weight"] = min(oversupply_w, 60)
-        config_dict["monthly_preference_weight"] = monthly_w
-    else:
-        # hybrid
-        config_dict["oversupply_equalize_enable"] = og > 0
-        config_dict["oversupply_equalize_weight"] = oversupply_w
-        config_dict["monthly_preference_weight"] = monthly_w
+    if legacy_mode_in_req:
+        if mode == "off":
+            config_dict["oversupply_equalize_enable"] = False
+            config_dict["oversupply_equalize_weight"] = 0
+            config_dict["monthly_preference_weight"] = 0
+        elif mode == "balanced":
+            config_dict["oversupply_equalize_enable"] = og > 0
+            config_dict["oversupply_equalize_weight"] = oversupply_w
+            config_dict["monthly_preference_weight"] = 0
+        elif mode == "preference":
+            # 선호 우선: 균등은 최소 가드레일만 남긴다(일별 D 쏠림 방지)
+            config_dict["oversupply_equalize_enable"] = og > 0
+            config_dict["oversupply_equalize_weight"] = min(oversupply_w, 60)
+            config_dict["monthly_preference_weight"] = monthly_w
+        else:
+            # hybrid
+            config_dict["oversupply_equalize_enable"] = og > 0
+            config_dict["oversupply_equalize_weight"] = oversupply_w
+            config_dict["monthly_preference_weight"] = monthly_w
 
     # ── 월단위 선호 payload(개인 입력) ──
     msp = getattr(req, "monthly_shift_preferences", None)
@@ -2467,6 +2565,37 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
         config_dict["monthly_shift_preferences"] = msp
     else:
         config_dict.setdefault("monthly_shift_preferences", {})
+
+    if "oversupply_day_dispersion_weight" in req_fields:
+        raw_w = getattr(req, "oversupply_day_dispersion_weight", None)
+        if raw_w is None:
+            config_dict.pop("oversupply_day_dispersion_weight", None)
+        else:
+            try:
+                config_dict["oversupply_day_dispersion_weight"] = max(0, int(raw_w))
+            except Exception:
+                pass
+
+    if "oversupply_day_dispersion_consecutive_only" in req_fields:
+        raw_cons = getattr(req, "oversupply_day_dispersion_consecutive_only", None)
+        if raw_cons is None:
+            config_dict.pop("oversupply_day_dispersion_consecutive_only", None)
+        else:
+            config_dict["oversupply_day_dispersion_consecutive_only"] = bool(raw_cons)
+
+    if "oversupply_adaptive_enable" in req_fields:
+        raw_adapt = getattr(req, "oversupply_adaptive_enable", None)
+        if raw_adapt is None:
+            config_dict.pop("oversupply_adaptive_enable", None)
+        else:
+            config_dict["oversupply_adaptive_enable"] = bool(raw_adapt)
+
+    if "oversupply_adaptive_profile" in req_fields:
+        raw_profile = str(getattr(req, "oversupply_adaptive_profile", "") or "").strip().lower()
+        if not raw_profile:
+            config_dict.pop("oversupply_adaptive_profile", None)
+        elif raw_profile in {"auto", "conservative", "aggressive"}:
+            config_dict["oversupply_adaptive_profile"] = raw_profile
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 

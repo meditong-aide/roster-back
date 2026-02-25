@@ -1,4 +1,6 @@
 .env
+.opencode/
+*AGENTS.md
 __pycache__
 *.mdc
 test_folder/

@@ -40,6 +40,85 @@ def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
     return n_forbid_n
 
 
+def _get_surplus_override_mode_by_nurse(rs) -> dict[int, str]:
+    raw = getattr(rs.config, "surplus_overrides_json", None)
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    allowed = {"avoid", "neutral", "prefer"}
+    out: dict[int, str] = {}
+    for n, nu in enumerate(rs.nurses):
+        key = str(getattr(nu, "db_id", "")).strip()
+        if not key:
+            continue
+        mode = str(raw.get(key, "")).strip().lower()
+        if mode in allowed and mode != "neutral":
+            out[n] = mode
+    return out
+
+
+def _adaptive_surplus_scaling(cfg, join: list[int], leave: list[int], fixed_cnt, D: int) -> tuple[float, float]:
+    if not bool(getattr(cfg, "oversupply_adaptive_enable", True)):
+        return 1.0, 1.0
+
+    req_map = getattr(cfg, "daily_shift_requirements", {}) or {}
+    work_codes = [str(code) for code in req_map.keys() if str(code) != "O"]
+    if not work_codes:
+        return 1.0, 1.0
+
+    shift_idx = {code: int(cfg.shift_types.index(code)) for code in work_codes if code in cfg.shift_types}
+    if not shift_idx:
+        return 1.0, 1.0
+
+    ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+    ratios: list[float] = []
+    for d in range(D):
+        available = sum(1 for n in range(len(join)) if join[n] <= d <= leave[n])
+        if available <= 0:
+            continue
+
+        if isinstance(ds_by_day, list) and d < len(ds_by_day) and isinstance(ds_by_day[d], dict):
+            need_map = ds_by_day[d]
+        else:
+            need_map = req_map
+
+        required = sum(max(0, int((need_map or {}).get(code, req_map.get(code, 0)) or 0)) for code in shift_idx.keys())
+
+        fixed_work = 0
+        if fixed_cnt is not None and d < len(fixed_cnt):
+            for code, s_idx in shift_idx.items():
+                if s_idx < len(fixed_cnt[d]):
+                    fixed_work += max(0, int(fixed_cnt[d][s_idx] or 0))
+
+        effective_required = max(0, required - fixed_work)
+        surplus = max(0, available - effective_required)
+        ratios.append(float(surplus) / float(max(1, available)))
+
+    if not ratios:
+        return 1.0, 1.0
+
+    avg_ratio = sum(ratios) / len(ratios)
+    if avg_ratio >= 0.60:
+        day_mult, bias_mult = 2.0, 0.35
+    elif avg_ratio >= 0.45:
+        day_mult, bias_mult = 2.2, 0.25
+    elif avg_ratio >= 0.30:
+        day_mult, bias_mult = 1.5, 0.6
+    else:
+        day_mult, bias_mult = 1.0, 1.0
+
+    profile = str(getattr(cfg, "oversupply_adaptive_profile", "auto") or "auto").lower()
+    if profile == "conservative":
+        day_mult *= 0.85
+        bias_mult *= 0.9
+    elif profile == "aggressive":
+        day_mult *= 1.2
+        bias_mult *= 0.8
+
+    day_mult = max(0.5, min(3.0, day_mult))
+    bias_mult = max(0.2, min(1.5, bias_mult))
+    return day_mult, bias_mult
+
+
 def build_main_objective_terms(
     *,
     m: cp_model.CpModel,
@@ -108,9 +187,19 @@ def build_main_objective_terms(
     try:
         off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
         if off_penalty > 0:
+            mode_by_nurse = _get_surplus_override_mode_by_nurse(rs)
             for n in range(N):
+                mode = mode_by_nurse.get(n)
+                if mode == "avoid":
+                    n_penalty = max(0, int(round(off_penalty * 0.85)))
+                elif mode == "prefer":
+                    n_penalty = int(round(off_penalty * 1.15))
+                else:
+                    n_penalty = off_penalty
+                if n_penalty <= 0:
+                    continue
                 for d in range(join[n], leave[n] + 1):
-                    obj.append(-off_penalty * X(n, d, off))
+                    obj.append(-n_penalty * X(n, d, off))
     except Exception:
         pass
 
@@ -324,6 +413,7 @@ def build_main_objective_terms(
     try:
         if bool(getattr(cfg, "oversupply_equalize_enable", True)):
             w_eq = int(getattr(cfg, "oversupply_equalize_weight", 120))
+            day_mult, bias_mult = _adaptive_surplus_scaling(cfg, join, leave, fixed_cnt, D)
             for d, code2ov in over_vars_by_day.items():
                 work_codes = [
                     code
@@ -338,8 +428,47 @@ def build_main_objective_terms(
                         m.Add(diff >= ov1 - ov2)
                         m.Add(diff >= ov2 - ov1)
                         obj.append(-w_eq * diff)
+
+            w_day_raw = getattr(cfg, "oversupply_day_dispersion_weight", None)
+            w_day_base = int(round(w_eq * 0.25)) if w_day_raw is None else int(w_day_raw or 0)
+            w_day = max(0, int(round(w_day_base * day_mult)))
+            if w_day > 0 and over_vars_by_day:
+                day_total_oversupply = {
+                    d: sum(code2ov.values()) for d, code2ov in over_vars_by_day.items()
+                }
+                day_indices = sorted(day_total_oversupply.keys())
+                consecutive_only = bool(getattr(cfg, "oversupply_day_dispersion_consecutive_only", False))
+                if consecutive_only:
+                    day_pairs = list(zip(day_indices, day_indices[1:]))
+                else:
+                    day_pairs = [
+                        (day_indices[i], day_indices[j])
+                        for i in range(len(day_indices))
+                        for j in range(i + 1, len(day_indices))
+                    ]
+                for d1, d2 in day_pairs:
+                    t1 = day_total_oversupply[d1]
+                    t2 = day_total_oversupply[d2]
+                    diff_day = m.NewIntVar(0, N, f"ov_day_diff_{d1}_{d2}")
+                    m.Add(diff_day >= t1 - t2)
+                    m.Add(diff_day >= t2 - t1)
+                    obj.append(-w_day * diff_day)
+
+            mode_by_nurse = _get_surplus_override_mode_by_nurse(rs)
+            if mode_by_nurse:
+                work_codes = [
+                    code
+                    for code in cfg.shift_types
+                    if code != "O" and code in cfg.daily_shift_requirements.keys()
+                ]
+                work_shift_indices = [cfg.shift_types.index(code) for code in work_codes]
+                if work_shift_indices:
+                    unit = max(1, int(round(w_eq * 0.03 * bias_mult)))
+                    for n, mode in mode_by_nurse.items():
+                        sign = 1 if mode == "prefer" else -1
+                        for d in range(join[n], leave[n] + 1):
+                            obj.append(sign * unit * sum(X(n, d, s_idx) for s_idx in work_shift_indices))
     except Exception:
         pass
 
     return obj
-

@@ -185,6 +185,10 @@ async def get_config_by_version(
                 preceptee_on=getattr(cfg, 'preceptee_on', False),
                 preceptee_shift_count=getattr(cfg, 'preceptee_shift_count', True),
                 weekly_off_group=getattr(cfg, 'weekly_off_group', False),
+                surplus_policy_preset=getattr(cfg, 'surplus_policy_preset', 'balanced'),
+                surplus_smoothing=getattr(cfg, 'surplus_smoothing', 'standard'),
+                surplus_policy_version=getattr(cfg, 'surplus_policy_version', 1),
+                surplus_overrides_json=getattr(cfg, 'surplus_overrides_json', None),
                 off_placement_mode=getattr(cfg, 'off_placement_mode', 0),
                 not_one_night=getattr(cfg, 'not_one_night', False),
                 use_mid=False,
@@ -223,6 +227,10 @@ async def get_config_by_version(
                 "preceptee_on" : new_config.preceptee_on,
                 "preceptee_shift_count" : new_config.preceptee_shift_count,
                 "weekly_off_group" : new_config.weekly_off_group,
+                "surplus_policy_preset": new_config.surplus_policy_preset,
+                "surplus_smoothing": new_config.surplus_smoothing,
+                "surplus_policy_version": new_config.surplus_policy_version,
+                "surplus_overrides_json": new_config.surplus_overrides_json,
                 "off_placement_mode" : new_config.off_placement_mode,
                 "not_one_night" : new_config.not_one_night,
                 "use_mid": bool(getattr(new_config, "use_mid", False)),
@@ -263,6 +271,10 @@ async def get_config_by_version(
                 "preceptee_on" : config.preceptee_on,
                 "preceptee_shift_count" : config.preceptee_shift_count,
                 "weekly_off_group" : config.weekly_off_group,
+                "surplus_policy_preset": config.surplus_policy_preset,
+                "surplus_smoothing": config.surplus_smoothing,
+                "surplus_policy_version": config.surplus_policy_version,
+                "surplus_overrides_json": config.surplus_overrides_json,
                 "off_placement_mode" : config.off_placement_mode,
                 "not_one_night" : config.not_one_night,
                 "use_mid": bool(getattr(config, "use_mid", False)),
@@ -361,9 +373,8 @@ async def get_issued_roster_snapshot(
             detail=f"Failed to get issued roster snapshot: {str(e)}",
         )
 
-# [Schedules] - 현재 그룹의 특정 월에 대한 스케줄 상태 확인
-@router.get("/status")
-async def get_schedule_status(
+@router.get("/status/summary")
+async def get_schedule_status_summary(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -547,9 +558,8 @@ async def get_schedule_versions(
         "name": schedule.name
     } for schedule in schedules]
 
-# [Roster] - 특정 월의 근무표 조회
-@router.get("/{year:int}/{month:int}")
-async def get_roster_for_month(
+@router.get("/{year:int}/{month:int}/issued-roster")
+async def get_issued_roster_for_month(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -1124,7 +1134,12 @@ async def validate_roster(
     month: int  = roster_data.get('month')
     roster      = roster_data.get('roster')
     schedule_id = roster_data.get('schedule_id')
-    config_id = db.query(Schedule).filter(Schedule.schedule_id == schedule_id).first().config_id
+    schedule = (
+        db.query(Schedule)
+        .filter(Schedule.schedule_id == schedule_id)
+        .first()
+    )
+    config_id = getattr(schedule, "config_id", None)
 
     # config_version = db.query(RosterConfigModel).filter(RosterConfigModel.config_id == config_id).first().config_version
     if not all([year, month, roster]):
@@ -1192,16 +1207,27 @@ async def validate_roster(
         except Exception as e:
             print(f"[validate_roster] 휴무 shift 정규화 로딩 실패: {e}")
         # ──────────────────────── 2. 근무표 설정(인원/제약) 불러오기 ────────────────────────
-        latest_config_db = db.query(RosterConfigModel).filter(
-            RosterConfigModel.office_id == office_id,
-            RosterConfigModel.group_id == target_group_id,
-        ).order_by(RosterConfigModel.created_at.desc()).first()
+        latest_config_db = None
+        if config_id is not None:
+            latest_config_db = (
+                db.query(RosterConfigModel)
+                .filter(RosterConfigModel.config_id == config_id)
+                .first()
+            )
+        if not latest_config_db:
+            latest_config_db = (
+                db.query(RosterConfigModel)
+                .filter(
+                    RosterConfigModel.office_id == office_id,
+                    RosterConfigModel.group_id == target_group_id,
+                )
+                .order_by(RosterConfigModel.created_at.desc())
+                .first()
+            )
         if not latest_config_db:
             return {"violations": ["근무표 설정을 찾을 수 없습니다."]}
 
         max_nig = latest_config_db.max_nig_per_month
-        if max_nig != 15:
-            max_nig = 17
 
         roster_config_for_engine = NurseRosterConfig(
             daily_shift_requirements=daily_shift_requirements,

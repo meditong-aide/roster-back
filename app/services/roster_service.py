@@ -9,6 +9,7 @@ from datetime import date, datetime
 import calendar
 import uuid
 
+from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -427,6 +428,10 @@ def create_issued_roster_snapshot(
                 "preceptor_gauge": cfg.preceptor_gauge,
                 "preceptee_on": cfg.preceptee_on,
                 "preceptee_shift_count": cfg.preceptee_shift_count,
+                "surplus_policy_preset": cfg.surplus_policy_preset,
+                "surplus_smoothing": cfg.surplus_smoothing,
+                "surplus_policy_version": cfg.surplus_policy_version,
+                "surplus_overrides_json": cfg.surplus_overrides_json,
                 "created_at": cfg.created_at.isoformat()
                 if getattr(cfg, "created_at", None)
                 else None,

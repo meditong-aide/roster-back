@@ -252,6 +252,10 @@ class RosterConfig(Base):
     team_balance_enable = Column(BOOLEAN, nullable=False, default=False)
     team_balance_gauge = Column(INTEGER, nullable=False, default=0)
     team_balance_mode = Column(VARCHAR(20), nullable=False, default="balanced")
+    surplus_policy_preset = Column(VARCHAR(30), nullable=False, default="balanced")
+    surplus_smoothing = Column(VARCHAR(20), nullable=False, default="standard")
+    surplus_policy_version = Column(INTEGER, nullable=False, default=1)
+    surplus_overrides_json = Column(JSON, nullable=True)
     off_placement_mode = Column(INTEGER, nullable=False, default=0)
     fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
 

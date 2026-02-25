@@ -69,20 +69,32 @@ WHERE TABLE_SCHEMA = 'dbo'
 5. Write/update the Notion entry using bullet points only; do not include commit hashes.
 
 ### Writing format (Mandatory)
-- Use short bullet points that describe:
-  - What feature or improvement was worked on today
-  - What key sub-tasks were done to complete that work
-  - What user-visible or operational effect is expected
-- Keep wording plain and intuitive so non-developers can understand it quickly.
-- Avoid low-level implementation detail unless it changes business behavior.
+- Use one top-level heading: `주요 내용`.
+- Under that heading, use numbered subheadings per work item:
+  - Format: `N. [카테고리]: [작업명] [소요시간]`
+  - Example category: `근무표 AI`, `코드 리뷰`, `운영 개선`
+- For each subheading, add 2-5 bullet points that explain:
+  - What was done
+  - Why it was needed (problem/risk)
+  - What changed for users or operations
+- Keep each bullet to one short sentence when possible.
+- Use plain, non-technical wording so non-developers can understand quickly.
+- Do not include commit hashes, deep internal formulas, or code-level jargon.
 
 ### Example skeleton
-- `오늘 진행한 기능`
-  - 예약/스케줄 관련 어떤 기능을 개선했는지 한 줄 요약
-- `세부 작업`
-  - 데이터 검증/권한 처리/응답 개선 등 핵심 작업 항목
-- `기대 효과`
-  - 현장 사용자가 체감하는 변화 또는 운영상 이점
+- `주요 내용`
+  - `근무표 AI`
+    - `1. v2 일정 수립 [80분]`
+      - 세브란스 관련 개발 항목을 정리하고 우선순위를 맞춤
+      - 항목을 주제별로 나눠 담당자와 일정을 배정함
+    - `2. 알고리즘 고도화 [240분]`
+      - 주휴 근처 OFF 배치가 불안정한 문제를 줄이도록 보완함
+      - 휴가가 많은 경우에도 OFF가 누락되지 않도록 계산 조건을 개선함
+      - 부작용 가능 구간은 추가 테스트 대상으로 분리해 추적 중임
+  - `코드 리뷰`
+    - `3. 에이전트 프롬프트 테스트 리뷰 [50분]`
+      - 동적 프롬프트 변경 건을 검토하고 병합함
+      - 최적화 roster 처리 관련 변경사항을 함께 확인함
 
 ### Operational checklist
 - Use `docs/DAILY_JOURNAL_CHECKLIST.md` when creating or updating the daily Notion journal entry.

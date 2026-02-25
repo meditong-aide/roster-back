@@ -10,7 +10,23 @@ from services.cp_sat.hardcoded_weights import (
     N_ONLY_NIGHT_BONUS,
     PREFERENCE_SCORE_SCALE,
 )
-from services.cp_sat.objective_terms import _n_forbid_n_set
+from services.cp_sat.objective_terms import _adaptive_surplus_scaling, _n_forbid_n_set
+
+
+def _get_surplus_override_mode_by_nurse(roster_system) -> dict[int, str]:
+    raw = getattr(roster_system.config, "surplus_overrides_json", None)
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    allowed = {"avoid", "neutral", "prefer"}
+    out: dict[int, str] = {}
+    for n, nu in enumerate(roster_system.nurses):
+        key = str(getattr(nu, "db_id", "")).strip()
+        if not key:
+            continue
+        mode = str(raw.get(key, "")).strip().lower()
+        if mode in allowed and mode != "neutral":
+            out[n] = mode
+    return out
 
 
 def build_fallback_stage3_objective_terms(
@@ -78,9 +94,19 @@ def build_fallback_stage3_objective_terms(
         off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
         if off_penalty > 0:
             off_idx = cfg.shift_types.index("O")
+            mode_by_nurse = _get_surplus_override_mode_by_nurse(roster_system)
             for n in range(N):
+                mode = mode_by_nurse.get(n)
+                if mode == "avoid":
+                    n_penalty = max(0, int(round(off_penalty * 0.85)))
+                elif mode == "prefer":
+                    n_penalty = int(round(off_penalty * 1.15))
+                else:
+                    n_penalty = off_penalty
+                if n_penalty <= 0:
+                    continue
                 for d in range(join[n], leave[n] + 1):
-                    obj.append(-off_penalty * X(n, d, off_idx))
+                    obj.append(-n_penalty * X(n, d, off_idx))
     except Exception:
         pass
 
@@ -361,6 +387,7 @@ def build_fallback_stage3_objective_terms(
     try:
         if bool(getattr(cfg, "oversupply_equalize_enable", True)):
             w_eq = int(getattr(cfg, "oversupply_equalize_weight", 120))
+            day_mult, bias_mult = _adaptive_surplus_scaling(cfg, join, leave, fixed_cnt, D)
             for d, code2ov in over_vars_by_day.items():
                 work_codes = [
                     code
@@ -375,6 +402,46 @@ def build_fallback_stage3_objective_terms(
                         m.Add(diff >= ov1 - ov2)
                         m.Add(diff >= ov2 - ov1)
                         obj.append(-w_eq * diff)
+
+            w_day_raw = getattr(cfg, "oversupply_day_dispersion_weight", None)
+            w_day_base = int(round(w_eq * 0.25)) if w_day_raw is None else int(w_day_raw or 0)
+            w_day = max(0, int(round(w_day_base * day_mult)))
+            if w_day > 0 and over_vars_by_day:
+                day_total_oversupply = {
+                    d: sum(code2ov.values()) for d, code2ov in over_vars_by_day.items()
+                }
+                day_indices = sorted(day_total_oversupply.keys())
+                consecutive_only = bool(getattr(cfg, "oversupply_day_dispersion_consecutive_only", False))
+                if consecutive_only:
+                    day_pairs = list(zip(day_indices, day_indices[1:]))
+                else:
+                    day_pairs = [
+                        (day_indices[i], day_indices[j])
+                        for i in range(len(day_indices))
+                        for j in range(i + 1, len(day_indices))
+                    ]
+                for d1, d2 in day_pairs:
+                    t1 = day_total_oversupply[d1]
+                    t2 = day_total_oversupply[d2]
+                    diff_day = m.NewIntVar(0, N, f"ov_day_diff_fb_{d1}_{d2}")
+                    m.Add(diff_day >= t1 - t2)
+                    m.Add(diff_day >= t2 - t1)
+                    obj.append(-w_day * diff_day)
+
+            mode_by_nurse = _get_surplus_override_mode_by_nurse(roster_system)
+            if mode_by_nurse:
+                work_codes = [
+                    code
+                    for code in cfg.shift_types
+                    if code != "O" and code in cfg.daily_shift_requirements.keys()
+                ]
+                work_shift_indices = [cfg.shift_types.index(code) for code in work_codes]
+                if work_shift_indices:
+                    unit = max(1, int(round(w_eq * 0.03 * bias_mult)))
+                    for n, mode in mode_by_nurse.items():
+                        sign = 1 if mode == "prefer" else -1
+                        for d in range(join[n], leave[n] + 1):
+                            obj.append(sign * unit * sum(X(n, d, s_idx) for s_idx in work_shift_indices))
     except Exception:
         pass
 
@@ -413,5 +480,3 @@ def build_fallback_stage3_objective_terms(
         pass
 
     return obj
-
-

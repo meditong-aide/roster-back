@@ -10,7 +10,6 @@
 
 ## 적용 위치(엔드포인트)
 - `POST /roster_create/generate` (요청 모델: `RosterRequest`)
-- `POST /roster_create/hold_generate` (요청 모델: `HoldGenerateRequest`)
 
 ## req 파라미터(임시 UI 대체)
 - **distribution_mode**: `"hybrid" | "balanced" | "preference" | "off"` (기본 `"hybrid"`)
@@ -58,5 +57,4 @@
   }
 }
 ```
-
 

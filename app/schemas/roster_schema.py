@@ -101,6 +101,13 @@ class RosterRequest(BaseModel):
     distribution_mode: str = Field(default="hybrid")
     oversupply_balance_gauge: Optional[int] = Field(default=6, ge=0, le=10)
     monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
+    surplus_policy_preset: Optional[Literal["balanced", "min_surplus", "fair_spread"]] = Field(default=None)
+    surplus_smoothing: Optional[Literal["off", "standard", "strong"]] = Field(default=None)
+    surplus_overrides_json: Optional[Dict[str, Literal["avoid", "neutral", "prefer"]]] = None
+    oversupply_day_dispersion_weight: Optional[int] = Field(default=None, ge=0)
+    oversupply_day_dispersion_consecutive_only: Optional[bool] = Field(default=None)
+    oversupply_adaptive_enable: Optional[bool] = Field(default=None)
+    oversupply_adaptive_profile: Optional[Literal["auto", "conservative", "aggressive"]] = Field(default=None)
     # 월단위 선호(개인 입력): nurse_id -> {"shift": "D|E|N", "strength": 0~10}
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
     not_one_night: Optional[bool] = Field(default=None, description="야간 단발성(1N) 금지 여부")
@@ -213,6 +220,10 @@ class RosterConfigBase(BaseModel):
     team_balance_enable: bool = Field(default=False)
     team_balance_gauge: int = Field(default=0, ge=0, le=10)
     team_balance_mode: str = Field(default="balanced")
+    surplus_policy_preset: Literal["balanced", "min_surplus", "fair_spread"] = Field(default="balanced")
+    surplus_smoothing: Literal["off", "standard", "strong"] = Field(default="standard")
+    surplus_policy_version: int = Field(default=1, ge=1)
+    surplus_overrides_json: Optional[Dict[str, Literal["avoid", "neutral", "prefer"]]] = None
     off_placement_mode: int = Field(default=1, description="주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)")
     fixed_wanted_use_yn: bool = Field(default=False, description="확정 원티드 DENO 전체 고정 여부")
 

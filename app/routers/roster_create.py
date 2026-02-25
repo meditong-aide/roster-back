@@ -3,13 +3,12 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import boto3
 import dotenv
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db.client2 import get_db
@@ -18,45 +17,11 @@ from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest
 from services.roster_create_service import (
     generate_roster_service,
-    # generate_roster_service_with_fixed_cells,
     request_schedule_service,
 )
 from services.job_status_service import create_job_record
 
 router = APIRouter(tags=["roster_create"])
-
-
-class HoldGenerateRequest(BaseModel):
-    """
-    고정 셀 정보를 포함한 근무표 생성 요청 모델.
-
-    인자:
-        year: 대상 연도 (예: 2025).
-        month: 대상 월 (예: 3).
-        fixed_cells: 미리 확정한 셀 목록.
-        config_id: 사용 설정 ID.
-        distribution_mode: 근무 배분 모드.
-        oversupply_balance_gauge: 과잉 공급 균형 지표(0~10, 예: 6).
-        monthly_preference_gauge: 월 선호도 반영 지표(0~10, 예: 3).
-        monthly_shift_preferences: 개인별 월간 선호 근무 설정.
-    반환:
-        BaseModel: Pydantic 검증을 거친 요청 데이터.
-    예외:
-        ValidationError: 필드 검증 실패 시 발생.
-    예시:
-        year=2025, month=3, oversupply_balance_gauge=6 → 검증 통과.
-    """
-
-    year: int
-    month: int
-    fixed_cells: List[Dict[str, Any]]
-    config_id: Optional[int] = None
-    # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
-    distribution_mode: str = "hybrid"
-    oversupply_balance_gauge: Optional[int] = Field(default=6, ge=0, le=10)
-    monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
-    monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 dotenv.load_dotenv(BASE_DIR / ".env")
 
@@ -85,7 +50,7 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
     try:
         message_body = json.dumps(job_body, ensure_ascii=False)
     except (TypeError, ValueError) as exc:
-        print('message_body', message_body)
+        print('job_body', job_body)
         raise HTTPException(status_code=400, detail=f"잘못된 메시지 본문: {exc}") from exc
 
     try:
@@ -230,35 +195,3 @@ async def request_schedule(
         return request_schedule_service(req, current_user, db)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"스케줄 생성 실패: {str(e)}")
-
-
-# [Roster] - 고정된 셀을 반영한 근무표 생성
-@router.post("/roster_create/hold_generate")
-async def hold_generate_roster_endpoint(
-    req: HoldGenerateRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db)
-):
-    """
-    고정된 셀 정보를 반영해 근무표를 생성한다.
-
-    인자:
-        req: 고정 셀 포함 근무표 생성 요청 DTO.
-        current_user: 로그인 사용자 정보.
-        db: DB 세션.
-    반환:
-        dict: 생성된 근무표 데이터.
-    예외:
-        HTTPException: 내부 오류 발생 시 500.
-    예시:
-        fixed_cells를 포함한 year=2025, month=3 요청 처리.
-    """
-    try:
-        # 고정된 셀 정보를 포함하여 근무표 생성 서비스 호출
-        return generate_roster_service_with_fixed_cells(req, current_user, db)
-    except Exception as e:
-        print('error', e)
-        raise HTTPException(status_code=500, detail=f"고정 후 근무표 생성 실패: {str(e)}")
-
-
-    
