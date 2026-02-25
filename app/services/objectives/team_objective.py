@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 from services.roster_system import RosterSystem
+from services.objectives.team_objective_v2 import add_team_balance_objective_terms_v2
 
 
-def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> list:
+def _add_team_balance_objective_terms_legacy(m, rs: RosterSystem, X, join, leave) -> list:
     """팀별 동일 교대 정렬을 유도하는 목적함수 항을 생성한다.
 
     개요:
@@ -144,4 +145,15 @@ def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> lis
 
     return obj_terms
 
+
+def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> list:
+    cfg = rs.config
+    strategy = str(
+        getattr(cfg, "team_balance_strategy", None)
+        or getattr(cfg, "team_balance_algorithm", None)
+        or "v2"
+    ).strip().lower()
+    if strategy == "legacy":
+        return _add_team_balance_objective_terms_legacy(m, rs, X, join, leave)
+    return add_team_balance_objective_terms_v2(m, rs, X, join, leave)
 

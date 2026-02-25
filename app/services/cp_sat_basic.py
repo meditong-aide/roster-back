@@ -478,6 +478,20 @@ class CPSATBasicEngine:
         setattr(cfg, "shadow_coverage_lookback_days", int(config_data.get("shadow_coverage_lookback_days", 6) or 0))
         setattr(cfg, "shadow_coverage_need_ratio", float(config_data.get("shadow_coverage_need_ratio", 0.6) or 0.0))
         setattr(cfg, "shadow_coverage_penalty_weight", int(config_data.get("shadow_coverage_penalty_weight", 6) or 0))
+        setattr(cfg, "surplus_target_enable", bool(config_data.get("surplus_target_enable", True)))
+        setattr(
+            cfg,
+            "surplus_direction_mode",
+            str(config_data.get("surplus_direction_mode", "de_balanced") or "de_balanced").lower(),
+        )
+        setattr(
+            cfg,
+            "surplus_target_strategy",
+            str(config_data.get("surplus_target_strategy", "huber") or "huber").lower(),
+        )
+        setattr(cfg, "surplus_target_weight", int(config_data.get("surplus_target_weight", 0) or 0))
+        setattr(cfg, "surplus_target_band", int(config_data.get("surplus_target_band", 1) or 1))
+        setattr(cfg, "surplus_target_hinge", int(config_data.get("surplus_target_hinge", 2) or 2))
         print("=== DEBUG: 최종 cfg 값 확인 ===")
         print("oversupply_equalize_weight:", cfg.oversupply_equalize_weight)
         print("extra_off_penalty_weight:", cfg.extra_off_penalty_weight)

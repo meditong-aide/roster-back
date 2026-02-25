@@ -108,6 +108,10 @@ class RosterRequest(BaseModel):
     oversupply_day_dispersion_consecutive_only: Optional[bool] = Field(default=None)
     oversupply_adaptive_enable: Optional[bool] = Field(default=None)
     oversupply_adaptive_profile: Optional[Literal["auto", "conservative", "aggressive"]] = Field(default=None)
+    team_balance_strategy: Optional[Literal["v2", "legacy"]] = Field(default=None)
+    surplus_direction_mode: Optional[Literal["d_only", "de_balanced", "all_work_balanced"]] = Field(default=None)
+    surplus_target_strategy: Optional[Literal["l1", "huber", "banded"]] = Field(default=None)
+    surplus_target_weight: Optional[int] = Field(default=None, ge=0)
     # 월단위 선호(개인 입력): nurse_id -> {"shift": "D|E|N", "strength": 0~10}
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
     not_one_night: Optional[bool] = Field(default=None, description="야간 단발성(1N) 금지 여부")

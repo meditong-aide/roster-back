@@ -2397,6 +2397,8 @@ def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
         config_dict["team_balance_focus_shifts"] = None
     if "team_balance_mode" not in config_dict:
         config_dict["team_balance_mode"] = "balanced"
+    if "team_balance_strategy" not in config_dict:
+        config_dict["team_balance_strategy"] = "v2"
 
     # 모드별 교대 가중치가 비어있으면 기본값을 채운다.
     if not config_dict.get("team_balance_shift_weights"):
@@ -2596,6 +2598,41 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
             config_dict.pop("oversupply_adaptive_profile", None)
         elif raw_profile in {"auto", "conservative", "aggressive"}:
             config_dict["oversupply_adaptive_profile"] = raw_profile
+
+    if "team_balance_strategy" in req_fields:
+        raw_team_strategy = str(getattr(req, "team_balance_strategy", "") or "").strip().lower()
+        if not raw_team_strategy:
+            config_dict.pop("team_balance_strategy", None)
+        elif raw_team_strategy in {"v2", "legacy"}:
+            config_dict["team_balance_strategy"] = raw_team_strategy
+
+    if "surplus_direction_mode" in req_fields:
+        raw_direction = str(getattr(req, "surplus_direction_mode", "") or "").strip().lower()
+        if not raw_direction:
+            config_dict.pop("surplus_direction_mode", None)
+        elif raw_direction in {"d_only", "de_balanced", "all_work_balanced"}:
+            config_dict["surplus_direction_mode"] = raw_direction
+
+    if "surplus_target_strategy" in req_fields:
+        raw_strategy = str(getattr(req, "surplus_target_strategy", "") or "").strip().lower()
+        if not raw_strategy:
+            config_dict.pop("surplus_target_strategy", None)
+        elif raw_strategy in {"l1", "huber", "banded"}:
+            config_dict["surplus_target_strategy"] = raw_strategy
+
+    if "surplus_target_weight" in req_fields:
+        raw_w = getattr(req, "surplus_target_weight", None)
+        if raw_w is None:
+            config_dict.pop("surplus_target_weight", None)
+        else:
+            try:
+                config_dict["surplus_target_weight"] = max(0, int(raw_w))
+            except Exception:
+                pass
+
+    config_dict.setdefault("surplus_direction_mode", "de_balanced")
+    config_dict.setdefault("surplus_target_strategy", "huber")
+    config_dict.setdefault("surplus_target_enable", True)
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 

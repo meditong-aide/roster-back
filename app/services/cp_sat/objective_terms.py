@@ -16,6 +16,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
     WEEK_OFF_SHORT_PENALTY,
 )
+from services.objectives.surplus_target_objective import append_surplus_target_direction_terms
 from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
 
@@ -453,6 +454,15 @@ def build_main_objective_terms(
                     m.Add(diff_day >= t1 - t2)
                     m.Add(diff_day >= t2 - t1)
                     obj.append(-w_day * diff_day)
+
+            append_surplus_target_direction_terms(
+                m=m,
+                cfg=cfg,
+                over_vars_by_day=over_vars_by_day,
+                obj=obj,
+                N=N,
+                prefix="main",
+            )
 
             mode_by_nurse = _get_surplus_override_mode_by_nurse(rs)
             if mode_by_nurse:
