@@ -70,6 +70,11 @@
 - Daily journal content MUST be derived from commits made today (branch-aware), and summarize feature-level work plus key sub-tasks without commit hashes.
 - Daily journal writing MUST use clear bullet points and plain, non-technical wording that non-developers can understand.
 - Daily journal entries MUST include per-item details for: problem, planned fix direction, work performed, tests/experiments, final decision/change, and total time spent (follow `docs/AGENTS.md` checklist).
+- Daily journal updates MUST use Notion MCP as the first path (do not rely on browser automation first).
+- Before writing, always verify MCP connectivity with `opencode mcp list` and confirm `notion` is connected.
+- If the first write attempt fails, retry with explicit model pin:
+  - `opencode run --model openai/gpt-5.3-codex "<Notion update instruction>"`
+- If MCP is unavailable, report the exact blocker (e.g., auth/billing/connectivity) and provide a ready-to-paste Notion body in the required format.
 
 ## Context Map (Action-Based Routing)
 

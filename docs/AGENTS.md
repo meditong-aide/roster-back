@@ -72,11 +72,15 @@ WHERE TABLE_SCHEMA = 'dbo'
 
 ### Update workflow (Mandatory)
 
+0. Verify Notion MCP connectivity first with `opencode mcp list` and confirm `notion` is connected.
 1. Check whether today's child page already exists under `개발일지`.
 2. If missing, create today's page. If present, update that same page.
 3. Collect today's commits with branch context (focus on commits authored today on the current working branch path).
 4. Convert commit intent into user-facing work summary (feature-level + key sub-tasks).
 5. Write/update the Notion entry using bullet points only; do not include commit hashes.
+6. If the first MCP write attempt fails, retry with explicit model pin:
+   - `opencode run --model openai/gpt-5.3-codex "<Notion update instruction>"`
+7. If MCP is unavailable, explicitly record blocker reason (auth/billing/connectivity) and return a ready-to-paste body.
 
 ### Writing format (Mandatory)
 
