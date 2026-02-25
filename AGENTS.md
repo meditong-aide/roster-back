@@ -69,6 +69,7 @@
 - For daily journal updates: if today's child page does not exist, create it; if it exists, append/update that same page.
 - Daily journal content MUST be derived from commits made today (branch-aware), and summarize feature-level work plus key sub-tasks without commit hashes.
 - Daily journal writing MUST use clear bullet points and plain, non-technical wording that non-developers can understand.
+- Daily journal entries MUST include per-item details for: problem, planned fix direction, work performed, tests/experiments, final decision/change, and total time spent (follow `docs/AGENTS.md` checklist).
 
 ## Context Map (Action-Based Routing)
 
