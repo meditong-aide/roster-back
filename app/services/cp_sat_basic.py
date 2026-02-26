@@ -1108,13 +1108,13 @@ class CPSATBasicEngine:
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
-        # 9-1. 불필요 OFF 정리 (N-only 제외)
-        try:
-            with Timer("불필요 OFF 정리"):
-                trimmed = self._postprocess_trim_extra_offs(roster_system, max_changes=80, prefer_shortage=True)
-                print(f"{self.logger_prefix} 불필요 OFF 교체 {trimmed}건")
-        except Exception as exc:
-            print(f"{self.logger_prefix} 불필요 OFF 후처리 실패: {exc}")
+        # # 9-1. 불필요 OFF 정리 (N-only 제외)
+        # try:
+        #     with Timer("불필요 OFF 정리"):
+        #         trimmed = self._postprocess_trim_extra_offs(roster_system, max_changes=80, prefer_shortage=True)
+        #         print(f"{self.logger_prefix} 불필요 OFF 교체 {trimmed}건")
+        # except Exception as exc:
+        #     print(f"{self.logger_prefix} 불필요 OFF 후처리 실패: {exc}")
 
         # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
         # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
