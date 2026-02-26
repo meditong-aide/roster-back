@@ -6,11 +6,13 @@ from ortools.sat.python import cp_model
 
 from services.cp_sat.hardcoded_weights import (
     FALLBACK_EXPERIENCE_SHORT_PENALTY,
-    NIGHT_DEVIATION_PENALTY,
     N_ONLY_NIGHT_BONUS,
     PREFERENCE_SCORE_SCALE,
 )
-from services.cp_sat.objective_terms import _n_forbid_n_set, add_even_mid_distribution_terms
+from services.cp_sat.objective_terms import (
+    add_even_mid_distribution_terms,
+    add_even_night_minmax_distribution_terms,
+)
 
 
 def build_fallback_stage3_objective_terms(
@@ -262,64 +264,19 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
-    # 야간 균등화(편차 패널티) - N 전일 금지 간호사는 대상에서 제외
     try:
-        if bool(getattr(cfg, "even_nights", False)):
-            night_idx = cfg.shift_types.index("N")
-            normals: list[int] = []
-            for i, nu in enumerate(roster_system.nurses):
-                is_n_only = False
-                raw = getattr(nu, "is_night_nurse", None)
-                if isinstance(raw, list):
-                    allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                    is_n_only = allowed == {"N"}
-                elif raw == 3 or (raw is not None and raw not in (0, False)):
-                    is_n_only = True
-                if not is_n_only:
-                    normals.append(i)
-            n_forbid_n = _n_forbid_n_set(roster_system, join, leave)
-            normals_can_n = [n for n in normals if n not in n_forbid_n]
-            if normals_can_n:
-                if (
-                    hasattr(cfg, "daily_shift_requirements_by_day")
-                    and isinstance(cfg.daily_shift_requirements_by_day, list)
-                    and len(cfg.daily_shift_requirements_by_day) == D
-                ):
-                    daily_need_n = [
-                        int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
-                        for d in range(D)
-                    ]
-                else:
-                    base_n = int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
-                    daily_need_n = [base_n for _ in range(D)]
-                total_need_n = 0
-                for d in range(D):
-                    need = max(0, daily_need_n[d] - int(fixed_cnt[d][night_idx] or 0))
-                    total_need_n += need
-
-                if total_need_n > 0:
-                    target = total_need_n // len(normals_can_n)
-                    print(
-                        f"{logger_prefix} [N균등] even_nights 적용(폴백 Stage3): "
-                        f"normals_can_N={len(normals_can_n)}, n_forbid_N={len(n_forbid_n)}, "
-                        f"target_N_per_nurse={target}, total_need_n={total_need_n}, "
-                        f"penalty_weight={NIGHT_DEVIATION_PENALTY}"
-                    )
-                    for n in normals_can_n:
-                        tot_nights = sum(
-                            X(n, d, night_idx) for d in range(join[n], leave[n] + 1)
-                        )
-                        dev_pos = m.NewIntVar(0, D, f"night_devP_fb_{n}")
-                        dev_neg = m.NewIntVar(0, D, f"night_devN_fb_{n}")
-                        m.Add(dev_pos - dev_neg == tot_nights - target)
-                        obj.extend(
-                            [
-                                -NIGHT_DEVIATION_PENALTY * dev_pos,
-                                -NIGHT_DEVIATION_PENALTY * dev_neg,
-                            ]
-                        )
-                else:
-                    print(f"{logger_prefix} [N균등] even_nights 켜짐 but total_need_n=0 → 패널티 미적용")
+        obj.extend(
+            add_even_night_minmax_distribution_terms(
+                m=m,
+                rs=roster_system,
+                X=X,
+                join=join,
+                leave=leave,
+                fixed_cnt=fixed_cnt,
+                logger_prefix=logger_prefix,
+                stage_label="폴백 Stage3",
+            )
+        )
         obj.extend(
             add_even_mid_distribution_terms(
                 m=m,
