@@ -10,7 +10,7 @@ from services.cp_sat.hardcoded_weights import (
     N_ONLY_NIGHT_BONUS,
     PREFERENCE_SCORE_SCALE,
 )
-from services.cp_sat.objective_terms import _n_forbid_n_set
+from services.cp_sat.objective_terms import _n_forbid_n_set, add_even_mid_distribution_terms
 
 
 def build_fallback_stage3_objective_terms(
@@ -320,11 +320,16 @@ def build_fallback_stage3_objective_terms(
                         )
                 else:
                     print(f"{logger_prefix} [N균등] even_nights 켜짐 but total_need_n=0 → 패널티 미적용")
-            else:
-                print(
-                    f"{logger_prefix} [N균등] even_nights 켜짐 but "
-                    "normals_can_N(비야간전담·N가능)=0 → 스킵"
-                )
+        obj.extend(
+            add_even_mid_distribution_terms(
+                m=m,
+                rs=roster_system,
+                X=X,
+                join=join,
+                leave=leave,
+                fixed_cnt=fixed_cnt,
+            )
+        )
     except Exception as exc:
         print(f"{logger_prefix} [WARN] even_nights penalty 적용 실패: {exc}")
 
@@ -413,5 +418,3 @@ def build_fallback_stage3_objective_terms(
         pass
 
     return obj
-
-
