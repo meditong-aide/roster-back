@@ -2190,15 +2190,22 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if code not in rs.config.shift_types:
                 continue
             s = rs.config.shift_types.index(code)
-            need = int(req) - fixed_cnt_adj[d][s]
-            if need <= 0:
-                continue
+            req_raw = max(0, int(req or 0))
+            need = req_raw - fixed_cnt_adj[d][s]
             assigned = sum(
                 X(n, d, s)
                 for n in range(N)
                 if join[n] <= d <= leave[n] and (n, d) not in fixed
                 and (not exclude_preceptee_from_den or n not in preceptee_indices)
             )
+            if code == "M":
+                assigned_total = assigned + int(fixed_cnt[d][s] or 0)
+                m.Add(assigned_total <= req_raw)
+                ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                over_vars_by_day.setdefault(d, {})[code] = ov
+                continue
+            if need <= 0:
+                continue
             m.Add(assigned >= need)
             ov = m.NewIntVar(0, N, f"over_{d}_{code}")
             m.Add(ov >= assigned - need)
