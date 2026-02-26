@@ -1127,33 +1127,50 @@ class CPSATBasicEngine:
         # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
         # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
         #       프리셉터의 특수코드(법,생,휴 등 원티드) → 프리셉티는 OFF
+        #       프리셉티 본인의 확정 원티드(fixed_wanted)는 유지
         preceptee_follow = bool(getattr(roster_system.config, 'preceptee_on', False))
         if preceptee_follow and hasattr(roster_system, 'nurses'):
             _shift_types = roster_system.config.shift_types
             _off_s_idx = _shift_types.index('O') if 'O' in _shift_types else None
-            _standard = {'D', 'E', 'N', 'O'}
+            _standard = set(_shift_types)  # D,E,N,O (+ M if use_mid)
             id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+
+            # fixed_wanted_use_yn일 때 프리셉티 본인의 확정 원티드 날짜 보호
+            _pte_own_fixed: set[tuple[int, int]] = set()
+            _fw_use = bool(getattr(roster_system.config, 'fixed_wanted_use_yn', False))
+            if _fw_use:
+                _fc = getattr(roster_system, "fixed_cells", []) or []
+                for cell in _fc:
+                    _ni = cell.get("nurse_index")
+                    if _ni is not None and _ni < len(roster_system.nurses):
+                        _nu_fc = roster_system.nurses[_ni]
+                        if getattr(_nu_fc, 'preceptor_id', None):
+                            _pte_own_fixed.add((_ni, cell.get("day_index")))
+
             synced = 0
             special_converted = 0
+            fixed_kept = 0
             for n, nu in enumerate(roster_system.nurses):
                 pid = getattr(nu, 'preceptor_id', None)
                 if not pid or pid not in id_to_idx:
                     continue
                 ptr_idx = id_to_idx[pid]
-                # 1단계: 프리셉터 roster 전체 복사
-                roster_system.roster[n] = roster_system.roster[ptr_idx].copy()
-                # 2단계: 특수코드 일자는 프리셉티를 OFF로 전환
-                if _off_s_idx is not None:
-                    for d in range(roster_system.num_days):
+                # 날짜별 복사 (프리셉티 본인의 확정 원티드 날짜는 SKIP)
+                for d in range(roster_system.num_days):
+                    if (n, d) in _pte_own_fixed:
+                        fixed_kept += 1
+                        continue  # 프리셉티 본인의 확정 원티드 유지
+                    # 프리셉터 roster 복사
+                    roster_system.roster[n, d, :] = roster_system.roster[ptr_idx, d, :].copy()
+                    # 특수코드 일자는 프리셉티를 OFF로 전환
+                    if _off_s_idx is not None:
                         need_off = False
                         _original = fixed_original_shift_map.get((ptr_idx, d))
                         if _original:
-                            # 원본 코드 존재 → 원본 기준으로만 판정 (엔진 정규화 코드 무시)
                             _ou = _original.upper()
                             if _ou not in _standard and _ou not in _work_sub_ids:
                                 need_off = True
                         else:
-                            # 원본 없으면 roster 코드 기준
                             _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
                             if len(_idx_arr) > 0:
                                 _s_code = _shift_types[int(_idx_arr[0])]
@@ -1163,20 +1180,16 @@ class CPSATBasicEngine:
                             roster_system.roster[n, d, :] = 0
                             roster_system.roster[n, d, _off_s_idx] = 1
                             special_converted += 1
-                            
-                            # 디버깅용
-                            # preceptor_code = _shift_types[int(np.where(roster_system.roster[ptr_idx, d] == 1)[0][0])]
-                            # original_code = fixed_original_shift_map.get((ptr_idx, d), '없음')
-                            # print(f"  → [{nu.name} <- {roster_system.nurses[ptr_idx].name}] {d+1}일차 : "
-                            #       f"preceptor={preceptor_code}, original={original_code} → OFF")
                 synced += 1
             if synced:
                 msg = f"{self.logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
                 if special_converted:
                     msg += f" (특수코드→OFF 전환: {special_converted}건)"
+                if fixed_kept:
+                    msg += f" (프리셉티 확정원티드 유지: {fixed_kept}건)"
                 print(msg)
                 
-            # 추가: 프리셉티의 fixed_cells를 프리셉터 값으로 강제 덮어쓰기
+            # 추가: 프리셉티의 fixed_cells를 프리셉터 값으로 동기화 (본인 확정원티드 제외)
             if preceptee_follow and synced > 0:
                 fixed_cells = getattr(roster_system, "fixed_cells", []) or []
                 new_fixed = []
@@ -1184,25 +1197,27 @@ class CPSATBasicEngine:
 
                 for cell in fixed_cells:
                     n_idx = cell.get("nurse_index")
-                    if n_idx in id_to_idx:
-                        nu = roster_system.nurses[n_idx]
-                        if getattr(nu, 'preceptor_id', None):
-                            # 프리셉티 fixed는 스킵 (아래에서 새로 만듦)
-                            continue
+                    if n_idx is not None and n_idx < len(roster_system.nurses):
+                        nu_c = roster_system.nurses[n_idx]
+                        if getattr(nu_c, 'preceptor_id', None):
+                            # 프리셉티 본인 확정원티드는 유지
+                            if (n_idx, cell.get("day_index")) in _pte_own_fixed:
+                                new_fixed.append(cell)
+                            continue  # 프리셉티의 다른 fixed는 아래에서 프리셉터 기준으로 재생성
+                    new_fixed.append(cell)
+                    # preceptor의 fixed 캐시 저장
+                    if n_idx is not None and n_idx < len(roster_system.nurses):
                         key = (n_idx, cell.get("day_index"))
                         preceptor_fixed[key] = cell
 
                 for n, nu in enumerate(roster_system.nurses):
                     pid = getattr(nu, 'preceptor_id', None)
                     if not pid or pid not in id_to_idx:
-                        # 프리셉티 아닌 경우 기존 유지
-                        for cell in fixed_cells:
-                            if cell.get("nurse_index") == n:
-                                new_fixed.append(cell)
                         continue
-
                     ptr_idx = id_to_idx[pid]
                     for d in range(roster_system.num_days):
+                        if (n, d) in _pte_own_fixed:
+                            continue  # 이미 위에서 추가됨
                         key = (ptr_idx, d)
                         if key in preceptor_fixed:
                             copied = preceptor_fixed[key].copy()
@@ -1299,17 +1314,30 @@ class CPSATBasicEngine:
                 if _pf and hasattr(roster_system, 'nurses'):
                     _st = roster_system.config.shift_types
                     _oi = _st.index('O') if 'O' in _st else None
-                    _std = {'D', 'E', 'N', 'O'}
+                    _std = set(_st)  # D,E,N,O (+ M if use_mid)
                     _id2i = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+                    # 프리셉티 본인의 확정 원티드 날짜 보호 (메인 동기화에서 구축한 것과 동일)
+                    _gr_pte_fixed: set[tuple[int, int]] = set()
+                    if bool(getattr(roster_system.config, 'fixed_wanted_use_yn', False)):
+                        _gr_fc = getattr(roster_system, "fixed_cells", []) or []
+                        for _gc in _gr_fc:
+                            _gni = _gc.get("nurse_index")
+                            if _gni is not None and _gni < len(roster_system.nurses):
+                                if getattr(roster_system.nurses[_gni], 'preceptor_id', None):
+                                    _gr_pte_fixed.add((_gni, _gc.get("day_index")))
                     _sc = 0
+                    _gr_kept = 0
                     for _n, _nu in enumerate(roster_system.nurses):
                         _pid = getattr(_nu, 'preceptor_id', None)
                         if not _pid or _pid not in _id2i:
                             continue
                         _pi = _id2i[_pid]
-                        roster_system.roster[_n] = roster_system.roster[_pi].copy()
-                        if _oi is not None:
-                            for _d in range(roster_system.num_days):
+                        for _d in range(roster_system.num_days):
+                            if (_n, _d) in _gr_pte_fixed:
+                                _gr_kept += 1
+                                continue  # 프리셉티 본인의 확정 원티드 유지
+                            roster_system.roster[_n, _d, :] = roster_system.roster[_pi, _d, :].copy()
+                            if _oi is not None:
                                 _need = False
                                 _orig = fixed_original_shift_map.get((_pi, _d))
                                 if _orig:
@@ -1327,7 +1355,10 @@ class CPSATBasicEngine:
                                     roster_system.roster[_n, _d, _oi] = 1
                         _sc += 1
                     if _sc:
-                        print(f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명")
+                        msg = f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명"
+                        if _gr_kept:
+                            msg += f" (프리셉티 확정원티드 유지: {_gr_kept}건)"
+                        print(msg)
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
                 )
@@ -1356,8 +1387,20 @@ class CPSATBasicEngine:
         # (roster 레벨은 엔진 정규화 코드(W 등)를 사용하므로, 최종 result 문자열 기준으로 덮어쓴다)
         if bool(getattr(roster_system.config, 'preceptee_on', False)):
             _off_code = canonical_to_shift_id.get('O', 'O')
+            _final_standard = set(roster_system.config.shift_types)  # D,E,N,O (+ M if use_mid)
             _id2i_final = {nu.db_id: n for n, nu in enumerate(nurses)}
+            # 프리셉티 본인의 확정 원티드 날짜 보호 (db_id 기반)
+            _final_pte_fixed: set[tuple[str, int]] = set()
+            if bool(getattr(roster_system.config, 'fixed_wanted_use_yn', False)):
+                _final_fc = getattr(roster_system, "fixed_cells", []) or []
+                for _fc_cell in _final_fc:
+                    _fc_ni = _fc_cell.get("nurse_index")
+                    if _fc_ni is not None and _fc_ni < len(nurses):
+                        _fc_nu = nurses[_fc_ni]
+                        if getattr(_fc_nu, 'preceptor_id', None):
+                            _final_pte_fixed.add((_fc_nu.db_id, _fc_cell.get("day_index")))
             _synced_final = 0
+            _final_kept = 0
             for nu in nurses:
                 _pid_f = getattr(nu, 'preceptor_id', None)
                 if not _pid_f or _pid_f not in _id2i_final:
@@ -1368,10 +1411,13 @@ class CPSATBasicEngine:
                     continue
                 changed = False
                 for d_i in range(min(len(ptr_sched), len(pte_sched))):
+                    if (nu.db_id, d_i) in _final_pte_fixed:
+                        _final_kept += 1
+                        continue  # 프리셉티 본인의 확정 원티드 유지
                     ptr_code = str(ptr_sched[d_i]).strip()
                     ptr_u = ptr_code.upper()
-                    if ptr_u in {'D', 'E', 'N', 'O'} or ptr_u in _work_sub_ids:
-                        # DEN/O 또는 근무 하위코드 → 프리셉터와 동일
+                    if ptr_u in _final_standard or ptr_u in _work_sub_ids:
+                        # DEN/O/M 또는 근무 하위코드 → 프리셉터와 동일
                         if pte_sched[d_i] != ptr_code:
                             pte_sched[d_i] = ptr_code
                             changed = True
@@ -1384,7 +1430,10 @@ class CPSATBasicEngine:
                     result[nu.db_id] = pte_sched
                     _synced_final += 1
             if _synced_final:
-                print(f"{self.logger_prefix} [PrecepteeSync] 최종 result 동기화: {_synced_final}명")
+                msg = f"{self.logger_prefix} [PrecepteeSync] 최종 result 동기화: {_synced_final}명"
+                if _final_kept:
+                    msg += f" (프리셉티 확정원티드 유지: {_final_kept}건)"
+                print(msg)
         # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
         try:
             weekly_off_by_idx = (

@@ -1641,25 +1641,41 @@ def optimize_fallback_lex_hard_first(
     # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
     # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
     #       프리셉터의 특수코드(W 등) → 프리셉티는 OFF
+    #       프리셉티 본인의 확정 원티드(fixed_wanted)는 유지
     if preceptee_follow and preceptee_indices:
         _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
         _fb_shift_types = cfg.shift_types
         _fb_off_idx = _fb_shift_types.index('O') if 'O' in _fb_shift_types else None
-        _fb_standard = {'D', 'E', 'N', 'O'}
+        _fb_standard = set(_fb_shift_types)  # D,E,N,O (+ M if use_mid)
+
+        # 프리셉티 본인의 확정 원티드 날짜 보호
+        _fb_pte_fixed: set[tuple[int, int]] = set()
+        if bool(getattr(cfg, 'fixed_wanted_use_yn', False)):
+            _fb_fc = getattr(roster_system, "fixed_cells", []) or []
+            for _fb_cell in _fb_fc:
+                _fb_ni = _fb_cell.get("nurse_index")
+                if _fb_ni is not None and _fb_ni < len(roster_system.nurses):
+                    if getattr(roster_system.nurses[_fb_ni], 'preceptor_id', None):
+                        _fb_pte_fixed.add((_fb_ni, _fb_cell.get("day_index")))
+
         synced = 0
         special_converted = 0
+        fb_fixed_kept = 0
         for pte_idx in preceptee_indices:
             pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
             if not pid or pid not in _fb_id_to_idx:
                 continue
             ptr_idx = _fb_id_to_idx[pid]
-            roster_system.roster[pte_idx] = roster_system.roster[ptr_idx].copy()
-            # 특수코드 일자는 프리셉티를 OFF로 전환
-            # 단, type=근무 + shift_gb=D/E/N 계열 하위코드는 근무이므로 그대로 유지
+            # 날짜별 복사 (프리셉티 본인의 확정 원티드 날짜는 SKIP)
             _fb_work_sub = getattr(roster_system, '_work_sub_ids', set())
             _fb_orig_map = getattr(roster_system, '_fixed_original_shift_map', {})
-            if _fb_off_idx is not None:
-                for d in range(roster_system.num_days):
+            for d in range(roster_system.num_days):
+                if (pte_idx, d) in _fb_pte_fixed:
+                    fb_fixed_kept += 1
+                    continue  # 프리셉티 본인의 확정 원티드 유지
+                roster_system.roster[pte_idx, d, :] = roster_system.roster[ptr_idx, d, :].copy()
+                # 특수코드 일자는 프리셉티를 OFF로 전환
+                if _fb_off_idx is not None:
                     _fb_need = False
                     _fb_orig = _fb_orig_map.get((ptr_idx, d))
                     if _fb_orig:
@@ -1681,6 +1697,8 @@ def optimize_fallback_lex_hard_first(
             msg = f"{logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
             if special_converted:
                 msg += f" (특수코드→OFF 전환: {special_converted}건)"
+            if fb_fixed_kept:
+                msg += f" (프리셉티 확정원티드 유지: {fb_fixed_kept}건)"
             print(msg)
 
     _log_weekend_work_assignments(
