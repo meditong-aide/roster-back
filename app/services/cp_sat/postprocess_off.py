@@ -89,6 +89,7 @@ def postprocess_rebalance_off(
     base_viol = len(roster_system._find_violations())
     accepted = 0
     N = len(roster_system.nurses)
+    mid_idx = cfg.shift_types.index("M") if "M" in cfg.shift_types else None
 
     for n_idx in range(N):
         if accepted >= max_attempts:
@@ -118,6 +119,8 @@ def postprocess_rebalance_off(
                 continue
             # N 이동은 2N2O 리스크가 크므로 제외
             if night_idx is not None and shift_idx == night_idx:
+                continue
+            if mid_idx is not None and shift_idx == mid_idx:
                 continue
 
             for off_day in off_candidates:
@@ -191,7 +194,7 @@ def postprocess_trim_extra_offs(
     work_codes = [
         code
         for code in (cfg.daily_shift_requirements or {}).keys()
-        if code in cfg.shift_types and code not in {"O", "W"}
+        if code in cfg.shift_types and code not in {"O", "W", "M"}
     ]
     work_shift_indices = [cfg.shift_types.index(code) for code in work_codes]
     if not work_shift_indices:
@@ -706,5 +709,3 @@ def postprocess_trim_extra_offs(
     if changes:
         print(f"{logger_prefix} [TrimExtraOff] 불필요 OFF 교체 {changes}건")
     return changes
-
-

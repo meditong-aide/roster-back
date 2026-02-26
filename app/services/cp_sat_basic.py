@@ -1439,13 +1439,110 @@ class CPSATBasicEngine:
         print(f"{self.logger_prefix} [Progress] 초기해={int(bool(feasible))}")
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
-            'shift_requirement', 'max_consecutive_night',
-            'max_consecutive_work', 'night_after_limit',
-            'day_after_evening', 'night_monthly_limit'
+            'shift_requirement',
+            'night_consecutive',
+            'consecutive_work',
+            'night_nd',
+            'night_ne',
+            'eve_ed',
+            'night_month_limit',
+            'rec_3n2o',
+            'rec_2n2o',
         }
         def hard_violation_cnt():
             return sum(1 for v in roster_system._find_violations()
                        if v['type'] in HARD_TYPES)
+
+        def log_hard_violation_diagnostics(stage: str):
+            violations = roster_system._find_violations()
+            total_cnt = len(violations)
+            hard_cnt = 0
+            by_type: dict[str, int] = defaultdict(int)
+            hard_by_type: dict[str, int] = defaultdict(int)
+            shortage_map: dict[tuple[int, str], dict] = {}
+            for v in violations:
+                v_type = str(v.get('type', 'unknown'))
+                by_type[v_type] += 1
+                if v_type in HARD_TYPES:
+                    hard_cnt += 1
+                    hard_by_type[v_type] += 1
+                if v_type == 'shift_requirement':
+                    day = v.get('day')
+                    shift = v.get('shift')
+                    if day is None or shift is None:
+                        continue
+                    try:
+                        d_idx = int(day)
+                    except Exception:
+                        continue
+                    req = int(v.get('required', 0) or 0)
+                    act = int(v.get('actual', 0) or 0)
+                    deficit = max(0, req - act)
+                    key = (d_idx, str(shift))
+                    prev = shortage_map.get(key)
+                    if prev is None or deficit > int(prev.get('deficit', -1)):
+                        shortage_map[key] = {
+                            'day': d_idx,
+                            'shift': str(shift),
+                            'required': req,
+                            'actual': act,
+                            'deficit': deficit,
+                        }
+
+            print(
+                f"{self.logger_prefix} [EnhancedFailDiag] stage={stage}, "
+                f"total_violations={total_cnt}, hard_violations={hard_cnt}, "
+                f"hard_filter={sorted(HARD_TYPES)}"
+            )
+            if by_type:
+                print(
+                    f"{self.logger_prefix} [EnhancedFailDiag] type_counts="
+                    f"{dict(sorted(by_type.items(), key=lambda x: (-x[1], x[0])))}"
+                )
+            if hard_by_type:
+                print(
+                    f"{self.logger_prefix} [EnhancedFailDiag] hard_type_counts="
+                    f"{dict(sorted(hard_by_type.items(), key=lambda x: (-x[1], x[0])))}"
+                )
+
+            if shortage_map:
+                top_shortages = sorted(
+                    shortage_map.values(),
+                    key=lambda x: (-int(x['deficit']), int(x['day']), str(x['shift'])),
+                )[:10]
+                print(f"{self.logger_prefix} [EnhancedFailDiag] top_shift_shortages=")
+                for row in top_shortages:
+                    print(
+                        f"{self.logger_prefix} [EnhancedFailDiag]   day={int(row['day']) + 1}, "
+                        f"shift={row['shift']}, required={row['required']}, "
+                        f"actual={row['actual']}, deficit={row['deficit']}"
+                    )
+
+            sample_cap = 3
+            samples: dict[str, list[str]] = {}
+            for v in violations:
+                v_type = str(v.get('type', 'unknown'))
+                if v_type not in HARD_TYPES:
+                    continue
+                if v_type == 'shift_requirement':
+                    continue
+                rows = samples.setdefault(v_type, [])
+                if len(rows) >= sample_cap:
+                    continue
+                n_idx = v.get('nurse_idx')
+                day = v.get('day')
+                nurse_label = f"nurse_idx={n_idx}"
+                if isinstance(n_idx, int) and 0 <= n_idx < len(roster_system.nurses):
+                    nu = roster_system.nurses[n_idx]
+                    nurse_label = (
+                        f"nurse_idx={n_idx}, id={getattr(nu, 'nurse_id', '?')}, "
+                        f"name={getattr(nu, 'name', '?')}"
+                    )
+                day_label = f"day={int(day) + 1}" if isinstance(day, int) else f"day={day}"
+                rows.append(f"{day_label}, {nurse_label}")
+
+            for v_type, rows in sorted(samples.items()):
+                print(f"{self.logger_prefix} [EnhancedFailDiag] sample[{v_type}]={rows}")
         best_viol = hard_violation_cnt()
         best_roster = roster_system.roster.copy()
         # ② RL 정책
@@ -1460,6 +1557,8 @@ class CPSATBasicEngine:
                 f"{self.logger_prefix} [Progress] 반복 없음: "
                 f"best_viol={best_viol}, remaining={remaining}s"
             )
+            if best_viol > 0:
+                log_hard_violation_diagnostics(stage="max_iter_0")
             return best_viol == 0
         for it in range(max_iter):
             try:
@@ -1503,6 +1602,7 @@ class CPSATBasicEngine:
                 f"{self.logger_prefix} [Progress] 종료: best_viol={best_viol}, "
                 f"max_iter={max_iter}, per_iter={per_iter}s"
             )
+            log_hard_violation_diagnostics(stage="enhanced_end")
         return best_viol == 0
 
 
