@@ -1904,6 +1904,93 @@ def _merge_initial_constraints(base: dict | None, extra: dict | None) -> dict:
 
     return {"forced_off": merged_forced_off_out, "forbidden": merged_forbidden_out}
 
+
+def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int, month: int) -> str | None:
+    if not bool(config_dict.get("use_mid", False)):
+        return None
+
+    num_days = calendar.monthrange(int(year), int(month))[1]
+    req_by_day: list[int] = []
+    ds_by_day = config_dict.get("daily_shift_requirements_by_day")
+    if isinstance(ds_by_day, list) and ds_by_day:
+        for d in range(num_days):
+            if d < len(ds_by_day) and isinstance(ds_by_day[d], dict):
+                req_by_day.append(max(0, int((ds_by_day[d] or {}).get("M", 0) or 0)))
+            else:
+                req_by_day.append(0)
+    else:
+        base_map = config_dict.get("daily_shift_requirements") or {}
+        base_req = max(0, int((base_map or {}).get("M", 0) or 0))
+        req_by_day = [base_req for _ in range(num_days)]
+
+    fixed_by_day_nurse: dict[tuple[int, int], str] = {}
+    for cell in (config_dict.get("fixed_cells") or []):
+        try:
+            n_idx = int(cell.get("nurse_index"))
+            d_idx = int(cell.get("day_index"))
+        except Exception:
+            continue
+        if d_idx < 0 or d_idx >= num_days:
+            continue
+        raw = str(cell.get("shift") or "-").strip().upper()
+        if raw in {"OFF", "주"}:
+            raw = "O"
+        fixed_by_day_nurse[(n_idx, d_idx)] = raw
+
+    initial_constraints = config_dict.get("initial_constraints") or {}
+    forced_off_src = initial_constraints.get("forced_off") or {}
+    forbidden_src = initial_constraints.get("forbidden") or {}
+
+    forced_off: dict[str, set[int]] = {}
+    for nurse_id, days in (forced_off_src or {}).items():
+        key = str(nurse_id)
+        forced_off[key] = set()
+        for d in (days or []):
+            try:
+                forced_off[key].add(int(d))
+            except Exception:
+                continue
+
+    forbidden: dict[str, dict[int, set[str]]] = {}
+    for nurse_id, day_map in (forbidden_src or {}).items():
+        key = str(nurse_id)
+        forbidden[key] = {}
+        for d, codes in (day_map or {}).items():
+            try:
+                d_idx = int(d)
+            except Exception:
+                continue
+            forbidden[key][d_idx] = {str(c).strip().upper() for c in (codes or [])}
+
+    nurse_ids = [str(getattr(n, "nurse_id", "") or "") for n in (nurses_in_group or [])]
+
+    for d in range(num_days):
+        req_m = req_by_day[d]
+        fixed_m = 0
+        variable_capacity = 0
+        for n_idx, nurse_id in enumerate(nurse_ids):
+            fixed_code = fixed_by_day_nurse.get((n_idx, d))
+            if fixed_code is not None:
+                if fixed_code == "M":
+                    fixed_m += 1
+                continue
+
+            if d in forced_off.get(nurse_id, set()):
+                continue
+            if "M" in forbidden.get(nurse_id, {}).get(d, set()):
+                continue
+            variable_capacity += 1
+
+        min_possible = fixed_m
+        max_possible = fixed_m + variable_capacity
+        if req_m < min_possible or req_m > max_possible:
+            return (
+                f"M 하드 제약 불가능: {d + 1}일 M 요구={req_m}, "
+                f"가능 범위=[{min_possible},{max_possible}]"
+            )
+
+    return None
+
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
@@ -2017,6 +2104,14 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         base=cross_month_constraints,
         extra=allowed_constraints,
     )
+    mid_feasibility_error = _validate_mid_hard_feasibility(
+        nurses_in_group=nurses_in_group,
+        config_dict=config_dict,
+        year=req.year,
+        month=req.month,
+    )
+    if mid_feasibility_error:
+        raise Exception(mid_feasibility_error)
     try:
         print("cp_sat_basic 엔진 호출 준비 완료")
         # ── 실행 초기에 정책 파라미터가 어떻게 적용됐는지 반드시 로그로 남긴다(추후 유지보수용) ──
@@ -2209,6 +2304,11 @@ def _validate_generated_roster(
                     return (
                         f"{d + 1}일에 필수 근무 인원이 모두 미배정되었습니다. "
                         f"(요구 인원: {req_msg})"
+                    )
+
+                if "M" in req and actual.get("M", 0) > req["M"]:
+                    return (
+                        f"{d + 1}일 M 과배정: 요구={req['M']}, 실제={actual.get('M', 0)}"
                     )
     except Exception:
         # 검증 로직이 실패해도 저장을 막지 않고, 기존 최소 검증 결과만 사용

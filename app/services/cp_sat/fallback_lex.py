@@ -889,15 +889,28 @@ def optimize_fallback_lex_hard_first(
                 if code not in roster_system.config.shift_types:
                     continue
                 s = roster_system.config.shift_types.index(code)
-                need = int(req) - _fb_fixed_cnt_adj[d][s]
-                if need <= 0:
-                    continue
+                req_raw = max(0, int(req or 0))
+                need = req_raw - _fb_fixed_cnt_adj[d][s]
                 assigned = sum(
                     X(n, d, s)
                     for n in range(N)
                     if join[n] <= d <= leave[n] and (n, d) not in fixed
                     and (not exclude_preceptee_from_den or n not in preceptee_indices)
                 )
+                if code == "M":
+                    assigned_total = assigned + int(fixed_cnt[d][s] or 0)
+                    m.Add(assigned_total <= req_raw)
+                    sh = m.NewIntVar(0, req_raw, f"short_{d}_{code}")
+                    m.Add(assigned_total + sh >= req_raw)
+                    ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                    short_terms.append(sh)
+                    over_terms.append(ov)
+                    over_vars_by_day.setdefault(d, {})[code] = ov
+                    short_vars_by_day_code[(d, code)] = sh
+                    over_vars_by_day_code[(d, code)] = ov
+                    continue
+                if need <= 0:
+                    continue
                 sh = m.NewIntVar(0, N, f"short_{d}_{code}")
                 ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                 # Coverage 우선: assigned + shortage >= need (hard), oversupply 추적은 선택
