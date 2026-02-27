@@ -46,6 +46,10 @@ from services.cp_sat.lookahead_constraints import (
     add_lookahead_off_cap_constraints,
     add_lookahead_distribution_penalty_terms,
 )
+from services.cp_sat.hard_diagnostics import (
+    collect_hard_diagnostics,
+    log_hard_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -752,6 +756,10 @@ class CPSATBasicEngine:
                 continue
             if sid and stype:
                 shift_id_to_type[sid] = stype
+                # default_shift -> type 매핑 추가 (V1의 default_shift=O, type=휴가면 O->휴가)
+                default_code = str(row.get("default_shift") or "").strip().upper()
+                if default_code and stype:
+                    shift_id_to_type[default_code] = stype
         # type='근무' + shift_gb가 DEN 계열인 하위코드 집합 (프리셉티 동기화에서 근무로 취급)
         _WORK_GB = {"D", "E", "N", "데이", "이브닝", "나이트"}
         _work_sub_ids: set[str] = set()
