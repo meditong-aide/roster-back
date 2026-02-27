@@ -1,21 +1,27 @@
-from fastapi import APIRouter, HTTPException, Depends
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Query
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from db.client2 import get_db
 from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie
-from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest
+from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
 from services.shift_service import (
     get_shifts_service as get_shifts_service_mysql,
     add_shift_service,
     update_shift_service,
     remove_shift_service,
     move_shift_service,
+    create_shift_template,
+    shift_upload_validate,
+    shift_upload_confirm,
+    get_available_shifts_for_import,
+    import_shifts_to_group,
 )
-from typing import Optional, Any
+from typing import Optional, Any, List
 import os
+import tempfile
 from services.shift_service_mssql import get_shifts_service as get_shifts_service_mssql
 from datetime import timedelta, datetime
 
@@ -155,6 +161,122 @@ async def move_shift(
         raise HTTPException(status_code=500, detail=f"근무코드 순서 변경 실패: {str(e)}")
 
 
+# [Shifts] - 엑셀 일괄 업로드
+@router.get("/shifts/template-download")
+async def download_shift_template(
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+):
+    """근무코드 엑셀 업로드 템플릿 다운로드"""
+    try:
+        template_path = create_shift_template()
+        return FileResponse(
+            path=template_path,
+            filename="근무코드_업로드_템플릿.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"템플릿 생성 실패: {str(e)}")
+
+
+@router.post("/shifts/upload-validate")
+async def shift_upload_validate_endpoint(
+    file: UploadFile = File(...),
+    group_id: str = Query(..., description="병동 그룹 ID (필수)"),
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """근무코드 엑셀 업로드 - 검증"""
+    try:
+        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+            raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_file_path = tmp_file.name
+        try:
+            result = shift_upload_validate(tmp_file_path, current_user, db, group_id=group_id)
+            return result
+        finally:
+            os.unlink(tmp_file_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
+
+
+@router.post("/shifts/upload-confirm")
+async def shift_upload_confirm_endpoint(
+    payload: ShiftUploadConfirmRequest,
+    group_id: str = Query(..., description="대상 병동 group_id (필수)"),
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """근무코드 엑셀 업로드 - 확정 저장"""
+    try:
+        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+            raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
+
+        target_group_id = group_id
+        if not target_group_id:
+            target_group_id = getattr(current_user, "group_id", None)
+        if not target_group_id:
+            raise HTTPException(status_code=400, detail="group_id가 필요합니다. URL에 ?group_id=... 를 포함해주세요.")
+
+        result = shift_upload_confirm(payload.rows, current_user, db, target_group_id)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
+
+
+# [Shifts] - 타 병동 근무코드 가져오기
+@router.get("/shifts/available-imports")
+async def get_available_shift_imports(
+    group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """현재 그룹에 없는 동일 오피스 내 다른 병동 근무코드 목록 조회"""
+    try:
+        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+            raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
+
+        office_id = getattr(current_user, "office_id", None)
+        if not office_id:
+            raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
+
+        result = get_available_shifts_for_import(office_id, group_id, db)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"조회 실패: {str(e)}")
+
+
+@router.post("/shifts/import-to-group")
+async def import_shifts_to_group_endpoint(
+    payload: ShiftImportRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """선택된 근무코드를 동일 오피스 내 다른 병동에서 현재 그룹으로 가져오기"""
+    try:
+        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+            raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
+
+        office_id = getattr(current_user, "office_id", None)
+        if not office_id:
+            raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
+
+        result = import_shifts_to_group(payload.shift_ids, payload.group_id, office_id, db)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"가져오기 실패: {str(e)}")
+
+
 # [Shift Management] - 시프트 관리 데이터 조회
 @router.get("/shift-manage/{class_name}")
 async def get_shift_manage(
@@ -224,7 +346,8 @@ async def get_shift_manage(
         default_slots = [
             {"shift_slot": 1, "main_code": "D", "codes": [], "manpower": 3},
             {"shift_slot": 2, "main_code": "E", "codes": [], "manpower": 3},
-            {"shift_slot": 3, "main_code": "N", "codes": [], "manpower": 2}
+            {"shift_slot": 3, "main_code": "N", "codes": [], "manpower": 2},
+            {"shift_slot": 5, "main_code": "M", "codes": [], "manpower": 0},
         ]
 
         for slot_data in default_slots:

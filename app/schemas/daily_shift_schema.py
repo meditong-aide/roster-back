@@ -40,6 +40,7 @@ class DailyShiftMonthlyUpdate(BaseModel):
     day: int
     evening: int
     night: int
+    mid: int = 0
     apply_globally: bool = True
 
 
@@ -55,10 +56,11 @@ class DailyShiftDailyUpdate(BaseModel):
     D: List[int]
     E: List[int]
     N: List[int]
+    M: List[int] = Field(default_factory=list)
 
 
 class CalendarUpdateRequest(BaseModel):
     office_id: str
     group_id: str
-    years: Dict[str, Dict[str, List[Dict[str, int]]]]  # {year: {month: [{day, d_count, e_count, n_count}]}, ...}
+    years: Dict[str, Dict[str, List[Dict[str, int]]]]
     comment: str | None = None  # 선택적 필드 추가

@@ -22,6 +22,7 @@ _MSSQL_SESSION_MAKER: sessionmaker | None = None
 #     return s
 
 
+
 def _to_time_str(value: Any) -> str | None:
     """TIME 컬럼값을 HH:MM 문자열로 변환합니다."""
     if value is None:
@@ -56,21 +57,27 @@ def _append_shift_manage_code(
     - 이미 존재하면 추가하지 않습니다.
     - update 시 shift_id 또는 shift_gb가 바뀌면 기존 슬롯에서 제거 후 새 슬롯에 추가합니다.
     """
-    slot_map = {"D": 1, "E": 2, "N": 3}
+    slot_map = {"D": 1, "E": 2, "N": 3, "M": 5, "데이": 1, "이브닝": 2, "나이트": 3, "미드": 5}
+    # shift_gb 한글 → ShiftManage.main_code 영문 변환
+    _gb_to_main = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
     if not office_id:
         return
+
+    def _resolve_main(gb: str | None) -> str | None:
+        return _gb_to_main.get(gb, gb)
 
     def _remove(target_gb: str | None, target_id: str | None) -> bool:
         if target_gb not in slot_map or not target_id:
             return False
         target_slot = slot_map[target_gb]
+        main_code = _resolve_main(target_gb)
         shift_manages = (
             session.query(ShiftManage)
             .filter(
                 ShiftManage.office_id == office_id,
                 ShiftManage.group_id == group_id,
                 ShiftManage.shift_slot == target_slot,
-                ShiftManage.main_code == target_gb,
+                ShiftManage.main_code == main_code,
             )
             .all()
         )
@@ -86,13 +93,14 @@ def _append_shift_manage_code(
         if target_gb not in slot_map:
             return False
         target_slot = slot_map[target_gb]
+        main_code = _resolve_main(target_gb)
         shift_manages = (
             session.query(ShiftManage)
             .filter(
                 ShiftManage.office_id == office_id,
                 ShiftManage.group_id == group_id,
                 ShiftManage.shift_slot == target_slot,
-                ShiftManage.main_code == target_gb,
+                ShiftManage.main_code == main_code,
             )
             .all()
         )
@@ -138,6 +146,40 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
         )
         
         if shifts:
+            has_mid = any(str(getattr(s, "default_shift", "") or "").upper() == "M" for s in shifts)
+            if not has_mid:
+                mid_shift = Shift(
+                    shift_id="M",
+                    name="미드",
+                    office_id=current_user.office_id,
+                    color="#E6A817",
+                    group_id=group_id,
+                    start_time="09:00:00",
+                    end_time="17:00:00",
+                    type="근무",
+                    allday=0,
+                    auto_schedule=1,
+                    duration=None,
+                    sequence=5,
+                    default_shift="M",
+                    shift_gb="미드",
+                    show_in_preference=True,
+                )
+                session.add(mid_shift)
+                session.commit()
+                _append_shift_manage_code(
+                    session=session,
+                    office_id=current_user.office_id,
+                    group_id=group_id,
+                    shift_id="M",
+                    shift_gb="미드",
+                )
+                shifts = (
+                    session.query(Shift)
+                    .filter(Shift.office_id == current_user.office_id, Shift.group_id == group_id)
+                    .order_by(Shift.sequence.asc())
+                    .all()
+                )
             # print('shifts', [s.__dict__ for s in shifts])
             
             return [
@@ -192,17 +234,18 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 default_shift=default_shift,
                 shift_gb=shift_gb,
                 # 추가
-                show_in_preference=True if shift_id in ["D","E","N","O"] else False # 기본 4개만 노출
+                show_in_preference=True if shift_id in ["D", "E", "N", "M", "O"] else False
             )
         defaults = [
             # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence, default_shift, shift_gb
             ("O", "Off", "#ffa0d2", None, None, "휴무", 1, 1, None, 4, "O", "O"),
-            ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E", "E"),
-            ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N", "N"),
-            ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D", "D"),
+            ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E", "이브닝"),
+            ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N", "나이트"),
+            ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D", "데이"),
+            ("M", "미드", "#E6A817", "09:00:00", "17:00:00", "근무", 0, 1, None, 5, "M", "미드"),
             # 주휴(표시용): 엔진/검증에서는 O로 정규화하여 휴무로 카운트한다.
             # sequence는 중복을 피하기 위해 기본 4개 뒤로 배치한다.
-            ("주", "주휴", "#ff977b", None, None, "휴무", 1, 0, None, 5, "주", "O"),
+            ("주", "주휴", "#ff977b", None, None, "휴무", 1, 0, None, 6, "주", "O"),
         ]
         for args in defaults:
             session.add(_mk(*args))

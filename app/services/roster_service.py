@@ -26,6 +26,7 @@ from db.models import (
     ShiftManage,
     IssuedRosterSnapshot,
     WeeklyOffSetting,
+    RosterGradeConfig,
 )
 from db.roster_config import NurseRosterConfig
 from db.nurse_config import Nurse as NurseEngine
@@ -80,6 +81,7 @@ def save_roster_config_service(
 
         # 3) 설정 저장
         config_dict = config_data.model_dump()
+        use_mid = bool(config_dict.get('use_mid', False))
         config_dict.update({
             'day_req': day_req,
             'eve_req': eve_req,
@@ -108,6 +110,33 @@ def save_roster_config_service(
                 {Nurse.weekly_off_enabled: new_enabled},
                 synchronize_session=False
             )
+
+        if not use_mid:
+            db.query(ShiftManage).filter(
+                ShiftManage.office_id == target_office_id,
+                ShiftManage.group_id == target_group_id,
+                ShiftManage.nurse_class == 'RN',
+                ShiftManage.shift_slot == 5,
+            ).update({ShiftManage.manpower: 0}, synchronize_session=False)
+
+            nurses = db.query(Nurse).filter(Nurse.group_id == target_group_id).all()
+            for nurse_row in nurses:
+                raw_types = getattr(nurse_row, 'is_night_nurse', None)
+                if isinstance(raw_types, list) and raw_types:
+                    nurse_row.is_night_nurse = [
+                        t for t in raw_types if str(t).strip().upper() != 'M'
+                    ]
+
+            grade_cfg = db.query(RosterGradeConfig).filter(
+                RosterGradeConfig.office_id == target_office_id,
+                RosterGradeConfig.group_id == target_group_id,
+            ).first()
+            if grade_cfg and isinstance(grade_cfg.constraints_json, dict):
+                cleaned = dict(grade_cfg.constraints_json)
+                if 'M' in cleaned:
+                    cleaned.pop('M', None)
+                    grade_cfg.constraints_json = cleaned
+
         db.add(db_config)
         db.commit()
         db.refresh(db_config)
@@ -396,6 +425,8 @@ def create_issued_roster_snapshot(
                 "even_nights": cfg.even_nights,
                 "nod_noe": cfg.nod_noe,
                 "preceptor_gauge": cfg.preceptor_gauge,
+                "preceptee_on": cfg.preceptee_on,
+                "preceptee_shift_count": cfg.preceptee_shift_count,
                 "created_at": cfg.created_at.isoformat()
                 if getattr(cfg, "created_at", None)
                 else None,

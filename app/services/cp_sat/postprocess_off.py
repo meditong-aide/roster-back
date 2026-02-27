@@ -202,6 +202,19 @@ def postprocess_trim_extra_offs(
     if not work_shift_indices:
         return 0
 
+    ############## preceptee 추가 ##############
+    preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
+    preceptee_indices = set()
+    if preceptee_follow:
+        id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+        for n, nu in enumerate(roster_system.nurses):
+            pid = getattr(nu, 'preceptor_id', None)
+            if pid and pid in id_to_idx:
+                preceptee_indices.add(n)
+        if preceptee_indices:
+            print(f"{logger_prefix} [POSTPROCESS PROTECT] 프리셉티 보호 적용: {len(preceptee_indices)}명 (후처리 OFF 변경 스킵)")
+    ############## preceptee 추가 ##############
+
     # 현재 로스터 스냅샷을 보존하여 회복 OFF(2N/3N→2O)를 안전하게 식별한다.
     roster_snapshot = roster_system.roster.copy()
 
@@ -576,6 +589,8 @@ def postprocess_trim_extra_offs(
         return False
 
     for n_idx, nurse in enumerate(roster_system.nurses):
+        if n_idx in preceptee_indices:
+            continue  # 프리셉티는 프리셉터 팔로우 → 후처리 OFF 변경 스킵
         if is_n_only(nurse):
             continue
 
@@ -618,8 +633,10 @@ def postprocess_trim_extra_offs(
                 break
 
             target_shift_idx = None
+            move_reason = "unknown"
             if prefer_shortage and d_idx in deficits_by_day and deficits_by_day[d_idx]:
                 target_shift_idx = max(deficits_by_day[d_idx].items(), key=lambda x: x[1])[0]
+                move_reason = "shortage"
             else:
                 best_score = None
                 for s_idx in work_shift_indices:
@@ -631,11 +648,15 @@ def postprocess_trim_extra_offs(
                         score += TEAM_BALANCE_POSTPROCESS_BONUS * team_shift_count(
                             d_idx, s_idx, team_id
                         )
+                        move_reason = "team_balance"
                     elif grade_strategy == "GRADE":
                         score += grade_bonus(n_idx, d_idx, s_idx)
+                        move_reason = "grade_bonus"
                     if best_score is None or score > best_score:
                         best_score = score
                         target_shift_idx = s_idx
+                if move_reason == "unkonwn":
+                    move_reason = "preference" if pref_matrix is not None else "default"
             if target_shift_idx is None:
                 continue
 
