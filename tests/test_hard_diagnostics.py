@@ -42,12 +42,18 @@ class DummyConfig:
 
 
 class DummyRosterSystem:
-    def __init__(self, roster: NDArray[np.int_], violations: Sequence[Mapping[str, object]]):
+    def __init__(
+        self,
+        roster: NDArray[np.int_],
+        violations: Sequence[Mapping[str, object]],
+        weekend_off_nurse_indexes: set[int] | None = None,
+    ):
+        weekend_off_nurse_indexes = set(weekend_off_nurse_indexes or set())
         self.roster = roster
         self.num_days = roster.shape[1]
         self.nurses = [
-            DummyNurse("n1", "Nurse1", db_id="n1"),
-            DummyNurse("n2", "Nurse2", db_id="n2"),
+            DummyNurse("n1", "Nurse1", is_weekend_off=0 in weekend_off_nurse_indexes, db_id="n1"),
+            DummyNurse("n2", "Nurse2", is_weekend_off=1 in weekend_off_nurse_indexes, db_id="n2"),
         ]
         self.config = DummyConfig(shift_types=["D", "E", "N", "O"], num_shifts=4)
         self.target_month = date(2026, 11, 1)
@@ -127,6 +133,7 @@ def test_collect_hard_diagnostics_off_partition_counts():
     roster[1, 2, 0] = 1
 
     rs = DummyRosterSystem(roster=roster, violations=[])
+    rs.config.max_extra_off_days = 3
     rs._diag_vacation_off_cells = {(0, 0)}
     rs._diag_weekly_off_by_idx = {0: [1]}
     rs._diag_weekend_days = {2}
@@ -137,3 +144,47 @@ def test_collect_hard_diagnostics_off_partition_counts():
     assert result.off_partition_counts.get("Wo") == 1
     assert result.off_partition_counts.get("O") == 1
     assert result.off_partition_counts.get("off_total") == 3
+    assert result.off_regulation_counts.get("off_partition_mismatch") == 0
+    assert result.global_error_indicator.is_feasible is True
+
+
+def test_collect_hard_diagnostics_weekend_off_regulation_and_global_indicator():
+    roster = np.zeros((2, 2, 4), dtype=int)
+    roster[0, 0, 0] = 1
+    roster[0, 1, 3] = 1
+    roster[1, 0, 0] = 1
+    roster[1, 1, 0] = 1
+
+    rs = DummyRosterSystem(roster=roster, violations=[], weekend_off_nurse_indexes={0})
+    rs._diag_weekend_days = {0}
+    result = collect_hard_diagnostics(rs)
+
+    assert result.off_regulation_counts.get("weekend_off_missing_weekend_o") == 1
+    assert result.off_regulation_counts.get("weekend_off_weekday_natural_o") == 1
+    assert result.expanded_by_type.get("weekend_off_missing_weekend_o", 0) >= 1
+    assert result.expanded_by_type.get("weekend_off_weekday_natural_o", 0) >= 1
+    assert result.global_error_indicator.is_feasible is False
+    assert any("Weekend-off policy" in issue for issue in result.global_error_indicator.primary_issues)
+
+
+def test_collect_hard_diagnostics_global_indicator_recommendations_for_initial_forbidden_and_off_max():
+    roster = np.zeros((2, 2, 4), dtype=int)
+    roster[0, 0, 0] = 1
+    roster[0, 1, 3] = 1
+    roster[1, 0, 0] = 1
+    roster[1, 1, 0] = 1
+
+    rs = DummyRosterSystem(roster=roster, violations=[])
+    rs.initial_forbidden = {(0, 0): {"D"}}
+    rs.config.global_monthly_off_days = 0
+    rs.config.standard_personal_off_days = 0
+    rs.config.max_extra_off_days = 0
+
+    result = collect_hard_diagnostics(rs)
+
+    assert result.expanded_by_type.get("initial_forbidden", 0) >= 1
+    assert result.expanded_by_type.get("off_max", 0) >= 1
+    assert result.global_error_indicator.is_feasible is False
+    joined_recs = "\n".join(result.global_error_indicator.recommendations)
+    assert "forbidden" in joined_recs.lower()
+    assert "max_extra_off_days" in joined_recs

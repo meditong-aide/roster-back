@@ -1551,6 +1551,11 @@ class CPSATBasicEngine:
 
             for v_type, rows in sorted(samples.items()):
                 print(f"{self.logger_prefix} [EnhancedFailDiag] sample[{v_type}]={rows}")
+            try:
+                hard_v2 = collect_hard_diagnostics(roster_system)
+                log_hard_diagnostics(hard_v2, self.logger_prefix, stage)
+            except Exception as e:
+                print(f"{self.logger_prefix} [HardDiagV2] failed: {e}")
         best_viol = hard_violation_cnt()
         best_roster = roster_system.roster.copy()
         # ② RL 정책
@@ -1972,6 +1977,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     if lookahead_weekly_off:
         structural_off_cells.update(lookahead_weekly_off)
     forced_off_cap_excluded: set[tuple[int, int]] = set(vacation_off_cells)
+    try:
+        setattr(rs, "_diag_vacation_off_cells", set(vacation_off_cells))
+        setattr(rs, "_diag_weekly_off_by_idx", dict(weekly_off_by_idx or {}))
+        setattr(rs, "_diag_weekend_days", set(weekend_days))
+    except Exception:
+        pass
 
     # N 금지 간호사 판별(모든 근무일에 N이 금지된 경우)
     n_forbid_n: set[int] = set()

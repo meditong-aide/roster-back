@@ -19,6 +19,14 @@ LEGACY_HARD_TYPES = {
 
 
 @dataclass
+class GlobalErrorIndicator:
+    is_feasible: bool
+    error_summary: str
+    primary_issues: list[str]
+    recommendations: list[str]
+
+
+@dataclass
 class HardDiagnosticsResult:
     legacy_hard_count: int
     legacy_by_type: dict[str, int]
@@ -28,6 +36,8 @@ class HardDiagnosticsResult:
     sample_rows: dict[str, list[str]]
     structural_coverage_hints: list[dict[str, int | str]]
     off_partition_counts: dict[str, int]
+    off_regulation_counts: dict[str, int]
+    global_error_indicator: GlobalErrorIndicator
 
 
 def _day_to_date(rs, day_idx: int):
@@ -67,6 +77,75 @@ def _build_sample(nurse_idx: int | None, day_idx: int | None, label: str, rs) ->
     if isinstance(day_idx, int):
         day_part = f"day={day_idx + 1}"
     return f"{day_part}, {nurse_part}, {label}"
+
+
+def _build_global_error_indicator(
+    expanded_hard_count: int,
+    expanded_by_type: dict[str, int],
+    structural_coverage_hints: list[dict[str, int | str]],
+    off_partition_counts: dict[str, int],
+    off_regulation_counts: dict[str, int],
+) -> GlobalErrorIndicator:
+    issues: list[str] = []
+    recommendations: list[str] = []
+
+    partition_sum = int(off_partition_counts.get("V", 0)) + int(off_partition_counts.get("Wo", 0)) + int(
+        off_partition_counts.get("O", 0)
+    )
+    off_total = int(off_partition_counts.get("off_total", 0))
+    partition_mismatch = max(0, abs(off_total - partition_sum))
+
+    if partition_mismatch > 0:
+        issues.append(f"OFF partition mismatch: off_total={off_total}, V+Wo+O={partition_sum}")
+        recommendations.append(
+            "Check vacation/weekly-off source mapping so OFF cells are classified as V, Wo, O without leakage"
+        )
+
+    if structural_coverage_hints:
+        top = structural_coverage_hints[0]
+        issues.append(
+            f"Structural coverage deficit on day={int(top.get('day', 0))}, deficit={int(top.get('deficit', 0))}"
+        )
+        recommendations.append(
+            "Reduce fixed/forbidden pressure or relax daily required headcount for deficit day/shift"
+        )
+
+    if int(expanded_by_type.get("initial_forbidden", 0)) > 0:
+        issues.append("Initial-forbidden conflict exists")
+        recommendations.append("Review forbidden shift set and relax over-constrained nurse/day blocks")
+
+    if int(expanded_by_type.get("off_max", 0)) > 0:
+        issues.append("OFF upper-bound exceeded")
+        recommendations.append("Increase max_extra_off_days or rebalance forced-O cells (Wo/weekend/fixed)")
+
+    if int(expanded_by_type.get("off_min", 0)) > 0:
+        issues.append("OFF lower-bound shortage exists")
+        recommendations.append("Increase OFF allocation or reduce hard work/fixed assignments")
+
+    weekend_issues = int(off_regulation_counts.get("weekend_off_weekday_natural_o", 0)) + int(
+        off_regulation_counts.get("weekend_off_missing_weekend_o", 0)
+    )
+    if weekend_issues > 0:
+        issues.append("Weekend-off policy violations detected")
+        recommendations.append("Ensure weekend-off nurses have O on weekends and avoid weekday natural O for that cohort")
+
+    is_feasible = expanded_hard_count == 0 and not structural_coverage_hints and partition_mismatch == 0
+    if is_feasible:
+        summary = "No hard-constraint diagnostic issue detected"
+    else:
+        summary = f"Detected {len(issues)} hard-constraint risk area(s)"
+
+    dedup_recommendations: list[str] = []
+    for item in recommendations:
+        if item not in dedup_recommendations:
+            dedup_recommendations.append(item)
+
+    return GlobalErrorIndicator(
+        is_feasible=is_feasible,
+        error_summary=summary,
+        primary_issues=issues,
+        recommendations=dedup_recommendations,
+    )
 
 
 def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
@@ -328,6 +407,11 @@ def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
     )
 
     off_partition_counts: dict[str, int] = {"V": 0, "Wo": 0, "O": 0, "off_total": 0}
+    off_regulation_counts: dict[str, int] = {
+        "weekend_off_weekday_natural_o": 0,
+        "weekend_off_missing_weekend_o": 0,
+        "off_partition_mismatch": 0,
+    }
     if rs.roster is not None:
         shift_types = list(getattr(rs.config, "shift_types", []) or [])
         off_idx = shift_types.index("O") if "O" in shift_types else None
@@ -349,6 +433,7 @@ def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
                     if int(rs.roster[n, d, off_idx]) != 1:
                         if bool(getattr(nu, "is_weekend_off", False)) and d in weekend_days and (n, d) not in vac_cells:
                             add_violation("weekend_off_missing_weekend_o", n, d, "expected=O")
+                            off_regulation_counts["weekend_off_missing_weekend_o"] += 1
                         continue
                     off_partition_counts["off_total"] += 1
                     if (n, d) in vac_cells:
@@ -359,6 +444,21 @@ def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
                         off_partition_counts["O"] += 1
                         if bool(getattr(nu, "is_weekend_off", False)) and d not in weekend_days:
                             add_violation("weekend_off_weekday_natural_o", n, d, "weekday natural O")
+                            off_regulation_counts["weekend_off_weekday_natural_o"] += 1
+
+    partition_sum = int(off_partition_counts.get("V", 0)) + int(off_partition_counts.get("Wo", 0)) + int(
+        off_partition_counts.get("O", 0)
+    )
+    off_total = int(off_partition_counts.get("off_total", 0))
+    off_regulation_counts["off_partition_mismatch"] = max(0, abs(off_total - partition_sum))
+
+    global_error_indicator = _build_global_error_indicator(
+        expanded_hard_count=expanded_hard_count,
+        expanded_by_type=expanded_by_type,
+        structural_coverage_hints=structural_coverage_hints,
+        off_partition_counts=off_partition_counts,
+        off_regulation_counts=off_regulation_counts,
+    )
 
     return HardDiagnosticsResult(
         legacy_hard_count=legacy_hard_count,
@@ -369,6 +469,8 @@ def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
         sample_rows=sample_rows,
         structural_coverage_hints=structural_coverage_hints[:10],
         off_partition_counts=off_partition_counts,
+        off_regulation_counts=off_regulation_counts,
+        global_error_indicator=global_error_indicator,
     )
 
 
@@ -390,6 +492,14 @@ def log_hard_diagnostics(result: HardDiagnosticsResult, logger_prefix: str, stag
             f"{result.structural_coverage_hints}"
         )
     print(f"{logger_prefix} [HardDiagV2] off_partition_counts={result.off_partition_counts}")
+    print(f"{logger_prefix} [HardDiagV2] off_regulation_counts={result.off_regulation_counts}")
+    print(
+        f"{logger_prefix} [HardDiagV2] global_error="
+        f"{{'is_feasible': {result.global_error_indicator.is_feasible}, "
+        f"'summary': {result.global_error_indicator.error_summary!r}, "
+        f"'issues': {result.global_error_indicator.primary_issues}, "
+        f"'recommendations': {result.global_error_indicator.recommendations}}}"
+    )
     for v_type, rows in sorted(result.sample_rows.items()):
         if rows:
             print(f"{logger_prefix} [HardDiagV2] sample[{v_type}]={rows}")
