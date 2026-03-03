@@ -1361,7 +1361,15 @@ def optimize_fallback_lex_hard_first(
         # stage별 목적/고정
         if stage == 1:
             # m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))
-            OFF_PENALTY=30
+            try:
+                OFF_PENALTY = int(getattr(cfg, "fallback_stage1_off_penalty_weight", 0) or 0)
+            except Exception:
+                OFF_PENALTY = 0
+            if OFF_PENALTY <= 0:
+                try:
+                    OFF_PENALTY = int(getattr(cfg, "extra_off_penalty_weight", 80) or 80)
+                except Exception:
+                    OFF_PENALTY = 80
             m.Minimize(
             FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms)
             + sum(over_terms)
@@ -1378,10 +1386,25 @@ def optimize_fallback_lex_hard_first(
                 m.Add(sum(short_terms) == coverage_eq)
             if over_le is not None:
                 m.Add(sum(over_terms) <= over_le)
+            try:
+                off_quota_excess_w = int(getattr(cfg, "fallback_off_quota_excess_weight", 50000) or 50000)
+            except Exception:
+                off_quota_excess_w = 50000
+            try:
+                off_quota_short_w = int(getattr(cfg, "fallback_off_quota_short_weight", 2000) or 2000)
+            except Exception:
+                off_quota_short_w = 2000
             safety_sum = []
             for k, arr in safety.items():
-                safety_sum.extend(arr)
-            m.Minimize(sum(safety_sum))
+                if not arr:
+                    continue
+                if k == "off_quota_excess":
+                    safety_sum.append(off_quota_excess_w * sum(arr))
+                elif k == "off_quota_short":
+                    safety_sum.append(off_quota_short_w * sum(arr))
+                else:
+                    safety_sum.append(sum(arr))
+            m.Minimize(sum(safety_sum) if safety_sum else 0)
         else:
             if coverage_eq is not None:
                 m.Add(sum(short_terms) == coverage_eq)

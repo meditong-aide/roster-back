@@ -24,6 +24,7 @@ class GlobalErrorIndicator:
     error_summary: str
     primary_issues: list[str]
     recommendations: list[str]
+    setting_actions: list[str]
 
 
 @dataclass
@@ -85,6 +86,8 @@ def _build_global_error_indicator(
     structural_coverage_hints: list[dict[str, int | str]],
     off_partition_counts: dict[str, int],
     off_regulation_counts: dict[str, int],
+    max_off_overflow: int,
+    initial_forbidden_count: int,
 ) -> GlobalErrorIndicator:
     issues: list[str] = []
     recommendations: list[str] = []
@@ -140,11 +143,29 @@ def _build_global_error_indicator(
         if item not in dedup_recommendations:
             dedup_recommendations.append(item)
 
+    setting_actions: list[str] = []
+    if max_off_overflow > 0:
+        setting_actions.append(
+            f"Increase max_extra_off_days by at least +{max_off_overflow} (or equivalent structural OFF rebalance)"
+        )
+        setting_actions.append(
+            "If OFF over-release in fallback is a concern, keep hard cap and raise fallback_off_quota_excess_weight"
+        )
+    if initial_forbidden_count > 0:
+        setting_actions.append(
+            "Reduce initial_forbidden density on high-conflict nurse/day cells before increasing coverage requirements"
+        )
+    if int(off_regulation_counts.get("weekend_off_weekday_natural_o", 0)) > 0:
+        setting_actions.append(
+            "Do not disable weekend_off_only_enable for weekend-off cohorts unless policy itself changes"
+        )
+
     return GlobalErrorIndicator(
         is_feasible=is_feasible,
         error_summary=summary,
         primary_issues=issues,
         recommendations=dedup_recommendations,
+        setting_actions=setting_actions,
     )
 
 
@@ -165,6 +186,7 @@ def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
         if len(rows) < sample_cap:
             rows.append(_build_sample(nurse_idx, day_idx, label, rs))
 
+    max_off_overflow = 0
     if rs.roster is not None:
         n_count = len(rs.nurses)
         d_count = rs.num_days
@@ -244,6 +266,7 @@ def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
                         f"actual={total_off}, min={min_off_required}",
                     )
                 if total_off > max_off_allowed:
+                    max_off_overflow = max(max_off_overflow, total_off - max_off_allowed)
                     add_violation(
                         "off_max",
                         n,
@@ -458,6 +481,8 @@ def collect_hard_diagnostics(rs, sample_cap: int = 3) -> HardDiagnosticsResult:
         structural_coverage_hints=structural_coverage_hints,
         off_partition_counts=off_partition_counts,
         off_regulation_counts=off_regulation_counts,
+        max_off_overflow=max_off_overflow,
+        initial_forbidden_count=int(expanded_by_type.get("initial_forbidden", 0)),
     )
 
     return HardDiagnosticsResult(
@@ -498,7 +523,8 @@ def log_hard_diagnostics(result: HardDiagnosticsResult, logger_prefix: str, stag
         f"{{'is_feasible': {result.global_error_indicator.is_feasible}, "
         f"'summary': {result.global_error_indicator.error_summary!r}, "
         f"'issues': {result.global_error_indicator.primary_issues}, "
-        f"'recommendations': {result.global_error_indicator.recommendations}}}"
+        f"'recommendations': {result.global_error_indicator.recommendations}, "
+        f"'setting_actions': {result.global_error_indicator.setting_actions}}}"
     )
     for v_type, rows in sorted(result.sample_rows.items()):
         if rows:

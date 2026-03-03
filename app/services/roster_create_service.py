@@ -2045,6 +2045,24 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         # fixed_cells 는 옵션
         # - '주' 등 휴무류 코드는 엔진에서 'O'로 정규화해야 한다(shift_types=['D','E','N','O']).
         if fixed_cells:
+            known_main_codes: set[str] = set()
+            for row in (shift_manage_data or []):
+                try:
+                    main_code = str((row or {}).get("main_code") or "").strip().upper()
+                except Exception:
+                    main_code = ""
+                if main_code:
+                    known_main_codes.add(main_code)
+            known_main_codes.update({"O", "OFF"})
+            shift_id_to_default: dict[str, str] = {}
+            for row in (config_dict.get("shift_definitions") or []):
+                try:
+                    sid = str((row or {}).get("shift_id") or "").strip().upper()
+                    dflt = str((row or {}).get("default_shift") or sid).strip().upper()
+                except Exception:
+                    continue
+                if sid and dflt:
+                    shift_id_to_default[sid] = dflt
             norm_fixed = []
             for c in fixed_cells:
                 try:
@@ -2053,6 +2071,18 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                     shift_code = ''
                 if shift_code in ('OFF', 'O', '주'):
                     shift_code = 'O'
+                elif shift_code in shift_id_to_default:
+                    shift_code = shift_id_to_default.get(shift_code, shift_code)
+
+                if shift_code not in known_main_codes:
+                    try:
+                        print(
+                            f"[FixedCellNormalize] skip unknown fixed shift: "
+                            f"nurse_index={c.get('nurse_index')}, day_index={c.get('day_index')}, shift={shift_code}"
+                        )
+                    except Exception:
+                        pass
+                    continue
                 norm_fixed.append(
                     {
                         'nurse_index': c.get('nurse_index'),
@@ -2161,6 +2191,8 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             req.month,
             shift_manage_data,
             time_limit_seconds=time_limit_seconds,
+            randomize=bool(config_dict.get("cp_sat_randomize", True)),
+            seed=(int(config_dict.get("cp_sat_seed")) if config_dict.get("cp_sat_seed") is not None else None),
             grade_strategy=req.grade_strategy,
             grade_config=engine_grade_config,
         )

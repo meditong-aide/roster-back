@@ -1430,7 +1430,15 @@ class CPSATBasicEngine:
         from ortools.sat.python import cp_model
         # randomize=False 여도 run_seed는 항상 정의되어야 한다.
         # (e.g., 테스트/재현성 평가 스크립트에서 seed 고정 실행)
-        run_seed = seed if seed is not None else ((int(time.time() * 1000) ^ random.getrandbits(31)) & 0x7fffffff)
+        if seed is not None:
+            run_seed = int(seed) & 0x7fffffff
+        elif not randomize:
+            run_seed = 314159265
+        else:
+            run_seed = (int(time.time() * 1000) ^ random.getrandbits(31)) & 0x7fffffff
+        print(
+            f"{self.logger_prefix} [Repro] randomize={int(bool(randomize))}, run_seed={run_seed}"
+        )
         # ① 0.3× time_limit 으로 “전체 모델” 한번 돌려 feasible 확보
         # time_limit_seconds가 작을 때도(테스트/평가) 입력된 제한을 존중한다.
         # 예: time_limit_seconds=10이면 base_tl은 최대 3초 정도로 제한.
@@ -1442,7 +1450,7 @@ class CPSATBasicEngine:
         )
         roster_system.is_quick_phase = True
         feasible = self._quick_initial_solve(
-            roster_system, base_tl, grouped, run_seed)
+            roster_system, base_tl, grouped, run_seed, randomize=randomize)
         roster_system.is_quick_phase = False
         print(f"{self.logger_prefix} [Progress] 초기해={int(bool(feasible))}")
         # hard 위반 수 세는 헬퍼
@@ -1581,7 +1589,7 @@ class CPSATBasicEngine:
                     f"n_sel={len(n_sel)}, d_sel={len(d_sel)}"
                 )
                 ok, status_text = _solve_neighbourhood(
-                    roster_system, n_sel, d_sel, per_iter, grouped, run_seed, it=it
+                    roster_system, n_sel, d_sel, per_iter, grouped, run_seed, it=it, randomize=randomize
                 )
             except Exception as e:
                 print(f"{self.logger_prefix} 근무표 생성 중 오류: {e}")
@@ -1644,7 +1652,7 @@ class CPSATBasicEngine:
         )
 
     def _quick_initial_solve(self, rs: RosterSystem,
-                             tl:int, grouped, run_seed: int | None = None):
+                             tl:int, grouped, run_seed: int | None = None, randomize: bool = True):
         from ortools.sat.python import cp_model
         try:
             model,X,j,l,fixed = _build_full_model(rs,grouped)
@@ -1660,14 +1668,14 @@ class CPSATBasicEngine:
             #     # 매 실행마다 다르게: 시간+랜덤믹스
             #     seed = (int(time.time()*1000) ^ random.getrandbits(31)) & 0x7fffffff
             if run_seed is None:
-                run_seed = random.randint(1, 1_000_000_000)
-            solver.parameters.randomize_search = True
+                run_seed = (random.randint(1, 1_000_000_000) if randomize else 1)
+            solver.parameters.randomize_search = bool(randomize)
             solver.parameters.random_seed = (run_seed ^ 0x9E3779B1) & 0x7fffffff
             solver.parameters.solution_pool_size = 10
             # ▲▲ 랜덤화 추가 ▲▲
 
             solver.parameters.max_time_in_seconds=tl
-            solver.parameters.num_search_workers=2
+            solver.parameters.num_search_workers = (2 if randomize else 1)
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
             print('stat', stat)
@@ -2594,8 +2602,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 if extra_allowed >= 0 and phys_range_off:
+                    forced_structural_nonvac = sum(
+                        1
+                        for d in phys_range_off
+                        if (n, d) in structural_off_cells and (n, d) not in vacation_off_cells
+                    )
                     if is_n_only:
                         max_off_allowed_n_only = max(0, avail_days - 15)
+                        if forced_structural_nonvac > max_off_allowed_n_only:
+                            max_off_allowed_n_only = forced_structural_nonvac
                         m.Add(
                             sum(
                                 X(n, d, off)
@@ -2611,6 +2626,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                     else:
                         max_off_allowed = min(min_off_required + extra_allowed, avail_days)
+                        if forced_structural_nonvac > max_off_allowed:
+                            max_off_allowed = forced_structural_nonvac
                         m.Add(
                             sum(
                                 X(n, d, off)
@@ -2621,7 +2638,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"vac_cnt={vacation_cnt}, min_off={min_off_required}, max_off={max_off_allowed}"
+                            f"vac_cnt={vacation_cnt}, forced_structural_nonvac={forced_structural_nonvac}, "
+                            f"min_off={min_off_required}, max_off={max_off_allowed}"
                         )
         except Exception:
             pass
@@ -2733,6 +2751,7 @@ def _solve_neighbourhood(
     grouped,
     run_seed: int | None = None,
     it: int = 0,
+    randomize: bool = True,
 ) -> tuple[bool, str]:
     """선택된 이웃(n_set, d_set)만 재탐색하여 해를 갱신한다."""
     from ortools.sat.python import cp_model
@@ -2806,14 +2825,16 @@ def _solve_neighbourhood(
         pass
 
     solver=cp_model.CpSolver()
+    if run_seed is None:
+        run_seed = 1 if not randomize else random.randint(1, 1_000_000_000)
     if run_seed is not None:
         # 이웃/반복에 따라 seed 살짝 변조 → 다양성
         tweak = (hash(tuple(sorted(n_set))) ^ hash(tuple(sorted(d_set))) ^ (it * 0x9E3779B1)) & 0x7fffffff
-        solver.parameters.randomize_search = True
-        solver.parameters.random_seed = (run_seed ^ tweak) & 0x7fffffff
+        solver.parameters.randomize_search = bool(randomize)
+        solver.parameters.random_seed = ((run_seed ^ tweak) if randomize else run_seed) & 0x7fffffff
         solver.parameters.solution_pool_size = 10
     solver.parameters.max_time_in_seconds=tl
-    solver.parameters.num_search_workers = 10
+    solver.parameters.num_search_workers = (10 if randomize else 1)
     solver.parameters.relative_gap_limit = 0.1
     st = solver.Solve(model)
     status_text = _cp_sat_status_to_text(st)
