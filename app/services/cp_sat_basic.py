@@ -62,15 +62,66 @@ class RLNeighborhoodPolicy:
         self.eps, self.eps_end, self.decay = eps0, eps_end, decay
         self.n_w, self.d_w = np.ones(N), np.ones(D)
 
-    def select(self, k_n=4, k_d=7):
-        if random.random() < self.eps:                          # explore
-            n_sel = random.sample(range(self.N), k=min(k_n,self.N))
-            d_sel = random.sample(range(self.D), k=min(k_d,self.D))
-        else:                                                   # exploit
-            n_sel = list(np.random.choice(self.N,k_n,replace=False,
-                                           p=self.n_w/self.n_w.sum()))
-            d_sel = list(np.random.choice(self.D,k_d,replace=False,
-                                           p=self.d_w/self.d_w.sum()))
+    def select(self, k_n=4, k_d=7, candidate_n=None, candidate_d=None, explore_ratio=0.3):
+        n_pool = list(candidate_n) if candidate_n else list(range(self.N))
+        d_pool = list(candidate_d) if candidate_d else list(range(self.D))
+        if not n_pool:
+            n_pool = list(range(self.N))
+        if not d_pool:
+            d_pool = list(range(self.D))
+
+        k_n_eff = min(max(1, int(k_n)), len(n_pool))
+        k_d_eff = min(max(1, int(k_d)), len(d_pool))
+
+        if random.random() < self.eps:
+            n_explore = max(1, int(round(k_n_eff * float(explore_ratio))))
+            d_explore = max(1, int(round(k_d_eff * float(explore_ratio))))
+            n_explore = min(n_explore, k_n_eff)
+            d_explore = min(d_explore, k_d_eff)
+
+            n_rand = random.sample(n_pool, k=n_explore)
+            d_rand = random.sample(d_pool, k=d_explore)
+
+            n_remaining = [x for x in n_pool if x not in n_rand]
+            d_remaining = [x for x in d_pool if x not in d_rand]
+
+            if k_n_eff > len(n_rand) and n_remaining:
+                w_n = self.n_w[n_remaining].astype(float)
+                p_n = w_n / w_n.sum() if w_n.sum() > 0 else None
+                n_pick = list(
+                    np.random.choice(
+                        n_remaining,
+                        k_n_eff - len(n_rand),
+                        replace=False,
+                        p=p_n,
+                    )
+                )
+            else:
+                n_pick = []
+
+            if k_d_eff > len(d_rand) and d_remaining:
+                w_d = self.d_w[d_remaining].astype(float)
+                p_d = w_d / w_d.sum() if w_d.sum() > 0 else None
+                d_pick = list(
+                    np.random.choice(
+                        d_remaining,
+                        k_d_eff - len(d_rand),
+                        replace=False,
+                        p=p_d,
+                    )
+                )
+            else:
+                d_pick = []
+
+            n_sel = n_rand + n_pick
+            d_sel = d_rand + d_pick
+        else:
+            w_n = self.n_w[n_pool].astype(float)
+            p_n = w_n / w_n.sum() if w_n.sum() > 0 else None
+            w_d = self.d_w[d_pool].astype(float)
+            p_d = w_d / w_d.sum() if w_d.sum() > 0 else None
+            n_sel = list(np.random.choice(n_pool, k_n_eff, replace=False, p=p_n))
+            d_sel = list(np.random.choice(d_pool, k_d_eff, replace=False, p=p_d))
         self.eps = max(self.eps_end, self.eps*self.decay)
         return n_sel, d_sel
 
@@ -1565,13 +1616,115 @@ class CPSATBasicEngine:
             except Exception as e:
                 print(f"{self.logger_prefix} [HardDiagV2] failed: {e}")
         best_viol = hard_violation_cnt()
+        initial_best_viol = best_viol
         best_roster = roster_system.roster.copy()
+        print(f"{self.logger_prefix} [Progress] initial_best_viol={initial_best_viol}")
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
                                       roster_system.num_days)
-        remaining = time_limit_seconds - base_tl
-        per_iter = 8
-        max_iter = max(0, remaining // per_iter)
+        remaining = max(0, int(time_limit_seconds - base_tl))
+        try:
+            target_iter = int(getattr(roster_system.config, "enhanced_max_iter", 10) or 10)
+        except Exception:
+            target_iter = 10
+        target_iter = max(1, target_iter)
+        max_iter = min(target_iter, remaining) if remaining > 0 else 0
+        per_iter = max(1, remaining // max_iter) if max_iter > 0 else 0
+        N_total = len(roster_system.nurses)
+        D_total = roster_system.num_days
+        try:
+            base_k_n = int(getattr(roster_system.config, "enhanced_k_n", 6) or 6)
+        except Exception:
+            base_k_n = 6
+        try:
+            base_k_d = int(getattr(roster_system.config, "enhanced_k_d", 10) or 10)
+        except Exception:
+            base_k_d = 10
+        try:
+            stagnation_limit = int(getattr(roster_system.config, "enhanced_stagnation_limit", 2) or 2)
+        except Exception:
+            stagnation_limit = 2
+        try:
+            max_scale = int(getattr(roster_system.config, "enhanced_max_neighborhood_scale", 4) or 4)
+        except Exception:
+            max_scale = 4
+        max_scale = max(1, max_scale)
+        stagnation_limit = max(1, stagnation_limit)
+        adaptive_enabled = bool(getattr(roster_system.config, "enhanced_adaptive_neighborhood", True))
+
+        def _build_adaptive_candidates():
+            violations = roster_system._find_violations()
+            hard_violations = [v for v in violations if str(v.get("type", "")) in HARD_TYPES]
+            if not hard_violations:
+                return None, None, {}
+
+            n_candidates: set[int] = set()
+            d_candidates: set[int] = set()
+            by_type: dict[str, int] = defaultdict(int)
+
+            shift_types = list(getattr(roster_system.config, "shift_types", []) or [])
+            initial_forbidden = (
+                getattr(roster_system, "initial_forbidden", {})
+                if isinstance(getattr(roster_system, "initial_forbidden", {}), dict)
+                else {}
+            )
+            fixed_cells_map = (
+                getattr(roster_system, "fixed_cells", {})
+                if isinstance(getattr(roster_system, "fixed_cells", {}), dict)
+                else {}
+            )
+            join_days = getattr(roster_system, "join_day", None)
+            leave_days = getattr(roster_system, "leave_day", None)
+
+            for v in hard_violations:
+                v_type = str(v.get("type", "unknown"))
+                by_type[v_type] += 1
+
+                n_idx = v.get("nurse_idx")
+                if isinstance(n_idx, int) and 0 <= n_idx < N_total:
+                    n_candidates.add(n_idx)
+
+                day = v.get("day")
+                if isinstance(day, int) and 0 <= day < D_total:
+                    d_candidates.add(day)
+                    d_candidates.add(max(0, day - 1))
+                    d_candidates.add(min(D_total - 1, day + 1))
+                    if v_type == "initial_forbidden":
+                        d_candidates.add(max(0, day - 2))
+                        d_candidates.add(min(D_total - 1, day + 2))
+
+                if v_type != "shift_requirement":
+                    continue
+
+                if not isinstance(day, int) or not (0 <= day < D_total):
+                    continue
+                shift_code = str(v.get("shift", "")).strip().upper()
+                if not shift_code or shift_code not in shift_types:
+                    continue
+                shift_idx = shift_types.index(shift_code)
+
+                for n in range(N_total):
+                    if isinstance(join_days, list) and n < len(join_days) and day < int(join_days[n]):
+                        continue
+                    if isinstance(leave_days, list) and n < len(leave_days) and day > int(leave_days[n]):
+                        continue
+
+                    fixed_s = fixed_cells_map.get((n, day))
+                    if fixed_s is not None and int(fixed_s) != shift_idx:
+                        continue
+
+                    forb = initial_forbidden.get((n, day), set())
+                    forb_codes = {str(c).strip().upper() for c in (forb or set())}
+                    if shift_code in forb_codes:
+                        continue
+
+                    n_candidates.add(n)
+
+            return (
+                sorted(n_candidates) if n_candidates else None,
+                sorted(d_candidates) if d_candidates else None,
+                dict(sorted(by_type.items(), key=lambda x: (-x[1], x[0]))),
+            )
 
         if max_iter == 0:
             print(
@@ -1581,12 +1734,29 @@ class CPSATBasicEngine:
             if best_viol > 0:
                 log_hard_violation_diagnostics(stage="max_iter_0")
             return best_viol == 0
+        no_improve_iters = 0
         for it in range(max_iter):
             try:
-                n_sel, d_sel = policy.select()
+                scale = 1 + min(max_scale - 1, no_improve_iters // stagnation_limit)
+                k_n = min(N_total, max(1, base_k_n * scale))
+                k_d = min(D_total, max(1, base_k_d * scale))
+
+                adaptive_meta = {}
+                if adaptive_enabled:
+                    cand_n, cand_d, adaptive_meta = _build_adaptive_candidates()
+                    n_sel, d_sel = policy.select(
+                        k_n=k_n,
+                        k_d=k_d,
+                        candidate_n=cand_n,
+                        candidate_d=cand_d,
+                    )
+                else:
+                    n_sel, d_sel = policy.select(k_n=k_n, k_d=k_d)
+
                 print(
                     f"{self.logger_prefix} [Progress] iter={it + 1}/{max_iter}, "
-                    f"n_sel={len(n_sel)}, d_sel={len(d_sel)}"
+                    f"n_sel={len(n_sel)}, d_sel={len(d_sel)}, scale={scale}, "
+                    f"adaptive={int(adaptive_enabled)}, top_types={list(adaptive_meta.items())[:3]}"
                 )
                 ok, status_text = _solve_neighbourhood(
                     roster_system, n_sel, d_sel, per_iter, grouped, run_seed, it=it, randomize=randomize
@@ -1600,13 +1770,16 @@ class CPSATBasicEngine:
                     f"status={status_text}"
                 )
                 policy.update(False, n_sel, d_sel)
+                no_improve_iters += 1
                 continue
             curr_viol = hard_violation_cnt()
             improved  = curr_viol < best_viol
             if improved:
                 best_viol = curr_viol;  best_roster = roster_system.roster.copy()
+                no_improve_iters = 0
             else:  # rollback
                 roster_system.roster = best_roster.copy()
+                no_improve_iters += 1
             policy.update(improved, n_sel, d_sel)
             print(
                 f"{self.logger_prefix} [Progress] iter={it + 1} "
@@ -1614,7 +1787,10 @@ class CPSATBasicEngine:
                 f"best_viol={best_viol}, improved={int(improved)}"
             )
             if best_viol == 0:
-                print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
+                print(
+                    f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료 "
+                    f"(at_iter={it + 1}, initial_best_viol={initial_best_viol})"
+                )
                 break
         roster_system.roster = best_roster
         log_n_even_distribution(roster_system, self.logger_prefix)
