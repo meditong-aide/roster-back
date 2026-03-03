@@ -1160,13 +1160,29 @@ class CPSATBasicEngine:
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
             success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
             if not success:
-                print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
-                self._optimize_fallback_lex_hard_first(
-                    roster_system,
-                    time_limit_seconds=time_limit_seconds,
-                    grouped=grouped,
-                    shift_type_map=shift_id_to_type,
-                )
+                try:
+                    retry_idx = int(getattr(roster_system.config, "cp_sat_retry_index", 1) or 1)
+                except Exception:
+                    retry_idx = 1
+                try:
+                    retry_total = int(getattr(roster_system.config, "cp_sat_retry_total", 1) or 1)
+                except Exception:
+                    retry_total = 1
+                retry_total = max(1, retry_total)
+                is_last_retry = retry_idx >= retry_total
+                if retry_total >= 2 and not is_last_retry:
+                    print(
+                        f"{self.logger_prefix} 개선된 제약사항으로 실패, "
+                        f"retry {retry_idx}/{retry_total}에서는 폴백 생략"
+                    )
+                else:
+                    print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
+                    self._optimize_fallback_lex_hard_first(
+                        roster_system,
+                        time_limit_seconds=time_limit_seconds,
+                        grouped=grouped,
+                        shift_type_map=shift_id_to_type,
+                    )
         # # 9-1. 불필요 OFF 정리 (N-only 제외)
         # try:
         #     with Timer("불필요 OFF 정리"):
@@ -1627,7 +1643,7 @@ class CPSATBasicEngine:
             target_iter = int(getattr(roster_system.config, "enhanced_max_iter", 10) or 10)
         except Exception:
             target_iter = 10
-        target_iter = max(1, target_iter)
+        target_iter = max(1, 1)
         max_iter = min(target_iter, remaining) if remaining > 0 else 0
         per_iter = max(1, remaining // max_iter) if max_iter > 0 else 0
         N_total = len(roster_system.nurses)
@@ -1656,11 +1672,13 @@ class CPSATBasicEngine:
             violations = roster_system._find_violations()
             hard_violations = [v for v in violations if str(v.get("type", "")) in HARD_TYPES]
             if not hard_violations:
-                return None, None, {}
+                return None, None, {}, {}
 
             n_candidates: set[int] = set()
             d_candidates: set[int] = set()
             by_type: dict[str, int] = defaultdict(int)
+            type_n_candidates: dict[str, set[int]] = defaultdict(set)
+            type_d_candidates: dict[str, set[int]] = defaultdict(set)
 
             shift_types = list(getattr(roster_system.config, "shift_types", []) or [])
             initial_forbidden = (
@@ -1683,15 +1701,19 @@ class CPSATBasicEngine:
                 n_idx = v.get("nurse_idx")
                 if isinstance(n_idx, int) and 0 <= n_idx < N_total:
                     n_candidates.add(n_idx)
+                    type_n_candidates[v_type].add(n_idx)
 
                 day = v.get("day")
                 if isinstance(day, int) and 0 <= day < D_total:
                     d_candidates.add(day)
                     d_candidates.add(max(0, day - 1))
                     d_candidates.add(min(D_total - 1, day + 1))
+                    type_d_candidates[v_type].add(day)
                     if v_type == "initial_forbidden":
                         d_candidates.add(max(0, day - 2))
                         d_candidates.add(min(D_total - 1, day + 2))
+                        type_d_candidates[v_type].add(max(0, day - 2))
+                        type_d_candidates[v_type].add(min(D_total - 1, day + 2))
 
                 if v_type != "shift_requirement":
                     continue
@@ -1719,11 +1741,20 @@ class CPSATBasicEngine:
                         continue
 
                     n_candidates.add(n)
+                    type_n_candidates[v_type].add(n)
 
+            focus_candidates = {
+                t: {
+                    "n": sorted(type_n_candidates.get(t, set())),
+                    "d": sorted(type_d_candidates.get(t, set())),
+                }
+                for t in ("shift_requirement", "initial_forbidden")
+            }
             return (
                 sorted(n_candidates) if n_candidates else None,
                 sorted(d_candidates) if d_candidates else None,
                 dict(sorted(by_type.items(), key=lambda x: (-x[1], x[0]))),
+                focus_candidates,
             )
 
         if max_iter == 0:
@@ -1742,8 +1773,9 @@ class CPSATBasicEngine:
                 k_d = min(D_total, max(1, base_k_d * scale))
 
                 adaptive_meta = {}
+                focus_candidates = {}
                 if adaptive_enabled:
-                    cand_n, cand_d, adaptive_meta = _build_adaptive_candidates()
+                    cand_n, cand_d, adaptive_meta, focus_candidates = _build_adaptive_candidates()
                     n_sel, d_sel = policy.select(
                         k_n=k_n,
                         k_d=k_d,
@@ -1752,6 +1784,36 @@ class CPSATBasicEngine:
                     )
                 else:
                     n_sel, d_sel = policy.select(k_n=k_n, k_d=k_d)
+
+                force_cover_enabled = bool(
+                    getattr(roster_system.config, "enhanced_force_type_cover_enable", False)
+                )
+                if adaptive_enabled and force_cover_enabled and focus_candidates:
+                    try:
+                        min_cover_n = int(getattr(roster_system.config, "enhanced_force_type_cover_min_n", 1) or 1)
+                    except Exception:
+                        min_cover_n = 1
+                    try:
+                        min_cover_d = int(getattr(roster_system.config, "enhanced_force_type_cover_min_d", 1) or 1)
+                    except Exception:
+                        min_cover_d = 1
+                    min_cover_n = max(1, min_cover_n)
+                    min_cover_d = max(1, min_cover_d)
+
+                    n_sel_set = set(n_sel)
+                    d_sel_set = set(d_sel)
+                    for t in ("shift_requirement", "initial_forbidden"):
+                        pools = focus_candidates.get(t, {}) if isinstance(focus_candidates, dict) else {}
+                        t_n = list(pools.get("n") or [])
+                        t_d = list(pools.get("d") or [])
+                        if t_n and not any(nn in n_sel_set for nn in t_n):
+                            for nn in t_n[:min_cover_n]:
+                                n_sel_set.add(int(nn))
+                        if t_d and not any(dd in d_sel_set for dd in t_d):
+                            for dd in t_d[:min_cover_d]:
+                                d_sel_set.add(int(dd))
+                    n_sel = sorted(n_sel_set)
+                    d_sel = sorted(d_sel_set)
 
                 print(
                     f"{self.logger_prefix} [Progress] iter={it + 1}/{max_iter}, "
@@ -1774,17 +1836,29 @@ class CPSATBasicEngine:
                 continue
             curr_viol = hard_violation_cnt()
             improved  = curr_viol < best_viol
+            equal_move = curr_viol == best_viol
+            accept_equal_move = bool(getattr(roster_system.config, "enhanced_accept_equal_move", False))
+            keep_equal = False
+            if (not improved) and equal_move and accept_equal_move:
+                try:
+                    accept_equal_every = int(getattr(roster_system.config, "enhanced_accept_equal_every", 3) or 3)
+                except Exception:
+                    accept_equal_every = 3
+                accept_equal_every = max(1, accept_equal_every)
+                keep_equal = (((it + 1) % accept_equal_every) == 0) or (no_improve_iters >= stagnation_limit)
             if improved:
                 best_viol = curr_viol;  best_roster = roster_system.roster.copy()
                 no_improve_iters = 0
+            elif keep_equal:
+                no_improve_iters += 1
             else:  # rollback
                 roster_system.roster = best_roster.copy()
                 no_improve_iters += 1
-            policy.update(improved, n_sel, d_sel)
+            policy.update(improved or keep_equal, n_sel, d_sel)
             print(
                 f"{self.logger_prefix} [Progress] iter={it + 1} "
                 f"status={status_text}, curr_viol={curr_viol}, "
-                f"best_viol={best_viol}, improved={int(improved)}"
+                f"best_viol={best_viol}, improved={int(improved)}, keep_equal={int(keep_equal)}"
             )
             if best_viol == 0:
                 print(

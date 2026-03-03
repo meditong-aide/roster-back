@@ -1994,6 +1994,52 @@ def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
+    solver_fn = globals().get("generate_roster_cp_sat")
+    if not callable(solver_fn):
+        raise Exception("CP-SAT 엔진이 준비되지 않았습니다.")
+    hard_types = {
+        "shift_requirement",
+        "night_consecutive",
+        "consecutive_work",
+        "night_nd",
+        "night_ne",
+        "eve_ed",
+        "night_month_limit",
+        "rec_3n2o",
+        "rec_2n2o",
+    }
+
+    def _hard_violation_count(result_obj) -> int | None:
+        if not isinstance(result_obj, dict):
+            return None
+        rs = result_obj.get("roster_system")
+        if rs is None or not hasattr(rs, "_find_violations"):
+            return None
+        try:
+            violations = rs._find_violations()
+            return sum(1 for v in violations if str(v.get("type", "")) in hard_types)
+        except Exception:
+            return None
+
+    def _run_once(config_dict: dict, grade_cfg: dict | None):
+        seed_raw = config_dict.get("cp_sat_seed")
+        try:
+            seed_value = int(seed_raw) if seed_raw is not None else None
+        except Exception:
+            seed_value = None
+        return solver_fn(
+            nurses_dict,
+            prefs_dict,
+            config_dict,
+            int(req.year),
+            int(req.month),
+            shift_manage_data,
+            time_limit_seconds=time_limit_seconds,
+            randomize=bool(config_dict.get("cp_sat_randomize", True)),
+            seed=seed_value,
+            grade_strategy=req.grade_strategy,
+            grade_config=grade_cfg,
+        )
     try:
         nurses_dict = [n.__dict__ for n in nurses_in_group]
         # is_weekend_off는 ORM 컬럼 유무와 무관하게, DB에 컬럼이 있으면 직접 조회해서 엔진 입력에 주입한다.
@@ -2183,19 +2229,51 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             engine_grade_config = _fetch_grade_config_dict(
                 db, current_user.office_id, current_user.group_id
             )
-        cp_sat_result = generate_roster_cp_sat(
-            nurses_dict,
-            prefs_dict,
-            config_dict,
-            req.year,
-            req.month,
-            shift_manage_data,
-            time_limit_seconds=time_limit_seconds,
-            randomize=bool(config_dict.get("cp_sat_randomize", True)),
-            seed=(int(config_dict.get("cp_sat_seed")) if config_dict.get("cp_sat_seed") is not None else None),
-            grade_strategy=req.grade_strategy,
-            grade_config=engine_grade_config,
-        )
+        try:
+            retry_attempts = int(config_dict.get("cp_sat_retry_attempts", 1) or 1)
+        except Exception:
+            retry_attempts = 1
+        retry_attempts = max(1, min(4, retry_attempts))
+
+        base_seed_raw = config_dict.get("cp_sat_seed")
+        try:
+            base_seed = int(base_seed_raw) if base_seed_raw is not None else None
+        except Exception:
+            base_seed = None
+
+        first_cfg = config_dict.copy()
+        first_cfg["cp_sat_retry_index"] = 1
+        first_cfg["cp_sat_retry_total"] = retry_attempts
+        cp_sat_result = _run_once(first_cfg, engine_grade_config)
+        best_hard = _hard_violation_count(cp_sat_result)
+        if best_hard is None:
+            best_hard = 10**9
+
+        if retry_attempts > 1 and best_hard > 0:
+            for attempt_idx in range(1, retry_attempts):
+                retry_cfg = config_dict.copy()
+                if base_seed is None:
+                    retry_seed = int(datetime.now().timestamp() * 1000) + attempt_idx * 100003
+                else:
+                    retry_seed = base_seed + attempt_idx * 100003
+                retry_cfg["cp_sat_seed"] = int(retry_seed)
+                retry_cfg["cp_sat_retry_index"] = attempt_idx + 1
+                retry_cfg["cp_sat_retry_total"] = retry_attempts
+
+                attempt_result = _run_once(retry_cfg, engine_grade_config)
+                attempt_hard = _hard_violation_count(attempt_result)
+                if attempt_hard is None:
+                    attempt_hard = 10**9
+                if attempt_hard < best_hard:
+                    cp_sat_result = attempt_result
+                    best_hard = attempt_hard
+
+                print(
+                    f"[CP-SAT-Retry] attempt={attempt_idx + 1}/{retry_attempts}, "
+                    f"seed={retry_seed}, attempt_hard={attempt_hard}, best_hard={best_hard}"
+                )
+                if best_hard == 0:
+                    break
     except Exception as e:
         print(f"error: {e}")
         raise
