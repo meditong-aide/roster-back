@@ -2021,7 +2021,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         except Exception:
             return None
 
-    def _run_once(config_dict: dict, grade_cfg: dict | None):
+    def _run_once(config_dict: dict, grade_cfg: dict | None, attempt_tl: int):
         seed_raw = config_dict.get("cp_sat_seed")
         try:
             seed_value = int(seed_raw) if seed_raw is not None else None
@@ -2034,7 +2034,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             int(req.year),
             int(req.month),
             shift_manage_data,
-            time_limit_seconds=time_limit_seconds,
+            time_limit_seconds=attempt_tl,
             randomize=bool(config_dict.get("cp_sat_randomize", True)),
             seed=seed_value,
             grade_strategy=req.grade_strategy,
@@ -2235,6 +2235,48 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             retry_attempts = 1
         retry_attempts = max(1, min(4, retry_attempts))
 
+        split_retry_time = bool(config_dict.get("cp_sat_retry_time_split_enable", True))
+        retry_time_profile = str(config_dict.get("cp_sat_retry_time_profile", "equal") or "equal").strip().lower()
+        try:
+            min_attempt_tl = int(config_dict.get("cp_sat_retry_min_attempt_seconds", 6) or 6)
+        except Exception:
+            min_attempt_tl = 6
+        min_attempt_tl = max(1, min_attempt_tl)
+
+        total_budget = max(1, int(time_limit_seconds or 1))
+        attempt_tls = [total_budget] * retry_attempts
+        if split_retry_time and retry_attempts > 1:
+            if retry_time_profile == "increasing":
+                attempt_tls = [min_attempt_tl for _ in range(retry_attempts)]
+                used = min(total_budget, min_attempt_tl * retry_attempts)
+                remain = max(0, total_budget - used)
+                weights = [idx + 1 for idx in range(retry_attempts)]
+                weight_sum = sum(weights)
+                for idx, w in enumerate(weights):
+                    if remain <= 0:
+                        break
+                    add = int(remain * (w / weight_sum))
+                    if idx == retry_attempts - 1:
+                        add = remain
+                    attempt_tls[idx] += max(0, add)
+                tl_sum = sum(attempt_tls)
+                if tl_sum > total_budget:
+                    overshoot = tl_sum - total_budget
+                    for idx in range(retry_attempts):
+                        take = min(overshoot, max(0, attempt_tls[idx] - 1))
+                        attempt_tls[idx] -= take
+                        overshoot -= take
+                        if overshoot <= 0:
+                            break
+            else:
+                per_attempt_tl = max(min_attempt_tl, total_budget // retry_attempts)
+                per_attempt_tl = min(total_budget, per_attempt_tl)
+                attempt_tls = [per_attempt_tl for _ in range(retry_attempts)]
+        print(
+            f"[CP-SAT-Retry] profile={retry_time_profile}, split={int(split_retry_time)}, "
+            f"attempt_tls={attempt_tls}, total_budget={total_budget}"
+        )
+
         base_seed_raw = config_dict.get("cp_sat_seed")
         try:
             base_seed = int(base_seed_raw) if base_seed_raw is not None else None
@@ -2244,7 +2286,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         first_cfg = config_dict.copy()
         first_cfg["cp_sat_retry_index"] = 1
         first_cfg["cp_sat_retry_total"] = retry_attempts
-        cp_sat_result = _run_once(first_cfg, engine_grade_config)
+        cp_sat_result = _run_once(first_cfg, engine_grade_config, int(attempt_tls[0]))
         best_hard = _hard_violation_count(cp_sat_result)
         if best_hard is None:
             best_hard = 10**9
@@ -2260,7 +2302,8 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                 retry_cfg["cp_sat_retry_index"] = attempt_idx + 1
                 retry_cfg["cp_sat_retry_total"] = retry_attempts
 
-                attempt_result = _run_once(retry_cfg, engine_grade_config)
+                attempt_tl = int(attempt_tls[min(attempt_idx, len(attempt_tls) - 1)])
+                attempt_result = _run_once(retry_cfg, engine_grade_config, attempt_tl)
                 attempt_hard = _hard_violation_count(attempt_result)
                 if attempt_hard is None:
                     attempt_hard = 10**9
@@ -2270,7 +2313,8 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
 
                 print(
                     f"[CP-SAT-Retry] attempt={attempt_idx + 1}/{retry_attempts}, "
-                    f"seed={retry_seed}, attempt_hard={attempt_hard}, best_hard={best_hard}"
+                    f"seed={retry_seed}, tl={attempt_tl}s, "
+                    f"attempt_hard={attempt_hard}, best_hard={best_hard}"
                 )
                 if best_hard == 0:
                     break

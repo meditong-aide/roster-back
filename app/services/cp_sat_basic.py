@@ -1643,9 +1643,27 @@ class CPSATBasicEngine:
             target_iter = int(getattr(roster_system.config, "enhanced_max_iter", 10) or 10)
         except Exception:
             target_iter = 10
-        target_iter = max(1, 1)
+        target_iter = max(1, target_iter)
         max_iter = min(target_iter, remaining) if remaining > 0 else 0
         per_iter = max(1, remaining // max_iter) if max_iter > 0 else 0
+        hard_first_phase_enabled = bool(
+            getattr(roster_system.config, "enhanced_hard_first_phase_enable", False)
+        )
+        try:
+            hard_first_phase_ratio = float(
+                getattr(roster_system.config, "enhanced_hard_first_phase_ratio", 0.4) or 0.4
+            )
+        except Exception:
+            hard_first_phase_ratio = 0.4
+        hard_first_phase_ratio = max(0.0, min(0.9, hard_first_phase_ratio))
+        hard_phase_iters = 0
+        if hard_first_phase_enabled and max_iter > 1:
+            hard_phase_iters = max(1, int(round(max_iter * hard_first_phase_ratio)))
+            hard_phase_iters = min(max_iter - 1, hard_phase_iters)
+            print(
+                f"{self.logger_prefix} [HardFirstPhase] enabled=1, "
+                f"hard_phase_iters={hard_phase_iters}/{max_iter}"
+            )
         N_total = len(roster_system.nurses)
         D_total = roster_system.num_days
         try:
@@ -1667,6 +1685,30 @@ class CPSATBasicEngine:
         max_scale = max(1, max_scale)
         stagnation_limit = max(1, stagnation_limit)
         adaptive_enabled = bool(getattr(roster_system.config, "enhanced_adaptive_neighborhood", True))
+        nogood_enabled = bool(getattr(roster_system.config, "enhanced_nogood_enable", False))
+        try:
+            nogood_repeat_threshold = int(
+                getattr(roster_system.config, "enhanced_nogood_repeat_threshold", 2) or 2
+            )
+        except Exception:
+            nogood_repeat_threshold = 2
+        try:
+            nogood_ttl_iters = int(
+                getattr(roster_system.config, "enhanced_nogood_ttl_iters", 4) or 4
+            )
+        except Exception:
+            nogood_ttl_iters = 4
+        try:
+            nogood_replace_limit = int(
+                getattr(roster_system.config, "enhanced_nogood_replace_limit", 2) or 2
+            )
+        except Exception:
+            nogood_replace_limit = 2
+        nogood_repeat_threshold = max(1, nogood_repeat_threshold)
+        nogood_ttl_iters = max(1, nogood_ttl_iters)
+        nogood_replace_limit = max(1, nogood_replace_limit)
+        nogood_fail_counts: dict[tuple[int, str], int] = defaultdict(int)
+        nogood_day_expire: dict[int, int] = {}
 
         def _build_adaptive_candidates():
             violations = roster_system._find_violations()
@@ -1767,6 +1809,8 @@ class CPSATBasicEngine:
             return best_viol == 0
         no_improve_iters = 0
         for it in range(max_iter):
+            hard_phase_iter = hard_phase_iters > 0 and it < hard_phase_iters
+            roster_system.is_quick_phase = bool(hard_phase_iter)
             try:
                 scale = 1 + min(max_scale - 1, no_improve_iters // stagnation_limit)
                 k_n = min(N_total, max(1, base_k_n * scale))
@@ -1774,6 +1818,7 @@ class CPSATBasicEngine:
 
                 adaptive_meta = {}
                 focus_candidates = {}
+                cand_d = None
                 if adaptive_enabled:
                     cand_n, cand_d, adaptive_meta, focus_candidates = _build_adaptive_candidates()
                     n_sel, d_sel = policy.select(
@@ -1784,6 +1829,25 @@ class CPSATBasicEngine:
                     )
                 else:
                     n_sel, d_sel = policy.select(k_n=k_n, k_d=k_d)
+
+                if nogood_enabled:
+                    active_nogood_days = {
+                        day for day, exp_iter in nogood_day_expire.items() if exp_iter >= it
+                    }
+                    if active_nogood_days:
+                        d_pool = cand_d if (adaptive_enabled and cand_d) else list(range(D_total))
+                        replacement_pool = [d for d in d_pool if d not in active_nogood_days and d not in d_sel]
+                        if replacement_pool:
+                            replace_cnt = 0
+                            new_d_sel: list[int] = []
+                            for dd in d_sel:
+                                if dd in active_nogood_days and replace_cnt < nogood_replace_limit:
+                                    rep = replacement_pool.pop(0)
+                                    new_d_sel.append(rep)
+                                    replace_cnt += 1
+                                else:
+                                    new_d_sel.append(dd)
+                            d_sel = new_d_sel
 
                 force_cover_enabled = bool(
                     getattr(roster_system.config, "enhanced_force_type_cover_enable", False)
@@ -1818,7 +1882,8 @@ class CPSATBasicEngine:
                 print(
                     f"{self.logger_prefix} [Progress] iter={it + 1}/{max_iter}, "
                     f"n_sel={len(n_sel)}, d_sel={len(d_sel)}, scale={scale}, "
-                    f"adaptive={int(adaptive_enabled)}, top_types={list(adaptive_meta.items())[:3]}"
+                    f"adaptive={int(adaptive_enabled)}, phase={'HARD' if hard_phase_iter else 'SOFT'}, "
+                    f"top_types={list(adaptive_meta.items())[:3]}"
                 )
                 ok, status_text = _solve_neighbourhood(
                     roster_system, n_sel, d_sel, per_iter, grouped, run_seed, it=it, randomize=randomize
@@ -1854,6 +1919,26 @@ class CPSATBasicEngine:
             else:  # rollback
                 roster_system.roster = best_roster.copy()
                 no_improve_iters += 1
+
+            if nogood_enabled and (not improved):
+                try:
+                    violations_now = roster_system._find_violations()
+                except Exception:
+                    violations_now = []
+                for vv in violations_now:
+                    if str(vv.get("type", "")) != "shift_requirement":
+                        continue
+                    try:
+                        day = int(vv.get("day"))
+                    except Exception:
+                        continue
+                    shift = str(vv.get("shift", "")).strip().upper()
+                    if not shift:
+                        continue
+                    key = (day, shift)
+                    nogood_fail_counts[key] += 1
+                    if nogood_fail_counts[key] >= nogood_repeat_threshold:
+                        nogood_day_expire[day] = it + nogood_ttl_iters
             policy.update(improved or keep_equal, n_sel, d_sel)
             print(
                 f"{self.logger_prefix} [Progress] iter={it + 1} "
@@ -1867,6 +1952,7 @@ class CPSATBasicEngine:
                 )
                 break
         roster_system.roster = best_roster
+        roster_system.is_quick_phase = False
         log_n_even_distribution(roster_system, self.logger_prefix)
         if best_viol > 0:
             print(
