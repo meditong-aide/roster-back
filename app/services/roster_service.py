@@ -33,6 +33,8 @@ from db.nurse_config import Nurse as NurseEngine
 from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequest
 from services.roster_system import RosterSystem
 from services.shift_service_mssql import _to_time_str
+
+
 def save_roster_config_service(
     config_data: RosterConfigCreate,
     user,
@@ -50,23 +52,28 @@ def save_roster_config_service(
         target_office_id: str
 
         if override_group_id:
-            group_row = db.query(Group).filter(Group.group_id == override_group_id).first()
+            group_row = (
+                db.query(Group).filter(Group.group_id == override_group_id).first()
+            )
             if not group_row:
                 raise Exception("지정한 그룹을 찾을 수 없습니다.")
             target_group_id = group_row.group_id
             target_office_id = group_row.office_id
         else:
-            
             nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
             target_group_id = user.group_id
             target_office_id = nurse.office_id
 
         # 2) ShiftManage 기준으로 기본 일/저/야 요구 인원 계산
-        shift_manages = db.query(ShiftManage).filter(
-            ShiftManage.office_id == target_office_id,
-            ShiftManage.group_id == target_group_id,
-            ShiftManage.nurse_class == 'RN',
-        ).all()
+        shift_manages = (
+            db.query(ShiftManage)
+            .filter(
+                ShiftManage.office_id == target_office_id,
+                ShiftManage.group_id == target_group_id,
+                ShiftManage.nurse_class == "RN",
+            )
+            .all()
+        )
         day_req = eve_req = nig_req = 0
         if shift_manages:
             for sm in shift_manages:
@@ -81,60 +88,53 @@ def save_roster_config_service(
 
         # 3) 설정 저장
         config_dict = config_data.model_dump()
-        use_mid = bool(config_dict.get('use_mid', False))
-        config_dict.update({
-            'day_req': day_req,
-            'eve_req': eve_req,
-            'nig_req': nig_req
-        })
+        use_mid = bool(config_dict.get("use_mid", False))
+        config_dict.update({"day_req": day_req, "eve_req": eve_req, "nig_req": nig_req})
         db_config = RosterConfigModel(
             **config_dict,
             office_id=target_office_id,
             group_id=target_group_id,
         )
-        print('db_config', db_config.__dict__)
-        weekly_off_group = config_dict.get('weekly_off_group')
+        print("db_config", db_config.__dict__)
+        weekly_off_group = config_dict.get("weekly_off_group")
         db.query(WeeklyOffSetting).filter(
             WeeklyOffSetting.office_id == target_office_id,
             WeeklyOffSetting.group_id == target_group_id,
-        ).update(
-            {
-                'activate': 1 if weekly_off_group else 0
-            }
-        )
+        ).update({"activate": 1 if weekly_off_group else 0})
         if weekly_off_group is not None:
             new_enabled = 1 if weekly_off_group else 0
-            db.query(Nurse).filter(
-                Nurse.group_id == target_group_id
-            ).update(
-                {Nurse.weekly_off_enabled: new_enabled},
-                synchronize_session=False
+            db.query(Nurse).filter(Nurse.group_id == target_group_id).update(
+                {Nurse.weekly_off_enabled: new_enabled}, synchronize_session=False
             )
 
         if not use_mid:
             db.query(ShiftManage).filter(
                 ShiftManage.office_id == target_office_id,
                 ShiftManage.group_id == target_group_id,
-                ShiftManage.nurse_class == 'RN',
+                ShiftManage.nurse_class == "RN",
                 ShiftManage.shift_slot == 5,
             ).update({ShiftManage.manpower: 0}, synchronize_session=False)
 
             nurses = db.query(Nurse).filter(Nurse.group_id == target_group_id).all()
             for nurse_row in nurses:
-                raw_types = getattr(nurse_row, 'is_night_nurse', None)
+                raw_types = getattr(nurse_row, "is_night_nurse", None)
                 if isinstance(raw_types, list) and raw_types:
                     nurse_row.is_night_nurse = [
-                        t for t in raw_types if str(t).strip().upper() != 'M'
+                        t for t in raw_types if str(t).strip().upper() != "M"
                     ]
 
-            grade_cfg = db.query(RosterGradeConfig).filter(
-                RosterGradeConfig.office_id == target_office_id,
-                RosterGradeConfig.group_id == target_group_id,
-            ).first()
+            grade_cfg = (
+                db.query(RosterGradeConfig)
+                .filter(
+                    RosterGradeConfig.office_id == target_office_id,
+                    RosterGradeConfig.group_id == target_group_id,
+                )
+                .first()
+            )
             if grade_cfg and isinstance(grade_cfg.constraints_json, dict):
                 cleaned = dict(grade_cfg.constraints_json)
-                if 'M' in cleaned:
-                    cleaned.pop('M', None)
+                if "M" in cleaned:
+                    cleaned.pop("M", None)
                     grade_cfg.constraints_json = cleaned
 
         db.add(db_config)
@@ -142,11 +142,14 @@ def save_roster_config_service(
         db.refresh(db_config)
         return {"message": "Configuration saved successfully"}
     except Exception as e:
-        print(f'설정 저장 오류: {str(e)}')
+        print(f"설정 저장 오류: {str(e)}")
         db.rollback()
         raise
 
-def get_latest_schedule_service(current_user, db: Session, override_group_id: str | None = None):
+
+def get_latest_schedule_service(
+    current_user, db: Session, override_group_id: str | None = None
+):
     """
     최신 스케줄 정보 조회 서비스 함수.
 
@@ -154,21 +157,22 @@ def get_latest_schedule_service(current_user, db: Session, override_group_id: st
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (
+        getattr(current_user, "is_head_nurse", False)
+        or getattr(current_user, "is_master_admin", False)
+    ):
         raise Exception("Permission denied")
 
     target_group_id = override_group_id or current_user.group_id
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
 
-    latest_schedule = db.query(Schedule).filter(
-        Schedule.group_id == target_group_id,
-        Schedule.dropped == False
-    ).order_by(
-        Schedule.year.desc(),
-        Schedule.month.desc(),
-        Schedule.version.desc()
-    ).first()
+    latest_schedule = (
+        db.query(Schedule)
+        .filter(Schedule.group_id == target_group_id, Schedule.dropped == False)
+        .order_by(Schedule.year.desc(), Schedule.month.desc(), Schedule.version.desc())
+        .first()
+    )
     if not latest_schedule:
         return None
     return {
@@ -176,10 +180,13 @@ def get_latest_schedule_service(current_user, db: Session, override_group_id: st
         "month": latest_schedule.month,
         "version": latest_schedule.version,
         "status": latest_schedule.status,
-        "schedule_id": latest_schedule.schedule_id
+        "schedule_id": latest_schedule.schedule_id,
     }
 
-def get_issued_schedules_service(current_user, db: Session, target_group_id: str | None = None):
+
+def get_issued_schedules_service(
+    current_user, db: Session, target_group_id: str | None = None
+):
     """
     발행된(issued) 모든 스케줄 정보 조회 서비스 함수.
 
@@ -190,21 +197,38 @@ def get_issued_schedules_service(current_user, db: Session, target_group_id: str
     # if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
     #     raise Exception("Permission denied")
 
- 
     try:
-        schedules_query = db.query(Schedule.schedule_id, Schedule.year, Schedule.month).filter(
-            Schedule.group_id == target_group_id,
-            Schedule.status == 'issued',
-            Schedule.dropped == False
-        ).distinct().order_by(Schedule.year.desc(), Schedule.month.desc()).all()
-        schedules = [{"year": r.year, "month": r.month, "schedule_id": r.schedule_id} for r in schedules_query]
+        schedules_query = (
+            db.query(Schedule.schedule_id, Schedule.year, Schedule.month)
+            .filter(
+                Schedule.group_id == target_group_id,
+                Schedule.status == "issued",
+                Schedule.dropped == False,
+            )
+            .distinct()
+            .order_by(Schedule.year.desc(), Schedule.month.desc())
+            .all()
+        )
+        schedules = [
+            {"year": r.year, "month": r.month, "schedule_id": r.schedule_id}
+            for r in schedules_query
+        ]
     except Exception as e:
-        print('[get_issued_schedules_service] error', e)
-        print('[get_issued_schedules_service] target_group_id', target_group_id)
-        raise HTTPException(status_code=500, detail=f"Failed to get issued schedules: {str(e)}")
+        print("[get_issued_schedules_service] error", e)
+        print("[get_issued_schedules_service] target_group_id", target_group_id)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get issued schedules: {str(e)}"
+        )
     return schedules
 
-def get_schedule_status_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
+
+def get_schedule_status_service(
+    year: int,
+    month: int,
+    current_user,
+    db: Session,
+    override_group_id: str | None = None,
+):
     """
     특정 월의 스케줄 상태 조회 서비스 함수.
 
@@ -214,37 +238,55 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
         raise Exception("Not authenticated")
 
     # HN/ADM 그룹 요약
-    if getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False):
+    if getattr(current_user, "is_head_nurse", False) or getattr(
+        current_user, "is_master_admin", False
+    ):
         target_group_id = override_group_id or current_user.group_id
         if not target_group_id:
             raise Exception("대상 그룹이 없습니다.")
-        schedules = db.query(Schedule).filter(
-            Schedule.group_id == target_group_id,
-            Schedule.year == year,
-            Schedule.month == month,
-            Schedule.dropped == False
-        ).all()
+        schedules = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id == target_group_id,
+                Schedule.year == year,
+                Schedule.month == month,
+                Schedule.dropped == False,
+            )
+            .all()
+        )
         has_schedules = len(schedules) > 0
         latest_status = schedules[0].status if schedules else None
         return {
             "has_schedules": has_schedules,
             "latest_status": latest_status,
-            "schedule_count": len(schedules)
+            "schedule_count": len(schedules),
         }
 
     # 일반 간호사 개인 선호도/상태
-    schedule = db.query(Schedule).filter(
-        Schedule.group_id == current_user.group_id,
-        Schedule.year == year,
-        Schedule.month == month,
-        Schedule.dropped == False
-    ).order_by(Schedule.version.desc()).first()
-    submitted_preference = db.query(ShiftPreference).filter(
-        ShiftPreference.nurse_id == current_user.nurse_id,
-        ShiftPreference.year == year,
-        ShiftPreference.month == month,
-        ShiftPreference.is_submitted == True
-    ).order_by(ShiftPreference.submitted_at.desc()).first()
+    schedule = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == current_user.group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.dropped == False,
+        )
+        .order_by(Schedule.version.desc())
+        .first()
+    )
+    submitted_preference = (
+        db.query(ShiftPreference)
+        .filter(
+            ShiftPreference.office_id == current_user.office_id,
+            ShiftPreference.group_id == current_user.group_id,
+            ShiftPreference.nurse_id == current_user.nurse_id,
+            ShiftPreference.year == year,
+            ShiftPreference.month == month,
+            ShiftPreference.is_submitted == True,
+        )
+        .order_by(ShiftPreference.submitted_at.desc())
+        .first()
+    )
     if submitted_preference:
         return {
             "schedule_status": schedule.status if schedule else None,
@@ -252,14 +294,21 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
             "preference_data": submitted_preference.data,
             "has_schedules": schedule is not None,
             "created_at": submitted_preference.created_at,
-            "submitted_at": submitted_preference.submitted_at
+            "submitted_at": submitted_preference.submitted_at,
         }
-    draft_preference = db.query(ShiftPreference).filter(
-        ShiftPreference.nurse_id == current_user.nurse_id,
-        ShiftPreference.year == year,
-        ShiftPreference.month == month,
-        ShiftPreference.is_submitted == False
-    ).order_by(ShiftPreference.created_at.desc()).first()
+    draft_preference = (
+        db.query(ShiftPreference)
+        .filter(
+            ShiftPreference.office_id == current_user.office_id,
+            ShiftPreference.group_id == current_user.group_id,
+            ShiftPreference.nurse_id == current_user.nurse_id,
+            ShiftPreference.year == year,
+            ShiftPreference.month == month,
+            ShiftPreference.is_submitted == False,
+        )
+        .order_by(ShiftPreference.created_at.desc())
+        .first()
+    )
     if draft_preference:
         return {
             "schedule_status": schedule.status if schedule else None,
@@ -267,7 +316,7 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
             "preference_data": draft_preference.data,
             "has_schedules": schedule is not None,
             "created_at": draft_preference.created_at,
-            "submitted_at": None
+            "submitted_at": None,
         }
     return {
         "schedule_status": schedule.status if schedule else None,
@@ -275,7 +324,7 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
         "preference_data": None,
         "has_schedules": schedule is not None,
         "created_at": None,
-        "submitted_at": None
+        "submitted_at": None,
     }
 
 

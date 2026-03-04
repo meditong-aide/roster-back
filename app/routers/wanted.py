@@ -167,6 +167,8 @@ async def get_submission_statuses(
     for nurse_id in nurse_ids_in_group:
         # 해당 간호사의 최신 제출된 선호도가 있는지 확인
         latest_submitted = db.query(ShiftPreference).filter(
+            ShiftPreference.office_id == current_user.office_id,
+            ShiftPreference.group_id == target_group_id,
             ShiftPreference.nurse_id == nurse_id,
             ShiftPreference.year == year,
             ShiftPreference.month == month,
@@ -322,12 +324,12 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
         db.commit() # 한번 더 강제 commit
         
         print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
-        return result
+        return {"response": result}
     except Exception as e:
         db.rollback()
         print(f'error', e)
         raise HTTPException(status_code=500, detail=str(e))
-    
+
     finally:
         pass
 
