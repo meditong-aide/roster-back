@@ -1353,52 +1353,36 @@ def optimize_fallback_lex_hard_first(
                     min_off_miss_by_n[n] = miss
                     safety["min_off_missing"].append(miss)
                 if extra_allowed >= 0:
-                    pure_offs = sum(
+                    nonvac_offs = sum(
                         X(n, d, off_idx)
                         for d in range(T0, T1 + 1)
-                        if (n, d) not in structural_off_cells
-                        and (n, d) not in vacation_off_cells
+                        if (n, d) not in vacation_off_cells
                     )
-                    # vacation은 순수 O 상한에서 제외하므로, 허용량에 vacation_cnt를 더해 총 휴무 여유가 줄지 않도록 한다.
-                    MAX_PURE_OFF = max_off_allowed_from_policy + vacation_cnt
-                    pure_cap_effective = MAX_PURE_OFF + relax_level
                     if is_n_only:
-                        max_off_allowed_n_only = max(0, avail_days - 15) + relax_level
-                        pure_cap_effective = min(pure_cap_effective, max_off_allowed_n_only)
-                        m.Add(pure_offs <= pure_cap_effective)
+                        total_cap_effective = max(0, avail_days - 15) + relax_level
                     else:
-                        max_off_allowed = min(pure_cap_effective, avail_days)
-                        if is_weekend_off:
-                            weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
-                            weekend_cnt = len(weekend_in_range)
-                            weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
-                            pure_cap_effective = weekday_off_cap + weekend_cnt
-                            if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
-                                cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
-                                weighted = m.NewIntVar(
-                                    0,
-                                    off_cap_bounded_slack_max * off_cap_bounded_slack_weight,
-                                    f"off_cap_slack_weighted_{n}",
-                                )
-                                m.Add(weighted == cap_slack * off_cap_bounded_slack_weight)
-                                safety["off_cap_bounded_slack"].append(weighted)
-                                m.Add(pure_offs <= pure_cap_effective + cap_slack)
-                            else:
-                                m.Add(pure_offs <= pure_cap_effective)
-                        else:
-                            pure_cap_effective = max_off_allowed
-                            if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
-                                cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
-                                weighted = m.NewIntVar(
-                                    0,
-                                    off_cap_bounded_slack_max * off_cap_bounded_slack_weight,
-                                    f"off_cap_slack_weighted_{n}",
-                                )
-                                m.Add(weighted == cap_slack * off_cap_bounded_slack_weight)
-                                safety["off_cap_bounded_slack"].append(weighted)
-                                m.Add(pure_offs <= pure_cap_effective + cap_slack)
-                            else:
-                                m.Add(pure_offs <= pure_cap_effective)
+                        base_cap = max_off_allowed_from_policy
+                        if n in per_nurse_off_cap_override:
+                            base_cap = max(base_cap, per_nurse_off_cap_override[n])
+                        total_cap_effective = min(base_cap + relax_level, avail_days)
+                    if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
+                        cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
+                        weighted = m.NewIntVar(
+                            0,
+                            off_cap_bounded_slack_max * off_cap_bounded_slack_weight,
+                            f"off_cap_slack_weighted_{n}",
+                        )
+                        m.Add(weighted == cap_slack * off_cap_bounded_slack_weight)
+                        safety["off_cap_bounded_slack"].append(weighted)
+                        m.Add(nonvac_offs <= total_cap_effective + cap_slack)
+                    else:
+                        m.Add(nonvac_offs <= total_cap_effective)
+                    if stage == 3:
+                        print(
+                            f"{logger_prefix} [OffCap][total] n={n}, id={nurse_id}, name={nurse_name}, "
+                            f"nonvac_cap={total_cap_effective}, min_off={min_off_required}, vacation={vacation_cnt}, "
+                            f"is_n_only={int(is_n_only)}, weekend_off={int(is_weekend_off)}"
+                        )
                     # print(
                     #     f"{logger_prefix} [OffCap][pure] n={n}, id={nurse_id}, name={nurse_name}, "
                     #     f"pure_off_cap={MAX_PURE_OFF}, effective_cap={pure_cap_effective}, "
