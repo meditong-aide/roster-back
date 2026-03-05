@@ -447,6 +447,7 @@ class CPSATBasicEngine:
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
             preceptee_on=bool(config_data.get('preceptee_on', False)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
+            use_mid=bool(config_data.get('use_mid', False)),
             # team_balance_enable=team_balance_enable,
             team_balance_enable=True, # test
             team_balance_gauge=10, # test
@@ -754,6 +755,8 @@ class CPSATBasicEngine:
                 shift_id_to_type[sid] = stype
         # type='근무' + shift_gb가 DEN 계열인 하위코드 집합 (프리셉티 동기화에서 근무로 취급)
         _WORK_GB = {"D", "E", "N", "데이", "이브닝", "나이트"}
+        if bool(config_data.get("use_mid", False)):
+            _WORK_GB |= {"M", "미드"}
         _work_sub_ids: set[str] = set()
         for row in shift_defs or []:
             try:
@@ -856,6 +859,22 @@ class CPSATBasicEngine:
                         print('[line 655] error!!!!!!!', e)
                         pass
                 c['shift'] = normalized_shift
+            _preceptee_fixed_wanted_map: dict[tuple[int, int], str] = {}
+            _preceptee_fixed_wanted_map_raw = config_data.get('preceptee_fixed_wanted_map') or {}
+            if isinstance(_preceptee_fixed_wanted_map_raw, dict):
+                for _key, _raw_code in _preceptee_fixed_wanted_map_raw.items():
+                    try:
+                        _n_idx, _d_idx = _key
+                        _n_i = int(_n_idx)
+                        _d_i = int(_d_idx)
+                    except Exception:
+                        continue
+                    _norm = _normalize_shift_code(str(_raw_code or '').strip(), shift_id_to_main)
+                    if _norm and _norm in config.shift_types:
+                        _preceptee_fixed_wanted_map[(_n_i, _d_i)] = _norm
+            else:
+                _preceptee_fixed_wanted_map_raw = {}
+            roster_system._preceptee_fixed_wanted_map = _preceptee_fixed_wanted_map
             # 디버그: 고정 셀(휴가/공가/주휴/기타 휴무류) 정규화/예외 처리 확인
             try:
                 off_ex = set(getattr(config, "off_exception_cells", []) or [])
@@ -1108,7 +1127,7 @@ class CPSATBasicEngine:
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
-        # # 9-1. 불필요 OFF 정리 (N-only 제외)
+        # 9-1. 불필요 OFF 정리 (N-only 제외)
         # try:
         #     with Timer("불필요 OFF 정리"):
         #         trimmed = self._postprocess_trim_extra_offs(roster_system, max_changes=80, prefer_shortage=True)
@@ -1124,9 +1143,13 @@ class CPSATBasicEngine:
             _shift_types = roster_system.config.shift_types
             _off_s_idx = _shift_types.index('O') if 'O' in _shift_types else None
             _standard = {'D', 'E', 'N', 'O'}
+            if bool(getattr(roster_system.config, 'use_mid', False)):
+                _standard.add('M')
             id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
             synced = 0
             special_converted = 0
+            _pte_fw_map = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
+            _fw_restored = 0
             for n, nu in enumerate(roster_system.nurses):
                 pid = getattr(nu, 'preceptor_id', None)
                 if not pid or pid not in id_to_idx:
@@ -1137,6 +1160,13 @@ class CPSATBasicEngine:
                 # 2단계: 특수코드 일자는 프리셉티를 OFF로 전환
                 if _off_s_idx is not None:
                     for d in range(roster_system.num_days):
+                        if (n, d) in _pte_fw_map:
+                            _fw_code = _pte_fw_map[(n, d)]
+                            if _fw_code in _shift_types:
+                                roster_system.roster[n, d, :] = 0
+                                roster_system.roster[n, d, _shift_types.index(_fw_code)] = 1
+                                _fw_restored += 1
+                                continue
                         need_off = False
                         _original = fixed_original_shift_map.get((ptr_idx, d))
                         if _original:
@@ -1166,6 +1196,8 @@ class CPSATBasicEngine:
                 msg = f"{self.logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
                 if special_converted:
                     msg += f" (특수코드→OFF 전환: {special_converted}건)"
+                if _fw_restored:
+                    msg += f", fixed_wanted 재적용: {_fw_restored}건"
                 print(msg)
                 
             # 추가: 프리셉티의 fixed_cells를 프리셉터 값으로 강제 덮어쓰기
@@ -1201,8 +1233,21 @@ class CPSATBasicEngine:
                             copied["nurse_index"] = n
                             new_fixed.append(copied)
 
-                roster_system.fixed_cells = new_fixed
-                print(f"[PrecepteeSync-Fixed] fixed_cells 프리셉터 동기화 완료: {len(new_fixed)}개")
+                _new_fixed_by_key = {}
+                for _cell in new_fixed:
+                    _k = (_cell.get('nurse_index'), _cell.get('day_index'))
+                    _new_fixed_by_key[_k] = _cell
+                _pte_fw_raw = _preceptee_fixed_wanted_map_raw
+                for (_n_idx, _d_idx), _fw_code in _pte_fw_map.items():
+                    _raw_shift = _pte_fw_raw.get((_n_idx, _d_idx), _fw_code) if isinstance(_pte_fw_raw, dict) else _fw_code
+                    _new_fixed_by_key[(_n_idx, _d_idx)] = {
+                        'nurse_index': _n_idx,
+                        'day_index': _d_idx,
+                        'shift': _raw_shift,
+                    }
+                _final_fixed = list(_new_fixed_by_key.values())
+                roster_system.fixed_cells = _final_fixed
+                print(f"[PrecepteeSync-Fixed] fixed_cells 프리셉터 동기화 완료: {len(_final_fixed)}개")
 
         # W 배정 디버그 로그
         try:
@@ -1292,8 +1337,12 @@ class CPSATBasicEngine:
                     _st = roster_system.config.shift_types
                     _oi = _st.index('O') if 'O' in _st else None
                     _std = {'D', 'E', 'N', 'O'}
+                    if bool(getattr(roster_system.config, 'use_mid', False)):
+                        _std.add('M')
                     _id2i = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
                     _sc = 0
+                    _gr_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
+                    _gr_fw_restored = 0
                     for _n, _nu in enumerate(roster_system.nurses):
                         _pid = getattr(_nu, 'preceptor_id', None)
                         if not _pid or _pid not in _id2i:
@@ -1302,6 +1351,13 @@ class CPSATBasicEngine:
                         roster_system.roster[_n] = roster_system.roster[_pi].copy()
                         if _oi is not None:
                             for _d in range(roster_system.num_days):
+                                if (_n, _d) in _gr_pte_fw:
+                                    _fw_code = _gr_pte_fw[(_n, _d)]
+                                    if _fw_code in _st:
+                                        roster_system.roster[_n, _d, :] = 0
+                                        roster_system.roster[_n, _d, _st.index(_fw_code)] = 1
+                                        _gr_fw_restored += 1
+                                        continue
                                 _need = False
                                 _orig = fixed_original_shift_map.get((_pi, _d))
                                 if _orig:
@@ -1319,7 +1375,10 @@ class CPSATBasicEngine:
                                     roster_system.roster[_n, _d, _oi] = 1
                         _sc += 1
                     if _sc:
-                        print(f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명")
+                        _msg = f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명"
+                        if _gr_fw_restored:
+                            _msg += f", fixed_wanted 재적용: {_gr_fw_restored}건"
+                        print(_msg)
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
                 )
@@ -1350,6 +1409,9 @@ class CPSATBasicEngine:
             _off_code = canonical_to_shift_id.get('O', 'O')
             _id2i_final = {nu.db_id: n for n, nu in enumerate(nurses)}
             _synced_final = 0
+            _synced_final_fw = 0
+            _pte_fw_raw_final = _preceptee_fixed_wanted_map_raw
+            _pte_fw_norm_final = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
             for nu in nurses:
                 _pid_f = getattr(nu, 'preceptor_id', None)
                 if not _pid_f or _pid_f not in _id2i_final:
@@ -1360,6 +1422,22 @@ class CPSATBasicEngine:
                     continue
                 changed = False
                 for d_i in range(min(len(ptr_sched), len(pte_sched))):
+                    _n_idx_final = _id2i_final.get(nu.db_id)
+                    _fw_code_final = None
+                    if _n_idx_final is not None:
+                        if isinstance(_pte_fw_raw_final, dict):
+                            _fw_code_final = _pte_fw_raw_final.get((_n_idx_final, d_i))
+                        if not _fw_code_final:
+                            _fw_norm = _pte_fw_norm_final.get((_n_idx_final, d_i)) if isinstance(_pte_fw_norm_final, dict) else None
+                            if _fw_norm:
+                                _fw_code_final = canonical_to_shift_id.get(_fw_norm, _fw_norm)
+                    if _fw_code_final:
+                        _fw_code_final = str(_fw_code_final).strip()
+                        if _fw_code_final and pte_sched[d_i] != _fw_code_final:
+                            pte_sched[d_i] = _fw_code_final
+                            changed = True
+                            _synced_final_fw += 1
+                        continue
                     ptr_code = str(ptr_sched[d_i]).strip()
                     ptr_u = ptr_code.upper()
                     if ptr_u in {'D', 'E', 'N', 'O'} or ptr_u in _work_sub_ids:
@@ -1376,7 +1454,10 @@ class CPSATBasicEngine:
                     result[nu.db_id] = pte_sched
                     _synced_final += 1
             if _synced_final:
-                print(f"{self.logger_prefix} [PrecepteeSync] 최종 result 동기화: {_synced_final}명")
+                _msg = f"{self.logger_prefix} [PrecepteeSync] 최종 result 동기화: {_synced_final}명"
+                if _synced_final_fw:
+                    _msg += f", fixed_wanted 재적용: {_synced_final_fw}건"
+                print(_msg)
         # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
         try:
             weekly_off_by_idx = (

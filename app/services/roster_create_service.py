@@ -2907,6 +2907,56 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             f"하드 고정={len(fw_fixed_cells)}건 {dict(_fw_code_counts)}, "
             f"스킵(특수코드 중복={_fw_skip_special}, 엔진 미포함 간호사={_fw_skip_nurse}, 활동범위 밖={_fw_skip_range})"
         )
+        _preceptee_on_val = config_dict.get("preceptee_on", False)
+        print(
+            f"[RosterCreate] 프리셉티 fixed_wanted 맵 구성 조건: preceptee_on={_preceptee_on_val}, all_fixed_entries={len(all_fixed_entries)}건"
+        )
+        if _preceptee_on_val:
+            _pte_fw_map: dict[tuple[int, int], str] = {}
+            _pte_ids = set()
+            _pte_names: dict[str, str] = {}
+            for nurse in nurses_for_engine:
+                if getattr(nurse, "preceptor_id", None):
+                    _pte_ids.add(str(nurse.nurse_id))
+                    _pte_names[str(nurse.nurse_id)] = getattr(nurse, "name", "?")
+            print(
+                f"[RosterCreate] 프리셉티 목록: {len(_pte_ids)}명 → {[(nid, _pte_names.get(nid, '?')) for nid in sorted(_pte_ids)]}"
+            )
+            _idx_to_nid = {idx: nid for nid, idx in fw_nurse_idx_map.items()}
+            for fe in all_fixed_entries:
+                _nid = str(fe.nurse_id)
+                if _nid not in _pte_ids:
+                    continue
+                _n_idx = fw_nurse_idx_map.get(_nid)
+                if _n_idx is None:
+                    continue
+                _d_idx = fe.shift_date.day - 1
+                if _d_idx < 0 or _d_idx >= days_in_month:
+                    continue
+                if active_range_candidates:
+                    _rng = active_range_candidates.get(_nid)
+                    if _rng:
+                        _start_idx, _end_idx = _rng
+                        if _d_idx < _start_idx or _d_idx > _end_idx:
+                            continue
+                _pte_fw_map[(_n_idx, _d_idx)] = str(fe.shift_id or "").strip()
+            if _pte_fw_map:
+                config_dict["preceptee_fixed_wanted_map"] = _pte_fw_map
+                print(
+                    f"[RosterCreate] 프리셉티 fixed_wanted 맵: {len(_pte_fw_map)}건 (후처리에서 보호)"
+                )
+                for (ni, di), sc in sorted(_pte_fw_map.items()):
+                    _nm = _pte_names.get(_idx_to_nid.get(ni, ""), "?")
+                    print(f"  → 프리셉티 {_nm}(idx={ni}) {di + 1}일차={sc}")
+            else:
+                print(
+                    f"[RosterCreate] 프리셉티 fixed_wanted 맵: 0건 (프리셉티 FixedWantedEntry 매칭 없음)"
+                )
+                print("  [DEBUG] 프리셉티 원본 FixedWantedEntry가 없거나 활동범위/엔진 매핑에서 제외됨")
+        else:
+            print(
+                f"[RosterCreate] preceptee_on=False → 프리셉티 fixed_wanted 맵 구성 스킵"
+            )
     else:
         print(
             f"[RosterCreate] fixed_wanted_use_yn=False: "
