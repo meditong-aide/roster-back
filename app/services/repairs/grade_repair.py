@@ -264,7 +264,7 @@ def _available_grade(rs, nurse_grades, day_idx, shift_code, g, join, leave):
             continue
         if not (join[n_idx] <= day_idx <= leave[n_idx]):
             continue
-        if shift_code in ("D", "E") and _is_night_only(rs.nurses[n_idx]):
+        if shift_code in ("D", "E", "M") and _is_night_only(rs.nurses[n_idx]):
             continue
         # fixed 셀 제외
         if hasattr(rs, "fixed_cells"):
@@ -290,7 +290,7 @@ def _find_candidates(rs, roster, nurse_grades, day_idx, shift_code, g, move_coun
             continue
         if not (join[n_idx] <= day_idx <= leave[n_idx]):
             continue
-        if shift_code in ("D", "E") and _is_night_only(rs.nurses[n_idx]):
+        if shift_code in ("D", "E", "M") and _is_night_only(rs.nurses[n_idx]):
             continue
         # 이미 해당 shift에 배정되어 있으면 skip
         if int(roster[n_idx, day_idx, s_idx]) == 1:

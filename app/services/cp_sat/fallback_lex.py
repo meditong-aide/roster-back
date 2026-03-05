@@ -1646,8 +1646,12 @@ def optimize_fallback_lex_hard_first(
         _fb_shift_types = cfg.shift_types
         _fb_off_idx = _fb_shift_types.index('O') if 'O' in _fb_shift_types else None
         _fb_standard = {'D', 'E', 'N', 'O'}
+        if bool(getattr(cfg, 'use_mid', False)):
+            _fb_standard.add('M')
+        _fb_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
         synced = 0
         special_converted = 0
+        _fb_fw_restored = 0
         for pte_idx in preceptee_indices:
             pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
             if not pid or pid not in _fb_id_to_idx:
@@ -1660,6 +1664,14 @@ def optimize_fallback_lex_hard_first(
             _fb_orig_map = getattr(roster_system, '_fixed_original_shift_map', {})
             if _fb_off_idx is not None:
                 for d in range(roster_system.num_days):
+                    # 프리셉티 fixed_wanted 일자는 프리셉터 복사 대신 본인 값 적용
+                    if (pte_idx, d) in _fb_pte_fw:
+                        _fw_code = _fb_pte_fw[(pte_idx, d)].strip().upper()
+                        if _fw_code in _fb_shift_types:
+                            roster_system.roster[pte_idx, d, :] = 0
+                            roster_system.roster[pte_idx, d, _fb_shift_types.index(_fw_code)] = 1
+                            _fb_fw_restored += 1
+                        continue
                     _fb_need = False
                     _fb_orig = _fb_orig_map.get((ptr_idx, d))
                     if _fb_orig:
@@ -1681,6 +1693,8 @@ def optimize_fallback_lex_hard_first(
             msg = f"{logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
             if special_converted:
                 msg += f" (특수코드→OFF 전환: {special_converted}건)"
+            if _fb_fw_restored:
+                msg += f", fixed_wanted 재적용: {_fb_fw_restored}건"
             print(msg)
 
     _log_weekend_work_assignments(

@@ -72,6 +72,8 @@ class NurseRosterConfig:
     # ── 프리셉티 팔로우/커버리지 제어 ──
     preceptee_on: bool = False                          # 프리셉티 팔로우 모드 (ON 시 프리셉티는 프리셉터 근무 따라감)
     preceptee_shift_count: bool = True                  # 프리셉티 커버리지 포함 여부 (ON: DEN에 포함, OFF: DEN에서 제외, preceptee_on=True일 때만 유효)
+    # ── 미드(M) 시프트 사용 여부 ──
+    use_mid: bool = False                               # True 시 DENO → DENMO 커버리지 전환
 
     # --- 신규 Hard Constraint 제어 파라미터 ---
     enforce_seniority_pairing: bool = True # 시니어-주니어 동반 근무 규칙 강제 여부
