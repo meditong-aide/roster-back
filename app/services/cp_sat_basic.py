@@ -1119,14 +1119,17 @@ class CPSATBasicEngine:
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
             success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
+            fallback_success = False
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
-                self._optimize_fallback_lex_hard_first(
+                fallback_success = self._optimize_fallback_lex_hard_first(
                     roster_system,
                     time_limit_seconds=time_limit_seconds,
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
+            if not success and not fallback_success:
+                raise RuntimeError("HARD_INFEASIBLE: stage1/fallback 모두 해 없음")
         # 9-1. 불필요 OFF 정리 (N-only 제외)
         # try:
         #     with Timer("불필요 OFF 정리"):
@@ -2497,6 +2500,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
             if bool(getattr(cfg, "not_one_night", False)):
                 for d in range(T0, T1 + 1):
+                    if d == T1:
+                        continue
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night:
                         continue  # 1N day0 N 고정(경계) 시 해당일 1N 제약 스킵
                     neighbors = []
@@ -2573,17 +2578,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                     else:
                         max_off_allowed = min(min_off_required + extra_allowed, avail_days)
+                        hard_mandatory_off = sum(
+                            1
+                            for d in phys_range_off
+                            if (n, d) in structural_off_cells
+                            and (n, d) not in vacation_off_cells
+                        )
+                        effective_max_off = max(max_off_allowed, hard_mandatory_off)
+                        effective_max_off = min(effective_max_off, avail_days)
                         m.Add(
                             sum(
                                 X(n, d, off)
                                 for d in phys_range_off
                                 if (n, d) not in vacation_off_cells
                             )
-                            <= max_off_allowed
+                            <= effective_max_off
                         )
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"vac_cnt={vacation_cnt}, min_off={min_off_required}, max_off={max_off_allowed}"
+                            f"vac_cnt={vacation_cnt}, min_off={min_off_required}, max_off={effective_max_off}"
                         )
         except Exception:
             pass
