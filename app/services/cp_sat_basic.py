@@ -46,6 +46,7 @@ from services.cp_sat.lookahead_constraints import (
     add_lookahead_off_cap_constraints,
     add_lookahead_distribution_penalty_terms,
 )
+from services.cp_sat.off_policy import compute_off_bounds, resolve_effective_off_days
 
 logger = logging.getLogger(__name__)
 
@@ -480,6 +481,13 @@ class CPSATBasicEngine:
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
             off_placement_mode=0,
+        )
+        off_days_eff, off_days_src = resolve_effective_off_days(config_data)
+        print(
+            f"[OffPolicy][Config] effective_off_days={off_days_eff}, source={off_days_src}, "
+            f"raw_off_days={config_data.get('off_days')}, "
+            f"raw_standard={config_data.get('standard_personal_off_days')}, "
+            f"raw_global={config_data.get('global_monthly_off_days')}"
         )
         # 월말 자연스러운 종료를 유도하기 위한 그림자 커버리지(소프트) 기본값
         setattr(cfg, "shadow_coverage_lookback_days", int(config_data.get("shadow_coverage_lookback_days", 6) or 0))
@@ -2540,11 +2548,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 phys_range_off = month_total_day_range(T0, T1, D_phys)
                 avail_days = len(phys_range_off) if phys_range_off else 0
                 vacation_cnt = sum(1 for d in phys_range_off if (n, d) in vacation_off_cells)
-                base_min_off = int(
-                    getattr(cfg, "global_monthly_off_days", 0)
-                    + getattr(cfg, "standard_personal_off_days", 0)
+                off_bounds = compute_off_bounds(
+                    source=cfg,
+                    avail_days=avail_days,
+                    vacation_cnt=vacation_cnt,
                 )
-                min_off_required = max(0, min(base_min_off, avail_days - vacation_cnt))
+                min_off_required = int(off_bounds["min_off_required"])
                 if min_off_required > 0 and phys_range_off:
                     m.Add(
                         sum(
@@ -2554,7 +2563,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         >= min_off_required
                     )
-                extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
+                extra_allowed = int(off_bounds["max_extra_off_days"])
                 if extra_allowed >= 0 and phys_range_off:
                     if is_n_only:
                         max_off_allowed_n_only = max(0, avail_days - 15)
@@ -2572,7 +2581,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
                         )
                     else:
-                        max_off_allowed = min(min_off_required + extra_allowed, avail_days)
+                        max_off_allowed = int(off_bounds["max_off_allowed"])
                         m.Add(
                             sum(
                                 X(n, d, off)

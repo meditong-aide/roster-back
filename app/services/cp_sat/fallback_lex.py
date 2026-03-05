@@ -34,6 +34,15 @@ def _cp_sat_status_to_text(status: int) -> str:
     return mapping.get(status, f"UNKNOWN({status})")
 
 
+def _load_off_policy_helpers():
+    module = __import__("services.cp_sat.off_policy", fromlist=["*"])
+    return (
+        getattr(module, "compute_off_bounds"),
+        getattr(module, "resolve_effective_off_days"),
+        getattr(module, "resolve_max_extra_off_days"),
+    )
+
+
 def _log_weekend_off_enforcement(
     roster_system,
     join: list[int],
@@ -151,6 +160,18 @@ def optimize_fallback_lex_hard_first(
 
     N, D, S = len(roster_system.nurses), roster_system.num_days, roster_system.config.num_shifts
     cfg = roster_system.config
+    (
+        compute_off_bounds,
+        resolve_effective_off_days,
+        resolve_max_extra_off_days,
+    ) = _load_off_policy_helpers()
+    effective_off_days, effective_off_source = resolve_effective_off_days(cfg)
+    effective_max_extra = resolve_max_extra_off_days(cfg, 0)
+    print(
+        f"{logger_prefix} [OffPolicy][Fallback] effective_off_days={effective_off_days}, "
+        f"source={effective_off_source}, max_extra_off_days={effective_max_extra}, "
+        f"raw_off_days={getattr(cfg, 'off_days', None)}"
+    )
 
     # 공통 인덱스/구간
     idx = {c: roster_system.config.shift_types.index(c) for c in ("D", "E", "N", "O")}
@@ -337,12 +358,8 @@ def optimize_fallback_lex_hard_first(
             )
         # 월 최대 OFF 상한 vs 2N→2OFF 강제 OFF 충돌 확인
         try:
-            base_min_off = int(
-                getattr(cfg, "global_monthly_off_days", 0)
-                + getattr(cfg, "standard_personal_off_days", 0)
-            )
-            # print('6', base_min_off)
-            extra_allowed = int(getattr(cfg, "max_extra_off_days", 1) or 1)
+            base_min_off = effective_off_days
+            extra_allowed = effective_max_extra
             # print('7', extra_allowed)
             max_off_allowed_per_person = base_min_off + extra_allowed
             # print('8', max_off_allowed_per_person)
@@ -554,11 +571,6 @@ def optimize_fallback_lex_hard_first(
 
             # (2) 강제/고정 OFF로 개인 OFF 상한 초과 여부
             try:
-                base_min_off = int(
-                    getattr(cfg, "global_monthly_off_days", 0)
-                    + getattr(cfg, "standard_personal_off_days", 0)
-                )
-                extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
                     avail_days = T1 - T0 + 1
@@ -586,9 +598,12 @@ def optimize_fallback_lex_hard_first(
                         max_off_allowed = max(0, avail_days - 15) + relax_level
                         # print(f'is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     else:
-                        max_off_allowed = min(
-                            base_min_off + extra_allowed + relax_level, avail_days
+                        off_bounds = compute_off_bounds(
+                            source=cfg,
+                            avail_days=avail_days,
+                            vacation_cnt=0,
                         )
+                        max_off_allowed = int(off_bounds["max_off_allowed"]) + relax_level
                         # print(f'not is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     if forced_off_cnt > max_off_allowed:
                         # print(f'forced_off_cnt > max_off_allowed, 간호사 n: {n}, forced_off_cnt: {forced_off_cnt}, max_off_allowed: {max_off_allowed}')
@@ -940,12 +955,24 @@ def optimize_fallback_lex_hard_first(
             "min_off_missing": [],  # 월 최소 OFF 부족(Int)
             "off_quota_short": [],  # 개인별 O 할당(주휴 제외) 부족 슬랙(Int)
             "off_quota_excess": [],  # 개인별 O 초과 슬랙(Int)
+            "off_cap_bounded_slack": [],
             "isolated_off_slack": [],  # 고립 OFF 허용 슬랙(가중치 포함)
         }
         off_quota_short_by_n: dict[int, cp_model.IntVar] = {}
         off_quota_excess_by_n: dict[int, cp_model.IntVar] = {}
         min_off_miss_by_n: dict[int, cp_model.IntVar] = {}
         target_o_by_n: dict[int, int] = {}
+        off_cap_bounded_slack_enable = bool(
+            getattr(cfg, "fallback_off_cap_bounded_slack_enable", False)
+        )
+        off_cap_bounded_slack_max = max(
+            0,
+            int(getattr(cfg, "fallback_off_cap_bounded_slack_max", 1) or 0),
+        )
+        off_cap_bounded_slack_weight = max(
+            1,
+            int(getattr(cfg, "fallback_off_cap_bounded_slack_weight", 10) or 1),
+        )
 
         # 고립 OFF 금지(슬랙 허용): sequential_offs 활성 + 옵션 켜졌을 때만 적용
         if (
@@ -1216,12 +1243,7 @@ def optimize_fallback_lex_hard_first(
         # 월 최소 OFF 부족량(가능일수 클램프)
         try:
             # 개인별 O 정량 할당(나이트 전담 제외, 주휴 제외한 순수 O 목표)
-            try:
-                std_personal_off = int(getattr(cfg, "standard_personal_off_days", 0))
-                print('std_personal_off!!!!!!', std_personal_off)
-            except Exception:
-                std_personal_off = 0
-            if off_idx is not None and std_personal_off > 0:
+            if off_idx is not None and effective_off_days > 0:
                 for n in range(N):
                     if preceptee_follow and n in preceptee_indices:
                         continue
@@ -1255,7 +1277,7 @@ def optimize_fallback_lex_hard_first(
                             )
                         except Exception:
                             weekend_forced = 0
-                    target_o = max(0, std_personal_off - (weekly_target + weekend_forced))
+                    target_o = max(0, effective_off_days - (weekly_target + weekend_forced))
                     if target_o <= 0:
                         continue
                     # 휴가/공가는 개인 O 목표 충족에서 제외
@@ -1294,15 +1316,18 @@ def optimize_fallback_lex_hard_first(
                 nurse_id = getattr(nu, "nurse_id", "?")
                 is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
 
-                base_min_off = int(
-                    getattr(cfg, "global_monthly_off_days", 0)
-                    + getattr(cfg, "standard_personal_off_days", 0)
-                )
                 avail_days = T1 - T0 + 1
                 vacation_cnt = sum(
                     1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells
                 )
-                min_off_required = max(0, min(base_min_off, avail_days - vacation_cnt))
+                off_bounds = compute_off_bounds(
+                    source=cfg,
+                    avail_days=avail_days,
+                    vacation_cnt=vacation_cnt,
+                )
+                min_off_required = int(off_bounds["min_off_required"])
+                max_off_allowed_from_policy = int(off_bounds["max_off_allowed"])
+                extra_allowed = int(off_bounds["max_extra_off_days"])
                 # print(
                 #     f"{logger_prefix} [OffCap][vac] n={n}, id={nurse_id}, name={nurse_name}, "
                 #     f"base_min_off={base_min_off}, avail_days={avail_days}, "
@@ -1322,7 +1347,6 @@ def optimize_fallback_lex_hard_first(
                     m.Add(miss >= min_off_required - offs)
                     min_off_miss_by_n[n] = miss
                     safety["min_off_missing"].append(miss)
-                extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 if extra_allowed >= 0:
                     pure_offs = sum(
                         X(n, d, off_idx)
@@ -1331,7 +1355,7 @@ def optimize_fallback_lex_hard_first(
                         and (n, d) not in vacation_off_cells
                     )
                     # vacation은 순수 O 상한에서 제외하므로, 허용량에 vacation_cnt를 더해 총 휴무 여유가 줄지 않도록 한다.
-                    MAX_PURE_OFF = min_off_required + extra_allowed + vacation_cnt
+                    MAX_PURE_OFF = max_off_allowed_from_policy + vacation_cnt
                     pure_cap_effective = MAX_PURE_OFF + relax_level
                     if is_n_only:
                         max_off_allowed_n_only = max(0, avail_days - 15) + relax_level
@@ -1344,10 +1368,32 @@ def optimize_fallback_lex_hard_first(
                             weekend_cnt = len(weekend_in_range)
                             weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
                             pure_cap_effective = weekday_off_cap + weekend_cnt
-                            m.Add(pure_offs <= pure_cap_effective)
+                            if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
+                                cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
+                                weighted = m.NewIntVar(
+                                    0,
+                                    off_cap_bounded_slack_max * off_cap_bounded_slack_weight,
+                                    f"off_cap_slack_weighted_{n}",
+                                )
+                                m.Add(weighted == cap_slack * off_cap_bounded_slack_weight)
+                                safety["off_cap_bounded_slack"].append(weighted)
+                                m.Add(pure_offs <= pure_cap_effective + cap_slack)
+                            else:
+                                m.Add(pure_offs <= pure_cap_effective)
                         else:
                             pure_cap_effective = max_off_allowed
-                            m.Add(pure_offs <= pure_cap_effective)
+                            if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
+                                cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
+                                weighted = m.NewIntVar(
+                                    0,
+                                    off_cap_bounded_slack_max * off_cap_bounded_slack_weight,
+                                    f"off_cap_slack_weighted_{n}",
+                                )
+                                m.Add(weighted == cap_slack * off_cap_bounded_slack_weight)
+                                safety["off_cap_bounded_slack"].append(weighted)
+                                m.Add(pure_offs <= pure_cap_effective + cap_slack)
+                            else:
+                                m.Add(pure_offs <= pure_cap_effective)
                     # print(
                     #     f"{logger_prefix} [OffCap][pure] n={n}, id={nurse_id}, name={nurse_name}, "
                     #     f"pure_off_cap={MAX_PURE_OFF}, effective_cap={pure_cap_effective}, "

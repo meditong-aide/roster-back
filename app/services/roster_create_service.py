@@ -2104,6 +2104,22 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         base=cross_month_constraints,
         extra=allowed_constraints,
     )
+    try:
+        checker_module = __import__(
+            "services.cp_sat.feasibility_alerts",
+            fromlist=["run_preflight_feasibility_alerts"],
+        )
+        checker_fn = getattr(checker_module, "run_preflight_feasibility_alerts", None)
+        if callable(checker_fn):
+            checker_fn(
+                nurses_in_group=nurses_in_group,
+                config_dict=config_dict,
+                year=req.year,
+                month=req.month,
+                logger_prefix="[PreflightFeasibility]",
+            )
+    except Exception as precheck_exc:
+        print(f"[PreflightFeasibility] checker failed: {precheck_exc}")
     mid_feasibility_error = _validate_mid_hard_feasibility(
         nurses_in_group=nurses_in_group,
         config_dict=config_dict,
