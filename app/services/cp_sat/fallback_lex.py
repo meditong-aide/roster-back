@@ -37,6 +37,7 @@ def _cp_sat_status_to_text(status: int) -> str:
 def _load_off_policy_helpers():
     module = __import__("services.cp_sat.off_policy", fromlist=["*"])
     return (
+        getattr(module, "build_off_partitions"),
         getattr(module, "compute_off_bounds"),
         getattr(module, "resolve_effective_off_days"),
         getattr(module, "resolve_max_extra_off_days"),
@@ -161,6 +162,7 @@ def optimize_fallback_lex_hard_first(
     N, D, S = len(roster_system.nurses), roster_system.num_days, roster_system.config.num_shifts
     cfg = roster_system.config
     (
+        build_off_partitions,
         compute_off_bounds,
         resolve_effective_off_days,
         resolve_max_extra_off_days,
@@ -430,34 +432,34 @@ def optimize_fallback_lex_hard_first(
         #     }
         # )
 
-        structural_off_cells = set()
-        vacation_off_cells = set(off_exception_vacation_cells)
-        # print('hahaha, forced_off_cells', forced_off_cells)
-        # print('hahaha, forced_off_for_cap', forced_off_for_cap)
-        # print('hahaha, off_exception_cells', off_exception_cells)
-        # print('hahaha, off_exception_vacation_cells', off_exception_vacation_cells)
-        # 강제 OFF를 의미별로 분리
-
-        # forced_off_structural = (off_exception_cells - off_exception_vacation_cells) 
-        # forced_off_vacation = off_exception_vacation_cells
-        
-        
-        # fixed OFF
-        for (n, d), s_idx in fixed.items():
-            # print(f'fixed, n:{roster_system.nurses[n].name}, d:{d}, s_idx:{s_idx}')
-            if s_idx == off_idx:
-                if fixed_type_by_cell.get((n, d)) in {"휴가", "공가"}:
-                    vacation_off_cells.add((n, d))
-                else:
-                    structural_off_cells.add((n, d))
-
-        # weekend_off
-        if cfg.weekend_off_only_enable:
-            for n, nu in enumerate(roster_system.nurses):
-                if nu.is_weekend_off:
-                    for d in weekend_days:
-                        if join[n] <= d <= leave[n]:
-                            structural_off_cells.add((n, d))
+        fixed_off_cells = {(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx}
+        fixed_vacation_off_cells = {
+            (n, d)
+            for (n, d), s_idx in fixed.items()
+            if s_idx == off_idx and fixed_type_by_cell.get((n, d)) in {"휴가", "공가"}
+        }
+        fixed_non_off_cells = {(n, d) for (n, d), s_idx in fixed.items() if s_idx != off_idx}
+        partition = build_off_partitions(
+            nurses=roster_system.nurses,
+            num_days=D,
+            first_day=first_day,
+            fixed_off_cells=fixed_off_cells,
+            fixed_vacation_off_cells=fixed_vacation_off_cells,
+            off_exception_cells=off_exception_cells,
+            off_exception_vacation_cells=off_exception_vacation_cells,
+            weekly_off_by_idx=None,
+            weekend_off_only_enable=bool(cfg.weekend_off_only_enable),
+            include_off_exception_cells=False,
+            include_weekly_off_cells=False,
+            include_weekend_off_cells=True,
+            weekend_within_active_range=True,
+            join=join,
+            leave=leave,
+            fixed_non_off_cells=fixed_non_off_cells,
+        )
+        structural_off_cells = set(partition["structural_off_cells"])
+        vacation_off_cells = set(partition["vacation_off_cells"])
+        weekend_days = set(partition["weekend_days"])
 
         # weekly_off_by_idx, cross-month 등
         # 👉 여기서만 structural_off_cells에 추가
@@ -732,7 +734,10 @@ def optimize_fallback_lex_hard_first(
                             continue
                         m.Add(X(n, d, off_idx) == 0)
 
-        off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
+        # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
+        # if raw_off_placement_mode != 0:
+        #     print(f"{logger_prefix} [OffPlacementMode] deprecated: forcing off_placement_mode=0")
+        # off_placement_mode = 0
         weekly_off_by_idx = (
             getattr(roster_system, "weekly_off_by_idx", {})
             if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
@@ -769,69 +774,69 @@ def optimize_fallback_lex_hard_first(
                     shortage_days.add(d)
         except Exception:
             shortage_days = set()
-        if off_placement_mode > 0 and weekly_off_by_idx:
-            for n, day_list in weekly_off_by_idx.items():
-                if n >= len(join):
-                    continue
-                if preceptee_follow and n in preceptee_indices:
-                    continue
-                T0, T1 = join[n], leave[n]
-                for d_raw in day_list or []:
-                    try:
-                        d = int(d_raw)
-                    except Exception:
-                        continue
-                    if d < T0 or d > T1:
-                        continue
-                    if d == D - 1:
-                        continue
-                    if d == 0:
-                        if bool(prev_month_last_is_off.get(n, False)):
-                            continue
-                        if d + 1 <= T1:
-                            m.Add(X(n, d + 1, off_idx) == 1)
-                            structural_off_cells.add((n, d + 1))
-                        continue
-                    if off_placement_mode == 1:
-                        neighbours = []
-                        left_pos = d - 1
-                        right_pos = d + 1
-                        # if left_pos >= T0 and left_pos not in shortage_days:
-                        allow_shortage_off = relax_level >= 3
+        # if off_placement_mode > 0 and weekly_off_by_idx:
+        #     for n, day_list in weekly_off_by_idx.items():
+        #         if n >= len(join):
+        #             continue
+        #         if preceptee_follow and n in preceptee_indices:
+        #             continue
+        #         T0, T1 = join[n], leave[n]
+        #         for d_raw in day_list or []:
+        #             try:
+        #                 d = int(d_raw)
+        #             except Exception:
+        #                 continue
+        #             if d < T0 or d > T1:
+        #                 continue
+        #             if d == D - 1:
+        #                 continue
+        #             if d == 0:
+        #                 if bool(prev_month_last_is_off.get(n, False)):
+        #                     continue
+        #                 if d + 1 <= T1:
+        #                     m.Add(X(n, d + 1, off_idx) == 1)
+        #                     structural_off_cells.add((n, d + 1))
+        #                 continue
+        #             if off_placement_mode == 1:
+        #                 neighbours = []
+        #                 left_pos = d - 1
+        #                 right_pos = d + 1
+        #                 # if left_pos >= T0 and left_pos not in shortage_days:
+        #                 allow_shortage_off = relax_level >= 3
 
-                        if left_pos >= T0 and (allow_shortage_off or left_pos not in shortage_days):
-                            neighbours.append(("left", X(n, left_pos, off_idx)))
-                        # if right_pos <= T1 and right_pos not in shortage_days:
-                        if right_pos <= T1 and (allow_shortage_off or right_pos not in shortage_days):
-                            neighbours.append(("right", X(n, right_pos, off_idx)))
-                        # 둘 다 부족일이면 스킵
-                        if not neighbours:
-                            continue
-                        vars_only = [v for _, v in neighbours]
-                        if len(vars_only) == 1:
-                            m.Add(vars_only[0] == 1)
-                        else:
-                            m.Add(sum(vars_only) >= 1)
-                        for direction, _var in neighbours:
-                            if direction == "left":
-                                structural_off_cells.add((n, left_pos))
-                            else:
-                                structural_off_cells.add((n, right_pos))
-                    else:
-                        left_pos = d - 1
-                        right_pos = d + 1
-                        placed = False
-                        if left_pos >= T0 and left_pos not in shortage_days:
-                            m.Add(X(n, left_pos, off_idx) == 1)
-                            structural_off_cells.add((n, left_pos))
-                            placed = True
-                        elif right_pos <= T1 and right_pos not in shortage_days:
-                            m.Add(X(n, right_pos, off_idx) == 1)
-                            structural_off_cells.add((n, right_pos))
-                            placed = True
-                        # 둘 다 부족일이면 스킵 (커버리지 우선)
-                        if not placed:
-                            continue
+        #                 if left_pos >= T0 and (allow_shortage_off or left_pos not in shortage_days):
+        #                     neighbours.append(("left", X(n, left_pos, off_idx)))
+        #                 # if right_pos <= T1 and right_pos not in shortage_days:
+        #                 if right_pos <= T1 and (allow_shortage_off or right_pos not in shortage_days):
+        #                     neighbours.append(("right", X(n, right_pos, off_idx)))
+        #                 # 둘 다 부족일이면 스킵
+        #                 if not neighbours:
+        #                     continue
+        #                 vars_only = [v for _, v in neighbours]
+        #                 if len(vars_only) == 1:
+        #                     m.Add(vars_only[0] == 1)
+        #                 else:
+        #                     m.Add(sum(vars_only) >= 1)
+        #                 for direction, _var in neighbours:
+        #                     if direction == "left":
+        #                         structural_off_cells.add((n, left_pos))
+        #                     else:
+        #                         structural_off_cells.add((n, right_pos))
+        #             else:
+        #                 left_pos = d - 1
+        #                 right_pos = d + 1
+        #                 placed = False
+        #                 if left_pos >= T0 and left_pos not in shortage_days:
+        #                     m.Add(X(n, left_pos, off_idx) == 1)
+        #                     structural_off_cells.add((n, left_pos))
+        #                     placed = True
+        #                 elif right_pos <= T1 and right_pos not in shortage_days:
+        #                     m.Add(X(n, right_pos, off_idx) == 1)
+        #                     structural_off_cells.add((n, right_pos))
+        #                     placed = True
+        #                 # 둘 다 부족일이면 스킵 (커버리지 우선)
+        #                 if not placed:
+        #                     continue
 
         # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
         try:
@@ -1455,7 +1460,19 @@ def optimize_fallback_lex_hard_first(
             )
             m.Maximize(sum(obj))
 
-        return m, X, short_terms, over_terms, safety, short_vars_by_day_code, over_vars_by_day_code
+        return (
+            m,
+            X,
+            short_terms,
+            over_terms,
+            safety,
+            short_vars_by_day_code,
+            over_vars_by_day_code,
+            target_o_by_n,
+            off_quota_short_by_n,
+            off_quota_excess_by_n,
+            min_off_miss_by_n,
+        )
     ############################################################## build model 끝 ##############################################################
     
     # ───── 1단계: 커버리지 (완화 재시도 포함) ─────
@@ -1470,7 +1487,19 @@ def optimize_fallback_lex_hard_first(
 
     for relax_level in range(max_relax_attempts):
         with timer_cls(f"폴백 1단계: 커버리지 부족 최소화 (완화레벨={relax_level})"):
-            m1, X1, short1, over1, safety1, short_map1, over_map1 = build_model(
+            (
+                m1,
+                X1,
+                short1,
+                over1,
+                safety1,
+                short_map1,
+                over_map1,
+                _,
+                _,
+                _,
+                _,
+            ) = build_model(
                 stage=1, relax_level=relax_level
             )
             s1 = cp_model.CpSolver()
@@ -1528,7 +1557,19 @@ def optimize_fallback_lex_hard_first(
 
     # ───── 2단계: 안전/법규 ─────
     with timer_cls("폴백 2단계: 안전/법규 위반 최소화"):
-        m2, X2, short2, over2, safety2, short_map2, over_map2 = build_model(
+        (
+            m2,
+            X2,
+            short2,
+            over2,
+            safety2,
+            short_map2,
+            over_map2,
+            _,
+            _,
+            _,
+            _,
+        ) = build_model(
             stage=2,
             coverage_eq=best_short,
             over_le=best_over,
@@ -1590,7 +1631,19 @@ def optimize_fallback_lex_hard_first(
 
     # ───── 3단계: 선호/공정성 ─────
     with timer_cls("폴백 3단계: 선호/공정성 최대화"):
-        m3, X3, short3, over3, safety3, short_map3, over_map3 = build_model(
+        (
+            m3,
+            X3,
+            short3,
+            over3,
+            safety3,
+            short_map3,
+            over_map3,
+            target_o_by_n,
+            off_quota_short_by_n,
+            off_quota_excess_by_n,
+            min_off_miss_by_n,
+        ) = build_model(
             stage=3,
             coverage_eq=best_short,
             over_le=best_over,
@@ -1755,6 +1808,34 @@ def optimize_fallback_lex_hard_first(
             if _fb_fw_restored:
                 msg += f", fixed_wanted 재적용: {_fb_fw_restored}건"
             print(msg)
+        # if bool(getattr(cfg, "ban_e_to_d", True)) and _fb_off_idx is not None:
+        #     _fb_eve_idx = _fb_shift_types.index('E') if 'E' in _fb_shift_types else None
+        #     _fb_day_idx = _fb_shift_types.index('D') if 'D' in _fb_shift_types else None
+        #     _fixed_blocked = 0
+        #     _repaired = 0
+        #     if _fb_eve_idx is not None and _fb_day_idx is not None:
+        #         for pte_idx in preceptee_indices:
+        #             for d in range(1, roster_system.num_days):
+        #                 if int(roster_system.roster[pte_idx, d - 1, _fb_eve_idx]) != 1:
+        #                     continue
+        #                 if int(roster_system.roster[pte_idx, d, _fb_day_idx]) != 1:
+        #                     continue
+        #                 cur_fixed = (pte_idx, d) in _fb_pte_fw
+        #                 prev_fixed = (pte_idx, d - 1) in _fb_pte_fw
+        #                 if not cur_fixed:
+        #                     roster_system.roster[pte_idx, d, :] = 0
+        #                     roster_system.roster[pte_idx, d, _fb_off_idx] = 1
+        #                     _repaired += 1
+        #                 elif not prev_fixed:
+        #                     roster_system.roster[pte_idx, d - 1, :] = 0
+        #                     roster_system.roster[pte_idx, d - 1, _fb_off_idx] = 1
+        #                     _repaired += 1
+        #                 else:
+        #                     _fixed_blocked += 1
+        #     if _repaired or _fixed_blocked:
+        #         print(
+        #             f"{logger_prefix} [PrecepteeSync][Repair-E->D] repaired={_repaired}, blocked_fixed={_fixed_blocked}"
+        #         )
 
     _log_weekend_work_assignments(
         roster_system=roster_system,

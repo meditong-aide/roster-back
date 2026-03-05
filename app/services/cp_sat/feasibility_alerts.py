@@ -11,6 +11,7 @@ CORE_CODES = ("D", "E", "N", "M")
 def _load_off_policy_helpers():
     module = __import__("services.cp_sat.off_policy", fromlist=["*"])
     return (
+        getattr(module, "build_off_partitions"),
         getattr(module, "compute_off_bounds"),
         getattr(module, "resolve_effective_off_days"),
         getattr(module, "resolve_max_extra_off_days"),
@@ -138,6 +139,7 @@ def run_preflight_feasibility_alerts(
     alerts: list[str] = []
     try:
         (
+            build_off_partitions,
             compute_off_bounds,
             resolve_effective_off_days,
             resolve_max_extra_off_days,
@@ -163,6 +165,39 @@ def run_preflight_feasibility_alerts(
 
         nurse_ids = [str(getattr(n, "nurse_id", "") or "") for n in (nurses_in_group or [])]
         active_ranges = [_active_range(n, first_day, last_day) for n in (nurses_in_group or [])]
+        fixed_off_cells = {(n, d) for (n, d), code in fixed.items() if code == "O"}
+        fixed_non_off_cells = {(n, d) for (n, d), code in fixed.items() if code != "O"}
+        off_exception_cells = {
+            (int(n_idx), int(d_idx))
+            for (n_idx, d_idx) in (config_dict.get("off_exception_cells") or [])
+        }
+        off_exception_vacation_cells = {
+            (int(n_idx), int(d_idx))
+            for (n_idx, d_idx) in (config_dict.get("off_exception_vacation_cells") or [])
+        }
+        join = [r[0] if r is not None else 1 for r in active_ranges]
+        leave = [r[1] if r is not None else 0 for r in active_ranges]
+        partition = build_off_partitions(
+            nurses=list(nurses_in_group or []),
+            num_days=num_days,
+            first_day=first_day,
+            fixed_off_cells=fixed_off_cells,
+            fixed_vacation_off_cells=set(),
+            off_exception_cells=off_exception_cells,
+            off_exception_vacation_cells=off_exception_vacation_cells,
+            weekly_off_by_idx=None,
+            weekend_off_only_enable=weekend_only_enable,
+            include_off_exception_cells=True,
+            include_weekly_off_cells=False,
+            include_weekend_off_cells=True,
+            weekend_within_active_range=True,
+            join=join,
+            leave=leave,
+            fixed_non_off_cells=fixed_non_off_cells,
+        )
+        structural_off_cells = set(partition["structural_off_cells"])
+        vacation_off_cells = set(partition["vacation_off_cells"])
+        weekend_days = set(partition["weekend_days"])
 
         for d in range(num_days):
             req_map = req_by_day[d]
@@ -294,9 +329,6 @@ def run_preflight_feasibility_alerts(
                         f"day={d+1} M: preceptee unit sizes={sorted(unit_sizes)} cannot meet remaining demand={remaining} (req={req_m}, fixedM={fixed_m})"
                     )
 
-        weekend_days = {
-            d for d in range(num_days) if (first_day + timedelta(days=d)).weekday() >= 5
-        }
         for n_idx, nurse in enumerate(nurses_in_group or []):
             r = active_ranges[n_idx]
             if r is None:
@@ -307,12 +339,13 @@ def run_preflight_feasibility_alerts(
                 continue
             nurse_id = nurse_ids[n_idx]
 
-            forced_nonvac: set[int] = set()
+            forced_nonvac: set[int] = {
+                d
+                for d in range(t0, t1 + 1)
+                if (n_idx, d) in structural_off_cells and (n_idx, d) not in vacation_off_cells
+            }
             for d in forced_off.get(nurse_id, set()):
-                if t0 <= d <= t1:
-                    forced_nonvac.add(d)
-            for d in range(t0, t1 + 1):
-                if fixed.get((n_idx, d)) == "O":
+                if t0 <= d <= t1 and (n_idx, d) not in vacation_off_cells:
                     forced_nonvac.add(d)
             if (
                 weekend_counts_toward_max

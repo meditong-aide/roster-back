@@ -46,7 +46,7 @@ from services.cp_sat.lookahead_constraints import (
     add_lookahead_off_cap_constraints,
     add_lookahead_distribution_penalty_terms,
 )
-from services.cp_sat.off_policy import compute_off_bounds, resolve_effective_off_days
+from services.cp_sat.off_policy import build_off_partitions, compute_off_bounds, resolve_effective_off_days
 
 logger = logging.getLogger(__name__)
 
@@ -348,7 +348,9 @@ class CPSATBasicEngine:
         even_nights = config_data.get('even_nights', True)
         enforce_clustered_offs = bool(config_data.get("enforce_clustered_offs", False))
         isolated_off_slack_penalty = int(config_data.get("isolated_off_slack_penalty", 300000) or 0)
-        off_placement_mode = int(config_data.get('off_placement_mode', 0) or 0)
+        # if int(config_data.get('off_placement_mode', 0) or 0) != 0:
+        #     print(f"{self.logger_prefix} [OffPlacementMode] deprecated: forcing off_placement_mode=0")
+        # off_placement_mode = 0
         
         # 가중치 설정 - Night Keep은 E와 차별화
         shift_weights = config_data.get('shift_preference_weights', {
@@ -480,7 +482,7 @@ class CPSATBasicEngine:
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
-            off_placement_mode=0,
+            # off_placement_mode=0,
         )
         off_days_eff, off_days_src = resolve_effective_off_days(config_data)
         print(
@@ -953,12 +955,14 @@ class CPSATBasicEngine:
             weekly_off_settings_activate = bool(config_data.get("weekly_off_settings_activate", False))
             if not weekly_off_settings_activate or not weekly_off_map_raw:
                 # activate가 0이거나 weekly_off_map이 비어있으면 주휴 관련 옵션 비활성화
-                config.off_placement_mode = 0
+                # config.off_placement_mode = 0
                 weekly_off_by_idx: dict[int, list[int]] = {}
                 print('weekly_off_by_idx 없는걸로', weekly_off_by_idx)
             else:
                 # 각 nurse 별 주휴 담기
-                config.off_placement_mode = int(config_data.get("off_placement_mode", 0) or 0)
+                # if int(config_data.get("off_placement_mode", 0) or 0) != 0:
+                #     print("[OffPlacementMode] deprecated: forcing off_placement_mode=0")
+                # config.off_placement_mode = 0
                 weekly_off_by_idx: dict[int, list[int]] = {}
                 for dbid, day_list in (weekly_off_map_raw or {}).items():
                     n_idx = rs_dbid_to_idx.get(str(dbid))
@@ -1207,6 +1211,37 @@ class CPSATBasicEngine:
                 if _fw_restored:
                     msg += f", fixed_wanted 재적용: {_fw_restored}건"
                 print(msg)
+            # if bool(getattr(roster_system.config, 'ban_e_to_d', True)) and _off_s_idx is not None:
+            #     _eve_s_idx = _shift_types.index('E') if 'E' in _shift_types else None
+            #     _day_s_idx = _shift_types.index('D') if 'D' in _shift_types else None
+            #     _repair_cnt = 0
+            #     _blocked_cnt = 0
+            #     if _eve_s_idx is not None and _day_s_idx is not None:
+            #         for n, nu in enumerate(roster_system.nurses):
+            #             pid = getattr(nu, 'preceptor_id', None)
+            #             if not pid or pid not in id_to_idx:
+            #                 continue
+            #             for d in range(1, roster_system.num_days):
+            #                 if int(roster_system.roster[n, d - 1, _eve_s_idx]) != 1:
+            #                     continue
+            #                 if int(roster_system.roster[n, d, _day_s_idx]) != 1:
+            #                     continue
+            #                 cur_fixed = (n, d) in _pte_fw_map
+            #                 prev_fixed = (n, d - 1) in _pte_fw_map
+            #                 if not cur_fixed:
+            #                     roster_system.roster[n, d, :] = 0
+            #                     roster_system.roster[n, d, _off_s_idx] = 1
+            #                     _repair_cnt += 1
+            #                 elif not prev_fixed:
+            #                     roster_system.roster[n, d - 1, :] = 0
+            #                     roster_system.roster[n, d - 1, _off_s_idx] = 1
+            #                     _repair_cnt += 1
+            #                 else:
+            #                     _blocked_cnt += 1
+            #     if _repair_cnt or _blocked_cnt:
+            #         print(
+            #             f"{self.logger_prefix} [PrecepteeSync][Repair-E->D] repaired={_repair_cnt}, blocked_fixed={_blocked_cnt}"
+            #         )
                 
             # 추가: 프리셉티의 fixed_cells를 프리셉터 값으로 강제 덮어쓰기
             if preceptee_follow and synced > 0:
@@ -1921,33 +1956,41 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
         fixed_type_by_cell[(n, d)] = code2type.get(c["shift"]) or code2type.get(s_main)
         # print('이미 있음 cpsat- fixed_type_by_cell', fixed_type_by_cell)
-    forced_off_cells: set[tuple[int, int]] = set()
-    vacation_off_cells: set[tuple[int, int]] = set(off_exception_vacation_cells)
-    structural_off_cells: set[tuple[int, int]] = set()
+    fixed_off_cells: set[tuple[int, int]] = set()
+    fixed_vacation_off_cells: set[tuple[int, int]] = set()
     if off_idx_full is not None:
-        forced_off_cells.update({(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full})
+        fixed_off_cells = {(n, d) for (n, d), s_idx in fixed.items() if s_idx == off_idx_full}
         vacation_types = {"휴가", "공가"}
-        for (n, d), s_idx in fixed.items():
-            if s_idx != off_idx_full:
-                continue
-            if fixed_type_by_cell.get((n, d)) in vacation_types:
-                vacation_off_cells.add((n, d))
-            else:
-                structural_off_cells.add((n, d))
-    # 예외 OFF 중 휴가가 아닌 것만 구조적 OFF로 분류
-    structural_off_cells.update({cell for cell in off_exception_cells if cell not in vacation_off_cells})
-    # 주휴(weekly_off)와 주말 전용 OFF를 구조적 OFF에 포함
-    for n_idx, day_list in (weekly_off_by_idx or {}).items():
-        for d in day_list or []:
-            structural_off_cells.add((n_idx, d))
-    weekend_days = {d for d in range(D) if (first_day + timedelta(days=d)).weekday() >= 5}
-    for n_idx, nurse in enumerate(rs.nurses):
-        if bool(getattr(nurse, "is_weekend_off", False)):
-            for d_idx in weekend_days:
-                # 해당 날짜가 이미 다른 고정 근무라면 제외
-                if (n_idx, d_idx) in fixed and fixed[(n_idx, d_idx)] != off_idx_full:
-                    continue
-                structural_off_cells.add((n_idx, d_idx))
+        fixed_vacation_off_cells = {
+            (n, d)
+            for (n, d), s_idx in fixed.items()
+            if s_idx == off_idx_full and fixed_type_by_cell.get((n, d)) in vacation_types
+        }
+    fixed_non_off_cells = {
+        (n, d)
+        for (n, d), s_idx in fixed.items()
+        if off_idx_full is not None and s_idx != off_idx_full
+    }
+    partition = build_off_partitions(
+        nurses=rs.nurses,
+        num_days=D,
+        first_day=first_day,
+        fixed_off_cells=fixed_off_cells,
+        fixed_vacation_off_cells=fixed_vacation_off_cells,
+        off_exception_cells=off_exception_cells,
+        off_exception_vacation_cells=off_exception_vacation_cells,
+        weekly_off_by_idx=weekly_off_by_idx,
+        weekend_off_only_enable=bool(getattr(rs.config, "weekend_off_only_enable", True)),
+        include_off_exception_cells=True,
+        include_weekly_off_cells=True,
+        include_weekend_off_cells=True,
+        weekend_within_active_range=False,
+        fixed_non_off_cells=fixed_non_off_cells,
+    )
+    vacation_off_cells = set(partition["vacation_off_cells"])
+    structural_off_cells = set(partition["structural_off_cells"])
+    weekend_days = set(partition["weekend_days"])
+    forced_off_cells: set[tuple[int, int]] = set(fixed_off_cells)
     # 룩어헤드 구간 주휴: 당월 weekly_off_by_idx가 아닌 별도 계산 셀만 사용
     lookahead_weekly_off = getattr(rs, "lookahead_weekly_off_cells", set()) or set()
     if lookahead_weekly_off:
@@ -2103,87 +2146,87 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 else:
                     m.Add(countable_off(n, d) <= slack_var)
     
-    # ───────────── 2-A3. 주휴 근처 OFF 배치 제약 (off_placement_mode) ─────────────
-    off_placement_mode = int(getattr(rs.config, "off_placement_mode", 0) or 0)
-    prev_month_last_is_off = getattr(rs, "prev_month_last_is_off", {}) if isinstance(getattr(rs, "prev_month_last_is_off", {}), dict) else {}
+    # # ───────────── 2-A3. 주휴 근처 OFF 배치 제약 (off_placement_mode) ─────────────
+    # off_placement_mode = int(getattr(rs.config, "off_placement_mode", 0) or 0)
+    # prev_month_last_is_off = getattr(rs, "prev_month_last_is_off", {}) if isinstance(getattr(rs, "prev_month_last_is_off", {}), dict) else {}
     
-    if off_placement_mode > 0 and weekly_off_by_idx:
-        # 커버리지 부족일 계산 (fallback_lex.py와 동일한 로직)
-        shortage_days: set[int] = set()
-        try:
-            for d in range(D):
-                if (
-                    hasattr(rs.config, "daily_shift_requirements_by_day")
-                    and isinstance(rs.config.daily_shift_requirements_by_day, list)
-                    and d < len(rs.config.daily_shift_requirements_by_day)
-                ):
-                    need_map = rs.config.daily_shift_requirements_by_day[d]
-                else:
-                    need_map = rs.config.daily_shift_requirements
-                total_need = sum(int(v) for v in (need_map or {}).values())
-                active_cnt = sum(1 for n in range(N) if join[n] <= d <= leave[n])
-                fixed_off_cnt = (
-                    sum(
-                        1
-                        for (fn, fd), s_idx in fixed.items()
-                        if s_idx == off_idx_full
-                        and fd == d
-                        and (fn, fd) not in vacation_off_cells
-                    )
-                    if off_idx_full is not None
-                    else 0
-                )
-                avail_eff = max(0, active_cnt - fixed_off_cnt)
-                if avail_eff < total_need:
-                    shortage_days.add(d)
-        except Exception:
-            shortage_days = set()
+    # if off_placement_mode > 0 and weekly_off_by_idx:
+    #     # 커버리지 부족일 계산 (fallback_lex.py와 동일한 로직)
+    #     shortage_days: set[int] = set()
+    #     try:
+    #         for d in range(D):
+    #             if (
+    #                 hasattr(rs.config, "daily_shift_requirements_by_day")
+    #                 and isinstance(rs.config.daily_shift_requirements_by_day, list)
+    #                 and d < len(rs.config.daily_shift_requirements_by_day)
+    #             ):
+    #                 need_map = rs.config.daily_shift_requirements_by_day[d]
+    #             else:
+    #                 need_map = rs.config.daily_shift_requirements
+    #             total_need = sum(int(v) for v in (need_map or {}).values())
+    #             active_cnt = sum(1 for n in range(N) if join[n] <= d <= leave[n])
+    #             fixed_off_cnt = (
+    #                 sum(
+    #                     1
+    #                     for (fn, fd), s_idx in fixed.items()
+    #                     if s_idx == off_idx_full
+    #                     and fd == d
+    #                     and (fn, fd) not in vacation_off_cells
+    #                 )
+    #                 if off_idx_full is not None
+    #                 else 0
+    #             )
+    #             avail_eff = max(0, active_cnt - fixed_off_cnt)
+    #             if avail_eff < total_need:
+    #                 shortage_days.add(d)
+    #     except Exception:
+    #         shortage_days = set()
         
-        for n, day_list in weekly_off_by_idx.items():
-            if n >= len(join):
-                continue
-            if preceptee_follow and n in preceptee_indices:
-                continue
-            # 주말 휴무 대상자는 주휴 인접 OFF 배치를 적용하지 않는다.
-            if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
-                continue
-            T0, T1 = join[n], leave[n]
-            for d_raw in day_list or []:
-                try:
-                    d = int(d_raw)
-                except Exception:
-                    continue
-                if d < T0 or d > T1:
-                    continue
-                if d == D - 1:
-                    continue
-                if d == 0:
-                    if bool(prev_month_last_is_off.get(n, False)):
-                        continue
-                    if d + 1 <= T1:
-                        m.Add(countable_off(n, d + 1) == 1)
-                    continue
+    #     for n, day_list in weekly_off_by_idx.items():
+    #         if n >= len(join):
+    #             continue
+    #         if preceptee_follow and n in preceptee_indices:
+    #             continue
+    #         # 주말 휴무 대상자는 주휴 인접 OFF 배치를 적용하지 않는다.
+    #         if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
+    #             continue
+    #         T0, T1 = join[n], leave[n]
+    #         for d_raw in day_list or []:
+    #             try:
+    #                 d = int(d_raw)
+    #             except Exception:
+    #                 continue
+    #             if d < T0 or d > T1:
+    #                 continue
+    #             if d == D - 1:
+    #                 continue
+    #             if d == 0:
+    #                 if bool(prev_month_last_is_off.get(n, False)):
+    #                     continue
+    #                 if d + 1 <= T1:
+    #                     m.Add(countable_off(n, d + 1) == 1)
+    #                 continue
                 
-                if off_placement_mode == 1:
-                    # 모드 1: 앞/뒤 중 하나에 O 배치
-                    neighbours = []
-                    left_pos = d - 1
-                    right_pos = d + 1
-                    if left_pos >= T0 and left_pos not in shortage_days:
-                        neighbours.append(countable_off(n, left_pos))
-                    if right_pos <= T1 and right_pos not in shortage_days:
-                        neighbours.append(countable_off(n, right_pos))
-                    if not neighbours:
-                        continue
-                    if len(neighbours) == 1:
-                        m.Add(neighbours[0] == 1)
-                    else:
-                        m.Add(sum(neighbours) >= 1)
-                elif off_placement_mode == 2:
-                    # 모드 2: 앞에만 O 배치
-                    left_pos = d - 1
-                    if left_pos >= T0 and left_pos not in shortage_days:
-                        m.Add(countable_off(n, left_pos) == 1)
+    #             if off_placement_mode == 1:
+    #                 # 모드 1: 앞/뒤 중 하나에 O 배치
+    #                 neighbours = []
+    #                 left_pos = d - 1
+    #                 right_pos = d + 1
+    #                 if left_pos >= T0 and left_pos not in shortage_days:
+    #                     neighbours.append(countable_off(n, left_pos))
+    #                 if right_pos <= T1 and right_pos not in shortage_days:
+    #                     neighbours.append(countable_off(n, right_pos))
+    #                 if not neighbours:
+    #                     continue
+    #                 if len(neighbours) == 1:
+    #                     m.Add(neighbours[0] == 1)
+    #                 else:
+    #                     m.Add(sum(neighbours) >= 1)
+    #             elif off_placement_mode == 2:
+    #                 # 모드 2: 앞에만 O 배치
+    #                 left_pos = d - 1
+    #                 if left_pos >= T0 and left_pos not in shortage_days:
+    #                     m.Add(countable_off(n, left_pos) == 1)
     
     # ───────────── 2-A2. 초기 금지 셀(경계 제약) ─────────────
     try:

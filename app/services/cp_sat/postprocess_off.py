@@ -241,28 +241,31 @@ def postprocess_trim_extra_offs(
 
     # 주휴 인접 OFF 셀 식별 (off_placement_mode가 활성화된 경우)
     weekly_off_adjacent_cells: set[tuple[int, int]] = set()
-    off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
-    if off_placement_mode > 0 and weekly_off_map:
-        for n_idx, day_list in weekly_off_map.items():
-            if n_idx >= len(roster_system.nurses):
-                continue
-            if bool(getattr(roster_system.nurses[n_idx], "is_weekend_off", False)):
-                continue
-            for d_raw in day_list or []:
-                try:
-                    d = int(d_raw)
-                except Exception:
-                    continue
-                if 0 <= d < num_days:
-                    # 주휴 앞/뒤 OFF 셀 보호
-                    if off_placement_mode == 1:  # 앞/뒤
-                        if d - 1 >= 0:
-                            weekly_off_adjacent_cells.add((n_idx, d - 1))
-                        if d + 1 < num_days:
-                            weekly_off_adjacent_cells.add((n_idx, d + 1))
-                    elif off_placement_mode == 2:  # 앞만
-                        if d - 1 >= 0:
-                            weekly_off_adjacent_cells.add((n_idx, d - 1))
+    # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
+    # if raw_off_placement_mode != 0:
+    #     print("[PostOff] OffPlacementMode deprecated: forcing off_placement_mode=0")
+    # off_placement_mode = 0
+    # if off_placement_mode > 0 and weekly_off_map:
+    #     for n_idx, day_list in weekly_off_map.items():
+    #         if n_idx >= len(roster_system.nurses):
+    #             continue
+    #         if bool(getattr(roster_system.nurses[n_idx], "is_weekend_off", False)):
+    #             continue
+    #         for d_raw in day_list or []:
+    #             try:
+    #                 d = int(d_raw)
+    #             except Exception:
+    #                 continue
+    #             if 0 <= d < num_days:
+    #                 # 주휴 앞/뒤 OFF 셀 보호
+    #                 if off_placement_mode == 1:  # 앞/뒤
+    #                     if d - 1 >= 0:
+    #                         weekly_off_adjacent_cells.add((n_idx, d - 1))
+    #                     if d + 1 < num_days:
+    #                         weekly_off_adjacent_cells.add((n_idx, d + 1))
+    #                 elif off_placement_mode == 2:  # 앞만
+    #                     if d - 1 >= 0:
+    #                         weekly_off_adjacent_cells.add((n_idx, d - 1))
 
     # 휴가 코드 식별 (생, 휴 등)
     vacation_codes = {code for code in cfg.shift_types if code not in {"D", "E", "N", "O", "W"} and code in {"생", "휴"}}
@@ -706,5 +709,4 @@ def postprocess_trim_extra_offs(
     if changes:
         print(f"{logger_prefix} [TrimExtraOff] 불필요 OFF 교체 {changes}건")
     return changes
-
 
