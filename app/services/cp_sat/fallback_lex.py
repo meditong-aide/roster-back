@@ -1140,13 +1140,20 @@ def optimize_fallback_lex_hard_first(
             if preceptee_follow and n in preceptee_indices:
                 continue
             raw = getattr(nu, "is_night_nurse", None)
-            is_n_only = False
             if isinstance(raw, list):
                 allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                is_n_only = allowed == {"N"}
+                if allowed:
+                    T0, T1 = join[n], leave[n]
+                    for d in range(T0, T1 + 1):
+                        if "D" not in allowed:
+                            m.Add(X(n, d, day_idx) == 0)
+                        if "E" not in allowed:
+                            m.Add(X(n, d, eve_idx) == 0)
+                        if "N" not in allowed:
+                            m.Add(X(n, d, night_idx) == 0)
+                        if mid_idx is not None:
+                            m.Add(X(n, d, mid_idx) == 0)
             elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
-                is_n_only = True
-            if is_n_only:
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
                     m.Add(X(n, d, day_idx) == 0)

@@ -1870,7 +1870,7 @@ def build_allowed_shift_type_constraints(
         if not allowed:
             continue  # 제한 없음
         disallowed_set = set(all_codes - set(allowed))
-        if allowed == {"N"}:
+        if allowed:
             disallowed_set.add("M")
         disallowed = sorted(disallowed_set)
         if not disallowed:

@@ -2545,16 +2545,22 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         raw = getattr(nu, "is_night_nurse", None)
-        is_n_only = False
         if isinstance(raw, list):
             allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-            is_n_only = (allowed == {"N"})  # ["N"]만 허용 = N 전담
+            if allowed:
+                for d in range(T0, T1 + 1):
+                    if "D" not in allowed:
+                        m.Add(X(n, d, day) == 0)
+                    if "E" not in allowed:
+                        m.Add(X(n, d, eve) == 0)
+                    if "N" not in allowed:
+                        m.Add(X(n, d, night) == 0)
+                    if mid is not None:
+                        m.Add(X(n, d, mid) == 0)
         elif raw == 3 or (raw is not None and raw != 0 and raw != False):
-            # 레거시: is_night_nurse == 3도 N 전담으로 간주
-            is_n_only = True
-        if is_n_only:
-            for d in range(T0,T1+1):
-                m.Add(X(n,d,day)==0); m.Add(X(n,d,eve)==0)
+            for d in range(T0, T1 + 1):
+                m.Add(X(n, d, day) == 0)
+                m.Add(X(n, d, eve) == 0)
                 if mid is not None:
                     m.Add(X(n, d, mid) == 0)
 
