@@ -40,6 +40,188 @@ def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
     return n_forbid_n
 
 
+def add_even_mid_distribution_terms(
+    *,
+    m: cp_model.CpModel,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    fixed_cnt: list[list[int]] | None = None,
+) -> list:
+    cfg = rs.config
+    if "M" not in cfg.shift_types:
+        return []
+    if not bool(getattr(cfg, "use_mid", False)):
+        return []
+    if not bool(getattr(cfg, "even_mids", True)):
+        return []
+
+    weight = int(getattr(cfg, "mid_deviation_penalty_weight", NIGHT_DEVIATION_PENALTY) or NIGHT_DEVIATION_PENALTY)
+    if weight <= 0:
+        return []
+
+    N = len(rs.nurses)
+    D = rs.num_days
+    S = cfg.num_shifts
+    mid_idx = cfg.shift_types.index("M")
+    fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+    initial_forbidden = getattr(rs, "initial_forbidden", None)
+    if not isinstance(initial_forbidden, dict):
+        initial_forbidden = {}
+
+    candidates: list[int] = []
+    for n, nu in enumerate(rs.nurses):
+        raw = getattr(nu, "is_night_nurse", None)
+        is_n_only = False
+        if isinstance(raw, list):
+            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+            is_n_only = (allowed == {"N"})
+        elif raw == 3 or (raw is not None and raw not in (0, False)):
+            is_n_only = True
+        if is_n_only:
+            continue
+
+        has_m_window = False
+        for d in range(join[n], leave[n] + 1):
+            if "M" not in initial_forbidden.get((n, d), set()):
+                has_m_window = True
+                break
+        if has_m_window:
+            candidates.append(n)
+
+    if not candidates:
+        return []
+
+    if (
+        hasattr(cfg, "daily_shift_requirements_by_day")
+        and isinstance(cfg.daily_shift_requirements_by_day, list)
+        and len(cfg.daily_shift_requirements_by_day) == D
+    ):
+        daily_need_m = [
+            int((cfg.daily_shift_requirements_by_day[d] or {}).get("M", 0) or 0)
+            for d in range(D)
+        ]
+    else:
+        base_m = int((cfg.daily_shift_requirements or {}).get("M", 0) or 0)
+        daily_need_m = [base_m for _ in range(D)]
+
+    total_need_m = 0
+    for d in range(D):
+        total_need_m += max(0, daily_need_m[d] - int(fc[d][mid_idx] if d < len(fc) else 0))
+    if total_need_m <= 0:
+        return []
+
+    low = total_need_m // len(candidates)
+    high = low + (1 if (total_need_m % len(candidates)) else 0)
+    obj: list = []
+    for n in candidates:
+        tot_mid = sum(X(n, d, mid_idx) for d in range(join[n], leave[n] + 1))
+        dev_low = m.NewIntVar(0, D, f"devMlow_{n}")
+        dev_high = m.NewIntVar(0, D, f"devMhigh_{n}")
+        m.Add(dev_low >= low - tot_mid)
+        m.Add(dev_high >= tot_mid - high)
+        obj.append(-weight * dev_low)
+        obj.append(-weight * dev_high)
+    return obj
+
+
+def add_even_night_minmax_distribution_terms(
+    *,
+    m: cp_model.CpModel,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    fixed_cnt: list[list[int]] | None = None,
+    logger_prefix: str = "[objective_terms]",
+    stage_label: str = "메인",
+) -> list:
+    cfg = rs.config
+    if "N" not in cfg.shift_types:
+        return []
+    if not bool(getattr(cfg, "even_nights", False)):
+        return []
+
+    N = len(rs.nurses)
+    D = rs.num_days
+    S = cfg.num_shifts
+    night_idx = cfg.shift_types.index("N")
+
+    normals: list[int] = []
+    for i, nu in enumerate(rs.nurses):
+        is_n_only = False
+        raw = getattr(nu, "is_night_nurse", None)
+        if isinstance(raw, list):
+            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+            is_n_only = allowed == {"N"}
+        elif raw == 3 or (raw is not None and raw not in (0, False)):
+            is_n_only = True
+        if not is_n_only:
+            normals.append(i)
+    n_forbid_n = _n_forbid_n_set(rs, join, leave)
+    normals_can_n = [n for n in normals if n not in n_forbid_n]
+    if not normals_can_n:
+        print(
+            f"{logger_prefix} [N균등] even_nights 켜짐 but "
+            "normals_can_N(비야간전담·N가능)=0 → 스킵"
+        )
+        return []
+
+    if (
+        hasattr(cfg, "daily_shift_requirements_by_day")
+        and isinstance(cfg.daily_shift_requirements_by_day, list)
+        and len(cfg.daily_shift_requirements_by_day) == D
+    ):
+        daily_need_n = [
+            int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
+            for d in range(D)
+        ]
+    else:
+        base_n = int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
+        daily_need_n = [base_n for _ in range(D)]
+    fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+    total_need_n = 0
+    for d in range(D):
+        need = max(0, daily_need_n[d] - int(fc[d][night_idx] if d < len(fc) else 0))
+        total_need_n += need
+    if total_need_n <= 0:
+        print(f"{logger_prefix} [N균등] even_nights 켜짐 but total_need_n=0 → 패널티 미적용")
+        return []
+
+    low = total_need_n // len(normals_can_n)
+    high = low + (1 if (total_need_n % len(normals_can_n)) else 0)
+    w_primary = int(
+        getattr(cfg, "night_minmax_primary_weight", NIGHT_DEVIATION_PENALTY * 20)
+        or NIGHT_DEVIATION_PENALTY * 20
+    )
+    w_secondary = int(
+        getattr(cfg, "night_minmax_secondary_weight", NIGHT_DEVIATION_PENALTY)
+        or NIGHT_DEVIATION_PENALTY
+    )
+
+    print(
+        f"{logger_prefix} [N균등] min-max 적용({stage_label}): "
+        f"normals_can_N={len(normals_can_n)}, n_forbid_N={len(n_forbid_n)}, "
+        f"band=[{low},{high}], total_need_n={total_need_n}, "
+        f"w_primary={w_primary}, w_secondary={w_secondary}"
+    )
+
+    obj: list = []
+    max_n = m.NewIntVar(0, D, f"night_max_{stage_label}")
+    for n in normals_can_n:
+        tot_nights = sum(X(n, d, night_idx) for d in range(join[n], leave[n] + 1))
+        m.Add(max_n >= tot_nights)
+        dev_low = m.NewIntVar(0, D, f"night_devL_{stage_label}_{n}")
+        dev_high = m.NewIntVar(0, D, f"night_devH_{stage_label}_{n}")
+        m.Add(dev_low >= low - tot_nights)
+        m.Add(dev_high >= tot_nights - high)
+        obj.append(-w_secondary * dev_low)
+        obj.append(-w_secondary * dev_high)
+    obj.append(-w_primary * max_n)
+    return obj
+
+
 def build_main_objective_terms(
     *,
     m: cp_model.CpModel,
@@ -179,67 +361,29 @@ def build_main_objective_terms(
                 m.Add(slack >= 2 - offs)
                 obj.append(-WEEK_OFF_SHORT_PENALTY * slack)
 
-    # (4-3) 야간 균등 (편차에 선형 패널티) - N 전일 금지 간호사는 대상에서 제외
-    if getattr(cfg, "even_nights", False):
-        normals: list[int] = []
-        for i, nu in enumerate(rs.nurses):
-            is_n_only = False
-            raw = getattr(nu, "is_night_nurse", None)
-            if isinstance(raw, list):
-                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                is_n_only = allowed == {"N"}
-            elif raw == 3 or (raw is not None and raw not in (0, False)):
-                is_n_only = True
-            if not is_n_only:
-                normals.append(i)
-        n_forbid_n = _n_forbid_n_set(rs, join, leave)
-        normals_can_n = [n for n in normals if n not in n_forbid_n]
-        if normals_can_n:
-            if (
-                hasattr(cfg, "daily_shift_requirements_by_day")
-                and isinstance(cfg.daily_shift_requirements_by_day, list)
-                and len(cfg.daily_shift_requirements_by_day) == D
-            ):
-                daily_need_n = [
-                    int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
-                    for d in range(D)
-                ]
-            else:
-                base_n = int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
-                daily_need_n = [base_n for _ in range(D)]
-            fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
-            total_need_n = 0
-            for d in range(D):
-                need = max(0, daily_need_n[d] - int(fc[d][night] if d < len(fc) else 0))
-                total_need_n += need
-            if total_need_n > 0:
-                target = total_need_n // len(normals_can_n)
-                print(
-                    "[objective_terms] [N균등] even_nights 적용(메인): "
-                    f"normals_can_N={len(normals_can_n)}, n_forbid_N={len(n_forbid_n)}, "
-                    f"target_N_per_nurse={target}, total_need_n={total_need_n}, "
-                    f"penalty_weight={NIGHT_DEVIATION_PENALTY}"
-                )
-                for n in normals_can_n:
-                    tot_nights = sum(
-                        X(n, d, night) for d in range(join[n], leave[n] + 1)
-                    )
-                    dev_pos = m.NewIntVar(0, D, f"devP_{n}")
-                    dev_neg = m.NewIntVar(0, D, f"devN_{n}")
-                    m.Add(dev_pos - dev_neg == tot_nights - target)
-                    obj.extend(
-                        [
-                            -NIGHT_DEVIATION_PENALTY * dev_pos,
-                            -NIGHT_DEVIATION_PENALTY * dev_neg,
-                        ]
-                    )
-            else:
-                print("[objective_terms] [N균등] even_nights 켜짐 but total_need_n=0 → 패널티 미적용")
-        else:
-            print(
-                "[objective_terms] [N균등] even_nights 켜짐 but "
-                "normals_can_N(비야간전담·N가능)=0 → 스킵"
-            )
+    obj.extend(
+        add_even_night_minmax_distribution_terms(
+            m=m,
+            rs=rs,
+            X=X,
+            join=join,
+            leave=leave,
+            fixed_cnt=fixed_cnt,
+            logger_prefix="[objective_terms]",
+            stage_label="메인",
+        )
+    )
+
+    obj.extend(
+        add_even_mid_distribution_terms(
+            m=m,
+            rs=rs,
+            X=X,
+            join=join,
+            leave=leave,
+            fixed_cnt=fixed_cnt,
+        )
+    )
 
     # (4-4) N-O-D/E 패턴
     if getattr(cfg, "nod_noe", True):
@@ -342,4 +486,3 @@ def build_main_objective_terms(
         pass
 
     return obj
-

@@ -513,8 +513,8 @@ async def get_personnel_basic_info(
     db: Session = Depends(get_db)
 ):
     try:
+        # nurse_id 기준으로만 조회 (group switch 이후에도 마이페이지 접근 가능하도록)
         nurse = db.query(NurseModel).filter(
-            NurseModel.group_id == current_user.group_id,
             NurseModel.nurse_id == current_user.nurse_id
         ).first()
         

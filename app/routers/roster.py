@@ -1690,7 +1690,11 @@ async def create_roster_with_weekly_off(
         RosterConfigModel.office_id == current_user.office_id,
     ).order_by(RosterConfigModel.created_at.desc()).first()
 
-    created_name = name or f"{month}월 근무표 VER{new_version} (주휴 포함)"
+    weekly_off_on = bool(getattr(latest_config, 'weekly_off_group', False)) if latest_config else False
+    created_name = name or (
+        f"{month}월 근무표 VER{new_version} (주휴 포함)" if weekly_off_on
+        else f"{month}월 근무표 VER{new_version}"
+    )
 
     new_schedule_id = str(uuid.uuid4().hex)[:12]
 

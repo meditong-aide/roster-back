@@ -1622,10 +1622,21 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         # (b-0) 1N 금지: 꼬리 N이 1개라면 day0 N 고정 또는 forbidden
         # day0이 주휴면 forbidden만(주휴 우선). 아니면 day0=N 고정 + 2N2O 시 day1,2 OFF 강제.
         if not_one_night and cons_n == 1:
+            has_day0_rest_guard = False
             if 0 in forced_off.get(nurse_id, []):
-                forced_off[nurse_id] = [d for d in forced_off.get(nurse_id, []) if d != 0]
+                has_day0_rest_guard = True
+            for _w in off_window_constraints.get(nurse_id, []) or []:
+                try:
+                    _l, _r = int(_w[0]), int(_w[1])
+                except Exception:
+                    continue
+                if _l <= 0 <= _r:
+                    has_day0_rest_guard = True
+                    break
             tail_str = ' '.join(tail) if tail else '(없음)'
-            if nurse_id in day0_weekly_off_nurse_ids:
+            if has_day0_rest_guard:
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail이지만 월초 휴식 하드제약(day0 OFF/윈도우) 우선 적용 → day0 N 고정 스킵, tail={tail_str}")
+            elif nurse_id in day0_weekly_off_nurse_ids:
                 forbidden[nurse_id][0].extend(['D', 'E', 'O'])
                 print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/O), tail={tail_str}")
             else:
@@ -1858,7 +1869,10 @@ def build_allowed_shift_type_constraints(
     for nurse_id, allowed in nurse_id_to_allowed.items():
         if not allowed:
             continue  # 제한 없음
-        disallowed = sorted(all_codes - set(allowed))
+        disallowed_set = set(all_codes - set(allowed))
+        if allowed:
+            disallowed_set.add("M")
+        disallowed = sorted(disallowed_set)
         if not disallowed:
             continue
         day_map: dict[int, list[str]] = {}
@@ -1903,6 +1917,93 @@ def _merge_initial_constraints(base: dict | None, extra: dict | None) -> dict:
         merged_forbidden_out[nurse_id] = {d: sorted(codes) for d, codes in day_map.items()}
 
     return {"forced_off": merged_forced_off_out, "forbidden": merged_forbidden_out}
+
+
+def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int, month: int) -> str | None:
+    if not bool(config_dict.get("use_mid", False)):
+        return None
+
+    num_days = calendar.monthrange(int(year), int(month))[1]
+    req_by_day: list[int] = []
+    ds_by_day = config_dict.get("daily_shift_requirements_by_day")
+    if isinstance(ds_by_day, list) and ds_by_day:
+        for d in range(num_days):
+            if d < len(ds_by_day) and isinstance(ds_by_day[d], dict):
+                req_by_day.append(max(0, int((ds_by_day[d] or {}).get("M", 0) or 0)))
+            else:
+                req_by_day.append(0)
+    else:
+        base_map = config_dict.get("daily_shift_requirements") or {}
+        base_req = max(0, int((base_map or {}).get("M", 0) or 0))
+        req_by_day = [base_req for _ in range(num_days)]
+
+    fixed_by_day_nurse: dict[tuple[int, int], str] = {}
+    for cell in (config_dict.get("fixed_cells") or []):
+        try:
+            n_idx = int(cell.get("nurse_index"))
+            d_idx = int(cell.get("day_index"))
+        except Exception:
+            continue
+        if d_idx < 0 or d_idx >= num_days:
+            continue
+        raw = str(cell.get("shift") or "-").strip().upper()
+        if raw in {"OFF", "주"}:
+            raw = "O"
+        fixed_by_day_nurse[(n_idx, d_idx)] = raw
+
+    initial_constraints = config_dict.get("initial_constraints") or {}
+    forced_off_src = initial_constraints.get("forced_off") or {}
+    forbidden_src = initial_constraints.get("forbidden") or {}
+
+    forced_off: dict[str, set[int]] = {}
+    for nurse_id, days in (forced_off_src or {}).items():
+        key = str(nurse_id)
+        forced_off[key] = set()
+        for d in (days or []):
+            try:
+                forced_off[key].add(int(d))
+            except Exception:
+                continue
+
+    forbidden: dict[str, dict[int, set[str]]] = {}
+    for nurse_id, day_map in (forbidden_src or {}).items():
+        key = str(nurse_id)
+        forbidden[key] = {}
+        for d, codes in (day_map or {}).items():
+            try:
+                d_idx = int(d)
+            except Exception:
+                continue
+            forbidden[key][d_idx] = {str(c).strip().upper() for c in (codes or [])}
+
+    nurse_ids = [str(getattr(n, "nurse_id", "") or "") for n in (nurses_in_group or [])]
+
+    for d in range(num_days):
+        req_m = req_by_day[d]
+        fixed_m = 0
+        variable_capacity = 0
+        for n_idx, nurse_id in enumerate(nurse_ids):
+            fixed_code = fixed_by_day_nurse.get((n_idx, d))
+            if fixed_code is not None:
+                if fixed_code == "M":
+                    fixed_m += 1
+                continue
+
+            if d in forced_off.get(nurse_id, set()):
+                continue
+            if "M" in forbidden.get(nurse_id, {}).get(d, set()):
+                continue
+            variable_capacity += 1
+
+        min_possible = fixed_m
+        max_possible = fixed_m + variable_capacity
+        if req_m < min_possible or req_m > max_possible:
+            return (
+                f"M 하드 제약 불가능: {d + 1}일 M 요구={req_m}, "
+                f"가능 범위=[{min_possible},{max_possible}]"
+            )
+
+    return None
 
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
@@ -2017,6 +2118,30 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         base=cross_month_constraints,
         extra=allowed_constraints,
     )
+    try:
+        checker_module = __import__(
+            "services.cp_sat.feasibility_alerts",
+            fromlist=["run_preflight_feasibility_alerts"],
+        )
+        checker_fn = getattr(checker_module, "run_preflight_feasibility_alerts", None)
+        if callable(checker_fn):
+            checker_fn(
+                nurses_in_group=nurses_in_group,
+                config_dict=config_dict,
+                year=req.year,
+                month=req.month,
+                logger_prefix="[PreflightFeasibility]",
+            )
+    except Exception as precheck_exc:
+        print(f"[PreflightFeasibility] checker failed: {precheck_exc}")
+    mid_feasibility_error = _validate_mid_hard_feasibility(
+        nurses_in_group=nurses_in_group,
+        config_dict=config_dict,
+        year=req.year,
+        month=req.month,
+    )
+    if mid_feasibility_error:
+        raise Exception(mid_feasibility_error)
     try:
         print("cp_sat_basic 엔진 호출 준비 완료")
         # ── 실행 초기에 정책 파라미터가 어떻게 적용됐는지 반드시 로그로 남긴다(추후 유지보수용) ──
@@ -2209,6 +2334,11 @@ def _validate_generated_roster(
                     return (
                         f"{d + 1}일에 필수 근무 인원이 모두 미배정되었습니다. "
                         f"(요구 인원: {req_msg})"
+                    )
+
+                if "M" in req and actual.get("M", 0) > req["M"]:
+                    return (
+                        f"{d + 1}일 M 과배정: 요구={req['M']}, 실제={actual.get('M', 0)}"
                     )
     except Exception:
         # 검증 로직이 실패해도 저장을 막지 않고, 기존 최소 검증 결과만 사용
@@ -2807,6 +2937,56 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             f"하드 고정={len(fw_fixed_cells)}건 {dict(_fw_code_counts)}, "
             f"스킵(특수코드 중복={_fw_skip_special}, 엔진 미포함 간호사={_fw_skip_nurse}, 활동범위 밖={_fw_skip_range})"
         )
+        _preceptee_on_val = config_dict.get("preceptee_on", False)
+        print(
+            f"[RosterCreate] 프리셉티 fixed_wanted 맵 구성 조건: preceptee_on={_preceptee_on_val}, all_fixed_entries={len(all_fixed_entries)}건"
+        )
+        if _preceptee_on_val:
+            _pte_fw_map: dict[tuple[int, int], str] = {}
+            _pte_ids = set()
+            _pte_names: dict[str, str] = {}
+            for nurse in nurses_for_engine:
+                if getattr(nurse, "preceptor_id", None):
+                    _pte_ids.add(str(nurse.nurse_id))
+                    _pte_names[str(nurse.nurse_id)] = getattr(nurse, "name", "?")
+            print(
+                f"[RosterCreate] 프리셉티 목록: {len(_pte_ids)}명 → {[(nid, _pte_names.get(nid, '?')) for nid in sorted(_pte_ids)]}"
+            )
+            _idx_to_nid = {idx: nid for nid, idx in fw_nurse_idx_map.items()}
+            for fe in all_fixed_entries:
+                _nid = str(fe.nurse_id)
+                if _nid not in _pte_ids:
+                    continue
+                _n_idx = fw_nurse_idx_map.get(_nid)
+                if _n_idx is None:
+                    continue
+                _d_idx = fe.shift_date.day - 1
+                if _d_idx < 0 or _d_idx >= days_in_month:
+                    continue
+                if active_range_candidates:
+                    _rng = active_range_candidates.get(_nid)
+                    if _rng:
+                        _start_idx, _end_idx = _rng
+                        if _d_idx < _start_idx or _d_idx > _end_idx:
+                            continue
+                _pte_fw_map[(_n_idx, _d_idx)] = str(fe.shift_id or "").strip()
+            if _pte_fw_map:
+                config_dict["preceptee_fixed_wanted_map"] = _pte_fw_map
+                print(
+                    f"[RosterCreate] 프리셉티 fixed_wanted 맵: {len(_pte_fw_map)}건 (후처리에서 보호)"
+                )
+                for (ni, di), sc in sorted(_pte_fw_map.items()):
+                    _nm = _pte_names.get(_idx_to_nid.get(ni, ""), "?")
+                    print(f"  → 프리셉티 {_nm}(idx={ni}) {di + 1}일차={sc}")
+            else:
+                print(
+                    f"[RosterCreate] 프리셉티 fixed_wanted 맵: 0건 (프리셉티 FixedWantedEntry 매칭 없음)"
+                )
+                print("  [DEBUG] 프리셉티 원본 FixedWantedEntry가 없거나 활동범위/엔진 매핑에서 제외됨")
+        else:
+            print(
+                f"[RosterCreate] preceptee_on=False → 프리셉티 fixed_wanted 맵 구성 스킵"
+            )
     else:
         print(
             f"[RosterCreate] fixed_wanted_use_yn=False: "

@@ -322,7 +322,7 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
         db.commit() # 한번 더 강제 commit
         
         print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
-        return result
+        return {"response": result}
     except Exception as e:
         db.rollback()
         print(f'error', e)
