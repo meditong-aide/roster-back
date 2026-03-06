@@ -46,7 +46,12 @@ from services.cp_sat.lookahead_constraints import (
     add_lookahead_off_cap_constraints,
     add_lookahead_distribution_penalty_terms,
 )
-from services.cp_sat.off_policy import build_off_partitions, compute_off_bounds, resolve_effective_off_days
+from services.cp_sat.off_policy import (
+    build_off_partitions,
+    compute_off_bounds,
+    off_cap_semantics_label,
+    resolve_effective_off_days,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1990,6 +1995,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     vacation_off_cells = set(partition["vacation_off_cells"])
     structural_off_cells = set(partition["structural_off_cells"])
     weekend_days = set(partition["weekend_days"])
+    off_cap_semantics = off_cap_semantics_label()
+    print(
+        f"[OffPolicy][Partition] cap_semantics={off_cap_semantics}, "
+        f"vacation_cells={len(vacation_off_cells)}, structural_cells={len(structural_off_cells)}"
+    )
     forced_off_cells: set[tuple[int, int]] = set(fixed_off_cells)
     # 룩어헤드 구간 주휴: 당월 weekly_off_by_idx가 아닌 별도 계산 셀만 사용
     lookahead_weekly_off = getattr(rs, "lookahead_weekly_off_cells", set()) or set()
@@ -2596,6 +2606,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     avail_days=avail_days,
                     vacation_cnt=vacation_cnt,
                 )
+                structural_cnt = sum(
+                    1
+                    for d in phys_range_off
+                    if (n, d) in structural_off_cells and (n, d) not in vacation_off_cells
+                )
+                nonvac_active_days = max(0, avail_days - vacation_cnt)
                 min_off_required = int(off_bounds["min_off_required"])
                 if min_off_required > 0 and phys_range_off:
                     m.Add(
@@ -2609,7 +2625,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 extra_allowed = int(off_bounds["max_extra_off_days"])
                 if extra_allowed >= 0 and phys_range_off:
                     if is_n_only:
-                        max_off_allowed_n_only = max(0, avail_days - 15)
+                        max_off_allowed_n_only = min(
+                            max(0, avail_days - 15),
+                            nonvac_active_days,
+                        )
                         m.Add(
                             sum(
                                 X(n, d, off)
@@ -2620,11 +2639,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"is_n_only=1, vac_cnt={vacation_cnt}, "
+                            f"cap_semantics={off_cap_semantics}, is_n_only=1, vac_cnt={vacation_cnt}, "
+                            f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
                             f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
                         )
                     else:
-                        max_off_allowed = int(off_bounds["max_off_allowed"])
+                        max_off_allowed = min(
+                            int(off_bounds["max_off_allowed"]),
+                            nonvac_active_days,
+                        )
                         m.Add(
                             sum(
                                 X(n, d, off)
@@ -2635,7 +2658,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"vac_cnt={vacation_cnt}, min_off={min_off_required}, max_off={max_off_allowed}"
+                            f"cap_semantics={off_cap_semantics}, vac_cnt={vacation_cnt}, "
+                            f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
+                            f"min_off={min_off_required}, max_off={max_off_allowed}"
                         )
         except Exception:
             pass

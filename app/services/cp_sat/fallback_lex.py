@@ -39,6 +39,7 @@ def _load_off_policy_helpers():
     return (
         getattr(module, "build_off_partitions"),
         getattr(module, "compute_off_bounds"),
+        getattr(module, "off_cap_semantics_label"),
         getattr(module, "resolve_effective_off_days"),
         getattr(module, "resolve_max_extra_off_days"),
     )
@@ -164,15 +165,17 @@ def optimize_fallback_lex_hard_first(
     (
         build_off_partitions,
         compute_off_bounds,
+        off_cap_semantics_label,
         resolve_effective_off_days,
         resolve_max_extra_off_days,
     ) = _load_off_policy_helpers()
     effective_off_days, effective_off_source = resolve_effective_off_days(cfg)
     effective_max_extra = resolve_max_extra_off_days(cfg, 0)
+    off_cap_semantics = off_cap_semantics_label()
     print(
         f"{logger_prefix} [OffPolicy][Fallback] effective_off_days={effective_off_days}, "
         f"source={effective_off_source}, max_extra_off_days={effective_max_extra}, "
-        f"raw_off_days={getattr(cfg, 'off_days', None)}"
+        f"raw_off_days={getattr(cfg, 'off_days', None)}, cap_semantics={off_cap_semantics}"
     )
 
     # 공통 인덱스/구간
@@ -1303,7 +1306,7 @@ def optimize_fallback_lex_hard_first(
                     print(
                         f"{logger_prefix} [OffCap][force] n={n}, "
                         f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
-                        f"target_O={target_o}, weekly_off_target={weekly_target}"
+                        f"cap_semantics={off_cap_semantics}, target_O={target_o}, weekly_off_target={weekly_target}"
                     )
             for n in range(N):
                 if preceptee_follow and n in preceptee_indices:
@@ -1325,6 +1328,12 @@ def optimize_fallback_lex_hard_first(
                 vacation_cnt = sum(
                     1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells
                 )
+                structural_cnt = sum(
+                    1
+                    for d in range(T0, T1 + 1)
+                    if (n, d) in structural_off_cells and (n, d) not in vacation_off_cells
+                )
+                nonvac_active_days = max(0, avail_days - vacation_cnt)
                 off_bounds = compute_off_bounds(
                     source=cfg,
                     avail_days=avail_days,
@@ -1380,7 +1389,9 @@ def optimize_fallback_lex_hard_first(
                     if stage == 3:
                         print(
                             f"{logger_prefix} [OffCap][total] n={n}, id={nurse_id}, name={nurse_name}, "
-                            f"nonvac_cap={total_cap_effective}, min_off={min_off_required}, vacation={vacation_cnt}, "
+                            f"cap_semantics={off_cap_semantics}, nonvac_cap={total_cap_effective}, "
+                            f"min_off={min_off_required}, vacation={vacation_cnt}, structural_nonvac={structural_cnt}, "
+                            f"nonvac_active_days={nonvac_active_days}, "
                             f"is_n_only={int(is_n_only)}, weekend_off={int(is_weekend_off)}"
                         )
                     # print(
@@ -1708,6 +1719,7 @@ def optimize_fallback_lex_hard_first(
                     print(
                         f"{logger_prefix} [OffCount][final] n={n}, "
                         f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                        f"cap_semantics={off_cap_semantics}, "
                         f"assigned_O={assigned_off}, vacation={vac_cnt}, weekly_off_target={weekly_target}, "
                         f"target_O={target_o}, slack_short={slack_short_val}, slack_excess={slack_excess_val}, "
                         f"min_off_miss={min_off_miss_val}"
