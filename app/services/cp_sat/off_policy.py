@@ -41,6 +41,10 @@ def resolve_weekend_counts_toward_max(source: Any) -> bool:
     return bool(_get_value(source, "weekend_off_counts_toward_max_off", False))
 
 
+def off_cap_semantics_label() -> str:
+    return "nonvac_total_off"
+
+
 def compute_off_bounds(*, source: Any, avail_days: int, vacation_cnt: int) -> dict[str, int | str]:
     effective_off_days, source_key = resolve_effective_off_days(source)
     min_off_required = max(0, min(effective_off_days, max(0, avail_days - max(0, vacation_cnt))))
