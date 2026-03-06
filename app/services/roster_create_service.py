@@ -1622,10 +1622,21 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         # (b-0) 1N 금지: 꼬리 N이 1개라면 day0 N 고정 또는 forbidden
         # day0이 주휴면 forbidden만(주휴 우선). 아니면 day0=N 고정 + 2N2O 시 day1,2 OFF 강제.
         if not_one_night and cons_n == 1:
+            has_day0_rest_guard = False
             if 0 in forced_off.get(nurse_id, []):
-                forced_off[nurse_id] = [d for d in forced_off.get(nurse_id, []) if d != 0]
+                has_day0_rest_guard = True
+            for _w in off_window_constraints.get(nurse_id, []) or []:
+                try:
+                    _l, _r = int(_w[0]), int(_w[1])
+                except Exception:
+                    continue
+                if _l <= 0 <= _r:
+                    has_day0_rest_guard = True
+                    break
             tail_str = ' '.join(tail) if tail else '(없음)'
-            if nurse_id in day0_weekly_off_nurse_ids:
+            if has_day0_rest_guard:
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail이지만 월초 휴식 하드제약(day0 OFF/윈도우) 우선 적용 → day0 N 고정 스킵, tail={tail_str}")
+            elif nurse_id in day0_weekly_off_nurse_ids:
                 forbidden[nurse_id][0].extend(['D', 'E', 'O'])
                 print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/O), tail={tail_str}")
             else:

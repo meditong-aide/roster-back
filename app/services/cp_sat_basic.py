@@ -1136,6 +1136,7 @@ class CPSATBasicEngine:
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
             success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
+            # fallback_success = False
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
                 self._optimize_fallback_lex_hard_first(
@@ -1144,6 +1145,8 @@ class CPSATBasicEngine:
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
+            # if not success and not fallback_success:
+            #     raise RuntimeError("HARD_INFEASIBLE: stage1/fallback 모두 해 없음")
         # 9-1. 불필요 OFF 정리 (N-only 제외)
         # try:
         #     with Timer("불필요 OFF 정리"):
@@ -2558,6 +2561,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
             if bool(getattr(cfg, "not_one_night", False)):
                 for d in range(T0, T1 + 1):
+                    if d == T1:
+                        continue
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night:
                         continue  # 1N day0 N 고정(경계) 시 해당일 1N 제약 스킵
                     neighbors = []
