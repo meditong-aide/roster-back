@@ -30,7 +30,7 @@ async def list_groups(
         db.query(GroupModel).filter(GroupModel.office_id == current_user.office_id)
         .all()
     )
-    
+
     data = [
         {
             "group_id": str(g.group_id),
@@ -258,6 +258,10 @@ async def get_my_admin_groups(
     if not current_user:
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
 
+    # DB에서 간호사의 실제 소속 group_id 조회 (JWT group_id는 switch로 변경될 수 있으므로)
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == current_user.nurse_id).first()
+    home_group_id = nurse.group_id if nurse else current_user.group_id
+
     all_groups = (
         db.query(GroupModel)
         .filter(GroupModel.office_id == current_user.office_id)
@@ -267,9 +271,9 @@ async def get_my_admin_groups(
     seen_ids = set()
     my_groups = []
 
-    # 자신의 원래 그룹 우선 포함
+    # 자신의 원래 소속 그룹 우선 포함 (DB 기준)
     for g in all_groups:
-        if g.group_id == current_user.group_id:
+        if g.group_id == home_group_id:
             my_groups.append({
                 "group_id": str(g.group_id),
                 "group_name": str(g.group_name),
