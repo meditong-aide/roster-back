@@ -1869,7 +1869,10 @@ def build_allowed_shift_type_constraints(
     for nurse_id, allowed in nurse_id_to_allowed.items():
         if not allowed:
             continue  # 제한 없음
-        disallowed = sorted(all_codes - set(allowed))
+        disallowed_set = set(all_codes - set(allowed))
+        if allowed == {"N"}:
+            disallowed_set.add("M")
+        disallowed = sorted(disallowed_set)
         if not disallowed:
             continue
         day_map: dict[int, list[str]] = {}

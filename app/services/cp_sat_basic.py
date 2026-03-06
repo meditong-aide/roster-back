@@ -2555,6 +2555,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if is_n_only:
             for d in range(T0,T1+1):
                 m.Add(X(n,d,day)==0); m.Add(X(n,d,eve)==0)
+                if mid is not None:
+                    m.Add(X(n, d, mid) == 0)
 
         if n not in n_forbid_n:
             # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.

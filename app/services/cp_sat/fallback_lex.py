@@ -1151,6 +1151,8 @@ def optimize_fallback_lex_hard_first(
                 for d in range(T0, T1 + 1):
                     m.Add(X(n, d, day_idx) == 0)
                     m.Add(X(n, d, eve_idx) == 0)
+                    if mid_idx is not None:
+                        m.Add(X(n, d, mid_idx) == 0)
 
         # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
         # for n, nu in enumerate(roster_system.nurses):
