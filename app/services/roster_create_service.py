@@ -35,6 +35,7 @@ from collections import defaultdict
 import calendar
 from sqlalchemy import text
 from db.client2 import get_db
+from services.cp_sat.off_policy import resolve_effective_off_days
 
 logger = logging.getLogger(__name__)
 # from db.client2 import _get_mssql_session
@@ -2263,6 +2264,71 @@ def _count_work_assignments(generated: dict[str, list[str]] | None) -> tuple[int
     return total_cells, work_cells
 
 
+def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] | None) -> str | None:
+    try:
+        cfg = getattr(roster_system, "config", None)
+        if cfg is None:
+            return None
+        num_days = int(getattr(roster_system, "num_days", 0) or 0)
+        if num_days <= 0:
+            return None
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        nurse_count = len(nurses) if nurses else len(generated or {})
+        if nurse_count <= 0:
+            return None
+
+        shift_types = list(getattr(cfg, "shift_types", []) or [])
+
+        def _required_by_day(day_idx: int) -> dict[str, int]:
+            by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+            if isinstance(by_day, list) and day_idx < len(by_day) and isinstance(by_day[day_idx], dict):
+                return {str(k).upper(): int(v or 0) for k, v in by_day[day_idx].items()}
+            base = getattr(cfg, "daily_shift_requirements", None)
+            if isinstance(base, dict):
+                return {str(k).upper(): int(v or 0) for k, v in base.items()}
+            return {}
+
+        total_required = 0
+        n_required = 0
+        for d in range(num_days):
+            req = _required_by_day(d)
+            for code, val in req.items():
+                if code == "O":
+                    continue
+                if shift_types and code not in shift_types:
+                    continue
+                v = int(val or 0)
+                if v <= 0:
+                    continue
+                total_required += v
+                if code == "N":
+                    n_required += v
+
+        effective_off_days, off_source = resolve_effective_off_days(cfg)
+        max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
+        total_capacity = nurse_count * max_work_per_nurse
+        if total_required > total_capacity:
+            return (
+                "[reason_code=CAPACITY_TOTAL_SHORTAGE] "
+                "Infeasible 진단: 월 총 필요 근무 슬롯이 공급 상한을 초과했습니다. "
+                f"(요구={total_required}, 공급상한={total_capacity}, 간호사={nurse_count}, "
+                f"days={num_days}, off_days={effective_off_days}, source={off_source})"
+            )
+
+        max_night_per_nurse = int(getattr(cfg, "max_night_shifts_per_month", 0) or 0)
+        if max_night_per_nurse > 0 and n_required > (nurse_count * max_night_per_nurse):
+            return (
+                "[reason_code=N_CAPACITY_SHORTAGE] "
+                "Infeasible 진단: 월간 N 수요가 N 상한 용량을 초과했습니다. "
+                f"(N요구={n_required}, N용량상한={nurse_count * max_night_per_nurse}, "
+                f"간호사={nurse_count}, max_night_per_month={max_night_per_nurse})"
+            )
+
+        return None
+    except Exception:
+        return None
+
+
 def _validate_generated_roster(
     generated: dict[str, list[str]] | None, roster_system
 ) -> str | None:
@@ -2280,15 +2346,10 @@ def _validate_generated_roster(
         총 750칸 중 실근무 0칸이거나 위반 1500건(750×2) 이상 → 메시지 반환.
     """
     total_cells, work_cells = _count_work_assignments(generated)
-    num_days = getattr(roster_system, "num_days", 0) or 0
-    work_ratio = (work_cells / total_cells) if total_cells else 0.0
 
     if total_cells > 0 and work_cells == 0:
-        return "근무 배정이 한 건도 없어 스케줄을 저장하지 않습니다."
-
-    # 근무 배정률이 10% 미만이면 비정상으로 간주
-    if total_cells > 0 and work_ratio < 0.1:
-        return "근무 배정률이 10% 미만이어서 스케줄을 저장하지 않습니다."
+        diag = _build_infeasible_diagnosis(roster_system, generated)
+        return diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다."
 
     # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
     try:
@@ -2330,15 +2391,19 @@ def _validate_generated_roster(
 
                 total_actual = sum(actual.values())
                 if total_actual == 0:
+                    diag = _build_infeasible_diagnosis(roster_system, generated)
+                    if diag:
+                        return diag
                     req_msg = ", ".join(f"{k}={v}" for k, v in req.items())
                     return (
-                        f"{d + 1}일에 필수 근무 인원이 모두 미배정되었습니다. "
-                        f"(요구 인원: {req_msg})"
+                        f"[reason_code=DAY_ZERO_COVERAGE] Infeasible 진단: "
+                        f"{d + 1}일 필수 근무 미배정 (요구: {req_msg})"
                     )
 
                 if "M" in req and actual.get("M", 0) > req["M"]:
                     return (
-                        f"{d + 1}일 M 과배정: 요구={req['M']}, 실제={actual.get('M', 0)}"
+                        f"[reason_code=M_OVERSUPPLY] {d + 1}일 M 과배정: "
+                        f"요구={req['M']}, 실제={actual.get('M', 0)}"
                     )
     except Exception:
         # 검증 로직이 실패해도 저장을 막지 않고, 기존 최소 검증 결과만 사용

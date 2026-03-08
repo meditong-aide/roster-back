@@ -2544,9 +2544,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             #     m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
+        is_n_only = False
         raw = getattr(nu, "is_night_nurse", None)
         if isinstance(raw, list):
             allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+            is_n_only = allowed == {"N"}
             if allowed:
                 for d in range(T0, T1 + 1):
                     if "D" not in allowed:
@@ -2558,6 +2560,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if mid is not None:
                         m.Add(X(n, d, mid) == 0)
         elif raw == 3 or (raw is not None and raw != 0 and raw != False):
+            is_n_only = True
             for d in range(T0, T1 + 1):
                 m.Add(X(n, d, day) == 0)
                 m.Add(X(n, d, eve) == 0)
@@ -2675,8 +2678,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
                             f"min_off={min_off_required}, max_off={max_off_allowed}"
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                f"[OffCap][Init] 적용 실패: nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, err={exc}"
+            )
 
         # N2/3→2OFF
         # 주의: "N 2회/3회 후 OFF 2회"는 다음 2일이 모두 OFF여야 한다.
