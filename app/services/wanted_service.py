@@ -1351,6 +1351,7 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
     return results
 
 
+
 def delete_wanted_config(db: Session, group_id: str, filters: dict = None) -> int:
     """일자별 원티드 제한 설정 삭제 (DAILY_LIMIT 전용)
 
