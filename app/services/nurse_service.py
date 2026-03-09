@@ -4,7 +4,7 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Nurse as NurseModel, Group, DeletedNurseHistory
+from db.models import Nurse as NurseModel, Group, DeletedNurseHistory, RosterConfig as RosterConfigModel
 from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any
@@ -14,6 +14,20 @@ from dateutil.parser import parse as parse_date
 from db.client2 import msdb_manager
 from datalayer.member import Member
 import logging
+
+def _get_display_flags(db: Session, group_id: str) -> dict:
+    """그룹의 최신 roster_config에서 show_level, show_preceptor 플래그 조회"""
+    config = (
+        db.query(RosterConfigModel)
+        .filter(RosterConfigModel.group_id == group_id)
+        .order_by(RosterConfigModel.created_at.desc())
+        .first()
+    )
+    return {
+        "show_level": getattr(config, "show_level", True) if config else True,
+        "show_preceptor": getattr(config, "show_preceptor", True) if config else True,
+    }
+
 
 def get_personnel_basic_info_service(current_user, db: Session):
     """
@@ -70,6 +84,9 @@ def get_nurses_in_group_service(
     # nurse_id로 필터링했는데 결과가 없으면 예외
     if nurse_id and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+
+    # roster_config에서 표시 설정 플래그 조회
+    display_flags = _get_display_flags(db, current_user.group_id)
 
     # 만 나이 계산
     current_date = date.today()
@@ -128,6 +145,8 @@ def get_nurses_in_group_service(
             "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
             "enable_aide": nurse.enable_aide,
             "wanted_max_requests": nurse.wanted_max_requests,
+            # 근무표 설정 메타 플래그
+            **display_flags,
         }
         result.append(nurse_dict)
 
@@ -171,6 +190,10 @@ def get_nurses_filtered_service(
     # nurse_id로 필터링했는데 결과가 없으면 예외
     if nurse_id is not None and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+
+    # roster_config에서 표시 설정 플래그 조회 (ADM: group_id 파라미터 우선, 없으면 첫 번째 간호사의 group_id 사용)
+    target_gid = group_id or (nurses[0].group_id if nurses else None)
+    display_flags = _get_display_flags(db, target_gid) if target_gid else {"show_level": True, "show_preceptor": True}
 
     # 만 나이 계산
     current_date = date.today()
@@ -228,6 +251,8 @@ def get_nurses_filtered_service(
             "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
             "enable_aide": nurse.enable_aide,
             "wanted_max_requests": nurse.wanted_max_requests,
+            # 근무표 설정 메타 플래그
+            **display_flags,
         }
         result.append(nurse_dict)
 

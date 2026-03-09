@@ -215,6 +215,8 @@ class RosterConfigBase(BaseModel):
     team_balance_mode: str = Field(default="balanced")
     off_placement_mode: int = Field(default=1, description="주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)")
     fixed_wanted_use_yn: bool = Field(default=False, description="확정 원티드 DENO 전체 고정 여부")
+    show_level: bool = Field(default=True, description="근무표에 직책(level_) 표시 여부")
+    show_preceptor: bool = Field(default=True, description="근무표에 프리셉터-프리셉티 관계 표시 여부")
 
 
 class RosterConfigCreate(RosterConfigBase):
@@ -279,6 +281,9 @@ class NurseProfile(BaseModel):
     enable_nurse_pair_preference: Optional[bool] = None  # 시크릿 기능 활성화
     enable_aide: Optional[bool] = None  # AIDE 기능 활성화
     wanted_max_requests: Optional[int] = None  # 원티드 요청 개수 제한 (휴무/휴가)
+    # 근무표 설정 메타 플래그 (roster_config 참조)
+    show_level: bool = Field(default=True, description="직책(level_) 표시 여부")
+    show_preceptor: bool = Field(default=True, description="프리셉터-프리셉티 관계 표시 여부")
 
     # @field_validator('fixed_shift')
     # @classmethod
