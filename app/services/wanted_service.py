@@ -1250,11 +1250,10 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
             - shift_type: 근무 타입 필터
 
     반환:
-        List[WantedConfig] (is_active=True인 것만)
+        List[WantedConfig]
     """
     query = db.query(WantedConfig).filter(
         WantedConfig.group_id == group_id,
-        WantedConfig.is_active == True
     )
 
     # 추가 필터 적용
@@ -1313,19 +1312,25 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
         month = config_data.get('month', target_date.month)
         shift_type = config_data.get('shift_type')
 
+        max_requests = config_data.get('max_requests')
+
         existing = db.query(WantedConfig).filter(
             WantedConfig.group_id == group_id,
             WantedConfig.target_date == target_date,
             WantedConfig.shift_type == shift_type
         ).first()
 
-        is_active = config_data.get('is_active', True)
+        # max_requests가 None이면 해당 row 삭제
+        if max_requests is None:
+            if existing:
+                db.delete(existing)
+                print(f"[DAILY_LIMIT] 설정 삭제: target_date={target_date}, shift_type={shift_type}")
+            continue
 
         if existing:
-            existing.max_requests = config_data.get('max_requests', 0)
+            existing.max_requests = max_requests
             existing.year = year
             existing.month = month
-            existing.is_active = is_active
             results.append(existing)
         else:
             config = WantedConfig(
@@ -1334,8 +1339,7 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
                 month=month,
                 target_date=target_date,
                 shift_type=shift_type,
-                max_requests=config_data.get('max_requests', 0),
-                is_active=is_active
+                max_requests=max_requests,
             )
             db.add(config)
             results.append(config)
@@ -1384,18 +1388,17 @@ def delete_wanted_config(db: Session, group_id: str, filters: dict = None) -> in
     return deleted
 
 
-def toggle_wanted_config_active(db: Session, group_id: str, year: int, month: int, is_active: bool) -> int:
-    """일자별 원티드 제한 설정 일괄 활성/비활성 토글
+def delete_wanted_config_by_month(db: Session, group_id: str, year: int, month: int) -> int:
+    """해당 그룹/월의 일자별 원티드 제한 설정 전체 삭제
 
     인자:
         db: DB 세션
         group_id: 그룹 ID
         year: 연도
         month: 월
-        is_active: True면 활성화, False면 비활성화
 
     반환:
-        변경된 레코드 수
+        삭제된 레코드 수
     """
     start_date = date(year, month, 1)
     if month == 12:
@@ -1403,17 +1406,14 @@ def toggle_wanted_config_active(db: Session, group_id: str, year: int, month: in
     else:
         end_date = date(year, month + 1, 1)
 
-    updated = db.query(WantedConfig).filter(
+    deleted = db.query(WantedConfig).filter(
         WantedConfig.group_id == group_id,
         WantedConfig.target_date >= start_date,
         WantedConfig.target_date < end_date
-    ).update(
-        {WantedConfig.is_active: is_active},
-        synchronize_session=False
-    )
+    ).delete(synchronize_session=False)
     db.commit()
-    print(f"[DAILY_LIMIT] 일괄 토글: group_id={group_id}, {year}-{month:02d}, is_active={is_active}, updated={updated}")
-    return updated
+    print(f"[DAILY_LIMIT] 일괄 삭제: group_id={group_id}, {year}-{month:02d}, deleted={deleted}")
+    return deleted
 
 
 def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int, month: int, shift_date: date) -> dict:
@@ -1468,7 +1468,6 @@ def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int,
         WantedConfig.group_id == group_id,
         WantedConfig.target_date == shift_date,
         WantedConfig.shift_type.is_(None),
-        WantedConfig.is_active == True
     ).first()
 
     daily_limit = daily_config.max_requests if daily_config else None

@@ -37,7 +37,7 @@ from services.wanted_service import (
     get_wanted_config,
     upsert_wanted_config,
     delete_wanted_config,
-    toggle_wanted_config_active,
+    delete_wanted_config_by_month,
     validate_wanted_limits,
     get_over_limit_nurses,
     delete_excess_off_requests,
@@ -617,19 +617,18 @@ async def delete_wanted_config_endpoint(
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
 
-@router.patch("/config/toggle")
-async def toggle_wanted_config_endpoint(
+@router.delete("/config/toggle")
+async def delete_wanted_config_by_month_endpoint(
     year: int,
     month: int,
-    is_active: bool,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """
-    일자별 원티드 제한 설정 일괄 활성/비활성 토글
-    - is_active=true: 해당 그룹/월의 모든 config 활성화 (복원)
-    - is_active=false: 해당 그룹/월의 모든 config 비활성화
+    일자별 원티드 제한 설정 일괄 삭제 (OFF 처리)
+    - 해당 그룹/월의 모든 config 행을 삭제
+    - 다시 ON 시에는 POST /config로 신규 데이터만 추가
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -651,14 +650,13 @@ async def toggle_wanted_config_endpoint(
         target_group_id = g.group_id
 
     try:
-        updated_count = toggle_wanted_config_active(db, target_group_id, year, month, is_active)
+        deleted_count = delete_wanted_config_by_month(db, target_group_id, year, month)
         return {
-            "message": f"{updated_count}건의 설정이 {'활성화' if is_active else '비활성화'}되었습니다.",
-            "updated_count": updated_count,
-            "is_active": is_active
+            "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
+            "deleted_count": deleted_count,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"설정 토글 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
 
 @router.post("/validate-limits")

@@ -306,7 +306,6 @@ class WantedConfig(Base):
     max_requests = Column(INTEGER, nullable=True)  # 해당 일자의 최대 요청 개수
     target_date = Column(DATE, nullable=True)  # 특정 일자
     shift_type = Column(CHAR(1), nullable=True)  # 근무 타입 (휴무/휴가)
-    is_active = Column(BOOLEAN, nullable=False, default=True)  # 활성/비활성 (토글 OFF 시 false)
 
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())

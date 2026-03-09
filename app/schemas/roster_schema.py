@@ -166,7 +166,6 @@ class WantedConfigBase(BaseModel):
     # target_date: Optional[str] = None  # 특정 일자 (YYYY-MM-DD)
     target_date: Optional[date] = None
     shift_type: Optional[str] = None  # 근무 타입 (휴무/휴가)
-    is_active: bool = Field(default=True, description="활성/비활성 여부")
 
 
 class WantedConfigCreate(WantedConfigBase):
