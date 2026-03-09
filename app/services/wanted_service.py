@@ -1236,7 +1236,7 @@ def close_expired_wanted(db: Session) -> int:
 
 
 # WantedConfig 관련 서비스 함수
-def get_wanted_config(db: Session, group_id: str, filters: dict = None):
+def get_wanted_config(db: Session, group_id: str, filters: dict = None, include_inactive: bool = False):
     """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용)
 
     - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
@@ -1248,6 +1248,7 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
             - year, month: 해당 월의 설정 조회
             - target_date: 특정 일자 조회
             - shift_type: 근무 타입 필터
+        include_inactive: True면 비활성(is_active=False) 포함 조회
 
     반환:
         List[WantedConfig]
@@ -1255,6 +1256,10 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
     query = db.query(WantedConfig).filter(
         WantedConfig.group_id == group_id
     )
+
+    # 기본적으로 활성 설정만 조회, include_inactive=True면 전체 조회
+    if not include_inactive:
+        query = query.filter(WantedConfig.is_active == True)
 
     # 추가 필터 적용
     if filters:
@@ -1318,10 +1323,13 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
             WantedConfig.shift_type == shift_type
         ).first()
 
+        is_active = config_data.get('is_active', True)
+
         if existing:
             existing.max_requests = config_data.get('max_requests', 0)
             existing.year = year
             existing.month = month
+            existing.is_active = is_active
             results.append(existing)
         else:
             config = WantedConfig(
@@ -1330,7 +1338,8 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
                 month=month,
                 target_date=target_date,
                 shift_type=shift_type,
-                max_requests=config_data.get('max_requests', 0)
+                max_requests=config_data.get('max_requests', 0),
+                is_active=is_active
             )
             db.add(config)
             results.append(config)
@@ -1377,6 +1386,38 @@ def delete_wanted_config(db: Session, group_id: str, filters: dict = None) -> in
     db.commit()
     print(f"[DAILY_LIMIT] 설정 삭제: group_id={group_id}, deleted={deleted}")
     return deleted
+
+
+def toggle_wanted_config_active(db: Session, group_id: str, year: int, month: int, is_active: bool) -> int:
+    """일자별 원티드 제한 설정 일괄 활성/비활성 토글
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+        is_active: True면 활성화, False면 비활성화
+
+    반환:
+        변경된 레코드 수
+    """
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1)
+    else:
+        end_date = date(year, month + 1, 1)
+
+    updated = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.target_date >= start_date,
+        WantedConfig.target_date < end_date
+    ).update(
+        {WantedConfig.is_active: is_active},
+        synchronize_session=False
+    )
+    db.commit()
+    print(f"[DAILY_LIMIT] 일괄 토글: group_id={group_id}, {year}-{month:02d}, is_active={is_active}, updated={updated}")
+    return updated
 
 
 def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int, month: int, shift_date: date) -> dict:
@@ -1426,11 +1467,12 @@ def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int,
     if nurse_limit is not None and nurse_current >= nurse_limit:
         errors.append(f"간호사별 최대 요청 개수({nurse_limit}개)를 초과했습니다.")
 
-    # 2. 일자별 제한 확인 (wanted_config 테이블, DAILY_LIMIT 전용)
+    # 2. 일자별 제한 확인 (wanted_config 테이블, DAILY_LIMIT 전용, 활성 설정만)
     daily_config = db.query(WantedConfig).filter(
         WantedConfig.group_id == group_id,
         WantedConfig.target_date == shift_date,
-        WantedConfig.shift_type.is_(None)
+        WantedConfig.shift_type.is_(None),
+        WantedConfig.is_active == True
     ).first()
 
     daily_limit = daily_config.max_requests if daily_config else None

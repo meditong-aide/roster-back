@@ -37,6 +37,7 @@ from services.wanted_service import (
     get_wanted_config,
     upsert_wanted_config,
     delete_wanted_config,
+    toggle_wanted_config_active,
     validate_wanted_limits,
     get_over_limit_nurses,
     delete_excess_off_requests,
@@ -489,11 +490,13 @@ async def get_wanted_config_endpoint(
     target_date: Optional[str] = None,
     shift_type: Optional[str] = None,
     group_id: Optional[str] = None,
+    include_inactive: bool = False,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """
     일자별 원티드 제한 설정 조회
+    - include_inactive=True: 비활성(is_active=False) 포함 전체 조회
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -522,7 +525,7 @@ async def get_wanted_config_endpoint(
         filters['shift_type'] = shift_type
 
     try:
-        result = get_wanted_config(db, target_group_id, filters)
+        result = get_wanted_config(db, target_group_id, filters, include_inactive=include_inactive)
         return [WantedConfigSchema.model_validate(r) for r in result]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")
@@ -614,6 +617,50 @@ async def delete_wanted_config_endpoint(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
+
+
+@router.patch("/config/toggle")
+async def toggle_wanted_config_endpoint(
+    year: int,
+    month: int,
+    is_active: bool,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    일자별 원티드 제한 설정 일괄 활성/비활성 토글
+    - is_active=true: 해당 그룹/월의 모든 config 활성화 (복원)
+    - is_active=false: 해당 그룹/월의 모든 config 비활성화
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        updated_count = toggle_wanted_config_active(db, target_group_id, year, month, is_active)
+        return {
+            "message": f"{updated_count}건의 설정이 {'활성화' if is_active else '비활성화'}되었습니다.",
+            "updated_count": updated_count,
+            "is_active": is_active
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 토글 실패: {str(e)}")
 
 
 @router.post("/validate-limits")
