@@ -490,13 +490,11 @@ async def get_wanted_config_endpoint(
     target_date: Optional[str] = None,
     shift_type: Optional[str] = None,
     group_id: Optional[str] = None,
-    include_inactive: bool = False,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """
-    일자별 원티드 제한 설정 조회
-    - include_inactive=True: 비활성(is_active=False) 포함 전체 조회
+    일자별 원티드 제한 설정 조회 (활성 설정만)
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -525,7 +523,7 @@ async def get_wanted_config_endpoint(
         filters['shift_type'] = shift_type
 
     try:
-        result = get_wanted_config(db, target_group_id, filters, include_inactive=include_inactive)
+        result = get_wanted_config(db, target_group_id, filters)
         return [WantedConfigSchema.model_validate(r) for r in result]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")

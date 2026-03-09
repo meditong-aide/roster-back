@@ -1236,8 +1236,8 @@ def close_expired_wanted(db: Session) -> int:
 
 
 # WantedConfig 관련 서비스 함수
-def get_wanted_config(db: Session, group_id: str, filters: dict = None, include_inactive: bool = False):
-    """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용)
+def get_wanted_config(db: Session, group_id: str, filters: dict = None):
+    """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용, 활성 설정만)
 
     - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
 
@@ -1248,18 +1248,14 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None, include_
             - year, month: 해당 월의 설정 조회
             - target_date: 특정 일자 조회
             - shift_type: 근무 타입 필터
-        include_inactive: True면 비활성(is_active=False) 포함 조회
 
     반환:
-        List[WantedConfig]
+        List[WantedConfig] (is_active=True인 것만)
     """
     query = db.query(WantedConfig).filter(
-        WantedConfig.group_id == group_id
+        WantedConfig.group_id == group_id,
+        WantedConfig.is_active == True
     )
-
-    # 기본적으로 활성 설정만 조회, include_inactive=True면 전체 조회
-    if not include_inactive:
-        query = query.filter(WantedConfig.is_active == True)
 
     # 추가 필터 적용
     if filters:
