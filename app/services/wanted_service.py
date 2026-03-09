@@ -1285,6 +1285,9 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
 def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
     """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용)
 
+    - 프론트에서 보내온 날짜만 유지, 요청에 없는 기존 DB 데이터는 삭제
+    - max_requests가 None이면 해당 날짜 row 삭제
+
     인자:
         db: DB 세션
         group_id: 그룹 ID
@@ -1296,13 +1299,48 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
     if not configs_data:
         raise ValueError("설정 목록이 비어있습니다.")
 
+    # year/month 추출 (첫 번째 항목 기준)
+    first = configs_data[0]
+    first_date_str = first.get('target_date')
+    if isinstance(first_date_str, str):
+        first_date = datetime.strptime(first_date_str, '%Y-%m-%d').date()
+    else:
+        first_date = first_date_str
+    req_year = first.get('year', first_date.year)
+    req_month = first.get('month', first_date.month)
+
+    start_date = date(req_year, req_month, 1)
+    if req_month == 12:
+        end_date = date(req_year + 1, 1, 1)
+    else:
+        end_date = date(req_year, req_month + 1, 1)
+
+    # 프론트에서 보내온 target_date 목록 수집
+    incoming_dates = set()
+    for config_data in configs_data:
+        td = config_data.get('target_date')
+        if isinstance(td, str):
+            incoming_dates.add(datetime.strptime(td, '%Y-%m-%d').date())
+        elif td:
+            incoming_dates.add(td)
+
+    # 요청에 없는 기존 DB row 삭제
+    deleted_count = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.target_date >= start_date,
+        WantedConfig.target_date < end_date,
+        ~WantedConfig.target_date.in_(incoming_dates) if incoming_dates else True
+    ).delete(synchronize_session=False)
+    if deleted_count:
+        print(f"[DAILY_LIMIT] 요청에 없는 기존 설정 {deleted_count}건 삭제")
+
+    # upsert 처리
     results = []
     for config_data in configs_data:
         target_date_str = config_data.get('target_date')
         if not target_date_str:
             raise ValueError("각 설정에 target_date가 필수입니다.")
 
-        # 문자열을 date로 변환
         if isinstance(target_date_str, str):
             target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
         else:
@@ -1311,7 +1349,6 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
         year = config_data.get('year', target_date.year)
         month = config_data.get('month', target_date.month)
         shift_type = config_data.get('shift_type')
-
         max_requests = config_data.get('max_requests')
 
         existing = db.query(WantedConfig).filter(
@@ -1347,7 +1384,7 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
     db.commit()
     for r in results:
         db.refresh(r)
-    print(f"[DAILY_LIMIT] 설정 저장 완료: group_id={group_id}, count={len(results)}")
+    print(f"[DAILY_LIMIT] 설정 저장 완료: group_id={group_id}, count={len(results)}, 삭제={deleted_count}")
     return results
 
 
