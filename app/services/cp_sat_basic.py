@@ -2438,16 +2438,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 min_off_required = max(0, min(base_min_off, (T1 - T0 + 1) - vac_cnt_in_range))
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 weekend_off_bonus = int(getattr(cfg, "weekend_off_extra_off_days", 2) or 2)
-                max_off_allowed = min(
-                    min_off_required + max(0, extra_allowed), T1 - T0 + 1
-                )
                 weekend_in_range = (
                     [d for d in weekend_days if T0 <= d <= T1 and d < D_phys] if is_weekend_only else []
                 )
                 weekend_cnt = len(weekend_in_range)
                 if is_weekend_only:
                     weekend_nonvac_cnt = max(0, weekend_cnt - vac_cnt_in_range)
-                    max_off_allowed = max(max_off_allowed, weekend_nonvac_cnt)
+                    max_off_allowed = weekend_nonvac_cnt
+                else:
+                    max_off_allowed = min(
+                        min_off_required + max(0, extra_allowed), T1 - T0 + 1
+                    )
                 weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
                 print(
                     f"[WeekendOff][HardCheck] nurse_idx={n}, "
