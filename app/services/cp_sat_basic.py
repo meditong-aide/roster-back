@@ -1064,7 +1064,11 @@ class CPSATBasicEngine:
                             d = d_str
                         normalized_codes = []
                         for code in (codes or []): # codes: ['D', 'E', 'N']
-                            norm_code = _normalize_shift_code(code, shift_id_to_main)
+                            raw_code = str(code or "").strip().upper()
+                            if raw_code == "M":
+                                norm_code = "M"
+                            else:
+                                norm_code = _normalize_shift_code(raw_code, shift_id_to_main)
                             if norm_code:
                                 normalized_codes.append(norm_code)
                         init_forb.setdefault((n_idx, d), set()).update(normalized_codes)
@@ -2440,6 +2444,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     [d for d in weekend_days if T0 <= d <= T1] if is_weekend_only else []
                 )
                 weekend_cnt = len(weekend_in_range)
+                if is_weekend_only:
+                    weekend_nonvac_cnt = max(0, weekend_cnt - vac_cnt_in_range)
+                    max_off_allowed = max(max_off_allowed, weekend_nonvac_cnt)
                 weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
                 print(
                     f"[WeekendOff][HardCheck] nurse_idx={n}, "

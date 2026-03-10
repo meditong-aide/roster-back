@@ -1748,23 +1748,7 @@ def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, s
     return code2main
 
 
-def _normalize_allowed_shift_types(raw_value: object) -> set[str]:
-    """간호사 row의 '허용 근무유형(D/E/N) 리스트'를 정규화한다.
-
-    정책:
-        - [] 또는 None: 제한 없음(= D/E/N 모두 가능)
-        - ["N"], ["D","E"], ["D","N"] 등: 해당 코드만 가능
-        - 기존 레거시 int/boolean 기반 night 전담 값은 **무시**한다.
-
-    Args:
-        raw_value: DB에 저장된 값(JSON). 기대 형태는 List[str] 또는 None.
-
-    Returns:
-        허용 코드 집합. 빈 집합이면 "제한 없음"을 의미한다.
-
-    Raises:
-        ValueError: 리스트에 D/E/N 이외의 코드가 섞여있을 때
-    """
+def _normalize_allowed_shift_types(raw_value: object, use_mid: bool = False) -> set[str]:
     if raw_value is None:
         return set()
     # 레거시 타입은 무시(요구사항: 기존 is_night_nurse 의미는 무시)
@@ -1773,18 +1757,25 @@ def _normalize_allowed_shift_types(raw_value: object) -> set[str]:
     if not isinstance(raw_value, list):
         return set()
 
+    valid_codes = {"D", "E", "N"}
+    if bool(use_mid):
+        valid_codes.add("M")
+
     allowed: set[str] = set()
     invalid: set[str] = set()
     for item in raw_value:
         code = str(item).strip().upper()
         if not code:
             continue
-        if code in {"D", "E", "N"}:
+        if code in valid_codes:
             allowed.add(code)
         else:
             invalid.add(code)
     if invalid:
-        raise ValueError(f"허용 근무유형 값이 올바르지 않습니다: {sorted(invalid)} (허용: D/E/N)")
+        print(
+            f"[AllowedShiftTypes] 허용 근무유형 무시: invalid={sorted(invalid)}, "
+            f"allowed={sorted(valid_codes)}"
+        )
     return allowed
 
 
@@ -1804,11 +1795,13 @@ def build_allowed_shift_type_constraints(
     month: int,
     shift_manage_data: list[dict] | None,
     fixed_cells: list[dict] | None,
+    use_mid: bool,
 ) -> dict:
     """간호사별 허용 근무유형(D/E/N) 하드 제약을 forbidden 형태로 생성한다.
 
     목표:
-        - 간호사 row에 저장된 허용 목록에 따라, 허용되지 않은 D/E/N 배정을 전일(day_idx 전체)에 대해 금지한다.
+        - 간호사 row에 저장된 허용 목록에 따라, 허용되지 않은 D/E/N(및 use_mid=True이면 M) 배정을
+          전일(day_idx 전체)에 대해 금지한다.
         - OFF(O)는 항상 가능하도록 금지 대상에서 제외한다.
         - fixed_cells(고정셀)가 허용 목록과 충돌하면 해당 날짜만 예외로 두고 진행한다.
 
@@ -1820,13 +1813,19 @@ def build_allowed_shift_type_constraints(
         return {"forced_off": {}, "forbidden": {}}
 
     code2main = _build_code_to_main_map(shift_manage_data)
+    allowed_main_codes = {"D", "E", "N"}
+    if bool(use_mid):
+        allowed_main_codes.add("M")
     nurse_id_to_allowed: dict[str, set[str]] = {}
 
     for n in nurses_in_group:
         nurse_id = str(getattr(n, "nurse_id", "") or "")
         if not nurse_id:
             continue
-        allowed = _normalize_allowed_shift_types(getattr(n, "is_night_nurse", None))
+        allowed = _normalize_allowed_shift_types(
+            getattr(n, "is_night_nurse", None),
+            use_mid=bool(use_mid),
+        )
         nurse_id_to_allowed[nurse_id] = allowed
 
     # ── 고정셀 충돌은 예외 처리(고정 우선) ──
@@ -1841,7 +1840,7 @@ def build_allowed_shift_type_constraints(
             except Exception:
                 continue
             fixed_main = _normalize_shift_to_main(c.get("shift"), code2main)
-            if fixed_main not in {"D", "E", "N"}:
+            if fixed_main not in allowed_main_codes:
                 continue  # O는 항상 가능
             nurse_id = idx_to_nurse_id.get(n_idx)
             if not nurse_id:
@@ -1866,13 +1865,11 @@ def build_allowed_shift_type_constraints(
                 )
 
     forbidden: dict[str, dict[int, list[str]]] = {}
-    all_codes = {"D", "E", "N"}
+    all_codes = set(allowed_main_codes)
     for nurse_id, allowed in nurse_id_to_allowed.items():
         if not allowed:
             continue  # 제한 없음
         disallowed_set = set(all_codes - set(allowed))
-        if allowed:
-            disallowed_set.add("M")
         disallowed = sorted(disallowed_set)
         if not disallowed:
             continue
@@ -2087,6 +2084,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         month=req.month,
         shift_manage_data=shift_manage_data,
         fixed_cells=config_dict.get("fixed_cells"),
+        use_mid=bool(config_dict.get("use_mid", False)),
     )
 
     # ── 2) cross-month 경계 제약 생성 ──
