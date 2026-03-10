@@ -4,7 +4,7 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
 from sqlalchemy.orm import Session
-from db.models import Nurse as NurseModel, Group, DeletedNurseHistory
+from db.models import Nurse as NurseModel, Group, DeletedNurseHistory, RosterConfig as RosterConfigModel, Shift
 from schemas.roster_schema import NurseProfile
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any
@@ -14,6 +14,20 @@ from dateutil.parser import parse as parse_date
 from db.client2 import msdb_manager
 from datalayer.member import Member
 import logging
+
+def _get_display_flags(db: Session, group_id: str) -> dict:
+    """그룹의 최신 roster_config에서 show_level, show_preceptor 플래그 조회"""
+    config = (
+        db.query(RosterConfigModel)
+        .filter(RosterConfigModel.group_id == group_id)
+        .order_by(RosterConfigModel.created_at.desc())
+        .first()
+    )
+    return {
+        "show_level": getattr(config, "show_level", True) if config else True,
+        "show_preceptor": getattr(config, "show_preceptor", True) if config else True,
+    }
+
 
 def get_personnel_basic_info_service(current_user, db: Session):
     """
@@ -70,6 +84,9 @@ def get_nurses_in_group_service(
     # nurse_id로 필터링했는데 결과가 없으면 예외
     if nurse_id and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+
+    # roster_config에서 표시 설정 플래그 조회
+    display_flags = _get_display_flags(db, current_user.group_id)
 
     # 만 나이 계산
     current_date = date.today()
@@ -128,6 +145,8 @@ def get_nurses_in_group_service(
             "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
             "enable_aide": nurse.enable_aide,
             "wanted_max_requests": nurse.wanted_max_requests,
+            # 근무표 설정 메타 플래그
+            **display_flags,
         }
         result.append(nurse_dict)
 
@@ -171,6 +190,10 @@ def get_nurses_filtered_service(
     # nurse_id로 필터링했는데 결과가 없으면 예외
     if nurse_id is not None and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+
+    # roster_config에서 표시 설정 플래그 조회 (ADM: group_id 파라미터 우선, 없으면 첫 번째 간호사의 group_id 사용)
+    target_gid = group_id or (nurses[0].group_id if nurses else None)
+    display_flags = _get_display_flags(db, target_gid) if target_gid else {"show_level": True, "show_preceptor": True}
 
     # 만 나이 계산
     current_date = date.today()
@@ -228,6 +251,8 @@ def get_nurses_filtered_service(
             "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
             "enable_aide": nurse.enable_aide,
             "wanted_max_requests": nurse.wanted_max_requests,
+            # 근무표 설정 메타 플래그
+            **display_flags,
         }
         result.append(nurse_dict)
 
@@ -384,8 +409,27 @@ def bulk_update_nurses_service(
         .all()
     }
 
+    # use_mid 여부 조회 (최신 roster_config 기준)
+    latest_config = (
+        db.query(RosterConfigModel)
+        .filter(RosterConfigModel.group_id == target_group_id)
+        .order_by(RosterConfigModel.created_at.desc())
+        .first()
+    )
+    use_mid = bool(getattr(latest_config, "use_mid", False)) if latest_config else False
+    ALL_SHIFTS = {"D", "E", "N", "M"} if use_mid else {"D", "E", "N"}
+
+    # shift_id → 상위 그룹(D/E/N/M) 매핑 (shift_gb 기준)
+    SHIFT_GB_MAP = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
+    shift_to_group = {}
+    group_shifts = db.query(Shift.shift_id, Shift.shift_gb).filter(
+        Shift.group_id == target_group_id
+    ).all()
+    for sid, sgb in group_shifts:
+        if sgb and sgb in SHIFT_GB_MAP:
+            shift_to_group[sid] = SHIFT_GB_MAP[sgb]
+
     updated_count = 0
-    ALL_SHIFTS = {"D","E","N"}
 
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
@@ -411,12 +455,10 @@ def bulk_update_nurses_service(
                 if hasattr(db_nurse, key):
                     setattr(db_nurse, key, value)
 
-            # === 후처리: is_night_nurse (3개 전체 선택 시 빈 배열) ===
+            # === 후처리: is_night_nurse (None → 빈 배열) ===
             if 'is_night_nurse' in update_data:
                 night_shifts = update_data['is_night_nurse']
-                if isinstance(night_shifts, list) and set(night_shifts) == ALL_SHIFTS:
-                    db_nurse.is_night_nurse = []
-                elif night_shifts is None:
+                if night_shifts is None:
                     db_nurse.is_night_nurse = []
 
             # === 후처리: work_shifts (None → 빈 배열) ===

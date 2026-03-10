@@ -37,6 +37,7 @@ from services.wanted_service import (
     get_wanted_config,
     upsert_wanted_config,
     delete_wanted_config,
+    delete_wanted_config_by_month,
     validate_wanted_limits,
     get_over_limit_nurses,
     delete_excess_off_requests,
@@ -493,7 +494,7 @@ async def get_wanted_config_endpoint(
     db: Session = Depends(get_db)
 ):
     """
-    일자별 원티드 제한 설정 조회
+    일자별 원티드 제한 설정 조회 (활성 설정만)
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -532,6 +533,8 @@ async def get_wanted_config_endpoint(
 async def upsert_wanted_config_endpoint(
     config_data: List[WantedConfigCreate],
     group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
@@ -560,7 +563,7 @@ async def upsert_wanted_config_endpoint(
 
     try:
         configs_list = [c.model_dump(exclude_unset=True) for c in config_data]
-        results = upsert_wanted_config(db, target_group_id, configs_list)
+        results = upsert_wanted_config(db, target_group_id, configs_list, year=year, month=month)
         return [WantedConfigSchema.model_validate(r) for r in results]
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -611,6 +614,48 @@ async def delete_wanted_config_endpoint(
         return {
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
+
+
+@router.delete("/config/toggle")
+async def delete_wanted_config_by_month_endpoint(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    일자별 원티드 제한 설정 일괄 삭제 (OFF 처리)
+    - 해당 그룹/월의 모든 config 행을 삭제
+    - 다시 ON 시에는 POST /config로 신규 데이터만 추가
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    try:
+        deleted_count = delete_wanted_config_by_month(db, target_group_id, year, month)
+        return {
+            "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
+            "deleted_count": deleted_count,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")

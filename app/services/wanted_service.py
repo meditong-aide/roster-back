@@ -1237,7 +1237,7 @@ def close_expired_wanted(db: Session) -> int:
 
 # WantedConfig 관련 서비스 함수
 def get_wanted_config(db: Session, group_id: str, filters: dict = None):
-    """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용)
+    """일자별 원티드 제한 설정 조회 (DAILY_LIMIT 전용, 활성 설정만)
 
     - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
 
@@ -1253,7 +1253,7 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
         List[WantedConfig]
     """
     query = db.query(WantedConfig).filter(
-        WantedConfig.group_id == group_id
+        WantedConfig.group_id == group_id,
     )
 
     # 추가 필터 적용
@@ -1282,27 +1282,80 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
     return query.all()
 
 
-def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
+def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict], year: int | None = None, month: int | None = None):
     """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용)
+
+    - 프론트에서 보내온 날짜만 유지, 요청에 없는 기존 DB 데이터는 삭제
+    - max_requests가 None이면 해당 날짜 row 삭제
+    - configs_data가 빈 리스트면 해당 월 설정 전체 삭제
 
     인자:
         db: DB 세션
         group_id: 그룹 ID
         configs_data: 설정 데이터 리스트
+        year: 대상 연도 (configs_data가 빈 리스트일 때 필수)
+        month: 대상 월 (configs_data가 빈 리스트일 때 필수)
 
     반환:
         List[WantedConfig]
     """
     if not configs_data:
-        raise ValueError("설정 목록이 비어있습니다.")
+        if not year or not month:
+            return []
+        start_date = date(year, month, 1)
+        end_date = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        deleted_count = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.target_date >= start_date,
+            WantedConfig.target_date < end_date,
+        ).delete(synchronize_session=False)
+        if deleted_count:
+            print(f"[DAILY_LIMIT] 빈 요청으로 기존 설정 {deleted_count}건 전체 삭제")
+        db.commit()
+        return []
 
+    # year/month 추출 (첫 번째 항목 기준)
+    first = configs_data[0]
+    first_date_str = first.get('target_date')
+    if isinstance(first_date_str, str):
+        first_date = datetime.strptime(first_date_str, '%Y-%m-%d').date()
+    else:
+        first_date = first_date_str
+    req_year = first.get('year', first_date.year)
+    req_month = first.get('month', first_date.month)
+
+    start_date = date(req_year, req_month, 1)
+    if req_month == 12:
+        end_date = date(req_year + 1, 1, 1)
+    else:
+        end_date = date(req_year, req_month + 1, 1)
+
+    # 프론트에서 보내온 target_date 목록 수집
+    incoming_dates = set()
+    for config_data in configs_data:
+        td = config_data.get('target_date')
+        if isinstance(td, str):
+            incoming_dates.add(datetime.strptime(td, '%Y-%m-%d').date())
+        elif td:
+            incoming_dates.add(td)
+
+    # 요청에 없는 기존 DB row 삭제
+    deleted_count = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.target_date >= start_date,
+        WantedConfig.target_date < end_date,
+        ~WantedConfig.target_date.in_(incoming_dates) if incoming_dates else True
+    ).delete(synchronize_session=False)
+    if deleted_count:
+        print(f"[DAILY_LIMIT] 요청에 없는 기존 설정 {deleted_count}건 삭제")
+
+    # upsert 처리
     results = []
     for config_data in configs_data:
         target_date_str = config_data.get('target_date')
         if not target_date_str:
             raise ValueError("각 설정에 target_date가 필수입니다.")
 
-        # 문자열을 date로 변환
         if isinstance(target_date_str, str):
             target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
         else:
@@ -1311,6 +1364,7 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
         year = config_data.get('year', target_date.year)
         month = config_data.get('month', target_date.month)
         shift_type = config_data.get('shift_type')
+        max_requests = config_data.get('max_requests')
 
         existing = db.query(WantedConfig).filter(
             WantedConfig.group_id == group_id,
@@ -1318,8 +1372,15 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
             WantedConfig.shift_type == shift_type
         ).first()
 
+        # max_requests가 None이면 해당 row 삭제
+        if max_requests is None:
+            if existing:
+                db.delete(existing)
+                print(f"[DAILY_LIMIT] 설정 삭제: target_date={target_date}, shift_type={shift_type}")
+            continue
+
         if existing:
-            existing.max_requests = config_data.get('max_requests', 0)
+            existing.max_requests = max_requests
             existing.year = year
             existing.month = month
             results.append(existing)
@@ -1330,7 +1391,7 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
                 month=month,
                 target_date=target_date,
                 shift_type=shift_type,
-                max_requests=config_data.get('max_requests', 0)
+                max_requests=max_requests,
             )
             db.add(config)
             results.append(config)
@@ -1338,8 +1399,9 @@ def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
     db.commit()
     for r in results:
         db.refresh(r)
-    print(f"[DAILY_LIMIT] 설정 저장 완료: group_id={group_id}, count={len(results)}")
+    print(f"[DAILY_LIMIT] 설정 저장 완료: group_id={group_id}, count={len(results)}, 삭제={deleted_count}")
     return results
+
 
 
 def delete_wanted_config(db: Session, group_id: str, filters: dict = None) -> int:
@@ -1376,6 +1438,34 @@ def delete_wanted_config(db: Session, group_id: str, filters: dict = None) -> in
     deleted = query.delete()
     db.commit()
     print(f"[DAILY_LIMIT] 설정 삭제: group_id={group_id}, deleted={deleted}")
+    return deleted
+
+
+def delete_wanted_config_by_month(db: Session, group_id: str, year: int, month: int) -> int:
+    """해당 그룹/월의 일자별 원티드 제한 설정 전체 삭제
+
+    인자:
+        db: DB 세션
+        group_id: 그룹 ID
+        year: 연도
+        month: 월
+
+    반환:
+        삭제된 레코드 수
+    """
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1)
+    else:
+        end_date = date(year, month + 1, 1)
+
+    deleted = db.query(WantedConfig).filter(
+        WantedConfig.group_id == group_id,
+        WantedConfig.target_date >= start_date,
+        WantedConfig.target_date < end_date
+    ).delete(synchronize_session=False)
+    db.commit()
+    print(f"[DAILY_LIMIT] 일괄 삭제: group_id={group_id}, {year}-{month:02d}, deleted={deleted}")
     return deleted
 
 
@@ -1426,11 +1516,11 @@ def validate_wanted_limits(db: Session, nurse_id: str, group_id: str, year: int,
     if nurse_limit is not None and nurse_current >= nurse_limit:
         errors.append(f"간호사별 최대 요청 개수({nurse_limit}개)를 초과했습니다.")
 
-    # 2. 일자별 제한 확인 (wanted_config 테이블, DAILY_LIMIT 전용)
+    # 2. 일자별 제한 확인 (wanted_config 테이블, DAILY_LIMIT 전용, 활성 설정만)
     daily_config = db.query(WantedConfig).filter(
         WantedConfig.group_id == group_id,
         WantedConfig.target_date == shift_date,
-        WantedConfig.shift_type.is_(None)
+        WantedConfig.shift_type.is_(None),
     ).first()
 
     daily_limit = daily_config.max_requests if daily_config else None
