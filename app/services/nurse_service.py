@@ -455,17 +455,10 @@ def bulk_update_nurses_service(
                 if hasattr(db_nurse, key):
                     setattr(db_nurse, key, value)
 
-            # === 후처리: is_night_nurse (전체 선택 시 빈 배열) ===
-            # 각 shift_id를 상위 그룹(D/E/N/M)으로 정규화 후 중복 제거
-            # use_mid=False: D,E,N 3종 전부 선택 시 빈 배열
-            # use_mid=True:  D,E,N,M 4종 전부 선택 시 빈 배열
+            # === 후처리: is_night_nurse (None → 빈 배열) ===
             if 'is_night_nurse' in update_data:
                 night_shifts = update_data['is_night_nurse']
-                if isinstance(night_shifts, list) and night_shifts:
-                    normalized = {shift_to_group.get(s, s) for s in night_shifts}
-                    if normalized == ALL_SHIFTS:
-                        db_nurse.is_night_nurse = []
-                elif night_shifts is None:
+                if night_shifts is None:
                     db_nurse.is_night_nurse = []
 
             # === 후처리: work_shifts (None → 빈 배열) ===
