@@ -533,6 +533,8 @@ async def get_wanted_config_endpoint(
 async def upsert_wanted_config_endpoint(
     config_data: List[WantedConfigCreate],
     group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
@@ -561,7 +563,7 @@ async def upsert_wanted_config_endpoint(
 
     try:
         configs_list = [c.model_dump(exclude_unset=True) for c in config_data]
-        results = upsert_wanted_config(db, target_group_id, configs_list)
+        results = upsert_wanted_config(db, target_group_id, configs_list, year=year, month=month)
         return [WantedConfigSchema.model_validate(r) for r in results]
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

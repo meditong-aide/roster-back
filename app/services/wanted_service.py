@@ -1282,22 +1282,37 @@ def get_wanted_config(db: Session, group_id: str, filters: dict = None):
     return query.all()
 
 
-def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict]):
+def upsert_wanted_config(db: Session, group_id: str, configs_data: list[dict], year: int | None = None, month: int | None = None):
     """일자별 원티드 제한 설정 생성/수정 (DAILY_LIMIT 전용)
 
     - 프론트에서 보내온 날짜만 유지, 요청에 없는 기존 DB 데이터는 삭제
     - max_requests가 None이면 해당 날짜 row 삭제
+    - configs_data가 빈 리스트면 해당 월 설정 전체 삭제
 
     인자:
         db: DB 세션
         group_id: 그룹 ID
         configs_data: 설정 데이터 리스트
+        year: 대상 연도 (configs_data가 빈 리스트일 때 필수)
+        month: 대상 월 (configs_data가 빈 리스트일 때 필수)
 
     반환:
         List[WantedConfig]
     """
     if not configs_data:
-        raise ValueError("설정 목록이 비어있습니다.")
+        if not year or not month:
+            return []
+        start_date = date(year, month, 1)
+        end_date = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        deleted_count = db.query(WantedConfig).filter(
+            WantedConfig.group_id == group_id,
+            WantedConfig.target_date >= start_date,
+            WantedConfig.target_date < end_date,
+        ).delete(synchronize_session=False)
+        if deleted_count:
+            print(f"[DAILY_LIMIT] 빈 요청으로 기존 설정 {deleted_count}건 전체 삭제")
+        db.commit()
+        return []
 
     # year/month 추출 (첫 번째 항목 기준)
     first = configs_data[0]
