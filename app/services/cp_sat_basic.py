@@ -34,7 +34,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
     WEEK_OFF_SHORT_PENALTY,
 )
-from services.cp_sat.objective_terms import build_main_objective_terms
+from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set
 from services.cp_sat.fallback_lex import optimize_fallback_lex_hard_first
 from services.cp_sat.night_distribution_log import log_n_even_distribution
 from services.cp_sat.lookahead_helpers import (
@@ -1635,6 +1635,31 @@ class CPSATBasicEngine:
         roster_system.roster = best_roster
         log_n_even_distribution(roster_system, self.logger_prefix)
         if best_viol > 0:
+            try:
+                violations = [
+                    v for v in roster_system._find_violations()
+                    if v.get('type') in HARD_TYPES
+                ]
+                by_type: dict[str, int] = {}
+                for v in violations:
+                    t = str(v.get('type') or 'unknown')
+                    by_type[t] = by_type.get(t, 0) + 1
+                print(
+                    f"{self.logger_prefix} [HardViolations] total={len(violations)}, by_type={by_type}"
+                )
+                if by_type.get('shift_requirement', 0) > 0:
+                    _log_shift_requirement_gaps(roster_system)
+                for v in violations[:12]:
+                    nurse_name = v.get('nurse_name') or v.get('name') or '?'
+                    nurse_id = v.get('nurse_id') or '?'
+                    day = v.get('day')
+                    detail = v.get('detail') or v.get('message') or ''
+                    print(
+                        f"{self.logger_prefix} [HardViolations] "
+                        f"type={v.get('type')}, nurse={nurse_name}({nurse_id}), day={day}, detail={detail}"
+                    )
+            except Exception as e:
+                print(f"{self.logger_prefix} [HardViolations] logging failed: {e}")
             print(
                 f"{self.logger_prefix} [Progress] 종료: best_viol={best_viol}, "
                 f"max_iter={max_iter}, per_iter={per_iter}s"
@@ -2015,31 +2040,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     forced_off_cap_excluded: set[tuple[int, int]] = set(vacation_off_cells)
 
     # N 금지 간호사 판별(모든 근무일에 N이 금지된 경우)
-    n_forbid_n: set[int] = set()
-    if initial_forbidden:
-        try:
-            n_idx_night = rs.config.shift_types.index("N")
-        except ValueError:
-            n_idx_night = None
-        fixed_n_by_nurse: dict[int, set[int]] = {}
-        if n_idx_night is not None:
-            for (n_idx, d_idx), s_idx in fixed.items():
-                if s_idx == n_idx_night:
-                    fixed_n_by_nurse.setdefault(n_idx, set()).add(d_idx)
-        for n in range(N):
-            t0, t1 = join[n], leave[n]
-            if t0 > t1:
-                continue
-            if n_idx_night is not None and fixed_n_by_nurse.get(n):
-                continue
-            active_days = range(t0, t1 + 1)
-            n_forbid_cnt = sum(
-                1
-                for d in active_days
-                if "N" in initial_forbidden.get((n, d), set())
-            )
-            if n_forbid_cnt == (t1 - t0 + 1):
-                n_forbid_n.add(n)
+    n_forbid_n: set[int] = _n_forbid_n_set(rs, join, leave)
     if n_forbid_n:
         try:
             n_forbid_list = [
@@ -2418,7 +2419,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 fixed_off_days = sorted(
                     d + 1
                     for (n_idx, d) in forced_off_cells
-                    if n_idx == n and T0 <= d <= T1
+                    if n_idx == n and T0 <= d <= T1 and d < D_phys
                 )
                 cap_excluded_days = sorted(
                     d + 1
@@ -2441,7 +2442,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     min_off_required + max(0, extra_allowed), T1 - T0 + 1
                 )
                 weekend_in_range = (
-                    [d for d in weekend_days if T0 <= d <= T1] if is_weekend_only else []
+                    [d for d in weekend_days if T0 <= d <= T1 and d < D_phys] if is_weekend_only else []
                 )
                 weekend_cnt = len(weekend_in_range)
                 if is_weekend_only:
@@ -2480,6 +2481,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 print(f"[WeekendOff][HardCheck] 로깅 실패: {e}")
             # print('nu!!!!!', nu.__dict__)
             for d in range(T0, T1 + 1):
+                if bool(getattr(nu, "is_weekend_off", False)) and d >= D_phys:
+                    continue
                 if d in weekend_days:
                     # 주말(토/일): 기본 OFF 강제
                     # 단, 고정 셀이 근무로 지정되어 있으면(예: 특수 근무/교육 등) 고정이 우선이다.
@@ -2882,6 +2885,9 @@ def _solve_neighbourhood(
     st = solver.Solve(model)
     status_text = _cp_sat_status_to_text(st)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        if not bool(getattr(rs, "_infeasible_n_diag_logged", False)):
+            _log_infeasible_n_capacity(rs, j, l, fixed)
+            rs._infeasible_n_diag_logged = True
         return False, status_text
 
     # 반영
@@ -2890,6 +2896,121 @@ def _solve_neighbourhood(
             for s in range(S):
                 rs.roster[n,d,s]=1 if solver.Value(X(n,d,s)) else 0
     return True, status_text
+
+
+def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dict[tuple[int, int], int]) -> None:
+    try:
+        cfg = rs.config
+        if "N" not in cfg.shift_types:
+            return
+        night_idx = cfg.shift_types.index("N")
+        d_phys = rs.num_days
+        d_ext = max(leave) + 1 if leave else d_phys
+        initial_forbidden = getattr(rs, "initial_forbidden", {})
+        if not isinstance(initial_forbidden, dict):
+            initial_forbidden = {}
+
+        def need_n(d: int) -> int:
+            if (
+                d < d_phys
+                and hasattr(cfg, "daily_shift_requirements_by_day")
+                and isinstance(cfg.daily_shift_requirements_by_day, list)
+                and d < len(cfg.daily_shift_requirements_by_day)
+                and isinstance(cfg.daily_shift_requirements_by_day[d], dict)
+            ):
+                return int((cfg.daily_shift_requirements_by_day[d] or {}).get("N", 0) or 0)
+            if d < d_phys:
+                return int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
+            head = getattr(cfg, "next_month_head_requirements", None)
+            i = d - d_phys
+            if isinstance(head, list) and i < len(head) and isinstance(head[i], dict):
+                return int((head[i] or {}).get("N", 0) or 0)
+            return int((cfg.daily_shift_requirements or {}).get("N", 0) or 0)
+
+        fixed_n_by_day = [0] * max(0, d_ext)
+        for (n, d), s_idx in (fixed or {}).items():
+            if 0 <= d < d_ext and s_idx == night_idx:
+                fixed_n_by_day[d] += 1
+
+        deficits: list[tuple[int, int, int, int]] = []
+        for d in range(d_ext):
+            req = max(0, need_n(d) - fixed_n_by_day[d])
+            if req <= 0:
+                continue
+            cap = 0
+            for n in range(len(rs.nurses)):
+                t0, t1 = join[n], leave[n]
+                if d < t0 or d > t1:
+                    continue
+                fixed_shift = fixed.get((n, d))
+                if fixed_shift is not None:
+                    if fixed_shift == night_idx:
+                        cap += 1
+                    continue
+                raw = getattr(rs.nurses[n], "is_night_nurse", None)
+                if isinstance(raw, list):
+                    allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                    if allowed and "N" not in allowed:
+                        continue
+                elif raw == 3 or (raw is not None and raw not in (0, False)):
+                    pass
+                if "N" in initial_forbidden.get((n, d), set()):
+                    continue
+                cap += 1
+            if cap < req:
+                deficits.append((d + 1, req, cap, fixed_n_by_day[d]))
+
+        if deficits:
+            print(
+                "[CP-SAT-Basic][Diag][N-Capacity] 일자별 N 수요 대비 가능 인원 부족 감지: "
+                f"count={len(deficits)}"
+            )
+            for day_1, req, cap, fixed_n in deficits[:12]:
+                print(
+                    "[CP-SAT-Basic][Diag][N-Capacity] "
+                    f"day={day_1}, req_after_fixed={req}, cap={cap}, fixed_n={fixed_n}"
+                )
+        else:
+            print("[CP-SAT-Basic][Diag][N-Capacity] 일자별 N 수요 대비 인원 부족은 없음")
+    except Exception as exc:
+        print(f"[CP-SAT-Basic][Diag][N-Capacity] 분석 실패: {exc}")
+
+
+def _log_shift_requirement_gaps(rs) -> None:
+    try:
+        cfg = rs.config
+        shift_types = list(getattr(cfg, "shift_types", []) or [])
+        if not shift_types:
+            return
+        ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+        gaps: list[tuple[int, str, int, int]] = []
+        for d in range(rs.num_days):
+            if isinstance(ds_by_day, list) and d < len(ds_by_day) and isinstance(ds_by_day[d], dict):
+                need_map = ds_by_day[d]
+            else:
+                need_map = base_req
+            for code, req_val in (need_map or {}).items():
+                s_code = str(code or "").strip().upper()
+                if s_code not in shift_types:
+                    continue
+                req = int(req_val or 0)
+                if req <= 0:
+                    continue
+                s_idx = shift_types.index(s_code)
+                assigned = int(sum(int(rs.roster[n, d, s_idx]) for n in range(len(rs.nurses))))
+                if assigned < req:
+                    gaps.append((d + 1, s_code, req, assigned))
+        if gaps:
+            print(f"[CP-SAT-Basic][Diag][ShiftGap] 부족 셀={len(gaps)}")
+            for day_1, code, req, assigned in gaps[:20]:
+                print(
+                    f"[CP-SAT-Basic][Diag][ShiftGap] day={day_1}, shift={code}, req={req}, assigned={assigned}, shortage={req-assigned}"
+                )
+        else:
+            print("[CP-SAT-Basic][Diag][ShiftGap] shift_requirement 부족 없음")
+    except Exception as exc:
+        print(f"[CP-SAT-Basic][Diag][ShiftGap] 분석 실패: {exc}")
 
 
 def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
