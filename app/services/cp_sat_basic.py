@@ -52,8 +52,13 @@ from services.cp_sat.off_policy import (
     off_cap_semantics_label,
     resolve_effective_off_days,
 )
+from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
 
 logger = logging.getLogger(__name__)
+
+
+def _allowed_shift_codes(raw) -> set[str]:
+    return normalize_allowed_shift_codes(raw, use_mid=True)
 
 
 # ─────────────────────────────  RL Neighborhood  ─────────────────────────
@@ -247,6 +252,7 @@ def _log_weekend_off_enforcement_once(
     join: list[int],
     leave: list[int],
     weekend_days: set[int],
+    d_phys: int,
     fixed: dict[tuple[int, int], int],
     off_idx: int | None,
     logger_prefix: str,
@@ -263,8 +269,10 @@ def _log_weekend_off_enforcement_once(
         if not bool(getattr(nu, "is_weekend_off", False)):
             continue
         t0, t1 = join[n], leave[n]
-        weekend_in_range = [d for d in sorted(weekend_days) if t0 <= d <= t1]
+        weekend_in_range_all = [d for d in sorted(weekend_days) if t0 <= d <= t1]
+        weekend_in_range = [d for d in weekend_in_range_all if d < d_phys]
         weekend_days_1based = [d + 1 for d in weekend_in_range]
+        lookahead_weekend_days_1based = [d + 1 for d in weekend_in_range_all if d >= d_phys]
         forced_days = []
         skipped_fixed_days = []
         for d in weekend_in_range:
@@ -278,6 +286,7 @@ def _log_weekend_off_enforcement_once(
             f"{logger_prefix} [WeekendOff][Enforce] nurse_idx={n}, "
             f"nurse_id={nurse_id}, name={nurse_name}, "
             f"weekend_days={weekend_days_1based}, "
+            f"lookahead_weekend_days={lookahead_weekend_days_1based}, "
             f"forced_off_days={forced_days}, "
             f"skipped_fixed_days={skipped_fixed_days}"
         )
@@ -2391,6 +2400,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         join=join,
         leave=leave,
         weekend_days=weekend_days,
+        d_phys=D_phys,
         fixed=fixed,
         off_idx=off,
         logger_prefix="[CP-SAT-Basic]",
@@ -2408,7 +2418,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         #   기존 고정이 우선이며 주말 OFF 강제를 덮어쓰지 않는다.
         if bool(getattr(nu, "is_weekend_off", False)) and getattr(cfg, "weekend_off_only_enable", True):
             try:
-                weekend_in_range = [d for d in weekend_days if T0 <= d <= T1]
+                weekend_in_range_all = [d for d in weekend_days if T0 <= d <= T1]
+                weekend_in_range = [d for d in weekend_in_range_all if d < D_phys]
                 weekend_cnt = len(weekend_in_range)
                 vac_cnt_in_range = sum(1 for d in weekend_in_range if (n, d) in vacation_off_cells)
                 off_exception_days = sorted(
@@ -2437,13 +2448,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 # 휴가/공가는 최소 OFF에서 제외 (coverage 혼동 방지)
                 min_off_required = max(0, min(base_min_off, (T1 - T0 + 1) - vac_cnt_in_range))
                 extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
-                weekend_off_bonus = int(getattr(cfg, "weekend_off_extra_off_days", 2) or 2)
-                weekend_in_range = (
-                    [d for d in weekend_days if T0 <= d <= T1 and d < D_phys] if is_weekend_only else []
-                )
                 weekend_cnt = len(weekend_in_range)
                 if is_weekend_only:
                     weekend_nonvac_cnt = max(0, weekend_cnt - vac_cnt_in_range)
+                    min_off_required = weekend_nonvac_cnt
                     max_off_allowed = weekend_nonvac_cnt
                 else:
                     max_off_allowed = min(
@@ -2463,6 +2471,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 print(
                     f"[WeekendOff][HardCheck][OFF-DETAIL] "
                     f"weekend_days={[(d + 1) for d in weekend_in_range]}, "
+                    f"lookahead_weekend_days={[(d + 1) for d in weekend_in_range_all if d >= D_phys]}, "
                     f"weekly_off_days={weekly_off_days}, "
                     f"off_exception_days={off_exception_days}, "
                     f"fixed_off_days={fixed_off_days}, "
@@ -2557,25 +2566,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         is_n_only = False
         raw = getattr(nu, "is_night_nurse", None)
-        if isinstance(raw, list):
-            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+        allowed = _allowed_shift_codes(raw)
+        if allowed:
             is_n_only = allowed == {"N"}
-            if allowed:
-                for d in range(T0, T1 + 1):
-                    if "D" not in allowed:
-                        m.Add(X(n, d, day) == 0)
-                    if "E" not in allowed:
-                        m.Add(X(n, d, eve) == 0)
-                    if "N" not in allowed:
-                        m.Add(X(n, d, night) == 0)
-                    if mid is not None:
-                        m.Add(X(n, d, mid) == 0)
-        elif raw == 3 or (raw is not None and raw != 0 and raw != False):
-            is_n_only = True
             for d in range(T0, T1 + 1):
-                m.Add(X(n, d, day) == 0)
-                m.Add(X(n, d, eve) == 0)
-                if mid is not None:
+                if "D" not in allowed:
+                    m.Add(X(n, d, day) == 0)
+                if "E" not in allowed:
+                    m.Add(X(n, d, eve) == 0)
+                if "N" not in allowed:
+                    m.Add(X(n, d, night) == 0)
+                if mid is not None and "M" not in allowed:
                     m.Add(X(n, d, mid) == 0)
 
         if n not in n_forbid_n:
@@ -2729,6 +2730,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         )
         fixed_off_lookahead = {
             (n, d) for (n, d) in structural_off_cells if d >= D_phys
+        }
+        fixed_off_lookahead = {
+            (n, d)
+            for (n, d) in fixed_off_lookahead
+            if not bool(getattr(rs.nurses[n], "is_weekend_off", False))
         }
         def _get_need_for_day(d_val):
             if d_val >= D_phys and isinstance(next_month_head_req, list) and (d_val - D_phys) < len(next_month_head_req):
@@ -2953,8 +2959,6 @@ def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dic
                     allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
                     if allowed and "N" not in allowed:
                         continue
-                elif raw == 3 or (raw is not None and raw not in (0, False)):
-                    pass
                 if "N" in initial_forbidden.get((n, d), set()):
                     continue
                 cap += 1

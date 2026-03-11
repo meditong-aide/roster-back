@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from services.cp_sat.objective_terms import _n_forbid_n_set
+from services.cp_sat.allowed_shift_types import is_n_only_profile
 
 
 def log_n_even_distribution(
@@ -42,13 +43,8 @@ def log_n_even_distribution(
 
         normals: list[int] = []
         for i, nu in enumerate(roster_system.nurses):
-            is_n_only = False
             raw = getattr(nu, "is_night_nurse", None)
-            if isinstance(raw, list):
-                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                is_n_only = allowed == {"N"}
-            elif raw == 3 or (raw is not None and raw not in (0, False)):
-                is_n_only = True
+            is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
             if not is_n_only:
                 normals.append(i)
 

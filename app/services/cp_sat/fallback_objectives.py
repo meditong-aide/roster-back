@@ -9,6 +9,7 @@ from services.cp_sat.hardcoded_weights import (
     N_ONLY_NIGHT_BONUS,
     PREFERENCE_SCORE_SCALE,
 )
+from services.cp_sat.allowed_shift_types import is_n_only_profile
 from services.cp_sat.objective_terms import (
     add_even_mid_distribution_terms,
     add_even_night_minmax_distribution_terms,
@@ -61,13 +62,8 @@ def build_fallback_stage3_objective_terms(
     P = roster_system.preference_matrix
     for n in range(N):
         nu = roster_system.nurses[n]
-        is_n_only = False
         raw = getattr(nu, "is_night_nurse", None)
-        if isinstance(raw, list):
-            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-            is_n_only = (allowed == {"N"})
-        elif raw == 3 or (raw is not None and raw != 0 and raw != False):
-            is_n_only = True
+        is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
         for d in range(join[n], leave[n] + 1):
             for s in range(S):
                 base_score = int(P[n, d, s] * PREFERENCE_SCORE_SCALE)

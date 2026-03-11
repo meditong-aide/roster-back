@@ -18,6 +18,10 @@ from services.cp_sat.hardcoded_weights import (
     N_ONLY_NIGHT_BONUS,
     PREFERENCE_SCORE_SCALE,
 )
+from services.cp_sat.allowed_shift_types import (
+    is_n_only_profile,
+    normalize_allowed_shift_codes,
+)
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
 from services.cp_sat.night_distribution_log import log_n_even_distribution
 
@@ -290,21 +294,14 @@ def optimize_fallback_lex_hard_first(
         n_only_cnt = 0
         for i, nu in enumerate(roster_system.nurses):
             raw = getattr(nu, "is_night_nurse", None)
-            if isinstance(raw, list):
-                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                # [] => 제한 없음 (N 가능)
-                if not allowed:
-                    n_allowed_indices.append(i)
-                    continue
-                if "N" in allowed:
-                    n_allowed_indices.append(i)
-                    if allowed == {"N"}:
-                        n_only_cnt += 1
-                    continue
-                # N이 없으면 N 불가
-            else:
-                # 레거시 타입(int/bool/None 등)은 허용 제약에서 무시했으므로 "N 가능"으로 간주
+            allowed = normalize_allowed_shift_codes(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
+            if not allowed:
                 n_allowed_indices.append(i)
+                continue
+            if "N" in allowed:
+                n_allowed_indices.append(i)
+                if allowed == {"N"}:
+                    n_only_cnt += 1
 
         # N 용량 상한(1) 단순: 개인 월 상한 + 재직일수(입/퇴사) 클램프
         cap_basic = 0
@@ -586,12 +583,7 @@ def optimize_fallback_lex_hard_first(
                     )
                     nu = roster_system.nurses[n]
                     raw = getattr(nu, "is_night_nurse", None)
-                    is_n_only = False
-                    if isinstance(raw, list):
-                        allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                        is_n_only = (allowed == {"N"})
-                    # elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
-                    #     is_n_only = True
+                    is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
                     # 디버그: 강제 OFF 개수 로그
                     print(
                         f"{logger_prefix} [HardCheck][ForcedOffCnt] "
@@ -1140,26 +1132,19 @@ def optimize_fallback_lex_hard_first(
             if preceptee_follow and n in preceptee_indices:
                 continue
             raw = getattr(nu, "is_night_nurse", None)
-            if isinstance(raw, list):
-                allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                if allowed:
-                    T0, T1 = join[n], leave[n]
-                    for d in range(T0, T1 + 1):
-                        if "D" not in allowed:
-                            m.Add(X(n, d, day_idx) == 0)
-                        if "E" not in allowed:
-                            m.Add(X(n, d, eve_idx) == 0)
-                        if "N" not in allowed:
-                            m.Add(X(n, d, night_idx) == 0)
-                        if mid_idx is not None:
-                            m.Add(X(n, d, mid_idx) == 0)
-            elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
-                T0, T1 = join[n], leave[n]
-                for d in range(T0, T1 + 1):
+            allowed = normalize_allowed_shift_codes(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
+            if not allowed:
+                continue
+            T0, T1 = join[n], leave[n]
+            for d in range(T0, T1 + 1):
+                if "D" not in allowed:
                     m.Add(X(n, d, day_idx) == 0)
+                if "E" not in allowed:
                     m.Add(X(n, d, eve_idx) == 0)
-                    if mid_idx is not None:
-                        m.Add(X(n, d, mid_idx) == 0)
+                if "N" not in allowed:
+                    m.Add(X(n, d, night_idx) == 0)
+                if mid_idx is not None and "M" not in allowed:
+                    m.Add(X(n, d, mid_idx) == 0)
 
         # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
         # for n, nu in enumerate(roster_system.nurses):
@@ -1266,12 +1251,7 @@ def optimize_fallback_lex_hard_first(
                         continue
                     nu = roster_system.nurses[n]
                     raw = getattr(nu, "is_night_nurse", None)
-                    is_n_only = False
-                    if isinstance(raw, list):
-                        allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                        is_n_only = (allowed == {"N"})
-                    elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
-                        is_n_only = True
+                    is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
                     if is_n_only:
                         continue
                     weekly_target = (
@@ -1322,13 +1302,8 @@ def optimize_fallback_lex_hard_first(
                     continue
                 T0, T1 = join[n], leave[n]
                 nu = roster_system.nurses[n]
-                is_n_only = False
                 raw = getattr(nu, "is_night_nurse", None)
-                if isinstance(raw, list):
-                    allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-                    is_n_only = (allowed == {"N"})
-                elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
-                    is_n_only = True
+                is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
                 nurse_name = getattr(nu, "name", "?")
                 nurse_id = getattr(nu, "nurse_id", "?")
                 is_weekend_off = bool(getattr(nu, "is_weekend_off", False))

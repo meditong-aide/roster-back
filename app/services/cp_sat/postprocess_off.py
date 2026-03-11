@@ -11,6 +11,7 @@ from datetime import timedelta
 import numpy as np
 
 from db.nurse_config import Nurse
+from services.cp_sat.allowed_shift_types import is_n_only_profile
 from services.roster_system import RosterSystem
 from services.cp_sat.hardcoded_weights import (
     GRADE_POSTPROCESS_BONUS,
@@ -283,10 +284,7 @@ def postprocess_trim_extra_offs(
 
     def is_n_only(nurse: Nurse) -> bool:
         raw = getattr(nurse, "is_night_nurse", None)
-        if isinstance(raw, list):
-            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-            return allowed == {"N"}
-        return raw == 3 or (raw is not None and raw != 0 and raw is not False)
+        return is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
 
     def count_vacation_days(n_idx: int) -> int:
         """휴가 일수를 카운트한다."""
@@ -709,4 +707,3 @@ def postprocess_trim_extra_offs(
     if changes:
         print(f"{logger_prefix} [TrimExtraOff] 불필요 OFF 교체 {changes}건")
     return changes
-

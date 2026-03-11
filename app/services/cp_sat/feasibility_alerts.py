@@ -4,6 +4,8 @@ import calendar
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from services.cp_sat.allowed_shift_types import is_code_blocked_by_profile
+
 
 CORE_CODES = ("D", "E", "N", "M")
 
@@ -100,16 +102,9 @@ def _active_range(nurse, first_day: date, last_day: date) -> tuple[int, int] | N
     return (join_date - first_day).days, (leave_date - first_day).days
 
 
-def _nurse_profile_blocks_code(nurse, code: str) -> bool:
+def _nurse_profile_blocks_code(nurse, code: str, use_mid: bool) -> bool:
     raw = getattr(nurse, "is_night_nurse", None)
-    if isinstance(raw, list):
-        allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-        if not allowed:
-            return False
-        return code not in allowed
-    if raw == 3 or (raw is not None and raw not in (0, False)):
-        return code in {"D", "E", "M"}
-    return False
+    return is_code_blocked_by_profile(raw, code, use_mid=use_mid)
 
 
 def _is_subset_sum_possible(target: int, sizes: list[int]) -> bool:
@@ -226,7 +221,7 @@ def run_preflight_feasibility_alerts(
                 for code in day_codes:
                     if code in forbid_set:
                         continue
-                    if _nurse_profile_blocks_code(nurse, code):
+                    if _nurse_profile_blocks_code(nurse, code, use_mid):
                         continue
                     var_cap[code] += 1
 
@@ -315,7 +310,7 @@ def run_preflight_feasibility_alerts(
                         elif "M" in forbidden.get(nurse_id, {}).get(d, set()):
                             unit_possible = False
                             break
-                        elif _nurse_profile_blocks_code(nurses_in_group[idx], "M"):
+                        elif _nurse_profile_blocks_code(nurses_in_group[idx], "M", use_mid):
                             unit_possible = False
                             break
                     if unit_fixed_m > 0:
