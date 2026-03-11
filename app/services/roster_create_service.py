@@ -2174,14 +2174,23 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             group_id=current_user.group_id,
             roster_config_id=getattr(latest_config, "config_id", None),
         )
-        # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
-        config_dict["grade_strategy"] = grade_strategy
         # 요청 바디에서 GRADE일 때는 DB에서 grade_config를 조회해 엔진에 전달
         engine_grade_config = grade_config
         if str(getattr(req, "grade_strategy", "") or "").upper() == "GRADE":
             engine_grade_config = _fetch_grade_config_dict(
                 db, current_user.office_id, current_user.group_id
             )
+        req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
+        has_grade_constraints = bool(
+            (engine_grade_config or {}).get("constraints_json")
+            or (engine_grade_config or {}).get("constraints")
+            or {}
+        )
+        effective_grade_strategy = (
+            "GRADE" if req_strategy == "GRADE" and has_grade_constraints else grade_strategy
+        )
+        # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
+        config_dict["grade_strategy"] = effective_grade_strategy
         cp_sat_result = generate_roster_cp_sat(
             nurses_dict,
             prefs_dict,
@@ -2190,7 +2199,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             req.month,
             shift_manage_data,
             time_limit_seconds=time_limit_seconds,
-            grade_strategy=req.grade_strategy,
+            grade_strategy=effective_grade_strategy,
             grade_config=engine_grade_config,
         )
     except Exception as e:
