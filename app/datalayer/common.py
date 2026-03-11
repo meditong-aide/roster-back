@@ -118,7 +118,7 @@ class Common:
     @staticmethod
     def get_push_list():
         _queryString = """
-        Select top %s 
+        Select top %s
                a.pushcode, a.pushsubcode, a.officecode, a.EmpSeqNo as senderEmpSeqNo, c.EmployeeName as sendername, a.Message, Convert(VarChar(10), b.RegDate, 120) as regdate, b.ReadYN
           From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
          Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
@@ -126,5 +126,14 @@ class Common:
           Left Join bizwiz20db.T_Part d WITH(NOLOCK) On c.OfficialTitleCode=d.code And d.OfficeCode=a.OfficeCode
          Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N' And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
          order by a.Idx desc
+        """
+        return _queryString
+
+    @staticmethod
+    def update_push_read_all():
+        _queryString = """
+        Update bizwiz20db.TB_Mobile_Push_History_User
+           Set ReadYN = 'Y'
+         Where EmpSeqNo = %s And OfficeCode = %s And ReadYN = 'N'
         """
         return _queryString

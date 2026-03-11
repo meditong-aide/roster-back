@@ -65,3 +65,17 @@ def message_view(listsize: int, current_user: UserSchema = Depends(get_current_u
         "regdate": row['regdate'],
         "ReadYN": row['ReadYN']
     } for row in rows]
+
+
+@router.patch("/read/all", summary="알림 전체 읽음 처리")
+def mark_all_push_read(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+    """
+    * 호출방식 : PATCH /push/read/all
+    * 기능 : 알림 모달 진입 시 안읽은 알림 전체를 ReadYN = Y로 일괄 변경
+    """
+    EmpSeqNo = current_user.EmpSeqNo
+    OfficeCode = current_user.office_id
+
+    msdb_manager.execute(Common.update_push_read_all(), params=(EmpSeqNo, OfficeCode))
+
+    return {"message": "전체 읽음 처리 완료"}
