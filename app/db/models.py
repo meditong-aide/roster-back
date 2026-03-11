@@ -564,3 +564,26 @@ class FixedWantedEntry(Base):
         Index('idx_fixed_entry_group_ym', 'group_id', 'year', 'month'),
         Index('idx_fixed_entry_nurse_date', 'group_id', 'year', 'month', 'nurse_id', 'shift_date'),
     )
+
+
+
+class ShareLink(Base):
+    __tablename__ = 'share_links'
+
+    token = Column(VARCHAR(64), primary_key=True)
+    schedule_id = Column(CHAR(12), ForeignKey('schedules.schedule_id'), nullable=False)
+    office_id = Column(VARCHAR(50), ForeignKey('offices.office_id'), nullable=False)
+    group_id = Column(VARCHAR(50), ForeignKey('groups.group_id'), nullable=False)
+    image_url = Column(VARCHAR(1000), nullable=False)
+    title = Column(NVARCHAR(200), nullable=True)
+    description = Column(NVARCHAR(1000), nullable=True)
+    created_by_nurse_id = Column(VARCHAR(50), ForeignKey('nurses.nurse_id'), nullable=True)
+    expires_at = Column(DATETIME, nullable=False)
+    revoked_at = Column(DATETIME, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    schedule = relationship('Schedule')
+    office = relationship('Office')
+    group = relationship('Group')
+    creator = relationship('Nurse', foreign_keys=[created_by_nurse_id])

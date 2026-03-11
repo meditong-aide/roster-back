@@ -435,3 +435,26 @@ class ToggleEntryResponse(BaseModel):
     id: int
     is_applied: bool
     message: str
+
+
+
+class ScheduleShareCreateRequest(BaseModel):
+    image_url: str
+    title: Optional[str] = "근무표 공유"
+    description: Optional[str] = "공유된 근무표입니다."
+    expires_in_days: int = Field(default=3, ge=1, le=365)
+
+
+
+class ScheduleShareAutoCreateRequest(BaseModel):
+    title: Optional[str] = "근무표 공유"
+    description: Optional[str] = "공유된 근무표입니다."
+    expires_in_days: int = Field(default=3, ge=1, le=365)
+
+
+
+class ScheduleShareCaptureCreateRequest(BaseModel):
+    image_data_url: str
+    title: Optional[str] = "근무표 공유"
+    description: Optional[str] = "공유된 근무표입니다."
+    expires_in_days: int = Field(default=3, ge=1, le=365)
