@@ -66,6 +66,8 @@ class Nurse(Base):
     resignation_date = Column(DATETIME, nullable=True)
     # 근무 종료 사유: 휴직 / 퇴사 / 파견 / 부서이동 또는 기타 자유 입력 텍스트
     resignation_reason = Column(NVARCHAR(100), nullable=True)
+    # 기타 사유 자유 입력 텍스트
+    resignation_reason_memo = Column(NVARCHAR(200), nullable=True)
     # 화면 표시 및 알고리즘 입력 순서 제어용
     sequence = Column(INTEGER, nullable=False, default=0)
     active = Column(INTEGER, default=1)
