@@ -2570,13 +2570,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if allowed:
             is_n_only = allowed == {"N"}
             for d in range(T0, T1 + 1):
-                if "D" not in allowed:
+                fixed_shift = fixed.get((n, d))
+                fixed_code = (
+                    rs.config.shift_types[fixed_shift]
+                    if fixed_shift is not None and 0 <= fixed_shift < len(rs.config.shift_types)
+                    else None
+                )
+                if "D" not in allowed and fixed_code != "D":
                     m.Add(X(n, d, day) == 0)
-                if "E" not in allowed:
+                if "E" not in allowed and fixed_code != "E":
                     m.Add(X(n, d, eve) == 0)
-                if "N" not in allowed:
+                if "N" not in allowed and fixed_code != "N":
                     m.Add(X(n, d, night) == 0)
-                if mid is not None and "M" not in allowed:
+                if mid is not None and "M" not in allowed and fixed_code != "M":
                     m.Add(X(n, d, mid) == 0)
 
         if n not in n_forbid_n:
@@ -2895,6 +2901,9 @@ def _solve_neighbourhood(
         if not bool(getattr(rs, "_infeasible_n_diag_logged", False)):
             _log_infeasible_n_capacity(rs, j, l, fixed)
             rs._infeasible_n_diag_logged = True
+        if not bool(getattr(rs, "_infeasible_den_cap_diag_logged", False)):
+            _log_infeasible_shift_capacity(rs, j, l, fixed)
+            rs._infeasible_den_cap_diag_logged = True
         return False, status_text
 
     # 반영
@@ -3016,6 +3025,130 @@ def _log_shift_requirement_gaps(rs) -> None:
             print("[CP-SAT-Basic][Diag][ShiftGap] shift_requirement 부족 없음")
     except Exception as exc:
         print(f"[CP-SAT-Basic][Diag][ShiftGap] 분석 실패: {exc}")
+
+
+def _log_infeasible_shift_capacity(
+    rs,
+    join: list[int],
+    leave: list[int],
+    fixed: dict[tuple[int, int], int],
+) -> None:
+    try:
+        cfg = rs.config
+        shift_types = list(getattr(cfg, "shift_types", []) or [])
+        if not shift_types:
+            return
+        d_phys = rs.num_days
+        initial_forbidden = getattr(rs, "initial_forbidden", {})
+        if not isinstance(initial_forbidden, dict):
+            initial_forbidden = {}
+        ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+        weekend_off_only_enable = bool(getattr(cfg, "weekend_off_only_enable", True))
+        first_day = rs.target_month
+
+        fixed_cnt_by_day = [[0 for _ in shift_types] for _ in range(d_phys)]
+        for (n, d), s_idx in (fixed or {}).items():
+            if 0 <= d < d_phys and 0 <= s_idx < len(shift_types):
+                fixed_cnt_by_day[d][s_idx] += 1
+
+        deficits: list[tuple[int, str, int, int, int, int, int]] = []
+        tight: list[tuple[int, str, int, int]] = []
+        focus_codes = [c for c in ("D", "E", "N") if c in shift_types]
+
+        for d in range(d_phys):
+            if isinstance(ds_by_day, list) and d < len(ds_by_day) and isinstance(ds_by_day[d], dict):
+                need_map = ds_by_day[d]
+            else:
+                need_map = base_req
+            weekday = (first_day + timedelta(days=d)).weekday()
+
+            for code in focus_codes:
+                s_idx = shift_types.index(code)
+                req_raw = int((need_map or {}).get(code, 0) or 0)
+                req = max(0, req_raw - fixed_cnt_by_day[d][s_idx])
+                if req <= 0:
+                    continue
+
+                cap = 0
+                blocked_profile = 0
+                blocked_forbidden = 0
+                blocked_weekend_off = 0
+                fixed_other = 0
+
+                for n in range(len(rs.nurses)):
+                    t0, t1 = join[n], leave[n]
+                    if d < t0 or d > t1:
+                        continue
+                    fixed_shift = fixed.get((n, d))
+                    if fixed_shift is not None:
+                        if fixed_shift == s_idx:
+                            cap += 1
+                        else:
+                            fixed_other += 1
+                        continue
+
+                    nu = rs.nurses[n]
+                    allowed = _allowed_shift_codes(getattr(nu, "is_night_nurse", None))
+                    if allowed and code not in allowed:
+                        blocked_profile += 1
+                        continue
+
+                    if code in initial_forbidden.get((n, d), set()):
+                        blocked_forbidden += 1
+                        continue
+
+                    if (
+                        code in {"D", "E", "N"}
+                        and weekend_off_only_enable
+                        and bool(getattr(nu, "is_weekend_off", False))
+                        and weekday >= 5
+                    ):
+                        blocked_weekend_off += 1
+                        continue
+
+                    cap += 1
+
+                if cap < req:
+                    deficits.append(
+                        (
+                            d + 1,
+                            code,
+                            req,
+                            cap,
+                            blocked_profile,
+                            blocked_forbidden,
+                            fixed_other + blocked_weekend_off,
+                        )
+                    )
+                elif cap == req:
+                    tight.append((d + 1, code, req, cap))
+
+        if deficits:
+            print(
+                "[CP-SAT-Basic][Diag][DEN-Capacity] "
+                f"요구 대비 이론 cap 부족 셀={len(deficits)}"
+            )
+            for day_1, code, req, cap, b_profile, b_forbid, b_other in deficits[:30]:
+                print(
+                    "[CP-SAT-Basic][Diag][DEN-Capacity] "
+                    f"day={day_1}, shift={code}, req_after_fixed={req}, cap={cap}, "
+                    f"blocked_profile={b_profile}, blocked_forbidden={b_forbid}, blocked_other={b_other}"
+                )
+        else:
+            print("[CP-SAT-Basic][Diag][DEN-Capacity] D/E/N 요구 대비 cap 부족은 없음")
+            if tight:
+                print(
+                    "[CP-SAT-Basic][Diag][DEN-Capacity] "
+                    f"cap==req 타이트 셀={len(tight)} (교차일 제약 충돌 가능)"
+                )
+                for day_1, code, req, cap in tight[:20]:
+                    print(
+                        "[CP-SAT-Basic][Diag][DEN-Capacity] "
+                        f"day={day_1}, shift={code}, req_after_fixed={req}, cap={cap}"
+                    )
+    except Exception as exc:
+        print(f"[CP-SAT-Basic][Diag][DEN-Capacity] 분석 실패: {exc}")
 
 
 def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):

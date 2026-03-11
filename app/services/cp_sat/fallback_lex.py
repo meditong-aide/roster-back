@@ -1137,13 +1137,19 @@ def optimize_fallback_lex_hard_first(
                 continue
             T0, T1 = join[n], leave[n]
             for d in range(T0, T1 + 1):
-                if "D" not in allowed:
+                fixed_shift = fixed.get((n, d))
+                fixed_code = (
+                    cfg.shift_types[fixed_shift]
+                    if fixed_shift is not None and 0 <= fixed_shift < len(cfg.shift_types)
+                    else None
+                )
+                if "D" not in allowed and fixed_code != "D":
                     m.Add(X(n, d, day_idx) == 0)
-                if "E" not in allowed:
+                if "E" not in allowed and fixed_code != "E":
                     m.Add(X(n, d, eve_idx) == 0)
-                if "N" not in allowed:
+                if "N" not in allowed and fixed_code != "N":
                     m.Add(X(n, d, night_idx) == 0)
-                if mid_idx is not None and "M" not in allowed:
+                if mid_idx is not None and "M" not in allowed and fixed_code != "M":
                     m.Add(X(n, d, mid_idx) == 0)
 
         # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
