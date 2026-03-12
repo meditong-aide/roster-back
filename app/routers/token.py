@@ -147,6 +147,7 @@ async def login_for_access_token(response: Response,
                     "gw_useYN": gw_useYN,
                     "qpis_useYN": qpis_useYN,
                     "official_title_name": official_title_name,  # 추가 필드
+                    "original_group_id": group_id,  # 로그인 시 DB 기준 원래 소속 그룹
                 },
                 expires_delta=access_token_expires,
             )
