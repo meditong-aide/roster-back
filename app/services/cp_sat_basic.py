@@ -728,18 +728,19 @@ class CPSATBasicEngine:
         return shift_preferences, off_requests, pair_preferences
 
     def generate_roster(
-        self, 
-        nurses_data: List[dict], 
-        prefs_data: List[dict], 
+        self,
+        nurses_data: List[dict],
+        prefs_data: List[dict],
         config_data: dict,
-        year: int, 
+        year: int,
         month: int,
         grouped: List[dict],
         grade_strategy: str = "BASE",
         grade_config: dict | None = None,
         time_limit_seconds: int = 60,
         randomize: bool = True,           # ← 추가
-        seed: int | None = None           # ← 추가 (재현 원하면 지정)
+        seed: int | None = None,          # ← 추가 (재현 원하면 지정)
+        rl_stage_callback=None,           # ← RL 에이전트 콜백 (None이면 기존 동작)
     ) -> Dict[str, List[str]]:
         """
         DB 데이터를 기반으로 CP-SAT를 사용해 근무표를 생성
@@ -757,7 +758,12 @@ class CPSATBasicEngine:
         """
         
         print(f"{self.logger_prefix} 근무표 생성 시작: {year}년 {month}월")
-        
+
+        # RL 콜백 저장 (fallback 단계에서 사용)
+        self._rl_stage_callback = rl_stage_callback
+        if rl_stage_callback is not None:
+            print(f"{self.logger_prefix} [RL] rl_stage_callback 활성화됨")
+
         # 1. 설정 객체 생성
         with Timer("설정 생성"):
             config = self.create_config_from_db(config_data)
@@ -1157,6 +1163,7 @@ class CPSATBasicEngine:
                     time_limit_seconds=time_limit_seconds,
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
+                    rl_stage_callback=getattr(self, "_rl_stage_callback", None),
                 )
             # if not success and not fallback_success:
             #     raise RuntimeError("HARD_INFEASIBLE: stage1/fallback 모두 해 없음")
@@ -1685,8 +1692,15 @@ class CPSATBasicEngine:
         time_limit_seconds: int,
         grouped=None,
         shift_type_map: dict[str, str] | None = None,
+        rl_stage_callback=None,
     ) -> bool:
-        """(호환) 폴백(서열) 최적화는 별도 모듈로 분리되었다."""
+        """(호환) 폴백(서열) 최적화는 별도 모듈로 분리되었다.
+
+        Args:
+            rl_stage_callback: (선택) RL 에이전트 콜백.
+                None이면 기존 하드코딩 시간 배분 사용.
+                SolverStageController 또는 동일 시그니처 callable.
+        """
         return optimize_fallback_lex_hard_first(
             roster_system=roster_system,
             time_limit_seconds=time_limit_seconds,
@@ -1698,6 +1712,7 @@ class CPSATBasicEngine:
             add_team_balance_terms_fn=add_team_balance_objective_terms,
             add_grade_constraints_fn=add_grade_constraints,
             postprocess_rebalance_off_fn=self._postprocess_rebalance_off,
+            rl_stage_callback=rl_stage_callback,
         )
 
     def _quick_initial_solve(self, rs: RosterSystem,
@@ -3314,6 +3329,7 @@ def generate_roster_cp_sat(
     seed=None,
     grade_strategy: str = "BASE",
     grade_config: dict | None = None,
+    rl_stage_callback=None,
 ):
     """
     기존 roster_engine.generate_roster 함수와 호환되는 인터페이스
@@ -3341,4 +3357,5 @@ def generate_roster_cp_sat(
         time_limit_seconds=time_limit_seconds,
         randomize=randomize,
         seed=seed,
-    ) 
+        rl_stage_callback=rl_stage_callback,
+    )

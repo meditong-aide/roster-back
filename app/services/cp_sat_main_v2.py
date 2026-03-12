@@ -1,3 +1,5 @@
+# DEPRECATED: 이 파일은 production에서 사용되지 않습니다. 참조: services/cp_sat_basic.py
+# 삭제 전 grep으로 호출 여부를 확인할 것. (2025-01 기준 dead code 판정)
 """
 main_v2.py와 동일한 품질의 CP-SAT + LNS 근무표 생성 엔진
 

@@ -134,6 +134,7 @@ def optimize_fallback_lex_hard_first(
     add_team_balance_terms_fn,
     add_grade_constraints_fn,
     postprocess_rebalance_off_fn,
+    rl_stage_callback=None,
 ) -> bool:
     """하드 제약을 최우선으로 하는 서열(lexicographic) 폴백 최적화 수행.
 
@@ -153,16 +154,53 @@ def optimize_fallback_lex_hard_first(
         add_team_balance_terms_fn: 팀 밸런스 목적함수 항 생성 함수
         add_grade_constraints_fn: Grade 제약 추가 함수
         postprocess_rebalance_off_fn: 후처리(OFF 재배치) 함수
+        rl_stage_callback: (선택) RL 에이전트 콜백. 시그니처:
+            rl_stage_callback(stage: int, state: dict) -> dict
+            - stage=0: 초기 시간 예산 결정 전 호출 (문제 특성 기반)
+            - stage=1: Stage1 완료 후 Stage2 파라미터 결정
+            - stage=2: Stage2 완료 후 Stage3 파라미터 결정
+            반환 dict 키: 'stage1_seconds', 'stage2_seconds', 'stage3_seconds',
+                         'weight_multipliers' (dict: 가중치명 -> float)
+            None이면 기존 하드코딩 배분(45%/35%/20%) 사용.
 
     Returns:
         bool: 최종적으로 하드 위반 합이 0인 해를 달성했는지 여부
     """
     print(f"{logger_prefix} 폴백(서열) 최적화 시작…")
 
-    # 동적 시간 배분(대략): 45% / 35% / 20%
-    tl1 = max(5, int(time_limit_seconds * 0.45))
-    tl2 = max(5, int(time_limit_seconds * 0.35))
-    tl3 = max(3, time_limit_seconds - tl1 - tl2)
+    # 기본 시간 배분: 45% / 35% / 20% (RL 미사용 시 혹은 콜백 없을 때)
+    _default_tl1 = max(5, int(time_limit_seconds * 0.45))
+    _default_tl2 = max(5, int(time_limit_seconds * 0.35))
+    _default_tl3 = max(3, time_limit_seconds - _default_tl1 - _default_tl2)
+
+    # RL Stage0 콜백: 초기 시간 예산 결정
+    _rl_weight_mults: dict = {}
+    if rl_stage_callback is not None:
+        try:
+            _stage0_state = {
+                "stage": 0,
+                "time_limit_seconds": time_limit_seconds,
+                "n_nurses": len(roster_system.nurses),
+                "n_days": getattr(roster_system, "num_days", 30),
+                "config": {
+                    "max_night_shifts_per_month": getattr(roster_system.config, "max_night_shifts_per_month", 10),
+                    "daily_shift_requirements": getattr(roster_system.config, "daily_shift_requirements", {}),
+                },
+            }
+            _stage0_params = rl_stage_callback(0, _stage0_state)
+            tl1 = max(3, int(_stage0_params.get("stage1_seconds", _default_tl1)))
+            tl2 = max(3, int(_stage0_params.get("stage2_seconds", _default_tl2)))
+            tl3 = max(3, int(_stage0_params.get("stage3_seconds", _default_tl3)))
+            _rl_weight_mults = _stage0_params.get("weight_multipliers", {})
+            print(
+                f"{logger_prefix} [RL] Stage0 콜백 적용: "
+                f"tl1={tl1}s, tl2={tl2}s, tl3={tl3}s, weight_mults={_rl_weight_mults}"
+            )
+        except Exception as _e:
+            print(f"{logger_prefix} [RL] Stage0 콜백 오류 → 기본값 사용: {_e}")
+            tl1, tl2, tl3 = _default_tl1, _default_tl2, _default_tl3
+    else:
+        tl1, tl2, tl3 = _default_tl1, _default_tl2, _default_tl3
 
     N, D, S = len(roster_system.nurses), roster_system.num_days, roster_system.config.num_shifts
     cfg = roster_system.config
@@ -1534,6 +1572,29 @@ def optimize_fallback_lex_hard_first(
         print(f"{logger_prefix} 폴백 중단: 1단계 해를 찾지 못함")
         return False
 
+    # RL Stage1 콜백: Stage1 결과를 관찰 후 Stage2/3 파라미터 재조정
+    if rl_stage_callback is not None:
+        try:
+            _stage1_state = {
+                "stage": 1,
+                "coverage_short": best_short,
+                "coverage_over": best_over,
+                "relax_level_used": used_relax_level,
+                "tl1_remaining": tl1,
+                "tl2_budget": tl2,
+                "tl3_budget": tl3,
+            }
+            _stage1_params = rl_stage_callback(1, _stage1_state)
+            tl2 = max(3, int(_stage1_params.get("stage2_seconds", tl2)))
+            tl3 = max(3, int(_stage1_params.get("stage3_seconds", tl3)))
+            _rl_weight_mults.update(_stage1_params.get("weight_multipliers", {}))
+            print(
+                f"{logger_prefix} [RL] Stage1 콜백 적용: "
+                f"coverage_short={best_short}, tl2={tl2}s, tl3={tl3}s"
+            )
+        except Exception as _e:
+            print(f"{logger_prefix} [RL] Stage1 콜백 오류 → 기존 값 유지: {_e}")
+
     # ───── 2단계: 안전/법규 ─────
     with timer_cls("폴백 2단계: 안전/법규 위반 최소화"):
         (
@@ -1607,6 +1668,26 @@ def optimize_fallback_lex_hard_first(
                 print(f"{logger_prefix} [Stage2 과잉 참고] day,shift,over =", sorted(over_items))
         except Exception as exc:
             print(f"{logger_prefix} [Stage2 상세로그 실패]: {exc}")
+
+    # RL Stage2 콜백: Stage2 결과를 관찰 후 Stage3 파라미터 결정
+    if rl_stage_callback is not None:
+        try:
+            _stage2_state = {
+                "stage": 2,
+                "coverage_short": best_short,
+                "safety_violation_sum": best_safe_sum,
+                "tl2_remaining": tl2,
+                "tl3_budget": tl3,
+            }
+            _stage2_params = rl_stage_callback(2, _stage2_state)
+            tl3 = max(3, int(_stage2_params.get("stage3_seconds", tl3)))
+            _rl_weight_mults.update(_stage2_params.get("weight_multipliers", {}))
+            print(
+                f"{logger_prefix} [RL] Stage2 콜백 적용: "
+                f"safety_sum={best_safe_sum}, tl3={tl3}s"
+            )
+        except Exception as _e:
+            print(f"{logger_prefix} [RL] Stage2 콜백 오류 → 기존 값 유지: {_e}")
 
     # ───── 3단계: 선호/공정성 ─────
     with timer_cls("폴백 3단계: 선호/공정성 최대화"):

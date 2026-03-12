@@ -1,3 +1,5 @@
+# DEPRECATED: 이 파일은 production에서 사용되지 않습니다. 참조: services/cp_sat_basic.py
+# 삭제 전 grep으로 호출 여부를 확인할 것. (2025-01 기준 dead code 판정)
 """
 CP-SAT 적응형 제약 최적화 엔진
 
