@@ -568,3 +568,15 @@ class FixedWantedEntry(Base):
         Index('idx_fixed_entry_group_ym', 'group_id', 'year', 'month'),
         Index('idx_fixed_entry_nurse_date', 'group_id', 'year', 'month', 'nurse_id', 'shift_date'),
     )
+
+
+class Notice(Base):
+    __tablename__ = 'notices'
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    title = Column(VARCHAR(200), nullable=False)
+    content = Column(TEXT, nullable=False)
+    author_id = Column(VARCHAR(50), nullable=False)    # 작성자 account_id
+    author_name = Column(VARCHAR(100), nullable=False)
+    is_pinned = Column(BOOLEAN, default=False)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())

@@ -5,9 +5,12 @@ from fastapi import APIRouter, Depends, Request, Form, HTTPException, status, Fi
 from fastapi.templating import Jinja2Templates
 from fastapi_mail import MessageType  # MessageType도 필요합니다.
 
+from sqlalchemy.orm import Session
+
 from datalayer.contact import Contact
 from datalayer.member import Member
-from db.client2 import msdb_manager
+from db.client2 import msdb_manager, get_db
+from db.models import Notice
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from utils.email import email_sender, EmailSchema
