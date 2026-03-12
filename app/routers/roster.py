@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 # from db.client import get_db
 from db.models import RosterConfig as RosterConfigModel
 from db.models import (
+    Office,
     Schedule,
     ShiftPreference,
     Nurse,
@@ -2446,15 +2447,71 @@ async def render_schedule_share_page(
     token: str, request: Request, db: Session = Depends(get_db)
 ):
     import html
+    import os
     from services.roster_service import get_public_share_link_service
 
     share_row = get_public_share_link_service(db=db, token=token)
     if not share_row:
         raise HTTPException(status_code=404, detail="Share link not found or expired")
 
-    og_title = html.escape(share_row.get("title") or "근무표 공유")
-    og_description = html.escape(share_row.get("description") or "공유된 근무표입니다.")
-    og_image = html.escape(
+    schedule_row = (
+        db.query(Schedule.year, Schedule.month)
+        .filter(Schedule.schedule_id == share_row.get("schedule_id"))
+        .first()
+    )
+    nurse_row = (
+        db.query(Nurse.name)
+        .filter(Nurse.nurse_id == share_row.get("created_by_nurse_id"))
+        .first()
+    )
+    office_row = (
+        db.query(Office.office_name)
+        .filter(Office.office_id == share_row.get("office_id"))
+        .first()
+    )
+    group_row = (
+        db.query(Group.group_name)
+        .filter(Group.group_id == share_row.get("group_id"))
+        .first()
+    )
+
+    year = (
+        int(schedule_row.year)
+        if schedule_row and schedule_row.year is not None
+        else None
+    )
+    month = (
+        int(schedule_row.month)
+        if schedule_row and schedule_row.month is not None
+        else None
+    )
+    nurse_name = str(nurse_row.name) if nurse_row and nurse_row.name else "간호사"
+    office_name = (
+        str(office_row.office_name)
+        if office_row and office_row.office_name
+        else "오피스"
+    )
+    group_name = (
+        str(group_row.group_name) if group_row and group_row.group_name else "그룹"
+    )
+
+    if year is not None and month is not None:
+        og_title_text = f"{year}.{month} {nurse_name} 근무표"
+        og_description_text = (
+            f"{office_name} {group_name} {year} {month} 근무표를 확인하세요."
+        )
+    else:
+        og_title_text = f"{nurse_name} 근무표"
+        og_description_text = f"{office_name} {group_name} 근무표를 확인하세요."
+
+    og_title = html.escape(og_title_text)
+    og_description = html.escape(og_description_text)
+    fixed_meta_image_url = os.getenv(
+        "SHARE_META_IMAGE_URL",
+        "https://s3-aide-backend-share-dev.s3.ap-northeast-2.amazonaws.com/og-images/meta/fixed-share-preview.png",
+    )
+    og_image = html.escape(str(fixed_meta_image_url).strip())
+    display_image = html.escape(
         str(request.url_for("render_schedule_share_image", token=token))
     )
 
@@ -2474,7 +2531,7 @@ async def render_schedule_share_page(
   <meta name="twitter:image" content="{og_image}" />
 </head>
 <body style="margin:0;background:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:8px;">
-  <img src="{og_image}" alt="{og_title}" style="max-width:100vw;max-height:100vh;width:auto;height:auto;display:block;object-fit:contain;" />
+  <img src="{display_image}" alt="{og_title}" style="max-width:100vw;max-height:100vh;width:auto;height:auto;display:block;object-fit:contain;" />
 </body>
 </html>
 """
