@@ -35,6 +35,7 @@ from collections import defaultdict
 import calendar
 from sqlalchemy import text
 from db.client2 import get_db
+from services.cp_sat.off_policy import resolve_effective_off_days
 
 logger = logging.getLogger(__name__)
 # from db.client2 import _get_mssql_session
@@ -1747,23 +1748,7 @@ def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, s
     return code2main
 
 
-def _normalize_allowed_shift_types(raw_value: object) -> set[str]:
-    """간호사 row의 '허용 근무유형(D/E/N) 리스트'를 정규화한다.
-
-    정책:
-        - [] 또는 None: 제한 없음(= D/E/N 모두 가능)
-        - ["N"], ["D","E"], ["D","N"] 등: 해당 코드만 가능
-        - 기존 레거시 int/boolean 기반 night 전담 값은 **무시**한다.
-
-    Args:
-        raw_value: DB에 저장된 값(JSON). 기대 형태는 List[str] 또는 None.
-
-    Returns:
-        허용 코드 집합. 빈 집합이면 "제한 없음"을 의미한다.
-
-    Raises:
-        ValueError: 리스트에 D/E/N 이외의 코드가 섞여있을 때
-    """
+def _normalize_allowed_shift_types(raw_value: object, use_mid: bool = False) -> set[str]:
     if raw_value is None:
         return set()
     # 레거시 타입은 무시(요구사항: 기존 is_night_nurse 의미는 무시)
@@ -1772,18 +1757,25 @@ def _normalize_allowed_shift_types(raw_value: object) -> set[str]:
     if not isinstance(raw_value, list):
         return set()
 
+    valid_codes = {"D", "E", "N"}
+    if bool(use_mid):
+        valid_codes.add("M")
+
     allowed: set[str] = set()
     invalid: set[str] = set()
     for item in raw_value:
         code = str(item).strip().upper()
         if not code:
             continue
-        if code in {"D", "E", "N"}:
+        if code in valid_codes:
             allowed.add(code)
         else:
             invalid.add(code)
     if invalid:
-        raise ValueError(f"허용 근무유형 값이 올바르지 않습니다: {sorted(invalid)} (허용: D/E/N)")
+        print(
+            f"[AllowedShiftTypes] 허용 근무유형 무시: invalid={sorted(invalid)}, "
+            f"allowed={sorted(valid_codes)}"
+        )
     return allowed
 
 
@@ -1803,11 +1795,13 @@ def build_allowed_shift_type_constraints(
     month: int,
     shift_manage_data: list[dict] | None,
     fixed_cells: list[dict] | None,
+    use_mid: bool,
 ) -> dict:
     """간호사별 허용 근무유형(D/E/N) 하드 제약을 forbidden 형태로 생성한다.
 
     목표:
-        - 간호사 row에 저장된 허용 목록에 따라, 허용되지 않은 D/E/N 배정을 전일(day_idx 전체)에 대해 금지한다.
+        - 간호사 row에 저장된 허용 목록에 따라, 허용되지 않은 D/E/N(및 use_mid=True이면 M) 배정을
+          전일(day_idx 전체)에 대해 금지한다.
         - OFF(O)는 항상 가능하도록 금지 대상에서 제외한다.
         - fixed_cells(고정셀)가 허용 목록과 충돌하면 해당 날짜만 예외로 두고 진행한다.
 
@@ -1819,13 +1813,19 @@ def build_allowed_shift_type_constraints(
         return {"forced_off": {}, "forbidden": {}}
 
     code2main = _build_code_to_main_map(shift_manage_data)
+    allowed_main_codes = {"D", "E", "N"}
+    if bool(use_mid):
+        allowed_main_codes.add("M")
     nurse_id_to_allowed: dict[str, set[str]] = {}
 
     for n in nurses_in_group:
         nurse_id = str(getattr(n, "nurse_id", "") or "")
         if not nurse_id:
             continue
-        allowed = _normalize_allowed_shift_types(getattr(n, "is_night_nurse", None))
+        allowed = _normalize_allowed_shift_types(
+            getattr(n, "is_night_nurse", None),
+            use_mid=bool(use_mid),
+        )
         nurse_id_to_allowed[nurse_id] = allowed
 
     # ── 고정셀 충돌은 예외 처리(고정 우선) ──
@@ -1840,7 +1840,7 @@ def build_allowed_shift_type_constraints(
             except Exception:
                 continue
             fixed_main = _normalize_shift_to_main(c.get("shift"), code2main)
-            if fixed_main not in {"D", "E", "N"}:
+            if fixed_main not in allowed_main_codes:
                 continue  # O는 항상 가능
             nurse_id = idx_to_nurse_id.get(n_idx)
             if not nurse_id:
@@ -1865,13 +1865,11 @@ def build_allowed_shift_type_constraints(
                 )
 
     forbidden: dict[str, dict[int, list[str]]] = {}
-    all_codes = {"D", "E", "N"}
+    all_codes = set(allowed_main_codes)
     for nurse_id, allowed in nurse_id_to_allowed.items():
         if not allowed:
             continue  # 제한 없음
         disallowed_set = set(all_codes - set(allowed))
-        if allowed:
-            disallowed_set.add("M")
         disallowed = sorted(disallowed_set)
         if not disallowed:
             continue
@@ -2086,6 +2084,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         month=req.month,
         shift_manage_data=shift_manage_data,
         fixed_cells=config_dict.get("fixed_cells"),
+        use_mid=bool(config_dict.get("use_mid", False)),
     )
 
     # ── 2) cross-month 경계 제약 생성 ──
@@ -2175,14 +2174,23 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             group_id=current_user.group_id,
             roster_config_id=getattr(latest_config, "config_id", None),
         )
-        # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
-        config_dict["grade_strategy"] = grade_strategy
         # 요청 바디에서 GRADE일 때는 DB에서 grade_config를 조회해 엔진에 전달
         engine_grade_config = grade_config
         if str(getattr(req, "grade_strategy", "") or "").upper() == "GRADE":
             engine_grade_config = _fetch_grade_config_dict(
                 db, current_user.office_id, current_user.group_id
             )
+        req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
+        has_grade_constraints = bool(
+            (engine_grade_config or {}).get("constraints_json")
+            or (engine_grade_config or {}).get("constraints")
+            or {}
+        )
+        effective_grade_strategy = (
+            "GRADE" if req_strategy == "GRADE" and has_grade_constraints else grade_strategy
+        )
+        # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
+        config_dict["grade_strategy"] = effective_grade_strategy
         cp_sat_result = generate_roster_cp_sat(
             nurses_dict,
             prefs_dict,
@@ -2191,7 +2199,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             req.month,
             shift_manage_data,
             time_limit_seconds=time_limit_seconds,
-            grade_strategy=req.grade_strategy,
+            grade_strategy=effective_grade_strategy,
             grade_config=engine_grade_config,
         )
     except Exception as e:
@@ -2263,6 +2271,71 @@ def _count_work_assignments(generated: dict[str, list[str]] | None) -> tuple[int
     return total_cells, work_cells
 
 
+def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] | None) -> str | None:
+    try:
+        cfg = getattr(roster_system, "config", None)
+        if cfg is None:
+            return None
+        num_days = int(getattr(roster_system, "num_days", 0) or 0)
+        if num_days <= 0:
+            return None
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        nurse_count = len(nurses) if nurses else len(generated or {})
+        if nurse_count <= 0:
+            return None
+
+        shift_types = list(getattr(cfg, "shift_types", []) or [])
+
+        def _required_by_day(day_idx: int) -> dict[str, int]:
+            by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+            if isinstance(by_day, list) and day_idx < len(by_day) and isinstance(by_day[day_idx], dict):
+                return {str(k).upper(): int(v or 0) for k, v in by_day[day_idx].items()}
+            base = getattr(cfg, "daily_shift_requirements", None)
+            if isinstance(base, dict):
+                return {str(k).upper(): int(v or 0) for k, v in base.items()}
+            return {}
+
+        total_required = 0
+        n_required = 0
+        for d in range(num_days):
+            req = _required_by_day(d)
+            for code, val in req.items():
+                if code == "O":
+                    continue
+                if shift_types and code not in shift_types:
+                    continue
+                v = int(val or 0)
+                if v <= 0:
+                    continue
+                total_required += v
+                if code == "N":
+                    n_required += v
+
+        effective_off_days, off_source = resolve_effective_off_days(cfg)
+        max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
+        total_capacity = nurse_count * max_work_per_nurse
+        if total_required > total_capacity:
+            return (
+                "[reason_code=CAPACITY_TOTAL_SHORTAGE] "
+                "Infeasible 진단: 월 총 필요 근무 슬롯이 공급 상한을 초과했습니다. "
+                f"(요구={total_required}, 공급상한={total_capacity}, 간호사={nurse_count}, "
+                f"days={num_days}, off_days={effective_off_days}, source={off_source})"
+            )
+
+        max_night_per_nurse = int(getattr(cfg, "max_night_shifts_per_month", 0) or 0)
+        if max_night_per_nurse > 0 and n_required > (nurse_count * max_night_per_nurse):
+            return (
+                "[reason_code=N_CAPACITY_SHORTAGE] "
+                "Infeasible 진단: 월간 N 수요가 N 상한 용량을 초과했습니다. "
+                f"(N요구={n_required}, N용량상한={nurse_count * max_night_per_nurse}, "
+                f"간호사={nurse_count}, max_night_per_month={max_night_per_nurse})"
+            )
+
+        return None
+    except Exception:
+        return None
+
+
 def _validate_generated_roster(
     generated: dict[str, list[str]] | None, roster_system
 ) -> str | None:
@@ -2280,15 +2353,10 @@ def _validate_generated_roster(
         총 750칸 중 실근무 0칸이거나 위반 1500건(750×2) 이상 → 메시지 반환.
     """
     total_cells, work_cells = _count_work_assignments(generated)
-    num_days = getattr(roster_system, "num_days", 0) or 0
-    work_ratio = (work_cells / total_cells) if total_cells else 0.0
 
     if total_cells > 0 and work_cells == 0:
-        return "근무 배정이 한 건도 없어 스케줄을 저장하지 않습니다."
-
-    # 근무 배정률이 10% 미만이면 비정상으로 간주
-    if total_cells > 0 and work_ratio < 0.1:
-        return "근무 배정률이 10% 미만이어서 스케줄을 저장하지 않습니다."
+        diag = _build_infeasible_diagnosis(roster_system, generated)
+        return diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다."
 
     # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
     try:
@@ -2330,15 +2398,19 @@ def _validate_generated_roster(
 
                 total_actual = sum(actual.values())
                 if total_actual == 0:
+                    diag = _build_infeasible_diagnosis(roster_system, generated)
+                    if diag:
+                        return diag
                     req_msg = ", ".join(f"{k}={v}" for k, v in req.items())
                     return (
-                        f"{d + 1}일에 필수 근무 인원이 모두 미배정되었습니다. "
-                        f"(요구 인원: {req_msg})"
+                        f"[reason_code=DAY_ZERO_COVERAGE] Infeasible 진단: "
+                        f"{d + 1}일 필수 근무 미배정 (요구: {req_msg})"
                     )
 
                 if "M" in req and actual.get("M", 0) > req["M"]:
                     return (
-                        f"{d + 1}일 M 과배정: 요구={req['M']}, 실제={actual.get('M', 0)}"
+                        f"[reason_code=M_OVERSUPPLY] {d + 1}일 M 과배정: "
+                        f"요구={req['M']}, 실제={actual.get('M', 0)}"
                     )
     except Exception:
         # 검증 로직이 실패해도 저장을 막지 않고, 기존 최소 검증 결과만 사용

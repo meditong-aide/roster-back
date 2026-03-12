@@ -18,6 +18,7 @@ from services.cp_sat.hardcoded_weights import (
 )
 from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
+from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes, is_n_only_profile
 
 
 def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
@@ -25,10 +26,15 @@ def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
     n_forbid_n: set[int] = set()
     initial_forbidden = getattr(rs, "initial_forbidden", None)
     if not isinstance(initial_forbidden, dict):
-        return n_forbid_n
+        initial_forbidden = {}
     for n in range(len(rs.nurses)):
         t0, t1 = join[n], leave[n]
         if t0 > t1:
+            continue
+        raw = getattr(rs.nurses[n], "is_night_nurse", None)
+        allowed = normalize_allowed_shift_codes(raw, use_mid=bool(getattr(rs.config, "use_mid", False)))
+        if allowed and "N" not in allowed:
+            n_forbid_n.add(n)
             continue
         n_days = t1 - t0 + 1
         forbid_cnt = sum(
@@ -73,12 +79,7 @@ def add_even_mid_distribution_terms(
     candidates: list[int] = []
     for n, nu in enumerate(rs.nurses):
         raw = getattr(nu, "is_night_nurse", None)
-        is_n_only = False
-        if isinstance(raw, list):
-            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-            is_n_only = (allowed == {"N"})
-        elif raw == 3 or (raw is not None and raw not in (0, False)):
-            is_n_only = True
+        is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
         if is_n_only:
             continue
 
@@ -150,13 +151,8 @@ def add_even_night_minmax_distribution_terms(
 
     normals: list[int] = []
     for i, nu in enumerate(rs.nurses):
-        is_n_only = False
         raw = getattr(nu, "is_night_nurse", None)
-        if isinstance(raw, list):
-            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-            is_n_only = allowed == {"N"}
-        elif raw == 3 or (raw is not None and raw not in (0, False)):
-            is_n_only = True
+        is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
         if not is_n_only:
             normals.append(i)
     n_forbid_n = _n_forbid_n_set(rs, join, leave)
@@ -271,13 +267,8 @@ def build_main_objective_terms(
 
     for n in range(N):
         nu = rs.nurses[n]
-        is_n_only = False
         raw = getattr(nu, "is_night_nurse", None)
-        if isinstance(raw, list):
-            allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
-            is_n_only = (allowed == {"N"})
-        elif raw == 3 or (raw is not None and raw != 0 and raw is not False):
-            is_n_only = True
+        is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
 
         for d in range(join[n], leave[n] + 1):
             for s in range(S):

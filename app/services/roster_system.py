@@ -345,39 +345,54 @@ class RosterSystem:
     # ───────── 1. find_violations 수정 ─────────
     def _find_violations(self) -> List[dict]:
         violations = []
+        shift_types = list(self.config.shift_types or [])
 
-        # (1) 일별 ‑ 병동 요구·경력 체크 (변경 없음) ...
+        off_idx = shift_types.index('O') if 'O' in shift_types else None
+        night_idx = shift_types.index('N') if 'N' in shift_types else None
+        day_idx = shift_types.index('D') if 'D' in shift_types else None
+        eve_idx = shift_types.index('E') if 'E' in shift_types else None
 
-        # (2) 간호사별 제약
-        for n_idx, nurse in enumerate(self.nurses):
-            for day in range(self.num_days):
-                # ── 2‑A. 야간 제약 3종 🔄
+        def _need_map_for_day(day: int) -> dict:
+            if (
+                hasattr(self.config, 'daily_shift_requirements_by_day')
+                and isinstance(self.config.daily_shift_requirements_by_day, list)
+                and day < len(self.config.daily_shift_requirements_by_day)
+                and isinstance(self.config.daily_shift_requirements_by_day[day], dict)
+            ):
+                return self.config.daily_shift_requirements_by_day[day]
+            return self.config.daily_shift_requirements
 
-                # Check shift requirements (일자별 요구치 우선 적용)
-                if (hasattr(self.config, 'daily_shift_requirements_by_day') and
-                    isinstance(self.config.daily_shift_requirements_by_day, list) and
-                    day < len(self.config.daily_shift_requirements_by_day)):
-                    need_map = self.config.daily_shift_requirements_by_day[day]
-                    # print('need_map1', need_map)
-                else:
-                    need_map = self.config.daily_shift_requirements
-                    # print('need_map2', need_map)
+        def _assigned_shift_idx(n_idx: int, day: int) -> int | None:
+            row = self.roster[n_idx, day, :]
+            ones = np.where(row == 1)[0]
+            if len(ones) == 0:
+                return None
+            return int(ones[0])
 
-                for shift, required in need_map.items():
-                    if shift not in self.config.shift_types:
-                        # print('컨티뉴')
-                        continue
-                    shift_idx = self.config.shift_types.index(shift)
-                    actual = np.sum(self.roster[:, day, shift_idx])
-                    if actual < required:  # 필요 인원보다 적을 때만 위반으로 처리
-                        violations.append({
+        for day in range(self.num_days):
+            need_map = _need_map_for_day(day)
+            for shift, required_raw in need_map.items():
+                if shift not in shift_types:
+                    continue
+                required = int(required_raw or 0)
+                if required <= 0:
+                    continue
+                shift_idx = shift_types.index(shift)
+                actual = int(np.sum(self.roster[:, day, shift_idx]))
+                if actual < required:
+                    violations.append(
+                        {
                             'type': 'shift_requirement',
                             'day': day,
                             'shift': shift,
                             'required': required,
-                            'actual': actual
-                        })
-                        violations.append({'type': 'shift_requirements', 'nurse_idx': n_idx, 'day': day})
+                            'actual': actual,
+                        }
+                    )
+
+        for n_idx, nurse in enumerate(self.nurses):
+            nurse_id = getattr(nurse, 'db_id', None)
+            for day in range(self.num_days):
                 if not self._check_consecutive_night_limit(n_idx, day):
                     violations.append({'type': 'night_consecutive', 'nurse_idx': n_idx, 'day': day})
                 if not self._check_day_after_night(n_idx, day):
@@ -386,14 +401,70 @@ class RosterSystem:
                     violations.append({'type': 'night_ne', 'nurse_idx': n_idx, 'day': day})
                 if getattr(self.config, 'ban_e_to_d', True) and not self._check_eve_before_day(n_idx, day):
                     violations.append({'type': 'eve_ed', 'nurse_idx': n_idx, 'day': day})
-                if not self._check_monthly_night_limit(n_idx, day):
-                    violations.append({'type': 'night_month_limit', 'nurse_idx': n_idx, 'day': day})
 
-                # ── 2‑B. 연속 근무일 🔄
+                if (
+                    getattr(self.config, 'ban_d_to_n', True)
+                    and day > 0
+                    and day_idx is not None
+                    and night_idx is not None
+                    and self.roster[n_idx, day - 1, day_idx] == 1
+                    and self.roster[n_idx, day, night_idx] == 1
+                ):
+                    violations.append({'type': 'day_night_dn', 'nurse_idx': n_idx, 'day': day})
+
+                if (
+                    getattr(self.config, 'not_one_night', False)
+                    and night_idx is not None
+                    and self.roster[n_idx, day, night_idx] == 1
+                ):
+                    left_n = day > 0 and self.roster[n_idx, day - 1, night_idx] == 1
+                    right_n = day + 1 < self.num_days and self.roster[n_idx, day + 1, night_idx] == 1
+                    if not left_n and not right_n:
+                        violations.append({'type': 'not_one_night', 'nurse_idx': n_idx, 'day': day})
+
+                if (
+                    getattr(self.config, 'weekend_off_only_enable', True)
+                    and bool(getattr(nurse, 'is_weekend_off', False))
+                    and off_idx is not None
+                    and (self.target_month + timedelta(days=day)).weekday() < 5
+                    and self.roster[n_idx, day, off_idx] == 1
+                ):
+                    violations.append({'type': 'weekend_off_only', 'nurse_idx': n_idx, 'day': day})
+
                 if not self._check_max_consecutive_work_days(n_idx, day):
                     violations.append({'type': 'consecutive_work', 'nurse_idx': n_idx, 'day': day})
 
-        # ── 2‑A2. 3N→2O, 2N→2O (회복 OFF, nurse·end_day 기준 1회씩) 🔄
+                init_forbidden = getattr(self, 'initial_forbidden', None)
+                if isinstance(init_forbidden, dict):
+                    forbidden_codes = set(init_forbidden.get((n_idx, day), set()) or set())
+                    assigned_idx = _assigned_shift_idx(n_idx, day)
+                    if assigned_idx is not None:
+                        assigned_code = str(shift_types[assigned_idx]).upper()
+                        if assigned_code in forbidden_codes:
+                            violations.append(
+                                {
+                                    'type': 'initial_forbidden',
+                                    'nurse_idx': n_idx,
+                                    'nurse_id': nurse_id,
+                                    'day': day,
+                                    'shift': assigned_code,
+                                }
+                            )
+
+            if night_idx is not None:
+                monthly_nights = int(np.sum(self.roster[n_idx, :, night_idx]))
+                max_nights = int(getattr(self.config, 'max_night_shifts_per_month', 0) or 0)
+                if monthly_nights > max_nights:
+                    violations.append(
+                        {
+                            'type': 'night_month_limit',
+                            'nurse_idx': n_idx,
+                            'nurse_id': nurse_id,
+                            'required': max_nights,
+                            'actual': monthly_nights,
+                        }
+                    )
+
         if getattr(self.config, 'two_offs_after_three_nig', False):
             for n_idx in range(len(self.nurses)):
                 for end_d in range(2, self.num_days - 2):

@@ -209,18 +209,18 @@ def _compute_shortages(rs, roster, nurse_grades, constraints_map, grade_values, 
             sum_base = sum(base_min.values())
             if sum_base <= 0:
                 continue
-            target = {}
-            for g in grade_values:
-                t = math.ceil(req * base_min.get(g, 0) / sum_base)
-                target[g] = min(t, req)
-            if min_leader_keep and 1 in base_min and base_min.get(1, 0) > 0 and req > 0:
-                target[1] = min(max(1, target.get(1, 0)), req)
-            if min_ratio_floor is not None and sum_base > 0:
-                ratio = req / sum_base
-                ratio = max(min_ratio_floor, min(1.0, ratio))
-                for g in grade_values:
-                    t = math.ceil(req * base_min.get(g, 0) / sum_base * ratio)
-                    target[g] = min(max(target.get(g, 0), t), req)
+            available = {
+                g: _available_grade(rs, nurse_grades, d, s_code, g, join, leave)
+                for g in grade_values
+            }
+            target = _compute_feasible_targets(
+                req=req,
+                base_min=base_min,
+                grade_values=grade_values,
+                min_leader_keep=min_leader_keep,
+                min_ratio_floor=min_ratio_floor,
+                available=available,
+            )
 
             assigned = {g: 0 for g in grade_values}
             for n_idx in range(len(nurse_grades)):
@@ -232,7 +232,7 @@ def _compute_shortages(rs, roster, nurse_grades, constraints_map, grade_values, 
                 short = max(0, target.get(g, 0) - assigned.get(g, 0))
                 if short > 0:
                     # scarcity: target / available
-                    avail = _available_grade(rs, nurse_grades, d, s_code, g, join, leave)
+                    avail = available.get(g, 0)
                     scarcity = (target.get(g, 0) / max(1, avail))
                     shortages.append({
                         "day": d,
@@ -244,6 +244,62 @@ def _compute_shortages(rs, roster, nurse_grades, constraints_map, grade_values, 
                         "scarcity": scarcity,
                     })
     return shortages
+
+
+def _compute_feasible_targets(
+    req: int,
+    base_min: dict[int, int],
+    grade_values: list[int],
+    min_leader_keep: bool,
+    min_ratio_floor: float | None,
+    available: dict[int, int],
+) -> dict[int, int]:
+    target = {g: 0 for g in grade_values}
+    sum_base = sum(base_min.values())
+    if req <= 0 or sum_base <= 0:
+        return target
+
+    ratio = min(1.0, req / float(sum_base))
+    if min_ratio_floor is not None:
+        ratio = max(float(min_ratio_floor), ratio)
+        ratio = min(1.0, ratio)
+
+    for g in grade_values:
+        target[g] = int(math.floor(base_min.get(g, 0) * ratio))
+
+    if (
+        min_leader_keep
+        and 1 in grade_values
+        and base_min.get(1, 0) > 0
+        and req > 0
+        and target.get(1, 0) == 0
+        and available.get(1, 0) > 0
+    ):
+        target[1] = 1
+
+    total = sum(target.values())
+    if total > req:
+        while total > req:
+            g = max(target.keys(), key=lambda x: (target[x], x))
+            if target[g] <= 0:
+                break
+            target[g] -= 1
+            total -= 1
+    elif total < req:
+        order = sorted(target.keys(), key=lambda g: (-base_min.get(g, 0), g))
+        i = 0
+        while total < req and order:
+            g = order[i % len(order)]
+            target[g] += 1
+            total += 1
+            i += 1
+
+    for g in grade_values:
+        avail = max(0, int(available.get(g, 0)))
+        if target[g] > avail:
+            target[g] = avail
+
+    return target
 
 
 def _is_night_only(nurse) -> bool:
@@ -400,4 +456,3 @@ def _compute_join_leave(rs):
         join.append(j)
         leave.append(l)
     return join, leave
-

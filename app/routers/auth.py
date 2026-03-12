@@ -453,8 +453,9 @@ async def handle_find_id_request(
 
     if member_row:
         return {"result": "succeed", "memberid" :  member_row[0]['memberid'] }
-    else:
-        return {"result": "fail", "message" : "일치하는 회원정보가 없습니다." }
+    # else:
+    #     return {"result": "fail", "message" : "일치하는 회원정보가 없습니다." }
+    raise HTTPException(status_code=500, detail="일치하는 회원정보가 없습니다.")
 
 @router.post("/find_pw")
 async def handle_find_pw_request(
@@ -471,7 +472,8 @@ async def handle_find_pw_request(
     pw_chk_result = msdb_manager.fetch_all(Member.find_pw_chk(), params=(memberID, EmployeeName))
 
     if not pw_chk_result:
-        return {"result": "fail", "message" : "일치하는 회원정보가 없습니다."}
+        # return {"result": "fail", "message" : "일치하는 회원정보가 없습니다."}
+        raise HTTPException(status_code=500, detail="일치하는 회원정보가 없습니다.")
 
     # 회원데이터
     phoneNum_chk = pw_chk_result[0]['PortableTel']

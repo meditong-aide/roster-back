@@ -75,24 +75,16 @@ def add_grade_constraints(
 
             s_idx = rs.config.shift_types.index(s_code)
 
-            # 1) 목표분배 계산: target_g = ceil(req * base_g / sum_base)
-            target = {}
-            for g in grade_values:
-                t = math.ceil(req * base_min.get(g, 0) / sum_base)
-                target[g] = min(t, req)
+            target = _compute_targets(
+                base_min=base_min,
+                req=req,
+                grade_values=grade_values,
+                use_dynamic_scaling=scaling["use_dynamic_scaling"],
+                min_ratio_floor=scaling["min_ratio_floor"],
+                min_leader_keep=scaling["min_leader_keep"],
+                by_grade=by_grade,
+            )
 
-            # 2) 리더 최소 보존
-            if (
-                scaling["min_leader_keep"]
-                and 1 in grade_values
-                and base_min.get(1, 0) > 0
-                and req > 0
-            ):
-                target[1] = min(max(1, target.get(1, 0)), req)
-
-            # 3) 배정/가용 계산
-            assigned_vars = {g: [X(n, d, s_idx) for n in by_grade.get(g, [])] for g in grade_values}
-            assigned_sum = {g: sum(assigned_vars.get(g, [])) for g in grade_values}
             available = _available_by_grade_for_day_shift(
                 rs=rs,
                 by_grade=by_grade,
@@ -102,22 +94,26 @@ def add_grade_constraints(
                 join=join,
                 leave=leave,
             )
+            _clamp_targets_to_available(
+                target=target,
+                available=available,
+                day_idx=d,
+                shift_code=s_code,
+                req=req,
+            )
 
-            # 4) 분배 패널티: |assigned - target| (over/under)
-            for g in grade_values:
-                tgt = int(target.get(g, 0))
-                if tgt <= 0:
-                    continue
-                # 목표가 가용보다 크면 목표를 가용으로 클램프 (단, 소프트이므로 크게 문제 없음)
-                if tgt > available.get(g, 0):
-                    tgt = available.get(g, 0)
-                over = m.NewIntVar(0, req, f"grade_over_{d}_{s_code}_{g}")
-                under = m.NewIntVar(0, req, f"grade_under_{d}_{s_code}_{g}")
-                m.Add(assigned_sum[g] - tgt <= over)
-                m.Add(tgt - assigned_sum[g] <= under)
-                obj_terms.append(-scaling["grade_penalty_weight"] * over)
-                obj_terms.append(-scaling["grade_penalty_weight"] * under)
-    return obj_terms
+            obj_terms.extend(
+                _add_minimum_constraints(
+                    m=m,
+                    X=X,
+                    by_grade=by_grade,
+                    day_idx=d,
+                    shift_idx=s_idx,
+                    target=target,
+                    allow_soft_fallback=scaling["allow_soft_fallback"],
+                    penalty_weight=scaling["grade_penalty_weight"],
+                )
+            )
     return obj_terms
 
 
@@ -430,5 +426,3 @@ def _add_minimum_constraints(
         else:
             m.Add(vars_sum >= int(t))
     return obj_terms
-
-

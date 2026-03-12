@@ -189,6 +189,8 @@ async def get_config_by_version(
                 not_one_night=getattr(cfg, 'not_one_night', False),
                 use_mid=False,
                 fixed_wanted_use_yn=getattr(cfg, 'fixed_wanted_use_yn', False),
+                show_level=getattr(cfg, 'show_level', True),
+                show_preceptor=getattr(cfg, 'show_preceptor', True),
             )
             db.add(new_config)
 
@@ -227,6 +229,8 @@ async def get_config_by_version(
                 "not_one_night" : new_config.not_one_night,
                 "use_mid": bool(getattr(new_config, "use_mid", False)),
                 "fixed_wanted_use_yn" : new_config.fixed_wanted_use_yn,
+                "show_level": new_config.show_level,
+                "show_preceptor": new_config.show_preceptor,
             }
         else:
             config = db.query(RosterConfigModel).filter(
@@ -267,6 +271,8 @@ async def get_config_by_version(
                 "not_one_night" : config.not_one_night,
                 "use_mid": bool(getattr(config, "use_mid", False)),
                 "fixed_wanted_use_yn" : config.fixed_wanted_use_yn,
+                "show_level": config.show_level,
+                "show_preceptor": config.show_preceptor,
             }
     except Exception as e:
         print('error', e)
