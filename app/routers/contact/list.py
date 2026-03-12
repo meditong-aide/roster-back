@@ -62,6 +62,8 @@ def message_view(page: int, pagesize: int, current_user: UserSchema = Depends(ge
         "Tel": row['Tel'],
         "wEmail": row['wEmail'],
         "replycontent": row['replycontent'],
+        "Comment": row['Comment'],         # 관리자 답변 내용
+        "Manager": row['Manager'],         # 담당자
         "jobState": row['jobState']
     } for row in rows]
 
