@@ -670,6 +670,15 @@ def _share_resolve_target_scope(current_user, db: Session, override_group_id: st
     return group_id, office_id
 
 
+
+
+def _share_build_object_prefix(office_id: str, group_id: str, nurse_id: str | None, year: int, month: int) -> str:
+    safe_office_id = str(office_id or "unknown")
+    safe_group_id = str(group_id or "unknown")
+    safe_nurse_id = str(nurse_id or "unknown")
+    return f"og-images/{safe_office_id}/{safe_group_id}/{safe_nurse_id}/{int(year):04d}/{int(month):02d}"
+
+
 def _share_find_by_token(db: Session, token: str) -> dict | None:
     from db.models import ShareLink
 
@@ -798,8 +807,28 @@ def upload_schedule_share_image_and_create_link_service(
         raise ValueError("share S3 bucket env is not configured")
     region = os.getenv("AWS_REGION", "ap-northeast-2")
 
+    target_group_id, target_office_id = _share_resolve_target_scope(
+        current_user=current_user,
+        db=db,
+        override_group_id=override_group_id,
+    )
+    schedule = db.query(Schedule).filter(
+        Schedule.schedule_id == schedule_id,
+        Schedule.group_id == target_group_id,
+        Schedule.office_id == target_office_id,
+    ).first()
+    if not schedule:
+        raise LookupError("Schedule not found for your scope")
+
     ext = allowed_types[content_type]
-    object_key = f"og-images/{schedule_id}/{secrets.token_hex(16)}{ext}"
+    object_prefix = _share_build_object_prefix(
+        office_id=target_office_id,
+        group_id=target_group_id,
+        nurse_id=getattr(current_user, "nurse_id", None),
+        year=int(schedule.year),
+        month=int(schedule.month),
+    )
+    object_key = f"{object_prefix}/{secrets.token_hex(16)}{ext}"
 
     try:
         s3_client = _share_build_s3_client(region)
@@ -921,7 +950,14 @@ def auto_generate_schedule_share_image_and_create_link_service(
     if not bucket_name:
         raise ValueError("share S3 bucket env is not configured")
     region = os.getenv("AWS_REGION", "ap-northeast-2")
-    object_key = f"og-images/{schedule_id}/auto-{secrets.token_hex(16)}.png"
+    object_prefix = _share_build_object_prefix(
+        office_id=target_office_id,
+        group_id=target_group_id,
+        nurse_id=getattr(current_user, "nurse_id", None),
+        year=year,
+        month=month,
+    )
+    object_key = f"{object_prefix}/auto-{secrets.token_hex(16)}.png"
 
     try:
         s3_client = _share_build_s3_client(region)
@@ -1023,7 +1059,14 @@ def capture_schedule_share_image_and_create_link_service(
     region = os.getenv("AWS_REGION", "ap-northeast-2")
 
     ext = allowed_types[mime_type]
-    object_key = f"og-images/{schedule_id}/capture-{secrets.token_hex(16)}{ext}"
+    object_prefix = _share_build_object_prefix(
+        office_id=target_office_id,
+        group_id=target_group_id,
+        nurse_id=getattr(current_user, "nurse_id", None),
+        year=int(schedule.year),
+        month=int(schedule.month),
+    )
+    object_key = f"{object_prefix}/capture-{secrets.token_hex(16)}{ext}"
 
     try:
         s3_client = _share_build_s3_client(region)
