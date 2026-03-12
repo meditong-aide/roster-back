@@ -15,12 +15,13 @@ class WantedDeadlineRequest(BaseModel):
     # exp_date: Optional[datetime] = None
     exp_date: Optional[datetime] = Field(
         None,
-        description="마감일 (선택). null 또는 생략 시 '마감일 없음'으로 처리됩니다."
+        description="마감일 (선택). null 또는 생략 시 '마감일 없음'으로 처리됩니다.",
     )
 
 
 class MoveShiftRequest(BaseModel):
     """시프트 순서 이동 요청 모델."""
+
     shift_id: str
     new_sequence: int
 
@@ -32,11 +33,13 @@ class MoveNurseRequest(BaseModel):
 
 class RemoveShiftRequest(BaseModel):
     """시프트 삭제 요청 모델."""
+
     shift_id: str
 
 
 class ShiftUpdateRequest(BaseModel):
     """시프트 수정 요청 모델."""
+
     default_shift: Optional[str] = None
     shift_gb: Optional[str] = None
     shift_id: str
@@ -51,11 +54,12 @@ class ShiftUpdateRequest(BaseModel):
     auto_schedule: Optional[int] = 1
     id: int
     # 추가
-    show_in_preference: Optional[bool] = None # None이면 기존 값 유지
+    show_in_preference: Optional[bool] = None  # None이면 기존 값 유지
 
 
 class ShiftAddRequest(BaseModel):
     """시프트 등록 요청 모델."""
+
     default_shift: Optional[str] = None
     shift_gb: Optional[str] = None
     shift_id: str
@@ -70,11 +74,14 @@ class ShiftAddRequest(BaseModel):
     auto_schedule: Optional[int] = 1
     # id: int
     # 추가 내역
-    show_in_preference: Optional[bool] = False # 기본 False, 프론트에서 안 보내면 자동 숨김
+    show_in_preference: Optional[bool] = (
+        False  # 기본 False, 프론트에서 안 보내면 자동 숨김
+    )
 
 
 class ShiftUploadConfirmRequest(BaseModel):
     """근무코드 엑셀 업로드 확정 요청 모델."""
+
     rows: List[dict]
     group_id: Optional[str] = None
 
@@ -86,6 +93,7 @@ class RosterRequest(BaseModel):
         - `preceptor_gauge` 등 기존 게이지와 동일하게, 분배 정책도 req로 주입받아 실행마다 조절한다.
         - 월단위 선호는 개인 입력값(간호사별)이고, 반영 강도/모드는 수간호사(생성 요청자)가 선택한다.
     """
+
     year: int
     month: int
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
@@ -103,9 +111,13 @@ class RosterRequest(BaseModel):
     monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
     # 월단위 선호(개인 입력): nurse_id -> {"shift": "D|E|N", "strength": 0~10}
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
-    not_one_night: Optional[bool] = Field(default=None, description="야간 단발성(1N) 금지 여부")
+    not_one_night: Optional[bool] = Field(
+        default=None, description="야간 단발성(1N) 금지 여부"
+    )
     # 확정 원티드 사용 여부 (True: FixedWantedEntry 사용, False: 기존 WantedRequest 사용)
-    use_fixed_wanted: bool = Field(default=False, description="(미사용) 확정 원티드가 존재하면 자동 적용됨")
+    use_fixed_wanted: bool = Field(
+        default=False, description="(미사용) 확정 원티드가 존재하면 자동 적용됨"
+    )
 
 
 class PreferenceSubmit(BaseModel):
@@ -160,6 +172,7 @@ class WantedInvokeResponse(BaseModel):
 # - GLOBAL, NURSE_LIMIT 설정은 nurses 테이블로 이동됨
 class WantedConfigBase(BaseModel):
     """일자별 원티드 제한 설정 기본 스키마 (DAILY_LIMIT 전용)"""
+
     year: Optional[int] = None
     month: Optional[int] = None
     max_requests: Optional[int] = None  # 해당 일자 최대 요청 개수
@@ -170,11 +183,13 @@ class WantedConfigBase(BaseModel):
 
 class WantedConfigCreate(WantedConfigBase):
     """원티드 설정 생성/수정 요청 스키마"""
+
     pass
 
 
 class WantedConfig(WantedConfigBase):
     """원티드 설정 조회 응답 스키마"""
+
     config_id: int
     group_id: str
     created_at: datetime
@@ -207,16 +222,29 @@ class RosterConfigBase(BaseModel):
     not_one_night: bool = Field(default=False, description="야간 단발성(1N) 금지 여부")
     use_mid: bool = Field(default=False)
     preceptor_gauge: float
-    preceptee_on: bool = Field(default=False, description="프리셉티 팔로우 모드 (ON 시 프리셉터 근무 따라감)")
-    preceptee_shift_count: bool = Field(default=True, description="프리셉티 커버리지 포함 여부 (ON: DEN 포함, OFF: DEN 제외, preceptee_on=True일 때만 유효)")
+    preceptee_on: bool = Field(
+        default=False, description="프리셉티 팔로우 모드 (ON 시 프리셉터 근무 따라감)"
+    )
+    preceptee_shift_count: bool = Field(
+        default=True,
+        description="프리셉티 커버리지 포함 여부 (ON: DEN 포함, OFF: DEN 제외, preceptee_on=True일 때만 유효)",
+    )
     weekly_off_group: bool = Field(default=False)
     team_balance_enable: bool = Field(default=False)
     team_balance_gauge: int = Field(default=0, ge=0, le=10)
     team_balance_mode: str = Field(default="balanced")
-    off_placement_mode: int = Field(default=1, description="주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)")
-    fixed_wanted_use_yn: bool = Field(default=False, description="확정 원티드 DENO 전체 고정 여부")
-    show_level: bool = Field(default=True, description="근무표에 직책(level_) 표시 여부")
-    show_preceptor: bool = Field(default=True, description="근무표에 프리셉터-프리셉티 관계 표시 여부")
+    off_placement_mode: int = Field(
+        default=1, description="주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)"
+    )
+    fixed_wanted_use_yn: bool = Field(
+        default=False, description="확정 원티드 DENO 전체 고정 여부"
+    )
+    show_level: bool = Field(
+        default=True, description="근무표에 직책(level_) 표시 여부"
+    )
+    show_preceptor: bool = Field(
+        default=True, description="근무표에 프리셉터-프리셉티 관계 표시 여부"
+    )
 
 
 class RosterConfigCreate(RosterConfigBase):
@@ -232,6 +260,7 @@ class RosterConfig(RosterConfigBase):
 
     class Config:
         from_attributes = True
+
 
 # class CodeMapp(StrEnum):
 #     D = "D"
@@ -267,15 +296,16 @@ class NurseProfile(BaseModel):
     # Side-Profile 추가 컬럼
     birth_date: Optional[str] = None
     phone_number: Optional[str] = None
-    age: Optional[int] = None # 나이
+    age: Optional[int] = None  # 나이
     gender: Optional[str] = None
+    profile_image_url: Optional[str] = None
     # 추가
     team_id: Optional[int] = None
     is_weekend_off: bool = Field(default=False)  # 주말 휴무 여부
     # 추가
     work_shifts: Optional[List[str]] = Field(
         default_factory=list,
-        description="근무 가능 형태 배열. 예: ['D', 'E2', 'N1', 'MD'] 또는 ['D', 'N']"
+        description="근무 가능 형태 배열. 예: ['D', 'E2', 'N1', 'MD'] 또는 ['D', 'N']",
     )
     # 원티드 설정 (간호사별 개별 설정)
     enable_nurse_pair_preference: Optional[bool] = None  # 시크릿 기능 활성화
@@ -283,7 +313,9 @@ class NurseProfile(BaseModel):
     wanted_max_requests: Optional[int] = None  # 원티드 요청 개수 제한 (휴무/휴가)
     # 근무표 설정 메타 플래그 (roster_config 참조)
     show_level: bool = Field(default=True, description="직책(level_) 표시 여부")
-    show_preceptor: bool = Field(default=True, description="프리셉터-프리셉티 관계 표시 여부")
+    show_preceptor: bool = Field(
+        default=True, description="프리셉터-프리셉티 관계 표시 여부"
+    )
 
     # @field_validator('fixed_shift')
     # @classmethod
@@ -308,7 +340,9 @@ class ExcelValidationRequest(BaseModel):
 class NurseSequenceUpdate(BaseModel):
     nurse_id: str
     new_sequence: int = Field(ge=1)
-    active: Optional[int] = Field(default=None, description="0: 비활성, 1: 활성, None: 변경 없음")
+    active: Optional[int] = Field(
+        default=None, description="0: 비활성, 1: 활성, None: 변경 없음"
+    )
 
 
 class ReorderPayload(BaseModel):
@@ -325,12 +359,13 @@ class ExcelConfirmRequest(BaseModel):
 class ScheduleMemoUpdate(BaseModel):
     schedule_id: str
     memo: str | None = None
-    group_id: str | None = None 
+    group_id: str | None = None
 
 
 class IntegratedRegisterRequest(BaseModel):
     group_id: str
     members: List[Dict[str, Any]]  # 한국어 키로 입력
+
 
 class AddToGroupRequest(BaseModel):
     nurse_ids: List[str]
@@ -339,6 +374,7 @@ class AddToGroupRequest(BaseModel):
 
 class ShiftImportRequest(BaseModel):
     """근무코드 타 병동 가져오기 요청"""
+
     shift_ids: List[str]
     group_id: str
 
@@ -346,27 +382,37 @@ class ShiftImportRequest(BaseModel):
 # 마이 페이지 테스트
 class PersonnelUpdate(BaseModel):
     """마이페이지 기본 정보 수정 (이메일 + 총경력만 허용)"""
+
     email: Optional[EmailStr] = Field(None, description="이메일 주소")
     experience: Optional[int] = Field(None, ge=0, description="총 경력(년)")
 
 
 class PasswordChangeRequest(BaseModel):
     """비밀번호 변경 요청 (SMS 인증 후 사용)"""
+
     current_password: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=8)
     confirm_password: str = Field(..., min_length=8)
-    verification_code: Optional[str] = Field(None, description="SMS 인증번호 (최초 요청 시 생략)")
+    verification_code: Optional[str] = Field(
+        None, description="SMS 인증번호 (최초 요청 시 생략)"
+    )
 
 
 class PhoneChangeRequest(BaseModel):
     """휴대폰 번호 변경 요청"""
-    new_phone_number: str = Field(..., pattern=r"^01[0-9]{8,9}$", description="새 휴대폰 번호")
-    verification_code: Optional[str] = Field(None, description="인증번호 (검증 단계에서만 사용)")
+
+    new_phone_number: str = Field(
+        ..., pattern=r"^01[0-9]{8,9}$", description="새 휴대폰 번호"
+    )
+    verification_code: Optional[str] = Field(
+        None, description="인증번호 (검증 단계에서만 사용)"
+    )
 
 
 # Fixed Wanted (확정 원티드) 스키마
 class FixedWantedEntryCreate(BaseModel):
     """확정 원티드 항목 생성 요청"""
+
     nurse_id: str
     shift_date: date
     shift_id: str
@@ -379,6 +425,7 @@ class FixedWantedEntryCreate(BaseModel):
 
 class FixedWantedCreate(BaseModel):
     """확정 원티드 저장 요청"""
+
     year: int
     month: int
     entries: List[FixedWantedEntryCreate]
@@ -386,6 +433,7 @@ class FixedWantedCreate(BaseModel):
 
 class FixedWantedEntryResponse(BaseModel):
     """확정 원티드 항목"""
+
     id: int
     group_id: str
     year: int
@@ -406,6 +454,7 @@ class FixedWantedEntryResponse(BaseModel):
 
 class AdjustmentNurse(BaseModel):
     """원티드 조정판 - 간호사별 데이터"""
+
     nurse_id: str
     name: str
     entries: List[FixedWantedEntryResponse]
@@ -414,12 +463,14 @@ class AdjustmentNurse(BaseModel):
 
 class AdjustmentResponse(BaseModel):
     """원티드 조정판 조회 응답"""
+
     nurses: List[AdjustmentNurse]
     has_fixed_wanted: bool = False  # 저장된 확정 원티드 존재 여부
 
 
 class FixedWantedListResponse(BaseModel):
     """확정 원티드 목록 조회 응답 (근무표 생성용)"""
+
     group_id: str
     year: int
     month: int
@@ -432,10 +483,10 @@ class FixedWantedListResponse(BaseModel):
 
 class ToggleEntryResponse(BaseModel):
     """항목 토글 응답"""
+
     id: int
     is_applied: bool
     message: str
-
 
 
 class ScheduleShareCreateRequest(BaseModel):
@@ -445,12 +496,10 @@ class ScheduleShareCreateRequest(BaseModel):
     expires_in_days: int = Field(default=3, ge=1, le=365)
 
 
-
 class ScheduleShareAutoCreateRequest(BaseModel):
     title: Optional[str] = "근무표 공유"
     description: Optional[str] = "공유된 근무표입니다."
     expires_in_days: int = Field(default=3, ge=1, le=365)
-
 
 
 class ScheduleShareCaptureCreateRequest(BaseModel):
