@@ -256,6 +256,8 @@ class NurseProfile(BaseModel):
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
     resignation_date: Optional[datetime] = None
+    resignation_reason: Optional[str] = None
+    resignation_reason_memo: Optional[str] = None
     sequence: Optional[int] = 0
     active: int = 1
     fixed_shift: Optional[str] = None

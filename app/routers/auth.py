@@ -211,6 +211,7 @@ async def login_for_access_token(
                 "qpis_useYN": qpis_useYN,
                 "official_title_name": official_title_name,  # 추가 필드
                 "hn_auth": hn_auth,  # 그룹 관리자 권한
+                "original_group_id": group_id,  # 로그인 시 DB 기준 원래 소속 그룹
                 # 일단은 토큰에는 추가 안함
                 # "is_nurse_registered": is_nurse_registered,
             },
@@ -292,6 +293,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         qpis_useYN: str = payload.get("qpis_useYN")
         official_title_name: str = payload.get("official_title_name")  # 추가 필드
         hn_auth: str = payload.get("hn_auth")  # 그룹 관리자 권한
+        original_group_id: str = payload.get("original_group_id")
         if account_id is None:
             return None
         token_data = TokenData(account_id=account_id)
@@ -317,6 +319,7 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         qpis_useYN = qpis_useYN,
         official_title_name=official_title_name,  # 추가 필드
         hn_auth=hn_auth,  # 그룹 관리자 권한
+        original_group_id=original_group_id,
     )
 
 @router.get("/me", response_model=UserSchema)
@@ -402,6 +405,7 @@ async def switch_group(
             "qpis_useYN": current_user.qpis_useYN,
             "official_title_name": current_user.official_title_name,
             "hn_auth": current_user.hn_auth,  # 그룹 관리자 권한 유지
+            "original_group_id": current_user.original_group_id or current_user.group_id,  # 원래 소속 그룹 유지
         },
         expires_delta=access_token_expires,
     )

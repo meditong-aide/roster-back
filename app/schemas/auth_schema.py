@@ -24,6 +24,7 @@ class User(BaseModel):
     # 추가
     is_nurse_registered: bool = False
     hn_auth: str | None = None  # 그룹 관리자 권한 ('HN' 또는 None)
+    original_group_id: str | None = None  # 원래 소속 그룹 (switch-group 전 DB 기준)
 
 
     class Config:
