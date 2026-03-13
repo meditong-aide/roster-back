@@ -582,7 +582,18 @@ def optimize_fallback_lex_hard_first(
                         1
                         for d in range(T0, T1 + 1)
                         if (n, d) in structural_off_cells
+                        and (n, d) not in vacation_off_cells
                     )
+                    # DB강제 O 셀(fixed O, 비vacation)도 forced_off_cnt에 포함
+                    # cp_sat_basic의 override 로직과 동일 기준으로 맞춤
+                    if off_idx is not None:
+                        forced_off_cnt += sum(
+                            1
+                            for d in range(T0, T1 + 1)
+                            if (n, d) not in vacation_off_cells
+                            and (n, d) not in structural_off_cells
+                            and fixed.get((n, d)) == off_idx
+                        )
                     nu = roster_system.nurses[n]
                     raw = getattr(nu, "is_night_nurse", None)
                     is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
@@ -621,7 +632,15 @@ def optimize_fallback_lex_hard_first(
                         forced_days = [
                             d_idx + 1
                             for d_idx in range(T0, T1 + 1)
-                            if (n, d_idx) in structural_off_cells
+                            if (
+                                ((n, d_idx) in structural_off_cells and (n, d_idx) not in vacation_off_cells)
+                                or (
+                                    off_idx is not None
+                                    and (n, d_idx) not in vacation_off_cells
+                                    and (n, d_idx) not in structural_off_cells
+                                    and fixed.get((n, d_idx)) == off_idx
+                                )
+                            )
                         ]
                         nurse_id = getattr(nu, "nurse_id", "?")
                         nurse_name = getattr(nu, "name", "?")

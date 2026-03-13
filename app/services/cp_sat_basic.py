@@ -2680,6 +2680,21 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             int(off_bounds["max_off_allowed"]),
                             nonvac_active_days,
                         )
+                        # forced_off(DB강제 O) 중 vacation 제외 셀 수가 max_off_allowed 초과 시
+                        # fallback_lex의 per_nurse_off_cap_override와 동일한 처리
+                        forced_nonvac_fixed_cnt = sum(
+                            1
+                            for d in phys_range_off
+                            if (n, d) not in vacation_off_cells
+                            and fixed.get((n, d)) == off
+                        )
+                        if forced_nonvac_fixed_cnt > max_off_allowed:
+                            print(
+                                f"[OffCap][Init][Override] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
+                                f"forced_nonvac_fixed={forced_nonvac_fixed_cnt} > max_off_policy={max_off_allowed} "
+                                f"→ override to {forced_nonvac_fixed_cnt}"
+                            )
+                            max_off_allowed = min(forced_nonvac_fixed_cnt, nonvac_active_days)
                         m.Add(
                             sum(
                                 X(n, d, off)
