@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import calendar
 from datetime import timedelta
 from typing import Dict, Optional
 
@@ -197,6 +198,7 @@ def optimize_fallback_lex_hard_first(
     # print('이미 있음 off_exception_cells', off_exception_cells)
     # print('이미 있음 off_exception_vacation_cells', off_exception_vacation_cells)
     first_day = roster_system.target_month
+    D_phys = calendar.monthrange(first_day.year, first_day.month)[1]
     last_day = first_day + timedelta(days=D - 1)
     weekend_days = {d for d in range(D) if (first_day + timedelta(days=d)).weekday() >= 5}
     join, leave = [], []
@@ -595,10 +597,21 @@ def optimize_fallback_lex_hard_first(
                         max_off_allowed = max(0, avail_days - 15) + relax_level
                         # print(f'is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     else:
+                        vacation_cnt = sum(
+                            1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells
+                        )
+                        weekend_slots_nonvac = sum(
+                            1
+                            for d in weekend_days
+                            if T0 <= d <= T1 and (n, d) not in vacation_off_cells
+                        )
                         off_bounds = compute_off_bounds(
                             source=cfg,
                             avail_days=avail_days,
-                            vacation_cnt=0,
+                            vacation_cnt=vacation_cnt,
+                            reference_days=D_phys,
+                            weekend_only=bool(getattr(nu, "is_weekend_off", False)),
+                            weekend_slots_nonvac=weekend_slots_nonvac,
                         )
                         max_off_allowed = int(off_bounds["max_off_allowed"]) + relax_level
                         # print(f'not is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
@@ -1259,6 +1272,9 @@ def optimize_fallback_lex_hard_first(
                         if isinstance(weekly_off_by_idx, dict)
                         else 0
                     )
+                    vacation_cnt = sum(
+                        1 for d in range(join[n], leave[n] + 1) if (n, d) in vacation_off_cells
+                    )
                     weekend_forced = 0
                     if bool(getattr(nu, "is_weekend_off", False)):
                         try:
@@ -1274,7 +1290,18 @@ def optimize_fallback_lex_hard_first(
                             )
                         except Exception:
                             weekend_forced = 0
-                    target_o = max(0, effective_off_days - (weekly_target + weekend_forced))
+                    off_bounds_for_target = compute_off_bounds(
+                        source=cfg,
+                        avail_days=(leave[n] - join[n] + 1),
+                        vacation_cnt=vacation_cnt,
+                        reference_days=D_phys,
+                        weekend_only=bool(getattr(nu, "is_weekend_off", False)),
+                        weekend_slots_nonvac=weekend_forced,
+                    )
+                    min_target = int(off_bounds_for_target["min_off_required"])
+                    max_target = int(off_bounds_for_target["max_off_allowed"])
+                    raw_target_o = max(0, effective_off_days - (weekly_target + weekend_forced))
+                    target_o = min(max(raw_target_o, min_target), max_target)
                     if target_o <= 0:
                         continue
                     # 휴가/공가는 개인 O 목표 충족에서 제외
@@ -1322,6 +1349,13 @@ def optimize_fallback_lex_hard_first(
                     source=cfg,
                     avail_days=avail_days,
                     vacation_cnt=vacation_cnt,
+                    reference_days=D_phys,
+                    weekend_only=is_weekend_off,
+                    weekend_slots_nonvac=sum(
+                        1
+                        for d in weekend_days
+                        if T0 <= d <= T1 and (n, d) not in vacation_off_cells
+                    ),
                 )
                 min_off_required = int(off_bounds["min_off_required"])
                 max_off_allowed_from_policy = int(off_bounds["max_off_allowed"])

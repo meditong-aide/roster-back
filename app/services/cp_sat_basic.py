@@ -2448,22 +2448,18 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     d + 1 for d in (weekly_off_by_idx.get(n, []) or []) if T0 <= d <= T1
                 )
                 is_weekend_only = bool(getattr(nu, "is_weekend_off", False))
-                base_min_off = int(
-                    getattr(cfg, "global_monthly_off_days", 0)
-                    + getattr(cfg, "standard_personal_off_days", 8)
-                )
-                # 휴가/공가는 최소 OFF에서 제외 (coverage 혼동 방지)
-                min_off_required = max(0, min(base_min_off, (T1 - T0 + 1) - vac_cnt_in_range))
-                extra_allowed = int(getattr(cfg, "max_extra_off_days", 0))
                 weekend_cnt = len(weekend_in_range)
-                if is_weekend_only:
-                    weekend_nonvac_cnt = max(0, weekend_cnt - vac_cnt_in_range)
-                    min_off_required = weekend_nonvac_cnt
-                    max_off_allowed = weekend_nonvac_cnt
-                else:
-                    max_off_allowed = min(
-                        min_off_required + max(0, extra_allowed), T1 - T0 + 1
-                    )
+                weekend_nonvac_cnt = max(0, weekend_cnt - vac_cnt_in_range)
+                off_bounds_in_range = compute_off_bounds(
+                    source=cfg,
+                    avail_days=(T1 - T0 + 1),
+                    vacation_cnt=vac_cnt_in_range,
+                    reference_days=D_phys,
+                    weekend_only=is_weekend_only,
+                    weekend_slots_nonvac=weekend_nonvac_cnt,
+                )
+                min_off_required = int(off_bounds_in_range["min_off_required"])
+                max_off_allowed = int(off_bounds_in_range["max_off_allowed"])
                 weekday_off_cap = max(0, max_off_allowed - weekend_cnt)
                 print(
                     f"[WeekendOff][HardCheck] nurse_idx={n}, "
@@ -2640,6 +2636,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     source=cfg,
                     avail_days=avail_days,
                     vacation_cnt=vacation_cnt,
+                    reference_days=D_phys,
                 )
                 structural_cnt = sum(
                     1

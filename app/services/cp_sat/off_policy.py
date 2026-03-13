@@ -45,17 +45,50 @@ def off_cap_semantics_label() -> str:
     return "nonvac_total_off"
 
 
-def compute_off_bounds(*, source: Any, avail_days: int, vacation_cnt: int) -> dict[str, int | str]:
+def compute_off_bounds(
+    *,
+    source: Any,
+    avail_days: int,
+    vacation_cnt: int,
+    reference_days: int | None = None,
+    weekend_only: bool = False,
+    weekend_slots_nonvac: int | None = None,
+) -> dict[str, int | str]:
     effective_off_days, source_key = resolve_effective_off_days(source)
-    min_off_required = max(0, min(effective_off_days, max(0, avail_days - max(0, vacation_cnt))))
+    active_nonvac_days = max(0, avail_days - max(0, vacation_cnt))
+    eligible_off_days = (
+        max(0, _as_int(weekend_slots_nonvac, 0))
+        if weekend_only
+        else active_nonvac_days
+    )
+
+    if weekend_only:
+        min_off_required = eligible_off_days
+    else:
+        min_off_required = max(0, min(effective_off_days, eligible_off_days))
+        ratio_enable = bool(_get_value(source, "active_range_off_ratio_enable", True))
+        if ratio_enable and effective_off_days > 0 and eligible_off_days > 0:
+            ref_days = _as_int(reference_days, 0)
+            if ref_days <= 0:
+                ref_days = _as_int(_get_value(source, "off_days_ratio_reference_days", 0), 0)
+            if ref_days <= 0:
+                ref_days = max(1, avail_days)
+            scaled_min = int(round(effective_off_days * (eligible_off_days / max(1, ref_days))))
+            min_off_required = max(0, min(min_off_required, scaled_min))
+
     max_extra_off_days = resolve_max_extra_off_days(source, 0)
-    max_off_allowed = min(min_off_required + max_extra_off_days, max(0, avail_days))
+    if weekend_only:
+        max_off_allowed = eligible_off_days
+    else:
+        max_off_allowed = min(min_off_required + max_extra_off_days, eligible_off_days)
     return {
         "effective_off_days": effective_off_days,
         "effective_off_days_source": source_key,
         "min_off_required": min_off_required,
         "max_off_allowed": max_off_allowed,
         "max_extra_off_days": max_extra_off_days,
+        "eligible_off_days": eligible_off_days,
+        "active_nonvac_days": active_nonvac_days,
     }
 
 
