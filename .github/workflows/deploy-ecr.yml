@@ -315,6 +315,8 @@ jobs:
             SECRET_KEY=${{ secrets.DEV_SECRET_KEY }}
             ALGORITHM=${{ secrets.DEV_ALGORITHM }}
             SQS_QUEUE_URL=${{ secrets.DEV_SQS_QUEUE_URL }}
+            AWS_SHARE_S3_BUCKET=${{ secrets.DEV_AWS_SHARE_S3_BUCKET }}
+            SHARE_PUBLIC_BASE_URL=${{ secrets.DEV_SHARE_PUBLIC_BASE_URL }}
             EOF
             echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
 
