@@ -250,7 +250,7 @@ def send_roster_publish_push(
         pushMessage=push_message,
         orgPushMessage=org_push_message,
         linkUrl="",
-        linkCode="",
+        linkCode=f"ROSTER:{year}:{month:02d}",
     )
 
 
@@ -408,7 +408,7 @@ def send_roster_republish_push(
         pushMessage=push_message,
         orgPushMessage=push_message,
         linkUrl="",
-        linkCode="",
+        linkCode=f"ROSTER:{year}:{month:02d}",
     )
 
 

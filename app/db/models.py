@@ -3,6 +3,7 @@ from sqlalchemy import (
     VARCHAR,
     NVARCHAR,
     SMALLINT,
+    BIGINT,
     BOOLEAN,
     DATETIME,
     func,
@@ -144,7 +145,7 @@ class Schedule(Base):
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
     year = Column(SMALLINT, nullable=False)
     month = Column(TINYINT, nullable=False)
-    version = Column(TINYINT, nullable=False)
+    version = Column(BIGINT, nullable=False)
     config_id = Column(INTEGER, ForeignKey("roster_config.config_id"))
     created_by = Column(VARCHAR(50), ForeignKey("nurses.account_id"))
     created_at = Column(DATETIME, default=func.now())
@@ -375,7 +376,7 @@ class IssuedRoster(Base):
         VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False
     )  # 발행한 사람
     issued_at = Column(DATETIME, default=func.now())
-    version = Column(TINYINT, primary_key=True, nullable=False)
+    version = Column(BIGINT, primary_key=True, nullable=False)
     v_name = Column(VARCHAR(100), nullable=True)  # 버전 명
     issue_cmmt = Column(VARCHAR(500), nullable=True)  # 발행 코멘트
     schedule_id = Column(CHAR(12), ForeignKey("schedules.schedule_id"), nullable=False)
@@ -396,7 +397,7 @@ class IssuedRosterSnapshot(Base):
     year = Column(SMALLINT, nullable=True)
     month = Column(TINYINT, nullable=True)
     schedule_id = Column(CHAR(12), ForeignKey("schedules.schedule_id"), nullable=False)
-    version = Column(TINYINT, nullable=False)
+    version = Column(BIGINT, nullable=False)
     created_at = Column(DATETIME, default=func.now())
     is_active_issued = Column(BOOLEAN, nullable=False, default=True)
 

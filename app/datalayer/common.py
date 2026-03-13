@@ -117,15 +117,97 @@ class Common:
 
     @staticmethod
     def get_push_list():
+        # LinkCode 기준 최신 1건만 노출 (동일 year/month 재마감 시 중복 제거)
+        # LinkCode가 빈값인 기존 데이터는 Message에서 year/month 파싱하여 파티션 키 생성
+        # params 순서: (OfficeCode, EmpSeqNo, listsize)
         _queryString = """
-        Select top %s
-               a.pushcode, a.pushsubcode, a.officecode, a.EmpSeqNo as senderEmpSeqNo, c.EmployeeName as sendername, a.Message, Convert(VarChar(10), b.RegDate, 120) as regdate, b.ReadYN
-          From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
-         Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
-         Inner Join bizwiz20db.Member c WITH(NOLOCK) On a.officeCode = c.officeCode and a.EmpSeqNo=c.EmpSeqNo
-          Left Join bizwiz20db.T_Part d WITH(NOLOCK) On c.OfficialTitleCode=d.code And d.OfficeCode=a.OfficeCode
-         Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N' And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
-         order by a.Idx desc
+        WITH Base AS (
+            Select
+                   a.Idx, a.pushcode, a.pushsubcode, a.officecode,
+                   a.EmpSeqNo as senderEmpSeqNo, c.EmployeeName as sendername,
+                   a.Message, Convert(VarChar(10), b.RegDate, 120) as regdate,
+                   b.ReadYN, b.Fk_Idx,
+                   ISNULL(a.LinkUrl, '') as LinkUrl,
+                   ISNULL(a.LinkCode, '') as LinkCode
+              From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
+             Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
+             Inner Join bizwiz20db.Member c WITH(NOLOCK) On a.officeCode = c.officeCode and a.EmpSeqNo=c.EmpSeqNo
+             Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N'
+               And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
+        ),
+        WithKey AS (
+            Select *,
+                   CASE
+                       -- 신규 데이터: LinkCode 그대로 사용
+                       WHEN LinkCode <> '' THEN LinkCode
+                       -- 기존 데이터: Message에서 year/month 파싱하여 파티션 키 생성
+                       WHEN pushsubcode IN ('S01','S04') AND CHARINDEX(N'년', Message) > 0 AND CHARINDEX(N'월', Message) > 0
+                       THEN CONCAT(
+                           'ROSTER:',
+                           LEFT(Message, CHARINDEX(N'년', Message) - 1),
+                           ':',
+                           RIGHT('0' + LTRIM(RTRIM(SUBSTRING(
+                               Message,
+                               CHARINDEX(N'년 ', Message) + 2,
+                               CHARINDEX(N'월', Message) - CHARINDEX(N'년 ', Message) - 2
+                           ))), 2)
+                       )
+                       WHEN pushsubcode = 'S02' AND CHARINDEX(N'년', Message) > 0 AND CHARINDEX(N'월', Message) > 0
+                       THEN CONCAT(
+                           'WANTED:',
+                           LEFT(Message, CHARINDEX(N'년', Message) - 1),
+                           ':',
+                           RIGHT('0' + LTRIM(RTRIM(SUBSTRING(
+                               Message,
+                               CHARINDEX(N'년 ', Message) + 2,
+                               CHARINDEX(N'월', Message) - CHARINDEX(N'년 ', Message) - 2
+                           ))), 2)
+                       )
+                       ELSE CAST(Idx AS VARCHAR(20))
+                   END AS DerivedLinkCode
+              From Base
+        ),
+        Ranked AS (
+            Select *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY DerivedLinkCode
+                       ORDER BY Idx DESC
+                   ) AS rn
+              From WithKey
+        )
+        Select Top %s
+               Idx, pushcode, pushsubcode, officecode, senderEmpSeqNo, sendername,
+               Message, regdate, ReadYN, Fk_Idx, LinkUrl,
+               DerivedLinkCode AS LinkCode
+          From Ranked
+         Where rn = 1
+         Order By Idx desc
+        """
+        return _queryString
+
+    @staticmethod
+    def update_push_read_one():
+        # 단건 읽음 처리: Fk_Idx(=TB_Mobile_Push_History_User.Fk_Idx) + EmpSeqNo 기준
+        # params 순서: (Fk_Idx, EmpSeqNo, OfficeCode)
+        _queryString = """
+        Update bizwiz20db.TB_Mobile_Push_History_User
+           Set ReadYN = 'Y'
+         Where Fk_Idx = %s And EmpSeqNo = %s And OfficeCode = %s And ReadYN = 'N'
+        """
+        return _queryString
+
+    @staticmethod
+    def update_push_read_by_code():
+        # 웹 프론트에서 pushcode + pushsubcode + officecode 기준 읽음 처리
+        # params 순서: (EmpSeqNo, OfficeCode, PushCode, PushSubCode, OfficeCode)
+        _queryString = """
+        Update bizwiz20db.TB_Mobile_Push_History_User
+           Set ReadYN = 'Y'
+         Where EmpSeqNo = %s And OfficeCode = %s And ReadYN = 'N'
+           And Fk_Idx In (
+               Select Idx From bizwiz20db.TB_Mobile_Push_History_Master WITH(NOLOCK)
+                Where PushCode = %s And PushSubCode = %s And OfficeCode = %s
+           )
         """
         return _queryString
 
