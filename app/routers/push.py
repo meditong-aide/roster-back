@@ -12,6 +12,9 @@ from schemas.auth_schema import User as UserSchema
 class PushSettingRequest(BaseModel):
     push_yn: Literal["Y", "N"]
 
+class PushReadRequest(BaseModel):
+    fk_idx: int
+
 router = APIRouter(
     prefix="/push",
     tags=["push"]
@@ -57,7 +60,8 @@ def message_view(listsize: int, current_user: UserSchema = Depends(get_current_u
     if not listsize:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="리스트수값이 필요합니다.")
 
-    rows = msdb_manager.fetch_all(Common.get_push_list(), params=(listsize, OfficeCode, EmpSeqNo))
+    # params 순서 변경: CTE로 인해 (OfficeCode, EmpSeqNo, listsize) 순서
+    rows = msdb_manager.fetch_all(Common.get_push_list(), params=(OfficeCode, EmpSeqNo, listsize))
 
     if rows is None:
         raise HTTPException(status_code=500, detail="요청을 찾을 수 없습니다.")
@@ -70,8 +74,48 @@ def message_view(listsize: int, current_user: UserSchema = Depends(get_current_u
         "sendername": row['sendername'],
         "Message": row['Message'],
         "regdate": row['regdate'],
-        "ReadYN": row['ReadYN']
+        "ReadYN": row['ReadYN'],
+        "fk_idx": row['Fk_Idx'],
+        "linkUrl": row['LinkUrl'],
+        "linkCode": row['LinkCode'],
     } for row in rows]
+
+
+@router.patch("/read", summary="알림 단건 읽음 처리 (웹 - pushcode 기준)")
+def mark_push_read_by_code(
+    pushcode: str,
+    pushsubcode: str,
+    officecode: str,
+    current_user: UserSchema = Depends(get_current_user_from_cookie)
+):
+    """
+    * 호출방식 : PATCH /push/read?pushcode=P30&pushsubcode=S04&officecode=102560
+    * 기능 : pushcode + pushsubcode + officecode 조건에 해당하는 알림을 ReadYN = Y로 변경
+    """
+    EmpSeqNo = current_user.EmpSeqNo
+    OfficeCode = current_user.office_id
+
+    msdb_manager.execute(
+        Common.update_push_read_by_code(),
+        params=(EmpSeqNo, OfficeCode, pushcode, pushsubcode, officecode)
+    )
+
+    return {"message": "읽음 처리 완료"}
+
+
+@router.patch("/read/one", summary="알림 단건 읽음 처리")
+def mark_one_push_read(req: PushReadRequest, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+    """
+    * 호출방식 : PATCH /push/read/one
+    * 바디 : { "fk_idx": 123 }
+    * 기능 : 특정 알림 1건을 ReadYN = Y로 변경
+    """
+    EmpSeqNo = current_user.EmpSeqNo
+    OfficeCode = current_user.office_id
+
+    msdb_manager.execute(Common.update_push_read_one(), params=(req.fk_idx, EmpSeqNo, OfficeCode))
+
+    return {"message": "읽음 처리 완료"}
 
 
 @router.patch("/read/all", summary="알림 전체 읽음 처리")
