@@ -949,7 +949,7 @@ async def publish_roster(
             sender_emp_seq_no=current_user.nurse_id,
             sender_member_id=current_user.account_id,
         )
-    
+
     # return message_result
 
     return {
@@ -2472,7 +2472,10 @@ async def render_schedule_share_page(
 ):
     import html
     import os
-    from services.roster_service import get_public_share_link_service
+    from services.roster_service import (
+        get_public_share_link_service,
+        _share_public_base_url,
+    )
 
     share_row = get_public_share_link_service(db=db, token=token)
     if not share_row:
@@ -2536,7 +2539,7 @@ async def render_schedule_share_page(
     )
     og_image = html.escape(str(fixed_meta_image_url).strip())
     display_image = html.escape(
-        str(request.url_for("render_schedule_share_image", token=token))
+        f"{_share_public_base_url(str(request.base_url).rstrip('/') if request else '')}/roster/s/{token}/image"
     )
 
     html_body = f"""<!doctype html>
