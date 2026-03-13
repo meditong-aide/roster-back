@@ -550,6 +550,7 @@ class CPSATBasicEngine:
             "next_month_head_requirements",
             config_data.get("next_month_head_requirements") or [],
         )
+        setattr(cfg, "shift_definitions", config_data.get("shift_definitions") or [])
         return cfg
     
     def create_shift_manage_from_db(self, shift_manage_data: List[dict]):
@@ -767,7 +768,7 @@ class CPSATBasicEngine:
                 setattr(config, "off_exception_cells", [])
         shift_defs = config_data.get("shift_definitions") if isinstance(config_data, dict) else None
         shift_id_to_main, main_to_shift_id = _build_shift_normalizer(shift_defs)
-        canonical_to_shift_id = main_to_shift_id or {"D": "D", "E": "E", "N": "N", "O": "O"}
+        canonical_to_shift_id = main_to_shift_id or {}
         shift_id_to_type: dict[str, str] = {}
         for row in shift_defs or []:
             try:
@@ -815,6 +816,7 @@ class CPSATBasicEngine:
         # 4. 근무표 시스템 생성
         with Timer("근무표 시스템 초기화"):
             roster_system = RosterSystem(nurses, target_month, config)
+            setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # 월단위 선호(개인 입력) - dict 형태로 전달됨을 가정
             # 예: {"441172": {"shift": "D", "strength": 7}, ...}
             try:
@@ -1582,6 +1584,11 @@ class CPSATBasicEngine:
             roster_system, base_tl, grouped, run_seed)
         roster_system.is_quick_phase = False
         print(f"{self.logger_prefix} [Progress] 초기해={int(bool(feasible))}")
+        if not feasible:
+            print(
+                f"{self.logger_prefix} [Progress] 초기해 실패 -> 이웃 탐색 생략, 폴백으로 전환"
+            )
+            return False
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
             'shift_requirement', 'max_consecutive_night',

@@ -1517,24 +1517,25 @@ async def validate_roster(
                 # row.codes 가 JSON 컬럼 → 이미 list 로 deserialize 되어있음
                 for code in row.codes:
                     alias_map[code.upper()] = base
-        # OFF(휴무) 도 항상 포함시킴
-        alias_map.setdefault("OFF", "O")
-        alias_map.setdefault("O", "O")
-        # 주휴(표시용)도 휴무(O)로 동일 취급한다.
-        alias_map.setdefault("주", "O")
-        # Shift 테이블에 휴무 타입이 더 있으면 모두 O로 정규화(예: 병원별 OFF 코드, 주휴 코드 등)
         try:
-            off_shift_ids = (
-                db.query(Shift.shift_id)
+            shift_defs = (
+                db.query(Shift.shift_id, Shift.default_shift)
                 .filter(Shift.office_id == office_id, Shift.group_id == target_group_id)
-                .filter(Shift.type.in_(["휴무"]))
                 .all()
             )
-            for (sid,) in off_shift_ids:
+            for sid, default_shift in shift_defs:
                 if sid:
-                    alias_map.setdefault(str(sid).upper(), "O")
+                    sid_u = str(sid).upper()
+                    base = str(default_shift or "").strip().upper()
+                    if base in {"OFF", "주"}:
+                        base = "O"
+                    if base in {"D", "E", "N", "O", "M", "W"}:
+                        alias_map.setdefault(sid_u, base)
         except Exception as e:
-            print(f"[validate_roster] 휴무 shift 정규화 로딩 실패: {e}")
+            print(f"[validate_roster] shift default 정규화 로딩 실패: {e}")
+        alias_map.setdefault("OFF", "O")
+        alias_map.setdefault("O", "O")
+        alias_map.setdefault("주", "O")
         # ──────────────────────── 2. 근무표 설정(인원/제약) 불러오기 ────────────────────────
         latest_config_db = (
             db.query(RosterConfigModel)

@@ -1784,9 +1784,10 @@ def _normalize_shift_to_main(shift_code: object, code2main: dict[str, str]) -> s
     code = str(shift_code or "").strip().upper()
     if code in {"OFF", "주"}:
         return "O"
-    if code in {"D", "E", "N", "O"}:
-        return code
-    return str(code2main.get(code, code)).strip().upper()
+    mapped = str(code2main.get(code, code)).strip().upper()
+    if mapped in {"D", "E", "N", "O", "M", "W"}:
+        return mapped
+    return code
 
 
 def build_allowed_shift_type_constraints(
@@ -1811,12 +1812,14 @@ def build_allowed_shift_type_constraints(
     days_in_month = int(get_days_in_month(year, month))
     if days_in_month <= 0:
         return {"forced_off": {}, "forbidden": {}}
+    month_start = date(year, month, 1)
 
     code2main = _build_code_to_main_map(shift_manage_data)
     allowed_main_codes = {"D", "E", "N"}
     if bool(use_mid):
         allowed_main_codes.add("M")
     nurse_id_to_allowed: dict[str, set[str]] = {}
+    nurse_id_to_active_range: dict[str, tuple[int, int] | None] = {}
 
     for n in nurses_in_group:
         nurse_id = str(getattr(n, "nurse_id", "") or "")
@@ -1827,6 +1830,7 @@ def build_allowed_shift_type_constraints(
             use_mid=bool(use_mid),
         )
         nurse_id_to_allowed[nurse_id] = allowed
+        nurse_id_to_active_range[nurse_id] = _active_range_in_month(n, month_start, days_in_month)
 
     # ── 고정셀 충돌은 예외 처리(고정 우선) ──
     override_days_by_nurse: dict[str, set[int]] = {}
@@ -1867,6 +1871,10 @@ def build_allowed_shift_type_constraints(
     forbidden: dict[str, dict[int, list[str]]] = {}
     all_codes = set(allowed_main_codes)
     for nurse_id, allowed in nurse_id_to_allowed.items():
+        active_range = nurse_id_to_active_range.get(nurse_id)
+        if not active_range:
+            continue
+        start_idx, end_idx = active_range
         if not allowed:
             continue  # 제한 없음
         disallowed_set = set(all_codes - set(allowed))
@@ -1875,11 +1883,12 @@ def build_allowed_shift_type_constraints(
             continue
         day_map: dict[int, list[str]] = {}
         override_days = override_days_by_nurse.get(nurse_id, set())
-        for d in range(days_in_month):
+        for d in range(start_idx, end_idx + 1):
             if d in override_days:
                 continue
             day_map[d] = disallowed
-        forbidden[nurse_id] = day_map
+        if day_map:
+            forbidden[nurse_id] = day_map
 
     forb_cnt = sum(len(v) * len(next(iter(v.values()), [])) for v in forbidden.values())
     if forbidden:
@@ -2243,7 +2252,10 @@ def _persist_entries(db: Session, schedule, generated, req):
     db.commit()
 
 
-def _count_work_assignments(generated: dict[str, list[str]] | None) -> tuple[int, int]:
+def _count_work_assignments(
+    generated: dict[str, list[str]] | None,
+    shift_main_map: dict[str, str] | None = None,
+) -> tuple[int, int]:
     """
     생성된 근무표에서 총 셀 수와 실근무 배정 수를 계산한다.
 
@@ -2258,17 +2270,65 @@ def _count_work_assignments(generated: dict[str, list[str]] | None) -> tuple[int
     """
     if not isinstance(generated, dict):
         return 0, 0
-    off_codes = {"-", "O", "OFF", "주"}
+    off_codes = {"-", "O"}
     total_cells = 0
     work_cells = 0
     for shifts in generated.values():
         for raw_shift in shifts or []:
             total_cells += 1
-            code = str(raw_shift).strip().upper() if raw_shift is not None else "-"
+            code = _normalize_assigned_code_for_validation(raw_shift, shift_main_map)
             if code in off_codes:
                 continue
             work_cells += 1
     return total_cells, work_cells
+
+
+def _build_validation_shift_main_map(roster_system) -> dict[str, str]:
+    shift_main_map: dict[str, str] = {
+        "OFF": "O",
+        "O": "O",
+        "주": "O",
+    }
+    try:
+        ext_map = getattr(roster_system, "shift_id_to_main", None)
+        if isinstance(ext_map, dict):
+            for k, v in ext_map.items():
+                key = str(k or "").strip().upper()
+                val = str(v or "").strip().upper()
+                if key and val:
+                    shift_main_map[key] = val
+    except Exception:
+        pass
+    try:
+        cfg = getattr(roster_system, "config", None)
+        defs = getattr(cfg, "shift_definitions", None)
+        if isinstance(defs, list):
+            for row in defs:
+                sid = str((row or {}).get("shift_id") or "").strip().upper()
+                default_shift = str((row or {}).get("default_shift") or "").strip().upper()
+                if default_shift in {"OFF", "주"}:
+                    default_shift = "O"
+                if sid and default_shift in {"D", "E", "N", "O", "M", "W"}:
+                    shift_main_map[sid] = default_shift
+    except Exception:
+        pass
+    return shift_main_map
+
+
+def _normalize_assigned_code_for_validation(
+    raw_shift: object,
+    shift_main_map: dict[str, str] | None = None,
+) -> str:
+    code = str(raw_shift).strip().upper() if raw_shift is not None else "-"
+    if not code:
+        return "-"
+    if code in {"-", "OFF", "O", "주"}:
+        return "O" if code != "-" else "-"
+    if shift_main_map and code in shift_main_map:
+        return str(shift_main_map[code]).strip().upper()
+    if code in {"D", "E", "N", "O", "M", "W"}:
+        return code
+    return code
 
 
 def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] | None) -> str | None:
@@ -2352,7 +2412,8 @@ def _validate_generated_roster(
     예시:
         총 750칸 중 실근무 0칸이거나 위반 1500건(750×2) 이상 → 메시지 반환.
     """
-    total_cells, work_cells = _count_work_assignments(generated)
+    shift_main_map = _build_validation_shift_main_map(roster_system)
+    total_cells, work_cells = _count_work_assignments(generated, shift_main_map)
 
     if total_cells > 0 and work_cells == 0:
         diag = _build_infeasible_diagnosis(roster_system, generated)
@@ -2390,9 +2451,7 @@ def _validate_generated_roster(
                 for shifts in generated.values():
                     if not isinstance(shifts, list) or d >= len(shifts):
                         continue
-                    code = str(shifts[d]).strip().upper() if shifts[d] is not None else "-"
-                    if code == "주":
-                        code = "O"
+                    code = _normalize_assigned_code_for_validation(shifts[d], shift_main_map)
                     if code in actual:
                         actual[code] += 1
 
@@ -2496,7 +2555,7 @@ def _load_shift_mappings(db: Session, schedule) -> tuple[set[str], dict[str, str
     Returns:
         (shift_ids, default_map):
             - shift_ids: 유효한 shift_id 집합
-            - default_map: 메인코드(D/E/N/O/주) → shift_id 매핑
+            - default_map: 메인코드(D/E/N/M/O/주) → shift_id 매핑
     """
     shifts_db = (
         db.query(Shift)
@@ -2509,20 +2568,20 @@ def _load_shift_mappings(db: Session, schedule) -> tuple[set[str], dict[str, str
 
 
 def _build_default_shift_mapping(shifts: list[Shift]) -> dict[str, str]:
-    """Shift.default_shift를 메인코드(D/E/N/O/주)로 삼아 실제 shift_id 매핑을 구성한다.
+    """Shift.default_shift를 메인코드(D/E/N/M/O/주)로 삼아 실제 shift_id 매핑을 구성한다.
 
     Args:
         shifts: 해당 그룹/오피스의 Shift 레코드 목록
 
     Returns:
-        메인코드(D/E/N/O/주) → shift_id 매핑
+        메인코드(D/E/N/M/O/주) → shift_id 매핑
     """
     mapping: dict[str, str] = {}
     for s in shifts:
         default_code = str(getattr(s, "default_shift", "") or "").strip().upper()
         if default_code == "OFF":
             default_code = "O"
-        if default_code not in {"D", "E", "N", "O", "주"}:
+        if default_code not in {"D", "E", "N", "M", "O", "주"}:
             continue
         if default_code not in mapping:
             mapping[default_code] = str(s.shift_id)
