@@ -50,7 +50,7 @@ from services.roster_service import (
     get_issued_roster_snapshot_service,
 )
 from services.weekly_off_service import get_nurses_weekly_off_service
-from utils.utils import send_roster_publish_push
+from utils.utils import send_roster_publish_push, send_roster_republish_push
 import uuid
 import pprint
 router = APIRouter(
@@ -718,6 +718,20 @@ async def publish_roster(
         group_id=target_group_id,
         db=db,
     )
+    # commit 전에 조회 → 신규 IssuedRoster가 아직 없으므로 이전 발행 기록만 정확히 감지
+    prev_issued = (
+        db.query(IssuedRoster)
+        .join(Schedule, IssuedRoster.schedule_id == Schedule.schedule_id)
+        .filter(
+            IssuedRoster.group_id == target_group_id,
+            IssuedRoster.office_id == office_id,
+            Schedule.year == schedule.year,
+            Schedule.month == schedule.month,
+        )
+        .first()
+    )
+    is_republish = prev_issued is not None
+
     db.add(issued_roster)
     db.add(snapshot)
     db.commit()
@@ -725,14 +739,24 @@ async def publish_roster(
     print('[DEBUG] [roster.py - publish_roster] nurses_in_group', nurses_in_group)
     receive_emp_seq_no = [nurse.nurse_id for nurse in nurses_in_group]
 
-    send_roster_publish_push(
-        year=schedule.year,
-        month=schedule.month,
-        recipients=receive_emp_seq_no,
-        office_code=office_id,
-        sender_emp_seq_no=current_user.nurse_id,
-        sender_member_id=current_user.account_id,
-    )
+    if is_republish:
+        send_roster_republish_push(
+            year=schedule.year,
+            month=schedule.month,
+            recipients=receive_emp_seq_no,
+            office_code=office_id,
+            sender_emp_seq_no=current_user.nurse_id,
+            sender_member_id=current_user.account_id,
+        )
+    else:
+        send_roster_publish_push(
+            year=schedule.year,
+            month=schedule.month,
+            recipients=receive_emp_seq_no,
+            office_code=office_id,
+            sender_emp_seq_no=current_user.nurse_id,
+            sender_member_id=current_user.account_id,
+        )
     
     # return message_result
 

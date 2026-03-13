@@ -21,6 +21,7 @@ from schemas.roster_schema import (
 )
 from services.graph_service import graph_service
 from routers.auth import get_current_user_from_cookie
+from utils.utils import send_wanted_close_push, send_wanted_deadline_update_push
 from db.client2 import get_db
 from db.models import (
     Wanted,
@@ -244,7 +245,18 @@ async def close_wanted_request(
     
     wanted.status = 'closed'
     db.commit()
-    
+
+    nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
+    recipients = [nurse.nurse_id for nurse in nurses_in_group]
+    send_wanted_close_push(
+        year=wanted.year,
+        month=wanted.month,
+        recipients=recipients,
+        office_code=current_user.office_id,
+        sender_emp_seq_no=current_user.nurse_id,
+        sender_member_id=current_user.account_id,
+    )
+
     return {"message": "Wanted 요청이 마감되었습니다."}
 
 
@@ -292,6 +304,17 @@ async def update_wanted_deadline(
         db.commit()
         db.refresh(wanted)
         message = "마감일이 제거되었습니다. (마감일 없음)" if req.exp_date is None else "마감일이 성공적으로 변경되었습니다."
+        nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
+        recipients = [nurse.nurse_id for nurse in nurses_in_group]
+        send_wanted_deadline_update_push(
+            year=wanted.year,
+            month=wanted.month,
+            recipients=recipients,
+            office_code=current_user.office_id,
+            sender_emp_seq_no=current_user.nurse_id,
+            sender_member_id=current_user.account_id,
+            deadline=wanted.exp_date,
+        )
     else:
         message = "마감일 변경 요청이 없어 기존 값이 유지됩니다."
     
@@ -462,9 +485,11 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
     )
 
     updated_count = 0
+    closed_wanteds = []
     try:
         for wanted in query:
             wanted.status = "closed"
+            closed_wanteds.append(wanted)
             updated_count += 1
 
         if updated_count > 0:
@@ -478,6 +503,28 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
         db.rollback()
         print(f"Wanted 수동 마감 중 오류: {exc}")
         raise
+
+    for wanted in closed_wanteds:
+        nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == wanted.group_id).all()
+        recipients = [nurse.nurse_id for nurse in nurses_in_group]
+        if not recipients:
+            continue
+        group = db.query(Group).filter(Group.group_id == wanted.group_id).first()
+        office_id = group.office_id if group else None
+        hn_id = (group.hn_id or [])[0] if group and group.hn_id else None
+        if not office_id or not hn_id:
+            continue
+        hn = db.query(Nurse).filter(Nurse.nurse_id == hn_id).first()
+        if not hn:
+            continue
+        send_wanted_close_push(
+            year=wanted.year,
+            month=wanted.month,
+            recipients=recipients,
+            office_code=office_id,
+            sender_emp_seq_no=hn.nurse_id,
+            sender_member_id=hn.account_id,
+        )
 
     return {"now_kst": now_kst.isoformat(), "updated": updated_count}
 
