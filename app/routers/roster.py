@@ -2523,12 +2523,12 @@ async def render_schedule_share_page(
     )
 
     if year is not None and month is not None:
-        og_title_text = f"{year}.{month} {nurse_name} 근무표"
+        og_title_text = f"{year}년 {month}월 {nurse_name}근무표"
         og_description_text = (
             f"{office_name} {group_name} {year} {month} 근무표를 확인하세요."
         )
     else:
-        og_title_text = f"{nurse_name} 근무표"
+        og_title_text = f"{nurse_name}근무표"
         og_description_text = f"{office_name} {group_name} 근무표를 확인하세요."
 
     og_title = html.escape(og_title_text)
