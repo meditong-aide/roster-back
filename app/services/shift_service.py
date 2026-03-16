@@ -297,11 +297,11 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
 
         defaults = [
             # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence, default_shift, shift_gb
-            ("O", "Off", "#ffa0d2", None, None, "휴무", 1, 1, None, 4, "O", "O"),
+            ("O", "Off", "#ffa0d2", None, None, "휴무", 1, 1, None, 5, "O", "O"),
             ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E", "이브닝"),
             ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N", "나이트"),
             ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D", "데이"),
-            ("M", "미드", "#E6A817", "09:00:00", "17:00:00", "근무", 0, 1, None, 5, "M", "미드"),
+            ("M", "미드", "#E6A817", "09:00:00", "17:00:00", "근무", 0, 1, None, 4, "M", "미드"),
         ]
 
         created = []
