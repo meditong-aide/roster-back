@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import UploadFile, File, Query
 from fastapi.responses import FileResponse, Response, JSONResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Dict
 import uuid
@@ -565,8 +565,10 @@ async def get_personnel_basic_info(
 ):
     try:
         # nurse_id 기준으로만 조회 (group switch 이후에도 마이페이지 접근 가능하도록)
+        # team 관계를 joinedload로 한 번에 가져옴
         nurse = (
             db.query(NurseModel)
+            .options(joinedload(NurseModel.team))
             .filter(NurseModel.nurse_id == current_user.nurse_id)
             .first()
         )
@@ -605,24 +607,10 @@ async def get_personnel_basic_info(
                 age = None
 
         work_place = "미등록"
-        if nurse.group_id and nurse.office_id:
-            team = (
-                db.query(TeamModel)
-                .filter(
-                    TeamModel.group_id == nurse.group_id,
-                    TeamModel.office_id == nurse.office_id,
-                )
-                .first()
-            )
+        if nurse.team and nurse.team.team_name:
+            work_place = nurse.team.team_name
 
-            if team and team.team_name:
-                work_place = team.team_name
-
-        # Member 테이블에서 이메일 + PortableTel 보강
-        member_raw = msdb_manager.fetch_one(
-            Member.member_view(), params=(current_user.account_id,)
-        )
-
+        # Member 테이블에서 이메일 + PortableTel 보강 (단일 호출)
         member_rows = msdb_manager.fetch_all(
             Member.member_view(), params=(current_user.account_id,)
         )

@@ -624,11 +624,14 @@ def bulk_update_nurses_service(
             print("제외된 간호사 for test:", db_nurse_id)
 
     # === active 상태 × role 그룹별 sequence 재정렬 (갭/중복 방지) ===
-    # autoflush=False 환경이므로 in-memory 변경사항을 DB에 반영 후 쿼리
-    db.flush()
+    # 이미 메모리에 로드된 db_nurses_dict를 재사용해 DB 추가 조회 없이 재정렬
     for active_status in (1, 0):
         for rg in ("RN", "AN", "ETC"):
-            nurses_in_group = _get_nurses_by_active(target_group_id, active_status, db, rg)
+            nurses_in_group = sorted(
+                [n for n in db_nurses_dict.values()
+                 if n.active == active_status and get_role_group(n.role) == rg],
+                key=lambda n: (n.sequence, n.nurse_id),
+            )
             _reindex_contiguously(nurses_in_group)
 
     db.commit()

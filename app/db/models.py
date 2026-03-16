@@ -678,3 +678,20 @@ class ShareLink(Base):
     office = relationship("Office")
     group = relationship("Group")
     creator = relationship("Nurse", foreign_keys=[created_by_nurse_id])
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"), nullable=False)
+    sender_nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    receiver_nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    message = Column(NVARCHAR(2000), nullable=True)
+    message_img = Column(VARCHAR(50), nullable=True)
+    is_read = Column(BOOLEAN, default=False, nullable=False)
+    created_at = Column(DATETIME, default=func.now(), nullable=False)
+    read_at = Column(DATETIME, nullable=True)
+
+    sender = relationship("Nurse", foreign_keys=[sender_nurse_id])
+    receiver = relationship("Nurse", foreign_keys=[receiver_nurse_id])

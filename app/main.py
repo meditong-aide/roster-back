@@ -35,7 +35,7 @@ from routers import (
     jobs,
 )
 from routers.contact import contact_router
-from routers.message import message_router
+from routers import messages
 from routers.sticker import sticker_router
 from routers.setting import router as setting_router
 from routers.member import member_router
@@ -74,7 +74,7 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 app.include_router(contact_router)
-app.include_router(message_router)
+app.include_router(messages.router)
 app.include_router(sticker_router)
 app.include_router(setting_router)
 app.include_router(member_router)
