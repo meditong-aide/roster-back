@@ -220,7 +220,7 @@ async def preference_analyzer(state):
         ),
         # 2차: Anthropic (백업)
         ChatAnthropic(
-            model="claude-3-7-sonnet-20250219",
+            model="claude-haiku-4-5-20251001",
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
         ),
         # 3차: Google Gemini (최종 백업)

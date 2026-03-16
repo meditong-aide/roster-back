@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import calendar
 from datetime import timedelta
 from typing import Dict, Optional
 
@@ -197,6 +198,7 @@ def optimize_fallback_lex_hard_first(
     # print('이미 있음 off_exception_cells', off_exception_cells)
     # print('이미 있음 off_exception_vacation_cells', off_exception_vacation_cells)
     first_day = roster_system.target_month
+    D_phys = calendar.monthrange(first_day.year, first_day.month)[1]
     last_day = first_day + timedelta(days=D - 1)
     weekend_days = {d for d in range(D) if (first_day + timedelta(days=d)).weekday() >= 5}
     join, leave = [], []
@@ -595,10 +597,21 @@ def optimize_fallback_lex_hard_first(
                         max_off_allowed = max(0, avail_days - 15) + relax_level
                         # print(f'is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     else:
+                        vacation_cnt = sum(
+                            1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells
+                        )
+                        weekend_slots_nonvac = sum(
+                            1
+                            for d in weekend_days
+                            if T0 <= d <= T1 and (n, d) not in vacation_off_cells
+                        )
                         off_bounds = compute_off_bounds(
                             source=cfg,
                             avail_days=avail_days,
-                            vacation_cnt=0,
+                            vacation_cnt=vacation_cnt,
+                            reference_days=D_phys,
+                            weekend_only=bool(getattr(nu, "is_weekend_off", False)),
+                            weekend_slots_nonvac=weekend_slots_nonvac,
                         )
                         max_off_allowed = int(off_bounds["max_off_allowed"]) + relax_level
                         # print(f'not is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
@@ -845,7 +858,8 @@ def optimize_fallback_lex_hard_first(
                         s_idx = roster_system.config.shift_types.index(code)
                         if (n, d) not in active_days:
                             continue
-                        if (n, d) in fixed and fixed[(n, d)] == s_idx:
+                        if (n, d) in fixed:
+                            # 유저 고정 셀 우선: 해당 날 전체 금지 무시
                             continue
                         m.Add(X(n, d, s_idx) == 0)
         except Exception as e:
@@ -1010,24 +1024,19 @@ def optimize_fallback_lex_hard_first(
                 xn = X(n, d - 1, night_idx)
                 xd = X(n, d, day_idx)
                 if getattr(cfg, "ban_n_to_d", True):
-                    # b_nd = m.NewBoolVar(f"viol_nd_{n}_{d}")
-                    # m.AddBoolOr([b_nd, xn.Not(), xd.Not()])
-                    # m.AddImplication(b_nd, xn)
-                    # m.AddImplication(b_nd, xd)
-                    # safety["trans_nd"].append(b_nd)
-                    m.Add(xn + xd <= 1)
+                    # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == day_idx):
+                        m.Add(xn + xd <= 1)
                 if getattr(cfg, "ban_e_to_d", True):
                     xe = X(n, d - 1, eve_idx)
-                    # E→D: 하드 제약으로 처리 (E 다음날 D 금지)
-                    m.Add(xe + xd <= 1)
+                    # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == eve_idx and fixed.get((n, d)) == day_idx):
+                        m.Add(xe + xd <= 1)
                 if getattr(cfg, "ban_n_to_e", True):
                     xe2 = X(n, d, eve_idx)
-                    # b_ne = m.NewBoolVar(f"viol_ne_{n}_{d}")
-                    # m.AddBoolOr([b_ne, xn.Not(), xe2.Not()])
-                    # m.AddImplication(b_ne, xn)
-                    # m.AddImplication(b_ne, xe2)
-                    # safety["trans_ne"].append(b_ne)
-                    m.Add(xn + xe2 <= 1)
+                    # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == eve_idx):
+                        m.Add(xn + xe2 <= 1)
                 if mid_idx is not None:
                     m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
                 # if getattr(cfg, "ban_d_to_n", True):
@@ -1089,11 +1098,17 @@ def optimize_fallback_lex_hard_first(
                         right = min(T1, w_end)
                         if left > right:
                             continue
-                        m.Add(sum(X(n, d, off_idx) for d in range(left, right + 1)) >= 1)
+                        # 유저 고정 우선: 윈도우 내 고정 비-OFF 셀은 제외하고 적용
+                        free_days_w = [d for d in range(left, right + 1) if not ((n, d) in fixed and fixed[(n, d)] != off_idx)]
+                        if not free_days_w:
+                            print(f"{logger_prefix} off_window 무시 (유저 고정 우선, fallback): n={n}, window=[{left+1},{right+1}] 전체 고정")
+                            continue
+                        m.Add(sum(X(n, d, off_idx) for d in free_days_w) >= 1)
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
         # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        # 고정 셀 우선: D/E/N/O 불문하고 fixed인 날은 자유 일수에서 제외
         K = cfg.max_consecutive_work_days
         for n in range(N):
             if preceptee_follow and n in preceptee_indices:
@@ -1102,8 +1117,15 @@ def optimize_fallback_lex_hard_first(
                 continue
             T0, T1 = join[n], leave[n]
             for d0 in range(T0, T1 - K + 1):
-                sum_off = sum(X(n, d0 + t, off_idx) for t in range(K + 1))
-                m.Add(sum_off >= 1)
+                window = [d0 + t for t in range(K + 1)]
+                # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
+                if any((n, d) in fixed and fixed[(n, d)] == off_idx for d in window):
+                    continue
+                # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 합산
+                free_days_w = [d for d in window if (n, d) not in fixed]
+                if not free_days_w:
+                    continue
+                m.Add(sum(X(n, d, off_idx) for d in free_days_w) >= 1)
 
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
@@ -1259,6 +1281,9 @@ def optimize_fallback_lex_hard_first(
                         if isinstance(weekly_off_by_idx, dict)
                         else 0
                     )
+                    vacation_cnt = sum(
+                        1 for d in range(join[n], leave[n] + 1) if (n, d) in vacation_off_cells
+                    )
                     weekend_forced = 0
                     if bool(getattr(nu, "is_weekend_off", False)):
                         try:
@@ -1274,7 +1299,18 @@ def optimize_fallback_lex_hard_first(
                             )
                         except Exception:
                             weekend_forced = 0
-                    target_o = max(0, effective_off_days - (weekly_target + weekend_forced))
+                    off_bounds_for_target = compute_off_bounds(
+                        source=cfg,
+                        avail_days=(leave[n] - join[n] + 1),
+                        vacation_cnt=vacation_cnt,
+                        reference_days=D_phys,
+                        weekend_only=bool(getattr(nu, "is_weekend_off", False)),
+                        weekend_slots_nonvac=weekend_forced,
+                    )
+                    min_target = int(off_bounds_for_target["min_off_required"])
+                    max_target = int(off_bounds_for_target["max_off_allowed"])
+                    raw_target_o = max(0, effective_off_days - (weekly_target + weekend_forced))
+                    target_o = min(max(raw_target_o, min_target), max_target)
                     if target_o <= 0:
                         continue
                     # 휴가/공가는 개인 O 목표 충족에서 제외
@@ -1322,6 +1358,13 @@ def optimize_fallback_lex_hard_first(
                     source=cfg,
                     avail_days=avail_days,
                     vacation_cnt=vacation_cnt,
+                    reference_days=D_phys,
+                    weekend_only=is_weekend_off,
+                    weekend_slots_nonvac=sum(
+                        1
+                        for d in weekend_days
+                        if T0 <= d <= T1 and (n, d) not in vacation_off_cells
+                    ),
                 )
                 min_off_required = int(off_bounds["min_off_required"])
                 max_off_allowed_from_policy = int(off_bounds["max_off_allowed"])

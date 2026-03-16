@@ -26,36 +26,16 @@ def apply_work_shift_overrides(
     if not roster_map or not nurses_data or not shift_definitions:
         return roster_map
 
-    def _normalize_shift_token(token: str) -> str | None:
-        """shift_id/shift_gb 문자열을 메인 코드(D/E/N/O/W)로 환산한다."""
+    def _normalize_default_shift(token: object) -> str | None:
         raw = str(token or "").strip()
         if not raw:
             return None
         upper = raw.upper()
-        compact = upper.replace(" ", "")
-        direct_map = {
-            "D": "D",
-            "E": "E",
-            "N": "N",
-            "O": "O",
-            "OFF": "O",
-            "주": "O",
-            "W": "W",
-        }
-        if upper in direct_map:
-            return direct_map[upper]
-        if compact.startswith("D"):
-            return "D"
-        if compact.startswith("E"):
-            return "E"
-        if compact.startswith("N"):
-            return "N"
-        ko_map = {
-            "데이": "D",
-            "이브닝": "E",
-            "나이트": "N",
-        }
-        return ko_map.get(raw) or ko_map.get(compact.lower())
+        if upper in {"OFF", "주"}:
+            return "O"
+        if upper in {"D", "E", "N", "O", "M", "W"}:
+            return upper
+        return None
 
     shift_meta_index: dict[str, list[dict[str, str | None]]] = {}
     main_by_shift_id: dict[str, str] = {}
@@ -64,15 +44,7 @@ def apply_work_shift_overrides(
         if not shift_id_raw:
             continue
         shift_id_key = shift_id_raw.upper()
-        main_code = None
-        for candidate in (
-            row.get("default_shift"),
-            row.get("shift_gb"),
-            row.get("shift_id"),
-        ):
-            main_code = _normalize_shift_token(candidate)
-            if main_code:
-                break
+        main_code = _normalize_default_shift(row.get("default_shift"))
         if main_code:
             main_by_shift_id[shift_id_key] = main_code
         meta = {
@@ -143,8 +115,10 @@ def apply_work_shift_overrides(
             meta = _select_shift_meta(ws_key, nurse_office, nurse_group)
             if not meta:
                 continue
-            main_code = meta.get("main_code") or _normalize_shift_token(ws_raw)
-            if main_code not in {"D", "E", "N"}:
+            main_code = meta.get("main_code")
+            if not main_code and ws_key in {"D", "E", "N", "M"}:
+                main_code = ws_key
+            if main_code not in {"D", "E", "N", "M"}:
                 continue
             # 첫 번째로 매칭된 shift_id를 우선 적용한다.
             target_by_main.setdefault(main_code, ws_raw)
@@ -157,12 +131,10 @@ def apply_work_shift_overrides(
             entry_str = str(entry)
             entry_key = entry_str.upper()
             entry_main = None
-            if entry_key in {"D", "E", "N"}:
+            if entry_key in {"D", "E", "N", "M"}:
                 entry_main = entry_key
             elif entry_key in main_by_shift_id:
                 entry_main = main_by_shift_id[entry_key]
-            else:
-                entry_main = _normalize_shift_token(entry_str)
             if entry_main and entry_main in target_by_main:
                 updated_schedule.append(target_by_main[entry_main])
             else:
@@ -170,5 +142,4 @@ def apply_work_shift_overrides(
         roster_map[roster_key] = updated_schedule
 
     return roster_map
-
 

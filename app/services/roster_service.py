@@ -579,3 +579,570 @@ def create_issued_roster_snapshot(
         month=schedule.month,
     )
     return snapshot
+
+
+
+def _share_now() -> datetime:
+    return datetime.now()
+
+
+
+def _share_build_s3_client(region: str):
+    import os
+    import boto3
+
+    access_key = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY")
+    session_token = os.getenv("AWS_SESSION_TOKEN")
+    profile_name = os.getenv("AWS_PROFILE")
+
+    if access_key and secret_key:
+        return boto3.client(
+            "s3",
+            region_name=region,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=session_token,
+        )
+
+    if profile_name:
+        session = boto3.Session(profile_name=profile_name, region_name=region)
+        creds = session.get_credentials()
+        if not creds or not creds.access_key or not creds.secret_key:
+            raise ValueError("AWS credentials not found for AWS_PROFILE")
+        return session.client("s3")
+
+    session = boto3.Session(region_name=region)
+    creds = session.get_credentials()
+    if not creds or not creds.access_key or not creds.secret_key:
+        raise ValueError("AWS credentials are missing. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or AWS_PROFILE")
+    return session.client("s3")
+
+
+def _share_public_base_url(fallback_base_url: str) -> str:
+    import os
+
+    configured = os.getenv("SHARE_PUBLIC_BASE_URL")
+    if configured and str(configured).strip():
+        return str(configured).strip().rstrip("/")
+    return (fallback_base_url or "").rstrip("/")
+
+
+def _share_fetch_s3_image_bytes(image_url: str) -> tuple[bytes, str]:
+    import os
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(image_url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("invalid image_url")
+
+    object_key = parsed.path.lstrip("/")
+    if not object_key:
+        raise ValueError("invalid image_url path")
+
+    region = os.getenv("AWS_REGION", "ap-northeast-2")
+    bucket_name = parsed.netloc.split(".s3.")[0] if ".s3." in parsed.netloc else os.getenv("AWS_SHARE_S3_BUCKET") or os.getenv("SHARE_S3_BUCKET") or os.getenv("S3_SHARE_BUCKET")
+    if not bucket_name:
+        raise ValueError("share S3 bucket env is not configured")
+
+    s3_client = _share_build_s3_client(region)
+    obj = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+    content_type = str(obj.get("ContentType") or "image/png")
+    image_bytes = obj["Body"].read()
+    return image_bytes, content_type
+
+
+def _share_resolve_target_scope(current_user, db: Session, override_group_id: str | None = None):
+    is_master_admin = bool(getattr(current_user, "is_master_admin", False))
+    if override_group_id:
+        if not is_master_admin:
+            raise PermissionError("Only admin can specify group_id")
+        group_row = db.query(Group).filter(Group.group_id == override_group_id).first()
+        if not group_row:
+            raise LookupError("Group not found")
+        if getattr(current_user, "office_id", None) and group_row.office_id != current_user.office_id:
+            raise PermissionError("Group does not belong to your office")
+        return group_row.group_id, group_row.office_id
+    group_id = getattr(current_user, "group_id", None)
+    office_id = getattr(current_user, "office_id", None)
+    if not group_id or not office_id:
+        raise ValueError("group_id or office_id is missing on current user")
+    return group_id, office_id
+
+
+
+
+def _share_build_object_prefix(office_id: str, group_id: str, nurse_id: str | None, year: int, month: int) -> str:
+    safe_office_id = str(office_id or "unknown")
+    safe_group_id = str(group_id or "unknown")
+    safe_nurse_id = str(nurse_id or "unknown")
+    return f"og-images/{safe_office_id}/{safe_group_id}/{safe_nurse_id}/{int(year):04d}/{int(month):02d}"
+
+
+def _share_find_by_token(db: Session, token: str) -> dict | None:
+    from db.models import ShareLink
+
+    row = db.query(ShareLink).filter(ShareLink.token == token).first()
+    if not row:
+        return None
+    return {
+        "token": row.token,
+        "schedule_id": row.schedule_id,
+        "office_id": row.office_id,
+        "group_id": row.group_id,
+        "image_url": row.image_url,
+        "title": row.title,
+        "description": row.description,
+        "created_by_nurse_id": row.created_by_nurse_id,
+        "expires_at": row.expires_at,
+        "revoked_at": row.revoked_at,
+        "created_at": row.created_at,
+    }
+
+
+def create_schedule_share_link_service(
+    db: Session,
+    current_user,
+    schedule_id: str,
+    fallback_base_url: str,
+    image_url: str,
+    title: str | None,
+    description: str | None,
+    expires_in_days: int,
+    override_group_id: str | None = None,
+) -> dict:
+    import secrets
+    from datetime import timedelta
+
+    target_group_id, target_office_id = _share_resolve_target_scope(
+        current_user=current_user,
+        db=db,
+        override_group_id=override_group_id,
+    )
+
+    schedule = db.query(Schedule).filter(
+        Schedule.schedule_id == schedule_id,
+        Schedule.group_id == target_group_id,
+        Schedule.office_id == target_office_id,
+    ).first()
+    if not schedule:
+        raise LookupError("Schedule not found for your scope")
+
+    if not image_url or not str(image_url).strip():
+        raise ValueError("image_url is required")
+    image_url = str(image_url).strip()
+
+    token = secrets.token_hex(24)
+    try:
+        expires_days = max(1, min(int(expires_in_days), 365))
+    except (TypeError, ValueError):
+        raise ValueError("expires_in_days must be integer")
+    expires_at = _share_now() + timedelta(days=expires_days)
+    now = _share_now()
+
+    from db.models import ShareLink
+
+    share_row = ShareLink(
+        token=token,
+        schedule_id=schedule_id,
+        office_id=target_office_id,
+        group_id=target_group_id,
+        image_url=image_url,
+        title=title,
+        description=description,
+        created_by_nurse_id=getattr(current_user, "nurse_id", None),
+        expires_at=expires_at,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(share_row)
+    db.commit()
+
+    base_url = _share_public_base_url(fallback_base_url)
+    return {
+        "token": token,
+        "share_url": f"{base_url}/roster/s/{token}",
+        "image_url": f"{base_url}/roster/s/{token}/image",
+        "expires_at": expires_at,
+        "schedule_id": schedule_id,
+        "group_id": target_group_id,
+        "office_id": target_office_id,
+    }
+
+
+
+def upload_schedule_share_image_and_create_link_service(
+    db: Session,
+    current_user,
+    schedule_id: str,
+    fallback_base_url: str,
+    image_file,
+    title: str | None,
+    description: str | None,
+    expires_in_days: int,
+    override_group_id: str | None = None,
+) -> dict:
+    import os
+    import secrets
+    import boto3
+
+    allowed_types = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+    }
+    content_type = str(getattr(image_file, "content_type", "") or "").lower()
+    if content_type not in allowed_types:
+        raise ValueError("지원하지 않는 이미지 형식입니다. (png, jpg, jpeg, webp)")
+
+    image_bytes = image_file.file.read()
+    if not image_bytes:
+        raise ValueError("image file is empty")
+    if len(image_bytes) > 5 * 1024 * 1024:
+        raise ValueError("image file size must be <= 5MB")
+
+    bucket_name = os.getenv("AWS_SHARE_S3_BUCKET") or os.getenv("SHARE_S3_BUCKET") or os.getenv("S3_SHARE_BUCKET")
+    if not bucket_name:
+        raise ValueError("share S3 bucket env is not configured")
+    region = os.getenv("AWS_REGION", "ap-northeast-2")
+
+    target_group_id, target_office_id = _share_resolve_target_scope(
+        current_user=current_user,
+        db=db,
+        override_group_id=override_group_id,
+    )
+    schedule = db.query(Schedule).filter(
+        Schedule.schedule_id == schedule_id,
+        Schedule.group_id == target_group_id,
+        Schedule.office_id == target_office_id,
+    ).first()
+    if not schedule:
+        raise LookupError("Schedule not found for your scope")
+
+    ext = allowed_types[content_type]
+    object_prefix = _share_build_object_prefix(
+        office_id=target_office_id,
+        group_id=target_group_id,
+        nurse_id=getattr(current_user, "nurse_id", None),
+        year=int(schedule.year),
+        month=int(schedule.month),
+    )
+    object_key = f"{object_prefix}/{secrets.token_hex(16)}{ext}"
+
+    try:
+        s3_client = _share_build_s3_client(region)
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=object_key,
+            Body=image_bytes,
+            ContentType=content_type,
+            CacheControl="max-age=31536000",
+        )
+    except Exception as e:
+        raise RuntimeError(f"S3 upload failed: {str(e)}")
+
+    image_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{object_key}"
+
+    return create_schedule_share_link_service(
+        db=db,
+        current_user=current_user,
+        schedule_id=schedule_id,
+        fallback_base_url=fallback_base_url,
+        image_url=image_url,
+        title=title,
+        description=description,
+        expires_in_days=expires_in_days,
+        override_group_id=override_group_id,
+    )
+
+
+
+def auto_generate_schedule_share_image_and_create_link_service(
+    db: Session,
+    current_user,
+    schedule_id: str,
+    fallback_base_url: str,
+    title: str | None,
+    description: str | None,
+    expires_in_days: int,
+    override_group_id: str | None = None,
+) -> dict:
+    import os
+    import io
+    import secrets
+    import calendar
+    import boto3
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from db.models import Nurse, ScheduleEntry
+
+    target_group_id, target_office_id = _share_resolve_target_scope(
+        current_user=current_user,
+        db=db,
+        override_group_id=override_group_id,
+    )
+
+    schedule = db.query(Schedule).filter(
+        Schedule.schedule_id == schedule_id,
+        Schedule.group_id == target_group_id,
+        Schedule.office_id == target_office_id,
+    ).first()
+    if not schedule:
+        raise LookupError("Schedule not found for your scope")
+
+    year = int(schedule.year)
+    month = int(schedule.month)
+    days_in_month = calendar.monthrange(year, month)[1]
+
+    nurses = db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence).filter(
+        Nurse.group_id == target_group_id,
+        Nurse.active == 1,
+    ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
+
+    entries = db.query(ScheduleEntry.nurse_id, ScheduleEntry.work_date, ScheduleEntry.shift_id).filter(
+        ScheduleEntry.schedule_id == schedule_id,
+    ).all()
+
+    by_nurse = {}
+    for e in entries:
+        by_nurse.setdefault(str(e.nurse_id), {})[int(e.work_date.day)] = str(e.shift_id) if e.shift_id else "-"
+
+    col_labels = ["이름"] + [str(d) for d in range(1, days_in_month + 1)]
+    table_rows = []
+    for n in nurses:
+        row = [str(n.name)]
+        day_map = by_nurse.get(str(n.nurse_id), {})
+        for d in range(1, days_in_month + 1):
+            row.append(day_map.get(d, "-"))
+        table_rows.append(row)
+
+    if not table_rows:
+        table_rows = [["데이터 없음"] + ["-" for _ in range(days_in_month)]]
+
+    fig_w = max(14, 1 + days_in_month * 0.42)
+    fig_h = max(4, 1.5 + len(table_rows) * 0.35)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    ax.set_title(f"{year}년 {month}월 근무표", fontsize=16, pad=18)
+
+    table = ax.table(
+        cellText=table_rows,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+        colLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.35)
+
+    image_buffer = io.BytesIO()
+    fig.savefig(image_buffer, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    image_buffer.seek(0)
+    image_bytes = image_buffer.getvalue()
+    if not image_bytes:
+        raise RuntimeError("failed to generate roster image")
+
+    bucket_name = os.getenv("AWS_SHARE_S3_BUCKET") or os.getenv("SHARE_S3_BUCKET") or os.getenv("S3_SHARE_BUCKET")
+    if not bucket_name:
+        raise ValueError("share S3 bucket env is not configured")
+    region = os.getenv("AWS_REGION", "ap-northeast-2")
+    object_prefix = _share_build_object_prefix(
+        office_id=target_office_id,
+        group_id=target_group_id,
+        nurse_id=getattr(current_user, "nurse_id", None),
+        year=year,
+        month=month,
+    )
+    object_key = f"{object_prefix}/auto-{secrets.token_hex(16)}.png"
+
+    try:
+        s3_client = _share_build_s3_client(region)
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=object_key,
+            Body=image_bytes,
+            ContentType="image/png",
+            CacheControl="max-age=31536000",
+        )
+    except Exception as e:
+        raise RuntimeError(f"S3 upload failed: {str(e)}")
+
+    image_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{object_key}"
+
+    return create_schedule_share_link_service(
+        db=db,
+        current_user=current_user,
+        schedule_id=schedule_id,
+        fallback_base_url=fallback_base_url,
+        image_url=image_url,
+        title=title,
+        description=description,
+        expires_in_days=expires_in_days,
+        override_group_id=override_group_id,
+    )
+
+
+
+def capture_schedule_share_image_and_create_link_service(
+    db: Session,
+    current_user,
+    schedule_id: str,
+    fallback_base_url: str,
+    image_data_url: str,
+    title: str | None,
+    description: str | None,
+    expires_in_days: int,
+    override_group_id: str | None = None,
+) -> dict:
+    import os
+    import base64
+    import secrets
+    import binascii
+    import boto3
+
+    target_group_id, target_office_id = _share_resolve_target_scope(
+        current_user=current_user,
+        db=db,
+        override_group_id=override_group_id,
+    )
+
+    schedule = db.query(Schedule).filter(
+        Schedule.schedule_id == schedule_id,
+        Schedule.group_id == target_group_id,
+        Schedule.office_id == target_office_id,
+    ).first()
+    if not schedule:
+        raise LookupError("Schedule not found for your scope")
+
+    if not image_data_url or not str(image_data_url).strip():
+        raise ValueError("image_data_url is required")
+
+    raw_data = str(image_data_url).strip()
+    if not raw_data.startswith("data:"):
+        raise ValueError("image_data_url must be data URL")
+
+    try:
+        header, b64_data = raw_data.split(",", 1)
+    except ValueError:
+        raise ValueError("invalid image_data_url format")
+
+    if ";base64" not in header:
+        raise ValueError("image_data_url must be base64 data URL")
+
+    mime_type = header[5:].split(";", 1)[0].lower()
+    allowed_types = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+    }
+    if mime_type not in allowed_types:
+        raise ValueError("지원하지 않는 이미지 형식입니다. (png, jpg, jpeg, webp)")
+
+    try:
+        image_bytes = base64.b64decode(b64_data, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("invalid base64 image data")
+
+    if not image_bytes:
+        raise ValueError("image data is empty")
+    if len(image_bytes) > 5 * 1024 * 1024:
+        raise ValueError("image data size must be <= 5MB")
+
+    bucket_name = os.getenv("AWS_SHARE_S3_BUCKET") or os.getenv("SHARE_S3_BUCKET") or os.getenv("S3_SHARE_BUCKET")
+    if not bucket_name:
+        raise ValueError("share S3 bucket env is not configured")
+    region = os.getenv("AWS_REGION", "ap-northeast-2")
+
+    ext = allowed_types[mime_type]
+    object_prefix = _share_build_object_prefix(
+        office_id=target_office_id,
+        group_id=target_group_id,
+        nurse_id=getattr(current_user, "nurse_id", None),
+        year=int(schedule.year),
+        month=int(schedule.month),
+    )
+    object_key = f"{object_prefix}/capture-{secrets.token_hex(16)}{ext}"
+
+    try:
+        s3_client = _share_build_s3_client(region)
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=object_key,
+            Body=image_bytes,
+            ContentType=mime_type,
+            CacheControl="max-age=31536000",
+        )
+    except Exception as e:
+        raise RuntimeError(f"S3 upload failed: {str(e)}")
+
+    image_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{object_key}"
+
+    return create_schedule_share_link_service(
+        db=db,
+        current_user=current_user,
+        schedule_id=schedule_id,
+        fallback_base_url=fallback_base_url,
+        image_url=image_url,
+        title=title,
+        description=description,
+        expires_in_days=expires_in_days,
+        override_group_id=override_group_id,
+    )
+
+
+def get_public_share_link_service(db: Session, token: str) -> dict | None:
+    share_row = _share_find_by_token(db, token)
+    if not share_row:
+        return None
+    if share_row.get("revoked_at") is not None:
+        return None
+    expires_at = share_row.get("expires_at")
+    if expires_at is not None and expires_at < _share_now():
+        return None
+    return share_row
+
+
+
+def get_public_share_image_service(db: Session, token: str) -> tuple[bytes, str]:
+    share_row = get_public_share_link_service(db, token)
+    if not share_row:
+        raise LookupError("Share link not found or expired")
+    image_url = share_row.get("image_url")
+    if not image_url:
+        raise LookupError("Share image not found")
+    return _share_fetch_s3_image_bytes(str(image_url))
+
+
+def revoke_schedule_share_link_service(db: Session, current_user, token: str) -> dict:
+
+    share_row = _share_find_by_token(db, token)
+    if not share_row:
+        raise LookupError("Share link not found")
+
+    is_master_admin = bool(getattr(current_user, "is_master_admin", False))
+    is_head_nurse = bool(getattr(current_user, "is_head_nurse", False))
+    if not (is_master_admin or is_head_nurse):
+        raise PermissionError("Permission denied")
+    if is_master_admin and getattr(current_user, "office_id", None) and share_row.get("office_id") != getattr(current_user, "office_id", None):
+        raise PermissionError("Share link does not belong to your office")
+    if not is_master_admin and share_row.get("group_id") != getattr(current_user, "group_id", None):
+        raise PermissionError("You can only revoke links in your group")
+
+    from db.models import ShareLink
+
+    revoked_at = _share_now()
+    db.query(ShareLink).filter(ShareLink.token == token).update(
+        {
+            ShareLink.revoked_at: revoked_at,
+            ShareLink.updated_at: revoked_at,
+        },
+        synchronize_session=False,
+    )
+    db.commit()
+
+    return {"success": True, "token": token, "revoked_at": revoked_at}

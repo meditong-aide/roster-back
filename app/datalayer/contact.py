@@ -21,7 +21,11 @@ class Contact:
     @staticmethod
     def get_contact_list(page: int, pagesize: int):
         _queryString = """
-            select No, title, context, Writer, WriterID, writeDate, filename, Tel, wEmail, isnull(replycontent,'') as replycontent, case when jobState = '완료' then '완료' else '접수' end as jobState
+            select No, title, context, Writer, WriterID, writeDate, filename, Tel, wEmail,
+                   isnull(replycontent,'') as replycontent,
+                   isnull(Comment,'') as Comment,
+                   isnull(Manager,'') as Manager,
+                   isnull(jobState,'') as jobState
             from bizwiz20db.Manage_Work
             where WriterID = %s
             order by No desc

@@ -22,7 +22,7 @@ dotenv.load_dotenv()
 
 def collector(state):
     """information collector"""
-    return state
+    return {}
 
 
 def init_data(state):
@@ -269,7 +269,7 @@ async def shift_analyzer(state):
     # LLM 모델 설정 (기존과 동일하게 백업 체계 유지)
     models_to_try = [
         ChatOpenAI(model="gpt-4.1-mini-2025-04-14", openai_api_key=os.getenv("OPENAI_API_KEY")),
-        ChatAnthropic(model="claude-3-7-sonnet-20250219", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")),
+        ChatAnthropic(model="claude-haiku-4-5-20251001", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")),
         ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
     ]
 

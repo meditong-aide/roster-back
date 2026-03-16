@@ -31,9 +31,13 @@ def convert_result_to_db_format(
     result: dict[str, list[str]] = {}
     canonical_map = {k.upper(): v for k, v in (canonical_to_shift_id or {}).items() if v}
     if not canonical_map:
-        canonical_map = {"D": "D", "E": "E", "N": "N", "O": "O", "주": "주"}
+        print("[ResultMapping] canonical_to_shift_id 비어있음: canonical 코드 그대로 반환")
     fixed_original_shift_map = fixed_original_shift_map or {}
     shift_map = {i: s for i, s in enumerate(roster_system.config.shift_types)}
+    for code in shift_map.values():
+        key = str(code).strip().upper()
+        if key and key not in canonical_map:
+            canonical_map[key] = str(code)
     fixed = getattr(roster_system, "fixed_cells", None)
     fixed_lookup: dict[tuple[int, int], str] = {}
     if fixed:
@@ -64,5 +68,4 @@ def convert_result_to_db_format(
                 nurse_schedule.append("-")
         result[nurse.db_id] = nurse_schedule
     return result
-
 

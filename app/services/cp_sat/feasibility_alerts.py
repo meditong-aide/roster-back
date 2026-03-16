@@ -253,7 +253,20 @@ def run_preflight_feasibility_alerts(
                 if avail_days <= 0:
                     continue
                 weekend_slots = sum(1 for d in weekend_days if t0 <= d <= t1)
-                bounds = compute_off_bounds(source=config_dict, avail_days=avail_days, vacation_cnt=0)
+                vacation_cnt = sum(
+                    1 for d in range(t0, t1 + 1) if (n_idx, d) in vacation_off_cells
+                )
+                weekend_slots_nonvac = sum(
+                    1 for d in weekend_days if t0 <= d <= t1 and (n_idx, d) not in vacation_off_cells
+                )
+                bounds = compute_off_bounds(
+                    source=config_dict,
+                    avail_days=avail_days,
+                    vacation_cnt=vacation_cnt,
+                    reference_days=num_days,
+                    weekend_only=True,
+                    weekend_slots_nonvac=weekend_slots_nonvac,
+                )
                 min_off_required = int(bounds["min_off_required"])
                 if min_off_required > weekend_slots:
                     alerts.append(
@@ -349,7 +362,18 @@ def run_preflight_feasibility_alerts(
             ):
                 forced_nonvac.update({d for d in weekend_days if t0 <= d <= t1})
 
-            bounds = compute_off_bounds(source=config_dict, avail_days=avail_days, vacation_cnt=0)
+            vacation_cnt = sum(1 for d in range(t0, t1 + 1) if (n_idx, d) in vacation_off_cells)
+            weekend_slots_nonvac = sum(
+                1 for d in weekend_days if t0 <= d <= t1 and (n_idx, d) not in vacation_off_cells
+            )
+            bounds = compute_off_bounds(
+                source=config_dict,
+                avail_days=avail_days,
+                vacation_cnt=vacation_cnt,
+                reference_days=num_days,
+                weekend_only=bool(getattr(nurse, "is_weekend_off", False)) and weekend_only_enable,
+                weekend_slots_nonvac=weekend_slots_nonvac,
+            )
             max_off_allowed = int(bounds["max_off_allowed"])
             if len(forced_nonvac) > max_off_allowed:
                 alerts.append(

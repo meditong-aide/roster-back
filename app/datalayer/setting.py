@@ -125,6 +125,20 @@ class Setting:
         return _queryString
 
     @staticmethod
+    def get_push_yn():
+        _queryString = """
+        SELECT PushYN FROM bizwiz20db.TB_Mobile_User_Setting_List WHERE MemberID = %s
+        """
+        return _queryString
+
+    @staticmethod
+    def update_push_yn():
+        _queryString = """
+        UPDATE bizwiz20db.TB_Mobile_User_Setting_List SET PushYN = %s WHERE MemberID = %s
+        """
+        return _queryString
+
+    @staticmethod
     def delete_position():
         _queryString = """
                        delete \

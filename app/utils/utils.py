@@ -250,7 +250,7 @@ def send_roster_publish_push(
         pushMessage=push_message,
         orgPushMessage=org_push_message,
         linkUrl="",
-        linkCode="",
+        linkCode=f"ROSTER:{year}:{month:02d}",
     )
 
 
@@ -305,6 +305,110 @@ def send_wanted_request_push(
         orgPushMessage=org_push_message,
         linkUrl="",
         linkCode="",
+    )
+
+
+def send_wanted_deadline_update_push(
+    year: int,
+    month: int,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+    deadline: datetime.datetime | None = None,
+):
+    """
+    원티드 마감일 변경 시 공용 푸시 메시지를 전송합니다.
+
+    - 푸시 코드: P30 / S05
+    - 메시지: "{year}년 {month}월 원티드 마감일 변경 ({마감일})"
+    """
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+
+    deadline_part = f"{deadline.strftime('%m')}월 {deadline.strftime('%d')}일 까지" if deadline else "마감일 없음"
+    receive_emp_seq_no = ",".join(map(str, recipients))
+    push_message = f"{year}년 {month}월 원티드 마감일 변경 ({deadline_part})"
+
+    return set_app_push(
+        pushCode="P30",
+        pushSubCode="S05",
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=receive_emp_seq_no,
+        pushMessage=push_message,
+        orgPushMessage=push_message,
+        linkUrl="",
+        linkCode="",
+    )
+
+
+def send_wanted_close_push(
+    year: int,
+    month: int,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+):
+    """
+    원티드 마감 시 공용 푸시 메시지를 전송합니다.
+
+    - 푸시 코드: P30 / S03
+    - 메시지: "{year}년 {month}월 원티드 마감"
+    """
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+
+    receive_emp_seq_no = ",".join(map(str, recipients))
+    push_message = f"{year}년 {month}월 원티드 마감"
+
+    return set_app_push(
+        pushCode="P30",
+        pushSubCode="S03",
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=receive_emp_seq_no,
+        pushMessage=push_message,
+        orgPushMessage=push_message,
+        linkUrl="",
+        linkCode="",
+    )
+
+
+def send_roster_republish_push(
+    year: int,
+    month: int,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+):
+    """
+    근무표 마감 철회 후 재마감 시 공용 푸시 메시지를 전송합니다.
+
+    - 푸시 코드: P30 / S04
+    - 메시지: "{year}년 {month}월 근무표 재마감"
+    """
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+
+    receive_emp_seq_no = ",".join(map(str, recipients))
+    push_message = f"{year}년 {month}월 근무표 재마감"
+
+    return set_app_push(
+        pushCode="P30",
+        pushSubCode="S04",
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=receive_emp_seq_no,
+        pushMessage=push_message,
+        orgPushMessage=push_message,
+        linkUrl="",
+        linkCode=f"ROSTER:{year}:{month:02d}",
     )
 
 

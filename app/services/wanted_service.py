@@ -1082,6 +1082,21 @@ async def invoke_and_persist_wanted_service(
 
             excluded_off_dates = sorted(set(d for d, _ in excluded_items))
 
+            # 이미 copy로 저장된 excluded (날짜, shift) 쌍도 DB에서 삭제
+            if excluded_items:
+                total_deleted = 0
+                for exc_day, exc_shift in excluded_items:
+                    exc_date = date(req.year, req.month, exc_day)
+                    cnt = db.query(NurseShiftRequest).filter(
+                        NurseShiftRequest.nurse_id == nurse_id,
+                        NurseShiftRequest.request_id == new_request_id,
+                        NurseShiftRequest.shift_date == exc_date,
+                        NurseShiftRequest.shift == exc_shift,
+                    ).delete(synchronize_session='fetch')
+                    total_deleted += cnt
+                if total_deleted:
+                    print(f"[AIDE OFF LIMIT] copy된 초과 off {total_deleted}건 DB에서 삭제: {excluded_items}")
+
             # 프론트에 전달할 명확한 메시지
             excluded_detail = ", ".join(
                 f"{req.month}/{d}일({s})" for d, s in excluded_items
@@ -1097,6 +1112,7 @@ async def invoke_and_persist_wanted_service(
                   f"추가={len(candidate_off_days)}, 합집합={potential_total}, 제한={max_requests}")
         
     # shift 저장
+    print(f"[AIDE PERSIST] shift_map 저장 직전: {list(shift_map.keys())}")
     if shift_map:
         _persist_shift_results(
             db, nurse_id, new_request_id, req.year, req.month, month_str,
@@ -1122,12 +1138,20 @@ async def invoke_and_persist_wanted_service(
         traceback.print_exc()
         raise
     
+    # 제외된 항목을 shift_parsed에서도 제거 (프론트가 저장된 것처럼 표시하지 않도록)
+    if excluded_off_dates:
+        for exc_day, exc_shift in excluded_items:
+            if exc_shift in shift_parsed and exc_day in shift_parsed[exc_shift]:
+                del shift_parsed[exc_shift][exc_day]
+                if not shift_parsed[exc_shift]:
+                    del shift_parsed[exc_shift]
+
     result = {
         "shift": shift_parsed,
         "preference": pref_parsed,
         "warning": None
     }
-    
+
     if excluded_off_dates:
         result["warning"] = {
             "message": warn_msg,

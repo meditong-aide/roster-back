@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends, status
+from sqlalchemy.orm import Session
 
 from datalayer.contact import Contact
-from db.client2 import msdb_manager
+from db.client2 import msdb_manager, get_db
+from db.models import Notice
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from utils.utils import download_file
@@ -62,6 +64,8 @@ def message_view(page: int, pagesize: int, current_user: UserSchema = Depends(ge
         "Tel": row['Tel'],
         "wEmail": row['wEmail'],
         "replycontent": row['replycontent'],
+        "Comment": row['Comment'],         # 관리자 답변 내용
+        "Manager": row['Manager'],         # 담당자
         "jobState": row['jobState']
     } for row in rows]
 
@@ -83,3 +87,65 @@ def message_view(filename: str, current_user: UserSchema = Depends(get_current_u
         root_upload_dir=GLOBAL_UPLOAD_ROOT,
         download_as="original"
     )
+
+
+# ─── 공지사항 ─────────────────────────────────────────────
+
+@router.get("/notice/list", summary="공지사항 목록")
+def get_notice_list(
+    page: int = 1,
+    pagesize: int = 10,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="인증이 필요합니다.")
+
+    offset = (page - 1) * pagesize
+    notices = (
+        db.query(Notice)
+        .order_by(Notice.is_pinned.desc(), Notice.created_at.desc())
+        .offset(offset)
+        .limit(pagesize)
+        .all()
+    )
+    total = db.query(Notice).count()
+
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": n.id,
+                "title": n.title,
+                "author_name": n.author_name,
+                "is_pinned": n.is_pinned,
+                "created_at": n.created_at,
+                "updated_at": n.updated_at,
+            }
+            for n in notices
+        ],
+    }
+
+
+@router.get("/notice/detail/{notice_id}", summary="공지사항 상세")
+def get_notice_detail(
+    notice_id: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="인증이 필요합니다.")
+
+    notice = db.query(Notice).filter(Notice.id == notice_id).first()
+    if not notice:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="공지사항을 찾을 수 없습니다.")
+
+    return {
+        "id": notice.id,
+        "title": notice.title,
+        "content": notice.content,
+        "author_name": notice.author_name,
+        "is_pinned": notice.is_pinned,
+        "created_at": notice.created_at,
+        "updated_at": notice.updated_at,
+    }
