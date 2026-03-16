@@ -153,14 +153,17 @@ def create_new_group(group_name: str, group_id: str, user: UserSchema, db: Sessi
     return group_id
 
 
-def get_next_sequence(group_id: str, active_status: int, db: Session) -> int:
-    """해당 그룹의 특정 active 상태에서 다음 sequence 번호 반환"""
-    
+def get_next_sequence(group_id: str, active_status: int, db: Session, role: str = "RN") -> int:
+    """해당 그룹의 특정 active 상태 + role 그룹에서 다음 sequence 번호 반환"""
+    from services.nurse_service import get_role_group, _role_group_filter
+
+    role_group = get_role_group(role)
     max_sequence = db.query(func.max(NurseModel.sequence)).filter(
         NurseModel.group_id == group_id,
-        NurseModel.active == active_status
+        NurseModel.active == active_status,
+        _role_group_filter(role_group)
     ).scalar()
-    
+
     return (max_sequence or 0) + 1
 
 
@@ -1307,7 +1310,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
             else:
                 print("   → 신규 등록")
                 try:
-                    seq_next = get_next_sequence(target_group_id, 1, db)
+                    seq_next = get_next_sequence(target_group_id, 1, db, role=role)
                     new_nurse = NurseModel(
                         nurse_id=nurse_id,
                         group_id=target_group_id,

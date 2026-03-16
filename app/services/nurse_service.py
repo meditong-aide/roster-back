@@ -92,6 +92,24 @@ def _get_display_flags(db: Session, group_id: str) -> dict:
     }
 
 
+def get_role_group(role: str) -> str:
+    """role 값을 RN/AN/ETC 그룹으로 분류"""
+    if role == "RN":
+        return "RN"
+    elif role == "AN":
+        return "AN"
+    else:
+        return "ETC"
+
+def _role_group_filter(role_group: str):
+    """role 그룹에 해당하는 SQLAlchemy 필터 조건 반환"""
+    if role_group == "RN":
+        return NurseModel.role == "RN"
+    elif role_group == "AN":
+        return NurseModel.role == "AN"
+    else:
+        return NurseModel.role.not_in(["RN", "AN"])
+
 def get_personnel_basic_info_service(current_user, db: Session):
     """
     간호사 기본 정보 조회 서비스 함수
@@ -346,31 +364,28 @@ def get_nurses_filtered_service(
     return result
 
 
-def get_next_sequence_for_active_status(
-    group_id: str, active_status: int, db: Session
-) -> int:
+def get_next_sequence_for_active_status(group_id: str, active_status: int, db: Session, role: str) -> int:
     """
-    특정 active 상태(활성/비활성)에서 다음 sequence 번호 반환
+    특정 active 상태 + role 그룹에서 다음 sequence 번호 반환
     """
-    max_sequence = (
-        db.query(NurseModel.sequence)
-        .filter(NurseModel.group_id == group_id, NurseModel.active == active_status)
-        .order_by(NurseModel.sequence.desc())
-        .first()
-    )
+    role_group = get_role_group(role)
+    max_sequence = db.query(NurseModel.sequence).filter(
+        NurseModel.group_id == group_id,
+        NurseModel.active == active_status,
+        _role_group_filter(role_group)
+    ).order_by(NurseModel.sequence.desc()).first()
 
     return (max_sequence[0] + 1) if max_sequence and max_sequence[0] is not None else 1
 
-
-def _get_nurses_by_active(
-    group_id: str, active_status: int, db: Session
-) -> List[NurseModel]:
-    return (
+def _get_nurses_by_active(group_id: str, active_status: int, db: Session, role_group: str = None) -> List[NurseModel]:
+    q = (
         db.query(NurseModel)
         .filter(NurseModel.group_id == group_id, NurseModel.active == active_status)
-        .order_by(
-            NurseModel.role.desc(), NurseModel.sequence.asc(), NurseModel.nurse_id.asc()
-        )
+    )
+    if role_group:
+        q = q.filter(_role_group_filter(role_group))
+    return (
+        q.order_by(NurseModel.role.desc(), NurseModel.sequence.asc(), NurseModel.nurse_id.asc())
         .all()
     )
 
@@ -429,10 +444,11 @@ def move_nurse_with_active_service(
 
     group_id = target_group_id
     old_active = nurse.active
+    role_group = get_role_group(nurse.role)
 
     if target_active is None or target_active == old_active:
-        # 같은 상태 내 재배치
-        lst = _get_nurses_by_active(group_id, old_active, db)
+        # 같은 상태 내 재배치 (같은 role 그룹 내에서만)
+        lst = _get_nurses_by_active(group_id, old_active, db, role_group)
         # 해당 간호사 제외
         lst = [n for n in lst if n.nurse_id != nurse.nurse_id]
         # 경계 보정 (1-based)
@@ -440,13 +456,13 @@ def move_nurse_with_active_service(
         lst.insert(insert_idx, nurse)
         _reindex_contiguously(lst)
     else:
-        # 상태 변경: 기존 리스트에서 제거하고 reindex
-        old_list = _get_nurses_by_active(group_id, old_active, db)
+        # 상태 변경: 기존 리스트에서 제거하고 reindex (같은 role 그룹 내)
+        old_list = _get_nurses_by_active(group_id, old_active, db, role_group)
         old_list = [n for n in old_list if n.nurse_id != nurse.nurse_id]
         _reindex_contiguously(old_list)
-        # 새 리스트로 이동하여 삽입
+        # 새 리스트로 이동하여 삽입 (같은 role 그룹 내)
         nurse.active = target_active
-        new_list = _get_nurses_by_active(group_id, target_active, db)
+        new_list = _get_nurses_by_active(group_id, target_active, db, role_group)
         # autoflush로 인해 nurse가 이미 new_list에 포함될 수 있으므로 제거 후 삽입
         new_list = [n for n in new_list if n.nurse_id != nurse.nurse_id]
         insert_idx = max(0, min(new_sequence - 1, len(new_list)))
@@ -477,21 +493,20 @@ def reorder_nurses_service(
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id).all()
     }
 
-    # 활성 정렬 적용
-    for idx, nid in enumerate(active_order, start=1):
-        n = id_to_nurse.get(nid)
-        if not n:
-            continue
-        n.active = 1
-        n.sequence = idx
+    # role 그룹별로 분리하여 sequence 부여
+    def _assign_sequences_by_role_group(order_list: List[str], active_val: int):
+        role_counters = {}  # role_group별 sequence 카운터
+        for nid in order_list:
+            n = id_to_nurse.get(nid)
+            if not n:
+                continue
+            n.active = active_val
+            rg = get_role_group(n.role)
+            role_counters[rg] = role_counters.get(rg, 0) + 1
+            n.sequence = role_counters[rg]
 
-    # 비활성 정렬 적용
-    for idx, nid in enumerate(inactive_order, start=1):
-        n = id_to_nurse.get(nid)
-        if not n:
-            continue
-        n.active = 0
-        n.sequence = idx
+    _assign_sequences_by_role_group(active_order, 1)
+    _assign_sequences_by_role_group(inactive_order, 0)
 
     db.commit()
     return {
@@ -565,12 +580,17 @@ def bulk_update_nurses_service(
             # 변경된 필드만 추출
             update_data = profile.dict(exclude_unset=True)
 
-            # active 변경 시 sequence 자동 조정
+            # active 또는 role 변경 시 sequence 자동 조정
             old_active = db_nurse.active
-            new_active = update_data.get("active", old_active)
-            if old_active != new_active and "active" in update_data:
-                update_data["sequence"] = get_next_sequence_for_active_status(
-                    target_group_id, new_active, db
+            old_role = db_nurse.role
+            new_active = update_data.get('active', old_active)
+            new_role = update_data.get('role', old_role)
+
+            if (old_active != new_active and 'active' in update_data) or \
+               (old_role != new_role and 'role' in update_data):
+                # role 그룹이 바뀌거나 active가 바뀌면 새 그룹의 마지막 sequence로 이동
+                update_data['sequence'] = get_next_sequence_for_active_status(
+                    target_group_id, new_active, db, role=new_role
                 )
 
             # === 프론트에서 보내준 값으로 일괄 업데이트 ===
@@ -603,12 +623,13 @@ def bulk_update_nurses_service(
         if db_nurse_id not in client_nurse_ids:
             print("제외된 간호사 for test:", db_nurse_id)
 
-    # === active 상태별 sequence 재정렬 (갭/중복 방지) ===
+    # === active 상태 × role 그룹별 sequence 재정렬 (갭/중복 방지) ===
     # autoflush=False 환경이므로 in-memory 변경사항을 DB에 반영 후 쿼리
     db.flush()
     for active_status in (1, 0):
-        nurses_in_status = _get_nurses_by_active(target_group_id, active_status, db)
-        _reindex_contiguously(nurses_in_status)
+        for rg in ("RN", "AN", "ETC"):
+            nurses_in_group = _get_nurses_by_active(target_group_id, active_status, db, rg)
+            _reindex_contiguously(nurses_in_group)
 
     db.commit()
 
@@ -642,26 +663,22 @@ def move_nurse_service(req, current_user, db: Session):
     old_sequence = nurse_to_move.sequence
     new_sequence = req.new_sequence
     active_status = nurse_to_move.active
+    role_grp_filter = _role_group_filter(get_role_group(nurse_to_move.role))
 
-    print(
-        f"[DEBUG] 순서 이동: {nurse_to_move.name} (active={active_status}) {old_sequence} → {new_sequence}"
-    )
+    print(f"[DEBUG] 순서 이동: {nurse_to_move.name} (active={active_status}, role={nurse_to_move.role}) {old_sequence} → {new_sequence}")
 
     if old_sequence == new_sequence:
         return {"message": "변경사항이 없습니다."}
 
-    # 같은 active 상태의 간호사들만 대상으로 sequence 재조정
+    # 같은 active 상태 + 같은 role 그룹의 간호사들만 대상으로 sequence 재조정
     if old_sequence < new_sequence:
-        affected_nurses = (
-            db.query(NurseModel)
-            .filter(
-                NurseModel.group_id == current_user.group_id,
-                NurseModel.active == active_status,
-                NurseModel.sequence > old_sequence,
-                NurseModel.sequence <= new_sequence,
-            )
-            .all()
-        )
+        affected_nurses = db.query(NurseModel).filter(
+            NurseModel.group_id == current_user.group_id,
+            NurseModel.active == active_status,
+            role_grp_filter,
+            NurseModel.sequence > old_sequence,
+            NurseModel.sequence <= new_sequence
+        ).all()
 
         for nurse in affected_nurses:
             nurse.sequence -= 1
@@ -669,16 +686,13 @@ def move_nurse_service(req, current_user, db: Session):
                 f"[DEBUG] {nurse.name} sequence: {nurse.sequence + 1} → {nurse.sequence}"
             )
     else:
-        affected_nurses = (
-            db.query(NurseModel)
-            .filter(
-                NurseModel.group_id == current_user.group_id,
-                NurseModel.active == active_status,
-                NurseModel.sequence >= new_sequence,
-                NurseModel.sequence < old_sequence,
-            )
-            .all()
-        )
+        affected_nurses = db.query(NurseModel).filter(
+            NurseModel.group_id == current_user.group_id,
+            NurseModel.active == active_status,
+            role_grp_filter,
+            NurseModel.sequence >= new_sequence,
+            NurseModel.sequence < old_sequence
+        ).all()
 
         for nurse in affected_nurses:
             nurse.sequence += 1
@@ -820,10 +834,8 @@ def add_nurses_to_group_service(
             if existing_nurse:
                 # 이미 nurses 테이블에 존재 → group_id만 변경
                 existing_nurse.group_id = group_id
-                # sequence는 현재 그룹 활성 목록의 마지막으로 배치
-                next_seq = get_next_sequence_for_active_status(
-                    group_id, existing_nurse.active, db
-                )
+                # sequence는 현재 그룹 + role 그룹 활성 목록의 마지막으로 배치
+                next_seq = get_next_sequence_for_active_status(group_id, existing_nurse.active, db, role=existing_nurse.role)
                 existing_nurse.sequence = next_seq
                 updated += 1
             else:
@@ -872,7 +884,8 @@ def add_nurses_to_group_service(
                     except (ValueError, TypeError):
                         joining_date = None
 
-                next_seq = get_next_sequence_for_active_status(group_id, 1, db)
+                nurse_role = str(_get('duty') or 'RN') if _get('duty') else 'RN'
+                next_seq = get_next_sequence_for_active_status(group_id, 1, db, role=nurse_role)
 
                 new_nurse = NurseModel(
                     nurse_id=str(nid),
@@ -884,7 +897,7 @@ def add_nurses_to_group_service(
                     else None,
                     name=str(_get("EmployeeName") or ""),
                     experience=experience,
-                    role=str(_get("duty") or "") if _get("duty") else None,
+                    role=nurse_role,
                     is_head_nurse=is_head_nurse,
                     joining_date=joining_date,
                     birth_date=str(_get("DateOfBirth") or "")
@@ -970,14 +983,14 @@ def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
 
         # 삭제
         group_id = db_nurse.group_id
+        deleted_role_group = get_role_group(db_nurse.role)
         db.delete(db_nurse)
         db.commit()
 
-        # 삭제 후 active 상태별 재정렬
-        active_nurses = _get_nurses_by_active(group_id, 1, db)
-        _reindex_contiguously(active_nurses)
-        inactive_nurses = _get_nurses_by_active(group_id, 0, db)
-        _reindex_contiguously(inactive_nurses)
+        # 삭제 후 해당 role 그룹만 재정렬
+        for active_status in (1, 0):
+            nurses_in_group = _get_nurses_by_active(group_id, active_status, db, deleted_role_group)
+            _reindex_contiguously(nurses_in_group)
         db.commit()
 
         return {"message": f"Nurse {nurse_id} deleted successfully"}

@@ -421,7 +421,7 @@ async def query_analyzer(state):
 
     models_to_try = [
         ChatOpenAI(model="gpt-4.1-mini-2025-04-14", openai_api_key=os.getenv("OPENAI_API_KEY")),
-        ChatAnthropic(model="claude-3-7-sonnet-20250219", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")),
+        ChatAnthropic(model="claude-haiku-4-5-20251001", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")),
         ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
     ]
 
@@ -465,10 +465,11 @@ async def query_analyzer(state):
     # LLM 호출 → case 유무 상관없이 항상 실행 (새 요청 처리 보장)
     for idx, client in enumerate(models_to_try, 1):
         try:
-            print(f'[LLM 시도 {idx}] {client.model_name}')
+            model_name_str = getattr(client, 'model', None) or getattr(client, 'model_name', 'unknown')
+            print(f'[LLM 시도 {idx}] {model_name_str}')
             llm = client.with_structured_output(queryAnalyzer)
             resp = await llm.ainvoke(messages)
-            used_model = client.model_name
+            used_model = model_name_str
             chat = resp.Chat
             shift = resp.Shift  # List[ShiftItem]
             preference = resp.Preference
@@ -488,7 +489,7 @@ async def query_analyzer(state):
     print(f"query_chat: {chat}")
 
     # 토큰 계산
-    model_name = used_model or models_to_try[0].model_name
+    model_name = used_model or getattr(models_to_try[0], 'model', None) or getattr(models_to_try[0], 'model_name', '')
     pt = _count_messages_tokens([prompt.system, prompt.human], model_name)
 
     # ShiftItem을 dict로 변환하여 JSON 직렬화
