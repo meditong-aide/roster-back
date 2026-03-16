@@ -1024,24 +1024,19 @@ def optimize_fallback_lex_hard_first(
                 xn = X(n, d - 1, night_idx)
                 xd = X(n, d, day_idx)
                 if getattr(cfg, "ban_n_to_d", True):
-                    # b_nd = m.NewBoolVar(f"viol_nd_{n}_{d}")
-                    # m.AddBoolOr([b_nd, xn.Not(), xd.Not()])
-                    # m.AddImplication(b_nd, xn)
-                    # m.AddImplication(b_nd, xd)
-                    # safety["trans_nd"].append(b_nd)
-                    m.Add(xn + xd <= 1)
+                    # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == day_idx):
+                        m.Add(xn + xd <= 1)
                 if getattr(cfg, "ban_e_to_d", True):
                     xe = X(n, d - 1, eve_idx)
-                    # E→D: 하드 제약으로 처리 (E 다음날 D 금지)
-                    m.Add(xe + xd <= 1)
+                    # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == eve_idx and fixed.get((n, d)) == day_idx):
+                        m.Add(xe + xd <= 1)
                 if getattr(cfg, "ban_n_to_e", True):
                     xe2 = X(n, d, eve_idx)
-                    # b_ne = m.NewBoolVar(f"viol_ne_{n}_{d}")
-                    # m.AddBoolOr([b_ne, xn.Not(), xe2.Not()])
-                    # m.AddImplication(b_ne, xn)
-                    # m.AddImplication(b_ne, xe2)
-                    # safety["trans_ne"].append(b_ne)
-                    m.Add(xn + xe2 <= 1)
+                    # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == eve_idx):
+                        m.Add(xn + xe2 <= 1)
                 if mid_idx is not None:
                     m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
                 # if getattr(cfg, "ban_d_to_n", True):
