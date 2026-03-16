@@ -1039,15 +1039,11 @@ class CPSATBasicEngine:
                     if n_idx is None:
                         continue
                     for d in day_list:
-                        # 기존 고정과 충돌 검출
+                        # 유저 고정 셀 우선: 유저가 비-O 고정을 넣은 날은 전월 꼬리 forced_off 무시
                         conflict = next((c for c in fixed_cells if c.get('nurse_index')==n_idx and c.get('day_index')==d and c.get('shift')!='O'), None)
                         if conflict:
-                            msg = f"법규-유저 고정 충돌: nurse={dbid}, day={d+1}, user={conflict.get('shift')}, law=O"
-                            print(f"{self.logger_prefix} {msg}")
-                            if not allow_override_by_law:
-                                raise ValueError(msg)
-                            # override: 기존 고정 무시
-                            fixed_cells = [c for c in fixed_cells if not (c.get('nurse_index')==n_idx and c.get('day_index')==d)]
+                            print(f"{self.logger_prefix} 법규-유저 고정 충돌 (유저 우선): nurse={dbid}, day={d+1}, user={conflict.get('shift')}, law=O → forced_off 무시")
+                            continue
                         fixed_cells.append({'nurse_index': n_idx, 'day_index': d, 'shift': 'O'})
             # print('fixed_cells!!!!!', fixed_cells)
             roster_system._work_sub_ids = _work_sub_ids  # fallback 등에서 참조
@@ -2276,8 +2272,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if (n, d) not in active_days:
                         print(f"[CP-SAT-Basic] 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
                         continue
-                    if (n,d) in fixed and fixed[(n,d)] == s_idx:
-                        print(f"[CP-SAT-Basic] 경고: 초기 금지와 고정 충돌 (n={n}, d={d+1}, code={code})")
+                    if (n,d) in fixed:
+                        print(f"[CP-SAT-Basic] 초기 금지 무시 (유저 고정 우선): n={n}, d={d+1}, code={code}, fixed={rs.config.shift_types[fixed[(n,d)]]}")
+                        continue
                     m.Add(X(n,d,s_idx)==0)
     except Exception as e:
         print(f"[CP-SAT-Basic] 초기 금지 셀 적용 중 오류: {e}")
@@ -2545,13 +2542,29 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     right = min(T1, w_end)
                     if left > right:
                         continue
-                    m.Add(sum(X(n, d, off_idx_full) for d in range(left, right + 1)) >= 1)
+                    # 유저 고정 우선: 윈도우 내 고정 비-OFF 셀은 제외하고 적용
+                    free_days = [d for d in range(left, right + 1) if not ((n, d) in fixed and fixed[(n, d)] != off_idx_full)]
+                    if not free_days:
+                        print(f"[CP-SAT-Basic] off_window 무시 (유저 고정 우선): n={n}, window=[{left+1},{right+1}] 전체 고정")
+                        continue
+                    m.Add(sum(X(n, d, off_idx_full) for d in free_days) >= 1)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
         # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        # 고정 셀 우선: D/E/N/O 불문하고 fixed_cells에 포함된 날은 자유 일수에서 제외
+        # → 유저가 K+1일 이상 연속 근무를 고정한 경우, 해당 윈도우는 제약 적용하지 않음
         if not bool(getattr(nu, "is_weekend_off", False)):
             for d0 in range(T0, T1-K+1):
-                m.Add(sum(X(n,d0+t,off) for t in range(K+1)) >= 1)
+                window = [d0 + t for t in range(K + 1)]
+                # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
+                if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
+                    continue
+                # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 대상으로 합산
+                free_days_w = [d for d in window if (n, d) not in fixed]
+                if not free_days_w:
+                    # 윈도우 전체가 고정(D/E/N 연속 포함) → 유저 고정 우선, 제약 무시
+                    continue
+                m.Add(sum(X(n, d, off) for d in free_days_w) >= 1)
 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):

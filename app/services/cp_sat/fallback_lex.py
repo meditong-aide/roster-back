@@ -858,7 +858,8 @@ def optimize_fallback_lex_hard_first(
                         s_idx = roster_system.config.shift_types.index(code)
                         if (n, d) not in active_days:
                             continue
-                        if (n, d) in fixed and fixed[(n, d)] == s_idx:
+                        if (n, d) in fixed:
+                            # 유저 고정 셀 우선: 해당 날 전체 금지 무시
                             continue
                         m.Add(X(n, d, s_idx) == 0)
         except Exception as e:
@@ -1102,11 +1103,17 @@ def optimize_fallback_lex_hard_first(
                         right = min(T1, w_end)
                         if left > right:
                             continue
-                        m.Add(sum(X(n, d, off_idx) for d in range(left, right + 1)) >= 1)
+                        # 유저 고정 우선: 윈도우 내 고정 비-OFF 셀은 제외하고 적용
+                        free_days_w = [d for d in range(left, right + 1) if not ((n, d) in fixed and fixed[(n, d)] != off_idx)]
+                        if not free_days_w:
+                            print(f"{logger_prefix} off_window 무시 (유저 고정 우선, fallback): n={n}, window=[{left+1},{right+1}] 전체 고정")
+                            continue
+                        m.Add(sum(X(n, d, off_idx) for d in free_days_w) >= 1)
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
         # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        # 고정 셀 우선: D/E/N/O 불문하고 fixed인 날은 자유 일수에서 제외
         K = cfg.max_consecutive_work_days
         for n in range(N):
             if preceptee_follow and n in preceptee_indices:
@@ -1115,8 +1122,15 @@ def optimize_fallback_lex_hard_first(
                 continue
             T0, T1 = join[n], leave[n]
             for d0 in range(T0, T1 - K + 1):
-                sum_off = sum(X(n, d0 + t, off_idx) for t in range(K + 1))
-                m.Add(sum_off >= 1)
+                window = [d0 + t for t in range(K + 1)]
+                # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
+                if any((n, d) in fixed and fixed[(n, d)] == off_idx for d in window):
+                    continue
+                # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 합산
+                free_days_w = [d for d in window if (n, d) not in fixed]
+                if not free_days_w:
+                    continue
+                m.Add(sum(X(n, d, off_idx) for d in free_days_w) >= 1)
 
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
