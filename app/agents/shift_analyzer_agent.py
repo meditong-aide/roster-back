@@ -22,7 +22,7 @@ dotenv.load_dotenv()
 
 def collector(state):
     """information collector"""
-    return state
+    return {}
 
 
 def init_data(state):

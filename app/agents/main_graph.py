@@ -12,7 +12,7 @@ def collector(state):
     """
     최종 정보 수집기: 모든 분석 결과를 통합하여 반환
     """
-    return state
+    return {}
 
 
 class ContextAnalyticsState(TypedDict):

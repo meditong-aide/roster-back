@@ -105,13 +105,60 @@ class Common:
 
     @staticmethod
     def get_push_cnt():
+        # get_push_list()와 동일한 dedup 로직 적용 — 노출되는 알림 수와 카운트 일치
         _queryString = """
-        Select a.PushCode, COUNT(*) As PushCnt
-          From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
-         Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
-         Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N' 
-           And b.ReadYN='N' And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01' 
-        Group By a.PushCode
+        WITH Base AS (
+            Select a.Idx, a.PushCode,
+                   ISNULL(a.LinkCode, '') as LinkCode,
+                   a.pushsubcode, a.Message
+              From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
+             Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
+             Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N'
+               And b.ReadYN = 'N'
+               And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
+        ),
+        WithKey AS (
+            Select *,
+                   CASE
+                       WHEN LinkCode <> '' THEN LinkCode
+                       WHEN pushsubcode IN ('S01','S04') AND CHARINDEX(N'년', Message) > 0 AND CHARINDEX(N'월', Message) > 0
+                       THEN CONCAT(
+                           'ROSTER:',
+                           LEFT(Message, CHARINDEX(N'년', Message) - 1),
+                           ':',
+                           RIGHT('0' + LTRIM(RTRIM(SUBSTRING(
+                               Message,
+                               CHARINDEX(N'년 ', Message) + 2,
+                               CHARINDEX(N'월', Message) - CHARINDEX(N'년 ', Message) - 2
+                           ))), 2)
+                       )
+                       WHEN pushsubcode = 'S02' AND CHARINDEX(N'년', Message) > 0 AND CHARINDEX(N'월', Message) > 0
+                       THEN CONCAT(
+                           'WANTED:',
+                           LEFT(Message, CHARINDEX(N'년', Message) - 1),
+                           ':',
+                           RIGHT('0' + LTRIM(RTRIM(SUBSTRING(
+                               Message,
+                               CHARINDEX(N'년 ', Message) + 2,
+                               CHARINDEX(N'월', Message) - CHARINDEX(N'년 ', Message) - 2
+                           ))), 2)
+                       )
+                       ELSE CAST(Idx AS VARCHAR(20))
+                   END AS DerivedLinkCode
+              From Base
+        ),
+        Ranked AS (
+            Select PushCode,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY DerivedLinkCode
+                       ORDER BY Idx DESC
+                   ) AS rn
+              From WithKey
+        )
+        Select PushCode, COUNT(*) As PushCnt
+          From Ranked
+         Where rn = 1
+        Group By PushCode
         """
         return _queryString
 
