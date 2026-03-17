@@ -1,3 +1,7 @@
+from datetime import datetime
+
+from dateutil.relativedelta import relativedelta
+
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
 
@@ -69,6 +73,23 @@ def message_view(page: int, pagesize: int, current_user: UserSchema = Depends(ge
         "jobState": row['jobState']
     } for row in rows]
 
+@router.delete("/{no}", summary="문의내역 삭제")
+def delete_contact(no: int, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+    """
+    * 나의 문의내역 삭제
+    * 호출방식 : DELETE /contact/{no}
+    * 본인이 작성한 문의만 삭제 가능
+    """
+    account_id = current_user.account_id
+
+    result = msdb_manager.execute(Contact.delete_contact(), params=(no, account_id))
+
+    if result == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="삭제할 문의를 찾을 수 없거나 권한이 없습니다.")
+
+    return {"result": "success", "message": "문의가 삭제되었습니다."}
+
+
 @router.get("/download", summary="파일 다운로드")
 def message_view(filename: str, current_user: UserSchema = Depends(get_current_user_from_cookie)):
     """
@@ -101,15 +122,17 @@ def get_notice_list(
     if not current_user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="인증이 필요합니다.")
 
+    six_months_ago = (datetime.now() - relativedelta(months=6)).replace(hour=0, minute=0, second=0, microsecond=0)
     offset = (page - 1) * pagesize
+    base_query = db.query(Notice).filter(Notice.created_at >= six_months_ago)
     notices = (
-        db.query(Notice)
+        base_query
         .order_by(Notice.is_pinned.desc(), Notice.created_at.desc())
         .offset(offset)
         .limit(pagesize)
         .all()
     )
-    total = db.query(Notice).count()
+    total = base_query.count()
 
     return {
         "total": total,

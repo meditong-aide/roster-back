@@ -34,3 +34,11 @@ class Contact:
         _queryString = _queryString + "FETCH NEXT  " + str(pagesize) + " ROW ONLY "
 
         return _queryString
+
+    @staticmethod
+    def delete_contact():
+        _queryString = """
+            DELETE FROM bizwiz20db.Manage_Work
+            WHERE No = %s AND WriterID = %s
+            """
+        return _queryString
