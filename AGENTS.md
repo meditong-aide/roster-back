@@ -48,6 +48,93 @@
 - Prefer explicit typing where patterns already use it.
 - Keep imports and file-level side effects aligned with existing project conventions.
 
+### Code Modification Rules (STRICT)
+
+- Only modify the minimum necessary lines to achieve the goal
+- Do NOT reformat, reorder, or clean up unrelated code
+- Do NOT change indentation, spacing, or line breaks unless required
+- Do NOT rename variables or refactor unless explicitly asked
+- Preserve existing coding style exactly as-is
+
+### Editing Discipline
+
+- Before editing, identify the exact lines that must change
+- Limit changes strictly to those lines
+- Avoid touching surrounding code
+- Prefer surgical edits over broad rewrites
+
+### Forbidden Behavior
+
+- No formatting-only changes
+- No "cleanup" changes
+- No style normalization
+- No large refactors unless explicitly requested
+
+### Patch Strategy
+
+- Prefer minimal, diff-style edits
+- Avoid rewriting entire files or functions unless strictly necessary
+- Never replace entire files unless absolutely necessary
+- Prefer line-level edits over block-level rewrites
+- Think in terms of diffs, not rewritten code
+
+### Work Mode Separation (STRICT)
+
+- Treat bug fixes and refactors as different kinds of work.
+- Default to Bugfix Mode unless the user explicitly asks for refactoring.
+- Never introduce refactoring during bug fixing unless explicitly requested.
+- Never expand the scope of a bug fix into cleanup, renaming, or structural improvement.
+- If a cleaner structural fix seems preferable, first explain it as a separate refactor option instead of applying it by default.
+
+### Bugfix Mode
+
+Use Bugfix Mode when the request is about:
+- fixing an error
+- resolving incorrect behavior
+- patching a failing test
+- addressing a regression
+- making a minimal functional correction
+
+In Bugfix Mode:
+- change only what is required to fix the issue
+- preserve existing structure unless the current structure directly prevents the fix
+- avoid renaming, extraction, file moves, or abstraction changes
+- avoid formatting-only edits
+- prefer the smallest safe patch
+- validate with the smallest relevant test scope first
+
+### Refactor Mode
+
+Use Refactor Mode only when the user explicitly asks for:
+- refactoring
+- cleanup
+- restructuring
+- simplification
+- modularization
+- naming improvements
+- abstraction changes
+
+In Refactor Mode:
+- explain the intended scope before making broad changes
+- keep behavior unchanged unless explicitly requested otherwise
+- separate pure refactor changes from behavior changes when possible
+- identify risk areas and affected modules before editing
+- validate behavior with relevant tests after changes
+
+### Decision Rule
+
+- If the request is ambiguous, choose Bugfix Mode.
+- If both bug fixing and refactoring are needed, do the bug fix first and present refactoring as a separate follow-up step.
+- Do not silently combine Bugfix Mode and Refactor Mode in a single edit pass unless explicitly requested.
+
+### Scope Control
+
+- Solve only the explicitly requested problem, not adjacent issues
+- Do not fix unrelated code smells during bug fixing
+- Do not expand a local fix into a broader redesign
+- If additional issues are discovered, report them separately instead of fixing them
+- Avoid modifying files or functions not directly related to the request
+
 ### Git Strategy
 - Branch naming: `feature/*`, `fix/*`, `chore/*`.
 - Commit style: conventional and intent-first.
