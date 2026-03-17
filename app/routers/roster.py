@@ -808,6 +808,195 @@ async def get_roster_for_month(
     return roster_data
 
 
+# [Roster] - 전월 근무표 tail N일 데이터 조회 (원티드 관리보드 / 생성된 근무표용)
+@router.get("/{year:int}/{month:int}/prev-tail")
+async def get_prev_month_tail(
+    year: int,
+    month: int,
+    schedule_id: Optional[str] = None,
+    tail_days: int = Query(default=5, ge=1, le=15),
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """전월 근무표의 마지막 N일 시프트 데이터 조회.
+
+    간호사 목록 기준:
+    - schedule_id 제공 시 → 해당 현재월 근무표에 포함된 간호사만
+    - schedule_id 없을 시 → 현재월 issued 근무표 기준, 없으면 그룹 active 간호사 전체
+
+    전월 근무표 기준:
+    - 마감된(issued) 근무표 우선 (동일 월 내 1개만 존재)
+    - 없으면 가장 마지막에 생성된 근무표 기준
+    - 전월 데이터가 없으면 data: null 반환 (404 아님)
+
+    전월에 없던 신규 간호사의 경우 해당 일자 shifts 값은 null로 반환됨.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 대상 그룹 결정
+    if current_user.is_head_nurse and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(
+                status_code=400, detail="group_id is required for admin"
+            )
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if (
+            getattr(current_user, "office_id", None)
+            and current_user.office_id != g.office_id
+        ):
+            raise HTTPException(
+                status_code=403, detail="Group does not belong to your office"
+            )
+        target_group_id = g.group_id
+
+    # 전월 계산
+    if month == 1:
+        prev_year, prev_month = year - 1, 12
+    else:
+        prev_year, prev_month = year, month - 1
+
+    # 현재월 근무표 기준 간호사 목록 결정
+    # 1순위: 파라미터로 받은 schedule_id의 ScheduleEntry에서 distinct nurse_id 추출
+    # 2순위: 현재월 issued 근무표
+    # 3순위: 그룹 active 간호사 전체 (fallback)
+    ref_schedule_id = schedule_id
+    if not ref_schedule_id:
+        cur_issued = (
+            db.query(Schedule.schedule_id)
+            .filter(
+                Schedule.group_id == target_group_id,
+                Schedule.year == year,
+                Schedule.month == month,
+                Schedule.status == "issued",
+                Schedule.dropped == False,
+            )
+            .scalar()
+        )
+        ref_schedule_id = cur_issued
+
+    if ref_schedule_id:
+        # 현재월 근무표에 등장하는 nurse_id 목록 (순서 포함)
+        nurse_ids_in_schedule = [
+            row.nurse_id
+            for row in (
+                db.query(ScheduleEntry.nurse_id)
+                .filter(ScheduleEntry.schedule_id == ref_schedule_id)
+                .distinct()
+                .all()
+            )
+        ]
+        nurses = (
+            db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence)
+            .filter(Nurse.nurse_id.in_(nurse_ids_in_schedule))
+            .order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc())
+            .all()
+        )
+    else:
+        # fallback: 그룹 active 간호사 전체
+        nurses = (
+            db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence)
+            .filter(
+                Nurse.group_id == target_group_id,
+                Nurse.active == 1,
+            )
+            .order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc())
+            .all()
+        )
+
+    # 전월 기준 스케줄 조회: 마감된(issued) 근무표 우선
+    # - 동일 월에 issued 상태는 1개만 존재 (발행 시 기존 issued → draft 전환)
+    # - 없으면 최근 생성 순
+    prev_schedule = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == target_group_id,
+            Schedule.year == prev_year,
+            Schedule.month == prev_month,
+            Schedule.status == "issued",
+            Schedule.dropped == False,
+        )
+        .first()
+    )
+
+    if not prev_schedule:
+        prev_schedule = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id == target_group_id,
+                Schedule.year == prev_year,
+                Schedule.month == prev_month,
+                Schedule.dropped == False,
+            )
+            .order_by(Schedule.created_at.desc())
+            .first()
+        )
+
+    if not prev_schedule:
+        return {"prev_year": prev_year, "prev_month": prev_month, "data": None}
+
+    # 전월 마지막 N일 계산
+    days_in_prev_month = get_days_in_month(prev_year, prev_month)
+    tail_day_list = list(
+        range(max(1, days_in_prev_month - tail_days + 1), days_in_prev_month + 1)
+    )
+
+    # 해당 일자 범위 엔트리 조회
+    start_date = date(prev_year, prev_month, tail_day_list[0])
+    end_date = date(prev_year, prev_month, tail_day_list[-1])
+
+    entries = (
+        db.query(ScheduleEntry)
+        .filter(
+            ScheduleEntry.schedule_id == prev_schedule.schedule_id,
+            ScheduleEntry.work_date >= start_date,
+            ScheduleEntry.work_date <= end_date,
+        )
+        .all()
+    )
+
+    # 간호사별 시프트 매핑 (day → shift_id)
+    entries_by_nurse: Dict[str, Dict[int, str]] = {}
+    for entry in entries:
+        nid = entry.nurse_id
+        if nid not in entries_by_nurse:
+            entries_by_nurse[nid] = {}
+        entries_by_nurse[nid][entry.work_date.day] = entry.shift_id
+
+    # 현재월 근무표 기준 간호사 순서대로 전월 시프트 매핑
+    # - 전월에 없던 신규 간호사는 해당 일자 shifts 값이 null
+    nurse_list = []
+    for nurse in nurses:
+        shifts = {
+            str(d): entries_by_nurse.get(nurse.nurse_id, {}).get(d)
+            for d in tail_day_list
+        }
+        nurse_list.append(
+            {
+                "nurse_id": nurse.nurse_id,
+                "name": nurse.name,
+                "shifts": shifts,
+            }
+        )
+
+    return {
+        "prev_year": prev_year,
+        "prev_month": prev_month,
+        "data": {
+            "schedule_id": prev_schedule.schedule_id,
+            "schedule_name": prev_schedule.name,
+            "schedule_status": prev_schedule.status,
+            "tail_days": tail_day_list,
+            "nurses": nurse_list,
+        },
+    }
+
+
 # [Roster] - 근무표 발행
 @router.post("/publish")
 async def publish_roster(
