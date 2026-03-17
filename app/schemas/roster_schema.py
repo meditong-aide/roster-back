@@ -298,6 +298,7 @@ class NurseProfile(BaseModel):
     # Side-Profile 추가 컬럼
     birth_date: Optional[str] = None
     phone_number: Optional[str] = None
+    email: Optional[str] = None
     age: Optional[int] = None  # 나이
     gender: Optional[str] = None
     profile_image_url: Optional[str] = None
@@ -387,6 +388,35 @@ class PersonnelUpdate(BaseModel):
 
     email: Optional[EmailStr] = Field(None, description="이메일 주소")
     experience: Optional[int] = Field(None, ge=0, description="총 경력(년)")
+
+
+class NurseProfileUpdate(BaseModel):
+    """nurse_id 기반 단건 프로필 업데이트 (사이드 프로필 / 마이페이지)"""
+
+    name: Optional[str] = None
+    experience: Optional[int] = Field(None, ge=0)
+    role: Optional[str] = None
+    level_: Optional[str] = None
+    grade: Optional[int] = None
+    birth_date: Optional[str] = None
+    phone_number: Optional[str] = None
+    email: Optional[EmailStr] = None
+    gender: Optional[str] = None
+    joining_date: Optional[datetime] = None
+    resignation_date: Optional[datetime] = None
+    resignation_reason: Optional[str] = None
+    resignation_reason_memo: Optional[str] = None
+    nurse_memo: Optional[str] = None
+    is_head_nurse: Optional[bool] = None
+    preceptor_id: Optional[str] = None
+    fixed_shift: Optional[str] = None
+    weekly_off_weekday: Optional[int] = None
+    is_weekend_off: Optional[bool] = None
+    is_night_nurse: Optional[List[str]] = None
+    work_shifts: Optional[List[str]] = None
+    enable_nurse_pair_preference: Optional[bool] = None
+    enable_aide: Optional[bool] = None
+    wanted_max_requests: Optional[int] = None
 
 
 class PasswordChangeRequest(BaseModel):

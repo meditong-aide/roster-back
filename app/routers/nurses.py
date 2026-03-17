@@ -26,6 +26,7 @@ from schemas.roster_schema import (
     ReorderPayload,
     ExcelConfirmRequest,
     PersonnelUpdate,
+    NurseProfileUpdate,
     PasswordChangeRequest,
     PhoneChangeRequest,
     AddToGroupRequest,
@@ -47,6 +48,7 @@ from services.nurse_service import (
     get_profile_image_info_service,
     delete_profile_image_service,
     get_profile_image_url,
+    update_nurse_profile_service,
 )
 from services.excel_service import (
     create_nurse_template,
@@ -610,41 +612,6 @@ async def get_personnel_basic_info(
         if nurse.team and nurse.team.team_name:
             work_place = nurse.team.team_name
 
-        # Member 테이블에서 이메일 + PortableTel 보강 (단일 호출)
-        member_rows = msdb_manager.fetch_all(
-            Member.member_view(), params=(current_user.account_id,)
-        )
-
-        email = ""
-        member_phone = ""
-
-        if member_rows and len(member_rows) > 0:
-            # fetch_all 결과가 리스트라고 가정
-            first_row = member_rows[0]
-
-            if isinstance(first_row, dict):
-                # 딕셔너리면 안전하게 get
-                email = first_row.get("Email", "")
-                member_phone = first_row.get("PortableTel", "") or first_row.get(
-                    "Tel", ""
-                )
-            elif isinstance(first_row, tuple):
-                # 튜플이면 인덱스로 매핑 (member_view 쿼리 순서 기준)
-                if len(first_row) > 11:
-                    email = first_row[11] or ""  # Email (인덱스 11)
-                if len(first_row) > 8:
-                    portable_tel = first_row[8] or ""  # PortableTel (인덱스 8)
-                    tel = first_row[7] or ""  # Tel (인덱스 7)
-                    member_phone = portable_tel or tel
-            elif isinstance(first_row, str):
-                # 문자열이면 (현재 상황처럼) office_id만 온 것으로 간주
-                print(f"[WARNING] fetch_all 첫 행이 문자열: {first_row}")
-                # 이 경우 추가 쿼리 필요하거나 email 빈 값 유지
-            else:
-                print(f"[ERROR] 예상치 못한 fetch_all 행 타입: {type(first_row)}")
-        else:
-            print("[WARNING] member_view 결과 없음")
-
         return {
             "nurse_id": nurse.nurse_id,
             "name": nurse.name,
@@ -657,8 +624,8 @@ async def get_personnel_basic_info(
             if nurse.joining_date
             else None,
             "experience": nurse.experience,
-            "phone_number": nurse.phone_number or member_phone,
-            "email": email,
+            "phone_number": nurse.phone_number,
+            "email": nurse.email or "",
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
@@ -687,21 +654,25 @@ async def partial_update_personnel_basic_info(
     if not nurse:
         raise HTTPException(404, "간호사 정보 없음")
 
-    updated = False
-
     if update_data.experience is not None:
         nurse.experience = update_data.experience
-        updated = True
-
-    if updated:
-        db.commit()
-        db.refresh(nurse)
 
     if update_data.email is not None:
-        msdb_manager.execute(
-            "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s",
-            (update_data.email, current_user.nurse_id),
-        )
+        nurse.email = update_data.email
+
+    db.commit()
+    db.refresh(nurse)
+
+    # email 변경 시 MSSQL dual write (비밀번호 찾기 본인확인용)
+    if update_data.email is not None:
+        try:
+            msdb_manager.execute(
+                "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s",
+                (update_data.email, current_user.nurse_id),
+            )
+        except Exception as e:
+            import logging
+            logging.warning(f"[personnel-basic-info] MSSQL email 동기화 실패: {e}")
 
     return {"message": "정보가 성공적으로 수정되었습니다"}
 
@@ -880,6 +851,21 @@ async def verify_and_update_phone(
     del verification_cache[nurse_id]
 
     return {"message": "휴대폰 번호가 성공적으로 변경되었습니다"}
+
+
+@router.patch("/{nurse_id}")
+async def update_nurse_profile(
+    nurse_id: str,
+    update_data: NurseProfileUpdate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    try:
+        return update_nurse_profile_service(nurse_id, update_data, current_user, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"간호사 정보 수정 실패: {str(e)}")
 
 
 @router.delete("/{nurse_id}")

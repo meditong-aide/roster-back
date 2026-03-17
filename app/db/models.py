@@ -101,6 +101,7 @@ class Nurse(Base):
     # 사이드 프로필 관련 추가 컬럼
     birth_date = Column(VARCHAR(10), nullable=True)
     phone_number = Column(VARCHAR(20), nullable=True)
+    email = Column(NVARCHAR(100), nullable=True)
     gender = Column(NVARCHAR(3), nullable=True)
     profile_image_key = Column(VARCHAR(1000), nullable=True)
     profile_image_updated_at = Column(DATETIME, nullable=True)

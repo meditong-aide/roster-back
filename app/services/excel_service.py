@@ -76,6 +76,7 @@ def create_nurse_template2() -> str:
         '생년월일(필수)': ['1999-01-01', '', '', ('생년월일 정보')],
         '연락처(필수)': ['010-0000-0000', '', '', ('연락처 정보')],
         '성별(필수)': ['남', '', '', ('성별 정보')],
+        '이메일(선택)': ['nurse001@hospital.com', '', '', ('이메일 정보')],
 
     }
     df = pd.DataFrame(template_data)
@@ -404,6 +405,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
         col_birth = find_col(['생년월일(필수)', '생년월일', 'birth_date'])
         col_phone = find_col(['연락처(필수)', '연락처', 'phone_number'])
         col_gender = find_col(['성별(필수)', '성별', 'gender'])
+        col_email = find_col_optional(['이메일(선택)', '이메일', 'email'])
         
         office_id = user.office_id
         rows_allowed = msdb_manager.fetch_all(Member.member_accounts_by_office(), params=(str(office_id),))
@@ -440,6 +442,8 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
             birth_date = row.get(col_birth)
             phone_num = row.get(col_phone)
             gender = row.get(col_gender)
+            email_val = str(row.get(col_email, '')).strip() if col_email else None
+            email_val = email_val if email_val else None
             # experience: 비어있으면 None 허용, 값이 있으면 숫자만 허용
             exp_val = None
             raw_exp_val = row.get(col_exp, 1)
@@ -526,7 +530,8 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
                     'birth_date': birth_date,
                     'phone_number': phone_num,
                     'is_night_nurse': [],
-                    'gender': gender
+                    'gender': gender,
+                    'email': email_val,
                 })
         
             if row_errs:
@@ -1277,6 +1282,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
             birth_date = str(item.get('birth_date', '')).strip()[:10] or None
             phone_number = str(item.get('phone_number', '')).strip()[:20] or None
             gender = str(item.get('gender', '')).strip()[:3] or None
+            email = str(item.get('email', '')).strip()[:100] or None
 
             is_night_nurse = item.get('is_night_nurse', []) or []
             work_shifts = item.get('work_shifts', []) or []
@@ -1304,6 +1310,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                 existing.birth_date = birth_date
                 existing.phone_number = phone_number
                 existing.gender = gender
+                existing.email = email
                 existing.is_night_nurse = is_night_nurse
                 existing.work_shifts = work_shifts
                 updated += 1
@@ -1331,6 +1338,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                         birth_date=birth_date,
                         phone_number=phone_number,
                         gender=gender,
+                        email=email,
                         work_shifts=work_shifts,
                     )
                     db.add(new_nurse)

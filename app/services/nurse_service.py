@@ -13,7 +13,7 @@ from db.models import (
     RosterConfig as RosterConfigModel,
     Shift,
 )
-from schemas.roster_schema import NurseProfile
+from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any
 from pprint import pprint
@@ -909,6 +909,7 @@ def add_nurses_to_group_service(
                     phone_number=str(_get("PortableTel") or "")
                     if _get("PortableTel")
                     else None,
+                    email=str(_get("Email") or "") if _get("Email") else None,
                     gender=str(_get("Gender") or "") if _get("Gender") else None,
                     sequence=next_seq,
                     active=1,
@@ -923,6 +924,60 @@ def add_nurses_to_group_service(
 
     db.commit()
     return {"added": added, "updated": updated, "errors": errors}
+
+
+def update_nurse_profile_service(
+    nurse_id: str,
+    update_data: NurseProfileUpdate,
+    current_user: UserSchema,
+    db: Session,
+):
+    """
+    nurse_id 기반 단건 프로필 업데이트 서비스 (근무자 관리 사이드 프로필용)
+    - 수간호사(HDN) 또는 관리자(ADM)만 수정 가능
+    - 수간호사는 같은 그룹 내만 수정 가능
+    - email 변경 시 bizwiz20db.Member에도 dual write
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    is_admin = current_user.is_master_admin
+    is_head = current_user.is_head_nurse
+
+    if not (is_admin or is_head):
+        raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 수정할 수 있습니다.")
+
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    if not nurse:
+        raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
+
+    # 수간호사는 같은 그룹 내만 수정 가능 (ADM 제외)
+    if not is_admin:
+        if nurse.group_id != current_user.group_id:
+            raise HTTPException(status_code=403, detail="같은 그룹의 간호사만 수정할 수 있습니다.")
+
+    fields = update_data.dict(exclude_unset=True)
+    email_changed = "email" in fields
+    new_email = fields.get("email")
+
+    for key, value in fields.items():
+        if hasattr(nurse, key):
+            setattr(nurse, key, value)
+
+    db.commit()
+    db.refresh(nurse)
+
+    # email 변경 시 MSSQL dual write
+    if email_changed and new_email is not None:
+        try:
+            msdb_manager.execute(
+                "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s",
+                (new_email, nurse_id),
+            )
+        except Exception as e:
+            logging.warning(f"[update_nurse_profile] MSSQL email 동기화 실패 nurse_id={nurse_id}: {e}")
+
+    return {"message": "간호사 정보가 성공적으로 수정되었습니다.", "nurse_id": nurse_id}
 
 
 def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
