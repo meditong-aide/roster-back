@@ -814,7 +814,7 @@ async def get_prev_month_tail(
     year: int,
     month: int,
     schedule_id: Optional[str] = None,
-    tail_days: int = Query(default=5, ge=1, le=15),
+    tail_days: int = Query(default=6, ge=1, le=15),
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),

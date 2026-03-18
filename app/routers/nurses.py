@@ -853,6 +853,35 @@ async def verify_and_update_phone(
     return {"message": "휴대폰 번호가 성공적으로 변경되었습니다"}
 
 
+@router.get("/{nurse_id}", response_model=NurseProfile)
+async def get_nurse_by_id(
+    nurse_id: str,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """단일 간호사 프로필 조회"""
+    try:
+        if current_user.is_master_admin:
+            result = get_nurses_filtered_service(
+                current_user,
+                db,
+                nurse_id=nurse_id,
+            )
+        else:
+            result = get_nurses_in_group_service(
+                current_user,
+                db,
+                nurse_id=nurse_id,
+            )
+        if not result:
+            raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
+        return result[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"간호사 조회 실패: {str(e)}")
+
+
 @router.patch("/{nurse_id}")
 async def update_nurse_profile(
     nurse_id: str,
