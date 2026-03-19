@@ -863,6 +863,9 @@ def optimize_fallback_lex_hard_first(
                         s_idx = roster_system.config.shift_types.index(code)
                         if (n, d) not in active_days:
                             continue
+                        if (n, d) in fixed:
+                            # 유저 고정 셀 우선: 해당 날 전체 금지 무시
+                            continue
                         m.Add(X(n, d, s_idx) == 0)
         except Exception as e:
             print(f"{logger_prefix} 초기 금지 셀 적용 중 오류: {e}")
