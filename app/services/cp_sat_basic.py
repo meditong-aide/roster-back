@@ -2285,6 +2285,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if (n, d) not in active_days:
                         print(f"[CP-SAT-Basic] 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
                         continue
+                    if (n, d) in fixed:
+                        print(f"[CP-SAT-Basic] 초기 금지 무시 (유저 고정 우선): n={n}, d={d+1}, code={code}, fixed={rs.config.shift_types[fixed[(n,d)]]}")
+                        continue
                     m.Add(X(n,d,s_idx)==0)
     except Exception as e:
         print(f"[CP-SAT-Basic] 초기 금지 셀 적용 중 오류: {e}")
@@ -2579,11 +2582,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):
             if getattr(cfg, "ban_n_to_d", True):
-                m.Add(X(n,d,day)+X(n,d-1,night)<=1)  # N→D 금지
+                # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
+                if not (fixed.get((n, d-1)) == night and fixed.get((n, d)) == day):
+                    m.Add(X(n,d,day)+X(n,d-1,night)<=1)  # N→D 금지
             if getattr(cfg, "ban_e_to_d", True):
-                m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
+                # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
+                if not (fixed.get((n, d-1)) == eve and fixed.get((n, d)) == day):
+                    m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
             if getattr(cfg, "ban_n_to_e", True):
-                m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
+                # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
+                if not (fixed.get((n, d-1)) == night and fixed.get((n, d)) == eve):
+                    m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
             if mid is not None:
                 m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
             if getattr(cfg, "ban_d_to_n", True):
