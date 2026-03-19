@@ -1026,18 +1026,24 @@ def optimize_fallback_lex_hard_first(
                 xn = X(n, d - 1, night_idx)
                 xd = X(n, d, day_idx)
                 if getattr(cfg, "ban_n_to_d", True):
-                    m.Add(xn + xd <= 1)
+                    # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == day_idx):
+                        m.Add(xn + xd <= 1)
                 if getattr(cfg, "ban_e_to_d", True):
                     xe = X(n, d - 1, eve_idx)
-                    m.Add(xe + xd <= 1)
+                    # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == eve_idx and fixed.get((n, d)) == day_idx):
+                        m.Add(xe + xd <= 1)
                 if getattr(cfg, "ban_n_to_e", True):
                     xe2 = X(n, d, eve_idx)
-                    m.Add(xn + xe2 <= 1)
+                    # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
+                    if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == eve_idx):
+                        m.Add(xn + xe2 <= 1)
                 if mid_idx is not None:
                     m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
-                if getattr(cfg, "ban_d_to_n", True):
-                    xd_prev = X(n, d - 1, day_idx)
-                    m.Add(xd_prev + xn <= 1)
+                # if getattr(cfg, "ban_d_to_n", True):
+                #     xd_prev = X(n, d - 1, day_idx)
+                #     m.Add(xd_prev + xn <= 1)
 
         # 1N 금지 (day0 N 고정인 경우 해당일만 스킵)
         not_one_night_val = getattr(cfg, "not_one_night", False)

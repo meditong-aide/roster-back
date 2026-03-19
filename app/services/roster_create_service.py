@@ -1697,8 +1697,6 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
             forbidden[nurse_id][0].append('D')
         if last_shift == 'N' and ban_n_to_e:
             forbidden[nurse_id][0].append('E')
-        if last_shift == 'D' and ban_d_to_n:
-            forbidden[nurse_id][0].append('N')
 
         # (d) 연속 N 상한
         if L and cons_n >= L:

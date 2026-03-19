@@ -2595,8 +2595,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
             if mid is not None:
                 m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
-            if getattr(cfg, "ban_d_to_n", True):
-                m.Add(X(n,d,night)+X(n,d-1,day)<=1)
+            # if getattr(cfg, "ban_d_to_n", True):
+            #     m.Add(X(n,d,night)+X(n,d-1,day)<=1)
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         is_n_only = False
