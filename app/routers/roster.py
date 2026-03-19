@@ -48,7 +48,6 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from datetime import datetime
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
-<<<<<<< HEAD
 from schemas.roster_schema import (
     RosterConfigCreate,
     RosterConfig,
@@ -60,10 +59,8 @@ from schemas.roster_schema import (
     ScheduleShareAutoCreateRequest,
     ScheduleShareCaptureCreateRequest,
 )
-=======
 from schemas.roster_schema import RosterConfigCreate, RosterConfig, PublishRequest, WantedInvokeRequest, WantedInvokeResponse, RosterRequest
 from schemas.replacement_schema import ReplacementRecommendRequest, ReplacementRecommendResponse
->>>>>>> feat/recommend
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User
 from db.client2 import get_db
