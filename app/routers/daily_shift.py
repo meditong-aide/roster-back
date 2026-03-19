@@ -164,6 +164,10 @@ async def save_calendar(
                     e_count = shift.get("e_count", 0)
                     n_count = shift.get("n_count", 0)
                     m_count = shift.get("m_count", 0)
+                    d_count_an = shift.get("d_count_an", 0)
+                    e_count_an = shift.get("e_count_an", 0)
+                    n_count_an = shift.get("n_count_an", 0)
+                    m_count_an = shift.get("m_count_an", 0)
 
                     existing = (
                         db.query(DailyShift)
@@ -172,7 +176,7 @@ async def save_calendar(
                             DailyShift.group_id == group_id,
                             DailyShift.year == year,
                             DailyShift.month == month,
-                            DailyShift.day == day
+                            DailyShift.day == day,
                         )
                         .first()
                     )
@@ -181,6 +185,10 @@ async def save_calendar(
                         existing.e_count = max(0, e_count)
                         existing.n_count = max(0, n_count)
                         existing.m_count = max(0, m_count)
+                        existing.d_count_an = max(0, d_count_an)
+                        existing.e_count_an = max(0, e_count_an)
+                        existing.n_count_an = max(0, n_count_an)
+                        existing.m_count_an = max(0, m_count_an)
                     else:
                         db.add(
                             DailyShift(
@@ -193,6 +201,10 @@ async def save_calendar(
                                 e_count=e_count,
                                 n_count=n_count,
                                 m_count=m_count,
+                                d_count_an=d_count_an,
+                                e_count_an=e_count_an,
+                                n_count_an=n_count_an,
+                                m_count_an=m_count_an,
                             )
                         )
         db.commit()

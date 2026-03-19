@@ -62,11 +62,19 @@ def _to_response(
     e_list = [r.e_count for r in rows_sorted]
     n_list = [r.n_count for r in rows_sorted]
     m_list = [int(getattr(r, "m_count", 0) or 0) for r in rows_sorted]
+    d_an_list = [int(getattr(r, "d_count_an", 0) or 0) for r in rows_sorted]
+    e_an_list = [int(getattr(r, "e_count_an", 0) or 0) for r in rows_sorted]
+    n_an_list = [int(getattr(r, "n_count_an", 0) or 0) for r in rows_sorted]
+    m_an_list = [int(getattr(r, "m_count_an", 0) or 0) for r in rows_sorted]
     month_summary = {
         "D_count": d_list[0] if d_list else 0,
         "E_count": e_list[0] if e_list else 0,
         "N_count": n_list[0] if n_list else 0,
         "M_count": m_list[0] if m_list else 0,
+        "D_count_an": d_an_list[0] if d_an_list else 0,
+        "E_count_an": e_an_list[0] if e_an_list else 0,
+        "N_count_an": n_an_list[0] if n_an_list else 0,
+        "M_count_an": m_an_list[0] if m_an_list else 0,
     }
     return {
         "office_id": office_id,
@@ -79,6 +87,10 @@ def _to_response(
             "E_count": e_list,
             "N_count": n_list,
             "M_count": m_list,
+            "D_count_an": d_an_list,
+            "E_count_an": e_an_list,
+            "N_count_an": n_an_list,
+            "M_count_an": m_an_list,
         },
     }
 
@@ -304,7 +316,12 @@ def format_shift_calendar(
         "E_count": first_day.e_count if first_day else 0,
         "N_count": first_day.n_count if first_day else 0,
         "M_count": int(getattr(first_day, "m_count", 0) or 0) if first_day else 0,
+        "D_count_an": int(getattr(first_day, "d_count_an", 0) or 0) if first_day else 0,
+        "E_count_an": int(getattr(first_day, "e_count_an", 0) or 0) if first_day else 0,
+        "N_count_an": int(getattr(first_day, "n_count_an", 0) or 0) if first_day else 0,
+        "M_count_an": int(getattr(first_day, "m_count_an", 0) or 0) if first_day else 0,
     }
+    _closed = is_month_closed(db, office_id, group_id, year, month)
     daily_shifts = [
         {
             "day": r.day,
@@ -312,7 +329,11 @@ def format_shift_calendar(
             "e_count": r.e_count,
             "n_count": r.n_count,
             "m_count": int(getattr(r, "m_count", 0) or 0),
-            "editable": not is_month_closed(db, office_id, group_id, year, month)  # 정확한 파라미터 전달
+            "d_count_an": int(getattr(r, "d_count_an", 0) or 0),
+            "e_count_an": int(getattr(r, "e_count_an", 0) or 0),
+            "n_count_an": int(getattr(r, "n_count_an", 0) or 0),
+            "m_count_an": int(getattr(r, "m_count_an", 0) or 0),
+            "editable": not _closed,
         }
         for r in rows_sorted
     ]

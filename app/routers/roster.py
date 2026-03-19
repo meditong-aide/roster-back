@@ -1767,9 +1767,9 @@ async def validate_roster(
         # day→counts 맵 구성 후 리스트로 변환(0-index)
         by_day = {
             r.day: {
-                "D": int(r.d_count or 0),
-                "E": int(r.e_count or 0),
-                "N": int(r.n_count or 0),
+                "D": int(r.d_count or 0) + int(getattr(r, "d_count_an", 0) or 0),
+                "E": int(r.e_count or 0) + int(getattr(r, "e_count_an", 0) or 0),
+                "N": int(r.n_count or 0) + int(getattr(r, "n_count_an", 0) or 0),
             }
             for r in rows
         }

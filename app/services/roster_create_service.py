@@ -558,14 +558,33 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
             counts['M'] = int(getattr(row, 'm_count', 0) or 0)
         return counts
 
+    def _row_to_day_counts_an(row: DailyShift) -> dict[str, int]:
+        counts = {
+            'D': int(getattr(row, 'd_count_an', 0) or 0),
+            'E': int(getattr(row, 'e_count_an', 0) or 0),
+            'N': int(getattr(row, 'n_count_an', 0) or 0),
+        }
+        if use_mid:
+            counts['M'] = int(getattr(row, 'm_count_an', 0) or 0)
+        return counts
+
     # day→counts 맵 구성 후 리스트로 변환(0-index)
     by_day: dict[int, dict[str, int]] = {}
+    by_day_an: dict[int, dict[str, int]] = {}
     for row in rows:
-        by_day[int(getattr(row, 'day', 0) or 0)] = _row_to_day_counts(row)
+        day_no = int(getattr(row, 'day', 0) or 0)
+        by_day[day_no] = _row_to_day_counts(row)
+        by_day_an[day_no] = _row_to_day_counts_an(row)
     daily_shift_requirements_by_day = [
         by_day.get(d, dict(daily_shift_requirements))
         for d in range(1, days_in_month + 1)
     ]
+    an_base: dict[str, int] = {k: 0 for k in base_keys}
+    an_shift_requirements_by_day = [
+        by_day_an.get(d, dict(an_base))
+        for d in range(1, days_in_month + 1)
+    ]
+    an_shift_requirements = dict(by_day_an.get(1, an_base))
 
     # 안전장치: 요구치가 전부 0이면 엔진은 OFF로 쏠릴 확률이 높다.
     if sum(daily_shift_requirements.values()) <= 0 and all(
@@ -575,7 +594,7 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
             "일별/기본 근무 요구치(D/E/N)가 모두 0입니다. "
             "ShiftManage.main_code 또는 DailyShift 설정을 확인해주세요."
         )
-    return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day
+    return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, an_shift_requirements, an_shift_requirements_by_day
 
 def _normalize_to_main(code: str, code2main: dict) -> str:
     """세부 근무코드를 메인코드로 정규화한다."""
@@ -1401,15 +1420,20 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
     )
     return latest.schedule_id if latest else None
 
-def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict) -> dict:
+def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict, active_nurse_ids: list[str] | None = None) -> dict:
     """해당 schedule_id의 마지막 N일 근무코드를 메인코드로 정규화하여 반환한다.
     반환: { nurse_id: ['E','N','O','D','N','O'] } (최대 길이 days, 과거→현재 순)
+    active_nurse_ids가 주어지면 해당 간호사의 엔트리만 로딩한다 (비활성 간호사 제외).
     """
     if not schedule_id:
         print(f"[CrossMonth] 이전 달 스케줄 ID 없음, 빈 맵 반환")
         return {}
-    # 해당 스케줄의 모든 엔트리 로딩
-    entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
+    # 해당 스케줄의 엔트리 로딩 (active 간호사만 필터)
+    q = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id)
+    if active_nurse_ids is not None:
+        q = q.filter(ScheduleEntry.nurse_id.in_(active_nurse_ids))
+        print(f"[CrossMonth] 비활성 간호사 이전달 데이터 제외: active {len(active_nurse_ids)}명 기준 필터")
+    entries = q.all()
     by_nurse: dict[str, dict[int, str]] = defaultdict(dict)
     max_day = 0
     for e in entries:
@@ -1499,7 +1523,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         print("[ERR] _query_prev_month_schedule_id:", e)
         raise
     try:
-        last_map = _get_last_days_map(db, prev_sid, lookback, code2main) if prev_sid else {}
+        last_map = _get_last_days_map(db, prev_sid, lookback, code2main, nurse_ids) if prev_sid else {}
         print(f"[CrossMonth] 이전 달 꼬리 패턴 조회 완료: {len(last_map)}명")
     except Exception as e:
         print("[ERR] _get_last_days_map:", e)
@@ -1536,7 +1560,10 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     two_after_two = bool(config_dict.get('two_offs_after_two_nig'))
     not_one_night = bool(config_dict.get("not_one_night", False))
     banned_E_to_D = bool(config_dict.get('banned_day_after_eve'))
-    L = int(config_dict.get('max_consecutive_nights') or 0)
+    # three_seq_nig(bool): True=3연속 허용(L=3), False=2연속 허용(L=2)
+    # max_consecutive_nights 컬럼은 DB에 없으므로 three_seq_nig 기반으로 산출
+    _three_seq_nig = bool(config_dict.get('three_seq_nig', False))
+    L = 3 if _three_seq_nig else int(config_dict.get('max_consecutive_nights') or 2)
 
     # 간호사별 is_weekend_off 정보 조회 (주말 휴무 대상자 필터링용)
     weekend_off_nurse_ids: set[str] = set()
@@ -1651,6 +1678,13 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         req_offs = 0
         two_after_two_effective = two_after_two or not_one_night
         two_after_three_effective = two_after_three
+        # max_consecutive_nights(L)가 설정된 경우: cons_n < L이면 아직 N을 더 배정 가능하므로
+        # 2N/3N→2OFF 강제 OFF 규칙을 적용하지 않음 (4월 초에 N 허용)
+        if L and cons_n < L:
+            two_after_two_effective = False
+            two_after_three_effective = False
+            if cons_n >= 2:
+                print(f"[CrossMonth] 간호사 {nurse_id}: N tail={cons_n} < max_consecutive_nights={L} → 2N/3N→2OFF 강제OFF 미적용 (N 배정 허용)")
         if two_after_three_effective and cons_n >= 3:
             req_offs = 2
         elif two_after_two_effective and cons_n >= 2:
@@ -2467,6 +2501,12 @@ def _validate_generated_roster(
                     )
 
                 if "M" in req and actual.get("M", 0) > req["M"]:
+                    if bool(getattr(roster_system, "_used_fallback", False)):
+                        print(
+                            f"[M_OVERSUPPLY][fallback 허용] {d + 1}일 M 과배정: "
+                            f"요구={req['M']}, 실제={actual.get('M', 0)}"
+                        )
+                        continue
                     return (
                         f"[reason_code=M_OVERSUPPLY] {d + 1}일 M 과배정: "
                         f"요구={req['M']}, 실제={actual.get('M', 0)}"
@@ -2815,11 +2855,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is not None
     ]
+    _include_an = bool(getattr(req, 'include_an', False))
+    engine_nurses = [
+        n
+        for n in engine_nurses
+        if str(getattr(n, 'role', 'RN') or 'RN').upper() in ('RN', 'AN')
+        and (_include_an or str(getattr(n, 'role', 'RN') or 'RN').upper() != 'AN')
+    ]
     engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
     preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
-    shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day = _build_shift_manage_and_requirements(
+    shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, an_shift_requirements, an_shift_requirements_by_day = _build_shift_manage_and_requirements(
         db, current_user, latest_config, req
     )
     # daily_shift_requirements를 config에 주입해서 엔진 호출
@@ -2827,6 +2874,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict['daily_shift_requirements'] = daily_shift_requirements
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
+    config_dict['include_an'] = _include_an
+    config_dict['an_shift_requirements'] = an_shift_requirements
+    config_dict['an_shift_requirements_by_day'] = an_shift_requirements_by_day
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)

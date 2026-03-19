@@ -523,6 +523,10 @@ class DailyShift(Base):
     e_count = Column(SMALLINT, nullable=False, default=0)
     n_count = Column(SMALLINT, nullable=False, default=0)
     m_count = Column(SMALLINT, nullable=False, default=0)
+    d_count_an = Column(SMALLINT, nullable=False, default=0)
+    e_count_an = Column(SMALLINT, nullable=False, default=0)
+    n_count_an = Column(SMALLINT, nullable=False, default=0)
+    m_count_an = Column(SMALLINT, nullable=False, default=0)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 
