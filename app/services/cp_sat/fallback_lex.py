@@ -950,6 +950,7 @@ def optimize_fallback_lex_hard_first(
         over_vars_by_day = {}
         short_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
         over_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
+        zero_demand_block_codes = {"D", "E", "N", "M"}
         for d in range(D):
             if (
                 hasattr(cfg, "daily_shift_requirements_by_day")
@@ -983,10 +984,35 @@ def optimize_fallback_lex_hard_first(
                         )
                     else:
                         assigned_m_bucket = assigned
-                    assigned_total = assigned_m_bucket + int(fixed_cnt[d][s] or 0)
-                    m.Add(assigned_total <= req_raw)
-                    sh = m.NewIntVar(0, req_raw, f"short_{d}_{code}")
-                    m.Add(assigned_total + sh >= req_raw)
+                    fixed_m_bucket = (
+                        sum(int(_fb_fixed_cnt_adj[d][s2] or 0) for s2 in m_bucket_indices)
+                        if m_bucket_indices
+                        else int(_fb_fixed_cnt_adj[d][s] or 0)
+                    )
+                    if req_raw == 0:
+                        m.Add(assigned_m_bucket == 0)
+                        sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
+                        ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                        short_terms.append(sh)
+                        over_terms.append(ov)
+                        over_vars_by_day.setdefault(d, {})[code] = ov
+                        short_vars_by_day_code[(d, code)] = sh
+                        over_vars_by_day_code[(d, code)] = ov
+                        continue
+                    m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
+                    m.Add(assigned_m_bucket <= m_cap_non_fixed)
+                    sh = m.NewIntVar(0, m_cap_non_fixed, f"short_{d}_{code}")
+                    m.Add(assigned_m_bucket + sh >= m_cap_non_fixed)
+                    ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                    short_terms.append(sh)
+                    over_terms.append(ov)
+                    over_vars_by_day.setdefault(d, {})[code] = ov
+                    short_vars_by_day_code[(d, code)] = sh
+                    over_vars_by_day_code[(d, code)] = ov
+                    continue
+                if code in zero_demand_block_codes and req_raw == 0:
+                    m.Add(assigned == 0)
+                    sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     short_terms.append(sh)
                     over_terms.append(ov)
@@ -1301,13 +1327,9 @@ def optimize_fallback_lex_hard_first(
                     xn_next = X(n, d + 1, night_idx)
                     end_block = m.NewBoolVar(f"end_2n_soft_{n}_{d}")
                     m.Add(end_block == xn_next.Not())
-                    need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)
-                    miss = m.NewIntVar(0, 2, f"rec2n2o_{n}_{d}")
-                    m.Add(miss == 0).OnlyEnforceIf(end_block.Not())
-                    m.Add(miss == 0).OnlyEnforceIf(xn_prev.Not())
-                    m.Add(miss == 0).OnlyEnforceIf(xn_curr.Not())
-                    m.Add(miss == 2 - need).OnlyEnforceIf([xn_prev, xn_curr, end_block])
-                    safety["rec_2n2o"].append(miss)
+                    m.Add(
+                        X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
+                    ).OnlyEnforceIf([xn_prev, xn_curr, end_block])
 
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):

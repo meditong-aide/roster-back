@@ -53,6 +53,19 @@ def postprocess_rebalance_off(
     K = getattr(cfg, "max_consecutive_work_days", None)
     if not isinstance(K, int) or K <= 0:
         return
+    zero_demand_block_codes = {"D", "E", "N", "M"}
+
+    def _day_required(shift_code: str, day_idx: int) -> int:
+        req_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        if (
+            isinstance(req_by_day, list)
+            and day_idx < len(req_by_day)
+            and isinstance(req_by_day[day_idx], dict)
+        ):
+            raw_req = req_by_day[day_idx].get(shift_code, 0)
+        else:
+            raw_req = (cfg.daily_shift_requirements or {}).get(shift_code, 0)
+        return max(0, int(raw_req or 0))
 
     def _max_run(n_idx: int) -> tuple[int, int, int] | None:
         """가장 긴 연속근무 구간(start, end, length)을 반환."""
@@ -126,6 +139,12 @@ def postprocess_rebalance_off(
                     continue
                 if (n_idx, off_day) in fixed_cells:
                     continue
+                shift_code = cfg.shift_types[shift_idx]
+                if (
+                    shift_code in zero_demand_block_codes
+                    and _day_required(shift_code, off_day) == 0
+                ):
+                    continue
 
                 # 스왑 적용
                 _swap_off(n_idx, work_day, off_day, shift_idx)
@@ -188,6 +207,19 @@ def postprocess_trim_extra_offs(
 
     off_idx = cfg.shift_types.index("O")
     night_idx = cfg.shift_types.index("N") if "N" in cfg.shift_types else None
+    zero_demand_block_codes = {"D", "E", "N", "M"}
+
+    def day_required(shift_code: str, day_idx: int) -> int:
+        req_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        if (
+            isinstance(req_by_day, list)
+            and day_idx < len(req_by_day)
+            and isinstance(req_by_day[day_idx], dict)
+        ):
+            raw_req = req_by_day[day_idx].get(shift_code, 0)
+        else:
+            raw_req = (cfg.daily_shift_requirements or {}).get(shift_code, 0)
+        return max(0, int(raw_req or 0))
     # W를 후처리 교체 대상에서 제외하고, 커버리지 코드(D/E/N 등)만 사용
     work_codes = [
         code
@@ -642,6 +674,9 @@ def postprocess_trim_extra_offs(
                 best_score = None
                 for s_idx in work_shift_indices:
                     if s_idx == off_idx:
+                        continue
+                    shift_code = cfg.shift_types[s_idx]
+                    if shift_code in zero_demand_block_codes and day_required(shift_code, d_idx) == 0:
                         continue
                     score = pref_matrix[n_idx, d_idx, s_idx] if pref_matrix is not None else 0
                     if grade_strategy == "TEAM":

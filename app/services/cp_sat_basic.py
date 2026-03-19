@@ -2389,6 +2389,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # ───────────── 2-C. Shift requirements (per-day, slack 허용) ───
     coverage_shortage_vars = []
     over_vars_by_day = {}
+    zero_demand_block_codes = {"D", "E", "N", "M"}
     cfg = rs.config
     next_month_head_req = getattr(cfg, "next_month_head_requirements", None) or []
     for d in range(D):
@@ -2423,8 +2424,23 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                 else:
                     assigned_m_bucket = assigned
-                assigned_total = assigned_m_bucket + int(fixed_cnt[d][s] or 0)
-                m.Add(assigned_total <= req_raw)
+                fixed_m_bucket = (
+                    sum(int(fixed_cnt_adj[d][s2] or 0) for s2 in m_bucket_indices)
+                    if m_bucket_indices
+                    else int(fixed_cnt_adj[d][s] or 0)
+                )
+                if req_raw == 0:
+                    m.Add(assigned_m_bucket == 0)
+                    ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                    over_vars_by_day.setdefault(d, {})[code] = ov
+                    continue
+                m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
+                m.Add(assigned_m_bucket <= m_cap_non_fixed)
+                ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                over_vars_by_day.setdefault(d, {})[code] = ov
+                continue
+            if code in zero_demand_block_codes and req_raw == 0:
+                m.Add(assigned == 0)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 continue
