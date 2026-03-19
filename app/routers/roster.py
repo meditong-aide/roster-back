@@ -48,6 +48,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from datetime import datetime
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
+<<<<<<< HEAD
 from schemas.roster_schema import (
     RosterConfigCreate,
     RosterConfig,
@@ -59,6 +60,10 @@ from schemas.roster_schema import (
     ScheduleShareAutoCreateRequest,
     ScheduleShareCaptureCreateRequest,
 )
+=======
+from schemas.roster_schema import RosterConfigCreate, RosterConfig, PublishRequest, WantedInvokeRequest, WantedInvokeResponse, RosterRequest
+from schemas.replacement_schema import ReplacementRecommendRequest, ReplacementRecommendResponse
+>>>>>>> feat/recommend
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User
 from db.client2 import get_db
@@ -91,6 +96,7 @@ from services.roster_service import (
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
 )
+from services.replacement_recommend_service import recommend_replacement_candidates
 from services.weekly_off_service import get_nurses_weekly_off_service
 from utils.utils import send_roster_publish_push, send_roster_republish_push
 import uuid
@@ -2441,6 +2447,32 @@ async def create_roster_with_weekly_off(
         "entries_created": created_entries,
     }
 
+@router.post("/replacement/recommend", response_model=ReplacementRecommendResponse)
+def recommend_replacements(
+    req: ReplacementRecommendRequest,
+
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        return recommend_replacement_candidates(
+            req=req,
+            current_user=current_user,
+            db=db,
+            requested_group_id=group_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"replacement recommendation failed: {e}")
 
 @router.post("/shares/schedules/{schedule_id}")
 async def create_schedule_share_link(
