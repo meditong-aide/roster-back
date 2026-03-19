@@ -24,6 +24,7 @@ from services.cp_sat.allowed_shift_types import (
     normalize_allowed_shift_codes,
 )
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
+from services.cp_sat.m_coverage import compute_main_bucket_indices
 from services.cp_sat.night_distribution_log import log_n_even_distribution
 
 
@@ -221,25 +222,57 @@ def optimize_fallback_lex_hard_first(
         leave.append(l)
 
     # 고정셀(메인코드 정규화)
-    code2main = {c: r["main_code"] for r in (grouped or []) for c in r["codes"]}
+    code2main = {
+        str(c).strip().upper(): str(r["main_code"]).strip().upper()
+        for r in (grouped or [])
+        for c in r["codes"]
+    }
     code2type = {}
     if shift_type_map:
         code2type.update(shift_type_map)
-    code2type.update({c: r.get("type") for r in (grouped or []) for c in r["codes"]})
+    code2type.update(
+        {
+            str(c).strip().upper(): r.get("type")
+            for r in (grouped or [])
+            for c in r["codes"]
+        }
+    )
+    shift_id_to_main_map = {
+        str(k).strip().upper(): str(v).strip().upper()
+        for k, v in (getattr(roster_system, "shift_id_to_main", {}) or {}).items()
+        if str(k or "").strip() and str(v or "").strip()
+    }
+
+    def _normalize_fixed_to_main(raw_code: object) -> str:
+        code = str(raw_code or "").strip().upper()
+        if not code:
+            return ""
+        mapped = code2main.get(code) or shift_id_to_main_map.get(code) or code
+        if mapped in {"OFF", "주"}:
+            return "O"
+        return mapped
+
     fixed, fixed_cnt = {}, [[0] * S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
     # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
     for c in getattr(roster_system, "fixed_cells", []) or []:
         
         n, d = c["nurse_index"], c["day_index"]
-        s_main = code2main.get(c["shift"], c["shift"])
+        s_main = _normalize_fixed_to_main(c.get("shift"))
+        if s_main not in roster_system.config.shift_types:
+            print(
+                f"{logger_prefix} fixed 셀 코드 스킵(미지원 메인코드): "
+                f"n={n}, d={d + 1}, raw={c.get('shift')}, main={s_main}"
+            )
+            continue
         s_idx = roster_system.config.shift_types.index(s_main)
         # print('이미 있음 c', c, s_idx)
         fixed[(n, d)] = s_idx
         fixed_cnt[d][s_idx] += 1
         # print('fallback fixed', fixed)
         # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
-        fixed_type_by_cell[(n, d)] = code2type.get(c["shift"]) or code2type.get(s_main)
+        raw_code = str(c.get("shift") or "").strip().upper()
+        fixed_type_by_cell[(n, d)] = code2type.get(raw_code) or code2type.get(s_main)
 
         # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
         # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
@@ -905,6 +938,13 @@ def optimize_fallback_lex_hard_first(
         else:
             _fb_fixed_cnt_adj = fixed_cnt
 
+        m_bucket_indices = compute_main_bucket_indices(
+            roster_system.config.shift_types,
+            target_main="M",
+            code2main=code2main,
+            shift_id_to_main_map=shift_id_to_main_map,
+        )
+
         # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
         short_terms, over_terms = [], []
         over_vars_by_day = {}
@@ -932,7 +972,18 @@ def optimize_fallback_lex_hard_first(
                     and (not exclude_preceptee_from_den or n not in preceptee_indices)
                 )
                 if code == "M":
-                    assigned_total = assigned + int(fixed_cnt[d][s] or 0)
+                    if m_bucket_indices:
+                        assigned_m_bucket = sum(
+                            X(n, d, s2)
+                            for n in range(N)
+                            if join[n] <= d <= leave[n]
+                            and (n, d) not in fixed
+                            and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                            for s2 in m_bucket_indices
+                        )
+                    else:
+                        assigned_m_bucket = assigned
+                    assigned_total = assigned_m_bucket + int(fixed_cnt[d][s] or 0)
                     m.Add(assigned_total <= req_raw)
                     sh = m.NewIntVar(0, req_raw, f"short_{d}_{code}")
                     m.Add(assigned_total + sh >= req_raw)

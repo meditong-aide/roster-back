@@ -15,6 +15,7 @@ from services.cp_sat.shift_normalizer import (
     build_shift_normalizer as build_shift_normalizer_impl,
     normalize_shift_code as normalize_shift_code_impl,
 )
+from services.cp_sat.m_coverage import compute_main_bucket_indices
 from services.cp_sat.result_mapping import convert_result_to_db_format as _convert_result_to_db_format_impl
 from services.cp_sat.work_shift_overrides import (
     apply_work_shift_overrides as _apply_work_shift_overrides_impl,
@@ -2005,18 +2006,47 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             D - 1,
         )
     # 고정 셀 (수간호사 등)
-    code2main = {c:r['main_code']
-                 for r in (grouped or []) for c in r['codes']}
-    code2type = {c: r.get('type') for r in (grouped or []) for c in r['codes']}
+    code2main = {
+        str(c).strip().upper(): str(r["main_code"]).strip().upper()
+        for r in (grouped or [])
+        for c in r["codes"]
+    }
+    code2type = {
+        str(c).strip().upper(): r.get("type")
+        for r in (grouped or [])
+        for c in r["codes"]
+    }
+    shift_id_to_main_map = {
+        str(k).strip().upper(): str(v).strip().upper()
+        for k, v in (getattr(rs, "shift_id_to_main", {}) or {}).items()
+        if str(k or "").strip() and str(v or "").strip()
+    }
+
+    def _normalize_fixed_to_main(raw_code: object) -> str:
+        code = str(raw_code or "").strip().upper()
+        if not code:
+            return ""
+        mapped = code2main.get(code) or shift_id_to_main_map.get(code) or code
+        if mapped in {"OFF", "주"}:
+            return "O"
+        return mapped
+
     fixed, fixed_cnt = {}, [[0]*S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
     for c in getattr(rs,'fixed_cells',[]) or []:
         n,d = c['nurse_index'], c['day_index']
-        s_main = code2main.get(c['shift'], c['shift'])
+        s_main = _normalize_fixed_to_main(c.get("shift"))
+        if s_main not in rs.config.shift_types:
+            print(
+                f"[CP-SAT-Basic] 고정 셀 코드 스킵(미지원 메인코드): "
+                f"n={n}, d={d + 1}, raw={c.get('shift')}, main={s_main}"
+            )
+            continue
         s_idx  = rs.config.shift_types.index(s_main)
         fixed[(n,d)] = s_idx; fixed_cnt[d][s_idx]+=1
         # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
-        fixed_type_by_cell[(n, d)] = code2type.get(c["shift"]) or code2type.get(s_main)
+        raw_code = str(c.get("shift") or "").strip().upper()
+        fixed_type_by_cell[(n, d)] = code2type.get(raw_code) or code2type.get(s_main)
         # print('이미 있음 cpsat- fixed_type_by_cell', fixed_type_by_cell)
     fixed_off_cells: set[tuple[int, int]] = set()
     fixed_vacation_off_cells: set[tuple[int, int]] = set()
@@ -2349,6 +2379,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     else:
         fixed_cnt_adj = fixed_cnt
 
+    m_bucket_indices = compute_main_bucket_indices(
+        rs.config.shift_types,
+        target_main="M",
+        code2main=code2main,
+        shift_id_to_main_map=shift_id_to_main_map,
+    )
+
     # ───────────── 2-C. Shift requirements (per-day, slack 허용) ───
     coverage_shortage_vars = []
     over_vars_by_day = {}
@@ -2375,7 +2412,18 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 and (not exclude_preceptee_from_den or n not in preceptee_indices)
             )
             if code == "M":
-                assigned_total = assigned + int(fixed_cnt[d][s] or 0)
+                if m_bucket_indices:
+                    assigned_m_bucket = sum(
+                        X(n, d, s2)
+                        for n in range(N)
+                        if join[n] <= d <= leave[n]
+                        and (n, d) not in fixed
+                        and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                        for s2 in m_bucket_indices
+                    )
+                else:
+                    assigned_m_bucket = assigned
+                assigned_total = assigned_m_bucket + int(fixed_cnt[d][s] or 0)
                 m.Add(assigned_total <= req_raw)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov

@@ -2,7 +2,7 @@
 
 이 모듈은 `services/cp_sat_basic.py`에서 사용하던 교대 코드 정규화 로직을 분리한 것입니다.
 특히 Wanted 기반의 '휴가/공가/근무'처럼 shift_gb가 없거나, OFF/주 등의 별도 표기가 들어와도
-엔진 내부에서는 D/E/N/O/W 메인 코드로 일관되게 다루도록 합니다.
+엔진 내부에서는 D/E/N/M/O/W 메인 코드로 일관되게 다루도록 합니다.
 """
 
 from __future__ import annotations
@@ -13,21 +13,21 @@ from typing import Any
 def build_shift_normalizer(
     shift_defs: list[dict] | None,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Shift ID를 알고리즘용 메인 코드(D/E/N/O/W/주)로 정규화하는 매핑을 생성한다.
+    """Shift ID를 알고리즘용 메인 코드(D/E/N/M/O/W/주)로 정규화하는 매핑을 생성한다.
 
     Args:
         shift_defs: shift_id, default_shift, shift_gb, type 등을 포함한 사전 리스트
 
     Returns:
         (id_to_main, main_to_id):
-            - id_to_main: shift_id(대문자) → 메인 코드(D/E/N/O/W/주)
+            - id_to_main: shift_id(대문자) → 메인 코드(D/E/N/M/O/W/주)
             - main_to_id: 메인 코드 → 대표 shift_id(초기값은 자기 자신, 매핑되면 우선 적용)
 
     Notes:
         - type이 '휴가'/'공가'면 메인 코드는 O로 처리한다.
         - type이 '근무'면 메인 코드는 W로 처리한다. (커버리지 요구치와 분리 목적)
     """
-    canonical = {"D", "E", "N", "O", "주", "W"}
+    canonical = {"D", "E", "N", "M", "O", "주", "W"}
     id_to_main: dict[str, str] = {}
     main_to_id: dict[str, str] = {c: c for c in canonical}
 
@@ -73,7 +73,7 @@ def build_shift_normalizer(
 
 
 def normalize_shift_code(raw_code: Any, id_to_main: dict[str, str]) -> str | None:
-    """입력 근무코드를 메인 코드(D/E/N/O/W/주)로 정규화한다.
+    """입력 근무코드를 메인 코드(D/E/N/M/O/W/주)로 정규화한다.
 
     Args:
         raw_code: 입력 코드(shift_id, default_shift, shift_gb, 'OFF', '주' 등)
@@ -91,8 +91,7 @@ def normalize_shift_code(raw_code: Any, id_to_main: dict[str, str]) -> str | Non
     upper = code.upper()
     if upper in {"OFF"}:
         return "O"
-    if upper in {"D", "E", "N", "O", "주", "W"}:
+    if upper in {"D", "E", "N", "M", "O", "주", "W"}:
         return upper
     return id_to_main.get(upper)
-
 
