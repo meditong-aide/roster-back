@@ -1009,6 +1009,19 @@ class CPSATBasicEngine:
                     continue
                 prev_last_off_by_idx[n_idx] = bool(flag)
             roster_system.prev_month_last_is_off = prev_last_off_by_idx
+            prev_n_tail_raw = config_data.get("prev_month_n_tail") or {}
+            prev_n_tail_by_idx: dict[int, int] = {}
+            for dbid, tail_cnt in (prev_n_tail_raw or {}).items():
+                n_idx = _get_nurse_idx(dbid)
+                if n_idx is None:
+                    continue
+                try:
+                    tcnt = int(tail_cnt or 0)
+                except Exception:
+                    tcnt = 0
+                if tcnt > 0:
+                    prev_n_tail_by_idx[n_idx] = tcnt
+            roster_system.prev_month_n_tail_by_idx = prev_n_tail_by_idx
             # 꼬리 연속근무 보정용 OFF 윈도우 (월초 0..K-w 구간 OFF≥1)
             off_window_raw = config_data.get("off_window_constraints") or {}
             off_window_by_idx: dict[int, list[tuple[int, int]]] = {}
@@ -2272,7 +2285,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if (n, d) not in active_days:
                         print(f"[CP-SAT-Basic] 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
                         continue
-                    if (n,d) in fixed:
+                    if (n, d) in fixed:
                         print(f"[CP-SAT-Basic] 초기 금지 무시 (유저 고정 우선): n={n}, d={d+1}, code={code}, fixed={rs.config.shift_types[fixed[(n,d)]]}")
                         continue
                     m.Add(X(n,d,s_idx)==0)
@@ -2583,7 +2596,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if mid is not None:
                 m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
             # if getattr(cfg, "ban_d_to_n", True):
-            #     m.Add(X(n,d,night)+X(n,d-1,day)<=1) # D→N 금지
+            #     m.Add(X(n,d,night)+X(n,d-1,day)<=1)
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         is_n_only = False
@@ -2610,6 +2623,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night:
                         continue  # 1N day0 N 고정(경계) 시 해당일 1N 제약 스킵
+                    if d == 0 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0:
+                        continue
                     neighbors = []
                     if d - 1 >= T0:
                         neighbors.append(X(n, d - 1, night))
@@ -2634,6 +2649,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             #             m.Add(X(n, d, night) == 0)
 
             # 연속 Night
+            n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
+            if n_tail > 0:
+                for w in range(1, n_tail + 1):
+                    april_window_end = L - w
+                    cap = L - w
+                    if april_window_end < 0 or cap < 0:
+                        continue
+                    days_in_window = list(range(T0, min(T0 + april_window_end + 1, T1 + 1)))
+                    if days_in_window:
+                        m.Add(sum(X(n, d, night) for d in days_in_window) <= cap)
             for d0 in range(T0, T1 - L + 1):
                 m.Add(sum(X(n, d0 + t, night) for t in range(L + 1)) <= L)
 
@@ -2722,6 +2747,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 주의: "N 2회/3회 후 OFF 2회"는 다음 2일이 모두 OFF여야 한다.
         # 기존 구현은 (sum_n - 1 <= off1 + off2) 형태여서 연속 N일 때 OFF 1개만 허용되는 버그가 있었다.
         if cfg.two_offs_after_three_nig and n not in n_forbid_n:
+            n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
+            if n_tail >= 2 and (T0 + 2) <= T1:
+                m.Add(
+                    countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
+                ).OnlyEnforceIf([X(n, T0, night)])
+            if n_tail == 1 and (T0 + 3) <= T1:
+                m.Add(
+                    countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
+                ).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
                 m.Add(
@@ -2730,6 +2764,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
                 )
         if cfg.two_offs_after_two_nig and n not in n_forbid_n:
+            n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
+            if n_tail >= 1 and (T0 + 2) <= T1:
+                end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
+                m.Add(end_block_b0 == X(n, T0 + 1, night).Not())
+                m.Add(
+                    countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
+                ).OnlyEnforceIf([X(n, T0, night), end_block_b0])
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)

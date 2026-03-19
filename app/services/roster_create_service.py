@@ -1401,7 +1401,7 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
     )
     return latest.schedule_id if latest else None
 
-def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict) -> dict:
+def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict, active_nurse_ids: list[str] | None = None) -> dict:
     """해당 schedule_id의 마지막 N일 근무코드를 메인코드로 정규화하여 반환한다.
     반환: { nurse_id: ['E','N','O','D','N','O'] } (최대 길이 days, 과거→현재 순)
     """
@@ -1409,7 +1409,11 @@ def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict
         print(f"[CrossMonth] 이전 달 스케줄 ID 없음, 빈 맵 반환")
         return {}
     # 해당 스케줄의 모든 엔트리 로딩
-    entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
+    q = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id)
+    if active_nurse_ids is not None:
+        q = q.filter(ScheduleEntry.nurse_id.in_(active_nurse_ids))
+        print(f"[CrossMonth] 비활성 간호사 이전달 데이터 제외: active {len(active_nurse_ids)}명 기준 필터")
+    entries = q.all()
     by_nurse: dict[str, dict[int, str]] = defaultdict(dict)
     max_day = 0
     for e in entries:
@@ -1499,13 +1503,14 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         print("[ERR] _query_prev_month_schedule_id:", e)
         raise
     try:
-        last_map = _get_last_days_map(db, prev_sid, lookback, code2main) if prev_sid else {}
+        last_map = _get_last_days_map(db, prev_sid, lookback, code2main, nurse_ids) if prev_sid else {}
         print(f"[CrossMonth] 이전 달 꼬리 패턴 조회 완료: {len(last_map)}명")
     except Exception as e:
         print("[ERR] _get_last_days_map:", e)
         raise
     prev_month_last_main: dict[str, str | None] = {}
     prev_month_last_is_off: dict[str, bool] = {}
+    prev_month_n_tail: dict[str, int] = {}
     off_window_constraints: dict[str, list[list[int]]] = {}
     for nurse_id, seq in last_map.items():
         last_code = seq[-1] if seq else None
@@ -1536,7 +1541,16 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     two_after_two = bool(config_dict.get('two_offs_after_two_nig'))
     not_one_night = bool(config_dict.get("not_one_night", False))
     banned_E_to_D = bool(config_dict.get('banned_day_after_eve'))
-    L = int(config_dict.get('max_consecutive_nights') or 0)
+    ban_e_to_d = bool(config_dict.get('ban_e_to_d', True))
+    ban_n_to_d = bool(config_dict.get('ban_n_to_d', True))
+    ban_n_to_e = bool(config_dict.get('ban_n_to_e', True))
+    ban_d_to_n = bool(config_dict.get('ban_d_to_n', True))
+    if not banned_E_to_D:
+        ban_e_to_d = False
+        ban_n_to_d = False
+        ban_n_to_e = False
+        ban_d_to_n = False
+    L = int(config_dict.get('max_consecutive_nights') or (3 if bool(config_dict.get('three_seq_nig', False)) else 2))
 
     # 간호사별 is_weekend_off 정보 조회 (주말 휴무 대상자 필터링용)
     weekend_off_nurse_ids: set[str] = set()
@@ -1597,6 +1611,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         cons_n = metrics['consecutive_night_tail']
         last_shift = metrics['last_day_shift']
         offs_after = metrics['offs_after_tail_nights']
+        prev_month_n_tail[nurse_id] = int(cons_n or 0)
         
         # 디버깅: 이전 달 꼬리 패턴과 계산된 메트릭 출력 (강제 OFF가 생성되는 경우만)
         forced_off_before = len(forced_off.get(nurse_id, []))
@@ -1638,18 +1653,17 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
             if has_day0_rest_guard:
                 print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail이지만 월초 휴식 하드제약(day0 OFF/윈도우) 우선 적용 → day0 N 고정 스킵, tail={tail_str}")
             elif nurse_id in day0_weekly_off_nurse_ids:
-                forbidden[nurse_id][0].extend(['D', 'E', 'O'])
-                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/O), tail={tail_str}")
+                forbidden[nurse_id][0].extend(['D', 'E', 'N'])
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/N), tail={tail_str}")
             else:
-                day0_n_fixed_nurse_ids.append(nurse_id)
-                two_after_two_effective = two_after_two or not_one_night
+                two_after_two_effective = two_after_two
                 if two_after_two_effective:
                     forced_off[nurse_id].extend([1, 2])
-                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail → day0 N 고정" + (", day1,2 OFF(2N2O)" if two_after_two_effective else "") + f", tail={tail_str}")
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail → day0 N 허용" + (", day1,2 OFF(2N2O)" if two_after_two_effective else "") + f", tail={tail_str}")
 
         # (b) N2/3 → 2OFF
         req_offs = 0
-        two_after_two_effective = two_after_two or not_one_night
+        two_after_two_effective = two_after_two
         two_after_three_effective = two_after_three
         if two_after_three_effective and cons_n >= 3:
             req_offs = 2
@@ -1677,13 +1691,15 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
                     forced_off[nurse_id] = filtered_days
 
         # (c) E→D, N→D 금지
-        if last_shift == 'E' and banned_E_to_D:
+        if last_shift == 'E' and ban_e_to_d:
             forbidden[nurse_id][0].append('D')
-        if last_shift == 'N':
+        if last_shift == 'N' and ban_n_to_d:
             forbidden[nurse_id][0].append('D')
+        if last_shift == 'N' and ban_n_to_e:
+            forbidden[nurse_id][0].append('E')
 
         # (d) 연속 N 상한
-        if L and cons_n == L:
+        if L and cons_n >= L:
             forbidden[nurse_id][0].append('N')
 
     # day0 강제 OFF 과밀 완화(cap 이동)는 기본 비활성화
@@ -1721,6 +1737,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         'forbidden': forbidden,
         'prev_month_last_main': prev_month_last_main,
         'prev_month_last_is_off': prev_month_last_is_off,
+        'prev_month_n_tail': prev_month_n_tail,
         'off_window_constraints': off_window_constraints,
         'day0_n_fixed_nurse_ids': day0_n_fixed_nurse_ids,
     }
@@ -2117,6 +2134,9 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     prev_month_last_is_off = cross_month_constraints.get("prev_month_last_is_off") or {}
     if prev_month_last_is_off:
         config_dict["prev_month_last_is_off"] = prev_month_last_is_off
+    prev_month_n_tail = cross_month_constraints.get("prev_month_n_tail") or {}
+    if prev_month_n_tail:
+        config_dict["prev_month_n_tail"] = prev_month_n_tail
     off_window_constraints = cross_month_constraints.get("off_window_constraints") or {}
     if off_window_constraints:
         config_dict["off_window_constraints"] = off_window_constraints

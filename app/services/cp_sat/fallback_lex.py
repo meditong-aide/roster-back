@@ -756,6 +756,11 @@ def optimize_fallback_lex_hard_first(
             if isinstance(getattr(roster_system, "prev_month_last_is_off", {}), dict)
             else {}
         )
+        prev_month_n_tail_by_idx = (
+            getattr(roster_system, "prev_month_n_tail_by_idx", {})
+            if isinstance(getattr(roster_system, "prev_month_n_tail_by_idx", {}), dict)
+            else {}
+        )
         # print('hahaha, weekly_off_by_idx', weekly_off_by_idx)
         # print('hahaha, prev_month_last_is_off', prev_month_last_is_off)
         # forced_off_cells: set[tuple[int, int]] = set(
@@ -857,9 +862,6 @@ def optimize_fallback_lex_hard_first(
                             continue
                         s_idx = roster_system.config.shift_types.index(code)
                         if (n, d) not in active_days:
-                            continue
-                        if (n, d) in fixed:
-                            # 유저 고정 셀 우선: 해당 날 전체 금지 무시
                             continue
                         m.Add(X(n, d, s_idx) == 0)
         except Exception as e:
@@ -1041,11 +1043,7 @@ def optimize_fallback_lex_hard_first(
                     m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
                 # if getattr(cfg, "ban_d_to_n", True):
                 #     xd_prev = X(n, d - 1, day_idx)
-                #     b_dn = m.NewBoolVar(f"viol_dn_{n}_{d}")
-                #     m.AddBoolOr([b_dn, xd_prev.Not(), xn.Not()])
-                #     m.AddImplication(b_dn, xd_prev)
-                #     m.AddImplication(b_dn, xn)
-                #     safety.setdefault("trans_dn", []).append(b_dn)
+                #     m.Add(xd_prev + xn <= 1)
 
         # 1N 금지 (day0 N 고정인 경우 해당일만 스킵)
         not_one_night_val = getattr(cfg, "not_one_night", False)
@@ -1057,6 +1055,8 @@ def optimize_fallback_lex_hard_first(
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night_idx:
+                        continue
+                    if d == 0 and prev_month_n_tail_by_idx.get(n, 0) > 0:
                         continue
                     neighbors = []
                     if d - 1 >= T0:
@@ -1133,6 +1133,16 @@ def optimize_fallback_lex_hard_first(
             if preceptee_follow and n in preceptee_indices:
                 continue
             T0, T1 = join[n], leave[n]
+            n_tail = prev_month_n_tail_by_idx.get(n, 0)
+            if n_tail > 0:
+                for w in range(1, n_tail + 1):
+                    april_window_end = L - w
+                    cap = L - w
+                    if april_window_end < 0 or cap < 0:
+                        continue
+                    days_in_window = list(range(T0, min(T0 + april_window_end + 1, T1 + 1)))
+                    if days_in_window:
+                        m.Add(sum(X(n, d, night_idx) for d in days_in_window) <= cap)
             for d0 in range(T0, T1 - L + 1):
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
                 exc = m.NewIntVar(0, L + 1, f"cnight_exc_{n}_{d0}")
@@ -1199,6 +1209,15 @@ def optimize_fallback_lex_hard_first(
                 if preceptee_follow and n in preceptee_indices:
                     continue
                 T0, T1 = join[n], leave[n]
+                n_tail = prev_month_n_tail_by_idx.get(n, 0)
+                if n_tail >= 2 and (T0 + 2) <= T1:
+                    m.Add(
+                        X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
+                    ).OnlyEnforceIf([X(n, T0, night_idx)])
+                if n_tail == 1 and (T0 + 3) <= T1:
+                    m.Add(
+                        X(n, T0 + 2, off_idx) + X(n, T0 + 3, off_idx) == 2
+                    ).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
                 for d in range(T0 + 2, T1 - 1):
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
@@ -1215,6 +1234,13 @@ def optimize_fallback_lex_hard_first(
                 if preceptee_follow and n in preceptee_indices:
                     continue
                 T0, T1 = join[n], leave[n]
+                n_tail = prev_month_n_tail_by_idx.get(n, 0)
+                if n_tail >= 1 and (T0 + 2) <= T1:
+                    end_block_b0 = m.NewBoolVar(f"end_2n_soft_b0_{n}")
+                    m.Add(end_block_b0 == X(n, T0 + 1, night_idx).Not())
+                    m.Add(
+                        X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
+                    ).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
                 for d in range(T0 + 1, T1 - 1):
                     xn_prev = X(n, d - 1, night_idx)
                     xn_curr = X(n, d, night_idx)
