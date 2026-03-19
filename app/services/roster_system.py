@@ -418,6 +418,8 @@ class RosterSystem:
                     and self.roster[n_idx, day, night_idx] == 1
                 ):
                     left_n = day > 0 and self.roster[n_idx, day - 1, night_idx] == 1
+                    if day == 0:
+                        left_n = bool(getattr(self, 'prev_month_n_tail_by_idx', {}).get(n_idx, 0) > 0)
                     right_n = day + 1 < self.num_days and self.roster[n_idx, day + 1, night_idx] == 1
                     if not left_n and not right_n:
                         violations.append({'type': 'not_one_night', 'nurse_idx': n_idx, 'day': day})
