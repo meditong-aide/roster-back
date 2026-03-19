@@ -1665,6 +1665,11 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         req_offs = 0
         two_after_two_effective = two_after_two
         two_after_three_effective = two_after_three
+        # N 상한(L) 미도달 시: 솔버 prefix cap이 경계를 처리하므로 forced OFF 불필요
+        # 예) three_seq_nig=True(L=3), cons_n=2 → day0에 N 1회 추가 허용
+        if L and cons_n < L:
+            two_after_two_effective = False
+            two_after_three_effective = False
         if two_after_three_effective and cons_n >= 3:
             req_offs = 2
         elif two_after_two_effective and cons_n >= 2:
