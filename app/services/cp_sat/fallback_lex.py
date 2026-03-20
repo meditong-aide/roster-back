@@ -1035,6 +1035,45 @@ def optimize_fallback_lex_hard_first(
                 short_vars_by_day_code[(d, code)] = sh
                 over_vars_by_day_code[(d, code)] = ov
 
+        if bool(getattr(cfg, "include_an", False)):
+            an_indices = [n for n, nu in enumerate(roster_system.nurses) if getattr(nu, "role_group", "RN") == "AN"]
+            if an_indices:
+                an_req_by_day = getattr(cfg, "an_shift_requirements_by_day", None) or []
+                an_req_base = getattr(cfg, "an_shift_requirements", None) or {}
+                for d in range(D):
+                    if isinstance(an_req_by_day, list) and d < len(an_req_by_day) and isinstance(an_req_by_day[d], dict):
+                        an_need_map = an_req_by_day[d]
+                    else:
+                        an_need_map = an_req_base
+                    for code, req in an_need_map.items():
+                        if code not in roster_system.config.shift_types:
+                            continue
+                        s = roster_system.config.shift_types.index(code)
+                        req_raw = max(0, int(req or 0))
+                        if req_raw <= 0:
+                            continue
+                        an_fixed_cnt = sum(
+                            1
+                            for (n2, d2), s_idx in fixed.items()
+                            if d2 == d and s_idx == s and n2 in an_indices
+                            and (not exclude_preceptee_from_den or n2 not in preceptee_indices)
+                        )
+                        an_need = req_raw - an_fixed_cnt
+                        if an_need <= 0:
+                            continue
+                        an_assigned = sum(
+                            X(n, d, s)
+                            for n in an_indices
+                            if join[n] <= d <= leave[n] and (n, d) not in fixed
+                            and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                        )
+                        sh = m.NewIntVar(0, len(an_indices), f"an_short_{d}_{code}")
+                        ov = m.NewIntVar(0, len(an_indices), f"an_over_{d}_{code}")
+                        m.Add(an_assigned + sh >= an_need)
+                        m.Add(an_assigned - ov <= an_need)
+                        short_terms.append(sh)
+                        over_terms.append(ov)
+
         # 2) 안전/법규 위반(정량 슬랙) 구성
         safety = {
             "trans_nd": [],  # N→D 위반 (Bool)
