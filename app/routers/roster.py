@@ -622,11 +622,13 @@ async def get_roster_by_schedule_id(
     }
     # Structure data by nurse
     entries_by_nurse = {}
+    entry_ids_by_nurse = {}
     for entry in entries:
         if entry.nurse_id not in entries_by_nurse:
             entries_by_nurse[entry.nurse_id] = {}
-        # entries_by_nurse[entry.nurse_id][entry.work_date.day] = entry.shift_id.shift()
+            entry_ids_by_nurse[entry.nurse_id] = {}
         entries_by_nurse[entry.nurse_id][entry.work_date.day] = entry.shift_id
+        entry_ids_by_nurse[entry.nurse_id][entry.work_date.day] = entry.id
 
     violations = []  # 임시로 빈 리스트
 
@@ -634,6 +636,10 @@ async def get_roster_by_schedule_id(
         # print('nurse', nurse.name)
         nurse_schedule = [
             entries_by_nurse.get(nurse.nurse_id, {}).get(d, "-")
+            for d in range(1, roster_data["days_in_month"] + 1)
+        ]
+        schedule_ids = [
+            entry_ids_by_nurse.get(nurse.nurse_id, {}).get(d)
             for d in range(1, roster_data["days_in_month"] + 1)
         ]
 
@@ -645,6 +651,7 @@ async def get_roster_by_schedule_id(
                 "name": nurse.name,
                 "experience": nurse.experience,
                 "schedule": nurse_schedule,
+                "schedule_ids": schedule_ids,
                 "counts": counts,
             }
         )

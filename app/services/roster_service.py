@@ -501,17 +501,24 @@ def create_issued_roster_snapshot(
         .all()
     )
     entries_by_nurse: dict = {}
+    entry_ids_by_nurse: dict = {}
     for entry in entries:
         nurse_id = entry.nurse_id
         day = entry.work_date.day
         if nurse_id not in entries_by_nurse:
             entries_by_nurse[nurse_id] = {}
+            entry_ids_by_nurse[nurse_id] = {}
         entries_by_nurse[nurse_id][day] = entry.shift_id
+        entry_ids_by_nurse[nurse_id][day] = entry.id
 
     roster_nurses = []
     for n in nurses:
         schedule_list = [
             entries_by_nurse.get(n.nurse_id, {}).get(day, "-")
+            for day in range(1, days_in_month + 1)
+        ]
+        schedule_ids = [
+            entry_ids_by_nurse.get(n.nurse_id, {}).get(day)
             for day in range(1, days_in_month + 1)
         ]
         counts = {
@@ -523,6 +530,7 @@ def create_issued_roster_snapshot(
                 "name": n.name,
                 "experience": n.experience,
                 "schedule": schedule_list,
+                "schedule_ids": schedule_ids,
                 "counts": counts,
             }
         )

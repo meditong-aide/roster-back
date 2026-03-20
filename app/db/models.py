@@ -167,6 +167,7 @@ class ScheduleEntry(Base):
     nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"))
     work_date = Column(DATETIME, nullable=False)
     shift_id = Column(VARCHAR(10), ForeignKey("shifts.shift_id"))  # D, E, N, O, etc.
+    id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
 
 
 class Shift(Base):
