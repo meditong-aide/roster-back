@@ -88,18 +88,18 @@ def get_weekday_label(weekday: Optional[int]) -> Optional[str]:
 
 def resolve_weekly_off_base_weekday(nurse: Nurse) -> Optional[int]:
     """
-    주말 휴무 플래그를 반영해 기준 주휴 요일을 반환합니다.
-    
+    기준 주휴 요일을 반환합니다.
+    is_weekend_off 여부와 무관하게 저장된 weekly_off_weekday를 그대로 반환합니다.
+    (주말휴무 간호사의 일요일 주휴 스킵은 엔트리 생성 단계에서 처리)
+
     Args:
         nurse (Nurse): 주휴 요일을 조회할 간호사 객체
-        
+
     Returns:
-        Optional[int]: is_weekend_off가 1이면 6(일요일), 아니면 저장된 주휴 요일
+        Optional[int]: 저장된 주휴 요일 (없으면 None)
     """
     if nurse is None:
         return None
-    if bool(getattr(nurse, "is_weekend_off", False)):
-        return 6
     return nurse.weekly_off_weekday
 
 
@@ -239,11 +239,9 @@ def get_nurses_weekly_off_service(
         is_weekend_off = bool(getattr(n, "is_weekend_off", False))
         preview_weekday = None
         
-        # 미리보기 계산
+        # 미리보기 계산 (is_weekend_off 여부와 무관하게 동일한 사이클 로직 적용)
         if n.weekly_off_enabled and base_weekday is not None:
-            if is_weekend_off:
-                preview_weekday = base_weekday
-            elif setting and setting.use_variable_cycle:
+            if setting and setting.use_variable_cycle:
                 # 1. 월 단위
                 if setting.cycle_type == 'month' and setting.base_year and setting.base_month:
                     preview_weekday = calc_weekly_off_weekday_by_month(

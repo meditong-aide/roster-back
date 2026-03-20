@@ -2393,8 +2393,11 @@ async def create_roster_with_weekly_off(
             f"[DEBUG] {idx + 1}번째 간호사: {name} (id:{nurse_id}) enabled={enabled}, preview={preview_wd}, base={base_wd}, label={label}"
         )
 
-        if not nurse_id or not enabled:
-            print(f"[DEBUG] 스킵 - enabled=False 또는 id 없음: {name}")
+        if not enabled:
+            print(f"[DEBUG] 스킵 - enabled=False: {name}")
+            continue
+
+        if not nurse_id:
             continue
 
         wd = preview_wd if preview_wd is not None else base_wd
@@ -2405,6 +2408,11 @@ async def create_roster_with_weekly_off(
             continue
 
         is_weekend_off = bool(weekend_off_by_nurse_id.get(str(nurse_id), False))
+
+        # 주말휴무 간호사는 일요일에 "주" 엔트리 미생성
+        if is_weekend_off and wd == 6:
+            print(f"[DEBUG] 스킵 - 주말휴무 간호사 일요일 주휴: {name}")
+            continue
 
         print(f"[DEBUG] {name} 주휴 적용 시작 - 요일 {wd} ({label})")
 
@@ -2418,9 +2426,6 @@ async def create_roster_with_weekly_off(
         count_for_this_nurse = 0
         while current <= month_end:
             if current.weekday() == wd:
-                if is_weekend_off and current.weekday() == 6:
-                    current += timedelta(days=1)
-                    continue
                 entry = ScheduleEntry(
                     entry_id=str(uuid.uuid4().hex)[:12],
                     schedule_id=new_schedule.schedule_id,
