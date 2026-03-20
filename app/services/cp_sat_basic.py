@@ -2600,6 +2600,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
                         )
                         continue
+                    if d <= 2 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0:
+                        print(
+                            f"[WeekendOff][HardDebug] 평일 OFF 금지 스킵(n_tail 월초 복구): "
+                            f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
+                        )
+                        continue
                     wd = (rs.target_month + timedelta(days=d)).weekday()
                     print(
                         f"[WeekendOff][HardDebug] X(n,d,off)==0 추가: "

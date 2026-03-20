@@ -773,6 +773,8 @@ def optimize_fallback_lex_hard_first(
                         # 단, 사용자 고정 OFF는 예외로 허용하고 별도 제약을 걸지 않는다.
                         if (n, d) in fixed and fixed[(n, d)] == off_idx:
                             continue
+                        if d <= 2 and getattr(roster_system, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0:
+                            continue
                         m.Add(X(n, d, off_idx) == 0)
 
         # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
