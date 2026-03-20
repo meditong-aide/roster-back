@@ -2600,7 +2600,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
                         )
                         continue
-                    if d <= 2 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0:
+                    if d <= 1 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) >= 2:
                         print(
                             f"[WeekendOff][HardDebug] 평일 OFF 금지 스킵(n_tail 월초 복구): "
                             f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
@@ -2818,6 +2818,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 기존 구현은 (sum_n - 1 <= off1 + off2) 형태여서 연속 N일 때 OFF 1개만 허용되는 버그가 있었다.
         if cfg.two_offs_after_three_nig and n not in n_forbid_n:
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
+            if n_tail >= 3 and (T0 + 1) <= T1:
+                end_prev_block = m.NewBoolVar(f"end_3n_prev_{n}")
+                m.Add(end_prev_block == X(n, T0, night).Not())
+                m.Add(
+                    countable_off(n, T0) + countable_off(n, T0 + 1) == 2
+                ).OnlyEnforceIf([end_prev_block])
             if n_tail >= 2 and (T0 + 2) <= T1:
                 m.Add(
                     countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
@@ -2835,6 +2841,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
         if cfg.two_offs_after_two_nig and n not in n_forbid_n:
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
+            if n_tail >= 2 and (T0 + 1) <= T1:
+                end_prev_block = m.NewBoolVar(f"end_2n_prev_{n}")
+                m.Add(end_prev_block == X(n, T0, night).Not())
+                m.Add(
+                    countable_off(n, T0) + countable_off(n, T0 + 1) == 2
+                ).OnlyEnforceIf([end_prev_block])
             if n_tail >= 1 and (T0 + 2) <= T1:
                 end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
                 m.Add(end_block_b0 == X(n, T0 + 1, night).Not())

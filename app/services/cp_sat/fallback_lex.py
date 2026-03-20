@@ -773,7 +773,7 @@ def optimize_fallback_lex_hard_first(
                         # 단, 사용자 고정 OFF는 예외로 허용하고 별도 제약을 걸지 않는다.
                         if (n, d) in fixed and fixed[(n, d)] == off_idx:
                             continue
-                        if d <= 2 and getattr(roster_system, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0:
+                        if d <= 1 and getattr(roster_system, "prev_month_n_tail_by_idx", {}).get(n, 0) >= 2:
                             continue
                         m.Add(X(n, d, off_idx) == 0)
 
@@ -1292,6 +1292,12 @@ def optimize_fallback_lex_hard_first(
                     continue
                 T0, T1 = join[n], leave[n]
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
+                if n_tail >= 3 and (T0 + 1) <= T1:
+                    end_prev_block = m.NewBoolVar(f"end_3n_prev_soft_{n}")
+                    m.Add(end_prev_block == X(n, T0, night_idx).Not())
+                    m.Add(
+                        X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
+                    ).OnlyEnforceIf([end_prev_block])
                 if n_tail >= 2 and (T0 + 2) <= T1:
                     m.Add(
                         X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
@@ -1317,6 +1323,12 @@ def optimize_fallback_lex_hard_first(
                     continue
                 T0, T1 = join[n], leave[n]
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
+                if n_tail >= 2 and (T0 + 1) <= T1:
+                    end_prev_block = m.NewBoolVar(f"end_2n_prev_soft_{n}")
+                    m.Add(end_prev_block == X(n, T0, night_idx).Not())
+                    m.Add(
+                        X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
+                    ).OnlyEnforceIf([end_prev_block])
                 if n_tail >= 1 and (T0 + 2) <= T1:
                     end_block_b0 = m.NewBoolVar(f"end_2n_soft_b0_{n}")
                     m.Add(end_block_b0 == X(n, T0 + 1, night_idx).Not())
