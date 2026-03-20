@@ -890,34 +890,16 @@ async def get_prev_month_tail(
         )
         ref_schedule_id = cur_issued
 
-    if ref_schedule_id:
-        # 현재월 근무표에 등장하는 nurse_id 목록 (순서 포함)
-        nurse_ids_in_schedule = [
-            row.nurse_id
-            for row in (
-                db.query(ScheduleEntry.nurse_id)
-                .filter(ScheduleEntry.schedule_id == ref_schedule_id)
-                .distinct()
-                .all()
-            )
-        ]
-        nurses = (
-            db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence)
-            .filter(Nurse.nurse_id.in_(nurse_ids_in_schedule))
-            .order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc())
-            .all()
+    # 항상 그룹 active 간호사 전체 기준으로 조회
+    nurses = (
+        db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence)
+        .filter(
+            Nurse.group_id == target_group_id,
+            Nurse.active == 1,
         )
-    else:
-        # fallback: 그룹 active 간호사 전체
-        nurses = (
-            db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence)
-            .filter(
-                Nurse.group_id == target_group_id,
-                Nurse.active == 1,
-            )
-            .order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc())
-            .all()
-        )
+        .order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc())
+        .all()
+    )
 
     # 전월 기준 스케줄 조회: 마감된(issued) 근무표 우선
     # - 동일 월에 issued 상태는 1개만 존재 (발행 시 기존 issued → draft 전환)
@@ -1423,15 +1405,16 @@ async def save_roster(
     ).delete()
 
     # Save new roster entries (케이스 보존을 위해 유효 shift_id 기반 정규화)
-    valid_shift_ids = {
-        s.shift_id
-        for s in db.query(Shift)
+    shifts_for_group = (
+        db.query(Shift)
         .filter(
             Shift.group_id == target_group_id,
             Shift.office_id == getattr(current_user, "office_id", None),
         )
         .all()
-    }
+    )
+    valid_shift_ids = {s.shift_id for s in shifts_for_group}
+    shift_id_to_int_id = {s.shift_id: s.id for s in shifts_for_group}
 
     def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
         if raw_shift in valid_shift_ids:
@@ -1460,6 +1443,7 @@ async def save_roster(
                     nurse_id=nurse_id,
                     work_date=work_date,
                     shift_id=norm_shift,
+                    id=shift_id_to_int_id.get(norm_shift),
                 )
                 db.add(entry)
 
@@ -2194,6 +2178,7 @@ async def copy_schedule_to_new_version(
                 nurse_id=entry.nurse_id,
                 work_date=entry.work_date,  # 그대로 복사 (DATETIME 유지)
                 shift_id=entry.shift_id,
+                id=entry.id,
             )
         )
 
@@ -2367,6 +2352,24 @@ async def create_roster_with_weekly_off(
 
     created_entries = 0
 
+    weekly_off_shift = (
+        db.query(Shift)
+        .filter(
+            Shift.group_id == target_group_id,
+            Shift.office_id == current_user.office_id,
+            Shift.shift_id == "주",
+        )
+        .first()
+    )
+    weekly_off_shift_int_id = weekly_off_shift.id if weekly_off_shift else None
+
+    weekend_off_by_nurse_id = {
+        str(r.nurse_id): bool(getattr(r, "is_weekend_off", False))
+        for r in db.query(Nurse.nurse_id, Nurse.is_weekend_off)
+        .filter(Nurse.group_id == target_group_id, Nurse.active == 1)
+        .all()
+    }
+
     nurses = []
     if isinstance(weekly_off_data, dict):
         nurses = weekly_off_data.get("items", [])
@@ -2401,6 +2404,8 @@ async def create_roster_with_weekly_off(
             )
             continue
 
+        is_weekend_off = bool(weekend_off_by_nurse_id.get(str(nurse_id), False))
+
         print(f"[DEBUG] {name} 주휴 적용 시작 - 요일 {wd} ({label})")
 
         first_day = date(year, month, 1)
@@ -2413,12 +2418,16 @@ async def create_roster_with_weekly_off(
         count_for_this_nurse = 0
         while current <= month_end:
             if current.weekday() == wd:
+                if is_weekend_off and current.weekday() == 6:
+                    current += timedelta(days=1)
+                    continue
                 entry = ScheduleEntry(
                     entry_id=str(uuid.uuid4().hex)[:12],
                     schedule_id=new_schedule.schedule_id,
                     nurse_id=nurse_id,
                     work_date=current,
                     shift_id="주",
+                    id=weekly_off_shift_int_id,
                 )
                 db.add(entry)
                 created_entries += 1

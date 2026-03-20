@@ -805,6 +805,7 @@ def _build_fixed_shift_roster(
         weekly_off_enabled = weekly_off_active and bool(
             getattr(nurse, "weekly_off_enabled", False)
         )
+        is_weekend_off = bool(getattr(nurse, "is_weekend_off", False))
         if shift_lookup is not None:
             if fixed_code not in shift_lookup:
                 raise HTTPException(
@@ -821,7 +822,7 @@ def _build_fixed_shift_roster(
         for day_idx in range(start_idx, end_idx + 1):
             weekday = (month_start + timedelta(days=day_idx)).weekday()
             if weekday >= 5:
-                is_sunday_weekly_off = weekday == 6 and weekly_off_enabled
+                is_sunday_weekly_off = weekday == 6 and weekly_off_enabled and not is_weekend_off
                 shifts[day_idx] = sunday_code if is_sunday_weekly_off else weekday_off_code
             else:
                 shifts[day_idx] = fixed_code
@@ -2176,6 +2177,12 @@ def _persist_entries(db: Session, schedule, generated, req):
     """생성된 근무표를 ScheduleEntry로 저장한다."""
     db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).delete()
     shift_ids, default_map = _load_shift_mappings(db, schedule)
+    shifts_db = (
+        db.query(Shift)
+        .filter(Shift.group_id == schedule.group_id, Shift.office_id == schedule.office_id)
+        .all()
+    )
+    shift_id_to_int_id = {s.shift_id: s.id for s in shifts_db}
     for nurse_id, shifts in generated.items():
         for day_index, shift_id in enumerate(shifts):
             if shift_id != '-':
@@ -2191,6 +2198,7 @@ def _persist_entries(db: Session, schedule, generated, req):
                     nurse_id=nurse_id,
                     work_date=work_date,
                     shift_id=norm_shift,
+                    id=shift_id_to_int_id.get(norm_shift),
                 )
                 db.add(entry)
         # try:
@@ -2457,10 +2465,13 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
         pass
 
     for nurse in nurses_in_group:
-        nurse_schedule = [
-            entries_by_nurse.get(nurse.nurse_id, {}).get(d, '-')
-            for d in range(1, roster_data["days_in_month"] + 1)
-        ]
+        nurse_schedule = []
+        is_weekend_off = bool(getattr(nurse, "is_weekend_off", False))
+        for d in range(1, roster_data["days_in_month"] + 1):
+            shift_code = entries_by_nurse.get(nurse.nurse_id, {}).get(d, '-')
+            if is_weekend_off and shift_code == "주" and date(req.year, req.month, d).weekday() == 6:
+                shift_code = "O"
+            nurse_schedule.append(shift_code)
         counts = {shift: nurse_schedule.count(shift) for shift in shift_colors.keys()}
         roster_data["nurses"].append(
             {
@@ -3186,8 +3197,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
 
     # ── 저장 시 주휴 날짜만 '주'로 마킹(표시용) ──
     try:
+        weekend_off_display_ids = {
+            str(getattr(n, "nurse_id", ""))
+            for n in nurses_in_group
+            if bool(getattr(n, "is_weekend_off", False)) and getattr(n, "nurse_id", None)
+        }
         if weekly_off_map and isinstance(generated, dict):
             for nurse_id, day_set in weekly_off_map.items():
+                if str(nurse_id) in weekend_off_display_ids:
+                    continue
                 shifts = generated.get(nurse_id)
                 if not shifts:
                     continue
