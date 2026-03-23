@@ -2039,6 +2039,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     fixed, fixed_cnt = {}, [[0]*S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
+    fixed_wanted_cells: set[tuple[int, int]] = set()
     for c in getattr(rs,'fixed_cells',[]) or []:
         n,d = c['nurse_index'], c['day_index']
         s_main = _normalize_fixed_to_main(c.get("shift"))
@@ -2053,6 +2054,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
         raw_code = str(c.get("shift") or "").strip().upper()
         fixed_type_by_cell[(n, d)] = code2type.get(raw_code) or code2type.get(s_main)
+        if str(c.get("fixed_source") or "").strip().lower() == "fixed_wanted":
+            fixed_wanted_cells.add((n, d))
         # print('이미 있음 cpsat- fixed_type_by_cell', fixed_type_by_cell)
     fixed_off_cells: set[tuple[int, int]] = set()
     fixed_vacation_off_cells: set[tuple[int, int]] = set()
@@ -2881,19 +2884,24 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if n_tail >= 3 and (T0 + 1) <= T1:
                 end_prev_block = m.NewBoolVar(f"end_3n_prev_{n}")
                 m.Add(end_prev_block == X(n, T0, night).Not())
-                m.Add(
-                    countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                ).OnlyEnforceIf([end_prev_block])
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
+                    m.Add(
+                        countable_off(n, T0) + countable_off(n, T0 + 1) == 2
+                    ).OnlyEnforceIf([end_prev_block])
             if n_tail >= 2 and (T0 + 2) <= T1:
-                m.Add(
-                    countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                ).OnlyEnforceIf([X(n, T0, night)])
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
+                    m.Add(
+                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
+                    ).OnlyEnforceIf([X(n, T0, night)])
             if n_tail == 1 and (T0 + 3) <= T1:
-                m.Add(
-                    countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
-                ).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 2, T0 + 3)):
+                    m.Add(
+                        countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
+                    ).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
+                if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
+                    continue
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
                 ).OnlyEnforceIf(
@@ -2904,15 +2912,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if n_tail >= 2 and (T0 + 1) <= T1:
                 end_prev_block = m.NewBoolVar(f"end_2n_prev_{n}")
                 m.Add(end_prev_block == X(n, T0, night).Not())
-                m.Add(
-                    countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                ).OnlyEnforceIf([end_prev_block])
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
+                    m.Add(
+                        countable_off(n, T0) + countable_off(n, T0 + 1) == 2
+                    ).OnlyEnforceIf([end_prev_block])
             if n_tail >= 1 and (T0 + 2) <= T1:
                 end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
                 m.Add(end_block_b0 == X(n, T0 + 1, night).Not())
-                m.Add(
-                    countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                ).OnlyEnforceIf([X(n, T0, night), end_block_b0])
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
+                    m.Add(
+                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
+                    ).OnlyEnforceIf([X(n, T0, night), end_block_b0])
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)
@@ -2920,6 +2930,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 xn_next = X(n, d + 1, night)
                 end_block = m.NewBoolVar(f'end_2n_main_{n}_{d}')
                 m.Add(end_block == xn_next.Not())
+                if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
+                    continue
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
                 ).OnlyEnforceIf(

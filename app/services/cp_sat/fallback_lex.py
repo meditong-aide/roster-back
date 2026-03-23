@@ -254,6 +254,7 @@ def optimize_fallback_lex_hard_first(
 
     fixed, fixed_cnt = {}, [[0] * S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
+    fixed_wanted_cells: set[tuple[int, int]] = set()
     # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
     for c in getattr(roster_system, "fixed_cells", []) or []:
         
@@ -273,6 +274,8 @@ def optimize_fallback_lex_hard_first(
         # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
         raw_code = str(c.get("shift") or "").strip().upper()
         fixed_type_by_cell[(n, d)] = code2type.get(raw_code) or code2type.get(s_main)
+        if str(c.get("fixed_source") or "").strip().lower() == "fixed_wanted":
+            fixed_wanted_cells.add((n, d))
 
         # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
         # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
@@ -1334,18 +1337,23 @@ def optimize_fallback_lex_hard_first(
                 if n_tail >= 3 and (T0 + 1) <= T1:
                     end_prev_block = m.NewBoolVar(f"end_3n_prev_soft_{n}")
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
-                    m.Add(
-                        X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
-                    ).OnlyEnforceIf([end_prev_block])
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0, T0 + 1)):
+                        m.Add(
+                            X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
+                        ).OnlyEnforceIf([end_prev_block])
                 if n_tail >= 2 and (T0 + 2) <= T1:
-                    m.Add(
-                        X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
-                    ).OnlyEnforceIf([X(n, T0, night_idx)])
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0 + 1, T0 + 2)):
+                        m.Add(
+                            X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
+                        ).OnlyEnforceIf([X(n, T0, night_idx)])
                 if n_tail == 1 and (T0 + 3) <= T1:
-                    m.Add(
-                        X(n, T0 + 2, off_idx) + X(n, T0 + 3, off_idx) == 2
-                    ).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0 + 2, T0 + 3)):
+                        m.Add(
+                            X(n, T0 + 2, off_idx) + X(n, T0 + 3, off_idx) == 2
+                        ).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
                 for d in range(T0 + 2, T1 - 1):
+                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
+                        continue
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
                     xn2 = X(n, d - 2, night_idx)
@@ -1365,21 +1373,25 @@ def optimize_fallback_lex_hard_first(
                 if n_tail >= 2 and (T0 + 1) <= T1:
                     end_prev_block = m.NewBoolVar(f"end_2n_prev_soft_{n}")
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
-                    m.Add(
-                        X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
-                    ).OnlyEnforceIf([end_prev_block])
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0, T0 + 1)):
+                        m.Add(
+                            X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
+                        ).OnlyEnforceIf([end_prev_block])
                 if n_tail >= 1 and (T0 + 2) <= T1:
                     end_block_b0 = m.NewBoolVar(f"end_2n_soft_b0_{n}")
                     m.Add(end_block_b0 == X(n, T0 + 1, night_idx).Not())
-                    m.Add(
-                        X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
-                    ).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0 + 1, T0 + 2)):
+                        m.Add(
+                            X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
+                        ).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
                 for d in range(T0 + 1, T1 - 1):
                     xn_prev = X(n, d - 1, night_idx)
                     xn_curr = X(n, d, night_idx)
                     xn_next = X(n, d + 1, night_idx)
                     end_block = m.NewBoolVar(f"end_2n_soft_{n}_{d}")
                     m.Add(end_block == xn_next.Not())
+                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
+                        continue
                     m.Add(
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
                     ).OnlyEnforceIf([xn_prev, xn_curr, end_block])

@@ -2044,6 +2044,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                         'nurse_index': c.get('nurse_index'),
                         'day_index': c.get('day_index'),
                         'shift': shift_code,
+                        'fixed_source': c.get('fixed_source'),
                     }
                 )
             config_dict['fixed_cells'] = norm_fixed
@@ -3060,6 +3061,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 "day_index": day_idx,
                 "shift": shift_code_raw,
                 "shift_type": "근무",
+                "fixed_source": "fixed_wanted",
             })
             _fw_code_counts[shift_code] = _fw_code_counts.get(shift_code, 0) + 1
         if fw_fixed_cells:
