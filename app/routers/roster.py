@@ -1433,17 +1433,22 @@ async def save_roster(
             continue  # nurse_id가 없으면 건너뛰기
 
         schedule_data = nurse.get("schedule", [])
+        schedule_ids = nurse.get("schedule_ids", [])
         for day_index, shift_id in enumerate(schedule_data):
-            if shift_id and shift_id.strip():  # 빈 값이 아닌 경우만
+            if shift_id and str(shift_id).strip() and str(shift_id).strip() != '-':
                 work_date = date(year, month, day_index + 1)
                 norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
+                # 기존 schedule_ids 값 우선 사용, 없으면(수동 수정 셀) shift_id로 lookup
+                int_id = schedule_ids[day_index] if day_index < len(schedule_ids) else None
+                if int_id is None:
+                    int_id = shift_id_to_int_id.get(norm_shift)
                 entry = ScheduleEntry(
                     entry_id=str(uuid.uuid4().hex)[:16],
                     schedule_id=schedule.schedule_id,
                     nurse_id=nurse_id,
                     work_date=work_date,
                     shift_id=norm_shift,
-                    id=shift_id_to_int_id.get(norm_shift),
+                    id=int_id,
                 )
                 db.add(entry)
 
