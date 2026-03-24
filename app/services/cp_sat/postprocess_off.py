@@ -236,16 +236,23 @@ def postprocess_trim_extra_offs(
         return 0
 
     ############## preceptee 추가 ##############
+    # 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요)
     preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
-    preceptee_indices = set()
-    if preceptee_follow:
-        id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-        for n, nu in enumerate(roster_system.nurses):
-            pid = getattr(nu, 'preceptor_id', None)
-            if pid and pid in id_to_idx:
-                preceptee_indices.add(n)
-        if preceptee_indices:
-            print(f"{logger_prefix} [POSTPROCESS PROTECT] 프리셉티 보호 적용: {len(preceptee_indices)}명 (후처리 OFF 변경 스킵)")
+    _pte_shift_count = bool(getattr(cfg, 'preceptee_shift_count', True))
+    preceptee_indices: set[int] = set()
+    id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+    for n, nu in enumerate(roster_system.nurses):
+        pid = getattr(nu, 'preceptor_id', None)
+        if pid and pid in id_to_idx:
+            preceptee_indices.add(n)
+    # preceptee_shift_count=False → 커버리지 계산에서 프리셉티 제외
+    exclude_preceptee_from_coverage = (not _pte_shift_count) and bool(preceptee_indices)
+    # 후처리 OFF 변경 스킵 조건: 팔로우 모드 또는 커버리지 제외
+    protect_preceptee = (preceptee_follow or exclude_preceptee_from_coverage) and bool(preceptee_indices)
+    if preceptee_indices:
+        print(f"{logger_prefix} [POSTPROCESS] 프리셉티 {len(preceptee_indices)}명 "
+              f"(follow={preceptee_follow}, shift_count={_pte_shift_count}, "
+              f"커버리지 제외={exclude_preceptee_from_coverage}, 보호={protect_preceptee})")
     ############## preceptee 추가 ##############
 
     # 현재 로스터 스냅샷을 보존하여 회복 OFF(2N/3N→2O)를 안전하게 식별한다.
@@ -449,7 +456,15 @@ def postprocess_trim_extra_offs(
                 if code not in cfg.shift_types or code == "O":
                     continue
                 s_idx = cfg.shift_types.index(code)
-                assigned = int(np.sum(roster_system.roster[:, d_idx, s_idx]))
+                if exclude_preceptee_from_coverage:
+                    # 프리셉티를 커버리지 계산에서 제외
+                    assigned = sum(
+                        int(roster_system.roster[n, d_idx, s_idx])
+                        for n in range(len(roster_system.nurses))
+                        if n not in preceptee_indices
+                    )
+                else:
+                    assigned = int(np.sum(roster_system.roster[:, d_idx, s_idx]))
                 need = int(req or 0)
                 if assigned < need:
                     deficits.setdefault(d_idx, {})[s_idx] = need - assigned
@@ -622,8 +637,8 @@ def postprocess_trim_extra_offs(
         return False
 
     for n_idx, nurse in enumerate(roster_system.nurses):
-        if n_idx in preceptee_indices:
-            continue  # 프리셉티는 프리셉터 팔로우 → 후처리 OFF 변경 스킵
+        if protect_preceptee and n_idx in preceptee_indices:
+            continue  # 프리셉티 보호: 팔로우 모드 또는 커버리지 제외 시 후처리 OFF 변경 스킵
         if is_n_only(nurse):
             continue
 
