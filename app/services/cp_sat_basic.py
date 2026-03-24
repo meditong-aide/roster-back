@@ -2139,17 +2139,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
     isolated_off_slacks: list = []
 
-    # ── 프리셉티 인덱스 사전 계산 (고정 셀 적용 전에 계산해야 면제 가능) ──
+    # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
     preceptee_follow = bool(getattr(rs.config, 'preceptee_on', False))
     preceptee_indices: set[int] = set()
-    if preceptee_follow:
-        _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
-        for n, nu in enumerate(rs.nurses):
-            pid = getattr(nu, 'preceptor_id', None)
-            if pid and pid in _id_to_idx_pre:
-                preceptee_indices.add(n)
-        preceptee_indices = set(preceptee_indices)
-        print(f"[FIX] 프리셉티 면제 로직 완전 제거 → 모든 프리셉티에 팔로우 제약 적용 (면제 대상: {len(preceptee_indices)}명)")
+    _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
+    for n, nu in enumerate(rs.nurses):
+        pid = getattr(nu, 'preceptor_id', None)
+        if pid and pid in _id_to_idx_pre:
+            preceptee_indices.add(n)
+    preceptee_indices = set(preceptee_indices)
+    if preceptee_indices:
+        print(f"[FIX] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
 
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
@@ -2371,13 +2371,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         print(f"[CP-SAT-Basic] 프리셉티 팔로우 모드: {len(preceptee_indices)}명, "
               f"제약 {constraint_count}개 추가, 개별 하드제약 면제 적용")
 
-    # preceptee_shift_count=False 이면 DEN 하드제약에서 프리셉티 제외
+    # preceptee_shift_count=False 이면 DEN 하드제약에서 프리셉티 제외 (preceptee_on 무관)
     _pte_shift_count = getattr(rs.config, 'preceptee_shift_count', True)
-    exclude_preceptee_from_den = preceptee_follow and not _pte_shift_count
+    exclude_preceptee_from_den = (not _pte_shift_count) and bool(preceptee_indices)
     _pte_cnt = len(preceptee_indices)
     if exclude_preceptee_from_den:
         print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=False → 프리셉티 {_pte_cnt}명 제외, DEN 대상: {N - _pte_cnt}명/{N}명")
-    elif preceptee_follow:
+    elif preceptee_indices:
         print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=True → 프리셉티 {_pte_cnt}명 포함, DEN 대상: {N}명/{N}명")
     # 프리셉티 제외 시 fixed_cnt도 재계산
     if exclude_preceptee_from_den:

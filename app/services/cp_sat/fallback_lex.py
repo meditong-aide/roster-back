@@ -287,18 +287,17 @@ def optimize_fallback_lex_hard_first(
         else {}
     )
 
-    # ── 프리셉티 인덱스 사전 계산 (fallback에서도 follow 모드 지원) ──
+    # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
     preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
     preceptee_indices: set[int] = set()
-    if preceptee_follow:
-        _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-        for n, nu in enumerate(roster_system.nurses):
-            pid = getattr(nu, 'preceptor_id', None)
-            if pid and pid in _fb_id_to_idx:
-                preceptee_indices.add(n)
-        if preceptee_indices:
-            print(f"{logger_prefix} [Fallback] 프리셉티 면제 대상: {len(preceptee_indices)}명")
-    exclude_preceptee_from_den = preceptee_follow and not getattr(cfg, 'preceptee_shift_count', True)
+    _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+    for n, nu in enumerate(roster_system.nurses):
+        pid = getattr(nu, 'preceptor_id', None)
+        if pid and pid in _fb_id_to_idx:
+            preceptee_indices.add(n)
+    if preceptee_indices:
+        print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
+    exclude_preceptee_from_den = (not getattr(cfg, 'preceptee_shift_count', True)) and bool(preceptee_indices)
     # 외부 스코프에서 로깅용으로 사용 (build_model 내부에서도 별도 정의)
     weekly_off_by_idx = (
         getattr(roster_system, "weekly_off_by_idx", {})
