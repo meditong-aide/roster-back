@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
+import logging
 from math import exp
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,9 @@ from schemas.replacement_schema import (
 
 
 OFF_SHIFT_IDS = {"O", "OFF", "-", "주"}
+VACATION_SHIFT_TYPE_TOKENS = {"휴가", "vacation", "annual_leave", "annual leave", "연차", "연가"}
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,6 +42,7 @@ class CandidateContext:
     nurse_name: str
     assigned_shift: str
     assigned_is_off: bool
+    assigned_is_vacation: bool
     rule_safety: float
     estimated_violation_delta: float
     off_priority: float
@@ -46,7 +51,20 @@ class CandidateContext:
     pair: float
     fairness: float
     change_cost: float
+    vacation_penalty: float
     tags: List[str]
+
+
+def _is_vacation_shift(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> bool:
+    meta = shift_meta.get(shift_id)
+    if not meta:
+        return False
+    shift_type = str(meta.get("type") or "").strip().lower()
+    if not shift_type:
+        return False
+    if shift_type in VACATION_SHIFT_TYPE_TOKENS:
+        return True
+    return "휴가" in shift_type or "vacation" in shift_type
 
 
 def _to_date(v: Any) -> Optional[date]:
@@ -72,6 +90,8 @@ def _is_off_shift(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> bool:
     code = _normalize_shift_code(shift_id)
     if code in OFF_SHIFT_IDS:
         return True
+    if _is_vacation_shift(shift_id, shift_meta):
+        return True
     meta = shift_meta.get(shift_id)
     if not meta:
         return False
@@ -80,18 +100,25 @@ def _is_off_shift(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> bool:
 
 
 def _main_shift_code(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> str:
+    code, _reason = _main_shift_code_with_reason(shift_id, shift_meta)
+    return code
+
+
+def _main_shift_code_with_reason(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> Tuple[str, Optional[str]]:
     code = _normalize_shift_code(shift_id)
     if code in OFF_SHIFT_IDS:
-        return "O"
+        return "O", None
     meta = shift_meta.get(shift_id)
     if not meta:
-        return code
+        if code in {"D", "E", "N", "M", "O", "OFF"}:
+            return ("O" if code in {"O", "OFF"} else code), "missing_shift_meta"
+        return code, "missing_shift_meta"
     default_shift = _normalize_shift_code(str(meta.get("default_shift") or ""))
     if default_shift in {"D", "E", "N", "O", "OFF", "M"}:
-        return "O" if default_shift in {"O", "OFF"} else default_shift
+        return ("O" if default_shift in {"O", "OFF"} else default_shift), None
     if code in {"D", "E", "N", "M"}:
-        return code
-    return code
+        return code, "fallback_to_shift_id"
+    return code, "unresolved_shift_semantic"
 
 
 def _resolve_target_group(
@@ -246,6 +273,74 @@ def _compute_streak(schedule: List[str], day_idx: int, shift_meta: Dict[str, Dic
     return prev_work, next_work
 
 
+def _prev_tail_schedule_map(
+    prev_tail_payload: Optional[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    if not prev_tail_payload:
+        return result
+    data = prev_tail_payload.get("data")
+    if not isinstance(data, dict):
+        return result
+    tail_days = data.get("tail_days")
+    nurses = data.get("nurses")
+    if not isinstance(tail_days, list) or not isinstance(nurses, list):
+        return result
+    ordered_days: List[str] = [str(d) for d in tail_days]
+    for nurse_row in nurses:
+        if not isinstance(nurse_row, dict):
+            continue
+        nurse_id = str(nurse_row.get("nurse_id") or "")
+        if not nurse_id:
+            continue
+        shifts = nurse_row.get("shifts")
+        if not isinstance(shifts, dict):
+            continue
+        result[nurse_id] = [str(shifts.get(day_key) or "-") for day_key in ordered_days]
+    return result
+
+
+def _recovery_off_risk(
+    schedule_ctx: List[str],
+    local_day_idx: int,
+    shift_meta: Dict[str, Dict[str, Any]],
+    config: Optional[Any],
+) -> Tuple[float, List[str]]:
+    if local_day_idx < 0 or local_day_idx >= len(schedule_ctx):
+        return 0.0, []
+    current_shift = schedule_ctx[local_day_idx]
+    if not _is_off_shift(current_shift, shift_meta):
+        return 0.0, []
+
+    block_start = local_day_idx
+    while block_start - 1 >= 0 and _is_off_shift(schedule_ctx[block_start - 1], shift_meta):
+        block_start -= 1
+    off_day_order = local_day_idx - block_start + 1
+    if off_day_order not in {1, 2}:
+        return 0.0, []
+
+    night_streak = 0
+    cursor = block_start - 1
+    while cursor >= 0:
+        if _main_shift_code(schedule_ctx[cursor], shift_meta) != "N":
+            break
+        night_streak += 1
+        cursor -= 1
+
+    two_off_after_two = bool(getattr(config, "two_offs_after_two_nig", False)) if config else False
+    two_off_after_three = bool(getattr(config, "two_offs_after_three_nig", False)) if config else False
+
+    risk = 0.0
+    tags: List[str] = []
+    if two_off_after_two and night_streak >= 2:
+        risk += 92.0
+        tags.append(f"protected_off_2n2o_day{off_day_order}_risk")
+    if two_off_after_three and night_streak >= 3:
+        risk += 98.0
+        tags.append(f"protected_off_3n2o_day{off_day_order}_risk")
+    return risk, tags
+
+
 def _rule_safety_score(
     nurse: Any,
     schedule: List[str],
@@ -253,6 +348,7 @@ def _rule_safety_score(
     target_shift_code: str,
     shift_meta: Dict[str, Dict[str, Any]],
     config: Optional[Any],
+    prev_tail_schedule: Optional[List[str]] = None,
 ) -> Tuple[float, float, List[str]]:
     tags: List[str] = []
     risk = 0.0
@@ -260,7 +356,10 @@ def _rule_safety_score(
     assigned_is_off = _is_off_shift(assigned_shift, shift_meta)
     if assigned_is_off:
         tags.append("off_today")
-    prev_shift = schedule[day_idx - 1] if day_idx - 1 >= 0 else "-"
+
+    schedule_ctx = list(prev_tail_schedule or []) + schedule
+    local_day_idx = day_idx + (len(prev_tail_schedule or []))
+    prev_shift = schedule_ctx[local_day_idx - 1] if local_day_idx - 1 >= 0 else "-"
     prev_main = _main_shift_code(prev_shift, shift_meta)
     target_main = _main_shift_code(target_shift_code, shift_meta)
 
@@ -268,7 +367,7 @@ def _rule_safety_score(
     monthly_night_limit = int(getattr(config, "max_nig_per_month", 8) or 8) if config else 8
     banned_day_after_eve = bool(getattr(config, "banned_day_after_eve", False)) if config else False
 
-    prev_work, next_work = _compute_streak(schedule, day_idx, shift_meta)
+    prev_work, next_work = _compute_streak(schedule_ctx, local_day_idx, shift_meta)
     projected_work = prev_work + 1 + next_work
     if target_main != "O" and projected_work > max_conseq:
         over = projected_work - max_conseq
@@ -298,6 +397,16 @@ def _rule_safety_score(
     if not assigned_is_off:
         risk += 30.0
         tags.append("requires_reassignment")
+
+    recovery_risk, recovery_tags = _recovery_off_risk(
+        schedule_ctx=schedule_ctx,
+        local_day_idx=local_day_idx,
+        shift_meta=shift_meta,
+        config=config,
+    )
+    if recovery_risk > 0.0:
+        risk += recovery_risk
+        tags.extend(recovery_tags)
 
     risk_clamped = min(100.0, max(0.0, risk))
     safety = max(0.0, 1.0 - (risk_clamped / 100.0))
@@ -351,7 +460,8 @@ def _final_score(ctx: CandidateContext) -> float:
         + 10.0 * ctx.preference
         + 8.0 * ctx.pair
         + 7.0 * ctx.fairness
-        - 10.0 * ctx.change_cost,
+        - 10.0 * ctx.change_cost
+        - ctx.vacation_penalty,
         3,
     )
 
@@ -420,9 +530,28 @@ def recommend_replacement_candidates(
     pref_score_map = _load_preference_score_map(db, request_ids, year_value, month_value)
     pair_score_map = _load_pair_score_map(db, nurse_ids, month_key)
 
+    from services.roster_service import get_prev_month_tail_service
+
+    prev_tail_payload = get_prev_month_tail_service(
+        year=year_value,
+        month=month_value,
+        schedule_id=schedule.schedule_id,
+        tail_days=6,
+        group_id=target_group_id,
+        current_user=current_user,
+        db=db,
+    )
+    prev_tail_by_nurse = _prev_tail_schedule_map(prev_tail_payload)
+
     target_grade = getattr(nurse_by_id.get(req.target_nurse_id), "grade", None)
     top_k = req.top_k
     max_scan = req.options.max_candidate_scan
+    ranking_scope = str(getattr(req.options, "ranking_scope", "ALL") or "ALL").upper()
+    if ranking_scope not in {"ALL", "OFF_ONLY", "ON_DUTY_ONLY", "VACATION_ONLY"}:
+        ranking_scope = "ALL"
+
+    shift_fallback_reason_counts: Dict[str, int] = defaultdict(int)
+    shift_fallback_event_count = 0
 
     results: List[SlotRecommendation] = []
 
@@ -430,7 +559,16 @@ def recommend_replacement_candidates(
         day = slot.date.day
         day_idx = day - 1
         target_shift_raw = slot.shift
-        target_shift_main = _main_shift_code(target_shift_raw, shift_meta)
+        target_shift_main, target_shift_reason = _main_shift_code_with_reason(target_shift_raw, shift_meta)
+        if target_shift_reason:
+            shift_fallback_event_count += 1
+            shift_fallback_reason_counts[target_shift_reason] += 1
+            logger.warning(
+                "near-error: replacement semantic mapping fallback reason=%s shift=%s slot_date=%s",
+                target_shift_reason,
+                target_shift_raw,
+                slot.date.isoformat(),
+            )
 
         excluded = defaultdict(int)
         candidate_pool: List[Tuple[str, CandidateContext]] = []
@@ -463,7 +601,31 @@ def recommend_replacement_candidates(
             schedule_row = schedule_map[candidate_id]
             assigned_shift = schedule_row[day_idx] if day_idx < len(schedule_row) else "-"
             assigned_is_off = _is_off_shift(assigned_shift, shift_meta)
-            if not req.options.allow_non_off_candidates and not assigned_is_off:
+            assigned_is_vacation = _is_vacation_shift(assigned_shift, shift_meta)
+            assigned_is_off_rest = assigned_is_off and not assigned_is_vacation
+
+            assigned_main, assigned_reason = _main_shift_code_with_reason(assigned_shift, shift_meta)
+            if assigned_reason:
+                shift_fallback_event_count += 1
+                shift_fallback_reason_counts[assigned_reason] += 1
+                logger.warning(
+                    "near-error: replacement semantic mapping fallback reason=%s shift=%s candidate_id=%s slot_date=%s",
+                    assigned_reason,
+                    assigned_shift,
+                    candidate_id,
+                    slot.date.isoformat(),
+                )
+
+            if ranking_scope == "OFF_ONLY" and not assigned_is_off_rest:
+                excluded["ranking_scope_filtered"] += 1
+                continue
+            if ranking_scope == "ON_DUTY_ONLY" and assigned_is_off:
+                excluded["ranking_scope_filtered"] += 1
+                continue
+            if ranking_scope == "VACATION_ONLY" and not assigned_is_vacation:
+                excluded["ranking_scope_filtered"] += 1
+                continue
+            if ranking_scope == "ALL" and not req.options.allow_non_off_candidates and not assigned_is_off:
                 excluded["non_off_candidate_disabled"] += 1
                 continue
 
@@ -474,6 +636,7 @@ def recommend_replacement_candidates(
                 target_shift_code=target_shift_raw,
                 shift_meta=shift_meta,
                 config=config,
+                prev_tail_schedule=prev_tail_by_nurse.get(candidate_id),
             )
 
             off_priority = 1.0 if assigned_is_off else 0.35
@@ -493,6 +656,14 @@ def recommend_replacement_candidates(
             pair = max(0.0, min(1.0, ((p1 + p2) / 2.0) / 5.0))
 
             tags = list(rule_tags)
+            if assigned_is_vacation:
+                tags.append("vacation_candidate")
+            if target_shift_reason:
+                tags.append("fallback_target_shift_mapping")
+            if assigned_reason:
+                tags.append("fallback_shift_mapping")
+            if assigned_main == "O" and assigned_is_off_rest:
+                tags.append("off_rest_candidate")
             if grade_fit >= 0.99:
                 tags.append("same_grade")
             elif grade_fit >= 0.45:
@@ -502,6 +673,11 @@ def recommend_replacement_candidates(
             if pair >= 0.7:
                 tags.append("high_pair_fit")
 
+            vacation_penalty = 0.0
+            if ranking_scope == "ALL" and assigned_is_vacation:
+                vacation_penalty = 70.0
+                tags.append("vacation_penalized")
+
             candidate_pool.append(
                 (
                     candidate_id,
@@ -510,6 +686,7 @@ def recommend_replacement_candidates(
                         nurse_name=str(getattr(nurse, "name", candidate_id)),
                         assigned_shift=assigned_shift,
                         assigned_is_off=assigned_is_off,
+                        assigned_is_vacation=assigned_is_vacation,
                         rule_safety=rule_safety,
                         estimated_violation_delta=estimated_delta,
                         off_priority=off_priority,
@@ -518,6 +695,7 @@ def recommend_replacement_candidates(
                         pair=pair,
                         fairness=0.5,
                         change_cost=0.0 if assigned_is_off else 1.0,
+                        vacation_penalty=vacation_penalty,
                         tags=tags,
                     ),
                 )
@@ -531,6 +709,10 @@ def recommend_replacement_candidates(
             ctx.fairness = fairness_map.get(candidate_id, 0.5)
 
         scored = sorted(candidate_pool, key=lambda item: _final_score(item[1]), reverse=True)
+        if ranking_scope == "ALL":
+            non_vacation = [item for item in scored if not item[1].assigned_is_vacation]
+            vacation = [item for item in scored if item[1].assigned_is_vacation]
+            scored = non_vacation + vacation
         top = scored[:top_k]
 
         candidate_models: List[CandidateRecommendation] = []
@@ -579,6 +761,9 @@ def recommend_replacement_candidates(
             "evaluated_slots": len(slots),
             "candidate_scan_limit": max_scan,
             "allow_non_off_candidates": req.options.allow_non_off_candidates,
+            "applied_ranking_scope": ranking_scope,
+            "shift_semantic_fallback_event_count": shift_fallback_event_count,
+            "shift_semantic_fallback_reasons": dict(shift_fallback_reason_counts),
             "scoring_policy": "rule_safety_priority_with_grade_fit",
         },
     )

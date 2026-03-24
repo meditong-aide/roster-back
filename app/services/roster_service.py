@@ -9,6 +9,7 @@ from datetime import date, datetime
 import calendar
 import uuid
 
+from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -30,6 +31,7 @@ from db.models import (
 )
 from db.roster_config import NurseRosterConfig
 from db.nurse_config import Nurse as NurseEngine
+from routers.utils import get_days_in_month
 from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequest
 from services.roster_system import RosterSystem
 from services.shift_service_mssql import _to_time_str
@@ -276,6 +278,142 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
         "has_schedules": schedule is not None,
         "created_at": None,
         "submitted_at": None
+    }
+
+
+def get_prev_month_tail_service(
+    year: int,
+    month: int,
+    schedule_id: str | None,
+    tail_days: int,
+    group_id: str | None,
+    current_user,
+    db: Session,
+):
+    if current_user.is_head_nurse and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if (
+            getattr(current_user, "office_id", None)
+            and current_user.office_id != g.office_id
+        ):
+            raise HTTPException(
+                status_code=403, detail="Group does not belong to your office"
+            )
+        target_group_id = g.group_id
+
+    if month == 1:
+        prev_year, prev_month = year - 1, 12
+    else:
+        prev_year, prev_month = year, month - 1
+
+    ref_schedule_id = schedule_id
+    if not ref_schedule_id:
+        cur_issued = (
+            db.query(Schedule.schedule_id)
+            .filter(
+                Schedule.group_id == target_group_id,
+                Schedule.year == year,
+                Schedule.month == month,
+                Schedule.status == "issued",
+                Schedule.dropped == False,
+            )
+            .scalar()
+        )
+        ref_schedule_id = cur_issued
+
+    nurses = (
+        db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence)
+        .filter(
+            Nurse.group_id == target_group_id,
+            Nurse.active == 1,
+        )
+        .order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc())
+        .all()
+    )
+
+    prev_schedule = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == target_group_id,
+            Schedule.year == prev_year,
+            Schedule.month == prev_month,
+            Schedule.status == "issued",
+            Schedule.dropped == False,
+        )
+        .first()
+    )
+
+    if not prev_schedule:
+        prev_schedule = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id == target_group_id,
+                Schedule.year == prev_year,
+                Schedule.month == prev_month,
+                Schedule.dropped == False,
+            )
+            .order_by(Schedule.created_at.desc())
+            .first()
+        )
+
+    if not prev_schedule:
+        return {"prev_year": prev_year, "prev_month": prev_month, "data": None}
+
+    days_in_prev_month = get_days_in_month(prev_year, prev_month)
+    tail_day_list = list(
+        range(max(1, days_in_prev_month - tail_days + 1), days_in_prev_month + 1)
+    )
+
+    start_date = date(prev_year, prev_month, tail_day_list[0])
+    end_date = date(prev_year, prev_month, tail_day_list[-1])
+
+    entries = (
+        db.query(ScheduleEntry)
+        .filter(
+            ScheduleEntry.schedule_id == prev_schedule.schedule_id,
+            ScheduleEntry.work_date >= start_date,
+            ScheduleEntry.work_date <= end_date,
+        )
+        .all()
+    )
+
+    entries_by_nurse = {}
+    for entry in entries:
+        nid = entry.nurse_id
+        if nid not in entries_by_nurse:
+            entries_by_nurse[nid] = {}
+        entries_by_nurse[nid][entry.work_date.day] = entry.shift_id
+
+    nurse_list = []
+    for nurse in nurses:
+        shifts = {
+            str(d): entries_by_nurse.get(nurse.nurse_id, {}).get(d)
+            for d in tail_day_list
+        }
+        nurse_list.append(
+            {
+                "nurse_id": nurse.nurse_id,
+                "name": nurse.name,
+                "shifts": shifts,
+            }
+        )
+
+    return {
+        "prev_year": prev_year,
+        "prev_month": prev_month,
+        "data": {
+            "schedule_id": prev_schedule.schedule_id,
+            "schedule_name": prev_schedule.name,
+            "schedule_status": prev_schedule.status,
+            "tail_days": tail_day_list,
+            "nurses": nurse_list,
+        },
     }
 
 
