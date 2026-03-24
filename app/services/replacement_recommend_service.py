@@ -32,6 +32,12 @@ from schemas.replacement_schema import (
 
 OFF_SHIFT_IDS = {"O", "OFF", "-", "주"}
 VACATION_SHIFT_TYPE_TOKENS = {"휴가", "vacation", "annual_leave", "annual leave", "연차", "연가"}
+WORK_SHIFT_GB_TO_MAIN = {
+    "데이": "D",
+    "이브닝": "E",
+    "미드": "M",
+    "나이트": "N",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -56,15 +62,11 @@ class CandidateContext:
 
 
 def _is_vacation_shift(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> bool:
-    meta = shift_meta.get(shift_id)
-    if not meta:
-        return False
-    shift_type = str(meta.get("type") or "").strip().lower()
-    if not shift_type:
-        return False
-    if shift_type in VACATION_SHIFT_TYPE_TOKENS:
-        return True
-    return "휴가" in shift_type or "vacation" in shift_type
+    _main, _is_off_rest, is_vacation, _is_off_any, _reason = _resolve_shift_semantic_with_reason(
+        shift_id,
+        shift_meta,
+    )
+    return is_vacation
 
 
 def _to_date(v: Any) -> Optional[date]:
@@ -87,16 +89,11 @@ def _normalize_shift_code(raw_shift: str) -> str:
 
 
 def _is_off_shift(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> bool:
-    code = _normalize_shift_code(shift_id)
-    if code in OFF_SHIFT_IDS:
-        return True
-    if _is_vacation_shift(shift_id, shift_meta):
-        return True
-    meta = shift_meta.get(shift_id)
-    if not meta:
-        return False
-    shift_type = str(meta.get("type") or "").lower()
-    return shift_type in {"off", "휴무", "weekly_off"}
+    _main, _is_off_rest, _is_vacation, is_off_any, _reason = _resolve_shift_semantic_with_reason(
+        shift_id,
+        shift_meta,
+    )
+    return is_off_any
 
 
 def _main_shift_code(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> str:
@@ -104,21 +101,59 @@ def _main_shift_code(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> st
     return code
 
 
-def _main_shift_code_with_reason(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> Tuple[str, Optional[str]]:
-    code = _normalize_shift_code(shift_id)
-    if code in OFF_SHIFT_IDS:
-        return "O", None
-    meta = shift_meta.get(shift_id)
-    if not meta:
-        if code in {"D", "E", "N", "M", "O", "OFF"}:
-            return ("O" if code in {"O", "OFF"} else code), "missing_shift_meta"
-        return code, "missing_shift_meta"
-    default_shift = _normalize_shift_code(str(meta.get("default_shift") or ""))
-    if default_shift in {"D", "E", "N", "O", "OFF", "M"}:
-        return ("O" if default_shift in {"O", "OFF"} else default_shift), None
-    if code in {"D", "E", "N", "M"}:
-        return code, "fallback_to_shift_id"
-    return code, "unresolved_shift_semantic"
+def _main_shift_code_with_reason(
+    shift_id: str,
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_pk: Optional[str] = None,
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[str, Optional[str]]:
+    main_code, _is_off_rest, _is_vacation, _is_off_any, reason = _resolve_shift_semantic_with_reason(
+        shift_id,
+        shift_meta,
+        shift_pk=shift_pk,
+        shift_meta_by_pk=shift_meta_by_pk,
+    )
+    return main_code, reason
+
+
+def _resolve_shift_semantic_with_reason(
+    shift_id: str,
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_pk: Optional[str] = None,
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[str, bool, bool, bool, Optional[str]]:
+    meta: Optional[Dict[str, Any]] = None
+    if shift_pk is not None and shift_meta_by_pk is not None:
+        meta = shift_meta_by_pk.get(str(shift_pk))
+    if meta is None:
+        meta = shift_meta.get(str(shift_id))
+
+    if meta is None:
+        fallback_code = _normalize_shift_code(shift_id)
+        if fallback_code in OFF_SHIFT_IDS:
+            return "O", True, False, True, "missing_shift_meta"
+        if fallback_code in {"D", "E", "M", "N"}:
+            return fallback_code, False, False, False, "missing_shift_meta"
+        return "W", False, False, False, "missing_shift_meta"
+
+    shift_type_raw = str(meta.get("type") or "").strip()
+    shift_type_norm = shift_type_raw.lower()
+    shift_gb = str(meta.get("shift_gb") or "").strip()
+
+    if shift_type_raw == "휴무":
+        return "O", True, False, True, None
+
+    is_vacation = bool(
+        shift_type_norm
+        and (shift_type_norm in VACATION_SHIFT_TYPE_TOKENS or "휴가" in shift_type_norm or "vacation" in shift_type_norm)
+    )
+    if is_vacation:
+        return "O", False, True, True, None
+
+    if shift_type_raw == "근무":
+        return WORK_SHIFT_GB_TO_MAIN.get(shift_gb, "W"), False, False, False, None
+
+    return "W", False, False, False, "unresolved_shift_type"
 
 
 def _resolve_target_group(
@@ -160,6 +195,22 @@ def _build_schedule_map(entries: List[Any], days_in_month: int) -> Dict[str, Lis
         day_idx = work_date.day - 1
         if 0 <= day_idx < days_in_month:
             data[nurse_id][day_idx] = str(e.shift_id)
+    return data
+
+
+def _build_schedule_shift_pk_map(entries: List[Any], days_in_month: int) -> Dict[str, List[Optional[str]]]:
+    data: Dict[str, List[Optional[str]]] = {}
+    for e in entries:
+        nurse_id = str(e.nurse_id)
+        if nurse_id not in data:
+            data[nurse_id] = [None] * days_in_month
+        work_date = getattr(e, "work_date", None)
+        if work_date is None:
+            continue
+        day_idx = work_date.day - 1
+        if 0 <= day_idx < days_in_month:
+            shift_pk = getattr(e, "id", None)
+            data[nurse_id][day_idx] = None if shift_pk is None else str(shift_pk)
     return data
 
 
@@ -255,18 +306,38 @@ def _nurse_can_work_shift(nurse: Any, shift_code: str) -> bool:
     return True
 
 
-def _compute_streak(schedule: List[str], day_idx: int, shift_meta: Dict[str, Dict[str, Any]]) -> Tuple[int, int]:
+def _compute_streak(
+    schedule: List[str],
+    day_idx: int,
+    shift_meta: Dict[str, Dict[str, Any]],
+    schedule_shift_pks: Optional[List[Optional[str]]] = None,
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[int, int]:
     prev_work = 0
     cur = day_idx - 1
     while cur >= 0:
-        if _is_off_shift(schedule[cur], shift_meta):
+        shift_pk = schedule_shift_pks[cur] if schedule_shift_pks and cur < len(schedule_shift_pks) else None
+        _main, _is_off_rest, _is_vacation, is_off_any, _reason = _resolve_shift_semantic_with_reason(
+            schedule[cur],
+            shift_meta,
+            shift_pk=shift_pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+        if is_off_any:
             break
         prev_work += 1
         cur -= 1
     next_work = 0
     cur = day_idx + 1
     while cur < len(schedule):
-        if _is_off_shift(schedule[cur], shift_meta):
+        shift_pk = schedule_shift_pks[cur] if schedule_shift_pks and cur < len(schedule_shift_pks) else None
+        _main, _is_off_rest, _is_vacation, is_off_any, _reason = _resolve_shift_semantic_with_reason(
+            schedule[cur],
+            shift_meta,
+            shift_pk=shift_pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+        if is_off_any:
             break
         next_work += 1
         cur += 1
@@ -305,15 +376,42 @@ def _recovery_off_risk(
     local_day_idx: int,
     shift_meta: Dict[str, Dict[str, Any]],
     config: Optional[Any],
+    schedule_ctx_shift_pks: Optional[List[Optional[str]]] = None,
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[float, List[str]]:
     if local_day_idx < 0 or local_day_idx >= len(schedule_ctx):
         return 0.0, []
     current_shift = schedule_ctx[local_day_idx]
-    if not _is_off_shift(current_shift, shift_meta):
+    current_shift_pk = (
+        schedule_ctx_shift_pks[local_day_idx]
+        if schedule_ctx_shift_pks and local_day_idx < len(schedule_ctx_shift_pks)
+        else None
+    )
+    _main, _is_off_rest, _is_vacation, current_is_off_any, _reason = _resolve_shift_semantic_with_reason(
+        current_shift,
+        shift_meta,
+        shift_pk=current_shift_pk,
+        shift_meta_by_pk=shift_meta_by_pk,
+    )
+    if not current_is_off_any:
         return 0.0, []
 
     block_start = local_day_idx
-    while block_start - 1 >= 0 and _is_off_shift(schedule_ctx[block_start - 1], shift_meta):
+    while block_start - 1 >= 0:
+        prev_idx = block_start - 1
+        prev_shift_pk = (
+            schedule_ctx_shift_pks[prev_idx]
+            if schedule_ctx_shift_pks and prev_idx < len(schedule_ctx_shift_pks)
+            else None
+        )
+        _m, _r, _v, prev_is_off_any, _reason_prev = _resolve_shift_semantic_with_reason(
+            schedule_ctx[prev_idx],
+            shift_meta,
+            shift_pk=prev_shift_pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+        if not prev_is_off_any:
+            break
         block_start -= 1
     off_day_order = local_day_idx - block_start + 1
     if off_day_order not in {1, 2}:
@@ -322,7 +420,18 @@ def _recovery_off_risk(
     night_streak = 0
     cursor = block_start - 1
     while cursor >= 0:
-        if _main_shift_code(schedule_ctx[cursor], shift_meta) != "N":
+        cursor_shift_pk = (
+            schedule_ctx_shift_pks[cursor] if schedule_ctx_shift_pks and cursor < len(schedule_ctx_shift_pks) else None
+        )
+        if (
+            _main_shift_code_with_reason(
+                schedule_ctx[cursor],
+                shift_meta,
+                shift_pk=cursor_shift_pk,
+                shift_meta_by_pk=shift_meta_by_pk,
+            )[0]
+            != "N"
+        ):
             break
         night_streak += 1
         cursor -= 1
@@ -349,25 +458,88 @@ def _rule_safety_score(
     shift_meta: Dict[str, Dict[str, Any]],
     config: Optional[Any],
     prev_tail_schedule: Optional[List[str]] = None,
+    schedule_shift_pks: Optional[List[Optional[str]]] = None,
+    prev_tail_shift_pks: Optional[List[Optional[str]]] = None,
+    target_shift_pk: Optional[str] = None,
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[float, float, List[str]]:
     tags: List[str] = []
     risk = 0.0
     assigned_shift = schedule[day_idx] if day_idx < len(schedule) else "-"
-    assigned_is_off = _is_off_shift(assigned_shift, shift_meta)
+    assigned_shift_pk = schedule_shift_pks[day_idx] if schedule_shift_pks and day_idx < len(schedule_shift_pks) else None
+    _assigned_main, _assigned_is_off_rest, _assigned_is_vacation, assigned_is_off, _assigned_reason = (
+        _resolve_shift_semantic_with_reason(
+            assigned_shift,
+            shift_meta,
+            shift_pk=assigned_shift_pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+    )
     if assigned_is_off:
         tags.append("off_today")
 
-    schedule_ctx = list(prev_tail_schedule or []) + schedule
-    local_day_idx = day_idx + (len(prev_tail_schedule or []))
+    prev_tail_ctx = list(prev_tail_schedule or [])
+    prev_tail_len = len(prev_tail_ctx)
+    schedule_ctx = prev_tail_ctx + schedule
+
+    if prev_tail_shift_pks is None:
+        normalized_prev_tail_shift_pks: List[Optional[str]] = [None] * prev_tail_len
+    else:
+        normalized_prev_tail_shift_pks = list(prev_tail_shift_pks[:prev_tail_len])
+        if len(normalized_prev_tail_shift_pks) < prev_tail_len:
+            normalized_prev_tail_shift_pks.extend([None] * (prev_tail_len - len(normalized_prev_tail_shift_pks)))
+
+    schedule_ctx_shift_pks = normalized_prev_tail_shift_pks + list(schedule_shift_pks or [])
+    if len(schedule_ctx_shift_pks) < len(schedule_ctx):
+        schedule_ctx_shift_pks.extend([None] * (len(schedule_ctx) - len(schedule_ctx_shift_pks)))
+    elif len(schedule_ctx_shift_pks) > len(schedule_ctx):
+        schedule_ctx_shift_pks = schedule_ctx_shift_pks[: len(schedule_ctx)]
+
+    local_day_idx = day_idx + prev_tail_len
     prev_shift = schedule_ctx[local_day_idx - 1] if local_day_idx - 1 >= 0 else "-"
-    prev_main = _main_shift_code(prev_shift, shift_meta)
-    target_main = _main_shift_code(target_shift_code, shift_meta)
+    prev_shift_pk = (
+        schedule_ctx_shift_pks[local_day_idx - 1]
+        if local_day_idx - 1 >= 0 and local_day_idx - 1 < len(schedule_ctx_shift_pks)
+        else None
+    )
+    prev_main = _main_shift_code_with_reason(
+        prev_shift,
+        shift_meta,
+        shift_pk=prev_shift_pk,
+        shift_meta_by_pk=shift_meta_by_pk,
+    )[0]
+    target_main = _main_shift_code_with_reason(
+        target_shift_code,
+        shift_meta,
+        shift_pk=target_shift_pk,
+        shift_meta_by_pk=shift_meta_by_pk,
+    )[0]
+    next_main = "-"
+    if local_day_idx + 1 < len(schedule_ctx):
+        next_shift = schedule_ctx[local_day_idx + 1]
+        next_shift_pk = (
+            schedule_ctx_shift_pks[local_day_idx + 1]
+            if local_day_idx + 1 < len(schedule_ctx_shift_pks)
+            else None
+        )
+        next_main = _main_shift_code_with_reason(
+            next_shift,
+            shift_meta,
+            shift_pk=next_shift_pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )[0]
 
     max_conseq = int(getattr(config, "max_conseq_work", 6) or 6) if config else 6
     monthly_night_limit = int(getattr(config, "max_nig_per_month", 8) or 8) if config else 8
     banned_day_after_eve = bool(getattr(config, "banned_day_after_eve", False)) if config else False
 
-    prev_work, next_work = _compute_streak(schedule_ctx, local_day_idx, shift_meta)
+    prev_work, next_work = _compute_streak(
+        schedule_ctx,
+        local_day_idx,
+        shift_meta,
+        schedule_shift_pks=schedule_ctx_shift_pks,
+        shift_meta_by_pk=shift_meta_by_pk,
+    )
     projected_work = prev_work + 1 + next_work
     if target_main != "O" and projected_work > max_conseq:
         over = projected_work - max_conseq
@@ -382,10 +554,28 @@ def _rule_safety_score(
         risk += 55.0
         tags.append("eve_to_day_risk")
 
+    if banned_day_after_eve and target_main == "E" and next_main == "D":
+        risk += 55.0
+        tags.append("lookahead_eve_to_day_risk")
+
+    if target_main == "N" and next_main == "D":
+        risk += 60.0
+        tags.append("lookahead_night_to_day_risk")
+
+    if target_main == "N" and next_main == "E":
+        risk += 60.0
+        tags.append("lookahead_night_to_evening_risk")
+
     if target_main == "N":
         month_nights = 0
         for idx, shift_id in enumerate(schedule):
-            code = _main_shift_code(shift_id, shift_meta)
+            shift_pk = schedule_shift_pks[idx] if schedule_shift_pks and idx < len(schedule_shift_pks) else None
+            code = _main_shift_code_with_reason(
+                shift_id,
+                shift_meta,
+                shift_pk=shift_pk,
+                shift_meta_by_pk=shift_meta_by_pk,
+            )[0]
             if code == "N" and idx != day_idx:
                 month_nights += 1
         projected_nights = month_nights + 1
@@ -403,6 +593,8 @@ def _rule_safety_score(
         local_day_idx=local_day_idx,
         shift_meta=shift_meta,
         config=config,
+        schedule_ctx_shift_pks=schedule_ctx_shift_pks,
+        shift_meta_by_pk=shift_meta_by_pk,
     )
     if recovery_risk > 0.0:
         risk += recovery_risk
@@ -417,14 +609,27 @@ def _rule_safety_score(
 def _fairness_scores(
     candidates: List[Tuple[str, CandidateContext]],
     schedules: Dict[str, List[str]],
+    schedule_shift_pk_map: Dict[str, List[Optional[str]]],
     shift_code: str,
     shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, float]:
     loads: Dict[str, int] = {}
     target_main = _main_shift_code(shift_code, shift_meta)
     for nurse_id, _ctx in candidates:
         schedule = schedules.get(nurse_id, [])
-        loads[nurse_id] = sum(1 for s in schedule if _main_shift_code(s, shift_meta) == target_main)
+        shift_pk_row = schedule_shift_pk_map.get(nurse_id, [])
+        loads[nurse_id] = sum(
+            1
+            for idx, s in enumerate(schedule)
+            if _main_shift_code_with_reason(
+                s,
+                shift_meta,
+                shift_pk=(shift_pk_row[idx] if idx < len(shift_pk_row) else None),
+                shift_meta_by_pk=shift_meta_by_pk,
+            )[0]
+            == target_main
+        )
 
     if not loads:
         return {}
@@ -439,6 +644,8 @@ def _build_slots_for_bulk(
     req: ReplacementRecommendRequest,
     target_schedule: List[str],
     shift_meta: Dict[str, Dict[str, Any]],
+    target_schedule_shift_pks: Optional[List[Optional[str]]] = None,
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[ReplacementSlot]:
     assert req.absence_window is not None
     slots: List[ReplacementSlot] = []
@@ -446,7 +653,14 @@ def _build_slots_for_bulk(
         dt = date(req.absence_window.start_date.year, req.absence_window.start_date.month, day_idx + 1)
         if dt < req.absence_window.start_date or dt > req.absence_window.end_date:
             continue
-        if _is_off_shift(shift_id, shift_meta):
+        shift_pk = target_schedule_shift_pks[day_idx] if target_schedule_shift_pks and day_idx < len(target_schedule_shift_pks) else None
+        _main, _is_off_rest, _is_vacation, is_off_any, _reason = _resolve_shift_semantic_with_reason(
+            shift_id,
+            shift_meta,
+            shift_pk=shift_pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+        if is_off_any:
             continue
         slots.append(ReplacementSlot(date=dt, shift=str(shift_id)))
     return slots
@@ -496,8 +710,18 @@ def recommend_replacement_candidates(
         str(s.shift_id): {
             "type": str(getattr(s, "type", "") or ""),
             "default_shift": str(getattr(s, "default_shift", "") or ""),
+            "shift_gb": str(getattr(s, "shift_gb", "") or ""),
         }
         for s in shifts
+    }
+    shift_meta_by_pk = {
+        str(getattr(s, "id")): {
+            "type": str(getattr(s, "type", "") or ""),
+            "default_shift": str(getattr(s, "default_shift", "") or ""),
+            "shift_gb": str(getattr(s, "shift_gb", "") or ""),
+        }
+        for s in shifts
+        if getattr(s, "id", None) is not None
     }
 
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).all()
@@ -513,6 +737,7 @@ def recommend_replacement_candidates(
         days_in_month = 29 if leap else 28
 
     schedule_map = _build_schedule_map(entries, days_in_month)
+    schedule_shift_pk_map = _build_schedule_shift_pk_map(entries, days_in_month)
     if req.target_nurse_id not in schedule_map:
         raise ValueError("target_nurse_id not found in schedule entries")
 
@@ -522,7 +747,13 @@ def recommend_replacement_candidates(
     if req.mode == "SINGLE":
         slots = req.slots or []
     else:
-        slots = _build_slots_for_bulk(req, schedule_map[req.target_nurse_id], shift_meta)
+        slots = _build_slots_for_bulk(
+            req,
+            schedule_map[req.target_nurse_id],
+            shift_meta,
+            target_schedule_shift_pks=schedule_shift_pk_map.get(req.target_nurse_id),
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
 
     month_key = f"{year_value:04d}-{month_value:02d}"
     nurse_ids = list(schedule_map.keys())
@@ -559,7 +790,11 @@ def recommend_replacement_candidates(
         day = slot.date.day
         day_idx = day - 1
         target_shift_raw = slot.shift
-        target_shift_main, target_shift_reason = _main_shift_code_with_reason(target_shift_raw, shift_meta)
+        target_shift_main, target_shift_reason = _main_shift_code_with_reason(
+            target_shift_raw,
+            shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
         if target_shift_reason:
             shift_fallback_event_count += 1
             shift_fallback_reason_counts[target_shift_reason] += 1
@@ -599,12 +834,18 @@ def recommend_replacement_candidates(
                 continue
 
             schedule_row = schedule_map[candidate_id]
+            schedule_shift_pk_row = schedule_shift_pk_map.get(candidate_id, [])
             assigned_shift = schedule_row[day_idx] if day_idx < len(schedule_row) else "-"
-            assigned_is_off = _is_off_shift(assigned_shift, shift_meta)
-            assigned_is_vacation = _is_vacation_shift(assigned_shift, shift_meta)
+            assigned_shift_pk = schedule_shift_pk_row[day_idx] if day_idx < len(schedule_shift_pk_row) else None
+            assigned_main, assigned_is_off_rest, assigned_is_vacation, assigned_is_off, assigned_reason = (
+                _resolve_shift_semantic_with_reason(
+                    assigned_shift,
+                    shift_meta,
+                    shift_pk=assigned_shift_pk,
+                    shift_meta_by_pk=shift_meta_by_pk,
+                )
+            )
             assigned_is_off_rest = assigned_is_off and not assigned_is_vacation
-
-            assigned_main, assigned_reason = _main_shift_code_with_reason(assigned_shift, shift_meta)
             if assigned_reason:
                 shift_fallback_event_count += 1
                 shift_fallback_reason_counts[assigned_reason] += 1
@@ -637,6 +878,13 @@ def recommend_replacement_candidates(
                 shift_meta=shift_meta,
                 config=config,
                 prev_tail_schedule=prev_tail_by_nurse.get(candidate_id),
+                schedule_shift_pks=schedule_shift_pk_row,
+                target_shift_pk=(
+                    schedule_shift_pk_map.get(req.target_nurse_id, [])[day_idx]
+                    if day_idx < len(schedule_shift_pk_map.get(req.target_nurse_id, []))
+                    else None
+                ),
+                shift_meta_by_pk=shift_meta_by_pk,
             )
 
             off_priority = 1.0 if assigned_is_off else 0.35
@@ -704,7 +952,14 @@ def recommend_replacement_candidates(
             if len(candidate_pool) >= max_scan:
                 break
 
-        fairness_map = _fairness_scores(candidate_pool, schedule_map, target_shift_raw, shift_meta)
+        fairness_map = _fairness_scores(
+            candidate_pool,
+            schedule_map,
+            schedule_shift_pk_map,
+            target_shift_raw,
+            shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
         for candidate_id, ctx in candidate_pool:
             ctx.fairness = fairness_map.get(candidate_id, 0.5)
 
