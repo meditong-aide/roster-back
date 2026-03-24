@@ -283,6 +283,16 @@ def submit_preferences_service(
         ).delete()
     
     # ==================== 상세 데이터 저장 ====================
+    # shifts.id 매핑
+    _nurse_row = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+    _grp_id = _nurse_row.group_id if _nurse_row else None
+    _shift_id_to_table_id = {}
+    if _grp_id:
+        _shift_id_to_table_id = {
+            s.shift_id: s.id
+            for s in db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == _grp_id).all()
+        }
+
     detailed_id = 1
     for date_str, shift_id in data_to_save.items():
         if shift_id:  # 빈 값은 저장하지 않음
@@ -301,7 +311,8 @@ def submit_preferences_service(
                 shift=shift_id,
                 score=1.0,
                 partial_request="",
-                comment=comment # 사유작성
+                comment=comment, # 사유작성
+                shifts_table_id=_shift_id_to_table_id.get(shift_id),
             ))
             detailed_id += 1
     

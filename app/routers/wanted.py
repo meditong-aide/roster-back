@@ -876,6 +876,7 @@ async def save_fixed_wanted(
                     nurse_id=e.nurse_id,
                     shift_date=e.shift_date,
                     shift_id=e.shift_id,
+                    shifts_table_id=e.shifts_table_id,
                     is_applied=e.is_applied,
                     source_type=e.source_type,
                     original_shift_id=e.original_shift_id,

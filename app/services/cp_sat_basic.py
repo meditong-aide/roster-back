@@ -2669,6 +2669,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
                         )
                         continue
+                    # off_window 범위 내 평일: 전월 꼬리 연속근무 보정을 위해 OFF 허용 필요
+                    _ow_ranges = (getattr(rs, "off_window_constraints", {}) or {}).get(n, []) or []
+                    if any(ws <= d <= we for (ws, we) in _ow_ranges):
+                        print(
+                            f"[WeekendOff][HardDebug] 평일 OFF 금지 스킵(off_window 월경계 보정): "
+                            f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
+                        )
+                        continue
                     wd = (rs.target_month + timedelta(days=d)).weekday()
                     print(
                         f"[WeekendOff][HardDebug] X(n,d,off)==0 추가: "
@@ -2677,13 +2685,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                     m.Add(X(n, d, off) == 0)
         # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
+        # 주말 휴무자도 월경계 연속근무 초과 가능 → 동일 적용
         try:
             off_windows = getattr(rs, "off_window_constraints", {}) or {}
             if off_idx_full is not None:
                 for (w_start, w_end) in off_windows.get(n, []) or []:
-                    nu = rs.nurses[n]
-                    if bool(getattr(nu, "is_weekend_off", False)):
-                        continue
                     left = max(T0, w_start)
                     right = min(T1, w_end)
                     if left > right:
@@ -2696,21 +2702,20 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     m.Add(sum(X(n, d, off_idx_full) for d in free_days) >= 1)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
-        # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자 포함: 월경계 연속근무 초과 방지)
         # 고정 셀 우선: D/E/N/O 불문하고 fixed_cells에 포함된 날은 자유 일수에서 제외
         # → 유저가 K+1일 이상 연속 근무를 고정한 경우, 해당 윈도우는 제약 적용하지 않음
-        if not bool(getattr(nu, "is_weekend_off", False)):
-            for d0 in range(T0, T1-K+1):
-                window = [d0 + t for t in range(K + 1)]
-                # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
-                if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
-                    continue
-                # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 대상으로 합산
-                free_days_w = [d for d in window if (n, d) not in fixed]
-                if not free_days_w:
-                    # 윈도우 전체가 고정(D/E/N 연속 포함) → 유저 고정 우선, 제약 무시
-                    continue
-                m.Add(sum(X(n, d, off) for d in free_days_w) >= 1)
+        for d0 in range(T0, T1-K+1):
+            window = [d0 + t for t in range(K + 1)]
+            # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
+            if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
+                continue
+            # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 대상으로 합산
+            free_days_w = [d for d in window if (n, d) not in fixed]
+            if not free_days_w:
+                # 윈도우 전체가 고정(D/E/N 연속 포함) → 유저 고정 우선, 제약 무시
+                continue
+            m.Add(sum(X(n, d, off) for d in free_days_w) >= 1)
 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):
@@ -2853,8 +2858,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
                         )
                     else:
+                        _base_max = int(off_bounds["max_off_allowed"])
+                        # weekend_off 간호사: n_tail(2N2O/3N2O) 및 off_window로 인한
+                        # 추가 평일 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
+                        _extra_off = 0
+                        if bool(getattr(nu, "is_weekend_off", False)):
+                            _n_tail_cap = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
+                            if _n_tail_cap >= 1 and (
+                                getattr(cfg, "two_offs_after_two_nig", False)
+                                or getattr(cfg, "two_offs_after_three_nig", False)
+                            ):
+                                _extra_off += 2
+                            _ow_data = (getattr(rs, "off_window_constraints", {}) or {}).get(n, []) or []
+                            for (_ws, _we) in _ow_data:
+                                _wl = max(T0, _ws)
+                                _wr = min(T1, _we)
+                                if _wl <= _wr and not any(_d in weekend_days for _d in range(_wl, _wr + 1)):
+                                    _extra_off += 1
                         max_off_allowed = min(
-                            int(off_bounds["max_off_allowed"]),
+                            _base_max + _extra_off,
                             nonvac_active_days,
                         )
                         m.Add(
@@ -2870,6 +2892,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"cap_semantics={off_cap_semantics}, vac_cnt={vacation_cnt}, "
                             f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
                             f"min_off={min_off_required}, max_off={max_off_allowed}"
+                            + (f", extra_off={_extra_off}" if _extra_off > 0 else "")
                         )
         except Exception as exc:
             print(

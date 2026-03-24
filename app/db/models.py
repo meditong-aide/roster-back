@@ -495,6 +495,7 @@ class NurseShiftRequest(Base):
     detailed_request_id = Column(INTEGER, primary_key=True)
     shift_date = Column(DATE, primary_key=True)
     shift = Column(CHAR(1), nullable=False)  # 'D','E','N','O'
+    shifts_table_id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
     score = Column(DECIMAL(3, 1), nullable=False)
     partial_request = Column(TEXT, nullable=True)
     # 사유작성
@@ -616,6 +617,7 @@ class FixedWantedEntry(Base):
     nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
     shift_date = Column(DATE, nullable=False)
     shift_id = Column(NVARCHAR(10), nullable=False)  # 근무코드 (D, E, N, O 등)
+    shifts_table_id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
     is_applied = Column(BOOLEAN, default=True)  # 적용/미적용 여부
     source_type = Column(
         VARCHAR(20), nullable=False

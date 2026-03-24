@@ -778,6 +778,10 @@ def optimize_fallback_lex_hard_first(
                             continue
                         if d <= 1 and getattr(roster_system, "prev_month_n_tail_by_idx", {}).get(n, 0) >= 2:
                             continue
+                        # off_window 범위 내 평일: 전월 꼬리 연속근무 보정을 위해 OFF 허용 필요
+                        _ow_ranges_fb = (getattr(roster_system, "off_window_constraints", {}) or {}).get(n, []) or []
+                        if any(ws <= d <= we for (ws, we) in _ow_ranges_fb):
+                            continue
                         m.Add(X(n, d, off_idx) == 0)
 
         # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
@@ -1213,9 +1217,7 @@ def optimize_fallback_lex_hard_first(
                 for n in range(N):
                     if preceptee_follow and n in preceptee_indices:
                         continue
-                    nu = roster_system.nurses[n]
-                    if bool(getattr(nu, "is_weekend_off", False)):
-                        continue
+                    # 주말 휴무자도 월경계 연속근무 초과 가능 → 동일 적용
                     T0, T1 = join[n], leave[n]
                     for (w_start, w_end) in off_windows.get(n, []) or []:
                         left = max(T0, w_start)
@@ -1231,13 +1233,11 @@ def optimize_fallback_lex_hard_first(
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
-        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자 포함: 월경계 연속근무 초과 방지)
         # 고정 셀 우선: D/E/N/O 불문하고 fixed인 날은 자유 일수에서 제외
         K = cfg.max_consecutive_work_days
         for n in range(N):
             if preceptee_follow and n in preceptee_indices:
-                continue
-            if bool(getattr(roster_system.nurses[n], "is_weekend_off", False)):
                 continue
             T0, T1 = join[n], leave[n]
             for d0 in range(T0, T1 - K + 1):
@@ -1565,6 +1565,23 @@ def optimize_fallback_lex_hard_first(
                         total_cap_effective = max(0, avail_days - 15) + relax_level
                     else:
                         base_cap = max_off_allowed_from_policy
+                        # weekend_off 간호사: n_tail(2N2O/3N2O) 및 off_window로 인한
+                        # 추가 평일 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
+                        _extra_off_fb = 0
+                        if is_weekend_off:
+                            _n_tail_fb = getattr(roster_system, "prev_month_n_tail_by_idx", {}).get(n, 0)
+                            if _n_tail_fb >= 1 and (
+                                getattr(cfg, "two_offs_after_two_nig", False)
+                                or getattr(cfg, "two_offs_after_three_nig", False)
+                            ):
+                                _extra_off_fb += 2
+                            _ow_data_fb = (getattr(roster_system, "off_window_constraints", {}) or {}).get(n, []) or []
+                            for (_ws, _we) in _ow_data_fb:
+                                _wl = max(T0, _ws)
+                                _wr = min(T1, _we)
+                                if _wl <= _wr and not any(_d in weekend_days for _d in range(_wl, _wr + 1)):
+                                    _extra_off_fb += 1
+                        base_cap += _extra_off_fb
                         if n in per_nurse_off_cap_override:
                             base_cap = max(base_cap, per_nurse_off_cap_override[n])
                         total_cap_effective = min(base_cap + relax_level, avail_days)

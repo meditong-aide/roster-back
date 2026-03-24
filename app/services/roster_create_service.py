@@ -1473,12 +1473,16 @@ def _calc_tail_metrics(seq: list[str]) -> dict:
             'offs_after_tail_nights': 0,
         }
     last = seq[-1]
-    # 연속 근무 꼬리(D/E/N)
+    # 연속 근무 꼬리 (D/E/N/M = 메인코드, WK = shift_gb·type 미설정 근무 폴백)
+    _WORK_CODES = ('D', 'E', 'N', 'M', 'WK')
     cons_work = 0
     for c in reversed(seq):
-        if c in ('D', 'E', 'N'):
+        if c in _WORK_CODES:
             cons_work += 1
         elif c == 'O':
+            break
+        else:
+            # '-' 등 미인식 코드는 연속 끊김 처리
             break
     # tail 끝의 OFF 카운트
     offs_after_n = 0
@@ -1513,7 +1517,57 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         main = r.get('main_code')
         for c in (r.get('codes') or []):
             code2main[str(c).upper()] = main
-    code2main['O'] = 'O'; code2main['O'] = 'O'
+    code2main['O'] = 'O'; code2main['OFF'] = 'O'; code2main['주'] = 'O'
+
+    # Shift 테이블의 shift_id → 메인코드 매핑 보강
+    # ShiftManage.codes에 없는 세부 근무코드(NT, A, VY, OO 등)를 정규화하기 위함
+    # 판정 우선순위: ① shift_gb(데이→D,이브닝→E,나이트→N,미드→M) ② default_shift ③ type
+    _SHIFT_GB_TO_MAIN = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
+    try:
+        all_shifts = (
+            db.query(Shift)
+            .filter(
+                Shift.group_id == current_user.group_id,
+                Shift.office_id == current_user.office_id,
+            )
+            .all()
+        )
+        _sup_cnt = 0
+        for s in all_shifts:
+            sid = str(s.shift_id).strip().upper()
+            if not sid or sid in code2main:
+                continue
+            # ① shift_gb 기반 판정 (가장 명확)
+            sgb = str(getattr(s, "shift_gb", "") or "").strip()
+            if sgb in _SHIFT_GB_TO_MAIN:
+                code2main[sid] = _SHIFT_GB_TO_MAIN[sgb]
+                _sup_cnt += 1
+                continue
+            # ② default_shift 기반 판정
+            ds = str(getattr(s, "default_shift", "") or "").strip().upper()
+            if ds in ("OFF", "주"):
+                ds = "O"
+            if ds in ("D", "E", "N", "M", "O"):
+                code2main[sid] = ds
+                _sup_cnt += 1
+                continue
+            # ③ type 기반 판정 (최후 폴백)
+            shift_type = str(getattr(s, "type", "") or "").strip()
+            if shift_type == "근무":
+                # shift_gb·default_shift 모두 미설정이지만 근무 shift → 'WK'(근무 마커)
+                # 'W'는 엔진 내 주휴(Weekly Off) 타입으로 사용 중이므로 충돌 회피
+                # _calc_tail_metrics에서 연속근무 카운트가 끊기지 않도록 함
+                code2main[sid] = "WK"
+                _sup_cnt += 1
+                print(f"[CrossMonth][WARN] shift_id={sid}: shift_gb/default_shift 미설정, type=근무 → 'WK' 폴백 (데이터 확인 권장)")
+            elif shift_type in ("휴가", "공가"):
+                code2main[sid] = "O"
+                _sup_cnt += 1
+        if _sup_cnt > 0:
+            _extra = {k: v for k, v in code2main.items() if k not in ('D', 'E', 'N', 'M', 'O', 'OFF', '주')}
+            print(f"[CrossMonth] Shift 테이블에서 {_sup_cnt}건 추가 코드 정규화 보강: {_extra}")
+    except Exception as e:
+        print(f"[CrossMonth][WARN] Shift 테이블 보강 실패(무시): {e}")
 
     # 이전 달 최신 스케줄 조회 → 마지막 N일 시퀀스
     try:
