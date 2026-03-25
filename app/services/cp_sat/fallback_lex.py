@@ -2130,5 +2130,21 @@ def optimize_fallback_lex_hard_first(
         off_idx=off_idx,
         logger_prefix=logger_prefix,
     )
+    # ── 후처리 완료 후 최종 커버리지 상태 로깅 ──
+    try:
+        final_viols = roster_system._find_violations()
+        final_cov_viols = [v for v in final_viols if v.get('type') == 'shift_requirement']
+        if final_cov_viols:
+            print(f"{logger_prefix} [최종 커버리지 부족] 후처리 후 {len(final_cov_viols)}건 부족:")
+            for v in sorted(final_cov_viols, key=lambda x: (x['day'], x['shift'])):
+                print(
+                    f"  day={v['day']+1}, shift={v['shift']}, "
+                    f"required={v['required']}, actual={v['actual']}, "
+                    f"gap={v['required'] - v['actual']}"
+                )
+        else:
+            print(f"{logger_prefix} [최종 커버리지] 후처리 후 커버리지 부족 없음 ✓")
+    except Exception as exc:
+        print(f"{logger_prefix} [최종 커버리지 로깅 실패]: {exc}")
     print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
     return best_short == 0 and best_safe_sum == 0

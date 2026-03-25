@@ -100,7 +100,12 @@ def postprocess_rebalance_off(
             return int(ones[0])
         return None
 
-    base_viol = len(roster_system._find_violations())
+    def _count_coverage_violations(viols):
+        return sum(1 for v in viols if v.get('type') == 'shift_requirement')
+
+    _base_viols = roster_system._find_violations()
+    base_viol = len(_base_viols)
+    base_cov_viol = _count_coverage_violations(_base_viols)
     accepted = 0
     N = len(roster_system.nurses)
 
@@ -149,17 +154,23 @@ def postprocess_rebalance_off(
                 # 스왑 적용
                 _swap_off(n_idx, work_day, off_day, shift_idx)
                 new_run = _max_run(n_idx)
-                new_viol = len(roster_system._find_violations())
+                _new_viols = roster_system._find_violations()
+                new_viol = len(_new_viols)
+                new_cov_viol = _count_coverage_violations(_new_viols)
 
                 ok = True
                 if new_run and new_run[2] > K:
                     ok = False
                 if new_viol > base_viol:
                     ok = False
+                # 커버리지 위반은 절대 증가 불허 (다른 위반 감소와 상쇄 방지)
+                if new_cov_viol > base_cov_viol:
+                    ok = False
 
                 if ok:
                     accepted += 1
                     base_viol = new_viol
+                    base_cov_viol = new_cov_viol
                     print(
                         f"{logger_prefix} [PostOff] swap accepted n={n_idx}, "
                         f"work_day={work_day+1}→O, off_day={off_day+1}→{cfg.shift_types[shift_idx]}, "
