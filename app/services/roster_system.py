@@ -478,6 +478,36 @@ class RosterSystem:
                     if not self._check_two_offs_after_two_night(n_idx, end_d):
                         violations.append({'type': 'rec_2n2o', 'nurse_idx': n_idx, 'day': end_d})
 
+        # ── 4O 연속 OFF 위반 체크 (당월 내 + 월경계) ──
+        if off_idx is not None:
+            # 고정 OFF 셀 (vacation/공가 포함): 후처리에서 이동되지 않으므로
+            # 4O 위반 감지 시에는 모든 OFF를 동일하게 취급
+            # 당월 내 4연속 OFF 체크
+            for n_idx in range(len(self.nurses)):
+                for d in range(self.num_days - 3):
+                    if all(self.roster[n_idx, d + k, off_idx] == 1 for k in range(4)):
+                        violations.append({'type': 'consecutive_4off', 'nurse_idx': n_idx, 'day': d})
+            # 월경계 4O 체크: 전월 꼬리 연속 OFF + 현월 초 연속 OFF 합산 4 이상
+            prev_off_tail = getattr(self, 'prev_month_off_tail_by_idx', {}) or {}
+            for n_idx, tail_cnt in prev_off_tail.items():
+                if not isinstance(tail_cnt, int) or tail_cnt <= 0 or tail_cnt >= 4:
+                    continue
+                if n_idx < 0 or n_idx >= len(self.nurses):
+                    continue
+                current_head_offs = 0
+                for d in range(min(4 - tail_cnt, self.num_days)):
+                    if self.roster[n_idx, d, off_idx] == 1:
+                        current_head_offs += 1
+                    else:
+                        break
+                if tail_cnt + current_head_offs >= 4:
+                    violations.append({
+                        'type': 'cross_month_4off',
+                        'nurse_idx': n_idx,
+                        'prev_tail': tail_cnt,
+                        'current_head': current_head_offs,
+                    })
+
         return violations
 
 

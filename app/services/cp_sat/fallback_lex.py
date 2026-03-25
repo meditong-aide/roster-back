@@ -733,6 +733,56 @@ def optimize_fallback_lex_hard_first(
                         + is_pure_o(n, d + 3)
                         <= 3
                     )
+        # ── 4O 월경계 제약: 전월 꼬리 연속 OFF + 현월 초 연속 OFF 합산 4 이상 금지 (하드) ──
+        _4o_cross_affected_fb: set[int] = set()
+        prev_off_tail = getattr(roster_system, "prev_month_off_tail_by_idx", {}) or {}
+        print(f"{logger_prefix} [4O-cross-month-debug] prev_off_tail_by_idx keys={list(prev_off_tail.keys())}, "
+              f"values={dict(prev_off_tail)}, N={N}")
+        for n in range(N):
+            if preceptee_follow and n in preceptee_indices:
+                continue
+            t = prev_off_tail.get(n, 0)
+            if t <= 0 or t >= 4:
+                continue
+            if join[n] > 0:
+                continue
+            need = 4 - t
+            window_days = list(range(0, min(need, leave[n] + 1)))
+            if len(window_days) < need:
+                continue
+            free_vars = []
+            effective_t = t
+            _detail_per_day = []
+            for wd in window_days:
+                in_structural = (n, wd) in structural_off_cells
+                in_fixed_off = (n, wd) in fixed and fixed[(n, wd)] == off_idx
+                is_fixed_off = in_structural or in_fixed_off
+                if is_fixed_off:
+                    effective_t += 1
+                    _detail_per_day.append(f"day{wd}=고정OFF(struct={in_structural},fixed={in_fixed_off})")
+                else:
+                    free_vars.append(is_pure_o(n, wd))
+                    _detail_per_day.append(f"day{wd}=free")
+            if effective_t >= 4:
+                nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
+                print(f"{logger_prefix} [4O-cross-month-SKIP] nurse_idx={n}, "
+                      f"name={getattr(nu, 'name', '?')}, prev_tail={t}, "
+                      f"effective_t={effective_t}>=4 → 제약 스킵 (이미 4O 불가피), "
+                      f"detail={_detail_per_day}")
+                continue
+            if not free_vars:
+                continue
+            remaining = 3 - effective_t
+            m.Add(sum(free_vars) <= remaining)
+            _4o_cross_affected_fb.add(n)
+            nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
+            print(
+                f"{logger_prefix} [4O-cross-month] nurse_idx={n}, "
+                f"name={getattr(nu, 'name', '?')}, prev_tail={t}, "
+                f"고정OFF={effective_t - t}, free={len(free_vars)}, OFF<={remaining}, "
+                f"detail={_detail_per_day}"
+            )
+
         # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
         # 평일(월~금)에는 OFF를 금지한다.
         #
@@ -1328,18 +1378,31 @@ def optimize_fallback_lex_hard_first(
 
         # 회복 규칙: N3→2O, N2→2O 부족량
         if cfg.two_offs_after_three_nig:
+            _n_offs_after_map_3n = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
                 if preceptee_follow and n in preceptee_indices:
                     continue
                 T0, T1 = join[n], leave[n]
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
-                if n_tail >= 3 and (T0 + 1) <= T1:
+                n_offs_after_3n = _n_offs_after_map_3n.get(n, 0)
+                _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
+                if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1:
                     end_prev_block = m.NewBoolVar(f"end_3n_prev_soft_{n}")
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0, T0 + 1)):
-                        m.Add(
-                            X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
-                        ).OnlyEnforceIf([end_prev_block])
+                        if _3n_rem >= 2:
+                            m.Add(
+                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
+                            ).OnlyEnforceIf([end_prev_block])
+                        else:
+                            m.Add(
+                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1
+                            ).OnlyEnforceIf([end_prev_block])
+                    print(f"{logger_prefix} [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                          f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
+                elif n_tail >= 3 and _3n_rem == 0:
+                    print(f"{logger_prefix} [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                          f"offs_after={n_offs_after_3n} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
                 if n_tail >= 2 and (T0 + 2) <= T1:
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0 + 1, T0 + 2)):
                         m.Add(
@@ -1364,18 +1427,33 @@ def optimize_fallback_lex_hard_first(
                     m.Add(miss == 2 - need).OnlyEnforceIf([xn0, xn1, xn2])
                     safety["rec_3n2o"].append(miss)
         if cfg.two_offs_after_two_nig:
+            _n_offs_after_map = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
                 if preceptee_follow and n in preceptee_indices:
                     continue
                 T0, T1 = join[n], leave[n]
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
-                if n_tail >= 2 and (T0 + 1) <= T1:
+                n_offs_after = _n_offs_after_map.get(n, 0)
+                # 전월 N tail 뒤 이미 소비된 OFF 수를 반영
+                _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
+                if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1:
                     end_prev_block = m.NewBoolVar(f"end_2n_prev_soft_{n}")
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0, T0 + 1)):
-                        m.Add(
-                            X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
-                        ).OnlyEnforceIf([end_prev_block])
+                        if _2n_rem >= 2:
+                            m.Add(
+                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
+                            ).OnlyEnforceIf([end_prev_block])
+                        else:
+                            # _2n_rem == 1: 1개만 추가 필요
+                            m.Add(
+                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1
+                            ).OnlyEnforceIf([end_prev_block])
+                    print(f"{logger_prefix} [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                          f"offs_after={n_offs_after}, rem={_2n_rem}")
+                elif n_tail >= 2 and _2n_rem == 0:
+                    print(f"{logger_prefix} [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                          f"offs_after={n_offs_after} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
                 if n_tail >= 1 and (T0 + 2) <= T1:
                     end_block_b0 = m.NewBoolVar(f"end_2n_soft_b0_{n}")
                     m.Add(end_block_b0 == X(n, T0 + 1, night_idx).Not())
@@ -1580,6 +1658,9 @@ def optimize_fallback_lex_hard_first(
                                 _wr = min(T1, _we)
                                 if _wl <= _wr and not any(_d in weekend_days for _d in range(_wl, _wr + 1)):
                                     _extra_off_fb += 1
+                        # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
+                        if n in _4o_cross_affected_fb:
+                            _extra_off_fb += 1
                         base_cap += _extra_off_fb
                         if n in per_nurse_off_cap_override:
                             base_cap = max(base_cap, per_nurse_off_cap_override[n])

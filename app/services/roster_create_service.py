@@ -1469,6 +1469,7 @@ def _calc_tail_metrics(seq: list[str]) -> dict:
         return {
             'consecutive_work_tail': 0,
             'consecutive_night_tail': 0,
+            'consecutive_off_tail': 0,
             'last_day_shift': None,
             'offs_after_tail_nights': 0,
         }
@@ -1484,6 +1485,13 @@ def _calc_tail_metrics(seq: list[str]) -> dict:
         else:
             # '-' 등 미인식 코드는 연속 끊김 처리
             break
+    # 꼬리 연속 OFF 카운트 (4O 월경계 제약용)
+    cons_off_tail = 0
+    for c in reversed(seq):
+        if c == 'O':
+            cons_off_tail += 1
+        else:
+            break
     # tail 끝의 OFF 카운트
     offs_after_n = 0
     i = len(seq) - 1
@@ -1498,6 +1506,7 @@ def _calc_tail_metrics(seq: list[str]) -> dict:
     return {
         'consecutive_work_tail': cons_work,
         'consecutive_night_tail': cons_n,
+        'consecutive_off_tail': cons_off_tail,
         'last_day_shift': last,
         'offs_after_tail_nights': min(2, offs_after_n),
     }
@@ -1509,7 +1518,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     lookback = int(config_dict.get('cross_month_lookback_days', 6))
     if not enable or lookback <= 0:
         print("이전 월 경계 제약 비활성화 또는 조회일수 0")
-        return {'forced_off': {}, 'forbidden': {}, 'day0_n_fixed_nurse_ids': []}
+        return {'forced_off': {}, 'forbidden': {}, 'day0_n_fixed_nurse_ids': [], 'prev_month_n_offs_after': {}}
 
     # 코드 정규화 맵 구성
     code2main = {}
@@ -1586,11 +1595,18 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     prev_month_last_main: dict[str, str | None] = {}
     prev_month_last_is_off: dict[str, bool] = {}
     prev_month_n_tail: dict[str, int] = {}
+    prev_month_n_offs_after: dict[str, int] = {}  # N tail 뒤 이미 소비된 OFF 수
+    prev_month_off_tail: dict[str, int] = {}
     off_window_constraints: dict[str, list[list[int]]] = {}
     for nurse_id, seq in last_map.items():
         last_code = seq[-1] if seq else None
         prev_month_last_main[nurse_id] = last_code
         prev_month_last_is_off[nurse_id] = bool(last_code == "O")
+        # 꼬리 연속 OFF (4O 월경계 제약용)
+        metrics = _calc_tail_metrics(seq)
+        cons_off = metrics.get('consecutive_off_tail', 0)
+        if cons_off > 0:
+            prev_month_off_tail[nurse_id] = cons_off
     forced_off = defaultdict(list)
     forbidden = defaultdict(lambda: defaultdict(list))
     day0_n_fixed_nurse_ids: list[str] = []
@@ -1687,6 +1703,8 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         last_shift = metrics['last_day_shift']
         offs_after = metrics['offs_after_tail_nights']
         prev_month_n_tail[nurse_id] = int(cons_n or 0)
+        if cons_n > 0:
+            prev_month_n_offs_after[nurse_id] = int(offs_after or 0)
         
         # 디버깅: 이전 달 꼬리 패턴과 계산된 메트릭 출력 (강제 OFF가 생성되는 경우만)
         forced_off_before = len(forced_off.get(nurse_id, []))
@@ -1818,6 +1836,8 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         'prev_month_last_main': prev_month_last_main,
         'prev_month_last_is_off': prev_month_last_is_off,
         'prev_month_n_tail': prev_month_n_tail,
+        'prev_month_n_offs_after': prev_month_n_offs_after,
+        'prev_month_off_tail': prev_month_off_tail,
         'off_window_constraints': off_window_constraints,
         'day0_n_fixed_nurse_ids': day0_n_fixed_nurse_ids,
     }
@@ -2140,6 +2160,12 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     prev_month_n_tail = cross_month_constraints.get("prev_month_n_tail") or {}
     if prev_month_n_tail:
         config_dict["prev_month_n_tail"] = prev_month_n_tail
+    prev_month_n_offs_after = cross_month_constraints.get("prev_month_n_offs_after") or {}
+    if prev_month_n_offs_after:
+        config_dict["prev_month_n_offs_after"] = prev_month_n_offs_after
+    prev_month_off_tail = cross_month_constraints.get("prev_month_off_tail") or {}
+    if prev_month_off_tail:
+        config_dict["prev_month_off_tail"] = prev_month_off_tail
     off_window_constraints = cross_month_constraints.get("off_window_constraints") or {}
     if off_window_constraints:
         config_dict["off_window_constraints"] = off_window_constraints
