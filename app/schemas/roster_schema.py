@@ -118,9 +118,6 @@ class RosterRequest(BaseModel):
     use_fixed_wanted: bool = Field(
         default=False, description="(미사용) 확정 원티드가 존재하면 자동 적용됨"
     )
-    include_an: bool = Field(
-        default=False, description="AN(간호조무사)을 근무표 생성에 포함할지 여부"
-    )
 
 
 class PreferenceSubmit(BaseModel):

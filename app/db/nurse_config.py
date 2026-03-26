@@ -32,7 +32,6 @@ class Nurse:
     head_nurse_off_pattern: Optional[str] = None  # 'weekend', 'mixed', 'normal'
     is_weekend_off: bool = False
     preceptor_id: Optional[str] = None  # 프리셉터 nurse_id (프리셉티인 경우 설정됨)
-    role_group: str = "RN"
 
     @classmethod
     def from_db_model(cls, db_nurse, index: int):
@@ -50,7 +49,6 @@ class Nurse:
             personal_off_adjustment=db_nurse.personal_off_adjustment,
             resignation_date=db_nurse.resignation_date if db_nurse.resignation_date else None,
             joining_date=db_nurse.joining_date if db_nurse.joining_date else None,
-            role_group=getattr(db_nurse, "role", "RN") if getattr(db_nurse, "role", "RN") in ("RN", "AN", "ETC") else "RN",
         )
 
     def __post_init__(self):

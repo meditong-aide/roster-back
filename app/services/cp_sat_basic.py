@@ -551,9 +551,6 @@ class CPSATBasicEngine:
             "next_month_head_requirements",
             config_data.get("next_month_head_requirements") or [],
         )
-        setattr(cfg, "include_an", bool(config_data.get("include_an", False)))
-        setattr(cfg, "an_shift_requirements", config_data.get("an_shift_requirements") or {})
-        setattr(cfg, "an_shift_requirements_by_day", config_data.get("an_shift_requirements_by_day") or [])
         setattr(cfg, "shift_definitions", config_data.get("shift_definitions") or [])
         return cfg
     
@@ -635,7 +632,6 @@ class CPSATBasicEngine:
                 'resignation_date': _to_date(nurse_data.get('resignation_date')),
                 'team_id': nurse_data.get('team_id'),
                 'preceptor_id': nurse_data.get('preceptor_id'),
-                'role_group': nurse_data.get('role') if nurse_data.get('role') in ('RN', 'AN', 'ETC') else 'RN',
             }
 
             nurses.append(Nurse(**nurse_dict))
@@ -2479,9 +2475,6 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     zero_demand_block_codes = {"D", "E", "N", "M"}
     cfg = rs.config
     next_month_head_req = getattr(cfg, "next_month_head_requirements", None) or []
-    include_an = bool(getattr(cfg, "include_an", False))
-    an_indices = [n for n, nu in enumerate(rs.nurses) if getattr(nu, "role_group", "RN") == "AN"]
-    rn_indices = [n for n, nu in enumerate(rs.nurses) if getattr(nu, "role_group", "RN") != "AN"]
     for d in range(D):
         # 일자별 요구치: 룩어헤드 일자는 next_month_head_requirements 또는 기본값
         if d >= D_phys and isinstance(next_month_head_req, list) and (d - D_phys) < len(next_month_head_req):
@@ -2495,20 +2488,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 continue
             s = rs.config.shift_types.index(code)
             req_raw = max(0, int(req or 0))
-            _coverage_indices = rn_indices if include_an and an_indices else range(N)
-            if include_an and an_indices:
-                _fixed_cov_cnt = sum(
-                    1
-                    for (n2, d2), s_idx in fixed.items()
-                    if d2 == d and s_idx == s and n2 in _coverage_indices
-                    and (not exclude_preceptee_from_den or n2 not in preceptee_indices)
-                )
-            else:
-                _fixed_cov_cnt = fixed_cnt_adj[d][s]
-            need = req_raw - _fixed_cov_cnt
+            need = req_raw - fixed_cnt_adj[d][s]
             assigned = sum(
                 X(n, d, s)
-                for n in _coverage_indices
+                for n in range(N)
                 if join[n] <= d <= leave[n] and (n, d) not in fixed
                 and (not exclude_preceptee_from_den or n not in preceptee_indices)
             )
@@ -2516,7 +2499,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 if m_bucket_indices:
                     assigned_m_bucket = sum(
                         X(n, d, s2)
-                        for n in _coverage_indices
+                        for n in range(N)
                         if join[n] <= d <= leave[n]
                         and (n, d) not in fixed
                         and (not exclude_preceptee_from_den or n not in preceptee_indices)
@@ -2524,19 +2507,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                 else:
                     assigned_m_bucket = assigned
-                if include_an and an_indices:
-                    fixed_m_bucket = sum(
-                        1
-                        for (n2, d2), s_idx in fixed.items()
-                        if d2 == d and n2 in _coverage_indices and s_idx in (m_bucket_indices or [s])
-                        and (not exclude_preceptee_from_den or n2 not in preceptee_indices)
-                    )
-                else:
-                    fixed_m_bucket = (
-                        sum(int(fixed_cnt_adj[d][s2] or 0) for s2 in m_bucket_indices)
-                        if m_bucket_indices
-                        else int(fixed_cnt_adj[d][s] or 0)
-                    )
+                fixed_m_bucket = (
+                    sum(int(fixed_cnt_adj[d][s2] or 0) for s2 in m_bucket_indices)
+                    if m_bucket_indices
+                    else int(fixed_cnt_adj[d][s] or 0)
+                )
                 if req_raw == 0:
                     m.Add(assigned_m_bucket == 0)
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
@@ -2558,39 +2533,6 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             ov = m.NewIntVar(0, N, f"over_{d}_{code}")
             m.Add(ov >= assigned - need)
             over_vars_by_day.setdefault(d, {})[code] = ov
-
-    if include_an and an_indices:
-        an_req_by_day = getattr(cfg, "an_shift_requirements_by_day", None) or []
-        an_req_base = getattr(cfg, "an_shift_requirements", None) or {}
-        for d in range(D):
-            if isinstance(an_req_by_day, list) and d < len(an_req_by_day) and isinstance(an_req_by_day[d], dict):
-                an_need_map = an_req_by_day[d]
-            else:
-                an_need_map = an_req_base
-            for code, req in an_need_map.items():
-                if code not in rs.config.shift_types:
-                    continue
-                s = rs.config.shift_types.index(code)
-                req_raw = max(0, int(req or 0))
-                an_fixed_cnt = sum(
-                    1
-                    for (n2, d2), s_idx in fixed.items()
-                    if d2 == d and s_idx == s and n2 in an_indices
-                    and (not exclude_preceptee_from_den or n2 not in preceptee_indices)
-                )
-                an_need = req_raw - an_fixed_cnt
-                an_assigned = sum(
-                    X(n, d, s)
-                    for n in an_indices
-                    if join[n] <= d <= leave[n] and (n, d) not in fixed
-                    and (not exclude_preceptee_from_den or n not in preceptee_indices)
-                )
-                if code == "M":
-                    m.Add(an_assigned + int(an_fixed_cnt) <= req_raw)
-                    continue
-                if an_need <= 0:
-                    continue
-                m.Add(an_assigned >= an_need)
 
     # shorthand indices
     idx = {c: rs.config.shift_types.index(c) for c in ('D', 'E', 'N', 'O')}
@@ -2866,7 +2808,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
             # 연속 Night
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
-            if n_tail > 0:
+            _n_offs_after_cnight = (getattr(rs, "prev_month_n_offs_after_by_idx", {}) or {}).get(n, 0)
+            # offs_after >= 1 이면 야간 연속이 이미 끊긴 상태 → 월경계 연속N 제약 스킵
+            if n_tail > 0 and _n_offs_after_cnight == 0:
                 for w in range(1, n_tail + 1):
                     april_window_end = L - w
                     cap = L - w
@@ -3004,12 +2948,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             elif n_tail >= 3 and _3n_rem == 0:
                 print(f"[CP-SAT-Basic] [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after_3n} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
-            if n_tail >= 2 and (T0 + 2) <= T1:
+            if n_tail >= 2 and n_offs_after_3n < 2 and (T0 + 2) <= T1:
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
                     m.Add(
                         countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
                     ).OnlyEnforceIf([X(n, T0, night)])
-            if n_tail == 1 and (T0 + 3) <= T1:
+            if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 2, T0 + 3)):
                     m.Add(
                         countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
@@ -3046,7 +2990,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             elif n_tail >= 2 and _2n_rem == 0:
                 print(f"[CP-SAT-Basic] [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
-            if n_tail >= 1 and (T0 + 2) <= T1:
+            if n_tail >= 1 and n_offs_after < 2 and (T0 + 2) <= T1:
                 end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
                 m.Add(end_block_b0 == X(n, T0 + 1, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
