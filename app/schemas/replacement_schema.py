@@ -66,6 +66,9 @@ class CandidateScoreBreakdown(BaseModel):
 class CandidateRecommendation(BaseModel):
     nurse_id: str
     name: str
+    candidate_grade: Optional[int] = None
+    current_assigned_shift_code: Optional[str] = None
+    current_assigned_shift_pk_id: Optional[str] = None
     final_score: float
     rank: int
     tags: List[str] = Field(default_factory=list)

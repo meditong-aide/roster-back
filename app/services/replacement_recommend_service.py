@@ -46,7 +46,9 @@ logger = logging.getLogger(__name__)
 class CandidateContext:
     nurse_id: str
     nurse_name: str
+    nurse_grade: Optional[int]
     assigned_shift: str
+    assigned_shift_pk_id: Optional[str]
     assigned_is_off: bool
     assigned_is_vacation: bool
     rule_safety: float
@@ -926,13 +928,23 @@ def recommend_replacement_candidates(
                 vacation_penalty = 70.0
                 tags.append("vacation_penalized")
 
+            candidate_grade_value = None
+            raw_candidate_grade = getattr(nurse, "grade", None)
+            if raw_candidate_grade is not None:
+                try:
+                    candidate_grade_value = int(raw_candidate_grade)
+                except Exception:
+                    candidate_grade_value = None
+
             candidate_pool.append(
                 (
                     candidate_id,
                     CandidateContext(
                         nurse_id=candidate_id,
                         nurse_name=str(getattr(nurse, "name", candidate_id)),
+                        nurse_grade=candidate_grade_value,
                         assigned_shift=assigned_shift,
+                        assigned_shift_pk_id=assigned_shift_pk,
                         assigned_is_off=assigned_is_off,
                         assigned_is_vacation=assigned_is_vacation,
                         rule_safety=rule_safety,
@@ -976,6 +988,9 @@ def recommend_replacement_candidates(
                 CandidateRecommendation(
                     nurse_id=ctx.nurse_id,
                     name=ctx.nurse_name,
+                    candidate_grade=ctx.nurse_grade,
+                    current_assigned_shift_code=ctx.assigned_shift,
+                    current_assigned_shift_pk_id=ctx.assigned_shift_pk_id,
                     final_score=_final_score(ctx),
                     rank=idx,
                     tags=ctx.tags if req.options.include_explanations else [],
