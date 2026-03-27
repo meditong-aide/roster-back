@@ -1633,11 +1633,27 @@ class CPSATBasicEngine:
         HARD_TYPES = {
             'shift_requirement', 'max_consecutive_night',
             'max_consecutive_work', 'night_after_limit',
-            'day_after_evening', 'night_monthly_limit'
+            'day_after_evening', 'night_monthly_limit',
+            'night_nd',  # N→D 전환 위반 — fallback에서 더 잘 처리
         }
+        FALLBACK_VIOL_THRESHOLD = 0  # 0=hard violation 0이어야 메인 모델 채택
+
+        def _collect_hard_violations():
+            return [v for v in roster_system._find_violations()
+                    if v['type'] in HARD_TYPES]
+
         def hard_violation_cnt():
-            return sum(1 for v in roster_system._find_violations()
-                       if v['type'] in HARD_TYPES)
+            return len(_collect_hard_violations())
+
+        def _hint_days_from_violations() -> list[int]:
+            """hard violation이 발생한 day 목록 (이웃 탐색 힌트용)"""
+            days = set()
+            for v in _collect_hard_violations():
+                d = v.get('day')
+                if d is not None and 0 <= d < roster_system.num_days:
+                    days.add(d)
+            return list(days)
+
         best_viol = hard_violation_cnt()
         best_roster = roster_system.roster.copy()
         # ② RL 정책
@@ -1652,10 +1668,17 @@ class CPSATBasicEngine:
                 f"{self.logger_prefix} [Progress] 반복 없음: "
                 f"best_viol={best_viol}, remaining={remaining}s"
             )
-            return best_viol == 0
+            return best_viol <= FALLBACK_VIOL_THRESHOLD
         for it in range(max_iter):
             try:
                 n_sel, d_sel = policy.select()
+                # hard violation이 있는 day를 이웃 탐색 대상에 우선 포함
+                hint_days = _hint_days_from_violations()
+                if hint_days:
+                    for hd in hint_days:
+                        if hd not in d_sel:
+                            d_sel.append(hd)
+                    policy.d_w[hint_days] += 1.0  # 해당 day 가중치 부스트
                 print(
                     f"{self.logger_prefix} [Progress] iter={it + 1}/{max_iter}, "
                     f"n_sel={len(n_sel)}, d_sel={len(d_sel)}"
@@ -1720,7 +1743,7 @@ class CPSATBasicEngine:
                 f"{self.logger_prefix} [Progress] 종료: best_viol={best_viol}, "
                 f"max_iter={max_iter}, per_iter={per_iter}s"
             )
-        return best_viol == 0
+        return best_viol <= FALLBACK_VIOL_THRESHOLD
 
 
     # ────────────────────────────────────────────────────────────────────

@@ -1081,10 +1081,14 @@ def optimize_fallback_lex_hard_first(
                     continue
                 if need <= 0:
                     continue
+                OVER_SUPPLY_MARGIN = 2
                 sh = m.NewIntVar(0, N, f"short_{d}_{code}")
                 ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-                # Coverage 우선: assigned + shortage >= need (hard), oversupply 추적은 선택
+                # Coverage 하한 (hard)
                 m.Add(assigned + sh >= need)
+                # Coverage 상한 (hard): 요구 + 마진까지만 허용
+                m.Add(assigned <= need + OVER_SUPPLY_MARGIN)
+                # 초과량 추적 (소프트)
                 m.Add(assigned - ov <= need)
                 short_terms.append(sh)
                 over_terms.append(ov)
@@ -1661,10 +1665,11 @@ def optimize_fallback_lex_hard_first(
         # stage별 목적/고정
         if stage == 1:
             # m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))
-            OFF_PENALTY=30
+            OFF_PENALTY = 30
+            OVER_PENALTY = 30  # over 1건 = OFF 1건과 동등 → 불필요한 과잉 배정 억제
             m.Minimize(
             FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms)
-            + sum(over_terms)
+            + OVER_PENALTY * sum(over_terms)
             + OFF_PENALTY * sum(
                 X(n, d, off_idx)
                 for n in range(N)
