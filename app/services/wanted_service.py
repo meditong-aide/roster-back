@@ -347,6 +347,14 @@ def _persist_shift_results(
     detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="shift")
     rows = 0
 
+    # shifts.id 매핑
+    _nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    _grp_id = _nurse_row.group_id if _nurse_row else None
+    _shift_id_to_table_id: Dict[str, int] = {}
+    if _grp_id:
+        _shift_q = db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == _grp_id)
+        _shift_id_to_table_id = {sid: tid for sid, tid in _shift_q.all()}
+
     print(f"shift_map 저장 시작 (request_id={request_id}): {shift_map}")
 
     for shift_code, by_day in (shift_map or {}).items():
@@ -378,6 +386,7 @@ def _persist_shift_results(
                 existing.score = score
                 existing.partial_request = partial_request
                 existing.comment = comment # 사유작성
+                existing.shifts_table_id = _shift_id_to_table_id.get(shift_code)
             else:
                 db.add(NurseShiftRequest(
                     nurse_id=nurse_id,
@@ -388,6 +397,7 @@ def _persist_shift_results(
                     score=score,
                     partial_request=partial_request,
                     comment=comment, # 사유작성
+                    shifts_table_id=_shift_id_to_table_id.get(shift_code),
                 ))
                 detailed_id += 1
             rows += 1
@@ -593,7 +603,8 @@ def _copy_existing_requests_to_new(
                 shift=old_row.shift,
                 score=old_row.score,
                 partial_request=old_row.partial_request,
-                comment=old_row.comment
+                comment=old_row.comment,
+                shifts_table_id=old_row.shifts_table_id,
             ))
             shift_count += 1
             detailed_id_shift += 1
@@ -1768,6 +1779,7 @@ def get_wanted_adjustment_service(
                     nurse_id=fe.nurse_id,
                     shift_date=fe.shift_date,
                     shift_id=fe.shift_id,
+                    shifts_table_id=fe.shifts_table_id,
                     is_applied=fe.is_applied,
                     source_type=fe.source_type,
                     original_shift_id=fe.original_shift_id,
@@ -1801,6 +1813,7 @@ def get_wanted_adjustment_service(
                         nurse_id=sr.nurse_id,
                         shift_date=sr.shift_date,
                         shift_id=sr.shift,
+                        shifts_table_id=sr.shifts_table_id,
                         is_applied=True,
                         source_type='original',
                         original_shift_id=None,
@@ -1893,6 +1906,14 @@ def save_fixed_wanted_service(
 
     print(f"원본 맵 구축 완료: {len(original_map)}건")
 
+    # ── shifts.id 매핑 (shift_id → shifts.id) ──
+    group_row = db.query(Group).filter(Group.group_id == group_id).first()
+    _office_id = group_row.office_id if group_row else None
+    _shift_q = db.query(Shift).filter(Shift.group_id == group_id)
+    if _office_id:
+        _shift_q = _shift_q.filter(Shift.office_id == _office_id)
+    _shift_id_to_table_id = {s.shift_id: s.id for s in _shift_q.all()}
+
     # ── 기존 FixedWantedEntry 삭제 ──
     deleted_count = db.query(FixedWantedEntry).filter(
         FixedWantedEntry.group_id == group_id,
@@ -1949,6 +1970,7 @@ def save_fixed_wanted_service(
             nurse_id=entry.nurse_id,
             shift_date=entry.shift_date,
             shift_id=entry.shift_id,
+            shifts_table_id=_shift_id_to_table_id.get(entry.shift_id),
             is_applied=entry.is_applied,
             source_type=resolved_source_type,
             original_shift_id=resolved_original_shift_id,
@@ -2037,6 +2059,7 @@ def get_fixed_wanted_for_roster_service(
             "nurse_id": entry.nurse_id,
             "shift_date": entry.shift_date,
             "shift": entry.shift_id,
+            "shifts_table_id": entry.shifts_table_id,
             "score": 10.0,
             "reason": entry.reason,
         })

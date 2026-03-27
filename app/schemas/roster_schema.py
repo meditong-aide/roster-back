@@ -473,6 +473,7 @@ class FixedWantedEntryResponse(BaseModel):
     nurse_id: str
     shift_date: date
     shift_id: str
+    shifts_table_id: Optional[int] = None
     is_applied: bool
     source_type: str
     original_shift_id: Optional[str] = None

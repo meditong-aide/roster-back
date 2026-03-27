@@ -1023,6 +1023,34 @@ class CPSATBasicEngine:
                 if tcnt > 0:
                     prev_n_tail_by_idx[n_idx] = tcnt
             roster_system.prev_month_n_tail_by_idx = prev_n_tail_by_idx
+            # N tail 뒤 이미 소비된 OFF 수 (2N→2OFF 크로스먼스 중복 방지용)
+            prev_n_offs_after_raw = config_data.get("prev_month_n_offs_after") or {}
+            prev_n_offs_after_by_idx: dict[int, int] = {}
+            for dbid, oa_cnt in (prev_n_offs_after_raw or {}).items():
+                n_idx = _get_nurse_idx(dbid)
+                if n_idx is None:
+                    continue
+                try:
+                    oacnt = int(oa_cnt or 0)
+                except Exception:
+                    oacnt = 0
+                if oacnt > 0:
+                    prev_n_offs_after_by_idx[n_idx] = oacnt
+            roster_system.prev_month_n_offs_after_by_idx = prev_n_offs_after_by_idx
+            # 전월 꼬리 연속 OFF 카운트 (4O 월경계 제약용)
+            prev_off_tail_raw = config_data.get("prev_month_off_tail") or {}
+            prev_off_tail_by_idx: dict[int, int] = {}
+            for dbid, off_cnt in (prev_off_tail_raw or {}).items():
+                n_idx = _get_nurse_idx(dbid)
+                if n_idx is None:
+                    continue
+                try:
+                    ocnt = int(off_cnt or 0)
+                except Exception:
+                    ocnt = 0
+                if ocnt > 0:
+                    prev_off_tail_by_idx[n_idx] = ocnt
+            roster_system.prev_month_off_tail_by_idx = prev_off_tail_by_idx
             # 꼬리 연속근무 보정용 OFF 윈도우 (월초 0..K-w 구간 OFF≥1)
             off_window_raw = config_data.get("off_window_constraints") or {}
             off_window_by_idx: dict[int, list[tuple[int, int]]] = {}
@@ -1160,10 +1188,12 @@ class CPSATBasicEngine:
         # 9. CP-SAT으로 최적화 (새로운 제약사항 포함)
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
+            setattr(roster_system, "_used_fallback", False)
             success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
             # fallback_success = False
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
+                setattr(roster_system, "_used_fallback", True)
                 self._optimize_fallback_lex_hard_first(
                     roster_system,
                     time_limit_seconds=time_limit_seconds,
@@ -2033,6 +2063,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     fixed, fixed_cnt = {}, [[0]*S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
+    fixed_wanted_cells: set[tuple[int, int]] = set()
     for c in getattr(rs,'fixed_cells',[]) or []:
         n,d = c['nurse_index'], c['day_index']
         s_main = _normalize_fixed_to_main(c.get("shift"))
@@ -2047,6 +2078,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
         raw_code = str(c.get("shift") or "").strip().upper()
         fixed_type_by_cell[(n, d)] = code2type.get(raw_code) or code2type.get(s_main)
+        if str(c.get("fixed_source") or "").strip().lower() == "fixed_wanted":
+            fixed_wanted_cells.add((n, d))
         # print('이미 있음 cpsat- fixed_type_by_cell', fixed_type_by_cell)
     fixed_off_cells: set[tuple[int, int]] = set()
     fixed_vacation_off_cells: set[tuple[int, int]] = set()
@@ -2130,17 +2163,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
     isolated_off_slacks: list = []
 
-    # ── 프리셉티 인덱스 사전 계산 (고정 셀 적용 전에 계산해야 면제 가능) ──
+    # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
     preceptee_follow = bool(getattr(rs.config, 'preceptee_on', False))
     preceptee_indices: set[int] = set()
-    if preceptee_follow:
-        _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
-        for n, nu in enumerate(rs.nurses):
-            pid = getattr(nu, 'preceptor_id', None)
-            if pid and pid in _id_to_idx_pre:
-                preceptee_indices.add(n)
-        preceptee_indices = set(preceptee_indices)
-        print(f"[FIX] 프리셉티 면제 로직 완전 제거 → 모든 프리셉티에 팔로우 제약 적용 (면제 대상: {len(preceptee_indices)}명)")
+    _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
+    for n, nu in enumerate(rs.nurses):
+        pid = getattr(nu, 'preceptor_id', None)
+        if pid and pid in _id_to_idx_pre:
+            preceptee_indices.add(n)
+    preceptee_indices = set(preceptee_indices)
+    if preceptee_indices:
+        print(f"[FIX] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
 
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
@@ -2197,6 +2230,56 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     for k in range(4)
                 ]
                 m.Add(sum(off_like) <= 3)
+
+    # ── 4O 월경계 제약: 전월 꼬리 연속 OFF + 현월 초 연속 OFF 합산 4 이상 금지 ──
+    _4o_cross_affected: set[int] = set()  # OffCap 보정 대상
+    if off_idx_full is not None:
+        prev_off_tail = getattr(rs, "prev_month_off_tail_by_idx", {}) or {}
+        print(f"[CP-SAT-Basic] [4O-cross-month-debug] prev_off_tail keys={list(prev_off_tail.keys())}, "
+              f"values={dict(prev_off_tail)}, N={N}")
+        for n in range(N):
+            if preceptee_follow and n in preceptee_indices:
+                continue
+            t = prev_off_tail.get(n, 0)
+            if t <= 0 or t >= 4:
+                continue
+            if join[n] > 0:
+                continue
+            need = 4 - t
+            window_days = list(range(0, min(need, leave[n] + 1)))
+            if len(window_days) < need:
+                continue
+            free_vars = []
+            effective_t = t
+            _detail_per_day = []
+            for wd in window_days:
+                in_off_weekly = (n, wd) in off_or_weekly
+                in_fixed_off = (n, wd) in fixed and fixed[(n, wd)] == off_idx_full
+                is_fixed_off = in_off_weekly or in_fixed_off
+                if is_fixed_off:
+                    effective_t += 1
+                    _detail_per_day.append(f"day{wd}=고정OFF(off_weekly={in_off_weekly},fixed={in_fixed_off})")
+                else:
+                    free_vars.append(countable_off(n, wd))
+                    _detail_per_day.append(f"day{wd}=free")
+            if effective_t >= 4:
+                nu = rs.nurses[n] if n < len(rs.nurses) else None
+                print(f"[CP-SAT-Basic] [4O-cross-month-SKIP] nurse_idx={n}, "
+                      f"name={getattr(nu, 'name', '?')}, prev_tail={t}, "
+                      f"effective_t={effective_t}>=4 → 제약 스킵, detail={_detail_per_day}")
+                continue
+            if not free_vars:
+                continue
+            remaining = 3 - effective_t
+            m.Add(sum(free_vars) <= remaining)
+            _4o_cross_affected.add(n)
+            nu = rs.nurses[n] if n < len(rs.nurses) else None
+            print(
+                f"[CP-SAT-Basic] [4O-cross-month] nurse_idx={n}, "
+                f"name={getattr(nu, 'name', '?')}, prev_tail={t}, "
+                f"고정OFF={effective_t - t}, free={len(free_vars)}, OFF<={remaining}, "
+                f"detail={_detail_per_day}"
+            )
 
     # ───────────── 2-A2. 고립 OFF 금지(슬랙 허용) ─────────────
     enforce_clustered_offs = bool(getattr(rs.config, "enforce_clustered_offs", False))
@@ -2362,13 +2445,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         print(f"[CP-SAT-Basic] 프리셉티 팔로우 모드: {len(preceptee_indices)}명, "
               f"제약 {constraint_count}개 추가, 개별 하드제약 면제 적용")
 
-    # preceptee_shift_count=False 이면 DEN 하드제약에서 프리셉티 제외
+    # preceptee_shift_count=False 이면 DEN 하드제약에서 프리셉티 제외 (preceptee_on 무관)
     _pte_shift_count = getattr(rs.config, 'preceptee_shift_count', True)
-    exclude_preceptee_from_den = preceptee_follow and not _pte_shift_count
+    exclude_preceptee_from_den = (not _pte_shift_count) and bool(preceptee_indices)
     _pte_cnt = len(preceptee_indices)
     if exclude_preceptee_from_den:
         print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=False → 프리셉티 {_pte_cnt}명 제외, DEN 대상: {N - _pte_cnt}명/{N}명")
-    elif preceptee_follow:
+    elif preceptee_indices:
         print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=True → 프리셉티 {_pte_cnt}명 포함, DEN 대상: {N}명/{N}명")
     # 프리셉티 제외 시 fixed_cnt도 재계산
     if exclude_preceptee_from_den:
@@ -2606,6 +2689,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
                         )
                         continue
+                    # off_window 범위 내 평일: 전월 꼬리 연속근무 보정을 위해 OFF 허용 필요
+                    _ow_ranges = (getattr(rs, "off_window_constraints", {}) or {}).get(n, []) or []
+                    if any(ws <= d <= we for (ws, we) in _ow_ranges):
+                        print(
+                            f"[WeekendOff][HardDebug] 평일 OFF 금지 스킵(off_window 월경계 보정): "
+                            f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, d={d+1}"
+                        )
+                        continue
                     wd = (rs.target_month + timedelta(days=d)).weekday()
                     print(
                         f"[WeekendOff][HardDebug] X(n,d,off)==0 추가: "
@@ -2614,13 +2705,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                     m.Add(X(n, d, off) == 0)
         # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
+        # 주말 휴무자도 월경계 연속근무 초과 가능 → 동일 적용
         try:
             off_windows = getattr(rs, "off_window_constraints", {}) or {}
             if off_idx_full is not None:
                 for (w_start, w_end) in off_windows.get(n, []) or []:
-                    nu = rs.nurses[n]
-                    if bool(getattr(nu, "is_weekend_off", False)):
-                        continue
                     left = max(T0, w_start)
                     right = min(T1, w_end)
                     if left > right:
@@ -2633,21 +2722,20 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     m.Add(sum(X(n, d, off_idx_full) for d in free_days) >= 1)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
-        # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자는 제외: 매 주말 OFF로 이미 휴식 보장)
+        # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자 포함: 월경계 연속근무 초과 방지)
         # 고정 셀 우선: D/E/N/O 불문하고 fixed_cells에 포함된 날은 자유 일수에서 제외
         # → 유저가 K+1일 이상 연속 근무를 고정한 경우, 해당 윈도우는 제약 적용하지 않음
-        if not bool(getattr(nu, "is_weekend_off", False)):
-            for d0 in range(T0, T1-K+1):
-                window = [d0 + t for t in range(K + 1)]
-                # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
-                if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
-                    continue
-                # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 대상으로 합산
-                free_days_w = [d for d in window if (n, d) not in fixed]
-                if not free_days_w:
-                    # 윈도우 전체가 고정(D/E/N 연속 포함) → 유저 고정 우선, 제약 무시
-                    continue
-                m.Add(sum(X(n, d, off) for d in free_days_w) >= 1)
+        for d0 in range(T0, T1-K+1):
+            window = [d0 + t for t in range(K + 1)]
+            # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
+            if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
+                continue
+            # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 대상으로 합산
+            free_days_w = [d for d in window if (n, d) not in fixed]
+            if not free_days_w:
+                # 윈도우 전체가 고정(D/E/N 연속 포함) → 유저 고정 우선, 제약 무시
+                continue
+            m.Add(sum(X(n, d, off) for d in free_days_w) >= 1)
 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):
@@ -2720,7 +2808,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
             # 연속 Night
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
-            if n_tail > 0:
+            _n_offs_after_cnight = (getattr(rs, "prev_month_n_offs_after_by_idx", {}) or {}).get(n, 0)
+            # offs_after >= 1 이면 야간 연속이 이미 끊긴 상태 → 월경계 연속N 제약 스킵
+            if n_tail > 0 and _n_offs_after_cnight == 0:
                 for w in range(1, n_tail + 1):
                     april_window_end = L - w
                     cap = L - w
@@ -2790,8 +2880,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"min_off={min_off_required}, max_off={max_off_allowed_n_only}"
                         )
                     else:
+                        _base_max = int(off_bounds["max_off_allowed"])
+                        # weekend_off 간호사: n_tail(2N2O/3N2O) 및 off_window로 인한
+                        # 추가 평일 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
+                        _extra_off = 0
+                        if bool(getattr(nu, "is_weekend_off", False)):
+                            _n_tail_cap = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
+                            if _n_tail_cap >= 1 and (
+                                getattr(cfg, "two_offs_after_two_nig", False)
+                                or getattr(cfg, "two_offs_after_three_nig", False)
+                            ):
+                                _extra_off += 2
+                            _ow_data = (getattr(rs, "off_window_constraints", {}) or {}).get(n, []) or []
+                            for (_ws, _we) in _ow_data:
+                                _wl = max(T0, _ws)
+                                _wr = min(T1, _we)
+                                if _wl <= _wr and not any(_d in weekend_days for _d in range(_wl, _wr + 1)):
+                                    _extra_off += 1
+                        # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
+                        if n in _4o_cross_affected:
+                            _extra_off += 1
                         max_off_allowed = min(
-                            int(off_bounds["max_off_allowed"]),
+                            _base_max + _extra_off,
                             nonvac_active_days,
                         )
                         m.Add(
@@ -2807,6 +2917,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             f"cap_semantics={off_cap_semantics}, vac_cnt={vacation_cnt}, "
                             f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
                             f"min_off={min_off_required}, max_off={max_off_allowed}"
+                            + (f", extra_off={_extra_off}" if _extra_off > 0 else "")
                         )
         except Exception as exc:
             print(
@@ -2818,22 +2929,39 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 기존 구현은 (sum_n - 1 <= off1 + off2) 형태여서 연속 N일 때 OFF 1개만 허용되는 버그가 있었다.
         if cfg.two_offs_after_three_nig and n not in n_forbid_n:
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
-            if n_tail >= 3 and (T0 + 1) <= T1:
+            n_offs_after_3n = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
+            _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
+            if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1:
                 end_prev_block = m.NewBoolVar(f"end_3n_prev_{n}")
                 m.Add(end_prev_block == X(n, T0, night).Not())
-                m.Add(
-                    countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                ).OnlyEnforceIf([end_prev_block])
-            if n_tail >= 2 and (T0 + 2) <= T1:
-                m.Add(
-                    countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                ).OnlyEnforceIf([X(n, T0, night)])
-            if n_tail == 1 and (T0 + 3) <= T1:
-                m.Add(
-                    countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
-                ).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
+                    if _3n_rem >= 2:
+                        m.Add(
+                            countable_off(n, T0) + countable_off(n, T0 + 1) == 2
+                        ).OnlyEnforceIf([end_prev_block])
+                    else:
+                        m.Add(
+                            countable_off(n, T0) + countable_off(n, T0 + 1) >= 1
+                        ).OnlyEnforceIf([end_prev_block])
+                print(f"[CP-SAT-Basic] [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                      f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
+            elif n_tail >= 3 and _3n_rem == 0:
+                print(f"[CP-SAT-Basic] [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                      f"offs_after={n_offs_after_3n} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
+            if n_tail >= 2 and n_offs_after_3n < 2 and (T0 + 2) <= T1:
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
+                    m.Add(
+                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
+                    ).OnlyEnforceIf([X(n, T0, night)])
+            if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 2, T0 + 3)):
+                    m.Add(
+                        countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
+                    ).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
+                if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
+                    continue
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
                 ).OnlyEnforceIf(
@@ -2841,18 +2969,34 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
         if cfg.two_offs_after_two_nig and n not in n_forbid_n:
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
-            if n_tail >= 2 and (T0 + 1) <= T1:
+            n_offs_after = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
+            # 전월 N tail 뒤 이미 소비된 OFF 수를 반영: req_offs(2) - offs_after 만큼만 현월에서 추가 필요
+            _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
+            if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1:
                 end_prev_block = m.NewBoolVar(f"end_2n_prev_{n}")
                 m.Add(end_prev_block == X(n, T0, night).Not())
-                m.Add(
-                    countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                ).OnlyEnforceIf([end_prev_block])
-            if n_tail >= 1 and (T0 + 2) <= T1:
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
+                    if _2n_rem >= 2:
+                        m.Add(
+                            countable_off(n, T0) + countable_off(n, T0 + 1) == 2
+                        ).OnlyEnforceIf([end_prev_block])
+                    else:
+                        # _2n_rem == 1: 1개만 추가 필요
+                        m.Add(
+                            countable_off(n, T0) + countable_off(n, T0 + 1) >= 1
+                        ).OnlyEnforceIf([end_prev_block])
+                print(f"[CP-SAT-Basic] [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                      f"offs_after={n_offs_after}, rem={_2n_rem}")
+            elif n_tail >= 2 and _2n_rem == 0:
+                print(f"[CP-SAT-Basic] [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
+                      f"offs_after={n_offs_after} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
+            if n_tail >= 1 and n_offs_after < 2 and (T0 + 2) <= T1:
                 end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
                 m.Add(end_block_b0 == X(n, T0 + 1, night).Not())
-                m.Add(
-                    countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                ).OnlyEnforceIf([X(n, T0, night), end_block_b0])
+                if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
+                    m.Add(
+                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
+                    ).OnlyEnforceIf([X(n, T0, night), end_block_b0])
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)
@@ -2860,6 +3004,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 xn_next = X(n, d + 1, night)
                 end_block = m.NewBoolVar(f'end_2n_main_{n}_{d}')
                 m.Add(end_block == xn_next.Not())
+                if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
+                    continue
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
                 ).OnlyEnforceIf(
