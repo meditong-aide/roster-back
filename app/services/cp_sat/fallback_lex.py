@@ -737,7 +737,6 @@ def optimize_fallback_lex_hard_first(
                     )
         # ── 4O 월경계 제약: 전월 꼬리 연속 OFF + 현월 초 연속 OFF 합산 4 이상 금지 (하드) ──
         _4o_cross_affected_fb: set[int] = set()
-        _4o_assumptions_fb: list[tuple] = []
         prev_off_tail = getattr(roster_system, "prev_month_off_tail_by_idx", {}) or {}
         print(f"{logger_prefix} [4O-cross-month-debug] prev_off_tail_by_idx keys={list(prev_off_tail.keys())}, "
               f"values={dict(prev_off_tail)}, N={N}")
@@ -776,10 +775,7 @@ def optimize_fallback_lex_hard_first(
             if not free_vars:
                 continue
             remaining = 3 - effective_t
-            _4o_assumption = m.NewBoolVar(f"4o_cross_assume_{n}")
-            m.Add(sum(free_vars) <= remaining).OnlyEnforceIf(_4o_assumption)
-            m.AddAssumption(_4o_assumption)
-            _4o_assumptions_fb.append((_4o_assumption, n))
+            m.Add(sum(free_vars) <= remaining)
             _4o_cross_affected_fb.add(n)
             nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
             print(
@@ -788,9 +784,6 @@ def optimize_fallback_lex_hard_first(
                 f"고정OFF={effective_t - t}, free={len(free_vars)}, OFF<={remaining}, "
                 f"detail={_detail_per_day}"
             )
-        m._4o_assumptions_map = {lit.Index(): n_idx for (lit, n_idx) in _4o_assumptions_fb}
-        m._4o_assumption_lits = [lit for (lit, _) in _4o_assumptions_fb]
-
         # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
         # 평일(월~금)에는 OFF를 금지한다.
         #
@@ -1802,36 +1795,6 @@ def optimize_fallback_lex_hard_first(
                 except Exception as exc:
                     print(f"{logger_prefix} [Stage1 상세로그 실패]: {exc}")
                 break
-            if st == cp_model.INFEASIBLE and hasattr(m1, '_4o_assumption_lits') and m1._4o_assumption_lits:
-                try:
-                    suf = s1.SufficientAssumptionsForInfeasibility()
-                    suf_indices = {v.Index() if hasattr(v, 'Index') else int(v) for v in suf}
-                    a_map = getattr(m1, '_4o_assumptions_map', {})
-                    culprit_nurses = [a_map[idx] for idx in suf_indices if idx in a_map]
-                    print(
-                        f"{logger_prefix} [4O-DIAG] relax={relax_level}, "
-                        f"sufficient_assumptions={len(suf)}/{len(m1._4o_assumption_lits)}, "
-                        f"4O_culprit_nurses={culprit_nurses}"
-                    )
-                    if not culprit_nurses:
-                        print(f"{logger_prefix} [4O-DIAG] 4O assumption이 충분 조건에 없음 → 4O 외 원인")
-                    else:
-                        for cn in culprit_nurses:
-                            nu = roster_system.nurses[cn] if cn < len(roster_system.nurses) else None
-                            print(
-                                f"{logger_prefix} [4O-DIAG] 원인 간호사: idx={cn}, "
-                                f"name={getattr(nu, 'name', '?')}, "
-                                f"off_tail={prev_off_tail.get(cn, 0)}, "
-                                f"n_tail={prev_month_n_tail_by_idx.get(cn, 0)}"
-                            )
-                    m1.ClearAssumptions()
-                    st_no4o = s1.Solve(m1)
-                    print(
-                        f"{logger_prefix} [4O-DIAG] 4O 비활성 시 결과: "
-                        f"status={_cp_sat_status_to_text(st_no4o)}"
-                    )
-                except Exception as diag_exc:
-                    print(f"{logger_prefix} [4O-DIAG] 진단 실패: {diag_exc}")
             if relax_level < max_relax_attempts - 1:
                 print(f"{logger_prefix} 폴백1 실패 (완화레벨={relax_level}): 재시도...")
             else:
