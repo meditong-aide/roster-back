@@ -21,8 +21,14 @@ from db.models import (
     WantedRequest,
 )
 from schemas.replacement_schema import (
+    BulkPathRecommendation,
+    BulkPathStep,
     CandidateRecommendation,
     CandidateScoreBreakdown,
+    ConstraintFactors,
+    ExcludedCandidate,
+    PathViolationDetail,
+    PathViolationSummary,
     ReplacementRecommendRequest,
     ReplacementRecommendResponse,
     ReplacementSlot,
@@ -31,6 +37,20 @@ from schemas.replacement_schema import (
 
 
 OFF_SHIFT_IDS = {"O", "OFF", "-", "주"}
+
+# Violation type severity weights — higher = more impactful violation.
+# Used in BULK path scoring to penalize severe violations more heavily.
+VIOLATION_TYPE_WEIGHT: Dict[str, float] = {
+    "night_15n_hard_limit": 5.0,  # 월 15N 절대상한 초과 — 최고 심각도
+    "off_day_shortage": 3.5,      # 월간 OFF 일수 기준 미달
+    "rec_3n2o": 3.0,              # 3연속 나이트 후 OFF 부족
+    "consecutive_work": 2.5,      # 최대 연속 근무 초과
+    "night_month_limit": 2.0,     # 월간 나이트 한도 초과
+    "rec_2n2o": 1.8,              # 2연속 나이트 후 OFF 부족
+    "night_nd": 1.5,              # N→D 전환 위반
+    "night_ne": 1.5,              # N→E 전환 위반
+    "eve_ed": 1.0,                # E→D 전환 위반
+}
 VACATION_SHIFT_TYPE_TOKENS = {"휴가", "vacation", "annual_leave", "annual leave", "연차", "연가"}
 WORK_SHIFT_GB_TO_MAIN = {
     "데이": "D",
@@ -585,6 +605,27 @@ def _rule_safety_score(
             over = projected_nights - monthly_night_limit
             risk += 40.0 + 10.0 * over
             tags.append("monthly_night_limit_risk")
+        # 15N 절대 상한: 월 15회 초과 시 사실상 배제
+        if projected_nights > 15:
+            risk += 100.0
+            tags.append("night_15n_hard_limit")
+
+    # OFF 일수 보장: 대체 투입 시 해당 간호사의 월간 OFF가 기준 이하로 떨어지는지 체크
+    required_off = int(getattr(config, "off_days", 8) or 8) if config else 8
+    if assigned_is_off:
+        current_off_count = 0
+        for idx, shift_id in enumerate(schedule):
+            shift_pk = schedule_shift_pks[idx] if schedule_shift_pks and idx < len(schedule_shift_pks) else None
+            _, _, _, is_off_any, _ = _resolve_shift_semantic_with_reason(
+                shift_id, shift_meta, shift_pk=shift_pk, shift_meta_by_pk=shift_meta_by_pk,
+            )
+            if is_off_any:
+                current_off_count += 1
+        projected_off = current_off_count - 1  # OFF 하나를 근무로 전환
+        if projected_off < required_off:
+            shortfall = required_off - projected_off
+            risk += 35.0 + 15.0 * shortfall
+            tags.append(f"off_day_shortage_{projected_off}of{required_off}")
 
     if not assigned_is_off:
         risk += 30.0
@@ -780,8 +821,43 @@ def recommend_replacement_candidates(
     top_k = req.top_k
     max_scan = req.options.max_candidate_scan
     ranking_scope = str(getattr(req.options, "ranking_scope", "ALL") or "ALL").upper()
+    violation_delta_lambda = 18.0
     if ranking_scope not in {"ALL", "OFF_ONLY", "ON_DUTY_ONLY", "VACATION_ONLY"}:
         ranking_scope = "ALL"
+
+    if req.mode == "BULK":
+        markov_results, bulk_paths = _recommend_bulk_markov(
+            slots=slots,
+            req=req,
+            schedule_map=schedule_map,
+            schedule_shift_pk_map=schedule_shift_pk_map,
+            nurse_by_id=nurse_by_id,
+            shift_meta=shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+            config=config,
+            prev_tail_by_nurse=prev_tail_by_nurse,
+            pref_score_map=pref_score_map,
+            pair_score_map=pair_score_map,
+            target_grade=target_grade,
+            ranking_scope=ranking_scope,
+            max_scan=max_scan,
+        )
+        return ReplacementRecommendResponse(
+            schedule_id=req.schedule_id,
+            mode=req.mode,
+            target_nurse_id=req.target_nurse_id,
+            results=markov_results,
+            bulk_paths=bulk_paths,
+            metadata={
+                "evaluated_slots": len(slots),
+                "candidate_scan_limit": max_scan,
+                "allow_non_off_candidates": req.options.allow_non_off_candidates,
+                "applied_ranking_scope": ranking_scope,
+                "violation_delta_lambda": round(violation_delta_lambda, 3),
+                "violation_type_weights": VIOLATION_TYPE_WEIGHT,
+                "scoring_policy": "violation_first_exclusive_pool_with_15n_off_guard",
+            },
+        )
 
     shift_fallback_reason_counts: Dict[str, int] = defaultdict(int)
     shift_fallback_event_count = 0
@@ -1037,3 +1113,849 @@ def recommend_replacement_candidates(
             "scoring_policy": "rule_safety_priority_with_grade_fit",
         },
     )
+
+
+def _evaluate_single_slot(
+    slot: ReplacementSlot,
+    req: ReplacementRecommendRequest,
+    schedule_map: Dict[str, List[str]],
+    schedule_shift_pk_map: Dict[str, List[Optional[str]]],
+    nurse_by_id: Dict[str, Any],
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Dict[str, Dict[str, Any]],
+    config: Any,
+    prev_tail_by_nurse: Dict[str, List[str]],
+    pref_score_map: Dict[Tuple[str, int, str], float],
+    pair_score_map: Dict[Tuple[str, str], float],
+    target_grade: Optional[int],
+    ranking_scope: str,
+    max_scan: int,
+    replacement_usage: Optional[Dict[str, int]] = None,
+    root_nurse_id: Optional[str] = None,
+    prev_nurse_id: Optional[str] = None,
+) -> List[Tuple[str, CandidateContext, float]]:
+    day = slot.date.day
+    day_idx = day - 1
+    target_shift_raw = slot.shift
+    target_shift_main = _main_shift_code(target_shift_raw, shift_meta)
+
+    usage = replacement_usage or {}
+    candidate_pool: List[Tuple[str, CandidateContext]] = []
+
+    for candidate_id, nurse in nurse_by_id.items():
+        if candidate_id == req.target_nurse_id:
+            continue
+        if candidate_id not in schedule_map:
+            continue
+        if int(getattr(nurse, "active", 1) or 1) == 0:
+            continue
+
+        join_date = _to_date(getattr(nurse, "joining_date", None))
+        resign_date = _to_date(getattr(nurse, "resignation_date", None))
+        if join_date and slot.date < join_date:
+            continue
+        if resign_date and slot.date > resign_date:
+            continue
+        if not _nurse_can_work_shift(nurse, target_shift_main):
+            continue
+
+        schedule_row = schedule_map[candidate_id]
+        schedule_shift_pk_row = schedule_shift_pk_map.get(candidate_id, [])
+        assigned_shift = schedule_row[day_idx] if day_idx < len(schedule_row) else "-"
+        assigned_shift_pk = (
+            schedule_shift_pk_row[day_idx]
+            if day_idx < len(schedule_shift_pk_row)
+            else None
+        )
+        (
+            assigned_main,
+            assigned_is_off_rest,
+            assigned_is_vacation,
+            assigned_is_off,
+            _reason,
+        ) = _resolve_shift_semantic_with_reason(
+            assigned_shift,
+            shift_meta,
+            shift_pk=assigned_shift_pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+        assigned_is_off_rest = assigned_is_off and not assigned_is_vacation
+
+        if ranking_scope == "OFF_ONLY" and not assigned_is_off_rest:
+            continue
+        if ranking_scope == "ON_DUTY_ONLY" and assigned_is_off:
+            continue
+        if ranking_scope == "VACATION_ONLY" and not assigned_is_vacation:
+            continue
+        if (
+            ranking_scope == "ALL"
+            and not req.options.allow_non_off_candidates
+            and not assigned_is_off
+        ):
+            continue
+
+        rule_safety, estimated_delta, rule_tags = _rule_safety_score(
+            nurse=nurse,
+            schedule=schedule_row,
+            day_idx=day_idx,
+            target_shift_code=target_shift_raw,
+            shift_meta=shift_meta,
+            config=config,
+            prev_tail_schedule=prev_tail_by_nurse.get(candidate_id),
+            schedule_shift_pks=schedule_shift_pk_row,
+            target_shift_pk=(
+                schedule_shift_pk_map.get(req.target_nurse_id, [])[day_idx]
+                if day_idx < len(schedule_shift_pk_map.get(req.target_nurse_id, []))
+                else None
+            ),
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+
+        prior_usage = usage.get(candidate_id, 0)
+        path_penalty = 0.0
+        if "consecutive_work_risk" in rule_tags:
+            path_penalty += 30.0
+            estimated_delta += 0.7
+            rule_tags = list(rule_tags) + ["consecutive_work_penalized"]
+
+        if assigned_is_off:
+            off_tail = 0
+            cursor = day_idx + 1
+            while cursor < len(schedule_row):
+                cursor_shift_pk = (
+                    schedule_shift_pk_row[cursor]
+                    if cursor < len(schedule_shift_pk_row)
+                    else None
+                )
+                _m, _r, _v, is_off_any, _reason2 = _resolve_shift_semantic_with_reason(
+                    schedule_row[cursor],
+                    shift_meta,
+                    shift_pk=cursor_shift_pk,
+                    shift_meta_by_pk=shift_meta_by_pk,
+                )
+                if not is_off_any:
+                    break
+                off_tail += 1
+                cursor += 1
+            if off_tail > 0:
+                path_penalty += min(40.0, 11.0 * off_tail)
+                estimated_delta += round(min(1.2, 0.2 * off_tail), 3)
+                rule_tags = list(rule_tags) + [
+                    f"residual_off_preservation_penalty_x{off_tail}"
+                ]
+
+        if prior_usage > 0:
+            usage_risk = min(95.0, 25.0 * prior_usage)
+            rule_safety = max(0.0, rule_safety - (usage_risk / 100.0))
+            estimated_delta += round(usage_risk / 35.0, 3)
+            path_penalty += 30.0 * prior_usage
+            rule_tags = list(rule_tags) + [f"replacement_reuse_x{prior_usage}"]
+        if prev_nurse_id and candidate_id == prev_nurse_id:
+            path_penalty += 34.0
+            estimated_delta += 0.6
+            rule_tags = list(rule_tags) + ["back_to_back_replacement_penalty"]
+
+        off_priority = 1.0 if assigned_is_off else 0.35
+        if target_grade is None or getattr(nurse, "grade", None) is None:
+            grade_fit = 0.5
+        else:
+            grade_diff = abs(int(getattr(nurse, "grade")) - int(target_grade))
+            grade_fit = float(exp(-0.7 * grade_diff))
+
+        pref_value = pref_score_map.get((candidate_id, day, target_shift_main), 0.0)
+        preference = max(0.0, min(1.0, pref_value / 5.0))
+
+        p1 = pair_score_map.get((req.target_nurse_id, candidate_id), 0.0)
+        p2 = pair_score_map.get((candidate_id, req.target_nurse_id), 0.0)
+        pair = max(0.0, min(1.0, ((p1 + p2) / 2.0) / 5.0))
+        prev_pair = 0.0
+        if prev_nurse_id and prev_nurse_id != req.target_nurse_id:
+            pp1 = pair_score_map.get((prev_nurse_id, candidate_id), 0.0)
+            pp2 = pair_score_map.get((candidate_id, prev_nurse_id), 0.0)
+            prev_pair = max(0.0, min(1.0, ((pp1 + pp2) / 2.0) / 5.0))
+        root_pair = 0.0
+        if root_nurse_id and root_nurse_id != req.target_nurse_id:
+            rp1 = pair_score_map.get((root_nurse_id, candidate_id), 0.0)
+            rp2 = pair_score_map.get((candidate_id, root_nurse_id), 0.0)
+            root_pair = max(0.0, min(1.0, ((rp1 + rp2) / 2.0) / 5.0))
+        if prev_nurse_id and root_nurse_id:
+            pair = max(
+                0.0, min(1.0, (pair * 0.35) + (prev_pair * 0.45) + (root_pair * 0.2))
+            )
+        elif prev_nurse_id:
+            pair = max(0.0, min(1.0, (pair * 0.45) + (prev_pair * 0.55)))
+        elif root_nurse_id:
+            pair = max(0.0, min(1.0, (pair * 0.55) + (root_pair * 0.45)))
+
+        tags = list(rule_tags)
+        if assigned_is_vacation:
+            tags.append("vacation_candidate")
+        if assigned_is_off_rest:
+            tags.append("off_rest_candidate")
+        if grade_fit >= 0.99:
+            tags.append("same_grade")
+        elif grade_fit >= 0.45:
+            tags.append("near_grade")
+        if preference >= 0.7:
+            tags.append("high_preference")
+        if pair >= 0.7:
+            tags.append("high_pair_fit")
+        if prev_pair >= 0.7:
+            tags.append("high_prev_pair_fit")
+        if root_pair >= 0.7:
+            tags.append("high_root_pair_fit")
+
+        vacation_penalty = 0.0
+        if ranking_scope == "ALL" and assigned_is_vacation:
+            vacation_penalty = 70.0
+            tags.append("vacation_penalized")
+
+        candidate_grade_value = None
+        raw_grade = getattr(nurse, "grade", None)
+        if raw_grade is not None:
+            try:
+                candidate_grade_value = int(raw_grade)
+            except Exception:
+                pass
+
+        candidate_pool.append(
+            (
+                candidate_id,
+                CandidateContext(
+                    nurse_id=candidate_id,
+                    nurse_name=str(getattr(nurse, "name", candidate_id)),
+                    nurse_grade=candidate_grade_value,
+                    assigned_shift=assigned_shift,
+                    assigned_shift_pk_id=assigned_shift_pk,
+                    assigned_is_off=assigned_is_off,
+                    assigned_is_vacation=assigned_is_vacation,
+                    rule_safety=rule_safety,
+                    estimated_violation_delta=estimated_delta,
+                    off_priority=off_priority,
+                    grade_fit=grade_fit,
+                    preference=preference,
+                    pair=pair,
+                    fairness=0.5,
+                    change_cost=0.0 if assigned_is_off else 1.0,
+                    vacation_penalty=vacation_penalty + path_penalty,
+                    tags=tags,
+                ),
+            )
+        )
+
+        if len(candidate_pool) >= max_scan:
+            break
+
+    fairness_map = _fairness_scores(
+        candidate_pool,
+        schedule_map,
+        schedule_shift_pk_map,
+        target_shift_raw,
+        shift_meta,
+        shift_meta_by_pk=shift_meta_by_pk,
+    )
+    for cid, ctx in candidate_pool:
+        ctx.fairness = fairness_map.get(cid, 0.5)
+
+    scored = sorted(
+        candidate_pool, key=lambda item: _final_score(item[1]), reverse=True
+    )
+    if ranking_scope == "ALL":
+        non_vacation = [item for item in scored if not item[1].assigned_is_vacation]
+        vacation = [item for item in scored if item[1].assigned_is_vacation]
+        scored = non_vacation + vacation
+
+    return [(cid, ctx, _final_score(ctx)) for cid, ctx in scored]
+
+
+def _apply_virtual_assignment(
+    schedule_map: Dict[str, List[str]],
+    schedule_shift_pk_map: Dict[str, List[Optional[str]]],
+    candidate_id: str,
+    day_idx: int,
+    new_shift: str,
+    new_shift_pk: Optional[str],
+) -> Tuple[Dict[str, List[str]], Dict[str, List[Optional[str]]]]:
+    new_schedule_map = {k: list(v) for k, v in schedule_map.items()}
+    new_pk_map = {k: list(v) for k, v in schedule_shift_pk_map.items()}
+    if candidate_id in new_schedule_map and day_idx < len(
+        new_schedule_map[candidate_id]
+    ):
+        new_schedule_map[candidate_id][day_idx] = new_shift
+        if candidate_id in new_pk_map and day_idx < len(new_pk_map[candidate_id]):
+            new_pk_map[candidate_id][day_idx] = new_shift_pk
+    return new_schedule_map, new_pk_map
+
+
+def _ctx_to_candidate_model(
+    ctx: CandidateContext, rank: int, include_explanations: bool
+) -> CandidateRecommendation:
+    return CandidateRecommendation(
+        nurse_id=ctx.nurse_id,
+        name=ctx.nurse_name,
+        candidate_grade=ctx.nurse_grade,
+        current_assigned_shift_code=ctx.assigned_shift,
+        current_assigned_shift_pk_id=ctx.assigned_shift_pk_id,
+        final_score=_final_score(ctx),
+        rank=rank,
+        tags=ctx.tags if include_explanations else [],
+        breakdown=CandidateScoreBreakdown(
+            rule_safety=round(ctx.rule_safety, 3),
+            off_priority=round(ctx.off_priority, 3),
+            grade_fit=round(ctx.grade_fit, 3),
+            preference=round(ctx.preference, 3),
+            pair=round(ctx.pair, 3),
+            fairness=round(ctx.fairness, 3),
+            change_cost=round(ctx.change_cost, 3),
+            estimated_violation_delta=round(ctx.estimated_violation_delta, 3),
+        ),
+    )
+
+
+def _count_path_violations(
+    path_steps: List[BulkPathStep],
+    schedule_map: Dict[str, List[str]],
+    schedule_shift_pk_map: Dict[str, List[Optional[str]]],
+    nurse_by_id: Dict[str, Any],
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Dict[str, Dict[str, Any]],
+    config: Any,
+    prev_tail_by_nurse: Dict[str, List[str]],
+    target_nurse_id: str,
+    include_target_nurse: bool = True,
+) -> PathViolationSummary:
+    v_map = {k: list(v) for k, v in schedule_map.items()}
+    v_pk_map = {k: list(v) for k, v in schedule_shift_pk_map.items()}
+    target_pk_row = schedule_shift_pk_map.get(target_nurse_id, [])
+    affected_nurses: Dict[str, set] = {}
+
+    for step in path_steps:
+        cid = step.candidate.nurse_id
+        if not cid:
+            continue
+        day_idx = step.slot.date.day - 1
+        if cid in v_map and day_idx < len(v_map[cid]):
+            v_map[cid][day_idx] = step.slot.shift
+        if cid in v_pk_map and day_idx < len(v_pk_map[cid]):
+            v_pk_map[cid][day_idx] = (
+                target_pk_row[day_idx] if day_idx < len(target_pk_row) else None
+            )
+        if cid not in affected_nurses:
+            affected_nurses[cid] = set()
+        affected_nurses[cid].add(day_idx)
+
+    if include_target_nurse:
+        for step in path_steps:
+            day_idx = step.slot.date.day - 1
+            if target_nurse_id not in affected_nurses:
+                affected_nurses[target_nurse_id] = set()
+            affected_nurses[target_nurse_id].add(day_idx)
+
+    max_conseq = int(getattr(config, "max_conseq_work", 6) or 6) if config else 6
+    monthly_night_limit = (
+        int(getattr(config, "max_nig_per_month", 8) or 8) if config else 8
+    )
+    banned_day_after_eve = (
+        bool(getattr(config, "banned_day_after_eve", False)) if config else False
+    )
+    two_off_after_two = (
+        bool(getattr(config, "two_offs_after_two_nig", False)) if config else False
+    )
+    two_off_after_three = (
+        bool(getattr(config, "two_offs_after_three_nig", False)) if config else False
+    )
+
+    violations: List[PathViolationDetail] = []
+    by_type: Dict[str, int] = defaultdict(int)
+
+    def _main_for(nid: str, shift_id: str, day_idx: int) -> str:
+        pk_row = v_pk_map.get(nid, [])
+        pk = pk_row[day_idx] if day_idx < len(pk_row) else None
+        code, _ = _main_shift_code_with_reason(
+            shift_id, shift_meta, shift_pk=pk, shift_meta_by_pk=shift_meta_by_pk
+        )
+        return code
+
+    def _is_off_for(nid: str, shift_id: str, day_idx: int) -> bool:
+        pk_row = v_pk_map.get(nid, [])
+        pk = pk_row[day_idx] if day_idx < len(pk_row) else None
+        _, _, _, is_off_any, _ = _resolve_shift_semantic_with_reason(
+            shift_id,
+            shift_meta,
+            shift_pk=pk,
+            shift_meta_by_pk=shift_meta_by_pk,
+        )
+        return is_off_any
+
+    def _add(vtype: str, nid: str, day_idx: int, desc: str):
+        nurse = nurse_by_id.get(nid)
+        name = str(getattr(nurse, "name", nid)) if nurse else nid
+        violations.append(
+            PathViolationDetail(
+                type=vtype,
+                nurse_id=nid,
+                nurse_name=name,
+                day=day_idx + 1,
+                description=desc,
+            )
+        )
+        by_type[vtype] += 1
+
+    for nid in affected_nurses:
+        sched_row = v_map.get(nid)
+        if not sched_row:
+            continue
+        nurse = nurse_by_id.get(nid)
+        name = str(getattr(nurse, "name", nid)) if nurse else nid
+        num_days = len(sched_row)
+
+        for d in range(num_days):
+            code = _main_for(nid, sched_row[d], d)
+            if code == "O":
+                continue
+
+            streak = 1
+            c = d - 1
+            while c >= 0 and not _is_off_for(nid, sched_row[c], c):
+                streak += 1
+                c -= 1
+            if c < 0:
+                tail = prev_tail_by_nurse.get(nid, [])
+                for t_shift in reversed(tail):
+                    if _is_off_shift(t_shift, shift_meta):
+                        break
+                    streak += 1
+            c = d + 1
+            while c < num_days and not _is_off_for(nid, sched_row[c], c):
+                streak += 1
+                c += 1
+            if streak > max_conseq:
+                _add(
+                    "consecutive_work",
+                    nid,
+                    d,
+                    f"{name}: 연속 {streak}일 근무 (제한 {max_conseq}일)",
+                )
+
+            if d > 0:
+                prev_code = _main_for(nid, sched_row[d - 1], d - 1)
+                if prev_code == "N" and code == "D":
+                    _add("night_nd", nid, d, f"{name}: N→D 위반")
+                if prev_code == "N" and code == "E":
+                    _add("night_ne", nid, d, f"{name}: N→E 위반")
+                if banned_day_after_eve and prev_code == "E" and code == "D":
+                    _add("eve_ed", nid, d, f"{name}: E→D 위반")
+
+        night_count = sum(
+            1 for d in range(num_days) if _main_for(nid, sched_row[d], d) == "N"
+        )
+        if night_count > monthly_night_limit:
+            _add(
+                "night_month_limit",
+                nid,
+                0,
+                f"{name}: 월 N근무 {night_count}회 (제한 {monthly_night_limit}회)",
+            )
+        if night_count > 15:
+            _add(
+                "night_15n_hard_limit",
+                nid,
+                0,
+                f"{name}: 월 N근무 {night_count}회 (절대상한 15회 초과)",
+            )
+
+        # OFF 일수 보장 위반 체크
+        required_off = int(getattr(config, "off_days", 8) or 8) if config else 8
+        off_count = sum(
+            1 for d in range(num_days) if _is_off_for(nid, sched_row[d], d)
+        )
+        if off_count < required_off:
+            _add(
+                "off_day_shortage",
+                nid,
+                0,
+                f"{name}: 월 OFF {off_count}일 (기준 {required_off}일 미달)",
+            )
+
+        if two_off_after_two or two_off_after_three:
+            for d in range(1, num_days):
+                if _main_for(nid, sched_row[d], d) != "N":
+                    continue
+                n_streak = 1
+                c = d - 1
+                while c >= 0 and _main_for(nid, sched_row[c], c) == "N":
+                    n_streak += 1
+                    c -= 1
+                if d + 1 < num_days and _main_for(nid, sched_row[d + 1], d + 1) == "N":
+                    continue
+                off_after = 0
+                for o in range(d + 1, min(d + 3, num_days)):
+                    if _is_off_for(nid, sched_row[o], o):
+                        off_after += 1
+                    else:
+                        break
+                if two_off_after_two and n_streak >= 2 and off_after < 2:
+                    _add(
+                        "rec_2n2o",
+                        nid,
+                        d,
+                        f"{name}: {n_streak}N 후 OFF {off_after}일 (2일 필요)",
+                    )
+                if two_off_after_three and n_streak >= 3 and off_after < 2:
+                    _add(
+                        "rec_3n2o",
+                        nid,
+                        d,
+                        f"{name}: {n_streak}N 후 OFF {off_after}일 (2일 필요)",
+                    )
+
+    seen = set()
+    unique_violations = []
+    for v in violations:
+        key = (v.type, v.nurse_id, v.day)
+        if key not in seen:
+            seen.add(key)
+            unique_violations.append(v)
+
+    unique_by_type: Dict[str, int] = defaultdict(int)
+    for v in unique_violations:
+        unique_by_type[v.type] += 1
+
+    return PathViolationSummary(
+        total_count=len(unique_violations),
+        by_type=dict(unique_by_type),
+        details=unique_violations,
+    )
+
+
+def _weighted_violation_score(summary: PathViolationSummary) -> float:
+    """Compute weighted violation penalty from a PathViolationSummary.
+
+    Instead of treating all violations equally, applies VIOLATION_TYPE_WEIGHT
+    so severe violations (rec_3n2o, consecutive_work) penalize much more
+    than mild ones (eve_ed).
+    """
+    score = 0.0
+    for vtype, count in summary.by_type.items():
+        weight = VIOLATION_TYPE_WEIGHT.get(vtype, 1.0)
+        score += weight * count
+    return score
+
+
+def _nurse_repeat_violation_penalty(summary: PathViolationSummary) -> float:
+    """Extra penalty when the same nurse is violated on multiple days.
+
+    Detects patterns where a single nurse accumulates violations across
+    different days in the path — indicates that nurse is being overloaded.
+    """
+    nurse_days: Dict[str, set] = defaultdict(set)
+    for detail in summary.details:
+        nurse_days[detail.nurse_id].add(detail.day)
+
+    penalty = 0.0
+    for nid, days in nurse_days.items():
+        if len(days) > 1:
+            # Each additional violation day for the same nurse adds escalating penalty
+            penalty += 1.5 * (len(days) - 1)
+    return penalty
+
+
+def _recommend_bulk_markov(
+    slots: List[ReplacementSlot],
+    req: ReplacementRecommendRequest,
+    schedule_map: Dict[str, List[str]],
+    schedule_shift_pk_map: Dict[str, List[Optional[str]]],
+    nurse_by_id: Dict[str, Any],
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Dict[str, Dict[str, Any]],
+    config: Any,
+    prev_tail_by_nurse: Dict[str, List[str]],
+    pref_score_map: Dict[Tuple[str, int, str], float],
+    pair_score_map: Dict[Tuple[str, str], float],
+    target_grade: Optional[int],
+    ranking_scope: str,
+    max_scan: int,
+) -> Tuple[List[SlotRecommendation], List[BulkPathRecommendation]]:
+    """BULK recommendation — 3 scenario paths with exclusive candidate pools.
+
+    Scenario A (최적안): each slot picks the best available candidate.
+    Scenario B (차선안): excludes A's pick per slot, picks best from remaining.
+    Scenario C (대안):   excludes A+B's picks per slot, picks best from remaining.
+
+    Each path maintains its own virtual schedule, usage tracking, and
+    multiplicative constraint factors (violation, reuse, back-to-back,
+    nurse repeat, consecutive work).
+    """
+    if not slots:
+        return [], []
+
+    num_paths = 3
+    target_pk_row = schedule_shift_pk_map.get(req.target_nurse_id, [])
+
+    # ── Initialize per-path state ──
+    paths: List[List[BulkPathStep]] = [[] for _ in range(num_paths)]
+    path_scores: List[float] = [0.0] * num_paths
+    path_schedule_maps: List[Dict[str, List[str]]] = [
+        {k: list(v) for k, v in schedule_map.items()} for _ in range(num_paths)
+    ]
+    path_shift_pk_maps: List[Dict[str, List[Optional[str]]]] = [
+        {k: list(v) for k, v in schedule_shift_pk_map.items()} for _ in range(num_paths)
+    ]
+    path_usage: List[Dict[str, int]] = [{} for _ in range(num_paths)]
+
+    slot_results: List[SlotRecommendation] = []
+
+    _no_candidate_step = lambda s: BulkPathStep(
+        slot=s,
+        candidate=CandidateRecommendation(
+            nurse_id="", name="(no candidate)", final_score=0.0,
+            rank=0, tags=["no_candidate_available"],
+            breakdown=CandidateScoreBreakdown(
+                rule_safety=0, off_priority=0, grade_fit=0,
+                preference=0, pair=0, fairness=0,
+                change_cost=0, estimated_violation_delta=0,
+            ),
+        ),
+        transition_score=0.0,
+    )
+
+    # ── Process each slot ──
+    for slot_idx, slot in enumerate(slots):
+        day_idx = slot.date.day - 1
+        target_shift_pk = (
+            target_pk_row[day_idx] if day_idx < len(target_pk_row) else None
+        )
+
+        scenario_labels = ["A", "B", "C"]
+        per_slot_candidates: List[CandidateRecommendation] = []
+
+        # ── Phase 1: Evaluate and rank candidates for each path independently ──
+        path_ranked: List[List[Tuple[int, float, str, CandidateContext, float, ConstraintFactors]]] = []
+
+        for path_idx in range(num_paths):
+            usage = path_usage[path_idx]
+            prev_nurse_id = (
+                paths[path_idx][-1].candidate.nurse_id
+                if paths[path_idx] else None
+            )
+            root_nurse_id = (
+                paths[path_idx][0].candidate.nurse_id
+                if paths[path_idx] else None
+            )
+
+            scored = _evaluate_single_slot(
+                slot=slot, req=req,
+                schedule_map=path_schedule_maps[path_idx],
+                schedule_shift_pk_map=path_shift_pk_maps[path_idx],
+                nurse_by_id=nurse_by_id, shift_meta=shift_meta,
+                shift_meta_by_pk=shift_meta_by_pk, config=config,
+                prev_tail_by_nurse=prev_tail_by_nurse,
+                pref_score_map=pref_score_map, pair_score_map=pair_score_map,
+                target_grade=target_grade, ranking_scope=ranking_scope,
+                max_scan=max_scan,
+                replacement_usage=usage,
+                prev_nurse_id=prev_nurse_id,
+                root_nurse_id=root_nurse_id,
+            )
+
+            baseline_summary = _count_path_violations(
+                path_steps=paths[path_idx],
+                schedule_map=schedule_map,
+                schedule_shift_pk_map=schedule_shift_pk_map,
+                nurse_by_id=nurse_by_id, shift_meta=shift_meta,
+                shift_meta_by_pk=shift_meta_by_pk, config=config,
+                prev_tail_by_nurse=prev_tail_by_nurse,
+                target_nurse_id=req.target_nurse_id,
+                include_target_nurse=False,
+            )
+            baseline_weighted = _weighted_violation_score(baseline_summary)
+            baseline_repeat = _nurse_repeat_violation_penalty(baseline_summary)
+
+            candidates: List[Tuple[int, float, str, CandidateContext, float, ConstraintFactors]] = []
+            eval_limit = min(8, len(scored))
+
+            for cid, ctx, base_score in scored[:eval_limit]:
+                candidate_model = _ctx_to_candidate_model(
+                    ctx, rank=1,
+                    include_explanations=req.options.include_explanations,
+                )
+                trial_step = BulkPathStep(
+                    slot=slot, candidate=candidate_model,
+                    transition_score=round(base_score, 3),
+                )
+
+                v_map, v_pk_map = _apply_virtual_assignment(
+                    path_schedule_maps[path_idx],
+                    path_shift_pk_maps[path_idx],
+                    cid, day_idx, slot.shift, target_shift_pk,
+                )
+                sim_summary = _count_path_violations(
+                    path_steps=paths[path_idx] + [trial_step],
+                    schedule_map=schedule_map,
+                    schedule_shift_pk_map=schedule_shift_pk_map,
+                    nurse_by_id=nurse_by_id, shift_meta=shift_meta,
+                    shift_meta_by_pk=shift_meta_by_pk, config=config,
+                    prev_tail_by_nurse=prev_tail_by_nurse,
+                    target_nurse_id=req.target_nurse_id,
+                    include_target_nurse=False,
+                )
+                sim_violation_count = sim_summary.total_count if sim_summary else 0
+
+                # ── Multiplicative constraint factors ──
+                sim_weighted = _weighted_violation_score(sim_summary)
+                weighted_delta = max(0.0, sim_weighted - baseline_weighted)
+                f_violation = max(0.1, 1.0 - 0.12 * weighted_delta)
+
+                prior_reuse = usage.get(cid, 0)
+                f_reuse = max(0.15, 0.55 ** prior_reuse) if prior_reuse > 0 else 1.0
+
+                f_back_to_back = 0.5 if (prev_nurse_id and cid == prev_nurse_id) else 1.0
+
+                sim_repeat = _nurse_repeat_violation_penalty(sim_summary)
+                repeat_delta = max(0.0, sim_repeat - baseline_repeat)
+                f_nurse_repeat = max(0.2, 1.0 - 0.18 * repeat_delta)
+
+                v_sched_row = v_map.get(cid, [])
+                f_consecutive = 1.0
+                if v_sched_row and day_idx < len(v_sched_row):
+                    streak = 1
+                    c = day_idx - 1
+                    while c >= 0:
+                        c_pk = (v_pk_map.get(cid, []) or [])[c] if c < len(v_pk_map.get(cid, []) or []) else None
+                        _, _, _, is_off, _ = _resolve_shift_semantic_with_reason(
+                            v_sched_row[c], shift_meta,
+                            shift_pk=c_pk, shift_meta_by_pk=shift_meta_by_pk,
+                        )
+                        if is_off:
+                            break
+                        streak += 1
+                        c -= 1
+                    c = day_idx + 1
+                    while c < len(v_sched_row):
+                        c_pk = (v_pk_map.get(cid, []) or [])[c] if c < len(v_pk_map.get(cid, []) or []) else None
+                        _, _, _, is_off, _ = _resolve_shift_semantic_with_reason(
+                            v_sched_row[c], shift_meta,
+                            shift_pk=c_pk, shift_meta_by_pk=shift_meta_by_pk,
+                        )
+                        if is_off:
+                            break
+                        streak += 1
+                        c += 1
+                    max_conseq = int(getattr(config, "max_conseq_work", 6) or 6) if config else 6
+                    streak_over = max(0, streak - max_conseq)
+                    f_consecutive = max(0.3, 1.0 - 0.1 * streak_over)
+
+                constraint_multiplier = (
+                    f_violation * f_reuse * f_back_to_back
+                    * f_nurse_repeat * f_consecutive
+                )
+                step_score = base_score * constraint_multiplier
+
+                factors = ConstraintFactors(
+                    f_violation=round(f_violation, 4),
+                    f_reuse=round(f_reuse, 4),
+                    f_back_to_back=round(f_back_to_back, 4),
+                    f_nurse_repeat=round(f_nurse_repeat, 4),
+                    f_consecutive=round(f_consecutive, 4),
+                    combined=round(constraint_multiplier, 4),
+                )
+
+                candidates.append((sim_violation_count, step_score, cid, ctx, base_score, factors))
+
+            # Sort: violation count asc, then step_score desc
+            candidates.sort(key=lambda x: (x[0], -x[1]))
+            path_ranked.append(candidates)
+
+        # ── Phase 2: Coordinated top-k assignment across paths ──
+        used_cids: set = set()
+        # Maps cid -> (name, score, scenario_label) for excluded evidence
+        slot_assignments: Dict[str, Tuple[str, float, str]] = {}
+
+        for path_idx in range(num_paths):
+            # Build excluded evidence from prior path assignments
+            step_excluded_list: List[ExcludedCandidate] = []
+            for ex_cid, (ex_name, ex_score, ex_scenario) in slot_assignments.items():
+                step_excluded_list.append(ExcludedCandidate(
+                    nurse_id=ex_cid,
+                    name=ex_name,
+                    original_score=round(ex_score, 3),
+                    excluded_by_scenario=ex_scenario,
+                ))
+
+            assigned = False
+            for candidate in path_ranked[path_idx]:
+                _viol, pick_score, pick_cid, pick_ctx, pick_base, pick_factors = candidate
+                if pick_cid in used_cids:
+                    continue
+
+                step = BulkPathStep(
+                    slot=slot,
+                    candidate=_ctx_to_candidate_model(
+                        pick_ctx, rank=1,
+                        include_explanations=req.options.include_explanations,
+                    ),
+                    transition_score=round(pick_score, 3),
+                    base_score=round(pick_base, 3),
+                    constraint_factors=pick_factors,
+                    excluded_candidates=step_excluded_list,
+                )
+                paths[path_idx].append(step)
+                path_scores[path_idx] += pick_score
+
+                v_map, v_pk_map = _apply_virtual_assignment(
+                    path_schedule_maps[path_idx],
+                    path_shift_pk_maps[path_idx],
+                    pick_cid, day_idx, slot.shift, target_shift_pk,
+                )
+                path_schedule_maps[path_idx] = v_map
+                path_shift_pk_maps[path_idx] = v_pk_map
+                path_usage[path_idx][pick_cid] = path_usage[path_idx].get(pick_cid, 0) + 1
+
+                used_cids.add(pick_cid)
+                slot_assignments[pick_cid] = (
+                    pick_ctx.nurse_name,
+                    pick_base,
+                    scenario_labels[path_idx],
+                )
+
+                if path_idx == 0:
+                    per_slot_candidates.append(step.candidate)
+
+                assigned = True
+                break
+
+            if not assigned:
+                paths[path_idx].append(_no_candidate_step(slot))
+
+        status = "OK" if per_slot_candidates else "NONE"
+        slot_results.append(SlotRecommendation(
+            slot=slot, recommendation_status=status,
+            candidates=per_slot_candidates, excluded_summary={},
+        ))
+
+    # ── Compute final violations for each completed path ──
+    scenario_descriptions = ["최적안", "차선안", "대안"]
+    bulk_paths: List[BulkPathRecommendation] = []
+    for path_idx in range(num_paths):
+        violation_summary = _count_path_violations(
+            path_steps=paths[path_idx],
+            schedule_map=schedule_map,
+            schedule_shift_pk_map=schedule_shift_pk_map,
+            nurse_by_id=nurse_by_id,
+            shift_meta=shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+            config=config,
+            prev_tail_by_nurse=prev_tail_by_nurse,
+            target_nurse_id=req.target_nurse_id,
+            include_target_nurse=False,
+        )
+        bulk_paths.append(BulkPathRecommendation(
+            path_rank=path_idx + 1,
+            scenario_label=scenario_descriptions[path_idx] if path_idx < len(scenario_descriptions) else f"시나리오 {path_idx + 1}",
+            steps=paths[path_idx],
+            total_path_score=round(path_scores[path_idx], 3),
+            violations=violation_summary,
+        ))
+
+    return slot_results, bulk_paths
+

@@ -82,9 +82,75 @@ class SlotRecommendation(BaseModel):
     excluded_summary: Dict[str, int] = Field(default_factory=dict)
 
 
+class ConstraintFactors(BaseModel):
+    """각 step에서 적용된 제약 조건 곱연산 factor (0.0~1.0).
+    1.0 = 제약 없음, 낮을수록 해당 제약에 의해 점수 감쇄됨."""
+    f_violation: float = Field(default=1.0, description="위반 유형별 가중 감쇄")
+    f_reuse: float = Field(default=1.0, description="path 내 동일 간호사 재사용 감쇄")
+    f_back_to_back: float = Field(default=1.0, description="직전 step 동일 간호사 감쇄")
+    f_nurse_repeat: float = Field(default=1.0, description="동일 간호사 다일 위반 감쇄")
+    f_consecutive: float = Field(default=1.0, description="연속근무 초과 감쇄")
+    combined: float = Field(default=1.0, description="전체 곱연산 결과")
+
+
+class ExcludedCandidate(BaseModel):
+    """상위 시나리오에서 선점되어 제외된 후보 정보."""
+    nurse_id: str
+    name: str
+    original_score: float = Field(description="제외 전 원래 점수")
+    excluded_by_scenario: str = Field(description="어떤 시나리오에서 선점했는지 (A/B)")
+
+
+class BulkPathStep(BaseModel):
+    slot: ReplacementSlot
+    candidate: CandidateRecommendation
+    transition_score: float = Field(
+        default=0.0,
+        description="base_score × constraint_multiplier 적용 후 점수",
+    )
+    base_score: float = Field(
+        default=0.0,
+        description="제약 조건 적용 전 원래 점수",
+    )
+    constraint_factors: Optional[ConstraintFactors] = Field(
+        default=None,
+        description="이 step에서 적용된 제약 조건 factor 상세",
+    )
+    excluded_candidates: List[ExcludedCandidate] = Field(
+        default_factory=list,
+        description="상위 시나리오에서 선점되어 이 시나리오에서 제외된 후보 목록",
+    )
+
+
+class PathViolationDetail(BaseModel):
+    type: str
+    nurse_id: str
+    nurse_name: str
+    day: int
+    description: str
+
+
+class PathViolationSummary(BaseModel):
+    total_count: int = 0
+    by_type: Dict[str, int] = Field(default_factory=dict)
+    details: List[PathViolationDetail] = Field(default_factory=list)
+
+
+class BulkPathRecommendation(BaseModel):
+    path_rank: int
+    scenario_label: str = Field(
+        default="",
+        description="시나리오 설명 (최적안/차선안/대안)",
+    )
+    steps: List[BulkPathStep] = Field(default_factory=list)
+    total_path_score: float = 0.0
+    violations: Optional[PathViolationSummary] = None
+
+
 class ReplacementRecommendResponse(BaseModel):
     schedule_id: str
     mode: Literal["SINGLE", "BULK"]
     target_nurse_id: str
     results: List[SlotRecommendation]
+    bulk_paths: Optional[List[BulkPathRecommendation]] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
