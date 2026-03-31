@@ -13,3 +13,6 @@ test_folder/
 
 *.ipynb
 *.xlsx
+
+# OMC state
+.omc/
