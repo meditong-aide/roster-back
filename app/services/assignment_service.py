@@ -5,6 +5,7 @@
 """
 
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from fastapi import HTTPException
 from datetime import date
 from typing import Optional
@@ -99,8 +100,10 @@ def get_assignments(
 
     if group_id:
         query = query.filter(
-            (NurseAssignment.source_group_id == group_id)
-            | (NurseAssignment.target_group_id == group_id)
+            or_(
+                NurseAssignment.source_group_id == group_id,
+                NurseAssignment.target_group_id == group_id,
+            )
         )
     if nurse_id:
         query = query.filter(NurseAssignment.nurse_id == nurse_id)
@@ -134,10 +137,14 @@ def get_active_assignments_for_month(
         .filter(
             NurseAssignment.status == "active",
             NurseAssignment.start_date <= month_end,
-            (NurseAssignment.end_date.is_(None))
-            | (NurseAssignment.end_date >= month_start),
-            (NurseAssignment.source_group_id == group_id)
-            | (NurseAssignment.target_group_id == group_id),
+            or_(
+                NurseAssignment.end_date.is_(None),
+                NurseAssignment.end_date >= month_start,
+            ),
+            or_(
+                NurseAssignment.source_group_id == group_id,
+                NurseAssignment.target_group_id == group_id,
+            ),
         )
         .all()
     )
@@ -157,8 +164,10 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
             NurseAssignment.status == "active",
             NurseAssignment.start_date <= today,
             NurseAssignment.target_group_id.isnot(None),
-            (NurseAssignment.source_group_id == group_id)
-            | (NurseAssignment.target_group_id == group_id),
+            or_(
+                NurseAssignment.source_group_id == group_id,
+                NurseAssignment.target_group_id == group_id,
+            ),
         )
         .all()
     )

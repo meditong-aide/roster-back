@@ -8,6 +8,7 @@ from db.nurse_config import Nurse
 from services.roster_system import RosterSystem
 import numpy as np
 from collections import defaultdict
+from services.day_windows import iter_nurse_days, build_active_days
 import random
 from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
@@ -817,6 +818,19 @@ class CPSATBasicEngine:
         # 4. 근무표 시스템 생성
         with Timer("근무표 시스템 초기화"):
             roster_system = RosterSystem(nurses, target_month, config)
+            # blocked_by_nurse: nurse_assignment 기반 불연속 근무일 처리
+            # config_data에서 nurse_id(문자열) 키로 받은 것을 솔버 내부 인덱스로 변환
+            _blocked_by_id = config_data.get("blocked_by_nurse_id") if isinstance(config_data, dict) else None
+            if _blocked_by_id:
+                _id_to_idx = {nu.db_id: i for i, nu in enumerate(nurses)}
+                _blocked_by_idx: dict[int, set[int]] = {}
+                for nid, days in _blocked_by_id.items():
+                    idx = _id_to_idx.get(str(nid))
+                    if idx is not None:
+                        _blocked_by_idx[idx] = days
+                        print(f"[Assignment][Solver] nurse_id={nid}, solver_idx={idx}, blocked={sorted(days)}")
+                if _blocked_by_idx:
+                    setattr(roster_system, "blocked_by_nurse", _blocked_by_idx)
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # 월단위 선호(개인 입력) - dict 형태로 전달됨을 가정
             # 예: {"441172": {"shift": "D", "strength": 7}, ...}
@@ -1745,6 +1759,7 @@ class CPSATBasicEngine:
             add_team_balance_terms_fn=add_team_balance_objective_terms,
             add_grade_constraints_fn=add_grade_constraints,
             postprocess_rebalance_off_fn=self._postprocess_rebalance_off,
+            blocked_by_nurse=getattr(roster_system, 'blocked_by_nurse', None),
         )
 
     def _quick_initial_solve(self, rs: RosterSystem,
@@ -1970,7 +1985,10 @@ class CPSATBasicEngine:
 
 # ================== Helper 함수 ==========================
 
-def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = True):
+def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = True, blocked_by_nurse: Optional[dict[int, set[int]]] = None):
+    # rs 객체에 blocked_by_nurse가 있으면 우선 사용
+    if blocked_by_nurse is None:
+        blocked_by_nurse = getattr(rs, 'blocked_by_nurse', None)
     from ortools.sat.python import cp_model
     m = cp_model.CpModel()
     D_phys = rs.num_days
@@ -2147,7 +2165,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # 변수 (룩어헤드 시 leave까지 생성)
     Xv = {}
     for n in range(N):
-        for d in range(join[n], leave[n] + 1):
+        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             for s in range(S):
                 Xv[n, d, s] = m.NewBoolVar(f"x_{n}_{d}_{s}")
     def X(n, d, s):
@@ -2160,7 +2178,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if (n, d) in vacation_off_cells:
             return 0
         return X(n, d, off_idx_full)
-    active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
+    active_days = build_active_days(N, join, leave, blocked_by_nurse)
     isolated_off_slacks: list = []
 
     # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
@@ -2191,7 +2209,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         for n in range(N):
             if preceptee_follow and n in preceptee_indices:
                 continue
-            for d in range(join[n], leave[n] + 1):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 if (n, d) in fixed and fixed[(n, d)] == w_idx:
                     continue
                 m.Add(X(n, d, w_idx) == 0)
@@ -2207,6 +2225,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 continue
             for d in range(join[n], leave[n] - 2):
                 if d + 3 > leave[n]:
+                    continue
+                # blocked day가 윈도우에 포함되면 스킵
+                if any((n, d + k) not in active_days for k in range(4)):
                     continue
                 # if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
                 #     continue
@@ -2407,7 +2428,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     # ───────────── 2-B. Exactly-one ──────────
     for n in range(N):
-        for d in range(join[n], leave[n]+1):
+        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             # 프리셉티는 고정 셀 스킵되었으므로 ExactlyOne 필요
             if (n,d) in fixed and not (preceptee_follow and n in preceptee_indices):
                 continue
@@ -2607,9 +2628,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 is_weekend_only = bool(getattr(nu, "is_weekend_off", False))
                 weekend_cnt = len(weekend_in_range)
                 weekend_nonvac_cnt = max(0, weekend_cnt - vac_cnt_in_range)
+                _n_blocked_r = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
                 off_bounds_in_range = compute_off_bounds(
                     source=cfg,
-                    avail_days=(T1 - T0 + 1),
+                    avail_days=(T1 - T0 + 1 - _n_blocked_r),
                     vacation_cnt=vac_cnt_in_range,
                     reference_days=D_phys,
                     weekend_only=is_weekend_only,
@@ -2725,8 +2747,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자 포함: 월경계 연속근무 초과 방지)
         # 고정 셀 우선: D/E/N/O 불문하고 fixed_cells에 포함된 날은 자유 일수에서 제외
         # → 유저가 K+1일 이상 연속 근무를 고정한 경우, 해당 윈도우는 제약 적용하지 않음
+        _blocked = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
         for d0 in range(T0, T1-K+1):
             window = [d0 + t for t in range(K + 1)]
+            # blocked day가 있으면 해당 일은 근무 불가 → 연속근무 자동 중단 → 스킵
+            if any(d in _blocked for d in window):
+                continue
             # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
             if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
                 continue
@@ -2834,6 +2860,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         try:
             if not bool(getattr(nu, "is_weekend_off", False)):
                 phys_range_off = month_total_day_range(T0, T1, D_phys)
+                _n_blocked_set = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+                if _n_blocked_set:
+                    phys_range_off = [d for d in phys_range_off if d not in _n_blocked_set]
                 avail_days = len(phys_range_off) if phys_range_off else 0
                 vacation_cnt = sum(1 for d in phys_range_off if (n, d) in vacation_off_cells)
                 off_bounds = compute_off_bounds(
@@ -3062,6 +3091,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         include_pair_objective=include_pair_objective,
         preceptor_terms_fn=_add_preceptor_objective_terms,
         fixed_cnt=fixed_cnt,
+        blocked_by_nurse=blocked_by_nurse,
     )
     # 고립 OFF 슬랙 패널티(강제 불가 시에만 허용)
     for slack_var, w in isolated_off_slacks:

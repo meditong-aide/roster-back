@@ -46,7 +46,7 @@ def build_blocked_days(
         start_idx = (overlap_start - month_start).days
         end_idx = (overlap_end - month_start).days
 
-        if a.reason in ("파견", "휴직", "퇴사") and a.source_group_id == group_id:
+        if a.reason in ("파견", "휴직", "퇴사", "병동이동") and a.source_group_id == group_id:
             # 이 그룹에서 빠지는 기간 → blocked
             for d in range(start_idx, end_idx + 1):
                 blocked.add(d)

@@ -26,6 +26,7 @@ from services.cp_sat.allowed_shift_types import (
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
 from services.cp_sat.m_coverage import compute_main_bucket_indices
 from services.cp_sat.night_distribution_log import log_n_even_distribution
+from services.day_windows import iter_nurse_days, build_active_days
 
 
 def _cp_sat_status_to_text(status: int) -> str:
@@ -136,6 +137,7 @@ def optimize_fallback_lex_hard_first(
     add_team_balance_terms_fn,
     add_grade_constraints_fn,
     postprocess_rebalance_off_fn,
+    blocked_by_nurse: dict[int, set[int]] | None = None,
 ) -> bool:
     """하드 제약을 최우선으로 하는 서열(lexicographic) 폴백 최적화 수행.
 
@@ -614,11 +616,13 @@ def optimize_fallback_lex_hard_first(
             try:
                 for n in range(N):
                     T0, T1 = join[n], leave[n]
-                    avail_days = T1 - T0 + 1
+                    _blocked_set = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+                    _n_blocked = len(_blocked_set)
+                    avail_days = T1 - T0 + 1 - _n_blocked
                     forced_off_cnt = sum(
                         1
                         for d in range(T0, T1 + 1)
-                        if (n, d) in structural_off_cells
+                        if (n, d) in structural_off_cells and d not in _blocked_set
                     )
                     nu = roster_system.nurses[n]
                     raw = getattr(nu, "is_night_nurse", None)
@@ -670,17 +674,17 @@ def optimize_fallback_lex_hard_first(
                             f"max_off_allowed={max_off_allowed}, forced_off_days={forced_days} "
                             "→ OFF 상한 초과(모순 가능)"
                         )
-            except Exception:
+            except Exception as e:
                 print(f"{logger_prefix} [HardCheck] 강제 OFF 상한 초과 여부 실패: {e}")
                 pass
         except Exception as exc:
             print(f"{logger_prefix} [HardCheck] precheck 실패: {exc}")
 
         for n in range(N):
-            for d in range(join[n], leave[n] + 1):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
                     Xv[n, d, s] = m.NewBoolVar(f"x_{n}_{d}_{s}")
-        active_days = {(n, d) for n in range(N) for d in range(join[n], leave[n] + 1)}
+        active_days = build_active_days(N, join, leave, blocked_by_nurse)
         # 고정 셀
         for (n, d), s_idx in fixed.items():
             if (n, d) not in active_days:
@@ -696,7 +700,7 @@ def optimize_fallback_lex_hard_first(
             for n in range(N):
                 if preceptee_follow and n in preceptee_indices:
                     continue
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     if (n, d) in fixed and fixed[(n, d)] == w_idx:
                         continue
                     m.Add(X(n, d, w_idx) == 0)
@@ -710,6 +714,8 @@ def optimize_fallback_lex_hard_first(
                     continue
                 for d in range(join[n], leave[n] - 2):
                     if d + 3 > leave[n]:
+                        continue
+                    if any((n, d+k) not in active_days for k in range(4)):
                         continue
                     # if skip_4o_hard_first_days > 0 and d < skip_4o_hard_first_days:
                     #     continue
@@ -806,7 +812,7 @@ def optimize_fallback_lex_hard_first(
                     continue
                 if not bool(getattr(nu, "is_weekend_off", False)):
                     continue
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     if d in weekend_days:
                         # 주말(토/일): 기본 OFF 강제
                         # 단, 고정 셀이 근무로 지정되어 있으면(예: 특수 근무/교육 등) 고정이 우선이다.
@@ -964,7 +970,7 @@ def optimize_fallback_lex_hard_first(
 
         # exactly-one
         for n in range(N):
-            for d in range(join[n], leave[n] + 1):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 if (n, d) in fixed and not (preceptee_follow and n in preceptee_indices):
                     continue
                 m.AddExactlyOne(X(n, d, s) for s in range(S))
@@ -1250,8 +1256,12 @@ def optimize_fallback_lex_hard_first(
             if preceptee_follow and n in preceptee_indices:
                 continue
             T0, T1 = join[n], leave[n]
+            _blocked = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
             for d0 in range(T0, T1 - K + 1):
                 window = [d0 + t for t in range(K + 1)]
+                # blocked day가 있으면 해당 일은 근무 불가 → 연속근무 자동 중단 → 스킵
+                if any(d in _blocked for d in window):
+                    continue
                 # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
                 if any((n, d) in fixed and fixed[(n, d)] == off_idx for d in window):
                     continue
@@ -1489,7 +1499,7 @@ def optimize_fallback_lex_hard_first(
                         else 0
                     )
                     vacation_cnt = sum(
-                        1 for d in range(join[n], leave[n] + 1) if (n, d) in vacation_off_cells
+                        1 for d in iter_nurse_days(n, join, leave, blocked_by_nurse) if (n, d) in vacation_off_cells
                     )
                     weekend_forced = 0
                     if bool(getattr(nu, "is_weekend_off", False)):
@@ -1506,9 +1516,10 @@ def optimize_fallback_lex_hard_first(
                             )
                         except Exception:
                             weekend_forced = 0
+                    _n_blocked_t = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
                     off_bounds_for_target = compute_off_bounds(
                         source=cfg,
-                        avail_days=(leave[n] - join[n] + 1),
+                        avail_days=(leave[n] - join[n] + 1 - _n_blocked_t),
                         vacation_cnt=vacation_cnt,
                         reference_days=D_phys,
                         weekend_only=bool(getattr(nu, "is_weekend_off", False)),
@@ -1516,14 +1527,19 @@ def optimize_fallback_lex_hard_first(
                     )
                     min_target = int(off_bounds_for_target["min_off_required"])
                     max_target = int(off_bounds_for_target["max_off_allowed"])
-                    raw_target_o = max(0, effective_off_days - (weekly_target + weekend_forced))
+                    # blocked days 비례로 effective_off_days 조정
+                    _eff_off = effective_off_days
+                    if _n_blocked_t > 0:
+                        _ratio = max(0, leave[n] - join[n] + 1 - _n_blocked_t) / max(1, D_phys)
+                        _eff_off = max(0, round(effective_off_days * _ratio))
+                    raw_target_o = max(0, _eff_off - (weekly_target + weekend_forced))
                     target_o = min(max(raw_target_o, min_target), max_target)
                     if target_o <= 0:
                         continue
                     # 휴가/공가는 개인 O 목표 충족에서 제외
                     assigned_o = sum(
                         X(n, d, off_idx)
-                        for d in range(join[n], leave[n] + 1)
+                        for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
                         if (n, d) not in vacation_off_cells
                     )
                     slack_short = m.NewIntVar(0, D, f"off_quota_short_{n}")
@@ -1551,14 +1567,15 @@ def optimize_fallback_lex_hard_first(
                 nurse_id = getattr(nu, "nurse_id", "?")
                 is_weekend_off = bool(getattr(nu, "is_weekend_off", False))
 
-                avail_days = T1 - T0 + 1
+                _n_blocked = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
+                avail_days = T1 - T0 + 1 - _n_blocked
                 vacation_cnt = sum(
-                    1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells
+                    1 for d in range(T0, T1 + 1) if (n, d) in vacation_off_cells and (n, d) in active_days
                 )
                 structural_cnt = sum(
                     1
                     for d in range(T0, T1 + 1)
-                    if (n, d) in structural_off_cells and (n, d) not in vacation_off_cells
+                    if (n, d) in structural_off_cells and (n, d) not in vacation_off_cells and (n, d) in active_days
                 )
                 nonvac_active_days = max(0, avail_days - vacation_cnt)
                 off_bounds = compute_off_bounds(
@@ -1668,7 +1685,7 @@ def optimize_fallback_lex_hard_first(
             + OFF_PENALTY * sum(
                 X(n, d, off_idx)
                 for n in range(N)
-                for d in range(join[n], leave[n] + 1)
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
                 if (n, d) not in structural_off_cells
                 and (n, d) not in vacation_off_cells
                 )
@@ -1706,6 +1723,7 @@ def optimize_fallback_lex_hard_first(
                 add_preceptor_terms_fn=add_preceptor_terms_fn,
                 add_team_balance_terms_fn=add_team_balance_terms_fn,
                 add_grade_constraints_fn=add_grade_constraints_fn,
+                blocked_by_nurse=blocked_by_nurse,
             )
             m.Maximize(sum(obj))
 
@@ -1834,7 +1852,7 @@ def optimize_fallback_lex_hard_first(
             print(f"{logger_prefix} 폴백2 실패: 단계 불가능 → 1단계 해 사용")
             roster_system.roster.fill(0)
             for n in range(N):
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     for s in range(S):
                         if s1.Value(X1(n, d, s)):
                             roster_system.roster[n, d, s] = 1
@@ -1902,7 +1920,7 @@ def optimize_fallback_lex_hard_first(
         for k in safety3.keys():
             m3.Add(sum(safety3[k]) == sum(safety2[k]))
         for n in range(N):
-            for d in range(join[n], leave[n] + 1):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
                     try:
                         m3.AddHint(X3(n, d, s), s2.Value(X2(n, d, s)))
@@ -1918,7 +1936,7 @@ def optimize_fallback_lex_hard_first(
             print(f"{logger_prefix} 폴백3 실패: 선호 단계 불가능 → 2단계 해 사용")
             roster_system.roster.fill(0)
             for n in range(N):
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     for s in range(S):
                         if s2.Value(X2(n, d, s)):
                             roster_system.roster[n, d, s] = 1
@@ -1952,11 +1970,11 @@ def optimize_fallback_lex_hard_first(
             if off_idx is not None:
                 for n, nu in enumerate(roster_system.nurses):
                     assigned_off = sum(
-                        int(s3.Value(X3(n, d, off_idx))) for d in range(join[n], leave[n] + 1)
+                        int(s3.Value(X3(n, d, off_idx))) for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
                     )
                     vac_cnt = sum(
                         1
-                        for d in range(join[n], leave[n] + 1)
+                        for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
                         if (n, d) in off_exception_vacation_cells
                     )
                     weekly_target = len(weekly_off_by_idx.get(n, []) if isinstance(weekly_off_by_idx, dict) else [])
@@ -1983,7 +2001,7 @@ def optimize_fallback_lex_hard_first(
 
     roster_system.roster.fill(0)
     for n in range(N):
-        for d in range(join[n], leave[n] + 1):
+        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             for s in range(S):
                 if s3.Value(X3(n, d, s)):
                     roster_system.roster[n, d, s] = 1

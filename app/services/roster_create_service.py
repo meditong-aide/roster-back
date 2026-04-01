@@ -36,6 +36,8 @@ import calendar
 from sqlalchemy import text
 from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
+from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
+from services.day_windows import build_blocked_days
 from services.cp_sat.mid_feasibility import validate_mid_hard_feasibility as _validate_mid_hard_feasibility_impl
 
 logger = logging.getLogger(__name__)
@@ -2853,6 +2855,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         print(f"[WeekendOff] 대상 간호사 로깅 실패: {e}")
     month_start = date(req.year, req.month, 1)
     days_in_month = calendar.monthrange(req.year, req.month)[1]
+    # ── 병동이동 레이지 체크 + assignment 기반 blocked_by_nurse 구성 ──
+    flush_pending_transfers(db, current_user.group_id)
+    _assignments = get_active_assignments_for_month(db, current_user.group_id, req.year, req.month)
+    print(f"[Assignment] group_id={current_user.group_id}, year={req.year}, month={req.month}, assignments_count={len(_assignments)}")
+    for _a in _assignments:
+        print(f"[Assignment] id={_a.id}, nurse_id={_a.nurse_id}, reason={_a.reason}, source={_a.source_group_id}, target={_a.target_group_id}, start={_a.start_date}, end={_a.end_date}")
     active_range_candidates = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in engine_nurses
@@ -2928,6 +2936,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict.setdefault("cross_month_lookback_days", 6)
     config_dict.setdefault("allow_override_by_law", False)
     config_dict.setdefault("lookahead_days", 0)
+    # ── nurse_assignment 기반 blocked_by_nurse 구성 (솔버에 전달) ──
+    if _assignments:
+        # nurse_id(문자열) → blocked days로 구성. 솔버 내부에서 자체 인덱스로 변환함.
+        _blocked_by_id: dict[str, set[int]] = {}
+        for n in nurses_for_engine:
+            nid = str(n.nurse_id)
+            days = build_blocked_days(_assignments, nid, current_user.group_id, month_start, days_in_month)
+            if days:
+                _blocked_by_id[nid] = days
+                print(f"[Assignment] nurse_id={nid}, blocked_days={sorted(days)}")
+        if _blocked_by_id:
+            config_dict["blocked_by_nurse_id"] = _blocked_by_id
+            print(f"[Assignment] blocked_by_nurse_id 적용: {len(_blocked_by_id)}명")
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
     # _debug_log(
     #     "config_ready",
