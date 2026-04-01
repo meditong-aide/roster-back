@@ -593,6 +593,11 @@ def bulk_update_nurses_service(
                     target_group_id, new_active, db, role=new_role
                 )
 
+            if 'email' in update_data:
+                email_value = update_data.get('email')
+                if (email_value is None or (isinstance(email_value, str) and not email_value.strip())) and db_nurse.email:
+                    update_data.pop('email')
+
             # === 프론트에서 보내준 값으로 일괄 업데이트 ===
             for key, value in update_data.items():
                 if hasattr(db_nurse, key):
