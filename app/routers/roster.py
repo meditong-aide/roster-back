@@ -92,6 +92,7 @@ from services.roster_service import (
     get_schedule_status_service,
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
+    get_my_issued_roster_service,
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
@@ -452,6 +453,29 @@ async def get_issued_roster_snapshot(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to get issued roster snapshot: {str(e)}",
+        )
+
+
+# [Roster] - 본인 발행 근무표 조회
+@router.get("/issued_roster/me")
+async def get_my_issued_roster(
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    try:
+        result = get_my_issued_roster_service(
+            year=year, month=month, current_user=current_user, db=db
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="발행된 근무표가 없습니다.")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"개인 근무표 조회 실패: {str(e)}"
         )
 
 

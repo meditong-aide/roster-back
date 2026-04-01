@@ -486,6 +486,48 @@ def get_issued_roster_snapshot_service(
     }
 
 
+def get_my_issued_roster_service(
+    year: int,
+    month: int,
+    current_user,
+    db: Session,
+) -> dict | None:
+    """
+    로그인 사용자 본인의 발행된 근무표만 조회합니다.
+    snapshot의 roster_json에서 nurse_id 기준으로 추출.
+    """
+    snapshot_data = get_issued_roster_snapshot_service(
+        year=year, month=month, current_user=current_user, db=db
+    )
+    if not snapshot_data:
+        return None
+
+    roster = snapshot_data.get("roster") or {}
+    nurse_id = getattr(current_user, "nurse_id", None)
+    if not nurse_id:
+        return None
+
+    roster_nurses = roster.get("nurses") or []
+    my_roster = next(
+        (n for n in roster_nurses if str(n.get("nurse_id")) == str(nurse_id)),
+        None,
+    )
+    if not my_roster:
+        return None
+
+    return {
+        "year": roster.get("year"),
+        "month": roster.get("month"),
+        "nurse_id": my_roster.get("nurse_id"),
+        "name": my_roster.get("name"),
+        "schedule": my_roster.get("schedule"),
+        "schedule_ids": my_roster.get("schedule_ids"),
+        "counts": my_roster.get("counts"),
+        "shift_colors": roster.get("shift_colors"),
+        "issued_at": snapshot_data.get("created_at"),
+    }
+
+
 def create_issued_roster_snapshot(
     schedule: Schedule,
     current_user,
