@@ -3084,6 +3084,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             FixedWantedEntry.month == req.month,
             FixedWantedEntry.is_applied == True,
         ).all()
+        # shifts_table_id → shift_id 매핑 (정확한 코드 복원용)
+        _fw_table_id_to_shift_id: dict[int, str] = {
+            s.id: s.shift_id
+            for s in db.query(Shift.id, Shift.shift_id).filter(
+                Shift.group_id == current_user.group_id
+            ).all()
+        }
         fw_nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
         fw_fixed_cells = []
         _fw_skip_special = 0
@@ -3091,7 +3098,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         _fw_skip_range = 0
         _fw_code_counts: dict[str, int] = {}
         for fe in all_fixed_entries:
-            shift_code_raw = str(fe.shift_id or "").strip()
+            # shifts_table_id가 있으면 정확한 shift_id로 복원, 없으면 기존 값 사용
+            if fe.shifts_table_id and fe.shifts_table_id in _fw_table_id_to_shift_id:
+                shift_code_raw = _fw_table_id_to_shift_id[fe.shifts_table_id]
+            else:
+                shift_code_raw = str(fe.shift_id or "").strip()
             shift_code = shift_code_raw.upper()
             # special_shift_map 에 있는 코드는 이미 special_fixed_cells 에서 처리됨
             if shift_code in special_shift_map:

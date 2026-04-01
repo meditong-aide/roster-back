@@ -288,7 +288,11 @@ def _normalize_case_items(
     """
     normalized: list[dict[str, Any]] = []
     ignored: list[dict[str, Any]] = []
-    allowed_shifts = set(allowed_shift_map.keys()) if allowed_shift_map else None
+    # 대소문자 무시 매칭을 위한 lookup: upper → 원본 shift_id
+    allowed_upper_to_original: dict[str, str] = {}
+    if allowed_shift_map:
+        for sid in allowed_shift_map.keys():
+            allowed_upper_to_original[sid.upper()] = sid
 
     for item in case_raw or []:
         try:
@@ -307,10 +311,19 @@ def _normalize_case_items(
             ignored.append({"reason": "shift 누락", "item": payload})
             continue
 
-        shift = str(shift_raw).strip().upper()
-        if not shift or (allowed_shifts and shift not in allowed_shifts):
+        shift_input = str(shift_raw).strip()
+        if not shift_input:
             ignored.append({"reason": "허용되지 않는 shift", "item": payload})
             continue
+        # 대소문자 무시로 allowed_shifts에서 원본 shift_id 매칭
+        if allowed_upper_to_original:
+            matched = allowed_upper_to_original.get(shift_input.upper())
+            if not matched:
+                ignored.append({"reason": "허용되지 않는 shift", "item": payload})
+                continue
+            shift = matched
+        else:
+            shift = shift_input
 
         parsed_date = _parse_case_date(
             date_value=date_raw,
@@ -488,7 +501,7 @@ def _parse_shift_results(
                 if not isinstance(record, dict) or "shift" not in record:
                     continue
 
-                shift = str(record.get("shift", "")).strip().upper()
+                shift = str(record.get("shift", "")).strip()
                 if not shift:
                     continue
 
