@@ -139,6 +139,27 @@ class Nurse(Base):
     # office_id는 컬럼으로 관리
 
 
+class NurseAssignment(Base):
+    """간호사 배정/상태 변경 이력 (파견/휴직/퇴사/프리셉티/병동이동)"""
+    __tablename__ = "nurse_assignment"
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    source_group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    target_group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=True)
+    office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"), nullable=False)
+    start_date = Column(DATE, nullable=False)
+    expected_end_date = Column(DATE, nullable=True)
+    end_date = Column(DATE, nullable=True)
+    reason = Column(NVARCHAR(200), nullable=False)
+    status = Column(VARCHAR(10), nullable=False, default="active")
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    source_group = relationship("Group", foreign_keys=[source_group_id])
+    target_group = relationship("Group", foreign_keys=[target_group_id])
+
+
 class Schedule(Base):
     __tablename__ = "schedules"
     schedule_id = Column(CHAR(12), primary_key=True)

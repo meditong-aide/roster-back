@@ -16,3 +16,12 @@ test_folder/
 
 # OMC state
 .omc/
+
+# MCP config (contains DB credentials)
+.mcp.json
+
+# Claude Code local config
+.claude.json
+
+# Ruff config (local dev only)
+ruff.toml

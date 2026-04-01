@@ -680,6 +680,11 @@ def create_issued_roster_snapshot(
         .filter(ScheduleEntry.schedule_id == schedule.schedule_id)
         .all()
     )
+    # shifts.id → 현재 shift_id 매핑 (schedule_entries의 shift_id가 구 코드일 수 있으므로)
+    _int_id_to_shift_id: dict[int, str] = {
+        s.id: s.shift_id for s in shift_rows
+    }
+
     entries_by_nurse: dict = {}
     entry_ids_by_nurse: dict = {}
     for entry in entries:
@@ -688,7 +693,11 @@ def create_issued_roster_snapshot(
         if nurse_id not in entries_by_nurse:
             entries_by_nurse[nurse_id] = {}
             entry_ids_by_nurse[nurse_id] = {}
-        entries_by_nurse[nurse_id][day] = entry.shift_id
+        # entry.id(shifts.id)가 있으면 현재 shift_id로 복원, 없으면 기존 값 사용
+        if entry.id and entry.id in _int_id_to_shift_id:
+            entries_by_nurse[nurse_id][day] = _int_id_to_shift_id[entry.id]
+        else:
+            entries_by_nurse[nurse_id][day] = entry.shift_id
         entry_ids_by_nurse[nurse_id][day] = entry.id
 
     roster_nurses = []

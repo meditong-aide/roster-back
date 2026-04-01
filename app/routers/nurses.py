@@ -30,9 +30,19 @@ from schemas.roster_schema import (
     PasswordChangeRequest,
     PhoneChangeRequest,
     AddToGroupRequest,
+    NurseAssignmentCreate,
+    NurseAssignmentUpdate,
+    NurseAssignmentResponse,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
+from services.assignment_service import (
+    create_assignment,
+    update_assignment,
+    cancel_assignment,
+    get_assignments,
+    flush_pending_transfers,
+)
 from services.nurse_service import (
     get_nurses_in_group_service,
     bulk_update_nurses_service,
@@ -122,6 +132,10 @@ async def get_nurses_in_group(
         getattr(current_user, "office_id", None),
         getattr(current_user, "office_name", None),
     )
+    # 병동이동 레이지 체크
+    _group = group_id or getattr(current_user, "group_id", None)
+    if _group:
+        flush_pending_transfers(db, _group)
     print(
         "current_user",
         current_user.nurse_id,
@@ -912,3 +926,53 @@ async def delete_nurse(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")
+
+
+# ── NurseAssignment 엔드포인트 ──
+
+
+@router.post("/assignments", response_model=NurseAssignmentResponse)
+async def create_nurse_assignment(
+    req: NurseAssignmentCreate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
+    return create_assignment(req, db)
+
+
+@router.get("/assignments", response_model=List[NurseAssignmentResponse])
+async def get_nurse_assignments(
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 이력 조회"""
+    office_id = getattr(current_user, "office_id", None)
+    if not office_id:
+        raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
+    _group = group_id or getattr(current_user, "group_id", None)
+    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
+
+
+@router.put("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+async def update_nurse_assignment(
+    assignment_id: int,
+    req: NurseAssignmentUpdate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 수정 (기간/상태 변경)"""
+    return update_assignment(assignment_id, req, db)
+
+
+@router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+async def delete_nurse_assignment(
+    assignment_id: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 취소 (status → cancelled)"""
+    return cancel_assignment(assignment_id, db)
