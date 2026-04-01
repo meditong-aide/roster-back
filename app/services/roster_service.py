@@ -651,16 +651,20 @@ def create_issued_roster_snapshot(
 
     roster_nurses = []
     for n in nurses:
-        schedule_list = [
-            entries_by_nurse.get(n.nurse_id, {}).get(day, "-")
-            for day in range(1, days_in_month + 1)
-        ]
+        schedule_list = []
+        for day in range(1, days_in_month + 1):
+            code = entries_by_nurse.get(n.nurse_id, {}).get(day, "-")
+            schedule_list.append({
+                "code": code,
+                "color": shift_colors.get(code, ""),
+            })
         schedule_ids = [
             entry_ids_by_nurse.get(n.nurse_id, {}).get(day)
             for day in range(1, days_in_month + 1)
         ]
         counts = {
-            shift_id: schedule_list.count(shift_id) for shift_id in shift_colors.keys()
+            shift_id: sum(1 for item in schedule_list if item["code"] == shift_id)
+            for shift_id in shift_colors.keys()
         }
         roster_nurses.append(
             {
