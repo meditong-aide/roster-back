@@ -7,7 +7,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from fastapi import HTTPException
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 from db.models import NurseAssignment, Nurse as NurseModel
 from schemas.roster_schema import (
@@ -195,6 +195,167 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
     if count > 0:
         db.commit()
         logger.info("병동이동 레이지 체크 완료: %d건 처리", count)
+
+    return count
+
+
+def transfer_shifts_on_publish(
+    db: Session,
+    schedule_id: str,
+    source_group_id: str,
+    office_id: str,
+    year: int,
+    month: int,
+) -> int:
+    """마감(발행) 시 파견/병동이동 간호사의 shift를 target group에 전달.
+
+    - start/end 월에만 해당 (중간 월은 target이 독립 생성)
+    - source shift_id → default_shift → target shift_id 변환
+    - target group의 해당 월 schedule에 ScheduleEntry 생성
+    Returns: 전달된 entry 수
+    """
+    import uuid
+    from calendar import monthrange
+    from db.models import Schedule, ScheduleEntry, Shift
+
+    month_start = date(year, month, 1)
+    month_end = date(year, month, monthrange(year, month)[1])
+
+    # 1. 해당 월에 걸리는 파견/병동이동 assignment 조회
+    assignments = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(["파견", "병동이동"]),
+            NurseAssignment.source_group_id == source_group_id,
+            NurseAssignment.target_group_id.isnot(None),
+            NurseAssignment.start_date <= month_end,
+            or_(
+                NurseAssignment.end_date.is_(None),
+                NurseAssignment.end_date >= month_start,
+            ),
+        )
+        .all()
+    )
+    if not assignments:
+        return 0
+
+    # start/end 월만 필터 (중간 월 제외)
+    eligible = []
+    for a in assignments:
+        _is_start_month = (a.start_date.year == year and a.start_date.month == month)
+        _a_end = a.end_date or a.expected_end_date
+        _is_end_month = (
+            _a_end is not None
+            and _a_end.year == year
+            and _a_end.month == month
+        )
+        if _is_start_month or _is_end_month:
+            eligible.append(a)
+    if not eligible:
+        return 0
+
+    # 2. source group shift → default_shift 매핑
+    source_shifts = db.query(Shift).filter(Shift.group_id == source_group_id).all()
+    source_to_default = {s.shift_id: s.default_shift for s in source_shifts if s.default_shift}
+
+    # 3. target group별 default_shift → target shift_id 매핑
+    target_group_ids = {a.target_group_id for a in eligible}
+    target_default_maps: dict[str, dict[str, str]] = {}  # {target_gid: {default: shift_id}}
+    for tgid in target_group_ids:
+        target_shifts = db.query(Shift).filter(Shift.group_id == tgid).all()
+        dmap: dict[str, str] = {}
+        for s in target_shifts:
+            if s.default_shift and s.default_shift not in dmap:
+                dmap[s.default_shift] = s.shift_id
+        target_default_maps[tgid] = dmap
+
+    # 4. source schedule의 ScheduleEntry 조회 (해당 간호사들)
+    nurse_ids = {a.nurse_id for a in eligible}
+    source_entries = (
+        db.query(ScheduleEntry)
+        .filter(
+            ScheduleEntry.schedule_id == schedule_id,
+            ScheduleEntry.nurse_id.in_(nurse_ids),
+        )
+        .all()
+    )
+    entries_by_nurse: dict[str, dict[date, str]] = {}
+    for e in source_entries:
+        # work_date가 datetime일 수 있으므로 date로 정규화
+        _wd = e.work_date.date() if hasattr(e.work_date, 'date') else e.work_date
+        entries_by_nurse.setdefault(e.nurse_id, {})[_wd] = e.shift_id
+
+    # 5. target schedule 찾기/생성 + shift 변환 + entry 생성
+    count = 0
+    for a in eligible:
+        tgid = a.target_group_id
+        dmap = target_default_maps.get(tgid, {})
+        nurse_entries = entries_by_nurse.get(a.nurse_id, {})
+
+        # 전달 기간 계산 (assignment 기간과 해당 월의 교집합)
+        a_end = a.end_date or a.expected_end_date or month_end
+        transfer_start = max(a.start_date, month_start)
+        transfer_end = min(a_end, month_end)
+
+        # target group의 해당 월 issued/latest schedule 찾기
+        target_schedule = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id == tgid,
+                Schedule.year == year,
+                Schedule.month == month,
+                Schedule.dropped == False,
+            )
+            .order_by(Schedule.version.desc())
+            .first()
+        )
+        if not target_schedule:
+            logger.warning(
+                "전달 대상 schedule 없음: target_group=%s, %d년 %d월", tgid, year, month
+            )
+            continue
+
+        # target shift_id → id 매핑
+        target_shifts_db = db.query(Shift).filter(Shift.group_id == tgid).all()
+        target_shift_id_to_int = {s.shift_id: s.id for s in target_shifts_db}
+
+        # 기존 해당 간호사의 target entry 삭제 (재전달 지원)
+        db.query(ScheduleEntry).filter(
+            ScheduleEntry.schedule_id == target_schedule.schedule_id,
+            ScheduleEntry.nurse_id == a.nurse_id,
+            ScheduleEntry.work_date >= transfer_start,
+            ScheduleEntry.work_date <= transfer_end,
+        ).delete(synchronize_session=False)
+
+        # shift 변환 + entry 생성
+        d = transfer_start
+        while d <= transfer_end:
+            src_shift = nurse_entries.get(d)
+            if src_shift and src_shift != '-':
+                default_code = source_to_default.get(src_shift, src_shift.upper())
+                target_shift = dmap.get(default_code, default_code)
+                entry = ScheduleEntry(
+                    entry_id=str(uuid.uuid4().hex)[:16],
+                    schedule_id=target_schedule.schedule_id,
+                    nurse_id=a.nurse_id,
+                    work_date=d,
+                    shift_id=target_shift,
+                    id=target_shift_id_to_int.get(target_shift),
+                )
+                db.add(entry)
+                count += 1
+            d += timedelta(days=1)
+
+        logger.info(
+            "shift 전달: nurse_id=%s, %s→%s, %s~%s, %d건",
+            a.nurse_id, source_group_id, tgid,
+            transfer_start, transfer_end, count,
+        )
+
+    if count > 0:
+        db.flush()
+        logger.info("shift 전달 완료: 총 %d건", count)
 
     return count
 

@@ -302,6 +302,7 @@ def optimize_fallback_lex_hard_first(
     if preceptee_indices:
         print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
     exclude_preceptee_from_den = (not getattr(cfg, 'preceptee_shift_count', True)) and bool(preceptee_indices)
+    coverage_exclude_cells: set[tuple[int, int]] = getattr(roster_system, "coverage_exclude_cells", set()) or set()
     # 외부 스코프에서 로깅용으로 사용 (build_model 내부에서도 별도 정의)
     weekly_off_by_idx = (
         getattr(roster_system, "weekly_off_by_idx", {})
@@ -1037,6 +1038,7 @@ def optimize_fallback_lex_hard_first(
                     for n in range(N)
                     if join[n] <= d <= leave[n] and (n, d) not in fixed
                     and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                    and (n, d) not in coverage_exclude_cells
                 )
                 if code == "M":
                     if m_bucket_indices:
@@ -1046,6 +1048,7 @@ def optimize_fallback_lex_hard_first(
                             if join[n] <= d <= leave[n]
                             and (n, d) not in fixed
                             and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                            and (n, d) not in coverage_exclude_cells
                             for s2 in m_bucket_indices
                         )
                     else:

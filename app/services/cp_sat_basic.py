@@ -831,6 +831,19 @@ class CPSATBasicEngine:
                         print(f"[Assignment][Solver] nurse_id={nid}, solver_idx={idx}, blocked={sorted(days)}")
                 if _blocked_by_idx:
                     setattr(roster_system, "blocked_by_nurse", _blocked_by_idx)
+            # coverage_exclude: 파견 기간 커버리지 제외 (nurse_id → solver_idx 변환)
+            _cov_excl_id = config_data.get("coverage_exclude_nurse_days") if isinstance(config_data, dict) else None
+            if _cov_excl_id:
+                _id_to_idx = getattr(roster_system, '_id_to_idx', None) or {nu.db_id: i for i, nu in enumerate(nurses)}
+                _cov_excl_cells: set[tuple[int, int]] = set()
+                for nid, days in _cov_excl_id.items():
+                    idx = _id_to_idx.get(str(nid))
+                    if idx is not None:
+                        for d in days:
+                            _cov_excl_cells.add((idx, d))
+                if _cov_excl_cells:
+                    setattr(roster_system, "coverage_exclude_cells", _cov_excl_cells)
+                    print(f"[Assignment][Solver] coverage_exclude_cells: {len(_cov_excl_cells)}건")
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # 월단위 선호(개인 입력) - dict 형태로 전달됨을 가정
             # 예: {"441172": {"shift": "D", "strength": 7}, ...}
@@ -2495,6 +2508,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     coverage_shortage_vars = []
     over_vars_by_day = {}
     zero_demand_block_codes = {"D", "E", "N", "M"}
+    coverage_exclude_cells: set[tuple[int, int]] = getattr(rs, "coverage_exclude_cells", set()) or set()
     cfg = rs.config
     next_month_head_req = getattr(cfg, "next_month_head_requirements", None) or []
     for d in range(D):
@@ -2516,6 +2530,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 for n in range(N)
                 if join[n] <= d <= leave[n] and (n, d) not in fixed
                 and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                and (n, d) not in coverage_exclude_cells
             )
             if code == "M":
                 if m_bucket_indices:
@@ -2525,6 +2540,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         if join[n] <= d <= leave[n]
                         and (n, d) not in fixed
                         and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                        and (n, d) not in coverage_exclude_cells
                         for s2 in m_bucket_indices
                     )
                 else:

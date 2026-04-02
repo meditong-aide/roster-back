@@ -80,6 +80,19 @@ def build_blocked_days(
         end_idx = (overlap_end - month_start).days
 
         if a.reason in ("파견", "휴직", "퇴사", "병동이동") and a.source_group_id == group_id:
+            # 파견/병동이동: start_date 또는 end_date가 포함된 월 → source가 full 생성 (blocking 안 함)
+            # 중간 월(start/end 모두 다른 달)만 full blocked
+            if a.reason in ("파견", "병동이동"):
+                _is_start_month = (a_start.year == month_start.year and a_start.month == month_start.month)
+                _a_end_actual = a.end_date or a.expected_end_date
+                _is_end_month = (
+                    _a_end_actual is not None
+                    and _a_end_actual.year == month_start.year
+                    and _a_end_actual.month == month_start.month
+                )
+                if _is_start_month or _is_end_month:
+                    # start/end 월: source가 full month 생성 → blocking 안 함
+                    continue
             for d in range(start_idx, end_idx + 1):
                 blocked.add(d)
 

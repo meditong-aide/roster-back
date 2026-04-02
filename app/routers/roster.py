@@ -97,6 +97,7 @@ from services.roster_service import (
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
 from services.weekly_off_service import get_nurses_weekly_off_service
+from services.assignment_service import transfer_shifts_on_publish
 from utils.utils import send_roster_publish_push, send_roster_republish_push
 import uuid
 import pprint
@@ -619,12 +620,29 @@ async def get_roster_by_schedule_id(
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
 
     # Get all nurses in the group
-    nurses_in_group = (
+    nurses_in_group = list(
         db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
         .filter(Nurse.group_id == target_group_id)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
+    # 인바운드 간호사 추가: ScheduleEntry에 존재하지만 group에 없는 간호사
+    _group_nurse_ids = {n.nurse_id for n in nurses_in_group}
+    _all_entry_nurse_ids = {
+        row.nurse_id for row in
+        db.query(ScheduleEntry.nurse_id)
+        .filter(ScheduleEntry.schedule_id == schedule_id)
+        .distinct()
+        .all()
+    }
+    _inbound_ids = _all_entry_nurse_ids - _group_nurse_ids
+    if _inbound_ids:
+        _inbound_nurses = (
+            db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
+            .filter(Nurse.nurse_id.in_(_inbound_ids))
+            .all()
+        )
+        nurses_in_group.extend(_inbound_nurses)
 
     # Get shift manage data
     # Get shift colors
@@ -670,16 +688,17 @@ async def get_roster_by_schedule_id(
 
         counts = {shift: nurse_schedule.count(shift) for shift in shift_colors.keys()}
 
-        roster_data["nurses"].append(
-            {
-                "id": nurse.nurse_id,
-                "name": nurse.name,
-                "experience": nurse.experience,
-                "schedule": nurse_schedule,
-                "schedule_ids": schedule_ids,
-                "counts": counts,
-            }
-        )
+        nurse_entry = {
+            "id": nurse.nurse_id,
+            "name": nurse.name,
+            "experience": nurse.experience,
+            "schedule": nurse_schedule,
+            "schedule_ids": schedule_ids,
+            "counts": counts,
+        }
+        if nurse.nurse_id in _inbound_ids:
+            nurse_entry["is_inbound"] = True
+        roster_data["nurses"].append(nurse_entry)
     # print('roster_data', roster_data['nurses'])
     roster_data["violations"] = violations
     return roster_data
@@ -997,6 +1016,20 @@ async def publish_roster(
 
     db.add(issued_roster)
     db.add(snapshot)
+    # ── 파견/병동이동 shift 전달: source group 마감 시 target group에 shift 전달 ──
+    try:
+        _transfer_cnt = transfer_shifts_on_publish(
+            db=db,
+            schedule_id=req.schedule_id,
+            source_group_id=target_group_id,
+            office_id=office_id,
+            year=schedule.year,
+            month=schedule.month,
+        )
+        if _transfer_cnt > 0:
+            print(f"[Publish] 파견/병동이동 shift 전달: {_transfer_cnt}건")
+    except Exception as e:
+        print(f"[Publish] shift 전달 실패: {e}")
     db.commit()
     nurses_in_group = (
         db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
