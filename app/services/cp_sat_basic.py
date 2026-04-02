@@ -2168,8 +2168,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             for s in range(S):
                 Xv[n, d, s] = m.NewBoolVar(f"x_{n}_{d}_{s}")
+    _false_var = m.NewConstant(0)
     def X(n, d, s):
-        return Xv.get((n, d, s), 0)
+        return Xv.get((n, d, s), _false_var)
 
     def countable_off(n: int, d: int) -> int:
         """vacation_off_cells를 제외한 O 변수만 반환한다."""

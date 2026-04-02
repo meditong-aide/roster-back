@@ -18,16 +18,50 @@ def build_blocked_days(
     group_id: str,
     month_start: date,
     days_in_month: int,
+    is_inbound: bool = False,
 ) -> set[int]:
     """특정 간호사의 해당 월 blocked day index 집합을 반환한다.
 
     blocked 조건:
-    - reason이 파견/휴직/퇴사 이고 source_group_id == group_id → 해당 기간 blocked
-    - reason이 파견/병동이동 이고 target_group_id == group_id → 해당 기간 외 blocked (아직 미도착)
+    - reason이 파견/휴직/퇴사/병동이동 이고 source_group_id == group_id → 해당 기간 blocked (아웃바운드)
+    - is_inbound=True: 인바운드 간호사 — assignment 기간 외의 모든 날이 blocked
     """
     month_end = month_start + timedelta(days=days_in_month - 1)
     blocked: set[int] = set()
 
+    if is_inbound:
+        # 인바운드: assignment 기간만 active, 나머지 blocked
+        active_days: set[int] = set()
+        for a in assignments:
+            if a.nurse_id != nurse_db_id:
+                continue
+            if a.status == "cancelled":
+                continue
+            if a.reason not in ("파견", "병동이동"):
+                continue
+            if a.target_group_id != group_id:
+                continue
+
+            a_start = a.start_date
+            a_end = a.end_date or a.expected_end_date or month_end
+
+            if a_end < month_start or a_start > month_end:
+                continue
+
+            overlap_start = max(a_start, month_start)
+            overlap_end = min(a_end, month_end)
+            start_idx = (overlap_start - month_start).days
+            end_idx = (overlap_end - month_start).days
+            for d in range(start_idx, end_idx + 1):
+                active_days.add(d)
+
+        # active_days 외의 모든 날 → blocked
+        for d in range(days_in_month):
+            if d not in active_days:
+                blocked.add(d)
+        return blocked
+
+    # 아웃바운드 (기존 로직)
     for a in assignments:
         if a.nurse_id != nurse_db_id:
             continue
@@ -37,7 +71,6 @@ def build_blocked_days(
         a_start = a.start_date
         a_end = a.end_date or a.expected_end_date or month_end
 
-        # 기간이 해당 월과 겹치지 않으면 스킵
         if a_end < month_start or a_start > month_end:
             continue
 
@@ -47,16 +80,10 @@ def build_blocked_days(
         end_idx = (overlap_end - month_start).days
 
         if a.reason in ("파견", "휴직", "퇴사", "병동이동") and a.source_group_id == group_id:
-            # 이 그룹에서 빠지는 기간 → blocked
             for d in range(start_idx, end_idx + 1):
                 blocked.add(d)
 
         elif a.reason == "프리셉티":
-            # 프리셉티는 blocked가 아님 — 프리셉터 팔로우로 처리
-            pass
-
-        elif a.reason in ("파견", "병동이동") and a.target_group_id == group_id:
-            # 이 그룹에 들어오는 간호사 — blocked 아님 (인바운드)
             pass
 
     return blocked

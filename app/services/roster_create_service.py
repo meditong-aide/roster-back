@@ -2570,15 +2570,17 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
             shift_code = entries_by_nurse.get(nurse.nurse_id, {}).get(d, '-')
             nurse_schedule.append(shift_code)
         counts = {shift: nurse_schedule.count(shift) for shift in shift_colors.keys()}
-        roster_data["nurses"].append(
-            {
-                "id": nurse.nurse_id,
-                "name": nurse.name,
-                "experience": nurse.experience,
-                "schedule": nurse_schedule,
-                "counts": counts,
-            }
-        )
+        nurse_entry = {
+            "id": nurse.nurse_id,
+            "name": nurse.name,
+            "experience": nurse.experience,
+            "schedule": nurse_schedule,
+            "counts": counts,
+        }
+        if getattr(nurse, 'is_inbound', False):
+            nurse_entry["is_inbound"] = True
+            nurse_entry["source_group_id"] = getattr(nurse, 'group_id', None)
+        roster_data["nurses"].append(nurse_entry)
     return roster_data
 
 
@@ -2861,10 +2863,44 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     print(f"[Assignment] group_id={current_user.group_id}, year={req.year}, month={req.month}, assignments_count={len(_assignments)}")
     for _a in _assignments:
         print(f"[Assignment] id={_a.id}, nurse_id={_a.nurse_id}, reason={_a.reason}, source={_a.source_group_id}, target={_a.target_group_id}, start={_a.start_date}, end={_a.end_date}")
+    # ── 인바운드 간호사: 타겟 그룹에 파견/병동이동으로 들어오는 간호사를 엔진에 추가 ──
+    _inbound_assignments = [
+        a for a in _assignments
+        if a.reason in ("파견", "병동이동")
+        and a.target_group_id == current_user.group_id
+        and a.source_group_id != current_user.group_id
+    ]
+    _existing_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
+    _inbound_nurse_ids = {str(a.nurse_id) for a in _inbound_assignments} - _existing_nurse_ids
+    if _inbound_nurse_ids:
+        _inbound_nurses = db.query(Nurse).filter(
+            Nurse.nurse_id.in_(_inbound_nurse_ids),
+            Nurse.active == 1,
+        ).all()
+        for n in _inbound_nurses:
+            setattr(n, 'is_inbound', True)
+        engine_nurses.extend(_inbound_nurses)
+        nurses_in_group.extend(_inbound_nurses)
+        print(
+            f"[Assignment][Inbound] 인바운드 간호사 {len(_inbound_nurses)}명 엔진 추가: "
+            f"{[f'{n.name}({n.nurse_id})' for n in _inbound_nurses]}"
+        )
     active_range_candidates = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in engine_nurses
     }
+    # 인바운드 간호사: active_range를 assignment 기간 기준으로 오버라이드 (joining_date가 다른 그룹 기준이므로)
+    for _ia in (_inbound_assignments if _assignments else []):
+        nid = str(_ia.nurse_id)
+        if nid not in _inbound_nurse_ids:
+            continue
+        _a_start = _ia.start_date
+        _a_end = _ia.end_date or _ia.expected_end_date or (month_start + timedelta(days=days_in_month - 1))
+        _month_end = month_start + timedelta(days=days_in_month - 1)
+        _s = max(_a_start, month_start)
+        _e = min(_a_end, _month_end)
+        if _s <= _e:
+            active_range_candidates[nid] = (((_s - month_start).days), ((_e - month_start).days))
     excluded_engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is None
     ]
@@ -2942,10 +2978,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         _blocked_by_id: dict[str, set[int]] = {}
         for n in nurses_for_engine:
             nid = str(n.nurse_id)
-            days = build_blocked_days(_assignments, nid, current_user.group_id, month_start, days_in_month)
+            _is_inbound = bool(getattr(n, 'is_inbound', False))
+            days = build_blocked_days(
+                _assignments, nid, current_user.group_id, month_start, days_in_month,
+                is_inbound=_is_inbound,
+            )
             if days:
                 _blocked_by_id[nid] = days
-                print(f"[Assignment] nurse_id={nid}, blocked_days={sorted(days)}")
+                _label = "[Inbound]" if _is_inbound else ""
+                print(f"[Assignment]{_label} nurse_id={nid}, blocked_days={sorted(days)}")
         if _blocked_by_id:
             config_dict["blocked_by_nurse_id"] = _blocked_by_id
             print(f"[Assignment] blocked_by_nurse_id 적용: {len(_blocked_by_id)}명")

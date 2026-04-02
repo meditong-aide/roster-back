@@ -532,8 +532,9 @@ def optimize_fallback_lex_hard_first(
                 pass
         Xv = {}
 
+        _false_var = m.NewConstant(0)
         def X(n, d, s):
-            return Xv.get((n, d, s), 0)
+            return Xv.get((n, d, s), _false_var)
 
         def is_pure_o(n: int, d: int):
             """휴가/공가(예외 휴무) 좌표는 제외한 순수 O만 반환합니다."""
