@@ -160,6 +160,24 @@ class NurseAssignment(Base):
     target_group = relationship("Group", foreign_keys=[target_group_id])
 
 
+class ShiftTransferLog(Base):
+    """마감 시 파견/병동이동 shift 전달 이력"""
+    __tablename__ = "shift_transfer_logs"
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    schedule_id = Column(CHAR(12), nullable=False)
+    target_schedule_id = Column(CHAR(12), nullable=False)
+    assignment_id = Column(INTEGER, nullable=False)
+    nurse_id = Column(VARCHAR(50), nullable=False)
+    source_group_id = Column(VARCHAR(50), nullable=False)
+    target_group_id = Column(VARCHAR(50), nullable=False)
+    transfer_start = Column(DATE, nullable=False)
+    transfer_end = Column(DATE, nullable=False)
+    entry_count = Column(INTEGER, nullable=False, default=0)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    transferred_at = Column(DATETIME, nullable=False, default=func.now())
+
+
 class Schedule(Base):
     __tablename__ = "schedules"
     schedule_id = Column(CHAR(12), primary_key=True)

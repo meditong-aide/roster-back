@@ -97,7 +97,7 @@ from services.roster_service import (
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
 from services.weekly_off_service import get_nurses_weekly_off_service
-from services.assignment_service import transfer_shifts_on_publish
+from services.assignment_service import transfer_shifts_on_publish, get_transfer_logs, get_transferred_wanted
 from utils.utils import send_roster_publish_push, send_roster_republish_push
 import uuid
 import pprint
@@ -2752,3 +2752,33 @@ async def render_schedule_share_image(token: str, db: Session = Depends(get_db))
         )
 
     return StreamingResponse(io.BytesIO(image_bytes), media_type=content_type)
+
+
+# ── 파견/병동이동 전달 이력 조회 ──
+
+@router.get("/transfers")
+def get_shift_transfers(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None,
+    user: User = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """전달 이력 조회 (운영자: group_id / 당사자: nurse_id)"""
+    _group = group_id or user.group_id
+    _nurse = nurse_id or None
+    logs = get_transfer_logs(db, year=year, month=month, group_id=_group, nurse_id=_nurse)
+    return {"transfers": logs}
+
+
+@router.get("/transferred-wanted")
+def get_transferred_wanted_api(
+    nurse_id: str,
+    year: int,
+    month: int,
+    user: User = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """파견/병동이동 간호사의 원티드를 target group shift로 변환 조회"""
+    return get_transferred_wanted(db, nurse_id=nurse_id, year=year, month=month)

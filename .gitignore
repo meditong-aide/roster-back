@@ -25,3 +25,6 @@ test_folder/
 
 # Ruff config (local dev only)
 ruff.toml
+
+# AGENTS.md governance files (local dev only)
+**/AGENTS.md
