@@ -844,6 +844,18 @@ class CPSATBasicEngine:
                 if _cov_excl_cells:
                     setattr(roster_system, "coverage_exclude_cells", _cov_excl_cells)
                     print(f"[Assignment][Solver] coverage_exclude_cells: {len(_cov_excl_cells)}건")
+            # preceptee_period: 프리셉티 기간 (nurse_id → solver_idx 변환)
+            _pperiod_id = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
+            if _pperiod_id:
+                _id_to_idx = getattr(roster_system, '_id_to_idx', None) or {nu.db_id: i for i, nu in enumerate(nurses)}
+                _pperiod_idx: dict[int, set[int]] = {}
+                for nid, days in _pperiod_id.items():
+                    idx = _id_to_idx.get(str(nid))
+                    if idx is not None:
+                        _pperiod_idx[idx] = days
+                        print(f"[Assignment][Solver] preceptee_period: nurse_id={nid}, solver_idx={idx}, days={sorted(days)}")
+                if _pperiod_idx:
+                    setattr(roster_system, "preceptee_follow_days", _pperiod_idx)
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # 월단위 선호(개인 입력) - dict 형태로 전달됨을 가정
             # 예: {"441172": {"shift": "D", "strength": 7}, ...}
@@ -1252,16 +1264,29 @@ class CPSATBasicEngine:
             special_converted = 0
             _pte_fw_map = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
             _fw_restored = 0
+            _pp_follow_days = getattr(roster_system, 'preceptee_follow_days', {}) or {}
             for n, nu in enumerate(roster_system.nurses):
                 pid = getattr(nu, 'preceptor_id', None)
                 if not pid or pid not in id_to_idx:
                     continue
                 ptr_idx = id_to_idx[pid]
-                # 1단계: 프리셉터 roster 전체 복사
-                roster_system.roster[n] = roster_system.roster[ptr_idx].copy()
+                # 1단계: 프리셉터 roster 복사 (기간 제한 적용)
+                _follow_set = _pp_follow_days.get(n)
+                print(f"[PrecepteeSync] n={n}, nurse={nu.name}({nu.db_id}), _follow_set={'set('+str(sorted(_follow_set))+')' if _follow_set is not None else 'None'}, _pp_follow_days_keys={list(_pp_follow_days.keys())}")
+                if _follow_set is not None:
+                    # 기간 내 day만 프리셉터 복사
+                    for d in _follow_set:
+                        if d < roster_system.num_days:
+                            roster_system.roster[n, d, :] = roster_system.roster[ptr_idx, d, :]
+                else:
+                    # 기간 미설정 → 전체 월 복사 (기존 동작)
+                    roster_system.roster[n] = roster_system.roster[ptr_idx].copy()
                 # 2단계: 특수코드 일자는 프리셉티를 OFF로 전환
                 if _off_s_idx is not None:
                     for d in range(roster_system.num_days):
+                        # 기간 외 day는 skip (독립 배정 유지)
+                        if _follow_set is not None and d not in _follow_set:
+                            continue
                         if (n, d) in _pte_fw_map:
                             _fw_code = _pte_fw_map[(n, d)]
                             if _fw_code in _shift_types:
@@ -1481,9 +1506,17 @@ class CPSATBasicEngine:
                         if not _pid or _pid not in _id2i:
                             continue
                         _pi = _id2i[_pid]
-                        roster_system.roster[_n] = roster_system.roster[_pi].copy()
+                        _gr_follow_set = _pp_follow_days.get(_n) if _pp_follow_days else None
+                        if _gr_follow_set is not None:
+                            for _fd in _gr_follow_set:
+                                if _fd < roster_system.num_days:
+                                    roster_system.roster[_n, _fd, :] = roster_system.roster[_pi, _fd, :]
+                        else:
+                            roster_system.roster[_n] = roster_system.roster[_pi].copy()
                         if _oi is not None:
                             for _d in range(roster_system.num_days):
+                                if _gr_follow_set is not None and _d not in _gr_follow_set:
+                                    continue
                                 if (_n, _d) in _gr_pte_fw:
                                     _fw_code = _gr_pte_fw[(_n, _d)]
                                     if _fw_code in _st:
@@ -1545,6 +1578,7 @@ class CPSATBasicEngine:
             _synced_final_fw = 0
             _pte_fw_raw_final = _preceptee_fixed_wanted_map_raw
             _pte_fw_norm_final = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
+            _pp_fw_final = getattr(roster_system, 'preceptee_follow_days', {}) or {}
             for nu in nurses:
                 _pid_f = getattr(nu, 'preceptor_id', None)
                 if not _pid_f or _pid_f not in _id2i_final:
@@ -1553,8 +1587,13 @@ class CPSATBasicEngine:
                 pte_sched = result.get(nu.db_id, [])
                 if not ptr_sched or not pte_sched:
                     continue
+                _n_final = _id2i_final.get(nu.db_id)
+                _final_follow_set = _pp_fw_final.get(_n_final) if _n_final is not None else None
                 changed = False
                 for d_i in range(min(len(ptr_sched), len(pte_sched))):
+                    # 기간 제한: follow 기간 외 day는 skip
+                    if _final_follow_set is not None and d_i not in _final_follow_set:
+                        continue
                     _n_idx_final = _id2i_final.get(nu.db_id)
                     _fw_code_final = None
                     if _n_idx_final is not None:
@@ -2206,14 +2245,34 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     preceptee_indices = set(preceptee_indices)
     if preceptee_indices:
         print(f"[FIX] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
+    # 프리셉티 기간 제한
+    preceptee_follow_days: dict[int, set[int]] = getattr(rs, "preceptee_follow_days", {}) or {}
+    _has_preceptee_period = bool(preceptee_follow_days)
+    # 기간이 빈 set인 프리셉티 = 해당 월에서 프리셉티 아님 → preceptee_indices에서 제거
+    if _has_preceptee_period:
+        _empty_period = {n for n, days in preceptee_follow_days.items() if len(days) == 0}
+        if _empty_period:
+            preceptee_indices -= _empty_period
+            print(f"[FIX] 프리셉티 기간 종료 → 인덱스 제거: {_empty_period}")
+
+    def _is_preceptee_at(n: int, d: int = -1) -> bool:
+        if not preceptee_follow or n not in preceptee_indices:
+            return False
+        if not _has_preceptee_period:
+            return True  # 기간 미설정 → 전체 월 follow
+        if n not in preceptee_follow_days:
+            return True  # 이 간호사에 대한 기간 미설정 → 전체 월 follow
+        if d < 0:
+            return False  # nurse-level: 기간 설정됨 → 제약 skip 안 함 (day별 판별 필요)
+        return d in preceptee_follow_days[n]
 
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
         if (n, d) not in active_days:
             print(f"[CP-SAT-Basic] 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
             continue
-        # 프리셉티는 고정 셀 스킵 (프리셉터의 스케줄을 따라감)
-        if preceptee_follow and n in preceptee_indices:
+        # 프리셉티는 고정 셀 스킵 (프리셉터의 스케줄을 따라감, 기간 내만)
+        if _is_preceptee_at(n, d):
             continue
         m.Add(X(n,d,s_idx)==1)
         for s in range(S):
@@ -2221,7 +2280,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # W(특별 근무)는 고정 셀 외에는 전부 금지
     if has_w and w_idx is not None:
         for n in range(N):
-            if preceptee_follow and n in preceptee_indices:
+            if _is_preceptee_at(n):
                 continue
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 if (n, d) in fixed and fixed[(n, d)] == w_idx:
@@ -2235,7 +2294,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         off_or_weekly = {cell for cell in structural_off_cells if cell not in vac_cells}
         skip_4o_hard_first_days = int(getattr(rs.config, "skip_4o_hard_first_days", 3) or 0)
         for n in range(N):
-            if preceptee_follow and n in preceptee_indices:
+            if _is_preceptee_at(n):
                 continue
             for d in range(join[n], leave[n] - 2):
                 if d + 3 > leave[n]:
@@ -2273,7 +2332,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         print(f"[CP-SAT-Basic] [4O-cross-month-debug] prev_off_tail keys={list(prev_off_tail.keys())}, "
               f"values={dict(prev_off_tail)}, N={N}")
         for n in range(N):
-            if preceptee_follow and n in preceptee_indices:
+            if _is_preceptee_at(n):
                 continue
             t = prev_off_tail.get(n, 0)
             if t <= 0 or t >= 4:
@@ -2321,7 +2380,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     if enforce_clustered_offs and off_idx_full is not None:
         slack_penalty = int(getattr(rs.config, "isolated_off_slack_penalty", 300000) or 0)
         for n in range(N):
-            if preceptee_follow and n in preceptee_indices:
+            if _is_preceptee_at(n):
                 continue
             t0, t1 = join[n], leave[n]
             for d in range(t0, t1 + 1):
@@ -2376,7 +2435,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     #     for n, day_list in weekly_off_by_idx.items():
     #         if n >= len(join):
     #             continue
-    #         if preceptee_follow and n in preceptee_indices:
+    #         if _is_preceptee_at(n):
     #             continue
     #         # 주말 휴무 대상자는 주휴 인접 OFF 배치를 적용하지 않는다.
     #         if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
@@ -2424,7 +2483,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if hasattr(rs, 'initial_forbidden') and isinstance(rs.initial_forbidden, dict):
             for (n, d), code_list in rs.initial_forbidden.items():
                 # 프리셉티는 AllowedShiftTypes 금지 면제 (프리셉터 스케줄 따라감)
-                if preceptee_follow and n in preceptee_indices:
+                if _is_preceptee_at(n):
                     continue
                 for code in (code_list or []):
                     if code not in rs.config.shift_types:
@@ -2444,7 +2503,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     for n in range(N):
         for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             # 프리셉티는 고정 셀 스킵되었으므로 ExactlyOne 필요
-            if (n,d) in fixed and not (preceptee_follow and n in preceptee_indices):
+            if (n,d) in fixed and not (_is_preceptee_at(n, d)):
                 continue
             m.AddExactlyOne(X(n,d,s) for s in range(S))
 
@@ -2467,9 +2526,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             d_end = min(leave[n], leave[p])
             # print(f"[CP-SAT-Basic] 프리셉티 팔로우: {nu.name}(idx={n}) → {preceptor_nurse.name}(idx={p}), "
             #       f"days={d_start}~{d_end}")
-            # 하드 제약: 프리셉티(n)의 근무 = 프리셉터(p)의 근무
+            # 하드 제약: 프리셉티(n)의 근무 = 프리셉터(p)의 근무 (기간 내에만)
             for d in range(d_start, d_end + 1):
-                # print(f"[DEBUG] 팔로우 제약 추가: 프리셉티 n={n}, 프리셉터 p={p}, day={d+1}")
+                if not _is_preceptee_at(n, d):
+                    continue
                 for s in range(S):
                     xn = X(n, d, s)
                     xp = X(p, d, s)
@@ -2610,7 +2670,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     for n,nu in enumerate(rs.nurses):
         T0,T1 = join[n], leave[n]
         # 프리셉티는 프리셉터의 일정을 그대로 따르므로 개별 하드제약 면제
-        if preceptee_follow and n in preceptee_indices:
+        if _is_preceptee_at(n):
             continue
         # 주말 휴무 제약: is_weekend_off=True인 간호사는 주말(토/일)은 기본적으로 OFF를 강제하고,
         # 평일(월~금)에는 OFF를 금지한다.
@@ -2748,13 +2808,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         try:
             off_windows = getattr(rs, "off_window_constraints", {}) or {}
             if off_idx_full is not None:
+                _blocked_ow = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 for (w_start, w_end) in off_windows.get(n, []) or []:
                     left = max(T0, w_start)
                     right = min(T1, w_end)
                     if left > right:
                         continue
                     # 유저 고정 우선: 윈도우 내 고정 비-OFF 셀은 제외하고 적용
-                    free_days = [d for d in range(left, right + 1) if not ((n, d) in fixed and fixed[(n, d)] != off_idx_full)]
+                    # blocked day도 제외 (X 변수 없음 → sum=0 → INFEASIBLE 방지)
+                    free_days = [d for d in range(left, right + 1) if d not in _blocked_ow and not ((n, d) in fixed and fixed[(n, d)] != off_idx_full)]
                     if not free_days:
                         print(f"[CP-SAT-Basic] off_window 무시 (유저 고정 우선): n={n}, window=[{left+1},{right+1}] 전체 고정")
                         continue
@@ -2976,8 +3038,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if cfg.two_offs_after_three_nig and n not in n_forbid_n:
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
             n_offs_after_3n = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
+            _blocked_3n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
             _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
-            if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1:
+            if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                 end_prev_block = m.NewBoolVar(f"end_3n_prev_{n}")
                 m.Add(end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
@@ -3016,9 +3079,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if cfg.two_offs_after_two_nig and n not in n_forbid_n:
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
             n_offs_after = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
+            _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
             # 전월 N tail 뒤 이미 소비된 OFF 수를 반영: req_offs(2) - offs_after 만큼만 현월에서 추가 필요
             _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
-            if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1:
+            if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
                 end_prev_block = m.NewBoolVar(f"end_2n_prev_{n}")
                 m.Add(end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):

@@ -132,14 +132,20 @@ def get_active_assignments_for_month(
     month_start = date(year, month, 1)
     month_end = date(year, month, monthrange(year, month)[1])
 
+    # end_date 또는 expected_end_date 중 확정된 값이 해당 월 이전이면 제외
+    from sqlalchemy import case, func as sa_func
+    _effective_end = case(
+        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+        else_=NurseAssignment.expected_end_date,
+    )
     return (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.status == "active",
             NurseAssignment.start_date <= month_end,
             or_(
-                NurseAssignment.end_date.is_(None),
-                NurseAssignment.end_date >= month_start,
+                _effective_end.is_(None),
+                _effective_end >= month_start,
             ),
             or_(
                 NurseAssignment.source_group_id == group_id,
