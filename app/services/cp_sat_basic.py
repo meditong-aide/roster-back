@@ -620,7 +620,7 @@ class CPSATBasicEngine:
                 'id': nurse_idx,  # 엔진에서 사용할 인덱스 ID
                 'db_id': nurse_data['nurse_id'],  # DB ID
                 'name': nurse_data['name'],
-                'experience_years': nurse_data.get('experience', 0),
+                'experience_years': nurse_data.get('experience') or 0,
                 # Grade(1~3): None 허용. 변환 정책은 Grade 제약 모듈에서 처리한다.
                 'grade': nurse_data.get('grade'),
                 'is_head_nurse': nurse_data.get('is_head_nurse', False),

@@ -445,6 +445,12 @@ async def get_issued_roster_snapshot(
         )
         if not snapshot:
             raise HTTPException(status_code=404, detail="Issued snapshot not found")
+
+        # 파견/병동이동 assignment 메타데이터 추가
+        from services.assignment_service import get_roster_assignments
+        snapshot["assignments"] = get_roster_assignments(
+            db, group_id=target_group_id, year=year, month=month,
+        )
         return snapshot
     except HTTPException:
         raise
@@ -701,6 +707,13 @@ async def get_roster_by_schedule_id(
         roster_data["nurses"].append(nurse_entry)
     # print('roster_data', roster_data['nurses'])
     roster_data["violations"] = violations
+
+    # 파견/병동이동 assignment 메타데이터 추가
+    from services.assignment_service import get_roster_assignments
+    roster_data["assignments"] = get_roster_assignments(
+        db, group_id=target_group_id, year=schedule.year, month=schedule.month,
+    )
+
     return roster_data
 
 
@@ -858,6 +871,12 @@ async def get_roster_for_month(
             }
         )
     roster_data["violations"] = violations
+
+    # 파견/병동이동 assignment 메타데이터 추가
+    from services.assignment_service import get_roster_assignments
+    roster_data["assignments"] = get_roster_assignments(
+        db, group_id=target_group_id, year=year, month=month,
+    )
 
     return roster_data
 

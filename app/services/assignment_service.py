@@ -190,8 +190,9 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
         )
         if nurse and nurse.group_id != row.target_group_id:
             nurse.group_id = row.target_group_id
+            nurse.team_id = None
             logger.info(
-                "병동이동 적용: nurse_id=%s, %s → %s",
+                "병동이동 적용: nurse_id=%s, %s → %s (team 초기화)",
                 row.nurse_id, row.source_group_id, row.target_group_id,
             )
         row.status = "completed"
@@ -213,16 +214,14 @@ def transfer_shifts_on_publish(
     year: int,
     month: int,
 ) -> int:
-    """마감(발행) 시 파견/병동이동 간호사의 shift를 target group에 전달.
+    """마감(발행) 시 파견/병동이동 전달 이력을 기록한다.
 
     - start/end 월에만 해당 (중간 월은 target이 독립 생성)
-    - source shift_id → default_shift → target shift_id 변환
-    - target group의 해당 월 schedule에 ScheduleEntry 생성
-    Returns: 전달된 entry 수
+    - target_schedule_id는 null (target에서 근무표 생성 시 별도 기록)
+    - 실제 entry 복사는 target 근무표 생성 시 수행
+    Returns: 기록된 log 수
     """
-    import uuid
     from calendar import monthrange
-    from db.models import Schedule, ScheduleEntry, Shift
 
     month_start = date(year, month, 1)
     month_end = date(year, month, monthrange(year, month)[1])
@@ -261,22 +260,8 @@ def transfer_shifts_on_publish(
     if not eligible:
         return 0
 
-    # 2. source group shift → default_shift 매핑
-    source_shifts = db.query(Shift).filter(Shift.group_id == source_group_id).all()
-    source_to_default = {s.shift_id: s.default_shift for s in source_shifts if s.default_shift}
-
-    # 3. target group별 default_shift → target shift_id 매핑
-    target_group_ids = {a.target_group_id for a in eligible}
-    target_default_maps: dict[str, dict[str, str]] = {}  # {target_gid: {default: shift_id}}
-    for tgid in target_group_ids:
-        target_shifts = db.query(Shift).filter(Shift.group_id == tgid).all()
-        dmap: dict[str, str] = {}
-        for s in target_shifts:
-            if s.default_shift and s.default_shift not in dmap:
-                dmap[s.default_shift] = s.shift_id
-        target_default_maps[tgid] = dmap
-
-    # 4. source schedule의 ScheduleEntry 조회 (해당 간호사들)
+    # 2. source schedule의 entry 수 집계 (log용)
+    from db.models import ScheduleEntry
     nurse_ids = {a.nurse_id for a in eligible}
     source_entries = (
         db.query(ScheduleEntry)
@@ -286,117 +271,185 @@ def transfer_shifts_on_publish(
         )
         .all()
     )
-    entries_by_nurse: dict[str, dict[date, str]] = {}
+    entry_count_by_nurse: dict[str, int] = {}
     for e in source_entries:
-        # work_date가 datetime일 수 있으므로 date로 정규화
         _wd = e.work_date.date() if hasattr(e.work_date, 'date') else e.work_date
-        entries_by_nurse.setdefault(e.nurse_id, {})[_wd] = e.shift_id
+        entry_count_by_nurse[e.nurse_id] = entry_count_by_nurse.get(e.nurse_id, 0) + 1
 
-    # 5. target schedule 찾기/생성 + shift 변환 + entry 생성
+    # 3. 기존 미소비 pending log 정리 (재마감 대응)
+    assignment_ids = [a.id for a in eligible]
+    db.query(ShiftTransferLog).filter(
+        ShiftTransferLog.assignment_id.in_(assignment_ids),
+        ShiftTransferLog.year == year,
+        ShiftTransferLog.month == month,
+        ShiftTransferLog.target_schedule_id.is_(None),
+    ).delete(synchronize_session=False)
+
+    # 4. 전달 이력 기록 (source 마감 → target_schedule_id는 null)
     count = 0
     for a in eligible:
-        tgid = a.target_group_id
-        dmap = target_default_maps.get(tgid, {})
-        nurse_entries = entries_by_nurse.get(a.nurse_id, {})
-
-        # 전달 기간 계산 (assignment 기간과 해당 월의 교집합)
         a_end = a.end_date or a.expected_end_date or month_end
         transfer_start = max(a.start_date, month_start)
         transfer_end = min(a_end, month_end)
 
-        # target group의 해당 월 issued/latest schedule 찾기
-        target_schedule = (
-            db.query(Schedule)
-            .filter(
-                Schedule.group_id == tgid,
-                Schedule.year == year,
-                Schedule.month == month,
-                Schedule.dropped == False,
-            )
-            .order_by(Schedule.version.desc())
-            .first()
-        )
-        if not target_schedule:
-            logger.warning(
-                "전달 대상 schedule 없음: target_group=%s, %d년 %d월", tgid, year, month
-            )
-            continue
-
-        # target shift_id → id 매핑
-        target_shifts_db = db.query(Shift).filter(Shift.group_id == tgid).all()
-        target_shift_id_to_int = {s.shift_id: s.id for s in target_shifts_db}
-
-        # 기존 해당 간호사의 target entry 삭제 (재전달 지원)
-        db.query(ScheduleEntry).filter(
-            ScheduleEntry.schedule_id == target_schedule.schedule_id,
-            ScheduleEntry.nurse_id == a.nurse_id,
-            ScheduleEntry.work_date >= transfer_start,
-            ScheduleEntry.work_date <= transfer_end,
-        ).delete(synchronize_session=False)
-
-        # shift 변환 + entry 생성
-        a_count = 0
-        d = transfer_start
-        while d <= transfer_end:
-            src_shift = nurse_entries.get(d)
-            if src_shift and src_shift != '-':
-                default_code = source_to_default.get(src_shift, src_shift.upper())
-                target_shift = dmap.get(default_code, default_code)
-                entry = ScheduleEntry(
-                    entry_id=str(uuid.uuid4().hex)[:16],
-                    schedule_id=target_schedule.schedule_id,
-                    nurse_id=a.nurse_id,
-                    work_date=d,
-                    shift_id=target_shift,
-                    id=target_shift_id_to_int.get(target_shift),
-                )
-                db.add(entry)
-                a_count += 1
-            d += timedelta(days=1)
-
-        count += a_count
-
-        # 전달 이력 기록 (기존 로그 upsert: 재마감 대응)
-        existing_log = (
-            db.query(ShiftTransferLog)
-            .filter(
-                ShiftTransferLog.assignment_id == a.id,
-                ShiftTransferLog.schedule_id == schedule_id,
-            )
-            .first()
-        )
-        if existing_log:
-            existing_log.target_schedule_id = target_schedule.schedule_id
-            existing_log.entry_count = a_count
-            existing_log.transfer_start = transfer_start
-            existing_log.transfer_end = transfer_end
-            existing_log.transferred_at = datetime.now()
-        else:
-            db.add(ShiftTransferLog(
-                schedule_id=schedule_id,
-                target_schedule_id=target_schedule.schedule_id,
-                assignment_id=a.id,
-                nurse_id=a.nurse_id,
-                source_group_id=source_group_id,
-                target_group_id=tgid,
-                transfer_start=transfer_start,
-                transfer_end=transfer_end,
-                entry_count=a_count,
-                year=year,
-                month=month,
-            ))
+        db.add(ShiftTransferLog(
+            schedule_id=schedule_id,
+            target_schedule_id=None,
+            assignment_id=a.id,
+            nurse_id=a.nurse_id,
+            source_group_id=source_group_id,
+            target_group_id=a.target_group_id,
+            transfer_start=transfer_start,
+            transfer_end=transfer_end,
+            entry_count=entry_count_by_nurse.get(a.nurse_id, 0),
+            year=year,
+            month=month,
+        ))
+        count += 1
 
         logger.info(
-            "shift 전달: nurse_id=%s, %s→%s, %s~%s, %d건",
-            a.nurse_id, source_group_id, tgid,
-            transfer_start, transfer_end, a_count,
+            "전달 이력 기록: nurse_id=%s, %s→%s, %s~%s",
+            a.nurse_id, source_group_id, a.target_group_id,
+            transfer_start, transfer_end,
         )
 
     if count > 0:
         db.flush()
-        logger.info("shift 전달 완료: 총 %d건", count)
+        logger.info("전달 이력 기록 완료: %d건", count)
 
     return count
+
+
+def copy_transferred_entries(
+    db: Session,
+    target_schedule_id: str,
+    target_group_id: str,
+    year: int,
+    month: int,
+) -> int:
+    """Target 근무표 생성 시 source에서 shift를 복사하고 log에 히스토리 추가.
+
+    - target_schedule_id가 null인 log에서 source schedule 조회
+    - source entry → default_shift → target shift 변환 후 복사
+    - 새 log row insert (히스토리 누적)
+    Returns: 복사된 entry 수
+    """
+    import uuid
+    from calendar import monthrange
+    from db.models import Schedule, ScheduleEntry, Shift
+
+    month_start = date(year, month, 1)
+    month_end = date(year, month, monthrange(year, month)[1])
+
+    # 1. 미전달 log 조회 (해당 target group, 해당 월, target_schedule_id가 null)
+    pending_logs = (
+        db.query(ShiftTransferLog)
+        .filter(
+            ShiftTransferLog.target_group_id == target_group_id,
+            ShiftTransferLog.year == year,
+            ShiftTransferLog.month == month,
+            ShiftTransferLog.target_schedule_id.is_(None),
+        )
+        .all()
+    )
+    if not pending_logs:
+        return 0
+
+    # 2. source → default_shift 매핑 (source group별)
+    source_group_ids = {log.source_group_id for log in pending_logs}
+    source_default_maps: dict[str, dict[str, str]] = {}
+    source_shift_id_to_int: dict[str, dict[str, int]] = {}
+    for sgid in source_group_ids:
+        shifts = db.query(Shift).filter(Shift.group_id == sgid).all()
+        source_default_maps[sgid] = {
+            s.shift_id: s.default_shift for s in shifts if s.default_shift
+        }
+        source_shift_id_to_int[sgid] = {s.shift_id: s.id for s in shifts}
+
+    # 3. target default_shift → target shift_id 매핑
+    target_shifts = db.query(Shift).filter(Shift.group_id == target_group_id).all()
+    target_dmap: dict[str, str] = {}
+    for s in target_shifts:
+        if s.default_shift and s.default_shift not in target_dmap:
+            target_dmap[s.default_shift] = s.shift_id
+    target_shift_id_to_int = {s.shift_id: s.id for s in target_shifts}
+
+    # 4. 각 log에 대해 entry 복사 + 새 log row 생성
+    total = 0
+    for log in pending_logs:
+        src_map = source_default_maps.get(log.source_group_id, {})
+
+        # source schedule에서 해당 간호사 entry 조회
+        source_entries = (
+            db.query(ScheduleEntry)
+            .filter(
+                ScheduleEntry.schedule_id == log.schedule_id,
+                ScheduleEntry.nurse_id == log.nurse_id,
+                ScheduleEntry.work_date >= log.transfer_start,
+                ScheduleEntry.work_date <= log.transfer_end,
+            )
+            .all()
+        )
+
+        # 기존 target entry 삭제 (재생성 대응)
+        db.query(ScheduleEntry).filter(
+            ScheduleEntry.schedule_id == target_schedule_id,
+            ScheduleEntry.nurse_id == log.nurse_id,
+            ScheduleEntry.work_date >= log.transfer_start,
+            ScheduleEntry.work_date <= log.transfer_end,
+        ).delete(synchronize_session=False)
+
+        # shift 변환 + entry 생성
+        src_int_map = source_shift_id_to_int.get(log.source_group_id, {})
+        a_count = 0
+        for e in source_entries:
+            src_shift = e.shift_id
+            if not src_shift or src_shift == '-':
+                continue
+            default_code = src_map.get(src_shift, src_shift.upper())
+            target_shift = target_dmap.get(default_code, default_code)
+            # 매핑 성공 → target id, 매핑 불가 → source id fallback
+            shift_int_id = target_shift_id_to_int.get(target_shift)
+            if shift_int_id is None:
+                shift_int_id = src_int_map.get(src_shift)
+            db.add(ScheduleEntry(
+                entry_id=str(uuid.uuid4().hex)[:16],
+                schedule_id=target_schedule_id,
+                nurse_id=log.nurse_id,
+                work_date=e.work_date,
+                shift_id=target_shift,
+                id=shift_int_id,
+            ))
+            a_count += 1
+
+        total += a_count
+
+        # 히스토리 log 추가 (새 row)
+        db.add(ShiftTransferLog(
+            schedule_id=log.schedule_id,
+            target_schedule_id=target_schedule_id,
+            assignment_id=log.assignment_id,
+            nurse_id=log.nurse_id,
+            source_group_id=log.source_group_id,
+            target_group_id=target_group_id,
+            transfer_start=log.transfer_start,
+            transfer_end=log.transfer_end,
+            entry_count=a_count,
+            year=year,
+            month=month,
+        ))
+
+        logger.info(
+            "shift 복사: nurse_id=%s, %s→%s (target_schedule=%s), %d건",
+            log.nurse_id, log.source_group_id, target_group_id,
+            target_schedule_id, a_count,
+        )
+
+    if total > 0:
+        db.flush()
+        logger.info("shift 복사 완료: 총 %d건", total)
+
+    return total
 
 
 def get_transfer_logs(
@@ -543,7 +596,7 @@ def get_transferred_wanted(
                 "shift": target["shift_id"],
                 "shift_name": target["name"],
                 "color": target["color"],
-                "score": float(e.score),
+                "score": float(e.score) if e.score is not None else 0.0,
                 "comment": e.comment,
                 "mapped": True,
             })
@@ -554,12 +607,53 @@ def get_transferred_wanted(
                 "shift": e.shift,
                 "shift_name": src.get("name", e.shift),
                 "color": src.get("color"),
-                "score": float(e.score),
+                "score": float(e.score) if e.score is not None else 0.0,
                 "comment": e.comment,
                 "mapped": False,
             })
 
     return {"entries": result, "assignment": _assignment_summary(a)}
+
+
+def get_roster_assignments(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+) -> dict[str, dict]:
+    """근무표 응답용 파견/병동이동 assignment 메타데이터.
+
+    해당 group이 source인 assignment만 반환 (source group 근무표에서 미표기 처리용).
+    Returns: {nurse_id: {reason, target_group_id, target_group_name, start_date, end_date}}
+    """
+    from db.models import Group
+
+    assignments = get_active_assignments_for_month(db, group_id, year, month)
+    # source group 기준: 파견/병동이동으로 나가는 간호사만
+    outbound = [
+        a for a in assignments
+        if a.reason in ("파견", "병동이동")
+        and a.source_group_id == group_id
+        and a.target_group_id
+    ]
+    if not outbound:
+        return {}
+
+    # target group name 조회
+    target_gids = {a.target_group_id for a in outbound}
+    groups = db.query(Group).filter(Group.group_id.in_(target_gids)).all()
+    gname_map = {g.group_id: g.group_name for g in groups}
+
+    result: dict[str, dict] = {}
+    for a in outbound:
+        result[a.nurse_id] = {
+            "reason": a.reason,
+            "target_group_id": a.target_group_id,
+            "target_group_name": gname_map.get(a.target_group_id, ""),
+            "start_date": str(a.start_date),
+            "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
+        }
+    return result
 
 
 def _assignment_summary(a: NurseAssignment) -> dict:

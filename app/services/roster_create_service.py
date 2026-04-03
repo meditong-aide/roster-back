@@ -199,7 +199,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                     NursePairRequest.nurse_id == nurse_id,
                     NursePairRequest.request_id == latest_wr.request_id,
                 ).all()
-                pair_data = [{"id": p.target_id, "weight": p.score} for p in pair_rows]
+                pair_data = [{"id": p.target_id, "weight": p.score if p.score is not None else 0} for p in pair_rows]
 
             data_json = {
                 "request": "확정 원티드 적용",
@@ -305,7 +305,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             )
             .all()
         )
-        pair_data = [{"id": p.target_id, "weight": p.score} for p in pair_rows]
+        pair_data = [{"id": p.target_id, "weight": p.score if p.score is not None else 0} for p in pair_rows]
 
         # 5️⃣ data JSON 구성
         data_json = {
@@ -3636,9 +3636,14 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         raise Exception(validation_error)
 
     _persist_entries(db, schedule, generated, req)
-    # ── 파견/병동이동 전달 entry 복사: source에서 마감 후 전달된 shift를 현재 schedule에 이관 ──
+    # ── 파견/병동이동 전달 entry 복사: source 마감 log 기반으로 shift 복사 + 히스토리 기록 ──
     try:
-        _n_copied = _copy_transferred_entries(db, schedule, current_user.group_id, req.year, req.month)
+        from services.assignment_service import copy_transferred_entries
+        _n_copied = copy_transferred_entries(
+            db, target_schedule_id=schedule.schedule_id,
+            target_group_id=current_user.group_id,
+            year=req.year, month=req.month,
+        )
         if _n_copied > 0:
             db.commit()
     except Exception as e:

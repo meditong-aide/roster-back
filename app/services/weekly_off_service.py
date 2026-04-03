@@ -462,12 +462,21 @@ def get_my_weekly_off_service(
             raise HTTPException(status_code=404, detail="Target nurse not found")
 
         # 수간호사인 경우, 같은 그룹인지 확인 (최고 관리자는 그룹 제한 없음)
+        # 파견/병동이동 인바운드 간호사는 다른 그룹이어도 허용
         if is_head_nurse and not is_master_admin:
             if nurse.group_id != user.group_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Head nurse can only view nurses in the same group"
-                )
+                from db.models import NurseAssignment
+                has_inbound = db.query(NurseAssignment).filter(
+                    NurseAssignment.nurse_id == target_nurse_id,
+                    NurseAssignment.target_group_id == user.group_id,
+                    NurseAssignment.reason.in_(["파견", "병동이동"]),
+                    NurseAssignment.status == "active",
+                ).first()
+                if not has_inbound:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Head nurse can only view nurses in the same group"
+                    )
 
     else:
         # 본인 조회

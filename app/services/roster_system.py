@@ -189,7 +189,7 @@ class RosterSystem:
 
     def _check_experience_requirements(self, day: int) -> bool:
         """각 교대에 대한 경력 요구사항이 충족되는지 확인합니다."""
-        experienced_nurses = [n for n in self.nurses if n.experience_years >= self.config.min_experience_per_shift]
+        experienced_nurses = [n for n in self.nurses if (n.experience_years or 0) >= self.config.min_experience_per_shift]
         
         for shift in self.config.daily_shift_requirements.keys():
             shift_idx = self.config.shift_types.index(shift)
@@ -544,7 +544,7 @@ class RosterSystem:
                 shift_idx = self.config.shift_types.index(shift)
                 exp_nurses = sum(
                     1 for n_idx, nurse in enumerate(self.nurses)
-                    if (nurse.experience_years >= self.config.min_experience_per_shift and
+                    if ((nurse.experience_years or 0) >= self.config.min_experience_per_shift and
                         self.roster[n_idx, day, shift_idx] == 1)
                 )
                 if exp_nurses < self.config.required_experienced_nurses:
@@ -897,9 +897,9 @@ class RosterSystem:
                 s_idx = self.config.shift_types.index(shift)
                 # Sum of experienced nurses assigned to this shift
                 exp_nurses_assigned = sum(
-                    x[n_idx, day, s_idx] 
-                    for n_idx, nurse in enumerate(self.nurses) 
-                    if nurse.experience_years >= self.config.min_experience_per_shift
+                    x[n_idx, day, s_idx]
+                    for n_idx, nurse in enumerate(self.nurses)
+                    if (nurse.experience_years or 0) >= self.config.min_experience_per_shift
                 )
                 # 경력 간호사 부족에 대한 패널티
                 exp_shortage = model.NewIntVar(0, self.config.required_experienced_nurses, f'exp_shortage_d{day}_s{shift}')
@@ -1905,11 +1905,11 @@ class RosterSystem:
             for shift in self.config.daily_shift_requirements.keys():
                 s_idx = self.config.shift_types.index(shift)
                 exp_nurses_assigned = sum(
-                    x[n_idx, day, s_idx] 
-                    for n_idx, nurse in enumerate(self.nurses) 
-                    if nurse.experience_years >= self.config.min_experience_per_shift
+                    x[n_idx, day, s_idx]
+                    for n_idx, nurse in enumerate(self.nurses)
+                    if (nurse.experience_years or 0) >= self.config.min_experience_per_shift
                 )
-                
+
                 exp_shortage = model.NewIntVar(0, self.config.required_experienced_nurses, f'exp_shortage_d{day}_s{shift}')
                 model.Add(exp_shortage >= self.config.required_experienced_nurses - exp_nurses_assigned)
                 exp_penalty_vars.append(exp_shortage)

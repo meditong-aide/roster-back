@@ -312,7 +312,7 @@ def build_fallback_stage3_objective_terms(
             exp_assigned = sum(
                 X(n, d, s)
                 for n, nu in enumerate(roster_system.nurses)
-                if join[n] <= d <= leave[n] and nu.experience_years >= cfg.min_experience_per_shift
+                if join[n] <= d <= leave[n] and (nu.experience_years or 0) >= cfg.min_experience_per_shift
             )
             shortage = m.NewIntVar(0, cfg.required_experienced_nurses, f"expShort_fb_{d}_{code}")
             m.Add(shortage >= cfg.required_experienced_nurses - exp_assigned)
