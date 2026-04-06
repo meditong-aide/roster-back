@@ -562,6 +562,9 @@ def get_my_issued_roster_service(
             target_group_id=my_transfer.target_group_id,
         )
         target_issued = False
+        src_schedule = result["schedule"] or []
+        src_ids = result["schedule_ids"] or []
+
         if target_snapshot:
             t_roster = target_snapshot.get("roster") or {}
             t_nurses = t_roster.get("nurses") or []
@@ -571,8 +574,6 @@ def get_my_issued_roster_service(
             )
             if t_my:
                 target_issued = True
-                src_schedule = result["schedule"] or []
-                src_ids = result["schedule_ids"] or []
                 tgt_schedule = t_my.get("schedule") or []
                 tgt_ids = t_my.get("schedule_ids") or []
 
@@ -584,16 +585,26 @@ def get_my_issued_roster_service(
                         if idx < len(src_ids) and idx < len(tgt_ids):
                             src_ids[idx] = tgt_ids[idx]
 
-                result["schedule"] = src_schedule
-                result["schedule_ids"] = src_ids
                 # shift_colors 병합
                 t_colors = t_roster.get("shift_colors") or {}
                 merged_colors = {**result["shift_colors"], **t_colors}
                 result["shift_colors"] = merged_colors
-                # counts 재계산
-                result["counts"] = {}
-                for code in merged_colors:
-                    result["counts"][code] = src_schedule.count(code)
+
+        if not target_issued:
+            # target 미마감: 해당 기간 빈 셀 처리
+            for d in range(period_start, period_end + 1):
+                idx = d - 1
+                if idx < len(src_schedule):
+                    src_schedule[idx] = "-"
+                if idx < len(src_ids):
+                    src_ids[idx] = None
+
+        result["schedule"] = src_schedule
+        result["schedule_ids"] = src_ids
+        # counts 재계산
+        result["counts"] = {}
+        for code in (result["shift_colors"] or {}):
+            result["counts"][code] = src_schedule.count(code)
 
         # transfer 정보 항상 첨부 (미마감 상태 포함)
         result["transfer"] = {
@@ -694,13 +705,30 @@ def create_issued_roster_snapshot(
                 else None,
             }
 
-    # 간호사 리스트 및 정보 스냅샷
-    nurses = (
+    # 간호사 리스트 및 정보 스냅샷 (인바운드 포함)
+    nurses = list(
         db.query(Nurse)
         .filter(Nurse.group_id == group_id)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
+    # 인바운드 간호사: schedule_entries에 존재하지만 group에 없는 간호사
+    _group_nids = {n.nurse_id for n in nurses}
+    _entry_nids = {
+        row.nurse_id for row in
+        db.query(ScheduleEntry.nurse_id)
+        .filter(ScheduleEntry.schedule_id == schedule.schedule_id)
+        .distinct()
+        .all()
+    }
+    _inbound_nids = _entry_nids - _group_nids
+    if _inbound_nids:
+        _inbound_nurses = (
+            db.query(Nurse)
+            .filter(Nurse.nurse_id.in_(_inbound_nids))
+            .all()
+        )
+        nurses.extend(_inbound_nurses)
     nurses_json = []
     for n in nurses:
         nurses_json.append(

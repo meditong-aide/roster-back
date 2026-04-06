@@ -446,11 +446,45 @@ async def get_issued_roster_snapshot(
         if not snapshot:
             raise HTTPException(status_code=404, detail="Issued snapshot not found")
 
-        # 파견/병동이동 assignment 메타데이터 추가
+        # 파견/병동이동 assignment 메타데이터 추가 + schedule 치환
         from services.assignment_service import get_roster_assignments
-        snapshot["assignments"] = get_roster_assignments(
+        _assignments = get_roster_assignments(
             db, group_id=target_group_id, year=year, month=month,
         )
+        snapshot["assignments"] = _assignments
+        if _assignments:
+            from datetime import date as _date
+            from calendar import monthrange as _mr
+            _days = _mr(year, month)[1]
+            _m_start = _date(year, month, 1)
+            _m_end = _date(year, month, _days)
+            _roster = snapshot.get("roster") or {}
+            _s_colors = _roster.get("shift_colors")
+            if _s_colors is not None:
+                _s_colors["파견"] = "#BDBDBD"
+                _s_colors["병동이동"] = "#BDBDBD"
+                _s_colors["휴직"] = "#BDBDBD"
+            for _nurse in (_roster.get("nurses") or []):
+                _nid = str(_nurse.get("nurse_id", ""))
+                _a = _assignments.get(_nid)
+                if not _a:
+                    continue
+                _a_start = _date.fromisoformat(_a["start_date"])
+                _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
+                _p_start = max(_a_start, _m_start).day
+                _p_end = min(_a_end, _m_end).day if _a_end else _days
+                _sched = _nurse.get("schedule") or []
+                _sids = _nurse.get("schedule_ids") or []
+                for d in range(_p_start, _p_end + 1):
+                    idx = d - 1
+                    if idx < len(_sched):
+                        # 스냅샷 schedule: 문자열 또는 {code,color} 객체
+                        if isinstance(_sched[idx], dict):
+                            _sched[idx] = {"code": _a["reason"], "color": "#BDBDBD"}
+                        else:
+                            _sched[idx] = _a["reason"]
+                    if idx < len(_sids):
+                        _sids[idx] = None
         return snapshot
     except HTTPException:
         raise
@@ -708,11 +742,37 @@ async def get_roster_by_schedule_id(
     # print('roster_data', roster_data['nurses'])
     roster_data["violations"] = violations
 
-    # 파견/병동이동 assignment 메타데이터 추가
+    # 파견/병동이동 assignment 메타데이터 추가 + schedule 치환
     from services.assignment_service import get_roster_assignments
-    roster_data["assignments"] = get_roster_assignments(
+    _assignments = get_roster_assignments(
         db, group_id=target_group_id, year=schedule.year, month=schedule.month,
     )
+    roster_data["assignments"] = _assignments
+    if _assignments:
+        shift_colors["파견"] = "#BDBDBD"
+        shift_colors["병동이동"] = "#BDBDBD"
+        shift_colors["휴직"] = "#BDBDBD"
+        from datetime import date as _date
+        from calendar import monthrange as _mr
+        _days = _mr(schedule.year, schedule.month)[1]
+        _m_start = _date(schedule.year, schedule.month, 1)
+        _m_end = _date(schedule.year, schedule.month, _days)
+        for nurse_entry in roster_data["nurses"]:
+            _a = _assignments.get(nurse_entry["id"])
+            if not _a:
+                continue
+            _a_start = _date.fromisoformat(_a["start_date"])
+            _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
+            _p_start = max(_a_start, _m_start).day
+            _p_end = min(_a_end, _m_end).day if _a_end else _days
+            sched = nurse_entry["schedule"]
+            sched_ids = nurse_entry.get("schedule_ids")
+            for d in range(_p_start, _p_end + 1):
+                idx = d - 1
+                if idx < len(sched):
+                    sched[idx] = _a["reason"]
+                if sched_ids and idx < len(sched_ids):
+                    sched_ids[idx] = None
 
     return roster_data
 

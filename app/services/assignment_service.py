@@ -629,27 +629,28 @@ def get_roster_assignments(
     from db.models import Group
 
     assignments = get_active_assignments_for_month(db, group_id, year, month)
-    # source group 기준: 파견/병동이동으로 나가는 간호사만
-    outbound = [
+    # source group 기준: 파견/병동이동/휴직 간호사
+    eligible = [
         a for a in assignments
-        if a.reason in ("파견", "병동이동")
+        if a.reason in ("파견", "병동이동", "휴직")
         and a.source_group_id == group_id
-        and a.target_group_id
     ]
-    if not outbound:
+    if not eligible:
         return {}
 
-    # target group name 조회
-    target_gids = {a.target_group_id for a in outbound}
-    groups = db.query(Group).filter(Group.group_id.in_(target_gids)).all()
-    gname_map = {g.group_id: g.group_name for g in groups}
+    # target group name 조회 (파견/병동이동만)
+    target_gids = {a.target_group_id for a in eligible if a.target_group_id}
+    gname_map: dict[str, str] = {}
+    if target_gids:
+        groups = db.query(Group).filter(Group.group_id.in_(target_gids)).all()
+        gname_map = {g.group_id: g.group_name for g in groups}
 
     result: dict[str, dict] = {}
-    for a in outbound:
+    for a in eligible:
         result[a.nurse_id] = {
             "reason": a.reason,
-            "target_group_id": a.target_group_id,
-            "target_group_name": gname_map.get(a.target_group_id, ""),
+            "target_group_id": a.target_group_id or "",
+            "target_group_name": gname_map.get(a.target_group_id, "") if a.target_group_id else "",
             "start_date": str(a.start_date),
             "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
         }
