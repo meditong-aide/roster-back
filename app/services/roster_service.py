@@ -390,12 +390,27 @@ def get_prev_month_tail_service(
             entries_by_nurse[nid] = {}
         entries_by_nurse[nid][entry.work_date.day] = entry.shift_id
 
+    # 전월 assignment 치환 (파견/병동이동/휴직)
+    from services.assignment_service import get_roster_assignments
+    _prev_assignments = get_roster_assignments(
+        db, group_id=target_group_id, year=prev_year, month=prev_month,
+    )
+
     nurse_list = []
     for nurse in nurses:
         shifts = {
             str(d): entries_by_nurse.get(nurse.nurse_id, {}).get(d)
             for d in tail_day_list
         }
+        # assignment 기간의 shift를 reason으로 치환
+        _a = _prev_assignments.get(nurse.nurse_id)
+        if _a:
+            _a_start = date.fromisoformat(_a["start_date"]) if isinstance(_a["start_date"], str) else _a["start_date"]
+            _a_end = date.fromisoformat(_a["end_date"]) if _a.get("end_date") else None
+            for d in tail_day_list:
+                _cell_date = date(prev_year, prev_month, d)
+                if _cell_date >= _a_start and (not _a_end or _cell_date <= _a_end):
+                    shifts[str(d)] = _a["reason"]
         nurse_list.append(
             {
                 "nurse_id": nurse.nurse_id,
@@ -591,11 +606,12 @@ def get_my_issued_roster_service(
                 result["shift_colors"] = merged_colors
 
         if not target_issued:
-            # target 미마감: 해당 기간 빈 셀 처리
+            # target 미마감: 해당 기간을 reason 라벨로 표시
+            _reason = my_transfer.reason  # "파견" / "병동이동"
             for d in range(period_start, period_end + 1):
                 idx = d - 1
                 if idx < len(src_schedule):
-                    src_schedule[idx] = "-"
+                    src_schedule[idx] = _reason
                 if idx < len(src_ids):
                     src_ids[idx] = None
 

@@ -1575,6 +1575,28 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     except Exception as e:
         print("[ERR] _get_last_days_map:", e)
         raise
+
+    # ── 인바운드 간호사 tail 보충: target 전월 schedule에 없으면 source group에서 조회 ──
+    _inbound_src_map = config_dict.get("_inbound_source_map")
+    if _inbound_src_map:
+        _missing = [nid for nid in _inbound_src_map if nid not in last_map]
+        if _missing:
+            _src_groups: dict[str, list[str]] = {}
+            for nid in _missing:
+                _src_groups.setdefault(_inbound_src_map[nid], []).append(nid)
+            for src_gid, nids in _src_groups.items():
+                _src_sid = _query_prev_month_schedule_id(db, src_gid, req.year, req.month)
+                if _src_sid:
+                    _src_map = _get_last_days_map(db, _src_sid, lookback, code2main, nids)
+                    for nid, seq in _src_map.items():
+                        last_map[nid] = seq
+                    print(
+                        f"[CrossMonth][Inbound] source({src_gid}) 전월 tail 보충: "
+                        f"{len(_src_map)}명/{len(nids)}명"
+                    )
+                else:
+                    print(f"[CrossMonth][Inbound] source({src_gid}) 전월 schedule 없음, tail 생략")
+
     prev_month_last_main: dict[str, str | None] = {}
     prev_month_last_is_off: dict[str, bool] = {}
     prev_month_n_tail: dict[str, int] = {}
@@ -2326,11 +2348,11 @@ def _copy_transferred_entries(
             continue
         if a.target_group_id != group_id:
             continue
-        _is_start = (a.start_date.year == year and a.start_date.month == month)
+        from services.day_windows import is_source_generated_month
         _a_end = a.end_date or a.expected_end_date
-        _is_end = (_a_end and _a_end.year == year and _a_end.month == month)
-        print(f"[CopyTransfer] nurse={a.nurse_id}, reason={a.reason}, src={a.source_group_id}, is_start={_is_start}, is_end={_is_end}")
-        if _is_start or _is_end:
+        _is_src = is_source_generated_month(a.start_date, _a_end, date(year, month, 1), monthrange(year, month)[1])
+        print(f"[CopyTransfer] nurse={a.nurse_id}, reason={a.reason}, src={a.source_group_id}, is_src_gen={_is_src}")
+        if _is_src:
             _inbound.append(a)
     if not _inbound:
         print(f"[CopyTransfer] 인바운드 없음 → skip")
@@ -2980,8 +3002,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     print(f"[Assignment] group_id={current_user.group_id}, year={req.year}, month={req.month}, assignments_count={len(_assignments)}")
     for _a in _assignments:
         print(f"[Assignment] id={_a.id}, nurse_id={_a.nurse_id}, reason={_a.reason}, source={_a.source_group_id}, target={_a.target_group_id}, start={_a.start_date}, end={_a.end_date}")
-    # ── 인바운드 간호사: 타겟 그룹에 파견/병동이동으로 들어오는 간호사를 엔진에 추가 ──
-    # 중간 월만 인바운드 (start/end 월은 source가 full 생성 후 마감 시 전달)
+    # ── 인바운드: full month / 중간 월은 target 독립 생성 (인바운드 엔진 추가) ──
+    from services.day_windows import is_source_generated_month
     _inbound_assignments = []
     for a in _assignments:
         if a.reason not in ("파견", "병동이동"):
@@ -2990,16 +3012,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             continue
         if a.source_group_id == current_user.group_id:
             continue
-        # start/end 월 판별 — 해당 월에 start 또는 end가 포함되면 source가 생성하므로 skip
-        _is_start_month = (a.start_date.year == month_start.year and a.start_date.month == month_start.month)
         _a_end = a.end_date or a.expected_end_date
-        _is_end_month = (
-            _a_end is not None
-            and _a_end.year == month_start.year
-            and _a_end.month == month_start.month
-        )
-        if _is_start_month or _is_end_month:
-            print(f"[Assignment][Inbound] skip (start/end 월, source가 생성): nurse_id={a.nurse_id}")
+        if is_source_generated_month(a.start_date, _a_end, month_start, days_in_month):
+            print(f"[Assignment][Inbound] skip (source 생성+전달): nurse_id={a.nurse_id}")
             continue
         _inbound_assignments.append(a)
     _existing_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
@@ -3065,6 +3080,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
+    # 인바운드 간호사의 source group 매핑 → cross-month tail 보충용
+    if _inbound_assignments:
+        config_dict["_inbound_source_map"] = {
+            str(a.nurse_id): str(a.source_group_id)
+            for a in _inbound_assignments
+        }
     if bool(config_dict.get("two_offs_after_two_nig")) or bool(config_dict.get("two_offs_after_three_nig")):
         print(
             "[OffReason] N연속 후 2OFF 하드 활성화: "
@@ -3131,15 +3152,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 continue
             if a.target_group_id is None:
                 continue
-            # start/end 월만 (blocking 안 하는 월 = source가 full 생성하는 월)
-            _is_start = (a.start_date.year == month_start.year and a.start_date.month == month_start.month)
+            # source 생성 월만 커버리지 제외 (full month/중간 월은 target 독립 → 제외 안 함)
             _a_end = a.end_date or a.expected_end_date
-            _is_end = (_a_end and _a_end.year == month_start.year and _a_end.month == month_start.month)
-            if not (_is_start or _is_end):
+            if not is_source_generated_month(a.start_date, _a_end, month_start, days_in_month):
                 continue
             # assignment 기간과 월의 교집합 → 커버리지 제외 day indices
             _month_end = month_start + timedelta(days=days_in_month - 1)
-            _a_end_actual = _a_end or _month_end
+            _a_end_actual = a.end_date or a.expected_end_date or _month_end
             _s = max(a.start_date, month_start)
             _e = min(_a_end_actual, _month_end)
             nid = str(a.nurse_id)

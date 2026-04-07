@@ -5,7 +5,7 @@
 """
 
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, and_
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -28,6 +28,42 @@ def create_assignment(
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
+
+    # 퇴사자 검증: resignation_date가 존재하고 start_date 이전이면 거부
+    _resign = getattr(nurse, "resignation_date", None)
+    if _resign:
+        _resign_d = _resign.date() if hasattr(_resign, "date") else _resign
+        if _resign_d <= req.start_date:
+            raise HTTPException(
+                status_code=400,
+                detail=f"퇴사 처리된 간호사입니다. (퇴사일: {_resign_d})",
+            )
+
+    # 기간 중복 검증: 동일 간호사의 active assignment와 일자 겹침 불허
+    from sqlalchemy import case
+    _eff_end = case(
+        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+        else_=NurseAssignment.expected_end_date,
+    )
+    _overlap = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == req.nurse_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.start_date <= req.expected_end_date,
+            or_(
+                _eff_end.is_(None),
+                _eff_end >= req.start_date,
+            ),
+        )
+        .first()
+    )
+    if _overlap:
+        raise HTTPException(
+            status_code=409,
+            detail=f"기간이 겹치는 배정이 존재합니다. (id={_overlap.id}, reason={_overlap.reason}, "
+                   f"{_overlap.start_date}~{_overlap.end_date or _overlap.expected_end_date})",
+        )
 
     row = NurseAssignment(
         nurse_id=req.nurse_id,
@@ -127,7 +163,7 @@ def get_active_assignments_for_month(
     year: int,
     month: int,
 ) -> list[NurseAssignment]:
-    """특정 월 기준 active 배정 레코드 조회 (솔버 입력용)"""
+    """특정 월 기준 배정 레코드 조회 (active + completed 포함, flush 후에도 유지)"""
     from calendar import monthrange
     month_start = date(year, month, 1)
     month_end = date(year, month, monthrange(year, month)[1])
@@ -141,7 +177,7 @@ def get_active_assignments_for_month(
     return (
         db.query(NurseAssignment)
         .filter(
-            NurseAssignment.status == "active",
+            NurseAssignment.status.in_(["active", "completed"]),
             NurseAssignment.start_date <= month_end,
             or_(
                 _effective_end.is_(None),
@@ -236,7 +272,13 @@ def transfer_shifts_on_publish(
             NurseAssignment.target_group_id.isnot(None),
             NurseAssignment.start_date <= month_end,
             or_(
-                NurseAssignment.end_date.is_(None),
+                and_(
+                    NurseAssignment.end_date.is_(None),
+                    or_(
+                        NurseAssignment.expected_end_date.is_(None),
+                        NurseAssignment.expected_end_date >= month_start,
+                    ),
+                ),
                 NurseAssignment.end_date >= month_start,
             ),
         )
@@ -245,18 +287,16 @@ def transfer_shifts_on_publish(
     if not assignments:
         return 0
 
-    # start/end 월만 필터 (중간 월 제외)
-    eligible = []
-    for a in assignments:
-        _is_start_month = (a.start_date.year == year and a.start_date.month == month)
-        _a_end = a.end_date or a.expected_end_date
-        _is_end_month = (
-            _a_end is not None
-            and _a_end.year == year
-            and _a_end.month == month
+    # source 생성 월만 전달 대상 (full month / 중간 월은 target 독립)
+    from calendar import monthrange as _mr
+    from services.day_windows import is_source_generated_month
+    _dim = _mr(year, month)[1]
+    eligible = [
+        a for a in assignments
+        if is_source_generated_month(
+            a.start_date, a.end_date or a.expected_end_date, month_start, _dim
         )
-        if _is_start_month or _is_end_month:
-            eligible.append(a)
+    ]
     if not eligible:
         return 0
 
@@ -276,10 +316,9 @@ def transfer_shifts_on_publish(
         _wd = e.work_date.date() if hasattr(e.work_date, 'date') else e.work_date
         entry_count_by_nurse[e.nurse_id] = entry_count_by_nurse.get(e.nurse_id, 0) + 1
 
-    # 3. 기존 미소비 pending log 정리 (재마감 대응)
-    assignment_ids = [a.id for a in eligible]
+    # 3. 기존 미소비 pending log 정리 (재마감 대응 — source group 전체 범위)
     db.query(ShiftTransferLog).filter(
-        ShiftTransferLog.assignment_id.in_(assignment_ids),
+        ShiftTransferLog.source_group_id == source_group_id,
         ShiftTransferLog.year == year,
         ShiftTransferLog.month == month,
         ShiftTransferLog.target_schedule_id.is_(None),
@@ -525,14 +564,27 @@ def get_transferred_wanted(
     month_start = date(year, month, 1)
     month_end = date(year, month, monthrange(year, month)[1])
 
-    # active 파견/병동이동 assignment 조회
-    assignments = get_active_assignments_for_month(db, nurse.group_id, year, month)
-    my_assign = [
-        a for a in assignments
-        if a.nurse_id == nurse_id
-        and a.reason in ("파견", "병동이동")
-        and a.target_group_id
-    ]
+    # 파견/병동이동 assignment 조회 (flush 후 group_id 변경 대응: nurse_id 직접 조회)
+    from sqlalchemy import case as _case
+    _eff_end = _case(
+        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+        else_=NurseAssignment.expected_end_date,
+    )
+    my_assign = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == nurse_id,
+            NurseAssignment.status.in_(["active", "completed"]),
+            NurseAssignment.reason.in_(["파견", "병동이동"]),
+            NurseAssignment.target_group_id.isnot(None),
+            NurseAssignment.start_date <= month_end,
+            or_(
+                _eff_end.is_(None),
+                _eff_end >= month_start,
+            ),
+        )
+        .all()
+    )
     if not my_assign:
         return {"entries": [], "assignment": None}
 

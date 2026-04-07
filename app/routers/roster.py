@@ -460,10 +460,33 @@ async def get_issued_roster_snapshot(
             _m_end = _date(year, month, _days)
             _roster = snapshot.get("roster") or {}
             _s_colors = _roster.get("shift_colors")
-            if _s_colors is not None:
-                _s_colors["파견"] = "#BDBDBD"
-                _s_colors["병동이동"] = "#BDBDBD"
-                _s_colors["휴직"] = "#BDBDBD"
+            # 본인이 파견/병동이동 대상자일 때 target 스냅샷 조회
+            _my_nid = getattr(current_user, "nurse_id", None)
+            _my_a = _assignments.get(_my_nid) if _my_nid else None
+            _my_tgt_roster = {}
+            if _my_a and _my_a["reason"] in ("파견", "병동이동") and _my_a.get("target_group_id"):
+                _tgt_snap = get_issued_roster_snapshot_service(
+                    year=year, month=month, current_user=current_user, db=db,
+                    target_group_id=_my_a["target_group_id"],
+                )
+                if _tgt_snap:
+                    _t_roster = _tgt_snap.get("roster") or {}
+                    _t_nurses = _t_roster.get("nurses") or []
+                    _t_my = next(
+                        (n for n in _t_nurses if str(n.get("nurse_id")) == str(_my_nid)),
+                        None,
+                    )
+                    if _t_my:
+                        _t_sched = _t_my.get("schedule") or []
+                        _t_sids = _t_my.get("schedule_ids") or []
+                        for i, item in enumerate(_t_sched):
+                            day = i + 1
+                            _my_tgt_roster[day] = (item, _t_sids[i] if i < len(_t_sids) else None)
+                    # target shift_colors 병합
+                    _t_colors = _t_roster.get("shift_colors") or {}
+                    if _s_colors is not None:
+                        _s_colors.update(_t_colors)
+
             for _nurse in (_roster.get("nurses") or []):
                 _nid = str(_nurse.get("nurse_id", ""))
                 _a = _assignments.get(_nid)
@@ -475,16 +498,27 @@ async def get_issued_roster_snapshot(
                 _p_end = min(_a_end, _m_end).day if _a_end else _days
                 _sched = _nurse.get("schedule") or []
                 _sids = _nurse.get("schedule_ids") or []
-                for d in range(_p_start, _p_end + 1):
-                    idx = d - 1
-                    if idx < len(_sched):
-                        # 스냅샷 schedule: 문자열 또는 {code,color} 객체
-                        if isinstance(_sched[idx], dict):
-                            _sched[idx] = {"code": _a["reason"], "color": "#BDBDBD"}
-                        else:
+
+                # 본인 행: target shift 병합
+                if _nid == _my_nid and _my_tgt_roster:
+                    for d in range(_p_start, _p_end + 1):
+                        idx = d - 1
+                        tgt = _my_tgt_roster.get(d)
+                        if tgt and idx < len(_sched):
+                            _sched[idx] = tgt[0]
+                            if idx < len(_sids):
+                                _sids[idx] = tgt[1]  # 스냅샷은 {code,color} 기반 → ids 유지 가능
+                        elif idx < len(_sched):
                             _sched[idx] = _a["reason"]
-                    if idx < len(_sids):
-                        _sids[idx] = None
+                            if idx < len(_sids):
+                                _sids[idx] = None
+                else:
+                    for d in range(_p_start, _p_end + 1):
+                        idx = d - 1
+                        if idx < len(_sched):
+                            _sched[idx] = _a["reason"]
+                        if idx < len(_sids):
+                            _sids[idx] = None
         return snapshot
     except HTTPException:
         raise
@@ -749,14 +783,47 @@ async def get_roster_by_schedule_id(
     )
     roster_data["assignments"] = _assignments
     if _assignments:
-        shift_colors["파견"] = "#BDBDBD"
-        shift_colors["병동이동"] = "#BDBDBD"
-        shift_colors["휴직"] = "#BDBDBD"
+        # reason color는 프론트에서 처리 — shift_colors에 추가하지 않음
         from datetime import date as _date
         from calendar import monthrange as _mr
         _days = _mr(schedule.year, schedule.month)[1]
         _m_start = _date(schedule.year, schedule.month, 1)
         _m_end = _date(schedule.year, schedule.month, _days)
+        # 본인이 파견/병동이동 대상자일 때 target schedule 조회 (본인 행 병합용)
+        _my_nid = getattr(current_user, "nurse_id", None)
+        _my_a = _assignments.get(_my_nid) if _my_nid else None
+        _my_target_entries = {}
+        if _my_a and _my_a["reason"] in ("파견", "병동이동") and _my_a.get("target_group_id"):
+            _tgt_sched = (
+                db.query(Schedule)
+                .filter(
+                    Schedule.group_id == _my_a["target_group_id"],
+                    Schedule.year == schedule.year,
+                    Schedule.month == schedule.month,
+                    Schedule.status == "issued",
+                    Schedule.dropped == False,
+                )
+                .order_by(Schedule.version.desc())
+                .first()
+            )
+            if _tgt_sched:
+                _tgt_entries = (
+                    db.query(ScheduleEntry)
+                    .filter(
+                        ScheduleEntry.schedule_id == _tgt_sched.schedule_id,
+                        ScheduleEntry.nurse_id == _my_nid,
+                    )
+                    .all()
+                )
+                # target group shift 매핑
+                _tgt_shifts = db.query(Shift).filter(Shift.group_id == _my_a["target_group_id"]).all()
+                _tgt_int_to_sid = {s.id: s.shift_id for s in _tgt_shifts}
+                _tgt_colors = {s.shift_id: s.color for s in _tgt_shifts}
+                shift_colors.update(_tgt_colors)
+                for _e in _tgt_entries:
+                    _sid = _tgt_int_to_sid.get(_e.id, _e.shift_id) if _e.id else _e.shift_id
+                    _my_target_entries[_e.work_date.day] = (_sid, _e.id)
+
         for nurse_entry in roster_data["nurses"]:
             _a = _assignments.get(nurse_entry["id"])
             if not _a:
@@ -767,12 +834,28 @@ async def get_roster_by_schedule_id(
             _p_end = min(_a_end, _m_end).day if _a_end else _days
             sched = nurse_entry["schedule"]
             sched_ids = nurse_entry.get("schedule_ids")
-            for d in range(_p_start, _p_end + 1):
-                idx = d - 1
-                if idx < len(sched):
-                    sched[idx] = _a["reason"]
-                if sched_ids and idx < len(sched_ids):
-                    sched_ids[idx] = None
+
+            # 본인 행: target shift 병합
+            if nurse_entry["id"] == _my_nid and _my_target_entries:
+                for d in range(_p_start, _p_end + 1):
+                    idx = d - 1
+                    tgt = _my_target_entries.get(d)
+                    if tgt and idx < len(sched):
+                        sched[idx] = tgt[0]
+                        if sched_ids and idx < len(sched_ids):
+                            sched_ids[idx] = None  # numericId null → code 기반 resolve
+                    elif idx < len(sched):
+                        sched[idx] = _a["reason"]
+                        if sched_ids and idx < len(sched_ids):
+                            sched_ids[idx] = None
+            else:
+                # 다른 간호사: reason 치환
+                for d in range(_p_start, _p_end + 1):
+                    idx = d - 1
+                    if idx < len(sched):
+                        sched[idx] = _a["reason"]
+                    if sched_ids and idx < len(sched_ids):
+                        sched_ids[idx] = None
 
     return roster_data
 

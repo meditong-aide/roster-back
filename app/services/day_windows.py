@@ -12,6 +12,39 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def is_full_month_assignment(
+    a_start: date, a_end_actual: date | None, month_start: date, days_in_month: int
+) -> bool:
+    """assignment가 해당 월 전체를 커버하는지 판별.
+    True = target 독립 생성 (전달 없음)
+    """
+    if a_end_actual is None:
+        return False
+    month_end = month_start + timedelta(days=days_in_month - 1)
+    return a_start <= month_start and a_end_actual >= month_end
+
+
+def is_source_generated_month(
+    a_start: date, a_end_actual: date | None, month_start: date, days_in_month: int
+) -> bool:
+    """source가 생성하고 target에 전달하는 월인지 판별.
+
+    True  = source 생성 + 전달 (월 일부만 커버: mid-start, end month)
+    False = target 독립 생성 (full month, 중간 월)
+    """
+    _is_start = (a_start.year == month_start.year and a_start.month == month_start.month)
+    _is_end = (
+        a_end_actual is not None
+        and a_end_actual.year == month_start.year
+        and a_end_actual.month == month_start.month
+    )
+    if not (_is_start or _is_end):
+        return False  # 중간 월 → target 독립
+    if is_full_month_assignment(a_start, a_end_actual, month_start, days_in_month):
+        return False  # full month → target 독립
+    return True  # 월 일부만 커버 → source 생성
+
+
 def build_blocked_days(
     assignments: list[NurseAssignment],
     nurse_db_id: str,
@@ -80,19 +113,12 @@ def build_blocked_days(
         end_idx = (overlap_end - month_start).days
 
         if a.reason in ("파견", "휴직", "퇴사", "병동이동") and a.source_group_id == group_id:
-            # 파견/병동이동: start_date 또는 end_date가 포함된 월 → source가 full 생성 (blocking 안 함)
-            # 중간 월(start/end 모두 다른 달)만 full blocked
+            # 파견/병동이동: source가 생성하는 월은 blocking 안 함, 그 외(full/중간)는 blocked
             if a.reason in ("파견", "병동이동"):
-                _is_start_month = (a_start.year == month_start.year and a_start.month == month_start.month)
                 _a_end_actual = a.end_date or a.expected_end_date
-                _is_end_month = (
-                    _a_end_actual is not None
-                    and _a_end_actual.year == month_start.year
-                    and _a_end_actual.month == month_start.month
-                )
-                if _is_start_month or _is_end_month:
-                    # start/end 월: source가 full month 생성 → blocking 안 함
-                    continue
+                if is_source_generated_month(a_start, _a_end_actual, month_start, days_in_month):
+                    continue  # source 생성 → blocking 안 함
+                # full month / 중간 월 → blocked
             for d in range(start_idx, end_idx + 1):
                 blocked.add(d)
 

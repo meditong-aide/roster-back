@@ -165,7 +165,7 @@ class ShiftTransferLog(Base):
     __tablename__ = "shift_transfer_logs"
     id = Column(INTEGER, primary_key=True, autoincrement=True)
     schedule_id = Column(CHAR(12), nullable=False)
-    target_schedule_id = Column(CHAR(12), nullable=False)
+    target_schedule_id = Column(CHAR(12), nullable=True)
     assignment_id = Column(INTEGER, nullable=False)
     nurse_id = Column(VARCHAR(50), nullable=False)
     source_group_id = Column(VARCHAR(50), nullable=False)
