@@ -551,7 +551,7 @@ class NurseAssignmentCreate(BaseModel):
     target_group_id: Optional[str] = None
     office_id: str
     start_date: date
-    expected_end_date: date = Field(description="예상 종료일 (필수)")
+    expected_end_date: Optional[date] = Field(default=None, description="예상 종료일 (병동이동 시 미지정 가능)")
     reason: str = Field(description="파견 / 휴직 / 퇴사 / 프리셉티 / 병동이동")
 
 
