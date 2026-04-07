@@ -79,19 +79,17 @@ def create_assignment(
         (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
         else_=NurseAssignment.expected_end_date,
     )
-    _overlap = (
-        db.query(NurseAssignment)
-        .filter(
-            NurseAssignment.nurse_id == req.nurse_id,
-            NurseAssignment.status == "active",
-            NurseAssignment.start_date <= req.expected_end_date,
-            or_(
-                _eff_end.is_(None),
-                _eff_end >= req.start_date,
-            ),
-        )
-        .first()
-    )
+    _overlap_filters = [
+        NurseAssignment.nurse_id == req.nurse_id,
+        NurseAssignment.status == "active",
+        or_(
+            _eff_end.is_(None),
+            _eff_end >= req.start_date,
+        ),
+    ]
+    if req.expected_end_date is not None:
+        _overlap_filters.append(NurseAssignment.start_date <= req.expected_end_date)
+    _overlap = db.query(NurseAssignment).filter(*_overlap_filters).first()
     if _overlap:
         raise HTTPException(
             status_code=409,
