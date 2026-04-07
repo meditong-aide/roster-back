@@ -462,12 +462,16 @@ async def get_issued_roster_snapshot(
             _s_colors = _roster.get("shift_colors")
             # 본인이 파견/병동이동 대상자일 때 target 스냅샷 조회
             _my_nid = getattr(current_user, "nurse_id", None)
-            _my_a = _assignments.get(_my_nid) if _my_nid else None
+            _my_a_list = _assignments.get(_my_nid, []) if _my_nid else []
             _my_tgt_roster = {}
-            if _my_a and _my_a["reason"] in ("파견", "병동이동") and _my_a.get("target_group_id"):
+            _my_tgt_a = next(
+                (a for a in _my_a_list if a["reason"] in ("파견", "병동이동") and a.get("target_group_id")),
+                None,
+            )
+            if _my_tgt_a:
                 _tgt_snap = get_issued_roster_snapshot_service(
                     year=year, month=month, current_user=current_user, db=db,
-                    target_group_id=_my_a["target_group_id"],
+                    target_group_id=_my_tgt_a["target_group_id"],
                 )
                 if _tgt_snap:
                     _t_roster = _tgt_snap.get("roster") or {}
@@ -482,43 +486,67 @@ async def get_issued_roster_snapshot(
                         for i, item in enumerate(_t_sched):
                             day = i + 1
                             _my_tgt_roster[day] = (item, _t_sids[i] if i < len(_t_sids) else None)
-                    # target shift_colors 병합
                     _t_colors = _t_roster.get("shift_colors") or {}
                     if _s_colors is not None:
                         _s_colors.update(_t_colors)
 
             for _nurse in (_roster.get("nurses") or []):
                 _nid = str(_nurse.get("nurse_id", ""))
-                _a = _assignments.get(_nid)
-                if not _a:
+                _a_list = _assignments.get(_nid)
+                if not _a_list:
                     continue
-                _a_start = _date.fromisoformat(_a["start_date"])
-                _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
-                _p_start = max(_a_start, _m_start).day
-                _p_end = min(_a_end, _m_end).day if _a_end else _days
                 _sched = _nurse.get("schedule") or []
                 _sids = _nurse.get("schedule_ids") or []
 
-                # 본인 행: target shift 병합
-                if _nid == _my_nid and _my_tgt_roster:
-                    for d in range(_p_start, _p_end + 1):
-                        idx = d - 1
-                        tgt = _my_tgt_roster.get(d)
-                        if tgt and idx < len(_sched):
-                            _sched[idx] = tgt[0]
-                            if idx < len(_sids):
-                                _sids[idx] = tgt[1]  # 스냅샷은 {code,color} 기반 → ids 유지 가능
-                        elif idx < len(_sched):
-                            _sched[idx] = _a["reason"]
+                # inbound 필드 추가 (프론트 요청 구조)
+                _nurse["inbound"] = {
+                    "inbound_list": [
+                        {
+                            "startDate": _a["start_date"],
+                            "endDate": _a["end_date"],
+                            "reason": _a["reason"],
+                        }
+                        for _a in _a_list
+                    ]
+                }
+
+                # 각 assignment별 셀 overlay
+                for _a in _a_list:
+                    _a_start = _date.fromisoformat(_a["start_date"])
+                    _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
+                    _p_start = max(_a_start, _m_start).day
+                    _p_end = min(_a_end, _m_end).day if _a_end else _days
+
+                    # 본인 행: target shift 병합 + reason 필드
+                    if _nid == _my_nid and _my_tgt_roster:
+                        for d in range(_p_start, _p_end + 1):
+                            idx = d - 1
+                            tgt = _my_tgt_roster.get(d)
+                            if tgt and idx < len(_sched):
+                                _cell = tgt[0]
+                                if isinstance(_cell, dict):
+                                    _cell["reason"] = _a["reason"]
+                                else:
+                                    _cell = {"code": _cell, "reason": _a["reason"]}
+                                _sched[idx] = _cell
+                                if idx < len(_sids):
+                                    _sids[idx] = tgt[1]
+                            elif idx < len(_sched):
+                                _sched[idx] = {"code": _a["reason"], "reason": _a["reason"]}
+                                if idx < len(_sids):
+                                    _sids[idx] = None
+                    else:
+                        # 타인 행: 기존 셀 유지 + reason 필드 추가
+                        for d in range(_p_start, _p_end + 1):
+                            idx = d - 1
+                            if idx < len(_sched):
+                                _cell = _sched[idx]
+                                if isinstance(_cell, dict):
+                                    _cell["reason"] = _a["reason"]
+                                else:
+                                    _sched[idx] = {"code": _cell, "reason": _a["reason"]}
                             if idx < len(_sids):
                                 _sids[idx] = None
-                else:
-                    for d in range(_p_start, _p_end + 1):
-                        idx = d - 1
-                        if idx < len(_sched):
-                            _sched[idx] = _a["reason"]
-                        if idx < len(_sids):
-                            _sids[idx] = None
         return snapshot
     except HTTPException:
         raise
@@ -791,13 +819,17 @@ async def get_roster_by_schedule_id(
         _m_end = _date(schedule.year, schedule.month, _days)
         # 본인이 파견/병동이동 대상자일 때 target schedule 조회 (본인 행 병합용)
         _my_nid = getattr(current_user, "nurse_id", None)
-        _my_a = _assignments.get(_my_nid) if _my_nid else None
+        _my_a_list = _assignments.get(_my_nid, []) if _my_nid else []
         _my_target_entries = {}
-        if _my_a and _my_a["reason"] in ("파견", "병동이동") and _my_a.get("target_group_id"):
+        _my_tgt_a = next(
+            (a for a in _my_a_list if a["reason"] in ("파견", "병동이동") and a.get("target_group_id")),
+            None,
+        )
+        if _my_tgt_a:
             _tgt_sched = (
                 db.query(Schedule)
                 .filter(
-                    Schedule.group_id == _my_a["target_group_id"],
+                    Schedule.group_id == _my_tgt_a["target_group_id"],
                     Schedule.year == schedule.year,
                     Schedule.month == schedule.month,
                     Schedule.status == "issued",
@@ -815,8 +847,7 @@ async def get_roster_by_schedule_id(
                     )
                     .all()
                 )
-                # target group shift 매핑
-                _tgt_shifts = db.query(Shift).filter(Shift.group_id == _my_a["target_group_id"]).all()
+                _tgt_shifts = db.query(Shift).filter(Shift.group_id == _my_tgt_a["target_group_id"]).all()
                 _tgt_int_to_sid = {s.id: s.shift_id for s in _tgt_shifts}
                 _tgt_colors = {s.shift_id: s.color for s in _tgt_shifts}
                 shift_colors.update(_tgt_colors)
@@ -825,37 +856,59 @@ async def get_roster_by_schedule_id(
                     _my_target_entries[_e.work_date.day] = (_sid, _e.id)
 
         for nurse_entry in roster_data["nurses"]:
-            _a = _assignments.get(nurse_entry["id"])
-            if not _a:
+            _a_list = _assignments.get(nurse_entry["id"], [])
+            if not _a_list:
                 continue
-            _a_start = _date.fromisoformat(_a["start_date"])
-            _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
-            _p_start = max(_a_start, _m_start).day
-            _p_end = min(_a_end, _m_end).day if _a_end else _days
             sched = nurse_entry["schedule"]
             sched_ids = nurse_entry.get("schedule_ids")
 
-            # 본인 행: target shift 병합
-            if nurse_entry["id"] == _my_nid and _my_target_entries:
-                for d in range(_p_start, _p_end + 1):
-                    idx = d - 1
-                    tgt = _my_target_entries.get(d)
-                    if tgt and idx < len(sched):
-                        sched[idx] = tgt[0]
-                        if sched_ids and idx < len(sched_ids):
-                            sched_ids[idx] = None  # numericId null → code 기반 resolve
-                    elif idx < len(sched):
-                        sched[idx] = _a["reason"]
+            # inbound 필드 추가
+            nurse_entry["inbound"] = {
+                "inbound_list": [
+                    {
+                        "startDate": _a["start_date"],
+                        "endDate": _a["end_date"],
+                        "reason": _a["reason"],
+                    }
+                    for _a in _a_list
+                ]
+            }
+
+            for _a in _a_list:
+                _a_start = _date.fromisoformat(_a["start_date"])
+                _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
+                _p_start = max(_a_start, _m_start).day
+                _p_end = min(_a_end, _m_end).day if _a_end else _days
+
+                # 본인 행: target shift 병합 + reason 필드
+                if nurse_entry["id"] == _my_nid and _my_target_entries:
+                    for d in range(_p_start, _p_end + 1):
+                        idx = d - 1
+                        tgt = _my_target_entries.get(d)
+                        if tgt and idx < len(sched):
+                            sched[idx] = tgt[0]
+                            if sched_ids and idx < len(sched_ids):
+                                sched_ids[idx] = None
+                        elif idx < len(sched):
+                            _cell = sched[idx]
+                            if isinstance(_cell, dict):
+                                _cell["reason"] = _a["reason"]
+                            else:
+                                sched[idx] = {"code": _cell, "reason": _a["reason"]}
+                            if sched_ids and idx < len(sched_ids):
+                                sched_ids[idx] = None
+                else:
+                    # 타인 행: 기존 셀 유지 + reason 필드 추가
+                    for d in range(_p_start, _p_end + 1):
+                        idx = d - 1
+                        if idx < len(sched):
+                            _cell = sched[idx]
+                            if isinstance(_cell, dict):
+                                _cell["reason"] = _a["reason"]
+                            else:
+                                sched[idx] = {"code": _cell, "reason": _a["reason"]}
                         if sched_ids and idx < len(sched_ids):
                             sched_ids[idx] = None
-            else:
-                # 다른 간호사: reason 치환
-                for d in range(_p_start, _p_end + 1):
-                    idx = d - 1
-                    if idx < len(sched):
-                        sched[idx] = _a["reason"]
-                    if sched_ids and idx < len(sched_ids):
-                        sched_ids[idx] = None
 
     return roster_data
 

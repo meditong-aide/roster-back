@@ -828,16 +828,16 @@ def get_roster_assignments(
     group_id: str,
     year: int,
     month: int,
-) -> dict[str, dict]:
+) -> dict[str, list[dict]]:
     """근무표 응답용 파견/병동이동 assignment 메타데이터.
 
     해당 group이 source인 assignment만 반환 (source group 근무표에서 미표기 처리용).
-    Returns: {nurse_id: {reason, target_group_id, target_group_name, start_date, end_date}}
+    Returns: {nurse_id: [{reason, target_group_id, target_group_name, start_date, end_date}]}
+    간호사당 복수 assignment 지원.
     """
     from db.models import Group
 
     assignments = get_active_assignments_for_month(db, group_id, year, month)
-    # source group 기준: 파견/병동이동/휴직 간호사
     eligible = [
         a for a in assignments
         if a.reason in ("파견", "병동이동", "휴직")
@@ -846,22 +846,22 @@ def get_roster_assignments(
     if not eligible:
         return {}
 
-    # target group name 조회 (파견/병동이동만)
     target_gids = {a.target_group_id for a in eligible if a.target_group_id}
     gname_map: dict[str, str] = {}
     if target_gids:
         groups = db.query(Group).filter(Group.group_id.in_(target_gids)).all()
         gname_map = {g.group_id: g.group_name for g in groups}
 
-    result: dict[str, dict] = {}
+    result: dict[str, list[dict]] = {}
     for a in eligible:
-        result[a.nurse_id] = {
+        entry = {
             "reason": a.reason,
             "target_group_id": a.target_group_id or "",
             "target_group_name": gname_map.get(a.target_group_id, "") if a.target_group_id else "",
             "start_date": str(a.start_date),
             "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
         }
+        result.setdefault(a.nurse_id, []).append(entry)
     return result
 
 
