@@ -9,7 +9,7 @@ from sqlalchemy import or_, and_
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
 from typing import Optional
-from db.models import NurseAssignment, Nurse as NurseModel, ShiftTransferLog
+from db.models import NurseAssignment, Nurse as NurseModel, ShiftTransferLog, Group
 from schemas.roster_schema import (
     NurseAssignmentCreate,
     NurseAssignmentUpdate,
@@ -18,6 +18,40 @@ from schemas.roster_schema import (
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _get_group_name(db: Session, group_id: str | None) -> str | None:
+    if not group_id:
+        return None
+    g = db.query(Group.group_name).filter(Group.group_id == group_id).first()
+    return g.group_name if g else None
+
+
+def _get_head_nurse_ids(db: Session, group_id: str | None) -> list[str]:
+    """그룹의 수간호사(is_head_nurse=True) nurse_id 목록 반환."""
+    if not group_id:
+        return []
+    rows = (
+        db.query(NurseModel.nurse_id)
+        .filter(
+            NurseModel.group_id == group_id,
+            NurseModel.is_head_nurse == True,
+            NurseModel.active == 1,
+        )
+        .all()
+    )
+    return [str(r.nurse_id) for r in rows]
+
+
+def _collect_assignment_recipients(
+    db: Session, nurse_id: str, source_group_id: str, target_group_id: str | None
+) -> list[str]:
+    """대상 간호사 + source/target 관리자 수신자 목록 (중복 제거)."""
+    recipients = {str(nurse_id)}
+    for gid in (source_group_id, target_group_id):
+        for nid in _get_head_nurse_ids(db, gid):
+            recipients.add(nid)
+    return list(recipients)
 
 
 def create_assignment(
@@ -82,6 +116,28 @@ def create_assignment(
         "배정 등록: nurse_id=%s, reason=%s, start=%s",
         req.nurse_id, req.reason, req.start_date,
     )
+
+    # 알림 발송 (S06)
+    try:
+        from utils.utils import send_assignment_created_push
+        _recipients = _collect_assignment_recipients(
+            db, req.nurse_id, req.source_group_id, req.target_group_id
+        )
+        send_assignment_created_push(
+            nurse_name=nurse.name,
+            reason=req.reason,
+            start_date=str(req.start_date),
+            end_date=str(req.expected_end_date),
+            source_group_name=_get_group_name(db, req.source_group_id) or req.source_group_id,
+            target_group_name=_get_group_name(db, req.target_group_id),
+            recipients=_recipients,
+            office_code=req.office_id,
+            sender_emp_seq_no=req.nurse_id,
+            sender_member_id=req.nurse_id,
+        )
+    except Exception as e:
+        logger.error("배정 생성 알림 발송 실패: %s", e, exc_info=True)
+
     return _to_response(row, nurse.name)
 
 
@@ -121,6 +177,26 @@ def cancel_assignment(
     db.commit()
     db.refresh(row)
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
+
+    # 알림 발송 (S07)
+    try:
+        from utils.utils import send_assignment_cancelled_push
+        _recipients = _collect_assignment_recipients(
+            db, row.nurse_id, row.source_group_id, row.target_group_id
+        )
+        send_assignment_cancelled_push(
+            nurse_name=nurse.name if nurse else str(row.nurse_id),
+            reason=row.reason,
+            source_group_name=_get_group_name(db, row.source_group_id) or row.source_group_id,
+            target_group_name=_get_group_name(db, row.target_group_id),
+            recipients=_recipients,
+            office_code=row.office_id,
+            sender_emp_seq_no=row.nurse_id,
+            sender_member_id=row.nurse_id,
+        )
+    except Exception as e:
+        logger.error("배정 취소 알림 발송 실패: %s", e, exc_info=True)
+
     return _to_response(row, nurse.name if nurse else None)
 
 
@@ -235,6 +311,24 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
         row.end_date = today
         count += 1
 
+        # 알림 발송 (S08)
+        try:
+            from utils.utils import send_transfer_completed_push
+            _tgt_name = _get_group_name(db, row.target_group_id) or str(row.target_group_id)
+            _recipients = {str(row.nurse_id)}
+            for nid in _get_head_nurse_ids(db, row.target_group_id):
+                _recipients.add(nid)
+            send_transfer_completed_push(
+                nurse_name=nurse.name if nurse else str(row.nurse_id),
+                target_group_name=_tgt_name,
+                recipients=list(_recipients),
+                office_code=row.office_id,
+                sender_emp_seq_no=row.nurse_id,
+                sender_member_id=row.nurse_id,
+            )
+        except Exception as e:
+            logger.error("병동이동 완료 알림 실패: %s", e, exc_info=True)
+
     if count > 0:
         db.commit()
         logger.info("병동이동 레이지 체크 완료: %d건 처리", count)
@@ -278,6 +372,24 @@ def flush_all_pending_transfers(db: Session) -> int:
         row.status = "completed"
         row.end_date = today
         count += 1
+
+        # 알림 발송 (S08)
+        try:
+            from utils.utils import send_transfer_completed_push
+            _tgt_name = _get_group_name(db, row.target_group_id) or str(row.target_group_id)
+            _recipients = {str(row.nurse_id)}
+            for nid in _get_head_nurse_ids(db, row.target_group_id):
+                _recipients.add(nid)
+            send_transfer_completed_push(
+                nurse_name=nurse.name if nurse else str(row.nurse_id),
+                target_group_name=_tgt_name,
+                recipients=list(_recipients),
+                office_code=row.office_id,
+                sender_emp_seq_no=row.nurse_id,
+                sender_member_id=row.nurse_id,
+            )
+        except Exception as e:
+            logger.error("[Scheduler] 병동이동 완료 알림 실패: %s", e, exc_info=True)
 
     if count > 0:
         db.commit()

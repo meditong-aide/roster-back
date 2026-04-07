@@ -412,6 +412,150 @@ def send_roster_republish_push(
     )
 
 
+# ── assignment 관련 알림 (S06~S12) ──
+
+_REASON_LABEL = {"파견": "파견", "병동이동": "병동이동", "휴직": "휴직", "프리셉티": "프리셉티"}
+
+
+def send_assignment_created_push(
+    nurse_name: str,
+    reason: str,
+    start_date: str,
+    end_date: str,
+    source_group_name: str,
+    target_group_name: str | None,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+):
+    """배정 생성 알림 (S06). 대상 간호사 + source/target 관리자."""
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    label = _REASON_LABEL.get(reason, reason)
+    period = f"{start_date}~{end_date}"
+    if target_group_name:
+        push_message = f"{nurse_name} {label} 배정 ({period}, {source_group_name}→{target_group_name})"
+    else:
+        push_message = f"{nurse_name} {label} 배정 ({period})"
+    return set_app_push(
+        pushCode="P30", pushSubCode="S06",
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=",".join(map(str, recipients)),
+        pushMessage=push_message, orgPushMessage=push_message,
+        linkUrl="", linkCode="",
+    )
+
+
+def send_assignment_cancelled_push(
+    nurse_name: str,
+    reason: str,
+    source_group_name: str,
+    target_group_name: str | None,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+):
+    """배정 취소 알림 (S07). 대상 간호사 + source/target 관리자."""
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    label = _REASON_LABEL.get(reason, reason)
+    if target_group_name:
+        push_message = f"{nurse_name} {label} 배정 취소 ({source_group_name}→{target_group_name})"
+    else:
+        push_message = f"{nurse_name} {label} 배정 취소"
+    return set_app_push(
+        pushCode="P30", pushSubCode="S07",
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=",".join(map(str, recipients)),
+        pushMessage=push_message, orgPushMessage=push_message,
+        linkUrl="", linkCode="",
+    )
+
+
+def send_transfer_completed_push(
+    nurse_name: str,
+    target_group_name: str,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+):
+    """병동이동 완료 알림 (S08). 대상 간호사 + target 관리자."""
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    push_message = f"{nurse_name} 병동이동 완료 ({target_group_name} 배속)"
+    return set_app_push(
+        pushCode="P30", pushSubCode="S08",
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=",".join(map(str, recipients)),
+        pushMessage=push_message, orgPushMessage=push_message,
+        linkUrl="", linkCode="",
+    )
+
+
+def send_assignment_roster_created_push(
+    nurse_name: str,
+    group_name: str,
+    year: int,
+    month: int,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+):
+    """근무표 생성 알림 — assignment 대상자용 (S09/S10 공용)."""
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    push_message = f"{group_name} {year}년 {month}월 근무표 생성 (배정 근무자: {nurse_name})"
+    return set_app_push(
+        pushCode="P30", pushSubCode="S09",
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=",".join(map(str, recipients)),
+        pushMessage=push_message, orgPushMessage=push_message,
+        linkUrl="", linkCode=f"ROSTER:{year}:{month:02d}",
+    )
+
+
+def send_assignment_roster_published_push(
+    group_name: str,
+    year: int,
+    month: int,
+    recipients: List[str],
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+    is_source: bool = True,
+):
+    """근무표 마감 알림 — 상대 그룹 관리자 + 대상 간호사용 (S11/S12).
+
+    is_source=True: source 마감 → target 관리자에게 (S11)
+    is_source=False: target 마감 → source 관리자에게 (S12)
+    """
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    sub_code = "S11" if is_source else "S12"
+    push_message = f"{group_name} {year}년 {month}월 근무표 마감 (배정 근무자 포함)"
+    return set_app_push(
+        pushCode="P30", pushSubCode=sub_code,
+        officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no,
+        sendMemberId=sender_member_id,
+        receiveEmpSeqNo=",".join(map(str, recipients)),
+        pushMessage=push_message, orgPushMessage=push_message,
+        linkUrl="", linkCode=f"ROSTER:{year}:{month:02d}",
+    )
+
+
 def set_sms(userPhoneNumber: str, sendPhoneNumber: str, smsMessage: str):
     # Unique key create
     random_part = random.randint(10000, 99999)

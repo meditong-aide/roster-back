@@ -3700,6 +3700,33 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
     roster_data["weekly_off_conflicts"] = weekly_off_conflicts
     roster_data["weekly_off_warnings"] = weekly_off_warnings
+
+    # ── assignment 대상자 근무표 생성 알림 (S09) ──
+    try:
+        from utils.utils import send_assignment_roster_created_push
+        from services.assignment_service import _get_group_name
+        _assign_nurse_ids = set()
+        for _a in _assignments:
+            if _a.reason in ("파견", "병동이동") and _a.status != "cancelled":
+                _assign_nurse_ids.add(str(_a.nurse_id))
+        if _assign_nurse_ids:
+            _gname = _get_group_name(db, current_user.group_id) or str(current_user.group_id)
+            _nurse_names = [
+                n.name for n in nurses_in_group if str(n.nurse_id) in _assign_nurse_ids
+            ] or list(_assign_nurse_ids)
+            send_assignment_roster_created_push(
+                nurse_name=", ".join(_nurse_names),
+                group_name=_gname,
+                year=req.year,
+                month=req.month,
+                recipients=list(_assign_nurse_ids),
+                office_code=current_user.office_id,
+                sender_emp_seq_no=current_user.nurse_id,
+                sender_member_id=current_user.account_id,
+            )
+    except Exception as e:
+        print(f"[RosterCreate] assignment 생성 알림 실패: {e}")
+
     return roster_data
 
 

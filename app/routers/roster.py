@@ -1218,7 +1218,42 @@ async def publish_roster(
             sender_member_id=current_user.account_id,
         )
 
-    # return message_result
+    # ── assignment 대상자 + 상대 그룹 관리자 알림 (S11/S12) ──
+    try:
+        from services.assignment_service import get_active_assignments_for_month
+        from utils.utils import send_assignment_roster_published_push
+        _assigns = get_active_assignments_for_month(db, current_user.group_id, schedule.year, schedule.month)
+        _notified: set[str] = set()
+        for _a in _assigns:
+            if _a.reason not in ("파견", "병동이동"):
+                continue
+            if _a.status == "cancelled":
+                continue
+            _is_source = (_a.source_group_id == current_user.group_id)
+            _other_gid = _a.target_group_id if _is_source else _a.source_group_id
+            # 수신자: 대상 간호사 + 상대 그룹 관리자
+            _recip: set[str] = {str(_a.nurse_id)}
+            if _other_gid:
+                from services.assignment_service import _get_head_nurse_ids
+                for _hn in _get_head_nurse_ids(db, _other_gid):
+                    _recip.add(_hn)
+            _new = _recip - _notified
+            if _new:
+                from services.assignment_service import _get_group_name
+                _gname = _get_group_name(db, current_user.group_id) or str(current_user.group_id)
+                send_assignment_roster_published_push(
+                    group_name=_gname,
+                    year=schedule.year,
+                    month=schedule.month,
+                    recipients=list(_new),
+                    office_code=office_id,
+                    sender_emp_seq_no=current_user.nurse_id,
+                    sender_member_id=current_user.account_id,
+                    is_source=_is_source,
+                )
+                _notified.update(_new)
+    except Exception as e:
+        print(f"[Publish] assignment 마감 알림 실패: {e}")
 
     return {
         "message": "근무표가 성공적으로 발행되었습니다.",
