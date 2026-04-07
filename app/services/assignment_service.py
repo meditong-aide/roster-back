@@ -242,6 +242,50 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
     return count
 
 
+def flush_all_pending_transfers(db: Session) -> int:
+    """전체 병동이동 레이지 체크 (스케줄러용, group_id 필터 없음).
+
+    start_date <= 오늘인 모든 active 병동이동 레코드를 처리한다.
+    """
+    today = date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.reason == "병동이동",
+            NurseAssignment.status == "active",
+            NurseAssignment.start_date <= today,
+            NurseAssignment.target_group_id.isnot(None),
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    count = 0
+    for row in rows:
+        nurse = (
+            db.query(NurseModel)
+            .filter(NurseModel.nurse_id == row.nurse_id)
+            .first()
+        )
+        if nurse and nurse.group_id != row.target_group_id:
+            nurse.group_id = row.target_group_id
+            nurse.team_id = None
+            logger.info(
+                "[Scheduler] 병동이동 적용: nurse_id=%s, %s → %s",
+                row.nurse_id, row.source_group_id, row.target_group_id,
+            )
+        row.status = "completed"
+        row.end_date = today
+        count += 1
+
+    if count > 0:
+        db.commit()
+        logger.info("[Scheduler] 병동이동 자동 flush 완료: %d건", count)
+
+    return count
+
+
 def transfer_shifts_on_publish(
     db: Session,
     schedule_id: str,
