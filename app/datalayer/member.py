@@ -5,7 +5,7 @@ class Member:
         _queryString = """
          select pwdcompare(%s,a.MemberPassEncrypt) as IsPWCorrect, a.EmpSeqNo, a.OfficeCode, a.EmpAuthGbn, isnull(mo.ade_sch,'N') as aiuseyn
           from bizwiz20db.Member_Login a inner join bizwiz20db.M_Office mo on a.OfficeCode = mo.OfficeCode 
-         where a.MemberID = %s and a.EmpAuthGbn in ('ADM', 'MEM')
+         where a.MemberID = %s and a.EmpAuthGbn in ('ADM', 'MEM', 'NMM')
         """
         return _queryString
 
@@ -58,7 +58,7 @@ class Member:
             Left Join bizwiz20db.T_Team D On A.mb_part=D.mb_part And A.OfficeCode=D.OfficeCode
             Left Join bizwiz20db.T_Part E On A.OfficialTitleCode=E.code And A.OfficeCode=E.OfficeCode
             left join bizwiz20db.Manage_Office F on A.OfficeCode = F.OfficeCode 
-            Where B.MemberID = %s AND a.EmpAuthGbn in ('ADM','MEM') and C.ade_sch = 'Y'
+            Where B.MemberID = %s AND a.EmpAuthGbn in ('ADM','MEM','NMM') and C.ade_sch = 'Y'
         
         """
         return _queryString
@@ -67,7 +67,7 @@ class Member:
         _queryString = """
         select a.EmpSeqNo, a.OfficeCode, a.EmpAuthGbn, isnull(mo.ade_sch,'N') as aiuseyn
           from bizwiz20db.Member_Login a inner join bizwiz20db.M_Office mo on a.OfficeCode = mo.OfficeCode 
-         where a.MemberID = %s and a.EmpAuthGbn in ('ADM', 'MEM')
+         where a.MemberID = %s and a.EmpAuthGbn in ('ADM', 'MEM', 'NMM')
         """
         return _queryString
 
@@ -167,7 +167,7 @@ class Member:
         LEFT JOIN bizwiz20db.member AS m 
             ON i.EmpSeqNo = m.EmpSeqNo 
         WHERE m.OfficeCode = %s
-          AND m.EmpAuthGbn IN ('ADM','MEM')
+          AND m.EmpAuthGbn IN ('ADM','MEM','NMM')
         """
         return _queryString
 
@@ -189,6 +189,6 @@ class Member:
           from bizwiz20db.Member a
                Inner Join bizwiz20db.Member_Login b On a.OfficeCode=b.OfficeCode And a.EmpSeqNo=b.EmpSeqNo
                Left Join bizwiz20db.T_Team c On a.mb_part=c.mb_part And a.OfficeCode=c.OfficeCode
-         where b.officecode = %s and a.EmpAuthGbn in ('ADM','MEM')
+         where b.officecode = %s and a.EmpAuthGbn in ('ADM','MEM','NMM')
         """
         return _queryString

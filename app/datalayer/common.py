@@ -15,7 +15,7 @@ class Common:
             _queryString = _queryString + " and EmpSeqNo in (%s) "
 
 
-        _queryString = _queryString + " and OfficeCode = %s and EmpAuthGbn in ('MEM', 'ADM') and isnull(LinkAlim,'Y') <> 'N' "
+        _queryString = _queryString + " and OfficeCode = %s and EmpAuthGbn in ('MEM', 'ADM', 'NMM') and isnull(LinkAlim,'Y') <> 'N' "
 
         return _queryString
 
@@ -88,7 +88,7 @@ class Common:
         _queryString = """
         select a.num, a.name, a.big_kind, a.middle_kind, a.small_kind, a.mb_part, a.[depth], a.sort, a.ref_num, b.EmpSeqNo, c.MemberID, b.EmployeeName, d.name as part_name, e.name as position_name, e.name as rank_name
           from bizwiz20db.T_Team a
-               inner join bizwiz20db.member b on a.OfficeCode = b.OfficeCode and a.mb_part = b.mb_part and b.EmpAuthGbn in ('MEM','ADM')
+               inner join bizwiz20db.member b on a.OfficeCode = b.OfficeCode and a.mb_part = b.mb_part and b.EmpAuthGbn in ('MEM','ADM','NMM')
                left join bizwiz20db.member_login c on b.OfficeCode = c.OfficeCode and b.EmpSeqNo = c.EmpSeqNo 
                left join bizwiz20db.T_Part d on a.OfficeCode = d.OfficeCode and b.OfficialTitleCode = d.code 
                left join bizwiz20db.T_Position e on a.OfficeCode = e.OfficeCode and b.OfficialPositionCode = e.code
