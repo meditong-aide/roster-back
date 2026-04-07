@@ -90,6 +90,7 @@ class ConstraintFactors(BaseModel):
     f_back_to_back: float = Field(default=1.0, description="직전 step 동일 간호사 감쇄")
     f_nurse_repeat: float = Field(default=1.0, description="동일 간호사 다일 위반 감쇄")
     f_consecutive: float = Field(default=1.0, description="연속근무 초과 감쇄")
+    f_coverage: float = Field(default=1.0, description="커버리지 부족 감쇄")
     combined: float = Field(default=1.0, description="전체 곱연산 결과")
 
 
@@ -106,7 +107,7 @@ class BulkPathStep(BaseModel):
     candidate: CandidateRecommendation
     transition_score: float = Field(
         default=0.0,
-        description="base_score × constraint_multiplier 적용 후 점수",
+        description="base_score x constraint_multiplier 적용 후 점수",
     )
     base_score: float = Field(
         default=0.0,
@@ -140,7 +141,7 @@ class BulkPathRecommendation(BaseModel):
     path_rank: int
     scenario_label: str = Field(
         default="",
-        description="시나리오 설명 (최적안/차선안/대안)",
+        description="시나리오 설명 (일자별 최적/균등 분할/근무유형 분할)",
     )
     steps: List[BulkPathStep] = Field(default_factory=list)
     total_path_score: float = 0.0

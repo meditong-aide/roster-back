@@ -57,6 +57,10 @@ WORK_SHIFT_GB_TO_MAIN = {
     "이브닝": "E",
     "미드": "M",
     "나이트": "N",
+    "D": "D",
+    "E": "E",
+    "M": "M",
+    "N": "N",
 }
 
 logger = logging.getLogger(__name__)
@@ -709,6 +713,436 @@ def _build_slots_for_bulk(
     return slots
 
 
+def _build_coverage_req(config: Any) -> Dict[str, int]:
+    """config에서 시프트 타입별 최소 커버리지 요구치를 구성.
+
+    솔버와 동일 로직: daily_shift_requirements JSON 우선, 없으면 구 필드 폴백.
+    use_mid=True 시 M 키 포함.
+    """
+    if not config:
+        return {}
+    raw = getattr(config, "daily_shift_requirements", None)
+    if raw and isinstance(raw, dict):
+        req = {}
+        for k, v in raw.items():
+            key = str(k).strip().upper()
+            try:
+                req[key] = int(v or 0)
+            except Exception:
+                req[key] = 0
+        return req
+    req = {
+        "D": int(getattr(config, "day_req", 0) or 0),
+        "E": int(getattr(config, "eve_req", 0) or 0),
+        "N": int(getattr(config, "nig_req", 0) or 0),
+    }
+    if bool(getattr(config, "use_mid", False)):
+        req["M"] = int(getattr(config, "mid_req", 0) or 0)
+    return req
+
+
+# ── Split Coverage 분할 전략 ──────────────────────────────
+
+
+def _split_slots_even(
+    slots: List[ReplacementSlot],
+    split_count: Optional[int] = None,
+) -> List[Tuple[str, List[ReplacementSlot]]]:
+    """균등 분할: N개 구간으로 슬롯을 균등 배분."""
+    if not slots:
+        return []
+    # 미지정 시 구간당 최대 4일 기준 자동 계산
+    n = split_count or max(2, -(-len(slots) // 4))
+    n = min(n, len(slots))
+    base, remainder = divmod(len(slots), n)
+    segments: List[Tuple[str, List[ReplacementSlot]]] = []
+    offset = 0
+    for i in range(n):
+        size = base + (1 if i < remainder else 0)
+        seg = slots[offset : offset + size]
+        label = f"구간 {i + 1} ({seg[0].date}~{seg[-1].date})"
+        segments.append((label, seg))
+        offset += size
+    return segments
+
+
+def _split_slots_ngram_optimal(
+    slots: List[ReplacementSlot],
+    max_window: int = 4,
+    evaluate_fn=None,
+) -> List[Tuple[str, List[ReplacementSlot]]]:
+    """n-gram 슬라이딩 윈도우 최적 분할 (DP).
+
+    가능한 모든 윈도우 크기(1~max_window) 조합 중
+    최소 위반 + 최고 점수인 파티션을 DP로 탐색.
+    evaluate_fn: (seg_slots) -> (violations, score) 평가 함수.
+    """
+    if not slots:
+        return []
+    n = len(slots)
+    if n <= max_window:
+        label = f"구간 1 ({slots[0].date}~{slots[-1].date})"
+        return [(label, slots)]
+
+    INF_V = 999999
+    # dp[i] = (total_violations, total_score, partition_indices)
+    dp: List[Tuple[int, float, List[Tuple[int, int]]]] = [
+        (INF_V, -1.0, []) for _ in range(n + 1)
+    ]
+    dp[0] = (0, 0.0, [])
+
+    for i in range(1, n + 1):
+        for w in range(1, min(max_window, i) + 1):
+            j = i - w
+            if dp[j][0] == INF_V and j > 0:
+                continue
+            seg = slots[j:i]
+            if evaluate_fn:
+                v_count, score = evaluate_fn(seg)
+            else:
+                v_count, score = 0, float(w)
+            total_v = dp[j][0] + v_count
+            total_s = dp[j][1] + score
+            if total_v < dp[i][0] or (total_v == dp[i][0] and total_s > dp[i][1]):
+                dp[i] = (total_v, total_s, dp[j][2] + [(j, i)])
+
+    segments: List[Tuple[str, List[ReplacementSlot]]] = []
+    for idx, (start, end) in enumerate(dp[n][2]):
+        seg = slots[start:end]
+        label = f"구간 {idx + 1} ({seg[0].date}~{seg[-1].date})"
+        segments.append((label, seg))
+    return segments
+
+
+def _split_slots_by_shift_type(
+    slots: List[ReplacementSlot],
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
+    target_schedule_shift_pks: Optional[List[Optional[str]]] = None,
+) -> List[Tuple[str, List[ReplacementSlot]]]:
+    """근무 유형 경계 분할: D/E/M vs N 연속 구간별 분리."""
+    if not slots:
+        return []
+
+    def _classify(slot: ReplacementSlot) -> str:
+        pk = None
+        if target_schedule_shift_pks:
+            idx = slot.date.day - 1
+            if idx < len(target_schedule_shift_pks):
+                pk = target_schedule_shift_pks[idx]
+        main, *_ = _resolve_shift_semantic_with_reason(
+            slot.shift, shift_meta, shift_pk=pk, shift_meta_by_pk=shift_meta_by_pk,
+        )
+        return "N" if main == "N" else "D/E"
+
+    segments: List[Tuple[str, List[ReplacementSlot]]] = []
+    current_type = _classify(slots[0])
+    current_group: List[ReplacementSlot] = [slots[0]]
+    for slot in slots[1:]:
+        st = _classify(slot)
+        if st != current_type:
+            label = f"{current_type} ({current_group[0].date}~{current_group[-1].date})"
+            segments.append((label, current_group))
+            current_type = st
+            current_group = [slot]
+        else:
+            current_group.append(slot)
+    label = f"{current_type} ({current_group[0].date}~{current_group[-1].date})"
+    segments.append((label, current_group))
+    return segments
+
+
+def _split_slots_by_weekday_weekend(
+    slots: List[ReplacementSlot],
+) -> List[Tuple[str, List[ReplacementSlot]]]:
+    """주중/주말 분할: 연속 주중(Mon-Fri)/주말(Sat-Sun) 구간별 분리."""
+    if not slots:
+        return []
+
+    def _is_weekend(d: date) -> bool:
+        return d.weekday() >= 5
+
+    segments: List[Tuple[str, List[ReplacementSlot]]] = []
+    current_is_wknd = _is_weekend(slots[0].date)
+    current_group: List[ReplacementSlot] = [slots[0]]
+    for slot in slots[1:]:
+        wknd = _is_weekend(slot.date)
+        if wknd != current_is_wknd:
+            tag = "주말" if current_is_wknd else "주중"
+            label = f"{tag} ({current_group[0].date}~{current_group[-1].date})"
+            segments.append((label, current_group))
+            current_is_wknd = wknd
+            current_group = [slot]
+        else:
+            current_group.append(slot)
+    tag = "주말" if current_is_wknd else "주중"
+    label = f"{tag} ({current_group[0].date}~{current_group[-1].date})"
+    segments.append((label, current_group))
+    return segments
+
+
+def _split_slots(
+    slots: List[ReplacementSlot],
+    strategy: str,
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
+    target_schedule_shift_pks: Optional[List[Optional[str]]] = None,
+    split_count: Optional[int] = None,
+) -> List[Tuple[str, List[ReplacementSlot]]]:
+    """전략에 따라 슬롯을 구간별로 분할."""
+    if strategy == "EVEN":
+        return _split_slots_even(slots, split_count)
+    elif strategy == "SHIFT_TYPE":
+        return _split_slots_by_shift_type(
+            slots, shift_meta, shift_meta_by_pk, target_schedule_shift_pks,
+        )
+    elif strategy == "WEEKDAY_WEEKEND":
+        return _split_slots_by_weekday_weekend(slots)
+    return [("전체", slots)]
+
+
+def _evaluate_segment_single_nurse(
+    seg_slots: List[ReplacementSlot],
+    req: ReplacementRecommendRequest,
+    schedule_map: Dict[str, List[str]],
+    schedule_shift_pk_map: Dict[str, List[Optional[str]]],
+    nurse_by_id: Dict[str, Any],
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Dict[str, Dict[str, Any]],
+    config: Any,
+    prev_tail_by_nurse: Dict[str, List[str]],
+    pref_score_map: Dict[Tuple[str, int, str], float],
+    pair_score_map: Dict[Tuple[str, str], float],
+    target_grade: Optional[int],
+    ranking_scope: str,
+    max_scan: int,
+    used_nurse_ids: set,
+) -> Tuple[Optional[CandidateRecommendation], float]:
+    """구간 전체를 1명이 커버할 최적 간호사를 평가.
+
+    각 후보에 대해 구간 내 모든 슬롯의 점수를 합산하고,
+    이전 구간에서 선점된 간호사(used_nurse_ids)는 제외.
+    """
+    if not seg_slots:
+        return None, 0.0
+
+    first_slot = seg_slots[0]
+    scored = _evaluate_single_slot(
+        slot=first_slot, req=req,
+        schedule_map=schedule_map,
+        schedule_shift_pk_map=schedule_shift_pk_map,
+        nurse_by_id=nurse_by_id, shift_meta=shift_meta,
+        shift_meta_by_pk=shift_meta_by_pk, config=config,
+        prev_tail_by_nurse=prev_tail_by_nurse,
+        pref_score_map=pref_score_map, pair_score_map=pair_score_map,
+        target_grade=target_grade, ranking_scope=ranking_scope,
+        max_scan=max_scan,
+    )
+
+    best_cid: Optional[str] = None
+    best_total = -1.0
+    best_violations = 999999
+    best_ctx: Optional[CandidateContext] = None
+    target_pk_row = schedule_shift_pk_map.get(req.target_nurse_id, [])
+
+    eval_limit = min(max_scan, len(scored))
+    for cid, ctx, base_score in scored[:eval_limit]:
+        if cid == req.target_nurse_id or cid in used_nurse_ids:
+            continue
+        nurse_sched = schedule_map.get(cid, [])
+        nurse_pk_row = schedule_shift_pk_map.get(cid, [])
+        total = 0.0
+        feasible = True
+        for slot in seg_slots:
+            day_idx = slot.date.day - 1
+            if day_idx >= len(nurse_sched):
+                feasible = False
+                break
+            cur_shift = nurse_sched[day_idx]
+            cur_pk = nurse_pk_row[day_idx] if day_idx < len(nurse_pk_row) else None
+            _main, _is_off_rest, _is_vac, is_off, _reason = _resolve_shift_semantic_with_reason(
+                cur_shift, shift_meta, shift_pk=cur_pk, shift_meta_by_pk=shift_meta_by_pk,
+            )
+            if is_off:
+                total += base_score
+            else:
+                total += base_score * 0.5
+        if not feasible:
+            continue
+        # 위반 시뮬레이션: 해당 간호사에 구간 전체 배정 후 위반 수 계산
+        trial_candidate = _ctx_to_candidate_model(ctx, rank=1, include_explanations=False)
+        trial_steps = [
+            BulkPathStep(slot=s, candidate=trial_candidate, transition_score=0.0)
+            for s in seg_slots
+        ]
+        v_summary = _count_path_violations(
+            path_steps=trial_steps,
+            schedule_map=schedule_map,
+            schedule_shift_pk_map=schedule_shift_pk_map,
+            nurse_by_id=nurse_by_id,
+            shift_meta=shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+            config=config,
+            prev_tail_by_nurse=prev_tail_by_nurse,
+            target_nurse_id=req.target_nurse_id,
+            include_target_nurse=False,
+        )
+        v_count = v_summary.total_count if v_summary else 0
+        # 커버리지 검증: 후보가 빠지면 원래 시프트 최소인원 위반 여부
+        _cov_req = _build_coverage_req(config)
+        for slot in seg_slots:
+            day_idx = slot.date.day - 1
+            if day_idx >= len(nurse_sched):
+                continue
+            cur_pk = nurse_pk_row[day_idx] if day_idx < len(nurse_pk_row) else None
+            _m, _, _, is_off, _ = _resolve_shift_semantic_with_reason(
+                nurse_sched[day_idx], shift_meta,
+                shift_pk=cur_pk, shift_meta_by_pk=shift_meta_by_pk,
+            )
+            if is_off or _m not in _cov_req or _cov_req[_m] <= 0:
+                continue
+            # 해당 일 해당 시프트 타입 인원 수 계산
+            day_count = 0
+            for other_id, other_sched in schedule_map.items():
+                if other_id == req.target_nurse_id:
+                    continue
+                if day_idx >= len(other_sched):
+                    continue
+                o_pk_row = schedule_shift_pk_map.get(other_id, [])
+                o_pk = o_pk_row[day_idx] if day_idx < len(o_pk_row) else None
+                o_main, _, _, o_off, _ = _resolve_shift_semantic_with_reason(
+                    other_sched[day_idx], shift_meta,
+                    shift_pk=o_pk, shift_meta_by_pk=shift_meta_by_pk,
+                )
+                if not o_off and o_main == _m:
+                    day_count += 1
+            # 후보가 빠지면 day_count - 1
+            if (day_count - 1) < _cov_req[_m]:
+                v_count += 1
+        # 최소 위반 우선, 동일 위반 시 점수 우선
+        if v_count < best_violations or (v_count == best_violations and total > best_total):
+            best_violations = v_count
+            best_total = total
+            best_cid = cid
+            best_ctx = ctx
+
+    if best_cid is None or best_ctx is None:
+        return None, 0.0
+
+    candidate = _ctx_to_candidate_model(
+        best_ctx, rank=1,
+        include_explanations=req.options.include_explanations,
+    )
+    # 구간 내 각 슬롯의 기존 시프트 정보를 태그에 추가
+    nurse_sched = schedule_map.get(best_cid, [])
+    nurse_pk_row = schedule_shift_pk_map.get(best_cid, [])
+    off_days = 0
+    for slot in seg_slots:
+        day_idx = slot.date.day - 1
+        if day_idx < len(nurse_sched):
+            cur_shift = nurse_sched[day_idx]
+            cur_pk = nurse_pk_row[day_idx] if day_idx < len(nurse_pk_row) else None
+            _m, _r, _v, is_off, _ = _resolve_shift_semantic_with_reason(
+                cur_shift, shift_meta, shift_pk=cur_pk, shift_meta_by_pk=shift_meta_by_pk,
+            )
+            if is_off:
+                off_days += 1
+    seg_len = len(seg_slots)
+    if off_days == seg_len:
+        candidate.tags.append(f"all_off_{seg_len}d")
+    elif off_days > 0:
+        candidate.tags.append(f"off_{off_days}_of_{seg_len}d")
+    else:
+        candidate.tags.append(f"requires_full_reassignment_{seg_len}d")
+
+    return candidate, best_total
+
+
+def _build_split_path(
+    segments_raw: List[Tuple[str, List[ReplacementSlot]]],
+    path_rank: int,
+    scenario_label: str,
+    req: ReplacementRecommendRequest,
+    schedule_map: Dict[str, List[str]],
+    schedule_shift_pk_map: Dict[str, List[Optional[str]]],
+    nurse_by_id: Dict[str, Any],
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_meta_by_pk: Dict[str, Dict[str, Any]],
+    config: Any,
+    prev_tail_by_nurse: Dict[str, List[str]],
+    pref_score_map: Dict[Tuple[str, int, str], float],
+    pair_score_map: Dict[Tuple[str, str], float],
+    target_grade: Optional[int],
+    ranking_scope: str,
+    max_scan: int,
+) -> Optional[BulkPathRecommendation]:
+    """구간 리스트를 받아 구간별 1명 평가 후 BulkPathRecommendation 반환."""
+    if not segments_raw:
+        return None
+    all_steps: List[BulkPathStep] = []
+    total_score = 0.0
+    used_nurse_ids: set = set()
+    for _seg_label, seg_slots in segments_raw:
+        best_candidate, best_score = _evaluate_segment_single_nurse(
+            seg_slots=seg_slots,
+            req=req,
+            schedule_map=schedule_map,
+            schedule_shift_pk_map=schedule_shift_pk_map,
+            nurse_by_id=nurse_by_id,
+            shift_meta=shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+            config=config,
+            prev_tail_by_nurse=prev_tail_by_nurse,
+            pref_score_map=pref_score_map,
+            pair_score_map=pair_score_map,
+            target_grade=target_grade,
+            ranking_scope=ranking_scope,
+            max_scan=max_scan,
+            used_nurse_ids=used_nurse_ids,
+        )
+        if best_candidate:
+            used_nurse_ids.add(best_candidate.nurse_id)
+            for s in seg_slots:
+                all_steps.append(BulkPathStep(
+                    slot=s,
+                    candidate=best_candidate,
+                    transition_score=round(best_score / len(seg_slots), 3),
+                ))
+            total_score += best_score
+        else:
+            no_cand = CandidateRecommendation(
+                nurse_id="", name="(후보 없음)", final_score=0.0, rank=0,
+                tags=["no_candidate_available"],
+                breakdown=CandidateScoreBreakdown(
+                    rule_safety=0, off_priority=0, grade_fit=0,
+                    preference=0, pair=0, fairness=0,
+                    change_cost=0, estimated_violation_delta=0,
+                ),
+            )
+            for s in seg_slots:
+                all_steps.append(BulkPathStep(slot=s, candidate=no_cand))
+
+    violations = _count_path_violations(
+        path_steps=all_steps,
+        schedule_map=schedule_map,
+        schedule_shift_pk_map=schedule_shift_pk_map,
+        nurse_by_id=nurse_by_id,
+        shift_meta=shift_meta,
+        shift_meta_by_pk=shift_meta_by_pk,
+        config=config,
+        prev_tail_by_nurse=prev_tail_by_nurse,
+        target_nurse_id=req.target_nurse_id,
+        include_target_nurse=False,
+    )
+    return BulkPathRecommendation(
+        path_rank=path_rank,
+        scenario_label=scenario_label,
+        steps=all_steps,
+        total_path_score=round(total_score, 3),
+        violations=violations,
+    )
+
+
 def _final_score(ctx: CandidateContext) -> float:
     return round(
         100.0 * ctx.rule_safety
@@ -826,7 +1260,8 @@ def recommend_replacement_candidates(
         ranking_scope = "ALL"
 
     if req.mode == "BULK":
-        markov_results, bulk_paths = _recommend_bulk_markov(
+        # Path 1: 일자별 최적 (기존 markov, 최적안만)
+        markov_results, markov_paths = _recommend_bulk_markov(
             slots=slots,
             req=req,
             schedule_map=schedule_map,
@@ -842,6 +1277,69 @@ def recommend_replacement_candidates(
             ranking_scope=ranking_scope,
             max_scan=max_scan,
         )
+        path_1 = markov_paths[0] if markov_paths else None
+        if path_1:
+            path_1.path_rank = 1
+            path_1.scenario_label = "일자별 최적"
+
+        # Path 2: EVEN n-gram 최적 분할 (구간별 1명 전담)
+        target_pk_row = schedule_shift_pk_map.get(req.target_nurse_id)
+        _common_eval_args = dict(
+            req=req,
+            schedule_map=schedule_map,
+            schedule_shift_pk_map=schedule_shift_pk_map,
+            nurse_by_id=nurse_by_id,
+            shift_meta=shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+            config=config,
+            prev_tail_by_nurse=prev_tail_by_nurse,
+            pref_score_map=pref_score_map,
+            pair_score_map=pair_score_map,
+            target_grade=target_grade,
+            ranking_scope=ranking_scope,
+            max_scan=max_scan,
+        )
+
+        def _ngram_eval(seg_slots: List[ReplacementSlot]) -> Tuple[int, float]:
+            """n-gram DP용 평가: (위반수, 점수) 반환."""
+            cand, score = _evaluate_segment_single_nurse(
+                seg_slots=seg_slots, used_nurse_ids=set(), **_common_eval_args,
+            )
+            if not cand:
+                return 999, 0.0
+            trial_steps = [BulkPathStep(slot=s, candidate=cand) for s in seg_slots]
+            v = _count_path_violations(
+                path_steps=trial_steps, schedule_map=schedule_map,
+                schedule_shift_pk_map=schedule_shift_pk_map,
+                nurse_by_id=nurse_by_id, shift_meta=shift_meta,
+                shift_meta_by_pk=shift_meta_by_pk, config=config,
+                prev_tail_by_nurse=prev_tail_by_nurse,
+                target_nurse_id=req.target_nurse_id, include_target_nurse=False,
+            )
+            return (v.total_count if v else 0), score
+
+        even_segments = _split_slots_ngram_optimal(
+            slots=slots, max_window=4, evaluate_fn=_ngram_eval,
+        )
+        path_2 = _build_split_path(
+            segments_raw=even_segments,
+            path_rank=2, scenario_label="균등 분할",
+            **_common_eval_args,
+        )
+
+        # Path 3: SHIFT_TYPE 분할 (구간별 1명 전담)
+        shift_type_segments = _split_slots_by_shift_type(
+            slots=slots, shift_meta=shift_meta,
+            shift_meta_by_pk=shift_meta_by_pk,
+            target_schedule_shift_pks=target_pk_row,
+        )
+        path_3 = _build_split_path(
+            segments_raw=shift_type_segments,
+            path_rank=3, scenario_label="근무유형 분할",
+            **_common_eval_args,
+        )
+
+        bulk_paths = [p for p in [path_1, path_2, path_3] if p]
         return ReplacementRecommendResponse(
             schedule_id=req.schedule_id,
             mode=req.mode,
@@ -855,7 +1353,7 @@ def recommend_replacement_candidates(
                 "applied_ranking_scope": ranking_scope,
                 "violation_delta_lambda": round(violation_delta_lambda, 3),
                 "violation_type_weights": VIOLATION_TYPE_WEIGHT,
-                "scoring_policy": "violation_first_exclusive_pool_with_15n_off_guard",
+                "scoring_policy": "unified_3_strategy",
             },
         )
 
@@ -1845,9 +2343,35 @@ def _recommend_bulk_markov(
                     streak_over = max(0, streak - max_conseq)
                     f_consecutive = max(0.3, 1.0 - 0.1 * streak_over)
 
+                # 커버리지 검증: 후보가 빠지면 원래 시프트 최소인원 위반 여부
+                f_coverage = 1.0
+                _cov_req_bulk = _build_coverage_req(config)
+                cid_sched = path_schedule_maps[path_idx].get(cid, [])
+                if cid_sched and day_idx < len(cid_sched):
+                    c_pk = (path_shift_pk_maps[path_idx].get(cid, []) or [])[day_idx] if day_idx < len(path_shift_pk_maps[path_idx].get(cid, []) or []) else None
+                    c_main, _, _, c_off, _ = _resolve_shift_semantic_with_reason(
+                        cid_sched[day_idx], shift_meta,
+                        shift_pk=c_pk, shift_meta_by_pk=shift_meta_by_pk,
+                    )
+                    if not c_off and c_main in _cov_req_bulk and _cov_req_bulk[c_main] > 0:
+                        day_shift_count = 0
+                        for o_id, o_sched in path_schedule_maps[path_idx].items():
+                            if o_id == req.target_nurse_id or day_idx >= len(o_sched):
+                                continue
+                            o_pk_r = path_shift_pk_maps[path_idx].get(o_id, [])
+                            o_pk = o_pk_r[day_idx] if day_idx < len(o_pk_r) else None
+                            o_m, _, _, o_off, _ = _resolve_shift_semantic_with_reason(
+                                o_sched[day_idx], shift_meta,
+                                shift_pk=o_pk, shift_meta_by_pk=shift_meta_by_pk,
+                            )
+                            if not o_off and o_m == c_main:
+                                day_shift_count += 1
+                        if (day_shift_count - 1) < _cov_req_bulk[c_main]:
+                            f_coverage = 0.1
+
                 constraint_multiplier = (
                     f_violation * f_reuse * f_back_to_back
-                    * f_nurse_repeat * f_consecutive
+                    * f_nurse_repeat * f_consecutive * f_coverage
                 )
                 step_score = base_score * constraint_multiplier
 
@@ -1857,6 +2381,7 @@ def _recommend_bulk_markov(
                     f_back_to_back=round(f_back_to_back, 4),
                     f_nurse_repeat=round(f_nurse_repeat, 4),
                     f_consecutive=round(f_consecutive, 4),
+                    f_coverage=round(f_coverage, 4),
                     combined=round(constraint_multiplier, 4),
                 )
 
