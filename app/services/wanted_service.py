@@ -7,7 +7,7 @@ import json
 import traceback
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import func
@@ -2095,3 +2095,67 @@ def get_fixed_wanted_entries_service(
         FixedWantedEntry.year == year,
         FixedWantedEntry.month == month,
     ).all()
+
+
+def get_shift_requests_service(
+    db: Session,
+    target_group_id: str,
+    year: int,
+    month: int,
+    shift_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """해당 년/월 그룹 내 전체 간호사의 원티드 제출 여부 + shift 내역 반환"""
+    nurse_ids = [
+        n[0] for n in
+        db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
+    ]
+    if not nurse_ids:
+        return []
+
+    month_str = f"{year:04d}-{month:02d}"
+    first_day = date(year, month, 1)
+    last_day = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+
+    # 제출 현황 일괄 조회
+    submitted_requests = (
+        db.query(WantedRequest)
+        .filter(
+            WantedRequest.nurse_id.in_(nurse_ids),
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True,
+        )
+        .all()
+    )
+    submitted_map = {wr.nurse_id: wr for wr in submitted_requests}
+
+    # shift 내역 일괄 조회
+    shift_query = db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id.in_(nurse_ids),
+        NurseShiftRequest.shift_date >= first_day,
+        NurseShiftRequest.shift_date < last_day,
+    )
+    if shift_type:
+        shift_query = shift_query.filter(NurseShiftRequest.shift == shift_type)
+    shift_rows = shift_query.all()
+
+    # nurse_id별 shift 그룹핑
+    shift_map: Dict[str, list] = {}
+    for row in shift_rows:
+        shift_map.setdefault(row.nurse_id, []).append({
+            "shift_date": row.shift_date.isoformat(),
+            "shift": row.shift,
+            "score": float(row.score),
+            "comment": row.comment,
+        })
+
+    results = []
+    for nurse_id in nurse_ids:
+        wr = submitted_map.get(nurse_id)
+        results.append({
+            "nurse_id": nurse_id,
+            "is_submitted": wr is not None,
+            "submitted_at": wr.submitted_at.isoformat() if wr and wr.submitted_at else None,
+            "shifts": shift_map.get(nurse_id, []),
+        })
+
+    return results
