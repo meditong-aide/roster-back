@@ -17,7 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.mysql import TINYINT
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, deferred
 from db.client2 import Base
 from sqlalchemy import DATE, DECIMAL, TEXT, Time
 
@@ -335,6 +335,7 @@ class RosterConfig(Base):
     fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
+    use_max_coverage = deferred(Column(BOOLEAN, nullable=True, server_default="0"))
 
     office = relationship("Office")
     group = relationship("Group")

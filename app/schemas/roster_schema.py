@@ -245,6 +245,10 @@ class RosterConfigBase(BaseModel):
     show_preceptor: bool = Field(
         default=True, description="근무표에 프리셉터-프리셉티 관계 표시 여부"
     )
+    use_max_coverage: bool = Field(
+        default=False,
+        description="True 시 daily coverage를 max coverage로 적용 (초과 배정 불가, 잔여 인원 Off)",
+    )
 
 
 class RosterConfigCreate(RosterConfigBase):

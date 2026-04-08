@@ -498,6 +498,8 @@ class CPSATBasicEngine:
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
+            # max coverage 모드
+            use_max_coverage=bool(config_data.get('use_max_coverage', False)),
             # off_placement_mode=0,
         )
         off_days_eff, off_days_src = resolve_effective_off_days(config_data)
@@ -2240,14 +2242,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
     for n, nu in enumerate(rs.nurses):
         pid = getattr(nu, 'preceptor_id', None)
-        if pid and pid in _id_to_idx_pre:
+        if pid:
             preceptee_indices.add(n)
-    preceptee_indices = set(preceptee_indices)
-    if preceptee_indices:
-        print(f"[FIX] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
     # 프리셉티 기간 제한
     preceptee_follow_days: dict[int, set[int]] = getattr(rs, "preceptee_follow_days", {}) or {}
     _has_preceptee_period = bool(preceptee_follow_days)
+    # dispatch(assignment) 기반 프리셉티도 인덱스에 포함
+    if _has_preceptee_period:
+        for n in preceptee_follow_days:
+            if n not in preceptee_indices:
+                preceptee_indices.add(n)
+    preceptee_indices = set(preceptee_indices)
+    if preceptee_indices:
+        print(f"[FIX] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
     # 기간이 빈 set인 프리셉티 = 해당 월에서 프리셉티 아님 → preceptee_indices에서 제거
     if _has_preceptee_period:
         _empty_period = {n for n, days in preceptee_follow_days.items() if len(days) == 0}
@@ -2570,6 +2577,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     zero_demand_block_codes = {"D", "E", "N", "M"}
     coverage_exclude_cells: set[tuple[int, int]] = getattr(rs, "coverage_exclude_cells", set()) or set()
     cfg = rs.config
+    use_max_coverage = bool(getattr(cfg, "use_max_coverage", False))
+    if use_max_coverage:
+        print("[MaxCoverage] max coverage 모드 활성화: 커버리지 상한 제약 적용")
     next_month_head_req = getattr(cfg, "next_month_head_requirements", None) or []
     for d in range(D):
         # 일자별 요구치: 룩어헤드 일자는 next_month_head_requirements 또는 기본값
@@ -2625,12 +2635,53 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 continue
-            if need <= 0:
+            if use_max_coverage:
+                # max coverage: 정확히 커버리지만큼 배정, 나머지 Off
+                if need <= 0:
+                    # 고정 셀만으로 이미 상한 도달 → 추가 배정 금지
+                    m.Add(assigned == 0)
+                else:
+                    m.Add(assigned == need)
+                ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                over_vars_by_day.setdefault(d, {})[code] = ov
+            else:
+                # min coverage(기존): 하한 제약
+                if need <= 0:
+                    continue
+                m.Add(assigned >= need)
+                ov = m.NewIntVar(0, N, f"over_{d}_{code}")
+                m.Add(ov >= assigned - need)
+                over_vars_by_day.setdefault(d, {})[code] = ov
+
+    # ───────────── 2-D. Max coverage Off 균등 분배 ───
+    max_cov_off_equalize_terms = []
+    if use_max_coverage:
+        off_idx = rs.config.shift_types.index('O')
+        nurse_off_vars = []
+        for n in range(N):
+            # 프리셉티는 프리셉터 스케줄을 따라가므로 균등화 대상에서 제외
+            if n in preceptee_indices:
                 continue
-            m.Add(assigned >= need)
-            ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-            m.Add(ov >= assigned - need)
-            over_vars_by_day.setdefault(d, {})[code] = ov
+            T0, T1 = join[n], leave[n]
+            phys_days = [d for d in range(T0, min(T1 + 1, D_phys))]
+            if not phys_days:
+                continue
+            total_off_n = m.NewIntVar(0, len(phys_days), f"mc_off_{n}")
+            m.Add(
+                total_off_n == sum(X(n, d, off_idx) for d in phys_days if (n, d) not in fixed)
+                + sum(1 for d in phys_days if (n, d) in fixed and fixed[(n, d)] == off_idx)
+            )
+            nurse_off_vars.append(total_off_n)
+        if len(nurse_off_vars) >= 2:
+            off_global_max = m.NewIntVar(0, D_phys, "mc_off_max")
+            off_global_min = m.NewIntVar(0, D_phys, "mc_off_min")
+            m.AddMaxEquality(off_global_max, nurse_off_vars)
+            m.AddMinEquality(off_global_min, nurse_off_vars)
+            off_range = m.NewIntVar(0, D_phys, "mc_off_range")
+            m.Add(off_range == off_global_max - off_global_min)
+            # Off 분산 패널티 (가중치 높게 설정하여 균등 분배 유도)
+            max_cov_off_equalize_terms.append(-200 * off_range)
+            print(f"[MaxCoverage] Off 균등 분배 제약 추가: 간호사 {len(nurse_off_vars)}명")
 
     # shorthand indices
     idx = {c: rs.config.shift_types.index(c) for c in ('D', 'E', 'N', 'O')}
@@ -2936,8 +2987,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
 
         # 월 최소/최대 OFF (당월 D_phys만 합산)
+        # max coverage 모드에서는 Off cap 미적용 (커버리지 상한에 의해 Off 자연 배정)
         try:
-            if not bool(getattr(nu, "is_weekend_off", False)):
+            if not use_max_coverage and not bool(getattr(nu, "is_weekend_off", False)):
                 phys_range_off = month_total_day_range(T0, T1, D_phys)
                 _n_blocked_set = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 if _n_blocked_set:
@@ -3194,6 +3246,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 weight=lookahead_dist_weight,
             )
         )
+    # max coverage Off 균등 분배 항 추가
+    if max_cov_off_equalize_terms:
+        obj.extend(max_cov_off_equalize_terms)
     m.Maximize(sum(obj))
 
     return m, X, join, leave, fixed

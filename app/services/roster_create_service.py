@@ -2086,6 +2086,12 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
 
         # 호출자가 구성한 config_dict(게이지 반영 등)이 있으면 이를 사용
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
+        # deferred 컬럼 명시 로딩 (DB 미반영 시에도 안전)
+        if latest_config and "use_max_coverage" not in config_dict:
+            try:
+                config_dict["use_max_coverage"] = bool(latest_config.use_max_coverage or False)
+            except Exception:
+                config_dict["use_max_coverage"] = False
         # ShiftManage 요구인원은 호출부에서 주입한다
 
         try:
@@ -3074,6 +3080,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     )
     # daily_shift_requirements를 config에 주입해서 엔진 호출
     config_dict = latest_config.__dict__ if latest_config else {}
+    # deferred 컬럼 명시 로딩 (DB 미반영 시에도 안전)
+    if latest_config and "use_max_coverage" not in config_dict:
+        try:
+            config_dict["use_max_coverage"] = bool(latest_config.use_max_coverage or False)
+        except Exception:
+            config_dict["use_max_coverage"] = False
     config_dict['daily_shift_requirements'] = daily_shift_requirements
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day

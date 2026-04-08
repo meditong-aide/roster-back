@@ -297,13 +297,18 @@ def optimize_fallback_lex_hard_first(
     _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
     for n, nu in enumerate(roster_system.nurses):
         pid = getattr(nu, 'preceptor_id', None)
-        if pid and pid in _fb_id_to_idx:
+        if pid:
             preceptee_indices.add(n)
-    if preceptee_indices:
-        print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
     # 프리셉티 기간 제한: assignment 기간 내에만 follow (기간 외 독립 배정)
     preceptee_follow_days: dict[int, set[int]] = getattr(roster_system, "preceptee_follow_days", {}) or {}
     _has_preceptee_period = bool(preceptee_follow_days)
+    # dispatch(assignment) 기반 프리셉티도 인덱스에 포함
+    if _has_preceptee_period:
+        for n in preceptee_follow_days:
+            if n not in preceptee_indices:
+                preceptee_indices.add(n)
+    if preceptee_indices:
+        print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
     # 기간이 빈 set인 프리셉티 = 해당 월에서 프리셉티 아님 → preceptee_indices에서 제거
     if _has_preceptee_period:
         _empty_period = {n for n, days in preceptee_follow_days.items() if len(days) == 0}
@@ -1040,6 +1045,9 @@ def optimize_fallback_lex_hard_first(
         )
 
         # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
+        use_max_coverage = bool(getattr(cfg, "use_max_coverage", False))
+        if use_max_coverage:
+            print(f"{logger_prefix} [MaxCoverage][Fallback] 고정 커버리지 모드 적용")
         short_terms, over_terms = [], []
         over_vars_by_day = {}
         short_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
@@ -1116,18 +1124,35 @@ def optimize_fallback_lex_hard_first(
                     short_vars_by_day_code[(d, code)] = sh
                     over_vars_by_day_code[(d, code)] = ov
                     continue
-                if need <= 0:
-                    continue
-                sh = m.NewIntVar(0, N, f"short_{d}_{code}")
-                ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-                # Coverage 우선: assigned + shortage >= need (hard), oversupply 추적은 선택
-                m.Add(assigned + sh >= need)
-                m.Add(assigned - ov <= need)
-                short_terms.append(sh)
-                over_terms.append(ov)
-                over_vars_by_day.setdefault(d, {})[code] = ov
-                short_vars_by_day_code[(d, code)] = sh
-                over_vars_by_day_code[(d, code)] = ov
+                if use_max_coverage:
+                    # 폴백: 상한만 적용 (초과 불가, 미달은 소프트 패널티)
+                    if need <= 0:
+                        m.Add(assigned == 0)
+                        sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
+                        ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                    else:
+                        m.Add(assigned <= need)
+                        sh = m.NewIntVar(0, N, f"short_{d}_{code}")
+                        m.Add(sh >= need - assigned)
+                        ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                    short_terms.append(sh)
+                    over_terms.append(ov)
+                    over_vars_by_day.setdefault(d, {})[code] = ov
+                    short_vars_by_day_code[(d, code)] = sh
+                    over_vars_by_day_code[(d, code)] = ov
+                else:
+                    if need <= 0:
+                        continue
+                    sh = m.NewIntVar(0, N, f"short_{d}_{code}")
+                    ov = m.NewIntVar(0, N, f"over_{d}_{code}")
+                    # Coverage 우선: assigned + shortage >= need (hard), oversupply 추적은 선택
+                    m.Add(assigned + sh >= need)
+                    m.Add(assigned - ov <= need)
+                    short_terms.append(sh)
+                    over_terms.append(ov)
+                    over_vars_by_day.setdefault(d, {})[code] = ov
+                    short_vars_by_day_code[(d, code)] = sh
+                    over_vars_by_day_code[(d, code)] = ov
         # 2) 안전/법규 위반(정량 슬랙) 구성
         safety = {
             "trans_nd": [],  # N→D 위반 (Bool)
@@ -1517,9 +1542,10 @@ def optimize_fallback_lex_hard_first(
                     safety["pattern_eod"].append(v3)
 
         # 월 최소 OFF 부족량(가능일수 클램프)
+        # max coverage 모드에서는 Off cap 미적용 (커버리지 고정에 의해 Off 자연 배정)
         try:
             # 개인별 O 정량 할당(나이트 전담 제외, 주휴 제외한 순수 O 목표)
-            if off_idx is not None and effective_off_days > 0:
+            if off_idx is not None and effective_off_days > 0 and not use_max_coverage:
                 for n in range(N):
                     if _is_preceptee_at(n):
                         continue
@@ -1592,6 +1618,8 @@ def optimize_fallback_lex_hard_first(
                         f"cap_semantics={off_cap_semantics}, target_O={target_o}, weekly_off_target={weekly_target}"
                     )
             for n in range(N):
+                if use_max_coverage:
+                    break  # max coverage: Off cap 미적용 (커버리지 고정에 의해 Off 자연 결정)
                 if _is_preceptee_at(n):
                     continue
                 T0, T1 = join[n], leave[n]
