@@ -233,6 +233,140 @@ def add_even_night_minmax_distribution_terms(
     return obj
 
 
+def add_even_shift_distribution_terms(
+    *,
+    m: cp_model.CpModel,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    fixed_cnt: list[list[int]] | None = None,
+    logger_prefix: str = "[objective_terms]",
+    stage_label: str = "메인",
+    blocked_by_nurse: dict[int, set[int]] | None = None,
+) -> list:
+    """D/E/N(/M) 시프트 균등 분배 — 간호사별 커버리지 비율 기반 band.
+
+    각 간호사의 (활동일 - Off) 에서 허용 시프트의 커버리지 비율로 기대치를 계산하고,
+    해당 band 내로 배정을 유도한다. N전담은 제외 (기존 even_nights에서 처리).
+    even_nights 활성화 시 N은 이 함수에서 제외하여 이중 적용 방지.
+    """
+    import math
+
+    cfg = rs.config
+    D = rs.num_days
+    S = cfg.num_shifts
+    use_mid = bool(getattr(cfg, "use_mid", False))
+    even_nights_on = bool(getattr(cfg, "even_nights", False))
+
+    all_work_codes = ["D", "E", "N"]
+    if use_mid and "M" in cfg.shift_types:
+        all_work_codes.append("M")
+
+    # N 포함: per-nurse band가 even_nights 글로벌 band보다 정확 (EN전용 간호사 대응)
+    target_codes = [c for c in all_work_codes if c in cfg.shift_types]
+    if not target_codes:
+        return []
+
+    # 커버리지 비율 맵 (daily_shift_requirements_by_day 우선 → 월 합산)
+    fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+    coverage_map: dict[str, int] = {}
+    for c in all_work_codes:
+        if c not in cfg.shift_types:
+            continue
+        s_i = cfg.shift_types.index(c)
+        if (
+            hasattr(cfg, "daily_shift_requirements_by_day")
+            and isinstance(cfg.daily_shift_requirements_by_day, list)
+            and len(cfg.daily_shift_requirements_by_day) == D
+        ):
+            total = sum(
+                max(0, int((cfg.daily_shift_requirements_by_day[d] or {}).get(c, 0) or 0)
+                    - int(fc[d][s_i] if d < len(fc) else 0))
+                for d in range(D)
+            )
+        else:
+            base = int((cfg.daily_shift_requirements or {}).get(c, 0) or 0)
+            total = sum(max(0, base - int(fc[d][s_i] if d < len(fc) else 0)) for d in range(D))
+        coverage_map[c] = total
+
+    off_days_cfg = int(getattr(cfg, "standard_personal_off_days", 8) or 8)
+    w_primary = 300000
+    w_secondary = 20000
+
+    obj: list = []
+    for code in target_codes:
+        if code not in cfg.shift_types:
+            continue
+        s_idx = cfg.shift_types.index(code)
+
+        nurse_data: list[tuple[int, int, int]] = []  # (n, low_n, high_n)
+        for n, nu in enumerate(rs.nurses):
+            raw = getattr(nu, "is_night_nurse", None)
+            is_n_only = is_n_only_profile(raw, use_mid=use_mid)
+            if is_n_only:
+                continue
+            # blocked day: join/leave 윈도우 교집합 기반
+            blocked_set = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+            _n_blocked = sum(1 for d in blocked_set if join[n] <= d <= leave[n])
+            _active = leave[n] - join[n] + 1 - _n_blocked
+            if _active <= 0:
+                continue
+
+            # 이 간호사의 허용 시프트
+            allowed = normalize_allowed_shift_codes(raw, use_mid=use_mid)
+            if not allowed:
+                allowed = set(all_work_codes)
+            if code not in allowed:
+                continue
+
+            # 허용 시프트 중 월간 커버리지 비율 합
+            allowed_coverage_sum = sum(coverage_map.get(c, 0) for c in allowed if c in coverage_map)
+            if allowed_coverage_sum <= 0:
+                continue
+
+            # 기대 근무일
+            work_days = max(0, _active - round(off_days_cfg * _active / D))
+
+            # 이 시프트의 기대 배정 수
+            code_coverage = coverage_map.get(code, 0)
+            expected = work_days * code_coverage / allowed_coverage_sum
+            low_n = int(expected)
+            high_n = max(low_n, math.ceil(expected))
+            if high_n == low_n:
+                high_n = low_n + 1
+
+            nurse_data.append((n, low_n, high_n))
+
+        if len(nurse_data) < 2:
+            continue
+
+        total_expected = sum(round((lo + hi) / 2) for _, lo, hi in nurse_data)
+        print(
+            f"{logger_prefix} [{code}균등] 비율기반 band({stage_label}): "
+            f"nurses={len(nurse_data)}, total_expected={total_expected}, "
+            f"band_sample=[{nurse_data[0][1]},{nurse_data[0][2]}], "
+            f"w_primary={w_primary}, w_secondary={w_secondary}"
+        )
+
+        max_var = m.NewIntVar(0, D, f"{code}_eq_max_{stage_label}")
+        min_var = m.NewIntVar(0, D, f"{code}_eq_min_{stage_label}")
+        for n, low_n, high_n in nurse_data:
+            tot = sum(X(n, d, s_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse))
+            m.Add(max_var >= tot)
+            m.Add(min_var <= tot)
+            dev_low = m.NewIntVar(0, D, f"{code}_eq_devL_{stage_label}_{n}")
+            dev_high = m.NewIntVar(0, D, f"{code}_eq_devH_{stage_label}_{n}")
+            m.Add(dev_low >= low_n - tot)
+            m.Add(dev_high >= tot - high_n)
+            obj.append(-w_secondary * dev_low)
+            obj.append(-w_secondary * dev_high)
+        obj.append(-w_primary * max_var)   # 최대 억제
+        obj.append(w_primary * min_var)    # 최소 끌어올림
+
+    return obj
+
+
 def build_main_objective_terms(
     *,
     m: cp_model.CpModel,
@@ -391,6 +525,21 @@ def build_main_objective_terms(
             join=join,
             leave=leave,
             fixed_cnt=fixed_cnt,
+        )
+    )
+
+    # (4-3-2) D/E(/M) 시프트 균등 분배
+    obj.extend(
+        add_even_shift_distribution_terms(
+            m=m,
+            rs=rs,
+            X=X,
+            join=join,
+            leave=leave,
+            fixed_cnt=fixed_cnt,
+            logger_prefix="[objective_terms]",
+            stage_label="메인",
+            blocked_by_nurse=blocked_by_nurse,
         )
     )
 

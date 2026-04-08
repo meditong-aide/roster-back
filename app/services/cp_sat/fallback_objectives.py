@@ -14,6 +14,7 @@ from services.day_windows import iter_nurse_days
 from services.cp_sat.objective_terms import (
     add_even_mid_distribution_terms,
     add_even_night_minmax_distribution_terms,
+    add_even_shift_distribution_terms,
 )
 
 
@@ -286,8 +287,21 @@ def build_fallback_stage3_objective_terms(
                 fixed_cnt=fixed_cnt,
             )
         )
+        obj.extend(
+            add_even_shift_distribution_terms(
+                m=m,
+                rs=roster_system,
+                X=X,
+                join=join,
+                leave=leave,
+                fixed_cnt=fixed_cnt,
+                logger_prefix=logger_prefix,
+                stage_label="폴백 Stage3",
+                blocked_by_nurse=blocked_by_nurse,
+            )
+        )
     except Exception as exc:
-        print(f"{logger_prefix} [WARN] even_nights penalty 적용 실패: {exc}")
+        print(f"{logger_prefix} [WARN] even_nights/shift_distribution penalty 적용 실패: {exc}")
 
     # 연속근무 소프트 상한
     try:
