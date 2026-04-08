@@ -898,11 +898,11 @@ async def get_roster_by_schedule_id(
                             if sched_ids and idx < len(sched_ids):
                                 sched_ids[idx] = None
                 else:
-                    # 타인 행: blocked_window 기간은 code=null 처리 (실근무 아님)
+                    # 타인 행: blocked_window 기간은 null 처리 (실근무 아님)
                     for d in range(_p_start, _p_end + 1):
                         idx = d - 1
                         if idx < len(sched):
-                            sched[idx] = {"code": None, "reason": _a["reason"]}
+                            sched[idx] = None
                         if sched_ids and idx < len(sched_ids):
                             sched_ids[idx] = None
 

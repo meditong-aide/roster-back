@@ -410,11 +410,7 @@ def get_prev_month_tail_service(
             for d in tail_day_list:
                 _cell_date = date(prev_year, prev_month, d)
                 if _cell_date >= _a_start and (not _a_end or _cell_date <= _a_end):
-                    _orig = shifts.get(str(d))
-                    if isinstance(_orig, dict):
-                        _orig["reason"] = _a["reason"]
-                    else:
-                        shifts[str(d)] = {"code": _orig, "reason": _a["reason"]}
+                    shifts[str(d)] = None
         nurse_list.append(
             {
                 "nurse_id": nurse.nurse_id,
