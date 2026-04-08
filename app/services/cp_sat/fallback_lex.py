@@ -25,7 +25,7 @@ from services.cp_sat.allowed_shift_types import (
 )
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
 from services.cp_sat.m_coverage import compute_main_bucket_indices
-from services.cp_sat.night_distribution_log import log_n_even_distribution
+from services.cp_sat.night_distribution_log import log_n_even_distribution, log_shift_distribution
 from services.day_windows import iter_nurse_days, build_active_days
 
 
@@ -2073,6 +2073,7 @@ def optimize_fallback_lex_hard_first(
                 if s3.Value(X3(n, d, s)):
                     roster_system.roster[n, d, s] = 1
     log_n_even_distribution(roster_system, logger_prefix, join=join, leave=leave)
+    log_shift_distribution(roster_system, logger_prefix, join=join, leave=leave, blocked_by_nurse=blocked_by_nurse)
     try:
         print(f"{logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
         before_viol = len(roster_system._find_violations())

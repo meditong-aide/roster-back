@@ -38,7 +38,7 @@ from services.cp_sat.hardcoded_weights import (
 )
 from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set
 from services.cp_sat.fallback_lex import optimize_fallback_lex_hard_first
-from services.cp_sat.night_distribution_log import log_n_even_distribution
+from services.cp_sat.night_distribution_log import log_n_even_distribution, log_shift_distribution
 from services.cp_sat.lookahead_helpers import (
     get_D_ext,
     compute_leave_ext,
@@ -1758,6 +1758,7 @@ class CPSATBasicEngine:
                 break
         roster_system.roster = best_roster
         log_n_even_distribution(roster_system, self.logger_prefix)
+        log_shift_distribution(roster_system, self.logger_prefix, blocked_by_nurse=getattr(roster_system, 'blocked_by_nurse', None))
         if best_viol > 0:
             try:
                 violations = [
@@ -1853,6 +1854,7 @@ class CPSATBasicEngine:
                     for s in range(S):
                         if solver.Value(X(n,d,s)): rs.roster[n,d,s]=1
             log_n_even_distribution(rs, self.logger_prefix, join=j, leave=leave_phys)
+            log_shift_distribution(rs, self.logger_prefix, join=j, leave=leave_phys, blocked_by_nurse=getattr(rs, 'blocked_by_nurse', None))
         except Exception as e:
             print(f"[ERR] _quick_initial_solve:", e)
             return False

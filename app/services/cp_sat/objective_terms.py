@@ -291,8 +291,7 @@ def add_even_shift_distribution_terms(
         coverage_map[c] = total
 
     off_days_cfg = int(getattr(cfg, "standard_personal_off_days", 8) or 8)
-    w_primary = 300000
-    w_secondary = 20000
+    w_dev = 100000  # per-nurse deviation only (글로벌 max/min 제거)
 
     obj: list = []
     for code in target_codes:
@@ -332,7 +331,7 @@ def add_even_shift_distribution_terms(
             code_coverage = coverage_map.get(code, 0)
             expected = work_days * code_coverage / allowed_coverage_sum
             low_n = int(expected)
-            high_n = max(low_n, math.ceil(expected))
+            high_n = math.ceil(expected)
             if high_n == low_n:
                 high_n = low_n + 1
 
@@ -346,23 +345,17 @@ def add_even_shift_distribution_terms(
             f"{logger_prefix} [{code}균등] 비율기반 band({stage_label}): "
             f"nurses={len(nurse_data)}, total_expected={total_expected}, "
             f"band_sample=[{nurse_data[0][1]},{nurse_data[0][2]}], "
-            f"w_primary={w_primary}, w_secondary={w_secondary}"
+            f"w_dev={w_dev}"
         )
 
-        max_var = m.NewIntVar(0, D, f"{code}_eq_max_{stage_label}")
-        min_var = m.NewIntVar(0, D, f"{code}_eq_min_{stage_label}")
         for n, low_n, high_n in nurse_data:
             tot = sum(X(n, d, s_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse))
-            m.Add(max_var >= tot)
-            m.Add(min_var <= tot)
             dev_low = m.NewIntVar(0, D, f"{code}_eq_devL_{stage_label}_{n}")
             dev_high = m.NewIntVar(0, D, f"{code}_eq_devH_{stage_label}_{n}")
             m.Add(dev_low >= low_n - tot)
             m.Add(dev_high >= tot - high_n)
-            obj.append(-w_secondary * dev_low)
-            obj.append(-w_secondary * dev_high)
-        obj.append(-w_primary * max_var)   # 최대 억제
-        obj.append(w_primary * min_var)    # 최소 끌어올림
+            obj.append(-w_dev * dev_low)
+            obj.append(-w_dev * dev_high)
 
     return obj
 
