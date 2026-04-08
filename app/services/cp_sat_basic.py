@@ -2609,7 +2609,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         for n in range(N)
                         if join[n] <= d <= leave[n]
                         and (n, d) not in fixed
-                        and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                        and (not exclude_preceptee_from_den or not _is_preceptee_at(n, d))
                         and (n, d) not in coverage_exclude_cells
                         for s2 in m_bucket_indices
                     )
@@ -2626,7 +2626,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     over_vars_by_day.setdefault(d, {})[code] = ov
                     continue
                 m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
-                m.Add(assigned_m_bucket <= m_cap_non_fixed)
+                if use_max_coverage:
+                    m.Add(assigned_m_bucket == m_cap_non_fixed)
+                else:
+                    m.Add(assigned_m_bucket <= m_cap_non_fixed)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 continue

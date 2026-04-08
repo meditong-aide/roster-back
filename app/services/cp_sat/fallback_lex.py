@@ -1105,8 +1105,12 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
                     m.Add(assigned_m_bucket <= m_cap_non_fixed)
-                    sh = m.NewIntVar(0, m_cap_non_fixed, f"short_{d}_{code}")
-                    m.Add(assigned_m_bucket + sh >= m_cap_non_fixed)
+                    if use_max_coverage:
+                        sh = m.NewIntVar(0, m_cap_non_fixed, f"short_{d}_{code}")
+                        m.Add(sh >= m_cap_non_fixed - assigned_m_bucket)
+                    else:
+                        sh = m.NewIntVar(0, m_cap_non_fixed, f"short_{d}_{code}")
+                        m.Add(assigned_m_bucket + sh >= m_cap_non_fixed)
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     short_terms.append(sh)
                     over_terms.append(ov)
