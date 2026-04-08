@@ -1072,7 +1072,7 @@ def optimize_fallback_lex_hard_first(
                     X(n, d, s)
                     for n in range(N)
                     if join[n] <= d <= leave[n] and (n, d) not in fixed
-                    and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                    and (not exclude_preceptee_from_den or not _is_preceptee_at(n, d))
                     and (n, d) not in coverage_exclude_cells
                 )
                 if code == "M":
@@ -1082,7 +1082,7 @@ def optimize_fallback_lex_hard_first(
                             for n in range(N)
                             if join[n] <= d <= leave[n]
                             and (n, d) not in fixed
-                            and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                            and (not exclude_preceptee_from_den or not _is_preceptee_at(n, d))
                             and (n, d) not in coverage_exclude_cells
                             for s2 in m_bucket_indices
                         )

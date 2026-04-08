@@ -42,6 +42,7 @@ from services.assignment_service import (
     cancel_assignment,
     get_assignments,
     flush_pending_transfers,
+    flush_expired_preceptees,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
@@ -136,6 +137,8 @@ async def get_nurses_in_group(
     _group = group_id or getattr(current_user, "group_id", None)
     if _group:
         flush_pending_transfers(db, _group)
+    # 프리셉티 만료 레이지 체크
+    flush_expired_preceptees(db)
     print(
         "current_user",
         current_user.nurse_id,

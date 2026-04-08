@@ -396,6 +396,87 @@ def flush_all_pending_transfers(db: Session) -> int:
     return count
 
 
+def flush_expired_preceptees(db: Session) -> int:
+    """프리셉티 기간 만료 자동 해제 (스케줄러용).
+
+    expected_end_date < 오늘인 active 프리셉티 assignment를 찾아:
+    - nurses.preceptor_id = NULL
+    - assignment status = completed, end_date = expected_end_date
+    - 알림 발송 (운영자, 해당 간호사, 프리셉터)
+    """
+    today = date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.reason == "프리셉티",
+            NurseAssignment.status == "active",
+            NurseAssignment.expected_end_date.isnot(None),
+            NurseAssignment.expected_end_date < today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    count = 0
+    for row in rows:
+        nurse = (
+            db.query(NurseModel)
+            .filter(NurseModel.nurse_id == row.nurse_id)
+            .first()
+        )
+        preceptor_id = nurse.preceptor_id if nurse else None
+        preceptor = (
+            db.query(NurseModel)
+            .filter(NurseModel.nurse_id == preceptor_id)
+            .first()
+        ) if preceptor_id else None
+
+        # preceptor_id 해제
+        if nurse and nurse.preceptor_id:
+            logger.info(
+                "[Scheduler] 프리셉티 해제: nurse_id=%s, preceptor_id=%s → NULL",
+                row.nurse_id, nurse.preceptor_id,
+            )
+            nurse.preceptor_id = None
+
+        row.status = "completed"
+        row.end_date = row.expected_end_date
+        count += 1
+
+        # 알림 발송
+        try:
+            from utils.utils import set_app_push
+            nurse_name = nurse.name if nurse else str(row.nurse_id)
+            preceptor_name = preceptor.name if preceptor else "?"
+            _group_name = _get_group_name(db, row.source_group_id) or str(row.source_group_id)
+            push_message = f"{nurse_name} 프리셉티 기간 종료 (프리셉터: {preceptor_name}, {_group_name})"
+
+            _recipients = {str(row.nurse_id)}
+            if preceptor_id:
+                _recipients.add(str(preceptor_id))
+            for nid in _get_head_nurse_ids(db, row.source_group_id):
+                _recipients.add(nid)
+
+            set_app_push(
+                pushCode="P30", pushSubCode="S13",
+                officeCode=row.office_id,
+                sendEmpSeqNo=row.nurse_id,
+                sendMemberId=row.nurse_id,
+                receiveEmpSeqNo=",".join(map(str, _recipients)),
+                pushMessage=push_message, orgPushMessage=push_message,
+                linkUrl="", linkCode="",
+            )
+        except Exception as e:
+            logger.error("[Scheduler] 프리셉티 해제 알림 실패: %s", e, exc_info=True)
+
+    if count > 0:
+        db.commit()
+        logger.info("[Scheduler] 프리셉티 자동 해제 완료: %d건", count)
+
+    return count
+
+
 def transfer_shifts_on_publish(
     db: Session,
     schedule_id: str,

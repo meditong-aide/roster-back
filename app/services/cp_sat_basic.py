@@ -2599,7 +2599,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 X(n, d, s)
                 for n in range(N)
                 if join[n] <= d <= leave[n] and (n, d) not in fixed
-                and (not exclude_preceptee_from_den or n not in preceptee_indices)
+                and (not exclude_preceptee_from_den or not _is_preceptee_at(n, d))
                 and (n, d) not in coverage_exclude_cells
             )
             if code == "M":

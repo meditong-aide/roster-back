@@ -433,7 +433,7 @@ def send_assignment_created_push(
     if not recipients:
         return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
     label = _REASON_LABEL.get(reason, reason)
-    period = f"{start_date}~{end_date}"
+    period = f"{start_date}~{end_date}" if end_date else f"{start_date}~"
     if target_group_name:
         push_message = f"{nurse_name} {label} 배정 ({period}, {source_group_name}→{target_group_name})"
     else:

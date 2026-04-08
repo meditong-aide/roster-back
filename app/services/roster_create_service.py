@@ -3002,8 +3002,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         print(f"[WeekendOff] 대상 간호사 로깅 실패: {e}")
     month_start = date(req.year, req.month, 1)
     days_in_month = calendar.monthrange(req.year, req.month)[1]
-    # ── 병동이동 레이지 체크 + assignment 기반 blocked_by_nurse 구성 ──
+    # ── 병동이동 레이지 체크 + 프리셉티 만료 체크 + assignment 기반 blocked_by_nurse 구성 ──
     flush_pending_transfers(db, current_user.group_id)
+    from services.assignment_service import flush_expired_preceptees
+    flush_expired_preceptees(db)
     _assignments = get_active_assignments_for_month(db, current_user.group_id, req.year, req.month)
     print(f"[Assignment] group_id={current_user.group_id}, year={req.year}, month={req.month}, assignments_count={len(_assignments)}")
     for _a in _assignments:
