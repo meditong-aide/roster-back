@@ -157,7 +157,9 @@ def log_shift_distribution(
                 allowed = set(all_work_codes)
 
             work_days = max(0, _active - round(off_days_cfg * _active / D))
-            allowed_cov_sum = sum(coverage_map.get(c, 0) for c in allowed if c in coverage_map)
+            total_cov = sum(coverage_map.get(c, 0) for c in all_work_codes if c in coverage_map)
+            ratio_map = {c: coverage_map[c] / total_cov for c in coverage_map} if total_cov > 0 else {}
+            allowed_ratio_sum = sum(ratio_map.get(c, 0) for c in allowed if c in ratio_map)
 
             counts = {}
             bands = {}
@@ -167,8 +169,8 @@ def log_shift_distribution(
                 s_idx = cfg.shift_types.index(code)
                 actual = int(sum(roster_system.roster[n, d, s_idx] for d in range(D)))
                 counts[code] = actual
-                if code in allowed and allowed_cov_sum > 0:
-                    expected = work_days * coverage_map.get(code, 0) / allowed_cov_sum
+                if code in allowed and allowed_ratio_sum > 0:
+                    expected = work_days * ratio_map.get(code, 0) / allowed_ratio_sum
                     _low = int(expected)
                     _high = math.ceil(expected)
                     if _high == _low:

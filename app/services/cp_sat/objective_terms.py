@@ -293,6 +293,14 @@ def add_even_shift_distribution_terms(
     off_days_cfg = int(getattr(cfg, "standard_personal_off_days", 8) or 8)
     w_dev = 100000  # per-nurse deviation only (글로벌 max/min 제거)
 
+    # 커버리지 비율 맵 (비율 계산용, 절대값이 아닌 비율만 사용)
+    ratio_map: dict[str, float] = {}
+    total_cov = sum(coverage_map.get(c, 0) for c in all_work_codes if c in coverage_map)
+    if total_cov > 0:
+        for c in all_work_codes:
+            if c in coverage_map:
+                ratio_map[c] = coverage_map[c] / total_cov
+
     obj: list = []
     for code in target_codes:
         if code not in cfg.shift_types:
@@ -305,31 +313,29 @@ def add_even_shift_distribution_terms(
             is_n_only = is_n_only_profile(raw, use_mid=use_mid)
             if is_n_only:
                 continue
-            # blocked day: join/leave 윈도우 교집합 기반
             blocked_set = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
             _n_blocked = sum(1 for d in blocked_set if join[n] <= d <= leave[n])
             _active = leave[n] - join[n] + 1 - _n_blocked
             if _active <= 0:
                 continue
 
-            # 이 간호사의 허용 시프트
             allowed = normalize_allowed_shift_codes(raw, use_mid=use_mid)
             if not allowed:
                 allowed = set(all_work_codes)
             if code not in allowed:
                 continue
 
-            # 허용 시프트 중 월간 커버리지 비율 합
-            allowed_coverage_sum = sum(coverage_map.get(c, 0) for c in allowed if c in coverage_map)
-            if allowed_coverage_sum <= 0:
+            # 허용 시프트 중 비율 합
+            allowed_ratio_sum = sum(ratio_map.get(c, 0) for c in allowed if c in ratio_map)
+            if allowed_ratio_sum <= 0:
                 continue
 
-            # 기대 근무일
+            # 실제 기대 근무일 (Off 제외)
             work_days = max(0, _active - round(off_days_cfg * _active / D))
 
-            # 이 시프트의 기대 배정 수
-            code_coverage = coverage_map.get(code, 0)
-            expected = work_days * code_coverage / allowed_coverage_sum
+            # 근무일을 허용 시프트 비율로 분배 (최소 수요가 아닌 실제 근무슬롯 기반)
+            code_ratio = ratio_map.get(code, 0)
+            expected = work_days * code_ratio / allowed_ratio_sum
             low_n = int(expected)
             high_n = math.ceil(expected)
             if high_n == low_n:
