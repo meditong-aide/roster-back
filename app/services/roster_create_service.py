@@ -36,6 +36,8 @@ import calendar
 from sqlalchemy import text
 from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
+from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
+from services.day_windows import build_blocked_days
 from services.cp_sat.mid_feasibility import validate_mid_hard_feasibility as _validate_mid_hard_feasibility_impl
 
 logger = logging.getLogger(__name__)
@@ -197,7 +199,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                     NursePairRequest.nurse_id == nurse_id,
                     NursePairRequest.request_id == latest_wr.request_id,
                 ).all()
-                pair_data = [{"id": p.target_id, "weight": p.score} for p in pair_rows]
+                pair_data = [{"id": p.target_id, "weight": p.score if p.score is not None else 0} for p in pair_rows]
 
             data_json = {
                 "request": "확정 원티드 적용",
@@ -303,7 +305,7 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             )
             .all()
         )
-        pair_data = [{"id": p.target_id, "weight": p.score} for p in pair_rows]
+        pair_data = [{"id": p.target_id, "weight": p.score if p.score is not None else 0} for p in pair_rows]
 
         # 5️⃣ data JSON 구성
         data_json = {
@@ -1573,6 +1575,28 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     except Exception as e:
         print("[ERR] _get_last_days_map:", e)
         raise
+
+    # ── 인바운드 간호사 tail 보충: target 전월 schedule에 없으면 source group에서 조회 ──
+    _inbound_src_map = config_dict.get("_inbound_source_map")
+    if _inbound_src_map:
+        _missing = [nid for nid in _inbound_src_map if nid not in last_map]
+        if _missing:
+            _src_groups: dict[str, list[str]] = {}
+            for nid in _missing:
+                _src_groups.setdefault(_inbound_src_map[nid], []).append(nid)
+            for src_gid, nids in _src_groups.items():
+                _src_sid = _query_prev_month_schedule_id(db, src_gid, req.year, req.month)
+                if _src_sid:
+                    _src_map = _get_last_days_map(db, _src_sid, lookback, code2main, nids)
+                    for nid, seq in _src_map.items():
+                        last_map[nid] = seq
+                    print(
+                        f"[CrossMonth][Inbound] source({src_gid}) 전월 tail 보충: "
+                        f"{len(_src_map)}명/{len(nids)}명"
+                    )
+                else:
+                    print(f"[CrossMonth][Inbound] source({src_gid}) 전월 schedule 없음, tail 생략")
+
     prev_month_last_main: dict[str, str | None] = {}
     prev_month_last_is_off: dict[str, bool] = {}
     prev_month_n_tail: dict[str, int] = {}
@@ -2062,6 +2086,12 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
 
         # 호출자가 구성한 config_dict(게이지 반영 등)이 있으면 이를 사용
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
+        # deferred 컬럼 명시 로딩 (DB 미반영 시에도 안전)
+        if latest_config and "use_max_coverage" not in config_dict:
+            try:
+                config_dict["use_max_coverage"] = bool(latest_config.use_max_coverage or False)
+            except Exception:
+                config_dict["use_max_coverage"] = False
         # ShiftManage 요구인원은 호출부에서 주입한다
 
         try:
@@ -2302,6 +2332,123 @@ def _persist_entries(db: Session, schedule, generated, req):
         # except Exception:
         #     pass
     db.commit()
+
+
+def _copy_transferred_entries(
+    db: Session, schedule: Schedule, group_id: str, year: int, month: int
+) -> int:
+    """Source group의 issued schedule에서 파견/병동이동 간호사 shift를 현재 target schedule로 복사.
+
+    source 마감 시 transfer_shifts_on_publish()로 전달했지만, target이 새 schedule을
+    생성하면 entry가 유실된다. source의 issued schedule에서 직접 가져온다.
+    """
+    import uuid
+    from services.assignment_service import get_active_assignments_for_month
+
+    _assignments = get_active_assignments_for_month(db, group_id, year, month)
+    # 파견/병동이동으로 들어오는 assignment (target == 이 그룹, start/end 월)
+    _inbound = []
+    print(f"[CopyTransfer] assignments={len(_assignments)}, group_id={group_id}, year={year}, month={month}")
+    for a in _assignments:
+        if a.reason not in ("파견", "병동이동"):
+            continue
+        if a.target_group_id != group_id:
+            continue
+        from services.day_windows import is_source_generated_month
+        _a_end = a.end_date or a.expected_end_date
+        _is_src = is_source_generated_month(a.start_date, _a_end, date(year, month, 1), monthrange(year, month)[1])
+        print(f"[CopyTransfer] nurse={a.nurse_id}, reason={a.reason}, src={a.source_group_id}, is_src_gen={_is_src}")
+        if _is_src:
+            _inbound.append(a)
+    if not _inbound:
+        print(f"[CopyTransfer] 인바운드 없음 → skip")
+        return 0
+    print(f"[CopyTransfer] 인바운드 {len(_inbound)}건 처리 시작")
+
+    from calendar import monthrange
+    month_start = date(year, month, 1)
+    month_end = date(year, month, monthrange(year, month)[1])
+    from db.models import IssuedRoster, Shift
+
+    count = 0
+    for a in _inbound:
+        src_gid = a.source_group_id
+        # source group의 해당 월 issued(마감) schedule 찾기
+        src_schedule = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id == src_gid,
+                Schedule.year == year,
+                Schedule.month == month,
+                Schedule.status == "issued",
+                Schedule.dropped == False,
+            )
+            .order_by(Schedule.version.desc())
+            .first()
+        )
+        print(f"[CopyTransfer] src_gid={src_gid}, src_schedule={'found: '+src_schedule.schedule_id if src_schedule else 'NOT FOUND'}")
+        if not src_schedule:
+            continue
+
+        # source shift → default_shift → target shift_id 매핑
+        src_shifts = db.query(Shift).filter(Shift.group_id == src_gid).all()
+        src_to_default = {s.shift_id: s.default_shift for s in src_shifts if s.default_shift}
+        tgt_shifts = db.query(Shift).filter(Shift.group_id == group_id).all()
+        default_to_tgt = {}
+        for s in tgt_shifts:
+            if s.default_shift and s.default_shift not in default_to_tgt:
+                default_to_tgt[s.default_shift] = s.shift_id
+        tgt_shift_id_to_int = {s.shift_id: s.id for s in tgt_shifts}
+
+        # 전달 기간
+        a_end = a.end_date or a.expected_end_date or month_end
+        t_start = max(a.start_date, month_start)
+        t_end = min(a_end, month_end)
+
+        # source entry 조회
+        src_entries = (
+            db.query(ScheduleEntry)
+            .filter(
+                ScheduleEntry.schedule_id == src_schedule.schedule_id,
+                ScheduleEntry.nurse_id == a.nurse_id,
+                ScheduleEntry.work_date >= t_start,
+                ScheduleEntry.work_date <= t_end,
+            )
+            .all()
+        )
+        if not src_entries:
+            continue
+
+        # 기존 target entry 삭제 (재복사 지원)
+        db.query(ScheduleEntry).filter(
+            ScheduleEntry.schedule_id == schedule.schedule_id,
+            ScheduleEntry.nurse_id == a.nurse_id,
+            ScheduleEntry.work_date >= t_start,
+            ScheduleEntry.work_date <= t_end,
+        ).delete(synchronize_session=False)
+
+        for e in src_entries:
+            src_shift = e.shift_id
+            if not src_shift or src_shift == '-':
+                continue
+            default_code = src_to_default.get(src_shift, src_shift.upper())
+            tgt_shift = default_to_tgt.get(default_code, default_code)
+            new_entry = ScheduleEntry(
+                entry_id=str(uuid.uuid4().hex)[:16],
+                schedule_id=schedule.schedule_id,
+                nurse_id=a.nurse_id,
+                work_date=e.work_date,
+                shift_id=tgt_shift,
+                id=tgt_shift_id_to_int.get(tgt_shift),
+            )
+            db.add(new_entry)
+            count += 1
+
+    if count > 0:
+        db.flush()
+        print(f"[Assignment] 전달 entry 복사: {count}건 → schedule {schedule.schedule_id}")
+
+    return count
 
 
 def _count_work_assignments(
@@ -2568,15 +2715,17 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
             shift_code = entries_by_nurse.get(nurse.nurse_id, {}).get(d, '-')
             nurse_schedule.append(shift_code)
         counts = {shift: nurse_schedule.count(shift) for shift in shift_colors.keys()}
-        roster_data["nurses"].append(
-            {
-                "id": nurse.nurse_id,
-                "name": nurse.name,
-                "experience": nurse.experience,
-                "schedule": nurse_schedule,
-                "counts": counts,
-            }
-        )
+        nurse_entry = {
+            "id": nurse.nurse_id,
+            "name": nurse.name,
+            "experience": nurse.experience,
+            "schedule": nurse_schedule,
+            "counts": counts,
+        }
+        if getattr(nurse, 'is_inbound', False):
+            nurse_entry["is_inbound"] = True
+            nurse_entry["source_group_id"] = getattr(nurse, 'group_id', None)
+        roster_data["nurses"].append(nurse_entry)
     return roster_data
 
 
@@ -2853,10 +3002,60 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         print(f"[WeekendOff] 대상 간호사 로깅 실패: {e}")
     month_start = date(req.year, req.month, 1)
     days_in_month = calendar.monthrange(req.year, req.month)[1]
+    # ── 병동이동 레이지 체크 + 프리셉티 만료 체크 + assignment 기반 blocked_by_nurse 구성 ──
+    flush_pending_transfers(db, current_user.group_id)
+    from services.assignment_service import flush_expired_preceptees
+    flush_expired_preceptees(db)
+    _assignments = get_active_assignments_for_month(db, current_user.group_id, req.year, req.month)
+    print(f"[Assignment] group_id={current_user.group_id}, year={req.year}, month={req.month}, assignments_count={len(_assignments)}")
+    for _a in _assignments:
+        print(f"[Assignment] id={_a.id}, nurse_id={_a.nurse_id}, reason={_a.reason}, source={_a.source_group_id}, target={_a.target_group_id}, start={_a.start_date}, end={_a.end_date}")
+    # ── 인바운드: full month / 중간 월은 target 독립 생성 (인바운드 엔진 추가) ──
+    from services.day_windows import is_source_generated_month
+    _inbound_assignments = []
+    for a in _assignments:
+        if a.reason not in ("파견", "병동이동"):
+            continue
+        if a.target_group_id != current_user.group_id:
+            continue
+        if a.source_group_id == current_user.group_id:
+            continue
+        _a_end = a.end_date or a.expected_end_date
+        if is_source_generated_month(a.start_date, _a_end, month_start, days_in_month):
+            print(f"[Assignment][Inbound] skip (source 생성+전달): nurse_id={a.nurse_id}")
+            continue
+        _inbound_assignments.append(a)
+    _existing_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
+    _inbound_nurse_ids = {str(a.nurse_id) for a in _inbound_assignments} - _existing_nurse_ids
+    if _inbound_nurse_ids:
+        _inbound_nurses = db.query(Nurse).filter(
+            Nurse.nurse_id.in_(_inbound_nurse_ids),
+            Nurse.active == 1,
+        ).all()
+        for n in _inbound_nurses:
+            setattr(n, 'is_inbound', True)
+        engine_nurses.extend(_inbound_nurses)
+        nurses_in_group.extend(_inbound_nurses)
+        print(
+            f"[Assignment][Inbound] 인바운드 간호사 {len(_inbound_nurses)}명 엔진 추가: "
+            f"{[f'{n.name}({n.nurse_id})' for n in _inbound_nurses]}"
+        )
     active_range_candidates = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in engine_nurses
     }
+    # 인바운드 간호사: active_range를 assignment 기간 기준으로 오버라이드 (joining_date가 다른 그룹 기준이므로)
+    for _ia in (_inbound_assignments if _assignments else []):
+        nid = str(_ia.nurse_id)
+        if nid not in _inbound_nurse_ids:
+            continue
+        _a_start = _ia.start_date
+        _a_end = _ia.end_date or _ia.expected_end_date or (month_start + timedelta(days=days_in_month - 1))
+        _month_end = month_start + timedelta(days=days_in_month - 1)
+        _s = max(_a_start, month_start)
+        _e = min(_a_end, _month_end)
+        if _s <= _e:
+            active_range_candidates[nid] = (((_s - month_start).days), ((_e - month_start).days))
     excluded_engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is None
     ]
@@ -2883,12 +3082,24 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     )
     # daily_shift_requirements를 config에 주입해서 엔진 호출
     config_dict = latest_config.__dict__ if latest_config else {}
+    # deferred 컬럼 명시 로딩 (DB 미반영 시에도 안전)
+    if latest_config and "use_max_coverage" not in config_dict:
+        try:
+            config_dict["use_max_coverage"] = bool(latest_config.use_max_coverage or False)
+        except Exception:
+            config_dict["use_max_coverage"] = False
     config_dict['daily_shift_requirements'] = daily_shift_requirements
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
+    # 인바운드 간호사의 source group 매핑 → cross-month tail 보충용
+    if _inbound_assignments:
+        config_dict["_inbound_source_map"] = {
+            str(a.nurse_id): str(a.source_group_id)
+            for a in _inbound_assignments
+        }
     if bool(config_dict.get("two_offs_after_two_nig")) or bool(config_dict.get("two_offs_after_three_nig")):
         print(
             "[OffReason] N연속 후 2OFF 하드 활성화: "
@@ -2928,6 +3139,109 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     config_dict.setdefault("cross_month_lookback_days", 6)
     config_dict.setdefault("allow_override_by_law", False)
     config_dict.setdefault("lookahead_days", 0)
+    # ── nurse_assignment 기반 blocked_by_nurse 구성 (솔버에 전달) ──
+    if _assignments:
+        # nurse_id(문자열) → blocked days로 구성. 솔버 내부에서 자체 인덱스로 변환함.
+        _blocked_by_id: dict[str, set[int]] = {}
+        for n in nurses_for_engine:
+            nid = str(n.nurse_id)
+            _is_inbound = bool(getattr(n, 'is_inbound', False))
+            days = build_blocked_days(
+                _assignments, nid, current_user.group_id, month_start, days_in_month,
+                is_inbound=_is_inbound,
+            )
+            if days:
+                _blocked_by_id[nid] = days
+                _label = "[Inbound]" if _is_inbound else ""
+                print(f"[Assignment]{_label} nurse_id={nid}, blocked_days={sorted(days)}")
+        if _blocked_by_id:
+            config_dict["blocked_by_nurse_id"] = _blocked_by_id
+            print(f"[Assignment] blocked_by_nurse_id 적용: {len(_blocked_by_id)}명")
+        # ── 커버리지 제외: 파견/병동이동 기간에는 source 커버리지에서 제외 ──
+        _cov_exclude: dict[str, set[int]] = {}
+        for a in _assignments:
+            if a.reason not in ("파견", "병동이동"):
+                continue
+            if a.source_group_id != current_user.group_id:
+                continue
+            if a.target_group_id is None:
+                continue
+            # source 생성 월만 커버리지 제외 (full month/중간 월은 target 독립 → 제외 안 함)
+            _a_end = a.end_date or a.expected_end_date
+            if not is_source_generated_month(a.start_date, _a_end, month_start, days_in_month):
+                continue
+            # assignment 기간과 월의 교집합 → 커버리지 제외 day indices
+            _month_end = month_start + timedelta(days=days_in_month - 1)
+            _a_end_actual = a.end_date or a.expected_end_date or _month_end
+            _s = max(a.start_date, month_start)
+            _e = min(_a_end_actual, _month_end)
+            nid = str(a.nurse_id)
+            for d in range((_s - month_start).days, (_e - month_start).days + 1):
+                _cov_exclude.setdefault(nid, set()).add(d)
+        if _cov_exclude:
+            config_dict["coverage_exclude_nurse_days"] = _cov_exclude
+            for nid, days in _cov_exclude.items():
+                print(f"[Assignment][CovExclude] nurse_id={nid}, days={sorted(days)}")
+        # ── 프리셉티 기간: assignment 기간 내에만 프리셉터 follow 적용 ──
+        # 프리셉티 assignment가 존재하는 간호사는 해당 월과 겹치는 기간만 follow,
+        # 겹치지 않으면 빈 set (독립 배정). assignment 미조회 월에도 적용되도록
+        # DB에서 해당 간호사의 active 프리셉티 assignment를 직접 조회.
+        _preceptee_period: dict[str, set[int]] = {}
+        # 1) 현재 _assignments에서 프리셉티 추출
+        for a in _assignments:
+            if a.reason != "프리셉티" or a.status == "cancelled":
+                continue
+            nid = str(a.nurse_id)
+            _a_start = a.start_date
+            _a_end = a.end_date or a.expected_end_date or (month_start + timedelta(days=days_in_month - 1))
+            _month_end = month_start + timedelta(days=days_in_month - 1)
+            if _a_end < month_start or _a_start > _month_end:
+                _preceptee_period.setdefault(nid, set())
+                continue
+            _s = max(_a_start, month_start)
+            _e = min(_a_end, _month_end)
+            for d in range((_s - month_start).days, (_e - month_start).days + 1):
+                _preceptee_period.setdefault(nid, set()).add(d)
+        # 2) preceptor_id가 있지만 _assignments에 프리셉티 레코드가 없는 간호사도 체크
+        #    (assignment 기간이 다른 월이라 조회 안 된 경우)
+        from db.models import NurseAssignment as _NA
+        for n in nurses_for_engine:
+            nid = str(n.nurse_id)
+            if nid in _preceptee_period:
+                continue  # 이미 처리됨
+            if not getattr(n, 'preceptor_id', None):
+                continue
+            # DB에서 이 간호사의 active 프리셉티 assignment가 존재하는지 확인
+            _has_pte = db.query(_NA.id).filter(
+                _NA.nurse_id == nid,
+                _NA.reason == "프리셉티",
+                _NA.status == "active",
+            ).first()
+            if _has_pte:
+                _preceptee_period[nid] = set()  # 해당 월 겹침 없음 → 빈 set (독립 배정)
+        if _preceptee_period:
+            config_dict["preceptee_period_by_nurse_id"] = _preceptee_period
+            for nid, days in _preceptee_period.items():
+                print(f"[Assignment][Preceptee] nurse_id={nid}, follow_days={sorted(days)}")
+    # ── 프리셉티 기간 체크 2단계: _assignments가 비어도 DB에서 직접 확인 ──
+    if "preceptee_period_by_nurse_id" not in config_dict:
+        from db.models import NurseAssignment as _NA2
+        _preceptee_period_2: dict[str, set[int]] = {}
+        for n in nurses_for_engine:
+            nid = str(n.nurse_id)
+            if not getattr(n, 'preceptor_id', None):
+                continue
+            _has_pte = db.query(_NA2.id).filter(
+                _NA2.nurse_id == nid,
+                _NA2.reason == "프리셉티",
+                _NA2.status == "active",
+            ).first()
+            if _has_pte:
+                _preceptee_period_2[nid] = set()
+        if _preceptee_period_2:
+            config_dict["preceptee_period_by_nurse_id"] = _preceptee_period_2
+            for nid, days in _preceptee_period_2.items():
+                print(f"[Assignment][Preceptee] nurse_id={nid}, follow_days={sorted(days)} (DB직접조회)")
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
     # _debug_log(
     #     "config_ready",
@@ -3084,6 +3398,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             FixedWantedEntry.month == req.month,
             FixedWantedEntry.is_applied == True,
         ).all()
+        # shifts_table_id → shift_id 매핑 (정확한 코드 복원용)
+        _fw_table_id_to_shift_id: dict[int, str] = {
+            s.id: s.shift_id
+            for s in db.query(Shift.id, Shift.shift_id).filter(
+                Shift.group_id == current_user.group_id
+            ).all()
+        }
         fw_nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
         fw_fixed_cells = []
         _fw_skip_special = 0
@@ -3091,7 +3412,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         _fw_skip_range = 0
         _fw_code_counts: dict[str, int] = {}
         for fe in all_fixed_entries:
-            shift_code_raw = str(fe.shift_id or "").strip()
+            # shifts_table_id가 있으면 정확한 shift_id로 복원, 없으면 기존 값 사용
+            if fe.shifts_table_id and fe.shifts_table_id in _fw_table_id_to_shift_id:
+                shift_code_raw = _fw_table_id_to_shift_id[fe.shifts_table_id]
+            else:
+                shift_code_raw = str(fe.shift_id or "").strip()
             shift_code = shift_code_raw.upper()
             # special_shift_map 에 있는 코드는 이미 special_fixed_cells 에서 처리됨
             if shift_code in special_shift_map:
@@ -3344,9 +3669,78 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         raise Exception(validation_error)
 
     _persist_entries(db, schedule, generated, req)
+    # ── 파견/병동이동 전달 entry 복사: source 마감 log 기반으로 shift 복사 + 히스토리 기록 ──
+    try:
+        from services.assignment_service import copy_transferred_entries
+        _n_copied = copy_transferred_entries(
+            db, target_schedule_id=schedule.schedule_id,
+            target_group_id=current_user.group_id,
+            year=req.year, month=req.month,
+        )
+        if _n_copied > 0:
+            db.commit()
+    except Exception as e:
+        print(f"[Assignment] 전달 entry 복사 실패: {e}")
+    # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
+    _group_nids = {str(n.nurse_id) for n in nurses_in_group}
+    _entry_nids = {
+        row.nurse_id for row in
+        db.query(ScheduleEntry.nurse_id)
+        .filter(ScheduleEntry.schedule_id == schedule.schedule_id)
+        .distinct()
+        .all()
+    }
+    _transferred_nids = _entry_nids - _group_nids
+    if _transferred_nids:
+        _transferred_nurses = db.query(Nurse).filter(Nurse.nurse_id.in_(_transferred_nids)).all()
+        for n in _transferred_nurses:
+            setattr(n, 'is_inbound', True)
+        nurses_in_group = list(nurses_in_group) + _transferred_nurses
+        print(f"[Assignment] 전달 간호사 응답 추가: {[f'{n.name}({n.nurse_id})' for n in _transferred_nurses]}")
+        # 인바운드 배정표 로그 (CloudWatch 분석용)
+        for _tn in _transferred_nurses:
+            _t_entries = (
+                db.query(ScheduleEntry)
+                .filter(
+                    ScheduleEntry.schedule_id == schedule.schedule_id,
+                    ScheduleEntry.nurse_id == _tn.nurse_id,
+                )
+                .order_by(ScheduleEntry.work_date)
+                .all()
+            )
+            _t_map = {e.work_date.day if hasattr(e.work_date, 'day') else e.work_date: e.shift_id for e in _t_entries}
+            _t_schedule = [_t_map.get(d, '-') for d in range(1, days_in_month + 1)]
+            print(f"[CP-SAT-Basic] 배정표(인바운드) {_tn.name}({_tn.nurse_id}): {' '.join(_t_schedule)}")
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
     roster_data["weekly_off_conflicts"] = weekly_off_conflicts
     roster_data["weekly_off_warnings"] = weekly_off_warnings
+
+    # ── assignment 대상자 근무표 생성 알림 (S09) ──
+    try:
+        from utils.utils import send_assignment_roster_created_push
+        from services.assignment_service import _get_group_name
+        _assign_nurse_ids = set()
+        for _a in _assignments:
+            if _a.reason in ("파견", "병동이동") and _a.status != "cancelled":
+                _assign_nurse_ids.add(str(_a.nurse_id))
+        if _assign_nurse_ids:
+            _gname = _get_group_name(db, current_user.group_id) or str(current_user.group_id)
+            _nurse_names = [
+                n.name for n in nurses_in_group if str(n.nurse_id) in _assign_nurse_ids
+            ] or list(_assign_nurse_ids)
+            send_assignment_roster_created_push(
+                nurse_name=", ".join(_nurse_names),
+                group_name=_gname,
+                year=req.year,
+                month=req.month,
+                recipients=list(_assign_nurse_ids),
+                office_code=current_user.office_id,
+                sender_emp_seq_no=current_user.nurse_id,
+                sender_member_id=current_user.account_id,
+            )
+    except Exception as e:
+        print(f"[RosterCreate] assignment 생성 알림 실패: {e}")
+
     return roster_data
 
 

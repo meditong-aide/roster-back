@@ -44,10 +44,47 @@ import warnings
 from starlette.responses import RedirectResponse
 from starlette import status
 
+from contextlib import asynccontextmanager
+import asyncio
+import logging
+
 from db.client2 import SessionLocal
 from services.wanted_service import close_expired_wanted
 
-app = FastAPI()
+_scheduler_logger = logging.getLogger("scheduler")
+
+
+async def _daily_flush_scheduler():
+    """매일 자정에 병동이동 flush 실행."""
+    from datetime import timedelta
+    while True:
+        now = datetime.now()
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await asyncio.sleep((tomorrow - now).total_seconds())
+
+        db = SessionLocal()
+        try:
+            from services.assignment_service import flush_all_pending_transfers, flush_expired_preceptees
+            count = flush_all_pending_transfers(db)
+            if count > 0:
+                _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
+            pte_count = flush_expired_preceptees(db)
+            if pte_count > 0:
+                _scheduler_logger.info("[Scheduler] 프리셉티 자동 해제: %d건", pte_count)
+        except Exception as e:
+            _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
+        finally:
+            db.close()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(_daily_flush_scheduler())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 origins = [

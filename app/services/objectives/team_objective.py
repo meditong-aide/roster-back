@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 from services.roster_system import RosterSystem
+from services.day_windows import iter_nurse_days
 
 
-def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> list:
+def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave, blocked_by_nurse=None) -> list:
     """팀별 동일 교대 정렬을 유도하는 목적함수 항을 생성한다.
 
     개요:
@@ -120,7 +121,7 @@ def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave) -> lis
 
         # 정렬 보너스: 팀원들이 대표 교대 Y를 따라가도록 Z=AND(X,Y) 보너스
         for n in members:
-            for d in range(join[n], leave[n] + 1):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for code in shift_codes:
                     s = rs.config.shift_types.index(code)
                     y = Y[(d, s)]

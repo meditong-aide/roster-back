@@ -10,6 +10,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
 )
 from services.cp_sat.allowed_shift_types import is_n_only_profile
+from services.day_windows import iter_nurse_days
 from services.cp_sat.objective_terms import (
     add_even_mid_distribution_terms,
     add_even_night_minmax_distribution_terms,
@@ -32,6 +33,7 @@ def build_fallback_stage3_objective_terms(
     add_preceptor_terms_fn,
     add_team_balance_terms_fn,
     add_grade_constraints_fn,
+    blocked_by_nurse: dict[int, set[int]] | None = None,
 ) -> list:
     """폴백 3단계(선호/공정성) 목적함수 항을 생성한다.
 
@@ -64,7 +66,7 @@ def build_fallback_stage3_objective_terms(
         nu = roster_system.nurses[n]
         raw = getattr(nu, "is_night_nurse", None)
         is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
-        for d in range(join[n], leave[n] + 1):
+        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             for s in range(S):
                 base_score = int(P[n, d, s] * PREFERENCE_SCORE_SCALE)
                 if is_n_only and s == cfg.shift_types.index("N"):
@@ -77,7 +79,7 @@ def build_fallback_stage3_objective_terms(
         if off_penalty > 0:
             off_idx = cfg.shift_types.index("O")
             for n in range(N):
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     obj.append(-off_penalty * X(n, d, off_idx))
     except Exception:
         pass
@@ -255,7 +257,7 @@ def build_fallback_stage3_objective_terms(
                 if w <= 0:
                     continue
                 s_idx = cfg.shift_types.index(code)
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     obj.append(w * X(n, d, s_idx))
     except Exception:
         pass
@@ -271,6 +273,7 @@ def build_fallback_stage3_objective_terms(
                 fixed_cnt=fixed_cnt,
                 logger_prefix=logger_prefix,
                 stage_label="폴백 Stage3",
+                blocked_by_nurse=blocked_by_nurse,
             )
         )
         obj.extend(
@@ -309,7 +312,7 @@ def build_fallback_stage3_objective_terms(
             exp_assigned = sum(
                 X(n, d, s)
                 for n, nu in enumerate(roster_system.nurses)
-                if join[n] <= d <= leave[n] and nu.experience_years >= cfg.min_experience_per_shift
+                if join[n] <= d <= leave[n] and (nu.experience_years or 0) >= cfg.min_experience_per_shift
             )
             shortage = m.NewIntVar(0, cfg.required_experienced_nurses, f"expShort_fb_{d}_{code}")
             m.Add(shortage >= cfg.required_experienced_nurses - exp_assigned)

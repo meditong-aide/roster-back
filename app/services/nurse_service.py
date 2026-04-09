@@ -135,12 +135,14 @@ def get_personnel_basic_info_service(current_user, db: Session):
 
 
 def get_nurses_in_group_service(
-    current_user, db: Session, nurse_id: Optional[str] = None
+    current_user, db: Session, nurse_id: Optional[str] = None,
+    skip_group_filter: bool = False,
 ):
     """
     그룹 내 간호사 목록 조회 서비스 함수
     특정 nurse_id가 제공되면 해당 간호사만 반환, 그렇지 않으면 그룹 내 모든 간호사 반환
     birth_date (VARCHAR)를 파싱하여 만 나이를 age로 추가
+    skip_group_filter: True면 group_id 필터 스킵 (파견/병동이동 인바운드 조회용)
     """
     if not current_user:
         raise Exception("Not authenticated")
@@ -148,7 +150,7 @@ def get_nurses_in_group_service(
     query = db.query(NurseModel)
 
     # 그룹 ID 필터링
-    if current_user.group_id:
+    if not skip_group_filter and current_user.group_id:
         query = query.filter(NurseModel.group_id == current_user.group_id)
 
     # 특정 nurse_id 필터링
@@ -592,6 +594,11 @@ def bulk_update_nurses_service(
                 update_data['sequence'] = get_next_sequence_for_active_status(
                     target_group_id, new_active, db, role=new_role
                 )
+
+            if 'email' in update_data:
+                email_value = update_data.get('email')
+                if (email_value is None or (isinstance(email_value, str) and not email_value.strip())) and db_nurse.email:
+                    update_data.pop('email')
 
             # === 프론트에서 보내준 값으로 일괄 업데이트 ===
             for key, value in update_data.items():
