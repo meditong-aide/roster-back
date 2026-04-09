@@ -2144,6 +2144,7 @@ def get_shift_requests_service(
         shift_map.setdefault(row.nurse_id, []).append({
             "shift_date": row.shift_date.isoformat(),
             "shift": row.shift,
+            "shifts_table_id": row.shifts_table_id,
             "score": float(row.score),
             "comment": row.comment,
         })
