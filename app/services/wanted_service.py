@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dateutil.relativedelta import relativedelta
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
 
 from db.models import (
@@ -2116,7 +2116,7 @@ def get_shift_requests_service(
     first_day = date(year, month, 1)
     last_day = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
 
-    # 제출 현황 일괄 조회
+    # 제출 현황 일괄 조회 (is_submitted=True인 최신 request_id만)
     submitted_requests = (
         db.query(WantedRequest)
         .filter(
@@ -2128,26 +2128,38 @@ def get_shift_requests_service(
     )
     submitted_map = {wr.nurse_id: wr for wr in submitted_requests}
 
-    # shift 내역 일괄 조회
-    shift_query = db.query(NurseShiftRequest).filter(
-        NurseShiftRequest.nurse_id.in_(nurse_ids),
-        NurseShiftRequest.shift_date >= first_day,
-        NurseShiftRequest.shift_date < last_day,
-    )
-    if shift_type:
-        shift_query = shift_query.filter(NurseShiftRequest.shift == shift_type)
-    shift_rows = shift_query.all()
+    # 제출된 간호사의 (nurse_id, request_id) 쌍으로 shift 필터
+    submitted_pairs = [
+        (wr.nurse_id, wr.request_id) for wr in submitted_requests
+    ]
 
-    # nurse_id별 shift 그룹핑
     shift_map: Dict[str, list] = {}
-    for row in shift_rows:
-        shift_map.setdefault(row.nurse_id, []).append({
-            "shift_date": row.shift_date.isoformat(),
-            "shift": row.shift,
-            "shifts_table_id": row.shifts_table_id,
-            "score": float(row.score),
-            "comment": row.comment,
-        })
+    if submitted_pairs:
+        shift_query = db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.shift_date >= first_day,
+            NurseShiftRequest.shift_date < last_day,
+            or_(
+                *(
+                    and_(
+                        NurseShiftRequest.nurse_id == nid,
+                        NurseShiftRequest.request_id == rid,
+                    )
+                    for nid, rid in submitted_pairs
+                )
+            ),
+        )
+        if shift_type:
+            shift_query = shift_query.filter(NurseShiftRequest.shift == shift_type)
+        shift_rows = shift_query.all()
+
+        for row in shift_rows:
+            shift_map.setdefault(row.nurse_id, []).append({
+                "shift_date": row.shift_date.isoformat(),
+                "shift": row.shift,
+                "shifts_table_id": row.shifts_table_id,
+                "score": float(row.score),
+                "comment": row.comment,
+            })
 
     results = []
     for nurse_id in nurse_ids:
