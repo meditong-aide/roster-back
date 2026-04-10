@@ -44,6 +44,7 @@ from services.assignment_service import (
     flush_pending_transfers,
     flush_expired_preceptees,
 )
+from services.nurse_sync_service import sync_new_nurses
 from services.nurse_service import (
     get_nurses_in_group_service,
     bulk_update_nurses_service,
@@ -996,3 +997,16 @@ async def delete_nurse_assignment(
 ):
     """배정 취소 (status → cancelled)"""
     return cancel_assignment(assignment_id, db)
+
+
+@router.post("/sync")
+async def sync_nurses_from_gw(
+    db: Session = Depends(get_db),
+):
+    """그룹웨어 icmc_member_org_info 오버라이트 완료 후 호출되는 webhook.
+
+    eun_gw 측에서 작업 완료 시 이 엔드포인트를 호출하면
+    신규 간호사를 roster DB에 자동 동기화한다.
+    """
+    result = sync_new_nurses(db)
+    return result
