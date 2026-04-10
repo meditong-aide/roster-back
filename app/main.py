@@ -77,11 +77,43 @@ async def _daily_flush_scheduler():
             db.close()
 
 
+async def _daily_nurse_sync_scheduler():
+    """매일 새벽 3시에 신규 간호사 자동 동기화 실행."""
+    from datetime import timedelta
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+
+        db = SessionLocal()
+        try:
+            from services.nurse_sync_service import sync_new_nurses
+            result = sync_new_nurses(db)
+            if result["added"] > 0:
+                _scheduler_logger.info(
+                    "[Scheduler] 신규 간호사 동기화: %d건 추가", result["added"]
+                )
+            if result["errors"]:
+                _scheduler_logger.warning(
+                    "[Scheduler] 신규 간호사 동기화 오류: %s", result["errors"]
+                )
+        except Exception as e:
+            _scheduler_logger.error(
+                "[Scheduler] 신규 간호사 동기화 실패: %s", e, exc_info=True
+            )
+        finally:
+            db.close()
+
+
 @asynccontextmanager
 async def lifespan(app):
-    task = asyncio.create_task(_daily_flush_scheduler())
+    flush_task = asyncio.create_task(_daily_flush_scheduler())
+    sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
     yield
-    task.cancel()
+    flush_task.cancel()
+    sync_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
