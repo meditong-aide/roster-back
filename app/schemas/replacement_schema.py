@@ -105,6 +105,14 @@ class ExcludedCandidate(BaseModel):
 class BulkPathStep(BaseModel):
     slot: ReplacementSlot
     candidate: CandidateRecommendation
+    original_shift_id: Optional[str] = Field(
+        default=None,
+        description="해당 일자 후보의 기존 시프트 코드 (예: Dxd, 나s, of)",
+    )
+    original_shift_pk: Optional[str] = Field(
+        default=None,
+        description="해당 일자 후보의 기존 시프트 PK (shifts 테이블 id)",
+    )
     transition_score: float = Field(
         default=0.0,
         description="base_score x constraint_multiplier 적용 후 점수",

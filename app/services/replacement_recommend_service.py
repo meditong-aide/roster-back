@@ -1102,10 +1102,16 @@ def _build_split_path(
         )
         if best_candidate:
             used_nurse_ids.add(best_candidate.nurse_id)
+            _cid = best_candidate.nurse_id
+            _c_sched = schedule_map.get(_cid, [])
+            _c_pk_row = schedule_shift_pk_map.get(_cid, [])
             for s in seg_slots:
+                _di = s.date.day - 1
                 all_steps.append(BulkPathStep(
                     slot=s,
                     candidate=best_candidate,
+                    original_shift_id=_c_sched[_di] if _di < len(_c_sched) else None,
+                    original_shift_pk=str(_c_pk_row[_di]) if _di < len(_c_pk_row) and _c_pk_row[_di] is not None else None,
                     transition_score=round(best_score / len(seg_slots), 3),
                 ))
             total_score += best_score
@@ -2413,12 +2419,16 @@ def _recommend_bulk_markov(
                 if pick_cid in used_cids:
                     continue
 
+                _orig_sched = path_schedule_maps[path_idx].get(pick_cid, [])
+                _orig_pk_row = path_shift_pk_maps[path_idx].get(pick_cid, [])
                 step = BulkPathStep(
                     slot=slot,
                     candidate=_ctx_to_candidate_model(
                         pick_ctx, rank=1,
                         include_explanations=req.options.include_explanations,
                     ),
+                    original_shift_id=_orig_sched[day_idx] if day_idx < len(_orig_sched) else None,
+                    original_shift_pk=str(_orig_pk_row[day_idx]) if day_idx < len(_orig_pk_row) and _orig_pk_row[day_idx] is not None else None,
                     transition_score=round(pick_score, 3),
                     base_score=round(pick_base, 3),
                     constraint_factors=pick_factors,
