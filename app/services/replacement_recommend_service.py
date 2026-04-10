@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from db.models import (
+    FixedWantedEntry,
     Group,
     Nurse,
     NurseAssignment,
@@ -149,6 +150,23 @@ def _build_assignment_blocked_dates(
             while d <= overlap_end:
                 blocked[nid].add(d)
                 d += timedelta(days=1)
+
+    # fixed_wanted_entries — 고정 셀이 있는 날짜는 추천 제외
+    fixed_entries = (
+        db.query(FixedWantedEntry.nurse_id, FixedWantedEntry.shift_date)
+        .filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.is_applied == True,
+        )
+        .all()
+    )
+    for nid_raw, shift_date in fixed_entries:
+        nid = str(nid_raw)
+        if nid not in blocked:
+            blocked[nid] = set()
+        blocked[nid].add(shift_date)
 
     return blocked
 
@@ -1508,6 +1526,15 @@ def recommend_replacement_candidates(
                 )
             )
             assigned_is_off_rest = assigned_is_off and not assigned_is_vacation
+
+            # 휴가(생, 연 등) 또는 특수 코드 — 건드리면 안 되는 셀
+            if assigned_is_vacation:
+                excluded["vacation_shift"] += 1
+                continue
+            if not assigned_is_off and assigned_main not in ("D", "E", "N", "M"):
+                excluded["special_shift_code"] += 1
+                continue
+
             if assigned_reason:
                 shift_fallback_event_count += 1
                 shift_fallback_reason_counts[assigned_reason] += 1
@@ -1768,6 +1795,12 @@ def _evaluate_single_slot(
             shift_meta_by_pk=shift_meta_by_pk,
         )
         assigned_is_off_rest = assigned_is_off and not assigned_is_vacation
+
+        # 휴가(생, 연 등) 또는 특수 코드 — 건드리면 안 되는 셀
+        if assigned_is_vacation:
+            continue
+        if not assigned_is_off and assigned_main not in ("D", "E", "N", "M"):
+            continue
 
         if ranking_scope == "OFF_ONLY" and not assigned_is_off_rest:
             continue
