@@ -101,9 +101,6 @@ class NurseRosterConfig:
     team_balance_focus_shifts: Optional[List[str]] = None  # 교대 제한 (없으면 D/E/N)
     team_balance_mode: str = "balanced"             # balanced | focus_D | focus_DE
     team_balance_shift_weights: Dict[str, float] = field(default_factory=dict)  # 모드별 파생 가중치
-    # ── max coverage 모드 ──
-    use_max_coverage: bool = False  # True 시 daily coverage를 상한(max)으로 적용, 초과 배정 불가, 잔여 인원 Off
-    
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}

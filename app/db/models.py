@@ -335,8 +335,6 @@ class RosterConfig(Base):
     fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
-    use_max_coverage = deferred(Column(BOOLEAN, nullable=True, server_default="0"))
-
     office = relationship("Office")
     group = relationship("Group")
 
@@ -565,6 +563,10 @@ class DailyShift(Base):
     e_count = Column(SMALLINT, nullable=False, default=0)
     n_count = Column(SMALLINT, nullable=False, default=0)
     m_count = Column(SMALLINT, nullable=False, default=0)
+    d_count_max = Column(SMALLINT, nullable=False, default=0)
+    e_count_max = Column(SMALLINT, nullable=False, default=0)
+    n_count_max = Column(SMALLINT, nullable=False, default=0)
+    m_count_max = Column(SMALLINT, nullable=False, default=0)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 

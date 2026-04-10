@@ -561,13 +561,31 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
             counts['M'] = int(getattr(row, 'm_count', 0) or 0)
         return counts
 
+    def _row_to_day_counts_max(row: DailyShift) -> dict[str, int]:
+        counts = {
+            'D': int(getattr(row, 'd_count_max', 0) or 0),
+            'E': int(getattr(row, 'e_count_max', 0) or 0),
+            'N': int(getattr(row, 'n_count_max', 0) or 0),
+        }
+        if use_mid:
+            counts['M'] = int(getattr(row, 'm_count_max', 0) or 0)
+        return counts
+
     # day→counts 맵 구성 후 리스트로 변환(0-index)
     by_day: dict[int, dict[str, int]] = {}
+    by_day_max: dict[int, dict[str, int]] = {}
     for row in rows:
         day_no = int(getattr(row, 'day', 0) or 0)
         by_day[day_no] = _row_to_day_counts(row)
+        by_day_max[day_no] = _row_to_day_counts_max(row)
     daily_shift_requirements_by_day = [
         by_day.get(d, dict(daily_shift_requirements))
+        for d in range(1, days_in_month + 1)
+    ]
+    # max 기본값: 0 = 상한 없음
+    _empty_max = {k: 0 for k in daily_shift_requirements}
+    daily_shift_requirements_max_by_day = [
+        by_day_max.get(d, dict(_empty_max))
         for d in range(1, days_in_month + 1)
     ]
     # 안전장치: 요구치가 전부 0이면 엔진은 OFF로 쏠릴 확률이 높다.
@@ -578,7 +596,7 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
             "일별/기본 근무 요구치(D/E/N)가 모두 0입니다. "
             "ShiftManage.main_code 또는 DailyShift 설정을 확인해주세요."
         )
-    return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day
+    return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day
 
 def _normalize_to_main(code: str, code2main: dict) -> str:
     """세부 근무코드를 메인코드로 정규화한다."""
@@ -2086,12 +2104,6 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
 
         # 호출자가 구성한 config_dict(게이지 반영 등)이 있으면 이를 사용
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
-        # deferred 컬럼 명시 로딩 (DB 미반영 시에도 안전)
-        if latest_config and "use_max_coverage" not in config_dict:
-            try:
-                config_dict["use_max_coverage"] = bool(latest_config.use_max_coverage or False)
-            except Exception:
-                config_dict["use_max_coverage"] = False
         # ShiftManage 요구인원은 호출부에서 주입한다
 
         try:
@@ -3077,20 +3089,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
-    shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day = _build_shift_manage_and_requirements(
+    shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day = _build_shift_manage_and_requirements(
         db, current_user, latest_config, req
     )
     # daily_shift_requirements를 config에 주입해서 엔진 호출
     config_dict = latest_config.__dict__ if latest_config else {}
-    # deferred 컬럼 명시 로딩 (DB 미반영 시에도 안전)
-    if latest_config and "use_max_coverage" not in config_dict:
-        try:
-            config_dict["use_max_coverage"] = bool(latest_config.use_max_coverage or False)
-        except Exception:
-            config_dict["use_max_coverage"] = False
     config_dict['daily_shift_requirements'] = daily_shift_requirements
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
+    config_dict['daily_shift_requirements_max_by_day'] = daily_shift_requirements_max_by_day
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
