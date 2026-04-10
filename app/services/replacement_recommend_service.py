@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import logging
 from math import exp
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from db.models import (
     Group,
     Nurse,
+    NurseAssignment,
     NursePairRequest,
     NurseShiftRequest,
     RosterConfig,
@@ -93,6 +94,63 @@ def _is_vacation_shift(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> 
         shift_meta,
     )
     return is_vacation
+
+
+def _build_assignment_blocked_dates(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+    days_in_month: int,
+) -> Dict[str, set]:
+    """해당 월의 active NurseAssignment에서 간호사별 blocked date 집합을 구성한다.
+
+    파견/병동이동/휴직: source_group_id == group_id인 아웃바운드 기간
+    프리셉티: preceptor_id가 있는 간호사의 assignment 기간
+    """
+    month_start = date(year, month, 1)
+    month_end = date(year, month, days_in_month)
+
+    assignments = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.status != "cancelled",
+            NurseAssignment.start_date <= month_end,
+        )
+        .all()
+    )
+
+    blocked: Dict[str, set] = {}
+    for a in assignments:
+        a_start = a.start_date
+        a_end = a.end_date or a.expected_end_date or month_end
+
+        if a_end < month_start or a_start > month_end:
+            continue
+
+        nid = str(a.nurse_id)
+        overlap_start = max(a_start, month_start)
+        overlap_end = min(a_end, month_end)
+
+        # 아웃바운드 (파견/병동이동/휴직) — source 병동 기준
+        if a.reason in ("파견", "병동이동", "휴직") and str(a.source_group_id) == group_id:
+            if nid not in blocked:
+                blocked[nid] = set()
+            d = overlap_start
+            while d <= overlap_end:
+                blocked[nid].add(d)
+                d += timedelta(days=1)
+
+        # 프리셉티 — 해당 기간 blocked
+        if a.reason == "프리셉티":
+            if nid not in blocked:
+                blocked[nid] = set()
+            d = overlap_start
+            while d <= overlap_end:
+                blocked[nid].add(d)
+                d += timedelta(days=1)
+
+    return blocked
 
 
 def _to_date(v: Any) -> Optional[date]:
@@ -791,6 +849,10 @@ def _split_slots_ngram_optimal(
     ]
     dp[0] = (0, 0.0, [])
 
+    # 세그먼트 전환 패널티: 분할 수가 많아질수록 불리하게 하여
+    # 1일 단위 분할을 방지하고 구간별 1명 전담 효과를 극대화
+    segment_penalty = 1
+
     for i in range(1, n + 1):
         for w in range(1, min(max_window, i) + 1):
             j = i - w
@@ -801,7 +863,9 @@ def _split_slots_ngram_optimal(
                 v_count, score = evaluate_fn(seg)
             else:
                 v_count, score = 0, float(w)
-            total_v = dp[j][0] + v_count
+            # 첫 세그먼트(j==0)는 패널티 없음, 이후 세그먼트마다 패널티 추가
+            split_cost = segment_penalty if j > 0 else 0
+            total_v = dp[j][0] + v_count + split_cost
             total_s = dp[j][1] + score
             if total_v < dp[i][0] or (total_v == dp[i][0] and total_s > dp[i][1]):
                 dp[i] = (total_v, total_s, dp[j][2] + [(j, i)])
@@ -840,7 +904,9 @@ def _split_slots_by_shift_type(
     current_group: List[ReplacementSlot] = [slots[0]]
     for slot in slots[1:]:
         st = _classify(slot)
-        if st != current_type:
+        # 유형 변경 또는 날짜 불연속(Off 끼임) 시 세그먼트 분리
+        date_gap = (slot.date - current_group[-1].date).days > 1
+        if st != current_type or date_gap:
             label = f"{current_type} ({current_group[0].date}~{current_group[-1].date})"
             segments.append((label, current_group))
             current_type = st
@@ -917,6 +983,7 @@ def _evaluate_segment_single_nurse(
     ranking_scope: str,
     max_scan: int,
     used_nurse_ids: set,
+    assignment_blocked: Optional[Dict[str, set]] = None,
 ) -> Tuple[Optional[CandidateRecommendation], float]:
     """구간 전체를 1명이 커버할 최적 간호사를 평가.
 
@@ -937,6 +1004,7 @@ def _evaluate_segment_single_nurse(
         pref_score_map=pref_score_map, pair_score_map=pair_score_map,
         target_grade=target_grade, ranking_scope=ranking_scope,
         max_scan=max_scan,
+        assignment_blocked=assignment_blocked,
     )
 
     best_cid: Optional[str] = None
@@ -1075,6 +1143,7 @@ def _build_split_path(
     target_grade: Optional[int],
     ranking_scope: str,
     max_scan: int,
+    assignment_blocked: Optional[Dict[str, set]] = None,
 ) -> Optional[BulkPathRecommendation]:
     """구간 리스트를 받아 구간별 1명 평가 후 BulkPathRecommendation 반환."""
     if not segments_raw:
@@ -1099,6 +1168,7 @@ def _build_split_path(
             ranking_scope=ranking_scope,
             max_scan=max_scan,
             used_nurse_ids=used_nurse_ids,
+            assignment_blocked=assignment_blocked,
         )
         if best_candidate:
             used_nurse_ids.add(best_candidate.nurse_id)
@@ -1227,6 +1297,10 @@ def recommend_replacement_candidates(
     nurses = db.query(Nurse).filter(Nurse.group_id == target_group_id).all()
     nurse_by_id = {str(n.nurse_id): n for n in nurses}
 
+    assignment_blocked = _build_assignment_blocked_dates(
+        db, target_group_id, year_value, month_value, days_in_month,
+    )
+
     if req.mode == "SINGLE":
         slots = req.slots or []
     else:
@@ -1282,6 +1356,7 @@ def recommend_replacement_candidates(
             target_grade=target_grade,
             ranking_scope=ranking_scope,
             max_scan=max_scan,
+            assignment_blocked=assignment_blocked,
         )
         path_1 = markov_paths[0] if markov_paths else None
         if path_1:
@@ -1304,6 +1379,7 @@ def recommend_replacement_candidates(
             target_grade=target_grade,
             ranking_scope=ranking_scope,
             max_scan=max_scan,
+            assignment_blocked=assignment_blocked,
         )
 
         def _ngram_eval(seg_slots: List[ReplacementSlot]) -> Tuple[int, float]:
@@ -1409,6 +1485,10 @@ def recommend_replacement_candidates(
                 continue
             if resign_date and slot.date > resign_date:
                 excluded["after_resignation_date"] += 1
+                continue
+
+            if slot.date in assignment_blocked.get(candidate_id, set()):
+                excluded["assignment_blocked"] += 1
                 continue
 
             if not _nurse_can_work_shift(nurse, target_shift_main):
@@ -1637,6 +1717,7 @@ def _evaluate_single_slot(
     replacement_usage: Optional[Dict[str, int]] = None,
     root_nurse_id: Optional[str] = None,
     prev_nurse_id: Optional[str] = None,
+    assignment_blocked: Optional[Dict[str, set]] = None,
 ) -> List[Tuple[str, CandidateContext, float]]:
     day = slot.date.day
     day_idx = day - 1
@@ -1644,6 +1725,7 @@ def _evaluate_single_slot(
     target_shift_main = _main_shift_code(target_shift_raw, shift_meta)
 
     usage = replacement_usage or {}
+    _asgn_blocked = assignment_blocked or {}
     candidate_pool: List[Tuple[str, CandidateContext]] = []
 
     for candidate_id, nurse in nurse_by_id.items():
@@ -1659,6 +1741,8 @@ def _evaluate_single_slot(
         if join_date and slot.date < join_date:
             continue
         if resign_date and slot.date > resign_date:
+            continue
+        if slot.date in _asgn_blocked.get(candidate_id, set()):
             continue
         if not _nurse_can_work_shift(nurse, target_shift_main):
             continue
@@ -2179,6 +2263,7 @@ def _recommend_bulk_markov(
     target_grade: Optional[int],
     ranking_scope: str,
     max_scan: int,
+    assignment_blocked: Optional[Dict[str, set]] = None,
 ) -> Tuple[List[SlotRecommendation], List[BulkPathRecommendation]]:
     """BULK recommendation — 3 scenario paths with exclusive candidate pools.
 
@@ -2260,6 +2345,7 @@ def _recommend_bulk_markov(
                 replacement_usage=usage,
                 prev_nurse_id=prev_nurse_id,
                 root_nurse_id=root_nurse_id,
+                assignment_blocked=assignment_blocked,
             )
 
             baseline_summary = _count_path_violations(
