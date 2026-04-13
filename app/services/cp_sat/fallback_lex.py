@@ -467,6 +467,8 @@ def optimize_fallback_lex_hard_first(
         m = cp_model.CpModel()
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
+        # relax_level >= 3: max coverage + M min hard → soft 전환 (인원 부족 시 생성 보장)
+        _relax_coverage = relax_level >= 3
         coverage_soft_weight = int(
             getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000
         )
@@ -1111,7 +1113,8 @@ def optimize_fallback_lex_hard_first(
                     m_need = max(0, int(req_raw - fixed_m_bucket))
                     m_cap_max = max(0, int(req_max_raw - fixed_m_bucket)) if req_max_raw > 0 else 0
                     # M min coverage: max coverage 있으면 hard, 없으면 soft
-                    if _fb_has_any_max and m_need > 0:
+                    # _relax_coverage 활성 시: 항상 soft (인원 부족 대응)
+                    if _fb_has_any_max and not _relax_coverage and m_need > 0:
                         m.Add(assigned_m_bucket >= m_need)
                         sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                     else:
@@ -1119,9 +1122,13 @@ def optimize_fallback_lex_hard_first(
                         if m_need > 0:
                             m.Add(assigned_m_bucket + sh >= m_need)
                     # M 상한: max coverage 있으면 hard, 없으면 min으로 hard cap
-                    if m_cap_max > 0:
+                    # _relax_coverage 활성 시: max도 soft
+                    if m_cap_max > 0 and not _relax_coverage:
                         m.Add(assigned_m_bucket <= m_cap_max)
                         ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                    elif m_cap_max > 0 and _relax_coverage:
+                        ov = m.NewIntVar(0, N, f"over_{d}_{code}")
+                        m.Add(ov >= assigned_m_bucket - m_cap_max)
                     else:
                         m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
                         m.Add(assigned_m_bucket <= m_cap_non_fixed)
@@ -1148,10 +1155,13 @@ def optimize_fallback_lex_hard_first(
                 else:
                     sh = m.NewIntVar(0, N, f"short_{d}_{code}")
                     m.Add(assigned + sh >= need)
-                # max 제약: hard (상한 초과 불가)
-                if need_max > 0:
+                # max 제약: hard (상한 초과 불가), _relax_coverage 시 soft
+                if need_max > 0 and not _relax_coverage:
                     m.Add(assigned <= need_max)
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                elif need_max > 0 and _relax_coverage:
+                    ov = m.NewIntVar(0, N, f"over_{d}_{code}")
+                    m.Add(ov >= assigned - need_max)
                 elif need > 0:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     m.Add(assigned - ov <= need)
@@ -1914,8 +1924,11 @@ def optimize_fallback_lex_hard_first(
                 best_over = int(s1.Value(sum(over1)))
                 used_relax_level = relax_level
                 if relax_level > 0:
+                    _relax_desc = f"OFF상한+{relax_level}"
+                    if relax_level >= 3:
+                        _relax_desc += ", max coverage soft, M min soft"
                     print(
-                        f"{logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 (월 최대 OFF 상한 +{relax_level})"
+                        f"{logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 ({_relax_desc})"
                     )
                 print(f"{logger_prefix} 최소 커버리지 부족: {best_short}, 과잉: {best_over}")
                 try:
