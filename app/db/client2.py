@@ -47,9 +47,9 @@ class MssqlDatabasemanager:
         finally:
             conn.close()
 
-    def fetch_all(self, query: str, params: tuple | None = None, database: str | None = None) -> list[dict]:
+    def fetch_all(self, query: str, params: tuple | None = None, database: str | None = None, charset: str | None = 'EUC-KR') -> list[dict]:
         """SELECT 쿼리를 실행하고 결과를 리스트[dict]로 반환합니다."""
-        with self.connection(database) as conn:
+        with self.connection(database, charset=charset) as conn:
             cursor = conn.cursor()
             cursor.execute(query, params or ())
             rows = cursor.fetchall()

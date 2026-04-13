@@ -100,7 +100,7 @@ def sync_new_nurses(db: Session) -> dict:
     Returns:
         {"added": int, "skipped": int, "errors": list[dict]}
     """
-    rows = msdb_manager.fetch_all(_QUERY_NEW_NURSES, params=(OFFICE_ID,))
+    rows = msdb_manager.fetch_all(_QUERY_NEW_NURSES, params=(OFFICE_ID,), charset='UTF-8')
     if not rows:
         return {"added": 0, "skipped": 0, "errors": []}
 
