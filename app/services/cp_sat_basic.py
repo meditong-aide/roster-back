@@ -878,6 +878,10 @@ class CPSATBasicEngine:
                 if _pperiod_idx:
                     setattr(roster_system, "preceptee_follow_days", _pperiod_idx)
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
+            # cross-group OFF cap 조정용
+            _other_group_offs = config_data.get("other_group_offs") if isinstance(config_data, dict) else None
+            if _other_group_offs:
+                setattr(roster_system, "other_group_offs", _other_group_offs)
             # 월단위 선호(개인 입력) - dict 형태로 전달됨을 가정
             # 예: {"441172": {"shift": "D", "strength": 7}, ...}
             try:
@@ -2507,21 +2511,32 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # ───────────── 2-A2. 초기 금지 셀(경계 제약) ─────────────
     try:
         if hasattr(rs, 'initial_forbidden') and isinstance(rs.initial_forbidden, dict):
+            # main code → shift_types 내 해당 shift_id 인덱스 매핑 (D → [Dx, D2, D3, ...])
+            _sid_to_main = getattr(rs, "shift_id_to_main", {}) or {}
+            _main_to_sidx: dict[str, list[int]] = {}
+            for s_idx, sid in enumerate(rs.config.shift_types):
+                main = _sid_to_main.get(sid, sid)
+                _main_to_sidx.setdefault(main, []).append(s_idx)
             for (n, d), code_list in rs.initial_forbidden.items():
-                # 프리셉티는 AllowedShiftTypes 금지 면제 (프리셉터 스케줄 따라감)
                 if _is_preceptee_at(n):
                     continue
                 for code in (code_list or []):
-                    if code not in rs.config.shift_types:
-                        continue
-                    s_idx = rs.config.shift_types.index(code)
+                    # main code로 매핑된 모든 shift_id를 금지
+                    target_indices = _main_to_sidx.get(code, [])
+                    if not target_indices:
+                        # 직접 shift_types에 있으면 그것만
+                        if code in rs.config.shift_types:
+                            target_indices = [rs.config.shift_types.index(code)]
+                        else:
+                            continue
                     if (n, d) not in active_days:
                         print(f"[CP-SAT-Basic] 초기 금지 무시: n={n}, d={d+1}, code={code} (퇴사/입사 범위 밖)")
                         continue
                     if (n, d) in fixed:
                         print(f"[CP-SAT-Basic] 초기 금지 무시 (유저 고정 우선): n={n}, d={d+1}, code={code}, fixed={rs.config.shift_types[fixed[(n,d)]]}")
                         continue
-                    m.Add(X(n,d,s_idx)==0)
+                    for s_idx in target_indices:
+                        m.Add(X(n,d,s_idx)==0)
     except Exception as e:
         print(f"[CP-SAT-Basic] 초기 금지 셀 적용 중 오류: {e}")
 
@@ -3020,10 +3035,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         try:
             _off_cap_skip = False
             if _has_any_max:
-                # 월 총 최소 OFF (max 커버리지 기준) 계산
                 _blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
                 _active_count = sum(1 for nn in range(N) if join[nn] <= 0 <= leave[nn] and nn not in _blocked_set)
-                # min 커버리지 기준으로 OFF 가용량 계산 (실제 동작은 min~max 범위)
                 _total_min_off = 0
                 for _dd in range(D_phys):
                     _day_min_sum = 0
@@ -3062,6 +3075,20 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
                 nonvac_active_days = max(0, avail_days - vacation_cnt)
                 min_off_required = int(off_bounds["min_off_required"])
+                # 상대 그룹 OFF 차감: 합산 기준 off cap 조정
+                _other_offs_map = getattr(rs, "other_group_offs", None) or {}
+                _nurse_db_id = str(getattr(nu, "nurse_id", getattr(nu, "db_id", "")))
+                _other_offs = (_other_offs_map or {}).get(_nurse_db_id, 0)
+                if _other_offs > 0:
+                    _full_month_off = int(off_bounds.get("effective_off_days", min_off_required))
+                    _adjusted_min = max(0, _full_month_off - _other_offs)
+                    _adjusted_min = min(_adjusted_min, nonvac_active_days)
+                    print(
+                        f"[OffCap][CrossGroup] nurse_idx={n}, id={_nurse_db_id}: "
+                        f"full_month_off={_full_month_off}, other_offs={_other_offs}, "
+                        f"min_off {min_off_required}→{_adjusted_min}"
+                    )
+                    min_off_required = _adjusted_min
                 if min_off_required > 0 and phys_range_off:
                     m.Add(
                         sum(
@@ -3072,6 +3099,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         >= min_off_required
                     )
                 extra_allowed = int(off_bounds["max_extra_off_days"])
+                # 상대 그룹 OFF 차감: max_off도 조정
+                if _other_offs > 0:
+                    _adjusted_max = max(min_off_required, min_off_required + extra_allowed)
+                    _adjusted_max = min(_adjusted_max, nonvac_active_days)
+                    extra_allowed = max(0, _adjusted_max - min_off_required)
+                    print(
+                        f"[OffCap][CrossGroup] nurse_idx={n}: max_off adjusted → "
+                        f"min={min_off_required}, max={_adjusted_max}, extra={extra_allowed}"
+                    )
                 if extra_allowed >= 0 and phys_range_off:
                     if is_n_only:
                         max_off_allowed_n_only = min(
@@ -3118,7 +3154,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             nonvac_active_days,
                         )
                         # max coverage 설정 시: Off cap max 상한 미적용 (min만 유지)
-                        if not _has_any_max:
+                        # 단, cross-group 조정 간호사는 max_off 강제 적용
+                        if not _has_any_max or _other_offs > 0:
                             m.Add(
                                 sum(
                                     X(n, d, off)

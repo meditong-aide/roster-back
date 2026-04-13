@@ -553,6 +553,15 @@ class NurseAssignmentCreate(BaseModel):
     start_date: date
     expected_end_date: Optional[date] = Field(default=None, description="예상 종료일 (병동이동 시 미지정 가능)")
     reason: str = Field(description="파견 / 휴직 / 퇴사 / 프리셉티 / 병동이동")
+    # target 그룹 전용 설정
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = Field(default=None, description="target 그룹 근무 가능 shift ID 목록")
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
 
 
 class NurseAssignmentUpdate(BaseModel):
@@ -560,6 +569,15 @@ class NurseAssignmentUpdate(BaseModel):
     expected_end_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[str] = Field(default=None, description="active / completed / cancelled")
+    # target 그룹 전용 설정
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
 
 
 class NurseAssignmentResponse(BaseModel):
@@ -575,6 +593,15 @@ class NurseAssignmentResponse(BaseModel):
     end_date: Optional[date] = None
     reason: str
     status: str
+    # target 그룹 전용 설정
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

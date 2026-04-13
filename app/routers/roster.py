@@ -1227,20 +1227,7 @@ async def publish_roster(
 
     db.add(issued_roster)
     db.add(snapshot)
-    # ── 파견/병동이동 shift 전달: source group 마감 시 target group에 shift 전달 ──
-    try:
-        _transfer_cnt = transfer_shifts_on_publish(
-            db=db,
-            schedule_id=req.schedule_id,
-            source_group_id=target_group_id,
-            office_id=office_id,
-            year=schedule.year,
-            month=schedule.month,
-        )
-        if _transfer_cnt > 0:
-            print(f"[Publish] 파견/병동이동 shift 전달: {_transfer_cnt}건")
-    except Exception as e:
-        print(f"[Publish] shift 전달 실패: {e}")
+    # NOTE: ShiftTransferLog 기반 전달은 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     db.commit()
     nurses_in_group = (
         db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()

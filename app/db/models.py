@@ -152,6 +152,15 @@ class NurseAssignment(Base):
     end_date = Column(DATE, nullable=True)
     reason = Column(NVARCHAR(200), nullable=False)
     status = Column(VARCHAR(10), nullable=False, default="active")
+    # target 그룹 전용 설정
+    target_weekly_off_type = Column(VARCHAR(20), nullable=True)
+    target_weekly_off_enabled = Column(TINYINT, nullable=True)
+    target_weekly_off_weekday = Column(TINYINT, nullable=True)
+    target_shift_types = Column(JSON, nullable=True)
+    target_team_id = Column(INTEGER, nullable=True)
+    target_grade = Column(INTEGER, nullable=True)
+    target_fixed_shift = Column(VARCHAR(20), nullable=True)
+    target_wanted_max_requests = Column(INTEGER, nullable=True)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 

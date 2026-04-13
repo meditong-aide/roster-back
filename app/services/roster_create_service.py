@@ -1397,24 +1397,28 @@ def _merge_fixed_cells_with_weekly_off(
     return list(merged.values()), conflicts
 
 def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: int) -> str | None:
-    """이전 달의 최종(issued 우선) schedule_id를 조회한다."""
+    """이전 달의 최종 schedule_id를 조회한다.
+
+    우선순위:
+    1) status='issued' 스케줄이 있으면 → 마감본 참조
+    2) 없으면(전부 draft) → 최신 version 참조
+    """
     py, pm = _get_prev_year_month(year, month)
-    # 1) IssuedRoster 우선 (is_active=True인 것만)
+    # 1) status='issued' 스케줄 조회
     issued = (
-        db.query(IssuedRoster)
-        .join(Schedule, IssuedRoster.schedule_id == Schedule.schedule_id)
+        db.query(Schedule)
         .filter(
             Schedule.group_id == group_id,
             Schedule.year == py,
             Schedule.month == pm,
-            IssuedRoster.is_active == True
+            Schedule.status == "issued",
         )
-        .order_by(IssuedRoster.issued_at.desc())
+        .order_by(Schedule.version.desc())
         .first()
     )
     if issued:
         return issued.schedule_id
-    # 2) 없으면 해당 월의 최신 Schedule
+    # 2) issued 없으면 최신 version
     latest = (
         db.query(Schedule)
         .filter(Schedule.group_id == group_id, Schedule.year == py, Schedule.month == pm)
@@ -1422,6 +1426,57 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
         .first()
     )
     return latest.schedule_id if latest else None
+
+
+def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: int) -> str | None:
+    """특정 그룹의 해당 월 최종 schedule_id를 조회한다.
+
+    우선순위: status='issued' > 최신 version(draft)
+    """
+    issued = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.status == "issued",
+        )
+        .order_by(Schedule.version.desc())
+        .first()
+    )
+    if issued:
+        return issued.schedule_id
+    latest = (
+        db.query(Schedule)
+        .filter(Schedule.group_id == group_id, Schedule.year == year, Schedule.month == month)
+        .order_by(Schedule.version.desc())
+        .first()
+    )
+    return latest.schedule_id if latest else None
+
+
+def _get_boundary_tail(
+    db: Session, schedule_id: str, nurse_id: str,
+    boundary_day: int, lookback: int, code2main: dict,
+) -> list[str]:
+    """경계일(0-indexed) 이전 lookback일의 shift 시퀀스를 반환한다."""
+    if not schedule_id or boundary_day <= 0:
+        return []
+    entries = (
+        db.query(ScheduleEntry)
+        .filter(
+            ScheduleEntry.schedule_id == schedule_id,
+            ScheduleEntry.nurse_id == nurse_id,
+        )
+        .all()
+    )
+    daymap: dict[int, str] = {}
+    for e in entries:
+        d = int(e.work_date.day) - 1  # 0-indexed
+        daymap[d] = _normalize_to_main(e.shift_id, code2main)
+    start = max(0, boundary_day - lookback)
+    return [daymap.get(d, '-') for d in range(start, boundary_day)]
+
 
 def _get_last_days_map(db: Session, schedule_id: str, days: int, code2main: dict, active_nurse_ids: list[str] | None = None) -> dict:
     """해당 schedule_id의 마지막 N일 근무코드를 메인코드로 정규화하여 반환한다.
@@ -1866,6 +1921,245 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     }
 
 
+def build_mid_month_boundary_constraints(
+    db: Session,
+    inbound_assignments: list,
+    group_id: str,
+    year: int,
+    month: int,
+    config_dict: dict,
+    code2main: dict,
+    outbound_assignments: list | None = None,
+) -> dict:
+    """인바운드/아웃바운드 간호사의 mid-month 경계 window 제약을 생성한다.
+
+    - 인바운드: source group의 같은 달 근무표에서 경계일 이전 tail 추출
+    - 아웃바운드 복귀: target group의 같은 달 근무표에서 복귀일 이전 tail 추출
+    """
+    lookback = int(config_dict.get('cross_month_lookback_days', 6))
+    days_in_month = calendar.monthrange(year, month)[1]
+    month_start = date(year, month, 1)
+
+    def _safe_int(val, default=None):
+        try:
+            if val is None or (isinstance(val, str) and not val.strip()):
+                return default
+            return int(val)
+        except Exception:
+            return default
+
+    K = _safe_int(config_dict.get('max_conseq_work'), None)
+    if K is None:
+        K = _safe_int(config_dict.get('max_consecutive_work_days'), None)
+    if K is None:
+        K = 5
+    L = int(config_dict.get('max_consecutive_nights') or (3 if bool(config_dict.get('three_seq_nig', False)) else 2))
+    two_after_three = bool(config_dict.get('two_offs_after_three_nig'))
+    two_after_two = bool(config_dict.get('two_offs_after_two_nig'))
+    ban_e_to_d = bool(config_dict.get('ban_e_to_d', True))
+    ban_n_to_d = bool(config_dict.get('ban_n_to_d', True))
+    ban_n_to_e = bool(config_dict.get('ban_n_to_e', True))
+    if not bool(config_dict.get('banned_day_after_eve')):
+        ban_e_to_d = False
+        ban_n_to_d = False
+        ban_n_to_e = False
+
+    forced_off: dict[str, list[int]] = defaultdict(list)
+    forbidden: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
+    off_window_constraints: dict[str, list[list[int]]] = defaultdict(list)
+
+    for a in inbound_assignments:
+        nurse_id = str(a.nurse_id)
+        boundary_day = (a.start_date - month_start).days
+        if boundary_day <= 0:
+            continue  # 월초 시작 = cross-month constraints가 처리
+
+        src_sid = _query_schedule_id_for_month(db, a.source_group_id, year, month)
+        if not src_sid:
+            print(f"[MidMonth] nurse={nurse_id}: source({a.source_group_id}) 근무표 없음, window 생략")
+            continue
+
+        # source 그룹의 Shift 기반 code2main 빌드 (target과 shift 코드 체계가 다를 수 있음)
+        src_code2main = dict(code2main)
+        try:
+            src_shifts = db.query(Shift).filter(Shift.group_id == a.source_group_id).all()
+            _GB = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
+            for s in src_shifts:
+                sid = str(s.shift_id).strip().upper()
+                if not sid or sid in src_code2main:
+                    continue
+                sgb = str(getattr(s, "shift_gb", "") or "").strip()
+                if sgb in _GB:
+                    src_code2main[sid] = _GB[sgb]
+                    continue
+                ds = str(getattr(s, "default_shift", "") or "").strip().upper()
+                if ds in ("OFF", "주"):
+                    ds = "O"
+                if ds in ("D", "E", "N", "M", "O"):
+                    src_code2main[sid] = ds
+        except Exception as e:
+            print(f"[MidMonth] source Shift 보강 실패(무시): {e}")
+
+        tail = _get_boundary_tail(db, src_sid, nurse_id, boundary_day, lookback, src_code2main)
+        if not tail:
+            print(f"[MidMonth] nurse={nurse_id}: source 근무표에 데이터 없음, window 생략")
+            continue
+
+        metrics = _calc_tail_metrics(tail)
+        cons_work = metrics['consecutive_work_tail']
+        cons_n = metrics['consecutive_night_tail']
+        last_shift = metrics['last_day_shift']
+        offs_after = metrics['offs_after_tail_nights']
+        bd = boundary_day
+        tail_str = ' '.join(tail)
+        print(f"[MidMonth] nurse={nurse_id}: boundary=day{bd}, tail=[{tail_str}], "
+              f"cons_work={cons_work}, cons_n={cons_n}, last={last_shift}")
+
+        # (a) 연속 근무 K → 경계일 OFF 강제
+        if K and cons_work >= K:
+            forced_off[nurse_id].append(bd)
+            print(f"[MidMonth] nurse={nurse_id}: cons_work={cons_work}≥K={K} → day{bd} OFF 강제")
+
+        # (a-1) off window: 경계일부터 K-w일 내 OFF ≥ 1
+        if K > 0 and cons_work > 0:
+            window_end = bd + max(0, K - cons_work)
+            window_end = min(window_end, days_in_month - 1)
+            if window_end >= bd:
+                off_window_constraints[nurse_id].append([bd, window_end])
+                print(f"[MidMonth] nurse={nurse_id}: off_window [{bd},{window_end}]")
+
+        # (b) N tail → forced OFF
+        two_eff2 = two_after_two if (L and cons_n >= L) else False
+        two_eff3 = two_after_three if (L and cons_n >= L) else False
+        req_offs = 0
+        if two_eff3 and cons_n >= 3:
+            req_offs = 2
+        elif two_eff2 and cons_n >= 2:
+            req_offs = 2
+        rem = max(0, req_offs - offs_after)
+        for i in range(min(2, rem)):
+            forced_off[nurse_id].append(bd + i)
+        if rem > 0:
+            print(f"[MidMonth] nurse={nurse_id}: N tail={cons_n} → day{bd}..{bd+rem-1} OFF 강제")
+
+        # (c) 전환 금지
+        if last_shift == 'E' and ban_e_to_d:
+            forbidden[nurse_id][bd].append('D')
+        if last_shift == 'N' and ban_n_to_d:
+            forbidden[nurse_id][bd].append('D')
+        if last_shift == 'N' and ban_n_to_e:
+            forbidden[nurse_id][bd].append('E')
+
+        # (d) N 상한
+        if L and cons_n >= L and offs_after == 0:
+            forbidden[nurse_id][bd].append('N')
+
+    # ── 아웃바운드 복귀: target group 근무표 tail → 복귀일 제약 ──
+    for a in (outbound_assignments or []):
+        nurse_id = str(a.nurse_id)
+        a_end = a.end_date or a.expected_end_date
+        if not a_end:
+            continue  # 종료일 미정 → 이번 달 복귀 없음
+        if a_end.year != year or a_end.month != month:
+            continue  # 종료일이 이번 달이 아님
+        return_day = (a_end - month_start).days + 1  # 종료일 다음날부터 복귀
+        if return_day >= days_in_month or return_day <= 0:
+            continue  # 월 범위 밖
+
+        tgt_sid = _query_schedule_id_for_month(db, a.target_group_id, year, month)
+        if not tgt_sid:
+            print(f"[MidMonth][Return] nurse={nurse_id}: target({a.target_group_id}) 근무표 없음, window 생략")
+            continue
+
+        # target 그룹의 Shift 기반 code2main 빌드 (source와 shift 코드 체계가 다를 수 있음)
+        tgt_code2main = dict(code2main)  # base copy
+        try:
+            tgt_shifts = db.query(Shift).filter(Shift.group_id == a.target_group_id).all()
+            _GB = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
+            for s in tgt_shifts:
+                sid = str(s.shift_id).strip().upper()
+                if not sid or sid in tgt_code2main:
+                    continue
+                sgb = str(getattr(s, "shift_gb", "") or "").strip()
+                if sgb in _GB:
+                    tgt_code2main[sid] = _GB[sgb]
+                    continue
+                ds = str(getattr(s, "default_shift", "") or "").strip().upper()
+                if ds in ("OFF", "주"):
+                    ds = "O"
+                if ds in ("D", "E", "N", "M", "O"):
+                    tgt_code2main[sid] = ds
+        except Exception as e:
+            print(f"[MidMonth][Return] target Shift 보강 실패(무시): {e}")
+
+        tail = _get_boundary_tail(db, tgt_sid, nurse_id, return_day, lookback, tgt_code2main)
+        if not tail:
+            print(f"[MidMonth][Return] nurse={nurse_id}: target 근무표에 데이터 없음, window 생략")
+            continue
+
+        metrics = _calc_tail_metrics(tail)
+        cons_work = metrics['consecutive_work_tail']
+        cons_n = metrics['consecutive_night_tail']
+        last_shift = metrics['last_day_shift']
+        offs_after = metrics['offs_after_tail_nights']
+        rd = return_day
+        tail_str = ' '.join(tail)
+        print(f"[MidMonth][Return] nurse={nurse_id}: return=day{rd}, tail=[{tail_str}], "
+              f"cons_work={cons_work}, cons_n={cons_n}, last={last_shift}")
+
+        # (a) 연속 근무 K → 복귀일 OFF 강제
+        if K and cons_work >= K:
+            forced_off[nurse_id].append(rd)
+            print(f"[MidMonth][Return] nurse={nurse_id}: cons_work={cons_work}≥K={K} → day{rd} OFF 강제")
+
+        # (a-1) off window
+        if K > 0 and cons_work > 0:
+            window_end = rd + max(0, K - cons_work)
+            window_end = min(window_end, days_in_month - 1)
+            if window_end >= rd:
+                off_window_constraints[nurse_id].append([rd, window_end])
+                print(f"[MidMonth][Return] nurse={nurse_id}: off_window [{rd},{window_end}]")
+
+        # (b) N tail → forced OFF
+        two_eff2 = two_after_two if (L and cons_n >= L) else False
+        two_eff3 = two_after_three if (L and cons_n >= L) else False
+        req_offs = 0
+        if two_eff3 and cons_n >= 3:
+            req_offs = 2
+        elif two_eff2 and cons_n >= 2:
+            req_offs = 2
+        rem = max(0, req_offs - offs_after)
+        for i in range(min(2, rem)):
+            forced_off[nurse_id].append(rd + i)
+        if rem > 0:
+            print(f"[MidMonth][Return] nurse={nurse_id}: N tail={cons_n} → day{rd}..{rd+rem-1} OFF 강제")
+
+        # (c) 전환 금지
+        if last_shift == 'E' and ban_e_to_d:
+            forbidden[nurse_id][rd].append('D')
+        if last_shift == 'N' and ban_n_to_d:
+            forbidden[nurse_id][rd].append('D')
+        if last_shift == 'N' and ban_n_to_e:
+            forbidden[nurse_id][rd].append('E')
+
+        # (d) N 상한
+        if L and cons_n >= L and offs_after == 0:
+            forbidden[nurse_id][rd].append('N')
+
+    forced_off_final = {k: sorted(set(v)) for k, v in forced_off.items()}
+    forbidden_final = {k: {d: sorted(set(ss)) for d, ss in v.items()} for k, v in forbidden.items()}
+    off_cnt = sum(len(v) for v in forced_off_final.values())
+    forb_cnt = sum(len(ss) for v in forbidden_final.values() for ss in v.values())
+    ow_cnt = sum(len(v) for v in off_window_constraints.values())
+    if off_cnt or forb_cnt or ow_cnt:
+        print(f"[MidMonth] 경계 제약: forced_off {off_cnt}건, forbidden {forb_cnt}건, off_window {ow_cnt}건")
+    return {
+        'forced_off': forced_off_final,
+        'forbidden': forbidden_final,
+        'off_window_constraints': dict(off_window_constraints),
+    }
+
+
 def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, str]:
     """ShiftManage의 codes → main_code 정규화 맵을 만든다.
 
@@ -2193,6 +2487,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     if off_window_constraints:
         config_dict["off_window_constraints"] = off_window_constraints
     print('prev_month_last_is_off', prev_month_last_is_off)
+
     # ── 3) 병합 후 주입(금지/강제OFF 합집합) ──
     config_dict["initial_constraints"] = _merge_initial_constraints(
         base=cross_month_constraints,
@@ -3022,8 +3317,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     print(f"[Assignment] group_id={current_user.group_id}, year={req.year}, month={req.month}, assignments_count={len(_assignments)}")
     for _a in _assignments:
         print(f"[Assignment] id={_a.id}, nurse_id={_a.nurse_id}, reason={_a.reason}, source={_a.source_group_id}, target={_a.target_group_id}, start={_a.start_date}, end={_a.end_date}")
-    # ── 인바운드: full month / 중간 월은 target 독립 생성 (인바운드 엔진 추가) ──
-    from services.day_windows import is_source_generated_month
+    # ── 인바운드: source/target 독립 생성 — 모든 인바운드를 엔진에 추가 ──
     _inbound_assignments = []
     for a in _assignments:
         if a.reason not in ("파견", "병동이동"):
@@ -3031,10 +3325,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         if a.target_group_id != current_user.group_id:
             continue
         if a.source_group_id == current_user.group_id:
-            continue
-        _a_end = a.end_date or a.expected_end_date
-        if is_source_generated_month(a.start_date, _a_end, month_start, days_in_month):
-            print(f"[Assignment][Inbound] skip (source 생성+전달): nurse_id={a.nurse_id}")
             continue
         _inbound_assignments.append(a)
     _existing_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
@@ -3044,8 +3334,26 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             Nurse.nurse_id.in_(_inbound_nurse_ids),
             Nurse.active == 1,
         ).all()
+        # assignment의 target 설정으로 nurse 속성 오버라이드
+        _assignment_by_nurse = {str(a.nurse_id): a for a in _inbound_assignments}
         for n in _inbound_nurses:
             setattr(n, 'is_inbound', True)
+            _a = _assignment_by_nurse.get(str(n.nurse_id))
+            if _a:
+                if _a.target_team_id is not None:
+                    n.team_id = _a.target_team_id
+                if _a.target_grade is not None:
+                    n.grade = _a.target_grade
+                if _a.target_weekly_off_enabled is not None:
+                    n.weekly_off_enabled = _a.target_weekly_off_enabled
+                if _a.target_weekly_off_type is not None:
+                    setattr(n, 'weekly_off_type', _a.target_weekly_off_type)
+                if _a.target_weekly_off_weekday is not None:
+                    n.weekly_off_weekday = _a.target_weekly_off_weekday
+                if _a.target_shift_types is not None:
+                    n.is_night_nurse = _a.target_shift_types
+                if _a.target_fixed_shift is not None:
+                    n.fixed_shift = _a.target_fixed_shift
         engine_nurses.extend(_inbound_nurses)
         nurses_in_group.extend(_inbound_nurses)
         print(
@@ -3164,6 +3472,67 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         if _blocked_by_id:
             config_dict["blocked_by_nurse_id"] = _blocked_by_id
             print(f"[Assignment] blocked_by_nurse_id 적용: {len(_blocked_by_id)}명")
+        # ── mid-month 경계 window 제약 (인바운드 + 아웃바운드 복귀) ──
+        _outbound_assignments = [
+            a for a in _assignments
+            if a.reason in ("파견", "병동이동")
+            and a.source_group_id == current_user.group_id
+            and a.target_group_id is not None
+        ]
+        if _inbound_assignments or _outbound_assignments:
+            try:
+                _code2main = _build_code_to_main_map(shift_manage_data)
+                mid_constraints = build_mid_month_boundary_constraints(
+                    db, _inbound_assignments, current_user.group_id,
+                    req.year, req.month, config_dict, _code2main,
+                    outbound_assignments=_outbound_assignments,
+                )
+                _ic = config_dict.get("initial_constraints") or {}
+                for nid, days in mid_constraints.get('forced_off', {}).items():
+                    _ic.setdefault('forced_off', {}).setdefault(nid, []).extend(days)
+                    _ic['forced_off'][nid] = sorted(set(_ic['forced_off'][nid]))
+                for nid, day_shifts in mid_constraints.get('forbidden', {}).items():
+                    for d, shifts in day_shifts.items():
+                        _ic.setdefault('forbidden', {}).setdefault(nid, {}).setdefault(d, []).extend(shifts)
+                        _ic['forbidden'][nid][d] = sorted(set(_ic['forbidden'][nid][d]))
+                config_dict["initial_constraints"] = _ic
+                mid_ow = mid_constraints.get('off_window_constraints', {})
+                if mid_ow:
+                    ow = config_dict.get("off_window_constraints") or {}
+                    for nid, windows in mid_ow.items():
+                        ow.setdefault(nid, []).extend(windows)
+                    config_dict["off_window_constraints"] = ow
+            except Exception as e:
+                print(f"[MidMonth] mid-month 경계 제약 생성 실패(무시): {e}")
+        # ── 상대 그룹 OFF 카운트 → off cap 조정용 ──
+        _other_group_offs: dict[str, int] = {}
+        _off_codes = {'O', 'OFF', '주'}
+        for a in (_inbound_assignments + _outbound_assignments):
+            nid = str(a.nurse_id)
+            other_gid = a.source_group_id if a.target_group_id == current_user.group_id else a.target_group_id
+            if not other_gid:
+                continue
+            other_sid = _query_schedule_id_for_month(db, other_gid, req.year, req.month)
+            if not other_sid:
+                continue
+            try:
+                other_entries = (
+                    db.query(ScheduleEntry)
+                    .filter(ScheduleEntry.schedule_id == other_sid, ScheduleEntry.nurse_id == nid)
+                    .all()
+                )
+                off_cnt = sum(
+                    1 for e in other_entries
+                    if str(e.shift_id).upper() in _off_codes
+                    or str(getattr(e, 'default_shift', '') or '').upper() in _off_codes
+                )
+                if off_cnt > 0:
+                    _other_group_offs[nid] = off_cnt
+                    print(f"[OffCap][CrossGroup] nurse={nid}: other_group({other_gid}) OFF={off_cnt}건")
+            except Exception as e:
+                print(f"[OffCap][CrossGroup] nurse={nid} OFF 카운트 실패(무시): {e}")
+        if _other_group_offs:
+            config_dict["other_group_offs"] = _other_group_offs
         # ── 커버리지 제외: 파견/병동이동 기간에는 source 커버리지에서 제외 ──
         _cov_exclude: dict[str, set[int]] = {}
         for a in _assignments:
@@ -3173,10 +3542,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 continue
             if a.target_group_id is None:
                 continue
-            # source 생성 월만 커버리지 제외 (full month/중간 월은 target 독립 → 제외 안 함)
-            _a_end = a.end_date or a.expected_end_date
-            if not is_source_generated_month(a.start_date, _a_end, month_start, days_in_month):
-                continue
+            # source/target 독립 생성: assignment 기간은 항상 커버리지 제외
             # assignment 기간과 월의 교집합 → 커버리지 제외 day indices
             _month_end = month_start + timedelta(days=days_in_month - 1)
             _a_end_actual = a.end_date or a.expected_end_date or _month_end
@@ -3676,18 +4042,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         raise Exception(validation_error)
 
     _persist_entries(db, schedule, generated, req)
-    # ── 파견/병동이동 전달 entry 복사: source 마감 log 기반으로 shift 복사 + 히스토리 기록 ──
-    try:
-        from services.assignment_service import copy_transferred_entries
-        _n_copied = copy_transferred_entries(
-            db, target_schedule_id=schedule.schedule_id,
-            target_group_id=current_user.group_id,
-            year=req.year, month=req.month,
-        )
-        if _n_copied > 0:
-            db.commit()
-    except Exception as e:
-        print(f"[Assignment] 전달 entry 복사 실패: {e}")
+    # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
     _group_nids = {str(n.nurse_id) for n in nurses_in_group}
     _entry_nids = {
