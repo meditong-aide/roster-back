@@ -32,6 +32,8 @@ _GROUP_ROLE_MAP: dict[tuple[str, str], tuple[str, str]] = {
 # 환경별 DB명: 운영=eun_roster, 개발=eun_roster_dev
 _ROSTER_DB = os.getenv("EUN_DB_NAME", "eun_roster")
 
+_TARGET_ORGS = ('42병동파트', '52병동파트', '중환자간호파트')
+
 _QUERY_NEW_NURSES = f"""
 WITH temp AS (
     SELECT a.employeename
@@ -45,7 +47,7 @@ WITH temp AS (
              WHERE g.office_id = %s
            ) b
         ON a.memberid = b.account_id
-     WHERE a.orgnm IN (N'42병동파트', N'52병동파트', N'중환자간호파트')
+     WHERE a.orgnm IN (%s, %s, %s)
        AND b.name IS NULL
 )
 SELECT m.EmpSeqNo
@@ -100,7 +102,7 @@ def sync_new_nurses(db: Session) -> dict:
     Returns:
         {"added": int, "skipped": int, "errors": list[dict]}
     """
-    rows = msdb_manager.fetch_all(_QUERY_NEW_NURSES, params=(OFFICE_ID,), charset='UTF-8')
+    rows = msdb_manager.fetch_all(_QUERY_NEW_NURSES, params=(OFFICE_ID, *_TARGET_ORGS))
     if not rows:
         return {"added": 0, "skipped": 0, "errors": []}
 
