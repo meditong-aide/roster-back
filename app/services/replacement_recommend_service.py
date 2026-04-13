@@ -1039,9 +1039,13 @@ def _evaluate_segment_single_nurse(
         nurse_pk_row = schedule_shift_pk_map.get(cid, [])
         total = 0.0
         feasible = True
+        _seg_blocked = (assignment_blocked or {}).get(cid, set())
         for slot in seg_slots:
             day_idx = slot.date.day - 1
             if day_idx >= len(nurse_sched):
+                feasible = False
+                break
+            if slot.date in _seg_blocked:
                 feasible = False
                 break
             cur_shift = nurse_sched[day_idx]
@@ -1312,7 +1316,7 @@ def recommend_replacement_candidates(
     if req.target_nurse_id not in schedule_map:
         raise ValueError("target_nurse_id not found in schedule entries")
 
-    nurses = db.query(Nurse).filter(Nurse.group_id == target_group_id).all()
+    nurses = db.query(Nurse).filter(Nurse.group_id == target_group_id).order_by(Nurse.nurse_id).all()
     nurse_by_id = {str(n.nurse_id): n for n in nurses}
 
     assignment_blocked = _build_assignment_blocked_dates(
@@ -1662,7 +1666,7 @@ def recommend_replacement_candidates(
         for candidate_id, ctx in candidate_pool:
             ctx.fairness = fairness_map.get(candidate_id, 0.5)
 
-        scored = sorted(candidate_pool, key=lambda item: _final_score(item[1]), reverse=True)
+        scored = sorted(candidate_pool, key=lambda item: (_final_score(item[1]), item[1].grade_fit, item[0]), reverse=True)
         if ranking_scope == "ALL":
             non_vacation = [item for item in scored if not item[1].assigned_is_vacation]
             vacation = [item for item in scored if item[1].assigned_is_vacation]
