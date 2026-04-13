@@ -2878,6 +2878,41 @@ def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] |
                     n_required += v
 
         effective_off_days, off_source = resolve_effective_off_days(cfg)
+        # max coverage가 있으면 auto_max로 off_days 클램핑
+        max_by_day = getattr(cfg, "daily_shift_requirements_max_by_day", None)
+        _has_max = isinstance(max_by_day, list) and any(
+            any(int(v or 0) > 0 for v in dm.values())
+            for dm in max_by_day if isinstance(dm, dict)
+        )
+        if _has_max:
+            import math
+            _blocked_set_diag = set()
+            blocked_by_nurse_diag = getattr(roster_system, "blocked_by_nurse", None) or {}
+            if blocked_by_nurse_diag:
+                _blocked_set_diag = set(blocked_by_nurse_diag.keys())
+            _total_capacity_diag = 0
+            for _dd in range(num_days):
+                _day_min_sum = 0
+                by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+                if isinstance(by_day, list) and _dd < len(by_day) and isinstance(by_day[_dd], dict):
+                    _day_min_sum = sum(int(v or 0) for v in by_day[_dd].values())
+                elif hasattr(cfg, "daily_shift_requirements") and isinstance(cfg.daily_shift_requirements, dict):
+                    _day_min_sum = sum(int(v or 0) for v in cfg.daily_shift_requirements.values())
+                join = getattr(roster_system, "join", None) or []
+                leave = getattr(roster_system, "leave", None) or []
+                N = len(nurses)
+                _day_active = sum(
+                    1 for nn in range(N)
+                    if nn < len(join) and nn < len(leave)
+                    and join[nn] <= _dd <= leave[nn]
+                    and _dd not in (blocked_by_nurse_diag.get(nn, set()))
+                )
+                _total_capacity_diag += max(0, _day_active - _day_min_sum)
+            _n_full = max(1, sum(1 for nn in range(len(nurses)) if nn not in _blocked_set_diag))
+            _auto_max_diag = max(1, int(_total_capacity_diag / _n_full))
+            if _auto_max_diag < int(effective_off_days or 0):
+                effective_off_days = _auto_max_diag
+                off_source = f"auto_max(coverage)"
         max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
         total_capacity = nurse_count * max_work_per_nurse
         if total_required > total_capacity:

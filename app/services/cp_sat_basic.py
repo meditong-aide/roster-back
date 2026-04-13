@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 import logging
+import math
 import time
 import numpy as np
 from typing import List, Dict, Optional, Tuple
@@ -2612,7 +2613,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     coverage_exclude_cells: set[tuple[int, int]] = getattr(rs, "coverage_exclude_cells", set()) or set()
     cfg = rs.config
     max_by_day = getattr(cfg, "daily_shift_requirements_max_by_day", None)
-    print(f"[MinMaxCoverage] max_by_day type={type(max_by_day).__name__}, len={len(max_by_day) if isinstance(max_by_day, list) else 'N/A'}, sample={max_by_day[0] if isinstance(max_by_day, list) and max_by_day else 'None'}")
+    _has_any_max = isinstance(max_by_day, list) and any(
+        any(int(v or 0) > 0 for v in day_map.values())
+        for day_map in max_by_day if isinstance(day_map, dict)
+    )
+    print(f"[MinMaxCoverage] max_by_day type={type(max_by_day).__name__}, len={len(max_by_day) if isinstance(max_by_day, list) else 'N/A'}, sample={max_by_day[0] if isinstance(max_by_day, list) and max_by_day else 'None'}, has_any_max={_has_any_max}")
+    m_coverage_shortage_vars = []  # M soft min shortage (max coverage 없을 때)
+    max_coverage_excess_vars = []  # max coverage 초과 soft 패널티
     next_month_head_req = getattr(cfg, "next_month_head_requirements", None) or []
     for d in range(D):
         # 일자별 요구치(min): 룩어헤드 일자는 next_month_head_requirements 또는 기본값
@@ -2663,14 +2670,26 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     over_vars_by_day.setdefault(d, {})[code] = ov
                     continue
-                m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
-                m.Add(assigned_m_bucket <= m_cap_non_fixed)
                 m_cap_max = max(0, int(req_max_raw - fixed_m_bucket)) if req_max_raw > 0 else 0
+                # M 상한: max coverage 있으면 hard, 없으면 min으로 hard cap
                 if m_cap_max > 0:
                     m.Add(assigned_m_bucket <= m_cap_max)
-                ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
-                over_vars_by_day.setdefault(d, {})[code] = ov
-                continue
+                else:
+                    m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
+                    m.Add(assigned_m_bucket <= m_cap_non_fixed)
+                # M min: max coverage 있으면 hard(D/E/N과 동일), 없으면 soft(shortage 허용)
+                if not _has_any_max:
+                    m_need = max(0, int(req_raw - fixed_m_bucket))
+                    if m_need > 0:
+                        m_sh = m.NewIntVar(0, m_need, f"m_short_{d}")
+                        m.Add(assigned_m_bucket + m_sh >= m_need)
+                        m_coverage_shortage_vars.append(m_sh)
+                    ov = m.NewIntVar(0, N, f"over_{d}_{code}")
+                    if need > 0:
+                        m.Add(ov >= assigned - need)
+                    over_vars_by_day.setdefault(d, {})[code] = ov
+                    continue
+                # max coverage 있으면 아래 일반 하드 로직으로 처리
             if code in zero_demand_block_codes and req_raw == 0:
                 m.Add(assigned == 0)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
@@ -2679,13 +2698,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             # min 제약: assigned >= need (하드)
             if need > 0:
                 m.Add(assigned >= need)
-            # max 제약: need_max > 0이면 상한 적용 (하드) + max 목표 유도 (소프트)
+            # max 제약: hard (상한 초과 불가)
             if need_max > 0:
                 m.Add(assigned <= need_max)
-                # max 목표 유도: assigned < need_max이면 패널티
-                max_short = m.NewIntVar(0, need_max, f"max_short_{d}_{code}")
-                m.Add(max_short >= need_max - assigned)
-                coverage_shortage_vars.append((max_short, code))
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
             elif need > 0:
@@ -2695,10 +2710,6 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     # ───────────── 2-D. Max coverage Off 균등 분배 ───
     max_cov_off_equalize_terms = []
-    _has_any_max = isinstance(max_by_day, list) and any(
-        any(int(v or 0) > 0 for v in day_map.values())
-        for day_map in max_by_day if isinstance(day_map, dict)
-    )
     if _has_any_max:
         off_idx = rs.config.shift_types.index('O')
         nurse_off_vars = []
@@ -3031,30 +3042,66 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
 
         # 월 최소/최대 OFF (당월 D_phys만 합산)
-        # max coverage가 설정된 경우: Off 가용량 체크 후 feasible하면 Off cap 적용
+        # max coverage가 설정된 경우: min/max coverage 기반으로 OFF cap 자동 조정
         try:
             _off_cap_skip = False
+            _auto_min_off = None  # max coverage 기반 자동 최소 OFF
+            _auto_max_off = None  # min coverage 기반 자동 최대 OFF
             if _has_any_max:
                 _blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
-                _active_count = sum(1 for nn in range(N) if join[nn] <= 0 <= leave[nn] and nn not in _blocked_set)
-                _total_min_off = 0
+                _total_off_capacity = 0  # min coverage 기준 최대 OFF 가용량
+                _total_off_required = 0  # max coverage 기준 최소 OFF 필요량
+                max_by_day = getattr(cfg, "daily_shift_requirements_max_by_day", None)
                 for _dd in range(D_phys):
                     _day_min_sum = 0
+                    _day_max_sum = 0
                     if hasattr(cfg, "daily_shift_requirements_by_day") and isinstance(cfg.daily_shift_requirements_by_day, list) and _dd < len(cfg.daily_shift_requirements_by_day):
                         _day_min_sum = sum(int(v or 0) for v in cfg.daily_shift_requirements_by_day[_dd].values())
                     elif hasattr(cfg, "daily_shift_requirements") and isinstance(cfg.daily_shift_requirements, dict):
                         _day_min_sum = sum(int(v or 0) for v in cfg.daily_shift_requirements.values())
-                    _day_active = sum(1 for nn in range(N) if join[nn] <= _dd <= leave[nn] and nn not in _blocked_set)
-                    _total_min_off += max(0, _day_active - _day_min_sum)
-                _off_cap_needed = _active_count * int(getattr(cfg, "off_days", 9) or 9)
-                if _total_min_off >= _off_cap_needed:
-                    _off_cap_skip = False
-                    if n == 0:
-                        print(f"[OffCap][MaxCov] Off cap 적용 (가용 {_total_min_off} >= 필요 {_off_cap_needed})")
-                else:
-                    _off_cap_skip = True
-                    if n == 0:
-                        print(f"[OffCap][MaxCov] Off cap 스킵 (가용 {_total_min_off} < 필요 {_off_cap_needed})")
+                    if isinstance(max_by_day, list) and _dd < len(max_by_day) and isinstance(max_by_day[_dd], dict):
+                        # shift type별: max >= min이면 max 사용, 아니면 min으로 폴백
+                        _day_min_map = {}
+                        if hasattr(cfg, "daily_shift_requirements_by_day") and isinstance(cfg.daily_shift_requirements_by_day, list) and _dd < len(cfg.daily_shift_requirements_by_day):
+                            _day_min_map = cfg.daily_shift_requirements_by_day[_dd]
+                        elif hasattr(cfg, "daily_shift_requirements") and isinstance(cfg.daily_shift_requirements, dict):
+                            _day_min_map = cfg.daily_shift_requirements
+                        _all_codes = set(list(max_by_day[_dd].keys()) + (list(_day_min_map.keys()) if isinstance(_day_min_map, dict) else []))
+                        for _code in _all_codes:
+                            if _code == 'O':
+                                continue
+                            _mv = int((max_by_day[_dd].get(_code) or 0))
+                            _minv = int((_day_min_map.get(_code) or 0) if isinstance(_day_min_map, dict) else 0)
+                            if _mv > 0 and _mv >= _minv:
+                                _day_max_sum += _mv
+                            else:
+                                _day_max_sum += _minv
+                    _day_active = sum(
+                        1 for nn in range(N)
+                        if join[nn] <= _dd <= leave[nn]
+                        and _dd not in (blocked_by_nurse.get(nn, set()) if blocked_by_nurse else set())
+                    )
+                    _total_off_capacity += max(0, _day_active - _day_min_sum)
+                    if _day_max_sum > 0:
+                        _total_off_required += max(0, _day_active - _day_max_sum)
+                _n_full = max(1, sum(1 for nn in range(N) if nn not in _blocked_set))
+                _auto_min_off = max(1, int(math.ceil(_total_off_required / _n_full)))
+                _auto_max_off = max(_auto_min_off, int(_total_off_capacity / _n_full))
+                # 안전장치: required > capacity이면 auto 값이 비현실적 → 비활성화
+                if _total_off_required > _total_off_capacity:
+                    print(
+                        f"[OffCap][MaxCov] required({_total_off_required}) > capacity({_total_off_capacity})"
+                        f" → auto 조정 비활성화 (max coverage 설정 오류 또는 인원 부족)"
+                    )
+                    _auto_min_off = None
+                    _auto_max_off = None
+                _configured_off = int(getattr(cfg, "off_days", 9) or 9)
+                if n == 0:
+                    print(
+                        f"[OffCap][MaxCov] 자동 조정: off_capacity={_total_off_capacity}, "
+                        f"off_required={_total_off_required}, N={_n_full}, "
+                        f"auto_min={_auto_min_off}, auto_max={_auto_max_off}, configured={_configured_off}"
+                    )
             if not _off_cap_skip and not bool(getattr(nu, "is_weekend_off", False)):
                 phys_range_off = month_total_day_range(T0, T1, D_phys)
                 _n_blocked_set = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
@@ -3075,6 +3122,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
                 nonvac_active_days = max(0, avail_days - vacation_cnt)
                 min_off_required = int(off_bounds["min_off_required"])
+                # max coverage 기반 자동 조정: max_off만 제한, min_off는 기존 비례축소 유지
+                # (min_off를 auto_max로 올리면 커버리지 부족 시 INFEASIBLE 발생)
                 # 상대 그룹 OFF 차감: 합산 기준 off cap 조정
                 _other_offs_map = getattr(rs, "other_group_offs", None) or {}
                 _nurse_db_id = str(getattr(nu, "nurse_id", getattr(nu, "db_id", "")))
@@ -3153,24 +3202,27 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             _base_max + _extra_off,
                             nonvac_active_days,
                         )
-                        # max coverage 설정 시: Off cap max 상한 미적용 (min만 유지)
-                        # 단, cross-group 조정 간호사는 max_off 강제 적용
-                        if not _has_any_max or _other_offs > 0:
-                            m.Add(
-                                sum(
-                                    X(n, d, off)
-                                    for d in phys_range_off
-                                    if (n, d) not in vacation_off_cells
-                                )
-                                <= max_off_allowed
+                        # max coverage 자동 조정: max_off도 auto 값으로 cap
+                        if _auto_max_off is not None:
+                            _ratio = nonvac_active_days / max(1, D_phys)
+                            _scaled_auto_max = max(min_off_required, int(_auto_max_off * _ratio))
+                            max_off_allowed = min(max_off_allowed, _scaled_auto_max)
+                            max_off_allowed = max(max_off_allowed, min_off_required)
+                        m.Add(
+                            sum(
+                                X(n, d, off)
+                                for d in phys_range_off
+                                if (n, d) not in vacation_off_cells
                             )
+                            <= max_off_allowed
+                        )
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
                             f"cap_semantics={off_cap_semantics}, vac_cnt={vacation_cnt}, "
                             f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
                             f"min_off={min_off_required}, max_off={max_off_allowed}"
                             + (f", extra_off={_extra_off}" if _extra_off > 0 else "")
-                            + (", max_off_cap=SKIP(max_coverage)" if _has_any_max else "")
+                            + (f", auto_max={_auto_max_off}" if _auto_max_off is not None else "")
                         )
         except Exception as exc:
             print(
@@ -3319,6 +3371,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         fixed_cnt=fixed_cnt,
         blocked_by_nurse=blocked_by_nurse,
     )
+    # M soft min shortage 패널티 (max coverage 없을 때만 활성)
+    for m_sh in m_coverage_shortage_vars:
+        obj.append(-FALLBACK_COVERAGE_SHORT_WEIGHT * m_sh)
     # 고립 OFF 슬랙 패널티(강제 불가 시에만 허용)
     for slack_var, w in isolated_off_slacks:
         if w > 0:
