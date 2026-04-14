@@ -434,19 +434,23 @@ def optimize_fallback_lex_hard_first(
         try:
             base_min_off = effective_off_days
             extra_allowed = effective_max_extra
-            # print('7', extra_allowed)
-            max_off_allowed_per_person = base_min_off + extra_allowed
-            # print('8', max_off_allowed_per_person)
+            # 2N2O/3N2O 활성 시 자동 확장분 반영
+            _noff_extra = 0
+            if bool(cfg.two_offs_after_two_nig) or bool(cfg.two_offs_after_three_nig):
+                _noff_extra = 2
+            effective_extra = extra_allowed + _noff_extra
+            max_off_allowed_per_person = base_min_off + effective_extra
             if bool(cfg.two_offs_after_two_nig) and max_off_allowed_per_person < base_min_off + 5:
                 est_extra_off_from_2n2o = (
                     int(total_need_n / len(n_allowed_indices) * 0.5)
                     if n_allowed_indices
                     else 0
                 )
-                if est_extra_off_from_2n2o > extra_allowed:
+                if est_extra_off_from_2n2o > effective_extra:
                     print(
                         f"{logger_prefix} [FallbackFeasibility][WARN] "
-                        f"2N→2OFF 하드가 예상 강제 OFF({est_extra_off_from_2n2o})가 월 최대 OFF 여유({extra_allowed})를 초과할 수 있습니다. "
+                        f"2N→2OFF 하드가 예상 강제 OFF({est_extra_off_from_2n2o})가 월 최대 OFF 여유({effective_extra}, "
+                        f"config={extra_allowed}+자동확장={_noff_extra})를 초과할 수 있습니다. "
                         f"(min_off={base_min_off}, max_allowed={max_off_allowed_per_person}) "
                         f"→ 2N→2OFF 하드 + 월 최대 OFF 상한 하드가 충돌하여 infeasible 가능성이 큽니다."
                     )
@@ -1057,6 +1061,7 @@ def optimize_fallback_lex_hard_first(
         short_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
         over_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
         zero_demand_block_codes = {"D", "E", "N", "M"}
+        _fb_daily_assigned_by_code: dict[str, list] = {}  # 일자별 커버리지 균등화용
         for d in range(D):
             if (
                 hasattr(cfg, "daily_shift_requirements_by_day")
@@ -1156,6 +1161,8 @@ def optimize_fallback_lex_hard_first(
                     sh = m.NewIntVar(0, N, f"short_{d}_{code}")
                     m.Add(assigned + sh >= need)
                 # max 제약: hard (상한 초과 불가), _relax_coverage 시 soft
+                if need_max > 0 and d < D_phys:
+                    _fb_daily_assigned_by_code.setdefault(code, []).append((d, assigned, need))
                 if need_max > 0 and not _relax_coverage:
                     m.Add(assigned <= need_max)
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
@@ -1470,13 +1477,9 @@ def optimize_fallback_lex_hard_first(
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
                     xn2 = X(n, d - 2, night_idx)
-                    need = X(n, d + 1, off_idx) + X(n, d + 2, off_idx)
-                    miss = m.NewIntVar(0, 2, f"rec3n2o_{n}_{d}")
-                    m.Add(miss == 0).OnlyEnforceIf(xn0.Not())
-                    m.Add(miss == 0).OnlyEnforceIf(xn1.Not())
-                    m.Add(miss == 0).OnlyEnforceIf(xn2.Not())
-                    m.Add(miss == 2 - need).OnlyEnforceIf([xn0, xn1, xn2])
-                    safety["rec_3n2o"].append(miss)
+                    m.Add(
+                        X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
+                    ).OnlyEnforceIf([xn0, xn1, xn2])
         if cfg.two_offs_after_two_nig:
             _n_offs_after_map = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
@@ -1514,13 +1517,13 @@ def optimize_fallback_lex_hard_first(
                             X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
                         ).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
                 for d in range(T0 + 1, T1 - 1):
+                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
+                        continue
                     xn_prev = X(n, d - 1, night_idx)
                     xn_curr = X(n, d, night_idx)
                     xn_next = X(n, d + 1, night_idx)
-                    end_block = m.NewBoolVar(f"end_2n_soft_{n}_{d}")
+                    end_block = m.NewBoolVar(f"end_2n_hard_{n}_{d}")
                     m.Add(end_block == xn_next.Not())
-                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
-                        continue
                     m.Add(
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
                     ).OnlyEnforceIf([xn_prev, xn_curr, end_block])
@@ -1603,6 +1606,9 @@ def optimize_fallback_lex_hard_first(
             _fb_n_full = max(1, sum(1 for nn in range(N) if nn not in _fb_blocked_set))
             _fb_auto_min_off = max(1, int(_math.ceil(_fb_total_required / _fb_n_full)))
             _fb_auto_max_off = max(_fb_auto_min_off, int(_fb_total_capacity / _fb_n_full))
+            # 2N2O/3N2O 하드 제약 활성 시 회복 OFF 여유 확보
+            if getattr(cfg, "two_offs_after_two_nig", False) or getattr(cfg, "two_offs_after_three_nig", False):
+                _fb_auto_max_off += 2
             if _fb_total_required > _fb_total_capacity:
                 print(
                     f"{logger_prefix} [OffCap][MaxCov] required({_fb_total_required}) > capacity({_fb_total_capacity})"
@@ -1615,6 +1621,9 @@ def optimize_fallback_lex_hard_first(
                 f"required={_fb_total_required}, N={_fb_n_full}, "
                 f"auto_min={_fb_auto_min_off}, auto_max={_fb_auto_max_off}"
             )
+        # N 전일 금지 간호사 집합 (2N2O/3N2O OFF 확장용)
+        from services.cp_sat.objective_terms import _n_forbid_n_set
+        _fb_n_forbid = _n_forbid_n_set(roster_system, join, leave)
         try:
             # 개인별 O 정량 할당(나이트 전담 제외, 주휴 제외한 순수 O 목표)
             if off_idx is not None and effective_off_days > 0:
@@ -1757,16 +1766,14 @@ def optimize_fallback_lex_hard_first(
                         total_cap_effective = max(0, avail_days - 15) + relax_level
                     else:
                         base_cap = max_off_allowed_from_policy
-                        # weekend_off 간호사: n_tail(2N2O/3N2O) 및 off_window로 인한
-                        # 추가 평일 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
+                        # 2N2O/3N2O 하드 제약으로 인한 추가 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
                         _extra_off_fb = 0
+                        if n not in _fb_n_forbid and (
+                            getattr(cfg, "two_offs_after_two_nig", False)
+                            or getattr(cfg, "two_offs_after_three_nig", False)
+                        ):
+                            _extra_off_fb += 2
                         if is_weekend_off:
-                            _n_tail_fb = getattr(roster_system, "prev_month_n_tail_by_idx", {}).get(n, 0)
-                            if _n_tail_fb >= 1 and (
-                                getattr(cfg, "two_offs_after_two_nig", False)
-                                or getattr(cfg, "two_offs_after_three_nig", False)
-                            ):
-                                _extra_off_fb += 2
                             _ow_data_fb = (getattr(roster_system, "off_window_constraints", {}) or {}).get(n, []) or []
                             for (_ws, _we) in _ow_data_fb:
                                 _wl = max(T0, _ws)
@@ -1866,6 +1873,35 @@ def optimize_fallback_lex_hard_first(
                 add_grade_constraints_fn=add_grade_constraints_fn,
                 blocked_by_nurse=blocked_by_nurse,
             )
+            # 일자별 커버리지 균등화 (min~max 범위 내 고른 배정)
+            if _fb_has_any_max and _fb_daily_assigned_by_code:
+                for _eq_code, _eq_entries in _fb_daily_assigned_by_code.items():
+                    if len(_eq_entries) < 2:
+                        continue
+                    _eq_vars = []
+                    for _eq_d, _eq_assigned, _eq_need in _eq_entries:
+                        _eq_v = m.NewIntVar(0, N, f"fb_dcov_{_eq_code}_{_eq_d}")
+                        m.Add(_eq_v == _eq_assigned)
+                        _eq_vars.append(_eq_v)
+                        # min 초과분 패널티: min에 가깝게 유도
+                        if _eq_need > 0:
+                            _eq_excess = m.NewIntVar(0, N, f"fb_dcov_excess_{_eq_code}_{_eq_d}")
+                            m.Add(_eq_excess >= _eq_v - _eq_need)
+                            obj.append(-80 * _eq_excess)
+                    # 글로벌 range: 블록 쏠림 방지
+                    _eq_max = m.NewIntVar(0, N, f"fb_dcov_max_{_eq_code}")
+                    _eq_min = m.NewIntVar(0, N, f"fb_dcov_min_{_eq_code}")
+                    m.AddMaxEquality(_eq_max, _eq_vars)
+                    m.AddMinEquality(_eq_min, _eq_vars)
+                    _eq_range = m.NewIntVar(0, N, f"fb_dcov_range_{_eq_code}")
+                    m.Add(_eq_range == _eq_max - _eq_min)
+                    obj.append(-150 * _eq_range)
+                    # 인접일 평활화: 급변 방지
+                    for _i in range(1, len(_eq_vars)):
+                        _adj = m.NewIntVar(0, N, f"fb_dcov_adj_{_eq_code}_{_i}")
+                        m.Add(_adj >= _eq_vars[_i] - _eq_vars[_i - 1])
+                        m.Add(_adj >= _eq_vars[_i - 1] - _eq_vars[_i])
+                        obj.append(-60 * _adj)
             m.Maximize(sum(obj))
 
         return (

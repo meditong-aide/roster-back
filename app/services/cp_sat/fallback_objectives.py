@@ -7,6 +7,7 @@ from ortools.sat.python import cp_model
 from services.cp_sat.hardcoded_weights import (
     FALLBACK_EXPERIENCE_SHORT_PENALTY,
     N_ONLY_NIGHT_BONUS,
+    PREFER_3N_BLOCK_PENALTY,
     PREFERENCE_SCORE_SCALE,
 )
 from services.cp_sat.allowed_shift_types import is_n_only_profile
@@ -371,6 +372,51 @@ def build_fallback_stage3_objective_terms(
     except Exception as e:
         print("grade_constraints 예외 발생")
         print("e", e)
+        pass
+
+    # 3N 블록 유도: 2N2O+3N2O 동시 활성 시 2N 블록에 소프트 페널티
+    try:
+        cfg = roster_system.config
+        _both_noff = (
+            bool(getattr(cfg, "two_offs_after_two_nig", False))
+            and bool(getattr(cfg, "two_offs_after_three_nig", False))
+        )
+        if _both_noff and PREFER_3N_BLOCK_PENALTY > 0:
+            night_idx = cfg.shift_types.index("N")
+            N = len(roster_system.nurses)
+            n_forbid = set(getattr(roster_system, "n_forbid_n", set()) or set())
+            for n in range(N):
+                if n in n_forbid:
+                    continue
+                T0, T1 = join[n], leave[n]
+                for d in range(T0 + 1, T1):
+                    if blocked_by_nurse and d in blocked_by_nurse.get(n, set()):
+                        continue
+                    xn_prev = X(n, d - 1, night_idx)
+                    xn_curr = X(n, d, night_idx)
+                    if d - 2 >= T0 and not (blocked_by_nurse and (d - 2) in blocked_by_nurse.get(n, set())):
+                        not_prev2 = X(n, d - 2, night_idx).Not()
+                    else:
+                        not_prev2 = None
+                    if d + 1 <= T1 and not (blocked_by_nurse and (d + 1) in blocked_by_nurse.get(n, set())):
+                        not_next = X(n, d + 1, night_idx).Not()
+                    else:
+                        not_next = None
+                    is_2n = m.NewBoolVar(f"fb_is2n_{n}_{d}")
+                    conds = [xn_prev, xn_curr]
+                    if not_prev2 is not None:
+                        conds.append(not_prev2)
+                    if not_next is not None:
+                        conds.append(not_next)
+                    m.Add(sum(conds) - len(conds) + 1 <= is_2n)
+                    m.Add(is_2n <= xn_prev)
+                    m.Add(is_2n <= xn_curr)
+                    if not_prev2 is not None:
+                        m.Add(is_2n <= not_prev2)
+                    if not_next is not None:
+                        m.Add(is_2n <= not_next)
+                    obj.append(-PREFER_3N_BLOCK_PENALTY * is_2n)
+    except Exception:
         pass
 
     return obj

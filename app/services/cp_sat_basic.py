@@ -2620,6 +2620,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     print(f"[MinMaxCoverage] max_by_day type={type(max_by_day).__name__}, len={len(max_by_day) if isinstance(max_by_day, list) else 'N/A'}, sample={max_by_day[0] if isinstance(max_by_day, list) and max_by_day else 'None'}, has_any_max={_has_any_max}")
     m_coverage_shortage_vars = []  # M soft min shortage (max coverage 없을 때)
     max_coverage_excess_vars = []  # max coverage 초과 soft 패널티
+    daily_assigned_by_code: dict[str, list] = {}  # 일자별 커버리지 균등화용 {code: [(day, assigned_var, need, need_max)]}
     next_month_head_req = getattr(cfg, "next_month_head_requirements", None) or []
     for d in range(D):
         # 일자별 요구치(min): 룩어헤드 일자는 next_month_head_requirements 또는 기본값
@@ -2703,6 +2704,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(assigned <= need_max)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
+                # 일자별 커버리지 균등화용 수집 (물리일만)
+                if d < D_phys:
+                    daily_assigned_by_code.setdefault(code, []).append((d, assigned, need, need_max))
             elif need > 0:
                 ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                 m.Add(ov >= assigned - need)
@@ -2737,6 +2741,39 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             # Off 분산 패널티 (가중치 높게 설정하여 균등 분배 유도)
             max_cov_off_equalize_terms.append(-200 * off_range)
             print(f"[MaxCoverage] Off 균등 분배 제약 추가: 간호사 {len(nurse_off_vars)}명")
+
+    # ───────────── 2-E. 일자별 커버리지 균등화 (min~max 범위 내 고른 배정) ───
+    daily_cov_equalize_terms = []
+    if _has_any_max and daily_assigned_by_code:
+        for code, day_entries in daily_assigned_by_code.items():
+            if len(day_entries) < 2:
+                continue
+            assigned_vars = []
+            for d, assigned_expr, _need, _need_max in day_entries:
+                av = m.NewIntVar(0, N, f"dcov_{code}_{d}")
+                m.Add(av == assigned_expr)
+                assigned_vars.append(av)
+                # min 초과분 패널티: min에 가깝게 유도
+                if _need > 0:
+                    excess = m.NewIntVar(0, N, f"dcov_excess_{code}_{d}")
+                    m.Add(excess >= av - _need)
+                    daily_cov_equalize_terms.append(-80 * excess)
+            # 글로벌 range: 월 전체에서 최대-최소 편차 최소화 (블록 쏠림 방지)
+            cov_max = m.NewIntVar(0, N, f"dcov_max_{code}")
+            cov_min = m.NewIntVar(0, N, f"dcov_min_{code}")
+            m.AddMaxEquality(cov_max, assigned_vars)
+            m.AddMinEquality(cov_min, assigned_vars)
+            cov_range = m.NewIntVar(0, N, f"dcov_range_{code}")
+            m.Add(cov_range == cov_max - cov_min)
+            daily_cov_equalize_terms.append(-150 * cov_range)
+            # 인접일 평활화: 연속된 날 급변 방지
+            for i in range(1, len(assigned_vars)):
+                diff = m.NewIntVar(0, N, f"dcov_adj_{code}_{i}")
+                m.Add(diff >= assigned_vars[i] - assigned_vars[i - 1])
+                m.Add(diff >= assigned_vars[i - 1] - assigned_vars[i])
+                daily_cov_equalize_terms.append(-60 * diff)
+        if daily_cov_equalize_terms:
+            print(f"[MaxCoverage] 일자별 커버리지 균등화 제약 추가: {list(daily_assigned_by_code.keys())}")
 
     # shorthand indices
     idx = {c: rs.config.shift_types.index(c) for c in ('D', 'E', 'N', 'O')}
@@ -3087,6 +3124,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 _n_full = max(1, sum(1 for nn in range(N) if nn not in _blocked_set))
                 _auto_min_off = max(1, int(math.ceil(_total_off_required / _n_full)))
                 _auto_max_off = max(_auto_min_off, int(_total_off_capacity / _n_full))
+                # 2N2O/3N2O 하드 제약 활성 시 회복 OFF 여유 확보
+                if getattr(cfg, "two_offs_after_two_nig", False) or getattr(cfg, "two_offs_after_three_nig", False):
+                    _auto_max_off += 2
                 # 안전장치: required > capacity이면 auto 값이 비현실적 → 비활성화
                 if _total_off_required > _total_off_capacity:
                     print(
@@ -3179,16 +3219,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                     else:
                         _base_max = int(off_bounds["max_off_allowed"])
-                        # weekend_off 간호사: n_tail(2N2O/3N2O) 및 off_window로 인한
-                        # 추가 평일 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
+                        # 2N2O/3N2O 하드 제약으로 인한 추가 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
                         _extra_off = 0
+                        if n not in n_forbid_n and (
+                            getattr(cfg, "two_offs_after_two_nig", False)
+                            or getattr(cfg, "two_offs_after_three_nig", False)
+                        ):
+                            _extra_off += 2
                         if bool(getattr(nu, "is_weekend_off", False)):
-                            _n_tail_cap = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
-                            if _n_tail_cap >= 1 and (
-                                getattr(cfg, "two_offs_after_two_nig", False)
-                                or getattr(cfg, "two_offs_after_three_nig", False)
-                            ):
-                                _extra_off += 2
                             _ow_data = (getattr(rs, "off_window_constraints", {}) or {}).get(n, []) or []
                             for (_ws, _we) in _ow_data:
                                 _wl = max(T0, _ws)
@@ -3397,6 +3435,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # max coverage Off 균등 분배 항 추가
     if max_cov_off_equalize_terms:
         obj.extend(max_cov_off_equalize_terms)
+    # 일자별 커버리지 균등화 항 추가
+    if daily_cov_equalize_terms:
+        obj.extend(daily_cov_equalize_terms)
     m.Maximize(sum(obj))
 
     return m, X, join, leave, fixed
