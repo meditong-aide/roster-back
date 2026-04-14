@@ -2478,16 +2478,7 @@ async def create_roster_with_weekly_off(
         .first()
     )
 
-    weekly_off_on = (
-        bool(getattr(latest_config, "weekly_off_group", False))
-        if latest_config
-        else False
-    )
-    created_name = name or (
-        f"{month}월 근무표 VER{new_version} (주휴 포함)"
-        if weekly_off_on
-        else f"{month}월 근무표 VER{new_version}"
-    )
+    created_name = name or f"{month}월 근무표 VER{new_version}"
 
     new_schedule_id = str(uuid.uuid4().hex)[:12]
 
@@ -2505,7 +2496,7 @@ async def create_roster_with_weekly_off(
         status="draft",
         dropped=False,
         name=created_name,
-        memo="주휴일 자동 포함 버전",
+        memo="",
     )
     db.add(new_schedule)
 
@@ -2614,11 +2605,11 @@ async def create_roster_with_weekly_off(
         db.rollback()
         print(f"[ERROR] commit 실패: {str(e)}")
         raise HTTPException(
-            status_code=500, detail=f"주휴 포함 근무표 생성 실패: {str(e)}"
+            status_code=500, detail=f"빈 근무표 생성 실패: {str(e)}"
         )
 
     return {
-        "message": "주휴일이 포함된 신규 빈 버전 생성 완료",
+        "message": "신규 빈 버전 생성 완료",
         "new_schedule_id": new_schedule.schedule_id,
         "new_version": new_version,
         "name": created_name,
