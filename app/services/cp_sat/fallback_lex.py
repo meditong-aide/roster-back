@@ -1293,6 +1293,33 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, night_idx) <= sum(neighbors))
 
+        # fixed 비근무 직전일 N 금지 (하드 제약)
+        if bool(getattr(cfg, "ban_night_before_fixed_off", False)):
+            for n in range(N):
+                if _is_preceptee_at(n):
+                    continue
+                T0, T1 = join[n], leave[n]
+                _ban_n_cnt = 0
+                for d in range(T0 + 1, T1 + 1):
+                    if (n, d) not in fixed:
+                        continue
+                    if fixed[(n, d)] != off_idx:
+                        continue  # OFF가 아닌 고정 셀은 대상 아님
+                    _fw_type = fixed_type_by_cell.get((n, d))
+                    if _fw_type == "근무":
+                        continue
+                    prev_d = d - 1
+                    if prev_d < T0:
+                        continue
+                    if blocked_by_nurse and prev_d in blocked_by_nurse.get(n, set()):
+                        continue
+                    if (n, prev_d) in fixed:
+                        continue  # 이미 고정된 셀은 변경 불가
+                    m.Add(X(n, prev_d, night_idx) == 0)
+                    _ban_n_cnt += 1
+                if _ban_n_cnt > 0:
+                    print(f"{logger_prefix} [BanNBeforeFixedOff] nurse_idx={n}: {_ban_n_cnt}건 N 금지")
+
         # # 주말 휴무자 N 요일 제한: 2N 2O 켜진 경우 목금만 N 허용 (2O가 주말에 자연 달성)
         # if bool(getattr(cfg, "two_offs_after_two_nig", False)):
         #     allowed_wd = {3, 4}  # 목금 (weekday: Mon=0 .. Fri=4)

@@ -351,6 +351,7 @@ class CPSATBasicEngine:
         two_offs_after_three_nig = config_data.get('two_offs_after_three_nig', True)
         two_offs_after_two_nig = config_data.get('two_offs_after_two_nig', False)
         not_one_night = config_data.get('not_one_night', False)
+        ban_night_before_fixed_off = bool(config_data.get('ban_night_before_fixed_off', True))
         max_nig_per_month = config_data.get('max_nig_per_month', 15)
         if max_nig_per_month != 15:
             max_nig_per_month = 17
@@ -442,6 +443,7 @@ class CPSATBasicEngine:
             max_night_shifts_per_month=max_nig_per_month,
             max_consecutive_nights=3 if three_seq_nig else 2,
             not_one_night=not_one_night,
+            ban_night_before_fixed_off=ban_night_before_fixed_off,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
             banned_day_after_eve=banned_day_after_eve,
@@ -3039,6 +3041,29 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if not neighbors:
                         continue
                     m.Add(X(n, d, night) <= sum(neighbors))
+
+            # fixed 비근무 직전일 N 금지 (하드 제약)
+            if bool(getattr(cfg, "ban_night_before_fixed_off", False)):
+                _ban_n_cnt = 0
+                for d in range(T0 + 1, T1 + 1):
+                    if (n, d) not in fixed:
+                        continue
+                    if fixed[(n, d)] != off_idx_full:
+                        continue  # OFF가 아닌 고정 셀은 대상 아님
+                    _fw_type = fixed_type_by_cell.get((n, d))
+                    if _fw_type == "근무":
+                        continue
+                    prev_d = d - 1
+                    if prev_d < T0:
+                        continue
+                    if blocked_by_nurse and prev_d in blocked_by_nurse.get(n, set()):
+                        continue
+                    if (n, prev_d) in fixed:
+                        continue  # 이미 고정된 셀은 변경 불가
+                    m.Add(X(n, prev_d, night) == 0)
+                    _ban_n_cnt += 1
+                if _ban_n_cnt > 0:
+                    print(f"[CP-SAT-Basic] [BanNBeforeFixedOff] nurse_idx={n}: {_ban_n_cnt}건 N 금지")
 
             # # 주말 휴무자 N 요일 제한: forbid_n 아니고 2N/3N 2O 켜진 경우 2O가 주말에 자연 달성되도록 제한
             # # 2N→2O만: 목금만 N 허용. 3N→2O도 켜진 경우: 수목금 N 허용 (3N 블록이 금요일 끝나면 2O=토일)

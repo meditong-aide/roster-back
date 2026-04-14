@@ -77,6 +77,7 @@ class NurseRosterConfig:
 
     # --- 신규 Hard Constraint 제어 파라미터 ---
     enforce_seniority_pairing: bool = True # 시니어-주니어 동반 근무 규칙 강제 여부
+    ban_night_before_fixed_off: bool = True  # fixed_wanted 비근무(휴무/휴가/공가 등) 직전일 N 배치 금지
     junior_pairing_max_experience: int = 2 # 주니어로 간주할 최대 연차
     senior_pairing_min_experience: int = 6 # 시니어로 간주할 최소 연차
     enforce_E_after_D_constraint: bool = True # E -> D 근무 금지 규칙 강제 여부
