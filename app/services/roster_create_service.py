@@ -1210,6 +1210,53 @@ def _build_engine_nurse_index_map(nurses_in_group: list[Nurse]) -> dict[str, int
     return {r["nurse_id"]: i for i, r in enumerate(sorted_rows)}
 
 
+def _exclude_alloff_nurses(
+    nurses: list,
+    fixed_cells: list[dict],
+    off_exc: set,
+    config: dict,
+    num_days: int,
+) -> tuple[list, list[dict], set, dict[str, list[str]]]:
+    """월 전체 OFF 고정 간호사를 엔진에서 제외하고 nurse_index를 리매핑한다."""
+    off_cnt: dict[int, int] = {}
+    for c in fixed_cells:
+        if str(c.get("shift") or "").upper() in ("O", "OFF", "주"):
+            ni = c.get("nurse_index")
+            if ni is not None:
+                off_cnt[ni] = off_cnt.get(ni, 0) + 1
+    alloff = {ni for ni, cnt in off_cnt.items() if cnt >= num_days}
+    if not alloff:
+        return nurses, fixed_cells, off_exc, {}
+    names = [
+        f"{getattr(nurses[i], 'name', '?')}({getattr(nurses[i], 'nurse_id', '?')})"
+        for i in sorted(alloff) if i < len(nurses)
+    ]
+    print(f"[RosterCreate] 일괄 OFF 간호사 엔진 자동 제외: {names}")
+    roster: dict[str, list[str]] = {
+        str(nurses[i].nurse_id): ["O"] * num_days
+        for i in sorted(alloff) if i < len(nurses)
+    }
+    remap: dict[int, int] = {}
+    new_i = 0
+    for old in range(len(nurses)):
+        if old not in alloff:
+            remap[old] = new_i
+            new_i += 1
+    nurses = [n for i, n in enumerate(nurses) if i not in alloff]
+    fixed_cells = [
+        {**c, "nurse_index": remap[c["nurse_index"]]}
+        for c in fixed_cells if c.get("nurse_index") in remap
+    ]
+    off_exc = {(remap[n], d) for n, d in off_exc if n in remap}
+    config["off_exception_cells"] = sorted(off_exc) if off_exc else []
+    pte = config.get("preceptee_fixed_wanted_map")
+    if pte:
+        config["preceptee_fixed_wanted_map"] = {
+            (remap[ni], di): v for (ni, di), v in pte.items() if ni in remap
+        }
+    return nurses, fixed_cells, off_exc, roster
+
+
 def _build_special_fixed_cells(
     requests: list[dict],
     nurse_idx_map: dict[str, int],
@@ -3476,7 +3523,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     _inject_special_work_code(config_dict, has_special_working)
     # OFF 상한/패널티 기본값 보정 (None 방지)
     if config_dict.get("max_extra_off_days") is None:
-        config_dict["max_extra_off_days"] = 1
+        _has_2n2o = bool(config_dict.get("two_offs_after_two_nig")) or bool(config_dict.get("two_offs_after_three_nig"))
+        config_dict["max_extra_off_days"] = 6 if _has_2n2o else 1
     if config_dict.get("extra_off_penalty_weight") is None:
         config_dict["extra_off_penalty_weight"] = 80
     # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──
@@ -3998,6 +4046,54 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     # except Exception:
     #     pass
 
+    # ── 2N→2OFF: N블록 종료 후 recovery OFF를 fixed_cells로 사전 주입 ──
+    if bool(config_dict.get("two_offs_after_two_nig")):
+        _n_cells_by_nurse: dict[int, set[int]] = {}
+        _o_cells_by_nurse: dict[int, set[int]] = {}
+        for c in combined_fixed_cells:
+            _ni = c.get("nurse_index")
+            _di = c.get("day_index")
+            _sh = str(c.get("shift") or "").upper()
+            if _ni is None or _di is None:
+                continue
+            if _sh == "N":
+                _n_cells_by_nurse.setdefault(_ni, set()).add(_di)
+            elif _sh in ("O", "OFF", "주"):
+                _o_cells_by_nurse.setdefault(_ni, set()).add(_di)
+        _existing_fixed = {(c.get("nurse_index"), c.get("day_index")) for c in combined_fixed_cells}
+        _recovery_added = 0
+        for _ni, _n_days in _n_cells_by_nurse.items():
+            _sorted = sorted(_n_days)
+            # N블록 종료 감지: 다음 날이 N이 아닌 연속 N의 마지막
+            for i, d in enumerate(_sorted):
+                if d + 1 not in _n_days and i > 0 and _sorted[i - 1] == d - 1:
+                    # d가 2+ 연속 N의 마지막 → recovery d+1, d+2
+                    for r in (d + 1, d + 2):
+                        if r >= days_in_month:
+                            continue
+                        if (_ni, r) in _existing_fixed:
+                            continue
+                        combined_fixed_cells.append({
+                            "nurse_index": _ni, "day_index": r,
+                            "shift": "O", "fixed_source": "2n2off_recovery",
+                        })
+                        off_exception_cells.add((_ni, r))
+                        _existing_fixed.add((_ni, r))
+                        _recovery_added += 1
+        if _recovery_added > 0:
+            config_dict["off_exception_cells"] = sorted(off_exception_cells)
+            config_dict["_2n2off_pre_injected"] = True
+            print(f"[2N2OFF-PreInject] recovery OFF {_recovery_added}건 fixed_cells에 추가")
+
+    # ── 일괄 OFF 간호사 엔진 자동 제외 ──
+    _alloff_roster: dict[str, list[str]] = {}
+    nurses_for_engine, combined_fixed_cells, off_exception_cells, _alloff_roster = (
+        _exclude_alloff_nurses(
+            nurses_for_engine, combined_fixed_cells, off_exception_cells,
+            config_dict, days_in_month,
+        )
+    )
+
     if nurses_for_engine:
         # _debug_log(
         #     "cp_sat_start",
@@ -4069,6 +4165,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         generated.update(fixed_roster)
     else:
         generated = fixed_roster
+    # 일괄 OFF 간호사 스케줄 병합
+    if _alloff_roster:
+        if isinstance(generated, dict):
+            generated.update(_alloff_roster)
+        else:
+            generated = dict(_alloff_roster)
 
     validation_error = _validate_generated_roster(generated, roster_system)
     if validation_error:

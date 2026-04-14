@@ -1474,7 +1474,7 @@ def optimize_fallback_lex_hard_first(
                 if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                     end_prev_block = m.NewBoolVar(f"end_3n_prev_soft_{n}")
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
-                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0, T0 + 1)):
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0, T0 + 1)):
                         if _3n_rem >= 2:
                             m.Add(
                                 X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
@@ -1489,17 +1489,17 @@ def optimize_fallback_lex_hard_first(
                     print(f"{logger_prefix} [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after_3n} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
                 if n_tail >= 2 and n_offs_after_3n < 2 and (T0 + 2) <= T1:
-                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0 + 1, T0 + 2)):
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 1, T0 + 2)):
                         m.Add(
                             X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
                         ).OnlyEnforceIf([X(n, T0, night_idx)])
                 if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
-                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0 + 2, T0 + 3)):
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 2, T0 + 3)):
                         m.Add(
                             X(n, T0 + 2, off_idx) + X(n, T0 + 3, off_idx) == 2
                         ).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
                 for d in range(T0 + 2, T1 - 1):
-                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
+                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (d + 1, d + 2)):
                         # 회복 OFF 슬롯에 non-OFF fixed_wanted → 3N 블록 자체를 금지
                         m.Add(
                             X(n, d, night_idx) + X(n, d - 1, night_idx) + X(n, d - 2, night_idx) <= 2
@@ -1525,7 +1525,7 @@ def optimize_fallback_lex_hard_first(
                 if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
                     end_prev_block = m.NewBoolVar(f"end_2n_prev_soft_{n}")
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
-                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0, T0 + 1)):
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0, T0 + 1)):
                         if _2n_rem >= 2:
                             m.Add(
                                 X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
@@ -1543,12 +1543,12 @@ def optimize_fallback_lex_hard_first(
                 if n_tail >= 1 and n_offs_after < 2 and (T0 + 2) <= T1:
                     end_block_b0 = m.NewBoolVar(f"end_2n_soft_b0_{n}")
                     m.Add(end_block_b0 == X(n, T0 + 1, night_idx).Not())
-                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (T0 + 1, T0 + 2)):
+                    if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 1, T0 + 2)):
                         m.Add(
                             X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
                         ).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
                 for d in range(T0 + 1, T1 - 1):
-                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
+                    if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (d + 1, d + 2)):
                         # 회복 OFF 슬롯에 non-OFF fixed_wanted → 이 위치에서 2N 블록 종료 금지
                         xn_prev_fw = X(n, d - 1, night_idx)
                         xn_curr_fw = X(n, d, night_idx)

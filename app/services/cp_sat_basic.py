@@ -3340,7 +3340,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 ).OnlyEnforceIf(
                     [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
                 )
-        if cfg.two_offs_after_two_nig and n not in n_forbid_n:
+        if cfg.two_offs_after_two_nig and n not in n_forbid_n and not getattr(cfg, '_2n2off_pre_injected', False):
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
             n_offs_after = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
             _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
@@ -3378,8 +3378,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 xn_next = X(n, d + 1, night)
                 end_block = m.NewBoolVar(f'end_2n_main_{n}_{d}')
                 m.Add(end_block == xn_next.Not())
-                if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
-                    # 회복 OFF 슬롯에 non-OFF fixed_wanted → 이 위치에서 2N 블록 종료 금지
+                if any(
+                    (n, d2) in fixed_wanted_cells
+                    and fixed.get((n, d2)) not in (off_idx_full, night, None)
+                    for d2 in (d + 1, d + 2)
+                ):
+                    # 회복 OFF 슬롯에 non-OFF/non-N fixed_wanted → 이 위치에서 2N 블록 종료 금지
                     m.Add(xn_prev + xn_curr + end_block <= 2)
                     continue
                 m.Add(
