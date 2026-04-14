@@ -467,6 +467,8 @@ def optimize_fallback_lex_hard_first(
         m = cp_model.CpModel()
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
+        # relax_level >= 3: max coverage + M min hard → soft 전환 (인원 부족 시 생성 보장)
+        _relax_coverage = relax_level >= 3
         coverage_soft_weight = int(
             getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000
         )
@@ -1045,9 +1047,11 @@ def optimize_fallback_lex_hard_first(
         )
 
         # 1) 커버리지 등식: assigned + short - over == need (날짜별 요구치 적용)
-        use_max_coverage = bool(getattr(cfg, "use_max_coverage", False))
-        if use_max_coverage:
-            print(f"{logger_prefix} [MaxCoverage][Fallback] 고정 커버리지 모드 적용")
+        _fb_max_by_day = getattr(cfg, "daily_shift_requirements_max_by_day", None)
+        _fb_has_any_max = isinstance(_fb_max_by_day, list) and any(
+            any(int(v or 0) > 0 for v in dm.values())
+            for dm in _fb_max_by_day if isinstance(dm, dict)
+        )
         short_terms, over_terms = [], []
         over_vars_by_day = {}
         short_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
@@ -1062,12 +1066,15 @@ def optimize_fallback_lex_hard_first(
                 need_map = cfg.daily_shift_requirements_by_day[d]
             else:
                 need_map = cfg.daily_shift_requirements
+            need_max_map = _fb_max_by_day[d] if isinstance(_fb_max_by_day, list) and d < len(_fb_max_by_day) else None
             for code, req in need_map.items():
                 if code not in roster_system.config.shift_types:
                     continue
                 s = roster_system.config.shift_types.index(code)
                 req_raw = max(0, int(req or 0))
                 need = req_raw - _fb_fixed_cnt_adj[d][s]
+                req_max_raw = int((need_max_map or {}).get(code, 0) or 0)
+                need_max = max(0, req_max_raw - _fb_fixed_cnt_adj[d][s]) if req_max_raw > 0 else 0
                 assigned = sum(
                     X(n, d, s)
                     for n in range(N)
@@ -1103,15 +1110,29 @@ def optimize_fallback_lex_hard_first(
                         short_vars_by_day_code[(d, code)] = sh
                         over_vars_by_day_code[(d, code)] = ov
                         continue
-                    m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
-                    m.Add(assigned_m_bucket <= m_cap_non_fixed)
-                    if use_max_coverage:
-                        sh = m.NewIntVar(0, m_cap_non_fixed, f"short_{d}_{code}")
-                        m.Add(sh >= m_cap_non_fixed - assigned_m_bucket)
+                    m_need = max(0, int(req_raw - fixed_m_bucket))
+                    m_cap_max = max(0, int(req_max_raw - fixed_m_bucket)) if req_max_raw > 0 else 0
+                    # M min coverage: max coverage 있으면 hard, 없으면 soft
+                    # _relax_coverage 활성 시: 항상 soft (인원 부족 대응)
+                    if _fb_has_any_max and not _relax_coverage and m_need > 0:
+                        m.Add(assigned_m_bucket >= m_need)
+                        sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                     else:
-                        sh = m.NewIntVar(0, m_cap_non_fixed, f"short_{d}_{code}")
-                        m.Add(assigned_m_bucket + sh >= m_cap_non_fixed)
-                    ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                        sh = m.NewIntVar(0, m_need if m_need > 0 else 0, f"short_{d}_{code}")
+                        if m_need > 0:
+                            m.Add(assigned_m_bucket + sh >= m_need)
+                    # M 상한: max coverage 있으면 hard, 없으면 min으로 hard cap
+                    # _relax_coverage 활성 시: max도 soft
+                    if m_cap_max > 0 and not _relax_coverage:
+                        m.Add(assigned_m_bucket <= m_cap_max)
+                        ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                    elif m_cap_max > 0 and _relax_coverage:
+                        ov = m.NewIntVar(0, N, f"over_{d}_{code}")
+                        m.Add(ov >= assigned_m_bucket - m_cap_max)
+                    else:
+                        m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
+                        m.Add(assigned_m_bucket <= m_cap_non_fixed)
+                        ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     short_terms.append(sh)
                     over_terms.append(ov)
                     over_vars_by_day.setdefault(d, {})[code] = ov
@@ -1128,35 +1149,29 @@ def optimize_fallback_lex_hard_first(
                     short_vars_by_day_code[(d, code)] = sh
                     over_vars_by_day_code[(d, code)] = ov
                     continue
-                if use_max_coverage:
-                    # 폴백: 상한만 적용 (초과 불가, 미달은 소프트 패널티)
-                    if need <= 0:
-                        m.Add(assigned == 0)
-                        sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
-                        ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
-                    else:
-                        m.Add(assigned <= need)
-                        sh = m.NewIntVar(0, N, f"short_{d}_{code}")
-                        m.Add(sh >= need - assigned)
-                        ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
-                    short_terms.append(sh)
-                    over_terms.append(ov)
-                    over_vars_by_day.setdefault(d, {})[code] = ov
-                    short_vars_by_day_code[(d, code)] = sh
-                    over_vars_by_day_code[(d, code)] = ov
+                # min 제약: assigned + shortage >= need
+                if need <= 0:
+                    sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                 else:
-                    if need <= 0:
-                        continue
                     sh = m.NewIntVar(0, N, f"short_{d}_{code}")
-                    ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-                    # Coverage 우선: assigned + shortage >= need (hard), oversupply 추적은 선택
                     m.Add(assigned + sh >= need)
+                # max 제약: hard (상한 초과 불가), _relax_coverage 시 soft
+                if need_max > 0 and not _relax_coverage:
+                    m.Add(assigned <= need_max)
+                    ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                elif need_max > 0 and _relax_coverage:
+                    ov = m.NewIntVar(0, N, f"over_{d}_{code}")
+                    m.Add(ov >= assigned - need_max)
+                elif need > 0:
+                    ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     m.Add(assigned - ov <= need)
-                    short_terms.append(sh)
-                    over_terms.append(ov)
-                    over_vars_by_day.setdefault(d, {})[code] = ov
-                    short_vars_by_day_code[(d, code)] = sh
-                    over_vars_by_day_code[(d, code)] = ov
+                else:
+                    ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                short_terms.append(sh)
+                over_terms.append(ov)
+                over_vars_by_day.setdefault(d, {})[code] = ov
+                short_vars_by_day_code[(d, code)] = sh
+                over_vars_by_day_code[(d, code)] = ov
         # 2) 안전/법규 위반(정량 슬랙) 구성
         safety = {
             "trans_nd": [],  # N→D 위반 (Bool)
@@ -1546,10 +1561,63 @@ def optimize_fallback_lex_hard_first(
                     safety["pattern_eod"].append(v3)
 
         # 월 최소 OFF 부족량(가능일수 클램프)
-        # max coverage 모드에서는 Off cap 미적용 (커버리지 고정에 의해 Off 자연 배정)
+        # max coverage 설정 시: min/max coverage 기반 OFF cap 자동 조정
+        _fb_auto_min_off = None
+        _fb_auto_max_off = None
+        if _fb_has_any_max:
+            import math as _math
+            _fb_blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
+            _fb_total_capacity = 0
+            _fb_total_required = 0
+            for _dd in range(D_phys):
+                _day_min_sum = 0
+                _day_max_sum = 0
+                if hasattr(cfg, "daily_shift_requirements_by_day") and isinstance(cfg.daily_shift_requirements_by_day, list) and _dd < len(cfg.daily_shift_requirements_by_day):
+                    _day_min_sum = sum(int(v or 0) for v in cfg.daily_shift_requirements_by_day[_dd].values())
+                elif hasattr(cfg, "daily_shift_requirements") and isinstance(cfg.daily_shift_requirements, dict):
+                    _day_min_sum = sum(int(v or 0) for v in cfg.daily_shift_requirements.values())
+                if isinstance(_fb_max_by_day, list) and _dd < len(_fb_max_by_day) and isinstance(_fb_max_by_day[_dd], dict):
+                    _day_min_map = {}
+                    if hasattr(cfg, "daily_shift_requirements_by_day") and isinstance(cfg.daily_shift_requirements_by_day, list) and _dd < len(cfg.daily_shift_requirements_by_day):
+                        _day_min_map = cfg.daily_shift_requirements_by_day[_dd]
+                    elif hasattr(cfg, "daily_shift_requirements") and isinstance(cfg.daily_shift_requirements, dict):
+                        _day_min_map = cfg.daily_shift_requirements
+                    _all_codes = set(list(_fb_max_by_day[_dd].keys()) + (list(_day_min_map.keys()) if isinstance(_day_min_map, dict) else []))
+                    for _code in _all_codes:
+                        if _code == 'O':
+                            continue
+                        _mv = int((_fb_max_by_day[_dd].get(_code) or 0))
+                        _minv = int((_day_min_map.get(_code) or 0) if isinstance(_day_min_map, dict) else 0)
+                        if _mv > 0 and _mv >= _minv:
+                            _day_max_sum += _mv
+                        else:
+                            _day_max_sum += _minv
+                _day_active = sum(
+                    1 for nn in range(N)
+                    if join[nn] <= _dd <= leave[nn]
+                    and _dd not in (blocked_by_nurse.get(nn, set()) if blocked_by_nurse else set())
+                )
+                _fb_total_capacity += max(0, _day_active - _day_min_sum)
+                if _day_max_sum > 0:
+                    _fb_total_required += max(0, _day_active - _day_max_sum)
+            _fb_n_full = max(1, sum(1 for nn in range(N) if nn not in _fb_blocked_set))
+            _fb_auto_min_off = max(1, int(_math.ceil(_fb_total_required / _fb_n_full)))
+            _fb_auto_max_off = max(_fb_auto_min_off, int(_fb_total_capacity / _fb_n_full))
+            if _fb_total_required > _fb_total_capacity:
+                print(
+                    f"{logger_prefix} [OffCap][MaxCov] required({_fb_total_required}) > capacity({_fb_total_capacity})"
+                    f" → auto 조정 비활성화"
+                )
+                _fb_auto_min_off = None
+                _fb_auto_max_off = None
+            print(
+                f"{logger_prefix} [OffCap][MaxCov] 자동 조정: capacity={_fb_total_capacity}, "
+                f"required={_fb_total_required}, N={_fb_n_full}, "
+                f"auto_min={_fb_auto_min_off}, auto_max={_fb_auto_max_off}"
+            )
         try:
             # 개인별 O 정량 할당(나이트 전담 제외, 주휴 제외한 순수 O 목표)
-            if off_idx is not None and effective_off_days > 0 and not use_max_coverage:
+            if off_idx is not None and effective_off_days > 0:
                 for n in range(N):
                     if _is_preceptee_at(n):
                         continue
@@ -1622,8 +1690,6 @@ def optimize_fallback_lex_hard_first(
                         f"cap_semantics={off_cap_semantics}, target_O={target_o}, weekly_off_target={weekly_target}"
                     )
             for n in range(N):
-                if use_max_coverage:
-                    break  # max coverage: Off cap 미적용 (커버리지 고정에 의해 Off 자연 결정)
                 if _is_preceptee_at(n):
                     continue
                 T0, T1 = join[n], leave[n]
@@ -1658,6 +1724,8 @@ def optimize_fallback_lex_hard_first(
                     ),
                 )
                 min_off_required = int(off_bounds["min_off_required"])
+                # max coverage 자동 조정 적용
+                # max coverage 기반 자동 조정: max_off만 제한, min_off는 기존 유지
                 max_off_allowed_from_policy = int(off_bounds["max_off_allowed"])
                 extra_allowed = int(off_bounds["max_extra_off_days"])
                 # print(
@@ -1712,6 +1780,12 @@ def optimize_fallback_lex_hard_first(
                         if n in per_nurse_off_cap_override:
                             base_cap = max(base_cap, per_nurse_off_cap_override[n])
                         total_cap_effective = min(base_cap + relax_level, avail_days)
+                        # max coverage 자동 조정: max_off cap
+                        if _fb_auto_max_off is not None:
+                            import math as _math
+                            _ratio_fb = nonvac_active_days / max(1, D_phys)
+                            _scaled_max_fb = max(min_off_required, int(_fb_auto_max_off * _ratio_fb))
+                            total_cap_effective = min(total_cap_effective, _scaled_max_fb)
                     if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
                         cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(
@@ -1850,8 +1924,11 @@ def optimize_fallback_lex_hard_first(
                 best_over = int(s1.Value(sum(over1)))
                 used_relax_level = relax_level
                 if relax_level > 0:
+                    _relax_desc = f"OFF상한+{relax_level}"
+                    if relax_level >= 3:
+                        _relax_desc += ", max coverage soft, M min soft"
                     print(
-                        f"{logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 (월 최대 OFF 상한 +{relax_level})"
+                        f"{logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 ({_relax_desc})"
                     )
                 print(f"{logger_prefix} 최소 커버리지 부족: {best_short}, 과잉: {best_over}")
                 try:

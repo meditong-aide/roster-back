@@ -94,36 +94,26 @@ def build_blocked_days(
                 blocked.add(d)
         return blocked
 
-    # 아웃바운드 (기존 로직)
+    # 아웃바운드: assignment 기간은 항상 blocked (source/target 독립 생성)
     for a in assignments:
         if a.nurse_id != nurse_db_id:
             continue
         if a.status == "cancelled":
             continue
 
-        a_start = a.start_date
-        a_end = a.end_date or a.expected_end_date or month_end
-
-        if a_end < month_start or a_start > month_end:
-            continue
-
-        overlap_start = max(a_start, month_start)
-        overlap_end = min(a_end, month_end)
-        start_idx = (overlap_start - month_start).days
-        end_idx = (overlap_end - month_start).days
-
         if a.reason in ("파견", "휴직", "퇴사", "병동이동") and a.source_group_id == group_id:
-            # 파견/병동이동: source가 생성하는 월은 blocking 안 함, 그 외(full/중간)는 blocked
-            if a.reason in ("파견", "병동이동"):
-                _a_end_actual = a.end_date or a.expected_end_date
-                if is_source_generated_month(a_start, _a_end_actual, month_start, days_in_month):
-                    continue  # source 생성 → blocking 안 함
-                # full month / 중간 월 → blocked
+            a_start = a.start_date
+            a_end = a.end_date or a.expected_end_date or month_end
+
+            if a_end < month_start or a_start > month_end:
+                continue
+
+            overlap_start = max(a_start, month_start)
+            overlap_end = min(a_end, month_end)
+            start_idx = (overlap_start - month_start).days
+            end_idx = (overlap_end - month_start).days
             for d in range(start_idx, end_idx + 1):
                 blocked.add(d)
-
-        elif a.reason == "프리셉티":
-            pass
 
     return blocked
 
