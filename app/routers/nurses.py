@@ -593,6 +593,53 @@ async def get_personnel_basic_info(
         )
 
         if not nurse:
+            # ADM(관리자)은 nurses 테이블에 레코드가 없으므로 기본 정보 반환
+            if getattr(current_user, "is_master_admin", False):
+                # 그룹웨어 DB에서 관리자 정보 조회
+                _acct = getattr(current_user, "account_id", "")
+                _gw_rows = msdb_manager.fetch_all(Member.member_view(), params=(_acct,)) if _acct else []
+                _gw = _gw_rows[0] if _gw_rows else {}
+                _birth = _gw.get("DateOfBirth")
+                _age = None
+                if _birth:
+                    try:
+                        _bd = datetime.strptime(str(_birth)[:10], "%Y-%m-%d").date() if isinstance(_birth, str) else _birth
+                        _age = (date.today() - _bd).days // 365
+                    except Exception:
+                        pass
+                _join = _gw.get("JoinDate")
+                _tenure = ""
+                if _join:
+                    try:
+                        _jd = _join.date() if hasattr(_join, "date") else _join
+                        if isinstance(_jd, date) and _jd <= date.today():
+                            _rd = relativedelta(date.today(), _jd)
+                            _tenure = f"{_rd.years}년 {_rd.months}개월"
+                    except Exception:
+                        pass
+                return {
+                    "is_admin": True,
+                    "account_id": _gw.get("account_id", _acct),
+                    "nurse_id": str(_gw.get("nurse_id", getattr(current_user, "nurse_id", ""))),
+                    "name": _gw.get("name", getattr(current_user, "name", "관리자")),
+                    "office_name": _gw.get("office_name", getattr(current_user, "office_name", "")),
+                    "group_name": "",
+                    "team_name": _gw.get("mb_partName", ""),
+                    "emp_num": str(_gw.get("nurse_id", "")),
+                    "role": "ADM",
+                    "level_": _gw.get("OfficialTitleName", ""),
+                    "birth_date": str(_birth)[:10] if _birth else None,
+                    "age": _age,
+                    "gender": _gw.get("gender"),
+                    "joining_date": str(_join)[:10] if _join else None,
+                    "experience": int(_gw.get("career") or 0) if _gw.get("career") else None,
+                    "tenure": _tenure,
+                    "tenure_display": _tenure,
+                    "work_place": _gw.get("office_name", ""),
+                    "phone_number": _gw.get("PortableTel"),
+                    "email": _gw.get("Email") or None,
+                    "profile_image_url": None,
+                }
             raise HTTPException(
                 status_code=404, detail="간호사 정보를 찾을 수 없습니다."
             )
