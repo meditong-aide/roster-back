@@ -3305,6 +3305,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
                 if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
+                    # 회복 OFF 슬롯에 non-OFF fixed_wanted → 3N 블록 자체를 금지
+                    m.Add(
+                        X(n, d, night) + X(n, d - 1, night) + X(n, d - 2, night) <= 2
+                    )
                     continue
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
@@ -3350,6 +3354,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 end_block = m.NewBoolVar(f'end_2n_main_{n}_{d}')
                 m.Add(end_block == xn_next.Not())
                 if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
+                    # 회복 OFF 슬롯에 non-OFF fixed_wanted → 이 위치에서 2N 블록 종료 금지
+                    m.Add(xn_prev + xn_curr + end_block <= 2)
                     continue
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2

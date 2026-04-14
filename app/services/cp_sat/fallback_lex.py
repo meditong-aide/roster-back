@@ -1473,6 +1473,10 @@ def optimize_fallback_lex_hard_first(
                         ).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
                 for d in range(T0 + 2, T1 - 1):
                     if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
+                        # 회복 OFF 슬롯에 non-OFF fixed_wanted → 3N 블록 자체를 금지
+                        m.Add(
+                            X(n, d, night_idx) + X(n, d - 1, night_idx) + X(n, d - 2, night_idx) <= 2
+                        )
                         continue
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
@@ -1518,6 +1522,12 @@ def optimize_fallback_lex_hard_first(
                         ).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
                 for d in range(T0 + 1, T1 - 1):
                     if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx for d2 in (d + 1, d + 2)):
+                        # 회복 OFF 슬롯에 non-OFF fixed_wanted → 이 위치에서 2N 블록 종료 금지
+                        xn_prev_fw = X(n, d - 1, night_idx)
+                        xn_curr_fw = X(n, d, night_idx)
+                        end_block_fw = m.NewBoolVar(f"end_2n_fw_{n}_{d}")
+                        m.Add(end_block_fw == X(n, d + 1, night_idx).Not())
+                        m.Add(xn_prev_fw + xn_curr_fw + end_block_fw <= 2)
                         continue
                     xn_prev = X(n, d - 1, night_idx)
                     xn_curr = X(n, d, night_idx)
