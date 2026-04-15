@@ -106,6 +106,14 @@ def create_assignment(
         expected_end_date=req.expected_end_date,
         reason=req.reason,
         status="active",
+        target_weekly_off_type=req.target_weekly_off_type,
+        target_weekly_off_enabled=req.target_weekly_off_enabled,
+        target_weekly_off_weekday=req.target_weekly_off_weekday,
+        target_shift_types=req.target_shift_types,
+        target_team_id=req.target_team_id,
+        target_grade=req.target_grade,
+        target_fixed_shift=req.target_fixed_shift,
+        target_wanted_max_requests=req.target_wanted_max_requests,
     )
     db.add(row)
     db.commit()
@@ -155,6 +163,20 @@ def update_assignment(
         row.end_date = req.end_date
     if req.status is not None:
         row.status = req.status
+
+    for _f in (
+        "target_weekly_off_type",
+        "target_weekly_off_enabled",
+        "target_weekly_off_weekday",
+        "target_shift_types",
+        "target_team_id",
+        "target_grade",
+        "target_fixed_shift",
+        "target_wanted_max_requests",
+    ):
+        _v = getattr(req, _f, None)
+        if _v is not None:
+            setattr(row, _f, _v)
 
     db.commit()
     db.refresh(row)
@@ -973,6 +995,14 @@ def _to_response(
         end_date=row.end_date,
         reason=row.reason,
         status=row.status,
+        target_weekly_off_type=row.target_weekly_off_type,
+        target_weekly_off_enabled=row.target_weekly_off_enabled,
+        target_weekly_off_weekday=row.target_weekly_off_weekday,
+        target_shift_types=row.target_shift_types,
+        target_team_id=row.target_team_id,
+        target_grade=row.target_grade,
+        target_fixed_shift=row.target_fixed_shift,
+        target_wanted_max_requests=row.target_wanted_max_requests,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

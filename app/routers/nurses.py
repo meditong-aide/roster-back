@@ -917,6 +917,56 @@ async def verify_and_update_phone(
     return {"message": "휴대폰 번호가 성공적으로 변경되었습니다"}
 
 
+# ── NurseAssignment 엔드포인트 (동적 경로보다 먼저 선언) ──
+
+
+@router.post("/assignments", response_model=NurseAssignmentResponse)
+async def create_nurse_assignment(
+    req: NurseAssignmentCreate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
+    return create_assignment(req, db)
+
+
+@router.get("/assignments", response_model=List[NurseAssignmentResponse])
+async def get_nurse_assignments(
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 이력 조회"""
+    office_id = getattr(current_user, "office_id", None)
+    if not office_id:
+        raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
+    _group = group_id or getattr(current_user, "group_id", None)
+    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
+
+
+@router.put("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+async def update_nurse_assignment(
+    assignment_id: int,
+    req: NurseAssignmentUpdate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 수정 (기간/상태 변경)"""
+    return update_assignment(assignment_id, req, db)
+
+
+@router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+async def delete_nurse_assignment(
+    assignment_id: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 취소 (status → cancelled)"""
+    return cancel_assignment(assignment_id, db)
+
+
 @router.get("/{nurse_id}", response_model=NurseProfile)
 async def get_nurse_by_id(
     nurse_id: str,
@@ -995,51 +1045,3 @@ async def delete_nurse(
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")
 
 
-# ── NurseAssignment 엔드포인트 ──
-
-
-@router.post("/assignments", response_model=NurseAssignmentResponse)
-async def create_nurse_assignment(
-    req: NurseAssignmentCreate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db),
-):
-    """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
-    return create_assignment(req, db)
-
-
-@router.get("/assignments", response_model=List[NurseAssignmentResponse])
-async def get_nurse_assignments(
-    group_id: Optional[str] = None,
-    nurse_id: Optional[str] = None,
-    status: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db),
-):
-    """배정 이력 조회"""
-    office_id = getattr(current_user, "office_id", None)
-    if not office_id:
-        raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
-    _group = group_id or getattr(current_user, "group_id", None)
-    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
-
-
-@router.put("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
-async def update_nurse_assignment(
-    assignment_id: int,
-    req: NurseAssignmentUpdate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db),
-):
-    """배정 수정 (기간/상태 변경)"""
-    return update_assignment(assignment_id, req, db)
-
-
-@router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
-async def delete_nurse_assignment(
-    assignment_id: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db),
-):
-    """배정 취소 (status → cancelled)"""
-    return cancel_assignment(assignment_id, db)
