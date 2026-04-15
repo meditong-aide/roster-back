@@ -478,7 +478,8 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         shift_data[shift_code][day] = {
             "request": s.partial_request,
             "score": float(s.score) if s.score is not None else None,
-            "comment": s.comment # 사유작성
+            "comment": s.comment, # 사유작성
+            "shifts_table_id": s.shifts_table_id,
         }
     
     # 5️⃣ pair 데이터 구조화 -> 여기만 나중에 바꿀것
@@ -581,7 +582,8 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             # )
             shift_data[shift_type][day] = {
                 "score": float(s.score) if s.score is not None else 1.0,
-                "comment": s.comment # 사유작성
+                "comment": s.comment, # 사유작성
+                "shifts_table_id": s.shifts_table_id,
             }
 
         # pair 요청들

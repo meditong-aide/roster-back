@@ -17,7 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.mysql import TINYINT
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, deferred
 from db.client2 import Base
 from sqlalchemy import DATE, DECIMAL, TEXT, Time
 
@@ -137,6 +137,54 @@ class Nurse(Base):
     )
 
     # office_id는 컬럼으로 관리
+
+
+class NurseAssignment(Base):
+    """간호사 배정/상태 변경 이력 (파견/휴직/퇴사/프리셉티/병동이동)"""
+    __tablename__ = "nurse_assignment"
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    source_group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    target_group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=True)
+    office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"), nullable=False)
+    start_date = Column(DATE, nullable=False)
+    expected_end_date = Column(DATE, nullable=True)
+    end_date = Column(DATE, nullable=True)
+    reason = Column(NVARCHAR(200), nullable=False)
+    status = Column(VARCHAR(10), nullable=False, default="active")
+    # target 그룹 전용 설정
+    target_weekly_off_type = Column(VARCHAR(20), nullable=True)
+    target_weekly_off_enabled = Column(TINYINT, nullable=True)
+    target_weekly_off_weekday = Column(TINYINT, nullable=True)
+    target_shift_types = Column(JSON, nullable=True)
+    target_team_id = Column(INTEGER, nullable=True)
+    target_grade = Column(INTEGER, nullable=True)
+    target_fixed_shift = Column(VARCHAR(20), nullable=True)
+    target_wanted_max_requests = Column(INTEGER, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    source_group = relationship("Group", foreign_keys=[source_group_id])
+    target_group = relationship("Group", foreign_keys=[target_group_id])
+
+
+class ShiftTransferLog(Base):
+    """마감 시 파견/병동이동 shift 전달 이력"""
+    __tablename__ = "shift_transfer_logs"
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    schedule_id = Column(CHAR(12), nullable=False)
+    target_schedule_id = Column(CHAR(12), nullable=True)
+    assignment_id = Column(INTEGER, nullable=False)
+    nurse_id = Column(VARCHAR(50), nullable=False)
+    source_group_id = Column(VARCHAR(50), nullable=False)
+    target_group_id = Column(VARCHAR(50), nullable=False)
+    transfer_start = Column(DATE, nullable=False)
+    transfer_end = Column(DATE, nullable=False)
+    entry_count = Column(INTEGER, nullable=False, default=0)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    transferred_at = Column(DATETIME, nullable=False, default=func.now())
 
 
 class Schedule(Base):
@@ -294,9 +342,9 @@ class RosterConfig(Base):
     team_balance_mode = Column(VARCHAR(20), nullable=False, default="balanced")
     off_placement_mode = Column(INTEGER, nullable=False, default=0)
     fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
+    ban_night_before_fixed_off = Column(BOOLEAN, nullable=False, default=True)
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
-
     office = relationship("Office")
     group = relationship("Group")
 
@@ -525,6 +573,10 @@ class DailyShift(Base):
     e_count = Column(SMALLINT, nullable=False, default=0)
     n_count = Column(SMALLINT, nullable=False, default=0)
     m_count = Column(SMALLINT, nullable=False, default=0)
+    d_count_max = Column(SMALLINT, nullable=False, default=0)
+    e_count_max = Column(SMALLINT, nullable=False, default=0)
+    n_count_max = Column(SMALLINT, nullable=False, default=0)
+    m_count_max = Column(SMALLINT, nullable=False, default=0)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 

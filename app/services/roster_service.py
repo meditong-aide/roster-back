@@ -390,12 +390,27 @@ def get_prev_month_tail_service(
             entries_by_nurse[nid] = {}
         entries_by_nurse[nid][entry.work_date.day] = entry.shift_id
 
+    # 전월 assignment 치환 (파견/병동이동/휴직)
+    from services.assignment_service import get_roster_assignments
+    _prev_assignments = get_roster_assignments(
+        db, group_id=target_group_id, year=prev_year, month=prev_month,
+    )
+
     nurse_list = []
     for nurse in nurses:
         shifts = {
             str(d): entries_by_nurse.get(nurse.nurse_id, {}).get(d)
             for d in tail_day_list
         }
+        # assignment 기간의 shift에 reason 필드 추가
+        _a_list = _prev_assignments.get(nurse.nurse_id, [])
+        for _a in _a_list:
+            _a_start = date.fromisoformat(_a["start_date"]) if isinstance(_a["start_date"], str) else _a["start_date"]
+            _a_end = date.fromisoformat(_a["end_date"]) if _a.get("end_date") else None
+            for d in tail_day_list:
+                _cell_date = date(prev_year, prev_month, d)
+                if _cell_date >= _a_start and (not _a_end or _cell_date <= _a_end):
+                    shifts[str(d)] = None
         nurse_list.append(
             {
                 "nurse_id": nurse.nurse_id,
@@ -486,6 +501,146 @@ def get_issued_roster_snapshot_service(
     }
 
 
+def get_my_issued_roster_service(
+    year: int,
+    month: int,
+    current_user,
+    db: Session,
+) -> dict | None:
+    """
+    로그인 사용자 본인의 발행된 근무표만 조회합니다.
+    snapshot의 roster_json에서 nurse_id 기준으로 추출.
+    """
+    snapshot_data = get_issued_roster_snapshot_service(
+        year=year, month=month, current_user=current_user, db=db
+    )
+    if not snapshot_data:
+        return None
+
+    roster = snapshot_data.get("roster") or {}
+    nurse_id = getattr(current_user, "nurse_id", None)
+    if not nurse_id:
+        return None
+
+    roster_nurses = roster.get("nurses") or []
+    my_roster = next(
+        (n for n in roster_nurses if str(n.get("nurse_id")) == str(nurse_id)),
+        None,
+    )
+    if not my_roster:
+        return None
+
+    result = {
+        "year": roster.get("year"),
+        "month": roster.get("month"),
+        "nurse_id": my_roster.get("nurse_id"),
+        "name": my_roster.get("name"),
+        "schedule": my_roster.get("schedule"),
+        "schedule_ids": my_roster.get("schedule_ids"),
+        "counts": my_roster.get("counts"),
+        "shift_colors": roster.get("shift_colors") or {},
+        "issued_at": snapshot_data.get("created_at"),
+    }
+
+    # 파견/병동이동 간호사: target group 근무표 병합
+    from services.assignment_service import get_active_assignments_for_month
+    from calendar import monthrange
+    assignments = get_active_assignments_for_month(
+        db, current_user.group_id, year, month,
+    )
+    my_transfer = next(
+        (a for a in assignments
+         if a.nurse_id == nurse_id
+         and a.reason in ("파견", "병동이동")
+         and a.source_group_id == current_user.group_id
+         and a.target_group_id),
+        None,
+    )
+    if my_transfer:
+        from calendar import monthrange
+        from datetime import date
+        days_in_month = monthrange(year, month)[1]
+        a_start = my_transfer.start_date
+        a_end = my_transfer.end_date or my_transfer.expected_end_date
+        m_start = date(year, month, 1)
+        m_end = date(year, month, days_in_month)
+        period_start = max(a_start, m_start).day
+        period_end = min(a_end, m_end).day if a_end else days_in_month
+
+        from db.models import Group
+        tgt_group = db.query(Group).filter(
+            Group.group_id == my_transfer.target_group_id
+        ).first()
+
+        target_snapshot = get_issued_roster_snapshot_service(
+            year=year, month=month, current_user=current_user, db=db,
+            target_group_id=my_transfer.target_group_id,
+        )
+        target_issued = False
+        src_schedule = result["schedule"] or []
+        src_ids = result["schedule_ids"] or []
+
+        if target_snapshot:
+            t_roster = target_snapshot.get("roster") or {}
+            t_nurses = t_roster.get("nurses") or []
+            t_my = next(
+                (n for n in t_nurses if str(n.get("nurse_id")) == str(nurse_id)),
+                None,
+            )
+            if t_my:
+                target_issued = True
+                tgt_schedule = t_my.get("schedule") or []
+                tgt_ids = t_my.get("schedule_ids") or []
+
+                for d in range(period_start, period_end + 1):
+                    idx = d - 1
+                    if idx < len(tgt_schedule):
+                        if idx < len(src_schedule):
+                            src_schedule[idx] = tgt_schedule[idx]
+                        if idx < len(src_ids) and idx < len(tgt_ids):
+                            src_ids[idx] = tgt_ids[idx]
+
+                # shift_colors 병합
+                t_colors = t_roster.get("shift_colors") or {}
+                merged_colors = {**result["shift_colors"], **t_colors}
+                result["shift_colors"] = merged_colors
+
+        if not target_issued:
+            # target 미마감: 기존 셀에 reason 필드 추가
+            _reason = my_transfer.reason  # "파견" / "병동이동"
+            for d in range(period_start, period_end + 1):
+                idx = d - 1
+                if idx < len(src_schedule):
+                    _cell = src_schedule[idx]
+                    if isinstance(_cell, dict):
+                        _cell["reason"] = _reason
+                    else:
+                        src_schedule[idx] = {"code": _cell, "reason": _reason}
+                if idx < len(src_ids):
+                    src_ids[idx] = None
+
+        result["schedule"] = src_schedule
+        result["schedule_ids"] = src_ids
+        # counts 재계산
+        result["counts"] = {}
+        for code in (result["shift_colors"] or {}):
+            result["counts"][code] = src_schedule.count(code)
+
+        # transfer 정보 항상 첨부 (미마감 상태 포함)
+        result["transfer"] = {
+            "reason": my_transfer.reason,
+            "target_group_id": my_transfer.target_group_id,
+            "target_group_name": tgt_group.group_name if tgt_group else "",
+            "start_date": str(a_start),
+            "end_date": str(a_end) if a_end else None,
+            "period_start_day": period_start,
+            "period_end_day": period_end,
+            "target_issued": target_issued,
+        }
+
+    return result
+
+
 def create_issued_roster_snapshot(
     schedule: Schedule,
     current_user,
@@ -570,13 +725,30 @@ def create_issued_roster_snapshot(
                 else None,
             }
 
-    # 간호사 리스트 및 정보 스냅샷
-    nurses = (
+    # 간호사 리스트 및 정보 스냅샷 (인바운드 포함)
+    nurses = list(
         db.query(Nurse)
         .filter(Nurse.group_id == group_id)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
+    # 인바운드 간호사: schedule_entries에 존재하지만 group에 없는 간호사
+    _group_nids = {n.nurse_id for n in nurses}
+    _entry_nids = {
+        row.nurse_id for row in
+        db.query(ScheduleEntry.nurse_id)
+        .filter(ScheduleEntry.schedule_id == schedule.schedule_id)
+        .distinct()
+        .all()
+    }
+    _inbound_nids = _entry_nids - _group_nids
+    if _inbound_nids:
+        _inbound_nurses = (
+            db.query(Nurse)
+            .filter(Nurse.nurse_id.in_(_inbound_nids))
+            .all()
+        )
+        nurses.extend(_inbound_nurses)
     nurses_json = []
     for n in nurses:
         nurses_json.append(
@@ -638,6 +810,11 @@ def create_issued_roster_snapshot(
         .filter(ScheduleEntry.schedule_id == schedule.schedule_id)
         .all()
     )
+    # shifts.id → 현재 shift_id 매핑 (schedule_entries의 shift_id가 구 코드일 수 있으므로)
+    _int_id_to_shift_id: dict[int, str] = {
+        s.id: s.shift_id for s in shift_rows
+    }
+
     entries_by_nurse: dict = {}
     entry_ids_by_nurse: dict = {}
     for entry in entries:
@@ -646,21 +823,29 @@ def create_issued_roster_snapshot(
         if nurse_id not in entries_by_nurse:
             entries_by_nurse[nurse_id] = {}
             entry_ids_by_nurse[nurse_id] = {}
-        entries_by_nurse[nurse_id][day] = entry.shift_id
+        # entry.id(shifts.id)가 있으면 현재 shift_id로 복원, 없으면 기존 값 사용
+        if entry.id and entry.id in _int_id_to_shift_id:
+            entries_by_nurse[nurse_id][day] = _int_id_to_shift_id[entry.id]
+        else:
+            entries_by_nurse[nurse_id][day] = entry.shift_id
         entry_ids_by_nurse[nurse_id][day] = entry.id
 
     roster_nurses = []
     for n in nurses:
-        schedule_list = [
-            entries_by_nurse.get(n.nurse_id, {}).get(day, "-")
-            for day in range(1, days_in_month + 1)
-        ]
+        schedule_list = []
+        for day in range(1, days_in_month + 1):
+            code = entries_by_nurse.get(n.nurse_id, {}).get(day, "-")
+            schedule_list.append({
+                "code": code,
+                "color": shift_colors.get(code, ""),
+            })
         schedule_ids = [
             entry_ids_by_nurse.get(n.nurse_id, {}).get(day)
             for day in range(1, days_in_month + 1)
         ]
         counts = {
-            shift_id: schedule_list.count(shift_id) for shift_id in shift_colors.keys()
+            shift_id: sum(1 for item in schedule_list if item["code"] == shift_id)
+            for shift_id in shift_colors.keys()
         }
         roster_nurses.append(
             {

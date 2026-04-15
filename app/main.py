@@ -54,27 +54,27 @@ from services.wanted_service import close_expired_wanted
 _scheduler_logger = logging.getLogger("scheduler")
 
 
-# async def _daily_flush_scheduler():
-#     """매일 자정에 병동이동 flush 실행."""
-#     from datetime import timedelta
-#     while True:
-#         now = datetime.now()
-#         tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-#         await asyncio.sleep((tomorrow - now).total_seconds())
+async def _daily_flush_scheduler():
+    """매일 자정에 병동이동 flush 실행."""
+    from datetime import timedelta
+    while True:
+        now = datetime.now()
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await asyncio.sleep((tomorrow - now).total_seconds())
 
-#         db = SessionLocal()
-#         try:
-#             from services.assignment_service import flush_all_pending_transfers, flush_expired_preceptees
-#             count = flush_all_pending_transfers(db)
-#             if count > 0:
-#                 _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
-#             pte_count = flush_expired_preceptees(db)
-#             if pte_count > 0:
-#                 _scheduler_logger.info("[Scheduler] 프리셉티 자동 해제: %d건", pte_count)
-#         except Exception as e:
-#             _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
-#         finally:
-#             db.close()
+        db = SessionLocal()
+        try:
+            from services.assignment_service import flush_all_pending_transfers, flush_expired_preceptees
+            count = flush_all_pending_transfers(db)
+            if count > 0:
+                _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
+            pte_count = flush_expired_preceptees(db)
+            if pte_count > 0:
+                _scheduler_logger.info("[Scheduler] 프리셉티 자동 해제: %d건", pte_count)
+        except Exception as e:
+            _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
+        finally:
+            db.close()
 
 
 def _run_nurse_sync():
@@ -116,10 +116,10 @@ async def _daily_nurse_sync_scheduler():
 
 @asynccontextmanager
 async def lifespan(app):
-    # flush_task = asyncio.create_task(_daily_flush_scheduler())
+    flush_task = asyncio.create_task(_daily_flush_scheduler())
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
     yield
-    # flush_task.cancel()
+    flush_task.cancel()
     sync_task.cancel()
 
 

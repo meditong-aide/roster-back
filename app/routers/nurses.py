@@ -30,17 +30,20 @@ from schemas.roster_schema import (
     PasswordChangeRequest,
     PhoneChangeRequest,
     AddToGroupRequest,
+    NurseAssignmentCreate,
+    NurseAssignmentUpdate,
+    NurseAssignmentResponse,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
-# from services.assignment_service import (
-#     create_assignment,
-#     update_assignment,
-#     cancel_assignment,
-#     get_assignments,
-#     flush_pending_transfers,
-#     flush_expired_preceptees,
-# )
+from services.assignment_service import (
+    create_assignment,
+    update_assignment,
+    cancel_assignment,
+    get_assignments,
+    flush_pending_transfers,
+    flush_expired_preceptees,
+)
 from services.nurse_service import (
     get_nurses_in_group_service,
     bulk_update_nurses_service,
@@ -130,6 +133,12 @@ async def get_nurses_in_group(
         getattr(current_user, "office_id", None),
         getattr(current_user, "office_name", None),
     )
+    # 병동이동 레이지 체크
+    _group = group_id or getattr(current_user, "group_id", None)
+    if _group:
+        flush_pending_transfers(db, _group)
+    # 프리셉티 만료 레이지 체크
+    flush_expired_preceptees(db)
     print(
         "current_user",
         current_user.nurse_id,
@@ -584,6 +593,53 @@ async def get_personnel_basic_info(
         )
 
         if not nurse:
+            # ADM(관리자)은 nurses 테이블에 레코드가 없으므로 기본 정보 반환
+            if getattr(current_user, "is_master_admin", False):
+                # 그룹웨어 DB에서 관리자 정보 조회
+                _acct = getattr(current_user, "account_id", "")
+                _gw_rows = msdb_manager.fetch_all(Member.member_view(), params=(_acct,)) if _acct else []
+                _gw = _gw_rows[0] if _gw_rows else {}
+                _birth = _gw.get("DateOfBirth")
+                _age = None
+                if _birth:
+                    try:
+                        _bd = datetime.strptime(str(_birth)[:10], "%Y-%m-%d").date() if isinstance(_birth, str) else _birth
+                        _age = (date.today() - _bd).days // 365
+                    except Exception:
+                        pass
+                _join = _gw.get("JoinDate")
+                _tenure = ""
+                if _join:
+                    try:
+                        _jd = _join.date() if hasattr(_join, "date") else _join
+                        if isinstance(_jd, date) and _jd <= date.today():
+                            _rd = relativedelta(date.today(), _jd)
+                            _tenure = f"{_rd.years}년 {_rd.months}개월"
+                    except Exception:
+                        pass
+                return {
+                    "is_admin": True,
+                    "account_id": _gw.get("account_id", _acct),
+                    "nurse_id": str(_gw.get("nurse_id", getattr(current_user, "nurse_id", ""))),
+                    "name": _gw.get("name", getattr(current_user, "name", "관리자")),
+                    "office_name": _gw.get("office_name", getattr(current_user, "office_name", "")),
+                    "group_name": "",
+                    "team_name": _gw.get("mb_partName", ""),
+                    "emp_num": str(_gw.get("nurse_id", "")),
+                    "role": "ADM",
+                    "level_": _gw.get("OfficialTitleName", ""),
+                    "birth_date": str(_birth)[:10] if _birth else None,
+                    "age": _age,
+                    "gender": _gw.get("gender"),
+                    "joining_date": str(_join)[:10] if _join else None,
+                    "experience": int(_gw.get("career") or 0) if _gw.get("career") else None,
+                    "tenure": _tenure,
+                    "tenure_display": _tenure,
+                    "work_place": _gw.get("office_name", ""),
+                    "phone_number": _gw.get("PortableTel"),
+                    "email": _gw.get("Email") or None,
+                    "profile_image_url": None,
+                }
             raise HTTPException(
                 status_code=404, detail="간호사 정보를 찾을 수 없습니다."
             )
@@ -861,14 +917,65 @@ async def verify_and_update_phone(
     return {"message": "휴대폰 번호가 성공적으로 변경되었습니다"}
 
 
+# ── NurseAssignment 엔드포인트 (동적 경로보다 먼저 선언) ──
+
+
+@router.post("/assignments", response_model=NurseAssignmentResponse)
+async def create_nurse_assignment(
+    req: NurseAssignmentCreate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
+    return create_assignment(req, db)
+
+
+@router.get("/assignments", response_model=List[NurseAssignmentResponse])
+async def get_nurse_assignments(
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 이력 조회"""
+    office_id = getattr(current_user, "office_id", None)
+    if not office_id:
+        raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
+    _group = group_id or getattr(current_user, "group_id", None)
+    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
+
+
+@router.put("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+async def update_nurse_assignment(
+    assignment_id: int,
+    req: NurseAssignmentUpdate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 수정 (기간/상태 변경)"""
+    return update_assignment(assignment_id, req, db)
+
+
+@router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+async def delete_nurse_assignment(
+    assignment_id: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 취소 (status → cancelled)"""
+    return cancel_assignment(assignment_id, db)
+
+
 @router.get("/{nurse_id}", response_model=NurseProfile)
 async def get_nurse_by_id(
     nurse_id: str,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """단일 간호사 프로필 조회"""
+    """단일 간호사 프로필 조회 (파견/병동이동 인바운드 간호사도 조회 허용)"""
     try:
+        result = None
         if current_user.is_master_admin:
             result = get_nurses_filtered_service(
                 current_user,
@@ -876,11 +983,27 @@ async def get_nurse_by_id(
                 nurse_id=nurse_id,
             )
         else:
-            result = get_nurses_in_group_service(
-                current_user,
-                db,
-                nurse_id=nurse_id,
-            )
+            try:
+                result = get_nurses_in_group_service(
+                    current_user,
+                    db,
+                    nurse_id=nurse_id,
+                )
+            except Exception:
+                result = None
+        # 같은 그룹에 없으면 → 파견/병동이동 인바운드 여부 확인 후 직접 조회
+        if not result:
+            from db.models import NurseAssignment
+            has_inbound = db.query(NurseAssignment).filter(
+                NurseAssignment.nurse_id == nurse_id,
+                NurseAssignment.target_group_id == current_user.group_id,
+                NurseAssignment.reason.in_(["파견", "병동이동"]),
+                NurseAssignment.status == "active",
+            ).first()
+            if has_inbound:
+                result = get_nurses_in_group_service(
+                    current_user, db, nurse_id=nurse_id, skip_group_filter=True,
+                )
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
         return result[0]
@@ -922,51 +1045,3 @@ async def delete_nurse(
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")
 
 
-# # ── NurseAssignment 엔드포인트 ──
-
-
-# @router.post("/assignments", response_model=NurseAssignmentResponse)
-# async def create_nurse_assignment(
-#     req: NurseAssignmentCreate,
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db),
-# ):
-#     """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
-#     return create_assignment(req, db)
-
-
-# @router.get("/assignments", response_model=List[NurseAssignmentResponse])
-# async def get_nurse_assignments(
-#     group_id: Optional[str] = None,
-#     nurse_id: Optional[str] = None,
-#     status: Optional[str] = None,
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db),
-# ):
-#     """배정 이력 조회"""
-#     office_id = getattr(current_user, "office_id", None)
-#     if not office_id:
-#         raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
-#     _group = group_id or getattr(current_user, "group_id", None)
-#     return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
-
-
-# @router.put("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
-# async def update_nurse_assignment(
-#     assignment_id: int,
-#     req: NurseAssignmentUpdate,
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db),
-# ):
-#     """배정 수정 (기간/상태 변경)"""
-#     return update_assignment(assignment_id, req, db)
-
-
-# @router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
-# async def delete_nurse_assignment(
-#     assignment_id: int,
-#     current_user: UserSchema = Depends(get_current_user_from_cookie),
-#     db: Session = Depends(get_db),
-# ):
-#     """배정 취소 (status → cancelled)"""
-#     return cancel_assignment(assignment_id, db)

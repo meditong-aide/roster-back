@@ -13,12 +13,14 @@ from services.cp_sat.hardcoded_weights import (
     NIGHT_DEVIATION_PENALTY,
     NOD_NOE_PENALTY,
     N_ONLY_NIGHT_BONUS,
+    PREFER_3N_BLOCK_PENALTY,
     PREFERENCE_SCORE_SCALE,
     WEEK_OFF_SHORT_PENALTY,
 )
 from services.constraints.grade_constraints import add_grade_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes, is_n_only_profile
+from services.day_windows import iter_nurse_days, build_active_days
 
 
 def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
@@ -84,7 +86,7 @@ def add_even_mid_distribution_terms(
             continue
 
         has_m_window = False
-        for d in range(join[n], leave[n] + 1):
+        for d in iter_nurse_days(n, join, leave, blocked_by_nurse=None):
             if "M" not in initial_forbidden.get((n, d), set()):
                 has_m_window = True
                 break
@@ -117,7 +119,7 @@ def add_even_mid_distribution_terms(
     high = low + (1 if (total_need_m % len(candidates)) else 0)
     obj: list = []
     for n in candidates:
-        tot_mid = sum(X(n, d, mid_idx) for d in range(join[n], leave[n] + 1))
+        tot_mid = sum(X(n, d, mid_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse=None))
         dev_low = m.NewIntVar(0, D, f"devMlow_{n}")
         dev_high = m.NewIntVar(0, D, f"devMhigh_{n}")
         m.Add(dev_low >= low - tot_mid)
@@ -137,6 +139,7 @@ def add_even_night_minmax_distribution_terms(
     fixed_cnt: list[list[int]] | None = None,
     logger_prefix: str = "[objective_terms]",
     stage_label: str = "메인",
+    blocked_by_nurse: dict[int, set[int]] | None = None,
 ) -> list:
     cfg = rs.config
     if "N" not in cfg.shift_types:
@@ -206,12 +209,25 @@ def add_even_night_minmax_distribution_terms(
     obj: list = []
     max_n = m.NewIntVar(0, D, f"night_max_{stage_label}")
     for n in normals_can_n:
-        tot_nights = sum(X(n, d, night_idx) for d in range(join[n], leave[n] + 1))
+        # blocked 간호사: active_days 비례로 N band 축소
+        _n_blocked = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
+        _active = leave[n] - join[n] + 1 - _n_blocked
+        if _n_blocked > 0 and _active < D:
+            _ratio = max(0.0, _active / max(1, D))
+            low_n = max(0, round(low * _ratio))
+            high_n = max(low_n, round(high * _ratio))
+            print(
+                f"{logger_prefix} [N균등] nurse_idx={n} blocked={_n_blocked}, "
+                f"active={_active}/{D}, band=[{low_n},{high_n}] (비례 축소)"
+            )
+        else:
+            low_n, high_n = low, high
+        tot_nights = sum(X(n, d, night_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse))
         m.Add(max_n >= tot_nights)
         dev_low = m.NewIntVar(0, D, f"night_devL_{stage_label}_{n}")
         dev_high = m.NewIntVar(0, D, f"night_devH_{stage_label}_{n}")
-        m.Add(dev_low >= low - tot_nights)
-        m.Add(dev_high >= tot_nights - high)
+        m.Add(dev_low >= low_n - tot_nights)
+        m.Add(dev_high >= tot_nights - high_n)
         obj.append(-w_secondary * dev_low)
         obj.append(-w_secondary * dev_high)
     obj.append(-w_primary * max_n)
@@ -230,6 +246,7 @@ def build_main_objective_terms(
     include_pair_objective: bool,
     preceptor_terms_fn: Callable[..., Iterable],
     fixed_cnt: list[list[int]] | None = None,
+    blocked_by_nurse: dict[int, set[int]] | None = None,
 ) -> list:
     """메인 모델의 목적 함수 항들을 생성한다.
 
@@ -257,6 +274,7 @@ def build_main_objective_terms(
     P = rs.preference_matrix
     N = len(rs.nurses)
     D = rs.num_days
+    active_days = build_active_days(N, join, leave, blocked_by_nurse)
     S = cfg.num_shifts
     idx = {c: cfg.shift_types.index(c) for c in ("D", "E", "N", "O")}
     day, eve, night, off = idx["D"], idx["E"], idx["N"], idx["O"]
@@ -270,7 +288,7 @@ def build_main_objective_terms(
         raw = getattr(nu, "is_night_nurse", None)
         is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
 
-        for d in range(join[n], leave[n] + 1):
+        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             for s in range(S):
                 base_score = int(P[n, d, s] * PREFERENCE_SCORE_SCALE) if d < D else 0
                 if is_n_only and s == night:
@@ -282,7 +300,7 @@ def build_main_objective_terms(
         off_penalty = int(getattr(cfg, "extra_off_penalty_weight", 0) or 0)
         if off_penalty > 0:
             for n in range(N):
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     obj.append(-off_penalty * X(n, d, off))
     except Exception:
         pass
@@ -308,7 +326,7 @@ def build_main_objective_terms(
                 if w <= 0:
                     continue
                 s_idx = cfg.shift_types.index(code)
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     obj.append(w * X(n, d, s_idx))
     except Exception:
         pass
@@ -335,7 +353,7 @@ def build_main_objective_terms(
             exp_assigned = sum(
                 X(n, d, s)
                 for n, nu in enumerate(rs.nurses)
-                if join[n] <= d <= leave[n] and nu.experience_years >= cfg.min_experience_per_shift
+                if join[n] <= d <= leave[n] and (nu.experience_years or 0) >= cfg.min_experience_per_shift
             )
             shortage = m.NewIntVar(0, cfg.required_experienced_nurses, f"expShort_{d}_{code}")
             m.Add(shortage >= cfg.required_experienced_nurses - exp_assigned)
@@ -362,6 +380,7 @@ def build_main_objective_terms(
             fixed_cnt=fixed_cnt,
             logger_prefix="[objective_terms]",
             stage_label="메인",
+            blocked_by_nurse=blocked_by_nurse,
         )
     )
 
@@ -380,6 +399,8 @@ def build_main_objective_terms(
     if getattr(cfg, "nod_noe", True):
         for n in range(N):
             for d in range(join[n], leave[n] - 2):
+                if any((n, d + k) not in active_days for k in range(4)):
+                    continue
                 pat = m.NewIntVar(0, 1, f"NOD_{n}_{d}")
                 m.Add(pat >= X(n, d, night) + X(n, d + 1, off) + X(n, d + 2, day) - 2)
                 obj.append(-NOD_NOE_PENALTY * pat)
@@ -393,7 +414,7 @@ def build_main_objective_terms(
     # (4-5) 고립 OFF (sequential_offs ON일 때만, fallback과 동일)
     if getattr(cfg, "sequential_offs", True):
         for n in range(N):
-            for d in range(join[n], leave[n] + 1):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 iso = m.NewIntVar(0, 1, f"iso_{n}_{d}")
                 m.Add(iso >= X(n, d, off) - X(n, d - 1, off) - X(n, d + 1, off))
                 m.Add(iso <= X(n, d, off))
@@ -424,7 +445,7 @@ def build_main_objective_terms(
         grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
         print("grade_strategy", grade_strategy)
         if grade_strategy == "TEAM":
-            obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave))
+            obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
 
     # (4-6a) Grade 분배 목적 항 (fallback Stage3와 동일)
     try:
@@ -473,6 +494,51 @@ def build_main_objective_terms(
                         m.Add(diff >= ov1 - ov2)
                         m.Add(diff >= ov2 - ov1)
                         obj.append(-w_eq * diff)
+    except Exception:
+        pass
+
+    # (4-9) 3N 블록 유도: 2N2O+3N2O 동시 활성 시 2N 블록에 소프트 페널티
+    try:
+        _both_noff = (
+            bool(getattr(cfg, "two_offs_after_two_nig", False))
+            and bool(getattr(cfg, "two_offs_after_three_nig", False))
+        )
+        if _both_noff and PREFER_3N_BLOCK_PENALTY > 0:
+            night_idx = cfg.shift_types.index("N")
+            n_forbid = set(getattr(rs, "n_forbid_n", set()) or set())
+            for n in range(N):
+                if n in n_forbid:
+                    continue
+                T0, T1 = join[n], leave[n]
+                for d in range(T0 + 1, T1):
+                    if blocked_by_nurse and d in blocked_by_nurse.get(n, set()):
+                        continue
+                    xn_prev = X(n, d - 1, night_idx)
+                    xn_curr = X(n, d, night_idx)
+                    # !N(d-2): 블록 시작 확인
+                    if d - 2 >= T0 and not (blocked_by_nurse and (d - 2) in blocked_by_nurse.get(n, set())):
+                        not_prev2 = X(n, d - 2, night_idx).Not()
+                    else:
+                        not_prev2 = None
+                    # !N(d+1): 블록 종료 확인
+                    if d + 1 <= T1 and not (blocked_by_nurse and (d + 1) in blocked_by_nurse.get(n, set())):
+                        not_next = X(n, d + 1, night_idx).Not()
+                    else:
+                        not_next = None
+                    is_2n = m.NewBoolVar(f"is2n_{n}_{d}")
+                    conds = [xn_prev, xn_curr]
+                    if not_prev2 is not None:
+                        conds.append(not_prev2)
+                    if not_next is not None:
+                        conds.append(not_next)
+                    m.Add(sum(conds) - len(conds) + 1 <= is_2n)
+                    m.Add(is_2n <= xn_prev)
+                    m.Add(is_2n <= xn_curr)
+                    if not_prev2 is not None:
+                        m.Add(is_2n <= not_prev2)
+                    if not_next is not None:
+                        m.Add(is_2n <= not_next)
+                    obj.append(-PREFER_3N_BLOCK_PENALTY * is_2n)
     except Exception:
         pass
 

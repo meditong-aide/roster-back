@@ -7,10 +7,10 @@ import json
 import traceback
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dateutil.relativedelta import relativedelta
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
 
 from db.models import (
@@ -288,7 +288,11 @@ def _normalize_case_items(
     """
     normalized: list[dict[str, Any]] = []
     ignored: list[dict[str, Any]] = []
-    allowed_shifts = set(allowed_shift_map.keys()) if allowed_shift_map else None
+    # 대소문자 무시 매칭을 위한 lookup: upper → 원본 shift_id
+    allowed_upper_to_original: dict[str, str] = {}
+    if allowed_shift_map:
+        for sid in allowed_shift_map.keys():
+            allowed_upper_to_original[sid.upper()] = sid
 
     for item in case_raw or []:
         try:
@@ -307,10 +311,19 @@ def _normalize_case_items(
             ignored.append({"reason": "shift 누락", "item": payload})
             continue
 
-        shift = str(shift_raw).strip().upper()
-        if not shift or (allowed_shifts and shift not in allowed_shifts):
+        shift_input = str(shift_raw).strip()
+        if not shift_input:
             ignored.append({"reason": "허용되지 않는 shift", "item": payload})
             continue
+        # 대소문자 무시로 allowed_shifts에서 원본 shift_id 매칭
+        if allowed_upper_to_original:
+            matched = allowed_upper_to_original.get(shift_input.upper())
+            if not matched:
+                ignored.append({"reason": "허용되지 않는 shift", "item": payload})
+                continue
+            shift = matched
+        else:
+            shift = shift_input
 
         parsed_date = _parse_case_date(
             date_value=date_raw,
@@ -488,7 +501,7 @@ def _parse_shift_results(
                 if not isinstance(record, dict) or "shift" not in record:
                     continue
 
-                shift = str(record.get("shift", "")).strip().upper()
+                shift = str(record.get("shift", "")).strip()
                 if not shift:
                     continue
 
@@ -2082,3 +2095,80 @@ def get_fixed_wanted_entries_service(
         FixedWantedEntry.year == year,
         FixedWantedEntry.month == month,
     ).all()
+
+
+def get_shift_requests_service(
+    db: Session,
+    target_group_id: str,
+    year: int,
+    month: int,
+    shift_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """해당 년/월 그룹 내 전체 간호사의 원티드 제출 여부 + shift 내역 반환"""
+    nurse_ids = [
+        n[0] for n in
+        db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
+    ]
+    if not nurse_ids:
+        return []
+
+    month_str = f"{year:04d}-{month:02d}"
+    first_day = date(year, month, 1)
+    last_day = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+
+    # 제출 현황 일괄 조회 (is_submitted=True인 최신 request_id만)
+    submitted_requests = (
+        db.query(WantedRequest)
+        .filter(
+            WantedRequest.nurse_id.in_(nurse_ids),
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True,
+        )
+        .all()
+    )
+    submitted_map = {wr.nurse_id: wr for wr in submitted_requests}
+
+    # 제출된 간호사의 (nurse_id, request_id) 쌍으로 shift 필터
+    submitted_pairs = [
+        (wr.nurse_id, wr.request_id) for wr in submitted_requests
+    ]
+
+    shift_map: Dict[str, list] = {}
+    if submitted_pairs:
+        shift_query = db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.shift_date >= first_day,
+            NurseShiftRequest.shift_date < last_day,
+            or_(
+                *(
+                    and_(
+                        NurseShiftRequest.nurse_id == nid,
+                        NurseShiftRequest.request_id == rid,
+                    )
+                    for nid, rid in submitted_pairs
+                )
+            ),
+        )
+        if shift_type:
+            shift_query = shift_query.filter(NurseShiftRequest.shift == shift_type)
+        shift_rows = shift_query.all()
+
+        for row in shift_rows:
+            shift_map.setdefault(row.nurse_id, []).append({
+                "shift_date": row.shift_date.isoformat(),
+                "shift": row.shift,
+                "shifts_table_id": row.shifts_table_id,
+                "score": float(row.score),
+                "comment": row.comment,
+            })
+
+    results = []
+    for nurse_id in nurse_ids:
+        wr = submitted_map.get(nurse_id)
+        results.append({
+            "nurse_id": nurse_id,
+            "is_submitted": wr is not None,
+            "submitted_at": wr.submitted_at.isoformat() if wr and wr.submitted_at else None,
+            "shifts": shift_map.get(nurse_id, []),
+        })
+
+    return results

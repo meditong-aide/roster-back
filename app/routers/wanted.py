@@ -26,6 +26,7 @@ from db.client2 import get_db
 from db.models import (
     Wanted,
     NurseShiftRequest,
+    WantedRequest,
     WantedConfig,
     Nurse,
     ShiftPreference,
@@ -48,6 +49,7 @@ from services.wanted_service import (
     get_fixed_wanted_for_roster_service,
     get_fixed_wanted_entries_service,
     reset_fixed_wanted_service,
+    get_shift_requests_service,
 )
 
 router = APIRouter(
@@ -1012,3 +1014,37 @@ async def get_fixed_wanted(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"확정 원티드 조회 실패: {str(e)}")
+
+
+# [Wanted] - 전체 원티드 제출 현황 + shift 내역 일괄 조회
+@router.get("/{year:int}/{month:int}/shift-requests")
+async def get_all_shift_requests(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    shift_type: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """해당 년/월 그룹 내 전체 간호사의 원티드 제출 여부 + nurse_shift_requests 내역 반환.
+    shift_type: 특정 근무만 필터링 (예: 'O'면 OFF만)"""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # 대상 그룹 결정
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        target_group_id = current_user.group_id
+    else:
+        if not getattr(current_user, 'is_master_admin', False):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
+            raise HTTPException(status_code=403, detail="Group does not belong to your office")
+        target_group_id = g.group_id
+
+    results = get_shift_requests_service(db, target_group_id, year, month, shift_type)
+    return {"results": results}

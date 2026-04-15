@@ -540,3 +540,69 @@ class ScheduleShareCaptureCreateRequest(BaseModel):
     title: Optional[str] = "근무표 공유"
     description: Optional[str] = "공유된 근무표입니다."
     expires_in_days: int = Field(default=3, ge=1, le=365)
+
+
+# ── NurseAssignment (파견/휴직/퇴사/프리셉티/병동이동) ──
+
+class NurseAssignmentCreate(BaseModel):
+    """배정/상태 변경 등록 요청"""
+    nurse_id: str
+    source_group_id: str
+    target_group_id: Optional[str] = None
+    office_id: str
+    start_date: date
+    expected_end_date: Optional[date] = Field(default=None, description="예상 종료일 (병동이동 시 미지정 가능)")
+    reason: str = Field(description="파견 / 휴직 / 퇴사 / 프리셉티 / 병동이동")
+    # target 그룹 전용 설정
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = Field(default=None, description="target 그룹 근무 가능 shift ID 목록")
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
+
+
+class NurseAssignmentUpdate(BaseModel):
+    """배정/상태 변경 수정 요청"""
+    expected_end_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: Optional[str] = Field(default=None, description="active / completed / cancelled")
+    # target 그룹 전용 설정
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
+
+
+class NurseAssignmentResponse(BaseModel):
+    """배정/상태 변경 응답"""
+    id: int
+    nurse_id: str
+    nurse_name: Optional[str] = None
+    source_group_id: str
+    target_group_id: Optional[str] = None
+    office_id: str
+    start_date: date
+    expected_end_date: Optional[date] = None
+    end_date: Optional[date] = None
+    reason: str
+    status: str
+    # target 그룹 전용 설정
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}

@@ -31,6 +31,9 @@ NOD_NOE_PENALTY = 300
 # 고립 OFF 패널티
 ISOLATED_OFF_PENALTY = 100
 
+# 2N 블록 패널티 (3N 유도): 2N2O+3N2O 동시 활성 시 3N 블록 선호
+PREFER_3N_BLOCK_PENALTY = 80
+
 # 팀 균형(TEAM 전략) 후처리 보너스 배수
 TEAM_BALANCE_POSTPROCESS_BONUS = 0.2
 

@@ -7,9 +7,11 @@ from ortools.sat.python import cp_model
 from services.cp_sat.hardcoded_weights import (
     FALLBACK_EXPERIENCE_SHORT_PENALTY,
     N_ONLY_NIGHT_BONUS,
+    PREFER_3N_BLOCK_PENALTY,
     PREFERENCE_SCORE_SCALE,
 )
 from services.cp_sat.allowed_shift_types import is_n_only_profile
+from services.day_windows import iter_nurse_days
 from services.cp_sat.objective_terms import (
     add_even_mid_distribution_terms,
     add_even_night_minmax_distribution_terms,
@@ -32,6 +34,7 @@ def build_fallback_stage3_objective_terms(
     add_preceptor_terms_fn,
     add_team_balance_terms_fn,
     add_grade_constraints_fn,
+    blocked_by_nurse: dict[int, set[int]] | None = None,
 ) -> list:
     """폴백 3단계(선호/공정성) 목적함수 항을 생성한다.
 
@@ -64,7 +67,7 @@ def build_fallback_stage3_objective_terms(
         nu = roster_system.nurses[n]
         raw = getattr(nu, "is_night_nurse", None)
         is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
-        for d in range(join[n], leave[n] + 1):
+        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             for s in range(S):
                 base_score = int(P[n, d, s] * PREFERENCE_SCORE_SCALE)
                 if is_n_only and s == cfg.shift_types.index("N"):
@@ -77,7 +80,7 @@ def build_fallback_stage3_objective_terms(
         if off_penalty > 0:
             off_idx = cfg.shift_types.index("O")
             for n in range(N):
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     obj.append(-off_penalty * X(n, d, off_idx))
     except Exception:
         pass
@@ -255,7 +258,7 @@ def build_fallback_stage3_objective_terms(
                 if w <= 0:
                     continue
                 s_idx = cfg.shift_types.index(code)
-                for d in range(join[n], leave[n] + 1):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     obj.append(w * X(n, d, s_idx))
     except Exception:
         pass
@@ -271,6 +274,7 @@ def build_fallback_stage3_objective_terms(
                 fixed_cnt=fixed_cnt,
                 logger_prefix=logger_prefix,
                 stage_label="폴백 Stage3",
+                blocked_by_nurse=blocked_by_nurse,
             )
         )
         obj.extend(
@@ -309,7 +313,7 @@ def build_fallback_stage3_objective_terms(
             exp_assigned = sum(
                 X(n, d, s)
                 for n, nu in enumerate(roster_system.nurses)
-                if join[n] <= d <= leave[n] and nu.experience_years >= cfg.min_experience_per_shift
+                if join[n] <= d <= leave[n] and (nu.experience_years or 0) >= cfg.min_experience_per_shift
             )
             shortage = m.NewIntVar(0, cfg.required_experienced_nurses, f"expShort_fb_{d}_{code}")
             m.Add(shortage >= cfg.required_experienced_nurses - exp_assigned)
@@ -368,6 +372,51 @@ def build_fallback_stage3_objective_terms(
     except Exception as e:
         print("grade_constraints 예외 발생")
         print("e", e)
+        pass
+
+    # 3N 블록 유도: 2N2O+3N2O 동시 활성 시 2N 블록에 소프트 페널티
+    try:
+        cfg = roster_system.config
+        _both_noff = (
+            bool(getattr(cfg, "two_offs_after_two_nig", False))
+            and bool(getattr(cfg, "two_offs_after_three_nig", False))
+        )
+        if _both_noff and PREFER_3N_BLOCK_PENALTY > 0:
+            night_idx = cfg.shift_types.index("N")
+            N = len(roster_system.nurses)
+            n_forbid = set(getattr(roster_system, "n_forbid_n", set()) or set())
+            for n in range(N):
+                if n in n_forbid:
+                    continue
+                T0, T1 = join[n], leave[n]
+                for d in range(T0 + 1, T1):
+                    if blocked_by_nurse and d in blocked_by_nurse.get(n, set()):
+                        continue
+                    xn_prev = X(n, d - 1, night_idx)
+                    xn_curr = X(n, d, night_idx)
+                    if d - 2 >= T0 and not (blocked_by_nurse and (d - 2) in blocked_by_nurse.get(n, set())):
+                        not_prev2 = X(n, d - 2, night_idx).Not()
+                    else:
+                        not_prev2 = None
+                    if d + 1 <= T1 and not (blocked_by_nurse and (d + 1) in blocked_by_nurse.get(n, set())):
+                        not_next = X(n, d + 1, night_idx).Not()
+                    else:
+                        not_next = None
+                    is_2n = m.NewBoolVar(f"fb_is2n_{n}_{d}")
+                    conds = [xn_prev, xn_curr]
+                    if not_prev2 is not None:
+                        conds.append(not_prev2)
+                    if not_next is not None:
+                        conds.append(not_next)
+                    m.Add(sum(conds) - len(conds) + 1 <= is_2n)
+                    m.Add(is_2n <= xn_prev)
+                    m.Add(is_2n <= xn_curr)
+                    if not_prev2 is not None:
+                        m.Add(is_2n <= not_prev2)
+                    if not_next is not None:
+                        m.Add(is_2n <= not_next)
+                    obj.append(-PREFER_3N_BLOCK_PENALTY * is_2n)
+    except Exception:
         pass
 
     return obj

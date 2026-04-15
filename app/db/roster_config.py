@@ -77,6 +77,7 @@ class NurseRosterConfig:
 
     # --- 신규 Hard Constraint 제어 파라미터 ---
     enforce_seniority_pairing: bool = True # 시니어-주니어 동반 근무 규칙 강제 여부
+    ban_night_before_fixed_off: bool = True  # fixed_wanted 비근무(휴무/휴가/공가 등) 직전일 N 배치 금지
     junior_pairing_max_experience: int = 2 # 주니어로 간주할 최대 연차
     senior_pairing_min_experience: int = 6 # 시니어로 간주할 최소 연차
     enforce_E_after_D_constraint: bool = True # E -> D 근무 금지 규칙 강제 여부
@@ -101,7 +102,6 @@ class NurseRosterConfig:
     team_balance_focus_shifts: Optional[List[str]] = None  # 교대 제한 (없으면 D/E/N)
     team_balance_mode: str = "balanced"             # balanced | focus_D | focus_DE
     team_balance_shift_weights: Dict[str, float] = field(default_factory=dict)  # 모드별 파생 가중치
-    
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
