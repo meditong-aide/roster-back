@@ -29,7 +29,15 @@ class ReplacementRecommendOptions(BaseModel):
     allow_non_off_candidates: bool = True
     max_candidate_scan: int = Field(default=50, ge=1, le=300)
     include_explanations: bool = True
-    ranking_scope: Literal["ALL", "OFF_ONLY", "ON_DUTY_ONLY", "VACATION_ONLY"] = "ALL"
+    ranking_scope: Literal[
+        "ALL",
+        "OFF_ONLY",
+        "ON_DUTY_ONLY",
+        "VACATION_ONLY",
+        "ON_DUTY_OR_OFF",
+        "ON_DUTY_OR_VACATION",
+        "OFF_OR_VACATION",
+    ] = "ALL"
 
 
 class ReplacementRecommendRequest(BaseModel):

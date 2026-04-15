@@ -51,6 +51,7 @@ VIOLATION_TYPE_WEIGHT: Dict[str, float] = {
     "rec_2n2o": 1.8,              # 2연속 나이트 후 OFF 부족
     "night_nd": 1.5,              # N→D 전환 위반
     "night_ne": 1.5,              # N→E 전환 위반
+    "daily_coverage_shortage": 2.0,  # 일자별 최소 인원(D/E/N) 악화
     "eve_ed": 1.0,                # E→D 전환 위반
 }
 VACATION_SHIFT_TYPE_TOKENS = {"휴가", "vacation", "annual_leave", "annual leave", "연차", "연가"}
@@ -66,6 +67,35 @@ WORK_SHIFT_GB_TO_MAIN = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _is_candidate_allowed_by_scope(
+    scope: str,
+    is_off_rest: bool,
+    is_vacation: bool,
+) -> bool:
+    """ranking_scope 필터 — SINGLE/BULK 공통.
+
+    OFF_ONLY 는 순수 휴무(rest)만 허용하며 휴가는 제외.
+    VACATION_ONLY 는 휴가만 허용. ON_DUTY_ONLY 는 비-휴무·비-휴가만.
+    조합 모드(ON_DUTY_OR_*, OFF_OR_VACATION) 는 union.
+    """
+    is_on_duty = not (is_off_rest or is_vacation)
+    if scope == "ALL":
+        return True
+    if scope == "ON_DUTY_ONLY":
+        return is_on_duty
+    if scope == "OFF_ONLY":
+        return is_off_rest
+    if scope == "VACATION_ONLY":
+        return is_vacation
+    if scope == "ON_DUTY_OR_OFF":
+        return is_on_duty or is_off_rest
+    if scope == "ON_DUTY_OR_VACATION":
+        return is_on_duty or is_vacation
+    if scope == "OFF_OR_VACATION":
+        return is_off_rest or is_vacation
+    return True
 
 
 @dataclass
@@ -846,6 +876,7 @@ def _split_slots_ngram_optimal(
     slots: List[ReplacementSlot],
     max_window: int = 4,
     evaluate_fn=None,
+    min_window: int = 1,
 ) -> List[Tuple[str, List[ReplacementSlot]]]:
     """n-gram 슬라이딩 윈도우 최적 분할 (DP).
 
@@ -867,12 +898,16 @@ def _split_slots_ngram_optimal(
     ]
     dp[0] = (0, 0.0, [])
 
-    # 세그먼트 전환 패널티: 분할 수가 많아질수록 불리하게 하여
-    # 1일 단위 분할을 방지하고 구간별 1명 전담 효과를 극대화
-    segment_penalty = 1
+    # 위반 최소화 우선. 분할 비용 없음.
+    segment_penalty = 0
 
     for i in range(1, n + 1):
-        for w in range(1, min(max_window, i) + 1):
+        _lo = max(1, min_window)
+        _hi = min(max_window, i)
+        # 전체 슬롯 수가 min_window 미만이면 어쩔 수 없이 1-window 허용
+        if i < min_window and n < min_window:
+            _lo = 1
+        for w in range(_lo, _hi + 1):
             j = i - w
             if dp[j][0] == INF_V and j > 0:
                 continue
@@ -883,7 +918,9 @@ def _split_slots_ngram_optimal(
                 v_count, score = 0, float(w)
             # 첫 세그먼트(j==0)는 패널티 없음, 이후 세그먼트마다 패널티 추가
             split_cost = segment_penalty if j > 0 else 0
-            total_v = dp[j][0] + v_count + split_cost
+            # 1-day 구간은 작은 패널티(soft): 2일 이상 묶음을 선호
+            small_seg_penalty = 1 if (w == 1 and min_window >= 2) else 0
+            total_v = dp[j][0] + v_count + split_cost + small_seg_penalty
             total_s = dp[j][1] + score
             if total_v < dp[i][0] or (total_v == dp[i][0] and total_s > dp[i][1]):
                 dp[i] = (total_v, total_s, dp[j][2] + [(j, i)])
@@ -901,8 +938,13 @@ def _split_slots_by_shift_type(
     shift_meta: Dict[str, Dict[str, Any]],
     shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
     target_schedule_shift_pks: Optional[List[Optional[str]]] = None,
+    max_segment_days: int = 3,
 ) -> List[Tuple[str, List[ReplacementSlot]]]:
-    """근무 유형 경계 분할: D/E/M vs N 연속 구간별 분리."""
+    """근무 유형 경계 분할: D/E/M vs N 연속 구간별 분리.
+
+    동일 유형 연속이라도 max_segment_days 초과 시 강제 분할하여
+    1명이 과도한 연속 근무로 몰리는 것을 방지.
+    """
     if not slots:
         return []
 
@@ -922,9 +964,9 @@ def _split_slots_by_shift_type(
     current_group: List[ReplacementSlot] = [slots[0]]
     for slot in slots[1:]:
         st = _classify(slot)
-        # 유형 변경 또는 날짜 불연속(Off 끼임) 시 세그먼트 분리
         date_gap = (slot.date - current_group[-1].date).days > 1
-        if st != current_type or date_gap:
+        over_cap = len(current_group) >= max_segment_days
+        if st != current_type or date_gap or over_cap:
             label = f"{current_type} ({current_group[0].date}~{current_group[-1].date})"
             segments.append((label, current_group))
             current_type = st
@@ -1032,6 +1074,7 @@ def _evaluate_segment_single_nurse(
     target_pk_row = schedule_shift_pk_map.get(req.target_nurse_id, [])
 
     eval_limit = min(max_scan, len(scored))
+    _max_conseq = int(getattr(config, "max_conseq_work", 5) or 5) if config else 5
     for cid, ctx, base_score in scored[:eval_limit]:
         if cid == req.target_nurse_id or cid in used_nurse_ids:
             continue
@@ -1040,6 +1083,33 @@ def _evaluate_segment_single_nurse(
         total = 0.0
         feasible = True
         _seg_blocked = (assignment_blocked or {}).get(cid, set())
+
+        # 사전 필터: seg_slots 전체 덮었을 때 이 후보의 연속근무가 max_conseq 초과면 컷
+        if nurse_sched:
+            _seg_days = {s.date.day - 1 for s in seg_slots}
+            _sim_row = list(nurse_sched)
+            for _d in _seg_days:
+                if _d < len(_sim_row):
+                    _sim_row[_d] = "X"  # 임시 근무 표식 (비-OFF)
+            _max_streak = 0
+            _cur = 0
+            for _i, _sh in enumerate(_sim_row):
+                _pk = nurse_pk_row[_i] if _i < len(nurse_pk_row) else None
+                if _sh == "X":
+                    _is_off_here = False
+                else:
+                    _, _, _, _is_off_here, _ = _resolve_shift_semantic_with_reason(
+                        _sh, shift_meta, shift_pk=_pk, shift_meta_by_pk=shift_meta_by_pk,
+                    )
+                if _is_off_here:
+                    _max_streak = max(_max_streak, _cur)
+                    _cur = 0
+                else:
+                    _cur += 1
+            _max_streak = max(_max_streak, _cur)
+            if _max_streak > _max_conseq:
+                continue
+
         for slot in seg_slots:
             day_idx = slot.date.day - 1
             if day_idx >= len(nurse_sched):
@@ -1053,10 +1123,13 @@ def _evaluate_segment_single_nurse(
             _main, _is_off_rest, _is_vac, is_off, _reason = _resolve_shift_semantic_with_reason(
                 cur_shift, shift_meta, shift_pk=cur_pk, shift_meta_by_pk=shift_meta_by_pk,
             )
-            if is_off:
-                total += base_score
-            else:
-                total += base_score * 0.5
+            # ranking_scope 기반 필터 (구간 내 모든 날에 대해 일관되게 적용)
+            if not _is_candidate_allowed_by_scope(
+                ranking_scope, _is_off_rest, _is_vac,
+            ):
+                feasible = False
+                break
+            total += base_score * (1.0 if is_off else 0.5)
         if not feasible:
             continue
         # 위반 시뮬레이션: 해당 간호사에 구간 전체 배정 후 위반 수 계산
@@ -1358,7 +1431,10 @@ def recommend_replacement_candidates(
     max_scan = req.options.max_candidate_scan
     ranking_scope = str(getattr(req.options, "ranking_scope", "ALL") or "ALL").upper()
     violation_delta_lambda = 18.0
-    if ranking_scope not in {"ALL", "OFF_ONLY", "ON_DUTY_ONLY", "VACATION_ONLY"}:
+    if ranking_scope not in {
+        "ALL", "OFF_ONLY", "ON_DUTY_ONLY", "VACATION_ONLY",
+        "ON_DUTY_OR_OFF", "ON_DUTY_OR_VACATION", "OFF_OR_VACATION",
+    }:
         ranking_scope = "ALL"
 
     if req.mode == "BULK":
@@ -1423,7 +1499,7 @@ def recommend_replacement_candidates(
             return (v.total_count if v else 0), score
 
         even_segments = _split_slots_ngram_optimal(
-            slots=slots, max_window=4, evaluate_fn=_ngram_eval,
+            slots=slots, max_window=3, min_window=2, evaluate_fn=_ngram_eval,
         )
         path_2 = _build_split_path(
             segments_raw=even_segments,
@@ -1487,6 +1563,7 @@ def recommend_replacement_candidates(
 
         excluded = defaultdict(int)
         candidate_pool: List[Tuple[str, CandidateContext]] = []
+        fallback_pool: List[Tuple[str, CandidateContext]] = []
 
         for candidate_id, nurse in nurse_by_id.items():
             if candidate_id == req.target_nurse_id:
@@ -1513,9 +1590,9 @@ def recommend_replacement_candidates(
                 excluded["assignment_blocked"] += 1
                 continue
 
-            if not _nurse_can_work_shift(nurse, target_shift_main):
+            _cap_fallback = not _nurse_can_work_shift(nurse, target_shift_main)
+            if _cap_fallback:
                 excluded["shift_not_allowed"] += 1
-                continue
 
             schedule_row = schedule_map[candidate_id]
             schedule_shift_pk_row = schedule_shift_pk_map.get(candidate_id, [])
@@ -1550,13 +1627,9 @@ def recommend_replacement_candidates(
                     slot.date.isoformat(),
                 )
 
-            if ranking_scope == "OFF_ONLY" and not assigned_is_off_rest:
-                excluded["ranking_scope_filtered"] += 1
-                continue
-            if ranking_scope == "ON_DUTY_ONLY" and assigned_is_off:
-                excluded["ranking_scope_filtered"] += 1
-                continue
-            if ranking_scope == "VACATION_ONLY" and not assigned_is_vacation:
+            if not _is_candidate_allowed_by_scope(
+                ranking_scope, assigned_is_off_rest, assigned_is_vacation,
+            ):
                 excluded["ranking_scope_filtered"] += 1
                 continue
             if ranking_scope == "ALL" and not req.options.allow_non_off_candidates and not assigned_is_off:
@@ -1619,6 +1692,9 @@ def recommend_replacement_candidates(
                 vacation_penalty = 70.0
                 tags.append("vacation_penalized")
 
+            if _cap_fallback:
+                tags.append("shift_capability_fallback")
+
             candidate_grade_value = None
             raw_candidate_grade = getattr(nurse, "grade", None)
             if raw_candidate_grade is not None:
@@ -1627,33 +1703,37 @@ def recommend_replacement_candidates(
                 except Exception:
                     candidate_grade_value = None
 
-            candidate_pool.append(
-                (
-                    candidate_id,
-                    CandidateContext(
-                        nurse_id=candidate_id,
-                        nurse_name=str(getattr(nurse, "name", candidate_id)),
-                        nurse_grade=candidate_grade_value,
-                        assigned_shift=assigned_shift,
-                        assigned_shift_pk_id=assigned_shift_pk,
-                        assigned_is_off=assigned_is_off,
-                        assigned_is_vacation=assigned_is_vacation,
-                        rule_safety=rule_safety,
-                        estimated_violation_delta=estimated_delta,
-                        off_priority=off_priority,
-                        grade_fit=grade_fit,
-                        preference=preference,
-                        pair=pair,
-                        fairness=0.5,
-                        change_cost=0.0 if assigned_is_off else 1.0,
-                        vacation_penalty=vacation_penalty,
-                        tags=tags,
-                    ),
-                )
+            _ctx = CandidateContext(
+                nurse_id=candidate_id,
+                nurse_name=str(getattr(nurse, "name", candidate_id)),
+                nurse_grade=candidate_grade_value,
+                assigned_shift=assigned_shift,
+                assigned_shift_pk_id=assigned_shift_pk,
+                assigned_is_off=assigned_is_off,
+                assigned_is_vacation=assigned_is_vacation,
+                rule_safety=rule_safety,
+                estimated_violation_delta=estimated_delta,
+                off_priority=off_priority,
+                grade_fit=grade_fit,
+                preference=preference,
+                pair=pair,
+                fairness=0.5,
+                change_cost=0.0 if assigned_is_off else 1.0,
+                vacation_penalty=vacation_penalty,
+                tags=tags,
             )
+            if _cap_fallback:
+                fallback_pool.append((candidate_id, _ctx))
+            else:
+                candidate_pool.append((candidate_id, _ctx))
 
             if len(candidate_pool) >= max_scan:
                 break
+
+        # top_k 미만이면 fallback 풀 전체 병합 (후속 정렬에서 점수 상위만 살아남음)
+        _top_k = int(getattr(req, "top_k", 10) or 10)
+        if len(candidate_pool) < _top_k and fallback_pool:
+            candidate_pool.extend(fallback_pool)
 
         fairness_map = _fairness_scores(
             candidate_pool,
@@ -1671,6 +1751,10 @@ def recommend_replacement_candidates(
             non_vacation = [item for item in scored if not item[1].assigned_is_vacation]
             vacation = [item for item in scored if item[1].assigned_is_vacation]
             scored = non_vacation + vacation
+        # shift_capability_fallback 후보는 항상 정규 후보 뒤로 배치 (내부 순서는 기존 정렬 유지)
+        _regular = [it for it in scored if "shift_capability_fallback" not in it[1].tags]
+        _fb = [it for it in scored if "shift_capability_fallback" in it[1].tags]
+        scored = _regular + _fb
         top = scored[:top_k]
 
         candidate_models: List[CandidateRecommendation] = []
@@ -1806,11 +1890,9 @@ def _evaluate_single_slot(
         if not assigned_is_off and assigned_main not in ("D", "E", "N", "M"):
             continue
 
-        if ranking_scope == "OFF_ONLY" and not assigned_is_off_rest:
-            continue
-        if ranking_scope == "ON_DUTY_ONLY" and assigned_is_off:
-            continue
-        if ranking_scope == "VACATION_ONLY" and not assigned_is_vacation:
+        if not _is_candidate_allowed_by_scope(
+            ranking_scope, assigned_is_off_rest, assigned_is_vacation,
+        ):
             continue
         if (
             ranking_scope == "ALL"
@@ -2234,10 +2316,46 @@ def _count_path_violations(
                         f"{name}: {n_streak}N 후 OFF {off_after}일 (2일 필요)",
                     )
 
+    # 일자별 커버리지 위반 — baseline 대비 악화된 경우만 카운트
+    cov_req = _build_coverage_req(config) if config else {}
+    if cov_req:
+        def _count_shift_at(src_map, src_pk_map, d: int) -> Dict[str, int]:
+            c: Dict[str, int] = defaultdict(int)
+            for nid, sched_row in src_map.items():
+                if nid == target_nurse_id or d >= len(sched_row):
+                    continue
+                pk_row = src_pk_map.get(nid, [])
+                pk = pk_row[d] if d < len(pk_row) else None
+                m_code, _, _, is_off_here, _ = _resolve_shift_semantic_with_reason(
+                    sched_row[d], shift_meta, shift_pk=pk, shift_meta_by_pk=shift_meta_by_pk,
+                )
+                if not is_off_here and m_code in cov_req:
+                    c[m_code] += 1
+            return c
+
+        affected_days = sorted({step.slot.date.day - 1 for step in path_steps})
+        for d in affected_days:
+            base_cnt = _count_shift_at(schedule_map, schedule_shift_pk_map, d)
+            post_cnt = _count_shift_at(v_map, v_pk_map, d)
+            for m_code, req_min in cov_req.items():
+                post = post_cnt.get(m_code, 0)
+                base = base_cnt.get(m_code, 0)
+                if req_min > 0 and post < req_min and post < base:
+                    violations.append(
+                        PathViolationDetail(
+                            type="daily_coverage_shortage",
+                            nurse_id="",
+                            nurse_name="",
+                            day=d + 1,
+                            description=f"{m_code} {post}/{req_min} 악화(baseline {base})",
+                        )
+                    )
+                    by_type["daily_coverage_shortage"] += 1
+
     seen = set()
     unique_violations = []
     for v in violations:
-        key = (v.type, v.nurse_id, v.day)
+        key = (v.type, v.nurse_id, v.day, v.description)
         if key not in seen:
             seen.add(key)
             unique_violations.append(v)
