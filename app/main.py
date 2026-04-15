@@ -114,13 +114,47 @@ async def _daily_nurse_sync_scheduler():
         _run_nurse_sync()
 
 
+async def _daily_prod_to_dev_sync_scheduler():
+    """매일 07:00 KST 에 prod → dev 동기화."""
+    from datetime import timedelta
+
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+
+        db = SessionLocal()
+        try:
+            from services.prod_to_dev_sync_service import sync_prod_to_dev
+            result = sync_prod_to_dev(db)
+            _scheduler_logger.info(
+                "[Scheduler] prod→dev 동기화: success=%d skipped=%d failed=%d",
+                result["success"], result["skipped"], result["failed"],
+            )
+            if result["failed"] > 0:
+                _scheduler_logger.warning(
+                    "[Scheduler] prod→dev 실패: %s",
+                    [r for r in result["results"] if "error" in r],
+                )
+        except Exception as e:
+            _scheduler_logger.error(
+                "[Scheduler] prod→dev 동기화 실패: %s", e, exc_info=True
+            )
+        finally:
+            db.close()
+
+
 @asynccontextmanager
 async def lifespan(app):
     flush_task = asyncio.create_task(_daily_flush_scheduler())
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
+    prod_dev_task = asyncio.create_task(_daily_prod_to_dev_sync_scheduler())
     yield
     flush_task.cancel()
     sync_task.cancel()
+    prod_dev_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -158,6 +192,8 @@ app.include_router(push.router)
 app.include_router(token.router)
 app.include_router(auth.router)
 app.include_router(nurses.router)
+from routers import admin_sync
+app.include_router(admin_sync.router)
 # app.include_router(schedules.router)
 app.include_router(roster.router)
 app.include_router(dates.router) 
