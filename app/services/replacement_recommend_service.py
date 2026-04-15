@@ -1289,6 +1289,7 @@ def _build_split_path(
                     preference=0, pair=0, fairness=0,
                     change_cost=0, estimated_violation_delta=0,
                 ),
+                no_candidate=True,
             )
             for s in seg_slots:
                 all_steps.append(BulkPathStep(slot=s, candidate=no_cand))
@@ -2459,6 +2460,7 @@ def _recommend_bulk_markov(
                 preference=0, pair=0, fairness=0,
                 change_cost=0, estimated_violation_delta=0,
             ),
+            no_candidate=True,
         ),
         transition_score=0.0,
     )

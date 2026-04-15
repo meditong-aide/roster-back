@@ -81,6 +81,7 @@ class CandidateRecommendation(BaseModel):
     rank: int
     tags: List[str] = Field(default_factory=list)
     breakdown: CandidateScoreBreakdown
+    no_candidate: bool = Field(default=False, description="추천 후보가 없을 때 true. 프론트에서 버튼 disabled 처리용.")
 
 
 class SlotRecommendation(BaseModel):
