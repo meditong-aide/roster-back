@@ -62,11 +62,31 @@ def get_schedule_entries(
     if nurse_ids:
         q = q.filter(ScheduleEntry.nurse_id.in_(nurse_ids))
     if date_str:
-        q = q.filter(ScheduleEntry.work_date == date_str)
+        # Parse to date object for cross-DB compat (SQLite stores datetime, MSSQL stores date)
+        from datetime import date as _date, datetime as _dt
+        try:
+            d = _dt.strptime(date_str, "%Y-%m-%d").date() if isinstance(date_str, str) else date_str
+            # Match both date and datetime columns
+            q = q.filter(
+                ScheduleEntry.work_date >= _dt.combine(d, _dt.min.time()),
+                ScheduleEntry.work_date < _dt.combine(d, _dt.min.time()) + __import__('datetime').timedelta(days=1),
+            )
+        except (ValueError, TypeError):
+            q = q.filter(ScheduleEntry.work_date == date_str)
     if date_range_start:
-        q = q.filter(ScheduleEntry.work_date >= date_range_start)
+        from datetime import datetime as _dt
+        try:
+            d = _dt.strptime(date_range_start, "%Y-%m-%d") if isinstance(date_range_start, str) else date_range_start
+            q = q.filter(ScheduleEntry.work_date >= d)
+        except (ValueError, TypeError):
+            q = q.filter(ScheduleEntry.work_date >= date_range_start)
     if date_range_end:
-        q = q.filter(ScheduleEntry.work_date <= date_range_end)
+        from datetime import datetime as _dt, timedelta
+        try:
+            d = _dt.strptime(date_range_end, "%Y-%m-%d") if isinstance(date_range_end, str) else date_range_end
+            q = q.filter(ScheduleEntry.work_date < d + timedelta(days=1))
+        except (ValueError, TypeError):
+            q = q.filter(ScheduleEntry.work_date <= date_range_end)
     rows = q.order_by(ScheduleEntry.work_date, ScheduleEntry.nurse_id).all()
     return [
         {
@@ -130,15 +150,27 @@ def find_schedule_entry(
     date_str: str,
 ) -> dict | None:
     """Find a specific entry by schedule + nurse + date."""
-    entry = (
+    q = (
         db.query(ScheduleEntry)
         .filter(
             ScheduleEntry.schedule_id == schedule_id,
             ScheduleEntry.nurse_id == nurse_id,
-            ScheduleEntry.work_date == date_str,
         )
-        .first()
     )
+    # Cross-DB date comparison: SQLite stores datetime, MSSQL stores date strings
+    from datetime import datetime as _dt, timedelta
+    if isinstance(date_str, str):
+        try:
+            d = _dt.strptime(date_str, "%Y-%m-%d").date()
+            q = q.filter(
+                ScheduleEntry.work_date >= _dt.combine(d, _dt.min.time()),
+                ScheduleEntry.work_date < _dt.combine(d, _dt.min.time()) + timedelta(days=1),
+            )
+        except (ValueError, TypeError):
+            q = q.filter(ScheduleEntry.work_date == date_str)
+    else:
+        q = q.filter(ScheduleEntry.work_date == date_str)
+    entry = q.first()
     if not entry:
         return None
     return {

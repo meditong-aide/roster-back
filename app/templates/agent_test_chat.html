@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AIDE Agent Debug Console</title>
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --surface: #131929;
+    --surface2: #1c2333;
+    --surface3: #252d3f;
+    --border: #2a3348;
+    --border-hover: #3d4a66;
+    --text: #e2e8f0;
+    --text-dim: #7b8ba3;
+    --text-muted: #4a5568;
+    --accent: #6366f1;
+    --accent-hover: #5254cc;
+    --accent-glow: rgba(99,102,241,.15);
+    --green: #10b981;
+    --green-dim: rgba(16,185,129,.12);
+    --yellow: #f59e0b;
+    --yellow-dim: rgba(245,158,11,.12);
+    --red: #ef4444;
+    --red-dim: rgba(239,68,68,.12);
+    --orange: #f97316;
+    --orange-dim: rgba(249,115,22,.12);
+    --purple: #a78bfa;
+    --purple-dim: rgba(167,139,250,.12);
+    --cyan: #22d3ee;
+    --cyan-dim: rgba(34,211,238,.12);
+    --pink: #f472b6;
+    --blue: #60a5fa;
+    --blue-dim: rgba(96,165,250,.12);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ── */
+  .header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+    z-index: 10;
+  }
+  .logo {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .logo-icon {
+    width: 28px; height: 28px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700; color: white;
+  }
+  .logo h1 { font-size: 15px; font-weight: 600; color: var(--text); letter-spacing: -.3px; }
+  .logo .version { font-size: 10px; color: var(--text-dim); font-weight: 400; margin-left: 4px; }
+
+  .badge {
+    font-size: 10px; padding: 3px 8px; border-radius: 99px;
+    font-weight: 600; letter-spacing: .3px; text-transform: uppercase;
+  }
+  .badge-ok { background: var(--green-dim); color: var(--green); }
+  .badge-warn { background: var(--yellow-dim); color: var(--yellow); }
+  .badge-err { background: var(--red-dim); color: var(--red); }
+  .badge-info { background: var(--accent-glow); color: var(--accent); }
+
+  .controls { display: flex; gap: 6px; margin-left: auto; align-items: center; }
+  select, .btn {
+    font-size: 11px; padding: 5px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--surface2); color: var(--text);
+    cursor: pointer; transition: border-color .15s;
+  }
+  select:hover, .btn:hover { border-color: var(--border-hover); }
+  select:focus, .btn:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: white; }
+  .btn-primary:hover { background: var(--accent-hover); }
+
+  .identity-tag {
+    font-size: 11px; padding: 4px 10px; border-radius: var(--radius-sm);
+    background: var(--accent-glow); color: var(--accent); cursor: pointer;
+    border: 1px solid transparent; transition: all .15s;
+  }
+  .identity-tag:hover { border-color: var(--accent); background: rgba(99,102,241,.22); }
+
+  /* ── Context Bar ── */
+  .context-bar {
+    padding: 6px 20px; background: var(--surface2); border-bottom: 1px solid var(--border);
+    display: flex; gap: 16px; font-size: 11px; color: var(--text-dim); flex-shrink: 0;
+    align-items: center;
+  }
+  .ctx-item { display: flex; align-items: center; gap: 4px; }
+  .ctx-item .ctx-label { color: var(--text-muted); }
+  .ctx-item .ctx-value { color: var(--text); font-weight: 500; }
+  .ctx-item input[type="number"] {
+    width: 52px; padding: 2px 6px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 11px;
+  }
+
+  /* ── Main Layout ── */
+  .main { flex: 1; display: flex; overflow: hidden; }
+
+  /* ── Chat Panel ── */
+  .chat-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .messages {
+    flex: 1; overflow-y: auto; padding: 20px 24px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .msg {
+    max-width: 80%; padding: 10px 14px; border-radius: var(--radius);
+    line-height: 1.6; font-size: 13px; white-space: pre-wrap; word-break: break-word;
+  }
+  .msg-user {
+    align-self: flex-end;
+    background: var(--accent); color: white;
+    border-bottom-right-radius: 3px;
+  }
+  .msg-agent {
+    align-self: flex-start;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-bottom-left-radius: 3px;
+  }
+  .msg-error { background: var(--red-dim); border-color: rgba(239,68,68,.3); color: var(--red); }
+  .msg-clarification { background: var(--yellow-dim); border-color: rgba(245,158,11,.3); }
+  .msg-approval { background: var(--purple-dim); border-color: rgba(167,139,250,.3); }
+  .msg-time { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+  .msg-user + .msg-time { text-align: right; }
+  .msg-system {
+    text-align: center; font-size: 11px; color: var(--text-muted); padding: 4px 0;
+  }
+
+  /* Typing */
+  .typing { align-self: flex-start; display: none; gap: 5px; padding: 10px 14px;
+    background: var(--surface2); border-radius: var(--radius); border: 1px solid var(--border); }
+  .typing.active { display: flex; align-items: center; }
+  .typing span {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim);
+    animation: blink 1.4s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: .2s; }
+  .typing span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%,80%,100%{opacity:.25} 40%{opacity:1} }
+
+  /* Input */
+  .input-area { padding: 12px 20px; border-top: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+  .input-row { display: flex; gap: 8px; }
+  .input-row input {
+    flex: 1; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px;
+  }
+  .input-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+  .input-row button {
+    padding: 10px 20px; border-radius: 8px; border: none;
+    background: var(--accent); color: white; font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: background .15s;
+  }
+  .input-row button:hover { background: var(--accent-hover); }
+  .input-row button:disabled { opacity: .4; cursor: not-allowed; }
+
+  .quick-queries { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
+  .quick-queries button {
+    font-size: 11px; padding: 4px 10px; border-radius: 99px;
+    border: 1px solid var(--border); background: transparent; color: var(--text-dim);
+    cursor: pointer; transition: all .15s; white-space: nowrap;
+  }
+  .quick-queries button:hover { background: var(--surface3); color: var(--text); border-color: var(--border-hover); }
+
+  /* ── Right Panel (Tabs: Pipeline / Messages) ── */
+  .right-panel {
+    width: 460px; border-left: 1px solid var(--border); background: var(--surface);
+    display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden;
+  }
+  .panel-tabs {
+    display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .panel-tab {
+    flex: 1; padding: 9px 0; text-align: center; font-size: 12px; font-weight: 500;
+    color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent;
+    transition: all .15s;
+  }
+  .panel-tab:hover { color: var(--text); background: var(--surface2); }
+  .panel-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .panel-tab .tab-count {
+    font-size: 10px; padding: 1px 5px; border-radius: 99px;
+    background: var(--surface3); color: var(--text-dim); margin-left: 4px;
+  }
+  .panel-tab.active .tab-count { background: var(--accent-glow); color: var(--accent); }
+
+  .panel-content { flex: 1; overflow-y: auto; }
+  .tab-pane { display: none; padding: 12px; }
+  .tab-pane.active { display: block; }
+
+  .panel-header-info {
+    padding: 8px 12px; display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; color: var(--text-dim);
+  }
+
+  /* ── Pipeline Timeline ── */
+  .timeline { position: relative; padding-left: 24px; }
+  .timeline::before {
+    content: ''; position: absolute; left: 9px; top: 8px; bottom: 8px;
+    width: 2px; background: var(--border); border-radius: 1px;
+  }
+  .tl-item {
+    position: relative; margin-bottom: 6px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    transition: border-color .15s;
+  }
+  .tl-item:hover { border-color: var(--border-hover); }
+  .tl-dot {
+    position: absolute; left: -20px; top: 12px;
+    width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--bg);
+  }
+  .tl-dot-green { background: var(--green); }
+  .tl-dot-orange { background: var(--orange); }
+  .tl-dot-blue { background: var(--blue); }
+  .tl-dot-red { background: var(--red); }
+  .tl-dot-yellow { background: var(--yellow); }
+  .tl-dot-purple { background: var(--purple); }
+
+  .tl-header {
+    padding: 8px 10px; display: flex; align-items: center; gap: 8px;
+    cursor: pointer; user-select: none;
+  }
+  .tl-icon { font-size: 13px; flex-shrink: 0; }
+  .tl-title { font-size: 12px; font-weight: 600; flex: 1; }
+  .tl-subtitle {
+    font-size: 10px; color: var(--text-dim); max-width: 140px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tl-time { font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .tl-chevron { font-size: 9px; color: var(--text-muted); transition: transform .15s; }
+  .tl-item.open .tl-chevron { transform: rotate(90deg); }
+
+  .tl-body { display: none; padding: 0 10px 10px; font-size: 11px; }
+  .tl-item.open .tl-body { display: block; }
+
+  /* Middleware mini-steps inside execution */
+  .mw-steps { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
+  .mw-step {
+    display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+    border-radius: 4px; background: var(--surface2); font-size: 10px;
+  }
+  .mw-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .mw-name { color: var(--text-dim); min-width: 85px; }
+  .mw-detail { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mw-status { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+
+  .code-block {
+    background: var(--surface2); border-radius: var(--radius-sm); padding: 8px;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px; line-height: 1.5; color: var(--text-dim);
+    max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+    border: 1px solid var(--border);
+  }
+
+  .section-label {
+    font-size: 10px; font-weight: 600; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: .5px; margin: 6px 0 4px;
+  }
+
+  /* ── Message Chain ── */
+  .msg-chain { display: flex; flex-direction: column; gap: 6px; padding: 4px; }
+  .chain-msg {
+    border-radius: var(--radius-sm); padding: 8px 10px; font-size: 11px; line-height: 1.5;
+    border: 1px solid var(--border);
+  }
+  .chain-role {
+    font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
+    margin-bottom: 4px; display: flex; align-items: center; gap: 6px;
+  }
+  .chain-system { background: var(--surface2); }
+  .chain-system .chain-role { color: var(--text-muted); }
+  .chain-user { background: var(--accent-glow); }
+  .chain-user .chain-role { color: var(--accent); }
+  .chain-assistant { background: var(--green-dim); }
+  .chain-assistant .chain-role { color: var(--green); }
+  .chain-tool { background: var(--orange-dim); }
+  .chain-tool .chain-role { color: var(--orange); }
+  .chain-content {
+    color: var(--text-dim); white-space: pre-wrap; word-break: break-word;
+    max-height: 120px; overflow-y: auto;
+  }
+
+  /* ── Pipeline Empty ── */
+  .pipeline-empty {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; color: var(--text-muted); font-size: 12px; gap: 8px; padding: 40px;
+    text-align: center;
+  }
+  .pipeline-empty-icon { font-size: 28px; opacity: .3; }
+
+  /* ── Login Overlay ── */
+  .login-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.75); backdrop-filter: blur(12px);
+    display: flex; align-items: center; justify-content: center; z-index: 100;
+  }
+  .login-overlay.hidden { display: none; }
+  .login-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+    padding: 32px; width: 440px; max-width: 95vw;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .login-card h2 { font-size: 18px; font-weight: 600; margin-bottom: 4px; color: var(--text); }
+  .login-card .subtitle { font-size: 12px; color: var(--text-dim); margin-bottom: 20px; }
+  .login-field { margin-bottom: 14px; }
+  .login-field label { display: block; font-size: 11px; font-weight: 600; color: var(--text-dim); margin-bottom: 5px; text-transform: uppercase; letter-spacing: .3px; }
+  .login-field select, .login-field input {
+    width: 100%; padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px;
+  }
+  .login-field select:disabled { opacity: .35; cursor: not-allowed; }
+  .login-row { display: flex; gap: 10px; }
+  .login-row .login-field { flex: 1; }
+  .login-actions { display: flex; gap: 8px; margin-top: 20px; }
+  .login-actions button {
+    flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border);
+    font-size: 13px; font-weight: 500; cursor: pointer; transition: all .15s;
+  }
+  .login-actions .btn-enter { background: var(--accent); border-color: var(--accent); color: white; }
+  .login-actions .btn-enter:hover { background: var(--accent-hover); }
+  .login-actions .btn-enter:disabled { opacity: .35; cursor: not-allowed; }
+  .login-actions .btn-test { background: var(--surface2); color: var(--text); }
+  .login-actions .btn-test:hover { background: var(--surface3); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+</style>
+</head>
+<body>
+
+<!-- Login Overlay -->
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-card">
+    <h2>AIDE Agent Debug Console</h2>
+    <div class="subtitle">Select identity to begin E2E testing</div>
+
+    <div class="login-field">
+      <label>DB Mode</label>
+      <select id="loginDbMode" onchange="onDbModeChange()">
+        <option value="test">Test DB (SQLite in-memory)</option>
+        <option value="real">Production DB (MSSQL)</option>
+      </select>
+    </div>
+
+    <div class="login-field">
+      <label>Office</label>
+      <select id="loginOffice" disabled onchange="onOfficeChange()">
+        <option value="">-- Setup DB first --</option>
+      </select>
+    </div>
+
+    <div class="login-field">
+      <label>Group</label>
+      <select id="loginGroup" disabled onchange="onGroupChange()">
+        <option value="">-- Select office --</option>
+      </select>
+    </div>
+
+    <div class="login-field">
+      <label>Nurse</label>
+      <select id="loginNurse" disabled>
+        <option value="">-- Select group --</option>
+      </select>
+    </div>
+
+    <div class="login-row">
+      <div class="login-field">
+        <label>Year</label>
+        <input type="number" id="loginYear" value="2026">
+      </div>
+      <div class="login-field">
+        <label>Month</label>
+        <input type="number" id="loginMonth" value="4" min="1" max="12">
+      </div>
+      <div class="login-field">
+        <label>LLM Provider</label>
+        <select id="loginLlm">
+          <option value="deterministic">Deterministic</option>
+          <option value="openai">OpenAI gpt-4.1-mini</option>
+          <option value="anthropic">Anthropic Haiku</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="login-actions">
+      <button class="btn-test" onclick="setupAndLogin()">Setup Test DB & Enter</button>
+      <button class="btn-enter" id="loginEnterBtn" onclick="enterChat()" disabled>Enter</button>
+    </div>
+  </div>
+</div>
+
+<!-- Header -->
+<div class="header">
+  <div class="logo">
+    <div class="logo-icon">A</div>
+    <h1>AIDE Debug Console <span class="version">v3</span></h1>
+  </div>
+  <span class="badge" id="dbBadge">--</span>
+  <span class="badge" id="llmBadge">--</span>
+  <div class="controls">
+    <span class="identity-tag" id="identityTag" onclick="showLogin()" title="Click to change identity">Select Identity</span>
+    <select id="llmSelect" onchange="onLlmChange()">
+      <option value="deterministic">Deterministic</option>
+      <option value="openai">OpenAI</option>
+      <option value="anthropic">Anthropic</option>
+    </select>
+    <button class="btn" onclick="resetConversation()" title="New conversation">New Chat</button>
+  </div>
+</div>
+
+<!-- Context Bar -->
+<div class="context-bar">
+  <div class="ctx-item"><span class="ctx-label">Office:</span><span class="ctx-value" id="ctxOfficeLabel">--</span></div>
+  <div class="ctx-item"><span class="ctx-label">Group:</span><span class="ctx-value" id="ctxGroupLabel">--</span></div>
+  <div class="ctx-item"><span class="ctx-label">Nurse:</span><span class="ctx-value" id="ctxNurseLabel">--</span></div>
+  <div class="ctx-item"><span class="ctx-label">Role:</span><span class="ctx-value" id="ctxRoleLabel">--</span></div>
+  <div class="ctx-item" style="margin-left:auto">
+    <span class="ctx-label">Year:</span>
+    <input type="number" id="ctxYear" value="2026">
+  </div>
+  <div class="ctx-item">
+    <span class="ctx-label">Month:</span>
+    <input type="number" id="ctxMonth" value="4" min="1" max="12">
+  </div>
+</div>
+
+<!-- Hidden state -->
+<input type="hidden" id="ctxGroup" value="">
+<input type="hidden" id="ctxOffice" value="">
+<input type="hidden" id="ctxNurse" value="">
+<input type="hidden" id="ctxNurseName" value="">
+<input type="hidden" id="ctxRole" value="">
+<input type="hidden" id="useTestDb" value="true">
+
+<!-- Main -->
+<div class="main">
+  <!-- Chat Panel -->
+  <div class="chat-panel">
+    <div class="messages" id="messages">
+      <div class="pipeline-empty">
+        <div class="pipeline-empty-icon">&#9678;</div>
+        <div>AIDE Agent Debug Console</div>
+        <div style="font-size:11px;color:var(--text-muted)">Select identity and start a conversation to see the agent pipeline</div>
+      </div>
+    </div>
+    <div class="typing" id="typing"><span></span><span></span><span></span></div>
+    <div class="input-area">
+      <div class="input-row">
+        <input type="text" id="msgInput" placeholder="Enter a query to test the agent pipeline..."
+               autocomplete="off"
+               onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}">
+        <button id="sendBtn" onclick="sendMessage()">Send</button>
+      </div>
+      <div class="quick-queries">
+        <button onclick="quickSend('4월 원티드 신청 내역 보여줘')">wanted list</button>
+        <button onclick="quickSend('원티드 미제출자 알려줘')">wanted count</button>
+        <button onclick="quickSend('김민지 4월 근무표 조회')">nurse schedule</button>
+        <button onclick="quickSend('나이트 근무자 누구야?')">night shift</button>
+        <button onclick="quickSend('간호사 목록 조회')">nurse list</button>
+        <button onclick="quickSend('제약조건 설정 보여줘')">constraints</button>
+        <button onclick="quickSend('김민지 원티드 취소해줘')">cancel wanted</button>
+        <button onclick="quickSend('4월 15일 김민지 근무 D로 변경해줘')">change shift</button>
+        <button onclick="quickSend('근무표 공정성 분석해줘')">fairness</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right Panel -->
+  <div class="right-panel">
+    <div class="panel-tabs">
+      <div class="panel-tab active" onclick="switchTab('pipeline')" id="tabPipeline">
+        Pipeline <span class="tab-count" id="stageCount">0</span>
+      </div>
+      <div class="panel-tab" onclick="switchTab('messages')" id="tabMessages">
+        Messages <span class="tab-count" id="msgCount">0</span>
+      </div>
+    </div>
+    <div class="panel-content">
+      <!-- Pipeline Tab -->
+      <div class="tab-pane active" id="panePipeline">
+        <div class="panel-header-info">
+          <span>Pipeline Trace</span>
+          <span id="totalTime"></span>
+        </div>
+        <div id="pipelineBody" style="padding:0 12px 12px">
+          <div class="pipeline-empty">
+            <div class="pipeline-empty-icon">&#8594;</div>
+            Send a message to trace the pipeline
+          </div>
+        </div>
+      </div>
+      <!-- Messages Tab -->
+      <div class="tab-pane" id="paneMessages">
+        <div class="panel-header-info">
+          <span>LLM Message Chain</span>
+          <span id="chainCount"></span>
+        </div>
+        <div id="messageChain" style="padding:0 12px 12px">
+          <div class="pipeline-empty">
+            <div class="pipeline-empty-icon">&#128172;</div>
+            Message chain will appear after first query
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Stage metadata ──
+const STAGE_META = {
+  planning:      { label: 'LLM Decision',    icon: '\u{1F9E0}', dot: 'tl-dot-orange' },
+  execution:     { label: 'Skill Execution',  icon: '\u26A1',    dot: 'tl-dot-green' },
+  answer:        { label: 'Answer Generated', icon: '\u{1F4AC}', dot: 'tl-dot-blue' },
+  clarification: { label: 'Clarification',    icon: '\u2753',    dot: 'tl-dot-yellow' },
+  error:         { label: 'Error',            icon: '\u274C',    dot: 'tl-dot-red' },
+};
+
+const MW_STATUS = {
+  pass:                   { color: 'var(--green)',  bg: 'var(--green-dim)',  label: 'PASS' },
+  block:                  { color: 'var(--red)',    bg: 'var(--red-dim)',    label: 'BLOCKED' },
+  injected:               { color: 'var(--cyan)',   bg: 'var(--cyan-dim)',   label: 'INJECTED' },
+  skip:                   { color: 'var(--text-muted)', bg: 'var(--surface3)', label: 'SKIP' },
+  grounded:               { color: 'var(--purple)', bg: 'var(--purple-dim)', label: 'GROUNDED' },
+  clarification_needed:   { color: 'var(--yellow)', bg: 'var(--yellow-dim)', label: 'CLARIFY' },
+  ok:                     { color: 'var(--green)',  bg: 'var(--green-dim)',  label: 'OK' },
+  error:                  { color: 'var(--red)',    bg: 'var(--red-dim)',    label: 'ERROR' },
+};
+
+let conversationId = null;
+let currentIdentity = { office_id:'', group_id:'', nurse_id:'', nurse_name:'', role:'', office_name:'', group_name:'' };
+
+// ── Init ──
+window.addEventListener('DOMContentLoaded', initApp);
+
+async function initApp() {
+  await checkStatus();
+}
+
+async function checkStatus() {
+  try {
+    const res = await fetch('/agent/test/status');
+    const data = await res.json();
+
+    const dbBadge = document.getElementById('dbBadge');
+    dbBadge.className = data.test_db_ready ? 'badge badge-ok' : 'badge badge-warn';
+    dbBadge.textContent = data.test_db_ready ? 'DB Ready' : 'DB Not Setup';
+
+    const llmBadge = document.getElementById('llmBadge');
+    const providers = data.available_providers || [];
+    const realProviders = providers.filter(p => p !== 'deterministic');
+    if (realProviders.length) {
+      llmBadge.className = 'badge badge-ok';
+      llmBadge.textContent = 'LLM: ' + realProviders.join(', ');
+      const preferred = realProviders.includes('openai') ? 'openai' : realProviders[0];
+      document.getElementById('llmSelect').value = preferred;
+      document.getElementById('loginLlm').value = preferred;
+    } else {
+      llmBadge.className = 'badge badge-warn';
+      llmBadge.textContent = 'deterministic only';
+    }
+  } catch (e) {
+    document.getElementById('dbBadge').className = 'badge badge-err';
+    document.getElementById('dbBadge').textContent = 'Error';
+  }
+}
+
+function onLlmChange() {
+  const p = document.getElementById('llmSelect').value;
+  const llmBadge = document.getElementById('llmBadge');
+  llmBadge.textContent = 'LLM: ' + p;
+  llmBadge.className = p === 'deterministic' ? 'badge badge-warn' : 'badge badge-ok';
+}
+
+// ── Tab switching ──
+function switchTab(tab) {
+  document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
+  document.getElementById('pane' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
+}
+
+// ── Login Flow ──
+function showLogin() { document.getElementById('loginOverlay').classList.remove('hidden'); }
+
+async function onDbModeChange() {
+  const mode = document.getElementById('loginDbMode').value;
+  if (mode !== 'test') {
+    await loadOffices(false);
+  } else {
+    document.getElementById('loginOffice').innerHTML = '<option value="">-- Setup Test DB first --</option>';
+    document.getElementById('loginOffice').disabled = true;
+  }
+  document.getElementById('loginGroup').innerHTML = '<option value="">-- Select office --</option>';
+  document.getElementById('loginGroup').disabled = true;
+  document.getElementById('loginNurse').innerHTML = '<option value="">-- Select group --</option>';
+  document.getElementById('loginNurse').disabled = true;
+  document.getElementById('loginEnterBtn').disabled = true;
+}
+
+async function loadOffices(useTest) {
+  const sel = document.getElementById('loginOffice');
+  try {
+    const res = await fetch(`/agent/test/offices?use_test_db=${useTest}`);
+    const offices = await res.json();
+    if (!offices.length) { sel.innerHTML = '<option value="">No offices found</option>'; sel.disabled = true; return; }
+    sel.innerHTML = '<option value="">-- Select --</option>' +
+      offices.map(o => `<option value="${o.office_id}">${o.office_name} (${o.office_id})</option>`).join('');
+    sel.disabled = false;
+    if (offices.length === 1) {
+      sel.value = offices[0].office_id;
+      currentIdentity.office_id = offices[0].office_id;
+      currentIdentity.office_name = offices[0].office_name;
+      await onOfficeChange();
+    }
+  } catch (e) { sel.innerHTML = `<option value="">Error: ${e.message}</option>`; }
+}
+
+async function onOfficeChange() {
+  const officeId = document.getElementById('loginOffice').value;
+  const groupSel = document.getElementById('loginGroup');
+  if (!officeId) { groupSel.innerHTML = '<option value="">-- Select office --</option>'; groupSel.disabled = true; return; }
+  currentIdentity.office_id = officeId;
+  currentIdentity.office_name = document.getElementById('loginOffice').selectedOptions[0]?.text || officeId;
+  const useTest = document.getElementById('loginDbMode').value === 'test';
+  try {
+    const res = await fetch(`/agent/test/groups?office_id=${officeId}&use_test_db=${useTest}`);
+    const groups = await res.json();
+    groupSel.innerHTML = '<option value="">-- Select --</option>' +
+      groups.map(g => `<option value="${g.group_id}">${g.group_name} (${g.group_id})</option>`).join('');
+    groupSel.disabled = false;
+    if (groups.length === 1) {
+      groupSel.value = groups[0].group_id;
+      currentIdentity.group_id = groups[0].group_id;
+      currentIdentity.group_name = groups[0].group_name;
+      await onGroupChange();
+    }
+  } catch (e) { groupSel.innerHTML = `<option value="">Error: ${e.message}</option>`; }
+}
+
+async function onGroupChange() {
+  const groupId = document.getElementById('loginGroup').value;
+  const nurseSel = document.getElementById('loginNurse');
+  if (!groupId) { nurseSel.innerHTML = '<option value="">-- Select group --</option>'; nurseSel.disabled = true; return; }
+  currentIdentity.group_id = groupId;
+  currentIdentity.group_name = document.getElementById('loginGroup').selectedOptions[0]?.text || groupId;
+  const useTest = document.getElementById('loginDbMode').value === 'test';
+  try {
+    const res = await fetch(`/agent/test/nurses?group_id=${groupId}&use_test_db=${useTest}`);
+    const nurses = await res.json();
+    nurseSel.innerHTML = '<option value="">-- Select --</option>' +
+      nurses.map(n => {
+        const role = n.hn_auth ? `[${n.hn_auth}]` : n.is_head_nurse ? '[HN]' : '';
+        return `<option value="${n.nurse_id}" data-role="${n.hn_auth || (n.is_head_nurse ? 'HN' : '')}" data-name="${n.name}">${n.name} ${role} (Grade ${n.grade})</option>`;
+      }).join('');
+    nurseSel.disabled = false;
+    nurseSel.onchange = () => {
+      const opt = nurseSel.selectedOptions[0];
+      if (opt?.value) {
+        currentIdentity.nurse_id = opt.value;
+        currentIdentity.nurse_name = opt.dataset.name || '';
+        currentIdentity.role = opt.dataset.role || 'NURSE';
+        document.getElementById('loginEnterBtn').disabled = false;
+      }
+    };
+    const hn = nurses.find(n => n.hn_auth || n.is_head_nurse);
+    if (hn) {
+      nurseSel.value = hn.nurse_id;
+      currentIdentity.nurse_id = hn.nurse_id;
+      currentIdentity.nurse_name = hn.name;
+      currentIdentity.role = hn.hn_auth || 'HN';
+      document.getElementById('loginEnterBtn').disabled = false;
+    }
+  } catch (e) { nurseSel.innerHTML = `<option value="">Error: ${e.message}</option>`; }
+}
+
+async function setupAndLogin() {
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = 'Setting up...';
+  try {
+    const res = await fetch('/agent/test/setup-db', { method: 'POST' });
+    const data = await res.json();
+    if (data.status !== 'error') {
+      document.getElementById('dbBadge').className = 'badge badge-ok';
+      document.getElementById('dbBadge').textContent = 'Test DB';
+      document.getElementById('loginDbMode').value = 'test';
+      await loadOffices(true);
+      addSystemMessage(`Test DB seeded: ${data.nurses || '?'} nurses, ${data.entries || '?'} schedule entries`);
+    } else {
+      addSystemMessage(`DB setup failed: ${data.message}`);
+    }
+  } catch (e) { addSystemMessage(`Error: ${e.message}`); }
+  btn.disabled = false; btn.textContent = 'Setup Test DB & Enter';
+}
+
+function enterChat() {
+  if (!currentIdentity.nurse_id) return;
+  const useTest = document.getElementById('loginDbMode').value === 'test';
+  document.getElementById('useTestDb').value = useTest ? 'true' : 'false';
+  document.getElementById('ctxGroup').value = currentIdentity.group_id;
+  document.getElementById('ctxOffice').value = currentIdentity.office_id;
+  document.getElementById('ctxNurse').value = currentIdentity.nurse_id;
+  document.getElementById('ctxNurseName').value = currentIdentity.nurse_name;
+  document.getElementById('ctxRole').value = currentIdentity.role || 'NURSE';
+  document.getElementById('ctxYear').value = document.getElementById('loginYear').value;
+  document.getElementById('ctxMonth').value = document.getElementById('loginMonth').value;
+  document.getElementById('llmSelect').value = document.getElementById('loginLlm').value;
+  onLlmChange();
+
+  document.getElementById('ctxOfficeLabel').textContent = currentIdentity.office_name;
+  document.getElementById('ctxGroupLabel').textContent = currentIdentity.group_name;
+  document.getElementById('ctxNurseLabel').textContent = `${currentIdentity.nurse_name} (${currentIdentity.nurse_id})`;
+  document.getElementById('ctxRoleLabel').textContent = currentIdentity.role || 'NURSE';
+
+  const roleLabel = currentIdentity.role === 'HN' ? 'Head Nurse' : currentIdentity.role === 'ADM' ? 'Admin' : 'Nurse';
+  document.getElementById('identityTag').textContent = `${currentIdentity.nurse_name} / ${currentIdentity.group_name} / ${roleLabel}`;
+
+  const dbBadge = document.getElementById('dbBadge');
+  dbBadge.className = 'badge badge-ok';
+  dbBadge.textContent = useTest ? 'Test DB' : 'Prod DB';
+
+  document.getElementById('loginOverlay').classList.add('hidden');
+  document.getElementById('msgInput').focus();
+  addSystemMessage(`Logged in as ${currentIdentity.nurse_name} (${currentIdentity.role})`);
+}
+
+function resetConversation() {
+  conversationId = null;
+  document.getElementById('messages').innerHTML = '';
+  document.getElementById('pipelineBody').innerHTML = '<div class="pipeline-empty"><div class="pipeline-empty-icon">&#8594;</div>Send a message to trace the pipeline</div>';
+  document.getElementById('messageChain').innerHTML = '';
+  document.getElementById('totalTime').textContent = '';
+  document.getElementById('stageCount').textContent = '0';
+  document.getElementById('msgCount').textContent = '0';
+  addSystemMessage('New conversation started');
+}
+
+function quickSend(text) {
+  document.getElementById('msgInput').value = text;
+  sendMessage();
+}
+
+// ── Send message ──
+async function sendMessage() {
+  const input = document.getElementById('msgInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+  if (!currentIdentity.nurse_id) { showLogin(); return; }
+
+  input.value = '';
+  addUserMessage(msg);
+  showTyping(true);
+  document.getElementById('sendBtn').disabled = true;
+
+  const t0 = performance.now();
+
+  try {
+    const body = {
+      message: msg,
+      year: parseInt(document.getElementById('ctxYear').value),
+      month: parseInt(document.getElementById('ctxMonth').value),
+      group_id: document.getElementById('ctxGroup').value,
+      office_id: document.getElementById('ctxOffice').value,
+      user_role: document.getElementById('ctxRole').value,
+      nurse_id: document.getElementById('ctxNurse').value,
+      nurse_name: document.getElementById('ctxNurseName').value || currentIdentity.nurse_name,
+      use_test_db: document.getElementById('useTestDb').value === 'true',
+      llm_provider: document.getElementById('llmSelect').value,
+      agent_version: 'v3',
+      conversation_id: conversationId,
+    };
+
+    const res = await fetch('/agent/test/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    const elapsed = Math.round(performance.now() - t0);
+
+    if (data.conversation_id) conversationId = data.conversation_id;
+
+    // Render pipeline
+    renderPipeline(data.pipeline_stages || [], data.total_time_ms || 0, elapsed);
+
+    // Render message chain
+    renderMessageChain(data.message_chain || []);
+
+    // Render response
+    if (data.error) {
+      addAgentMessage(data.error, 'error');
+    } else if (data.needs_clarification) {
+      let text = data.clarification_question || 'Clarification needed';
+      if (data.clarification_options?.length) {
+        text += '\n\n' + data.clarification_options.map((o,i) => `  ${i+1}. ${o}`).join('\n');
+      }
+      addAgentMessage(text, 'clarification');
+    } else if (data.awaiting_approval) {
+      addAgentMessage('Preview:\n' + JSON.stringify(data.preview, null, 2), 'approval');
+    } else {
+      addAgentMessage(data.answer || '(no answer)');
+    }
+  } catch (e) {
+    addAgentMessage(`Request failed: ${e.message}`, 'error');
+  }
+
+  showTyping(false);
+  document.getElementById('sendBtn').disabled = false;
+  input.focus();
+}
+
+// ── Chat rendering ──
+function addUserMessage(text) {
+  const el = document.createElement('div');
+  el.innerHTML = `<div class="msg msg-user">${esc(text)}</div><div class="msg-time" style="text-align:right">${timeStr()}</div>`;
+  document.getElementById('messages').appendChild(el);
+  scrollBottom();
+}
+
+function addAgentMessage(text, type) {
+  const cls = type === 'error' ? 'msg-error' : type === 'clarification' ? 'msg-clarification' : type === 'approval' ? 'msg-approval' : '';
+  const el = document.createElement('div');
+  el.innerHTML = `<div class="msg msg-agent ${cls}">${formatAnswer(text)}</div><div class="msg-time">${timeStr()}</div>`;
+  document.getElementById('messages').appendChild(el);
+  scrollBottom();
+}
+
+function addSystemMessage(text) {
+  const el = document.createElement('div');
+  el.className = 'msg-system';
+  el.textContent = text;
+  document.getElementById('messages').appendChild(el);
+  scrollBottom();
+}
+
+function showTyping(show) { document.getElementById('typing').classList.toggle('active', show); }
+function scrollBottom() { const el = document.getElementById('messages'); el.scrollTop = el.scrollHeight; }
+
+// ── Pipeline rendering ──
+function renderPipeline(stages, totalMs, wallMs) {
+  const body = document.getElementById('pipelineBody');
+  document.getElementById('totalTime').textContent = totalMs ? `${Math.round(totalMs)}ms pipeline / ${wallMs || '?'}ms wall` : '';
+  document.getElementById('stageCount').textContent = stages.length;
+
+  if (!stages.length) {
+    body.innerHTML = '<div class="pipeline-empty">No pipeline data</div>';
+    return;
+  }
+
+  body.innerHTML = '<div class="timeline"></div>';
+  const timeline = body.querySelector('.timeline');
+
+  stages.forEach((stage, i) => {
+    const meta = STAGE_META[stage.name] || { label: stage.name, icon: '?', dot: 'tl-dot-blue' };
+    const item = document.createElement('div');
+    item.className = 'tl-item';
+
+    // Build subtitle
+    let subtitle = '';
+    if (stage.name === 'planning') subtitle = stage.data?.skill || '';
+    else if (stage.name === 'execution') subtitle = stage.data?.skill || '';
+    else if (stage.name === 'answer') subtitle = (stage.data?.text || '').slice(0, 40);
+
+    // Build body content
+    let bodyHtml = '';
+
+    if (stage.name === 'planning') {
+      const skill = stage.data?.skill || '?';
+      const args = stage.data?.args || {};
+      const reasoning = stage.data?.reasoning;
+      bodyHtml += `<div class="section-label">Tool Selected</div>`;
+      bodyHtml += `<div style="margin-bottom:6px;font-size:12px;font-weight:600;color:var(--orange)">${esc(skill)}</div>`;
+      bodyHtml += `<div class="section-label">Arguments (LLM output)</div>`;
+      bodyHtml += `<div class="code-block">${esc(JSON.stringify(args, null, 2))}</div>`;
+      if (reasoning) {
+        bodyHtml += `<div class="section-label">LLM Reasoning</div>`;
+        bodyHtml += `<div style="color:var(--text-dim);font-size:11px;font-style:italic;padding:4px 0">${esc(reasoning)}</div>`;
+      }
+    } else if (stage.name === 'execution') {
+      // Middleware steps
+      const mwSteps = stage.data?.middleware_steps || [];
+      if (mwSteps.length) {
+        bodyHtml += `<div class="section-label">Middleware Pipeline</div>`;
+        bodyHtml += '<div class="mw-steps">';
+        mwSteps.forEach(s => {
+          const st = MW_STATUS[s.status] || MW_STATUS['skip'];
+          bodyHtml += `<div class="mw-step">
+            <div class="mw-dot" style="background:${st.color}"></div>
+            <span class="mw-name">${esc(s.name)}</span>
+            <span class="mw-detail" title="${esc(s.detail || '')}">${esc(s.detail || '--')}</span>
+            <span class="mw-status" style="background:${st.bg};color:${st.color}">${st.label}</span>
+          </div>`;
+        });
+        bodyHtml += '</div>';
+      }
+
+      // Grounded params
+      const grounded = stage.data?.grounded_params;
+      if (grounded) {
+        bodyHtml += `<div class="section-label">Grounded Parameters</div>`;
+        bodyHtml += `<div class="code-block">${esc(JSON.stringify(grounded, null, 2))}</div>`;
+      }
+
+      // Result
+      const result = stage.data?.result;
+      if (result) {
+        bodyHtml += `<div class="section-label">Skill Result</div>`;
+        const rStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+        const truncated = rStr.length > 800 ? rStr.slice(0, 800) + '\n...(truncated)' : rStr;
+        bodyHtml += `<div class="code-block">${esc(truncated)}</div>`;
+      }
+    } else if (stage.name === 'answer') {
+      bodyHtml += `<div style="padding:8px;background:var(--surface2);border-radius:6px;line-height:1.6;font-size:12px">${formatAnswer(stage.data?.text || '')}</div>`;
+    } else {
+      bodyHtml += `<div class="code-block">${esc(JSON.stringify(stage.data, null, 2))}</div>`;
+    }
+
+    item.innerHTML = `
+      <div class="tl-dot ${meta.dot}"></div>
+      <div class="tl-header" onclick="this.parentElement.classList.toggle('open')">
+        <span class="tl-icon">${meta.icon}</span>
+        <span class="tl-title">${meta.label}</span>
+        <span class="tl-subtitle">${esc(subtitle)}</span>
+        <span class="tl-time">${Math.round(stage.duration_ms)}ms</span>
+        <span class="tl-chevron">&#9654;</span>
+      </div>
+      <div class="tl-body">${bodyHtml}</div>
+    `;
+
+    timeline.appendChild(item);
+  });
+
+  // Auto-open all stages (they're compact enough)
+  timeline.querySelectorAll('.tl-item').forEach(item => item.classList.add('open'));
+}
+
+// ── Message chain rendering ──
+function renderMessageChain(messages) {
+  const container = document.getElementById('messageChain');
+  document.getElementById('msgCount').textContent = messages.length;
+
+  if (!messages.length) {
+    container.innerHTML = '<div class="pipeline-empty">No messages yet</div>';
+    return;
+  }
+
+  let html = '<div class="msg-chain">';
+  messages.forEach(m => {
+    const role = m.role || '?';
+    let cls = 'chain-' + role;
+    let roleLabel = role.toUpperCase();
+    let content = '';
+
+    if (role === 'assistant' && m.tool_calls) {
+      const tc = m.tool_calls[0];
+      roleLabel = 'ASSISTANT (tool_call)';
+      content = `${tc.function?.name || '?'}(${tc.function?.arguments || '{}'})`;
+    } else if (role === 'tool') {
+      roleLabel = `TOOL RESULT [${m.tool_call_id || '?'}]`;
+      content = m.content || '';
+    } else {
+      content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    }
+
+    const truncContent = content.length > 300 ? content.slice(0, 300) + '...' : content;
+
+    html += `<div class="chain-msg ${cls}">
+      <div class="chain-role">${esc(roleLabel)}</div>
+      <div class="chain-content">${esc(truncContent)}</div>
+    </div>`;
+  });
+  html += '</div>';
+  container.innerHTML = html;
+
+  document.getElementById('chainCount').textContent = `${messages.length} messages`;
+}
+
+// ── Helpers ──
+function esc(text) {
+  if (!text) return '';
+  const el = document.createElement('span');
+  el.textContent = String(text);
+  return el.innerHTML;
+}
+
+function formatAnswer(text) {
+  let html = esc(text);
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\n/g, '<br>');
+  return html;
+}
+
+function timeStr() {
+  return new Date().toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
+</script>
+</body>
+</html>

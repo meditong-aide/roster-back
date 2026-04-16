@@ -167,6 +167,10 @@ app.include_router(weekly_off.router)  # 추가
 app.include_router(grade.router)
 app.include_router(jobs.router)
 
+# Agent v2 test chat UI
+from agents_v2.test_chat_router import router as agent_test_router
+app.include_router(agent_test_router)
+
 import uvicorn
 
 if __name__ == "__main__":

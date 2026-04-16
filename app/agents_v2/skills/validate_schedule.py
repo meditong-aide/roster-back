@@ -102,6 +102,15 @@ def validate_schedule(db: Session, params: dict) -> Any:
                     "mean": stats["mean"],
                 })
 
+    # Enrich violations with nurse names
+    if violations:
+        from agents_v2.tools import nurse_tools
+        all_nurses = nurse_tools.get_nurses_in_group(db, group_id)
+        nurse_map = {n["nurse_id"]: n["name"] for n in all_nurses}
+        for v in violations:
+            if v.get("nurse_id"):
+                v["nurse_name"] = nurse_map.get(v["nurse_id"], v["nurse_id"])
+
     return {
         "schedule_id": schedule_id,
         "violation_count": len(violations),

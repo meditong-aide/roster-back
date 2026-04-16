@@ -49,10 +49,19 @@ def _analyze_schedule(db, group_id, year, month, params):
     # Per-nurse shift counts
     counts = analysis_tools.count_shifts_per_nurse(db, schedule_id, shift_ids=target_shifts)
 
-    # Variance per shift
+    # Enrich with nurse names
+    all_nurses = nurse_tools.get_nurses_in_group(db, group_id)
+    nurse_map = {n["nurse_id"]: n["name"] for n in all_nurses}
+    for c in counts if isinstance(counts, list) else []:
+        if c.get("nurse_id"):
+            c["nurse_name"] = nurse_map.get(c["nurse_id"], c["nurse_id"])
+
+    # Variance per shift — enrich with shift names
+    shift_map = {s["shift_id"]: s.get("shift_gb") or s["name"] for s in shifts}
     variance_reports = []
     for sid in target_shifts:
         stats = analysis_tools.shift_count_variance(db, schedule_id, sid)
+        stats["shift_name"] = shift_map.get(sid, sid)
         variance_reports.append(stats)
 
     # Daily headcount

@@ -24,10 +24,11 @@ def run_skill(db: Session, skill_name: str, params: dict) -> Any:
     """Execute a skill by name.
 
     This is the SkillRunner callable expected by the executor.
+    Accepts both hyphenated (query-schedule) and underscored (query_schedule) names.
 
     Args:
         db: Database session.
-        skill_name: Registered skill name (e.g. "query-schedule").
+        skill_name: Registered skill name (e.g. "query-schedule" or "query_schedule").
         params: Parameters dict from the execution plan.
 
     Returns:
@@ -36,12 +37,12 @@ def run_skill(db: Session, skill_name: str, params: dict) -> Any:
     Raises:
         KeyError: If skill_name is not registered.
     """
-    if skill_name not in SKILL_REGISTRY:
-        # Ensure all skills are imported
-        _ensure_loaded()
-        if skill_name not in SKILL_REGISTRY:
-            raise KeyError(f"Unknown skill: {skill_name}")
-    return SKILL_REGISTRY[skill_name](db, params)
+    _ensure_loaded()
+    # Normalize: try as-is, then hyphenated, then underscored
+    for candidate in (skill_name, skill_name.replace("_", "-"), skill_name.replace("-", "_")):
+        if candidate in SKILL_REGISTRY:
+            return SKILL_REGISTRY[candidate](db, params)
+    raise KeyError(f"Unknown skill: {skill_name}")
 
 
 _loaded = False

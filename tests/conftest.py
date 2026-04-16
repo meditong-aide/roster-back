@@ -50,7 +50,7 @@ sys.modules["db.client2"] = _fake_client2
 from db.models import (  # noqa: E402
     Office, Group, Team, Nurse, Shift,
     Schedule, ScheduleEntry, RosterConfig, RosterJob,
-    Wanted, WantedRequest, NurseShiftRequest, FixedWantedEntry,
+    Wanted, WantedRequest, NurseShiftRequest, NursePairRequest, FixedWantedEntry,
     IssuedRoster, ShiftManage, RosterGradeConfig,
 )
 
@@ -74,6 +74,7 @@ _REQUIRED_TABLES = [
     Shift.__table__, Schedule.__table__, ScheduleEntry.__table__,
     RosterConfig.__table__, RosterGradeConfig.__table__, RosterJob.__table__,
     Wanted.__table__, WantedRequest.__table__, NurseShiftRequest.__table__,
+    NursePairRequest.__table__,
     FixedWantedEntry.__table__, ShiftManage.__table__, IssuedRoster.__table__,
 ]
 
@@ -333,6 +334,28 @@ def seed_data(db: Session) -> dict:
                 score=1.0,
             )
             db.add(nsr)
+    db.flush()
+
+    # ── Nurse Pair Requests (pair preferences for N001) ──
+    pair1 = NursePairRequest(
+        nurse_id="N001",
+        request_id=1,
+        month="2026-04",
+        detailed_request_id=1,
+        target_id="N002",
+        score=1.5,
+        partial_request="같이 근무 선호",
+    )
+    pair2 = NursePairRequest(
+        nurse_id="N001",
+        request_id=1,
+        month="2026-04",
+        detailed_request_id=2,
+        target_id="N004",
+        score=-1.0,
+        partial_request="비선호",
+    )
+    db.add_all([pair1, pair2])
     db.flush()
 
     # ── Fixed Wanted Entries (adjustments) ──
