@@ -49,6 +49,7 @@ SYNC_TABLES: List[tuple] = [
     ("fixed_wanted_entries", "upsert"),
     ("schedules", "upsert"),
     ("schedule_entries", "upsert"),
+    ("daily_shift", "upsert"),
     ("issued_roster", "wipe"),
     ("issued_roster_snapshot", "upsert"),
 ]
