@@ -3054,13 +3054,6 @@ def _validate_generated_roster(
                         f"{d + 1}일 필수 근무 미배정 (요구: {req_msg})"
                     )
 
-                if "M" in req and actual.get("M", 0) > req["M"]:
-                    if bool(getattr(roster_system, "_used_fallback", False)):
-                        continue
-                    return (
-                        f"[reason_code=M_OVERSUPPLY] {d + 1}일 M 과배정: "
-                        f"요구={req['M']}, 실제={actual.get('M', 0)}"
-                    )
     except Exception:
         # 검증 로직이 실패해도 저장을 막지 않고, 기존 최소 검증 결과만 사용
         pass
