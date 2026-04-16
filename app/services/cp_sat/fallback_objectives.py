@@ -15,6 +15,7 @@ from services.day_windows import iter_nurse_days
 from services.cp_sat.objective_terms import (
     add_even_mid_distribution_terms,
     add_even_night_minmax_distribution_terms,
+    add_kld_distribution_terms,
 )
 
 
@@ -265,7 +266,7 @@ def build_fallback_stage3_objective_terms(
 
     try:
         obj.extend(
-            add_even_night_minmax_distribution_terms(
+            add_kld_distribution_terms(
                 m=m,
                 rs=roster_system,
                 X=X,
@@ -273,22 +274,12 @@ def build_fallback_stage3_objective_terms(
                 leave=leave,
                 fixed_cnt=fixed_cnt,
                 logger_prefix=logger_prefix,
-                stage_label="폴백 Stage3",
+                stage_label="폴백Stage3",
                 blocked_by_nurse=blocked_by_nurse,
             )
         )
-        obj.extend(
-            add_even_mid_distribution_terms(
-                m=m,
-                rs=roster_system,
-                X=X,
-                join=join,
-                leave=leave,
-                fixed_cnt=fixed_cnt,
-            )
-        )
     except Exception as exc:
-        print(f"{logger_prefix} [WARN] even_nights penalty 적용 실패: {exc}")
+        print(f"{logger_prefix} [WARN] KLD distribution 적용 실패: {exc}")
 
     # 연속근무 소프트 상한
     try:

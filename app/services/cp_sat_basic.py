@@ -764,7 +764,7 @@ class CPSATBasicEngine:
         grouped: List[dict],
         grade_strategy: str = "BASE",
         grade_config: dict | None = None,
-        time_limit_seconds: int = 60,
+        time_limit_seconds: int = 120,
         randomize: bool = True,           # ← 추가
         seed: int | None = None           # ← 추가 (재현 원하면 지정)
     ) -> Dict[str, List[str]]:
