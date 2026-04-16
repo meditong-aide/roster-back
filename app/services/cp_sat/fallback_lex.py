@@ -1305,6 +1305,8 @@ def optimize_fallback_lex_hard_first(
                         continue
                     if fixed[(n, d)] != off_idx:
                         continue  # OFF가 아닌 고정 셀은 대상 아님
+                    if (n, d) in fixed_wanted_cells:
+                        continue  # fixed_wanted OFF는 BanN 대상 제외
                     _fw_type = fixed_type_by_cell.get((n, d))
                     if _fw_type == "근무":
                         continue
