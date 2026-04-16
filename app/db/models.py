@@ -357,6 +357,7 @@ class RosterGradeConfig(Base):
     group_id = Column(VARCHAR(50), nullable=False)
     null_grade_policy = Column(VARCHAR(20), nullable=False, default="LOWEST")
     constraints_json = Column(JSON, nullable=True)
+    grade_names_json = Column(JSON, nullable=True)
     use_dynamic_scaling = Column(TINYINT, nullable=False, default=1)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
