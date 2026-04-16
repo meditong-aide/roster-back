@@ -19,6 +19,14 @@ class GradeConfigBase(BaseModel):
         default_factory=dict,
         description="Shift별 Grade 최소 인원 예: {'D': {1:1, 2:2}}",
     )
+    grade_names: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Grade 번호별 표시 이름 예: {'1': '주니어', '2': '시니어'}. null이면 숫자 그대로 표시.",
+    )
+    use_mid: bool = Field(
+        default=False,
+        description="해당 그룹의 MID 근무코드 사용 여부 (roster_config 기반)",
+    )
 
 
 class GradeConfigUpsert(GradeConfigBase):
