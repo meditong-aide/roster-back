@@ -17,8 +17,16 @@ def update_constraint(db: Session, params: dict) -> Any:
     mutation = params.get("mutation", {})
     preview_only = params.get("preview_only", False)
 
-    target_field = mutation.get("target_field", "")
-    target_value = mutation.get("target_value")
+    # Support both nested (mutation.target_field) and flat (field/value) params
+    target_field = (
+        params.get("field")
+        or mutation.get("target_field", "")
+    )
+    target_value = (
+        params.get("value")
+        if params.get("value") is not None
+        else mutation.get("target_value")
+    )
 
     # Check if this is a shift_manage update (manpower)
     if target_field in ("manpower",) or params.get("nurse_class"):

@@ -1122,3 +1122,89 @@ class TestWantedPerDateCRUD:
         })
         assert "error" not in result
         assert result.get("status") == "retracted"
+
+
+# ── Constraint Update (update_constraint) ─────────────────────
+
+
+class TestConstraintUpdate:
+    """Test update_constraint skill with flat field/value params."""
+
+    def test_preview_integer_field(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "update-constraint", {
+            "group_id": seed_data["group_id"],
+            "field": "max_nig_per_month",
+            "value": 5,
+            "preview_only": True,
+        })
+        assert result.get("preview") is True
+        assert "max_nig_per_month" in result.get("changes", {})
+        change = result["changes"]["max_nig_per_month"]
+        assert change["old"] == 7  # seed_data default
+        assert change["new"] == 5
+
+    def test_execute_integer_field(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "update-constraint", {
+            "group_id": seed_data["group_id"],
+            "field": "max_conseq_work",
+            "value": 4,
+            "preview_only": False,
+        })
+        assert result.get("preview") is False
+        assert result["changes"]["max_conseq_work"]["new"] == 4
+
+        # Verify persisted
+        config = run_skill(db, "update-constraint", {
+            "group_id": seed_data["group_id"],
+        })
+        assert config["max_conseq_work"] == 4
+
+    def test_preview_boolean_field(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "update-constraint", {
+            "group_id": seed_data["group_id"],
+            "field": "banned_day_after_eve",
+            "value": False,
+            "preview_only": True,
+        })
+        assert result.get("preview") is True
+        change = result["changes"]["banned_day_after_eve"]
+        assert change["old"] is True
+        assert change["new"] is False
+
+    def test_execute_boolean_field(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "update-constraint", {
+            "group_id": seed_data["group_id"],
+            "field": "team_balance_enable",
+            "value": False,
+            "preview_only": False,
+        })
+        assert result["changes"]["team_balance_enable"]["new"] is False
+
+    def test_unknown_field_error(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "update-constraint", {
+            "group_id": seed_data["group_id"],
+            "field": "nonexistent_field",
+            "value": 123,
+            "preview_only": False,
+        })
+        assert "error" in result
+
+    def test_no_field_returns_current_config(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "update-constraint", {
+            "group_id": seed_data["group_id"],
+        })
+        assert "config_id" in result
+        assert "max_nig_per_month" in result
+        assert result["max_nig_per_month"] == 7
