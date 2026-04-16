@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 from typing import Callable, Iterable
 
 from ortools.sat.python import cp_model
@@ -129,6 +130,409 @@ def add_even_mid_distribution_terms(
     return obj
 
 
+def add_ratio_per_nurse_distribution_terms(
+    *,
+    m: cp_model.CpModel,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    fixed_cnt: list[list[int]] | None = None,
+    logger_prefix: str = "[objective_terms]",
+    stage_label: str = "메인",
+    blocked_by_nurse: dict[int, set[int]] | None = None,
+) -> list:
+    """ratio_map 기반 per-nurse band: 간호사별 실 근무일 기반 개별 비율 band."""
+    cfg = rs.config
+    D = rs.num_days
+    S = cfg.num_shifts
+    use_mid = bool(getattr(cfg, "use_mid", False))
+
+    all_work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    if use_mid and "M" in cfg.shift_types:
+        all_work_codes.append("M")
+    if len(all_work_codes) < 2:
+        return []
+
+    fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+
+    coverage_map: dict[str, int] = {}
+    for c in all_work_codes:
+        s_i = cfg.shift_types.index(c)
+        if (
+            hasattr(cfg, "daily_shift_requirements_by_day")
+            and isinstance(cfg.daily_shift_requirements_by_day, list)
+            and len(cfg.daily_shift_requirements_by_day) == D
+        ):
+            total = sum(
+                max(0, int((cfg.daily_shift_requirements_by_day[d] or {}).get(c, 0) or 0)
+                    - int(fc[d][s_i] if d < len(fc) else 0))
+                for d in range(D)
+            )
+        else:
+            base = int((cfg.daily_shift_requirements or {}).get(c, 0) or 0)
+            total = sum(max(0, base - int(fc[d][s_i] if d < len(fc) else 0)) for d in range(D))
+        coverage_map[c] = total
+
+    total_cov = sum(coverage_map.values())
+    if total_cov <= 0:
+        return []
+    ratio_map = {c: coverage_map[c] / total_cov for c in coverage_map}
+
+    eligible_count = sum(
+        1 for n, nu in enumerate(rs.nurses)
+        if not is_n_only_profile(getattr(nu, "is_night_nurse", None), use_mid=use_mid)
+        and (leave[n] - join[n] + 1) > 0
+    )
+    demand_work = total_cov / max(1, eligible_count)
+
+    _year = int(getattr(cfg, "year", 2026) or 2026)
+    _month = int(getattr(cfg, "month", 1) or 1)
+    weekend_days = sum(1 for d in range(1, D + 1) if calendar.weekday(_year, _month, d) >= 5)
+
+    pref = getattr(rs, "preference_matrix", None)
+    off_idx = cfg.shift_types.index("O") if "O" in cfg.shift_types else -1
+    off_req_cnt: dict[int, int] = {}
+    if pref is not None and off_idx >= 0:
+        for n in range(len(rs.nurses)):
+            cnt = sum(1 for d in range(D) if pref[n, d, off_idx] > 0)
+            if cnt > 0:
+                off_req_cnt[n] = cnt
+
+    w_ratio = NIGHT_DEVIATION_PENALTY // 2
+
+    obj: list = []
+    applied = 0
+    for code in all_work_codes:
+        if code not in cfg.shift_types:
+            continue
+        s_idx = cfg.shift_types.index(code)
+
+        for n, nu in enumerate(rs.nurses):
+            raw = getattr(nu, "is_night_nurse", None)
+            if is_n_only_profile(raw, use_mid=use_mid):
+                continue
+            allowed = normalize_allowed_shift_codes(raw, use_mid=use_mid) or set(all_work_codes)
+            if len(allowed) <= 1 or code not in allowed:
+                continue
+
+            n_blocked = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
+            if bool(getattr(nu, "is_weekend_off", False)):
+                n_blocked += weekend_days
+            n_blocked += off_req_cnt.get(n, 0)
+            active = leave[n] - join[n] + 1 - n_blocked
+            if active <= 0:
+                continue
+
+            nurse_work = demand_work * (active / D) if active < D else demand_work
+            allowed_ratio_sum = sum(ratio_map.get(c, 0) for c in allowed if c in ratio_map)
+            if allowed_ratio_sum <= 0:
+                continue
+
+            expected = nurse_work * ratio_map.get(code, 0) / allowed_ratio_sum
+            low_n = int(expected)
+            high_n = low_n + 1
+
+            tot = sum(X(n, d, s_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse))
+            dev_low = m.NewIntVar(0, D, f"{code}_rdevL_{stage_label}_{n}")
+            dev_high = m.NewIntVar(0, D, f"{code}_rdevH_{stage_label}_{n}")
+            m.Add(dev_low >= low_n - tot)
+            m.Add(dev_high >= tot - high_n)
+            obj.append(-w_ratio * dev_low)
+            obj.append(-w_ratio * dev_high)
+            applied += 1
+
+    if applied > 0:
+        print(
+            f"{logger_prefix} [ratio균등] ({stage_label}): "
+            f"terms={applied}, w={w_ratio}"
+        )
+    return obj
+
+
+def add_even_minmax_distribution_terms(
+    *,
+    m: cp_model.CpModel,
+    rs,
+    X,
+    shift_code: str,
+    join: list[int],
+    leave: list[int],
+    fixed_cnt: list[list[int]] | None = None,
+    logger_prefix: str = "[objective_terms]",
+    stage_label: str = "메인",
+    blocked_by_nurse: dict[int, set[int]] | None = None,
+) -> list:
+    """범용 shift 균등 분배: total_need/eligible 기반 band + global max 억제."""
+    cfg = rs.config
+    if shift_code not in cfg.shift_types:
+        return []
+
+    D = rs.num_days
+    S = cfg.num_shifts
+    s_idx = cfg.shift_types.index(shift_code)
+    use_mid = bool(getattr(cfg, "use_mid", False))
+
+    normals: list[int] = []
+    for i, nu in enumerate(rs.nurses):
+        raw = getattr(nu, "is_night_nurse", None)
+        if not is_n_only_profile(raw, use_mid=use_mid):
+            normals.append(i)
+
+    all_codes = {"D", "E", "N"}
+    if use_mid and "M" in cfg.shift_types:
+        all_codes.add("M")
+    n_forbid_n = _n_forbid_n_set(rs, join, leave) if shift_code == "N" else set()
+
+    full_eligible: list[int] = []
+    restricted_eligible: list[int] = []
+    for n in normals:
+        if shift_code == "N" and n in n_forbid_n:
+            continue
+        allowed = normalize_allowed_shift_codes(
+            getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+        ) or all_codes
+        if shift_code not in allowed:
+            continue
+        if len(allowed) <= 1:
+            continue
+        if allowed >= all_codes:
+            full_eligible.append(n)
+        else:
+            restricted_eligible.append(n)
+
+    if not full_eligible and not restricted_eligible:
+        return []
+
+    if (
+        hasattr(cfg, "daily_shift_requirements_by_day")
+        and isinstance(cfg.daily_shift_requirements_by_day, list)
+        and len(cfg.daily_shift_requirements_by_day) == D
+    ):
+        daily_need = [
+            int((cfg.daily_shift_requirements_by_day[d] or {}).get(shift_code, 0) or 0)
+            for d in range(D)
+        ]
+    else:
+        base = int((cfg.daily_shift_requirements or {}).get(shift_code, 0) or 0)
+        daily_need = [base for _ in range(D)]
+
+    fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+    total_need = sum(
+        max(0, daily_need[d] - int(fc[d][s_idx] if d < len(fc) else 0))
+        for d in range(D)
+    )
+    if total_need <= 0:
+        return []
+
+    w_primary = int(
+        getattr(cfg, "night_minmax_primary_weight", min(NIGHT_DEVIATION_PENALTY * 4, 200000))
+        or min(NIGHT_DEVIATION_PENALTY * 4, 200000)
+    )
+    w_secondary = int(
+        getattr(cfg, "night_minmax_secondary_weight", NIGHT_DEVIATION_PENALTY)
+        or NIGHT_DEVIATION_PENALTY
+    )
+
+    _year = int(getattr(cfg, "year", 2026) or 2026)
+    _month = int(getattr(cfg, "month", 1) or 1)
+    weekend_days_in_month = sum(
+        1 for d in range(1, D + 1)
+        if calendar.weekday(_year, _month, d) >= 5
+    )
+
+    off_request_cnt: dict[int, int] = {}
+    pref = getattr(rs, "preference_matrix", None)
+    if pref is not None:
+        off_idx = cfg.shift_types.index("O") if "O" in cfg.shift_types else -1
+        if off_idx >= 0:
+            for n in range(len(rs.nurses)):
+                cnt = sum(1 for d in range(D) if pref[n, d, off_idx] > 0)
+                if cnt > 0:
+                    off_request_cnt[n] = cnt
+
+    def _get_nurse_band(n: int, low: int, high: int) -> tuple[int, int]:
+        _n_blocked = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
+        if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
+            _n_blocked += weekend_days_in_month
+        _off_req = off_request_cnt.get(n, 0)
+        _n_blocked += _off_req
+        _active = leave[n] - join[n] + 1 - _n_blocked
+        if _n_blocked > 0 and _active < D:
+            _ratio = max(0.0, _active / max(1, D))
+            return max(0, round(low * _ratio)), max(0, round(high * _ratio))
+        return low, high
+
+    obj: list = []
+
+    if full_eligible:
+        low = total_need // len(full_eligible)
+        high = low + (1 if (total_need % len(full_eligible)) else 0)
+        print(
+            f"{logger_prefix} [{shift_code}균등] min-max({stage_label}): "
+            f"full={len(full_eligible)}, band=[{low},{high}], "
+            f"total_need={total_need}, w_pri={w_primary}, w_sec={w_secondary}"
+        )
+        max_var = m.NewIntVar(0, D, f"{shift_code}_max_{stage_label}")
+        min_var = m.NewIntVar(0, D, f"{shift_code}_min_{stage_label}")
+        for n in full_eligible:
+            low_n, high_n = _get_nurse_band(n, low, high)
+            tot = sum(X(n, d, s_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse))
+            m.Add(max_var >= tot)
+            m.Add(min_var <= tot)
+            dev_low = m.NewIntVar(0, D, f"{shift_code}_devL_{stage_label}_{n}")
+            dev_high = m.NewIntVar(0, D, f"{shift_code}_devH_{stage_label}_{n}")
+            m.Add(dev_low >= low_n - tot)
+            m.Add(dev_high >= tot - high_n)
+            obj.append(-w_secondary * dev_low)
+            obj.append(-w_secondary * dev_high)
+        obj.append(-w_primary * max_var)
+        obj.append(w_primary * min_var)
+
+    if restricted_eligible:
+        daily_need_all: dict[str, int] = {}
+        for c in all_codes:
+            if c not in cfg.shift_types:
+                continue
+            ci = cfg.shift_types.index(c)
+            if (
+                hasattr(cfg, "daily_shift_requirements_by_day")
+                and isinstance(cfg.daily_shift_requirements_by_day, list)
+                and len(cfg.daily_shift_requirements_by_day) == D
+            ):
+                daily_need_all[c] = sum(
+                    max(0, int((cfg.daily_shift_requirements_by_day[d] or {}).get(c, 0) or 0))
+                    for d in range(D)
+                )
+            else:
+                daily_need_all[c] = int((cfg.daily_shift_requirements or {}).get(c, 0) or 0) * D
+
+        max_var_r = m.NewIntVar(0, D, f"{shift_code}_max_r_{stage_label}")
+        min_var_r = m.NewIntVar(0, D, f"{shift_code}_min_r_{stage_label}")
+        for n in restricted_eligible:
+            allowed = normalize_allowed_shift_codes(
+                getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+            ) or all_codes
+            allowed_need = sum(daily_need_all.get(c, 0) for c in allowed)
+            if allowed_need <= 0:
+                continue
+            code_ratio = daily_need_all.get(shift_code, 0) / allowed_need
+            _n_blocked = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
+            if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
+                _n_blocked += weekend_days_in_month
+            _active = leave[n] - join[n] + 1 - _n_blocked
+            work = max(0, _active - round(9 * _active / D))
+            expected = work * code_ratio
+            low_n = int(expected)
+            high_n = low_n + 1
+            _off_req = off_request_cnt.get(n, 0)
+            if _off_req > 0:
+                _active_adj = max(0, _active - _off_req)
+                work = max(0, _active_adj - round(9 * _active_adj / D))
+                expected = work * code_ratio
+                low_n = int(expected)
+                high_n = low_n + 1
+            tot = sum(X(n, d, s_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse))
+            m.Add(max_var_r >= tot)
+            m.Add(min_var_r <= tot)
+            dev_low = m.NewIntVar(0, D, f"{shift_code}_devL_r_{stage_label}_{n}")
+            dev_high = m.NewIntVar(0, D, f"{shift_code}_devH_r_{stage_label}_{n}")
+            m.Add(dev_low >= low_n - tot)
+            m.Add(dev_high >= tot - high_n)
+            obj.append(-w_secondary * dev_low)
+            obj.append(-w_secondary * dev_high)
+        obj.append(-w_primary * max_var_r)
+        obj.append(w_primary * min_var_r)
+        print(
+            f"{logger_prefix} [{shift_code}균등] restricted({stage_label}): "
+            f"cnt={len(restricted_eligible)}"
+        )
+
+    return obj
+
+
+def add_total_work_equalization_terms(
+    *,
+    m: cp_model.CpModel,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    logger_prefix: str = "[objective_terms]",
+    stage_label: str = "메인",
+    blocked_by_nurse: dict[int, set[int]] | None = None,
+) -> list:
+    """총 근무수(D+E+N+M) 균등화: max-min 편차를 소프트 페널티로 억제."""
+    cfg = rs.config
+    D = rs.num_days
+    use_mid = bool(getattr(cfg, "use_mid", False))
+
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    if use_mid and "M" in cfg.shift_types:
+        work_codes.append("M")
+    if not work_codes:
+        return []
+    work_indices = [cfg.shift_types.index(c) for c in work_codes]
+
+    normals: list[int] = []
+    for i, nu in enumerate(rs.nurses):
+        raw = getattr(nu, "is_night_nurse", None)
+        if not is_n_only_profile(raw, use_mid=use_mid):
+            allowed = normalize_allowed_shift_codes(raw, use_mid=use_mid) or {"D", "E", "N"}
+            if len(allowed) > 1:
+                normals.append(i)
+    if len(normals) < 2:
+        return []
+
+    total_need = 0
+    for c in work_codes:
+        ci = cfg.shift_types.index(c)
+        if (
+            hasattr(cfg, "daily_shift_requirements_by_day")
+            and isinstance(cfg.daily_shift_requirements_by_day, list)
+            and len(cfg.daily_shift_requirements_by_day) == D
+        ):
+            total_need += sum(
+                int((cfg.daily_shift_requirements_by_day[d] or {}).get(c, 0) or 0)
+                for d in range(D)
+            )
+        else:
+            total_need += int((cfg.daily_shift_requirements or {}).get(c, 0) or 0) * D
+
+    target = total_need // len(normals)
+    target_high = target + (1 if (total_need % len(normals)) else 0)
+
+    w_total = NIGHT_DEVIATION_PENALTY
+
+    print(
+        f"{logger_prefix} [총근무균등] ({stage_label}): "
+        f"nurses={len(normals)}, target=[{target},{target_high}], "
+        f"total_need={total_need}, w={w_total}"
+    )
+
+    obj: list = []
+    max_work = m.NewIntVar(0, D, f"total_work_max_{stage_label}")
+    min_work = m.NewIntVar(0, D, f"total_work_min_{stage_label}")
+    for n in normals:
+        tot = sum(
+            X(n, d, s)
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
+            for s in work_indices
+        )
+        m.Add(max_work >= tot)
+        m.Add(min_work <= tot)
+        dev_low = m.NewIntVar(0, D, f"tw_devL_{stage_label}_{n}")
+        dev_high = m.NewIntVar(0, D, f"tw_devH_{stage_label}_{n}")
+        m.Add(dev_low >= target - tot)
+        m.Add(dev_high >= tot - target_high)
+        obj.append(-w_total * dev_low)
+        obj.append(-w_total * dev_high)
+    range_var = m.NewIntVar(0, D, f"total_work_range_{stage_label}")
+    m.Add(range_var >= max_work - min_work)
+    obj.append(-w_total * 2 * range_var)
+    return obj
+
+
 def add_even_night_minmax_distribution_terms(
     *,
     m: cp_model.CpModel,
@@ -191,8 +595,8 @@ def add_even_night_minmax_distribution_terms(
     low = total_need_n // len(normals_can_n)
     high = low + (1 if (total_need_n % len(normals_can_n)) else 0)
     w_primary = int(
-        getattr(cfg, "night_minmax_primary_weight", NIGHT_DEVIATION_PENALTY * 20)
-        or NIGHT_DEVIATION_PENALTY * 20
+        getattr(cfg, "night_minmax_primary_weight", min(NIGHT_DEVIATION_PENALTY * 4, 200000))
+        or min(NIGHT_DEVIATION_PENALTY * 4, 200000)
     )
     w_secondary = int(
         getattr(cfg, "night_minmax_secondary_weight", NIGHT_DEVIATION_PENALTY)
@@ -370,28 +774,35 @@ def build_main_objective_terms(
                 m.Add(slack >= 2 - offs)
                 obj.append(-WEEK_OFF_SHORT_PENALTY * slack)
 
-    obj.extend(
-        add_even_night_minmax_distribution_terms(
-            m=m,
-            rs=rs,
-            X=X,
-            join=join,
-            leave=leave,
-            fixed_cnt=fixed_cnt,
-            logger_prefix="[objective_terms]",
-            stage_label="메인",
-            blocked_by_nurse=blocked_by_nurse,
+    _dist_codes = ["D", "E", "N"]
+    if bool(getattr(cfg, "use_mid", False)) and "M" in cfg.shift_types:
+        _dist_codes.append("M")
+    for _sc in _dist_codes:
+        obj.extend(
+            add_even_minmax_distribution_terms(
+                m=m,
+                rs=rs,
+                X=X,
+                shift_code=_sc,
+                join=join,
+                leave=leave,
+                fixed_cnt=fixed_cnt,
+                logger_prefix="[objective_terms]",
+                stage_label="메인",
+                blocked_by_nurse=blocked_by_nurse,
         )
     )
 
     obj.extend(
-        add_even_mid_distribution_terms(
+        add_total_work_equalization_terms(
             m=m,
             rs=rs,
             X=X,
             join=join,
             leave=leave,
-            fixed_cnt=fixed_cnt,
+            logger_prefix="[objective_terms]",
+            stage_label="메인",
+            blocked_by_nurse=blocked_by_nurse,
         )
     )
 

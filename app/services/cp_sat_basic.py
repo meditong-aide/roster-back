@@ -39,7 +39,7 @@ from services.cp_sat.hardcoded_weights import (
 )
 from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set
 from services.cp_sat.fallback_lex import optimize_fallback_lex_hard_first
-from services.cp_sat.night_distribution_log import log_n_even_distribution
+from services.cp_sat.night_distribution_log import log_n_even_distribution, log_shift_distribution
 from services.cp_sat.lookahead_helpers import (
     get_D_ext,
     compute_leave_ext,
@@ -1784,6 +1784,8 @@ class CPSATBasicEngine:
                 break
         roster_system.roster = best_roster
         log_n_even_distribution(roster_system, self.logger_prefix)
+        log_shift_distribution(roster_system, self.logger_prefix,
+                               blocked_by_nurse=getattr(roster_system, 'blocked_by_nurse', None))
         if best_viol > 0:
             try:
                 violations = [
@@ -1866,8 +1868,8 @@ class CPSATBasicEngine:
             # ▲▲ 랜덤화 추가 ▲▲
 
             solver.parameters.max_time_in_seconds=tl
-            solver.parameters.num_search_workers=2
-            solver.parameters.relative_gap_limit = 0.1
+            solver.parameters.num_search_workers=8
+            solver.parameters.relative_gap_limit = 0.05
             stat=solver.Solve(model)
             print('stat', stat)
             if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE): return False

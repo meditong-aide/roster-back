@@ -13,8 +13,8 @@ from services.cp_sat.hardcoded_weights import (
 from services.cp_sat.allowed_shift_types import is_n_only_profile
 from services.day_windows import iter_nurse_days
 from services.cp_sat.objective_terms import (
-    add_even_mid_distribution_terms,
-    add_even_night_minmax_distribution_terms,
+    add_even_minmax_distribution_terms,
+    add_total_work_equalization_terms,
 )
 
 
@@ -264,31 +264,38 @@ def build_fallback_stage3_objective_terms(
         pass
 
     try:
+        _dist_codes = ["D", "E", "N"]
+        if bool(getattr(cfg, "use_mid", False)) and "M" in cfg.shift_types:
+            _dist_codes.append("M")
+        for _sc in _dist_codes:
+            obj.extend(
+                add_even_minmax_distribution_terms(
+                    m=m,
+                    rs=roster_system,
+                    X=X,
+                    shift_code=_sc,
+                    join=join,
+                    leave=leave,
+                    fixed_cnt=fixed_cnt,
+                    logger_prefix=logger_prefix,
+                    stage_label="폴백 Stage3",
+                    blocked_by_nurse=blocked_by_nurse,
+                )
+            )
         obj.extend(
-            add_even_night_minmax_distribution_terms(
+            add_total_work_equalization_terms(
                 m=m,
                 rs=roster_system,
                 X=X,
                 join=join,
                 leave=leave,
-                fixed_cnt=fixed_cnt,
                 logger_prefix=logger_prefix,
                 stage_label="폴백 Stage3",
                 blocked_by_nurse=blocked_by_nurse,
             )
         )
-        obj.extend(
-            add_even_mid_distribution_terms(
-                m=m,
-                rs=roster_system,
-                X=X,
-                join=join,
-                leave=leave,
-                fixed_cnt=fixed_cnt,
-            )
-        )
     except Exception as exc:
-        print(f"{logger_prefix} [WARN] even_nights penalty 적용 실패: {exc}")
+        print(f"{logger_prefix} [WARN] even distribution penalty 적용 실패: {exc}")
 
     # 연속근무 소프트 상한
     try:
