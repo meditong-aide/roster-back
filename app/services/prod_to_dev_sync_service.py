@@ -173,8 +173,27 @@ def _merge_upsert(db: Session, table: str) -> dict:
     if not common:
         return {"table": table, "skipped": "no_common_cols", "upserted": 0}
 
+    # 문자열 PK 컬럼의 collation 충돌 방지 (prod/dev DB 기본 collation 다를 수 있음)
+    str_types = {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
+    col_types = {}
+    type_rows = db.execute(
+        text(
+            f"SELECT COLUMN_NAME, DATA_TYPE FROM {DEV_DB}.INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=:t"
+        ),
+        {"t": table},
+    ).fetchall()
+    for r in type_rows:
+        col_types[r[0]] = r[1]
+
     non_pk = [c for c in common if c not in pk_cols]
-    pk_join = " AND ".join(f"dst.[{c}] = src.[{c}]" for c in pk_cols)
+    pk_parts = []
+    for c in pk_cols:
+        if col_types.get(c, "") in str_types:
+            pk_parts.append(f"dst.[{c}] = src.[{c}] COLLATE DATABASE_DEFAULT")
+        else:
+            pk_parts.append(f"dst.[{c}] = src.[{c}]")
+    pk_join = " AND ".join(pk_parts)
     insert_cols = ", ".join(f"[{c}]" for c in common)
     insert_vals = ", ".join(f"src.[{c}]" for c in common)
     update_clause = ""
