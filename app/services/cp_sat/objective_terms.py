@@ -127,7 +127,7 @@ def add_kld_distribution_terms(
     # ── 글로벌 range 억제 가중치 ──
     W_RANGE = int(getattr(cfg, "kld_range_weight", 1200000) or 1200000)
     # ── 총근무 균등 가중치 ──
-    W_TOTAL = int(getattr(cfg, "kld_total_weight", 200000) or 200000)
+    W_TOTAL = int(getattr(cfg, "kld_total_weight", 100000) or 100000)
 
     # ── N 전일 금지 / 프로필 분류 ──
     n_forbid_n = _n_forbid_n_set(rs, join, leave)
