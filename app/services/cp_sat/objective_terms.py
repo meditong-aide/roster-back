@@ -125,9 +125,9 @@ def add_kld_distribution_terms(
             w_shift[c] = BASE_W
 
     # ── 글로벌 range 억제 가중치 ──
-    W_RANGE = int(getattr(cfg, "kld_range_weight", 400000) or 400000)
+    W_RANGE = int(getattr(cfg, "kld_range_weight", 1200000) or 1200000)
     # ── 총근무 균등 가중치 ──
-    W_TOTAL = int(getattr(cfg, "kld_total_weight", 40000) or 40000)
+    W_TOTAL = int(getattr(cfg, "kld_total_weight", 200000) or 200000)
 
     # ── N 전일 금지 / 프로필 분류 ──
     n_forbid_n = _n_forbid_n_set(rs, join, leave)
@@ -249,18 +249,33 @@ def add_kld_distribution_terms(
             m.Add(max_var >= tot)
             m.Add(min_var <= tot)
 
-            # 비례 target 이탈 페널티 (역비율 가중)
-            dev_low = m.NewIntVar(0, D, f"kld_{c}_dL_{stage_label}_{n}")
-            dev_high = m.NewIntVar(0, D, f"kld_{c}_dH_{stage_label}_{n}")
-            m.Add(dev_low >= target_low - tot)
-            m.Add(dev_high >= tot - target_high)
-            obj.append(-w_dev * dev_low)
-            obj.append(-w_dev * dev_high)
+            # U: 볼록(piecewise-linear) 편차 페널티 — KL divergence 근사
+            # dev = d1 + d2 + d3 (d1 ≤ 1, d2 ≤ 2, d3 ≤ D)
+            # penalty = w·d1 + 3w·d2 + 10w·d3 (평균에서 멀수록 급격히 증가)
+            for side_tag, lb_expr in (
+                ("L", target_low - tot),  # 미달 측
+                ("H", tot - target_high), # 초과 측
+            ):
+                d_tot = m.NewIntVar(0, D, f"kld_{c}_d{side_tag}tot_{stage_label}_{n}")
+                d1 = m.NewIntVar(0, 1, f"kld_{c}_d{side_tag}1_{stage_label}_{n}")
+                d2 = m.NewIntVar(0, 2, f"kld_{c}_d{side_tag}2_{stage_label}_{n}")
+                d3 = m.NewIntVar(0, D, f"kld_{c}_d{side_tag}3_{stage_label}_{n}")
+                m.Add(d_tot >= lb_expr)
+                m.Add(d_tot == d1 + d2 + d3)
+                obj.append(-w_dev * d1)
+                obj.append(-3 * w_dev * d2)
+                obj.append(-10 * w_dev * d3)
 
-        # range 억제: max - min 최소화
+        # range 억제: max - min 최소화 (U2: 3-tier 볼록 페널티)
         range_var = m.NewIntVar(0, D, f"kld_{c}_range_{stage_label}")
         m.Add(range_var >= max_var - min_var)
-        obj.append(-W_RANGE * range_var)
+        r1 = m.NewIntVar(0, 1, f"kld_{c}_r1_{stage_label}")
+        r2 = m.NewIntVar(0, 2, f"kld_{c}_r2_{stage_label}")
+        r3 = m.NewIntVar(0, D, f"kld_{c}_r3_{stage_label}")
+        m.Add(range_var == r1 + r2 + r3)
+        obj.append(-W_RANGE * r1)
+        obj.append(-3 * W_RANGE * r2)
+        obj.append(-10 * W_RANGE * r3)
         # min 끌어올림
         obj.append(W_RANGE * min_var)
 
@@ -302,16 +317,31 @@ def add_kld_distribution_terms(
         m.Add(max_work >= tot)
         m.Add(min_work <= tot)
 
-        dev_low = m.NewIntVar(0, D, f"kld_tw_dL_{stage_label}_{n}")
-        dev_high = m.NewIntVar(0, D, f"kld_tw_dH_{stage_label}_{n}")
-        m.Add(dev_low >= target_work - tot)
-        m.Add(dev_high >= tot - target_work_high)
-        obj.append(-W_TOTAL * dev_low)
-        obj.append(-W_TOTAL * dev_high)
+        # U: 총근무 편차도 3-tier 볼록 페널티 (KL 근사)
+        for side_tag, lb_expr in (
+            ("L", target_work - tot),
+            ("H", tot - target_work_high),
+        ):
+            d_tot = m.NewIntVar(0, D, f"kld_tw_d{side_tag}tot_{stage_label}_{n}")
+            d1 = m.NewIntVar(0, 1, f"kld_tw_d{side_tag}1_{stage_label}_{n}")
+            d2 = m.NewIntVar(0, 2, f"kld_tw_d{side_tag}2_{stage_label}_{n}")
+            d3 = m.NewIntVar(0, D, f"kld_tw_d{side_tag}3_{stage_label}_{n}")
+            m.Add(d_tot >= lb_expr)
+            m.Add(d_tot == d1 + d2 + d3)
+            obj.append(-W_TOTAL * d1)
+            obj.append(-3 * W_TOTAL * d2)
+            obj.append(-10 * W_TOTAL * d3)
 
+    # U2: 총근무 range에도 3-tier 볼록 페널티
     range_work = m.NewIntVar(0, D, f"kld_tw_range_{stage_label}")
     m.Add(range_work >= max_work - min_work)
-    obj.append(-W_TOTAL * 2 * range_work)
+    rw1 = m.NewIntVar(0, 1, f"kld_tw_r1_{stage_label}")
+    rw2 = m.NewIntVar(0, 2, f"kld_tw_r2_{stage_label}")
+    rw3 = m.NewIntVar(0, D, f"kld_tw_r3_{stage_label}")
+    m.Add(range_work == rw1 + rw2 + rw3)
+    obj.append(-W_TOTAL * 2 * rw1)
+    obj.append(-3 * W_TOTAL * 2 * rw2)
+    obj.append(-10 * W_TOTAL * 2 * rw3)
 
     print(
         f"{logger_prefix} [KLD-총근무] ({stage_label}): "

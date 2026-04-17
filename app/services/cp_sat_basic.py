@@ -64,6 +64,91 @@ def _allowed_shift_codes(raw) -> set[str]:
     return normalize_allowed_shift_codes(raw, use_mid=True)
 
 
+# ─────────────────────────  Row-commit tiered LNS (B안)  ─────────────────
+def _row_commit_counts(rs, roster) -> tuple[list[dict[str, int]], list[int], list[int]]:
+    """D/E/N/T counts + mixed indices 반환."""
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    shift_idx = {c: cfg.shift_types.index(c) for c in work_codes}
+    N, D = len(rs.nurses), rs.num_days
+    counts: list[dict[str, int]] = []
+    totals: list[int] = []
+    for n in range(N):
+        cnts = {c: int(roster[n, :D, shift_idx[c]].sum()) for c in work_codes}
+        counts.append(cnts)
+        totals.append(sum(cnts.values()))
+    mixed = [n for n in range(N) if all(counts[n].get(c, 0) >= 1 for c in work_codes)]
+    return counts, totals, mixed
+
+
+def _row_commit_frozen_rows(rs, roster, tolerance: float) -> set[int]:
+    """mixed 간호사 중 모든 D/E/N count 가 mean±tolerance 이내면 frozen."""
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    if not work_codes:
+        return set()
+    counts, _, mixed = _row_commit_counts(rs, roster)
+    if not mixed:
+        return set()
+    means = {c: sum(counts[n][c] for n in mixed) / len(mixed) for c in work_codes}
+    frozen: set[int] = set()
+    for n in mixed:
+        if all(abs(counts[n][c] - means[c]) <= tolerance for c in work_codes):
+            frozen.add(n)
+    return frozen
+
+
+def _row_commit_range_sum(rs, roster) -> tuple[int, dict[str, int]]:
+    """Dw + Ew + Nw + Tw (mixed 간호사 범위 합) 및 per-shift width 반환."""
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    counts, totals, mixed = _row_commit_counts(rs, roster)
+    breakdown: dict[str, int] = {c: 0 for c in work_codes}
+    breakdown["T"] = 0
+    if not mixed:
+        return 0, breakdown
+    for c in work_codes:
+        vals = [counts[n][c] for n in mixed]
+        breakdown[c] = max(vals) - min(vals)
+    t_vals = [totals[n] for n in mixed]
+    breakdown["T"] = max(t_vals) - min(t_vals)
+    return sum(breakdown.values()), breakdown
+
+
+def _row_commit_rebias(policy, rs, roster) -> tuple[list[int], dict[int, float]]:
+    """현재 roster 기반으로 n_w 시드 (A compact: soft bias).
+    bad_rows(top 2/3 deviation) 반환 + deviation map.
+
+    - A compact: pool 열어두고 n_w 만 3/2/1 tier 로 시드.
+    - max-based dev → shift 간 compensation effect 없음 (v2 regression 교훈).
+    """
+    counts, _, mixed = _row_commit_counts(rs, roster)
+    work_codes = [c for c in ["D", "E", "N"] if c in rs.config.shift_types]
+    if not mixed or not work_codes:
+        policy.set_pool(None)
+        return [], {}
+    means = {
+        c: sum(counts[n][c] for n in mixed) / len(mixed)
+        for c in work_codes
+    }
+    devs = {
+        n: max(abs(counts[n][c] - means[c]) for c in work_codes)
+        for n in mixed
+    }
+    ranked = sorted(mixed, key=lambda n: devs[n], reverse=True)
+    third = max(1, len(ranked) // 3)
+    # n_w 초기화 후 재가중
+    policy.n_w = np.ones(policy.N)
+    for n in ranked[:third]:
+        policy.n_w[n] = 3.0
+    for n in ranked[third:2 * third]:
+        policy.n_w[n] = 2.0
+    bad_rows = ranked[:2 * third]
+    # A compact: pool 열어둠 (good row 도 재조합 가능)
+    policy.set_pool(None)
+    return bad_rows, devs
+
+
 # ─────────────────────────────  RL Neighborhood  ─────────────────────────
 class RLNeighborhoodPolicy:
     """아주 가벼운 ε-greedy 정책"""
@@ -71,14 +156,32 @@ class RLNeighborhoodPolicy:
         self.N, self.D = N, D
         self.eps, self.eps_end, self.decay = eps0, eps_end, decay
         self.n_w, self.d_w = np.ones(N), np.ones(D)
+        # active_pool: None 이면 전체 N, 지정 시 해당 인덱스에서만 n_sel 샘플링
+        self.active_pool: list[int] | None = None
+
+    def set_pool(self, pool: list[int] | None) -> None:
+        """n_sel 샘플 제한 (row-commit: good row 고정, bad row 만 재탐색)."""
+        self.active_pool = list(pool) if pool else None
 
     def select(self, k_n=4, k_d=7):
+        pool = self.active_pool if self.active_pool else list(range(self.N))
+        k_n_eff = min(k_n, len(pool))
+        if k_n_eff <= 0:
+            pool = list(range(self.N))
+            k_n_eff = min(k_n, self.N)
         if random.random() < self.eps:                          # explore
-            n_sel = random.sample(range(self.N), k=min(k_n,self.N))
+            n_sel = random.sample(pool, k=k_n_eff)
             d_sel = random.sample(range(self.D), k=min(k_d,self.D))
         else:                                                   # exploit
-            n_sel = list(np.random.choice(self.N,k_n,replace=False,
-                                           p=self.n_w/self.n_w.sum()))
+            pool_arr = np.array(pool, dtype=int)
+            pool_w = self.n_w[pool_arr]
+            _sum = pool_w.sum()
+            if _sum <= 0:
+                pool_w = np.ones_like(pool_w)
+                _sum = pool_w.sum()
+            p = pool_w / _sum
+            n_sel = list(pool_arr[np.random.choice(
+                len(pool_arr), k_n_eff, replace=False, p=p)])
             d_sel = list(np.random.choice(self.D,k_d,replace=False,
                                            p=self.d_w/self.d_w.sum()))
         self.eps = max(self.eps_end, self.eps*self.decay)
@@ -1704,25 +1807,13 @@ class CPSATBasicEngine:
         # randomize=False 여도 run_seed는 항상 정의되어야 한다.
         # (e.g., 테스트/재현성 평가 스크립트에서 seed 고정 실행)
         run_seed = seed if seed is not None else ((int(time.time() * 1000) ^ random.getrandbits(31)) & 0x7fffffff)
-        # ① 0.3× time_limit 으로 “전체 모델” 한번 돌려 feasible 확보
-        # time_limit_seconds가 작을 때도(테스트/평가) 입력된 제한을 존중한다.
-        # 예: time_limit_seconds=10이면 base_tl은 최대 3초 정도로 제한.
+        # ① 0.3× time_limit 으로 Phase 1(초기해) 확보
         base_tl = max(1, int(time_limit_seconds * 0.3))
         base_tl = min(base_tl, max(1, int(time_limit_seconds)))
         print(
             f"{self.logger_prefix} [Progress] base_tl={base_tl}s, "
             f"remaining={time_limit_seconds - base_tl}s"
         )
-        roster_system.is_quick_phase = True
-        feasible = self._quick_initial_solve(
-            roster_system, base_tl, grouped, run_seed)
-        roster_system.is_quick_phase = False
-        print(f"{self.logger_prefix} [Progress] 초기해={int(bool(feasible))}")
-        if not feasible:
-            print(
-                f"{self.logger_prefix} [Progress] 초기해 실패 -> 이웃 탐색 생략, 폴백으로 전환"
-            )
-            return False
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
             'shift_requirement', 'max_consecutive_night',
@@ -1732,12 +1823,43 @@ class CPSATBasicEngine:
         def hard_violation_cnt():
             return sum(1 for v in roster_system._find_violations()
                        if v['type'] in HARD_TYPES)
+
+        roster_system.is_quick_phase = True
+        feasible = self._quick_initial_solve(
+            roster_system, base_tl, grouped, run_seed)
+        roster_system.is_quick_phase = False
+        if not feasible:
+            print(
+                f"{self.logger_prefix} [Progress] Phase 1 실패 -> 폴백으로 전환"
+            )
+            return False
         best_viol = hard_violation_cnt()
         best_roster = roster_system.roster.copy()
+        print(
+            f"{self.logger_prefix} [Progress] Phase 1 완료: best_viol={best_viol}"
+        )
+        remaining = time_limit_seconds - base_tl
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
                                       roster_system.num_days)
-        remaining = time_limit_seconds - base_tl
+        # Phase 1.5 A compact: deviation-based bias + range-aware acceptance
+        #   - n_w 3/2/1 tier 시드 (pool 은 전체 N 열어둠)
+        #   - best_range_sum 으로 range-aware 수용 기준 활성화
+        bad_rows, _devs_map = _row_commit_rebias(
+            policy, roster_system, best_roster)
+        if bad_rows:
+            _ranked_top = sorted(
+                bad_rows, key=lambda n: _devs_map.get(n, 0), reverse=True)[:3]
+            print(
+                f"{self.logger_prefix} [RC-A] biased={len(bad_rows)} "
+                f"top3_devs={[(n, round(_devs_map.get(n,0),1)) for n in _ranked_top]}"
+            )
+        best_range_sum, best_range_brk = _row_commit_range_sum(
+            roster_system, best_roster)
+        print(
+            f"{self.logger_prefix} [RC-A] init range_sum={best_range_sum}, "
+            f"brk={best_range_brk}"
+        )
         per_iter = 8
         max_iter = max(0, remaining // per_iter)
 
@@ -1754,7 +1876,7 @@ class CPSATBasicEngine:
                     f"{self.logger_prefix} [Progress] iter={it + 1}/{max_iter}, "
                     f"n_sel={len(n_sel)}, d_sel={len(d_sel)}"
                 )
-                ok, status_text = _solve_neighbourhood(
+                ok, status_text, _curr_obj = _solve_neighbourhood(
                     roster_system, n_sel, d_sel, per_iter, grouped, run_seed, it=it
                 )
             except Exception as e:
@@ -1768,16 +1890,33 @@ class CPSATBasicEngine:
                 policy.update(False, n_sel, d_sel)
                 continue
             curr_viol = hard_violation_cnt()
-            improved  = curr_viol < best_viol
-            if improved:
-                best_viol = curr_viol;  best_roster = roster_system.roster.copy()
-            else:  # rollback
+            # RC-A: viol 감소 또는 viol 동일 & range-sum 감소 시 수용
+            if curr_viol < best_viol:
+                improved = True
+                best_viol = curr_viol
+                best_roster = roster_system.roster.copy()
+                best_range_sum, best_range_brk = _row_commit_range_sum(
+                    roster_system, best_roster)
+            elif curr_viol == best_viol:
+                curr_sum, curr_brk = _row_commit_range_sum(
+                    roster_system, roster_system.roster)
+                if curr_sum < best_range_sum:
+                    improved = True
+                    best_range_sum = curr_sum
+                    best_range_brk = curr_brk
+                    best_roster = roster_system.roster.copy()
+                else:
+                    improved = False
+                    roster_system.roster = best_roster.copy()
+            else:
+                improved = False
                 roster_system.roster = best_roster.copy()
             policy.update(improved, n_sel, d_sel)
             print(
                 f"{self.logger_prefix} [Progress] iter={it + 1} "
                 f"status={status_text}, curr_viol={curr_viol}, "
-                f"best_viol={best_viol}, improved={int(improved)}"
+                f"best_viol={best_viol}, range_sum={best_range_sum} "
+                f"brk={best_range_brk}, improved={int(improved)}"
             )
             if best_viol == 0:
                 print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
@@ -1866,7 +2005,7 @@ class CPSATBasicEngine:
             # ▲▲ 랜덤화 추가 ▲▲
 
             solver.parameters.max_time_in_seconds=tl
-            solver.parameters.num_search_workers=2
+            solver.parameters.num_search_workers=4
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
             print('stat', stat)
@@ -3491,8 +3630,10 @@ def _solve_neighbourhood(
     grouped,
     run_seed: int | None = None,
     it: int = 0,
-) -> tuple[bool, str]:
-    """선택된 이웃(n_set, d_set)만 재탐색하여 해를 갱신한다."""
+) -> tuple[bool, str, float]:
+    """선택된 이웃(n_set, d_set)만 재탐색하여 해를 갱신한다.
+    반환: (성공여부, 상태텍스트, 목적함수값). 실패 시 obj는 -inf.
+    """
     from ortools.sat.python import cp_model
     model,X,j,l,fixed=_build_full_model(rs,grouped, include_pair_objective=False)
 
@@ -3579,14 +3720,18 @@ def _solve_neighbourhood(
         if not bool(getattr(rs, "_infeasible_n_diag_logged", False)):
             _log_infeasible_n_capacity(rs, j, l, fixed)
             rs._infeasible_n_diag_logged = True
-        return False, status_text
+        return False, status_text, float("-inf")
 
     # 반영
     for n in n_set:
         for d in d_set:
             for s in range(S):
                 rs.roster[n,d,s]=1 if solver.Value(X(n,d,s)) else 0
-    return True, status_text
+    try:
+        obj_val = float(solver.ObjectiveValue())
+    except Exception:
+        obj_val = float("-inf")
+    return True, status_text, obj_val
 
 
 def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dict[tuple[int, int], int]) -> None:
