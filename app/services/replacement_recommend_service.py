@@ -133,11 +133,13 @@ def _build_assignment_blocked_dates(
     year: int,
     month: int,
     days_in_month: int,
+    office_id: Optional[str] = None,
 ) -> Dict[str, set]:
     """해당 월의 active NurseAssignment에서 간호사별 blocked date 집합을 구성한다.
 
     파견/병동이동/휴직: source_group_id == group_id인 아웃바운드 기간
     프리셉티: preceptor_id가 있는 간호사의 assignment 기간
+    주휴(weekly_off): nurses.weekly_off_weekday + weekly_off_settings 기반 계산 — 주휴일은 대체 배정 금지
     """
     month_start = date(year, month, 1)
     month_end = date(year, month, days_in_month)
@@ -198,6 +200,28 @@ def _build_assignment_blocked_dates(
             blocked[nid] = set()
         blocked[nid].add(shift_date)
 
+    # weekly_off — nurses.weekly_off_weekday + weekly_off_settings 로 계산된 주휴일 차단
+    if office_id:
+        try:
+            from services.roster_create_service import (
+                _compute_weekly_off_day_indices_for_month,
+            )
+            weekly_map, _warns = _compute_weekly_off_day_indices_for_month(
+                db, office_id, group_id, year, month,
+            )
+            for nid_raw, day_idx_set in (weekly_map or {}).items():
+                nid = str(nid_raw)
+                if nid not in blocked:
+                    blocked[nid] = set()
+                for d_idx in day_idx_set:
+                    if 0 <= int(d_idx) < days_in_month:
+                        blocked[nid].add(date(year, month, int(d_idx) + 1))
+        except Exception as exc:
+            logger.warning(
+                "near-error: weekly_off blocked-dates computation failed group_id=%s reason=%s",
+                group_id, exc,
+            )
+
     return blocked
 
 
@@ -226,6 +250,23 @@ def _is_off_shift(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> bool:
         shift_meta,
     )
     return is_off_any
+
+
+def _is_weekly_off_shift(
+    shift_id: str,
+    shift_meta: Dict[str, Dict[str, Any]],
+    shift_pk: Optional[str] = None,
+    shift_meta_by_pk: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> bool:
+    """shifts.default_shift == '주' 인 셀은 주휴(주) 표기 — 대체 후보에서 완전 제외."""
+    meta: Optional[Dict[str, Any]] = None
+    if shift_pk is not None and shift_meta_by_pk is not None:
+        meta = shift_meta_by_pk.get(str(shift_pk))
+    if meta is None:
+        meta = shift_meta.get(str(shift_id))
+    if meta is None:
+        return False
+    return str(meta.get("default_shift", "") or "").strip() == "주"
 
 
 def _main_shift_code(shift_id: str, shift_meta: Dict[str, Dict[str, Any]]) -> str:
@@ -1120,6 +1161,13 @@ def _evaluate_segment_single_nurse(
                 break
             cur_shift = nurse_sched[day_idx]
             cur_pk = nurse_pk_row[day_idx] if day_idx < len(nurse_pk_row) else None
+            # 주휴(default_shift='주') 셀 — 구간 내 어떤 날이라도 주휴면 후보 탈락
+            if _is_weekly_off_shift(
+                cur_shift, shift_meta,
+                shift_pk=cur_pk, shift_meta_by_pk=shift_meta_by_pk,
+            ):
+                feasible = False
+                break
             _main, _is_off_rest, _is_vac, is_off, _reason = _resolve_shift_semantic_with_reason(
                 cur_shift, shift_meta, shift_pk=cur_pk, shift_meta_by_pk=shift_meta_by_pk,
             )
@@ -1395,6 +1443,7 @@ def recommend_replacement_candidates(
 
     assignment_blocked = _build_assignment_blocked_dates(
         db, target_group_id, year_value, month_value, days_in_month,
+        office_id=_target_office_id,
     )
 
     if req.mode == "SINGLE":
@@ -1609,6 +1658,13 @@ def recommend_replacement_candidates(
             )
             assigned_is_off_rest = assigned_is_off and not assigned_is_vacation
 
+            # 주휴(default_shift='주') — 건드리면 안 되는 셀
+            if _is_weekly_off_shift(
+                assigned_shift, shift_meta,
+                shift_pk=assigned_shift_pk, shift_meta_by_pk=shift_meta_by_pk,
+            ):
+                excluded["weekly_off_shift"] += 1
+                continue
             # 휴가(생, 연 등) 또는 특수 코드 — 건드리면 안 되는 셀
             if assigned_is_vacation:
                 excluded["vacation_shift"] += 1
@@ -1885,6 +1941,12 @@ def _evaluate_single_slot(
         )
         assigned_is_off_rest = assigned_is_off and not assigned_is_vacation
 
+        # 주휴(default_shift='주') — 건드리면 안 되는 셀
+        if _is_weekly_off_shift(
+            assigned_shift, shift_meta,
+            shift_pk=assigned_shift_pk, shift_meta_by_pk=shift_meta_by_pk,
+        ):
+            continue
         # 휴가(생, 연 등) 또는 특수 코드 — 건드리면 안 되는 셀
         if assigned_is_vacation:
             continue
