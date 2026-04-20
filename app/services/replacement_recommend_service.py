@@ -1044,6 +1044,7 @@ def _evaluate_segment_single_nurse(
     max_scan: int,
     used_nurse_ids: set,
     assignment_blocked: Optional[Dict[str, set]] = None,
+    allow_capability_fallback: bool = False,
 ) -> Tuple[Optional[CandidateRecommendation], float]:
     """구간 전체를 1명이 커버할 최적 간호사를 평가.
 
@@ -1065,6 +1066,7 @@ def _evaluate_segment_single_nurse(
         target_grade=target_grade, ranking_scope=ranking_scope,
         max_scan=max_scan,
         assignment_blocked=assignment_blocked,
+        allow_capability_fallback=allow_capability_fallback,
     )
 
     best_cid: Optional[str] = None
@@ -1221,6 +1223,48 @@ def _evaluate_segment_single_nurse(
     return candidate, best_total
 
 
+def _evaluate_segment_with_fallback(
+    seg_slots: List[ReplacementSlot],
+    used_nurse_ids: set,
+    eval_kwargs: Dict[str, Any],
+) -> Tuple[Optional[CandidateRecommendation], float, int]:
+    """구간 후보를 Level 0→1→2로 단계 완화하며 평가.
+
+    Level 0: 정상 평가 (regular pool only).
+    Level 1: shift_capability_fallback 풀 병합 (cap 미충족 후보 허용 + 페널티).
+    Level 2: used_nurse_ids 격리 해제 (다른 path/segment에서 쓰인 후보 허용 + 페널티).
+
+    하드 제약(연속근무·NDED·1N·max_conseq·assignment_blocked·ranking_scope·휴직 등)은
+    어떤 단계에서도 완화되지 않는다.
+    """
+    cand0, score0 = _evaluate_segment_single_nurse(
+        seg_slots=seg_slots, used_nurse_ids=used_nurse_ids,
+        allow_capability_fallback=False, **eval_kwargs,
+    )
+    if cand0 is not None:
+        return cand0, score0, 0
+
+    cand1, score1 = _evaluate_segment_single_nurse(
+        seg_slots=seg_slots, used_nurse_ids=used_nurse_ids,
+        allow_capability_fallback=True, **eval_kwargs,
+    )
+    if cand1 is not None:
+        return cand1, score1, 1
+
+    cand2, score2 = _evaluate_segment_single_nurse(
+        seg_slots=seg_slots, used_nurse_ids=set(),
+        allow_capability_fallback=True, **eval_kwargs,
+    )
+    if cand2 is not None:
+        if "relaxed_path_isolation" not in cand2.tags:
+            cand2.tags.append("relaxed_path_isolation")
+        # Level 2 추가 페널티: 정규 점수 대비 큰 폭으로 감쇄 (정렬에서 항상 후순위 보장)
+        score2 = score2 - 200.0 * max(1, len(seg_slots))
+        return cand2, score2, 2
+
+    return None, 0.0, 0
+
+
 def _build_split_path(
     segments_raw: List[Tuple[str, List[ReplacementSlot]]],
     path_rank: int,
@@ -1246,27 +1290,34 @@ def _build_split_path(
     all_steps: List[BulkPathStep] = []
     total_score = 0.0
     used_nurse_ids: set = set()
+    path_max_relax_level = 0
+    eval_kwargs = dict(
+        req=req,
+        schedule_map=schedule_map,
+        schedule_shift_pk_map=schedule_shift_pk_map,
+        nurse_by_id=nurse_by_id,
+        shift_meta=shift_meta,
+        shift_meta_by_pk=shift_meta_by_pk,
+        config=config,
+        prev_tail_by_nurse=prev_tail_by_nurse,
+        pref_score_map=pref_score_map,
+        pair_score_map=pair_score_map,
+        target_grade=target_grade,
+        ranking_scope=ranking_scope,
+        max_scan=max_scan,
+        assignment_blocked=assignment_blocked,
+    )
     for _seg_label, seg_slots in segments_raw:
-        best_candidate, best_score = _evaluate_segment_single_nurse(
+        best_candidate, best_score, relax_level = _evaluate_segment_with_fallback(
             seg_slots=seg_slots,
-            req=req,
-            schedule_map=schedule_map,
-            schedule_shift_pk_map=schedule_shift_pk_map,
-            nurse_by_id=nurse_by_id,
-            shift_meta=shift_meta,
-            shift_meta_by_pk=shift_meta_by_pk,
-            config=config,
-            prev_tail_by_nurse=prev_tail_by_nurse,
-            pref_score_map=pref_score_map,
-            pair_score_map=pair_score_map,
-            target_grade=target_grade,
-            ranking_scope=ranking_scope,
-            max_scan=max_scan,
             used_nurse_ids=used_nurse_ids,
-            assignment_blocked=assignment_blocked,
+            eval_kwargs=eval_kwargs,
         )
         if best_candidate:
-            used_nurse_ids.add(best_candidate.nurse_id)
+            # Level 2(used 해제)에서는 used 집합에 추가하지 않음 — 다음 segment에서도 같은 후보 재사용 가능하도록.
+            if relax_level < 2:
+                used_nurse_ids.add(best_candidate.nurse_id)
+            path_max_relax_level = max(path_max_relax_level, relax_level)
             _cid = best_candidate.nurse_id
             _c_sched = schedule_map.get(_cid, [])
             _c_pk_row = schedule_shift_pk_map.get(_cid, [])
@@ -1306,6 +1357,11 @@ def _build_split_path(
         target_nurse_id=req.target_nurse_id,
         include_target_nurse=False,
     )
+    if path_max_relax_level > 0:
+        logger.debug(
+            "BULK segment path fallback applied: scenario=%s rank=%s max_relax_level=%s",
+            scenario_label, path_rank, path_max_relax_level,
+        )
     return BulkPathRecommendation(
         path_rank=path_rank,
         scenario_label=scenario_label,
@@ -1834,6 +1890,7 @@ def _evaluate_single_slot(
     root_nurse_id: Optional[str] = None,
     prev_nurse_id: Optional[str] = None,
     assignment_blocked: Optional[Dict[str, set]] = None,
+    allow_capability_fallback: bool = False,
 ) -> List[Tuple[str, CandidateContext, float]]:
     day = slot.date.day
     day_idx = day - 1
@@ -1860,7 +1917,8 @@ def _evaluate_single_slot(
             continue
         if slot.date in _asgn_blocked.get(candidate_id, set()):
             continue
-        if not _nurse_can_work_shift(nurse, target_shift_main):
+        _cap_fallback = not _nurse_can_work_shift(nurse, target_shift_main)
+        if _cap_fallback and not allow_capability_fallback:
             continue
 
         schedule_row = schedule_map[candidate_id]
@@ -1925,6 +1983,11 @@ def _evaluate_single_slot(
             path_penalty += 30.0
             estimated_delta += 0.7
             rule_tags = list(rule_tags) + ["consecutive_work_penalized"]
+        if _cap_fallback:
+            # Level 1 fallback: shift_capability 미충족 — 큰 패널티로 정규 후보 뒤로 밀어냄
+            path_penalty += 100.0
+            estimated_delta += 1.0
+            rule_tags = list(rule_tags) + ["shift_capability_fallback"]
 
         if assigned_is_off:
             off_tail = 0
@@ -2404,6 +2467,39 @@ def _nurse_repeat_violation_penalty(summary: PathViolationSummary) -> float:
     return penalty
 
 
+def _markov_fallback_pick(
+    slot: ReplacementSlot,
+    path_idx: int,
+    used_cids: set,
+    **eval_kwargs: Any,
+) -> Tuple[Optional[Tuple[str, "CandidateContext", float]], int]:
+    """Markov path에서 정규 후보가 없을 때 Level 1 → Level 2 단계 완화 평가.
+
+    Level 1: shift_capability_fallback 풀 병합. used_cids는 그대로 적용.
+    Level 2: used_cids 격리도 해제. Level 1 → Level 2 순으로 시도.
+
+    하드 제약(연속근무·NDED·1N·max_conseq·assignment_blocked·ranking_scope·휴직 등)은
+    어떤 단계에서도 완화되지 않는다.
+    """
+    scored_lvl1 = _evaluate_single_slot(
+        slot=slot, allow_capability_fallback=True, **eval_kwargs,
+    )
+    pick_lvl1 = next(
+        ((cid, ctx, score) for cid, ctx, score in scored_lvl1 if cid not in used_cids),
+        None,
+    )
+    if pick_lvl1 is not None:
+        return pick_lvl1, 1
+
+    pick_lvl2 = next(iter(scored_lvl1), None)
+    if pick_lvl2 is not None:
+        cid, ctx, score = pick_lvl2
+        # Level 2: 점수 추가 페널티로 정렬에서 항상 후순위 보장
+        return (cid, ctx, score - 200.0), 2
+
+    return None, 0
+
+
 def _recommend_bulk_markov(
     slots: List[ReplacementSlot],
     req: ReplacementRecommendRequest,
@@ -2447,6 +2543,7 @@ def _recommend_bulk_markov(
         {k: list(v) for k, v in schedule_shift_pk_map.items()} for _ in range(num_paths)
     ]
     path_usage: List[Dict[str, int]] = [{} for _ in range(num_paths)]
+    path_max_relax_level: List[int] = [0] * num_paths
 
     slot_results: List[SlotRecommendation] = []
 
@@ -2703,7 +2800,76 @@ def _recommend_bulk_markov(
                 break
 
             if not assigned:
-                paths[path_idx].append(_no_candidate_step(slot))
+                fb_pick, fb_level = _markov_fallback_pick(
+                    slot=slot, path_idx=path_idx, used_cids=used_cids,
+                    req=req,
+                    schedule_map=path_schedule_maps[path_idx],
+                    schedule_shift_pk_map=path_shift_pk_maps[path_idx],
+                    nurse_by_id=nurse_by_id, shift_meta=shift_meta,
+                    shift_meta_by_pk=shift_meta_by_pk, config=config,
+                    prev_tail_by_nurse=prev_tail_by_nurse,
+                    pref_score_map=pref_score_map,
+                    pair_score_map=pair_score_map,
+                    target_grade=target_grade,
+                    ranking_scope=ranking_scope, max_scan=max_scan,
+                    replacement_usage=path_usage[path_idx],
+                    prev_nurse_id=(
+                        paths[path_idx][-1].candidate.nurse_id
+                        if paths[path_idx] else None
+                    ),
+                    root_nurse_id=(
+                        paths[path_idx][0].candidate.nurse_id
+                        if paths[path_idx] else None
+                    ),
+                    assignment_blocked=assignment_blocked,
+                )
+                if fb_pick is not None:
+                    fb_cid, fb_ctx, fb_score = fb_pick
+                    fb_candidate = _ctx_to_candidate_model(
+                        fb_ctx, rank=1,
+                        include_explanations=req.options.include_explanations,
+                    )
+                    if fb_level == 2 and "relaxed_path_isolation" not in fb_candidate.tags:
+                        fb_candidate.tags.append("relaxed_path_isolation")
+                    fb_orig_sched = path_schedule_maps[path_idx].get(fb_cid, [])
+                    fb_orig_pk_row = path_shift_pk_maps[path_idx].get(fb_cid, [])
+                    logger.debug(
+                        "BULK markov fallback applied: path_idx=%s slot=%s level=%s nurse=%s",
+                        path_idx, slot.date, fb_level, fb_cid,
+                    )
+                    fb_step = BulkPathStep(
+                        slot=slot,
+                        candidate=fb_candidate,
+                        original_shift_id=fb_orig_sched[day_idx] if day_idx < len(fb_orig_sched) else None,
+                        original_shift_pk=str(fb_orig_pk_row[day_idx]) if day_idx < len(fb_orig_pk_row) and fb_orig_pk_row[day_idx] is not None else None,
+                        transition_score=round(fb_score, 3),
+                        base_score=round(fb_score, 3),
+                        excluded_candidates=step_excluded_list,
+                    )
+                    paths[path_idx].append(fb_step)
+                    path_scores[path_idx] += fb_score
+                    v_map, v_pk_map = _apply_virtual_assignment(
+                        path_schedule_maps[path_idx],
+                        path_shift_pk_maps[path_idx],
+                        fb_cid, day_idx, slot.shift, target_shift_pk,
+                    )
+                    path_schedule_maps[path_idx] = v_map
+                    path_shift_pk_maps[path_idx] = v_pk_map
+                    path_usage[path_idx][fb_cid] = path_usage[path_idx].get(fb_cid, 0) + 1
+                    # Level 1만 used_cids에 등록 (Level 2는 재사용 허용)
+                    if fb_level == 1:
+                        used_cids.add(fb_cid)
+                        slot_assignments[fb_cid] = (
+                            fb_ctx.nurse_name, fb_score,
+                            scenario_labels[path_idx],
+                        )
+                    if path_idx == 0:
+                        per_slot_candidates.append(fb_candidate)
+                    path_max_relax_level[path_idx] = max(
+                        path_max_relax_level[path_idx], fb_level,
+                    )
+                else:
+                    paths[path_idx].append(_no_candidate_step(slot))
 
         status = "OK" if per_slot_candidates else "NONE"
         slot_results.append(SlotRecommendation(
@@ -2727,6 +2893,11 @@ def _recommend_bulk_markov(
             target_nurse_id=req.target_nurse_id,
             include_target_nurse=False,
         )
+        if path_max_relax_level[path_idx] > 0:
+            logger.debug(
+                "BULK markov path fallback applied: path_idx=%s max_relax_level=%s",
+                path_idx, path_max_relax_level[path_idx],
+            )
         bulk_paths.append(BulkPathRecommendation(
             path_rank=path_idx + 1,
             scenario_label=scenario_descriptions[path_idx] if path_idx < len(scenario_descriptions) else f"시나리오 {path_idx + 1}",
