@@ -37,7 +37,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
     WEEK_OFF_SHORT_PENALTY,
 )
-from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set
+from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set, add_per_nurse_target_distribution_terms
 from services.cp_sat.fallback_lex import optimize_fallback_lex_hard_first
 from services.cp_sat.night_distribution_log import log_n_even_distribution
 from services.cp_sat.lookahead_helpers import (
@@ -56,6 +56,7 @@ from services.cp_sat.off_policy import (
     resolve_effective_off_days,
 )
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
+from services.cp_sat.postprocess_balance import apply_phase1_post_swap
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ def _row_commit_rebias(policy, rs, roster) -> tuple[list[int], dict[int, float]]
 
 # ─────────────────────────────  RL Neighborhood  ─────────────────────────
 class RLNeighborhoodPolicy:
-    """아주 가벼운 ε-greedy 정책"""
+    """ε-greedy 이웃 크기 정책."""
     def __init__(self, N, D, eps0=0.3, eps_end=0.05, decay=0.995):
         self.N, self.D = N, D
         self.eps, self.eps_end, self.decay = eps0, eps_end, decay
@@ -169,9 +170,10 @@ class RLNeighborhoodPolicy:
         if k_n_eff <= 0:
             pool = list(range(self.N))
             k_n_eff = min(k_n, self.N)
-        if random.random() < self.eps:                          # explore
+        k_d_eff = min(k_d, self.D)
+        if random.random() < self.eps:                           # explore
             n_sel = random.sample(pool, k=k_n_eff)
-            d_sel = random.sample(range(self.D), k=min(k_d,self.D))
+            d_sel = random.sample(range(self.D), k=k_d_eff)
         else:                                                   # exploit
             pool_arr = np.array(pool, dtype=int)
             pool_w = self.n_w[pool_arr]
@@ -182,7 +184,7 @@ class RLNeighborhoodPolicy:
             p = pool_w / _sum
             n_sel = list(pool_arr[np.random.choice(
                 len(pool_arr), k_n_eff, replace=False, p=p)])
-            d_sel = list(np.random.choice(self.D,k_d,replace=False,
+            d_sel = list(np.random.choice(self.D, k_d_eff, replace=False,
                                            p=self.d_w/self.d_w.sum()))
         self.eps = max(self.eps_end, self.eps*self.decay)
         return n_sel, d_sel
@@ -1816,9 +1818,12 @@ class CPSATBasicEngine:
         )
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
-            'shift_requirement', 'max_consecutive_night',
-            'max_consecutive_work', 'night_after_limit',
-            'day_after_evening', 'night_monthly_limit'
+            'shift_requirement', 'night_consecutive',
+            'consecutive_work', 'night_nd', 'night_ne',
+            'eve_ed', 'night_month_limit',
+            'not_one_night', 'rec_2n2o', 'rec_3n2o',
+            'initial_forbidden', 'weekend_off_only',
+            'consecutive_4off', 'cross_month_4off',
         }
         def hard_violation_cnt():
             return sum(1 for v in roster_system._find_violations()
@@ -1838,6 +1843,55 @@ class CPSATBasicEngine:
         print(
             f"{self.logger_prefix} [Progress] Phase 1 완료: best_viol={best_viol}"
         )
+        try:
+            _p1c, _p1t, _p1mx = _row_commit_counts(roster_system, best_roster)
+            _p1lines = [f"=== Phase1 seed={run_seed} ts={time.strftime('%H:%M:%S')} ==="]
+            for _i, _nr in enumerate(roster_system.nurses):
+                _nm = getattr(_nr, "name", str(_i))
+                _c = _p1c[_i]
+                _mk = "MIX" if _i in _p1mx else "---"
+                _p1lines.append(
+                    f"  [{_i:2d}] {_nm:10s} {_mk} "
+                    f"D={_c.get('D',0):2d} E={_c.get('E',0):2d} "
+                    f"N={_c.get('N',0):2d} T={_p1t[_i]:2d}"
+                )
+            with open("/tmp/phase1_dump.log", "a") as _fp:
+                _fp.write("\n".join(_p1lines) + "\n")
+        except Exception as _err:
+            print(f"[DEBUG-ERR] phase1 dump: {_err}")
+        # Phase1 post-swap: 그룹별 shift 분포 균등화 (CP-SAT 외부 repair)
+        if bool(getattr(roster_system.config, "phase1_post_swap_on", True)):
+            try:
+                best_roster, _ps_cnt = apply_phase1_post_swap(
+                    roster_system, best_roster, hard_violation_cnt,
+                    logger_prefix=f"{self.logger_prefix} ",
+                )
+                best_viol = hard_violation_cnt()
+                # post-swap 결과를 phase1 dump에 기록(검증용)
+                try:
+                    _psc, _pst, _psmx = _row_commit_counts(
+                        roster_system, best_roster)
+                    _pslines = [
+                        f"=== Phase1-PostSwap seed={run_seed} "
+                        f"ts={time.strftime('%H:%M:%S')} swaps={_ps_cnt} ==="
+                    ]
+                    for _i, _nr in enumerate(roster_system.nurses):
+                        _nm = getattr(_nr, "name", str(_i))
+                        _c = _psc[_i]
+                        _mk = "MIX" if _i in _psmx else "---"
+                        _pslines.append(
+                            f"  [{_i:2d}] {_nm:10s} {_mk} "
+                            f"D={_c.get('D',0):2d} E={_c.get('E',0):2d} "
+                            f"N={_c.get('N',0):2d} T={_pst[_i]:2d}"
+                        )
+                    with open("/tmp/phase1_dump.log", "a") as _fp:
+                        _fp.write("\n".join(_pslines) + "\n")
+                except Exception as _err:
+                    print(f"[DEBUG-ERR] phase1-postswap dump: {_err}")
+            except Exception as _err:
+                print(
+                    f"{self.logger_prefix} [Phase1-PostSwap] skipped: {_err}"
+                )
         remaining = time_limit_seconds - base_tl
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
@@ -1922,6 +1976,22 @@ class CPSATBasicEngine:
                 print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
                 break
         roster_system.roster = best_roster
+        try:
+            _fnc, _fnt, _fnmx = _row_commit_counts(roster_system, best_roster)
+            _fnlines = [f"=== Final seed={run_seed} ts={time.strftime('%H:%M:%S')} ==="]
+            for _i, _nr in enumerate(roster_system.nurses):
+                _nm = getattr(_nr, "name", str(_i))
+                _c = _fnc[_i]
+                _mk = "MIX" if _i in _fnmx else "---"
+                _fnlines.append(
+                    f"  [{_i:2d}] {_nm:10s} {_mk} "
+                    f"D={_c.get('D',0):2d} E={_c.get('E',0):2d} "
+                    f"N={_c.get('N',0):2d} T={_fnt[_i]:2d}"
+                )
+            with open("/tmp/phase1_dump.log", "a") as _fp:
+                _fp.write("\n".join(_fnlines) + "\n")
+        except Exception as _err:
+            print(f"[DEBUG-ERR] final dump: {_err}")
         log_n_even_distribution(roster_system, self.logger_prefix)
         if best_viol > 0:
             try:
@@ -3614,6 +3684,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # 일자별 커버리지 균등화 항 추가
     if daily_cov_equalize_terms:
         obj.extend(daily_cov_equalize_terms)
+    # Per-nurse avail 기반 target 편차 패널티 (옵션1) - 원인 파악 중, 기본 비활성
+    try:
+        pnt_weight = int(getattr(rs.config, "per_nurse_target_weight", 0) or 0)
+        if pnt_weight > 0:
+            obj.extend(
+                add_per_nurse_target_distribution_terms(
+                    m, rs, X, join, leave, fixed, weight=pnt_weight
+                )
+            )
+    except Exception as _err:
+        print(f"[WARN] per_nurse_target_terms skipped: {_err}")
     m.Maximize(sum(obj))
 
     return m, X, join, leave, fixed

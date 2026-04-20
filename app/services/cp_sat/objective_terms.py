@@ -836,3 +836,100 @@ def build_main_objective_terms(
         pass
 
     return obj
+
+
+def add_per_nurse_target_distribution_terms(
+    m,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    fixed: dict,
+    weight: int = 10,
+) -> list:
+    """각 간호사의 avail 기반 D/E/N target 과 실제 count 간 편차 패널티.
+
+    배정 가능 일수(avail) 비율로 나눈 target 에 가까워지도록 유도.
+    전담 간호사(한 shift 가 월 40% 이상 고정)는 제외.
+    Maximize 모델용 obj_terms(음수) 반환.
+    """
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    if not work_codes:
+        return []
+    shift_idx = {c: cfg.shift_types.index(c) for c in work_codes}
+    off_idx = cfg.shift_types.index("O") if "O" in cfg.shift_types else None
+    N = len(rs.nurses)
+    D_phys = rs.num_days
+
+    fixed_shift = [{c: 0 for c in work_codes} for _ in range(N)]
+    fixed_off_n = [0] * N
+    fixed_other_n = [0] * N
+    for (n, d), s in fixed.items():
+        if d >= D_phys:
+            continue
+        if off_idx is not None and s == off_idx:
+            fixed_off_n[n] += 1
+            continue
+        matched = False
+        for c in work_codes:
+            if s == shift_idx[c]:
+                fixed_shift[n][c] += 1
+                matched = True
+                break
+        if not matched:
+            fixed_other_n[n] += 1
+
+    dedi_threshold = 0.4 * D_phys
+    is_dedi = [False] * N
+    for n in range(N):
+        for c in work_codes:
+            if fixed_shift[n][c] > dedi_threshold:
+                is_dedi[n] = True
+                break
+
+    avail = [0] * N
+    for n in range(N):
+        j_n = join[n] if n < len(join) else 0
+        l_n = min(leave[n] if n < len(leave) else D_phys - 1, D_phys - 1)
+        window = max(0, l_n - j_n + 1)
+        used = fixed_off_n[n] + fixed_other_n[n] + sum(fixed_shift[n].values())
+        avail[n] = max(0, window - used)
+
+    mixed = [n for n in range(N) if not is_dedi[n] and avail[n] > 0]
+    if not mixed:
+        return []
+    total_avail = sum(avail[n] for n in mixed)
+    if total_avail <= 0:
+        return []
+
+    default_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+    by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+
+    def _need(code: str, d: int) -> int:
+        req = by_day[d] if isinstance(by_day, list) and d < len(by_day) else default_req
+        return int(req.get(code, 0)) if isinstance(req, dict) else 0
+
+    obj_terms: list = []
+    for c in work_codes:
+        total_demand = sum(_need(c, d) for d in range(D_phys))
+        dedi_fixed = sum(fixed_shift[n][c] for n in range(N) if is_dedi[n])
+        mixed_fixed = sum(fixed_shift[n][c] for n in mixed)
+        mixed_demand = max(0, total_demand - dedi_fixed)
+        remaining = max(0, mixed_demand - mixed_fixed)
+
+        for n in mixed:
+            share = remaining * avail[n] / total_avail if total_avail > 0 else 0
+            target = fixed_shift[n][c] + int(round(share))
+            j_n = join[n] if n < len(join) else 0
+            l_n = min(leave[n] if n < len(leave) else D_phys - 1, D_phys - 1)
+            if j_n > l_n:
+                continue
+            count_expr = sum(X(n, d, shift_idx[c]) for d in range(j_n, l_n + 1))
+            dev = m.NewIntVar(0, D_phys, f"pnt_dev_{n}_{c}")
+            diff = m.NewIntVar(-D_phys, D_phys, f"pnt_diff_{n}_{c}")
+            m.Add(diff == count_expr - target)
+            m.AddAbsEquality(dev, diff)
+            obj_terms.append(-weight * dev)
+
+    return obj_terms
