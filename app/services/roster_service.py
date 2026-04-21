@@ -126,6 +126,15 @@ def save_roster_config_service(
                     sample = cj.get('D') or cj.get('E') or cj.get('N') or {}
                     cj['M'] = {g: 0 for g in sample}
                     grade_cfg.constraints_json = cj
+            # default_shifts 에 M 항목 없으면 자동 추가 (shift_table_id=None)
+            if grade_cfg:
+                ds = list(grade_cfg.default_shifts_json or [])
+                if not any(
+                    isinstance(it, dict) and str(it.get('code', '')).upper() == 'M'
+                    for it in ds
+                ):
+                    ds.append({'code': 'M', 'shift_table_id': None})
+                    grade_cfg.default_shifts_json = ds
 
         if not use_mid:
             db.query(ShiftManage).filter(
@@ -152,6 +161,15 @@ def save_roster_config_service(
                 if 'M' in cleaned:
                     cleaned.pop('M', None)
                     grade_cfg.constraints_json = cleaned
+            # default_shifts 에서 M 항목 제거
+            if grade_cfg:
+                ds = list(grade_cfg.default_shifts_json or [])
+                filtered = [
+                    it for it in ds
+                    if not (isinstance(it, dict) and str(it.get('code', '')).upper() == 'M')
+                ]
+                if len(filtered) != len(ds):
+                    grade_cfg.default_shifts_json = filtered
 
         db.add(db_config)
         db.commit()

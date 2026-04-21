@@ -1,7 +1,17 @@
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+
+class DefaultShiftItem(BaseModel):
+    """메인 근무코드(D/E/N/M)별 기본 매핑 shift 정보"""
+
+    code: str = Field(..., description="메인 근무코드 (D | E | N | M)")
+    shift_table_id: Optional[int] = Field(
+        default=None,
+        description="shifts.id 매핑 (없으면 None)",
+    )
 
 
 class GradeConfigBase(BaseModel):
@@ -26,6 +36,13 @@ class GradeConfigBase(BaseModel):
     use_mid: bool = Field(
         default=False,
         description="해당 그룹의 MID 근무코드 사용 여부 (roster_config 기반)",
+    )
+    default_shifts: Optional[List[DefaultShiftItem]] = Field(
+        default=None,
+        description=(
+            "메인 근무코드별 기본 shift 매핑. 예: [{'code':'D','shift_table_id':1}]. "
+            "upsert 시 None/미전송이면 기존 값 유지, 빈 배열이면 초기화."
+        ),
     )
 
 
