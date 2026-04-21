@@ -74,28 +74,7 @@ def create_assignment(
             )
 
     # 기간 중복 검증: 동일 간호사의 active assignment와 일자 겹침 불허
-    from sqlalchemy import case
-    _eff_end = case(
-        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
-        else_=NurseAssignment.expected_end_date,
-    )
-    _overlap_filters = [
-        NurseAssignment.nurse_id == req.nurse_id,
-        NurseAssignment.status == "active",
-        or_(
-            _eff_end.is_(None),
-            _eff_end >= req.start_date,
-        ),
-    ]
-    if req.expected_end_date is not None:
-        _overlap_filters.append(NurseAssignment.start_date <= req.expected_end_date)
-    _overlap = db.query(NurseAssignment).filter(*_overlap_filters).first()
-    if _overlap:
-        raise HTTPException(
-            status_code=409,
-            detail=f"기간이 겹치는 배정이 존재합니다. (id={_overlap.id}, reason={_overlap.reason}, "
-                   f"{_overlap.start_date}~{_overlap.end_date or _overlap.expected_end_date})",
-        )
+    _raise_if_overlap(db, req.nurse_id, req.start_date, req.expected_end_date)
 
     row = NurseAssignment(
         nurse_id=req.nurse_id,
@@ -147,6 +126,37 @@ def create_assignment(
     return _to_response(row, nurse.name)
 
 
+def _raise_if_overlap(
+    db: Session,
+    nurse_id: str,
+    my_start: date,
+    my_end_upper: Optional[date],
+    exclude_id: Optional[int] = None,
+) -> None:
+    """동일 간호사의 active 배정 중 기간 겹침이 있으면 409."""
+    from sqlalchemy import case
+    _eff_end = case(
+        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+        else_=NurseAssignment.expected_end_date,
+    )
+    _filters = [
+        NurseAssignment.nurse_id == nurse_id,
+        NurseAssignment.status == "active",
+        or_(_eff_end.is_(None), _eff_end >= my_start),
+    ]
+    if my_end_upper is not None:
+        _filters.append(NurseAssignment.start_date <= my_end_upper)
+    if exclude_id is not None:
+        _filters.append(NurseAssignment.id != exclude_id)
+    _overlap = db.query(NurseAssignment).filter(*_filters).first()
+    if _overlap:
+        raise HTTPException(
+            status_code=409,
+            detail=f"기간이 겹치는 배정이 존재합니다. (id={_overlap.id}, reason={_overlap.reason}, "
+                   f"{_overlap.start_date}~{_overlap.end_date or _overlap.expected_end_date})",
+        )
+
+
 def update_assignment(
     assignment_id: int,
     req: NurseAssignmentUpdate,
@@ -156,6 +166,17 @@ def update_assignment(
     row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
+
+    # 기간/상태 변경 시 동일 간호사 active 배정과의 겹침 차단 (create_assignment와 동일 정책)
+    _period_changed = any(
+        v is not None for v in (req.expected_end_date, req.end_date, req.status)
+    )
+    _new_status = req.status if req.status is not None else row.status
+    if _period_changed and _new_status == "active":
+        _new_end = req.end_date if req.end_date is not None else row.end_date
+        _new_exp = req.expected_end_date if req.expected_end_date is not None else row.expected_end_date
+        _eff_upper = _new_end if _new_end is not None else _new_exp
+        _raise_if_overlap(db, row.nurse_id, row.start_date, _eff_upper, exclude_id=row.id)
 
     if req.expected_end_date is not None:
         row.expected_end_date = req.expected_end_date
