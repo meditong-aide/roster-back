@@ -56,7 +56,6 @@ from services.cp_sat.off_policy import (
     resolve_effective_off_days,
 )
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
-from services.cp_sat.postprocess_balance import apply_phase1_post_swap
 
 logger = logging.getLogger(__name__)
 
@@ -1859,39 +1858,6 @@ class CPSATBasicEngine:
                 _fp.write("\n".join(_p1lines) + "\n")
         except Exception as _err:
             print(f"[DEBUG-ERR] phase1 dump: {_err}")
-        # Phase1 post-swap: 그룹별 shift 분포 균등화 (CP-SAT 외부 repair)
-        if bool(getattr(roster_system.config, "phase1_post_swap_on", True)):
-            try:
-                best_roster, _ps_cnt = apply_phase1_post_swap(
-                    roster_system, best_roster, hard_violation_cnt,
-                    logger_prefix=f"{self.logger_prefix} ",
-                )
-                best_viol = hard_violation_cnt()
-                # post-swap 결과를 phase1 dump에 기록(검증용)
-                try:
-                    _psc, _pst, _psmx = _row_commit_counts(
-                        roster_system, best_roster)
-                    _pslines = [
-                        f"=== Phase1-PostSwap seed={run_seed} "
-                        f"ts={time.strftime('%H:%M:%S')} swaps={_ps_cnt} ==="
-                    ]
-                    for _i, _nr in enumerate(roster_system.nurses):
-                        _nm = getattr(_nr, "name", str(_i))
-                        _c = _psc[_i]
-                        _mk = "MIX" if _i in _psmx else "---"
-                        _pslines.append(
-                            f"  [{_i:2d}] {_nm:10s} {_mk} "
-                            f"D={_c.get('D',0):2d} E={_c.get('E',0):2d} "
-                            f"N={_c.get('N',0):2d} T={_pst[_i]:2d}"
-                        )
-                    with open("/tmp/phase1_dump.log", "a") as _fp:
-                        _fp.write("\n".join(_pslines) + "\n")
-                except Exception as _err:
-                    print(f"[DEBUG-ERR] phase1-postswap dump: {_err}")
-            except Exception as _err:
-                print(
-                    f"{self.logger_prefix} [Phase1-PostSwap] skipped: {_err}"
-                )
         remaining = time_limit_seconds - base_tl
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
