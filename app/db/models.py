@@ -345,6 +345,7 @@ class RosterConfig(Base):
     ban_night_before_fixed_off = Column(BOOLEAN, nullable=False, default=True)
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
+    off_first = Column(BOOLEAN, nullable=False, default=False)
     office = relationship("Office")
     group = relationship("Group")
 

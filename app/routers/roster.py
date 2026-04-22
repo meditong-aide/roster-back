@@ -261,6 +261,7 @@ async def get_config_by_version(
                 fixed_wanted_use_yn=getattr(cfg, "fixed_wanted_use_yn", False),
                 show_level=getattr(cfg, "show_level", True),
                 show_preceptor=getattr(cfg, "show_preceptor", True),
+                off_first=getattr(cfg, "off_first", False),
             )
             db.add(new_config)
 
@@ -303,6 +304,7 @@ async def get_config_by_version(
                 "fixed_wanted_use_yn": new_config.fixed_wanted_use_yn,
                 "show_level": new_config.show_level,
                 "show_preceptor": new_config.show_preceptor,
+                "off_first": bool(getattr(new_config, "off_first", False)),
             }
         else:
             config = (
@@ -352,6 +354,7 @@ async def get_config_by_version(
                 "fixed_wanted_use_yn": config.fixed_wanted_use_yn,
                 "show_level": config.show_level,
                 "show_preceptor": config.show_preceptor,
+                "off_first": bool(getattr(config, "off_first", False)),
             }
     except Exception as e:
         print("error", e)

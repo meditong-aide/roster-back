@@ -1362,8 +1362,11 @@ def optimize_fallback_lex_hard_first(
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
-        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → 하드 제약 (주말 휴무자 포함: 월경계 연속근무 초과 방지)
-        # 고정 셀 우선: D/E/N/O 불문하고 fixed인 날은 자유 일수에서 제외
+        # 연속 근무 K+1 창에서 최소 1 OFF 필요 → HARD 제약 (fixed_wanted 포함, 우회 불가)
+        # 정책:
+        #   - blocked day 포함 윈도우: X 변수 부재 → 자동 중단 → 스킵
+        #   - fixed OFF 포함 윈도우: 자동 만족 → 스킵
+        #   - 그 외: 전체 윈도우에 대해 enforce. 유저가 K+1 연속 근무를 fixed_wanted로 지정했다면 INFEASIBLE로 보고.
         K = cfg.max_consecutive_work_days
         for n in range(N):
             if _is_preceptee_at(n):
@@ -1372,17 +1375,11 @@ def optimize_fallback_lex_hard_first(
             _blocked = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
             for d0 in range(T0, T1 - K + 1):
                 window = [d0 + t for t in range(K + 1)]
-                # blocked day가 있으면 해당 일은 근무 불가 → 연속근무 자동 중단 → 스킵
                 if any(d in _blocked for d in window):
                     continue
-                # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
                 if any((n, d) in fixed and fixed[(n, d)] == off_idx for d in window):
                     continue
-                # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 합산
-                free_days_w = [d for d in window if (n, d) not in fixed]
-                if not free_days_w:
-                    continue
-                m.Add(sum(X(n, d, off_idx) for d in free_days_w) >= 1)
+                m.Add(sum(X(n, d, off_idx) for d in window) >= 1)
 
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
@@ -1804,7 +1801,6 @@ def optimize_fallback_lex_hard_first(
                     if is_n_only:
                         total_cap_effective = max(0, avail_days - 15) + relax_level
                     else:
-                        base_cap = max_off_allowed_from_policy
                         # 2N2O/3N2O 하드 제약으로 인한 추가 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
                         _extra_off_fb = 0
                         if n not in _fb_n_forbid and (
@@ -1822,16 +1818,27 @@ def optimize_fallback_lex_hard_first(
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected_fb:
                             _extra_off_fb += 1
-                        base_cap += _extra_off_fb
-                        if n in per_nurse_off_cap_override:
-                            base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                        total_cap_effective = min(base_cap + relax_level, avail_days)
-                        # max coverage 자동 조정: max_off cap
-                        if _fb_auto_max_off is not None:
-                            import math as _math
-                            _ratio_fb = nonvac_active_days / max(1, D_phys)
-                            _scaled_max_fb = max(min_off_required, int(_fb_auto_max_off * _ratio_fb))
-                            total_cap_effective = min(total_cap_effective, _scaled_max_fb)
+                        # off_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
+                        _off_first_fb = bool(getattr(cfg, "off_first", False))
+                        if _off_first_fb:
+                            base_cap = max_off_allowed_from_policy
+                            base_cap += _extra_off_fb
+                            if n in per_nurse_off_cap_override:
+                                base_cap = max(base_cap, per_nurse_off_cap_override[n])
+                            total_cap_effective = min(base_cap + relax_level, avail_days)
+                            # max coverage 자동 조정: max_off cap
+                            if _fb_auto_max_off is not None:
+                                import math as _math
+                                _ratio_fb = nonvac_active_days / max(1, D_phys)
+                                _scaled_max_fb = max(min_off_required, int(_fb_auto_max_off * _ratio_fb))
+                                total_cap_effective = min(total_cap_effective, _scaled_max_fb)
+                        else:
+                            # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
+                            base_cap = min_off_required + _extra_off_fb
+                            if n in per_nurse_off_cap_override:
+                                base_cap = max(base_cap, per_nurse_off_cap_override[n])
+                            total_cap_effective = min(base_cap + relax_level, avail_days)
+                            total_cap_effective = max(total_cap_effective, min_off_required)
                     if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
                         cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(

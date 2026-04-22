@@ -245,6 +245,10 @@ class RosterConfigBase(BaseModel):
     show_preceptor: bool = Field(
         default=True, description="근무표에 프리셉터-프리셉티 관계 표시 여부"
     )
+    off_first: bool = Field(
+        default=False,
+        description="OFF 우선 모드(False, default): OFF cap 충족 우선 + max coverage 미부과 + 남는 셀 근무 배정 + fixed_wanted O 차감 / 근무 우선 모드(True): 현행 min-max coverage 균등화 유지",
+    )
 
 
 class RosterConfigCreate(RosterConfigBase):
