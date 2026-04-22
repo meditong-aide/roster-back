@@ -3470,6 +3470,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     ]
     engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
     preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
+    # nurse_index 일관성: cp_sat_basic.create_nurses_from_db 및 _build_engine_nurse_index_map과
+    # 동일한 키로 정렬하여 fixed_cells.nurse_index ↔ nurses_for_engine[i] 포지셔널 매칭을 보장한다.
+    engine_nurses.sort(key=lambda n: (
+        int(getattr(n, "sequence", 0) or 0),
+        -int(getattr(n, "experience", 0) or 0),
+        str(getattr(n, "nurse_id", "")),
+    ))
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day = _build_shift_manage_and_requirements(

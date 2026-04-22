@@ -352,11 +352,15 @@ class CPSATBasicEngine:
         two_offs_after_two_nig = config_data.get('two_offs_after_two_nig', False)
         not_one_night = config_data.get('not_one_night', False)
         ban_night_before_fixed_off = bool(config_data.get('ban_night_before_fixed_off', True))
+        off_first = bool(config_data.get('off_first', False))
         max_nig_per_month = config_data.get('max_nig_per_month', 15)
         if max_nig_per_month != 15:
             max_nig_per_month = 17
         # 디버그: N 상한 보정 전/후 확인
         print(f"{self.logger_prefix} max_nig_per_month(raw)={max_nig_per_month}")
+        # off_first=False(default): 근무 shift oversupply (OFF cap을 min_off_required + HARD recovery buffer로 tight clamp)
+        # off_first=True: OFF oversupply (dev HEAD 기존 동작: max_off_allowed = _base_max + _extra_off + auto_max scaling)
+        print(f"{self.logger_prefix} [OffPriorityMode] off_first={off_first} (False=Work oversupply/OFF tight, True=OFF oversupply/loose)")
         
         # 병원 내규 (Soft Constraints)
         min_exp_per_shift = config_data.get('min_exp_per_shift', 3)
@@ -444,6 +448,7 @@ class CPSATBasicEngine:
             max_consecutive_nights=3 if three_seq_nig else 2,
             not_one_night=not_one_night,
             ban_night_before_fixed_off=ban_night_before_fixed_off,
+            off_first=off_first,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
             banned_day_after_eve=banned_day_after_eve,
@@ -2968,24 +2973,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     m.Add(sum(X(n, d, off_idx_full) for d in free_days) >= 1)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
-        # 연속 근무 K+1 중 OFF ≥1 (주말 휴무자 포함: 월경계 연속근무 초과 방지)
-        # 고정 셀 우선: D/E/N/O 불문하고 fixed_cells에 포함된 날은 자유 일수에서 제외
-        # → 유저가 K+1일 이상 연속 근무를 고정한 경우, 해당 윈도우는 제약 적용하지 않음
+        # 연속 근무 K+1 중 OFF ≥1 (HARD: 주말 휴무자 포함, 월경계 연속근무 초과 방지)
+        # 정책: 하드 제약은 어떤 고정(fixed_wanted 포함)이든 우회 불가.
+        #   - blocked day 포함 윈도우: X 변수 부재 → 자동 중단 → 스킵
+        #   - fixed OFF 포함 윈도우: 자동 만족 → 스킵
+        #   - 그 외: 전체 윈도우에 대해 enforce. 유저가 K+1 연속 근무를 fixed_wanted로 지정했다면 INFEASIBLE로 보고.
         _blocked = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
         for d0 in range(T0, T1-K+1):
             window = [d0 + t for t in range(K + 1)]
-            # blocked day가 있으면 해당 일은 근무 불가 → 연속근무 자동 중단 → 스킵
             if any(d in _blocked for d in window):
                 continue
-            # 고정 OFF가 하나라도 있으면 이미 만족 → 스킵
             if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
                 continue
-            # 고정 셀(근무/OFF 불문)을 제외한 자유 일수만 대상으로 합산
-            free_days_w = [d for d in window if (n, d) not in fixed]
-            if not free_days_w:
-                # 윈도우 전체가 고정(D/E/N 연속 포함) → 유저 고정 우선, 제약 무시
-                continue
-            m.Add(sum(X(n, d, off) for d in free_days_w) >= 1)
+            m.Add(sum(X(n, d, off) for d in window) >= 1)
 
         # E→D, N→D, N→E
         for d in range(T0+1, T1+1):
@@ -3263,15 +3263,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected:
                             _extra_off += 1
-                        max_off_allowed = min(
-                            _base_max + _extra_off,
-                            nonvac_active_days,
-                        )
-                        # max coverage 자동 조정: max_off도 auto 값으로 cap
-                        if _auto_max_off is not None:
-                            _ratio = nonvac_active_days / max(1, D_phys)
-                            _scaled_auto_max = max(min_off_required, int(_auto_max_off * _ratio))
-                            max_off_allowed = min(max_off_allowed, _scaled_auto_max)
+                        # off_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
+                        _off_first = bool(getattr(cfg, "off_first", False))
+                        if _off_first:
+                            max_off_allowed = min(
+                                _base_max + _extra_off,
+                                nonvac_active_days,
+                            )
+                            # max coverage 자동 조정: max_off도 auto 값으로 cap
+                            if _auto_max_off is not None:
+                                _ratio = nonvac_active_days / max(1, D_phys)
+                                _scaled_auto_max = max(min_off_required, int(_auto_max_off * _ratio))
+                                max_off_allowed = min(max_off_allowed, _scaled_auto_max)
+                                max_off_allowed = max(max_off_allowed, min_off_required)
+                        else:
+                            # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
+                            max_off_allowed = min(
+                                min_off_required + _extra_off,
+                                nonvac_active_days,
+                            )
                             max_off_allowed = max(max_off_allowed, min_off_required)
                         m.Add(
                             sum(
@@ -3283,11 +3293,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"cap_semantics={off_cap_semantics}, vac_cnt={vacation_cnt}, "
+                            f"cap_semantics={off_cap_semantics}, off_first={_off_first}, vac_cnt={vacation_cnt}, "
                             f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
                             f"min_off={min_off_required}, max_off={max_off_allowed}"
                             + (f", extra_off={_extra_off}" if _extra_off > 0 else "")
-                            + (f", auto_max={_auto_max_off}" if _auto_max_off is not None else "")
+                            + (f", auto_max={_auto_max_off}" if (_off_first and _auto_max_off is not None) else "")
                         )
         except Exception as exc:
             print(
