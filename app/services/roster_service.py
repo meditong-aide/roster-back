@@ -113,6 +113,29 @@ def save_roster_config_service(
                 synchronize_session=False
             )
 
+        if use_mid:
+            # use_mid=True: grade_config 에 M 키 없으면 자동 추가 (각 grade 0명)
+            grade_cfg = db.query(RosterGradeConfig).filter(
+                RosterGradeConfig.office_id == target_office_id,
+                RosterGradeConfig.group_id == target_group_id,
+            ).first()
+            if grade_cfg and isinstance(grade_cfg.constraints_json, dict):
+                cj = dict(grade_cfg.constraints_json)
+                if 'M' not in cj and cj:
+                    # 기존 D 키에서 grade 번호 추출해서 M 기본값 생성
+                    sample = cj.get('D') or cj.get('E') or cj.get('N') or {}
+                    cj['M'] = {g: 0 for g in sample}
+                    grade_cfg.constraints_json = cj
+            # default_shifts 에 M 항목 없으면 자동 추가 (shift_table_id=None)
+            if grade_cfg:
+                ds = list(grade_cfg.default_shifts_json or [])
+                if not any(
+                    isinstance(it, dict) and str(it.get('code', '')).upper() == 'M'
+                    for it in ds
+                ):
+                    ds.append({'code': 'M', 'shift_table_id': None})
+                    grade_cfg.default_shifts_json = ds
+
         if not use_mid:
             db.query(ShiftManage).filter(
                 ShiftManage.office_id == target_office_id,
@@ -138,6 +161,15 @@ def save_roster_config_service(
                 if 'M' in cleaned:
                     cleaned.pop('M', None)
                     grade_cfg.constraints_json = cleaned
+            # default_shifts 에서 M 항목 제거
+            if grade_cfg:
+                ds = list(grade_cfg.default_shifts_json or [])
+                filtered = [
+                    it for it in ds
+                    if not (isinstance(it, dict) and str(it.get('code', '')).upper() == 'M')
+                ]
+                if len(filtered) != len(ds):
+                    grade_cfg.default_shifts_json = filtered
 
         db.add(db_config)
         db.commit()

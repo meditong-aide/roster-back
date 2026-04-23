@@ -53,6 +53,8 @@ def add_grade_constraints(
     cfg = rs.config
     ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
     apply_shifts = {"D", "E", "N"}
+    if bool(getattr(cfg, "use_mid", False)):
+        apply_shifts.add("M")
 
     obj_terms: list = []
     for d in range(rs.num_days):

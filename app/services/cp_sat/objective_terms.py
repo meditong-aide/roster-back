@@ -48,6 +48,310 @@ def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
     return n_forbid_n
 
 
+def add_kld_distribution_terms(
+    *,
+    m: cp_model.CpModel,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    fixed_cnt: list[list[int]] | None = None,
+    logger_prefix: str = "[objective_terms]",
+    stage_label: str = "메인",
+    blocked_by_nurse: dict[int, set[int]] | None = None,
+) -> list:
+    """KLD 이론 기반 D/E/N 균등 분배.
+
+    핵심 원리:
+    - 커버리지 비율(Q)에서 per-nurse 비례 target 산출
+    - 역비율 가중(inverse-proportion): 희소 시프트 편차에 높은 페널티
+    - 간호사 간 분포 거리(range) 최소화
+    - 총 근무수(D+E+N) 균등화
+    """
+    import calendar
+
+    cfg = rs.config
+    D = rs.num_days
+    S = cfg.num_shifts
+    use_mid = bool(getattr(cfg, "use_mid", False))
+
+    # ── 대상 시프트 코드 결정 ──
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    if use_mid and "M" in cfg.shift_types:
+        work_codes.append("M")
+    if not work_codes:
+        return []
+    work_indices = {c: cfg.shift_types.index(c) for c in work_codes}
+
+    # ── 일별 수요 산출 ──
+    daily_need: dict[str, list[int]] = {}
+    for c in work_codes:
+        if (
+            hasattr(cfg, "daily_shift_requirements_by_day")
+            and isinstance(cfg.daily_shift_requirements_by_day, list)
+            and len(cfg.daily_shift_requirements_by_day) == D
+        ):
+            daily_need[c] = [
+                int((cfg.daily_shift_requirements_by_day[d] or {}).get(c, 0) or 0)
+                for d in range(D)
+            ]
+        else:
+            base = int((cfg.daily_shift_requirements or {}).get(c, 0) or 0)
+            daily_need[c] = [base] * D
+
+    fc = fixed_cnt if fixed_cnt is not None else [[0] * S for _ in range(D)]
+    total_need: dict[str, int] = {}
+    for c in work_codes:
+        ci = work_indices[c]
+        total_need[c] = sum(
+            max(0, daily_need[c][d] - int(fc[d][ci] if d < len(fc) else 0))
+            for d in range(D)
+        )
+    total_all = sum(total_need.values())
+    if total_all <= 0:
+        return []
+
+    # ── 비율 Q(s) = need(s) / total ──
+    Q: dict[str, float] = {c: total_need[c] / total_all for c in work_codes}
+
+    # ── 역비율 가중치: w_s = base / Q(s) ──
+    # 희소 시프트(N)일수록 높은 가중치
+    BASE_W = int(getattr(cfg, "kld_base_weight", 30000) or 30000)
+    w_shift: dict[str, int] = {}
+    for c in work_codes:
+        if Q[c] > 0:
+            w_shift[c] = int(BASE_W / Q[c])
+        else:
+            w_shift[c] = BASE_W
+
+    # ── 글로벌 range 억제 가중치 ──
+    W_RANGE = int(getattr(cfg, "kld_range_weight", 1200000) or 1200000)
+    # ── 총근무 균등 가중치 ──
+    W_TOTAL = int(getattr(cfg, "kld_total_weight", 100000) or 100000)
+
+    # ── N 전일 금지 / 프로필 분류 ──
+    n_forbid_n = _n_forbid_n_set(rs, join, leave)
+    all_codes_set = set(work_codes)
+
+    # ── 주말일수 / OFF 요청 수 (band 보정용) ──
+    _year = int(getattr(cfg, "year", 2026) or 2026)
+    _month = int(getattr(cfg, "month", 1) or 1)
+    weekend_days_in_month = sum(
+        1 for d in range(1, D + 1) if calendar.weekday(_year, _month, d) >= 5
+    )
+    off_request_cnt: dict[int, int] = {}
+    pref = getattr(rs, "preference_matrix", None)
+    if pref is not None:
+        off_idx = cfg.shift_types.index("O") if "O" in cfg.shift_types else -1
+        if off_idx >= 0:
+            for n in range(len(rs.nurses)):
+                cnt = sum(1 for d in range(D) if pref[n, d, off_idx] > 0)
+                if cnt > 0:
+                    off_request_cnt[n] = cnt
+
+    # ── 간호사 분류 ──
+    normals: list[int] = []
+    for i, nu in enumerate(rs.nurses):
+        raw = getattr(nu, "is_night_nurse", None)
+        if not is_n_only_profile(raw, use_mid=use_mid):
+            normals.append(i)
+    if len(normals) < 2:
+        return []
+
+    def _nurse_work_days(n: int) -> int:
+        """간호사 n의 유효 근무일수 추정."""
+        _blocked = len(blocked_by_nurse.get(n, set())) if blocked_by_nurse else 0
+        _active = leave[n] - join[n] + 1 - _blocked
+        if bool(getattr(rs.nurses[n], "is_weekend_off", False)):
+            _active -= weekend_days_in_month
+        _off_req = off_request_cnt.get(n, 0)
+        _active -= _off_req
+        # OFF 일수 추정 (min_off 기준, 이미 차감된 주말/요청 제외)
+        _base_off = int(getattr(cfg, "standard_personal_off_days", 8) or 8)
+        _already_deducted = (
+            (weekend_days_in_month if bool(getattr(rs.nurses[n], "is_weekend_off", False)) else 0)
+            + _off_req
+        )
+        _remaining_off = max(0, _base_off - _already_deducted)
+        return max(1, _active - _remaining_off)
+
+    obj: list = []
+
+    # ══════════════════════════════════════════════
+    # Layer 1: Per-shift 비례 target + 역비율 가중 편차
+    # ══════════════════════════════════════════════
+    for c in work_codes:
+        s_idx = work_indices[c]
+        w_dev = w_shift[c]
+
+        # 해당 시프트에 배정 가능한 간호사 필터링
+        eligible: list[int] = []
+        for n in normals:
+            if c == "N" and n in n_forbid_n:
+                continue
+            allowed = normalize_allowed_shift_codes(
+                getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+            ) or all_codes_set
+            if c not in allowed:
+                continue
+            if len(allowed) <= 1:
+                continue
+            eligible.append(n)
+
+        if not eligible:
+            continue
+
+        # 글로벌 range 변수
+        max_var = m.NewIntVar(0, D, f"kld_{c}_max_{stage_label}")
+        min_var = m.NewIntVar(0, D, f"kld_{c}_min_{stage_label}")
+
+        # N 블록 단위 target 재계산: 2N→2OFF 구조에서 N은 2 or 3 블록 단위
+        _use_n_block = (
+            c == "N"
+            and (
+                bool(getattr(cfg, "two_offs_after_two_nig", False))
+                or bool(getattr(cfg, "two_offs_after_three_nig", False))
+            )
+        )
+        _prefer_3n = (
+            bool(getattr(cfg, "two_offs_after_two_nig", False))
+            and bool(getattr(cfg, "two_offs_after_three_nig", False))
+        )
+        # 평균 블록 크기: 3N 유도면 2.5N/block, 2N만이면 2N/block
+        _avg_block_n = 2.5 if _prefer_3n else 2.0
+        # 블록당 소요일수: NN+OO=4일 or NNN+OO=5일 → 평균 4.5 or 4.0
+        _days_per_block = (_avg_block_n + 2)
+
+        for n in eligible:
+            work_d = _nurse_work_days(n)
+
+            if _use_n_block:
+                # N 블록 기반 target: 가용일수에서 가능한 블록 수 → N 수
+                max_blocks = max(0, work_d / _days_per_block)
+                # 전체 필요 블록 수
+                total_blocks = total_need[c] / _avg_block_n
+                # per-nurse 블록 수 = 전체 블록 / eligible
+                nurse_blocks = total_blocks / max(1, len(eligible))
+                target_n = nurse_blocks * _avg_block_n
+                # 가용일수 비례 보정
+                if max_blocks < nurse_blocks:
+                    target_n = max_blocks * _avg_block_n
+                # 2N 단위에 가까운 정수로 반올림
+                target_low = max(0, round(target_n - 0.5))
+                target_high = target_low + 1
+                # 홀수 target이면 ±1 허용 (2+3=5 가능)
+            else:
+                target = work_d * Q[c]
+                target_low = int(target)
+                target_high = target_low + 1
+
+            tot = sum(X(n, d, s_idx) for d in iter_nurse_days(n, join, leave, blocked_by_nurse))
+            m.Add(max_var >= tot)
+            m.Add(min_var <= tot)
+
+            # U: 볼록(piecewise-linear) 편차 페널티 — KL divergence 근사
+            # dev = d1 + d2 + d3 (d1 ≤ 1, d2 ≤ 2, d3 ≤ D)
+            # penalty = w·d1 + 3w·d2 + 10w·d3 (평균에서 멀수록 급격히 증가)
+            for side_tag, lb_expr in (
+                ("L", target_low - tot),  # 미달 측
+                ("H", tot - target_high), # 초과 측
+            ):
+                d_tot = m.NewIntVar(0, D, f"kld_{c}_d{side_tag}tot_{stage_label}_{n}")
+                d1 = m.NewIntVar(0, 1, f"kld_{c}_d{side_tag}1_{stage_label}_{n}")
+                d2 = m.NewIntVar(0, 2, f"kld_{c}_d{side_tag}2_{stage_label}_{n}")
+                d3 = m.NewIntVar(0, D, f"kld_{c}_d{side_tag}3_{stage_label}_{n}")
+                m.Add(d_tot >= lb_expr)
+                m.Add(d_tot == d1 + d2 + d3)
+                obj.append(-w_dev * d1)
+                obj.append(-3 * w_dev * d2)
+                obj.append(-10 * w_dev * d3)
+
+        # range 억제: max - min 최소화 (U2: 3-tier 볼록 페널티)
+        range_var = m.NewIntVar(0, D, f"kld_{c}_range_{stage_label}")
+        m.Add(range_var >= max_var - min_var)
+        r1 = m.NewIntVar(0, 1, f"kld_{c}_r1_{stage_label}")
+        r2 = m.NewIntVar(0, 2, f"kld_{c}_r2_{stage_label}")
+        r3 = m.NewIntVar(0, D, f"kld_{c}_r3_{stage_label}")
+        m.Add(range_var == r1 + r2 + r3)
+        obj.append(-W_RANGE * r1)
+        obj.append(-3 * W_RANGE * r2)
+        obj.append(-10 * W_RANGE * r3)
+        # min 끌어올림
+        obj.append(W_RANGE * min_var)
+
+        _block_info = ""
+        if _use_n_block:
+            _block_info = (
+                f", n_block=True, avg_block={_avg_block_n}, "
+                f"days_per_block={_days_per_block}, "
+                f"total_blocks={total_need[c]/_avg_block_n:.1f}"
+            )
+        print(
+            f"{logger_prefix} [KLD-{c}] ({stage_label}): "
+            f"eligible={len(eligible)}, Q={Q[c]:.3f}, "
+            f"w_dev={w_dev}, w_range={W_RANGE}, total_need={total_need[c]}"
+            f"{_block_info}"
+        )
+
+    # ══════════════════════════════════════════════
+    # Layer 2: 총 근무수(D+E+N) 균등화
+    # ══════════════════════════════════════════════
+    total_work_need = sum(total_need[c] for c in work_codes)
+    target_work = total_work_need // len(normals)
+    target_work_high = target_work + (1 if total_work_need % len(normals) else 0)
+
+    max_work = m.NewIntVar(0, D, f"kld_tw_max_{stage_label}")
+    min_work = m.NewIntVar(0, D, f"kld_tw_min_{stage_label}")
+    for n in normals:
+        allowed = normalize_allowed_shift_codes(
+            getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+        ) or all_codes_set
+        if len(allowed) <= 1:
+            continue
+        tot = sum(
+            X(n, d, work_indices[c])
+            for c in work_codes
+            if c in allowed
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
+        )
+        m.Add(max_work >= tot)
+        m.Add(min_work <= tot)
+
+        # U: 총근무 편차도 3-tier 볼록 페널티 (KL 근사)
+        for side_tag, lb_expr in (
+            ("L", target_work - tot),
+            ("H", tot - target_work_high),
+        ):
+            d_tot = m.NewIntVar(0, D, f"kld_tw_d{side_tag}tot_{stage_label}_{n}")
+            d1 = m.NewIntVar(0, 1, f"kld_tw_d{side_tag}1_{stage_label}_{n}")
+            d2 = m.NewIntVar(0, 2, f"kld_tw_d{side_tag}2_{stage_label}_{n}")
+            d3 = m.NewIntVar(0, D, f"kld_tw_d{side_tag}3_{stage_label}_{n}")
+            m.Add(d_tot >= lb_expr)
+            m.Add(d_tot == d1 + d2 + d3)
+            obj.append(-W_TOTAL * d1)
+            obj.append(-3 * W_TOTAL * d2)
+            obj.append(-10 * W_TOTAL * d3)
+
+    # U2: 총근무 range에도 3-tier 볼록 페널티
+    range_work = m.NewIntVar(0, D, f"kld_tw_range_{stage_label}")
+    m.Add(range_work >= max_work - min_work)
+    rw1 = m.NewIntVar(0, 1, f"kld_tw_r1_{stage_label}")
+    rw2 = m.NewIntVar(0, 2, f"kld_tw_r2_{stage_label}")
+    rw3 = m.NewIntVar(0, D, f"kld_tw_r3_{stage_label}")
+    m.Add(range_work == rw1 + rw2 + rw3)
+    obj.append(-W_TOTAL * 2 * rw1)
+    obj.append(-3 * W_TOTAL * 2 * rw2)
+    obj.append(-10 * W_TOTAL * 2 * rw3)
+
+    print(
+        f"{logger_prefix} [KLD-총근무] ({stage_label}): "
+        f"nurses={len(normals)}, target=[{target_work},{target_work_high}], "
+        f"total_need={total_work_need}, w={W_TOTAL}"
+    )
+
+    return obj
+
+
 def add_even_mid_distribution_terms(
     *,
     m: cp_model.CpModel,
@@ -371,7 +675,7 @@ def build_main_objective_terms(
                 obj.append(-WEEK_OFF_SHORT_PENALTY * slack)
 
     obj.extend(
-        add_even_night_minmax_distribution_terms(
+        add_kld_distribution_terms(
             m=m,
             rs=rs,
             X=X,
@@ -381,17 +685,6 @@ def build_main_objective_terms(
             logger_prefix="[objective_terms]",
             stage_label="메인",
             blocked_by_nurse=blocked_by_nurse,
-        )
-    )
-
-    obj.extend(
-        add_even_mid_distribution_terms(
-            m=m,
-            rs=rs,
-            X=X,
-            join=join,
-            leave=leave,
-            fixed_cnt=fixed_cnt,
         )
     )
 
@@ -424,7 +717,7 @@ def build_main_objective_terms(
 
     # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
     if getattr(cfg, "sequential_offs", True):
-        SEQUENTIAL_OFF_BONUS = 150000  # 연속 휴무 보너스 가중치
+        SEQUENTIAL_OFF_BONUS = 50000  # 연속 휴무 보너스 가중치 (KLD 균등과 균형)
         for n in range(N):
             T0, T1 = join[n], leave[n]
             for d in range(T0, T1):
@@ -543,3 +836,100 @@ def build_main_objective_terms(
         pass
 
     return obj
+
+
+def add_per_nurse_target_distribution_terms(
+    m,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    fixed: dict,
+    weight: int = 10,
+) -> list:
+    """각 간호사의 avail 기반 D/E/N target 과 실제 count 간 편차 패널티.
+
+    배정 가능 일수(avail) 비율로 나눈 target 에 가까워지도록 유도.
+    전담 간호사(한 shift 가 월 40% 이상 고정)는 제외.
+    Maximize 모델용 obj_terms(음수) 반환.
+    """
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    if not work_codes:
+        return []
+    shift_idx = {c: cfg.shift_types.index(c) for c in work_codes}
+    off_idx = cfg.shift_types.index("O") if "O" in cfg.shift_types else None
+    N = len(rs.nurses)
+    D_phys = rs.num_days
+
+    fixed_shift = [{c: 0 for c in work_codes} for _ in range(N)]
+    fixed_off_n = [0] * N
+    fixed_other_n = [0] * N
+    for (n, d), s in fixed.items():
+        if d >= D_phys:
+            continue
+        if off_idx is not None and s == off_idx:
+            fixed_off_n[n] += 1
+            continue
+        matched = False
+        for c in work_codes:
+            if s == shift_idx[c]:
+                fixed_shift[n][c] += 1
+                matched = True
+                break
+        if not matched:
+            fixed_other_n[n] += 1
+
+    dedi_threshold = 0.4 * D_phys
+    is_dedi = [False] * N
+    for n in range(N):
+        for c in work_codes:
+            if fixed_shift[n][c] > dedi_threshold:
+                is_dedi[n] = True
+                break
+
+    avail = [0] * N
+    for n in range(N):
+        j_n = join[n] if n < len(join) else 0
+        l_n = min(leave[n] if n < len(leave) else D_phys - 1, D_phys - 1)
+        window = max(0, l_n - j_n + 1)
+        used = fixed_off_n[n] + fixed_other_n[n] + sum(fixed_shift[n].values())
+        avail[n] = max(0, window - used)
+
+    mixed = [n for n in range(N) if not is_dedi[n] and avail[n] > 0]
+    if not mixed:
+        return []
+    total_avail = sum(avail[n] for n in mixed)
+    if total_avail <= 0:
+        return []
+
+    default_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+    by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+
+    def _need(code: str, d: int) -> int:
+        req = by_day[d] if isinstance(by_day, list) and d < len(by_day) else default_req
+        return int(req.get(code, 0)) if isinstance(req, dict) else 0
+
+    obj_terms: list = []
+    for c in work_codes:
+        total_demand = sum(_need(c, d) for d in range(D_phys))
+        dedi_fixed = sum(fixed_shift[n][c] for n in range(N) if is_dedi[n])
+        mixed_fixed = sum(fixed_shift[n][c] for n in mixed)
+        mixed_demand = max(0, total_demand - dedi_fixed)
+        remaining = max(0, mixed_demand - mixed_fixed)
+
+        for n in mixed:
+            share = remaining * avail[n] / total_avail if total_avail > 0 else 0
+            target = fixed_shift[n][c] + int(round(share))
+            j_n = join[n] if n < len(join) else 0
+            l_n = min(leave[n] if n < len(leave) else D_phys - 1, D_phys - 1)
+            if j_n > l_n:
+                continue
+            count_expr = sum(X(n, d, shift_idx[c]) for d in range(j_n, l_n + 1))
+            dev = m.NewIntVar(0, D_phys, f"pnt_dev_{n}_{c}")
+            diff = m.NewIntVar(-D_phys, D_phys, f"pnt_diff_{n}_{c}")
+            m.Add(diff == count_expr - target)
+            m.AddAbsEquality(dev, diff)
+            obj_terms.append(-weight * dev)
+
+    return obj_terms
