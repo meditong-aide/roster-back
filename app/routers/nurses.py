@@ -923,13 +923,21 @@ async def verify_and_update_phone(
 # ── NurseAssignment 엔드포인트 (동적 경로보다 먼저 선언) ──
 
 
-@router.post("/assignments", response_model=NurseAssignmentResponse)
+@router.post(
+    "/assignments",
+    response_model=NurseAssignmentResponse,
+    deprecated=True,
+)
 async def create_nurse_assignment(
     req: NurseAssignmentCreate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
+    """[DEPRECATED] 배정/상태 변경 등록.
+
+    신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "create", ...}` payload로 대체해 주세요.
+    (파견/휴직/퇴사/프리셉티/병동이동)
+    """
     return create_assignment(req, db, current_user=current_user)
 
 
@@ -949,24 +957,38 @@ async def get_nurse_assignments(
     return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
 
 
-@router.put("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+@router.put(
+    "/assignments/{assignment_id}",
+    response_model=NurseAssignmentResponse,
+    deprecated=True,
+)
 async def update_nurse_assignment(
     assignment_id: int,
     req: NurseAssignmentUpdate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정 수정 (기간/상태 변경)"""
+    """[DEPRECATED] 배정 수정 (기간/상태 변경).
+
+    신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "update", assignment_id, ...}` payload로 대체해 주세요.
+    """
     return update_assignment(assignment_id, req, db, current_user=current_user)
 
 
-@router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+@router.delete(
+    "/assignments/{assignment_id}",
+    response_model=NurseAssignmentResponse,
+    deprecated=True,
+)
 async def delete_nurse_assignment(
     assignment_id: int,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정 취소 (status → cancelled)"""
+    """[DEPRECATED] 배정 취소 (status → cancelled).
+
+    신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "cancel", assignment_id}` payload로 대체해 주세요.
+    """
     return cancel_assignment(assignment_id, db, current_user=current_user)
 
 

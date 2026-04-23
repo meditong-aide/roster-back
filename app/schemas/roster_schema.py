@@ -422,6 +422,35 @@ class PersonnelUpdate(BaseModel):
     experience: Optional[int] = Field(None, ge=0, description="총 경력(년)")
 
 
+class NurseAssignmentPayload(BaseModel):
+    """사이드 프로필 업데이트와 함께 전달되는 배정(파견/병동이동/휴직/프리셉티) payload.
+
+    operation:
+      - 'create': 신규 배정 등록 (reason/start_date/target_group_id 등 필수)
+      - 'update': 기존 배정 수정 (assignment_id 필수)
+      - 'cancel': 기존 배정 취소 (assignment_id 필수)
+    """
+
+    operation: str = Field(description="'create' | 'update' | 'cancel'")
+    assignment_id: Optional[int] = Field(default=None, description="update/cancel 시 필수")
+    reason: Optional[str] = Field(default=None, description="파견/휴직/퇴사/프리셉티/병동이동")
+    source_group_id: Optional[str] = None
+    target_group_id: Optional[str] = None
+    office_id: Optional[str] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: Optional[str] = None
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
+
+
 class NurseProfileUpdate(BaseModel):
     """nurse_id 기반 단건 프로필 업데이트 (사이드 프로필 / 마이페이지)"""
 
@@ -449,6 +478,10 @@ class NurseProfileUpdate(BaseModel):
     enable_nurse_pair_preference: Optional[bool] = None
     enable_aide: Optional[bool] = None
     wanted_max_requests: Optional[int] = None
+    assignment: Optional[NurseAssignmentPayload] = Field(
+        default=None,
+        description="배정(파견/병동이동 등) create/update/cancel을 프로필 수정과 함께 수행",
+    )
 
 
 class PasswordChangeRequest(BaseModel):
@@ -524,6 +557,9 @@ class AdjustmentNurse(BaseModel):
     name: str
     entries: List[FixedWantedEntryResponse]
     monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, "주": 4, ...}
+    # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자 목록.
+    # 프론트는 이 일자를 저장/편집 불가(blocked)로 표기해야 한다.
+    blocked_dates: List[date] = Field(default_factory=list)
 
 
 class AdjustmentResponse(BaseModel):

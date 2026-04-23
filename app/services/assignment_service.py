@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple, List
 from db.models import NurseAssignment, Nurse as NurseModel, ShiftTransferLog, Group
 from schemas.roster_schema import (
     NurseAssignmentCreate,
@@ -19,6 +19,12 @@ from schemas.auth_schema import User as UserSchema
 import logging
 
 logger = logging.getLogger(__name__)
+
+# FixedWantedEntry 재배치 시 open-ended assignment(end_date=None)의 월 범위 캡
+_REALLOCATE_OPEN_WINDOW_CAP_MONTHS = 12
+
+# 파견/병동이동 이관 사유 (nurse_service._INBOUND_REASONS와 동일 정책)
+_INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
 
 
 def _assert_caller_owns_source(
@@ -95,6 +101,144 @@ def _collect_assignment_recipients(
     return list(recipients)
 
 
+# ── FixedWantedEntry 재배치 헬퍼 ───────────────────────────────────────
+# 정책 B: assignment 기간 내(in-period) 엔트리 소유자는 target_group_id,
+# 기간 외(out-of-period) 소유자는 source_group_id.
+# 재배치 충돌 시 Policy 1(desired_owner 기존 엔트리 보존)로 해결한다.
+
+
+def _effective_end_date(row: NurseAssignment) -> Optional[date]:
+    """assignment의 실제 종료 경계(end_date 우선, 없으면 expected_end_date)."""
+    return row.end_date or row.expected_end_date
+
+
+def _collect_affected_months(
+    start_date: date,
+    end_date: Optional[date],
+    cap_months: int = _REALLOCATE_OPEN_WINDOW_CAP_MONTHS,
+) -> List[Tuple[int, int]]:
+    """[start_date, end_date] 범위의 (year, month) 목록. open-ended는 cap_months로 제한."""
+    if end_date is None:
+        y, m = start_date.year, start_date.month + cap_months
+        while m > 12:
+            y += 1
+            m -= 12
+        end = date(y, m, 1)
+    else:
+        end = end_date
+    cur_y, cur_m = start_date.year, start_date.month
+    months: List[Tuple[int, int]] = []
+    while (cur_y, cur_m) <= (end.year, end.month):
+        months.append((cur_y, cur_m))
+        cur_m += 1
+        if cur_m > 12:
+            cur_y += 1
+            cur_m = 1
+    return months
+
+
+def _desired_owner_for_date(
+    d: date,
+    source_group_id: str,
+    target_group_id: Optional[str],
+    window: Optional[Tuple[date, Optional[date]]],
+) -> str:
+    """window 기간 내면 target, 바깥(또는 window=None)이면 source."""
+    if not target_group_id or window is None:
+        return source_group_id
+    start, end = window
+    if d < start:
+        return source_group_id
+    if end is not None and d > end:
+        return source_group_id
+    return target_group_id
+
+
+def _reallocate_month_fixed_wanted(
+    db: Session,
+    nurse_id: str,
+    source_group_id: str,
+    target_group_id: Optional[str],
+    year: int,
+    month: int,
+    window: Optional[Tuple[date, Optional[date]]],
+) -> int:
+    """해당 월 FixedWantedEntry.group_id를 desired_owner 기준으로 재배치."""
+    from db.models import FixedWantedEntry
+
+    candidate_gids = [source_group_id]
+    if target_group_id:
+        candidate_gids.append(target_group_id)
+    entries = (
+        db.query(FixedWantedEntry)
+        .filter(
+            FixedWantedEntry.nurse_id == nurse_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.group_id.in_(candidate_gids),
+        )
+        .all()
+    )
+    if not entries:
+        return 0
+    by_date: dict[date, dict[str, list]] = {}
+    for e in entries:
+        by_date.setdefault(e.shift_date, {}).setdefault(e.group_id, []).append(e)
+    changed = 0
+    for d, owners in by_date.items():
+        want = _desired_owner_for_date(d, source_group_id, target_group_id, window)
+        has_want = bool(owners.get(want))
+        for gid, rows in owners.items():
+            if gid == want:
+                continue
+            if has_want:
+                for r in rows:
+                    db.delete(r)
+                    changed += 1
+            else:
+                for r in rows:
+                    r.group_id = want
+                    changed += 1
+    return changed
+
+
+def _reallocate_fixed_wanted_on_assignment_change(
+    db: Session,
+    nurse_id: str,
+    source_group_id: str,
+    target_group_id: Optional[str],
+    old_window: Optional[Tuple[date, Optional[date]]],
+    new_window: Optional[Tuple[date, Optional[date]]],
+) -> int:
+    """assignment 변경(create/update/cancel)에 따라 FixedWantedEntry 소유자를 재배치.
+
+    old_window∪new_window 범위의 월들에 대해서만 재배치한다.
+    파견/병동이동만 대상(target_group_id 존재 시); 그 외 사유는 no-op.
+    """
+    if not target_group_id:
+        return 0
+    months: set[Tuple[int, int]] = set()
+    for win in (old_window, new_window):
+        if win is None:
+            continue
+        for ym in _collect_affected_months(win[0], win[1]):
+            months.add(ym)
+    if not months:
+        return 0
+    total = 0
+    for (year, month) in months:
+        total += _reallocate_month_fixed_wanted(
+            db, nurse_id, source_group_id, target_group_id, year, month, new_window,
+        )
+    if total > 0:
+        db.flush()
+        logger.info(
+            "FixedWantedEntry 재배치: nurse_id=%s, %s⇄%s, months=%s, touched=%d",
+            nurse_id, source_group_id, target_group_id, sorted(months), total,
+        )
+    return total
+
+
 def create_assignment(
     req: NurseAssignmentCreate,
     db: Session,
@@ -153,6 +297,22 @@ def create_assignment(
         "배정 등록: nurse_id=%s, reason=%s, start=%s",
         req.nurse_id, req.reason, req.start_date,
     )
+
+    # FixedWantedEntry 재배치 (파견/병동이동만)
+    if req.reason in _INBOUND_REASONS and req.target_group_id:
+        try:
+            _reallocate_fixed_wanted_on_assignment_change(
+                db,
+                nurse_id=req.nurse_id,
+                source_group_id=req.source_group_id,
+                target_group_id=req.target_group_id,
+                old_window=None,
+                new_window=(row.start_date, _effective_end_date(row)),
+            )
+            db.commit()
+        except Exception as e:
+            logger.error("FixedWantedEntry 재배치 실패(create): %s", e, exc_info=True)
+            db.rollback()
 
     # 알림 발송 (S06)
     try:
@@ -287,6 +447,11 @@ def update_assignment(
 
     _assert_caller_owns_source(current_user, row.source_group_id)
 
+    # 재배치 판정을 위해 기존(window) 스냅샷 저장
+    _old_window = (row.start_date, _effective_end_date(row))
+    _old_reason = row.reason
+    _old_status = row.status
+
     # 기간/상태 변경 시 동일 간호사 active 배정과의 겹침 차단 (create_assignment와 동일 정책)
     _period_changed = any(
         v is not None for v in (req.expected_end_date, req.end_date, req.status)
@@ -321,6 +486,28 @@ def update_assignment(
 
     db.commit()
     db.refresh(row)
+
+    # FixedWantedEntry 재배치 (파견/병동이동 & 상태 변화 기준)
+    if _old_reason in _INBOUND_REASONS and row.target_group_id:
+        _was_active = _old_status == "active"
+        _now_active = row.status == "active"
+        _old = _old_window if _was_active else None
+        _new = (row.start_date, _effective_end_date(row)) if _now_active else None
+        if _old is not None or _new is not None:
+            try:
+                _reallocate_fixed_wanted_on_assignment_change(
+                    db,
+                    nurse_id=row.nurse_id,
+                    source_group_id=row.source_group_id,
+                    target_group_id=row.target_group_id,
+                    old_window=_old,
+                    new_window=_new,
+                )
+                db.commit()
+            except Exception as e:
+                logger.error("FixedWantedEntry 재배치 실패(update): %s", e, exc_info=True)
+                db.rollback()
+
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
     return _to_response(row, nurse.name if nurse else None)
 
@@ -337,10 +524,34 @@ def cancel_assignment(
 
     _assert_caller_owns_source(current_user, row.source_group_id)
 
+    _old_window = (row.start_date, _effective_end_date(row))
+    _old_reason = row.reason
+    _old_status = row.status
+
     row.status = "cancelled"
     db.commit()
     db.refresh(row)
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
+
+    # FixedWantedEntry 재배치: 기존 target-period 엔트리 → source로 복귀
+    if (
+        _old_reason in _INBOUND_REASONS
+        and _old_status == "active"
+        and row.target_group_id
+    ):
+        try:
+            _reallocate_fixed_wanted_on_assignment_change(
+                db,
+                nurse_id=row.nurse_id,
+                source_group_id=row.source_group_id,
+                target_group_id=row.target_group_id,
+                old_window=_old_window,
+                new_window=None,
+            )
+            db.commit()
+        except Exception as e:
+            logger.error("FixedWantedEntry 재배치 실패(cancel): %s", e, exc_info=True)
+            db.rollback()
 
     # 알림 발송 (S07)
     try:

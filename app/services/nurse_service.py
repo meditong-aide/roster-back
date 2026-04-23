@@ -18,7 +18,7 @@ from db.models import (
 from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP
 from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pprint import pprint
 from datetime import date, datetime
 from dateutil.parser import parse as parse_date
@@ -1008,6 +1008,7 @@ def update_nurse_profile_service(
     - 수간호사(HDN) 또는 관리자(ADM)만 수정 가능
     - 수간호사는 같은 그룹 내만 수정 가능
     - email 변경 시 bizwiz20db.Member에도 dual write
+    - `assignment` payload 포함 시 NurseAssignment CRUD를 먼저 처리 (create/update/cancel)
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -1023,9 +1024,22 @@ def update_nurse_profile_service(
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
 
     fields = update_data.dict(exclude_unset=True)
+    # assignment payload는 별도 브랜치로 분리 후 source/target 저장 단계에서 제외
+    assignment_payload = fields.pop("assignment", None)
+    if assignment_payload is not None:
+        _dispatch_assignment_payload(db, nurse_id, assignment_payload, current_user)
+        # assignment 저장 직후 resolve_edit_target 재평가 위해 세션 refresh
+        db.refresh(nurse)
+
     email_changed = "email" in fields
     new_email = fields.get("email")
     applied_source = False
+
+    if not fields:
+        return {
+            "message": "배정 정보가 성공적으로 반영되었습니다.",
+            "nurse_id": nurse_id,
+        }
 
     # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
     if is_admin:
@@ -1068,6 +1082,72 @@ def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> Non
     for key, value in fields.items():
         if hasattr(nurse, key):
             setattr(nurse, key, value)
+
+
+_ASSIGNMENT_CREATE_FIELDS: Tuple[str, ...] = (
+    "source_group_id", "target_group_id", "office_id",
+    "start_date", "expected_end_date", "reason",
+    "target_weekly_off_type", "target_weekly_off_enabled", "target_weekly_off_weekday",
+    "target_shift_types", "target_team_id", "target_grade",
+    "target_fixed_shift", "target_wanted_max_requests",
+)
+
+_ASSIGNMENT_UPDATE_FIELDS: Tuple[str, ...] = (
+    "expected_end_date", "end_date", "status",
+    "target_weekly_off_type", "target_weekly_off_enabled", "target_weekly_off_weekday",
+    "target_shift_types", "target_team_id", "target_grade",
+    "target_fixed_shift", "target_wanted_max_requests",
+)
+
+
+def _dispatch_assignment_payload(
+    db: Session,
+    nurse_id: str,
+    payload: Dict[str, Any],
+    current_user: UserSchema,
+) -> None:
+    """NurseProfileUpdate.assignment payload를 operation별로 assignment_service에 위임."""
+    from schemas.roster_schema import (
+        NurseAssignmentCreate as _CreateReq,
+        NurseAssignmentUpdate as _UpdateReq,
+    )
+    from services.assignment_service import (
+        create_assignment as _create_assignment,
+        update_assignment as _update_assignment,
+        cancel_assignment as _cancel_assignment,
+    )
+
+    op = (payload or {}).get("operation")
+    if op == "create":
+        data = {k: payload.get(k) for k in _ASSIGNMENT_CREATE_FIELDS}
+        data["nurse_id"] = nurse_id
+        try:
+            req = _CreateReq(**{k: v for k, v in data.items() if v is not None})
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"assignment.create payload 오류: {e}")
+        _create_assignment(req, db, current_user=current_user)
+        return
+    if op == "update":
+        aid = payload.get("assignment_id")
+        if aid is None:
+            raise HTTPException(status_code=422, detail="assignment.update: assignment_id 필수")
+        data = {k: payload.get(k) for k in _ASSIGNMENT_UPDATE_FIELDS if payload.get(k) is not None}
+        try:
+            req = _UpdateReq(**data)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"assignment.update payload 오류: {e}")
+        _update_assignment(aid, req, db, current_user=current_user)
+        return
+    if op == "cancel":
+        aid = payload.get("assignment_id")
+        if aid is None:
+            raise HTTPException(status_code=422, detail="assignment.cancel: assignment_id 필수")
+        _cancel_assignment(aid, db, current_user=current_user)
+        return
+    raise HTTPException(
+        status_code=422,
+        detail=f"assignment.operation 값이 올바르지 않습니다: {op!r}",
+    )
 
 
 def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):

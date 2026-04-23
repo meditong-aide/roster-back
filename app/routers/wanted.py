@@ -889,6 +889,9 @@ async def save_fixed_wanted(
             ],
             total_count=len(entries),
         )
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"확정 원티드 저장 실패: {str(e)}")
@@ -902,19 +905,27 @@ async def toggle_fixed_wanted_entry(
 ):
     """
     확정 원티드 개별 항목 적용/미적용 토글 API
+    - 수간호사는 본인 병동 entries만 토글 가능. master_admin은 office 범위로 허용.
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
+    caller_group_id: Optional[str] = None
+    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
+        caller_group_id = current_user.group_id
+
     try:
-        entry = toggle_fixed_wanted_entry_service(db, entry_id)
+        entry = toggle_fixed_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)
         return ToggleEntryResponse(
             id=entry.id,
             is_applied=entry.is_applied,
             message=f"항목이 {'적용' if entry.is_applied else '미적용'}으로 변경되었습니다."
         )
+    except HTTPException:
+        db.rollback()
+        raise
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
