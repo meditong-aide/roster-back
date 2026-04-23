@@ -1590,12 +1590,25 @@ def _build_inbound_blocks(
             name_map[gid] = gname or ""
     blocks: Dict[str, Dict[str, Any]] = {}
     for r in rows:
+        _end = r.end_date or r.expected_end_date
         entry = {
-            "startDate": r.start_date.isoformat() if r.start_date else None,
-            "endDate": r.expected_end_date.isoformat() if r.expected_end_date else None,
+            "id": r.id,
+            "status": r.status,
             "reason": r.reason,
+            "startDate": r.start_date.isoformat() if r.start_date else None,
+            "endDate": _end.isoformat() if _end else None,
+            "source_group_id": r.source_group_id,
             "target_group_id": r.target_group_id,
             "target_group_name": name_map.get(r.target_group_id, ""),
+            "office_id": r.office_id,
+            "target_weekly_off_type": r.target_weekly_off_type,
+            "target_weekly_off_enabled": r.target_weekly_off_enabled,
+            "target_weekly_off_weekday": r.target_weekly_off_weekday,
+            "target_shift_types": r.target_shift_types,
+            "target_team_id": r.target_team_id,
+            "target_grade": r.target_grade,
+            "target_fixed_shift": r.target_fixed_shift,
+            "target_wanted_max_requests": r.target_wanted_max_requests,
         }
         blocks.setdefault(r.nurse_id, {"inbound_list": []})["inbound_list"].append(entry)
     return blocks

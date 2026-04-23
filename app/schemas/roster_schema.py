@@ -273,17 +273,41 @@ class RosterConfig(RosterConfigBase):
 
 
 class InboundEntry(BaseModel):
-    """활성 파견/병동이동 1건에 대한 프론트 노출용 엔트리."""
+    """활성 파견/병동이동 1건에 대한 프론트 노출용 엔트리.
 
+    관리(수정/취소)에 필요한 assignment_id / source_group_id / status 및
+    target_* overlay 값을 포함한다. PATCH /nurses/{nurse_id}의 assignment payload에서
+    operation='update'|'cancel'을 호출하려면 여기 `id`(assignment_id)를 사용한다.
+    """
+
+    id: Optional[int] = Field(default=None, description="nurse_assignment.id")
+    status: Optional[str] = Field(
+        default=None, description="active / completed / cancelled"
+    )
+    reason: str = Field(description="'파견' 또는 '병동이동'")
     startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
     endDate: Optional[str] = Field(
         default=None, description="예정 종료일 ISO 문자열 (미정이면 null)"
     )
-    reason: str = Field(description="'파견' 또는 '병동이동'")
+    source_group_id: Optional[str] = Field(
+        default=None, description="source 그룹 ID (생성/수정 권한 판정용)"
+    )
     target_group_id: Optional[str] = Field(
         default=None, description="target 그룹 ID"
     )
     target_group_name: str = Field(default="", description="target 그룹명")
+    office_id: Optional[str] = Field(
+        default=None, description="office 경계 검증용"
+    )
+    # target 그룹 overlay 현재값 (수정 화면 프리필용)
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
 
 
 class InboundBlock(BaseModel):
