@@ -265,8 +265,11 @@ def create_assignment(
     if req.reason == "병동이동":
         _assert_transfer_chain_source(db, req.nurse_id, req.source_group_id)
 
+    # 파견/병동이동: target_group_id 필수 + source != target 검증
+    _assert_valid_inbound_target(req.reason, req.source_group_id, req.target_group_id)
+
     # Office 경계 검증 (파견/병동이동: target_group이 동일 office 소속이어야 함)
-    if req.reason in ("파견", "병동이동") and req.target_group_id:
+    if req.reason in _INBOUND_REASONS and req.target_group_id:
         _assert_target_in_same_office(db, req.office_id, req.target_group_id)
 
     # 기간 중복 검증: 동일 간호사의 active assignment와 일자 겹침 불허
@@ -380,6 +383,29 @@ def _assert_transfer_chain_source(
         )
 
 
+def _assert_valid_inbound_target(
+    reason: str,
+    source_group_id: str,
+    target_group_id: Optional[str],
+) -> None:
+    """파견/병동이동: target_group_id 필수 + source와 달라야 함."""
+    if reason not in _INBOUND_REASONS:
+        return
+    if not target_group_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{reason}은(는) target_group_id 필수입니다.",
+        )
+    if target_group_id == source_group_id:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{reason}의 target_group_id가 source_group_id({source_group_id})와 "
+                f"동일합니다. 다른 병동을 선택해 주세요."
+            ),
+        )
+
+
 def _assert_target_in_same_office(
     db: Session,
     caller_office_id: str,
@@ -460,6 +486,13 @@ def update_assignment(
     _new_target_gid = (
         req.target_group_id if req.target_group_id is not None else row.target_group_id
     )
+
+    # 파견/병동이동: 최종 target_group_id 필수 + source != target 검증
+    # (reason 또는 target_group_id 변경 시 재검증, 또는 기존 reason이 파견/병동이동인데 invalid state인 경우 차단)
+    if _new_reason in _INBOUND_REASONS and (
+        req.reason is not None or req.target_group_id is not None
+    ):
+        _assert_valid_inbound_target(_new_reason, row.source_group_id, _new_target_gid)
 
     # target_group_id 교체: office 경계 재검증 (파견/병동이동만 의미)
     if (
