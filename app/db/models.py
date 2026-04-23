@@ -156,7 +156,7 @@ class NurseAssignment(Base):
     target_weekly_off_type = Column(VARCHAR(20), nullable=True)
     target_weekly_off_enabled = Column(TINYINT, nullable=True)
     target_weekly_off_weekday = Column(TINYINT, nullable=True)
-    target_shift_types = Column(JSON, nullable=True)
+    target_shift_types = Column(JSON(none_as_null=True), nullable=True, default=list)
     target_team_id = Column(INTEGER, nullable=True)
     target_grade = Column(INTEGER, nullable=True)
     target_fixed_shift = Column(VARCHAR(20), nullable=True)

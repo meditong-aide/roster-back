@@ -15,9 +15,50 @@ from schemas.roster_schema import (
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
 )
+from schemas.auth_schema import User as UserSchema
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_caller_owns_source(
+    current_user: Optional[UserSchema],
+    source_group_id: str,
+) -> None:
+    """파견/병동이동/휴직 등 assignment 조작 권한 검증.
+
+    정책: source 병동 수간호사만 자기 병동 간호사를 파견/이동시킬 수 있다.
+    - is_master_admin: 예외 (모든 그룹 조작 허용)
+    - 그 외: caller.group_id == source_group_id 필수
+    - current_user가 None이면 system/admin 경로로 간주하고 통과.
+    """
+    if current_user is None:
+        return
+    if getattr(current_user, "is_master_admin", False):
+        return
+    caller_gid = getattr(current_user, "group_id", None)
+    if caller_gid != source_group_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"권한 없음: source 병동({source_group_id})의 수간호사만 "
+                f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
+            ),
+        )
+
+
+# source(nurses.*) 필드명 → target(nurse_assignment.target_*) 필드명 매핑
+# Target 병동 수간호사가 inbound 간호사 프로필을 수정할 때 사용.
+_SOURCE_TO_TARGET_FIELD_MAP: dict[str, str] = {
+    "grade": "target_grade",
+    "fixed_shift": "target_fixed_shift",
+    "is_night_nurse": "target_shift_types",
+    "team_id": "target_team_id",
+    "weekly_off_enabled": "target_weekly_off_enabled",
+    "weekly_off_type": "target_weekly_off_type",
+    "weekly_off_weekday": "target_weekly_off_weekday",
+    "wanted_max_requests": "target_wanted_max_requests",
+}
 
 
 def _get_group_name(db: Session, group_id: str | None) -> str | None:
@@ -57,8 +98,11 @@ def _collect_assignment_recipients(
 def create_assignment(
     req: NurseAssignmentCreate,
     db: Session,
+    current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 등록"""
+    _assert_caller_owns_source(current_user, req.source_group_id)
+
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
@@ -72,6 +116,14 @@ def create_assignment(
                 status_code=400,
                 detail=f"퇴사 처리된 간호사입니다. (퇴사일: {_resign_d})",
             )
+
+    # 병동이동 체인 검증 (source가 직전 target 또는 현재 group_id 와 일치)
+    if req.reason == "병동이동":
+        _assert_transfer_chain_source(db, req.nurse_id, req.source_group_id)
+
+    # Office 경계 검증 (파견/병동이동: target_group이 동일 office 소속이어야 함)
+    if req.reason in ("파견", "병동이동") and req.target_group_id:
+        _assert_target_in_same_office(db, req.office_id, req.target_group_id)
 
     # 기간 중복 검증: 동일 간호사의 active assignment와 일자 겹침 불허
     _raise_if_overlap(db, req.nurse_id, req.start_date, req.expected_end_date)
@@ -88,7 +140,7 @@ def create_assignment(
         target_weekly_off_type=req.target_weekly_off_type,
         target_weekly_off_enabled=req.target_weekly_off_enabled,
         target_weekly_off_weekday=req.target_weekly_off_weekday,
-        target_shift_types=req.target_shift_types,
+        target_shift_types=req.target_shift_types if req.target_shift_types is not None else [],
         target_team_id=req.target_team_id,
         target_grade=req.target_grade,
         target_fixed_shift=req.target_fixed_shift,
@@ -126,6 +178,71 @@ def create_assignment(
     return _to_response(row, nurse.name)
 
 
+def _assert_transfer_chain_source(
+    db: Session,
+    nurse_id: str,
+    source_group_id: str,
+) -> None:
+    """병동이동 체인 검증.
+
+    후속 병동이동의 source_group_id는 직전 active 병동이동의 target_group_id와 일치해야 한다.
+    직전 이동이 없으면 현재 nurses.group_id와 일치해야 한다.
+    """
+    prev = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == nurse_id,
+            NurseAssignment.reason == "병동이동",
+            NurseAssignment.status == "active",
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .first()
+    )
+    if prev is not None:
+        if source_group_id != prev.target_group_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"병동이동 체인 불일치: 직전 이동 target={prev.target_group_id}, "
+                    f"후속 source={source_group_id}"
+                ),
+            )
+        return
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    if nurse and source_group_id != nurse.group_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"source 불일치: 현재 그룹={nurse.group_id}, "
+                f"요청 source={source_group_id}"
+            ),
+        )
+
+
+def _assert_target_in_same_office(
+    db: Session,
+    caller_office_id: str,
+    target_group_id: str,
+) -> None:
+    """파견/병동이동의 target_group_id가 호출자 office_id와 동일한 오피스인지 검증."""
+    target_group = (
+        db.query(Group).filter(Group.group_id == target_group_id).first()
+    )
+    if target_group is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"target_group_id={target_group_id}는 존재하지 않습니다.",
+        )
+    if target_group.office_id != caller_office_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"office 경계 위반: target group의 office={target_group.office_id}, "
+                f"요청 office={caller_office_id}"
+            ),
+        )
+
+
 def _raise_if_overlap(
     db: Session,
     nurse_id: str,
@@ -161,11 +278,14 @@ def update_assignment(
     assignment_id: int,
     req: NurseAssignmentUpdate,
     db: Session,
+    current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 수정"""
     row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
+
+    _assert_caller_owns_source(current_user, row.source_group_id)
 
     # 기간/상태 변경 시 동일 간호사 active 배정과의 겹침 차단 (create_assignment와 동일 정책)
     _period_changed = any(
@@ -208,11 +328,14 @@ def update_assignment(
 def cancel_assignment(
     assignment_id: int,
     db: Session,
+    current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정 취소 (status → cancelled)"""
     row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
+
+    _assert_caller_owns_source(current_user, row.source_group_id)
 
     row.status = "cancelled"
     db.commit()
@@ -309,6 +432,38 @@ def get_active_assignments_for_month(
     )
 
 
+def _apply_target_profile_reset(
+    db: Session,
+    nurse: NurseModel,
+    row: NurseAssignment,
+) -> int:
+    """병동이동 발효 시 간호사 속성을 target overlay 또는 기본값으로 초기화.
+
+    프리셉터/프리셉티 비대칭도 함께 해제.
+    Returns: 해제된 하위 프리셉티 수 (로깅용).
+    """
+    nurse.grade = row.target_grade
+    nurse.fixed_shift = row.target_fixed_shift
+    # is_night_nurse는 네이밍과 달리 실제로 근무 가능 shift 타입 JSON list 저장용 컬럼임
+    nurse.is_night_nurse = row.target_shift_types if row.target_shift_types is not None else []
+    nurse.weekly_off_enabled = (
+        row.target_weekly_off_enabled if row.target_weekly_off_enabled is not None else False
+    )
+    nurse.weekly_off_type = row.target_weekly_off_type
+    nurse.weekly_off_weekday = row.target_weekly_off_weekday
+    nurse.wanted_max_requests = (
+        row.target_wanted_max_requests if row.target_wanted_max_requests is not None else 0
+    )
+    nurse.is_weekend_off = False
+
+    detached = db.query(NurseModel).filter(NurseModel.preceptor_id == row.nurse_id).update(
+        {NurseModel.preceptor_id: None}, synchronize_session=False
+    )
+    if nurse.preceptor_id is not None:
+        nurse.preceptor_id = None
+    return int(detached or 0)
+
+
 def flush_pending_transfers(db: Session, group_id: str) -> int:
     """병동이동 레이지 체크: start_date <= 오늘인 active 병동이동 레코드 처리
     - nurses.group_id를 target_group_id로 업데이트
@@ -344,9 +499,10 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
         if nurse and nurse.group_id != row.target_group_id:
             nurse.group_id = row.target_group_id
             nurse.team_id = None
+            detached = _apply_target_profile_reset(db, nurse, row)
             logger.info(
-                "병동이동 적용: nurse_id=%s, %s → %s (team 초기화)",
-                row.nurse_id, row.source_group_id, row.target_group_id,
+                "[transfer] nurse_id=%s, %s → %s target overlay applied, preceptees detached=%d",
+                row.nurse_id, row.source_group_id, row.target_group_id, detached,
             )
         row.status = "completed"
         row.end_date = today
@@ -406,9 +562,10 @@ def flush_all_pending_transfers(db: Session) -> int:
         if nurse and nurse.group_id != row.target_group_id:
             nurse.group_id = row.target_group_id
             nurse.team_id = None
+            detached = _apply_target_profile_reset(db, nurse, row)
             logger.info(
-                "[Scheduler] 병동이동 적용: nurse_id=%s, %s → %s",
-                row.nurse_id, row.source_group_id, row.target_group_id,
+                "[Scheduler][transfer] nurse_id=%s, %s → %s target overlay applied, preceptees detached=%d",
+                row.nurse_id, row.source_group_id, row.target_group_id, detached,
             )
         row.status = "completed"
         row.end_date = today
@@ -518,6 +675,36 @@ def flush_expired_preceptees(db: Session) -> int:
         logger.info("[Scheduler] 프리셉티 자동 해제 완료: %d건", count)
 
     return count
+
+
+def flush_expired_dispatches(db: Session) -> int:
+    """파견 만료 자동 디엑티브 (스케줄러용).
+
+    조건: reason='파견' AND status='active' AND expected_end_date < today
+    처리: status='completed', end_date=expected_end_date. target_* 은 이력으로만 남김.
+    Returns: 처리된 건수
+    """
+    today = date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.reason == "파견",
+            NurseAssignment.status == "active",
+            NurseAssignment.expected_end_date.isnot(None),
+            NurseAssignment.expected_end_date < today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    for row in rows:
+        row.status = "completed"
+        row.end_date = row.expected_end_date
+
+    db.commit()
+    logger.info("[Scheduler] 파견 자동 디엑티브 %d건", len(rows))
+    return len(rows)
 
 
 def transfer_shifts_on_publish(

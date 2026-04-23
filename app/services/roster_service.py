@@ -18,6 +18,7 @@ from db.models import (
     Schedule,
     ShiftPreference,
     Nurse,
+    NurseAssignment,
     ScheduleEntry,
     Shift,
     Group,
@@ -781,8 +782,44 @@ def create_issued_roster_snapshot(
             .all()
         )
         nurses.extend(_inbound_nurses)
+
+    # inbound assignment 블록 스냅샷 (파견/병동이동 이력 포함)
+    _all_nids = [n.nurse_id for n in nurses]
+    _inbound_blocks: dict[str, dict] = {}
+    if _all_nids:
+        _asg_rows = (
+            db.query(NurseAssignment)
+            .filter(
+                NurseAssignment.nurse_id.in_(_all_nids),
+                NurseAssignment.status == "active",
+                NurseAssignment.reason.in_(("파견", "병동이동")),
+            )
+            .order_by(NurseAssignment.start_date.asc())
+            .all()
+        )
+        if _asg_rows:
+            _gid_set = {r.target_group_id for r in _asg_rows if r.target_group_id}
+            _name_map: dict[str, str] = {}
+            if _gid_set:
+                for gid, gname in (
+                    db.query(Group.group_id, Group.group_name)
+                    .filter(Group.group_id.in_(_gid_set))
+                    .all()
+                ):
+                    _name_map[gid] = gname or ""
+            for r in _asg_rows:
+                entry = {
+                    "startDate": r.start_date.isoformat() if r.start_date else None,
+                    "endDate": r.expected_end_date.isoformat() if r.expected_end_date else None,
+                    "reason": r.reason,
+                    "target_group_id": r.target_group_id,
+                    "target_group_name": _name_map.get(r.target_group_id, ""),
+                }
+                _inbound_blocks.setdefault(r.nurse_id, {"inbound_list": []})["inbound_list"].append(entry)
+
     nurses_json = []
     for n in nurses:
+        _block = _inbound_blocks.get(n.nurse_id)
         nurses_json.append(
             {
                 "nurse_id": n.nurse_id,
@@ -808,6 +845,8 @@ def create_issued_roster_snapshot(
                 "sequence": n.sequence,
                 "active": n.active,
                 "team_id": n.team_id,
+                "is_inbound": n.group_id != group_id,
+                "inbound": _block if _block else None,
             }
         )
 

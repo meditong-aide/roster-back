@@ -43,6 +43,7 @@ from services.assignment_service import (
     get_assignments,
     flush_pending_transfers,
     flush_expired_preceptees,
+    flush_expired_dispatches,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
@@ -139,6 +140,8 @@ async def get_nurses_in_group(
         flush_pending_transfers(db, _group)
     # 프리셉티 만료 레이지 체크
     flush_expired_preceptees(db)
+    # 파견 만료 레이지 체크 (status change only, 안전 작업)
+    flush_expired_dispatches(db)
     print(
         "current_user",
         current_user.nurse_id,
@@ -927,7 +930,7 @@ async def create_nurse_assignment(
     db: Session = Depends(get_db),
 ):
     """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
-    return create_assignment(req, db)
+    return create_assignment(req, db, current_user=current_user)
 
 
 @router.get("/assignments", response_model=List[NurseAssignmentResponse])
@@ -954,7 +957,7 @@ async def update_nurse_assignment(
     db: Session = Depends(get_db),
 ):
     """배정 수정 (기간/상태 변경)"""
-    return update_assignment(assignment_id, req, db)
+    return update_assignment(assignment_id, req, db, current_user=current_user)
 
 
 @router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
@@ -964,7 +967,7 @@ async def delete_nurse_assignment(
     db: Session = Depends(get_db),
 ):
     """배정 취소 (status → cancelled)"""
-    return cancel_assignment(assignment_id, db)
+    return cancel_assignment(assignment_id, db, current_user=current_user)
 
 
 @router.get("/{nurse_id}", response_model=NurseProfile)

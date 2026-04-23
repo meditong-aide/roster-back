@@ -272,6 +272,24 @@ class RosterConfig(RosterConfigBase):
 #     N = "N"
 
 
+class InboundEntry(BaseModel):
+    """활성 파견/병동이동 1건에 대한 프론트 노출용 엔트리."""
+
+    startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
+    endDate: Optional[str] = Field(
+        default=None, description="예정 종료일 ISO 문자열 (미정이면 null)"
+    )
+    reason: str = Field(description="'파견' 또는 '병동이동'")
+    target_group_id: Optional[str] = Field(
+        default=None, description="target 그룹 ID"
+    )
+    target_group_name: str = Field(default="", description="target 그룹명")
+
+
+class InboundBlock(BaseModel):
+    inbound_list: List[InboundEntry] = Field(default_factory=list)
+
+
 class NurseProfile(BaseModel):
     office_id: str
     # EmpAuthGbn: Optional[str] = None
@@ -322,6 +340,16 @@ class NurseProfile(BaseModel):
     show_level: bool = Field(default=True, description="직책(level_) 표시 여부")
     show_preceptor: bool = Field(
         default=True, description="프리셉터-프리셉티 관계 표시 여부"
+    )
+    # Target 병동 시점 구분용 (파견/병동이동 inbound 간호사는 True)
+    is_inbound: bool = Field(
+        default=False,
+        description="호출자 병동이 target(파견/병동이동 수신측)일 때 True",
+    )
+    # 기간 설정(파견/병동이동) 활성 이력 (source/target 양쪽에서 동일 표시)
+    inbound: Optional["InboundBlock"] = Field(
+        default=None,
+        description="활성 파견/병동이동 이력 블록. 없으면 null",
     )
 
     # @field_validator('fixed_shift')

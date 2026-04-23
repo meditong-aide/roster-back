@@ -64,13 +64,24 @@ async def _daily_flush_scheduler():
 
         db = SessionLocal()
         try:
-            from services.assignment_service import flush_all_pending_transfers, flush_expired_preceptees
+            from services.assignment_service import (
+                flush_all_pending_transfers,
+                flush_expired_preceptees,
+                flush_expired_dispatches,
+            )
+            from services.nurse_service import flush_resigned_nurses
             count = flush_all_pending_transfers(db)
             if count > 0:
                 _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
             pte_count = flush_expired_preceptees(db)
             if pte_count > 0:
                 _scheduler_logger.info("[Scheduler] 프리셉티 자동 해제: %d건", pte_count)
+            disp_count = flush_expired_dispatches(db)
+            if disp_count > 0:
+                _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
+            res_count = flush_resigned_nurses(db)
+            if res_count > 0:
+                _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
         except Exception as e:
             _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
         finally:

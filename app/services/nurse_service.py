@@ -5,14 +5,17 @@
 """
 
 from sqlalchemy.orm import Session
+from sqlalchemy import or_, select
 from fastapi import HTTPException
 from db.models import (
     Nurse as NurseModel,
     Group,
     DeletedNurseHistory,
+    NurseAssignment,
     RosterConfig as RosterConfigModel,
     Shift,
 )
+from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP
 from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any
@@ -149,9 +152,23 @@ def get_nurses_in_group_service(
 
     query = db.query(NurseModel)
 
-    # 그룹 ID 필터링
+    # 그룹 ID 필터링: source(nurses.group_id) + inbound(assignment.target_group_id)
     if not skip_group_filter and current_user.group_id:
-        query = query.filter(NurseModel.group_id == current_user.group_id)
+        _inbound_subq = (
+            db.query(NurseAssignment.nurse_id)
+            .filter(
+                NurseAssignment.target_group_id == current_user.group_id,
+                NurseAssignment.status == "active",
+                NurseAssignment.reason.in_(_INBOUND_REASONS),
+            )
+            .subquery()
+        )
+        query = query.filter(
+            or_(
+                NurseModel.group_id == current_user.group_id,
+                NurseModel.nurse_id.in_(select(_inbound_subq.c.nurse_id)),
+            )
+        )
 
     # 특정 nurse_id 필터링
     if nurse_id:
@@ -193,6 +210,15 @@ def get_nurses_in_group_service(
         except (ValueError, TypeError) as e:
             logging.warning(f"Invalid birth_date format: {birth_date_str}, error: {e}")
             return None
+
+    # inbound assignment 배치 로드 (응답 overlay용; skip_group_filter 시에도 표시 일관성 위해 조회)
+    inbound_map: Dict[str, NurseAssignment] = {}
+    inbound_blocks: Dict[str, Dict[str, Any]] = {}
+    if nurses:
+        _nids = [n.nurse_id for n in nurses]
+        if current_user.group_id:
+            inbound_map = _load_inbound_map(db, current_user.group_id, _nids)
+        inbound_blocks = _build_inbound_blocks(db, _nids)
 
     # 결과 변환: NurseProfile과 호환
     result = []
@@ -236,9 +262,15 @@ def get_nurses_in_group_service(
             "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
             "enable_aide": nurse.enable_aide,
             "wanted_max_requests": nurse.wanted_max_requests,
+            "is_inbound": False,
             # 근무표 설정 메타 플래그
             **display_flags,
         }
+        inbound_row = inbound_map.get(nurse.nurse_id)
+        if inbound_row is not None:
+            _overlay_inbound_fields(nurse_dict, inbound_row)
+        _inbound_block = inbound_blocks.get(nurse.nurse_id)
+        nurse_dict["inbound"] = _inbound_block if _inbound_block else None
         result.append(nurse_dict)
 
     return result
@@ -539,13 +571,32 @@ def bulk_update_nurses_service(
     if not target_group_id:
         raise Exception("그룹 ID를 확인할 수 없습니다.")
 
-    # 그룹 내 모든 간호사 미리 로드 (효율성)
+    # 그룹 내 모든 간호사 + inbound 간호사까지 미리 로드 (target 모드 지원)
+    _inbound_ids = [
+        row.nurse_id
+        for row in db.query(NurseAssignment.nurse_id)
+        .filter(
+            NurseAssignment.target_group_id == target_group_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .all()
+    ]
     db_nurses_dict = {
         n.nurse_id: n
         for n in db.query(NurseModel)
-        .filter(NurseModel.group_id == target_group_id)
+        .filter(
+            or_(
+                NurseModel.group_id == target_group_id,
+                NurseModel.nurse_id.in_(_inbound_ids) if _inbound_ids else False,
+            )
+        )
         .all()
     }
+
+    # source/target 분기 판단 1회로 dict 확보
+    _nurse_ids = [p.nurse_id for p in nurses_data]
+    _edit_modes = resolve_edit_targets_batch(db, target_group_id, _nurse_ids)
 
     # use_mid 여부 조회 (최신 roster_config 기준)
     latest_config = (
@@ -573,56 +624,66 @@ def bulk_update_nurses_service(
 
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
+        if not db_nurse:
+            continue
 
-        # 기존 간호사 업데이트
-        if db_nurse:
-            if db_nurse.group_id != target_group_id:
-                continue
+        mode, assign_row = _edit_modes.get(profile.nurse_id, ("none", None))
+        update_data = profile.dict(exclude_unset=True)
 
-            # 변경된 필드만 추출
-            update_data = profile.dict(exclude_unset=True)
-
-            # active 또는 role 변경 시 sequence 자동 조정
-            old_active = db_nurse.active
-            old_role = db_nurse.role
-            new_active = update_data.get('active', old_active)
-            new_role = update_data.get('role', old_role)
-
-            if (old_active != new_active and 'active' in update_data) or \
-               (old_role != new_role and 'role' in update_data):
-                # role 그룹이 바뀌거나 active가 바뀌면 새 그룹의 마지막 sequence로 이동
-                update_data['sequence'] = get_next_sequence_for_active_status(
-                    target_group_id, new_active, db, role=new_role
-                )
-
-            if 'email' in update_data:
-                email_value = update_data.get('email')
-                if (email_value is None or (isinstance(email_value, str) and not email_value.strip())) and db_nurse.email:
-                    update_data.pop('email')
-
-            # === 프론트에서 보내준 값으로 일괄 업데이트 ===
-            for key, value in update_data.items():
-                if hasattr(db_nurse, key):
-                    setattr(db_nurse, key, value)
-
-            # === 후처리: is_night_nurse (전체 선택 시 빈 배열) ===
-            # 각 shift_id를 상위 그룹(D/E/N/M)으로 정규화 후 중복 제거
-            # use_mid=False: D,E,N 3종 전부 선택 시 빈 배열
-            # use_mid=True:  D,E,N,M 4종 전부 선택 시 빈 배열
-            if "is_night_nurse" in update_data:
-                night_shifts = update_data["is_night_nurse"]
-                if isinstance(night_shifts, list) and night_shifts:
-                    normalized = {shift_to_group.get(s, s) for s in night_shifts}
-                    if normalized == ALL_SHIFTS:
-                        db_nurse.is_night_nurse = []
-                elif night_shifts is None:
-                    db_nurse.is_night_nurse = []
-
-            # === 후처리: work_shifts (None → 빈 배열) ===
-            if "work_shifts" in update_data and update_data["work_shifts"] is None:
-                db_nurse.work_shifts = []
-
+        if mode == "target" and assign_row is not None:
+            # Target 병동 모드: nurse_assignment.target_* 저장
+            _apply_target_update(assign_row, update_data)
             updated_count += 1
+            continue
+
+        if mode != "source":
+            logging.warning(
+                "[bulk_update_nurses] 권한 밖 간호사 skip: nurse_id=%s", profile.nurse_id
+            )
+            continue
+
+        # === Source 모드: nurses.* 직접 저장 (기존 경로) ===
+        # active 또는 role 변경 시 sequence 자동 조정
+        old_active = db_nurse.active
+        old_role = db_nurse.role
+        new_active = update_data.get('active', old_active)
+        new_role = update_data.get('role', old_role)
+
+        if (old_active != new_active and 'active' in update_data) or \
+           (old_role != new_role and 'role' in update_data):
+            # role 그룹이 바뀌거나 active가 바뀌면 새 그룹의 마지막 sequence로 이동
+            update_data['sequence'] = get_next_sequence_for_active_status(
+                target_group_id, new_active, db, role=new_role
+            )
+
+        if 'email' in update_data:
+            email_value = update_data.get('email')
+            if (email_value is None or (isinstance(email_value, str) and not email_value.strip())) and db_nurse.email:
+                update_data.pop('email')
+
+        # === 프론트에서 보내준 값으로 일괄 업데이트 ===
+        for key, value in update_data.items():
+            if hasattr(db_nurse, key):
+                setattr(db_nurse, key, value)
+
+        # === 후처리: is_night_nurse (전체 선택 시 빈 배열) ===
+        # 각 shift_id를 상위 그룹(D/E/N/M)으로 정규화 후 중복 제거
+        # use_mid=False: D,E,N 3종 전부 선택 시 빈 배열
+        # use_mid=True:  D,E,N,M 4종 전부 선택 시 빈 배열
+        if "is_night_nurse" in update_data:
+            night_shifts = update_data["is_night_nurse"]
+            if isinstance(night_shifts, list) and night_shifts:
+                normalized = {shift_to_group.get(s, s) for s in night_shifts}
+                if normalized == ALL_SHIFTS:
+                    db_nurse.is_night_nurse = []
+            elif night_shifts is None:
+                db_nurse.is_night_nurse = []
+
+        # === 후처리: work_shifts (None → 빈 배열) ===
+        if "work_shifts" in update_data and update_data["work_shifts"] is None:
+            db_nurse.work_shifts = []
+
+        updated_count += 1
 
     # === 클라이언트에서 제외된 간호사 확인 ===
     client_nurse_ids = {profile.nurse_id for profile in nurses_data}
@@ -631,11 +692,14 @@ def bulk_update_nurses_service(
             print("제외된 간호사 for test:", db_nurse_id)
 
     # === active 상태 × role 그룹별 sequence 재정렬 (갭/중복 방지) ===
-    # 이미 메모리에 로드된 db_nurses_dict를 재사용해 DB 추가 조회 없이 재정렬
+    # inbound(파견/병동이동) 간호사는 제외 — source 병동 기준으로만 재정렬
+    _source_nurses = [
+        n for n in db_nurses_dict.values() if n.group_id == target_group_id
+    ]
     for active_status in (1, 0):
         for rg in ("RN", "AN", "ETC"):
             nurses_in_group = sorted(
-                [n for n in db_nurses_dict.values()
+                [n for n in _source_nurses
                  if n.active == active_status and get_role_group(n.role) == rg],
                 key=lambda n: (n.sequence, n.nurse_id),
             )
@@ -958,24 +1022,36 @@ def update_nurse_profile_service(
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
 
-    # 수간호사는 같은 그룹 내만 수정 가능 (ADM 제외)
-    if not is_admin:
-        if nurse.group_id != current_user.group_id:
-            raise HTTPException(status_code=403, detail="같은 그룹의 간호사만 수정할 수 있습니다.")
-
     fields = update_data.dict(exclude_unset=True)
     email_changed = "email" in fields
     new_email = fields.get("email")
+    applied_source = False
 
-    for key, value in fields.items():
-        if hasattr(nurse, key):
-            setattr(nurse, key, value)
+    # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
+    if is_admin:
+        _apply_source_nurse_update(nurse, fields)
+        db.commit()
+        db.refresh(nurse)
+        applied_source = True
+    else:
+        mode, assign_row = resolve_edit_target(db, current_user.group_id, nurse_id)
+        if mode == "none":
+            raise HTTPException(
+                status_code=403, detail="해당 간호사를 수정할 권한이 없습니다."
+            )
+        if mode == "target" and assign_row is not None:
+            _apply_target_update(assign_row, fields)
+            db.commit()
+            db.refresh(assign_row)
+        else:
+            _apply_source_nurse_update(nurse, fields)
+            db.commit()
+            db.refresh(nurse)
+            applied_source = True
 
-    db.commit()
-    db.refresh(nurse)
-
-    # email 변경 시 MSSQL dual write
-    if email_changed and new_email is not None:
+    # email 변경 시 MSSQL dual write는 source/admin 경로에서만 수행
+    # (target 모드는 nurses.email을 건드리지 않으므로 Member.Email과의 정합성을 깨뜨리지 않기 위해 skip)
+    if applied_source and email_changed and new_email is not None:
         try:
             msdb_manager.execute(
                 "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s",
@@ -985,6 +1061,13 @@ def update_nurse_profile_service(
             logging.warning(f"[update_nurse_profile] MSSQL email 동기화 실패 nurse_id={nurse_id}: {e}")
 
     return {"message": "간호사 정보가 성공적으로 수정되었습니다.", "nurse_id": nurse_id}
+
+
+def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> None:
+    """Source 모드 nurses.* 직접 저장 (update_nurse_profile_service 전용 분리)"""
+    for key, value in fields.items():
+        if hasattr(nurse, key):
+            setattr(nurse, key, value)
 
 
 def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
@@ -1062,6 +1145,57 @@ def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
     except Exception as e:
         db.rollback()
         raise Exception(f"Deletion failed: {str(e)}")
+
+
+def flush_resigned_nurses(db: Session) -> int:
+    """퇴사일+1일 경과 간호사 자동 삭제 (스케줄러용).
+
+    조건: resignation_date IS NOT NULL AND resignation_date(date) < today
+    처리: DeletedNurseHistory 이력 저장 + nurses 레코드 hard delete
+    snapshot(nurses_json)에 이력이 보존되므로 기존 근무표 조회에는 영향 없음.
+    Returns: 처리된 건수
+    """
+    today = date.today()
+    candidates = (
+        db.query(NurseModel)
+        .filter(NurseModel.resignation_date.isnot(None))
+        .all()
+    )
+    rows = []
+    for n in candidates:
+        _d = n.resignation_date
+        _d = _d.date() if hasattr(_d, "date") else _d
+        if _d and _d < today:
+            rows.append(n)
+    if not rows:
+        return 0
+
+    for n in rows:
+        history = DeletedNurseHistory(
+            target_nurse_id=n.nurse_id,
+            office_id=n.office_id,
+            group_id=n.group_id,
+            emp_num=n.emp_num,
+            account_id=n.account_id,
+            name=n.name,
+            role=n.role,
+            experience=n.experience,
+            is_head_nurse=n.is_head_nurse,
+            joining_date=n.joining_date,
+            birth_date=n.birth_date,
+            phone_number=n.phone_number,
+            gender=n.gender,
+            deleted_by_nurse_id="SYSTEM",
+            deleted_by_account_id="SYSTEM",
+            deleted_by_name="[Scheduler]",
+            deleted_by_role="SYS",
+        )
+        db.add(history)
+        db.delete(n)
+
+    db.commit()
+    logging.info("[Scheduler] 퇴사자 자동 삭제: %d건", len(rows))
+    return len(rows)
 
 
 def get_profile_image_info_service(current_user, db: Session) -> Dict[str, Any]:
@@ -1214,3 +1348,190 @@ def delete_profile_image_service(current_user, db: Session) -> Dict[str, Any]:
         if nurse.profile_image_updated_at
         else None,
     }
+
+
+# ── source/target 수정 분기 헬퍼 ──────────────────────────────────────
+# 관리자 수간호사가 inbound(파견/병동이동) 간호사 프로필을 수정할 때
+# nurse 원본 대신 nurse_assignment.target_* 필드에 저장해야 한다.
+
+_INBOUND_REASONS = ("파견", "병동이동")
+
+
+def _fetch_inbound_assignment(
+    db: Session, caller_group_id: str, nurse_id: str
+) -> Optional[NurseAssignment]:
+    """caller_group_id가 target인 간호사의 최신 active inbound assignment 반환."""
+    return (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == nurse_id,
+            NurseAssignment.target_group_id == caller_group_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .first()
+    )
+
+
+def resolve_edit_target(
+    db: Session, caller_group_id: str, nurse_id: str
+) -> tuple[str, Optional[NurseAssignment]]:
+    """간호사 수정 시 source/target 분기 판단.
+
+    Returns:
+        ('source', None): 호출자가 source 병동 소속 → nurses.* 에 저장
+        ('target', row):  호출자가 target 병동 소속 → assignment.target_* 에 저장
+        ('none', None):   양쪽 모두 아님 → 권한 없음
+    """
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    if nurse and nurse.group_id == caller_group_id:
+        return ("source", None)
+    inbound = _fetch_inbound_assignment(db, caller_group_id, nurse_id)
+    if inbound is not None:
+        return ("target", inbound)
+    return ("none", None)
+
+
+def resolve_edit_targets_batch(
+    db: Session, caller_group_id: str, nurse_ids: List[str]
+) -> Dict[str, tuple]:
+    """복수 간호사 대상 분기 판단 (N+1 회피용 배치 쿼리).
+
+    Returns dict[nurse_id] = (mode, assignment|None)
+    """
+    if not nurse_ids:
+        return {}
+
+    source_ids: set[str] = {
+        row.nurse_id
+        for row in db.query(NurseModel.nurse_id)
+        .filter(
+            NurseModel.nurse_id.in_(nurse_ids),
+            NurseModel.group_id == caller_group_id,
+        )
+        .all()
+    }
+
+    inbound_rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id.in_(nurse_ids),
+            NurseAssignment.target_group_id == caller_group_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .all()
+    )
+    inbound_map: Dict[str, NurseAssignment] = {}
+    for row in inbound_rows:
+        # 가장 최근 start_date만 유지 (order_by desc → 첫 발견이 최신)
+        inbound_map.setdefault(row.nurse_id, row)
+
+    result: Dict[str, tuple] = {}
+    for nid in nurse_ids:
+        if nid in source_ids:
+            result[nid] = ("source", None)
+        elif nid in inbound_map:
+            result[nid] = ("target", inbound_map[nid])
+        else:
+            result[nid] = ("none", None)
+    return result
+
+
+def _apply_target_update(
+    row: NurseAssignment, update_data: Dict[str, Any]
+) -> None:
+    """source 필드명 기준 update_data를 assignment.target_* 필드로 저장.
+
+    매핑 테이블에 없는 키는 무시(나이/생일 등 target로 전달 불가 항목).
+    """
+    for src_key, value in update_data.items():
+        target_key = _SOURCE_TO_TARGET_FIELD_MAP.get(src_key)
+        if target_key is not None and hasattr(row, target_key):
+            setattr(row, target_key, value)
+
+
+def _load_inbound_map(
+    db: Session, caller_group_id: str, nurse_ids: List[str]
+) -> Dict[str, NurseAssignment]:
+    """caller_group_id가 target인 간호사들의 최신 active inbound assignment 일괄 로드."""
+    if not nurse_ids:
+        return {}
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id.in_(nurse_ids),
+            NurseAssignment.target_group_id == caller_group_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .all()
+    )
+    inbound_map: Dict[str, NurseAssignment] = {}
+    for row in rows:
+        # 가장 최근 start_date만 유지
+        inbound_map.setdefault(row.nurse_id, row)
+    return inbound_map
+
+
+def _build_inbound_blocks(
+    db: Session, nurse_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """간호사별 활성 파견/병동이동 블록 구성 (source/target 양쪽 화면 공용).
+
+    Returns: dict[nurse_id] = {"inbound_list": [InboundEntry dict, ...]}
+    inbound_list는 start_date ASC 정렬. target_group_name은 Group 배치 조회로 채움.
+    """
+    if not nurse_ids:
+        return {}
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id.in_(nurse_ids),
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .order_by(NurseAssignment.start_date.asc())
+        .all()
+    )
+    if not rows:
+        return {}
+    gid_set = {r.target_group_id for r in rows if r.target_group_id}
+    name_map: Dict[str, str] = {}
+    if gid_set:
+        for gid, gname in (
+            db.query(Group.group_id, Group.group_name)
+            .filter(Group.group_id.in_(gid_set))
+            .all()
+        ):
+            name_map[gid] = gname or ""
+    blocks: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        entry = {
+            "startDate": r.start_date.isoformat() if r.start_date else None,
+            "endDate": r.expected_end_date.isoformat() if r.expected_end_date else None,
+            "reason": r.reason,
+            "target_group_id": r.target_group_id,
+            "target_group_name": name_map.get(r.target_group_id, ""),
+        }
+        blocks.setdefault(r.nurse_id, {"inbound_list": []})["inbound_list"].append(entry)
+    return blocks
+
+
+def _overlay_inbound_fields(
+    nurse_dict: Dict[str, Any], row: NurseAssignment
+) -> None:
+    """응답 dict에 target_* 값을 overlay (원본 ORM/nurses 테이블 불변).
+
+    정책: Target 병동 시점에서는 매핑된 모든 컬럼을 assignment.target_* 값으로 교체.
+    target_*가 NULL이어도 NULL 그대로 노출(= nurses.*로 fallback 하지 않음).
+    is_night_nurse만 프론트 호환을 위해 None → [] 처리.
+    """
+    nurse_dict["is_inbound"] = True
+    for src_key, tgt_key in _SOURCE_TO_TARGET_FIELD_MAP.items():
+        nurse_dict[src_key] = getattr(row, tgt_key, None)
+    if nurse_dict.get("is_night_nurse") is None:
+        nurse_dict["is_night_nurse"] = []
