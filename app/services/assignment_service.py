@@ -281,6 +281,7 @@ def create_assignment(
         expected_end_date=req.expected_end_date,
         reason=req.reason,
         status="active",
+        note=req.note,
         target_weekly_off_type=req.target_weekly_off_type,
         target_weekly_off_enabled=req.target_weekly_off_enabled,
         target_weekly_off_weekday=req.target_weekly_off_weekday,
@@ -451,24 +452,55 @@ def update_assignment(
     _old_window = (row.start_date, _effective_end_date(row))
     _old_reason = row.reason
     _old_status = row.status
+    _old_target_gid = row.target_group_id
 
-    # 기간/상태 변경 시 동일 간호사 active 배정과의 겹침 차단 (create_assignment와 동일 정책)
+    # 신규 값(변경 없으면 기존 값) 산정
+    _new_start = req.start_date if req.start_date is not None else row.start_date
+    _new_reason = req.reason if req.reason is not None else row.reason
+    _new_target_gid = (
+        req.target_group_id if req.target_group_id is not None else row.target_group_id
+    )
+
+    # target_group_id 교체: office 경계 재검증 (파견/병동이동만 의미)
+    if (
+        req.target_group_id is not None
+        and req.target_group_id != _old_target_gid
+        and _new_reason in _INBOUND_REASONS
+    ):
+        _assert_target_in_same_office(db, row.office_id, req.target_group_id)
+
+    # 병동이동 체인: reason/start_date 변경 시 체인 검증 재실행
+    if _new_reason == "병동이동" and (
+        req.reason is not None or req.start_date is not None
+    ):
+        _assert_transfer_chain_source(db, row.nurse_id, row.source_group_id)
+
+    # 기간/상태/사유 변경 시 동일 간호사 active 배정과의 겹침 차단
     _period_changed = any(
-        v is not None for v in (req.expected_end_date, req.end_date, req.status)
+        v is not None
+        for v in (req.start_date, req.expected_end_date, req.end_date, req.status)
     )
     _new_status = req.status if req.status is not None else row.status
     if _period_changed and _new_status == "active":
         _new_end = req.end_date if req.end_date is not None else row.end_date
         _new_exp = req.expected_end_date if req.expected_end_date is not None else row.expected_end_date
         _eff_upper = _new_end if _new_end is not None else _new_exp
-        _raise_if_overlap(db, row.nurse_id, row.start_date, _eff_upper, exclude_id=row.id)
+        _raise_if_overlap(db, row.nurse_id, _new_start, _eff_upper, exclude_id=row.id)
 
+    if req.start_date is not None:
+        row.start_date = req.start_date
     if req.expected_end_date is not None:
         row.expected_end_date = req.expected_end_date
     if req.end_date is not None:
         row.end_date = req.end_date
     if req.status is not None:
         row.status = req.status
+    if req.reason is not None:
+        row.reason = req.reason
+    if req.target_group_id is not None:
+        row.target_group_id = req.target_group_id
+    if req.note is not None:
+        row.note = req.note
 
     for _f in (
         "target_weekly_off_type",
@@ -1394,6 +1426,7 @@ def _assignment_summary(a: NurseAssignment) -> dict:
         "target_group_id": a.target_group_id,
         "start_date": a.start_date,
         "end_date": a.end_date or a.expected_end_date,
+        "note": getattr(a, "note", None),
     }
 
 
@@ -1414,6 +1447,7 @@ def _to_response(
         end_date=row.end_date,
         reason=row.reason,
         status=row.status,
+        note=getattr(row, "note", None),
         target_weekly_off_type=row.target_weekly_off_type,
         target_weekly_off_enabled=row.target_weekly_off_enabled,
         target_weekly_off_weekday=row.target_weekly_off_weekday,

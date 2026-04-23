@@ -152,6 +152,7 @@ class NurseAssignment(Base):
     end_date = Column(DATE, nullable=True)
     reason = Column(NVARCHAR(200), nullable=False)
     status = Column(VARCHAR(10), nullable=False, default="active")
+    note = Column(NVARCHAR(1000), nullable=True)
     # target 그룹 전용 설정
     target_weekly_off_type = Column(VARCHAR(20), nullable=True)
     target_weekly_off_enabled = Column(TINYINT, nullable=True)
