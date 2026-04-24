@@ -227,6 +227,42 @@ def _resolve_owner_group_for_date_multi(
     return nurse_home_group
 
 
+def _build_assignment_window(
+    asg: NurseAssignment,
+    direction: str,
+    month_first: date,
+    month_last: date,
+    group_name_map: Dict[str, str],
+) -> Optional["AdjustmentAssignmentWindow"]:
+    """NurseAssignment → AdjustmentAssignmentWindow (해당 월과 겹치지 않으면 None).
+
+    shift-requests / adjustment 양쪽 서비스에서 동일 스키마로 파견 메타데이터를
+    내려주기 위해 공용 헬퍼로 추출.
+    """
+    _start = asg.start_date
+    if _start is None:
+        return None
+    _end = asg.expected_end_date or asg.end_date
+    if _start > month_last:
+        return None
+    if _end is not None and _end < month_first:
+        return None
+    _eff_start = max(_start, month_first)
+    _eff_end = min(_end, month_last) if _end else month_last
+    return AdjustmentAssignmentWindow(
+        reason=asg.reason or "파견",
+        direction=direction,
+        source_group_id=asg.source_group_id or "",
+        source_group_name=group_name_map.get(asg.source_group_id or "", ""),
+        target_group_id=asg.target_group_id or "",
+        target_group_name=group_name_map.get(asg.target_group_id or "", ""),
+        start_date=_start,
+        end_date=_end,
+        period_start_day=_eff_start.day,
+        period_end_day=_eff_end.day,
+    )
+
+
 def _compute_weekly_off_days(
     db: Session,
     nurse_id: str,
@@ -1925,28 +1961,8 @@ def get_wanted_adjustment_service(
     def _build_window(
         asg: NurseAssignment, direction: str
     ) -> Optional[AdjustmentAssignmentWindow]:
-        """assignment → AdjustmentAssignmentWindow (해당 월과 겹치지 않으면 None)."""
-        _start = asg.start_date
-        if _start is None:
-            return None
-        _end = asg.expected_end_date or asg.end_date
-        if _start > _m_last:
-            return None
-        if _end is not None and _end < _m_first:
-            return None
-        _eff_start = max(_start, _m_first)
-        _eff_end = min(_end, _m_last) if _end else _m_last
-        return AdjustmentAssignmentWindow(
-            reason=asg.reason or "파견",
-            direction=direction,
-            source_group_id=asg.source_group_id or "",
-            source_group_name=_group_name_map.get(asg.source_group_id or "", ""),
-            target_group_id=asg.target_group_id or "",
-            target_group_name=_group_name_map.get(asg.target_group_id or "", ""),
-            start_date=_start,
-            end_date=_end,
-            period_start_day=_eff_start.day,
-            period_end_day=_eff_end.day,
+        return _build_assignment_window(
+            asg, direction, _m_first, _m_last, _group_name_map,
         )
 
     nurses = list(source_nurses) + list(inbound_nurses)
@@ -2744,6 +2760,24 @@ def get_shift_requests_service(
     month_str = f"{year:04d}-{month:02d}"
     first_day = date(year, month, 1)
     last_day = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    month_last = last_day - timedelta(days=1)
+
+    # 4-1. group_name 룩업 (파견 메타데이터에 source/target 이름 동봉)
+    _gid_set: Set[str] = {target_group_id}
+    for _asgs in list(inbound_map.values()) + list(outbound_map.values()):
+        for _asg in _asgs:
+            if _asg.source_group_id:
+                _gid_set.add(_asg.source_group_id)
+            if _asg.target_group_id:
+                _gid_set.add(_asg.target_group_id)
+    group_name_map: Dict[str, str] = {}
+    if _gid_set:
+        for gid, gname in (
+            db.query(Group.group_id, Group.group_name)
+            .filter(Group.group_id.in_(list(_gid_set)))
+            .all()
+        ):
+            group_name_map[gid] = gname or ""
 
     # 5. 관할 일자 집합 계산 (일자 단위 필터)
     def _in_window(asg: NurseAssignment, d: date) -> bool:
@@ -2835,11 +2869,26 @@ def get_shift_requests_service(
     results = []
     for nurse_id in nurse_ids:
         wr = submitted_map.get(nurse_id)
+        # 파견 메타데이터 (adjustment 과 동일 스키마)
+        assignments_payload: List[Dict[str, Any]] = []
+        for _asg in inbound_map.get(nurse_id, []):
+            _w = _build_assignment_window(
+                _asg, "inbound", first_day, month_last, group_name_map,
+            )
+            if _w is not None:
+                assignments_payload.append(_w.model_dump(mode="json"))
+        for _asg in outbound_map.get(nurse_id, []):
+            _w = _build_assignment_window(
+                _asg, "outbound", first_day, month_last, group_name_map,
+            )
+            if _w is not None:
+                assignments_payload.append(_w.model_dump(mode="json"))
         results.append({
             "nurse_id": nurse_id,
             "is_submitted": wr is not None,
             "submitted_at": wr.submitted_at.isoformat() if wr and wr.submitted_at else None,
             "shifts": shift_map.get(nurse_id, []),
+            "assignments": assignments_payload,
         })
 
     return results
