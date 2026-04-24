@@ -33,6 +33,7 @@ from schemas.roster_schema import (
     NurseAssignmentCreate,
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
+    NurseAssignmentListResponse,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -41,6 +42,7 @@ from services.assignment_service import (
     update_assignment,
     cancel_assignment,
     get_assignments,
+    get_assignment_status_counts,
     flush_pending_transfers,
     flush_expired_preceptees,
     flush_expired_dispatches,
@@ -941,7 +943,7 @@ async def create_nurse_assignment(
     return create_assignment(req, db, current_user=current_user)
 
 
-@router.get("/assignments", response_model=List[NurseAssignmentResponse])
+@router.get("/assignments", response_model=NurseAssignmentListResponse)
 async def get_nurse_assignments(
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
@@ -951,15 +953,29 @@ async def get_nurse_assignments(
 ):
     """배정 이력 조회.
 
+    응답 구조:
+    - items: 현재 status 필터가 적용된 레코드 목록
+    - counts: 동일 범위 전체의 status 별 카운트 (필터 무관)
+    - total: counts 합계
+    - applied_status: 사용된 status 값
+
     status 기본값은 'active' — cancelled/completed 등 비활성 이력은 기본 미노출.
-    전체 이력이 필요하면 `status=all` 로 명시적으로 호출.
+    전체 이력이 필요하면 `status=all` 로 호출.
     """
     office_id = getattr(current_user, "office_id", None)
     if not office_id:
         raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
     _group = group_id or getattr(current_user, "group_id", None)
     _status = None if status == "all" else status
-    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=_status)
+    items = get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=_status)
+    counts = get_assignment_status_counts(db, office_id, group_id=_group, nurse_id=nurse_id)
+    total = counts.active + counts.completed + counts.cancelled + counts.on_hold
+    return NurseAssignmentListResponse(
+        items=items,
+        counts=counts,
+        total=total,
+        applied_status=status,
+    )
 
 
 @router.put(

@@ -494,7 +494,7 @@ async def get_issued_roster_snapshot(
                 (a for a in _my_a_list if a["reason"] in ("파견", "병동이동") and a.get("target_group_id")),
                 None,
             )
-            # target_group_id → group_name 맵 (inbound_list 표시용, batch 1회 조회)
+            # target_group_id → group_name 맵 (inbound 배지 표시용, batch 1회 조회)
             _tgt_gids = {
                 _a.get("target_group_id")
                 for _al in _assignments.values()
@@ -572,21 +572,18 @@ async def get_issued_roster_snapshot(
                 # 프론트 전달용 assignments 배열 (period_*, target_issued 포함)
                 _assignments_out: list[dict] = []
 
-                # 기존 inbound_list 호환 유지 (프론트 마이그레이션 전까지 dual-write)
-                _nurse["inbound"] = {
-                    "inbound_list": [
-                        {
-                            "startDate": _a["start_date"],
-                            "endDate": _a["end_date"],
-                            "reason": _a["reason"],
-                            "target_group_id": _a.get("target_group_id"),
-                            "target_group_name": _tgid_to_name.get(
-                                _a.get("target_group_id")
-                            ),
-                        }
-                        for _a in _a_list
-                    ]
-                }
+                _nurse["inbound"] = [
+                    {
+                        "startDate": _a["start_date"],
+                        "endDate": _a["end_date"],
+                        "reason": _a["reason"],
+                        "target_group_id": _a.get("target_group_id"),
+                        "target_group_name": _tgid_to_name.get(
+                            _a.get("target_group_id")
+                        ),
+                    }
+                    for _a in _a_list
+                ]
 
                 # 각 assignment별 셀 overlay
                 for _a in _a_list:
@@ -936,7 +933,7 @@ async def get_roster_by_schedule_id(
             (a for a in _my_a_list if a["reason"] in ("파견", "병동이동") and a.get("target_group_id")),
             None,
         )
-        # target_group_id → group_name 맵 (inbound_list 표시용, batch 1회 조회)
+        # target_group_id → group_name 맵 (inbound 배지 표시용, batch 1회 조회)
         _tgt_gids = {
             _a.get("target_group_id")
             for _al in _assignments.values()
@@ -1017,21 +1014,18 @@ async def get_roster_by_schedule_id(
             # 프론트 전달용 assignments 배열 (period_*, target_issued 포함)
             _assignments_out: list[dict] = []
 
-            # 기존 inbound_list 호환 유지 (프론트 마이그레이션 전까지 dual-write)
-            nurse_entry["inbound"] = {
-                "inbound_list": [
-                    {
-                        "startDate": _a["start_date"],
-                        "endDate": _a["end_date"],
-                        "reason": _a["reason"],
-                        "target_group_id": _a.get("target_group_id"),
-                        "target_group_name": _tgid_to_name.get(
-                            _a.get("target_group_id")
-                        ),
-                    }
-                    for _a in _a_list
-                ]
-            }
+            nurse_entry["inbound"] = [
+                {
+                    "startDate": _a["start_date"],
+                    "endDate": _a["end_date"],
+                    "reason": _a["reason"],
+                    "target_group_id": _a.get("target_group_id"),
+                    "target_group_name": _tgid_to_name.get(
+                        _a.get("target_group_id")
+                    ),
+                }
+                for _a in _a_list
+            ]
 
             for _a in _a_list:
                 _a_start = _date.fromisoformat(_a["start_date"])

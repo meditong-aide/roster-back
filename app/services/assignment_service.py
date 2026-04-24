@@ -5,7 +5,7 @@
 """
 
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
 from typing import Optional, Tuple, List
@@ -14,6 +14,7 @@ from schemas.roster_schema import (
     NurseAssignmentCreate,
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
+    AssignmentStatusCounts,
 )
 from schemas.auth_schema import User as UserSchema
 import logging
@@ -671,6 +672,32 @@ def get_assignments(
         nurse_map = {n.nurse_id: n.name for n in nurses}
 
     return [_to_response(r, nurse_map.get(r.nurse_id)) for r in rows]
+
+
+def get_assignment_status_counts(
+    db: Session,
+    office_id: str,
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None,
+) -> AssignmentStatusCounts:
+    """status 필터와 무관한 전체 카운트 집계 (리스트 응답 메타용)."""
+    query = db.query(NurseAssignment.status, func.count(NurseAssignment.id)).filter(
+        NurseAssignment.office_id == office_id
+    )
+    if group_id:
+        query = query.filter(
+            or_(
+                NurseAssignment.source_group_id == group_id,
+                NurseAssignment.target_group_id == group_id,
+            )
+        )
+    if nurse_id:
+        query = query.filter(NurseAssignment.nurse_id == nurse_id)
+    counts = {"active": 0, "completed": 0, "cancelled": 0, "on_hold": 0}
+    for status_val, cnt in query.group_by(NurseAssignment.status).all():
+        if status_val in counts:
+            counts[status_val] = int(cnt)
+    return AssignmentStatusCounts(**counts)
 
 
 def get_active_assignments_for_month(

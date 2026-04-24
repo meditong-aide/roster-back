@@ -350,10 +350,6 @@ class CurrentAssignment(BaseModel):
     note: Optional[str] = Field(default=None, description="assignment별 메모")
 
 
-class InboundBlock(BaseModel):
-    inbound_list: List[InboundEntry] = Field(default_factory=list)
-
-
 class NurseAssignmentPayload(BaseModel):
     """사이드 프로필 업데이트와 함께 전달되는 배정(파견/병동이동/휴직/프리셉티) payload.
 
@@ -446,9 +442,9 @@ class NurseProfile(BaseModel):
         description="호출자 병동이 target(파견/병동이동 수신측)일 때 True",
     )
     # 기간 설정(파견/병동이동/휴직/퇴사/프리셉티) 활성 이력 (source/target 양쪽에서 동일 표시)
-    inbound: Optional["InboundBlock"] = Field(
-        default=None,
-        description="활성 파견/병동이동/휴직/퇴사/프리셉티 이력 블록. 없으면 null",
+    inbound: List["InboundEntry"] = Field(
+        default_factory=list,
+        description="활성 파견/병동이동/휴직/퇴사/프리셉티 이력 배열. 없으면 빈 배열 []",
     )
     # 현재 대표 1건 flat 요약 (프론트 폼 바인딩용)
     current_assignment: Optional["CurrentAssignment"] = Field(
@@ -630,6 +626,19 @@ class FixedWantedEntryResponse(BaseModel):
         from_attributes = True
 
 
+class AdjustmentBlockedDay(BaseModel):
+    """원티드 조정 화면에서 저장/편집 불가로 표시해야 하는 일자 1건.
+
+    reason 값:
+    - "outside_dispatch_window": 파견 인바운드 간호사의 파견기간 밖 일자 (원 소속 담당)
+    - "dispatched_elsewhere": 소속 간호사가 타병동 파견중인 기간
+    """
+
+    day: int = Field(description="1~31, 프론트 컬럼 인덱스 즉시 매칭용")
+    date: date
+    reason: str
+
+
 class AdjustmentNurse(BaseModel):
     """원티드 조정판 - 간호사별 데이터"""
 
@@ -637,9 +646,9 @@ class AdjustmentNurse(BaseModel):
     name: str
     entries: List[FixedWantedEntryResponse]
     monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, "주": 4, ...}
-    # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자 목록.
+    # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자.
     # 프론트는 이 일자를 저장/편집 불가(blocked)로 표기해야 한다.
-    blocked_dates: List[date] = Field(default_factory=list)
+    blocked_days: List[AdjustmentBlockedDay] = Field(default_factory=list)
 
 
 class AdjustmentResponse(BaseModel):
@@ -771,3 +780,27 @@ class NurseAssignmentResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class AssignmentStatusCounts(BaseModel):
+    """assignment status 별 카운트 (필터와 무관한 전체 집계)."""
+
+    active: int = 0
+    completed: int = 0
+    cancelled: int = 0
+    on_hold: int = 0
+
+
+class NurseAssignmentListResponse(BaseModel):
+    """`GET /nurses/assignments` 리스트 응답 래퍼.
+
+    - items: 현재 status 필터가 적용된 실제 레코드 목록
+    - counts: 동일 범위(office/group/nurse)에서 status 별 전체 카운트
+    - total: counts 합계 (필터 무관 전체 건수)
+    - applied_status: 현재 적용된 status 필터 값 ("active" / "all" / 등)
+    """
+
+    items: List[NurseAssignmentResponse]
+    counts: AssignmentStatusCounts
+    total: int = 0
+    applied_status: Optional[str] = None

@@ -563,115 +563,165 @@ def get_my_issued_roster_service(
     if not my_roster:
         return None
 
-    result = {
+    from calendar import monthrange
+    from datetime import date
+    from db.models import Group
+    from services.assignment_service import get_active_assignments_for_month
+
+    days_in_month = monthrange(year, month)[1]
+    m_start = date(year, month, 1)
+    m_end = date(year, month, days_in_month)
+    src_gid = getattr(current_user, "group_id", "") or ""
+    src_group_row = (
+        db.query(Group).filter(Group.group_id == src_gid).first() if src_gid else None
+    )
+    src_group_name = src_group_row.group_name if src_group_row else ""
+
+    shift_colors: dict[str, str] = dict(roster.get("shift_colors") or {})
+    src_cells = my_roster.get("schedule") or []
+    src_ids = my_roster.get("schedule_ids") or []
+
+    def _cell_code(_cell) -> str:
+        if isinstance(_cell, dict):
+            return str(_cell.get("code", "") or "")
+        return str(_cell or "")
+
+    def _cell_color(_cell, _code: str) -> str:
+        if isinstance(_cell, dict) and _cell.get("color"):
+            return str(_cell.get("color") or "")
+        return str(shift_colors.get(_code, "") or "")
+
+    # 일자별 병합 배열 초기화(=source 기준)
+    schedule_days: list[dict] = []
+    for _i in range(days_in_month):
+        _cell = src_cells[_i] if _i < len(src_cells) else None
+        _code = _cell_code(_cell)
+        schedule_days.append({
+            "day": _i + 1,
+            "code": _code,
+            "color": _cell_color(_cell, _code),
+            "schedule_id": (src_ids[_i] if _i < len(src_ids) else None),
+            "group_id": src_gid,
+            "group_name": src_group_name,
+            "is_source": True,
+            "reason": None,
+        })
+
+    # 파견/병동이동: target 근무표 overlay (복수 assignment 지원)
+    assignments = get_active_assignments_for_month(db, src_gid, year, month)
+    my_transfers = [
+        a for a in assignments
+        if a.nurse_id == nurse_id
+        and a.reason in ("파견", "병동이동")
+        and a.source_group_id == src_gid
+        and a.target_group_id
+    ]
+    transfers_out: list[dict] = []
+
+    if my_transfers:
+        _tgt_gids = {a.target_group_id for a in my_transfers}
+        _grows = db.query(Group).filter(Group.group_id.in_(list(_tgt_gids))).all()
+        tgid_to_name = {g.group_id: g.group_name for g in _grows}
+
+        _tgt_cache: dict[str, dict | None] = {}
+
+        def _load_my_target(_tgid: str) -> dict | None:
+            if _tgid in _tgt_cache:
+                return _tgt_cache[_tgid]
+            _snap = get_issued_roster_snapshot_service(
+                year=year, month=month, current_user=current_user, db=db,
+                target_group_id=_tgid,
+            )
+            _out: dict | None = None
+            if _snap:
+                _t_roster = _snap.get("roster") or {}
+                _t_nurses = _t_roster.get("nurses") or []
+                _t_my = next(
+                    (n for n in _t_nurses if str(n.get("nurse_id")) == str(nurse_id)),
+                    None,
+                )
+                if _t_my:
+                    _out = {
+                        "schedule": _t_my.get("schedule") or [],
+                        "schedule_ids": _t_my.get("schedule_ids") or [],
+                        "shift_colors": _t_roster.get("shift_colors") or {},
+                    }
+            _tgt_cache[_tgid] = _out
+            return _out
+
+        for _a in my_transfers:
+            _a_start = _a.start_date
+            _a_end = _a.end_date or _a.expected_end_date
+            _p_start = max(_a_start, m_start).day
+            _p_end = min(_a_end, m_end).day if _a_end else days_in_month
+            _tgid = _a.target_group_id
+            _tgt_name = tgid_to_name.get(_tgid, "")
+            _tgt = _load_my_target(_tgid)
+            _target_issued = _tgt is not None
+
+            if _target_issued:
+                shift_colors.update(_tgt.get("shift_colors") or {})
+                _t_cells = _tgt["schedule"]
+                _t_ids = _tgt["schedule_ids"]
+                for d in range(_p_start, _p_end + 1):
+                    idx = d - 1
+                    if idx >= days_in_month:
+                        break
+                    _t_cell = _t_cells[idx] if idx < len(_t_cells) else None
+                    _code = _cell_code(_t_cell)
+                    schedule_days[idx].update({
+                        "code": _code,
+                        "color": _cell_color(_t_cell, _code),
+                        "schedule_id": (_t_ids[idx] if idx < len(_t_ids) else None),
+                        "group_id": _tgid,
+                        "group_name": _tgt_name,
+                        "is_source": False,
+                        "reason": _a.reason,
+                    })
+            else:
+                for d in range(_p_start, _p_end + 1):
+                    idx = d - 1
+                    if idx >= days_in_month:
+                        break
+                    schedule_days[idx].update({
+                        "schedule_id": None,
+                        "group_id": _tgid,
+                        "group_name": _tgt_name,
+                        "is_source": False,
+                        "reason": _a.reason,
+                    })
+
+            transfers_out.append({
+                "reason": _a.reason,
+                "target_group_id": _tgid,
+                "target_group_name": _tgt_name,
+                "start_date": str(_a_start),
+                "end_date": str(_a_end) if _a_end else None,
+                "period_start_day": _p_start,
+                "period_end_day": _p_end,
+                "target_issued": _target_issued,
+            })
+
+    # counts 최종 재계산
+    counts: dict[str, int] = {code: 0 for code in shift_colors}
+    for _d in schedule_days:
+        _c = _d["code"]
+        if _c:
+            counts[_c] = counts.get(_c, 0) + 1
+
+    return {
         "year": roster.get("year"),
         "month": roster.get("month"),
         "nurse_id": my_roster.get("nurse_id"),
         "name": my_roster.get("name"),
-        "schedule": my_roster.get("schedule"),
-        "schedule_ids": my_roster.get("schedule_ids"),
-        "counts": my_roster.get("counts"),
-        "shift_colors": roster.get("shift_colors") or {},
+        "source_group_id": src_gid,
+        "source_group_name": src_group_name,
         "issued_at": snapshot_data.get("created_at"),
+        "shift_colors": shift_colors,
+        "schedule": schedule_days,
+        "counts": counts,
+        "transfers": transfers_out,
     }
-
-    # 파견/병동이동 간호사: target group 근무표 병합
-    from services.assignment_service import get_active_assignments_for_month
-    from calendar import monthrange
-    assignments = get_active_assignments_for_month(
-        db, current_user.group_id, year, month,
-    )
-    my_transfer = next(
-        (a for a in assignments
-         if a.nurse_id == nurse_id
-         and a.reason in ("파견", "병동이동")
-         and a.source_group_id == current_user.group_id
-         and a.target_group_id),
-        None,
-    )
-    if my_transfer:
-        from calendar import monthrange
-        from datetime import date
-        days_in_month = monthrange(year, month)[1]
-        a_start = my_transfer.start_date
-        a_end = my_transfer.end_date or my_transfer.expected_end_date
-        m_start = date(year, month, 1)
-        m_end = date(year, month, days_in_month)
-        period_start = max(a_start, m_start).day
-        period_end = min(a_end, m_end).day if a_end else days_in_month
-
-        from db.models import Group
-        tgt_group = db.query(Group).filter(
-            Group.group_id == my_transfer.target_group_id
-        ).first()
-
-        target_snapshot = get_issued_roster_snapshot_service(
-            year=year, month=month, current_user=current_user, db=db,
-            target_group_id=my_transfer.target_group_id,
-        )
-        target_issued = False
-        src_schedule = result["schedule"] or []
-        src_ids = result["schedule_ids"] or []
-
-        if target_snapshot:
-            t_roster = target_snapshot.get("roster") or {}
-            t_nurses = t_roster.get("nurses") or []
-            t_my = next(
-                (n for n in t_nurses if str(n.get("nurse_id")) == str(nurse_id)),
-                None,
-            )
-            if t_my:
-                target_issued = True
-                tgt_schedule = t_my.get("schedule") or []
-                tgt_ids = t_my.get("schedule_ids") or []
-
-                for d in range(period_start, period_end + 1):
-                    idx = d - 1
-                    if idx < len(tgt_schedule):
-                        if idx < len(src_schedule):
-                            src_schedule[idx] = tgt_schedule[idx]
-                        if idx < len(src_ids) and idx < len(tgt_ids):
-                            src_ids[idx] = tgt_ids[idx]
-
-                # shift_colors 병합
-                t_colors = t_roster.get("shift_colors") or {}
-                merged_colors = {**result["shift_colors"], **t_colors}
-                result["shift_colors"] = merged_colors
-
-        if not target_issued:
-            # target 미마감: 기존 셀에 reason 필드 추가
-            _reason = my_transfer.reason  # "파견" / "병동이동"
-            for d in range(period_start, period_end + 1):
-                idx = d - 1
-                if idx < len(src_schedule):
-                    _cell = src_schedule[idx]
-                    if isinstance(_cell, dict):
-                        _cell["reason"] = _reason
-                    else:
-                        src_schedule[idx] = {"code": _cell, "reason": _reason}
-                if idx < len(src_ids):
-                    src_ids[idx] = None
-
-        result["schedule"] = src_schedule
-        result["schedule_ids"] = src_ids
-        # counts 재계산
-        result["counts"] = {}
-        for code in (result["shift_colors"] or {}):
-            result["counts"][code] = src_schedule.count(code)
-
-        # transfer 정보 항상 첨부 (미마감 상태 포함)
-        result["transfer"] = {
-            "reason": my_transfer.reason,
-            "target_group_id": my_transfer.target_group_id,
-            "target_group_name": tgt_group.group_name if tgt_group else "",
-            "start_date": str(a_start),
-            "end_date": str(a_end) if a_end else None,
-            "period_start_day": period_start,
-            "period_end_day": period_end,
-            "target_issued": target_issued,
-        }
-
-    return result
 
 
 def create_issued_roster_snapshot(
@@ -846,7 +896,7 @@ def create_issued_roster_snapshot(
                 "active": n.active,
                 "team_id": n.team_id,
                 "is_inbound": n.group_id != group_id,
-                "inbound": _block if _block else None,
+                "inbound": list(_block.get("inbound_list", [])) if _block else [],
             }
         )
 

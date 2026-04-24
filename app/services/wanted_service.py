@@ -38,6 +38,7 @@ from schemas.roster_schema import (
     WantedInvokeRequest,
     FixedWantedCreate,
     FixedWantedEntryCreate,
+    AdjustmentBlockedDay,
     AdjustmentNurse,
     AdjustmentResponse,
     FixedWantedEntryResponse,
@@ -1985,23 +1986,31 @@ def get_wanted_adjustment_service(
                     ))
                 monthly_summary["주"] = len(weekly_off_days)
 
-        # blocked_dates 계산
+        # blocked_days 계산 (프론트에서 day index + reason 을 바로 사용)
         # - inbound (caller == assignment.target_group_id): out-of-period가 blocked
         # - outbound (caller == assignment.source_group_id, target != caller): in-period가 blocked
-        blocked_dates: List[date] = []
+        blocked_days: List[AdjustmentBlockedDay] = []
         if assignment_overlay is not None:
-            _, blocked_dates = _assignment_window_dates(assignment_overlay, year, month)
+            _, _out_dates = _assignment_window_dates(assignment_overlay, year, month)
+            blocked_days = [
+                AdjustmentBlockedDay(day=d.day, date=d, reason="outside_dispatch_window")
+                for d in _out_dates
+            ]
         else:
             outbound_overlay = outbound_map.get(nurse.nurse_id)
             if outbound_overlay is not None:
-                blocked_dates, _ = _assignment_window_dates(outbound_overlay, year, month)
+                _in_dates, _ = _assignment_window_dates(outbound_overlay, year, month)
+                blocked_days = [
+                    AdjustmentBlockedDay(day=d.day, date=d, reason="dispatched_elsewhere")
+                    for d in _in_dates
+                ]
 
         nurse_data_list.append(AdjustmentNurse(
             nurse_id=nurse.nurse_id,
             name=nurse.name,
             entries=entries,
             monthly_summary=dict(monthly_summary),
-            blocked_dates=blocked_dates,
+            blocked_days=blocked_days,
         ))
 
     return AdjustmentResponse(

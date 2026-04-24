@@ -271,10 +271,10 @@ def get_nurses_in_group_service(
             _overlay_inbound_fields(nurse_dict, inbound_row)
         _inbound_block = inbound_blocks.get(nurse.nurse_id)
         if _inbound_block:
-            nurse_dict["inbound"] = {"inbound_list": _inbound_block.get("inbound_list", [])}
+            nurse_dict["inbound"] = list(_inbound_block.get("inbound_list", []))
             nurse_dict["current_assignment"] = _inbound_block.get("current_assignment")
         else:
-            nurse_dict["inbound"] = None
+            nurse_dict["inbound"] = []
             nurse_dict["current_assignment"] = None
         result.append(nurse_dict)
 
