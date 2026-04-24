@@ -945,16 +945,21 @@ async def create_nurse_assignment(
 async def get_nurse_assignments(
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[str] = "active",
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정 이력 조회"""
+    """배정 이력 조회.
+
+    status 기본값은 'active' — cancelled/completed 등 비활성 이력은 기본 미노출.
+    전체 이력이 필요하면 `status=all` 로 명시적으로 호출.
+    """
     office_id = getattr(current_user, "office_id", None)
     if not office_id:
         raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
     _group = group_id or getattr(current_user, "group_id", None)
-    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
+    _status = None if status == "all" else status
+    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=_status)
 
 
 @router.put(

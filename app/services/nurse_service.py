@@ -1153,8 +1153,27 @@ def update_nurse_profile_service(
     return {"message": "간호사 정보가 성공적으로 수정되었습니다.", "nurse_id": nurse_id}
 
 
+_DISPATCH_REASON_ALIASES: frozenset[str] = frozenset({"파견", "병동이동", "부서이동"})
+
+
+def _sanitize_resignation_fields(fields: Dict[str, Any]) -> None:
+    """파견/병동이동 reason이 들어오면 resignation_* 3종을 null로 강제.
+
+    파견·병동이동은 진짜 퇴사 사유가 아니라 nurse_assignment로만 추적해야 한다.
+    프론트 구버전·엑셀 업로드·벌크 업데이트 등 다른 경로로 endDate가 새어들어
+    nurses.resignation_date 로 저장되면 _active_range_in_month가 active 구간을 잘라
+    해당 월 근무표 전체가 블랭크가 되는 회귀를 유발한다(443 이슈).
+    """
+    reason = fields.get("resignation_reason")
+    if isinstance(reason, str) and reason.strip() in _DISPATCH_REASON_ALIASES:
+        fields["resignation_reason"] = None
+        fields["resignation_date"] = None
+        fields["resignation_reason_memo"] = None
+
+
 def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> None:
     """Source 모드 nurses.* 직접 저장 (update_nurse_profile_service 전용 분리)"""
+    _sanitize_resignation_fields(fields)
     for key, value in fields.items():
         if hasattr(nurse, key):
             setattr(nurse, key, value)

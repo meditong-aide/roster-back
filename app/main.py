@@ -68,6 +68,7 @@ async def _daily_flush_scheduler():
                 flush_all_pending_transfers,
                 flush_expired_preceptees,
                 flush_expired_dispatches,
+                flush_expired_leaves,
             )
             from services.nurse_service import flush_resigned_nurses
             count = flush_all_pending_transfers(db)
@@ -79,6 +80,9 @@ async def _daily_flush_scheduler():
             disp_count = flush_expired_dispatches(db)
             if disp_count > 0:
                 _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
+            leave_count = flush_expired_leaves(db)
+            if leave_count > 0:
+                _scheduler_logger.info("[Scheduler] 휴직 자동 디엑티브: %d건", leave_count)
             res_count = flush_resigned_nurses(db)
             if res_count > 0:
                 _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)

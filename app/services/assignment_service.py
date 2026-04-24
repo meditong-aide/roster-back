@@ -983,6 +983,36 @@ def flush_expired_dispatches(db: Session) -> int:
     return len(rows)
 
 
+def flush_expired_leaves(db: Session) -> int:
+    """휴직 만료 자동 디엑티브 (스케줄러용).
+
+    조건: reason='휴직' AND status='active' AND expected_end_date < today
+    처리: status='completed', end_date=expected_end_date.
+    Returns: 처리된 건수
+    """
+    today = date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.reason == "휴직",
+            NurseAssignment.status == "active",
+            NurseAssignment.expected_end_date.isnot(None),
+            NurseAssignment.expected_end_date < today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    for row in rows:
+        row.status = "completed"
+        row.end_date = row.expected_end_date
+
+    db.commit()
+    logger.info("[Scheduler] 휴직 자동 디엑티브 %d건", len(rows))
+    return len(rows)
+
+
 def transfer_shifts_on_publish(
     db: Session,
     schedule_id: str,
@@ -1414,13 +1444,18 @@ def get_roster_assignments(
     year: int,
     month: int,
 ) -> dict[str, list[dict]]:
-    """근무표 응답용 파견/병동이동 assignment 메타데이터.
+    """근무표 응답용 파견/병동이동/휴직/퇴사 assignment 메타데이터.
 
-    해당 group이 source인 assignment만 반환 (source group 근무표에서 미표기 처리용).
+    해당 group이 source인 assignment + 해당 월 퇴사자 synthetic entry.
     Returns: {nurse_id: [{reason, target_group_id, target_group_name, start_date, end_date}]}
     간호사당 복수 assignment 지원.
     """
-    from db.models import Group
+    from calendar import monthrange
+
+    _days = monthrange(year, month)[1]
+    _m_start = date(year, month, 1)
+    _m_end = date(year, month, _days)
+    _DISPATCH_REASON_ALIASES = frozenset({"파견", "병동이동", "부서이동"})
 
     assignments = get_active_assignments_for_month(db, group_id, year, month)
     eligible = [
@@ -1428,7 +1463,24 @@ def get_roster_assignments(
         if a.reason in ("파견", "병동이동", "휴직")
         and a.source_group_id == group_id
     ]
-    if not eligible:
+
+    # 해당 월 퇴사자 (nurses.resignation_date 기반 synthetic entry)
+    _resigning_all = (
+        db.query(NurseModel)
+        .filter(
+            NurseModel.group_id == group_id,
+            NurseModel.resignation_date.isnot(None),
+            NurseModel.resignation_date >= _m_start,
+            NurseModel.resignation_date <= _m_end,
+        )
+        .all()
+    )
+    _resigning = [
+        n for n in _resigning_all
+        if (n.resignation_reason or "").strip() not in _DISPATCH_REASON_ALIASES
+    ]
+
+    if not eligible and not _resigning:
         return {}
 
     target_gids = {a.target_group_id for a in eligible if a.target_group_id}
@@ -1447,6 +1499,15 @@ def get_roster_assignments(
             "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
         }
         result.setdefault(a.nurse_id, []).append(entry)
+    for n in _resigning:
+        # 퇴사일 당일부터 월말까지 블랭크 (프론트 배지/기간바 용)
+        result.setdefault(n.nurse_id, []).append({
+            "reason": "퇴사",
+            "target_group_id": "",
+            "target_group_name": "",
+            "start_date": str(n.resignation_date),
+            "end_date": None,
+        })
     return result
 
 
