@@ -639,6 +639,30 @@ class AdjustmentBlockedDay(BaseModel):
     reason: str
 
 
+class AdjustmentAssignmentWindow(BaseModel):
+    """간호사의 파견/병동이동 기간 1건 (조회 병동 기준 방향 포함).
+
+    프론트는 이 정보를 이용해 월 그리드에 파견/이동 구간을 표기한다.
+    """
+
+    reason: str = Field(description='"파견" | "병동이동"')
+    direction: str = Field(
+        description='caller 기준 방향. "inbound"(caller==target) | "outbound"(caller==source)'
+    )
+    source_group_id: str
+    source_group_name: str
+    target_group_id: str
+    target_group_name: str
+    start_date: date
+    end_date: Optional[date] = None
+    period_start_day: Optional[int] = Field(
+        default=None, description="해당 월 가시 구간 시작 일자(1~말일)"
+    )
+    period_end_day: Optional[int] = Field(
+        default=None, description="해당 월 가시 구간 종료 일자(1~말일)"
+    )
+
+
 class AdjustmentNurse(BaseModel):
     """원티드 조정판 - 간호사별 데이터"""
 
@@ -649,6 +673,8 @@ class AdjustmentNurse(BaseModel):
     # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자.
     # 프론트는 이 일자를 저장/편집 불가(blocked)로 표기해야 한다.
     blocked_days: List[AdjustmentBlockedDay] = Field(default_factory=list)
+    # 해당 간호사의 활성 파견/병동이동 구간 (inbound/outbound 양쪽 포함).
+    assignments: List[AdjustmentAssignmentWindow] = Field(default_factory=list)
 
 
 class AdjustmentResponse(BaseModel):

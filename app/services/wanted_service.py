@@ -39,6 +39,7 @@ from schemas.roster_schema import (
     FixedWantedCreate,
     FixedWantedEntryCreate,
     AdjustmentBlockedDay,
+    AdjustmentAssignmentWindow,
     AdjustmentNurse,
     AdjustmentResponse,
     FixedWantedEntryResponse,
@@ -202,6 +203,28 @@ def _resolve_owner_group_for_date(
     if in_period:
         return assignment.target_group_id or nurse_home_group
     return assignment.source_group_id or nurse_home_group
+
+
+def _resolve_owner_group_for_date_multi(
+    nurse_home_group: Optional[str],
+    assignments: List[NurseAssignment],
+    target_date: date,
+) -> Optional[str]:
+    """다수 assignments(병렬 파견 허용) 중 주어진 일자를 커버하는 첫 match 채택.
+
+    중첩 파견은 금지 정책이므로 같은 일자를 커버하는 assignment 는 최대 1개로 간주.
+    커버하는 assignment 가 없으면 nurse_home_group 반환.
+    """
+    for asg in assignments:
+        if asg.start_date is None:
+            continue
+        end = asg.expected_end_date or asg.end_date
+        if target_date < asg.start_date:
+            continue
+        if end is not None and target_date > end:
+            continue
+        return asg.target_group_id or nurse_home_group
+    return nurse_home_group
 
 
 def _compute_weekly_off_days(
@@ -1832,13 +1855,6 @@ def get_wanted_adjustment_service(
     start_date = date(year, month, 1)
     end_date = date(year, month + 1, 1) if month < 12 else date(year + 1, 1, 1)
 
-    # caller 병동 기준 FixedWantedEntry 존재 여부 (UI 모드 플래그용)
-    fixed_entries_exist = db.query(FixedWantedEntry).filter(
-        FixedWantedEntry.group_id == group_id,
-        FixedWantedEntry.year == year,
-        FixedWantedEntry.month == month,
-    ).first() is not None
-
     # 그룹 내 간호사 목록 (source 소속)
     source_nurses = db.query(Nurse).filter(
         Nurse.group_id == group_id,
@@ -1846,7 +1862,7 @@ def get_wanted_adjustment_service(
     ).order_by(Nurse.sequence).all()
     source_id_set = {n.nurse_id for n in source_nurses}
 
-    # Inbound 간호사 병합 (파견/병동이동 target=caller)
+    # Inbound 간호사 병합 (파견/병동이동 target=caller) — multi-dispatch list
     inbound_rows = (
         db.query(NurseAssignment)
         .filter(
@@ -1857,9 +1873,9 @@ def get_wanted_adjustment_service(
         .order_by(NurseAssignment.start_date.desc())
         .all()
     )
-    inbound_map: Dict[str, NurseAssignment] = {}
+    inbound_map: Dict[str, List[NurseAssignment]] = defaultdict(list)
     for row in inbound_rows:
-        inbound_map.setdefault(row.nurse_id, row)
+        inbound_map[row.nurse_id].append(row)
 
     additional_ids = [nid for nid in inbound_map.keys() if nid not in source_id_set]
     inbound_nurses: List[Nurse] = []
@@ -1869,7 +1885,7 @@ def get_wanted_adjustment_service(
             Nurse.active == 1,
         ).order_by(Nurse.sequence).all()
 
-    # Outbound assignment (source=caller, target!=caller) — 소속 간호사의 파견 나간 기간 blocked 용
+    # Outbound assignment (source=caller, target!=caller) — 병렬 파견 지원 (multi-dispatch list)
     outbound_rows = (
         db.query(NurseAssignment)
         .filter(
@@ -1881,27 +1897,132 @@ def get_wanted_adjustment_service(
         .order_by(NurseAssignment.start_date.desc())
         .all()
     )
-    outbound_map: Dict[str, NurseAssignment] = {}
+    outbound_map: Dict[str, List[NurseAssignment]] = defaultdict(list)
     for row in outbound_rows:
-        outbound_map.setdefault(row.nurse_id, row)
+        outbound_map[row.nurse_id].append(row)
+
+    # assignment 노출용 group_name 룩업 (source/target 모두 포함)
+    _gid_set: Set[str] = {group_id}
+    for _asgs in list(inbound_map.values()) + list(outbound_map.values()):
+        for _asg in _asgs:
+            if _asg.source_group_id:
+                _gid_set.add(_asg.source_group_id)
+            if _asg.target_group_id:
+                _gid_set.add(_asg.target_group_id)
+    _group_name_map: Dict[str, str] = {}
+    if _gid_set:
+        for gid, gname in (
+            db.query(Group.group_id, Group.group_name)
+            .filter(Group.group_id.in_(list(_gid_set)))
+            .all()
+        ):
+            _group_name_map[gid] = gname or ""
+
+    _month_days = _iter_month_days(year, month)
+    _m_first = _month_days[0]
+    _m_last = _month_days[-1]
+
+    def _build_window(
+        asg: NurseAssignment, direction: str
+    ) -> Optional[AdjustmentAssignmentWindow]:
+        """assignment → AdjustmentAssignmentWindow (해당 월과 겹치지 않으면 None)."""
+        _start = asg.start_date
+        if _start is None:
+            return None
+        _end = asg.expected_end_date or asg.end_date
+        if _start > _m_last:
+            return None
+        if _end is not None and _end < _m_first:
+            return None
+        _eff_start = max(_start, _m_first)
+        _eff_end = min(_end, _m_last) if _end else _m_last
+        return AdjustmentAssignmentWindow(
+            reason=asg.reason or "파견",
+            direction=direction,
+            source_group_id=asg.source_group_id or "",
+            source_group_name=_group_name_map.get(asg.source_group_id or "", ""),
+            target_group_id=asg.target_group_id or "",
+            target_group_name=_group_name_map.get(asg.target_group_id or "", ""),
+            start_date=_start,
+            end_date=_end,
+            period_start_day=_eff_start.day,
+            period_end_day=_eff_end.day,
+        )
 
     nurses = list(source_nurses) + list(inbound_nurses)
     nurse_data_list: List[AdjustmentNurse] = []
+    # caller 관할(stored group_id 불문) FixedWantedEntry 존재 여부 (UI 모드 플래그).
+    # target caller 가 source 저장 엔트리를 상속받는 케이스 포함.
+    fixed_entries_exist = False
 
     for nurse in nurses:
-        assignment_overlay = inbound_map.get(nurse.nurse_id)
+        _inbound_asgs = inbound_map.get(nurse.nurse_id, [])
+        _outbound_asgs = outbound_map.get(nurse.nurse_id, [])
+        # overlay: weekly-off 계산 시 대표 1건이 필요해 최신 inbound 우선.
+        assignment_overlay = _inbound_asgs[0] if _inbound_asgs else None
+
+        # blocked_days 선계산 (entries 필터·주휴 절단에 재사용)
+        # - inbound(caller == target): 모든 inbound 창 UNION 밖 일자가 blocked
+        # - outbound(caller == source): 모든 outbound 창 UNION 안 일자가 blocked
+        blocked_days: List[AdjustmentBlockedDay] = []
+        blocked_set: Set[date] = set()
+        if _inbound_asgs:
+            _valid: Set[date] = set()
+            for _asg in _inbound_asgs:
+                _in, _ = _assignment_window_dates(_asg, year, month)
+                _valid.update(_in)
+            _out_dates = [d for d in _month_days if d not in _valid]
+            blocked_days = [
+                AdjustmentBlockedDay(day=d.day, date=d, reason="outside_dispatch_window")
+                for d in _out_dates
+            ]
+            blocked_set = set(_out_dates)
+        elif _outbound_asgs:
+            _blocked_in: Set[date] = set()
+            for _asg in _outbound_asgs:
+                _in, _ = _assignment_window_dates(_asg, year, month)
+                _blocked_in.update(_in)
+            blocked_days = [
+                AdjustmentBlockedDay(day=d.day, date=d, reason="dispatched_elsewhere")
+                for d in sorted(_blocked_in)
+            ]
+            blocked_set = _blocked_in
+
+        # AdjustmentAssignmentWindow 목록 (프론트 기간바 표시용)
+        assignment_windows: List[AdjustmentAssignmentWindow] = []
+        for _asg in _inbound_asgs:
+            _w = _build_window(_asg, "inbound")
+            if _w is not None:
+                assignment_windows.append(_w)
+        for _asg in _outbound_asgs:
+            _w = _build_window(_asg, "outbound")
+            if _w is not None:
+                assignment_windows.append(_w)
+
         entries: List[FixedWantedEntryResponse] = []
         monthly_summary: Dict[str, int] = defaultdict(int)
 
-        # 해당 간호사의 FixedWantedEntry (group_id 무관, source/target 전체 병합)
+        # FixedWantedEntry: stored group_id 불문, shift_date 기준 caller 관할 일자만 노출.
+        # - blocked_set 으로 caller 관할 외 일자 제외.
+        # - 동일 (nurse_id, shift_date) 중복은 최신 id 우선 (target-saved > 구 source-saved).
         nurse_fixed_entries = db.query(FixedWantedEntry).filter(
             FixedWantedEntry.nurse_id == nurse.nurse_id,
             FixedWantedEntry.year == year,
             FixedWantedEntry.month == month,
         ).all()
 
-        if nurse_fixed_entries:
-            for fe in nurse_fixed_entries:
+        _by_date: Dict[date, FixedWantedEntry] = {}
+        for fe in nurse_fixed_entries:
+            if fe.shift_date in blocked_set:
+                continue
+            existing = _by_date.get(fe.shift_date)
+            if existing is None or (fe.id or 0) > (existing.id or 0):
+                _by_date[fe.shift_date] = fe
+        _kept_entries = list(_by_date.values())
+
+        if _kept_entries:
+            fixed_entries_exist = True
+            for fe in _kept_entries:
                 entries.append(FixedWantedEntryResponse(
                     id=fe.id,
                     group_id=fe.group_id,
@@ -1921,7 +2042,9 @@ def get_wanted_adjustment_service(
                 if fe.is_applied:
                     monthly_summary[fe.shift_id] += 1
         else:
-            # NurseShiftRequest fallback (최종 request_id 기준 제출 여부 확인)
+            # NurseShiftRequest fallback (최종 request_id 기준 제출 여부 확인).
+            # caller 소유 일자만 반환(blocked_set 제외) — 파견 기간에 대한 제출은
+            # source caller 조회에서, 원소속 기간은 target caller 조회에서 각각 제거.
             latest_wr = db.query(WantedRequest).filter(
                 WantedRequest.nurse_id == nurse.nurse_id,
                 WantedRequest.month == month_str,
@@ -1936,6 +2059,8 @@ def get_wanted_adjustment_service(
                 ).all()
 
                 for idx, sr in enumerate(shift_requests):
+                    if sr.shift_date in blocked_set:
+                        continue
                     entries.append(FixedWantedEntryResponse(
                         id=idx,  # 임시 ID (아직 FixedWantedEntry에 저장 전)
                         group_id=group_id,
@@ -1961,11 +2086,16 @@ def get_wanted_adjustment_service(
             weekly_off_enabled = getattr(nurse, "weekly_off_enabled", False) or False
         weekly_off_days: List[int] = []
         if weekly_off_enabled:
-            weekly_off_days = sorted(_compute_weekly_off_days(
+            # outbound 케이스: nurse.weekly_off 가 활성이어도 파견 기간(blocked_set)은
+            # 타 병동 관할이라 source caller 에서 주휴를 드러내면 안 됨.
+            _raw_wo_days = sorted(_compute_weekly_off_days(
                 db, nurse.nurse_id, group_id, year, month,
                 assignment_overlay=assignment_overlay,
             ))
-            # 주휴 일자를 entries에 추가 (source_type: "weekly_off")
+            weekly_off_days = [
+                day for day in _raw_wo_days
+                if date(year, month, day) not in blocked_set
+            ]
             if weekly_off_days:
                 for day in weekly_off_days:
                     weekly_off_date = date(year, month, day)
@@ -1986,31 +2116,13 @@ def get_wanted_adjustment_service(
                     ))
                 monthly_summary["주"] = len(weekly_off_days)
 
-        # blocked_days 계산 (프론트에서 day index + reason 을 바로 사용)
-        # - inbound (caller == assignment.target_group_id): out-of-period가 blocked
-        # - outbound (caller == assignment.source_group_id, target != caller): in-period가 blocked
-        blocked_days: List[AdjustmentBlockedDay] = []
-        if assignment_overlay is not None:
-            _, _out_dates = _assignment_window_dates(assignment_overlay, year, month)
-            blocked_days = [
-                AdjustmentBlockedDay(day=d.day, date=d, reason="outside_dispatch_window")
-                for d in _out_dates
-            ]
-        else:
-            outbound_overlay = outbound_map.get(nurse.nurse_id)
-            if outbound_overlay is not None:
-                _in_dates, _ = _assignment_window_dates(outbound_overlay, year, month)
-                blocked_days = [
-                    AdjustmentBlockedDay(day=d.day, date=d, reason="dispatched_elsewhere")
-                    for d in _in_dates
-                ]
-
         nurse_data_list.append(AdjustmentNurse(
             nurse_id=nurse.nurse_id,
             name=nurse.name,
             entries=entries,
             monthly_summary=dict(monthly_summary),
             blocked_days=blocked_days,
+            assignments=assignment_windows,
         ))
 
     return AdjustmentResponse(
@@ -2022,7 +2134,7 @@ def get_wanted_adjustment_service(
 def _collect_assignment_map_for_nurses(
     db: Session, nurse_ids: List[str]
 ) -> Dict[str, NurseAssignment]:
-    """간호사별 최신 활성 파견/병동이동 assignment 맵."""
+    """간호사별 최신 활성 파견/병동이동 assignment 맵 (scalar, multi-dispatch 미지원)."""
     if not nurse_ids:
         return {}
     rows = (
@@ -2039,6 +2151,31 @@ def _collect_assignment_map_for_nurses(
     for row in rows:
         assignment_map.setdefault(row.nurse_id, row)
     return assignment_map
+
+
+def _collect_assignment_list_map_for_nurses(
+    db: Session, nurse_ids: List[str]
+) -> Dict[str, List[NurseAssignment]]:
+    """간호사별 활성 파견/병동이동 assignment 리스트 맵 (multi-dispatch 지원).
+
+    한 간호사가 병렬로 여러 병동에 파견된 경우를 대비해 scalar 맵과 분리.
+    """
+    if not nurse_ids:
+        return {}
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id.in_(nurse_ids),
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .all()
+    )
+    result: Dict[str, List[NurseAssignment]] = defaultdict(list)
+    for row in rows:
+        result[row.nurse_id].append(row)
+    return result
 
 
 def _build_original_shift_map(
@@ -2421,6 +2558,87 @@ def reset_fixed_wanted_service(
     return get_wanted_adjustment_service(db, group_id, year, month)
 
 
+def _filter_entries_by_caller_ownership(
+    db: Session,
+    entries: List[FixedWantedEntry],
+    caller_group_id: str,
+) -> List[FixedWantedEntry]:
+    """stored group_id 와 무관하게 shift_date 기준 실 ownership 이
+    caller 인 엔트리만 유지한다 (multi-dispatch 지원).
+    """
+    if not entries:
+        return entries
+    nurse_ids = list({e.nurse_id for e in entries})
+    if not nurse_ids:
+        return entries
+    nurse_home: Dict[str, Optional[str]] = {
+        nid: gid
+        for nid, gid in (
+            db.query(Nurse.nurse_id, Nurse.group_id)
+            .filter(Nurse.nurse_id.in_(nurse_ids))
+            .all()
+        )
+    }
+    assignment_list_map = _collect_assignment_list_map_for_nurses(db, nurse_ids)
+    kept: List[FixedWantedEntry] = []
+    for entry in entries:
+        owner = _resolve_owner_group_for_date_multi(
+            nurse_home_group=nurse_home.get(entry.nurse_id),
+            assignments=assignment_list_map.get(entry.nurse_id, []),
+            target_date=entry.shift_date,
+        )
+        if owner == caller_group_id:
+            kept.append(entry)
+    return kept
+
+
+def _fetch_caller_owned_entries(
+    db: Session,
+    caller_group_id: str,
+    year: int,
+    month: int,
+    only_applied: bool = False,
+) -> List[FixedWantedEntry]:
+    """caller 관할(shift_date 기준) 확정 원티드 엔트리 조회.
+
+    - 소속 간호사 + inbound 간호사(=caller 가 target 인 활성 assignment)의
+      해당 월 모든 엔트리를 stored group_id 불문 조회.
+    - shift_date 기준 owner==caller 인 엔트리만 유지.
+    - (nurse_id, shift_date) 기준 최신 id 우선으로 dedup (target 저장 entry 우선).
+    """
+    source_nurse_ids = {
+        nid for (nid,) in db.query(Nurse.nurse_id).filter(
+            Nurse.group_id == caller_group_id,
+            Nurse.active == 1,
+        ).all()
+    }
+    inbound_rows = db.query(NurseAssignment.nurse_id).filter(
+        NurseAssignment.target_group_id == caller_group_id,
+        NurseAssignment.status == "active",
+        NurseAssignment.reason.in_(_INBOUND_REASONS),
+    ).all()
+    inbound_nurse_ids = {r[0] for r in inbound_rows}
+    relevant = source_nurse_ids | inbound_nurse_ids
+    if not relevant:
+        return []
+    q = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.nurse_id.in_(list(relevant)),
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
+    )
+    if only_applied:
+        q = q.filter(FixedWantedEntry.is_applied == True)  # noqa: E712
+    raw_entries = q.all()
+    filtered = _filter_entries_by_caller_ownership(db, raw_entries, caller_group_id)
+    by_key: Dict[Tuple[str, date], FixedWantedEntry] = {}
+    for fe in filtered:
+        key = (fe.nurse_id, fe.shift_date)
+        existing = by_key.get(key)
+        if existing is None or (fe.id or 0) > (existing.id or 0):
+            by_key[key] = fe
+    return list(by_key.values())
+
+
 def get_fixed_wanted_for_roster_service(
     db: Session,
     group_id: str,
@@ -2430,13 +2648,11 @@ def get_fixed_wanted_for_roster_service(
     """
     근무표 생성용 확정 원티드 조회 서비스 (단일 테이블 구조)
     - is_applied=True인 항목만 반환
+    - caller 관할(shift_date 기준) 엔트리만 포함. stored group_id 불문.
     """
-    entries = db.query(FixedWantedEntry).filter(
-        FixedWantedEntry.group_id == group_id,
-        FixedWantedEntry.year == year,
-        FixedWantedEntry.month == month,
-        FixedWantedEntry.is_applied == True,
-    ).all()
+    entries = _fetch_caller_owned_entries(
+        db, group_id, year, month, only_applied=True,
+    )
 
     result = []
     for entry in entries:
@@ -2460,13 +2676,12 @@ def get_fixed_wanted_entries_service(
     month: int,
 ) -> List[FixedWantedEntry]:
     """
-    확정 원티드 엔트리 목록 조회 서비스 (단일 테이블 구조)
+    확정 원티드 엔트리 목록 조회 서비스 (단일 테이블 구조).
+    caller 관할(shift_date 기준) 엔트리만 포함. stored group_id 불문.
     """
-    return db.query(FixedWantedEntry).filter(
-        FixedWantedEntry.group_id == group_id,
-        FixedWantedEntry.year == year,
-        FixedWantedEntry.month == month,
-    ).all()
+    return _fetch_caller_owned_entries(
+        db, group_id, year, month, only_applied=False,
+    )
 
 
 def get_shift_requests_service(
@@ -2476,11 +2691,53 @@ def get_shift_requests_service(
     month: int,
     shift_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """해당 년/월 그룹 내 전체 간호사의 원티드 제출 여부 + shift 내역 반환"""
-    nurse_ids = [
+    """해당 년/월 caller(target_group_id) 관할 간호사의 원티드 제출 여부 + shift 내역.
+
+    관할 산정:
+    - source 간호사(home == target_group_id): outbound 파견 기간 일자는 제외.
+    - inbound 간호사(다른 병동 소속이나 target_group_id 로 파견): inbound 파견
+      기간 일자만 포함.
+    """
+    # 1. source 간호사 (home == target_group_id)
+    source_ids: List[str] = [
         n[0] for n in
         db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     ]
+    source_id_set = set(source_ids)
+
+    # 2. inbound assignment (target == target_group_id) — multi-dispatch list
+    inbound_rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.target_group_id == target_group_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .all()
+    )
+    inbound_map: Dict[str, List[NurseAssignment]] = defaultdict(list)
+    for row in inbound_rows:
+        inbound_map[row.nurse_id].append(row)
+
+    # 3. outbound assignment (source == target_group_id, target != target_group_id)
+    outbound_rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.source_group_id == target_group_id,
+            NurseAssignment.target_group_id != target_group_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .all()
+    )
+    outbound_map: Dict[str, List[NurseAssignment]] = defaultdict(list)
+    for row in outbound_rows:
+        outbound_map[row.nurse_id].append(row)
+
+    # 4. 병합 간호사 ID (source ∪ inbound)
+    inbound_only_ids = [nid for nid in inbound_map.keys() if nid not in source_id_set]
+    nurse_ids: List[str] = list(source_ids) + inbound_only_ids
     if not nurse_ids:
         return []
 
@@ -2488,7 +2745,45 @@ def get_shift_requests_service(
     first_day = date(year, month, 1)
     last_day = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
 
-    # 제출 현황 일괄 조회 (is_submitted=True인 최신 request_id만)
+    # 5. 관할 일자 집합 계산 (일자 단위 필터)
+    def _in_window(asg: NurseAssignment, d: date) -> bool:
+        if asg.start_date is None or d < asg.start_date:
+            return False
+        end = asg.expected_end_date or asg.end_date
+        if end is not None and d > end:
+            return False
+        return True
+
+    allowed_dates: Dict[str, Set[date]] = {}
+    _month_days: List[date] = []
+    _cursor = first_day
+    while _cursor < last_day:
+        _month_days.append(_cursor)
+        _cursor = _cursor + timedelta(days=1)
+    for nid in nurse_ids:
+        if nid in source_id_set:
+            # source: outbound 파견 기간 제외
+            _outs = outbound_map.get(nid, [])
+            if not _outs:
+                allowed_dates[nid] = set(_month_days)
+            else:
+                _blocked: Set[date] = set()
+                for asg in _outs:
+                    for d in _month_days:
+                        if _in_window(asg, d):
+                            _blocked.add(d)
+                allowed_dates[nid] = {d for d in _month_days if d not in _blocked}
+        else:
+            # inbound: inbound 파견 기간만 포함
+            _ins = inbound_map.get(nid, [])
+            _valid: Set[date] = set()
+            for asg in _ins:
+                for d in _month_days:
+                    if _in_window(asg, d):
+                        _valid.add(d)
+            allowed_dates[nid] = _valid
+
+    # 6. 제출 현황 일괄 조회 (is_submitted=True인 최신 request_id만)
     submitted_requests = (
         db.query(WantedRequest)
         .filter(
@@ -2500,7 +2795,7 @@ def get_shift_requests_service(
     )
     submitted_map = {wr.nurse_id: wr for wr in submitted_requests}
 
-    # 제출된 간호사의 (nurse_id, request_id) 쌍으로 shift 필터
+    # 7. 제출된 간호사의 (nurse_id, request_id) 쌍으로 shift 필터
     submitted_pairs = [
         (wr.nurse_id, wr.request_id) for wr in submitted_requests
     ]
@@ -2525,6 +2820,10 @@ def get_shift_requests_service(
         shift_rows = shift_query.all()
 
         for row in shift_rows:
+            # 일자 단위 관할 필터 — caller 관할 외 일자는 제외
+            _allowed = allowed_dates.get(row.nurse_id)
+            if _allowed is None or row.shift_date not in _allowed:
+                continue
             shift_map.setdefault(row.nurse_id, []).append({
                 "shift_date": row.shift_date.isoformat(),
                 "shift": row.shift,

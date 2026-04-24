@@ -912,28 +912,19 @@ async def get_roster_by_schedule_id(
     # print('roster_data', roster_data['nurses'])
     roster_data["violations"] = violations
 
-    # 파견/병동이동 assignment 메타데이터 추가 + schedule 치환
+    # 파견/병동이동 assignment 메타데이터 + 현재 병동 관할 외 일자 마스킹
     from services.assignment_service import get_roster_assignments
     _assignments = get_roster_assignments(
         db, group_id=target_group_id, year=schedule.year, month=schedule.month,
     )
     roster_data["assignments"] = _assignments
     if _assignments:
-        # reason color는 프론트에서 처리 — shift_colors에 추가하지 않음
         from datetime import date as _date
         from calendar import monthrange as _mr
         _days = _mr(schedule.year, schedule.month)[1]
         _m_start = _date(schedule.year, schedule.month, 1)
         _m_end = _date(schedule.year, schedule.month, _days)
-        # 본인이 파견/병동이동 대상자일 때 target schedule 조회 (본인 행 병합용)
-        _my_nid = getattr(current_user, "nurse_id", None)
-        _my_a_list = _assignments.get(_my_nid, []) if _my_nid else []
-        _my_target_entries = {}
-        _my_tgt_a = next(
-            (a for a in _my_a_list if a["reason"] in ("파견", "병동이동") and a.get("target_group_id")),
-            None,
-        )
-        # target_group_id → group_name 맵 (inbound 배지 표시용, batch 1회 조회)
+        # target_group_id → group_name 맵 (inbound 배지 표시용, batch 1회)
         _tgt_gids = {
             _a.get("target_group_id")
             for _al in _assignments.values()
@@ -964,45 +955,17 @@ async def get_roster_by_schedule_id(
                 .all()
             )
             _tgid_issued = {r[0]: True for r in _issued_rows}
-        # target_group_id → {nurse_id → {day → (shift_id, entry_id)}} 공용 캐시
-        _tgt_cells_cache: dict[str, dict[str, dict[int, tuple]]] = {}
-
-        def _load_tgt_cells(_tgid: str) -> dict[str, dict[int, tuple]]:
-            if _tgid in _tgt_cells_cache:
-                return _tgt_cells_cache[_tgid]
-            _nmap: dict[str, dict[int, tuple]] = {}
-            _sched_row = (
-                db.query(Schedule)
-                .filter(
-                    Schedule.group_id == _tgid,
-                    Schedule.year == schedule.year,
-                    Schedule.month == schedule.month,
-                    Schedule.status == "issued",
-                    Schedule.dropped == False,
-                )
-                .order_by(Schedule.version.desc())
-                .first()
-            )
-            if _sched_row:
-                _entries_rows = (
-                    db.query(ScheduleEntry)
-                    .filter(ScheduleEntry.schedule_id == _sched_row.schedule_id)
-                    .all()
-                )
-                _shift_rows = db.query(Shift).filter(Shift.group_id == _tgid).all()
-                _int_to_sid = {s.id: s.shift_id for s in _shift_rows}
-                _t_colors_local = {s.shift_id: s.color for s in _shift_rows}
-                shift_colors.update(_t_colors_local)
-                for _e in _entries_rows:
-                    _sid = _int_to_sid.get(_e.id, _e.shift_id) if _e.id else _e.shift_id
-                    _nmap.setdefault(str(_e.nurse_id), {})[_e.work_date.day] = (_sid, _e.id)
-            _tgt_cells_cache[_tgid] = _nmap
-            return _nmap
-
-        if _my_tgt_a:
-            _my_target_entries = dict(
-                _load_tgt_cells(_my_tgt_a["target_group_id"]).get(str(_my_nid), {})
-            )
+        # assignment 보유 간호사 home_group 룩업 (ownership 판정용)
+        _asg_nids = list(_assignments.keys())
+        _nurse_home_map: dict[str, str] = {}
+        if _asg_nids:
+            for _nid, _gid in (
+                db.query(Nurse.nurse_id, Nurse.group_id)
+                .filter(Nurse.nurse_id.in_(_asg_nids))
+                .all()
+            ):
+                if _gid:
+                    _nurse_home_map[_nid] = _gid
 
         for nurse_entry in roster_data["nurses"]:
             _a_list = _assignments.get(nurse_entry["id"], [])
@@ -1011,9 +974,7 @@ async def get_roster_by_schedule_id(
             sched = nurse_entry["schedule"]
             sched_ids = nurse_entry.get("schedule_ids")
 
-            # 프론트 전달용 assignments 배열 (period_*, target_issued 포함)
-            _assignments_out: list[dict] = []
-
+            # 프론트 전달용 inbound/assignments 메타 (기간바·배지용)
             nurse_entry["inbound"] = [
                 {
                     "startDate": _a["start_date"],
@@ -1027,6 +988,7 @@ async def get_roster_by_schedule_id(
                 for _a in _a_list
             ]
 
+            _assignments_out: list[dict] = []
             for _a in _a_list:
                 _a_start = _date.fromisoformat(_a["start_date"])
                 _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
@@ -1045,49 +1007,31 @@ async def get_roster_by_schedule_id(
                         "target_issued": bool(_tgid and _tgid_issued.get(_tgid)),
                     }
                 )
-
-                # 본인 행: target shift 병합 + reason 필드
-                if nurse_entry["id"] == _my_nid and _my_target_entries:
-                    for d in range(_p_start, _p_end + 1):
-                        idx = d - 1
-                        tgt = _my_target_entries.get(d)
-                        if tgt and idx < len(sched):
-                            sched[idx] = tgt[0]
-                            if sched_ids and idx < len(sched_ids):
-                                sched_ids[idx] = None
-                        elif idx < len(sched):
-                            _cell = sched[idx]
-                            if isinstance(_cell, dict):
-                                _cell["reason"] = _a["reason"]
-                            else:
-                                sched[idx] = {"code": _cell, "reason": _a["reason"]}
-                            if sched_ids and idx < len(sched_ids):
-                                sched_ids[idx] = None
-                else:
-                    # 타인 행: 아웃바운드(파견/병동이동)면 target 근무표 overlay,
-                    # 그 외는 blocked_window 기간을 null 처리 (실근무 아님)
-                    _a_tgid = _a.get("target_group_id")
-                    _tgt_map = (
-                        _load_tgt_cells(_a_tgid).get(nurse_entry["id"], {})
-                        if _a_tgid
-                        and _a["reason"] in ("파견", "병동이동")
-                        and _a_tgid != target_group_id
-                        else {}
-                    )
-                    for d in range(_p_start, _p_end + 1):
-                        idx = d - 1
-                        tgt = _tgt_map.get(d)
-                        if tgt and idx < len(sched):
-                            sched[idx] = tgt[0]
-                            if sched_ids and idx < len(sched_ids):
-                                sched_ids[idx] = None
-                            continue
-                        if idx < len(sched):
-                            sched[idx] = None
-                        if sched_ids and idx < len(sched_ids):
-                            sched_ids[idx] = None
-
             nurse_entry["assignments"] = _assignments_out
+
+            # 일자별 관할 판정 → 현재 병동(target_group_id) 외 일자는 마스킹.
+            # schedule 배열은 현재 병동 소유 셀만 노출, 나머지 일자는 None.
+            _nurse_home = _nurse_home_map.get(nurse_entry["id"])
+            for _d in range(1, _days + 1):
+                _day = _date(schedule.year, schedule.month, _d)
+                _owner = _nurse_home
+                for _a in _a_list:
+                    if _a["reason"] not in ("파견", "병동이동"):
+                        continue
+                    _as = _date.fromisoformat(_a["start_date"])
+                    _ae = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
+                    if _day < _as:
+                        continue
+                    if _ae is not None and _day > _ae:
+                        continue
+                    _owner = _a.get("target_group_id") or _nurse_home
+                    break
+                if _owner != target_group_id:
+                    idx = _d - 1
+                    if 0 <= idx < len(sched):
+                        sched[idx] = None
+                    if sched_ids and 0 <= idx < len(sched_ids):
+                        sched_ids[idx] = None
 
     return roster_data
 
