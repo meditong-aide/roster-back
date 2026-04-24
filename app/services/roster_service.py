@@ -515,22 +515,74 @@ def get_issued_roster_snapshot_service(
     if not matched_snapshot:
         return None
 
+    _meta = matched_snapshot.meta_json or {}
+    _nurses_json = matched_snapshot.nurses_json or []
+
+    # 관련 병동(group) 목록: 발행 그룹 + 각 간호사 소속 + 모든 inbound target 취합
+    _gid_set: set[str] = set()
+    if matched_snapshot.group_id:
+        _gid_set.add(matched_snapshot.group_id)
+    _name_frozen: dict[str, str] = {}
+    for _n in _nurses_json:
+        if not isinstance(_n, dict):
+            continue
+        _n_gid = _n.get("group_id")
+        if _n_gid:
+            _gid_set.add(_n_gid)
+            _n_gname = _n.get("group_name")
+            if _n_gname:
+                _name_frozen[_n_gid] = _n_gname
+        _inbound_raw = _n.get("inbound")
+        # 구 스냅샷 호환: `{inbound_list: [...]}` 래핑 형태
+        if isinstance(_inbound_raw, dict):
+            _inbound_raw = _inbound_raw.get("inbound_list") or []
+        for _ib in _inbound_raw or []:
+            if not isinstance(_ib, dict):
+                continue
+            _tgid = _ib.get("target_group_id") or _ib.get("targetGroupId")
+            if _tgid:
+                _gid_set.add(_tgid)
+                _tname = _ib.get("target_group_name") or _ib.get("targetGroupName")
+                if _tname:
+                    _name_frozen[_tgid] = _tname
+    _meta_gname = _meta.get("group_name")
+    if matched_snapshot.group_id and _meta_gname:
+        _name_frozen.setdefault(matched_snapshot.group_id, _meta_gname)
+    _missing = _gid_set - set(_name_frozen.keys())
+    if _missing:
+        for gid, gname in (
+            db.query(Group.group_id, Group.group_name)
+            .filter(Group.group_id.in_(_missing))
+            .all()
+        ):
+            _name_frozen[gid] = gname or ""
+    groups_out = [
+        {"group_id": _gid, "group_name": _name_frozen.get(_gid, "")}
+        for _gid in _gid_set
+    ]
+
+    _group_name = _name_frozen.get(matched_snapshot.group_id or "", "") or (
+        _meta_gname or ""
+    )
+
     return {
         "snapshot_id": matched_snapshot.snapshot_id,
         "office_id": matched_snapshot.office_id,
         "group_id": matched_snapshot.group_id,
+        "group_name": _group_name,
         "schedule_id": matched_snapshot.schedule_id,
         "version": matched_snapshot.version,
         "created_at": matched_snapshot.created_at,
         "is_active_issued": matched_snapshot.is_active_issued,
-        "meta": matched_snapshot.meta_json or {},
+        "meta": _meta,
         "config": matched_snapshot.config_json or {},
-        "nurses": matched_snapshot.nurses_json or [],
+        "nurses": _nurses_json,
         "shifts": matched_snapshot.shifts_json or [],
         "shift_manage": matched_snapshot.shift_manage_json or [],
         "roster": matched_snapshot.roster_json or {},
         "violations": matched_snapshot.violations_json
         or {"messages": [], "details": []},
+        "groups": groups_out,
     }
 
 
@@ -709,6 +761,19 @@ def get_my_issued_roster_service(
         if _c:
             counts[_c] = counts.get(_c, 0) + 1
 
+    # 관련 병동(group) 목록: 본인 소속 + 파견/이동 target 전체
+    _groups_map: dict[str, str] = {}
+    if src_gid:
+        _groups_map[src_gid] = src_group_name or ""
+    for _t in transfers_out:
+        _tgid = _t.get("target_group_id")
+        if _tgid and _tgid not in _groups_map:
+            _groups_map[_tgid] = _t.get("target_group_name") or ""
+    groups_out = [
+        {"group_id": _gid, "group_name": _gname}
+        for _gid, _gname in _groups_map.items()
+    ]
+
     return {
         "year": roster.get("year"),
         "month": roster.get("month"),
@@ -721,6 +786,7 @@ def get_my_issued_roster_service(
         "schedule": schedule_days,
         "counts": counts,
         "transfers": transfers_out,
+        "groups": groups_out,
     }
 
 
@@ -754,9 +820,18 @@ def create_issued_roster_snapshot(
         )
     )
     # 메타 정보 구성
+    _main_group_row = (
+        db.query(Group).filter(Group.group_id == group_id).first()
+        if group_id
+        else None
+    )
+    _main_group_name = (
+        _main_group_row.group_name if _main_group_row else ""
+    ) or ""
     meta_json: dict = {
         "office_id": office_id,
         "group_id": group_id,
+        "group_name": _main_group_name,
         "schedule_id": schedule.schedule_id,
         "year": schedule.year,
         "month": schedule.month,
@@ -867,6 +942,19 @@ def create_issued_roster_snapshot(
                 }
                 _inbound_blocks.setdefault(r.nurse_id, {"inbound_list": []})["inbound_list"].append(entry)
 
+    # 간호사별 group_name 조회 (인바운드 소스 그룹 포함)
+    _nurse_gids = {n.group_id for n in nurses if n.group_id}
+    _nurse_group_name_map: dict[str, str] = {}
+    if _nurse_gids:
+        for gid, gname in (
+            db.query(Group.group_id, Group.group_name)
+            .filter(Group.group_id.in_(_nurse_gids))
+            .all()
+        ):
+            _nurse_group_name_map[gid] = gname or ""
+    if group_id and group_id not in _nurse_group_name_map:
+        _nurse_group_name_map[group_id] = _main_group_name
+
     nurses_json = []
     for n in nurses:
         _block = _inbound_blocks.get(n.nurse_id)
@@ -874,6 +962,7 @@ def create_issued_roster_snapshot(
             {
                 "nurse_id": n.nurse_id,
                 "group_id": n.group_id,
+                "group_name": _nurse_group_name_map.get(n.group_id, ""),
                 "office_id": n.office_id,
                 "account_id": n.account_id,
                 "emp_num": n.emp_num,
