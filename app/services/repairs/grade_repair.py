@@ -163,8 +163,11 @@ def _extract_grade_values(constraints_map: Any) -> List[int]:
     return sorted(grades) or [1, 2, 3]
 
 
-def _map_nurse_grades(nurses, grade_values: List[int], null_policy: str) -> List[int]:
-    vals = []
+def _map_nurse_grades(nurses, grade_values: List[int], null_policy: str) -> List[int | None]:
+    """null_policy == 'EXCLUDE' 인 경우 NULL/정의역 밖 grade는 None 으로 표기하여
+    repair 루틴의 집계/후보 탐색에서 제외한다.
+    """
+    vals: List[int | None] = []
     raw = []
     for n in nurses:
         g = getattr(n, "grade", None)
@@ -174,13 +177,16 @@ def _map_nurse_grades(nurses, grade_values: List[int], null_policy: str) -> List
         except Exception:
             raw.append(None)
     avg = round(sum(x for x in raw if x is not None) / max(1, len([x for x in raw if x is not None]))) if any(x is not None for x in raw) else max(grade_values)
+    policy = str(null_policy or "LOWEST").upper()
     for i, g in enumerate(raw):
         if g in grade_values:
             vals.append(g)
             continue
-        if null_policy == "AVERAGE":
+        if policy == "EXCLUDE":
+            vals.append(None)
+        elif policy == "AVERAGE":
             vals.append(avg if avg in grade_values else max(grade_values))
-        elif null_policy == "RANDOM":
+        elif policy == "RANDOM":
             h = hashlib.md5(str(getattr(nurses[i], "db_id", i)).encode()).hexdigest()
             vals.append(grade_values[int(h[:8], 16) % len(grade_values)])
         else:  # LOWEST
@@ -226,6 +232,8 @@ def _compute_shortages(rs, roster, nurse_grades, constraints_map, grade_values, 
             for n_idx in range(len(nurse_grades)):
                 if int(roster[n_idx, d, s_idx]) == 1:
                     g = nurse_grades[n_idx]
+                    if g is None:
+                        continue
                     assigned[g] = assigned.get(g, 0) + 1
 
             for g in grade_values:

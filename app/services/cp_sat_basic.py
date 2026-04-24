@@ -610,6 +610,10 @@ class CPSATBasicEngine:
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
+            # 팀별 최소 시프트 커버리지(팀 단위 per-team 제약)
+            team_min_by_team=config_data.get("team_min_by_team") or {},
+            team_min_soft_fallback=bool(config_data.get("team_min_soft_fallback", True)),
+            team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 500) or 0),
             # use_max_coverage 폐기 → min/max 범위 모델로 전환 (daily_shift_requirements_max_by_day)
             # off_placement_mode=0,
         )
@@ -1603,10 +1607,10 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
 
-        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE 전략일 때만)
+        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE/COMBINED 전략일 때만)
         try:
             grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm == "GRADE" and grade_config:
+            if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
                 _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="solve 직후"
@@ -1617,7 +1621,7 @@ class CPSATBasicEngine:
         # Grade-aware Local Repair (Phase 3)
         try:
             grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm == "GRADE" and grade_config:
+            if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
                 from services.repairs.grade_repair import grade_local_repair
                 updated_roster, repair_log = grade_local_repair(
                     roster_system,
@@ -4009,6 +4013,8 @@ def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_pre
                     return gi
             except Exception:
                 pass
+        if null_policy == "EXCLUDE":
+            return None
         if null_policy == "AVERAGE":
             return avg_grade if avg_grade in grade_values else max(grade_values)
         if null_policy == "RANDOM":
@@ -4032,6 +4038,8 @@ def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_pre
                 # roster는 one-hot
                 if int(rs.roster[n_idx, d, s_idx]) == 1:
                     g = nurse_grades[n_idx]
+                    if g is None:
+                        continue
                     assigned_by_grade[g] = assigned_by_grade.get(g, 0) + 1
             # 요구치
             req_by_grade = {}
@@ -4111,6 +4119,8 @@ def _log_grade_result(
                     return gi
             except Exception:
                 pass
+        if null_policy == "EXCLUDE":
+            return None
         if null_policy == "AVERAGE":
             return avg_grade if avg_grade in grade_values else max(grade_values)
         if null_policy == "RANDOM":
@@ -4175,6 +4185,8 @@ def _log_grade_result(
             for n_idx in range(len(nurses)):
                 if int(rs.roster[n_idx, d, s_idx]) == 1:
                     g = nurse_grades[n_idx]
+                    if g is None:
+                        continue
                     total_assigned_by_grade[g] = total_assigned_by_grade.get(g, 0) + 1
 
     print(f"{logger_prefix} --- Grade별 목표 대비 배치 현황 ---")

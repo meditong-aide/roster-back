@@ -98,7 +98,7 @@ class RosterRequest(BaseModel):
     month: int
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
-    grade_strategy: str = "BASE"  # "BASE" | "TEAM" | "GRADE"
+    grade_strategy: str = "BASE"  # "BASE" | "TEAM" | "GRADE" | "COMBINED"(=TEAM+GRADE)
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
     # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
     # mode:

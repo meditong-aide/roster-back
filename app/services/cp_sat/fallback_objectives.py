@@ -11,6 +11,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
 )
 from services.cp_sat.allowed_shift_types import is_n_only_profile
+from services.constraints.team_constraints import add_team_min_constraints
 from services.day_windows import iter_nurse_days
 from services.cp_sat.objective_terms import (
     add_even_mid_distribution_terms,
@@ -341,8 +342,12 @@ def build_fallback_stage3_objective_terms(
     try:
         grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
         print("grade_strategy", grade_strategy)
-        if grade_strategy == "TEAM":
+        if grade_strategy in ("TEAM", "COMBINED"):
             obj.extend(add_team_balance_terms_fn(m, roster_system, X, join, leave))
+            try:
+                obj.extend(add_team_min_constraints(m, roster_system, X, join, leave, grade_strategy=grade_strategy, blocked_by_nurse=blocked_by_nurse))
+            except Exception as e2:
+                print("team_min_constraints(fallback) 예외 발생", e2)
     except Exception as e:
         print("team_balance_objective_terms 예외 발생")
         print("e", e)

@@ -219,18 +219,20 @@ use_mid == false ∧ (
 
 ### E. 공통 풀 · `allowed_shifts` 관련
 
-#### E-1. `COMMON_POOL_NIGHT_CAPACITY`
-**조건**: 공통 풀 인력 중 N 허용자가 월간 N need를 충족 못함 (팀이 N min=0일 때만 의미 있음)
+#### E-1. `MONTHLY_NIGHT_CAPACITY_SHORTAGE`
+**조건**: N 허용 간호사 전체의 월간 근무 가능일 합이 월 N need 미만.
+
+> ⚠ 이전 이름 `COMMON_POOL_NIGHT_CAPACITY` 는 "공통풀 한정" 가정이 있었으나, `team_min[t,N]=0` 은 "팀이 N 에 의무적으로 기여하지 않아도 됨" 의미일 뿐 팀원이 N 배정 **불가** 한다는 뜻이 아니라서 false positive 가 빈번했다. 2026-04-17 수정 — 팀/공통풀 구분을 제거하고 N 허용자 전체를 합산한다.
+
 ```
-If ∀ t: team_min[t, "N"] == 0:
-  common_N_capacity = Σ_{n ∈ N_common, "N" ∈ allowed[n]} working_days_capacity(n)
-  monthly_N_need    = Σ_d need["N", d]
-  if common_N_capacity < monthly_N_need: infeasible
+N_capable = { n : "N" ∈ allowed[n] }
+night_capacity = Σ_{n ∈ N_capable} working_days_capacity(n)
+monthly_N_need = Σ_d need["N", d]
+if night_capacity < monthly_N_need: infeasible
 ```
 `working_days_capacity(n) = (leave[n]-join[n]+1) - required_off_days[n]`
 
-> N전담 공통 풀 전용 케이스. 팀이 N min>0인 구조면 이 검사는 스킵.
-**evidence**: `{common_N_capacity, monthly_N_need}`
+**evidence**: `{night_allowed_count, night_capacity, monthly_N_need}`
 
 ---
 
@@ -241,6 +243,23 @@ If ∀ t: team_min[t, "N"] == 0:
 ```
 > 이 사람은 근무 불가능한데 OFF 상한을 초과하는 활성 일수를 가져 확정 infeasible.
 **evidence**: `{nurse_id, allowed, active_days, required_off_days}`
+
+---
+
+### G. 팀 × Grade 교차
+
+#### G-1. `TEAM_GRADE_INTERSECT_SHORTAGE`
+**조건**: 팀 내 grade 분포를 `max_by_shift` 로 cap 한 유효 배정 가능수가 팀 최소 미달.
+
+**동기**: 팀 t 가 `team_min[D]=2` 로 요구하는데 팀원이 모두 Grade 3 이고 `max_by_shift["D"][3]=1` 로 cap 되어 있으면, 팀 단위로도 Grade 단위로도 각각은 feasible 하지만 **교차** 에서 필연 infeasible.
+
+```
+For each (t, s, d) with team_min[t,s] > 0 and max_by_shift[s] defined:
+  by_grade[g] = |{ n ∈ N_team[t] : active(n,d) ∧ s ∈ allowed(n) ∧ grade(n)==g }|
+  effective   = Σ_g min(by_grade[g], max_by_shift[s][g])   # grade 미지정/max 미정 등급은 cap 없음
+  if effective < team_min[t,s]: infeasible
+```
+**evidence**: `{team_id, shift, day, effective_capacity, required, by_grade}`
 
 ---
 
@@ -274,24 +293,38 @@ If ∀ t: team_min[t, "N"] == 0:
 
 ---
 
+#### F-4. `FIXED_OFF_EXCEEDS_SPAN`
+**조건**: 간호사 개별 단위로 fixed_off_days 가 근무 span 전체를 점유해서 근무 불가.
+```
+∃ n:  |{ d ∈ fixed_off[n] : join[n] ≤ d ≤ leave[n] }|  >=  (leave[n] - join[n] + 1)
+```
+**evidence**: `{nurse_id, span, fixed_off_count}`
+
+---
+
 ## 3. 검사 순서 (권장)
 
 비용이 낮은 것부터, 그리고 한 검사 실패가 다른 검사를 의미 없게 만드는 순서로 정렬:
 
 ```
-1. D-1, D-2           (설정 정합성 — 가장 싸고 확정적)
-2. E-2                (개인 allowed_shifts 공집합)
-3. B-2                (팀 크기 부족 — 일자 순회 불필요)
-4. C-1                (grade min 합계 산술 검사)
-5. F-1, F-2           (고정 배정 정합성)
-6. A-1, A-2, A-3      (전역 커버리지/공급 부족)
-7. B-1, B-3, B-4      (팀 일자별 검사)
-8. C-2, C-3, C-4      (grade 일자별 검사)
-9. F-3                (팀 × 고정 배정 교차)
-10. E-1               (공통 풀 N 월간 용량)
+1. D-1, D-2              (설정 정합성 — 가장 싸고 확정적)
+2. E-2                   (개인 allowed_shifts 공집합)
+3. F-4                   (fixed_off 개인 단위 과다)
+4. B-2                   (팀 크기 부족 — 일자 순회 불필요)
+5. C-1                   (grade min 합계 산술 검사)
+6. F-1, F-2              (고정 배정 정합성)
+7. A-1, A-2, A-3         (전역 커버리지/공급 부족)
+8. B-1, B-3, B-4         (팀 일자별 검사)
+9. C-2, C-3, C-4         (grade 일자별 검사)
+10. G-1                  (팀 × grade 교차)
+11. F-3                  (팀 × 고정 배정 교차)
+12. E-1                  (월간 N 용량)
 ```
 
-중단 정책 권장: **설정성 오류(D, E-2, F-1/F-2)는 즉시 중단, 데이터성 오류(나머지)는 모두 수집해 한 번에 표시**.
+중단 정책 권장: **설정성 오류(D, E-2, F-1/F-2, F-4)는 즉시 중단, 데이터성 오류(나머지)는 모두 수집해 한 번에 표시**.
+
+### Dedup 정책
+같은 `(shift, day)` 에 `GRADE_ANTIPAIR_FORCES_SHORTAGE` 가 있으면 `GRADE_MAX_SUM_BELOW_NEED` 는 suppress. ANTIPAIR 가 더 구체적이고 두 코드는 동일 root cause.
 
 ---
 
@@ -347,6 +380,7 @@ Precheck를 프론트에서 돌려도, 마지막 안전망은 백엔드여야 �
 ```
 GLOBAL_DAY_CAPACITY_SHORTAGE
 GLOBAL_SHIFT_ALLOWED_SHORTAGE
+CAPACITY_TOTAL_SHORTAGE
 TEAM_MIN_EXCEEDS_GLOBAL_NEED
 TEAM_SIZE_INSUFFICIENT
 TEAM_ACTIVE_MEMBERS_INSUFFICIENT
@@ -355,13 +389,15 @@ GRADE_MIN_SUM_EXCEEDS_NEED
 GRADE_MAX_SUM_BELOW_NEED
 GRADE_MIN_AVAILABLE_SHORTAGE
 GRADE_ANTIPAIR_FORCES_SHORTAGE
+TEAM_GRADE_INTERSECT_SHORTAGE        # neu (2026-04-17)
 MID_REQUIRED_MISSING
 MID_DISABLED_BUT_USED
-COMMON_POOL_NIGHT_CAPACITY
+MONTHLY_NIGHT_CAPACITY_SHORTAGE      # renamed from COMMON_POOL_NIGHT_CAPACITY (2026-04-17)
 ALLOWED_SHIFTS_ISOLATES_NURSE
 FIXED_ASSIGN_EXCEEDS_NEED
 FIXED_ASSIGN_VIOLATES_ALLOWED
 FIXED_ASSIGN_BREAKS_TEAM_MIN
+FIXED_OFF_EXCEEDS_SPAN               # neu (2026-04-17)
 ```
 
 ---

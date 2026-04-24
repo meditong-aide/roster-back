@@ -33,6 +33,7 @@ from routers import (
     weekly_off,  # 추가
     grade,
     jobs,
+    roster_precheck,
 )
 from routers.contact import contact_router
 from routers import messages
@@ -184,6 +185,7 @@ app.include_router(groups.router)
 app.include_router(weekly_off.router)  # 추가
 app.include_router(grade.router)
 app.include_router(jobs.router)
+app.include_router(roster_precheck.router)
 
 import uvicorn
 

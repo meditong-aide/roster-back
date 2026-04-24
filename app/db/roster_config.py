@@ -103,6 +103,13 @@ class NurseRosterConfig:
     team_balance_focus_shifts: Optional[List[str]] = None  # 교대 제한 (없으면 D/E/N)
     team_balance_mode: str = "balanced"             # balanced | focus_D | focus_DE
     team_balance_shift_weights: Dict[str, float] = field(default_factory=dict)  # 모드별 파생 가중치
+    # ── 팀별 일일 최소 시프트 커버리지 ──
+    # team_min_by_team[team_id_str] = {'D': 1, 'E': 1, 'N': 0}
+    # 팀마다 개별 min 설정 가능. use_mid=True 일 때 'M' 키 사용 가능.
+    # 팀이 맵에 없거나 값이 {} 이면 "제약 없음".
+    team_min_by_team: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    team_min_soft_fallback: bool = True  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
+    team_min_penalty_weight: int = 500   # 소프트 모드에서 팀 미달 슬랙 패널티
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}

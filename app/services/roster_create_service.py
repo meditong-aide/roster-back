@@ -23,6 +23,7 @@ from db.models import (
     Shift,
     ShiftManage,
     ShiftPreference,
+    Team,
     Wanted,
     WantedRequest,
 )
@@ -422,11 +423,13 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
             "null_grade_policy": "LOWEST",
             "use_dynamic_scaling": True,
             "constraints_json": {},
+            "constraints_max_json": {},
         }
     return {
         "null_grade_policy": config.null_grade_policy or "LOWEST",
         "use_dynamic_scaling": bool(config.use_dynamic_scaling),
         "constraints_json": config.constraints_json or {},
+        "constraints_max_json": config.constraints_max_json or {},
     }
 
 
@@ -482,8 +485,8 @@ def _resolve_grade_strategy(
     """
     # 1) DB 컬럼 우선
     s = _fetch_grade_strategy_from_roster_config(db, roster_config_id)
-    if s in ("BASE", "TEAM", "GRADE"):
-        if s == "GRADE":
+    if s in ("BASE", "TEAM", "GRADE", "COMBINED"):
+        if s in ("GRADE", "COMBINED"):
             gc = _fetch_grade_config_dict(db, office_id, group_id)
             return s, gc
         return s, None
@@ -2447,6 +2450,40 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
         # ShiftManage 요구인원은 호출부에서 주입한다
 
+        # teams.min_shift → config_dict["team_min_by_team"] 로 주입
+        # 키는 team_id(str). 팀별 dict 가 비어있거나 NULL 이면 제외.
+        try:
+            team_rows = (
+                db.query(Team)
+                .filter(
+                    Team.office_id == current_user.office_id,
+                    Team.group_id == current_user.group_id,
+                    Team.active == 1,
+                )
+                .all()
+            )
+            team_min_by_team: dict[str, dict[str, int]] = {}
+            for t in team_rows:
+                ms = t.min_shift if isinstance(t.min_shift, dict) else None
+                if not ms:
+                    continue
+                cleaned: dict[str, int] = {}
+                for k, v in ms.items():
+                    if k not in ("D", "E", "N", "M"):
+                        continue
+                    try:
+                        iv = int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if iv > 0:
+                        cleaned[k] = iv
+                if cleaned:
+                    team_min_by_team[str(t.team_id)] = cleaned
+            if team_min_by_team:
+                config_dict["team_min_by_team"] = team_min_by_team
+        except Exception as e:
+            print(f"[TeamMin] teams.min_shift 로딩 실패(무시): {e}")
+
         try:
             shift_lookup = _load_shift_lookup(db, current_user.office_id, current_user.group_id)
             shift_defs = []
@@ -2597,9 +2634,9 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             group_id=current_user.group_id,
             roster_config_id=getattr(latest_config, "config_id", None),
         )
-        # 요청 바디에서 GRADE일 때는 DB에서 grade_config를 조회해 엔진에 전달
+        # 요청 바디에서 GRADE/COMBINED일 때는 DB에서 grade_config를 조회해 엔진에 전달
         engine_grade_config = grade_config
-        if str(getattr(req, "grade_strategy", "") or "").upper() == "GRADE":
+        if str(getattr(req, "grade_strategy", "") or "").upper() in ("GRADE", "COMBINED"):
             engine_grade_config = _fetch_grade_config_dict(
                 db, current_user.office_id, current_user.group_id
             )
@@ -2610,7 +2647,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             or {}
         )
         effective_grade_strategy = (
-            "GRADE" if req_strategy == "GRADE" and has_grade_constraints else grade_strategy
+            req_strategy if req_strategy in ("GRADE", "COMBINED") and has_grade_constraints else grade_strategy
         )
         # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
         config_dict["grade_strategy"] = effective_grade_strategy

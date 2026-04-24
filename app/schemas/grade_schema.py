@@ -19,7 +19,10 @@ class GradeConfigBase(BaseModel):
 
     null_grade_policy: str = Field(
         default="LOWEST",
-        description="NULL Grade 처리 정책 (LOWEST | AVERAGE | RANDOM)",
+        description=(
+            "NULL Grade 처리 정책 "
+            "(LOWEST=최하위로 매핑 | AVERAGE=평균값 스냅 | RANDOM=해시 결정 | EXCLUDE=grade 제약에서 제외)"
+        ),
     )
     use_dynamic_scaling: bool = Field(
         default=True,
@@ -28,6 +31,10 @@ class GradeConfigBase(BaseModel):
     constraints: Dict[str, Dict[int, int]] = Field(
         default_factory=dict,
         description="Shift별 Grade 최소 인원 예: {'D': {1:1, 2:2}}",
+    )
+    constraints_max: Dict[str, Dict[int, int]] = Field(
+        default_factory=dict,
+        description="Shift별 Grade 최대 인원(anti-pair). 예: {'N': {1: 2}} → N에 grade 1 최대 2명. 값 -1/음수는 '제한 없음'으로 처리.",
     )
     grade_names: Optional[Dict[str, str]] = Field(
         default=None,

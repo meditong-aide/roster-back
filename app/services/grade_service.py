@@ -39,6 +39,7 @@ def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
             null_grade_policy="LOWEST",
             use_dynamic_scaling=True,
             constraints={},
+            constraints_max={},
             grade_names=None,
             use_mid=_use_mid,
             default_shifts=[],
@@ -52,6 +53,7 @@ def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
         null_grade_policy=config.null_grade_policy or "LOWEST",
         use_dynamic_scaling=bool(config.use_dynamic_scaling),
         constraints=config.constraints_json or {},
+        constraints_max=config.constraints_max_json or {},
         grade_names=config.grade_names_json,
         use_mid=_use_mid,
         default_shifts=_normalize_default_shifts(config.default_shifts_json, _use_mid),
@@ -84,15 +86,23 @@ def upsert_grade_config_service(
     )
     use_mid = bool(getattr(roster_cfg, "use_mid", False)) if roster_cfg else False
 
+    policy = str(payload.null_grade_policy or "LOWEST").upper()
+    allowed_policies = {"LOWEST", "AVERAGE", "RANDOM", "EXCLUDE"}
+    if policy not in allowed_policies:
+        raise ValueError(
+            f"허용되지 않은 null_grade_policy: {payload.null_grade_policy} "
+            f"(허용: {sorted(allowed_policies)})"
+        )
+
     _validate_constraints(payload.constraints, use_mid=use_mid)
-    # default_shifts는 None(미전송)이면 기존 값 유지, 리스트이면 갱신
-    if payload.default_shifts is not None:
-        _validate_default_shifts(db, group_id, payload.default_shifts, use_mid=use_mid)
+    _validate_constraints(payload.constraints_max, use_mid=use_mid, allow_negative_as_unset=True)
 
     # use_mid=False 면 M 키 제거
     cleaned = dict(payload.constraints or {})
+    cleaned_max = dict(payload.constraints_max or {})
     if not use_mid:
         cleaned.pop("M", None)
+        cleaned_max.pop("M", None)
 
     config = (
         db.query(RosterGradeConfig)
@@ -107,9 +117,10 @@ def upsert_grade_config_service(
         )
         db.add(config)
 
-    config.null_grade_policy = payload.null_grade_policy or "LOWEST"
+    config.null_grade_policy = policy
     config.use_dynamic_scaling = 1 if payload.use_dynamic_scaling else 0
     config.constraints_json = cleaned
+    config.constraints_max_json = cleaned_max
     config.grade_names_json = payload.grade_names
     if payload.default_shifts is not None:
         # use_mid=False 면 M 항목 제거 후 저장
@@ -129,6 +140,7 @@ def upsert_grade_config_service(
         null_grade_policy=config.null_grade_policy,
         use_dynamic_scaling=bool(config.use_dynamic_scaling),
         constraints=config.constraints_json or {},
+        constraints_max=config.constraints_max_json or {},
         grade_names=config.grade_names_json,
         use_mid=use_mid,
         default_shifts=_normalize_default_shifts(config.default_shifts_json, use_mid),
@@ -141,8 +153,12 @@ def upsert_grade_config_service(
 def _validate_constraints(
     constraints: Dict[str, Dict[int, int]],
     use_mid: bool = False,
+    allow_negative_as_unset: bool = False,
 ) -> None:
-    """Shift/Grade 키와 값의 유효성을 검증합니다."""
+    """Shift/Grade 키와 값의 유효성을 검증합니다.
+
+    allow_negative_as_unset=True(max용): 음수는 '제한 없음' 시그널로 허용.
+    """
     if not constraints:
         return
 
@@ -161,7 +177,7 @@ def _validate_constraints(
                 int(g_key)
             except Exception:
                 raise ValueError(f"Grade 키는 정수여야 합니다: {g_key}")
-            if int(count) < 0:
+            if not allow_negative_as_unset and int(count) < 0:
                 raise ValueError(f"필요 인원은 0 이상이어야 합니다: {shift_code}-{g_key}")
 
 

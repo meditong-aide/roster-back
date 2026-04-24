@@ -18,6 +18,7 @@ from services.cp_sat.hardcoded_weights import (
     WEEK_OFF_SHORT_PENALTY,
 )
 from services.constraints.grade_constraints import add_grade_constraints
+from services.constraints.team_constraints import add_team_min_constraints
 from services.objectives.team_objective import add_team_balance_objective_terms
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes, is_n_only_profile
 from services.day_windows import iter_nurse_days, build_active_days
@@ -737,13 +738,17 @@ def build_main_objective_terms(
             pass
         grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
         print("grade_strategy", grade_strategy)
-        if grade_strategy == "TEAM":
+        if grade_strategy in ("TEAM", "COMBINED"):
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
+            try:
+                obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy=grade_strategy, blocked_by_nurse=blocked_by_nurse))
+            except Exception as e:
+                print("team_min_constraints 예외 발생", e)
 
     # (4-6a) Grade 분배 목적 항 (fallback Stage3와 동일)
     try:
         _gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        if _gs == "GRADE":
+        if _gs in ("GRADE", "COMBINED"):
             grade_terms = add_grade_constraints(
                 m=m,
                 rs=rs,
