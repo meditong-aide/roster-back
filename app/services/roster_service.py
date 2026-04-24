@@ -5,7 +5,7 @@
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일을 지향합니다.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import calendar
 import uuid
 
@@ -518,20 +518,35 @@ def get_issued_roster_snapshot_service(
     _meta = matched_snapshot.meta_json or {}
     _nurses_json = matched_snapshot.nurses_json or []
 
-    # 관련 병동(group) 목록: 발행 그룹 + 각 간호사 소속 + 모든 inbound target 취합
+    # 관련 병동(group) 목록: 발행 그룹 + 각 간호사 소속 + 조회 월과 strict overlap 되는
+    # inbound target 만 취합 (N_tail 버퍼는 auth gate 에서만 사용, groups 집계는 월내 strict).
+    # 예: 4/14~6/15 파견 → 4/5/6월 모두 포함. 5/1~5/8 파견 → 5월만 포함 (4월·6월 제외).
+    _m_start = date(year, month, 1)
+    _m_end = date(year, month, calendar.monthrange(year, month)[1])
+
+    def _parse_iso_date(v):
+        if not isinstance(v, str) or not v:
+            return None
+        try:
+            return date.fromisoformat(v[:10])
+        except ValueError:
+            return None
+
     _gid_set: set[str] = set()
     if matched_snapshot.group_id:
         _gid_set.add(matched_snapshot.group_id)
     _name_frozen: dict[str, str] = {}
+    # 주의: 간호사의 group_id 는 자동으로 _gid_set 에 추가하지 않는다.
+    # - home 간호사의 group_id 는 publishing group 과 동일(이미 추가됨).
+    # - inbound 간호사(타 병동 home)의 home group 은 현재 월과 무관한 과거/고아 기록일 수
+    #   있으므로, 아래 live assignment 쿼리로 실제 해당 월 overlap 파견만 집계한다.
     for _n in _nurses_json:
         if not isinstance(_n, dict):
             continue
         _n_gid = _n.get("group_id")
-        if _n_gid:
-            _gid_set.add(_n_gid)
-            _n_gname = _n.get("group_name")
-            if _n_gname:
-                _name_frozen[_n_gid] = _n_gname
+        _n_gname = _n.get("group_name")
+        if _n_gid and _n_gname:
+            _name_frozen[_n_gid] = _n_gname
         _inbound_raw = _n.get("inbound")
         # 구 스냅샷 호환: `{inbound_list: [...]}` 래핑 형태
         if isinstance(_inbound_raw, dict):
@@ -539,12 +554,37 @@ def get_issued_roster_snapshot_service(
         for _ib in _inbound_raw or []:
             if not isinstance(_ib, dict):
                 continue
+            _s = _parse_iso_date(_ib.get("startDate") or _ib.get("start_date"))
+            _e = _parse_iso_date(_ib.get("endDate") or _ib.get("end_date"))
+            # 월 strict overlap: start <= m_end AND (end is None OR end >= m_start)
+            if _s is None or _s > _m_end:
+                continue
+            if _e is not None and _e < _m_start:
+                continue
             _tgid = _ib.get("target_group_id") or _ib.get("targetGroupId")
             if _tgid:
                 _gid_set.add(_tgid)
                 _tname = _ib.get("target_group_name") or _ib.get("targetGroupName")
                 if _tname:
                     _name_frozen[_tgid] = _tname
+
+    # Inbound-direction live 집계: 타 병동 간호사가 현재 병동으로 파견/이동된 경우,
+    # 해당 파견의 source_group_id 를 groups 에 포함 (스냅샷의 inbound_list 는 outbound 만
+    # 저장하므로 별도 쿼리가 필요).
+    if matched_snapshot.group_id:
+        from services.assignment_service import (
+            get_active_assignments_for_month as _get_assigns_for_month,
+        )
+        _live_assigns = _get_assigns_for_month(
+            db, matched_snapshot.group_id, year, month
+        )
+        for _a in _live_assigns:
+            if (
+                _a.target_group_id == matched_snapshot.group_id
+                and _a.source_group_id
+                and _a.reason in ("파견", "병동이동")
+            ):
+                _gid_set.add(_a.source_group_id)
     _meta_gname = _meta.get("group_name")
     if matched_snapshot.group_id and _meta_gname:
         _name_frozen.setdefault(matched_snapshot.group_id, _meta_gname)
@@ -704,14 +744,18 @@ def get_my_issued_roster_service(
         for _a in my_transfers:
             _a_start = _a.start_date
             _a_end = _a.end_date or _a.expected_end_date
-            _p_start = max(_a_start, m_start).day
-            _p_end = min(_a_end, m_end).day if _a_end else days_in_month
+            # 월내 실제 overlap 구간 계산 (N_tail 버퍼 only 인 파견은 in_month=False → overlay 스킵)
+            _overlap_start = max(_a_start, m_start)
+            _overlap_end = min(_a_end, m_end) if _a_end else m_end
+            _in_month = _overlap_start <= _overlap_end
+            _p_start = _overlap_start.day if _in_month else 0
+            _p_end = _overlap_end.day if _in_month else 0
             _tgid = _a.target_group_id
             _tgt_name = tgid_to_name.get(_tgid, "")
             _tgt = _load_my_target(_tgid)
             _target_issued = _tgt is not None
 
-            if _target_issued:
+            if _in_month and _target_issued:
                 shift_colors.update(_tgt.get("shift_colors") or {})
                 _t_cells = _tgt["schedule"]
                 _t_ids = _tgt["schedule_ids"]
@@ -730,7 +774,7 @@ def get_my_issued_roster_service(
                         "is_source": False,
                         "reason": _a.reason,
                     })
-            else:
+            elif _in_month:
                 for d in range(_p_start, _p_end + 1):
                     idx = d - 1
                     if idx >= days_in_month:
@@ -742,6 +786,9 @@ def get_my_issued_roster_service(
                         "is_source": False,
                         "reason": _a.reason,
                     })
+            elif _target_issued:
+                # 버퍼 내 파견이라도 target shift_colors 는 머지하여 후속 조회/렌더에 활용.
+                shift_colors.update(_tgt.get("shift_colors") or {})
 
             transfers_out.append({
                 "reason": _a.reason,

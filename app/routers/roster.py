@@ -439,11 +439,27 @@ async def get_issued_roster_snapshot(
             target_group_id = group_id
         else:
             target_group_id = current_user.group_id
-            # 본인 파견/병동이동 target_group_id 도 허용 (병동 전환 Select 용)
+            # 본인 파견/병동이동 target_group_id 도 허용 (병동 전환 Select 용).
+            # 조회월(±6일 N_tail 버퍼) 과 파견 기간 overlap 체크:
+            # - 5/1~5/8 파견 → 4월(prev context) + 5월 허용
+            # - 5/1~5/31 파견 → 5월 + 6월(tail context) 허용
+            # - 조회월에 전혀 무관한 파견은 403
             if group_id and group_id != target_group_id:
                 _my_nid = getattr(current_user, "nurse_id", None)
                 _my_dispatch = None
                 if _my_nid:
+                    from datetime import date as _date, timedelta as _td
+                    from calendar import monthrange as _mr
+                    from sqlalchemy import or_ as _or_, case as _case
+                    _lookback = 6
+                    _m_start = _date(year, month, 1)
+                    _m_end = _date(year, month, _mr(year, month)[1])
+                    _view_start = _m_start - _td(days=_lookback)
+                    _view_end = _m_end + _td(days=_lookback)
+                    _eff_end = _case(
+                        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+                        else_=NurseAssignment.expected_end_date,
+                    )
                     _my_dispatch = (
                         db.query(NurseAssignment)
                         .filter(
@@ -451,6 +467,11 @@ async def get_issued_roster_snapshot(
                             NurseAssignment.target_group_id == group_id,
                             NurseAssignment.reason.in_(["파견", "병동이동"]),
                             NurseAssignment.status == "active",
+                            NurseAssignment.start_date <= _view_end,
+                            _or_(
+                                _eff_end.is_(None),
+                                _eff_end >= _view_start,
+                            ),
                         )
                         .first()
                     )
@@ -589,8 +610,12 @@ async def get_issued_roster_snapshot(
                 for _a in _a_list:
                     _a_start = _date.fromisoformat(_a["start_date"])
                     _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
-                    _p_start = max(_a_start, _m_start).day
-                    _p_end = min(_a_end, _m_end).day if _a_end else _days
+                    # 월내 실제 overlap 계산 (N_tail 버퍼-only 파견 → in_month=False, overlay 스킵)
+                    _overlap_start = max(_a_start, _m_start)
+                    _overlap_end = min(_a_end, _m_end) if _a_end else _m_end
+                    _in_month = _overlap_start <= _overlap_end
+                    _p_start = _overlap_start.day if _in_month else 0
+                    _p_end = _overlap_end.day if _in_month else 0
                     _tgid = _a.get("target_group_id")
                     _assignments_out.append(
                         {
@@ -604,6 +629,9 @@ async def get_issued_roster_snapshot(
                             "target_issued": bool(_tgid and _tgid_issued.get(_tgid)),
                         }
                     )
+
+                    if not _in_month:
+                        continue
 
                     # 본인 행: target shift 병합 + reason 필드
                     if _nid == _my_nid and _my_tgt_roster:
@@ -992,8 +1020,12 @@ async def get_roster_by_schedule_id(
             for _a in _a_list:
                 _a_start = _date.fromisoformat(_a["start_date"])
                 _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
-                _p_start = max(_a_start, _m_start).day
-                _p_end = min(_a_end, _m_end).day if _a_end else _days
+                # 월내 실제 overlap (N_tail 버퍼-only 파견 → period 0/0).
+                _overlap_start = max(_a_start, _m_start)
+                _overlap_end = min(_a_end, _m_end) if _a_end else _m_end
+                _in_month = _overlap_start <= _overlap_end
+                _p_start = _overlap_start.day if _in_month else 0
+                _p_end = _overlap_end.day if _in_month else 0
                 _tgid = _a.get("target_group_id")
                 _assignments_out.append(
                     {
