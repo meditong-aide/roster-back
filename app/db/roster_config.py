@@ -110,6 +110,16 @@ class NurseRosterConfig:
     team_min_by_team: Dict[str, Dict[str, int]] = field(default_factory=dict)
     team_min_soft_fallback: bool = True  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
     team_min_penalty_weight: int = 500   # 소프트 모드에서 팀 미달 슬랙 패널티
+    # ── 팀 내 인계 제한(handoff restrictions) ──
+    # team_handoff_policy_by_team[team_id_str] = {
+    #   "restrictions": [
+    #     {"grades":[..], "block_same_shift":bool, "block_adjacent":bool},
+    #     # future: {"from":[..], "to":[..], "bidirectional":bool, ...}
+    #   ]
+    # }
+    team_handoff_policy_by_team: Dict[str, Dict] = field(default_factory=dict)
+    team_handoff_soft_fallback: bool = True
+    team_handoff_penalty_weight: int = 80000  # grade(160000)와 team_min(500) 사이
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}

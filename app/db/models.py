@@ -49,6 +49,10 @@ class Team(Base):
     active = Column(TINYINT, nullable=False, default=1)
     # 팀별 일일 최소 시프트 커버리지. 예: {"D":1,"E":1,"N":0,"M":0}
     min_shift = Column(JSON, nullable=True)
+    # 팀 내 인계 제한 정책. 예:
+    # {"restrictions": [{"grades":[6,7,8], "block_same_shift":true, "block_adjacent":true}]}
+    # 미래 확장: {"from":[..], "to":[..], "bidirectional":bool} 규칙도 같은 배열에 추가 가능.
+    handoff_policy = Column(JSON, nullable=True)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 

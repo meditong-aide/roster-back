@@ -19,6 +19,9 @@ from services.cp_sat.hardcoded_weights import (
 )
 from services.constraints.grade_constraints import add_grade_constraints
 from services.constraints.team_constraints import add_team_min_constraints
+from services.constraints.team_grade_handoff_constraints import (
+    add_team_grade_handoff_constraints,
+)
 from services.objectives.team_objective import add_team_balance_objective_terms
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes, is_n_only_profile
 from services.day_windows import iter_nurse_days, build_active_days
@@ -761,6 +764,18 @@ def build_main_objective_terms(
             obj.extend(grade_terms or [])
     except Exception:
         pass
+
+    # (4-6b) 팀×Grade handoff 제한 (COMBINED 전략에서만 활성)
+    try:
+        _gs2 = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        if _gs2 == "COMBINED":
+            obj.extend(
+                add_team_grade_handoff_constraints(
+                    m, rs, X, join, leave, grade_strategy=_gs2
+                )
+            )
+    except Exception as e:
+        print("team_grade_handoff_constraints 예외 발생", e)
 
     # (4-7) 커버리지 부족 패널티 (shift_requirement_priority 기반)
     try:

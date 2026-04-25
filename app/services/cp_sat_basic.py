@@ -614,6 +614,10 @@ class CPSATBasicEngine:
             team_min_by_team=config_data.get("team_min_by_team") or {},
             team_min_soft_fallback=bool(config_data.get("team_min_soft_fallback", True)),
             team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 500) or 0),
+            # 팀 내 인계 제한 정책(팀별)
+            team_handoff_policy_by_team=config_data.get("team_handoff_policy_by_team") or {},
+            team_handoff_soft_fallback=bool(config_data.get("team_handoff_soft_fallback", True)),
+            team_handoff_penalty_weight=int(config_data.get("team_handoff_penalty_weight", 80000) or 0),
             # use_max_coverage 폐기 → min/max 범위 모델로 전환 (daily_shift_requirements_max_by_day)
             # off_placement_mode=0,
         )

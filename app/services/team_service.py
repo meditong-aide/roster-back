@@ -28,6 +28,63 @@ def _coerce_min_shift(raw: Any) -> Optional[Dict[str, int]]:
     return cleaned or None
 
 
+def _coerce_handoff_policy(raw: Any) -> Optional[Dict[str, Any]]:
+    """payload 의 handoff_policy 를 정제.
+    None → None (변경 없음 시그널과 별개로, 클리어 결정 후 호출됨)
+    {}   → None (정책 없음)
+    {"restrictions":[{...}, ...]} → 유효 규칙만 남긴 dict. 규칙 0개면 None.
+
+    규칙 스키마(v1):
+        {"grades":[int,...], "block_same_shift":bool, "block_adjacent":bool}
+    미래 확장(v2, 파싱만 허용하고 유지; CP-SAT 쪽에서 처리):
+        {"from":[...], "to":[...], "bidirectional":bool, "block_adjacent":bool}
+    """
+    if raw is None or not isinstance(raw, dict):
+        return None
+    rules_in = raw.get("restrictions")
+    if not isinstance(rules_in, list):
+        return None
+    cleaned_rules: List[Dict[str, Any]] = []
+    for r in rules_in:
+        if not isinstance(r, dict):
+            continue
+        out: Dict[str, Any] = {}
+        # v1: symmetric set
+        if "grades" in r:
+            grades = [int(g) for g in (r.get("grades") or []) if _safe_int(g) is not None]
+            grades = sorted(set(g for g in grades if g is not None))
+            if not grades:
+                continue
+            out["grades"] = grades
+        # v2: directional (현재 CP-SAT 에서는 대칭만 처리. 스키마는 보존.)
+        elif "from" in r and "to" in r:
+            frs = sorted(set(g for g in (_safe_int(x) for x in (r.get("from") or [])) if g is not None))
+            tos = sorted(set(g for g in (_safe_int(x) for x in (r.get("to") or [])) if g is not None))
+            if not frs or not tos:
+                continue
+            out["from"] = frs
+            out["to"] = tos
+            if r.get("bidirectional"):
+                out["bidirectional"] = True
+        else:
+            continue
+        out["block_same_shift"] = bool(r.get("block_same_shift", False))
+        out["block_adjacent"] = bool(r.get("block_adjacent", True))
+        if not out["block_same_shift"] and not out["block_adjacent"]:
+            continue
+        cleaned_rules.append(out)
+    if not cleaned_rules:
+        return None
+    return {"restrictions": cleaned_rules}
+
+
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def list_teams_with_members(db: Session, office_id: str, group_id: str) -> List[Dict]:
     """팀 목록과 각 팀 멤버 nurse_id 리스트를 반환한다."""
     teams = db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id, Team.active == 1).all()
@@ -39,6 +96,7 @@ def list_teams_with_members(db: Session, office_id: str, group_id: str) -> List[
             'team_name': t.team_name,
             'team_members': [m[0] for m in members],
             'min_shift': t.min_shift if isinstance(t.min_shift, dict) else None,
+            'handoff_policy': t.handoff_policy if isinstance(t.handoff_policy, dict) else None,
         })
     return result
 
@@ -63,6 +121,12 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
         update_ms = ms_raw is not None
         min_shift_value = _coerce_min_shift(ms_raw) if update_ms else None
 
+        # handoff_policy 시그널 (min_shift 와 동일한 3-상태):
+        #   None  → 변경 없음, {} → 클리어(NULL), {...} → 정제 후 저장
+        hp_raw = item.get('handoff_policy')
+        update_hp = hp_raw is not None
+        handoff_policy_value = _coerce_handoff_policy(hp_raw) if update_hp else None
+
         # upsert team (team_id 없으면 그룹 내 next team_id 할당)
         team = None
         if team_id:
@@ -79,6 +143,8 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
             team = Team(office_id=office_id, group_id=group_id, team_id=next_team_id, team_name=team_name, active=1)
             if update_ms:
                 team.min_shift = min_shift_value
+            if update_hp:
+                team.handoff_policy = handoff_policy_value
             db.add(team)
             db.flush()
             by_id[team.team_id] = team
@@ -90,6 +156,8 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
             if update_ms:
                 # {} → None(클리어), {...} → 정제값
                 team.min_shift = min_shift_value
+            if update_hp:
+                team.handoff_policy = handoff_policy_value
 
         # add: 타깃 팀으로 이동(원팀 자동 해제)
         if add_ids:

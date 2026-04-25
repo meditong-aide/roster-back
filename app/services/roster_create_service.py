@@ -2463,26 +2463,31 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                 .all()
             )
             team_min_by_team: dict[str, dict[str, int]] = {}
+            team_handoff_policy_by_team: dict[str, dict] = {}
             for t in team_rows:
                 ms = t.min_shift if isinstance(t.min_shift, dict) else None
-                if not ms:
-                    continue
-                cleaned: dict[str, int] = {}
-                for k, v in ms.items():
-                    if k not in ("D", "E", "N", "M"):
-                        continue
-                    try:
-                        iv = int(v)
-                    except (TypeError, ValueError):
-                        continue
-                    if iv > 0:
-                        cleaned[k] = iv
-                if cleaned:
-                    team_min_by_team[str(t.team_id)] = cleaned
+                if ms:
+                    cleaned: dict[str, int] = {}
+                    for k, v in ms.items():
+                        if k not in ("D", "E", "N", "M"):
+                            continue
+                        try:
+                            iv = int(v)
+                        except (TypeError, ValueError):
+                            continue
+                        if iv > 0:
+                            cleaned[k] = iv
+                    if cleaned:
+                        team_min_by_team[str(t.team_id)] = cleaned
+                hp = t.handoff_policy if isinstance(t.handoff_policy, dict) else None
+                if hp and isinstance(hp.get("restrictions"), list) and hp["restrictions"]:
+                    team_handoff_policy_by_team[str(t.team_id)] = hp
             if team_min_by_team:
                 config_dict["team_min_by_team"] = team_min_by_team
+            if team_handoff_policy_by_team:
+                config_dict["team_handoff_policy_by_team"] = team_handoff_policy_by_team
         except Exception as e:
-            print(f"[TeamMin] teams.min_shift 로딩 실패(무시): {e}")
+            print(f"[TeamMin] teams.min_shift/handoff_policy 로딩 실패(무시): {e}")
 
         try:
             shift_lookup = _load_shift_lookup(db, current_user.office_id, current_user.group_id)
