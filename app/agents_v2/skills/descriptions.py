@@ -19,7 +19,7 @@ SKILL_TOOLS: list[dict] = [
             "병동의 근무 관련 데이터를 조회합니다.\n"
             "원티드(희망근무) 신청 내역, 원티드 조정판, 근무표, 간호사 정보, "
             "시프트 정의, 제약조건 설정 등을 조회할 때 사용합니다.\n\n"
-            "데이터 수정/삭제에는 사용하지 마세요. 읽기 전용입니다.\n\n"
+            "⛔ 데이터 수정/삭제에는 사용하지 마세요. 읽기 전용입니다.\n\n"
             "예시:\n"
             "- '원티드 신청 내역 보여줘' → scope='wanted_submissions'\n"
             "- '원티드 미제출자 알려줘' → scope='wanted_submissions', operation='count'\n"
@@ -53,7 +53,7 @@ SKILL_TOOLS: list[dict] = [
                         "list=개별 항목 목록 조회. "
                         "count=제출/미제출 현황 (submitted + not_submitted 명단 포함). "
                         "summarize=요약. 기본값 list. "
-                        " 미제출자, 제출 현황, 몇 명 제출했는지 등을 물으면 반드시 count를 사용하세요."
+                        "⚠️ 미제출자, 제출 현황, 몇 명 제출했는지 등을 물으면 반드시 count를 사용하세요."
                     ),
                 },
                 "nurse_name": {
@@ -75,6 +75,29 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "description": "날짜 범위. 반드시 YYYY-MM-DD~YYYY-MM-DD 형식 (예: '2026-04-01~2026-04-10')",
                 },
+                "grade": {
+                    "type": "integer",
+                    "description": (
+                        "간호사 등급 필터. 병동별 등급 체계가 다르므로, "
+                        "모호한 표현('신규', '시니어' 등)은 먼저 nurse_info로 등급 분포를 확인 후 사용하세요."
+                    ),
+                },
+                "include_cancelled": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "원티드 조회 시 취소(미제출) 건도 포함할지 여부. "
+                        "기본값=false (제출 완료된 건만). "
+                        "'취소된 원티드', '미제출 원티드' 조회 시 true로 설정하세요."
+                    ),
+                },
+                "submitted_date_range": {
+                    "type": "string",
+                    "description": (
+                        "원티드 제출일 기준 날짜 범위. YYYY-MM-DD~YYYY-MM-DD 형식. "
+                        "'지난주에 등록된 원티드' 등 제출 시점 기준 필터링에 사용."
+                    ),
+                },
             },
             "required": ["scope"],
         },
@@ -82,11 +105,15 @@ SKILL_TOOLS: list[dict] = [
     {
         "name": "bulk_mutation",
         "description": (
-            "근무 데이터를 수정합니다. 원티드 취소, 조정판 수정, 근무표 시프트 변경 등.\n\n"
-            "반드시 preview_only=true로 먼저 실행하고 사용자 확인 후 실제 수정하세요.\n"
-            "읽기 전용 조회에는 사용하지 마세요. query_schedule을 사용하세요.\n\n"
+            "근무 데이터를 수정합니다. 원티드 추가/수정/취소, 마감일 수정, 조정판 수정, 근무표 시프트 변경 등.\n\n"
+            "⚠️ 반드시 preview_only=true로 먼저 실행하고 사용자 확인 후 실제 수정하세요.\n"
+            "⛔ 읽기 전용 조회에는 사용하지 마세요. query_schedule을 사용하세요.\n\n"
             "예시:\n"
-            "- '김민지 원티드 취소' → scope='wanted_submissions', action='cancel'\n"
+            "- '5/3 원티드 취소' → scope='wanted_submissions', action='cancel', date='2026-05-03'\n"
+            "- '5/15에 Oz 원티드 추가' → scope='wanted_submissions', action='add_shift', date='2026-05-15', shift_name='Oz'\n"
+            "- '5/3 원티드 D를 N으로' → scope='wanted_submissions', action='change_shift', date='2026-05-03', new_shift_name='N'\n"
+            "- '원티드 전체 취소' → scope='wanted_submissions', action='cancel' (date 없이)\n"
+            "- '원티드 마감일 수정' → scope='wanted_submissions', action='update_deadline', new_deadline='2026-04-18'\n"
             "- '조정판 쉬는사람 해제' → scope='wanted_adjustment', action='unapply_off'\n"
             "- '김민지 4/5 D→E' → scope='schedule', action='change_shift'"
         ),
@@ -108,7 +135,12 @@ SKILL_TOOLS: list[dict] = [
                         "change_shift",
                         "add_shift",
                         "remove_shift",
+                        "update_deadline",
                     ],
+                    "description": (
+                        "수행할 작업. 원티드 날짜별: cancel(취소), add_shift(추가), change_shift(변경). "
+                        "근무표: change_shift, add_shift, remove_shift. 조정판: unapply_off, apply."
+                    ),
                 },
                 "nurse_name": {"type": "string"},
                 "shift_name": {"type": "string"},
@@ -117,6 +149,17 @@ SKILL_TOOLS: list[dict] = [
                     "description": "변경할 새 시프트",
                 },
                 "date": {"type": "string"},
+                "new_deadline": {
+                    "type": "string",
+                    "description": "새 마감일. 반드시 YYYY-MM-DD 형식 (예: '2026-04-18')",
+                },
+                "comment": {
+                    "type": "string",
+                    "description": (
+                        "사유/메모. 원티드 추가/수정 시 사유가 있으면 포함. "
+                        "예: '부모님 병원 방문', '개인 사정'"
+                    ),
+                },
                 "preview_only": {
                     "type": "boolean",
                     "default": True,
@@ -203,7 +246,28 @@ SKILL_TOOLS: list[dict] = [
             "근무표 생성 제약조건을 수정합니다. "
             "야간 최대 횟수, 연속 근무일 제한 등.\n\n"
             "⚠️ 다음 근무표 생성에 영향을 미칩니다.\n\n"
-            "예시: '야간 최대 7회로 설정', '연속 근무 5일로 제한'"
+            "필드 매핑 (field 파라미터에 DB 필드명 사용):\n"
+            "- 야간 최대 횟수 → max_nig_per_month (정수)\n"
+            "- 연속 근무일 제한 → max_conseq_work (정수)\n"
+            "- 이브닝 다음날 데이 금지 → banned_day_after_eve (true/false)\n"
+            "- 3연속 야간 허용 → three_seq_nig (true/false)\n"
+            "- 3연야 후 2일 휴무 → two_offs_after_three_nig (true/false)\n"
+            "- 2연야 후 2일 휴무 → two_offs_after_two_nig (true/false)\n"
+            "- 주 2회 오프 보장 → two_offs_per_week (true/false)\n"
+            "- 데이 필요인원 → day_req (정수)\n"
+            "- 이브닝 필요인원 → eve_req (정수)\n"
+            "- 나이트 필요인원 → nig_req (정수)\n"
+            "- 오프 일수 → off_days (정수)\n"
+            "- 야간 균등 배분 → even_nights (true/false)\n"
+            "- 프리셉터 매칭 → preceptee_on (true/false)\n"
+            "- 팀 밸런스 → team_balance_enable (true/false)\n"
+            "- 팀 밸런스 강도 → team_balance_gauge (정수 0~10)\n"
+            "- 연속 오프 → sequential_offs (true/false)\n\n"
+            "예시:\n"
+            "- '야간 최대 7회로 설정' → field='max_nig_per_month', value=7\n"
+            "- '연속 근무 5일로 제한' → field='max_conseq_work', value=5\n"
+            "- '이브닝 다음날 데이 금지 해제' → field='banned_day_after_eve', value=false\n"
+            "- '팀 밸런스 켜줘' → field='team_balance_enable', value=true"
         ),
         "parameters": {
             "type": "object",
