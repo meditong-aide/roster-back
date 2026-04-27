@@ -643,6 +643,20 @@ def get_issued_roster_snapshot_service(
     # - home 간호사의 group_id 는 publishing group 과 동일(이미 추가됨).
     # - inbound 간호사(타 병동 home)의 home group 은 현재 월과 무관한 과거/고아 기록일 수
     #   있으므로, 아래 live assignment 쿼리로 실제 해당 월 overlap 파견만 집계한다.
+
+    # 응답 시점 overlay: inbound / current_assignment 를 현재 DB 상태로 덮어쓴다.
+    # 스냅샷 생성 시점(roster 발행 시) 이후 발생한 파견/병동이동/휴직/퇴사/프리셉티 변경은
+    # snapshot.nurses_json 에 반영되지 않으므로, 조회 시점에 _build_inbound_blocks 로
+    # NurseProfile 응답과 동일한 결과를 즉석 합성한다.
+    from services.nurse_service import _build_inbound_blocks as _live_inbound_blocks
+
+    _live_nurse_ids = [
+        _n.get("nurse_id")
+        for _n in _nurses_json
+        if isinstance(_n, dict) and _n.get("nurse_id")
+    ]
+    _live_blocks = _live_inbound_blocks(db, _live_nurse_ids) if _live_nurse_ids else {}
+
     for _n in _nurses_json:
         if not isinstance(_n, dict):
             continue
@@ -653,6 +667,9 @@ def get_issued_roster_snapshot_service(
         # revert 이전 발행된 stale snapshot 의 outbound/is_outbound 키 제거
         _n.pop("outbound", None)
         _n.pop("is_outbound", None)
+        _block = _live_blocks.get(_n.get("nurse_id") or "") or {}
+        _n["inbound"] = _block.get("inbound_list") or []
+        _n["current_assignment"] = _block.get("current_assignment")
         _absorb_window(_n.get("inbound"))
 
     # Live 집계: inbound (target=발행그룹) 만. source_group_id 를 groups 에 추가.

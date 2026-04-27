@@ -190,33 +190,6 @@ def _assignment_window_dates(
     return (in_period, out_period)
 
 
-def _resolve_owner_group_for_date(
-    nurse_home_group: Optional[str],
-    assignment: Optional[NurseAssignment],
-    target_date: date,
-) -> Optional[str]:
-    """주어진 일자에 대한 관할 group_id를 판정합니다.
-
-    - assignment(파견/병동이동)가 없으면 nurse_home_group.
-    - assignment가 있으면 기간 내 → target_group_id, 기간 외 → source_group_id.
-    - 병동이동은 영구 이동이므로 flush가 set한 end_date(today)는 무시하고
-      expected_end_date만 인정한다.
-    - 병동이동 pre-transfer: post-flush 케이스에서는 nurse_home 이 이미 target 으로
-      변경됐으므로 명시적으로 source_group_id 를 반환해야 한다.
-    """
-    if assignment is None or assignment.start_date is None:
-        return nurse_home_group
-    start = assignment.start_date
-    if assignment.reason == "병동이동":
-        end = assignment.expected_end_date
-    else:
-        end = assignment.expected_end_date or assignment.end_date
-    in_period = (target_date >= start) and (end is None or target_date <= end)
-    if in_period:
-        return assignment.target_group_id or nurse_home_group
-    return assignment.source_group_id or nurse_home_group
-
-
 def _resolve_owner_group_for_date_multi(
     nurse_home_group: Optional[str],
     assignments: List[NurseAssignment],
@@ -226,10 +199,19 @@ def _resolve_owner_group_for_date_multi(
 
     중첩 파견은 금지 정책이므로 같은 일자를 커버하는 assignment 는 최대 1개로 간주.
     커버하는 assignment 가 없으면 nurse_home_group 반환.
+
     병동이동은 영구 이동이므로 flush가 set한 end_date(today)는 무시한다.
-    병동이동 pre-transfer 일자는 post-flush 시 nurse_home 이 이미 target 으로
-    변경됐으므로 명시적으로 source_group_id 를 반환한다.
+    sequential 병동이동(T1 종료 → T2 시작) 사이 일자나 단일 병동이동의 pre/post
+    transfer 일자에서도 실 소속 병동을 정확히 판정하도록 3-단계 우선순위를 둔다:
+
+    1) in-period 매칭 (target_date 가 [start, end] 범위 내) → asg.target_group_id
+    2) post-transfer fallback: target_date 이전에 끝난 병동이동 중 가장 최근 것의
+       target_group_id. (예: T1 4/01~4/14 → 4/15~4/19 사이 → T1.target 반환)
+    3) pre-transfer fallback: target_date 이후에 시작될 병동이동 중 가장 임박한
+       것의 source_group_id. (예: T1 4/20 시작 → 4/15 → T1.source 반환)
     """
+    most_recent_past_transfer: Optional[NurseAssignment] = None
+    nearest_future_transfer: Optional[NurseAssignment] = None
     for asg in assignments:
         if asg.start_date is None:
             continue
@@ -239,11 +221,26 @@ def _resolve_owner_group_for_date_multi(
             end = asg.expected_end_date or asg.end_date
         if target_date < asg.start_date:
             if asg.reason == "병동이동":
-                return asg.source_group_id or nurse_home_group
+                if (
+                    nearest_future_transfer is None
+                    or asg.start_date < nearest_future_transfer.start_date
+                ):
+                    nearest_future_transfer = asg
             continue
         if end is not None and target_date > end:
+            if asg.reason == "병동이동":
+                # start_date 가 큰 것이 더 최근 transfer
+                if (
+                    most_recent_past_transfer is None
+                    or asg.start_date > most_recent_past_transfer.start_date
+                ):
+                    most_recent_past_transfer = asg
             continue
         return asg.target_group_id or nurse_home_group
+    if most_recent_past_transfer is not None:
+        return most_recent_past_transfer.target_group_id or nurse_home_group
+    if nearest_future_transfer is not None:
+        return nearest_future_transfer.source_group_id or nurse_home_group
     return nurse_home_group
 
 
@@ -2347,10 +2344,13 @@ def _validate_cross_save_entries(
     req: FixedWantedCreate,
     caller_group_id: str,
     nurse_rows: Dict[str, Nurse],
-    assignment_map: Dict[str, NurseAssignment],
+    assignment_list_map: Dict[str, List[NurseAssignment]],
     nurse_name_map: Dict[str, str],
 ) -> Tuple[List[Dict[str, Any]], Set[str]]:
     """각 entry의 관할 group_id를 판정하여 교차 저장 entry를 탐지.
+
+    다중 assignment(예: 동월 sequential 병동이동, 미래 병동이동 + 진행중 파견 등)
+    상황을 정확히 판정하기 위해 list 기반 multi-resolver 를 사용한다.
 
     반환:
         (errors, cross_blocked_nurse_ids)
@@ -2372,9 +2372,10 @@ def _validate_cross_save_entries(
                 "message": f"알 수 없는 간호사: {entry.nurse_id}",
             })
             continue
-        owner_group = _resolve_owner_group_for_date(
+        nurse_assignments = assignment_list_map.get(entry.nurse_id, [])
+        owner_group = _resolve_owner_group_for_date_multi(
             nurse_row.group_id,
-            assignment_map.get(entry.nurse_id),
+            nurse_assignments,
             entry.shift_date,
         )
         if owner_group == caller_group_id:
@@ -2383,9 +2384,13 @@ def _validate_cross_save_entries(
         if entry.nurse_id in reported_nurses:
             continue
         reported_nurses.add(entry.nurse_id)
-        assignment = assignment_map.get(entry.nurse_id)
         nurse_name = nurse_name_map.get(entry.nurse_id, entry.nurse_id)
-        if assignment is not None and owner_group == assignment.target_group_id:
+        # 메시지 분기: owner_group 이 list 중 어떤 assignment 의 target 인지
+        # (해당 entry.shift_date 기준) 찾아서 정확히 분기
+        is_target_of_any = any(
+            owner_group == a.target_group_id for a in nurse_assignments
+        )
+        if is_target_of_any:
             msg = f"{nurse_name} 간호사 파견 기간 요청은 파견 병동에서 저장해야 합니다"
         else:
             msg = f"{nurse_name} 간호사 소속 기간 요청은 소속 병동에서 저장해야 합니다"
@@ -2567,6 +2572,11 @@ def save_fixed_wanted_service(
         nid: (n.name or nid) for nid, n in nurse_rows.items()
     }
     assignment_map = _collect_assignment_map_for_nurses(db, request_nurse_ids)
+    # 다중 assignment(sequential 병동이동, 미래 transfer + 진행중 파견 등)를
+    # 정확히 판정하기 위해 list 기반 맵도 별도로 구성한다.
+    assignment_list_map = _collect_assignment_list_map_for_nurses(
+        db, request_nurse_ids
+    )
 
     # ── caller group shift_id → shifts.id 매핑 ──
     group_row = db.query(Group).filter(Group.group_id == group_id).first()
@@ -2578,7 +2588,7 @@ def save_fixed_wanted_service(
 
     # ── 1단계: 교차 저장 검증 ──
     cross_errors, cross_blocked = _validate_cross_save_entries(
-        req, group_id, nurse_rows, assignment_map, nurse_name_map,
+        req, group_id, nurse_rows, assignment_list_map, nurse_name_map,
     )
 
     # ── 2단계: 월 OFF 상한 검증 ──
