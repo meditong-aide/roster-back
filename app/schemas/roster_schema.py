@@ -661,6 +661,20 @@ class AdjustmentAssignmentWindow(BaseModel):
     period_end_day: Optional[int] = Field(
         default=None, description="해당 월 가시 구간 종료 일자(1~말일)"
     )
+    source_schedule_id: Optional[str] = Field(
+        default=None, description="이전(source) 병동 issued schedule_id (없으면 null)"
+    )
+    source_shifts: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description='이전(source) 병동의 가시 구간 일자별 shift_id 매핑. key="day"(str), value=shift_id|null',
+    )
+    target_schedule_id: Optional[str] = Field(
+        default=None, description="변경(target) 병동 issued schedule_id (없으면 null)"
+    )
+    target_shifts: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description='변경(target) 병동의 가시 구간 일자별 shift_id 매핑. key="day"(str), value=shift_id|null',
+    )
 
 
 class AdjustmentNurse(BaseModel):

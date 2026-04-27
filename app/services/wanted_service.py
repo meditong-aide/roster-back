@@ -25,6 +25,8 @@ from db.models import (
     NursePairRequest,
     NurseShiftRequest,
     RosterConfig,
+    Schedule,
+    ScheduleEntry,
     Shift,
     ShiftPreference,
     Wanted,
@@ -233,11 +235,16 @@ def _build_assignment_window(
     month_first: date,
     month_last: date,
     group_name_map: Dict[str, str],
+    nurse_id: Optional[str] = None,
+    body_loader: Optional[Any] = None,
 ) -> Optional["AdjustmentAssignmentWindow"]:
     """NurseAssignment → AdjustmentAssignmentWindow (해당 월과 겹치지 않으면 None).
 
     shift-requests / adjustment 양쪽 서비스에서 동일 스키마로 파견 메타데이터를
     내려주기 위해 공용 헬퍼로 추출.
+
+    body_loader: (group_id) -> (schedule_id, {nurse_id: {day: shift_id}}). 지정 시
+    가시 구간 일자에 대해 source/target 양쪽 병동의 shift body 를 동봉.
     """
     _start = asg.start_date
     if _start is None:
@@ -249,6 +256,26 @@ def _build_assignment_window(
         return None
     _eff_start = max(_start, month_first)
     _eff_end = min(_end, month_last) if _end else month_last
+
+    _source_schedule_id: Optional[str] = None
+    _source_shifts: Optional[Dict[str, Optional[str]]] = None
+    _target_schedule_id: Optional[str] = None
+    _target_shifts: Optional[Dict[str, Optional[str]]] = None
+    if body_loader is not None and nurse_id:
+        _vis_days: List[int] = []
+        _cursor = _eff_start
+        while _cursor <= _eff_end:
+            _vis_days.append(_cursor.day)
+            _cursor = _cursor + timedelta(days=1)
+        _s_sid, _s_by_nurse = body_loader(asg.source_group_id or "")
+        _source_schedule_id = _s_sid
+        _s_nurse_map = _s_by_nurse.get(nurse_id, {}) if _s_by_nurse else {}
+        _source_shifts = {str(d): _s_nurse_map.get(d) for d in _vis_days}
+        _t_sid, _t_by_nurse = body_loader(asg.target_group_id or "")
+        _target_schedule_id = _t_sid
+        _t_nurse_map = _t_by_nurse.get(nurse_id, {}) if _t_by_nurse else {}
+        _target_shifts = {str(d): _t_nurse_map.get(d) for d in _vis_days}
+
     return AdjustmentAssignmentWindow(
         reason=asg.reason or "파견",
         direction=direction,
@@ -260,7 +287,55 @@ def _build_assignment_window(
         end_date=_end,
         period_start_day=_eff_start.day,
         period_end_day=_eff_end.day,
+        source_schedule_id=_source_schedule_id,
+        source_shifts=_source_shifts,
+        target_schedule_id=_target_schedule_id,
+        target_shifts=_target_shifts,
     )
+
+
+def _make_assignment_body_loader(db: Session, year: int, month: int):
+    """assignment 가시 구간에 대한 source/target 병동 schedule body 로더 (per-group 캐시).
+
+    반환: (group_id) -> (schedule_id|None, {nurse_id: {day: shift_id}})
+    """
+    _cache: Dict[str, Tuple[Optional[str], Dict[str, Dict[int, str]]]] = {}
+
+    def _load(group_id: str) -> Tuple[Optional[str], Dict[str, Dict[int, str]]]:
+        if group_id in _cache:
+            return _cache[group_id]
+        if not group_id:
+            _cache[group_id] = (None, {})
+            return _cache[group_id]
+        sched = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id == group_id,
+                Schedule.year == year,
+                Schedule.month == month,
+                Schedule.status == "issued",
+                Schedule.dropped == False,  # noqa: E712
+            )
+            .order_by(Schedule.version.desc())
+            .first()
+        )
+        if not sched:
+            _cache[group_id] = (None, {})
+            return _cache[group_id]
+        entries = (
+            db.query(ScheduleEntry)
+            .filter(ScheduleEntry.schedule_id == sched.schedule_id)
+            .all()
+        )
+        by_nurse: Dict[str, Dict[int, str]] = {}
+        for e in entries:
+            if e.work_date is None:
+                continue
+            by_nurse.setdefault(e.nurse_id, {})[e.work_date.day] = e.shift_id
+        _cache[group_id] = (sched.schedule_id, by_nurse)
+        return _cache[group_id]
+
+    return _load
 
 
 def _compute_weekly_off_days(
@@ -1957,12 +2032,14 @@ def get_wanted_adjustment_service(
     _month_days = _iter_month_days(year, month)
     _m_first = _month_days[0]
     _m_last = _month_days[-1]
+    _body_loader = _make_assignment_body_loader(db, year, month)
 
     def _build_window(
-        asg: NurseAssignment, direction: str
+        asg: NurseAssignment, direction: str, nurse_id: Optional[str] = None,
     ) -> Optional[AdjustmentAssignmentWindow]:
         return _build_assignment_window(
             asg, direction, _m_first, _m_last, _group_name_map,
+            nurse_id=nurse_id, body_loader=_body_loader,
         )
 
     nurses = list(source_nurses) + list(inbound_nurses)
@@ -2007,11 +2084,11 @@ def get_wanted_adjustment_service(
         # AdjustmentAssignmentWindow 목록 (프론트 기간바 표시용)
         assignment_windows: List[AdjustmentAssignmentWindow] = []
         for _asg in _inbound_asgs:
-            _w = _build_window(_asg, "inbound")
+            _w = _build_window(_asg, "inbound", nurse_id=nurse.nurse_id)
             if _w is not None:
                 assignment_windows.append(_w)
         for _asg in _outbound_asgs:
-            _w = _build_window(_asg, "outbound")
+            _w = _build_window(_asg, "outbound", nurse_id=nurse.nurse_id)
             if _w is not None:
                 assignment_windows.append(_w)
 
@@ -2866,6 +2943,7 @@ def get_shift_requests_service(
                 "comment": row.comment,
             })
 
+    body_loader = _make_assignment_body_loader(db, year, month)
     results = []
     for nurse_id in nurse_ids:
         wr = submitted_map.get(nurse_id)
@@ -2874,12 +2952,14 @@ def get_shift_requests_service(
         for _asg in inbound_map.get(nurse_id, []):
             _w = _build_assignment_window(
                 _asg, "inbound", first_day, month_last, group_name_map,
+                nurse_id=nurse_id, body_loader=body_loader,
             )
             if _w is not None:
                 assignments_payload.append(_w.model_dump(mode="json"))
         for _asg in outbound_map.get(nurse_id, []):
             _w = _build_assignment_window(
                 _asg, "outbound", first_day, month_last, group_name_map,
+                nurse_id=nurse_id, body_loader=body_loader,
             )
             if _w is not None:
                 assignments_payload.append(_w.model_dump(mode="json"))

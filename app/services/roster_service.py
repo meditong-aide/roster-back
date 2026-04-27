@@ -429,26 +429,105 @@ def get_prev_month_tail_service(
         db, group_id=target_group_id, year=prev_year, month=prev_month,
     )
 
+    # 변경(target) 병동의 전월 발행 근무표 사전 적재 (caching).
+    # target_gid → {schedule_id, schedule_name, entries_by_nurse: {nurse_id: {day: shift_id}}}
+    _target_prev_cache: dict[str, dict] = {}
+
+    def _load_target_prev_tail(_t_gid: str) -> dict:
+        if _t_gid in _target_prev_cache:
+            return _target_prev_cache[_t_gid]
+        _t_sched = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id == _t_gid,
+                Schedule.year == prev_year,
+                Schedule.month == prev_month,
+                Schedule.status == "issued",
+                Schedule.dropped == False,
+            )
+            .first()
+        )
+        if not _t_sched:
+            _t_sched = (
+                db.query(Schedule)
+                .filter(
+                    Schedule.group_id == _t_gid,
+                    Schedule.year == prev_year,
+                    Schedule.month == prev_month,
+                    Schedule.dropped == False,
+                )
+                .order_by(Schedule.created_at.desc())
+                .first()
+            )
+        if not _t_sched:
+            _out = {"schedule_id": None, "schedule_name": None, "entries_by_nurse": {}}
+            _target_prev_cache[_t_gid] = _out
+            return _out
+        _t_entries = (
+            db.query(ScheduleEntry)
+            .filter(
+                ScheduleEntry.schedule_id == _t_sched.schedule_id,
+                ScheduleEntry.work_date >= start_date,
+                ScheduleEntry.work_date <= end_date,
+            )
+            .all()
+        )
+        _t_by_nurse: dict = {}
+        for _e in _t_entries:
+            _t_by_nurse.setdefault(_e.nurse_id, {})[_e.work_date.day] = _e.shift_id
+        _out = {
+            "schedule_id": _t_sched.schedule_id,
+            "schedule_name": _t_sched.name,
+            "entries_by_nurse": _t_by_nurse,
+        }
+        _target_prev_cache[_t_gid] = _out
+        return _out
+
     nurse_list = []
     for nurse in nurses:
         shifts = {
             str(d): entries_by_nurse.get(nurse.nurse_id, {}).get(d)
             for d in tail_day_list
         }
-        # assignment 기간의 shift에 reason 필드 추가
+        # assignment 기간의 shift는 None으로 마스킹 + reason/target 메타 + target_shifts 동봉
         _a_list = _prev_assignments.get(nurse.nurse_id, [])
+        nurse_assignments: list[dict] = []
         for _a in _a_list:
             _a_start = date.fromisoformat(_a["start_date"]) if isinstance(_a["start_date"], str) else _a["start_date"]
             _a_end = date.fromisoformat(_a["end_date"]) if _a.get("end_date") else None
+            _overlap_days: list[int] = []
             for d in tail_day_list:
                 _cell_date = date(prev_year, prev_month, d)
                 if _cell_date >= _a_start and (not _a_end or _cell_date <= _a_end):
                     shifts[str(d)] = None
+                    _overlap_days.append(d)
+            if _overlap_days:
+                _t_gid = _a.get("target_group_id") or ""
+                _target_shifts: dict[str, str | None] = {}
+                _target_schedule_id = None
+                if _t_gid and _a.get("reason") in ("파견", "병동이동"):
+                    _t_payload = _load_target_prev_tail(_t_gid)
+                    _target_schedule_id = _t_payload.get("schedule_id")
+                    _t_nurse_map = (_t_payload.get("entries_by_nurse") or {}).get(nurse.nurse_id, {})
+                    for d in _overlap_days:
+                        _target_shifts[str(d)] = _t_nurse_map.get(d)
+                nurse_assignments.append({
+                    "reason": _a.get("reason"),
+                    "target_group_id": _t_gid,
+                    "target_group_name": _a.get("target_group_name") or "",
+                    "start_day": _overlap_days[0],
+                    "end_day": _overlap_days[-1],
+                    "start_date": _a.get("start_date"),
+                    "end_date": _a.get("end_date"),
+                    "target_schedule_id": _target_schedule_id,
+                    "target_shifts": _target_shifts,
+                })
         nurse_list.append(
             {
                 "nurse_id": nurse.nurse_id,
                 "name": nurse.name,
                 "shifts": shifts,
+                "assignments": nurse_assignments,
             }
         )
 
@@ -471,11 +550,14 @@ def get_issued_roster_snapshot_service(
     current_user,
     db: Session,
     target_group_id: str | None = None,
+    _expand_target_rosters: bool = True,
 ) -> dict | None:
     """
     특정 연월에 대해 활성 발행본(is_active_issued=True)의 근무표 스냅샷을 조회합니다.
 
     관리자(ADM)는 `target_group_id`로 대상 그룹을 지정할 수 있습니다.
+    `_expand_target_rosters=True`일 때 응답의 `target_rosters` 필드에 변경(파견/병동이동)
+    병동의 동월 발행 스냅샷 body 를 동봉합니다 (재귀 차단을 위해 내부 호출은 False).
     """
     if not current_user:
         raise Exception("Not authenticated")
@@ -605,6 +687,48 @@ def get_issued_roster_snapshot_service(
         _meta_gname or ""
     )
 
+    # 변경(파견/병동이동) 병동의 동월 발행 스냅샷 body 동봉.
+    # 재귀 차단: 내부 호출은 _expand_target_rosters=False.
+    target_rosters: dict[str, dict] = {}
+    if _expand_target_rosters:
+        _self_gid = matched_snapshot.group_id or ""
+        for _t_gid in _gid_set:
+            if not _t_gid or _t_gid == _self_gid:
+                continue
+            try:
+                _t_snap = get_issued_roster_snapshot_service(
+                    year=year,
+                    month=month,
+                    current_user=current_user,
+                    db=db,
+                    target_group_id=_t_gid,
+                    _expand_target_rosters=False,
+                )
+            except Exception:
+                _t_snap = None
+            if not _t_snap:
+                target_rosters[_t_gid] = {
+                    "group_id": _t_gid,
+                    "group_name": _name_frozen.get(_t_gid, ""),
+                    "snapshot_id": None,
+                    "schedule_id": None,
+                    "nurses": [],
+                    "shifts": [],
+                    "shift_manage": [],
+                    "roster": {},
+                }
+                continue
+            target_rosters[_t_gid] = {
+                "group_id": _t_snap.get("group_id"),
+                "group_name": _t_snap.get("group_name") or _name_frozen.get(_t_gid, ""),
+                "snapshot_id": _t_snap.get("snapshot_id"),
+                "schedule_id": _t_snap.get("schedule_id"),
+                "nurses": _t_snap.get("nurses") or [],
+                "shifts": _t_snap.get("shifts") or [],
+                "shift_manage": _t_snap.get("shift_manage") or [],
+                "roster": _t_snap.get("roster") or {},
+            }
+
     return {
         "snapshot_id": matched_snapshot.snapshot_id,
         "office_id": matched_snapshot.office_id,
@@ -623,6 +747,7 @@ def get_issued_roster_snapshot_service(
         "violations": matched_snapshot.violations_json
         or {"messages": [], "details": []},
         "groups": groups_out,
+        "target_rosters": target_rosters,
     }
 
 

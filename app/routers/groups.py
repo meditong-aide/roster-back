@@ -155,12 +155,20 @@ async def list_groups_by_office(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    """ADM 또는 HN 사용자가 자신의 office_id에 해당하는 모든 그룹 조회 (hn_id 포함)."""
+    """ADM/HN/수간호사가 자신의 office_id에 해당하는 모든 그룹 조회.
+
+    권한별 응답:
+    - 마스터 관리자/HN: hn_id 포함
+    - 수간호사: hn_id 제외 (assignment 변경 병동 선택용 readonly 목록)
+    """
     if not current_user:
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
 
-    if not current_user.is_master_admin and str(current_user.hn_auth or '').upper() != 'HN':
-        raise HTTPException(status_code=403, detail="관리자 또는 그룹 관리자만 접근 가능합니다.")
+    _is_admin = bool(current_user.is_master_admin)
+    _is_hn = str(current_user.hn_auth or '').upper() == 'HN'
+    _is_head = bool(getattr(current_user, "is_head_nurse", False))
+    if not (_is_admin or _is_hn or _is_head):
+        raise HTTPException(status_code=403, detail="관리자/그룹관리자/수간호사만 접근 가능합니다.")
 
     rows = (
         db.query(GroupModel)
@@ -168,12 +176,13 @@ async def list_groups_by_office(
         .all()
     )
 
+    _expose_hn = _is_admin or _is_hn
     data = [
         {
             "group_id": str(g.group_id),
             "group_name": str(g.group_name),
             "office_id": str(g.office_id),
-            "hn_id": g.hn_id or [],
+            **({"hn_id": g.hn_id or []} if _expose_hn else {}),
         }
         for g in rows
     ]
