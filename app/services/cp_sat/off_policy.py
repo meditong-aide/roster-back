@@ -66,7 +66,7 @@ def compute_off_bounds(
         min_off_required = eligible_off_days
     else:
         min_off_required = max(0, min(effective_off_days, eligible_off_days))
-        ratio_enable = bool(_get_value(source, "active_range_off_ratio_enable", True))
+        ratio_enable = bool(_get_value(source, "active_range_off_ratio_enable", False))
         if ratio_enable and effective_off_days > 0 and eligible_off_days > 0:
             ref_days = _as_int(reference_days, 0)
             if ref_days <= 0:

@@ -2800,6 +2800,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         for day_map in max_by_day if isinstance(day_map, dict)
     )
     print(f"[MinMaxCoverage] max_by_day type={type(max_by_day).__name__}, len={len(max_by_day) if isinstance(max_by_day, list) else 'N/A'}, sample={max_by_day[0] if isinstance(max_by_day, list) and max_by_day else 'None'}, has_any_max={_has_any_max}")
+    # off_first=True: 사용자가 max coverage를 명시 안 한 코드/일에 대해 min을 max로 강제(=잔여 셀을 OFF로 회수).
+    _off_first_cfg = bool(getattr(cfg, "off_first", False))
+    print(f"[CP-SAT-Basic] [OffFirstCoverage] off_first={_off_first_cfg}, _has_any_max={_has_any_max} → force_min_as_max={_off_first_cfg and not _has_any_max}")
     m_coverage_shortage_vars = []  # M soft min shortage (max coverage 없을 때)
     max_coverage_excess_vars = []  # max coverage 초과 soft 패널티
     daily_assigned_by_code: dict[str, list] = {}  # 일자별 커버리지 균등화용 {code: [(day, assigned_var, need, need_max)]}
@@ -2889,29 +2892,58 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 # 일자별 커버리지 균등화용 수집 (물리일만)
                 if d < D_phys:
                     daily_assigned_by_code.setdefault(code, []).append((d, assigned, need, need_max))
+            elif _off_first_cfg and need > 0:
+                # off_first=True + max 미설정: assigned <= need 하드 (잔여 셀 OFF로 회수)
+                m.Add(assigned <= need)
+                ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                over_vars_by_day.setdefault(d, {})[code] = ov
             elif need > 0:
                 ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                 m.Add(ov >= assigned - need)
                 over_vars_by_day.setdefault(d, {})[code] = ov
 
     # ───────────── 2-D. Max coverage Off 균등 분배 ───
+    # off_first=True: max coverage 미설정이라도 OFF가 잔여 셀로 회수되므로
+    # 일반 간호사 사이에 균등 분배 유도가 핵심 요구사항.
     max_cov_off_equalize_terms = []
-    if _has_any_max:
+    if _has_any_max or _off_first_cfg:
         off_idx = rs.config.shift_types.index('O')
         nurse_off_vars = []
         for n in range(N):
             # 프리셉티는 프리셉터 스케줄을 따라가므로 균등화 대상에서 제외
             if n in preceptee_indices:
                 continue
+            # off_first=True: 주말휴무자·N 전담은 OFF cap이 일반 풀과 상이 → 풀에서 제외
+            #   - 주말휴무자: weekend OFF 고정 슬롯
+            #   - N 전담: 월 N 15회 후 잔여 셀 일괄 OFF (cap 관리 대상 아님)
+            # 나머지 일반 근무자에 대해서만 동일 OFF 수렴 유도
+            if _off_first_cfg:
+                _nu = rs.nurses[n] if n < len(rs.nurses) else None
+                if _nu is not None and bool(getattr(_nu, "is_weekend_off", False)):
+                    continue
+                _raw_nn = getattr(_nu, "is_night_nurse", None) if _nu is not None else None
+                if isinstance(_raw_nn, (set, list, tuple)) and set(_raw_nn) == {"N"}:
+                    continue
+            # off_first=False 경로의 OFF cap 식과 동일한 도메인:
+            #   phys_range_off = month_total_day_range(T0,T1,D_phys) ∖ blocked_by_nurse[n]
+            #   휴가/공가(vacation_off_cells) 제외, 고정 OFF는 X(n,d,off)=1로 자동 카운트
             T0, T1 = join[n], leave[n]
-            phys_days = [d for d in range(T0, min(T1 + 1, D_phys))]
-            if not phys_days:
+            _phys_range_off_eq = month_total_day_range(T0, T1, D_phys)
+            _blk_set_n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+            if _blk_set_n:
+                _phys_range_off_eq = [d for d in _phys_range_off_eq if d not in _blk_set_n]
+            _phys_range_off_eq = [d for d in _phys_range_off_eq if (n, d) not in vacation_off_cells]
+            if not _phys_range_off_eq:
                 continue
-            total_off_n = m.NewIntVar(0, len(phys_days), f"mc_off_{n}")
-            m.Add(
-                total_off_n == sum(X(n, d, off_idx) for d in phys_days if (n, d) not in fixed)
-                + sum(1 for d in phys_days if (n, d) in fixed and fixed[(n, d)] == off_idx)
-            )
+            # off_first=True HARD 풀 가드: 풀먼스 active window 아닌 간호사는 제외
+            #   - 중도 가입자(T0>0) / 중도 퇴사자(T1<D_phys-1) → 최대 OFF 용량 상이
+            #   - blocked_by_nurse 보유자 → 출장/연수 등으로 OFF 가용량 비대칭
+            #   동일 OFF 강제 시 INFEASIBLE 또는 풀 전체 OFF가 그들에 끌려 내려감
+            if _off_first_cfg:
+                if T0 > 0 or T1 < D_phys - 1 or _blk_set_n:
+                    continue
+            total_off_n = m.NewIntVar(0, len(_phys_range_off_eq), f"mc_off_{n}")
+            m.Add(total_off_n == sum(X(n, d, off_idx) for d in _phys_range_off_eq))
             nurse_off_vars.append(total_off_n)
         if len(nurse_off_vars) >= 2:
             off_global_max = m.NewIntVar(0, D_phys, "mc_off_max")
@@ -2920,9 +2952,24 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.AddMinEquality(off_global_min, nurse_off_vars)
             off_range = m.NewIntVar(0, D_phys, "mc_off_range")
             m.Add(off_range == off_global_max - off_global_min)
-            # Off 분산 패널티 (가중치 높게 설정하여 균등 분배 유도)
-            max_cov_off_equalize_terms.append(-200 * off_range)
-            print(f"[MaxCoverage] Off 균등 분배 제약 추가: 간호사 {len(nurse_off_vars)}명")
+            # off_first=True: 일반 풀 OFF range HARD 상한 (소프트 가중치로는 수렴 부족)
+            if _off_first_cfg:
+                _off_first_hard_range = int(getattr(rs.config, "off_first_hard_range", 2) or 2)
+                m.Add(off_range <= _off_first_hard_range)
+                print(f"[MaxCoverage] OFF range HARD ≤ {_off_first_hard_range} 적용 (off_first=True)")
+            _off_eq_weight = -100000 if _off_first_cfg else -200
+            max_cov_off_equalize_terms.append(_off_eq_weight * off_range)
+            # L1 deviation: 양 끝점뿐 아니라 중간 분산도 평탄화
+            if _off_first_cfg and len(nurse_off_vars) >= 3:
+                _N_eq = len(nurse_off_vars)
+                _off_sum = m.NewIntVar(0, D_phys * _N_eq, "mc_off_sum")
+                m.Add(_off_sum == sum(nurse_off_vars))
+                for _i, _ov in enumerate(nurse_off_vars):
+                    _dev = m.NewIntVar(0, D_phys * _N_eq, f"mc_off_dev_{_i}")
+                    m.Add(_dev * _N_eq >= _ov * _N_eq - _off_sum)
+                    m.Add(_dev * _N_eq >= _off_sum - _ov * _N_eq)
+                    max_cov_off_equalize_terms.append(-2000 * _dev)
+            print(f"[MaxCoverage] Off 균등 분배 제약 추가: 간호사 {len(nurse_off_vars)}명, range_weight={_off_eq_weight}")
 
     # ───────────── 2-E. 일자별 커버리지 균등화 (min~max 범위 내 고른 배정) ───
     daily_cov_equalize_terms = []
@@ -3286,7 +3333,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             _off_cap_skip = False
             _auto_min_off = None  # max coverage 기반 자동 최소 OFF
             _auto_max_off = None  # min coverage 기반 자동 최대 OFF
-            if _has_any_max:
+            # off_first=True 시: max coverage 미설정이라도 _auto_max_off가 OFF cap의 단일 소스
+            if _has_any_max or _off_first_cfg:
                 _blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
                 _total_off_capacity = 0  # min coverage 기준 최대 OFF 가용량
                 _total_off_required = 0  # max coverage 기준 최소 OFF 필요량
@@ -3380,6 +3428,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         f"min_off {min_off_required}→{_adjusted_min}"
                     )
                     min_off_required = _adjusted_min
+                # N전담 예외: offcap 고정값 적용 제외 (max는 별도 공식 avail_days-15)
+                if is_n_only:
+                    min_off_required = 0
                 if min_off_required > 0 and phys_range_off:
                     m.Add(
                         sum(
@@ -3438,19 +3489,22 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected:
                             _extra_off += 1
-                        # off_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
+                        # off_first 분기: False=근무 oversupply(OFF tight) / True=min coverage 잔여 OFF 회수
                         _off_first = bool(getattr(cfg, "off_first", False))
                         if _off_first:
-                            max_off_allowed = min(
-                                _base_max + _extra_off,
-                                nonvac_active_days,
-                            )
-                            # max coverage 자동 조정: max_off도 auto 값으로 cap
+                            # off_first=True: daily_shift min coverage 기반 capacity가 단일 cap 소스
+                            # off_days config은 무시 (실제 OFF는 잔여 셀로 자연 결정).
                             if _auto_max_off is not None:
                                 _ratio = nonvac_active_days / max(1, D_phys)
                                 _scaled_auto_max = max(min_off_required, int(_auto_max_off * _ratio))
-                                max_off_allowed = min(max_off_allowed, _scaled_auto_max)
+                                max_off_allowed = min(
+                                    _scaled_auto_max + _extra_off,
+                                    nonvac_active_days,
+                                )
                                 max_off_allowed = max(max_off_allowed, min_off_required)
+                            else:
+                                # 안전 폴백: _auto_max_off 계산 실패 시 nonvac_active_days로 cap
+                                max_off_allowed = max(min_off_required, nonvac_active_days)
                         else:
                             # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
                             max_off_allowed = min(
