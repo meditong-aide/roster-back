@@ -109,7 +109,13 @@ def _collect_assignment_recipients(
 
 
 def _effective_end_date(row: NurseAssignment) -> Optional[date]:
-    """assignment의 실제 종료 경계(end_date 우선, 없으면 expected_end_date)."""
+    """assignment의 실제 종료 경계(end_date 우선, 없으면 expected_end_date).
+
+    병동이동은 영구 이동이라 flush가 set한 end_date(today)는 상태 마커일 뿐
+    실제 종료가 아니다. 따라서 expected_end_date 만 인정한다.
+    """
+    if row.reason == "병동이동":
+        return row.expected_end_date
     return row.end_date or row.expected_end_date
 
 

@@ -600,8 +600,8 @@ def get_issued_roster_snapshot_service(
     _meta = matched_snapshot.meta_json or {}
     _nurses_json = matched_snapshot.nurses_json or []
 
-    # 관련 병동(group) 목록: 발행 그룹 + 각 간호사 소속 + 조회 월과 strict overlap 되는
-    # inbound target 만 취합 (N_tail 버퍼는 auth gate 에서만 사용, groups 집계는 월내 strict).
+    # 관련 병동(group) 목록: 발행 그룹 + 조회 월과 strict overlap 되는 모든 파견/병동이동.
+    # N_tail 버퍼는 auth gate 에서만 사용, groups 집계는 월내 strict.
     # 예: 4/14~6/15 파견 → 4/5/6월 모두 포함. 5/1~5/8 파견 → 5월만 포함 (4월·6월 제외).
     _m_start = date(year, month, 1)
     _m_end = date(year, month, calendar.monthrange(year, month)[1])
@@ -618,6 +618,27 @@ def get_issued_roster_snapshot_service(
     if matched_snapshot.group_id:
         _gid_set.add(matched_snapshot.group_id)
     _name_frozen: dict[str, str] = {}
+
+    def _absorb_window(_block) -> None:
+        """nurses_json 내 inbound 블록의 월 overlap 만 _gid_set 에 흡수."""
+        if isinstance(_block, dict):
+            _block = _block.get("inbound_list") or []
+        for _entry in _block or []:
+            if not isinstance(_entry, dict):
+                continue
+            _s = _parse_iso_date(_entry.get("startDate") or _entry.get("start_date"))
+            _e = _parse_iso_date(_entry.get("endDate") or _entry.get("end_date"))
+            if _s is None or _s > _m_end:
+                continue
+            if _e is not None and _e < _m_start:
+                continue
+            _tgid = _entry.get("target_group_id") or _entry.get("targetGroupId")
+            if _tgid:
+                _gid_set.add(_tgid)
+                _tname = _entry.get("target_group_name") or _entry.get("targetGroupName")
+                if _tname:
+                    _name_frozen[_tgid] = _tname
+
     # 주의: 간호사의 group_id 는 자동으로 _gid_set 에 추가하지 않는다.
     # - home 간호사의 group_id 는 publishing group 과 동일(이미 추가됨).
     # - inbound 간호사(타 병동 home)의 home group 은 현재 월과 무관한 과거/고아 기록일 수
@@ -629,30 +650,12 @@ def get_issued_roster_snapshot_service(
         _n_gname = _n.get("group_name")
         if _n_gid and _n_gname:
             _name_frozen[_n_gid] = _n_gname
-        _inbound_raw = _n.get("inbound")
-        # 구 스냅샷 호환: `{inbound_list: [...]}` 래핑 형태
-        if isinstance(_inbound_raw, dict):
-            _inbound_raw = _inbound_raw.get("inbound_list") or []
-        for _ib in _inbound_raw or []:
-            if not isinstance(_ib, dict):
-                continue
-            _s = _parse_iso_date(_ib.get("startDate") or _ib.get("start_date"))
-            _e = _parse_iso_date(_ib.get("endDate") or _ib.get("end_date"))
-            # 월 strict overlap: start <= m_end AND (end is None OR end >= m_start)
-            if _s is None or _s > _m_end:
-                continue
-            if _e is not None and _e < _m_start:
-                continue
-            _tgid = _ib.get("target_group_id") or _ib.get("targetGroupId")
-            if _tgid:
-                _gid_set.add(_tgid)
-                _tname = _ib.get("target_group_name") or _ib.get("targetGroupName")
-                if _tname:
-                    _name_frozen[_tgid] = _tname
+        # revert 이전 발행된 stale snapshot 의 outbound/is_outbound 키 제거
+        _n.pop("outbound", None)
+        _n.pop("is_outbound", None)
+        _absorb_window(_n.get("inbound"))
 
-    # Inbound-direction live 집계: 타 병동 간호사가 현재 병동으로 파견/이동된 경우,
-    # 해당 파견의 source_group_id 를 groups 에 포함 (스냅샷의 inbound_list 는 outbound 만
-    # 저장하므로 별도 쿼리가 필요).
+    # Live 집계: inbound (target=발행그룹) 만. source_group_id 를 groups 에 추가.
     if matched_snapshot.group_id:
         from services.assignment_service import (
             get_active_assignments_for_month as _get_assigns_for_month,
@@ -661,10 +664,12 @@ def get_issued_roster_snapshot_service(
             db, matched_snapshot.group_id, year, month
         )
         for _a in _live_assigns:
+            if _a.reason not in ("파견", "병동이동"):
+                continue
             if (
                 _a.target_group_id == matched_snapshot.group_id
                 and _a.source_group_id
-                and _a.reason in ("파견", "병동이동")
+                and _a.source_group_id != matched_snapshot.group_id
             ):
                 _gid_set.add(_a.source_group_id)
     _meta_gname = _meta.get("group_name")
@@ -1088,6 +1093,7 @@ def create_issued_roster_snapshot(
             db.query(NurseAssignment)
             .filter(
                 NurseAssignment.nurse_id.in_(_all_nids),
+                NurseAssignment.target_group_id == group_id,
                 NurseAssignment.status == "active",
                 NurseAssignment.reason.in_(("파견", "병동이동")),
             )
@@ -1095,7 +1101,12 @@ def create_issued_roster_snapshot(
             .all()
         )
         if _asg_rows:
-            _gid_set = {r.target_group_id for r in _asg_rows if r.target_group_id}
+            _gid_set: set[str] = set()
+            for r in _asg_rows:
+                if r.target_group_id:
+                    _gid_set.add(r.target_group_id)
+                if r.source_group_id:
+                    _gid_set.add(r.source_group_id)
             _name_map: dict[str, str] = {}
             if _gid_set:
                 for gid, gname in (
@@ -1105,12 +1116,16 @@ def create_issued_roster_snapshot(
                 ):
                     _name_map[gid] = gname or ""
             for r in _asg_rows:
+                if r.source_group_id == group_id:
+                    continue
                 entry = {
                     "startDate": r.start_date.isoformat() if r.start_date else None,
                     "endDate": r.expected_end_date.isoformat() if r.expected_end_date else None,
                     "reason": r.reason,
                     "target_group_id": r.target_group_id,
                     "target_group_name": _name_map.get(r.target_group_id, ""),
+                    "source_group_id": r.source_group_id,
+                    "source_group_name": _name_map.get(r.source_group_id, ""),
                 }
                 _inbound_blocks.setdefault(r.nurse_id, {"inbound_list": []})["inbound_list"].append(entry)
 

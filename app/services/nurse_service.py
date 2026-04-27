@@ -637,11 +637,19 @@ def bulk_update_nurses_service(
         update_data = profile.dict(exclude_unset=True)
 
         # === 배정(파견/병동이동/휴직/퇴사/프리셉티) payload 먼저 처리 ===
+        # 단건(assignment) + 다건(assignments) 모두 지원. 다건이 먼저 적용된 후 단건이 뒤따른다.
         assignment_payload = update_data.pop("assignment", None)
+        assignments_payload = update_data.pop("assignments", None)
+        _payloads_to_apply: List[Dict[str, Any]] = []
+        if assignments_payload:
+            _payloads_to_apply.extend([p for p in assignments_payload if p])
         if assignment_payload is not None:
-            _dispatch_assignment_payload(
-                db, profile.nurse_id, assignment_payload, current_user
-            )
+            _payloads_to_apply.append(assignment_payload)
+        if _payloads_to_apply:
+            for _p in _payloads_to_apply:
+                _dispatch_assignment_payload(
+                    db, profile.nurse_id, _p, current_user
+                )
             db.refresh(db_nurse)
             # 배정 dispatch로 edit mode가 바뀔 수 있음 → 재평가
             mode, assign_row = resolve_edit_target(db, target_group_id, profile.nurse_id)
@@ -656,7 +664,7 @@ def bulk_update_nurses_service(
 
         if mode != "source":
             # 배정 payload만 처리하고 프로필 필드 업데이트 권한은 없을 수 있음
-            if assignment_payload is not None and not update_data:
+            if _payloads_to_apply and not update_data:
                 updated_count += 1
                 continue
             logging.warning(
@@ -1074,10 +1082,18 @@ def update_nurse_profile_service(
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
 
     fields = update_data.dict(exclude_unset=True)
-    # assignment payload는 별도 브랜치로 분리 후 source/target 저장 단계에서 제외
+    # assignment payload는 별도 브랜치로 분리 후 source/target 저장 단계에서 제외.
+    # 단건(assignment) + 다건(assignments) 모두 지원 — 다건 먼저 적용 후 단건.
     assignment_payload = fields.pop("assignment", None)
+    assignments_payload = fields.pop("assignments", None)
+    _payloads_to_apply: List[Dict[str, Any]] = []
+    if assignments_payload:
+        _payloads_to_apply.extend([p for p in assignments_payload if p])
     if assignment_payload is not None:
-        _dispatch_assignment_payload(db, nurse_id, assignment_payload, current_user)
+        _payloads_to_apply.append(assignment_payload)
+    if _payloads_to_apply:
+        for _p in _payloads_to_apply:
+            _dispatch_assignment_payload(db, nurse_id, _p, current_user)
         # assignment 저장 직후 resolve_edit_target 재평가 위해 세션 refresh
         db.refresh(nurse)
 
@@ -1181,7 +1197,7 @@ def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> Non
 
 _ASSIGNMENT_CREATE_FIELDS: Tuple[str, ...] = (
     "source_group_id", "target_group_id", "office_id",
-    "start_date", "expected_end_date", "reason",
+    "start_date", "expected_end_date", "end_date", "reason",
     "note",
     "target_weekly_off_type", "target_weekly_off_enabled", "target_weekly_off_weekday",
     "target_shift_types", "target_team_id", "target_grade",
@@ -1223,6 +1239,10 @@ def _dispatch_assignment_payload(
     if op == "create":
         data = {k: payload.get(k) for k in _ASSIGNMENT_CREATE_FIELDS}
         data["nurse_id"] = nurse_id
+        # 프론트 호환: end_date 키로 들어온 값을 expected_end_date 로 fold
+        if data.get("expected_end_date") is None and data.get("end_date") is not None:
+            data["expected_end_date"] = data["end_date"]
+        data.pop("end_date", None)
         # source_group_id / office_id 자동 보정 (프론트 전송 필수항목 최소화)
         _src_gid = data.get("source_group_id")
         _office = data.get("office_id")
@@ -1761,12 +1781,13 @@ def _load_inbound_map(
 
 
 def _build_inbound_blocks(
-    db: Session, nurse_ids: List[str]
+    db: Session,
+    nurse_ids: List[str],
 ) -> Dict[str, Dict[str, Any]]:
     """간호사별 활성 파견/병동이동/휴직/퇴사/프리셉티 블록 구성.
 
     Returns: dict[nurse_id] = {
-        "inbound_list": [InboundEntry dict, ...],   # 5종 전부, start_date ASC
+        "inbound_list": [InboundEntry dict, ...],
         "current_assignment": {CurrentAssignment dict} or None,
     }
     current_assignment: 휴직/퇴사 > 프리셉티 > 파견/병동이동 우선,
@@ -1786,7 +1807,12 @@ def _build_inbound_blocks(
     )
     if not rows:
         return {}
-    gid_set = {r.target_group_id for r in rows if r.target_group_id}
+    gid_set: set[str] = set()
+    for r in rows:
+        if r.target_group_id:
+            gid_set.add(r.target_group_id)
+        if r.source_group_id:
+            gid_set.add(r.source_group_id)
     name_map: Dict[str, str] = {}
     if gid_set:
         for gid, gname in (
@@ -1807,6 +1833,7 @@ def _build_inbound_blocks(
             "startDate": r.start_date.isoformat() if r.start_date else None,
             "endDate": _end.isoformat() if _end else None,
             "source_group_id": r.source_group_id,
+            "source_group_name": name_map.get(r.source_group_id, ""),
             "target_group_id": r.target_group_id,
             "target_group_name": name_map.get(r.target_group_id, ""),
             "office_id": r.office_id,
@@ -1820,9 +1847,11 @@ def _build_inbound_blocks(
             "target_fixed_shift": r.target_fixed_shift,
             "target_wanted_max_requests": r.target_wanted_max_requests,
         }
-        blocks.setdefault(
-            r.nurse_id, {"inbound_list": [], "current_assignment": None}
-        )["inbound_list"].append(entry)
+        block = blocks.setdefault(
+            r.nurse_id,
+            {"inbound_list": [], "current_assignment": None},
+        )
+        block["inbound_list"].append(entry)
         # 우선순위 산정: priority 작을수록, start_date 클수록 우선
         prio = _ASSIGNMENT_PRIORITY.get(r.reason, 99)
         cand = (prio, r.start_date, r)
@@ -1843,6 +1872,7 @@ def _build_inbound_blocks(
             "startDate": row.start_date.isoformat() if row.start_date else None,
             "endDate": _end.isoformat() if _end else None,
             "source_group_id": row.source_group_id,
+            "source_group_name": name_map.get(row.source_group_id, "") or None,
             "target_group_id": row.target_group_id,
             "target_group_name": name_map.get(row.target_group_id, "") or None,
             "note": getattr(row, "note", None),

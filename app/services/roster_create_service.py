@@ -3404,6 +3404,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         _inbound_assignments.append(a)
     _existing_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
     _inbound_nurse_ids = {str(a.nurse_id) for a in _inbound_assignments} - _existing_nurse_ids
+    # 병동이동 flush 후: nurse.group_id가 이미 target으로 옮겨져 engine_nurses에 자연 포함된 케이스.
+    # 이런 간호사도 mid-month 시작이면 active_range를 assignment 기간으로 클리핑해야
+    # weekly_off가 이동 이전 일자에 박히는 누수를 막을 수 있다.
+    _flushed_transfer_ids = {str(a.nurse_id) for a in _inbound_assignments} & _existing_nurse_ids
     if _inbound_nurse_ids:
         _inbound_nurses = db.query(Nurse).filter(
             Nurse.nurse_id.in_(_inbound_nurse_ids),
@@ -3435,18 +3439,37 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             f"[Assignment][Inbound] 인바운드 간호사 {len(_inbound_nurses)}명 엔진 추가: "
             f"{[f'{n.name}({n.nurse_id})' for n in _inbound_nurses]}"
         )
+    if _flushed_transfer_ids:
+        _flushed_names = []
+        for n in engine_nurses:
+            if str(n.nurse_id) in _flushed_transfer_ids:
+                # 인바운드와 동일하게 마킹하여 build_blocked_days에서 인바운드 분기를 타게 한다.
+                setattr(n, 'is_inbound', True)
+                _flushed_names.append(f'{getattr(n, "name", "?")}({n.nurse_id})')
+        print(
+            f"[Assignment][FlushedTransfer] 병동이동 flush된 간호사 {len(_flushed_transfer_ids)}명 활동범위 클리핑 대상: "
+            f"{_flushed_names}"
+        )
     active_range_candidates = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in engine_nurses
     }
     # 인바운드 간호사: active_range를 assignment 기간 기준으로 오버라이드 (joining_date가 다른 그룹 기준이므로)
-    for _ia in (_inbound_assignments if _assignments else []):
-        nid = str(_ia.nurse_id)
-        if nid not in _inbound_nurse_ids:
+    # 병동이동 flush 케이스(_flushed_transfer_ids)도 동일하게 클리핑한다.
+    # 단 병동이동은 영구 이동이므로 end_date(=flush 시각의 today)로 clip하지 않고 월말까지 활성으로 본다.
+    _assignment_by_nurse_all = {str(a.nurse_id): a for a in _inbound_assignments}
+    _override_targets = _inbound_nurse_ids | _flushed_transfer_ids
+    for nid in _override_targets:
+        _ia = _assignment_by_nurse_all.get(nid)
+        if _ia is None:
             continue
         _a_start = _ia.start_date
-        _a_end = _ia.end_date or _ia.expected_end_date or (month_start + timedelta(days=days_in_month - 1))
         _month_end = month_start + timedelta(days=days_in_month - 1)
+        if _ia.reason == "병동이동":
+            # 병동이동은 영구 이동이라 end_date(today marker)는 무시하고 월말까지 활성
+            _a_end = _ia.expected_end_date or _month_end
+        else:
+            _a_end = _ia.end_date or _ia.expected_end_date or _month_end
         _s = max(_a_start, month_start)
         _e = min(_a_end, _month_end)
         if _s <= _e:

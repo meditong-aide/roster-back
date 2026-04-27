@@ -441,10 +441,10 @@ class NurseProfile(BaseModel):
         default=False,
         description="호출자 병동이 target(파견/병동이동 수신측)일 때 True",
     )
-    # 기간 설정(파견/병동이동/휴직/퇴사/프리셉티) 활성 이력 (source/target 양쪽에서 동일 표시)
+    # 기간 설정(파견/병동이동/휴직/퇴사/프리셉티) 활성 이력.
     inbound: List["InboundEntry"] = Field(
         default_factory=list,
-        description="활성 파견/병동이동/휴직/퇴사/프리셉티 이력 배열. 없으면 빈 배열 []",
+        description="활성 파견/병동이동/휴직/퇴사/프리셉티 이력. 없으면 [].",
     )
     # 현재 대표 1건 flat 요약 (프론트 폼 바인딩용)
     current_assignment: Optional["CurrentAssignment"] = Field(
@@ -454,7 +454,13 @@ class NurseProfile(BaseModel):
     # 일괄 업데이트(POST /bulk-update) 시 동반 전달 가능한 배정 payload
     assignment: Optional[NurseAssignmentPayload] = Field(
         default=None,
-        description="bulk 업데이트와 함께 배정(파견/병동이동/휴직/퇴사/프리셉티) create/update/cancel 수행",
+        description="bulk 업데이트와 함께 배정(파견/병동이동/휴직/퇴사/프리셉티) create/update/cancel 수행 — 단건",
+    )
+    # 사이드 프로필에서 한 번에 여러 파견을 작성/수정/취소할 때 사용하는 다건 payload.
+    # `assignment`(단건) 와 동시 전달되면 둘 다 처리(assignments 먼저, 그 다음 단건).
+    assignments: Optional[List[NurseAssignmentPayload]] = Field(
+        default=None,
+        description="다건 배정 처리 — 한 간호사의 여러 파견을 한 번에 create/update/cancel",
     )
 
     # @field_validator('fixed_shift')
@@ -556,7 +562,11 @@ class NurseProfileUpdate(BaseModel):
     wanted_max_requests: Optional[int] = None
     assignment: Optional[NurseAssignmentPayload] = Field(
         default=None,
-        description="배정(파견/병동이동 등) create/update/cancel을 프로필 수정과 함께 수행",
+        description="배정(파견/병동이동 등) create/update/cancel을 프로필 수정과 함께 수행 — 단건",
+    )
+    assignments: Optional[List[NurseAssignmentPayload]] = Field(
+        default=None,
+        description="사이드 프로필에서 여러 파견을 한 번에 create/update/cancel — 다건",
     )
 
 
