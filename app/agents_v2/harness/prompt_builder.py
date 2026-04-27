@@ -152,9 +152,10 @@ def _build_few_shot_section() -> str:
 
 def _build_rules_section(ctx: SessionContext) -> str:
     role_rules = ""
-    if ctx.user_role == "HN":
-        role_rules = """
-- ✅ 수간호사(HN) 권한: 모든 간호사의 데이터 조회/수정이 가능합니다.
+    if ctx.user_role in ("HN", "ADM"):
+        role_label = "수간호사(HN)" if ctx.user_role == "HN" else "관리자(ADM)"
+        role_rules = f"""
+- ✅ {role_label} 권한: 모든 간호사의 데이터 조회/수정이 가능합니다.
 - 다른 간호사의 원티드 취소, 근무 변경, 속성 수정 모두 가능합니다.
 - 권한 판단은 시스템이 처리하므로, 도구를 직접 호출하세요. 권한을 스스로 판단하지 마세요."""
     else:

@@ -115,7 +115,7 @@ class OpenAIClient:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4.1-mini",
+        model: str = "gpt-5.5",
     ):
         from openai import OpenAI
 

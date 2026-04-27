@@ -70,7 +70,9 @@ def get_wanted_submissions(
     q = (
         db.query(NurseShiftRequest, WantedRequest.is_submitted, WantedRequest.submitted_at)
         .join(WantedRequest, NurseShiftRequest.request_id == WantedRequest.request_id)
+        .join(Nurse, NurseShiftRequest.nurse_id == Nurse.nurse_id)
         .filter(WantedRequest.month == month_str)
+        .filter(Nurse.group_id == group_id)
     )
     if nurse_id:
         q = q.filter(NurseShiftRequest.nurse_id == nurse_id)
@@ -102,20 +104,36 @@ def get_wanted_adjustments(
     group_id: str,
     year: int,
     month: int,
+    *,
+    nurse_id: str | None = None,
+    date_range: tuple[str, str] | None = None,
+    source_types: list[str] | None = None,
+    is_applied: bool | None = None,
 ) -> list[dict]:
     """Get fixed wanted (adjustment) entries for a group/month.
 
-    These are the post-submission adjustments with is_applied flags.
+    Returned rows expose ``source_type`` and ``original_shift_id`` so the caller
+    can distinguish nurse-submitted intent from head-nurse interventions:
+      - ``original``: nurse-submitted, shift_id is the answer
+      - ``modified``: nurse-submitted but head nurse changed code → original_shift_id is the nurse's intent
+      - ``added``: head-nurse only, no nurse submission
+      - ``weekly_off``: auto-assigned weekly off
     """
-    rows = (
-        db.query(FixedWantedEntry)
-        .filter(
-            FixedWantedEntry.group_id == group_id,
-            FixedWantedEntry.year == year,
-            FixedWantedEntry.month == month,
-        )
-        .all()
+    q = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
     )
+    if nurse_id:
+        q = q.filter(FixedWantedEntry.nurse_id == nurse_id)
+    if date_range:
+        start, end = date_range
+        q = q.filter(FixedWantedEntry.shift_date >= start, FixedWantedEntry.shift_date <= end)
+    if source_types:
+        q = q.filter(FixedWantedEntry.source_type.in_(source_types))
+    if is_applied is not None:
+        q = q.filter(FixedWantedEntry.is_applied == is_applied)
+    rows = q.all()
     return [
         {
             "entry_id": r.id,
@@ -125,7 +143,11 @@ def get_wanted_adjustments(
             "month": r.month,
             "work_date": str(r.shift_date) if r.shift_date else None,
             "shift_id": r.shift_id,
+            "source_type": r.source_type,
+            "original_shift_id": r.original_shift_id,
             "is_applied": bool(r.is_applied) if hasattr(r, "is_applied") else True,
+            "reason": r.reason,
+            "head_nurse_memo": r.head_nurse_memo,
         }
         for r in rows
     ]

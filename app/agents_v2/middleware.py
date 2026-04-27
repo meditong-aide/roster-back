@@ -168,8 +168,8 @@ def _check_permission(
     """Check permissions. Returns error message if blocked."""
     normalized = skill_name.replace("-", "_")
 
-    # Non-HN users cannot modify other nurses' data
-    if normalized in _MUTATION_SKILLS and ctx.user_role != "HN":
+    # Non-admin users cannot modify other nurses' data
+    if normalized in _MUTATION_SKILLS and ctx.user_role not in ("HN", "ADM"):
         nurse_name = args.get("nurse_name", "")
         if nurse_name and nurse_name != ctx.nurse_name and nurse_name not in (
             "나",

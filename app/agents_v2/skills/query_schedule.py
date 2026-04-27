@@ -93,17 +93,33 @@ def _query_wanted_submissions(db, group_id, year, month, params):
 
 
 def _query_wanted_adjustments(db, group_id, year, month, params):
-    rows = wanted_tools.get_wanted_adjustments(db, group_id, year, month)
-
     nurse_ids = params.get("nurse_ids")
-    if nurse_ids:
+    single_nurse = nurse_ids[0] if nurse_ids and len(nurse_ids) == 1 else None
+
+    date_range_param = params.get("date_range")
+    date_range_tuple = None
+    if date_range_param and "~" in str(date_range_param):
+        start, end = str(date_range_param).split("~", 1)
+        date_range_tuple = (start.strip(), end.strip())
+
+    source_types = params.get("source_types")
+    is_applied = params.get("is_applied")
+
+    rows = wanted_tools.get_wanted_adjustments(
+        db, group_id, year, month,
+        nurse_id=single_nurse,
+        date_range=date_range_tuple,
+        source_types=source_types,
+        is_applied=is_applied,
+    )
+
+    if nurse_ids and not single_nurse:
         rows = [r for r in rows if r.get("nurse_id") in nurse_ids]
 
     shift_codes = params.get("shift_codes")
     if shift_codes:
         rows = [r for r in rows if r.get("shift_id") in shift_codes]
 
-    # Filter by predicate
     predicate = params.get("predicate", {})
     if predicate.get("name") == "off" and predicate.get("arguments", {}).get("shift_ids"):
         off_ids = set(predicate["arguments"]["shift_ids"])
