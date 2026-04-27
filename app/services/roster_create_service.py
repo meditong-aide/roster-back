@@ -3463,10 +3463,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is not None
     ]
+    # 인바운드는 source 그룹의 role이 파트장 등 비RN이어도 target에서 임상 배정되어야 함
     engine_nurses = [
         n
         for n in engine_nurses
         if str(getattr(n, 'role', 'RN') or 'RN').upper() in ('RN', 'AN')
+        or bool(getattr(n, 'is_inbound', False))
     ]
     engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
     preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
