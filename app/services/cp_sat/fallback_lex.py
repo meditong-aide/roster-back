@@ -26,6 +26,7 @@ from services.cp_sat.allowed_shift_types import (
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
 from services.cp_sat.m_coverage import compute_main_bucket_indices
 from services.cp_sat.night_distribution_log import log_n_even_distribution
+from services.constraints.team_constraints import add_team_min_constraints
 from services.day_windows import iter_nurse_days, build_active_days
 
 
@@ -1868,6 +1869,21 @@ def optimize_fallback_lex_hard_first(
         except Exception as e:
             print('예외데쇼!!', e)
             pass
+
+        # team_min hard 제약 — Stage 1, 2 에도 등록한다.
+        # Stage 3 는 build_fallback_stage3_objective_terms 가 자체 호출하므로 중복 회피.
+        # 누락 시 Stage 3 INFEASIBLE → Stage 2 해 commit 경로에서 team_min 위반이 새어나감.
+        if stage in (1, 2):
+            try:
+                _gs_tm = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+                if _gs_tm in ("TEAM", "COMBINED"):
+                    add_team_min_constraints(
+                        m, roster_system, X, join, leave,
+                        grade_strategy=_gs_tm,
+                        blocked_by_nurse=blocked_by_nurse,
+                    )
+            except Exception as e:
+                print(f"{logger_prefix} [Stage{stage}] team_min hard 등록 실패: {e}")
 
         # stage별 목적/고정
         if stage == 1:

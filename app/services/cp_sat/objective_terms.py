@@ -743,10 +743,14 @@ def build_main_objective_terms(
         print("grade_strategy", grade_strategy)
         if grade_strategy in ("TEAM", "COMBINED"):
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
-            try:
-                obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy=grade_strategy, blocked_by_nurse=blocked_by_nurse))
-            except Exception as e:
-                print("team_min_constraints 예외 발생", e)
+
+    # (4-6-tm) team_min 하드/소프트 제약은 LNS 라운드에서도 유지되어야 하므로 게이트 밖으로 분리
+    try:
+        _gs_tm = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        if _gs_tm in ("TEAM", "COMBINED"):
+            obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy=_gs_tm, blocked_by_nurse=blocked_by_nurse))
+    except Exception as e:
+        print("team_min_constraints 예외 발생", e)
 
     # (4-6a) Grade 분배 목적 항 (fallback Stage3와 동일)
     try:

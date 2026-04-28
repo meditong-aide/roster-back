@@ -108,7 +108,7 @@ class NurseRosterConfig:
     # 팀마다 개별 min 설정 가능. use_mid=True 일 때 'M' 키 사용 가능.
     # 팀이 맵에 없거나 값이 {} 이면 "제약 없음".
     team_min_by_team: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    team_min_soft_fallback: bool = True  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
+    team_min_soft_fallback: bool = False  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
     team_min_penalty_weight: int = 500   # 소프트 모드에서 팀 미달 슬랙 패널티
     # ── 팀 내 인계 제한(handoff restrictions) ──
     # team_handoff_policy_by_team[team_id_str] = {

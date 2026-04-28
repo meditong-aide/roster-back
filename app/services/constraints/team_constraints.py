@@ -62,10 +62,11 @@ def add_team_min_constraints(
 
     team_min_by_team = dict(getattr(cfg, "team_min_by_team", {}) or {})
     if not team_min_by_team:
+        print("[TeamMin] skip: cfg.team_min_by_team is empty")
         return obj_terms
 
     use_mid = bool(getattr(cfg, "use_mid", False))
-    allow_soft = bool(getattr(cfg, "team_min_soft_fallback", True))
+    allow_soft = bool(getattr(cfg, "team_min_soft_fallback", False))
     penalty_weight = int(getattr(cfg, "team_min_penalty_weight", 500) or 0)
 
     # 팀별 멤버 인덱스 집합
@@ -76,9 +77,12 @@ def add_team_min_constraints(
             continue
         team_members.setdefault(str(tid), []).append(idx)
     if not team_members:
+        print("[TeamMin] skip: no nurses have team_id")
         return obj_terms
 
     shift_types = list(rs.config.shift_types)
+    added_cnt = 0
+    skipped_capacity: list[tuple[str, int, str, int, int]] = []  # (tid, day, code, active, min_t)
 
     for tid, members in team_members.items():
         if not members:
@@ -99,6 +103,7 @@ def add_team_min_constraints(
                 upper = len(active)
                 if upper < min_t and not allow_soft:
                     # 하드 모드에서 데이터 부족으로 강제 불가 → 스킵(INFEASIBLE 방지)
+                    skipped_capacity.append((tid, d, code, upper, min_t))
                     continue
                 vars_sum = sum(X(n, d, s_idx) for n in active)
                 if allow_soft:
@@ -108,5 +113,21 @@ def add_team_min_constraints(
                         obj_terms.append(-penalty_weight * slack)
                 else:
                     m.Add(vars_sum >= min_t)
+                added_cnt += 1
+
+    mode = "soft" if allow_soft else "hard"
+    print(
+        f"[TeamMin] mode={mode} teams={len(team_members)} added={added_cnt} "
+        f"skipped_capacity={len(skipped_capacity)}"
+    )
+    if skipped_capacity:
+        sample = skipped_capacity[:10]
+        for tid, d, code, upper, min_t in sample:
+            print(
+                f"[TeamMin][skip-capacity] team={tid} day={d+1} code={code} "
+                f"active={upper} < min={min_t} (hard mode)"
+            )
+        if len(skipped_capacity) > len(sample):
+            print(f"[TeamMin][skip-capacity] ...and {len(skipped_capacity) - len(sample)} more")
 
     return obj_terms

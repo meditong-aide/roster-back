@@ -579,17 +579,11 @@ class CPSATBasicEngine:
             preceptee_on=bool(config_data.get('preceptee_on', False)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
             use_mid=bool(config_data.get('use_mid', False)),
-            # team_balance_enable=team_balance_enable,
-            team_balance_enable=True, # test
-            team_balance_gauge=10, # test
-            # team_balance_gauge=team_balance_gauge,
-            # team_balance_weight=team_balance_weight,
-            # team_balance_weight=100, # test
-            # team_balance_top_days=team_balance_top_days,
-            team_balance_top_days=30,
-            # team_balance_top_days=30, # test
+            # team_balance_* 는 DB 의 team_balance_enable / team_balance_gauge 를 그대로 따른다.
+            # team_balance_top_days, weight 는 __post_init__ 가 gauge 로부터 자동 산출한다.
+            team_balance_enable=team_balance_enable,
+            team_balance_gauge=team_balance_gauge,
             team_balance_focus_shifts=team_balance_focus,
-            # team_balance_focus_shifts=['D', 'E', 'N'], # test
             team_balance_mode=team_balance_mode,
             team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
@@ -612,7 +606,7 @@ class CPSATBasicEngine:
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
             # 팀별 최소 시프트 커버리지(팀 단위 per-team 제약)
             team_min_by_team=config_data.get("team_min_by_team") or {},
-            team_min_soft_fallback=bool(config_data.get("team_min_soft_fallback", True)),
+            team_min_soft_fallback=bool(config_data.get("team_min_soft_fallback", False)),
             team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 500) or 0),
             # 팀 내 인계 제한 정책(팀별)
             team_handoff_policy_by_team=config_data.get("team_handoff_policy_by_team") or {},
@@ -1622,91 +1616,91 @@ class CPSATBasicEngine:
         except Exception as e:
             print(f"{self.logger_prefix} Grade 요약 출력 중 오류: {e}")
 
-        # Grade-aware Local Repair (Phase 3)
-        try:
-            grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
-                from services.repairs.grade_repair import grade_local_repair
-                updated_roster, repair_log = grade_local_repair(
-                    roster_system,
-                    grade_config,
-                    max_iterations=100,
-                    max_moves_per_nurse=1,
-                )
-                roster_system.roster = updated_roster
-                # Grade Repair 이후 프리셉티 재동기화
-                _pf = bool(getattr(roster_system.config, 'preceptee_on', False))
-                if _pf and hasattr(roster_system, 'nurses'):
-                    _st = roster_system.config.shift_types
-                    _oi = _st.index('O') if 'O' in _st else None
-                    _std = {'D', 'E', 'N', 'O'}
-                    if bool(getattr(roster_system.config, 'use_mid', False)):
-                        _std.add('M')
-                    _id2i = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-                    _sc = 0
-                    _gr_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
-                    _gr_fw_restored = 0
-                    for _n, _nu in enumerate(roster_system.nurses):
-                        _pid = getattr(_nu, 'preceptor_id', None)
-                        if not _pid or _pid not in _id2i:
-                            continue
-                        _pi = _id2i[_pid]
-                        _gr_follow_set = _pp_follow_days.get(_n) if _pp_follow_days else None
-                        if _gr_follow_set is not None:
-                            for _fd in _gr_follow_set:
-                                if _fd < roster_system.num_days:
-                                    roster_system.roster[_n, _fd, :] = roster_system.roster[_pi, _fd, :]
-                        else:
-                            roster_system.roster[_n] = roster_system.roster[_pi].copy()
-                        if _oi is not None:
-                            for _d in range(roster_system.num_days):
-                                if _gr_follow_set is not None and _d not in _gr_follow_set:
-                                    continue
-                                if (_n, _d) in _gr_pte_fw:
-                                    _fw_code = _gr_pte_fw[(_n, _d)]
-                                    if _fw_code in _st:
-                                        roster_system.roster[_n, _d, :] = 0
-                                        roster_system.roster[_n, _d, _st.index(_fw_code)] = 1
-                                        _gr_fw_restored += 1
-                                        continue
-                                _need = False
-                                _orig = fixed_original_shift_map.get((_pi, _d))
-                                if _orig:
-                                    _ou2 = _orig.upper()
-                                    if _ou2 not in _std and _ou2 not in _work_sub_ids:
-                                        _need = True
-                                else:
-                                    _ia = np.where(roster_system.roster[_pi, _d] == 1)[0]
-                                    if len(_ia) > 0:
-                                        _sc2 = _st[int(_ia[0])]
-                                        if _sc2 not in _std and _sc2.upper() not in _work_sub_ids:
-                                            _need = True
-                                if _need:
-                                    roster_system.roster[_n, _d, :] = 0
-                                    roster_system.roster[_n, _d, _oi] = 1
-                        _sc += 1
-                    if _sc:
-                        _msg = f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명"
-                        if _gr_fw_restored:
-                            _msg += f", fixed_wanted 재적용: {_gr_fw_restored}건"
-                        print(_msg)
-                _log_grade_result(
-                    roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
-                )
-                # repair 로그 간단 출력
-                if repair_log:
-                    print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
-                    for r in repair_log[:10]:
-                        print(f"{self.logger_prefix} [REPAIR] {r}")
-                # repair 이후 결과로 DB 변환 갱신
-                result = self._convert_result_to_db_format(
-                    roster_system,
-                    nurses,
-                    canonical_to_shift_id=canonical_to_shift_id,
-                    fixed_original_shift_map=fixed_original_shift_map,
-                )
-        except Exception as e:
-            print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
+        # # Grade-aware Local Repair (Phase 3)
+        # try:
+        #     grade_strategy_norm = str(grade_strategy or "BASE").upper()
+        #     if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
+        #         from services.repairs.grade_repair import grade_local_repair
+        #         # updated_roster, repair_log = grade_local_repair(
+        #         #     roster_system,
+        #         #     grade_config,
+        #         #     max_iterations=100,
+        #         #     max_moves_per_nurse=1,
+        #         # )
+        #         # roster_system.roster = updated_roster
+        #         # Grade Repair 이후 프리셉티 재동기화
+        #         _pf = bool(getattr(roster_system.config, 'preceptee_on', False))
+        #         if _pf and hasattr(roster_system, 'nurses'):
+        #             _st = roster_system.config.shift_types
+        #             _oi = _st.index('O') if 'O' in _st else None
+        #             _std = {'D', 'E', 'N', 'O'}
+        #             if bool(getattr(roster_system.config, 'use_mid', False)):
+        #                 _std.add('M')
+        #             _id2i = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+        #             _sc = 0
+        #             _gr_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
+        #             _gr_fw_restored = 0
+        #             for _n, _nu in enumerate(roster_system.nurses):
+        #                 _pid = getattr(_nu, 'preceptor_id', None)
+        #                 if not _pid or _pid not in _id2i:
+        #                     continue
+        #                 _pi = _id2i[_pid]
+        #                 _gr_follow_set = _pp_follow_days.get(_n) if _pp_follow_days else None
+        #                 if _gr_follow_set is not None:
+        #                     for _fd in _gr_follow_set:
+        #                         if _fd < roster_system.num_days:
+        #                             roster_system.roster[_n, _fd, :] = roster_system.roster[_pi, _fd, :]
+        #                 else:
+        #                     roster_system.roster[_n] = roster_system.roster[_pi].copy()
+        #                 if _oi is not None:
+        #                     for _d in range(roster_system.num_days):
+        #                         if _gr_follow_set is not None and _d not in _gr_follow_set:
+        #                             continue
+        #                         if (_n, _d) in _gr_pte_fw:
+        #                             _fw_code = _gr_pte_fw[(_n, _d)]
+        #                             if _fw_code in _st:
+        #                                 roster_system.roster[_n, _d, :] = 0
+        #                                 roster_system.roster[_n, _d, _st.index(_fw_code)] = 1
+        #                                 _gr_fw_restored += 1
+        #                                 continue
+        #                         _need = False
+        #                         _orig = fixed_original_shift_map.get((_pi, _d))
+        #                         if _orig:
+        #                             _ou2 = _orig.upper()
+        #                             if _ou2 not in _std and _ou2 not in _work_sub_ids:
+        #                                 _need = True
+        #                         else:
+        #                             _ia = np.where(roster_system.roster[_pi, _d] == 1)[0]
+        #                             if len(_ia) > 0:
+        #                                 _sc2 = _st[int(_ia[0])]
+        #                                 if _sc2 not in _std and _sc2.upper() not in _work_sub_ids:
+        #                                     _need = True
+        #                         if _need:
+        #                             roster_system.roster[_n, _d, :] = 0
+        #                             roster_system.roster[_n, _d, _oi] = 1
+        #                 _sc += 1
+        #             if _sc:
+        #                 _msg = f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명"
+        #                 if _gr_fw_restored:
+        #                     _msg += f", fixed_wanted 재적용: {_gr_fw_restored}건"
+        #                 print(_msg)
+        #         _log_grade_result(
+        #             roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
+        #         )
+        #         # repair 로그 간단 출력
+        #         if repair_log:
+        #             print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
+        #             for r in repair_log[:10]:
+        #                 print(f"{self.logger_prefix} [REPAIR] {r}")
+        #         # repair 이후 결과로 DB 변환 갱신
+        #         result = self._convert_result_to_db_format(
+        #             roster_system,
+        #             nurses,
+        #             canonical_to_shift_id=canonical_to_shift_id,
+        #             fixed_original_shift_map=fixed_original_shift_map,
+        #         )
+        # except Exception as e:
+        #     print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
 
         # nurse별 work_shifts에 맞춰 최종 근무 코드를 대체한다.
         result = self._apply_work_shift_overrides(
@@ -2068,7 +2062,8 @@ class CPSATBasicEngine:
                         if solver.Value(X(n,d,s)): rs.roster[n,d,s]=1
             log_n_even_distribution(rs, self.logger_prefix, join=j, leave=leave_phys)
         except Exception as e:
-            print(f"[ERR] _quick_initial_solve:", e)
+            import traceback
+            print(f"[ERR] _quick_initial_solve: {e}\n{traceback.format_exc()}")
             return False
         return True
     
