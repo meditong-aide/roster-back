@@ -304,7 +304,12 @@ class InboundEntry(BaseModel):
     )
     startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
     endDate: Optional[str] = Field(
-        default=None, description="예정 종료일 ISO 문자열 (미정이면 null)"
+        default=None,
+        description="유효 종료일 ISO 문자열 (end_date 우선, 없으면 expected_end_date)",
+    )
+    expectedEndDate: Optional[str] = Field(
+        default=None,
+        description="예정 종료일 ISO 문자열 (expected_end_date 원본, 미정이면 null)",
     )
     source_group_id: Optional[str] = Field(
         default=None, description="source 그룹 ID (생성/수정 권한 판정용)"
@@ -343,7 +348,14 @@ class CurrentAssignment(BaseModel):
         default=None, description="'파견' / '병동이동' / '휴직' / '퇴사' / '프리셉티'"
     )
     startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
-    endDate: Optional[str] = Field(default=None, description="종료/예정 종료 ISO 문자열")
+    endDate: Optional[str] = Field(
+        default=None,
+        description="유효 종료일 ISO 문자열 (end_date 우선, 없으면 expected_end_date)",
+    )
+    expectedEndDate: Optional[str] = Field(
+        default=None,
+        description="예정 종료일 ISO 문자열 (expected_end_date 원본, 미정이면 null)",
+    )
     source_group_id: Optional[str] = None
     target_group_id: Optional[str] = None
     target_group_name: Optional[str] = None

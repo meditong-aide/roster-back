@@ -759,6 +759,53 @@ def _active_range_in_month(nurse: Nurse, month_start: date, days_in_month: int) 
     return start_idx, end_idx
 
 
+def _clip_active_range_for_leaves(
+    active_range_map: dict,
+    leave_assignments: list,
+    month_start: date,
+    days_in_month: int,
+) -> list[str]:
+    """휴직/퇴사 active assignment 의 start_date 를 active_range 에 반영.
+
+    nurse_assignment.reason in ("휴직", "퇴사") 인 행을 받아 해당 nurse 의
+    active_range 를 [s_idx, leave_start_idx - 1] 까지로 클리핑한다.
+    leave_start_date 가 월 시작일 이전이면 그 달 전체 비활성(None) 처리.
+
+    ※ `_active_range_in_month` 는 nurses.resignation_date 만 본다.
+    휴직 시작일은 nurse_assignment.start_date 에 저장되므로 이 helper 로 별도 클리핑.
+    expected_end_date 이후 복귀 시점은 status=completed 처리(자동 flush)로 자연 정리됨.
+    """
+    if not leave_assignments:
+        return []
+    month_end = month_start + timedelta(days=days_in_month - 1)
+    affected: list[str] = []
+    for la in leave_assignments:
+        nid = str(getattr(la, "nurse_id", "") or "")
+        if not nid:
+            continue
+        existing = active_range_map.get(nid)
+        if existing is None:
+            continue
+        start = getattr(la, "start_date", None)
+        if start is None:
+            continue
+        if start <= month_start:
+            active_range_map[nid] = None
+            affected.append(f"{nid}({la.reason} 전월시작)")
+            continue
+        if start > month_end:
+            continue
+        leave_start_idx = (start - month_start).days - 1
+        s_idx, e_idx = existing
+        if leave_start_idx < s_idx:
+            active_range_map[nid] = None
+            affected.append(f"{nid}({la.reason} 시작일 {start} → 전체 비활성)")
+        else:
+            active_range_map[nid] = (s_idx, min(e_idx, leave_start_idx))
+            affected.append(f"{nid}({la.reason} {start} 전까지)")
+    return affected
+
+
 def _split_fixed_nurses(nurses_in_group: list[Nurse]) -> tuple[list[Nurse], list[Nurse]]:
     """고정 근무 지정 여부로 간호사 목록을 분리합니다.
 
@@ -3474,6 +3521,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         _e = min(_a_end, _month_end)
         if _s <= _e:
             active_range_candidates[nid] = (((_s - month_start).days), ((_e - month_start).days))
+    # 휴직/퇴사: nurse_assignment.start_date 이후 nurse 자체를 비활성화한다.
+    # `_active_range_in_month` 는 nurses.resignation_date 만 보므로 별도 클리핑 필요.
+    _leave_assignments_main = [
+        a for a in _assignments
+        if a.reason in ("휴직", "퇴사")
+        and a.source_group_id == current_user.group_id
+    ]
+    _leave_clipped_main = _clip_active_range_for_leaves(
+        active_range_candidates, _leave_assignments_main, month_start, days_in_month
+    )
+    if _leave_clipped_main:
+        print(f"[Assignment][Leave] 휴직/퇴사 active_range 클리핑: {_leave_clipped_main}")
     excluded_engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is None
     ]
@@ -3743,6 +3802,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in nurses_for_engine
     }
+    # 휴직/퇴사: 위 main path 와 동일한 정책으로 active_range_map 도 클리핑.
+    _leave_assignments_alt = [
+        a for a in _assignments
+        if a.reason in ("휴직", "퇴사")
+        and a.source_group_id == current_user.group_id
+    ]
+    _leave_clipped_alt = _clip_active_range_for_leaves(
+        active_range_map, _leave_assignments_alt, month_start, days_in_month
+    )
+    if _leave_clipped_alt:
+        print(f"[Assignment][Leave/AltPath] 휴직/퇴사 active_range_map 클리핑: {_leave_clipped_alt}")
 
     # print('active_range_map', active_range_map)
     weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
