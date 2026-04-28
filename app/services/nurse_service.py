@@ -659,6 +659,9 @@ def bulk_update_nurses_service(
             _payloads_to_apply.extend([p for p in assignments_payload if p])
         if assignment_payload is not None:
             _payloads_to_apply.append(assignment_payload)
+        # 처리 순서 정합: cancel → update → create (단건 PATCH 와 동일)
+        _op_order = {"cancel": 0, "update": 1, "create": 2}
+        _payloads_to_apply.sort(key=lambda p: _op_order.get(p.get("operation"), 99))
         if _payloads_to_apply:
             for _p in _payloads_to_apply:
                 _dispatch_assignment_payload(
@@ -1105,6 +1108,11 @@ def update_nurse_profile_service(
         _payloads_to_apply.extend([p for p in assignments_payload if p])
     if assignment_payload is not None:
         _payloads_to_apply.append(assignment_payload)
+    # 처리 순서 정합: cancel → update → create.
+    # 휴지통 삭제와 신규 추가가 같은 payload 에 함께 올 때, 먼저 cancel/update 가
+    # 적용되어 active 행 상태를 정리한 뒤 create 의 chain/overlap 검증을 통과하도록.
+    _op_order = {"cancel": 0, "update": 1, "create": 2}
+    _payloads_to_apply.sort(key=lambda p: _op_order.get(p.get("operation"), 99))
     if _payloads_to_apply:
         for _p in _payloads_to_apply:
             _dispatch_assignment_payload(db, nurse_id, _p, current_user)
