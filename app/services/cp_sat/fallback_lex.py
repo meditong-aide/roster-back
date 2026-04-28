@@ -1227,11 +1227,10 @@ def optimize_fallback_lex_hard_first(
                 m.AddMinEquality(_fb_off_min, _fb_nurse_off_vars)
                 _fb_off_range = m.NewIntVar(0, D_phys, "fb_mc_off_range")
                 m.Add(_fb_off_range == _fb_off_max - _fb_off_min)
-                # off_first=True: 일반 풀 OFF range HARD 상한
+                # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
+                # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
                 if _fb_off_first_cfg:
-                    _fb_off_first_hard_range = int(getattr(cfg, "off_first_hard_range", 2) or 2)
-                    m.Add(_fb_off_range <= _fb_off_first_hard_range)
-                    print(f"{logger_prefix} [MaxCoverage/OffFirst] OFF range HARD ≤ {_fb_off_first_hard_range}")
+                    print(f"{logger_prefix} [MaxCoverage/OffFirst] OFF range는 SOFT (off_first=True)")
                 _fb_off_eq_w = -100000 if _fb_off_first_cfg else -200
                 _fb_max_cov_off_equalize_terms.append(_fb_off_eq_w * _fb_off_range)
                 if _fb_off_first_cfg and len(_fb_nurse_off_vars) >= 3:
@@ -1847,6 +1846,9 @@ def optimize_fallback_lex_hard_first(
                 # )
                 # N전담 예외: offcap 고정값 적용 제외 (max는 avail_days-15 공식)
                 if is_n_only:
+                    min_off_required = 0
+                # off_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
+                if bool(getattr(cfg, "off_first", False)):
                     min_off_required = 0
                 if min_off_required > 0 and not is_weekend_off:
                     # 휴가/공가는 최소 OFF 충족에서 제외

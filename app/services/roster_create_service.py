@@ -101,45 +101,26 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
 def _collect_nurses_and_preferences(db: Session, req, current_user):
     """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (FixedWantedEntry 존재 시 자동 사용).
 
-    nurse 풀 정책 (caller 관할 + inbound 통일):
-      - source: Nurse.group_id == caller, active=1
-      - inbound: NurseAssignment.target_group_id == caller, status='active', reason in 파견/병동이동
-        → is_inbound=True 플래그 부여 (build_blocked_days가 inbound 모드로 처리되어
-          assignment 기간 외 일자는 blocked → OFF cap이 실근무 일수 기준으로 비례 산정).
+    nurse 풀: source(Nurse.group_id == caller)만 반환.
+    inbound nurse 합치기와 target_* overlay 는 generate_roster_service 의 line 3482~3508 전용
+    분기에서 처리한다 (여기서 미리 합치면 _inbound_nurse_ids 차집합이 0이 되어 overlay 분기가
+    발동하지 않는 버그가 발생).
     """
-    from db.models import NurseAssignment as _NA
-    from services.nurse_service import _INBOUND_REASONS
-
     print('collect_nurses_and_preferences 진입')
-    source_nurses = (
+    nurses_in_group = (
         db.query(Nurse)
-        .filter(Nurse.group_id == current_user.group_id, Nurse.active == 1)
+        .filter(Nurse.group_id == current_user.group_id)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
-    source_id_set = {n.nurse_id for n in source_nurses}
-    inbound_rows = db.query(_NA.nurse_id).filter(
-        _NA.target_group_id == current_user.group_id,
-        _NA.status == "active",
-        _NA.reason.in_(_INBOUND_REASONS),
-    ).all()
-    inbound_ids = {r[0] for r in inbound_rows} - source_id_set
-    inbound_nurses: list[Nurse] = []
-    if inbound_ids:
-        inbound_nurses = (
-            db.query(Nurse)
-            .filter(Nurse.nurse_id.in_(list(inbound_ids)), Nurse.active == 1)
-            .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
-            .all()
-        )
-        # is_inbound transient flag: build_blocked_days(is_inbound=True) 라우팅용.
-        # 미설정 시 outbound 모드로 처리되어 31일 풀 active 처리 → OFF cap 비례 산정 실패.
-        for _n in inbound_nurses:
-            _n.is_inbound = True
-    nurses_in_group = list(source_nurses) + list(inbound_nurses)
+    inactive_nurses = [
+        f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')})"
+        for n in nurses_in_group
+        if getattr(n, "active", 1) == 0
+    ]
     print(
-        "[RosterCreate] 그룹 간호사 로드(통일): source="
-        f"{len(source_nurses)}, inbound={len(inbound_nurses)}, total={len(nurses_in_group)}"
+        "[RosterCreate] 그룹 간호사 로드: total="
+        f"{len(nurses_in_group)}, inactive={len(inactive_nurses)} → {inactive_nurses}"
     )
     nurse_ids = [n.nurse_id for n in nurses_in_group]
     month_str = f"{req.year}-{req.month:02d}"
@@ -3031,14 +3012,20 @@ def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] |
             if _auto_max_diag < int(effective_off_days or 0):
                 effective_off_days = _auto_max_diag
                 off_source = f"auto_max(coverage)"
-        max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
+        # off_first=True: off_days(월 OFF 수) 무시하고 daily_shift 커버리지 충족만 검증.
+        #   잔여 셀이 OFF로 자연 회수되는 정책이므로 사전 capacity 검증에서 OFF 차감 제거.
+        _off_first = bool(getattr(cfg, "off_first", False))
+        if _off_first:
+            max_work_per_nurse = num_days
+        else:
+            max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
         total_capacity = nurse_count * max_work_per_nurse
         if total_required > total_capacity:
             return (
                 "[reason_code=CAPACITY_TOTAL_SHORTAGE] "
                 "Infeasible 진단: 월 총 필요 근무 슬롯이 공급 상한을 초과했습니다. "
                 f"(요구={total_required}, 공급상한={total_capacity}, 간호사={nurse_count}, "
-                f"days={num_days}, off_days={effective_off_days}, source={off_source})"
+                f"days={num_days}, off_days={effective_off_days}, off_first={_off_first}, source={off_source})"
             )
 
         max_night_per_nurse = int(getattr(cfg, "max_night_shifts_per_month", 0) or 0)
@@ -3484,26 +3471,24 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             Nurse.nurse_id.in_(_inbound_nurse_ids),
             Nurse.active == 1,
         ).all()
-        # assignment의 target 설정으로 nurse 속성 오버라이드
+        # assignment의 target 설정으로 nurse 속성 오버라이드.
+        # 정책: inbound nurse 는 nurse_assignment.target_* 만 진실 원천.
+        #   target_* 가 NULL 이면 default(비활성/없음) 적용. source(nurses table) 값으로 fallback 금지.
+        # 주의: SQLAlchemy ORM instrumented attr setter 는 `[n.__dict__ for n in nurses_in_group]`
+        #   변환 시 dict 에 미반영될 수 있어 `n.__dict__` 직접 주입으로 강제 동기화한다.
         _assignment_by_nurse = {str(a.nurse_id): a for a in _inbound_assignments}
         for n in _inbound_nurses:
-            setattr(n, 'is_inbound', True)
+            n.__dict__['is_inbound'] = True
             _a = _assignment_by_nurse.get(str(n.nurse_id))
             if _a:
-                if _a.target_team_id is not None:
-                    n.team_id = _a.target_team_id
-                if _a.target_grade is not None:
-                    n.grade = _a.target_grade
-                if _a.target_weekly_off_enabled is not None:
-                    n.weekly_off_enabled = _a.target_weekly_off_enabled
-                if _a.target_weekly_off_type is not None:
-                    setattr(n, 'weekly_off_type', _a.target_weekly_off_type)
-                if _a.target_weekly_off_weekday is not None:
-                    n.weekly_off_weekday = _a.target_weekly_off_weekday
-                if _a.target_shift_types is not None:
-                    n.is_night_nurse = _a.target_shift_types
-                if _a.target_fixed_shift is not None:
-                    n.fixed_shift = _a.target_fixed_shift
+                d = n.__dict__
+                d['team_id'] = _a.target_team_id
+                d['grade'] = _a.target_grade
+                d['weekly_off_enabled'] = bool(_a.target_weekly_off_enabled or 0)
+                d['weekly_off_type'] = _a.target_weekly_off_type
+                d['weekly_off_weekday'] = _a.target_weekly_off_weekday
+                d['is_night_nurse'] = _a.target_shift_types or []
+                d['fixed_shift'] = _a.target_fixed_shift
         engine_nurses.extend(_inbound_nurses)
         nurses_in_group.extend(_inbound_nurses)
         print(
@@ -3515,7 +3500,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         for n in engine_nurses:
             if str(n.nurse_id) in _flushed_transfer_ids:
                 # 인바운드와 동일하게 마킹하여 build_blocked_days에서 인바운드 분기를 타게 한다.
-                setattr(n, 'is_inbound', True)
+                # SQLAlchemy ORM 우회 위해 __dict__ 직접 주입.
+                n.__dict__['is_inbound'] = True
                 _flushed_names.append(f'{getattr(n, "name", "?")}({n.nurse_id})')
         print(
             f"[Assignment][FlushedTransfer] 병동이동 flush된 간호사 {len(_flushed_transfer_ids)}명 활동범위 클리핑 대상: "

@@ -2952,11 +2952,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.AddMinEquality(off_global_min, nurse_off_vars)
             off_range = m.NewIntVar(0, D_phys, "mc_off_range")
             m.Add(off_range == off_global_max - off_global_min)
-            # off_first=True: 일반 풀 OFF range HARD 상한 (소프트 가중치로는 수렴 부족)
+            # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
+            # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
             if _off_first_cfg:
-                _off_first_hard_range = int(getattr(rs.config, "off_first_hard_range", 2) or 2)
-                m.Add(off_range <= _off_first_hard_range)
-                print(f"[MaxCoverage] OFF range HARD ≤ {_off_first_hard_range} 적용 (off_first=True)")
+                print(f"[MaxCoverage] OFF range는 SOFT (off_first=True, daily 커버리지 우선)")
             _off_eq_weight = -100000 if _off_first_cfg else -200
             max_cov_off_equalize_terms.append(_off_eq_weight * off_range)
             # L1 deviation: 양 끝점뿐 아니라 중간 분산도 평탄화
@@ -3430,6 +3429,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     min_off_required = _adjusted_min
                 # N전담 예외: offcap 고정값 적용 제외 (max는 별도 공식 avail_days-15)
                 if is_n_only:
+                    min_off_required = 0
+                # off_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
+                # (실제 OFF는 daily 커버리지 + 6연근/N패턴 hard에 의해 자연 결정)
+                if bool(getattr(cfg, "off_first", False)):
                     min_off_required = 0
                 if min_off_required > 0 and phys_range_off:
                     m.Add(
