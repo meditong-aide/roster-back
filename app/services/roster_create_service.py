@@ -122,7 +122,24 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         "[RosterCreate] 그룹 간호사 로드: total="
         f"{len(nurses_in_group)}, inactive={len(inactive_nurses)} → {inactive_nurses}"
     )
-    nurse_ids = [n.nurse_id for n in nurses_in_group]
+    # source nurse_ids + inbound nurse_ids (caller 관할 fixed_wanted 조회용).
+    # nurses_in_group 에는 source 만 둠 — inbound nurse 객체 추가는 generate_roster_service 의
+    # line 3482-3508 단일 분기에서 처리 (target_* overlay 동반).
+    # 여기서는 fixed_wanted_entries 누락 방지 위해 nurse_ids 만 inbound 까지 확장.
+    from db.models import NurseAssignment as _NA
+    from services.nurse_service import _INBOUND_REASONS
+    _source_ids = [n.nurse_id for n in nurses_in_group]
+    _inbound_ids = [
+        r[0] for r in db.query(_NA.nurse_id).filter(
+            _NA.target_group_id == current_user.group_id,
+            _NA.status == "active",
+            _NA.reason.in_(_INBOUND_REASONS),
+        ).all()
+        if r[0] not in _source_ids
+    ]
+    nurse_ids = _source_ids + _inbound_ids
+    if _inbound_ids:
+        print(f"[RosterCreate] fixed_wanted 조회 대상 inbound nurse 추가: {_inbound_ids}")
     month_str = f"{req.year}-{req.month:02d}"
     preferences = []
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
