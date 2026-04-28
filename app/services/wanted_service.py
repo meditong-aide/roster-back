@@ -1144,8 +1144,13 @@ async def invoke_and_persist_wanted_service(
     response = [[], []]
     shift_parsed = {}
     pref_parsed = []
+    # AIDE 처리 상태 — 응답에 동봉해 프론트가 "임시 저장됐지만 정상 수행 안 됨"
+    # 케이스를 식별 가능하도록 한다.
+    aide_status: Dict[str, Any] = {"code": "success", "ok": True}
 
-    if not is_dummy_request:
+    if is_dummy_request:
+        aide_status = {"code": "skipped_dummy", "ok": True}
+    else:
         try:
             raw_response = await graph_service.invoke(
                 request=req.request,
@@ -1158,13 +1163,24 @@ async def invoke_and_persist_wanted_service(
             )
             if isinstance(raw_response, str):
                 raw_response = json.loads(raw_response)
-            response = raw_response if isinstance(raw_response, list) and len(raw_response) == 2 else [[], []]
-
-            shift_parsed = _parse_shift_results(response)
-            pref_parsed = _parse_preferences(response, req.schema)
+            if isinstance(raw_response, list) and len(raw_response) == 2:
+                response = raw_response
+                shift_parsed = _parse_shift_results(response)
+                pref_parsed = _parse_preferences(response, req.schema)
+                if not shift_parsed and not pref_parsed:
+                    aide_status = {"code": "no_output", "ok": False}
+            else:
+                response = [[], []]
+                aide_status = {"code": "malformed_response", "ok": False}
         except Exception as e:
             print(f"그래프 호출 실패: {e}")
             traceback.print_exc()
+            aide_status = {
+                "code": "exception",
+                "ok": False,
+                "detail": str(e),
+                "error_type": type(e).__name__,
+            }
 
     # 새 request_id 생성
     new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
@@ -1402,7 +1418,8 @@ async def invoke_and_persist_wanted_service(
     result = {
         "shift": shift_parsed,
         "preference": pref_parsed,
-        "warning": None
+        "warning": None,
+        "aide_status": aide_status,
     }
 
     if excluded_off_dates:
@@ -1417,10 +1434,6 @@ async def invoke_and_persist_wanted_service(
             "limit": max_requests
         }
 
-    # return {
-    #     "shift": shift_parsed,
-    #     "preference": pref_parsed
-    # }
     return result
 
 
