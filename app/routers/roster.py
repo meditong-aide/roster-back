@@ -1018,8 +1018,17 @@ async def get_roster_by_schedule_id(
 
             _assignments_out: list[dict] = []
             for _a in _a_list:
-                _a_start = _date.fromisoformat(_a["start_date"])
-                _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
+                # `_a["start_date"]` 는 string("YYYY-MM-DD"), datetime 직렬화 문자열
+                # ("YYYY-MM-DD HH:MM:SS"), 혹은 date/datetime 객체로 올 수 있다.
+                # 안전하게 첫 10자만 잘라 ISO date 로 파싱한다.
+                def _to_date(v):
+                    if v is None:
+                        return None
+                    if isinstance(v, _date):
+                        return v
+                    return _date.fromisoformat(str(v)[:10])
+                _a_start = _to_date(_a["start_date"])
+                _a_end = _to_date(_a["end_date"])
                 # 월내 실제 overlap (N_tail 버퍼-only 파견 → period 0/0).
                 _overlap_start = max(_a_start, _m_start)
                 _overlap_end = min(_a_end, _m_end) if _a_end else _m_end
