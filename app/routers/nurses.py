@@ -46,6 +46,7 @@ from services.assignment_service import (
     flush_pending_transfers,
     flush_expired_preceptees,
     flush_expired_dispatches,
+    flush_expired_leaves,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
@@ -144,6 +145,8 @@ async def get_nurses_in_group(
     flush_expired_preceptees(db)
     # 파견 만료 레이지 체크 (status change only, 안전 작업)
     flush_expired_dispatches(db)
+    # 휴직 만료 레이지 체크 (status change only, 안전 작업)
+    flush_expired_leaves(db)
     print(
         "current_user",
         current_user.nurse_id,

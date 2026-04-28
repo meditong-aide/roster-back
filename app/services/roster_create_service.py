@@ -3843,6 +3843,27 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         config_dict["weekly_off_settings_activate"] = False
     weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
 
+    # source-side outbound 기간(파견/병동이동으로 다른 그룹에 가 있는 일자)은
+    # 해당 병동 실 근무가 아니므로 weekly_off 셀도 미표시한다.
+    _outbound_day_idx_map: dict[str, set[int]] = {}
+    _month_end_d = month_start + timedelta(days=days_in_month - 1)
+    for _a in _assignments:
+        if _a.reason not in ("파견", "병동이동"):
+            continue
+        if _a.source_group_id != current_user.group_id:
+            continue
+        if _a.target_group_id == current_user.group_id:
+            continue
+        _nid = str(_a.nurse_id)
+        _a_end = _a.end_date or _a.expected_end_date or _month_end_d
+        _s = max(_a.start_date, month_start)
+        _e = min(_a_end, _month_end_d)
+        if _s > _e:
+            continue
+        _s_idx = (_s - month_start).days
+        _e_idx = (_e - month_start).days
+        _outbound_day_idx_map.setdefault(_nid, set()).update(range(_s_idx, _e_idx + 1))
+
     if weekly_off_map:
         filtered_map: dict[str, set[int]] = {}
         for nurse_id, day_set in weekly_off_map.items():
@@ -3850,7 +3871,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             if not rng:
                 continue
             start_idx, end_idx = rng
-            clipped = {d for d in day_set if start_idx <= d <= end_idx}
+            _ob_days = _outbound_day_idx_map.get(str(nurse_id), set())
+            clipped = {
+                d for d in day_set
+                if start_idx <= d <= end_idx and d not in _ob_days
+            }
             if clipped:
                 filtered_map[str(nurse_id)] = clipped
         weekly_off_map = filtered_map
