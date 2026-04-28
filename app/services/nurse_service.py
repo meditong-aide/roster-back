@@ -153,27 +153,16 @@ def get_nurses_in_group_service(
     query = db.query(NurseModel)
 
     # 그룹 ID 필터링: source(nurses.group_id) + inbound(assignment.target_group_id)
+    # 정책: status='active' 인 inbound assignment 가 있는 nurse 는 미래 시작 여부와 무관하게 노출.
+    #   - source 측: Nurse.group_id 매칭으로 outbound nurse 도 자연 노출 (양쪽 노출).
+    #   - 실근무 일자가 아닌 셀은 솔버의 active_window/blocked_days 로 제외되므로 안전.
     if not skip_group_filter and current_user.group_id:
-        # cancelled 가 아닌 모든 inbound (active + completed) 중 "오늘이 속한 월"과
-        # 기간(start_date ~ end_date or expected_end_date)이 겹치는 행만 노출.
-        # → 대상월에만 inbound nurse 노출, 그 월이 지나면 자동으로 빠짐.
-        from calendar import monthrange
-        from sqlalchemy import case
-        _today = date.today()
-        _month_start = _today.replace(day=1)
-        _month_end = _today.replace(day=monthrange(_today.year, _today.month)[1])
-        _eff_end = case(
-            (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
-            else_=NurseAssignment.expected_end_date,
-        )
         _inbound_subq = (
             db.query(NurseAssignment.nurse_id)
             .filter(
                 NurseAssignment.target_group_id == current_user.group_id,
-                NurseAssignment.status != "cancelled",
+                NurseAssignment.status == "active",
                 NurseAssignment.reason.in_(_INBOUND_REASONS),
-                NurseAssignment.start_date <= _month_end,
-                or_(_eff_end.is_(None), _eff_end >= _month_start),
             )
             .subquery()
         )

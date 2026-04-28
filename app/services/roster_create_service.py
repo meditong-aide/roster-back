@@ -99,23 +99,47 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
     }
 
 def _collect_nurses_and_preferences(db: Session, req, current_user):
-    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (FixedWantedEntry 존재 시 자동 사용)"""
-    # 1️⃣ 그룹 내 간호사 목록
+    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (FixedWantedEntry 존재 시 자동 사용).
+
+    nurse 풀 정책 (caller 관할 + inbound 통일):
+      - source: Nurse.group_id == caller, active=1
+      - inbound: NurseAssignment.target_group_id == caller, status='active', reason in 파견/병동이동
+        → is_inbound=True 플래그 부여 (build_blocked_days가 inbound 모드로 처리되어
+          assignment 기간 외 일자는 blocked → OFF cap이 실근무 일수 기준으로 비례 산정).
+    """
+    from db.models import NurseAssignment as _NA
+    from services.nurse_service import _INBOUND_REASONS
+
     print('collect_nurses_and_preferences 진입')
-    nurses_in_group = (
+    source_nurses = (
         db.query(Nurse)
-        .filter(Nurse.group_id == current_user.group_id)
+        .filter(Nurse.group_id == current_user.group_id, Nurse.active == 1)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
     )
-    inactive_nurses = [
-        f"{getattr(n, 'name', '?')}({getattr(n, 'nurse_id', '?')})"
-        for n in nurses_in_group
-        if getattr(n, "active", 1) == 0
-    ]
+    source_id_set = {n.nurse_id for n in source_nurses}
+    inbound_rows = db.query(_NA.nurse_id).filter(
+        _NA.target_group_id == current_user.group_id,
+        _NA.status == "active",
+        _NA.reason.in_(_INBOUND_REASONS),
+    ).all()
+    inbound_ids = {r[0] for r in inbound_rows} - source_id_set
+    inbound_nurses: list[Nurse] = []
+    if inbound_ids:
+        inbound_nurses = (
+            db.query(Nurse)
+            .filter(Nurse.nurse_id.in_(list(inbound_ids)), Nurse.active == 1)
+            .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
+            .all()
+        )
+        # is_inbound transient flag: build_blocked_days(is_inbound=True) 라우팅용.
+        # 미설정 시 outbound 모드로 처리되어 31일 풀 active 처리 → OFF cap 비례 산정 실패.
+        for _n in inbound_nurses:
+            _n.is_inbound = True
+    nurses_in_group = list(source_nurses) + list(inbound_nurses)
     print(
-        "[RosterCreate] 그룹 간호사 로드: total="
-        f"{len(nurses_in_group)}, inactive={len(inactive_nurses)} → {inactive_nurses}"
+        "[RosterCreate] 그룹 간호사 로드(통일): source="
+        f"{len(source_nurses)}, inbound={len(inbound_nurses)}, total={len(nurses_in_group)}"
     )
     nurse_ids = [n.nurse_id for n in nurses_in_group]
     month_str = f"{req.year}-{req.month:02d}"
