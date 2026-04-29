@@ -30,6 +30,7 @@ from db.models import (
 from schemas.roster_schema import RosterRequest
 from routers.utils import get_days_in_month, Timer
 from datetime import date, datetime, timedelta
+import json
 import uuid
 from sqlalchemy import func, or_
 from collections import defaultdict
@@ -413,23 +414,68 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
         - DB에 설정이 없으면 기본값을 반환한다.
         - Grade 제약은 `cp_sat_basic`에서 grade_strategy="GRADE"일 때만 적용된다.
     """
-    config = (
-        db.query(RosterGradeConfig)
-        .filter(RosterGradeConfig.office_id == office_id, RosterGradeConfig.group_id == group_id)
-        .first()
-    )
-    if not config:
+    def _default() -> dict:
         return {
             "null_grade_policy": "LOWEST",
             "use_dynamic_scaling": True,
+            "allow_soft_fallback": False,
             "constraints_json": {},
             "constraints_max_json": {},
         }
+
+    def _safe_json_obj(raw, field_name: str) -> dict:
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            txt = raw.strip()
+            if not txt:
+                return {}
+            try:
+                parsed = json.loads(txt)
+            except (json.JSONDecodeError, TypeError) as e:
+                sample = txt[:120]
+                print(
+                    "[GradeConfig][WARN] "
+                    f"field={field_name} office_id={office_id} group_id={group_id} "
+                    f"len={len(txt)} sample={sample!r} parse_error={e}"
+                )
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    # JSON 컬럼에 손상 데이터가 있을 수 있으므로 ORM(JSON 디코딩) 대신 raw text로 안전 조회한다.
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT TOP 1
+                    null_grade_policy,
+                    use_dynamic_scaling,
+                    allow_soft_fallback,
+                    CAST(constraints_json AS NVARCHAR(MAX)) AS constraints_json_text,
+                    CAST(constraints_max_json AS NVARCHAR(MAX)) AS constraints_max_json_text
+                FROM roster_grade_config
+                WHERE office_id = :office_id AND group_id = :group_id
+                ORDER BY config_id DESC
+                """
+            ),
+            {"office_id": office_id, "group_id": group_id},
+        ).fetchone()
+    except Exception as e:
+        print(f"[GradeConfig][WARN] raw 조회 실패. 기본값 사용: {e}")
+        return _default()
+
+    if not row:
+        return _default()
+
     return {
-        "null_grade_policy": config.null_grade_policy or "LOWEST",
-        "use_dynamic_scaling": bool(config.use_dynamic_scaling),
-        "constraints_json": config.constraints_json or {},
-        "constraints_max_json": config.constraints_max_json or {},
+        "null_grade_policy": (getattr(row, "null_grade_policy", None) or "LOWEST"),
+        "use_dynamic_scaling": bool(getattr(row, "use_dynamic_scaling", True)),
+        "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
+        "constraints_json": _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json"),
+        "constraints_max_json": _safe_json_obj(getattr(row, "constraints_max_json_text", None), "constraints_max_json"),
     }
 
 
@@ -496,9 +542,36 @@ def _resolve_grade_strategy(
         return "TEAM", None
 
     gc = _fetch_grade_config_dict(db, office_id, group_id)
-    if bool((gc or {}).get("constraints_json") or {}):
+    if bool((gc or {}).get("constraints_json") or {}) or bool((gc or {}).get("constraints_max_json") or {}):
         return "GRADE", gc
     return "BASE", None
+
+
+def _has_any_grade_constraints(grade_config: dict | None) -> bool:
+    gc = grade_config or {}
+    return bool(
+        (gc.get("constraints_json") or gc.get("constraints") or {})
+        or (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+    )
+
+
+def _select_effective_grade_strategy(
+    req_strategy: str,
+    resolved_strategy: str,
+    grade_config: dict | None,
+) -> str:
+    req = str(req_strategy or "").upper()
+    resolved = str(resolved_strategy or "BASE").upper()
+
+    if req == "COMBINED" and _has_any_grade_constraints(grade_config):
+        return "COMBINED"
+    if req == "GRADE" and _has_any_grade_constraints(grade_config):
+        return "GRADE"
+    if req == "TEAM":
+        return "TEAM"
+    if req == "BASE":
+        return "BASE"
+    return resolved
 
 def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
@@ -2631,7 +2704,8 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             )
         except Exception as _log_exc:
             print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")
-        # 전략은 요청 바디가 아니라 "DB(roster_config.grade_strategy) → 없으면 config_dict 기반 폴백"만 사용한다.
+        # 기본 전략은 DB(roster_config.grade_strategy) 기준으로 잡되,
+        # 요청에서 COMBINED/GRADE를 명시하고 grade 제약이 존재하면 해당 전략을 우선 적용한다.
         grade_strategy, grade_config = _resolve_grade_strategy(
             db=db,
             config_dict=config_dict,
@@ -2646,13 +2720,10 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                 db, current_user.office_id, current_user.group_id
             )
         req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
-        has_grade_constraints = bool(
-            (engine_grade_config or {}).get("constraints_json")
-            or (engine_grade_config or {}).get("constraints")
-            or {}
-        )
-        effective_grade_strategy = (
-            req_strategy if req_strategy in ("GRADE", "COMBINED") and has_grade_constraints else grade_strategy
+        effective_grade_strategy = _select_effective_grade_strategy(
+            req_strategy=req_strategy,
+            resolved_strategy=grade_strategy,
+            grade_config=engine_grade_config,
         )
         # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
         config_dict["grade_strategy"] = effective_grade_strategy
@@ -3026,6 +3097,155 @@ def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] |
         return None
 
 
+# TEMP-PROBE-DELETE-START
+def _probe_first_grade_hard_blocker(roster_system) -> str | None:
+    """임시 프로브: Grade hard 제약의 일자/교대별 첫 충돌 지점을 찾는다.
+
+    삭제 가이드:
+      - TEMP-PROBE-DELETE-START ~ TEMP-PROBE-DELETE-END 전체 삭제
+      - _validate_generated_roster 내 호출부(동일 태그 주석)도 함께 삭제
+    """
+    try:
+        cfg = getattr(roster_system, "config", None)
+        if cfg is None:
+            return None
+        gc = getattr(roster_system, "grade_config", None) or {}
+        min_map = (gc.get("constraints_json") or gc.get("constraints") or {})
+        max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+        if not min_map and not max_map:
+            return None
+
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        if not nurses:
+            return None
+        num_days = int(getattr(roster_system, "num_days", 0) or 0)
+        if num_days <= 0:
+            return None
+
+        shift_types = set(str(s).upper() for s in (getattr(cfg, "shift_types", []) or []))
+        join = list(getattr(roster_system, "join", []) or [])
+        leave = list(getattr(roster_system, "leave", []) or [])
+        if len(join) != len(nurses) or len(leave) != len(nurses):
+            # CP-SAT 내부 join/leave가 객체에 노출되지 않는 경로 보정
+            join = [0 for _ in nurses]
+            leave = [num_days - 1 for _ in nurses]
+        blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
+
+        req_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        req_base = getattr(cfg, "daily_shift_requirements", None) or {}
+
+        # 제약에 명시된 grade만 추출(미명시 grade는 중립)
+        constrained_grades = set()
+        for mp in (min_map, max_map):
+            if not isinstance(mp, dict):
+                continue
+            for by_g in mp.values():
+                if not isinstance(by_g, dict):
+                    continue
+                for gk in by_g.keys():
+                    try:
+                        constrained_grades.add(int(gk))
+                    except Exception:
+                        continue
+        if not constrained_grades:
+            return None
+
+        def _day_req(day_idx: int, shift_code: str) -> int:
+            if isinstance(req_by_day, list) and day_idx < len(req_by_day) and isinstance(req_by_day[day_idx], dict):
+                return int((req_by_day[day_idx] or {}).get(shift_code, 0) or 0)
+            return int((req_base or {}).get(shift_code, 0) or 0)
+
+        def _is_active(n_idx: int, day_idx: int, shift_code: str) -> bool:
+            if n_idx >= len(join) or n_idx >= len(leave):
+                return False
+            if not (join[n_idx] <= day_idx <= leave[n_idx]):
+                return False
+            if day_idx in (blocked_by_nurse.get(n_idx, set()) or set()):
+                return False
+            if shift_code in {"D", "E"} and bool(getattr(nurses[n_idx], "is_night_nurse", 0) == 3):
+                return False
+            return True
+
+        for d in range(num_days):
+            for s_code in sorted(set([str(k).upper() for k in list(min_map.keys()) + list(max_map.keys())])):
+                if shift_types and s_code not in shift_types:
+                    continue
+                req = _day_req(d, s_code)
+                if req <= 0:
+                    continue
+
+                active_total = 0
+                active_by_grade = defaultdict(int)
+                active_unconstrained = 0
+                for i, n in enumerate(nurses):
+                    if not _is_active(i, d, s_code):
+                        continue
+                    active_total += 1
+                    g = getattr(n, "grade", None)
+                    try:
+                        gi = int(g) if g is not None else None
+                    except Exception:
+                        gi = None
+                    if gi in constrained_grades:
+                        active_by_grade[gi] += 1
+                    else:
+                        active_unconstrained += 1
+
+                if active_total < req:
+                    return (
+                        f"[probe=GRADE_HARD_ACTIVE_SHORTAGE] day={d+1} shift={s_code} "
+                        f"active={active_total} < req={req}"
+                    )
+
+                min_by_g_raw = (min_map.get(s_code) or {}) if isinstance(min_map, dict) else {}
+                min_sum = 0
+                for gk, tv in min_by_g_raw.items():
+                    try:
+                        gi = int(gk)
+                        t = int(tv or 0)
+                    except Exception:
+                        continue
+                    if t <= 0:
+                        continue
+                    avail = int(active_by_grade.get(gi, 0))
+                    if avail < t:
+                        return (
+                            f"[probe=GRADE_HARD_MIN_BLOCK] day={d+1} shift={s_code} grade={gi} "
+                            f"need={t} avail={avail} req={req}"
+                        )
+                    min_sum += t
+                if min_sum > req:
+                    return (
+                        f"[probe=GRADE_HARD_MIN_OVER_NEED] day={d+1} shift={s_code} "
+                        f"min_sum={min_sum} > req={req}"
+                    )
+
+                max_by_g_raw = (max_map.get(s_code) or {}) if isinstance(max_map, dict) else {}
+                if isinstance(max_by_g_raw, dict) and max_by_g_raw:
+                    capped = active_unconstrained
+                    for gk, uv in max_by_g_raw.items():
+                        try:
+                            gi = int(gk)
+                            u = int(uv)
+                        except Exception:
+                            continue
+                        if u < 0:
+                            continue
+                        capped += min(int(active_by_grade.get(gi, 0)), u)
+                    for gi in constrained_grades:
+                        if str(gi) not in {str(k) for k in max_by_g_raw.keys()}:
+                            capped += int(active_by_grade.get(gi, 0))
+                    if capped < req:
+                        return (
+                            f"[probe=GRADE_HARD_MAX_CAP_SHORTAGE] day={d+1} shift={s_code} "
+                            f"cap={capped} < req={req} (unconstrained={active_unconstrained}, by_grade={dict(active_by_grade)})"
+                        )
+        return None
+    except Exception as exc:
+        return f"[probe=GRADE_HARD_PROBE_ERROR] {exc}"
+# TEMP-PROBE-DELETE-END
+
+
 def _validate_generated_roster(
     generated: dict[str, list[str]] | None, roster_system
 ) -> str | None:
@@ -3047,6 +3267,18 @@ def _validate_generated_roster(
 
     if total_cells > 0 and work_cells == 0:
         diag = _build_infeasible_diagnosis(roster_system, generated)
+        cp_probe_msg = getattr(roster_system, "_grade_hard_probe_msg", None)
+        if cp_probe_msg:
+            if diag:
+                return f"{diag} | [cp_probe={cp_probe_msg}]"
+            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]"
+        # TEMP-PROBE-DELETE: NO_ASSIGNMENT 시 grade hard 충돌 일자/교대를 임시 탐색
+        probe_msg = _probe_first_grade_hard_blocker(roster_system)
+        if probe_msg:
+            print(f"[InfeasibleProbe] {probe_msg}")
+            if diag:
+                return f"{diag} | {probe_msg}"
+            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}"
         return diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다."
 
     # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)

@@ -28,6 +28,10 @@ class GradeConfigBase(BaseModel):
         default=True,
         description="일자별 필요 인원 감소 시 비율 축소 적용 여부",
     )
+    allow_soft_fallback: bool = Field(
+        default=False,
+        description="grade 최소/최대 제약을 soft(slack 허용)로 완화할지 여부. 기본값 False=hard.",
+    )
     constraints: Dict[str, Dict[int, int]] = Field(
         default_factory=dict,
         description="Shift별 Grade 최소 인원 예: {'D': {1:1, 2:2}}",
@@ -68,4 +72,3 @@ class GradeConfigResponse(GradeConfigBase):
     updated_by: Optional[str] = None
     class Config:
         from_attributes = True
-

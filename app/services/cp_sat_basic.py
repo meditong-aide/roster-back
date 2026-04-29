@@ -23,7 +23,7 @@ from services.cp_sat.work_shift_overrides import (
     apply_work_shift_overrides as _apply_work_shift_overrides_impl,
 )
 from services.cp_sat.postprocess_off import (
-    postprocess_rebalance_off as _postprocess_rebalance_off_impl,
+    # postprocess_rebalance_off as _postprocess_rebalance_off_impl,
     postprocess_trim_extra_offs as _postprocess_trim_extra_offs_impl,
 )
 from services.cp_sat.hardcoded_weights import (
@@ -2020,7 +2020,7 @@ class CPSATBasicEngine:
             add_preceptor_terms_fn=_add_preceptor_objective_terms,
             add_team_balance_terms_fn=add_team_balance_objective_terms,
             add_grade_constraints_fn=add_grade_constraints,
-            postprocess_rebalance_off_fn=self._postprocess_rebalance_off,
+            postprocess_rebalance_off_fn=(lambda *_args, **_kwargs: None),
             blocked_by_nurse=getattr(roster_system, 'blocked_by_nurse', None),
         )
 
@@ -2095,31 +2095,31 @@ class CPSATBasicEngine:
             shift_definitions=shift_definitions,
         )
 
-    def _postprocess_rebalance_off(
-        self,
-        roster_system: RosterSystem,
-        max_attempts: int = 30,
-    ) -> None:
-        """(호환) 후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다."""
-        _postprocess_rebalance_off_impl(
-            roster_system=roster_system,
-            logger_prefix=self.logger_prefix,
-            max_attempts=max_attempts,
-        )
+    # def _postprocess_rebalance_off(
+    #     self,
+    #     roster_system: RosterSystem,
+    #     max_attempts: int = 30,
+    # ) -> None:
+    #     """(호환) 후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다."""
+    #     _postprocess_rebalance_off_impl(
+    #         roster_system=roster_system,
+    #         logger_prefix=self.logger_prefix,
+    #         max_attempts=max_attempts,
+    #     )
 
-    def _postprocess_trim_extra_offs(
-        self,
-        roster_system: RosterSystem,
-        max_changes: int = 80,
-        prefer_shortage: bool = True,
-    ) -> int:
-        """(호환) 필수/강제 OFF를 보존하면서 불필요한 OFF를 근무로 교체한다."""
-        return _postprocess_trim_extra_offs_impl(
-            roster_system=roster_system,
-            logger_prefix=self.logger_prefix,
-            max_changes=max_changes,
-            prefer_shortage=prefer_shortage,
-        )
+    # def _postprocess_trim_extra_offs(
+    #     self,
+    #     roster_system: RosterSystem,
+    #     max_changes: int = 80,
+    #     prefer_shortage: bool = True,
+    # ) -> int:
+    #     """(호환) 필수/강제 OFF를 보존하면서 불필요한 OFF를 근무로 교체한다."""
+    #     return _postprocess_trim_extra_offs_impl(
+    #         roster_system=roster_system,
+    #         logger_prefix=self.logger_prefix,
+    #         max_changes=max_changes,
+    #         prefer_shortage=prefer_shortage,
+    #     )
 
     def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
         """최종 근무표를 간호사별로 출력합니다.
@@ -2316,6 +2316,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             D_phys,
             D - 1,
         )
+    # TEMP-PROBE-DELETE: join/leave/blocked 확정 시점의 grade hard blocker 진단
+    _log_grade_hard_blocker_probe(rs, join, leave, blocked_by_nurse)
     # 고정 셀 (수간호사 등)
     code2main = {
         str(c).strip().upper(): str(r["main_code"]).strip().upper()
@@ -3868,6 +3870,163 @@ def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dic
             print("[CP-SAT-Basic][Diag][N-Capacity] 일자별 N 수요 대비 인원 부족은 없음")
     except Exception as exc:
         print(f"[CP-SAT-Basic][Diag][N-Capacity] 분석 실패: {exc}")
+
+
+# TEMP-PROBE-DELETE-START
+def _log_grade_hard_blocker_probe(
+    rs,
+    join: list[int],
+    leave: list[int],
+    blocked_by_nurse: Optional[dict[int, set[int]]],
+) -> None:
+    """임시 프로브: grade hard 제약의 첫 일자/교대 충돌 후보를 로깅한다.
+
+    삭제 가이드:
+      - TEMP-PROBE-DELETE-START ~ TEMP-PROBE-DELETE-END 전체 삭제
+      - _build_full_model 내 호출부(TEMP-PROBE-DELETE 태그)도 함께 삭제
+    """
+    try:
+        gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        gc = getattr(rs, "grade_config", None) or {}
+        allow_soft = bool((gc or {}).get("allow_soft_fallback", False))
+        if gs not in ("GRADE", "COMBINED") or allow_soft:
+            return
+
+        min_map = (gc.get("constraints_json") or gc.get("constraints") or {})
+        max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+        if not isinstance(min_map, dict) or not isinstance(max_map, dict):
+            return
+        if not min_map and not max_map:
+            return
+
+        cfg = rs.config
+        shift_types = set(str(s).upper() for s in (getattr(cfg, "shift_types", []) or []))
+        day_reqs = getattr(cfg, "daily_shift_requirements_by_day", None)
+        base_reqs = getattr(cfg, "daily_shift_requirements", {}) or {}
+
+        constrained_grades: set[int] = set()
+        for mp in (min_map, max_map):
+            for by_g in (mp or {}).values():
+                if not isinstance(by_g, dict):
+                    continue
+                for gk in by_g.keys():
+                    try:
+                        constrained_grades.add(int(gk))
+                    except Exception:
+                        continue
+        if not constrained_grades:
+            return
+
+        def _req(day_idx: int, s_code: str) -> int:
+            if isinstance(day_reqs, list) and day_idx < len(day_reqs) and isinstance(day_reqs[day_idx], dict):
+                return int((day_reqs[day_idx] or {}).get(s_code, 0) or 0)
+            return int((base_reqs or {}).get(s_code, 0) or 0)
+
+        block = blocked_by_nurse or {}
+        keys = sorted(set([str(k).upper() for k in list(min_map.keys()) + list(max_map.keys())]))
+        for d in range(rs.num_days):
+            for s_code in keys:
+                if shift_types and s_code not in shift_types:
+                    continue
+                req = _req(d, s_code)
+                if req <= 0:
+                    continue
+
+                active_total = 0
+                active_by_grade = defaultdict(int)
+                active_unconstrained = 0
+                for n_idx, nurse in enumerate(rs.nurses):
+                    if not (join[n_idx] <= d <= leave[n_idx]):
+                        continue
+                    if d in (block.get(n_idx, set()) if block else set()):
+                        continue
+                    if s_code in {"D", "E"} and bool(getattr(nurse, "is_night_nurse", 0) == 3):
+                        continue
+                    active_total += 1
+                    try:
+                        gi = int(getattr(nurse, "grade", None))
+                    except Exception:
+                        gi = None
+                    if gi in constrained_grades:
+                        active_by_grade[gi] += 1
+                    else:
+                        active_unconstrained += 1
+
+                if active_total < req:
+                    msg = (
+                        f"[ACTIVE_SHORTAGE] day={d+1} shift={s_code} active={active_total} req={req}"
+                    )
+                    print(
+                        "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                        f"{msg}"
+                    )
+                    setattr(rs, "_grade_hard_probe_msg", msg)
+                    return
+
+                min_by_g = (min_map.get(s_code) or {}) if isinstance(min_map.get(s_code), dict) else {}
+                min_sum = 0
+                for gk, tv in min_by_g.items():
+                    try:
+                        gi = int(gk)
+                        t = int(tv or 0)
+                    except Exception:
+                        continue
+                    if t <= 0:
+                        continue
+                    avail = int(active_by_grade.get(gi, 0))
+                    if avail < t:
+                        msg = (
+                            f"[MIN_BLOCK] day={d+1} shift={s_code} grade={gi} need={t} avail={avail} req={req}"
+                        )
+                        print(
+                            "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                            f"{msg}"
+                        )
+                        setattr(rs, "_grade_hard_probe_msg", msg)
+                        return
+                    min_sum += t
+                if min_sum > req:
+                    msg = f"[MIN_OVER_NEED] day={d+1} shift={s_code} min_sum={min_sum} req={req}"
+                    print(
+                        "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                        f"{msg}"
+                    )
+                    setattr(rs, "_grade_hard_probe_msg", msg)
+                    return
+
+                max_by_g = (max_map.get(s_code) or {}) if isinstance(max_map.get(s_code), dict) else {}
+                if max_by_g:
+                    capped = active_unconstrained
+                    max_keys = {str(k) for k in max_by_g.keys()}
+                    for gk, uv in max_by_g.items():
+                        try:
+                            gi = int(gk)
+                            u = int(uv)
+                        except Exception:
+                            continue
+                        if u < 0:
+                            continue
+                        capped += min(int(active_by_grade.get(gi, 0)), u)
+                    for gi in constrained_grades:
+                        if str(gi) not in max_keys:
+                            capped += int(active_by_grade.get(gi, 0))
+                    if capped < req:
+                        msg = (
+                            f"[MAX_CAP_SHORTAGE] day={d+1} shift={s_code} cap={capped} req={req} "
+                            f"unconstrained={active_unconstrained} by_grade={dict(active_by_grade)}"
+                        )
+                        print(
+                            "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                            f"{msg}"
+                        )
+                        setattr(rs, "_grade_hard_probe_msg", msg)
+                        return
+        print("[CP-SAT-Basic][Diag][GradeHardProbe] blocker not detected in fast probe")
+        setattr(rs, "_grade_hard_probe_msg", None)
+    except Exception as exc:
+        print(f"[CP-SAT-Basic][Diag][GradeHardProbe] probe failed: {exc}")
+        setattr(rs, "_grade_hard_probe_msg", f"[PROBE_ERROR] {exc}")
+# TEMP-PROBE-DELETE-END
 
 
 def _log_shift_requirement_gaps(rs) -> None:

@@ -79,6 +79,7 @@ def get_grade_config(db: Session, group_id: str) -> dict | None:
         "null_grade_policy": row.null_grade_policy,
         "constraints_json": row.constraints_json,
         "use_dynamic_scaling": bool(row.use_dynamic_scaling),
+        "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
         "updated_at": str(row.updated_at) if row.updated_at else None,
     }
 

@@ -1885,6 +1885,28 @@ def optimize_fallback_lex_hard_first(
             except Exception as e:
                 print(f"{logger_prefix} [Stage{stage}] team_min hard 등록 실패: {e}")
 
+        # Grade hard 제약은 fallback 모든 stage에서 동일하게 유지되어야 한다.
+        # (기존에는 stage3 objective 경로에서만 add_grade_constraints가 호출되어,
+        #  stage3 infeasible 시 stage2/1 해로 내려가며 grade hard가 빠질 수 있었다.)
+        try:
+            _gs_fb = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+            _gc_fb = getattr(roster_system, "grade_config", None)
+            _allow_soft_fb = True
+            if isinstance(_gc_fb, dict):
+                _allow_soft_fb = bool(_gc_fb.get("allow_soft_fallback", False))
+            if _gs_fb in ("GRADE", "COMBINED") and isinstance(_gc_fb, dict) and not _allow_soft_fb:
+                add_grade_constraints_fn(
+                    m=m,
+                    rs=roster_system,
+                    X=X,
+                    join=join,
+                    leave=leave,
+                    grade_strategy=_gs_fb,
+                    grade_config=_gc_fb,
+                )
+        except Exception as _grade_hard_exc:
+            print(f"{logger_prefix} [GradeHard] fallback stage 공통 제약 추가 실패: {_grade_hard_exc}")
+
         # stage별 목적/고정
         if stage == 1:
             # m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))
@@ -2248,17 +2270,18 @@ def optimize_fallback_lex_hard_first(
                 if s3.Value(X3(n, d, s)):
                     roster_system.roster[n, d, s] = 1
     log_n_even_distribution(roster_system, logger_prefix, join=join, leave=leave)
-    try:
-        print(f"{logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
-        before_viol = len(roster_system._find_violations())
-        postprocess_rebalance_off_fn(roster_system)
-        after_viol = len(roster_system._find_violations())
-        print(
-            f"{logger_prefix} [PostOff] 종료: viol {before_viol}->{after_viol} "
-            f"(감소={before_viol - after_viol})"
-        )
-    except Exception as exc:
-        print(f"{logger_prefix} [PostOff] 후처리 실패: {exc}")
+    # NOTE: rebalance_off 후처리 비활성화(호출 무시)
+    # try:
+    #     print(f"{logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
+    #     before_viol = len(roster_system._find_violations())
+    #     postprocess_rebalance_off_fn(roster_system)
+    #     after_viol = len(roster_system._find_violations())
+    #     print(
+    #         f"{logger_prefix} [PostOff] 종료: viol {before_viol}->{after_viol} "
+    #         f"(감소={before_viol - after_viol})"
+    #     )
+    # except Exception as exc:
+    #     print(f"{logger_prefix} [PostOff] 후처리 실패: {exc}")
 
     # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
     # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사

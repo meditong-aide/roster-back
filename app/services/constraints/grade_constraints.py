@@ -89,22 +89,7 @@ def add_grade_constraints(
                 by_grade=by_grade,
             )
 
-            available = _available_by_grade_for_day_shift(
-                rs=rs,
-                by_grade=by_grade,
-                is_night_only=is_night_only,
-                day_idx=d,
-                shift_code=s_code,
-                join=join,
-                leave=leave,
-            )
-            _clamp_targets_to_available(
-                target=target,
-                available=available,
-                day_idx=d,
-                shift_code=s_code,
-                req=req,
-            )
+            # hard grade 제약 보장을 위해 target을 가용치로 내리는 clamp를 비활성화한다.
 
             obj_terms.extend(
                 _add_minimum_constraints(
@@ -305,10 +290,10 @@ def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict,
         except Exception:
             min_ratio_floor = None
     scaling = {
-        "use_dynamic_scaling": bool(grade_config.get("use_dynamic_scaling", True)),
-        "min_leader_keep": bool(grade_config.get("min_leader_keep", True)),
+        "use_dynamic_scaling": _to_bool(grade_config.get("use_dynamic_scaling", True), True),
+        "min_leader_keep": _to_bool(grade_config.get("min_leader_keep", True), True),
         "min_ratio_floor": min_ratio_floor,
-        "allow_soft_fallback": bool(grade_config.get("allow_soft_fallback", True)),
+        "allow_soft_fallback": _to_bool(grade_config.get("allow_soft_fallback", False), False),
         "grade_penalty_weight": int(grade_config.get("grade_penalty_weight", 160000)),
     }
     return constraints_map, max_constraints_map, policy, scaling
@@ -321,23 +306,30 @@ def _build_grade_groups(
 ) -> tuple[dict[int, list[int]], list[bool]]:
     """간호사 grade를 정의역(grade_values)에 맞게 매핑하고, grade별 인덱스 그룹을 만든다.
 
-    null_grade_policy == "EXCLUDE" 인 경우, NULL/정의역 밖 grade인 간호사는
-    어떤 grade 그룹에도 포함되지 않아 grade min/max 제약에서 완전히 자유롭게 배치된다.
+    정책:
+    - 정의역 밖(=제약에 명시되지 않은) grade는 항상 제외한다.
+      즉, grade min/max 집계에서 완전히 빠진다.
+    - NULL grade만 null_grade_policy에 따라 처리한다.
     """
     raw_grades = [_normalize_grade_int(getattr(n, "grade", None)) for n in rs.nurses]
     print('raw_grades', raw_grades)
     policy = str(null_grade_policy or "LOWEST").upper()
 
     mapped: list[int | None] = []
+    avg_grade = _average_grade_or_lowest(raw_grades, fallback=max(grade_values))
     if policy == "EXCLUDE":
         for g in raw_grades:
+            # EXCLUDE 정책: NULL/정의역 밖 모두 제외
             mapped.append(g if g in grade_values else None)
     else:
-        avg_grade = _average_grade_or_lowest(raw_grades, fallback=max(grade_values))
         print('avg_grade', avg_grade)
         for i, g in enumerate(raw_grades):
             if g in grade_values:
                 mapped.append(g)  # type: ignore[arg-type]
+                continue
+            if g is not None and g not in grade_values:
+                # 제약에 명시되지 않은 grade는 정책과 무관하게 제외(중립 처리)
+                mapped.append(None)
                 continue
             mapped.append(
                 _resolve_null_or_unknown_grade(
@@ -374,6 +366,23 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except Exception:
         return 0
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    """문자열/숫자/불리언 입력을 안전하게 bool로 변환한다."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off", ""}:
+            return False
+    return bool(value)
 
 
 def _parse_base_min(base: Any, grade_values: list[int]) -> dict[int, int]:

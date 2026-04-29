@@ -38,6 +38,7 @@ def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
             group_id=group.group_id,
             null_grade_policy="LOWEST",
             use_dynamic_scaling=True,
+            allow_soft_fallback=False,
             constraints={},
             constraints_max={},
             grade_names=None,
@@ -52,6 +53,7 @@ def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
         group_id=config.group_id,
         null_grade_policy=config.null_grade_policy or "LOWEST",
         use_dynamic_scaling=bool(config.use_dynamic_scaling),
+        allow_soft_fallback=bool(getattr(config, "allow_soft_fallback", False)),
         constraints=config.constraints_json or {},
         constraints_max=config.constraints_max_json or {},
         grade_names=config.grade_names_json,
@@ -86,6 +88,8 @@ def upsert_grade_config_service(
     )
     use_mid = bool(getattr(roster_cfg, "use_mid", False)) if roster_cfg else False
 
+    provided_fields = set(payload.model_fields_set)
+
     policy = str(payload.null_grade_policy or "LOWEST").upper()
     allowed_policies = {"LOWEST", "AVERAGE", "RANDOM", "EXCLUDE"}
     if policy not in allowed_policies:
@@ -93,16 +97,6 @@ def upsert_grade_config_service(
             f"허용되지 않은 null_grade_policy: {payload.null_grade_policy} "
             f"(허용: {sorted(allowed_policies)})"
         )
-
-    _validate_constraints(payload.constraints, use_mid=use_mid)
-    _validate_constraints(payload.constraints_max, use_mid=use_mid, allow_negative_as_unset=True)
-
-    # use_mid=False 면 M 키 제거
-    cleaned = dict(payload.constraints or {})
-    cleaned_max = dict(payload.constraints_max or {})
-    if not use_mid:
-        cleaned.pop("M", None)
-        cleaned_max.pop("M", None)
 
     config = (
         db.query(RosterGradeConfig)
@@ -117,12 +111,33 @@ def upsert_grade_config_service(
         )
         db.add(config)
 
-    config.null_grade_policy = policy
-    config.use_dynamic_scaling = 1 if payload.use_dynamic_scaling else 0
-    config.constraints_json = cleaned
-    config.constraints_max_json = cleaned_max
-    config.grade_names_json = payload.grade_names
-    if payload.default_shifts is not None:
+    if "null_grade_policy" in provided_fields or not config.null_grade_policy:
+        config.null_grade_policy = policy
+
+    if "use_dynamic_scaling" in provided_fields or config.use_dynamic_scaling is None:
+        config.use_dynamic_scaling = 1 if payload.use_dynamic_scaling else 0
+
+    if "allow_soft_fallback" in provided_fields or getattr(config, "allow_soft_fallback", None) is None:
+        config.allow_soft_fallback = 1 if payload.allow_soft_fallback else 0
+
+    if "constraints" in provided_fields:
+        _validate_constraints(payload.constraints, use_mid=use_mid)
+        cleaned = dict(payload.constraints or {})
+        if not use_mid:
+            cleaned.pop("M", None)
+        config.constraints_json = cleaned
+
+    if "constraints_max" in provided_fields:
+        _validate_constraints(payload.constraints_max, use_mid=use_mid, allow_negative_as_unset=True)
+        cleaned_max = dict(payload.constraints_max or {})
+        if not use_mid:
+            cleaned_max.pop("M", None)
+        config.constraints_max_json = cleaned_max
+
+    if "grade_names" in provided_fields:
+        config.grade_names_json = payload.grade_names
+
+    if "default_shifts" in provided_fields and payload.default_shifts is not None:
         # use_mid=False 면 M 항목 제거 후 저장
         config.default_shifts_json = [
             item.model_dump() for item in payload.default_shifts
@@ -139,6 +154,7 @@ def upsert_grade_config_service(
         group_id=config.group_id,
         null_grade_policy=config.null_grade_policy,
         use_dynamic_scaling=bool(config.use_dynamic_scaling),
+        allow_soft_fallback=bool(getattr(config, "allow_soft_fallback", False)),
         constraints=config.constraints_json or {},
         constraints_max=config.constraints_max_json or {},
         grade_names=config.grade_names_json,
@@ -250,4 +266,3 @@ def _normalize_default_shifts(raw: Any, use_mid: bool) -> List[DefaultShiftItem]
         sid = int(sid_raw) if isinstance(sid_raw, (int, str)) and str(sid_raw).strip() else None
         result.append(DefaultShiftItem(code=code, shift_table_id=sid))
     return result
-

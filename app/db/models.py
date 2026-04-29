@@ -370,6 +370,7 @@ class RosterGradeConfig(Base):
     grade_names_json = Column(JSON, nullable=True)
     default_shifts_json = Column(JSON, nullable=True, default=list, server_default="[]")
     use_dynamic_scaling = Column(TINYINT, nullable=False, default=1)
+    allow_soft_fallback = Column(TINYINT, nullable=False, default=0)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
     updated_by = Column(VARCHAR(50), nullable=True)
