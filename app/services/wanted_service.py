@@ -2599,20 +2599,53 @@ def save_fixed_wanted_service(
         shift_q = shift_q.filter(Shift.office_id == office_id)
     shift_id_to_table_id: Dict[str, int] = {s.shift_id: s.id for s in shift_q.all()}
 
-    # ── 1단계: 교차 저장 검증 ──
+    # ── 1단계: 교차 저장 검증 (caller 관할 외 일자 — entry 단위로 자동 skip) ──
     cross_errors, cross_blocked = _validate_cross_save_entries(
         req, group_id, nurse_rows, assignment_list_map, nurse_name_map,
     )
+    # 정책: cross_save_blocked 는 자동 skip(저장 성공 path 유지),
+    #       unknown_nurse 등 진짜 invalid 한 type 은 422 로 명시 거부.
+    fatal_cross_errors = [
+        e for e in cross_errors if e.get("type") != "cross_save_blocked"
+    ]
+    if fatal_cross_errors:
+        raise HTTPException(status_code=422, detail={"errors": fatal_cross_errors})
+    skippable_cross_errors = [
+        e for e in cross_errors if e.get("type") == "cross_save_blocked"
+    ]
+    skipped_pairs: set[tuple[str, date]] = set()
+    if skippable_cross_errors:
+        for _err in skippable_cross_errors:
+            try:
+                _sd = date.fromisoformat(str(_err.get("shift_date") or ""))
+            except (ValueError, TypeError):
+                continue
+            skipped_pairs.add((str(_err.get("nurse_id") or ""), _sd))
+        if skipped_pairs:
+            print(
+                f"[FixedWanted] cross-save 자동 skip: caller={group_id}, "
+                f"skipped_pairs={len(skipped_pairs)}건 (ownership 차단)"
+            )
+            filtered_entries = [
+                e for e in req.entries
+                if (e.nurse_id, e.shift_date) not in skipped_pairs
+            ]
+            req = FixedWantedCreate(
+                year=req.year, month=req.month, entries=filtered_entries,
+            )
+            # cross-skipped 후엔 잔여 entries 가 모두 caller-owned 이므로
+            # cross_blocked 를 비워 off_cap 검증이 잔여 entries 를 정확히 평가하도록 한다.
+            cross_blocked = set()
 
-    # ── 2단계: 월 OFF 상한 검증 ──
+    # ── 2단계: 월 OFF 상한 검증 (cross-skipped 후 잔여 entries 기준) ──
     off_errors = _validate_monthly_off_cap(
         db, req, group_id, nurse_rows, cross_blocked,
         shift_id_to_table_id, nurse_name_map,
     )
 
-    all_errors = cross_errors + off_errors
-    if all_errors:
-        raise HTTPException(status_code=422, detail={"errors": all_errors})
+    if off_errors:
+        # OFF 상한 초과는 사용자 명시 입력 오류이므로 422 유지
+        raise HTTPException(status_code=422, detail={"errors": off_errors})
 
     # ── 원본 맵 / 주휴 맵 구축 (요청 간호사 한정) ──
     original_map = _build_original_shift_map(
