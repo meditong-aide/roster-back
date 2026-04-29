@@ -2509,7 +2509,10 @@ def _insert_fixed_wanted_entries(
             skipped_weekly_off += 1
             continue
         entry_day = entry.shift_date.day
-        if entry_day in nurse_weekly_off_map.get(entry.nurse_id, set()):
+        # weekly_off 일자 처리:
+        #   - "주" entry 는 자동 inject (프론트 GET 응답에 포함) → 중복 방지 위해 skip
+        #   - 그 외 shift_id (휴/보/D/E 등) 는 사용자 명시 override 로 정상 저장
+        if entry_day in nurse_weekly_off_map.get(entry.nurse_id, set()) and entry.shift_id == "주":
             skipped_weekly_off += 1
             continue
         key = (entry.nurse_id, entry.shift_date.isoformat())
@@ -2630,12 +2633,24 @@ def save_fixed_wanted_service(
                 e for e in req.entries
                 if (e.nurse_id, e.shift_date) not in skipped_pairs
             ]
+            # 모든 entries 가 cross-skip 된 경우 (사용자 입력 = blocked 일자만)
+            # 아래 caller-group delete-then-insert 단계로 진입하면 기존 caller-owned
+            # entries 전부 손실되므로, DB 변경 없이 early return.
+            if not filtered_entries:
+                print(
+                    f"[FixedWanted] 모든 entries cross-skipped → DB 변경 없음 (early return)"
+                )
+                return []
             req = FixedWantedCreate(
                 year=req.year, month=req.month, entries=filtered_entries,
             )
-            # cross-skipped 후엔 잔여 entries 가 모두 caller-owned 이므로
-            # cross_blocked 를 비워 off_cap 검증이 잔여 entries 를 정확히 평가하도록 한다.
-            cross_blocked = set()
+            # 주의: cross_blocked(nurse 단위 set)은 그대로 유지한다.
+            # _validate_monthly_off_cap 가 cross_blocked nurse 의 OFF 검증을 skip 하므로,
+            # 클리어할 경우 caller-owned entries 의 OFF + existing_other(다른 group 기존
+            # OFF) 합산이 source group cap 을 초과해 source 일자 entries 가 422 로 거부됨.
+            # 정책: cross-skip 발생한 nurse 는 nurse 단위로 OFF 검증 skip(보수적). 이는
+            # caller-owned 부분의 OFF 검증을 한 단계 느슨하게 두지만, source 일자 정상
+            # 저장을 우선한다.
 
     # ── 2단계: 월 OFF 상한 검증 (cross-skipped 후 잔여 entries 기준) ──
     off_errors = _validate_monthly_off_cap(
