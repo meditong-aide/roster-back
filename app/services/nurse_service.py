@@ -1125,8 +1125,21 @@ def update_nurse_profile_service(
             "nurse_id": nurse_id,
         }
 
-    # 호출 view 의 group_id 결정 (target view 에서 inbound nurse 수정 시 명시 필요)
+    # 호출 view 의 group_id 결정 (target view 에서 inbound nurse 수정 시 명시 필요).
+    # 권한 검증:
+    #   - 본인 group 과 동일하면 OK
+    #   - 다른 group 인 경우 master_admin 또는 hn_auth=='HN'(그룹 관리자) 만 허용
     _caller_view_group = view_group_id or current_user.group_id
+    if (
+        view_group_id
+        and view_group_id != current_user.group_id
+        and not is_admin
+        and str(getattr(current_user, "hn_auth", "") or "").upper() != "HN"
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="다른 그룹 view 에서 nurse 수정 권한이 없습니다 (HN/admin 필요).",
+        )
     # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
     if is_admin:
         _apply_source_nurse_update(nurse, fields)

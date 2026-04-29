@@ -565,7 +565,9 @@ class NurseProfileUpdate(BaseModel):
     is_head_nurse: Optional[bool] = None
     preceptor_id: Optional[str] = None
     fixed_shift: Optional[str] = None
+    weekly_off_enabled: Optional[int] = None
     weekly_off_weekday: Optional[int] = None
+    weekly_off_type: Optional[str] = None
     is_weekend_off: Optional[bool] = None
     is_night_nurse: Optional[List[str]] = None
     work_shifts: Optional[List[str]] = None
