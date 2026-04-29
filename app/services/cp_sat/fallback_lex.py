@@ -1871,7 +1871,8 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) not in vacation_off_cells
                     )
                     if is_n_only:
-                        total_cap_effective = max(0, avail_days - 15) + relax_level
+                        # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                        total_cap_effective = max(0, avail_days - 15)
                     else:
                         # 2N2O/3N2O 하드 제약으로 인한 추가 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
                         _extra_off_fb = 0
@@ -1897,7 +1898,8 @@ def optimize_fallback_lex_hard_first(
                             base_cap += _extra_off_fb
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            total_cap_effective = min(base_cap + relax_level, avail_days)
+                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            total_cap_effective = min(base_cap, avail_days)
                             # max coverage 자동 조정: max_off cap
                             if _fb_auto_max_off is not None:
                                 import math as _math
@@ -1909,16 +1911,31 @@ def optimize_fallback_lex_hard_first(
                             base_cap = min_off_required + _extra_off_fb
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            total_cap_effective = min(base_cap + relax_level, avail_days)
+                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            total_cap_effective = min(base_cap, avail_days)
                             total_cap_effective = max(total_cap_effective, min_off_required)
+                    # OFF cap slack 결정 정책:
+                    # 1) cfg gate (off_cap_bounded_slack_enable=True) → 기존 cfg max/weight 사용
+                    # 2) gate False AND relax_level > 0 → per-nurse fallback 슬랙
+                    #    (글로벌 +relax_level 폐지 후 위반 nurse 만 cap 풀어주는 구조)
+                    # 3) gate False AND relax_level == 0 → cap hard (slack 없음)
                     if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
-                        cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
+                        _slack_max = int(off_cap_bounded_slack_max)
+                        _slack_weight = int(off_cap_bounded_slack_weight)
+                    elif int(relax_level or 0) > 0:
+                        _slack_max = int(relax_level)
+                        _slack_weight = 100000
+                    else:
+                        _slack_max = 0
+                        _slack_weight = 0
+                    if _slack_max > 0:
+                        cap_slack = m.NewIntVar(0, _slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(
                             0,
-                            off_cap_bounded_slack_max * off_cap_bounded_slack_weight,
+                            _slack_max * _slack_weight,
                             f"off_cap_slack_weighted_{n}",
                         )
-                        m.Add(weighted == cap_slack * off_cap_bounded_slack_weight)
+                        m.Add(weighted == cap_slack * _slack_weight)
                         safety["off_cap_bounded_slack"].append(weighted)
                         m.Add(nonvac_offs <= total_cap_effective + cap_slack)
                     else:
