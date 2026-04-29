@@ -1158,6 +1158,19 @@ def update_nurse_profile_service(
             db.refresh(assign_row)
         else:
             _apply_source_nurse_update(nurse, fields)
+            # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
+            # 프론트가 view_group_id 안 보내도 source view 호출 한 번으로 inbound 모두 동기화.
+            _cascade_inbounds = (
+                db.query(NurseAssignment)
+                .filter(
+                    NurseAssignment.nurse_id == nurse_id,
+                    NurseAssignment.status == "active",
+                    NurseAssignment.reason.in_(_INBOUND_REASONS),
+                )
+                .all()
+            )
+            for _ia in _cascade_inbounds:
+                _apply_target_update(_ia, fields)
             db.commit()
             db.refresh(nurse)
             applied_source = True

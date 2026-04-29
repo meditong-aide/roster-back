@@ -2371,6 +2371,9 @@ def _validate_cross_save_entries(
     errors: List[Dict[str, Any]] = []
     reported_nurses: Set[str] = set()
     cross_blocked: Set[str] = set()
+    # 모든 cross-blocked entry pair 수집 — auto-skip 시 entry 단위 정확 매핑 위해.
+    # (errors 는 nurse 단위 dedup 되어 첫 1건만 잡혀, 같은 nurse 의 다른 cross-blocked
+    #  entries 가 skip 누락되던 버그를 cross_blocked_pairs 별도 수집으로 보강.)
     for entry in req.entries:
         if entry.source_type == "weekly_off":
             continue
@@ -2394,12 +2397,10 @@ def _validate_cross_save_entries(
         if owner_group == caller_group_id:
             continue
         cross_blocked.add(entry.nurse_id)
-        if entry.nurse_id in reported_nurses:
-            continue
-        reported_nurses.add(entry.nurse_id)
+        # cross-blocked entry 는 모두 errors 에 추가 (nurse 단위 dedup 제거).
+        # → skipped_pairs 가 entry 단위로 정확히 채워져 같은 nurse 의 여러 cross-blocked
+        #   일자를 모두 자동 skip 할 수 있음.
         nurse_name = nurse_name_map.get(entry.nurse_id, entry.nurse_id)
-        # 메시지 분기: owner_group 이 list 중 어떤 assignment 의 target 인지
-        # (해당 entry.shift_date 기준) 찾아서 정확히 분기
         is_target_of_any = any(
             owner_group == a.target_group_id for a in nurse_assignments
         )
