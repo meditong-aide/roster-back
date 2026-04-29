@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
@@ -2719,6 +2720,10 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             engine_grade_config = _fetch_grade_config_dict(
                 db, current_user.office_id, current_user.group_id
             )
+        if bool(config_dict.get("_force_grade_max_soft_fallback")) and isinstance(engine_grade_config, dict):
+            engine_grade_config = dict(engine_grade_config)
+            engine_grade_config["allow_soft_fallback"] = True
+            print("[GradeFallback] force allow_soft_fallback=True (grade_max soft)")
         req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
         effective_grade_strategy = _select_effective_grade_strategy(
             req_strategy=req_strategy,
@@ -3247,7 +3252,11 @@ def _probe_first_grade_hard_blocker(roster_system) -> str | None:
 
 
 def _validate_generated_roster(
-    generated: dict[str, list[str]] | None, roster_system
+    generated: dict[str, list[str]] | None,
+    roster_system,
+    nurses_context: list | None = None,
+    config_context: dict | None = None,
+    grade_config_context: dict | None = None,
 ) -> str | None:
     """
     엔진 결과가 고객에게 보여줄 수 없는 수준인지 최소 검증한다.
@@ -3268,9 +3277,37 @@ def _validate_generated_roster(
     if total_cells > 0 and work_cells == 0:
         diag = _build_infeasible_diagnosis(roster_system, generated)
         cp_probe_msg = getattr(roster_system, "_grade_hard_probe_msg", None)
+
+        def _grade_probe_comment(msg: str | None) -> str | None:
+            if not msg:
+                return None
+            if "MAX_CAP_SHORTAGE" not in msg:
+                return None
+            day_m = re.search(r"day=(\d+)", msg)
+            shift_m = re.search(r"shift=([A-Z]+)", msg)
+            cap_m = re.search(r"cap=(\d+)", msg)
+            req_m = re.search(r"req=(\d+)", msg)
+            day = day_m.group(1) if day_m else "?"
+            shift = shift_m.group(1) if shift_m else "?"
+            cap = cap_m.group(1) if cap_m else "?"
+            req = req_m.group(1) if req_m else "?"
+            return (
+                "[comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮아 infeasible 발생 "
+                f"(day={day}, shift={shift}, cap={cap}, req={req}). "
+                "grade_max 중요도를 낮춘 soft fallback 또는 상한 완화가 필요합니다."
+            )
+
+        probe_comment = _grade_probe_comment(cp_probe_msg)
         if cp_probe_msg:
             if diag:
+                if probe_comment:
+                    return f"{diag} | [cp_probe={cp_probe_msg}] | {probe_comment}"
                 return f"{diag} | [cp_probe={cp_probe_msg}]"
+            if probe_comment:
+                return (
+                    "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
+                    f"| [cp_probe={cp_probe_msg}] | {probe_comment}"
+                )
             return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]"
         # TEMP-PROBE-DELETE: NO_ASSIGNMENT 시 grade hard 충돌 일자/교대를 임시 탐색
         probe_msg = _probe_first_grade_hard_blocker(roster_system)
@@ -3279,6 +3316,74 @@ def _validate_generated_roster(
             if diag:
                 return f"{diag} | {probe_msg}"
             return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}"
+
+        # probe로 못 잡힌 경우, grade_max 산술 상한만으로도 즉시 불가능한 케이스를 보조 진단한다.
+        try:
+            cfg = getattr(roster_system, "config", None)
+            gc = getattr(roster_system, "grade_config", None) or {}
+            if cfg is None and isinstance(config_context, dict):
+                class _CfgProxy:
+                    pass
+                _p = _CfgProxy()
+                setattr(_p, "daily_shift_requirements", config_context.get("daily_shift_requirements") or {})
+                setattr(_p, "daily_shift_requirements_by_day", config_context.get("daily_shift_requirements_by_day"))
+                cfg = _p
+            if (not gc) and isinstance(grade_config_context, dict):
+                gc = grade_config_context
+            max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+            if cfg and isinstance(max_map, dict) and max_map:
+                nurses = list(getattr(roster_system, "nurses", []) or [])
+                if not nurses and isinstance(nurses_context, list):
+                    nurses = list(nurses_context)
+                grade_counts: dict[int, int] = defaultdict(int)
+                for nu in nurses:
+                    try:
+                        grade_counts[int(getattr(nu, "grade", None))] += 1
+                    except Exception:
+                        continue
+
+                ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+                base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+
+                def _req(day_idx: int, shift_code: str) -> int:
+                    if isinstance(ds_by_day, list) and day_idx < len(ds_by_day) and isinstance(ds_by_day[day_idx], dict):
+                        return int((ds_by_day[day_idx] or {}).get(shift_code, 0) or 0)
+                    return int((base_req or {}).get(shift_code, 0) or 0)
+
+                days = int(getattr(roster_system, "num_days", 0) or 0)
+                if days <= 0 and isinstance(ds_by_day, list):
+                    days = len(ds_by_day)
+                for d in range(days):
+                    for s_code, limits_raw in max_map.items():
+                        if not isinstance(limits_raw, dict):
+                            continue
+                        shift_code = str(s_code or "").strip().upper()
+                        req = _req(d, shift_code)
+                        if req <= 0:
+                            continue
+
+                        constrained = {int(gk): int(v or 0) for gk, v in limits_raw.items() if str(gk).isdigit()}
+                        cap = 0
+                        for g, cnt in grade_counts.items():
+                            if g in constrained:
+                                cap += min(cnt, max(0, constrained[g]))
+                            else:
+                                cap += cnt
+                        if cap < req:
+                            aux = (
+                                "[reason_code=GRADE_MAX_SUM_BELOW_NEED] "
+                                f"day={d+1} shift={shift_code} req={req} cap={cap} "
+                                f"limits={constrained}"
+                            )
+                            if diag:
+                                return f"{diag} | {aux}"
+                            return (
+                                "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
+                                f"| {aux} | [comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮습니다. "
+                                "grade_max 중요도를 soft로 낮추거나 상한 완화를 검토하세요."
+                            )
+        except Exception as _aux_exc:
+            print(f"[InfeasibleProbe][aux] grade_max 보조진단 실패(무시): {_aux_exc}")
         return diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다."
 
     # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
@@ -4446,8 +4551,88 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         else:
             generated = dict(_alloff_roster)
 
-    validation_error = _validate_generated_roster(generated, roster_system)
+    validation_error = _validate_generated_roster(
+        generated,
+        roster_system,
+        nurses_context=list(nurses_for_engine or []),
+        config_context=config_dict,
+        grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
+    )
     if validation_error:
+        _is_grade_max_case = (
+            ("MAX_CAP_SHORTAGE" in validation_error)
+            or ("GRADE_MAX_SUM_BELOW_NEED" in validation_error)
+        )
+        if _is_grade_max_case and not bool(config_dict.get("_force_grade_max_soft_fallback")):
+            print("[GradeFallback] grade_max 병목 감지 → grade_max soft fallback으로 1회 재시도")
+            soft_cfg = dict(config_dict)
+            soft_cfg["_force_grade_max_soft_fallback"] = True
+            retry_generated, _, retry_rs = _run_cp_sat_basic(
+                db,
+                current_user,
+                nurses_for_engine,
+                preferences,
+                latest_config,
+                req,
+                shift_manage_data,
+                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                time_limit_seconds=60,
+                config_override=soft_cfg,
+            )
+            # 동일 후처리 적용
+            try:
+                weekend_off_display_ids = {
+                    str(getattr(n, "nurse_id", ""))
+                    for n in nurses_in_group
+                    if bool(getattr(n, "is_weekend_off", False)) and getattr(n, "nurse_id", None)
+                }
+                if weekly_off_map and isinstance(retry_generated, dict):
+                    for nurse_id, day_set in weekly_off_map.items():
+                        if str(nurse_id) in weekend_off_display_ids:
+                            continue
+                        shifts = retry_generated.get(nurse_id)
+                        if not shifts:
+                            continue
+                        for d in day_set:
+                            if 0 <= d < len(shifts):
+                                shifts[d] = "주"
+            except Exception as e:
+                weekly_off_warnings.append({"type": "weekly_off_mark_failed_retry", "detail": str(e)})
+
+            if isinstance(retry_generated, dict):
+                retry_generated.update(fixed_roster)
+            else:
+                retry_generated = fixed_roster
+            if _alloff_roster:
+                if isinstance(retry_generated, dict):
+                    retry_generated.update(_alloff_roster)
+                else:
+                    retry_generated = dict(_alloff_roster)
+
+            retry_validation_error = _validate_generated_roster(
+                retry_generated,
+                retry_rs,
+                nurses_context=list(nurses_for_engine or []),
+                config_context=soft_cfg,
+                grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
+            )
+            if not retry_validation_error:
+                generated = retry_generated
+                roster_system = retry_rs
+                weekly_off_warnings.append(
+                    {
+                        "type": "grade_max_soft_fallback_applied",
+                        "detail": "grade_max 병목으로 infeasible 발생하여 grade_max를 soft로 완화해 재생성했습니다.",
+                    }
+                )
+                print("[GradeFallback] soft fallback 재시도 성공")
+                validation_error = None
+            else:
+                print(f"[GradeFallback] soft fallback 재시도 실패: {retry_validation_error}")
+                validation_error = retry_validation_error
+
+    if validation_error:
+        print(f"[RosterGenerate][ValidationError] {validation_error}")
         db.delete(schedule)
         db.commit()
         raise Exception(validation_error)
