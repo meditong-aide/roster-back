@@ -33,6 +33,7 @@ from schemas.roster_schema import (
     NurseAssignmentCreate,
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
+    NurseAssignmentListResponse,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -41,8 +42,11 @@ from services.assignment_service import (
     update_assignment,
     cancel_assignment,
     get_assignments,
+    get_assignment_status_counts,
     flush_pending_transfers,
     flush_expired_preceptees,
+    flush_expired_dispatches,
+    flush_expired_leaves,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
@@ -139,6 +143,10 @@ async def get_nurses_in_group(
         flush_pending_transfers(db, _group)
     # 프리셉티 만료 레이지 체크
     flush_expired_preceptees(db)
+    # 파견 만료 레이지 체크 (status change only, 안전 작업)
+    flush_expired_dispatches(db)
+    # 휴직 만료 레이지 체크 (status change only, 안전 작업)
+    flush_expired_leaves(db)
     print(
         "current_user",
         current_user.nurse_id,
@@ -920,51 +928,92 @@ async def verify_and_update_phone(
 # ── NurseAssignment 엔드포인트 (동적 경로보다 먼저 선언) ──
 
 
-@router.post("/assignments", response_model=NurseAssignmentResponse)
+@router.post(
+    "/assignments",
+    response_model=NurseAssignmentResponse,
+    deprecated=True,
+)
 async def create_nurse_assignment(
     req: NurseAssignmentCreate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정/상태 변경 등록 (파견/휴직/퇴사/프리셉티/병동이동)"""
-    return create_assignment(req, db)
+    """[DEPRECATED] 배정/상태 변경 등록.
+
+    신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "create", ...}` payload로 대체해 주세요.
+    (파견/휴직/퇴사/프리셉티/병동이동)
+    """
+    return create_assignment(req, db, current_user=current_user)
 
 
-@router.get("/assignments", response_model=List[NurseAssignmentResponse])
+@router.get("/assignments", response_model=NurseAssignmentListResponse)
 async def get_nurse_assignments(
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[str] = "active",
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정 이력 조회"""
+    """배정 이력 조회.
+
+    응답 구조:
+    - items: 현재 status 필터가 적용된 레코드 목록
+    - counts: 동일 범위 전체의 status 별 카운트 (필터 무관)
+    - total: counts 합계
+    - applied_status: 사용된 status 값
+
+    status 기본값은 'active' — cancelled/completed 등 비활성 이력은 기본 미노출.
+    전체 이력이 필요하면 `status=all` 로 호출.
+    """
     office_id = getattr(current_user, "office_id", None)
     if not office_id:
         raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
     _group = group_id or getattr(current_user, "group_id", None)
-    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
+    _status = None if status == "all" else status
+    items = get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=_status)
+    counts = get_assignment_status_counts(db, office_id, group_id=_group, nurse_id=nurse_id)
+    total = counts.active + counts.completed + counts.cancelled + counts.on_hold
+    return NurseAssignmentListResponse(
+        items=items,
+        counts=counts,
+        total=total,
+        applied_status=status,
+    )
 
 
-@router.put("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+@router.put(
+    "/assignments/{assignment_id}",
+    response_model=NurseAssignmentResponse,
+    deprecated=True,
+)
 async def update_nurse_assignment(
     assignment_id: int,
     req: NurseAssignmentUpdate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정 수정 (기간/상태 변경)"""
-    return update_assignment(assignment_id, req, db)
+    """[DEPRECATED] 배정 수정 (기간/상태 변경).
+
+    신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "update", assignment_id, ...}` payload로 대체해 주세요.
+    """
+    return update_assignment(assignment_id, req, db, current_user=current_user)
 
 
-@router.delete("/assignments/{assignment_id}", response_model=NurseAssignmentResponse)
+@router.delete(
+    "/assignments/{assignment_id}",
+    response_model=NurseAssignmentResponse,
+    deprecated=True,
+)
 async def delete_nurse_assignment(
     assignment_id: int,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정 취소 (status → cancelled)"""
-    return cancel_assignment(assignment_id, db)
+    """[DEPRECATED] 배정 취소 (status → cancelled).
+
+    신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "cancel", assignment_id}` payload로 대체해 주세요.
+    """
+    return cancel_assignment(assignment_id, db, current_user=current_user)
 
 
 @router.get("/{nurse_id}", response_model=NurseProfile)
@@ -1017,11 +1066,20 @@ async def get_nurse_by_id(
 async def update_nurse_profile(
     nurse_id: str,
     update_data: NurseProfileUpdate,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
+    """간호사 프로필 수정.
+
+    group_id: 호출 view 의 그룹(=caller_group_id). 미지정 시 current_user.group_id 사용.
+    target view(인바운드 간호사 수정) 에서 호출 시 명시 전달해야 target_* overlay 가
+    정상 적용된다 (미전달 시 항상 source 분기로 처리되어 nurse 자체 컬럼만 변경됨).
+    """
     try:
-        return update_nurse_profile_service(nurse_id, update_data, current_user, db)
+        return update_nurse_profile_service(
+            nurse_id, update_data, current_user, db, view_group_id=group_id,
+        )
     except HTTPException:
         raise
     except Exception as e:

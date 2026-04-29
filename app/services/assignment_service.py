@@ -5,19 +5,67 @@
 """
 
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple, List
 from db.models import NurseAssignment, Nurse as NurseModel, ShiftTransferLog, Group
 from schemas.roster_schema import (
     NurseAssignmentCreate,
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
+    AssignmentStatusCounts,
 )
+from schemas.auth_schema import User as UserSchema
 import logging
 
 logger = logging.getLogger(__name__)
+
+# FixedWantedEntry 재배치 시 open-ended assignment(end_date=None)의 월 범위 캡
+_REALLOCATE_OPEN_WINDOW_CAP_MONTHS = 12
+
+# 파견/병동이동 이관 사유 (nurse_service._INBOUND_REASONS와 동일 정책)
+_INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
+
+
+def _assert_caller_owns_source(
+    current_user: Optional[UserSchema],
+    source_group_id: str,
+) -> None:
+    """파견/병동이동/휴직 등 assignment 조작 권한 검증.
+
+    정책: source 병동 수간호사만 자기 병동 간호사를 파견/이동시킬 수 있다.
+    - is_master_admin: 예외 (모든 그룹 조작 허용)
+    - 그 외: caller.group_id == source_group_id 필수
+    - current_user가 None이면 system/admin 경로로 간주하고 통과.
+    """
+    if current_user is None:
+        return
+    if getattr(current_user, "is_master_admin", False):
+        return
+    caller_gid = getattr(current_user, "group_id", None)
+    if caller_gid != source_group_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"권한 없음: source 병동({source_group_id})의 수간호사만 "
+                f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
+            ),
+        )
+
+
+# source(nurses.*) 필드명 → target(nurse_assignment.target_*) 필드명 매핑
+# Target 병동 수간호사가 inbound 간호사 프로필을 수정할 때 사용.
+_SOURCE_TO_TARGET_FIELD_MAP: dict[str, str] = {
+    "grade": "target_grade",
+    "fixed_shift": "target_fixed_shift",
+    "is_night_nurse": "target_shift_types",
+    "team_id": "target_team_id",
+    "weekly_off_enabled": "target_weekly_off_enabled",
+    "weekly_off_type": "target_weekly_off_type",
+    "weekly_off_weekday": "target_weekly_off_weekday",
+    "wanted_max_requests": "target_wanted_max_requests",
+}
 
 
 def _get_group_name(db: Session, group_id: str | None) -> str | None:
@@ -54,11 +102,158 @@ def _collect_assignment_recipients(
     return list(recipients)
 
 
+# ── FixedWantedEntry 재배치 헬퍼 ───────────────────────────────────────
+# 정책 B: assignment 기간 내(in-period) 엔트리 소유자는 target_group_id,
+# 기간 외(out-of-period) 소유자는 source_group_id.
+# 재배치 충돌 시 Policy 1(desired_owner 기존 엔트리 보존)로 해결한다.
+
+
+def _effective_end_date(row: NurseAssignment) -> Optional[date]:
+    """assignment의 실제 종료 경계(end_date 우선, 없으면 expected_end_date).
+
+    병동이동은 영구 이동이라 flush가 set한 end_date(today)는 상태 마커일 뿐
+    실제 종료가 아니다. 따라서 expected_end_date 만 인정한다.
+    """
+    if row.reason == "병동이동":
+        return row.expected_end_date
+    return row.end_date or row.expected_end_date
+
+
+def _collect_affected_months(
+    start_date: date,
+    end_date: Optional[date],
+    cap_months: int = _REALLOCATE_OPEN_WINDOW_CAP_MONTHS,
+) -> List[Tuple[int, int]]:
+    """[start_date, end_date] 범위의 (year, month) 목록. open-ended는 cap_months로 제한."""
+    if end_date is None:
+        y, m = start_date.year, start_date.month + cap_months
+        while m > 12:
+            y += 1
+            m -= 12
+        end = date(y, m, 1)
+    else:
+        end = end_date
+    cur_y, cur_m = start_date.year, start_date.month
+    months: List[Tuple[int, int]] = []
+    while (cur_y, cur_m) <= (end.year, end.month):
+        months.append((cur_y, cur_m))
+        cur_m += 1
+        if cur_m > 12:
+            cur_y += 1
+            cur_m = 1
+    return months
+
+
+def _desired_owner_for_date(
+    d: date,
+    source_group_id: str,
+    target_group_id: Optional[str],
+    window: Optional[Tuple[date, Optional[date]]],
+) -> str:
+    """window 기간 내면 target, 바깥(또는 window=None)이면 source."""
+    if not target_group_id or window is None:
+        return source_group_id
+    start, end = window
+    if d < start:
+        return source_group_id
+    if end is not None and d > end:
+        return source_group_id
+    return target_group_id
+
+
+def _reallocate_month_fixed_wanted(
+    db: Session,
+    nurse_id: str,
+    source_group_id: str,
+    target_group_id: Optional[str],
+    year: int,
+    month: int,
+    window: Optional[Tuple[date, Optional[date]]],
+) -> int:
+    """해당 월 FixedWantedEntry.group_id를 desired_owner 기준으로 재배치."""
+    from db.models import FixedWantedEntry
+
+    candidate_gids = [source_group_id]
+    if target_group_id:
+        candidate_gids.append(target_group_id)
+    entries = (
+        db.query(FixedWantedEntry)
+        .filter(
+            FixedWantedEntry.nurse_id == nurse_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.group_id.in_(candidate_gids),
+        )
+        .all()
+    )
+    if not entries:
+        return 0
+    by_date: dict[date, dict[str, list]] = {}
+    for e in entries:
+        by_date.setdefault(e.shift_date, {}).setdefault(e.group_id, []).append(e)
+    changed = 0
+    for d, owners in by_date.items():
+        want = _desired_owner_for_date(d, source_group_id, target_group_id, window)
+        has_want = bool(owners.get(want))
+        for gid, rows in owners.items():
+            if gid == want:
+                continue
+            if has_want:
+                for r in rows:
+                    db.delete(r)
+                    changed += 1
+            else:
+                for r in rows:
+                    r.group_id = want
+                    changed += 1
+    return changed
+
+
+def _reallocate_fixed_wanted_on_assignment_change(
+    db: Session,
+    nurse_id: str,
+    source_group_id: str,
+    target_group_id: Optional[str],
+    old_window: Optional[Tuple[date, Optional[date]]],
+    new_window: Optional[Tuple[date, Optional[date]]],
+) -> int:
+    """assignment 변경(create/update/cancel)에 따라 FixedWantedEntry 소유자를 재배치.
+
+    old_window∪new_window 범위의 월들에 대해서만 재배치한다.
+    파견/병동이동만 대상(target_group_id 존재 시); 그 외 사유는 no-op.
+    """
+    if not target_group_id:
+        return 0
+    months: set[Tuple[int, int]] = set()
+    for win in (old_window, new_window):
+        if win is None:
+            continue
+        for ym in _collect_affected_months(win[0], win[1]):
+            months.add(ym)
+    if not months:
+        return 0
+    total = 0
+    for (year, month) in months:
+        total += _reallocate_month_fixed_wanted(
+            db, nurse_id, source_group_id, target_group_id, year, month, new_window,
+        )
+    if total > 0:
+        db.flush()
+        logger.info(
+            "FixedWantedEntry 재배치: nurse_id=%s, %s⇄%s, months=%s, touched=%d",
+            nurse_id, source_group_id, target_group_id, sorted(months), total,
+        )
+    return total
+
+
 def create_assignment(
     req: NurseAssignmentCreate,
     db: Session,
+    current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 등록"""
+    _assert_caller_owns_source(current_user, req.source_group_id)
+
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
@@ -73,29 +268,19 @@ def create_assignment(
                 detail=f"퇴사 처리된 간호사입니다. (퇴사일: {_resign_d})",
             )
 
+    # 병동이동 체인 검증 (source가 직전 target 또는 현재 group_id 와 일치)
+    if req.reason == "병동이동":
+        _assert_transfer_chain_source(db, req.nurse_id, req.source_group_id)
+
+    # 파견/병동이동: target_group_id 필수 + source != target 검증
+    _assert_valid_inbound_target(req.reason, req.source_group_id, req.target_group_id)
+
+    # Office 경계 검증 (파견/병동이동: target_group이 동일 office 소속이어야 함)
+    if req.reason in _INBOUND_REASONS and req.target_group_id:
+        _assert_target_in_same_office(db, req.office_id, req.target_group_id)
+
     # 기간 중복 검증: 동일 간호사의 active assignment와 일자 겹침 불허
-    from sqlalchemy import case
-    _eff_end = case(
-        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
-        else_=NurseAssignment.expected_end_date,
-    )
-    _overlap_filters = [
-        NurseAssignment.nurse_id == req.nurse_id,
-        NurseAssignment.status == "active",
-        or_(
-            _eff_end.is_(None),
-            _eff_end >= req.start_date,
-        ),
-    ]
-    if req.expected_end_date is not None:
-        _overlap_filters.append(NurseAssignment.start_date <= req.expected_end_date)
-    _overlap = db.query(NurseAssignment).filter(*_overlap_filters).first()
-    if _overlap:
-        raise HTTPException(
-            status_code=409,
-            detail=f"기간이 겹치는 배정이 존재합니다. (id={_overlap.id}, reason={_overlap.reason}, "
-                   f"{_overlap.start_date}~{_overlap.end_date or _overlap.expected_end_date})",
-        )
+    _raise_if_overlap(db, req.nurse_id, req.start_date, req.expected_end_date)
 
     row = NurseAssignment(
         nurse_id=req.nurse_id,
@@ -106,10 +291,11 @@ def create_assignment(
         expected_end_date=req.expected_end_date,
         reason=req.reason,
         status="active",
+        note=req.note,
         target_weekly_off_type=req.target_weekly_off_type,
         target_weekly_off_enabled=req.target_weekly_off_enabled,
         target_weekly_off_weekday=req.target_weekly_off_weekday,
-        target_shift_types=req.target_shift_types,
+        target_shift_types=req.target_shift_types if req.target_shift_types is not None else [],
         target_team_id=req.target_team_id,
         target_grade=req.target_grade,
         target_fixed_shift=req.target_fixed_shift,
@@ -122,6 +308,22 @@ def create_assignment(
         "배정 등록: nurse_id=%s, reason=%s, start=%s",
         req.nurse_id, req.reason, req.start_date,
     )
+
+    # FixedWantedEntry 재배치 (파견/병동이동만)
+    if req.reason in _INBOUND_REASONS and req.target_group_id:
+        try:
+            _reallocate_fixed_wanted_on_assignment_change(
+                db,
+                nurse_id=req.nurse_id,
+                source_group_id=req.source_group_id,
+                target_group_id=req.target_group_id,
+                old_window=None,
+                new_window=(row.start_date, _effective_end_date(row)),
+            )
+            db.commit()
+        except Exception as e:
+            logger.error("FixedWantedEntry 재배치 실패(create): %s", e, exc_info=True)
+            db.rollback()
 
     # 알림 발송 (S06)
     try:
@@ -147,22 +349,198 @@ def create_assignment(
     return _to_response(row, nurse.name)
 
 
+def _assert_transfer_chain_source(
+    db: Session,
+    nurse_id: str,
+    source_group_id: str,
+) -> None:
+    """병동이동 체인 검증.
+
+    후속 병동이동의 source_group_id는 직전 active 병동이동의 target_group_id와 일치해야 한다.
+    직전 이동이 없으면 현재 nurses.group_id와 일치해야 한다.
+    """
+    prev = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == nurse_id,
+            NurseAssignment.reason == "병동이동",
+            NurseAssignment.status == "active",
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .first()
+    )
+    if prev is not None:
+        if source_group_id != prev.target_group_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"병동이동 체인 불일치: 직전 이동 target={prev.target_group_id}, "
+                    f"후속 source={source_group_id}"
+                ),
+            )
+        return
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    if nurse and source_group_id != nurse.group_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"source 불일치: 현재 그룹={nurse.group_id}, "
+                f"요청 source={source_group_id}"
+            ),
+        )
+
+
+def _assert_valid_inbound_target(
+    reason: str,
+    source_group_id: str,
+    target_group_id: Optional[str],
+) -> None:
+    """파견/병동이동: target_group_id 필수 + source와 달라야 함."""
+    if reason not in _INBOUND_REASONS:
+        return
+    if not target_group_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{reason}은(는) target_group_id 필수입니다.",
+        )
+    if target_group_id == source_group_id:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{reason}의 target_group_id가 source_group_id({source_group_id})와 "
+                f"동일합니다. 다른 병동을 선택해 주세요."
+            ),
+        )
+
+
+def _assert_target_in_same_office(
+    db: Session,
+    caller_office_id: str,
+    target_group_id: str,
+) -> None:
+    """파견/병동이동의 target_group_id가 호출자 office_id와 동일한 오피스인지 검증."""
+    target_group = (
+        db.query(Group).filter(Group.group_id == target_group_id).first()
+    )
+    if target_group is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"target_group_id={target_group_id}는 존재하지 않습니다.",
+        )
+    if target_group.office_id != caller_office_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"office 경계 위반: target group의 office={target_group.office_id}, "
+                f"요청 office={caller_office_id}"
+            ),
+        )
+
+
+def _raise_if_overlap(
+    db: Session,
+    nurse_id: str,
+    my_start: date,
+    my_end_upper: Optional[date],
+    exclude_id: Optional[int] = None,
+) -> None:
+    """동일 간호사의 active 배정 중 기간 겹침이 있으면 409."""
+    from sqlalchemy import case
+    _eff_end = case(
+        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+        else_=NurseAssignment.expected_end_date,
+    )
+    _filters = [
+        NurseAssignment.nurse_id == nurse_id,
+        NurseAssignment.status == "active",
+        or_(_eff_end.is_(None), _eff_end >= my_start),
+    ]
+    if my_end_upper is not None:
+        _filters.append(NurseAssignment.start_date <= my_end_upper)
+    if exclude_id is not None:
+        _filters.append(NurseAssignment.id != exclude_id)
+    _overlap = db.query(NurseAssignment).filter(*_filters).first()
+    if _overlap:
+        raise HTTPException(
+            status_code=409,
+            detail=f"기간이 겹치는 배정이 존재합니다. (id={_overlap.id}, reason={_overlap.reason}, "
+                   f"{_overlap.start_date}~{_overlap.end_date or _overlap.expected_end_date})",
+        )
+
+
 def update_assignment(
     assignment_id: int,
     req: NurseAssignmentUpdate,
     db: Session,
+    current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 수정"""
     row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
+    _assert_caller_owns_source(current_user, row.source_group_id)
+
+    # 재배치 판정을 위해 기존(window) 스냅샷 저장
+    _old_window = (row.start_date, _effective_end_date(row))
+    _old_reason = row.reason
+    _old_status = row.status
+    _old_target_gid = row.target_group_id
+
+    # 신규 값(변경 없으면 기존 값) 산정
+    _new_start = req.start_date if req.start_date is not None else row.start_date
+    _new_reason = req.reason if req.reason is not None else row.reason
+    _new_target_gid = (
+        req.target_group_id if req.target_group_id is not None else row.target_group_id
+    )
+
+    # 파견/병동이동: 최종 target_group_id 필수 + source != target 검증
+    # (reason 또는 target_group_id 변경 시 재검증, 또는 기존 reason이 파견/병동이동인데 invalid state인 경우 차단)
+    if _new_reason in _INBOUND_REASONS and (
+        req.reason is not None or req.target_group_id is not None
+    ):
+        _assert_valid_inbound_target(_new_reason, row.source_group_id, _new_target_gid)
+
+    # target_group_id 교체: office 경계 재검증 (파견/병동이동만 의미)
+    if (
+        req.target_group_id is not None
+        and req.target_group_id != _old_target_gid
+        and _new_reason in _INBOUND_REASONS
+    ):
+        _assert_target_in_same_office(db, row.office_id, req.target_group_id)
+
+    # 병동이동 체인: reason/start_date 변경 시 체인 검증 재실행
+    if _new_reason == "병동이동" and (
+        req.reason is not None or req.start_date is not None
+    ):
+        _assert_transfer_chain_source(db, row.nurse_id, row.source_group_id)
+
+    # 기간/상태/사유 변경 시 동일 간호사 active 배정과의 겹침 차단
+    _period_changed = any(
+        v is not None
+        for v in (req.start_date, req.expected_end_date, req.end_date, req.status)
+    )
+    _new_status = req.status if req.status is not None else row.status
+    if _period_changed and _new_status == "active":
+        _new_end = req.end_date if req.end_date is not None else row.end_date
+        _new_exp = req.expected_end_date if req.expected_end_date is not None else row.expected_end_date
+        _eff_upper = _new_end if _new_end is not None else _new_exp
+        _raise_if_overlap(db, row.nurse_id, _new_start, _eff_upper, exclude_id=row.id)
+
+    if req.start_date is not None:
+        row.start_date = req.start_date
     if req.expected_end_date is not None:
         row.expected_end_date = req.expected_end_date
     if req.end_date is not None:
         row.end_date = req.end_date
     if req.status is not None:
         row.status = req.status
+    if req.reason is not None:
+        row.reason = req.reason
+    if req.target_group_id is not None:
+        row.target_group_id = req.target_group_id
+    if req.note is not None:
+        row.note = req.note
 
     for _f in (
         "target_weekly_off_type",
@@ -180,6 +558,28 @@ def update_assignment(
 
     db.commit()
     db.refresh(row)
+
+    # FixedWantedEntry 재배치 (파견/병동이동 & 상태 변화 기준)
+    if _old_reason in _INBOUND_REASONS and row.target_group_id:
+        _was_active = _old_status == "active"
+        _now_active = row.status == "active"
+        _old = _old_window if _was_active else None
+        _new = (row.start_date, _effective_end_date(row)) if _now_active else None
+        if _old is not None or _new is not None:
+            try:
+                _reallocate_fixed_wanted_on_assignment_change(
+                    db,
+                    nurse_id=row.nurse_id,
+                    source_group_id=row.source_group_id,
+                    target_group_id=row.target_group_id,
+                    old_window=_old,
+                    new_window=_new,
+                )
+                db.commit()
+            except Exception as e:
+                logger.error("FixedWantedEntry 재배치 실패(update): %s", e, exc_info=True)
+                db.rollback()
+
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
     return _to_response(row, nurse.name if nurse else None)
 
@@ -187,16 +587,43 @@ def update_assignment(
 def cancel_assignment(
     assignment_id: int,
     db: Session,
+    current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정 취소 (status → cancelled)"""
     row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
+    _assert_caller_owns_source(current_user, row.source_group_id)
+
+    _old_window = (row.start_date, _effective_end_date(row))
+    _old_reason = row.reason
+    _old_status = row.status
+
     row.status = "cancelled"
     db.commit()
     db.refresh(row)
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
+
+    # FixedWantedEntry 재배치: 기존 target-period 엔트리 → source로 복귀
+    if (
+        _old_reason in _INBOUND_REASONS
+        and _old_status == "active"
+        and row.target_group_id
+    ):
+        try:
+            _reallocate_fixed_wanted_on_assignment_change(
+                db,
+                nurse_id=row.nurse_id,
+                source_group_id=row.source_group_id,
+                target_group_id=row.target_group_id,
+                old_window=_old_window,
+                new_window=None,
+            )
+            db.commit()
+        except Exception as e:
+            logger.error("FixedWantedEntry 재배치 실패(cancel): %s", e, exc_info=True)
+            db.rollback()
 
     # 알림 발송 (S07)
     try:
@@ -253,6 +680,32 @@ def get_assignments(
     return [_to_response(r, nurse_map.get(r.nurse_id)) for r in rows]
 
 
+def get_assignment_status_counts(
+    db: Session,
+    office_id: str,
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None,
+) -> AssignmentStatusCounts:
+    """status 필터와 무관한 전체 카운트 집계 (리스트 응답 메타용)."""
+    query = db.query(NurseAssignment.status, func.count(NurseAssignment.id)).filter(
+        NurseAssignment.office_id == office_id
+    )
+    if group_id:
+        query = query.filter(
+            or_(
+                NurseAssignment.source_group_id == group_id,
+                NurseAssignment.target_group_id == group_id,
+            )
+        )
+    if nurse_id:
+        query = query.filter(NurseAssignment.nurse_id == nurse_id)
+    counts = {"active": 0, "completed": 0, "cancelled": 0, "on_hold": 0}
+    for status_val, cnt in query.group_by(NurseAssignment.status).all():
+        if status_val in counts:
+            counts[status_val] = int(cnt)
+    return AssignmentStatusCounts(**counts)
+
+
 def get_active_assignments_for_month(
     db: Session,
     group_id: str,
@@ -286,6 +739,38 @@ def get_active_assignments_for_month(
         )
         .all()
     )
+
+
+def _apply_target_profile_reset(
+    db: Session,
+    nurse: NurseModel,
+    row: NurseAssignment,
+) -> int:
+    """병동이동 발효 시 간호사 속성을 target overlay 또는 기본값으로 초기화.
+
+    프리셉터/프리셉티 비대칭도 함께 해제.
+    Returns: 해제된 하위 프리셉티 수 (로깅용).
+    """
+    nurse.grade = row.target_grade
+    nurse.fixed_shift = row.target_fixed_shift
+    # is_night_nurse는 네이밍과 달리 실제로 근무 가능 shift 타입 JSON list 저장용 컬럼임
+    nurse.is_night_nurse = row.target_shift_types if row.target_shift_types is not None else []
+    nurse.weekly_off_enabled = (
+        row.target_weekly_off_enabled if row.target_weekly_off_enabled is not None else False
+    )
+    nurse.weekly_off_type = row.target_weekly_off_type
+    nurse.weekly_off_weekday = row.target_weekly_off_weekday
+    nurse.wanted_max_requests = (
+        row.target_wanted_max_requests if row.target_wanted_max_requests is not None else 0
+    )
+    nurse.is_weekend_off = False
+
+    detached = db.query(NurseModel).filter(NurseModel.preceptor_id == row.nurse_id).update(
+        {NurseModel.preceptor_id: None}, synchronize_session=False
+    )
+    if nurse.preceptor_id is not None:
+        nurse.preceptor_id = None
+    return int(detached or 0)
 
 
 def flush_pending_transfers(db: Session, group_id: str) -> int:
@@ -323,9 +808,10 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
         if nurse and nurse.group_id != row.target_group_id:
             nurse.group_id = row.target_group_id
             nurse.team_id = None
+            detached = _apply_target_profile_reset(db, nurse, row)
             logger.info(
-                "병동이동 적용: nurse_id=%s, %s → %s (team 초기화)",
-                row.nurse_id, row.source_group_id, row.target_group_id,
+                "[transfer] nurse_id=%s, %s → %s target overlay applied, preceptees detached=%d",
+                row.nurse_id, row.source_group_id, row.target_group_id, detached,
             )
         row.status = "completed"
         row.end_date = today
@@ -385,9 +871,10 @@ def flush_all_pending_transfers(db: Session) -> int:
         if nurse and nurse.group_id != row.target_group_id:
             nurse.group_id = row.target_group_id
             nurse.team_id = None
+            detached = _apply_target_profile_reset(db, nurse, row)
             logger.info(
-                "[Scheduler] 병동이동 적용: nurse_id=%s, %s → %s",
-                row.nurse_id, row.source_group_id, row.target_group_id,
+                "[Scheduler][transfer] nurse_id=%s, %s → %s target overlay applied, preceptees detached=%d",
+                row.nurse_id, row.source_group_id, row.target_group_id, detached,
             )
         row.status = "completed"
         row.end_date = today
@@ -497,6 +984,66 @@ def flush_expired_preceptees(db: Session) -> int:
         logger.info("[Scheduler] 프리셉티 자동 해제 완료: %d건", count)
 
     return count
+
+
+def flush_expired_dispatches(db: Session) -> int:
+    """파견 만료 자동 디엑티브 (스케줄러용).
+
+    조건: reason='파견' AND status='active' AND expected_end_date < today
+    처리: status='completed', end_date=expected_end_date. target_* 은 이력으로만 남김.
+    Returns: 처리된 건수
+    """
+    today = date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.reason == "파견",
+            NurseAssignment.status == "active",
+            NurseAssignment.expected_end_date.isnot(None),
+            NurseAssignment.expected_end_date < today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    for row in rows:
+        row.status = "completed"
+        row.end_date = row.expected_end_date
+
+    db.commit()
+    logger.info("[Scheduler] 파견 자동 디엑티브 %d건", len(rows))
+    return len(rows)
+
+
+def flush_expired_leaves(db: Session) -> int:
+    """휴직 만료 자동 디엑티브 (스케줄러용).
+
+    조건: reason='휴직' AND status='active' AND expected_end_date < today
+    처리: status='completed', end_date=expected_end_date.
+    Returns: 처리된 건수
+    """
+    today = date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.reason == "휴직",
+            NurseAssignment.status == "active",
+            NurseAssignment.expected_end_date.isnot(None),
+            NurseAssignment.expected_end_date < today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    for row in rows:
+        row.status = "completed"
+        row.end_date = row.expected_end_date
+
+    db.commit()
+    logger.info("[Scheduler] 휴직 자동 디엑티브 %d건", len(rows))
+    return len(rows)
 
 
 def transfer_shifts_on_publish(
@@ -930,13 +1477,18 @@ def get_roster_assignments(
     year: int,
     month: int,
 ) -> dict[str, list[dict]]:
-    """근무표 응답용 파견/병동이동 assignment 메타데이터.
+    """근무표 응답용 파견/병동이동/휴직/퇴사 assignment 메타데이터.
 
-    해당 group이 source인 assignment만 반환 (source group 근무표에서 미표기 처리용).
+    해당 group이 source인 assignment + 해당 월 퇴사자 synthetic entry.
     Returns: {nurse_id: [{reason, target_group_id, target_group_name, start_date, end_date}]}
     간호사당 복수 assignment 지원.
     """
-    from db.models import Group
+    from calendar import monthrange
+
+    _days = monthrange(year, month)[1]
+    _m_start = date(year, month, 1)
+    _m_end = date(year, month, _days)
+    _DISPATCH_REASON_ALIASES = frozenset({"파견", "병동이동", "부서이동"})
 
     assignments = get_active_assignments_for_month(db, group_id, year, month)
     eligible = [
@@ -944,7 +1496,24 @@ def get_roster_assignments(
         if a.reason in ("파견", "병동이동", "휴직")
         and a.source_group_id == group_id
     ]
-    if not eligible:
+
+    # 해당 월 퇴사자 (nurses.resignation_date 기반 synthetic entry)
+    _resigning_all = (
+        db.query(NurseModel)
+        .filter(
+            NurseModel.group_id == group_id,
+            NurseModel.resignation_date.isnot(None),
+            NurseModel.resignation_date >= _m_start,
+            NurseModel.resignation_date <= _m_end,
+        )
+        .all()
+    )
+    _resigning = [
+        n for n in _resigning_all
+        if (n.resignation_reason or "").strip() not in _DISPATCH_REASON_ALIASES
+    ]
+
+    if not eligible and not _resigning:
         return {}
 
     target_gids = {a.target_group_id for a in eligible if a.target_group_id}
@@ -963,6 +1532,15 @@ def get_roster_assignments(
             "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
         }
         result.setdefault(a.nurse_id, []).append(entry)
+    for n in _resigning:
+        # 퇴사일 당일부터 월말까지 블랭크 (프론트 배지/기간바 용)
+        result.setdefault(n.nurse_id, []).append({
+            "reason": "퇴사",
+            "target_group_id": "",
+            "target_group_name": "",
+            "start_date": str(n.resignation_date),
+            "end_date": None,
+        })
     return result
 
 
@@ -975,6 +1553,7 @@ def _assignment_summary(a: NurseAssignment) -> dict:
         "target_group_id": a.target_group_id,
         "start_date": a.start_date,
         "end_date": a.end_date or a.expected_end_date,
+        "note": getattr(a, "note", None),
     }
 
 
@@ -995,6 +1574,7 @@ def _to_response(
         end_date=row.end_date,
         reason=row.reason,
         status=row.status,
+        note=getattr(row, "note", None),
         target_weekly_off_type=row.target_weekly_off_type,
         target_weekly_off_enabled=row.target_weekly_off_enabled,
         target_weekly_off_weekday=row.target_weekly_off_weekday,

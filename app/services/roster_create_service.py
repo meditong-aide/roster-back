@@ -99,8 +99,13 @@ def _load_special_shift_map(db: Session, group_id: str, office_id: str) -> dict[
     }
 
 def _collect_nurses_and_preferences(db: Session, req, current_user):
-    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (FixedWantedEntry 존재 시 자동 사용)"""
-    # 1️⃣ 그룹 내 간호사 목록
+    """그룹 내 간호사 목록, 선호도, 특별 고정 요청을 수집한다. (FixedWantedEntry 존재 시 자동 사용).
+
+    nurse 풀: source(Nurse.group_id == caller)만 반환.
+    inbound nurse 합치기와 target_* overlay 는 generate_roster_service 의 line 3482~3508 전용
+    분기에서 처리한다 (여기서 미리 합치면 _inbound_nurse_ids 차집합이 0이 되어 overlay 분기가
+    발동하지 않는 버그가 발생).
+    """
     print('collect_nurses_and_preferences 진입')
     nurses_in_group = (
         db.query(Nurse)
@@ -117,7 +122,24 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         "[RosterCreate] 그룹 간호사 로드: total="
         f"{len(nurses_in_group)}, inactive={len(inactive_nurses)} → {inactive_nurses}"
     )
-    nurse_ids = [n.nurse_id for n in nurses_in_group]
+    # source nurse_ids + inbound nurse_ids (caller 관할 fixed_wanted 조회용).
+    # nurses_in_group 에는 source 만 둠 — inbound nurse 객체 추가는 generate_roster_service 의
+    # line 3482-3508 단일 분기에서 처리 (target_* overlay 동반).
+    # 여기서는 fixed_wanted_entries 누락 방지 위해 nurse_ids 만 inbound 까지 확장.
+    from db.models import NurseAssignment as _NA
+    from services.nurse_service import _INBOUND_REASONS
+    _source_ids = [n.nurse_id for n in nurses_in_group]
+    _inbound_ids = [
+        r[0] for r in db.query(_NA.nurse_id).filter(
+            _NA.target_group_id == current_user.group_id,
+            _NA.status == "active",
+            _NA.reason.in_(_INBOUND_REASONS),
+        ).all()
+        if r[0] not in _source_ids
+    ]
+    nurse_ids = _source_ids + _inbound_ids
+    if _inbound_ids:
+        print(f"[RosterCreate] fixed_wanted 조회 대상 inbound nurse 추가: {_inbound_ids}")
     month_str = f"{req.year}-{req.month:02d}"
     preferences = []
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
@@ -757,6 +779,53 @@ def _active_range_in_month(nurse: Nurse, month_start: date, days_in_month: int) 
     end_idx = (end_date - month_start).days
 
     return start_idx, end_idx
+
+
+def _clip_active_range_for_leaves(
+    active_range_map: dict,
+    leave_assignments: list,
+    month_start: date,
+    days_in_month: int,
+) -> list[str]:
+    """휴직/퇴사 active assignment 의 start_date 를 active_range 에 반영.
+
+    nurse_assignment.reason in ("휴직", "퇴사") 인 행을 받아 해당 nurse 의
+    active_range 를 [s_idx, leave_start_idx - 1] 까지로 클리핑한다.
+    leave_start_date 가 월 시작일 이전이면 그 달 전체 비활성(None) 처리.
+
+    ※ `_active_range_in_month` 는 nurses.resignation_date 만 본다.
+    휴직 시작일은 nurse_assignment.start_date 에 저장되므로 이 helper 로 별도 클리핑.
+    expected_end_date 이후 복귀 시점은 status=completed 처리(자동 flush)로 자연 정리됨.
+    """
+    if not leave_assignments:
+        return []
+    month_end = month_start + timedelta(days=days_in_month - 1)
+    affected: list[str] = []
+    for la in leave_assignments:
+        nid = str(getattr(la, "nurse_id", "") or "")
+        if not nid:
+            continue
+        existing = active_range_map.get(nid)
+        if existing is None:
+            continue
+        start = getattr(la, "start_date", None)
+        if start is None:
+            continue
+        if start <= month_start:
+            active_range_map[nid] = None
+            affected.append(f"{nid}({la.reason} 전월시작)")
+            continue
+        if start > month_end:
+            continue
+        leave_start_idx = (start - month_start).days - 1
+        s_idx, e_idx = existing
+        if leave_start_idx < s_idx:
+            active_range_map[nid] = None
+            affected.append(f"{nid}({la.reason} 시작일 {start} → 전체 비활성)")
+        else:
+            active_range_map[nid] = (s_idx, min(e_idx, leave_start_idx))
+            affected.append(f"{nid}({la.reason} {start} 전까지)")
+    return affected
 
 
 def _split_fixed_nurses(nurses_in_group: list[Nurse]) -> tuple[list[Nurse], list[Nurse]]:
@@ -2960,14 +3029,20 @@ def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] |
             if _auto_max_diag < int(effective_off_days or 0):
                 effective_off_days = _auto_max_diag
                 off_source = f"auto_max(coverage)"
-        max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
+        # off_first=True: off_days(월 OFF 수) 무시하고 daily_shift 커버리지 충족만 검증.
+        #   잔여 셀이 OFF로 자연 회수되는 정책이므로 사전 capacity 검증에서 OFF 차감 제거.
+        _off_first = bool(getattr(cfg, "off_first", False))
+        if _off_first:
+            max_work_per_nurse = num_days
+        else:
+            max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
         total_capacity = nurse_count * max_work_per_nurse
         if total_required > total_capacity:
             return (
                 "[reason_code=CAPACITY_TOTAL_SHORTAGE] "
                 "Infeasible 진단: 월 총 필요 근무 슬롯이 공급 상한을 초과했습니다. "
                 f"(요구={total_required}, 공급상한={total_capacity}, 간호사={nurse_count}, "
-                f"days={num_days}, off_days={effective_off_days}, source={off_source})"
+                f"days={num_days}, off_days={effective_off_days}, off_first={_off_first}, source={off_source})"
             )
 
         max_night_per_nurse = int(getattr(cfg, "max_night_shifts_per_month", 0) or 0)
@@ -3404,53 +3479,87 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         _inbound_assignments.append(a)
     _existing_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
     _inbound_nurse_ids = {str(a.nurse_id) for a in _inbound_assignments} - _existing_nurse_ids
+    # 병동이동 flush 후: nurse.group_id가 이미 target으로 옮겨져 engine_nurses에 자연 포함된 케이스.
+    # 이런 간호사도 mid-month 시작이면 active_range를 assignment 기간으로 클리핑해야
+    # weekly_off가 이동 이전 일자에 박히는 누수를 막을 수 있다.
+    _flushed_transfer_ids = {str(a.nurse_id) for a in _inbound_assignments} & _existing_nurse_ids
     if _inbound_nurse_ids:
         _inbound_nurses = db.query(Nurse).filter(
             Nurse.nurse_id.in_(_inbound_nurse_ids),
             Nurse.active == 1,
         ).all()
-        # assignment의 target 설정으로 nurse 속성 오버라이드
+        # assignment의 target 설정으로 nurse 속성 오버라이드.
+        # 정책: inbound nurse 는 nurse_assignment.target_* 만 진실 원천.
+        #   target_* 가 NULL 이면 default(비활성/없음) 적용. source(nurses table) 값으로 fallback 금지.
+        # 주의: SQLAlchemy ORM instrumented attr setter 는 `[n.__dict__ for n in nurses_in_group]`
+        #   변환 시 dict 에 미반영될 수 있어 `n.__dict__` 직접 주입으로 강제 동기화한다.
         _assignment_by_nurse = {str(a.nurse_id): a for a in _inbound_assignments}
         for n in _inbound_nurses:
-            setattr(n, 'is_inbound', True)
+            n.__dict__['is_inbound'] = True
             _a = _assignment_by_nurse.get(str(n.nurse_id))
             if _a:
-                if _a.target_team_id is not None:
-                    n.team_id = _a.target_team_id
-                if _a.target_grade is not None:
-                    n.grade = _a.target_grade
-                if _a.target_weekly_off_enabled is not None:
-                    n.weekly_off_enabled = _a.target_weekly_off_enabled
-                if _a.target_weekly_off_type is not None:
-                    setattr(n, 'weekly_off_type', _a.target_weekly_off_type)
-                if _a.target_weekly_off_weekday is not None:
-                    n.weekly_off_weekday = _a.target_weekly_off_weekday
-                if _a.target_shift_types is not None:
-                    n.is_night_nurse = _a.target_shift_types
-                if _a.target_fixed_shift is not None:
-                    n.fixed_shift = _a.target_fixed_shift
+                d = n.__dict__
+                d['team_id'] = _a.target_team_id
+                d['grade'] = _a.target_grade
+                d['weekly_off_enabled'] = bool(_a.target_weekly_off_enabled or 0)
+                d['weekly_off_type'] = _a.target_weekly_off_type
+                d['weekly_off_weekday'] = _a.target_weekly_off_weekday
+                d['is_night_nurse'] = _a.target_shift_types or []
+                d['fixed_shift'] = _a.target_fixed_shift
         engine_nurses.extend(_inbound_nurses)
         nurses_in_group.extend(_inbound_nurses)
         print(
             f"[Assignment][Inbound] 인바운드 간호사 {len(_inbound_nurses)}명 엔진 추가: "
             f"{[f'{n.name}({n.nurse_id})' for n in _inbound_nurses]}"
         )
+    if _flushed_transfer_ids:
+        _flushed_names = []
+        for n in engine_nurses:
+            if str(n.nurse_id) in _flushed_transfer_ids:
+                # 인바운드와 동일하게 마킹하여 build_blocked_days에서 인바운드 분기를 타게 한다.
+                # SQLAlchemy ORM 우회 위해 __dict__ 직접 주입.
+                n.__dict__['is_inbound'] = True
+                _flushed_names.append(f'{getattr(n, "name", "?")}({n.nurse_id})')
+        print(
+            f"[Assignment][FlushedTransfer] 병동이동 flush된 간호사 {len(_flushed_transfer_ids)}명 활동범위 클리핑 대상: "
+            f"{_flushed_names}"
+        )
     active_range_candidates = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in engine_nurses
     }
     # 인바운드 간호사: active_range를 assignment 기간 기준으로 오버라이드 (joining_date가 다른 그룹 기준이므로)
-    for _ia in (_inbound_assignments if _assignments else []):
-        nid = str(_ia.nurse_id)
-        if nid not in _inbound_nurse_ids:
+    # 병동이동 flush 케이스(_flushed_transfer_ids)도 동일하게 클리핑한다.
+    # 단 병동이동은 영구 이동이므로 end_date(=flush 시각의 today)로 clip하지 않고 월말까지 활성으로 본다.
+    _assignment_by_nurse_all = {str(a.nurse_id): a for a in _inbound_assignments}
+    _override_targets = _inbound_nurse_ids | _flushed_transfer_ids
+    for nid in _override_targets:
+        _ia = _assignment_by_nurse_all.get(nid)
+        if _ia is None:
             continue
         _a_start = _ia.start_date
-        _a_end = _ia.end_date or _ia.expected_end_date or (month_start + timedelta(days=days_in_month - 1))
         _month_end = month_start + timedelta(days=days_in_month - 1)
+        if _ia.reason == "병동이동":
+            # 병동이동은 영구 이동이라 end_date(today marker)는 무시하고 월말까지 활성
+            _a_end = _ia.expected_end_date or _month_end
+        else:
+            _a_end = _ia.end_date or _ia.expected_end_date or _month_end
         _s = max(_a_start, month_start)
         _e = min(_a_end, _month_end)
         if _s <= _e:
             active_range_candidates[nid] = (((_s - month_start).days), ((_e - month_start).days))
+    # 휴직/퇴사: nurse_assignment.start_date 이후 nurse 자체를 비활성화한다.
+    # `_active_range_in_month` 는 nurses.resignation_date 만 보므로 별도 클리핑 필요.
+    _leave_assignments_main = [
+        a for a in _assignments
+        if a.reason in ("휴직", "퇴사")
+        and a.source_group_id == current_user.group_id
+    ]
+    _leave_clipped_main = _clip_active_range_for_leaves(
+        active_range_candidates, _leave_assignments_main, month_start, days_in_month
+    )
+    if _leave_clipped_main:
+        print(f"[Assignment][Leave] 휴직/퇴사 active_range 클리핑: {_leave_clipped_main}")
     excluded_engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is None
     ]
@@ -3463,10 +3572,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is not None
     ]
+    # 인바운드는 source 그룹의 role이 파트장 등 비RN이어도 target에서 임상 배정되어야 함
     engine_nurses = [
         n
         for n in engine_nurses
         if str(getattr(n, 'role', 'RN') or 'RN').upper() in ('RN', 'AN')
+        or bool(getattr(n, 'is_inbound', False))
     ]
     engine_nurse_ids = {str(n.nurse_id) for n in engine_nurses}
     preferences = [p for p in preferences if str(p.get("nurse_id")) in engine_nurse_ids]
@@ -3718,6 +3829,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in nurses_for_engine
     }
+    # 휴직/퇴사: 위 main path 와 동일한 정책으로 active_range_map 도 클리핑.
+    _leave_assignments_alt = [
+        a for a in _assignments
+        if a.reason in ("휴직", "퇴사")
+        and a.source_group_id == current_user.group_id
+    ]
+    _leave_clipped_alt = _clip_active_range_for_leaves(
+        active_range_map, _leave_assignments_alt, month_start, days_in_month
+    )
+    if _leave_clipped_alt:
+        print(f"[Assignment][Leave/AltPath] 휴직/퇴사 active_range_map 클리핑: {_leave_clipped_alt}")
 
     # print('active_range_map', active_range_map)
     weekly_off_map, weekly_off_warnings = _compute_weekly_off_day_indices_for_month(
@@ -3748,6 +3870,27 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         config_dict["weekly_off_settings_activate"] = False
     weekly_off_map = {k: v for k, v in weekly_off_map.items() if k in engine_nurse_ids}
 
+    # source-side outbound 기간(파견/병동이동으로 다른 그룹에 가 있는 일자)은
+    # 해당 병동 실 근무가 아니므로 weekly_off 셀도 미표시한다.
+    _outbound_day_idx_map: dict[str, set[int]] = {}
+    _month_end_d = month_start + timedelta(days=days_in_month - 1)
+    for _a in _assignments:
+        if _a.reason not in ("파견", "병동이동"):
+            continue
+        if _a.source_group_id != current_user.group_id:
+            continue
+        if _a.target_group_id == current_user.group_id:
+            continue
+        _nid = str(_a.nurse_id)
+        _a_end = _a.end_date or _a.expected_end_date or _month_end_d
+        _s = max(_a.start_date, month_start)
+        _e = min(_a_end, _month_end_d)
+        if _s > _e:
+            continue
+        _s_idx = (_s - month_start).days
+        _e_idx = (_e - month_start).days
+        _outbound_day_idx_map.setdefault(_nid, set()).update(range(_s_idx, _e_idx + 1))
+
     if weekly_off_map:
         filtered_map: dict[str, set[int]] = {}
         for nurse_id, day_set in weekly_off_map.items():
@@ -3755,7 +3898,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             if not rng:
                 continue
             start_idx, end_idx = rng
-            clipped = {d for d in day_set if start_idx <= d <= end_idx}
+            _ob_days = _outbound_day_idx_map.get(str(nurse_id), set())
+            clipped = {
+                d for d in day_set
+                if start_idx <= d <= end_idx and d not in _ob_days
+            }
             if clipped:
                 filtered_map[str(nurse_id)] = clipped
         weekly_off_map = filtered_map

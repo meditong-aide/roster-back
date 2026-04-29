@@ -272,6 +272,131 @@ class RosterConfig(RosterConfigBase):
 #     N = "N"
 
 
+# ── NurseAssignment.reason 입력 정규화 헬퍼 ─────────────────
+# 프론트/구버전 호환: '부서이동' → 정식 '병동이동' 으로 교정.
+# 빈 문자열/None 은 그대로 통과시킨다 (상위에서 required 검증).
+def _normalize_assignment_reason(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "부서이동":
+            return "병동이동"
+        return s
+    return v
+
+
+class InboundEntry(BaseModel):
+    """활성 파견/병동이동/휴직/퇴사/프리셉티 1건에 대한 프론트 노출용 엔트리.
+
+    관리(수정/취소)에 필요한 assignment_id / source_group_id / status 및
+    target_* overlay 값을 포함한다. PATCH /nurses/{nurse_id}의 assignment payload에서
+    operation='update'|'cancel'을 호출하려면 여기 `id`(assignment_id)를 사용한다.
+    휴직/퇴사/프리셉티는 target_group_id가 NULL일 수 있다.
+    """
+
+    id: Optional[int] = Field(default=None, description="nurse_assignment.id")
+    status: Optional[str] = Field(
+        default=None, description="active / completed / cancelled"
+    )
+    reason: str = Field(
+        description="'파견' / '병동이동' / '휴직' / '퇴사' / '프리셉티'"
+    )
+    startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
+    endDate: Optional[str] = Field(
+        default=None,
+        description="유효 종료일 ISO 문자열 (end_date 우선, 없으면 expected_end_date)",
+    )
+    expectedEndDate: Optional[str] = Field(
+        default=None,
+        description="예정 종료일 ISO 문자열 (expected_end_date 원본, 미정이면 null)",
+    )
+    source_group_id: Optional[str] = Field(
+        default=None, description="source 그룹 ID (생성/수정 권한 판정용)"
+    )
+    target_group_id: Optional[str] = Field(
+        default=None, description="target 그룹 ID (휴직/퇴사/프리셉티는 null)"
+    )
+    target_group_name: str = Field(default="", description="target 그룹명")
+    office_id: Optional[str] = Field(
+        default=None, description="office 경계 검증용"
+    )
+    note: Optional[str] = Field(
+        default=None, description="assignment별 메모 (수간호사 기록용, 선택)"
+    )
+    # target 그룹 overlay 현재값 (수정 화면 프리필용; 파견/병동이동에서만 의미)
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
+
+
+class CurrentAssignment(BaseModel):
+    """간호사의 '현재 대표' assignment 요약 — 프론트 폼 바인딩/상태 표시용.
+
+    우선순위: 휴직/퇴사 > 프리셉티 > 파견/병동이동, 동률 시 start_date DESC.
+    assignment가 없으면 응답에서 null.
+    """
+
+    id: Optional[int] = Field(default=None, description="nurse_assignment.id")
+    status: Optional[str] = Field(default=None, description="active 등")
+    reason: Optional[str] = Field(
+        default=None, description="'파견' / '병동이동' / '휴직' / '퇴사' / '프리셉티'"
+    )
+    startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
+    endDate: Optional[str] = Field(
+        default=None,
+        description="유효 종료일 ISO 문자열 (end_date 우선, 없으면 expected_end_date)",
+    )
+    expectedEndDate: Optional[str] = Field(
+        default=None,
+        description="예정 종료일 ISO 문자열 (expected_end_date 원본, 미정이면 null)",
+    )
+    source_group_id: Optional[str] = None
+    target_group_id: Optional[str] = None
+    target_group_name: Optional[str] = None
+    note: Optional[str] = Field(default=None, description="assignment별 메모")
+
+
+class NurseAssignmentPayload(BaseModel):
+    """사이드 프로필 업데이트와 함께 전달되는 배정(파견/병동이동/휴직/프리셉티) payload.
+
+    operation:
+      - 'create': 신규 배정 등록 (reason/start_date/target_group_id 등 필수)
+      - 'update': 기존 배정 수정 (assignment_id 필수)
+      - 'cancel': 기존 배정 취소 (assignment_id 필수)
+    """
+
+    operation: str = Field(description="'create' | 'update' | 'cancel'")
+    assignment_id: Optional[int] = Field(default=None, description="update/cancel 시 필수")
+    reason: Optional[str] = Field(default=None, description="파견/휴직/퇴사/프리셉티/병동이동")
+    source_group_id: Optional[str] = None
+    target_group_id: Optional[str] = None
+    office_id: Optional[str] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: Optional[str] = None
+    note: Optional[str] = Field(default=None, description="assignment별 메모 (수간호사 기록용)")
+    target_weekly_off_type: Optional[str] = None
+    target_weekly_off_enabled: Optional[int] = None
+    target_weekly_off_weekday: Optional[int] = None
+    target_shift_types: Optional[list] = None
+    target_team_id: Optional[int] = None
+    target_grade: Optional[int] = None
+    target_fixed_shift: Optional[str] = None
+    target_wanted_max_requests: Optional[int] = None
+
+    @field_validator("reason")
+    @classmethod
+    def _normalize_reason(cls, v):
+        return _normalize_assignment_reason(v)
+
+
 class NurseProfile(BaseModel):
     office_id: str
     # EmpAuthGbn: Optional[str] = None
@@ -322,6 +447,32 @@ class NurseProfile(BaseModel):
     show_level: bool = Field(default=True, description="직책(level_) 표시 여부")
     show_preceptor: bool = Field(
         default=True, description="프리셉터-프리셉티 관계 표시 여부"
+    )
+    # Target 병동 시점 구분용 (파견/병동이동 inbound 간호사는 True)
+    is_inbound: bool = Field(
+        default=False,
+        description="호출자 병동이 target(파견/병동이동 수신측)일 때 True",
+    )
+    # 기간 설정(파견/병동이동/휴직/퇴사/프리셉티) 활성 이력.
+    inbound: List["InboundEntry"] = Field(
+        default_factory=list,
+        description="활성 파견/병동이동/휴직/퇴사/프리셉티 이력. 없으면 [].",
+    )
+    # 현재 대표 1건 flat 요약 (프론트 폼 바인딩용)
+    current_assignment: Optional["CurrentAssignment"] = Field(
+        default=None,
+        description="휴직/퇴사 > 프리셉티 > 파견/병동이동 우선, 동률 시 start_date DESC",
+    )
+    # 일괄 업데이트(POST /bulk-update) 시 동반 전달 가능한 배정 payload
+    assignment: Optional[NurseAssignmentPayload] = Field(
+        default=None,
+        description="bulk 업데이트와 함께 배정(파견/병동이동/휴직/퇴사/프리셉티) create/update/cancel 수행 — 단건",
+    )
+    # 사이드 프로필에서 한 번에 여러 파견을 작성/수정/취소할 때 사용하는 다건 payload.
+    # `assignment`(단건) 와 동시 전달되면 둘 다 처리(assignments 먼저, 그 다음 단건).
+    assignments: Optional[List[NurseAssignmentPayload]] = Field(
+        default=None,
+        description="다건 배정 처리 — 한 간호사의 여러 파견을 한 번에 create/update/cancel",
     )
 
     # @field_validator('fixed_shift')
@@ -414,13 +565,23 @@ class NurseProfileUpdate(BaseModel):
     is_head_nurse: Optional[bool] = None
     preceptor_id: Optional[str] = None
     fixed_shift: Optional[str] = None
+    weekly_off_enabled: Optional[int] = None
     weekly_off_weekday: Optional[int] = None
+    weekly_off_type: Optional[str] = None
     is_weekend_off: Optional[bool] = None
     is_night_nurse: Optional[List[str]] = None
     work_shifts: Optional[List[str]] = None
     enable_nurse_pair_preference: Optional[bool] = None
     enable_aide: Optional[bool] = None
     wanted_max_requests: Optional[int] = None
+    assignment: Optional[NurseAssignmentPayload] = Field(
+        default=None,
+        description="배정(파견/병동이동 등) create/update/cancel을 프로필 수정과 함께 수행 — 단건",
+    )
+    assignments: Optional[List[NurseAssignmentPayload]] = Field(
+        default=None,
+        description="사이드 프로필에서 여러 파견을 한 번에 create/update/cancel — 다건",
+    )
 
 
 class PasswordChangeRequest(BaseModel):
@@ -489,6 +650,57 @@ class FixedWantedEntryResponse(BaseModel):
         from_attributes = True
 
 
+class AdjustmentBlockedDay(BaseModel):
+    """원티드 조정 화면에서 저장/편집 불가로 표시해야 하는 일자 1건.
+
+    reason 값:
+    - "outside_dispatch_window": 파견 인바운드 간호사의 파견기간 밖 일자 (원 소속 담당)
+    - "dispatched_elsewhere": 소속 간호사가 타병동 파견중인 기간
+    """
+
+    day: int = Field(description="1~31, 프론트 컬럼 인덱스 즉시 매칭용")
+    date: date
+    reason: str
+
+
+class AdjustmentAssignmentWindow(BaseModel):
+    """간호사의 파견/병동이동 기간 1건 (조회 병동 기준 방향 포함).
+
+    프론트는 이 정보를 이용해 월 그리드에 파견/이동 구간을 표기한다.
+    """
+
+    reason: str = Field(description='"파견" | "병동이동"')
+    direction: str = Field(
+        description='caller 기준 방향. "inbound"(caller==target) | "outbound"(caller==source)'
+    )
+    source_group_id: str
+    source_group_name: str
+    target_group_id: str
+    target_group_name: str
+    start_date: date
+    end_date: Optional[date] = None
+    period_start_day: Optional[int] = Field(
+        default=None, description="해당 월 가시 구간 시작 일자(1~말일)"
+    )
+    period_end_day: Optional[int] = Field(
+        default=None, description="해당 월 가시 구간 종료 일자(1~말일)"
+    )
+    source_schedule_id: Optional[str] = Field(
+        default=None, description="이전(source) 병동 issued schedule_id (없으면 null)"
+    )
+    source_shifts: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description='이전(source) 병동의 가시 구간 일자별 shift_id 매핑. key="day"(str), value=shift_id|null',
+    )
+    target_schedule_id: Optional[str] = Field(
+        default=None, description="변경(target) 병동 issued schedule_id (없으면 null)"
+    )
+    target_shifts: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description='변경(target) 병동의 가시 구간 일자별 shift_id 매핑. key="day"(str), value=shift_id|null',
+    )
+
+
 class AdjustmentNurse(BaseModel):
     """원티드 조정판 - 간호사별 데이터"""
 
@@ -496,6 +708,11 @@ class AdjustmentNurse(BaseModel):
     name: str
     entries: List[FixedWantedEntryResponse]
     monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, "주": 4, ...}
+    # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자.
+    # 프론트는 이 일자를 저장/편집 불가(blocked)로 표기해야 한다.
+    blocked_days: List[AdjustmentBlockedDay] = Field(default_factory=list)
+    # 해당 간호사의 활성 파견/병동이동 구간 (inbound/outbound 양쪽 포함).
+    assignments: List[AdjustmentAssignmentWindow] = Field(default_factory=list)
 
 
 class AdjustmentResponse(BaseModel):
@@ -557,6 +774,7 @@ class NurseAssignmentCreate(BaseModel):
     start_date: date
     expected_end_date: Optional[date] = Field(default=None, description="예상 종료일 (병동이동 시 미지정 가능)")
     reason: str = Field(description="파견 / 휴직 / 퇴사 / 프리셉티 / 병동이동")
+    note: Optional[str] = Field(default=None, description="assignment별 메모 (수간호사 기록용)")
     # target 그룹 전용 설정
     target_weekly_off_type: Optional[str] = None
     target_weekly_off_enabled: Optional[int] = None
@@ -567,12 +785,22 @@ class NurseAssignmentCreate(BaseModel):
     target_fixed_shift: Optional[str] = None
     target_wanted_max_requests: Optional[int] = None
 
+    @field_validator("reason")
+    @classmethod
+    def _normalize_reason(cls, v):
+        return _normalize_assignment_reason(v)
+
 
 class NurseAssignmentUpdate(BaseModel):
     """배정/상태 변경 수정 요청"""
+    # 식별/기간/사유 (단건 endpoint 1개로 전경로 커버)
+    start_date: Optional[date] = None
     expected_end_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[str] = Field(default=None, description="active / completed / cancelled")
+    reason: Optional[str] = Field(default=None, description="파견 / 휴직 / 퇴사 / 프리셉티 / 병동이동")
+    target_group_id: Optional[str] = Field(default=None, description="파견/병동이동 target 교체 시 지정")
+    note: Optional[str] = Field(default=None, description="assignment별 메모 (수간호사 기록용)")
     # target 그룹 전용 설정
     target_weekly_off_type: Optional[str] = None
     target_weekly_off_enabled: Optional[int] = None
@@ -582,6 +810,11 @@ class NurseAssignmentUpdate(BaseModel):
     target_grade: Optional[int] = None
     target_fixed_shift: Optional[str] = None
     target_wanted_max_requests: Optional[int] = None
+
+    @field_validator("reason")
+    @classmethod
+    def _normalize_reason(cls, v):
+        return _normalize_assignment_reason(v)
 
 
 class NurseAssignmentResponse(BaseModel):
@@ -597,6 +830,7 @@ class NurseAssignmentResponse(BaseModel):
     end_date: Optional[date] = None
     reason: str
     status: str
+    note: Optional[str] = None
     # target 그룹 전용 설정
     target_weekly_off_type: Optional[str] = None
     target_weekly_off_enabled: Optional[int] = None
@@ -610,3 +844,27 @@ class NurseAssignmentResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class AssignmentStatusCounts(BaseModel):
+    """assignment status 별 카운트 (필터와 무관한 전체 집계)."""
+
+    active: int = 0
+    completed: int = 0
+    cancelled: int = 0
+    on_hold: int = 0
+
+
+class NurseAssignmentListResponse(BaseModel):
+    """`GET /nurses/assignments` 리스트 응답 래퍼.
+
+    - items: 현재 status 필터가 적용된 실제 레코드 목록
+    - counts: 동일 범위(office/group/nurse)에서 status 별 전체 카운트
+    - total: counts 합계 (필터 무관 전체 건수)
+    - applied_status: 현재 적용된 status 필터 값 ("active" / "all" / 등)
+    """
+
+    items: List[NurseAssignmentResponse]
+    counts: AssignmentStatusCounts
+    total: int = 0
+    applied_status: Optional[str] = None

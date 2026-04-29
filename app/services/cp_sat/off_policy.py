@@ -66,13 +66,19 @@ def compute_off_bounds(
         min_off_required = eligible_off_days
     else:
         min_off_required = max(0, min(effective_off_days, eligible_off_days))
-        ratio_enable = bool(_get_value(source, "active_range_off_ratio_enable", True))
+        ref_days = _as_int(reference_days, 0)
+        if ref_days <= 0:
+            ref_days = _as_int(_get_value(source, "off_days_ratio_reference_days", 0), 0)
+        if ref_days <= 0:
+            ref_days = max(1, avail_days)
+        # 부분활동(partial-month) 안전 스케일: avail_days < ref_days인 경우 항상 적용
+        # — 휴가는 무관, 활동 일수만 기준 (active_range_off_ratio_enable과 별개)
+        if effective_off_days > 0 and avail_days > 0 and avail_days < ref_days:
+            scaled_partial = int(round(effective_off_days * (avail_days / max(1, ref_days))))
+            min_off_required = max(0, min(min_off_required, scaled_partial))
+        # 휴가 비례 축소(legacy): 옵션 활성화 시에만 추가 적용
+        ratio_enable = bool(_get_value(source, "active_range_off_ratio_enable", False))
         if ratio_enable and effective_off_days > 0 and eligible_off_days > 0:
-            ref_days = _as_int(reference_days, 0)
-            if ref_days <= 0:
-                ref_days = _as_int(_get_value(source, "off_days_ratio_reference_days", 0), 0)
-            if ref_days <= 0:
-                ref_days = max(1, avail_days)
             scaled_min = int(round(effective_off_days * (eligible_off_days / max(1, ref_days))))
             min_off_required = max(0, min(min_off_required, scaled_min))
 

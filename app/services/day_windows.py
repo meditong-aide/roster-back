@@ -76,7 +76,11 @@ def build_blocked_days(
                 continue
 
             a_start = a.start_date
-            a_end = a.end_date or a.expected_end_date or month_end
+            # 병동이동은 영구 이동이라 flush가 set한 end_date(today)는 무시하고 월말까지 활성으로 간주한다.
+            if a.reason == "병동이동":
+                a_end = a.expected_end_date or month_end
+            else:
+                a_end = a.end_date or a.expected_end_date or month_end
 
             if a_end < month_start or a_start > month_end:
                 continue

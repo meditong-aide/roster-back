@@ -1056,6 +1056,9 @@ def optimize_fallback_lex_hard_first(
             any(int(v or 0) > 0 for v in dm.values())
             for dm in _fb_max_by_day if isinstance(dm, dict)
         )
+        # off_first=True: max coverage 미설정 코드/일에 대해 min을 max로 강제(=잔여 셀 OFF 회수)
+        _fb_off_first_cfg = bool(getattr(cfg, "off_first", False))
+        print(f"{logger_prefix} [OffFirstCoverage] off_first={_fb_off_first_cfg}, _fb_has_any_max={_fb_has_any_max} → force_min_as_max={_fb_off_first_cfg and not _fb_has_any_max}")
         short_terms, over_terms = [], []
         over_vars_by_day = {}
         short_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
@@ -1169,6 +1172,10 @@ def optimize_fallback_lex_hard_first(
                 elif need_max > 0 and _relax_coverage:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     m.Add(ov >= assigned - need_max)
+                elif _fb_off_first_cfg and need > 0 and not _relax_coverage:
+                    # off_first=True + max 미설정: assigned <= need 하드 (잔여 셀 OFF로 회수)
+                    m.Add(assigned <= need)
+                    ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 elif need > 0:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     m.Add(assigned - ov <= need)
@@ -1179,6 +1186,64 @@ def optimize_fallback_lex_hard_first(
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 short_vars_by_day_code[(d, code)] = sh
                 over_vars_by_day_code[(d, code)] = ov
+
+        # 1-B) Max coverage / off_first OFF 균등 분배
+        # off_first=True: max coverage 미설정이라도 OFF가 잔여 셀로 회수되므로
+        # 일반 간호사 사이에 균등 분배 유도 (전담/주말휴무/preceptee 제외)
+        _fb_max_cov_off_equalize_terms = []
+        if _fb_has_any_max or _fb_off_first_cfg:
+            _fb_nurse_off_vars = []
+            for n in range(N):
+                if n in preceptee_indices:
+                    continue
+                if _fb_off_first_cfg:
+                    # 주말휴무자·N 전담은 cap 관리 대상 아님 → 풀에서 제외
+                    _nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
+                    if _nu is not None and bool(getattr(_nu, "is_weekend_off", False)):
+                        continue
+                    _raw_nn = getattr(_nu, "is_night_nurse", None) if _nu is not None else None
+                    if isinstance(_raw_nn, (set, list, tuple)) and set(_raw_nn) == {"N"}:
+                        continue
+                # off_first=False 경로의 nonvac_offs 식과 동일한 도메인:
+                #   range(T0, T1+1) 중 vacation_off_cells 제외, 고정 OFF는 X(n,d,off)=1 자동
+                T0, T1 = join[n], leave[n]
+                # off_first=True HARD 풀 가드: 풀먼스 active window 아닌 간호사는 제외
+                #   - 중도 가입자(T0>0) / 중도 퇴사자(T1<D_phys-1) → 최대 OFF 용량 상이
+                #   - blocked_by_nurse 보유자 → 출장/연수 등으로 OFF 가용량 비대칭
+                _fb_blk_set_n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+                if _fb_off_first_cfg:
+                    if T0 > 0 or T1 < D_phys - 1 or _fb_blk_set_n:
+                        continue
+                _phys_days_n = [d for d in range(T0, T1 + 1) if (n, d) not in vacation_off_cells]
+                if not _phys_days_n:
+                    continue
+                _total_off_n = m.NewIntVar(0, len(_phys_days_n), f"fb_mc_off_{n}")
+                m.Add(_total_off_n == sum(X(n, d, off_idx) for d in _phys_days_n))
+                _fb_nurse_off_vars.append(_total_off_n)
+            if len(_fb_nurse_off_vars) >= 2:
+                _fb_off_max = m.NewIntVar(0, D_phys, "fb_mc_off_max")
+                _fb_off_min = m.NewIntVar(0, D_phys, "fb_mc_off_min")
+                m.AddMaxEquality(_fb_off_max, _fb_nurse_off_vars)
+                m.AddMinEquality(_fb_off_min, _fb_nurse_off_vars)
+                _fb_off_range = m.NewIntVar(0, D_phys, "fb_mc_off_range")
+                m.Add(_fb_off_range == _fb_off_max - _fb_off_min)
+                # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
+                # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
+                if _fb_off_first_cfg:
+                    print(f"{logger_prefix} [MaxCoverage/OffFirst] OFF range는 SOFT (off_first=True)")
+                _fb_off_eq_w = -100000 if _fb_off_first_cfg else -200
+                _fb_max_cov_off_equalize_terms.append(_fb_off_eq_w * _fb_off_range)
+                if _fb_off_first_cfg and len(_fb_nurse_off_vars) >= 3:
+                    _fbN = len(_fb_nurse_off_vars)
+                    _fb_off_sum = m.NewIntVar(0, D_phys * _fbN, "fb_mc_off_sum")
+                    m.Add(_fb_off_sum == sum(_fb_nurse_off_vars))
+                    for _i, _ov in enumerate(_fb_nurse_off_vars):
+                        _dev = m.NewIntVar(0, D_phys * _fbN, f"fb_mc_off_dev_{_i}")
+                        m.Add(_dev * _fbN >= _ov * _fbN - _fb_off_sum)
+                        m.Add(_dev * _fbN >= _fb_off_sum - _ov * _fbN)
+                        _fb_max_cov_off_equalize_terms.append(-2000 * _dev)
+                print(f"{logger_prefix} [MaxCoverage/OffFirst] OFF 균등 분배 제약 추가: 간호사 {len(_fb_nurse_off_vars)}명, range_weight={_fb_off_eq_w}")
+
         # 2) 안전/법규 위반(정량 슬랙) 구성
         safety = {
             "trans_nd": [],  # N→D 위반 (Bool)
@@ -1601,9 +1666,10 @@ def optimize_fallback_lex_hard_first(
 
         # 월 최소 OFF 부족량(가능일수 클램프)
         # max coverage 설정 시: min/max coverage 기반 OFF cap 자동 조정
+        # off_first=True: max coverage 미설정이라도 동일한 자동 조정 수행 (단일 cap 소스)
         _fb_auto_min_off = None
         _fb_auto_max_off = None
-        if _fb_has_any_max:
+        if _fb_has_any_max or _fb_off_first_cfg:
             import math as _math
             _fb_blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
             _fb_total_capacity = 0
@@ -1778,6 +1844,12 @@ def optimize_fallback_lex_hard_first(
                 #     f"base_min_off={base_min_off}, avail_days={avail_days}, "
                 #     f"vacation={vacation_cnt}, min_off_required={min_off_required}"
                 # )
+                # N전담 예외: offcap 고정값 적용 제외 (max는 avail_days-15 공식)
+                if is_n_only:
+                    min_off_required = 0
+                # off_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
+                if bool(getattr(cfg, "off_first", False)):
+                    min_off_required = 0
                 if min_off_required > 0 and not is_weekend_off:
                     # 휴가/공가는 최소 OFF 충족에서 제외
                     offs = sum(
@@ -1799,7 +1871,8 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) not in vacation_off_cells
                     )
                     if is_n_only:
-                        total_cap_effective = max(0, avail_days - 15) + relax_level
+                        # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                        total_cap_effective = max(0, avail_days - 15)
                     else:
                         # 2N2O/3N2O 하드 제약으로 인한 추가 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
                         _extra_off_fb = 0
@@ -1825,7 +1898,8 @@ def optimize_fallback_lex_hard_first(
                             base_cap += _extra_off_fb
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            total_cap_effective = min(base_cap + relax_level, avail_days)
+                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            total_cap_effective = min(base_cap, avail_days)
                             # max coverage 자동 조정: max_off cap
                             if _fb_auto_max_off is not None:
                                 import math as _math
@@ -1837,16 +1911,31 @@ def optimize_fallback_lex_hard_first(
                             base_cap = min_off_required + _extra_off_fb
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            total_cap_effective = min(base_cap + relax_level, avail_days)
+                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            total_cap_effective = min(base_cap, avail_days)
                             total_cap_effective = max(total_cap_effective, min_off_required)
+                    # OFF cap slack 결정 정책:
+                    # 1) cfg gate (off_cap_bounded_slack_enable=True) → 기존 cfg max/weight 사용
+                    # 2) gate False AND relax_level > 0 → per-nurse fallback 슬랙
+                    #    (글로벌 +relax_level 폐지 후 위반 nurse 만 cap 풀어주는 구조)
+                    # 3) gate False AND relax_level == 0 → cap hard (slack 없음)
                     if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
-                        cap_slack = m.NewIntVar(0, off_cap_bounded_slack_max, f"off_cap_slack_{n}")
+                        _slack_max = int(off_cap_bounded_slack_max)
+                        _slack_weight = int(off_cap_bounded_slack_weight)
+                    elif int(relax_level or 0) > 0:
+                        _slack_max = int(relax_level)
+                        _slack_weight = 100000
+                    else:
+                        _slack_max = 0
+                        _slack_weight = 0
+                    if _slack_max > 0:
+                        cap_slack = m.NewIntVar(0, _slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(
                             0,
-                            off_cap_bounded_slack_max * off_cap_bounded_slack_weight,
+                            _slack_max * _slack_weight,
                             f"off_cap_slack_weighted_{n}",
                         )
-                        m.Add(weighted == cap_slack * off_cap_bounded_slack_weight)
+                        m.Add(weighted == cap_slack * _slack_weight)
                         safety["off_cap_bounded_slack"].append(weighted)
                         m.Add(nonvac_offs <= total_cap_effective + cap_slack)
                     else:
@@ -1948,6 +2037,8 @@ def optimize_fallback_lex_hard_first(
                         m.Add(_adj >= _eq_vars[_i] - _eq_vars[_i - 1])
                         m.Add(_adj >= _eq_vars[_i - 1] - _eq_vars[_i])
                         obj.append(-60 * _adj)
+            if _fb_max_cov_off_equalize_terms:
+                obj.extend(_fb_max_cov_off_equalize_terms)
             m.Maximize(sum(obj))
 
         return (

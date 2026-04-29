@@ -37,7 +37,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFERENCE_SCORE_SCALE,
     WEEK_OFF_SHORT_PENALTY,
 )
-from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set
+from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set, add_per_nurse_target_distribution_terms
 from services.cp_sat.fallback_lex import optimize_fallback_lex_hard_first
 from services.cp_sat.night_distribution_log import log_n_even_distribution
 from services.cp_sat.lookahead_helpers import (
@@ -64,22 +64,126 @@ def _allowed_shift_codes(raw) -> set[str]:
     return normalize_allowed_shift_codes(raw, use_mid=True)
 
 
+# ─────────────────────────  Row-commit tiered LNS (B안)  ─────────────────
+def _row_commit_counts(rs, roster) -> tuple[list[dict[str, int]], list[int], list[int]]:
+    """D/E/N/T counts + mixed indices 반환."""
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    shift_idx = {c: cfg.shift_types.index(c) for c in work_codes}
+    N, D = len(rs.nurses), rs.num_days
+    counts: list[dict[str, int]] = []
+    totals: list[int] = []
+    for n in range(N):
+        cnts = {c: int(roster[n, :D, shift_idx[c]].sum()) for c in work_codes}
+        counts.append(cnts)
+        totals.append(sum(cnts.values()))
+    mixed = [n for n in range(N) if all(counts[n].get(c, 0) >= 1 for c in work_codes)]
+    return counts, totals, mixed
+
+
+def _row_commit_frozen_rows(rs, roster, tolerance: float) -> set[int]:
+    """mixed 간호사 중 모든 D/E/N count 가 mean±tolerance 이내면 frozen."""
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    if not work_codes:
+        return set()
+    counts, _, mixed = _row_commit_counts(rs, roster)
+    if not mixed:
+        return set()
+    means = {c: sum(counts[n][c] for n in mixed) / len(mixed) for c in work_codes}
+    frozen: set[int] = set()
+    for n in mixed:
+        if all(abs(counts[n][c] - means[c]) <= tolerance for c in work_codes):
+            frozen.add(n)
+    return frozen
+
+
+def _row_commit_range_sum(rs, roster) -> tuple[int, dict[str, int]]:
+    """Dw + Ew + Nw + Tw (mixed 간호사 범위 합) 및 per-shift width 반환."""
+    cfg = rs.config
+    work_codes = [c for c in ["D", "E", "N"] if c in cfg.shift_types]
+    counts, totals, mixed = _row_commit_counts(rs, roster)
+    breakdown: dict[str, int] = {c: 0 for c in work_codes}
+    breakdown["T"] = 0
+    if not mixed:
+        return 0, breakdown
+    for c in work_codes:
+        vals = [counts[n][c] for n in mixed]
+        breakdown[c] = max(vals) - min(vals)
+    t_vals = [totals[n] for n in mixed]
+    breakdown["T"] = max(t_vals) - min(t_vals)
+    return sum(breakdown.values()), breakdown
+
+
+def _row_commit_rebias(policy, rs, roster) -> tuple[list[int], dict[int, float]]:
+    """현재 roster 기반으로 n_w 시드 (A compact: soft bias).
+    bad_rows(top 2/3 deviation) 반환 + deviation map.
+
+    - A compact: pool 열어두고 n_w 만 3/2/1 tier 로 시드.
+    - max-based dev → shift 간 compensation effect 없음 (v2 regression 교훈).
+    """
+    counts, _, mixed = _row_commit_counts(rs, roster)
+    work_codes = [c for c in ["D", "E", "N"] if c in rs.config.shift_types]
+    if not mixed or not work_codes:
+        policy.set_pool(None)
+        return [], {}
+    means = {
+        c: sum(counts[n][c] for n in mixed) / len(mixed)
+        for c in work_codes
+    }
+    devs = {
+        n: max(abs(counts[n][c] - means[c]) for c in work_codes)
+        for n in mixed
+    }
+    ranked = sorted(mixed, key=lambda n: devs[n], reverse=True)
+    third = max(1, len(ranked) // 3)
+    # n_w 초기화 후 재가중
+    policy.n_w = np.ones(policy.N)
+    for n in ranked[:third]:
+        policy.n_w[n] = 3.0
+    for n in ranked[third:2 * third]:
+        policy.n_w[n] = 2.0
+    bad_rows = ranked[:2 * third]
+    # A compact: pool 열어둠 (good row 도 재조합 가능)
+    policy.set_pool(None)
+    return bad_rows, devs
+
+
 # ─────────────────────────────  RL Neighborhood  ─────────────────────────
 class RLNeighborhoodPolicy:
-    """아주 가벼운 ε-greedy 정책"""
+    """ε-greedy 이웃 크기 정책."""
     def __init__(self, N, D, eps0=0.3, eps_end=0.05, decay=0.995):
         self.N, self.D = N, D
         self.eps, self.eps_end, self.decay = eps0, eps_end, decay
         self.n_w, self.d_w = np.ones(N), np.ones(D)
+        # active_pool: None 이면 전체 N, 지정 시 해당 인덱스에서만 n_sel 샘플링
+        self.active_pool: list[int] | None = None
+
+    def set_pool(self, pool: list[int] | None) -> None:
+        """n_sel 샘플 제한 (row-commit: good row 고정, bad row 만 재탐색)."""
+        self.active_pool = list(pool) if pool else None
 
     def select(self, k_n=4, k_d=7):
-        if random.random() < self.eps:                          # explore
-            n_sel = random.sample(range(self.N), k=min(k_n,self.N))
-            d_sel = random.sample(range(self.D), k=min(k_d,self.D))
+        pool = self.active_pool if self.active_pool else list(range(self.N))
+        k_n_eff = min(k_n, len(pool))
+        if k_n_eff <= 0:
+            pool = list(range(self.N))
+            k_n_eff = min(k_n, self.N)
+        k_d_eff = min(k_d, self.D)
+        if random.random() < self.eps:                           # explore
+            n_sel = random.sample(pool, k=k_n_eff)
+            d_sel = random.sample(range(self.D), k=k_d_eff)
         else:                                                   # exploit
-            n_sel = list(np.random.choice(self.N,k_n,replace=False,
-                                           p=self.n_w/self.n_w.sum()))
-            d_sel = list(np.random.choice(self.D,k_d,replace=False,
+            pool_arr = np.array(pool, dtype=int)
+            pool_w = self.n_w[pool_arr]
+            _sum = pool_w.sum()
+            if _sum <= 0:
+                pool_w = np.ones_like(pool_w)
+                _sum = pool_w.sum()
+            p = pool_w / _sum
+            n_sel = list(pool_arr[np.random.choice(
+                len(pool_arr), k_n_eff, replace=False, p=p)])
+            d_sel = list(np.random.choice(self.D, k_d_eff, replace=False,
                                            p=self.d_w/self.d_w.sum()))
         self.eps = max(self.eps_end, self.eps*self.decay)
         return n_sel, d_sel
@@ -1709,40 +1813,78 @@ class CPSATBasicEngine:
         # randomize=False 여도 run_seed는 항상 정의되어야 한다.
         # (e.g., 테스트/재현성 평가 스크립트에서 seed 고정 실행)
         run_seed = seed if seed is not None else ((int(time.time() * 1000) ^ random.getrandbits(31)) & 0x7fffffff)
-        # ① 0.3× time_limit 으로 “전체 모델” 한번 돌려 feasible 확보
-        # time_limit_seconds가 작을 때도(테스트/평가) 입력된 제한을 존중한다.
-        # 예: time_limit_seconds=10이면 base_tl은 최대 3초 정도로 제한.
+        # ① 0.3× time_limit 으로 Phase 1(초기해) 확보
         base_tl = max(1, int(time_limit_seconds * 0.3))
         base_tl = min(base_tl, max(1, int(time_limit_seconds)))
         print(
             f"{self.logger_prefix} [Progress] base_tl={base_tl}s, "
             f"remaining={time_limit_seconds - base_tl}s"
         )
-        roster_system.is_quick_phase = True
-        feasible = self._quick_initial_solve(
-            roster_system, base_tl, grouped, run_seed)
-        roster_system.is_quick_phase = False
-        print(f"{self.logger_prefix} [Progress] 초기해={int(bool(feasible))}")
-        if not feasible:
-            print(
-                f"{self.logger_prefix} [Progress] 초기해 실패 -> 이웃 탐색 생략, 폴백으로 전환"
-            )
-            return False
         # hard 위반 수 세는 헬퍼
         HARD_TYPES = {
-            'shift_requirement', 'max_consecutive_night',
-            'max_consecutive_work', 'night_after_limit',
-            'day_after_evening', 'night_monthly_limit'
+            'shift_requirement', 'night_consecutive',
+            'consecutive_work', 'night_nd', 'night_ne',
+            'eve_ed', 'night_month_limit',
+            'not_one_night', 'rec_2n2o', 'rec_3n2o',
+            'initial_forbidden', 'weekend_off_only',
+            'consecutive_4off', 'cross_month_4off',
         }
         def hard_violation_cnt():
             return sum(1 for v in roster_system._find_violations()
                        if v['type'] in HARD_TYPES)
+
+        roster_system.is_quick_phase = True
+        feasible = self._quick_initial_solve(
+            roster_system, base_tl, grouped, run_seed)
+        roster_system.is_quick_phase = False
+        if not feasible:
+            print(
+                f"{self.logger_prefix} [Progress] Phase 1 실패 -> 폴백으로 전환"
+            )
+            return False
         best_viol = hard_violation_cnt()
         best_roster = roster_system.roster.copy()
+        print(
+            f"{self.logger_prefix} [Progress] Phase 1 완료: best_viol={best_viol}"
+        )
+        try:
+            _p1c, _p1t, _p1mx = _row_commit_counts(roster_system, best_roster)
+            _p1lines = [f"=== Phase1 seed={run_seed} ts={time.strftime('%H:%M:%S')} ==="]
+            for _i, _nr in enumerate(roster_system.nurses):
+                _nm = getattr(_nr, "name", str(_i))
+                _c = _p1c[_i]
+                _mk = "MIX" if _i in _p1mx else "---"
+                _p1lines.append(
+                    f"  [{_i:2d}] {_nm:10s} {_mk} "
+                    f"D={_c.get('D',0):2d} E={_c.get('E',0):2d} "
+                    f"N={_c.get('N',0):2d} T={_p1t[_i]:2d}"
+                )
+            with open("/tmp/phase1_dump.log", "a") as _fp:
+                _fp.write("\n".join(_p1lines) + "\n")
+        except Exception:
+            pass
+        remaining = time_limit_seconds - base_tl
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
                                       roster_system.num_days)
-        remaining = time_limit_seconds - base_tl
+        # Phase 1.5 A compact: deviation-based bias + range-aware acceptance
+        #   - n_w 3/2/1 tier 시드 (pool 은 전체 N 열어둠)
+        #   - best_range_sum 으로 range-aware 수용 기준 활성화
+        bad_rows, _devs_map = _row_commit_rebias(
+            policy, roster_system, best_roster)
+        if bad_rows:
+            _ranked_top = sorted(
+                bad_rows, key=lambda n: _devs_map.get(n, 0), reverse=True)[:3]
+            print(
+                f"{self.logger_prefix} [RC-A] biased={len(bad_rows)} "
+                f"top3_devs={[(n, round(_devs_map.get(n,0),1)) for n in _ranked_top]}"
+            )
+        best_range_sum, best_range_brk = _row_commit_range_sum(
+            roster_system, best_roster)
+        print(
+            f"{self.logger_prefix} [RC-A] init range_sum={best_range_sum}, "
+            f"brk={best_range_brk}"
+        )
         per_iter = 8
         max_iter = max(0, remaining // per_iter)
 
@@ -1759,7 +1901,7 @@ class CPSATBasicEngine:
                     f"{self.logger_prefix} [Progress] iter={it + 1}/{max_iter}, "
                     f"n_sel={len(n_sel)}, d_sel={len(d_sel)}"
                 )
-                ok, status_text = _solve_neighbourhood(
+                ok, status_text, _curr_obj = _solve_neighbourhood(
                     roster_system, n_sel, d_sel, per_iter, grouped, run_seed, it=it
                 )
             except Exception as e:
@@ -1773,21 +1915,54 @@ class CPSATBasicEngine:
                 policy.update(False, n_sel, d_sel)
                 continue
             curr_viol = hard_violation_cnt()
-            improved  = curr_viol < best_viol
-            if improved:
-                best_viol = curr_viol;  best_roster = roster_system.roster.copy()
-            else:  # rollback
+            # RC-A: viol 감소 또는 viol 동일 & range-sum 감소 시 수용
+            if curr_viol < best_viol:
+                improved = True
+                best_viol = curr_viol
+                best_roster = roster_system.roster.copy()
+                best_range_sum, best_range_brk = _row_commit_range_sum(
+                    roster_system, best_roster)
+            elif curr_viol == best_viol:
+                curr_sum, curr_brk = _row_commit_range_sum(
+                    roster_system, roster_system.roster)
+                if curr_sum < best_range_sum:
+                    improved = True
+                    best_range_sum = curr_sum
+                    best_range_brk = curr_brk
+                    best_roster = roster_system.roster.copy()
+                else:
+                    improved = False
+                    roster_system.roster = best_roster.copy()
+            else:
+                improved = False
                 roster_system.roster = best_roster.copy()
             policy.update(improved, n_sel, d_sel)
             print(
                 f"{self.logger_prefix} [Progress] iter={it + 1} "
                 f"status={status_text}, curr_viol={curr_viol}, "
-                f"best_viol={best_viol}, improved={int(improved)}"
+                f"best_viol={best_viol}, range_sum={best_range_sum} "
+                f"brk={best_range_brk}, improved={int(improved)}"
             )
             if best_viol == 0:
                 print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
                 break
         roster_system.roster = best_roster
+        try:
+            _fnc, _fnt, _fnmx = _row_commit_counts(roster_system, best_roster)
+            _fnlines = [f"=== Final seed={run_seed} ts={time.strftime('%H:%M:%S')} ==="]
+            for _i, _nr in enumerate(roster_system.nurses):
+                _nm = getattr(_nr, "name", str(_i))
+                _c = _fnc[_i]
+                _mk = "MIX" if _i in _fnmx else "---"
+                _fnlines.append(
+                    f"  [{_i:2d}] {_nm:10s} {_mk} "
+                    f"D={_c.get('D',0):2d} E={_c.get('E',0):2d} "
+                    f"N={_c.get('N',0):2d} T={_fnt[_i]:2d}"
+                )
+            with open("/tmp/phase1_dump.log", "a") as _fp:
+                _fp.write("\n".join(_fnlines) + "\n")
+        except Exception:
+            pass
         log_n_even_distribution(roster_system, self.logger_prefix)
         if best_viol > 0:
             try:
@@ -1871,7 +2046,7 @@ class CPSATBasicEngine:
             # ▲▲ 랜덤화 추가 ▲▲
 
             solver.parameters.max_time_in_seconds=tl
-            solver.parameters.num_search_workers=2
+            solver.parameters.num_search_workers=4
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
             print('stat', stat)
@@ -2625,6 +2800,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         for day_map in max_by_day if isinstance(day_map, dict)
     )
     print(f"[MinMaxCoverage] max_by_day type={type(max_by_day).__name__}, len={len(max_by_day) if isinstance(max_by_day, list) else 'N/A'}, sample={max_by_day[0] if isinstance(max_by_day, list) and max_by_day else 'None'}, has_any_max={_has_any_max}")
+    # off_first=True: 사용자가 max coverage를 명시 안 한 코드/일에 대해 min을 max로 강제(=잔여 셀을 OFF로 회수).
+    _off_first_cfg = bool(getattr(cfg, "off_first", False))
+    print(f"[CP-SAT-Basic] [OffFirstCoverage] off_first={_off_first_cfg}, _has_any_max={_has_any_max} → force_min_as_max={_off_first_cfg and not _has_any_max}")
     m_coverage_shortage_vars = []  # M soft min shortage (max coverage 없을 때)
     max_coverage_excess_vars = []  # max coverage 초과 soft 패널티
     daily_assigned_by_code: dict[str, list] = {}  # 일자별 커버리지 균등화용 {code: [(day, assigned_var, need, need_max)]}
@@ -2714,29 +2892,58 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 # 일자별 커버리지 균등화용 수집 (물리일만)
                 if d < D_phys:
                     daily_assigned_by_code.setdefault(code, []).append((d, assigned, need, need_max))
+            elif _off_first_cfg and need > 0:
+                # off_first=True + max 미설정: assigned <= need 하드 (잔여 셀 OFF로 회수)
+                m.Add(assigned <= need)
+                ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
+                over_vars_by_day.setdefault(d, {})[code] = ov
             elif need > 0:
                 ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                 m.Add(ov >= assigned - need)
                 over_vars_by_day.setdefault(d, {})[code] = ov
 
     # ───────────── 2-D. Max coverage Off 균등 분배 ───
+    # off_first=True: max coverage 미설정이라도 OFF가 잔여 셀로 회수되므로
+    # 일반 간호사 사이에 균등 분배 유도가 핵심 요구사항.
     max_cov_off_equalize_terms = []
-    if _has_any_max:
+    if _has_any_max or _off_first_cfg:
         off_idx = rs.config.shift_types.index('O')
         nurse_off_vars = []
         for n in range(N):
             # 프리셉티는 프리셉터 스케줄을 따라가므로 균등화 대상에서 제외
             if n in preceptee_indices:
                 continue
+            # off_first=True: 주말휴무자·N 전담은 OFF cap이 일반 풀과 상이 → 풀에서 제외
+            #   - 주말휴무자: weekend OFF 고정 슬롯
+            #   - N 전담: 월 N 15회 후 잔여 셀 일괄 OFF (cap 관리 대상 아님)
+            # 나머지 일반 근무자에 대해서만 동일 OFF 수렴 유도
+            if _off_first_cfg:
+                _nu = rs.nurses[n] if n < len(rs.nurses) else None
+                if _nu is not None and bool(getattr(_nu, "is_weekend_off", False)):
+                    continue
+                _raw_nn = getattr(_nu, "is_night_nurse", None) if _nu is not None else None
+                if isinstance(_raw_nn, (set, list, tuple)) and set(_raw_nn) == {"N"}:
+                    continue
+            # off_first=False 경로의 OFF cap 식과 동일한 도메인:
+            #   phys_range_off = month_total_day_range(T0,T1,D_phys) ∖ blocked_by_nurse[n]
+            #   휴가/공가(vacation_off_cells) 제외, 고정 OFF는 X(n,d,off)=1로 자동 카운트
             T0, T1 = join[n], leave[n]
-            phys_days = [d for d in range(T0, min(T1 + 1, D_phys))]
-            if not phys_days:
+            _phys_range_off_eq = month_total_day_range(T0, T1, D_phys)
+            _blk_set_n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+            if _blk_set_n:
+                _phys_range_off_eq = [d for d in _phys_range_off_eq if d not in _blk_set_n]
+            _phys_range_off_eq = [d for d in _phys_range_off_eq if (n, d) not in vacation_off_cells]
+            if not _phys_range_off_eq:
                 continue
-            total_off_n = m.NewIntVar(0, len(phys_days), f"mc_off_{n}")
-            m.Add(
-                total_off_n == sum(X(n, d, off_idx) for d in phys_days if (n, d) not in fixed)
-                + sum(1 for d in phys_days if (n, d) in fixed and fixed[(n, d)] == off_idx)
-            )
+            # off_first=True HARD 풀 가드: 풀먼스 active window 아닌 간호사는 제외
+            #   - 중도 가입자(T0>0) / 중도 퇴사자(T1<D_phys-1) → 최대 OFF 용량 상이
+            #   - blocked_by_nurse 보유자 → 출장/연수 등으로 OFF 가용량 비대칭
+            #   동일 OFF 강제 시 INFEASIBLE 또는 풀 전체 OFF가 그들에 끌려 내려감
+            if _off_first_cfg:
+                if T0 > 0 or T1 < D_phys - 1 or _blk_set_n:
+                    continue
+            total_off_n = m.NewIntVar(0, len(_phys_range_off_eq), f"mc_off_{n}")
+            m.Add(total_off_n == sum(X(n, d, off_idx) for d in _phys_range_off_eq))
             nurse_off_vars.append(total_off_n)
         if len(nurse_off_vars) >= 2:
             off_global_max = m.NewIntVar(0, D_phys, "mc_off_max")
@@ -2745,9 +2952,23 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.AddMinEquality(off_global_min, nurse_off_vars)
             off_range = m.NewIntVar(0, D_phys, "mc_off_range")
             m.Add(off_range == off_global_max - off_global_min)
-            # Off 분산 패널티 (가중치 높게 설정하여 균등 분배 유도)
-            max_cov_off_equalize_terms.append(-200 * off_range)
-            print(f"[MaxCoverage] Off 균등 분배 제약 추가: 간호사 {len(nurse_off_vars)}명")
+            # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
+            # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
+            if _off_first_cfg:
+                print(f"[MaxCoverage] OFF range는 SOFT (off_first=True, daily 커버리지 우선)")
+            _off_eq_weight = -100000 if _off_first_cfg else -200
+            max_cov_off_equalize_terms.append(_off_eq_weight * off_range)
+            # L1 deviation: 양 끝점뿐 아니라 중간 분산도 평탄화
+            if _off_first_cfg and len(nurse_off_vars) >= 3:
+                _N_eq = len(nurse_off_vars)
+                _off_sum = m.NewIntVar(0, D_phys * _N_eq, "mc_off_sum")
+                m.Add(_off_sum == sum(nurse_off_vars))
+                for _i, _ov in enumerate(nurse_off_vars):
+                    _dev = m.NewIntVar(0, D_phys * _N_eq, f"mc_off_dev_{_i}")
+                    m.Add(_dev * _N_eq >= _ov * _N_eq - _off_sum)
+                    m.Add(_dev * _N_eq >= _off_sum - _ov * _N_eq)
+                    max_cov_off_equalize_terms.append(-2000 * _dev)
+            print(f"[MaxCoverage] Off 균등 분배 제약 추가: 간호사 {len(nurse_off_vars)}명, range_weight={_off_eq_weight}")
 
     # ───────────── 2-E. 일자별 커버리지 균등화 (min~max 범위 내 고른 배정) ───
     daily_cov_equalize_terms = []
@@ -3111,7 +3332,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             _off_cap_skip = False
             _auto_min_off = None  # max coverage 기반 자동 최소 OFF
             _auto_max_off = None  # min coverage 기반 자동 최대 OFF
-            if _has_any_max:
+            # off_first=True 시: max coverage 미설정이라도 _auto_max_off가 OFF cap의 단일 소스
+            if _has_any_max or _off_first_cfg:
                 _blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
                 _total_off_capacity = 0  # min coverage 기준 최대 OFF 가용량
                 _total_off_required = 0  # max coverage 기준 최소 OFF 필요량
@@ -3205,6 +3427,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         f"min_off {min_off_required}→{_adjusted_min}"
                     )
                     min_off_required = _adjusted_min
+                # N전담 예외: offcap 고정값 적용 제외 (max는 별도 공식 avail_days-15)
+                if is_n_only:
+                    min_off_required = 0
+                # off_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
+                # (실제 OFF는 daily 커버리지 + 6연근/N패턴 hard에 의해 자연 결정)
+                if bool(getattr(cfg, "off_first", False)):
+                    min_off_required = 0
                 if min_off_required > 0 and phys_range_off:
                     m.Add(
                         sum(
@@ -3263,19 +3492,22 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected:
                             _extra_off += 1
-                        # off_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
+                        # off_first 분기: False=근무 oversupply(OFF tight) / True=min coverage 잔여 OFF 회수
                         _off_first = bool(getattr(cfg, "off_first", False))
                         if _off_first:
-                            max_off_allowed = min(
-                                _base_max + _extra_off,
-                                nonvac_active_days,
-                            )
-                            # max coverage 자동 조정: max_off도 auto 값으로 cap
+                            # off_first=True: daily_shift min coverage 기반 capacity가 단일 cap 소스
+                            # off_days config은 무시 (실제 OFF는 잔여 셀로 자연 결정).
                             if _auto_max_off is not None:
                                 _ratio = nonvac_active_days / max(1, D_phys)
                                 _scaled_auto_max = max(min_off_required, int(_auto_max_off * _ratio))
-                                max_off_allowed = min(max_off_allowed, _scaled_auto_max)
+                                max_off_allowed = min(
+                                    _scaled_auto_max + _extra_off,
+                                    nonvac_active_days,
+                                )
                                 max_off_allowed = max(max_off_allowed, min_off_required)
+                            else:
+                                # 안전 폴백: _auto_max_off 계산 실패 시 nonvac_active_days로 cap
+                                max_off_allowed = max(min_off_required, nonvac_active_days)
                         else:
                             # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
                             max_off_allowed = min(
@@ -3485,6 +3717,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     # 일자별 커버리지 균등화 항 추가
     if daily_cov_equalize_terms:
         obj.extend(daily_cov_equalize_terms)
+    # Per-nurse avail 기반 target 편차 패널티 (옵션1) - 원인 파악 중, 기본 비활성
+    try:
+        pnt_weight = int(getattr(rs.config, "per_nurse_target_weight", 0) or 0)
+        if pnt_weight > 0:
+            obj.extend(
+                add_per_nurse_target_distribution_terms(
+                    m, rs, X, join, leave, fixed, weight=pnt_weight
+                )
+            )
+    except Exception as _err:
+        print(f"[WARN] per_nurse_target_terms skipped: {_err}")
     m.Maximize(sum(obj))
 
     return m, X, join, leave, fixed
@@ -3501,8 +3744,10 @@ def _solve_neighbourhood(
     grouped,
     run_seed: int | None = None,
     it: int = 0,
-) -> tuple[bool, str]:
-    """선택된 이웃(n_set, d_set)만 재탐색하여 해를 갱신한다."""
+) -> tuple[bool, str, float]:
+    """선택된 이웃(n_set, d_set)만 재탐색하여 해를 갱신한다.
+    반환: (성공여부, 상태텍스트, 목적함수값). 실패 시 obj는 -inf.
+    """
     from ortools.sat.python import cp_model
     model,X,j,l,fixed=_build_full_model(rs,grouped, include_pair_objective=False)
 
@@ -3589,14 +3834,18 @@ def _solve_neighbourhood(
         if not bool(getattr(rs, "_infeasible_n_diag_logged", False)):
             _log_infeasible_n_capacity(rs, j, l, fixed)
             rs._infeasible_n_diag_logged = True
-        return False, status_text
+        return False, status_text, float("-inf")
 
     # 반영
     for n in n_set:
         for d in d_set:
             for s in range(S):
                 rs.roster[n,d,s]=1 if solver.Value(X(n,d,s)) else 0
-    return True, status_text
+    try:
+        obj_val = float(solver.ObjectiveValue())
+    except Exception:
+        obj_val = float("-inf")
+    return True, status_text, obj_val
 
 
 def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dict[tuple[int, int], int]) -> None:
