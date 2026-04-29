@@ -1066,6 +1066,7 @@ def update_nurse_profile_service(
     update_data: NurseProfileUpdate,
     current_user: UserSchema,
     db: Session,
+    view_group_id: Optional[str] = None,
 ):
     """
     nurse_id 기반 단건 프로필 업데이트 서비스 (근무자 관리 사이드 프로필용)
@@ -1073,6 +1074,8 @@ def update_nurse_profile_service(
     - 수간호사는 같은 그룹 내만 수정 가능
     - email 변경 시 bizwiz20db.Member에도 dual write
     - `assignment` payload 포함 시 NurseAssignment CRUD를 먼저 처리 (create/update/cancel)
+    - view_group_id: 호출 view 의 group_id (target view 에서 inbound nurse 수정 시 필수).
+      미지정 시 current_user.group_id 사용.
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -1122,6 +1125,8 @@ def update_nurse_profile_service(
             "nurse_id": nurse_id,
         }
 
+    # 호출 view 의 group_id 결정 (target view 에서 inbound nurse 수정 시 명시 필요)
+    _caller_view_group = view_group_id or current_user.group_id
     # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
     if is_admin:
         _apply_source_nurse_update(nurse, fields)
@@ -1129,7 +1134,7 @@ def update_nurse_profile_service(
         db.refresh(nurse)
         applied_source = True
     else:
-        mode, assign_row = resolve_edit_target(db, current_user.group_id, nurse_id)
+        mode, assign_row = resolve_edit_target(db, _caller_view_group, nurse_id)
         if mode == "none":
             raise HTTPException(
                 status_code=403, detail="해당 간호사를 수정할 권한이 없습니다."

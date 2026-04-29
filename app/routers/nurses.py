@@ -1066,11 +1066,20 @@ async def get_nurse_by_id(
 async def update_nurse_profile(
     nurse_id: str,
     update_data: NurseProfileUpdate,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
+    """간호사 프로필 수정.
+
+    group_id: 호출 view 의 그룹(=caller_group_id). 미지정 시 current_user.group_id 사용.
+    target view(인바운드 간호사 수정) 에서 호출 시 명시 전달해야 target_* overlay 가
+    정상 적용된다 (미전달 시 항상 source 분기로 처리되어 nurse 자체 컬럼만 변경됨).
+    """
     try:
-        return update_nurse_profile_service(nurse_id, update_data, current_user, db)
+        return update_nurse_profile_service(
+            nurse_id, update_data, current_user, db, view_group_id=group_id,
+        )
     except HTTPException:
         raise
     except Exception as e:
