@@ -14,7 +14,11 @@ def _resolve_grade_names(
     grade_names_raw: Any,
     constraints: Optional[Dict[str, Dict[Any, int]]],
 ) -> Optional[Dict[str, str]]:
-    """grade_names_json이 비어있으면 constraints_json 키로 기본 매핑을 생성한다."""
+    """grade_names_json이 비어있으면 constraints_json 키로 기본 매핑을 생성한다.
+
+    fallback 시 value를 빈 문자열로 둠 — 프론트의 trim().length>0 분기에서
+    "Grade N" 자동 라벨이 살아있도록 한다(사용자 미입력 상태 보존).
+    """
     if isinstance(grade_names_raw, dict) and grade_names_raw:
         return {str(k): str(v) for k, v in grade_names_raw.items()}
 
@@ -34,7 +38,7 @@ def _resolve_grade_names(
     if not grade_keys:
         return None
 
-    return {key: key for key in sorted(grade_keys, key=lambda x: int(x))}
+    return {key: "" for key in sorted(grade_keys, key=lambda x: int(x))}
 
 
 def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:

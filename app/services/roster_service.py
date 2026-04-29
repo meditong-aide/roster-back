@@ -855,6 +855,16 @@ def get_my_issued_roster_service(
         and a.source_group_id == src_gid
         and a.target_group_id
     ]
+    # 과거 병동이동 inbound: 본인이 src_gid 로 영구이동해 들어온 케이스.
+    # query month 내 transfer.start_date 이전 일자는 이전 home(=source_group_id) 근무표를 참조해야 함.
+    my_inbound_transfers = [
+        a for a in assignments
+        if a.nurse_id == nurse_id
+        and a.reason == "병동이동"
+        and a.target_group_id == src_gid
+        and a.source_group_id
+        and a.source_group_id != src_gid
+    ]
     transfers_out: list[dict] = []
 
     if my_transfers:
@@ -946,6 +956,104 @@ def get_my_issued_roster_service(
                 "period_start_day": _p_start,
                 "period_end_day": _p_end,
                 "target_issued": _target_issued,
+            })
+
+    # 과거 home overlay (영구 병동이동 inbound):
+    # 본인이 src_gid 로 이동해 들어온 경우, transfer.start_date 이전 일자는
+    # 이전 home(source_group_id) 근무표를 참조해 채운다.
+    if my_inbound_transfers:
+        _src_home_gids = {a.source_group_id for a in my_inbound_transfers}
+        _src_grows = db.query(Group).filter(Group.group_id.in_(list(_src_home_gids))).all()
+        _src_gid_to_name = {g.group_id: g.group_name for g in _src_grows}
+        _prev_home_cache: dict[str, dict | None] = {}
+
+        def _load_my_prev_home(_pgid: str) -> dict | None:
+            if _pgid in _prev_home_cache:
+                return _prev_home_cache[_pgid]
+            _snap = get_issued_roster_snapshot_service(
+                year=year, month=month, current_user=current_user, db=db,
+                target_group_id=_pgid,
+            )
+            _out: dict | None = None
+            if _snap:
+                _p_roster = _snap.get("roster") or {}
+                _p_nurses = _p_roster.get("nurses") or []
+                _p_my = next(
+                    (n for n in _p_nurses if str(n.get("nurse_id")) == str(nurse_id)),
+                    None,
+                )
+                if _p_my:
+                    _out = {
+                        "schedule": _p_my.get("schedule") or [],
+                        "schedule_ids": _p_my.get("schedule_ids") or [],
+                        "shift_colors": _p_roster.get("shift_colors") or {},
+                    }
+            _prev_home_cache[_pgid] = _out
+            return _out
+
+        for _a in my_inbound_transfers:
+            _a_start = _a.start_date
+            # 이전 home 구간: 월 시작 ~ transfer 시작일 전날 (월 내 strict overlap)
+            if _a_start <= m_start:
+                continue  # 월 시작 이전에 이미 이동 완료 — 이전 home 표시 불필요
+            _prev_end = min(_a_start - timedelta(days=1), m_end)
+            _prev_start = m_start
+            if _prev_start > _prev_end:
+                continue
+            _pgid = _a.source_group_id
+            _pgname = _src_gid_to_name.get(_pgid, "")
+            _prev = _load_my_prev_home(_pgid)
+            _prev_issued = _prev is not None
+
+            _p_start = _prev_start.day
+            _p_end = _prev_end.day
+
+            if _prev_issued:
+                shift_colors.update(_prev.get("shift_colors") or {})
+                _p_cells = _prev["schedule"]
+                _p_ids = _prev["schedule_ids"]
+                for d in range(_p_start, _p_end + 1):
+                    idx = d - 1
+                    if idx >= days_in_month:
+                        break
+                    _p_cell = _p_cells[idx] if idx < len(_p_cells) else None
+                    _code = _cell_code(_p_cell)
+                    schedule_days[idx].update({
+                        "code": _code,
+                        "color": _cell_color(_p_cell, _code),
+                        "schedule_id": (_p_ids[idx] if idx < len(_p_ids) else None),
+                        "group_id": _pgid,
+                        "group_name": _pgname,
+                        "is_source": False,
+                        "reason": _a.reason,
+                    })
+            else:
+                # 이전 home snapshot 미발행 → cell 비우고 group/reason 만 표시
+                for d in range(_p_start, _p_end + 1):
+                    idx = d - 1
+                    if idx >= days_in_month:
+                        break
+                    schedule_days[idx].update({
+                        "code": "",
+                        "schedule_id": None,
+                        "group_id": _pgid,
+                        "group_name": _pgname,
+                        "is_source": False,
+                        "reason": _a.reason,
+                    })
+
+            # 이전 home: 프론트가 별도 분기 없이도 식별 가능하도록 라벨에 접두어
+            _label = f"이전: {_pgname}" if _pgname else "이전 병동"
+            transfers_out.append({
+                "reason": _a.reason,
+                "target_group_id": _pgid,
+                "target_group_name": _label,
+                "start_date": str(_prev_start),
+                "end_date": str(_prev_end),
+                "period_start_day": _p_start,
+                "period_end_day": _p_end,
+                "target_issued": _prev_issued,
+                "is_prev_home": True,
             })
 
     # counts 최종 재계산

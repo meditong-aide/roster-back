@@ -356,6 +356,58 @@ def _make_assignment_body_loader(db: Session, year: int, month: int):
     return _load
 
 
+def _compute_leave_blocked_days_in_month(
+    db: Session,
+    nurse_id: str,
+    year: int,
+    month: int,
+) -> Set[int]:
+    """휴직/퇴사 기간과 겹치는 해당 월의 day set을 반환합니다.
+
+    fixed_wanted_entries '주' 자동 주입 차단용.
+    포함 대상:
+      - nurse_assignment.reason in ('휴직','퇴사') 의 active/completed 기간
+      - nurses.resignation_date 이후 (assignment 미생성된 퇴사도 포함)
+    """
+    from calendar import monthrange
+    m_start = date(year, month, 1)
+    m_end = date(year, month, monthrange(year, month)[1])
+    blocked: Set[int] = set()
+
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == nurse_id,
+            NurseAssignment.reason.in_(["휴직", "퇴사"]),
+            NurseAssignment.status.in_(["active", "completed"]),
+        )
+        .all()
+    )
+    for r in rows:
+        s = r.start_date
+        e = r.end_date or r.expected_end_date or m_end
+        if s is None or s > m_end or e < m_start:
+            continue
+        cur = max(s, m_start)
+        last = min(e, m_end)
+        for i in range((last - cur).days + 1):
+            blocked.add((cur + timedelta(days=i)).day)
+
+    # nurses.resignation_date 기반 퇴사 (assignment 미연동 케이스 보완)
+    nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    if nurse_row is not None:
+        _resign = getattr(nurse_row, "resignation_date", None)
+        if _resign is not None:
+            _resign_d = _resign.date() if hasattr(_resign, "date") else _resign
+            if _resign_d <= m_end:
+                cur = max(_resign_d, m_start)
+                last = m_end
+                for i in range((last - cur).days + 1):
+                    blocked.add((cur + timedelta(days=i)).day)
+
+    return blocked
+
+
 def _compute_weekly_off_days(
     db: Session,
     nurse_id: str,
@@ -375,7 +427,7 @@ def _compute_weekly_off_days(
         assignment_overlay: 지정 시 target_weekly_off_* 값으로 overlay (inbound 간호사 전용)
 
     반환:
-        주휴 요일에 해당하는 day 집합(1~31). 예: {3, 10, 17, 24}
+        주휴 요일에 해당하는 day 집합(1~31). 휴직 기간은 제외.
     """
     nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse_row:
@@ -425,6 +477,11 @@ def _compute_weekly_off_days(
         if current.weekday() == preview_weekday:
             weekly_off_days.add(current.day)
         current += timedelta(days=1)
+
+    # 휴직 기간 day 제외 — fixed_wanted_entries '주' 자동 주입/저장 차단
+    leave_blocked = _compute_leave_blocked_days_in_month(db, nurse_id, year, month)
+    if leave_blocked:
+        weekly_off_days -= leave_blocked
 
     return weekly_off_days
 
@@ -603,9 +660,6 @@ def _persist_shift_results(
         for day, info in (by_day or {}).items():
             if not isinstance(day, int) or not 1 <= day <= 31:
                 continue
-            
-            print(f"[DEBUG-4] 저장 시도: {year}-{month:02d}-{day:02d} {shift_code} | "
-                  f"request={info.get('request')!r}, comment={info.get('comment')!r}")
 
             score = float(info.get("score", 1.0))
             score = max(0.0, min(10.0, score))  # case 우선순위 반영 위해 범위 확대
@@ -1030,11 +1084,6 @@ async def invoke_and_persist_wanted_service(
         allowed_shift_map=allowed_shift_map,
     )
     has_case = bool(normalized_case)
-    
-    print("[DEBUG-1] normalized_case 전체 내용 : ", normalized_case)
-    for idx, item in enumerate(normalized_case):
-        print(f"[DEBUG-1] case[{idx}]: date={item.get('date')}, shift={item.get('shift')}, "
-              f"comment={item.get('comment')!r} (type={type(item.get('comment'))})")
 
     # # 3. NURSE_LIMIT 검증 (간호사별 월단위 요청 개수 제한) - 프론트에서 검증, nurses 테이블로 이동됨
     # nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
@@ -1221,11 +1270,6 @@ async def invoke_and_persist_wanted_service(
                 "comment": comment, # 사유작성
                 "shift": shift
             }
-    
-    print("[DEBUG-2] case 처리 완료 후 shift_map : ", shift_map)
-    for shift_code, days in shift_map.items():
-        for day, info in days.items():
-            print(f"[DEBUG-2]   {shift_code} {day}일 → comment={info.get('comment')!r}")
 
     # 2. AIDE 결과 병합 (case 없는 날만 반영)
     for shift_id, days_dict in shift_parsed.items():
@@ -1254,7 +1298,6 @@ async def invoke_and_persist_wanted_service(
                     "comment": info.get("comment", ""),  # AIDE에서 파싱한 사유 사용
                     "shift": shift_id
                 }
-    print("[DEBUG-3] AIDE 병합 완료 후 shift_map : ", shift_map)
 
     # 주휴 필터링
     weekly_off_days = _compute_weekly_off_days(
@@ -2501,15 +2544,21 @@ def _insert_fixed_wanted_entries(
     shift_id_to_table_id: Dict[str, int],
     original_map: Dict[Tuple[str, str], str],
     nurse_weekly_off_map: Dict[str, Set[int]],
+    nurse_leave_blocked_map: Optional[Dict[str, Set[int]]] = None,
 ) -> Tuple[List[FixedWantedEntry], int]:
     """새 FixedWantedEntry를 caller_group_id로 bulk insert."""
     new_entries: List[FixedWantedEntry] = []
     skipped_weekly_off = 0
+    leave_map = nurse_leave_blocked_map or {}
     for entry in req.entries:
         if entry.source_type == "weekly_off":
             skipped_weekly_off += 1
             continue
         entry_day = entry.shift_date.day
+        # 휴직 기간 '주' 차단: 휴직 day 와 겹치는 "주" entry 는 저장하지 않는다.
+        if entry.shift_id == "주" and entry_day in leave_map.get(entry.nurse_id, set()):
+            skipped_weekly_off += 1
+            continue
         # weekly_off 일자 처리:
         #   - "주" entry 는 자동 inject (프론트 GET 응답에 포함) → 중복 방지 위해 skip
         #   - 그 외 shift_id (휴/보/D/E 등) 는 사용자 명시 override 로 정상 저장
@@ -2683,6 +2732,15 @@ def save_fixed_wanted_service(
         if days:
             nurse_weekly_off_map[nid] = days
 
+    # 휴직 기간 day 맵 — '주' 직접 저장 시도 차단용
+    nurse_leave_blocked_map: Dict[str, Set[int]] = {}
+    for nid in nurse_rows.keys():
+        leave_days = _compute_leave_blocked_days_in_month(
+            db, nid, req.year, req.month,
+        )
+        if leave_days:
+            nurse_leave_blocked_map[nid] = leave_days
+
     # ── caller group entries 삭제 (다른 group 보존) ──
     deleted_count = db.query(FixedWantedEntry).filter(
         FixedWantedEntry.group_id == group_id,
@@ -2696,6 +2754,7 @@ def save_fixed_wanted_service(
     new_entries, skipped_weekly_off = _insert_fixed_wanted_entries(
         db, req, group_id, nurse_id,
         shift_id_to_table_id, original_map, nurse_weekly_off_map,
+        nurse_leave_blocked_map=nurse_leave_blocked_map,
     )
 
     db.commit()

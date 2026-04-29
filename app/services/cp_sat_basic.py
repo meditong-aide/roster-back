@@ -1861,8 +1861,8 @@ class CPSATBasicEngine:
                 )
             with open("/tmp/phase1_dump.log", "a") as _fp:
                 _fp.write("\n".join(_p1lines) + "\n")
-        except Exception as _err:
-            print(f"[DEBUG-ERR] phase1 dump: {_err}")
+        except Exception:
+            pass
         remaining = time_limit_seconds - base_tl
         # ② RL 정책
         policy = RLNeighborhoodPolicy(len(roster_system.nurses),
@@ -1961,8 +1961,8 @@ class CPSATBasicEngine:
                 )
             with open("/tmp/phase1_dump.log", "a") as _fp:
                 _fp.write("\n".join(_fnlines) + "\n")
-        except Exception as _err:
-            print(f"[DEBUG-ERR] final dump: {_err}")
+        except Exception:
+            pass
         log_n_even_distribution(roster_system, self.logger_prefix)
         if best_viol > 0:
             try:
