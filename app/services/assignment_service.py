@@ -31,27 +31,40 @@ _INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
 def _assert_caller_owns_source(
     current_user: Optional[UserSchema],
     source_group_id: str,
+    db: Optional[Session] = None,
 ) -> None:
     """파견/병동이동/휴직 등 assignment 조작 권한 검증.
 
-    정책: source 병동 수간호사만 자기 병동 간호사를 파견/이동시킬 수 있다.
-    - is_master_admin: 예외 (모든 그룹 조작 허용)
-    - 그 외: caller.group_id == source_group_id 필수
-    - current_user가 None이면 system/admin 경로로 간주하고 통과.
+    통과 조건 (OR):
+    - current_user is None → system/admin 경로로 간주
+    - is_master_admin
+    - caller.group_id == source_group_id (현재 view가 source)
+    - caller.original_group_id == source_group_id (원본 소속이 source — view 전환 중)
+    - caller.nurse_id ∈ groups[source_group_id].hn_id (해당 그룹의 등록된 그룹 관리자)
     """
     if current_user is None:
         return
     if getattr(current_user, "is_master_admin", False):
         return
     caller_gid = getattr(current_user, "group_id", None)
-    if caller_gid != source_group_id:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"권한 없음: source 병동({source_group_id})의 수간호사만 "
-                f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
-            ),
-        )
+    if caller_gid == source_group_id:
+        return
+    caller_original = getattr(current_user, "original_group_id", None)
+    if caller_original and caller_original == source_group_id:
+        return
+    caller_nid = getattr(current_user, "nurse_id", None)
+    if db is not None and caller_nid:
+        src_group = db.query(Group).filter(Group.group_id == source_group_id).first()
+        hn_ids = list(src_group.hn_id or []) if src_group is not None else []
+        if str(caller_nid) in {str(x) for x in hn_ids}:
+            return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"권한 없음: source 병동({source_group_id})의 수간호사 또는 그룹 관리자만 "
+            f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
+        ),
+    )
 
 
 # source(nurses.*) 필드명 → target(nurse_assignment.target_*) 필드명 매핑
@@ -252,7 +265,7 @@ def create_assignment(
     current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 등록"""
-    _assert_caller_owns_source(current_user, req.source_group_id)
+    _assert_caller_owns_source(current_user, req.source_group_id, db=db)
 
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
     if not nurse:
@@ -479,7 +492,7 @@ def update_assignment(
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
-    _assert_caller_owns_source(current_user, row.source_group_id)
+    _assert_caller_owns_source(current_user, row.source_group_id, db=db)
 
     # 재배치 판정을 위해 기존(window) 스냅샷 저장
     _old_window = (row.start_date, _effective_end_date(row))
@@ -594,7 +607,7 @@ def cancel_assignment(
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
-    _assert_caller_owns_source(current_user, row.source_group_id)
+    _assert_caller_owns_source(current_user, row.source_group_id, db=db)
 
     _old_window = (row.start_date, _effective_end_date(row))
     _old_reason = row.reason
