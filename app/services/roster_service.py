@@ -847,20 +847,33 @@ def get_my_issued_roster_service(
         })
 
     # 파견/병동이동: target 근무표 overlay (복수 assignment 지원)
-    assignments = get_active_assignments_for_month(db, src_gid, year, month)
+    # 본인 nurse_id 기반으로 month 와 overlap 되는 모든 assignment 수집
+    # (영구이동 발효 후엔 src_gid 가 변경되므로 source/target group 필터 사용 금지)
+    from db.models import NurseAssignment as _NurseAssignment
+    _all_my_asgs = (
+        db.query(_NurseAssignment)
+        .filter(
+            _NurseAssignment.nurse_id == nurse_id,
+            _NurseAssignment.status.in_(["active", "completed"]),
+            _NurseAssignment.reason.in_(["파견", "병동이동"]),
+        )
+        .all()
+    )
+    assignments = [
+        a for a in _all_my_asgs
+        if a.start_date is not None
+        and a.start_date <= m_end
+        and (a.end_date or a.expected_end_date or m_end) >= m_start
+    ]
+    # outbound (현재 home 외부로 나간 케이스): target != src_gid
     my_transfers = [
         a for a in assignments
-        if a.nurse_id == nurse_id
-        and a.reason in ("파견", "병동이동")
-        and a.source_group_id == src_gid
-        and a.target_group_id
+        if a.target_group_id and a.target_group_id != src_gid
     ]
-    # 과거 병동이동 inbound: 본인이 src_gid 로 영구이동해 들어온 케이스.
-    # query month 내 transfer.start_date 이전 일자는 이전 home(=source_group_id) 근무표를 참조해야 함.
+    # inbound (영구이동으로 src_gid 에 들어온 케이스): target == src_gid AND source != src_gid
     my_inbound_transfers = [
         a for a in assignments
-        if a.nurse_id == nurse_id
-        and a.reason == "병동이동"
+        if a.reason == "병동이동"
         and a.target_group_id == src_gid
         and a.source_group_id
         and a.source_group_id != src_gid
