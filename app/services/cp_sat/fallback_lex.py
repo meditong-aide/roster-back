@@ -277,7 +277,12 @@ def optimize_fallback_lex_hard_first(
         # print('fallback fixed', fixed)
         # 코드에 타입 매핑이 없으면 메인 코드 기준으로 재시도
         raw_code = str(c.get("shift") or "").strip().upper()
-        fixed_type_by_cell[(n, d)] = code2type.get(raw_code) or code2type.get(s_main)
+        # 빌더가 명시한 shift_type 을 우선 (예: weekly_off="주휴", special="휴가/휴무/공가").
+        fixed_type_by_cell[(n, d)] = (
+            (c.get("shift_type") or "").strip()
+            or code2type.get(raw_code)
+            or code2type.get(s_main)
+        )
         if str(c.get("fixed_source") or "").strip().lower() == "fixed_wanted":
             fixed_wanted_cells.add((n, d))
 
@@ -1358,7 +1363,10 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, night_idx) <= sum(neighbors))
 
-        # fixed 비근무 직전일 N 금지 (하드 제약)
+        # 휴가/공가 fixed 셀의 직전일 N 금지 (하드, 휴가/공가 보호 정책).
+        # fixed_wanted O / 휴무 / 주휴 등은 사용자 자발 OFF 또는 자동 OFF 라 대상 외.
+        # 단 prev_d == T0(day 0) 자체는 cross-month 면제.
+        _BAN_N_TYPES = {"휴가", "공가"}
         if bool(getattr(cfg, "ban_night_before_fixed_off", False)):
             for n in range(N):
                 if _is_preceptee_at(n):
@@ -1368,13 +1376,9 @@ def optimize_fallback_lex_hard_first(
                 for d in range(T0 + 1, T1 + 1):
                     if (n, d) not in fixed:
                         continue
-                    if fixed[(n, d)] != off_idx:
-                        continue  # OFF가 아닌 고정 셀은 대상 아님
-                    if (n, d) in fixed_wanted_cells:
-                        continue  # fixed_wanted OFF는 BanN 대상 제외
                     _fw_type = fixed_type_by_cell.get((n, d))
-                    if _fw_type == "근무":
-                        continue
+                    if _fw_type not in _BAN_N_TYPES:
+                        continue  # 휴가/휴무/공가 외 type 은 BanN 대상 아님
                     prev_d = d - 1
                     if prev_d < T0:
                         continue
