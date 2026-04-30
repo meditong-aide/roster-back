@@ -2551,6 +2551,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                         'nurse_index': c.get('nurse_index'),
                         'day_index': c.get('day_index'),
                         'shift': shift_code,
+                        'shift_type': c.get('shift_type'),
                         'fixed_source': c.get('fixed_source'),
                     }
                 )
