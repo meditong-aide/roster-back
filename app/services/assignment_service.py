@@ -999,6 +999,35 @@ def flush_expired_preceptees(db: Session) -> int:
     return count
 
 
+def flush_orphan_preceptee_assignments(db: Session) -> int:
+    """nurses.preceptor_id=NULL 이지만 active 프리셉티 assignment 가 떠있는 비대칭을 정리.
+
+    원인: 외부 경로(직접 INSERT, 프론트 가드로 PATCH 누락 등)로 nurses.preceptor_id 와
+    nurse_assignment 가 어긋난 경우. lazy 체크 시점에 active row 를 모두 cancelled 로 정리.
+    알림은 발송하지 않는다(자동 정리는 사용자 의도 변경이 아님).
+    """
+    rows = (
+        db.query(NurseAssignment)
+        .join(NurseModel, NurseModel.nurse_id == NurseAssignment.nurse_id)
+        .filter(
+            NurseAssignment.reason == "프리셉티",
+            NurseAssignment.status == "active",
+            NurseModel.preceptor_id.is_(None),
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+    today = date.today()
+    for row in rows:
+        row.status = "cancelled"
+        if row.end_date is None:
+            row.end_date = today
+    db.commit()
+    logger.info("[Lazy] orphan 프리셉티 assignment 정리: %d건", len(rows))
+    return len(rows)
+
+
 def flush_expired_dispatches(db: Session) -> int:
     """파견 만료 자동 디엑티브 (스케줄러용).
 

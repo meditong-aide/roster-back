@@ -723,8 +723,9 @@ def bulk_update_nurses_service(
         if "work_shifts" in update_data and update_data["work_shifts"] is None:
             db_nurse.work_shifts = []
 
-        # === source 경로에서 preceptor_id 실제 변경 기록 (commit 후 동기화) ===
-        if _preceptor_field_present and db_nurse.preceptor_id != _preceptor_before:
+        # === source 경로에서 preceptor_id 필드 수신분 기록 (commit 후 동기화) ===
+        # 값 변경이 없어도 nurse_assignment 비대칭이 있을 수 있으므로 sync 호출 대상에 포함.
+        if _preceptor_field_present:
             preceptor_changes.append(
                 (db_nurse, _preceptor_before, db_nurse.preceptor_id)
             )
@@ -1175,12 +1176,9 @@ def update_nurse_profile_service(
             db.refresh(nurse)
             applied_source = True
 
-    # source 경로에서 preceptor_id 실제 변경 → nurse_assignment(reason='프리셉티') 자동 동기화
-    if (
-        applied_source
-        and _preceptor_field_present
-        and nurse.preceptor_id != _preceptor_before
-    ):
+    # source 경로에서 preceptor_id 필드를 받으면 nurse_assignment(reason='프리셉티') 자동 동기화.
+    # 값 변경이 없는 경우(둘 다 NULL 등)에도 active row 비대칭이 있으면 reconcile 한다.
+    if applied_source and _preceptor_field_present:
         try:
             _sync_preceptee_assignment(
                 db, nurse,
@@ -1337,19 +1335,18 @@ def _sync_preceptee_assignment(
 ) -> None:
     """nurses.preceptor_id 변경에 맞춰 nurse_assignment(reason='프리셉티')를 자동 동기화.
 
-    - (None → 값): 새 active 프리셉티 assignment 생성 (start=today, end=미정)
-    - (값 → None): 기존 active 프리셉티 assignment cancel
-    - (valueA → valueB): assignment row에 preceptor_id 저장 필드가 없으므로 no-op
+    - 해제 (new=None): nurses.preceptor_id가 NULL이면 active 프리셉티 row 전부 cancel.
+      이전 값이 None이었더라도 (state 비대칭 reconcile) active row가 떠있으면 정리한다.
+    - 신규 (previous=None, new=값): active row가 없으면 새로 생성.
+    - 변경 (valueA → valueB): assignment row에 preceptor_id 저장 필드가 없으므로 no-op.
     """
-    if previous_preceptor_id == new_preceptor_id:
-        return
     from schemas.roster_schema import NurseAssignmentCreate as _CreateReq
     from services.assignment_service import (
         create_assignment as _create_assignment,
         cancel_assignment as _cancel_assignment,
     )
 
-    existing = (
+    existings = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.nurse_id == nurse.nurse_id,
@@ -1357,26 +1354,30 @@ def _sync_preceptee_assignment(
             NurseAssignment.status == "active",
         )
         .order_by(NurseAssignment.start_date.desc())
-        .first()
+        .all()
     )
 
-    # (값 → None): 해제
+    # 해제: nurses.preceptor_id가 NULL인 모든 케이스에서 active row 정리.
+    # (값→None) 정상 해제 + (None→None) state reconcile 둘 다 처리.
     if new_preceptor_id is None:
-        if existing is not None:
+        for existing in existings:
             try:
                 _cancel_assignment(existing.id, db, current_user=current_user)
             except HTTPException:
                 raise
             except Exception as e:
                 logging.warning(
-                    "[preceptee_sync] cancel 실패 nurse=%s: %s",
-                    nurse.nurse_id, e,
+                    "[preceptee_sync] cancel 실패 nurse=%s id=%s: %s",
+                    nurse.nurse_id, existing.id, e,
                 )
+        return
+
+    if previous_preceptor_id == new_preceptor_id:
         return
 
     # (None → 값): 신규 생성 (이미 active면 no-op)
     if previous_preceptor_id is None:
-        if existing is not None:
+        if existings:
             return
         try:
             req = _CreateReq(
