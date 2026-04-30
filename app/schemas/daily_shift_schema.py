@@ -30,9 +30,9 @@ class DailyShiftMonthResponse(BaseModel):
 
 class DailyShiftMonthlyUpdate(BaseModel):
     """월 전체 일괄 업데이트 요청.
-    - 인자: office_id, group_id, year, month, day, evening, night, mid (+ *_max)
-    - 예시: day=4, evening=3, night=2, day_max=5, evening_max=5, night_max=4
-    - *_max 미지정(=0) 시 상한 미설정으로 처리.
+    - 인자: office_id, group_id, year, month, day, evening, night, mid (+ *_max, max_enabled)
+    - 예시: day=4, evening=3, night=2, day_max=5, evening_max=5, night_max=4, max_enabled=true
+    - max_enabled=False 시 *_max 컬럼 모두 0 으로 reset (사용자 입력 *_max 값 무시).
     """
     office_id: str
     group_id: str
@@ -46,14 +46,15 @@ class DailyShiftMonthlyUpdate(BaseModel):
     evening_max: int = Field(default=0, ge=0, description="E 최대 인원(0=상한 미설정)")
     night_max: int = Field(default=0, ge=0, description="N 최대 인원(0=상한 미설정)")
     mid_max: int = Field(default=0, ge=0, description="M 최대 인원(0=상한 미설정)")
+    max_enabled: bool = Field(default=False, description="False=*_max 사용 안 함(0 reset)")
     apply_globally: bool = True
 
 
 class DailyShiftDailyUpdate(BaseModel):
     """일자별 배열 업데이트 요청.
-    - 인자: office_id, group_id, year, month, D/E/N/M 리스트 (+ *_max)
-    - 예시: D=[1,3,3], D_max=[3,3,3]
-    - *_max 미지정 시 빈 리스트로 두면 상한 미적용으로 저장(0).
+    - 인자: office_id, group_id, year, month, D/E/N/M 리스트 (+ *_max, max_enabled)
+    - 예시: D=[1,3,3], D_max=[3,3,3], max_enabled=true
+    - max_enabled=False 시 *_max 컬럼 모두 0 으로 reset.
     """
     office_id: str
     group_id: str
@@ -67,6 +68,7 @@ class DailyShiftDailyUpdate(BaseModel):
     E_max: List[int] = Field(default_factory=list, description="E 일자별 상한(0=미설정)")
     N_max: List[int] = Field(default_factory=list, description="N 일자별 상한(0=미설정)")
     M_max: List[int] = Field(default_factory=list, description="M 일자별 상한(0=미설정)")
+    max_enabled: bool = Field(default=False, description="False=*_max 사용 안 함(0 reset)")
 
 
 class CalendarUpdateRequest(BaseModel):

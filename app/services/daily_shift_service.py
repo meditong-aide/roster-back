@@ -67,6 +67,7 @@ def _to_response(
     e_max_list = [int(getattr(r, "e_count_max", 0) or 0) for r in rows_sorted]
     n_max_list = [int(getattr(r, "n_count_max", 0) or 0) for r in rows_sorted]
     m_max_list = [int(getattr(r, "m_count_max", 0) or 0) for r in rows_sorted]
+    max_enabled = bool(getattr(rows_sorted[0], "max_enabled", False)) if rows_sorted else False
     month_summary = {
         "D_count": d_list[0] if d_list else 0,
         "E_count": e_list[0] if e_list else 0,
@@ -76,6 +77,7 @@ def _to_response(
         "E_count_max": e_max_list[0] if e_max_list else 0,
         "N_count_max": n_max_list[0] if n_max_list else 0,
         "M_count_max": m_max_list[0] if m_max_list else 0,
+        "max_enabled": max_enabled,
     }
     return {
         "office_id": office_id,
@@ -93,6 +95,7 @@ def _to_response(
             "N_count_max": n_max_list,
             "M_count_max": m_max_list,
         },
+        "max_enabled": max_enabled,
     }
 
 
@@ -156,19 +159,24 @@ def update_monthly(
     eve_max: int = 0,
     nig_max: int = 0,
     mid_max: int = 0,
+    max_enabled: bool = False,
     apply_globally: bool = True,
 ) -> Dict:
     """월 전체 일괄 업데이트를 수행합니다.
     - shift_manage 템플릿을 갱신 후 daily_shift의 해당 월 모든 날짜를 동일 값으로 저장합니다.
-    - *_max=0 은 상한 미설정. *_max>0 이면 *_count <= *_max 보장 (max < min 시 max=min 으로 clamp).
+    - max_enabled=False 이면 사용자 입력 *_max 값 무시하고 0 으로 reset (상한 미사용 모드).
+    - max_enabled=True 이면 *_max 사용 — *_max>0 시 *_count <= *_max 보장 (max < min 시 max=min 으로 clamp).
     - 예시: day=4, evening=3, night=2이면 7월 1..말일을 (4,3,2)로 설정
     """
     days = _get_month_days(year, month)
-    # max < min 방어: max 가 0보다 크고 min 보다 작으면 min 으로 clamp.
-    day_max = int(day_max) if int(day_max) <= 0 or int(day_max) >= int(day_cnt) else int(day_cnt)
-    eve_max = int(eve_max) if int(eve_max) <= 0 or int(eve_max) >= int(eve_cnt) else int(eve_cnt)
-    nig_max = int(nig_max) if int(nig_max) <= 0 or int(nig_max) >= int(nig_cnt) else int(nig_cnt)
-    mid_max = int(mid_max) if int(mid_max) <= 0 or int(mid_max) >= int(mid_cnt) else int(mid_cnt)
+    # max_enabled=False → *_max 값 강제 0; True → max < min clamp.
+    if not max_enabled:
+        day_max = eve_max = nig_max = mid_max = 0
+    else:
+        day_max = int(day_max) if int(day_max) <= 0 or int(day_max) >= int(day_cnt) else int(day_cnt)
+        eve_max = int(eve_max) if int(eve_max) <= 0 or int(eve_max) >= int(eve_cnt) else int(eve_cnt)
+        nig_max = int(nig_max) if int(nig_max) <= 0 or int(nig_max) >= int(nig_cnt) else int(nig_cnt)
+        mid_max = int(mid_max) if int(mid_max) <= 0 or int(mid_max) >= int(mid_cnt) else int(mid_cnt)
 
     if apply_globally:
         # RN, slot 1~3 업데이트
@@ -208,6 +216,7 @@ def update_monthly(
                     e_count_max=eve_max,
                     n_count_max=nig_max,
                     m_count_max=mid_max,
+                    max_enabled=max_enabled,
                 )
             )
     else:
@@ -221,6 +230,7 @@ def update_monthly(
             r.e_count_max = eve_max
             r.n_count_max = nig_max
             r.m_count_max = mid_max
+            r.max_enabled = max_enabled
 
     db.commit()
     return {"updated": True, "days_affected": days}
@@ -263,19 +273,24 @@ def update_daily(
     e_max_list: List[int] | None = None,
     n_max_list: List[int] | None = None,
     m_max_list: List[int] | None = None,
+    max_enabled: bool = False,
 ) -> Dict:
     """일자별 배열을 그대로 저장합니다.
     - 리스트 길이는 해당 월의 일수와 같아야 합니다.
-    - *_max 리스트는 선택. 빈 리스트면 0(상한 미설정)으로 채움.
-    - 예시: D=[1,3,3], E=[2,2,3], N=[2,2,2], D_max=[3,3,3]
+    - max_enabled=False 이면 *_max 입력 무시하고 0 으로 reset (상한 미사용).
+    - max_enabled=True 이면 *_max 리스트 사용; 빈 리스트면 0 채움; max < min 은 min 으로 clamp.
+    - 예시: D=[1,3,3], E=[2,2,3], N=[2,2,2], D_max=[3,3,3], max_enabled=True
     """
     days = _get_month_days(year, month)
     if not (len(d_list) == len(e_list) == len(n_list) == len(m_list) == days):
         raise ValueError("리스트 길이가 월의 일수와 다릅니다.")
-    d_max = _normalize_max_list(d_max_list or [], d_list, days)
-    e_max = _normalize_max_list(e_max_list or [], e_list, days)
-    n_max = _normalize_max_list(n_max_list or [], n_list, days)
-    m_max = _normalize_max_list(m_max_list or [], m_list, days)
+    if not max_enabled:
+        d_max = e_max = n_max = m_max = [0] * days
+    else:
+        d_max = _normalize_max_list(d_max_list or [], d_list, days)
+        e_max = _normalize_max_list(e_max_list or [], e_list, days)
+        n_max = _normalize_max_list(n_max_list or [], n_list, days)
+        m_max = _normalize_max_list(m_max_list or [], m_list, days)
 
     # 기존 행 조회
     rows = (
@@ -305,6 +320,7 @@ def update_daily(
             r.e_count_max = e_max[idx]
             r.n_count_max = n_max[idx]
             r.m_count_max = m_max[idx]
+            r.max_enabled = max_enabled
         else:
             db.add(
                 DailyShift(
@@ -321,6 +337,7 @@ def update_daily(
                     e_count_max=e_max[idx],
                     n_count_max=n_max[idx],
                     m_count_max=m_max[idx],
+                    max_enabled=max_enabled,
                 )
             )
     db.commit()
@@ -370,6 +387,7 @@ def format_shift_calendar(
     """
     rows_sorted = sorted(rows, key=lambda r: r.day)
     first_day = rows_sorted[0] if rows_sorted else None
+    max_enabled = bool(getattr(first_day, "max_enabled", False)) if first_day else False
     month_summary = {
         "D_count": first_day.d_count if first_day else 0,
         "E_count": first_day.e_count if first_day else 0,
@@ -379,6 +397,7 @@ def format_shift_calendar(
         "E_count_max": int(getattr(first_day, "e_count_max", 0) or 0) if first_day else 0,
         "N_count_max": int(getattr(first_day, "n_count_max", 0) or 0) if first_day else 0,
         "M_count_max": int(getattr(first_day, "m_count_max", 0) or 0) if first_day else 0,
+        "max_enabled": max_enabled,
     }
     daily_shifts = [
         {
@@ -391,6 +410,7 @@ def format_shift_calendar(
             "e_count_max": int(getattr(r, "e_count_max", 0) or 0),
             "n_count_max": int(getattr(r, "n_count_max", 0) or 0),
             "m_count_max": int(getattr(r, "m_count_max", 0) or 0),
+            "max_enabled": bool(getattr(r, "max_enabled", False)),
             "editable": not is_month_closed(db, office_id, group_id, year, month)  # 정확한 파라미터 전달
         }
         for r in rows_sorted

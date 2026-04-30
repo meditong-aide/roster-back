@@ -69,6 +69,7 @@ async def put_monthly(
             eve_max=body.evening_max,
             nig_max=body.night_max,
             mid_max=body.mid_max,
+            max_enabled=body.max_enabled,
             apply_globally=body.apply_globally,
         )
         return result
@@ -103,6 +104,7 @@ async def put_daily(
             e_max_list=body.E_max,
             n_max_list=body.N_max,
             m_max_list=body.M_max,
+            max_enabled=body.max_enabled,
         )
         return result
     except ValueError as ve:
@@ -173,16 +175,21 @@ async def save_calendar(
                     e_count = shift.get("e_count", 0)
                     n_count = shift.get("n_count", 0)
                     m_count = shift.get("m_count", 0)
-                    # *_count_max 미지정(=0) 은 상한 미설정. max < min 케이스는 min 으로 clamp.
+                    # max_enabled=False(default) 면 *_count_max 입력 무시하고 0 reset.
+                    # max_enabled=True 면 *_count_max 사용 (max < min 시 min 으로 clamp).
+                    max_enabled = bool(shift.get("max_enabled", False))
                     def _clamp_max(mx_raw: int, mn: int) -> int:
                         mx = int(mx_raw or 0)
                         if mx <= 0:
                             return 0
                         return mx if mx >= mn else mn
-                    d_count_max = _clamp_max(shift.get("d_count_max", 0), int(d_count or 0))
-                    e_count_max = _clamp_max(shift.get("e_count_max", 0), int(e_count or 0))
-                    n_count_max = _clamp_max(shift.get("n_count_max", 0), int(n_count or 0))
-                    m_count_max = _clamp_max(shift.get("m_count_max", 0), int(m_count or 0))
+                    if max_enabled:
+                        d_count_max = _clamp_max(shift.get("d_count_max", 0), int(d_count or 0))
+                        e_count_max = _clamp_max(shift.get("e_count_max", 0), int(e_count or 0))
+                        n_count_max = _clamp_max(shift.get("n_count_max", 0), int(n_count or 0))
+                        m_count_max = _clamp_max(shift.get("m_count_max", 0), int(m_count or 0))
+                    else:
+                        d_count_max = e_count_max = n_count_max = m_count_max = 0
 
                     existing = (
                         db.query(DailyShift)
@@ -204,6 +211,7 @@ async def save_calendar(
                         existing.e_count_max = e_count_max
                         existing.n_count_max = n_count_max
                         existing.m_count_max = m_count_max
+                        existing.max_enabled = max_enabled
                     else:
                         db.add(
                             DailyShift(
@@ -220,6 +228,7 @@ async def save_calendar(
                                 e_count_max=e_count_max,
                                 n_count_max=n_count_max,
                                 m_count_max=m_count_max,
+                                max_enabled=max_enabled,
                             )
                         )
         db.commit()
