@@ -581,6 +581,7 @@ class DailyShift(Base):
     e_count_max = Column(SMALLINT, nullable=False, default=0)
     n_count_max = Column(SMALLINT, nullable=False, default=0)
     m_count_max = Column(SMALLINT, nullable=False, default=0)
+    max_enabled = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 
