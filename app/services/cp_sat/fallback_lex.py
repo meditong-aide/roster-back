@@ -306,6 +306,14 @@ def optimize_fallback_lex_hard_first(
             preceptee_indices.add(n)
     # 프리셉티 기간 제한: assignment 기간 내에만 follow (기간 외 독립 배정)
     preceptee_follow_days: dict[int, set[int]] = getattr(roster_system, "preceptee_follow_days", {}) or {}
+    # 안전망: 월 전체 cover entry 는 default 동작(전체 월 follow)과 동등 → 솔버 hard 제약
+    # 인스턴스화 시 capacity 모순 회피를 위해 dict 에서 제거하고 default 분기로 위임한다.
+    _full_month_set_fb = set(range(roster_system.num_days))
+    _full_keys_fb = [n for n, days in preceptee_follow_days.items() if set(days) == _full_month_set_fb]
+    for n in _full_keys_fb:
+        del preceptee_follow_days[n]
+    if _full_keys_fb:
+        print(f"{logger_prefix} [Fallback] 프리셉티 전체월 follow → default 위임: solver_idx={_full_keys_fb}")
     _has_preceptee_period = bool(preceptee_follow_days)
     # dispatch(assignment) 기반 프리셉티도 인덱스에 포함
     if _has_preceptee_period:

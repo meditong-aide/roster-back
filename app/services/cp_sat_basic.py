@@ -978,15 +978,23 @@ class CPSATBasicEngine:
                     setattr(roster_system, "coverage_exclude_cells", _cov_excl_cells)
                     print(f"[Assignment][Solver] coverage_exclude_cells: {len(_cov_excl_cells)}건")
             # preceptee_period: 프리셉티 기간 (nurse_id → solver_idx 변환)
+            # 월 전체를 cover하는 entry는 default 동작(preceptor_id 기반 전체 월 follow)과
+            # 동등하면서도 솔버 hard 제약 인스턴스화 단계에서 capacity 모순을 유발하는 사례가 있어
+            # 명시 등록을 생략하고 default 분기로 위임한다. 부분 기간만 명시적으로 등록.
             _pperiod_id = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
             if _pperiod_id:
                 _id_to_idx = getattr(roster_system, '_id_to_idx', None) or {nu.db_id: i for i, nu in enumerate(nurses)}
                 _pperiod_idx: dict[int, set[int]] = {}
+                _full_month_set = set(range(roster_system.num_days))
                 for nid, days in _pperiod_id.items():
                     idx = _id_to_idx.get(str(nid))
-                    if idx is not None:
-                        _pperiod_idx[idx] = days
-                        print(f"[Assignment][Solver] preceptee_period: nurse_id={nid}, solver_idx={idx}, days={sorted(days)}")
+                    if idx is None:
+                        continue
+                    if days and set(days) == _full_month_set:
+                        print(f"[Assignment][Solver] preceptee_period 전체월→default 위임: nurse_id={nid}, solver_idx={idx}")
+                        continue
+                    _pperiod_idx[idx] = set(days)
+                    print(f"[Assignment][Solver] preceptee_period: nurse_id={nid}, solver_idx={idx}, days={sorted(days)}")
                 if _pperiod_idx:
                     setattr(roster_system, "preceptee_follow_days", _pperiod_idx)
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
@@ -2457,6 +2465,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             preceptee_indices.add(n)
     # 프리셉티 기간 제한
     preceptee_follow_days: dict[int, set[int]] = getattr(rs, "preceptee_follow_days", {}) or {}
+    # 안전망: 월 전체 cover entry 는 default 동작(전체 월 follow)과 동등 → 솔버 hard 제약
+    # 인스턴스화 시 capacity 모순 회피를 위해 dict 에서 제거하고 default 분기로 위임한다.
+    _full_month_set_pre = set(range(rs.num_days))
+    _full_keys_pre = [n for n, days in preceptee_follow_days.items() if set(days) == _full_month_set_pre]
+    for n in _full_keys_pre:
+        del preceptee_follow_days[n]
+    if _full_keys_pre:
+        print(f"[FIX] 프리셉티 전체월 follow → default 위임: solver_idx={_full_keys_pre}")
     _has_preceptee_period = bool(preceptee_follow_days)
     # dispatch(assignment) 기반 프리셉티도 인덱스에 포함
     if _has_preceptee_period:
