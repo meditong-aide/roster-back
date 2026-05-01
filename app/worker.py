@@ -163,16 +163,37 @@ def main():
 
     except Exception:
         traceback.print_exc()
+        err_msg = str(sys.exc_info()[1])
+        # service 예외로 session 트랜잭션이 깨진 상태일 수 있어 rollback 후 status 업데이트 시도
+        try:
+            db.rollback()
+        except Exception as exc_rb:
+            print(f"[worker] DB rollback 실패: {exc_rb}", file=sys.stderr)
         try:
             update_job_record(
                 db,
                 job_id,
                 status=STATUS_FAILED,
                 progress=100,
-                error_message=str(sys.exc_info()[1]),
+                error_message=err_msg,
             )
         except Exception as exc2:
-            print(f"[worker] Job 상태 업데이트 실패(FAILED): {exc2}", file=sys.stderr)
+            # 기존 session 으로 실패 → 새 session 으로 재시도 (FAILED 상태 기록 누락 방지)
+            print(f"[worker] Job 상태 업데이트 실패(FAILED): {exc2} → 새 session 으로 재시도", file=sys.stderr)
+            try:
+                db_retry = SessionLocal()
+                try:
+                    update_job_record(
+                        db_retry,
+                        job_id,
+                        status=STATUS_FAILED,
+                        progress=100,
+                        error_message=err_msg,
+                    )
+                finally:
+                    db_retry.close()
+            except Exception as exc3:
+                print(f"[worker] Job 상태 업데이트 재시도 실패(FAILED): {exc3}", file=sys.stderr)
         # update_job_status(db, job_id, "FAILED")  # 선택
         sys.exit(1)
 
