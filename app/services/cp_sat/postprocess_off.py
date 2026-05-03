@@ -498,7 +498,7 @@ def postprocess_trim_extra_offs(
 
     def grade_bonus(n_idx: int, d_idx: int, s_idx: int) -> float:
         """GRADE 전략 시 소프트 보너스(가벼운 휴리스틱)."""
-        if grade_strategy != "GRADE" or not isinstance(grade_config, dict):
+        if grade_strategy not in ("GRADE", "COMBINED") or not isinstance(grade_config, dict):
             return 0.0
         grade_val = getattr(roster_system.nurses[n_idx], "grade", None)
         try:
@@ -705,15 +705,17 @@ def postprocess_trim_extra_offs(
                     if shift_code in zero_demand_block_codes and day_required(shift_code, d_idx) == 0:
                         continue
                     score = pref_matrix[n_idx, d_idx, s_idx] if pref_matrix is not None else 0
-                    if grade_strategy == "TEAM":
+                    apply_team = grade_strategy in ("TEAM", "COMBINED")
+                    apply_grade = grade_strategy in ("GRADE", "COMBINED")
+                    if apply_team:
                         team_id = team_map.get(n_idx)
                         score += TEAM_BALANCE_POSTPROCESS_BONUS * team_shift_count(
                             d_idx, s_idx, team_id
                         )
                         move_reason = "team_balance"
-                    elif grade_strategy == "GRADE":
+                    if apply_grade:
                         score += grade_bonus(n_idx, d_idx, s_idx)
-                        move_reason = "grade_bonus"
+                        move_reason = "combined" if apply_team else "grade_bonus"
                     if best_score is None or score > best_score:
                         best_score = score
                         target_shift_idx = s_idx

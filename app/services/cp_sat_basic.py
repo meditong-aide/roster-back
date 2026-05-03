@@ -23,7 +23,7 @@ from services.cp_sat.work_shift_overrides import (
     apply_work_shift_overrides as _apply_work_shift_overrides_impl,
 )
 from services.cp_sat.postprocess_off import (
-    postprocess_rebalance_off as _postprocess_rebalance_off_impl,
+    # postprocess_rebalance_off as _postprocess_rebalance_off_impl,
     postprocess_trim_extra_offs as _postprocess_trim_extra_offs_impl,
 )
 from services.cp_sat.hardcoded_weights import (
@@ -579,17 +579,11 @@ class CPSATBasicEngine:
             preceptee_on=bool(config_data.get('preceptee_on', False)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
             use_mid=bool(config_data.get('use_mid', False)),
-            # team_balance_enable=team_balance_enable,
-            team_balance_enable=True, # test
-            team_balance_gauge=10, # test
-            # team_balance_gauge=team_balance_gauge,
-            # team_balance_weight=team_balance_weight,
-            # team_balance_weight=100, # test
-            # team_balance_top_days=team_balance_top_days,
-            team_balance_top_days=30,
-            # team_balance_top_days=30, # test
+            # team_balance_* 는 DB 의 team_balance_enable / team_balance_gauge 를 그대로 따른다.
+            # team_balance_top_days, weight 는 __post_init__ 가 gauge 로부터 자동 산출한다.
+            team_balance_enable=team_balance_enable,
+            team_balance_gauge=team_balance_gauge,
             team_balance_focus_shifts=team_balance_focus,
-            # team_balance_focus_shifts=['D', 'E', 'N'], # test
             team_balance_mode=team_balance_mode,
             team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
@@ -610,6 +604,14 @@ class CPSATBasicEngine:
             oversupply_equalize_weight=int(config_data.get('oversupply_equalize_weight', 120)),
             # 주말 휴무 제약: is_weekend_off=True인 간호사가 주말에만 휴무를 받도록 강제
             weekend_off_only_enable=bool(config_data.get('weekend_off_only_enable', True)),
+            # 팀별 최소 시프트 커버리지(팀 단위 per-team 제약)
+            team_min_by_team=config_data.get("team_min_by_team") or {},
+            team_min_soft_fallback=bool(config_data.get("team_min_soft_fallback", False)),
+            team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 500) or 0),
+            # 팀 내 인계 제한 정책(팀별)
+            team_handoff_policy_by_team=config_data.get("team_handoff_policy_by_team") or {},
+            team_handoff_soft_fallback=bool(config_data.get("team_handoff_soft_fallback", True)),
+            team_handoff_penalty_weight=int(config_data.get("team_handoff_penalty_weight", 80000) or 0),
             # use_max_coverage 폐기 → min/max 범위 모델로 전환 (daily_shift_requirements_max_by_day)
             # off_placement_mode=0,
         )
@@ -1611,10 +1613,10 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
 
-        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE 전략일 때만)
+        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE/COMBINED 전략일 때만)
         try:
             grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm == "GRADE" and grade_config:
+            if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
                 _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="solve 직후"
@@ -1622,91 +1624,91 @@ class CPSATBasicEngine:
         except Exception as e:
             print(f"{self.logger_prefix} Grade 요약 출력 중 오류: {e}")
 
-        # Grade-aware Local Repair (Phase 3)
-        try:
-            grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm == "GRADE" and grade_config:
-                from services.repairs.grade_repair import grade_local_repair
-                updated_roster, repair_log = grade_local_repair(
-                    roster_system,
-                    grade_config,
-                    max_iterations=100,
-                    max_moves_per_nurse=1,
-                )
-                roster_system.roster = updated_roster
-                # Grade Repair 이후 프리셉티 재동기화
-                _pf = bool(getattr(roster_system.config, 'preceptee_on', False))
-                if _pf and hasattr(roster_system, 'nurses'):
-                    _st = roster_system.config.shift_types
-                    _oi = _st.index('O') if 'O' in _st else None
-                    _std = {'D', 'E', 'N', 'O'}
-                    if bool(getattr(roster_system.config, 'use_mid', False)):
-                        _std.add('M')
-                    _id2i = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-                    _sc = 0
-                    _gr_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
-                    _gr_fw_restored = 0
-                    for _n, _nu in enumerate(roster_system.nurses):
-                        _pid = getattr(_nu, 'preceptor_id', None)
-                        if not _pid or _pid not in _id2i:
-                            continue
-                        _pi = _id2i[_pid]
-                        _gr_follow_set = _pp_follow_days.get(_n) if _pp_follow_days else None
-                        if _gr_follow_set is not None:
-                            for _fd in _gr_follow_set:
-                                if _fd < roster_system.num_days:
-                                    roster_system.roster[_n, _fd, :] = roster_system.roster[_pi, _fd, :]
-                        else:
-                            roster_system.roster[_n] = roster_system.roster[_pi].copy()
-                        if _oi is not None:
-                            for _d in range(roster_system.num_days):
-                                if _gr_follow_set is not None and _d not in _gr_follow_set:
-                                    continue
-                                if (_n, _d) in _gr_pte_fw:
-                                    _fw_code = _gr_pte_fw[(_n, _d)]
-                                    if _fw_code in _st:
-                                        roster_system.roster[_n, _d, :] = 0
-                                        roster_system.roster[_n, _d, _st.index(_fw_code)] = 1
-                                        _gr_fw_restored += 1
-                                        continue
-                                _need = False
-                                _orig = fixed_original_shift_map.get((_pi, _d))
-                                if _orig:
-                                    _ou2 = _orig.upper()
-                                    if _ou2 not in _std and _ou2 not in _work_sub_ids:
-                                        _need = True
-                                else:
-                                    _ia = np.where(roster_system.roster[_pi, _d] == 1)[0]
-                                    if len(_ia) > 0:
-                                        _sc2 = _st[int(_ia[0])]
-                                        if _sc2 not in _std and _sc2.upper() not in _work_sub_ids:
-                                            _need = True
-                                if _need:
-                                    roster_system.roster[_n, _d, :] = 0
-                                    roster_system.roster[_n, _d, _oi] = 1
-                        _sc += 1
-                    if _sc:
-                        _msg = f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명"
-                        if _gr_fw_restored:
-                            _msg += f", fixed_wanted 재적용: {_gr_fw_restored}건"
-                        print(_msg)
-                _log_grade_result(
-                    roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
-                )
-                # repair 로그 간단 출력
-                if repair_log:
-                    print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
-                    for r in repair_log[:10]:
-                        print(f"{self.logger_prefix} [REPAIR] {r}")
-                # repair 이후 결과로 DB 변환 갱신
-                result = self._convert_result_to_db_format(
-                    roster_system,
-                    nurses,
-                    canonical_to_shift_id=canonical_to_shift_id,
-                    fixed_original_shift_map=fixed_original_shift_map,
-                )
-        except Exception as e:
-            print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
+        # # Grade-aware Local Repair (Phase 3)
+        # try:
+        #     grade_strategy_norm = str(grade_strategy or "BASE").upper()
+        #     if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
+        #         from services.repairs.grade_repair import grade_local_repair
+        #         # updated_roster, repair_log = grade_local_repair(
+        #         #     roster_system,
+        #         #     grade_config,
+        #         #     max_iterations=100,
+        #         #     max_moves_per_nurse=1,
+        #         # )
+        #         # roster_system.roster = updated_roster
+        #         # Grade Repair 이후 프리셉티 재동기화
+        #         _pf = bool(getattr(roster_system.config, 'preceptee_on', False))
+        #         if _pf and hasattr(roster_system, 'nurses'):
+        #             _st = roster_system.config.shift_types
+        #             _oi = _st.index('O') if 'O' in _st else None
+        #             _std = {'D', 'E', 'N', 'O'}
+        #             if bool(getattr(roster_system.config, 'use_mid', False)):
+        #                 _std.add('M')
+        #             _id2i = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+        #             _sc = 0
+        #             _gr_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
+        #             _gr_fw_restored = 0
+        #             for _n, _nu in enumerate(roster_system.nurses):
+        #                 _pid = getattr(_nu, 'preceptor_id', None)
+        #                 if not _pid or _pid not in _id2i:
+        #                     continue
+        #                 _pi = _id2i[_pid]
+        #                 _gr_follow_set = _pp_follow_days.get(_n) if _pp_follow_days else None
+        #                 if _gr_follow_set is not None:
+        #                     for _fd in _gr_follow_set:
+        #                         if _fd < roster_system.num_days:
+        #                             roster_system.roster[_n, _fd, :] = roster_system.roster[_pi, _fd, :]
+        #                 else:
+        #                     roster_system.roster[_n] = roster_system.roster[_pi].copy()
+        #                 if _oi is not None:
+        #                     for _d in range(roster_system.num_days):
+        #                         if _gr_follow_set is not None and _d not in _gr_follow_set:
+        #                             continue
+        #                         if (_n, _d) in _gr_pte_fw:
+        #                             _fw_code = _gr_pte_fw[(_n, _d)]
+        #                             if _fw_code in _st:
+        #                                 roster_system.roster[_n, _d, :] = 0
+        #                                 roster_system.roster[_n, _d, _st.index(_fw_code)] = 1
+        #                                 _gr_fw_restored += 1
+        #                                 continue
+        #                         _need = False
+        #                         _orig = fixed_original_shift_map.get((_pi, _d))
+        #                         if _orig:
+        #                             _ou2 = _orig.upper()
+        #                             if _ou2 not in _std and _ou2 not in _work_sub_ids:
+        #                                 _need = True
+        #                         else:
+        #                             _ia = np.where(roster_system.roster[_pi, _d] == 1)[0]
+        #                             if len(_ia) > 0:
+        #                                 _sc2 = _st[int(_ia[0])]
+        #                                 if _sc2 not in _std and _sc2.upper() not in _work_sub_ids:
+        #                                     _need = True
+        #                         if _need:
+        #                             roster_system.roster[_n, _d, :] = 0
+        #                             roster_system.roster[_n, _d, _oi] = 1
+        #                 _sc += 1
+        #             if _sc:
+        #                 _msg = f"{self.logger_prefix} [PrecepteeSync] Grade Repair 후 프리셉티 재동기화: {_sc}명"
+        #                 if _gr_fw_restored:
+        #                     _msg += f", fixed_wanted 재적용: {_gr_fw_restored}건"
+        #                 print(_msg)
+        #         _log_grade_result(
+        #             roster_system, nurses, grade_config, self.logger_prefix, label="최종(Repair 후)"
+        #         )
+        #         # repair 로그 간단 출력
+        #         if repair_log:
+        #             print(f"{self.logger_prefix} [REPAIR SUMMARY] moves={len([r for r in repair_log if 'before_short' in r])}, failures={len([r for r in repair_log if r.get('reason')])}")
+        #             for r in repair_log[:10]:
+        #                 print(f"{self.logger_prefix} [REPAIR] {r}")
+        #         # repair 이후 결과로 DB 변환 갱신
+        #         result = self._convert_result_to_db_format(
+        #             roster_system,
+        #             nurses,
+        #             canonical_to_shift_id=canonical_to_shift_id,
+        #             fixed_original_shift_map=fixed_original_shift_map,
+        #         )
+        # except Exception as e:
+        #     print(f"{self.logger_prefix} Grade Repair 중 오류: {e}")
 
         # nurse별 work_shifts에 맞춰 최종 근무 코드를 대체한다.
         result = self._apply_work_shift_overrides(
@@ -2026,7 +2028,7 @@ class CPSATBasicEngine:
             add_preceptor_terms_fn=_add_preceptor_objective_terms,
             add_team_balance_terms_fn=add_team_balance_objective_terms,
             add_grade_constraints_fn=add_grade_constraints,
-            postprocess_rebalance_off_fn=self._postprocess_rebalance_off,
+            postprocess_rebalance_off_fn=(lambda *_args, **_kwargs: None),
             blocked_by_nurse=getattr(roster_system, 'blocked_by_nurse', None),
         )
 
@@ -2068,7 +2070,8 @@ class CPSATBasicEngine:
                         if solver.Value(X(n,d,s)): rs.roster[n,d,s]=1
             log_n_even_distribution(rs, self.logger_prefix, join=j, leave=leave_phys)
         except Exception as e:
-            print(f"[ERR] _quick_initial_solve:", e)
+            import traceback
+            print(f"[ERR] _quick_initial_solve: {e}\n{traceback.format_exc()}")
             return False
         return True
     
@@ -2100,31 +2103,31 @@ class CPSATBasicEngine:
             shift_definitions=shift_definitions,
         )
 
-    def _postprocess_rebalance_off(
-        self,
-        roster_system: RosterSystem,
-        max_attempts: int = 30,
-    ) -> None:
-        """(호환) 후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다."""
-        _postprocess_rebalance_off_impl(
-            roster_system=roster_system,
-            logger_prefix=self.logger_prefix,
-            max_attempts=max_attempts,
-        )
+    # def _postprocess_rebalance_off(
+    #     self,
+    #     roster_system: RosterSystem,
+    #     max_attempts: int = 30,
+    # ) -> None:
+    #     """(호환) 후처리로 불필요한 O를 당겨와 연속근무 위반을 완화합니다."""
+    #     _postprocess_rebalance_off_impl(
+    #         roster_system=roster_system,
+    #         logger_prefix=self.logger_prefix,
+    #         max_attempts=max_attempts,
+    #     )
 
-    def _postprocess_trim_extra_offs(
-        self,
-        roster_system: RosterSystem,
-        max_changes: int = 80,
-        prefer_shortage: bool = True,
-    ) -> int:
-        """(호환) 필수/강제 OFF를 보존하면서 불필요한 OFF를 근무로 교체한다."""
-        return _postprocess_trim_extra_offs_impl(
-            roster_system=roster_system,
-            logger_prefix=self.logger_prefix,
-            max_changes=max_changes,
-            prefer_shortage=prefer_shortage,
-        )
+    # def _postprocess_trim_extra_offs(
+    #     self,
+    #     roster_system: RosterSystem,
+    #     max_changes: int = 80,
+    #     prefer_shortage: bool = True,
+    # ) -> int:
+    #     """(호환) 필수/강제 OFF를 보존하면서 불필요한 OFF를 근무로 교체한다."""
+    #     return _postprocess_trim_extra_offs_impl(
+    #         roster_system=roster_system,
+    #         logger_prefix=self.logger_prefix,
+    #         max_changes=max_changes,
+    #         prefer_shortage=prefer_shortage,
+    #     )
 
     def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
         """최종 근무표를 간호사별로 출력합니다.
@@ -2321,6 +2324,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             D_phys,
             D - 1,
         )
+    # TEMP-PROBE-DELETE: join/leave/blocked 확정 시점의 grade hard blocker 진단
+    _log_grade_hard_blocker_probe(rs, join, leave, blocked_by_nurse)
     # 고정 셀 (수간호사 등)
     code2main = {
         str(c).strip().upper(): str(r["main_code"]).strip().upper()
@@ -3944,6 +3949,163 @@ def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dic
         print(f"[CP-SAT-Basic][Diag][N-Capacity] 분석 실패: {exc}")
 
 
+# TEMP-PROBE-DELETE-START
+def _log_grade_hard_blocker_probe(
+    rs,
+    join: list[int],
+    leave: list[int],
+    blocked_by_nurse: Optional[dict[int, set[int]]],
+) -> None:
+    """임시 프로브: grade hard 제약의 첫 일자/교대 충돌 후보를 로깅한다.
+
+    삭제 가이드:
+      - TEMP-PROBE-DELETE-START ~ TEMP-PROBE-DELETE-END 전체 삭제
+      - _build_full_model 내 호출부(TEMP-PROBE-DELETE 태그)도 함께 삭제
+    """
+    try:
+        gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        gc = getattr(rs, "grade_config", None) or {}
+        allow_soft = bool((gc or {}).get("allow_soft_fallback", False))
+        if gs not in ("GRADE", "COMBINED") or allow_soft:
+            return
+
+        min_map = (gc.get("constraints_json") or gc.get("constraints") or {})
+        max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+        if not isinstance(min_map, dict) or not isinstance(max_map, dict):
+            return
+        if not min_map and not max_map:
+            return
+
+        cfg = rs.config
+        shift_types = set(str(s).upper() for s in (getattr(cfg, "shift_types", []) or []))
+        day_reqs = getattr(cfg, "daily_shift_requirements_by_day", None)
+        base_reqs = getattr(cfg, "daily_shift_requirements", {}) or {}
+
+        constrained_grades: set[int] = set()
+        for mp in (min_map, max_map):
+            for by_g in (mp or {}).values():
+                if not isinstance(by_g, dict):
+                    continue
+                for gk in by_g.keys():
+                    try:
+                        constrained_grades.add(int(gk))
+                    except Exception:
+                        continue
+        if not constrained_grades:
+            return
+
+        def _req(day_idx: int, s_code: str) -> int:
+            if isinstance(day_reqs, list) and day_idx < len(day_reqs) and isinstance(day_reqs[day_idx], dict):
+                return int((day_reqs[day_idx] or {}).get(s_code, 0) or 0)
+            return int((base_reqs or {}).get(s_code, 0) or 0)
+
+        block = blocked_by_nurse or {}
+        keys = sorted(set([str(k).upper() for k in list(min_map.keys()) + list(max_map.keys())]))
+        for d in range(rs.num_days):
+            for s_code in keys:
+                if shift_types and s_code not in shift_types:
+                    continue
+                req = _req(d, s_code)
+                if req <= 0:
+                    continue
+
+                active_total = 0
+                active_by_grade = defaultdict(int)
+                active_unconstrained = 0
+                for n_idx, nurse in enumerate(rs.nurses):
+                    if not (join[n_idx] <= d <= leave[n_idx]):
+                        continue
+                    if d in (block.get(n_idx, set()) if block else set()):
+                        continue
+                    if s_code in {"D", "E"} and bool(getattr(nurse, "is_night_nurse", 0) == 3):
+                        continue
+                    active_total += 1
+                    try:
+                        gi = int(getattr(nurse, "grade", None))
+                    except Exception:
+                        gi = None
+                    if gi in constrained_grades:
+                        active_by_grade[gi] += 1
+                    else:
+                        active_unconstrained += 1
+
+                if active_total < req:
+                    msg = (
+                        f"[ACTIVE_SHORTAGE] day={d+1} shift={s_code} active={active_total} req={req}"
+                    )
+                    print(
+                        "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                        f"{msg}"
+                    )
+                    setattr(rs, "_grade_hard_probe_msg", msg)
+                    return
+
+                min_by_g = (min_map.get(s_code) or {}) if isinstance(min_map.get(s_code), dict) else {}
+                min_sum = 0
+                for gk, tv in min_by_g.items():
+                    try:
+                        gi = int(gk)
+                        t = int(tv or 0)
+                    except Exception:
+                        continue
+                    if t <= 0:
+                        continue
+                    avail = int(active_by_grade.get(gi, 0))
+                    if avail < t:
+                        msg = (
+                            f"[MIN_BLOCK] day={d+1} shift={s_code} grade={gi} need={t} avail={avail} req={req}"
+                        )
+                        print(
+                            "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                            f"{msg}"
+                        )
+                        setattr(rs, "_grade_hard_probe_msg", msg)
+                        return
+                    min_sum += t
+                if min_sum > req:
+                    msg = f"[MIN_OVER_NEED] day={d+1} shift={s_code} min_sum={min_sum} req={req}"
+                    print(
+                        "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                        f"{msg}"
+                    )
+                    setattr(rs, "_grade_hard_probe_msg", msg)
+                    return
+
+                max_by_g = (max_map.get(s_code) or {}) if isinstance(max_map.get(s_code), dict) else {}
+                if max_by_g:
+                    capped = active_unconstrained
+                    max_keys = {str(k) for k in max_by_g.keys()}
+                    for gk, uv in max_by_g.items():
+                        try:
+                            gi = int(gk)
+                            u = int(uv)
+                        except Exception:
+                            continue
+                        if u < 0:
+                            continue
+                        capped += min(int(active_by_grade.get(gi, 0)), u)
+                    for gi in constrained_grades:
+                        if str(gi) not in max_keys:
+                            capped += int(active_by_grade.get(gi, 0))
+                    if capped < req:
+                        msg = (
+                            f"[MAX_CAP_SHORTAGE] day={d+1} shift={s_code} cap={capped} req={req} "
+                            f"unconstrained={active_unconstrained} by_grade={dict(active_by_grade)}"
+                        )
+                        print(
+                            "[CP-SAT-Basic][Diag][GradeHardProbe] "
+                            f"{msg}"
+                        )
+                        setattr(rs, "_grade_hard_probe_msg", msg)
+                        return
+        print("[CP-SAT-Basic][Diag][GradeHardProbe] blocker not detected in fast probe")
+        setattr(rs, "_grade_hard_probe_msg", None)
+    except Exception as exc:
+        print(f"[CP-SAT-Basic][Diag][GradeHardProbe] probe failed: {exc}")
+        setattr(rs, "_grade_hard_probe_msg", f"[PROBE_ERROR] {exc}")
+# TEMP-PROBE-DELETE-END
+
+
 def _log_shift_requirement_gaps(rs) -> None:
     try:
         cfg = rs.config
@@ -4086,6 +4248,8 @@ def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_pre
                     return gi
             except Exception:
                 pass
+        if null_policy == "EXCLUDE":
+            return None
         if null_policy == "AVERAGE":
             return avg_grade if avg_grade in grade_values else max(grade_values)
         if null_policy == "RANDOM":
@@ -4109,6 +4273,8 @@ def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_pre
                 # roster는 one-hot
                 if int(rs.roster[n_idx, d, s_idx]) == 1:
                     g = nurse_grades[n_idx]
+                    if g is None:
+                        continue
                     assigned_by_grade[g] = assigned_by_grade.get(g, 0) + 1
             # 요구치
             req_by_grade = {}
@@ -4188,6 +4354,8 @@ def _log_grade_result(
                     return gi
             except Exception:
                 pass
+        if null_policy == "EXCLUDE":
+            return None
         if null_policy == "AVERAGE":
             return avg_grade if avg_grade in grade_values else max(grade_values)
         if null_policy == "RANDOM":
@@ -4252,6 +4420,8 @@ def _log_grade_result(
             for n_idx in range(len(nurses)):
                 if int(rs.roster[n_idx, d, s_idx]) == 1:
                     g = nurse_grades[n_idx]
+                    if g is None:
+                        continue
                     total_assigned_by_grade[g] = total_assigned_by_grade.get(g, 0) + 1
 
     print(f"{logger_prefix} --- Grade별 목표 대비 배치 현황 ---")
