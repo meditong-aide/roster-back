@@ -55,6 +55,10 @@ def add_team_min_constraints(
 ) -> list:
     obj_terms: list = []
     cfg = rs.config
+    _impact_modes = getattr(rs, "_constraint_impact_constraint_modes", None)
+    if _impact_modes is None:
+        _impact_modes = []
+        setattr(rs, "_constraint_impact_constraint_modes", _impact_modes)
 
     gs = str(grade_strategy or "BASE").upper()
     if gs not in ("TEAM", "COMBINED"):
@@ -104,6 +108,15 @@ def add_team_min_constraints(
                 if upper < min_t and not allow_soft:
                     # 하드 모드에서 데이터 부족으로 강제 불가 → 스킵(INFEASIBLE 방지)
                     skipped_capacity.append((tid, d, code, upper, min_t))
+                    _impact_modes.append({
+                        "family": "team_min",
+                        "key": f"team_min:{tid}:{d}:{code}",
+                        "configured_mode": "hard",
+                        "effective_mode": "skipped_by_capacity",
+                        "source_file": "app/services/constraints/team_constraints.py",
+                        "reason": "active team members < min_t in hard mode",
+                        "evidence": {"team_id": tid, "day": d + 1, "shift": code, "active": upper, "min_t": min_t},
+                    })
                     continue
                 vars_sum = sum(X(n, d, s_idx) for n in active)
                 if allow_soft:
@@ -111,8 +124,26 @@ def add_team_min_constraints(
                     m.Add(vars_sum + slack >= min_t)
                     if penalty_weight > 0:
                         obj_terms.append(-penalty_weight * slack)
+                    _impact_modes.append({
+                        "family": "team_min",
+                        "key": f"team_min:{tid}:{d}:{code}",
+                        "configured_mode": "soft",
+                        "effective_mode": "soft_fallback",
+                        "source_file": "app/services/constraints/team_constraints.py",
+                        "reason": "team_min soft fallback active",
+                        "evidence": {"team_id": tid, "day": d + 1, "shift": code, "min_t": min_t},
+                    })
                 else:
                     m.Add(vars_sum >= min_t)
+                    _impact_modes.append({
+                        "family": "team_min",
+                        "key": f"team_min:{tid}:{d}:{code}",
+                        "configured_mode": "hard",
+                        "effective_mode": "enforced",
+                        "source_file": "app/services/constraints/team_constraints.py",
+                        "reason": "team_min hard constraint added",
+                        "evidence": {"team_id": tid, "day": d + 1, "shift": code, "min_t": min_t},
+                    })
                 added_cnt += 1
 
     mode = "soft" if allow_soft else "hard"

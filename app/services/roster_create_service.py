@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 import re
+import time
+from copy import deepcopy
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
@@ -1648,6 +1650,43 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
     return latest.schedule_id if latest else None
 
 
+def _query_schedule_ref_for_month(db: Session, group_id: str, year: int, month: int) -> tuple[str | None, str]:
+    """특정 그룹의 해당 월 참조 schedule과 선택 기준을 함께 반환한다.
+
+    Returns:
+        (schedule_id | None, basis)
+        basis in {'issued', 'latest', 'blank'}
+    """
+    issued = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.status == "issued",
+            Schedule.dropped == False,
+        )
+        .order_by(Schedule.version.desc())
+        .first()
+    )
+    if issued:
+        return issued.schedule_id, "issued"
+    latest = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.dropped == False,
+        )
+        .order_by(Schedule.version.desc())
+        .first()
+    )
+    if latest:
+        return latest.schedule_id, "latest"
+    return None, "blank"
+
+
 def _get_boundary_tail(
     db: Session, schedule_id: str, nurse_id: str,
     boundary_day: int, lookback: int, code2main: dict,
@@ -2726,6 +2765,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         base=cross_month_constraints,
         extra=allowed_constraints,
     )
+    preflight_alerts = []
     try:
         checker_module = __import__(
             "services.cp_sat.feasibility_alerts",
@@ -2733,13 +2773,13 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
         checker_fn = getattr(checker_module, "run_preflight_feasibility_alerts", None)
         if callable(checker_fn):
-            checker_fn(
+            preflight_alerts = checker_fn(
                 nurses_in_group=nurses_in_group,
                 config_dict=config_dict,
                 year=req.year,
                 month=req.month,
                 logger_prefix="[PreflightFeasibility]",
-            )
+            ) or []
     except Exception as precheck_exc:
         print(f"[PreflightFeasibility] checker failed: {precheck_exc}")
     mid_feasibility_error = _validate_mid_hard_feasibility(
@@ -2817,6 +2857,61 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         print(f"error: {e}")
         raise
     if isinstance(cp_sat_result, dict) and "roster" in cp_sat_result:
+        try:
+            _rs = cp_sat_result.get("roster_system")
+            if _rs is not None:
+                setattr(_rs, "_constraint_impact_preflight_alerts", list(preflight_alerts or []))
+                setattr(_rs, "_constraint_impact_mid_feasibility_error", mid_feasibility_error)
+                setattr(_rs, "_constraint_impact_merged_initial_constraints", deepcopy(config_dict.get("initial_constraints") or {}))
+                setattr(_rs, "_constraint_impact_special_fixed_requests", deepcopy(config_dict.get("special_fixed_requests") or []))
+                setattr(
+                    _rs,
+                    "_constraint_impact_assignment_windows",
+                    _build_constraint_impact_assignment_windows(
+                        _assignments,
+                        current_user.group_id,
+                        date(req.year, req.month, 1),
+                        calendar.monthrange(req.year, req.month)[1],
+                    ),
+                )
+                setattr(
+                    _rs,
+                    "_constraint_impact_carryover_artifacts",
+                    _build_constraint_impact_carryover_artifacts(
+                        db,
+                        _inbound_assignments,
+                        _outbound_assignments,
+                        req.year,
+                        req.month,
+                    ),
+                )
+                setattr(
+                    _rs,
+                    "_constraint_impact_attempt_meta",
+                    {
+                        "attempt_index": 1 if bool(config_dict.get("_force_grade_max_soft_fallback")) else 0,
+                        "label": "grade_max_retry" if bool(config_dict.get("_force_grade_max_soft_fallback")) else "primary",
+                        "forced_grade_soft_fallback": bool(config_dict.get("_force_grade_max_soft_fallback")),
+                        "config_flags": {
+                            "preceptee_on": bool(config_dict.get("preceptee_on", False)),
+                            "preceptee_shift_count": bool(config_dict.get("preceptee_shift_count", True)),
+                            "use_mid": bool(config_dict.get("use_mid", False)),
+                            "off_first": bool(config_dict.get("off_first", False)),
+                            "weekend_off_only_enable": bool(config_dict.get("weekend_off_only_enable", True)),
+                            "team_min_soft_fallback": bool(config_dict.get("team_min_soft_fallback", False)),
+                            "team_handoff_soft_fallback": bool(config_dict.get("team_handoff_soft_fallback", True)),
+                            "grade_allow_soft_fallback": bool((engine_grade_config or {}).get("allow_soft_fallback", False)) if isinstance(engine_grade_config, dict) else False,
+                            "two_offs_after_two_nig": bool(config_dict.get("two_offs_after_two_nig", False)),
+                            "two_offs_after_three_nig": bool(config_dict.get("two_offs_after_three_nig", False)),
+                            "not_one_night": bool(config_dict.get("not_one_night", False)),
+                            "ban_n_to_d": bool(config_dict.get("ban_n_to_d", True)),
+                            "ban_e_to_d": bool(config_dict.get("ban_e_to_d", True)),
+                            "ban_n_to_e": bool(config_dict.get("ban_n_to_e", True)),
+                        },
+                    },
+                )
+        except Exception as _snapshot_exc:
+            print(f"[ConstraintImpact] roster_system metadata attach failed: {_snapshot_exc}")
         return (
             cp_sat_result["roster"],
             cp_sat_result.get("satisfaction_data", {}),
@@ -3564,6 +3659,235 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
             nurse_entry["source_group_id"] = getattr(nurse, 'group_id', None)
         roster_data["nurses"].append(nurse_entry)
     return roster_data
+
+
+def _build_constraint_impact_payload(roster_system, req) -> dict:
+    """생성 완료된 roster_system 기준 constraint-impact 요약을 생성한다."""
+    started = time.perf_counter()
+    try:
+        from services.constraint_impact import (
+            analyze_current_roster,
+            build_current_atoms_from_roster_system,
+            build_semantics_snapshot_from_roster_system,
+        )
+
+        snapshot = build_semantics_snapshot_from_roster_system(
+            roster_system,
+            year=req.year,
+            month=req.month,
+        )
+        atoms = build_current_atoms_from_roster_system(snapshot, roster_system)
+        analysis = analyze_current_roster(snapshot=snapshot, current_atoms=atoms)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "enabled": True,
+            "timing_ms": elapsed_ms,
+            "valid_under_current_semantics": analysis.valid_under_current_semantics,
+            "atom_count": analysis.atom_count,
+            "fixed_atom_count": analysis.fixed_atom_count,
+            "preceptee_atom_count": analysis.preceptee_atom_count,
+            "coverage_excluded_atom_count": analysis.coverage_excluded_atom_count,
+            "hard_violation_count": analysis.hard_violation_count,
+            "risky_constraint_count": analysis.risky_constraint_count,
+            "constraint_mode_summary": analysis.constraint_mode_summary,
+            "preflight_alerts": analysis.preflight_alerts,
+            "violated_constraints": [
+                {
+                    "node_id": v.node_id,
+                    "slack": v.slack,
+                    "pressure": v.pressure,
+                    "details": v.details,
+                }
+                for v in analysis.violated_constraints[:50]
+            ],
+            "risky_constraints": [
+                {
+                    "node_id": v.node_id,
+                    "slack": v.slack,
+                    "pressure": v.pressure,
+                    "details": v.details,
+                }
+                for v in analysis.risky_constraints[:50]
+            ],
+            "snapshot_meta": {
+                "attempt_label": snapshot.attempt.label,
+                "attempt_index": snapshot.attempt.attempt_index,
+                "forced_grade_soft_fallback": snapshot.attempt.forced_grade_soft_fallback,
+                "nurse_count": len(snapshot.nurses),
+                "fixed_cell_count": len(snapshot.fixed_cells),
+                "preceptee_count": len(snapshot.preceptee_facts),
+            },
+        }
+    except Exception as e:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "enabled": False,
+            "timing_ms": elapsed_ms,
+            "error": str(e),
+        }
+
+
+def _build_constraint_impact_assignment_windows(assignments, target_group_id: str, month_start: date, days_in_month: int) -> list[dict]:
+    month_end = month_start + timedelta(days=days_in_month - 1)
+    rows: list[dict] = []
+    for a in assignments or []:
+        nurse_id = str(getattr(a, "nurse_id", "") or "")
+        if not nurse_id:
+            continue
+        reason = str(getattr(a, "reason", "") or "assignment")
+        source_gid = getattr(a, "source_group_id", None)
+        target_gid = getattr(a, "target_group_id", None)
+        start = getattr(a, "start_date", None)
+        if start is None:
+            continue
+        if reason == "병동이동":
+            end = getattr(a, "expected_end_date", None) or month_end
+        else:
+            end = getattr(a, "end_date", None) or getattr(a, "expected_end_date", None) or month_end
+        overlap_start = max(start, month_start)
+        overlap_end = min(end, month_end)
+        active_days = set()
+        if overlap_start <= overlap_end:
+            active_days = {int((overlap_start - month_start).days + i) for i in range((overlap_end - overlap_start).days + 1)}
+        all_days = set(range(days_in_month))
+        direction = "inbound" if target_gid == target_group_id and source_gid != target_group_id else "outbound"
+        if reason == "병동이동":
+            direction = "transfer"
+        if reason in ("휴직", "퇴사"):
+            direction = "leave"
+        if reason == "교육":
+            direction = "training"
+        rows.append(
+            {
+                "nurse_id": nurse_id,
+                "direction": direction,
+                "source_group_id": source_gid,
+                "target_group_id": target_gid,
+                "reason": reason,
+                "active_day_indices": sorted(active_days),
+                "inactive_day_indices": sorted(all_days - active_days),
+                "allowed_shift_codes": list(getattr(a, "target_shift_types", None) or []),
+                "carries_state": direction in {"inbound", "transfer", "training"},
+                "counts_to_coverage": True,
+                "metadata": {
+                    "start_date": str(start),
+                    "end_date": str(end) if end is not None else None,
+                },
+            }
+        )
+    return rows
+
+
+def _build_constraint_impact_carryover_artifacts(
+    db: Session,
+    inbound_assignments: list,
+    outbound_assignments: list,
+    year: int,
+    month: int,
+) -> list[dict]:
+    """현재 파견/복귀 정책과 동일한 schedule 선택 우선순위로 carryover artifact를 생성한다.
+
+    정책:
+    - 참조 schedule 선택: issued > latest > blank
+    - inbound: source 병동 기준
+    - outbound 복귀: target 병동 기준
+    - tail metrics는 기존 mid-month boundary 계산과 동일 helper 사용
+    """
+    month_start = date(year, month, 1)
+    lookback = 6
+    rows: list[dict] = []
+
+    def _group_code2main(group_id: str | None) -> dict:
+        if not group_id:
+            return {}
+        out: dict[str, str] = {}
+        try:
+            shifts = db.query(Shift).filter(Shift.group_id == group_id).all()
+            _GB = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
+            for s in shifts:
+                sid = str(getattr(s, "shift_id", "") or "").strip().upper()
+                if not sid:
+                    continue
+                sgb = str(getattr(s, "shift_gb", "") or "").strip()
+                if sgb in _GB:
+                    out[sid] = _GB[sgb]
+                    continue
+                ds = str(getattr(s, "default_shift", "") or "").strip().upper()
+                if ds in ("OFF", "주"):
+                    ds = "O"
+                if ds in ("D", "E", "N", "M", "O"):
+                    out[sid] = ds
+        except Exception:
+            return {}
+        return out
+
+    def _append_artifact(*, nurse_id: str, direction: str, boundary_day_index: int, reference_group_id: str | None, schedule_id: str | None, basis: str, tail: list[str], carries_state: bool, metadata: dict):
+        rows.append(
+            {
+                "nurse_id": nurse_id,
+                "direction": direction,
+                "boundary_day_index": boundary_day_index,
+                "reference_group_id": reference_group_id,
+                "selected_schedule_id": schedule_id,
+                "selected_schedule_basis": basis,
+                "carries_state": carries_state,
+                "tail_sequence": list(tail or []),
+                "metrics": _calc_tail_metrics(tail) if tail else {},
+                "metadata": metadata,
+            }
+        )
+
+    for a in inbound_assignments or []:
+        nurse_id = str(a.nurse_id)
+        boundary_day = (a.start_date - month_start).days
+        if boundary_day <= 0:
+            continue
+        schedule_id, basis = _query_schedule_ref_for_month(db, a.source_group_id, year, month)
+        tail = _get_boundary_tail(db, schedule_id, nurse_id, boundary_day, lookback, _group_code2main(a.source_group_id)) if schedule_id else []
+        _append_artifact(
+            nurse_id=nurse_id,
+            direction="inbound" if a.reason != "병동이동" else "transfer",
+            boundary_day_index=boundary_day,
+            reference_group_id=a.source_group_id,
+            schedule_id=schedule_id,
+            basis=basis,
+            tail=tail,
+            carries_state=True,
+            metadata={
+                "reason": a.reason,
+                "start_date": str(a.start_date),
+                "expected_end_date": str(getattr(a, "expected_end_date", None)) if getattr(a, "expected_end_date", None) else None,
+            },
+        )
+
+    for a in outbound_assignments or []:
+        nurse_id = str(a.nurse_id)
+        a_end = a.end_date or a.expected_end_date
+        if not a_end:
+            continue
+        if a_end.year != year or a_end.month != month:
+            continue
+        return_day = (a_end - month_start).days + 1
+        if return_day <= 0:
+            continue
+        schedule_id, basis = _query_schedule_ref_for_month(db, a.target_group_id, year, month)
+        tail = _get_boundary_tail(db, schedule_id, nurse_id, return_day, lookback, _group_code2main(a.target_group_id)) if schedule_id else []
+        _append_artifact(
+            nurse_id=nurse_id,
+            direction="outbound" if a.reason != "병동이동" else "transfer",
+            boundary_day_index=return_day,
+            reference_group_id=a.target_group_id,
+            schedule_id=schedule_id,
+            basis=basis,
+            tail=tail,
+            carries_state=True,
+            metadata={
+                "reason": a.reason,
+                "return_date": str(a_end + timedelta(days=1)),
+            },
+        )
+
+    return rows
 
 
 def _normalize_shift_id_for_save(raw_shift: str, valid_shift_ids: set[str]) -> str:
@@ -4820,6 +5144,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
     roster_data["weekly_off_conflicts"] = weekly_off_conflicts
     roster_data["weekly_off_warnings"] = weekly_off_warnings
+    roster_data["constraint_impact"] = _build_constraint_impact_payload(roster_system, req)
 
     # ── assignment 대상자 근무표 생성 알림 (S09) ──
     try:

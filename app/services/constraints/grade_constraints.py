@@ -31,12 +31,34 @@ def add_grade_constraints(
     """
     print('grade_strategy', grade_strategy)
     print('grade_config', grade_config)
+    _impact_modes = getattr(rs, "_constraint_impact_constraint_modes", None)
+    if _impact_modes is None:
+        _impact_modes = []
+        setattr(rs, "_constraint_impact_constraint_modes", _impact_modes)
     if str(grade_strategy or "").upper() not in ("GRADE", "COMBINED"):
         return []
     if grade_config is None:
         return []
 
     constraints_map, max_constraints_map, policy, scaling = _parse_grade_config(grade_config)
+    _impact_modes.append({
+        "family": "grade_min",
+        "key": "grade_min:global",
+        "configured_mode": "soft" if scaling["allow_soft_fallback"] else "hard",
+        "effective_mode": "soft_fallback" if scaling["allow_soft_fallback"] else "enforced",
+        "source_file": "app/services/constraints/grade_constraints.py",
+        "reason": "grade constraints active",
+        "evidence": {"strategy": str(grade_strategy or "").upper()},
+    })
+    _impact_modes.append({
+        "family": "grade_max",
+        "key": "grade_max:global",
+        "configured_mode": "soft" if scaling["allow_soft_fallback"] else "hard",
+        "effective_mode": "soft_fallback" if scaling["allow_soft_fallback"] else "enforced",
+        "source_file": "app/services/constraints/grade_constraints.py",
+        "reason": "grade constraints active",
+        "evidence": {"strategy": str(grade_strategy or "").upper()},
+    })
     print('constraints_map', constraints_map)
     print('max_constraints_map', max_constraints_map)
     grade_values = _extract_grade_values_from_constraints(constraints_map, max_constraints_map)

@@ -2458,6 +2458,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             return 0
         return X(n, d, off_idx_full)
     active_days = build_active_days(N, join, leave, blocked_by_nurse)
+    try:
+        rs._constraint_impact_join = list(join)
+        rs._constraint_impact_leave = list(leave)
+        rs._constraint_impact_active_days = {int(n): set(days) for n, days in (active_days or {}).items()}
+        rs._constraint_impact_fixed_wanted_cells = set(fixed_wanted_cells)
+        rs._constraint_impact_fixed_type_by_cell = dict(fixed_type_by_cell)
+        rs._constraint_impact_vacation_off_cells = set(vacation_off_cells)
+        rs._constraint_impact_structural_off_cells = set(structural_off_cells)
+        rs._constraint_impact_forced_off_cap_excluded = set(forced_off_cap_excluded)
+        rs._constraint_impact_weekend_days = set(weekend_days)
+        rs._constraint_impact_n_forbid_n = set(n_forbid_n)
+    except Exception:
+        pass
     isolated_off_slacks: list = []
 
     # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
