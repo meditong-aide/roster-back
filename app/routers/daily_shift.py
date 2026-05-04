@@ -8,6 +8,7 @@ from schemas.daily_shift_schema import DailyShiftReplace
 from services.daily_shift_service import (
     get_or_init_month,
     replace_month_data,
+    apply_bulk_to_days,
 )
 
 router = APIRouter(prefix="/daily-shift", tags=["daily-shift"])
@@ -49,6 +50,19 @@ async def put_month(
     if not current_user:
         raise HTTPException(status_code=401, detail="인증 필요")
     try:
+        bulk = body.month_summary.model_dump() if body.month_summary is not None else None
+        if body.apply_summary_to_days:
+            return apply_bulk_to_days(
+                db,
+                office_id=body.office_id,
+                group_id=body.group_id,
+                year=body.year,
+                month=body.month,
+                bulk=bulk,
+                apply_globally=body.apply_globally,
+            )
+        if body.date is None:
+            raise HTTPException(status_code=400, detail="apply_summary_to_days=False 시 date 필드는 필수입니다.")
         d_list = body.date.D_count
         m_list = body.date.M_count if body.date.M_count else [0] * len(d_list)
         return replace_month_data(
@@ -67,7 +81,10 @@ async def put_month(
             m_max_list=body.date.M_count_max,
             max_enabled=body.max_enabled,
             apply_globally=body.apply_globally,
+            bulk=bulk,
         )
+    except HTTPException:
+        raise
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
