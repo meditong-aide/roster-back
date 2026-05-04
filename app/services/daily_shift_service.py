@@ -259,6 +259,28 @@ def _normalize_max_list(max_list: List[int], min_list: List[int], days: int) -> 
     return out
 
 
+def _sync_shift_manage_template(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    day_cnt: int,
+    eve_cnt: int,
+    nig_cnt: int,
+    mid_cnt: int,
+) -> None:
+    """shift_manage 의 RN 슬롯(1:D, 2:E, 3:N, 5:M)을 주어진 값으로 동기화.
+    - 인자: 4개 슬롯에 적용할 manpower 스칼라값
+    - 반환 없음 (commit 은 호출자 책임)
+    """
+    for slot, value in [(1, day_cnt), (2, eve_cnt), (3, nig_cnt), (5, mid_cnt)]:
+        db.query(ShiftManage).filter(
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == group_id,
+            ShiftManage.nurse_class == 'RN',
+            ShiftManage.shift_slot == slot,
+        ).update({ShiftManage.manpower: int(value)})
+
+
 def update_daily(
     db: Session,
     office_id: str,
@@ -342,6 +364,58 @@ def update_daily(
             )
     db.commit()
     return {"updated": True, "days_affected": days}
+
+
+def replace_month_data(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    d_list: List[int],
+    e_list: List[int],
+    n_list: List[int],
+    m_list: List[int],
+    d_max_list: List[int] | None = None,
+    e_max_list: List[int] | None = None,
+    n_max_list: List[int] | None = None,
+    m_max_list: List[int] | None = None,
+    max_enabled: bool = False,
+    apply_globally: bool = False,
+) -> Dict:
+    """월 데이터를 일자별 배열로 일괄 교체합니다 (PUT /daily-shift 진입점).
+    - 일자별 upsert 는 update_daily 에 위임.
+    - apply_globally=True 면 day=1 값을 기준으로 shift_manage 템플릿(RN 1/2/3/5) 동기화.
+    - 반환: GET /daily-shift 와 동일 형태(저장 직후 재조회).
+    """
+    update_daily(
+        db,
+        office_id=office_id,
+        group_id=group_id,
+        year=year,
+        month=month,
+        d_list=d_list,
+        e_list=e_list,
+        n_list=n_list,
+        m_list=m_list,
+        d_max_list=d_max_list,
+        e_max_list=e_max_list,
+        n_max_list=n_max_list,
+        m_max_list=m_max_list,
+        max_enabled=max_enabled,
+    )
+    if apply_globally and d_list:
+        _sync_shift_manage_template(
+            db,
+            office_id,
+            group_id,
+            int(d_list[0]),
+            int(e_list[0]),
+            int(n_list[0]),
+            int(m_list[0]) if m_list else 0,
+        )
+        db.commit()
+    return get_or_init_month(db, office_id, group_id, year, month)
 
 
 # Daily-Shift 작업

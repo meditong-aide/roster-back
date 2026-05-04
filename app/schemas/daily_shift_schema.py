@@ -1,5 +1,37 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict
+from typing import List, Dict, Optional
+
+
+class DailyShiftDateArrays(BaseModel):
+    """일자별 인원·상한 배열. 길이는 해당 월의 일수와 동일해야 합니다.
+    - 인자: D_count/E_count/N_count/M_count + *_count_max(선택)
+    - 빈 리스트는 update_daily 내부에서 0 패딩 처리됨.
+    """
+    D_count: List[int]
+    E_count: List[int]
+    N_count: List[int]
+    M_count: List[int] = Field(default_factory=list, description="M 배열(빈 리스트 → 0 패딩)")
+    D_count_max: List[int] = Field(default_factory=list, description="D 일자별 상한(0=미설정)")
+    E_count_max: List[int] = Field(default_factory=list, description="E 일자별 상한(0=미설정)")
+    N_count_max: List[int] = Field(default_factory=list, description="N 일자별 상한(0=미설정)")
+    M_count_max: List[int] = Field(default_factory=list, description="M 일자별 상한(0=미설정)")
+
+
+class DailyShiftReplace(BaseModel):
+    """월 데이터 일괄 교체 요청 (PUT /daily-shift).
+    - body 모양은 GET /daily-shift 응답과 동형이며, 저장 권위는 date 배열이다.
+    - month_summary 는 round-trip 편의로 수용하나 저장에는 사용하지 않는다.
+    - apply_globally=True 시 shift_manage 템플릿(RN 슬롯 1/2/3/5)을 day=1 값으로 동기화한다.
+    - max_enabled=False 시 *_count_max 입력은 모두 0 으로 reset.
+    """
+    office_id: str
+    group_id: str
+    year: int
+    month: int
+    date: DailyShiftDateArrays
+    max_enabled: bool = Field(default=False, description="False=*_max 0 reset")
+    apply_globally: bool = Field(default=False, description="True=shift_manage 템플릿 day=1 값으로 동기화")
+    month_summary: Optional[Dict[str, int]] = Field(default=None, description="GET 응답 round-trip 수용용(저장에 사용 안 함)")
 
 
 class DailyShiftMonthQuery(BaseModel):
