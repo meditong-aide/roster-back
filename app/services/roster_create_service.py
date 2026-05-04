@@ -2206,9 +2206,9 @@ def build_mid_month_boundary_constraints(
         if boundary_day <= 0:
             continue  # 월초 시작 = cross-month constraints가 처리
 
-        src_sid = _query_schedule_id_for_month(db, a.source_group_id, year, month)
+        src_sid, src_basis = _query_schedule_ref_for_month(db, a.source_group_id, year, month)
         if not src_sid:
-            print(f"[MidMonth] nurse={nurse_id}: source({a.source_group_id}) 근무표 없음, window 생략")
+            print(f"[MidMonth] nurse={nurse_id}: source({a.source_group_id}) 근무표 없음(basis={src_basis}), window 생략")
             continue
 
         # source 그룹의 Shift 기반 code2main 빌드 (target과 shift 코드 체계가 다를 수 있음)
@@ -2247,44 +2247,26 @@ def build_mid_month_boundary_constraints(
         print(f"[MidMonth] nurse={nurse_id}: boundary=day{bd}, tail=[{tail_str}], "
               f"cons_work={cons_work}, cons_n={cons_n}, last={last_shift}")
 
-        # (a) 연속 근무 K → 경계일 OFF 강제
-        if K and cons_work >= K:
-            forced_off[nurse_id].append(bd)
-            print(f"[MidMonth] nurse={nurse_id}: cons_work={cons_work}≥K={K} → day{bd} OFF 강제")
-
-        # (a-1) off window: 경계일부터 K-w일 내 OFF ≥ 1
-        if K > 0 and cons_work > 0:
-            window_end = bd + max(0, K - cons_work)
-            window_end = min(window_end, days_in_month - 1)
-            if window_end >= bd:
-                off_window_constraints[nurse_id].append([bd, window_end])
-                print(f"[MidMonth] nurse={nurse_id}: off_window [{bd},{window_end}]")
-
-        # (b) N tail → forced OFF
-        two_eff2 = two_after_two if (L and cons_n >= L) else False
-        two_eff3 = two_after_three if (L and cons_n >= L) else False
-        req_offs = 0
-        if two_eff3 and cons_n >= 3:
-            req_offs = 2
-        elif two_eff2 and cons_n >= 2:
-            req_offs = 2
-        rem = max(0, req_offs - offs_after)
-        for i in range(min(2, rem)):
-            forced_off[nurse_id].append(bd + i)
-        if rem > 0:
-            print(f"[MidMonth] nurse={nurse_id}: N tail={cons_n} → day{bd}..{bd+rem-1} OFF 강제")
-
-        # (c) 전환 금지
-        if last_shift == 'E' and ban_e_to_d:
-            forbidden[nurse_id][bd].append('D')
-        if last_shift == 'N' and ban_n_to_d:
-            forbidden[nurse_id][bd].append('D')
-        if last_shift == 'N' and ban_n_to_e:
-            forbidden[nurse_id][bd].append('E')
-
-        # (d) N 상한
-        if L and cons_n >= L and offs_after == 0:
-            forbidden[nurse_id][bd].append('N')
+        compiled = _compile_boundary_overlap_constraints(
+            nurse_id=nurse_id,
+            boundary_day=bd,
+            days_in_month=days_in_month,
+            cons_work=cons_work,
+            cons_n=cons_n,
+            last_shift=last_shift,
+            offs_after=offs_after,
+            K=K,
+            L=L,
+            two_after_two=two_after_two,
+            two_after_three=two_after_three,
+            ban_e_to_d=ban_e_to_d,
+            ban_n_to_d=ban_n_to_d,
+            ban_n_to_e=ban_n_to_e,
+        )
+        forced_off[nurse_id].extend(compiled['forced_off'])
+        for d, codes in compiled['forbidden'].items():
+            forbidden[nurse_id][d].extend(codes)
+        off_window_constraints[nurse_id].extend(compiled['off_window_constraints'])
 
     # ── 아웃바운드 복귀: target group 근무표 tail → 복귀일 제약 ──
     for a in (outbound_assignments or []):
@@ -2298,9 +2280,9 @@ def build_mid_month_boundary_constraints(
         if return_day >= days_in_month or return_day <= 0:
             continue  # 월 범위 밖
 
-        tgt_sid = _query_schedule_id_for_month(db, a.target_group_id, year, month)
+        tgt_sid, tgt_basis = _query_schedule_ref_for_month(db, a.target_group_id, year, month)
         if not tgt_sid:
-            print(f"[MidMonth][Return] nurse={nurse_id}: target({a.target_group_id}) 근무표 없음, window 생략")
+            print(f"[MidMonth][Return] nurse={nurse_id}: target({a.target_group_id}) 근무표 없음(basis={tgt_basis}), window 생략")
             continue
 
         # target 그룹의 Shift 기반 code2main 빌드 (source와 shift 코드 체계가 다를 수 있음)
@@ -2339,44 +2321,26 @@ def build_mid_month_boundary_constraints(
         print(f"[MidMonth][Return] nurse={nurse_id}: return=day{rd}, tail=[{tail_str}], "
               f"cons_work={cons_work}, cons_n={cons_n}, last={last_shift}")
 
-        # (a) 연속 근무 K → 복귀일 OFF 강제
-        if K and cons_work >= K:
-            forced_off[nurse_id].append(rd)
-            print(f"[MidMonth][Return] nurse={nurse_id}: cons_work={cons_work}≥K={K} → day{rd} OFF 강제")
-
-        # (a-1) off window
-        if K > 0 and cons_work > 0:
-            window_end = rd + max(0, K - cons_work)
-            window_end = min(window_end, days_in_month - 1)
-            if window_end >= rd:
-                off_window_constraints[nurse_id].append([rd, window_end])
-                print(f"[MidMonth][Return] nurse={nurse_id}: off_window [{rd},{window_end}]")
-
-        # (b) N tail → forced OFF
-        two_eff2 = two_after_two if (L and cons_n >= L) else False
-        two_eff3 = two_after_three if (L and cons_n >= L) else False
-        req_offs = 0
-        if two_eff3 and cons_n >= 3:
-            req_offs = 2
-        elif two_eff2 and cons_n >= 2:
-            req_offs = 2
-        rem = max(0, req_offs - offs_after)
-        for i in range(min(2, rem)):
-            forced_off[nurse_id].append(rd + i)
-        if rem > 0:
-            print(f"[MidMonth][Return] nurse={nurse_id}: N tail={cons_n} → day{rd}..{rd+rem-1} OFF 강제")
-
-        # (c) 전환 금지
-        if last_shift == 'E' and ban_e_to_d:
-            forbidden[nurse_id][rd].append('D')
-        if last_shift == 'N' and ban_n_to_d:
-            forbidden[nurse_id][rd].append('D')
-        if last_shift == 'N' and ban_n_to_e:
-            forbidden[nurse_id][rd].append('E')
-
-        # (d) N 상한
-        if L and cons_n >= L and offs_after == 0:
-            forbidden[nurse_id][rd].append('N')
+        compiled = _compile_boundary_overlap_constraints(
+            nurse_id=nurse_id,
+            boundary_day=rd,
+            days_in_month=days_in_month,
+            cons_work=cons_work,
+            cons_n=cons_n,
+            last_shift=last_shift,
+            offs_after=offs_after,
+            K=K,
+            L=L,
+            two_after_two=two_after_two,
+            two_after_three=two_after_three,
+            ban_e_to_d=ban_e_to_d,
+            ban_n_to_d=ban_n_to_d,
+            ban_n_to_e=ban_n_to_e,
+        )
+        forced_off[nurse_id].extend(compiled['forced_off'])
+        for d, codes in compiled['forbidden'].items():
+            forbidden[nurse_id][d].extend(codes)
+        off_window_constraints[nurse_id].extend(compiled['off_window_constraints'])
 
     forced_off_final = {k: sorted(set(v)) for k, v in forced_off.items()}
     forbidden_final = {k: {d: sorted(set(ss)) for d, ss in v.items()} for k, v in forbidden.items()}
@@ -3888,6 +3852,62 @@ def _build_constraint_impact_carryover_artifacts(
         )
 
     return rows
+
+
+def _compile_boundary_overlap_constraints(
+    *,
+    nurse_id: str,
+    boundary_day: int,
+    days_in_month: int,
+    cons_work: int,
+    cons_n: int,
+    last_shift: str | None,
+    offs_after: int,
+    K: int,
+    L: int,
+    two_after_two: bool,
+    two_after_three: bool,
+    ban_e_to_d: bool,
+    ban_n_to_d: bool,
+    ban_n_to_e: bool,
+) -> dict:
+    forced_off: list[int] = []
+    forbidden: dict[int, list[str]] = defaultdict(list)
+    off_window_constraints: list[list[int]] = []
+
+    if K and cons_work >= K:
+        forced_off.append(boundary_day)
+
+    if K > 0 and cons_work > 0:
+        window_end = boundary_day + max(0, K - cons_work)
+        window_end = min(window_end, days_in_month - 1)
+        if window_end >= boundary_day:
+            off_window_constraints.append([boundary_day, window_end])
+
+    req_offs = 0
+    if two_after_three and L and cons_n >= 3:
+        req_offs = 2
+    elif two_after_two and L and cons_n >= 2:
+        req_offs = 2
+    rem = max(0, req_offs - offs_after)
+    for i in range(min(2, rem)):
+        if boundary_day + i < days_in_month:
+            forced_off.append(boundary_day + i)
+
+    if last_shift == 'E' and ban_e_to_d:
+        forbidden[boundary_day].append('D')
+    if last_shift == 'N' and ban_n_to_d:
+        forbidden[boundary_day].append('D')
+    if last_shift == 'N' and ban_n_to_e:
+        forbidden[boundary_day].append('E')
+    if L and cons_n >= L and offs_after == 0:
+        forbidden[boundary_day].append('N')
+
+    return {
+        'forced_off': sorted(set(forced_off)),
+        'forbidden': {d: sorted(set(v)) for d, v in forbidden.items()},
+        'off_window_constraints': off_window_constraints,
+    }
 
 
 def _normalize_shift_id_for_save(raw_shift: str, valid_shift_ids: set[str]) -> str:
