@@ -16,6 +16,7 @@ from sqlalchemy import create_engine, func, event, Integer
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.mysql import TINYINT
+from sqlalchemy.pool import StaticPool
 
 # ── Add app/ to path FIRST so 'db' package is findable ──────────
 APP_DIR = Path(__file__).resolve().parent.parent / "app"
@@ -33,13 +34,18 @@ def _compile_tinyint_sqlite(type_, compiler, **kw):
     return "INTEGER"
 
 _TestBase = declarative_base()
-_test_engine = create_engine("sqlite:///:memory:")
+_test_engine = create_engine(
+    "sqlite:///:memory:",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
 
 _fake_client2 = types.ModuleType("db.client2")
 _fake_client2.Base = _TestBase
 _fake_client2.engine = _test_engine
 _fake_client2.SessionLocal = sessionmaker(bind=_test_engine)
 _fake_client2.get_db = lambda: None
+_fake_client2.msdb_manager = None
 
 # Register the fake client2 in sys.modules.
 # The real 'db' package directory exists at app/db/, so Python will find
