@@ -73,16 +73,21 @@ def test_monthly_limits_upsert_and_list_round_trip(api):
     }
     put_resp = api.put("/nurses/monthly-limits", json=payload)
     assert put_resp.status_code == 200, put_resp.text
-    items = put_resp.json()["items"]
+    body = put_resp.json()
+    items = body["items"]
     assert len(items) == 1
     assert items[0]["d_min"] == 3 and items[0]["d_max"] == 3 and items[0]["d_exact"] == 3
     assert items[0]["n_min"] == 2 and items[0]["n_max"] == 2 and items[0]["n_exact"] == 2
+    assert body["meta"]["target_nurse_count"] == 1
+    assert body["meta"]["active_nurse_count"] == 6
 
     get_resp = api.get("/nurses/monthly-limits", params={"year": 2026, "month": 5})
     assert get_resp.status_code == 200, get_resp.text
-    got = get_resp.json()["items"]
+    got_body = get_resp.json()
+    got = got_body["items"]
     assert len(got) == 1
     assert got[0]["nurse_id"] == "N001"
+    assert got_body["meta"]["target_nurse_count"] == 1
 
 
 def test_monthly_limits_reject_exact_sum_over_capacity(api):
@@ -105,3 +110,111 @@ def test_monthly_limits_reject_exact_sum_over_capacity(api):
     resp = api.put("/nurses/monthly-limits", json=payload)
     assert resp.status_code == 400, resp.text
     assert "exact 합" in resp.json().get("detail", "")
+
+
+def test_monthly_limits_warn_when_override_ratio_exceeds_30_percent(api):
+    payload = {
+        "year": 2026,
+        "month": 5,
+        "limits": [
+            {
+                "nurse_id": "N001",
+                "group_id": "GRP001",
+                "year": 2026,
+                "month": 5,
+                "o_exact": 8,
+            },
+            {
+                "nurse_id": "N002",
+                "group_id": "GRP001",
+                "year": 2026,
+                "month": 5,
+                "o_exact": 8,
+            },
+        ],
+    }
+    resp = api.put("/nurses/monthly-limits", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["meta"]["target_nurse_count"] == 2
+    assert body["meta"]["active_nurse_count"] == 6
+    warnings = body.get("warnings") or []
+    assert any(w.get("code") == "OVERRIDE_RATIO_EXCEEDED" for w in warnings)
+
+
+def test_monthly_limits_delete_row_when_all_bounds_are_null(api):
+    create_payload = {
+        "year": 2026,
+        "month": 5,
+        "limits": [
+            {
+                "nurse_id": "N001",
+                "group_id": "GRP001",
+                "year": 2026,
+                "month": 5,
+                "o_exact": 8,
+            }
+        ],
+    }
+    create_resp = api.put("/nurses/monthly-limits", json=create_payload)
+    assert create_resp.status_code == 200, create_resp.text
+    assert len(create_resp.json()["items"]) == 1
+
+    clear_payload = {
+        "year": 2026,
+        "month": 5,
+        "limits": [
+            {
+                "nurse_id": "N001",
+                "group_id": "GRP001",
+                "year": 2026,
+                "month": 5,
+                "d_min": None,
+                "d_max": None,
+                "d_exact": None,
+                "e_min": None,
+                "e_max": None,
+                "e_exact": None,
+                "n_min": None,
+                "n_max": None,
+                "n_exact": None,
+                "o_min": None,
+                "o_max": None,
+                "o_exact": None,
+            }
+        ],
+    }
+    clear_resp = api.put("/nurses/monthly-limits", json=clear_payload)
+    assert clear_resp.status_code == 200, clear_resp.text
+    assert clear_resp.json()["items"] == []
+
+
+def test_monthly_limits_get_forbidden_for_other_group(api):
+    resp = api.get("/nurses/monthly-limits", params={"year": 2026, "month": 5, "group_id": "GRP999"})
+    assert resp.status_code == 403, resp.text
+
+
+def test_monthly_limits_reject_duplicate_scope_in_single_request(api):
+    payload = {
+        "year": 2026,
+        "month": 5,
+        "limits": [
+            {
+                "nurse_id": "N001",
+                "group_id": "GRP001",
+                "year": 2026,
+                "month": 5,
+                "d_exact": 10,
+            },
+            {
+                "nurse_id": "N001",
+                "group_id": "GRP001",
+                "year": 2026,
+                "month": 5,
+                "e_exact": 10,
+            },
+        ],
+    }
+    resp = api.put("/nurses/monthly-limits", json=payload)
+    assert resp.status_code == 400, resp.text
+    assert "중복" in resp.json().get("detail", "")

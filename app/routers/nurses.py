@@ -107,7 +107,8 @@ async def get_monthly_limits(
         month=month,
         group_id=group_id,
     )
-    return NurseMonthlyLimitListResponse(items=items)
+    _items, _meta, _warnings = items
+    return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
 
 
 @router.put("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
@@ -123,7 +124,8 @@ async def put_monthly_limits(
         month=body.month,
         limits=[x.model_dump() for x in body.limits],
     )
-    return NurseMonthlyLimitListResponse(items=items)
+    _items, _meta, _warnings = items
+    return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
 
 
 def _ensure_office_exists(
@@ -1141,4 +1143,3 @@ async def delete_nurse(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")
-

@@ -613,8 +613,23 @@ class NurseMonthlyLimitBulkUpsertRequest(BaseModel):
     limits: List[NurseMonthlyLimitItem]
 
 
+class NurseMonthlyLimitWarning(BaseModel):
+    code: str
+    message: str
+    severity: str = "warning"
+
+
+class NurseMonthlyLimitMeta(BaseModel):
+    target_nurse_count: int
+    active_nurse_count: int
+    override_ratio: float
+    recommended_ratio: float = 0.30
+
+
 class NurseMonthlyLimitListResponse(BaseModel):
     items: List[NurseMonthlyLimitItem]
+    meta: Optional[NurseMonthlyLimitMeta] = None
+    warnings: Optional[List[NurseMonthlyLimitWarning]] = None
 
 
 class PasswordChangeRequest(BaseModel):

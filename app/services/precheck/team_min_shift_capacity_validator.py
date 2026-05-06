@@ -1,4 +1,4 @@
-"""팀 min_shift 저장 전 인원 수 모순만 검증하는 validator.
+"""팀 min_shift 저장 전 모순을 검증하는 validator.
 
 검증 범위 (HARD only, 무거운 capacity 분석은 일절 안 함):
   1) 팀에 배정된 인원이 0명인데 일일 최소 인원 합 > 0
@@ -6,16 +6,19 @@
   2) 팀 인원이 일일 최소 인원 합보다 적음 (모두가 한 날 동시에 일해도 불가)
        → TEAM_ACTIVE_LT_DAY_MIN_SUM
 
-OffCap, cross-month, weekend OFF, vacation, allowed_shifts 등 동적/분포 요소는 일절 보지 않는다.
+추가 검증:
+  3) 월별 개인 제한(특히 OFF exact/min) 기준으로 팀의 월 총 필요량이 불가능
+       → TEAM_MONTHLY_CAPACITY_LT_MIN_TOTAL
 """
 
 from __future__ import annotations
 
+from calendar import monthrange
 from typing import Any, Iterable
 
 from sqlalchemy.orm import Session
 
-from db.models import Nurse, Team
+from db.models import Nurse, NurseMonthlyLimit, Team
 
 
 SHIFT_NAMES = {
@@ -189,6 +192,67 @@ def validate_team_min_shift_capacity(
                 "details": details,
             }
         )
+
+    # 3) 월별 개인 제한(OFF exact/min) 기반 월 총량 검증
+    if eligible and day_min_sum > 0:
+        nurse_ids = [_normalize_id(getattr(n, "nurse_id", "")) for n in eligible]
+        nurse_ids = [x for x in nurse_ids if x]
+        if nurse_ids:
+            rows = (
+                db.query(NurseMonthlyLimit)
+                .filter(
+                    NurseMonthlyLimit.group_id == group_id,
+                    NurseMonthlyLimit.nurse_id.in_(nurse_ids),
+                )
+                .all()
+            )
+            by_month: dict[tuple[int, int], dict[str, NurseMonthlyLimit]] = {}
+            for r in rows:
+                ym = (int(r.year), int(r.month))
+                by_month.setdefault(ym, {})[str(r.nurse_id)] = r
+
+            for (yy, mm), per_nurse in sorted(by_month.items()):
+                days_in_month = monthrange(int(yy), int(mm))[1]
+                required_total = int(day_min_sum) * int(days_in_month)
+                max_workable_total = 0
+                for nid in nurse_ids:
+                    rec = per_nurse.get(nid)
+                    if rec is None:
+                        max_workable_total += days_in_month
+                        continue
+                    off_floor = 0
+                    if rec.o_exact is not None:
+                        off_floor = int(rec.o_exact)
+                    elif rec.o_min is not None:
+                        off_floor = int(rec.o_min)
+                    max_workable_total += max(0, days_in_month - off_floor)
+
+                if max_workable_total < required_total:
+                    issues.append(
+                        {
+                            "severity": "hard",
+                            "code": "TEAM_MONTHLY_CAPACITY_LT_MIN_TOTAL",
+                            "title": "월별 개인 제한으로 팀 최소 인원을 채울 수 없어요",
+                            "message": (
+                                f"{team_name}팀 {yy}-{mm:02d} 기준 월 총 필요량({required_total})이 "
+                                f"팀 월 최대 근무 가능량({max_workable_total})을 초과해요."
+                            ),
+                            "suggestion": (
+                                "팀 min_shift를 낮추거나, 개인 OFF exact/min 제한을 완화하거나, "
+                                "팀 인원을 조정해 주세요."
+                            ),
+                            "details": {
+                                "팀": team_name,
+                                "year": yy,
+                                "month": mm,
+                                "days_in_month": days_in_month,
+                                "일일 최소 인원 합": day_min_sum,
+                                "월 총 필요량": required_total,
+                                "팀 월 최대 근무 가능량": max_workable_total,
+                                "대상 인원 수": len(nurse_ids),
+                            },
+                        }
+                    )
 
     saveable = not any(i.get("severity") == "hard" for i in issues)
     return {"saveable": saveable, "issues": issues}
