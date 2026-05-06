@@ -51,7 +51,7 @@ from db.models import (  # noqa: E402
     Office, Group, Team, Nurse, Shift,
     Schedule, ScheduleEntry, RosterConfig, RosterJob,
     Wanted, WantedRequest, NurseShiftRequest, NursePairRequest, FixedWantedEntry,
-    IssuedRoster, ShiftManage, RosterGradeConfig,
+    IssuedRoster, ShiftManage, RosterGradeConfig, NurseMonthlyLimit, NurseAssignment,
 )
 
 
@@ -76,6 +76,7 @@ _REQUIRED_TABLES = [
     Wanted.__table__, WantedRequest.__table__, NurseShiftRequest.__table__,
     NursePairRequest.__table__,
     FixedWantedEntry.__table__, ShiftManage.__table__, IssuedRoster.__table__,
+    NurseMonthlyLimit.__table__, NurseAssignment.__table__,
 ]
 
 

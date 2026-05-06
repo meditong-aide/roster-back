@@ -43,6 +43,7 @@ from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
 from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
 from services.day_windows import build_blocked_days
+from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_by_nurse
 from services.cp_sat.mid_feasibility import validate_mid_hard_feasibility as _validate_mid_hard_feasibility_impl
 
 logger = logging.getLogger(__name__)
@@ -4312,6 +4313,25 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         -int(getattr(n, "experience", 0) or 0),
         str(getattr(n, "nurse_id", "")),
     ))
+
+    # 월별 개인 shift/off 제한 오버레이 적용 (group/year/month scope)
+    try:
+        _limit_map = fetch_effective_monthly_limits_by_nurse(
+            db=db,
+            year=req.year,
+            month=req.month,
+            nurse_ids=[str(n.nurse_id) for n in engine_nurses],
+            group_id=str(current_user.group_id),
+        )
+        for _n in engine_nurses:
+            _lim = _limit_map.get(str(_n.nurse_id))
+            if not _lim:
+                continue
+            for _k, _v in _lim.items():
+                _n.__dict__[_k] = _v
+    except Exception as _e:
+        print(f"[MonthlyLimits] 오버레이 실패(무시): {_e}")
+
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day = _build_shift_manage_and_requirements(

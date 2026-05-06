@@ -768,6 +768,18 @@ class CPSATBasicEngine:
                 'resignation_date': _to_date(nurse_data.get('resignation_date')),
                 'team_id': nurse_data.get('team_id'),
                 'preceptor_id': nurse_data.get('preceptor_id'),
+                'd_min': nurse_data.get('d_min'),
+                'd_max': nurse_data.get('d_max'),
+                'd_exact': nurse_data.get('d_exact'),
+                'e_min': nurse_data.get('e_min'),
+                'e_max': nurse_data.get('e_max'),
+                'e_exact': nurse_data.get('e_exact'),
+                'n_min': nurse_data.get('n_min'),
+                'n_max': nurse_data.get('n_max'),
+                'n_exact': nurse_data.get('n_exact'),
+                'o_min': nurse_data.get('o_min'),
+                'o_max': nurse_data.get('o_max'),
+                'o_exact': nurse_data.get('o_exact'),
             }
 
             nurses.append(Nurse(**nurse_dict))
@@ -3363,6 +3375,33 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     sum(X(n, d, night) for d in phys_range_night)
                     <= cfg.max_night_shifts_per_month
                 )
+
+            # 월별 개인 shift/off 제한 (effective monthly limits)
+            phys_range_month = month_total_day_range(T0, T1, D_phys)
+            if phys_range_month:
+                def _norm_bounds(_min_v, _max_v, _exact_v):
+                    if _exact_v is not None:
+                        vv = int(_exact_v)
+                        return vv, vv
+                    mn = int(_min_v) if _min_v is not None else None
+                    mx = int(_max_v) if _max_v is not None else None
+                    return mn, mx
+
+                _bound_specs = [
+                    (day, getattr(nu, "d_min", None), getattr(nu, "d_max", None), getattr(nu, "d_exact", None), "D"),
+                    (eve, getattr(nu, "e_min", None), getattr(nu, "e_max", None), getattr(nu, "e_exact", None), "E"),
+                    (night, getattr(nu, "n_min", None), getattr(nu, "n_max", None), getattr(nu, "n_exact", None), "N"),
+                    (off, getattr(nu, "o_min", None), getattr(nu, "o_max", None), getattr(nu, "o_exact", None), "O"),
+                ]
+                for _code_idx, _mn_raw, _mx_raw, _ex_raw, _label in _bound_specs:
+                    _mn, _mx = _norm_bounds(_mn_raw, _mx_raw, _ex_raw)
+                    if _mn is None and _mx is None:
+                        continue
+                    _sumv = sum(X(n, d, _code_idx) for d in phys_range_month)
+                    if _mn is not None:
+                        m.Add(_sumv >= _mn)
+                    if _mx is not None:
+                        m.Add(_sumv <= _mx)
 
         # 월 최소/최대 OFF (당월 D_phys만 합산)
         # max coverage가 설정된 경우: min/max coverage 기반으로 OFF cap 자동 조정

@@ -584,6 +584,39 @@ class NurseProfileUpdate(BaseModel):
     )
 
 
+class NurseMonthlyLimitItem(BaseModel):
+    nurse_id: str
+    group_id: str
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+
+    d_min: Optional[int] = Field(default=None, ge=0)
+    d_max: Optional[int] = Field(default=None, ge=0)
+    d_exact: Optional[int] = Field(default=None, ge=0)
+
+    e_min: Optional[int] = Field(default=None, ge=0)
+    e_max: Optional[int] = Field(default=None, ge=0)
+    e_exact: Optional[int] = Field(default=None, ge=0)
+
+    n_min: Optional[int] = Field(default=None, ge=0)
+    n_max: Optional[int] = Field(default=None, ge=0)
+    n_exact: Optional[int] = Field(default=None, ge=0)
+
+    o_min: Optional[int] = Field(default=None, ge=0)
+    o_max: Optional[int] = Field(default=None, ge=0)
+    o_exact: Optional[int] = Field(default=None, ge=0)
+
+
+class NurseMonthlyLimitBulkUpsertRequest(BaseModel):
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+    limits: List[NurseMonthlyLimitItem]
+
+
+class NurseMonthlyLimitListResponse(BaseModel):
+    items: List[NurseMonthlyLimitItem]
+
+
 class PasswordChangeRequest(BaseModel):
     """비밀번호 변경 요청 (SMS 인증 후 사용)"""
 

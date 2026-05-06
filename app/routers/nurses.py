@@ -34,6 +34,8 @@ from schemas.roster_schema import (
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
     NurseAssignmentListResponse,
+    NurseMonthlyLimitBulkUpsertRequest,
+    NurseMonthlyLimitListResponse,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -65,6 +67,10 @@ from services.nurse_service import (
     get_profile_image_url,
     update_nurse_profile_service,
 )
+from services.nurse_monthly_limit_service import (
+    list_nurse_monthly_limits_service,
+    upsert_nurse_monthly_limits_service,
+)
 from services.excel_service import (
     create_nurse_template,
     # process_excel_upload,
@@ -84,6 +90,40 @@ from utils.utils import set_sms
 
 
 router = APIRouter(prefix="/nurses", tags=["nurses"])
+
+
+@router.get("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
+async def get_monthly_limits(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    items = list_nurse_monthly_limits_service(
+        db=db,
+        current_user=current_user,
+        year=year,
+        month=month,
+        group_id=group_id,
+    )
+    return NurseMonthlyLimitListResponse(items=items)
+
+
+@router.put("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
+async def put_monthly_limits(
+    body: NurseMonthlyLimitBulkUpsertRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    items = upsert_nurse_monthly_limits_service(
+        db=db,
+        current_user=current_user,
+        year=body.year,
+        month=body.month,
+        limits=[x.model_dump() for x in body.limits],
+    )
+    return NurseMonthlyLimitListResponse(items=items)
 
 
 def _ensure_office_exists(
@@ -1101,5 +1141,4 @@ async def delete_nurse(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")
-
 
