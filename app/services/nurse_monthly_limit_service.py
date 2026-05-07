@@ -242,9 +242,25 @@ def upsert_nurse_monthly_limits_service(
         normalized.append(row)
 
     # cross-group consistency / capacity checks per nurse-month
+    from services.precheck.monthly_limit_validator import (
+        validate_monthly_limit_row,
+        build_validation_payload,
+    )
+
     by_nurse: Dict[str, List[Dict[str, Any]]] = {}
     for r in normalized:
         by_nurse.setdefault(str(r["nurse_id"]), []).append(r)
+
+    issues_all: List[Dict[str, Any]] = []
+
+    def _push_issue(code: str, nurse_id: str, nurse_name: Optional[str], evidence: Dict[str, Any], msg: str, fixes: List[str]):
+        issues_all.append({
+            "reason_code": code,
+            "severity": "blocking",
+            "evidence": {**{"nurse_id": nurse_id}, **({"nurse_name": nurse_name} if nurse_name else {}), **evidence},
+            "human_message_ko": msg,
+            "fix_suggestions_ko": fixes,
+        })
 
     for nurse_id, rows in by_nurse.items():
         nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
@@ -276,6 +292,7 @@ def upsert_nurse_monthly_limits_service(
 
         days_in_month = monthrange(year, month)[1]
         total_active_est = 0
+        nurse_name = getattr(nurse, "name", None)
         for rr in merged_rows:
             inbound = str(rr.get("group_id")) != str(nurse.group_id)
             cap_days = _group_active_capacity_days(
@@ -287,23 +304,32 @@ def upsert_nurse_monthly_limits_service(
                 inbound=inbound,
             )
             total_active_est += cap_days
+
+            # 새 산술 모순 검사 (nurse 특성 + 강제 OFF + sum coverage 등)
+            issues_all.extend(
+                validate_monthly_limit_row(
+                    row=rr, nurse=nurse, cap_days=cap_days, year=year, month=month,
+                )
+            )
+
+            # 기존 검사: 그룹별 sum
             exact_sum = _sum_exact_required(rr)
             if exact_sum > cap_days:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"{nurse_id} / group {rr.get('group_id')} 설정 불가: "
-                        f"exact 합({exact_sum}) > 그룹 가용일({cap_days})"
-                    ),
+                _push_issue(
+                    "MONTHLY_LIMIT_GROUP_EXACT_SUM_EXCEEDS",
+                    nurse_id, nurse_name,
+                    {"group_id": rr.get("group_id"), "exact_sum": exact_sum, "cap_days": cap_days},
+                    f"그룹 {rr.get('group_id')}의 exact 합({exact_sum})이 그룹 가용일 {cap_days}일을 초과합니다.",
+                    [f"exact 합을 {cap_days} 이하로 설정하세요."],
                 )
             min_sum = _sum_min_required(rr)
             if min_sum > cap_days:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"{nurse_id} / group {rr.get('group_id')} 설정 불가: "
-                        f"min 합({min_sum}) > 그룹 가용일({cap_days})"
-                    ),
+                _push_issue(
+                    "MONTHLY_LIMIT_GROUP_MIN_SUM_EXCEEDS",
+                    nurse_id, nurse_name,
+                    {"group_id": rr.get("group_id"), "min_sum": min_sum, "cap_days": cap_days},
+                    f"그룹 {rr.get('group_id')}의 min 합({min_sum})이 그룹 가용일 {cap_days}일을 초과합니다.",
+                    [f"min 합을 {cap_days} 이하로 설정하세요."],
                 )
 
         # 월 전체 합산 검증(그룹별 row 모순 방지)
@@ -311,19 +337,31 @@ def upsert_nurse_monthly_limits_service(
         total_exact_all = sum(_sum_exact_required(r) for r in merged_rows)
         total_min_all = sum(_sum_min_required(r) for r in merged_rows)
         if total_exact_all > month_active_upper:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"{nurse_id} 월 합산 설정 불가: exact 합({total_exact_all}) > 월 가용일({month_active_upper})"
-                ),
+            _push_issue(
+                "MONTHLY_LIMIT_MONTH_EXACT_SUM_EXCEEDS",
+                nurse_id, nurse_name,
+                {"total_exact": total_exact_all, "month_active": month_active_upper},
+                f"월 합산 exact({total_exact_all})이 월 가용일 {month_active_upper}일을 초과합니다.",
+                ["월 전체 그룹의 exact 합을 줄이세요."],
             )
         if total_min_all > month_active_upper:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"{nurse_id} 월 합산 설정 불가: min 합({total_min_all}) > 월 가용일({month_active_upper})"
-                ),
+            _push_issue(
+                "MONTHLY_LIMIT_MONTH_MIN_SUM_EXCEEDS",
+                nurse_id, nurse_name,
+                {"total_min": total_min_all, "month_active": month_active_upper},
+                f"월 합산 min({total_min_all})이 월 가용일 {month_active_upper}일을 초과합니다.",
+                ["월 전체 그룹의 min 합을 줄이세요."],
             )
+
+    if issues_all:
+        payload = build_validation_payload(issues_all)
+        print(
+            f"[MonthlyLimit][BLOCKING] {len(issues_all)}건 — "
+            f"codes={sorted({i['reason_code'] for i in issues_all})}"
+        )
+        for i in issues_all[:5]:
+            print(f"[MonthlyLimit][BLOCKING][message] {i.get('human_message_ko')}")
+        raise HTTPException(status_code=500, detail=payload)
 
     # upsert/delete
     for row in normalized:
