@@ -2007,6 +2007,19 @@ def optimize_fallback_lex_hard_first(
         except Exception as _grade_hard_exc:
             print(f"{logger_prefix} [GradeHard] fallback stage 공통 제약 추가 실패: {_grade_hard_exc}")
 
+        # nurse-level 월간 D/E/N/O 한도 hard (모든 stage 공통).
+        # primary cp_sat_basic이 INFEASIBLE 되어 fallback 진입 시 사용자 입력 한도가
+        # 무시되던 회귀 fix. 같은 모듈을 primary와 공유하여 동작 일치성 확보.
+        try:
+            from services.constraints.monthly_limit_constraints import (
+                add_monthly_limit_constraints,
+            )
+            _ml_added = add_monthly_limit_constraints(m, roster_system, X, join, leave)
+            if _ml_added:
+                print(f"{logger_prefix} [MonthlyLimit][stage{stage}] {_ml_added}건 hard 제약 추가")
+        except Exception as _ml_exc:
+            print(f"{logger_prefix} [MonthlyLimit][stage{stage}] 제약 추가 실패(무시): {_ml_exc}")
+
         # stage별 목적/고정
         if stage == 1:
             # m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))

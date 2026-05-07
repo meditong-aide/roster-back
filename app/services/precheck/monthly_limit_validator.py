@@ -446,6 +446,106 @@ def validate_monthly_limit_row(
     return issues
 
 
+def check_group_n_pool(
+    *,
+    group_id: str,
+    monthly_n_demand: int,
+    forced_n_sum: int,
+    free_capacity_sum: int,
+    nurses_with_n_forced: int,
+    total_n_capable_nurses: int,
+    daily_n_max_total: Optional[int],
+    days_in_month: int,
+) -> List[Dict[str, Any]]:
+    """그룹 단위 N 풀 산술 검증.
+
+    Args:
+        forced_n_sum: 강제(n_exact) 설정된 nurse들의 합
+        free_capacity_sum: 자유 nurse(n_exact 미설정)의 가용 N 상한 합
+            (n_max가 있으면 n_max, 없으면 active_days)
+        nurses_with_n_forced: n_exact가 설정된 nurse 수
+        total_n_capable_nurses: N이 가능한 nurse 총 수
+        daily_n_max_total: 월간 daily_max(N) 합. None이면 상한 없음.
+        monthly_n_demand: 30일 × 일별 N 요구치 합
+    """
+    issues: List[Dict[str, Any]] = []
+
+    total_capacity = forced_n_sum + free_capacity_sum
+    if monthly_n_demand > 0 and total_capacity < monthly_n_demand:
+        issues.append({
+            "reason_code": "MONTHLY_LIMIT_GROUP_N_CAPACITY_BELOW_DEMAND",
+            "severity": "blocking",
+            "evidence": {
+                "group_id": group_id,
+                "monthly_n_demand": monthly_n_demand,
+                "forced_n_sum": forced_n_sum,
+                "free_capacity_sum": free_capacity_sum,
+                "total_capacity": total_capacity,
+            },
+            "human_message_ko": (
+                f"그룹 N 가용 합({total_capacity})이 월간 N 요구({monthly_n_demand})에 부족합니다. "
+                f"(강제 합 {forced_n_sum} + 자유 한도 합 {free_capacity_sum})"
+            ),
+            "fix_suggestions_ko": [
+                "일부 nurse의 n_exact를 늘리세요.",
+                "n_exact를 빼고 자유 nurse를 늘리세요.",
+                "야간 가능 간호사를 추가 배치하세요.",
+            ],
+        })
+
+    # 모든 N 가능 nurse가 forced(n_exact)인데 합이 부족 → 자유도 0 + 부족
+    if (
+        nurses_with_n_forced > 0
+        and nurses_with_n_forced == total_n_capable_nurses
+        and monthly_n_demand > 0
+        and forced_n_sum < monthly_n_demand
+    ):
+        issues.append({
+            "reason_code": "MONTHLY_LIMIT_GROUP_N_FORCED_SUM_BELOW_DEMAND",
+            "severity": "blocking",
+            "evidence": {
+                "group_id": group_id,
+                "monthly_n_demand": monthly_n_demand,
+                "forced_n_sum": forced_n_sum,
+                "nurses_forced": nurses_with_n_forced,
+            },
+            "human_message_ko": (
+                f"모든 N 가능 간호사 {nurses_with_n_forced}명이 n_exact로 고정되었지만 "
+                f"합({forced_n_sum})이 월 N 요구({monthly_n_demand})에 부족합니다."
+            ),
+            "fix_suggestions_ko": [
+                "일부 nurse의 n_exact를 빼서 솔버 자율 분배에 맡기세요.",
+                "n_exact 값을 더 큰 수로 조정하세요.",
+            ],
+        })
+
+    # 강제 합이 일별 N max로 분배 불가 (daily_n_max_total = days × max)
+    if (
+        daily_n_max_total is not None
+        and daily_n_max_total > 0
+        and forced_n_sum > daily_n_max_total
+    ):
+        issues.append({
+            "reason_code": "MONTHLY_LIMIT_GROUP_N_FORCED_EXCEEDS_DAILY_CAP",
+            "severity": "blocking",
+            "evidence": {
+                "group_id": group_id,
+                "forced_n_sum": forced_n_sum,
+                "daily_n_max_total": daily_n_max_total,
+                "days_in_month": days_in_month,
+            },
+            "human_message_ko": (
+                f"강제 N 합({forced_n_sum})이 월간 일별 N 상한 합({daily_n_max_total})을 초과합니다."
+            ),
+            "fix_suggestions_ko": [
+                "일부 nurse의 n_exact를 줄이세요.",
+                "일별 N 상한(daily_shift_requirements_max_by_day)을 늘리세요.",
+            ],
+        })
+
+    return issues
+
+
 def build_validation_payload(issues: List[Dict[str, Any]]) -> Dict[str, Any]:
     """validate_monthly_limit_row 결과를 HTTP 500 detail 페이로드로 변환."""
     summary = (

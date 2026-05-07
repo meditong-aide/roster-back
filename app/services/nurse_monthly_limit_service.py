@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from db.models import Nurse, NurseAssignment, NurseMonthlyLimit
+from db.models import Nurse, NurseAssignment, NurseMonthlyLimit, RosterConfig
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import (
     NurseMonthlyLimitItem,
@@ -352,6 +352,104 @@ def upsert_nurse_monthly_limits_service(
                 f"월 합산 min({total_min_all})이 월 가용일 {month_active_upper}일을 초과합니다.",
                 ["월 전체 그룹의 min 합을 줄이세요."],
             )
+
+    # ── 그룹 단위 N pool 산술 검사 (cross-nurse) ──
+    from services.precheck.monthly_limit_validator import (
+        check_group_n_pool,
+        _allowed_work_shifts,  # private이지만 같은 패키지 활용
+    )
+
+    group_ids_in_request = {str(r["group_id"]) for r in normalized}
+    days_in_month_full = monthrange(year, month)[1]
+
+    for gid in group_ids_in_request:
+        try:
+            # RosterConfig → daily N 요구치
+            roster_cfg = (
+                db.query(RosterConfig)
+                .filter(RosterConfig.group_id == gid)
+                .order_by(RosterConfig.config_id.desc())
+                .first()
+            )
+            if roster_cfg is None:
+                continue
+            n_daily = int(getattr(roster_cfg, "nig_req", 0) or 0)
+            if n_daily <= 0:
+                continue  # N 요구 없으면 검사 skip
+            monthly_n_demand = n_daily * days_in_month_full
+            # daily N max는 RosterConfig에 직접 저장 안 됨; 보수적으로 None.
+            daily_n_max_total = None
+
+            # group의 모든 nurse + N 가능 여부
+            group_nurses = (
+                db.query(Nurse)
+                .filter(Nurse.group_id == gid, Nurse.active == 1)
+                .all()
+            )
+            n_capable_nurses = [
+                nu for nu in group_nurses
+                if "N" in (_allowed_work_shifts(nu) or {"D", "E", "N"})
+            ]
+            total_n_capable = len(n_capable_nurses)
+
+            # 요청 + 기존 limit 병합 (nurse_id 단위)
+            request_by_nurse: Dict[str, Dict[str, Any]] = {
+                str(r["nurse_id"]): r for r in normalized if str(r["group_id"]) == gid
+            }
+            existing_limits = (
+                db.query(NurseMonthlyLimit)
+                .filter(
+                    NurseMonthlyLimit.group_id == gid,
+                    NurseMonthlyLimit.year == year,
+                    NurseMonthlyLimit.month == month,
+                )
+                .all()
+            )
+            existing_by_nurse = {str(e.nurse_id): e for e in existing_limits}
+
+            forced_n_sum = 0
+            nurses_with_n_forced = 0
+            free_capacity_sum = 0
+
+            for nu in n_capable_nurses:
+                nid = str(nu.nurse_id)
+                # request 우선, 없으면 기존, 없으면 free
+                if nid in request_by_nurse:
+                    rr = request_by_nurse[nid]
+                    n_exact = rr.get("n_exact")
+                    n_max = rr.get("n_max")
+                else:
+                    e = existing_by_nurse.get(nid)
+                    n_exact = getattr(e, "n_exact", None) if e else None
+                    n_max = getattr(e, "n_max", None) if e else None
+
+                # 가용일 (그룹 active)
+                inbound = False
+                cap = _group_active_capacity_days(
+                    db, nurse_id=nid, group_id=gid, year=year, month=month, inbound=inbound,
+                )
+
+                if n_exact is not None:
+                    forced_n_sum += int(n_exact)
+                    nurses_with_n_forced += 1
+                elif n_max is not None:
+                    free_capacity_sum += min(int(n_max), cap)
+                else:
+                    free_capacity_sum += cap
+
+            pool_issues = check_group_n_pool(
+                group_id=gid,
+                monthly_n_demand=monthly_n_demand,
+                forced_n_sum=forced_n_sum,
+                free_capacity_sum=free_capacity_sum,
+                nurses_with_n_forced=nurses_with_n_forced,
+                total_n_capable_nurses=total_n_capable,
+                daily_n_max_total=daily_n_max_total,
+                days_in_month=days_in_month_full,
+            )
+            issues_all.extend(pool_issues)
+        except Exception as _pool_exc:
+            print(f"[MonthlyLimit] group N pool 검사 실패(무시) gid={gid}: {_pool_exc}")
 
     if issues_all:
         payload = build_validation_payload(issues_all)
