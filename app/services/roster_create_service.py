@@ -5044,9 +5044,45 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             (n.__dict__ if hasattr(n, "__dict__") else dict(n))
             for n in (nurses_for_engine or [])
         ]
+        # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
+        # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
+        precheck_config = dict(config_dict)
+        if "team_min_by_team" not in precheck_config:
+            try:
+                _team_rows = (
+                    db.query(Team)
+                    .filter(
+                        Team.office_id == current_user.office_id,
+                        Team.group_id == current_user.group_id,
+                        Team.active == 1,
+                    )
+                    .all()
+                )
+                _team_min_by_team: dict[str, dict[str, int]] = {}
+                for _t in _team_rows:
+                    _ms = _t.min_shift if isinstance(_t.min_shift, dict) else None
+                    if not _ms:
+                        continue
+                    _cleaned: dict[str, int] = {}
+                    for _k, _v in _ms.items():
+                        if _k not in ("D", "E", "N", "M"):
+                            continue
+                        try:
+                            _iv = int(_v)
+                        except (TypeError, ValueError):
+                            continue
+                        if _iv > 0:
+                            _cleaned[_k] = _iv
+                    if _cleaned:
+                        _team_min_by_team[str(_t.team_id)] = _cleaned
+                if _team_min_by_team:
+                    precheck_config["team_min_by_team"] = _team_min_by_team
+            except Exception as _team_exc:
+                print(f"[Precheck] team_min 로딩 실패(무시): {_team_exc}")
+
         precheck_result = run_runtime_precheck(
             nurses_dict=_nurses_dict_for_precheck,
-            config_dict=config_dict,
+            config_dict=precheck_config,
             grade_config=_engine_grade_config,
             fixed_cells=combined_fixed_cells,
             year=req.year,
