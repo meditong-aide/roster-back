@@ -42,7 +42,7 @@ logger = Logger(service="roster-solver")
 _IS_COLD_START = True
 
 
-@logger.inject_lambda_context
+@logger.inject_lambda_context(clear_state=True)
 def handler(event: dict, context) -> dict:
     """SQS event source mapping에 의해 호출되는 진입점.
 
