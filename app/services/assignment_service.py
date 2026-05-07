@@ -80,6 +80,62 @@ _SOURCE_TO_TARGET_FIELD_MAP: dict[str, str] = {
     "wanted_max_requests": "target_wanted_max_requests",
 }
 
+# 동일 nurse + 동일 target_group_id 로 재파견 시 직전 row 에서 자동 승계할 필드.
+# 사용자가 신규 create 요청에서 명시하지 않은(model_fields_set 누락) 키만 채운다.
+_ASSIGNMENT_INHERITABLE_FIELDS: Tuple[str, ...] = (
+    "target_weekly_off_type",
+    "target_weekly_off_enabled",
+    "target_weekly_off_weekday",
+    "target_shift_types",
+    "target_team_id",
+    "target_grade",
+    "target_fixed_shift",
+    "target_wanted_max_requests",
+    "note",
+)
+
+
+def _inherit_target_fields_from_prior(
+    db: Session,
+    req: NurseAssignmentCreate,
+) -> None:
+    """동일 nurse + 동일 target_group_id 의 직전 active 파견/병동이동 row 에서
+    create 요청에 명시되지 않은 target_* / note 필드를 자동 승계.
+
+    "명시" 기준: Pydantic v2 `model_fields_set` 에 키가 포함되었는지.
+    명시적 null 전송은 그대로 유지한다.
+    cancelled / completed row 는 사용자가 의도적으로 종료/취소한 이력이므로
+    승계 대상에서 제외한다.
+    """
+    if req.reason not in _INBOUND_REASONS or not req.target_group_id:
+        return
+
+    prior = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == req.nurse_id,
+            NurseAssignment.target_group_id == req.target_group_id,
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+            NurseAssignment.status == "active",
+        )
+        .order_by(
+            NurseAssignment.created_at.desc(),
+            NurseAssignment.id.desc(),
+        )
+        .first()
+    )
+    if not prior:
+        return
+
+    _provided = req.model_fields_set
+    for _f in _ASSIGNMENT_INHERITABLE_FIELDS:
+        if _f in _provided:
+            continue
+        _v = getattr(prior, _f, None)
+        if _v is None:
+            continue
+        setattr(req, _f, _v)
+
 
 def _get_group_name(db: Session, group_id: str | None) -> str | None:
     if not group_id:
@@ -294,6 +350,9 @@ def create_assignment(
 
     # 기간 중복 검증: 동일 간호사의 active assignment와 일자 겹침 불허
     _raise_if_overlap(db, req.nurse_id, req.start_date, req.expected_end_date)
+
+    # 동일 target_group_id 재파견/재병동이동 시 이전 row 의 target_*/note 자동 승계
+    _inherit_target_fields_from_prior(db, req)
 
     row = NurseAssignment(
         nurse_id=req.nurse_id,
