@@ -5,11 +5,12 @@ FROM public.ecr.aws/lambda/python:3.12 AS builder
 RUN dnf install -y gcc gcc-c++ make \
  && dnf clean all
 
-COPY requirements.txt /tmp/requirements.txt
+COPY requirements.lambda.txt /tmp/requirements.lambda.txt
 
-# 의존성을 /opt/python 으로 격리 install → Stage 2 로 복사
+# Lambda 전용 슬림 의존성 install (Phase 2)
+# API 서버용 requirements.txt는 별개로 deploy-ecr.yml이 사용한다.
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir --target /opt/python -r /tmp/requirements.txt
+ && pip install --no-cache-dir --target /opt/python -r /tmp/requirements.lambda.txt
 
 
 # ───────── Stage 2: Runtime ─────────

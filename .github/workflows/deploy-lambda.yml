@@ -7,7 +7,7 @@ on:
       - dev
     paths:
       - 'app/**'
-      - 'requirements.txt'
+      - 'requirements.lambda.txt'
       - 'Dockerfile.lambda'
       - '.github/workflows/deploy-lambda.yml'
 
