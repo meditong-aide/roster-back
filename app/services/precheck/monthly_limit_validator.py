@@ -158,35 +158,34 @@ def _check_single_bounds(
         mx = _row_value(row, f"{p}_max")
         ex = _row_value(row, f"{p}_exact")
 
-        # B5: exact + min/max 동시
-        if ex is not None and (mn is not None or mx is not None):
-            issues.append(_make_issue(
-                "MONTHLY_LIMIT_EXACT_WITH_MIN_OR_MAX",
-                nurse_id=nurse_id, nurse_name=nurse_name,
-                evidence={"shift": p.upper(), "exact": ex, "min": mn, "max": mx},
-                human_message_ko=(
-                    f"{_SHIFT_LABEL[p]}에 exact={ex}와 min/max가 함께 입력되어 있습니다. "
-                    "exact만 사용하거나 min/max만 사용해야 합니다."
-                ),
-                fix_suggestions_ko=[
-                    "exact 또는 min/max 중 하나만 보내주세요.",
-                ],
-            ))
-
-        # B1: min > cap_days
-        for label, v in (("min", mn), ("exact", ex)):
-            if v is not None and v > cap_days:
+        # 정책: exact가 입력되면 _normalize_row가 min=max=exact로 자동 동기화한다.
+        # 프론트는 exact만 보내고 min/max는 null로 보내는 경우가 정상이므로 별도 충돌 검사 안 함.
+        # B1: 단일 시프트 min(또는 exact)이 가용일 초과 — exact가 있으면 exact 한 번만 검사
+        if ex is not None:
+            if ex > cap_days:
                 issues.append(_make_issue(
                     "MONTHLY_LIMIT_VALUE_EXCEEDS_ACTIVE_DAYS",
                     nurse_id=nurse_id, nurse_name=nurse_name,
-                    evidence={"shift": p.upper(), "field": f"{p}_{label}", "value": v, "active_days": cap_days},
+                    evidence={"shift": p.upper(), "field": f"{p}_exact", "value": ex, "active_days": cap_days},
                     human_message_ko=(
-                        f"{_SHIFT_LABEL[p]} {label}={v}가 가용일 {cap_days}일을 초과합니다."
+                        f"{_SHIFT_LABEL[p]} exact={ex}가 가용일 {cap_days}일을 초과합니다."
                     ),
                     fix_suggestions_ko=[
-                        f"{_SHIFT_LABEL[p]} {label}을 {cap_days} 이하로 설정하세요.",
+                        f"{_SHIFT_LABEL[p]} exact를 {cap_days} 이하로 설정하세요.",
                     ],
                 ))
+        elif mn is not None and mn > cap_days:
+            issues.append(_make_issue(
+                "MONTHLY_LIMIT_VALUE_EXCEEDS_ACTIVE_DAYS",
+                nurse_id=nurse_id, nurse_name=nurse_name,
+                evidence={"shift": p.upper(), "field": f"{p}_min", "value": mn, "active_days": cap_days},
+                human_message_ko=(
+                    f"{_SHIFT_LABEL[p]} min={mn}이 가용일 {cap_days}일을 초과합니다."
+                ),
+                fix_suggestions_ko=[
+                    f"{_SHIFT_LABEL[p]} min을 {cap_days} 이하로 설정하세요.",
+                ],
+            ))
     return issues
 
 
