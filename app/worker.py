@@ -2,9 +2,15 @@
 """Roster solver worker — ECS task와 Lambda 양쪽 공통 진입점.
 
 import 정책:
-    - top-level은 표준 라이브러리만 (os, sys, json, traceback).
+    - top-level은 표준 라이브러리 + 가벼운 logger 만 (os, sys, json, traceback, powertools.Logger).
     - 무거운 의존성(sqlalchemy, db.*, schemas.*, services.*)은 함수 내부로 lazy import.
     - 목적: Lambda init phase 10초 timeout 회피 + ECS 호환 유지.
+
+Logging:
+    aws-lambda-powertools.Logger(child=True) 로 lambda_handler 의 부모 logger 컨텍스트 상속.
+    process_job 진입 시 office_id 를 append_keys 로 추가 주입.
+    핵심 비즈니스 이벤트(작업 시작/완료/실패)만 JSON 으로 logging.
+    그 외 디버깅 print 는 표준 stdout 그대로 유지 (CloudWatch 표준 log group).
 """
 from __future__ import annotations
 import os, sys
@@ -19,6 +25,12 @@ if project_root not in sys.path:
 
 import json
 import traceback
+
+# Structured JSON logger (powertools).
+# Lambda 환경: lambda_handler 의 부모 Logger 컨텍스트 자동 상속.
+# ECS 환경: 부모 없이 단독 동작 (stdout JSON 출력).
+from aws_lambda_powertools import Logger
+logger = Logger(service="roster-solver", child=True)
 
 
 # =========================================================
@@ -126,7 +138,19 @@ def process_job(payload: dict) -> dict:
     db: Session = SessionLocal()
     try:
         current_user = load_current_user_by_nurse_id(db, nurse_id, override_group_id=job_group_id)
-        print(f"[worker] 작업 시작 job_id={job_id}, nurse_id={nurse_id}, group_id={current_user.group_id}, req={req}")
+
+        # office_id 를 logger context 에 추가 주입.
+        # (lambda_handler 가 이미 job_id/group_id/nurse_id 주입한 상태)
+        # 이후 모든 logger 호출(이 함수 + services 의 child logger 포함)에 자동 포함.
+        logger.append_keys(office_id=current_user.office_id)
+        logger.info(
+            "작업 시작",
+            extra={
+                "year": getattr(req, "year", None),
+                "month": getattr(req, "month", None),
+                "config_id": getattr(req, "config_id", None),
+            },
+        )
 
         update_job_record(db, job_id, status=STATUS_RUNNING, progress=10)
 
@@ -155,12 +179,22 @@ def process_job(payload: dict) -> dict:
             progress=100,
             result_roster_id=result_id,
         )
-        print(f"[worker] 작업 완료 job_id={job_id}; roster_nurses={len(roster_data.get('nurses', []))}")
+        roster_nurses_count = len(roster_data.get("nurses", [])) if isinstance(roster_data, dict) else 0
+        logger.info(
+            "작업 완료",
+            extra={
+                "result_roster_id": result_id,
+                "roster_nurses_count": roster_nurses_count,
+            },
+        )
         return {"status": "success", "job_id": job_id, "result_id": result_id}
 
     except Exception:
-        traceback.print_exc()
         err_msg = str(sys.exc_info()[1])
+        # JSON structured log + traceback (powertools 가 stack_trace 자동 포함)
+        logger.exception("작업 실패", extra={"error_message": err_msg})
+        # stdout 에도 traceback 출력 (기존 호환)
+        traceback.print_exc()
         try:
             db.rollback()
         except Exception as exc_rb:

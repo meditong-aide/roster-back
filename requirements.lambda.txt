@@ -36,6 +36,12 @@ python-dotenv
 psutil>=7.0.0
 cryptography>=45.0.5
 
+# === Logging / Observability ===
+# AWS Lambda Powertools — structured JSON logging + context injection
+# CloudWatch Logs Insights에서 office_id/group_id/nurse_id 필터링용.
+# Phase 2 Forwarder Lambda 가 이 JSON 을 파싱하여 3단 log group 에 forward.
+aws-lambda-powertools>=2.30.0
+
 # === 솔버 path 확실치 않으나 보수적 유지 ===
 # matplotlib: 시각화 (재검증 후 제거 후보)
 # openpyxl: shift_service_mssql 에서 사용 (재검증 후 제거 후보)
