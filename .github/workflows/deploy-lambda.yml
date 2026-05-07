@@ -68,6 +68,9 @@ jobs:
           tags: ${{ env.IMAGE_URI }}
           cache-from: type=gha,scope=lambda-${{ env.ENV }}
           cache-to: type=gha,mode=max,scope=lambda-${{ env.ENV }}
+          # Lambda 는 Docker v2 manifest 만 지원 → buildx 의 OCI provenance attestation 비활성화
+          provenance: false
+          sbom: false
 
       - name: Check Lambda function exists
         id: check-lambda
