@@ -1,0 +1,204 @@
+version: 1
+
+constraints:
+  CoverageMin:
+    label: Coverage Minimum
+    parent: CoverageConstraint
+    scope: [day, shift]
+    effective_modes: [enforced, soft_fallback, inactive, precheck_blocked]
+    connects: [AssignmentAtom, Day, Shift]
+    explanation_template: "{day} {shift}는 최소 {min_required}명이 필요합니다."
+    aliases: [GLOBAL_DAY_CAPACITY_SHORTAGE, GLOBAL_SHIFT_ALLOWED_SHORTAGE, CAPACITY_TOTAL_SHORTAGE, DAY_ZERO_COVERAGE, NO_ASSIGNMENT]
+    default_severity: hard
+
+  TeamMin:
+    label: Team Minimum Coverage
+    parent: CoverageConstraint
+    scope: [team, day, shift]
+    effective_modes: [enforced, skipped_by_capacity, soft_fallback, inactive, precheck_blocked]
+    connects: [AssignmentAtom, Team, Day, Shift]
+    explanation_template: "{day} {shift}에서 {team}은 최소 {min_required}명이 필요합니다."
+    aliases: [TEAM_MIN_EXCEEDS_GLOBAL_NEED, TEAM_SIZE_INSUFFICIENT, TEAM_ACTIVE_MEMBERS_INSUFFICIENT, TEAM_SHIFT_ALLOWED_SHORTAGE, FIXED_ASSIGN_BREAKS_TEAM_MIN]
+    default_severity: hard
+
+  GradeMin:
+    label: Grade Minimum Coverage
+    parent: CoverageConstraint
+    scope: [grade, day, shift]
+    effective_modes: [enforced, soft_fallback, inactive, precheck_blocked]
+    connects: [AssignmentAtom, Grade, Day, Shift]
+    explanation_template: "{day} {shift}에서 {grade}는 최소 {min_required}명이 필요합니다."
+    aliases: [GRADE_MIN_SUM_EXCEEDS_NEED, GRADE_MIN_AVAILABLE_SHORTAGE]
+    default_severity: hard
+
+  GradeMax:
+    label: Grade Maximum Coverage
+    parent: CoverageConstraint
+    scope: [grade, day, shift]
+    effective_modes: [enforced, soft_fallback, inactive, precheck_blocked]
+    connects: [AssignmentAtom, Grade, Day, Shift]
+    explanation_template: "{day} {shift}에서 {grade}는 최대 {max_allowed}명까지 가능합니다."
+    aliases: [GRADE_MAX_SUM_BELOW_NEED, GRADE_ANTIPAIR_FORCES_SHORTAGE]
+    default_severity: hard
+
+  TeamGradeHandoff:
+    label: Team Grade Handoff
+    parent: CoverageConstraint
+    scope: [team, grade, day, shift]
+    effective_modes: [enforced, soft_fallback, inactive]
+    connects: [AssignmentAtom, Team, Grade, Day, Shift]
+    explanation_template: "{team} 내 {grade} 간 handoff 제약이 적용됩니다."
+    aliases: [TEAM_GRADE_INTERSECT_SHORTAGE]
+    default_severity: hard
+
+  ConsecutiveWorkLimit:
+    label: Consecutive Work Limit
+    parent: NurseLocalConstraint
+    scope: [nurse, day_window]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "{nurse}는 최대 연속근무일 {max_days}일을 초과할 수 없습니다."
+    default_severity: hard
+
+  ConsecutiveNightLimit:
+    label: Consecutive Night Limit
+    parent: NurseLocalConstraint
+    scope: [nurse, day_window]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "{nurse}는 최대 연속 나이트 수를 초과할 수 없습니다."
+    default_severity: hard
+
+  NightRecovery:
+    label: Night Recovery
+    parent: NurseLocalConstraint
+    scope: [nurse, day_window]
+    effective_modes: [enforced, bypassed_by_fixed, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    produces: [ForcedOff]
+    explanation_template: "{nurse}는 N 블록 이후 회복 OFF가 필요합니다."
+    aliases: [MONTHLY_NIGHT_CAPACITY_SHORTAGE]
+    default_severity: hard
+
+  OffCap:
+    label: Off Cap
+    parent: NurseLocalConstraint
+    scope: [nurse, month]
+    effective_modes: [enforced, bypassed_by_fixed, inactive]
+    connects: [AssignmentAtom, Nurse, Month]
+    explanation_template: "{nurse}의 OFF 개수는 허용 범위를 벗어날 수 없습니다."
+    aliases: [FIXED_OFF_EXCEEDS_SPAN]
+    default_severity: hard
+
+  BoundaryTransitionBan:
+    label: Boundary Transition Ban
+    parent: NurseLocalConstraint
+    scope: [nurse, boundary_day]
+    effective_modes: [enforced, bypassed_by_fixed, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "경계일 직전 근무와 다음 근무 사이 전환 금지가 적용됩니다."
+    aliases: [N_CAPACITY_SHORTAGE]
+    default_severity: hard
+
+  PrecepteeSync:
+    label: Preceptee Sync
+    parent: CouplingConstraint
+    scope: [preceptor, preceptee, day]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "프리셉티는 지정 기간 동안 프리셉터와 동일 근무여야 합니다."
+    default_severity: hard
+
+  AssignmentWindow:
+    label: Assignment Window
+    parent: CouplingConstraint
+    scope: [nurse, assignment_period]
+    effective_modes: [enforced, inactive]
+    connects: [Assignment, Day, Nurse]
+    explanation_template: "기간 파견/이동 구간에서 소유 group 및 허용 shift가 바뀝니다."
+    default_severity: hard
+
+  CarryoverBoundary:
+    label: Carryover Boundary
+    parent: CouplingConstraint
+    scope: [nurse, boundary_day]
+    effective_modes: [enforced, inactive]
+    connects: [ScheduleSnapshot, Nurse, Day]
+    explanation_template: "이전 스케줄 tail 상태를 경계일에 이어받습니다."
+    default_severity: hard
+
+  FixedWanted:
+    label: Fixed Wanted
+    parent: OverridePolicy
+    scope: [nurse, day, shift]
+    effective_modes: [enforced, bypassed_by_fixed, inactive]
+    connects: [WantedEntry, AssignmentAtom, Day, Nurse]
+    explanation_template: "확정 원티드는 일부 제약을 우회하거나 회복 슬롯을 막을 수 있습니다."
+    default_severity: hard
+
+  ConfigIntegrity:
+    label: Configuration Integrity
+    parent: MetaConstraint
+    scope: [config, group, month]
+    effective_modes: [precheck_blocked, inactive]
+    connects: [RosterConfig, GradeConfig]
+    explanation_template: "설정 정합성 오류로 인해 생성 전 차단됩니다."
+    aliases: [MID_DISABLED_BUT_USED, MID_REQUIRED_MISSING, ALLOWED_SHIFTS_ISOLATES_NURSE, FIXED_ASSIGN_EXCEEDS_NEED, FIXED_ASSIGN_VIOLATES_ALLOWED]
+    default_severity: hard
+
+overrides:
+  FixedWanted:
+    label: Fixed Wanted Override
+    parent: OverridePolicy
+    bypasses: [BoundaryTransitionBan, InitialForbiddenOverride, ProfileShiftLimit]
+    does_not_bypass: [ConsecutiveWorkLimit]
+    conditional_effects:
+      blocks_recovery_slot: true
+      counts_to_coverage: policy_dependent
+      affects_preceptee_sync: policy_dependent
+
+modes:
+  enforced:
+    label: Enforced
+    meaning: 실제 solver 또는 precheck에서 hard로 적용된 상태
+    is_enforced: true
+    severity: hard
+  soft_fallback:
+    label: Soft Fallback
+    meaning: retry 또는 fallback 경로에서 hard가 soft objective로 내려간 상태
+    is_enforced: false
+    severity: soft
+  skipped_by_capacity:
+    label: Skipped by Capacity
+    meaning: 후보 또는 active member 부족으로 constraint가 실제 추가되지 않은 상태
+    is_enforced: false
+    severity: hard
+  bypassed_by_fixed:
+    label: Bypassed by Fixed
+    meaning: fixed 또는 fixed_wanted로 인해 특정 제약이 우회된 상태
+    is_enforced: false
+    severity: hard
+  inactive:
+    label: Inactive
+    meaning: 설정 또는 실행 경로상 비활성 상태
+    is_enforced: false
+    severity: none
+  precheck_blocked:
+    label: Precheck Blocked
+    meaning: solver build 이전 precheck 단계에서 차단된 상태
+    is_enforced: true
+    severity: hard
+
+relations:
+  applies_to:
+    source: Constraint
+    target: RuntimeFact
+  bypasses:
+    source: OverridePolicy
+    target: Constraint
+  cannot_bypass:
+    source: OverridePolicy
+    target: Constraint
+  carries_state:
+    source: AssignmentWindow
+    target: CarryoverBoundary
