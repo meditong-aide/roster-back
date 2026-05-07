@@ -5,7 +5,7 @@
 """
 
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
 from typing import Optional, Tuple, List
@@ -14,6 +14,7 @@ from schemas.roster_schema import (
     NurseAssignmentCreate,
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
+    AssignmentStatusCounts,
 )
 from schemas.auth_schema import User as UserSchema
 import logging
@@ -30,27 +31,40 @@ _INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
 def _assert_caller_owns_source(
     current_user: Optional[UserSchema],
     source_group_id: str,
+    db: Optional[Session] = None,
 ) -> None:
     """파견/병동이동/휴직 등 assignment 조작 권한 검증.
 
-    정책: source 병동 수간호사만 자기 병동 간호사를 파견/이동시킬 수 있다.
-    - is_master_admin: 예외 (모든 그룹 조작 허용)
-    - 그 외: caller.group_id == source_group_id 필수
-    - current_user가 None이면 system/admin 경로로 간주하고 통과.
+    통과 조건 (OR):
+    - current_user is None → system/admin 경로로 간주
+    - is_master_admin
+    - caller.group_id == source_group_id (현재 view가 source)
+    - caller.original_group_id == source_group_id (원본 소속이 source — view 전환 중)
+    - caller.nurse_id ∈ groups[source_group_id].hn_id (해당 그룹의 등록된 그룹 관리자)
     """
     if current_user is None:
         return
     if getattr(current_user, "is_master_admin", False):
         return
     caller_gid = getattr(current_user, "group_id", None)
-    if caller_gid != source_group_id:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"권한 없음: source 병동({source_group_id})의 수간호사만 "
-                f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
-            ),
-        )
+    if caller_gid == source_group_id:
+        return
+    caller_original = getattr(current_user, "original_group_id", None)
+    if caller_original and caller_original == source_group_id:
+        return
+    caller_nid = getattr(current_user, "nurse_id", None)
+    if db is not None and caller_nid:
+        src_group = db.query(Group).filter(Group.group_id == source_group_id).first()
+        hn_ids = list(src_group.hn_id or []) if src_group is not None else []
+        if str(caller_nid) in {str(x) for x in hn_ids}:
+            return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"권한 없음: source 병동({source_group_id})의 수간호사 또는 그룹 관리자만 "
+            f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
+        ),
+    )
 
 
 # source(nurses.*) 필드명 → target(nurse_assignment.target_*) 필드명 매핑
@@ -108,7 +122,13 @@ def _collect_assignment_recipients(
 
 
 def _effective_end_date(row: NurseAssignment) -> Optional[date]:
-    """assignment의 실제 종료 경계(end_date 우선, 없으면 expected_end_date)."""
+    """assignment의 실제 종료 경계(end_date 우선, 없으면 expected_end_date).
+
+    병동이동은 영구 이동이라 flush가 set한 end_date(today)는 상태 마커일 뿐
+    실제 종료가 아니다. 따라서 expected_end_date 만 인정한다.
+    """
+    if row.reason == "병동이동":
+        return row.expected_end_date
     return row.end_date or row.expected_end_date
 
 
@@ -245,7 +265,7 @@ def create_assignment(
     current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 등록"""
-    _assert_caller_owns_source(current_user, req.source_group_id)
+    _assert_caller_owns_source(current_user, req.source_group_id, db=db)
 
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
     if not nurse:
@@ -472,7 +492,7 @@ def update_assignment(
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
-    _assert_caller_owns_source(current_user, row.source_group_id)
+    _assert_caller_owns_source(current_user, row.source_group_id, db=db)
 
     # 재배치 판정을 위해 기존(window) 스냅샷 저장
     _old_window = (row.start_date, _effective_end_date(row))
@@ -587,7 +607,7 @@ def cancel_assignment(
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
-    _assert_caller_owns_source(current_user, row.source_group_id)
+    _assert_caller_owns_source(current_user, row.source_group_id, db=db)
 
     _old_window = (row.start_date, _effective_end_date(row))
     _old_reason = row.reason
@@ -671,6 +691,32 @@ def get_assignments(
         nurse_map = {n.nurse_id: n.name for n in nurses}
 
     return [_to_response(r, nurse_map.get(r.nurse_id)) for r in rows]
+
+
+def get_assignment_status_counts(
+    db: Session,
+    office_id: str,
+    group_id: Optional[str] = None,
+    nurse_id: Optional[str] = None,
+) -> AssignmentStatusCounts:
+    """status 필터와 무관한 전체 카운트 집계 (리스트 응답 메타용)."""
+    query = db.query(NurseAssignment.status, func.count(NurseAssignment.id)).filter(
+        NurseAssignment.office_id == office_id
+    )
+    if group_id:
+        query = query.filter(
+            or_(
+                NurseAssignment.source_group_id == group_id,
+                NurseAssignment.target_group_id == group_id,
+            )
+        )
+    if nurse_id:
+        query = query.filter(NurseAssignment.nurse_id == nurse_id)
+    counts = {"active": 0, "completed": 0, "cancelled": 0, "on_hold": 0}
+    for status_val, cnt in query.group_by(NurseAssignment.status).all():
+        if status_val in counts:
+            counts[status_val] = int(cnt)
+    return AssignmentStatusCounts(**counts)
 
 
 def get_active_assignments_for_month(
@@ -953,6 +999,35 @@ def flush_expired_preceptees(db: Session) -> int:
     return count
 
 
+def flush_orphan_preceptee_assignments(db: Session) -> int:
+    """nurses.preceptor_id=NULL 이지만 active 프리셉티 assignment 가 떠있는 비대칭을 정리.
+
+    원인: 외부 경로(직접 INSERT, 프론트 가드로 PATCH 누락 등)로 nurses.preceptor_id 와
+    nurse_assignment 가 어긋난 경우. lazy 체크 시점에 active row 를 모두 cancelled 로 정리.
+    알림은 발송하지 않는다(자동 정리는 사용자 의도 변경이 아님).
+    """
+    rows = (
+        db.query(NurseAssignment)
+        .join(NurseModel, NurseModel.nurse_id == NurseAssignment.nurse_id)
+        .filter(
+            NurseAssignment.reason == "프리셉티",
+            NurseAssignment.status == "active",
+            NurseModel.preceptor_id.is_(None),
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+    today = date.today()
+    for row in rows:
+        row.status = "cancelled"
+        if row.end_date is None:
+            row.end_date = today
+    db.commit()
+    logger.info("[Lazy] orphan 프리셉티 assignment 정리: %d건", len(rows))
+    return len(rows)
+
+
 def flush_expired_dispatches(db: Session) -> int:
     """파견 만료 자동 디엑티브 (스케줄러용).
 
@@ -980,6 +1055,36 @@ def flush_expired_dispatches(db: Session) -> int:
 
     db.commit()
     logger.info("[Scheduler] 파견 자동 디엑티브 %d건", len(rows))
+    return len(rows)
+
+
+def flush_expired_leaves(db: Session) -> int:
+    """휴직 만료 자동 디엑티브 (스케줄러용).
+
+    조건: reason='휴직' AND status='active' AND expected_end_date < today
+    처리: status='completed', end_date=expected_end_date.
+    Returns: 처리된 건수
+    """
+    today = date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.reason == "휴직",
+            NurseAssignment.status == "active",
+            NurseAssignment.expected_end_date.isnot(None),
+            NurseAssignment.expected_end_date < today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    for row in rows:
+        row.status = "completed"
+        row.end_date = row.expected_end_date
+
+    db.commit()
+    logger.info("[Scheduler] 휴직 자동 디엑티브 %d건", len(rows))
     return len(rows)
 
 
@@ -1414,13 +1519,18 @@ def get_roster_assignments(
     year: int,
     month: int,
 ) -> dict[str, list[dict]]:
-    """근무표 응답용 파견/병동이동 assignment 메타데이터.
+    """근무표 응답용 파견/병동이동/휴직/퇴사 assignment 메타데이터.
 
-    해당 group이 source인 assignment만 반환 (source group 근무표에서 미표기 처리용).
+    해당 group이 source인 assignment + 해당 월 퇴사자 synthetic entry.
     Returns: {nurse_id: [{reason, target_group_id, target_group_name, start_date, end_date}]}
     간호사당 복수 assignment 지원.
     """
-    from db.models import Group
+    from calendar import monthrange
+
+    _days = monthrange(year, month)[1]
+    _m_start = date(year, month, 1)
+    _m_end = date(year, month, _days)
+    _DISPATCH_REASON_ALIASES = frozenset({"파견", "병동이동", "부서이동"})
 
     assignments = get_active_assignments_for_month(db, group_id, year, month)
     eligible = [
@@ -1428,7 +1538,24 @@ def get_roster_assignments(
         if a.reason in ("파견", "병동이동", "휴직")
         and a.source_group_id == group_id
     ]
-    if not eligible:
+
+    # 해당 월 퇴사자 (nurses.resignation_date 기반 synthetic entry)
+    _resigning_all = (
+        db.query(NurseModel)
+        .filter(
+            NurseModel.group_id == group_id,
+            NurseModel.resignation_date.isnot(None),
+            NurseModel.resignation_date >= _m_start,
+            NurseModel.resignation_date <= _m_end,
+        )
+        .all()
+    )
+    _resigning = [
+        n for n in _resigning_all
+        if (n.resignation_reason or "").strip() not in _DISPATCH_REASON_ALIASES
+    ]
+
+    if not eligible and not _resigning:
         return {}
 
     target_gids = {a.target_group_id for a in eligible if a.target_group_id}
@@ -1447,6 +1574,15 @@ def get_roster_assignments(
             "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
         }
         result.setdefault(a.nurse_id, []).append(entry)
+    for n in _resigning:
+        # 퇴사일 당일부터 월말까지 블랭크 (프론트 배지/기간바 용)
+        result.setdefault(n.nurse_id, []).append({
+            "reason": "퇴사",
+            "target_group_id": "",
+            "target_group_name": "",
+            "start_date": str(n.resignation_date),
+            "end_date": None,
+        })
     return result
 
 

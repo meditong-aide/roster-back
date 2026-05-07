@@ -342,19 +342,19 @@ def build_fallback_stage3_objective_terms(
         print("preceptor_objective_terms 예외 발생")
         print("e", e)
         pass
+    grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+    print("grade_strategy", grade_strategy)
     try:
-        grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
-        print("grade_strategy", grade_strategy)
         if grade_strategy in ("TEAM", "COMBINED"):
             obj.extend(add_team_balance_terms_fn(m, roster_system, X, join, leave))
-            try:
-                obj.extend(add_team_min_constraints(m, roster_system, X, join, leave, grade_strategy=grade_strategy, blocked_by_nurse=blocked_by_nurse))
-            except Exception as e2:
-                print("team_min_constraints(fallback) 예외 발생", e2)
     except Exception as e:
         print("team_balance_objective_terms 예외 발생")
         print("e", e)
-        pass
+    # team_min 은 데이터(team_min_by_team) 존재 여부로만 활성. strategy는 weight tilt용.
+    try:
+        obj.extend(add_team_min_constraints(m, roster_system, X, join, leave, grade_strategy=grade_strategy, blocked_by_nurse=blocked_by_nurse))
+    except Exception as e2:
+        print("team_min_constraints(fallback) 예외 발생", e2)
 
     # Grade 제약을 soft penalty로 추가 (distribution 전용)
     try:

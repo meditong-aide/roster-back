@@ -1,0 +1,86 @@
+name: Build - Push - Update Lambda (Roster Solver)
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'app/**'
+      - 'requirements.lambda.txt'
+      - 'Dockerfile.lambda'
+      - '.github/workflows/deploy-lambda.yml'
+
+jobs:
+  build-push-lambda:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set dynamic env vars
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "ENV=prod" >> $GITHUB_ENV
+            echo "ECR_REPO=aide-roster-lambda-prod" >> $GITHUB_ENV
+            echo "DOCKER_TAG=prod-${{ github.sha }}" >> $GITHUB_ENV
+            echo "LAMBDA_FUNCTION=roster-solver-prod" >> $GITHUB_ENV
+          elif [[ "${{ github.ref_name }}" == "dev" ]]; then
+            echo "ENV=dev" >> $GITHUB_ENV
+            echo "ECR_REPO=aide-roster-lambda-dev" >> $GITHUB_ENV
+            echo "DOCKER_TAG=dev-${{ github.sha }}" >> $GITHUB_ENV
+            echo "LAMBDA_FUNCTION=roster-solver-dev" >> $GITHUB_ENV
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Lambda Docker image
+        run: |
+          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
+          docker build -f Dockerfile.lambda -t "$IMAGE_URI" .
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      - name: Push image to ECR
+        run: |
+          docker push "${{ env.IMAGE_URI }}"
+
+      - name: Check Lambda function exists
+        id: check-lambda
+        shell: bash
+        run: |
+          if aws lambda get-function --function-name "${{ env.LAMBDA_FUNCTION }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update Lambda function code
+        if: steps.check-lambda.outputs.exists == 'true'
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ env.LAMBDA_FUNCTION }}" \
+            --image-uri "${{ env.IMAGE_URI }}"
+
+          aws lambda wait function-updated \
+            --function-name "${{ env.LAMBDA_FUNCTION }}"
+
+      - name: Notice — Lambda function not yet created
+        if: steps.check-lambda.outputs.exists == 'false'
+        run: |
+          echo "::warning::Lambda 함수 ${{ env.LAMBDA_FUNCTION }} 가 존재하지 않습니다."
+          echo "::warning::이미지 URI: ${{ env.IMAGE_URI }}"
+          echo "::warning::AWS Console 또는 CLI로 함수 신규 생성 후, 위 URI를 사용하세요."

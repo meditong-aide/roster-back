@@ -1,4 +1,4 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -8,6 +8,37 @@ from schemas.grade_schema import (
     GradeConfigUpsert,
     GradeConfigResponse,
 )
+
+
+def _resolve_grade_names(
+    grade_names_raw: Any,
+    constraints: Optional[Dict[str, Dict[Any, int]]],
+) -> Optional[Dict[str, str]]:
+    """grade_names_json이 비어있으면 constraints_json 키로 기본 매핑을 생성한다.
+
+    fallback 시 value를 빈 문자열로 둠 — 프론트의 trim().length>0 분기에서
+    "Grade N" 자동 라벨이 살아있도록 한다(사용자 미입력 상태 보존).
+    """
+    if isinstance(grade_names_raw, dict) and grade_names_raw:
+        return {str(k): str(v) for k, v in grade_names_raw.items()}
+
+    if not isinstance(constraints, dict) or not constraints:
+        return None
+
+    grade_keys: set[str] = set()
+    for grades_map in constraints.values():
+        if not isinstance(grades_map, dict):
+            continue
+        for g_key in grades_map.keys():
+            try:
+                grade_keys.add(str(int(g_key)))
+            except (TypeError, ValueError):
+                continue
+
+    if not grade_keys:
+        return None
+
+    return {key: "" for key in sorted(grade_keys, key=lambda x: int(x))}
 
 
 def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
@@ -47,6 +78,7 @@ def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
             updated_by=None,
         )
 
+    # constraints = config.constraints_json or {}
     return GradeConfigResponse(
         config_id=config.config_id,
         office_id=config.office_id,
@@ -56,7 +88,6 @@ def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
         allow_soft_fallback=bool(getattr(config, "allow_soft_fallback", False)),
         constraints=config.constraints_json or {},
         constraints_max=config.constraints_max_json or {},
-        grade_names=config.grade_names_json,
         use_mid=_use_mid,
         default_shifts=_normalize_default_shifts(config.default_shifts_json, _use_mid),
         created_at=config.created_at,
@@ -148,6 +179,7 @@ def upsert_grade_config_service(
     db.commit()
     db.refresh(config)
 
+    # constraints_out = config.constraints_json or {}
     return GradeConfigResponse(
         config_id=config.config_id,
         office_id=config.office_id,
@@ -157,7 +189,6 @@ def upsert_grade_config_service(
         allow_soft_fallback=bool(getattr(config, "allow_soft_fallback", False)),
         constraints=config.constraints_json or {},
         constraints_max=config.constraints_max_json or {},
-        grade_names=config.grade_names_json,
         use_mid=use_mid,
         default_shifts=_normalize_default_shifts(config.default_shifts_json, use_mid),
         created_at=config.created_at,

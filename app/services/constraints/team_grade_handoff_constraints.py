@@ -118,6 +118,10 @@ def add_team_grade_handoff_constraints(
 ) -> list:
     """팀×grade 교차 handoff 제약을 추가한다. 목적함수 항 리스트를 반환."""
     obj_terms: list = []
+    _impact_modes = getattr(rs, "_constraint_impact_constraint_modes", None)
+    if _impact_modes is None:
+        _impact_modes = []
+        setattr(rs, "_constraint_impact_constraint_modes", _impact_modes)
     gs = str(grade_strategy or "BASE").upper()
     if gs not in ("COMBINED",):
         return obj_terms
@@ -130,6 +134,15 @@ def add_team_grade_handoff_constraints(
     allow_soft = bool(getattr(cfg, "team_handoff_soft_fallback", True))
     penalty_weight = int(getattr(cfg, "team_handoff_penalty_weight", 80000) or 0)
     num_days = int(rs.num_days)
+    _impact_modes.append({
+        "family": "handoff",
+        "key": "team_grade_handoff:global",
+        "configured_mode": "soft" if allow_soft else "hard",
+        "effective_mode": "soft_fallback" if allow_soft else "enforced",
+        "source_file": "app/services/constraints/team_grade_handoff_constraints.py",
+        "reason": "team grade handoff active",
+        "evidence": {"strategy": gs, "penalty_weight": penalty_weight},
+    })
 
     s_D = _shift_index(rs, "D")
     s_E = _shift_index(rs, "E")

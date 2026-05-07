@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 from db.models import Team, Nurse
+from services.precheck.team_min_shift_capacity_validator import validate_team_min_shift_capacity
 
 
 _ALLOWED_SHIFT_KEYS = ("D", "E", "N", "M")
@@ -159,6 +160,31 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
             if update_hp:
                 team.handoff_policy = handoff_policy_value
 
+        # min_shift 저장 전 검증 (현재 요청의 add/remove 반영한 projected members 기준)
+        if update_ms:
+            current_member_ids = {
+                str(x[0])
+                for x in db.query(Nurse.nurse_id)
+                .filter(Nurse.group_id == group_id, Nurse.team_id == team.team_id)
+                .all()
+            }
+            projected_ids = (current_member_ids | set(add_ids)) - set(remove_ids)
+            vr = validate_team_min_shift_capacity(
+                db,
+                office_id=office_id,
+                group_id=group_id,
+                team_id=team.team_id,
+                new_min_shift=ms_raw if isinstance(ms_raw, dict) else {},
+                projected_member_ids=projected_ids,
+                team_name_hint=team.team_name,
+            )
+            if not vr.get("saveable", True):
+                hard_issues = [i for i in (vr.get("issues") or []) if i.get("severity") == "hard"]
+                first = hard_issues[0] if hard_issues else (vr.get("issues") or [{}])[0]
+                code = first.get("code", "TEAM_MIN_SHIFT_INVALID")
+                msg = first.get("message", "팀 최소 인원 설정이 저장 불가능한 값입니다.")
+                raise ValueError(f"[{code}] {msg}")
+
         # add: 타깃 팀으로 이동(원팀 자동 해제)
         if add_ids:
             db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(add_ids)).update({Nurse.team_id: team.team_id}, synchronize_session=False)
@@ -176,5 +202,4 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
 
     db.commit()
     return list_teams_with_members(db, office_id, group_id)
-
 

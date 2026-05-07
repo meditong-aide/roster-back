@@ -98,7 +98,7 @@ class RosterRequest(BaseModel):
     month: int
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
-    grade_strategy: str = "BASE"  # "BASE" | "TEAM" | "GRADE" | "COMBINED"(=TEAM+GRADE)
+    grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
     # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
     # mode:
@@ -304,7 +304,12 @@ class InboundEntry(BaseModel):
     )
     startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
     endDate: Optional[str] = Field(
-        default=None, description="예정 종료일 ISO 문자열 (미정이면 null)"
+        default=None,
+        description="유효 종료일 ISO 문자열 (end_date 우선, 없으면 expected_end_date)",
+    )
+    expectedEndDate: Optional[str] = Field(
+        default=None,
+        description="예정 종료일 ISO 문자열 (expected_end_date 원본, 미정이면 null)",
     )
     source_group_id: Optional[str] = Field(
         default=None, description="source 그룹 ID (생성/수정 권한 판정용)"
@@ -343,15 +348,18 @@ class CurrentAssignment(BaseModel):
         default=None, description="'파견' / '병동이동' / '휴직' / '퇴사' / '프리셉티'"
     )
     startDate: Optional[str] = Field(default=None, description="시작일 ISO 문자열")
-    endDate: Optional[str] = Field(default=None, description="종료/예정 종료 ISO 문자열")
+    endDate: Optional[str] = Field(
+        default=None,
+        description="유효 종료일 ISO 문자열 (end_date 우선, 없으면 expected_end_date)",
+    )
+    expectedEndDate: Optional[str] = Field(
+        default=None,
+        description="예정 종료일 ISO 문자열 (expected_end_date 원본, 미정이면 null)",
+    )
     source_group_id: Optional[str] = None
     target_group_id: Optional[str] = None
     target_group_name: Optional[str] = None
     note: Optional[str] = Field(default=None, description="assignment별 메모")
-
-
-class InboundBlock(BaseModel):
-    inbound_list: List[InboundEntry] = Field(default_factory=list)
 
 
 class NurseAssignmentPayload(BaseModel):
@@ -445,10 +453,10 @@ class NurseProfile(BaseModel):
         default=False,
         description="호출자 병동이 target(파견/병동이동 수신측)일 때 True",
     )
-    # 기간 설정(파견/병동이동/휴직/퇴사/프리셉티) 활성 이력 (source/target 양쪽에서 동일 표시)
-    inbound: Optional["InboundBlock"] = Field(
-        default=None,
-        description="활성 파견/병동이동/휴직/퇴사/프리셉티 이력 블록. 없으면 null",
+    # 기간 설정(파견/병동이동/휴직/퇴사/프리셉티) 활성 이력.
+    inbound: List["InboundEntry"] = Field(
+        default_factory=list,
+        description="활성 파견/병동이동/휴직/퇴사/프리셉티 이력. 없으면 [].",
     )
     # 현재 대표 1건 flat 요약 (프론트 폼 바인딩용)
     current_assignment: Optional["CurrentAssignment"] = Field(
@@ -458,7 +466,13 @@ class NurseProfile(BaseModel):
     # 일괄 업데이트(POST /bulk-update) 시 동반 전달 가능한 배정 payload
     assignment: Optional[NurseAssignmentPayload] = Field(
         default=None,
-        description="bulk 업데이트와 함께 배정(파견/병동이동/휴직/퇴사/프리셉티) create/update/cancel 수행",
+        description="bulk 업데이트와 함께 배정(파견/병동이동/휴직/퇴사/프리셉티) create/update/cancel 수행 — 단건",
+    )
+    # 사이드 프로필에서 한 번에 여러 파견을 작성/수정/취소할 때 사용하는 다건 payload.
+    # `assignment`(단건) 와 동시 전달되면 둘 다 처리(assignments 먼저, 그 다음 단건).
+    assignments: Optional[List[NurseAssignmentPayload]] = Field(
+        default=None,
+        description="다건 배정 처리 — 한 간호사의 여러 파견을 한 번에 create/update/cancel",
     )
 
     # @field_validator('fixed_shift')
@@ -551,7 +565,9 @@ class NurseProfileUpdate(BaseModel):
     is_head_nurse: Optional[bool] = None
     preceptor_id: Optional[str] = None
     fixed_shift: Optional[str] = None
+    weekly_off_enabled: Optional[int] = None
     weekly_off_weekday: Optional[int] = None
+    weekly_off_type: Optional[str] = None
     is_weekend_off: Optional[bool] = None
     is_night_nurse: Optional[List[str]] = None
     work_shifts: Optional[List[str]] = None
@@ -560,8 +576,60 @@ class NurseProfileUpdate(BaseModel):
     wanted_max_requests: Optional[int] = None
     assignment: Optional[NurseAssignmentPayload] = Field(
         default=None,
-        description="배정(파견/병동이동 등) create/update/cancel을 프로필 수정과 함께 수행",
+        description="배정(파견/병동이동 등) create/update/cancel을 프로필 수정과 함께 수행 — 단건",
     )
+    assignments: Optional[List[NurseAssignmentPayload]] = Field(
+        default=None,
+        description="사이드 프로필에서 여러 파견을 한 번에 create/update/cancel — 다건",
+    )
+
+
+class NurseMonthlyLimitItem(BaseModel):
+    nurse_id: str
+    group_id: str
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+
+    d_min: Optional[int] = Field(default=None, ge=0)
+    d_max: Optional[int] = Field(default=None, ge=0)
+    d_exact: Optional[int] = Field(default=None, ge=0)
+
+    e_min: Optional[int] = Field(default=None, ge=0)
+    e_max: Optional[int] = Field(default=None, ge=0)
+    e_exact: Optional[int] = Field(default=None, ge=0)
+
+    n_min: Optional[int] = Field(default=None, ge=0)
+    n_max: Optional[int] = Field(default=None, ge=0)
+    n_exact: Optional[int] = Field(default=None, ge=0)
+
+    o_min: Optional[int] = Field(default=None, ge=0)
+    o_max: Optional[int] = Field(default=None, ge=0)
+    o_exact: Optional[int] = Field(default=None, ge=0)
+
+
+class NurseMonthlyLimitBulkUpsertRequest(BaseModel):
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+    limits: List[NurseMonthlyLimitItem]
+
+
+class NurseMonthlyLimitWarning(BaseModel):
+    code: str
+    message: str
+    severity: str = "warning"
+
+
+class NurseMonthlyLimitMeta(BaseModel):
+    target_nurse_count: int
+    active_nurse_count: int
+    override_ratio: float
+    recommended_ratio: float = 0.30
+
+
+class NurseMonthlyLimitListResponse(BaseModel):
+    items: List[NurseMonthlyLimitItem]
+    meta: Optional[NurseMonthlyLimitMeta] = None
+    warnings: Optional[List[NurseMonthlyLimitWarning]] = None
 
 
 class PasswordChangeRequest(BaseModel):
@@ -630,6 +698,57 @@ class FixedWantedEntryResponse(BaseModel):
         from_attributes = True
 
 
+class AdjustmentBlockedDay(BaseModel):
+    """원티드 조정 화면에서 저장/편집 불가로 표시해야 하는 일자 1건.
+
+    reason 값:
+    - "outside_dispatch_window": 파견 인바운드 간호사의 파견기간 밖 일자 (원 소속 담당)
+    - "dispatched_elsewhere": 소속 간호사가 타병동 파견중인 기간
+    """
+
+    day: int = Field(description="1~31, 프론트 컬럼 인덱스 즉시 매칭용")
+    date: date
+    reason: str
+
+
+class AdjustmentAssignmentWindow(BaseModel):
+    """간호사의 파견/병동이동 기간 1건 (조회 병동 기준 방향 포함).
+
+    프론트는 이 정보를 이용해 월 그리드에 파견/이동 구간을 표기한다.
+    """
+
+    reason: str = Field(description='"파견" | "병동이동"')
+    direction: str = Field(
+        description='caller 기준 방향. "inbound"(caller==target) | "outbound"(caller==source)'
+    )
+    source_group_id: str
+    source_group_name: str
+    target_group_id: str
+    target_group_name: str
+    start_date: date
+    end_date: Optional[date] = None
+    period_start_day: Optional[int] = Field(
+        default=None, description="해당 월 가시 구간 시작 일자(1~말일)"
+    )
+    period_end_day: Optional[int] = Field(
+        default=None, description="해당 월 가시 구간 종료 일자(1~말일)"
+    )
+    source_schedule_id: Optional[str] = Field(
+        default=None, description="이전(source) 병동 issued schedule_id (없으면 null)"
+    )
+    source_shifts: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description='이전(source) 병동의 가시 구간 일자별 shift_id 매핑. key="day"(str), value=shift_id|null',
+    )
+    target_schedule_id: Optional[str] = Field(
+        default=None, description="변경(target) 병동 issued schedule_id (없으면 null)"
+    )
+    target_shifts: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description='변경(target) 병동의 가시 구간 일자별 shift_id 매핑. key="day"(str), value=shift_id|null',
+    )
+
+
 class AdjustmentNurse(BaseModel):
     """원티드 조정판 - 간호사별 데이터"""
 
@@ -637,9 +756,11 @@ class AdjustmentNurse(BaseModel):
     name: str
     entries: List[FixedWantedEntryResponse]
     monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, "주": 4, ...}
-    # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자 목록.
+    # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자.
     # 프론트는 이 일자를 저장/편집 불가(blocked)로 표기해야 한다.
-    blocked_dates: List[date] = Field(default_factory=list)
+    blocked_days: List[AdjustmentBlockedDay] = Field(default_factory=list)
+    # 해당 간호사의 활성 파견/병동이동 구간 (inbound/outbound 양쪽 포함).
+    assignments: List[AdjustmentAssignmentWindow] = Field(default_factory=list)
 
 
 class AdjustmentResponse(BaseModel):
@@ -771,3 +892,27 @@ class NurseAssignmentResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class AssignmentStatusCounts(BaseModel):
+    """assignment status 별 카운트 (필터와 무관한 전체 집계)."""
+
+    active: int = 0
+    completed: int = 0
+    cancelled: int = 0
+    on_hold: int = 0
+
+
+class NurseAssignmentListResponse(BaseModel):
+    """`GET /nurses/assignments` 리스트 응답 래퍼.
+
+    - items: 현재 status 필터가 적용된 실제 레코드 목록
+    - counts: 동일 범위(office/group/nurse)에서 status 별 전체 카운트
+    - total: counts 합계 (필터 무관 전체 건수)
+    - applied_status: 현재 적용된 status 필터 값 ("active" / "all" / 등)
+    """
+
+    items: List[NurseAssignmentResponse]
+    counts: AssignmentStatusCounts
+    total: int = 0
+    applied_status: Optional[str] = None

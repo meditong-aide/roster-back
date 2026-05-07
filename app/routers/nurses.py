@@ -33,6 +33,9 @@ from schemas.roster_schema import (
     NurseAssignmentCreate,
     NurseAssignmentUpdate,
     NurseAssignmentResponse,
+    NurseAssignmentListResponse,
+    NurseMonthlyLimitBulkUpsertRequest,
+    NurseMonthlyLimitListResponse,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -41,9 +44,11 @@ from services.assignment_service import (
     update_assignment,
     cancel_assignment,
     get_assignments,
+    get_assignment_status_counts,
     flush_pending_transfers,
     flush_expired_preceptees,
     flush_expired_dispatches,
+    flush_expired_leaves,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
@@ -61,6 +66,10 @@ from services.nurse_service import (
     delete_profile_image_service,
     get_profile_image_url,
     update_nurse_profile_service,
+)
+from services.nurse_monthly_limit_service import (
+    list_nurse_monthly_limits_service,
+    upsert_nurse_monthly_limits_service,
 )
 from services.excel_service import (
     create_nurse_template,
@@ -81,6 +90,42 @@ from utils.utils import set_sms
 
 
 router = APIRouter(prefix="/nurses", tags=["nurses"])
+
+
+@router.get("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
+async def get_monthly_limits(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    items = list_nurse_monthly_limits_service(
+        db=db,
+        current_user=current_user,
+        year=year,
+        month=month,
+        group_id=group_id,
+    )
+    _items, _meta, _warnings = items
+    return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
+
+
+@router.put("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
+async def put_monthly_limits(
+    body: NurseMonthlyLimitBulkUpsertRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    items = upsert_nurse_monthly_limits_service(
+        db=db,
+        current_user=current_user,
+        year=body.year,
+        month=body.month,
+        limits=[x.model_dump() for x in body.limits],
+    )
+    _items, _meta, _warnings = items
+    return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
 
 
 def _ensure_office_exists(
@@ -142,6 +187,8 @@ async def get_nurses_in_group(
     flush_expired_preceptees(db)
     # 파견 만료 레이지 체크 (status change only, 안전 작업)
     flush_expired_dispatches(db)
+    # 휴직 만료 레이지 체크 (status change only, 안전 작업)
+    flush_expired_leaves(db)
     print(
         "current_user",
         current_user.nurse_id,
@@ -941,20 +988,39 @@ async def create_nurse_assignment(
     return create_assignment(req, db, current_user=current_user)
 
 
-@router.get("/assignments", response_model=List[NurseAssignmentResponse])
+@router.get("/assignments", response_model=NurseAssignmentListResponse)
 async def get_nurse_assignments(
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[str] = "active",
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """배정 이력 조회"""
+    """배정 이력 조회.
+
+    응답 구조:
+    - items: 현재 status 필터가 적용된 레코드 목록
+    - counts: 동일 범위 전체의 status 별 카운트 (필터 무관)
+    - total: counts 합계
+    - applied_status: 사용된 status 값
+
+    status 기본값은 'active' — cancelled/completed 등 비활성 이력은 기본 미노출.
+    전체 이력이 필요하면 `status=all` 로 호출.
+    """
     office_id = getattr(current_user, "office_id", None)
     if not office_id:
         raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
     _group = group_id or getattr(current_user, "group_id", None)
-    return get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=status)
+    _status = None if status == "all" else status
+    items = get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=_status)
+    counts = get_assignment_status_counts(db, office_id, group_id=_group, nurse_id=nurse_id)
+    total = counts.active + counts.completed + counts.cancelled + counts.on_hold
+    return NurseAssignmentListResponse(
+        items=items,
+        counts=counts,
+        total=total,
+        applied_status=status,
+    )
 
 
 @router.put(
@@ -1042,11 +1108,20 @@ async def get_nurse_by_id(
 async def update_nurse_profile(
     nurse_id: str,
     update_data: NurseProfileUpdate,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
+    """간호사 프로필 수정.
+
+    group_id: 호출 view 의 그룹(=caller_group_id). 미지정 시 current_user.group_id 사용.
+    target view(인바운드 간호사 수정) 에서 호출 시 명시 전달해야 target_* overlay 가
+    정상 적용된다 (미전달 시 항상 source 분기로 처리되어 nurse 자체 컬럼만 변경됨).
+    """
     try:
-        return update_nurse_profile_service(nurse_id, update_data, current_user, db)
+        return update_nurse_profile_service(
+            nurse_id, update_data, current_user, db, view_group_id=group_id,
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -1068,5 +1143,3 @@ async def delete_nurse(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")
-
-

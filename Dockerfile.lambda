@@ -1,0 +1,30 @@
+# ───────── Stage 1: Build (의존성 설치) ─────────
+FROM public.ecr.aws/lambda/python:3.12 AS builder
+
+# wheel 빌드용 도구 (pymssql, scipy, ortools 등 native 빌드 대비)
+RUN dnf install -y gcc gcc-c++ make \
+ && dnf clean all
+
+COPY requirements.lambda.txt /tmp/requirements.lambda.txt
+
+# Lambda 전용 슬림 의존성 install (Phase 2)
+# API 서버용 requirements.txt는 별개로 deploy-ecr.yml이 사용한다.
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir --target /opt/python -r /tmp/requirements.lambda.txt
+
+
+# ───────── Stage 2: Runtime ─────────
+FROM public.ecr.aws/lambda/python:3.12
+
+# 한국 timezone (Lambda Python base는 tzdata 포함)
+ENV TZ=Asia/Seoul
+
+# 빌드 단계에서 install된 의존성을 LAMBDA_TASK_ROOT 으로 복사
+COPY --from=builder /opt/python ${LAMBDA_TASK_ROOT}
+
+# 소스 코드 (의존성 변경 없이 코드만 바뀔 때 캐시 활용)
+COPY app ${LAMBDA_TASK_ROOT}/app
+
+# Lambda handler: <module>.<function>
+# 실제 위치: ${LAMBDA_TASK_ROOT}/app/lambda_handler.py 의 handler() 함수
+CMD ["app.lambda_handler.handler"]

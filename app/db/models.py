@@ -145,6 +145,50 @@ class Nurse(Base):
     # office_id는 컬럼으로 관리
 
 
+class NurseMonthlyLimit(Base):
+    """월별/그룹별 간호사 개인 근무 개수 제한.
+
+    - nurses 는 정적 기본 프로필을 유지하고,
+    - 월별 변동 제한은 이 테이블에서 관리한다.
+    """
+
+    __tablename__ = "nurse_monthly_limits"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+
+    d_min = Column(INTEGER, nullable=True)
+    d_max = Column(INTEGER, nullable=True)
+    d_exact = Column(INTEGER, nullable=True)
+
+    e_min = Column(INTEGER, nullable=True)
+    e_max = Column(INTEGER, nullable=True)
+    e_exact = Column(INTEGER, nullable=True)
+
+    n_min = Column(INTEGER, nullable=True)
+    n_max = Column(INTEGER, nullable=True)
+    n_exact = Column(INTEGER, nullable=True)
+
+    o_min = Column(INTEGER, nullable=True)
+    o_max = Column(INTEGER, nullable=True)
+    o_exact = Column(INTEGER, nullable=True)
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    group = relationship("Group", foreign_keys=[group_id])
+
+    __table_args__ = (
+        UniqueConstraint(
+            "nurse_id", "group_id", "year", "month", name="ux_nurse_monthly_limits_scope"
+        ),
+    )
+
+
 class NurseAssignment(Base):
     """간호사 배정/상태 변경 이력 (파견/휴직/퇴사/프리셉티/병동이동)"""
     __tablename__ = "nurse_assignment"
@@ -590,6 +634,7 @@ class DailyShift(Base):
     e_count_max = Column(SMALLINT, nullable=False, default=0)
     n_count_max = Column(SMALLINT, nullable=False, default=0)
     m_count_max = Column(SMALLINT, nullable=False, default=0)
+    max_enabled = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 
