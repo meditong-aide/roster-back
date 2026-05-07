@@ -5055,9 +5055,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         )
         if has_blocking_issues(precheck_result):
             payload = build_blocking_payload(precheck_result)
+            inf = payload.get("infeasibility", {})
+            issue_codes = sorted({
+                str(i.get("reason_code", "?"))
+                for i in (precheck_result.get("issues") or [])
+            })
             print(
-                f"[Precheck] BLOCKING — {len(precheck_result.get('issues', []))}건. 솔버 호출 생략."
+                f"[Precheck][BLOCKING] {len(precheck_result.get('issues', []))}건 — "
+                f"codes={issue_codes}"
             )
+            print(f"[Precheck][BLOCKING][message] {inf.get('summary_message_ko')}")
+            for s in (inf.get("fix_suggestions_ko") or [])[:5]:
+                print(f"[Precheck][BLOCKING][fix] {s}")
+            print("[Precheck][BLOCKING] 솔버 호출 생략. HTTP 500 응답.")
             try:
                 db.delete(schedule)
                 db.commit()
@@ -5231,14 +5241,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                         ),
                     }
                 )
-                print("[GradeFallback] soft fallback 재시도 성공")
+                print(
+                    "[GradeFallback][AUTO-SOFT][success] grade hard→soft 자동 전환으로 근무표 생성. "
+                    "사용자 응답: HTTP 200, severity=warning, applied_relaxations=['grade_hard_to_soft']"
+                )
                 validation_error = None
             else:
-                print(f"[GradeFallback] soft fallback 재시도 실패: {retry_validation_error}")
+                print(f"[GradeFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
                 validation_error = retry_validation_error
 
     if validation_error:
-        print(f"[RosterGenerate][ValidationError] {validation_error}")
+        print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")
+        print(f"[RosterGenerate][UNRECOVERABLE] applied_relaxations={applied_relaxations}")
         try:
             db.delete(schedule)
             db.commit()
@@ -5251,6 +5265,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 precheck_result=precheck_result,
                 applied_relaxations=applied_relaxations,
                 last_error_reason=str(validation_error),
+            )
+            inf = unrecoverable.get("infeasibility", {})
+            print(
+                f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
+                f"message={inf.get('summary_message_ko')}"
             )
             raise HTTPException(status_code=500, detail=unrecoverable)
         except HTTPException:
@@ -5306,6 +5325,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 hard_violation_count=int(_ci.get("hard_violation_count") or 0),
             )
         )
+        _inf = roster_data.get("infeasibility") or {}
+        _vs = _inf.get("violation_summary") or {}
+        _vs_summary = {k: v.get("count") for k, v in _vs.items()}
+        print(
+            f"[RosterGenerate][response] HTTP 200, severity={_inf.get('severity')}, "
+            f"applied_relaxations={_inf.get('applied_relaxations')}, "
+            f"violations={_vs_summary}"
+        )
+        if _inf.get("severity") == "warning" and _inf.get("summary_message_ko"):
+            print(f"[RosterGenerate][response][message] {_inf['summary_message_ko']}")
     except Exception as _exc:
         print(f"[Infeasibility] payload 빌드 실패(무시): {_exc}")
 
