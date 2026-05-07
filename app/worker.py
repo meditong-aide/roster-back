@@ -1,4 +1,12 @@
 # app/worker.py
+"""Roster solver worker — ECS task와 Lambda 양쪽 공통 진입점.
+
+import 정책:
+    - top-level은 표준 라이브러리만 (os, sys, json, traceback).
+    - 무거운 의존성(sqlalchemy, db.*, schemas.*, services.*)은 함수 내부로 lazy import.
+    - 목적: Lambda init phase 10초 timeout 회피 + ECS 호환 유지.
+"""
+from __future__ import annotations
 import os, sys
 
 # sys.path 설정: app/ 디렉토리를 추가하여 db, schemas 등을 직접 import 가능하게 함
@@ -11,27 +19,14 @@ if project_root not in sys.path:
 
 import json
 import traceback
-from sqlalchemy.orm import Session
 
-# app/ 디렉토리가 sys.path에 있으므로 db, schemas 직접 import 가능
-from db.client2 import SessionLocal
-from db.models import Nurse, RosterConfig
-from schemas.roster_schema import RosterRequest
-from schemas.auth_schema import User as UserSchema
-from services.roster_create_service import generate_roster_service
-from services.job_status_service import (
-    STATUS_FAILED,
-    STATUS_RUNNING,
-    STATUS_SUCCESS,
-    update_job_record,
-)
 
 # =========================================================
 # 사용자 로딩 함수
 # =========================================================
 def load_current_user_by_nurse_id(
-    db: Session, nurse_id: str, override_group_id: str | None = None,
-) -> UserSchema:
+    db, nurse_id: str, override_group_id: str | None = None,
+):
     """
     nurse_id로 간호사를 조회해 생성 엔진이 필요한 최소 UserSchema를 구성한다.
 
@@ -48,6 +43,9 @@ def load_current_user_by_nurse_id(
     예시:
         nurse_id="438390" → office_id, group_id, is_head_nurse 포함한 스키마 반환.
     """
+    from db.models import Nurse
+    from schemas.auth_schema import User as UserSchema
+
     nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse:
         raise RuntimeError(f"해당 nurse_id에 대한 사용자 없음: nurse_id={nurse_id}")
@@ -99,6 +97,19 @@ def process_job(payload: dict) -> dict:
           호출자(SQS event source mapping, ECS exit code)가 재시도/실패 처리를 결정하도록 한다.
           Caller는 exception swallow 금지 — transient 오류 시 메시지 영구 손실 방지.
     """
+    # ↓↓↓ Lazy import: 무거운 모듈을 함수 내부로 이동하여 Lambda init phase 부하 절감.
+    from sqlalchemy.orm import Session  # noqa: F401 — type hint 외에는 미사용
+    from db.client2 import SessionLocal
+    from db.models import RosterConfig
+    from schemas.roster_schema import RosterRequest
+    from services.roster_create_service import generate_roster_service
+    from services.job_status_service import (
+        STATUS_FAILED,
+        STATUS_RUNNING,
+        STATUS_SUCCESS,
+        update_job_record,
+    )
+
     job_id = payload.get("job_id")
     nurse_id = payload.get("nurse_id")
     job_group_id = payload.get("group_id")
