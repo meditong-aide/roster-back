@@ -1,4 +1,12 @@
 # app/worker.py
+"""Roster solver worker — ECS task와 Lambda 양쪽 공통 진입점.
+
+import 정책:
+    - top-level은 표준 라이브러리만 (os, sys, json, traceback).
+    - 무거운 의존성(sqlalchemy, db.*, schemas.*, services.*)은 함수 내부로 lazy import.
+    - 목적: Lambda init phase 10초 timeout 회피 + ECS 호환 유지.
+"""
+from __future__ import annotations
 import os, sys
 
 # sys.path 설정: app/ 디렉토리를 추가하여 db, schemas 등을 직접 import 가능하게 함
@@ -11,27 +19,14 @@ if project_root not in sys.path:
 
 import json
 import traceback
-from sqlalchemy.orm import Session
 
-# app/ 디렉토리가 sys.path에 있으므로 db, schemas 직접 import 가능
-from db.client2 import SessionLocal
-from db.models import Nurse, RosterConfig
-from schemas.roster_schema import RosterRequest
-from schemas.auth_schema import User as UserSchema
-from services.roster_create_service import generate_roster_service
-from services.job_status_service import (
-    STATUS_FAILED,
-    STATUS_RUNNING,
-    STATUS_SUCCESS,
-    update_job_record,
-)
 
 # =========================================================
 # 사용자 로딩 함수
 # =========================================================
 def load_current_user_by_nurse_id(
-    db: Session, nurse_id: str, override_group_id: str | None = None,
-) -> UserSchema:
+    db, nurse_id: str, override_group_id: str | None = None,
+):
     """
     nurse_id로 간호사를 조회해 생성 엔진이 필요한 최소 UserSchema를 구성한다.
 
@@ -48,6 +43,9 @@ def load_current_user_by_nurse_id(
     예시:
         nurse_id="438390" → office_id, group_id, is_head_nurse 포함한 스키마 반환.
     """
+    from db.models import Nurse
+    from schemas.auth_schema import User as UserSchema
+
     nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse:
         raise RuntimeError(f"해당 nurse_id에 대한 사용자 없음: nurse_id={nurse_id}")
@@ -84,54 +82,59 @@ def load_current_user_by_nurse_id(
 # =========================================================
 # 핵심 워커 실행
 # =========================================================
-def main():
-    print("ENV KEYS:", os.environ.keys())
-    print("JOB_JSON RAW:", os.getenv("JOB_JSON"))
-    job_json = os.getenv("JOB_JSON")
-    if not job_json:
-        print("[worker] JOB_JSON 환경변수가 없습니다", file=sys.stderr)
-        sys.exit(2)
+def process_job(payload: dict) -> dict:
+    """SQS / JOB_JSON payload를 받아 솔버를 실행.
 
-    try:
-        payload = json.loads(job_json)
-    except json.JSONDecodeError:
-        print("[worker] JOB_JSON JSON 파싱 실패", file=sys.stderr)
-        sys.exit(2)
+    ECS task와 Lambda 양쪽에서 공통으로 호출되는 진입점.
+
+    인자:
+        payload: {"job_id":..., "nurse_id":..., "group_id":..., "params":{...}}
+    반환:
+        성공 시 {"status": "success", "job_id":..., "result_id":...}
+    예외:
+        - ValueError: payload 자체 부적절 (nurse_id 없음 등). 재시도 무의미.
+        - 그 외 Exception: 솔버 실행/DB 오류. DB STATUS_FAILED 기록 후 그대로 전파하여
+          호출자(SQS event source mapping, ECS exit code)가 재시도/실패 처리를 결정하도록 한다.
+          Caller는 exception swallow 금지 — transient 오류 시 메시지 영구 손실 방지.
+    """
+    # ↓↓↓ Lazy import: 무거운 모듈을 함수 내부로 이동하여 Lambda init phase 부하 절감.
+    from sqlalchemy.orm import Session  # noqa: F401 — type hint 외에는 미사용
+    from db.client2 import SessionLocal
+    from db.models import RosterConfig
+    from schemas.roster_schema import RosterRequest
+    from services.roster_create_service import generate_roster_service
+    from services.job_status_service import (
+        STATUS_FAILED,
+        STATUS_RUNNING,
+        STATUS_SUCCESS,
+        update_job_record,
+    )
 
     job_id = payload.get("job_id")
-    nurse_id = payload.get("nurse_id")  # ⬅ account_id 로 사용한다고 가정
-    job_group_id = payload.get("group_id")  # 그룹 전환 시 실제 대상 그룹 ID
+    nurse_id = payload.get("nurse_id")
+    job_group_id = payload.get("group_id")
     params = payload.get("params", {})
 
     if not nurse_id:
-        print("[worker] nurse_id 값이 필요합니다", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError("nurse_id 값이 필요합니다")
 
-    # params로 RosterRequest 구성 (모델 필드: year, month, config_id, preceptor_gauge 등)
     try:
         req = RosterRequest(**params)
     except Exception as e:
-        print(f"[worker] RosterRequest 생성 오류: {e}", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError(f"RosterRequest 생성 오류: {e}") from e
 
     db: Session = SessionLocal()
     try:
         current_user = load_current_user_by_nurse_id(db, nurse_id, override_group_id=job_group_id)
         print(f"[worker] 작업 시작 job_id={job_id}, nurse_id={nurse_id}, group_id={current_user.group_id}, req={req}")
 
-        try:
-            update_job_record(db, job_id, status=STATUS_RUNNING, progress=10)
-        except Exception as exc:
-            print(f"[worker] Job 상태 업데이트 실패(RUNNING): {exc}", file=sys.stderr)
-            raise
+        update_job_record(db, job_id, status=STATUS_RUNNING, progress=10)
 
-        # 사전 검사: 설정 존재 여부 확인 (없으면 서비스 내부에서 충돌 가능)
         latest_config = None
         if getattr(req, "config_id", None):
             latest_config = db.query(RosterConfig).filter(RosterConfig.config_id == req.config_id).first()
-            print('최종 config 정보', latest_config.__dict__)
+            print('최종 config 정보', latest_config.__dict__ if latest_config else None)
         else:
-            # 간단한 최신 설정 조회 (group 기준)
             latest_config = (
                 db.query(RosterConfig)
                 .filter(RosterConfig.group_id == current_user.group_id)
@@ -139,10 +142,8 @@ def main():
                 .first()
             )
         if not latest_config:
-            print("[worker] RosterConfig가 존재하지 않습니다. 먼저 설정을 등록하거나 config_id를 전달하세요.", file=sys.stderr)
-            sys.exit(2)
+            raise RuntimeError("RosterConfig가 존재하지 않습니다. 먼저 설정을 등록하거나 config_id를 전달하세요.")
 
-        # 핵심: 엔드포인트가 하던 것을 그대로 서비스로 호출
         roster_data = generate_roster_service(req, current_user, db)
         result_id = None
         if isinstance(roster_data, dict):
@@ -154,17 +155,12 @@ def main():
             progress=100,
             result_roster_id=result_id,
         )
-
-        # 필요하면 jobs 테이블에 DONE/요약 기록 (선택)
-        # update_job_status(db, job_id, "DONE", meta=...)
-
         print(f"[worker] 작업 완료 job_id={job_id}; roster_nurses={len(roster_data.get('nurses', []))}")
-        sys.exit(0)
+        return {"status": "success", "job_id": job_id, "result_id": result_id}
 
     except Exception:
         traceback.print_exc()
         err_msg = str(sys.exc_info()[1])
-        # service 예외로 session 트랜잭션이 깨진 상태일 수 있어 rollback 후 status 업데이트 시도
         try:
             db.rollback()
         except Exception as exc_rb:
@@ -178,7 +174,6 @@ def main():
                 error_message=err_msg,
             )
         except Exception as exc2:
-            # 기존 session 으로 실패 → 새 session 으로 재시도 (FAILED 상태 기록 누락 방지)
             print(f"[worker] Job 상태 업데이트 실패(FAILED): {exc2} → 새 session 으로 재시도", file=sys.stderr)
             try:
                 db_retry = SessionLocal()
@@ -194,11 +189,40 @@ def main():
                     db_retry.close()
             except Exception as exc3:
                 print(f"[worker] Job 상태 업데이트 재시도 실패(FAILED): {exc3}", file=sys.stderr)
-        # update_job_status(db, job_id, "FAILED")  # 선택
-        sys.exit(1)
+        # transient 오류(DB 일시 단절, 네트워크 등)도 영구 ack 되지 않도록 caller에 전파한다.
+        raise
 
     finally:
         db.close()
+
+
+def main():
+    """ECS task 진입점: JOB_JSON 환경변수에서 payload 파싱 후 process_job 호출."""
+    print("ENV KEYS:", os.environ.keys())
+    print("JOB_JSON RAW:", os.getenv("JOB_JSON"))
+    job_json = os.getenv("JOB_JSON")
+    if not job_json:
+        print("[worker] JOB_JSON 환경변수가 없습니다", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        payload = json.loads(job_json)
+    except json.JSONDecodeError:
+        print("[worker] JOB_JSON JSON 파싱 실패", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        process_job(payload)
+    except ValueError as e:
+        # payload 자체 오류 (재시도 무의미)
+        print(f"[worker] payload 오류: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        # 처리 실패 (transient 가능) → ECS는 exit(1) 반환, 상위 dispatcher 정책에 위임
+        print(f"[worker] 처리 실패: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":

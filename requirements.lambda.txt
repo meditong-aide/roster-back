@@ -1,0 +1,44 @@
+# Lambda 전용 의존성 (Phase 2 slim) — solver path만 활성화.
+# 제거된 패키지: uvicorn (HTTP 서버), fastapi-mail (이메일), alembic (마이그레이션),
+#               python-jose / passlib (인증), pymysql / psycopg2-binary (안 쓰는 DB),
+#               xlrd / tqdm / timer / tiktoken / optuna,
+#               google-genai / langchain-anthropic / langchain-google-genai /
+#               langchain-openai / langgraph* / langchain-mcp-adapters (LLM agent).
+#
+# holiday_pack.py 의 from langchain_core.tools import tool 의존성을 위해
+# langchain-core 만 명시적으로 유지 (전체 langchain 배제).
+
+# === Solver 핵심 ===
+ortools>=9.12.4544
+numpy[standard]>=2.2.5
+scipy>=1.15.3
+pandas>=2.2.3
+
+# === DB ===
+sqlalchemy>=2.0.41
+pymssql>=2.3.8
+# 안 쓰는 DB이지만 db/client2.py 가 top-level 에서 import → ImportError 회피용 보수 유지
+# Phase 2-C 에서 db/client2.py 정리 시 함께 제거 예정
+pymysql>=1.1.1
+
+# === Schema / HTTPException ===
+pydantic>=2.0
+# Pydantic EmailStr 타입 사용 시 필요 (schemas/roster_schema 등에서 transitive)
+email-validator>=2.0
+fastapi>=0.115.12
+
+# === Holiday support ===
+holidays>=0.76
+langchain-core>=0.3.0
+
+# === Util ===
+python-dotenv
+psutil>=7.0.0
+cryptography>=45.0.5
+
+# === 솔버 path 확실치 않으나 보수적 유지 ===
+# matplotlib: 시각화 (재검증 후 제거 후보)
+# openpyxl: shift_service_mssql 에서 사용 (재검증 후 제거 후보)
+# boto3: AWS SDK (Lambda 환경에서는 lambda runtime이 자체 boto3 제공, 불필요할 수 있음)
+matplotlib>=3.10.3
+openpyxl>=3.1.5
