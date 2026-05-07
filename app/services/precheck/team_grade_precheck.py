@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Any
 
+from services.semantics import attach_reason_code_ontology
+
 
 # ---------------------------------------------------------------------------
 # Input dataclasses
@@ -104,7 +106,11 @@ def _working_capacity(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
 
 
 def _issue(code: str, evidence: Dict[str, Any], severity: str = "hard") -> Dict[str, Any]:
-    return {"reason_code": code, "severity": severity, "evidence": evidence}
+    return attach_reason_code_ontology(
+        reason_code=code,
+        evidence=evidence,
+        severity=severity,
+    )
 
 
 # ---------------------------------------------------------------------------

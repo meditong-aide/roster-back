@@ -42,6 +42,7 @@ from services.cp_sat.off_policy import resolve_effective_off_days
 from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
 from services.day_windows import build_blocked_days
 from services.cp_sat.mid_feasibility import validate_mid_hard_feasibility as _validate_mid_hard_feasibility_impl
+from services.semantics import attach_reason_code_ontology
 
 logger = logging.getLogger(__name__)
 # from db.client2 import _get_mssql_session
@@ -3271,6 +3272,14 @@ def _validate_generated_roster(
     예시:
         총 750칸 중 실근무 0칸이거나 위반 1500건(750×2) 이상 → 메시지 반환.
     """
+    def _with_ontology(msg: str | None) -> str | None:
+        if msg and roster_system is not None:
+            try:
+                setattr(roster_system, "_ontology_last_reason", attach_reason_code_ontology(message=msg, severity="hard"))
+            except Exception:
+                pass
+        return msg
+
     shift_main_map = _build_validation_shift_main_map(roster_system)
     total_cells, work_cells = _count_work_assignments(generated, shift_main_map)
 
@@ -3301,21 +3310,21 @@ def _validate_generated_roster(
         if cp_probe_msg:
             if diag:
                 if probe_comment:
-                    return f"{diag} | [cp_probe={cp_probe_msg}] | {probe_comment}"
-                return f"{diag} | [cp_probe={cp_probe_msg}]"
+                    return _with_ontology(f"{diag} | [cp_probe={cp_probe_msg}] | {probe_comment}")
+                return _with_ontology(f"{diag} | [cp_probe={cp_probe_msg}]")
             if probe_comment:
-                return (
+                return _with_ontology(
                     "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
                     f"| [cp_probe={cp_probe_msg}] | {probe_comment}"
                 )
-            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]"
+            return _with_ontology(f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]")
         # TEMP-PROBE-DELETE: NO_ASSIGNMENT 시 grade hard 충돌 일자/교대를 임시 탐색
         probe_msg = _probe_first_grade_hard_blocker(roster_system)
         if probe_msg:
             print(f"[InfeasibleProbe] {probe_msg}")
             if diag:
-                return f"{diag} | {probe_msg}"
-            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}"
+                return _with_ontology(f"{diag} | {probe_msg}")
+            return _with_ontology(f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}")
 
         # probe로 못 잡힌 경우, grade_max 산술 상한만으로도 즉시 불가능한 케이스를 보조 진단한다.
         try:
@@ -3376,15 +3385,15 @@ def _validate_generated_roster(
                                 f"limits={constrained}"
                             )
                             if diag:
-                                return f"{diag} | {aux}"
-                            return (
+                                return _with_ontology(f"{diag} | {aux}")
+                            return _with_ontology(
                                 "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
                                 f"| {aux} | [comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮습니다. "
                                 "grade_max 중요도를 soft로 낮추거나 상한 완화를 검토하세요."
                             )
         except Exception as _aux_exc:
             print(f"[InfeasibleProbe][aux] grade_max 보조진단 실패(무시): {_aux_exc}")
-        return diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다."
+        return _with_ontology(diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다.")
 
     # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
     try:
@@ -3426,9 +3435,9 @@ def _validate_generated_roster(
                 if total_actual == 0:
                     diag = _build_infeasible_diagnosis(roster_system, generated)
                     if diag:
-                        return diag
+                        return _with_ontology(diag)
                     req_msg = ", ".join(f"{k}={v}" for k, v in req.items())
-                    return (
+                    return _with_ontology(
                         f"[reason_code=DAY_ZERO_COVERAGE] Infeasible 진단: "
                         f"{d + 1}일 필수 근무 미배정 (요구: {req_msg})"
                     )
