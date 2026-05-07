@@ -23,6 +23,8 @@ pymysql>=1.1.1
 
 # === Schema / HTTPException ===
 pydantic>=2.0
+# Pydantic EmailStr 타입 사용 시 필요 (schemas/roster_schema 등에서 transitive)
+email-validator>=2.0
 fastapi>=0.115.12
 
 # === Holiday support ===
