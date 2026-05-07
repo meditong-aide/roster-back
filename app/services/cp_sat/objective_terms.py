@@ -744,28 +744,26 @@ def build_main_objective_terms(
         if grade_strategy in ("TEAM", "COMBINED"):
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
 
-    # (4-6-tm) team_min 하드/소프트 제약은 LNS 라운드에서도 유지되어야 하므로 게이트 밖으로 분리
+    # (4-6-tm) team_min 제약: 데이터(team_min_by_team) 존재 여부만으로 활성. strategy는 weight tilt용.
     try:
         _gs_tm = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        if _gs_tm in ("TEAM", "COMBINED"):
-            obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy=_gs_tm, blocked_by_nurse=blocked_by_nurse))
+        obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy=_gs_tm, blocked_by_nurse=blocked_by_nurse))
     except Exception as e:
         print("team_min_constraints 예외 발생", e)
 
-    # (4-6a) Grade 분배 목적 항 (fallback Stage3와 동일)
+    # (4-6a) Grade 분배 제약: grade_config 존재 여부만으로 활성. strategy는 weight tilt용.
     try:
         _gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        if _gs in ("GRADE", "COMBINED"):
-            grade_terms = add_grade_constraints(
-                m=m,
-                rs=rs,
-                X=X,
-                join=join,
-                leave=leave,
-                grade_strategy=_gs,
-                grade_config=getattr(rs, "grade_config", None),
-            )
-            obj.extend(grade_terms or [])
+        grade_terms = add_grade_constraints(
+            m=m,
+            rs=rs,
+            X=X,
+            join=join,
+            leave=leave,
+            grade_strategy=_gs,
+            grade_config=getattr(rs, "grade_config", None),
+        )
+        obj.extend(grade_terms or [])
     except Exception:
         pass
 

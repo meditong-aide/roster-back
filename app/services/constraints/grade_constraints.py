@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 from typing import Any
 
@@ -35,12 +34,15 @@ def add_grade_constraints(
     if _impact_modes is None:
         _impact_modes = []
         setattr(rs, "_constraint_impact_constraint_modes", _impact_modes)
-    if str(grade_strategy or "").upper() not in ("GRADE", "COMBINED"):
-        return []
     if grade_config is None:
         return []
 
-    constraints_map, max_constraints_map, policy, scaling = _parse_grade_config(grade_config)
+    constraints_map, max_constraints_map, scaling = _parse_grade_config(grade_config)
+    # grade_strategy=GRADE 이면 grade weight 가중치를 끌어올림(선호 신호).
+    gs = str(grade_strategy or "").upper()
+    if gs == "GRADE":
+        scaling = dict(scaling)
+        scaling["grade_penalty_weight"] = int(scaling["grade_penalty_weight"]) * 4
     _impact_modes.append({
         "family": "grade_min",
         "key": "grade_min:global",
@@ -69,7 +71,6 @@ def add_grade_constraints(
     by_grade, is_night_only = _build_grade_groups(
         rs=rs,
         grade_values=grade_values,
-        null_grade_policy=policy["null_grade_policy"],
     )
     print('by_grade', by_grade)
     print('is_night_only', is_night_only)
@@ -168,36 +169,6 @@ def _normalize_grade_int(value: Any) -> int | None:
     return v
 
 
-def _average_grade_or_lowest(grades: list[int | None], fallback: int) -> int:
-    """주어진 grade 목록의 평균(반올림)을 계산하고, 전부 None이면 fallback을 반환한다."""
-    vals = [g for g in grades if g is not None]
-    if not vals:
-        return int(fallback)
-    avg = sum(vals) / float(len(vals))
-    return int(math.floor(avg + 0.5))
-
-
-def _resolve_null_or_unknown_grade(
-    policy: str,
-    nurse_db_id: str,
-    avg_grade: int,
-    grade_values: list[int],
-) -> int:
-    """NULL 또는 정의역 밖 Grade를 정책에 따라 결정적으로 변환한다."""
-    p = str(policy or "LOWEST").upper()
-    if p == "LOWEST":
-        return int(max(grade_values))
-    if p == "AVERAGE":
-        # 평균값이 정의역 밖이면 가장 가까운 값으로 스냅한다.
-        return _snap_to_domain(avg_grade, grade_values)
-    if p == "RANDOM":
-        # 해시 기반 결정적 매핑: md5(nurse_id) % len(grade_values)
-        h = hashlib.md5(nurse_db_id.encode("utf-8")).hexdigest()
-        idx = int(h[:8], 16) % len(grade_values)
-        return int(grade_values[idx])
-    return int(max(grade_values))
-
-
 def _shrink_targets_to_req_dynamic(target: dict[int, int], req: int) -> None:
     """target 합계가 req를 초과하면 감소시켜 req 이하로 맞춘다(가드)."""
     total = sum(target.values())
@@ -211,21 +182,6 @@ def _shrink_targets_to_req_dynamic(target: dict[int, int], req: int) -> None:
             break
         target[g] -= 1
         total -= 1
-
-
-def _fill_targets_to_req_dynamic(target: dict[int, int], base_min: dict[int, int], req: int) -> None:
-    """target 합계가 req보다 작으면 base_min이 큰 grade부터 채운다."""
-    total = sum(target.values())
-    if total >= req:
-        return
-    # base_min 큰 순으로 반복 증가(동률이면 grade 낮은 쪽 우선)
-    order = sorted(target.keys(), key=lambda g: (-base_min.get(g, 0), g))
-    i = 0
-    while total < req:
-        g = order[i % len(order)]
-        target[g] += 1
-        total += 1
-        i += 1
 
 
 def _available_by_grade_for_day_shift(
@@ -278,18 +234,11 @@ def _extract_grade_values_from_constraints(*constraints_maps: Any) -> list[int]:
     return sorted(grades)
 
 
-def _snap_to_domain(value: int, domain: list[int]) -> int:
-    """정수 value를 domain 내 가장 가까운 값으로 스냅한다(동률이면 작은 값)."""
-    if not domain:
-        return value
-    return min(domain, key=lambda d: (abs(d - value), d))
-
-
-def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict, dict]:
-    """grade_config 딕셔너리에서 제약/정책/스케일 파라미터를 추출한다.
+def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict]:
+    """grade_config 딕셔너리에서 제약/스케일 파라미터를 추출한다.
 
     Returns:
-        (constraints_map, max_constraints_map, policy, scaling)
+        (constraints_map, max_constraints_map, scaling)
 
     Notes:
         - `constraints` / `constraints_json`: shift별 grade 최소 인원(min)
@@ -302,9 +251,6 @@ def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict,
         or grade_config.get("constraints_max_json")
         or {}
     )
-    policy = {
-        "null_grade_policy": str(grade_config.get("null_grade_policy") or "LOWEST").upper(),
-    }
     min_ratio_floor = grade_config.get("min_ratio_floor", None)
     if min_ratio_floor is not None:
         try:
@@ -318,55 +264,23 @@ def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict,
         "allow_soft_fallback": _to_bool(grade_config.get("allow_soft_fallback", False), False),
         "grade_penalty_weight": int(grade_config.get("grade_penalty_weight", 160000)),
     }
-    return constraints_map, max_constraints_map, policy, scaling
+    return constraints_map, max_constraints_map, scaling
 
 
 def _build_grade_groups(
     rs: RosterSystem,
     grade_values: list[int],
-    null_grade_policy: str,
 ) -> tuple[dict[int, list[int]], list[bool]]:
     """간호사 grade를 정의역(grade_values)에 맞게 매핑하고, grade별 인덱스 그룹을 만든다.
 
-    정책:
-    - 정의역 밖(=제약에 명시되지 않은) grade는 항상 제외한다.
-      즉, grade min/max 집계에서 완전히 빠진다.
-    - NULL grade만 null_grade_policy에 따라 처리한다.
+    정의역(grade_values) 밖이거나 NULL인 grade는 grade min/max 집계에서 완전히 빠진다.
+    이들은 다른 제약(커버리지 등)에 의해 자유롭게 배정되며, grade 분배에는 영향이 없다.
     """
     raw_grades = [_normalize_grade_int(getattr(n, "grade", None)) for n in rs.nurses]
-    print('raw_grades', raw_grades)
-    policy = str(null_grade_policy or "LOWEST").upper()
-
-    mapped: list[int | None] = []
-    avg_grade = _average_grade_or_lowest(raw_grades, fallback=max(grade_values))
-    if policy == "EXCLUDE":
-        for g in raw_grades:
-            # EXCLUDE 정책: NULL/정의역 밖 모두 제외
-            mapped.append(g if g in grade_values else None)
-    else:
-        print('avg_grade', avg_grade)
-        for i, g in enumerate(raw_grades):
-            if g in grade_values:
-                mapped.append(g)  # type: ignore[arg-type]
-                continue
-            if g is not None and g not in grade_values:
-                # 제약에 명시되지 않은 grade는 정책과 무관하게 제외(중립 처리)
-                mapped.append(None)
-                continue
-            mapped.append(
-                _resolve_null_or_unknown_grade(
-                    policy=policy,
-                    nurse_db_id=str(getattr(rs.nurses[i], "db_id", i)),
-                    avg_grade=avg_grade,
-                    grade_values=grade_values,
-                )
-            )
-
     by_grade: dict[int, list[int]] = {g: [] for g in grade_values}
-    for idx, g in enumerate(mapped):
-        if g is None:
-            continue
-        by_grade.setdefault(g, []).append(idx)
+    for idx, g in enumerate(raw_grades):
+        if g in grade_values:
+            by_grade.setdefault(g, []).append(idx)
 
     is_night_only = [bool(getattr(n, "is_night_nurse", 0) == 3) for n in rs.nurses]
     return by_grade, is_night_only
@@ -481,7 +395,6 @@ def _compute_targets(
         target[1] = 1
 
     _shrink_targets_to_req_dynamic(target, req)
-    _fill_targets_to_req_dynamic(target, base_min, req)
     return target
 
 

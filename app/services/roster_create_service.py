@@ -442,7 +442,6 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     """
     def _default() -> dict:
         return {
-            "null_grade_policy": "LOWEST",
             "use_dynamic_scaling": True,
             "allow_soft_fallback": False,
             "constraints_json": {},
@@ -477,7 +476,6 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
             text(
                 """
                 SELECT TOP 1
-                    null_grade_policy,
                     use_dynamic_scaling,
                     allow_soft_fallback,
                     CAST(constraints_json AS NVARCHAR(MAX)) AS constraints_json_text,
@@ -497,7 +495,6 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
         return _default()
 
     return {
-        "null_grade_policy": (getattr(row, "null_grade_policy", None) or "LOWEST"),
         "use_dynamic_scaling": bool(getattr(row, "use_dynamic_scaling", True)),
         "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
         "constraints_json": _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json"),
@@ -3626,6 +3623,50 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
     return roster_data
 
 
+def _compute_coverage_gaps(roster_system) -> list[dict]:
+    """현재 roster vs daily_shift_requirements 비교해 부족분 리스트를 반환.
+
+    primary 솔버는 coverage hard지만, INFEASIBLE 시 fallback에서 soft로 떨어져
+    shortage가 남을 수 있다. 사용자 진단용으로 일/시프트별 부족 셀을 노출한다.
+    """
+    try:
+        cfg = roster_system.config
+        shift_types = list(getattr(cfg, "shift_types", []) or [])
+        if not shift_types or not hasattr(roster_system, "roster"):
+            return []
+        ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+        N = len(roster_system.nurses)
+        gaps: list[dict] = []
+        for d in range(roster_system.num_days):
+            need_map = (
+                ds_by_day[d]
+                if isinstance(ds_by_day, list) and d < len(ds_by_day) and isinstance(ds_by_day[d], dict)
+                else base_req
+            )
+            for code, req_val in (need_map or {}).items():
+                s_code = str(code or "").strip().upper()
+                if s_code not in shift_types:
+                    continue
+                req = int(req_val or 0)
+                if req <= 0:
+                    continue
+                s_idx = shift_types.index(s_code)
+                assigned = int(sum(int(roster_system.roster[n, d, s_idx]) for n in range(N)))
+                if assigned < req:
+                    gaps.append({
+                        "day": d + 1,
+                        "shift": s_code,
+                        "need": req,
+                        "assigned": assigned,
+                        "short": req - assigned,
+                    })
+        return gaps
+    except Exception as exc:
+        print(f"[CoverageGaps] 계산 실패: {exc}")
+        return []
+
+
 def _build_constraint_impact_payload(roster_system, req) -> dict:
     """생성 완료된 roster_system 기준 constraint-impact 요약을 생성한다."""
     started = time.perf_counter()
@@ -3644,6 +3685,8 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
         atoms = build_current_atoms_from_roster_system(snapshot, roster_system)
         analysis = analyze_current_roster(snapshot=snapshot, current_atoms=atoms)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        used_fallback = bool(getattr(roster_system, "_used_fallback", False))
+        coverage_gaps = _compute_coverage_gaps(roster_system)
         return {
             "enabled": True,
             "timing_ms": elapsed_ms,
@@ -3678,10 +3721,13 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
                 "attempt_label": snapshot.attempt.label,
                 "attempt_index": snapshot.attempt.attempt_index,
                 "forced_grade_soft_fallback": snapshot.attempt.forced_grade_soft_fallback,
+                "used_fallback": used_fallback,
                 "nurse_count": len(snapshot.nurses),
                 "fixed_cell_count": len(snapshot.fixed_cells),
                 "preceptee_count": len(snapshot.preceptee_facts),
             },
+            "solver_status": "fallback" if used_fallback else "primary",
+            "coverage_gaps": coverage_gaps,
         }
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)

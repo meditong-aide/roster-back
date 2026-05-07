@@ -4263,7 +4263,6 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
 # ─────────────────────────────────────────────────────────────
 import csv
 import os
-import hashlib
 
 
 def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_prefix: str = "[CP-SAT-Basic]"):
@@ -4286,31 +4285,17 @@ def _dump_grade_summary(rs: RosterSystem, nurses, grade_config: dict, logger_pre
                 continue
     grade_values = sorted(grades) or [1, 2, 3]
 
-    # NULL Grade 처리 정책
-    null_policy = str(grade_config.get("null_grade_policy") or "LOWEST").upper()
-    valid_grades = [n.grade for n in nurses if getattr(n, "grade", None) is not None]
-    avg_grade = round(sum(valid_grades) / len(valid_grades)) if valid_grades else max(grade_values)
-
     def _resolve_grade(nurse):
         g = getattr(nurse, "grade", None)
-        if g is not None:
-            try:
-                gi = int(g)
-                if gi in grade_values:
-                    return gi
-            except Exception:
-                pass
-        if null_policy == "EXCLUDE":
+        if g is None:
             return None
-        if null_policy == "AVERAGE":
-            return avg_grade if avg_grade in grade_values else max(grade_values)
-        if null_policy == "RANDOM":
-            h = hashlib.md5(str(getattr(nurse, "db_id", nurse.name)).encode()).hexdigest()
-            return grade_values[int(h[:8], 16) % len(grade_values)]
-        # LOWEST
-        return max(grade_values)
+        try:
+            gi = int(g)
+        except Exception:
+            return None
+        return gi if gi in grade_values else None
 
-    nurse_grades = [ _resolve_grade(n) for n in nurses ]
+    nurse_grades = [_resolve_grade(n) for n in nurses]
 
     rows = []
     for d in range(rs.num_days):
@@ -4393,27 +4378,16 @@ def _log_grade_result(
             except (TypeError, ValueError):
                 continue
     grade_values = sorted(_grades) if _grades else [1, 2, 3]
-    null_policy = str(grade_config.get("null_grade_policy") or "LOWEST").upper()
-    valid_grades = [getattr(n, "grade", None) for n in nurses if getattr(n, "grade", None) is not None]
-    avg_grade = round(sum(valid_grades) / len(valid_grades)) if valid_grades else max(grade_values)
 
     def _resolve_grade(nurse):
         g = getattr(nurse, "grade", None)
-        if g is not None:
-            try:
-                gi = int(g)
-                if gi in grade_values:
-                    return gi
-            except Exception:
-                pass
-        if null_policy == "EXCLUDE":
+        if g is None:
             return None
-        if null_policy == "AVERAGE":
-            return avg_grade if avg_grade in grade_values else max(grade_values)
-        if null_policy == "RANDOM":
-            h = hashlib.md5(str(getattr(nurse, "db_id", getattr(nurse, "name", ""))).encode()).hexdigest()
-            return grade_values[int(h[:8], 16) % len(grade_values)]
-        return max(grade_values)
+        try:
+            gi = int(g)
+        except Exception:
+            return None
+        return gi if gi in grade_values else None
 
     nurse_grades = [_resolve_grade(n) for n in nurses]
 

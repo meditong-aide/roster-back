@@ -1977,12 +1977,11 @@ def optimize_fallback_lex_hard_first(
         if stage in (1, 2):
             try:
                 _gs_tm = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
-                if _gs_tm in ("TEAM", "COMBINED"):
-                    add_team_min_constraints(
-                        m, roster_system, X, join, leave,
-                        grade_strategy=_gs_tm,
-                        blocked_by_nurse=blocked_by_nurse,
-                    )
+                add_team_min_constraints(
+                    m, roster_system, X, join, leave,
+                    grade_strategy=_gs_tm,
+                    blocked_by_nurse=blocked_by_nurse,
+                )
             except Exception as e:
                 print(f"{logger_prefix} [Stage{stage}] team_min hard 등록 실패: {e}")
 
@@ -1995,7 +1994,7 @@ def optimize_fallback_lex_hard_first(
             _allow_soft_fb = True
             if isinstance(_gc_fb, dict):
                 _allow_soft_fb = bool(_gc_fb.get("allow_soft_fallback", False))
-            if _gs_fb in ("GRADE", "COMBINED") and isinstance(_gc_fb, dict) and not _allow_soft_fb:
+            if isinstance(_gc_fb, dict) and not _allow_soft_fb:
                 add_grade_constraints_fn(
                     m=m,
                     rs=roster_system,
