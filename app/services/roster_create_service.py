@@ -5031,6 +5031,47 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         )
     )
 
+    # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
+    precheck_result: dict | None = None
+    try:
+        from services.precheck import (
+            run_runtime_precheck,
+            has_blocking_issues,
+            build_blocking_payload,
+        )
+        _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
+        _nurses_dict_for_precheck = [
+            (n.__dict__ if hasattr(n, "__dict__") else dict(n))
+            for n in (nurses_for_engine or [])
+        ]
+        precheck_result = run_runtime_precheck(
+            nurses_dict=_nurses_dict_for_precheck,
+            config_dict=config_dict,
+            grade_config=_engine_grade_config,
+            fixed_cells=combined_fixed_cells,
+            year=req.year,
+            month=req.month,
+            stop_on_config_error=False,
+        )
+        if has_blocking_issues(precheck_result):
+            payload = build_blocking_payload(precheck_result)
+            print(
+                f"[Precheck] BLOCKING — {len(precheck_result.get('issues', []))}건. 솔버 호출 생략."
+            )
+            try:
+                db.delete(schedule)
+                db.commit()
+            except Exception:
+                db.rollback()
+            from fastapi import HTTPException
+            raise HTTPException(status_code=500, detail=payload)
+    except HTTPException:
+        raise
+    except Exception as _pre_exc:
+        # precheck 자체가 실패하면 무시하고 솔버 진행
+        print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
+        precheck_result = None
+
     if nurses_for_engine:
         # _debug_log(
         #     "cp_sat_start",
@@ -5116,13 +5157,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         config_context=config_dict,
         grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
     )
+    applied_relaxations: list[str] = []
     if validation_error:
-        _is_grade_max_case = (
-            ("MAX_CAP_SHORTAGE" in validation_error)
+        # 자연 soft 트리거: NO_ASSIGNMENT 또는 grade_max 병목, 그리고 아직 soft 미적용
+        _trigger_soft = (
+            ("NO_ASSIGNMENT" in validation_error)
+            or ("MAX_CAP_SHORTAGE" in validation_error)
             or ("GRADE_MAX_SUM_BELOW_NEED" in validation_error)
         )
-        if _is_grade_max_case and not bool(config_dict.get("_force_grade_max_soft_fallback")):
-            print("[GradeFallback] grade_max 병목 감지 → grade_max soft fallback으로 1회 재시도")
+        if _trigger_soft and not bool(config_dict.get("_force_grade_max_soft_fallback")):
+            print("[GradeFallback] infeasible 감지 → grade hard→soft 자동 전환으로 1회 재시도")
             soft_cfg = dict(config_dict)
             soft_cfg["_force_grade_max_soft_fallback"] = True
             retry_generated, _, retry_rs = _run_cp_sat_basic(
@@ -5177,10 +5221,14 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             if not retry_validation_error:
                 generated = retry_generated
                 roster_system = retry_rs
+                applied_relaxations.append("grade_hard_to_soft")
                 weekly_off_warnings.append(
                     {
-                        "type": "grade_max_soft_fallback_applied",
-                        "detail": "grade_max 병목으로 infeasible 발생하여 grade_max를 soft로 완화해 재생성했습니다.",
+                        "type": "grade_hard_to_soft_applied",
+                        "detail": (
+                            "Grade hard 제약이 infeasible로 인해 자동 soft 전환되어 재생성됐습니다. "
+                            "일부 grade 최소가 미충족일 수 있습니다."
+                        ),
                     }
                 )
                 print("[GradeFallback] soft fallback 재시도 성공")
@@ -5191,9 +5239,24 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
 
     if validation_error:
         print(f"[RosterGenerate][ValidationError] {validation_error}")
-        db.delete(schedule)
-        db.commit()
-        raise Exception(validation_error)
+        try:
+            db.delete(schedule)
+            db.commit()
+        except Exception:
+            db.rollback()
+        try:
+            from services.precheck import build_unrecoverable_payload
+            from fastapi import HTTPException
+            unrecoverable = build_unrecoverable_payload(
+                precheck_result=precheck_result,
+                applied_relaxations=applied_relaxations,
+                last_error_reason=str(validation_error),
+            )
+            raise HTTPException(status_code=500, detail=unrecoverable)
+        except HTTPException:
+            raise
+        except Exception:
+            raise Exception(validation_error)
 
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
@@ -5231,6 +5294,20 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     roster_data["weekly_off_conflicts"] = weekly_off_conflicts
     roster_data["weekly_off_warnings"] = weekly_off_warnings
     roster_data["constraint_impact"] = _build_constraint_impact_payload(roster_system, req)
+    # ── infeasibility 페이로드 (precheck warning + applied_relaxations + violation summary) ──
+    try:
+        from services.precheck import build_success_payload
+        _ci = roster_data.get("constraint_impact") or {}
+        roster_data.update(
+            build_success_payload(
+                precheck_result=precheck_result,
+                applied_relaxations=applied_relaxations,
+                violated_constraints=_ci.get("violated_constraints") or [],
+                hard_violation_count=int(_ci.get("hard_violation_count") or 0),
+            )
+        )
+    except Exception as _exc:
+        print(f"[Infeasibility] payload 빌드 실패(무시): {_exc}")
 
     # ── assignment 대상자 근무표 생성 알림 (S09) ──
     try:
