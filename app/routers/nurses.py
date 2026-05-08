@@ -94,21 +94,18 @@ router = APIRouter(prefix="/nurses", tags=["nurses"])
 
 @router.get("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
 async def get_monthly_limits(
-    year: int,
-    month: int,
-    group_id: Optional[str] = None,
+    group_id: str,
+    nurse_id: str,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
     items = list_nurse_monthly_limits_service(
         db=db,
         current_user=current_user,
-        year=year,
-        month=month,
         group_id=group_id,
+        nurse_id=nurse_id,
     )
-    _items, _meta, _warnings = items
-    return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
+    return NurseMonthlyLimitListResponse(items=items, meta=None, warnings=None)
 
 
 @router.put("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
