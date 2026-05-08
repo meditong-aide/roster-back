@@ -145,7 +145,50 @@ def _compute_override_meta_and_warnings(
     return meta, warnings
 
 
+def _row_to_item(r: NurseMonthlyLimit) -> NurseMonthlyLimitItem:
+    return NurseMonthlyLimitItem(
+        nurse_id=str(r.nurse_id),
+        group_id=str(r.group_id),
+        year=int(r.year),
+        month=int(r.month),
+        d_min=r.d_min,
+        d_max=r.d_max,
+        d_exact=r.d_exact,
+        e_min=r.e_min,
+        e_max=r.e_max,
+        e_exact=r.e_exact,
+        n_min=r.n_min,
+        n_max=r.n_max,
+        n_exact=r.n_exact,
+        o_min=r.o_min,
+        o_max=r.o_max,
+        o_exact=r.o_exact,
+    )
+
+
 def list_nurse_monthly_limits_service(
+    db: Session,
+    current_user: UserSchema,
+    group_id: str,
+    nurse_id: str,
+) -> List[NurseMonthlyLimitItem]:
+    if (
+        not current_user.is_master_admin
+        and str(group_id) != str(current_user.group_id)
+    ):
+        raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 조회할 수 없습니다.")
+    rows = (
+        db.query(NurseMonthlyLimit)
+        .filter(
+            NurseMonthlyLimit.group_id == group_id,
+            NurseMonthlyLimit.nurse_id == nurse_id,
+        )
+        .all()
+    )
+    return [_row_to_item(r) for r in rows]
+
+
+def _list_by_year_month(
     db: Session,
     current_user: UserSchema,
     year: int,
@@ -153,12 +196,6 @@ def list_nurse_monthly_limits_service(
     group_id: Optional[str] = None,
 ) -> Tuple[List[NurseMonthlyLimitItem], Optional[NurseMonthlyLimitMeta], List[NurseMonthlyLimitWarning]]:
     gid = group_id or current_user.group_id
-    if (
-        not current_user.is_master_admin
-        and group_id is not None
-        and str(group_id) != str(current_user.group_id)
-    ):
-        raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 조회할 수 없습니다.")
     q = db.query(NurseMonthlyLimit).filter(
         NurseMonthlyLimit.year == year,
         NurseMonthlyLimit.month == month,
@@ -168,31 +205,9 @@ def list_nurse_monthly_limits_service(
             q = q.filter(NurseMonthlyLimit.group_id == group_id)
     else:
         q = q.filter(NurseMonthlyLimit.group_id == gid)
-    rows = q.all()
-    items = [
-        NurseMonthlyLimitItem(
-            nurse_id=str(r.nurse_id),
-            group_id=str(r.group_id),
-            year=int(r.year),
-            month=int(r.month),
-            d_min=r.d_min,
-            d_max=r.d_max,
-            d_exact=r.d_exact,
-            e_min=r.e_min,
-            e_max=r.e_max,
-            e_exact=r.e_exact,
-            n_min=r.n_min,
-            n_max=r.n_max,
-            n_exact=r.n_exact,
-            o_min=r.o_min,
-            o_max=r.o_max,
-            o_exact=r.o_exact,
-        )
-        for r in rows
-    ]
+    items = [_row_to_item(r) for r in q.all()]
     meta: Optional[NurseMonthlyLimitMeta] = None
     warnings: List[NurseMonthlyLimitWarning] = []
-    # 관리자 전체 조회(group_id 미지정)는 group 단위 비율 통계가 모호하므로 meta/warnings 생략
     if gid and (not current_user.is_master_admin or group_id is not None):
         meta, warnings = _compute_override_meta_and_warnings(
             db,
@@ -498,7 +513,7 @@ def upsert_nurse_monthly_limits_service(
 
     db.commit()
     groups_touched = {str(r.get("group_id")) for r in normalized}
-    return list_nurse_monthly_limits_service(
+    return _list_by_year_month(
         db,
         current_user,
         year,
