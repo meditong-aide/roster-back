@@ -191,6 +191,9 @@ app.include_router(grade.router)
 app.include_router(jobs.router)
 app.include_router(roster_precheck.router)
 
+from routers import constraint_impact as constraint_impact_router
+app.include_router(constraint_impact_router.router)
+
 # Agent v2 test chat UI
 from agents_v2.test_chat_router import router as agent_test_router
 app.include_router(agent_test_router)

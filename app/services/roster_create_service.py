@@ -3696,6 +3696,77 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         used_fallback = bool(getattr(roster_system, "_used_fallback", False))
         coverage_gaps = _compute_coverage_gaps(roster_system)
+
+        # Phase B: surface solver-attach-point emit recordings.
+        # Outcome-conditional retention:
+        #   SAT  → aggregate + interesting_events (bypassed_by_fixed) only
+        #   UNSAT/infeasibility → full granular records + ConflictProbeReport
+        emit_rec = getattr(roster_system, "_constraint_impact_solver_emit_recorder", None)
+        emit_summary: dict[str, dict[str, int]] = {}
+        interesting_events: list[dict] = []
+        full_records_for_unsat: list[dict] = []
+        conflict_probe_payload: dict | None = None
+        outcome_label = "sat" if analysis.valid_under_current_semantics else "unsat"
+        if emit_rec is not None:
+            try:
+                records = emit_rec.records()
+                for r in records:
+                    fam = emit_summary.setdefault(r.family, {})
+                    fam[r.mode] = fam.get(r.mode, 0) + 1
+                    if r.mode != "enforced":
+                        interesting_events.append(r.to_dict())
+                if outcome_label == "unsat":
+                    # cap per family to keep payload bounded; agents can re-fetch via dedicated endpoint
+                    per_family_cap = 50
+                    counter: dict[str, int] = {}
+                    for r in records:
+                        c = counter.get(r.family, 0)
+                        if c >= per_family_cap:
+                            continue
+                        counter[r.family] = c + 1
+                        full_records_for_unsat.append(r.to_dict())
+                    from services.constraint_impact.conflict_probe import (
+                        build_conflict_probe_report,
+                    )
+                    probe = build_conflict_probe_report(emit_records=records)
+                    conflict_probe_payload = {
+                        "ranked_candidates": [
+                            {
+                                "family": c.family,
+                                "score": c.score,
+                                "relaxation_priority": c.relaxation_priority,
+                                "scope_explosion": c.scope_explosion,
+                                "emit_count": c.emit_count,
+                                "matched_scenario_ids": c.matched_scenario_ids,
+                                "reasons": c.reasons,
+                                "sample_records": c.sample_records,
+                            }
+                            for c in probe.ranked_candidates
+                        ],
+                        "matched_scenarios": [
+                            {
+                                "scenario_id": s.scenario_id,
+                                "involved_families": s.involved_families,
+                                "confidence": s.confidence,
+                                "suggested_relaxation": s.suggested_relaxation,
+                                "why_infeasible": s.why_infeasible,
+                                "detection_hint": s.detection_hint,
+                            }
+                            for s in probe.matched_scenarios
+                        ],
+                        "probe_plan": [
+                            {
+                                "order": p.order,
+                                "family": p.family,
+                                "action": p.action,
+                                "rationale": p.rationale,
+                            }
+                            for p in probe.probe_plan
+                        ],
+                        "notes": probe.notes,
+                    }
+            except Exception:
+                pass
         return {
             "enabled": True,
             "timing_ms": elapsed_ms,
@@ -3737,6 +3808,11 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
             },
             "solver_status": "fallback" if used_fallback else "primary",
             "coverage_gaps": coverage_gaps,
+            "outcome": outcome_label,
+            "solver_emitted_summary": emit_summary,
+            "interesting_emit_events": interesting_events,
+            "solver_emitted_nodes": full_records_for_unsat,
+            "conflict_probe": conflict_probe_payload,
         }
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
