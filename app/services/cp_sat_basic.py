@@ -2943,9 +2943,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 # 일자별 커버리지 균등화용 수집 (물리일만)
                 if d < D_phys:
                     daily_assigned_by_code.setdefault(code, []).append((d, assigned, need, need_max))
-            elif _off_first_cfg and need > 0:
-                # off_first=True + max 미설정: assigned <= need 하드 (잔여 셀 OFF로 회수)
-                m.Add(assigned <= need)
+            elif _off_first_cfg:
+                # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
+                # need=0 (fixed_wanted 가 min 다 채움) 케이스에도 assigned <= 0 강제 → 추가 근무 차단.
+                m.Add(assigned <= max(0, need))
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
             elif need > 0:

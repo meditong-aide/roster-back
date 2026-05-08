@@ -662,6 +662,13 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         return counts
 
     def _row_to_day_counts_max(row: DailyShift) -> dict[str, int]:
+        # max_enabled=False 면 *_count_max 값 무관 0 반환 (상한 미사용 모드).
+        # daily_shift_service 의 자동 reset 로직이 누락된 비정합 row 도 안전하게 0 처리.
+        if not bool(getattr(row, 'max_enabled', False)):
+            counts = {'D': 0, 'E': 0, 'N': 0}
+            if use_mid:
+                counts['M'] = 0
+            return counts
         counts = {
             'D': int(getattr(row, 'd_count_max', 0) or 0),
             'E': int(getattr(row, 'e_count_max', 0) or 0),
