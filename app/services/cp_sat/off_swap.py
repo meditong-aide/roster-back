@@ -14,10 +14,10 @@ from datetime import date
 from typing import Iterable
 
 from dateutil.relativedelta import relativedelta
-from sqlalchemy import text
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from db.models import FixedWantedEntry, Nurse, Shift
+from db.models import FixedWantedEntry, Nurse, Schedule, ScheduleEntry, Shift
 from services.cp_sat.allowed_shift_types import is_n_only_profile
 
 logger = logging.getLogger(__name__)
@@ -209,32 +209,49 @@ def _load_prev_month_tail(
 ) -> list[str]:
     """전월 마지막 n_days 의 default_shift 코드. group 무관 (파견자 대응).
 
-    schedule_entries 에 entry 가 없으면 빈 문자열로 채워서 N-run 카운트 끊기.
+    - schedule_entries.id NULL 폴백: id 가 비어있는 legacy row 는 shift_id+group_id 로 조인
+    - 같은 (nurse, date) 에 dropped=0 schedule 이 다수 공존하면
+      version DESC → updated_at DESC 우선순위로 1건만 채용 (결정적 선택)
+    - 누락된 날짜는 빈 문자열로 채워서 N-run 카운트 끊기
     """
     first_of_month = date(year, month, 1)
     end = first_of_month - relativedelta(days=1)
     start = end - relativedelta(days=n_days - 1)
 
-    rows = db.execute(
-        text(
-            """
-            SELECT se.work_date, s.default_shift
-            FROM schedule_entries se
-            JOIN schedules sc ON sc.schedule_id = se.schedule_id
-            JOIN shifts s     ON s.id = se.id
-            WHERE sc.dropped = 0
-              AND se.nurse_id = :nid
-              AND se.work_date BETWEEN :st AND :ed
-            ORDER BY se.work_date
-            """
+    join_condition = or_(
+        and_(ScheduleEntry.id.isnot(None), Shift.id == ScheduleEntry.id),
+        and_(
+            ScheduleEntry.id.is_(None),
+            Shift.shift_id == ScheduleEntry.shift_id,
+            Shift.group_id == Schedule.group_id,
         ),
-        {"nid": nurse_id, "st": start, "ed": end},
-    ).fetchall()
+    )
+
+    rows = (
+        db.query(ScheduleEntry.work_date, Shift.default_shift)
+        .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
+        .join(Shift, join_condition)
+        .filter(
+            Schedule.dropped == False,  # noqa: E712
+            ScheduleEntry.nurse_id == nurse_id,
+            ScheduleEntry.work_date >= start,
+            ScheduleEntry.work_date <= end,
+        )
+        .order_by(
+            ScheduleEntry.work_date.asc(),
+            Schedule.version.desc(),
+            Schedule.updated_at.desc(),
+        )
+        .all()
+    )
 
     by_day: dict[date, str] = {}
-    for r in rows:
-        wd = r.work_date.date() if hasattr(r.work_date, "date") else r.work_date
-        by_day[wd] = str(r.default_shift or "").strip().upper()
+    for work_date, default_shift in rows:
+        wd = work_date.date() if hasattr(work_date, "date") else work_date
+        # 같은 날짜 중복 row 는 가장 최신 version 만 채용
+        if wd in by_day:
+            continue
+        by_day[wd] = str(default_shift or "").strip().upper()
 
     return [by_day.get(start + relativedelta(days=i), "") for i in range(n_days)]
 

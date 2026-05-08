@@ -41,7 +41,7 @@ import calendar
 from sqlalchemy import text
 from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
-from services.cp_sat.postprocess_off_swap import postprocess_off_swap
+from services.cp_sat.off_swap import postprocess_off_swap
 from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
 from services.day_windows import build_blocked_days
 from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_by_nurse
