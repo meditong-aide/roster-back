@@ -3260,19 +3260,42 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             m.Add(sum(X(n, d, off) for d in window) >= 1)
 
         # E→D, N→D, N→E
+        from services.constraint_impact.solver_emit import get_or_attach_recorder as _get_emit_recorder
+        _emit_rec = _get_emit_recorder(rs)
         for d in range(T0+1, T1+1):
             if getattr(cfg, "ban_n_to_d", True):
-                # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
-                if not (fixed.get((n, d-1)) == night and fixed.get((n, d)) == day):
+                _bypassed = (fixed.get((n, d-1)) == night and fixed.get((n, d)) == day)
+                if not _bypassed:
                     m.Add(X(n,d,day)+X(n,d-1,night)<=1)  # N→D 금지
+                _emit_rec.emit(
+                    family="BoundaryTransitionBan",
+                    scope={"nurse_index": n, "day": d + 1, "transition": "N->D"},
+                    target="forbid",
+                    mode="bypassed_by_fixed" if _bypassed else "enforced",
+                    related_atom_keys=[(n, d - 1), (n, d)],
+                )
             if getattr(cfg, "ban_e_to_d", True):
-                # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
-                if not (fixed.get((n, d-1)) == eve and fixed.get((n, d)) == day):
+                _bypassed = (fixed.get((n, d-1)) == eve and fixed.get((n, d)) == day)
+                if not _bypassed:
                     m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
+                _emit_rec.emit(
+                    family="BoundaryTransitionBan",
+                    scope={"nurse_index": n, "day": d + 1, "transition": "E->D"},
+                    target="forbid",
+                    mode="bypassed_by_fixed" if _bypassed else "enforced",
+                    related_atom_keys=[(n, d - 1), (n, d)],
+                )
             if getattr(cfg, "ban_n_to_e", True):
-                # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
-                if not (fixed.get((n, d-1)) == night and fixed.get((n, d)) == eve):
+                _bypassed = (fixed.get((n, d-1)) == night and fixed.get((n, d)) == eve)
+                if not _bypassed:
                     m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
+                _emit_rec.emit(
+                    family="BoundaryTransitionBan",
+                    scope={"nurse_index": n, "day": d + 1, "transition": "N->E"},
+                    target="forbid",
+                    mode="bypassed_by_fixed" if _bypassed else "enforced",
+                    related_atom_keys=[(n, d - 1), (n, d)],
+                )
             if mid is not None:
                 m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
             # if getattr(cfg, "ban_d_to_n", True):
@@ -3287,16 +3310,47 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for d in range(T0, T1 + 1):
                 if "D" not in allowed:
                     m.Add(X(n, d, day) == 0)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "D"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
                 if "E" not in allowed:
                     m.Add(X(n, d, eve) == 0)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "E"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
                 if "N" not in allowed:
                     m.Add(X(n, d, night) == 0)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "N"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
                 if mid is not None and "M" not in allowed:
                     m.Add(X(n, d, mid) == 0)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "M"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
 
         if n not in n_forbid_n:
             # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
-            # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
             if bool(getattr(cfg, "not_one_night", False)):
                 for d in range(T0, T1 + 1):
                     if d == T1:
@@ -3313,6 +3367,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if not neighbors:
                         continue
                     m.Add(X(n, d, night) <= sum(neighbors))
+                    _emit_rec.emit(
+                        family="NotOneNight",
+                        scope={"nurse_index": n, "day": d + 1},
+                        target="implies_neighbor_n",
+                        mode="enforced",
+                        related_atom_keys=[(n, dd) for dd in (d - 1, d, d + 1) if T0 <= dd <= T1],
+                    )
 
             # 휴가/공가 fixed 셀의 직전일 N 금지 (하드, 휴가/공가 보호 정책).
             # fixed_wanted O / 휴무 / 주휴 등은 사용자 자발 OFF 또는 자동 OFF 라 대상 외.
@@ -3332,8 +3393,23 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if blocked_by_nurse and prev_d in blocked_by_nurse.get(n, set()):
                         continue
                     if (n, prev_d) in fixed:
+                        _emit_rec.emit(
+                            family="BanNightBeforeFixedOff",
+                            scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type},
+                            target="forbid_prev_day_night",
+                            mode="bypassed_by_fixed",
+                            related_atom_keys=[(n, prev_d), (n, d)],
+                            metadata={"prev_fixed_present": True},
+                        )
                         continue  # 이미 고정된 셀은 변경 불가
                     m.Add(X(n, prev_d, night) == 0)
+                    _emit_rec.emit(
+                        family="BanNightBeforeFixedOff",
+                        scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type},
+                        target="forbid_prev_day_night",
+                        mode="enforced",
+                        related_atom_keys=[(n, prev_d), (n, d)],
+                    )
                     _ban_n_cnt += 1
                 if _ban_n_cnt > 0:
                     print(f"[CP-SAT-Basic] [BanNBeforeFixedOff] nurse_idx={n}: {_ban_n_cnt}건 N 금지")
