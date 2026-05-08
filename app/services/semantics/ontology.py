@@ -22,6 +22,18 @@ class OntologyConstraintEntry:
     aliases: list[str] = field(default_factory=list)
     default_severity: str | None = None
     notes: str | None = None
+    relaxation_priority: int | None = None
+    scope_explosion: str | None = None
+
+
+@dataclass(slots=True)
+class OntologyConflictScenario:
+    scenario_id: str
+    involved_families: list[str]
+    trigger_condition: str
+    why_infeasible: str
+    suggested_relaxation: str
+    detection_hint: str
 
 
 @dataclass(slots=True)
@@ -51,6 +63,7 @@ class ConstraintOntology:
         self.overrides: dict[str, OntologyOverrideEntry] = {}
         self.modes: dict[str, OntologyModeEntry] = {}
         self.relations: dict[str, dict[str, Any]] = {}
+        self.conflict_scenarios: list[OntologyConflictScenario] = []
         self._alias_to_id: dict[str, str] = {}
         self._load()
 
@@ -73,6 +86,8 @@ class ConstraintOntology:
                 aliases=list(body.get("aliases") or []),
                 default_severity=body.get("default_severity"),
                 notes=body.get("notes"),
+                relaxation_priority=body.get("relaxation_priority"),
+                scope_explosion=body.get("scope_explosion"),
             )
             self.constraints[cid] = entry
             self._alias_to_id[cid.upper()] = cid
@@ -96,6 +111,20 @@ class ConstraintOntology:
                 severity=str(body.get("severity") or "none"),
             )
         self.relations = dict(raw.get("relations") or {})
+        for scen in (raw.get("conflict_scenarios") or []):
+            try:
+                self.conflict_scenarios.append(
+                    OntologyConflictScenario(
+                        scenario_id=str(scen.get("id") or ""),
+                        involved_families=list(scen.get("involved_families") or []),
+                        trigger_condition=str(scen.get("trigger_condition") or "").strip(),
+                        why_infeasible=str(scen.get("why_infeasible") or "").strip(),
+                        suggested_relaxation=str(scen.get("suggested_relaxation") or "").strip(),
+                        detection_hint=str(scen.get("detection_hint") or "").strip(),
+                    )
+                )
+            except Exception:
+                continue
 
     def get_constraint(self, family: str) -> OntologyConstraintEntry | None:
         resolved = self.resolve_alias(family)
@@ -138,6 +167,23 @@ class ConstraintOntology:
         if target in ov.does_not_bypass:
             return False
         return None
+
+    def get_relaxation_priority(self, family: str) -> int | None:
+        entry = self.get_constraint(family)
+        return entry.relaxation_priority if entry else None
+
+    def get_scope_explosion(self, family: str) -> str | None:
+        entry = self.get_constraint(family)
+        return entry.scope_explosion if entry else None
+
+    def scenarios_involving(self, family: str) -> list[OntologyConflictScenario]:
+        target = self.resolve_alias(family)
+        if target is None:
+            return []
+        return [
+            s for s in self.conflict_scenarios
+            if target in s.involved_families
+        ]
 
 
 @lru_cache(maxsize=1)

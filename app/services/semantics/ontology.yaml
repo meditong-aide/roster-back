@@ -1,4 +1,12 @@
-version: 1
+version: 2
+
+# `relaxation_priority` (1~5): conflict probe 가 어느 family 를 먼저 풀어볼지 정렬할 때 사용.
+#   1 = 가장 먼저 풀음 (영향 가벼움)
+#   5 = 절대 안 풀음 (nurse welfare / 안전)
+# `scope_explosion` (low/medium/high): 인스턴스 수의 자릿수.
+#   low    = nurse 수 또는 그 이하
+#   medium = nurse × day 미만
+#   high   = nurse × day × shift 등
 
 constraints:
   CoverageMin:
@@ -10,6 +18,8 @@ constraints:
     explanation_template: "{day} {shift}는 최소 {min_required}명이 필요합니다."
     aliases: [GLOBAL_DAY_CAPACITY_SHORTAGE, GLOBAL_SHIFT_ALLOWED_SHORTAGE, CAPACITY_TOTAL_SHORTAGE, DAY_ZERO_COVERAGE, NO_ASSIGNMENT]
     default_severity: hard
+    relaxation_priority: 4
+    scope_explosion: medium
 
   TeamMin:
     label: Team Minimum Coverage
@@ -20,6 +30,8 @@ constraints:
     explanation_template: "{day} {shift}에서 {team}은 최소 {min_required}명이 필요합니다."
     aliases: [TEAM_MIN_EXCEEDS_GLOBAL_NEED, TEAM_SIZE_INSUFFICIENT, TEAM_ACTIVE_MEMBERS_INSUFFICIENT, TEAM_SHIFT_ALLOWED_SHORTAGE, FIXED_ASSIGN_BREAKS_TEAM_MIN]
     default_severity: hard
+    relaxation_priority: 2
+    scope_explosion: high
 
   GradeMin:
     label: Grade Minimum Coverage
@@ -30,6 +42,8 @@ constraints:
     explanation_template: "{day} {shift}에서 {grade}는 최소 {min_required}명이 필요합니다."
     aliases: [GRADE_MIN_SUM_EXCEEDS_NEED, GRADE_MIN_AVAILABLE_SHORTAGE]
     default_severity: hard
+    relaxation_priority: 3
+    scope_explosion: high
 
   GradeMax:
     label: Grade Maximum Coverage
@@ -40,6 +54,8 @@ constraints:
     explanation_template: "{day} {shift}에서 {grade}는 최대 {max_allowed}명까지 가능합니다."
     aliases: [GRADE_MAX_SUM_BELOW_NEED, GRADE_ANTIPAIR_FORCES_SHORTAGE]
     default_severity: hard
+    relaxation_priority: 2
+    scope_explosion: high
 
   TeamGradeHandoff:
     label: Team Grade Handoff
@@ -50,6 +66,8 @@ constraints:
     explanation_template: "{team} 내 {grade} 간 handoff 제약이 적용됩니다."
     aliases: [TEAM_GRADE_INTERSECT_SHORTAGE]
     default_severity: hard
+    relaxation_priority: 1
+    scope_explosion: medium
 
   ConsecutiveWorkLimit:
     label: Consecutive Work Limit
@@ -59,6 +77,8 @@ constraints:
     connects: [AssignmentAtom, Nurse, Day]
     explanation_template: "{nurse}는 최대 연속근무일 {max_days}일을 초과할 수 없습니다."
     default_severity: hard
+    relaxation_priority: 4
+    scope_explosion: medium
 
   ConsecutiveNightLimit:
     label: Consecutive Night Limit
@@ -68,6 +88,8 @@ constraints:
     connects: [AssignmentAtom, Nurse, Day]
     explanation_template: "{nurse}는 최대 연속 나이트 수를 초과할 수 없습니다."
     default_severity: hard
+    relaxation_priority: 4
+    scope_explosion: medium
 
   NightRecovery:
     label: Night Recovery
@@ -77,8 +99,44 @@ constraints:
     connects: [AssignmentAtom, Nurse, Day]
     produces: [ForcedOff]
     explanation_template: "{nurse}는 N 블록 이후 회복 OFF가 필요합니다."
+    default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: medium
+
+  MonthlyNightCap:
+    label: Monthly Night Cap
+    parent: NurseLocalConstraint
+    scope: [nurse, month]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Month]
+    explanation_template: "{nurse}의 월 N 합계는 {max_count}을 초과할 수 없습니다."
     aliases: [MONTHLY_NIGHT_CAPACITY_SHORTAGE]
     default_severity: hard
+    relaxation_priority: 4
+    scope_explosion: low
+
+  BanNightBeforeFixedOff:
+    label: Ban Night Before Fixed Off
+    parent: NurseLocalConstraint
+    scope: [nurse, day]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "{nurse}의 휴가/공가 fixed 셀 직전일에는 N 시프트 금지 (휴가/공가 보호)."
+    default_severity: hard
+    relaxation_priority: 4
+    scope_explosion: low
+    notes: "Trigger 한정: (n, d) 의 fixed_type ∈ {휴가, 공가}. fixed_wanted O / 휴무 / 주휴 등은 trigger 안 함. Bypass: (n, d-1) 이 이미 fixed (fixed_wanted 포함) 이면 ban 룰 스킵 — 사용자가 명시적으로 N 직후 휴가/공가 fixed 조합을 둔 것은 의도로 간주. config flag: ban_night_before_fixed_off (default True)."
+
+  WeekendOffOnly:
+    label: Weekend Off Only
+    parent: NurseLocalConstraint
+    scope: [nurse, weekday]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "{nurse}는 평일 OFF 금지 + 주말 OFF 보장 (주말휴무 정책)."
+    default_severity: hard
+    relaxation_priority: 4
+    scope_explosion: medium
 
   OffCap:
     label: Off Cap
@@ -86,9 +144,24 @@ constraints:
     scope: [nurse, month]
     effective_modes: [enforced, bypassed_by_fixed, inactive]
     connects: [AssignmentAtom, Nurse, Month]
-    explanation_template: "{nurse}의 OFF 개수는 허용 범위를 벗어날 수 없습니다."
+    explanation_template: "{nurse}의 월 OFF 개수는 monthly_limits.o_exact (있으면) 또는 roster_config.off_days (없으면) 한도를 따름."
     aliases: [FIXED_OFF_EXCEEDS_SPAN]
     default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: low
+    notes: "Source priority: monthly_limit_constraints.o_exact (per-nurse exact) → roster_config.off_days (group fallback)."
+
+  OffWindow:
+    label: Off Window (cross-month / mid-month boundary)
+    parent: NurseLocalConstraint
+    scope: [nurse, day_window]
+    effective_modes: [enforced, bypassed_by_fixed, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "{nurse}의 [{window}] 구간 OFF 강제 — 전월 N tail / 전월 연속근무 tail / 월경계 inherited recovery."
+    default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: low
+    notes: "Derived from upstream NightRecovery (two_offs_after_two_nig / two_offs_after_three_nig) + ConsecutiveWorkLimit (max_consecutive_work_days) + month boundary handling. To remove OffWindow indirectly, adjust those upstream families instead — there is no direct disable for OffWindow."
 
   BoundaryTransitionBan:
     label: Boundary Transition Ban
@@ -99,6 +172,31 @@ constraints:
     explanation_template: "경계일 직전 근무와 다음 근무 사이 전환 금지가 적용됩니다."
     aliases: [N_CAPACITY_SHORTAGE]
     default_severity: hard
+    relaxation_priority: 3
+    scope_explosion: high
+    notes: "두 메커니즘이 같은 functional family. (a) Within-month: cp_sat_basic line 3267 의 transition pair m.Add. (b) Cross-month / mid-month: roster_create_service 가 initial_constraints.forbidden 으로 single-cell forbid 변환 후 enforce. 후자는 cross-month source 로 metadata 태깅 권장."
+
+  AllowedShiftMask:
+    label: Allowed Shift Mask
+    parent: NurseLocalConstraint
+    scope: [nurse, day, shift]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Day, Shift]
+    explanation_template: "{nurse}는 허용되지 않은 shift 를 가질 수 없습니다."
+    default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: high
+
+  NotOneNight:
+    label: Not One Night
+    parent: NurseLocalConstraint
+    scope: [nurse, day]
+    effective_modes: [enforced, inactive]
+    connects: [AssignmentAtom, Nurse, Day]
+    explanation_template: "1N (단발성 N) 금지 — N 배정 시 인접일 중 하나는 N 이어야 합니다."
+    default_severity: hard
+    relaxation_priority: 3
+    scope_explosion: medium
 
   PrecepteeSync:
     label: Preceptee Sync
@@ -108,6 +206,8 @@ constraints:
     connects: [AssignmentAtom, Nurse, Day]
     explanation_template: "프리셉티는 지정 기간 동안 프리셉터와 동일 근무여야 합니다."
     default_severity: hard
+    relaxation_priority: 4
+    scope_explosion: medium
 
   AssignmentWindow:
     label: Assignment Window
@@ -117,6 +217,8 @@ constraints:
     connects: [Assignment, Day, Nurse]
     explanation_template: "기간 파견/이동 구간에서 소유 group 및 허용 shift가 바뀝니다."
     default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: low
 
   CarryoverBoundary:
     label: Carryover Boundary
@@ -126,6 +228,8 @@ constraints:
     connects: [ScheduleSnapshot, Nurse, Day]
     explanation_template: "이전 스케줄 tail 상태를 경계일에 이어받습니다."
     default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: low
 
   FixedWanted:
     label: Fixed Wanted
@@ -135,6 +239,8 @@ constraints:
     connects: [WantedEntry, AssignmentAtom, Day, Nurse]
     explanation_template: "확정 원티드는 일부 제약을 우회하거나 회복 슬롯을 막을 수 있습니다."
     default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: medium
 
   ConfigIntegrity:
     label: Configuration Integrity
@@ -145,13 +251,18 @@ constraints:
     explanation_template: "설정 정합성 오류로 인해 생성 전 차단됩니다."
     aliases: [MID_DISABLED_BUT_USED, MID_REQUIRED_MISSING, ALLOWED_SHIFTS_ISOLATES_NURSE, FIXED_ASSIGN_EXCEEDS_NEED, FIXED_ASSIGN_VIOLATES_ALLOWED]
     default_severity: hard
+    relaxation_priority: 5
+    scope_explosion: low
 
 overrides:
   FixedWanted:
     label: Fixed Wanted Override
     parent: OverridePolicy
-    bypasses: [BoundaryTransitionBan, InitialForbiddenOverride, ProfileShiftLimit]
-    does_not_bypass: [ConsecutiveWorkLimit]
+    # bypasses 정정 (Q6):
+    #   - 'InitialForbiddenOverride' 제거: 본질적으로 BoundaryTransitionBan 의 cross-month 확장이라 중복.
+    #   - 'ProfileShiftLimit' → 'AllowedShiftMask' 로 통합 (같은 의미의 다른 이름).
+    bypasses: [BoundaryTransitionBan, AllowedShiftMask, BanNightBeforeFixedOff]
+    does_not_bypass: [ConsecutiveWorkLimit, OffCap, NightRecovery, MonthlyNightCap]
     conditional_effects:
       blocks_recovery_slot: true
       counts_to_coverage: policy_dependent
@@ -202,3 +313,91 @@ relations:
   carries_state:
     source: AssignmentWindow
     target: CarryoverBoundary
+
+# 구체적 hard 충돌 상황 카탈로그 — conflict_probe 가 매칭/제안 근거로 사용.
+# 각 시나리오:
+#   id              : 안정적 식별자 (snake_case 대문자)
+#   involved_families : 충돌에 관여한 family 들 (ontology constraint id)
+#   trigger_condition : 어떤 조건에서 발생하는가 (자연어 + 측정 가능 힌트)
+#   why_infeasible    : 왜 솔버가 풀 수 없는가
+#   suggested_relaxation : 어떤 모듈을 어떻게 조절하면 풀리는가
+#   detection_hint    : 자동 매칭 시 어떤 신호를 봐야 하는가
+conflict_scenarios:
+  - id: BTBAN_VS_FIXED_SEQUENCE
+    involved_families: [BoundaryTransitionBan, FixedWanted]
+    trigger_condition: |
+      fixed_wanted 가 (D-1=N, D=D) 또는 (D-1=E, D=D) 시퀀스를 강제하면서
+      해당 시퀀스가 BoundaryTransitionBan 의 bypass 매트릭스에 명시되지 않은 경우.
+    why_infeasible: |
+      두 fixed cell 이 transition ban 을 피하지 못해 모델이 UNSAT.
+    suggested_relaxation: |
+      FixedWanted 셀 검토 후 시퀀스 수정, 또는 BoundaryTransitionBan
+      해당 nurse-day pair 에 한해 일시 disable.
+    detection_hint: |
+      emit 에서 mode=enforced 인 BoundaryTransitionBan 노드의
+      related_atom_keys 가 두 atom 모두 fixed_cells 와 겹치는 케이스 카운트.
+
+  - id: OFFCAP_VS_WEEKEND_OFF_NARROW_WINDOW
+    involved_families: [OffCap, WeekendOffOnly, AssignmentWindow]
+    trigger_condition: |
+      WeekendOffOnly 적용 nurse 의 active_days (파견/병동이동/휴직 클리핑 후) 가
+      OffCap min 보다 좁고, 그 active 윈도우 안의 weekend slot 수가 OffCap min 미만.
+    why_infeasible: |
+      OFF 강제 슬롯이 cap 을 못 채움. 평일은 O 금지이므로 OFF 추가 배정 불가.
+    suggested_relaxation: |
+      해당 nurse 의 OffCap 완화 (set_threshold) 또는
+      AssignmentWindow 의 active 일자 확대.
+    detection_hint: |
+      preflight_alerts 의 weekend_slot_shortage 메시지 + 해당 nurse 의 active_day 수
+      < off_cap_min.
+
+  - id: NIGHT_RECOVERY_VS_COVERAGE_MIN
+    involved_families: [NightRecovery, CoverageMin, TeamMin]
+    trigger_condition: |
+      특정 nurse 의 2N/3N 블록 직후 recovery OFF 가 강제된 일자에
+      해당 day 의 CoverageMin 또는 TeamMin slack 이 0 또는 음수.
+    why_infeasible: |
+      복수 nurse 의 recovery OFF 가 같은 날에 몰려 D/E/N 인력이 부족.
+    suggested_relaxation: |
+      CoverageMin 의 해당 day 일시 soft 강등, 또는 N 블록 분산
+      (다른 nurse 의 N 일자 변경).
+    detection_hint: |
+      block_end_day 와 day-level coverage slack ≤ 0 의 교집합 카운트.
+
+  - id: TEAM_MIN_VS_GRADE_MAX_INTERSECTION
+    involved_families: [TeamMin, GradeMax]
+    trigger_condition: |
+      특정 team 의 minimum 인원 요구가 그 day/shift 의 GradeMax 한도와
+      교집합에서 빈자리를 만들지 못하는 경우 (등급 X 가 필요한데 GradeMax 가 그 등급 막음).
+    why_infeasible: |
+      TeamMin 만족하려면 등급 X 가 필요한데 GradeMax 가 추가 배정 차단.
+    suggested_relaxation: |
+      GradeMax 의 해당 grade soft 강등 (force_soft_mode), 또는
+      TeamMin 의 해당 team 일시 disable.
+    detection_hint: |
+      team membership ∩ grade 의 교집합 사이즈 < TeamMin.
+
+  - id: ALLOWED_SHIFT_MASK_VS_TEAM_MIN
+    involved_families: [AllowedShiftMask, TeamMin]
+    trigger_condition: |
+      해당 team 의 active member 중 night-only / day-only 등 제한된
+      AllowedShiftMask 를 가진 nurse 비율이 높아 다른 shift 의 TeamMin 충족 불가.
+    why_infeasible: |
+      AllowedShiftMask 가 hard 라 nurse 가 다른 shift 로 이동 불가,
+      그 결과 TeamMin 이 다른 shift 에서 인원 부족.
+    suggested_relaxation: |
+      특정 nurse 의 AllowedShiftMask 임시 완화 또는 TeamMin disable.
+    detection_hint: |
+      team 별로 AllowedShiftMask 합집합이 요구 shift 를 모두 cover 하지 못하는 케이스.
+
+  - id: NOT_ONE_NIGHT_VS_FIXED_OFF_NEIGHBOR
+    involved_families: [NotOneNight, FixedWanted]
+    trigger_condition: |
+      특정 nurse 의 day D 에 N 이 배정 가능하지만, 인접일 D-1, D+1 모두
+      fixed off 또는 fixed non-N 으로 잠겨 1N 회피 불가.
+    why_infeasible: |
+      NotOneNight 가 인접일 N 을 요구하는데 인접 fixed 가 그것을 막음.
+    suggested_relaxation: |
+      해당 nurse-day 의 NotOneNight 일시 비활성, 또는 fixed_wanted 인접일 수정.
+    detection_hint: |
+      D 에 N 후보가 있고 D-1, D+1 fixed 가 N 외의 값으로 잠긴 케이스.
