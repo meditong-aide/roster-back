@@ -1603,9 +1603,11 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
     우선순위:
     1) status='issued' 스케줄이 있으면 → 마감본 참조
     2) 없으면(전부 draft) → 최신 version 참조
+
+    dropped=True (취소/대체) 인 schedule 은 어느 분기든 제외.
     """
     py, pm = _get_prev_year_month(year, month)
-    # 1) status='issued' 스케줄 조회
+    # 1) status='issued' 스케줄 조회 (dropped 제외)
     issued = (
         db.query(Schedule)
         .filter(
@@ -1613,16 +1615,22 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
             Schedule.year == py,
             Schedule.month == pm,
             Schedule.status == "issued",
+            Schedule.dropped == False,  # noqa: E712
         )
         .order_by(Schedule.version.desc())
         .first()
     )
     if issued:
         return issued.schedule_id
-    # 2) issued 없으면 최신 version
+    # 2) issued 없으면 최신 version (dropped 제외)
     latest = (
         db.query(Schedule)
-        .filter(Schedule.group_id == group_id, Schedule.year == py, Schedule.month == pm)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == py,
+            Schedule.month == pm,
+            Schedule.dropped == False,  # noqa: E712
+        )
         .order_by(Schedule.version.desc())
         .first()
     )
@@ -1633,6 +1641,7 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
     """특정 그룹의 해당 월 최종 schedule_id를 조회한다.
 
     우선순위: status='issued' > 최신 version(draft)
+    dropped=True (취소/대체) 인 schedule 은 어느 분기든 제외.
     """
     issued = (
         db.query(Schedule)
@@ -1641,6 +1650,7 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
             Schedule.year == year,
             Schedule.month == month,
             Schedule.status == "issued",
+            Schedule.dropped == False,  # noqa: E712
         )
         .order_by(Schedule.version.desc())
         .first()
@@ -1649,7 +1659,12 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
         return issued.schedule_id
     latest = (
         db.query(Schedule)
-        .filter(Schedule.group_id == group_id, Schedule.year == year, Schedule.month == month)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.dropped == False,  # noqa: E712
+        )
         .order_by(Schedule.version.desc())
         .first()
     )
