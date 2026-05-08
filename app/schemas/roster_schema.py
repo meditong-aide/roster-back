@@ -55,6 +55,7 @@ class ShiftUpdateRequest(BaseModel):
     id: int
     # 추가
     show_in_preference: Optional[bool] = None  # None이면 기존 값 유지
+    off_swap_target: Optional[bool] = None  # None이면 기존 값 유지 (초과 OFF 변환 타깃)
 
 
 class ShiftAddRequest(BaseModel):
@@ -77,6 +78,7 @@ class ShiftAddRequest(BaseModel):
     show_in_preference: Optional[bool] = (
         False  # 기본 False, 프론트에서 안 보내면 자동 숨김
     )
+    off_swap_target: Optional[bool] = False  # 초과 OFF 변환 타깃 (그룹당 1개)
 
 
 class ShiftUploadConfirmRequest(BaseModel):
@@ -248,6 +250,10 @@ class RosterConfigBase(BaseModel):
     off_first: bool = Field(
         default=False,
         description="OFF 우선 모드(False, default): OFF cap 충족 우선 + max coverage 미부과 + 남는 셀 근무 배정 + fixed_wanted O 차감 / 근무 우선 모드(True): 현행 min-max coverage 균등화 유지",
+    )
+    off_swap_enabled: bool = Field(
+        default=False,
+        description="초과 OFF 후처리 — True 시 baseline(off_days) 초과 OFF 를 shifts.off_swap_target=True 인 코드로 변환. 보호: 회복 OFF(1N/2N/3N 직후) / fixed_wanted / '주' / N전담",
     )
 
 

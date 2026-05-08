@@ -41,6 +41,7 @@ import calendar
 from sqlalchemy import text
 from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
+from services.cp_sat.postprocess_off_swap import postprocess_off_swap
 from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
 from services.day_windows import build_blocked_days
 from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_by_nurse
@@ -5313,6 +5314,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         except Exception:
             raise Exception(validation_error)
 
+    # 초과 OFF → 연차 변환 후처리 (off_swap_enabled=True 일 때만 동작, 보호 4종 적용)
+    print(
+        f"[OffSwap][CALL] schedule_id={schedule.schedule_id} "
+        f"latest_config_id={getattr(latest_config, 'config_id', None)} "
+        f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r} "
+        f"off_days={getattr(latest_config, 'off_days', None)!r}"
+    )
+    try:
+        generated = postprocess_off_swap(db, schedule, generated, latest_config, req)
+    except Exception as _off_swap_exc:
+        print(f"[OffSwap] 후처리 실패 — 변환 미적용 진행: {_off_swap_exc}")
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──

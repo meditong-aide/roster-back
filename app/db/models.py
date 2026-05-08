@@ -297,6 +297,7 @@ class Shift(Base):
         server_default="0",  # MSSQL에서 0 (False)
         default=False,
     )
+    off_swap_target = Column(BOOLEAN, nullable=False, default=False)
 
     office = relationship("Office")
     group = relationship("Group")
@@ -397,6 +398,7 @@ class RosterConfig(Base):
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
+    off_swap_enabled = Column(BOOLEAN, nullable=False, default=False)
     office = relationship("Office")
     group = relationship("Group")
 

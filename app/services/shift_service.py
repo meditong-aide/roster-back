@@ -394,7 +394,8 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         sequence=max_sequence + 1,
         shift_gb=req.shift_gb,
         # 추가
-        show_in_preference=getattr(req, "show_in_preference", False) # 프론트 미 전송 시 False
+        show_in_preference=getattr(req, "show_in_preference", False), # 프론트 미 전송 시 False
+        off_swap_target=bool(getattr(req, "off_swap_target", False) or False),
     )
     db.add(new_shift)
     db.commit()
@@ -445,6 +446,9 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     # 원티드 페이지 노출 여부 업데이트
     if hasattr(req, "show_in_preference") and req.show_in_preference is not None:
         existing_shift.show_in_preference = req.show_in_preference
+    # 초과 OFF 변환 타깃 업데이트 (None 이면 기존 값 유지)
+    if hasattr(req, "off_swap_target") and req.off_swap_target is not None:
+        existing_shift.off_swap_target = bool(req.off_swap_target)
     print('existing_shift.shift_gb after', existing_shift.shift_gb)
     db.commit()
     db.refresh(existing_shift)
