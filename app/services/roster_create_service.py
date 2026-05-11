@@ -41,6 +41,7 @@ import calendar
 from sqlalchemy import text
 from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
+from services.cp_sat.off_swap import postprocess_off_swap
 from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
 from services.day_windows import build_blocked_days
 from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_by_nurse
@@ -662,6 +663,13 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         return counts
 
     def _row_to_day_counts_max(row: DailyShift) -> dict[str, int]:
+        # max_enabled=False 면 *_count_max 값 무관 0 반환 (상한 미사용 모드).
+        # daily_shift_service 의 자동 reset 로직이 누락된 비정합 row 도 안전하게 0 처리.
+        if not bool(getattr(row, 'max_enabled', False)):
+            counts = {'D': 0, 'E': 0, 'N': 0}
+            if use_mid:
+                counts['M'] = 0
+            return counts
         counts = {
             'D': int(getattr(row, 'd_count_max', 0) or 0),
             'E': int(getattr(row, 'e_count_max', 0) or 0),
@@ -1596,9 +1604,11 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
     우선순위:
     1) status='issued' 스케줄이 있으면 → 마감본 참조
     2) 없으면(전부 draft) → 최신 version 참조
+
+    dropped=True (취소/대체) 인 schedule 은 어느 분기든 제외.
     """
     py, pm = _get_prev_year_month(year, month)
-    # 1) status='issued' 스케줄 조회
+    # 1) status='issued' 스케줄 조회 (dropped 제외)
     issued = (
         db.query(Schedule)
         .filter(
@@ -1606,16 +1616,22 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
             Schedule.year == py,
             Schedule.month == pm,
             Schedule.status == "issued",
+            Schedule.dropped == False,  # noqa: E712
         )
         .order_by(Schedule.version.desc())
         .first()
     )
     if issued:
         return issued.schedule_id
-    # 2) issued 없으면 최신 version
+    # 2) issued 없으면 최신 version (dropped 제외)
     latest = (
         db.query(Schedule)
-        .filter(Schedule.group_id == group_id, Schedule.year == py, Schedule.month == pm)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == py,
+            Schedule.month == pm,
+            Schedule.dropped == False,  # noqa: E712
+        )
         .order_by(Schedule.version.desc())
         .first()
     )
@@ -1626,6 +1642,7 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
     """특정 그룹의 해당 월 최종 schedule_id를 조회한다.
 
     우선순위: status='issued' > 최신 version(draft)
+    dropped=True (취소/대체) 인 schedule 은 어느 분기든 제외.
     """
     issued = (
         db.query(Schedule)
@@ -1634,6 +1651,7 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
             Schedule.year == year,
             Schedule.month == month,
             Schedule.status == "issued",
+            Schedule.dropped == False,  # noqa: E712
         )
         .order_by(Schedule.version.desc())
         .first()
@@ -1642,7 +1660,12 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
         return issued.schedule_id
     latest = (
         db.query(Schedule)
-        .filter(Schedule.group_id == group_id, Schedule.year == year, Schedule.month == month)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.dropped == False,  # noqa: E712
+        )
         .order_by(Schedule.version.desc())
         .first()
     )
@@ -5398,6 +5421,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         except Exception:
             raise Exception(validation_error)
 
+    # 초과 OFF → 연차 변환 후처리 (off_swap_enabled=True 일 때만 동작, 보호 4종 적용)
+    print(
+        f"[OffSwap][CALL] schedule_id={schedule.schedule_id} "
+        f"latest_config_id={getattr(latest_config, 'config_id', None)} "
+        f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r} "
+        f"off_days={getattr(latest_config, 'off_days', None)!r}"
+    )
+    try:
+        generated = postprocess_off_swap(db, schedule, generated, latest_config, req)
+    except Exception as _off_swap_exc:
+        print(f"[OffSwap] 후처리 실패 — 변환 미적용 진행: {_off_swap_exc}")
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──

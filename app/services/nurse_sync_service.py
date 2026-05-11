@@ -20,6 +20,8 @@ logger = logging.getLogger("nurse_sync")
 OFFICE_ID = "102243"
 
 # 부서 + 직책코드 → (group_name, role)
+# 0008=간호사(RN), 0014=간호조무사(AN). 그 외 직군(예: 0060 운송원)은
+# 같은 부서의 -AN 그룹에 ETC role 로 fallback (아래 _AN_GROUP_BY_ORG 참조).
 _GROUP_ROLE_MAP: dict[tuple[str, str], tuple[str, str]] = {
     ("42병동파트", "0008"): ("42병동-RN", "RN"),
     ("42병동파트", "0014"): ("42병동-AN", "AN"),
@@ -27,6 +29,16 @@ _GROUP_ROLE_MAP: dict[tuple[str, str], tuple[str, str]] = {
     ("52병동파트", "0014"): ("52병동-AN", "AN"),
     ("중환자간호파트", "0008"): ("중환자실", "RN"),
     ("중환자간호파트", "0014"): ("중환자실", "AN"),
+}
+
+# 간호직군 title_code 화이트리스트
+_KNOWN_NURSE_TITLE_CODES = {"0008", "0014"}
+
+# 비-간호직군 (운송원 등) fallback 용 -AN 그룹명 매핑
+_AN_GROUP_BY_ORG: dict[str, str] = {
+    "42병동파트": "42병동-AN",
+    "52병동파트": "52병동-AN",
+    "중환자간호파트": "중환자실",
 }
 
 # 환경별 DB명: 운영=eun_roster, 개발=eun_roster_dev
@@ -123,6 +135,15 @@ def sync_new_nurses(db: Session) -> dict:
         str(r["memberid"]).strip(): str(r["orgnm"]).strip() for r in orgnm_rows
     }
 
+    # T_Part 코드 → 직군명 (ETC fallback 시 nurses.level_ 채울 때 사용)
+    part_rows = msdb_manager.fetch_all(
+        "SELECT code, name FROM eun_gw.bizwiz20db.T_Part WHERE OfficeCode = %s",
+        params=(OFFICE_ID,),
+    )
+    part_code_to_name: dict[str, str] = {
+        str(r["code"]).strip(): str(r["name"]).strip() for r in part_rows
+    }
+
     # groups 테이블에서 group_name → group_id 매핑 캐시
     groups = (
         db.query(GroupModel.group_id, GroupModel.group_name)
@@ -186,6 +207,13 @@ def sync_new_nurses(db: Session) -> dict:
         emp_name = str(row.get("EmployeeName", "")).strip()
         title_code = str(row.get("OfficialTitleCode", "")).strip()
         mapping = _GROUP_ROLE_MAP.get((orgnm, title_code))
+        title_level: str | None = None  # ETC fallback 시 직군명 (level_ 컬럼)
+        if not mapping and title_code not in _KNOWN_NURSE_TITLE_CODES:
+            # 비-간호직군 (예: 0060 운송원) → 같은 부서 -AN 그룹에 ETC role 로 등록
+            an_group = _AN_GROUP_BY_ORG.get(orgnm)
+            if an_group:
+                mapping = (an_group, "ETC")
+                title_level = part_code_to_name.get(title_code) or None
         if not mapping:
             errors.append({
                 "account_id": account_id,
@@ -218,6 +246,7 @@ def sync_new_nurses(db: Session) -> dict:
                 name=emp_name,
                 experience=experience,
                 role=role,
+                level_=title_level,  # ETC 케이스만 채워짐 (예: '운송원')
                 is_head_nurse=is_head,
                 joining_date=_parse_joining_date(row.get("JoinDate")),
                 birth_date=str(row.get("DateOfBirth", "")) or None,

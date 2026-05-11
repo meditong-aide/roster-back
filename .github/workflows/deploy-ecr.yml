@@ -7,6 +7,10 @@ on:
       - dev
       - feat/**
 
+concurrency:
+  group: deploy-ecr-${{ github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   build-push-deploy:
     runs-on: ubuntu-latest
@@ -70,54 +74,29 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        if: github.ref_name == 'main'
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Login to Amazon ECR
-        if: github.ref_name == 'dev'
-        id: ecr-login-dev
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
-        if: github.ref_name == 'main'
-        run: |
-          docker build \
-            --build-arg ENV=${{ env.ENVIRONMENT }} \
-            --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
-            --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
-            --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
-            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
-
-      - name: Build Docker image (dev)
-        if: github.ref_name == 'dev'
-        run: |
-          docker build \
-            --build-arg ENV=${{ env.ENVIRONMENT }} \
-            --build-arg GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }} \
-            --build-arg ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }} \
-            --build-arg OPENAI_API_KEY=${{ env.OPENAI_API_KEY }} \
-            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }} .
-
-      - name: Push Docker image to ECR
-        if: github.ref_name == 'main'
-        run: |
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
-
-      - name: Push Docker image to ECR (dev)
-        if: github.ref_name == 'dev'
-        run: |
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
-
-      - name: Export image uri
-        if: github.ref_name == 'main'
+      - name: Compute image URI
         run: |
           echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
 
-      - name: Export image uri (dev)
-        if: github.ref_name == 'dev'
-        run: |
-          echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
+      - name: Build & push backend image (gha cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_URI }}
+          cache-from: type=gha,scope=backend-${{ env.ENV }}
+          cache-to: type=gha,mode=max,scope=backend-${{ env.ENV }}
+          build-args: |
+            ENV=${{ env.ENVIRONMENT }}
+            GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }}
+            ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }}
+            OPENAI_API_KEY=${{ env.OPENAI_API_KEY }}
 
       - name: Apply ECR lifecycle policy (idempotent)
         if: github.ref_name == 'main'
@@ -221,7 +200,7 @@ jobs:
 
             echo "ECR login on EC2 done (dev)"
 
-      - name: Stop & prune on EC2 (keep volumes)
+      - name: Stop & cleanup on EC2 (keep image layers for cache)
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ env.EC2_HOST }}
@@ -229,10 +208,9 @@ jobs:
           key: ${{ secrets.PROD_EC2_SSH_KEY }}
           script: |
             set -e
-            sudo docker ps -q | xargs -r sudo docker stop
-            sudo docker ps -a -q | xargs -r sudo docker rm
-            sudo docker images -q | xargs -r sudo docker rmi
-            sudo docker system prune -af
+            sudo docker stop "aide-server-${{ env.ENV }}" || true
+            sudo docker rm   "aide-server-${{ env.ENV }}" || true
+            sudo docker image prune -f
 
       - name: Pull new image on EC2
         if: github.ref_name == 'main'

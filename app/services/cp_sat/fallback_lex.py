@@ -1186,9 +1186,10 @@ def optimize_fallback_lex_hard_first(
                 elif need_max > 0 and _relax_coverage:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     m.Add(ov >= assigned - need_max)
-                elif _fb_off_first_cfg and need > 0 and not _relax_coverage:
-                    # off_first=True + max 미설정: assigned <= need 하드 (잔여 셀 OFF로 회수)
-                    m.Add(assigned <= need)
+                elif _fb_off_first_cfg:
+                    # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
+                    # relax_coverage / need=0 무관 강제 — fixed_wanted 가 min 다 채워도 추가 근무 차단.
+                    m.Add(assigned <= max(0, need))
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 elif need > 0:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")

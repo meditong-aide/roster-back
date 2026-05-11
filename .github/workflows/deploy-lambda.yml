@@ -11,6 +11,10 @@ on:
       - 'Dockerfile.lambda'
       - '.github/workflows/deploy-lambda.yml'
 
+concurrency:
+  group: deploy-lambda-${{ github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   build-push-lambda:
     runs-on: ubuntu-latest
@@ -48,15 +52,25 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build Lambda Docker image
-        run: |
-          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}
-          docker build -f Dockerfile.lambda -t "$IMAGE_URI" .
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Push image to ECR
+      - name: Compute image URI
         run: |
-          docker push "${{ env.IMAGE_URI }}"
+          echo "IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
+
+      - name: Build & push Lambda image (gha cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.lambda
+          push: true
+          tags: ${{ env.IMAGE_URI }}
+          cache-from: type=gha,scope=lambda-${{ env.ENV }}
+          cache-to: type=gha,mode=max,scope=lambda-${{ env.ENV }}
+          # Lambda 는 Docker v2 manifest 만 지원 → buildx 의 OCI provenance attestation 비활성화
+          provenance: false
+          sbom: false
 
       - name: Check Lambda function exists
         id: check-lambda

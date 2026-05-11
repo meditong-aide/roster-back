@@ -199,6 +199,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                     "id": getattr(s, "id", None),
                     # 추가
                     "show_in_preference": s.show_in_preference, # True/False 또는 1/0
+                    "off_swap_target": bool(getattr(s, "off_swap_target", False)),
                 }
                 for s in shifts
             ]
@@ -282,6 +283,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 "id": getattr(s, "id", None),
                 # 추가
                 "show_in_preference": s.show_in_preference,
+                "off_swap_target": bool(getattr(s, "off_swap_target", False)),
             }
             for s in shifts
         ]

@@ -263,6 +263,7 @@ async def get_config_by_version(
                 show_level=getattr(cfg, "show_level", True),
                 show_preceptor=getattr(cfg, "show_preceptor", True),
                 off_first=getattr(cfg, "off_first", False),
+                off_swap_enabled=getattr(cfg, "off_swap_enabled", False),
             )
             db.add(new_config)
 
@@ -306,6 +307,7 @@ async def get_config_by_version(
                 "show_level": new_config.show_level,
                 "show_preceptor": new_config.show_preceptor,
                 "off_first": bool(getattr(new_config, "off_first", False)),
+                "off_swap_enabled": bool(getattr(new_config, "off_swap_enabled", False)),
             }
         else:
             config = (
@@ -356,6 +358,7 @@ async def get_config_by_version(
                 "show_level": config.show_level,
                 "show_preceptor": config.show_preceptor,
                 "off_first": bool(getattr(config, "off_first", False)),
+                "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
             }
     except Exception as e:
         print("error", e)
