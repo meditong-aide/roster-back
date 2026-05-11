@@ -1,0 +1,353 @@
+version: 1
+name: roster-checklist-core
+description: Mandatory checklist rules for roster generation QA gate
+
+defaults:
+  blocking_fail: true
+  repeat_runs: 5
+
+rules:
+  # A. Hard constraints
+  - id: A_1N_SINGLE
+    group: A
+    name: 1N 단독 발생 여부
+    severity: blocking
+    metric: hard.not_one_night_single_n_count
+    pass_condition: "== 0"
+    owner_family: [consecutive_night, recovery]
+
+  - id: A_2N_2OFF
+    group: A
+    name: 2N→2OFF 준수
+    severity: blocking
+    metric: hard.recovery_2n2o_violation_count
+    pass_condition: "== 0"
+    owner_family: [recovery_2n2o]
+
+  - id: A_3N_2OFF
+    group: A
+    name: 3N→2OFF 준수
+    severity: blocking
+    metric: hard.recovery_3n2o_violation_count
+    pass_condition: "== 0"
+    owner_family: [recovery_3n2o]
+
+  - id: A_4N_MAX
+    group: A
+    name: 4N 이상 연속 금지
+    severity: blocking
+    metric: hard.max_consecutive_night_overflow_count
+    pass_condition: "== 0"
+    owner_family: [consecutive_night]
+
+  - id: A_MAX_CONSEQ_WORK
+    group: A
+    name: 연속 근무일 수(max_conseq_work)
+    severity: blocking
+    metric: hard.max_consecutive_work_overflow_count
+    pass_condition: "== 0"
+    owner_family: [consecutive_work]
+
+  - id: A_NOD
+    group: A
+    name: NOD 패턴 금지
+    severity: blocking
+    metric: hard.nod_violation_count
+    pass_condition: "== 0"
+    owner_family: [transition_ban]
+
+  - id: A_NOE
+    group: A
+    name: NOE 패턴 금지
+    severity: blocking
+    metric: hard.noe_violation_count
+    pass_condition: "== 0"
+    owner_family: [transition_ban]
+
+  - id: A_EOD
+    group: A
+    name: EOD 패턴 금지
+    severity: blocking
+    metric: hard.eod_violation_count
+    pass_condition: "== 0"
+    owner_family: [transition_ban]
+
+  - id: A_MONTHLY_N_CAP
+    group: A
+    name: 월 나이트 횟수 상한
+    severity: blocking
+    metric: hard.monthly_night_cap_over_count
+    pass_condition: "== 0"
+    owner_family: [monthly_night_cap]
+
+  # B. OFF / 휴무
+  - id: B_OFF_NEAR_CONFIG
+    group: B
+    name: OFF 수 설정 일치(±1)
+    severity: warning
+    metric: off.off_days_out_of_band_count
+    pass_condition: "== 0"
+    owner_family: [monthly_off]
+
+  - id: B_OFF_CAP_EXACT
+    group: B
+    name: OFF cap 정확 일치(제외인원 배제)
+    severity: blocking
+    metric: off.off_cap_exact_mismatch_count
+    pass_condition: "== 0"
+    owner_family: [monthly_off]
+
+  - id: B_WEEKLY_OFF
+    group: B
+    name: 주휴 정상 배정
+    severity: warning
+    metric: off.weekly_off_missing_count
+    pass_condition: "== 0"
+    owner_family: [weekly_off]
+
+  - id: B_OFF_SWAP_RECOVERY
+    group: B
+    name: off_swap 회복 OFF 보호
+    severity: blocking
+    metric: offswap.recovery_off_converted_count
+    pass_condition: "== 0"
+    owner_family: [off_swap]
+
+  - id: B_OFF_SWAP_N_ONLY
+    group: B
+    name: off_swap N전담 보호
+    severity: blocking
+    metric: offswap.night_only_off_converted_count
+    pass_condition: "== 0"
+    owner_family: [off_swap]
+
+  - id: B_OFF_SWAP_FIXED
+    group: B
+    name: off_swap fixed_wanted 보호
+    severity: blocking
+    metric: offswap.fixed_off_converted_count
+    pass_condition: "== 0"
+    owner_family: [off_swap, fixed_wanted]
+
+  - id: B_OFF_SWAP_JU
+    group: B
+    name: off_swap 주 보호
+    severity: blocking
+    metric: offswap.ju_converted_count
+    pass_condition: "== 0"
+    owner_family: [off_swap]
+
+  - id: B_OFF_SWAP_TARGET_SINGLE
+    group: B
+    name: off_swap target shift 단일
+    severity: blocking
+    metric: offswap.target_shift_multi_count
+    pass_condition: "== 0"
+    owner_family: [config_integrity]
+
+  # C. 균등 분배
+  - id: C_DEN_BALANCE
+    group: C
+    name: D/E/N 균등 분배
+    severity: warning
+    metric: fairness.den_spread_ratio
+    pass_condition: "<= 0.25"
+    owner_family: [fairness]
+
+  - id: C_TOTAL_BALANCE
+    group: C
+    name: 총 근무일 균등
+    severity: warning
+    metric: fairness.total_work_spread
+    pass_condition: "<= 4"
+    owner_family: [fairness]
+
+  - id: C_N_SKEW
+    group: C
+    name: N 쏠림 현상
+    severity: warning
+    metric: fairness.n_shift_skew_ratio
+    pass_condition: "<= 0.35"
+    owner_family: [fairness]
+
+  # D. 커버리지
+  - id: D_D_MIN
+    group: D
+    name: 일자별 D 최소 인원 충족
+    severity: blocking
+    metric: coverage.under_count_D
+    pass_condition: "== 0"
+    owner_family: [coverage, team_min, grade_min, off_window]
+
+  - id: D_E_MIN
+    group: D
+    name: 일자별 E 최소 인원 충족
+    severity: blocking
+    metric: coverage.under_count_E
+    pass_condition: "== 0"
+    owner_family: [coverage, team_min, grade_min, off_window]
+
+  - id: D_N_MIN
+    group: D
+    name: 일자별 N 최소 인원 충족
+    severity: blocking
+    metric: coverage.under_count_N
+    pass_condition: "== 0"
+    owner_family: [coverage, team_min, grade_min, off_window]
+
+  - id: D_M_MIN
+    group: D
+    name: 일자별 M 최소 인원 충족
+    severity: blocking
+    metric: coverage.under_count_M
+    pass_condition: "== 0"
+    owner_family: [coverage, team_min, grade_min]
+    when: "config.use_mid == true"
+
+  - id: D_MAX_OVER
+    group: D
+    name: 커버리지 과잉(max)
+    severity: warning
+    metric: coverage.max_overflow_count
+    pass_condition: "== 0"
+    owner_family: [coverage]
+
+  - id: D_MAX_ENABLED_INTEGRITY
+    group: D
+    name: max_enabled 토글 반영
+    severity: blocking
+    metric: config.max_enabled_inconsistency_count
+    pass_condition: "== 0"
+    owner_family: [config_integrity]
+
+  # E. 원티드/fixed
+  - id: E_WANTED_APPLY
+    group: E
+    name: 원티드 정상 반영
+    severity: warning
+    metric: wanted.apply_ratio
+    pass_condition: ">= 0.90"
+    owner_family: [wanted]
+
+  - id: E_FIXED_LOCK
+    group: E
+    name: Fixed 셀 정상 고정
+    severity: blocking
+    metric: fixed.changed_cell_count
+    pass_condition: "== 0"
+    owner_family: [fixed_wanted]
+
+  - id: E_BAN_N_BEFORE_FIXED_OFF
+    group: E
+    name: ban_night_before_fixed_off
+    severity: blocking
+    metric: fixed.n_before_fixed_off_violation_count
+    pass_condition: "== 0"
+    owner_family: [fixed_wanted, transition_ban]
+
+  # F. 전월 연계
+  - id: F_PREV_TRANSITION
+    group: F
+    name: 전월 연계 패턴 위반
+    severity: blocking
+    metric: carryover.prev_transition_violation_count
+    pass_condition: "== 0"
+    owner_family: [carryover_prev_month, transition_ban]
+
+  - id: F_PREV_CONSEQ_WORK
+    group: F
+    name: 전월 연속근무 이월 위반
+    severity: blocking
+    metric: carryover.prev_conseq_work_overflow_count
+    pass_condition: "== 0"
+    owner_family: [carryover_prev_month, consecutive_work]
+
+  - id: F_PREV_N_RECOVERY
+    group: F
+    name: 전월 N 이월 recovery OFF
+    severity: blocking
+    metric: carryover.prev_n_recovery_violation_count
+    pass_condition: "== 0"
+    owner_family: [carryover_prev_month, recovery]
+
+  - id: F_DROPPED_FILTER
+    group: F
+    name: dropped schedule 미참조
+    severity: blocking
+    metric: carryover.dropped_ref_count
+    pass_condition: "== 0"
+    owner_family: [config_integrity, carryover_prev_month]
+
+  # G. 특수 케이스
+  - id: G_PRECEPTEE_SYNC
+    group: G
+    name: 프리셉티 동반 근무
+    severity: warning
+    metric: preceptee.sync_violation_count
+    pass_condition: "== 0"
+    owner_family: [preceptee_sync]
+
+  - id: G_PRECEPTEE_PAIR_SPREAD
+    group: G
+    name: 프리셉티 페어 분산
+    severity: warning
+    metric: preceptee.pair_shift_concentration_ratio
+    pass_condition: "<= 0.5"
+    owner_family: [preceptee_sync, fairness]
+
+  - id: G_PRECEPTEE_MAPPING
+    group: G
+    name: 프리셉티 매핑 정합성
+    severity: blocking
+    metric: preceptee.mapping_invalid_count
+    pass_condition: "== 0"
+    owner_family: [config_integrity]
+
+  - id: G_ROLE_NULL
+    group: G
+    name: role NULL nurse
+    severity: warning
+    metric: data.role_null_active_count
+    pass_condition: "== 0"
+    owner_family: [data_quality]
+
+  - id: G_GRADE_CONSTRAINT
+    group: G
+    name: Grade 제약 준수
+    severity: blocking
+    metric: grade.minmax_violation_count
+    pass_condition: "== 0"
+    owner_family: [grade_min, grade_max, team_grade_intersect]
+
+  # H. 시스템 안정성
+  - id: H_NO_INFEASIBLE
+    group: H
+    name: Infeasible 미발생
+    severity: blocking
+    metric: system.infeasible_run_count
+    pass_condition: "== 0"
+    owner_family: [solver]
+
+  - id: H_FALLBACK_OK
+    group: H
+    name: Fallback 전환 여부
+    severity: warning
+    metric: system.fallback_error_count
+    pass_condition: "== 0"
+    owner_family: [solver]
+
+  - id: H_RUNTIME
+    group: H
+    name: 생성 시간
+    severity: warning
+    metric: system.solve_time_ms_p95
+    pass_condition: "<= 30000"
+    owner_family: [performance]
+
+  - id: H_OFF_SWAP_LOG
+    group: H
+    name: off_swap 후처리 로그
+    severity: warning
+    metric: logs.offswap_trace_missing_count
+    pass_condition: "== 0"
+    owner_family: [off_swap, observability]
