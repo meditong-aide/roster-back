@@ -19,15 +19,26 @@ class GradeConfigBase(BaseModel):
 
     null_grade_policy: str = Field(
         default="LOWEST",
-        description="NULL Grade 처리 정책 (LOWEST | AVERAGE | RANDOM)",
+        description=(
+            "NULL Grade 처리 정책 "
+            "(LOWEST=최하위로 매핑 | AVERAGE=평균값 스냅 | RANDOM=해시 결정 | EXCLUDE=grade 제약에서 제외)"
+        ),
     )
     use_dynamic_scaling: bool = Field(
         default=True,
         description="일자별 필요 인원 감소 시 비율 축소 적용 여부",
     )
+    allow_soft_fallback: bool = Field(
+        default=False,
+        description="grade 최소/최대 제약을 soft(slack 허용)로 완화할지 여부. 기본값 False=hard.",
+    )
     constraints: Dict[str, Dict[int, int]] = Field(
         default_factory=dict,
         description="Shift별 Grade 최소 인원 예: {'D': {1:1, 2:2}}",
+    )
+    constraints_max: Dict[str, Dict[int, int]] = Field(
+        default_factory=dict,
+        description="Shift별 Grade 최대 인원(anti-pair). 예: {'N': {1: 2}} → N에 grade 1 최대 2명. 값 -1/음수는 '제한 없음'으로 처리.",
     )
     grade_names: Optional[Dict[str, str]] = Field(
         default=None,
@@ -61,4 +72,3 @@ class GradeConfigResponse(GradeConfigBase):
     updated_by: Optional[str] = None
     class Config:
         from_attributes = True
-

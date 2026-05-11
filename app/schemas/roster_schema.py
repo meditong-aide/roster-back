@@ -55,6 +55,7 @@ class ShiftUpdateRequest(BaseModel):
     id: int
     # 추가
     show_in_preference: Optional[bool] = None  # None이면 기존 값 유지
+    off_swap_target: Optional[bool] = None  # None이면 기존 값 유지 (초과 OFF 변환 타깃)
 
 
 class ShiftAddRequest(BaseModel):
@@ -77,6 +78,7 @@ class ShiftAddRequest(BaseModel):
     show_in_preference: Optional[bool] = (
         False  # 기본 False, 프론트에서 안 보내면 자동 숨김
     )
+    off_swap_target: Optional[bool] = False  # 초과 OFF 변환 타깃 (그룹당 1개)
 
 
 class ShiftUploadConfirmRequest(BaseModel):
@@ -98,7 +100,7 @@ class RosterRequest(BaseModel):
     month: int
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
-    grade_strategy: str = "BASE"  # "BASE" | "TEAM" | "GRADE"
+    grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
     # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
     # mode:
@@ -249,6 +251,10 @@ class RosterConfigBase(BaseModel):
         default=False,
         description="OFF 우선 모드(False, default): OFF cap 충족 우선 + max coverage 미부과 + 남는 셀 근무 배정 + fixed_wanted O 차감 / 근무 우선 모드(True): 현행 min-max coverage 균등화 유지",
     )
+    off_swap_enabled: bool = Field(
+        default=False,
+        description="초과 OFF 후처리 — True 시 baseline(off_days) 초과 OFF 를 shifts.off_swap_target=True 인 코드로 변환. 보호: 회복 OFF(1N/2N/3N 직후) / fixed_wanted / '주' / N전담",
+    )
 
 
 class RosterConfigCreate(RosterConfigBase):
@@ -397,6 +403,27 @@ class NurseAssignmentPayload(BaseModel):
         return _normalize_assignment_reason(v)
 
 
+class PreceptorPeerAssignment(BaseModel):
+    """프리셉터 사이드 프로필에 동봉되는 1건 프리셉티 nurse_assignment 메타.
+
+    reason='프리셉티' active row 를 직접 매핑한다. PATCH 시 `assignment_id`
+    를 그대로 update/cancel 식별자로 사용한다.
+    """
+    assignment_id: int
+    start_date: date
+    expected_end_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: str
+    note: Optional[str] = None
+
+
+class PreceptorPeer(BaseModel):
+    """프리셉터 본인의 사이드 프로필에 N명 노출되는 프리셉티 1명."""
+    nurse_id: str
+    name: str
+    assignment: Optional[PreceptorPeerAssignment] = None
+
+
 class NurseProfile(BaseModel):
     office_id: str
     # EmpAuthGbn: Optional[str] = None
@@ -462,6 +489,11 @@ class NurseProfile(BaseModel):
     current_assignment: Optional["CurrentAssignment"] = Field(
         default=None,
         description="휴직/퇴사 > 프리셉티 > 파견/병동이동 우선, 동률 시 start_date DESC",
+    )
+    # 본인이 프리셉터인 경우 자기를 따르는 N명의 프리셉티. preceptee 이거나 0명이면 [].
+    preceptees: List[PreceptorPeer] = Field(
+        default_factory=list,
+        description="본인이 preceptor 일 때 자기를 따르는 N명. 각자 active 프리셉티 nurse_assignment 메타 포함.",
     )
     # 일괄 업데이트(POST /bulk-update) 시 동반 전달 가능한 배정 payload
     assignment: Optional[NurseAssignmentPayload] = Field(
@@ -545,6 +577,22 @@ class PersonnelUpdate(BaseModel):
     experience: Optional[int] = Field(None, ge=0, description="총 경력(년)")
 
 
+class PreceptorPeerUpdate(BaseModel):
+    """프리셉터 사이드 프로필 PATCH 시 preceptees N명 변경 1건.
+
+    operation 별 필수 필드:
+    - create: target_nurse_id, start_date (assignment_id 불요)
+    - update: assignment_id (+ 선택: start_date / expected_end_date / note)
+    - cancel: assignment_id 만 필수
+    """
+    operation: Literal["create", "update", "cancel"]
+    target_nurse_id: str
+    assignment_id: Optional[int] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+    note: Optional[str] = None
+
+
 class NurseProfileUpdate(BaseModel):
     """nurse_id 기반 단건 프로필 업데이트 (사이드 프로필 / 마이페이지)"""
 
@@ -582,6 +630,58 @@ class NurseProfileUpdate(BaseModel):
         default=None,
         description="사이드 프로필에서 여러 파견을 한 번에 create/update/cancel — 다건",
     )
+    preceptees_assignment: Optional[List[PreceptorPeerUpdate]] = Field(
+        default=None,
+        description="프리셉터 본인 입장에서 N명 preceptees 의 nurse_assignment(reason='프리셉티') 일괄 create/update/cancel",
+    )
+
+
+class NurseMonthlyLimitItem(BaseModel):
+    nurse_id: str
+    group_id: str
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+
+    d_min: Optional[int] = Field(default=None, ge=0)
+    d_max: Optional[int] = Field(default=None, ge=0)
+    d_exact: Optional[int] = Field(default=None, ge=0)
+
+    e_min: Optional[int] = Field(default=None, ge=0)
+    e_max: Optional[int] = Field(default=None, ge=0)
+    e_exact: Optional[int] = Field(default=None, ge=0)
+
+    n_min: Optional[int] = Field(default=None, ge=0)
+    n_max: Optional[int] = Field(default=None, ge=0)
+    n_exact: Optional[int] = Field(default=None, ge=0)
+
+    o_min: Optional[int] = Field(default=None, ge=0)
+    o_max: Optional[int] = Field(default=None, ge=0)
+    o_exact: Optional[int] = Field(default=None, ge=0)
+
+
+class NurseMonthlyLimitBulkUpsertRequest(BaseModel):
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+    limits: List[NurseMonthlyLimitItem]
+
+
+class NurseMonthlyLimitWarning(BaseModel):
+    code: str
+    message: str
+    severity: str = "warning"
+
+
+class NurseMonthlyLimitMeta(BaseModel):
+    target_nurse_count: int
+    active_nurse_count: int
+    override_ratio: float
+    recommended_ratio: float = 0.30
+
+
+class NurseMonthlyLimitListResponse(BaseModel):
+    items: List[NurseMonthlyLimitItem]
+    meta: Optional[NurseMonthlyLimitMeta] = None
+    warnings: Optional[List[NurseMonthlyLimitWarning]] = None
 
 
 class PasswordChangeRequest(BaseModel):

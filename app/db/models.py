@@ -47,6 +47,12 @@ class Team(Base):
     team_id = Column(INTEGER, primary_key=True)  # 그룹 내 로컬 식별자
     team_name = Column(VARCHAR(100), nullable=False)
     active = Column(TINYINT, nullable=False, default=1)
+    # 팀별 일일 최소 시프트 커버리지. 예: {"D":1,"E":1,"N":0,"M":0}
+    min_shift = Column(JSON, nullable=True)
+    # 팀 내 인계 제한 정책. 예:
+    # {"restrictions": [{"grades":[6,7,8], "block_same_shift":true, "block_adjacent":true}]}
+    # 미래 확장: {"from":[..], "to":[..], "bidirectional":bool} 규칙도 같은 배열에 추가 가능.
+    handoff_policy = Column(JSON, nullable=True)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
 
@@ -137,6 +143,50 @@ class Nurse(Base):
     )
 
     # office_id는 컬럼으로 관리
+
+
+class NurseMonthlyLimit(Base):
+    """월별/그룹별 간호사 개인 근무 개수 제한.
+
+    - nurses 는 정적 기본 프로필을 유지하고,
+    - 월별 변동 제한은 이 테이블에서 관리한다.
+    """
+
+    __tablename__ = "nurse_monthly_limits"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+
+    d_min = Column(INTEGER, nullable=True)
+    d_max = Column(INTEGER, nullable=True)
+    d_exact = Column(INTEGER, nullable=True)
+
+    e_min = Column(INTEGER, nullable=True)
+    e_max = Column(INTEGER, nullable=True)
+    e_exact = Column(INTEGER, nullable=True)
+
+    n_min = Column(INTEGER, nullable=True)
+    n_max = Column(INTEGER, nullable=True)
+    n_exact = Column(INTEGER, nullable=True)
+
+    o_min = Column(INTEGER, nullable=True)
+    o_max = Column(INTEGER, nullable=True)
+    o_exact = Column(INTEGER, nullable=True)
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    group = relationship("Group", foreign_keys=[group_id])
+
+    __table_args__ = (
+        UniqueConstraint(
+            "nurse_id", "group_id", "year", "month", name="ux_nurse_monthly_limits_scope"
+        ),
+    )
 
 
 class NurseAssignment(Base):
@@ -247,6 +297,7 @@ class Shift(Base):
         server_default="0",  # MSSQL에서 0 (False)
         default=False,
     )
+    off_swap_target = Column(BOOLEAN, nullable=False, default=False)
 
     office = relationship("Office")
     group = relationship("Group")
@@ -347,6 +398,7 @@ class RosterConfig(Base):
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
+    off_swap_enabled = Column(BOOLEAN, nullable=False, default=False)
     office = relationship("Office")
     group = relationship("Group")
 
@@ -359,9 +411,12 @@ class RosterGradeConfig(Base):
     group_id = Column(VARCHAR(50), nullable=False)
     null_grade_policy = Column(VARCHAR(20), nullable=False, default="LOWEST")
     constraints_json = Column(JSON, nullable=True)
+    # anti-pair: shift별 grade 최대 인원. 예: {"N": {"1": 2}} → N 시프트에 grade 1을 최대 2명까지
+    constraints_max_json = Column(JSON, nullable=True)
     grade_names_json = Column(JSON, nullable=True)
     default_shifts_json = Column(JSON, nullable=True, default=list, server_default="[]")
     use_dynamic_scaling = Column(TINYINT, nullable=False, default=1)
+    allow_soft_fallback = Column(TINYINT, nullable=False, default=0)
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
     updated_by = Column(VARCHAR(50), nullable=True)

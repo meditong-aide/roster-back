@@ -44,7 +44,7 @@ async def put_teams(
     else:
         target_group_id = current_user.group_id
     try:
-        payload = [t.dict() for t in body.teams]
+        payload = [t.model_dump() for t in body.teams]
         return apply_team_ops(
             db,
             current_user.office_id,
@@ -52,6 +52,8 @@ async def put_teams(
             payload,
             delete_team_ids=body.delete_team_ids,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         print('[DEBUG] [teams.py - put_teams] office_id', current_user.office_id)
         print('[DEBUG] [teams.py - put_teams] group_id', current_user.group_id)
@@ -59,5 +61,3 @@ async def put_teams(
         print('[DEBUG] [teams.py - put_teams] body.teams', body.teams)
         print('[DEBUG] [teams.py - put_teams] error', e)
         raise HTTPException(status_code=500, detail=f"팀 동기화 실패: {e}")
-
-

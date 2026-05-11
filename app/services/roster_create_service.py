@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
+from copy import deepcopy
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
@@ -23,12 +26,14 @@ from db.models import (
     Shift,
     ShiftManage,
     ShiftPreference,
+    Team,
     Wanted,
     WantedRequest,
 )
 from schemas.roster_schema import RosterRequest
 from routers.utils import get_days_in_month, Timer
 from datetime import date, datetime, timedelta
+import json
 import uuid
 from sqlalchemy import func, or_
 from collections import defaultdict
@@ -36,8 +41,10 @@ import calendar
 from sqlalchemy import text
 from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
+from services.cp_sat.off_swap import postprocess_off_swap
 from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
 from services.day_windows import build_blocked_days
+from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_by_nurse
 from services.cp_sat.mid_feasibility import validate_mid_hard_feasibility as _validate_mid_hard_feasibility_impl
 
 logger = logging.getLogger(__name__)
@@ -434,21 +441,65 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
         - DB에 설정이 없으면 기본값을 반환한다.
         - Grade 제약은 `cp_sat_basic`에서 grade_strategy="GRADE"일 때만 적용된다.
     """
-    config = (
-        db.query(RosterGradeConfig)
-        .filter(RosterGradeConfig.office_id == office_id, RosterGradeConfig.group_id == group_id)
-        .first()
-    )
-    if not config:
+    def _default() -> dict:
         return {
-            "null_grade_policy": "LOWEST",
             "use_dynamic_scaling": True,
+            "allow_soft_fallback": False,
             "constraints_json": {},
+            "constraints_max_json": {},
         }
+
+    def _safe_json_obj(raw, field_name: str) -> dict:
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            txt = raw.strip()
+            if not txt:
+                return {}
+            try:
+                parsed = json.loads(txt)
+            except (json.JSONDecodeError, TypeError) as e:
+                sample = txt[:120]
+                print(
+                    "[GradeConfig][WARN] "
+                    f"field={field_name} office_id={office_id} group_id={group_id} "
+                    f"len={len(txt)} sample={sample!r} parse_error={e}"
+                )
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    # JSON 컬럼에 손상 데이터가 있을 수 있으므로 ORM(JSON 디코딩) 대신 raw text로 안전 조회한다.
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT TOP 1
+                    use_dynamic_scaling,
+                    allow_soft_fallback,
+                    CAST(constraints_json AS NVARCHAR(MAX)) AS constraints_json_text,
+                    CAST(constraints_max_json AS NVARCHAR(MAX)) AS constraints_max_json_text
+                FROM roster_grade_config
+                WHERE office_id = :office_id AND group_id = :group_id
+                ORDER BY config_id DESC
+                """
+            ),
+            {"office_id": office_id, "group_id": group_id},
+        ).fetchone()
+    except Exception as e:
+        print(f"[GradeConfig][WARN] raw 조회 실패. 기본값 사용: {e}")
+        return _default()
+
+    if not row:
+        return _default()
+
     return {
-        "null_grade_policy": config.null_grade_policy or "LOWEST",
-        "use_dynamic_scaling": bool(config.use_dynamic_scaling),
-        "constraints_json": config.constraints_json or {},
+        "use_dynamic_scaling": bool(getattr(row, "use_dynamic_scaling", True)),
+        "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
+        "constraints_json": _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json"),
+        "constraints_max_json": _safe_json_obj(getattr(row, "constraints_max_json_text", None), "constraints_max_json"),
     }
 
 
@@ -504,8 +555,8 @@ def _resolve_grade_strategy(
     """
     # 1) DB 컬럼 우선
     s = _fetch_grade_strategy_from_roster_config(db, roster_config_id)
-    if s in ("BASE", "TEAM", "GRADE"):
-        if s == "GRADE":
+    if s in ("BASE", "TEAM", "GRADE", "COMBINED"):
+        if s in ("GRADE", "COMBINED"):
             gc = _fetch_grade_config_dict(db, office_id, group_id)
             return s, gc
         return s, None
@@ -515,9 +566,36 @@ def _resolve_grade_strategy(
         return "TEAM", None
 
     gc = _fetch_grade_config_dict(db, office_id, group_id)
-    if bool((gc or {}).get("constraints_json") or {}):
+    if bool((gc or {}).get("constraints_json") or {}) or bool((gc or {}).get("constraints_max_json") or {}):
         return "GRADE", gc
     return "BASE", None
+
+
+def _has_any_grade_constraints(grade_config: dict | None) -> bool:
+    gc = grade_config or {}
+    return bool(
+        (gc.get("constraints_json") or gc.get("constraints") or {})
+        or (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+    )
+
+
+def _select_effective_grade_strategy(
+    req_strategy: str,
+    resolved_strategy: str,
+    grade_config: dict | None,
+) -> str:
+    req = str(req_strategy or "").upper()
+    resolved = str(resolved_strategy or "BASE").upper()
+
+    if req == "COMBINED" and _has_any_grade_constraints(grade_config):
+        return "COMBINED"
+    if req == "GRADE" and _has_any_grade_constraints(grade_config):
+        return "GRADE"
+    if req == "TEAM":
+        return "TEAM"
+    if req == "BASE":
+        return "BASE"
+    return resolved
 
 def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
@@ -584,6 +662,13 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         return counts
 
     def _row_to_day_counts_max(row: DailyShift) -> dict[str, int]:
+        # max_enabled=False 면 *_count_max 값 무관 0 반환 (상한 미사용 모드).
+        # daily_shift_service 의 자동 reset 로직이 누락된 비정합 row 도 안전하게 0 처리.
+        if not bool(getattr(row, 'max_enabled', False)):
+            counts = {'D': 0, 'E': 0, 'N': 0}
+            if use_mid:
+                counts['M'] = 0
+            return counts
         counts = {
             'D': int(getattr(row, 'd_count_max', 0) or 0),
             'E': int(getattr(row, 'e_count_max', 0) or 0),
@@ -1518,9 +1603,11 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
     우선순위:
     1) status='issued' 스케줄이 있으면 → 마감본 참조
     2) 없으면(전부 draft) → 최신 version 참조
+
+    dropped=True (취소/대체) 인 schedule 은 어느 분기든 제외.
     """
     py, pm = _get_prev_year_month(year, month)
-    # 1) status='issued' 스케줄 조회
+    # 1) status='issued' 스케줄 조회 (dropped 제외)
     issued = (
         db.query(Schedule)
         .filter(
@@ -1528,16 +1615,22 @@ def _query_prev_month_schedule_id(db: Session, group_id: str, year: int, month: 
             Schedule.year == py,
             Schedule.month == pm,
             Schedule.status == "issued",
+            Schedule.dropped == False,  # noqa: E712
         )
         .order_by(Schedule.version.desc())
         .first()
     )
     if issued:
         return issued.schedule_id
-    # 2) issued 없으면 최신 version
+    # 2) issued 없으면 최신 version (dropped 제외)
     latest = (
         db.query(Schedule)
-        .filter(Schedule.group_id == group_id, Schedule.year == py, Schedule.month == pm)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == py,
+            Schedule.month == pm,
+            Schedule.dropped == False,  # noqa: E712
+        )
         .order_by(Schedule.version.desc())
         .first()
     )
@@ -1548,6 +1641,7 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
     """특정 그룹의 해당 월 최종 schedule_id를 조회한다.
 
     우선순위: status='issued' > 최신 version(draft)
+    dropped=True (취소/대체) 인 schedule 은 어느 분기든 제외.
     """
     issued = (
         db.query(Schedule)
@@ -1556,6 +1650,7 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
             Schedule.year == year,
             Schedule.month == month,
             Schedule.status == "issued",
+            Schedule.dropped == False,  # noqa: E712
         )
         .order_by(Schedule.version.desc())
         .first()
@@ -1564,11 +1659,53 @@ def _query_schedule_id_for_month(db: Session, group_id: str, year: int, month: i
         return issued.schedule_id
     latest = (
         db.query(Schedule)
-        .filter(Schedule.group_id == group_id, Schedule.year == year, Schedule.month == month)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.dropped == False,  # noqa: E712
+        )
         .order_by(Schedule.version.desc())
         .first()
     )
     return latest.schedule_id if latest else None
+
+
+def _query_schedule_ref_for_month(db: Session, group_id: str, year: int, month: int) -> tuple[str | None, str]:
+    """특정 그룹의 해당 월 참조 schedule과 선택 기준을 함께 반환한다.
+
+    Returns:
+        (schedule_id | None, basis)
+        basis in {'issued', 'latest', 'blank'}
+    """
+    issued = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.status == "issued",
+            Schedule.dropped == False,
+        )
+        .order_by(Schedule.version.desc())
+        .first()
+    )
+    if issued:
+        return issued.schedule_id, "issued"
+    latest = (
+        db.query(Schedule)
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.dropped == False,
+        )
+        .order_by(Schedule.version.desc())
+        .first()
+    )
+    if latest:
+        return latest.schedule_id, "latest"
+    return None, "blank"
 
 
 def _get_boundary_tail(
@@ -2090,9 +2227,9 @@ def build_mid_month_boundary_constraints(
         if boundary_day <= 0:
             continue  # 월초 시작 = cross-month constraints가 처리
 
-        src_sid = _query_schedule_id_for_month(db, a.source_group_id, year, month)
+        src_sid, src_basis = _query_schedule_ref_for_month(db, a.source_group_id, year, month)
         if not src_sid:
-            print(f"[MidMonth] nurse={nurse_id}: source({a.source_group_id}) 근무표 없음, window 생략")
+            print(f"[MidMonth] nurse={nurse_id}: source({a.source_group_id}) 근무표 없음(basis={src_basis}), window 생략")
             continue
 
         # source 그룹의 Shift 기반 code2main 빌드 (target과 shift 코드 체계가 다를 수 있음)
@@ -2131,44 +2268,26 @@ def build_mid_month_boundary_constraints(
         print(f"[MidMonth] nurse={nurse_id}: boundary=day{bd}, tail=[{tail_str}], "
               f"cons_work={cons_work}, cons_n={cons_n}, last={last_shift}")
 
-        # (a) 연속 근무 K → 경계일 OFF 강제
-        if K and cons_work >= K:
-            forced_off[nurse_id].append(bd)
-            print(f"[MidMonth] nurse={nurse_id}: cons_work={cons_work}≥K={K} → day{bd} OFF 강제")
-
-        # (a-1) off window: 경계일부터 K-w일 내 OFF ≥ 1
-        if K > 0 and cons_work > 0:
-            window_end = bd + max(0, K - cons_work)
-            window_end = min(window_end, days_in_month - 1)
-            if window_end >= bd:
-                off_window_constraints[nurse_id].append([bd, window_end])
-                print(f"[MidMonth] nurse={nurse_id}: off_window [{bd},{window_end}]")
-
-        # (b) N tail → forced OFF
-        two_eff2 = two_after_two if (L and cons_n >= L) else False
-        two_eff3 = two_after_three if (L and cons_n >= L) else False
-        req_offs = 0
-        if two_eff3 and cons_n >= 3:
-            req_offs = 2
-        elif two_eff2 and cons_n >= 2:
-            req_offs = 2
-        rem = max(0, req_offs - offs_after)
-        for i in range(min(2, rem)):
-            forced_off[nurse_id].append(bd + i)
-        if rem > 0:
-            print(f"[MidMonth] nurse={nurse_id}: N tail={cons_n} → day{bd}..{bd+rem-1} OFF 강제")
-
-        # (c) 전환 금지
-        if last_shift == 'E' and ban_e_to_d:
-            forbidden[nurse_id][bd].append('D')
-        if last_shift == 'N' and ban_n_to_d:
-            forbidden[nurse_id][bd].append('D')
-        if last_shift == 'N' and ban_n_to_e:
-            forbidden[nurse_id][bd].append('E')
-
-        # (d) N 상한
-        if L and cons_n >= L and offs_after == 0:
-            forbidden[nurse_id][bd].append('N')
+        compiled = _compile_boundary_overlap_constraints(
+            nurse_id=nurse_id,
+            boundary_day=bd,
+            days_in_month=days_in_month,
+            cons_work=cons_work,
+            cons_n=cons_n,
+            last_shift=last_shift,
+            offs_after=offs_after,
+            K=K,
+            L=L,
+            two_after_two=two_after_two,
+            two_after_three=two_after_three,
+            ban_e_to_d=ban_e_to_d,
+            ban_n_to_d=ban_n_to_d,
+            ban_n_to_e=ban_n_to_e,
+        )
+        forced_off[nurse_id].extend(compiled['forced_off'])
+        for d, codes in compiled['forbidden'].items():
+            forbidden[nurse_id][d].extend(codes)
+        off_window_constraints[nurse_id].extend(compiled['off_window_constraints'])
 
     # ── 아웃바운드 복귀: target group 근무표 tail → 복귀일 제약 ──
     for a in (outbound_assignments or []):
@@ -2182,9 +2301,9 @@ def build_mid_month_boundary_constraints(
         if return_day >= days_in_month or return_day <= 0:
             continue  # 월 범위 밖
 
-        tgt_sid = _query_schedule_id_for_month(db, a.target_group_id, year, month)
+        tgt_sid, tgt_basis = _query_schedule_ref_for_month(db, a.target_group_id, year, month)
         if not tgt_sid:
-            print(f"[MidMonth][Return] nurse={nurse_id}: target({a.target_group_id}) 근무표 없음, window 생략")
+            print(f"[MidMonth][Return] nurse={nurse_id}: target({a.target_group_id}) 근무표 없음(basis={tgt_basis}), window 생략")
             continue
 
         # target 그룹의 Shift 기반 code2main 빌드 (source와 shift 코드 체계가 다를 수 있음)
@@ -2223,44 +2342,26 @@ def build_mid_month_boundary_constraints(
         print(f"[MidMonth][Return] nurse={nurse_id}: return=day{rd}, tail=[{tail_str}], "
               f"cons_work={cons_work}, cons_n={cons_n}, last={last_shift}")
 
-        # (a) 연속 근무 K → 복귀일 OFF 강제
-        if K and cons_work >= K:
-            forced_off[nurse_id].append(rd)
-            print(f"[MidMonth][Return] nurse={nurse_id}: cons_work={cons_work}≥K={K} → day{rd} OFF 강제")
-
-        # (a-1) off window
-        if K > 0 and cons_work > 0:
-            window_end = rd + max(0, K - cons_work)
-            window_end = min(window_end, days_in_month - 1)
-            if window_end >= rd:
-                off_window_constraints[nurse_id].append([rd, window_end])
-                print(f"[MidMonth][Return] nurse={nurse_id}: off_window [{rd},{window_end}]")
-
-        # (b) N tail → forced OFF
-        two_eff2 = two_after_two if (L and cons_n >= L) else False
-        two_eff3 = two_after_three if (L and cons_n >= L) else False
-        req_offs = 0
-        if two_eff3 and cons_n >= 3:
-            req_offs = 2
-        elif two_eff2 and cons_n >= 2:
-            req_offs = 2
-        rem = max(0, req_offs - offs_after)
-        for i in range(min(2, rem)):
-            forced_off[nurse_id].append(rd + i)
-        if rem > 0:
-            print(f"[MidMonth][Return] nurse={nurse_id}: N tail={cons_n} → day{rd}..{rd+rem-1} OFF 강제")
-
-        # (c) 전환 금지
-        if last_shift == 'E' and ban_e_to_d:
-            forbidden[nurse_id][rd].append('D')
-        if last_shift == 'N' and ban_n_to_d:
-            forbidden[nurse_id][rd].append('D')
-        if last_shift == 'N' and ban_n_to_e:
-            forbidden[nurse_id][rd].append('E')
-
-        # (d) N 상한
-        if L and cons_n >= L and offs_after == 0:
-            forbidden[nurse_id][rd].append('N')
+        compiled = _compile_boundary_overlap_constraints(
+            nurse_id=nurse_id,
+            boundary_day=rd,
+            days_in_month=days_in_month,
+            cons_work=cons_work,
+            cons_n=cons_n,
+            last_shift=last_shift,
+            offs_after=offs_after,
+            K=K,
+            L=L,
+            two_after_two=two_after_two,
+            two_after_three=two_after_three,
+            ban_e_to_d=ban_e_to_d,
+            ban_n_to_d=ban_n_to_d,
+            ban_n_to_e=ban_n_to_e,
+        )
+        forced_off[nurse_id].extend(compiled['forced_off'])
+        for d, codes in compiled['forbidden'].items():
+            forbidden[nurse_id][d].extend(codes)
+        off_window_constraints[nurse_id].extend(compiled['off_window_constraints'])
 
     forced_off_final = {k: sorted(set(v)) for k, v in forced_off.items()}
     forbidden_final = {k: {d: sorted(set(ss)) for d, ss in v.items()} for k, v in forbidden.items()}
@@ -2516,6 +2617,45 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
         # ShiftManage 요구인원은 호출부에서 주입한다
 
+        # teams.min_shift → config_dict["team_min_by_team"] 로 주입
+        # 키는 team_id(str). 팀별 dict 가 비어있거나 NULL 이면 제외.
+        try:
+            team_rows = (
+                db.query(Team)
+                .filter(
+                    Team.office_id == current_user.office_id,
+                    Team.group_id == current_user.group_id,
+                    Team.active == 1,
+                )
+                .all()
+            )
+            team_min_by_team: dict[str, dict[str, int]] = {}
+            team_handoff_policy_by_team: dict[str, dict] = {}
+            for t in team_rows:
+                ms = t.min_shift if isinstance(t.min_shift, dict) else None
+                if ms:
+                    cleaned: dict[str, int] = {}
+                    for k, v in ms.items():
+                        if k not in ("D", "E", "N", "M"):
+                            continue
+                        try:
+                            iv = int(v)
+                        except (TypeError, ValueError):
+                            continue
+                        if iv > 0:
+                            cleaned[k] = iv
+                    if cleaned:
+                        team_min_by_team[str(t.team_id)] = cleaned
+                hp = t.handoff_policy if isinstance(t.handoff_policy, dict) else None
+                if hp and isinstance(hp.get("restrictions"), list) and hp["restrictions"]:
+                    team_handoff_policy_by_team[str(t.team_id)] = hp
+            if team_min_by_team:
+                config_dict["team_min_by_team"] = team_min_by_team
+            if team_handoff_policy_by_team:
+                config_dict["team_handoff_policy_by_team"] = team_handoff_policy_by_team
+        except Exception as e:
+            print(f"[TeamMin] teams.min_shift/handoff_policy 로딩 실패(무시): {e}")
+
         try:
             shift_lookup = _load_shift_lookup(db, current_user.office_id, current_user.group_id)
             shift_defs = []
@@ -2610,6 +2750,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         base=cross_month_constraints,
         extra=allowed_constraints,
     )
+    preflight_alerts = []
     try:
         checker_module = __import__(
             "services.cp_sat.feasibility_alerts",
@@ -2617,13 +2758,13 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
         checker_fn = getattr(checker_module, "run_preflight_feasibility_alerts", None)
         if callable(checker_fn):
-            checker_fn(
+            preflight_alerts = checker_fn(
                 nurses_in_group=nurses_in_group,
                 config_dict=config_dict,
                 year=req.year,
                 month=req.month,
                 logger_prefix="[PreflightFeasibility]",
-            )
+            ) or []
     except Exception as precheck_exc:
         print(f"[PreflightFeasibility] checker failed: {precheck_exc}")
     mid_feasibility_error = _validate_mid_hard_feasibility(
@@ -2659,7 +2800,8 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             )
         except Exception as _log_exc:
             print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")
-        # 전략은 요청 바디가 아니라 "DB(roster_config.grade_strategy) → 없으면 config_dict 기반 폴백"만 사용한다.
+        # 기본 전략은 DB(roster_config.grade_strategy) 기준으로 잡되,
+        # 요청에서 COMBINED/GRADE를 명시하고 grade 제약이 존재하면 해당 전략을 우선 적용한다.
         grade_strategy, grade_config = _resolve_grade_strategy(
             db=db,
             config_dict=config_dict,
@@ -2667,20 +2809,21 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             group_id=current_user.group_id,
             roster_config_id=getattr(latest_config, "config_id", None),
         )
-        # 요청 바디에서 GRADE일 때는 DB에서 grade_config를 조회해 엔진에 전달
+        # 요청 바디에서 GRADE/COMBINED일 때는 DB에서 grade_config를 조회해 엔진에 전달
         engine_grade_config = grade_config
-        if str(getattr(req, "grade_strategy", "") or "").upper() == "GRADE":
+        if str(getattr(req, "grade_strategy", "") or "").upper() in ("GRADE", "COMBINED"):
             engine_grade_config = _fetch_grade_config_dict(
                 db, current_user.office_id, current_user.group_id
             )
+        if bool(config_dict.get("_force_grade_max_soft_fallback")) and isinstance(engine_grade_config, dict):
+            engine_grade_config = dict(engine_grade_config)
+            engine_grade_config["allow_soft_fallback"] = True
+            print("[GradeFallback] force allow_soft_fallback=True (grade_max soft)")
         req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
-        has_grade_constraints = bool(
-            (engine_grade_config or {}).get("constraints_json")
-            or (engine_grade_config or {}).get("constraints")
-            or {}
-        )
-        effective_grade_strategy = (
-            "GRADE" if req_strategy == "GRADE" and has_grade_constraints else grade_strategy
+        effective_grade_strategy = _select_effective_grade_strategy(
+            req_strategy=req_strategy,
+            resolved_strategy=grade_strategy,
+            grade_config=engine_grade_config,
         )
         # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
         config_dict["grade_strategy"] = effective_grade_strategy
@@ -2699,6 +2842,61 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         print(f"error: {e}")
         raise
     if isinstance(cp_sat_result, dict) and "roster" in cp_sat_result:
+        try:
+            _rs = cp_sat_result.get("roster_system")
+            if _rs is not None:
+                setattr(_rs, "_constraint_impact_preflight_alerts", list(preflight_alerts or []))
+                setattr(_rs, "_constraint_impact_mid_feasibility_error", mid_feasibility_error)
+                setattr(_rs, "_constraint_impact_merged_initial_constraints", deepcopy(config_dict.get("initial_constraints") or {}))
+                setattr(_rs, "_constraint_impact_special_fixed_requests", deepcopy(config_dict.get("special_fixed_requests") or []))
+                setattr(
+                    _rs,
+                    "_constraint_impact_assignment_windows",
+                    _build_constraint_impact_assignment_windows(
+                        _assignments,
+                        current_user.group_id,
+                        date(req.year, req.month, 1),
+                        calendar.monthrange(req.year, req.month)[1],
+                    ),
+                )
+                setattr(
+                    _rs,
+                    "_constraint_impact_carryover_artifacts",
+                    _build_constraint_impact_carryover_artifacts(
+                        db,
+                        _inbound_assignments,
+                        _outbound_assignments,
+                        req.year,
+                        req.month,
+                    ),
+                )
+                setattr(
+                    _rs,
+                    "_constraint_impact_attempt_meta",
+                    {
+                        "attempt_index": 1 if bool(config_dict.get("_force_grade_max_soft_fallback")) else 0,
+                        "label": "grade_max_retry" if bool(config_dict.get("_force_grade_max_soft_fallback")) else "primary",
+                        "forced_grade_soft_fallback": bool(config_dict.get("_force_grade_max_soft_fallback")),
+                        "config_flags": {
+                            "preceptee_on": bool(config_dict.get("preceptee_on", False)),
+                            "preceptee_shift_count": bool(config_dict.get("preceptee_shift_count", True)),
+                            "use_mid": bool(config_dict.get("use_mid", False)),
+                            "off_first": bool(config_dict.get("off_first", False)),
+                            "weekend_off_only_enable": bool(config_dict.get("weekend_off_only_enable", True)),
+                            "team_min_soft_fallback": bool(config_dict.get("team_min_soft_fallback", False)),
+                            "team_handoff_soft_fallback": bool(config_dict.get("team_handoff_soft_fallback", True)),
+                            "grade_allow_soft_fallback": bool((engine_grade_config or {}).get("allow_soft_fallback", False)) if isinstance(engine_grade_config, dict) else False,
+                            "two_offs_after_two_nig": bool(config_dict.get("two_offs_after_two_nig", False)),
+                            "two_offs_after_three_nig": bool(config_dict.get("two_offs_after_three_nig", False)),
+                            "not_one_night": bool(config_dict.get("not_one_night", False)),
+                            "ban_n_to_d": bool(config_dict.get("ban_n_to_d", True)),
+                            "ban_e_to_d": bool(config_dict.get("ban_e_to_d", True)),
+                            "ban_n_to_e": bool(config_dict.get("ban_n_to_e", True)),
+                        },
+                    },
+                )
+        except Exception as _snapshot_exc:
+            print(f"[ConstraintImpact] roster_system metadata attach failed: {_snapshot_exc}")
         return (
             cp_sat_result["roster"],
             cp_sat_result.get("satisfaction_data", {}),
@@ -3060,8 +3258,161 @@ def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] |
         return None
 
 
+# TEMP-PROBE-DELETE-START
+def _probe_first_grade_hard_blocker(roster_system) -> str | None:
+    """임시 프로브: Grade hard 제약의 일자/교대별 첫 충돌 지점을 찾는다.
+
+    삭제 가이드:
+      - TEMP-PROBE-DELETE-START ~ TEMP-PROBE-DELETE-END 전체 삭제
+      - _validate_generated_roster 내 호출부(동일 태그 주석)도 함께 삭제
+    """
+    try:
+        cfg = getattr(roster_system, "config", None)
+        if cfg is None:
+            return None
+        gc = getattr(roster_system, "grade_config", None) or {}
+        min_map = (gc.get("constraints_json") or gc.get("constraints") or {})
+        max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+        if not min_map and not max_map:
+            return None
+
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        if not nurses:
+            return None
+        num_days = int(getattr(roster_system, "num_days", 0) or 0)
+        if num_days <= 0:
+            return None
+
+        shift_types = set(str(s).upper() for s in (getattr(cfg, "shift_types", []) or []))
+        join = list(getattr(roster_system, "join", []) or [])
+        leave = list(getattr(roster_system, "leave", []) or [])
+        if len(join) != len(nurses) or len(leave) != len(nurses):
+            # CP-SAT 내부 join/leave가 객체에 노출되지 않는 경로 보정
+            join = [0 for _ in nurses]
+            leave = [num_days - 1 for _ in nurses]
+        blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
+
+        req_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        req_base = getattr(cfg, "daily_shift_requirements", None) or {}
+
+        # 제약에 명시된 grade만 추출(미명시 grade는 중립)
+        constrained_grades = set()
+        for mp in (min_map, max_map):
+            if not isinstance(mp, dict):
+                continue
+            for by_g in mp.values():
+                if not isinstance(by_g, dict):
+                    continue
+                for gk in by_g.keys():
+                    try:
+                        constrained_grades.add(int(gk))
+                    except Exception:
+                        continue
+        if not constrained_grades:
+            return None
+
+        def _day_req(day_idx: int, shift_code: str) -> int:
+            if isinstance(req_by_day, list) and day_idx < len(req_by_day) and isinstance(req_by_day[day_idx], dict):
+                return int((req_by_day[day_idx] or {}).get(shift_code, 0) or 0)
+            return int((req_base or {}).get(shift_code, 0) or 0)
+
+        def _is_active(n_idx: int, day_idx: int, shift_code: str) -> bool:
+            if n_idx >= len(join) or n_idx >= len(leave):
+                return False
+            if not (join[n_idx] <= day_idx <= leave[n_idx]):
+                return False
+            if day_idx in (blocked_by_nurse.get(n_idx, set()) or set()):
+                return False
+            if shift_code in {"D", "E"} and bool(getattr(nurses[n_idx], "is_night_nurse", 0) == 3):
+                return False
+            return True
+
+        for d in range(num_days):
+            for s_code in sorted(set([str(k).upper() for k in list(min_map.keys()) + list(max_map.keys())])):
+                if shift_types and s_code not in shift_types:
+                    continue
+                req = _day_req(d, s_code)
+                if req <= 0:
+                    continue
+
+                active_total = 0
+                active_by_grade = defaultdict(int)
+                active_unconstrained = 0
+                for i, n in enumerate(nurses):
+                    if not _is_active(i, d, s_code):
+                        continue
+                    active_total += 1
+                    g = getattr(n, "grade", None)
+                    try:
+                        gi = int(g) if g is not None else None
+                    except Exception:
+                        gi = None
+                    if gi in constrained_grades:
+                        active_by_grade[gi] += 1
+                    else:
+                        active_unconstrained += 1
+
+                if active_total < req:
+                    return (
+                        f"[probe=GRADE_HARD_ACTIVE_SHORTAGE] day={d+1} shift={s_code} "
+                        f"active={active_total} < req={req}"
+                    )
+
+                min_by_g_raw = (min_map.get(s_code) or {}) if isinstance(min_map, dict) else {}
+                min_sum = 0
+                for gk, tv in min_by_g_raw.items():
+                    try:
+                        gi = int(gk)
+                        t = int(tv or 0)
+                    except Exception:
+                        continue
+                    if t <= 0:
+                        continue
+                    avail = int(active_by_grade.get(gi, 0))
+                    if avail < t:
+                        return (
+                            f"[probe=GRADE_HARD_MIN_BLOCK] day={d+1} shift={s_code} grade={gi} "
+                            f"need={t} avail={avail} req={req}"
+                        )
+                    min_sum += t
+                if min_sum > req:
+                    return (
+                        f"[probe=GRADE_HARD_MIN_OVER_NEED] day={d+1} shift={s_code} "
+                        f"min_sum={min_sum} > req={req}"
+                    )
+
+                max_by_g_raw = (max_map.get(s_code) or {}) if isinstance(max_map, dict) else {}
+                if isinstance(max_by_g_raw, dict) and max_by_g_raw:
+                    capped = active_unconstrained
+                    for gk, uv in max_by_g_raw.items():
+                        try:
+                            gi = int(gk)
+                            u = int(uv)
+                        except Exception:
+                            continue
+                        if u < 0:
+                            continue
+                        capped += min(int(active_by_grade.get(gi, 0)), u)
+                    for gi in constrained_grades:
+                        if str(gi) not in {str(k) for k in max_by_g_raw.keys()}:
+                            capped += int(active_by_grade.get(gi, 0))
+                    if capped < req:
+                        return (
+                            f"[probe=GRADE_HARD_MAX_CAP_SHORTAGE] day={d+1} shift={s_code} "
+                            f"cap={capped} < req={req} (unconstrained={active_unconstrained}, by_grade={dict(active_by_grade)})"
+                        )
+        return None
+    except Exception as exc:
+        return f"[probe=GRADE_HARD_PROBE_ERROR] {exc}"
+# TEMP-PROBE-DELETE-END
+
+
 def _validate_generated_roster(
-    generated: dict[str, list[str]] | None, roster_system
+    generated: dict[str, list[str]] | None,
+    roster_system,
+    nurses_context: list | None = None,
+    config_context: dict | None = None,
+    grade_config_context: dict | None = None,
 ) -> str | None:
     """
     엔진 결과가 고객에게 보여줄 수 없는 수준인지 최소 검증한다.
@@ -3081,6 +3432,114 @@ def _validate_generated_roster(
 
     if total_cells > 0 and work_cells == 0:
         diag = _build_infeasible_diagnosis(roster_system, generated)
+        cp_probe_msg = getattr(roster_system, "_grade_hard_probe_msg", None)
+
+        def _grade_probe_comment(msg: str | None) -> str | None:
+            if not msg:
+                return None
+            if "MAX_CAP_SHORTAGE" not in msg:
+                return None
+            day_m = re.search(r"day=(\d+)", msg)
+            shift_m = re.search(r"shift=([A-Z]+)", msg)
+            cap_m = re.search(r"cap=(\d+)", msg)
+            req_m = re.search(r"req=(\d+)", msg)
+            day = day_m.group(1) if day_m else "?"
+            shift = shift_m.group(1) if shift_m else "?"
+            cap = cap_m.group(1) if cap_m else "?"
+            req = req_m.group(1) if req_m else "?"
+            return (
+                "[comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮아 infeasible 발생 "
+                f"(day={day}, shift={shift}, cap={cap}, req={req}). "
+                "grade_max 중요도를 낮춘 soft fallback 또는 상한 완화가 필요합니다."
+            )
+
+        probe_comment = _grade_probe_comment(cp_probe_msg)
+        if cp_probe_msg:
+            if diag:
+                if probe_comment:
+                    return f"{diag} | [cp_probe={cp_probe_msg}] | {probe_comment}"
+                return f"{diag} | [cp_probe={cp_probe_msg}]"
+            if probe_comment:
+                return (
+                    "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
+                    f"| [cp_probe={cp_probe_msg}] | {probe_comment}"
+                )
+            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]"
+        # TEMP-PROBE-DELETE: NO_ASSIGNMENT 시 grade hard 충돌 일자/교대를 임시 탐색
+        probe_msg = _probe_first_grade_hard_blocker(roster_system)
+        if probe_msg:
+            print(f"[InfeasibleProbe] {probe_msg}")
+            if diag:
+                return f"{diag} | {probe_msg}"
+            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}"
+
+        # probe로 못 잡힌 경우, grade_max 산술 상한만으로도 즉시 불가능한 케이스를 보조 진단한다.
+        try:
+            cfg = getattr(roster_system, "config", None)
+            gc = getattr(roster_system, "grade_config", None) or {}
+            if cfg is None and isinstance(config_context, dict):
+                class _CfgProxy:
+                    pass
+                _p = _CfgProxy()
+                setattr(_p, "daily_shift_requirements", config_context.get("daily_shift_requirements") or {})
+                setattr(_p, "daily_shift_requirements_by_day", config_context.get("daily_shift_requirements_by_day"))
+                cfg = _p
+            if (not gc) and isinstance(grade_config_context, dict):
+                gc = grade_config_context
+            max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
+            if cfg and isinstance(max_map, dict) and max_map:
+                nurses = list(getattr(roster_system, "nurses", []) or [])
+                if not nurses and isinstance(nurses_context, list):
+                    nurses = list(nurses_context)
+                grade_counts: dict[int, int] = defaultdict(int)
+                for nu in nurses:
+                    try:
+                        grade_counts[int(getattr(nu, "grade", None))] += 1
+                    except Exception:
+                        continue
+
+                ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+                base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+
+                def _req(day_idx: int, shift_code: str) -> int:
+                    if isinstance(ds_by_day, list) and day_idx < len(ds_by_day) and isinstance(ds_by_day[day_idx], dict):
+                        return int((ds_by_day[day_idx] or {}).get(shift_code, 0) or 0)
+                    return int((base_req or {}).get(shift_code, 0) or 0)
+
+                days = int(getattr(roster_system, "num_days", 0) or 0)
+                if days <= 0 and isinstance(ds_by_day, list):
+                    days = len(ds_by_day)
+                for d in range(days):
+                    for s_code, limits_raw in max_map.items():
+                        if not isinstance(limits_raw, dict):
+                            continue
+                        shift_code = str(s_code or "").strip().upper()
+                        req = _req(d, shift_code)
+                        if req <= 0:
+                            continue
+
+                        constrained = {int(gk): int(v or 0) for gk, v in limits_raw.items() if str(gk).isdigit()}
+                        cap = 0
+                        for g, cnt in grade_counts.items():
+                            if g in constrained:
+                                cap += min(cnt, max(0, constrained[g]))
+                            else:
+                                cap += cnt
+                        if cap < req:
+                            aux = (
+                                "[reason_code=GRADE_MAX_SUM_BELOW_NEED] "
+                                f"day={d+1} shift={shift_code} req={req} cap={cap} "
+                                f"limits={constrained}"
+                            )
+                            if diag:
+                                return f"{diag} | {aux}"
+                            return (
+                                "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
+                                f"| {aux} | [comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮습니다. "
+                                "grade_max 중요도를 soft로 낮추거나 상한 완화를 검토하세요."
+                            )
+        except Exception as _aux_exc:
+            print(f"[InfeasibleProbe][aux] grade_max 보조진단 실패(무시): {_aux_exc}")
         return diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다."
 
     # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
@@ -3185,6 +3644,340 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
             nurse_entry["source_group_id"] = getattr(nurse, 'group_id', None)
         roster_data["nurses"].append(nurse_entry)
     return roster_data
+
+
+def _compute_coverage_gaps(roster_system) -> list[dict]:
+    """현재 roster vs daily_shift_requirements 비교해 부족분 리스트를 반환.
+
+    primary 솔버는 coverage hard지만, INFEASIBLE 시 fallback에서 soft로 떨어져
+    shortage가 남을 수 있다. 사용자 진단용으로 일/시프트별 부족 셀을 노출한다.
+    """
+    try:
+        cfg = roster_system.config
+        shift_types = list(getattr(cfg, "shift_types", []) or [])
+        if not shift_types or not hasattr(roster_system, "roster"):
+            return []
+        ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+        base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
+        N = len(roster_system.nurses)
+        gaps: list[dict] = []
+        for d in range(roster_system.num_days):
+            need_map = (
+                ds_by_day[d]
+                if isinstance(ds_by_day, list) and d < len(ds_by_day) and isinstance(ds_by_day[d], dict)
+                else base_req
+            )
+            for code, req_val in (need_map or {}).items():
+                s_code = str(code or "").strip().upper()
+                if s_code not in shift_types:
+                    continue
+                req = int(req_val or 0)
+                if req <= 0:
+                    continue
+                s_idx = shift_types.index(s_code)
+                assigned = int(sum(int(roster_system.roster[n, d, s_idx]) for n in range(N)))
+                if assigned < req:
+                    gaps.append({
+                        "day": d + 1,
+                        "shift": s_code,
+                        "need": req,
+                        "assigned": assigned,
+                        "short": req - assigned,
+                    })
+        return gaps
+    except Exception as exc:
+        print(f"[CoverageGaps] 계산 실패: {exc}")
+        return []
+
+
+def _build_constraint_impact_payload(roster_system, req) -> dict:
+    """생성 완료된 roster_system 기준 constraint-impact 요약을 생성한다."""
+    started = time.perf_counter()
+    try:
+        from services.constraint_impact import (
+            analyze_current_roster,
+            build_current_atoms_from_roster_system,
+            build_semantics_snapshot_from_roster_system,
+        )
+
+        snapshot = build_semantics_snapshot_from_roster_system(
+            roster_system,
+            year=req.year,
+            month=req.month,
+        )
+        atoms = build_current_atoms_from_roster_system(snapshot, roster_system)
+        analysis = analyze_current_roster(snapshot=snapshot, current_atoms=atoms)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        used_fallback = bool(getattr(roster_system, "_used_fallback", False))
+        coverage_gaps = _compute_coverage_gaps(roster_system)
+        return {
+            "enabled": True,
+            "timing_ms": elapsed_ms,
+            "valid_under_current_semantics": analysis.valid_under_current_semantics,
+            "atom_count": analysis.atom_count,
+            "fixed_atom_count": analysis.fixed_atom_count,
+            "preceptee_atom_count": analysis.preceptee_atom_count,
+            "coverage_excluded_atom_count": analysis.coverage_excluded_atom_count,
+            "hard_violation_count": analysis.hard_violation_count,
+            "risky_constraint_count": analysis.risky_constraint_count,
+            "constraint_mode_summary": analysis.constraint_mode_summary,
+            "preflight_alerts": analysis.preflight_alerts,
+            "violated_constraints": [
+                {
+                    "node_id": v.node_id,
+                    "slack": v.slack,
+                    "pressure": v.pressure,
+                    "details": v.details,
+                }
+                for v in analysis.violated_constraints[:50]
+            ],
+            "risky_constraints": [
+                {
+                    "node_id": v.node_id,
+                    "slack": v.slack,
+                    "pressure": v.pressure,
+                    "details": v.details,
+                }
+                for v in analysis.risky_constraints[:50]
+            ],
+            "snapshot_meta": {
+                "attempt_label": snapshot.attempt.label,
+                "attempt_index": snapshot.attempt.attempt_index,
+                "forced_grade_soft_fallback": snapshot.attempt.forced_grade_soft_fallback,
+                "used_fallback": used_fallback,
+                "nurse_count": len(snapshot.nurses),
+                "fixed_cell_count": len(snapshot.fixed_cells),
+                "preceptee_count": len(snapshot.preceptee_facts),
+            },
+            "solver_status": "fallback" if used_fallback else "primary",
+            "coverage_gaps": coverage_gaps,
+        }
+    except Exception as e:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "enabled": False,
+            "timing_ms": elapsed_ms,
+            "error": str(e),
+        }
+
+
+def _build_constraint_impact_assignment_windows(assignments, target_group_id: str, month_start: date, days_in_month: int) -> list[dict]:
+    month_end = month_start + timedelta(days=days_in_month - 1)
+    rows: list[dict] = []
+    for a in assignments or []:
+        nurse_id = str(getattr(a, "nurse_id", "") or "")
+        if not nurse_id:
+            continue
+        reason = str(getattr(a, "reason", "") or "assignment")
+        source_gid = getattr(a, "source_group_id", None)
+        target_gid = getattr(a, "target_group_id", None)
+        start = getattr(a, "start_date", None)
+        if start is None:
+            continue
+        if reason == "병동이동":
+            end = getattr(a, "expected_end_date", None) or month_end
+        else:
+            end = getattr(a, "end_date", None) or getattr(a, "expected_end_date", None) or month_end
+        overlap_start = max(start, month_start)
+        overlap_end = min(end, month_end)
+        active_days = set()
+        if overlap_start <= overlap_end:
+            active_days = {int((overlap_start - month_start).days + i) for i in range((overlap_end - overlap_start).days + 1)}
+        all_days = set(range(days_in_month))
+        direction = "inbound" if target_gid == target_group_id and source_gid != target_group_id else "outbound"
+        if reason == "병동이동":
+            direction = "transfer"
+        if reason in ("휴직", "퇴사"):
+            direction = "leave"
+        if reason == "교육":
+            direction = "training"
+        rows.append(
+            {
+                "nurse_id": nurse_id,
+                "direction": direction,
+                "source_group_id": source_gid,
+                "target_group_id": target_gid,
+                "reason": reason,
+                "active_day_indices": sorted(active_days),
+                "inactive_day_indices": sorted(all_days - active_days),
+                "allowed_shift_codes": list(getattr(a, "target_shift_types", None) or []),
+                "carries_state": direction in {"inbound", "transfer", "training"},
+                "counts_to_coverage": True,
+                "metadata": {
+                    "start_date": str(start),
+                    "end_date": str(end) if end is not None else None,
+                },
+            }
+        )
+    return rows
+
+
+def _build_constraint_impact_carryover_artifacts(
+    db: Session,
+    inbound_assignments: list,
+    outbound_assignments: list,
+    year: int,
+    month: int,
+) -> list[dict]:
+    """현재 파견/복귀 정책과 동일한 schedule 선택 우선순위로 carryover artifact를 생성한다.
+
+    정책:
+    - 참조 schedule 선택: issued > latest > blank
+    - inbound: source 병동 기준
+    - outbound 복귀: target 병동 기준
+    - tail metrics는 기존 mid-month boundary 계산과 동일 helper 사용
+    """
+    month_start = date(year, month, 1)
+    lookback = 6
+    rows: list[dict] = []
+
+    def _group_code2main(group_id: str | None) -> dict:
+        if not group_id:
+            return {}
+        out: dict[str, str] = {}
+        try:
+            shifts = db.query(Shift).filter(Shift.group_id == group_id).all()
+            _GB = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
+            for s in shifts:
+                sid = str(getattr(s, "shift_id", "") or "").strip().upper()
+                if not sid:
+                    continue
+                sgb = str(getattr(s, "shift_gb", "") or "").strip()
+                if sgb in _GB:
+                    out[sid] = _GB[sgb]
+                    continue
+                ds = str(getattr(s, "default_shift", "") or "").strip().upper()
+                if ds in ("OFF", "주"):
+                    ds = "O"
+                if ds in ("D", "E", "N", "M", "O"):
+                    out[sid] = ds
+        except Exception:
+            return {}
+        return out
+
+    def _append_artifact(*, nurse_id: str, direction: str, boundary_day_index: int, reference_group_id: str | None, schedule_id: str | None, basis: str, tail: list[str], carries_state: bool, metadata: dict):
+        rows.append(
+            {
+                "nurse_id": nurse_id,
+                "direction": direction,
+                "boundary_day_index": boundary_day_index,
+                "reference_group_id": reference_group_id,
+                "selected_schedule_id": schedule_id,
+                "selected_schedule_basis": basis,
+                "carries_state": carries_state,
+                "tail_sequence": list(tail or []),
+                "metrics": _calc_tail_metrics(tail) if tail else {},
+                "metadata": metadata,
+            }
+        )
+
+    for a in inbound_assignments or []:
+        nurse_id = str(a.nurse_id)
+        boundary_day = (a.start_date - month_start).days
+        if boundary_day <= 0:
+            continue
+        schedule_id, basis = _query_schedule_ref_for_month(db, a.source_group_id, year, month)
+        tail = _get_boundary_tail(db, schedule_id, nurse_id, boundary_day, lookback, _group_code2main(a.source_group_id)) if schedule_id else []
+        _append_artifact(
+            nurse_id=nurse_id,
+            direction="inbound" if a.reason != "병동이동" else "transfer",
+            boundary_day_index=boundary_day,
+            reference_group_id=a.source_group_id,
+            schedule_id=schedule_id,
+            basis=basis,
+            tail=tail,
+            carries_state=True,
+            metadata={
+                "reason": a.reason,
+                "start_date": str(a.start_date),
+                "expected_end_date": str(getattr(a, "expected_end_date", None)) if getattr(a, "expected_end_date", None) else None,
+            },
+        )
+
+    for a in outbound_assignments or []:
+        nurse_id = str(a.nurse_id)
+        a_end = a.end_date or a.expected_end_date
+        if not a_end:
+            continue
+        if a_end.year != year or a_end.month != month:
+            continue
+        return_day = (a_end - month_start).days + 1
+        if return_day <= 0:
+            continue
+        schedule_id, basis = _query_schedule_ref_for_month(db, a.target_group_id, year, month)
+        tail = _get_boundary_tail(db, schedule_id, nurse_id, return_day, lookback, _group_code2main(a.target_group_id)) if schedule_id else []
+        _append_artifact(
+            nurse_id=nurse_id,
+            direction="outbound" if a.reason != "병동이동" else "transfer",
+            boundary_day_index=return_day,
+            reference_group_id=a.target_group_id,
+            schedule_id=schedule_id,
+            basis=basis,
+            tail=tail,
+            carries_state=True,
+            metadata={
+                "reason": a.reason,
+                "return_date": str(a_end + timedelta(days=1)),
+            },
+        )
+
+    return rows
+
+
+def _compile_boundary_overlap_constraints(
+    *,
+    nurse_id: str,
+    boundary_day: int,
+    days_in_month: int,
+    cons_work: int,
+    cons_n: int,
+    last_shift: str | None,
+    offs_after: int,
+    K: int,
+    L: int,
+    two_after_two: bool,
+    two_after_three: bool,
+    ban_e_to_d: bool,
+    ban_n_to_d: bool,
+    ban_n_to_e: bool,
+) -> dict:
+    forced_off: list[int] = []
+    forbidden: dict[int, list[str]] = defaultdict(list)
+    off_window_constraints: list[list[int]] = []
+
+    if K and cons_work >= K:
+        forced_off.append(boundary_day)
+
+    if K > 0 and cons_work > 0:
+        window_end = boundary_day + max(0, K - cons_work)
+        window_end = min(window_end, days_in_month - 1)
+        if window_end >= boundary_day:
+            off_window_constraints.append([boundary_day, window_end])
+
+    req_offs = 0
+    if two_after_three and L and cons_n >= 3:
+        req_offs = 2
+    elif two_after_two and L and cons_n >= 2:
+        req_offs = 2
+    rem = max(0, req_offs - offs_after)
+    for i in range(min(2, rem)):
+        if boundary_day + i < days_in_month:
+            forced_off.append(boundary_day + i)
+
+    if last_shift == 'E' and ban_e_to_d:
+        forbidden[boundary_day].append('D')
+    if last_shift == 'N' and ban_n_to_d:
+        forbidden[boundary_day].append('D')
+    if last_shift == 'N' and ban_n_to_e:
+        forbidden[boundary_day].append('E')
+    if L and cons_n >= L and offs_after == 0:
+        forbidden[boundary_day].append('N')
+
+    return {
+        'forced_off': sorted(set(forced_off)),
+        'forbidden': {d: sorted(set(v)) for d, v in forbidden.items()},
+        'off_window_constraints': off_window_constraints,
+    }
 
 
 def _normalize_shift_id_for_save(raw_shift: str, valid_shift_ids: set[str]) -> str:
@@ -3589,6 +4382,25 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         -int(getattr(n, "experience", 0) or 0),
         str(getattr(n, "nurse_id", "")),
     ))
+
+    # 월별 개인 shift/off 제한 오버레이 적용 (group/year/month scope)
+    try:
+        _limit_map = fetch_effective_monthly_limits_by_nurse(
+            db=db,
+            year=req.year,
+            month=req.month,
+            nurse_ids=[str(n.nurse_id) for n in engine_nurses],
+            group_id=str(current_user.group_id),
+        )
+        for _n in engine_nurses:
+            _lim = _limit_map.get(str(_n.nurse_id))
+            if not _lim:
+                continue
+            for _k, _v in _lim.items():
+                _n.__dict__[_k] = _v
+    except Exception as _e:
+        print(f"[MonthlyLimits] 오버레이 실패(무시): {_e}")
+
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day = _build_shift_manage_and_requirements(
@@ -4242,6 +5054,93 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         )
     )
 
+    # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
+    precheck_result: dict | None = None
+    try:
+        from services.precheck import (
+            run_runtime_precheck,
+            has_blocking_issues,
+            build_blocking_payload,
+        )
+        _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
+        _nurses_dict_for_precheck = [
+            (n.__dict__ if hasattr(n, "__dict__") else dict(n))
+            for n in (nurses_for_engine or [])
+        ]
+        # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
+        # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
+        precheck_config = dict(config_dict)
+        if "team_min_by_team" not in precheck_config:
+            try:
+                _team_rows = (
+                    db.query(Team)
+                    .filter(
+                        Team.office_id == current_user.office_id,
+                        Team.group_id == current_user.group_id,
+                        Team.active == 1,
+                    )
+                    .all()
+                )
+                _team_min_by_team: dict[str, dict[str, int]] = {}
+                for _t in _team_rows:
+                    _ms = _t.min_shift if isinstance(_t.min_shift, dict) else None
+                    if not _ms:
+                        continue
+                    _cleaned: dict[str, int] = {}
+                    for _k, _v in _ms.items():
+                        if _k not in ("D", "E", "N", "M"):
+                            continue
+                        try:
+                            _iv = int(_v)
+                        except (TypeError, ValueError):
+                            continue
+                        if _iv > 0:
+                            _cleaned[_k] = _iv
+                    if _cleaned:
+                        _team_min_by_team[str(_t.team_id)] = _cleaned
+                if _team_min_by_team:
+                    precheck_config["team_min_by_team"] = _team_min_by_team
+            except Exception as _team_exc:
+                print(f"[Precheck] team_min 로딩 실패(무시): {_team_exc}")
+
+        precheck_result = run_runtime_precheck(
+            nurses_dict=_nurses_dict_for_precheck,
+            config_dict=precheck_config,
+            grade_config=_engine_grade_config,
+            fixed_cells=combined_fixed_cells,
+            year=req.year,
+            month=req.month,
+            stop_on_config_error=False,
+        )
+        if has_blocking_issues(precheck_result):
+            payload = build_blocking_payload(precheck_result)
+            inf = payload.get("infeasibility", {})
+            issue_codes = sorted({
+                str(i.get("reason_code", "?"))
+                for i in (precheck_result.get("issues") or [])
+            })
+            print(
+                f"[Precheck][BLOCKING] {len(precheck_result.get('issues', []))}건 — "
+                f"codes={issue_codes}"
+            )
+            print(f"[Precheck][BLOCKING][message] {inf.get('summary_message_ko')}")
+            for s in (inf.get("fix_suggestions_ko") or [])[:5]:
+                print(f"[Precheck][BLOCKING][fix] {s}")
+            print("[Precheck][BLOCKING] 솔버 호출 생략. HTTP 500 응답.")
+            try:
+                db.delete(schedule)
+                db.commit()
+            except Exception:
+                db.rollback()
+            from fastapi import HTTPException
+            raise HTTPException(status_code=500, detail=payload)
+    except HTTPException:
+        raise
+    except Exception as _pre_exc:
+        # precheck 자체가 실패하면 무시하고 솔버 진행
+        print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
+        precheck_result = None
+
     if nurses_for_engine:
         # _debug_log(
         #     "cp_sat_start",
@@ -4320,12 +5219,134 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         else:
             generated = dict(_alloff_roster)
 
-    validation_error = _validate_generated_roster(generated, roster_system)
+    validation_error = _validate_generated_roster(
+        generated,
+        roster_system,
+        nurses_context=list(nurses_for_engine or []),
+        config_context=config_dict,
+        grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
+    )
+    applied_relaxations: list[str] = []
     if validation_error:
-        db.delete(schedule)
-        db.commit()
-        raise Exception(validation_error)
+        # 자연 soft 트리거: NO_ASSIGNMENT 또는 grade_max 병목, 그리고 아직 soft 미적용
+        _trigger_soft = (
+            ("NO_ASSIGNMENT" in validation_error)
+            or ("MAX_CAP_SHORTAGE" in validation_error)
+            or ("GRADE_MAX_SUM_BELOW_NEED" in validation_error)
+        )
+        if _trigger_soft and not bool(config_dict.get("_force_grade_max_soft_fallback")):
+            print("[GradeFallback] infeasible 감지 → grade hard→soft 자동 전환으로 1회 재시도")
+            soft_cfg = dict(config_dict)
+            soft_cfg["_force_grade_max_soft_fallback"] = True
+            retry_generated, _, retry_rs = _run_cp_sat_basic(
+                db,
+                current_user,
+                nurses_for_engine,
+                preferences,
+                latest_config,
+                req,
+                shift_manage_data,
+                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                time_limit_seconds=60,
+                config_override=soft_cfg,
+            )
+            # 동일 후처리 적용
+            try:
+                weekend_off_display_ids = {
+                    str(getattr(n, "nurse_id", ""))
+                    for n in nurses_in_group
+                    if bool(getattr(n, "is_weekend_off", False)) and getattr(n, "nurse_id", None)
+                }
+                if weekly_off_map and isinstance(retry_generated, dict):
+                    for nurse_id, day_set in weekly_off_map.items():
+                        if str(nurse_id) in weekend_off_display_ids:
+                            continue
+                        shifts = retry_generated.get(nurse_id)
+                        if not shifts:
+                            continue
+                        for d in day_set:
+                            if 0 <= d < len(shifts):
+                                shifts[d] = "주"
+            except Exception as e:
+                weekly_off_warnings.append({"type": "weekly_off_mark_failed_retry", "detail": str(e)})
 
+            if isinstance(retry_generated, dict):
+                retry_generated.update(fixed_roster)
+            else:
+                retry_generated = fixed_roster
+            if _alloff_roster:
+                if isinstance(retry_generated, dict):
+                    retry_generated.update(_alloff_roster)
+                else:
+                    retry_generated = dict(_alloff_roster)
+
+            retry_validation_error = _validate_generated_roster(
+                retry_generated,
+                retry_rs,
+                nurses_context=list(nurses_for_engine or []),
+                config_context=soft_cfg,
+                grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
+            )
+            if not retry_validation_error:
+                generated = retry_generated
+                roster_system = retry_rs
+                applied_relaxations.append("grade_hard_to_soft")
+                weekly_off_warnings.append(
+                    {
+                        "type": "grade_hard_to_soft_applied",
+                        "detail": (
+                            "Grade hard 제약이 infeasible로 인해 자동 soft 전환되어 재생성됐습니다. "
+                            "일부 grade 최소가 미충족일 수 있습니다."
+                        ),
+                    }
+                )
+                print(
+                    "[GradeFallback][AUTO-SOFT][success] grade hard→soft 자동 전환으로 근무표 생성. "
+                    "사용자 응답: HTTP 200, severity=warning, applied_relaxations=['grade_hard_to_soft']"
+                )
+                validation_error = None
+            else:
+                print(f"[GradeFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
+                validation_error = retry_validation_error
+
+    if validation_error:
+        print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")
+        print(f"[RosterGenerate][UNRECOVERABLE] applied_relaxations={applied_relaxations}")
+        try:
+            db.delete(schedule)
+            db.commit()
+        except Exception:
+            db.rollback()
+        try:
+            from services.precheck import build_unrecoverable_payload
+            from fastapi import HTTPException
+            unrecoverable = build_unrecoverable_payload(
+                precheck_result=precheck_result,
+                applied_relaxations=applied_relaxations,
+                last_error_reason=str(validation_error),
+            )
+            inf = unrecoverable.get("infeasibility", {})
+            print(
+                f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
+                f"message={inf.get('summary_message_ko')}"
+            )
+            raise HTTPException(status_code=500, detail=unrecoverable)
+        except HTTPException:
+            raise
+        except Exception:
+            raise Exception(validation_error)
+
+    # 초과 OFF → 연차 변환 후처리 (off_swap_enabled=True 일 때만 동작, 보호 4종 적용)
+    print(
+        f"[OffSwap][CALL] schedule_id={schedule.schedule_id} "
+        f"latest_config_id={getattr(latest_config, 'config_id', None)} "
+        f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r} "
+        f"off_days={getattr(latest_config, 'off_days', None)!r}"
+    )
+    try:
+        generated = postprocess_off_swap(db, schedule, generated, latest_config, req)
+    except Exception as _off_swap_exc:
+        print(f"[OffSwap] 후처리 실패 — 변환 미적용 진행: {_off_swap_exc}")
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
@@ -4361,6 +5382,31 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     roster_data = _build_roster_response(db, schedule, req, nurses_in_group)
     roster_data["weekly_off_conflicts"] = weekly_off_conflicts
     roster_data["weekly_off_warnings"] = weekly_off_warnings
+    roster_data["constraint_impact"] = _build_constraint_impact_payload(roster_system, req)
+    # ── infeasibility 페이로드 (precheck warning + applied_relaxations + violation summary) ──
+    try:
+        from services.precheck import build_success_payload
+        _ci = roster_data.get("constraint_impact") or {}
+        roster_data.update(
+            build_success_payload(
+                precheck_result=precheck_result,
+                applied_relaxations=applied_relaxations,
+                violated_constraints=_ci.get("violated_constraints") or [],
+                hard_violation_count=int(_ci.get("hard_violation_count") or 0),
+            )
+        )
+        _inf = roster_data.get("infeasibility") or {}
+        _vs = _inf.get("violation_summary") or {}
+        _vs_summary = {k: v.get("count") for k, v in _vs.items()}
+        print(
+            f"[RosterGenerate][response] HTTP 200, severity={_inf.get('severity')}, "
+            f"applied_relaxations={_inf.get('applied_relaxations')}, "
+            f"violations={_vs_summary}"
+        )
+        if _inf.get("severity") == "warning" and _inf.get("summary_message_ko"):
+            print(f"[RosterGenerate][response][message] {_inf['summary_message_ko']}")
+    except Exception as _exc:
+        print(f"[Infeasibility] payload 빌드 실패(무시): {_exc}")
 
     # ── assignment 대상자 근무표 생성 알림 (S09) ──
     try:

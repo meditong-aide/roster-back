@@ -77,9 +77,7 @@ def update_job_record(
     예시:
         status="RUNNING", progress=10 → 실행 중 표시.
     """
-    print('job_id', job_id)
     job = db.query(RosterJob).filter(RosterJob.job_id == job_id).first()
-    print('job', job.__dict__)
     if not job:
         raise ValueError(f"job_id를 찾을 수 없습니다: {job_id}")
 

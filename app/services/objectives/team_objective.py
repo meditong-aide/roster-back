@@ -100,28 +100,38 @@ def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave, blocke
                 ys.append(y)
             m.AddExactlyOne(ys)
 
-        for d in range(rs.num_days - 1):
-            for s in shift_indices:
-                diff = m.NewBoolVar(f"y_diff_{team_id}_{d}_{s}")
-                m.Add(diff >= Y[(d, s)] - Y[(d+1, s)])
-                m.Add(diff >= Y[(d+1, s)] - Y[(d, s)])
-                obj_terms.append(-int(align_w * 0.3) * diff)
-        # 분포 패널티: 월간 Y 분포가 ratio를 따르도록
-        for code in shift_codes:
-            s_idx = rs.config.shift_types.index(code)
-            cnt = m.NewIntVar(0, rs.num_days, f"yCnt_{team_id}_{code}")
-            m.Add(cnt == sum(Y[(d, s_idx)] for d in range(rs.num_days)))
-            target = int(round(rs.num_days * ratio.get(code, 0.0)))
-            dev_pos = m.NewIntVar(0, rs.num_days, f"yDevP_{team_id}_{code}")
-            dev_neg = m.NewIntVar(0, rs.num_days, f"yDevN_{team_id}_{code}")
-            m.Add(dev_pos - dev_neg == cnt - target)
-            w_code = float(shift_weights.get(code, 1.0))
-            obj_terms.append(-int(dist_w * w_code) * dev_pos)
-            obj_terms.append(-int(dist_w * w_code) * dev_neg)
+        # (D) 대표 교대 day-to-day diff 페널티 — team_min hard 위주 정책에서는 의미 약하므로 비활성.
+        #     향후 필요 시 ENABLE_TEAM_BALANCE_DIFF=True 로 다시 켜면 된다.
+        ENABLE_TEAM_BALANCE_DIFF = False
+        if ENABLE_TEAM_BALANCE_DIFF:
+            for d in range(rs.num_days - 1):
+                for s in shift_indices:
+                    diff = m.NewBoolVar(f"y_diff_{team_id}_{d}_{s}")
+                    m.Add(diff >= Y[(d, s)] - Y[(d+1, s)])
+                    m.Add(diff >= Y[(d+1, s)] - Y[(d, s)])
+                    obj_terms.append(-int(align_w * 0.3) * diff)
+
+        # (C) 분포 패널티 — 팀별 D/E/N 비율을 ward 평균에 맞추는 항. team_min 과 충돌 가능하므로 비활성.
+        ENABLE_TEAM_BALANCE_DIST = False
+        if ENABLE_TEAM_BALANCE_DIST:
+            for code in shift_codes:
+                s_idx = rs.config.shift_types.index(code)
+                cnt = m.NewIntVar(0, rs.num_days, f"yCnt_{team_id}_{code}")
+                m.Add(cnt == sum(Y[(d, s_idx)] for d in range(rs.num_days)))
+                target = int(round(rs.num_days * ratio.get(code, 0.0)))
+                dev_pos = m.NewIntVar(0, rs.num_days, f"yDevP_{team_id}_{code}")
+                dev_neg = m.NewIntVar(0, rs.num_days, f"yDevN_{team_id}_{code}")
+                m.Add(dev_pos - dev_neg == cnt - target)
+                w_code = float(shift_weights.get(code, 1.0))
+                obj_terms.append(-int(dist_w * w_code) * dev_pos)
+                obj_terms.append(-int(dist_w * w_code) * dev_neg)
 
         # 정렬 보너스: 팀원들이 대표 교대 Y를 따라가도록 Z=AND(X,Y) 보너스
+        # Y는 D_phys(=rs.num_days)만큼만 생성되므로 lookahead 일자는 스킵
         for n in members:
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                if d >= rs.num_days:
+                    continue
                 for code in shift_codes:
                     s = rs.config.shift_types.index(code)
                     y = Y[(d, s)]
@@ -131,17 +141,8 @@ def add_team_balance_objective_terms(m, rs: RosterSystem, X, join, leave, blocke
                     m.Add(z >= X(n, d, s) + y - 1)
                     w_code = float(shift_weights.get(code, 1.0))
                     obj_terms.append(int(align_w * w_code) * z)
-        # 팀원 간 직접 정렬 (부분 적용)
-        for i in range(len(members)):
-            for j in range(i+1, len(members)):
-                ni, nj = members[i], members[j]
-                for d in range(join[ni], leave[ni] + 1):
-                    for s in shift_indices:
-                        z2 = m.NewBoolVar(f"tpair_{team_id}_{ni}_{nj}_{d}_{s}")
-                        m.Add(z2 <= X(ni, d, s))
-                        m.Add(z2 <= X(nj, d, s))
-                        m.Add(z2 >= X(ni, d, s) + X(nj, d, s) - 1)
-                        obj_terms.append(int(align_w * 0.4) * z2)
+        # (B) 팀원 간 직접 정렬 z2 — 위 Z 보너스와 중복 인센티브이고 가장 큰 변수/제약 폭증의 원인이라 제거.
+        # team_min hard 가 충분히 팀 커버리지를 보장하므로 z2 는 불필요.
 
     return obj_terms
 

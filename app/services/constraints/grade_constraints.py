@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 from typing import Any
 
@@ -31,14 +30,40 @@ def add_grade_constraints(
     """
     print('grade_strategy', grade_strategy)
     print('grade_config', grade_config)
-    if str(grade_strategy or "").upper() != "GRADE":
-        return []
+    _impact_modes = getattr(rs, "_constraint_impact_constraint_modes", None)
+    if _impact_modes is None:
+        _impact_modes = []
+        setattr(rs, "_constraint_impact_constraint_modes", _impact_modes)
     if grade_config is None:
         return []
 
-    constraints_map, policy, scaling = _parse_grade_config(grade_config)
+    constraints_map, max_constraints_map, scaling = _parse_grade_config(grade_config)
+    # grade_strategy=GRADE 이면 grade weight 가중치를 끌어올림(선호 신호).
+    gs = str(grade_strategy or "").upper()
+    if gs == "GRADE":
+        scaling = dict(scaling)
+        scaling["grade_penalty_weight"] = int(scaling["grade_penalty_weight"]) * 4
+    _impact_modes.append({
+        "family": "grade_min",
+        "key": "grade_min:global",
+        "configured_mode": "soft" if scaling["allow_soft_fallback"] else "hard",
+        "effective_mode": "soft_fallback" if scaling["allow_soft_fallback"] else "enforced",
+        "source_file": "app/services/constraints/grade_constraints.py",
+        "reason": "grade constraints active",
+        "evidence": {"strategy": str(grade_strategy or "").upper()},
+    })
+    _impact_modes.append({
+        "family": "grade_max",
+        "key": "grade_max:global",
+        "configured_mode": "soft" if scaling["allow_soft_fallback"] else "hard",
+        "effective_mode": "soft_fallback" if scaling["allow_soft_fallback"] else "enforced",
+        "source_file": "app/services/constraints/grade_constraints.py",
+        "reason": "grade constraints active",
+        "evidence": {"strategy": str(grade_strategy or "").upper()},
+    })
     print('constraints_map', constraints_map)
-    grade_values = _extract_grade_values_from_constraints(constraints_map)
+    print('max_constraints_map', max_constraints_map)
+    grade_values = _extract_grade_values_from_constraints(constraints_map, max_constraints_map)
     print('grade_values', grade_values)
     if not grade_values:
         return []
@@ -46,7 +71,6 @@ def add_grade_constraints(
     by_grade, is_night_only = _build_grade_groups(
         rs=rs,
         grade_values=grade_values,
-        null_grade_policy=policy["null_grade_policy"],
     )
     print('by_grade', by_grade)
     print('is_night_only', is_night_only)
@@ -59,6 +83,7 @@ def add_grade_constraints(
     obj_terms: list = []
     for d in range(rs.num_days):
         need_map = _get_need_map_for_day(cfg, ds_by_day, d)
+        # (1) Minimum 제약 처리
         for shift_code, base in (constraints_map or {}).items():
             s_code = str(shift_code or "").upper()
             if s_code not in apply_shifts:
@@ -87,22 +112,7 @@ def add_grade_constraints(
                 by_grade=by_grade,
             )
 
-            available = _available_by_grade_for_day_shift(
-                rs=rs,
-                by_grade=by_grade,
-                is_night_only=is_night_only,
-                day_idx=d,
-                shift_code=s_code,
-                join=join,
-                leave=leave,
-            )
-            _clamp_targets_to_available(
-                target=target,
-                available=available,
-                day_idx=d,
-                shift_code=s_code,
-                req=req,
-            )
+            # hard grade 제약 보장을 위해 target을 가용치로 내리는 clamp를 비활성화한다.
 
             obj_terms.extend(
                 _add_minimum_constraints(
@@ -112,6 +122,30 @@ def add_grade_constraints(
                     day_idx=d,
                     shift_idx=s_idx,
                     target=target,
+                    allow_soft_fallback=scaling["allow_soft_fallback"],
+                    penalty_weight=scaling["grade_penalty_weight"],
+                )
+            )
+
+        # (2) Maximum 제약 처리 (anti-pair 등)
+        for shift_code, base in (max_constraints_map or {}).items():
+            s_code = str(shift_code or "").upper()
+            if s_code not in apply_shifts:
+                continue
+            if s_code not in rs.config.shift_types:
+                continue
+            max_by_grade = _parse_base_max(base, grade_values)
+            if not any(v >= 0 and k in by_grade for k, v in max_by_grade.items()):
+                continue
+            s_idx = rs.config.shift_types.index(s_code)
+            obj_terms.extend(
+                _add_maximum_constraints(
+                    m=m,
+                    X=X,
+                    by_grade=by_grade,
+                    day_idx=d,
+                    shift_idx=s_idx,
+                    max_by_grade=max_by_grade,
                     allow_soft_fallback=scaling["allow_soft_fallback"],
                     penalty_weight=scaling["grade_penalty_weight"],
                 )
@@ -135,36 +169,6 @@ def _normalize_grade_int(value: Any) -> int | None:
     return v
 
 
-def _average_grade_or_lowest(grades: list[int | None], fallback: int) -> int:
-    """주어진 grade 목록의 평균(반올림)을 계산하고, 전부 None이면 fallback을 반환한다."""
-    vals = [g for g in grades if g is not None]
-    if not vals:
-        return int(fallback)
-    avg = sum(vals) / float(len(vals))
-    return int(math.floor(avg + 0.5))
-
-
-def _resolve_null_or_unknown_grade(
-    policy: str,
-    nurse_db_id: str,
-    avg_grade: int,
-    grade_values: list[int],
-) -> int:
-    """NULL 또는 정의역 밖 Grade를 정책에 따라 결정적으로 변환한다."""
-    p = str(policy or "LOWEST").upper()
-    if p == "LOWEST":
-        return int(max(grade_values))
-    if p == "AVERAGE":
-        # 평균값이 정의역 밖이면 가장 가까운 값으로 스냅한다.
-        return _snap_to_domain(avg_grade, grade_values)
-    if p == "RANDOM":
-        # 해시 기반 결정적 매핑: md5(nurse_id) % len(grade_values)
-        h = hashlib.md5(nurse_db_id.encode("utf-8")).hexdigest()
-        idx = int(h[:8], 16) % len(grade_values)
-        return int(grade_values[idx])
-    return int(max(grade_values))
-
-
 def _shrink_targets_to_req_dynamic(target: dict[int, int], req: int) -> None:
     """target 합계가 req를 초과하면 감소시켜 req 이하로 맞춘다(가드)."""
     total = sum(target.values())
@@ -178,21 +182,6 @@ def _shrink_targets_to_req_dynamic(target: dict[int, int], req: int) -> None:
             break
         target[g] -= 1
         total -= 1
-
-
-def _fill_targets_to_req_dynamic(target: dict[int, int], base_min: dict[int, int], req: int) -> None:
-    """target 합계가 req보다 작으면 base_min이 큰 grade부터 채운다."""
-    total = sum(target.values())
-    if total >= req:
-        return
-    # base_min 큰 순으로 반복 증가(동률이면 grade 낮은 쪽 우선)
-    order = sorted(target.keys(), key=lambda g: (-base_min.get(g, 0), g))
-    i = 0
-    while total < req:
-        g = order[i % len(order)]
-        target[g] += 1
-        total += 1
-        i += 1
 
 
 def _available_by_grade_for_day_shift(
@@ -228,39 +217,40 @@ def _available_by_grade_for_day_shift(
     return avail
 
 
-def _extract_grade_values_from_constraints(constraints_map: Any) -> list[int]:
-    """constraints에서 등장하는 grade 키들을 정수로 추출해 오름차순으로 반환한다."""
-    if not isinstance(constraints_map, dict):
-        return []
+def _extract_grade_values_from_constraints(*constraints_maps: Any) -> list[int]:
+    """여러 constraints 맵(min/max 등)에서 등장하는 grade 키를 합쳐 정수 오름차순으로 반환한다."""
     grades: set[int] = set()
-    for _, grade_map in constraints_map.items():
-        if not isinstance(grade_map, dict):
+    for cmap in constraints_maps:
+        if not isinstance(cmap, dict):
             continue
-        for k in grade_map.keys():
-            try:
-                grades.add(int(k))
-            except Exception:
+        for _, grade_map in cmap.items():
+            if not isinstance(grade_map, dict):
                 continue
+            for k in grade_map.keys():
+                try:
+                    grades.add(int(k))
+                except Exception:
+                    continue
     return sorted(grades)
 
 
-def _snap_to_domain(value: int, domain: list[int]) -> int:
-    """정수 value를 domain 내 가장 가까운 값으로 스냅한다(동률이면 작은 값)."""
-    if not domain:
-        return value
-    return min(domain, key=lambda d: (abs(d - value), d))
-
-
 def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict]:
-    """grade_config 딕셔너리에서 제약/정책/스케일 파라미터를 추출한다.
+    """grade_config 딕셔너리에서 제약/스케일 파라미터를 추출한다.
 
     Returns:
-        (constraints_map, policy, scaling)
+        (constraints_map, max_constraints_map, scaling)
+
+    Notes:
+        - `constraints` / `constraints_json`: shift별 grade 최소 인원(min)
+        - `constraints_max` / `constraints_max_json`: shift별 grade 최대 인원(max, anti-pair 용)
+        - max는 옵션(미설정 시 빈 dict). min만 있던 구조와 하위호환 유지.
     """
     constraints_map = grade_config.get("constraints") or grade_config.get("constraints_json") or {}
-    policy = {
-        "null_grade_policy": str(grade_config.get("null_grade_policy") or "LOWEST").upper(),
-    }
+    max_constraints_map = (
+        grade_config.get("constraints_max")
+        or grade_config.get("constraints_max_json")
+        or {}
+    )
     min_ratio_floor = grade_config.get("min_ratio_floor", None)
     if min_ratio_floor is not None:
         try:
@@ -268,42 +258,29 @@ def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict]
         except Exception:
             min_ratio_floor = None
     scaling = {
-        "use_dynamic_scaling": bool(grade_config.get("use_dynamic_scaling", True)),
-        "min_leader_keep": bool(grade_config.get("min_leader_keep", True)),
+        "use_dynamic_scaling": _to_bool(grade_config.get("use_dynamic_scaling", True), True),
+        "min_leader_keep": _to_bool(grade_config.get("min_leader_keep", True), True),
         "min_ratio_floor": min_ratio_floor,
-        "allow_soft_fallback": bool(grade_config.get("allow_soft_fallback", True)),
+        "allow_soft_fallback": _to_bool(grade_config.get("allow_soft_fallback", False), False),
         "grade_penalty_weight": int(grade_config.get("grade_penalty_weight", 160000)),
     }
-    return constraints_map, policy, scaling
+    return constraints_map, max_constraints_map, scaling
 
 
 def _build_grade_groups(
     rs: RosterSystem,
     grade_values: list[int],
-    null_grade_policy: str,
 ) -> tuple[dict[int, list[int]], list[bool]]:
-    """간호사 grade를 정의역(grade_values)에 맞게 매핑하고, grade별 인덱스 그룹을 만든다."""
-    raw_grades = [_normalize_grade_int(getattr(n, "grade", None)) for n in rs.nurses]
-    print('raw_grades', raw_grades)
-    avg_grade = _average_grade_or_lowest(raw_grades, fallback=max(grade_values))
-    print('avg_grade', avg_grade)
-    mapped: list[int] = []
-    for i, g in enumerate(raw_grades):
-        if g in grade_values:
-            mapped.append(g)  # type: ignore[arg-type]
-            continue
-        mapped.append(
-            _resolve_null_or_unknown_grade(
-                policy=null_grade_policy,
-                nurse_db_id=str(getattr(rs.nurses[i], "db_id", i)),
-                avg_grade=avg_grade,
-                grade_values=grade_values,
-            )
-        )
+    """간호사 grade를 정의역(grade_values)에 맞게 매핑하고, grade별 인덱스 그룹을 만든다.
 
+    정의역(grade_values) 밖이거나 NULL인 grade는 grade min/max 집계에서 완전히 빠진다.
+    이들은 다른 제약(커버리지 등)에 의해 자유롭게 배정되며, grade 분배에는 영향이 없다.
+    """
+    raw_grades = [_normalize_grade_int(getattr(n, "grade", None)) for n in rs.nurses]
     by_grade: dict[int, list[int]] = {g: [] for g in grade_values}
-    for idx, g in enumerate(mapped):
-        by_grade.setdefault(g, []).append(idx)
+    for idx, g in enumerate(raw_grades):
+        if g in grade_values:
+            by_grade.setdefault(g, []).append(idx)
 
     is_night_only = [bool(getattr(n, "is_night_nurse", 0) == 3) for n in rs.nurses]
     return by_grade, is_night_only
@@ -327,6 +304,23 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _to_bool(value: Any, default: bool = False) -> bool:
+    """문자열/숫자/불리언 입력을 안전하게 bool로 변환한다."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
 def _parse_base_min(base: Any, grade_values: list[int]) -> dict[int, int]:
     """shift별 constraints 항목에서 grade별 최소 인원(base_min)을 파싱한다."""
     base_min: dict[int, int] = {g: 0 for g in grade_values}
@@ -342,6 +336,31 @@ def _parse_base_min(base: Any, grade_values: list[int]) -> dict[int, int]:
             continue
         base_min[gi] = max(0, _safe_int(v))
     return base_min
+
+
+def _parse_base_max(base: Any, grade_values: list[int]) -> dict[int, int]:
+    """shift별 constraints_max 항목에서 grade별 최대 인원(base_max)을 파싱한다.
+
+    Notes:
+        - 값이 -1 (설정 안 함)이면 제외.
+        - grade_values에 포함되지 않은 grade 키는 무시.
+    """
+    base_max: dict[int, int] = {}
+    grade_map = base or {}
+    if not isinstance(grade_map, dict):
+        return base_max
+    for k, v in grade_map.items():
+        try:
+            gi = int(k)
+        except Exception:
+            continue
+        if gi not in grade_values:
+            continue
+        mv = _safe_int(v)
+        if mv < 0:
+            continue
+        base_max[gi] = mv
+    return base_max
 
 
 def _compute_targets(
@@ -376,7 +395,6 @@ def _compute_targets(
         target[1] = 1
 
     _shrink_targets_to_req_dynamic(target, req)
-    _fill_targets_to_req_dynamic(target, base_min, req)
     return target
 
 
@@ -427,4 +445,43 @@ def _add_minimum_constraints(
             obj_terms.append(-penalty_weight * slack)
         else:
             m.Add(vars_sum >= int(t))
+    return obj_terms
+
+
+def _add_maximum_constraints(
+    m,
+    X,
+    by_grade: dict[int, list[int]],
+    day_idx: int,
+    shift_idx: int,
+    max_by_grade: dict[int, int],
+    allow_soft_fallback: bool,
+    penalty_weight: int,
+) -> list:
+    """모델에 grade 최대 인원 제약을 추가한다 (anti-pair 등).
+
+    각 grade g에 대해 해당 (day, shift)의 배정 수가 max_by_grade[g]를 넘지 않도록 제약한다.
+    allow_soft_fallback=True 이면 초과분 slack을 허용하며 패널티로 억제,
+    False이면 하드 제약 (`vars_sum <= max_t`).
+    """
+    obj_terms: list = []
+    for g, max_t in max_by_grade.items():
+        nurses = by_grade.get(g, [])
+        if not nurses:
+            continue
+        upper = len(nurses)
+        mt = int(max_t)
+        if mt >= upper:
+            # 이미 trivially 성립 — 제약 생략
+            continue
+        vars_sum = sum(X(n, day_idx, shift_idx) for n in nurses)
+        if allow_soft_fallback:
+            # 초과분만큼 slack 허용 (0~upper-mt). 패널티로 목적함수에서 억제.
+            slack_over = m.NewIntVar(
+                0, max(0, upper - mt), f"grade_max_slack_d{day_idx}_s{shift_idx}_g{g}"
+            )
+            m.Add(vars_sum - slack_over <= mt)
+            obj_terms.append(-penalty_weight * slack_over)
+        else:
+            m.Add(vars_sum <= mt)
     return obj_terms

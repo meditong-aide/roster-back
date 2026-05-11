@@ -32,6 +32,18 @@ class Nurse:
     head_nurse_off_pattern: Optional[str] = None  # 'weekend', 'mixed', 'normal'
     is_weekend_off: bool = False
     preceptor_id: Optional[str] = None  # 프리셉터 nurse_id (프리셉티인 경우 설정됨)
+    d_min: Optional[int] = None
+    d_max: Optional[int] = None
+    d_exact: Optional[int] = None
+    e_min: Optional[int] = None
+    e_max: Optional[int] = None
+    e_exact: Optional[int] = None
+    n_min: Optional[int] = None
+    n_max: Optional[int] = None
+    n_exact: Optional[int] = None
+    o_min: Optional[int] = None
+    o_max: Optional[int] = None
+    o_exact: Optional[int] = None
 
     @classmethod
     def from_db_model(cls, db_nurse, index: int):

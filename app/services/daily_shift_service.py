@@ -55,30 +55,46 @@ def _to_response(
     rows: List[DailyShift],
 ) -> Dict:
     """DailyShift row 리스트를 응답 포맷으로 변환합니다.
-    - month_summary는 1일차 값을 사용합니다.
-    - *_count_max 컬럼도 함께 노출(0=상한 미설정).
+    - day=0 row 가 있으면 그 값을 month_summary 권위(월 일괄값)로 노출.
+    - day=0 row 가 없으면 day=1 row 미러로 fallback (기존 동작).
+    - date 배열은 day=1..말일 순서로만 구성 (day=0 분리).
     """
-    rows_sorted = sorted(rows, key=lambda r: r.day)
-    d_list = [r.d_count for r in rows_sorted]
-    e_list = [r.e_count for r in rows_sorted]
-    n_list = [r.n_count for r in rows_sorted]
-    m_list = [int(getattr(r, "m_count", 0) or 0) for r in rows_sorted]
-    d_max_list = [int(getattr(r, "d_count_max", 0) or 0) for r in rows_sorted]
-    e_max_list = [int(getattr(r, "e_count_max", 0) or 0) for r in rows_sorted]
-    n_max_list = [int(getattr(r, "n_count_max", 0) or 0) for r in rows_sorted]
-    m_max_list = [int(getattr(r, "m_count_max", 0) or 0) for r in rows_sorted]
-    max_enabled = bool(getattr(rows_sorted[0], "max_enabled", False)) if rows_sorted else False
-    month_summary = {
-        "D_count": d_list[0] if d_list else 0,
-        "E_count": e_list[0] if e_list else 0,
-        "N_count": n_list[0] if n_list else 0,
-        "M_count": m_list[0] if m_list else 0,
-        "D_count_max": d_max_list[0] if d_max_list else 0,
-        "E_count_max": e_max_list[0] if e_max_list else 0,
-        "N_count_max": n_max_list[0] if n_max_list else 0,
-        "M_count_max": m_max_list[0] if m_max_list else 0,
-        "max_enabled": max_enabled,
-    }
+    rows_sorted = sorted(rows, key=lambda r: int(getattr(r, "day", 0) or 0))
+    bulk_row = next((r for r in rows_sorted if int(getattr(r, "day", 0) or 0) == 0), None)
+    daily_rows = [r for r in rows_sorted if int(getattr(r, "day", 0) or 0) > 0]
+    d_list = [r.d_count for r in daily_rows]
+    e_list = [r.e_count for r in daily_rows]
+    n_list = [r.n_count for r in daily_rows]
+    m_list = [int(getattr(r, "m_count", 0) or 0) for r in daily_rows]
+    d_max_list = [int(getattr(r, "d_count_max", 0) or 0) for r in daily_rows]
+    e_max_list = [int(getattr(r, "e_count_max", 0) or 0) for r in daily_rows]
+    n_max_list = [int(getattr(r, "n_count_max", 0) or 0) for r in daily_rows]
+    m_max_list = [int(getattr(r, "m_count_max", 0) or 0) for r in daily_rows]
+    if bulk_row is not None:
+        month_summary = {
+            "D_count": int(bulk_row.d_count or 0),
+            "E_count": int(bulk_row.e_count or 0),
+            "N_count": int(bulk_row.n_count or 0),
+            "M_count": int(getattr(bulk_row, "m_count", 0) or 0),
+            "D_count_max": int(getattr(bulk_row, "d_count_max", 0) or 0),
+            "E_count_max": int(getattr(bulk_row, "e_count_max", 0) or 0),
+            "N_count_max": int(getattr(bulk_row, "n_count_max", 0) or 0),
+            "M_count_max": int(getattr(bulk_row, "m_count_max", 0) or 0),
+            "max_enabled": bool(getattr(bulk_row, "max_enabled", False)),
+        }
+    else:
+        month_summary = {
+            "D_count": d_list[0] if d_list else 0,
+            "E_count": e_list[0] if e_list else 0,
+            "N_count": n_list[0] if n_list else 0,
+            "M_count": m_list[0] if m_list else 0,
+            "D_count_max": d_max_list[0] if d_max_list else 0,
+            "E_count_max": e_max_list[0] if e_max_list else 0,
+            "N_count_max": n_max_list[0] if n_max_list else 0,
+            "M_count_max": m_max_list[0] if m_max_list else 0,
+            "max_enabled": bool(getattr(daily_rows[0], "max_enabled", False)) if daily_rows else False,
+        }
+    daily_max_enabled = bool(getattr(daily_rows[0], "max_enabled", False)) if daily_rows else False
     return {
         "office_id": office_id,
         "group_id": group_id,
@@ -95,7 +111,7 @@ def _to_response(
             "N_count_max": n_max_list,
             "M_count_max": m_max_list,
         },
-        "max_enabled": max_enabled,
+        "max_enabled": daily_max_enabled,
     }
 
 
@@ -259,6 +275,98 @@ def _normalize_max_list(max_list: List[int], min_list: List[int], days: int) -> 
     return out
 
 
+def _upsert_day_zero(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    bulk: Dict[str, int],
+) -> None:
+    """월 일괄값을 day=0 row 로 upsert.
+    - bulk: {D_count, E_count, N_count, M_count, D_count_max, E_count_max, N_count_max, M_count_max, max_enabled}
+    - max_enabled=False 시 *_count_max 는 0 으로 reset.
+    - max_enabled=True 시 *_count_max < *_count 면 *_count 로 clamp.
+    """
+    bulk_max_enabled = bool(bulk.get("max_enabled", False))
+    d_min = int(bulk.get("D_count", 0))
+    e_min = int(bulk.get("E_count", 0))
+    n_min = int(bulk.get("N_count", 0))
+    m_min = int(bulk.get("M_count", 0))
+    if not bulk_max_enabled:
+        d_max = e_max = n_max = m_max = 0
+    else:
+        def _clamp(raw, mn: int) -> int:
+            mx = int(raw or 0)
+            if mx <= 0:
+                return 0
+            return mx if mx >= mn else mn
+        d_max = _clamp(bulk.get("D_count_max", 0), d_min)
+        e_max = _clamp(bulk.get("E_count_max", 0), e_min)
+        n_max = _clamp(bulk.get("N_count_max", 0), n_min)
+        m_max = _clamp(bulk.get("M_count_max", 0), m_min)
+    row = (
+        db.query(DailyShift)
+        .filter(
+            DailyShift.office_id == office_id,
+            DailyShift.group_id == group_id,
+            DailyShift.year == year,
+            DailyShift.month == month,
+            DailyShift.day == 0,
+        )
+        .first()
+    )
+    if row:
+        row.d_count = d_min
+        row.e_count = e_min
+        row.n_count = n_min
+        row.m_count = m_min
+        row.d_count_max = d_max
+        row.e_count_max = e_max
+        row.n_count_max = n_max
+        row.m_count_max = m_max
+        row.max_enabled = bulk_max_enabled
+    else:
+        db.add(DailyShift(
+            office_id=office_id,
+            group_id=group_id,
+            year=year,
+            month=month,
+            day=0,
+            d_count=d_min,
+            e_count=e_min,
+            n_count=n_min,
+            m_count=m_min,
+            d_count_max=d_max,
+            e_count_max=e_max,
+            n_count_max=n_max,
+            m_count_max=m_max,
+            max_enabled=bulk_max_enabled,
+        ))
+
+
+def _sync_shift_manage_template(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    day_cnt: int,
+    eve_cnt: int,
+    nig_cnt: int,
+    mid_cnt: int,
+) -> None:
+    """shift_manage 의 RN 슬롯(1:D, 2:E, 3:N, 5:M)을 주어진 값으로 동기화.
+    - 인자: 4개 슬롯에 적용할 manpower 스칼라값
+    - 반환 없음 (commit 은 호출자 책임)
+    """
+    for slot, value in [(1, day_cnt), (2, eve_cnt), (3, nig_cnt), (5, mid_cnt)]:
+        db.query(ShiftManage).filter(
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == group_id,
+            ShiftManage.nurse_class == 'RN',
+            ShiftManage.shift_slot == slot,
+        ).update({ShiftManage.manpower: int(value)})
+
+
 def update_daily(
     db: Session,
     office_id: str,
@@ -342,6 +450,126 @@ def update_daily(
             )
     db.commit()
     return {"updated": True, "days_affected": days}
+
+
+def replace_month_data(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    d_list: List[int],
+    e_list: List[int],
+    n_list: List[int],
+    m_list: List[int],
+    d_max_list: List[int] | None = None,
+    e_max_list: List[int] | None = None,
+    n_max_list: List[int] | None = None,
+    m_max_list: List[int] | None = None,
+    max_enabled: bool = False,
+    apply_globally: bool = False,
+    bulk: Dict[str, int] | None = None,
+) -> Dict:
+    """월 데이터를 일자별 배열로 일괄 교체합니다 (PUT /daily-shift 진입점).
+    - 일자별 upsert 는 update_daily 에 위임 (day=1..말일).
+    - bulk 가 주어지면 day=0 row 로 월 일괄값 upsert.
+    - apply_globally=True 면 day=1 값을 기준으로 shift_manage 템플릿(RN 1/2/3/5) 동기화.
+    - 반환: GET /daily-shift 와 동일 형태(저장 직후 재조회).
+    """
+    update_daily(
+        db,
+        office_id=office_id,
+        group_id=group_id,
+        year=year,
+        month=month,
+        d_list=d_list,
+        e_list=e_list,
+        n_list=n_list,
+        m_list=m_list,
+        d_max_list=d_max_list,
+        e_max_list=e_max_list,
+        n_max_list=n_max_list,
+        m_max_list=m_max_list,
+        max_enabled=max_enabled,
+    )
+    if bulk is not None:
+        _upsert_day_zero(db, office_id, group_id, year, month, bulk)
+        db.commit()
+    if apply_globally and d_list:
+        _sync_shift_manage_template(
+            db,
+            office_id,
+            group_id,
+            int(d_list[0]),
+            int(e_list[0]),
+            int(n_list[0]),
+            int(m_list[0]) if m_list else 0,
+        )
+        db.commit()
+    return get_or_init_month(db, office_id, group_id, year, month)
+
+
+def apply_bulk_to_days(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    bulk: Dict[str, int] | None = None,
+    apply_globally: bool = False,
+) -> Dict:
+    """day=0 row 값을 day=1..말일 모든 row 에 fan-out (일괄적용).
+    - bulk 가 주어지면 day=0 row 를 먼저 그 값으로 upsert 후 fan-out.
+    - bulk 생략 시 기존 day=0 row 를 사용. 없으면 ValueError.
+    - day=0 row 의 *_count / *_count_max / max_enabled 가 그대로 day=1..말일 에 전파됨.
+    - apply_globally=True 면 day=0 값으로 shift_manage 템플릿(RN 1/2/3/5) 동기화.
+    """
+    if bulk is not None:
+        _upsert_day_zero(db, office_id, group_id, year, month, bulk)
+        db.commit()
+    bulk_row = (
+        db.query(DailyShift)
+        .filter(
+            DailyShift.office_id == office_id,
+            DailyShift.group_id == group_id,
+            DailyShift.year == year,
+            DailyShift.month == month,
+            DailyShift.day == 0,
+        )
+        .first()
+    )
+    if bulk_row is None:
+        raise ValueError("day=0 row 가 없어 일괄적용을 수행할 수 없습니다. month_summary 를 함께 보내거나 먼저 등록하세요.")
+    days = _get_month_days(year, month)
+    d = int(bulk_row.d_count or 0)
+    e = int(bulk_row.e_count or 0)
+    n = int(bulk_row.n_count or 0)
+    m = int(getattr(bulk_row, "m_count", 0) or 0)
+    d_max = int(getattr(bulk_row, "d_count_max", 0) or 0)
+    e_max = int(getattr(bulk_row, "e_count_max", 0) or 0)
+    n_max = int(getattr(bulk_row, "n_count_max", 0) or 0)
+    m_max = int(getattr(bulk_row, "m_count_max", 0) or 0)
+    bulk_max_enabled = bool(getattr(bulk_row, "max_enabled", False))
+    update_daily(
+        db,
+        office_id=office_id,
+        group_id=group_id,
+        year=year,
+        month=month,
+        d_list=[d] * days,
+        e_list=[e] * days,
+        n_list=[n] * days,
+        m_list=[m] * days,
+        d_max_list=[d_max] * days,
+        e_max_list=[e_max] * days,
+        n_max_list=[n_max] * days,
+        m_max_list=[m_max] * days,
+        max_enabled=bulk_max_enabled,
+    )
+    if apply_globally:
+        _sync_shift_manage_template(db, office_id, group_id, d, e, n, m)
+        db.commit()
+    return get_or_init_month(db, office_id, group_id, year, month)
 
 
 # Daily-Shift 작업

@@ -26,6 +26,7 @@ from services.cp_sat.allowed_shift_types import (
 from services.cp_sat.fallback_objectives import build_fallback_stage3_objective_terms
 from services.cp_sat.m_coverage import compute_main_bucket_indices
 from services.cp_sat.night_distribution_log import log_n_even_distribution
+from services.constraints.team_constraints import add_team_min_constraints
 from services.day_windows import iter_nurse_days, build_active_days
 
 
@@ -1185,9 +1186,10 @@ def optimize_fallback_lex_hard_first(
                 elif need_max > 0 and _relax_coverage:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     m.Add(ov >= assigned - need_max)
-                elif _fb_off_first_cfg and need > 0 and not _relax_coverage:
-                    # off_first=True + max 미설정: assigned <= need 하드 (잔여 셀 OFF로 회수)
-                    m.Add(assigned <= need)
+                elif _fb_off_first_cfg:
+                    # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
+                    # relax_coverage / need=0 무관 강제 — fixed_wanted 가 min 다 채워도 추가 근무 차단.
+                    m.Add(assigned <= max(0, need))
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 elif need > 0:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
@@ -1970,6 +1972,55 @@ def optimize_fallback_lex_hard_first(
             print('예외데쇼!!', e)
             pass
 
+        # team_min hard 제약 — Stage 1, 2 에도 등록한다.
+        # Stage 3 는 build_fallback_stage3_objective_terms 가 자체 호출하므로 중복 회피.
+        # 누락 시 Stage 3 INFEASIBLE → Stage 2 해 commit 경로에서 team_min 위반이 새어나감.
+        if stage in (1, 2):
+            try:
+                _gs_tm = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+                add_team_min_constraints(
+                    m, roster_system, X, join, leave,
+                    grade_strategy=_gs_tm,
+                    blocked_by_nurse=blocked_by_nurse,
+                )
+            except Exception as e:
+                print(f"{logger_prefix} [Stage{stage}] team_min hard 등록 실패: {e}")
+
+        # Grade hard 제약은 fallback 모든 stage에서 동일하게 유지되어야 한다.
+        # (기존에는 stage3 objective 경로에서만 add_grade_constraints가 호출되어,
+        #  stage3 infeasible 시 stage2/1 해로 내려가며 grade hard가 빠질 수 있었다.)
+        try:
+            _gs_fb = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+            _gc_fb = getattr(roster_system, "grade_config", None)
+            _allow_soft_fb = True
+            if isinstance(_gc_fb, dict):
+                _allow_soft_fb = bool(_gc_fb.get("allow_soft_fallback", False))
+            if isinstance(_gc_fb, dict) and not _allow_soft_fb:
+                add_grade_constraints_fn(
+                    m=m,
+                    rs=roster_system,
+                    X=X,
+                    join=join,
+                    leave=leave,
+                    grade_strategy=_gs_fb,
+                    grade_config=_gc_fb,
+                )
+        except Exception as _grade_hard_exc:
+            print(f"{logger_prefix} [GradeHard] fallback stage 공통 제약 추가 실패: {_grade_hard_exc}")
+
+        # nurse-level 월간 D/E/N/O 한도 hard (모든 stage 공통).
+        # primary cp_sat_basic이 INFEASIBLE 되어 fallback 진입 시 사용자 입력 한도가
+        # 무시되던 회귀 fix. 같은 모듈을 primary와 공유하여 동작 일치성 확보.
+        try:
+            from services.constraints.monthly_limit_constraints import (
+                add_monthly_limit_constraints,
+            )
+            _ml_added = add_monthly_limit_constraints(m, roster_system, X, join, leave)
+            if _ml_added:
+                print(f"{logger_prefix} [MonthlyLimit][stage{stage}] {_ml_added}건 hard 제약 추가")
+        except Exception as _ml_exc:
+            print(f"{logger_prefix} [MonthlyLimit][stage{stage}] 제약 추가 실패(무시): {_ml_exc}")
+
         # stage별 목적/고정
         if stage == 1:
             # m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))
@@ -2335,17 +2386,18 @@ def optimize_fallback_lex_hard_first(
                 if s3.Value(X3(n, d, s)):
                     roster_system.roster[n, d, s] = 1
     log_n_even_distribution(roster_system, logger_prefix, join=join, leave=leave)
-    try:
-        print(f"{logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
-        before_viol = len(roster_system._find_violations())
-        postprocess_rebalance_off_fn(roster_system)
-        after_viol = len(roster_system._find_violations())
-        print(
-            f"{logger_prefix} [PostOff] 종료: viol {before_viol}->{after_viol} "
-            f"(감소={before_viol - after_viol})"
-        )
-    except Exception as exc:
-        print(f"{logger_prefix} [PostOff] 후처리 실패: {exc}")
+    # NOTE: rebalance_off 후처리 비활성화(호출 무시)
+    # try:
+    #     print(f"{logger_prefix} [PostOff] 시작: 최종 stage3 해 기반 후처리 시도")
+    #     before_viol = len(roster_system._find_violations())
+    #     postprocess_rebalance_off_fn(roster_system)
+    #     after_viol = len(roster_system._find_violations())
+    #     print(
+    #         f"{logger_prefix} [PostOff] 종료: viol {before_viol}->{after_viol} "
+    #         f"(감소={before_viol - after_viol})"
+    #     )
+    # except Exception as exc:
+    #     print(f"{logger_prefix} [PostOff] 후처리 실패: {exc}")
 
     # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
     # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사

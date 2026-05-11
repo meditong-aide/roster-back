@@ -18,6 +18,10 @@ from services.cp_sat.hardcoded_weights import (
     WEEK_OFF_SHORT_PENALTY,
 )
 from services.constraints.grade_constraints import add_grade_constraints
+from services.constraints.team_constraints import add_team_min_constraints
+from services.constraints.team_grade_handoff_constraints import (
+    add_team_grade_handoff_constraints,
+)
 from services.objectives.team_objective import add_team_balance_objective_terms
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes, is_n_only_profile
 from services.day_windows import iter_nurse_days, build_active_days
@@ -737,25 +741,43 @@ def build_main_objective_terms(
             pass
         grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
         print("grade_strategy", grade_strategy)
-        if grade_strategy == "TEAM":
+        if grade_strategy in ("TEAM", "COMBINED"):
             obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
 
-    # (4-6a) Grade 분배 목적 항 (fallback Stage3와 동일)
+    # (4-6-tm) team_min 제약: 데이터(team_min_by_team) 존재 여부만으로 활성. strategy는 weight tilt용.
+    try:
+        _gs_tm = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy=_gs_tm, blocked_by_nurse=blocked_by_nurse))
+    except Exception as e:
+        print("team_min_constraints 예외 발생", e)
+
+    # (4-6a) Grade 분배 제약: grade_config 존재 여부만으로 활성. strategy는 weight tilt용.
     try:
         _gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        if _gs == "GRADE":
-            grade_terms = add_grade_constraints(
-                m=m,
-                rs=rs,
-                X=X,
-                join=join,
-                leave=leave,
-                grade_strategy=_gs,
-                grade_config=getattr(rs, "grade_config", None),
-            )
-            obj.extend(grade_terms or [])
+        grade_terms = add_grade_constraints(
+            m=m,
+            rs=rs,
+            X=X,
+            join=join,
+            leave=leave,
+            grade_strategy=_gs,
+            grade_config=getattr(rs, "grade_config", None),
+        )
+        obj.extend(grade_terms or [])
     except Exception:
         pass
+
+    # (4-6b) 팀×Grade handoff 제한 (COMBINED 전략에서만 활성)
+    try:
+        _gs2 = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+        if _gs2 == "COMBINED":
+            obj.extend(
+                add_team_grade_handoff_constraints(
+                    m, rs, X, join, leave, grade_strategy=_gs2
+                )
+            )
+    except Exception as e:
+        print("team_grade_handoff_constraints 예외 발생", e)
 
     # (4-7) 커버리지 부족 패널티 (shift_requirement_priority 기반)
     try:

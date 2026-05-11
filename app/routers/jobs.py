@@ -16,12 +16,16 @@ router = APIRouter(tags=["jobs"])
 
 # Long-polling 설정 (프론트 변경 없이 동일 엔드포인트로 동작)
 _TERMINAL_STATUSES = {"SUCCESS", "FAILED"}
-_LONG_POLL_WAIT = 55       # 최대 대기 시간(초). ALB idle timeout 60초 안전마진 5초
+_LONG_POLL_WAIT = 25       # 최대 대기 시간(초). ALB idle timeout 60초 안전마진
 _LONG_POLL_INTERVAL = 1.0  # 서버 측 DB 재조회 간격(초)
+# polling 끊김(새로고침) 감지용 last_seen TTL.
+# 정상 polling interval(3초) 보다 약간 큰 값 → 새로고침으로 갭 발생 시 만료되어
+# 다음 요청 즉시 응답 (long-poll 대기 회피, 모달이 빈 상태 유지되는 시간 최소화).
+_LAST_SEEN_TTL = 4.0
 
-# 사용자별 last-seen (job_id, status) 추적.
+# 사용자별 last-seen (job_id, status, set_at_monotonic) 추적.
 # 단일 API 인스턴스 가정 (멀티 인스턴스 운영 시 Redis 등 외부 저장소 필요).
-_LAST_SEEN: Dict[str, Tuple[str, str]] = {}
+_LAST_SEEN: Dict[str, Tuple[str, str, float]] = {}
 _LAST_SEEN_LOCK = Lock()
 
 
@@ -30,13 +34,21 @@ def _user_key(office_id: Optional[str], group_id: Optional[str], nurse_id: Optio
 
 
 def _get_last_seen(key: str) -> Optional[Tuple[str, str]]:
+    """TTL 만료 체크 후 (job_id, status) 반환. 만료 시 자동 정리 + None."""
     with _LAST_SEEN_LOCK:
-        return _LAST_SEEN.get(key)
+        entry = _LAST_SEEN.get(key)
+        if entry is None:
+            return None
+        job_id, status, set_at = entry
+        if time.monotonic() - set_at > _LAST_SEEN_TTL:
+            _LAST_SEEN.pop(key, None)
+            return None
+        return (job_id, status)
 
 
 def _set_last_seen(key: str, value: Tuple[str, str]) -> None:
     with _LAST_SEEN_LOCK:
-        _LAST_SEEN[key] = value
+        _LAST_SEEN[key] = (value[0], value[1], time.monotonic())
 
 
 def _clear_last_seen(key: str) -> None:
