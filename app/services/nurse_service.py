@@ -1433,12 +1433,30 @@ def _dispatch_preceptees_payload(
         allowed_groups = set(resolve_managed_group_ids(db, current_user))
         if target.group_id not in allowed_groups:
             raise HTTPException(status_code=403, detail=f"해당 간호사({row.nurse_id})에 접근 권한이 없습니다.")
+        # start_date 는 NOT NULL 이라 explicit null 전달 차단
+        if "start_date" in peer and peer["start_date"] is None:
+            raise HTTPException(status_code=400, detail="start_date 는 null 로 변경할 수 없습니다.")
+        # 1단계: 일반 필드 변경은 _update_assignment 위임 (overlap·기간 정합성 등 공통 검증 보존).
+        #   None=no-change 시맨틱이라 explicit null 은 여기서 적용되지 않는다.
         upd = NurseAssignmentUpdate(
-            start_date=start_date,
-            expected_end_date=expected_end_date,
-            note=note,
+            start_date=peer.get("start_date"),
+            expected_end_date=peer.get("expected_end_date"),
+            note=peer.get("note"),
         )
         _update_assignment(assignment_id, upd, db, current_user=current_user)
+        # 2단계: explicit null 필드 (key 있고 value None) 만 row 직접 NULL 처리.
+        #   _update_assignment 통과 후 적용되므로 검증 우회 아님.
+        explicit_null_changed = False
+        row_after = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
+        if row_after is not None:
+            if "expected_end_date" in peer and peer["expected_end_date"] is None:
+                row_after.expected_end_date = None
+                explicit_null_changed = True
+            if "note" in peer and peer["note"] is None:
+                row_after.note = None
+                explicit_null_changed = True
+            if explicit_null_changed:
+                db.commit()
     elif op == "cancel":
         if not assignment_id:
             raise HTTPException(status_code=400, detail="cancel 시 assignment_id 필수")
