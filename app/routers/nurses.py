@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import UploadFile, File, Query
 from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Dict
@@ -17,6 +18,8 @@ from db.client2 import get_db, msdb_manager
 from db.models import Nurse as NurseModel
 from db.models import Office as OfficeModel
 from db.models import Team as TeamModel
+from db.models import Group as GroupModel
+from db.models import NurseAssignment
 from schemas.roster_schema import (
     NurseProfile,
     MoveNurseRequest,
@@ -71,6 +74,7 @@ from services.nurse_monthly_limit_service import (
     list_nurse_monthly_limits_service,
     upsert_nurse_monthly_limits_service,
 )
+from services.group_access import resolve_managed_group_ids
 from services.excel_service import (
     create_nurse_template,
     # process_excel_upload,
@@ -90,6 +94,93 @@ from utils.utils import set_sms
 
 
 router = APIRouter(prefix="/nurses", tags=["nurses"])
+
+
+@router.get("/managed-groups/summary")
+async def get_managed_groups_summary(
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """현재 사용자가 관리 가능한 그룹 목록 + 간호사 카운트 요약.
+
+    권한별 노출 그룹:
+    - ADM(is_master_admin): 같은 office_id 의 모든 그룹
+    - HN(hn_auth=='HN'): home group + group.hn_id 에 등록된 그룹
+    - 그 외(수간호사·일반 간호사, HN 권한 없음): 토큰 group_id 1개
+
+    카운트 기준 (group_id 축, distinct nurse_id):
+    - active_nurse_count: home 소속(nurses.group_id==G_x) + inbound
+      (NurseAssignment.target_group_id==G_x AND status='active') 중
+      nurses.resignation_date IS NULL 인 간호사. 같은 nurse 가 home·inbound
+      양쪽에 잡혀도 1회만 카운트.
+    - inactive_nurse_count: home 소속이며 resignation_date IS NOT NULL.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+    group_ids = resolve_managed_group_ids(db, current_user)
+    if not group_ids:
+        return JSONResponse(
+            content=jsonable_encoder([]),
+            media_type="application/json; charset=utf-8",
+        )
+
+    groups = (
+        db.query(GroupModel)
+        .filter(GroupModel.group_id.in_(group_ids))
+        .all()
+    )
+    groups_map = {g.group_id: g for g in groups}
+
+    home_rows = (
+        db.query(NurseModel.nurse_id, NurseModel.group_id, NurseModel.resignation_date)
+        .filter(NurseModel.group_id.in_(group_ids))
+        .all()
+    )
+
+    inbound_rows = (
+        db.query(NurseAssignment.nurse_id, NurseAssignment.target_group_id)
+        .join(NurseModel, NurseModel.nurse_id == NurseAssignment.nurse_id)
+        .filter(
+            NurseAssignment.target_group_id.in_(group_ids),
+            NurseAssignment.status == "active",
+            NurseModel.resignation_date.is_(None),
+        )
+        .all()
+    )
+
+    active_set: dict = {gid: set() for gid in group_ids}
+    inactive_set: dict = {gid: set() for gid in group_ids}
+
+    for nid, gid, resigned in home_rows:
+        if gid not in active_set:
+            continue
+        if resigned is None:
+            active_set[gid].add(nid)
+        else:
+            inactive_set[gid].add(nid)
+
+    for nid, tgid in inbound_rows:
+        if tgid in active_set:
+            active_set[tgid].add(nid)
+
+    data = []
+    for gid in group_ids:
+        g = groups_map.get(gid)
+        if not g:
+            continue
+        data.append({
+            "group_id": str(g.group_id),
+            "group_name": str(g.group_name),
+            "office_id": str(g.office_id),
+            "active_nurse_count": len(active_set[gid]),
+            "inactive_nurse_count": len(inactive_set[gid]),
+        })
+
+    return JSONResponse(
+        content=jsonable_encoder(data),
+        media_type="application/json; charset=utf-8",
+    )
 
 
 @router.get("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
