@@ -11,7 +11,7 @@ Minimal executable harness for roster generation QA gate.
   - `run_result.json`
   - `summary.json`
   - `triage.md`
-  - `graph_export.json` (ontology mapping seed)
+  - `graph_export.json` (ontology/hypergraph exchange payload)
 
 ## Usage
 
@@ -38,4 +38,8 @@ python tools/harness/runner.py \
 - Unknown metrics in YAML are reported as `SKIPPED` (not evaluated yet).
 - `--strict` is enabled, `SKIPPED` + `severity=blocking` becomes FAIL.
 - Runner exits with non-zero code when summary status is `FAIL` (CI gate friendly).
+- `graph_export.json` now includes typed `nodes[]` and `edges[]` plus:
+  - `mapping_summary` (`rules_total`, `mapped_rules_count`, `unmapped_rules`)
+  - `consistency` (summary fail rules vs exported violations cross-check)
+- For currently unsupported metrics, rule status can still be `SKIPPED`; with `--strict`, blocking SKIPPED causes FAIL.
 - This is v1 runner; extend evaluators incrementally as new checklist rules are implemented.

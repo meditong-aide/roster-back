@@ -116,6 +116,7 @@ class RunStats:
     coverage_gaps_count: int = 0
     violated_constraints_count: int = 0
     solver_status: str | None = None
+    timing_ms: int = 0
 
 
 def _coverage_counts(roster: Dict[str, Any], day_need: Dict[str, List[int]], shift_main_map: Dict[str, str]) -> Dict[str, int]:
@@ -171,6 +172,26 @@ def _coverage_under_cells(roster: Dict[str, Any], day_need: Dict[str, List[int]]
     return out
 
 
+def _coverage_over_cells(roster: Dict[str, Any], day_need: Dict[str, List[int]], shift_main_map: Dict[str, str]) -> List[Dict[str, Any]]:
+    nurses = roster.get("nurses") or []
+    days = len(day_need["D"])
+    assigned = [{"D": 0, "E": 0, "N": 0, "M": 0} for _ in range(days)]
+    for n in nurses:
+        sched = n.get("schedule") or []
+        for d, raw in enumerate(sched[:days]):
+            m = _to_main(raw, shift_main_map)
+            if m in ("D", "E", "N", "M"):
+                assigned[d][m] += 1
+    out = []
+    for d in range(days):
+        for sh in ("D", "E", "N", "M"):
+            need = int(day_need.get(sh, [0] * days)[d])
+            extra = assigned[d][sh] - need
+            if extra > 0:
+                out.append({"day": d + 1, "shift": sh, "need": need, "assigned": assigned[d][sh], "over": extra})
+    return out
+
+
 def _roster_off_counts(roster: Dict[str, Any], shift_main_map: Dict[str, str]) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for n in roster.get("nurses") or []:
@@ -185,6 +206,184 @@ def _roster_off_counts(roster: Dict[str, Any], shift_main_map: Dict[str, str]) -
                 c += 1
         out[nid] = c
     return out
+
+
+def _weekly_off_missing_count(weekly_off_payload: Dict[str, Any]) -> int:
+    items = (weekly_off_payload or {}).get("items") or []
+    missing = 0
+    for it in items:
+        if bool(it.get("weekly_off_enabled")) and it.get("preview_weekday") in (None, "", "null"):
+            missing += 1
+    return missing
+
+
+def _weekly_off_missing_nurse_ids(weekly_off_payload: Dict[str, Any]) -> List[str]:
+    items = (weekly_off_payload or {}).get("items") or []
+    out: List[str] = []
+    for it in items:
+        if bool(it.get("weekly_off_enabled")) and it.get("preview_weekday") in (None, "", "null"):
+            nid = str(it.get("nurse_id") or "")
+            if nid:
+                out.append(nid)
+    return out
+
+
+def _wanted_apply_ratio_from_fixed(
+    roster: Dict[str, Any],
+    fixed_payload: Dict[str, Any],
+    shift_main_map: Dict[str, str],
+) -> float:
+    entries = (fixed_payload or {}).get("entries") or []
+    if not entries:
+        return 1.0
+    by_nurse: Dict[str, List[str]] = {}
+    for n in roster.get("nurses") or []:
+        nid = str(n.get("id") or "")
+        if nid:
+            by_nurse[nid] = [_to_main(x, shift_main_map) for x in (n.get("schedule") or [])]
+    total = 0
+    matched = 0
+    for e in entries:
+        nid = str(e.get("nurse_id") or "")
+        day = int(e.get("day") or 0)
+        if not nid or day <= 0 or nid not in by_nurse:
+            continue
+        sched = by_nurse[nid]
+        if day - 1 >= len(sched):
+            continue
+        want = _to_main(str(e.get("shift_id") or ""), shift_main_map)
+        total += 1
+        if sched[day - 1] == want:
+            matched += 1
+    if total == 0:
+        return 1.0
+    return matched / float(total)
+
+
+def _wanted_submission_ratio(submissions_payload: Dict[str, Any], eval_ids: set[str]) -> float:
+    submitted = set(str(x) for x in ((submissions_payload or {}).get("submitted_nurses") or []))
+    if not eval_ids:
+        return 1.0
+    return len(submitted & eval_ids) / float(len(eval_ids))
+
+
+def _contains_offswap_signal(obj: Any) -> bool:
+    if obj is None:
+        return False
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if "off" in str(k).lower() and "swap" in str(k).lower():
+                return True
+            if _contains_offswap_signal(v):
+                return True
+        return False
+    if isinstance(obj, list):
+        return any(_contains_offswap_signal(x) for x in obj)
+    s = str(obj).lower()
+    return ("off" in s and "swap" in s)
+
+
+def _preceptee_pair_shift_concentration_ratio(
+    roster: Dict[str, Any],
+    nurses_payload: List[Dict[str, Any]],
+    shift_main_map: Dict[str, str],
+) -> float:
+    by_nid = {str(n.get("nurse_id") or ""): n for n in nurses_payload}
+    sched_by_nid: Dict[str, List[str]] = {}
+    for n in roster.get("nurses") or []:
+        nid = str(n.get("id") or "")
+        if nid:
+            sched_by_nid[nid] = [_to_main(x, shift_main_map) for x in (n.get("schedule") or [])]
+
+    shift_hits = {"D": 0, "E": 0, "N": 0, "M": 0}
+    total_hits = 0
+    for nid, n in by_nid.items():
+        pid = n.get("preceptor_id")
+        if pid in (None, "", "null"):
+            continue
+        pid = str(pid)
+        s1 = sched_by_nid.get(nid)
+        s2 = sched_by_nid.get(pid)
+        if not s1 or not s2:
+            continue
+        days = min(len(s1), len(s2))
+        for d in range(days):
+            a, b = s1[d], s2[d]
+            if a == b and a in shift_hits:
+                shift_hits[a] += 1
+                total_hits += 1
+
+    if total_hits == 0:
+        return 0.0
+    return max(shift_hits.values()) / float(total_hits)
+
+
+def _fairness_metrics(
+    roster: Dict[str, Any],
+    shift_main_map: Dict[str, str],
+    eval_ids: set[str],
+) -> Dict[str, float]:
+    den_counts: List[int] = []
+    total_work_counts: List[int] = []
+    night_counts: List[int] = []
+    for n in roster.get("nurses") or []:
+        nid = str(n.get("id") or "")
+        if nid and eval_ids and nid not in eval_ids:
+            continue
+        main = [_to_main(x, shift_main_map) for x in (n.get("schedule") or [])]
+        d = sum(1 for x in main if x == "D")
+        e = sum(1 for x in main if x == "E")
+        nn = sum(1 for x in main if x == "N")
+        den = d + e + nn
+        total_work = sum(1 for x in main if x in ("D", "E", "N", "M"))
+        den_counts.append(den)
+        total_work_counts.append(total_work)
+        night_counts.append(nn)
+
+    if not den_counts:
+        return {
+            "fairness.den_spread_ratio": 0.0,
+            "fairness.total_work_spread": 0.0,
+            "fairness.n_shift_skew_ratio": 0.0,
+        }
+
+    den_max = max(den_counts)
+    den_min = min(den_counts)
+    total_max = max(total_work_counts)
+    total_min = min(total_work_counts)
+    n_total = sum(night_counts)
+    n_max = max(night_counts) if night_counts else 0
+    return {
+        "fairness.den_spread_ratio": (float(den_max - den_min) / float(den_max)) if den_max > 0 else 0.0,
+        "fairness.total_work_spread": float(total_max - total_min),
+        "fairness.n_shift_skew_ratio": (float(n_max) / float(n_total)) if n_total > 0 else 0.0,
+    }
+
+
+def _fairness_total_work_extremes(
+    roster: Dict[str, Any],
+    shift_main_map: Dict[str, str],
+    eval_ids: set[str],
+) -> Dict[str, Any]:
+    rows: List[Tuple[str, int]] = []
+    for n in roster.get("nurses") or []:
+        nid = str(n.get("id") or "")
+        if not nid or (eval_ids and nid not in eval_ids):
+            continue
+        main = [_to_main(x, shift_main_map) for x in (n.get("schedule") or [])]
+        total_work = sum(1 for x in main if x in ("D", "E", "N", "M"))
+        rows.append((nid, total_work))
+    if not rows:
+        return {"min_nurse_id": None, "max_nurse_id": None, "min_total_work": 0, "max_total_work": 0}
+    rows.sort(key=lambda x: x[1])
+    min_nid, min_w = rows[0]
+    max_nid, max_w = rows[-1]
+    return {
+        "min_nurse_id": min_nid,
+        "max_nurse_id": max_nid,
+        "min_total_work": int(min_w),
+        "max_total_work": int(max_w),
+    }
 
 
 def _build_monthly_limit_exact_map(items: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -206,6 +405,51 @@ def _active_nurse_ids(nurses_payload: List[Dict[str, Any]]) -> set[str]:
             if nid:
                 ids.add(nid)
     return ids
+
+
+def _parse_date_ymd(v: Any) -> tuple[int, int, int] | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace("/", "-")
+    if "T" in s:
+        s = s.split("T", 1)[0]
+    parts = s.split("-")
+    if len(parts) < 3:
+        return None
+    try:
+        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        return y, m, d
+    except Exception:
+        return None
+
+
+def _monthly_joiner_ids(nurses_payload: List[Dict[str, Any]], year: int, month: int) -> set[str]:
+    out: set[str] = set()
+    for n in nurses_payload:
+        nid = str(n.get("nurse_id") or "")
+        if not nid:
+            continue
+        dtv = n.get("joining_date")
+        p = _parse_date_ymd(dtv)
+        if not p:
+            continue
+        y, m, _ = p
+        if y == year and m == month:
+            out.add(nid)
+    return out
+
+
+def _preceptee_ids(nurses_payload: List[Dict[str, Any]]) -> set[str]:
+    out: set[str] = set()
+    for n in nurses_payload:
+        nid = str(n.get("nurse_id") or "")
+        pid = n.get("preceptor_id")
+        if nid and pid not in (None, "", "null"):
+            out.add(nid)
+    return out
 
 
 def _excluded_nurse_ids_from_assignments(assignments_payload: Dict[str, Any]) -> set[str]:
@@ -497,6 +741,491 @@ def _eval_condition(value: Any, expr: str) -> bool:
     raise ValueError(f"Unsupported pass_condition: {expr}")
 
 
+def _owner_family_nodes(owner_families: List[str], ctx: Dict[str, Any], run_id: str) -> List[Dict[str, Any]]:
+    nodes: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(node_id: str, node_type: str, attrs: Dict[str, Any]) -> None:
+        if node_id in seen:
+            return
+        seen.add(node_id)
+        nodes.append({"id": node_id, "type": node_type, "attrs": attrs})
+
+    day = ctx.get("day")
+    shift = ctx.get("shift")
+    team_id = str(ctx.get("team_id") or "*")
+    grade = str(ctx.get("grade") or "*")
+    nurse_id = str(ctx.get("nurse_id") or "*")
+    fixed_entries_count = int(ctx.get("fixed_entries_count") or 0)
+    wanted_submission_ratio = float(ctx.get("wanted_submission_ratio") or 0.0)
+    wanted_apply_ratio = float(ctx.get("wanted_apply_ratio") or 0.0)
+    coverage_mode = str(ctx.get("coverage_mode") or "min")
+    metric_name = str(ctx.get("metric_name") or "")
+
+    for fam in owner_families:
+        if fam == "coverage" and day and shift:
+            if coverage_mode == "max":
+                add(f"coverage:max:{day}:{shift}", "CoverageMaxNode", {"day": day, "shift": shift})
+            else:
+                add(f"coverage:min:{day}:{shift}", "CoverageMinNode", {"day": day, "shift": shift})
+        elif fam == "team_min" and day and shift:
+            add(
+                f"team_min:{team_id}:{day}:{shift}",
+                "TeamMinNode",
+                {"team_id": team_id, "day": day, "shift": shift},
+            )
+        elif fam == "grade_min" and day and shift:
+            add(
+                f"grade_min:{grade}:{day}:{shift}",
+                "GradeMinNode",
+                {"grade": grade, "day": day, "shift": shift},
+            )
+        elif fam == "grade_max" and day and shift:
+            add(
+                f"grade_max:{grade}:{day}:{shift}",
+                "GradeMaxNode",
+                {"grade": grade, "day": day, "shift": shift},
+            )
+        elif fam == "off_window":
+            add(
+                f"off_window:{nurse_id}:{day or '*'}:{shift or '*'}",
+                "OffWindowNode",
+                {"nurse_id": nurse_id, "day": day, "shift": shift},
+            )
+        elif fam in ("transition_ban", "carryover_prev_month"):
+            add(
+                f"carryover:transition:{nurse_id}:{day or 1}",
+                "CarryoverTransitionNode",
+                {"nurse_id": nurse_id, "day": day},
+            )
+        elif fam == "preceptee_sync":
+            add(
+                f"preceptee_sync:{ctx.get('pair_id') or '*'}:{day or '*'}:{shift or '*'}",
+                "PrecepteeSyncNode",
+                {"pair_id": ctx.get("pair_id") or "*", "day": day, "shift": shift},
+            )
+        elif fam == "solver":
+            add(f"solver:run:{run_id}", "ConstraintNode", {"kind": "solver"})
+        elif fam == "wanted":
+            add(
+                f"wanted:submission:{run_id}",
+                "WantedSubmissionNode",
+                {"run_id": run_id, "ratio": wanted_submission_ratio},
+            )
+            add(
+                f"wanted:apply:{run_id}",
+                "WantedApplyNode",
+                {
+                    "run_id": run_id,
+                    "ratio": wanted_apply_ratio,
+                    "fixed_entries_count": fixed_entries_count,
+                },
+            )
+        elif fam == "monthly_off":
+            add(
+                f"monthly_off:{nurse_id}:{run_id}",
+                "MonthlyOffNode",
+                {"nurse_id": nurse_id, "run_id": run_id},
+            )
+        elif fam == "weekly_off":
+            add(
+                f"weekly_off:{nurse_id}:{run_id}",
+                "WeeklyOffNode",
+                {"nurse_id": nurse_id, "run_id": run_id},
+            )
+        elif fam == "fairness":
+            add(
+                f"fairness:{metric_name or 'metric'}:{run_id}",
+                "FairnessNode",
+                {"run_id": run_id, "metric": metric_name},
+            )
+        elif fam == "data_quality":
+            add(
+                f"data_quality:role:{nurse_id or '*'}:{run_id}",
+                "DataQualityNode",
+                {"run_id": run_id, "nurse_id": nurse_id or "*", "field": "role"},
+            )
+
+    return nodes
+
+
+def _evidence_from_rule(
+    rule: Dict[str, Any],
+    drilldown: Dict[str, Any],
+    runs: List[RunStats],
+) -> Dict[str, Any]:
+    rid = str(rule.get("rule_id") or "")
+    metric = str(rule.get("metric") or "")
+    value = rule.get("value")
+    ci_node_ids = list(drilldown.get("ci_violated_node_ids") or [])
+    ci_reason_codes = list(drilldown.get("ci_preflight_reason_codes") or [])
+
+    if rid in ("D_D_MIN", "D_E_MIN", "D_N_MIN", "D_M_MIN"):
+        shift = rid.split("_")[1]
+        cells = [c for c in (drilldown.get("coverage_under_cells") or []) if str(c.get("shift")) == shift]
+        if cells:
+            top = cells[0]
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "day": top.get("day"),
+                "shift": top.get("shift"),
+                "need": top.get("need"),
+                "assigned": top.get("assigned"),
+                "short": top.get("short"),
+                "slack": -int(top.get("short") or 0),
+            }
+
+    if rid == "F_PREV_TRANSITION":
+        rows = drilldown.get("prev_transition_violations") or []
+        if rows:
+            top = rows[0]
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "nurse_id": top.get("nurse_id"),
+                "prev": top.get("prev"),
+                "curr": top.get("curr"),
+                "slack": -1,
+            }
+
+    if rid == "F_PREV_CONSEQ_WORK":
+        rows = drilldown.get("prev_conseq_work_violations") or []
+        if rows:
+            top = rows[0]
+            overflow = max(0, int(top.get("total") or 0) - 6)
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "nurse_id": top.get("nurse_id"),
+                "prev_suffix_work": top.get("prev_suffix_work"),
+                "curr_prefix_work": top.get("curr_prefix_work"),
+                "total": top.get("total"),
+                "slack": -int(overflow),
+            }
+
+    if rid == "H_NO_INFEASIBLE":
+        details = [r.infeasible_detail for r in runs if r.status_code != 200 and r.infeasible_detail is not None]
+        return {
+            "metric": metric,
+            "value": value,
+            "condition": rule.get("pass_condition"),
+            "infeasible_details": details[:5],
+            "slack": -int(value or 0),
+        }
+
+    if rid == "E_WANTED_APPLY":
+        return {
+            "metric": metric,
+            "value": value,
+            "condition": rule.get("pass_condition"),
+            "fixed_entries_count": int(rule.get("fixed_entries_count") or 0),
+            "wanted_submission_ratio": float(rule.get("wanted_submission_ratio") or 0.0),
+            "wanted_apply_ratio": float(rule.get("wanted_apply_ratio") or float(value or 0.0)),
+            "slack": float(value or 0.0) - float(str(rule.get("pass_condition", ">= 0")).replace(">=", "").strip() or 0.0),
+        }
+
+    if rid == "D_MAX_OVER":
+        rows = drilldown.get("coverage_over_cells") or []
+        if rows:
+            top = rows[0]
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "day": top.get("day"),
+                "shift": top.get("shift"),
+                "need": top.get("need"),
+                "assigned": top.get("assigned"),
+                "over": top.get("over"),
+                "coverage_mode": "max",
+                "ci_node_ids": ci_node_ids[:20],
+                "ci_reason_codes": ci_reason_codes[:20],
+                "slack": -int(top.get("over") or 0),
+            }
+
+    if rid == "B_OFF_NEAR_CONFIG":
+        rows = drilldown.get("off_band_nurses") or []
+        if rows:
+            top = rows[0]
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "nurse_id": top.get("nurse_id"),
+                "team_id": top.get("team_id"),
+                "off_days": top.get("off_days"),
+                "off_cfg": top.get("off_cfg"),
+                "slack": -1,
+            }
+
+    if rid == "B_WEEKLY_OFF":
+        rows = drilldown.get("weekly_off_missing_nurses") or []
+        if rows:
+            top = rows[0]
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "nurse_id": top.get("nurse_id"),
+                "team_id": top.get("team_id"),
+                "slack": -1,
+            }
+
+    if rid == "C_TOTAL_BALANCE":
+        ex = drilldown.get("fairness_total_work_extremes") or {}
+        if ex:
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "nurse_id": ex.get("max_nurse_id"),
+                "team_id": ex.get("max_team_id"),
+                "min_nurse_id": ex.get("min_nurse_id"),
+                "min_team_id": ex.get("min_team_id"),
+                "min_total_work": ex.get("min_total_work"),
+                "max_total_work": ex.get("max_total_work"),
+                "slack": None,
+            }
+
+    if rid == "G_ROLE_NULL":
+        rows = drilldown.get("role_null_nurses") or []
+        if rows:
+            top = rows[0]
+            return {
+                "metric": metric,
+                "value": value,
+                "condition": rule.get("pass_condition"),
+                "nurse_id": top.get("nurse_id"),
+                "team_id": top.get("team_id"),
+                "slack": -1,
+            }
+
+    slack = None
+    try:
+        if str(rule.get("pass_condition", "")).strip() == "== 0" and value is not None:
+            slack = -float(value)
+    except Exception:
+        slack = None
+    return {
+        "metric": metric,
+        "value": value,
+        "condition": rule.get("pass_condition"),
+        "ci_node_ids": ci_node_ids[:20],
+        "ci_reason_codes": ci_reason_codes[:20],
+        "slack": slack,
+    }
+
+
+def _build_graph_export(
+    *,
+    run_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    strategy: str,
+    input_hash: str,
+    rule_results: List[Dict[str, Any]],
+    rules_catalog: List[Dict[str, Any]],
+    drilldown: Dict[str, Any],
+    runs: List[RunStats],
+    solver_status: str,
+) -> Dict[str, Any]:
+    catalog_by_id = {str(r.get("id") or ""): r for r in rules_catalog}
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    node_seen: set[str] = set()
+    edge_seen: set[str] = set()
+
+    def add_node(node_id: str, node_type: str, attrs: Dict[str, Any]) -> None:
+        if node_id in node_seen:
+            return
+        node_seen.add(node_id)
+        nodes.append({"id": node_id, "type": node_type, "attrs": attrs})
+
+    def add_edge(edge_type: str, from_id: str, to_id: str) -> None:
+        k = f"{edge_type}|{from_id}|{to_id}"
+        if k in edge_seen:
+            return
+        edge_seen.add(k)
+        edges.append({"type": edge_type, "from": from_id, "to": to_id})
+
+    def add_entity_context_nodes(ev: Dict[str, Any], violation_id: str) -> List[str]:
+        created: List[str] = []
+        day = ev.get("day")
+        shift = ev.get("shift")
+        nurse_id = ev.get("nurse_id")
+        team_id = ev.get("team_id")
+
+        if day is not None:
+            day_node = f"day:{year}-{month:02d}:{int(day)}"
+            add_node(day_node, "DayNode", {"year": year, "month": month, "day": int(day)})
+            add_edge("CONTEXT_OF", day_node, violation_id)
+            created.append(day_node)
+
+        if shift:
+            shift_code = str(shift).upper()
+            shift_node = f"shift:{shift_code}"
+            add_node(shift_node, "ShiftNode", {"code": shift_code})
+            add_edge("CONTEXT_OF", shift_node, violation_id)
+            created.append(shift_node)
+
+        if nurse_id:
+            n_node = f"nurse:{nurse_id}"
+            add_node(n_node, "NurseNode", {"nurse_id": str(nurse_id)})
+            add_edge("CONTEXT_OF", n_node, violation_id)
+            created.append(n_node)
+
+        if team_id and str(team_id) != "*":
+            t_node = f"team:{team_id}"
+            add_node(t_node, "TeamNode", {"team_id": str(team_id)})
+            add_edge("CONTEXT_OF", t_node, violation_id)
+            created.append(t_node)
+
+        if day is not None and shift:
+            day_node = f"day:{year}-{month:02d}:{int(day)}"
+            shift_node = f"shift:{str(shift).upper()}"
+            add_edge("DAY_SHIFT", day_node, shift_node)
+
+        return created
+
+    month_id = f"month:{year}-{month:02d}"
+    group_node_id = f"group:{group_id}"
+    run_node_id = f"run:{run_id}"
+    add_node(month_id, "MonthNode", {"year": year, "month": month})
+    add_node(group_node_id, "GroupNode", {"group_id": group_id})
+    add_node(
+        run_node_id,
+        "RunNode",
+        {"run_id": run_id, "strategy": strategy, "input_hash": input_hash, "solver_status": solver_status},
+    )
+    add_edge("RUN_ON", run_node_id, month_id)
+    add_edge("RUN_ON", run_node_id, group_node_id)
+
+    mapped_rules = 0
+    fail_rules_with_constraint_nodes = 0
+    fail_rules_without_constraint_nodes: List[str] = []
+    violations: List[Dict[str, Any]] = []
+    for idx, rr in enumerate(rule_results):
+        rid = str(rr.get("rule_id") or "")
+        metric_name = str(rr.get("metric") or "")
+        rule_node_id = f"rule:{rid}"
+        metric_node_id = f"metric:{run_id}:{metric_name}"
+        add_node(rule_node_id, "RuleNode", {"rule_id": rid, "severity": rr.get("severity")})
+        add_node(metric_node_id, "MetricNode", {"metric": metric_name, "value": rr.get("value"), "run_id": run_id})
+        add_edge("EVALUATED_BY", metric_node_id, rule_node_id)
+
+        spec_rule = catalog_by_id.get(rid, {})
+        families = list(spec_rule.get("owner_family") or [])
+        if families:
+            mapped_rules += 1
+
+        if rr.get("status") != "FAIL":
+            continue
+
+        evidence = _evidence_from_rule(rr, drilldown, runs)
+        viol_node_id = f"violation:{run_id}:{rid}:{idx}"
+        add_node(
+            viol_node_id,
+            "ViolationNode",
+            {
+                "rule_id": rid,
+                "run_id": run_id,
+                "severity": rr.get("severity"),
+                "slack": evidence.get("slack"),
+            },
+        )
+        add_edge("FAILED_RULE", viol_node_id, rule_node_id)
+        add_edge("OBSERVED_IN", viol_node_id, run_node_id)
+
+        context = {
+            "day": evidence.get("day"),
+            "shift": evidence.get("shift"),
+            "nurse_id": evidence.get("nurse_id"),
+            "pair_id": evidence.get("pair_id"),
+            "team_id": evidence.get("team_id"),
+            "fixed_entries_count": evidence.get("fixed_entries_count", 0),
+            "wanted_submission_ratio": evidence.get("wanted_submission_ratio", 0.0),
+            "wanted_apply_ratio": evidence.get("wanted_apply_ratio", 0.0),
+            "coverage_mode": evidence.get("coverage_mode", "min"),
+            "metric_name": metric_name,
+        }
+        c_nodes = _owner_family_nodes(families, context, run_id)
+        if c_nodes:
+            fail_rules_with_constraint_nodes += 1
+        else:
+            fail_rules_without_constraint_nodes.append(rid)
+        for cn in c_nodes:
+            add_node(cn["id"], cn["type"], cn["attrs"])
+            add_edge("CAUSES_VIOLATION", cn["id"], viol_node_id)
+        add_edge("CAUSES_VIOLATION", metric_node_id, viol_node_id)
+
+        entity_node_ids = add_entity_context_nodes(evidence, viol_node_id)
+
+        node_ids = [rule_node_id, metric_node_id] + [cn["id"] for cn in c_nodes] + entity_node_ids
+        violations.append(
+            {
+                "rule_id": rid,
+                "violation_id": viol_node_id,
+                "node_ids": node_ids,
+                "evidence": evidence,
+                "slack": evidence.get("slack"),
+            }
+        )
+
+    fail_rule_ids = {str(r.get("rule_id") or "") for r in rule_results if r.get("status") == "FAIL"}
+    graph_fail_rule_ids = {str(v.get("rule_id") or "") for v in violations}
+    consistency = {
+        "fail_rule_count": len(fail_rule_ids),
+        "graph_violation_count": len(violations),
+        "missing_in_graph": sorted(fail_rule_ids - graph_fail_rule_ids),
+        "extra_in_graph": sorted(graph_fail_rule_ids - fail_rule_ids),
+    }
+
+    return {
+        "run": {
+            "run_id": run_id,
+            "group_id": group_id,
+            "year": year,
+            "month": month,
+            "strategy": strategy,
+            "input_hash": input_hash,
+            "solver_status": solver_status,
+        },
+        "rules": [
+            {
+                "rule_id": r["rule_id"],
+                "status": r["status"],
+                "severity": r["severity"],
+                "metric": r.get("metric"),
+                "value": r.get("value"),
+            }
+            for r in rule_results
+        ],
+        "violations": violations,
+        "nodes": nodes,
+        "edges": edges,
+        "mapping_summary": {
+            "rules_total": len(rule_results),
+            "mapped_rules_count": mapped_rules,
+            "fail_rules_total": len(fail_rule_ids),
+            "fail_rules_with_constraint_nodes": fail_rules_with_constraint_nodes,
+            "fail_rules_without_constraint_nodes": sorted(set(fail_rules_without_constraint_nodes)),
+            "unmapped_rules": sorted(
+                [
+                    str(r.get("rule_id") or "")
+                    for r in rule_results
+                    if not list((catalog_by_id.get(str(r.get("rule_id") or ""), {}) or {}).get("owner_family") or [])
+                ]
+            ),
+        },
+        "consistency": consistency,
+    }
+
+
 def main() -> None:
     args = _parse_args()
     rules_doc = _load_rules(args.rules)
@@ -555,6 +1284,9 @@ def main() -> None:
         except Exception:
             monthly_limits = {"items": []}
     assignments = _get_json(s, args.base_url, "/nurses/assignments", params={"status": "active"})
+    weekly_off = _get_json(s, args.base_url, "/weekly-off/nurses", params={"year": year, "month": month})
+    wanted_status = _get_json(s, args.base_url, "/wanted/status", params={"year": year, "month": month})
+    wanted_submissions = _get_json(s, args.base_url, f"/wanted/{year}/{month}/submissions")
     fixed = _get_json(s, args.base_url, f"/wanted/fixed/{year}/{month}")
     prev_tail = _get_json(s, args.base_url, f"/roster/{year}/{month}/prev-tail", params={"tail_days": 6})
 
@@ -567,6 +1299,9 @@ def main() -> None:
         "nurses": nurses_payload,
         "monthly_limits": monthly_limits,
         "assignments": assignments,
+        "weekly_off": weekly_off,
+        "wanted_status": wanted_status,
+        "wanted_submissions": wanted_submissions,
         "fixed_wanted": fixed,
         "prev_tail": prev_tail,
         "strategy": args.strategy,
@@ -602,6 +1337,7 @@ def main() -> None:
         st.coverage_gaps_count = len(ci.get("coverage_gaps") or [])
         st.violated_constraints_count = len(ci.get("violated_constraints") or [])
         st.solver_status = ci.get("solver_status")
+        st.timing_ms = int(ci.get("timing_ms") or 0)
 
         roster = _get_json(s, args.base_url, f"/roster/schedule/{st.schedule_id}")
         cov = _coverage_counts(roster, day_need, shift_main_map)
@@ -610,6 +1346,19 @@ def main() -> None:
         runs.append(st)
 
     # aggregate metrics
+    success_runs = [r for r in runs if r.status_code == 200]
+    success_timing = sorted([int(r.timing_ms) for r in success_runs if int(r.timing_ms) > 0])
+    if success_timing:
+        idx95 = max(0, int(math.ceil(0.95 * len(success_timing))) - 1)
+        solve_time_ms_p95 = int(success_timing[min(idx95, len(success_timing) - 1)])
+    else:
+        solve_time_ms_p95 = 0
+    fallback_error_count = sum(
+        1
+        for r in success_runs
+        if str(r.solver_status or "").strip().lower() not in ("", "primary", "ok", "success")
+    )
+
     metrics: Dict[str, Any] = {
         "coverage.under_count_D": sum(r.under_count_D for r in runs),
         "coverage.under_count_E": sum(r.under_count_E for r in runs),
@@ -619,8 +1368,8 @@ def main() -> None:
             r.over_count_D + r.over_count_E + r.over_count_N + r.over_count_M for r in runs
         ),
         "system.infeasible_run_count": sum(1 for r in runs if r.status_code != 200),
-        "system.fallback_error_count": 0,
-        "system.solve_time_ms_p95": 0,
+        "system.fallback_error_count": fallback_error_count,
+        "system.solve_time_ms_p95": solve_time_ms_p95,
     }
 
     hard_agg = {
@@ -644,9 +1393,12 @@ def main() -> None:
     metrics.update(hard_agg)
 
     # B/G metrics (API-backed)
-    active_ids = _active_nurse_ids(nurses_payload if isinstance(nurses_payload, list) else [])
+    nurses_list = nurses_payload if isinstance(nurses_payload, list) else []
+    active_ids = _active_nurse_ids(nurses_list)
     excluded_ids = _excluded_nurse_ids_from_assignments(assignments if isinstance(assignments, dict) else {})
-    eval_ids = active_ids - excluded_ids
+    monthly_joiners = _monthly_joiner_ids(nurses_list, year, month)
+    preceptee_ids = _preceptee_ids(nurses_list)
+    eval_ids = active_ids - excluded_ids - monthly_joiners - preceptee_ids
     limit_items = (monthly_limits or {}).get("items") if isinstance(monthly_limits, dict) else []
     o_exact_map = _build_monthly_limit_exact_map(limit_items or [])
 
@@ -657,6 +1409,16 @@ def main() -> None:
     preceptee_sync_viol = 0
     preceptee_mapping_invalid = _preceptee_mapping_invalid_count(nurses_payload if isinstance(nurses_payload, list) else [])
     grade_minmax_viol = 0
+    weekly_off_missing_count = 0
+    wanted_apply_ratio = 1.0
+    wanted_submission_ratio = 1.0
+    wanted_fixed_apply_ratio = 1.0
+    fixed_entries_count = 0
+    preceptee_pair_shift_concentration_ratio = 0.0
+    offswap_trace_missing_count = 0
+    fairness_den_spread_ratio = 0.0
+    fairness_total_work_spread = 0.0
+    fairness_n_shift_skew_ratio = 0.0
     prev_transition_violation_count = 0
     prev_n_recovery_violation_count = 0
     prev_conseq_work_overflow_count = 0
@@ -664,26 +1426,51 @@ def main() -> None:
     fixed_n_before_off_violation_count = 0
     drilldown: Dict[str, Any] = {
         "coverage_under_cells": [],
+        "coverage_over_cells": [],
+        "off_band_nurses": [],
+        "weekly_off_missing_nurses": [],
+        "role_null_nurses": [],
+        "fairness_total_work_extremes": {},
         "prev_transition_violations": [],
         "prev_conseq_work_violations": [],
+        "ci_violated_node_ids": [],
+        "ci_preflight_reason_codes": [],
+    }
+
+    nurse_team_map = {
+        str(n.get("nurse_id") or ""): str(n.get("team_id") or "")
+        for n in (nurses_payload if isinstance(nurses_payload, list) else [])
+        if str(n.get("nurse_id") or "")
     }
 
     for n in (nurses_payload if isinstance(nurses_payload, list) else []):
         act = str(n.get("active", 1))
         role = str(n.get("role") or "").strip()
+        nid = str(n.get("nurse_id") or "")
         if act in ("1", "True", "true") and role == "":
             role_null_active_count += 1
+            if nid:
+                drilldown["role_null_nurses"].append({"nurse_id": nid, "team_id": nurse_team_map.get(nid)})
 
     first_ok = next((r for r in runs if r.status_code == 200 and r.schedule_id), None)
     if first_ok is not None:
         roster = _get_json(s, args.base_url, f"/roster/schedule/{first_ok.schedule_id}")
         drilldown["coverage_under_cells"] = _coverage_under_cells(roster, day_need, shift_main_map)
+        drilldown["coverage_over_cells"] = _coverage_over_cells(roster, day_need, shift_main_map)
         off_counts = _roster_off_counts(roster, shift_main_map)
         off_days_cfg = float(cfg.get("off_days") or 0)
         for nid in eval_ids:
             actual = int(off_counts.get(nid, 0))
             if not (math.floor(off_days_cfg - 1) <= actual <= math.ceil(off_days_cfg + 1)):
                 off_band_cnt += 1
+                drilldown["off_band_nurses"].append(
+                    {
+                        "nurse_id": nid,
+                        "team_id": nurse_team_map.get(nid),
+                        "off_days": actual,
+                        "off_cfg": off_days_cfg,
+                    }
+                )
             if nid in o_exact_map and int(o_exact_map[nid]) != actual:
                 off_cap_mismatch += 1
 
@@ -696,6 +1483,10 @@ def main() -> None:
         )
         if r0[0] == 200:
             ci = (r0[1].get("constraint_impact") or {}) if isinstance(r0[1], dict) else {}
+            drilldown["ci_violated_node_ids"] = [str(v.get("node_id") or "") for v in (ci.get("violated_constraints") or [])]
+            drilldown["ci_preflight_reason_codes"] = [
+                str(x.get("reason_code") or "") for x in (ci.get("preflight_alerts") or []) if x.get("reason_code")
+            ]
             for v in ci.get("violated_constraints") or []:
                 nid = str(v.get("node_id") or "")
                 if "preceptee" in nid:
@@ -742,37 +1533,89 @@ def main() -> None:
         fixed_changed_cell_count = int(f.get("fixed.changed_cell_count", 0))
         fixed_n_before_off_violation_count = int(f.get("fixed.n_before_fixed_off_violation_count", 0))
 
+        weekly_off_missing_count = _weekly_off_missing_count(weekly_off if isinstance(weekly_off, dict) else {})
+        weekly_missing_ids = _weekly_off_missing_nurse_ids(weekly_off if isinstance(weekly_off, dict) else {})
+        drilldown["weekly_off_missing_nurses"] = [
+            {"nurse_id": nid, "team_id": nurse_team_map.get(nid)} for nid in weekly_missing_ids
+        ]
+        fixed_entries_count = len(((fixed or {}).get("entries") or [])) if isinstance(fixed, dict) else 0
+        wanted_fixed_apply_ratio = _wanted_apply_ratio_from_fixed(roster, fixed if isinstance(fixed, dict) else {}, shift_main_map)
+        wanted_submission_ratio = _wanted_submission_ratio(wanted_submissions if isinstance(wanted_submissions, dict) else {}, eval_ids)
+        w_status = str((wanted_status or {}).get("status") or "").lower()
+        if fixed_entries_count > 0:
+            wanted_apply_ratio = wanted_fixed_apply_ratio
+        else:
+            wanted_apply_ratio = wanted_fixed_apply_ratio if w_status in ("closed", "applied", "done") else wanted_submission_ratio
+        preceptee_pair_shift_concentration_ratio = _preceptee_pair_shift_concentration_ratio(
+            roster,
+            nurses_payload if isinstance(nurses_payload, list) else [],
+            shift_main_map,
+        )
+        fairness = _fairness_metrics(roster, shift_main_map, eval_ids)
+        fairness_den_spread_ratio = float(fairness.get("fairness.den_spread_ratio", 0.0))
+        fairness_total_work_spread = float(fairness.get("fairness.total_work_spread", 0.0))
+        fairness_n_shift_skew_ratio = float(fairness.get("fairness.n_shift_skew_ratio", 0.0))
+        fx = _fairness_total_work_extremes(roster, shift_main_map, eval_ids)
+        drilldown["fairness_total_work_extremes"] = {
+            **fx,
+            "min_team_id": nurse_team_map.get(str(fx.get("min_nurse_id") or "")),
+            "max_team_id": nurse_team_map.get(str(fx.get("max_nurse_id") or "")),
+        }
+        # 로그 파이프라인 미연동인 환경에서는 offswap 자체 비활성 여부로 최소 점검
+        offswap_enabled = bool(cfg.get("off_swap_enabled", False))
+        has_target = any(int((row.get("off_swap_target") or 0)) == 1 for row in (shifts if isinstance(shifts, list) else []))
+        ci_blob = (r0[1].get("constraint_impact") or {}) if (r0[0] == 200 and isinstance(r0[1], dict)) else {}
+        offswap_signal = _contains_offswap_signal(ci_blob)
+        # offswap가 켜져 있는데 target/event 신호가 전혀 없으면 trace 누락으로 본다.
+        offswap_trace_missing_count = 1 if (offswap_enabled and (not has_target or not offswap_signal)) else 0
+
     metrics.update(
         {
             "off.off_days_out_of_band_count": off_band_cnt,
             "off.off_cap_exact_mismatch_count": off_cap_mismatch,
+            "off.weekly_off_missing_count": weekly_off_missing_count,
+            "fairness.den_spread_ratio": fairness_den_spread_ratio,
+            "fairness.total_work_spread": fairness_total_work_spread,
+            "fairness.n_shift_skew_ratio": fairness_n_shift_skew_ratio,
             "data.role_null_active_count": role_null_active_count,
             "preceptee.sync_violation_count": preceptee_sync_viol,
+            "preceptee.pair_shift_concentration_ratio": preceptee_pair_shift_concentration_ratio,
             "preceptee.mapping_invalid_count": preceptee_mapping_invalid,
             "grade.minmax_violation_count": grade_minmax_viol,
             "carryover.prev_transition_violation_count": prev_transition_violation_count,
             "carryover.prev_n_recovery_violation_count": prev_n_recovery_violation_count,
             "carryover.prev_conseq_work_overflow_count": prev_conseq_work_overflow_count,
-            "carryover.dropped_ref_count": 0,
+            "carryover.dropped_ref_count": 1 if str((prev_tail or {}).get("data", {}).get("schedule_status") or "").lower() == "dropped" else 0,
             "config.max_enabled_inconsistency_count": _max_enabled_inconsistency_count(daily if isinstance(daily, dict) else {}),
             "fixed.changed_cell_count": fixed_changed_cell_count,
             "fixed.n_before_fixed_off_violation_count": fixed_n_before_off_violation_count,
+            "wanted.apply_ratio": wanted_apply_ratio,
+            "wanted.submission_ratio": wanted_submission_ratio,
+            "wanted.fixed_apply_ratio": wanted_fixed_apply_ratio,
+            "wanted.fixed_entries_count": fixed_entries_count,
             "offswap.target_shift_multi_count": _offswap_target_multi_count(shifts if isinstance(shifts, list) else []),
             # TODO: exact offswap conversion metrics require conversion trace / annual-leave delta source
             "offswap.recovery_off_converted_count": 0,
             "offswap.night_only_off_converted_count": 0,
             "offswap.fixed_off_converted_count": 0,
             "offswap.ju_converted_count": 0,
+            "logs.offswap_trace_missing_count": offswap_trace_missing_count,
         }
     )
 
     # evaluate rules
     rule_results = []
+    fairness_mode = str(os.getenv("HARNESS_FAIRNESS_MODE", "warning")).strip().lower()
     for rule in rules:
         rid = rule.get("id")
         metric_name = rule.get("metric")
         cond = str(rule.get("pass_condition", "== 0"))
         severity = rule.get("severity", "warning")
+        if fairness_mode == "blocking" and str(rid).startswith("C_"):
+            severity = "blocking"
+        # Guardrail: when fixed wanted exists, wanted apply must be exact.
+        if rid == "E_WANTED_APPLY" and int(metrics.get("wanted.fixed_entries_count") or 0) > 0:
+            cond = ">= 1.0"
         value = metrics.get(metric_name)
         if value is None:
             rule_results.append(
@@ -795,6 +1638,9 @@ def main() -> None:
                 "status": "PASS" if passed else "FAIL",
                 "severity": severity,
                 "pass_condition": cond,
+                "fixed_entries_count": int(metrics.get("wanted.fixed_entries_count") or 0) if rid == "E_WANTED_APPLY" else 0,
+                "wanted_submission_ratio": float(metrics.get("wanted.submission_ratio") or 0.0) if rid == "E_WANTED_APPLY" else 0.0,
+                "wanted_apply_ratio": float(metrics.get("wanted.apply_ratio") or 0.0) if rid == "E_WANTED_APPLY" else 0.0,
             }
         )
 
@@ -826,35 +1672,28 @@ def main() -> None:
         "rules": rule_results,
     }
 
-    graph_export = {
-        "run": {
-            "run_id": f"{year}-{month:02d}-{group_id}-{args.strategy}-{ts}",
-            "group_id": group_id,
-            "year": year,
-            "month": month,
-            "strategy": args.strategy,
-            "input_hash": input_hash,
-        },
-        "rules": [
-            {
-                "rule_id": r["rule_id"],
-                "status": r["status"],
-                "severity": r["severity"],
-                "metric": r.get("metric"),
-                "value": r.get("value"),
-            }
-            for r in rule_results
-        ],
-        "violations": [
-            {
-                "rule_id": r["rule_id"],
-                "node_ids": [f"rule:{r['rule_id']}"],
-                "evidence": {"metric": r.get("metric"), "value": r.get("value"), "condition": r.get("pass_condition")},
-            }
-            for r in rule_results
-            if r["status"] == "FAIL"
-        ],
-    }
+    run_id = f"{year}-{month:02d}-{group_id}-{args.strategy}-{ts}"
+    solver_status_agg = "unknown"
+    for r in runs:
+        if r.solver_status:
+            solver_status_agg = str(r.solver_status)
+            if solver_status_agg.lower() == "primary":
+                break
+    graph_export = _build_graph_export(
+        run_id=run_id,
+        group_id=group_id,
+        year=year,
+        month=month,
+        strategy=args.strategy,
+        input_hash=input_hash,
+        rule_results=rule_results,
+        rules_catalog=rules,
+        drilldown=drilldown,
+        runs=runs,
+        solver_status=solver_status_agg,
+    )
+    summary["graph_consistency"] = graph_export.get("consistency", {})
+    summary["mapping_summary"] = graph_export.get("mapping_summary", {})
 
     triage_lines = [
         f"# Harness Triage ({year}-{month:02d}, {args.strategy})",

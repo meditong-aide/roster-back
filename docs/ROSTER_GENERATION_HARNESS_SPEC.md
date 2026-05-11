@@ -152,6 +152,7 @@
 - `preceptee`
 - `off_window` / `assignment_window`
 - `fixed_wanted`
+- `wanted` (submission/apply)
 - `carryover_prev_month`
 - `config_integrity`
 
@@ -209,10 +210,23 @@ tools/harness/
 ## 10.1 CI Stage
 - `harness-baseline` (빠른 2회)
 - `harness-nightly` (5~10회 반복 + sweep)
+- `harness-dev-gate` (개발 브랜치 strict 게이트)
 
 ## 10.2 Release Gate
 - blocking rule fail 1건 이상: 배포 차단
 - warning threshold 초과: 승인 필요
+- `graph_consistency.missing_in_graph/extra_in_graph` 비어있지 않으면 차단
+
+### Fairness staged rollout
+- C그룹 기본 severity는 warning으로 시작
+- 안정화 후 blocking 승격 시 환경변수 적용:
+  - `HARNESS_FAIRNESS_MODE=blocking`
+
+## 10.3 Dev CI Checklist Link
+- 체크리스트 커버리지/우선순위 및 CI 점검표:
+  - `docs/HARNESS_CHECKLIST_COVERAGE_MATRIX.md`
+- Branch protection 운영 가이드(켜기/끄기/완화):
+  - `docs/HARNESS_BRANCH_PROTECTION_OPERATIONS.md`
 
 ---
 
@@ -242,5 +256,13 @@ tools/harness/
   - `tools/harness/rules/checklist_core.yaml`
 - Ontology/Hypergraph mapping:
   - `docs/HARNESS_TO_ONTOLOGY_HYPERGRAPH_MAPPING.md`
+
+### Graph causal nodes (recent)
+- `WantedSubmissionNode`, `WantedApplyNode`를 graph_export에 생성
+- `owner_family: [wanted]` 규칙 실패 시 `CAUSES_VIOLATION` 엣지로 위 노드를 `ViolationNode`에 연결
+- Coverage matrix + CI checklist:
+  - `docs/HARNESS_CHECKLIST_COVERAGE_MATRIX.md`
+- Branch protection ops guide:
+  - `docs/HARNESS_BRANCH_PROTECTION_OPERATIONS.md`
 - Constraint impact graph base:
   - `docs/CONSTRAINT_IMPACT_GRAPH_SCHEMA_AND_API.md`
