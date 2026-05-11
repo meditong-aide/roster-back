@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -927,6 +928,8 @@ def main() -> None:
             ensure_ascii=False,
         )
     )
+    if summary["status"] == "FAIL":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

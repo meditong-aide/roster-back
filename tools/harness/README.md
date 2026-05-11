@@ -37,4 +37,5 @@ python tools/harness/runner.py \
 - If token is raw JWT, runner automatically also supports `Bearer <JWT>` format in cookie.
 - Unknown metrics in YAML are reported as `SKIPPED` (not evaluated yet).
 - `--strict` is enabled, `SKIPPED` + `severity=blocking` becomes FAIL.
+- Runner exits with non-zero code when summary status is `FAIL` (CI gate friendly).
 - This is v1 runner; extend evaluators incrementally as new checklist rules are implemented.
