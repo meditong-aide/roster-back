@@ -93,6 +93,75 @@ async def _daily_flush_scheduler():
             db.close()
 
 
+def _expire_stale_status(db, status_in: str, cutoff_seconds: int, message: str) -> int:
+    """주어진 status 의 created_at + cutoff_seconds 초과 job 을 FAILED 로 전환.
+
+    인자:
+        db: DB 세션
+        status_in: 대상 status (QUEUED 또는 RUNNING)
+        cutoff_seconds: 경과 시간 임계 (초)
+        message: error_message 에 기록할 사유
+    반환:
+        변경된 행 수
+    """
+    from datetime import timedelta
+    from db.models import RosterJob
+
+    now = datetime.now()
+    return (
+        db.query(RosterJob)
+        .filter(
+            RosterJob.status == status_in,
+            RosterJob.created_at < now - timedelta(seconds=cutoff_seconds),
+        )
+        .update(
+            {
+                "status": "FAILED",
+                "error_message": message,
+                "updated_at": now,
+            },
+            synchronize_session=False,
+        )
+    )
+
+
+def _sweep_stale_jobs(db) -> tuple[int, int]:
+    """QUEUED 5분 / RUNNING 15분 초과 job 일괄 FAILED. (queued_count, running_count) 반환."""
+    queued = _expire_stale_status(
+        db, "QUEUED", 300, "QUEUED timeout (Lambda 미호출 추정)"
+    )
+    running = _expire_stale_status(
+        db, "RUNNING", 900, "RUNNING timeout (worker 중단 추정)"
+    )
+    db.commit()
+    return queued, running
+
+
+async def _stale_jobs_janitor():
+    """1분 주기로 stale job 정리. 무한 polling 차단용 안전장치.
+
+    QUEUED 5분: Lambda 가 호출되지 않은 케이스 (SQS event source 이슈 등) 추정.
+    RUNNING 15분: worker 가 RUNNING 진입 후 죽은 케이스 추정 (Lambda timeout 600s + retry 1회 마진).
+    """
+    while True:
+        await asyncio.sleep(60)
+        db = SessionLocal()
+        try:
+            queued, running = _sweep_stale_jobs(db)
+            if queued or running:
+                _scheduler_logger.warning(
+                    "[Scheduler] stale jobs swept: queued→failed=%d, running→failed=%d",
+                    queued,
+                    running,
+                )
+        except Exception as e:
+            _scheduler_logger.error(
+                "[Scheduler] stale jobs sweep 실패: %s", e, exc_info=True
+            )
+        finally:
+            db.close()
+
+
 def _run_nurse_sync():
     """신규 간호사 동기화 1회 실행."""
     from services.nurse_sync_service import sync_new_nurses
@@ -134,9 +203,11 @@ async def _daily_nurse_sync_scheduler():
 async def lifespan(app):
     flush_task = asyncio.create_task(_daily_flush_scheduler())
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
+    janitor_task = asyncio.create_task(_stale_jobs_janitor())
     yield
     flush_task.cancel()
     sync_task.cancel()
+    janitor_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
