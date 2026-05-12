@@ -28,3 +28,9 @@ ruff.toml
 
 # AGENTS.md governance files (local dev only)
 **/AGENTS.md
+
+# Editor / IDE
+.obsidian/
+
+# Harness run artifacts (generated)
+tools/harness/reports/
