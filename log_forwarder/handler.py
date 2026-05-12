@@ -79,28 +79,45 @@ def handler(event: dict, context) -> dict:
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
     skipped = 0
 
-    for ev in log_events:
+    # Subscription Filter pattern 을 빈 문자열(전체 통과)로 운영하므로 plain print 도 흘러온다.
+    # 솔버는 invocation 시작에 powertools Logger 가 office/group/nurse/job_id 포함 JSON 을 먼저 출력
+    # → 이후 발생하는 모든 stdout(plain print 포함) 은 직전 JSON 의 context 로 동일 nurse stream 에 라우팅.
+    # Subscription Filter event 의 logEvents 는 단일 source stream 의 시간순 chunk 이므로
+    # 같은 invocation 안에서는 last_context 가 유효.
+    last_context: dict | None = None
+
+    for ev in sorted(log_events, key=lambda e: e.get('timestamp', 0)):
         message = ev.get('message', '')
+
         try:
             log_json = json.loads(message)
         except json.JSONDecodeError:
-            # JSON 이 아닌 로그 (디버깅 print 등) 는 표준 log group 에만 남기고 skip.
+            log_json = None
+
+        if log_json is not None:
+            office_id = log_json.get('office_id')
+            group_id = log_json.get('group_id')
+            nurse_id = log_json.get('nurse_id')
+            job_id = log_json.get('job_id') or 'default'
+            if all([office_id, group_id, nurse_id]):
+                last_context = {
+                    'office_id': office_id,
+                    'group_id': group_id,
+                    'nurse_id': nurse_id,
+                    'job_id': job_id,
+                }
+
+        if last_context is None:
+            # 첫 JSON 컨텍스트 도착 전 출력(Lambda init 등) — skip.
+            # 원본 /aws/lambda/roster-solver-{env} log group 에는 그대로 남아 있음.
             skipped += 1
             continue
 
-        office_id = log_json.get('office_id')
-        group_id = log_json.get('group_id')
-        nurse_id = log_json.get('nurse_id')
-        job_id = log_json.get('job_id') or 'default'
-
-        if not all([office_id, group_id, nurse_id]):
-            # 컨텍스트 미주입 로그 (예: handler 진입 직후 SQS records 수신) 는 skip.
-            # 이런 로그는 표준 log group 에서 확인 가능.
-            skipped += 1
-            continue
-
-        target_group = f"{LOG_GROUP_PREFIX}/{env}/{office_id}/{group_id}/{nurse_id}"
-        grouped[(target_group, job_id)].append({
+        target_group = (
+            f"{LOG_GROUP_PREFIX}/{env}/{last_context['office_id']}/"
+            f"{last_context['group_id']}/{last_context['nurse_id']}"
+        )
+        grouped[(target_group, last_context['job_id'])].append({
             'timestamp': ev['timestamp'],
             'message': message,
         })
