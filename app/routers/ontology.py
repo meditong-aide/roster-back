@@ -665,24 +665,54 @@ _HTML = """<!doctype html>
   <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
   <style>
     :root {
-      --bg:#0b1020; --panel:#121a33; --border:#29304a; --hover:#27345d;
-      --text:#e8ecf4; --muted:#9aa3b8; --accent:#60a5fa; --fail:#ef4444; --pass:#22c55e;
+      --bg:#0b1020; --bg2:#0d1428; --panel:#121a33; --panel2:#19234a;
+      --border:#29304a; --hover:#27345d;
+      --text:#e8ecf4; --muted:#9aa3b8; --accent:#60a5fa;
+      --fail:#ef4444; --pass:#22c55e; --warn:#fbbf24;
+      --cause:#fca5a5; --effect:#7dd3fc;
     }
     html,body { margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--text); }
-    #app { display:grid; grid-template-columns: 260px 1fr 320px; grid-template-rows: 50px 1fr; height:100vh; }
-    #topbar { grid-column:1/4; padding:10px 14px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:center; }
-    #topbar h1 { font-size:14px; margin:0 14px 0 0; }
-    #topbar .stats { color:var(--muted); font-size:12px; margin-left:auto; }
-    #sidebar { padding:12px; border-right:1px solid var(--border); overflow:auto; }
-    #sidebar h2 { font-size:11px; text-transform:uppercase; color:var(--muted); margin:12px 0 6px; letter-spacing:.05em; }
-    #sidebar h2:first-child { margin-top:0; }
+    #app { display:grid; grid-template-columns: 280px 1fr 400px; grid-template-rows: 56px 1fr; height:100vh; }
+    /* ── Topbar ───────────────────────────── */
+    #topbar { grid-column:1/4; padding:0 16px; border-bottom:1px solid var(--border); display:flex; gap:14px; align-items:center; background:var(--bg2); }
+    #topbar h1 { font-size:15px; margin:0; font-weight:600; }
+    #topbar h1 small { color:var(--muted); font-size:11px; font-weight:400; margin-left:6px; }
+    .tb-group { display:flex; gap:0; align-items:center; }
+    .tb-group .tb-label { font-size:10px; color:var(--muted); margin-right:6px; text-transform:uppercase; letter-spacing:.05em; }
+    .tb-group .btn { border-radius:0; border-right-width:0; }
+    .tb-group .btn:first-of-type { border-top-left-radius:6px; border-bottom-left-radius:6px; }
+    .tb-group .btn:last-of-type { border-radius:0 6px 6px 0; border-right-width:1px; }
+    #topbar .stats { color:var(--muted); font-size:11px; margin-left:auto; font-family:monospace; }
+    .divider { width:1px; height:24px; background:var(--border); }
+    /* ── Sidebar ──────────────────────────── */
+    #sidebar { padding:0; border-right:1px solid var(--border); overflow:auto; background:var(--bg2); }
+    #sidebar .help { background:var(--panel); border-bottom:1px solid var(--border); padding:10px 12px; color:var(--muted); font-size:11px; line-height:1.4; }
+    #sidebar .help b { color:var(--text); }
+    .sb-section { padding:10px 12px; border-bottom:1px solid var(--border); }
+    .sb-section h2 { font-size:11px; text-transform:uppercase; color:var(--muted); margin:0 0 4px; letter-spacing:.05em; display:flex; align-items:center; gap:6px; }
+    .sb-section h2 .hint-tip { color:#475569; font-size:10px; text-transform:none; font-weight:normal; letter-spacing:0; }
     #sidebar label { display:flex; align-items:center; gap:6px; font-size:12px; padding:3px 0; cursor:pointer; }
     #sidebar label:hover { color:var(--accent); }
-    #sidebar select, #sidebar input[type=text] { width:100%; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 7px; font-size:12px; }
+    #sidebar input[type=text] { width:100%; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12px; box-sizing:border-box; }
+    /* Node legend */
+    .legend-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px 8px; margin-top:4px; }
+    .legend-item { display:flex; align-items:center; gap:5px; font-size:10px; color:#cbd5e1; }
+    .legend-dot { width:10px; height:10px; border-radius:3px; border:1px solid #0b1020; flex-shrink:0; }
+    /* ── Canvas overlay ─────────────────── */
+    #canvas-wrap { position:relative; }
     #cy { width:100%; height:100%; background:var(--bg); }
-    #detail { padding:12px; border-left:1px solid var(--border); overflow:auto; font-size:12px; }
-    #detail .hint { color:var(--muted); }
-    #detail h3 { margin:0 0 6px; font-size:13px; }
+    .canvas-hint { position:absolute; left:50%; top:14px; transform:translateX(-50%); background:rgba(18,26,51,.85); border:1px solid var(--border); border-radius:8px; padding:6px 14px; font-size:11px; color:var(--muted); pointer-events:none; }
+    /* ── Detail panel ──────────────────── */
+    #detail { padding:0; border-left:1px solid var(--border); overflow:auto; font-size:12px; background:var(--bg2); }
+    .d-empty { padding:24px; color:var(--muted); font-size:13px; text-align:center; line-height:1.5; }
+    .d-empty .icon { font-size:28px; margin-bottom:6px; }
+    .d-section { padding:12px 14px; border-bottom:1px solid var(--border); }
+    .d-section.cause { background:linear-gradient(180deg, rgba(252,165,165,.06), transparent); border-left:3px solid var(--cause); }
+    .d-section.effect { background:linear-gradient(180deg, rgba(125,211,252,.06), transparent); border-left:3px solid var(--effect); }
+    .d-section.viol { background:linear-gradient(180deg, rgba(239,68,68,.07), transparent); border-left:3px solid var(--fail); }
+    .d-section.drilldown { background:linear-gradient(180deg, rgba(96,165,250,.06), transparent); border-left:3px solid var(--accent); }
+    .d-section h3 { margin:0 0 4px; font-size:13px; display:flex; align-items:center; gap:6px; }
+    .d-section .h-desc { display:block; color:var(--muted); font-size:10px; font-weight:normal; margin-top:1px; }
     #detail .badge { display:inline-block; padding:2px 7px; border-radius:999px; background:var(--panel); border:1px solid var(--border); font-size:10px; margin-right:4px; }
     #detail .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; margin:6px 0; }
     #detail .kv b { color:var(--muted); font-weight:500; }
@@ -715,41 +745,73 @@ _HTML = """<!doctype html>
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>🔬 Ontology Inspector</h1>
-    <div class="row">
-      <button class="btn" data-level="month">Month</button>
-      <button class="btn active" data-level="run">Run</button>
-      <button class="btn" data-level="rule">Rule</button>
-      <button class="btn" data-level="full">Full</button>
+    <h1>🔬 Ontology Inspector <small>제약 위반 인과 그래프</small></h1>
+    <div class="tb-group">
+      <span class="tb-label">관점</span>
+      <button class="btn" data-level="month" title="월 단위 비교">월별</button>
+      <button class="btn active" data-level="run" title="실행(run) 단위로 보기">실행별</button>
+      <button class="btn" data-level="rule" title="규칙 + 위반 체인">규칙별</button>
+      <button class="btn" data-level="full" title="모든 노드 (느림)">전체</button>
     </div>
-    <div class="row">
+    <div class="divider"></div>
+    <div class="tb-group">
+      <span class="tb-label">결과</span>
       <button class="btn" data-status="ALL">전체</button>
-      <button class="btn" data-status="FAIL">FAIL만</button>
-      <button class="btn" data-status="PASS">PASS만</button>
+      <button class="btn" data-status="FAIL">실패만</button>
+      <button class="btn" data-status="PASS">통과만</button>
     </div>
-    <button class="btn" id="btnFit">맞춤</button>
-    <button class="btn" id="btnReload">↻</button>
-    <div class="stats" id="stats">…</div>
+    <div class="divider"></div>
+    <button class="btn" id="btnFit" title="화면에 맞춤">⛶ 맞춤</button>
+    <button class="btn" id="btnReload" title="데이터 다시 불러오기">↻ 새로고침</button>
+    <div class="stats" id="stats">로딩 중…</div>
   </div>
 
   <div id="sidebar">
-    <h2>월 (Month)</h2>
-    <div id="filter-months"></div>
-    <h2>그룹 (Group)</h2>
-    <div id="filter-groups"></div>
-    <h2>전략 (Strategy)</h2>
-    <div id="filter-strategies"></div>
-    <h2>Solver 상태</h2>
-    <div id="filter-solver"></div>
-    <h2>룰 (Rule ID)</h2>
-    <input type="text" id="filter-rule-search" placeholder="rule_id 검색 (예: D_MAX)" />
-    <div id="filter-rules" style="max-height:280px; overflow:auto; margin-top:4px;"></div>
+    <div class="help">
+      <b>사용 방법</b><br>
+      ① 아래 필터로 조회 범위를 좁힙니다.<br>
+      ② 가운데 그래프에서 <b>노드를 클릭</b>합니다.<br>
+      ③ 오른쪽 패널에 <b>원인 / 영향 / 위반</b>이 색 구역으로 나타납니다.
+    </div>
+    <div class="sb-section">
+      <h2>📅 월 <span class="hint-tip">조회할 월 선택</span></h2>
+      <div id="filter-months"></div>
+    </div>
+    <div class="sb-section">
+      <h2>🏥 그룹 <span class="hint-tip">병동 그룹</span></h2>
+      <div id="filter-groups"></div>
+    </div>
+    <div class="sb-section">
+      <h2>⚙️ 전략 <span class="hint-tip">스케줄러 모드</span></h2>
+      <div id="filter-strategies"></div>
+    </div>
+    <div class="sb-section">
+      <h2>🧮 Solver 상태 <span class="hint-tip">CP-SAT/fallback 결과</span></h2>
+      <div id="filter-solver"></div>
+    </div>
+    <div class="sb-section">
+      <h2>📋 룰 ID <span class="hint-tip">예: D_MAX_OVER</span></h2>
+      <input type="text" id="filter-rule-search" placeholder="rule_id 검색" />
+      <div id="filter-rules" style="max-height:240px; overflow:auto; margin-top:4px;"></div>
+    </div>
+    <div class="sb-section">
+      <h2>🎨 노드 색 범례</h2>
+      <div class="legend-grid" id="legend"></div>
+    </div>
   </div>
 
-  <div id="cy"></div>
+  <div id="canvas-wrap" style="position:relative;">
+    <div id="cy"></div>
+    <div class="canvas-hint">노드 클릭 → 오른쪽 패널에 원인·영향 노출</div>
+  </div>
 
   <div id="detail">
-    <div class="hint">노드를 클릭하면 상세 정보가 여기에 표시됩니다.</div>
+    <div class="d-empty">
+      <div class="icon">🖱️</div>
+      <b>노드를 클릭하세요</b><br>
+      클릭한 노드의 속성·원인 노드·영향 노드·관련 위반이<br>
+      여기 색 구역으로 정리되어 표시됩니다.
+    </div>
   </div>
 </div>
 
@@ -856,19 +918,28 @@ function ensureCy() {
     elements: [],
     style: [
       { selector:'node', style: {
-        'background-color':'data(color)', 'label':'data(label)',
-        'font-size':10, 'text-wrap':'wrap', 'text-max-width':140,
-        'color':'#0b1020', 'border-width':1, 'border-color':'#0b1020',
-        'width':28, 'height':28, 'min-zoomed-font-size': 6,
+        'background-color':'data(color)',
+        'label':'data(label)',
+        'font-size':11, 'font-weight':500,
+        'text-wrap':'wrap', 'text-max-width':160,
+        'text-valign':'bottom', 'text-halign':'center', 'text-margin-y':3,
+        'color':'#e8ecf4',
+        'text-background-color':'#0b1020', 'text-background-opacity':0.85,
+        'text-background-padding':3, 'text-background-shape':'roundrectangle',
+        'text-border-color':'#29304a', 'text-border-width':1, 'text-border-opacity':0.5,
+        'border-width':2, 'border-color':'#0b1020',
+        'width':32, 'height':32,
+        'min-zoomed-font-size': 5,
       }},
       { selector:'node[isFail = 1]', style: {
-        'border-width':3, 'border-color':'#ef4444', 'width':34, 'height':34,
+        'border-width':3, 'border-color':'#ef4444', 'width':38, 'height':38,
+        'text-border-color':'#ef4444', 'text-border-opacity':0.8,
       }},
       { selector:'edge', style: {
         'curve-style':'haystack','haystack-radius':0.3,
-        'line-color':'#60709c','width':1.2, 'opacity':0.6,
+        'line-color':'#60709c','width':1.2, 'opacity':0.5,
       }},
-      { selector:'.dim', style:{ 'opacity':0.1 }},
+      { selector:'.dim', style:{ 'opacity':0.08 }},
       { selector:'.focus', style:{ 'opacity':1 }},
     ],
     textureOnViewport: true,
@@ -897,9 +968,9 @@ function computePresetPositions(nodes) {
     (layers[r] = layers[r] || []).push(n);
   }
   const W = Math.max(900, $('#cy').clientWidth - 40);
-  const SUB_ROW_H = 55;
-  const LAYER_GAP = 50;
-  const MAX_PER_ROW = 14;
+  const SUB_ROW_H = 75;  // 노드 라벨이 노드 아래에 박히기 때문에 행간 더 띄움
+  const LAYER_GAP = 80;
+  const MAX_PER_ROW = 12;
   const pos = {};
   const ranks = Object.keys(layers).map(Number).sort((a, b) => a - b);
   let yCursor = 60;
@@ -990,14 +1061,42 @@ function shortLabel(n) {
   return n.id.length > 28 ? n.id.slice(0, 25) + '…' : n.id;
 }
 
+function renderLegend() {
+  const items = [
+    'MonthNode','GroupNode','RunNode','RuleNode',
+    'MetricNode','ViolationNode',
+    'CoverageMinNode','CoverageMaxNode',
+    'TeamMinNode','GradeMinNode','GradeMaxNode',
+    'MonthlyOffNode','WeeklyOffNode','OffWindowNode',
+    'CarryoverTransitionNode','PrecepteeSyncNode',
+    'WantedSubmissionNode','WantedApplyNode',
+    'NurseNode','ConstraintNode',
+  ];
+  const box = $('#legend');
+  box.innerHTML = '';
+  for (const t of items) {
+    const item = el('div', { class:'legend-item' });
+    const dot = el('span', { class:'legend-dot' });
+    dot.style.background = PALETTE[t] || PALETTE.default;
+    item.append(dot);
+    item.append(nodeTypeKorean(t));
+    box.append(item);
+  }
+}
+
 function renderNeighborList(neighbors) {
   const box = el('div');
   for (const n of neighbors) {
     const card = el('div', { class:'neighbor-card' });
     const head = el('div', { class:'vc-head' });
-    head.append(el('span', { class:'badge' }, n.type || '?'));
+    const tb = el('span', { class:'badge' }, nodeTypeKorean(n.type));
+    tb.style.background = (PALETTE[n.type] || PALETTE.default);
+    tb.style.color = '#0b1020';
+    head.append(tb);
     for (const et of (n.edge_types || [])) {
-      head.append(el('span', { class:'pill fail' }, et));
+      const ep = el('span', { class:'pill fail' }, edgeTypeKorean(et));
+      ep.title = et;
+      head.append(ep);
     }
     card.append(head);
     card.append(el('div', { class:'vc-title' }, n.id));
@@ -1132,72 +1231,104 @@ function renderViolationCard(v) {
   return card;
 }
 
+function edgeTypeKorean(t) {
+  return ({
+    RUN_ON:'실행 기준', IN_GROUP:'그룹 소속',
+    EVALUATED_BY:'규칙 평가', FAILED_RULE:'규칙 실패',
+    OBSERVED_IN:'발견된 run', CAUSES_VIOLATION:'위반 유발',
+    CONTEXT_OF:'문맥', DAY_SHIFT:'일·시프트',
+    BLOCKED_RUN:'run 차단', RISKY_FOR:'위태로운 제약',
+  })[t] || t;
+}
+
+function nodeTypeKorean(t) {
+  const M = {
+    MonthNode:'월',  GroupNode:'그룹', RunNode:'실행', RuleNode:'규칙',
+    MetricNode:'측정값', ViolationNode:'위반',
+    CoverageMinNode:'최소 인원 제약', CoverageMaxNode:'최대 인원 제약',
+    TeamMinNode:'팀 최소 인원', TeamMaxNode:'팀 최대 인원',
+    GradeMinNode:'숙련도 최소', GradeMaxNode:'숙련도 최대',
+    MonthlyOffNode:'월간 OFF 제약', WeeklyOffNode:'주휴 제약',
+    OffWindowNode:'OFF 구간', PrecepteeSyncNode:'프리셉티 동반',
+    CarryoverTransitionNode:'전월 전이', WantedSubmissionNode:'원티드 제출',
+    WantedApplyNode:'원티드 반영', NurseNode:'간호사',
+    ShiftNode:'시프트', DayNode:'일자', TeamNode:'팀',
+    FairnessNode:'공정성', DataQualityNode:'데이터 정합성',
+    ConstraintNode:'기타 제약',
+  };
+  return M[t] || t || '?';
+}
+
 async function showNodeDetail(id) {
   const d = $('#detail');
-  d.innerHTML = '<div class="hint">loading…</div>';
+  d.innerHTML = '<div class="d-empty"><div class="icon">⏳</div>불러오는 중…</div>';
   try {
     const j = await fetchJSON('/ontology/node/' + encodeURIComponent(id));
     d.innerHTML = '';
     const n = j.node;
-    d.append(el('h3', {}, n.type));
-    d.append(el('div', { class:'badge' }, n.id));
+
+    // ── 1. 기본 정보 ──
+    const head = el('div', { class:'d-section' });
+    const titleRow = el('h3', {});
+    const typeBadge = el('span', { class:'badge' }, nodeTypeKorean(n.type));
+    typeBadge.style.background = (PALETTE[n.type] || PALETTE.default);
+    typeBadge.style.color = '#0b1020';
+    titleRow.append(typeBadge);
+    titleRow.append(el('span', {}, n.type));
+    head.append(titleRow);
+    head.append(el('div', { class:'h-desc' }, n.id));
 
     const kv = el('div', { class:'kv' });
     for (const [k, v] of Object.entries(n.attrs || {})) {
-      if (typeof v === 'object') continue;
+      if (typeof v === 'object' || k.startsWith('_')) continue;
       kv.append(el('b', {}, k));
       kv.append(el('span', {}, String(v)));
     }
-    d.append(kv);
-
-    d.append(el('h3', {}, `등장한 run (${j.incidence_count})`));
-    const ul = el('div');
-    for (const inc of j.incidences.slice(0, 50)) {
-      ul.append(el('div', { class:'badge' }, `${inc.month_key || '?'} · ${inc.strategy || ''} · ${(inc.run_id || '').slice(-10)}`));
-    }
-    d.append(ul);
-
-    if (j.metric_history && j.metric_history.length) {
-      d.append(el('h3', {}, '메트릭 추이'));
-      const tbl = el('div', { class:'kv' });
-      for (const h of j.metric_history.slice(-12)) {
-        tbl.append(el('b', {}, `${h.month_key || '?'} · ${(h.run_id || '').slice(-10)}`));
-        tbl.append(el('span', {}, String(h.value)));
+    if (n.type === 'RunNode') {
+      if (n.attrs._schedule_id) { kv.append(el('b', {}, 'schedule')); kv.append(el('span', {}, n.attrs._schedule_id)); }
+      if (n.attrs._solver_status_dist) { kv.append(el('b', {}, 'solver 결과')); kv.append(el('span', {}, JSON.stringify(n.attrs._solver_status_dist))); }
+      if (n.attrs._fallback_used !== undefined) { kv.append(el('b', {}, 'fallback')); kv.append(el('span', {}, n.attrs._fallback_used ? '⚠ 사용됨' : '미사용')); }
+      if (n.attrs._coverage_over_cells !== undefined) { kv.append(el('b', {}, 'over cells')); kv.append(el('span', {}, String(n.attrs._coverage_over_cells))); }
+      if (n.attrs._coverage_under_cells !== undefined) { kv.append(el('b', {}, 'under cells')); kv.append(el('span', {}, String(n.attrs._coverage_under_cells))); }
+    } else if (n.type === 'RuleNode') {
+      if (n.attrs._fail_count !== undefined) {
+        kv.append(el('b', {}, '실패 / 전체'));
+        kv.append(el('span', {}, `${n.attrs._fail_count} / ${n.attrs._runs_total}  (${(n.attrs._fail_ratio*100).toFixed(0)}%)`));
       }
-      d.append(tbl);
+      const meta = state.catalog[n.attrs.rule_id];
+      if (meta) {
+        if (meta.title) { kv.append(el('b', {}, '제목')); kv.append(el('span', {}, meta.title)); }
+        if (meta.what)  { kv.append(el('b', {}, '의미')); kv.append(el('span', {}, meta.what)); }
+        if (meta.why)   { kv.append(el('b', {}, '이유')); kv.append(el('span', {}, meta.why)); }
+      }
     }
+    head.append(kv);
+    head.append(el('div', { class:'h-desc' }, `📊 ${j.incidence_count}개 실행에서 등장`));
+    d.append(head);
 
+    // ── 2. 원인 (inbound) — 빨간 stripe ──
     if (j.inbound_neighbors && j.inbound_neighbors.length) {
-      d.append(el('h3', {}, `← 원인 노드 (inbound · ${j.inbound_neighbors.length})`));
-      d.append(renderNeighborList(j.inbound_neighbors));
-    }
-    if (j.outbound_neighbors && j.outbound_neighbors.length) {
-      d.append(el('h3', {}, `→ 영향 노드 (outbound · ${j.outbound_neighbors.length})`));
-      d.append(renderNeighborList(j.outbound_neighbors));
+      const sec = el('div', { class:'d-section cause' });
+      const h = el('h3', {}, '← 원인 노드');
+      h.append(el('span', { class:'badge fail' }, String(j.inbound_neighbors.length)));
+      sec.append(h);
+      sec.append(el('div', { class:'h-desc' }, '이 노드를 만든 상위 노드들 (CAUSES_VIOLATION, BLOCKED_RUN, RISKY_FOR 등). 카드 클릭 → 그 노드로 이동.'));
+      sec.append(renderNeighborList(j.inbound_neighbors));
+      d.append(sec);
     }
 
-    if (j.run_drilldown) {
-      const rd = j.run_drilldown;
-      d.append(el('h3', {}, 'Run drilldown'));
-      const at = el('div', { class:'kv' });
-      for (const a of (rd.attempts || [])) {
-        at.append(el('b', {}, `attempt ${a.run_index || '?'}`));
-        const fb = a.solver_status !== 'primary' ? ' ⚠' : '';
-        at.append(el('span', {}, `${a.solver_status}${fb} · sched=${a.schedule_id || '-'} · timing=${a.timing_ms || '?'}ms`));
-      }
-      d.append(at);
-      const dd = rd.drilldown || {};
-      const over = dd.coverage_over_cells || [];
-      const under = dd.coverage_under_cells || [];
-      if (over.length) {
-        d.append(el('h3', {}, `Over cells (${over.length})`));
-        d.append(renderCellTable(over, 'over'));
-      }
-      if (under.length) {
-        d.append(el('h3', {}, `Under cells (${under.length})`));
-        d.append(renderCellTable(under, 'shortage'));
-      }
+    // ── 3. 영향 (outbound) — 파란 stripe ──
+    if (j.outbound_neighbors && j.outbound_neighbors.length) {
+      const sec = el('div', { class:'d-section effect' });
+      const h = el('h3', {}, '→ 영향 노드');
+      h.append(el('span', { class:'badge' }, String(j.outbound_neighbors.length)));
+      sec.append(h);
+      sec.append(el('div', { class:'h-desc' }, '이 노드가 가리키는 하위 노드들 (FAILED_RULE, OBSERVED_IN, RUN_ON 등 outbound edge).'));
+      sec.append(renderNeighborList(j.outbound_neighbors));
+      d.append(sec);
     }
+
+    // ── 4. 관련 위반 — 빨간 stripe ──
     if (j.related_violations && j.related_violations.length) {
       const groups = {};
       for (const v of j.related_violations) {
@@ -1207,13 +1338,69 @@ async function showNodeDetail(id) {
       }
       const gList = Object.values(groups).sort((a, b) =>
         b.items.length - a.items.length || (a.month_key || '').localeCompare(b.month_key || ''));
-      d.append(el('h3', {}, `관련 위반 (${j.related_violations.length} / ${gList.length} 그룹)`));
-      for (const g of gList) {
-        d.append(renderGroupedViolationCard(g));
+      const sec = el('div', { class:'d-section viol' });
+      const h = el('h3', {}, '⚠️ 관련 위반');
+      h.append(el('span', { class:'badge fail' }, `${j.related_violations.length}건 / ${gList.length}그룹`));
+      sec.append(h);
+      sec.append(el('div', { class:'h-desc' }, '(rule_id, 월) 단위로 묶음. 하단 "n개 run 펼치기" 버튼으로 attempt별 보기.'));
+      for (const g of gList) sec.append(renderGroupedViolationCard(g));
+      d.append(sec);
+    }
+
+    // ── 5. 메트릭 추이 ──
+    if (j.metric_history && j.metric_history.length) {
+      const sec = el('div', { class:'d-section' });
+      sec.append(el('h3', {}, '📈 메트릭 추이'));
+      sec.append(el('div', { class:'h-desc' }, '같은 메트릭이 여러 run에서 보인 값.'));
+      const tbl = el('div', { class:'kv' });
+      for (const h of j.metric_history.slice(-12)) {
+        tbl.append(el('b', {}, `${h.month_key || '?'} · ${(h.run_id || '').slice(-10)}`));
+        tbl.append(el('span', {}, String(h.value)));
       }
+      sec.append(tbl);
+      d.append(sec);
+    }
+
+    // ── 6. Run drilldown — 파란 stripe ──
+    if (j.run_drilldown) {
+      const rd = j.run_drilldown;
+      const sec = el('div', { class:'d-section drilldown' });
+      sec.append(el('h3', {}, '🧩 Run 상세 — attempts · 셀'));
+      sec.append(el('div', { class:'h-desc' }, 'solver attempts와 over/under cell 표. fallback이 일어난 attempt는 ⚠.'));
+      const at = el('div', { class:'kv' });
+      for (const a of (rd.attempts || [])) {
+        at.append(el('b', {}, `attempt #${a.run_index || '?'}`));
+        const fb = (a.solver_status || '').includes('fallback') ? ' ⚠' : '';
+        at.append(el('span', {}, `${a.solver_status || '-'}${fb} · schedule=${a.schedule_id || '-'} · ${a.timing_ms || '?'}ms`));
+      }
+      sec.append(at);
+      const dd = rd.drilldown || {};
+      const over = dd.coverage_over_cells || [];
+      const under = dd.coverage_under_cells || [];
+      if (over.length) {
+        sec.append(el('div', { class:'h-desc', style:'margin-top:8px;' }, `Over cells (정원 초과) · ${over.length}건`));
+        sec.append(renderCellTable(over, 'over'));
+      }
+      if (under.length) {
+        sec.append(el('div', { class:'h-desc', style:'margin-top:8px;' }, `Under cells (정원 미달) · ${under.length}건`));
+        sec.append(renderCellTable(under, 'shortage'));
+      }
+      d.append(sec);
+    }
+
+    // ── 7. 등장한 run 리스트 ──
+    if (j.incidences && j.incidences.length) {
+      const sec = el('div', { class:'d-section' });
+      sec.append(el('h3', {}, `📁 등장한 실행 (${j.incidence_count})`));
+      const ul = el('div');
+      for (const inc of j.incidences.slice(0, 30)) {
+        ul.append(el('div', { class:'badge' }, `${inc.month_key || '?'} · ${inc.strategy || ''} · ${(inc.run_id || '').slice(-10)}`));
+      }
+      sec.append(ul);
+      d.append(sec);
     }
   } catch (err) {
-    d.innerHTML = `<div class="hint">error: ${err.message}</div>`;
+    d.innerHTML = `<div class="d-empty"><div class="icon">⚠️</div>오류: ${err.message}</div>`;
   }
 }
 
@@ -1224,6 +1411,7 @@ async function bootstrap() {
   renderFacet('#filter-groups', facets.facets.groups, state.groups);
   renderFacet('#filter-strategies', facets.facets.strategies, state.strategies);
   renderFacet('#filter-solver', facets.facets.solver_statuses || [], state.solverStatuses);
+  renderLegend();
 
   const r = await fetchJSON('/ontology/rules');
   state.allRules = r.rules;
