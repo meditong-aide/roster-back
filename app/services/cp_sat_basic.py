@@ -3090,6 +3090,18 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         off_idx=off,
         logger_prefix="[CP-SAT-Basic]",
     )
+
+    # nurse_monthly_limit n_max == 1 면제 set — 1N 금지 hard 제약에서 제외 대상.
+    # (월간 한도가 N=1 로 명시된 nurse 는 default 1N 금지보다 사용자 의도 우선)
+    try:
+        from services.constraints.monthly_limit_constraints import (
+            collect_single_n_allowed_nurse_indices,
+        )
+        _single_n_allowed = collect_single_n_allowed_nurse_indices(rs)
+    except Exception as _e:
+        print(f"[CP-SAT-Basic] single_n allowed set 계산 실패(무시): {_e}")
+        _single_n_allowed = set()
+
     for n,nu in enumerate(rs.nurses):
         T0,T1 = join[n], leave[n]
         # 프리셉티는 프리셉터의 일정을 그대로 따르므로 개별 하드제약 면제
@@ -3352,7 +3364,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
         if n not in n_forbid_n:
             # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
-            if bool(getattr(cfg, "not_one_night", False)):
+            # 단 nurse_monthly_limit.n_max==1 nurse 는 면제 (사용자 명시 의도 우선).
+            if bool(getattr(cfg, "not_one_night", False)) and n not in _single_n_allowed:
                 for d in range(T0, T1 + 1):
                     if d == T1:
                         continue
