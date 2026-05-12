@@ -140,15 +140,20 @@ def get_personnel_basic_info_service(current_user, db: Session):
 def get_nurses_in_group_service(
     current_user, db: Session, nurse_id: Optional[str] = None,
     skip_group_filter: bool = False,
+    override_group_id: Optional[str] = None,
 ):
     """
     그룹 내 간호사 목록 조회 서비스 함수
     특정 nurse_id가 제공되면 해당 간호사만 반환, 그렇지 않으면 그룹 내 모든 간호사 반환
     birth_date (VARCHAR)를 파싱하여 만 나이를 age로 추가
     skip_group_filter: True면 group_id 필터 스킵 (파견/병동이동 인바운드 조회용)
+    override_group_id: HN 등이 query param 으로 다른 그룹 조회 시 사용. 권한 검증은 라우터 책임.
     """
     if not current_user:
         raise Exception("Not authenticated")
+
+    # 다른 그룹 view 강제 시 override_group_id 우선, 아니면 토큰 group_id
+    effective_group_id = override_group_id or current_user.group_id
 
     query = db.query(NurseModel)
 
@@ -156,11 +161,11 @@ def get_nurses_in_group_service(
     # 정책: status='active' 인 inbound assignment 가 있는 nurse 는 미래 시작 여부와 무관하게 노출.
     #   - source 측: Nurse.group_id 매칭으로 outbound nurse 도 자연 노출 (양쪽 노출).
     #   - 실근무 일자가 아닌 셀은 솔버의 active_window/blocked_days 로 제외되므로 안전.
-    if not skip_group_filter and current_user.group_id:
+    if not skip_group_filter and effective_group_id:
         _inbound_subq = (
             db.query(NurseAssignment.nurse_id)
             .filter(
-                NurseAssignment.target_group_id == current_user.group_id,
+                NurseAssignment.target_group_id == effective_group_id,
                 NurseAssignment.status == "active",
                 NurseAssignment.reason.in_(_INBOUND_REASONS),
             )
@@ -168,7 +173,7 @@ def get_nurses_in_group_service(
         )
         query = query.filter(
             or_(
-                NurseModel.group_id == current_user.group_id,
+                NurseModel.group_id == effective_group_id,
                 NurseModel.nurse_id.in_(select(_inbound_subq.c.nurse_id)),
             )
         )
@@ -190,8 +195,8 @@ def get_nurses_in_group_service(
     if nurse_id and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
 
-    # roster_config에서 표시 설정 플래그 조회
-    display_flags = _get_display_flags(db, current_user.group_id)
+    # roster_config에서 표시 설정 플래그 조회 (override 그룹이면 그쪽 flag)
+    display_flags = _get_display_flags(db, effective_group_id)
 
     # 만 나이 계산
     current_date = date.today()
@@ -219,8 +224,8 @@ def get_nurses_in_group_service(
     inbound_blocks: Dict[str, Dict[str, Any]] = {}
     if nurses:
         _nids = [n.nurse_id for n in nurses]
-        if current_user.group_id:
-            inbound_map = _load_inbound_map(db, current_user.group_id, _nids)
+        if effective_group_id:
+            inbound_map = _load_inbound_map(db, effective_group_id, _nids)
         inbound_blocks = _build_inbound_blocks(db, _nids)
 
     # 결과 변환: NurseProfile과 호환

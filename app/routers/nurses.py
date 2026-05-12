@@ -133,7 +133,12 @@ async def get_managed_groups_summary(
     groups_map = {g.group_id: g for g in groups}
 
     home_rows = (
-        db.query(NurseModel.nurse_id, NurseModel.group_id, NurseModel.resignation_date)
+        db.query(
+            NurseModel.nurse_id,
+            NurseModel.group_id,
+            NurseModel.resignation_date,
+            NurseModel.active,
+        )
         .filter(NurseModel.group_id.in_(group_ids))
         .all()
     )
@@ -145,6 +150,7 @@ async def get_managed_groups_summary(
             NurseAssignment.target_group_id.in_(group_ids),
             NurseAssignment.status == "active",
             NurseModel.resignation_date.is_(None),
+            NurseModel.active == 1,
         )
         .all()
     )
@@ -152,13 +158,14 @@ async def get_managed_groups_summary(
     active_set: dict = {gid: set() for gid in group_ids}
     inactive_set: dict = {gid: set() for gid in group_ids}
 
-    for nid, gid, resigned in home_rows:
+    # 비활성 정의: active=0 OR resignation_date IS NOT NULL (합집합)
+    for nid, gid, resigned, is_active in home_rows:
         if gid not in active_set:
             continue
-        if resigned is None:
-            active_set[gid].add(nid)
-        else:
+        if (resigned is not None) or (not bool(is_active)):
             inactive_set[gid].add(nid)
+        else:
+            active_set[gid].add(nid)
 
     for nid, tgid in inbound_rows:
         if tgid in active_set:
@@ -284,7 +291,7 @@ async def get_nurses_in_group(
         current_user.office_id,
     )
     try:
-        # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
+        # ADM: 필터링 옵션 자유. HN: resolve_managed_group_ids 안의 그룹만 query 허용.
         if current_user.is_master_admin:
             response = get_nurses_filtered_service(
                 current_user,
@@ -294,10 +301,20 @@ async def get_nurses_in_group(
                 nurse_id=nurse_id,  # nurse_id 전달
             )
             return response
+        # HN/수간호사/일반: query group_id 있으면 권한 검증 후 override, 없으면 토큰 group_id
+        override_gid: Optional[str] = None
+        if group_id:
+            allowed = resolve_managed_group_ids(db, current_user)
+            if group_id not in allowed:
+                raise HTTPException(
+                    status_code=403, detail="해당 병동에 접근할 수 없습니다."
+                )
+            override_gid = group_id
         return get_nurses_in_group_service(
             current_user,
             db,
             nurse_id=nurse_id,  # nurse_id 전달
+            override_group_id=override_gid,
         )
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)
