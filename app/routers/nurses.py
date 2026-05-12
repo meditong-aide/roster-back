@@ -1166,6 +1166,7 @@ async def delete_nurse_assignment(
 @router.get("/{nurse_id}", response_model=NurseProfile)
 async def get_nurse_by_id(
     nurse_id: str,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -1173,11 +1174,18 @@ async def get_nurse_by_id(
 
     통합 권한 헬퍼(can_caller_access_nurse)로 ADM / self / home·managed source /
     inbound (파견·병동이동) 모두 통과시킨 뒤, 그룹 필터를 건너뛰고 직접 조회한다.
+
+    group_id (Optional):
+        사이드프로필 view 컨텍스트. 명시 시 해당 그룹의 inbound assignment 기준으로
+        target_* overlay 가 적용됨. 본인 home group 외 값이면 managed groups 검증.
     """
     try:
-        from services.group_access import can_caller_access_nurse
+        from services.group_access import can_caller_access_nurse, assert_caller_can_access_group
         if not can_caller_access_nurse(db, current_user, nurse_id):
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
+
+        if group_id and str(group_id) != str(getattr(current_user, "group_id", "")):
+            assert_caller_can_access_group(db, current_user, group_id)
 
         if current_user.is_master_admin:
             result = get_nurses_filtered_service(
@@ -1186,6 +1194,7 @@ async def get_nurse_by_id(
         else:
             result = get_nurses_in_group_service(
                 current_user, db, nurse_id=nurse_id, skip_group_filter=True,
+                override_group_id=group_id,
             )
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")

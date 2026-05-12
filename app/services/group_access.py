@@ -10,8 +10,9 @@ nurses 테이블의 실제 소속 group_id 를 우선한다 (routers/groups.py �
 my-admin-groups 패턴과 동일).
 """
 
-from typing import List, Set
+from typing import List, Optional, Set
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from db.models import Group as GroupModel
@@ -133,3 +134,44 @@ def resolve_managed_group_ids(db: Session, current_user: UserSchema) -> List[str
         return managed
 
     return [str(current_user.group_id)] if current_user.group_id else []
+
+
+def assert_caller_can_access_group(
+    db: Session,
+    current_user: UserSchema,
+    target_group_id: Optional[str],
+) -> None:
+    """호출자가 target_group_id 그룹에 접근 가능한지 검증. 외부면 403 raise.
+
+    통과 조건 (OR):
+    - ADM(is_master_admin)
+    - target_group_id 가 None / 빈 문자열 (호출 측이 caller.group_id fallback 처리)
+    - target_group_id == caller.group_id (home)
+    - target_group_id == caller.original_group_id (view 전환 중)
+    - target_group_id ∈ resolve_managed_group_ids(caller)  — HN multi-group
+
+    사용처: grade/teams/weekly-off/issued_roster 등 단일 그룹 선택형 endpoint.
+    HN multi-group 통합페이지의 managed group dropdown 선택을 지원하기 위함.
+    """
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if bool(getattr(current_user, "is_master_admin", False)):
+        return
+    if not target_group_id:
+        return
+    caller_gid = getattr(current_user, "group_id", None)
+    if caller_gid and str(target_group_id) == str(caller_gid):
+        return
+    caller_original = getattr(current_user, "original_group_id", None)
+    if caller_original and str(target_group_id) == str(caller_original):
+        return
+    managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+    if str(target_group_id) in managed:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"권한 없음: 그룹({target_group_id}) 은 본인이 관리하는 병동이 아닙니다. "
+            f"(caller={caller_gid})"
+        ),
+    )

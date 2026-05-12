@@ -14,6 +14,7 @@ from schemas.weekly_off_schema import (
     MyWeeklyOffResponse
 )
 from schemas.auth_schema import User as UserSchema
+from services.group_access import assert_caller_can_access_group
 
 # ------------------------------------------------------------------
 # 1. 공통 계산 함수 (Core Logic)
@@ -116,6 +117,7 @@ def get_weekly_off_settings_service(
     target_group_id = group_id if group_id else user.group_id
     if not target_group_id:
          raise HTTPException(status_code=400, detail="Target group_id is required")
+    assert_caller_can_access_group(db, user, target_group_id)
 
     setting = db.query(WeeklyOffSetting).filter(
         WeeklyOffSetting.group_id == target_group_id
@@ -154,7 +156,8 @@ def update_weekly_off_settings_service(
     target_group_id = group_id if group_id else current_user.group_id
     if not target_group_id:
          raise HTTPException(status_code=400, detail="Target group_id is required")
-         
+    assert_caller_can_access_group(db, current_user, target_group_id)
+
     # 오피스 ID 조회
     grp = db.query(Group).filter(Group.group_id == target_group_id).first()
     if not grp:
@@ -217,12 +220,15 @@ def get_nurses_weekly_off_service(
     간호사 주휴 설정 목록 조회 (+미리보기 계산)
     """
     target_group_id = group_id if group_id else user.group_id
-    
+    if not target_group_id:
+        raise HTTPException(status_code=400, detail="Target group_id is required")
+    assert_caller_can_access_group(db, user, target_group_id)
+
     # 설정 조회
     setting = db.query(WeeklyOffSetting).filter(
         WeeklyOffSetting.group_id == target_group_id
     ).first()
-    
+
     cycle_type = setting.cycle_type if setting else 'month'
     
     # 간호사 목록 조회 (Team 조인)
@@ -303,7 +309,10 @@ def update_nurses_weekly_off_service(
     중요: 저장 시점의 연/월을 '기준 시점(base_year/base_month)'으로 업데이트함.
     """
     target_group_id = group_id if group_id else current_user.group_id
-    
+    if not target_group_id:
+        raise HTTPException(status_code=400, detail="Target group_id is required")
+    assert_caller_can_access_group(db, current_user, target_group_id)
+
     # 설정 조회 및 base update
     setting = db.query(WeeklyOffSetting).filter(
         WeeklyOffSetting.group_id == target_group_id

@@ -405,13 +405,20 @@ async def get_issued_schedules(
     try:
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
+        # ADM: query 그대로. HN multi-group: managed 안이면 query 그대로, 외엔 403.
+        # 일반 수간호사/간호사: 본인 home group 강제.
         if current_user.is_master_admin:
             target_group_id = group_id
         else:
-            target_group_id = current_user.group_id
+            target_group_id = group_id or current_user.group_id
+            if target_group_id and str(target_group_id) != str(current_user.group_id):
+                from services.group_access import assert_caller_can_access_group
+                assert_caller_can_access_group(db, current_user, target_group_id)
         return get_issued_schedules_service(
             current_user, db, target_group_id=target_group_id
         )
+    except HTTPException:
+        raise
     except Exception as e:
         print("[/issued] error", e)
         raise HTTPException(
@@ -437,54 +444,61 @@ async def get_issued_roster_snapshot(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     try:
-        # 대상 그룹 결정
+        # 대상 그룹 결정.
+        # 우선순위: ADM(query 그대로) → HN multi-group managed → 본인 파견 inbound → 본인 home group.
         if current_user.is_master_admin:
             target_group_id = group_id
         else:
             target_group_id = current_user.group_id
-            # 본인 파견/병동이동 target_group_id 도 허용 (병동 전환 Select 용).
-            # 조회월(±6일 N_tail 버퍼) 과 파견 기간 overlap 체크:
-            # - 5/1~5/8 파견 → 4월(prev context) + 5월 허용
-            # - 5/1~5/31 파견 → 5월 + 6월(tail context) 허용
-            # - 조회월에 전혀 무관한 파견은 403
             if group_id and group_id != target_group_id:
-                _my_nid = getattr(current_user, "nurse_id", None)
-                _my_dispatch = None
-                if _my_nid:
-                    from datetime import date as _date, timedelta as _td
-                    from calendar import monthrange as _mr
-                    from sqlalchemy import or_ as _or_, case as _case
-                    _lookback = 6
-                    _m_start = _date(year, month, 1)
-                    _m_end = _date(year, month, _mr(year, month)[1])
-                    _view_start = _m_start - _td(days=_lookback)
-                    _view_end = _m_end + _td(days=_lookback)
-                    _eff_end = _case(
-                        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
-                        else_=NurseAssignment.expected_end_date,
-                    )
-                    _my_dispatch = (
-                        db.query(NurseAssignment)
-                        .filter(
-                            NurseAssignment.nurse_id == _my_nid,
-                            NurseAssignment.target_group_id == group_id,
-                            NurseAssignment.reason.in_(["파견", "병동이동"]),
-                            NurseAssignment.status == "active",
-                            NurseAssignment.start_date <= _view_end,
-                            _or_(
-                                _eff_end.is_(None),
-                                _eff_end >= _view_start,
-                            ),
-                        )
-                        .first()
-                    )
-                if _my_dispatch:
+                # HN multi-group 통합페이지: managed groups 안이면 통과.
+                from services.group_access import resolve_managed_group_ids
+                _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+                if str(group_id) in _managed:
                     target_group_id = group_id
                 else:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="해당 그룹 근무표 조회 권한이 없습니다.",
-                    )
+                    # 본인 파견/병동이동 target_group_id 도 허용 (병동 전환 Select 용).
+                    # 조회월(±6일 N_tail 버퍼) 과 파견 기간 overlap 체크:
+                    # - 5/1~5/8 파견 → 4월(prev context) + 5월 허용
+                    # - 5/1~5/31 파견 → 5월 + 6월(tail context) 허용
+                    # - 조회월에 전혀 무관한 파견은 403
+                    _my_nid = getattr(current_user, "nurse_id", None)
+                    _my_dispatch = None
+                    if _my_nid:
+                        from datetime import date as _date, timedelta as _td
+                        from calendar import monthrange as _mr
+                        from sqlalchemy import or_ as _or_, case as _case
+                        _lookback = 6
+                        _m_start = _date(year, month, 1)
+                        _m_end = _date(year, month, _mr(year, month)[1])
+                        _view_start = _m_start - _td(days=_lookback)
+                        _view_end = _m_end + _td(days=_lookback)
+                        _eff_end = _case(
+                            (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+                            else_=NurseAssignment.expected_end_date,
+                        )
+                        _my_dispatch = (
+                            db.query(NurseAssignment)
+                            .filter(
+                                NurseAssignment.nurse_id == _my_nid,
+                                NurseAssignment.target_group_id == group_id,
+                                NurseAssignment.reason.in_(["파견", "병동이동"]),
+                                NurseAssignment.status == "active",
+                                NurseAssignment.start_date <= _view_end,
+                                _or_(
+                                    _eff_end.is_(None),
+                                    _eff_end >= _view_start,
+                                ),
+                            )
+                            .first()
+                        )
+                    if _my_dispatch:
+                        target_group_id = group_id
+                    else:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                        )
 
         snapshot = get_issued_roster_snapshot_service(
             year=year,
