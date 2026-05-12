@@ -1180,6 +1180,9 @@ def update_nurse_profile_service(
                 _caller_view_group = _inbound_match.target_group_id  # target view 자동
     # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
     if is_admin:
+        _validate_team_grade_change_or_raise(
+            db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
+        )
         _apply_source_nurse_update(nurse, fields)
         db.commit()
         db.refresh(nurse)
@@ -1191,10 +1194,18 @@ def update_nurse_profile_service(
                 status_code=403, detail="해당 간호사를 수정할 권한이 없습니다."
             )
         if mode == "target" and assign_row is not None:
+            _validate_team_grade_change_or_raise(
+                db, nurse, fields, scope="target",
+                group_id=assign_row.target_group_id,
+                assign_row=assign_row,
+            )
             _apply_target_update(assign_row, fields)
             db.commit()
             db.refresh(assign_row)
         else:
+            _validate_team_grade_change_or_raise(
+                db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
+            )
             _apply_source_nurse_update(nurse, fields)
             # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
             # 프론트가 view_group_id 안 보내도 source view 호출 한 번으로 inbound 모두 동기화.
@@ -1270,6 +1281,58 @@ def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> Non
     for key, value in fields.items():
         if hasattr(nurse, key):
             setattr(nurse, key, value)
+
+
+def _validate_team_grade_change_or_raise(
+    db: Session,
+    nurse: NurseModel,
+    fields: Dict[str, Any],
+    *,
+    scope: str,  # 'source' | 'target'
+    group_id: str,
+    assign_row: Optional[NurseAssignment] = None,
+) -> None:
+    """fields 에 team_id/grade 변경 포함 시 인원 정합성 검증. 위반 시 422 raise.
+
+    scope='source': nurses.* 직접 수정 (변경 전 값 = nurse.team_id / nurse.grade)
+    scope='target': nurse_assignment.target_* 수정 (변경 전 값 = assign_row.target_team_id / .target_grade)
+    """
+    has_team = "team_id" in fields
+    has_grade = "grade" in fields
+    if not has_team and not has_grade:
+        return
+    if scope == "source":
+        old_team = nurse.team_id
+        old_grade = nurse.grade
+    else:
+        if assign_row is None:
+            return
+        old_team = assign_row.target_team_id
+        old_grade = assign_row.target_grade
+    new_team = fields["team_id"] if has_team else old_team
+    new_grade = fields["grade"] if has_grade else old_grade
+
+    from services.precheck.nurse_change_validators import validate_nurse_change
+
+    result = validate_nurse_change(
+        db,
+        group_id=group_id,
+        swap_nurse_id=str(nurse.nurse_id),
+        old_team_id=old_team,
+        new_team_id=new_team,
+        old_grade=old_grade,
+        new_grade=new_grade,
+        scope=scope,
+    )
+    if not result.get("saveable", True):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "TEAM_GRADE_VALIDATION_FAILED",
+                "message": "팀/Grade 변경이 인원 정합성을 충족하지 못합니다.",
+                "issues": result.get("issues", []),
+            },
+        )
 
 
 _ASSIGNMENT_CREATE_FIELDS: Tuple[str, ...] = (
