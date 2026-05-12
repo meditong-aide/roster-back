@@ -1354,11 +1354,22 @@ def optimize_fallback_lex_hard_first(
                 #     m.Add(xd_prev + xn <= 1)
 
         # 1N 금지 (day0 N 고정인 경우 해당일만 스킵)
+        # nurse_monthly_limit.n_max==1 nurse 는 사용자 명시 의도 우선으로 면제.
         not_one_night_val = getattr(cfg, "not_one_night", False)
         print(f"{logger_prefix} [1N금지] not_one_night={not_one_night_val!r} (type={type(not_one_night_val).__name__})")
+        try:
+            from services.constraints.monthly_limit_constraints import (
+                collect_single_n_allowed_nurse_indices,
+            )
+            _single_n_allowed_lex = collect_single_n_allowed_nurse_indices(roster_system)
+        except Exception as _e_sn:
+            print(f"{logger_prefix} [1N금지] single_n allowed set 계산 실패(무시): {_e_sn}")
+            _single_n_allowed_lex = set()
         if bool(not_one_night_val):
             for n in range(N):
                 if _is_preceptee_at(n):
+                    continue
+                if n in _single_n_allowed_lex:
                     continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
