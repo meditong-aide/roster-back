@@ -443,40 +443,21 @@ def get_my_weekly_off_service(
     target_nurse_id: Optional[str] = None  # nurse_id가 str이므로 str로 변경
 ) -> MyWeeklyOffResponse:
 
-    # 권한 플래그
-    is_head_nurse = user.is_head_nurse
     is_master_admin = user.is_master_admin
 
     # 조회 대상 nurse 결정
     if target_nurse_id is not None:
-        # 다른 간호사 조회 시도 → 수간호사 또는 최고 관리자만 허용
-        if not (is_head_nurse or is_master_admin):
+        # 통합 권한 헬퍼: ADM / self / home·managed source / inbound 모두 처리
+        from services.group_access import can_caller_access_nurse
+        if not can_caller_access_nurse(db, user, target_nurse_id):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only head nurse or master admin can view other nurses' weekly off"
+                detail="해당 간호사를 조회할 권한이 없습니다.",
             )
 
-        # 대상 간호사 조회 (nurse_id는 str)
         nurse = db.query(Nurse).filter(Nurse.nurse_id == target_nurse_id).first()
         if not nurse:
             raise HTTPException(status_code=404, detail="Target nurse not found")
-
-        # 수간호사인 경우, 같은 그룹인지 확인 (최고 관리자는 그룹 제한 없음)
-        # 파견/병동이동 인바운드 간호사는 다른 그룹이어도 허용
-        if is_head_nurse and not is_master_admin:
-            if nurse.group_id != user.group_id:
-                from db.models import NurseAssignment
-                has_inbound = db.query(NurseAssignment).filter(
-                    NurseAssignment.nurse_id == target_nurse_id,
-                    NurseAssignment.target_group_id == user.group_id,
-                    NurseAssignment.reason.in_(["파견", "병동이동"]),
-                    NurseAssignment.status == "active",
-                ).first()
-                if not has_inbound:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Head nurse can only view nurses in the same group"
-                    )
 
     else:
         # 본인 조회
