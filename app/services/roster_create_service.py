@@ -3153,6 +3153,103 @@ def _normalize_assigned_code_for_validation(
     return code
 
 
+def _extract_unrecoverable_violated_constraints(
+    roster_system,
+    generated: dict[str, list[str]] | None,
+    validation_error: str | None,
+) -> list[dict]:
+    """Unrecoverable infeasibility 케이스에서 인과 제약 리스트를 추출한다.
+
+    출처:
+      1. validation_error 문자열의 reason_code 패턴 (예: `[reason_code=NO_ASSIGNMENT]`)
+      2. _build_infeasible_diagnosis(roster_system, generated)의 reason_code
+      3. _probe_first_grade_hard_blocker(roster_system) — grade-hard 충돌
+      4. roster_system.blocked_by_nurse — 해당 nurse가 전부 차단된 케이스
+
+    반환 항목 형식:
+        {"node_id", "slack", "details", "reason_code", "human_message_ko"}
+
+    node_id prefix 컨벤션은 ontology dashboard의 _ctype_from_id가
+    typed ConstraintNode로 매핑한다.
+    """
+    import re
+
+    out: list[dict] = []
+    seen_codes: set[str] = set()
+    err = str(validation_error or "")
+
+    REASON_TO_NODE = {
+        "CAPACITY_TOTAL_SHORTAGE": ("infeasibility:capacity_total", "ConstraintNode"),
+        "N_CAPACITY_SHORTAGE":     ("infeasibility:n_capacity", "ConstraintNode"),
+        "NO_ASSIGNMENT":           ("infeasibility:no_assignment", "ConstraintNode"),
+        "MAX_CAP_SHORTAGE":        ("infeasibility:max_cap_shortage", "ConstraintNode"),
+        "GRADE_MAX_SUM_BELOW_NEED":("grade_max:sum_below_need", "GradeMaxNode"),
+        "GRADE_HARD_PROBE":        ("grade_max:hard_probe", "GradeMaxNode"),
+    }
+
+    def _push(reason_code: str, human_msg: str | None, slack=None, details=None):
+        if not reason_code or reason_code in seen_codes:
+            return
+        seen_codes.add(reason_code)
+        node_id, _ = REASON_TO_NODE.get(reason_code, (f"infeasibility:{reason_code.lower()}", "ConstraintNode"))
+        out.append({
+            "node_id": node_id,
+            "reason_code": reason_code,
+            "slack": slack,
+            "details": details or {},
+            "human_message_ko": (human_msg or "")[:400] if human_msg else None,
+        })
+
+    for m in re.finditer(r"\[reason_code=([A-Z_]+)\]", err):
+        _push(m.group(1), err, details={"source": "validation_error"})
+
+    try:
+        diag = _build_infeasible_diagnosis(roster_system, generated)
+        if diag:
+            m = re.search(r"\[reason_code=([A-Z_]+)\]", diag)
+            if m:
+                _push(m.group(1), diag, details={"source": "diagnosis"})
+    except Exception:
+        pass
+
+    try:
+        probe = _probe_first_grade_hard_blocker(roster_system)
+        if probe:
+            _push("GRADE_HARD_PROBE", probe, details={"source": "grade_hard_probe"})
+    except Exception:
+        pass
+
+    try:
+        blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        for idx, blocked_days in blocked_by_nurse.items():
+            try:
+                if not blocked_days:
+                    continue
+                if idx < len(nurses):
+                    nurse_id = str(getattr(nurses[idx], "nurse_id", idx))
+                else:
+                    nurse_id = str(idx)
+                node_id = f"nurse:{nurse_id}"
+                if node_id in {x.get("node_id") for x in out}:
+                    continue
+                out.append({
+                    "node_id": node_id,
+                    "reason_code": "NURSE_BLOCKED_DAYS",
+                    "slack": -len(blocked_days),
+                    "details": {"blocked_day_count": len(blocked_days), "source": "blocked_by_nurse"},
+                    "human_message_ko": f"간호사 {nurse_id}가 {len(blocked_days)}일 차단됨",
+                })
+                if len(out) >= 50:
+                    return out
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return out[:50]
+
+
 def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] | None) -> str | None:
     try:
         cfg = getattr(roster_system, "config", None)
@@ -5405,10 +5502,24 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         try:
             from services.precheck import build_unrecoverable_payload
             from fastapi import HTTPException
+            try:
+                _violated = _extract_unrecoverable_violated_constraints(
+                    roster_system, generated, validation_error
+                )
+            except Exception:
+                _violated = []
+            try:
+                from services.precheck.conflict_detector import run_conflict_detectors
+                _conflict_cores = run_conflict_detectors(roster_system)
+            except Exception as _cc_exc:
+                print(f"[ConflictDetector] failed (ignore): {_cc_exc}")
+                _conflict_cores = []
             unrecoverable = build_unrecoverable_payload(
                 precheck_result=precheck_result,
                 applied_relaxations=applied_relaxations,
                 last_error_reason=str(validation_error),
+                violated_constraints=_violated,
+                conflict_cores=_conflict_cores,
             )
             inf = unrecoverable.get("infeasibility", {})
             print(

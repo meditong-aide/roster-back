@@ -270,8 +270,10 @@ def merged_graph(
     strategies: str = Query("", description="CSV of strategies"),
     rules: str = Query("", description="CSV of rule_ids"),
     status: str = Query("ALL", description="ALL|FAIL|PASS"),
-    level: str = Query("full", description="full|rule|run|month"),
+    level: str = Query("full", description="full|rule|run|month (legacy preset)"),
+    layers: str = Query("", description="CSV of layers to show: month,group,run,rule,violation,metric,cause"),
     solver_statuses: str = Query("", description="CSV of solver_status (primary, fallback, ...)"),
+    severities: str = Query("", description="CSV of severities: blocking,warning"),
 ) -> JSONResponse:
     runs = _scan_runs()
     mset = {s for s in months.split(",") if s}
@@ -282,6 +284,7 @@ def merged_graph(
 
     selected = [r for r in runs if _run_matches(r, mset, gset, sset, solset)]
     run_summary_cache = {(r["data"].get("run") or {}).get("run_id"): _run_summary(r) for r in selected}
+    sev_set = {s.strip().lower() for s in (severities or "").split(",") if s.strip()}
 
     nodes: dict[str, dict[str, Any]] = {}
     edges: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -428,18 +431,63 @@ def merged_graph(
             if not (n["type"] == "RuleNode" and n["attrs"].get("rule_id") in fail_rule_ids)
         }
 
-    # Level reduction — collapse to higher zoom.
-    level = (level or "full").lower()
-    if level == "month":
-        keep_types = {"MonthNode", "GroupNode", "RuleNode"}
+    # Layer filter — explicit list of layers wins; otherwise fall back to legacy `level`.
+    LAYER_TO_TYPES = {
+        "month": {"MonthNode"},
+        "group": {"GroupNode"},
+        "run": {"RunNode"},
+        "rule": {"RuleNode"},
+        "violation": {"ViolationNode"},
+        "metric": {"MetricNode"},
+        "cause": {
+            "CoverageMinNode", "CoverageMaxNode",
+            "TeamMinNode", "TeamMaxNode",
+            "GradeMinNode", "GradeMaxNode",
+            "MonthlyOffNode", "WeeklyOffNode", "OffWindowNode",
+            "CarryoverTransitionNode", "PrecepteeSyncNode",
+            "WantedSubmissionNode", "WantedApplyNode",
+            "NurseNode", "ShiftNode", "DayNode", "TeamNode",
+            "FairnessNode", "DataQualityNode", "ConstraintNode",
+            "ConflictCoreNode", "NurseRoleNode", "OffCapNode",
+            "NightCapNode", "MonthlyNExactNode",
+        },
+    }
+    layer_set = {s.strip() for s in (layers or "").split(",") if s.strip()}
+    if layer_set:
+        keep_types: set[str] = set()
+        for lyr in layer_set:
+            keep_types |= LAYER_TO_TYPES.get(lyr, set())
         nodes = {nid: n for nid, n in nodes.items() if n["type"] in keep_types}
-    elif level == "run":
-        keep_types = {"MonthNode", "GroupNode", "RunNode", "RuleNode"}
-        nodes = {nid: n for nid, n in nodes.items() if n["type"] in keep_types}
-    elif level == "rule":
-        keep_types = {"MonthNode", "GroupNode", "RunNode", "RuleNode", "ViolationNode"}
-        nodes = {nid: n for nid, n in nodes.items() if n["type"] in keep_types}
-    # else "full" → no collapse
+    else:
+        # legacy preset
+        level = (level or "full").lower()
+        if level == "month":
+            keep_types = {"MonthNode", "GroupNode", "RuleNode"}
+            nodes = {nid: n for nid, n in nodes.items() if n["type"] in keep_types}
+        elif level == "run":
+            keep_types = {"MonthNode", "GroupNode", "RunNode", "RuleNode"}
+            nodes = {nid: n for nid, n in nodes.items() if n["type"] in keep_types}
+        elif level == "rule":
+            keep_types = {"MonthNode", "GroupNode", "RunNode", "RuleNode", "ViolationNode"}
+            nodes = {nid: n for nid, n in nodes.items() if n["type"] in keep_types}
+        # else "full" → no collapse
+
+    # Severity filter — restrict rules/violations to selected severity buckets.
+    if sev_set:
+        rule_severity = {rid: str(s.get("severity") or "").lower() for rid, s in rule_stats.items()}
+        nodes = {
+            nid: n for nid, n in nodes.items()
+            if n["type"] not in {"RuleNode", "ViolationNode"}
+            or str(
+                n["attrs"].get("severity")
+                or rule_severity.get(n["attrs"].get("rule_id"), "")
+                or ""
+            ).lower() in sev_set
+        }
+        violations = [
+            v for v in violations
+            if rule_severity.get(v.get("rule_id"), "") in sev_set
+        ]
 
     # Enrich RuleNode with aggregated stats.
     for n in nodes.values():
@@ -725,6 +773,10 @@ _HTML = """<!doctype html>
     .pill.pass { background:rgba(34,197,94,.15); color:#86efac; border:1px solid rgba(34,197,94,.4); }
     .pill.fail { background:rgba(239,68,68,.15); color:#fca5a5; border:1px solid rgba(239,68,68,.4); }
     .violation-card { background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--fail); border-radius:6px; padding:8px 10px; margin:8px 0; }
+    .violation-card.warn { border-left-color:var(--warn); }
+    .sev-dot { width:8px; height:8px; border-radius:2px; display:inline-block; flex-shrink:0; }
+    .sev-dot.blocking { background:var(--fail); }
+    .sev-dot.warning  { background:var(--warn); }
     .violation-card .vc-head { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
     .violation-card .vc-title { font-size:13px; font-weight:600; margin:4px 0 2px; }
     .violation-card .vc-what  { color:#cbd5e1; font-size:12px; }
@@ -746,12 +798,15 @@ _HTML = """<!doctype html>
 <div id="app">
   <div id="topbar">
     <h1>🔬 Ontology Inspector <small>제약 위반 인과 그래프</small></h1>
-    <div class="tb-group">
-      <span class="tb-label">관점</span>
-      <button class="btn" data-level="month" title="월 단위 비교">월별</button>
-      <button class="btn active" data-level="run" title="실행(run) 단위로 보기">실행별</button>
-      <button class="btn" data-level="rule" title="규칙 + 위반 체인">규칙별</button>
-      <button class="btn" data-level="full" title="모든 노드 (느림)">전체</button>
+    <div class="tb-group" id="layer-toggles">
+      <span class="tb-label">레이어</span>
+      <button class="btn active" data-layer="month"     title="월 노드">월</button>
+      <button class="btn active" data-layer="group"     title="그룹 노드">그룹</button>
+      <button class="btn active" data-layer="run"       title="실행 노드 — 월별 안에서 실행 목록을 함께 보기">실행</button>
+      <button class="btn active" data-layer="rule"      title="규칙 노드">규칙</button>
+      <button class="btn"        data-layer="violation" title="위반 노드 — 특정 run에서 발생한 위반을 그래프상에 표시">위반</button>
+      <button class="btn"        data-layer="metric"    title="측정값 노드 (느림)">측정값</button>
+      <button class="btn"        data-layer="cause"     title="환경/제약 원인 노드 (CoverageMin/TeamMin/OffWindow/Nurse 등)">원인</button>
     </div>
     <div class="divider"></div>
     <div class="tb-group">
@@ -759,6 +814,19 @@ _HTML = """<!doctype html>
       <button class="btn" data-status="ALL">전체</button>
       <button class="btn" data-status="FAIL">실패만</button>
       <button class="btn" data-status="PASS">통과만</button>
+    </div>
+    <div class="divider"></div>
+    <div class="tb-group" id="severity-toggles">
+      <span class="tb-label">심각도</span>
+      <button class="btn active" data-severity="blocking" title="hard 위반 — 반드시 막아야 함">🔴 블로킹</button>
+      <button class="btn active" data-severity="warning"  title="soft 위반 — 경고">🟡 경고</button>
+    </div>
+    <div class="divider"></div>
+    <div class="tb-group" id="outcome-toggles">
+      <span class="tb-label">Solver</span>
+      <button class="btn" data-outcome="success"  title="CP-SAT primary 통과만">🟢 CP-SAT</button>
+      <button class="btn" data-outcome="fallback" title="CP-SAT 실패→fallback이 해를 찾음">🟡 Fallback</button>
+      <button class="btn" data-outcome="failed"   title="CP-SAT/fallback 모두 실패 또는 primary-unsat">🔴 실패</button>
     </div>
     <div class="divider"></div>
     <button class="btn" id="btnFit" title="화면에 맞춤">⛶ 맞춤</button>
@@ -823,13 +891,21 @@ const PALETTE = {
   CoverageMinNode:'#fde68a', TeamMinNode:'#fdba74', GradeMinNode:'#fcd34d',
   GradeMaxNode:'#fbbf24', OffWindowNode:'#86efac', PrecepteeSyncNode:'#d8b4fe',
   WantedSubmissionNode:'#60a5fa', WantedApplyNode:'#34d399',
+  // Conflict core + member types
+  ConflictCoreNode:'#e879f9',   // 자주색 — 다중 충돌 코어
+  NurseRoleNode:'#fb923c',
+  OffCapNode:'#fcd34d',
+  NightCapNode:'#a78bfa',
+  MonthlyNExactNode:'#fb7185',
   ConstraintNode:'#9ca3af', default:'#d1d5db',
 };
 
 const state = {
   months:new Set(), groups:new Set(), strategies:new Set(), rules:new Set(),
   solverStatuses:new Set(),
-  status:'ALL', level:'run',
+  layers:new Set(['month','group','run','rule']),  // default
+  severities:new Set(['blocking','warning']),       // default both
+  status:'ALL',
   cy:null, facets:null, allRules:[], reloadPending:false, catalog:{},
 };
 
@@ -840,9 +916,11 @@ const GROUP_LABEL = {
 
 const TYPE_RANK = {
   GroupNode:0, MonthNode:1, RunNode:2, RuleNode:3,
-  MetricNode:4, ViolationNode:5, CarryoverTransitionNode:5,
-  CoverageMinNode:5, TeamMinNode:5, GradeMinNode:5, GradeMaxNode:5,
-  OffWindowNode:5, PrecepteeSyncNode:5,
+  ConflictCoreNode:4,  // 충돌 코어는 violation 위, member 아래
+  MetricNode:5, ViolationNode:5, CarryoverTransitionNode:5,
+  CoverageMinNode:6, TeamMinNode:6, GradeMinNode:6, GradeMaxNode:6,
+  OffWindowNode:6, PrecepteeSyncNode:6,
+  NurseRoleNode:6, OffCapNode:6, NightCapNode:6, MonthlyNExactNode:6,
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -868,6 +946,7 @@ function renderFacet(containerId, facetEntries, stateSet) {
   c.innerHTML = '';
   for (const [key, count] of facetEntries) {
     const cb = el('input', { type:'checkbox' });
+    cb.checked = stateSet.has(key);
     cb.addEventListener('change', () => {
       if (cb.checked) stateSet.add(key); else stateSet.delete(key);
       reloadGraph();
@@ -889,9 +968,13 @@ function renderRulesList(filter='') {
       reloadGraph();
     });
     const label = el('label', {}, cb);
+    const sevDot = el('span', { class:'sev-dot ' + (r.severity || '') });
+    sevDot.title = r.severity === 'blocking' ? '블로킹 (hard)' : '경고 (soft)';
+    label.append(sevDot);
     label.append(r.rule_id);
     if (r.fail > 0) {
-      label.append(el('span', { class:'pill fail' }, `${r.fail}/${r.total}`));
+      const pillCls = r.severity === 'blocking' ? 'pill fail' : 'pill warn';
+      label.append(el('span', { class:pillCls }, `${r.fail}/${r.total}`));
     } else {
       label.append(el('span', { class:'pill pass' }, 'OK'));
     }
@@ -907,7 +990,8 @@ function buildQuery() {
   if (state.solverStatuses.size) p.set('solver_statuses', [...state.solverStatuses].join(','));
   if (state.rules.size) p.set('rules', [...state.rules].join(','));
   p.set('status', state.status);
-  p.set('level', state.level);
+  if (state.layers.size) p.set('layers', [...state.layers].join(','));
+  if (state.severities.size && state.severities.size < 2) p.set('severities', [...state.severities].join(','));
   return p.toString();
 }
 
@@ -931,16 +1015,50 @@ function ensureCy() {
         'width':32, 'height':32,
         'min-zoomed-font-size': 5,
       }},
-      { selector:'node[isFail = 1]', style: {
-        'border-width':3, 'border-color':'#ef4444', 'width':38, 'height':38,
-        'text-border-color':'#ef4444', 'text-border-opacity':0.8,
+      { selector:'node[isFail = 1][severity = "blocking"]', style: {
+        'border-width':4, 'border-color':'#ef4444', 'width':40, 'height':40,
+        'text-border-color':'#ef4444', 'text-border-opacity':0.9,
+        'shape':'octagon',
+      }},
+      { selector:'node[isFail = 1][severity = "warning"]', style: {
+        'border-width':3, 'border-color':'#fbbf24', 'width':36, 'height':36,
+        'text-border-color':'#fbbf24', 'text-border-opacity':0.8,
+        'shape':'diamond',
+      }},
+      { selector:'node[isFail = 1][severity = ""]', style: {
+        'border-width':3, 'border-color':'#ef4444', 'width':36, 'height':36,
+      }},
+      // RunNode visual differentiation by solver outcome
+      { selector:'node[type = "RunNode"][runOutcome = "success"]', style: {
+        'border-width':3, 'border-color':'#22c55e',
+        'shape':'ellipse',
+      }},
+      { selector:'node[type = "RunNode"][runOutcome = "fallback"]', style: {
+        'border-width':3, 'border-color':'#fbbf24',
+        'shape':'round-hexagon',
+      }},
+      { selector:'node[type = "RunNode"][runOutcome = "failed"]', style: {
+        'border-width':4, 'border-color':'#ef4444',
+        'shape':'octagon', 'width':40, 'height':40,
       }},
       { selector:'edge', style: {
         'curve-style':'haystack','haystack-radius':0.3,
         'line-color':'#60709c','width':1.2, 'opacity':0.5,
       }},
       { selector:'.dim', style:{ 'opacity':0.08 }},
-      { selector:'.focus', style:{ 'opacity':1 }},
+      { selector:'node.focus', style:{
+        'opacity':1,
+        'border-width':4, 'border-color':'#facc15', 'border-opacity':1,
+        'text-border-color':'#facc15', 'text-border-opacity':1, 'text-border-width':2,
+        'z-index':99,
+      }},
+      { selector:'edge.focus', style:{
+        'opacity':1,
+        'line-color':'#facc15', 'width':3.5,
+        'curve-style':'bezier', 'target-arrow-shape':'triangle',
+        'target-arrow-color':'#facc15', 'arrow-scale':1.2,
+        'z-index':99,
+      }},
     ],
     textureOnViewport: true,
     hideEdgesOnViewport: true,
@@ -949,8 +1067,9 @@ function ensureCy() {
   });
   state.cy.on('tap', 'node', (evt) => {
     const id = evt.target.data('id');
+    const nb = evt.target.closedNeighborhood();
     state.cy.elements().addClass('dim').removeClass('focus');
-    evt.target.closedNeighborhood().addClass('focus').removeClass('dim');
+    nb.addClass('focus').removeClass('dim');
     showNodeDetail(id);
   });
   state.cy.on('tap', (evt) => {
@@ -1011,12 +1130,22 @@ async function reloadGraph() {
     for (const n of g.nodes) {
       const isFail = (n.type === 'RuleNode' && failRuleIds.has(n.attrs?.rule_id))
                   || (n.type === 'ViolationNode');
+      // RunNode → 'success' (all primary) | 'fallback' (CP-SAT 실패→fallback success) | 'failed' (infeasible/unsat)
+      let runOutcome = '';
+      if (n.type === 'RunNode') {
+        const dist = n.attrs?._solver_status_dist || {};
+        if (dist['cpsat-infeasible'] || dist['fallback-infeasible'] || dist['primary-unsat'] || dist['http-error']) runOutcome = 'failed';
+        else if (dist['fallback-optimal'] || dist['fallback']) runOutcome = 'fallback';
+        else if (dist['primary']) runOutcome = 'success';
+      }
       elements.push({
         group: 'nodes',
         data: {
           id: n.id, label: shortLabel(n), type: n.type,
           color: PALETTE[n.type] || PALETTE.default,
           isFail: isFail ? 1 : 0,
+          severity: String(n.attrs?.severity || ''),
+          runOutcome,
         },
         position: positions[n.id],
       });
@@ -1052,8 +1181,12 @@ function shortLabel(n) {
   if (n.type === 'RunNode') {
     const s = n.attrs?.strategy || '';
     const sched = n.attrs?._schedule_id || (n.attrs?.run_id || '').slice(-8);
-    const fb = n.attrs?._fallback_used ? ' ⚠fb' : '';
-    return `${s} · ${sched}${fb}`;
+    const dist = n.attrs?._solver_status_dist || {};
+    let icon = '';
+    if (dist['cpsat-infeasible'] || dist['fallback-infeasible'] || dist['primary-unsat'] || dist['http-error']) icon = '🔴 ';
+    else if (dist['fallback-optimal'] || dist['fallback']) icon = '🟡 ';
+    else if (dist['primary']) icon = '🟢 ';
+    return `${icon}${s} · ${sched}`;
   }
   if (n.type === 'GroupNode') return `grp:${(n.attrs?.group_id || '').slice(0, 12)}`;
   if (n.type === 'MetricNode') return `${n.attrs?.metric || ''}=${n.attrs?.value}`;
@@ -1065,6 +1198,8 @@ function renderLegend() {
   const items = [
     'MonthNode','GroupNode','RunNode','RuleNode',
     'MetricNode','ViolationNode',
+    'ConflictCoreNode',
+    'NurseRoleNode','OffCapNode','NightCapNode','MonthlyNExactNode',
     'CoverageMinNode','CoverageMaxNode',
     'TeamMinNode','GradeMinNode','GradeMaxNode',
     'MonthlyOffNode','WeeklyOffNode','OffWindowNode',
@@ -1138,8 +1273,12 @@ function renderCellTable(cells, kind) {
 
 function renderGroupedViolationCard(g) {
   const meta = state.catalog[g.rule_id] || {};
-  const card = el('div', { class:'violation-card' });
+  const ruleStat = state.allRules.find(r => r.rule_id === g.rule_id);
+  const severity = ruleStat ? ruleStat.severity : null;
+  const card = el('div', { class:'violation-card' + (severity === 'warning' ? ' warn' : '') });
   const head = el('div', { class:'vc-head' });
+  head.append(el('span', { class:'pill ' + (severity === 'blocking' ? 'fail' : 'warn') },
+    severity === 'blocking' ? '🔴 블로킹' : (severity === 'warning' ? '🟡 경고' : '?')));
   head.append(el('span', { class:'pill fail' }, g.rule_id));
   if (meta.group) head.append(el('span', { class:'badge' }, `${meta.group} · ${GROUP_LABEL[meta.group] || ''}`));
   head.append(el('span', { class:'badge' }, `${g.month_key || '?'}`));
@@ -1238,6 +1377,7 @@ function edgeTypeKorean(t) {
     OBSERVED_IN:'발견된 run', CAUSES_VIOLATION:'위반 유발',
     CONTEXT_OF:'문맥', DAY_SHIFT:'일·시프트',
     BLOCKED_RUN:'run 차단', RISKY_FOR:'위태로운 제약',
+    MEMBER_OF_CONFLICT:'충돌 구성원',
   })[t] || t;
 }
 
@@ -1254,6 +1394,12 @@ function nodeTypeKorean(t) {
     WantedApplyNode:'원티드 반영', NurseNode:'간호사',
     ShiftNode:'시프트', DayNode:'일자', TeamNode:'팀',
     FairnessNode:'공정성', DataQualityNode:'데이터 정합성',
+    // Conflict core members
+    ConflictCoreNode:'⚡ 충돌 코어',
+    NurseRoleNode:'간호사 시프트 가용역할',
+    OffCapNode:'OFF 상한',
+    NightCapNode:'월간 N 상한',
+    MonthlyNExactNode:'월 N exact',
     ConstraintNode:'기타 제약',
   };
   return M[t] || t || '?';
@@ -1305,6 +1451,34 @@ async function showNodeDetail(id) {
     head.append(kv);
     head.append(el('div', { class:'h-desc' }, `📊 ${j.incidence_count}개 실행에서 등장`));
     d.append(head);
+
+    // ── 1.5 ConflictCoreNode 전용 인과 스토리 ──
+    if (n.type === 'ConflictCoreNode') {
+      const sec = el('div', { class:'d-section viol' });
+      sec.append(el('h3', {}, '⚡ 충돌 코어 — 인과 스토리'));
+      sec.append(el('div', { class:'h-desc' }, '여러 hard 제약이 결합해 infeasible을 만든 코어. 아래 단계로 추론됨.'));
+      const concl = n.attrs.conclusion;
+      if (concl) {
+        sec.append(el('pre', { class:'vc-metric', style:'border-color:var(--fail);' }, `결론: ${concl}`));
+      }
+      const deriv = n.attrs.derivation || [];
+      if (deriv.length) {
+        const dv = el('div', { class:'kv' });
+        for (const s of deriv) {
+          dv.append(el('b', {}, `step ${s.step}`));
+          dv.append(el('span', {}, s.infer || s.conclusion || s.from || ''));
+        }
+        sec.append(dv);
+      }
+      const hints = n.attrs.resolution_hints || [];
+      if (hints.length) {
+        sec.append(el('div', { class:'h-desc', style:'margin-top:8px; color:#86efac;' }, '✅ 해결 제안 (택일 또는 조합)'));
+        for (const h of hints) {
+          sec.append(el('div', { class:'badge', style:'display:block; margin:4px 0; padding:6px 10px; line-height:1.4;' }, `• ${h.human_message_ko || h.action}`));
+        }
+      }
+      d.append(sec);
+    }
 
     // ── 2. 원인 (inbound) — 빨간 stripe ──
     if (j.inbound_neighbors && j.inbound_neighbors.length) {
@@ -1421,11 +1595,53 @@ async function bootstrap() {
 
   $('#filter-rule-search').addEventListener('input', (e) => renderRulesList(e.target.value));
 
-  document.querySelectorAll('[data-level]').forEach(b => {
+  document.querySelectorAll('[data-layer]').forEach(b => {
     b.addEventListener('click', () => {
-      document.querySelectorAll('[data-level]').forEach(x => x.classList.remove('active'));
-      b.classList.add('active');
-      state.level = b.dataset.level;
+      const lyr = b.dataset.layer;
+      if (state.layers.has(lyr)) {
+        state.layers.delete(lyr);
+        b.classList.remove('active');
+      } else {
+        state.layers.add(lyr);
+        b.classList.add('active');
+      }
+      reloadGraph();
+    });
+  });
+  document.querySelectorAll('[data-severity]').forEach(b => {
+    b.addEventListener('click', () => {
+      const sv = b.dataset.severity;
+      if (state.severities.has(sv)) {
+        state.severities.delete(sv);
+        b.classList.remove('active');
+      } else {
+        state.severities.add(sv);
+        b.classList.add('active');
+      }
+      reloadGraph();
+    });
+  });
+
+  // Solver outcome quick toggles → map to raw solver_status values
+  const OUTCOME_MAP = {
+    success:  ['primary'],
+    fallback: ['fallback', 'fallback-optimal'],
+    failed:   ['cpsat-infeasible', 'fallback-infeasible', 'primary-unsat', 'http-error'],
+  };
+  document.querySelectorAll('[data-outcome]').forEach(b => {
+    b.addEventListener('click', () => {
+      const oc = b.dataset.outcome;
+      const mapped = OUTCOME_MAP[oc] || [];
+      const isActive = b.classList.contains('active');
+      if (isActive) {
+        for (const s of mapped) state.solverStatuses.delete(s);
+        b.classList.remove('active');
+      } else {
+        for (const s of mapped) state.solverStatuses.add(s);
+        b.classList.add('active');
+      }
+      // Re-render sidebar checkboxes to stay in sync
+      renderFacet('#filter-solver', state.facets?.solver_statuses || [], state.solverStatuses);
       reloadGraph();
     });
   });
@@ -1438,7 +1654,21 @@ async function bootstrap() {
     });
   });
   $('#btnFit').addEventListener('click', () => state.cy && state.cy.fit(state.cy.elements(), 40));
-  $('#btnReload').addEventListener('click', reloadGraph);
+  $('#btnReload').addEventListener('click', async () => {
+    // Full soft-refresh: re-fetch facets + rules + graph so newly produced
+    // harness runs (new schedule_id / solver_status / etc) appear without
+    // requiring a full page reload.
+    const facets = await fetchJSON('/ontology/runs');
+    state.facets = facets.facets;
+    renderFacet('#filter-months', facets.facets.months, state.months);
+    renderFacet('#filter-groups', facets.facets.groups, state.groups);
+    renderFacet('#filter-strategies', facets.facets.strategies, state.strategies);
+    renderFacet('#filter-solver', facets.facets.solver_statuses || [], state.solverStatuses);
+    const r = await fetchJSON('/ontology/rules');
+    state.allRules = r.rules;
+    renderRulesList($('#filter-rule-search').value || '');
+    await reloadGraph();
+  });
 
   await reloadGraph();
 }

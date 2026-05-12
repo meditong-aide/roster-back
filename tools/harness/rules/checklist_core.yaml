@@ -326,7 +326,10 @@ rules:
     severity: blocking
     metric: system.infeasible_run_count
     pass_condition: "== 0"
-    owner_family: [solver]
+    # owner_family 빈 채로 둠 — 진짜 원인은 API가 채워주는 violated_constraints /
+    # preflight_issues 에서 ConstraintNode + BLOCKED_RUN + CAUSES_VIOLATION 으로 연결.
+    # `solver:run:<id>` 같은 placeholder 노드를 박지 않음 (false signal 방지).
+    owner_family: []
 
   - id: H_FALLBACK_OK
     group: H

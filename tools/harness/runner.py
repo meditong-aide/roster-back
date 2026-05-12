@@ -1161,8 +1161,9 @@ def _build_graph_export(
                 "slack": evidence.get("slack"),
             },
         )
-        add_edge("FAILED_RULE", viol_node_id, rule_node_id)
-        add_edge("OBSERVED_IN", viol_node_id, run_node_id)
+        # 방향: cause→effect 통일 (Rule이 violation을 발생시킴, Run이 violation을 만들어냄)
+        add_edge("FAILED_RULE", rule_node_id, viol_node_id)
+        add_edge("OBSERVED_IN", run_node_id, viol_node_id)
 
         context = {
             "day": evidence.get("day"),
@@ -1234,10 +1235,122 @@ def _build_graph_export(
         return "ConstraintNode"
 
     constraint_blocks: List[Dict[str, Any]] = []
+    # H_NO_INFEASIBLE / H_FALLBACK_OK 위반을 미리 찾아둠 — 5xx run의 preflight 이슈를
+    # 직접 그 위반들의 인과로 박기 위함.
+    h_infeas_viol_ids = [v["violation_id"] for v in violations if v.get("rule_id") == "H_NO_INFEASIBLE"]
     for rs in runs:
-        if rs.status_code != 200:
-            continue
         attempt_label = f"{rs.solver_status or '?'}#{rs.run_index}"
+        if rs.status_code != 200:
+            # 5xx 경로: API가 채운 preflight_issues / violated_constraints를
+            # ConstraintNode + BLOCKED_RUN + CAUSES_VIOLATION 으로 표면화.
+            inf = rs.infeasible_detail if isinstance(rs.infeasible_detail, dict) else {}
+
+            preflight = list(inf.get("preflight_issues") or [])
+            for idx, issue in enumerate(preflight[:50]):
+                rc = str(issue.get("reason_code") or issue.get("code") or f"issue{idx}")
+                cid = f"precheck:{rc}:{rs.run_index}:{idx}"
+                ctype = _ctype_from_id(rc) if rc else "ConstraintNode"
+                add_node(
+                    cid,
+                    ctype,
+                    {
+                        "reason_code": rc,
+                        "human_message_ko": issue.get("human_message_ko"),
+                        "evidence": issue.get("evidence"),
+                        "fix_suggestions_ko": issue.get("fix_suggestions_ko"),
+                        "first_seen_attempt": attempt_label,
+                    },
+                )
+                add_edge("BLOCKED_RUN", cid, run_node_id)
+                for vid in h_infeas_viol_ids:
+                    add_edge("CAUSES_VIOLATION", cid, vid)
+                constraint_blocks.append(
+                    {"node_id": cid, "ctype": ctype, "kind": "precheck",
+                     "reason_code": rc, "attempt": attempt_label}
+                )
+
+            # ConflictCore: 다중 hard 제약이 결합한 충돌 코어를 ConflictCoreNode +
+            # member ConstraintNode들 + 인과 엣지로 emit. dashboard에서 인과 스토리로
+            # 펼쳐 보임.
+            cores = list(inf.get("conflict_cores") or [])
+            for core in cores[:50]:
+                core_id = str(core.get("core_id") or "")
+                if not core_id:
+                    continue
+                add_node(
+                    core_id,
+                    "ConflictCoreNode",
+                    {
+                        "core_id": core_id,
+                        "pattern": core.get("pattern"),
+                        "scope": core.get("scope"),
+                        "nurse_id": core.get("nurse_id"),
+                        "conclusion": core.get("conclusion"),
+                        "human_message_ko": core.get("human_message_ko"),
+                        "derivation": core.get("derivation") or [],
+                        "resolution_hints": core.get("resolution_hints") or [],
+                        "first_seen_attempt": attempt_label,
+                    },
+                )
+                # 코어 자체가 H_NO_INFEASIBLE 위반의 원인
+                for vid in h_infeas_viol_ids:
+                    add_edge("CAUSES_VIOLATION", core_id, vid)
+                add_edge("BLOCKED_RUN", core_id, run_node_id)
+                # 구성원 ConstraintNode들 → core (MEMBER_OF_CONFLICT)
+                for member in (core.get("members") or []):
+                    m_id = str(member.get("node_id") or "")
+                    m_type = str(member.get("type") or "ConstraintNode")
+                    if not m_id:
+                        continue
+                    add_node(
+                        m_id,
+                        m_type,
+                        {
+                            "node_id": m_id,
+                            "label": member.get("label"),
+                            "value": member.get("value"),
+                            "human_message_ko": member.get("human_message_ko"),
+                        },
+                    )
+                    add_edge("MEMBER_OF_CONFLICT", m_id, core_id)
+                constraint_blocks.append(
+                    {
+                        "node_id": core_id,
+                        "ctype": "ConflictCoreNode",
+                        "kind": "conflict_core",
+                        "pattern": core.get("pattern"),
+                        "attempt": attempt_label,
+                    }
+                )
+
+            # build_unrecoverable_payload가 채운 violated_constraints — 솔버/검증기가
+            # 식별한 실제 인과 제약. node_id prefix가 typed ConstraintNode로 매핑된다.
+            violated = list(inf.get("violated_constraints") or [])
+            for vc in violated[:50]:
+                cid = str(vc.get("node_id") or "")
+                if not cid:
+                    continue
+                ctype = _ctype_from_id(cid)
+                add_node(
+                    cid,
+                    ctype,
+                    {
+                        "node_id": cid,
+                        "reason_code": vc.get("reason_code"),
+                        "slack": vc.get("slack"),
+                        "details": vc.get("details"),
+                        "human_message_ko": vc.get("human_message_ko"),
+                        "first_seen_attempt": attempt_label,
+                    },
+                )
+                add_edge("BLOCKED_RUN", cid, run_node_id)
+                for vid in h_infeas_viol_ids:
+                    add_edge("CAUSES_VIOLATION", cid, vid)
+                constraint_blocks.append(
+                    {"node_id": cid, "ctype": ctype, "kind": "infeasibility",
+                     "reason_code": vc.get("reason_code"), "attempt": attempt_label}
+                )
+            continue
         for vc in (rs.violated_constraints or [])[:50]:
             cid = str(vc.get("node_id") or "")
             if not cid:
@@ -1447,8 +1560,30 @@ def main() -> None:
         )
         st = RunStats(run_index=i, status_code=code, schedule_id=None, infeasible_detail=None)
         if code != 200:
-            st.infeasible_detail = body.get("detail") if isinstance(body, dict) else body
-            st.solver_status = "http-error"
+            # 5xx 응답의 body는 build_blocking_payload / build_unrecoverable_payload
+            # 결과로 `detail.infeasibility.{preflight_issues, applied_relaxations, ...}`
+            # 구조를 갖는다. 이 정보로 solver_status를 더 세밀하게 분류한다.
+            body_obj = body if isinstance(body, dict) else {}
+            detail = body_obj.get("detail") if isinstance(body_obj, dict) else None
+            if isinstance(detail, dict):
+                inf = detail.get("infeasibility") or {}
+                applied_relax = list(inf.get("applied_relaxations") or [])
+                preflight = list(inf.get("preflight_issues") or [])
+                # `last_error_reason`는 build_unrecoverable_payload에서만 채워지므로
+                # precheck blocking vs solver/fallback-infeasible을 구분하는 신뢰 신호.
+                # applied_relaxations는 부가 신호.
+                last_err = inf.get("last_error_reason")
+                if last_err or applied_relax:
+                    st.solver_status = "fallback-infeasible"
+                    st.used_fallback = True
+                else:
+                    st.solver_status = "cpsat-infeasible"
+                st.outcome = "unsat"
+                st.preflight_alerts = preflight
+                st.infeasible_detail = inf
+            else:
+                st.infeasible_detail = detail if detail is not None else body
+                st.solver_status = "http-error"
             runs.append(st)
             continue
 
