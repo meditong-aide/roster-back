@@ -1041,6 +1041,18 @@ function ensureCy() {
       { selector:'node[isFail = 1][severity = ""]', style: {
         'border-width':3, 'border-color':'#ef4444', 'width':36, 'height':36,
       }},
+      // ConflictCoreNode visual differentiation by solver_phase
+      { selector:'node[type = "ConflictCoreNode"][solverPhase = "primary"]', style: {
+        'background-color':'#e879f9',
+        'shape':'round-hexagon',
+        'border-width':3, 'border-color':'#a855f7',
+      }},
+      { selector:'node[type = "ConflictCoreNode"][solverPhase = "fallback"]', style: {
+        'background-color':'#fb923c',
+        'shape':'octagon',
+        'border-width':4, 'border-color':'#ea580c',
+        'border-style':'dashed',
+      }},
       // RunNode visual differentiation by solver outcome
       { selector:'node[type = "RunNode"][runOutcome = "success"]', style: {
         'border-width':3, 'border-color':'#22c55e',
@@ -1159,6 +1171,7 @@ async function reloadGraph() {
           isFail: isFail ? 1 : 0,
           severity: String(n.attrs?.severity || ''),
           runOutcome,
+          solverPhase: String(n.attrs?.solver_phase || ''),
         },
         position: positions[n.id],
       });
@@ -1468,8 +1481,22 @@ async function showNodeDetail(id) {
     // ── 1.5 ConflictCoreNode 전용 인과 스토리 ──
     if (n.type === 'ConflictCoreNode') {
       const sec = el('div', { class:'d-section viol' });
-      sec.append(el('h3', {}, '⚡ 충돌 코어 — 인과 스토리'));
-      sec.append(el('div', { class:'h-desc' }, '여러 hard 제약이 결합해 infeasible을 만든 코어. 아래 단계로 추론됨.'));
+      const phase = n.attrs.solver_phase;
+      const phaseHead = el('h3', {}, '⚡ 충돌 코어 — 인과 스토리');
+      if (phase === 'primary') {
+        phaseHead.append(el('span', { class:'badge', style:'background:#e879f9; color:#0b1020; margin-left:6px;' }, '🟣 Primary'));
+      } else if (phase === 'fallback') {
+        phaseHead.append(el('span', { class:'badge', style:'background:#fb923c; color:#0b1020; margin-left:6px;' }, '🟠 Fallback (일부 hard→soft 전환됨)'));
+      } else {
+        phaseHead.append(el('span', { class:'badge', style:'margin-left:6px;' }, '🔵 Detector'));
+      }
+      sec.append(phaseHead);
+      const phaseHint = phase === 'fallback'
+        ? 'fallback 단계 MUS — primary에서 풀리지 않아 일부 hard 제약이 soft 전환된 상태에서 남은 충돌.'
+        : phase === 'primary'
+        ? 'CP-SAT primary 솔버가 직접 식별한 충돌 (모든 hard 제약 활성 상태).'
+        : '코드 기반 detector가 식별한 충돌 (모델 외 신호 포함).';
+      sec.append(el('div', { class:'h-desc' }, phaseHint));
       // group-level: affected_nurse_ids 표시
       const affected = n.attrs.affected_nurse_ids || [];
       const affCount = n.attrs.affected_count;

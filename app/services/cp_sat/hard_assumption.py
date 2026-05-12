@@ -94,12 +94,18 @@ class HardAssumptionRegistry:
             # CP-SAT 버전에 따라 AddAssumptions 미지원 시 silent
             print(f"[HardAssumption] AddAssumptions failed (ignore): {e}")
 
-    def extract_conflict_cores(self, solver) -> List[Dict[str, Any]]:
+    def extract_conflict_cores(self, solver, *, solver_phase: str = "primary") -> List[Dict[str, Any]]:
         """solver.SufficientAssumptionsForInfeasibility() 결과를 받아
         scope_key 단위로 그룹핑해 ConflictCore 형식으로 반환.
 
         같은 scope_key (예: "nurse_4") 의 assumption 들이 한 ConflictCore의
         members가 된다 — dashboard에서 "이 nurse의 충돌 구성" 처럼 묶여 노출.
+
+        Args:
+            solver_phase: "primary" | "fallback" — 이 MUS가 어느 솔버 단계에서
+                추출됐는지. dashboard가 시각·해석을 분기하는 데 사용한다.
+                fallback 단계는 일부 hard 제약이 soft로 풀린 상태라 충돌 집합이
+                primary 와 다를 수 있음.
         """
         try:
             indices = list(solver.SufficientAssumptionsForInfeasibility())
@@ -129,16 +135,17 @@ class HardAssumptionRegistry:
                     "nurse_id": a.meta.get("nurse_id"),
                     "members": [],
                     "derivation": [
-                        {"step": 1, "from": "CP-SAT solver",
+                        {"step": 1, "from": f"CP-SAT solver ({solver_phase})",
                          "infer": "model.AddAssumptions(...) 로 묶인 hard 제약 중 다음 셋이 동시 만족 불가"},
                     ],
                     "conclusion": "CP-SAT MUS: 다음 제약이 동시에 만족될 수 없습니다",
                     "resolution_hints": [],
                     "human_message_ko": (
-                        "CP-SAT 솔버가 식별한 최소 충돌 집합 (deletion-MUS)."
+                        f"CP-SAT 솔버({solver_phase})가 식별한 최소 충돌 집합 (deletion-MUS)."
                         " 이 중 하나를 풀면 feasible 해질 가능성이 높습니다."
                     ),
-                    "source": "cpsat_mus",
+                    "source": f"cpsat_mus_{solver_phase}",
+                    "solver_phase": solver_phase,
                 }
 
             grouped[core_id]["members"].append({
@@ -200,6 +207,8 @@ class HardAssumptionRegistry:
                 "scope": "multi_nurse",
                 "pattern": rep.get("pattern"),
                 "nurse_id": None,
+                "solver_phase": solver_phase,
+                "source": f"cpsat_mus_{solver_phase}",
                 "affected_nurse_ids": affected,
                 "affected_count": len(affected),
                 # 멤버는 type 단위로 1개씩만 (대표) — 자세한 nurse별 멤버는

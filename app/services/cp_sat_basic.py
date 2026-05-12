@@ -2078,7 +2078,7 @@ class CPSATBasicEngine:
                     try:
                         _reg = getattr(model, "_cpsat_assumption_registry", None)
                         if _reg is not None:
-                            _cores = _reg.extract_conflict_cores(solver)
+                            _cores = _reg.extract_conflict_cores(solver, solver_phase="primary")
                             if _cores:
                                 rs._cpsat_conflict_cores = (
                                     list(getattr(rs, "_cpsat_conflict_cores", []) or []) + _cores

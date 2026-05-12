@@ -1292,6 +1292,8 @@ def _build_graph_export(
                         "human_message_ko": core.get("human_message_ko"),
                         "derivation": core.get("derivation") or [],
                         "resolution_hints": core.get("resolution_hints") or [],
+                        "source": core.get("source"),
+                        "solver_phase": core.get("solver_phase"),
                         "first_seen_attempt": attempt_label,
                     },
                 )

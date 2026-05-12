@@ -483,6 +483,15 @@ def optimize_fallback_lex_hard_first(
         relax_level: int = 0,
     ):
         m = cp_model.CpModel()
+        # MUS 추출용 hard assumption registry — fallback path도 primary와 동일하게.
+        # shared module (monthly_limit_constraints.py) 호출 시 이 registry가 활성화되어
+        # 자동으로 wrap 됨. attach_to_model() 은 caller가 solver.Solve 직전에 호출.
+        try:
+            from services.cp_sat.hard_assumption import HardAssumptionRegistry
+            _assume_registry_fb = HardAssumptionRegistry(m)
+            m._cpsat_assumption_registry = _assume_registry_fb  # type: ignore[attr-defined]
+        except Exception as _ar_fb_exc:
+            print(f"[FallbackLex] HardAssumptionRegistry init failed (ignore): {_ar_fb_exc}")
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
         # relax_level >= 3: max coverage + M min hard → soft 전환 (인원 부족 시 생성 보장)
@@ -2161,7 +2170,21 @@ def optimize_fallback_lex_hard_first(
             s1.parameters.max_time_in_seconds = time_per_attempt
             s1.parameters.num_search_workers = 8
             s1.parameters.relative_gap_limit = 0.15
+            # MUS 추출용 assumption registry attach
+            _reg_s1 = getattr(m1, "_cpsat_assumption_registry", None)
+            if _reg_s1 is not None:
+                _reg_s1.attach_to_model()
             st = s1.Solve(m1)
+            if st == cp_model.INFEASIBLE and _reg_s1 is not None:
+                try:
+                    _fb_cores = _reg_s1.extract_conflict_cores(s1, solver_phase="fallback")
+                    if _fb_cores:
+                        roster_system._cpsat_conflict_cores = (
+                            list(getattr(roster_system, "_cpsat_conflict_cores", []) or []) + _fb_cores
+                        )
+                        print(f"[FallbackLex][stage1] MUS cores: {len(_fb_cores)}")
+                except Exception as _mus_exc:
+                    print(f"[FallbackLex][stage1] MUS 추출 실패(무시): {_mus_exc}")
             print(
                 f"{logger_prefix} 폴백1 결과: relax_level={relax_level}, "
                 f"status={_cp_sat_status_to_text(st)}"
@@ -2237,7 +2260,20 @@ def optimize_fallback_lex_hard_first(
         s2.parameters.max_time_in_seconds = tl2
         s2.parameters.num_search_workers = 8
         s2.parameters.relative_gap_limit = 0.15
+        _reg_s2 = getattr(m2, "_cpsat_assumption_registry", None)
+        if _reg_s2 is not None:
+            _reg_s2.attach_to_model()
         st2 = s2.Solve(m2)
+        if st2 == cp_model.INFEASIBLE and _reg_s2 is not None:
+            try:
+                _fb_cores = _reg_s2.extract_conflict_cores(s2, solver_phase="fallback")
+                if _fb_cores:
+                    roster_system._cpsat_conflict_cores = (
+                        list(getattr(roster_system, "_cpsat_conflict_cores", []) or []) + _fb_cores
+                    )
+                    print(f"[FallbackLex][stage2] MUS cores: {len(_fb_cores)}")
+            except Exception as _mus_exc:
+                print(f"[FallbackLex][stage2] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백2 결과: status={_cp_sat_status_to_text(st2)}")
         if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백2 실패: 단계 불가능 → 1단계 해 사용")
@@ -2321,7 +2357,20 @@ def optimize_fallback_lex_hard_first(
         s3.parameters.max_time_in_seconds = tl3
         s3.parameters.num_search_workers = 8
         s3.parameters.relative_gap_limit = 0.05
+        _reg_s3 = getattr(m3, "_cpsat_assumption_registry", None)
+        if _reg_s3 is not None:
+            _reg_s3.attach_to_model()
         st3 = s3.Solve(m3)
+        if st3 == cp_model.INFEASIBLE and _reg_s3 is not None:
+            try:
+                _fb_cores = _reg_s3.extract_conflict_cores(s3, solver_phase="fallback")
+                if _fb_cores:
+                    roster_system._cpsat_conflict_cores = (
+                        list(getattr(roster_system, "_cpsat_conflict_cores", []) or []) + _fb_cores
+                    )
+                    print(f"[FallbackLex][stage3] MUS cores: {len(_fb_cores)}")
+            except Exception as _mus_exc:
+                print(f"[FallbackLex][stage3] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백3 결과: status={_cp_sat_status_to_text(st3)}")
         if st3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백3 실패: 선호 단계 불가능 → 2단계 해 사용")

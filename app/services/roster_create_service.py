@@ -5514,10 +5514,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             except Exception as _cc_exc:
                 print(f"[ConflictDetector] failed (ignore): {_cc_exc}")
                 _conflict_cores = []
-            # CP-SAT MUS 가 추출한 conflict cores 도 합쳐서 같은 리스트로 노출
-            _cpsat_cores = list(getattr(roster_system, "_cpsat_conflict_cores", []) or [])
+            # CP-SAT MUS 가 추출한 conflict cores 도 합쳐서 같은 리스트로 노출.
+            # fallback의 multi-stage retry로 같은 core_id가 여러 번 emit될 수 있어
+            # core_id 단위 dedup (affected_count 가장 큰 entry keep).
+            _cpsat_cores_raw = list(getattr(roster_system, "_cpsat_conflict_cores", []) or [])
+            _cpsat_by_id: dict = {}
+            for _c in _cpsat_cores_raw:
+                _cid = _c.get("core_id")
+                if not _cid:
+                    continue
+                _existing = _cpsat_by_id.get(_cid)
+                if _existing is None or (_c.get("affected_count") or 0) > (_existing.get("affected_count") or 0):
+                    _cpsat_by_id[_cid] = _c
+            _cpsat_cores = list(_cpsat_by_id.values())
             if _cpsat_cores:
-                print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
+                print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores_raw)}건 → dedup {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
                 _conflict_cores = _conflict_cores + _cpsat_cores
             unrecoverable = build_unrecoverable_payload(
                 precheck_result=precheck_result,
