@@ -559,6 +559,7 @@ class NurseProfileUpdate(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     grade: Optional[int] = None
+    team_id: Optional[int] = None
     birth_date: Optional[str] = None
     phone_number: Optional[str] = None
     email: Optional[EmailStr] = None
