@@ -7,7 +7,7 @@ import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -117,6 +117,29 @@ class RunStats:
     violated_constraints_count: int = 0
     solver_status: str | None = None
     timing_ms: int = 0
+    # Granular solver outcome (Group H의 cpsat/fallback 구분용).
+    outcome: str | None = None
+    used_fallback: bool = False
+    # Constraint-level causal info from constraint_impact API.
+    violated_constraints: List[Dict[str, Any]] = field(default_factory=list)
+    risky_constraints: List[Dict[str, Any]] = field(default_factory=list)
+    preflight_alerts: List[Dict[str, Any]] = field(default_factory=list)
+    conflict_probe: Dict[str, Any] | None = None
+
+
+def _derive_solver_outcome(used_fallback: bool, outcome: str | None) -> str:
+    """Map (used_fallback, outcome) → granular solver status label.
+
+    버킷:
+      - primary             : CP-SAT primary 성공
+      - primary-unsat       : CP-SAT primary 성공 but 의미상 unsat (드묾)
+      - fallback-optimal    : CP-SAT infeasible → fallback이 해를 찾음
+      - fallback-infeasible : CP-SAT infeasible → fallback도 실패
+    """
+    o = (outcome or "").lower()
+    if used_fallback:
+        return "fallback-optimal" if o == "sat" else "fallback-infeasible"
+    return "primary" if o == "sat" else "primary-unsat"
 
 
 def _coverage_counts(roster: Dict[str, Any], day_need: Dict[str, List[int]], shift_main_map: Dict[str, str]) -> Dict[str, int]:
@@ -1176,6 +1199,101 @@ def _build_graph_export(
             }
         )
 
+    # Constraint-level causality from API constraint_impact (violated/risky).
+    # Each RunStats can carry the constraint node_ids that the solver could not satisfy
+    # (BLOCKED_RUN) or barely satisfied (RISKY_FOR). These are independent of harness
+    # rule evaluation — they explain *why* the solver took the fallback path.
+    def _ctype_from_id(nid: str) -> str:
+        s = (nid or "").lower()
+        if s.startswith("coverage:min") or s.startswith("coverage_min"):
+            return "CoverageMinNode"
+        if s.startswith("coverage:max") or s.startswith("coverage_max"):
+            return "CoverageMaxNode"
+        if s.startswith("team_min") or s.startswith("team:min"):
+            return "TeamMinNode"
+        if s.startswith("team_max") or s.startswith("team:max"):
+            return "TeamMaxNode"
+        if s.startswith("grade_min") or s.startswith("grade:min"):
+            return "GradeMinNode"
+        if s.startswith("grade_max") or s.startswith("grade:max"):
+            return "GradeMaxNode"
+        if s.startswith("monthly_off") or s.startswith("monthly:off"):
+            return "MonthlyOffNode"
+        if s.startswith("weekly_off") or s.startswith("weekly:off"):
+            return "WeeklyOffNode"
+        if s.startswith("off_window") or s.startswith("offwindow"):
+            return "OffWindowNode"
+        if s.startswith("preceptee") or s.startswith("precept"):
+            return "PrecepteeNode"
+        if s.startswith("nurse:"):
+            return "NurseNode"
+        if s.startswith("fixed:"):
+            return "FixedConstraintNode"
+        if s.startswith("wanted:"):
+            return "WantedNode"
+        return "ConstraintNode"
+
+    constraint_blocks: List[Dict[str, Any]] = []
+    for rs in runs:
+        if rs.status_code != 200:
+            continue
+        attempt_label = f"{rs.solver_status or '?'}#{rs.run_index}"
+        for vc in (rs.violated_constraints or [])[:50]:
+            cid = str(vc.get("node_id") or "")
+            if not cid:
+                continue
+            ctype = _ctype_from_id(cid)
+            add_node(
+                cid,
+                ctype,
+                {
+                    "node_id": cid,
+                    "slack": vc.get("slack"),
+                    "pressure": vc.get("pressure"),
+                    "details": vc.get("details"),
+                    "first_seen_attempt": attempt_label,
+                },
+            )
+            add_edge("BLOCKED_RUN", cid, run_node_id)
+            constraint_blocks.append(
+                {
+                    "node_id": cid,
+                    "ctype": ctype,
+                    "kind": "violated",
+                    "slack": vc.get("slack"),
+                    "pressure": vc.get("pressure"),
+                    "attempt": attempt_label,
+                }
+            )
+        for rc in (rs.risky_constraints or [])[:50]:
+            cid = str(rc.get("node_id") or "")
+            if not cid:
+                continue
+            ctype = _ctype_from_id(cid)
+            add_node(
+                cid,
+                ctype,
+                {
+                    "node_id": cid,
+                    "slack": rc.get("slack"),
+                    "pressure": rc.get("pressure"),
+                    "details": rc.get("details"),
+                    "risky": True,
+                    "first_seen_attempt": attempt_label,
+                },
+            )
+            add_edge("RISKY_FOR", cid, run_node_id)
+            constraint_blocks.append(
+                {
+                    "node_id": cid,
+                    "ctype": ctype,
+                    "kind": "risky",
+                    "slack": rc.get("slack"),
+                    "pressure": rc.get("pressure"),
+                    "attempt": attempt_label,
+                }
+            )
+
     fail_rule_ids = {str(r.get("rule_id") or "") for r in rule_results if r.get("status") == "FAIL"}
     graph_fail_rule_ids = {str(v.get("rule_id") or "") for v in violations}
     consistency = {
@@ -1206,6 +1324,7 @@ def _build_graph_export(
             for r in rule_results
         ],
         "violations": violations,
+        "constraint_blocks": constraint_blocks,
         "nodes": nodes,
         "edges": edges,
         "mapping_summary": {
@@ -1329,15 +1448,33 @@ def main() -> None:
         st = RunStats(run_index=i, status_code=code, schedule_id=None, infeasible_detail=None)
         if code != 200:
             st.infeasible_detail = body.get("detail") if isinstance(body, dict) else body
+            st.solver_status = "http-error"
             runs.append(st)
             continue
 
         st.schedule_id = str(body.get("schedule_id") or "")
         ci = body.get("constraint_impact") or {}
         st.coverage_gaps_count = len(ci.get("coverage_gaps") or [])
-        st.violated_constraints_count = len(ci.get("violated_constraints") or [])
-        st.solver_status = ci.get("solver_status")
+        st.violated_constraints = list(ci.get("violated_constraints") or [])
+        st.risky_constraints = list(ci.get("risky_constraints") or [])
+        st.preflight_alerts = list(ci.get("preflight_alerts") or [])
+        st.conflict_probe = ci.get("conflict_probe")
+        st.violated_constraints_count = len(st.violated_constraints)
         st.timing_ms = int(ci.get("timing_ms") or 0)
+        # Derive granular solver_status from (used_fallback, outcome).
+        snap_meta = ci.get("snapshot_meta") or {}
+        st.used_fallback = bool(snap_meta.get("used_fallback") or False)
+        st.outcome = ci.get("outcome")
+        st.solver_status = _derive_solver_outcome(st.used_fallback, st.outcome)
+        # Surface constraint-level info under infeasible_detail even when HTTP 200,
+        # so the dashboard can answer "what blocked this run".
+        if st.violated_constraints or st.risky_constraints or st.conflict_probe or st.preflight_alerts:
+            st.infeasible_detail = {
+                "violated_constraints": st.violated_constraints[:50],
+                "risky_constraints": st.risky_constraints[:50],
+                "preflight_alerts": st.preflight_alerts[:20],
+                "conflict_probe": st.conflict_probe,
+            }
 
         roster = _get_json(s, args.base_url, f"/roster/schedule/{st.schedule_id}")
         cov = _coverage_counts(roster, day_need, shift_main_map)
