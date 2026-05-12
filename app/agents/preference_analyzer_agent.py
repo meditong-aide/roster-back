@@ -215,7 +215,7 @@ async def preference_analyzer(state):
     models_to_try = [
         # 1차: OpenAI (기본)
         ChatOpenAI(
-            model="gpt-5.5",
+            model="gpt-4.1-mini-2025-04-14",
             openai_api_key=os.getenv("OPENAI_API_KEY"),
         ),
         # 2차: Anthropic (백업)

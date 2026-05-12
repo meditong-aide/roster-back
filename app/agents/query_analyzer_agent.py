@@ -420,7 +420,7 @@ async def query_analyzer(state):
     )
 
     models_to_try = [
-        ChatOpenAI(model="gpt-5.5", openai_api_key=os.getenv("OPENAI_API_KEY")),
+        ChatOpenAI(model="gpt-4.1-mini-2025-04-14", openai_api_key=os.getenv("OPENAI_API_KEY")),
         ChatAnthropic(model="claude-haiku-4-5-20251001", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")),
         ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
     ]
