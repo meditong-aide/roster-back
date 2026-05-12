@@ -580,16 +580,30 @@ def postprocess_trim_extra_offs(
                 return True
         return False
 
+    # nurse_monthly_limit.n_max==1 면제 set (1회 lazy 계산, closure)
+    try:
+        from services.constraints.monthly_limit_constraints import (
+            collect_single_n_allowed_nurse_indices,
+        )
+        _single_n_allowed_pp = collect_single_n_allowed_nurse_indices(roster_system)
+    except Exception as _e_sn_pp:
+        print(f"[postprocess_off] single_n allowed set 계산 실패(무시): {_e_sn_pp}")
+        _single_n_allowed_pp = set()
+
     def would_create_single_night(n_idx: int, d_idx: int, s_idx: int) -> bool:
         """후처리에서 N 배정 시 1N 금지를 위반하는지 검사한다.
 
         수식: 1N 금지 → N(d) ≤ N(d-1) + N(d+1) (예: d=5이면 N5 ≤ N4+N6)
         수식 예시: N5=1, N4=0, N6=0 → 1 ≤ 0+0(불가)
+
+        예외: nurse_monthly_limit.n_max == 1 nurse 는 1N 금지 면제.
         """
         if not bool(getattr(cfg, "not_one_night", False)):
             return False
         if "N" not in cfg.shift_types:
             return False
+        if n_idx in _single_n_allowed_pp:
+            return False  # 월간 한도 N=1 명시 면제
         night_idx_local = cfg.shift_types.index("N")
         if s_idx != night_idx_local:
             return False
