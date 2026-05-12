@@ -230,11 +230,14 @@ def detect_nurse_overconstrained(rs: Any) -> List[Dict[str, Any]]:
                     _conclusion = (
                         f"31 = N + OFF (work_shifts = {sole_shift}만) — N ∈ [{n_lower}, {n_upper}] = ∅"
                     )
+                _nurse_id_str = str(_safe_attr(nu, "nurse_id", idx))
                 cores.append({
                     "core_id": f"conflict:nurse_{idx}:n_only_vs_caps",
                     "scope": "nurse",
                     "pattern": "n_only_vs_caps",
-                    "nurse_id": str(_safe_attr(nu, "nurse_id", idx)),
+                    "nurse_id": _nurse_id_str,
+                    "affected_count": 1,
+                    "affected_nurse_ids": [_nurse_id_str],
                     "members": members,
                     "derivation": derivation,
                     "conclusion": _conclusion,
@@ -246,6 +249,189 @@ def detect_nurse_overconstrained(rs: Any) -> List[Dict[str, Any]]:
     return cores
 
 
+def detect_capacity_shortage(rs: Any) -> List[Dict[str, Any]]:
+    """월 총 work 수요 vs 공급 산술 검증 — _build_infeasible_diagnosis의
+    CAPACITY_TOTAL_SHORTAGE / N_CAPACITY_SHORTAGE 로직을 ConflictCore 형식으로 재산출.
+    """
+    cores: List[Dict[str, Any]] = []
+    cfg = _safe_attr(rs, "config", None)
+    nurses = list(_safe_attr(rs, "nurses", []) or [])
+    if cfg is None or not nurses:
+        return cores
+
+    num_days = int(_safe_attr(rs, "num_days", 0) or 0)
+    if num_days <= 0:
+        return cores
+    nurse_count = len(nurses)
+
+    shift_types = list(_safe_attr(cfg, "shift_types", []) or [])
+    by_day = _safe_attr(cfg, "daily_shift_requirements_by_day", None)
+    base_req = _safe_attr(cfg, "daily_shift_requirements", None) or {}
+
+    def _required_by_day(day_idx: int) -> Dict[str, int]:
+        if isinstance(by_day, list) and day_idx < len(by_day) and isinstance(by_day[day_idx], dict):
+            return {str(k).upper(): int(v or 0) for k, v in by_day[day_idx].items()}
+        if isinstance(base_req, dict):
+            return {str(k).upper(): int(v or 0) for k, v in base_req.items()}
+        return {}
+
+    total_required = 0
+    n_required = 0
+    for d in range(num_days):
+        for code, val in _required_by_day(d).items():
+            if code == "O":
+                continue
+            if shift_types and code not in shift_types:
+                continue
+            v = int(val or 0)
+            if v <= 0:
+                continue
+            total_required += v
+            if code == "N":
+                n_required += v
+
+    max_off_arr = _safe_attr(rs, "max_off_per_nurse", None) or []
+    avg_max_off = sum(int(x or 0) for x in max_off_arr) / max(1, len(max_off_arr))
+    max_work_per_nurse = max(0, num_days - int(avg_max_off))
+    total_capacity = nurse_count * max_work_per_nurse
+
+    if total_required > total_capacity:
+        cores.append({
+            "core_id": "conflict:capacity:total",
+            "scope": "global",
+            "pattern": "capacity_total_shortage",
+            "affected_count": nurse_count,
+            "affected_nurse_ids": [str(_safe_attr(nu, "nurse_id", i)) for i, nu in enumerate(nurses)],
+            "members": [
+                {"node_id": "demand:total_work", "type": "ConstraintNode",
+                 "label": "월 총 work 요구", "value": total_required,
+                 "human_message_ko": f"월간 총 work 요구 {total_required} cells"},
+                {"node_id": "supply:total_work", "type": "ConstraintNode",
+                 "label": "월 총 work 공급", "value": total_capacity,
+                 "human_message_ko": f"공급 가능 work {total_capacity} cells ({nurse_count}명 × {max_work_per_nurse}일)"},
+            ],
+            "derivation": [
+                {"step": 1, "from": "daily_shift_requirements", "infer": f"총 work 요구 = {total_required}"},
+                {"step": 2, "from": "nurse_count × (num_days - avg_max_off)", "infer": f"공급 = {nurse_count} × {max_work_per_nurse} = {total_capacity}"},
+                {"step": 99, "conclusion": f"요구({total_required}) > 공급({total_capacity}) — 산술 부족"},
+            ],
+            "conclusion": f"월 work 요구 {total_required} > 공급 상한 {total_capacity}",
+            "resolution_hints": [
+                {"action": "reduce_daily_shift_requirements",
+                 "human_message_ko": "daily_shift_requirements 를 낮추세요."},
+                {"action": "add_nurses",
+                 "human_message_ko": "간호사를 추가하거나 OFF 상한을 늘리세요."},
+            ],
+            "human_message_ko": "산술적으로 work 공급이 부족합니다.",
+        })
+
+    max_night_global = int(_safe_attr(cfg, "max_night_shifts_per_month", 0) or 0)
+    if max_night_global > 0 and n_required > (nurse_count * max_night_global):
+        n_cap = nurse_count * max_night_global
+        cores.append({
+            "core_id": "conflict:capacity:n_shortage",
+            "scope": "global",
+            "pattern": "n_capacity_shortage",
+            "affected_count": nurse_count,
+            "affected_nurse_ids": [str(_safe_attr(nu, "nurse_id", i)) for i, nu in enumerate(nurses)],
+            "members": [
+                {"node_id": "demand:total_n", "type": "ConstraintNode",
+                 "label": "월 N 요구", "value": n_required,
+                 "human_message_ko": f"월간 N 요구 {n_required} cells"},
+                {"node_id": "supply:total_n_cap", "type": "NightCapNode",
+                 "label": "월 N 공급 (cap × nurse_count)", "value": n_cap,
+                 "human_message_ko": f"N 공급 상한 {n_cap} ({nurse_count}명 × {max_night_global}일)"},
+            ],
+            "derivation": [
+                {"step": 1, "from": "daily N requirements", "infer": f"월간 N 요구 = {n_required}"},
+                {"step": 2, "from": "nurse_count × max_night", "infer": f"N 공급 상한 = {nurse_count} × {max_night_global} = {n_cap}"},
+                {"step": 99, "conclusion": f"N 요구({n_required}) > N 공급({n_cap}) — N 산술 부족"},
+            ],
+            "conclusion": f"월 N 요구 {n_required} > 공급 상한 {n_cap}",
+            "resolution_hints": [
+                {"action": "reduce_daily_n_requirement",
+                 "human_message_ko": "일별 N 요구를 줄이세요."},
+                {"action": "increase_max_night",
+                 "human_message_ko": f"max_night_shifts_per_month를 {max_night_global} → {max(1, (n_required + nurse_count - 1) // nurse_count)} 이상으로 늘리세요."},
+            ],
+            "human_message_ko": "야간 인력 산술 부족.",
+        })
+
+    return cores
+
+
+def detect_initial_forbidden_concentration(rs: Any) -> List[Dict[str, Any]]:
+    """특정 nurse가 전 기간 동안 같은 shift code(D, E 등) 차단된 패턴 감지.
+
+    예: nurse_role이 "N-only"로 마스터에 등록되어 D/E가 모든 날 forbidden →
+    이 nurse는 사실상 N 전담 → 다른 hard 제약과 결합해 충돌 가능.
+    detect_nurse_overconstrained가 이미 수학적 충돌은 잡지만, 이 detector는
+    "데이터 정합성" 차원에서 "이 nurse role이 N-only로 강제됐다"는 사실 자체를
+    표면화 (false alarm 방지 — 항상 emit, 충돌 여부와 무관).
+    """
+    cores: List[Dict[str, Any]] = []
+    nurses = list(_safe_attr(rs, "nurses", []) or [])
+    num_days = int(_safe_attr(rs, "num_days", 0) or 0)
+    if not nurses or num_days <= 0:
+        return cores
+
+    cfg = _safe_attr(rs, "config", None)
+    shift_types = list(_safe_attr(cfg, "shift_types", []) or []) if cfg else []
+    work_shifts = [s for s in shift_types if str(s).upper() != "O"]
+
+    for idx, nu in enumerate(nurses):
+        forbidden_all = _forbidden_shift_set(rs, idx)
+        if not forbidden_all:
+            continue
+        allowed_work = [s for s in work_shifts if s not in forbidden_all]
+        if not allowed_work or len(allowed_work) >= len(work_shifts):
+            continue
+
+        role_label = "+".join(sorted(allowed_work)) + "-only" if allowed_work else "no-work"
+        forbidden_label = ",".join(sorted(forbidden_all))
+        _nurse_id_str = str(_safe_attr(nu, "nurse_id", idx))
+        cores.append({
+            "core_id": f"data_quality:nurse_role_constrained:nurse_{idx}",
+            "scope": "nurse",
+            "pattern": "nurse_role_constrained",
+            "nurse_id": _nurse_id_str,
+            "affected_count": 1,
+            "affected_nurse_ids": [_nurse_id_str],
+            "members": [
+                {
+                    "node_id": f"nurse_role:{role_label}:nurse_{idx}",
+                    "type": "NurseRoleNode",
+                    "label": role_label,
+                    "value": role_label,
+                    "human_message_ko": (
+                        f"이 간호사는 {num_days}일 내내 {forbidden_label} 시프트를 못 박습니다 — "
+                        f"실질 role: {role_label}"
+                    ),
+                },
+            ],
+            "derivation": [
+                {"step": 1, "from": "initial_forbidden",
+                 "infer": f"이 간호사가 {num_days}일 모두 {forbidden_label} 금지"},
+                {"step": 2, "from": "shift_types - forbidden",
+                 "infer": f"가용 work shift = {sorted(allowed_work)}"},
+                {"step": 99,
+                 "conclusion": f"실질적으로 '{role_label}' 인력으로 동작"},
+            ],
+            "conclusion": f"nurse_{idx} 는 {num_days}일 전부 {forbidden_label} 금지 → 실질 {role_label} role",
+            "resolution_hints": [
+                {"action": "expand_nurse_shift_eligibility",
+                 "human_message_ko": (
+                    f"이 간호사가 추가 시프트 ({forbidden_label}) 도 가능하도록 role/master 데이터 확장."
+                 )},
+            ],
+            "human_message_ko": (
+                f"이 간호사는 데이터상 {role_label} 강제 — 다른 제약과 결합 시 충돌 위험."
+            ),
+        })
+
+    return cores
+
+
 def run_conflict_detectors(rs: Any) -> List[Dict[str, Any]]:
     """모든 detector를 실행하고 발견된 ConflictCore 리스트 반환."""
     out: List[Dict[str, Any]] = []
@@ -253,7 +439,12 @@ def run_conflict_detectors(rs: Any) -> List[Dict[str, Any]]:
         out.extend(detect_nurse_overconstrained(rs))
     except Exception as e:
         print(f"[ConflictDetector] detect_nurse_overconstrained failed (ignore): {e}")
-    # 후속 detector 등록 예:
-    # try: out.extend(detect_coverage_vs_capacity(rs))
-    # except Exception: ...
+    try:
+        out.extend(detect_capacity_shortage(rs))
+    except Exception as e:
+        print(f"[ConflictDetector] detect_capacity_shortage failed (ignore): {e}")
+    try:
+        out.extend(detect_initial_forbidden_concentration(rs))
+    except Exception as e:
+        print(f"[ConflictDetector] detect_initial_forbidden_concentration failed (ignore): {e}")
     return out

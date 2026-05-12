@@ -361,6 +361,13 @@ def merged_graph(
                 }
                 nodes[nid] = merged
             entry = nodes[nid]
+            # 같은 id의 attrs를 union — 새 attrs에 있는 key가 기존에 없으면 채움.
+            # (cross-run 누적 시 최신 run의 풍부한 메타가 표면화되도록.)
+            new_attrs = n.get("attrs") or {}
+            for k, v in new_attrs.items():
+                cur = entry["attrs"].get(k)
+                if cur is None or cur == "" or cur == []:
+                    entry["attrs"][k] = v
             if run_id and run_id not in entry["_seen_in_runs"]:
                 entry["_seen_in_runs"].append(run_id)
             if mk and mk not in entry["_months"]:
@@ -622,6 +629,12 @@ def node_detail(node_id: str) -> JSONResponse:
             if n.get("id") == node_id:
                 if base_node is None:
                     base_node = {"id": n.get("id"), "type": n.get("type"), "attrs": dict(n.get("attrs") or {})}
+                else:
+                    # cross-run attrs union — 새 run이 더 풍부한 attrs 가지면 채움.
+                    for k, v in (n.get("attrs") or {}).items():
+                        cur = base_node["attrs"].get(k)
+                        if cur is None or cur == "" or cur == []:
+                            base_node["attrs"][k] = v
                 incidences.append(
                     {
                         "run_id": run_id,
@@ -1457,6 +1470,37 @@ async function showNodeDetail(id) {
       const sec = el('div', { class:'d-section viol' });
       sec.append(el('h3', {}, '⚡ 충돌 코어 — 인과 스토리'));
       sec.append(el('div', { class:'h-desc' }, '여러 hard 제약이 결합해 infeasible을 만든 코어. 아래 단계로 추론됨.'));
+      // group-level: affected_nurse_ids 표시
+      const affected = n.attrs.affected_nurse_ids || [];
+      const affCount = n.attrs.affected_count;
+      if (affCount && affCount > 1) {
+        const pill = el('div', { class:'badge', style:'background:rgba(232,121,249,.18); color:#f0abfc; border-color:#e879f9; display:block; padding:6px 10px; margin:4px 0;' },
+          `👥 ${affCount}명에 동시 발생`);
+        sec.append(pill);
+        const nurseList = el('div', { style:'font-size:11px; color:#cbd5e1; margin:4px 0 8px;' });
+        nurseList.append(el('b', {}, 'affected nurses: '));
+        nurseList.append(affected.slice(0, 30).join(', '));
+        if (affected.length > 30) nurseList.append(` (+${affected.length - 30}명)`);
+        sec.append(nurseList);
+        const perNurse = n.attrs.per_nurse_cores || [];
+        if (perNurse.length) {
+          const btn = el('button', { class:'btn vc-btn' }, `${perNurse.length}개 nurse별 코어 펼치기`);
+          const list = el('div');
+          list.style.display = 'none';
+          for (const pid of perNurse.slice(0, 50)) {
+            const link = el('div', { class:'badge', style:'display:block; cursor:pointer; margin:2px 0;' }, pid);
+            link.addEventListener('click', () => showNodeDetail(pid));
+            list.append(link);
+          }
+          btn.addEventListener('click', () => {
+            const vis = list.style.display !== 'none';
+            list.style.display = vis ? 'none' : 'block';
+            btn.textContent = vis ? `${perNurse.length}개 nurse별 코어 펼치기` : '접기';
+          });
+          sec.append(btn);
+          sec.append(list);
+        }
+      }
       const concl = n.attrs.conclusion;
       if (concl) {
         sec.append(el('pre', { class:'vc-metric', style:'border-color:var(--fail);' }, `결론: ${concl}`));

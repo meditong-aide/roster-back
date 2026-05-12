@@ -5514,6 +5514,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             except Exception as _cc_exc:
                 print(f"[ConflictDetector] failed (ignore): {_cc_exc}")
                 _conflict_cores = []
+            # CP-SAT MUS 가 추출한 conflict cores 도 합쳐서 같은 리스트로 노출
+            _cpsat_cores = list(getattr(roster_system, "_cpsat_conflict_cores", []) or [])
+            if _cpsat_cores:
+                print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
+                _conflict_cores = _conflict_cores + _cpsat_cores
             unrecoverable = build_unrecoverable_payload(
                 precheck_result=precheck_result,
                 applied_relaxations=applied_relaxations,

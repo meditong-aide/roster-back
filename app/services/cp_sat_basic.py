@@ -2072,7 +2072,21 @@ class CPSATBasicEngine:
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
             print('stat', stat)
-            if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE): return False
+            if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE):
+                # CP-SAT INFEASIBLE → assumption registry MUS 추출해서 roster_system에 stash
+                if stat == cp_model.INFEASIBLE:
+                    try:
+                        _reg = getattr(model, "_cpsat_assumption_registry", None)
+                        if _reg is not None:
+                            _cores = _reg.extract_conflict_cores(solver)
+                            if _cores:
+                                rs._cpsat_conflict_cores = (
+                                    list(getattr(rs, "_cpsat_conflict_cores", []) or []) + _cores
+                                )
+                                print(f"[CP-SAT-Basic] MUS conflict cores: {len(_cores)} (총 {len(rs._cpsat_conflict_cores)})")
+                    except Exception as _mus_exc:
+                        print(f"[CP-SAT-Basic] MUS 추출 실패(무시): {_mus_exc}")
+                return False
             rs.roster.fill(0)
             N,D,S=len(rs.nurses),rs.num_days,rs.config.num_shifts
             leave_phys = [min(int(x), D - 1) for x in l]
@@ -2274,6 +2288,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         blocked_by_nurse = getattr(rs, 'blocked_by_nurse', None)
     from ortools.sat.python import cp_model
     m = cp_model.CpModel()
+    # MUS 추출용 hard assumption registry — 정책 hard 제약을 묶어
+    # INFEASIBLE 시 SufficientAssumptionsForInfeasibility() 로 충돌 코어 검출.
+    # add_hard 도 같이 가져와 wrap site 들에서 재import 안 하도록 한다.
+    try:
+        from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard
+        _assume_registry = HardAssumptionRegistry(m)
+        m._cpsat_assumption_registry = _assume_registry  # type: ignore[attr-defined]
+    except Exception as _ar_exc:
+        print(f"[CP-SAT-Basic] HardAssumptionRegistry init failed (ignore): {_ar_exc}")
+        _assume_registry = None
+        _add_hard = None
     D_phys = rs.num_days
     # K_lookahead = int(getattr(rs.config, "lookahead_days", 5) or 0)
     K_lookahead = 5
@@ -2932,9 +2957,27 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 continue
-            # min 제약: assigned >= need (하드)
+            # min 제약: assigned >= need (하드) — MUS 추출용 wrap
             if need > 0:
-                m.Add(assigned >= need)
+                _cov_min_expr = (assigned >= need)
+                if _assume_registry is not None:
+                    _add_hard(
+                        m, _assume_registry,
+                        name=f"CoverageMin:day_{d}:shift_{code}",
+                        constraint_expr=_cov_min_expr,
+                        meta={
+                            "node_id": f"coverage:min:{d}:{code}",
+                            "type": "CoverageMinNode",
+                            "label": f"day {d+1} {code} 최소 인원",
+                            "value": need,
+                            "scope": "cell", "scope_key": f"day_{d}_shift_{code}",
+                            "pattern": "coverage_min",
+                            "human_message_ko": f"day {d+1} {code} 시프트 최소 {need}명 필요",
+                            "resolution_hint": f"day {d+1} {code} 시프트 최소 인원을 줄이거나 가용 nurse 확대.",
+                        },
+                    )
+                else:
+                    m.Add(_cov_min_expr)
             # max 제약: hard (상한 초과 불가)
             if need_max > 0:
                 m.Add(assigned <= need_max)
@@ -3366,6 +3409,23 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
             # 단 nurse_monthly_limit.n_max==1 nurse 는 면제 (사용자 명시 의도 우선).
             if bool(getattr(cfg, "not_one_night", False)) and n not in _single_n_allowed:
+                # MUS용 assumption literal — 이 nurse의 1N 금지 정책 binding 여부 식별
+                _assume_no1n = None
+                if _assume_registry is not None:
+                    _assume_no1n = _assume_registry.create_literal(
+                        f"NotOneNight:nurse_{n}",
+                        meta={
+                            "node_id": f"not_one_night:nurse_{n}",
+                            "type": "NotOneNightNode",
+                            "label": "1N 단독 금지",
+                            "value": True,
+                            "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "not_one_night",
+                            "nurse_id": str(getattr(nu, "nurse_id", n)),
+                            "human_message_ko": "야간(N) 단독 박힘 금지 (인접일 중 ≥1일 N 필요)",
+                            "resolution_hint": "이 간호사의 n_max 한도를 1로 설정하면 1N 금지에서 면제됩니다.",
+                        },
+                    )
                 for d in range(T0, T1 + 1):
                     if d == T1:
                         continue
@@ -3380,7 +3440,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         neighbors.append(X(n, d + 1, night))
                     if not neighbors:
                         continue
-                    m.Add(X(n, d, night) <= sum(neighbors))
+                    if _assume_no1n is not None:
+                        m.Add(X(n, d, night) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n)
+                    else:
+                        m.Add(X(n, d, night) <= sum(neighbors))
                     _emit_rec.emit(
                         family="NotOneNight",
                         scope={"nurse_index": n, "day": d + 1},
@@ -3458,13 +3521,32 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for d0 in range(T0, T1 - L + 1):
                 m.Add(sum(X(n, d0 + t, night) for t in range(L + 1)) <= L)
 
-            # 월 Night 상한 (당월 D_phys만 합산)
+            # 월 Night 상한 (당월 D_phys만 합산) — MUS 추출용 assumption literal로 wrap
             phys_range_night = month_total_day_range(T0, T1, D_phys)
             if phys_range_night:
-                m.Add(
+                _mn_expr = (
                     sum(X(n, d, night) for d in phys_range_night)
                     <= cfg.max_night_shifts_per_month
                 )
+                if _assume_registry is not None:
+                    _add_hard(
+                        m, _assume_registry,
+                        name=f"MaxNight:nurse_{n}",
+                        constraint_expr=_mn_expr,
+                        meta={
+                            "node_id": f"max_night:nurse_{n}",
+                            "type": "NightCapNode",
+                            "label": "max_night_shifts_per_month",
+                            "value": int(cfg.max_night_shifts_per_month or 0),
+                            "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "max_night",
+                            "nurse_id": str(getattr(nu, "nurse_id", n)),
+                            "human_message_ko": f"월간 N 상한 {int(cfg.max_night_shifts_per_month or 0)}일",
+                            "resolution_hint": f"월간 N 상한을 늘리거나 이 간호사의 N 부담을 다른 인력에 분산하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_mn_expr)
 
             # 월별 개인 shift/off 제한은 모듈에서 한 번에 처리 (인라인 제거)
 
@@ -3612,7 +3694,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             max(0, avail_days - 15),
                             nonvac_active_days,
                         )
-                        m.Add(
+                        _off_cap_expr = (
                             sum(
                                 X(n, d, off)
                                 for d in phys_range_off
@@ -3620,6 +3702,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             )
                             <= max_off_allowed_n_only
                         )
+                        if _assume_registry is not None:
+                            _add_hard(
+                                m, _assume_registry,
+                                name=f"OffCap:nurse_{n}",
+                                constraint_expr=_off_cap_expr,
+                                meta={
+                                    "node_id": f"off_cap:nurse_{n}",
+                                    "type": "OffCapNode",
+                                    "label": "max_off (effective, N-only)",
+                                    "value": max_off_allowed_n_only,
+                                    "scope": "nurse", "scope_key": f"nurse_{n}",
+                                    "pattern": "off_cap",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": (
+                                        f"이 간호사 OFF 상한 {max_off_allowed_n_only}일 "
+                                        f"(N-only 공식: avail_days({avail_days}) - 15)"
+                                    ),
+                                    "resolution_hint": f"이 간호사 OFF 상한을 늘리세요 (또는 N-only role을 다중 시프트로 변경).",
+                                },
+                            )
+                        else:
+                            m.Add(_off_cap_expr)
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
                             f"cap_semantics={off_cap_semantics}, is_n_only=1, vac_cnt={vacation_cnt}, "
@@ -3668,7 +3772,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 nonvac_active_days,
                             )
                             max_off_allowed = max(max_off_allowed, min_off_required)
-                        m.Add(
+                        _off_cap_expr_reg = (
                             sum(
                                 X(n, d, off)
                                 for d in phys_range_off
@@ -3676,6 +3780,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             )
                             <= max_off_allowed
                         )
+                        if _assume_registry is not None:
+                            _add_hard(
+                                m, _assume_registry,
+                                name=f"OffCap:nurse_{n}",
+                                constraint_expr=_off_cap_expr_reg,
+                                meta={
+                                    "node_id": f"off_cap:nurse_{n}",
+                                    "type": "OffCapNode",
+                                    "label": "max_off (effective)",
+                                    "value": max_off_allowed,
+                                    "scope": "nurse", "scope_key": f"nurse_{n}",
+                                    "pattern": "off_cap",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": f"이 간호사 OFF 상한 {max_off_allowed}일",
+                                    "resolution_hint": "이 간호사 OFF 상한을 늘리세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_off_cap_expr_reg)
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
                             f"cap_semantics={off_cap_semantics}, off_first={_off_first}, vac_cnt={vacation_cnt}, "
@@ -3696,6 +3819,23 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
             n_offs_after_3n = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
             _blocked_3n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+            # MUS용 assumption literal — 이 nurse의 3N2OFF 회복 정책 binding 여부 식별
+            _assume_3n2off = None
+            if _assume_registry is not None:
+                _assume_3n2off = _assume_registry.create_literal(
+                    f"Recovery3N2OFF:nurse_{n}",
+                    meta={
+                        "node_id": f"recovery_3n2off:nurse_{n}",
+                        "type": "RecoveryOffNode",
+                        "label": "3N 후 2OFF 회복",
+                        "value": "3N→2OFF",
+                        "scope": "nurse", "scope_key": f"nurse_{n}",
+                        "pattern": "recovery_3n2off",
+                        "nurse_id": str(getattr(nu, "nurse_id", n)),
+                        "human_message_ko": "3N 연속 뒤 2OFF 회복 강제",
+                        "resolution_hint": "3N 후 2OFF 회복 정책(two_offs_after_three_nig)을 끄거나 완화하세요.",
+                    },
+                )
             _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
             if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                 end_prev_block = m.NewBoolVar(f"end_3n_prev_{n}")
@@ -3732,15 +3872,33 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         X(n, d, night) + X(n, d - 1, night) + X(n, d - 2, night) <= 2
                     )
                     continue
+                _enforce_3n = [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
+                if _assume_3n2off is not None:
+                    _enforce_3n.append(_assume_3n2off)
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
-                ).OnlyEnforceIf(
-                    [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
-                )
+                ).OnlyEnforceIf(_enforce_3n)
         if cfg.two_offs_after_two_nig and n not in n_forbid_n and not getattr(cfg, '_2n2off_pre_injected', False):
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
             n_offs_after = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
             _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+            # MUS용 assumption literal — 이 nurse의 2N2OFF 회복 정책 binding 여부 식별
+            _assume_2n2off = None
+            if _assume_registry is not None:
+                _assume_2n2off = _assume_registry.create_literal(
+                    f"Recovery2N2OFF:nurse_{n}",
+                    meta={
+                        "node_id": f"recovery_2n2off:nurse_{n}",
+                        "type": "RecoveryOffNode",
+                        "label": "2N 후 2OFF 회복",
+                        "value": "2N→2OFF",
+                        "scope": "nurse", "scope_key": f"nurse_{n}",
+                        "pattern": "recovery_2n2off",
+                        "nurse_id": str(getattr(nu, "nurse_id", n)),
+                        "human_message_ko": "2N 연속 뒤 2OFF 회복 강제",
+                        "resolution_hint": "2N 후 2OFF 회복 정책(two_offs_after_two_nig)을 끄거나 완화하세요.",
+                    },
+                )
             # 전월 N tail 뒤 이미 소비된 OFF 수를 반영: req_offs(2) - offs_after 만큼만 현월에서 추가 필요
             _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
             if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
@@ -3765,9 +3923,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
                 m.Add(end_block_b0 == X(n, T0 + 1, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
+                    _enforce_2n_b0 = [X(n, T0, night), end_block_b0]
+                    if _assume_2n2off is not None:
+                        _enforce_2n_b0.append(_assume_2n2off)
                     m.Add(
                         countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                    ).OnlyEnforceIf([X(n, T0, night), end_block_b0])
+                    ).OnlyEnforceIf(_enforce_2n_b0)
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)
@@ -3882,6 +4043,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     except Exception as _err:
         print(f"[WARN] per_nurse_target_terms skipped: {_err}")
     m.Maximize(sum(obj))
+
+    # assumption literal 등록 완료 — INFEASIBLE 시 MUS 추출 가능 상태로 만든다.
+    if _assume_registry is not None:
+        _assume_registry.attach_to_model()
+        print(f"[CP-SAT-Basic] HardAssumption registry: {len(_assume_registry._by_name)} assumption literals attached")
 
     return m, X, join, leave, fixed
 
