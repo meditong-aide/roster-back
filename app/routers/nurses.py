@@ -1169,37 +1169,24 @@ async def get_nurse_by_id(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """단일 간호사 프로필 조회 (파견/병동이동 인바운드 간호사도 조회 허용)"""
+    """단일 간호사 프로필 조회.
+
+    통합 권한 헬퍼(can_caller_access_nurse)로 ADM / self / home·managed source /
+    inbound (파견·병동이동) 모두 통과시킨 뒤, 그룹 필터를 건너뛰고 직접 조회한다.
+    """
     try:
-        result = None
+        from services.group_access import can_caller_access_nurse
+        if not can_caller_access_nurse(db, current_user, nurse_id):
+            raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
+
         if current_user.is_master_admin:
             result = get_nurses_filtered_service(
-                current_user,
-                db,
-                nurse_id=nurse_id,
+                current_user, db, nurse_id=nurse_id,
             )
         else:
-            try:
-                result = get_nurses_in_group_service(
-                    current_user,
-                    db,
-                    nurse_id=nurse_id,
-                )
-            except Exception:
-                result = None
-        # 같은 그룹에 없으면 → 파견/병동이동 인바운드 여부 확인 후 직접 조회
-        if not result:
-            from db.models import NurseAssignment
-            has_inbound = db.query(NurseAssignment).filter(
-                NurseAssignment.nurse_id == nurse_id,
-                NurseAssignment.target_group_id == current_user.group_id,
-                NurseAssignment.reason.in_(["파견", "병동이동"]),
-                NurseAssignment.status == "active",
-            ).first()
-            if has_inbound:
-                result = get_nurses_in_group_service(
-                    current_user, db, nurse_id=nurse_id, skip_group_filter=True,
-                )
+            result = get_nurses_in_group_service(
+                current_user, db, nurse_id=nurse_id, skip_group_filter=True,
+            )
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
         return result[0]

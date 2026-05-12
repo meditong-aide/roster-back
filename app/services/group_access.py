@@ -10,13 +10,76 @@ nurses 테이블의 실제 소속 group_id 를 우선한다 (routers/groups.py �
 my-admin-groups 패턴과 동일).
 """
 
-from typing import List
+from typing import List, Set
 
 from sqlalchemy.orm import Session
 
 from db.models import Group as GroupModel
 from db.models import Nurse as NurseModel
+from db.models import NurseAssignment as NurseAssignmentModel
 from schemas.auth_schema import User as UserSchema
+
+
+_INBOUND_REASONS = ("파견", "병동이동")
+
+
+def resolve_accessible_group_ids(
+    db: Session, current_user: UserSchema
+) -> Set[str]:
+    """호출자가 접근 가능한 group_id 집합 (home + HN multi-group managed)."""
+    accessible: Set[str] = set()
+    if current_user is None:
+        return accessible
+    if getattr(current_user, "group_id", None):
+        accessible.add(str(current_user.group_id))
+    if str(getattr(current_user, "hn_auth", "") or "").upper() == "HN":
+        accessible.update(str(g) for g in resolve_managed_group_ids(db, current_user))
+    return accessible
+
+
+def can_caller_access_nurse(
+    db: Session, current_user: UserSchema, nurse_id: str
+) -> bool:
+    """호출자가 해당 간호사를 조회/수정할 수 있는지 통합 판단.
+
+    통과 경로:
+    - ADM(is_master_admin): 모든 간호사
+    - self: 본인 자기 자신 (str 비교)
+    - 간호사 home group 이 caller 의 accessible groups 안에 있음
+    - 간호사가 caller 의 accessible groups 중 하나로 inbound (파견/병동이동) 되어 있음
+
+    accessible = home group + (hn_auth=='HN' 이면 managed groups)
+    """
+    if current_user is None:
+        return False
+    if bool(getattr(current_user, "is_master_admin", False)):
+        return True
+    if str(nurse_id) == str(getattr(current_user, "nurse_id", "")):
+        return True
+
+    accessible = resolve_accessible_group_ids(db, current_user)
+    if not accessible:
+        return False
+
+    nurse = (
+        db.query(NurseModel)
+        .filter(NurseModel.nurse_id == nurse_id)
+        .first()
+    )
+    if nurse and str(nurse.group_id or "") in accessible:
+        return True
+
+    inbound = (
+        db.query(NurseAssignmentModel)
+        .filter(
+            NurseAssignmentModel.nurse_id == nurse_id,
+            NurseAssignmentModel.target_group_id.in_(list(accessible)),
+            NurseAssignmentModel.status == "active",
+            NurseAssignmentModel.reason.in_(_INBOUND_REASONS),
+        )
+        .first()
+    )
+    return inbound is not None
 
 
 def resolve_managed_group_ids(db: Session, current_user: UserSchema) -> List[str]:

@@ -1132,20 +1132,52 @@ def update_nurse_profile_service(
         }
 
     # 호출 view 의 group_id 결정 (target view 에서 inbound nurse 수정 시 명시 필요).
-    # 권한 검증:
+    # 권한 검증 (사이드프로필 / source 모두 동일):
     #   - 본인 group 과 동일하면 OK
-    #   - 다른 group 인 경우 master_admin 또는 hn_auth=='HN'(그룹 관리자) 만 허용
+    #   - 다른 group 인 경우 ADM 또는 HN multi-group 의 managed groups 안에 있어야 함
     _caller_view_group = view_group_id or current_user.group_id
+    if view_group_id and view_group_id != current_user.group_id and not is_admin:
+        is_hn_multi = str(getattr(current_user, "hn_auth", "") or "").upper() == "HN"
+        if not is_hn_multi:
+            raise HTTPException(
+                status_code=403,
+                detail="다른 그룹 view 에서 nurse 수정 권한이 없습니다 (HN/admin 필요).",
+            )
+        from services.group_access import resolve_managed_group_ids
+        _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+        if str(view_group_id) not in _managed:
+            raise HTTPException(
+                status_code=403,
+                detail="해당 view 그룹은 본인이 관리하는 그룹이 아닙니다.",
+            )
+
+    # HN multi-group 자동 보정: view_group_id 미전송 시 nurse 의 home/inbound 가
+    # managed groups 안에 있으면 _caller_view_group 자동 매핑 (통합보기 / 프론트가
+    # view_group_id 안 보내는 경우 대응).
     if (
-        view_group_id
-        and view_group_id != current_user.group_id
+        not view_group_id
         and not is_admin
-        and str(getattr(current_user, "hn_auth", "") or "").upper() != "HN"
+        and str(getattr(current_user, "hn_auth", "") or "").upper() == "HN"
+        and str(nurse.group_id) != str(current_user.group_id)
     ):
-        raise HTTPException(
-            status_code=403,
-            detail="다른 그룹 view 에서 nurse 수정 권한이 없습니다 (HN/admin 필요).",
-        )
+        from services.group_access import resolve_managed_group_ids
+        _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+        if str(nurse.group_id) in _managed:
+            _caller_view_group = nurse.group_id  # source view 자동
+        else:
+            _inbound_match = (
+                db.query(NurseAssignment)
+                .filter(
+                    NurseAssignment.nurse_id == nurse_id,
+                    NurseAssignment.target_group_id.in_(list(_managed)),
+                    NurseAssignment.status == "active",
+                    NurseAssignment.reason.in_(_INBOUND_REASONS),
+                )
+                .order_by(NurseAssignment.start_date.desc())
+                .first()
+            )
+            if _inbound_match is not None:
+                _caller_view_group = _inbound_match.target_group_id  # target view 자동
     # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
     if is_admin:
         _apply_source_nurse_update(nurse, fields)

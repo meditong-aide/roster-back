@@ -38,9 +38,10 @@ def _assert_caller_owns_source(
     통과 조건 (OR):
     - current_user is None → system/admin 경로로 간주
     - is_master_admin
-    - caller.group_id == source_group_id (현재 view가 source)
+    - caller.group_id == source_group_id (현재 view 가 source)
     - caller.original_group_id == source_group_id (원본 소속이 source — view 전환 중)
-    - caller.nurse_id ∈ groups[source_group_id].hn_id (해당 그룹의 등록된 그룹 관리자)
+    - source_group_id ∈ resolve_managed_group_ids(caller)
+      (HN multi-group: home + group.hn_id JSON 에 본인이 등록된 모든 그룹)
     """
     if current_user is None:
         return
@@ -52,11 +53,10 @@ def _assert_caller_owns_source(
     caller_original = getattr(current_user, "original_group_id", None)
     if caller_original and caller_original == source_group_id:
         return
-    caller_nid = getattr(current_user, "nurse_id", None)
-    if db is not None and caller_nid:
-        src_group = db.query(Group).filter(Group.group_id == source_group_id).first()
-        hn_ids = list(src_group.hn_id or []) if src_group is not None else []
-        if str(caller_nid) in {str(x) for x in hn_ids}:
+    if db is not None:
+        from services.group_access import resolve_managed_group_ids
+        managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+        if str(source_group_id) in managed:
             return
     raise HTTPException(
         status_code=403,
