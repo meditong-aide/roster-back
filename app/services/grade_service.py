@@ -88,6 +88,9 @@ def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:
         allow_soft_fallback=bool(getattr(config, "allow_soft_fallback", False)),
         constraints=config.constraints_json or {},
         constraints_max=config.constraints_max_json or {},
+        grade_names=_resolve_grade_names(
+            config.grade_names_json, config.constraints_json or {}
+        ),
         use_mid=_use_mid,
         default_shifts=_normalize_default_shifts(config.default_shifts_json, _use_mid),
         created_at=config.created_at,
@@ -189,6 +192,9 @@ def upsert_grade_config_service(
         allow_soft_fallback=bool(getattr(config, "allow_soft_fallback", False)),
         constraints=config.constraints_json or {},
         constraints_max=config.constraints_max_json or {},
+        grade_names=_resolve_grade_names(
+            config.grade_names_json, config.constraints_json or {}
+        ),
         use_mid=use_mid,
         default_shifts=_normalize_default_shifts(config.default_shifts_json, use_mid),
         created_at=config.created_at,
