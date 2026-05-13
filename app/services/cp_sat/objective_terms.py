@@ -298,11 +298,65 @@ def add_kld_distribution_terms(
         )
 
     # ══════════════════════════════════════════════
-    # Layer 2: 총 근무수(D+E+N) 균등화
+    # Layer 2: 총 근무수(D+E+N) 균등화 — NML-aware per-nurse target
     # ══════════════════════════════════════════════
+    # NML(nurse_monthly_limit) 강제값을 인지하여 각 nurse 별 target 산정:
+    #   - o_exact 또는 o_min==o_max → forced_work = D - o
+    #   - d/e/n 모두 fixed (exact 또는 min==max) → forced_work = d+e+n
+    #   - 그 외 → unrestricted, target = D - off_days (baseline OFF 기반)
+    # 효과: NML 강제로 baseline 미만/초과인 nurse 의 보상이 unrestricted nurse 에게
+    # 떠넘겨지지 않도록 함. unrestricted nurse 들이 baseline OFF 에 정확히 수렴.
+    def _nml_forced_work(nu) -> int | None:
+        ox = getattr(nu, "o_exact", None)
+        if ox is not None:
+            try:
+                return D - int(ox)
+            except (TypeError, ValueError):
+                pass
+        omn = getattr(nu, "o_min", None)
+        omx = getattr(nu, "o_max", None)
+        if omn is not None and omx is not None:
+            try:
+                if int(omn) == int(omx):
+                    return D - int(omn)
+            except (TypeError, ValueError):
+                pass
+        total = 0
+        all_fixed = True
+        for prefix in ("d", "e", "n"):
+            ex = getattr(nu, f"{prefix}_exact", None)
+            if ex is not None:
+                try:
+                    total += int(ex)
+                    continue
+                except (TypeError, ValueError):
+                    all_fixed = False
+                    break
+            mn = getattr(nu, f"{prefix}_min", None)
+            mx = getattr(nu, f"{prefix}_max", None)
+            if mn is not None and mx is not None:
+                try:
+                    if int(mn) == int(mx):
+                        total += int(mn)
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            all_fixed = False
+            break
+        return total if all_fixed else None
+
     total_work_need = sum(total_need[c] for c in work_codes)
-    target_work = total_work_need // len(normals)
-    target_work_high = target_work + (1 if total_work_need % len(normals) else 0)
+    baseline_work_target = max(1, D - int(getattr(cfg, "off_days", 10) or 10))
+
+    nurse_total_target: dict[int, int] = {}
+    nml_count = 0
+    for n in normals:
+        forced = _nml_forced_work(rs.nurses[n])
+        if forced is not None:
+            nurse_total_target[n] = max(0, min(D, forced))
+            nml_count += 1
+        else:
+            nurse_total_target[n] = baseline_work_target
 
     max_work = m.NewIntVar(0, D, f"kld_tw_max_{stage_label}")
     min_work = m.NewIntVar(0, D, f"kld_tw_min_{stage_label}")
@@ -312,6 +366,8 @@ def add_kld_distribution_terms(
         ) or all_codes_set
         if len(allowed) <= 1:
             continue
+        t_target = nurse_total_target.get(n, baseline_work_target)
+
         tot = sum(
             X(n, d, work_indices[c])
             for c in work_codes
@@ -321,10 +377,10 @@ def add_kld_distribution_terms(
         m.Add(max_work >= tot)
         m.Add(min_work <= tot)
 
-        # U: 총근무 편차도 3-tier 볼록 페널티 (KL 근사)
+        # U: 총근무 편차 3-tier 볼록 페널티 (KL 근사) — per-nurse target
         for side_tag, lb_expr in (
-            ("L", target_work - tot),
-            ("H", tot - target_work_high),
+            ("L", t_target - tot),
+            ("H", tot - t_target),
         ):
             d_tot = m.NewIntVar(0, D, f"kld_tw_d{side_tag}tot_{stage_label}_{n}")
             d1 = m.NewIntVar(0, 1, f"kld_tw_d{side_tag}1_{stage_label}_{n}")
@@ -336,20 +392,21 @@ def add_kld_distribution_terms(
             obj.append(-3 * W_TOTAL * d2)
             obj.append(-10 * W_TOTAL * d3)
 
-    # U2: 총근무 range에도 3-tier 볼록 페널티
+    # U2: 총근무 range에도 3-tier 볼록 페널티 — 범위 압축 강화 (multiplier 5)
     range_work = m.NewIntVar(0, D, f"kld_tw_range_{stage_label}")
     m.Add(range_work >= max_work - min_work)
     rw1 = m.NewIntVar(0, 1, f"kld_tw_r1_{stage_label}")
     rw2 = m.NewIntVar(0, 2, f"kld_tw_r2_{stage_label}")
     rw3 = m.NewIntVar(0, D, f"kld_tw_r3_{stage_label}")
     m.Add(range_work == rw1 + rw2 + rw3)
-    obj.append(-W_TOTAL * 2 * rw1)
-    obj.append(-3 * W_TOTAL * 2 * rw2)
-    obj.append(-10 * W_TOTAL * 2 * rw3)
+    obj.append(-W_TOTAL * 5 * rw1)
+    obj.append(-3 * W_TOTAL * 5 * rw2)
+    obj.append(-10 * W_TOTAL * 5 * rw3)
 
     print(
         f"{logger_prefix} [KLD-총근무] ({stage_label}): "
-        f"nurses={len(normals)}, target=[{target_work},{target_work_high}], "
+        f"nurses={len(normals)}, baseline_target={baseline_work_target}, "
+        f"nml_aware={nml_count}/{len(normals)}, "
         f"total_need={total_work_need}, w={W_TOTAL}"
     )
 
