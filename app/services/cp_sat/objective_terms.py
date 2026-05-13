@@ -348,90 +348,17 @@ def add_kld_distribution_terms(
     total_work_need = sum(total_need[c] for c in work_codes)
     baseline_work_target = max(1, D - int(getattr(cfg, "off_days", 10) or 10))
 
-    # ── A.3: grade-aware target 보조 ──
-    # grade_config 의 constraints_json 에 등장하는 grade 별 일일 demand 를 기반으로
-    # 각 grade nurse 의 평균 근무량을 target 으로 사용. NML 은 우선.
-    # baseline 과의 격차 완화를 위해 baseline 양옆 [-3, +3] 으로 클램프.
-    grade_config = getattr(rs, "grade_config", None) or {}
-    constraints_map = (
-        grade_config.get("constraints")
-        or grade_config.get("constraints_json")
-        or {}
-    )
-    if not isinstance(constraints_map, dict):
-        constraints_map = {}
-
-    grade_nurse_count: dict[int, int] = {}
-    for n in normals:
-        ng = getattr(rs.nurses[n], "grade", None)
-        if ng is None:
-            continue
-        try:
-            gi = int(ng)
-        except (TypeError, ValueError):
-            continue
-        grade_nurse_count[gi] = grade_nurse_count.get(gi, 0) + 1
-
-    def _grade_demand_per_nurse(grade) -> int | None:
-        if grade is None or not constraints_map:
-            return None
-        try:
-            gi = int(grade)
-        except (TypeError, ValueError):
-            return None
-        if gi not in grade_nurse_count or grade_nurse_count[gi] <= 0:
-            return None
-        total = 0
-        for c in work_codes:
-            per_shift = constraints_map.get(c) or constraints_map.get(c.lower()) or {}
-            if not isinstance(per_shift, dict):
-                continue
-            min_count = 0
-            for k in (gi, str(gi)):
-                v = per_shift.get(k)
-                if v is not None:
-                    try:
-                        min_count = int(v)
-                        break
-                    except (TypeError, ValueError):
-                        pass
-            if min_count <= 0:
-                continue
-            sum_base = 0
-            for v in per_shift.values():
-                try:
-                    sum_base += max(0, int(v or 0))
-                except (TypeError, ValueError):
-                    continue
-            req = total_need.get(c, 0) / D if D > 0 else 0
-            if sum_base <= 0 or req <= 0:
-                continue
-            ratio = min(1.0, req / float(sum_base))
-            scaled = int(round(min_count * ratio))
-            total += scaled * D
-        if total <= 0:
-            return None
-        return int(round(total / grade_nurse_count[gi]))
-
+    # A.3 (grade-aware target) 폐기: prod COMBINED 환경에서 grade demand 기반 target 이
+    # grade 별 work 양극화를 유발 → G2 OFF<baseline → off_swap excess≤0 → FB 변환 skip.
+    # baseline 일률 적용이 cross-grade range 가 더 좁고 FB 분배가 고름.
+    # 메모리: [[kld-a3-grade-aware-discarded-20260513]]
     nurse_total_target: dict[int, int] = {}
     nml_count = 0
-    grade_aware_count = 0
-    _GRADE_CLAMP_BAND = 3  # baseline 기준 ±3 까지 grade-aware 허용
     for n in normals:
         forced = _nml_forced_work(rs.nurses[n])
         if forced is not None:
             nurse_total_target[n] = max(0, min(D, forced))
             nml_count += 1
-            continue
-        grade = getattr(rs.nurses[n], "grade", None)
-        grade_t = _grade_demand_per_nurse(grade)
-        if grade_t is not None:
-            clamped = max(
-                baseline_work_target - _GRADE_CLAMP_BAND,
-                min(baseline_work_target + _GRADE_CLAMP_BAND, grade_t),
-            )
-            nurse_total_target[n] = max(1, min(D, clamped))
-            grade_aware_count += 1
         else:
             nurse_total_target[n] = baseline_work_target
 
@@ -484,7 +411,6 @@ def add_kld_distribution_terms(
         f"{logger_prefix} [KLD-총근무] ({stage_label}): "
         f"nurses={len(normals)}, baseline_target={baseline_work_target}, "
         f"nml_aware={nml_count}/{len(normals)}, "
-        f"grade_aware={grade_aware_count}/{len(normals)}, clamp_band=±{_GRADE_CLAMP_BAND}, "
         f"total_need={total_work_need}, w={W_TOTAL}"
     )
 
