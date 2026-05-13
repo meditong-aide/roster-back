@@ -1497,10 +1497,12 @@ async function showNodeDetail(id) {
         ? 'CP-SAT primary 솔버가 직접 식별한 충돌 (모든 hard 제약 활성 상태).'
         : '코드 기반 detector가 식별한 충돌 (모델 외 신호 포함).';
       sec.append(el('div', { class:'h-desc' }, phaseHint));
-      // group-level: affected_nurse_ids 표시
+      // group-level: affected_nurse_ids (nurse-scoped) 또는 affected_scope_keys (정책-scoped) 표시
       const affected = n.attrs.affected_nurse_ids || [];
+      const affectedKeys = n.attrs.affected_scope_keys || [];
       const affCount = n.attrs.affected_count;
-      if (affCount && affCount > 1) {
+      if (affCount && affCount > 1 && affected.length > 0) {
+        // nurse-scoped: "n명에 동시 발생"
         const pill = el('div', { class:'badge', style:'background:rgba(232,121,249,.18); color:#f0abfc; border-color:#e879f9; display:block; padding:6px 10px; margin:4px 0;' },
           `👥 ${affCount}명에 동시 발생`);
         sec.append(pill);
@@ -1523,6 +1525,35 @@ async function showNodeDetail(id) {
             const vis = list.style.display !== 'none';
             list.style.display = vis ? 'none' : 'block';
             btn.textContent = vis ? `${perNurse.length}개 nurse별 코어 펼치기` : '접기';
+          });
+          sec.append(btn);
+          sec.append(list);
+        }
+      } else if (affCount && affCount > 1 && affectedKeys.length > 0) {
+        // 정책-scoped (grade 등): "n건의 정책에 동시 발생"
+        const scopeLabel = String(n.attrs.scope || 'group');
+        const pill = el('div', { class:'badge', style:'background:rgba(232,121,249,.18); color:#f0abfc; border-color:#e879f9; display:block; padding:6px 10px; margin:4px 0;' },
+          `📐 ${affCount}건의 ${scopeLabel} 정책에 동시 발생`);
+        sec.append(pill);
+        const keyList = el('div', { style:'font-size:11px; color:#cbd5e1; margin:4px 0 8px;' });
+        keyList.append(el('b', {}, 'affected policies: '));
+        keyList.append(affectedKeys.slice(0, 30).join(', '));
+        if (affectedKeys.length > 30) keyList.append(` (+${affectedKeys.length - 30}건)`);
+        sec.append(keyList);
+        const perMember = n.attrs.per_member_cores || [];
+        if (perMember.length) {
+          const btn = el('button', { class:'btn vc-btn' }, `${perMember.length}개 정책별 코어 펼치기`);
+          const list = el('div');
+          list.style.display = 'none';
+          for (const pid of perMember.slice(0, 50)) {
+            const link = el('div', { class:'badge', style:'display:block; cursor:pointer; margin:2px 0;' }, pid);
+            link.addEventListener('click', () => showNodeDetail(pid));
+            list.append(link);
+          }
+          btn.addEventListener('click', () => {
+            const vis = list.style.display !== 'none';
+            list.style.display = vis ? 'none' : 'block';
+            btn.textContent = vis ? `${perMember.length}개 정책별 코어 펼치기` : '접기';
           });
           sec.append(btn);
           sec.append(list);
