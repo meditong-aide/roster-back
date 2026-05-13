@@ -134,6 +134,15 @@ def add_team_grade_handoff_constraints(
     allow_soft = bool(getattr(cfg, "team_handoff_soft_fallback", True))
     penalty_weight = int(getattr(cfg, "team_handoff_penalty_weight", 80000) or 0)
     num_days = int(rs.num_days)
+
+    # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
+    _registry = getattr(m, "_cpsat_assumption_registry", None)
+    _add_hard_fn = None
+    if _registry is not None and not allow_soft:
+        try:
+            from services.cp_sat.hard_assumption import add_hard as _add_hard_fn
+        except Exception:
+            _add_hard_fn = None
     _impact_modes.append({
         "family": "handoff",
         "key": "team_grade_handoff:global",
@@ -192,7 +201,34 @@ def add_team_grade_handoff_constraints(
                                 if penalty_weight > 0:
                                     obj_terms.append(-penalty_weight * slack)
                             else:
-                                m.Add(vars_sum <= 1)
+                                if _add_hard_fn is not None and _registry is not None:
+                                    # 같은 (team, rule) 의 모든 day×shift 를 하나의 literal 로 묶음.
+                                    _name = f"HandoffSame:team_{team_id}:rule_{r_idx}"
+                                    _meta = {
+                                        "node_id": f"handoff_same:team_{team_id}:rule_{r_idx}",
+                                        "type": "HandoffSameNode",
+                                        "label": f"Team {team_id} rule#{r_idx} 같은 시프트 ≤ 1",
+                                        "value": {
+                                            "team_id": str(team_id),
+                                            "rule_idx": int(r_idx),
+                                            "grades": list(lhs_grades),
+                                        },
+                                        "scope": "team_handoff",
+                                        "scope_key": f"handoff_team_{team_id}_rule_{r_idx}_same",
+                                        "pattern": "handoff_same",
+                                        "human_message_ko": (
+                                            f"팀 {team_id} 의 handoff 규칙 #{r_idx} "
+                                            f"(grades={lhs_grades}) 의 '같은 시프트 동시 1명 이하' 정책"
+                                        ),
+                                        "resolution_hint": (
+                                            f"팀 {team_id} handoff 규칙 #{r_idx} 의 "
+                                            "block_same_shift 를 끄거나 soft fallback 으로 전환하세요."
+                                        ),
+                                    }
+                                    _add_hard_fn(m, _registry, name=_name,
+                                                 constraint_expr=(vars_sum <= 1), meta=_meta)
+                                else:
+                                    m.Add(vars_sum <= 1)
 
                 # (B) 인접 인계 금지: b_L + b_R <= 1
                 if block_adj:
@@ -230,6 +266,35 @@ def add_team_grade_handoff_constraints(
                                 if penalty_weight > 0:
                                     obj_terms.append(-penalty_weight * slack)
                             else:
-                                m.Add(bL + bR <= 1)
+                                if _add_hard_fn is not None and _registry is not None:
+                                    # 같은 (team, rule) 의 모든 day×transition 을 하나의 literal 로 묶음.
+                                    _name = f"HandoffAdj:team_{team_id}:rule_{r_idx}"
+                                    _meta = {
+                                        "node_id": f"handoff_adj:team_{team_id}:rule_{r_idx}",
+                                        "type": "HandoffAdjNode",
+                                        "label": f"Team {team_id} rule#{r_idx} 인접 인계 금지",
+                                        "value": {
+                                            "team_id": str(team_id),
+                                            "rule_idx": int(r_idx),
+                                            "lhs_grades": list(lhs_grades),
+                                            "rhs_grades": list(rhs_grades),
+                                        },
+                                        "scope": "team_handoff",
+                                        "scope_key": f"handoff_team_{team_id}_rule_{r_idx}_adj",
+                                        "pattern": "handoff_adj",
+                                        "human_message_ko": (
+                                            f"팀 {team_id} 의 handoff 규칙 #{r_idx} "
+                                            f"(lhs={lhs_grades} → rhs={rhs_grades}) 의 "
+                                            "'인접 인계 (D→E, E→N, N→D익일) 금지' 정책"
+                                        ),
+                                        "resolution_hint": (
+                                            f"팀 {team_id} handoff 규칙 #{r_idx} 의 "
+                                            "block_adjacent 를 끄거나 soft fallback 으로 전환하세요."
+                                        ),
+                                    }
+                                    _add_hard_fn(m, _registry, name=_name,
+                                                 constraint_expr=(bL + bR <= 1), meta=_meta)
+                                else:
+                                    m.Add(bL + bR <= 1)
 
     return obj_terms
