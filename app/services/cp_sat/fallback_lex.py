@@ -485,8 +485,10 @@ def optimize_fallback_lex_hard_first(
         m = cp_model.CpModel()
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
-        # relax_level >= 3: max coverage + M min hard → soft 전환 (인원 부족 시 생성 보장)
-        _relax_coverage = relax_level >= 3
+        # 정책 (2026-05-13 이후): relax_level 여부와 무관하게 max coverage / M min 일괄 HARD 유지.
+        # 이전: relax_level >= 3 일 때 soft 전환했으나, 운영상 max coverage 가 무너지면 품질 저하 →
+        # relax 단계에서도 hard 유지. 인원 부족 시에는 다른 hard(team_min, grade 등) 를 먼저 soft 로 풀어야 함.
+        _relax_coverage = False
         coverage_soft_weight = int(
             getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000
         )
@@ -1352,11 +1354,22 @@ def optimize_fallback_lex_hard_first(
                 #     m.Add(xd_prev + xn <= 1)
 
         # 1N 금지 (day0 N 고정인 경우 해당일만 스킵)
+        # nurse_monthly_limit.n_max==1 nurse 는 사용자 명시 의도 우선으로 면제.
         not_one_night_val = getattr(cfg, "not_one_night", False)
         print(f"{logger_prefix} [1N금지] not_one_night={not_one_night_val!r} (type={type(not_one_night_val).__name__})")
+        try:
+            from services.constraints.monthly_limit_constraints import (
+                collect_single_n_allowed_nurse_indices,
+            )
+            _single_n_allowed_lex = collect_single_n_allowed_nurse_indices(roster_system)
+        except Exception as _e_sn:
+            print(f"{logger_prefix} [1N금지] single_n allowed set 계산 실패(무시): {_e_sn}")
+            _single_n_allowed_lex = set()
         if bool(not_one_night_val):
             for n in range(N):
                 if _is_preceptee_at(n):
+                    continue
+                if n in _single_n_allowed_lex:
                     continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):

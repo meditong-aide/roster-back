@@ -53,10 +53,22 @@ def postprocess_off_swap(
     target = _resolve_target_shift(db, schedule.group_id)
     print(
         f"[OffSwap] target_shift={target.shift_id if target else None} "
-        f"target_id={target.id if target else None}"
+        f"target_id={target.id if target else None} target_type={getattr(target, 'type', None) if target else None}"
     )
     if target is None:
         print("[OffSwap][SKIP] target shift 없음 (off_swap_target=True 인 shifts row 미존재)")
+        return generated
+    # 안전망: target shift 의 type 이 '근무' 면 OFF→근무 변환이 일별 coverage oversupply 를
+    # 유발하므로 변환 자체를 SKIP. 정상적으로는 _assert_off_swap_target_valid 로 저장
+    # 단계에서 차단되지만, 기존 dirty 데이터 보호용.
+    if str(getattr(target, "type", "") or "").strip() == "근무":
+        logger.warning(
+            f"[OffSwap][SKIP] target shift={target.shift_id} type='근무' — OFF→근무 치환 시 "
+            f"oversupply 위험으로 후처리 스킵. 운영자가 다른 휴가성 shift 로 변경 필요."
+        )
+        print(
+            f"[OffSwap][SKIP] target shift={target.shift_id} type='근무' — oversupply 위험"
+        )
         return generated
 
     baseline = int(getattr(latest_config, "off_days", 0) or 0)
