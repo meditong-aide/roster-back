@@ -166,6 +166,59 @@ class HardAssumptionRegistry:
                     "human_message_ko": hint_msg,
                 })
 
+        # ── min/max pairing: 같은 (grade, shift) 의 grade_min ∧ grade_max 가
+        #    같은 MUS 안에 동시 등장하면 한 코어로 병합한다 (reversed config 등).
+        #    scope_key 명명은 wrap 측에서 "grade_{g}_{shift}_{min|max}" 로 고정.
+        import re as _re
+        _pair_re = _re.compile(r"^grade_(\d+)_([a-z]+)_(min|max)$")
+        _by_base: Dict[str, Dict[str, str]] = {}
+        for cid in list(grouped.keys()):
+            sk = cid.replace("conflict:cpsat:", "")
+            mm = _pair_re.match(sk)
+            if not mm:
+                continue
+            base = f"grade_{mm.group(1)}_{mm.group(2)}"
+            _by_base.setdefault(base, {})[mm.group(3)] = cid
+        for base, sides in _by_base.items():
+            if "min" not in sides or "max" not in sides:
+                continue
+            min_cid, max_cid = sides["min"], sides["max"]
+            min_core, max_core = grouped[min_cid], grouped[max_cid]
+            merged_id = f"conflict:cpsat:{base}_minmax"
+            _parts = base.split("_")  # ["grade", "<g>", "<shift>"]
+            _g, _sc = _parts[1], _parts[2].upper()
+            grouped[merged_id] = {
+                "core_id": merged_id,
+                "scope": "grade",
+                "pattern": "cpsat_mus:grade_minmax_conflict",
+                "nurse_id": None,
+                "members": list(min_core["members"]) + list(max_core["members"]),
+                "derivation": [
+                    {"step": 1, "from": f"CP-SAT solver ({solver_phase})",
+                     "infer": (
+                         f"같은 (Grade {_g}, {_sc} 시프트) 의 min·max 가 "
+                         "동시에 만족 불가 — 설정 반전(min > max) 또는 "
+                         "다른 hard 제약과의 결합 가능성"
+                     )},
+                ],
+                "conclusion": (
+                    f"CP-SAT MUS: Grade {_g} {_sc} 의 min 과 max 가 동시 충돌"
+                ),
+                "resolution_hints": (
+                    list(min_core.get("resolution_hints") or [])
+                    + list(max_core.get("resolution_hints") or [])
+                ),
+                "human_message_ko": (
+                    f"Grade {_g} 등급의 {_sc} 시프트는 min 과 max 가 동시에 "
+                    "충돌합니다. 두 정책 중 하나를 완화하거나 (min ≤ max) 가 "
+                    "되도록 재설정하세요."
+                ),
+                "source": f"cpsat_mus_{solver_phase}",
+                "solver_phase": solver_phase,
+            }
+            grouped.pop(min_cid, None)
+            grouped.pop(max_cid, None)
+
         # 결론 텍스트 정교화 (member 수에 따라 자연어 분기)
         def _quantifier(n: int) -> str:
             return "둘이" if n == 2 else "셋이" if n == 3 else f"{n}개가"
