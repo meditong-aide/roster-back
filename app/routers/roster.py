@@ -838,12 +838,9 @@ async def get_roster_by_schedule_id(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # 대상 그룹 결정
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, "is_master_admin", False):
-            raise HTTPException(status_code=403, detail="Permission denied")
+    # 대상 그룹 결정.
+    # 우선순위: ADM(query 그대로) → HN multi-group managed → 본인 home group.
+    if current_user.is_master_admin:
         if not group_id:
             raise HTTPException(
                 status_code=400, detail="group_id is required for admin"
@@ -859,6 +856,21 @@ async def get_roster_by_schedule_id(
                 status_code=403, detail="Group does not belong to your office"
             )
         target_group_id = g.group_id
+    elif current_user.is_head_nurse and current_user.group_id:
+        target_group_id = current_user.group_id
+        if group_id and group_id != target_group_id:
+            # HN multi-group 통합페이지: managed groups 안이면 통과.
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                )
+    else:
+        raise HTTPException(status_code=403, detail="Permission denied")
 
     # Get schedule info
     schedule = (
