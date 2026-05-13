@@ -485,8 +485,10 @@ def optimize_fallback_lex_hard_first(
         m = cp_model.CpModel()
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
-        # relax_level >= 3: max coverage + M min hard → soft 전환 (인원 부족 시 생성 보장)
-        _relax_coverage = relax_level >= 3
+        # 정책 (2026-05-13 이후): relax_level 여부와 무관하게 max coverage / M min 일괄 HARD 유지.
+        # 이전: relax_level >= 3 일 때 soft 전환했으나, 운영상 max coverage 가 무너지면 품질 저하 →
+        # relax 단계에서도 hard 유지. 인원 부족 시에는 다른 hard(team_min, grade 등) 를 먼저 soft 로 풀어야 함.
+        _relax_coverage = False
         coverage_soft_weight = int(
             getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000
         )

@@ -11,12 +11,51 @@ from datetime import time as dt_time
 from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
+from fastapi import HTTPException
 from openpyxl.styles import Font, PatternFill
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from db.models import Shift, Nurse, Group, ShiftManage, ScheduleEntry
 from schemas.auth_schema import User as UserSchema
+
+
+def _assert_off_swap_target_valid(
+    db: Session,
+    *,
+    group_id: str,
+    target_value: bool,
+    shift_type: Optional[str],
+    self_id: Optional[int] = None,
+) -> None:
+    """off_swap_target=True 저장 전 정책 검증.
+
+    1) 변환 대상 shift 의 type 은 '근무' 가 아니어야 한다.
+       (근무 코드를 변환 target 으로 두면 OFF→근무 치환 시 일별 coverage oversupply 발생)
+    2) 동일 group_id 내 off_swap_target=True 인 row 는 단 1건만 허용.
+       (다수면 _resolve_target_shift 가 sequence ASC 첫 번째만 채택해 의도와 다른 결과)
+
+    target_value=False 면 검증 skip. self_id 는 update 시 본인 row 를 비교 대상에서 제외.
+    """
+    if not target_value:
+        return
+    if str(shift_type or "").strip() == "근무":
+        raise HTTPException(
+            status_code=400,
+            detail="off_swap_target=True 는 type='근무' 인 근무코드에는 설정할 수 없습니다.",
+        )
+    q = db.query(Shift).filter(Shift.group_id == group_id, Shift.off_swap_target == True)  # noqa: E712
+    if self_id is not None:
+        q = q.filter(Shift.id != self_id)
+    other = q.first()
+    if other is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"off_swap_target=True 는 그룹당 1건만 설정 가능합니다. "
+                f"기존 설정: shift_id={other.shift_id}, name={other.name}"
+            ),
+        )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -378,6 +417,13 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
     ).first()
     if existing_shift:
         raise Exception("이미 존재하는 근무코드입니다.")
+    _assert_off_swap_target_valid(
+        db,
+        group_id=target_group_id,
+        target_value=bool(getattr(req, "off_swap_target", False) or False),
+        shift_type=getattr(req, "type", None),
+        self_id=None,
+    )
     max_sequence = db.query(func.max(Shift.sequence)).filter(Shift.group_id == target_group_id).scalar() or 0
     new_shift = Shift(
         shift_id=req.shift_id,
@@ -431,6 +477,19 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     print('existing_shift.shift_gb before', existing_shift.shift_gb)
     if not existing_shift:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
+    # off_swap_target 정책 검증 — 변경 후 (type, off_swap_target) 조합 기준.
+    _new_target = (
+        bool(req.off_swap_target)
+        if (hasattr(req, "off_swap_target") and req.off_swap_target is not None)
+        else bool(existing_shift.off_swap_target or False)
+    )
+    _assert_off_swap_target_valid(
+        db,
+        group_id=target_group_id,
+        target_value=_new_target,
+        shift_type=req.type,
+        self_id=existing_shift.id,
+    )
     old_shift_id = existing_shift.shift_id
     old_shift_gb = getattr(existing_shift, "shift_gb", None)
     existing_shift.shift_id = req.shift_id

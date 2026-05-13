@@ -117,6 +117,8 @@ async def add_shift(
     try:
         print('----------------------------------[shifts/add] group_id', group_id)
         result = add_shift_service(req, current_user, db, group_id)
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"근무코드 추가 실패: {str(e)}")
@@ -132,6 +134,8 @@ async def update_shift(
         print('[shifts/update] group_id', group_id)
         result = update_shift_service(req, current_user, db, group_id)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"근무코드 수정 실패: {str(e)}")
