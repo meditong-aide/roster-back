@@ -196,52 +196,119 @@ class HardAssumptionRegistry:
                         c["affected_nurse_ids"] = [nid] if nid else []
                 deduped.extend(group)
                 continue
-            # 같은 패턴 그룹 합치기 — 대표 core를 골라 affected_nurse_ids 추가
+            # 같은 패턴 그룹 합치기.
+            # nurse-scoped (nurse_id 존재) → 기존대로 "n명에 동시 binding" 요약.
+            # 비-nurse scope (예: grade, global) → scope_key 별 멤버를 보존해
+            # "Grade 1 D min, Grade 2 D min …" 처럼 구체 정책 단위로 노출.
             rep = group[0]
-            affected = [c.get("nurse_id") for c in group if c.get("nurse_id")]
-            affected = sorted(set(str(a) for a in affected if a is not None))
+            affected_nurses = sorted(set(
+                str(c.get("nurse_id")) for c in group if c.get("nurse_id")
+            ))
             rep_member_types = sorted(set(str(m.get("type")) for m in rep["members"]))
-            collapsed_core_id = f"conflict:cpsat:group:{rep.get('pattern')}"
-            collapsed = {
-                "core_id": collapsed_core_id,
-                "scope": "multi_nurse",
-                "pattern": rep.get("pattern"),
-                "nurse_id": None,
-                "solver_phase": solver_phase,
-                "source": f"cpsat_mus_{solver_phase}",
-                "affected_nurse_ids": affected,
-                "affected_count": len(affected),
-                # 멤버는 type 단위로 1개씩만 (대표) — 자세한 nurse별 멤버는
-                # per_nurse_cores 리스트에 보존
-                "members": [
-                    {
-                        "node_id": f"member_type_summary:{t}",
-                        "type": t,
-                        "label": f"{t} × {len(affected)} nurses",
-                        "value": None,
-                        "human_message_ko": f"{t} 제약이 {len(affected)} 명의 nurse 에 동시 binding",
-                    }
-                    for t in rep_member_types
-                ],
-                "derivation": [
-                    {"step": 1, "from": "CP-SAT solver",
-                     "infer": f"같은 멤버 타입 셋 ({', '.join(rep_member_types)})이 {len(affected)} 명에 동시 unsat"},
-                    {"step": 99, "conclusion":
-                     f"affected: {', '.join(affected[:5])}"
-                     + (f" (+{len(affected)-5}명)" if len(affected) > 5 else "")},
-                ],
-                "conclusion": (
-                    f"CP-SAT MUS: 같은 패턴 ({', '.join(rep_member_types)}) 이 "
-                    f"{len(affected)} 명에 동시 binding"
-                ),
-                "resolution_hints": rep.get("resolution_hints") or [],
-                "human_message_ko": (
-                    f"이 충돌은 {len(affected)} 명의 간호사에 동시 발생. "
-                    "공통 제약(전역 cap 또는 같은 정책)을 풀면 일괄 해소될 가능성."
-                ),
-                "source": "cpsat_mus",
-                "per_nurse_cores": [c["core_id"] for c in group],
-            }
+            is_nurse_scoped = bool(affected_nurses)
+
+            if is_nurse_scoped:
+                collapsed_core_id = f"conflict:cpsat:group:{rep.get('pattern')}"
+                collapsed = {
+                    "core_id": collapsed_core_id,
+                    "scope": "multi_nurse",
+                    "pattern": rep.get("pattern"),
+                    "nurse_id": None,
+                    "solver_phase": solver_phase,
+                    "source": f"cpsat_mus_{solver_phase}",
+                    "affected_nurse_ids": affected_nurses,
+                    "affected_count": len(affected_nurses),
+                    # 멤버는 type 단위로 1개씩만 (대표) — 자세한 nurse별 멤버는
+                    # per_nurse_cores 리스트에 보존
+                    "members": [
+                        {
+                            "node_id": f"member_type_summary:{t}",
+                            "type": t,
+                            "label": f"{t} × {len(affected_nurses)} nurses",
+                            "value": None,
+                            "human_message_ko": f"{t} 제약이 {len(affected_nurses)} 명의 nurse 에 동시 binding",
+                        }
+                        for t in rep_member_types
+                    ],
+                    "derivation": [
+                        {"step": 1, "from": "CP-SAT solver",
+                         "infer": f"같은 멤버 타입 셋 ({', '.join(rep_member_types)})이 {len(affected_nurses)} 명에 동시 unsat"},
+                        {"step": 99, "conclusion":
+                         f"affected: {', '.join(affected_nurses[:5])}"
+                         + (f" (+{len(affected_nurses)-5}명)" if len(affected_nurses) > 5 else "")},
+                    ],
+                    "conclusion": (
+                        f"CP-SAT MUS: 같은 패턴 ({', '.join(rep_member_types)}) 이 "
+                        f"{len(affected_nurses)} 명에 동시 binding"
+                    ),
+                    "resolution_hints": rep.get("resolution_hints") or [],
+                    "human_message_ko": (
+                        f"이 충돌은 {len(affected_nurses)} 명의 간호사에 동시 발생. "
+                        "공통 제약(전역 cap 또는 같은 정책)을 풀면 일괄 해소될 가능성."
+                    ),
+                    "source": "cpsat_mus",
+                    "per_nurse_cores": [c["core_id"] for c in group],
+                }
+            else:
+                # 비-nurse scope (grade 등): 각 core 의 members 를 펼쳐 모아
+                # scope_key 단위로 dedupe (같은 (grade, shift) 의 여러 day 가
+                # 한 literal 로 묶여 있어 보통 1 member). resolution_hints 도 합산.
+                merged_members: List[Dict[str, Any]] = []
+                seen_member_keys: set = set()
+                merged_hints: List[Dict[str, Any]] = []
+                seen_hint_msgs: set = set()
+                affected_scope_keys: List[str] = []
+                for c in group:
+                    sk = str(c.get("core_id") or "").replace("conflict:cpsat:", "")
+                    if sk:
+                        affected_scope_keys.append(sk)
+                    for m in c.get("members") or []:
+                        key = (m.get("node_id"), m.get("type"), m.get("label"))
+                        if key in seen_member_keys:
+                            continue
+                        seen_member_keys.add(key)
+                        merged_members.append(m)
+                    for h in c.get("resolution_hints") or []:
+                        msg = h.get("human_message_ko") or ""
+                        if msg in seen_hint_msgs:
+                            continue
+                        seen_hint_msgs.add(msg)
+                        merged_hints.append(h)
+                affected_scope_keys = sorted(set(affected_scope_keys))
+                collapsed_core_id = f"conflict:cpsat:group:{rep.get('pattern')}"
+                _scope = str(rep.get("scope") or "group")
+                collapsed = {
+                    "core_id": collapsed_core_id,
+                    "scope": _scope,
+                    "pattern": rep.get("pattern"),
+                    "nurse_id": None,
+                    "solver_phase": solver_phase,
+                    "source": f"cpsat_mus_{solver_phase}",
+                    "affected_scope_keys": affected_scope_keys,
+                    "affected_count": len(affected_scope_keys),
+                    "members": merged_members,
+                    "derivation": [
+                        {"step": 1, "from": f"CP-SAT solver ({solver_phase})",
+                         "infer": (
+                             f"같은 패턴({rep.get('pattern')}) 의 정책 "
+                             f"{len(affected_scope_keys)} 건이 동시에 만족 불가"
+                         )},
+                        {"step": 99, "conclusion":
+                         f"affected policies: {', '.join(affected_scope_keys[:5])}"
+                         + (f" (+{len(affected_scope_keys)-5}건)" if len(affected_scope_keys) > 5 else "")},
+                    ],
+                    "conclusion": (
+                        f"CP-SAT MUS: {len(affected_scope_keys)} 개의 {_scope} "
+                        f"정책이 동시 만족 불가"
+                    ),
+                    "resolution_hints": merged_hints,
+                    "human_message_ko": (
+                        f"{len(affected_scope_keys)} 건의 {_scope} 정책이 동시에 만족 불가. "
+                        "아래 정책 중 하나를 완화하면 해소될 가능성이 높습니다."
+                    ),
+                    "source": "cpsat_mus",
+                    "per_member_cores": [c["core_id"] for c in group],
+                }
             deduped.append(collapsed)
 
         return deduped
