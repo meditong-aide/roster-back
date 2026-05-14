@@ -86,6 +86,31 @@ def _has_identity(db: Session, db_name: str, table: str) -> bool:
     return bool(row and row[0])
 
 
+def _table_has_column(db: Session, db_name: str, table: str, column: str) -> bool:
+    row = db.execute(
+        text(
+            f"SELECT 1 FROM {db_name}.INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=:t AND COLUMN_NAME=:c"
+        ),
+        {"t": table, "c": column},
+    ).fetchone()
+    return bool(row)
+
+
+def _exclude_group_clause(
+    exclude_group_ids: Optional[List[str]],
+    alias: str = "",
+) -> tuple:
+    """exclude_group_ids 가 있으면 (' WHERE group_id NOT IN (...)', params) 반환."""
+    if not exclude_group_ids:
+        return "", {}
+    placeholders = ", ".join(f":xg{i}" for i in range(len(exclude_group_ids)))
+    prefix = f"{alias}." if alias else ""
+    where = f" WHERE {prefix}group_id NOT IN ({placeholders})"
+    params = {f"xg{i}": g for i, g in enumerate(exclude_group_ids)}
+    return where, params
+
+
 def _disable_fk(db: Session, table: str) -> None:
     db.execute(text(f"ALTER TABLE {DEV_DB}.dbo.[{table}] NOCHECK CONSTRAINT ALL"))
 
@@ -116,12 +141,19 @@ def _get_pk_cols(db: Session, db_name: str, table: str) -> List[str]:
     return [r[0] for r in rows]
 
 
-def _delete_dev(db: Session, table: str) -> int:
-    result = db.execute(text(f"DELETE FROM {DEV_DB}.dbo.[{table}]"))
+def _delete_dev(
+    db: Session, table: str, exclude_group_ids: Optional[List[str]] = None
+) -> int:
+    where, params = "", {}
+    if exclude_group_ids and _table_has_column(db, DEV_DB, table, "group_id"):
+        where, params = _exclude_group_clause(exclude_group_ids)
+    result = db.execute(text(f"DELETE FROM {DEV_DB}.dbo.[{table}]{where}"), params)
     return result.rowcount if result.rowcount is not None else -1
 
 
-def _copy_prod_to_dev(db: Session, table: str) -> dict:
+def _copy_prod_to_dev(
+    db: Session, table: str, exclude_group_ids: Optional[List[str]] = None
+) -> dict:
     """dev 에 prod 내용을 그대로 INSERT. 공통 컬럼만 복사."""
     if not _table_exists(db, PROD_DB, table):
         return {"table": table, "skipped": "prod_missing", "inserted": 0}
@@ -139,15 +171,19 @@ def _copy_prod_to_dev(db: Session, table: str) -> dict:
 
     has_identity = _has_identity(db, DEV_DB, table)
 
+    where, params = "", {}
+    if exclude_group_ids and "group_id" in prod_cols:
+        where, params = _exclude_group_clause(exclude_group_ids, alias="src")
+
     sql = (
         f"INSERT INTO {DEV_DB}.dbo.[{table}] ({col_list}) "
-        f"SELECT {sel_list} FROM {PROD_DB}.dbo.[{table}] AS src"
+        f"SELECT {sel_list} FROM {PROD_DB}.dbo.[{table}] AS src{where}"
     )
 
     if has_identity:
         db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.[{table}] ON"))
     try:
-        result = db.execute(text(sql))
+        result = db.execute(text(sql), params)
         inserted = result.rowcount if result.rowcount is not None else -1
     finally:
         if has_identity:
@@ -156,7 +192,9 @@ def _copy_prod_to_dev(db: Session, table: str) -> dict:
     return {"table": table, "inserted": inserted}
 
 
-def _merge_upsert(db: Session, table: str) -> dict:
+def _merge_upsert(
+    db: Session, table: str, exclude_group_ids: Optional[List[str]] = None
+) -> dict:
     """MERGE 로 prod → dev upsert. dev-only row 보존 (DELETE 절 없음)."""
     if not _table_exists(db, PROD_DB, table):
         return {"table": table, "skipped": "prod_missing", "upserted": 0}
@@ -172,6 +210,12 @@ def _merge_upsert(db: Session, table: str) -> dict:
     common = [c for c in dev_cols if c in prod_cols]
     if not common:
         return {"table": table, "skipped": "no_common_cols", "upserted": 0}
+
+    src_clause = f"{PROD_DB}.dbo.[{table}]"
+    params: dict = {}
+    if exclude_group_ids and "group_id" in prod_cols:
+        where, params = _exclude_group_clause(exclude_group_ids)
+        src_clause = f"(SELECT * FROM {PROD_DB}.dbo.[{table}]{where})"
 
     # 문자열 PK 컬럼의 collation 충돌 방지 (prod/dev DB 기본 collation 다를 수 있음)
     str_types = {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
@@ -203,7 +247,7 @@ def _merge_upsert(db: Session, table: str) -> dict:
 
     sql = f"""
     MERGE {DEV_DB}.dbo.[{table}] AS dst
-    USING {PROD_DB}.dbo.[{table}] AS src
+    USING {src_clause} AS src
         ON {pk_join}
     {update_clause}
     WHEN NOT MATCHED BY TARGET THEN
@@ -214,7 +258,7 @@ def _merge_upsert(db: Session, table: str) -> dict:
     if has_identity:
         db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.[{table}] ON"))
     try:
-        result = db.execute(text(sql))
+        result = db.execute(text(sql), params)
         affected = result.rowcount if result.rowcount is not None else -1
     finally:
         if has_identity:
@@ -249,7 +293,11 @@ def _run_in_session(fn) -> tuple:
             pass
 
 
-def sync_prod_to_dev(db: Session = None, tables: Optional[List[str]] = None) -> dict:
+def sync_prod_to_dev(
+    db: Session = None,
+    tables: Optional[List[str]] = None,
+    exclude_group_ids: Optional[List[str]] = None,
+) -> dict:
     """마스터=wipe+copy / 트랜잭션=upsert(MERGE).
 
     각 단계를 **테이블별 독립 세션**으로 실행하여 connection drop 에 강건.
@@ -258,6 +306,9 @@ def sync_prod_to_dev(db: Session = None, tables: Optional[List[str]] = None) -> 
     Args:
         tables: 특정 테이블만 sync (None 이면 SYNC_TABLES 전체).
                 각 테이블의 mode 는 SYNC_TABLES 에서 lookup.
+        exclude_group_ids: group_id 컬럼이 있는 테이블에 한해 해당 group_id 행을
+                prod 에서 가져오지 않고 dev wipe 대상에서도 제외 (dev 기존 데이터 보존).
+                group_id 컬럼이 없는 테이블은 영향 없음.
     """
     # 모드 lookup
     mode_map = {t: m for t, m in SYNC_TABLES}
@@ -291,10 +342,12 @@ def sync_prod_to_dev(db: Session = None, tables: Optional[List[str]] = None) -> 
             errors.append({"phase": "disable_fk", "table": table, "error": err})
             logger.error("[prod→dev sync] FK disable 실패 %s: %s", table, err)
 
-    # 2. wipe 대상만 역순 DELETE
+    # 2. wipe 대상만 역순 DELETE (exclude_group_ids 행은 dev 보존)
     deleted_summary: dict = {}
     for table in reversed(wipe_tables):
-        cnt, err = _run_in_session(lambda s, t=table: _delete_dev(s, t))
+        cnt, err = _run_in_session(
+            lambda s, t=table: _delete_dev(s, t, exclude_group_ids)
+        )
         if err:
             errors.append({"phase": "delete", "table": table, "error": err})
             logger.error("[prod→dev sync] DELETE 실패 %s: %s", table, err)
@@ -304,7 +357,9 @@ def sync_prod_to_dev(db: Session = None, tables: Optional[List[str]] = None) -> 
     # 3. 순방향 처리 — wipe=INSERT, upsert=MERGE
     for table, mode in target_existing:
         if mode == "wipe":
-            r, err = _run_in_session(lambda s, t=table: _copy_prod_to_dev(s, t))
+            r, err = _run_in_session(
+                lambda s, t=table: _copy_prod_to_dev(s, t, exclude_group_ids)
+            )
             if err:
                 errors.append({"phase": "insert", "table": table, "error": err})
                 logger.error("[prod→dev sync] INSERT 실패 %s: %s", table, err)
@@ -315,7 +370,9 @@ def sync_prod_to_dev(db: Session = None, tables: Optional[List[str]] = None) -> 
                 r["deleted"] = deleted_summary.get(table, 0)
                 results.append(r)
         else:  # upsert
-            r, err = _run_in_session(lambda s, t=table: _merge_upsert(s, t))
+            r, err = _run_in_session(
+                lambda s, t=table: _merge_upsert(s, t, exclude_group_ids)
+            )
             if err:
                 errors.append({"phase": "upsert", "table": table, "error": err})
                 logger.error("[prod→dev sync] UPSERT 실패 %s: %s", table, err)
