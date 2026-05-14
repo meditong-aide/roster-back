@@ -215,6 +215,46 @@ def check_grade_min_sum_exceeds_need(inp: PrecheckInput) -> List[Dict]:
     return issues
 
 
+def check_grade_min_exceeds_max(inp: PrecheckInput) -> List[Dict]:
+    """Grade min/max 산술 모순(min > max) 즉시 탐지.
+
+    같은 shift, 같은 grade에서 minimum_by_shift 값이 max_by_shift 값을
+    초과하면 솔버 실행 전 설정 모순으로 간주한다.
+    """
+    gc = inp.grade_constraints or {}
+    gc_min = gc.get("minimum_by_shift") or {}
+    gc_max = gc.get("max_by_shift") or {}
+    issues: List[Dict] = []
+
+    for shift, per_grade_min in gc_min.items():
+        if not isinstance(per_grade_min, dict):
+            continue
+        per_grade_max = gc_max.get(shift) or {}
+        if not isinstance(per_grade_max, dict):
+            continue
+        for g_raw, mn_raw in per_grade_min.items():
+            if g_raw not in per_grade_max:
+                continue
+            try:
+                mn = int(mn_raw or 0)
+                mx = int(per_grade_max.get(g_raw) or 0)
+            except (TypeError, ValueError):
+                continue
+            if mn > mx:
+                issues.append(
+                    _issue(
+                        "GRADE_MIN_EXCEEDS_MAX",
+                        {
+                            "shift": shift,
+                            "grade": int(g_raw),
+                            "min": mn,
+                            "max": mx,
+                        },
+                    )
+                )
+    return issues
+
+
 def check_fixed_assign_exceeds_need(inp: PrecheckInput) -> List[Dict]:
     S = set(_apply_shifts(bool(inp.roster_config.get("use_mid", False))))
     counts: Dict[Tuple[str, int], int] = {}
@@ -709,6 +749,7 @@ _CONFIG_ERROR_CODES = {
     "FIXED_ASSIGN_EXCEEDS_NEED",
     "FIXED_ASSIGN_VIOLATES_ALLOWED",
     "FIXED_OFF_EXCEEDS_SPAN",
+    "GRADE_MIN_EXCEEDS_MAX",
 }
 
 
@@ -757,6 +798,7 @@ def run_precheck(
         check_mid_disabled_but_used,
         check_allowed_shifts_isolates_nurse,
         check_fixed_off_exceeds_span,  # Fix 4
+        check_grade_min_exceeds_max,
         check_team_size_insufficient,
         check_grade_min_sum_exceeds_need,
         check_fixed_assign_exceeds_need,
