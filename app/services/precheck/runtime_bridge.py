@@ -46,24 +46,47 @@ def _to_day_index(value: Any, year: int, month: int, days_in_month: int) -> Opti
 
 
 def _allowed_shifts_for(nurse: dict, use_mid: bool) -> Optional[List[str]]:
-    """해당 간호사가 가능한 시프트 코드 집합을 반환한다(공집합/기본=None)."""
-    shifts = nurse.get("work_shifts")
-    if shifts is None:
-        # is_night_nurse=3 → N 전담
-        if int(nurse.get("is_night_nurse", 0) or 0) == 3:
-            return ["N"]
-        return None
-    if isinstance(shifts, str):
-        codes = [c.strip().upper() for c in shifts.split(",") if c.strip()]
-    elif isinstance(shifts, (list, tuple, set)):
-        codes = [str(c).strip().upper() for c in shifts if c]
-    else:
-        return None
+    """해당 간호사가 가능한 시프트 코드 집합을 반환한다(공집합/기본=None).
+
+    현재 schema: ``is_night_nurse`` 는 허용 시프트 코드 list (예: ``["N"]`` = N전담,
+    ``[]`` = 전부 가능). ``work_shifts`` 는 일부 legacy 데이터에서만 채워진다.
+    """
     universe = {"D", "E", "N"}
     if use_mid:
         universe.add("M")
-    cleaned = [c for c in codes if c in universe]
-    return cleaned or None
+
+    def _normalize(raw: object) -> Optional[List[str]]:
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
+        elif isinstance(raw, (list, tuple, set)):
+            codes = [str(c).strip().upper() for c in raw if c is not None and str(c).strip()]
+        else:
+            return None
+        cleaned = [c for c in codes if c in universe]
+        return cleaned or None
+
+    # 현재 schema 우선
+    raw_nights = nurse.get("is_night_nurse")
+    if isinstance(raw_nights, (list, tuple, set)):
+        # 빈 list 는 "제한 없음" — None 으로 둬 universe 전체 허용
+        return _normalize(raw_nights)
+
+    # work_shifts 가 채워진 케이스
+    raw_shifts = nurse.get("work_shifts")
+    if raw_shifts is not None:
+        return _normalize(raw_shifts)
+
+    # 레거시: is_night_nurse 가 int/bool 인 경우
+    if isinstance(raw_nights, bool):
+        return ["N"] if raw_nights else None
+    if isinstance(raw_nights, (int, float)):
+        try:
+            return ["N"] if int(raw_nights) == 3 else None
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _weekly_off_count(weekly_off_weekday: Any, year: int, month: int) -> int:
