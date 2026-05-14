@@ -30,7 +30,7 @@ EXPLICIT_PKS = {
 # mode="wipe":  dev 전체 삭제 후 prod 복사 (마스터 — prod 완전 미러)
 # mode="upsert": MERGE (prod row 있으면 UPDATE, 없으면 INSERT, dev-only 보존)
 SYNC_TABLES: List[tuple] = [
-    # 마스터 (prod 완전 미러)
+    # 마스터 (prod 완전 미러) — 정의/설정 성격
     ("offices", "wipe"),
     ("groups", "wipe"),
     ("teams", "wipe"),
@@ -40,17 +40,29 @@ SYNC_TABLES: List[tuple] = [
     ("wanted_config", "wipe"),
     ("weekly_off_settings", "wipe"),
     ("shifts", "wipe"),
-    # 트랜잭션 (dev 테스트 데이터 보존)
-    ("wanted_requests", "upsert"),
-    # nurse_shift_requests / nurse_pair_requests / issued_roster:
-    # prod에 PK 제약이 없어 중복 발생 → MERGE 불가, wipe 로 처리
+    ("notices", "wipe"),
+    ("sticker", "wipe"),
+    ("schedule_holiday", "wipe"),
+    # 트랜잭션 — wipe (prod에 PK 제약 없어 MERGE 불가 또는 PK 자체가 없음)
     ("nurse_shift_requests", "wipe"),
     ("nurse_pair_requests", "wipe"),
+    ("issued_roster", "wipe"),
+    ("shift_preferences", "wipe"),  # PK 없음
+    # 트랜잭션 — upsert (PK 매칭 MERGE, dev-only row 보존)
+    ("wanted", "upsert"),
+    ("wanted_requests", "upsert"),
     ("fixed_wanted_entries", "upsert"),
     ("schedules", "upsert"),
     ("schedule_entries", "upsert"),
     ("daily_shift", "upsert"),
-    ("issued_roster", "wipe"),
+    ("nurse_assignment", "upsert"),
+    ("nurse_monthly_limits", "upsert"),
+    ("messages", "upsert"),
+    ("deleted_nurse_history", "upsert"),
+    ("share_links", "upsert"),
+    ("shift_manage", "upsert"),
+    ("shift_transfer_logs", "upsert"),
+    ("roster_jobs", "upsert"),
     ("issued_roster_snapshot", "upsert"),
 ]
 
