@@ -40,6 +40,88 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+# ---------------------------------------------------------------------------
+# Causal layer taxonomy
+#
+# 각 ConflictCore 의 root vs cascade 판별을 위한 분류 체계. dashboard 는
+# `causal_layer` 가 ``policy`` 인 core 를 root 후보로 핀하고, ``structural`` /
+# ``personal`` 인 core 는 cascade 로 접어둔다.
+# ---------------------------------------------------------------------------
+
+#: ``meta.type`` (member node type) → causal layer 매핑. 등록 안 된 타입은
+#: ``"unknown"`` 으로 처리되어 cascade 보다도 아래로 떨어진다.
+TYPE_TO_LAYER: Dict[str, str] = {
+    # policy — 사용자가 직접 설정한 정책 hard 제약
+    "TeamMinNode": "policy",
+    "TeamMaxNode": "policy",
+    "GradeMinNode": "policy",
+    "GradeMaxNode": "policy",
+    "CoverageMinNode": "policy",
+    "CoverageMaxNode": "policy",
+    "MonthlyLimitDMinNode": "policy",
+    "MonthlyLimitDMaxNode": "policy",
+    "MonthlyLimitEMinNode": "policy",
+    "MonthlyLimitEMaxNode": "policy",
+    "MonthlyLimitNMinNode": "policy",
+    "MonthlyLimitNMaxNode": "policy",
+    "MonthlyLimitOMinNode": "policy",
+    "MonthlyLimitOMaxNode": "policy",
+    # data — 입력 마스터 데이터 fact (사용자 데이터 입력 단계)
+    "ForbiddenCellNode": "data",
+    "AllowedShiftMaskNode": "data",
+    # personal — 개별 nurse 에 박힌 cap / 강제
+    "OffCapNode": "personal",
+    "NightCapNode": "personal",
+    "MonthlyNExactNode": "personal",
+    "MonthlyDExactNode": "personal",
+    "MonthlyEExactNode": "personal",
+    "MonthlyOExactNode": "personal",
+    "FixedWantedNode": "personal",
+    "WantedSubmissionNode": "personal",
+    "WantedApplyNode": "personal",
+    "PrecepteeSyncNode": "personal",
+    # structural — 모델 규칙 (모든 nurse 에 자동 적용)
+    "ConsecutiveWorkNode": "structural",
+    "ConsecutiveNightCapNode": "structural",
+    "RecoveryOffNode": "structural",
+    "TransitionBanNode": "structural",
+    "NotOneNightNode": "structural",
+    "OffWindowNode": "structural",
+    "CarryoverTransitionNode": "structural",
+}
+
+#: 우선순위 (작은 인덱스 = 더 root 다움).
+LAYER_PRIORITY: List[str] = ["policy", "data", "personal", "structural", "unknown"]
+
+
+def classify_member_type(node_type: Optional[str]) -> str:
+    """Member 의 ``type`` 으로 causal layer 결정. 미등록 타입은 ``"unknown"``."""
+    if not node_type:
+        return "unknown"
+    return TYPE_TO_LAYER.get(str(node_type), "unknown")
+
+
+def derive_core_layer(members: List[Dict[str, Any]]) -> str:
+    """Member 들 중 가장 root-y 한 layer 를 코어 대표 layer 로 반환."""
+    if not members:
+        return "unknown"
+    layers = {classify_member_type(m.get("type")) for m in members}
+    for lyr in LAYER_PRIORITY:
+        if lyr in layers:
+            return lyr
+    return "unknown"
+
+
+def per_layer_counts(members: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Member type 들의 layer 별 빈도. dashboard 가 breakdown 표시할 때 사용."""
+    counts: Dict[str, int] = {lyr: 0 for lyr in LAYER_PRIORITY}
+    for m in members or []:
+        lyr = classify_member_type(m.get("type"))
+        counts[lyr] = counts.get(lyr, 0) + 1
+    # 0 짜리는 제거해 dict 가 가벼워지도록
+    return {k: v for k, v in counts.items() if v > 0}
+
+
 class HardAssumption:
     __slots__ = ("lit", "name", "meta")
 
@@ -228,6 +310,9 @@ class HardAssumptionRegistry:
             if members:
                 names = ", ".join(m.get("label") or m.get("assumption_name") for m in members)
                 core["conclusion"] = f"CP-SAT MUS: {{ {names} }} {_quantifier(len(members))} 동시 만족 불가"
+            # causal layer (root vs cascade 판정)
+            core["causal_layer"] = derive_core_layer(members)
+            core["per_layer_counts"] = per_layer_counts(members)
 
         # ── Dedupe: 같은 (pattern + member type signature) 의 nurse 단위 cores를
         # 1개 group core 로 묶는다. 동일 패턴이 여러 nurse에 동시 발생할 때
@@ -247,6 +332,10 @@ class HardAssumptionRegistry:
                         c["affected_count"] = 1
                         nid = c.get("nurse_id")
                         c["affected_nurse_ids"] = [nid] if nid else []
+                    # singleton 도 causal_layer 보존되어 있어야 함 (위에서 set 됨)
+                    if "causal_layer" not in c:
+                        c["causal_layer"] = derive_core_layer(c.get("members") or [])
+                        c["per_layer_counts"] = per_layer_counts(c.get("members") or [])
                 deduped.extend(group)
                 continue
             # 같은 패턴 그룹 합치기.
@@ -362,6 +451,10 @@ class HardAssumptionRegistry:
                     "source": "cpsat_mus",
                     "per_member_cores": [c["core_id"] for c in group],
                 }
+            # collapsed core 의 causal_layer 는 멤버 타입(또는 그룹 첫 core)에서 derive
+            collapsed_members = collapsed.get("members") or []
+            collapsed["causal_layer"] = derive_core_layer(collapsed_members)
+            collapsed["per_layer_counts"] = per_layer_counts(collapsed_members)
             deduped.append(collapsed)
 
         return deduped

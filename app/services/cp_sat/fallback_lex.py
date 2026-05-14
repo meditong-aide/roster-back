@@ -259,7 +259,41 @@ def optimize_fallback_lex_hard_first(
 
     fixed, fixed_cnt = {}, [[0] * S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
+    fixed_source_by_cell: dict[tuple[int, int], str] = {}
     fixed_wanted_cells: set[tuple[int, int]] = set()
+
+    def _normalize_fixed_source(
+        raw_source: object,
+        shift_type: Optional[str],
+        shift_main: str,
+    ) -> str:
+        src = str(raw_source or "").strip().lower()
+        if src:
+            if src == "fixed_wanted":
+                return "fixed_wanted"
+            if src == "2n2off_recovery":
+                return "recovery_2n2off"
+            if src == "3n2off_recovery":
+                return "recovery_3n2off"
+            if src == "recovery_off":
+                return "recovery_off"
+            if src in {"weekly_off", "weekoff", "weekly_off_fixed"}:
+                return "weekly_off"
+            if src in {"special_fixed", "special", "vacation", "leave"}:
+                return "special"
+            return src
+        st = str(shift_type or "").strip()
+        if st == "주휴":
+            return "weekly_off"
+        if st in {"휴가", "공가", "휴무"}:
+            return "special"
+        if shift_main == "O":
+            return "off_fixed"
+        return "manual"
+
+    def _fixed_pattern_from_source(source: str) -> str:
+        return f"fixed_assignment:{source or 'manual'}"
+
     # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
     for c in getattr(roster_system, "fixed_cells", []) or []:
         
@@ -283,6 +317,11 @@ def optimize_fallback_lex_hard_first(
             (c.get("shift_type") or "").strip()
             or code2type.get(raw_code)
             or code2type.get(s_main)
+        )
+        fixed_source_by_cell[(n, d)] = _normalize_fixed_source(
+            c.get("fixed_source"),
+            fixed_type_by_cell[(n, d)],
+            s_main,
         )
         if str(c.get("fixed_source") or "").strip().lower() == "fixed_wanted":
             fixed_wanted_cells.add((n, d))
@@ -486,12 +525,14 @@ def optimize_fallback_lex_hard_first(
         # MUS 추출용 hard assumption registry — fallback path도 primary와 동일하게.
         # shared module (monthly_limit_constraints.py) 호출 시 이 registry가 활성화되어
         # 자동으로 wrap 됨. attach_to_model() 은 caller가 solver.Solve 직전에 호출.
+        _add_hard_fb = None
         try:
-            from services.cp_sat.hard_assumption import HardAssumptionRegistry
+            from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard_fb
             _assume_registry_fb = HardAssumptionRegistry(m)
             m._cpsat_assumption_registry = _assume_registry_fb  # type: ignore[attr-defined]
         except Exception as _ar_fb_exc:
             print(f"[FallbackLex] HardAssumptionRegistry init failed (ignore): {_ar_fb_exc}")
+            _assume_registry_fb = None
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
         # relax_level >= 3: max coverage + M min hard → soft 전환 (인원 부족 시 생성 보장)
@@ -748,14 +789,60 @@ def optimize_fallback_lex_hard_first(
         active_days = build_active_days(N, join, leave, blocked_by_nurse)
         # 고정 셀
         for (n, d), s_idx in fixed.items():
+            _fixed_source = fixed_source_by_cell.get((n, d), "manual")
+            _fixed_pattern = _fixed_pattern_from_source(_fixed_source)
             if (n, d) not in active_days:
                 continue
             if _is_preceptee_at(n):
                 continue
-            m.Add(X(n, d, s_idx) == 1)
+            _fixed_expr = (X(n, d, s_idx) == 1)
+            if _assume_registry_fb is not None and _add_hard_fb is not None:
+                _add_hard_fb(
+                    m,
+                    _assume_registry_fb,
+                    name=f"FixedCell:nurse_{n}:day_{d}",
+                    constraint_expr=_fixed_expr,
+                    meta={
+                        "node_id": f"fixed_cell:nurse_{n}:day_{d}",
+                        "type": "FixedWantedNode",
+                        "label": "fixed_assignment",
+                        "value": {"day": d + 1, "shift_idx": int(s_idx)},
+                        "fixed_source": _fixed_source,
+                        "scope": "nurse",
+                        "scope_key": f"nurse_{n}",
+                        "pattern": _fixed_pattern,
+                        "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                        "human_message_ko": f"{d + 1}일 고정 근무를 유지해야 합니다.",
+                        "resolution_hint": "해당 날짜 고정 근무를 해제하거나 충돌 정책을 완화하세요.",
+                    },
+                )
+            else:
+                m.Add(_fixed_expr)
             for s in range(S):
                 if s != s_idx:
-                    m.Add(X(n, d, s) == 0)
+                    _ban_expr = (X(n, d, s) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"FixedCellBan:nurse_{n}:day_{d}",
+                            constraint_expr=_ban_expr,
+                            meta={
+                                "node_id": f"fixed_cell_ban:nurse_{n}:day_{d}",
+                                "type": "FixedWantedNode",
+                                "label": "fixed_assignment_exclusive",
+                                "value": {"day": d + 1, "fixed_shift_idx": int(s_idx)},
+                                "fixed_source": _fixed_source,
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": _fixed_pattern,
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": f"{d + 1}일 고정 근무와 다른 시프트는 금지됩니다.",
+                                "resolution_hint": "고정 근무 또는 다른 하드 제약 중 하나를 조정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_ban_expr)
         # W(특별 근무)는 고정 셀 외에는 전부 금지
         if has_w and w_idx is not None:
             for n in range(N):
@@ -764,7 +851,28 @@ def optimize_fallback_lex_hard_first(
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     if (n, d) in fixed and fixed[(n, d)] == w_idx:
                         continue
-                    m.Add(X(n, d, w_idx) == 0)
+                    _w_ban_expr = (X(n, d, w_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"SpecialShiftBanW:nurse_{n}:day_{d}",
+                            constraint_expr=_w_ban_expr,
+                            meta={
+                                "node_id": f"special_shift_ban_w:nurse_{n}:day_{d}",
+                                "type": "ForbiddenCellNode",
+                                "label": "ban_unfixed_w_shift",
+                                "value": {"day": d + 1, "shift": "W"},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "forbidden_shift",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "고정되지 않은 W(특별 근무)는 배정할 수 없습니다.",
+                                "resolution_hint": "W 배정이 필요하면 해당 셀을 고정 근무로 지정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_w_ban_expr)
         # 순수 O 4연속 금지 (fixed로 이미 4O면 경고만 남기고 스킵)
         # cfg.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3)
         if off_idx is not None:
@@ -1025,7 +1133,28 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) in fixed:
                             # 유저 고정 셀 우선: 해당 날 전체 금지 무시
                             continue
-                        m.Add(X(n, d, s_idx) == 0)
+                        _if_expr = (X(n, d, s_idx) == 0)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"InitialForbidden:nurse_{n}:day_{d}",
+                                constraint_expr=_if_expr,
+                                meta={
+                                    "node_id": f"initial_forbidden:nurse_{n}:day_{d}",
+                                    "type": "ForbiddenCellNode",
+                                    "label": "initial_forbidden_shift",
+                                    "value": {"day": d + 1, "shift": code},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "initial_forbidden",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": f"초기 금지 규칙에 의해 {d + 1}일 {code} 배정이 금지됩니다.",
+                                    "resolution_hint": "초기 금지 규칙을 해제하거나 다른 하드 제약을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_if_expr)
         except Exception as e:
             print(f"{logger_prefix} 초기 금지 셀 적용 중 오류: {e}")
 
@@ -1343,17 +1472,80 @@ def optimize_fallback_lex_hard_first(
                 if getattr(cfg, "ban_n_to_d", True):
                     # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
                     if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == day_idx):
-                        m.Add(xn + xd <= 1)
+                        _n2d_expr = (xn + xd <= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"TransitionBanN2D:nurse_{n}:day_{d}",
+                                constraint_expr=_n2d_expr,
+                                meta={
+                                    "node_id": f"transition_ban_n2d:nurse_{n}:day_{d}",
+                                    "type": "TransitionBanNode",
+                                    "label": "ban_n_to_d",
+                                    "value": {"day": d + 1, "transition": "N->D"},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "transition_ban",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "N 다음날 D 전이는 금지됩니다.",
+                                    "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_n2d_expr)
                 if getattr(cfg, "ban_e_to_d", True):
                     xe = X(n, d - 1, eve_idx)
                     # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
                     if not (fixed.get((n, d-1)) == eve_idx and fixed.get((n, d)) == day_idx):
-                        m.Add(xe + xd <= 1)
+                        _e2d_expr = (xe + xd <= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"TransitionBanE2D:nurse_{n}:day_{d}",
+                                constraint_expr=_e2d_expr,
+                                meta={
+                                    "node_id": f"transition_ban_e2d:nurse_{n}:day_{d}",
+                                    "type": "TransitionBanNode",
+                                    "label": "ban_e_to_d",
+                                    "value": {"day": d + 1, "transition": "E->D"},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "transition_ban",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "E 다음날 D 전이는 금지됩니다.",
+                                    "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_e2d_expr)
                 if getattr(cfg, "ban_n_to_e", True):
                     xe2 = X(n, d, eve_idx)
                     # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
                     if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == eve_idx):
-                        m.Add(xn + xe2 <= 1)
+                        _n2e_expr = (xn + xe2 <= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"TransitionBanN2E:nurse_{n}:day_{d}",
+                                constraint_expr=_n2e_expr,
+                                meta={
+                                    "node_id": f"transition_ban_n2e:nurse_{n}:day_{d}",
+                                    "type": "TransitionBanNode",
+                                    "label": "ban_n_to_e",
+                                    "value": {"day": d + 1, "transition": "N->E"},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "transition_ban",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "N 다음날 E 전이는 금지됩니다.",
+                                    "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_n2e_expr)
                 if mid_idx is not None:
                     m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
                 # if getattr(cfg, "ban_d_to_n", True):
@@ -1457,7 +1649,28 @@ def optimize_fallback_lex_hard_first(
                         if not free_days_w:
                             print(f"{logger_prefix} off_window 무시 (유저 고정 우선, fallback): n={n}, window=[{left+1},{right+1}] 전체 고정")
                             continue
-                        m.Add(sum(X(n, d, off_idx) for d in free_days_w) >= 1)
+                        _ow_expr_fb = (sum(X(n, d, off_idx) for d in free_days_w) >= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"OffWindowRequirement:nurse_{n}:left_{left}:right_{right}",
+                                constraint_expr=_ow_expr_fb,
+                                meta={
+                                    "node_id": f"off_window_requirement:nurse_{n}:left_{left}:right_{right}",
+                                    "type": "OffWindowNode",
+                                    "label": "off_window_min_off",
+                                    "value": {"left_day": left + 1, "right_day": right + 1},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "off_window_requirement",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "월초 보정 구간 내 최소 1회 OFF가 필요합니다.",
+                                    "resolution_hint": "해당 구간의 고정 근무를 일부 해제하거나 OFF 배정 여유를 확보하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_ow_expr_fb)
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
@@ -1478,7 +1691,28 @@ def optimize_fallback_lex_hard_first(
                     continue
                 if any((n, d) in fixed and fixed[(n, d)] == off_idx for d in window):
                     continue
-                m.Add(sum(X(n, d, off_idx) for d in window) >= 1)
+                _mcw_expr_fb = (sum(X(n, d, off_idx) for d in window) >= 1)
+                if _assume_registry_fb is not None and _add_hard_fb is not None:
+                    _add_hard_fb(
+                        m,
+                        _assume_registry_fb,
+                        name=f"MaxConsecutiveWorkWindow:nurse_{n}:start_{d0}:k_{K}",
+                        constraint_expr=_mcw_expr_fb,
+                        meta={
+                            "node_id": f"max_consecutive_work:nurse_{n}:start_{d0}:k_{K}",
+                            "type": "ConsecutiveWorkNode",
+                            "label": "max_consecutive_work_min_off",
+                            "value": {"start_day": d0 + 1, "window_size": K + 1},
+                            "scope": "nurse",
+                            "scope_key": f"nurse_{n}",
+                            "pattern": "max_consecutive_work",
+                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "연속 근무 제한 구간(K+1)에는 최소 1회 OFF가 필요합니다.",
+                            "resolution_hint": "연속 근무 구간의 고정 배정을 완화하거나 OFF를 추가하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_mcw_expr_fb)
 
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
@@ -1497,22 +1731,84 @@ def optimize_fallback_lex_hard_first(
                         continue
                     days_in_window = list(range(T0, min(T0 + april_window_end + 1, T1 + 1)))
                     if days_in_window:
-                        m.Add(sum(X(n, d, night_idx) for d in days_in_window) <= cap)
+                        _cn_edge_expr_fb = (sum(X(n, d, night_idx) for d in days_in_window) <= cap)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"ConsecutiveNightCapEdge:nurse_{n}:w_{w}",
+                                constraint_expr=_cn_edge_expr_fb,
+                                meta={
+                                    "node_id": f"consecutive_night_cap_edge:nurse_{n}:w_{w}",
+                                    "type": "ConsecutiveNightCapNode",
+                                    "label": "consecutive_night_cap_edge",
+                                    "value": {"window_len": len(days_in_window), "cap": int(cap)},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "consecutive_night_cap",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "월경계 연속 야간 상한을 초과할 수 없습니다.",
+                                    "resolution_hint": "해당 구간의 N 고정을 완화하거나 야간 배정을 분산하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_cn_edge_expr_fb)
             for d0 in range(T0, T1 - L + 1):
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
                 exc = m.NewIntVar(0, L + 1, f"cnight_exc_{n}_{d0}")
                 m.Add(exc >= sum_n - L)
                 # 연속 N 상한 L 하드: three_seq_nig False면 L=2(3N 금지), True면 L=3(3N 허용)
-                m.Add(sum_n <= L)
+                _cn_expr_fb = (sum_n <= L)
+                if _assume_registry_fb is not None and _add_hard_fb is not None:
+                    _add_hard_fb(
+                        m,
+                        _assume_registry_fb,
+                        name=f"ConsecutiveNightCap:nurse_{n}:start_{d0}:L_{L}",
+                        constraint_expr=_cn_expr_fb,
+                        meta={
+                            "node_id": f"consecutive_night_cap:nurse_{n}:start_{d0}:L_{L}",
+                            "type": "ConsecutiveNightCapNode",
+                            "label": "consecutive_night_cap",
+                            "value": {"start_day": d0 + 1, "window_size": L + 1, "cap": int(L)},
+                            "scope": "nurse",
+                            "scope_key": f"nurse_{n}",
+                            "pattern": "consecutive_night_cap",
+                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "연속 야간 상한을 초과할 수 없습니다.",
+                            "resolution_hint": "연속 야간 구간의 고정을 완화하거나 다른 간호사로 분산하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_cn_expr_fb)
                 safety["cnight_excess"].append(exc)
 
-        # 월 Night 상한 초과량
+        # 월 Night 상한 초과량 — MUS 추출용 assumption literal로 wrap
         for n in range(N):
             if _is_preceptee_at(n):
                 continue
             T0, T1 = join[n], leave[n]
             sum_m = sum(X(n, d, night_idx) for d in range(T0, T1 + 1))
-            m.Add(sum_m <= cfg.max_night_shifts_per_month)
+            _fb_mn_expr = (sum_m <= cfg.max_night_shifts_per_month)
+            if _assume_registry_fb is not None and _add_hard_fb is not None:
+                _fb_nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
+                _add_hard_fb(
+                    m, _assume_registry_fb,
+                    name=f"MaxNight:nurse_{n}",
+                    constraint_expr=_fb_mn_expr,
+                    meta={
+                        "node_id": f"max_night:nurse_{n}",
+                        "type": "NightCapNode",
+                        "label": "max_night_shifts_per_month",
+                        "value": int(cfg.max_night_shifts_per_month or 0),
+                        "scope": "nurse", "scope_key": f"nurse_{n}",
+                        "pattern": "max_night",
+                        "nurse_id": str(getattr(_fb_nu, "nurse_id", n)) if _fb_nu else str(n),
+                        "human_message_ko": f"월간 N 상한 {int(cfg.max_night_shifts_per_month or 0)}일",
+                        "resolution_hint": "월간 N 상한을 늘리거나 이 간호사의 N 부담을 다른 인력에 분산하세요.",
+                    },
+                )
+            else:
+                m.Add(_fb_mn_expr)
 
         # N 전담: D/E 하드 금지 (메인 모델과 동일)
         for n, nu in enumerate(roster_system.nurses):
@@ -1525,13 +1821,97 @@ def optimize_fallback_lex_hard_first(
             T0, T1 = join[n], leave[n]
             for d in range(T0, T1 + 1):
                 if "D" not in allowed:
-                    m.Add(X(n, d, day_idx) == 0)
+                    _allow_d_expr = (X(n, d, day_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanD:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_d_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_D",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "D", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 D 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_d_expr)
                 if "E" not in allowed:
-                    m.Add(X(n, d, eve_idx) == 0)
+                    _allow_e_expr = (X(n, d, eve_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanE:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_e_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_E",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "E", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 E 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_e_expr)
                 if "N" not in allowed:
-                    m.Add(X(n, d, night_idx) == 0)
+                    _allow_n_expr = (X(n, d, night_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanN:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_n_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_N",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "N", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 N 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_n_expr)
                 if mid_idx is not None and "M" not in allowed:
-                    m.Add(X(n, d, mid_idx) == 0)
+                    _allow_m_expr = (X(n, d, mid_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanM:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_m_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_M",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "M", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 M 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_m_expr)
 
         # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
         # for n, nu in enumerate(roster_system.nurses):
@@ -1973,7 +2353,27 @@ def optimize_fallback_lex_hard_first(
                         safety["off_cap_bounded_slack"].append(weighted)
                         m.Add(nonvac_offs <= total_cap_effective + cap_slack)
                     else:
-                        m.Add(nonvac_offs <= total_cap_effective)
+                        # OFF cap hard branch — MUS 추출용 assumption literal로 wrap
+                        _fb_oc_expr = (nonvac_offs <= total_cap_effective)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m, _assume_registry_fb,
+                                name=f"OffCap:nurse_{n}",
+                                constraint_expr=_fb_oc_expr,
+                                meta={
+                                    "node_id": f"off_cap:nurse_{n}",
+                                    "type": "OffCapNode",
+                                    "label": "max_off (effective)",
+                                    "value": int(total_cap_effective),
+                                    "scope": "nurse", "scope_key": f"nurse_{n}",
+                                    "pattern": "off_cap",
+                                    "nurse_id": str(nurse_id) if nurse_id is not None else str(n),
+                                    "human_message_ko": f"이 간호사 OFF 상한 {int(total_cap_effective)}일",
+                                    "resolution_hint": "이 간호사 OFF 상한을 늘리세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_fb_oc_expr)
                     if stage == 3:
                         print(
                             f"{logger_prefix} [OffCap][total] n={n}, id={nurse_id}, name={nurse_name}, "
