@@ -2750,10 +2750,22 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     print('prev_month_last_is_off', prev_month_last_is_off)
 
     # ── 3) 병합 후 주입(금지/강제OFF 합집합) ──
+    # generate_roster_service 에서 미리 머지된 initial_constraints (mid-month boundary 등)
+    # 가 있으면 cross_month_constraints 머지 결과에 덧붙여 보존한다.
+    # 그렇지 않으면 _merge_initial_constraints 가 덮어써 mid-month 룰이 사라짐.
+    _pre_existing_ic = dict(config_dict.get("initial_constraints") or {})
     config_dict["initial_constraints"] = _merge_initial_constraints(
         base=cross_month_constraints,
         extra=allowed_constraints,
     )
+    _ic = config_dict["initial_constraints"]
+    for nid, days in (_pre_existing_ic.get('forced_off', {}) or {}).items():
+        _ic.setdefault('forced_off', {}).setdefault(nid, []).extend(days)
+        _ic['forced_off'][nid] = sorted(set(_ic['forced_off'][nid]))
+    for nid, day_shifts in (_pre_existing_ic.get('forbidden', {}) or {}).items():
+        for d, shifts in (day_shifts or {}).items():
+            _ic.setdefault('forbidden', {}).setdefault(nid, {}).setdefault(d, []).extend(shifts)
+            _ic['forbidden'][nid][d] = sorted(set(_ic['forbidden'][nid][d]))
     preflight_alerts = []
     try:
         checker_module = __import__(
@@ -3974,8 +3986,10 @@ def _compile_boundary_overlap_constraints(
         forbidden[boundary_day].append('D')
     if last_shift == 'N' and ban_n_to_e:
         forbidden[boundary_day].append('E')
-    if L and cons_n >= L and offs_after == 0:
-        forbidden[boundary_day].append('N')
+    # 정책 (2026-05-14): 파견/병동이동 분기점 day 는 last_shift / cons_n 와
+    # 무관하게 **무조건 N 금지**. 새 환경 첫 일자에 야간 근무 시작 회피.
+    # (기존 `cons_n >= L && offs_after == 0` 조건은 무조건 금지에 포함됨.)
+    forbidden[boundary_day].append('N')
 
     return {
         'forced_off': sorted(set(forced_off)),
