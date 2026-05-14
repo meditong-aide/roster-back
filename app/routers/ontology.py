@@ -204,6 +204,18 @@ def _run_summary(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _core_details_by_id(target: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rr = target.get("run_result") or {}
+    out: dict[str, dict[str, Any]] = {}
+    for attempt in (rr.get("runs") or []):
+        inf = attempt.get("infeasible_detail") or {}
+        for core in (inf.get("conflict_cores") or []):
+            cid = str(core.get("core_id") or "")
+            if cid and cid not in out:
+                out[cid] = core
+    return out
+
+
 # ── Endpoints ──────────────────────────────────────────────
 
 
@@ -450,12 +462,13 @@ def merged_graph(
             "CoverageMinNode", "CoverageMaxNode",
             "TeamMinNode", "TeamMaxNode",
             "GradeMinNode", "GradeMaxNode",
+            "TeamPoolNode", "GradePoolNode", "CommonPoolNode",
             "MonthlyOffNode", "WeeklyOffNode", "OffWindowNode",
             "CarryoverTransitionNode", "PrecepteeSyncNode",
             "WantedSubmissionNode", "WantedApplyNode",
             "NurseNode", "ShiftNode", "DayNode", "TeamNode",
             "FairnessNode", "DataQualityNode", "ConstraintNode",
-            "ConflictCoreNode", "NurseRoleNode", "OffCapNode",
+            "ConflictCoreNode", "OffCapNode",
             "NightCapNode", "MonthlyNExactNode",
         },
     }
@@ -684,10 +697,28 @@ def node_detail(node_id: str) -> JSONResponse:
         if node_id == f"run:{run_id}":
             rr = r.get("run_result") or {}
             attempts = rr.get("runs") or []
+            # 생성 시각: graph_export.run.generated_at 또는 run_dir 이름에서 파싱
+            _gen_at = (d.get("run") or {}).get("generated_at")
+            if not _gen_at:
+                try:
+                    _parts = r["dir"].split("-")
+                    if len(_parts) >= 2:
+                        _dp, _tp = _parts[-2], _parts[-1]
+                        if len(_dp) == 8 and len(_tp) == 6:
+                            _gen_at = (
+                                f"{_dp[:4]}-{_dp[4:6]}-{_dp[6:]}T"
+                                f"{_tp[:2]}:{_tp[2:4]}:{_tp[4:]}"
+                            )
+                except Exception:
+                    pass
+            if base_node is not None and _gen_at:
+                base_node["attrs"]["_generated_at"] = _gen_at
+                base_node["attrs"]["_run_dir"] = r["dir"]
             run_drilldown = {
                 "attempts": attempts,
                 "metrics": rr.get("metrics") or {},
                 "drilldown": rr.get("drilldown") or {},
+                "nurse_index_map": d.get("nurse_index_map") or {},
             }
 
     if base_node is None:
@@ -701,6 +732,17 @@ def node_detail(node_id: str) -> JSONResponse:
         out.sort(key=lambda x: (x.get("type") or "", x["id"]))
         return out
 
+    # nurse_index_map: 이 노드가 등장한 run들 중 가장 최신 run의 매핑 사용
+    # (같은 group이면 통상 동일하지만 ConflictCoreNode가 여러 run에 걸친 경우 보강용)
+    _nurse_idx_map: dict[str, dict] = {}
+    for r in runs:
+        rdir = r["dir"]
+        rid = (r["data"].get("run") or {}).get("run_id")
+        if rid and rid in [inc.get("run_id") for inc in incidences]:
+            nim = r["data"].get("nurse_index_map") or {}
+            if nim:
+                _nurse_idx_map = nim  # latest wins
+
     return JSONResponse(
         {
             "node": base_node,
@@ -711,8 +753,736 @@ def node_detail(node_id: str) -> JSONResponse:
             "inbound_neighbors": _normalize(inbound),
             "outbound_neighbors": _normalize(outbound),
             "run_drilldown": run_drilldown if run_drilldown else None,
+            "nurse_index_map": _nurse_idx_map,
         }
     )
+
+
+CONFLICT_CATALOG: dict[str, dict[str, Any]] = {
+    "cpsat_mus:fixed_assignment:fixed_wanted": {
+        "title": "원티드 고정 셀 충돌",
+        "what_ko": "승인/고정 원티드 셀이 다른 하드 제약과 동시에 만족되지 않습니다.",
+        "action_ko": "해당 원티드 고정을 해제하거나, 충돌하는 하드 제약(연속근무/야간상한/전이금지)을 완화하세요.",
+        "action_target": "fixed_wanted",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment:weekly_off": {
+        "title": "주휴(weekly OFF) 고정 셀 충돌",
+        "what_ko": "주휴로 고정된 OFF 셀이 다른 하드 제약과 동시에 만족되지 않습니다.",
+        "action_ko": "주휴 정책 또는 충돌하는 하드 제약(연속근무/야간상한/전이금지)을 조정하세요.",
+        "action_target": "weekly_off",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment:recovery_2n2off": {
+        "title": "2N→2OFF 회복 고정 셀 충돌",
+        "what_ko": "2N 후 2OFF 회복으로 고정된 OFF 셀이 다른 하드 제약과 충돌합니다.",
+        "action_ko": "two_offs_after_two_nig 설정 또는 충돌하는 하드 제약을 완화하세요.",
+        "action_target": "two_offs_after_two_nig",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment:recovery_3n2off": {
+        "title": "3N→2OFF 회복 고정 셀 충돌",
+        "what_ko": "3N 후 2OFF 회복으로 고정된 OFF 셀이 다른 하드 제약과 충돌합니다.",
+        "action_ko": "two_offs_after_three_nig 설정 또는 충돌하는 하드 제약을 완화하세요.",
+        "action_target": "two_offs_after_three_nig",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment:recovery_off": {
+        "title": "회복 OFF 고정 셀 충돌",
+        "what_ko": "회복 OFF로 분류된 고정 셀이 다른 하드 제약과 동시에 만족되지 않습니다.",
+        "action_ko": "회복 OFF 관련 정책(2N/3N 회복) 또는 충돌하는 하드 제약을 완화하세요.",
+        "action_target": "recovery_off",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment:special": {
+        "title": "특수/휴가 고정 셀 충돌",
+        "what_ko": "휴가·공가·특수 요청으로 고정된 셀이 다른 하드 제약과 충돌합니다.",
+        "action_ko": "해당 특수/휴가 고정을 조정하거나, 충돌하는 하드 제약을 완화하세요.",
+        "action_target": "special_fixed",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment:off_fixed": {
+        "title": "OFF 고정 셀 충돌",
+        "what_ko": "일반 OFF 고정 셀이 다른 하드 제약과 동시에 만족되지 않습니다.",
+        "action_ko": "해당 OFF 고정을 조정하거나, 충돌하는 하드 제약을 완화하세요.",
+        "action_target": "fixed_off",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment:manual": {
+        "title": "수동 고정 셀 충돌",
+        "what_ko": "수동으로 고정된 셀이 다른 하드 제약과 동시에 만족되지 않습니다.",
+        "action_ko": "해당 고정 셀을 조정하거나, 충돌하는 하드 제약을 완화하세요.",
+        "action_target": "fixed_assignment",
+        "adjustable": True,
+    },
+    "cpsat_mus:fixed_assignment": {
+        "title": "고정 셀 충돌",
+        "what_ko": "고정 셀이 다른 하드 제약과 동시에 만족되지 않습니다.",
+        "action_ko": "해당 고정 셀 또는 충돌하는 하드 제약을 조정하세요.",
+        "action_target": "fixed_assignment",
+        "adjustable": True,
+    },
+    "cpsat_mus:not_one_night": {
+        "title": "야간 배정 규칙 과부하",
+        "what_ko": "야간 단독 금지·월간 N상한·OFF상한·회복 규칙이 동시에 너무 좁습니다.",
+        "action_ko": "월간 야간 상한을 1~2 늘리거나, 야간 단독 금지 규칙을 완화하세요.",
+        "action_target": "night_cap",
+        "adjustable": True,
+    },
+    "cpsat_mus:monthly_limit_n": {
+        "title": "월간 야간 횟수 고정값 충돌",
+        "what_ko": "월간 야간 정확값(N_exact) 제약이 다른 OFF 제약과 동시에 맞지 않습니다.",
+        "action_ko": "해당 간호사의 월간 야간 횟수 고정 제약을 해제하세요.",
+        "action_target": "n_exact",
+        "adjustable": True,
+    },
+    "cpsat_mus:coverage_min": {
+        "title": "최소 인원 미달 충돌",
+        "what_ko": "특정 시프트의 최소 인원 기준이 현재 배정 가능 인원보다 많습니다.",
+        "action_ko": "해당 시프트의 최소 인원 기준을 낮추거나, 배정 가능 간호사를 추가하세요.",
+        "action_target": "coverage_min",
+        "adjustable": True,
+    },
+    "n_only_vs_caps": {
+        "title": "N전담 + OFF 상한 불가능 조합",
+        "what_ko": "N 전담 설정인데 OFF 여유가 없어 어떤 배정도 불가합니다.",
+        "action_ko": "해당 간호사의 N전담 지정을 해제하거나, OFF 상한을 높이세요.",
+        "action_target": "nurse_role",
+        "adjustable": True,
+    },
+    "cpsat_mus:max_night": {
+        "title": "월간 야간 상한 초과 충돌",
+        "what_ko": "월간 야간 상한이 다른 제약(연속근무, OFF 등)과 맞지 않습니다.",
+        "action_ko": "월간 야간 상한을 1~2 늘리거나, 연속 야간 제한을 완화하세요.",
+        "action_target": "night_cap",
+        "adjustable": True,
+    },
+    # ── 전월(carryover) 기반 구조적 제약 — 변경 불가 ──
+    # 진단 가치는 보존하되, agent가 잘못 "전월 기록 무시"를 제안하지 않도록
+    # action_target=NON_ADJUSTABLE로 라우팅 차단.
+    "carryover_prev_n_tail": {
+        "title": "전월 야간 후속 (구조적, 조정 불가)",
+        "what_ko": "전월 마지막에 N 시프트가 있어 이번 달 초의 회복 OFF가 강제됩니다.",
+        "action_ko": "전월 기록은 변경할 수 없습니다. 같은 충돌의 다른 제약(OFF 상한·이번달 야간 상한)을 조정하세요.",
+        "action_target": "NON_ADJUSTABLE",
+        "adjustable": False,
+    },
+    "carryover_prev_consec_work": {
+        "title": "전월 연속근무 (구조적, 조정 불가)",
+        "what_ko": "전월부터 이어진 연속근무가 이번 달 최대 연속근무 한도에 직접 영향을 미칩니다.",
+        "action_ko": "전월 기록은 변경할 수 없습니다. 이번 달 최대 연속근무 한도를 늘리거나 첫 주 OFF 배치를 조정하세요.",
+        "action_target": "NON_ADJUSTABLE",
+        "adjustable": False,
+    },
+    "carryover_prev_off_tail": {
+        "title": "전월 OFF 꼬리 (구조적, 조정 불가)",
+        "what_ko": "전월 마지막 OFF 패턴이 이번 달 초의 배정 가능성을 제한합니다.",
+        "action_ko": "전월 기록은 변경할 수 없습니다. 같은 충돌의 다른 멤버를 조정하세요.",
+        "action_target": "NON_ADJUSTABLE",
+        "adjustable": False,
+    },
+}
+
+# nurse_role_constrained는 운영상 실제 문제가 아니므로 operator card 제외
+_CONFLICT_CATALOG_SKIP_PATTERNS = {"nurse_role_constrained"}
+
+# 조정 불가 패턴: 단독으로는 operator card 생성하지 않음.
+# (같은 MUS의 다른 adjustable 멤버가 있을 때만 진단 보조로 노출)
+_CONFLICT_CATALOG_NON_ADJUSTABLE_PATTERNS = {
+    "carryover_prev_n_tail",
+    "carryover_prev_consec_work",
+    "carryover_prev_off_tail",
+}
+
+
+_FIXED_ASSIGNMENT_DISPLAY_MAP: dict[str, str] = {
+    "fixed_wanted": "fixed_wanted",
+    "weekly_off": "weekly_off",
+    "recovery_2n2off": "recovery_2n2off",
+    "recovery_3n2off": "recovery_3n2off",
+    "recovery_off": "recovery_off",
+    "special": "special_fixed",
+    "off_fixed": "off_fixed",
+    "manual": "fixed_cell",
+}
+
+
+def _to_display_pattern(pattern: str) -> str:
+    p = str(pattern or "")
+    if p.startswith("cpsat_mus:fixed_assignment:"):
+        src = p.split(":")[-1]
+        return _FIXED_ASSIGNMENT_DISPLAY_MAP.get(src, src)
+    return p
+
+
+_GUIDANCE_META: dict[str, dict[str, str]] = {
+    "supply_policy_gap": {
+        "title_ko": "수요/정책 요구 과밀",
+        "kind": "root",
+        "why_ko": "coverage/team/grade 최소 요구가 현재 가능한 인력/배치 조합보다 큽니다.",
+        "change_ko": "최소 요구치를 현실화하거나, 해당 shift를 소화할 수 있는 인력 풀을 늘리세요.",
+    },
+    "eligibility_gap": {
+        "title_ko": "배치 가능 인력 자격 부족",
+        "kind": "root",
+        "why_ko": "allowed shift, initial forbidden, role 제한 때문에 필요한 shift에 들어갈 후보 자체가 부족합니다.",
+        "change_ko": "허용 시프트/역할 제약을 재검토하거나, 특정 간호사의 금지 규칙을 완화하세요.",
+    },
+    "fixed_assignment_pressure": {
+        "title_ko": "고정 셀 압력",
+        "kind": "pressure",
+        "why_ko": "고정 OFF/원티드/특수 고정이 남은 배치 선택지를 줄이고 있습니다.",
+        "change_ko": "고정 셀을 유지해야 하는지 먼저 확인하고, 가능하면 일부 고정을 예외 처리하세요.",
+    },
+    "sequence_pressure": {
+        "title_ko": "시퀀스 제약 압력",
+        "kind": "pressure",
+        "why_ko": "연속근무·전이금지·월간 N 상한·회복 OFF 규칙이 남은 배치 경로를 더 좁히고 있습니다.",
+        "change_ko": "전역 완화보다, 특정 cohort의 연속근무/전이/야간 상한을 국소적으로 조정하세요.",
+    },
+    "boundary_transition_pressure": {
+        "title_ko": "경계/회복창 전이 압력",
+        "kind": "pressure",
+        "why_ko": "전월 tail·회복 OFF 창(OffWindow)과 전이금지 규칙이 함께 걸려 일반 nod/noe 완화만으로는 풀리지 않는 구간입니다.",
+        "change_ko": "단순 전이금지 토글보다, 경계일 carryover·회복 OFF 창·해당 구간 고정 셀을 함께 검토하세요.",
+    },
+    "coupling_pressure": {
+        "title_ko": "연동 제약 압력",
+        "kind": "pressure",
+        "why_ko": "프리셉티/페어링/인계 같은 연동 규칙이 개별 feasible 조합을 묶고 있습니다.",
+        "change_ko": "동반/연동이 꼭 필요한 구간만 유지하고 나머지는 범위를 좁히세요.",
+    },
+    "soft_tradeoff": {
+        "title_ko": "자동 완화/소프트 희생 발생",
+        "kind": "tradeoff",
+        "why_ko": "하드 infeasible을 피하거나 품질을 높이기 위해 일부 제약이 soft fallback 또는 완화 상태로 처리되었습니다.",
+        "change_ko": "이 결과를 확정하기 전에 어떤 hard 규칙이 soft로 내려갔는지 검토하세요.",
+    },
+}
+
+
+def _guidance_category_for_core(core: dict[str, Any]) -> str | None:
+    p = str(core.get("pattern") or "")
+    member_types = {str(t) for t in (core.get("member_types") or [])}
+    if p.startswith("pool_shortage:"):
+        return "supply_policy_gap"
+    if p in {
+        "n_only_vs_caps",
+        "nurse_role_constrained",
+    } or p.endswith("initial_forbidden"):
+        return "eligibility_gap"
+    if p.startswith("cpsat_mus:fixed_assignment"):
+        return "fixed_assignment_pressure"
+    if "transition_ban" in p and "OffWindowNode" in member_types:
+        return "boundary_transition_pressure"
+    if any(tok in p for tok in (
+        "max_consecutive_work",
+        "transition_ban",
+        "monthly_limit_n",
+        "not_one_night",
+        "recovery_2n2off",
+        "recovery_3n2off",
+        "recovery_off",
+        "off_window",
+        "consecutive_night",
+    )):
+        return "sequence_pressure"
+    if "preceptee" in p or "pair" in p or "handoff" in p:
+        return "coupling_pressure"
+    if any(tok in p for tok in (
+        "coverage_min",
+        "team_min",
+        "grade_min",
+    )):
+        return "supply_policy_gap"
+    return None
+
+
+def _collect_tradeoff_signals(target: dict[str, Any]) -> list[dict[str, Any]]:
+    graph_signals = list((target.get("data") or {}).get("tradeoff_signals") or [])
+    if graph_signals:
+        return graph_signals
+    rr = target.get("run_result") or {}
+    out: list[dict[str, Any]] = []
+    for attempt in (rr.get("runs") or []):
+        inf = attempt.get("infeasible_detail") or {}
+        applied = list(attempt.get("applied_relaxations") or inf.get("applied_relaxations") or [])
+        summary = attempt.get("summary_message_ko") or inf.get("summary_message_ko")
+        if not applied and not summary:
+            continue
+        out.append(
+            {
+                "run_index": attempt.get("run_index"),
+                "attempt": f"{attempt.get('solver_status') or '?'}#{attempt.get('run_index')}",
+                "solver_status": attempt.get("solver_status"),
+                "used_fallback": bool(attempt.get("used_fallback") or False),
+                "outcome": attempt.get("outcome"),
+                "applied_relaxations": applied,
+                "summary_message_ko": summary,
+            }
+        )
+    return out
+
+
+def _build_operator_guidance(
+    *,
+    all_cores: list[dict[str, Any]],
+    tradeoff_signals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for core in all_cores:
+        cat = _guidance_category_for_core(core)
+        if not cat:
+            continue
+        meta = _GUIDANCE_META[cat]
+        bucket = grouped.setdefault(
+            cat,
+            {
+                "category_id": cat,
+                "title_ko": meta["title_ko"],
+                "kind": meta["kind"],
+                "why_ko": meta["why_ko"],
+                "change_ko": meta["change_ko"],
+                "evidence_patterns": [],
+                "evidence_patterns_raw": [],
+                "sample_core_ids": [],
+                "affected_nurse_ids": set(),
+                "max_affected_count": 0,
+                "evidence_core_count": 0,
+                "sample_hints": [],
+            },
+        )
+        bucket["evidence_core_count"] += 1
+        patt = _to_display_pattern(core.get("pattern") or "")
+        raw = core.get("pattern") or ""
+        if patt not in bucket["evidence_patterns"]:
+            bucket["evidence_patterns"].append(patt)
+        if raw not in bucket["evidence_patterns_raw"]:
+            bucket["evidence_patterns_raw"].append(raw)
+        cid = core.get("node_id") or core.get("core_id") or ""
+        if cid and cid not in bucket["sample_core_ids"] and len(bucket["sample_core_ids"]) < 5:
+            bucket["sample_core_ids"].append(cid)
+        bucket["max_affected_count"] = max(bucket["max_affected_count"], int(core.get("affected_count") or 0))
+        for nid in (core.get("affected_nurse_ids") or []):
+            bucket["affected_nurse_ids"].add(str(nid))
+        for hint in (core.get("resolution_hints") or [])[:2]:
+            msg = hint.get("human_message_ko")
+            if msg and msg not in bucket["sample_hints"] and len(bucket["sample_hints"]) < 4:
+                bucket["sample_hints"].append(msg)
+
+    guidance_items: list[dict[str, Any]] = []
+    for cat in ("supply_policy_gap", "eligibility_gap", "fixed_assignment_pressure", "boundary_transition_pressure", "sequence_pressure", "coupling_pressure"):
+        bucket = grouped.get(cat)
+        if not bucket:
+            continue
+        bucket["affected_nurse_ids"] = sorted(bucket["affected_nurse_ids"])
+        guidance_items.append(bucket)
+
+    soft_items: list[dict[str, Any]] = []
+    if tradeoff_signals:
+        seen_relax = []
+        for sig in tradeoff_signals:
+            for relax in (sig.get("applied_relaxations") or []):
+                if relax not in seen_relax:
+                    seen_relax.append(relax)
+        meta = _GUIDANCE_META["soft_tradeoff"]
+        soft_items.append(
+            {
+                "category_id": "soft_tradeoff",
+                "title_ko": meta["title_ko"],
+                "kind": meta["kind"],
+                "why_ko": meta["why_ko"],
+                "change_ko": meta["change_ko"],
+                "applied_relaxations": seen_relax,
+                "attempts": tradeoff_signals,
+            }
+        )
+
+    summary_parts = []
+    if guidance_items:
+        top = guidance_items[0]
+        summary_parts.append(f"우선 원인 축은 '{top['title_ko']}' 입니다")
+    if soft_items:
+        summary_parts.append("일부 run에서는 soft fallback/완화도 함께 고려해야 합니다")
+
+    return {
+        "root_and_pressure": guidance_items,
+        "soft_tradeoffs": soft_items,
+        "summary_ko": ". ".join(summary_parts) + ("." if summary_parts else ""),
+    }
+
+
+def _render_operator_card(core: dict[str, Any], priority: int) -> dict[str, Any]:
+    """conflict core 1개를 운영자용 한국어 카드로 변환."""
+    pattern = core.get("pattern") or ""
+    # pattern이 "cpsat_mus:xxx" 형태일 수 있어 catalog key와 일치시킴
+    catalog = CONFLICT_CATALOG.get(pattern) or {}
+    affected = core.get("affected_nurse_ids") or []
+    affected_count = core.get("affected_count") or 0
+    scope_keys = core.get("affected_scope_keys") or []
+    # stale-data fallback: 구버전 run은 cell-scope 코어를 multi_nurse로 잘못 묶고
+    # affected_nurse_ids=[], per_nurse_cores=[N개] 형태로 저장했음. per_nurse_cores
+    # 길이로 affected_count 보정.
+    if affected_count == 0 and not affected and not scope_keys:
+        per_nurse = core.get("per_nurse_cores") or []
+        per_member = core.get("per_member_cores") or []
+        fallback_count = len(per_nurse) + len(per_member)
+        if fallback_count > 0:
+            affected_count = fallback_count
+            scope_keys = [
+                str(c).replace("conflict:cpsat:", "")
+                for c in (per_nurse + per_member)
+            ]
+
+    # scope-aware unit: cell/grade → "건", nurse → "명"
+    unit = "명"
+    is_cell_scope = bool(
+        scope_keys
+        or pattern.endswith("coverage_min")
+        or pattern.endswith("coverage_max")
+        or "day_" in str(core.get("node_id", ""))
+    ) and not affected
+    if is_cell_scope:
+        unit = "건"
+
+    if affected_count > 1 and affected:
+        scope_msg = f"{affected_count}명 동시 영향"
+    elif affected_count > 1 and is_cell_scope:
+        scope_msg = f"{affected_count}건의 정책 동시 영향"
+    elif len(affected) == 1:
+        scope_msg = f"간호사 {affected[0]} 단독"
+    elif affected_count == 1:
+        scope_msg = f"1{unit} 단독"
+    else:
+        scope_msg = "전역"
+
+    # adjustable: catalog 우선, 없으면 패턴 멤버십으로 판단, 둘 다 없으면 True
+    if "adjustable" in catalog:
+        adjustable = bool(catalog["adjustable"])
+    else:
+        adjustable = pattern not in _CONFLICT_CATALOG_NON_ADJUSTABLE_PATTERNS
+
+    return {
+        "priority": priority,
+        "title": catalog.get("title") or pattern,
+        "scope_msg": scope_msg,
+        "affected_count": affected_count,
+        "affected_nurse_ids": affected,
+        "what_ko": catalog.get("what_ko") or core.get("human_message_ko") or "",
+        "action_ko": catalog.get("action_ko") or "",
+        "detail": core.get("conclusion") or "",
+        "action_target": catalog.get("action_target") or "",
+        "adjustable": adjustable,
+        "pattern": _to_display_pattern(pattern),
+        "pattern_raw": pattern,
+        "node_id": core.get("node_id") or "",
+        # causal_layer 는 dashboard 가 root vs cascade 분리 렌더할 때 사용
+        "causal_layer": core.get("causal_layer") or "unknown",
+        "per_layer_counts": core.get("per_layer_counts") or {},
+    }
+
+
+def _make_operator_summary_ko(
+    multi_nurse: list,
+    individual: list,
+    global_infeas: list,
+) -> str:
+    parts = []
+    if multi_nurse:
+        top = multi_nurse[0]
+        # cell-scope 코어(coverage_min/max)는 "건", nurse-scope는 "명"
+        affected_ids = top.get("affected_nurse_ids") or []
+        scope_keys = top.get("affected_scope_keys") or []
+        per_member = top.get("per_member_cores") or []
+        per_nurse = top.get("per_nurse_cores") or []
+        cnt = top.get("affected_count") or 0
+        if not affected_ids and (scope_keys or per_member or (per_nurse and cnt == 0)):
+            # cell/policy 단위 코어 — 정상 또는 stale 둘 다 처리
+            display_cnt = cnt if cnt > 0 else (len(scope_keys) or len(per_member) or len(per_nurse))
+            parts.append(
+                f"가장 광범위한 충돌은 '{_to_display_pattern(top['pattern'])}' "
+                f"({display_cnt}건의 정책 동시 영향)"
+            )
+        else:
+            parts.append(
+                f"가장 광범위한 충돌은 '{_to_display_pattern(top['pattern'])}' "
+                f"({cnt}명 동시 영향)"
+            )
+    if individual:
+        parts.append(f"개별 충돌 {len(individual)}건 (nurse별 단독 MUS)")
+    if global_infeas:
+        parts.append(f"전역 infeasibility 신호 {len(global_infeas)}건")
+    if not parts:
+        return "이 run에서 충돌 코어가 탐지되지 않았습니다."
+    return ". ".join(parts) + "."
+
+
+@router.get("/conflict_summary")
+def conflict_summary(
+    run_id: str = Query("", description="run_id to analyze (omit for most-recent run)"),
+    nurse_id: str = Query("", description="optional nurse_id for perspective card"),
+) -> JSONResponse:
+    """3계층 conflict 분해 + 운영자용 한국어 요약 + (선택) nurse 관점 카드.
+
+    Layers:
+        individual_nurse_cores — scope=nurse, affected_count=1
+        multi_nurse_cores      — scope=multi_nurse (same pattern, N nurses)
+        global_infeasibility   — non-nurse scope or data_quality / no_assignment
+    """
+    runs = _scan_runs()
+    target: dict[str, Any] | None = None
+    if run_id:
+        for r in runs:
+            if (r["data"].get("run") or {}).get("run_id") == run_id:
+                target = r
+                break
+    if target is None:
+        if not runs:
+            raise HTTPException(status_code=404, detail="no runs found")
+        target = runs[-1]  # fallback: most-recent
+
+    d = target["data"]
+    meta = d.get("run") or {}
+    core_details = _core_details_by_id(target)
+    # nurse idx → {nurse_id, name} 매핑 (harness가 생성 시 주입)
+    nurse_index_map: dict[str, dict] = d.get("nurse_index_map") or {}
+
+    def _nurse_label(idx_or_id: Any) -> str:
+        """idx(0/1/...) 또는 nurse_id 문자열을 'idx (이름)' 형태로 변환."""
+        key = str(idx_or_id)
+        entry = nurse_index_map.get(key) or {}
+        name = entry.get("name")
+        nid = entry.get("nurse_id")
+        if name:
+            return f"{key} ({name})"
+        # 혹시 key가 nurse_id 형태로 들어왔다면 역방향 매칭
+        for _idx, _meta in nurse_index_map.items():
+            if str(_meta.get("nurse_id")) == key:
+                _nm = _meta.get("name")
+                return f"{_idx} ({_nm})" if _nm else key
+        return key
+
+    conflict_nodes = [
+        n for n in (d.get("nodes") or [])
+        if n.get("type") == "ConflictCoreNode"
+    ]
+
+    individual: list[dict[str, Any]] = []
+    multi_nurse_list: list[dict[str, Any]] = []
+    global_infeas: list[dict[str, Any]] = []
+
+    for n in conflict_nodes:
+        a = n.get("attrs") or {}
+        detailed_core = core_details.get(str(a.get("core_id") or n.get("id") or "")) or {}
+        scope = str(a.get("scope") or "")
+        pattern = str(a.get("pattern") or "")
+        node_id = n.get("id") or ""
+        affected_count = int(a.get("affected_count") or 0)
+
+        is_global = (
+            scope in ("global", "data_quality")
+            or "no_assignment" in pattern
+            or "infeasibility" in pattern
+            or "data_quality" in node_id
+        )
+        is_multi = scope == "multi_nurse" or (scope == "nurse" and affected_count > 1)
+
+        core: dict[str, Any] = {
+            "node_id": node_id,
+            "core_id": a.get("core_id") or node_id,
+            "pattern": pattern,
+            "pattern_display": _to_display_pattern(pattern),
+            "member_types": [
+                str((m or {}).get("type") or "")
+                for m in ((detailed_core.get("members") or a.get("members") or []))
+                if str((m or {}).get("type") or "")
+            ],
+            "scope": scope,
+            "affected_count": affected_count,
+            "affected_nurse_ids": a.get("affected_nurse_ids") or [],
+            "conclusion": a.get("conclusion"),
+            "human_message_ko": a.get("human_message_ko"),
+            "resolution_hints": a.get("resolution_hints") or [],
+            "solver_phase": a.get("solver_phase"),
+            "per_nurse_cores": a.get("per_nurse_cores") or [],
+            "source": a.get("source"),
+            # causal layer (root vs cascade) — hard_assumption.derive_core_layer 가 세팅
+            "causal_layer": a.get("causal_layer") or "unknown",
+            "per_layer_counts": a.get("per_layer_counts") or {},
+        }
+        if is_global:
+            global_infeas.append(core)
+        elif is_multi:
+            multi_nurse_list.append(core)
+        else:
+            individual.append(core)
+
+    multi_nurse_list.sort(key=lambda x: -(x["affected_count"] or 0))
+    individual.sort(key=lambda x: -(x["affected_count"] or 0))
+
+    # TOP-N 원인 (pattern 단위 dedupe)
+    all_cores = multi_nurse_list + individual + global_infeas
+    top_causes: list[dict[str, Any]] = []
+    seen_patterns: set[str] = set()
+    for c in all_cores:
+        p = c["pattern"]
+        if p in seen_patterns:
+            continue
+        seen_patterns.add(p)
+        layer = (
+            "multi_nurse" if c in multi_nurse_list
+            else "individual" if c in individual
+            else "global"
+        )
+        hints = c.get("resolution_hints") or []
+        top_causes.append({
+            "pattern": _to_display_pattern(p),
+            "pattern_raw": p,
+            "affected_count": c["affected_count"],
+            "human_message_ko": c["human_message_ko"],
+            "top_hint": hints[0] if hints else None,
+            "layer": layer,
+        })
+
+    # Nurse 관점 카드
+    nurse_perspective: dict[str, Any] | None = None
+    if nurse_id:
+        nid = str(nurse_id)
+        cohort_cores = [
+            c for c in multi_nurse_list
+            if nid in [str(x) for x in (c.get("affected_nurse_ids") or [])]
+        ]
+        solo_cores = [
+            c for c in individual
+            if nid in [str(x) for x in (c.get("affected_nurse_ids") or [])]
+        ]
+        if cohort_cores or solo_cores:
+            label_parts = []
+            if cohort_cores:
+                label_parts.append(f"{len(cohort_cores)}개 집계 충돌 코어의 cohort 소속")
+            if solo_cores:
+                label_parts.append(f"{len(solo_cores)}개 단독 충돌의 원인")
+            nurse_perspective = {
+                "nurse_id": nid,
+                "is_in_cohort": bool(cohort_cores),
+                "is_solo": bool(solo_cores),
+                "cohort_cores": cohort_cores,
+                "solo_cores": solo_cores,
+                "summary_ko": f"간호사 {nid}는 " + " + ".join(label_parts) + ".",
+            }
+        else:
+            nurse_perspective = {
+                "nurse_id": nid,
+                "is_in_cohort": False,
+                "is_solo": False,
+                "cohort_cores": [],
+                "solo_cores": [],
+                "summary_ko": (
+                    f"간호사 {nid}는 이 run의 충돌 코어에 직접 등장하지 않습니다."
+                ),
+            }
+
+    total_affected = len(set(
+        str(x)
+        for c in all_cores
+        for x in (c.get("affected_nurse_ids") or [])
+    ))
+
+    tradeoff_signals = _collect_tradeoff_signals(target)
+    operator_guidance = _build_operator_guidance(
+        all_cores=all_cores,
+        tradeoff_signals=tradeoff_signals,
+    )
+
+    # operator_cards: 우선순위 정렬 후 skip 패턴 제외, catalog 기반 카드 생성
+    cardable = [
+        c for c in all_cores
+        if (c.get("pattern") or "") not in _CONFLICT_CATALOG_SKIP_PATTERNS
+        and (c.get("scope") != "multi_nurse" or (c.get("affected_count") or 0) > 0)
+    ]
+    # 정렬 순 (root 가 가장 위, cascade 는 아래):
+    #   1. causal_layer rank: policy(0) → data(1) → personal(2) → structural(3) → unknown(4)
+    #   2. adjustable=True 가 먼저 (운영자가 실제로 조정 가능한 것 우선)
+    #   3. multi_nurse(영향 큰 순) → individual(nurse) → global
+    #   4. affected_count 내림차순
+    _CAUSAL_LAYER_RANK = {
+        "policy": 0, "data": 1, "personal": 2, "structural": 3, "unknown": 4,
+    }
+
+    def _card_sort_key(c: dict) -> tuple:
+        pattern = c.get("pattern") or ""
+        catalog = CONFLICT_CATALOG.get(pattern) or {}
+        if "adjustable" in catalog:
+            adjustable = bool(catalog["adjustable"])
+        else:
+            adjustable = pattern not in _CONFLICT_CATALOG_NON_ADJUSTABLE_PATTERNS
+        adj_rank = 0 if adjustable else 1
+        scope = c.get("scope") or ""
+        scope_rank = 0 if scope == "multi_nurse" else 1 if scope == "nurse" else 2
+        layer_rank = _CAUSAL_LAYER_RANK.get(c.get("causal_layer") or "unknown", 4)
+        return (layer_rank, adj_rank, scope_rank, -(c.get("affected_count") or 0))
+
+    cardable.sort(key=_card_sort_key)
+    operator_cards = [
+        _render_operator_card(c, i + 1)
+        for i, c in enumerate(cardable)
+    ]
+
+    # run 생성 시각: graph_export["run"]["generated_at"] 또는 run_dir 이름에서 파싱
+    generated_at = meta.get("generated_at")
+    if not generated_at:
+        # run-YYYYMM-YYYYMMDD-HHMMSS 형태에서 마지막 토큰 추출
+        try:
+            parts = target["dir"].split("-")
+            if len(parts) >= 2:
+                date_part = parts[-2]  # YYYYMMDD
+                time_part = parts[-1]  # HHMMSS
+                if len(date_part) == 8 and len(time_part) == 6:
+                    generated_at = (
+                        f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:]}T"
+                        f"{time_part[:2]}:{time_part[2:4]}:{time_part[4:]}"
+                    )
+        except Exception:
+            pass
+
+    # operator_cards에 nurse 이름 보강
+    for card in operator_cards:
+        ids = card.get("affected_nurse_ids") or []
+        if ids and nurse_index_map:
+            card["affected_nurse_labels"] = [_nurse_label(x) for x in ids]
+            # scope_msg에도 첫 번째 이름 살짝 노출 (간호사 X 단독 케이스)
+            if len(ids) == 1:
+                card["scope_msg"] = f"간호사 {_nurse_label(ids[0])} 단독"
+            elif len(ids) > 1 and len(ids) <= 6:
+                # 적은 cohort는 이름 나열
+                card["scope_msg"] = (
+                    f"{card.get('affected_count')}명 — "
+                    + ", ".join(_nurse_label(x) for x in ids[:6])
+                )
+
+    return JSONResponse({
+        "run_dir": target["dir"],
+        "run_id": meta.get("run_id"),
+        "generated_at": generated_at,
+        "total_conflict_nodes": len(conflict_nodes),
+        "layers": {
+            "individual_nurse_cores": individual,
+            "multi_nurse_cores": multi_nurse_list,
+            "global_infeasibility": global_infeas,
+        },
+        "operator_summary": {
+            "top_causes": top_causes[:5],
+            "structural_conflict_count": len(seen_patterns),
+            "total_affected_nurses": total_affected,
+            "summary_ko": _make_operator_summary_ko(
+                multi_nurse_list, individual, global_infeas
+            ),
+        },
+        "operator_guidance": operator_guidance,
+        "operator_cards": operator_cards,
+        "nurse_perspective": nurse_perspective,
+        "nurse_index_map": nurse_index_map,
+    })
 
 
 # ── HTML page ──────────────────────────────────────────────
@@ -733,7 +1503,7 @@ _HTML = """<!doctype html>
       --cause:#fca5a5; --effect:#7dd3fc;
     }
     html,body { margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--text); }
-    #app { display:grid; grid-template-columns: 280px 1fr 400px; grid-template-rows: 56px 1fr; height:100vh; }
+    #app { display:grid; grid-template-columns: 300px 1fr 420px; grid-template-rows: 56px 1fr; height:100vh; }
     /* ── Topbar ───────────────────────────── */
     #topbar { grid-column:1/4; padding:0 16px; border-bottom:1px solid var(--border); display:flex; gap:14px; align-items:center; background:var(--bg2); }
     #topbar h1 { font-size:15px; margin:0; font-weight:600; }
@@ -759,6 +1529,9 @@ _HTML = """<!doctype html>
     .legend-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px 8px; margin-top:4px; }
     .legend-item { display:flex; align-items:center; gap:5px; font-size:10px; color:#cbd5e1; }
     .legend-dot { width:10px; height:10px; border-radius:3px; border:1px solid #0b1020; flex-shrink:0; }
+    .preset-row { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+    .preset-btn { font-size:11px; padding:4px 8px; border-radius:999px; border:1px solid var(--border); background:var(--panel); color:var(--text); cursor:pointer; }
+    .preset-btn:hover { background:var(--hover); }
     /* ── Canvas overlay ─────────────────── */
     #canvas-wrap { position:relative; }
     #cy { width:100%; height:100%; background:var(--bg); }
@@ -767,6 +1540,11 @@ _HTML = """<!doctype html>
     #detail { padding:0; border-left:1px solid var(--border); overflow:auto; font-size:12px; background:var(--bg2); }
     .d-empty { padding:24px; color:var(--muted); font-size:13px; text-align:center; line-height:1.5; }
     .d-empty .icon { font-size:28px; margin-bottom:6px; }
+    .d-overview { padding:10px 12px; border-bottom:1px solid var(--border); background:linear-gradient(180deg, rgba(96,165,250,.08), transparent); }
+    .ov-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .ov-card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:8px; }
+    .ov-card b { display:block; font-size:10px; color:var(--muted); margin-bottom:4px; }
+    .ov-card span { font-size:16px; font-weight:700; }
     .d-section { padding:12px 14px; border-bottom:1px solid var(--border); }
     .d-section.cause { background:linear-gradient(180deg, rgba(252,165,165,.06), transparent); border-left:3px solid var(--cause); }
     .d-section.effect { background:linear-gradient(180deg, rgba(125,211,252,.06), transparent); border-left:3px solid var(--effect); }
@@ -805,6 +1583,30 @@ _HTML = """<!doctype html>
     .cell-row.cell-head { background:var(--panel); color:var(--muted); font-weight:600; }
     .pill.warn { background:rgba(251,191,36,.15); color:#fbbf24; border:1px solid rgba(251,191,36,.4); }
     .vc-btn { margin-top:6px; font-size:10px; }
+    .collapsible-head { display:flex; align-items:center; justify-content:space-between; gap:8px; cursor:pointer; margin-bottom:6px; }
+    .collapsible-toggle { font-size:11px; color:var(--muted); }
+    .collapsed .collapsible-body { display:none; }
+    .collapsible-wrap { padding:12px 14px; border-bottom:1px solid var(--border); }
+    .collapsible-btn { all:unset; display:flex; align-items:center; justify-content:space-between; width:100%; cursor:pointer; }
+    .collapsible-btn:focus-visible { outline:2px solid var(--accent); border-radius:6px; }
+    /* ── Conflict layer analysis ─────────────────────────── */
+    .layer-badge { display:inline-flex; align-items:center; gap:4px; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:600; margin:2px 0 6px; }
+    .layer-badge.individual { background:rgba(251,191,36,.15); color:#fbbf24; border:1px solid rgba(251,191,36,.4); }
+    .layer-badge.multi_nurse { background:rgba(232,121,249,.15); color:#e879f9; border:1px solid rgba(232,121,249,.4); }
+    .layer-badge.global { background:rgba(239,68,68,.15); color:#fca5a5; border:1px solid rgba(239,68,68,.4); }
+    .cause-item { background:var(--panel); border:1px solid var(--border); border-left:3px solid; border-radius:6px; padding:8px 10px; margin:5px 0; cursor:pointer; }
+    .cause-item:hover { background:var(--hover); }
+    .cause-item.multi_nurse { border-left-color:#e879f9; }
+    .cause-item.individual  { border-left-color:#fbbf24; }
+    .cause-item.global      { border-left-color:#ef4444; }
+    .cause-item.non-adjustable { opacity:0.85; border-left-color:#64748b !important; background:rgba(100,116,139,.08); }
+    .non-adj-badge { display:inline-flex; padding:2px 8px; border-radius:999px; font-size:10px; background:rgba(100,116,139,.18); color:#cbd5e1; border:1px solid rgba(100,116,139,.4); font-weight:600; }
+    .cause-rank { font-size:14px; font-weight:700; color:var(--muted); margin-right:4px; }
+    .nurse-persp-card { background:var(--panel); border:1px solid var(--border); border-left:3px solid #60a5fa; border-radius:6px; padding:10px 12px; margin:6px 0; }
+    .nurse-persp-card.cohort { border-left-color:#e879f9; }
+    .nurse-persp-card.solo   { border-left-color:#fbbf24; }
+    .nurse-persp-input { display:flex; gap:6px; margin:8px 0; }
+    .nurse-persp-input input { flex:1; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12px; }
   </style>
 </head>
 <body>
@@ -874,6 +1676,11 @@ _HTML = """<!doctype html>
       <h2>📋 룰 ID <span class="hint-tip">예: D_MAX_OVER</span></h2>
       <input type="text" id="filter-rule-search" placeholder="rule_id 검색" />
       <div id="filter-rules" style="max-height:240px; overflow:auto; margin-top:4px;"></div>
+      <div class="preset-row" id="quick-presets">
+        <button class="preset-btn" data-preset="fail-focus">실패 집중</button>
+        <button class="preset-btn" data-preset="core-trace">코어 추적</button>
+        <button class="preset-btn" data-preset="full-reset">전체 보기</button>
+      </div>
     </div>
     <div class="sb-section">
       <h2>🎨 노드 색 범례</h2>
@@ -902,11 +1709,11 @@ const PALETTE = {
   RuleNode:'#a7f3d0', MetricNode:'#f9a8d4', ViolationNode:'#fca5a5',
   CarryoverTransitionNode:'#67e8f9',
   CoverageMinNode:'#fde68a', TeamMinNode:'#fdba74', GradeMinNode:'#fcd34d',
+  TeamPoolNode:'#fb7185', GradePoolNode:'#f87171', CommonPoolNode:'#fda4af',
   GradeMaxNode:'#fbbf24', OffWindowNode:'#86efac', PrecepteeSyncNode:'#d8b4fe',
   WantedSubmissionNode:'#60a5fa', WantedApplyNode:'#34d399',
   // Conflict core + member types
   ConflictCoreNode:'#e879f9',   // 자주색 — 다중 충돌 코어
-  NurseRoleNode:'#fb923c',
   OffCapNode:'#fcd34d',
   NightCapNode:'#a78bfa',
   MonthlyNExactNode:'#fb7185',
@@ -932,8 +1739,9 @@ const TYPE_RANK = {
   ConflictCoreNode:4,  // 충돌 코어는 violation 위, member 아래
   MetricNode:5, ViolationNode:5, CarryoverTransitionNode:5,
   CoverageMinNode:6, TeamMinNode:6, GradeMinNode:6, GradeMaxNode:6,
+  TeamPoolNode:5, GradePoolNode:5, CommonPoolNode:5,
   OffWindowNode:6, PrecepteeSyncNode:6,
-  NurseRoleNode:6, OffCapNode:6, NightCapNode:6, MonthlyNExactNode:6,
+  OffCapNode:6, NightCapNode:6, MonthlyNExactNode:6,
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -1225,9 +2033,10 @@ function renderLegend() {
     'MonthNode','GroupNode','RunNode','RuleNode',
     'MetricNode','ViolationNode',
     'ConflictCoreNode',
-    'NurseRoleNode','OffCapNode','NightCapNode','MonthlyNExactNode',
+    'OffCapNode','NightCapNode','MonthlyNExactNode',
     'CoverageMinNode','CoverageMaxNode',
     'TeamMinNode','GradeMinNode','GradeMaxNode',
+    'TeamPoolNode','GradePoolNode','CommonPoolNode',
     'MonthlyOffNode','WeeklyOffNode','OffWindowNode',
     'CarryoverTransitionNode','PrecepteeSyncNode',
     'WantedSubmissionNode','WantedApplyNode',
@@ -1413,6 +2222,7 @@ function nodeTypeKorean(t) {
     MetricNode:'측정값', ViolationNode:'위반',
     CoverageMinNode:'최소 인원 제약', CoverageMaxNode:'최대 인원 제약',
     TeamMinNode:'팀 최소 인원', TeamMaxNode:'팀 최대 인원',
+    TeamPoolNode:'팀 풀(시프트 가용)', GradePoolNode:'Grade 풀(시프트 가용)', CommonPoolNode:'공통 풀(무소속)',
     GradeMinNode:'숙련도 최소', GradeMaxNode:'숙련도 최대',
     MonthlyOffNode:'월간 OFF 제약', WeeklyOffNode:'주휴 제약',
     OffWindowNode:'OFF 구간', PrecepteeSyncNode:'프리셉티 동반',
@@ -1422,13 +2232,57 @@ function nodeTypeKorean(t) {
     FairnessNode:'공정성', DataQualityNode:'데이터 정합성',
     // Conflict core members
     ConflictCoreNode:'⚡ 충돌 코어',
-    NurseRoleNode:'간호사 시프트 가용역할',
     OffCapNode:'OFF 상한',
     NightCapNode:'월간 N 상한',
     MonthlyNExactNode:'월 N exact',
     ConstraintNode:'기타 제약',
   };
   return M[t] || t || '?';
+}
+
+function createCollapsibleSection(section, title, badgeText, opened = true) {
+  const headBtn = el('button', { class:'collapsible-btn', type:'button', 'aria-expanded': String(opened) });
+  const head = el('div', { class:'collapsible-head' });
+  const titleWrap = el('h3', {}, title);
+  if (badgeText) titleWrap.append(el('span', { class:'badge' }, badgeText));
+  const toggle = el('span', { class:'collapsible-toggle' }, opened ? '접기 ▲' : '펼치기 ▼');
+  head.append(titleWrap, toggle);
+  headBtn.append(head);
+  const body = el('div', { class:'collapsible-body' });
+  const wrap = el('div', { class:'collapsible-wrap' });
+  wrap.append(headBtn, body);
+  if (!opened) wrap.classList.add('collapsed');
+  headBtn.addEventListener('click', () => {
+    const collapsed = wrap.classList.toggle('collapsed');
+    headBtn.setAttribute('aria-expanded', String(!collapsed));
+    toggle.textContent = collapsed ? '펼치기 ▼' : '접기 ▲';
+  });
+  section.append(wrap);
+  return body;
+}
+
+function syncToolbarState() {
+  document.querySelectorAll('[data-layer]').forEach(b => b.classList.toggle('active', state.layers.has(b.dataset.layer)));
+  document.querySelectorAll('[data-severity]').forEach(b => b.classList.toggle('active', state.severities.has(b.dataset.severity)));
+  document.querySelectorAll('[data-status]').forEach(b => b.classList.toggle('active', state.status === b.dataset.status));
+}
+
+function renderDetailOverview(container, info) {
+  const box = el('div', { class:'d-overview' });
+  const grid = el('div', { class:'ov-grid' });
+  const items = [
+    ['원인 노드', info.inboundCount],
+    ['영향 노드', info.outboundCount],
+    ['관련 위반', info.violationCount],
+    ['등장 실행', info.incidenceCount],
+  ];
+  for (const [k, v] of items) {
+    const card = el('div', { class:'ov-card' });
+    card.append(el('b', {}, k), el('span', {}, String(v || 0)));
+    grid.append(card);
+  }
+  box.append(grid);
+  container.append(box);
 }
 
 async function showNodeDetail(id) {
@@ -1438,6 +2292,13 @@ async function showNodeDetail(id) {
     const j = await fetchJSON('/ontology/node/' + encodeURIComponent(id));
     d.innerHTML = '';
     const n = j.node;
+
+    renderDetailOverview(d, {
+      inboundCount: (j.inbound_neighbors || []).length,
+      outboundCount: (j.outbound_neighbors || []).length,
+      violationCount: (j.related_violations || []).length,
+      incidenceCount: j.incidence_count || 0,
+    });
 
     // ── 1. 기본 정보 ──
     const head = el('div', { class:'d-section' });
@@ -1451,12 +2312,45 @@ async function showNodeDetail(id) {
     head.append(el('div', { class:'h-desc' }, n.id));
 
     const kv = el('div', { class:'kv' });
+    const _nurseMap = j.nurse_index_map || {};
+    function _nurseName(idx) {
+      const e = _nurseMap[String(idx)];
+      return e && e.name ? e.name : null;
+    }
     for (const [k, v] of Object.entries(n.attrs || {})) {
       if (typeof v === 'object' || k.startsWith('_')) continue;
       kv.append(el('b', {}, k));
-      kv.append(el('span', {}, String(v)));
+      // nurse_id 필드: idx → 이름 자동 첨부
+      let display = String(v);
+      if (k === 'nurse_id' && _nurseMap && _nurseName(v)) {
+        display = `${v} (${_nurseName(v)})`;
+      }
+      kv.append(el('span', {}, display));
+    }
+    // affected_nurse_ids: idx 배열 → 이름 첨부 한 줄
+    const _aff = (n.attrs || {}).affected_nurse_ids;
+    if (Array.isArray(_aff) && _aff.length && _nurseMap && Object.keys(_nurseMap).length) {
+      kv.append(el('b', {}, 'affected_nurses (이름)'));
+      const labeled = _aff.map(x => {
+        const nm = _nurseName(x);
+        return nm ? `${x} (${nm})` : String(x);
+      }).join(', ');
+      kv.append(el('span', {}, labeled));
     }
     if (n.type === 'RunNode') {
+      if (n.attrs._generated_at) {
+        kv.append(el('b', {}, '🕒 생성시각'));
+        const ga = String(n.attrs._generated_at);
+        const ageMs = Date.now() - Date.parse(ga + (ga.endsWith('Z') ? '' : 'Z'));
+        let ageStr = '';
+        if (!isNaN(ageMs) && ageMs >= 0) {
+          const h = Math.floor(ageMs / 3600000);
+          const m = Math.floor((ageMs % 3600000) / 60000);
+          ageStr = h > 0 ? ` (${h}시간 전)` : m > 0 ? ` (${m}분 전)` : ' (방금)';
+        }
+        kv.append(el('span', {}, ga + ageStr));
+      }
+      if (n.attrs._run_dir) { kv.append(el('b', {}, 'run_dir')); kv.append(el('span', { style:'font-family:monospace; font-size:11px;' }, n.attrs._run_dir)); }
       if (n.attrs._schedule_id) { kv.append(el('b', {}, 'schedule')); kv.append(el('span', {}, n.attrs._schedule_id)); }
       if (n.attrs._solver_status_dist) { kv.append(el('b', {}, 'solver 결과')); kv.append(el('span', {}, JSON.stringify(n.attrs._solver_status_dist))); }
       if (n.attrs._fallback_used !== undefined) { kv.append(el('b', {}, 'fallback')); kv.append(el('span', {}, n.attrs._fallback_used ? '⚠ 사용됨' : '미사용')); }
@@ -1478,6 +2372,32 @@ async function showNodeDetail(id) {
     head.append(el('div', { class:'h-desc' }, `📊 ${j.incidence_count}개 실행에서 등장`));
     d.append(head);
 
+    // ── 1.55 RunNode → Conflict 분석 버튼 ──
+    if (n.type === 'RunNode') {
+      const runId = n.id.replace(/^run:/, '');
+      const cfSec = el('div', { class:'d-section drilldown' });
+      const cfHdr = el('h3', {}, '🔬 Conflict 분석');
+      cfHdr.append(el('span', { class:'h-desc', style:'display:inline; margin-left:6px;' }, '3계층 충돌 코어 + 운영자 요약'));
+      cfSec.append(cfHdr);
+      const cfBtn = el('button', { class:'btn', style:'width:100%; font-size:12px; padding:7px; margin-top:6px;' }, '▶ 분석 열기');
+      const cfBody = el('div');
+      let cfLoaded = false;
+      cfBtn.addEventListener('click', async () => {
+        if (cfLoaded) {
+          cfBody.style.display = cfBody.style.display === 'none' ? '' : 'none';
+          cfBtn.textContent = cfBody.style.display === 'none' ? '▶ 분석 열기' : '▲ 닫기';
+          return;
+        }
+        cfBtn.disabled = true; cfBtn.textContent = '⏳ 분석 중…';
+        await showConflictSummary(runId, cfBody);
+        cfLoaded = true;
+        cfBtn.disabled = false; cfBtn.textContent = '▲ 닫기';
+        cfSec.append(cfBody);
+      });
+      cfSec.append(cfBtn);
+      d.append(cfSec);
+    }
+
     // ── 1.5 ConflictCoreNode 전용 인과 스토리 ──
     if (n.type === 'ConflictCoreNode') {
       const sec = el('div', { class:'d-section viol' });
@@ -1491,6 +2411,20 @@ async function showNodeDetail(id) {
         phaseHead.append(el('span', { class:'badge', style:'margin-left:6px;' }, '🔵 Detector'));
       }
       sec.append(phaseHead);
+      // ── layer badge (개별 / 집계 / 전역) ──
+      {
+        const scope = n.attrs.scope || '';
+        const afc   = n.attrs.affected_count || 0;
+        let lbl, lcls;
+        if (scope === 'multi_nurse') {
+          lbl = '👥 집계 코어 (multi_nurse)'; lcls = 'multi_nurse';
+        } else if (scope === 'nurse' && afc <= 1) {
+          lbl = '👤 개별 코어 (individual)';  lcls = 'individual';
+        } else {
+          lbl = '🌐 전역/데이터품질';           lcls = 'global';
+        }
+        sec.append(el('span', { class:`layer-badge ${lcls}` }, lbl));
+      }
       const phaseHint = phase === 'fallback'
         ? 'fallback 단계 MUS — primary에서 풀리지 않아 일부 hard 제약이 soft 전환된 상태에서 남은 충돌.'
         : phase === 'primary'
@@ -1585,22 +2519,18 @@ async function showNodeDetail(id) {
     // ── 2. 원인 (inbound) — 빨간 stripe ──
     if (j.inbound_neighbors && j.inbound_neighbors.length) {
       const sec = el('div', { class:'d-section cause' });
-      const h = el('h3', {}, '← 원인 노드');
-      h.append(el('span', { class:'badge fail' }, String(j.inbound_neighbors.length)));
-      sec.append(h);
-      sec.append(el('div', { class:'h-desc' }, '이 노드를 만든 상위 노드들 (CAUSES_VIOLATION, BLOCKED_RUN, RISKY_FOR 등). 카드 클릭 → 그 노드로 이동.'));
-      sec.append(renderNeighborList(j.inbound_neighbors));
+      const body = createCollapsibleSection(sec, '← 원인 노드', String(j.inbound_neighbors.length), false);
+      body.append(el('div', { class:'h-desc' }, '이 노드를 만든 상위 노드들 (CAUSES_VIOLATION, BLOCKED_RUN, RISKY_FOR 등). 카드 클릭 → 그 노드로 이동.'));
+      body.append(renderNeighborList(j.inbound_neighbors));
       d.append(sec);
     }
 
     // ── 3. 영향 (outbound) — 파란 stripe ──
     if (j.outbound_neighbors && j.outbound_neighbors.length) {
       const sec = el('div', { class:'d-section effect' });
-      const h = el('h3', {}, '→ 영향 노드');
-      h.append(el('span', { class:'badge' }, String(j.outbound_neighbors.length)));
-      sec.append(h);
-      sec.append(el('div', { class:'h-desc' }, '이 노드가 가리키는 하위 노드들 (FAILED_RULE, OBSERVED_IN, RUN_ON 등 outbound edge).'));
-      sec.append(renderNeighborList(j.outbound_neighbors));
+      const body = createCollapsibleSection(sec, '→ 영향 노드', String(j.outbound_neighbors.length), false);
+      body.append(el('div', { class:'h-desc' }, '이 노드가 가리키는 하위 노드들 (FAILED_RULE, OBSERVED_IN, RUN_ON 등 outbound edge).'));
+      body.append(renderNeighborList(j.outbound_neighbors));
       d.append(sec);
     }
 
@@ -1615,25 +2545,23 @@ async function showNodeDetail(id) {
       const gList = Object.values(groups).sort((a, b) =>
         b.items.length - a.items.length || (a.month_key || '').localeCompare(b.month_key || ''));
       const sec = el('div', { class:'d-section viol' });
-      const h = el('h3', {}, '⚠️ 관련 위반');
-      h.append(el('span', { class:'badge fail' }, `${j.related_violations.length}건 / ${gList.length}그룹`));
-      sec.append(h);
-      sec.append(el('div', { class:'h-desc' }, '(rule_id, 월) 단위로 묶음. 하단 "n개 run 펼치기" 버튼으로 attempt별 보기.'));
-      for (const g of gList) sec.append(renderGroupedViolationCard(g));
+      const body = createCollapsibleSection(sec, '⚠️ 관련 위반', `${j.related_violations.length}건 / ${gList.length}그룹`, true);
+      body.append(el('div', { class:'h-desc' }, '(rule_id, 월) 단위로 묶음. 하단 "n개 run 펼치기" 버튼으로 attempt별 보기.'));
+      for (const g of gList) body.append(renderGroupedViolationCard(g));
       d.append(sec);
     }
 
     // ── 5. 메트릭 추이 ──
     if (j.metric_history && j.metric_history.length) {
       const sec = el('div', { class:'d-section' });
-      sec.append(el('h3', {}, '📈 메트릭 추이'));
-      sec.append(el('div', { class:'h-desc' }, '같은 메트릭이 여러 run에서 보인 값.'));
+      const body = createCollapsibleSection(sec, '📈 메트릭 추이', '', false);
+      body.append(el('div', { class:'h-desc' }, '같은 메트릭이 여러 run에서 보인 값.'));
       const tbl = el('div', { class:'kv' });
       for (const h of j.metric_history.slice(-12)) {
         tbl.append(el('b', {}, `${h.month_key || '?'} · ${(h.run_id || '').slice(-10)}`));
         tbl.append(el('span', {}, String(h.value)));
       }
-      sec.append(tbl);
+      body.append(tbl);
       d.append(sec);
     }
 
@@ -1641,25 +2569,25 @@ async function showNodeDetail(id) {
     if (j.run_drilldown) {
       const rd = j.run_drilldown;
       const sec = el('div', { class:'d-section drilldown' });
-      sec.append(el('h3', {}, '🧩 Run 상세 — attempts · 셀'));
-      sec.append(el('div', { class:'h-desc' }, 'solver attempts와 over/under cell 표. fallback이 일어난 attempt는 ⚠.'));
+      const body = createCollapsibleSection(sec, '🧩 Run 상세 — attempts · 셀', '', false);
+      body.append(el('div', { class:'h-desc' }, 'solver attempts와 over/under cell 표. fallback이 일어난 attempt는 ⚠.'));
       const at = el('div', { class:'kv' });
       for (const a of (rd.attempts || [])) {
         at.append(el('b', {}, `attempt #${a.run_index || '?'}`));
         const fb = (a.solver_status || '').includes('fallback') ? ' ⚠' : '';
         at.append(el('span', {}, `${a.solver_status || '-'}${fb} · schedule=${a.schedule_id || '-'} · ${a.timing_ms || '?'}ms`));
       }
-      sec.append(at);
+      body.append(at);
       const dd = rd.drilldown || {};
       const over = dd.coverage_over_cells || [];
       const under = dd.coverage_under_cells || [];
       if (over.length) {
-        sec.append(el('div', { class:'h-desc', style:'margin-top:8px;' }, `Over cells (정원 초과) · ${over.length}건`));
-        sec.append(renderCellTable(over, 'over'));
+        body.append(el('div', { class:'h-desc', style:'margin-top:8px;' }, `Over cells (정원 초과) · ${over.length}건`));
+        body.append(renderCellTable(over, 'over'));
       }
       if (under.length) {
-        sec.append(el('div', { class:'h-desc', style:'margin-top:8px;' }, `Under cells (정원 미달) · ${under.length}건`));
-        sec.append(renderCellTable(under, 'shortage'));
+        body.append(el('div', { class:'h-desc', style:'margin-top:8px;' }, `Under cells (정원 미달) · ${under.length}건`));
+        body.append(renderCellTable(under, 'shortage'));
       }
       d.append(sec);
     }
@@ -1667,16 +2595,275 @@ async function showNodeDetail(id) {
     // ── 7. 등장한 run 리스트 ──
     if (j.incidences && j.incidences.length) {
       const sec = el('div', { class:'d-section' });
-      sec.append(el('h3', {}, `📁 등장한 실행 (${j.incidence_count})`));
+      const body = createCollapsibleSection(sec, `📁 등장한 실행`, String(j.incidence_count), false);
       const ul = el('div');
       for (const inc of j.incidences.slice(0, 30)) {
         ul.append(el('div', { class:'badge' }, `${inc.month_key || '?'} · ${inc.strategy || ''} · ${(inc.run_id || '').slice(-10)}`));
       }
-      sec.append(ul);
+      body.append(ul);
       d.append(sec);
     }
   } catch (err) {
     d.innerHTML = `<div class="d-empty"><div class="icon">⚠️</div>오류: ${err.message}</div>`;
+  }
+}
+
+// ── Conflict analysis helpers ──────────────────────────────────────────
+
+function renderCauseItem(cause, rank) {
+  const lcls = cause.layer === 'multi_nurse' ? 'multi_nurse'
+    : cause.layer === 'global' ? 'global' : 'individual';
+  const card = el('div', { class:`cause-item ${lcls}` });
+  const head = el('div', { style:'display:flex; align-items:center; gap:8px; margin-bottom:4px;' });
+  head.append(el('span', { class:'cause-rank' }, `#${rank}`));
+  const lbl = lcls === 'multi_nurse' ? '👥 집계' : lcls === 'global' ? '🌐 전역' : '👤 개별';
+  head.append(el('span', { class:`layer-badge ${lcls}` }, lbl));
+  if ((cause.affected_count || 0) > 1) {
+    head.append(el('span', { class:'badge' }, `${cause.affected_count}명 영향`));
+  }
+  card.append(head);
+  card.append(el('div', { style:'font-size:12px; font-weight:600;' }, cause.pattern || ''));
+  if (cause.human_message_ko) {
+    card.append(el('div', { style:'font-size:11px; color:#cbd5e1; margin-top:3px;' }, cause.human_message_ko));
+  }
+  if (cause.top_hint) {
+    const hintMsg = cause.top_hint.human_message_ko || cause.top_hint.action || '';
+    if (hintMsg) {
+      card.append(el('div', { class:'badge', style:'display:block; margin-top:6px; color:#86efac; border-color:#22c55e; line-height:1.4;' },
+        `✅ ${hintMsg}`));
+    }
+  }
+  return card;
+}
+
+function renderNursePerspectiveCard(persp) {
+  if (!persp) return el('div');
+  const pcls = persp.is_in_cohort ? 'cohort' : persp.is_solo ? 'solo' : '';
+  const card = el('div', { class:`nurse-persp-card ${pcls}` });
+  card.append(el('div', { style:'font-size:13px; font-weight:700; margin-bottom:5px;' },
+    `👤 Nurse ${persp.nurse_id} 관점`));
+  card.append(el('div', { style:'font-size:12px; color:#cbd5e1; margin-bottom:8px; line-height:1.4;' },
+    persp.summary_ko));
+  if (persp.is_in_cohort && persp.cohort_cores.length) {
+    card.append(el('div', { style:'font-size:11px; color:var(--muted); margin:4px 0 2px;' },
+      `📌 소속 집계 코어 (${persp.cohort_cores.length}건):`));
+    for (const c of persp.cohort_cores) {
+      const link = el('div', { class:'badge', style:'display:block; cursor:pointer; margin:2px 0; border-color:#e879f9; color:#f0abfc;' },
+        `${c.node_id} · ${c.affected_count}명`);
+      link.addEventListener('click', () => showNodeDetail(c.node_id));
+      card.append(link);
+    }
+  }
+  if (persp.is_solo && persp.solo_cores.length) {
+    card.append(el('div', { style:'font-size:11px; color:var(--muted); margin:6px 0 2px;' },
+      `⚡ 단독 충돌 코어 (${persp.solo_cores.length}건):`));
+    for (const c of persp.solo_cores) {
+      const link = el('div', { class:'badge', style:'display:block; cursor:pointer; margin:2px 0; border-color:#fbbf24; color:#fde68a; line-height:1.4;' },
+        `${c.node_id}\\n${c.conclusion || ''}`);
+      link.addEventListener('click', () => showNodeDetail(c.node_id));
+      card.append(link);
+    }
+  }
+  return card;
+}
+
+function renderConflictSummaryPanel(data, container) {
+  container.innerHTML = '';
+  const panel = el('div', { class:'conflict-summary-panel' });
+
+  // 헤더
+  const hdr = el('h3', { style:'margin:0 0 6px; font-size:14px; padding:12px 14px 0;' }, '⚡ 생성 실패 원인 및 해결 방법');
+  const opsm = data.operator_summary || {};
+  if (opsm.total_affected_nurses != null) {
+    hdr.append(el('span', { class:'badge', style:'margin-left:8px; font-size:10px;' },
+      `영향 ${opsm.total_affected_nurses}명 · 충돌 ${opsm.structural_conflict_count}종`));
+  }
+  panel.append(hdr);
+
+  // 운영자 카드 (주 UI) — causal_layer 기반 root vs cascade 분리 렌더
+  const cards = data.operator_cards || [];
+  // 카드 1장을 DOM 으로 렌더 (root/cascade 양쪽이 공유)
+  function _renderCauseCard(c) {
+    const isNonAdj = c.adjustable === false || c.action_target === 'NON_ADJUSTABLE';
+    const lcls = c.pattern && (c.pattern.includes('multi') || (c.affected_count > 1))
+      ? 'multi_nurse'
+      : c.action_target === 'nurse_role' || c.action_target === 'n_exact'
+      ? 'individual'
+      : 'global';
+    const cardCls = `cause-item ${lcls}` + (isNonAdj ? ' non-adjustable' : '');
+    const card = el('div', { class:cardCls, style:'cursor:default;' });
+
+    // causal_layer badge — 한 눈에 root/cascade 인지 보이게
+    const layer = c.causal_layer || 'unknown';
+    const LAYER_BADGE = {
+      policy:    { icon:'💥', text:'POLICY ROOT', bg:'rgba(239,68,68,.2)', fg:'#fca5a5', bd:'#ef4444' },
+      data:      { icon:'📊', text:'DATA ROOT',   bg:'rgba(245,158,11,.2)',fg:'#fcd34d', bd:'#f59e0b' },
+      personal:  { icon:'👤', text:'PERSONAL',    bg:'rgba(96,165,250,.18)',fg:'#93c5fd', bd:'#3b82f6' },
+      structural:{ icon:'⚙️', text:'CASCADE',     bg:'rgba(148,163,184,.18)',fg:'#cbd5e1', bd:'#64748b' },
+      unknown:   { icon:'❔', text:'UNKNOWN',     bg:'rgba(148,163,184,.18)',fg:'#cbd5e1', bd:'#64748b' },
+    };
+    const lb = LAYER_BADGE[layer] || LAYER_BADGE.unknown;
+
+    // 제목 행
+    const titleRow = el('div', { style:'display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;' });
+    titleRow.append(el('span', { class:'cause-rank' }, `#${c.priority}`));
+    titleRow.append(el('span', {
+      style:`padding:1px 7px; font-size:10px; font-weight:700; border-radius:4px;
+             background:${lb.bg}; color:${lb.fg}; border:1px solid ${lb.bd};`,
+    }, `${lb.icon} ${lb.text}`));
+    titleRow.append(el('span', { style:'font-size:13px; font-weight:700;' }, c.title));
+    if (c.scope_msg) titleRow.append(el('span', { class:'badge' }, c.scope_msg));
+    if (isNonAdj) titleRow.append(el('span', { class:'non-adj-badge' }, '🔒 조정 불가'));
+    card.append(titleRow);
+
+    // per_layer_counts breakdown — cascade 케이스에서 "structural 7개 + personal 2개" 표기
+    const plc = c.per_layer_counts || {};
+    const keys = Object.keys(plc);
+    if (keys.length > 1) {
+      const order = ['policy','data','personal','structural','unknown'];
+      const parts = order
+        .filter(k => plc[k])
+        .map(k => `${(LAYER_BADGE[k]||{}).icon||''} ${k} ×${plc[k]}`);
+      card.append(el('div', { style:'font-size:10px; color:var(--muted); margin-bottom:6px;' },
+        '구성: ' + parts.join(' · ')));
+    }
+
+    // 문제 설명
+    if (c.what_ko) {
+      card.append(el('div', { style:'font-size:12px; color:#cbd5e1; margin-bottom:4px; line-height:1.5;' },
+        `🔍 ${c.what_ko}`));
+    }
+    if (c.detail) {
+      card.append(el('div', { style:'font-size:11px; color:var(--muted); font-family:monospace; margin-bottom:6px;' },
+        c.detail));
+    }
+    if (c.action_ko) {
+      const actionStyle = isNonAdj
+        ? 'display:block; padding:7px 10px; color:#cbd5e1; border-color:#64748b; background:rgba(100,116,139,.12); font-size:12px; line-height:1.5;'
+        : 'display:block; padding:7px 10px; color:#86efac; border-color:#22c55e; font-size:12px; line-height:1.5;';
+      card.append(el('div', { class:'badge', style:actionStyle },
+        (isNonAdj ? '🔒 안내: ' : '✅ 해결: ') + c.action_ko));
+    }
+    if (c.node_id) {
+      const link = el('div', { style:'font-size:10px; color:var(--muted); margin-top:5px; cursor:pointer; text-decoration:underline;' },
+        `→ 충돌 코어 상세 보기 (${c.node_id.slice(-30)})`);
+      link.addEventListener('click', () => showNodeDetail(c.node_id));
+      card.append(link);
+    }
+    return card;
+  }
+
+  if (cards.length) {
+    const rootCards    = cards.filter(c => (c.causal_layer === 'policy' || c.causal_layer === 'data'));
+    const cascadeCards = cards.filter(c => !(c.causal_layer === 'policy' || c.causal_layer === 'data'));
+
+    // 💥 Root 섹션 — 항상 펼침
+    if (rootCards.length) {
+      const rootHeader = el('div', {
+        style:'margin:6px 14px 4px; font-size:11px; font-weight:700; color:#fca5a5; letter-spacing:.5px;',
+      }, `💥 ROOT — 정책/데이터 근본 원인 (${rootCards.length}건)`);
+      panel.append(rootHeader);
+      const rootWrap = el('div', { style:'padding:0 14px;' });
+      for (const c of rootCards) rootWrap.append(_renderCauseCard(c));
+      panel.append(rootWrap);
+    }
+
+    // 📋 Cascade 섹션 — root 있으면 접고, 없으면 펼침 (root 없으면 cascade 가 사실상 root)
+    if (cascadeCards.length) {
+      const cascadeWrap = el('div', { style:'padding:0 14px; margin-top:8px;' });
+      const cascadeSec = el('div');
+      const cascadeBody = createCollapsibleSection(
+        cascadeSec,
+        rootCards.length
+          ? `📋 CASCADE — 위 root 로 인해 유발된 부수 충돌 (${cascadeCards.length}건)`
+          : `📋 충돌 cores (${cascadeCards.length}건)`,
+        '',
+        rootCards.length === 0,  // root 없으면 펼친다
+      );
+      for (const c of cascadeCards) cascadeBody.append(_renderCauseCard(c));
+      cascadeWrap.append(cascadeSec);
+      panel.append(cascadeWrap);
+    }
+  } else {
+    panel.append(el('div', { style:'padding:14px; color:var(--muted); font-size:12px;' },
+      '이 run에서 해석 가능한 충돌 원인이 없습니다.'));
+  }
+
+  // 3계층 breakdown (기술용, collapsible — 기본 접힘)
+  const layers = data.layers || {};
+  const layerDefs = [
+    { key:'multi_nurse_cores',     label:'👥 집계(multi_nurse) 코어', cls:'multi_nurse', open:false },
+    { key:'individual_nurse_cores',label:'👤 개별(individual) 코어',  cls:'individual',  open:false },
+    { key:'global_infeasibility',  label:'🌐 전역 infeasibility 신호', cls:'global',      open:false },
+  ];
+  const hasLayers = layerDefs.some(ld => (layers[ld.key] || []).length > 0);
+  if (hasLayers) {
+    const techWrap = el('div', { style:'padding:0 14px;' });
+    const techSec  = el('div');
+    const techBody = createCollapsibleSection(techSec, '🔧 기술 상세 (3계층 분해)', '', false);
+    for (const ld of layerDefs) {
+      const items = layers[ld.key] || [];
+      if (!items.length) continue;
+      const subSec = el('div');
+      const subBody = createCollapsibleSection(subSec, ld.label, String(items.length), false);
+      for (const c of items) {
+        const card = el('div', { class:`cause-item ${ld.cls}` });
+        if ((c.affected_count || 0) > 1) card.append(el('span', { class:'badge', style:'margin-bottom:4px;' }, `${c.affected_count}명`));
+        card.append(el('div', { style:'font-size:11px; font-weight:600;' }, c.pattern || c.node_id || ''));
+        if (c.conclusion) card.append(el('div', { style:'font-size:10px; color:var(--muted); margin-top:2px;' }, c.conclusion));
+        card.addEventListener('click', () => showNodeDetail(c.node_id));
+        subBody.append(card);
+      }
+      techBody.append(subSec);
+    }
+    techWrap.append(techSec);
+    panel.append(techWrap);
+  }
+
+  // Nurse 관점 입력
+  const perspSec = el('div', { style:'padding:12px 14px; border-top:1px solid var(--border); margin-top:8px;' });
+  perspSec.append(el('div', { style:'font-size:11px; color:var(--muted); margin-bottom:6px;' }, '👤 특정 간호사 관점 조회'));
+  const perspRow = el('div', { class:'nurse-persp-input' });
+  const perspInput = el('input', { type:'text', placeholder:'nurse_id (예: 13)' });
+  const perspBtn = el('button', { class:'btn', style:'white-space:nowrap;' }, '관점 보기');
+  const perspResult = el('div');
+  perspRow.append(perspInput, perspBtn);
+  perspSec.append(perspRow, perspResult);
+
+  perspBtn.addEventListener('click', async () => {
+    const nid = perspInput.value.trim();
+    if (!nid) return;
+    perspBtn.disabled = true;
+    try {
+      const url = '/ontology/conflict_summary?run_id=' + encodeURIComponent(data.run_id || '') + '&nurse_id=' + encodeURIComponent(nid);
+      const res = await fetchJSON(url);
+      perspResult.innerHTML = '';
+      perspResult.append(renderNursePerspectiveCard(res.nurse_perspective));
+    } catch(e) {
+      perspResult.textContent = '오류: ' + e.message;
+    } finally {
+      perspBtn.disabled = false;
+    }
+  });
+  perspInput.addEventListener('keydown', e => { if (e.key === 'Enter') perspBtn.click(); });
+
+  // nurse_perspective가 이미 포함된 경우 바로 표시
+  if (data.nurse_perspective) {
+    perspInput.value = data.nurse_perspective.nurse_id || '';
+    perspResult.append(renderNursePerspectiveCard(data.nurse_perspective));
+  }
+
+  panel.append(perspSec);
+  container.append(panel);
+}
+
+async function showConflictSummary(runId, container) {
+  container.innerHTML = '<div class="d-empty" style="padding:16px;">⏳ Conflict 분석 중…</div>';
+  try {
+    const data = await fetchJSON('/ontology/conflict_summary?run_id=' + encodeURIComponent(runId));
+    renderConflictSummaryPanel(data, container);
+  } catch (e) {
+    container.innerHTML = `<div class="d-empty">⚠️ Conflict 분석 오류: ${e.message}</div>`;
   }
 }
 
@@ -1696,6 +2883,37 @@ async function bootstrap() {
   state.catalog = await fetchJSON('/ontology/rule_catalog');
 
   $('#filter-rule-search').addEventListener('input', (e) => renderRulesList(e.target.value));
+
+  document.querySelectorAll('#quick-presets [data-preset]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const p = btn.dataset.preset;
+      if (p === 'fail-focus') {
+        state.status = 'FAIL';
+        state.layers = new Set(['month','group','run','rule','violation']);
+        state.severities = new Set(['blocking','warning']);
+      } else if (p === 'core-trace') {
+        state.status = 'FAIL';
+        state.layers = new Set(['run','rule','cause','violation']);
+        state.severities = new Set(['blocking']);
+      } else {
+        state.months.clear();
+        state.groups.clear();
+        state.strategies.clear();
+        state.rules.clear();
+        state.solverStatuses.clear();
+        state.status = 'ALL';
+        state.layers = new Set(['month','group','run','rule']);
+        state.severities = new Set(['blocking','warning']);
+        renderFacet('#filter-months', state.facets?.months || [], state.months);
+        renderFacet('#filter-groups', state.facets?.groups || [], state.groups);
+        renderFacet('#filter-strategies', state.facets?.strategies || [], state.strategies);
+        renderFacet('#filter-solver', state.facets?.solver_statuses || [], state.solverStatuses);
+        renderRulesList($('#filter-rule-search').value || '');
+      }
+      syncToolbarState();
+      reloadGraph();
+    });
+  });
 
   document.querySelectorAll('[data-layer]').forEach(b => {
     b.addEventListener('click', () => {
@@ -1749,9 +2967,8 @@ async function bootstrap() {
   });
   document.querySelectorAll('[data-status]').forEach(b => {
     b.addEventListener('click', () => {
-      document.querySelectorAll('[data-status]').forEach(x => x.classList.remove('active'));
-      b.classList.add('active');
       state.status = b.dataset.status;
+      syncToolbarState();
       reloadGraph();
     });
   });
@@ -1773,6 +2990,7 @@ async function bootstrap() {
   });
 
   await reloadGraph();
+  syncToolbarState();
 }
 bootstrap();
 </script>

@@ -125,6 +125,8 @@ class RunStats:
     risky_constraints: List[Dict[str, Any]] = field(default_factory=list)
     preflight_alerts: List[Dict[str, Any]] = field(default_factory=list)
     conflict_probe: Dict[str, Any] | None = None
+    applied_relaxations: List[str] = field(default_factory=list)
+    summary_message_ko: str | None = None
 
 
 def _derive_solver_outcome(used_fallback: bool, outcome: str | None) -> str:
@@ -1235,11 +1237,39 @@ def _build_graph_export(
         return "ConstraintNode"
 
     constraint_blocks: List[Dict[str, Any]] = []
+    tradeoff_signals: List[Dict[str, Any]] = []
     # H_NO_INFEASIBLE / H_FALLBACK_OK 위반을 미리 찾아둠 — 5xx run의 preflight 이슈를
     # 직접 그 위반들의 인과로 박기 위함.
     h_infeas_viol_ids = [v["violation_id"] for v in violations if v.get("rule_id") == "H_NO_INFEASIBLE"]
     for rs in runs:
         attempt_label = f"{rs.solver_status or '?'}#{rs.run_index}"
+        if rs.applied_relaxations or rs.summary_message_ko:
+            tradeoff_signals.append(
+                {
+                    "run_index": rs.run_index,
+                    "attempt": attempt_label,
+                    "solver_status": rs.solver_status,
+                    "used_fallback": bool(rs.used_fallback),
+                    "outcome": rs.outcome,
+                    "applied_relaxations": list(rs.applied_relaxations or []),
+                    "summary_message_ko": rs.summary_message_ko,
+                }
+            )
+            for relax in rs.applied_relaxations:
+                tid = f"tradeoff:{run_id}:{rs.run_index}:{relax}"
+                add_node(
+                    tid,
+                    "SoftTradeoffNode",
+                    {
+                        "run_index": rs.run_index,
+                        "attempt": attempt_label,
+                        "solver_status": rs.solver_status,
+                        "used_fallback": bool(rs.used_fallback),
+                        "relaxation": relax,
+                        "summary_message_ko": rs.summary_message_ko,
+                    },
+                )
+                add_edge("TRADEOFF_APPLIED", tid, run_node_id)
         if rs.status_code != 200:
             # 5xx 경로: API가 채운 preflight_issues / violated_constraints를
             # ConstraintNode + BLOCKED_RUN + CAUSES_VIOLATION 으로 표면화.
@@ -1269,6 +1299,25 @@ def _build_graph_export(
                      "reason_code": rc, "attempt": attempt_label}
                 )
 
+            # Pool 그래프 emit (ConflictCore loop 보다 *먼저* 처리한다 — `add_node` 가
+            # first-wins 라 conflict member 가 thin attrs 로 선점하면 풀의 풍부한
+            # attrs (allowed_count / monthly_capacity 등) 가 묻힘).
+            pool_snap = inf.get("pool_snapshot") or {}
+            for pool in (pool_snap.get("pools") or []):
+                p_id = str(pool.get("pool_id") or "")
+                p_type = str(pool.get("pool_type") or "PoolNode")
+                if not p_id:
+                    continue
+                attrs = dict(pool.get("attrs") or {})
+                attrs["first_seen_attempt"] = attempt_label
+                add_node(p_id, p_type, attrs)
+            for edge in (pool_snap.get("nurse_pool_edges") or [])[:1000]:
+                rel = str(edge.get("rel") or "")
+                src = str(edge.get("src") or "")
+                dst = str(edge.get("dst") or "")
+                if rel and src and dst:
+                    add_edge(rel, src, dst)
+
             # ConflictCore: 다중 hard 제약이 결합한 충돌 코어를 ConflictCoreNode +
             # member ConstraintNode들 + 인과 엣지로 emit. dashboard에서 인과 스토리로
             # 펼쳐 보임.
@@ -1296,6 +1345,9 @@ def _build_graph_export(
                         "resolution_hints": core.get("resolution_hints") or [],
                         "source": core.get("source"),
                         "solver_phase": core.get("solver_phase"),
+                        # causal layer (root vs cascade) — hard_assumption.py 가 derive
+                        "causal_layer": core.get("causal_layer"),
+                        "per_layer_counts": core.get("per_layer_counts") or {},
                         "first_seen_attempt": attempt_label,
                     },
                 )
@@ -1445,6 +1497,7 @@ def _build_graph_export(
         ],
         "violations": violations,
         "constraint_blocks": constraint_blocks,
+        "tradeoff_signals": tradeoff_signals,
         "nodes": nodes,
         "edges": edges,
         "mapping_summary": {
@@ -1576,6 +1629,8 @@ def main() -> None:
                 inf = detail.get("infeasibility") or {}
                 applied_relax = list(inf.get("applied_relaxations") or [])
                 preflight = list(inf.get("preflight_issues") or [])
+                st.applied_relaxations = applied_relax
+                st.summary_message_ko = inf.get("summary_message_ko")
                 # `last_error_reason`는 build_unrecoverable_payload에서만 채워지므로
                 # precheck blocking vs solver/fallback-infeasible을 구분하는 신뢰 신호.
                 # applied_relaxations는 부가 신호.
@@ -1596,11 +1651,14 @@ def main() -> None:
 
         st.schedule_id = str(body.get("schedule_id") or "")
         ci = body.get("constraint_impact") or {}
+        inf_ok = body.get("infeasibility") or {}
         st.coverage_gaps_count = len(ci.get("coverage_gaps") or [])
         st.violated_constraints = list(ci.get("violated_constraints") or [])
         st.risky_constraints = list(ci.get("risky_constraints") or [])
         st.preflight_alerts = list(ci.get("preflight_alerts") or [])
         st.conflict_probe = ci.get("conflict_probe")
+        st.applied_relaxations = list(inf_ok.get("applied_relaxations") or [])
+        st.summary_message_ko = inf_ok.get("summary_message_ko")
         st.violated_constraints_count = len(st.violated_constraints)
         st.timing_ms = int(ci.get("timing_ms") or 0)
         # Derive granular solver_status from (used_fallback, outcome).
@@ -1616,6 +1674,8 @@ def main() -> None:
                 "risky_constraints": st.risky_constraints[:50],
                 "preflight_alerts": st.preflight_alerts[:20],
                 "conflict_probe": st.conflict_probe,
+                "applied_relaxations": st.applied_relaxations,
+                "summary_message_ko": st.summary_message_ko,
             }
 
         roster = _get_json(s, args.base_url, f"/roster/schedule/{st.schedule_id}")
@@ -1971,6 +2031,41 @@ def main() -> None:
         runs=runs,
         solver_status=solver_status_agg,
     )
+    # ── nurse idx → 이름 매핑 (CP-SAT engine 정렬 기준으로 재구성) ──
+    # cp_sat 엔진 정렬: (sequence ASC, experience DESC, nurse_id ASC) + active=1 +
+    # role in {RN, AN} or is_inbound. ontology UI가 conflict core의
+    # affected_nurse_ids(인덱스)를 이름으로 표시할 때 사용한다.
+    try:
+        _engine_nurses = [
+            n for n in (nurses_payload or [])
+            if int(n.get("active") or 0) == 1
+            and (
+                str(n.get("role") or "RN").upper() in ("RN", "AN")
+                or bool(n.get("is_inbound"))
+            )
+        ]
+        _engine_nurses.sort(key=lambda n: (
+            int(n.get("sequence") or 0),
+            -int(n.get("experience") or 0),
+            str(n.get("nurse_id") or ""),
+        ))
+        graph_export["nurse_index_map"] = {
+            str(idx): {
+                "nurse_id": str(n.get("nurse_id") or ""),
+                "name": n.get("name") or "",
+                "team_id": n.get("team_id"),
+                "grade": n.get("grade"),
+                "is_night_nurse": n.get("is_night_nurse") or [],
+                "preceptor_id": n.get("preceptor_id"),
+            }
+            for idx, n in enumerate(_engine_nurses)
+        }
+    except Exception as _nm_exc:
+        print(f"[Harness] nurse_index_map 생성 실패(무시): {_nm_exc}")
+        graph_export["nurse_index_map"] = {}
+    # ── 생성 시각(타임스탬프) ──
+    # out_base 이름이 run-YYYYMM-YYYYMMDD-HHMMSS 형태 → ontology UI가 표시
+    graph_export.setdefault("run", {})["generated_at"] = _utc_now_str()
     summary["graph_consistency"] = graph_export.get("consistency", {})
     summary["mapping_summary"] = graph_export.get("mapping_summary", {})
 
