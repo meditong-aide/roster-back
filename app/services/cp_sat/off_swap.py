@@ -207,6 +207,7 @@ def _load_fixed_wanted_set(
         FixedWantedEntry.year == year,
         FixedWantedEntry.month == month,
         FixedWantedEntry.is_applied == True,
+        FixedWantedEntry.source_type != "month_memo",
     ).all()
     return {(str(e.nurse_id), e.shift_date.day) for e in rows if e.shift_date}
 

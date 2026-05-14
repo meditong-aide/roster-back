@@ -154,10 +154,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
 
     # FixedWantedEntry 존재 여부 확인 (단일 테이블 구조)
     # → 해당 년/월에 확정 원티드가 존재하면 자동으로 사용 (프론트에서 플래그 전달 불필요)
+    # → source_type='month_memo' marker row 는 셀 데이터 아니므로 존재 판단에서 제외.
     has_fixed_wanted = db.query(FixedWantedEntry).filter(
         FixedWantedEntry.group_id == current_user.group_id,
         FixedWantedEntry.year == req.year,
         FixedWantedEntry.month == req.month,
+        FixedWantedEntry.source_type != "month_memo",
     ).first() is not None
 
     if has_fixed_wanted:
@@ -168,12 +170,14 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         _fw_other_count = 0     # 미분류(DENO/특수 어디에도 해당 안 됨) 건수
         for nurse_id in nurse_ids:
             # FixedWantedEntry에서 해당 간호사의 항목 조회 (is_applied=True만)
+            # source_type='month_memo' marker row 제외 (솔버 입력 오염 방지).
             fixed_entries = db.query(FixedWantedEntry).filter(
                 FixedWantedEntry.group_id == current_user.group_id,
                 FixedWantedEntry.year == req.year,
                 FixedWantedEntry.month == req.month,
                 FixedWantedEntry.nurse_id == nurse_id,
                 FixedWantedEntry.is_applied == True,
+                FixedWantedEntry.source_type != "month_memo",
             ).all()
 
             if not fixed_entries:
@@ -4800,11 +4804,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         combined_fixed_cells.extend(special_fixed_cells)
 
     # ── fixed_wanted_use_yn 설정에 따른 확정 원티드 하드 고정 처리 ──
+    # source_type='month_memo' marker row 는 솔버 입력 / 데이터 출처 판단에서 모두 제외.
     _fw_use_yn = bool(getattr(latest_config, 'fixed_wanted_use_yn', False))
     _fw_source = "FixedWantedEntry" if db.query(FixedWantedEntry).filter(
         FixedWantedEntry.group_id == current_user.group_id,
         FixedWantedEntry.year == req.year,
         FixedWantedEntry.month == req.month,
+        FixedWantedEntry.source_type != "month_memo",
     ).first() is not None else "WantedRequest"
     print(f"[RosterCreate] fixed_wanted_use_yn={_fw_use_yn}, 데이터 출처={_fw_source}")
     if _fw_use_yn:
@@ -4813,6 +4819,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             FixedWantedEntry.year == req.year,
             FixedWantedEntry.month == req.month,
             FixedWantedEntry.is_applied == True,
+            FixedWantedEntry.source_type != "month_memo",
         ).all()
         # shifts_table_id → shift_id 매핑 (정확한 코드 복원용)
         _fw_table_id_to_shift_id: dict[int, str] = {

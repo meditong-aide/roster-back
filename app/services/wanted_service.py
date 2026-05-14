@@ -2191,10 +2191,12 @@ def get_wanted_adjustment_service(
         # FixedWantedEntry: stored group_id 불문, shift_date 기준 caller 관할 일자만 노출.
         # - blocked_set 으로 caller 관할 외 일자 제외.
         # - 동일 (nurse_id, shift_date) 중복은 최신 id 우선 (target-saved > 구 source-saved).
+        # - source_type='month_memo' marker row 는 셀 데이터가 아니라 응답에서 제외.
         nurse_fixed_entries = db.query(FixedWantedEntry).filter(
             FixedWantedEntry.nurse_id == nurse.nurse_id,
             FixedWantedEntry.year == year,
             FixedWantedEntry.month == month,
+            FixedWantedEntry.source_type != "month_memo",
         ).all()
 
         _by_date: Dict[date, FixedWantedEntry] = {}
@@ -2311,9 +2313,26 @@ def get_wanted_adjustment_service(
             assignments=assignment_windows,
         ))
 
+    # 월 단위 단일 메모 (source_type='month_memo' marker row 의 head_nurse_memo)
+    # caller group(=조회 그룹) 기준 조회. 다른 group 의 marker 는 노출하지 않음.
+    month_memo_row = (
+        db.query(FixedWantedEntry.head_nurse_memo)
+        .filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.source_type == "month_memo",
+        )
+        .first()
+    )
+    month_memo_value: Optional[str] = (
+        month_memo_row[0] if month_memo_row is not None else None
+    )
+
     return AdjustmentResponse(
         nurses=nurse_data_list,
         has_fixed_wanted=fixed_entries_exist,
+        month_memo=month_memo_value,
     )
 
 
@@ -2488,6 +2507,7 @@ def _validate_monthly_off_cap(
         FixedWantedEntry.month == req.month,
         FixedWantedEntry.group_id != caller_group_id,
         FixedWantedEntry.is_applied == True,  # noqa: E712
+        FixedWantedEntry.source_type != "month_memo",  # marker row 제외
     ).all()
     other_off_count: Dict[str, int] = defaultdict(int)
     for e in existing_other:
@@ -2579,6 +2599,9 @@ def _insert_fixed_wanted_entries(
         else:
             resolved_source_type = "original"
             resolved_original_shift_id = None
+        memo_value = entry.head_nurse_memo
+        if isinstance(memo_value, str):
+            memo_value = memo_value.strip() or None
         new_entry = FixedWantedEntry(
             group_id=caller_group_id,
             year=req.year,
@@ -2591,12 +2614,85 @@ def _insert_fixed_wanted_entries(
             source_type=resolved_source_type,
             original_shift_id=resolved_original_shift_id,
             reason=entry.reason,
-            head_nurse_memo=entry.head_nurse_memo,
+            head_nurse_memo=memo_value,
             created_by=created_by,
         )
         db.add(new_entry)
         new_entries.append(new_entry)
     return new_entries, skipped_weekly_off
+
+
+def get_month_memo(
+    db: Session, group_id: str, year: int, month: int
+) -> Optional[str]:
+    """월 단위 단일 메모 조회 (source_type='month_memo' marker row).
+
+    없으면 None. group/year/month 당 최대 1 row.
+    """
+    row = (
+        db.query(FixedWantedEntry.head_nurse_memo)
+        .filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.source_type == "month_memo",
+        )
+        .first()
+    )
+    return row[0] if row is not None else None
+
+
+def _upsert_month_memo_marker(
+    db: Session,
+    *,
+    group_id: str,
+    year: int,
+    month: int,
+    caller_nurse_id: str,
+    raw_memo: Optional[str],
+) -> Optional[str]:
+    """월 단위 단일 메모(marker row) UPSERT.
+
+    marker row 식별: (group_id, year, month, source_type='month_memo').
+    raw_memo 가 None/공백 → marker row 가 있으면 삭제. 정규화된 memo 반환.
+    """
+    memo_value: Optional[str] = raw_memo
+    if isinstance(memo_value, str):
+        memo_value = memo_value.strip() or None
+    existing_marker = (
+        db.query(FixedWantedEntry)
+        .filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.source_type == "month_memo",
+        )
+        .first()
+    )
+    if memo_value is None:
+        if existing_marker is not None:
+            db.delete(existing_marker)
+        return None
+    if existing_marker is None:
+        marker = FixedWantedEntry(
+            group_id=group_id,
+            year=year,
+            month=month,
+            nurse_id=caller_nurse_id,
+            shift_date=date(year, month, 1),
+            shift_id="MEMO",
+            shifts_table_id=None,
+            is_applied=False,
+            source_type="month_memo",
+            original_shift_id=None,
+            reason=None,
+            head_nurse_memo=memo_value,
+            created_by=caller_nurse_id,
+        )
+        db.add(marker)
+    else:
+        existing_marker.head_nurse_memo = memo_value
+    return memo_value
 
 
 def save_fixed_wanted_service(
@@ -2621,11 +2717,22 @@ def save_fixed_wanted_service(
 
     request_nurse_ids = sorted({e.nurse_id for e in req.entries})
     if not request_nurse_ids:
+        # entries 빈 요청: marker row 보존하면서 셀 entries 만 wipe.
+        # 그 후 month_memo 처리 (있으면 marker UPSERT, 없으면 marker 삭제).
         deleted_count = db.query(FixedWantedEntry).filter(
             FixedWantedEntry.group_id == group_id,
             FixedWantedEntry.year == req.year,
             FixedWantedEntry.month == req.month,
+            FixedWantedEntry.source_type != "month_memo",
         ).delete()
+        _upsert_month_memo_marker(
+            db,
+            group_id=group_id,
+            year=req.year,
+            month=req.month,
+            caller_nurse_id=nurse_id,
+            raw_memo=req.month_memo,
+        )
         db.commit()
         print(f"빈 요청 — caller_group={group_id} entries {deleted_count}건 삭제")
         return []
@@ -2741,11 +2848,12 @@ def save_fixed_wanted_service(
         if leave_days:
             nurse_leave_blocked_map[nid] = leave_days
 
-    # ── caller group entries 삭제 (다른 group 보존) ──
+    # ── caller group entries 삭제 (다른 group 보존, month_memo marker row 보존) ──
     deleted_count = db.query(FixedWantedEntry).filter(
         FixedWantedEntry.group_id == group_id,
         FixedWantedEntry.year == req.year,
         FixedWantedEntry.month == req.month,
+        FixedWantedEntry.source_type != "month_memo",
     ).delete()
     if deleted_count > 0:
         print(f"기존 FixedWantedEntry 삭제(caller_group={group_id}): {deleted_count}건")
@@ -2755,6 +2863,16 @@ def save_fixed_wanted_service(
         db, req, group_id, nurse_id,
         shift_id_to_table_id, original_map, nurse_weekly_off_map,
         nurse_leave_blocked_map=nurse_leave_blocked_map,
+    )
+
+    # ── month_memo marker row UPSERT (entries 와 별개 단일 row) ──
+    _upsert_month_memo_marker(
+        db,
+        group_id=group_id,
+        year=req.year,
+        month=req.month,
+        caller_nurse_id=nurse_id,
+        raw_memo=req.month_memo,
     )
 
     db.commit()

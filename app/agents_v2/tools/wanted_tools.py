@@ -123,6 +123,8 @@ def get_wanted_adjustments(
         FixedWantedEntry.group_id == group_id,
         FixedWantedEntry.year == year,
         FixedWantedEntry.month == month,
+        # source_type='month_memo' marker row 는 셀 entry 가 아니므로 LLM 응답에서 항상 제외.
+        FixedWantedEntry.source_type != "month_memo",
     )
     if nurse_id:
         q = q.filter(FixedWantedEntry.nurse_id == nurse_id)

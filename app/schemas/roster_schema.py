@@ -717,7 +717,11 @@ class FixedWantedEntryCreate(BaseModel):
     source_type: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
     original_shift_id: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
     reason: Optional[str] = None
-    head_nurse_memo: Optional[str] = None
+    head_nurse_memo: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        description="수간호사/관리자 메모 (최대 500자, 빈 문자열은 NULL 저장)",
+    )
 
 
 class FixedWantedCreate(BaseModel):
@@ -726,6 +730,15 @@ class FixedWantedCreate(BaseModel):
     year: int
     month: int
     entries: List[FixedWantedEntryCreate]
+    month_memo: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "월 단위 단일 메모(수간호사/관리자만 입력). "
+            "fixed_wanted_entries 내 source_type='month_memo' marker row 로 분리 저장됨. "
+            "빈 문자열/None 이면 해당 marker row 삭제."
+        ),
+    )
 
 
 class FixedWantedEntryResponse(BaseModel):
@@ -820,6 +833,13 @@ class AdjustmentResponse(BaseModel):
 
     nurses: List[AdjustmentNurse]
     has_fixed_wanted: bool = False  # 저장된 확정 원티드 존재 여부
+    month_memo: Optional[str] = Field(
+        default=None,
+        description=(
+            "월 단위 단일 메모. source_type='month_memo' marker row 의 head_nurse_memo. "
+            "없으면 null."
+        ),
+    )
 
 
 class FixedWantedListResponse(BaseModel):
@@ -830,6 +850,10 @@ class FixedWantedListResponse(BaseModel):
     month: int
     entries: List[FixedWantedEntryResponse]
     total_count: int
+    month_memo: Optional[str] = Field(
+        default=None,
+        description="월 단위 단일 메모 (marker row.head_nurse_memo).",
+    )
 
     class Config:
         from_attributes = True

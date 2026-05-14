@@ -245,6 +245,7 @@ def _reallocate_month_fixed_wanted(
     candidate_gids = [source_group_id]
     if target_group_id:
         candidate_gids.append(target_group_id)
+    # source_type='month_memo' marker row 는 caller_group 단일 메모이므로 파견 재배치 대상 제외.
     entries = (
         db.query(FixedWantedEntry)
         .filter(
@@ -252,6 +253,7 @@ def _reallocate_month_fixed_wanted(
             FixedWantedEntry.year == year,
             FixedWantedEntry.month == month,
             FixedWantedEntry.group_id.in_(candidate_gids),
+            FixedWantedEntry.source_type != "month_memo",
         )
         .all()
     )

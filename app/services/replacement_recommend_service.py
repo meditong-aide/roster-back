@@ -182,6 +182,7 @@ def _build_assignment_blocked_dates(
                 d += timedelta(days=1)
 
     # fixed_wanted_entries — 고정 셀이 있는 날짜는 추천 제외
+    # source_type='month_memo' marker row 는 가상의 (caller, YYYY-MM-01) 키이므로 제외.
     fixed_entries = (
         db.query(FixedWantedEntry.nurse_id, FixedWantedEntry.shift_date)
         .filter(
@@ -189,6 +190,7 @@ def _build_assignment_blocked_dates(
             FixedWantedEntry.year == year,
             FixedWantedEntry.month == month,
             FixedWantedEntry.is_applied == True,
+            FixedWantedEntry.source_type != "month_memo",
         )
         .all()
     )

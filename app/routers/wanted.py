@@ -50,6 +50,7 @@ from services.wanted_service import (
     get_fixed_wanted_entries_service,
     reset_fixed_wanted_service,
     get_shift_requests_service,
+    get_month_memo,
 )
 
 router = APIRouter(
@@ -865,6 +866,7 @@ async def save_fixed_wanted(
 
     try:
         entries = save_fixed_wanted_service(db, target_group_id, current_user.nurse_id, req)
+        month_memo_value = get_month_memo(db, target_group_id, req.year, req.month)
         return FixedWantedListResponse(
             group_id=target_group_id,
             year=req.year,
@@ -888,6 +890,7 @@ async def save_fixed_wanted(
                 ) for e in entries
             ],
             total_count=len(entries),
+            month_memo=month_memo_value,
         )
     except HTTPException:
         db.rollback()
