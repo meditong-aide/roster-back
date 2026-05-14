@@ -519,7 +519,7 @@ def optimize_fallback_lex_hard_first(
         coverage_eq: Optional[int] = None,
         over_le: Optional[int] = None,
         stage2_zero_locks: Optional[Dict[str, list]] = None,
-        relax_level: int = 0,
+        broad_soft: bool = False,
     ):
         m = cp_model.CpModel()
         # MUS 추출용 hard assumption registry — fallback path도 primary와 동일하게.
@@ -535,8 +535,8 @@ def optimize_fallback_lex_hard_first(
             _assume_registry_fb = None
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
-        # relax_level >= 3: max coverage + M min hard → soft 전환 (인원 부족 시 생성 보장)
-        _relax_coverage = relax_level >= 3
+        # broad_soft=True: 2차 fallback 시도에서 max coverage + M min hard → soft 전환
+        _relax_coverage = bool(broad_soft)
         coverage_soft_weight = int(
             getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000
         )
@@ -605,7 +605,7 @@ def optimize_fallback_lex_hard_first(
 
         # weekly_off_by_idx, cross-month 등
         # 👉 여기서만 structural_off_cells에 추가
-        if stage == 1 and relax_level == 0:
+        if stage == 1 and not broad_soft:
             try:
                 mapping_logs = []
                 for idx, nu in enumerate(roster_system.nurses):
@@ -737,7 +737,7 @@ def optimize_fallback_lex_hard_first(
                         f"avail_days={avail_days}"
                     )
                     if is_n_only:
-                        max_off_allowed = max(0, avail_days - 15) + relax_level
+                        max_off_allowed = max(0, avail_days - 15)
                         # print(f'is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     else:
                         vacation_cnt = sum(
@@ -756,7 +756,7 @@ def optimize_fallback_lex_hard_first(
                             weekend_only=bool(getattr(nu, "is_weekend_off", False)),
                             weekend_slots_nonvac=weekend_slots_nonvac,
                         )
-                        max_off_allowed = int(off_bounds["max_off_allowed"]) + relax_level
+                        max_off_allowed = int(off_bounds["max_off_allowed"])
                         # print(f'not is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     if forced_off_cnt > max_off_allowed:
                         # print(f'forced_off_cnt > max_off_allowed, 간호사 n: {n}, forced_off_cnt: {forced_off_cnt}, max_off_allowed: {max_off_allowed}')
@@ -1082,7 +1082,7 @@ def optimize_fallback_lex_hard_first(
         #                 left_pos = d - 1
         #                 right_pos = d + 1
         #                 # if left_pos >= T0 and left_pos not in shortage_days:
-        #                 allow_shortage_off = relax_level >= 3
+                #                 allow_shortage_off = broad_soft
 
         #                 if left_pos >= T0 and (allow_shortage_off or left_pos not in shortage_days):
         #                     neighbours.append(("left", X(n, left_pos, off_idx)))
@@ -2271,8 +2271,7 @@ def optimize_fallback_lex_hard_first(
                         for d in range(T0, T1 + 1)
                         if (n, d) not in vacation_off_cells
                     )
-                    # relax_level에 따라 부분 하드: relax_level=0이면 완전 하드, 1이면 1일 부족 허용 …
-                    hard_lower = max(0, min_off_required - relax_level)
+                    hard_lower = int(min_off_required)
                     m.Add(offs >= hard_lower)
                     miss = m.NewIntVar(0, D, f"min_off_miss_{n}")
                     m.Add(miss >= min_off_required - offs)
@@ -2285,7 +2284,7 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) not in vacation_off_cells
                     )
                     if is_n_only:
-                        # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                        # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
                         total_cap_effective = max(0, avail_days - 15)
                     else:
                         # 2N2O/3N2O 하드 제약으로 인한 추가 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
@@ -2312,7 +2311,7 @@ def optimize_fallback_lex_hard_first(
                             base_cap += _extra_off_fb
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
                             total_cap_effective = min(base_cap, avail_days)
                             # max coverage 자동 조정: max_off cap
                             if _fb_auto_max_off is not None:
@@ -2325,20 +2324,15 @@ def optimize_fallback_lex_hard_first(
                             base_cap = min_off_required + _extra_off_fb
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
                             total_cap_effective = min(base_cap, avail_days)
                             total_cap_effective = max(total_cap_effective, min_off_required)
                     # OFF cap slack 결정 정책:
                     # 1) cfg gate (off_cap_bounded_slack_enable=True) → 기존 cfg max/weight 사용
-                    # 2) gate False AND relax_level > 0 → per-nurse fallback 슬랙
-                    #    (글로벌 +relax_level 폐지 후 위반 nurse 만 cap 풀어주는 구조)
-                    # 3) gate False AND relax_level == 0 → cap hard (slack 없음)
+                    # 2) gate False → cap hard (슬랙 없음)
                     if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
                         _slack_max = int(off_cap_bounded_slack_max)
                         _slack_weight = int(off_cap_bounded_slack_weight)
-                    elif int(relax_level or 0) > 0:
-                        _slack_max = int(relax_level)
-                        _slack_weight = 100000
                     else:
                         _slack_max = 0
                         _slack_weight = 0
@@ -2539,18 +2533,18 @@ def optimize_fallback_lex_hard_first(
         )
     ############################################################## build model 끝 ##############################################################
     
-    # ───── 1단계: 커버리지 (완화 재시도 포함) ─────
+    # ───── 1단계: 커버리지 (hard 1회 → broad soft 1회) ─────
     m1, X1, short1, over1, safety1 = None, None, None, None, None
     short_map1 = {}
     over_map1 = {}
     s1 = None
     best_short, best_over = None, None
-    used_relax_level = 0  # 1단계에서 성공한 완화 레벨
-    max_relax_attempts = 10  # 최대 10회까지 완화 재시도
-    time_per_attempt = max(3, tl1 // max_relax_attempts)  # 각 시도당 시간 (최소 3초)
+    used_broad_soft = False
+    attempt_specs = [(False, "hard"), (True, "broad_soft")]
+    time_per_attempt = max(5, tl1 // len(attempt_specs))
 
-    for relax_level in range(max_relax_attempts):
-        with timer_cls(f"폴백 1단계: 커버리지 부족 최소화 (완화레벨={relax_level})"):
+    for broad_soft, attempt_label in attempt_specs:
+        with timer_cls(f"폴백 1단계: 커버리지 부족 최소화 ({attempt_label})"):
             (
                 m1,
                 X1,
@@ -2564,7 +2558,7 @@ def optimize_fallback_lex_hard_first(
                 _,
                 _,
             ) = build_model(
-                stage=1, relax_level=relax_level
+                stage=1, broad_soft=broad_soft
             )
             s1 = cp_model.CpSolver()
             s1.parameters.max_time_in_seconds = time_per_attempt
@@ -2586,20 +2580,15 @@ def optimize_fallback_lex_hard_first(
                 except Exception as _mus_exc:
                     print(f"[FallbackLex][stage1] MUS 추출 실패(무시): {_mus_exc}")
             print(
-                f"{logger_prefix} 폴백1 결과: relax_level={relax_level}, "
+                f"{logger_prefix} 폴백1 결과: attempt={attempt_label}, "
                 f"status={_cp_sat_status_to_text(st)}"
             )
             if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 best_short = int(s1.Value(sum(short1)))
                 best_over = int(s1.Value(sum(over1)))
-                used_relax_level = relax_level
-                if relax_level > 0:
-                    _relax_desc = f"OFF상한+{relax_level}"
-                    if relax_level >= 3:
-                        _relax_desc += ", max coverage soft, M min soft"
-                    print(
-                        f"{logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 ({_relax_desc})"
-                    )
+                used_broad_soft = broad_soft
+                if broad_soft:
+                    print(f"{logger_prefix} 폴백1 성공: broad soft 적용 (max coverage soft, M min soft)")
                 print(f"{logger_prefix} 최소 커버리지 부족: {best_short}, 과잉: {best_over}")
                 try:
                     short_items = []
@@ -2627,10 +2616,10 @@ def optimize_fallback_lex_hard_first(
                 except Exception as exc:
                     print(f"{logger_prefix} [Stage1 상세로그 실패]: {exc}")
                 break
-            if relax_level < max_relax_attempts - 1:
-                print(f"{logger_prefix} 폴백1 실패 (완화레벨={relax_level}): 재시도...")
+            if not broad_soft:
+                print(f"{logger_prefix} 폴백1 실패 ({attempt_label}): broad soft 1회 재시도...")
             else:
-                print(f"{logger_prefix} 폴백1 최종 실패: 모든 완화 시도 실패")
+                print(f"{logger_prefix} 폴백1 최종 실패: hard/broad soft 모두 실패")
 
     if best_short is None or best_over is None:
         print(f"{logger_prefix} 폴백 중단: 1단계 해를 찾지 못함")
@@ -2654,7 +2643,7 @@ def optimize_fallback_lex_hard_first(
             stage=2,
             coverage_eq=best_short,
             over_le=best_over,
-            relax_level=used_relax_level,
+            broad_soft=used_broad_soft,
         )
         s2 = cp_model.CpSolver()
         s2.parameters.max_time_in_seconds = tl2
@@ -2742,7 +2731,7 @@ def optimize_fallback_lex_hard_first(
             coverage_eq=best_short,
             over_le=best_over,
             stage2_zero_locks=stage2_zero_locks,
-            relax_level=used_relax_level,
+            broad_soft=used_broad_soft,
         )
         for k in safety3.keys():
             m3.Add(sum(safety3[k]) == sum(safety2[k]))
