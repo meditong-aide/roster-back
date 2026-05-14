@@ -1453,6 +1453,7 @@ def _build_special_fixed_cells(
                 "day_index": day - 1,
                 "shift": shift_id,
                 "shift_type": shift_type,
+                "fixed_source": "special_fixed",
             }
         )
     # for f in fixed_cells:
@@ -2727,7 +2728,15 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         for nurse_id in day0_n_fixed_nurse_ids:
             n_idx = nurse_idx_map.get(str(nurse_id))
             if n_idx is not None:
-                fixed_list.append({"nurse_index": n_idx, "day_index": 0, "shift": "N"})
+                fixed_list.append(
+                    {
+                        "nurse_index": n_idx,
+                        "day_index": 0,
+                        "shift": "N",
+                        "shift_type": "근무",
+                        "fixed_source": "carryover_day0_n",
+                    }
+                )
         config_dict["fixed_cells"] = fixed_list
     prev_month_last_is_off = cross_month_constraints.get("prev_month_last_is_off") or {}
     if prev_month_last_is_off:
@@ -4928,7 +4937,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             day_list = sorted(day_set)
             print(f"[WeeklyOff] 간호사 {nurse_name}({nurse_id}, index={n_idx}): 주휴 day_idx={day_list} (실제 날짜: {[d+1 for d in day_list]})")
             for d in day_list:
-                weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
+                weekly_off_fixed_cells.append(
+                    {
+                        "nurse_index": n_idx,
+                        "day_index": d,
+                        "shift": "O",
+                        "shift_type": "주휴",
+                        "fixed_source": "weekly_off",
+                    }
+                )
     config_dict["weekly_off_map"] = {k: sorted(list(v)) for k, v in weekly_off_map.items()}
 
     # 룩어헤드: 다음 달 1~K일 주휴 고정 OFF 셀(당월 weekly_off_by_idx와 별도로 재계산)
@@ -5245,8 +5262,23 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             build_blocking_payload,
         )
         _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
+        # `n.__dict__` 은 SQLAlchemy 의 이미 로딩된 attr 만 담아서 team_id /
+        # is_night_nurse 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
+        # 풀에서 사용할 키를 모두 일관되게 채운다.
         _nurses_dict_for_precheck = [
-            (n.__dict__ if hasattr(n, "__dict__") else dict(n))
+            {
+                "nurse_id": getattr(n, "nurse_id", None),
+                "db_id": getattr(n, "nurse_id", None),
+                "team_id": getattr(n, "team_id", None),
+                "grade": getattr(n, "grade", None),
+                "is_night_nurse": getattr(n, "is_night_nurse", None),
+                "work_shifts": getattr(n, "work_shifts", None),
+                "joining_date": getattr(n, "joining_date", None),
+                "resignation_date": getattr(n, "resignation_date", None),
+                "personal_off_adjustment": getattr(n, "personal_off_adjustment", 0),
+                "is_weekend_off": getattr(n, "is_weekend_off", False),
+                "weekly_off_weekday": getattr(n, "weekly_off_weekday", None),
+            }
             for n in (nurses_for_engine or [])
         ]
         # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
@@ -5530,12 +5562,37 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             if _cpsat_cores:
                 print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores_raw)}건 → dedup {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
                 _conflict_cores = _conflict_cores + _cpsat_cores
+            # Pool 그래프 스냅샷 — TeamPool / GradePool / CommonPool capacity vs demand
+            # 분석을 통한 root cause 표면화. shortage 가 발견되면 conflict_cores 에 합류.
+            _pool_snapshot_dict: dict[str, Any] = {}
+            try:
+                from services.ontology_pool import build_pool_snapshot_from_runtime
+                _pool_snap = build_pool_snapshot_from_runtime(
+                    nurses_dict=_nurses_dict_for_precheck,
+                    config_dict=precheck_config,
+                    grade_config=_engine_grade_config,
+                    fixed_cells=combined_fixed_cells,
+                    year=req.year,
+                    month=req.month,
+                )
+                _pool_snapshot_dict = _pool_snap.to_dict()
+                _shortage_cores = list(_pool_snapshot_dict.get("shortages") or [])
+                if _shortage_cores:
+                    print(
+                        f"[PoolGraph] shortages 발견: {len(_shortage_cores)}건 — "
+                        f"pools={len(_pool_snapshot_dict.get('pools') or [])}, "
+                        f"edges={len(_pool_snapshot_dict.get('nurse_pool_edges') or [])}"
+                    )
+                    _conflict_cores = _shortage_cores + _conflict_cores
+            except Exception as _pool_exc:
+                print(f"[PoolGraph] build 실패(무시): {_pool_exc}")
             unrecoverable = build_unrecoverable_payload(
                 precheck_result=precheck_result,
                 applied_relaxations=applied_relaxations,
                 last_error_reason=str(validation_error),
                 violated_constraints=_violated,
                 conflict_cores=_conflict_cores,
+                pool_snapshot=_pool_snapshot_dict,
             )
             inf = unrecoverable.get("infeasibility", {})
             print(

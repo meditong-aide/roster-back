@@ -136,12 +136,17 @@ def build_unrecoverable_payload(
     last_error_reason: Optional[str] = None,
     violated_constraints: Optional[List[Dict[str, Any]]] = None,
     conflict_cores: Optional[List[Dict[str, Any]]] = None,
+    pool_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """자연 soft까지 시도했음에도 근무표 생성 실패한 케이스(HTTP 500 detail).
 
     `violated_constraints`: solver/validator가 식별한 인과 제약 리스트
         [{"node_id", "slack", "details", "reason_code", "human_message_ko"}].
         ontology dashboard가 ConstraintNode + CAUSES_VIOLATION 엣지로 표면화한다.
+
+    `pool_snapshot`: :mod:`services.ontology_pool` 에서 산출된 pool 그래프 스냅샷.
+        nodes/edges/shortages 가 들어있다. dashboard 가 TeamPool / GradePool /
+        CommonPool 풀 상태를 시각화할 때 사용한다.
     """
     issues = humanize_all((precheck_result or {}).get("issues", []) or [])
     fix_suggestions: List[str] = [
@@ -162,6 +167,7 @@ def build_unrecoverable_payload(
             "violation_summary": {},
             "violated_constraints": list(violated_constraints or []),
             "conflict_cores": list(conflict_cores or []),
+            "pool_snapshot": pool_snapshot or {},
             "last_error_reason": last_error_reason,
         }
     }
