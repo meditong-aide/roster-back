@@ -24,6 +24,7 @@ EXPLICIT_PKS = {
     "nurse_shift_requests": ["nurse_id", "request_id", "detailed_request_id"],
     "nurse_pair_requests": ["nurse_id", "request_id", "month"],
     "issued_roster": ["office_id", "group_id", "version"],
+    "wanted": ["group_id", "year", "month"],
 }
 
 # (table, mode) — FK 부모 → 자식 순서
