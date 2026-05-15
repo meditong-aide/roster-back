@@ -1662,28 +1662,158 @@ def _list_runs_with_meta() -> list[dict[str, Any]]:
     return rows
 
 
-def _narrative_ko(*, ves: dict, fp: dict, structural: dict) -> str | None:
+def _why_analysis(*, ves: dict, fp: dict, structural: dict, attempt: dict,
+                  violated: list) -> dict[str, Any]:
+    """Derive a causal 'why infeasible' explanation, not just symptom numbers.
+
+    Returns dict with:
+      - headline_ko: 1~2 sentence root-cause statement (the answer to '왜?')
+      - mechanism_ko: 작동 메커니즘 1~2 sentences
+      - evidence_bullets: [{label, value}] tying claim to concrete signals
+      - confidence: 'high' | 'med' | 'low'
+    """
     total = int(ves.get("total_failed_cells") or 0)
     elig_zero = int(ves.get("eligible_zero_cells") or 0)
     fixed_cnt = int(ves.get("fixed_forbidden_count") or 0)
     carry = int(ves.get("carryover_artifact_count") or 0)
     short_total = int(ves.get("required_minus_assigned_total") or 0)
+    cells = list(ves.get("top_failed_cells") or [])
+    codes = {str(v.get("reason_code") or "").upper() for v in (violated or [])}
+    used_fallback = bool(attempt.get("used_fallback"))
+    applied = list(attempt.get("applied_relaxations") or [])
+
+    early_days = [c for c in cells if int(c.get("day") or 0) <= 7]
+    by_shift: dict[str, int] = defaultdict(int)
+    elig_vs_assigned_zero = 0
+    for c in cells:
+        sh = str(c.get("shift") or "").upper()
+        by_shift[sh] += 1
+        if int(c.get("eligible") or 0) > 0 and int(c.get("assigned") or 0) == 0:
+            elig_vs_assigned_zero += 1
+    dominant_shift = max(by_shift.items(), key=lambda kv: kv[1])[0] if by_shift else ""
+    sample_day_shift = [
+        f"{c.get('day')}일 {str(c.get('shift') or '').upper()}"
+        for c in cells[:5]
+        if c.get("day") is not None
+    ]
+
+    # Pattern 1: ConfigIntegrity (T0)
     if fp.get("data_correction_required"):
-        return "입력 설정이 수학적으로 풀리지 않습니다. 룰 완화로는 해소되지 않으니 데이터(인력풀·요구 인원·고정 배정)를 직접 정비해야 합니다."
-    if total > 20 and elig_zero == 0 and fixed_cnt >= 50:
-        return (
-            f"인력 자체는 충분합니다(후보 0인 셀 없음). 다만 고정/금지 셀 {fixed_cnt}건이 솔버 흐름을 차단해 "
-            f"{total}셀, 누적 {short_total}인-셀이 미배정되었습니다. "
-            "고정 셀 일부 분산과 D/E 필요 인원 소폭 완화부터 시도해 보세요."
-        )
+        return {
+            "headline_ko": "입력 설정 자체가 수학적으로 풀리지 않습니다.",
+            "mechanism_ko": (
+                "룰 완화로 해소되지 않는 영역입니다. "
+                f"감지된 데이터 무결성 family: {', '.join(fp.get('data_correction_families') or ['ConfigIntegrity'])}. "
+                "인력풀·요구 인원·고정 배정 같은 입력 데이터를 직접 정비해야 합니다."
+            ),
+            "evidence_bullets": [
+                {"label": "데이터 무결성 코드", "value": ", ".join(sorted(codes & {"MID_REQUIRED_MISSING","MID_DISABLED_BUT_USED","ALLOWED_SHIFTS_ISOLATES_NURSE","FIXED_ASSIGN_EXCEEDS_NEED","FIXED_ASSIGN_VIOLATES_ALLOWED"}) or "ConfigIntegrity")},
+            ],
+            "confidence": "high",
+        }
+
+    # Pattern 2: eligible_zero — 진짜 인력 부족 / 마스크 고립
     if elig_zero > 0:
-        return f"{elig_zero}개 셀에서 배정 가능한 간호사가 0명입니다. 허용 시프트 마스크/역할 분포를 점검하세요."
-    if carry > 0:
-        return f"전월 carryover 잔여({carry}건)가 월초 셀을 차단합니다. 전월 N tail / 연속근무 꼬리를 확인하세요."
-    if (fp.get("axis_actions") or []):
-        n = len(fp["axis_actions"])
-        return f"{n}개 축의 조정이 권장됩니다. 우선순위가 낮은 룰부터 단계적으로 풀어 보세요."
-    return None
+        return {
+            "headline_ko": f"{elig_zero}개 셀에 배정 가능한 간호사가 0명입니다.",
+            "mechanism_ko": (
+                "이 셀들에는 시프트 마스크·휴가/공가·전월 회복 OFF 같은 hard 제약으로 "
+                "그날 그 시프트를 할 수 있는 인력이 단 한 명도 없는 상태입니다. "
+                "룰 완화보다는 인력 충원 또는 허용 시프트 마스크 확장이 우선입니다."
+            ),
+            "evidence_bullets": [
+                {"label": "후보 0 셀 수", "value": str(elig_zero)},
+                {"label": "실패 셀 예시", "value": " · ".join(sample_day_shift)} if sample_day_shift else {"label": "스코프", "value": "n/a"},
+            ],
+            "confidence": "high",
+        }
+
+    # Pattern 3: 후보는 있는데 배정 0 — 고정 잠금 우세
+    sample_ratio = elig_vs_assigned_zero / max(len(cells), 1)
+    if total > 10 and sample_ratio >= 0.5 and fixed_cnt >= 30:
+        scope_txt = ""
+        if early_days:
+            mn = min(int(c.get("day") or 0) for c in early_days)
+            mx = max(int(c.get("day") or 0) for c in early_days)
+            scope_txt = f"{mn}~{mx}일 "
+        sh_txt = f"{dominant_shift} 시프트 중심으로 " if dominant_shift else ""
+        return {
+            "headline_ko": (
+                f"{scope_txt}{sh_txt}고정/금지 셀 {fixed_cnt}건이 후보 인력을 선점해 "
+                f"솔버가 어떤 인원도 배정할 수 없었습니다."
+            ),
+            "mechanism_ko": (
+                f"후보 자체는 충분합니다(top {len(cells)} 셀 중 후보 0인 셀 없음). "
+                f"하지만 가용 인력이 다른 일자/시프트의 고정 배정(휴가·공가·원티드·N전담 등)에 묶여 있어, "
+                f"{dominant_shift or 'D/E'} 시프트 최소 인원을 채울 자유 인력이 0이 되는 조합입니다. "
+                f"fallback 솔버도 fixed 영역은 hard 가드라 풀지 못합니다."
+            ),
+            "evidence_bullets": [
+                {"label": "후보 있으나 배정 0인 셀", "value": f"{elig_vs_assigned_zero}건"},
+                {"label": "실패 셀 예시", "value": " · ".join(sample_day_shift) if sample_day_shift else "n/a"},
+                {"label": "고정/금지 셀 총량", "value": f"{fixed_cnt}건"},
+                {"label": "fallback 결과", "value": "시도됐으나 효과 0 (fixed 미우회)"} if used_fallback and not applied else {"label": "누적 미배정", "value": f"{short_total}인-셀"},
+            ],
+            "confidence": "high",
+        }
+
+    # Pattern 4: carryover dominant
+    if carry > 0 and (early_days or "PREV_MONTH_TRANSITION" in codes):
+        return {
+            "headline_ko": f"전월에서 넘어온 회복/연속근무 꼬리({carry}건)가 월초 셀을 차단합니다.",
+            "mechanism_ko": (
+                "전월 마지막 N 블록의 회복 OFF, 전월 연속근무 잔여, 또는 전월→당월 전이 금지가 "
+                "월초 1~5일 셀 후보를 사전 제거하는 상태입니다."
+            ),
+            "evidence_bullets": [
+                {"label": "carryover artifact", "value": f"{carry}건"},
+                {"label": "월초 실패 셀", "value": f"1~7일 {len(early_days)}개"} if early_days else {"label": "직접 reason", "value": "PREV_MONTH_TRANSITION"},
+            ],
+            "confidence": "high",
+        }
+
+    # Pattern 5: 산술 불가능 / pool 부족
+    structural_codes = codes & {"CAPACITY_TOTAL_SHORTAGE","GLOBAL_DAY_CAPACITY_SHORTAGE","TEAM_MIN_EXCEEDS_GLOBAL_NEED","GRADE_MIN_SUM_EXCEEDS_NEED"}
+    if structural_codes:
+        return {
+            "headline_ko": "요구 인원이 가용 풀을 수학적으로 초과합니다.",
+            "mechanism_ko": (
+                f"감지된 구조 코드: {', '.join(sorted(structural_codes))}. "
+                "이는 인원 충원 또는 요구치 하향 없이는 풀 수 없는 산술 불가능 케이스입니다."
+            ),
+            "evidence_bullets": [
+                {"label": "구조 reason codes", "value": ", ".join(sorted(structural_codes))},
+                {"label": "누적 부족", "value": f"{short_total}인-셀"} if short_total else {"label": "스코프", "value": "전체"},
+            ],
+            "confidence": "high",
+        }
+
+    # Pattern 6: axis hints only
+    axes = fp.get("axis_actions") or []
+    if axes:
+        names = ", ".join(a.get("axis_id") for a in axes[:3] if a.get("axis_id"))
+        return {
+            "headline_ko": f"{len(axes)}개 축의 조정이 권장됩니다 (top: {names}).",
+            "mechanism_ko": "구체 인과 evidence는 약하지만 (conflict cores 미생성), 축 단위 완화로 재시도해 볼 수 있습니다.",
+            "evidence_bullets": [{"label": f"axis {a.get('axis_id')}", "value": str(a.get("human_message_ko") or "")[:60]} for a in axes[:3]],
+            "confidence": "low",
+        }
+
+    # Default — 신호 부족
+    return {
+        "headline_ko": "원인 신호가 부족합니다.",
+        "mechanism_ko": "conflict cores·pool snapshot·validator evidence 모두 비어 있어 구체 인과를 추정할 수 없습니다. precheck 단계를 통과시킨 뒤 solver-stage infeasible 을 유도해 보세요.",
+        "evidence_bullets": [],
+        "confidence": "low",
+    }
+
+
+def _narrative_ko(*, ves: dict, fp: dict, structural: dict) -> str | None:
+    """Back-compat one-liner for any legacy caller."""
+    why = _why_analysis(ves=ves, fp=fp, structural=structural, attempt={}, violated=[])
+    parts = [why.get("headline_ko") or "", why.get("mechanism_ko") or ""]
+    s = " ".join(p for p in parts if p)
+    return s or None
 
 
 def _build_diagnosis_report(target: dict[str, Any]) -> dict[str, Any]:
@@ -1713,6 +1843,13 @@ def _build_diagnosis_report(target: dict[str, Any]) -> dict[str, Any]:
             "schedule_id": attempt.get("schedule_id"),
         },
         "narrative_ko": _narrative_ko(ves=ves, fp=fp, structural=sd),
+        "why": _why_analysis(
+            ves=ves,
+            fp=fp,
+            structural=sd,
+            attempt=attempt,
+            violated=list(inf.get("violated_constraints") or []),
+        ),
         "failure_stage": fp.get("failure_stage"),
         "failure_stage_label_ko": fp.get("failure_stage_label_ko"),
         "tier_summary": fp.get("tier_summary") or {"T0": 0, "T1": 0, "T2": 0, "T3": 0},
@@ -1915,6 +2052,16 @@ _HTML = """<!doctype html>
     .verdict .v-status-pill { font-size:10px; padding:2px 8px; border-radius:10px; background:var(--panel2); color:var(--accent); }
 
     .narrative { background:#0a1525; border:1px solid #1e3a8a; border-radius:8px; padding:14px 18px; margin-bottom:14px; font-size:13px; line-height:1.7; color:#dbeafe; }
+
+    /* Why panel — 인과 답변 */
+    .why-panel { background:#1a1605; border:1px solid #713f12; border-left:4px solid #fbbf24; border-radius:8px; padding:14px 18px; margin-bottom:14px; }
+    .why-headline { font-size:15px; font-weight:600; color:#fef3c7; line-height:1.55; margin-bottom:8px; }
+    .why-mech { font-size:12px; color:#fde68a; line-height:1.7; margin-bottom:10px; }
+    .why-bullets { background:rgba(0,0,0,0.2); border-radius:6px; padding:8px 12px; margin-top:8px; }
+    .wb-row { display:flex; align-items:baseline; gap:10px; font-size:11px; padding:3px 0; }
+    .wb-label { color:#a16207; min-width:140px; }
+    .wb-value { color:#fef3c7; font-family:monospace; }
+    .why-conf { font-size:10px; color:#a16207; margin-top:8px; text-align:right; font-style:italic; }
     .stage-bar { margin-bottom:14px; }
     .stage-pill { display:inline-block; background:#1e293b; color:#93c5fd; padding:5px 14px; border-radius:14px; font-size:12px; border:1px solid #334155; }
 
@@ -2159,8 +2306,32 @@ _HTML = """<!doctype html>
       card.append(el('div', { class:'v-meta' }, `${d.run.run_id}`));
       root.append(card);
 
-      // Narrative
-      if (d.narrative_ko) root.append(el('div', { class:'narrative' }, d.narrative_ko));
+      // Why panel (the actual answer to "왜?") — replaces narrative one-liner
+      const why = d.why || {};
+      if (why.headline_ko) {
+        root.append(el('div', { class:'section-title', style:'color:#fbbf24; font-size:12px;' }, '📍 왜 안 됐는가'));
+        const wp = el('div', { class:'why-panel' });
+        wp.append(el('div', { class:'why-headline' }, why.headline_ko));
+        if (why.mechanism_ko) wp.append(el('div', { class:'why-mech' }, why.mechanism_ko));
+        const bullets = why.evidence_bullets || [];
+        if (bullets.length) {
+          const ul = el('div', { class:'why-bullets' });
+          for (const b of bullets) {
+            if (!b || !b.value) continue;
+            const row = el('div', { class:'wb-row' });
+            row.append(el('span', { class:'wb-label' }, b.label || ''));
+            row.append(el('span', { class:'wb-value' }, b.value));
+            ul.append(row);
+          }
+          wp.append(ul);
+        }
+        if (why.confidence) {
+          wp.append(el('div', { class:'why-conf' }, `근거 강도: ${why.confidence}`));
+        }
+        root.append(wp);
+      } else if (d.narrative_ko) {
+        root.append(el('div', { class:'narrative' }, d.narrative_ko));
+      }
 
       // Stage
       if (d.failure_stage && d.failure_stage !== 'unknown') {
@@ -2197,8 +2368,8 @@ _HTML = """<!doctype html>
       }
       root.append(ts2);
 
-      // Evidence
-      root.append(el('div', { class:'section-title' }, '진단 증거'));
+      // Evidence (raw measurements — reference)
+      root.append(el('div', { class:'section-title' }, '측정값 (참고)'));
       const es = el('div', { class:'ev-strip' });
       const evItems = [
         { label:'실패 셀', value:ev.total_failed_cells, warn:ev.total_failed_cells > 0 },
