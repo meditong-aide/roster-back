@@ -3146,6 +3146,155 @@ def _build_validation_shift_main_map(roster_system) -> dict[str, str]:
     return shift_main_map
 
 
+def _collect_validator_evidence(
+    generated: dict[str, list[str]] | None,
+    roster_system,
+    shift_main_map: dict[str, str] | None = None,
+) -> dict:
+    """validator 실패 해석용 근거 스냅샷(경량).
+
+    - day/shift 단위로 required/assigned/eligible를 수집
+    - top_failed_cells(최대 50) 샘플 생성
+    """
+    try:
+        cfg = getattr(roster_system, "config", None)
+        if cfg is None or not isinstance(generated, dict):
+            return {}
+
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        nurse_count = len(nurses)
+        num_days = int(getattr(roster_system, "num_days", 0) or 0)
+        if num_days <= 0:
+            num_days = max((len(v or []) for v in generated.values()), default=0)
+        if num_days <= 0:
+            return {}
+
+        join = list(getattr(roster_system, "join", []) or [])
+        leave = list(getattr(roster_system, "leave", []) or [])
+        blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
+
+        def _req_by_day(day_idx: int) -> dict[str, int]:
+            by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+            if isinstance(by_day, list) and day_idx < len(by_day) and isinstance(by_day[day_idx], dict):
+                return {str(k).upper(): int(v or 0) for k, v in by_day[day_idx].items()}
+            base = getattr(cfg, "daily_shift_requirements", None)
+            if isinstance(base, dict):
+                return {str(k).upper(): int(v or 0) for k, v in base.items()}
+            return {}
+
+        # assigned counter by day/shift
+        assigned_map: dict[tuple[int, str], int] = defaultdict(int)
+        for shifts in generated.values():
+            for d, raw in enumerate(shifts or []):
+                code = _normalize_assigned_code_for_validation(raw, shift_main_map)
+                if code in {"-", "O"}:
+                    continue
+                assigned_map[(d, code)] += 1
+
+        def _is_eligible(n_idx: int, d: int, code: str) -> bool:
+            if n_idx < len(join) and n_idx < len(leave):
+                if not (join[n_idx] <= d <= leave[n_idx]):
+                    return False
+            if d in (blocked_by_nurse.get(n_idx, set()) or set()):
+                return False
+            if n_idx < nurse_count:
+                nu = nurses[n_idx]
+                allowed = set(str(x).upper() for x in (getattr(nu, "allowed_shifts", None) or []))
+                if allowed and code not in allowed:
+                    return False
+                if code in {"D", "E"} and bool(getattr(nu, "is_night_nurse", 0) == 3):
+                    return False
+            return True
+
+        cells: list[dict] = []
+        for d in range(num_days):
+            req = _req_by_day(d)
+            for code, need in req.items():
+                code_u = str(code).upper()
+                if code_u == "O":
+                    continue
+                n_need = int(need or 0)
+                if n_need <= 0:
+                    continue
+                assigned = int(assigned_map.get((d, code_u), 0) or 0)
+                eligible = 0
+                if nurse_count > 0:
+                    for n_idx in range(nurse_count):
+                        if _is_eligible(n_idx, d, code_u):
+                            eligible += 1
+                cells.append(
+                    {
+                        "day": d + 1,
+                        "shift": code_u,
+                        "required": n_need,
+                        "assigned": assigned,
+                        "eligible": eligible,
+                        "shortage": max(0, n_need - assigned),
+                        "eligible_gap": max(0, n_need - eligible),
+                    }
+                )
+
+        failed = [c for c in cells if c["assigned"] < c["required"]]
+        failed.sort(key=lambda x: (x["shortage"], x["eligible_gap"]), reverse=True)
+        top_failed = failed[:50]
+
+        # Attach blocking_axes per cell (S3)
+        _shift_to_capacity_axis = {
+            "N": "night_capacity",
+            "D": "day_capacity",
+            "E": "evening_capacity",
+            "M": "mid_capacity",
+        }
+        for c in top_failed:
+            sh = str(c.get("shift") or "").upper()
+            primary = _shift_to_capacity_axis.get(sh)
+            blocking: list[str] = []
+            if primary:
+                blocking.append(primary)
+            eligible = int(c.get("eligible") or 0)
+            required = int(c.get("required") or 0)
+            assigned = int(c.get("assigned") or 0)
+            # Eligibility lock: 후보 자체가 부족
+            if eligible < required:
+                blocking.append("allowed_shift_mask")
+            # Coverage-but-eligible: 후보는 있지만 배정 안 됨 → fixed/carryover/team_min 의심
+            elif eligible >= required and assigned < required:
+                # team_min / fixed_lock / carryover_lock 중 후속 단계에서 분기. 일단 capacity 만 표시.
+                pass
+            c["blocking_axes"] = blocking
+            c["blocking_detail"] = {
+                "primary_axis": primary,
+                "eligibility_gap": max(0, required - eligible),
+                "assignment_gap": max(0, required - assigned),
+                "shift": sh,
+            }
+
+        # fixed/forbidden 및 carryover 단서 집계
+        merged_ic = getattr(roster_system, "_constraint_impact_merged_initial_constraints", None) or {}
+        forbidden_map = (merged_ic or {}).get("forbidden") or {}
+        fixed_forbidden_count = 0
+        if isinstance(forbidden_map, dict):
+            for day_map in forbidden_map.values():
+                if not isinstance(day_map, dict):
+                    continue
+                for codes in day_map.values():
+                    fixed_forbidden_count += len(list(codes or []))
+
+        carryover_artifacts = getattr(roster_system, "_constraint_impact_carryover_artifacts", None) or []
+        carryover_artifact_count = len(list(carryover_artifacts or []))
+
+        return {
+            "total_failed_cells": len(failed),
+            "top_failed_cells": top_failed,
+            "eligible_zero_cells": sum(1 for c in failed if c["eligible"] <= 0),
+            "required_minus_assigned_total": sum(int(c["shortage"]) for c in failed),
+            "fixed_forbidden_count": int(fixed_forbidden_count),
+            "carryover_artifact_count": int(carryover_artifact_count),
+        }
+    except Exception:
+        return {}
+
+
 def _normalize_assigned_code_for_validation(
     raw_shift: object,
     shift_main_map: dict[str, str] | None = None,
@@ -3191,6 +3340,10 @@ def _extract_unrecoverable_violated_constraints(
         "CAPACITY_TOTAL_SHORTAGE": ("infeasibility:capacity_total", "ConstraintNode"),
         "N_CAPACITY_SHORTAGE":     ("infeasibility:n_capacity", "ConstraintNode"),
         "NO_ASSIGNMENT":           ("infeasibility:no_assignment", "ConstraintNode"),
+        "NO_ASSIGNMENT_CAPACITY":  ("infeasibility:no_assignment_capacity", "ConstraintNode"),
+        "NO_ASSIGNMENT_ELIGIBILITY": ("infeasibility:no_assignment_eligibility", "ConstraintNode"),
+        "NO_ASSIGNMENT_FIXED":     ("infeasibility:no_assignment_fixed", "ConstraintNode"),
+        "NO_ASSIGNMENT_CARRYOVER": ("infeasibility:no_assignment_carryover", "ConstraintNode"),
         "MAX_CAP_SHORTAGE":        ("infeasibility:max_cap_shortage", "ConstraintNode"),
         "GRADE_MAX_SUM_BELOW_NEED":("grade_max:sum_below_need", "GradeMaxNode"),
         "GRADE_HARD_PROBE":        ("grade_max:hard_probe", "GradeMaxNode"),
@@ -3211,6 +3364,61 @@ def _extract_unrecoverable_violated_constraints(
 
     for m in re.finditer(r"\[reason_code=([A-Z_]+)\]", err):
         _push(m.group(1), err, details={"source": "validation_error"})
+
+    def _infer_no_assignment_direct_reasons() -> list[str]:
+        """NO_ASSIGNMENT를 4축 direct reason으로 분해한다 (규칙 기반)."""
+        direct: list[str] = []
+        text = str(err or "").upper()
+        evidence = getattr(roster_system, "_validator_evidence", None) or {}
+        top_failed = list((evidence or {}).get("top_failed_cells") or [])
+        eligible_zero_cells = int((evidence or {}).get("eligible_zero_cells") or 0)
+        total_failed_cells = int((evidence or {}).get("total_failed_cells") or 0)
+        fixed_forbidden_count = int((evidence or {}).get("fixed_forbidden_count") or 0)
+        carryover_artifact_count = int((evidence or {}).get("carryover_artifact_count") or 0)
+
+        if "NO_ASSIGNMENT" not in text and "NO_ASSIGNMENT" not in seen_codes:
+            return direct
+
+        # capacity
+        try:
+            pool = getattr(roster_system, "_constraint_pool_snapshot", None) or {}
+            shortages = list((pool or {}).get("shortages") or [])
+            if shortages or any(k in text for k in ["CAPACITY_TOTAL_SHORTAGE", "N_CAPACITY_SHORTAGE", "DAY_ZERO_COVERAGE"]):
+                direct.append("NO_ASSIGNMENT_CAPACITY")
+            elif int((evidence or {}).get("required_minus_assigned_total") or 0) > 0 and eligible_zero_cells < max(1, total_failed_cells // 3):
+                direct.append("NO_ASSIGNMENT_CAPACITY")
+        except Exception:
+            pass
+
+        # eligibility
+        if any(k in text for k in ["ALLOWED_SHIFTS_ISOLATES_NURSE", "TEAM_SHIFT_ALLOWED_SHORTAGE", "SHIFT_NOT_ALLOWED", "N_ONLY"]):
+            direct.append("NO_ASSIGNMENT_ELIGIBILITY")
+        elif total_failed_cells > 0 and eligible_zero_cells >= max(1, total_failed_cells // 2):
+            direct.append("NO_ASSIGNMENT_ELIGIBILITY")
+
+        # fixed
+        if any(k in text for k in ["FIXED_ASSIGN_", "INITIAL_FORBIDDEN", "FORBIDDEN_SHIFT", "FIXED_WANTED"]):
+            direct.append("NO_ASSIGNMENT_FIXED")
+        elif total_failed_cells > 0 and fixed_forbidden_count > 0:
+            direct.append("NO_ASSIGNMENT_FIXED")
+
+        # carryover
+        if any(k in text for k in ["PREV_", "CARRYOVER", "2N2OFF", "3N2OFF", "BOUNDARY"]):
+            direct.append("NO_ASSIGNMENT_CARRYOVER")
+        elif total_failed_cells > 0 and carryover_artifact_count > 0:
+            direct.append("NO_ASSIGNMENT_CARRYOVER")
+
+        return list(dict.fromkeys(direct))
+
+    for rc in _infer_no_assignment_direct_reasons():
+        _push(
+            rc,
+            f"[reason_code={rc}] NO_ASSIGNMENT direct reason 분류",
+            details={
+                "source": "no_assignment_direct_rule",
+                "validator_evidence": getattr(roster_system, "_validator_evidence", None) or {},
+            },
+        )
 
     try:
         diag = _build_infeasible_diagnosis(roster_system, generated)
@@ -3544,6 +3752,15 @@ def _validate_generated_roster(
 
     shift_main_map = _build_validation_shift_main_map(roster_system)
     total_cells, work_cells = _count_work_assignments(generated, shift_main_map)
+    try:
+        if roster_system is not None:
+            setattr(
+                roster_system,
+                "_validator_evidence",
+                _collect_validator_evidence(generated, roster_system, shift_main_map),
+            )
+    except Exception:
+        pass
 
     if total_cells > 0 and work_cells == 0:
         diag = _build_infeasible_diagnosis(roster_system, generated)

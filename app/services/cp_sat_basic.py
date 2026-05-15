@@ -4201,13 +4201,47 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
                     if _3n_rem >= 2:
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_3n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) == 2)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery3N2OFF:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_3n2off:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 3N2OFF boundary",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 2},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 3N 꼬리로 월초 2OFF 회복이 필요합니다.",
+                                    "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block])
                     else:
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) >= 1
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_3n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) >= 1)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery3N2OFFPartial:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_3n2off_partial:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 3N2OFF boundary partial",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 1},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 3N 꼬리 회복 OFF가 월초에 추가로 필요합니다.",
+                                    "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block])
                 print(f"[CP-SAT-Basic] [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
             elif n_tail >= 3 and _3n_rem == 0:
@@ -4215,21 +4249,74 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                       f"offs_after={n_offs_after_3n} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
             if n_tail >= 2 and n_offs_after_3n < 2 and (T0 + 2) <= T1:
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
-                    m.Add(
-                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                    ).OnlyEnforceIf([X(n, T0, night)])
+                    _expr_3n_tail2 = (countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2)
+                    if _assume_registry is not None:
+                        _co_lit = _assume_registry.create_literal(
+                            f"CarryoverRecovery3N2OFFTail2:nurse_{n}:day_{T0}",
+                            meta={
+                                "node_id": f"carryover_recovery_3n2off_tail2:nurse_{n}:day_{T0}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "prev_month 3N2OFF boundary tail2",
+                                "value": {"day": T0 + 2, "remaining_off_needed": 2},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "전월 N 꼬리로 월초 회복 OFF 2일이 필요합니다.",
+                                "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                            },
+                        )
+                        m.Add(_expr_3n_tail2).OnlyEnforceIf([X(n, T0, night), _co_lit])
+                    else:
+                        m.Add(_expr_3n_tail2).OnlyEnforceIf([X(n, T0, night)])
             if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 2, T0 + 3)):
-                    m.Add(
-                        countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
-                    ).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
+                    _expr_3n_tail1 = (countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2)
+                    if _assume_registry is not None:
+                        _co_lit = _assume_registry.create_literal(
+                            f"CarryoverRecovery3N2OFFTail1:nurse_{n}:day_{T0}",
+                            meta={
+                                "node_id": f"carryover_recovery_3n2off_tail1:nurse_{n}:day_{T0}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "prev_month 3N2OFF boundary tail1",
+                                "value": {"day": T0 + 3, "remaining_off_needed": 2},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "전월 N 꼬리 회복을 위해 월초 OFF 2일이 필요합니다.",
+                                "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                            },
+                        )
+                        m.Add(_expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night), _co_lit])
+                    else:
+                        m.Add(_expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
                 if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
                     # 회복 OFF 슬롯에 non-OFF fixed_wanted → 3N 블록 자체를 금지
-                    m.Add(
-                        X(n, d, night) + X(n, d - 1, night) + X(n, d - 2, night) <= 2
-                    )
+                    _guard_3n_expr = (X(n, d, night) + X(n, d - 1, night) + X(n, d - 2, night) <= 2)
+                    if _assume_registry is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"CarryoverRecovery3N2OFFGuard:nurse_{n}:day_{d}",
+                            constraint_expr=_guard_3n_expr,
+                            meta={
+                                "node_id": f"carryover_recovery_3n2off_guard:nurse_{n}:day_{d}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "carryover 3N block guard",
+                                "value": {"day": d + 1, "blocked_by_fixed": True},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "회복 OFF 슬롯 고정과 3N 블록이 충돌합니다.",
+                                "resolution_hint": "해당 고정 배정 또는 회복 규칙을 조정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_guard_3n_expr)
                     continue
                 _enforce_3n = [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
                 if _assume_3n2off is not None:
@@ -4265,14 +4352,48 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
                     if _2n_rem >= 2:
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_2n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) == 2)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery2N2OFF:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_2n2off:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 2N2OFF boundary",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 2},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 2N 꼬리로 월초 2OFF 회복이 필요합니다.",
+                                    "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block])
                     else:
                         # _2n_rem == 1: 1개만 추가 필요
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) >= 1
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_2n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) >= 1)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery2N2OFFPartial:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_2n2off_partial:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 2N2OFF boundary partial",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 1},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 2N 꼬리 회복 OFF가 월초에 추가로 필요합니다.",
+                                    "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block])
                 print(f"[CP-SAT-Basic] [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after}, rem={_2n_rem}")
             elif n_tail >= 2 and _2n_rem == 0:
@@ -4285,9 +4406,26 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     _enforce_2n_b0 = [X(n, T0, night), end_block_b0]
                     if _assume_2n2off is not None:
                         _enforce_2n_b0.append(_assume_2n2off)
-                    m.Add(
-                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                    ).OnlyEnforceIf(_enforce_2n_b0)
+                    _expr_2n_b0 = (countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2)
+                    if _assume_registry is not None:
+                        _co_lit = _assume_registry.create_literal(
+                            f"CarryoverRecovery2N2OFFBoundary:nurse_{n}:day_{T0}",
+                            meta={
+                                "node_id": f"carryover_recovery_2n2off_boundary:nurse_{n}:day_{T0}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "prev_month 2N2OFF boundary enforce",
+                                "value": {"day": T0 + 2, "remaining_off_needed": 2},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "전월 2N 꼬리 회복 OFF가 월초에 강제됩니다.",
+                                "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                            },
+                        )
+                        m.Add(_expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0 + [_co_lit])
+                    else:
+                        m.Add(_expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0)
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)

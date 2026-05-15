@@ -37,7 +37,8 @@ scope_key는 같은 group의 assumption들을 dashboard에서 묶기 위한 키.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+import os
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,47 @@ TYPE_TO_LAYER: Dict[str, str] = {
 LAYER_PRIORITY: List[str] = ["policy", "data", "personal", "structural", "unknown"]
 
 
+def _member_budget() -> int:
+    """Conflict core member visible budget.
+
+    노드 폭증을 막기 위해 core 당 members 노출 개수를 제한한다.
+    원본 개수/축약 개수는 메타 필드로 보존해 agent drilldown이 가능하도록 한다.
+    """
+    try:
+        v = int(os.getenv("CONFLICT_CORE_MEMBER_BUDGET", "24"))
+        return max(6, min(v, 200))
+    except Exception:
+        return 24
+
+
+def _apply_member_budget(core: Dict[str, Any], budget: int) -> Dict[str, Any]:
+    members = list(core.get("members") or [])
+    total = len(members)
+    if total <= budget:
+        core["members_total"] = total
+        core["members_visible"] = total
+        core["members_collapsed_count"] = 0
+        core["members_truncated"] = False
+        return core
+
+    visible = members[:budget]
+    overflow = members[budget: budget + 5]
+    core["members"] = visible
+    core["members_total"] = total
+    core["members_visible"] = len(visible)
+    core["members_collapsed_count"] = total - len(visible)
+    core["members_truncated"] = True
+    core["members_overflow_sample"] = overflow
+    deriv = list(core.get("derivation") or [])
+    deriv.append({
+        "step": 100,
+        "from": "member_budget",
+        "infer": f"members truncated: visible={len(visible)}, collapsed={total - len(visible)}",
+    })
+    core["derivation"] = deriv
+    return core
+
+
 def classify_member_type(node_type: Optional[str]) -> str:
     """Member 의 ``type`` 으로 causal layer 결정. 미등록 타입은 ``"unknown"``."""
     if not node_type:
@@ -125,7 +167,7 @@ def per_layer_counts(members: List[Dict[str, Any]]) -> Dict[str, int]:
 class HardAssumption:
     __slots__ = ("lit", "name", "meta")
 
-    def __init__(self, lit, name: str, meta: dict):
+    def __init__(self, lit: Any, name: str, meta: Dict[str, Any]):
         self.lit = lit
         self.name = name
         self.meta = meta
@@ -144,7 +186,7 @@ class HardAssumptionRegistry:
         self._by_index: Dict[int, HardAssumption] = {}
         self._attached = False
 
-    def create_literal(self, name: str, meta: Optional[dict] = None) -> Any:
+    def create_literal(self, name: str, meta: Optional[Dict[str, Any]] = None) -> Any:
         """assumption literal 가져오기 — 같은 name이면 기존 literal 반환.
 
         meta 는 첫 등록 시 저장. 이후 추가 호출의 meta는 무시 (보강하려면
@@ -228,7 +270,14 @@ class HardAssumptionRegistry:
                     ),
                     "source": f"cpsat_mus_{solver_phase}",
                     "solver_phase": solver_phase,
+                    "pattern_candidates": [],
                 }
+
+            core_patterns = grouped[core_id].get("pattern_candidates") or []
+            full_pattern = f"cpsat_mus:{pattern}"
+            if full_pattern not in core_patterns:
+                core_patterns.append(full_pattern)
+                grouped[core_id]["pattern_candidates"] = core_patterns
 
             grouped[core_id]["members"].append({
                 "node_id": str(a.meta.get("node_id") or a.name),
@@ -307,6 +356,18 @@ class HardAssumptionRegistry:
 
         for core in grouped.values():
             members = core["members"]
+            pattern_candidates = list(core.get("pattern_candidates") or [])
+            if len(pattern_candidates) > 1:
+                core["pattern"] = "cpsat_mus:mixed"
+                deriv = list(core.get("derivation") or [])
+                deriv.append(
+                    {
+                        "step": 2,
+                        "from": "pattern_normalization",
+                        "infer": "mixed member patterns detected; normalized as cpsat_mus:mixed",
+                    }
+                )
+                core["derivation"] = deriv
             if members:
                 names = ", ".join(m.get("label") or m.get("assumption_name") for m in members)
                 core["conclusion"] = f"CP-SAT MUS: {{ {names} }} {_quantifier(len(members))} 동시 만족 불가"
@@ -324,6 +385,8 @@ class HardAssumptionRegistry:
             per_signature.setdefault(sig, []).append(core)
 
         deduped: List[Dict[str, Any]] = []
+        budget = _member_budget()
+
         for sig, group in per_signature.items():
             if len(group) <= 1:
                 # singleton: affected_count=1 + affected_nurse_ids=[nurse_id] 보강
@@ -336,6 +399,7 @@ class HardAssumptionRegistry:
                     if "causal_layer" not in c:
                         c["causal_layer"] = derive_core_layer(c.get("members") or [])
                         c["per_layer_counts"] = per_layer_counts(c.get("members") or [])
+                    c = _apply_member_budget(c, budget)
                 deduped.extend(group)
                 continue
             # 같은 패턴 그룹 합치기.
@@ -396,9 +460,9 @@ class HardAssumptionRegistry:
                 # scope_key 단위로 dedupe (같은 (grade, shift) 의 여러 day 가
                 # 한 literal 로 묶여 있어 보통 1 member). resolution_hints 도 합산.
                 merged_members: List[Dict[str, Any]] = []
-                seen_member_keys: set = set()
+                seen_member_keys: Set[Tuple[Any, Any, Any]] = set()
                 merged_hints: List[Dict[str, Any]] = []
-                seen_hint_msgs: set = set()
+                seen_hint_msgs: Set[str] = set()
                 affected_scope_keys: List[str] = []
                 for c in group:
                     sk = str(c.get("core_id") or "").replace("conflict:cpsat:", "")
@@ -452,16 +516,21 @@ class HardAssumptionRegistry:
                     "per_member_cores": [c["core_id"] for c in group],
                 }
             # collapsed core 의 causal_layer 는 멤버 타입(또는 그룹 첫 core)에서 derive
-            collapsed_members = collapsed.get("members") or []
+            _collapsed_members_raw = collapsed.get("members")
+            if isinstance(_collapsed_members_raw, list):
+                collapsed_members = [m for m in _collapsed_members_raw if isinstance(m, dict)]
+            else:
+                collapsed_members: List[Dict[str, Any]] = []
             collapsed["causal_layer"] = derive_core_layer(collapsed_members)
             collapsed["per_layer_counts"] = per_layer_counts(collapsed_members)
+            collapsed = _apply_member_budget(collapsed, budget)
             deduped.append(collapsed)
 
         return deduped
 
 
 def add_hard(model, registry: HardAssumptionRegistry, *, name: str,
-             constraint_expr, meta: Optional[dict] = None) -> Any:
+             constraint_expr, meta: Optional[Dict[str, Any]] = None) -> Any:
     """정책 hard 제약을 assumption literal로 감싸 모델에 추가.
 
     Args:

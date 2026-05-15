@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,55 @@ from services.roster_create_service import (
 from services.job_status_service import create_job_record
 
 router = APIRouter(tags=["roster_create"])
+
+
+def _fallback_unrecoverable_from_exception(error_message: str) -> dict:
+    """비구조화 예외를 표준 infeasibility payload로 변환한다."""
+    from services.precheck import build_unrecoverable_payload
+
+    msg = str(error_message or "")
+    reasons: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(code: str):
+        if code in seen:
+            return
+        seen.add(code)
+        reasons.append(
+            {
+                "reason_code": code,
+                "node_id": f"infeasibility:{code.lower()}",
+                "details": {"source": "router_exception_fallback"},
+                "human_message_ko": msg[:300],
+            }
+        )
+
+    for m in re.finditer(r"\[reason_code=([A-Z_]+)\]", msg.upper()):
+        _add(m.group(1))
+
+    up = msg.upper()
+    if "NO_ASSIGNMENT" in up:
+        _add("NO_ASSIGNMENT")
+    if any(k in up for k in ["CAPACITY", "DAY_ZERO_COVERAGE", "SHORTAGE"]):
+        _add("NO_ASSIGNMENT_CAPACITY")
+    if any(k in up for k in ["ALLOWED", "SHIFT_NOT_ALLOWED", "N_ONLY"]):
+        _add("NO_ASSIGNMENT_ELIGIBILITY")
+    if any(k in up for k in ["FIXED", "FORBIDDEN"]):
+        _add("NO_ASSIGNMENT_FIXED")
+    if any(k in up for k in ["PREV_", "CARRYOVER", "2N2OFF", "3N2OFF", "BOUNDARY"]):
+        _add("NO_ASSIGNMENT_CARRYOVER")
+
+    if not reasons:
+        _add("INTERNAL_GENERATION_ERROR")
+
+    return build_unrecoverable_payload(
+        precheck_result={"issues": []},
+        applied_relaxations=[],
+        last_error_reason=msg,
+        violated_constraints=reasons,
+        conflict_cores=[],
+        pool_snapshot={},
+    )
 
 
 class HoldGenerateRequest(BaseModel):
@@ -205,7 +255,8 @@ async def generate_roster_endpoint(
         raise
     except Exception as e:
         print('error', e)
-        raise HTTPException(status_code=500, detail=f"근무표 생성 실패: {str(e)}")
+        payload = _fallback_unrecoverable_from_exception(f"근무표 생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=payload)
 
 
     # [Schedules] - 수간호사가 근무표 생성 요청

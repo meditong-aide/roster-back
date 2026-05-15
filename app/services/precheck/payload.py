@@ -13,6 +13,8 @@ from services.precheck.messaging import (
     humanize_all,
     summarize_violation_family,
 )
+from services.precheck.fix_plan import build_fix_plan
+from services.precheck.structural_diagnosis import build_structural_diagnosis
 
 
 # 설정성 오류로 분류되는 reason_code (즉시 차단 권장)
@@ -38,6 +40,26 @@ _BLOCKING_CODES = {
     "FIXED_ASSIGN_BREAKS_TEAM_MIN",
     "MONTHLY_NIGHT_CAPACITY",
 }
+
+
+def _extract_validator_evidence_summary(violated_constraints: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for v in violated_constraints or []:
+        if not isinstance(v, dict):
+            continue
+        details = v.get("details") or {}
+        if not isinstance(details, dict):
+            continue
+        ev = details.get("validator_evidence")
+        if isinstance(ev, dict) and ev:
+            return {
+                "total_failed_cells": int(ev.get("total_failed_cells") or 0),
+                "eligible_zero_cells": int(ev.get("eligible_zero_cells") or 0),
+                "required_minus_assigned_total": int(ev.get("required_minus_assigned_total") or 0),
+                "fixed_forbidden_count": int(ev.get("fixed_forbidden_count") or 0),
+                "carryover_artifact_count": int(ev.get("carryover_artifact_count") or 0),
+                "top_failed_cells": list(ev.get("top_failed_cells") or [])[:20],
+            }
+    return {}
 
 
 def has_blocking_issues(precheck_result: Dict[str, Any]) -> bool:
@@ -67,6 +89,13 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
             if s not in seen:
                 fix_suggestions.append(s)
                 seen.add(s)
+    structural = build_structural_diagnosis(
+        preflight_issues=issues,
+        violated_constraints=[],
+        conflict_cores=[],
+        pool_snapshot={},
+        applied_relaxations=[],
+    )
     return {
         "infeasibility": {
             "severity": "blocking",
@@ -75,6 +104,14 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
             "applied_relaxations": [],
             "fix_suggestions_ko": fix_suggestions,
             "violation_summary": {},
+            "structural_diagnosis": structural,
+            "fix_plan": build_fix_plan(
+                structural_diagnosis=structural,
+                preflight_issues=issues,
+                violated_constraints=[],
+                conflict_cores=[],
+                pool_snapshot={},
+            ),
             "last_error_reason": None,
         }
     }
@@ -116,6 +153,17 @@ def build_success_payload(
                 fix_suggestions.append(s)
                 seen.add(s)
 
+    structural = {
+        "mode": "relaxation_candidate",
+        "primary_causes": [],
+        "signals": {
+            "reason_codes": [],
+            "shortage_count": 0,
+            "conflict_pattern_count": 0,
+            "applied_relaxation_count": len(relaxations),
+        },
+    }
+
     return {
         "infeasibility": {
             "severity": severity,
@@ -124,6 +172,14 @@ def build_success_payload(
             "applied_relaxations": relaxations,
             "fix_suggestions_ko": fix_suggestions,
             "violation_summary": violation_summary,
+            "structural_diagnosis": structural,
+            "fix_plan": build_fix_plan(
+                structural_diagnosis=structural,
+                preflight_issues=issues,
+                violated_constraints=list(violated_constraints or []),
+                conflict_cores=[],
+                pool_snapshot={},
+            ),
             "last_error_reason": None,
         }
     }
@@ -154,6 +210,13 @@ def build_unrecoverable_payload(
         "고정 셀(원티드/휴가) 분포가 특정 시프트에 몰려있는지 확인하세요.",
         "월간 N 시프트 상한 또는 야간 가능 인원을 점검하세요.",
     ]
+    structural = build_structural_diagnosis(
+        preflight_issues=issues,
+        violated_constraints=list(violated_constraints or []),
+        conflict_cores=list(conflict_cores or []),
+        pool_snapshot=pool_snapshot or {},
+        applied_relaxations=list(applied_relaxations or []),
+    )
     return {
         "infeasibility": {
             "severity": "blocking",
@@ -168,6 +231,15 @@ def build_unrecoverable_payload(
             "violated_constraints": list(violated_constraints or []),
             "conflict_cores": list(conflict_cores or []),
             "pool_snapshot": pool_snapshot or {},
+            "validator_evidence_summary": _extract_validator_evidence_summary(list(violated_constraints or [])),
+            "structural_diagnosis": structural,
+            "fix_plan": build_fix_plan(
+                structural_diagnosis=structural,
+                preflight_issues=issues,
+                violated_constraints=list(violated_constraints or []),
+                conflict_cores=list(conflict_cores or []),
+                pool_snapshot=pool_snapshot or {},
+            ),
             "last_error_reason": last_error_reason,
         }
     }
