@@ -694,6 +694,84 @@ causes:
     aliases: [DISPATCH_FIXED_GROUP_MISMATCH, INBOUND_FIXED_CROSS_GROUP]
     problem_template_ko: "파견 입주 간호사 {nurse_id} 의 fixed 배정이 source group({source_group_id}) 과 target group({target_group_id}) 간 충돌. {day}일 {shift}."
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Carryover (월경계) — 전월 schedule tail 이 본 월 시작 day 차단
+  # ─────────────────────────────────────────────────────────────────────
+  cause:carryover:prev_month_n_tail_blocks_start:
+    label: "전월 N tail 로 본 월 시작 day 전이 차단"
+    category: carryover
+    causal_layer: structural
+    tier: T1
+    is_hard: true
+    aliases: [PREV_MONTH_N_TAIL_BLOCKS, CARRYOVER_PREV_MONTH_TRANSITION]
+    problem_template_ko: "간호사 {nurse_id} 가 전월 마지막 일에 N 배정 → 본 월 day {day} 에서 N→{shift} 전이 금지 적용, 그 day 배정 불가."
+
+  cause:carryover:fixed_n_isolated_by_off_neighbors:
+    label: "fixed N 인접 OFF 로 NotOneNight 위반 강제"
+    category: carryover
+    causal_layer: structural
+    tier: T1
+    is_hard: true
+    aliases: [CARRYOVER_FIXED_N_ISOLATION, FIXED_N_NEIGHBOR_OFF]
+    problem_template_ko: "간호사 {nurse_id} 의 {day}일 fixed N 양옆 ({prev_day}, {next_day}) 이 OFF 강제 → 1N 회피(NotOneNight) 충족 불가."
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Transition Ban — 시프트 전이 금지 (N→D, E→D, N→E 등)
+  # ─────────────────────────────────────────────────────────────────────
+  cause:transition:nod_pattern_forces_infeasibility:
+    label: "N→OFF→D 패턴 hard 와 인접 fixed 충돌"
+    category: transition
+    causal_layer: structural
+    tier: T2
+    is_hard: true
+    aliases: [TRANSITION_BAN_NOD_CHAIN, NOD_PATTERN_BLOCKS]
+    problem_template_ko: "간호사 {nurse_id} 의 {day}일 N 후속 day 의 D 배정 필요 (fixed 또는 demand) → N→OFF→D 또는 N→D 전이 금지 위반."
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Recovery OFF — 2N→2OFF, 3N→2OFF 회복 강제로 day d+2~d+3 demand 부족
+  # ─────────────────────────────────────────────────────────────────────
+  cause:recovery:two_n_two_off_blocks_demand:
+    label: "2N→2OFF 회복으로 후속 일 demand 미충족"
+    category: recovery
+    causal_layer: structural
+    tier: T1
+    is_hard: true
+    aliases: [RECOVERY_2N2OFF_BLOCKS, TWO_N_RECOVERY_DEMAND_GAP]
+    problem_template_ko: "{day_a}~{day_b}일 2N 배정 간호사 {nurses}명 → 후속 {day_c}~{day_d}일 OFF 강제, 그 기간 {affected_shift} 수요 {shortage}명 부족."
+
+  cause:recovery:three_n_two_off_blocks_demand:
+    label: "3N→2OFF 회복으로 후속 일 demand 미충족"
+    category: recovery
+    causal_layer: structural
+    tier: T1
+    is_hard: true
+    aliases: [RECOVERY_3N2OFF_BLOCKS, THREE_N_RECOVERY_DEMAND_GAP]
+    problem_template_ko: "{day_a}~{day_c}일 3N 배정 간호사 {nurses}명 → 후속 {day_d}~{day_e}일 OFF 강제, 그 기간 {affected_shift} 수요 {shortage}명 부족."
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Preceptee — 페어 동기화로 두 사람 자유도 손실
+  # ─────────────────────────────────────────────────────────────────────
+  cause:preceptee:sync_window_mismatch:
+    label: "프리셉터-프리셉티 동기화 vs 가능 시프트/팀 불일치"
+    category: preceptee
+    causal_layer: personal
+    tier: T2
+    is_hard: true
+    aliases: [PRECEPTEE_SYNC_MISMATCH, PAIR_SYNC_INCOMPATIBLE]
+    problem_template_ko: "프리셉터 {preceptor_id} 와 프리셉티 {preceptee_id} 동기화 기간 {start_day}~{end_day} 동안 두 사람의 가능 시프트/팀 intersection 이 비어 동시 배정 불가."
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Consecutive Work/Night — 연속 근무/야간 한도 강제로 windowed coverage 불능
+  # ─────────────────────────────────────────────────────────────────────
+  cause:consecutive:work_limit_blocks_coverage:
+    label: "max_consecutive_work 강제로 windowed coverage 부족"
+    category: consecutive
+    causal_layer: structural
+    tier: T2
+    is_hard: true
+    aliases: [CONSECUTIVE_WORK_LIMIT_BLOCKS, MAX_CONSEC_WORK_INFEASIBLE]
+    problem_template_ko: "{day_a}~{day_b}일 ({window_days}일 구간) 에 max_consecutive_work({limit}) 강제로 모든 가용 간호사가 최소 1 OFF 필요 → 그 구간 {affected_shift} 수요 {shortage}명 부족."
+
 
 treatments:
   treatment:soft:grade_max:
@@ -754,7 +832,10 @@ treatments:
     direction: disable
     rationale_ko: "야간→주간 등 전이 금지 룰을 일시 해제. 인력 재구성 자유도 증가."
     trade_off_ko: "야간 직후 주간 출근 등 전이 발생 가능. 안전상 주의 필요."
-    applies_to_causes: [cause:capacity:daily_night_shortage]
+    applies_to_causes:
+      - cause:capacity:daily_night_shortage
+      - cause:carryover:prev_month_n_tail_blocks_start
+      - cause:transition:nod_pattern_forces_infeasibility
 
   treatment:disable:night_recovery:
     label: "야간 회복 OFF 강제 비활성화"
@@ -764,7 +845,10 @@ treatments:
     direction: disable
     rationale_ko: "2N→2OFF / 3N→2OFF 회복 OFF 강제를 비활성. 야간 후 즉시 다른 시프트 가능."
     trade_off_ko: "회복 시간 부족으로 피로 누적 위험 — 운영상 보정 필요."
-    applies_to_causes: [cause:capacity:monthly_night_shortage]
+    applies_to_causes:
+      - cause:capacity:monthly_night_shortage
+      - cause:recovery:two_n_two_off_blocks_demand
+      - cause:recovery:three_n_two_off_blocks_demand
 
   treatment:threshold:coverage_min:
     label: "일 수요 하향 조정"
@@ -888,3 +972,40 @@ treatments:
       - cause:dispatch:inbound_shift_mask_incompatible
       - cause:dispatch:fixed_assign_wrong_group
       - cause:dispatch:inbound_window_too_narrow
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Carryover / Preceptee / Consecutive 도메인 treatment
+  # ─────────────────────────────────────────────────────────────────────
+  treatment:data:adjust_carryover_input:
+    label: "전월 schedule 의 carryover input 조정 (manual)"
+    action_type: data_correction_required
+    target_family: CarryoverBoundary
+    config_key: prev_month_schedule
+    direction: manual
+    rationale_ko: "본 월 시작 day 차단의 원인인 전월 N tail / fixed neighbor 패턴을 데이터 차원에서 조정. 전월 발행된 schedule 의 마지막 며칠 또는 본 월 첫 fixed_wanted 재설정. 또는 NotOneNight bypass 명시."
+    trade_off_ko: "전월 schedule 발행 후 수정은 운영상 부담. fixed 재설정은 사용자 동의 필요."
+    applies_to_causes:
+      - cause:carryover:prev_month_n_tail_blocks_start
+      - cause:carryover:fixed_n_isolated_by_off_neighbors
+
+  treatment:data:relax_preceptee_sync:
+    label: "프리셉터-프리셉티 동기화 기간 조정 (manual)"
+    action_type: data_correction_required
+    target_family: PrecepteeSync
+    config_key: preceptee_pair
+    direction: manual
+    rationale_ko: "동기화 기간 축소 또는 페어 재구성. 호환되는 가능 시프트/팀 intersection 이 비어있지 않도록 페어 변경 또는 양쪽 allowed_shifts 확장 검토."
+    trade_off_ko: "동기화 단축은 교육 효과 저하 우려. 페어 재구성은 인사 조정 필요."
+    applies_to_causes:
+      - cause:preceptee:sync_window_mismatch
+
+  treatment:threshold:consecutive_work:
+    label: "max_consecutive_work 상한 조정"
+    action_type: set_threshold
+    target_family: ConsecutiveWorkLimit
+    config_key: max_consecutive_work_days
+    direction: increase
+    rationale_ko: "연속 근무 한도를 1~2일 상향하여 windowed coverage 풀이 자유도 증가. 예: 5일 → 6일."
+    trade_off_ko: "연속 근무일이 늘어나면 개인 피로 누적. 다음 달 OFF 배치로 보정 권장."
+    applies_to_causes:
+      - cause:consecutive:work_limit_blocks_coverage
