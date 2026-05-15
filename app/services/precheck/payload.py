@@ -16,6 +16,7 @@ from services.precheck.messaging import (
 from services.precheck.fix_plan import build_fix_plan
 from services.precheck.structural_diagnosis import build_structural_diagnosis
 from services.precheck.cause_symptom_classifier import split_violations
+from services.precheck.cause_inferer import infer_causes_from_cores
 from services.precheck.evidence_builder import build_evidence_node
 from services.cause_treatment_hitter import propose_bundles
 from services.resolution_narrative import build_narrative, narrative_to_dict
@@ -222,8 +223,12 @@ def build_unrecoverable_payload(
         applied_relaxations=list(applied_relaxations or []),
     )
 
+    # US-D: conflict_cores 의 MUS pattern → cause_id 자동 추론, violated 와 합침
+    core_inferred_causes = infer_causes_from_cores(list(conflict_cores or []))
+    combined_violations = list(violated_constraints or []) + core_inferred_causes
+
     # US-1: cause-bucket / symptom-bucket / evidence 분리 노출 (cause 와 symptom 절대 교차 없음)
-    causes, observed_symptoms, _undiag_present = split_violations(list(violated_constraints or []))
+    causes, observed_symptoms, _undiag_present = split_violations(combined_violations)
     evidence = build_evidence_node(
         applied_relaxations=list(applied_relaxations or []),
         conflict_cores=list(conflict_cores or []),
