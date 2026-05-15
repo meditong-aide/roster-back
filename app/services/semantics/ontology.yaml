@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 # `relaxation_priority` (1~5): conflict probe 가 어느 family 를 먼저 풀어볼지 정렬할 때 사용.
 #   1 = 가장 먼저 풀음 (영향 가벼움)
@@ -7,6 +7,16 @@ version: 2
 #   low    = nurse 수 또는 그 이하
 #   medium = nurse × day 미만
 #   high   = nurse × day × shift 등
+# `tier` (T0/T1/T2/T3): hard 제약 4-tier 계층화.
+#   T0 = 절대/물리 hard - 수학적 불가능, family가 아닌 진단 결과로 도달 (ConfigIntegrity 만 family-level)
+#   T1 = 안전 hard - 풀지 않음 (환자/간호사 안전·법규·사용자 명시적 결정)
+#   T2 = 운영 hard - 정책성, 풀 수 있으나 결과 추적 필요
+#   T3 = 품질 soft - 분배 균형·선호 (현재 v3 에서는 family 정의 없음)
+# tier ↔ relaxation_priority 정렬:
+#   T0: ConfigIntegrity + structural_diagnosis 의 HARD_IMPOSSIBLE_CODES 매칭 시
+#   T1: priority 5 family
+#   T2: priority 1~4 family
+#   T3: (예정)
 
 constraints:
   CoverageMin:
@@ -19,6 +29,7 @@ constraints:
     aliases: [GLOBAL_DAY_CAPACITY_SHORTAGE, GLOBAL_SHIFT_ALLOWED_SHORTAGE, CAPACITY_TOTAL_SHORTAGE, DAY_ZERO_COVERAGE, NO_ASSIGNMENT]
     default_severity: hard
     relaxation_priority: 4
+    tier: T2
     scope_explosion: medium
 
   TeamMin:
@@ -31,6 +42,7 @@ constraints:
     aliases: [TEAM_MIN_EXCEEDS_GLOBAL_NEED, TEAM_SIZE_INSUFFICIENT, TEAM_ACTIVE_MEMBERS_INSUFFICIENT, TEAM_SHIFT_ALLOWED_SHORTAGE, FIXED_ASSIGN_BREAKS_TEAM_MIN]
     default_severity: hard
     relaxation_priority: 2
+    tier: T2
     scope_explosion: high
 
   GradeMin:
@@ -43,6 +55,7 @@ constraints:
     aliases: [GRADE_MIN_SUM_EXCEEDS_NEED, GRADE_MIN_AVAILABLE_SHORTAGE]
     default_severity: hard
     relaxation_priority: 3
+    tier: T2
     scope_explosion: high
 
   GradeMax:
@@ -55,6 +68,7 @@ constraints:
     aliases: [GRADE_MAX_SUM_BELOW_NEED, GRADE_ANTIPAIR_FORCES_SHORTAGE]
     default_severity: hard
     relaxation_priority: 2
+    tier: T2
     scope_explosion: high
 
   TeamGradeHandoff:
@@ -67,6 +81,7 @@ constraints:
     aliases: [TEAM_GRADE_INTERSECT_SHORTAGE]
     default_severity: hard
     relaxation_priority: 1
+    tier: T2
     scope_explosion: medium
 
   ConsecutiveWorkLimit:
@@ -78,6 +93,7 @@ constraints:
     explanation_template: "{nurse}는 최대 연속근무일 {max_days}일을 초과할 수 없습니다."
     default_severity: hard
     relaxation_priority: 4
+    tier: T2
     scope_explosion: medium
 
   ConsecutiveNightLimit:
@@ -89,6 +105,7 @@ constraints:
     explanation_template: "{nurse}는 최대 연속 나이트 수를 초과할 수 없습니다."
     default_severity: hard
     relaxation_priority: 4
+    tier: T2
     scope_explosion: medium
 
   NightRecovery:
@@ -101,6 +118,7 @@ constraints:
     explanation_template: "{nurse}는 N 블록 이후 회복 OFF가 필요합니다."
     default_severity: hard
     relaxation_priority: 5
+    tier: T1
     scope_explosion: medium
 
   MonthlyNightCap:
@@ -113,6 +131,7 @@ constraints:
     aliases: [MONTHLY_NIGHT_CAPACITY_SHORTAGE]
     default_severity: hard
     relaxation_priority: 4
+    tier: T2
     scope_explosion: low
 
   BanNightBeforeFixedOff:
@@ -124,6 +143,7 @@ constraints:
     explanation_template: "{nurse}의 휴가/공가 fixed 셀 직전일에는 N 시프트 금지 (휴가/공가 보호)."
     default_severity: hard
     relaxation_priority: 4
+    tier: T2
     scope_explosion: low
     notes: "Trigger 한정: (n, d) 의 fixed_type ∈ {휴가, 공가}. fixed_wanted O / 휴무 / 주휴 등은 trigger 안 함. Bypass: (n, d-1) 이 이미 fixed (fixed_wanted 포함) 이면 ban 룰 스킵 — 사용자가 명시적으로 N 직후 휴가/공가 fixed 조합을 둔 것은 의도로 간주. config flag: ban_night_before_fixed_off (default True)."
 
@@ -136,6 +156,7 @@ constraints:
     explanation_template: "{nurse}는 평일 OFF 금지 + 주말 OFF 보장 (주말휴무 정책)."
     default_severity: hard
     relaxation_priority: 4
+    tier: T2
     scope_explosion: medium
 
   OffCap:
@@ -148,6 +169,7 @@ constraints:
     aliases: [FIXED_OFF_EXCEEDS_SPAN]
     default_severity: hard
     relaxation_priority: 5
+    tier: T1
     scope_explosion: low
     notes: "Source priority: monthly_limit_constraints.o_exact (per-nurse exact) → roster_config.off_days (group fallback)."
 
@@ -160,6 +182,7 @@ constraints:
     explanation_template: "{nurse}의 [{window}] 구간 OFF 강제 — 전월 N tail / 전월 연속근무 tail / 월경계 inherited recovery."
     default_severity: hard
     relaxation_priority: 5
+    tier: T1
     scope_explosion: low
     notes: "Derived from upstream NightRecovery (two_offs_after_two_nig / two_offs_after_three_nig) + ConsecutiveWorkLimit (max_consecutive_work_days) + month boundary handling. To remove OffWindow indirectly, adjust those upstream families instead — there is no direct disable for OffWindow."
 
@@ -173,6 +196,7 @@ constraints:
     aliases: [N_CAPACITY_SHORTAGE]
     default_severity: hard
     relaxation_priority: 3
+    tier: T2
     scope_explosion: high
     notes: "두 메커니즘이 같은 functional family. (a) Within-month: cp_sat_basic line 3267 의 transition pair m.Add. (b) Cross-month / mid-month: roster_create_service 가 initial_constraints.forbidden 으로 single-cell forbid 변환 후 enforce. 후자는 cross-month source 로 metadata 태깅 권장."
 
@@ -185,6 +209,7 @@ constraints:
     explanation_template: "{nurse}는 허용되지 않은 shift 를 가질 수 없습니다."
     default_severity: hard
     relaxation_priority: 5
+    tier: T1
     scope_explosion: high
 
   NotOneNight:
@@ -196,6 +221,7 @@ constraints:
     explanation_template: "1N (단발성 N) 금지 — N 배정 시 인접일 중 하나는 N 이어야 합니다."
     default_severity: hard
     relaxation_priority: 3
+    tier: T2
     scope_explosion: medium
 
   PrecepteeSync:
@@ -207,6 +233,7 @@ constraints:
     explanation_template: "프리셉티는 지정 기간 동안 프리셉터와 동일 근무여야 합니다."
     default_severity: hard
     relaxation_priority: 4
+    tier: T2
     scope_explosion: medium
 
   AssignmentWindow:
@@ -218,6 +245,7 @@ constraints:
     explanation_template: "기간 파견/이동 구간에서 소유 group 및 허용 shift가 바뀝니다."
     default_severity: hard
     relaxation_priority: 5
+    tier: T1
     scope_explosion: low
 
   CarryoverBoundary:
@@ -229,6 +257,7 @@ constraints:
     explanation_template: "이전 스케줄 tail 상태를 경계일에 이어받습니다."
     default_severity: hard
     relaxation_priority: 5
+    tier: T1
     scope_explosion: low
 
   FixedWanted:
@@ -240,6 +269,7 @@ constraints:
     explanation_template: "확정 원티드는 일부 제약을 우회하거나 회복 슬롯을 막을 수 있습니다."
     default_severity: hard
     relaxation_priority: 5
+    tier: T1
     scope_explosion: medium
 
   ConfigIntegrity:
@@ -252,6 +282,7 @@ constraints:
     aliases: [MID_DISABLED_BUT_USED, MID_REQUIRED_MISSING, ALLOWED_SHIFTS_ISOLATES_NURSE, FIXED_ASSIGN_EXCEEDS_NEED, FIXED_ASSIGN_VIOLATES_ALLOWED]
     default_severity: hard
     relaxation_priority: 5
+    tier: T0
     scope_explosion: low
 
 overrides:

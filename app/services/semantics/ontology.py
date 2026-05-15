@@ -24,6 +24,7 @@ class OntologyConstraintEntry:
     notes: str | None = None
     relaxation_priority: int | None = None
     scope_explosion: str | None = None
+    tier: str | None = None
 
 
 @dataclass(slots=True)
@@ -88,6 +89,7 @@ class ConstraintOntology:
                 notes=body.get("notes"),
                 relaxation_priority=body.get("relaxation_priority"),
                 scope_explosion=body.get("scope_explosion"),
+                tier=body.get("tier"),
             )
             self.constraints[cid] = entry
             self._alias_to_id[cid.upper()] = cid
@@ -175,6 +177,18 @@ class ConstraintOntology:
     def get_scope_explosion(self, family: str) -> str | None:
         entry = self.get_constraint(family)
         return entry.scope_explosion if entry else None
+
+    def get_tier(self, family: str) -> str | None:
+        """Return 4-tier hard-constraint classification.
+
+        T0=절대/물리 hard, T1=안전 hard, T2=운영 hard, T3=품질 soft.
+        Unknown family returns None (caller decides fallback).
+        """
+        entry = self.get_constraint(family)
+        return entry.tier if entry else None
+
+    def families_by_tier(self, tier: str) -> list[str]:
+        return [cid for cid, e in self.constraints.items() if (e.tier or "") == tier]
 
     def scenarios_involving(self, family: str) -> list[OntologyConflictScenario]:
         target = self.resolve_alias(family)
