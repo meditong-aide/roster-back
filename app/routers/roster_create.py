@@ -54,7 +54,7 @@ def _fallback_unrecoverable_from_exception(error_message: str) -> dict:
     up = msg.upper()
     if "NO_ASSIGNMENT" in up:
         _add("NO_ASSIGNMENT")
-    if any(k in up for k in ["CAPACITY", "DAY_ZERO_COVERAGE", "SHORTAGE"]):
+    if any(k in up for k in ["CAPACITY", "SHORTAGE"]):
         _add("NO_ASSIGNMENT_CAPACITY")
     if any(k in up for k in ["ALLOWED", "SHIFT_NOT_ALLOWED", "N_ONLY"]):
         _add("NO_ASSIGNMENT_ELIGIBILITY")

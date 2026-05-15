@@ -21,14 +21,56 @@ def test_ontology_loader_resolves_aliases_and_modes():
 
 
 def test_attach_reason_code_ontology_from_message():
+    """Cause 코드 (CAPACITY_TOTAL_SHORTAGE) 는 ontology family 매핑이 붙는다."""
     payload = attach_reason_code_ontology(
-        message="[reason_code=DAY_ZERO_COVERAGE] Infeasible 진단: 1일 필수 근무 미배정",
+        message="[reason_code=CAPACITY_TOTAL_SHORTAGE] Infeasible 진단: 월 총 필요 슬롯이 공급 상한을 초과",
+        severity="hard",
+        evidence={"required": 750, "capacity": 700},
+    )
+    assert payload["reason_code"] == "CAPACITY_TOTAL_SHORTAGE"
+    assert payload["ontology"]["constraint_id"] == "CoverageMin"
+    assert payload["ontology"]["group"] == "CoverageConstraint"
+
+
+def test_day_zero_coverage_no_longer_maps_to_family():
+    """DAY_ZERO_COVERAGE 는 symptom 으로 폐기되어 어떤 family 에도 매핑되지 않는다."""
+    payload = attach_reason_code_ontology(
+        message="[reason_code=DAY_ZERO_COVERAGE] (legacy message — should be unmapped)",
+        severity="hard",
+    )
+    assert payload["reason_code"] == "DAY_ZERO_COVERAGE"
+    assert "ontology" not in payload
+
+
+def test_undiagnosed_sentinel_has_no_family():
+    """UNDIAGNOSED sentinel 은 cause 가 식별되지 않은 케이스. ontology 매핑 없음."""
+    payload = attach_reason_code_ontology(
+        message="[reason_code=UNDIAGNOSED] day-zero trigger fired but no root cause identified",
         severity="hard",
         evidence={"day": 1},
     )
-    assert payload["reason_code"] == "DAY_ZERO_COVERAGE"
-    assert payload["ontology"]["constraint_id"] == "CoverageMin"
-    assert payload["ontology"]["group"] == "CoverageConstraint"
+    assert payload["reason_code"] == "UNDIAGNOSED"
+    assert "ontology" not in payload
+
+
+def test_monthly_night_shortage_remaps_to_monthly_night_cap():
+    """잘못된 NightRecovery 매핑 제거 후 fallback alias 가 MonthlyNightCap 으로 해소."""
+    payload = attach_reason_code_ontology(
+        message="[reason_code=MONTHLY_NIGHT_CAPACITY_SHORTAGE]",
+        severity="hard",
+    )
+    assert payload["ontology"]["constraint_id"] == "MonthlyNightCap"
+
+
+def test_n_capacity_shortage_no_longer_mismaps_to_boundary_ban():
+    """N_CAPACITY_SHORTAGE 는 BoundaryTransitionBan 과 무관 — 잘못된 매핑 제거 후 미매핑."""
+    payload = attach_reason_code_ontology(
+        message="[reason_code=N_CAPACITY_SHORTAGE]",
+        severity="hard",
+    )
+    assert payload["reason_code"] == "N_CAPACITY_SHORTAGE"
+    # Phase 2 에서 cause:capacity:daily_night_shortage 로 매핑 예정. Phase 1 에선 매핑 없음.
+    assert "ontology" not in payload
 
 
 def test_attach_constraint_ontology_unknown_family_passthrough():

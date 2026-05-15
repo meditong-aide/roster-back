@@ -15,6 +15,10 @@ from services.precheck.messaging import (
 )
 from services.precheck.fix_plan import build_fix_plan
 from services.precheck.structural_diagnosis import build_structural_diagnosis
+from services.precheck.cause_symptom_classifier import split_violations
+from services.precheck.evidence_builder import build_evidence_node
+from services.cause_treatment_hitter import propose_bundles
+from services.resolution_narrative import build_narrative, narrative_to_dict
 
 
 # 설정성 오류로 분류되는 reason_code (즉시 차단 권장)
@@ -217,6 +221,58 @@ def build_unrecoverable_payload(
         pool_snapshot=pool_snapshot or {},
         applied_relaxations=list(applied_relaxations or []),
     )
+
+    # US-1: cause-bucket / symptom-bucket / evidence 분리 노출 (cause 와 symptom 절대 교차 없음)
+    causes, observed_symptoms, _undiag_present = split_violations(list(violated_constraints or []))
+    evidence = build_evidence_node(
+        applied_relaxations=list(applied_relaxations or []),
+        conflict_cores=list(conflict_cores or []),
+        status="INFEASIBLE",
+        proof_type="cp_sat_unsat_core_heuristic",
+        witness_schedule_id=None,
+    )
+
+    # US-9: cause 가 식별되면 hitter + narrative 통합 호출 (실패하면 silent — payload 는 항상 유지)
+    treatment_recommendations: List[Dict[str, Any]] = []
+    resolution_narrative: Optional[Dict[str, Any]] = None
+    try:
+        cause_ids = [c.get("reason_code") for c in causes if c.get("reason_code")]
+        if cause_ids:
+            bundles = propose_bundles(active_causes=cause_ids, max_alternatives=3)
+            for b in bundles:
+                treatment_recommendations.append({
+                    "bundle_id": b.bundle_id,
+                    "total_cost": b.total_cost,
+                    "overhead": b.overhead,
+                    "covered_causes": b.covered_causes,
+                    "uncovered_causes": b.uncovered_causes,
+                    "treatments": [
+                        {
+                            "treatment_id": t.treatment_id,
+                            "target_family": t.target_family,
+                            "action_type": t.action_type,
+                            "config_key": t.config_key,
+                            "direction": t.direction,
+                            "rationale_ko": t.rationale_ko,
+                            "trade_off_ko": t.trade_off_ko,
+                            "cost": t.cost,
+                            "covers": t.covers,
+                        }
+                        for t in b.treatments
+                    ],
+                })
+            primary_bundle = bundles[0] if bundles else None
+            narr = build_narrative(
+                cause_payloads=causes,
+                bundle=primary_bundle,
+                evidence=evidence,
+            )
+            resolution_narrative = narrative_to_dict(narr)
+    except Exception:
+        # narrative build 가 실패해도 payload 구조 보존 (cause/symptom/evidence 는 항상 노출)
+        treatment_recommendations = []
+        resolution_narrative = None
+
     return {
         "infeasibility": {
             "severity": "blocking",
@@ -228,6 +284,14 @@ def build_unrecoverable_payload(
             "applied_relaxations": list(applied_relaxations or []),
             "fix_suggestions_ko": fix_suggestions,
             "violation_summary": {},
+            # US-1 신규 3 필드 (cause/symptom/evidence 분리)
+            "causes": causes,
+            "observed_symptoms": observed_symptoms,
+            "evidence": evidence,
+            # US-9 신규 2 필드 (treatment 추천 + 자연어 narrative)
+            "treatment_recommendations": treatment_recommendations,
+            "resolution_narrative": resolution_narrative,
+            # legacy — 호환 위해 1 릴리즈 유지 (deprecated)
             "violated_constraints": list(violated_constraints or []),
             "conflict_cores": list(conflict_cores or []),
             "pool_snapshot": pool_snapshot or {},

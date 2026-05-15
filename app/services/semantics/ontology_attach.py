@@ -49,7 +49,6 @@ REASON_CODE_TO_CONSTRAINT = {
     "GLOBAL_DAY_CAPACITY_SHORTAGE": "CoverageMin",
     "GLOBAL_SHIFT_ALLOWED_SHORTAGE": "CoverageMin",
     "CAPACITY_TOTAL_SHORTAGE": "CoverageMin",
-    "DAY_ZERO_COVERAGE": "CoverageMin",
     "NO_ASSIGNMENT": "CoverageMin",
     "TEAM_MIN_EXCEEDS_GLOBAL_NEED": "TeamMin",
     "TEAM_SIZE_INSUFFICIENT": "TeamMin",
@@ -67,8 +66,6 @@ REASON_CODE_TO_CONSTRAINT = {
     "FIXED_ASSIGN_EXCEEDS_NEED": "ConfigIntegrity",
     "FIXED_ASSIGN_VIOLATES_ALLOWED": "ConfigIntegrity",
     "FIXED_OFF_EXCEEDS_SPAN": "OffCap",
-    "MONTHLY_NIGHT_CAPACITY_SHORTAGE": "NightRecovery",
-    "N_CAPACITY_SHORTAGE": "BoundaryTransitionBan",
 }
 
 

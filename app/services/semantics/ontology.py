@@ -25,6 +25,7 @@ class OntologyConstraintEntry:
     relaxation_priority: int | None = None
     scope_explosion: str | None = None
     tier: str | None = None
+    causal_layer: str | None = None
 
 
 @dataclass(slots=True)
@@ -56,6 +57,36 @@ class OntologyModeEntry:
     severity: str
 
 
+@dataclass(slots=True)
+class OntologyCause:
+    """US-6 (v4) — Cause 노드. reason_code 로 노출되는 유일한 카테고리."""
+    cause_id: str
+    label: str
+    category: str
+    causal_layer: str
+    tier: str
+    is_hard: bool
+    aliases: list[str] = field(default_factory=list)
+    problem_template_ko: str = ""
+
+
+@dataclass(slots=True)
+class OntologyTreatment:
+    """US-6 (v4) — Treatment 노드. atomic relaxation action.
+
+    applies_to_causes 가 hitting set 의 cause→treatment edge. US-4 hitter 가 이걸 lookup.
+    """
+    treatment_id: str
+    label: str
+    action_type: str        # force_soft_mode / disable_module / set_threshold / narrow_scope / data_correction_required
+    target_family: str
+    config_key: str | None
+    direction: str          # enable / disable / increase / decrease / clear / remove_key / manual
+    rationale_ko: str
+    trade_off_ko: str
+    applies_to_causes: list[str] = field(default_factory=list)
+
+
 class ConstraintOntology:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path else Path(__file__).with_name("ontology.yaml")
@@ -66,6 +97,13 @@ class ConstraintOntology:
         self.relations: dict[str, dict[str, Any]] = {}
         self.conflict_scenarios: list[OntologyConflictScenario] = []
         self._alias_to_id: dict[str, str] = {}
+        # US-2: cost model meta — 모든 cost 가중치의 단일 진실 (ontology.yaml meta.cost_model)
+        self.cost_model_meta: dict[str, Any] = {}
+        self.parent_to_default_causal_layer: dict[str, str] = {}
+        # US-6 (v4): cause / treatment 카탈로그
+        self.causes: dict[str, OntologyCause] = {}
+        self.treatments: dict[str, OntologyTreatment] = {}
+        self._cause_alias_to_id: dict[str, str] = {}
         self._load()
 
     def _load(self) -> None:
@@ -73,11 +111,20 @@ class ConstraintOntology:
             return
         raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
         self.version = int(raw.get("version") or 0)
+        meta = raw.get("meta") or {}
+        self.cost_model_meta = dict(meta.get("cost_model") or {})
+        self.parent_to_default_causal_layer = dict(meta.get("parent_to_default_causal_layer") or {})
         for cid, body in (raw.get("constraints") or {}).items():
+            parent = str(body.get("parent") or "")
+            explicit_layer = body.get("causal_layer")
+            causal_layer = (
+                str(explicit_layer) if explicit_layer
+                else self.parent_to_default_causal_layer.get(parent)
+            )
             entry = OntologyConstraintEntry(
                 constraint_id=cid,
                 label=str(body.get("label") or cid),
-                parent=str(body.get("parent") or ""),
+                parent=parent,
                 scope=list(body.get("scope") or []),
                 effective_modes=list(body.get("effective_modes") or []),
                 connects=list(body.get("connects") or []),
@@ -90,6 +137,7 @@ class ConstraintOntology:
                 relaxation_priority=body.get("relaxation_priority"),
                 scope_explosion=body.get("scope_explosion"),
                 tier=body.get("tier"),
+                causal_layer=causal_layer,
             )
             self.constraints[cid] = entry
             self._alias_to_id[cid.upper()] = cid
@@ -127,6 +175,59 @@ class ConstraintOntology:
                 )
             except Exception:
                 continue
+        # US-6 (v4): causes / treatments
+        for cid, body in (raw.get("causes") or {}).items():
+            entry = OntologyCause(
+                cause_id=cid,
+                label=str(body.get("label") or cid),
+                category=str(body.get("category") or "uncategorized"),
+                causal_layer=str(body.get("causal_layer") or "structural"),
+                tier=str(body.get("tier") or "T2"),
+                is_hard=bool(body.get("is_hard", True)),
+                aliases=list(body.get("aliases") or []),
+                problem_template_ko=str(body.get("problem_template_ko") or ""),
+            )
+            self.causes[cid] = entry
+            self._cause_alias_to_id[cid.upper()] = cid
+            for alias in entry.aliases:
+                self._cause_alias_to_id[str(alias).upper()] = cid
+        for tid, body in (raw.get("treatments") or {}).items():
+            self.treatments[tid] = OntologyTreatment(
+                treatment_id=tid,
+                label=str(body.get("label") or tid),
+                action_type=str(body.get("action_type") or "manual"),
+                target_family=str(body.get("target_family") or ""),
+                config_key=body.get("config_key"),
+                direction=str(body.get("direction") or "manual"),
+                rationale_ko=str(body.get("rationale_ko") or "").strip(),
+                trade_off_ko=str(body.get("trade_off_ko") or "").strip(),
+                applies_to_causes=list(body.get("applies_to_causes") or []),
+            )
+
+    # ---- US-6 (v4) — cause/treatment API ----
+    def get_cause(self, cause_id_or_alias: str) -> OntologyCause | None:
+        cid = self.resolve_cause_alias(cause_id_or_alias)
+        return self.causes.get(cid) if cid else None
+
+    def resolve_cause_alias(self, raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        key = str(raw).strip()
+        if not key:
+            return None
+        # 정확 id 우선
+        if key in self.causes:
+            return key
+        return self._cause_alias_to_id.get(key.upper())
+
+    def get_treatment(self, treatment_id: str) -> OntologyTreatment | None:
+        return self.treatments.get(treatment_id)
+
+    def treatments_for_cause(self, cause_id_or_alias: str) -> list[OntologyTreatment]:
+        cid = self.resolve_cause_alias(cause_id_or_alias)
+        if not cid:
+            return []
+        return [t for t in self.treatments.values() if cid in t.applies_to_causes]
 
     def get_constraint(self, family: str) -> OntologyConstraintEntry | None:
         resolved = self.resolve_alias(family)

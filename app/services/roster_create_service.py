@@ -3383,7 +3383,7 @@ def _extract_unrecoverable_violated_constraints(
         try:
             pool = getattr(roster_system, "_constraint_pool_snapshot", None) or {}
             shortages = list((pool or {}).get("shortages") or [])
-            if shortages or any(k in text for k in ["CAPACITY_TOTAL_SHORTAGE", "N_CAPACITY_SHORTAGE", "DAY_ZERO_COVERAGE"]):
+            if shortages or any(k in text for k in ["CAPACITY_TOTAL_SHORTAGE", "N_CAPACITY_SHORTAGE"]):
                 direct.append("NO_ASSIGNMENT_CAPACITY")
             elif int((evidence or {}).get("required_minus_assigned_total") or 0) > 0 and eligible_zero_cells < max(1, total_failed_cells // 3):
                 direct.append("NO_ASSIGNMENT_CAPACITY")
@@ -3874,12 +3874,12 @@ def _validate_generated_roster(
             print(f"[InfeasibleProbe][aux] grade_max 보조진단 실패(무시): {_aux_exc}")
         return _with_ontology(diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다.")
 
-    # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
+    # day-zero coverage 감지 — symptom 라벨은 throw 하지 않고 cause probe 4축을 강제 실행.
+    # cause 가 식별되면 그것만 반환, 모든 probe 가 침묵하면 UNDIAGNOSED sentinel + evidence dump.
     try:
         cfg = getattr(roster_system, "config", None)
         num_days = getattr(roster_system, "num_days", 0) or 0
         shift_types = list(getattr(cfg, "shift_types", []) or [])
-        off_alias = {"-", "O", "OFF", "주"}
 
         def _required_by_day(day_idx: int) -> dict[str, int]:
             if isinstance(getattr(cfg, "daily_shift_requirements_by_day", None), list):
@@ -3915,10 +3915,22 @@ def _validate_generated_roster(
                     diag = _build_infeasible_diagnosis(roster_system, generated)
                     if diag:
                         return _with_ontology(diag)
+                    probe = _probe_first_grade_hard_blocker(roster_system)
+                    if probe:
+                        return _with_ontology(f"[reason_code=GRADE_HARD_PROBE] {probe}")
+                    ev = getattr(roster_system, "_validator_evidence", None) or {}
                     req_msg = ", ".join(f"{k}={v}" for k, v in req.items())
+                    ev_brief = {
+                        "day": d + 1,
+                        "required": req,
+                        "total_failed_cells": ev.get("total_failed_cells"),
+                        "eligible_zero_cells": ev.get("eligible_zero_cells"),
+                        "fixed_forbidden_count": ev.get("fixed_forbidden_count"),
+                        "carryover_artifact_count": ev.get("carryover_artifact_count"),
+                    }
                     return _with_ontology(
-                        f"[reason_code=DAY_ZERO_COVERAGE] Infeasible 진단: "
-                        f"{d + 1}일 필수 근무 미배정 (요구: {req_msg})"
+                        f"[reason_code=UNDIAGNOSED] day-zero trigger fired but no root cause identified "
+                        f"(day={d + 1}, req={req_msg}). evidence={ev_brief}"
                     )
 
     except Exception:
