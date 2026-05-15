@@ -113,6 +113,7 @@
 2. **offswap 로그 계측 연동**: `H_OFF_SWAP_LOG` 실측화
 3. **fairness/wanted 정책식 확정**: C/E/G 계산식 표준화
 4. **CI gate 강화**: PR 보호 규칙으로 `harness-dev-gate` required check 설정
+5. **Constraint wrap 정합성 회귀 스위트**: `docs/CONSTRAINT_TAXONOMY_AND_WRAP_TEST_PLAN.md` 와 `docs/CONSTRAINT_TESTCASE_MATRIX_SPEC.md` 기준으로 패턴/멤버/그래프 엣지 정합성 자동 검증 추가
 
 ---
 
@@ -128,3 +129,12 @@
   - 기본은 warning
   - CI/운영 승격 시 환경변수로 C그룹 blocking 전환
     - `HARNESS_FAIRNESS_MODE=blocking`
+
+---
+
+## 8) Linked Taxonomy / Wrap Test Specs
+
+- 제약 전체 재분류 + hard/soft/fallback 규칙:  
+  `docs/CONSTRAINT_TAXONOMY_AND_WRAP_TEST_PLAN.md`
+- 실행 가능한 케이스 카탈로그(우선순위/P0~P2):  
+  `docs/CONSTRAINT_TESTCASE_MATRIX_SPEC.md`
