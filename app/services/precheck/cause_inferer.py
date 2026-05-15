@@ -51,6 +51,12 @@ _PATTERN_TO_CAUSE: dict[str, str] = {
     "off_window_requirement":  "cause:fixed:off_exceeds_span",
     "team_min":                "cause:team:min_over_need",
     "grade_minmax_conflict":   "cause:config:grade_min_gt_max",
+    # B' 도메인 확장 (Eligibility/Role)
+    "n_only_vs_caps":          "cause:eligibility:role_only_oversupply",
+    "weekend_off_only":        "cause:eligibility:weekend_off_only_drains_weekday",
+    "ban_night_before_fixed_off": "cause:eligibility:ban_n_before_fixed_off_isolates",
+    "initial_forbidden_concentration": "cause:fixed:initial_forbidden_concentration",
+    "n_exact_unattainable":    "cause:config:monthly_limit_n_exact_unattainable",
 }
 
 

@@ -772,6 +772,54 @@ causes:
     aliases: [CONSECUTIVE_WORK_LIMIT_BLOCKS, MAX_CONSEC_WORK_INFEASIBLE]
     problem_template_ko: "{day_a}~{day_b}일 ({window_days}일 구간) 에 max_consecutive_work({limit}) 강제로 모든 가용 간호사가 최소 1 OFF 필요 → 그 구간 {affected_shift} 수요 {shortage}명 부족."
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Eligibility / Role 세분화 — AllowedShiftMask / WeekendOffOnly / BanNightBeforeFixedOff
+  # ─────────────────────────────────────────────────────────────────────
+  cause:eligibility:role_only_oversupply:
+    label: "특정 role (예: N-only) 비율 과다 → 다른 shift 부족"
+    category: eligibility
+    causal_layer: data
+    tier: T1
+    is_hard: true
+    aliases: [N_ONLY_ROLE_OVERSUPPLY, ROLE_ONLY_OVERSUPPLY, N_ONLY_VS_CAPS]
+    problem_template_ko: "특정 role({role}) 만 가능한 간호사 {role_only_count}명이 해당 shift 수요 {role_demand}명을 초과 → 다른 shift {other_demand}명 수요에 가용 인원 {other_eligible}명 부족."
+
+  cause:eligibility:weekend_off_only_drains_weekday:
+    label: "주말 OFF 전용 비율 과다 → 평일 공급 부족"
+    category: eligibility
+    causal_layer: data
+    tier: T2
+    is_hard: true
+    aliases: [WEEKEND_OFF_ONLY_DRAINS_WEEKDAY, WEEKDAY_SUPPLY_SHORTAGE]
+    problem_template_ko: "주말 OFF 전용 간호사 {weekend_off_count}명으로 평일 가용 인원 {weekday_eligible}명이 평일 수요 {weekday_demand}명을 미충족."
+
+  cause:eligibility:ban_n_before_fixed_off_isolates:
+    label: "fixed OFF 직전 N 금지 + N 수요 충돌"
+    category: eligibility
+    causal_layer: structural
+    tier: T2
+    is_hard: true
+    aliases: [BAN_N_BEFORE_FIXED_OFF_ISOLATES, FIXED_OFF_N_ISOLATION]
+    problem_template_ko: "{day}일 N 수요 {n_required}명이 있으나 인접일 fixed OFF 가 있는 간호사 {blocked_nurses}명은 ban_n_before_fixed_off 로 N 배정 불가 → 가용 N 인력 {available_n}명 미달."
+
+  cause:fixed:initial_forbidden_concentration:
+    label: "fixed 차단 집중 — 실질 single-shift role 강제"
+    category: fixed
+    causal_layer: data
+    tier: T1
+    is_hard: true
+    aliases: [INITIAL_FORBIDDEN_CONCENTRATION, ROLE_FROM_FIXED_FORBID]
+    problem_template_ko: "간호사 {nurse_id} 가 {forbidden_shifts} 시프트 전 기간 차단 → 실질 {effective_role} 역할 강제, 그 결과 다른 shift 공급 부족."
+
+  cause:config:monthly_limit_n_exact_unattainable:
+    label: "월간 N 정확 값이 active 일수와 모순"
+    category: config
+    causal_layer: meta
+    tier: T0
+    is_hard: true
+    aliases: [MONTHLY_LIMIT_N_EXACT_UNATTAINABLE, N_EXACT_INCOMPATIBLE]
+    problem_template_ko: "간호사 {nurse_id} 의 N 정확({n_exact})이 active 일수 {active_days}일 또는 다른 제약과 양립 불가."
+
 
 treatments:
   treatment:soft:grade_max:
@@ -906,6 +954,8 @@ treatments:
       - cause:config:grade_min_gt_max
       - cause:config:monthly_limit_contradiction
       - cause:dispatch:fixed_assign_wrong_group
+      - cause:config:monthly_limit_n_exact_unattainable
+      - cause:fixed:initial_forbidden_concentration
 
   treatment:data:reduce_fixed:
     label: "고정 셀 / 원티드 정리 (manual)"
@@ -1009,3 +1059,40 @@ treatments:
     trade_off_ko: "연속 근무일이 늘어나면 개인 피로 누적. 다음 달 OFF 배치로 보정 권장."
     applies_to_causes:
       - cause:consecutive:work_limit_blocks_coverage
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Eligibility / Role 도메인 treatment
+  # ─────────────────────────────────────────────────────────────────────
+  treatment:disable:weekend_off_only:
+    label: "주말 OFF 전용 정책 비활성화"
+    action_type: disable_module
+    target_family: WeekendOffOnly
+    config_key: weekend_off_only_enable
+    direction: disable
+    rationale_ko: "주말 OFF 전용 간호사를 평일에도 배정 가능하게. 평일 공급 부족 해소."
+    trade_off_ko: "기존 weekend-off 약속을 깸 — 개인 협의 필요. 다음 달 보정 권장."
+    applies_to_causes:
+      - cause:eligibility:weekend_off_only_drains_weekday
+
+  treatment:disable:ban_night_before_fixed_off:
+    label: "fixed OFF 직전 N 금지 비활성화"
+    action_type: disable_module
+    target_family: BanNightBeforeFixedOff
+    config_key: ban_night_before_fixed_off
+    direction: disable
+    rationale_ko: "fixed OFF 인접일 N 금지 룰 해제. N 가용 인원 회복."
+    trade_off_ko: "OFF 직전 N 배정 발생 가능 — 휴가 시작 직전 피로 누적 우려."
+    applies_to_causes:
+      - cause:eligibility:ban_n_before_fixed_off_isolates
+
+  treatment:data:reassign_role_only:
+    label: "Role-only 간호사 비율 재조정 (manual)"
+    action_type: data_correction_required
+    target_family: AllowedShiftMask
+    config_key: allowed_shifts
+    direction: manual
+    rationale_ko: "N-only / D-only 등 single-shift role 간호사 일부의 allowed_shifts 를 확장하거나, 추가 인력 배치. 인사·간호부 협의."
+    trade_off_ko: "Role 확장은 교육·자격 검토 필요. 즉시 적용 불가."
+    applies_to_causes:
+      - cause:eligibility:role_only_oversupply
+      - cause:fixed:initial_forbidden_concentration
