@@ -263,6 +263,36 @@ def _latest_fix_plan(target: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _latest_infeasible_detail(target: dict[str, Any]) -> dict[str, Any] | None:
+    """가장 최근 시도의 infeasible_detail 전체 (validator_evidence_summary,
+    structural_diagnosis, pool_snapshot 등 진단 패널에 필요한 부수 데이터 포함)."""
+    rr = target.get("run_result") or {}
+    runs = list(rr.get("runs") or [])
+    for attempt in reversed(runs):
+        inf = attempt.get("infeasible_detail") or {}
+        if isinstance(inf, dict) and inf:
+            return inf
+    return None
+
+
+def _latest_run_attempt_meta(target: dict[str, Any]) -> dict[str, Any]:
+    """가장 최근 시도의 status_code/solver_status/used_fallback 등 메타."""
+    rr = target.get("run_result") or {}
+    runs = list(rr.get("runs") or [])
+    if not runs:
+        return {}
+    a = runs[-1] or {}
+    return {
+        "status_code": a.get("status_code"),
+        "solver_status": a.get("solver_status"),
+        "outcome": a.get("outcome"),
+        "used_fallback": a.get("used_fallback"),
+        "applied_relaxations": a.get("applied_relaxations") or [],
+        "summary_message_ko": a.get("summary_message_ko"),
+        "schedule_id": a.get("schedule_id"),
+    }
+
+
 def _build_fix_plan_links(target: dict[str, Any], fix_plan: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(fix_plan, dict):
         return []
@@ -1581,6 +1611,28 @@ def conflict_summary(
         "operator_cards": operator_cards,
         "nurse_perspective": nurse_perspective,
         "nurse_index_map": nurse_index_map,
+        # 진단-우선 UI 용 부수 데이터
+        "diagnostic": {
+            "run_meta": {
+                "run_id": meta.get("run_id"),
+                "group_id": meta.get("group_id"),
+                "year": meta.get("year"),
+                "month": meta.get("month"),
+                "strategy": meta.get("strategy"),
+                "generated_at": generated_at,
+            },
+            "attempt": _latest_run_attempt_meta(target),
+            "validator_evidence_summary": (
+                (_latest_infeasible_detail(target) or {}).get("validator_evidence_summary")
+                or (_latest_infeasible_detail(target) or {}).get("validator_evidence")
+                or {}
+            ),
+            "structural_diagnosis": (_latest_infeasible_detail(target) or {}).get("structural_diagnosis") or {},
+            "pool_shortages": list(((_latest_infeasible_detail(target) or {}).get("pool_snapshot") or {}).get("shortages") or []),
+            "violated_constraints": list((_latest_infeasible_detail(target) or {}).get("violated_constraints") or []),
+            "conflict_cores": list((_latest_infeasible_detail(target) or {}).get("conflict_cores") or []),
+            "preflight_issues": list((_latest_infeasible_detail(target) or {}).get("preflight_issues") or []),
+        },
     })
 
 
@@ -1634,6 +1686,57 @@ _HTML = """<!doctype html>
     /* ── Canvas overlay ─────────────────── */
     #canvas-wrap { position:relative; }
     #cy { width:100%; height:100%; background:var(--bg); }
+
+    /* Diagnostic-first view (default landing) */
+    #diagnostic-view { width:100%; height:100%; overflow-y:auto; background:var(--bg); padding:16px 22px 32px; box-sizing:border-box; }
+    .view-tabs { display:flex; gap:0; align-items:center; padding:8px 14px; background:var(--bg2); border-bottom:1px solid var(--border); }
+    .view-tabs .vt-btn { padding:6px 14px; background:transparent; color:var(--muted); border:none; cursor:pointer; font-size:12px; border-bottom:2px solid transparent; }
+    .view-tabs .vt-btn.active { color:var(--text); border-bottom-color:var(--accent); }
+    .diag-section { margin-bottom:18px; }
+    .diag-h { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
+    .verdict-card { background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--accent); border-radius:8px; padding:14px 16px; margin-bottom:14px; }
+    .verdict-card.fail { border-left-color:var(--fail); }
+    .verdict-card.pass { border-left-color:var(--pass); }
+    .verdict-card .v-title { font-size:14px; font-weight:600; margin-bottom:6px; display:flex; align-items:center; gap:8px; }
+    .verdict-card .v-msg { font-size:12px; color:var(--muted); line-height:1.6; }
+    .verdict-card .v-meta { font-size:10px; color:var(--muted); margin-top:8px; font-family:monospace; }
+    .tier-grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; margin-bottom:14px; }
+    .tier-cell { background:var(--panel); border-radius:6px; padding:10px; text-align:center; border:1px solid var(--border); }
+    .tier-cell .t-label { font-size:9px; color:var(--muted); text-transform:uppercase; }
+    .tier-cell .t-value { font-size:24px; font-weight:700; margin-top:4px; }
+    .tier-cell.T0 { border-color:#7f1d1d; }
+    .tier-cell.T0 .t-value { color:#fca5a5; }
+    .tier-cell.T1 { border-color:#713f12; }
+    .tier-cell.T1 .t-value { color:#fde68a; }
+    .tier-cell.T2 { border-color:#1e3a8a; }
+    .tier-cell.T2 .t-value { color:#93c5fd; }
+    .tier-cell.T3 { border-color:#374151; }
+    .tier-cell.T3 .t-value { color:#d1d5db; }
+    .evidence-grid { display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; }
+    .ev-row { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:8px 12px; }
+    .ev-row .ev-label { font-size:10px; color:var(--muted); }
+    .ev-row .ev-value { font-size:16px; font-weight:600; margin-top:2px; font-family:monospace; }
+    .ev-row.warn { border-color:#7f1d1d; background:#1a0a0a; }
+    .ev-row.warn .ev-value { color:#fca5a5; }
+    .ev-row.ok { border-color:#14532d; }
+    .axis-card { background:var(--panel); border:1px solid #1e3a8a; border-radius:6px; padding:10px 12px; margin-bottom:8px; }
+    .axis-card .ax-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
+    .axis-card .ax-prio { background:#1e3a8a; color:#bfdbfe; padding:2px 8px; border-radius:10px; font-size:10px; font-weight:700; }
+    .axis-card .ax-id { font-size:13px; color:var(--text); font-weight:600; font-family:monospace; }
+    .axis-card .ax-fam { font-size:10px; color:var(--muted); }
+    .axis-card .ax-msg { font-size:12px; color:#e2e8f0; line-height:1.5; }
+    .axis-card .ax-targets { font-size:10px; color:#94a3b8; margin-top:6px; }
+    .protected-card { background:#1a1605; border:1px solid #713f12; border-radius:6px; padding:8px 12px; margin-bottom:6px; }
+    .protected-card .pc-label { font-size:11px; color:#fde68a; }
+    .protected-card .pc-fam { font-size:10px; color:#a16207; margin-top:2px; }
+    .cells-table { width:100%; border-collapse:collapse; font-size:11px; }
+    .cells-table th { text-align:left; padding:6px 8px; color:var(--muted); font-weight:500; border-bottom:1px solid var(--border); }
+    .cells-table td { padding:6px 8px; border-bottom:1px solid var(--panel); }
+    .cells-table tr:hover { background:var(--panel); }
+    .cells-table .axis-pill { display:inline-block; background:#1e3a8a; color:#bfdbfe; padding:1px 6px; border-radius:8px; font-size:9px; margin-right:3px; }
+    .data-correction-banner { background:linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%); color:#fee2e2; padding:10px 14px; border-radius:6px; margin-bottom:14px; font-size:12px; }
+    .stage-pill { display:inline-block; background:#1e293b; color:#93c5fd; padding:3px 10px; border-radius:14px; font-size:11px; border:1px solid #334155; }
+    .narrative-card { background:#0a1525; border:1px solid #1e3a8a; border-radius:6px; padding:10px 14px; margin-bottom:14px; font-size:12px; color:#cbd5e1; line-height:1.7; }
     .canvas-hint { position:absolute; left:50%; top:14px; transform:translateX(-50%); background:rgba(18,26,51,.85); border:1px solid var(--border); border-radius:8px; padding:6px 14px; font-size:11px; color:var(--muted); pointer-events:none; }
     /* ── Detail panel ──────────────────── */
     #detail { padding:0; border-left:1px solid var(--border); overflow:auto; font-size:12px; background:var(--bg2); }
@@ -1788,9 +1891,17 @@ _HTML = """<!doctype html>
     </div>
   </div>
 
-  <div id="canvas-wrap" style="position:relative;">
-    <div id="cy"></div>
-    <div class="canvas-hint">노드 클릭 → 오른쪽 패널에 원인·영향 노출</div>
+  <div id="canvas-wrap" style="position:relative; display:flex; flex-direction:column;">
+    <div class="view-tabs">
+      <button class="vt-btn active" data-view="diagnostic">🩺 진단</button>
+      <button class="vt-btn" data-view="graph">🕸 그래프 (raw)</button>
+      <span style="margin-left:auto; color:var(--muted); font-size:10px;" id="view-hint">집계된 진단 — 인력 분포·축·티어로 정리</span>
+    </div>
+    <div id="diagnostic-view" style="flex:1; overflow-y:auto;">
+      <div style="padding:24px; color:var(--muted); font-size:12px;">진단 데이터 로딩 중...</div>
+    </div>
+    <div id="cy" style="flex:1; display:none;"></div>
+    <div class="canvas-hint" style="display:none;">노드 클릭 → 오른쪽 패널에 원인·영향 노출</div>
   </div>
 
   <div id="detail">
@@ -3176,9 +3287,237 @@ async function showConflictSummary(runId, container) {
   try {
     const data = await fetchJSON('/ontology/conflict_summary?run_id=' + encodeURIComponent(runId));
     renderConflictSummaryPanel(data, container);
+    renderDiagnosticView(data);
   } catch (e) {
     container.innerHTML = `<div class="d-empty">⚠️ Conflict 분석 오류: ${e.message}</div>`;
   }
+}
+
+// 진단-우선 뷰: tier_summary + axis_actions + evidence + 셀 표를
+// 중앙 패널(#diagnostic-view) 에 렌더한다. cytoscape 그래프는 보조.
+function renderDiagnosticView(data) {
+  const root = $('#diagnostic-view');
+  if (!root) return;
+  root.replaceChildren();
+  const fp = data.fix_plan || {};
+  const diag = data.diagnostic || {};
+  const meta = diag.run_meta || {};
+  const attempt = diag.attempt || {};
+  const ves = diag.validator_evidence_summary || {};
+  const sd = diag.structural_diagnosis || {};
+  const violated = diag.violated_constraints || [];
+  const tierSummary = fp.tier_summary || {};
+
+  // ── 1. Verdict header ─────────────────────────────────────────
+  const isFail = attempt.status_code && Number(attempt.status_code) >= 400;
+  const verdict = el('div', { class: 'verdict-card ' + (isFail ? 'fail' : 'pass') });
+  const vTitle = el('div', { class: 'v-title' });
+  vTitle.append(el('span', {}, isFail ? '🚫' : '✅'));
+  vTitle.append(el('span', {}, isFail ? '근무표 생성 실패' : '근무표 생성 성공'));
+  if (attempt.solver_status) {
+    vTitle.append(el('span', { class: 'badge', style: 'background:#1e293b; color:#93c5fd; font-size:10px;' }, attempt.solver_status));
+  }
+  verdict.append(vTitle);
+  if (attempt.summary_message_ko) {
+    verdict.append(el('div', { class: 'v-msg' }, attempt.summary_message_ko));
+  }
+  const metaTxt = `${meta.group_id || '?'} · ${meta.year || '?'}-${String(meta.month || '?').padStart(2,'0')} · ${meta.strategy || '?'} · ${meta.run_id || ''}`;
+  verdict.append(el('div', { class: 'v-meta' }, metaTxt));
+  root.append(verdict);
+
+  // ── 2. Narrative (인력은 충분한데 ... 같은 1문장 해석) ───────────
+  const narr = buildNarrative({ ves, fp, sd, violated });
+  if (narr) {
+    const nc = el('div', { class: 'narrative-card' });
+    nc.append(el('div', {}, narr));
+    root.append(nc);
+  }
+
+  // ── 3. Failure stage + data correction banner ─────────────────
+  if (fp.failure_stage && fp.failure_stage !== 'unknown') {
+    const sec = el('div', { class: 'diag-section' });
+    sec.append(el('span', { class: 'stage-pill' }, `🪜 ${fp.failure_stage_label_ko || fp.failure_stage}`));
+    root.append(sec);
+  }
+  if (fp.data_correction_required) {
+    const fams = (fp.data_correction_families || []).join(', ') || 'ConfigIntegrity';
+    const banner = el('div', { class: 'data-correction-banner' });
+    banner.append(el('div', { style:'font-weight:600; margin-bottom:4px;' }, `⛔ 데이터 정비 필요 (${fams})`));
+    banner.append(el('div', { style:'font-size:11px; opacity:.9;' }, fp.data_correction_message_ko || '룰 완화가 아닌 입력 데이터(요구 인원/인력풀/고정 배정)를 직접 정비하세요.'));
+    root.append(banner);
+  }
+
+  // ── 4. Tier grid (T0/T1/T2/T3) ────────────────────────────────
+  const tierSec = el('div', { class: 'diag-section' });
+  tierSec.append(el('div', { class: 'diag-h' }, '무엇이 막혔는가 (Tier 분류)'));
+  const tierGrid = el('div', { class: 'tier-grid' });
+  const tierMeta = {
+    T0: { label: '절대/물리', sub: '데이터 정비' },
+    T1: { label: '안전', sub: '절대 풀지 마' },
+    T2: { label: '운영', sub: '풀 수 있음' },
+    T3: { label: '품질', sub: 'soft' },
+  };
+  for (const t of ['T0','T1','T2','T3']) {
+    const c = el('div', { class: 'tier-cell ' + t });
+    c.append(el('div', { class: 't-label' }, `${t} · ${tierMeta[t].label}`));
+    c.append(el('div', { class: 't-value' }, String(Number(tierSummary[t] || 0))));
+    c.append(el('div', { style:'font-size:9px; color:var(--muted); margin-top:2px;' }, tierMeta[t].sub));
+    tierGrid.append(c);
+  }
+  tierSec.append(tierGrid);
+  root.append(tierSec);
+
+  // ── 5. Evidence panel ─────────────────────────────────────────
+  const evSec = el('div', { class: 'diag-section' });
+  evSec.append(el('div', { class: 'diag-h' }, '진단 증거'));
+  const evGrid = el('div', { class: 'evidence-grid' });
+  const evItems = [
+    { label: '실패 셀 수', value: ves.total_failed_cells, warn: (ves.total_failed_cells || 0) > 0 },
+    { label: '누적 미배정 인-셀', value: ves.required_minus_assigned_total, warn: (ves.required_minus_assigned_total || 0) > 0 },
+    { label: '후보 0 셀 (인력 부족)', value: ves.eligible_zero_cells, warn: (ves.eligible_zero_cells || 0) > 0, ok: (ves.total_failed_cells || 0) > 0 && (ves.eligible_zero_cells || 0) === 0 },
+    { label: '고정/금지 셀', value: ves.fixed_forbidden_count, warn: (ves.fixed_forbidden_count || 0) > 50 },
+    { label: '월경계 carryover', value: ves.carryover_artifact_count, warn: (ves.carryover_artifact_count || 0) > 0 },
+    { label: 'pool 부족', value: (diag.pool_shortages || []).length, warn: (diag.pool_shortages || []).length > 0 },
+  ];
+  for (const ev of evItems) {
+    if (ev.value === undefined || ev.value === null) continue;
+    const row = el('div', { class: 'ev-row' + (ev.warn ? ' warn' : '') + (ev.ok ? ' ok' : '') });
+    row.append(el('div', { class: 'ev-label' }, ev.label));
+    row.append(el('div', { class: 'ev-value' }, String(ev.value)));
+    evGrid.append(row);
+  }
+  evSec.append(evGrid);
+  root.append(evSec);
+
+  // ── 6. Protected axes (T1) ────────────────────────────────────
+  if ((fp.protected_axes || []).length) {
+    const ps = el('div', { class: 'diag-section' });
+    ps.append(el('div', { class: 'diag-h', style:'color:#fbbf24;' }, '🔒 절대 풀지 마세요 (T1 안전 hard)'));
+    for (const p of fp.protected_axes) {
+      const card = el('div', { class: 'protected-card' });
+      card.append(el('div', { class: 'pc-label' }, `• ${p.label_ko || p.axis_id}`));
+      card.append(el('div', { class: 'pc-fam' }, `${p.family || ''} — ${p.why_protected_ko || '안전·법규성 룰'}`));
+      ps.append(card);
+    }
+    root.append(ps);
+  }
+
+  // ── 7. Axis actions (T2) ──────────────────────────────────────
+  if ((fp.axis_actions || []).length) {
+    const as = el('div', { class: 'diag-section' });
+    as.append(el('div', { class: 'diag-h', style:'color:#93c5fd;' }, `🛠 풀 수 있는 룰 (T2, 우선순위 순 · 최대 ${fp.axis_actions_cap || 5}건)`));
+    for (const a of fp.axis_actions) {
+      const card = el('div', { class: 'axis-card' });
+      const head = el('div', { class: 'ax-head' });
+      head.append(el('span', { class: 'ax-prio' }, `${a.priority || '?'}`));
+      head.append(el('span', { class: 'ax-id' }, a.axis_id || '?'));
+      head.append(el('span', { class: 'ax-fam' }, `${a.family || ''} · ${a.tier || ''} · prio=${a.relaxation_priority ?? '-'}`));
+      card.append(head);
+      if (a.human_message_ko) card.append(el('div', { class: 'ax-msg' }, a.human_message_ko));
+      const tgts = a.targets || [];
+      if (tgts.length) {
+        const tline = tgts.slice(0, 5).map(t => {
+          if (t.pool_id) return `${t.pool_id} (부족${t.shortage ?? '?'})`;
+          if (t.day != null) return `${t.day}일 ${t.shift || ''}`;
+          if (t.grade) return `등급 ${t.grade}`;
+          return JSON.stringify(t);
+        }).join(' · ');
+        card.append(el('div', { class: 'ax-targets' }, `📍 ${tline}${tgts.length > 5 ? ` 외 ${tgts.length - 5}건` : ''}`));
+      }
+      as.append(card);
+    }
+    if (Number(fp.axis_actions_truncated || 0) > 0) {
+      as.append(el('div', { style:'font-size:10px; color:var(--muted); margin-top:6px;' },
+        `(${fp.axis_actions_truncated}건 더 있음 — 상위 ${fp.axis_actions_cap || 5}개만 표시)`));
+    }
+    root.append(as);
+  }
+
+  // ── 8. violated_constraints reason codes 요약 ─────────────────
+  if (violated.length) {
+    const vs = el('div', { class: 'diag-section' });
+    vs.append(el('div', { class: 'diag-h' }, '직접 reason codes'));
+    const row = el('div', { style:'display:flex; flex-wrap:wrap; gap:6px;' });
+    for (const v of violated.slice(0, 12)) {
+      row.append(el('span', { class:'badge' }, v.reason_code || '?'));
+    }
+    vs.append(row);
+    root.append(vs);
+  }
+
+  // ── 9. Top failed cells table ─────────────────────────────────
+  const cells = ves.top_failed_cells || [];
+  if (cells.length) {
+    const ts = el('div', { class: 'diag-section' });
+    ts.append(el('div', { class: 'diag-h' }, `상세 실패 셀 (Top ${Math.min(cells.length, 10)})`));
+    const tbl = el('table', { class: 'cells-table' });
+    const thead = el('thead');
+    const trh = el('tr');
+    for (const h of ['Day', 'Shift', '요구', '후보', '배정', '부족', '막힌 axis']) {
+      trh.append(el('th', {}, h));
+    }
+    thead.append(trh);
+    tbl.append(thead);
+    const tbody = el('tbody');
+    for (const c of cells.slice(0, 10)) {
+      const tr = el('tr');
+      tr.append(el('td', {}, String(c.day ?? '?')));
+      tr.append(el('td', {}, String(c.shift ?? '')));
+      tr.append(el('td', {}, String(c.required ?? '')));
+      tr.append(el('td', {}, String(c.eligible ?? '')));
+      tr.append(el('td', {}, String(c.assigned ?? '')));
+      tr.append(el('td', { style:'color:#fca5a5; font-weight:600;' }, String(c.shortage ?? '')));
+      const axCell = el('td');
+      const axes = c.blocking_axes || [];
+      if (axes.length) {
+        for (const ax of axes) {
+          axCell.append(el('span', { class: 'axis-pill' }, ax));
+        }
+      } else {
+        axCell.append(el('span', { style:'color:var(--muted); font-size:10px;' }, '-'));
+      }
+      tr.append(axCell);
+      tbody.append(tr);
+    }
+    tbl.append(tbody);
+    ts.append(tbl);
+    root.append(ts);
+  }
+
+  // ── 10. Structural diagnosis trail ────────────────────────────
+  if (sd && sd.mode) {
+    const ss = el('div', { class: 'diag-section' });
+    ss.append(el('div', { class: 'diag-h' }, 'G0 구조 진단'));
+    ss.append(el('div', { style:'font-size:11px; color:var(--muted); font-family:monospace;' },
+      `mode=${sd.mode} · causes=[${(sd.primary_causes || []).join(',')}] · trace=${(sd.decision_trace || []).join(' / ')}`));
+    root.append(ss);
+  }
+}
+
+function buildNarrative({ ves, fp, sd, violated }) {
+  const total = Number(ves.total_failed_cells || 0);
+  const eligZero = Number(ves.eligible_zero_cells || 0);
+  const fixedCnt = Number(ves.fixed_forbidden_count || 0);
+  const carry = Number(ves.carryover_artifact_count || 0);
+  const stage = fp.failure_stage || 'unknown';
+  if (total === 0 && (fp.tier_summary?.T2 || 0) === 0) return null;
+  // 인력은 있는데 fixed 잠금 우세
+  if (total > 20 && eligZero === 0 && fixedCnt >= 50) {
+    return `인력 자체는 충분하지만 고정/금지 셀이 ${fixedCnt}건 박혀 솔버가 자유롭게 배정하지 못한 케이스입니다. ${total}셀, 누적 ${ves.required_minus_assigned_total}인-셀이 미배정되었지만 후보가 0인 셀은 없습니다. 추천 흐름: ① 고정 셀 일부 분산 ② 해당 일자 D/E/N 필요 인원 1씩 완화.`;
+  }
+  if (eligZero > 0 && total > 0) {
+    return `${eligZero}개 셀에서 배정 가능한 간호사가 0명입니다. 인력 자체 또는 허용 시프트 마스크가 너무 좁은지 점검이 필요합니다.`;
+  }
+  if (carry > 0) {
+    return `전월 carryover 잔여(${carry}건)가 월초 셀을 차단하는 케이스입니다. 전월 N tail / 연속근무 꼬리를 확인하세요.`;
+  }
+  if (fp.data_correction_required) {
+    return '입력 설정이 수학적으로 풀리지 않는 상태입니다. 룰 완화로는 해소되지 않으니 데이터를 직접 손봐야 합니다.';
+  }
+  if ((fp.axis_actions || []).length) {
+    return `${fp.axis_actions.length}개 축의 조정이 권장되는 케이스입니다. 우선순위 낮은 룰부터 단계적으로 풀어보세요.`;
+  }
+  return null;
 }
 
 async function bootstrap() {
@@ -3287,6 +3626,31 @@ async function bootstrap() {
     });
   });
   $('#btnFit').addEventListener('click', () => state.cy && state.cy.fit(state.cy.elements(), 40));
+
+  // View tabs (진단 ↔ 그래프)
+  document.querySelectorAll('.vt-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const v = btn.dataset.view;
+      document.querySelectorAll('.vt-btn').forEach(b => b.classList.toggle('active', b === btn));
+      const diag = $('#diagnostic-view'); const cy = $('#cy');
+      const hint = $('.canvas-hint');
+      const vh = $('#view-hint');
+      if (v === 'diagnostic') {
+        if (diag) diag.style.display = 'block';
+        if (cy) cy.style.display = 'none';
+        if (hint) hint.style.display = 'none';
+        if (vh) vh.textContent = '집계된 진단 — 인력 분포·축·티어로 정리';
+      } else {
+        if (diag) diag.style.display = 'none';
+        if (cy) cy.style.display = 'block';
+        if (hint) hint.style.display = '';
+        if (vh) vh.textContent = '원시 그래프 — 모든 노드/엣지 (필요시 “전체노드” 토글)';
+        // resize cytoscape after becoming visible
+        if (state.cy) { state.cy.resize(); state.cy.fit(state.cy.elements(), 40); }
+      }
+    });
+  });
+
   const btnShowAll = $('#btnShowAllNodes');
   if (btnShowAll) {
     btnShowAll.addEventListener('click', () => {
