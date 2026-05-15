@@ -27,6 +27,42 @@ from fastapi.responses import HTMLResponse, JSONResponse
 router = APIRouter(prefix="/ontology", tags=["ontology"])
 
 
+# Node-type visibility tier for UI rendering.
+#   - HIGH: 사용자가 즉시 봐야 하는 신호 (default visible)
+#   - MED: 기본 숨김, 드릴다운 시 노출
+#   - LOW: 그래프 전용 (agent/ontology layer 가 소비, UI 기본 숨김)
+# 원본 nodes[] 는 그대로 유지하고, 각 노드에 `ui_visible: bool` 만 추가한다.
+_NODE_TYPE_UI_TIER: dict[str, str] = {
+    # 신호 강도 HIGH — 운영자 화면 1차 노출
+    "ConflictCoreNode": "high",
+    "ViolationNode": "high",
+    "DataQualityNode": "high",
+    "ConstraintNode": "high",
+    # 신호 강도 MED — 드릴다운/필터 ON 시 노출
+    "RuleNode": "med",
+    "RunNode": "med",
+    # 신호 강도 LOW — 그래프 백본/내부 풀 모델 (UI 기본 숨김)
+    "MetricNode": "low",
+    "TeamPoolNode": "low",
+    "GradePoolNode": "low",
+    "CommonPoolNode": "low",
+    "MonthNode": "low",
+    "GroupNode": "low",
+    "NurseNode": "low",
+    "TeamNode": "low",
+    "DayNode": "low",
+    "ShiftNode": "low",
+}
+
+
+def _ui_visible_for_type(node_type: str) -> bool:
+    return _NODE_TYPE_UI_TIER.get(str(node_type or ""), "med") == "high"
+
+
+def _ui_tier_for_type(node_type: str) -> str:
+    return _NODE_TYPE_UI_TIER.get(str(node_type or ""), "med")
+
+
 # ── Rule catalog (human-readable explanation per rule_id) ──
 #
 # 출처: docs/ONTOLOGY_RULE_GRANULARITY_SPEC.md §3 + checklist_core.yaml.
@@ -214,6 +250,44 @@ def _core_details_by_id(target: dict[str, Any]) -> dict[str, dict[str, Any]]:
             if cid and cid not in out:
                 out[cid] = core
     return out
+
+
+def _latest_fix_plan(target: dict[str, Any]) -> dict[str, Any] | None:
+    rr = target.get("run_result") or {}
+    runs = list(rr.get("runs") or [])
+    for attempt in reversed(runs):
+        inf = attempt.get("infeasible_detail") or {}
+        fp = inf.get("fix_plan")
+        if isinstance(fp, dict) and fp:
+            return fp
+    return None
+
+
+def _build_fix_plan_links(target: dict[str, Any], fix_plan: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(fix_plan, dict):
+        return []
+    nodes = list((target.get("data") or {}).get("nodes") or [])
+    pool_nodes = {
+        str(n.get("id") or "")
+        for n in nodes
+        if str(n.get("type") or "") in {"TeamPoolNode", "GradePoolNode", "CommonPoolNode"}
+    }
+    links: list[dict[str, Any]] = []
+    for action in list(fix_plan.get("actions") or []):
+        aid = str(action.get("action_id") or "")
+        for t in list(action.get("targets") or []):
+            pool_id = str(t.get("pool_id") or "")
+            if not pool_id:
+                continue
+            links.append(
+                {
+                    "action_id": aid,
+                    "pool_id": pool_id,
+                    "pool_node_exists": pool_id in pool_nodes,
+                    "shortage": t.get("shortage"),
+                }
+            )
+    return links
 
 
 # ── Endpoints ──────────────────────────────────────────────
@@ -539,9 +613,23 @@ def merged_graph(
         e for e in edges.values() if e["from"] in nodes and e["to"] in nodes
     ]
 
+    # Attach ui_visible/ui_tier per node — agent/ontology consumers see all nodes;
+    # UI clients can filter by ui_visible.
+    final_nodes: list[dict[str, Any]] = []
+    ui_visible_count = 0
+    for n in nodes.values():
+        ntype = str(n.get("type") or "")
+        tier = _ui_tier_for_type(ntype)
+        visible = tier == "high"
+        n["ui_tier"] = tier
+        n["ui_visible"] = visible
+        if visible:
+            ui_visible_count += 1
+        final_nodes.append(n)
+
     return JSONResponse(
         {
-            "nodes": list(nodes.values()),
+            "nodes": final_nodes,
             "edges": pruned_edges,
             "violations": violations,
             "stats": {
@@ -549,6 +637,7 @@ def merged_graph(
                 "node_count": len(nodes),
                 "edge_count": len(pruned_edges),
                 "violation_count": len(violations),
+                "ui_visible_node_count": ui_visible_count,
             },
         }
     )
@@ -1175,6 +1264,7 @@ def _render_operator_card(core: dict[str, Any], priority: int) -> dict[str, Any]
         "adjustable": adjustable,
         "pattern": _to_display_pattern(pattern),
         "pattern_raw": pattern,
+        "pattern_candidates": core.get("pattern_candidates") or [],
         "node_id": core.get("node_id") or "",
         # causal_layer 는 dashboard 가 root vs cascade 분리 렌더할 때 사용
         "causal_layer": core.get("causal_layer") or "unknown",
@@ -1309,6 +1399,7 @@ def conflict_summary(
             # causal layer (root vs cascade) — hard_assumption.derive_core_layer 가 세팅
             "causal_layer": a.get("causal_layer") or "unknown",
             "per_layer_counts": a.get("per_layer_counts") or {},
+            "pattern_candidates": detailed_core.get("pattern_candidates") or a.get("pattern_candidates") or [],
         }
         if is_global:
             global_infeas.append(core)
@@ -1393,6 +1484,8 @@ def conflict_summary(
         all_cores=all_cores,
         tradeoff_signals=tradeoff_signals,
     )
+    fix_plan = _latest_fix_plan(target)
+    fix_plan_links = _build_fix_plan_links(target, fix_plan)
 
     # operator_cards: 우선순위 정렬 후 skip 패턴 제외, catalog 기반 카드 생성
     cardable = [
@@ -1479,6 +1572,12 @@ def conflict_summary(
             ),
         },
         "operator_guidance": operator_guidance,
+        "fix_plan": fix_plan,
+        "fix_plan_links": fix_plan_links,
+        "fix_plan_context": {
+            "run_id": meta.get("run_id"),
+            "generated_at": generated_at,
+        },
         "operator_cards": operator_cards,
         "nurse_perspective": nurse_perspective,
         "nurse_index_map": nurse_index_map,
@@ -1622,6 +1721,7 @@ _HTML = """<!doctype html>
       <button class="btn"        data-layer="violation" title="위반 노드 — 특정 run에서 발생한 위반을 그래프상에 표시">위반</button>
       <button class="btn"        data-layer="metric"    title="측정값 노드 (느림)">측정값</button>
       <button class="btn"        data-layer="cause"     title="환경/제약 원인 노드 (CoverageMin/TeamMin/OffWindow/Nurse 등)">원인</button>
+      <button class="btn"        id="btnShowAllNodes"   title="저신호 노드(메트릭/풀/맥락) 까지 모두 표시. 기본은 사용자 핵심 노드만.">🔧 전체노드</button>
     </div>
     <div class="divider"></div>
     <div class="tb-group">
@@ -1726,7 +1826,8 @@ const state = {
   layers:new Set(['month','group','run','rule']),  // default
   severities:new Set(['blocking','warning']),       // default both
   status:'ALL',
-  cy:null, facets:null, allRules:[], reloadPending:false, catalog:{},
+  showAllNodes:false,  // default: 사용자 핵심 노드(ui_visible=true)만 그래프 표시
+  cy:null, facets:null, allRules:[], reloadPending:false, catalog:{}, selectedNodeId:'',
 };
 
 const GROUP_LABEL = {
@@ -1957,10 +2058,13 @@ async function reloadGraph() {
     const failRuleIds = new Set();
     for (const v of g.violations || []) failRuleIds.add(v.rule_id);
 
-    const positions = computePresetPositions(g.nodes);
-    const nodeIds = new Set(g.nodes.map(n => n.id));
+    // UI 가시성 필터: 기본은 ui_visible=true 만, "전체노드" 토글 시 모두.
+    const showAll = !!state.showAllNodes;
+    const visibleNodes = g.nodes.filter(n => showAll || n.ui_visible !== false);
+    const positions = computePresetPositions(visibleNodes);
+    const nodeIds = new Set(visibleNodes.map(n => n.id));
     const elements = [];
-    for (const n of g.nodes) {
+    for (const n of visibleNodes) {
       const isFail = (n.type === 'RuleNode' && failRuleIds.has(n.attrs?.rule_id))
                   || (n.type === 'ViolationNode');
       // RunNode → 'success' (all primary) | 'fallback' (CP-SAT 실패→fallback success) | 'failed' (infeasible/unsat)
@@ -1998,6 +2102,23 @@ async function reloadGraph() {
       cy.add(elements);
     });
     cy.fit(cy.elements(), 40);
+    // 선택 유지: 리로드 후에도 기존 노드를 유지하고, 없으면 첫 RunNode 자동 선택
+    let targetId = state.selectedNodeId;
+    if (!targetId || !nodeIds.has(targetId)) {
+      const firstRun = (g.nodes || []).find(n => n.type === 'RunNode');
+      targetId = firstRun ? firstRun.id : ((g.nodes || [])[0] ? g.nodes[0].id : '');
+    }
+    if (targetId) {
+      const node = cy.getElementById(targetId);
+      if (node && node.length) {
+        const nb = node.closedNeighborhood();
+        cy.elements().addClass('dim').removeClass('focus');
+        nb.addClass('focus').removeClass('dim');
+      }
+      await showNodeDetail(targetId);
+    } else {
+      $('#detail').innerHTML = '<div class="d-empty"><div class="icon">🧭</div>표시할 노드가 없습니다.</div>';
+    }
     $('#stats').textContent += ` · ${Math.round(performance.now() - t0)}ms`;
   } finally {
     state.reloadPending = false;
@@ -2286,6 +2407,7 @@ function renderDetailOverview(container, info) {
 }
 
 async function showNodeDetail(id) {
+  state.selectedNodeId = id;
   const d = $('#detail');
   d.innerHTML = '<div class="d-empty"><div class="icon">⏳</div>불러오는 중…</div>';
   try {
@@ -2379,22 +2501,11 @@ async function showNodeDetail(id) {
       const cfHdr = el('h3', {}, '🔬 Conflict 분석');
       cfHdr.append(el('span', { class:'h-desc', style:'display:inline; margin-left:6px;' }, '3계층 충돌 코어 + 운영자 요약'));
       cfSec.append(cfHdr);
-      const cfBtn = el('button', { class:'btn', style:'width:100%; font-size:12px; padding:7px; margin-top:6px;' }, '▶ 분석 열기');
       const cfBody = el('div');
-      let cfLoaded = false;
-      cfBtn.addEventListener('click', async () => {
-        if (cfLoaded) {
-          cfBody.style.display = cfBody.style.display === 'none' ? '' : 'none';
-          cfBtn.textContent = cfBody.style.display === 'none' ? '▶ 분석 열기' : '▲ 닫기';
-          return;
-        }
-        cfBtn.disabled = true; cfBtn.textContent = '⏳ 분석 중…';
-        await showConflictSummary(runId, cfBody);
-        cfLoaded = true;
-        cfBtn.disabled = false; cfBtn.textContent = '▲ 닫기';
-        cfSec.append(cfBody);
-      });
-      cfSec.append(cfBtn);
+      const cfMeta = el('div', { class:'h-desc', style:'margin:4px 0 8px;' }, '선택한 실행의 대표 원인을 자동으로 표시합니다.');
+      cfSec.append(cfMeta);
+      cfSec.append(cfBody);
+      await showConflictSummary(runId, cfBody);
       d.append(cfSec);
     }
 
@@ -2623,6 +2734,10 @@ function renderCauseItem(cause, rank) {
   }
   card.append(head);
   card.append(el('div', { style:'font-size:12px; font-weight:600;' }, cause.pattern || ''));
+  if (cause.pattern_candidates && cause.pattern_candidates.length) {
+    card.append(el('div', { style:'font-size:10px; color:var(--muted); margin-top:2px;' },
+      `candidates: ${cause.pattern_candidates.join(', ')}`));
+  }
   if (cause.human_message_ko) {
     card.append(el('div', { style:'font-size:11px; color:#cbd5e1; margin-top:3px;' }, cause.human_message_ko));
   }
@@ -2680,8 +2795,189 @@ function renderConflictSummaryPanel(data, container) {
   }
   panel.append(hdr);
 
+  // fix plan 요약 (NO_ASSIGNMENT 분해 + 링크 + tier/axis/stage v2)
+  const fp = data.fix_plan || null;
+  if (fp) {
+    const fpSec = el('div', { style:'padding:8px 14px 10px;' });
+    fpSec.append(el('div', { style:'font-size:11px; color:var(--muted); margin-bottom:4px;' },
+      `🧭 Fix plan (${fp.reason_source || 'inferred'} · ${fp.plan_mode || '-'})`));
+
+    // failure_stage badge (S0~S4 or unknown)
+    if (fp.failure_stage && fp.failure_stage !== 'unknown') {
+      const stageBadge = el('div', { style:'display:flex; align-items:center; gap:6px; margin-bottom:6px;' });
+      stageBadge.append(el('span', { class:'badge', style:'background:#1e293b; color:#93c5fd; border:1px solid #334155;' },
+        `🪜 ${fp.failure_stage_label_ko || fp.failure_stage}`));
+      fpSec.append(stageBadge);
+    }
+
+    // tier_summary (T0/T1/T2/T3 4-mini badge)
+    if (fp.tier_summary) {
+      const t = fp.tier_summary;
+      const tWrap = el('div', { style:'display:flex; gap:4px; margin-bottom:6px; font-size:10px;' });
+      const tierColors = {
+        T0: { bg:'#7f1d1d', fg:'#fecaca' }, // 절대 hard / 데이터 정비
+        T1: { bg:'#713f12', fg:'#fde68a' }, // 안전 hard / 절대 풀지마
+        T2: { bg:'#1e3a8a', fg:'#bfdbfe' }, // 운영 hard / 풀 수 있음
+        T3: { bg:'#374151', fg:'#d1d5db' }, // 품질 soft
+      };
+      const tierLabels = { T0:'절대', T1:'안전', T2:'운영', T3:'품질' };
+      for (const tier of ['T0','T1','T2','T3']) {
+        const n = Number(t[tier] || 0);
+        if (n <= 0) continue;
+        const c = tierColors[tier];
+        tWrap.append(el('span', { style:`background:${c.bg}; color:${c.fg}; padding:2px 7px; border-radius:10px; font-weight:600;` },
+          `${tier} ${tierLabels[tier]} ${n}`));
+      }
+      if (tWrap.children.length > 0) fpSec.append(tWrap);
+    }
+
+    // data_correction_required (T0 banner)
+    if (fp.data_correction_required) {
+      const fams = (fp.data_correction_families || []).join(', ') || 'ConfigIntegrity';
+      const banner = el('div', {
+        style:'background:#7f1d1d; color:#fee2e2; padding:6px 9px; border-radius:6px; font-size:11px; margin-bottom:6px;',
+      }, `⛔ 데이터 정비 필요 (${fams}): ${fp.data_correction_message_ko || '입력 데이터를 직접 정비하세요.'}`);
+      fpSec.append(banner);
+    }
+
+    // protected_axes (T1)
+    if ((fp.protected_axes || []).length) {
+      fpSec.append(el('div', { style:'font-size:10px; color:#fbbf24; margin:6px 0 3px;' },
+        `🔒 절대 풀지 마세요 (T1)`));
+      const pWrap = el('div', { style:'display:flex; flex-direction:column; gap:3px; padding-left:8px;' });
+      for (const pa of fp.protected_axes) {
+        pWrap.append(el('div', { style:'font-size:11px; color:#fde68a;' },
+          `• ${pa.label_ko} (${pa.family})`));
+      }
+      fpSec.append(pWrap);
+    }
+
+    // axis_actions (T2 권고, max 5)
+    if ((fp.axis_actions || []).length) {
+      fpSec.append(el('div', { style:'font-size:10px; color:#93c5fd; margin:8px 0 3px;' },
+        `🛠 풀 수 있는 룰 (T2) — 우선순위 순`));
+      const aWrap = el('div', { style:'display:flex; flex-direction:column; gap:6px;' });
+      for (const ax of fp.axis_actions) {
+        const card = el('div', {
+          style:'background:#0f1a35; border:1px solid #1e3a8a; border-radius:5px; padding:6px 8px;',
+        });
+        const head = el('div', { style:'display:flex; align-items:center; gap:6px; margin-bottom:3px;' });
+        head.append(el('span', { class:'badge', style:'background:#1e3a8a; color:#bfdbfe;' },
+          `${ax.priority || '?'}`));
+        head.append(el('span', { style:'font-size:11px; color:#cbd5e1;' }, ax.axis_id || ''));
+        head.append(el('span', { style:'font-size:10px; color:#64748b;' },
+          `${ax.family || ''} · prio=${ax.relaxation_priority ?? '-'}`));
+        card.append(head);
+        if (ax.human_message_ko) {
+          card.append(el('div', { style:'font-size:11px; color:#e2e8f0; line-height:1.5;' }, ax.human_message_ko));
+        }
+        const tgts = ax.targets || [];
+        if (tgts.length) {
+          const tline = tgts.slice(0, 3).map(t => {
+            if (t.pool_id) return `${t.pool_id}(부족${t.shortage ?? '?'})`;
+            if (t.day) return `${t.day}일 ${t.shift || ''}`;
+            return JSON.stringify(t);
+          }).join(', ');
+          card.append(el('div', { style:'font-size:10px; color:#94a3b8; margin-top:3px;' },
+            `📍 ${tline}${tgts.length > 3 ? ` 외 ${tgts.length - 3}건` : ''}`));
+        }
+        aWrap.append(card);
+      }
+      fpSec.append(aWrap);
+      if (Number(fp.axis_actions_truncated || 0) > 0) {
+        fpSec.append(el('div', { style:'font-size:10px; color:#64748b; margin-top:4px;' },
+          `(${fp.axis_actions_truncated}건 더 있음 — 상위 ${fp.axis_actions_cap || 5}개만 표시)`));
+      }
+    }
+
+    // Legacy no_assignment_breakdown (요약 배지)
+    if (fp.no_assignment_breakdown && fp.no_assignment_breakdown.length) {
+      const row = el('div', { style:'display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;' });
+      for (const k of fp.no_assignment_breakdown) {
+        row.append(el('span', { class:'badge' }, `NO_ASSIGNMENT/${k}`));
+      }
+      fpSec.append(row);
+    }
+    const links = data.fix_plan_links || [];
+    if (links.length) {
+      const lwrap = el('div', { style:'display:flex; flex-direction:column; gap:4px; margin-top:6px;' });
+      for (const lk of links.slice(0, 8)) {
+        const txt = `${lk.action_id} → ${lk.pool_id} (shortage=${lk.shortage ?? '?'})`;
+        const tone = lk.pool_node_exists ? '#86efac' : '#fca5a5';
+        lwrap.append(el('div', { style:`font-size:11px; color:${tone};` }, txt));
+      }
+      fpSec.append(lwrap);
+    }
+    panel.append(fpSec);
+  }
+
   // 운영자 카드 (주 UI) — causal_layer 기반 root vs cascade 분리 렌더
   const cards = data.operator_cards || [];
+
+  // 대표 원인 그룹(원인 중심 요약) — 기본 노출
+  function buildCanonicalCauseGroups(items) {
+    const m = new Map();
+    for (const c of (items || [])) {
+      const sig = [
+        c.causal_layer || 'unknown',
+        c.pattern_raw || c.pattern || '-',
+        c.action_target || '-',
+        c.scope_msg || '-',
+      ].join('||');
+      if (!m.has(sig)) {
+        m.set(sig, {
+          signature: sig,
+          title: c.title || c.pattern || '원인',
+          causal_layer: c.causal_layer || 'unknown',
+          pattern: c.pattern || c.pattern_raw || '-',
+          action_target: c.action_target || '-',
+          scope_msg: c.scope_msg || '',
+          count: 0,
+          affected_max: 0,
+          samples: [],
+        });
+      }
+      const g = m.get(sig);
+      g.count += 1;
+      g.affected_max = Math.max(g.affected_max || 0, Number(c.affected_count || 0));
+      if (g.samples.length < 3 && c.node_id) g.samples.push(c.node_id);
+    }
+    return [...m.values()].sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return (b.affected_max || 0) - (a.affected_max || 0);
+    });
+  }
+
+  if (cards.length) {
+    const groups = buildCanonicalCauseGroups(cards);
+    const gSec = el('div', { style:'padding:0 14px 8px;' });
+    const gWrap = el('div');
+    const gBody = createCollapsibleSection(
+      gWrap,
+      `🧭 대표 원인 그룹 (${groups.length}개)` ,
+      '',
+      true,
+    );
+    for (const g of groups.slice(0, 8)) {
+      const item = el('div', { class:'cause-item', style:'margin-bottom:8px;' });
+      const top = el('div', { style:'display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:4px;' });
+      top.append(el('span', { class:'badge' }, `빈도 ${g.count}`));
+      top.append(el('span', { class:'badge' }, `${g.causal_layer}`));
+      if (g.scope_msg) top.append(el('span', { class:'badge' }, g.scope_msg));
+      if ((g.affected_max || 0) > 1) top.append(el('span', { class:'badge' }, `최대 영향 ${g.affected_max}명`));
+      item.append(top);
+      item.append(el('div', { style:'font-size:12px; font-weight:700;' }, g.title));
+      item.append(el('div', { style:'font-size:11px; color:var(--muted); margin-top:2px;' }, `pattern: ${g.pattern}`));
+      if (g.samples.length) {
+        const samples = el('div', { style:'font-size:10px; color:var(--muted); margin-top:5px;' },
+          `sample nodes: ${g.samples.map(x => x.slice(-16)).join(', ')}`);
+        item.append(samples);
+      }
+      gBody.append(item);
+    }
+    gSec.append(gWrap);
+    panel.append(gSec);
+  }
   // 카드 1장을 DOM 으로 렌더 (root/cascade 양쪽이 공유)
   function _renderCauseCard(c) {
     const isNonAdj = c.adjustable === false || c.action_target === 'NON_ADJUSTABLE';
@@ -2713,6 +3009,9 @@ function renderConflictSummaryPanel(data, container) {
     }, `${lb.icon} ${lb.text}`));
     titleRow.append(el('span', { style:'font-size:13px; font-weight:700;' }, c.title));
     if (c.scope_msg) titleRow.append(el('span', { class:'badge' }, c.scope_msg));
+    if (c.pattern_candidates && c.pattern_candidates.length) {
+      titleRow.append(el('span', { class:'badge' }, `cands:${c.pattern_candidates.length}`));
+    }
     if (isNonAdj) titleRow.append(el('span', { class:'non-adj-badge' }, '🔒 조정 불가'));
     card.append(titleRow);
 
@@ -2732,6 +3031,10 @@ function renderConflictSummaryPanel(data, container) {
     if (c.what_ko) {
       card.append(el('div', { style:'font-size:12px; color:#cbd5e1; margin-bottom:4px; line-height:1.5;' },
         `🔍 ${c.what_ko}`));
+    }
+    if (c.pattern_candidates && c.pattern_candidates.length) {
+      card.append(el('div', { style:'font-size:10px; color:var(--muted); margin-bottom:5px;' },
+        `pattern candidates: ${c.pattern_candidates.join(', ')}`));
     }
     if (c.detail) {
       card.append(el('div', { style:'font-size:11px; color:var(--muted); font-family:monospace; margin-bottom:6px;' },
@@ -2754,6 +3057,15 @@ function renderConflictSummaryPanel(data, container) {
   }
 
   if (cards.length) {
+    const detailWrapOuter = el('div', { style:'padding:0 14px;' });
+    const detailSec = el('div');
+    const detailBody = createCollapsibleSection(
+      detailSec,
+      `🔍 상세 충돌 카드 (${cards.length}건)` ,
+      '',
+      false,
+    );
+
     const rootCards    = cards.filter(c => (c.causal_layer === 'policy' || c.causal_layer === 'data'));
     const cascadeCards = cards.filter(c => !(c.causal_layer === 'policy' || c.causal_layer === 'data'));
 
@@ -2762,15 +3074,15 @@ function renderConflictSummaryPanel(data, container) {
       const rootHeader = el('div', {
         style:'margin:6px 14px 4px; font-size:11px; font-weight:700; color:#fca5a5; letter-spacing:.5px;',
       }, `💥 ROOT — 정책/데이터 근본 원인 (${rootCards.length}건)`);
-      panel.append(rootHeader);
-      const rootWrap = el('div', { style:'padding:0 14px;' });
+      detailBody.append(rootHeader);
+      const rootWrap = el('div');
       for (const c of rootCards) rootWrap.append(_renderCauseCard(c));
-      panel.append(rootWrap);
+      detailBody.append(rootWrap);
     }
 
     // 📋 Cascade 섹션 — root 있으면 접고, 없으면 펼침 (root 없으면 cascade 가 사실상 root)
     if (cascadeCards.length) {
-      const cascadeWrap = el('div', { style:'padding:0 14px; margin-top:8px;' });
+      const cascadeWrap = el('div', { style:'margin-top:8px;' });
       const cascadeSec = el('div');
       const cascadeBody = createCollapsibleSection(
         cascadeSec,
@@ -2782,8 +3094,10 @@ function renderConflictSummaryPanel(data, container) {
       );
       for (const c of cascadeCards) cascadeBody.append(_renderCauseCard(c));
       cascadeWrap.append(cascadeSec);
-      panel.append(cascadeWrap);
+      detailBody.append(cascadeWrap);
     }
+    detailWrapOuter.append(detailSec);
+    panel.append(detailWrapOuter);
   } else {
     panel.append(el('div', { style:'padding:14px; color:var(--muted); font-size:12px;' },
       '이 run에서 해석 가능한 충돌 원인이 없습니다.'));
@@ -2973,6 +3287,15 @@ async function bootstrap() {
     });
   });
   $('#btnFit').addEventListener('click', () => state.cy && state.cy.fit(state.cy.elements(), 40));
+  const btnShowAll = $('#btnShowAllNodes');
+  if (btnShowAll) {
+    btnShowAll.addEventListener('click', () => {
+      state.showAllNodes = !state.showAllNodes;
+      if (state.showAllNodes) btnShowAll.classList.add('active');
+      else btnShowAll.classList.remove('active');
+      reloadGraph();
+    });
+  }
   $('#btnReload').addEventListener('click', async () => {
     // Full soft-refresh: re-fetch facets + rules + graph so newly produced
     // harness runs (new schedule_id / solver_status / etc) appear without
