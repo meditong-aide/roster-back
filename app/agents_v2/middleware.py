@@ -152,31 +152,64 @@ def execute_skill(
 
 _MUTATION_SKILLS = frozenset({
     "bulk_mutation",
-    "bulk-mutation",
     "update_constraint",
-    "update-constraint",
     "update_person_attr",
-    "update-person-attr",
     "generate_schedule",
-    "generate-schedule",
+    "update_monthly_limit",
 })
+
+_SELF_REFERENCE_ALIASES = ("나", "내", "제", "본인")
+
+
+def _is_head_or_admin(ctx: SessionContext) -> bool:
+    return ctx.user_role in ("HN", "ADM")
 
 
 def _check_permission(
     skill_name: str, args: dict, ctx: SessionContext
 ) -> str | None:
-    """Check permissions. Returns error message if blocked."""
-    normalized = skill_name.replace("-", "_")
+    """Permission gate. router/auth.py 의 is_head_nurse / is_master_admin 와 동일 의미.
 
-    # Non-admin users cannot modify other nurses' data
-    if normalized in _MUTATION_SKILLS and ctx.user_role not in ("HN", "ADM"):
+    규칙:
+      1) 병동 전체 영향 (update_constraint / generate_schedule) — HN/ADM 만.
+      2) bulk_mutation 의 마감일 변경 / 일괄 승인 등 ward-wide action — HN/ADM 만.
+      3) 개인 속성 mutation (update_person_attr) — HN/ADM 또는 본인.
+      4) update_monthly_limit (개인별 N 한도) — HN/ADM 만 (다른 nurse 한도 설정).
+      5) 그 외 mutation 은 본인 데이터 mutation 만 허용.
+    """
+    normalized = skill_name.replace("-", "_")
+    is_hn = _is_head_or_admin(ctx)
+
+    # (1) 병동 전체 영향 mutation
+    if normalized in {"update_constraint", "generate_schedule"} and not is_hn:
+        return "병동 전체 설정 변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (4) 다른 간호사의 월 한도 설정
+    if normalized == "update_monthly_limit" and not is_hn:
+        return "다른 간호사의 월 한도 설정은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (2) bulk_mutation 의 ward-wide action
+    if normalized == "bulk_mutation" and not is_hn:
+        scope = args.get("scope", "")
+        action = args.get("action", "")
+        if scope == "wanted_submissions" and action == "update_deadline":
+            return "원티드 마감일 변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+        if scope == "wanted_adjustment":
+            # 본인 nurse 만 명시되어 있고 self 인 경우는 허용
+            nurse_ids = args.get("nurse_ids") or []
+            nurse_name = args.get("nurse_name") or ""
+            is_self_target = (
+                (nurse_name in _SELF_REFERENCE_ALIASES)
+                or (nurse_name == ctx.nurse_name)
+                or (ctx.nurse_id and nurse_ids == [ctx.nurse_id])
+            )
+            if not is_self_target:
+                return "원티드 일괄 처리는 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (3, 5) 다른 간호사 data 수정 차단 (기존 로직 유지)
+    if normalized in _MUTATION_SKILLS and not is_hn:
         nurse_name = args.get("nurse_name", "")
-        if nurse_name and nurse_name != ctx.nurse_name and nurse_name not in (
-            "나",
-            "내",
-            "제",
-            "본인",
-        ):
+        if nurse_name and nurse_name != ctx.nurse_name and nurse_name not in _SELF_REFERENCE_ALIASES:
             return f"다른 간호사({nurse_name})의 데이터를 수정할 권한이 없습니다."
 
     return None
