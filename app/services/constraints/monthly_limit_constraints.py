@@ -45,26 +45,21 @@ def _norm_bounds(min_v: Any, max_v: Any, exact_v: Any) -> tuple[int | None, int 
 
 
 def collect_single_n_allowed_nurse_indices(rs: RosterSystem) -> set[int]:
-    """nurse_monthly_limit 에서 N=1 가능성이 명시된 nurse 의 nurse_index set.
+    """nurse_monthly_limit 의 n_max == 1 인 nurse 의 nurse_index set 을 반환.
 
     1N 금지(not_one_night) hard 제약에서 면제 대상 — 운영자가 월간 한도로 N=1 을
-    어느 필드든 명시한 의도는 default 1N 금지 정책보다 우선한다.
+    명시한 의도는 default 1N 금지 정책보다 우선한다.
 
-    면제 조건 (셋 중 어느 하나):
-        - n_exact == 1  → 정규화 시 (1, 1)
-        - n_max   == 1  → 상한이 1 (강제 N=0 or 1)
-        - n_min   == 1  → 하한이 1 (1 가능, 더 많을 수도)
-
-    사용자 정책: "n_min=1 이든 n_max=1 이든 n_exact=1 이든 알고리즘에서 1이
-    나오는 경우" 해당 nurse 는 1N ban 면제.
+    면제 조건:
+        - nurse.n_max == 1 (또는 n_exact == 1 로 인해 정규화 시 max==1)
     """
     out: set[int] = set()
     for n_idx, nu in enumerate(rs.nurses):
         mn_raw = getattr(nu, "n_min", None)
         mx_raw = getattr(nu, "n_max", None)
         ex_raw = getattr(nu, "n_exact", None)
-        mn, mx = _norm_bounds(mn_raw, mx_raw, ex_raw)
-        if mn == 1 or mx == 1:
+        _, mx = _norm_bounds(mn_raw, mx_raw, ex_raw)
+        if mx == 1:
             out.add(n_idx)
     return out
 
@@ -94,6 +89,15 @@ def add_monthly_limit_constraints(
     if not code_idx:
         return 0
 
+    # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
+    _registry = getattr(m, "_cpsat_assumption_registry", None)
+    _add_hard_fn = None
+    if _registry is not None:
+        try:
+            from services.cp_sat.hard_assumption import add_hard as _add_hard_fn
+        except Exception:
+            _add_hard_fn = None
+
     added = 0
     for n_idx, nu in enumerate(rs.nurses):
         T0 = int(join[n_idx])
@@ -112,9 +116,41 @@ def add_monthly_limit_constraints(
                 continue
             c_idx = code_idx[code_upper]
             sumv = sum(X(n_idx, d, c_idx) for d in phys_range)
-            if mn is not None:
-                m.Add(sumv >= mn)
-            if mx is not None:
-                m.Add(sumv <= mx)
+
+            # MUS용 wrap — n_min/n_max/n_exact 모두 같은 nurse의 같은 shift 정책이라
+            # 하나의 assumption literal로 묶음 (per-(nurse, shift))
+            if _add_hard_fn is not None and _registry is not None:
+                _is_exact = ex_raw is not None
+                _meta_value = ex_raw if _is_exact else {"min": mn, "max": mx}
+                _label = f"{code_upper}_exact" if _is_exact else f"{code_upper} ∈ [{mn}, {mx}]"
+                _node_id = f"monthly_limit:{code_upper.lower()}:nurse_{n_idx}"
+                _type = "MonthlyNExactNode" if (code_upper == "N" and _is_exact) else "MonthlyLimitNode"
+                _hint = (
+                    f"이 간호사의 {code_upper}={ex_raw} 정확치를 풀거나 범위로 바꾸세요."
+                    if _is_exact
+                    else f"이 간호사의 {code_upper} 범위 [{mn}, {mx}]를 완화하세요."
+                )
+                _assume_name = f"MonthlyLimit:{code_upper}:nurse_{n_idx}"
+                _meta = {
+                    "node_id": _node_id,
+                    "type": _type,
+                    "label": _label,
+                    "value": _meta_value,
+                    "scope": "nurse",
+                    "scope_key": f"nurse_{n_idx}",
+                    "pattern": f"monthly_limit_{code_upper.lower()}",
+                    "nurse_id": str(getattr(nu, "nurse_id", n_idx)),
+                    "human_message_ko": f"이 간호사의 월 {code_upper} 한도 ({_label})",
+                    "resolution_hint": _hint,
+                }
+                if mn is not None:
+                    _add_hard_fn(m, _registry, name=_assume_name, constraint_expr=(sumv >= mn), meta=_meta)
+                if mx is not None:
+                    _add_hard_fn(m, _registry, name=_assume_name, constraint_expr=(sumv <= mx), meta=_meta)
+            else:
+                if mn is not None:
+                    m.Add(sumv >= mn)
+                if mx is not None:
+                    m.Add(sumv <= mx)
             added += 1
     return added

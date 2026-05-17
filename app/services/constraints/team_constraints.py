@@ -87,6 +87,15 @@ def add_team_min_constraints(
     added_cnt = 0
     skipped_capacity: list[tuple[str, int, str, int, int]] = []  # (tid, day, code, active, min_t)
 
+    # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
+    _registry = getattr(m, "_cpsat_assumption_registry", None)
+    _add_hard_fn = None
+    if _registry is not None and not allow_soft:
+        try:
+            from services.cp_sat.hard_assumption import add_hard as _add_hard_fn
+        except Exception:
+            _add_hard_fn = None
+
     for tid, members in team_members.items():
         if not members:
             continue
@@ -133,7 +142,27 @@ def add_team_min_constraints(
                         "evidence": {"team_id": tid, "day": d + 1, "shift": code, "min_t": min_t},
                     })
                 else:
-                    m.Add(vars_sum >= min_t)
+                    if _add_hard_fn is not None and _registry is not None:
+                        # 같은 (team, shift) 의 모든 day 를 하나의 literal 로 묶음.
+                        _name = f"TeamMin:team_{tid}:{code}"
+                        _meta = {
+                            "node_id": f"team_min:team_{tid}:{code.lower()}",
+                            "type": "TeamMinNode",
+                            "label": f"Team {tid} {code} min ≥ {int(min_t)}",
+                            "value": {"team_id": tid, "shift": code, "min": int(min_t)},
+                            "scope": "team",
+                            "scope_key": f"team_{tid}_{code.lower()}_min",
+                            "pattern": "team_min",
+                            "human_message_ko": f"팀 {tid} 의 {code} 시프트 최소 인원 정책",
+                            "resolution_hint": (
+                                f"팀 {tid} 의 {code} 최소치({int(min_t)}) 를 낮추거나 "
+                                "team_min 을 soft fallback 으로 전환하세요."
+                            ),
+                        }
+                        _add_hard_fn(m, _registry, name=_name,
+                                     constraint_expr=(vars_sum >= min_t), meta=_meta)
+                    else:
+                        m.Add(vars_sum >= min_t)
                     _impact_modes.append({
                         "family": "team_min",
                         "key": f"team_min:{tid}:{d}:{code}",

@@ -46,24 +46,47 @@ def _to_day_index(value: Any, year: int, month: int, days_in_month: int) -> Opti
 
 
 def _allowed_shifts_for(nurse: dict, use_mid: bool) -> Optional[List[str]]:
-    """해당 간호사가 가능한 시프트 코드 집합을 반환한다(공집합/기본=None)."""
-    shifts = nurse.get("work_shifts")
-    if shifts is None:
-        # is_night_nurse=3 → N 전담
-        if int(nurse.get("is_night_nurse", 0) or 0) == 3:
-            return ["N"]
-        return None
-    if isinstance(shifts, str):
-        codes = [c.strip().upper() for c in shifts.split(",") if c.strip()]
-    elif isinstance(shifts, (list, tuple, set)):
-        codes = [str(c).strip().upper() for c in shifts if c]
-    else:
-        return None
+    """해당 간호사가 가능한 시프트 코드 집합을 반환한다(공집합/기본=None).
+
+    현재 schema: ``is_night_nurse`` 는 허용 시프트 코드 list (예: ``["N"]`` = N전담,
+    ``[]`` = 전부 가능). ``work_shifts`` 는 일부 legacy 데이터에서만 채워진다.
+    """
     universe = {"D", "E", "N"}
     if use_mid:
         universe.add("M")
-    cleaned = [c for c in codes if c in universe]
-    return cleaned or None
+
+    def _normalize(raw: object) -> Optional[List[str]]:
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
+        elif isinstance(raw, (list, tuple, set)):
+            codes = [str(c).strip().upper() for c in raw if c is not None and str(c).strip()]
+        else:
+            return None
+        cleaned = [c for c in codes if c in universe]
+        return cleaned or None
+
+    # 현재 schema 우선
+    raw_nights = nurse.get("is_night_nurse")
+    if isinstance(raw_nights, (list, tuple, set)):
+        # 빈 list 는 "제한 없음" — None 으로 둬 universe 전체 허용
+        return _normalize(raw_nights)
+
+    # work_shifts 가 채워진 케이스
+    raw_shifts = nurse.get("work_shifts")
+    if raw_shifts is not None:
+        return _normalize(raw_shifts)
+
+    # 레거시: is_night_nurse 가 int/bool 인 경우
+    if isinstance(raw_nights, bool):
+        return ["N"] if raw_nights else None
+    if isinstance(raw_nights, (int, float)):
+        try:
+            return ["N"] if int(raw_nights) == 3 else None
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _weekly_off_count(weekly_off_weekday: Any, year: int, month: int) -> int:
@@ -218,6 +241,15 @@ def build_precheck_input(
             d: code for d, code in fixed_map.items() if code not in {"O", "OFF"}
         }
 
+        # preceptor 페어링 — preceptor_id 가 있으면 본인이 preceptee
+        raw_ptor = nd.get("preceptor_id")
+        preceptor_id = str(raw_ptor).strip() if raw_ptor not in (None, "", 0) else None
+        # 동기 window 는 nurse data 에 명시되지 않으면 None → check 함수가 join/leave 로 채움
+        ws_start = nd.get("sync_window_start")
+        ws_end = nd.get("sync_window_end")
+        sync_start = _to_day_index(ws_start, year, month, days_in_month) if ws_start else None
+        sync_end = _to_day_index(ws_end, year, month, days_in_month) if ws_end else None
+
         nurses.append(
             PrecheckNurse(
                 nurse_id=nid,
@@ -229,6 +261,9 @@ def build_precheck_input(
                 personal_off_adjustment=personal_off,
                 fixed_off_days=fixed_off_days,
                 fixed_shift_assignments=fixed_shift_assignments,
+                preceptor_id=preceptor_id,
+                sync_window_start=sync_start,
+                sync_window_end=sync_end,
             )
         )
 
@@ -255,6 +290,14 @@ def build_precheck_input(
         "global_monthly_off_days": _safe_int(config_dict.get("global_monthly_off_days"), 0),
         "standard_personal_off_days": _safe_int(config_dict.get("standard_personal_off_days"), 0),
     }
+    # closed-loop apply target keys — 명시되어 있을 때만 forward (precheck 가 cfg 한도 추가 활용)
+    for k in ("max_night_shifts_per_month", "max_consecutive_work"):
+        v = config_dict.get(k)
+        if v is not None:
+            try:
+                roster_config[k] = int(v)
+            except (TypeError, ValueError):
+                pass
 
     return PrecheckInput(
         num_days=days_in_month,

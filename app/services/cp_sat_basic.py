@@ -2072,7 +2072,21 @@ class CPSATBasicEngine:
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
             print('stat', stat)
-            if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE): return False
+            if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE):
+                # CP-SAT INFEASIBLE → assumption registry MUS 추출해서 roster_system에 stash
+                if stat == cp_model.INFEASIBLE:
+                    try:
+                        _reg = getattr(model, "_cpsat_assumption_registry", None)
+                        if _reg is not None:
+                            _cores = _reg.extract_conflict_cores(solver, solver_phase="primary")
+                            if _cores:
+                                rs._cpsat_conflict_cores = (
+                                    list(getattr(rs, "_cpsat_conflict_cores", []) or []) + _cores
+                                )
+                                print(f"[CP-SAT-Basic] MUS conflict cores: {len(_cores)} (총 {len(rs._cpsat_conflict_cores)})")
+                    except Exception as _mus_exc:
+                        print(f"[CP-SAT-Basic] MUS 추출 실패(무시): {_mus_exc}")
+                return False
             rs.roster.fill(0)
             N,D,S=len(rs.nurses),rs.num_days,rs.config.num_shifts
             leave_phys = [min(int(x), D - 1) for x in l]
@@ -2274,6 +2288,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         blocked_by_nurse = getattr(rs, 'blocked_by_nurse', None)
     from ortools.sat.python import cp_model
     m = cp_model.CpModel()
+    # MUS 추출용 hard assumption registry — 정책 hard 제약을 묶어
+    # INFEASIBLE 시 SufficientAssumptionsForInfeasibility() 로 충돌 코어 검출.
+    # add_hard 도 같이 가져와 wrap site 들에서 재import 안 하도록 한다.
+    try:
+        from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard
+        _assume_registry = HardAssumptionRegistry(m)
+        m._cpsat_assumption_registry = _assume_registry  # type: ignore[attr-defined]
+    except Exception as _ar_exc:
+        print(f"[CP-SAT-Basic] HardAssumptionRegistry init failed (ignore): {_ar_exc}")
+        _assume_registry = None
+        _add_hard = None
     D_phys = rs.num_days
     # K_lookahead = int(getattr(rs.config, "lookahead_days", 5) or 0)
     K_lookahead = 5
@@ -2366,7 +2391,41 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     fixed, fixed_cnt = {}, [[0]*S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
+    fixed_source_by_cell: dict[tuple[int, int], str] = {}
     fixed_wanted_cells: set[tuple[int, int]] = set()
+
+    def _normalize_fixed_source(
+        raw_source: object,
+        shift_type: Optional[str],
+        shift_main: str,
+    ) -> str:
+        src = str(raw_source or "").strip().lower()
+        if src:
+            if src == "fixed_wanted":
+                return "fixed_wanted"
+            if src == "2n2off_recovery":
+                return "recovery_2n2off"
+            if src == "3n2off_recovery":
+                return "recovery_3n2off"
+            if src == "recovery_off":
+                return "recovery_off"
+            if src in {"weekly_off", "weekoff", "weekly_off_fixed"}:
+                return "weekly_off"
+            if src in {"special_fixed", "special", "vacation", "leave"}:
+                return "special"
+            return src
+        st = str(shift_type or "").strip()
+        if st == "주휴":
+            return "weekly_off"
+        if st in {"휴가", "공가", "휴무"}:
+            return "special"
+        if shift_main == "O":
+            return "off_fixed"
+        return "manual"
+
+    def _fixed_pattern_from_source(source: str) -> str:
+        return f"fixed_assignment:{source or 'manual'}"
+
     for c in getattr(rs,'fixed_cells',[]) or []:
         n,d = c['nurse_index'], c['day_index']
         s_main = _normalize_fixed_to_main(c.get("shift"))
@@ -2385,6 +2444,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             (c.get("shift_type") or "").strip()
             or code2type.get(raw_code)
             or code2type.get(s_main)
+        )
+        fixed_source_by_cell[(n, d)] = _normalize_fixed_source(
+            c.get("fixed_source"),
+            fixed_type_by_cell[(n, d)],
+            s_main,
         )
         if str(c.get("fixed_source") or "").strip().lower() == "fixed_wanted":
             fixed_wanted_cells.add((n, d))
@@ -2532,15 +2596,62 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
+        _fixed_source = fixed_source_by_cell.get((n, d), "manual")
+        _fixed_pattern = _fixed_pattern_from_source(_fixed_source)
         if (n, d) not in active_days:
             print(f"[CP-SAT-Basic] 고정 셀 무시: n={n}, d={d+1} (퇴사/입사 범위 밖)")
             continue
         # 프리셉티는 고정 셀 스킵 (프리셉터의 스케줄을 따라감, 기간 내만)
         if _is_preceptee_at(n, d):
             continue
-        m.Add(X(n,d,s_idx)==1)
+        _fixed_expr = (X(n, d, s_idx) == 1)
+        if _assume_registry is not None and _add_hard is not None:
+            _add_hard(
+                m,
+                _assume_registry,
+                name=f"FixedCell:nurse_{n}:day_{d}",
+                constraint_expr=_fixed_expr,
+                meta={
+                    "node_id": f"fixed_cell:nurse_{n}:day_{d}",
+                    "type": "FixedWantedNode",
+                    "label": "fixed_assignment",
+                    "value": {"day": d + 1, "shift_idx": int(s_idx)},
+                    "fixed_source": _fixed_source,
+                    "scope": "nurse",
+                    "scope_key": f"nurse_{n}",
+                    "pattern": _fixed_pattern,
+                    "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                    "human_message_ko": f"{d + 1}일 고정 근무를 유지해야 합니다.",
+                    "resolution_hint": "해당 날짜 고정 근무를 해제하거나 충돌 정책을 완화하세요.",
+                },
+            )
+        else:
+            m.Add(_fixed_expr)
         for s in range(S):
-            if s!=s_idx: m.Add(X(n,d,s)==0)
+            if s != s_idx:
+                _ban_expr = (X(n, d, s) == 0)
+                if _assume_registry is not None and _add_hard is not None:
+                    _add_hard(
+                        m,
+                        _assume_registry,
+                        name=f"FixedCellBan:nurse_{n}:day_{d}",
+                        constraint_expr=_ban_expr,
+                        meta={
+                            "node_id": f"fixed_cell_ban:nurse_{n}:day_{d}",
+                            "type": "FixedWantedNode",
+                            "label": "fixed_assignment_exclusive",
+                            "value": {"day": d + 1, "fixed_shift_idx": int(s_idx)},
+                            "fixed_source": _fixed_source,
+                            "scope": "nurse",
+                            "scope_key": f"nurse_{n}",
+                            "pattern": _fixed_pattern,
+                            "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                            "human_message_ko": f"{d + 1}일 고정 근무와 다른 시프트는 금지됩니다.",
+                            "resolution_hint": "고정 근무 또는 다른 하드 제약 중 하나를 조정하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_ban_expr)
     # W(특별 근무)는 고정 셀 외에는 전부 금지
     if has_w and w_idx is not None:
         for n in range(N):
@@ -2549,7 +2660,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 if (n, d) in fixed and fixed[(n, d)] == w_idx:
                     continue
-                m.Add(X(n, d, w_idx) == 0)
+                _w_ban_expr = (X(n, d, w_idx) == 0)
+                if _assume_registry is not None and _add_hard is not None:
+                    _add_hard(
+                        m,
+                        _assume_registry,
+                        name=f"SpecialShiftBanW:nurse_{n}:day_{d}",
+                        constraint_expr=_w_ban_expr,
+                        meta={
+                            "node_id": f"special_shift_ban_w:nurse_{n}:day_{d}",
+                            "type": "ForbiddenCellNode",
+                            "label": "ban_unfixed_w_shift",
+                            "value": {"day": d + 1, "shift": "W"},
+                            "scope": "nurse",
+                            "scope_key": f"nurse_{n}",
+                            "pattern": "forbidden_shift",
+                            "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "고정되지 않은 W(특별 근무)는 배정할 수 없습니다.",
+                            "resolution_hint": "W 배정이 필요하면 해당 셀을 고정 근무로 지정하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_w_ban_expr)
 
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
     # config.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3 → 1~3일 시작 윈도우는 4연속 O 허용)
@@ -2770,7 +2902,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         print(f"[CP-SAT-Basic] 초기 금지 무시 (유저 고정 우선): n={n}, d={d+1}, code={code}, fixed={rs.config.shift_types[fixed[(n,d)]]}")
                         continue
                     for s_idx in target_indices:
-                        m.Add(X(n,d,s_idx)==0)
+                        _if_expr = (X(n, d, s_idx) == 0)
+                        if _assume_registry is not None and _add_hard is not None:
+                            _add_hard(
+                                m,
+                                _assume_registry,
+                                name=f"InitialForbidden:nurse_{n}:day_{d}",
+                                constraint_expr=_if_expr,
+                                meta={
+                                    "node_id": f"initial_forbidden:nurse_{n}:day_{d}",
+                                    "type": "ForbiddenCellNode",
+                                    "label": "initial_forbidden_shift",
+                                    "value": {"day": d + 1, "shift": code},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "initial_forbidden",
+                                    "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": f"초기 금지 규칙에 의해 {d + 1}일 {code} 배정이 금지됩니다.",
+                                    "resolution_hint": "초기 금지 규칙을 해제하거나 다른 하드 제약을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_if_expr)
     except Exception as e:
         print(f"[CP-SAT-Basic] 초기 금지 셀 적용 중 오류: {e}")
 
@@ -2932,9 +3085,27 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 continue
-            # min 제약: assigned >= need (하드)
+            # min 제약: assigned >= need (하드) — MUS 추출용 wrap
             if need > 0:
-                m.Add(assigned >= need)
+                _cov_min_expr = (assigned >= need)
+                if _assume_registry is not None:
+                    _add_hard(
+                        m, _assume_registry,
+                        name=f"CoverageMin:day_{d}:shift_{code}",
+                        constraint_expr=_cov_min_expr,
+                        meta={
+                            "node_id": f"coverage:min:{d}:{code}",
+                            "type": "CoverageMinNode",
+                            "label": f"day {d+1} {code} 최소 인원",
+                            "value": need,
+                            "scope": "cell", "scope_key": f"day_{d}_shift_{code}",
+                            "pattern": "coverage_min",
+                            "human_message_ko": f"day {d+1} {code} 시프트 최소 {need}명 필요",
+                            "resolution_hint": f"day {d+1} {code} 시프트 최소 인원을 줄이거나 가용 nurse 확대.",
+                        },
+                    )
+                else:
+                    m.Add(_cov_min_expr)
             # max 제약: hard (상한 초과 불가)
             if need_max > 0:
                 m.Add(assigned <= need_max)
@@ -3255,7 +3426,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if not free_days:
                         print(f"[CP-SAT-Basic] off_window 무시 (유저 고정 우선): n={n}, window=[{left+1},{right+1}] 전체 고정")
                         continue
-                    m.Add(sum(X(n, d, off_idx_full) for d in free_days) >= 1)
+                        _ow_expr = (sum(X(n, d, off_idx_full) for d in free_days) >= 1)
+                        if _assume_registry is not None and _add_hard is not None:
+                            _add_hard(
+                                m,
+                                _assume_registry,
+                                name=f"OffWindowRequirement:nurse_{n}:left_{left}:right_{right}",
+                                constraint_expr=_ow_expr,
+                                meta={
+                                    "node_id": f"off_window_requirement:nurse_{n}:left_{left}:right_{right}",
+                                    "type": "OffWindowNode",
+                                    "label": "off_window_min_off",
+                                    "value": {"left_day": left + 1, "right_day": right + 1},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "off_window_requirement",
+                                    "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "월초 보정 구간 내 최소 1회 OFF가 필요합니다.",
+                                    "resolution_hint": "해당 구간의 고정 근무를 일부 해제하거나 OFF 배정 여유를 확보하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_ow_expr)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
         # 연속 근무 K+1 중 OFF ≥1 (HARD: 주말 휴무자 포함, 월경계 연속근무 초과 방지)
@@ -3270,22 +3462,129 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 continue
             if any((n, d) in fixed and fixed[(n, d)] == off for d in window):
                 continue
-            m.Add(sum(X(n, d, off) for d in window) >= 1)
+            _mcw_expr = (sum(X(n, d, off) for d in window) >= 1)
+            if _assume_registry is not None and _add_hard is not None:
+                _add_hard(
+                    m,
+                    _assume_registry,
+                    name=f"MaxConsecutiveWorkWindow:nurse_{n}:start_{d0}:k_{K}",
+                    constraint_expr=_mcw_expr,
+                    meta={
+                        "node_id": f"max_consecutive_work:nurse_{n}:start_{d0}:k_{K}",
+                        "type": "ConsecutiveWorkNode",
+                        "label": "max_consecutive_work_min_off",
+                        "value": {"start_day": d0 + 1, "window_size": K + 1},
+                        "scope": "nurse",
+                        "scope_key": f"nurse_{n}",
+                        "pattern": "max_consecutive_work",
+                        "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                        "human_message_ko": "연속 근무 제한 구간(K+1)에는 최소 1회 OFF가 필요합니다.",
+                        "resolution_hint": "연속 근무 구간의 고정 배정을 완화하거나 OFF를 추가하세요.",
+                    },
+                )
+            else:
+                m.Add(_mcw_expr)
 
         # E→D, N→D, N→E
+        from services.constraint_impact.solver_emit import get_or_attach_recorder as _get_emit_recorder
+        _emit_rec = _get_emit_recorder(rs)
         for d in range(T0+1, T1+1):
             if getattr(cfg, "ban_n_to_d", True):
-                # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
-                if not (fixed.get((n, d-1)) == night and fixed.get((n, d)) == day):
-                    m.Add(X(n,d,day)+X(n,d-1,night)<=1)  # N→D 금지
+                _bypassed = (fixed.get((n, d-1)) == night and fixed.get((n, d)) == day)
+                if not _bypassed:
+                    _n2d_expr = (X(n, d, day) + X(n, d - 1, night) <= 1)
+                    if _assume_registry is not None and _add_hard is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"TransitionBanN2D:nurse_{n}:day_{d}",
+                            constraint_expr=_n2d_expr,
+                            meta={
+                                "node_id": f"transition_ban_n2d:nurse_{n}:day_{d}",
+                                "type": "TransitionBanNode",
+                                "label": "ban_n_to_d",
+                                "value": {"day": d + 1, "transition": "N->D"},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "transition_ban",
+                                "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "N 다음날 D 전이는 금지됩니다.",
+                                "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_n2d_expr)
+                _emit_rec.emit(
+                    family="BoundaryTransitionBan",
+                    scope={"nurse_index": n, "day": d + 1, "transition": "N->D"},
+                    target="forbid",
+                    mode="bypassed_by_fixed" if _bypassed else "enforced",
+                    related_atom_keys=[(n, d - 1), (n, d)],
+                )
             if getattr(cfg, "ban_e_to_d", True):
-                # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
-                if not (fixed.get((n, d-1)) == eve and fixed.get((n, d)) == day):
-                    m.Add(X(n,d,day)+X(n,d-1,eve)<=1)   # E→D 금지
+                _bypassed = (fixed.get((n, d-1)) == eve and fixed.get((n, d)) == day)
+                if not _bypassed:
+                    _e2d_expr = (X(n, d, day) + X(n, d - 1, eve) <= 1)
+                    if _assume_registry is not None and _add_hard is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"TransitionBanE2D:nurse_{n}:day_{d}",
+                            constraint_expr=_e2d_expr,
+                            meta={
+                                "node_id": f"transition_ban_e2d:nurse_{n}:day_{d}",
+                                "type": "TransitionBanNode",
+                                "label": "ban_e_to_d",
+                                "value": {"day": d + 1, "transition": "E->D"},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "transition_ban",
+                                "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "E 다음날 D 전이는 금지됩니다.",
+                                "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_e2d_expr)
+                _emit_rec.emit(
+                    family="BoundaryTransitionBan",
+                    scope={"nurse_index": n, "day": d + 1, "transition": "E->D"},
+                    target="forbid",
+                    mode="bypassed_by_fixed" if _bypassed else "enforced",
+                    related_atom_keys=[(n, d - 1), (n, d)],
+                )
             if getattr(cfg, "ban_n_to_e", True):
-                # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
-                if not (fixed.get((n, d-1)) == night and fixed.get((n, d)) == eve):
-                    m.Add(X(n,d,eve)+X(n,d-1,night)<=1) # N→E 금지
+                _bypassed = (fixed.get((n, d-1)) == night and fixed.get((n, d)) == eve)
+                if not _bypassed:
+                    _n2e_expr = (X(n, d, eve) + X(n, d - 1, night) <= 1)
+                    if _assume_registry is not None and _add_hard is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"TransitionBanN2E:nurse_{n}:day_{d}",
+                            constraint_expr=_n2e_expr,
+                            meta={
+                                "node_id": f"transition_ban_n2e:nurse_{n}:day_{d}",
+                                "type": "TransitionBanNode",
+                                "label": "ban_n_to_e",
+                                "value": {"day": d + 1, "transition": "N->E"},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "transition_ban",
+                                "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "N 다음날 E 전이는 금지됩니다.",
+                                "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_n2e_expr)
+                _emit_rec.emit(
+                    family="BoundaryTransitionBan",
+                    scope={"nurse_index": n, "day": d + 1, "transition": "N->E"},
+                    target="forbid",
+                    mode="bypassed_by_fixed" if _bypassed else "enforced",
+                    related_atom_keys=[(n, d - 1), (n, d)],
+                )
             if mid is not None:
                 m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
             # if getattr(cfg, "ban_d_to_n", True):
@@ -3299,19 +3598,151 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             is_n_only = allowed == {"N"}
             for d in range(T0, T1 + 1):
                 if "D" not in allowed:
-                    m.Add(X(n, d, day) == 0)
+                    _allow_d_expr = (X(n, d, day) == 0)
+                    if _assume_registry is not None and _add_hard is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"AllowedShiftMaskBanD:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_d_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_D",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "D", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 D 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_d_expr)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "D"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
                 if "E" not in allowed:
-                    m.Add(X(n, d, eve) == 0)
+                    _allow_e_expr = (X(n, d, eve) == 0)
+                    if _assume_registry is not None and _add_hard is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"AllowedShiftMaskBanE:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_e_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_E",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "E", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 E 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_e_expr)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "E"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
                 if "N" not in allowed:
-                    m.Add(X(n, d, night) == 0)
+                    _allow_n_expr = (X(n, d, night) == 0)
+                    if _assume_registry is not None and _add_hard is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"AllowedShiftMaskBanN:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_n_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_N",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "N", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 N 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_n_expr)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "N"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
                 if mid is not None and "M" not in allowed:
-                    m.Add(X(n, d, mid) == 0)
+                    _allow_m_expr = (X(n, d, mid) == 0)
+                    if _assume_registry is not None and _add_hard is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"AllowedShiftMaskBanM:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_m_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_M",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "M", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(rs.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 M 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_m_expr)
+                    _emit_rec.emit(
+                        family="AllowedShiftMask",
+                        scope={"nurse_index": n, "day": d + 1, "shift": "M"},
+                        target="forbid",
+                        mode="enforced",
+                        related_atom_keys=[(n, d)],
+                        metadata={"allowed": sorted(allowed)},
+                    )
 
         if n not in n_forbid_n:
             # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
             # 단 nurse_monthly_limit.n_max==1 nurse 는 면제 (사용자 명시 의도 우선).
-            # print(f"[NotOneNight] not_one_night: {bool(getattr(cfg, 'not_one_night', False))}")
             if bool(getattr(cfg, "not_one_night", False)) and n not in _single_n_allowed:
+                # MUS용 assumption literal — 이 nurse의 1N 금지 정책 binding 여부 식별
+                _assume_no1n = None
+                if _assume_registry is not None:
+                    _assume_no1n = _assume_registry.create_literal(
+                        f"NotOneNight:nurse_{n}",
+                        meta={
+                            "node_id": f"not_one_night:nurse_{n}",
+                            "type": "NotOneNightNode",
+                            "label": "1N 단독 금지",
+                            "value": True,
+                            "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "not_one_night",
+                            "nurse_id": str(getattr(nu, "nurse_id", n)),
+                            "human_message_ko": "야간(N) 단독 박힘 금지 (인접일 중 ≥1일 N 필요)",
+                            "resolution_hint": "이 간호사의 n_max 한도를 1로 설정하면 1N 금지에서 면제됩니다.",
+                        },
+                    )
                 for d in range(T0, T1 + 1):
                     if d == T1:
                         continue
@@ -3326,7 +3757,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         neighbors.append(X(n, d + 1, night))
                     if not neighbors:
                         continue
-                    m.Add(X(n, d, night) <= sum(neighbors))
+                    if _assume_no1n is not None:
+                        m.Add(X(n, d, night) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n)
+                    else:
+                        m.Add(X(n, d, night) <= sum(neighbors))
+                    _emit_rec.emit(
+                        family="NotOneNight",
+                        scope={"nurse_index": n, "day": d + 1},
+                        target="implies_neighbor_n",
+                        mode="enforced",
+                        related_atom_keys=[(n, dd) for dd in (d - 1, d, d + 1) if T0 <= dd <= T1],
+                    )
 
             # 휴가/공가 fixed 셀의 직전일 N 금지 (하드, 휴가/공가 보호 정책).
             # fixed_wanted O / 휴무 / 주휴 등은 사용자 자발 OFF 또는 자동 OFF 라 대상 외.
@@ -3346,8 +3787,23 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if blocked_by_nurse and prev_d in blocked_by_nurse.get(n, set()):
                         continue
                     if (n, prev_d) in fixed:
+                        _emit_rec.emit(
+                            family="BanNightBeforeFixedOff",
+                            scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type},
+                            target="forbid_prev_day_night",
+                            mode="bypassed_by_fixed",
+                            related_atom_keys=[(n, prev_d), (n, d)],
+                            metadata={"prev_fixed_present": True},
+                        )
                         continue  # 이미 고정된 셀은 변경 불가
                     m.Add(X(n, prev_d, night) == 0)
+                    _emit_rec.emit(
+                        family="BanNightBeforeFixedOff",
+                        scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type},
+                        target="forbid_prev_day_night",
+                        mode="enforced",
+                        related_atom_keys=[(n, prev_d), (n, d)],
+                    )
                     _ban_n_cnt += 1
                 if _ban_n_cnt > 0:
                     print(f"[CP-SAT-Basic] [BanNBeforeFixedOff] nurse_idx={n}: {_ban_n_cnt}건 N 금지")
@@ -3378,17 +3834,78 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     days_in_window = list(range(T0, min(T0 + april_window_end + 1, T1 + 1)))
                     if days_in_window:
-                        m.Add(sum(X(n, d, night) for d in days_in_window) <= cap)
+                        _cn_month_edge_expr = (sum(X(n, d, night) for d in days_in_window) <= cap)
+                        if _assume_registry is not None and _add_hard is not None:
+                            _add_hard(
+                                m,
+                                _assume_registry,
+                                name=f"ConsecutiveNightCapEdge:nurse_{n}:w_{w}",
+                                constraint_expr=_cn_month_edge_expr,
+                                meta={
+                                    "node_id": f"consecutive_night_cap_edge:nurse_{n}:w_{w}",
+                                    "type": "ConsecutiveNightCapNode",
+                                    "label": "consecutive_night_cap_edge",
+                                    "value": {"window_len": len(days_in_window), "cap": int(cap)},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "consecutive_night_cap",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "월경계 연속 야간 상한을 초과할 수 없습니다.",
+                                    "resolution_hint": "해당 구간의 N 고정을 완화하거나 야간 배정을 분산하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_cn_month_edge_expr)
             for d0 in range(T0, T1 - L + 1):
-                m.Add(sum(X(n, d0 + t, night) for t in range(L + 1)) <= L)
+                _cn_expr = (sum(X(n, d0 + t, night) for t in range(L + 1)) <= L)
+                if _assume_registry is not None and _add_hard is not None:
+                    _add_hard(
+                        m,
+                        _assume_registry,
+                        name=f"ConsecutiveNightCap:nurse_{n}:start_{d0}:L_{L}",
+                        constraint_expr=_cn_expr,
+                        meta={
+                            "node_id": f"consecutive_night_cap:nurse_{n}:start_{d0}:L_{L}",
+                            "type": "ConsecutiveNightCapNode",
+                            "label": "consecutive_night_cap",
+                            "value": {"start_day": d0 + 1, "window_size": L + 1, "cap": int(L)},
+                            "scope": "nurse",
+                            "scope_key": f"nurse_{n}",
+                            "pattern": "consecutive_night_cap",
+                            "nurse_id": str(getattr(nu, "nurse_id", n)),
+                            "human_message_ko": "연속 야간 상한을 초과할 수 없습니다.",
+                            "resolution_hint": "연속 야간 구간의 고정을 완화하거나 다른 간호사로 분산하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_cn_expr)
 
-            # 월 Night 상한 (당월 D_phys만 합산)
+            # 월 Night 상한 (당월 D_phys만 합산) — MUS 추출용 assumption literal로 wrap
             phys_range_night = month_total_day_range(T0, T1, D_phys)
             if phys_range_night:
-                m.Add(
+                _mn_expr = (
                     sum(X(n, d, night) for d in phys_range_night)
                     <= cfg.max_night_shifts_per_month
                 )
+                if _assume_registry is not None:
+                    _add_hard(
+                        m, _assume_registry,
+                        name=f"MaxNight:nurse_{n}",
+                        constraint_expr=_mn_expr,
+                        meta={
+                            "node_id": f"max_night:nurse_{n}",
+                            "type": "NightCapNode",
+                            "label": "max_night_shifts_per_month",
+                            "value": int(cfg.max_night_shifts_per_month or 0),
+                            "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "max_night",
+                            "nurse_id": str(getattr(nu, "nurse_id", n)),
+                            "human_message_ko": f"월간 N 상한 {int(cfg.max_night_shifts_per_month or 0)}일",
+                            "resolution_hint": f"월간 N 상한을 늘리거나 이 간호사의 N 부담을 다른 인력에 분산하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_mn_expr)
 
             # 월별 개인 shift/off 제한은 모듈에서 한 번에 처리 (인라인 제거)
 
@@ -3536,7 +4053,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             max(0, avail_days - 15),
                             nonvac_active_days,
                         )
-                        m.Add(
+                        _off_cap_expr = (
                             sum(
                                 X(n, d, off)
                                 for d in phys_range_off
@@ -3544,6 +4061,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             )
                             <= max_off_allowed_n_only
                         )
+                        if _assume_registry is not None:
+                            _add_hard(
+                                m, _assume_registry,
+                                name=f"OffCap:nurse_{n}",
+                                constraint_expr=_off_cap_expr,
+                                meta={
+                                    "node_id": f"off_cap:nurse_{n}",
+                                    "type": "OffCapNode",
+                                    "label": "max_off (effective, N-only)",
+                                    "value": max_off_allowed_n_only,
+                                    "scope": "nurse", "scope_key": f"nurse_{n}",
+                                    "pattern": "off_cap",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": (
+                                        f"이 간호사 OFF 상한 {max_off_allowed_n_only}일 "
+                                        f"(N-only 공식: avail_days({avail_days}) - 15)"
+                                    ),
+                                    "resolution_hint": f"이 간호사 OFF 상한을 늘리세요 (또는 N-only role을 다중 시프트로 변경).",
+                                },
+                            )
+                        else:
+                            m.Add(_off_cap_expr)
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
                             f"cap_semantics={off_cap_semantics}, is_n_only=1, vac_cnt={vacation_cnt}, "
@@ -3592,7 +4131,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 nonvac_active_days,
                             )
                             max_off_allowed = max(max_off_allowed, min_off_required)
-                        m.Add(
+                        _off_cap_expr_reg = (
                             sum(
                                 X(n, d, off)
                                 for d in phys_range_off
@@ -3600,6 +4139,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             )
                             <= max_off_allowed
                         )
+                        if _assume_registry is not None:
+                            _add_hard(
+                                m, _assume_registry,
+                                name=f"OffCap:nurse_{n}",
+                                constraint_expr=_off_cap_expr_reg,
+                                meta={
+                                    "node_id": f"off_cap:nurse_{n}",
+                                    "type": "OffCapNode",
+                                    "label": "max_off (effective)",
+                                    "value": max_off_allowed,
+                                    "scope": "nurse", "scope_key": f"nurse_{n}",
+                                    "pattern": "off_cap",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": f"이 간호사 OFF 상한 {max_off_allowed}일",
+                                    "resolution_hint": "이 간호사 OFF 상한을 늘리세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_off_cap_expr_reg)
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
                             f"cap_semantics={off_cap_semantics}, off_first={_off_first}, vac_cnt={vacation_cnt}, "
@@ -3620,19 +4178,70 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
             n_offs_after_3n = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
             _blocked_3n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+            # MUS용 assumption literal — 이 nurse의 3N2OFF 회복 정책 binding 여부 식별
+            _assume_3n2off = None
+            if _assume_registry is not None:
+                _assume_3n2off = _assume_registry.create_literal(
+                    f"Recovery3N2OFF:nurse_{n}",
+                    meta={
+                        "node_id": f"recovery_3n2off:nurse_{n}",
+                        "type": "RecoveryOffNode",
+                        "label": "3N 후 2OFF 회복",
+                        "value": "3N→2OFF",
+                        "scope": "nurse", "scope_key": f"nurse_{n}",
+                        "pattern": "recovery_3n2off",
+                        "nurse_id": str(getattr(nu, "nurse_id", n)),
+                        "human_message_ko": "3N 연속 뒤 2OFF 회복 강제",
+                        "resolution_hint": "3N 후 2OFF 회복 정책(two_offs_after_three_nig)을 끄거나 완화하세요.",
+                    },
+                )
             _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
             if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                 end_prev_block = m.NewBoolVar(f"end_3n_prev_{n}")
                 m.Add(end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
                     if _3n_rem >= 2:
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_3n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) == 2)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery3N2OFF:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_3n2off:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 3N2OFF boundary",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 2},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 3N 꼬리로 월초 2OFF 회복이 필요합니다.",
+                                    "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block])
                     else:
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) >= 1
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_3n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) >= 1)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery3N2OFFPartial:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_3n2off_partial:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 3N2OFF boundary partial",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 1},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 3N 꼬리 회복 OFF가 월초에 추가로 필요합니다.",
+                                    "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block])
                 print(f"[CP-SAT-Basic] [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
             elif n_tail >= 3 and _3n_rem == 0:
@@ -3640,31 +4249,102 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                       f"offs_after={n_offs_after_3n} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
             if n_tail >= 2 and n_offs_after_3n < 2 and (T0 + 2) <= T1:
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
-                    m.Add(
-                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                    ).OnlyEnforceIf([X(n, T0, night)])
+                    _expr_3n_tail2 = (countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2)
+                    if _assume_registry is not None:
+                        _co_lit = _assume_registry.create_literal(
+                            f"CarryoverRecovery3N2OFFTail2:nurse_{n}:day_{T0}",
+                            meta={
+                                "node_id": f"carryover_recovery_3n2off_tail2:nurse_{n}:day_{T0}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "prev_month 3N2OFF boundary tail2",
+                                "value": {"day": T0 + 2, "remaining_off_needed": 2},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "전월 N 꼬리로 월초 회복 OFF 2일이 필요합니다.",
+                                "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                            },
+                        )
+                        m.Add(_expr_3n_tail2).OnlyEnforceIf([X(n, T0, night), _co_lit])
+                    else:
+                        m.Add(_expr_3n_tail2).OnlyEnforceIf([X(n, T0, night)])
             if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 2, T0 + 3)):
-                    m.Add(
-                        countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2
-                    ).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
+                    _expr_3n_tail1 = (countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2)
+                    if _assume_registry is not None:
+                        _co_lit = _assume_registry.create_literal(
+                            f"CarryoverRecovery3N2OFFTail1:nurse_{n}:day_{T0}",
+                            meta={
+                                "node_id": f"carryover_recovery_3n2off_tail1:nurse_{n}:day_{T0}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "prev_month 3N2OFF boundary tail1",
+                                "value": {"day": T0 + 3, "remaining_off_needed": 2},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "전월 N 꼬리 회복을 위해 월초 OFF 2일이 필요합니다.",
+                                "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                            },
+                        )
+                        m.Add(_expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night), _co_lit])
+                    else:
+                        m.Add(_expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
                 if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
                     # 회복 OFF 슬롯에 non-OFF fixed_wanted → 3N 블록 자체를 금지
-                    m.Add(
-                        X(n, d, night) + X(n, d - 1, night) + X(n, d - 2, night) <= 2
-                    )
+                    _guard_3n_expr = (X(n, d, night) + X(n, d - 1, night) + X(n, d - 2, night) <= 2)
+                    if _assume_registry is not None:
+                        _add_hard(
+                            m,
+                            _assume_registry,
+                            name=f"CarryoverRecovery3N2OFFGuard:nurse_{n}:day_{d}",
+                            constraint_expr=_guard_3n_expr,
+                            meta={
+                                "node_id": f"carryover_recovery_3n2off_guard:nurse_{n}:day_{d}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "carryover 3N block guard",
+                                "value": {"day": d + 1, "blocked_by_fixed": True},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "회복 OFF 슬롯 고정과 3N 블록이 충돌합니다.",
+                                "resolution_hint": "해당 고정 배정 또는 회복 규칙을 조정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_guard_3n_expr)
                     continue
+                _enforce_3n = [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
+                if _assume_3n2off is not None:
+                    _enforce_3n.append(_assume_3n2off)
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
-                ).OnlyEnforceIf(
-                    [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
-                )
+                ).OnlyEnforceIf(_enforce_3n)
         if cfg.two_offs_after_two_nig and n not in n_forbid_n and not getattr(cfg, '_2n2off_pre_injected', False):
             n_tail = getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0)
             n_offs_after = getattr(rs, "prev_month_n_offs_after_by_idx", {}).get(n, 0)
             _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+            # MUS용 assumption literal — 이 nurse의 2N2OFF 회복 정책 binding 여부 식별
+            _assume_2n2off = None
+            if _assume_registry is not None:
+                _assume_2n2off = _assume_registry.create_literal(
+                    f"Recovery2N2OFF:nurse_{n}",
+                    meta={
+                        "node_id": f"recovery_2n2off:nurse_{n}",
+                        "type": "RecoveryOffNode",
+                        "label": "2N 후 2OFF 회복",
+                        "value": "2N→2OFF",
+                        "scope": "nurse", "scope_key": f"nurse_{n}",
+                        "pattern": "recovery_2n2off",
+                        "nurse_id": str(getattr(nu, "nurse_id", n)),
+                        "human_message_ko": "2N 연속 뒤 2OFF 회복 강제",
+                        "resolution_hint": "2N 후 2OFF 회복 정책(two_offs_after_two_nig)을 끄거나 완화하세요.",
+                    },
+                )
             # 전월 N tail 뒤 이미 소비된 OFF 수를 반영: req_offs(2) - offs_after 만큼만 현월에서 추가 필요
             _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
             if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
@@ -3672,14 +4352,48 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 m.Add(end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
                     if _2n_rem >= 2:
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) == 2
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_2n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) == 2)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery2N2OFF:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_2n2off:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 2N2OFF boundary",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 2},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 2N 꼬리로 월초 2OFF 회복이 필요합니다.",
+                                    "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block])
                     else:
                         # _2n_rem == 1: 1개만 추가 필요
-                        m.Add(
-                            countable_off(n, T0) + countable_off(n, T0 + 1) >= 1
-                        ).OnlyEnforceIf([end_prev_block])
+                        _co_2n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) >= 1)
+                        if _assume_registry is not None:
+                            _co_lit = _assume_registry.create_literal(
+                                f"CarryoverRecovery2N2OFFPartial:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_2n2off_partial:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 2N2OFF boundary partial",
+                                    "value": {"day": T0 + 1, "remaining_off_needed": 1},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                    "human_message_ko": "전월 2N 꼬리 회복 OFF가 월초에 추가로 필요합니다.",
+                                    "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                },
+                            )
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                        else:
+                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block])
                 print(f"[CP-SAT-Basic] [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after}, rem={_2n_rem}")
             elif n_tail >= 2 and _2n_rem == 0:
@@ -3689,9 +4403,29 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
                 m.Add(end_block_b0 == X(n, T0 + 1, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
-                    m.Add(
-                        countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2
-                    ).OnlyEnforceIf([X(n, T0, night), end_block_b0])
+                    _enforce_2n_b0 = [X(n, T0, night), end_block_b0]
+                    if _assume_2n2off is not None:
+                        _enforce_2n_b0.append(_assume_2n2off)
+                    _expr_2n_b0 = (countable_off(n, T0 + 1) + countable_off(n, T0 + 2) == 2)
+                    if _assume_registry is not None:
+                        _co_lit = _assume_registry.create_literal(
+                            f"CarryoverRecovery2N2OFFBoundary:nurse_{n}:day_{T0}",
+                            meta={
+                                "node_id": f"carryover_recovery_2n2off_boundary:nurse_{n}:day_{T0}",
+                                "type": "CarryoverTransitionNode",
+                                "label": "prev_month 2N2OFF boundary enforce",
+                                "value": {"day": T0 + 2, "remaining_off_needed": 2},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "carryover_boundary",
+                                "nurse_id": str(getattr(nu, "nurse_id", n)),
+                                "human_message_ko": "전월 2N 꼬리 회복 OFF가 월초에 강제됩니다.",
+                                "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                            },
+                        )
+                        m.Add(_expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0 + [_co_lit])
+                    else:
+                        m.Add(_expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0)
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)
@@ -3806,6 +4540,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     except Exception as _err:
         print(f"[WARN] per_nurse_target_terms skipped: {_err}")
     m.Maximize(sum(obj))
+
+    # assumption literal 등록 완료 — INFEASIBLE 시 MUS 추출 가능 상태로 만든다.
+    if _assume_registry is not None:
+        _assume_registry.attach_to_model()
+        print(f"[CP-SAT-Basic] HardAssumption registry: {len(_assume_registry._by_name)} assumption literals attached")
 
     return m, X, join, leave, fixed
 
