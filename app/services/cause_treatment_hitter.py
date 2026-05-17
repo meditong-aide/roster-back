@@ -26,6 +26,8 @@ from services.cost_model import compute_treatment_cost
 from services.semantics.ontology import (
     ConstraintOntology,
     OntologyTreatment,
+    friendly_config_key_label,
+    friendly_direction_label,
     get_default_ontology,
 )
 
@@ -41,6 +43,9 @@ class TreatmentChoice:
     trade_off_ko: str
     cost: float
     covers: list[str] = field(default_factory=list)
+    # 사용자 dashboard 노출용 친화 라벨 (raw key/direction 의 한국어 alias)
+    config_key_label_ko: str | None = None
+    direction_label_ko: str | None = None
 
 
 @dataclass(slots=True)
@@ -204,6 +209,8 @@ def enumerate_minimal_hitting_sets_brute_force(
                 trade_off_ko=t.trade_off_ko,
                 cost=treatment_to_cost[tid],
                 covers=sorted(treatment_to_causes[tid] & universe),
+                config_key_label_ko=friendly_config_key_label(t.config_key),
+                direction_label_ko=friendly_direction_label(t.direction),
             ))
         total_cost = sum(t.cost for t in treatments)
         bundles.append(Bundle(
@@ -262,6 +269,8 @@ def _greedy_set_cover(
             trade_off_ko=t_obj.trade_off_ko,
             cost=treatment_to_cost[best_tid],
             covers=sorted(new_covered),
+            config_key_label_ko=friendly_config_key_label(t_obj.config_key),
+            direction_label_ko=friendly_direction_label(t_obj.direction),
         ))
         uncovered -= new_covered
 

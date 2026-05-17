@@ -26,6 +26,8 @@ from services.cause_treatment_hitter import Bundle
 from services.semantics.ontology import (
     ConstraintOntology,
     OntologyCause,
+    friendly_config_key_label,
+    friendly_direction_label,
     get_default_ontology,
 )
 
@@ -261,7 +263,9 @@ def narrative_to_dict(msg: NarrativeMessage) -> dict[str, Any]:
                 "target_family": a.target_family,
                 "action_type": a.action_type,
                 "config_key": a.config_key,
+                "config_key_label_ko": friendly_config_key_label(a.config_key),
                 "direction": a.direction,
+                "direction_label_ko": friendly_direction_label(a.direction),
                 "rationale_ko": a.rationale_ko,
                 "covers_causes": a.covers_causes,
             }

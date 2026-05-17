@@ -3097,8 +3097,10 @@ _HTML_V2 = """<!doctype html>
     acts.slice(0, 6).forEach(a => {
       const it = el('div', 'item');
       it.appendChild(el('div', 'text', a.rationale_ko || a.treatment_id));
-      if (a.config_key && a.direction) {
-        it.appendChild(el('span', 'config-row', `${a.config_key} → ${a.direction}`));
+      const keyLabel = a.config_key_label_ko || a.config_key;
+      const dirLabel = a.direction_label_ko || a.direction;
+      if (keyLabel && dirLabel) {
+        it.appendChild(el('span', 'config-row', `${keyLabel} → ${dirLabel}`));
       } else if (a.action_type === 'data_correction_required') {
         it.appendChild(el('span', 'config-row', '수동 점검'));
       }

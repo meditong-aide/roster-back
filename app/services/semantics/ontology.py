@@ -87,6 +87,53 @@ class OntologyTreatment:
     applies_to_causes: list[str] = field(default_factory=list)
 
 
+# ── 친화 라벨링 (사용자 dashboard 노출용) ─────────────────────────────────
+# raw setting key 가 사용자에게 jargon 으로 보이지 않도록 한국어 운영 어휘로 매핑.
+# yaml 미수정 — 코드 측 중앙 사전.
+CONFIG_KEY_LABELS_KO: dict[str, str] = {
+    "_force_grade_max_soft_fallback": "등급 상한 soft 전환",
+    "_force_grade_min_soft_fallback": "등급 최저 soft 전환",
+    "team_min_soft_fallback":         "팀 최소 soft 전환",
+    "team_handoff_soft_fallback":     "팀 인계 soft 전환",
+    "team_min_by_team":               "팀 최소 인원",
+    "daily_shift_requirements":       "일별 시프트 요구 인원",
+    "max_night_shifts_per_month":     "월 야간 한도",
+    "max_consecutive_work_days":      "최대 연속 근무일",
+    "ban_n_to_d":                     "야간→주간 전이 금지",
+    "ban_night_before_fixed_off":     "고정 OFF 직전 N 금지",
+    "two_offs_after_two_nig":         "2N 후 2일 OFF 규칙",
+    "weekend_off_only_enable":        "주말 OFF 전용 정책",
+    "allowed_shifts":                 "가능 시프트 목록",
+    "prev_month_schedule":            "전월 근무표",
+    "preceptee_pair":                 "프리셉터-프리셉티 페어",
+    "nurse_assignment":               "간호사 배정 (파견 등)",
+}
+
+DIRECTION_LABELS_KO: dict[str, str] = {
+    "enable":     "활성화",
+    "disable":    "비활성화",
+    "increase":   "상향",
+    "decrease":   "하향",
+    "clear":      "초기화",
+    "remove_key": "특정 키 제거",
+    "manual":     "수동 점검",
+}
+
+
+def friendly_config_key_label(config_key: str | None) -> str | None:
+    """raw config_key → 사용자 친화 라벨. 미정의 키는 raw 그대로 반환."""
+    if not config_key:
+        return None
+    return CONFIG_KEY_LABELS_KO.get(config_key, config_key)
+
+
+def friendly_direction_label(direction: str | None) -> str | None:
+    """raw direction → 사용자 친화 라벨."""
+    if not direction:
+        return None
+    return DIRECTION_LABELS_KO.get(direction, direction)
+
+
 class ConstraintOntology:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path else Path(__file__).with_name("ontology.yaml")
