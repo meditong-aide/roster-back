@@ -246,6 +246,7 @@ def _seed_test_db(db: Session):
     for nurse_id, is_sub in [("N001", True), ("N002", True), ("N003", False)]:
         db.add(WantedRequest(
             nurse_id=nurse_id, request_id=1, month="2026-04",
+            group_id="GRP001",
             is_submitted=is_sub,
             submitted_at=datetime(2026, 3, 20) if is_sub else None,
         ))
@@ -258,6 +259,7 @@ def _seed_test_db(db: Session):
                 nurse_id=nurse_id, request_id=1,
                 detailed_request_id=day,
                 shift_date=date(2026, 4, day),
+                group_id="GRP001",
                 shift=shift, score=1.0,
             ))
     db.flush()

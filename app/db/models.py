@@ -589,6 +589,7 @@ class WantedRequest(Base):
     nurse_id = Column(VARCHAR(50), primary_key=True)
     request_id = Column(INTEGER, primary_key=True)
     month = Column(CHAR(7), primary_key=True)  # 'YYYY-MM'
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
     request = Column(TEXT, nullable=True)
     is_submitted = Column(TINYINT(1), nullable=False, default=0)
     created_at = Column(DATETIME, nullable=False, default=func.now())
@@ -601,6 +602,7 @@ class NurseShiftRequest(Base):
     request_id = Column(INTEGER, primary_key=True)
     detailed_request_id = Column(INTEGER, primary_key=True)
     shift_date = Column(DATE, primary_key=True)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
     shift = Column(CHAR(1), nullable=False)  # 'D','E','N','O'
     shifts_table_id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
     score = Column(DECIMAL(3, 1), nullable=False)
@@ -616,6 +618,7 @@ class NursePairRequest(Base):
     month = Column(CHAR(7), primary_key=True)  # 'YYYY-MM'
     detailed_request_id = Column(INTEGER, primary_key=True)
     target_id = Column(VARCHAR(50), primary_key=True)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
     score = Column(DECIMAL(3, 1), nullable=False)
     partial_request = Column(TEXT, nullable=True)
 

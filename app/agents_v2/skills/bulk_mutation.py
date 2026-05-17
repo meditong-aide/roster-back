@@ -77,9 +77,12 @@ def _cancel_wanted_request(db, params, preview_only=False):
     nurse_ids = params.get("nurse_ids", [])
     year = params.get("year")
     month = params.get("month")
+    group_id = params.get("group_id")
 
     if not nurse_ids:
         return {"error": "nurse_id required for cancel"}
+    if not group_id:
+        return {"error": "group_id required for cancel"}
 
     if preview_only:
         return {
@@ -93,7 +96,7 @@ def _cancel_wanted_request(db, params, preview_only=False):
 
     results = []
     for nid in nurse_ids:
-        result = wanted_tools.cancel_wanted_request(db, nid, year, month)
+        result = wanted_tools.cancel_wanted_request(db, nid, group_id, year, month)
         results.append(result)
 
     if len(results) == 1:
@@ -134,6 +137,7 @@ def _delete_wanted_by_date(db, params, preview_only=False):
     return wanted_tools.delete_wanted_by_date(
         db,
         nurse_id=nurse_ids[0],
+        group_id=params["group_id"],
         year=params.get("year"),
         month=params.get("month"),
         date=params["date"],

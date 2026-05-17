@@ -323,6 +323,7 @@ def seed_data(db: Session) -> dict:
             nurse_id=nurse_id,
             request_id=1,
             month="2026-04",
+            group_id="GRP001",
             is_submitted=is_sub,
             submitted_at=datetime(2026, 3, 20) if is_sub else None,
         )
@@ -337,6 +338,7 @@ def seed_data(db: Session) -> dict:
                 request_id=1,
                 detailed_request_id=day,
                 shift_date=date(2026, 4, day),
+                group_id="GRP001",
                 shift=shift,
                 score=1.0,
             )
@@ -350,6 +352,7 @@ def seed_data(db: Session) -> dict:
         month="2026-04",
         detailed_request_id=1,
         target_id="N002",
+        group_id="GRP001",
         score=1.5,
         partial_request="같이 근무 선호",
     )
@@ -359,6 +362,7 @@ def seed_data(db: Session) -> dict:
         month="2026-04",
         detailed_request_id=2,
         target_id="N004",
+        group_id="GRP001",
         score=-1.0,
         partial_request="비선호",
     )

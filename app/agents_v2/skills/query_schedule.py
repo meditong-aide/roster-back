@@ -247,7 +247,7 @@ def _summarize_entries(entries: list[dict], year: int, month: int) -> dict:
 def _query_nurses(db, group_id, params):
     nurse_ids = params.get("nurse_ids")
     if nurse_ids and len(nurse_ids) == 1:
-        return nurse_tools.get_nurse_by_id(db, nurse_ids[0])
+        return nurse_tools.get_nurse_by_id(db, nurse_ids[0], group_id)
     if nurse_ids:
-        return [nurse_tools.get_nurse_by_id(db, nid) for nid in nurse_ids]
+        return [nurse_tools.get_nurse_by_id(db, nid, group_id) for nid in nurse_ids]
     return nurse_tools.get_nurses_in_group(db, group_id)

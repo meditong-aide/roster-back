@@ -37,9 +37,11 @@ def get_nurses_in_group(db: Session, group_id: str) -> list[dict]:
     return [_nurse_summary(r) for r in rows]
 
 
-def get_nurse_by_id(db: Session, nurse_id: str) -> dict | None:
-    """Get a single nurse by ID."""
-    r = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+def get_nurse_by_id(db: Session, nurse_id: str, group_id: str) -> dict | None:
+    """Get a single nurse by ID, scoped to group_id (RBAC guard)."""
+    r = db.query(Nurse).filter(
+        Nurse.nurse_id == nurse_id, Nurse.group_id == group_id
+    ).first()
     if not r:
         return None
     return _nurse_detail(r)
