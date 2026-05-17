@@ -45,21 +45,26 @@ def _norm_bounds(min_v: Any, max_v: Any, exact_v: Any) -> tuple[int | None, int 
 
 
 def collect_single_n_allowed_nurse_indices(rs: RosterSystem) -> set[int]:
-    """nurse_monthly_limit 의 n_max == 1 인 nurse 의 nurse_index set 을 반환.
+    """nurse_monthly_limit 에서 N=1 가능성이 명시된 nurse 의 nurse_index set.
 
     1N 금지(not_one_night) hard 제약에서 면제 대상 — 운영자가 월간 한도로 N=1 을
-    명시한 의도는 default 1N 금지 정책보다 우선한다.
+    어느 필드든 명시한 의도는 default 1N 금지 정책보다 우선한다.
 
-    면제 조건:
-        - nurse.n_max == 1 (또는 n_exact == 1 로 인해 정규화 시 max==1)
+    면제 조건 (셋 중 어느 하나):
+        - n_exact == 1  → 정규화 시 (1, 1)
+        - n_max   == 1  → 상한이 1 (강제 N=0 or 1)
+        - n_min   == 1  → 하한이 1 (1 가능, 더 많을 수도)
+
+    사용자 정책: "n_min=1 이든 n_max=1 이든 n_exact=1 이든 알고리즘에서 1이
+    나오는 경우" 해당 nurse 는 1N ban 면제.
     """
     out: set[int] = set()
     for n_idx, nu in enumerate(rs.nurses):
         mn_raw = getattr(nu, "n_min", None)
         mx_raw = getattr(nu, "n_max", None)
         ex_raw = getattr(nu, "n_exact", None)
-        _, mx = _norm_bounds(mn_raw, mx_raw, ex_raw)
-        if mx == 1:
+        mn, mx = _norm_bounds(mn_raw, mx_raw, ex_raw)
+        if mn == 1 or mx == 1:
             out.add(n_idx)
     return out
 
