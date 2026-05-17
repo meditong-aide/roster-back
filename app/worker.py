@@ -190,7 +190,19 @@ def process_job(payload: dict) -> dict:
         return {"status": "success", "job_id": job_id, "result_id": result_id}
 
     except Exception:
-        err_msg = str(sys.exc_info()[1])
+        import json as _json
+        from fastapi import HTTPException as _HTTPException
+
+        exc_obj = sys.exc_info()[1]
+        # generate_roster_service 가 raise 한 구조화 infeasibility payload 가 있으면
+        # error_message 에 JSON 으로 보존 → get_job_status 가 narrative 추출 가능.
+        if isinstance(exc_obj, _HTTPException) and isinstance(exc_obj.detail, dict):
+            try:
+                err_msg = _json.dumps(exc_obj.detail, ensure_ascii=False)
+            except (TypeError, ValueError):
+                err_msg = str(exc_obj.detail)
+        else:
+            err_msg = str(exc_obj)
         # JSON structured log + traceback (powertools 가 stack_trace 자동 포함)
         logger.exception("작업 실패", extra={"error_message": err_msg})
         # stdout 에도 traceback 출력 (기존 호환)

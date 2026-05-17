@@ -718,7 +718,9 @@ SKILL_TOOLS: list[dict] = [
             "병동의 **근무표를 자동 생성하는 비동기 잡**을 큐에 등록합니다. "
             "사용자가 '근무표 생성', '자동으로 짜줘', '돌려줘'처럼 신규 생성 의도를 표현할 때 사용.\n\n"
 
-            "⚠️ **고위험·비동기**: 잡 등록 후 SQS를 통해 백그라운드에서 실행됨. 결과는 즉시 나오지 않음.\n"
+            "⚠️ **고위험·비동기**: 잡 등록 후 SQS를 통해 백그라운드에서 실행됨. 결과는 즉시 나오지 않음. "
+            "보통 15~30초 정도 소요됨 — 잡 등록 직후 사용자에게 예상 소요 시간(약 15~30초)을 자연스럽게 안내하고, "
+            "사용자가 '어떻게 됐어?'/'결과 보여줘' 등으로 물으면 get_job_status (또는 query_schedule scope='generation_job')로 확인할 것.\n"
             "⚠️ 사전 조건:\n"
             "  • 해당 병동의 RosterConfig가 존재해야 함 (없으면 update_constraint로 먼저 설정 필요).\n"
             "  • 같은 병동에 QUEUED/RUNNING 상태 잡이 없어야 함 (있으면 충돌 거부).\n"
@@ -729,6 +731,16 @@ SKILL_TOOLS: list[dict] = [
             "- preview: {preview:true, group_id, year, month, config_id, message}\n"
             "- 실제 등록: 잡 레코드 + _sqs_dispatch_required + _generation_params(year,month,config_id). "
             "실제 SQS 디스패치는 호출 레이어가 담당.\n\n"
+
+            "🔎 **결과 추적 (FAILED 시)**: 잡이 FAILED 상태면 get_job_status (또는 query_schedule scope='generation_job') "
+            "의 결과에 `infeasibility` 필드가 포함됨. 이 필드에는:\n"
+            "  • summary_ko: 한 줄 요약\n"
+            "  • problems[]: 왜 못 만들었는지 (한국어 문장 리스트)\n"
+            "  • actions[]: 어떻게 해결할지 (한국어 문장 리스트)\n"
+            "  • trade_offs[]: 각 해결책의 부작용\n"
+            "  • hard_case: 어려운 케이스 분류 (true면 운영자 검토 권장)\n"
+            "  • apply_hint: 재시도용 설정 변경 힌트\n"
+            "사용자에게 답할 때는 narrative 필드를 활용해 '왜 실패했고 어떻게 풀 수 있는지' 자연스럽게 설명할 것.\n\n"
 
             "─────────── 인접 스킬과의 경계 ───────────\n"
             "- 기존 근무표 진단·교체 제안 → repair_schedule (재생성 아님)\n"
