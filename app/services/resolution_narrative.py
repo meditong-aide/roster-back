@@ -32,7 +32,7 @@ from services.semantics.ontology import (
 
 # 사용자 요구 — naive headcount reduction 류 패턴 차단 (regex 로 narrative 후처리 검증)
 _NAIVE_PATTERNS = [
-    re.compile(r"(간호사|인원)(을|를)\s*(줄이|감축)", re.IGNORECASE),
+    re.compile(r"(간호사|인원)(을|를)?\s*\S{0,12}?\s*(줄이|감축)", re.IGNORECASE),
 ]
 
 
@@ -45,6 +45,9 @@ class ProblemListItem:
     tier: str
     rendered_ko: str        # problem_template_ko 에 evidence 채워넣은 문장
     raw_evidence: dict[str, Any] = field(default_factory=dict)
+    # U-4: 각 problem 에 해결책 (treatment) 매핑 — '원인 + 해결' 묶음 가시화
+    mapped_treatments: list[dict[str, Any]] = field(default_factory=list)
+    cause_solution_ko: str = ""    # "원인 + 해결책" 한 문장 결합 표시
 
 
 @dataclass(slots=True)
@@ -93,13 +96,22 @@ def _fill_template(template: str, evidence: Mapping[str, Any]) -> str:
 
 
 def _validate_no_naive_patterns(text: str) -> None:
-    """assertion — naive headcount reduction 패턴이 발견되면 ValueError raise."""
+    """assertion — naive headcount reduction 패턴이 발견되면 ValueError raise.
+
+    예외 컨텍스트:
+      - 인력 보강/추가/배치 (반대 방향 권장)
+      - demand 하향 비교 문맥
+      - "단순 일시" / "재발" / "권장하지" / "지양" / "주의" 같은 anti-pattern 경고문
+    """
+    _SAFE_CONTEXT_KEYWORDS = (
+        "보강", "추가", "배치", "demand", "수요 하향", "demand 하향",
+        "단순 일시", "재발", "권장하지", "지양", "주의", "안 됨", "위험",
+    )
     for pat in _NAIVE_PATTERNS:
         m = pat.search(text or "")
         if m:
-            # 단, "인력 보강 / 추가" 같은 문맥은 OK
-            context = text[max(0, m.start() - 30): m.end() + 30]
-            if any(k in context for k in ("보강", "추가", "demand", "수요 하향", "demand 하향")):
+            context = text[max(0, m.start() - 60): m.end() + 60]
+            if any(k in context for k in _SAFE_CONTEXT_KEYWORDS):
                 continue
             raise ValueError(
                 f"naive headcount reduction pattern detected: '{m.group(0)}' in '{context}'"
@@ -121,7 +133,7 @@ def build_narrative(
     """
     onto = ontology or get_default_ontology()
 
-    # 1. problem_list 생성
+    # 1. problem_list 생성 — 각 cause 에 매칭되는 treatment 도 함께 묶어 둠
     problem_list: list[ProblemListItem] = []
     for p in cause_payloads or []:
         if not isinstance(p, Mapping):
@@ -135,6 +147,26 @@ def build_narrative(
         merged_evidence = {**ev, **{k: v for k, v in p.items()
                                     if k not in ("cause_id", "reason_code", "details", "evidence")}}
         rendered = _fill_template(c.problem_template_ko, merged_evidence)
+        # U-4: 본 cause 에 대응 가능한 treatment 들을 ontology lookup
+        mapped: list[dict[str, Any]] = []
+        for t in onto.treatments_for_cause(c.cause_id):
+            mapped.append({
+                "treatment_id": t.treatment_id,
+                "label": t.label,
+                "action_type": t.action_type,
+                "config_key": t.config_key,
+                "direction": t.direction,
+                "rationale_ko": t.rationale_ko,
+                "trade_off_ko": t.trade_off_ko,
+            })
+        # cause + solution 결합 문장 — UI/agent 가 한 줄로 표시 가능
+        if mapped:
+            actions_ko = " 또는 ".join(t["rationale_ko"].split(".")[0] for t in mapped[:2])
+            cause_solution_ko = f"{rendered} → 해결책: {actions_ko}."
+        else:
+            cause_solution_ko = (
+                f"{rendered} → 해결책: 자동 lever 없음 — 데이터/설정 직접 점검 필요."
+            )
         problem_list.append(ProblemListItem(
             cause_id=c.cause_id,
             label=c.label,
@@ -143,6 +175,8 @@ def build_narrative(
             tier=c.tier,
             rendered_ko=rendered,
             raw_evidence=merged_evidence,
+            mapped_treatments=mapped,
+            cause_solution_ko=cause_solution_ko,
         ))
 
     # 2. action_levers + trade_offs (bundle 가 있을 때만)
@@ -216,6 +250,8 @@ def narrative_to_dict(msg: NarrativeMessage) -> dict[str, Any]:
                 "tier": p.tier,
                 "rendered_ko": p.rendered_ko,
                 "raw_evidence": p.raw_evidence,
+                "mapped_treatments": list(p.mapped_treatments),
+                "cause_solution_ko": p.cause_solution_ko,
             }
             for p in msg.problem_list
         ],

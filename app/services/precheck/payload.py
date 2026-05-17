@@ -18,8 +18,13 @@ from services.precheck.structural_diagnosis import build_structural_diagnosis
 from services.precheck.cause_symptom_classifier import split_violations
 from services.precheck.cause_inferer import infer_causes_from_cores
 from services.precheck.evidence_builder import build_evidence_node
+from services.precheck.hard_case_classifier import (
+    classify_hard_case,
+    manual_investigation_treatment_dict,
+)
 from services.cause_treatment_hitter import propose_bundles
 from services.resolution_narrative import build_narrative, narrative_to_dict
+from services.payload_graph import build_payload_graph
 
 
 # 설정성 오류로 분류되는 reason_code (즉시 차단 권장)
@@ -44,7 +49,46 @@ _BLOCKING_CODES = {
     "TEAM_GRADE_INTERSECT_SHORTAGE",
     "FIXED_ASSIGN_BREAKS_TEAM_MIN",
     "MONTHLY_NIGHT_CAPACITY",
+    "MONTHLY_NIGHT_CAPACITY_SHORTAGE",
+    "N_CAPACITY_SHORTAGE",
+    "PRECEPTEE_SYNC_MISMATCH",
 }
+
+
+def _dedup_causes_by_reason(causes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """같은 reason_code 의 cause 들을 1건으로 묶는다.
+
+    cause-bucket 의 의미 단위는 reason_code (cause_id) — day 마다 중복 emit 되면
+    narrative 가 noisy 해진다. 첫 번째 cause 를 keep 하고 디테일은 occurrences /
+    affected_days / affected_shifts 로 aggregate.
+    """
+    out: List[Dict[str, Any]] = []
+    bucket: Dict[str, Dict[str, Any]] = {}
+    for c in causes:
+        rc = (c.get("reason_code") or c.get("node_id") or "?")
+        raw_det = c.get("details") if isinstance(c.get("details"), dict) else (
+            c.get("evidence") if isinstance(c.get("evidence"), dict) else {}
+        )
+        if rc not in bucket:
+            head = dict(c)
+            head_details = dict(raw_det)
+            head_details["occurrence_count"] = 1
+            head_details["affected_days"] = []
+            head_details["affected_shifts"] = []
+            head["details"] = head_details
+            bucket[rc] = head
+            out.append(head)
+        else:
+            head = bucket[rc]
+            hd = head["details"]
+            hd["occurrence_count"] = int(hd.get("occurrence_count") or 1) + 1
+            d = raw_det.get("day")
+            s = raw_det.get("shift")
+            if d is not None and d not in hd["affected_days"]:
+                hd["affected_days"].append(d)
+            if s is not None and s not in hd["affected_shifts"]:
+                hd["affected_shifts"].append(s)
+    return out
 
 
 def _extract_validator_evidence_summary(violated_constraints: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -67,6 +111,74 @@ def _extract_validator_evidence_summary(violated_constraints: List[Dict[str, Any
     return {}
 
 
+def _build_treatments_narrative_and_hard_case(
+    causes: List[Dict[str, Any]],
+    observed_symptoms: List[Dict[str, Any]],
+    evidence: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    """cause/evidence 로 treatment_recommendations + narrative + hard_case + graph 생성.
+
+    blocking / unrecoverable payload 양쪽에서 동일하게 호출 (DRY).
+    treatment build 실패 시 graceful degradation — payload 구조 보존.
+    """
+    treatment_recommendations: List[Dict[str, Any]] = []
+    resolution_narrative: Optional[Dict[str, Any]] = None
+    bundles_objs: List[Any] = []
+    try:
+        cause_ids = [c.get("reason_code") for c in causes if c.get("reason_code")]
+        if cause_ids:
+            bundles_objs = propose_bundles(active_causes=cause_ids, max_alternatives=3)
+            for b in bundles_objs:
+                treatment_recommendations.append({
+                    "bundle_id": b.bundle_id,
+                    "total_cost": b.total_cost,
+                    "overhead": b.overhead,
+                    "covered_causes": b.covered_causes,
+                    "uncovered_causes": b.uncovered_causes,
+                    "treatments": [
+                        {
+                            "treatment_id": t.treatment_id,
+                            "target_family": t.target_family,
+                            "action_type": t.action_type,
+                            "config_key": t.config_key,
+                            "direction": t.direction,
+                            "rationale_ko": t.rationale_ko,
+                            "trade_off_ko": t.trade_off_ko,
+                            "cost": t.cost,
+                            "covers": t.covers,
+                        }
+                        for t in b.treatments
+                    ],
+                })
+            primary_bundle = bundles_objs[0] if bundles_objs else None
+            narr = build_narrative(
+                cause_payloads=causes,
+                bundle=primary_bundle,
+                evidence=evidence,
+            )
+            resolution_narrative = narrative_to_dict(narr)
+    except Exception:
+        treatment_recommendations = []
+        resolution_narrative = None
+        bundles_objs = []
+
+    hard_case_verdict = classify_hard_case(causes, bundles=bundles_objs)
+    if hard_case_verdict.is_hard:
+        manual_t = manual_investigation_treatment_dict(hard_case_verdict)
+        if manual_t is not None:
+            treatment_recommendations.append(manual_t)
+
+    hard_case_dict = hard_case_verdict.to_dict()
+    graph = build_payload_graph(
+        causes=causes,
+        symptoms=observed_symptoms,
+        treatment_bundles=treatment_recommendations,
+        evidence=evidence,
+        hard_case=hard_case_dict,
+    )
+    return treatment_recommendations, resolution_narrative, hard_case_dict, graph
+
+
 def has_blocking_issues(precheck_result: Dict[str, Any]) -> bool:
     """precheck 결과에 blocking severity 이슈가 하나라도 있는지."""
     if not precheck_result:
@@ -79,7 +191,13 @@ def has_blocking_issues(precheck_result: Dict[str, Any]) -> bool:
 
 
 def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
-    """Precheck blocking 케이스의 응답 페이로드(HTTP 500 detail로 사용)."""
+    """Precheck blocking 케이스의 응답 페이로드(HTTP 500 detail로 사용).
+
+    US-1/US-9 새 필드 (causes / observed_symptoms / evidence /
+    treatment_recommendations / resolution_narrative) 도 채워준다.
+    precheck issues 의 reason_code 는 곧 cause 의 alias 이므로 split_violations
+    가 자동으로 cause-bucket 으로 분리한다.
+    """
     issues = humanize_all(precheck_result.get("issues", []) or [])
     # 첫 번째 이슈를 대표 메시지로
     summary = (
@@ -101,6 +219,30 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
         pool_snapshot={},
         applied_relaxations=[],
     )
+
+    # US-1: precheck issues 를 cause/symptom 으로 분리
+    # issues 안 evidence dict 를 details 키로 normalize 해서 split_violations 가 처리하게.
+    normalized = []
+    for it in issues:
+        item = dict(it)
+        if "details" not in item and isinstance(item.get("evidence"), dict):
+            item["details"] = item["evidence"]
+        normalized.append(item)
+    causes, observed_symptoms, _undiag = split_violations(normalized)
+    causes = _dedup_causes_by_reason(causes)
+    observed_symptoms = _dedup_causes_by_reason(observed_symptoms)
+    evidence = build_evidence_node(
+        applied_relaxations=[],
+        conflict_cores=[],
+        status="INFEASIBLE",
+        proof_type="precheck_arithmetic_blocking",
+        witness_schedule_id=None,
+    )
+
+    treatment_recommendations, resolution_narrative, hard_case_dict, graph = (
+        _build_treatments_narrative_and_hard_case(causes, observed_symptoms, evidence)
+    )
+
     return {
         "infeasibility": {
             "severity": "blocking",
@@ -109,6 +251,13 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
             "applied_relaxations": [],
             "fix_suggestions_ko": fix_suggestions,
             "violation_summary": {},
+            "causes": causes,
+            "observed_symptoms": observed_symptoms,
+            "evidence": evidence,
+            "treatment_recommendations": treatment_recommendations,
+            "resolution_narrative": resolution_narrative,
+            "hard_case": hard_case_dict,
+            "graph": graph,
             "structural_diagnosis": structural,
             "fix_plan": build_fix_plan(
                 structural_diagnosis=structural,
@@ -225,10 +374,24 @@ def build_unrecoverable_payload(
 
     # US-D: conflict_cores 의 MUS pattern → cause_id 자동 추론, violated 와 합침
     core_inferred_causes = infer_causes_from_cores(list(conflict_cores or []))
-    combined_violations = list(violated_constraints or []) + core_inferred_causes
+    # precheck issues 도 cause/symptom 분류 대상에 포함 — payload 가 unrecoverable
+    # 경로로 빠져도 precheck 가 잡은 산술 cause 가 표면화되도록.
+    precheck_issues_normalized = []
+    for it in issues:
+        item = dict(it)
+        if "details" not in item and isinstance(item.get("evidence"), dict):
+            item["details"] = item["evidence"]
+        precheck_issues_normalized.append(item)
+    combined_violations = (
+        list(violated_constraints or [])
+        + core_inferred_causes
+        + precheck_issues_normalized
+    )
 
     # US-1: cause-bucket / symptom-bucket / evidence 분리 노출 (cause 와 symptom 절대 교차 없음)
     causes, observed_symptoms, _undiag_present = split_violations(combined_violations)
+    causes = _dedup_causes_by_reason(causes)
+    observed_symptoms = _dedup_causes_by_reason(observed_symptoms)
     evidence = build_evidence_node(
         applied_relaxations=list(applied_relaxations or []),
         conflict_cores=list(conflict_cores or []),
@@ -237,46 +400,9 @@ def build_unrecoverable_payload(
         witness_schedule_id=None,
     )
 
-    # US-9: cause 가 식별되면 hitter + narrative 통합 호출 (실패하면 silent — payload 는 항상 유지)
-    treatment_recommendations: List[Dict[str, Any]] = []
-    resolution_narrative: Optional[Dict[str, Any]] = None
-    try:
-        cause_ids = [c.get("reason_code") for c in causes if c.get("reason_code")]
-        if cause_ids:
-            bundles = propose_bundles(active_causes=cause_ids, max_alternatives=3)
-            for b in bundles:
-                treatment_recommendations.append({
-                    "bundle_id": b.bundle_id,
-                    "total_cost": b.total_cost,
-                    "overhead": b.overhead,
-                    "covered_causes": b.covered_causes,
-                    "uncovered_causes": b.uncovered_causes,
-                    "treatments": [
-                        {
-                            "treatment_id": t.treatment_id,
-                            "target_family": t.target_family,
-                            "action_type": t.action_type,
-                            "config_key": t.config_key,
-                            "direction": t.direction,
-                            "rationale_ko": t.rationale_ko,
-                            "trade_off_ko": t.trade_off_ko,
-                            "cost": t.cost,
-                            "covers": t.covers,
-                        }
-                        for t in b.treatments
-                    ],
-                })
-            primary_bundle = bundles[0] if bundles else None
-            narr = build_narrative(
-                cause_payloads=causes,
-                bundle=primary_bundle,
-                evidence=evidence,
-            )
-            resolution_narrative = narrative_to_dict(narr)
-    except Exception:
-        # narrative build 가 실패해도 payload 구조 보존 (cause/symptom/evidence 는 항상 노출)
-        treatment_recommendations = []
-        resolution_narrative = None
+    treatment_recommendations, resolution_narrative, hard_case_dict, graph = (
+        _build_treatments_narrative_and_hard_case(causes, observed_symptoms, evidence)
+    )
 
     return {
         "infeasibility": {
@@ -296,6 +422,9 @@ def build_unrecoverable_payload(
             # US-9 신규 2 필드 (treatment 추천 + 자연어 narrative)
             "treatment_recommendations": treatment_recommendations,
             "resolution_narrative": resolution_narrative,
+            # U-3 / U-5 신규 2 필드 (hard_case 판정 + 명확한 그래프)
+            "hard_case": hard_case_dict,
+            "graph": graph,
             # legacy — 호환 위해 1 릴리즈 유지 (deprecated)
             "violated_constraints": list(violated_constraints or []),
             "conflict_cores": list(conflict_cores or []),

@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Literal, Tuple
 
 SYMPTOM_CODES = frozenset({
     "NO_ASSIGNMENT",
+    "NO_ASSIGNMENT_CAPACITY",
+    "NO_ASSIGNMENT_ELIGIBILITY",
+    "NO_ASSIGNMENT_FIXED",
+    "NO_ASSIGNMENT_CARRYOVER",
     "DAY_ZERO_COVERAGE",  # legacy — Phase 1 에서 코드 throw 제거됨. 안전망.
     "NURSE_BLOCKED_DAYS",
 })
@@ -35,12 +39,10 @@ PROBE_CODES = frozenset({
 
 UNDIAGNOSED_SENTINEL = "UNDIAGNOSED"
 
-PARTIAL_CAUSE_CODES = frozenset({
-    "NO_ASSIGNMENT_CAPACITY",
-    "NO_ASSIGNMENT_ELIGIBILITY",
-    "NO_ASSIGNMENT_FIXED",
-    "NO_ASSIGNMENT_CARRYOVER",
-})
+# US-10: NO_ASSIGNMENT_* 4축 라벨 cause-bucket 진입 차단.
+# 미배정은 "결과(symptom)" 이며 cause 가 아니다. 구체 cause_id 는 detector
+# (team_grade_precheck) + MUS inferer (cause_inferer) 가 발급한다.
+PARTIAL_CAUSE_CODES: frozenset = frozenset()
 
 
 Category = Literal["cause", "partial_cause", "symptom", "probe", "undiagnosed"]

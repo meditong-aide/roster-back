@@ -48,20 +48,12 @@ def _fallback_unrecoverable_from_exception(error_message: str) -> dict:
             }
         )
 
-    for m in re.finditer(r"\[reason_code=([A-Z_]+)\]", msg.upper()):
-        _add(m.group(1))
+    for m in re.finditer(r"\[reason_code=([A-Za-z_]+)\]", msg, flags=re.IGNORECASE):
+        _add(m.group(1).upper())
 
-    up = msg.upper()
-    if "NO_ASSIGNMENT" in up:
-        _add("NO_ASSIGNMENT")
-    if any(k in up for k in ["CAPACITY", "SHORTAGE"]):
-        _add("NO_ASSIGNMENT_CAPACITY")
-    if any(k in up for k in ["ALLOWED", "SHIFT_NOT_ALLOWED", "N_ONLY"]):
-        _add("NO_ASSIGNMENT_ELIGIBILITY")
-    if any(k in up for k in ["FIXED", "FORBIDDEN"]):
-        _add("NO_ASSIGNMENT_FIXED")
-    if any(k in up for k in ["PREV_", "CARRYOVER", "2N2OFF", "3N2OFF", "BOUNDARY"]):
-        _add("NO_ASSIGNMENT_CARRYOVER")
+    # NO_ASSIGNMENT / NO_ASSIGNMENT_* 4축 라벨은 "결과(미배정 cell)" 일 뿐 cause 가 아님 — 차단.
+    # 진짜 cause 는 산술 detector (team_grade_precheck) + MUS inferer (cause_inferer)
+    # 가 더 정확한 cause_id 로 만들어준다.
 
     if not reasons:
         _add("INTERNAL_GENERATION_ERROR")

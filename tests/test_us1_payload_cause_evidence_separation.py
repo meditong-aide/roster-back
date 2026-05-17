@@ -44,6 +44,11 @@ def test_classify_returns_expected_category_for_each_code_type():
 
 
 def test_split_violations_disjoint_buckets():
+    """정책 (U-1, 2026-05-17 ralph): NO_ASSIGNMENT* 4 축 라벨도 symptom-bucket 으로 라우팅.
+
+    cause-bucket: real cause + UNDIAGNOSED sentinel.
+    symptom-bucket: NO_ASSIGNMENT / NO_ASSIGNMENT_X4 / DAY_ZERO_COVERAGE / NURSE_BLOCKED_DAYS / probes.
+    """
     violations = [
         {"reason_code": "NO_ASSIGNMENT"},
         {"reason_code": "DAY_ZERO_COVERAGE"},
@@ -63,12 +68,16 @@ def test_split_violations_disjoint_buckets():
 
     # 교집합 0
     assert cause_codes.isdisjoint(sym_codes), (cause_codes, sym_codes)
-    # cause-bucket 에 cause + partial_cause + undiagnosed
-    assert {"CAPACITY_TOTAL_SHORTAGE", "GRADE_MAX_SUM_BELOW_NEED",
-            "NO_ASSIGNMENT_CAPACITY", "NO_ASSIGNMENT_FIXED", "UNDIAGNOSED"} <= cause_codes
-    # symptom-bucket 에 symptom + probe
+    # cause-bucket: real cause + UNDIAGNOSED only — NO_ASSIGNMENT* 절대 진입 금지
+    assert {"CAPACITY_TOTAL_SHORTAGE", "GRADE_MAX_SUM_BELOW_NEED", "UNDIAGNOSED"} <= cause_codes
+    for forbidden in ("NO_ASSIGNMENT", "NO_ASSIGNMENT_CAPACITY", "NO_ASSIGNMENT_FIXED",
+                      "NO_ASSIGNMENT_ELIGIBILITY", "NO_ASSIGNMENT_CARRYOVER",
+                      "DAY_ZERO_COVERAGE"):
+        assert forbidden not in cause_codes, f"{forbidden} leaked into causes"
+    # symptom-bucket: 모든 NO_ASSIGNMENT* + DAY_ZERO_COVERAGE + NURSE_BLOCKED_DAYS + probes
     assert {"NO_ASSIGNMENT", "DAY_ZERO_COVERAGE", "NURSE_BLOCKED_DAYS",
-            "GRADE_HARD_PROBE", "MAX_CAP_SHORTAGE"} <= sym_codes
+            "GRADE_HARD_PROBE", "MAX_CAP_SHORTAGE",
+            "NO_ASSIGNMENT_CAPACITY", "NO_ASSIGNMENT_FIXED"} <= sym_codes
     assert has_undiag is True
 
 
@@ -165,7 +174,9 @@ def test_unrecoverable_payload_separates_cause_symptom_evidence():
     symptom_codes = {s["reason_code"] for s in infeasibility["observed_symptoms"]}
 
     assert "CAPACITY_TOTAL_SHORTAGE" in cause_codes
-    assert "NO_ASSIGNMENT_CAPACITY" in cause_codes
+    # 새 정책 (U-1): NO_ASSIGNMENT* 는 symptom-bucket 으로 라우팅
+    assert "NO_ASSIGNMENT_CAPACITY" not in cause_codes
+    assert "NO_ASSIGNMENT_CAPACITY" in symptom_codes
     assert "NO_ASSIGNMENT" in symptom_codes
     assert "GRADE_HARD_PROBE" in symptom_codes
 
