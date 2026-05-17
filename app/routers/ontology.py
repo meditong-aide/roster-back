@@ -2035,6 +2035,70 @@ def get_case(case_id: str) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+# ── U-51: Matrix 50 cases endpoints (synthetic, no solver) ────────────────
+import sys as _sys  # local import — module-level 의존성 추가 안 하려고
+
+_MATRIX_PATH = Path(__file__).resolve().parents[2] / "tools" / "harness"
+if str(_MATRIX_PATH) not in _sys.path:
+    _sys.path.insert(0, str(_MATRIX_PATH))
+
+
+def _load_matrix_module():
+    try:
+        import matrix_50_cases  # type: ignore
+        return matrix_50_cases
+    except Exception:
+        return None
+
+
+@router.get("/matrix/cases")
+def matrix_cases_list() -> JSONResponse:
+    """50 case meta list — dashboard dropdown 용."""
+    m = _load_matrix_module()
+    if m is None:
+        return JSONResponse({"error": "matrix_50_cases module not loadable"}, status_code=500)
+    items = [
+        {
+            "id": c["id"],
+            "title": c["title"],
+            "category": c["category"],
+            "cause_count": len(c["causes"]),
+            "expected_cats": sorted(c["expected_cats"]),
+        }
+        for c in m.CASES_50
+    ]
+    by_cat: dict[str, list] = {}
+    for it in items:
+        by_cat.setdefault(it["category"], []).append(it["id"])
+    return JSONResponse({"items": items, "count": len(items), "by_category": by_cat})
+
+
+@router.get("/matrix/case/{case_id}/payload")
+def matrix_case_payload(case_id: str) -> JSONResponse:
+    """case_id → 합성된 build_unrecoverable_payload (실시간)."""
+    m = _load_matrix_module()
+    if m is None:
+        return JSONResponse({"error": "matrix_50_cases module not loadable"}, status_code=500)
+    case = next((c for c in m.CASES_50 if c["id"] == case_id), None)
+    if case is None:
+        return JSONResponse({"error": f"case {case_id} not found in matrix"}, status_code=404)
+    try:
+        payload = m._build_case_payload(case)
+        result = m.assert_case(case)
+        return JSONResponse({
+            "case_meta": {
+                "id": case["id"],
+                "title": case["title"],
+                "category": case["category"],
+                "expected_cats": sorted(case["expected_cats"]),
+            },
+            "payload": payload,
+            "verdict": result,
+        })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 # ── HTML page ──────────────────────────────────────────────
 
 
@@ -2698,87 +2762,155 @@ _HTML_V2 = """<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <title>Ontology — 진단</title>
+  <title>Ontology — 진단 v3</title>
   <style>
     * { box-sizing: border-box; }
+    :root {
+      --bg: #f7f8fa; --panel: #fff; --border: #e6e8ed; --ink: #1a1d24; --muted: #5a6373;
+      --cat-capacity:#EF4444; --cat-eligibility:#F59E0B; --cat-fixed:#8B5CF6;
+      --cat-team:#3B82F6; --cat-grade:#10B981; --cat-carryover:#6B7280;
+      --cat-recovery:#0EA5E9; --cat-transition:#EC4899; --cat-preceptee:#14B8A6;
+      --cat-consecutive:#A855F7; --cat-config:#F97316; --cat-meta:#DC2626;
+      --cat-evidence:#0EA5E9; --cat-bundle:#3B82F6; --cat-treatment:#10B981;
+      --hard-bg:#FEE2E2; --hard-fg:#991B1B; --hard-border:#FCA5A5;
+      --soft-bg:#FEF3C7; --soft-fg:#92400E;
+      --ok-bg:#D1FAE5; --ok-fg:#065F46;
+    }
     body {
       margin: 0; padding: 0;
       font-family: -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
-      background: #f7f8fa; color: #1a1d24;
-      line-height: 1.5;
+      background: var(--bg); color: var(--ink); line-height: 1.5; font-size: 13px;
     }
     header {
-      background: #fff; border-bottom: 1px solid #e6e8ed;
-      padding: 16px 24px; display: flex; align-items: center; gap: 16px;
+      background: var(--panel); border-bottom: 1px solid var(--border);
+      padding: 12px 24px; display: flex; align-items: center; gap: 16px;
+      position: sticky; top: 0; z-index: 50;
     }
-    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header h1 { margin: 0; font-size: 16px; font-weight: 700; }
+    header h1 small { color: var(--muted); font-weight: 400; margin-left: 6px; font-size: 11px; }
     header select {
-      padding: 8px 12px; border: 1px solid #cfd4dc; border-radius: 6px;
-      background: #fff; font-size: 14px; min-width: 280px;
+      padding: 6px 10px; border: 1px solid #cfd4dc; border-radius: 6px;
+      background: #fff; font-size: 13px; min-width: 360px; cursor: pointer;
     }
-    main { max-width: 1100px; margin: 0 auto; padding: 24px; }
-    .summary {
-      background: #fff; border: 1px solid #e6e8ed; border-radius: 12px;
-      padding: 20px 24px; margin-bottom: 20px;
+    header .meta {
+      font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace;
+      margin-left: auto;
     }
-    .summary .severity {
-      display: inline-block; padding: 4px 12px; border-radius: 999px;
-      font-size: 12px; font-weight: 600; letter-spacing: 0.3px;
+    header .verdict {
+      padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
     }
-    .severity.blocking { background: #fee; color: #c0392b; }
-    .severity.warning { background: #fff3cd; color: #856404; }
-    .severity.ok { background: #d4edda; color: #155724; }
-    .summary h2 { margin: 8px 0 4px; font-size: 22px; }
-    .summary p { margin: 4px 0 0; color: #555; font-size: 14px; }
-    .section-title {
-      font-size: 14px; font-weight: 600; color: #5a6373;
-      letter-spacing: 0.5px; margin: 0 0 10px; text-transform: uppercase;
+    header .verdict.pass { background: var(--ok-bg); color: var(--ok-fg); }
+    header .verdict.fail { background: var(--hard-bg); color: var(--hard-fg); }
+    main { max-width: 1200px; margin: 0 auto; padding: 20px 24px 80px; }
+    /* Tier 1 — Status Banner */
+    .banner {
+      border-radius: 12px; padding: 18px 22px; margin-bottom: 18px;
+      display: flex; align-items: center; gap: 16px;
+      border: 1px solid var(--border); background: var(--panel);
     }
-    .cards {
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-      gap: 12px; margin-bottom: 24px;
+    .banner.hard { background: var(--hard-bg); border-color: var(--hard-border); }
+    .banner.soft { background: var(--soft-bg); border-color: #FCD34D; }
+    .banner.ok   { background: var(--ok-bg);   border-color: #6EE7B7; }
+    .banner .icon { font-size: 32px; line-height: 1; }
+    .banner .title { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+    .banner.hard .title { color: var(--hard-fg); }
+    .banner.soft .title { color: var(--soft-fg); }
+    .banner.ok   .title { color: var(--ok-fg); }
+    .banner .desc { font-size: 13px; color: var(--muted); }
+    .banner .criteria { display: flex; gap: 6px; margin-top: 6px; }
+    .criteria .chip {
+      background: rgba(0,0,0,0.05); color: var(--ink); padding: 2px 8px;
+      border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace;
     }
-    .card {
-      background: #fff; border: 1px solid #e6e8ed; border-radius: 10px;
-      padding: 16px 18px;
+    .banner.hard .criteria .chip { background: rgba(255,255,255,0.6); color: var(--hard-fg); }
+
+    /* Tier 2 — Narrative Cards (3-column) */
+    .cards-3col {
+      display: grid; grid-template-columns: repeat(3, 1fr);
+      gap: 14px; margin-bottom: 20px;
     }
-    .card.cause { border-left: 4px solid #c0392b; }
-    .card.action { border-left: 4px solid #2980b9; }
-    .card .label { font-size: 12px; font-weight: 600; color: #5a6373; margin-bottom: 6px; }
-    .card .headline { font-size: 15px; font-weight: 600; margin: 4px 0; }
-    .card .detail { font-size: 13px; color: #555; margin-top: 6px; }
-    .card .config-row {
-      display: inline-block; background: #eef3f9; padding: 4px 10px;
-      border-radius: 6px; font-family: ui-monospace, monospace;
-      font-size: 12px; margin-top: 8px;
+    .col { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+    .col-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); margin-bottom: 10px; }
+    .col-problem .col-title { color: #DC2626; }
+    .col-solution .col-title { color: #059669; }
+    .col-tradeoff .col-title { color: #B45309; }
+    .item {
+      padding: 10px 0; border-bottom: 1px dashed #e6e8ed;
     }
+    .item:last-child { border-bottom: none; }
+    .item .top { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+    .cat-badge {
+      display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px;
+      font-weight: 600; color: white; text-transform: uppercase; letter-spacing: 0.3px;
+    }
+    .cat-capacity { background: var(--cat-capacity); }
+    .cat-eligibility { background: var(--cat-eligibility); }
+    .cat-fixed { background: var(--cat-fixed); }
+    .cat-team { background: var(--cat-team); }
+    .cat-grade { background: var(--cat-grade); }
+    .cat-carryover { background: var(--cat-carryover); }
+    .cat-recovery { background: var(--cat-recovery); }
+    .cat-transition { background: var(--cat-transition); }
+    .cat-preceptee { background: var(--cat-preceptee); }
+    .cat-consecutive { background: var(--cat-consecutive); }
+    .cat-config { background: var(--cat-config); }
+    .cat-meta { background: var(--cat-meta); }
+    .cat-evidence { background: var(--cat-evidence); }
+    .cat-bundle { background: var(--cat-bundle); }
+    .cat-treatment { background: var(--cat-treatment); }
+    .item .text { font-size: 13px; color: var(--ink); }
+    .item .meta { font-size: 11px; color: var(--muted); margin-top: 3px; font-family: ui-monospace, monospace; }
+    .item .config-row {
+      display: inline-block; background: #F3F4F6; padding: 2px 8px;
+      border-radius: 4px; font-family: ui-monospace, monospace;
+      font-size: 11px; margin-top: 4px;
+    }
+    .show-more {
+      font-size: 11px; color: var(--muted); margin-top: 8px;
+      text-align: center; cursor: pointer;
+    }
+    .show-more:hover { color: var(--ink); text-decoration: underline; }
+
+    /* Tier 3 — Mini Graph */
+    .graph-wrap {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 16px 20px; margin-bottom: 18px;
+    }
+    .graph-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+    .graph-title { font-size: 13px; font-weight: 700; color: var(--ink); margin-right: auto; }
+    .filter-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .filter-chip {
+      padding: 3px 9px; border-radius: 999px; font-size: 11px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+      user-select: none; font-family: ui-monospace, monospace;
+    }
+    .filter-chip.active { background: var(--ink); color: white; border-color: var(--ink); }
+    .graph-svg { width: 100%; height: 480px; background: #FAFBFC; border-radius: 8px; }
+    .graph-stats { font-size: 11px; color: var(--muted); margin-top: 8px; font-family: ui-monospace, monospace; }
+
+    /* Advanced */
     details.advanced {
-      background: #fff; border: 1px solid #e6e8ed; border-radius: 10px;
-      padding: 12px 18px; margin-top: 24px;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 16px; margin-top: 16px;
     }
-    details.advanced > summary {
-      cursor: pointer; font-size: 14px; font-weight: 600; color: #5a6373;
-      list-style: none; outline: none;
-    }
-    details.advanced > summary::before { content: "▶  "; font-size: 11px; }
+    details.advanced > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); list-style: none; outline: none; }
+    details.advanced > summary::before { content: "▶  "; font-size: 10px; }
     details.advanced[open] > summary::before { content: "▼  "; }
     details.advanced pre {
-      background: #1a1d24; color: #e6e8ed; padding: 14px;
-      border-radius: 6px; font-size: 11px; overflow-x: auto;
-      max-height: 480px; margin: 12px 0 0;
+      background: #1a1d24; color: #e6e8ed; padding: 12px;
+      border-radius: 6px; font-size: 10px; overflow-x: auto;
+      max-height: 400px; margin: 10px 0 0;
     }
-    .advanced-section { margin-top: 16px; }
-    .advanced-section h4 { font-size: 13px; margin: 4px 0 6px; color: #5a6373; }
+    .adv-section h4 { font-size: 12px; margin: 4px 0 6px; color: var(--muted); }
     .empty { color: #888; padding: 40px 0; text-align: center; }
-    .pill { display: inline-block; padding: 2px 8px; background: #eef3f9; border-radius: 4px; font-size: 11px; margin-right: 4px; font-family: ui-monospace, monospace; }
-    .trade-off { font-size: 12px; color: #856404; background: #fff8e1; padding: 8px 10px; border-radius: 6px; margin-top: 8px; }
   </style>
 </head>
 <body>
   <header>
-    <h1>온톨로지 진단</h1>
+    <h1>온톨로지 진단 <small>v3 split-panel</small></h1>
     <select id="case-select"></select>
-    <span id="case-meta" style="font-size:12px;color:#888"></span>
+    <span id="verdict" class="verdict">…</span>
+    <span class="meta" id="meta-info"></span>
   </header>
   <main id="root">
     <div class="empty">케이스 로드 중…</div>
@@ -2786,29 +2918,10 @@ _HTML_V2 = """<!doctype html>
 
   <script>
   const sel = document.getElementById('case-select');
-  const meta = document.getElementById('case-meta');
+  const verdictEl = document.getElementById('verdict');
+  const metaInfo = document.getElementById('meta-info');
   const root = document.getElementById('root');
-
-  async function loadCases() {
-    const r = await fetch('/ontology/cases');
-    const d = await r.json();
-    sel.innerHTML = '';
-    (d.items || []).forEach(c => {
-      const opt = document.createElement('option');
-      opt.value = c.case_id;
-      opt.textContent = `${c.case_id}  —  ${c.cause_count} causes / ${c.treatment_count} treatments`;
-      sel.appendChild(opt);
-    });
-    if (d.items && d.items.length) loadCase(d.items[0].case_id);
-  }
-
-  async function loadCase(caseId) {
-    const r = await fetch(`/ontology/case/${encodeURIComponent(caseId)}`);
-    const d = await r.json();
-    render(d);
-  }
-
-  sel.addEventListener('change', () => loadCase(sel.value));
+  let activeFilters = new Set();  // empty = show all
 
   function el(tag, cls, html) {
     const e = document.createElement(tag);
@@ -2817,151 +2930,375 @@ _HTML_V2 = """<!doctype html>
     return e;
   }
 
-  function shortValue(v) {
-    if (v === null || v === undefined) return '—';
-    if (typeof v === 'object') return JSON.stringify(v).slice(0, 80);
-    const s = String(v);
-    return s.length > 80 ? s.slice(0, 77) + '…' : s;
+  async function loadCases() {
+    let items = [];
+    // Matrix 50 cases (synthetic — primary source)
+    try {
+      const r = await fetch('/ontology/matrix/cases');
+      const d = await r.json();
+      (d.items || []).forEach(c => items.push({
+        source: 'matrix', id: c.id, title: c.title,
+        category: c.category, cause_count: c.cause_count,
+      }));
+    } catch (e) {}
+    // Legacy alpha cases (file-based)
+    try {
+      const r = await fetch('/ontology/cases');
+      const d = await r.json();
+      (d.items || []).forEach(c => items.push({
+        source: 'alpha', id: c.case_id, title: c.case_id,
+        category: 'Alpha file', cause_count: c.cause_count,
+      }));
+    } catch (e) {}
+
+    sel.innerHTML = '';
+    let group = {};
+    items.forEach(it => {
+      group[it.category] = group[it.category] || [];
+      group[it.category].push(it);
+    });
+    Object.keys(group).sort().forEach(cat => {
+      const og = document.createElement('optgroup');
+      og.label = cat;
+      group[cat].forEach(it => {
+        const opt = document.createElement('option');
+        opt.value = `${it.source}::${it.id}`;
+        opt.textContent = `${it.id}  —  ${it.title}`;
+        og.appendChild(opt);
+      });
+      sel.appendChild(og);
+    });
+    if (items.length) loadCase(sel.value);
   }
 
+  async function loadCase(sourceId) {
+    const [source, id] = sourceId.split('::');
+    const url = source === 'matrix'
+      ? `/ontology/matrix/case/${encodeURIComponent(id)}/payload`
+      : `/ontology/case/${encodeURIComponent(id)}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    activeFilters = new Set();   // reset filters per case
+    render(d, source);
+  }
+
+  sel.addEventListener('change', () => loadCase(sel.value));
+
+  // ───── Narrative helpers ─────
   function causeHeadline(c) {
     const det = c.details || c.evidence || {};
     const rc = c.reason_code || c.node_id || '?';
-    if (rc === 'PRECEPTEE_SYNC_MISMATCH') {
-      return `프리셉터-프리셉티 동기화 불가 (${det.preceptor_id || '?'} ↔ ${det.preceptee_id || '?'})`;
-    }
-    if (rc === 'N_CAPACITY_SHORTAGE') {
-      return `일별 야간 인력 부족 (${det.day || '?'}일, 수요 ${det.n_required ?? '?'} / 가능 ${det.n_capacity ?? '?'})`;
-    }
-    if (rc === 'MONTHLY_NIGHT_CAPACITY_SHORTAGE') {
-      return `월간 야간 capacity 부족 (수요 ${det.n_required ?? '?'} / 한도 ${det.n_capacity ?? '?'})`;
-    }
-    if (rc === 'GLOBAL_SHIFT_ALLOWED_SHORTAGE') {
-      return `${det.day || '?'}일 ${det.shift || '?'} 시프트 자격자 부족 (가능 ${det.eligible ?? '?'} / 수요 ${det.required ?? '?'})`;
-    }
-    if (rc === 'CAPACITY_TOTAL_SHORTAGE') {
-      return `월 총 인력 부족 (수요 ${det.required ?? '?'} / 공급 ${det.capacity ?? '?'})`;
-    }
-    return c.human_message_ko || rc;
+    const map = {
+      PRECEPTEE_SYNC_MISMATCH:        `프리셉터-프리셉티 동기화 불가 (${det.preceptor_id || '?'} ↔ ${det.preceptee_id || '?'})`,
+      N_CAPACITY_SHORTAGE:            `일별 야간 인력 부족 (${det.day || '?'}일, 수요 ${det.n_required ?? '?'} / 가능 ${det.n_capacity ?? '?'})`,
+      MONTHLY_NIGHT_CAPACITY_SHORTAGE:`월간 야간 capacity 부족 (수요 ${det.n_required ?? '?'} / 한도 ${det.n_capacity ?? '?'})`,
+      GLOBAL_SHIFT_ALLOWED_SHORTAGE:  `${det.day || '?'}일 ${det.shift || '?'} 시프트 자격자 부족 (가능 ${det.eligible ?? '?'} / 수요 ${det.required ?? '?'})`,
+      CAPACITY_TOTAL_SHORTAGE:        `월 총 인력 부족 (수요 ${det.required ?? '?'} / 공급 ${det.capacity ?? '?'})`,
+      TEAM_MIN_EXCEEDS_GLOBAL_NEED:   `${det.day || '?'}일 ${det.shift || '?'} 팀 최소 합 ${det.min_sum ?? '?'} > 일 수요 ${det.required ?? '?'}`,
+      GRADE_MIN_SUM_EXCEEDS_NEED:     `${det.day || '?'}일 ${det.shift || '?'} 등급 최소 합 ${det.min_sum ?? '?'} > 수요 ${det.required ?? '?'}`,
+      GRADE_MAX_SUM_BELOW_NEED:       `${det.day || '?'}일 ${det.shift || '?'} 등급 상한 합 ${det.cap ?? '?'} < 수요 ${det.required ?? '?'}`,
+      FIXED_ASSIGN_EXCEEDS_NEED:      `${det.day || '?'}일 ${det.shift || '?'} 고정 배정 ${det.fixed_count ?? '?'}명 > 수요 ${det.required ?? '?'}`,
+      ALLOWED_SHIFTS_ISOLATES_NURSE:  `간호사 ${det.nurse_id || '?'} 의 allowed_shifts 비어있음`,
+      GRADE_MIN_EXCEEDS_MAX:          `grade ${det.grade || '?'} min(${det.min_val ?? '?'}) > max(${det.max_val ?? '?'}) — 산술 모순`,
+      MID_DISABLED_BUT_USED:          `미드 시프트 비활성인데 team/grade 제약에 M 참조`,
+      RECOVERY_2N2OFF_BLOCKS:         `2N→2OFF 회복으로 ${det.day_c}~${det.day_d}일 ${det.affected_shift} 수요 ${det.shortage}명 부족`,
+      RECOVERY_3N2OFF_BLOCKS:         `3N→2OFF 회복으로 ${det.day_d}~${det.day_e}일 ${det.affected_shift} 수요 ${det.shortage}명 부족`,
+      TRANSITION_BAN_NOD_CHAIN:       `간호사 ${det.nurse_id || '?'} day ${det.day || '?'} N→OFF→D 또는 N→D 전이 금지 위반`,
+      PREV_MONTH_N_TAIL_BLOCKS:       `간호사 ${det.nurse_id || '?'} 전월 마지막 N → 본 월 day ${det.day || '?'} 배정 차단`,
+      CARRYOVER_FIXED_N_ISOLATION:    `간호사 ${det.nurse_id || '?'} ${det.day || '?'}일 fixed N 양옆 OFF → NotOneNight 위반`,
+      WEEKEND_OFF_ONLY_DRAINS_WEEKDAY:`주말 OFF 전용 ${det.weekend_off_count ?? '?'}명 → 평일 ${det.weekday_eligible ?? '?'} 가용/수요 ${det.weekday_demand ?? '?'}`,
+      BAN_N_BEFORE_FIXED_OFF_ISOLATES:`${det.day || '?'}일 N 수요 ${det.n_required ?? '?'}, 인접 fixed OFF 간호사 ${det.blocked_nurses ?? '?'}명 차단 → 가용 ${det.available_n ?? '?'} 미달`,
+      N_ONLY_VS_CAPS:                 `${det.role || '?'}-only ${det.role_only_count ?? '?'}명 > role 수요 ${det.role_demand ?? '?'} → 다른 shift 부족`,
+      CONSECUTIVE_WORK_LIMIT_BLOCKS:  `연속근무 한도 ${det.limit ?? '?'} → ${det.day_a}~${det.day_b}일 ${det.affected_shift} 수요 ${det.shortage}명 부족`,
+      INITIAL_FORBIDDEN_CONCENTRATION:`간호사 ${det.nurse_id || '?'} ${det.forbidden_shifts || '?'} 전 기간 차단 → 실질 ${det.effective_role || '?'} 역할 강제`,
+      MONTHLY_LIMIT_MIN_EXCEEDS_MAX:  `간호사 ${det.nurse_id || '?'} ${det.shift || '?'} 월 min(${det.min_val ?? '?'}) > max(${det.max_val ?? '?'})`,
+      MONTHLY_LIMIT_N_EXACT_UNATTAINABLE:`간호사 ${det.nurse_id || '?'} N exact(${det.n_exact ?? '?'}) 가 active ${det.active_days ?? '?'}일과 모순`,
+      FIXED_OFF_EXCEEDS_SPAN:         `간호사 ${det.nurse_id || '?'} fixed OFF/예산 ${det.total ?? '?'}일 > 활성 ${det.span ?? '?'}일`,
+      GLOBAL_DAY_CAPACITY_SHORTAGE:   `${det.day || '?'}일 총 근무 수요 ${det.total_demand ?? '?'}명 > 간호사 ${det.nurse_count ?? '?'}명`,
+      TEAM_SIZE_INSUFFICIENT:         `팀 ${det.team_id || '?'} 크기(${det.size ?? '?'}) < 팀 최소(${det.team_min ?? '?'})`,
+      FIXED_ASSIGN_VIOLATES_ALLOWED:  `간호사 ${det.nurse_id || '?'} fixed ${det.shift || '?'} → allowed_shifts 위반`,
+    };
+    return map[rc] || c.human_message_ko || rc;
   }
 
-  function causeDetailLine(c) {
-    const det = c.details || c.evidence || {};
-    const occ = det.occurrence_count;
-    if (occ && occ > 1) {
-      const days = (det.affected_days || []).slice(0, 5);
-      return `유사 ${occ}건` + (days.length ? ` · ${days.length}+ 영향 일자: ${days.join(', ')}일${(det.affected_days||[]).length > 5 ? ' 외' : ''}` : '');
-    }
-    return '';
+  function categoryFromCauseId(cid) {
+    if (!cid) return 'meta';
+    const m = cid.match(/^cause:([a-z]+):/);
+    return m ? m[1] : 'meta';
   }
 
-  function actionHeadline(t) {
-    const cfg = t.config_key || '?';
-    const dir = t.direction || '?';
-    if (t.action_type === 'data_correction_required') {
-      return `수동 점검 필요: ${cfg}`;
-    }
-    return `설정 조정: ${cfg} (${dir})`;
+  function categoryOfNode(n) {
+    if (n.kind === 'cause') return n.category || categoryFromCauseId(n.id);
+    if (n.kind === 'hard_case_meta') return 'meta';
+    if (n.kind === 'evidence') return 'evidence';
+    if (n.kind === 'bundle') return 'bundle';
+    if (n.kind === 'treatment') return 'treatment';
+    if (n.kind === 'symptom') return 'meta';
+    return 'meta';
   }
 
-  function render(d) {
-    root.innerHTML = '';
-    const inf = (d || {}).infeasibility || {};
+  // ───── Tier 1 — Status Banner ─────
+  function renderBanner(inf, meta) {
+    const hc = inf.hard_case || {};
     const severity = inf.severity || 'unknown';
-    const causes = inf.causes || [];
-    const symptoms = inf.observed_symptoms || [];
-    const treatments = inf.treatment_recommendations || [];
-    const narrative = inf.resolution_narrative || {};
-
-    meta.textContent = `severity=${severity}`;
-
-    // Summary card
-    const sum = el('div', 'summary');
-    sum.appendChild(el('span', 'severity ' + severity, severity.toUpperCase()));
-    sum.appendChild(el('h2', null, causes.length ? `${causes.length}건의 원인이 발견됐어요` : '근무표 생성 가능'));
-    sum.appendChild(el('p', null, inf.summary_message_ko || (causes.length ? '아래 원인 해소 후 다시 시도해주세요.' : '문제 없습니다.')));
-    root.appendChild(sum);
-
-    if (!causes.length && !treatments.length) {
-      root.appendChild(el('div', 'empty', '이 케이스에는 cause/treatment 가 없습니다.'));
+    let cls = 'soft', icon = '⚠', title = '문제 발견', desc = '';
+    if (severity === 'ok') {
+      cls = 'ok'; icon = '✅'; title = '근무표 생성 가능'; desc = '식별된 원인 없음';
+    } else if (hc.is_hard) {
+      cls = 'hard'; icon = '🚨'; title = `어려운 케이스 (${(hc.criteria_matched || []).join(', ')})`;
+      desc = hc.hard_reason_ko || '';
+    } else if (severity === 'blocking') {
+      cls = 'soft'; icon = '⚠'; title = `${(inf.causes || []).length}건의 원인 발견`;
+      desc = '아래 추천대로 적용하면 자동 해소 가능합니다.';
     }
+    const banner = el('div', 'banner ' + cls);
+    banner.appendChild(el('div', 'icon', icon));
+    const body = el('div');
+    body.appendChild(el('div', 'title', title));
+    body.appendChild(el('div', 'desc', desc));
+    if (hc.criteria_matched && hc.criteria_matched.length) {
+      const crit = el('div', 'criteria');
+      hc.criteria_matched.forEach(c => crit.appendChild(el('span', 'chip', c)));
+      body.appendChild(crit);
+    }
+    banner.appendChild(body);
+    return banner;
+  }
 
-    // Cause cards
-    if (causes.length) {
-      root.appendChild(el('div', 'section-title', '원인'));
-      const grid = el('div', 'cards');
-      causes.forEach(c => {
-        const card = el('div', 'card cause');
-        card.appendChild(el('div', 'label', c.reason_code || c.node_id || ''));
-        card.appendChild(el('div', 'headline', causeHeadline(c)));
-        const dl = causeDetailLine(c);
-        if (dl) card.appendChild(el('div', 'detail', dl));
-        grid.appendChild(card);
+  // ───── Tier 2 — Narrative Cards (3 columns) ─────
+  function renderNarrative(inf) {
+    const narr = inf.resolution_narrative || {};
+    const probs = narr.problem_list || [];
+    const acts  = narr.action_levers || [];
+    const tos   = narr.trade_offs || [];
+
+    const wrap = el('div', 'cards-3col');
+
+    // Problems
+    const colP = el('div', 'col col-problem');
+    colP.appendChild(el('div', 'col-title', `🔴  문제 (${probs.length})`));
+    if (!probs.length) colP.appendChild(el('div', 'item text', '식별된 원인 없음'));
+    probs.slice(0, 6).forEach(p => {
+      const it = el('div', 'item');
+      const top = el('div', 'top');
+      top.appendChild(el('span', `cat-badge cat-${p.category || 'meta'}`, p.category || 'meta'));
+      it.appendChild(top);
+      it.appendChild(el('div', 'text', p.rendered_ko || p.label || p.cause_id));
+      it.appendChild(el('div', 'meta', `${p.cause_id} · tier ${p.tier || '?'} · ${p.causal_layer || '?'}`));
+      colP.appendChild(it);
+    });
+    if (probs.length > 6) colP.appendChild(el('div', 'show-more', `…더 ${probs.length - 6}건`));
+    wrap.appendChild(colP);
+
+    // Solutions
+    const colS = el('div', 'col col-solution');
+    colS.appendChild(el('div', 'col-title', `🟢  해결책 (${acts.length})`));
+    if (!acts.length) colS.appendChild(el('div', 'item text', '추천 lever 없음'));
+    acts.slice(0, 6).forEach(a => {
+      const it = el('div', 'item');
+      it.appendChild(el('div', 'text', a.rationale_ko || a.treatment_id));
+      if (a.config_key && a.direction) {
+        it.appendChild(el('span', 'config-row', `${a.config_key} → ${a.direction}`));
+      } else if (a.action_type === 'data_correction_required') {
+        it.appendChild(el('span', 'config-row', '수동 점검'));
+      }
+      colS.appendChild(it);
+    });
+    if (acts.length > 6) colS.appendChild(el('div', 'show-more', `…더 ${acts.length - 6}건`));
+    wrap.appendChild(colS);
+
+    // Trade-offs
+    const colT = el('div', 'col col-tradeoff');
+    colT.appendChild(el('div', 'col-title', `⚠  부작용 주의 (${tos.length})`));
+    if (!tos.length) colT.appendChild(el('div', 'item text', '특이사항 없음'));
+    tos.slice(0, 6).forEach(t => {
+      const it = el('div', 'item');
+      it.appendChild(el('div', 'text', t.trade_off_ko));
+      colT.appendChild(it);
+    });
+    if (tos.length > 6) colT.appendChild(el('div', 'show-more', `…더 ${tos.length - 6}건`));
+    wrap.appendChild(colT);
+
+    return wrap;
+  }
+
+  // ───── Tier 3 — Mini Graph (3-column SVG) ─────
+  function buildGraphSvg(graph) {
+    const nodes = (graph && graph.nodes) || [];
+    const edges = (graph && graph.edges) || [];
+
+    // Apply category filter
+    const filtered = activeFilters.size
+      ? nodes.filter(n => activeFilters.has(categoryOfNode(n)) || n.kind !== 'cause')
+      : nodes;
+    const visibleIds = new Set(filtered.map(n => n.id));
+
+    // Layout: 3 columns
+    const colMap = {
+      cause: 0, symptom: 0,
+      treatment: 1, bundle: 1,
+      evidence: 2, hard_case_meta: 2,
+    };
+    const cols = [[], [], []];
+    filtered.forEach(n => {
+      const c = colMap[n.kind] ?? 2;
+      cols[c].push(n);
+    });
+
+    const W = 1100, H = 480;
+    const colX = [120, 540, 980];
+    const colW = 280;
+    const lineH = 38;
+    const startY = 50;
+
+    const positions = {};
+    cols.forEach((nodeList, ci) => {
+      const total = nodeList.length;
+      const colH = total * lineH;
+      const offsetY = Math.max(startY, (H - colH) / 2);
+      nodeList.forEach((n, i) => {
+        positions[n.id] = { x: colX[ci], y: offsetY + i * lineH, ci };
       });
-      root.appendChild(grid);
-    }
+    });
 
-    // Action cards
-    const primary = treatments[0];
-    const allTreatments = (primary && primary.treatments) ? primary.treatments : [];
-    if (allTreatments.length) {
-      root.appendChild(el('div', 'section-title', '추천 행동'));
-      const grid = el('div', 'cards');
-      allTreatments.forEach(t => {
-        const card = el('div', 'card action');
-        card.appendChild(el('div', 'label', t.target_family || t.treatment_id));
-        card.appendChild(el('div', 'headline', actionHeadline(t)));
-        if (t.config_key) {
-          const row = el('span', 'config-row', `${t.config_key} → ${t.direction}`);
-          card.appendChild(row);
-        }
-        if (t.rationale_ko) card.appendChild(el('div', 'detail', t.rationale_ko));
-        if (t.trade_off_ko) card.appendChild(el('div', 'trade-off', '⚠ ' + t.trade_off_ko));
-        grid.appendChild(card);
+    let svg = `<svg class="graph-svg" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+    // Column headers
+    svg += `<text x="${colX[0]}" y="22" text-anchor="middle" font-size="12" font-weight="700" fill="#5a6373">CAUSES</text>`;
+    svg += `<text x="${colX[1]}" y="22" text-anchor="middle" font-size="12" font-weight="700" fill="#5a6373">TREATMENTS / BUNDLES</text>`;
+    svg += `<text x="${colX[2]}" y="22" text-anchor="middle" font-size="12" font-weight="700" fill="#5a6373">EVIDENCE · HARD_CASE</text>`;
+
+    // Edges
+    edges.forEach(e => {
+      if (!visibleIds.has(e.src) || !visibleIds.has(e.dst)) return;
+      const p1 = positions[e.src], p2 = positions[e.dst];
+      if (!p1 || !p2) return;
+      const stroke = { causal: '#94a3b8', treatment: '#10b981',
+                       evidence: '#0ea5e9', aggregation: '#dc2626',
+                       member: '#cbd5e1' }[e.kind] || '#cbd5e1';
+      const dash = e.kind === 'member' ? '4,4' : (e.kind === 'aggregation' ? '6,3' : 'none');
+      const x1 = p1.x + 100, y1 = p1.y;
+      const x2 = p2.x - 100, y2 = p2.y;
+      const cx = (x1 + x2) / 2;
+      svg += `<path d="M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}" stroke="${stroke}" stroke-width="1.2" stroke-dasharray="${dash}" fill="none" opacity="0.6"/>`;
+    });
+
+    // Nodes
+    filtered.forEach(n => {
+      const p = positions[n.id]; if (!p) return;
+      const cat = categoryOfNode(n);
+      const color = getComputedStyle(document.documentElement).getPropertyValue('--cat-' + cat).trim() || '#6B7280';
+      const label = (n.label || n.id || '').replace(/cause:[a-z]+:/, '').slice(0, 32);
+      svg += `<rect x="${p.x - 100}" y="${p.y - 14}" width="200" height="28" rx="6" fill="${color}" opacity="0.92"/>`;
+      svg += `<text x="${p.x}" y="${p.y + 4}" text-anchor="middle" font-size="11" fill="white" font-weight="600">${escapeXml(label)}</text>`;
+    });
+    svg += '</svg>';
+    return svg;
+  }
+
+  function escapeXml(s) {
+    return String(s).replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c]));
+  }
+
+  function renderGraph(inf) {
+    const graph = inf.graph || { nodes: [], edges: [], stats: {} };
+    const stats = graph.stats || {};
+    const wrap = el('div', 'graph-wrap');
+    const header = el('div', 'graph-header');
+    header.appendChild(el('div', 'graph-title', '온톨로지 그래프 — cause → treatment → evidence'));
+
+    // Category filter chips (only cause categories in this graph)
+    const cats = new Set();
+    (graph.nodes || []).forEach(n => { if (n.kind === 'cause') cats.add(n.category); });
+    const chips = el('div', 'filter-chips');
+    Array.from(cats).sort().forEach(cat => {
+      const chip = el('div', 'filter-chip', cat);
+      chip.style.borderLeft = `4px solid var(--cat-${cat}, #6B7280)`;
+      if (activeFilters.size === 0 || activeFilters.has(cat)) chip.classList.add('active');
+      chip.addEventListener('click', () => {
+        if (activeFilters.has(cat)) activeFilters.delete(cat);
+        else activeFilters.add(cat);
+        renderAll();
       });
-      root.appendChild(grid);
+      chips.appendChild(chip);
+    });
+    if (cats.size > 1) {
+      const resetChip = el('div', 'filter-chip', '⟲ all');
+      resetChip.addEventListener('click', () => { activeFilters.clear(); renderAll(); });
+      chips.appendChild(resetChip);
     }
+    header.appendChild(chips);
+    wrap.appendChild(header);
 
-    // Advanced (자세히 보기)
+    const svgWrap = el('div');
+    svgWrap.innerHTML = buildGraphSvg(graph);
+    wrap.appendChild(svgWrap);
+
+    wrap.appendChild(el('div', 'graph-stats',
+      `nodes=${stats.node_count ?? 0} (cause:${stats.cause_count ?? 0} · treatment:${stats.treatment_count ?? 0} · bundle:${stats.bundle_count ?? 0}) · edges=${stats.edge_count ?? 0} · dangling=${stats.dangling_edges ?? 0}`));
+    return wrap;
+  }
+
+  // ───── Render orchestrator ─────
+  let _lastData = null, _lastSource = null;
+  function render(d, source) {
+    _lastData = d; _lastSource = source;
+    renderAll();
+  }
+  function renderAll() {
+    const d = _lastData; if (!d) return;
+    root.innerHTML = '';
+    const inf = (d.payload && d.payload.infeasibility) || d.infeasibility || {};
+    const verdict = d.verdict;
+    const meta = d.case_meta || {};
+
+    // Header verdict pill
+    if (verdict !== undefined) {
+      verdictEl.className = 'verdict ' + (verdict && verdict.pass ? 'pass' : 'fail');
+      verdictEl.textContent = verdict && verdict.pass ? `PASS (${verdict.actual_codes?.length || 0} causes)` : 'FAIL';
+    } else {
+      verdictEl.textContent = inf.severity || '—';
+      verdictEl.className = 'verdict';
+    }
+    metaInfo.textContent = meta.category ? `${meta.category} · ${meta.id}` : '';
+
+    root.appendChild(renderBanner(inf, meta));
+    root.appendChild(renderNarrative(inf));
+    root.appendChild(renderGraph(inf));
+
+    // Advanced (raw debug)
     const adv = el('details', 'advanced');
-    const sm = el('summary', null, '자세히 보기 (원자료 · 번들 · evidence)');
-    adv.appendChild(sm);
-
+    adv.appendChild(el('summary', null, '자세히 보기 (payload · graph · verdict raw)'));
+    const causes = inf.causes || [];
     if (causes.length) {
-      const s1 = el('div', 'advanced-section');
-      s1.appendChild(el('h4', null, '원인별 raw evidence'));
-      s1.appendChild(el('pre', null, JSON.stringify(causes.map(c => ({reason_code: c.reason_code, details: c.details || c.evidence})), null, 2)));
-      adv.appendChild(s1);
+      const s = el('div', 'adv-section');
+      s.appendChild(el('h4', null, `Causes (${causes.length}) — raw`));
+      s.appendChild(el('pre', null, JSON.stringify(causes, null, 2)));
+      adv.appendChild(s);
     }
-    if (treatments.length) {
-      const s2 = el('div', 'advanced-section');
-      s2.appendChild(el('h4', null, 'Treatment 번들 (cost / cover)'));
-      s2.appendChild(el('pre', null, JSON.stringify(treatments, null, 2)));
-      adv.appendChild(s2);
+    if (inf.treatment_recommendations) {
+      const s = el('div', 'adv-section');
+      s.appendChild(el('h4', null, `Treatments (${inf.treatment_recommendations.length} bundles)`));
+      s.appendChild(el('pre', null, JSON.stringify(inf.treatment_recommendations, null, 2)));
+      adv.appendChild(s);
     }
-    if (narrative && Object.keys(narrative).length) {
-      const s3 = el('div', 'advanced-section');
-      s3.appendChild(el('h4', null, 'Narrative (problem_list / action_levers / trade_offs)'));
-      s3.appendChild(el('pre', null, JSON.stringify(narrative, null, 2)));
-      adv.appendChild(s3);
+    if (inf.hard_case) {
+      const s = el('div', 'adv-section');
+      s.appendChild(el('h4', null, 'Hard Case Verdict'));
+      s.appendChild(el('pre', null, JSON.stringify(inf.hard_case, null, 2)));
+      adv.appendChild(s);
     }
-    if (symptoms.length) {
-      const s4 = el('div', 'advanced-section');
-      s4.appendChild(el('h4', null, '관찰된 증상 (symptoms — cause 아님)'));
-      s4.appendChild(el('pre', null, JSON.stringify(symptoms, null, 2)));
-      adv.appendChild(s4);
+    if (inf.graph) {
+      const s = el('div', 'adv-section');
+      s.appendChild(el('h4', null, `Graph (${(inf.graph.nodes || []).length} nodes / ${(inf.graph.edges || []).length} edges)`));
+      s.appendChild(el('pre', null, JSON.stringify(inf.graph, null, 2)));
+      adv.appendChild(s);
     }
-    if (inf.evidence) {
-      const s5 = el('div', 'advanced-section');
-      s5.appendChild(el('h4', null, 'EvidenceNode'));
-      s5.appendChild(el('pre', null, JSON.stringify(inf.evidence, null, 2)));
-      adv.appendChild(s5);
+    if (verdict) {
+      const s = el('div', 'adv-section');
+      s.appendChild(el('h4', null, 'Verdict (assert_case)'));
+      s.appendChild(el('pre', null, JSON.stringify(verdict, null, 2)));
+      adv.appendChild(s);
     }
-    const s6 = el('div', 'advanced-section');
-    s6.appendChild(el('h4', null, 'Payload 원본 (debug)'));
-    s6.appendChild(el('pre', null, JSON.stringify(d, null, 2)));
-    adv.appendChild(s6);
-
     root.appendChild(adv);
   }
 
