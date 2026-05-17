@@ -2073,6 +2073,25 @@ def matrix_cases_list() -> JSONResponse:
     return JSONResponse({"items": items, "count": len(items), "by_category": by_cat})
 
 
+@router.get("/audit")
+def ontology_audit_endpoint() -> JSONResponse:
+    """Ontology consistency audit — 9 invariant 검증.
+
+    응답: {pass, total, by_invariant, by_severity, findings[]}
+    HTTP 200 항상 (audit fail 도 OK 응답으로 — UI 가 노출).
+
+    invariants:
+      I1 cause.problem_template_ko    I2 cause ≥1 treatment
+      I3 treatment.applies_to_causes  I4 treatment rationale+trade_off
+      I5 config_key 친화 라벨         I6 direction 친화 라벨
+      I7 family ↔ MUS token mapping   I8 matrix factory cause_id 정합
+      I9 cause.category known set
+    """
+    from services.semantics.ontology_audit import audit_all, audit_summary
+    findings = audit_all()
+    return JSONResponse(audit_summary(findings))
+
+
 @router.get("/matrix/case/{case_id}/payload")
 def matrix_case_payload(case_id: str) -> JSONResponse:
     """case_id → 합성된 build_unrecoverable_payload (실시간)."""
