@@ -241,6 +241,15 @@ def build_precheck_input(
             d: code for d, code in fixed_map.items() if code not in {"O", "OFF"}
         }
 
+        # preceptor 페어링 — preceptor_id 가 있으면 본인이 preceptee
+        raw_ptor = nd.get("preceptor_id")
+        preceptor_id = str(raw_ptor).strip() if raw_ptor not in (None, "", 0) else None
+        # 동기 window 는 nurse data 에 명시되지 않으면 None → check 함수가 join/leave 로 채움
+        ws_start = nd.get("sync_window_start")
+        ws_end = nd.get("sync_window_end")
+        sync_start = _to_day_index(ws_start, year, month, days_in_month) if ws_start else None
+        sync_end = _to_day_index(ws_end, year, month, days_in_month) if ws_end else None
+
         nurses.append(
             PrecheckNurse(
                 nurse_id=nid,
@@ -252,6 +261,9 @@ def build_precheck_input(
                 personal_off_adjustment=personal_off,
                 fixed_off_days=fixed_off_days,
                 fixed_shift_assignments=fixed_shift_assignments,
+                preceptor_id=preceptor_id,
+                sync_window_start=sync_start,
+                sync_window_end=sync_end,
             )
         )
 
@@ -278,6 +290,14 @@ def build_precheck_input(
         "global_monthly_off_days": _safe_int(config_dict.get("global_monthly_off_days"), 0),
         "standard_personal_off_days": _safe_int(config_dict.get("standard_personal_off_days"), 0),
     }
+    # closed-loop apply target keys — 명시되어 있을 때만 forward (precheck 가 cfg 한도 추가 활용)
+    for k in ("max_night_shifts_per_month", "max_consecutive_work"):
+        v = config_dict.get(k)
+        if v is not None:
+            try:
+                roster_config[k] = int(v)
+            except (TypeError, ValueError):
+                pass
 
     return PrecheckInput(
         num_days=days_in_month,

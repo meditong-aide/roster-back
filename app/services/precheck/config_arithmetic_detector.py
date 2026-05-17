@@ -12,6 +12,12 @@
   - TEAM_MIN_EXCEEDS_TEAM_SIZE       — 팀 최소 인원 > 팀 크기
 
 기존 reason_code 들과 시맨틱 중복 없음 (각각 다른 차원의 모순).
+
+※ capacity/eligibility/preceptee 영역의 산술 검출은 team_grade_precheck.py
+   의 check_capacity_total_shortage / check_global_shift_allowed_shortage /
+   check_monthly_night_capacity / check_daily_night_shortage /
+   check_preceptee_sync_mismatch 가 담당한다 — PrecheckInput dataclass 기반
+   단일 진실 영역.
 """
 
 from __future__ import annotations

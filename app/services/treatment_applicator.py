@@ -65,14 +65,45 @@ class ApplyResult:
     dry_run: bool
 
 
+def _infer_target_value(
+    *,
+    config_dict: Optional[dict[str, Any]],
+    config_key: Optional[str],
+    direction: Optional[str],
+) -> Optional[Any]:
+    """set_threshold treatment 의 default target_value 추론.
+
+    사용자 정책 (docs HYPERGRAPH_AGENT_EXPERIMENT_LOG line 400):
+      "과격한 일괄 해제 없이도, 작은 단계 조정(1칸)으로 infeasible 해소".
+
+    config_dict 에서 config_key 의 현재 값을 읽고 direction 에 따라 ±1.
+    값이 없거나 정수 아니면 None (핸들러가 raise — manual 영역으로 분류 처리).
+    """
+    if not config_dict or not config_key:
+        return None
+    cur = config_dict.get(config_key)
+    if not isinstance(cur, int):
+        return None
+    if direction == "increase":
+        return cur + 1
+    if direction == "decrease":
+        return max(0, cur - 1)
+    return None
+
+
 def build_apply_plan(
     treatment_ids: list[str],
     ontology: Optional[ConstraintOntology] = None,
+    *,
+    config_dict: Optional[dict[str, Any]] = None,
 ) -> ApplyPlan:
     """treatment_id list → ApplyPlan (auto / manual / unresolved 분리).
 
     각 treatment 의 action_type 이 data_correction_required 면 manual_required 로 분리.
     ontology 에 없는 treatment_id 는 unresolved_treatment_ids 로.
+
+    config_dict 가 주어지면 set_threshold treatment 의 target_value 를 1-step
+    delta 로 자동 채운다. 값을 못 채우면 (cfg 키 없음 등) manual_required 분류.
     """
     onto = ontology or get_default_ontology()
     auto: list[ConstraintAdjustment] = []
@@ -87,9 +118,21 @@ def build_apply_plan(
         if ctrl_action is None:
             manual.append(tid)
             continue
+        target_value: Any = None
+        if ctrl_action == "set_threshold":
+            target_value = _infer_target_value(
+                config_dict=config_dict,
+                config_key=t.config_key,
+                direction=t.direction,
+            )
+            if target_value is None:
+                # cfg 에 키 없음/값 잘못 → manual 로 강등 (operator 가 직접)
+                manual.append(tid)
+                continue
         auto.append(ConstraintAdjustment(
             family=t.target_family,
             action=ctrl_action,
+            target_value=target_value,
             reason=f"treatment={tid}",
         ))
     return ApplyPlan(
@@ -114,7 +157,7 @@ def apply_treatments(
     config_dict 는 immutable — deepcopy 후 작업.
     """
     onto = ontology or get_default_ontology()
-    plan = build_apply_plan(treatment_ids, onto)
+    plan = build_apply_plan(treatment_ids, onto, config_dict=config_dict)
 
     snapshot = copy.deepcopy(config_dict or {})
 

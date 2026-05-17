@@ -170,30 +170,45 @@ def test_day_zero_path_emits_undiagnosed_when_all_probes_silent():
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Case 5: _extract_unrecoverable 의 NO_ASSIGNMENT 분해는 DAY_ZERO_COVERAGE 키워드 의존 없이 동작
+# Case 5 (US-10): NO_ASSIGNMENT* 결과 라벨은 cause-bucket 진입 금지.
+# 미배정 cell 자체는 결과(symptom) 이며 cause 가 아니다. 진짜 cause 는
+# team_grade_precheck 산술 detector + cause_inferer MUS 추론이 발급한다.
 # ─────────────────────────────────────────────────────────────────────────
-def test_no_assignment_capacity_decomposition_without_day_zero_keyword():
-    """Phase 1 회귀: line 3386 의 `DAY_ZERO_COVERAGE` 키워드 매칭 제거 후에도
-    shortages 만으로 NO_ASSIGNMENT_CAPACITY 분해가 잘 일어나는지 확인."""
+def test_no_assignment_4axis_not_emitted_anymore():
+    """NO_ASSIGNMENT 분해 (4 축) 가 더 이상 reason_code 로 emit 되지 않아야 한다."""
     rs = _MockRosterSystem(
         config=_MockConfig(),
         nurses=[],
         _constraint_pool_snapshot={"shortages": [{"pool_id": "team_pool:1:D", "shortage": 3}]},
     )
-    msg = "[reason_code=NO_ASSIGNMENT] Infeasible"  # DAY_ZERO_COVERAGE 키워드 없음
-    items = _extract_unrecoverable_violated_constraints(rs, generated=None, validation_error=msg)
-    codes = {x.get("reason_code") for x in items}
-    assert "NO_ASSIGNMENT_CAPACITY" in codes
-
-
-def test_no_assignment_capacity_decomposition_via_capacity_total_shortage_keyword():
-    """Phase 1 회귀: CAPACITY_TOTAL_SHORTAGE 키워드는 NO_ASSIGNMENT_CAPACITY 분해 트리거 유지."""
-    rs = _MockRosterSystem(config=_MockConfig(), nurses=[])
     msg = "[reason_code=NO_ASSIGNMENT] | [reason_code=CAPACITY_TOTAL_SHORTAGE]"
     items = _extract_unrecoverable_violated_constraints(rs, generated=None, validation_error=msg)
     codes = {x.get("reason_code") for x in items}
-    assert "NO_ASSIGNMENT_CAPACITY" in codes
-    assert "CAPACITY_TOTAL_SHORTAGE" in codes
+    for banned in (
+        "NO_ASSIGNMENT_CAPACITY", "NO_ASSIGNMENT_ELIGIBILITY",
+        "NO_ASSIGNMENT_FIXED", "NO_ASSIGNMENT_CARRYOVER",
+    ):
+        assert banned not in codes, f"4-axis label {banned} should be blocked"
+    # 단 raw NO_ASSIGNMENT 자체는 솔버 raw output 으로 들어올 수 있고,
+    # 그 경우는 classifier 가 symptom-bucket 으로 분리 처리한다.
+
+
+def test_no_assignment_raw_is_symptom_not_cause():
+    """raw NO_ASSIGNMENT 가 들어와도 cause-bucket 에는 들어가지 않는다."""
+    from services.precheck.cause_symptom_classifier import classify, split_violations
+    # 1) classifier 단독 검증
+    assert classify("NO_ASSIGNMENT") == "symptom"
+    # 2) split_violations 분리 검증
+    violations = [
+        {"reason_code": "NO_ASSIGNMENT", "details": {}},
+        {"reason_code": "CAPACITY_TOTAL_SHORTAGE", "details": {}},
+    ]
+    causes, symptoms, _ = split_violations(violations)
+    cause_codes = {c.get("reason_code") for c in causes}
+    sym_codes = {s.get("reason_code") for s in symptoms}
+    assert "NO_ASSIGNMENT" not in cause_codes
+    assert "NO_ASSIGNMENT" in sym_codes
+    assert "CAPACITY_TOTAL_SHORTAGE" in cause_codes
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -3339,11 +3339,6 @@ def _extract_unrecoverable_violated_constraints(
     REASON_TO_NODE = {
         "CAPACITY_TOTAL_SHORTAGE": ("infeasibility:capacity_total", "ConstraintNode"),
         "N_CAPACITY_SHORTAGE":     ("infeasibility:n_capacity", "ConstraintNode"),
-        "NO_ASSIGNMENT":           ("infeasibility:no_assignment", "ConstraintNode"),
-        "NO_ASSIGNMENT_CAPACITY":  ("infeasibility:no_assignment_capacity", "ConstraintNode"),
-        "NO_ASSIGNMENT_ELIGIBILITY": ("infeasibility:no_assignment_eligibility", "ConstraintNode"),
-        "NO_ASSIGNMENT_FIXED":     ("infeasibility:no_assignment_fixed", "ConstraintNode"),
-        "NO_ASSIGNMENT_CARRYOVER": ("infeasibility:no_assignment_carryover", "ConstraintNode"),
         "MAX_CAP_SHORTAGE":        ("infeasibility:max_cap_shortage", "ConstraintNode"),
         "GRADE_MAX_SUM_BELOW_NEED":("grade_max:sum_below_need", "GradeMaxNode"),
         "GRADE_HARD_PROBE":        ("grade_max:hard_probe", "GradeMaxNode"),
@@ -3365,60 +3360,10 @@ def _extract_unrecoverable_violated_constraints(
     for m in re.finditer(r"\[reason_code=([A-Z_]+)\]", err):
         _push(m.group(1), err, details={"source": "validation_error"})
 
-    def _infer_no_assignment_direct_reasons() -> list[str]:
-        """NO_ASSIGNMENT를 4축 direct reason으로 분해한다 (규칙 기반)."""
-        direct: list[str] = []
-        text = str(err or "").upper()
-        evidence = getattr(roster_system, "_validator_evidence", None) or {}
-        top_failed = list((evidence or {}).get("top_failed_cells") or [])
-        eligible_zero_cells = int((evidence or {}).get("eligible_zero_cells") or 0)
-        total_failed_cells = int((evidence or {}).get("total_failed_cells") or 0)
-        fixed_forbidden_count = int((evidence or {}).get("fixed_forbidden_count") or 0)
-        carryover_artifact_count = int((evidence or {}).get("carryover_artifact_count") or 0)
-
-        if "NO_ASSIGNMENT" not in text and "NO_ASSIGNMENT" not in seen_codes:
-            return direct
-
-        # capacity
-        try:
-            pool = getattr(roster_system, "_constraint_pool_snapshot", None) or {}
-            shortages = list((pool or {}).get("shortages") or [])
-            if shortages or any(k in text for k in ["CAPACITY_TOTAL_SHORTAGE", "N_CAPACITY_SHORTAGE"]):
-                direct.append("NO_ASSIGNMENT_CAPACITY")
-            elif int((evidence or {}).get("required_minus_assigned_total") or 0) > 0 and eligible_zero_cells < max(1, total_failed_cells // 3):
-                direct.append("NO_ASSIGNMENT_CAPACITY")
-        except Exception:
-            pass
-
-        # eligibility
-        if any(k in text for k in ["ALLOWED_SHIFTS_ISOLATES_NURSE", "TEAM_SHIFT_ALLOWED_SHORTAGE", "SHIFT_NOT_ALLOWED", "N_ONLY"]):
-            direct.append("NO_ASSIGNMENT_ELIGIBILITY")
-        elif total_failed_cells > 0 and eligible_zero_cells >= max(1, total_failed_cells // 2):
-            direct.append("NO_ASSIGNMENT_ELIGIBILITY")
-
-        # fixed
-        if any(k in text for k in ["FIXED_ASSIGN_", "INITIAL_FORBIDDEN", "FORBIDDEN_SHIFT", "FIXED_WANTED"]):
-            direct.append("NO_ASSIGNMENT_FIXED")
-        elif total_failed_cells > 0 and fixed_forbidden_count > 0:
-            direct.append("NO_ASSIGNMENT_FIXED")
-
-        # carryover
-        if any(k in text for k in ["PREV_", "CARRYOVER", "2N2OFF", "3N2OFF", "BOUNDARY"]):
-            direct.append("NO_ASSIGNMENT_CARRYOVER")
-        elif total_failed_cells > 0 and carryover_artifact_count > 0:
-            direct.append("NO_ASSIGNMENT_CARRYOVER")
-
-        return list(dict.fromkeys(direct))
-
-    for rc in _infer_no_assignment_direct_reasons():
-        _push(
-            rc,
-            f"[reason_code={rc}] NO_ASSIGNMENT direct reason 분류",
-            details={
-                "source": "no_assignment_direct_rule",
-                "validator_evidence": getattr(roster_system, "_validator_evidence", None) or {},
-            },
-        )
+    # NO_ASSIGNMENT* 4축 라벨 추론 코드 제거됨 (US-10):
+    # 미배정 cell 자체는 "결과(symptom)" 이며 cause 가 아니다.
+    # 실제 cause 는 team_grade_precheck 의 산술 detector + cause_inferer 의
+    # MUS pattern 추론 가 구체 cause_id 로 만들어준다.
 
     try:
         diag = _build_infeasible_diagnosis(roster_system, generated)

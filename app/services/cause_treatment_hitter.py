@@ -126,7 +126,13 @@ def propose_bundles(
         alt.overhead = bundle_overhead_per_extra * max(0, len(alt.treatments) - 1)
         bundles.append(alt)
 
-    bundles.sort(key=lambda b: (b.total_cost + b.overhead, len(b.uncovered_causes), len(b.treatments)))
+    # 정렬 우선순위:
+    #   1) uncovered 적은 것 (전체 cover 가능한 bundle 가 있으면 그것 primary)
+    #   2) cost 낮은 것
+    #   3) treatment 수 적은 것
+    # 사용자 정신: "추천대로 적용하면 cause 가 실제 해결돼야 한다".
+    # cost 만으로 정렬하면 partial-cover bundle 이 full-cover 위로 가서 추천 실패.
+    bundles.sort(key=lambda b: (len(b.uncovered_causes), b.total_cost + b.overhead, len(b.treatments)))
     return bundles[:max_alternatives]
 
 

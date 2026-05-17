@@ -45,6 +45,12 @@ class PrecheckNurse:
     personal_off_adjustment: int = 0
     fixed_off_days: Set[int] = field(default_factory=set)
     fixed_shift_assignments: Dict[int, str] = field(default_factory=dict)  # {day: shift}
+    # 프리셉티 — preceptor 와의 동기 페어링.
+    # None 이면 일반 nurse, 값이 있으면 본인이 preceptee 이고 가리키는 사람이 preceptor.
+    preceptor_id: Optional[str] = None
+    # 동기화 기간 (0-based day index). None → [join_day, leave_day] 전체로 간주.
+    sync_window_start: Optional[int] = None
+    sync_window_end: Optional[int] = None
 
 
 @dataclass
@@ -79,8 +85,12 @@ def _need(cfg: Dict[str, Any], shift: str, day: int) -> int:
 
 def _allowed_set(nurse: PrecheckNurse, S: List[str]) -> Set[str]:
     raw = nurse.allowed_shifts
-    if raw is None or len(raw) == 0:
+    if raw is None:
+        # 미지정 → universe 전체 가능 (기본값).
         return set(S)
+    if len(raw) == 0:
+        # 명시적 빈 list = 명시적 lockout (∅). ALLOWED_SHIFTS_ISOLATES_NURSE 발급 가능.
+        return set()
     return {str(x) for x in raw if x in S}
 
 
@@ -320,39 +330,116 @@ def check_global_shift_allowed_shortage(inp: PrecheckInput) -> List[Dict]:
             nd = _need(inp.roster_config, s, d)
             if nd <= 0:
                 continue
-            avail = 0
+            eligible_ids: List[str] = []
             for n in inp.nurses:
                 if not _active(n, d):
                     continue
                 if s in _allowed_set(n, S):
-                    avail += 1
-            if nd > avail:
-                issues.append(
-                    _issue(
-                        "GLOBAL_SHIFT_ALLOWED_SHORTAGE",
-                        {"shift": s, "day": d, "required": nd, "allowed_nurses": avail},
-                    )
+                    eligible_ids.append(n.nurse_id)
+            avail = len(eligible_ids)
+            if nd <= avail:
+                continue
+
+            # 인접 shift 자격자 풀 — 'D 부족할 때 N 가능한 사람 몇명?' 같은 컨텍스트
+            cross_pool: Dict[str, List[str]] = {}
+            for other in S:
+                if other == s:
+                    continue
+                cross = [
+                    n.nurse_id for n in inp.nurses
+                    if _active(n, d) and (other in _allowed_set(n, S)) and (n.nurse_id not in eligible_ids)
+                ]
+                if cross:
+                    cross_pool[other] = cross
+
+            issues.append(
+                _issue(
+                    "GLOBAL_SHIFT_ALLOWED_SHORTAGE",
+                    {
+                        # ontology template keys (day 는 1-based 로 노출)
+                        "shift": s,
+                        "day": d + 1,
+                        "required": nd,
+                        "eligible": avail,
+                        "shortage": nd - avail,
+                        # legacy
+                        "allowed_nurses": avail,
+                        # 풍부 디테일
+                        "eligible_nurses": eligible_ids,
+                        "cross_shift_eligible_pool": {k: v for k, v in cross_pool.items()},
+                        "cross_shift_eligible_counts": {k: len(v) for k, v in cross_pool.items()},
+                    },
                 )
+            )
     return issues
 
 
 def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
-    total_need = sum(_need(inp.roster_config, s, d) for d in range(inp.num_days) for s in S)
-    total_cap = sum(_working_capacity(n, inp.roster_config) for n in inp.nurses)
-    if total_need > total_cap:
-        return [
-            _issue(
-                "CAPACITY_TOTAL_SHORTAGE",
-                {
-                    "required_total": total_need,
-                    "capacity_total": total_cap,
-                    "nurse_count": len(inp.nurses),
-                    "num_days": inp.num_days,
-                },
-            )
-        ]
-    return []
+    # 일별 demand 분포 — bottleneck 식별용
+    daily_demand = [
+        {"day": d + 1, "by_shift": {s: _need(inp.roster_config, s, d) for s in S}}
+        for d in range(inp.num_days)
+    ]
+    for dd in daily_demand:
+        dd["demand"] = sum(dd["by_shift"].values())
+
+    total_need = sum(dd["demand"] for dd in daily_demand)
+    if total_need <= 0:
+        return []
+
+    per_nurse_caps = [
+        {"nurse_id": n.nurse_id, "capacity_days": _working_capacity(n, inp.roster_config),
+         "personal_off_adjustment": n.personal_off_adjustment}
+        for n in inp.nurses
+    ]
+    total_cap = sum(c["capacity_days"] for c in per_nurse_caps)
+
+    if total_need <= total_cap:
+        return []
+
+    shortage = total_need - total_cap
+    avg_daily = total_need / inp.num_days if inp.num_days else 0.0
+
+    # 평균 초과 day → bottleneck (동적 임계값)
+    bottleneck_days = sorted(
+        [dd for dd in daily_demand if dd["demand"] > avg_daily],
+        key=lambda x: x["demand"], reverse=True,
+    )
+
+    # shift 별 share
+    by_shift_total: Dict[str, int] = {s: 0 for s in S}
+    for dd in daily_demand:
+        for s, v in dd["by_shift"].items():
+            by_shift_total[s] = by_shift_total.get(s, 0) + v
+
+    # 가장 capacity 낮은 nurse 상위 — shortage 와 동일 수 (단 nurse_count 이하)
+    per_nurse_caps.sort(key=lambda x: x["capacity_days"])
+    top_n = min(shortage, len(per_nurse_caps))
+    lowest_capacity_nurses = per_nurse_caps[:top_n]
+
+    return [
+        _issue(
+            "CAPACITY_TOTAL_SHORTAGE",
+            {
+                # ontology template keys
+                "required": total_need,
+                "capacity": total_cap,
+                "shortage": shortage,
+                # legacy keys (1 릴리즈 유지)
+                "required_total": total_need,
+                "capacity_total": total_cap,
+                "nurse_count": len(inp.nurses),
+                "num_days": inp.num_days,
+                # 풍부 디테일 — narrative 가 problem_list/action_lever 구성에 사용
+                "avg_daily_demand": round(avg_daily, 2),
+                "demand_by_shift": by_shift_total,
+                "bottleneck_days": bottleneck_days,
+                "lowest_capacity_nurses": lowest_capacity_nurses,
+                "demand_uniform": len(bottleneck_days) == 0,
+            },
+        )
+    ]
 
 
 def check_team_min_exceeds_global_need(inp: PrecheckInput) -> List[Dict]:
@@ -719,23 +806,196 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
 
     Fix 1: 공통풀에 국한하지 않고 N 허용 간호사 전체의 working capacity 를 합산한다.
     팀 여부/team_min[N] 값과 무관 — N 할 수 있는 모든 사람이 공급원이다.
+
+    Fix 2 (α): cfg.max_night_shifts_per_month 한도도 동시에 적용 — 이 값이 명시되어
+    있으면 nurse 당 night 가용일이 두 값 중 작은 쪽으로 제약됨.
+    `cap = Σ_n min(working_capacity[n], max_night_shifts_per_month)`.
     """
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     n_capable = [n for n in inp.nurses if "N" in _allowed_set(n, S)]
-    cap = sum(_working_capacity(n, inp.roster_config) for n in n_capable)
+    cfg_max_night = inp.roster_config.get("max_night_shifts_per_month")
+    try:
+        cfg_max_night = int(cfg_max_night) if cfg_max_night is not None else None
+    except (TypeError, ValueError):
+        cfg_max_night = None
+
+    def _night_cap_for_nurse(n: PrecheckNurse) -> int:
+        wc = _working_capacity(n, inp.roster_config)
+        if cfg_max_night is not None and cfg_max_night >= 0:
+            return min(wc, cfg_max_night)
+        return wc
+
+    cap = sum(_night_cap_for_nurse(n) for n in n_capable)
     monthly_need = sum(_need(inp.roster_config, "N", d) for d in range(inp.num_days))
-    if cap < monthly_need:
-        return [
+    if cap >= monthly_need:
+        return []
+
+    # 일별 N 수요 분포 — peak day 식별
+    daily_N_need = [
+        {"day": d + 1, "demand": _need(inp.roster_config, "N", d)}
+        for d in range(inp.num_days)
+    ]
+    avg_n_daily = monthly_need / inp.num_days if inp.num_days else 0.0
+    peak_days = sorted(
+        [r for r in daily_N_need if r["demand"] > avg_n_daily],
+        key=lambda x: x["demand"], reverse=True,
+    )
+
+    # N 가능 nurse 별 working capacity — 누가 가장 가용 적은지
+    n_capable_caps = [
+        {"nurse_id": n.nurse_id, "capacity_days": _working_capacity(n, inp.roster_config)}
+        for n in n_capable
+    ]
+    n_capable_caps.sort(key=lambda x: x["capacity_days"])
+
+    return [
+        _issue(
+            "MONTHLY_NIGHT_CAPACITY_SHORTAGE",
+            {
+                # ontology template keys
+                "n_required": monthly_need,
+                "n_capacity": cap,
+                "shortage": monthly_need - cap,
+                # legacy keys
+                "night_allowed_count": len(n_capable),
+                "night_capacity": cap,
+                "monthly_N_need": monthly_need,
+                # 풍부 디테일
+                "avg_daily_N_demand": round(avg_n_daily, 2),
+                "peak_n_days": peak_days,
+                "night_capable_nurses": n_capable_caps,
+                "demand_uniform": len(peak_days) == 0,
+            },
+        )
+    ]
+
+
+def check_daily_night_shortage(inp: PrecheckInput) -> List[Dict]:
+    """일별 N 수요 > 그 날 N 가능 active 인원.
+
+    monthly_night 와 다른 차원 — 월 합은 충분하지만 특정 day 에 N 가능자가
+    OFF/휴가/carryover 회복 등으로 부족할 수 있다.
+    """
+    S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
+    issues: List[Dict] = []
+    n_capable_ids = {n.nurse_id for n in inp.nurses if "N" in _allowed_set(n, S)}
+    if not n_capable_ids:
+        return []
+
+    for d in range(inp.num_days):
+        nd = _need(inp.roster_config, "N", d)
+        if nd <= 0:
+            continue
+        # 그 날 N 가능하면서 active 한 nurse
+        active_n_capable = [
+            n.nurse_id for n in inp.nurses
+            if n.nurse_id in n_capable_ids and _active(n, d)
+        ]
+        avail = len(active_n_capable)
+        if nd <= avail:
+            continue
+
+        # 비활성 사유 — 같은 N 가능자 중 fixed_off/leave/join 으로 빠진 사람
+        blocked = []
+        for n in inp.nurses:
+            if n.nurse_id not in n_capable_ids:
+                continue
+            if _active(n, d):
+                continue
+            reason = []
+            if d in n.fixed_off_days:
+                reason.append("fixed_off")
+            if d < n.join_day:
+                reason.append("not_joined")
+            if d > n.leave_day:
+                reason.append("after_leave")
+            blocked.append({"nurse_id": n.nurse_id, "reasons": reason or ["unknown"]})
+
+        issues.append(
             _issue(
-                "MONTHLY_NIGHT_CAPACITY_SHORTAGE",
+                "N_CAPACITY_SHORTAGE",
                 {
-                    "night_allowed_count": len(n_capable),
-                    "night_capacity": cap,
-                    "monthly_N_need": monthly_need,
+                    # ontology template keys
+                    "day": d + 1,
+                    "n_required": nd,
+                    "n_capacity": avail,
+                    "shortage": nd - avail,
+                    # 풍부 디테일
+                    "active_night_capable_nurses": active_n_capable,
+                    "blocked_night_capable_nurses": blocked,
+                    "total_night_capable_pool": len(n_capable_ids),
                 },
             )
-        ]
-    return []
+        )
+    return issues
+
+
+def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
+    """preceptor-preceptee pair 가 동시 근무 불가 → 페어링 실패.
+
+    감지 사유:
+      - shift_intersection_empty: 양쪽 allowed_shifts intersection ∅
+      - team_mismatch: team_id 불일치
+      - window_empty: sync_window 가 양쪽 active span 와 ∅
+    """
+    S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
+    by_id: Dict[str, PrecheckNurse] = {n.nurse_id: n for n in inp.nurses}
+    issues: List[Dict] = []
+    for n in inp.nurses:
+        if not n.preceptor_id:
+            continue
+        ptor = by_id.get(str(n.preceptor_id))
+        if ptor is None:
+            continue  # mentor 가 PrecheckInput 에 없으면 다른 영역에서 처리
+
+        ptor_shifts = _allowed_set(ptor, S)
+        ptee_shifts = _allowed_set(n, S)
+        shift_intersection = ptor_shifts & ptee_shifts
+
+        team_match = (ptor.team_id is not None
+                      and ptor.team_id == n.team_id
+                      and ptor.team_id not in (None, "", 0))
+
+        ws_start = n.sync_window_start if n.sync_window_start is not None else max(n.join_day, ptor.join_day)
+        ws_end = n.sync_window_end if n.sync_window_end is not None else min(n.leave_day, ptor.leave_day)
+        window_days = max(0, ws_end - ws_start + 1)
+        # active span ∩ window — 두 사람 모두 활동하는 구간 안에 window 가 있어야 의미
+        effective_start = max(ws_start, n.join_day, ptor.join_day)
+        effective_end = min(ws_end, n.leave_day, ptor.leave_day)
+        effective_days = max(0, effective_end - effective_start + 1)
+
+        reasons: List[str] = []
+        if not shift_intersection:
+            reasons.append("shift_intersection_empty")
+        if not team_match:
+            reasons.append("team_mismatch")
+        if effective_days <= 0:
+            reasons.append("window_empty")
+
+        if not reasons:
+            continue
+
+        issues.append(
+            _issue(
+                "PRECEPTEE_SYNC_MISMATCH",
+                {
+                    # ontology template keys
+                    "preceptor_id": ptor.nurse_id,
+                    "preceptee_id": n.nurse_id,
+                    "start_day": ws_start + 1,
+                    "end_day": ws_end + 1,
+                    # 풍부 디테일
+                    "window_days": window_days,
+                    "mismatch_reasons": reasons,
+                    "preceptor_shifts": sorted(ptor_shifts),
+                    "preceptee_shifts": sorted(ptee_shifts),
+                    "shift_intersection": sorted(shift_intersection),
+                    "preceptor_team": ptor.team_id,
+                    "preceptee_team": n.team_id,
+                },
+            )
+        )
+    return issues
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +1085,8 @@ def run_precheck(
         check_team_grade_intersect_shortage,  # Fix 3
         check_fixed_assign_breaks_team_min,
         check_monthly_night_capacity,  # Fix 1 (renamed from check_common_pool_night_capacity)
+        check_daily_night_shortage,
+        check_preceptee_sync_mismatch,
     ]
     for fn in day_phase:
         issues.extend(fn(inp))

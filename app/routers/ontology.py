@@ -1993,6 +1993,48 @@ def patterns(
     )
 
 
+# ── Alpha case API (α 새 시스템 e2e 결과 노출) ─────────────────────────
+
+_ALPHA_CASES_DIR = Path(__file__).resolve().parents[2] / "tools" / "harness" / "reports" / "alpha_cases"
+
+
+def _list_alpha_cases() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not _ALPHA_CASES_DIR.exists():
+        return out
+    for p in sorted(_ALPHA_CASES_DIR.glob("*.json")):
+        try:
+            d = json.loads(p.read_text())
+            inf = d.get("infeasibility", {}) or {}
+            causes = inf.get("causes") or []
+            out.append({
+                "case_id": p.stem,
+                "severity": inf.get("severity"),
+                "cause_count": len(causes),
+                "cause_ids": [c.get("reason_code") for c in causes],
+                "treatment_count": len(inf.get("treatment_recommendations") or []),
+            })
+        except Exception:
+            continue
+    return out
+
+
+@router.get("/cases")
+def list_cases() -> JSONResponse:
+    return JSONResponse({"items": _list_alpha_cases()})
+
+
+@router.get("/case/{case_id}")
+def get_case(case_id: str) -> JSONResponse:
+    path = _ALPHA_CASES_DIR / f"{case_id}.json"
+    if not path.exists():
+        return JSONResponse({"error": f"case {case_id} not found"}, status_code=404)
+    try:
+        return JSONResponse(json.loads(path.read_text()))
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 # ── HTML page ──────────────────────────────────────────────
 
 
@@ -2652,7 +2694,291 @@ _HTML = """<!doctype html>
 """
 
 
+_HTML_V2 = """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>Ontology — 진단</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 0;
+      font-family: -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+      background: #f7f8fa; color: #1a1d24;
+      line-height: 1.5;
+    }
+    header {
+      background: #fff; border-bottom: 1px solid #e6e8ed;
+      padding: 16px 24px; display: flex; align-items: center; gap: 16px;
+    }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header select {
+      padding: 8px 12px; border: 1px solid #cfd4dc; border-radius: 6px;
+      background: #fff; font-size: 14px; min-width: 280px;
+    }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .summary {
+      background: #fff; border: 1px solid #e6e8ed; border-radius: 12px;
+      padding: 20px 24px; margin-bottom: 20px;
+    }
+    .summary .severity {
+      display: inline-block; padding: 4px 12px; border-radius: 999px;
+      font-size: 12px; font-weight: 600; letter-spacing: 0.3px;
+    }
+    .severity.blocking { background: #fee; color: #c0392b; }
+    .severity.warning { background: #fff3cd; color: #856404; }
+    .severity.ok { background: #d4edda; color: #155724; }
+    .summary h2 { margin: 8px 0 4px; font-size: 22px; }
+    .summary p { margin: 4px 0 0; color: #555; font-size: 14px; }
+    .section-title {
+      font-size: 14px; font-weight: 600; color: #5a6373;
+      letter-spacing: 0.5px; margin: 0 0 10px; text-transform: uppercase;
+    }
+    .cards {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 12px; margin-bottom: 24px;
+    }
+    .card {
+      background: #fff; border: 1px solid #e6e8ed; border-radius: 10px;
+      padding: 16px 18px;
+    }
+    .card.cause { border-left: 4px solid #c0392b; }
+    .card.action { border-left: 4px solid #2980b9; }
+    .card .label { font-size: 12px; font-weight: 600; color: #5a6373; margin-bottom: 6px; }
+    .card .headline { font-size: 15px; font-weight: 600; margin: 4px 0; }
+    .card .detail { font-size: 13px; color: #555; margin-top: 6px; }
+    .card .config-row {
+      display: inline-block; background: #eef3f9; padding: 4px 10px;
+      border-radius: 6px; font-family: ui-monospace, monospace;
+      font-size: 12px; margin-top: 8px;
+    }
+    details.advanced {
+      background: #fff; border: 1px solid #e6e8ed; border-radius: 10px;
+      padding: 12px 18px; margin-top: 24px;
+    }
+    details.advanced > summary {
+      cursor: pointer; font-size: 14px; font-weight: 600; color: #5a6373;
+      list-style: none; outline: none;
+    }
+    details.advanced > summary::before { content: "▶  "; font-size: 11px; }
+    details.advanced[open] > summary::before { content: "▼  "; }
+    details.advanced pre {
+      background: #1a1d24; color: #e6e8ed; padding: 14px;
+      border-radius: 6px; font-size: 11px; overflow-x: auto;
+      max-height: 480px; margin: 12px 0 0;
+    }
+    .advanced-section { margin-top: 16px; }
+    .advanced-section h4 { font-size: 13px; margin: 4px 0 6px; color: #5a6373; }
+    .empty { color: #888; padding: 40px 0; text-align: center; }
+    .pill { display: inline-block; padding: 2px 8px; background: #eef3f9; border-radius: 4px; font-size: 11px; margin-right: 4px; font-family: ui-monospace, monospace; }
+    .trade-off { font-size: 12px; color: #856404; background: #fff8e1; padding: 8px 10px; border-radius: 6px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>온톨로지 진단</h1>
+    <select id="case-select"></select>
+    <span id="case-meta" style="font-size:12px;color:#888"></span>
+  </header>
+  <main id="root">
+    <div class="empty">케이스 로드 중…</div>
+  </main>
+
+  <script>
+  const sel = document.getElementById('case-select');
+  const meta = document.getElementById('case-meta');
+  const root = document.getElementById('root');
+
+  async function loadCases() {
+    const r = await fetch('/ontology/cases');
+    const d = await r.json();
+    sel.innerHTML = '';
+    (d.items || []).forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.case_id;
+      opt.textContent = `${c.case_id}  —  ${c.cause_count} causes / ${c.treatment_count} treatments`;
+      sel.appendChild(opt);
+    });
+    if (d.items && d.items.length) loadCase(d.items[0].case_id);
+  }
+
+  async function loadCase(caseId) {
+    const r = await fetch(`/ontology/case/${encodeURIComponent(caseId)}`);
+    const d = await r.json();
+    render(d);
+  }
+
+  sel.addEventListener('change', () => loadCase(sel.value));
+
+  function el(tag, cls, html) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html !== undefined) e.innerHTML = html;
+    return e;
+  }
+
+  function shortValue(v) {
+    if (v === null || v === undefined) return '—';
+    if (typeof v === 'object') return JSON.stringify(v).slice(0, 80);
+    const s = String(v);
+    return s.length > 80 ? s.slice(0, 77) + '…' : s;
+  }
+
+  function causeHeadline(c) {
+    const det = c.details || c.evidence || {};
+    const rc = c.reason_code || c.node_id || '?';
+    if (rc === 'PRECEPTEE_SYNC_MISMATCH') {
+      return `프리셉터-프리셉티 동기화 불가 (${det.preceptor_id || '?'} ↔ ${det.preceptee_id || '?'})`;
+    }
+    if (rc === 'N_CAPACITY_SHORTAGE') {
+      return `일별 야간 인력 부족 (${det.day || '?'}일, 수요 ${det.n_required ?? '?'} / 가능 ${det.n_capacity ?? '?'})`;
+    }
+    if (rc === 'MONTHLY_NIGHT_CAPACITY_SHORTAGE') {
+      return `월간 야간 capacity 부족 (수요 ${det.n_required ?? '?'} / 한도 ${det.n_capacity ?? '?'})`;
+    }
+    if (rc === 'GLOBAL_SHIFT_ALLOWED_SHORTAGE') {
+      return `${det.day || '?'}일 ${det.shift || '?'} 시프트 자격자 부족 (가능 ${det.eligible ?? '?'} / 수요 ${det.required ?? '?'})`;
+    }
+    if (rc === 'CAPACITY_TOTAL_SHORTAGE') {
+      return `월 총 인력 부족 (수요 ${det.required ?? '?'} / 공급 ${det.capacity ?? '?'})`;
+    }
+    return c.human_message_ko || rc;
+  }
+
+  function causeDetailLine(c) {
+    const det = c.details || c.evidence || {};
+    const occ = det.occurrence_count;
+    if (occ && occ > 1) {
+      const days = (det.affected_days || []).slice(0, 5);
+      return `유사 ${occ}건` + (days.length ? ` · ${days.length}+ 영향 일자: ${days.join(', ')}일${(det.affected_days||[]).length > 5 ? ' 외' : ''}` : '');
+    }
+    return '';
+  }
+
+  function actionHeadline(t) {
+    const cfg = t.config_key || '?';
+    const dir = t.direction || '?';
+    if (t.action_type === 'data_correction_required') {
+      return `수동 점검 필요: ${cfg}`;
+    }
+    return `설정 조정: ${cfg} (${dir})`;
+  }
+
+  function render(d) {
+    root.innerHTML = '';
+    const inf = (d || {}).infeasibility || {};
+    const severity = inf.severity || 'unknown';
+    const causes = inf.causes || [];
+    const symptoms = inf.observed_symptoms || [];
+    const treatments = inf.treatment_recommendations || [];
+    const narrative = inf.resolution_narrative || {};
+
+    meta.textContent = `severity=${severity}`;
+
+    // Summary card
+    const sum = el('div', 'summary');
+    sum.appendChild(el('span', 'severity ' + severity, severity.toUpperCase()));
+    sum.appendChild(el('h2', null, causes.length ? `${causes.length}건의 원인이 발견됐어요` : '근무표 생성 가능'));
+    sum.appendChild(el('p', null, inf.summary_message_ko || (causes.length ? '아래 원인 해소 후 다시 시도해주세요.' : '문제 없습니다.')));
+    root.appendChild(sum);
+
+    if (!causes.length && !treatments.length) {
+      root.appendChild(el('div', 'empty', '이 케이스에는 cause/treatment 가 없습니다.'));
+    }
+
+    // Cause cards
+    if (causes.length) {
+      root.appendChild(el('div', 'section-title', '원인'));
+      const grid = el('div', 'cards');
+      causes.forEach(c => {
+        const card = el('div', 'card cause');
+        card.appendChild(el('div', 'label', c.reason_code || c.node_id || ''));
+        card.appendChild(el('div', 'headline', causeHeadline(c)));
+        const dl = causeDetailLine(c);
+        if (dl) card.appendChild(el('div', 'detail', dl));
+        grid.appendChild(card);
+      });
+      root.appendChild(grid);
+    }
+
+    // Action cards
+    const primary = treatments[0];
+    const allTreatments = (primary && primary.treatments) ? primary.treatments : [];
+    if (allTreatments.length) {
+      root.appendChild(el('div', 'section-title', '추천 행동'));
+      const grid = el('div', 'cards');
+      allTreatments.forEach(t => {
+        const card = el('div', 'card action');
+        card.appendChild(el('div', 'label', t.target_family || t.treatment_id));
+        card.appendChild(el('div', 'headline', actionHeadline(t)));
+        if (t.config_key) {
+          const row = el('span', 'config-row', `${t.config_key} → ${t.direction}`);
+          card.appendChild(row);
+        }
+        if (t.rationale_ko) card.appendChild(el('div', 'detail', t.rationale_ko));
+        if (t.trade_off_ko) card.appendChild(el('div', 'trade-off', '⚠ ' + t.trade_off_ko));
+        grid.appendChild(card);
+      });
+      root.appendChild(grid);
+    }
+
+    // Advanced (자세히 보기)
+    const adv = el('details', 'advanced');
+    const sm = el('summary', null, '자세히 보기 (원자료 · 번들 · evidence)');
+    adv.appendChild(sm);
+
+    if (causes.length) {
+      const s1 = el('div', 'advanced-section');
+      s1.appendChild(el('h4', null, '원인별 raw evidence'));
+      s1.appendChild(el('pre', null, JSON.stringify(causes.map(c => ({reason_code: c.reason_code, details: c.details || c.evidence})), null, 2)));
+      adv.appendChild(s1);
+    }
+    if (treatments.length) {
+      const s2 = el('div', 'advanced-section');
+      s2.appendChild(el('h4', null, 'Treatment 번들 (cost / cover)'));
+      s2.appendChild(el('pre', null, JSON.stringify(treatments, null, 2)));
+      adv.appendChild(s2);
+    }
+    if (narrative && Object.keys(narrative).length) {
+      const s3 = el('div', 'advanced-section');
+      s3.appendChild(el('h4', null, 'Narrative (problem_list / action_levers / trade_offs)'));
+      s3.appendChild(el('pre', null, JSON.stringify(narrative, null, 2)));
+      adv.appendChild(s3);
+    }
+    if (symptoms.length) {
+      const s4 = el('div', 'advanced-section');
+      s4.appendChild(el('h4', null, '관찰된 증상 (symptoms — cause 아님)'));
+      s4.appendChild(el('pre', null, JSON.stringify(symptoms, null, 2)));
+      adv.appendChild(s4);
+    }
+    if (inf.evidence) {
+      const s5 = el('div', 'advanced-section');
+      s5.appendChild(el('h4', null, 'EvidenceNode'));
+      s5.appendChild(el('pre', null, JSON.stringify(inf.evidence, null, 2)));
+      adv.appendChild(s5);
+    }
+    const s6 = el('div', 'advanced-section');
+    s6.appendChild(el('h4', null, 'Payload 원본 (debug)'));
+    s6.appendChild(el('pre', null, JSON.stringify(d, null, 2)));
+    adv.appendChild(s6);
+
+    root.appendChild(adv);
+  }
+
+  loadCases();
+  </script>
+</body>
+</html>
+"""
+
+
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
+    return HTMLResponse(_HTML_V2)
+
+
+@router.get("/legacy", response_class=HTMLResponse)
+def dashboard_legacy() -> HTMLResponse:
+    """기존 cytoscape + side panel UI — 참고용 보존."""
     return HTMLResponse(_HTML)
