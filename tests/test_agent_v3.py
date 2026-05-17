@@ -320,7 +320,7 @@ class TestConversationStore:
 
 class TestSkillDescriptions:
     def test_count(self):
-        assert len(SKILL_TOOLS) == 9
+        assert len(SKILL_TOOLS) == 10
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:
@@ -333,6 +333,7 @@ class TestSkillDescriptions:
         assert "query_schedule" in names
         assert "bulk_mutation" in names
         assert "generate_schedule" in names
+        assert "update_monthly_limit" in names
 
 
 # ── Scope Routing (Bug #35) ────────────────────────────────

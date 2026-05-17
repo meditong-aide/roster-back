@@ -14,6 +14,7 @@ from agents_v2.tools import (
     shift_tools,
     constraint_tools,
     generation_tools,
+    nurse_monthly_limit_tools,
 )
 
 
@@ -39,9 +40,38 @@ def query_schedule(db: Session, params: dict) -> Any:
         return constraint_tools.get_roster_config(db, group_id)
     elif scope == "generation_job":
         return generation_tools.get_latest_job(db, group_id)
+    elif scope == "monthly_limit":
+        return _query_monthly_limits(db, group_id, year, month, params)
     else:
         # Fallback: try schedule
         return _query_schedule_entries(db, group_id, year, month, params)
+
+
+def _query_monthly_limits(db, group_id, year, month, params):
+    """NurseMonthlyLimit 조회 — 단일 nurse 또는 그룹 전체."""
+    if year is None or month is None:
+        return {"error": "year/month required for monthly_limit scope"}
+    nurse_ids = params.get("nurse_ids")
+    if nurse_ids and len(nurse_ids) == 1:
+        single = nurse_monthly_limit_tools.get_monthly_limit(
+            db, nurse_ids[0], group_id, year, month
+        )
+        if single is None:
+            return {
+                "nurse_id": nurse_ids[0],
+                "year": year,
+                "month": month,
+                "limit_set": False,
+                "message": "해당 간호사의 월 한도 설정 없음.",
+            }
+        return {**single, "limit_set": True}
+    return {
+        "year": year,
+        "month": month,
+        "limits": nurse_monthly_limit_tools.list_monthly_limits(
+            db, group_id, year, month, nurse_ids=nurse_ids
+        ),
+    }
 
 
 def _query_wanted_submissions(db, group_id, year, month, params):

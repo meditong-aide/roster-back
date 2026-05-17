@@ -61,4 +61,5 @@ def _ensure_loaded():
     import agents_v2.skills.recommend_candidates
     import agents_v2.skills.repair_schedule
     import agents_v2.skills.analyze_report
+    import agents_v2.skills.update_monthly_limit
     _loaded = True

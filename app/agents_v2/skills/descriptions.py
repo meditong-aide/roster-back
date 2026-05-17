@@ -102,6 +102,7 @@ SKILL_TOOLS: list[dict] = [
                         "shift_definitions",
                         "constraint_config",
                         "generation_job",
+                        "monthly_limit",
                     ],
                     "description": (
                         "조회 도메인. 사용자가 묻는 정보가 어느 데이터 영역에 속하는지로 결정. "
@@ -109,7 +110,8 @@ SKILL_TOOLS: list[dict] = [
                         "원티드 **신청 내용**(시프트·날짜)=wanted_adjustment, "
                         "근무표 셀=schedule, 간호사 인사정보=nurse_info, "
                         "시프트 정의=shift_definitions, 제약 설정=constraint_config, "
-                        "생성잡 상태=generation_job"
+                        "생성잡 상태=generation_job, "
+                        "**개인별 월 한도** (예: '김민지 5월 N 몇 번', '5월 D 정확히 설정한 간호사')=monthly_limit"
                     ),
                 },
                 "operation": {
@@ -754,6 +756,61 @@ SKILL_TOOLS: list[dict] = [
                 },
             },
             "required": ["year", "month"],
+        },
+    },
+    {
+        "name": "update_monthly_limit",
+        "description": (
+            "**간호사 개인의 월 시프트 한도**(D/E/N/O × min/max/exact)를 설정/수정합니다. "
+            "예: '김민지 5월 야간 4번으로 맞춰줘' / '박혜미 5월 D 최소 8회' / '이영희 5월 N 최대 5회로 제한'.\n\n"
+
+            "⚠️ 권한: 수간호사(HN) 또는 관리자(ADM) 만 가능 (다른 간호사 한도 조정).\n"
+            "⚠️ 변경 전 반드시 preview_only=true 로 영향 범위 표시 → 사용자 동의 후 preview_only=false 로 재호출.\n\n"
+
+            "─────────── 필드 매핑 ───────────\n"
+            "  • 'N 몇 번'/'야간 정확히'   → n_exact (정수)\n"
+            "  • 'N 최대'/'야간 한도'      → n_max (정수)\n"
+            "  • 'N 최소'/'야간 최소'      → n_min (정수)\n"
+            "  • D / E / O 도 동일 패턴 (d_exact, d_min, d_max, e_*, o_*)\n\n"
+
+            "─────────── 인접 skill 과의 경계 ───────────\n"
+            "- '병동 전체 야간 최대 7회' (정책) → update_constraint (max_nig_per_month)\n"
+            "- '김민지 야간 전담' (개인 속성) → update_person_attr (is_night_nurse)\n"
+            "- '김민지 5월 야간 4번' (개인 월 한도) → update_monthly_limit (n_exact)\n\n"
+
+            "예시:\n"
+            "- '김민지 5월 야간 4번' → nurse_ids=['김민지의 nurse_id'], year=2026, month=5, n_exact=4\n"
+            "- '박혜미 5월 D 최소 8회' → nurse_ids=[...], year=2026, month=5, d_min=8"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "nurse_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "대상 간호사 ID. 보통 단일.",
+                },
+                "year": {"type": "integer"},
+                "month": {"type": "integer"},
+                "d_exact": {"type": "integer", "description": "데이 정확히 몇 번"},
+                "d_min": {"type": "integer"},
+                "d_max": {"type": "integer"},
+                "e_exact": {"type": "integer", "description": "이브닝 정확히 몇 번"},
+                "e_min": {"type": "integer"},
+                "e_max": {"type": "integer"},
+                "n_exact": {"type": "integer", "description": "야간 정확히 몇 번"},
+                "n_min": {"type": "integer"},
+                "n_max": {"type": "integer"},
+                "o_exact": {"type": "integer", "description": "오프 정확히 몇 번"},
+                "o_min": {"type": "integer"},
+                "o_max": {"type": "integer"},
+                "preview_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "true 면 미리보기, false 면 적용.",
+                },
+            },
+            "required": ["nurse_ids", "year", "month"],
         },
     },
 ]
