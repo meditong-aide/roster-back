@@ -5779,6 +5779,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
                 f"message={inf.get('summary_message_ko')}"
             )
+            try:
+                from services.live_graph_export import dump_live_graph_export
+
+                dump_live_graph_export(
+                    group_id=str(getattr(current_user, "group_id", "") or ""),
+                    year=int(req.year),
+                    month=int(req.month),
+                    conflict_cores=_conflict_cores,
+                    pool_snapshot=_pool_snapshot_dict,
+                    violated_constraints=_violated,
+                    applied_relaxations=applied_relaxations,
+                    last_error_reason=str(validation_error),
+                )
+            except Exception as _lg_exc:
+                print(f"[LiveGraphExport] hook 실패(무시): {_lg_exc}")
             raise HTTPException(status_code=500, detail=unrecoverable)
         except HTTPException:
             raise
