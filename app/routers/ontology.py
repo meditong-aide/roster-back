@@ -2960,14 +2960,22 @@ _HTML_V2 = """<!doctype html>
         category: c.category, cause_count: c.cause_count,
       }));
     } catch (e) {}
-    // Legacy alpha cases (file-based)
+    // Alpha cases (file-based). Live API UNRECOVERABLE 도 dump_live_graph_export
+    // 가 alpha_cases sidecar 로 저장하므로 같은 채널에서 로드되며, 파일명
+    // prefix (run-live-) 로 별도 카테고리 분류.
     try {
       const r = await fetch('/ontology/cases');
       const d = await r.json();
-      (d.items || []).forEach(c => items.push({
-        source: 'alpha', id: c.case_id, title: c.case_id,
-        category: 'Alpha file', cause_count: c.cause_count,
-      }));
+      (d.items || []).forEach(c => {
+        const isLive = (c.case_id || '').startsWith('run-live-');
+        items.push({
+          source: 'alpha',
+          id: c.case_id,
+          title: c.case_id,
+          category: isLive ? 'Live API run' : 'Alpha file',
+          cause_count: c.cause_count,
+        });
+      });
     } catch (e) {}
 
     sel.innerHTML = '';
@@ -3037,7 +3045,13 @@ _HTML_V2 = """<!doctype html>
       TEAM_SIZE_INSUFFICIENT:         `팀 ${det.team_id || '?'} 크기(${det.size ?? '?'}) < 팀 최소(${det.team_min ?? '?'})`,
       FIXED_ASSIGN_VIOLATES_ALLOWED:  `간호사 ${det.nurse_id || '?'} fixed ${det.shift || '?'} → allowed_shifts 위반`,
     };
-    return map[rc] || c.human_message_ko || rc;
+    // 우선순위: enriched human_message_ko (placeholder 없는 구체 메시지) > JS template > fallback.
+    // treatment_enricher 가 cause.human_message_ko 를 member_sample 기반으로 재작성하므로,
+    // 미치환 `{xx}` 가 없으면 그 메시지를 우선 사용. (JS template 의 `?` fallback 회피)
+    const hmk = c.human_message_ko;
+    const isEnrichedSpecific = hmk && !/\{[^}]+\}/.test(hmk);
+    if (isEnrichedSpecific) return hmk;
+    return map[rc] || hmk || rc;
   }
 
   function categoryFromCauseId(cid) {

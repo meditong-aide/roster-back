@@ -64,6 +64,7 @@ def dump_live_graph_export(
     applied_relaxations: list[str] | None = None,
     last_error_reason: str | None = None,
     reports_dir: Path | None = None,
+    unrecoverable_payload: dict[str, Any] | None = None,
 ) -> Path | None:
     """Write a structural-only graph_export for the live UNRECOVERABLE path.
 
@@ -269,6 +270,34 @@ def dump_live_graph_export(
             json.dumps(summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        # alpha case sidecar — /ontology v3 UI (split-panel) 가 alpha_cases/*.json
+        # 을 케이스로 자동 로드함. 전체 unrecoverable 페이로드 (causes / symptoms /
+        # treatment_recommendations 포함) 를 그대로 저장해 v3 UI 의 narrative
+        # 렌더가 작동하게 한다.
+        if unrecoverable_payload:
+            try:
+                alpha_dir = target_root / "alpha_cases"
+                alpha_dir.mkdir(parents=True, exist_ok=True)
+                alpha_case_id = f"run-live-{year}{month:02d}-{ts}"
+                alpha_path = alpha_dir / f"{alpha_case_id}.json"
+                alpha_blob = dict(unrecoverable_payload)
+                alpha_blob["matrix_meta"] = {
+                    "id": alpha_case_id,
+                    "title": f"Live API UNRECOVERABLE · {year}-{month:02d} · {group_id}",
+                    "category": "Live API run",
+                    "source": "live-api",
+                    "generated_at": generated_at,
+                    "group_id": group_id,
+                    "year": year,
+                    "month": month,
+                }
+                alpha_path.write_text(
+                    json.dumps(alpha_blob, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                print(f"[LiveGraphExport] alpha case sidecar → {alpha_path.name}")
+            except Exception as _alpha_exc:
+                print(f"[LiveGraphExport] alpha sidecar 실패(무시): {_alpha_exc}")
         print(
             f"[LiveGraphExport] dumped → {out_base.name} "
             f"(nodes={len(nodes)}, edges={len(edges)}, "

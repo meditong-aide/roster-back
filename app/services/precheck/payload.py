@@ -121,6 +121,19 @@ def _build_treatments_narrative_and_hard_case(
     blocking / unrecoverable payload 양쪽에서 동일하게 호출 (DRY).
     treatment build 실패 시 graceful degradation — payload 구조 보존.
     """
+    # B 처방: cause.human_message_ko 의 미치환 placeholder ({day}/{shift}/...)
+    # 를 member_sample 기반 evidence narrative 로 대체. UI 에 `?` 가 보이는
+    # 근본 원인을 잡는다. 이후 narrative / treatment 빌더가 모두 이 풍부한
+    # human_message_ko 를 그대로 활용.
+    try:
+        from .treatment_enricher import enrich_causes
+        nurse_index_map_pre = None
+        if isinstance(evidence, dict):
+            nurse_index_map_pre = evidence.get("nurse_index_map")
+        enrich_causes(causes, nurse_index_map=nurse_index_map_pre)
+    except Exception as _ec_exc:
+        print(f"[TreatmentEnricher][cause] enrich 실패(무시): {_ec_exc}")
+
     treatment_recommendations: List[Dict[str, Any]] = []
     resolution_narrative: Optional[Dict[str, Any]] = None
     bundles_objs: List[Any] = []
@@ -160,6 +173,65 @@ def _build_treatments_narrative_and_hard_case(
                 evidence=evidence,
             )
             resolution_narrative = narrative_to_dict(narr)
+            # B 처방 (선행): treatment_recommendations 의 각 bundle.treatments[*]
+            # rationale_ko 에 "적용 대상: ..." 라인 합성. 이후 action_levers override
+            # 가 enriched 값을 참조한다.
+            try:
+                from .treatment_enricher import enrich_treatment_recommendations as _enr_tr
+                _nim = None
+                if isinstance(evidence, dict):
+                    _nim = evidence.get("nurse_index_map")
+                _enr_tr(treatment_recommendations, causes, nurse_index_map=_nim)
+            except Exception as _enr_exc_pre:
+                print(f"[TreatmentEnricher][pre-narr] enrich 실패(무시): {_enr_exc_pre}")
+            # B 처방 후속: build_narrative 의 rendered_ko 는 yaml `problem_template_ko`
+            # 를 evidence dict 로 substitute 한 결과. flat 필드 누락 시 `{day}` 같은
+            # placeholder 가 남고 UI 가 `?` 로 표시함. 우리 enrich_causes 가 만든
+            # cause.human_message_ko (evidence 기반 narrative) 가 있으면 그걸로
+            # rendered_ko 를 덮어쓴다. cause_id 매칭.
+            if resolution_narrative and isinstance(resolution_narrative.get("problem_list"), list):
+                cause_msg_by_id: Dict[str, str] = {}
+                for c in causes or []:
+                    cid = c.get("node_id") or c.get("cause_id")
+                    hmk = c.get("human_message_ko") or ""
+                    if cid and hmk and "{" not in hmk:
+                        cause_msg_by_id[cid] = hmk
+                # _fill_template 의 SafeDict 가 missing key 를 `?` 로 채우기 때문에
+                # rendered 에 `?` 가 다수 들어있으면 enriched 메시지로 덮어쓴다.
+                # placeholder `{}` 가 그대로 남은 경우도 덮어쓰기.
+                def _is_placeholder_polluted(s: str) -> bool:
+                    if not s:
+                        return False
+                    if "{" in s and "}" in s:
+                        return True
+                    # `?` 가 2개 이상이면 미치환 흔적으로 간주
+                    return s.count("?") >= 2
+                for p in resolution_narrative["problem_list"]:
+                    pid = p.get("cause_id")
+                    rendered = p.get("rendered_ko") or ""
+                    if pid in cause_msg_by_id and _is_placeholder_polluted(rendered):
+                        p["rendered_ko"] = cause_msg_by_id[pid]
+            # B 처방 후속 (해결책): action_levers 의 rationale_ko 도 enricher 가 만든
+            # 구체 버전 ("적용 대상: ...") 으로 override. treatment_id 매칭.
+            # enrich_treatment_recommendations 가 treatment_recommendations 의 각
+            # bundle.treatments[*].rationale_ko 에 "적용 대상" 라인을 append 한 후라,
+            # 그 값을 narrative.action_levers 로 복사.
+            if resolution_narrative and isinstance(resolution_narrative.get("action_levers"), list):
+                # treatment_id → enriched rationale_ko (가장 풍부한 것 우선)
+                _t_msg_by_id: Dict[str, str] = {}
+                for bundle in (treatment_recommendations or []):
+                    for t in (bundle.get("treatments") or []):
+                        tid = t.get("treatment_id")
+                        rk = t.get("rationale_ko") or ""
+                        if not tid:
+                            continue
+                        if tid not in _t_msg_by_id or len(rk) > len(_t_msg_by_id[tid]):
+                            _t_msg_by_id[tid] = rk
+                for a in resolution_narrative["action_levers"]:
+                    tid = a.get("treatment_id")
+                    new_rk = _t_msg_by_id.get(tid)
+                    if new_rk and "적용 대상:" in new_rk:
+                        a["rationale_ko"] = new_rk
     except Exception:
         treatment_recommendations = []
         resolution_narrative = None
@@ -170,6 +242,18 @@ def _build_treatments_narrative_and_hard_case(
         manual_t = manual_investigation_treatment_dict(hard_case_verdict)
         if manual_t is not None:
             treatment_recommendations.append(manual_t)
+
+    # B 처방 (HardCase 추가): manual_investigation bundle 이 append 됐으면 그
+    # bundle 의 hard_case_note_ko 도 채우기 위해 한 번 더 enrich. 이전 호출의
+    # idempotent guard 덕분에 기존 "적용 대상" 라인 중복 append 는 안 됨.
+    try:
+        from .treatment_enricher import enrich_treatment_recommendations as _enr_tr_post
+        _nim2 = None
+        if isinstance(evidence, dict):
+            _nim2 = evidence.get("nurse_index_map")
+        _enr_tr_post(treatment_recommendations, causes, nurse_index_map=_nim2)
+    except Exception as _enr_exc_post:
+        print(f"[TreatmentEnricher][post-hard-case] enrich 실패(무시): {_enr_exc_post}")
 
     hard_case_dict = hard_case_verdict.to_dict()
     graph = build_payload_graph(
@@ -350,6 +434,7 @@ def build_unrecoverable_payload(
     violated_constraints: Optional[List[Dict[str, Any]]] = None,
     conflict_cores: Optional[List[Dict[str, Any]]] = None,
     pool_snapshot: Optional[Dict[str, Any]] = None,
+    nurse_index_map: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """자연 soft까지 시도했음에도 근무표 생성 실패한 케이스(HTTP 500 detail).
 
@@ -402,6 +487,10 @@ def build_unrecoverable_payload(
         proof_type="cp_sat_unsat_core_heuristic",
         witness_schedule_id=None,
     )
+    # nurse_index_map: enricher 가 node_id 의 nurse idx 를 실제 이름+사번 으로
+    # 치환할 수 있도록 evidence dict 에 합쳐 둔다 (renderer 가 자동으로 사용).
+    if nurse_index_map and isinstance(evidence, dict):
+        evidence["nurse_index_map"] = nurse_index_map
 
     treatment_recommendations, resolution_narrative, hard_case_dict, graph = (
         _build_treatments_narrative_and_hard_case(causes, observed_symptoms, evidence)

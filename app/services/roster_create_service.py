@@ -5766,6 +5766,20 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                     _conflict_cores = _shortage_cores + _conflict_cores
             except Exception as _pool_exc:
                 print(f"[PoolGraph] build 실패(무시): {_pool_exc}")
+            # nurse_index_map: enricher 가 node_id (예: off_cap:nurse_5) 의 idx 를
+            # 실제 이름+사번 으로 치환할 수 있도록 engine 순서로 매핑 빌드.
+            _nurse_index_map: dict[str, dict] = {}
+            try:
+                for _i, _n in enumerate(nurses_for_engine or []):
+                    _nurse_index_map[str(_i)] = {
+                        "nurse_id": str(getattr(_n, "nurse_id", "") or ""),
+                        "name": getattr(_n, "name", "") or "",
+                        "team_id": getattr(_n, "team_id", None),
+                        "grade": getattr(_n, "grade", None),
+                    }
+            except Exception as _nim_exc:
+                print(f"[UNRECOVERABLE] nurse_index_map build 실패(무시): {_nim_exc}")
+                _nurse_index_map = {}
             unrecoverable = build_unrecoverable_payload(
                 precheck_result=precheck_result,
                 applied_relaxations=applied_relaxations,
@@ -5773,6 +5787,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 violated_constraints=_violated,
                 conflict_cores=_conflict_cores,
                 pool_snapshot=_pool_snapshot_dict,
+                nurse_index_map=_nurse_index_map,
             )
             inf = unrecoverable.get("infeasibility", {})
             print(
@@ -5791,6 +5806,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                     violated_constraints=_violated,
                     applied_relaxations=applied_relaxations,
                     last_error_reason=str(validation_error),
+                    unrecoverable_payload=unrecoverable,
                 )
             except Exception as _lg_exc:
                 print(f"[LiveGraphExport] hook 실패(무시): {_lg_exc}")
