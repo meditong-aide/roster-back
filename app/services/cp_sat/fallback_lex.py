@@ -522,14 +522,24 @@ def optimize_fallback_lex_hard_first(
         broad_soft: bool = False,
     ):
         m = cp_model.CpModel()
-        # MUS 추출용 hard assumption registry — fallback path도 primary와 동일하게.
-        # shared module (monthly_limit_constraints.py) 호출 시 이 registry가 활성화되어
-        # 자동으로 wrap 됨. attach_to_model() 은 caller가 solver.Solve 직전에 호출.
+        # per-nurse OFF cap slack 추적: post-solve 시 어느 nurse 가 슬랙을 실제로
+        # 사용했는지 로그하기 위함.
+        m._off_slack_lower_by_n = {}  # type: ignore[attr-defined]
+        m._off_slack_upper_by_n = {}  # type: ignore[attr-defined]
+        # HardAssumptionRegistry — MUS (UNSAT core) 추출 인프라.
+        # 모든 hard 식을 BoolVar + OnlyEnforceIf(lit) 로 reify 하므로 모델 사이즈와
+        # search branching 이 늘어나 wall-time 비용이 상당하다. INFEASIBLE 케이스가
+        # 드문 운영 환경에서는 비용 대비 효용이 낮아 **기본 OFF**.
+        # MUS 추출이 필요하면 `AIDE_ENABLE_MUS_REGISTRY=1` 로 명시 활성화.
         _add_hard_fb = None
+        _assume_registry_fb = None
         try:
-            from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard_fb
-            _assume_registry_fb = HardAssumptionRegistry(m)
-            m._cpsat_assumption_registry = _assume_registry_fb  # type: ignore[attr-defined]
+            import os as _os_fb
+            if _os_fb.environ.get("AIDE_ENABLE_MUS_REGISTRY") == "1":
+                from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard_fb
+                _assume_registry_fb = HardAssumptionRegistry(m)
+                m._cpsat_assumption_registry = _assume_registry_fb  # type: ignore[attr-defined]
+                print(f"[FallbackLex] AIDE_ENABLE_MUS_REGISTRY=1 — registry wrapping ON (stage={stage})")
         except Exception as _ar_fb_exc:
             print(f"[FallbackLex] HardAssumptionRegistry init failed (ignore): {_ar_fb_exc}")
             _assume_registry_fb = None
@@ -2412,7 +2422,27 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) not in vacation_off_cells
                     )
                     hard_lower = int(min_off_required)
-                    m.Add(offs >= hard_lower)
+                    # per-nurse 1일 lower slack (페널티 무거움) — 솔버가 min_off 1일
+                    # 부족한 nurse 만 자동 풀어줌. 글로벌 -1 (구 relax_level=1) 의
+                    # 항상-ON per-nurse 버전. 9B 2026-07 등 min_off=11 hard 가
+                    # combinatorial 로 막히는 케이스 회복.
+                    _lower_slack_max = 1
+                    _lower_slack_weight = 100000
+                    if _lower_slack_max > 0:
+                        min_off_lower_slack = m.NewIntVar(
+                            0, _lower_slack_max, f"min_off_lower_slack_{n}"
+                        )
+                        m.Add(offs + min_off_lower_slack >= hard_lower)
+                        _lower_weighted = m.NewIntVar(
+                            0,
+                            _lower_slack_max * _lower_slack_weight,
+                            f"min_off_lower_slack_weighted_{n}",
+                        )
+                        m.Add(_lower_weighted == min_off_lower_slack * _lower_slack_weight)
+                        safety["off_cap_bounded_slack"].append(_lower_weighted)
+                        m._off_slack_lower_by_n[n] = min_off_lower_slack  # type: ignore[attr-defined]
+                    else:
+                        m.Add(offs >= hard_lower)
                     miss = m.NewIntVar(0, D, f"min_off_miss_{n}")
                     m.Add(miss >= min_off_required - offs)
                     min_off_miss_by_n[n] = miss
@@ -2469,13 +2499,17 @@ def optimize_fallback_lex_hard_first(
                             total_cap_effective = max(total_cap_effective, min_off_required)
                     # OFF cap slack 결정 정책:
                     # 1) cfg gate (off_cap_bounded_slack_enable=True) → 기존 cfg max/weight 사용
-                    # 2) gate False → cap hard (슬랙 없음)
+                    # 2) gate False → **per-nurse 1일 slack 기본 활성** (페널티 무거움)
+                    #    → 솔버가 cap 부족한 nurse 만 자동으로 1일 풀어줌. 나머지는 0.
+                    #    이전 relax_level=1 의 글로벌 retry 단계를 항상-ON 형태로 대체
+                    #    (9B 2026-07 등 정적 cap 진단은 통과하지만 combinatorial 로 막히는
+                    #    케이스 회복).
                     if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
                         _slack_max = int(off_cap_bounded_slack_max)
                         _slack_weight = int(off_cap_bounded_slack_weight)
                     else:
-                        _slack_max = 0
-                        _slack_weight = 0
+                        _slack_max = 1
+                        _slack_weight = 100000
                     if _slack_max > 0:
                         cap_slack = m.NewIntVar(0, _slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(
@@ -2486,6 +2520,7 @@ def optimize_fallback_lex_hard_first(
                         m.Add(weighted == cap_slack * _slack_weight)
                         safety["off_cap_bounded_slack"].append(weighted)
                         m.Add(nonvac_offs <= total_cap_effective + cap_slack)
+                        m._off_slack_upper_by_n[n] = cap_slack  # type: ignore[attr-defined]
                     else:
                         # OFF cap hard branch — MUS 추출용 assumption literal로 wrap
                         _fb_oc_expr = (nonvac_offs <= total_cap_effective)
@@ -2672,7 +2707,39 @@ def optimize_fallback_lex_hard_first(
             min_off_miss_by_n,
         )
     ############################################################## build model 끝 ##############################################################
-    
+
+    def _log_off_slack_used(stage_label, solver, model):
+        """post-solve: 어느 nurse 가 OFF cap slack 을 실제 사용했는지 stdout 로그."""
+        try:
+            lo = getattr(model, "_off_slack_lower_by_n", {}) or {}
+            hi = getattr(model, "_off_slack_upper_by_n", {}) or {}
+            rows = []
+            for n in sorted(set(list(lo.keys()) + list(hi.keys()))):
+                lv = solver.Value(lo[n]) if n in lo else 0
+                uv = solver.Value(hi[n]) if n in hi else 0
+                if lv > 0 or uv > 0:
+                    nu = roster_system.nurses[n] if 0 <= n < len(roster_system.nurses) else None
+                    nid = getattr(nu, "nurse_id", "?") if nu else "?"
+                    name = getattr(nu, "name", "?") if nu else "?"
+                    rows.append((n, nid, name, int(lv), int(uv)))
+            if rows:
+                print(
+                    f"{logger_prefix} [OffCapSlack][used][{stage_label}] "
+                    f"count={len(rows)} (페널티 100K 강제 trigger — combinatorial 회피)"
+                )
+                for n, nid, name, lv, uv in rows:
+                    parts = []
+                    if lv > 0:
+                        parts.append(f"min_off -{lv}")
+                    if uv > 0:
+                        parts.append(f"max_off +{uv}")
+                    print(
+                        f"{logger_prefix} [OffCapSlack][used][{stage_label}]   "
+                        f"nurse_idx={n}, id={nid}, name={name}, {', '.join(parts)}"
+                    )
+        except Exception as _slack_exc:
+            print(f"{logger_prefix} [OffCapSlack][log] 실패(무시): {_slack_exc}")
+
     # ───── 1단계: 커버리지 (hard 1회 → broad soft 1회) ─────
     m1, X1, short1, over1, safety1 = None, None, None, None, None
     short_map1 = {}
@@ -2724,6 +2791,7 @@ def optimize_fallback_lex_hard_first(
                 f"status={_cp_sat_status_to_text(st)}"
             )
             if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                _log_off_slack_used(f"stage1:{attempt_label}", s1, m1)
                 best_short = int(s1.Value(sum(short1)))
                 best_over = int(s1.Value(sum(over1)))
                 used_broad_soft = broad_soft
@@ -2804,6 +2872,8 @@ def optimize_fallback_lex_hard_first(
             except Exception as _mus_exc:
                 print(f"[FallbackLex][stage2] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백2 결과: status={_cp_sat_status_to_text(st2)}")
+        if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            _log_off_slack_used("stage2", s2, m2)
         if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백2 실패: 단계 불가능 → 1단계 해 사용")
             roster_system.roster.fill(0)
@@ -2901,6 +2971,8 @@ def optimize_fallback_lex_hard_first(
             except Exception as _mus_exc:
                 print(f"[FallbackLex][stage3] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백3 결과: status={_cp_sat_status_to_text(st3)}")
+        if st3 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            _log_off_slack_used("stage3", s3, m3)
         if st3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백3 실패: 선호 단계 불가능 → 2단계 해 사용")
             roster_system.roster.fill(0)

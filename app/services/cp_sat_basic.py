@@ -2295,13 +2295,20 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         blocked_by_nurse = getattr(rs, 'blocked_by_nurse', None)
     from ortools.sat.python import cp_model
     m = cp_model.CpModel()
-    # MUS 추출용 hard assumption registry — 정책 hard 제약을 묶어
-    # INFEASIBLE 시 SufficientAssumptionsForInfeasibility() 로 충돌 코어 검출.
-    # add_hard 도 같이 가져와 wrap site 들에서 재import 안 하도록 한다.
+    # HardAssumptionRegistry — MUS (UNSAT core) 추출 인프라.
+    # 모든 hard 식을 BoolVar + OnlyEnforceIf(lit) 로 reify 하므로 모델 사이즈와
+    # search branching 이 늘어나 wall-time 비용이 상당하다. INFEASIBLE 케이스가
+    # 드문 운영 환경에서는 비용 대비 효용이 낮아 **기본 OFF**.
+    # MUS 추출이 필요하면 `AIDE_ENABLE_MUS_REGISTRY=1` 로 명시 활성화.
+    _assume_registry = None
+    _add_hard = None
     try:
-        from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard
-        _assume_registry = HardAssumptionRegistry(m)
-        m._cpsat_assumption_registry = _assume_registry  # type: ignore[attr-defined]
+        import os as _os_pri
+        if _os_pri.environ.get("AIDE_ENABLE_MUS_REGISTRY") == "1":
+            from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard
+            _assume_registry = HardAssumptionRegistry(m)
+            m._cpsat_assumption_registry = _assume_registry  # type: ignore[attr-defined]
+            print("[CP-SAT-Basic] AIDE_ENABLE_MUS_REGISTRY=1 — registry wrapping ON (primary)")
     except Exception as _ar_exc:
         print(f"[CP-SAT-Basic] HardAssumptionRegistry init failed (ignore): {_ar_exc}")
         _assume_registry = None
