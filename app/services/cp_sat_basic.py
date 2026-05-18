@@ -457,10 +457,17 @@ class CPSATBasicEngine:
         not_one_night = config_data.get('not_one_night', False)
         ban_night_before_fixed_off = bool(config_data.get('ban_night_before_fixed_off', True))
         off_first = bool(config_data.get('off_first', False))
-        max_nig_per_month = config_data.get('max_nig_per_month', 15)
-        if max_nig_per_month != 15:
-            max_nig_per_month = 17
-        # 디버그: N 상한 보정 전/후 확인
+        # config.max_nig_per_month 를 그대로 사용. 2026-01-15 hotfix (d095cc6d)
+        # `if != 15: = 17` override 는 제거 — DB/payload 값을 신뢰.
+        # 단, 0/None/음수 garbage 값은 INFEASIBLE 유발하므로 15 로 floor (config 정정 권장).
+        _raw_max_nig = config_data.get('max_nig_per_month', 15)
+        max_nig_per_month = _raw_max_nig if (_raw_max_nig is not None) else 15
+        if max_nig_per_month <= 0:
+            print(
+                f"{self.logger_prefix} [WARN] max_nig_per_month={_raw_max_nig!r} → 15 로 보정 "
+                "(DB config 정정 권장: 0/None 은 모든 N 시프트 금지 의미라 정상 스케줄 불가)"
+            )
+            max_nig_per_month = 15
         print(f"{self.logger_prefix} max_nig_per_month(raw)={max_nig_per_month}")
         # off_first=False(default): 근무 shift oversupply (OFF cap을 min_off_required + HARD recovery buffer로 tight clamp)
         # off_first=True: OFF oversupply (dev HEAD 기존 동작: max_off_allowed = _base_max + _extra_off + auto_max scaling)
