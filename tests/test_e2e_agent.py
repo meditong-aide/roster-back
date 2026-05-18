@@ -83,7 +83,7 @@ class TestToolLayer:
         from agents_v2.tools.schedule_tools import find_schedule_entry
         from datetime import datetime
 
-        entry = find_schedule_entry(db, seed_data["schedule_id"], "N001", datetime(2026, 4, 1))
+        entry = find_schedule_entry(db, seed_data["schedule_id"], "N001", datetime(2026, 4, 1), seed_data["group_id"])
         assert entry is not None
         assert entry["nurse_id"] == "N001"
 

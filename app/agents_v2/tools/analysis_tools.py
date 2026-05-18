@@ -8,7 +8,7 @@ from operator import itemgetter
 
 from sqlalchemy.orm import Session
 
-from db.models import ScheduleEntry, Shift, Nurse
+from db.models import ScheduleEntry, Shift, Nurse, Schedule
 
 
 def count_shifts_per_nurse(
@@ -123,13 +123,17 @@ def dates_missing_grade(
 ) -> list[dict]:
     """Find dates where no nurse of at least min_grade is assigned to a shift.
 
+    group_id-scoped: Schedule join 으로 schedule_id 격리 검증 + Nurse.group_id 필터.
+
     Returns list of {work_date, shift_id, assigned_nurse_ids, max_grade_present}.
     """
     entries = (
         db.query(ScheduleEntry)
+        .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
         .filter(
             ScheduleEntry.schedule_id == schedule_id,
             ScheduleEntry.shift_id == shift_id,
+            Schedule.group_id == group_id,
         )
         .order_by(ScheduleEntry.work_date)
         .all()
@@ -140,7 +144,7 @@ def dates_missing_grade(
         return []
     nurses = (
         db.query(Nurse.nurse_id, Nurse.grade)
-        .filter(Nurse.nurse_id.in_(nurse_ids))
+        .filter(Nurse.nurse_id.in_(nurse_ids), Nurse.group_id == group_id)
         .all()
     )
     grade_map = {n.nurse_id: n.grade for n in nurses}
@@ -177,9 +181,18 @@ def daily_headcount(
 ) -> list[dict]:
     """Get per-date, per-shift headcount for a schedule.
 
+    group_id-scoped: Schedule join 으로 schedule_id 격리 검증.
+
     Returns list of {work_date, shift_id, count}.
     """
-    q = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id)
+    q = (
+        db.query(ScheduleEntry)
+        .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
+        .filter(
+            ScheduleEntry.schedule_id == schedule_id,
+            Schedule.group_id == group_id,
+        )
+    )
     if date_range_start:
         q = q.filter(ScheduleEntry.work_date >= date_range_start)
     if date_range_end:

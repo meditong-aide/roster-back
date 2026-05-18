@@ -69,7 +69,7 @@ def _mutate_wanted_adjustments(db, params, mutation, preview_only):
     value = mutation.get("target_value")
 
     return wanted_tools.bulk_update_wanted_adjustments(
-        db, entry_ids, field, value, preview_only=preview_only,
+        db, entry_ids, field, value, group_id=group_id, preview_only=preview_only,
     )
 
 
@@ -209,7 +209,7 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
 
     # Single entry update
     if nurse_ids and len(nurse_ids) == 1 and date and new_shift:
-        entry = schedule_tools.find_schedule_entry(db, schedule_id, nurse_ids[0], date)
+        entry = schedule_tools.find_schedule_entry(db, schedule_id, nurse_ids[0], date, group_id)
         if not entry:
             return {"error": f"No entry found for nurse {nurse_ids[0]} on {date}"}
         if preview_only:
@@ -218,7 +218,7 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
                 "entry": entry,
                 "new_shift_id": new_shift,
             }
-        return schedule_tools.update_schedule_entry(db, entry["entry_id"], new_shift)
+        return schedule_tools.update_schedule_entry(db, entry["entry_id"], new_shift, group_id)
 
     # Bulk: get all matching entries and update
     entries = schedule_tools.get_schedule_entries(
@@ -243,7 +243,7 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
 
     results = []
     for e in entries:
-        result = schedule_tools.update_schedule_entry(db, e["entry_id"], new_shift)
+        result = schedule_tools.update_schedule_entry(db, e["entry_id"], new_shift, group_id)
         results.append(result)
 
     return {"affected_count": len(results), "results": results}

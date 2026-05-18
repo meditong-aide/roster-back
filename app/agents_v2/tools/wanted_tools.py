@@ -194,12 +194,20 @@ def bulk_update_wanted_adjustments(
     field: str,
     value,
     *,
+    group_id: str,
     preview_only: bool = False,
 ) -> dict:
-    """Bulk update fixed wanted entries. Returns affected count."""
+    """Bulk update fixed wanted entries. Returns affected count.
+
+    group_id-scoped: 전달된 entry_ids 중 group_id 가 일치하는 것만 적용
+    (cross-group mutation 차단).
+    """
     rows = (
         db.query(FixedWantedEntry)
-        .filter(FixedWantedEntry.id.in_(entry_ids))
+        .filter(
+            FixedWantedEntry.id.in_(entry_ids),
+            FixedWantedEntry.group_id == group_id,
+        )
         .all()
     )
     if preview_only:
@@ -294,13 +302,17 @@ def _parse_date(val) -> date_type:
 
 
 def _get_latest_submitted_request(
-    db: Session, nurse_id: str, month_str: str
+    db: Session, nurse_id: str, group_id: str, month_str: str
 ) -> WantedRequest | None:
-    """Find the latest submitted WantedRequest for a nurse+month."""
+    """Find the latest submitted WantedRequest for a nurse+month.
+
+    group_id-scoped: cross-group read 차단 (RBAC defense-in-depth).
+    """
     return (
         db.query(WantedRequest)
         .filter(
             WantedRequest.nurse_id == nurse_id,
+            WantedRequest.group_id == group_id,
             WantedRequest.month == month_str,
             WantedRequest.is_submitted == True,
         )
@@ -462,7 +474,7 @@ def delete_wanted_by_date(
 ) -> dict:
     """Delete a specific date from wanted submissions."""
     month_str = _wanted_request_month_str(year, month)
-    old_wr = _get_latest_submitted_request(db, nurse_id, month_str)
+    old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     if not old_wr:
         return {"error": "제출된 원티드가 없습니다."}
 
@@ -514,7 +526,7 @@ def add_wanted_by_date(
 ) -> dict:
     """Add a new date to wanted submissions."""
     month_str = _wanted_request_month_str(year, month)
-    old_wr = _get_latest_submitted_request(db, nurse_id, month_str)
+    old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     old_rid = old_wr.request_id if old_wr else None
 
     # Check duplicate
@@ -575,7 +587,7 @@ def modify_wanted_by_date(
 ) -> dict:
     """Modify the shift of an existing wanted date."""
     month_str = _wanted_request_month_str(year, month)
-    old_wr = _get_latest_submitted_request(db, nurse_id, month_str)
+    old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     if not old_wr:
         return {"error": "제출된 원티드가 없습니다."}
 
