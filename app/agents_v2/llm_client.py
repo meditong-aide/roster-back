@@ -131,13 +131,13 @@ class OpenAIClient:
     ) -> LLMResponse:
         openai_tools = [{"type": "function", "function": t} for t in tools]
 
+        # gpt-5 계열은 temperature 기본값(1)만 지원 — 명시 전달 시 400.
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             tools=openai_tools if tools else None,
             tool_choice=tool_choice if tools else None,
-            temperature=0.1,
-            max_tokens=2048,
+            max_completion_tokens=2048,
         )
         choice = response.choices[0]
 
