@@ -14,9 +14,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
-from services.memory.session_repo import SessionMemoryRepo
+from services.memory.session_repo import SessionMemoryRepo, _is_missing_table_error
 
 # Variable-memory 안에 pending_approval 을 보관할 때 사용하는 reserved key.
 # AgentConversation 스키마에 별도 컬럼 없이 vm_json 에 함께 직렬화한다.
@@ -102,21 +103,37 @@ class ConversationStore:
         user_id: str | None = None,
         group_id: str | None = None,
     ) -> Conversation | None:
-        """기존 세션 로드 — 없으면 None, group_id mismatch 면 None (격리)."""
+        """기존 세션 로드 — 없으면 None, group_id mismatch 면 None (격리).
+
+        SOT 비활성 (마이그레이션 미적용) 환경에서는 Redis cache hit 만으로 판정한다.
+        """
         gid_filter = group_id  # None 이면 격리 검사 skip
         repo = self._repo(db)
         messages = repo.load_messages(conv_id, group_id=gid_filter)
         vm_full = repo.load_variable_memory(conv_id, group_id=gid_filter)
 
         # AgentConversation row 자체가 없으면 messages == [] AND vm_full == {}
-        # 이 경우 세션 존재 여부 확인 — MSSQL 직접 조회
+        # 이 경우 세션 존재 여부 확인 — MSSQL 직접 조회 (SOT 활성 시에만)
         if not messages and not vm_full:
+            if SessionMemoryRepo._sot_disabled:
+                # Redis cache 가 비었고 SOT 도 없으면 존재 안 함으로 간주.
+                return None
             from db.models import AgentConversation
-            conv_row = (
-                db.query(AgentConversation)
-                .filter(AgentConversation.session_id == conv_id)
-                .one_or_none()
-            )
+            try:
+                conv_row = (
+                    db.query(AgentConversation)
+                    .filter(AgentConversation.session_id == conv_id)
+                    .one_or_none()
+                )
+            except (ProgrammingError, OperationalError) as exc:
+                if _is_missing_table_error(exc):
+                    try:
+                        db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    SessionMemoryRepo._disable_sot("ConversationStore.get")
+                    return None
+                raise
             if conv_row is None:
                 return None
             if group_id is not None and conv_row.group_id != group_id:
