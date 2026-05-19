@@ -380,20 +380,44 @@ class SchedulingAgent:
         """
         return getattr(ctx, "nurse_id", None)
 
+    _user_memory_sot_disabled = False  # process-wide once-set flag
+
     def _load_user_facts(
         self,
         db: Session,
         ctx: SessionContext,
     ) -> list[dict]:
-        """현재 user_id+group_id 의 valid facts 조회. 실패 시 빈 list."""
+        """현재 user_id+group_id 의 valid facts 조회. 실패 시 빈 list.
+
+        agent_user_memory 테이블 부재 시 한 번만 warning 로그하고 이후 silent skip.
+        """
         user_id = self._resolve_memory_user_id(ctx)
         if not user_id or not ctx.group_id:
+            return []
+        if SchedulingAgent._user_memory_sot_disabled:
             return []
         try:
             repo = UserMemoryRepo(db)
             return repo.query_valid_facts(user_id=user_id, group_id=ctx.group_id)
         except Exception as e:
-            logger.warning("[agent_v3] _load_user_facts failed: %s", e)
+            msg = str(e).lower()
+            is_missing = any(
+                p in msg
+                for p in ("invalid object name", "does not exist", "no such table")
+            )
+            if is_missing:
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                SchedulingAgent._user_memory_sot_disabled = True
+                logger.warning(
+                    "[agent_v3] agent_user_memory 테이블이 운영 DB 에 없습니다 — "
+                    "migrations/2026_05_19_add_agent_memory_tables.sql 적용 필요. "
+                    "장기 사용자 메모리 비활성화 (이후 silent skip)."
+                )
+            else:
+                logger.warning("[agent_v3] _load_user_facts failed: %s", e)
             return []
 
     @staticmethod
@@ -420,11 +444,14 @@ class SchedulingAgent:
         """Turn 종료 후 MemoryExtractor 호출 → apply_fact 순회.
 
         실패 시 silent log (호출자가 try/except 로 감쌈).
+        SOT 비활성 (테이블 부재) 시 skip.
         """
         user_id = self._resolve_memory_user_id(ctx)
         if not user_id or not ctx.group_id:
             return
         if self.memory_extractor is None:
+            return
+        if SchedulingAgent._user_memory_sot_disabled:
             return
 
         # 이번 turn 의 user/assistant/tool 메시지만 추출 (system 제외)
