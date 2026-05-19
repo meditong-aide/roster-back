@@ -474,14 +474,14 @@ def list_groups(office_id: str, use_test_db: bool = True):
 
 @router.get("/nurses")
 def list_nurses(group_id: str, use_test_db: bool = True):
-    """List active nurses in a group (for identity selection)."""
+    """List nurses in a group for identity selection (active + inactive)."""
     from db.models import Nurse
     db = _get_test_db() if use_test_db else _get_real_db()
     try:
         rows = (
             db.query(Nurse)
-            .filter(Nurse.group_id == group_id, Nurse.active == 1)
-            .order_by(Nurse.sequence)
+            .filter(Nurse.group_id == group_id)
+            .order_by(Nurse.active.desc(), Nurse.sequence)
             .all()
         )
         return [
@@ -493,6 +493,7 @@ def list_nurses(group_id: str, use_test_db: bool = True):
                 "hn_auth": r.hn_auth,
                 "role": r.role,
                 "team_id": r.team_id,
+                "active": int(r.active) if r.active is not None else 0,
             }
             for r in rows
         ]
