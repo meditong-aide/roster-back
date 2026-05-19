@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
 from db.models import RosterJob
-from agents_v2.tools.narrative_formatter import format_infeasibility
+from agents_v2.tools.narrative_formatter import format_infeasibility, format_infeasibility_response
 
 
 def get_job_status(db: Session, job_id: str) -> dict | None:
@@ -101,6 +101,10 @@ def _job_dict(row: RosterJob) -> dict:
             narrative = format_infeasibility(payload)
             if narrative:
                 d["infeasibility"] = narrative
+                # 사용자에게 노출되는 한국어 자연어 응답 (raw enum 코드 미노출)
+                d["infeasibility_response"] = format_infeasibility_response(payload)
+                # raw payload 는 debug/trace 용도로 격리
+                d["debug_payload"] = payload
         except (json.JSONDecodeError, ValueError):
             pass
     return d

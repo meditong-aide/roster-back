@@ -10,6 +10,8 @@ Pipeline stages:
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -27,6 +29,8 @@ from agents_v2.grounding.internal import (
 )
 from agents_v2.schemas.session_context import SessionContext
 from agents_v2.skills.registry import run_skill
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,6 +67,53 @@ class SkillResult:
     middleware_steps: list[MiddlewareStep] = field(default_factory=list)
 
 
+_AUDIT_ARGS_MAX_LEN = 2000
+
+
+def _safe_args_json(args: dict, max_len: int = _AUDIT_ARGS_MAX_LEN) -> str | None:
+    """args dict → JSON 문자열. 직렬화 실패하거나 너무 길면 truncate/None."""
+    try:
+        s = json.dumps(args, ensure_ascii=False, default=str)
+    except Exception:
+        return None
+    if len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+
+def _write_skill_audit(
+    db: Session,
+    ctx: SessionContext,
+    skill_name: str,
+    args: dict,
+    status: str,
+    error_message: str | None,
+    latency_ms: float,
+) -> None:
+    """Skill 호출 audit row insert. 실패 시 silent — skill 실행 자체에 영향 X.
+
+    의료 도메인 audit 요건 + RBAC 추적 + 디버깅용.
+    """
+    try:
+        from db.models import AgentSkillInvocation
+
+        row = AgentSkillInvocation(
+            agent_run_id=ctx.conversation_id,
+            session_id=ctx.conversation_id,
+            user_id=ctx.nurse_id,
+            group_id=ctx.group_id,
+            skill_name=skill_name,
+            args_json=_safe_args_json(args),
+            status=status,
+            error_message=error_message,
+            latency_ms=latency_ms,
+        )
+        db.add(row)
+        db.flush()
+    except Exception as e:
+        logger.warning("[middleware] skill audit insert failed: %s", e)
+
+
 def execute_skill(
     db: Session,
     skill_name: str,
@@ -72,14 +123,17 @@ def execute_skill(
     """Run the full middleware pipeline and execute the skill."""
     t0 = time.time()
     steps: list[MiddlewareStep] = []
+    args_original = {**args}
 
     # ── ① Permission Check ──
     block = _check_permission(skill_name, args, ctx)
     if block:
         steps.append(MiddlewareStep("permission", "block", detail=block))
+        dt = (time.time() - t0) * 1000
+        _write_skill_audit(db, ctx, skill_name, args_original, "DENIED", block, dt)
         return SkillResult(
             data={"error": block, "permission_denied": True},
-            duration_ms=0,
+            duration_ms=dt,
             skill_name=skill_name,
             grounded_params=args,
             blocked=True,
@@ -112,6 +166,12 @@ def execute_skill(
             detail=clarification.get("question", "ambiguous input"),
         ))
         dt = (time.time() - t0) * 1000
+        _write_skill_audit(
+            db, ctx, skill_name, args,
+            "CLARIFICATION_NEEDED",
+            clarification.get("question", "ambiguous input"),
+            dt,
+        )
         return SkillResult(
             data=clarification,
             duration_ms=dt,
@@ -127,17 +187,24 @@ def execute_skill(
     ))
 
     # ── ④ Skill Execution ──
+    status = "SUCCESS"
+    err_msg: str | None = None
     try:
         result = run_skill(db, skill_name, args)
         steps.append(MiddlewareStep("execution", "ok", detail=skill_name))
     except KeyError as e:
         result = {"error": f"Unknown skill: {e}"}
         steps.append(MiddlewareStep("execution", "error", detail=str(e)))
+        status = "ERROR"
+        err_msg = f"Unknown skill: {e}"
     except Exception as e:
         result = {"error": f"Skill execution error: {str(e)}"}
         steps.append(MiddlewareStep("execution", "error", detail=str(e)))
+        status = "ERROR"
+        err_msg = str(e)
 
     dt = (time.time() - t0) * 1000
+    _write_skill_audit(db, ctx, skill_name, args, status, err_msg, dt)
 
     return SkillResult(
         data=result,

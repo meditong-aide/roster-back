@@ -25,8 +25,14 @@ from agents_v2.middleware import SkillResult, execute_skill
 from agents_v2.schemas.session_context import SessionContext
 from agents_v2.skills.descriptions import SKILL_TOOLS
 from agents_v2.variable_memory import VariableMemory
+from services.memory.extractor import MemoryExtractor
+from services.memory.user_repo import UserMemoryRepo
 
 logger = logging.getLogger(__name__)
+
+# US-A4: Tier-2 user memory injection 시 system prompt 에 들어가는 fact 갯수 상한.
+# 토큰 절약 + LLM attention 산만 방지.
+_MAX_INJECTED_FACTS = 20
 
 
 # ── Data classes ────────────────────────────────────────────
@@ -90,8 +96,24 @@ class SchedulingAgent:
 
     MAX_TURNS = 6
 
-    def __init__(self, llm_client: LLMClient):
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        memory_extractor: MemoryExtractor | None = None,
+        enable_user_memory: bool = True,
+    ):
+        """SchedulingAgent.
+
+        Args:
+            llm_client: 메인 turn LLM (도구 호출 + 응답 생성).
+            memory_extractor: US-A4 Tier-2 fact extractor. 없으면 llm_client 재사용.
+            enable_user_memory: False 면 inject/consolidate 모두 스킵 (테스트/긴급용).
+        """
         self.llm = llm_client
+        self.enable_user_memory = enable_user_memory
+        if memory_extractor is None and enable_user_memory:
+            memory_extractor = MemoryExtractor(llm_client)
+        self.memory_extractor = memory_extractor
 
     def run(
         self,
@@ -99,8 +121,46 @@ class SchedulingAgent:
         user_message: str,
         ctx: SessionContext,
     ) -> AgentResult:
+        """Turn entry — inject_user_memory_context → _run_impl → consolidate_after_turn."""
+        # US-A4 Tier-2 memory inject + run + consolidate 흐름은 _run_impl 이 핸들링.
+        # consolidate 는 응답 반환 직전에 호출 (silent on failure).
+        current_user_facts: list[dict] = (
+            self._load_user_facts(db, ctx) if self.enable_user_memory else []
+        )
+
+        result = self._run_impl(db, user_message, ctx, current_user_facts)
+
+        # ── US-A4 consolidate_after_turn (turn 종료 후) ──
+        if self.enable_user_memory and self.memory_extractor is not None:
+            try:
+                self._consolidate_after_turn(
+                    db, ctx, result.messages, current_user_facts
+                )
+            except Exception as e:
+                # silent log — agent 응답에 영향 X
+                logger.warning(
+                    "[agent_v3] consolidate_after_turn failed: %s", e
+                )
+
+        return result
+
+    def _run_impl(
+        self,
+        db: Session,
+        user_message: str,
+        ctx: SessionContext,
+        current_user_facts: list[dict],
+    ) -> AgentResult:
         # ── Build system prompt (with domain knowledge + routines) ──
         system_prompt = build_system_prompt(ctx)
+
+        # ── US-A4 inject_user_memory_context (turn 시작) ──
+        # 현재 user_id+group_id 의 valid facts 를 system prompt 끝에 자연어로 주입.
+        # 빈 list 면 주입 생략 (토큰 절약).
+        if self.enable_user_memory:
+            mem_block = self._format_memory_block(current_user_facts)
+            if mem_block:
+                system_prompt = f"{system_prompt}\n\n---\n\n{mem_block}"
 
         # ── Restore or initialize conversation ──
         if ctx.messages:
@@ -114,8 +174,37 @@ class SchedulingAgent:
             ]
 
         # ── Handle pending approval ──
-        if ctx.pending_approval and _is_confirmation(user_message):
-            return self._execute_approval(db, ctx, messages)
+        if ctx.pending_approval:
+            ptype = ctx.pending_approval.get("type")
+            if ptype == "apply_hint":
+                # apply_hint 재시도 흐름: 확인/거부/모호 분기
+                if _is_denial(user_message):
+                    return AgentResult(
+                        answer="취소했습니다. 다음에 어떤 행동을 원하시나요?",
+                        trace=[],
+                        messages=messages,
+                        variable_memory=ctx.variable_memory,
+                    )
+                if _is_confirmation(user_message):
+                    return self._execute_apply_hint(db, ctx, messages)
+                # 모호한 입력 → 재질의 (pending_approval 유지)
+                return AgentResult(
+                    awaiting_approval=True,
+                    preview=ctx.pending_approval,
+                    answer=ctx.pending_approval.get("question", "재시도하시겠습니까?"),
+                    trace=[],
+                    messages=messages,
+                    variable_memory=ctx.variable_memory,
+                )
+            elif _is_confirmation(user_message):
+                return self._execute_approval(db, ctx, messages)
+            elif _is_denial(user_message):
+                return AgentResult(
+                    answer="취소했습니다. 다음에 어떤 행동을 원하시나요?",
+                    trace=[],
+                    messages=messages,
+                    variable_memory=ctx.variable_memory,
+                )
 
         tools = SKILL_TOOLS
         trace: list[Stage] = []
@@ -214,6 +303,30 @@ class SchedulingAgent:
                         skill_args, result, _failed_shift_terms,
                     )
 
+                    # ── apply_hint 흐름 — generate_schedule INFEASIBLE 재시도 ──
+                    apply_hint_q = _extract_apply_hint_question(skill_name, result.data)
+                    if apply_hint_q is not None:
+                        hint_data = result.data["infeasibility"]["apply_hint"]
+                        pending = {
+                            "type": "apply_hint",
+                            "apply_hint": hint_data,
+                            "original_args": skill_args,
+                            "question": apply_hint_q,
+                        }
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.call_id,
+                            "content": json.dumps(result.data, ensure_ascii=False, default=str),
+                        })
+                        return AgentResult(
+                            awaiting_approval=True,
+                            preview=pending,
+                            answer=apply_hint_q,
+                            trace=trace,
+                            messages=messages,
+                            variable_memory=vm.to_dict(),
+                        )
+
                     # ── Approval flow (preview) — must exit for user confirmation ──
                     if _is_preview_result(result.data):
                         preview_with_context = {
@@ -252,6 +365,152 @@ class SchedulingAgent:
             trace=trace,
             messages=messages,
             variable_memory=vm.to_dict(),
+        )
+
+    # ── US-A4: Tier-2 user memory helpers ─────────────────────────
+
+    @staticmethod
+    def _resolve_memory_user_id(ctx: SessionContext) -> str | None:
+        """SessionContext → user_id (nurse_id 기반). 없으면 None.
+
+        AgentUserMemory.user_id NOT NULL 이므로 None 이면 memory hooks 모두 스킵.
+        """
+        return getattr(ctx, "nurse_id", None)
+
+    def _load_user_facts(
+        self,
+        db: Session,
+        ctx: SessionContext,
+    ) -> list[dict]:
+        """현재 user_id+group_id 의 valid facts 조회. 실패 시 빈 list."""
+        user_id = self._resolve_memory_user_id(ctx)
+        if not user_id or not ctx.group_id:
+            return []
+        try:
+            repo = UserMemoryRepo(db)
+            return repo.query_valid_facts(user_id=user_id, group_id=ctx.group_id)
+        except Exception as e:
+            logger.warning("[agent_v3] _load_user_facts failed: %s", e)
+            return []
+
+    @staticmethod
+    def _format_memory_block(facts: list[dict]) -> str:
+        """facts → system prompt 에 붙일 자연어 블록. 빈 list 면 빈 문자열."""
+        if not facts:
+            return ""
+        # 최신 fact 우선 (valid_from desc) — 단순히 끝에서 자르도록 reverse
+        limited = facts[-_MAX_INJECTED_FACTS:] if len(facts) > _MAX_INJECTED_FACTS else facts
+        lines = ["## 사용자에 대해 알고 있는 사실 (장기 기억)"]
+        for f in limited:
+            fact_type = f.get("fact_type", "?")
+            fact_text = f.get("fact_text", "?")
+            lines.append(f"- [{fact_type}] {fact_text}")
+        return "\n".join(lines)
+
+    def _consolidate_after_turn(
+        self,
+        db: Session,
+        ctx: SessionContext,
+        messages: list[dict],
+        existing_facts: list[dict],
+    ) -> None:
+        """Turn 종료 후 MemoryExtractor 호출 → apply_fact 순회.
+
+        실패 시 silent log (호출자가 try/except 로 감쌈).
+        """
+        user_id = self._resolve_memory_user_id(ctx)
+        if not user_id or not ctx.group_id:
+            return
+        if self.memory_extractor is None:
+            return
+
+        # 이번 turn 의 user/assistant/tool 메시지만 추출 (system 제외)
+        recent = [m for m in messages if m.get("role") != "system"]
+        if not recent:
+            return
+
+        decisions = self.memory_extractor.extract_facts(
+            messages=recent,
+            existing_facts=existing_facts,
+        )
+        if not decisions:
+            return
+
+        repo = UserMemoryRepo(db)
+        session_id = getattr(ctx, "conversation_id", None)
+        for d in decisions:
+            action = d["action"]
+            fact_payload = {
+                "user_id": user_id,
+                "group_id": ctx.group_id,
+                "fact_type": d["fact_type"],
+                "fact_text": d["fact_text"],
+                "source": d["source"],
+                "confidence": d.get("confidence", 1.0),
+                "evidence_session_id": session_id,
+            }
+            try:
+                repo.apply_fact(action, fact_payload)
+            except Exception as e:
+                logger.warning(
+                    "[agent_v3] apply_fact failed action=%s fact_type=%s: %s",
+                    action, d.get("fact_type"), e,
+                )
+
+        # commit — UserMemoryRepo 는 flush 만 호출하므로 turn 단위 commit 필요
+        try:
+            db.commit()
+        except Exception as e:
+            logger.warning("[agent_v3] consolidate commit failed: %s", e)
+            db.rollback()
+
+    def _execute_apply_hint(
+        self,
+        db: Session,
+        ctx: SessionContext,
+        messages: list[dict],
+    ) -> AgentResult:
+        """apply_hint를 constraint_adjustments에 적용하고 generate_schedule 재호출."""
+        approval = ctx.pending_approval
+        if not approval:
+            return AgentResult(answer="재시도할 apply_hint가 없습니다.", messages=messages)
+
+        hint = approval.get("apply_hint") or {}
+        original_args = approval.get("original_args") or {}
+
+        # config_overrides → generate_schedule 의 constraint_adjustments 로 전달
+        config_overrides = hint.get("config_overrides") or {}
+
+        new_args = {
+            **original_args,
+            "preview_only": False,
+            "constraint_adjustments": config_overrides,
+        }
+
+        trace: list[Stage] = []
+        result = execute_skill(db, "generate_schedule", new_args, ctx)
+
+        trace.append(
+            Stage(
+                "execution",
+                "error" if _is_error(result.data) else "ok",
+                {"skill": "generate_schedule", "result": _truncate(result.data)},
+                result.duration_ms,
+            )
+        )
+
+        if _is_error(result.data):
+            return AgentResult(
+                answer=f"재시도 중 오류가 발생했습니다: {result.data.get('error', '')}",
+                trace=trace,
+                messages=messages,
+            )
+
+        return AgentResult(
+            answer="제약 조건을 조정하여 근무표 생성을 재시도했습니다.",
+            trace=trace,
+            messages=messages,
+            variable_memory=ctx.variable_memory,
         )
 
     def _execute_approval(
@@ -343,6 +602,59 @@ _CONFIRM_WORDS = frozenset({
     "변경해",
     "확인했어",
 })
+
+
+_DENY_WORDS = frozenset({
+    "아니오",
+    "아니요",
+    "아니",
+    "no",
+    "취소",
+    "취소해",
+    "취소해줘",
+    "하지마",
+    "그만",
+    "됐어",
+    "괜찮아",
+    "skip",
+    "건너뛰기",
+})
+
+
+def _is_denial(msg: str) -> bool:
+    """사용자 메시지가 거부/취소 의사인지 확인."""
+    cleaned = msg.strip().lower()
+    if cleaned in _DENY_WORDS:
+        return True
+    return any(w in cleaned for w in _DENY_WORDS)
+
+
+def _extract_apply_hint_question(skill_name: str, data: Any) -> str | None:
+    """generate_schedule 결과에 user_actionable apply_hint가 있으면 재시도 질문 반환.
+
+    None 반환 시 apply_hint 흐름 미진입.
+    """
+    if skill_name not in ("generate_schedule", "generate-schedule"):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    infeasibility = data.get("infeasibility")
+    if not isinstance(infeasibility, dict):
+        return None
+
+    apply_hint = infeasibility.get("apply_hint")
+    if not isinstance(apply_hint, dict):
+        return None
+
+    # user_consent_required=True 인 경우만 사용자에게 질의
+    if not apply_hint.get("user_consent_required", False):
+        return None
+
+    human_msg = apply_hint.get("human_message_ko") or ""
+    if human_msg:
+        return human_msg
+    return "제약 조건을 조정하고 근무표 생성을 재시도하시겠습니까?"
 
 
 def _call_signature(skill_name: str, args: dict) -> str:

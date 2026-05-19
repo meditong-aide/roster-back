@@ -20,6 +20,7 @@ from sqlalchemy.dialects.mysql import TINYINT
 from sqlalchemy.orm import relationship, deferred
 from db.client2 import Base
 from sqlalchemy import DATE, DECIMAL, TEXT, Time
+from datetime import datetime
 
 
 class Group(Base):
@@ -814,3 +815,152 @@ class Message(Base):
 
     sender = relationship("Nurse", foreign_keys=[sender_nurse_id])
     receiver = relationship("Nurse", foreign_keys=[receiver_nurse_id])
+
+
+# ───────────────────────────── Agent Session Memory (US-A1) ─────────────────────────────
+
+
+class AgentConversation(Base):
+    """Agent 다중 대화 세션 — MSSQL SOT.
+
+    Redis (sess:{group_id}:{session_id}:msgs / :vm) 가 hot cache,
+    이 테이블이 source of truth.
+    """
+
+    __tablename__ = "agent_conversation"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    session_id = Column(VARCHAR(64), unique=True, nullable=False, index=True)
+    user_id = Column(VARCHAR(64), nullable=False, index=True)
+    group_id = Column(VARCHAR(64), nullable=False, index=True)
+    # variable_memory JSON-직렬화 (skill 간 cross-turn state)
+    vm_json = Column(TEXT, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    last_active_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+    ttl_until = Column(DATETIME, nullable=True)
+
+
+class AgentConversationMessage(Base):
+    """Agent 대화 메시지 turn — MSSQL SOT.
+
+    turn_idx 는 세션 내 0-based 순서.
+    """
+
+    __tablename__ = "agent_conversation_message"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    session_id = Column(
+        VARCHAR(64),
+        ForeignKey("agent_conversation.session_id"),
+        nullable=False,
+        index=True,
+    )
+    turn_idx = Column(INTEGER, nullable=False)
+    role = Column(VARCHAR(32), nullable=False)  # system / user / assistant / tool
+    content = Column(TEXT, nullable=True)
+    tool_calls_json = Column(TEXT, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "turn_idx", name="ux_agent_conv_msg_session_turn"
+        ),
+    )
+
+
+# ───────────────────────────── Agent User Memory (US-A3) ─────────────────────────────
+
+
+class AgentUserMemory(Base):
+    """Tier 2 user fact — cross-session에서 학습된 사용자 선호/사실 저장소.
+
+    Zep 식 temporal validity: valid_to IS NULL = 현재 유효,
+    non-NULL = 만료(이력 보존).
+    group_id NOT NULL — D-1/D-2 audit 정책 (cross-group read/write 차단).
+    """
+
+    __tablename__ = "agent_user_memory"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    user_id = Column(VARCHAR(64), nullable=False, index=True)
+    group_id = Column(VARCHAR(64), nullable=False, index=True)  # NOT NULL — D-1/D-2 audit 정책
+    fact_type = Column(VARCHAR(64), nullable=False, index=True)  # 'nurse_pref' / 'shift_alias' / 'ward_pattern' 등
+    fact_text = Column(TEXT, nullable=False)
+    source = Column(VARCHAR(32), nullable=False)  # 'USER_STATED' | 'AGENT_INFERRED' | 'SYSTEM_DERIVED'
+    valid_from = Column(DATETIME, default=func.now(), nullable=False)
+    valid_to = Column(DATETIME, nullable=True)  # NULL = currently valid; non-NULL = expired/superseded
+    confidence = Column(FLOAT, default=1.0)
+    evidence_session_id = Column(VARCHAR(64), nullable=True)
+    created_at = Column(DATETIME, default=func.now(), nullable=False)
+
+
+# ───────────────────────── Agent Memory Audit (US-A5) ─────────────────────────────
+
+
+class AgentMemoryAudit(Base):
+    """의료 도메인 audit 요건 — 메모리 계층별 읽기/쓰기/변경/삭제 이력.
+
+    action  : READ | WRITE | UPDATE | DELETE | EXPIRE
+    tier    : SESSION | USER | PROCEDURAL
+    row_id  : 영향 받은 row PK (해당하는 경우)
+    who     : user_id 또는 agent identity
+    why     : reason / context
+    agent_run_id : evidence_session_id 등 추적 식별자
+    timestamp    : UTC 기록 시각 (index for efficient audit queries)
+    """
+
+    __tablename__ = "agent_memory_audit"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    action = Column(VARCHAR(16), nullable=False)      # READ | WRITE | UPDATE | DELETE | EXPIRE
+    tier = Column(VARCHAR(16), nullable=False)         # SESSION | USER | PROCEDURAL
+    row_id = Column(INTEGER, nullable=True)            # 영향 받은 row PK (가능 시)
+    who = Column(VARCHAR(64), nullable=True)           # user_id 또는 agent identity
+    why = Column(TEXT, nullable=True)                  # reason / context
+    agent_run_id = Column(VARCHAR(64), nullable=True)  # evidence_session_id 등
+    timestamp = Column(
+        DATETIME,
+        default=datetime.utcnow,
+        nullable=False,
+        index=True,
+    )
+
+
+# ───────────────────────── Agent Skill Invocation Audit ───────────────────────
+
+
+class AgentSkillInvocation(Base):
+    """Agent skill 호출 audit — 의료 감사 + 디버깅 + RBAC 검증 용도.
+
+    PRD 사용자 결정 ("tool history는 MSSQL audit으로 위임")의 구현.
+
+    status:
+      - SUCCESS              : skill 정상 실행
+      - DENIED               : permission_check 차단 (RBAC)
+      - CLARIFICATION_NEEDED : grounding 단계에서 clarification 요구
+      - ERROR                : skill 내부 예외
+      - BLOCKED              : 기타 차단 (정책 등)
+
+    group_id NOT NULL — D-1/D-2 audit 정책 (cross-group 추적).
+    args_json 은 PII 포함 가능 — 디버깅용 raw 저장.
+    프로덕션 PII 보호 필요 시 column-level encryption 적용 권장.
+    """
+
+    __tablename__ = "agent_skill_invocation"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    agent_run_id = Column(VARCHAR(64), nullable=True, index=True)
+    session_id = Column(VARCHAR(64), nullable=True, index=True)
+    user_id = Column(VARCHAR(64), nullable=True, index=True)
+    group_id = Column(VARCHAR(64), nullable=False, index=True)
+    skill_name = Column(VARCHAR(64), nullable=False, index=True)
+    args_json = Column(TEXT, nullable=True)
+    status = Column(VARCHAR(32), nullable=False, index=True)
+    error_message = Column(TEXT, nullable=True)
+    latency_ms = Column(FLOAT, nullable=True)
+    timestamp = Column(
+        DATETIME,
+        default=datetime.utcnow,
+        nullable=False,
+        index=True,
+    )

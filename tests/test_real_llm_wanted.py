@@ -155,7 +155,7 @@ def run_test(db: Session, query: str, nurse_id: str = "N001", nurse_name: str = 
     from agents_v2.conversation import ConversationStore
 
     store = ConversationStore()
-    conv = store.get_or_create(None)
+    conv = store.get_or_create(db, None, user_id=nurse_id, group_id="GRP001")
 
     ctx = SessionContext(
         office_id="OFF001",

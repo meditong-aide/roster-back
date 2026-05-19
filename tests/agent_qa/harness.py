@@ -113,7 +113,10 @@ class AgentTestSession:
             user_role=user_role,
         )
         self.client = client or DeterministicClient()
-        self.agent = SchedulingAgent(self.client)
+        # QA harness: ScriptedClient 는 turn 단위 응답을 미리 정의하므로,
+        # US-A4 user-memory consolidate hook 이 같은 client 를 호출하면
+        # scripted sequence 가 꼬인다. memory hook 은 명시 테스트에서만 enable.
+        self.agent = SchedulingAgent(self.client, enable_user_memory=False)
         self.last_result: AgentResult | None = None
         self.all_results: list[AgentResult] = []
 

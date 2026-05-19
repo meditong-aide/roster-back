@@ -322,8 +322,13 @@ def _run_v3(db, req: TestChatRequest) -> dict:
     from agents_v2.llm_client import get_llm_client
     from agents_v2.schemas.session_context import SessionContext
 
-    # Conversation state
-    conv = conversation_store.get_or_create(req.conversation_id)
+    # Conversation state (SessionMemoryRepo-backed — db 필수)
+    conv = conversation_store.get_or_create(
+        db,
+        req.conversation_id,
+        user_id=req.nurse_id,
+        group_id=req.group_id,
+    )
 
     # Session context
     ctx = SessionContext(
@@ -346,12 +351,18 @@ def _run_v3(db, req: TestChatRequest) -> dict:
     result = agent.run(db, req.message, ctx)
 
     # Persist conversation state
-    conversation_store.save_messages(conv.id, result.messages)
-    conversation_store.save_variable_memory(conv.id, result.variable_memory)
-    if result.awaiting_approval:
-        conversation_store.set_pending_approval(conv.id, result.preview)
-    else:
-        conversation_store.set_pending_approval(conv.id, None)
+    conversation_store.save_messages(
+        db, conv.id, result.messages,
+        user_id=req.nurse_id, group_id=req.group_id,
+    )
+    conversation_store.save_variable_memory(
+        db, conv.id, result.variable_memory,
+        user_id=req.nurse_id, group_id=req.group_id,
+    )
+    conversation_store.set_pending_approval(
+        db, conv.id, result.preview if result.awaiting_approval else None,
+        user_id=req.nurse_id, group_id=req.group_id,
+    )
 
     # Response
     resp = result.to_dict()

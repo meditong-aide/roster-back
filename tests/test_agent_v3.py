@@ -285,34 +285,44 @@ class TestDeterministicClient:
 
 
 class TestConversationStore:
-    def test_create_and_get(self):
-        store = ConversationStore()
-        conv = store.create()
-        assert store.get(conv.id) is not None
-        assert store.get(conv.id).id == conv.id
+    """ConversationStore is now SessionMemoryRepo-backed (US-A2).
+    All methods require db Session — group_id 격리 강제.
+    """
 
-    def test_get_nonexistent(self):
+    def test_create_and_get(self, db):
         store = ConversationStore()
-        assert store.get("nonexistent") is None
+        conv = store.create(db, user_id="u1", group_id="G1")
+        assert store.get(db, conv.id, group_id="G1") is not None
+        assert store.get(db, conv.id, group_id="G1").id == conv.id
 
-    def test_get_or_create(self):
+    def test_get_nonexistent(self, db):
         store = ConversationStore()
-        conv1 = store.get_or_create(None)
+        assert store.get(db, "nonexistent") is None
+
+    def test_get_or_create(self, db):
+        store = ConversationStore()
+        conv1 = store.get_or_create(db, None, user_id="u1", group_id="G1")
         assert conv1 is not None
-        conv2 = store.get_or_create(conv1.id)
+        conv2 = store.get_or_create(db, conv1.id, user_id="u1", group_id="G1")
         assert conv2.id == conv1.id
 
-    def test_save_messages(self):
+    def test_save_messages(self, db):
         store = ConversationStore()
-        conv = store.create()
-        store.save_messages(conv.id, [{"role": "user", "content": "hi"}])
-        assert len(store.get(conv.id).messages) == 1
+        conv = store.create(db, user_id="u1", group_id="G1")
+        store.save_messages(
+            db, conv.id, [{"role": "user", "content": "hi"}],
+            user_id="u1", group_id="G1",
+        )
+        assert len(store.get(db, conv.id, group_id="G1").messages) == 1
 
-    def test_variable_memory_persistence(self):
+    def test_variable_memory_persistence(self, db):
         store = ConversationStore()
-        conv = store.create()
-        store.save_variable_memory(conv.id, {"schedule_id": 42})
-        assert store.get(conv.id).variable_memory["schedule_id"] == 42
+        conv = store.create(db, user_id="u1", group_id="G1")
+        store.save_variable_memory(
+            db, conv.id, {"schedule_id": 42},
+            user_id="u1", group_id="G1",
+        )
+        assert store.get(db, conv.id, group_id="G1").variable_memory["schedule_id"] == 42
 
 
 # ── Skill Descriptions ──────���───────────────────────────────
