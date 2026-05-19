@@ -218,8 +218,11 @@ class SchedulingAgent:
 
         for turn in range(self.MAX_TURNS):
             # ── LLM call ──
+            # Truncate inject messages for token budget — 영구 messages 변수는 전체 보존.
+            # MSSQL/Redis save_messages 에는 전체 messages 가 저장되어 감사 trail 손실 없음.
+            inject_messages = _truncate_for_llm(messages, max_chars=_MAX_INJECT_CHARS)
             t0 = time.time()
-            response = self.llm.chat(messages, tools=tools)
+            response = self.llm.chat(inject_messages, tools=tools)
             llm_ms = (time.time() - t0) * 1000
 
             # ── Text response → final answer ──
@@ -774,3 +777,75 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
                 msg["content"] = content[:500] + "..."
         sanitized.append(msg)
     return sanitized
+
+
+# ── Token budget — LLM inject 직전 messages truncation ──────────────────────
+#
+# 영구 저장 (MSSQL/Redis) 의 messages 는 전체 보존되어 감사 trail 손실 없음.
+# 본 truncation 은 매 LLM call 직전에만 적용되어 token 비용 방어.
+#
+# build_system_prompt 가 한국어 도메인 지식 + skill descriptions 포함으로
+# 약 31k chars (~10k tokens). 96000 chars 예산 = ~24k tokens →
+# 최신 modern LLM context window (128k+) 안에서 안전.
+#
+# 정책:
+#   - system message (index 0) 항상 head 에 유지
+#   - 최신 메시지 (마지막) 항상 유지 — LLM 호출이 의미를 가지려면 최소 latest user 보존
+#   - 중간 history 는 budget 안에서 최신순으로 포함
+
+_MAX_INJECT_CHARS = 96000  # ≈ 24k tokens
+
+
+def _message_size(m: dict) -> int:
+    """단일 메시지의 대략적 char size (content + tool_calls 직렬화 추정)."""
+    content = m.get("content")
+    n = len(content) if isinstance(content, str) else 0
+    tc = m.get("tool_calls")
+    if tc:
+        try:
+            n += len(str(tc))
+        except Exception:
+            pass
+    return n
+
+
+def _truncate_for_llm(
+    messages: list[dict], *, max_chars: int = _MAX_INJECT_CHARS
+) -> list[dict]:
+    """LLM injection 용 messages truncation — system + latest 필수 + 중간 history budget.
+
+    원본 messages list 는 변경하지 않음. 영구 저장 흐름과 분리.
+    """
+    if not messages:
+        return []
+
+    head: list[dict] = []
+    if messages[0].get("role") == "system":
+        head = [messages[0]]
+        rest = messages[1:]
+    else:
+        rest = messages
+
+    if not rest:
+        return head
+
+    # 최신 메시지는 반드시 보존 (LLM 호출의 baseline)
+    latest = rest[-1]
+    older = rest[:-1]
+    must_chars = sum(_message_size(m) for m in head) + _message_size(latest)
+
+    if must_chars >= max_chars or not older:
+        # 예산 초과해도 필수만 반환 / older 없으면 즉시 반환
+        return head + [latest]
+
+    budget = max_chars - must_chars
+    selected_reversed: list[dict] = []
+    used = 0
+    for m in reversed(older):
+        size = _message_size(m)
+        if used + size > budget:
+            break
+        selected_reversed.append(m)
+        used += size
+
+    return head + list(reversed(selected_reversed)) + [latest]
