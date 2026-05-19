@@ -915,7 +915,7 @@ class AgentMemoryAudit(Base):
     action = Column(VARCHAR(16), nullable=False)      # READ | WRITE | UPDATE | DELETE | EXPIRE
     tier = Column(VARCHAR(16), nullable=False)         # SESSION | USER | PROCEDURAL
     row_id = Column(INTEGER, nullable=True)            # 영향 받은 row PK (가능 시)
-    who = Column(VARCHAR(64), nullable=True)           # user_id 또는 agent identity
+    who = Column(VARCHAR(64), nullable=False, index=True)  # user_id 또는 agent identity — 의료 audit 필수
     why = Column(TEXT, nullable=True)                  # reason / context
     agent_run_id = Column(VARCHAR(64), nullable=True)  # evidence_session_id 등
     timestamp = Column(

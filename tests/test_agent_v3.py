@@ -1141,7 +1141,12 @@ class TestWantedPerDateCRUD:
 class TestConstraintUpdate:
     """Test update_constraint skill with flat field/value params."""
 
-    def test_preview_integer_field(self, db, seed_data):
+    def test_preview_integer_field_policy_locked(self, db, seed_data):
+        """QA §B1 — max_nig_per_month 는 정책-고정 field. preview 도 거절.
+
+        과거에는 preview 정상 통과했으나 운영 정책 위반 회귀 방지를 위해
+        policy_locked 응답을 검증한다 (QA 시나리오 docs/AGENT_QA_SCENARIOS_2026-05-18.md §B1).
+        """
         from agents_v2.skills import run_skill
 
         result = run_skill(db, "update-constraint", {
@@ -1150,11 +1155,9 @@ class TestConstraintUpdate:
             "value": 5,
             "preview_only": True,
         })
-        assert result.get("preview") is True
-        assert "max_nig_per_month" in result.get("changes", {})
-        change = result["changes"]["max_nig_per_month"]
-        assert change["old"] == 7  # seed_data default
-        assert change["new"] == 5
+        assert result.get("error") == "policy_locked"
+        assert result.get("field") == "max_nig_per_month"
+        assert "update_monthly_limit" in result.get("alternative", "")
 
     def test_execute_integer_field(self, db, seed_data):
         from agents_v2.skills import run_skill
