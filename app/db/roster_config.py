@@ -34,6 +34,16 @@ class NurseRosterConfig:
     standard_personal_off_days: int = 8  # 간호사별 표준 개인 휴무일 수
     max_extra_off_days: int = 3  # 월 최소 휴무 기준 대비 허용되는 추가 OFF 상한(n)
     extra_off_penalty_weight: int = 80  # 추가 OFF(여유 OFF)를 기피하는 목적함수 패널티 가중치
+    # GRADE/coverage 충족을 위해 per-nurse OFF cap을 추가로 풀어주는 여유 일수.
+    # 솔버는 extra_off_penalty_weight 때문에 *필요할 때만* 이 여유를 사용함.
+    # 후처리(OffSwap, off_swap_enabled=True)가 baseline=off_days 초과분을 연차로 라벨링하므로
+    # 사실상 "연차로 흡수 가능한 추가 OFF" 역할. 기본 0(기존 동작 유지).
+    off_cap_relax_extra: int = 0
+    # 월 합계 GRADE hard constraint (soft + 10× weight로 사실상 hard).
+    # per-day는 allow_soft_fallback=True의 soft penalty 유지(KLD 자유도 보존),
+    # 월 누계는 grade demand×D를 거의 강제 → grade 비율 보장.
+    # 시화병원처럼 인원 vs demand가 빡센 케이스에서 GRADE 트레이드오프 곡선 확장.
+    grade_monthly_hard: bool = True  # TEMP: 시화병원 6월 테스트용 (배포 시 False)
     soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
     soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
     off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)

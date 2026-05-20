@@ -150,6 +150,58 @@ def add_grade_constraints(
                     penalty_weight=scaling["grade_penalty_weight"],
                 )
             )
+
+    # ── 월 합계 hard(near) 제약 ──
+    # per-day는 soft penalty(KLD 자유도 유지)로 두되, 월 합계는 10× weight로 사실상 강제.
+    # 시화병원처럼 grade 인원 vs demand가 빡센 케이스에서 grade 비율 100% 보장 목적.
+    if bool(getattr(cfg, "grade_monthly_hard", False)):
+        monthly_target_min: dict[tuple[str, int], int] = {}
+        for d in range(rs.num_days):
+            need_map = _get_need_map_for_day(cfg, ds_by_day, d)
+            for shift_code, base in (constraints_map or {}).items():
+                s_code = str(shift_code or "").upper()
+                if s_code not in apply_shifts or s_code not in rs.config.shift_types:
+                    continue
+                req = _safe_int(need_map.get(s_code, 0))
+                if req <= 0:
+                    continue
+                base_min = _parse_base_min(base, grade_values)
+                if sum(base_min.values()) <= 0:
+                    continue
+                t_d = _compute_targets(
+                    base_min=base_min,
+                    req=req,
+                    grade_values=grade_values,
+                    use_dynamic_scaling=scaling["use_dynamic_scaling"],
+                    min_ratio_floor=scaling["min_ratio_floor"],
+                    min_leader_keep=scaling["min_leader_keep"],
+                    by_grade=by_grade,
+                )
+                for g, t in t_d.items():
+                    if t > 0:
+                        key = (s_code, g)
+                        monthly_target_min[key] = monthly_target_min.get(key, 0) + int(t)
+
+        monthly_weight = scaling["grade_penalty_weight"] * 10
+        for (s_code, g), m_t in monthly_target_min.items():
+            s_idx = rs.config.shift_types.index(s_code)
+            nurses_g = by_grade.get(g, [])
+            if not nurses_g:
+                continue
+            monthly_sum = sum(
+                X(n, d, s_idx)
+                for n in nurses_g
+                for d in range(rs.num_days)
+                if join[n] <= d <= leave[n]
+            )
+            slack = m.NewIntVar(0, int(m_t), f"grade_monthly_slack_{s_code}_g{g}")
+            m.Add(monthly_sum + slack >= int(m_t))
+            obj_terms.append(-monthly_weight * slack)
+        print(
+            f"[GradeConstraints] 월 합계 soft(near-hard) 추가: "
+            f"{len(monthly_target_min)} 조합, weight={monthly_weight}"
+        )
+
     return obj_terms
 
 
