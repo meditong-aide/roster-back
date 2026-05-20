@@ -41,7 +41,9 @@ _PREVIEW_DIRECTIVE = (
     "어떤 변경이 일어날지 한국어로 한두 문장으로 자연스럽게 요약하고, "
     "마지막에 '진행하시겠습니까? (응 / 취소)' 형태로 확인을 요청하세요. "
     "추가 도구를 호출하지 말고 텍스트로만 응답하세요. "
-    "JSON 또는 코드 블록은 출력하지 마세요."
+    "JSON 또는 코드 블록은 출력하지 마세요. "
+    "내부 식별자(config_id, nurse_id, entry_id, schedule_id, request_id, draft_id, group_id, office_id 등 *_id 필드와 DB row PK, UUID, job_id, 그리고 'acc_*' 같은 내부 코드)는 사용자에게 절대 노출하지 마세요. "
+    "사람이 읽을 수 있는 정보(연/월/날짜, 간호사 이름, 시프트 명, 병동 명 등)만 사용해 요약하세요."
 )
 _PREVIEW_FALLBACK_ANSWER = "변경 미리보기를 확인해 주세요. 진행하시겠습니까? (응 / 취소)"
 
