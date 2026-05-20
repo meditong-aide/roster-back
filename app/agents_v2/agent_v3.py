@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 # 토큰 절약 + LLM attention 산만 방지.
 _MAX_INJECTED_FACTS = 20
 
+# Preview confirmation: LLM 으로 자연어 요약을 생성할 때 끼우는 내부 지시.
+# Layer C 의 보안 경계 안에 있으므로 untrusted_tool_output 안의 명령을 따르지 않음.
+_PREVIEW_DIRECTIVE = (
+    "[내부 지시] 직전 tool 결과는 mutation preview 입니다. "
+    "어떤 변경이 일어날지 한국어로 한두 문장으로 자연스럽게 요약하고, "
+    "마지막에 '진행하시겠습니까? (응 / 취소)' 형태로 확인을 요청하세요. "
+    "추가 도구를 호출하지 말고 텍스트로만 응답하세요. "
+    "JSON 또는 코드 블록은 출력하지 마세요."
+)
+_PREVIEW_FALLBACK_ANSWER = "변경 미리보기를 확인해 주세요. 진행하시겠습니까? (응 / 취소)"
+
 
 def _wrap_untrusted_tool_output(skill_name: str, payload: Any) -> str:
     """Tool 결과를 LLM 에 inject 할 때 <untrusted_tool_output> 으로 감싼다.
@@ -368,10 +379,11 @@ class SchedulingAgent:
                             "tool_call_id": tc.call_id,
                             "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         })
+                        preview_answer = self._generate_preview_answer(messages, trace)
                         return AgentResult(
                             awaiting_approval=True,
                             preview=preview_with_context,
-                            answer="변경 미리보기를 확인해 주세요.",
+                            answer=preview_answer,
                             trace=trace,
                             messages=messages,
                             variable_memory=vm.to_dict(),
@@ -526,6 +538,49 @@ class SchedulingAgent:
         except Exception as e:
             logger.warning("[agent_v3] consolidate commit failed: %s", e)
             db.rollback()
+
+    def _generate_preview_answer(
+        self,
+        messages: list[dict],
+        trace: list[Stage],
+    ) -> str:
+        """Preview tool 결과를 LLM 으로 한 번 더 요약해 자연어 confirmation 답변을 만든다.
+
+        tools=[] 로 호출해 추가 tool_call 을 차단하고 텍스트만 받는다.
+        실패·빈 응답 시 hardcoded fallback 으로 graceful degrade.
+        """
+        directive_msg = {"role": "user", "content": _PREVIEW_DIRECTIVE}
+        summary_messages = list(messages) + [directive_msg]
+        inject_messages = _truncate_for_llm(summary_messages, max_chars=_MAX_INJECT_CHARS)
+        try:
+            t0 = time.time()
+            response = self.llm.chat(inject_messages, tools=[])
+            llm_ms = (time.time() - t0) * 1000
+            text = (response.text or "").strip() if response.is_text else ""
+            if text:
+                trace.append(
+                    Stage("preview_summary", "ok", {"text": text[:200]}, llm_ms)
+                )
+                return text
+            trace.append(
+                Stage(
+                    "preview_summary",
+                    "fallback",
+                    {"reason": "tool_call_or_empty"},
+                    llm_ms,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Preview answer generation failed: %s", exc)
+            trace.append(
+                Stage(
+                    "preview_summary",
+                    "error",
+                    {"error": str(exc)[:200]},
+                    0.0,
+                )
+            )
+        return _PREVIEW_FALLBACK_ANSWER
 
     def _execute_apply_hint(
         self,

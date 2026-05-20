@@ -26,8 +26,15 @@ SKILL_TOOLS: list[dict] = [
             "─────────── scope (조회 도메인) ───────────\n"
             "scope는 **'어떤 종류의 데이터를 보고 싶은가'**를 의미합니다. 키워드 매칭이 아니라, "
             "사용자가 묻는 정보가 어느 데이터 도메인에 속하는지 판단해서 고르세요.\n\n"
+            "- `wanted_campaign` — **원티드 캠페인 자체의 운영 메타**(wanted 테이블). "
+            "  마감일(exp_date), 운영 상태(status: requested/closed), 캠페인 존재 여부. "
+            "  '원티드 마감 언제야', '제출 기한 언제까지', '4월 원티드 닫혔어?', "
+            "  '캠페인 열려있어?', '원티드 마감일 알려줘'처럼 **신청 내용·제출자가 아니라 캠페인 일정 자체**를 묻는 경우. "
+            "  ⚠️ '마감/기한/언제까지/열렸어/닫혔어/캠페인' 같은 운영 일정 단어가 핵심이면 이 scope. "
+            "  '미제출자 명단'(누가)·'신청 내용'(무엇)과 의미적으로 다른 축임을 구분.\n"
             "- `wanted_submissions` — **제출 메타데이터 전용**: 누가 제출했는지/안 했는지, 제출 시각. "
-            "  '미제출자 누구야', '몇 명 제출했어', '제출 현황'처럼 **제출 여부·집계**만 묻는 경우.\n"
+            "  '미제출자 누구야', '몇 명 제출했어', '제출 현황'처럼 **제출 여부·집계**만 묻는 경우. "
+            "  ※ 마감일은 여기서 안 나옴 → `wanted_campaign` 으로.\n"
             "- `wanted_adjustment` — **원티드 신청 내역의 정식 조회 경로**(fixed_wanted_entries 테이블). "
             "  간호사가 신청한 시프트의 날짜·코드, 수간호사 조정 결과를 모두 담고 있음. "
             "  '4월 원티드 신청 내역', '김민지 4월 원티드 뭐 냈어', '5/3 원티드 어떻게 돼있어' 등 "
@@ -78,6 +85,9 @@ SKILL_TOOLS: list[dict] = [
             "─────────── 예시 ───────────\n"
             "- '4월 원티드 미제출자 리스트업' → scope=wanted_submissions, operation=count\n"
             "- '몇 명 제출했어' → scope=wanted_submissions, operation=count\n"
+            "- '원티드 제출 마감 언제야' → scope=wanted_campaign\n"
+            "- '4월 원티드 닫혔어?' → scope=wanted_campaign\n"
+            "- '캠페인 기한 알려줘' → scope=wanted_campaign\n"
             "- '4월 원티드 신청 내역 보여줘' → scope=wanted_adjustment\n"
             "- '김민지 4월 원티드 뭐 냈어' → scope=wanted_adjustment, nurse_name='김민지'\n"
             "- '4월 첫째 주 김민지가 낸 원티드' → scope=wanted_adjustment, "
@@ -95,6 +105,7 @@ SKILL_TOOLS: list[dict] = [
                 "scope": {
                     "type": "string",
                     "enum": [
+                        "wanted_campaign",
                         "wanted_submissions",
                         "wanted_adjustment",
                         "schedule",
@@ -106,6 +117,7 @@ SKILL_TOOLS: list[dict] = [
                     ],
                     "description": (
                         "조회 도메인. 사용자가 묻는 정보가 어느 데이터 영역에 속하는지로 결정. "
+                        "원티드 **캠페인 운영 메타**(마감일·status·열림 여부)=wanted_campaign, "
                         "원티드 **제출 여부·집계**=wanted_submissions, "
                         "원티드 **신청 내용**(시프트·날짜)=wanted_adjustment, "
                         "근무표 셀=schedule, 간호사 인사정보=nurse_info, "
@@ -212,7 +224,7 @@ SKILL_TOOLS: list[dict] = [
             "- 'wanted_adjustment': 원티드 조정판 (수간호사가 신청들을 모아 조율하는 단계).\n"
             "- 'schedule': 확정된 근무표의 시프트 셀.\n\n"
             "scope × action 유효 조합:\n"
-            "- wanted_submissions: cancel / approve / reject / add_shift / change_shift / update_deadline\n"
+            "- wanted_submissions: cancel / approve / reject / add_shift / change_shift / update_deadline / clear_deadline\n"
             "- wanted_adjustment: apply / unapply_off\n"
             "- schedule: change_shift / add_shift / remove_shift\n\n"
             "날짜 포맷:\n"
@@ -226,12 +238,22 @@ SKILL_TOOLS: list[dict] = [
             "⚠️ '한도'와 '마감일' 혼동 주의:\n"
             "- '원티드 최대 횟수/한도' (간호사 개인 설정) → update_person_attr.wanted_max_requests\n"
             "- '원티드 마감일/제출 기한' (운영 일정) → bulk_mutation action='update_deadline'\n\n"
+
+            "⚠️ '마감일 없애/제거/삭제/해제/취소/풀어' = NULL 클리어:\n"
+            "- 마감일을 **해제**(설정값 자체를 비우기) 의도면 반드시 action='clear_deadline'.\n"
+            "- 이때 new_deadline 파라미터는 **절대 채우지 말 것**. 직전 값으로 되돌린다 같은 추측도 금지.\n"
+            "- 즉 사용자가 '없애줘 / 다시 원래대로 / 마감일 풀어줘 / clear / 삭제' 라고 하면 임의로\n"
+            "  과거 값을 골라 update_deadline 하지 말고 clear_deadline 으로 NULL 시킬 것.\n"
+            "- 사용자가 '되돌려'라고만 했고 직전 값이 명백하지 않으면, 임의 추측보다 clear 우선 또는\n"
+            "  사용자에게 명확화 요청.\n\n"
             "예시:\n"
             "- '5/3 원티드 취소' → scope='wanted_submissions', action='cancel', date='2026-05-03'\n"
             "- '5/15에 Oz 원티드 추가' → scope='wanted_submissions', action='add_shift', date='2026-05-15', shift_name='Oz'\n"
             "- '5/3 원티드 D를 N으로' → scope='wanted_submissions', action='change_shift', date='2026-05-03', new_shift_name='N'\n"
             "- '원티드 전체 취소' → scope='wanted_submissions', action='cancel' (date 없이)\n"
             "- '원티드 마감일 수정' → scope='wanted_submissions', action='update_deadline', new_deadline='2026-04-18'\n"
+            "- '원티드 마감일 없애줘 / 그냥 없애 / 마감 풀어줘 / 마감일 삭제' → "
+            "scope='wanted_submissions', action='clear_deadline' (new_deadline 미지정)\n"
             "- '조정판 쉬는사람 해제' → scope='wanted_adjustment', action='unapply_off'\n"
             "- '김민지 4/5 D→E' → scope='schedule', action='change_shift'\n\n"
             "⛔ 다음은 bulk_mutation 아님 (update_person_attr로):\n"
@@ -260,10 +282,12 @@ SKILL_TOOLS: list[dict] = [
                         "add_shift",
                         "remove_shift",
                         "update_deadline",
+                        "clear_deadline",
                     ],
                     "description": (
                         "수행할 작업. 원티드 날짜별: cancel(취소), add_shift(추가), change_shift(변경). "
-                        "근무표: change_shift, add_shift, remove_shift. 조정판: unapply_off, apply."
+                        "근무표: change_shift, add_shift, remove_shift. 조정판: unapply_off, apply. "
+                        "마감일: update_deadline(새 값 설정), clear_deadline(마감일 해제 — NULL)."
                     ),
                 },
                 "nurse_name": {"type": "string"},

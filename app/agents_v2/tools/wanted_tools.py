@@ -259,6 +259,37 @@ def update_wanted_deadline(
     }
 
 
+def clear_wanted_deadline(
+    db: Session, group_id: str, year: int, month: int
+) -> dict:
+    """Clear wanted campaign deadline (set exp_date to NULL).
+
+    DB 컬럼 자체가 nullable 이므로 마감일 해제는 정상 운영 경로.
+    "마감일 없애줘 / 제거 / 삭제" 같은 의도에 대응한다.
+    """
+    row = (
+        db.query(Wanted)
+        .filter(
+            Wanted.group_id == group_id,
+            Wanted.year == year,
+            Wanted.month == month,
+        )
+        .first()
+    )
+    if not row:
+        return {"error": "Wanted campaign not found"}
+    old_deadline = str(row.exp_date) if row.exp_date else None
+    row.exp_date = None
+    db.commit()
+    return {
+        "group_id": group_id,
+        "year": year,
+        "month": month,
+        "old_deadline": old_deadline,
+        "new_deadline": None,
+    }
+
+
 def cancel_wanted_request(
     db: Session, nurse_id: str, group_id: str, year: int, month: int, request_id: int | None = None
 ) -> dict:

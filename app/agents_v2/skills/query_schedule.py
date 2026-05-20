@@ -26,7 +26,9 @@ def query_schedule(db: Session, params: dict) -> Any:
     year = params.get("year")
     month = params.get("month")
 
-    if scope == "wanted_submissions":
+    if scope == "wanted_campaign":
+        return _query_wanted_campaign(db, group_id, year, month)
+    elif scope == "wanted_submissions":
         return _query_wanted_submissions(db, group_id, year, month, params)
     elif scope == "wanted_adjustment":
         return _query_wanted_adjustments(db, group_id, year, month, params)
@@ -71,6 +73,36 @@ def _query_monthly_limits(db, group_id, year, month, params):
         "limits": nurse_monthly_limit_tools.list_monthly_limits(
             db, group_id, year, month, nurse_ids=nurse_ids
         ),
+    }
+
+
+def _query_wanted_campaign(db, group_id, year, month):
+    """원티드 캠페인 운영 메타 — 마감일, status, 열림 여부."""
+    if year is None or month is None:
+        return {"error": "year/month required for wanted_campaign scope"}
+    status = wanted_tools.get_wanted_status(db, group_id, year, month)
+    if status is None:
+        return {
+            "group_id": group_id,
+            "year": year,
+            "month": month,
+            "campaign_exists": False,
+            "message": "해당 월의 원티드 캠페인이 아직 생성되지 않았습니다.",
+        }
+    from datetime import datetime as _dt
+
+    exp_date = status.get("exp_date")
+    is_open = None
+    if exp_date:
+        try:
+            deadline = _dt.fromisoformat(exp_date.replace(" ", "T")).date()
+            is_open = _dt.now().date() <= deadline
+        except (ValueError, AttributeError):
+            is_open = None
+    return {
+        **status,
+        "campaign_exists": True,
+        "is_open": is_open,
     }
 
 

@@ -27,6 +27,8 @@ def bulk_mutation(db: Session, params: dict) -> Any:
         return _cancel_wanted_request(db, params, preview_only)
     elif scope == "wanted_submissions" and action == "update_deadline":
         return _update_wanted_deadline(db, params, preview_only)
+    elif scope == "wanted_submissions" and action == "clear_deadline":
+        return _clear_wanted_deadline(db, params, preview_only)
     elif scope == "wanted_submissions" and action == "add_shift":
         return _add_wanted_by_date(db, params, preview_only)
     elif scope == "wanted_submissions" and action == "change_shift":
@@ -128,6 +130,28 @@ def _update_wanted_deadline(db, params, preview_only=False):
         }
 
     return wanted_tools.update_wanted_deadline(db, group_id, year, month, new_deadline)
+
+
+def _clear_wanted_deadline(db, params, preview_only=False):
+    """원티드 마감일을 NULL 로 해제. 임의 날짜 추측 차단."""
+    group_id = params["group_id"]
+    year = params.get("year")
+    month = params.get("month")
+
+    if preview_only:
+        current = wanted_tools.get_wanted_status(db, group_id, year, month)
+        if not current:
+            return {"error": f"No wanted campaign found for {year}/{month}"}
+        return {
+            "preview_only": True,
+            "action": "clear_deadline",
+            "current_deadline": current.get("exp_date"),
+            "new_deadline": None,
+            "year": year,
+            "month": month,
+        }
+
+    return wanted_tools.clear_wanted_deadline(db, group_id, year, month)
 
 
 def _delete_wanted_by_date(db, params, preview_only=False):

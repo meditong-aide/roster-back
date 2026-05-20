@@ -90,6 +90,17 @@ def test_bulk_mutation_deadline_blocked_for_nurse():
     assert "마감일" in err or "수간호사" in err
 
 
+def test_bulk_mutation_clear_deadline_blocked_for_nurse():
+    """clear_deadline 도 update_deadline 과 동일하게 HN/ADM 권한 필요."""
+    err = _check_permission(
+        "bulk_mutation",
+        {"scope": "wanted_submissions", "action": "clear_deadline"},
+        _ctx("nurse"),
+    )
+    assert err is not None
+    assert "마감일" in err or "수간호사" in err
+
+
 def test_bulk_mutation_self_wanted_cancel_allowed_for_nurse():
     err = _check_permission(
         "bulk_mutation",

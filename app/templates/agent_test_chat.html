@@ -814,7 +814,10 @@ async function sendMessage() {
       }
       addAgentMessage(text, 'clarification');
     } else if (data.awaiting_approval) {
-      addAgentMessage('Preview:\n' + JSON.stringify(data.preview, null, 2), 'approval');
+      addAgentMessageWithPreview(
+        data.answer || '변경 미리보기를 확인해 주세요. 진행하시겠습니까? (응 / 취소)',
+        data.preview,
+      );
     } else {
       addAgentMessage(data.answer || '(no answer)');
     }
@@ -839,6 +842,17 @@ function addAgentMessage(text, type) {
   const cls = type === 'error' ? 'msg-error' : type === 'clarification' ? 'msg-clarification' : type === 'approval' ? 'msg-approval' : '';
   const el = document.createElement('div');
   el.innerHTML = `<div class="msg msg-agent ${cls}">${formatAnswer(text)}</div><div class="msg-time">${timeStr()}</div>`;
+  document.getElementById('messages').appendChild(el);
+  scrollBottom();
+}
+
+function addAgentMessageWithPreview(answerText, previewObj) {
+  const previewJson = JSON.stringify(previewObj, null, 2);
+  const el = document.createElement('div');
+  el.innerHTML = `<div class="msg msg-agent msg-approval">${formatAnswer(answerText)}` +
+    `<details style="margin-top:8px;font-size:11px;opacity:.7"><summary style="cursor:pointer;user-select:none">preview JSON (debug)</summary>` +
+    `<pre style="background:#f6f8fa;padding:8px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;margin-top:6px">${esc(previewJson)}</pre>` +
+    `</details></div><div class="msg-time">${timeStr()}</div>`;
   document.getElementById('messages').appendChild(el);
   scrollBottom();
 }

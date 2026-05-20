@@ -196,6 +196,42 @@ class TestSkillLayer:
         assert result["submitted_count"] == 2
         assert result["not_submitted_count"] == 4
 
+    def test_query_wanted_campaign(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "query-schedule", {
+            "group_id": seed_data["group_id"],
+            "year": 2026,
+            "month": 4,
+            "scope": "wanted_campaign",
+        })
+        assert result["campaign_exists"] is True
+        assert result["status"] == "requested"
+        assert result["exp_date"] is not None
+        assert result["exp_date"].startswith("2026-03-25")
+        assert result["is_open"] is False  # 2026-03-25 마감, 현재 시점은 그 이후
+
+    def test_query_wanted_campaign_absent(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "query-schedule", {
+            "group_id": seed_data["group_id"],
+            "year": 2099,
+            "month": 12,
+            "scope": "wanted_campaign",
+        })
+        assert result["campaign_exists"] is False
+        assert "원티드 캠페인" in result["message"]
+
+    def test_query_wanted_campaign_missing_year_month(self, db, seed_data):
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "query-schedule", {
+            "group_id": seed_data["group_id"],
+            "scope": "wanted_campaign",
+        })
+        assert "error" in result
+
     def test_query_wanted_adjustments(self, db, seed_data):
         from agents_v2.skills import run_skill
 
@@ -207,6 +243,57 @@ class TestSkillLayer:
         })
         assert isinstance(result, list)
         assert len(result) == 4
+
+    def test_bulk_mutation_clear_deadline_preview(self, db, seed_data):
+        """clear_deadline preview: 현재 마감일 표시 + new_deadline=None."""
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "bulk-mutation", {
+            "group_id": seed_data["group_id"],
+            "year": 2026,
+            "month": 4,
+            "scope": "wanted_submissions",
+            "action": "clear_deadline",
+            "preview_only": True,
+        })
+        assert result["preview_only"] is True
+        assert result["action"] == "clear_deadline"
+        assert result["new_deadline"] is None
+        assert result["current_deadline"] is not None  # seed: 2026-03-25
+
+    def test_bulk_mutation_clear_deadline_apply(self, db, seed_data):
+        """clear_deadline 적용: DB exp_date 가 NULL 로 바뀐다."""
+        from agents_v2.skills import run_skill
+        from agents_v2.tools.wanted_tools import get_wanted_status
+
+        result = run_skill(db, "bulk-mutation", {
+            "group_id": seed_data["group_id"],
+            "year": 2026,
+            "month": 4,
+            "scope": "wanted_submissions",
+            "action": "clear_deadline",
+            "preview_only": False,
+        })
+        assert result["new_deadline"] is None
+        assert result["old_deadline"] is not None
+
+        # DB 상태 직접 확인
+        status = get_wanted_status(db, seed_data["group_id"], 2026, 4)
+        assert status["exp_date"] is None
+
+    def test_bulk_mutation_clear_deadline_missing_campaign(self, db, seed_data):
+        """캠페인 부재 시 error."""
+        from agents_v2.skills import run_skill
+
+        result = run_skill(db, "bulk-mutation", {
+            "group_id": seed_data["group_id"],
+            "year": 2099,
+            "month": 12,
+            "scope": "wanted_submissions",
+            "action": "clear_deadline",
+            "preview_only": True,
+        })
+        assert "error" in result
 
     def test_query_shift_definitions(self, db, seed_data):
         from agents_v2.skills import run_skill

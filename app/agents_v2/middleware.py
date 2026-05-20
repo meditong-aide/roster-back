@@ -259,7 +259,7 @@ def _check_permission(
     if normalized == "bulk_mutation" and not is_hn:
         scope = args.get("scope", "")
         action = args.get("action", "")
-        if scope == "wanted_submissions" and action == "update_deadline":
+        if scope == "wanted_submissions" and action in ("update_deadline", "clear_deadline"):
             return "원티드 마감일 변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
         if scope == "wanted_adjustment":
             # 본인 nurse 만 명시되어 있고 self 인 경우는 허용

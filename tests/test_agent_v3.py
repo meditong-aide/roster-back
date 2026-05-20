@@ -446,6 +446,84 @@ class TestSchedulingAgentE2E:
             assert "duration_ms" in stage
 
 
+# ── Preview natural-language answer ─────────────────────────
+
+
+class _PreviewScriptedClient:
+    """첫 호출은 update_deadline preview tool_call, 두 번째 호출은 사전 텍스트 반환.
+
+    tools=[] 로 호출되는 두 번째 chat 에서 답변 텍스트를 검증하기 위함.
+    auto_answer 패턴 없이 정확한 호출 순서 제어.
+    """
+
+    def __init__(self, second_text: str | None):
+        self.second_text = second_text
+        self.idx = 0
+        self.last_tools_arg: list | None = None
+
+    def chat(self, messages, tools, *, tool_choice="auto"):
+        self.last_tools_arg = tools
+        if self.idx == 0:
+            self.idx += 1
+            return LLMResponse(
+                type="tool_call",
+                tool_calls=[
+                    ToolCall(
+                        name="bulk_mutation",
+                        args={
+                            "scope": "wanted_submissions",
+                            "action": "update_deadline",
+                            "new_deadline": "2026-05-30",
+                            "preview_only": True,
+                            "year": 2026,
+                            "month": 4,
+                        },
+                        call_id="call_0",
+                    )
+                ],
+            )
+        self.idx += 1
+        if self.second_text is None:
+            return LLMResponse(type="text", text="")
+        return LLMResponse(type="text", text=self.second_text)
+
+
+class TestPreviewNaturalLanguageAnswer:
+    """Preview mutation 결과를 LLM 으로 자연어 요약하는 흐름 검증."""
+
+    def test_preview_uses_llm_generated_answer(self, db, seed_data, ctx):
+        scripted_text = "원티드 마감일을 2026-05-30로 변경합니다. 진행하시겠습니까? (응 / 취소)"
+        client = _PreviewScriptedClient(second_text=scripted_text)
+        agent = SchedulingAgent(client, enable_user_memory=False)
+
+        result = agent.run(db, "마감일 5월 30일로 해줘", ctx)
+
+        assert result.awaiting_approval is True
+        assert result.preview is not None
+        assert result.preview.get("skill_name") == "bulk_mutation"
+        assert result.answer == scripted_text
+        # tools=[] 가 두 번째 호출에 전달됐는지 — LLM 이 추가 tool_call 못 하게.
+        assert client.last_tools_arg == []
+        # trace 에 preview_summary 스테이지가 ok 로 기록됐는지.
+        summary_stages = [s for s in result.trace if s.name == "preview_summary"]
+        assert len(summary_stages) == 1
+        assert summary_stages[0].status == "ok"
+
+    def test_preview_falls_back_when_llm_returns_empty(self, db, seed_data, ctx):
+        client = _PreviewScriptedClient(second_text="")
+        agent = SchedulingAgent(client, enable_user_memory=False)
+
+        result = agent.run(db, "마감일 5월 30일로 해줘", ctx)
+
+        assert result.awaiting_approval is True
+        assert result.preview is not None
+        # Hardcoded fallback 이 사용됐는지.
+        assert "진행하시겠습니까" in result.answer
+        summary_stages = [s for s in result.trace if s.name == "preview_summary"]
+        assert len(summary_stages) == 1
+        assert summary_stages[0].status == "fallback"
+
+
 # ── Abbreviation Resolution Pipeline ────────────────────────
 
 
