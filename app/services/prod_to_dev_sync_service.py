@@ -110,17 +110,34 @@ def _table_has_column(db: Session, db_name: str, table: str, column: str) -> boo
     return bool(row)
 
 
-def _exclude_group_clause(
-    exclude_group_ids: Optional[List[str]],
+def _group_filter_clause(
+    include_group_ids: Optional[List[str]] = None,
+    exclude_group_ids: Optional[List[str]] = None,
     alias: str = "",
 ) -> tuple:
-    """exclude_group_ids 가 있으면 (' WHERE group_id NOT IN (...)', params) 반환."""
-    if not exclude_group_ids:
+    """include/exclude group_ids 를 결합해 WHERE 절 + params 반환.
+
+    - include_group_ids 만 있으면: WHERE group_id IN (...)
+    - exclude_group_ids 만 있으면: WHERE group_id NOT IN (...)
+    - 둘 다 있으면: WHERE group_id IN (...) AND group_id NOT IN (...)
+    - 둘 다 없으면: ("", {}).
+    """
+    if not include_group_ids and not exclude_group_ids:
         return "", {}
-    placeholders = ", ".join(f":xg{i}" for i in range(len(exclude_group_ids)))
     prefix = f"{alias}." if alias else ""
-    where = f" WHERE {prefix}group_id NOT IN ({placeholders})"
-    params = {f"xg{i}": g for i, g in enumerate(exclude_group_ids)}
+    conds: List[str] = []
+    params: dict = {}
+    if include_group_ids:
+        ph = ", ".join(f":ig{i}" for i in range(len(include_group_ids)))
+        conds.append(f"{prefix}group_id IN ({ph})")
+        for i, g in enumerate(include_group_ids):
+            params[f"ig{i}"] = g
+    if exclude_group_ids:
+        ph = ", ".join(f":xg{i}" for i in range(len(exclude_group_ids)))
+        conds.append(f"{prefix}group_id NOT IN ({ph})")
+        for i, g in enumerate(exclude_group_ids):
+            params[f"xg{i}"] = g
+    where = " WHERE " + " AND ".join(conds)
     return where, params
 
 
@@ -155,17 +172,27 @@ def _get_pk_cols(db: Session, db_name: str, table: str) -> List[str]:
 
 
 def _delete_dev(
-    db: Session, table: str, exclude_group_ids: Optional[List[str]] = None
+    db: Session,
+    table: str,
+    include_group_ids: Optional[List[str]] = None,
+    exclude_group_ids: Optional[List[str]] = None,
 ) -> int:
+    has_grp = _table_has_column(db, DEV_DB, table, "group_id")
+    # include_group_ids 지정 시 group_id 컬럼 없는 테이블은 dev 보존 (delete skip).
+    if include_group_ids and not has_grp:
+        return 0
     where, params = "", {}
-    if exclude_group_ids and _table_has_column(db, DEV_DB, table, "group_id"):
-        where, params = _exclude_group_clause(exclude_group_ids)
+    if has_grp and (include_group_ids or exclude_group_ids):
+        where, params = _group_filter_clause(include_group_ids, exclude_group_ids)
     result = db.execute(text(f"DELETE FROM {DEV_DB}.dbo.[{table}]{where}"), params)
     return result.rowcount if result.rowcount is not None else -1
 
 
 def _copy_prod_to_dev(
-    db: Session, table: str, exclude_group_ids: Optional[List[str]] = None
+    db: Session,
+    table: str,
+    include_group_ids: Optional[List[str]] = None,
+    exclude_group_ids: Optional[List[str]] = None,
 ) -> dict:
     """dev 에 prod 내용을 그대로 INSERT. 공통 컬럼만 복사."""
     if not _table_exists(db, PROD_DB, table):
@@ -179,14 +206,20 @@ def _copy_prod_to_dev(
     if not common:
         return {"table": table, "skipped": "no_common_cols", "inserted": 0}
 
+    # include_group_ids 지정 시 group_id 컬럼 없는 테이블은 dev 보존 (insert skip).
+    if include_group_ids and "group_id" not in prod_cols:
+        return {"table": table, "skipped": "no_group_id_with_include", "inserted": 0}
+
     col_list = ", ".join(f"[{c}]" for c in common)
     sel_list = ", ".join(f"src.[{c}]" for c in common)
 
     has_identity = _has_identity(db, DEV_DB, table)
 
     where, params = "", {}
-    if exclude_group_ids and "group_id" in prod_cols:
-        where, params = _exclude_group_clause(exclude_group_ids, alias="src")
+    if "group_id" in prod_cols and (include_group_ids or exclude_group_ids):
+        where, params = _group_filter_clause(
+            include_group_ids, exclude_group_ids, alias="src"
+        )
 
     sql = (
         f"INSERT INTO {DEV_DB}.dbo.[{table}] ({col_list}) "
@@ -206,7 +239,10 @@ def _copy_prod_to_dev(
 
 
 def _merge_upsert(
-    db: Session, table: str, exclude_group_ids: Optional[List[str]] = None
+    db: Session,
+    table: str,
+    include_group_ids: Optional[List[str]] = None,
+    exclude_group_ids: Optional[List[str]] = None,
 ) -> dict:
     """MERGE 로 prod → dev upsert. dev-only row 보존 (DELETE 절 없음)."""
     if not _table_exists(db, PROD_DB, table):
@@ -224,10 +260,14 @@ def _merge_upsert(
     if not common:
         return {"table": table, "skipped": "no_common_cols", "upserted": 0}
 
+    # include_group_ids 지정 시 group_id 컬럼 없는 테이블은 dev 보존 (upsert skip).
+    if include_group_ids and "group_id" not in prod_cols:
+        return {"table": table, "skipped": "no_group_id_with_include", "upserted": 0}
+
     src_clause = f"{PROD_DB}.dbo.[{table}]"
     params: dict = {}
-    if exclude_group_ids and "group_id" in prod_cols:
-        where, params = _exclude_group_clause(exclude_group_ids)
+    if "group_id" in prod_cols and (include_group_ids or exclude_group_ids):
+        where, params = _group_filter_clause(include_group_ids, exclude_group_ids)
         src_clause = f"(SELECT * FROM {PROD_DB}.dbo.[{table}]{where})"
 
     # 문자열 PK 컬럼의 collation 충돌 방지 (prod/dev DB 기본 collation 다를 수 있음)
@@ -309,6 +349,7 @@ def _run_in_session(fn) -> tuple:
 def sync_prod_to_dev(
     db: Session = None,
     tables: Optional[List[str]] = None,
+    include_group_ids: Optional[List[str]] = None,
     exclude_group_ids: Optional[List[str]] = None,
 ) -> dict:
     """마스터=wipe+copy / 트랜잭션=upsert(MERGE).
@@ -319,9 +360,13 @@ def sync_prod_to_dev(
     Args:
         tables: 특정 테이블만 sync (None 이면 SYNC_TABLES 전체).
                 각 테이블의 mode 는 SYNC_TABLES 에서 lookup.
+        include_group_ids: group_id 컬럼이 있는 테이블에 한해 해당 group_id 행만
+                prod 에서 가져오고 dev 의 해당 group_id 행만 wipe 대상.
+                group_id 컬럼이 없는 테이블은 **건드리지 않음 (dev 보존)**.
+                다른 group 의 dev 데이터는 그대로 유지.
         exclude_group_ids: group_id 컬럼이 있는 테이블에 한해 해당 group_id 행을
                 prod 에서 가져오지 않고 dev wipe 대상에서도 제외 (dev 기존 데이터 보존).
-                group_id 컬럼이 없는 테이블은 영향 없음.
+                group_id 컬럼이 없는 테이블은 영향 없음 (full wipe+copy).
     """
     # 모드 lookup
     mode_map = {t: m for t, m in SYNC_TABLES}
@@ -355,11 +400,13 @@ def sync_prod_to_dev(
             errors.append({"phase": "disable_fk", "table": table, "error": err})
             logger.error("[prod→dev sync] FK disable 실패 %s: %s", table, err)
 
-    # 2. wipe 대상만 역순 DELETE (exclude_group_ids 행은 dev 보존)
+    # 2. wipe 대상만 역순 DELETE
+    #    - exclude_group_ids 행은 dev 보존
+    #    - include_group_ids 지정 시 해당 group_id 행만 DELETE
     deleted_summary: dict = {}
     for table in reversed(wipe_tables):
         cnt, err = _run_in_session(
-            lambda s, t=table: _delete_dev(s, t, exclude_group_ids)
+            lambda s, t=table: _delete_dev(s, t, include_group_ids, exclude_group_ids)
         )
         if err:
             errors.append({"phase": "delete", "table": table, "error": err})
@@ -371,7 +418,9 @@ def sync_prod_to_dev(
     for table, mode in target_existing:
         if mode == "wipe":
             r, err = _run_in_session(
-                lambda s, t=table: _copy_prod_to_dev(s, t, exclude_group_ids)
+                lambda s, t=table: _copy_prod_to_dev(
+                    s, t, include_group_ids, exclude_group_ids
+                )
             )
             if err:
                 errors.append({"phase": "insert", "table": table, "error": err})
@@ -384,7 +433,9 @@ def sync_prod_to_dev(
                 results.append(r)
         else:  # upsert
             r, err = _run_in_session(
-                lambda s, t=table: _merge_upsert(s, t, exclude_group_ids)
+                lambda s, t=table: _merge_upsert(
+                    s, t, include_group_ids, exclude_group_ids
+                )
             )
             if err:
                 errors.append({"phase": "upsert", "table": table, "error": err})
