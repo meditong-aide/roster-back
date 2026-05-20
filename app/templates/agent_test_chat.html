@@ -466,7 +466,7 @@
       <div class="input-row">
         <input type="text" id="msgInput" placeholder="Enter a query to test the agent pipeline..."
                autocomplete="off"
-               onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}">
+               onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();sendMessage()}">
         <button id="sendBtn" onclick="sendMessage()">Send</button>
       </div>
       <div class="quick-queries">
