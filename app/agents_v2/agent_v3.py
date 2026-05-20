@@ -35,6 +35,22 @@ logger = logging.getLogger(__name__)
 _MAX_INJECTED_FACTS = 20
 
 
+def _wrap_untrusted_tool_output(skill_name: str, payload: Any) -> str:
+    """Tool 결과를 LLM 에 inject 할 때 <untrusted_tool_output> 으로 감싼다.
+
+    payload 안에 prompt injection (예: nurse_memo, resignation_reason_memo 같은
+    사용자 작성 필드)이 섞여 있어도 LLM 이 명령이 아닌 데이터로 다루도록 만든다.
+    system prompt 의 보안 경계 안내문(SECURITY_BOUNDARY)과 짝을 이룬다.
+    """
+    body = json.dumps(payload, ensure_ascii=False, default=str)
+    safe_skill = str(skill_name).replace("<", "&lt;").replace(">", "&gt;").replace('"', "")
+    return (
+        f'<untrusted_tool_output skill="{safe_skill}">\n'
+        f"{body}\n"
+        f"</untrusted_tool_output>"
+    )
+
+
 # ── Data classes ────────────────────────────────────────────
 
 
@@ -163,13 +179,22 @@ class SchedulingAgent:
                 system_prompt = f"{system_prompt}\n\n---\n\n{mem_block}"
 
         # ── Restore or initialize conversation ──
+        # turn 2+ 에서도 system prompt 를 최신으로 유지한다 — 이전엔 첫 턴 system 이
+        # ctx.messages[0] 으로 고정되어 user_memory / SECURITY_BOUNDARY / 날짜 갱신이
+        # 반영되지 않았다. 매 턴 prepend/replace.
+        fresh_system = {"role": "system", "content": system_prompt}
         if ctx.messages:
-            messages = ctx.messages + [
+            history = list(ctx.messages)
+            if history and history[0].get("role") == "system":
+                history[0] = fresh_system
+            else:
+                history.insert(0, fresh_system)
+            messages = history + [
                 {"role": "user", "content": user_message}
             ]
         else:
             messages = [
-                {"role": "system", "content": system_prompt},
+                fresh_system,
                 {"role": "user", "content": user_message},
             ]
 
@@ -319,7 +344,7 @@ class SchedulingAgent:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.call_id,
-                            "content": json.dumps(result.data, ensure_ascii=False, default=str),
+                            "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         })
                         return AgentResult(
                             awaiting_approval=True,
@@ -341,7 +366,7 @@ class SchedulingAgent:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.call_id,
-                            "content": json.dumps(result.data, ensure_ascii=False, default=str),
+                            "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         })
                         return AgentResult(
                             awaiting_approval=True,
@@ -357,9 +382,7 @@ class SchedulingAgent:
                         {
                             "role": "tool",
                             "tool_call_id": tc.call_id,
-                            "content": json.dumps(
-                                result.data, ensure_ascii=False, default=str
-                            ),
+                            "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         }
                     )
 
@@ -422,16 +445,26 @@ class SchedulingAgent:
 
     @staticmethod
     def _format_memory_block(facts: list[dict]) -> str:
-        """facts → system prompt 에 붙일 자연어 블록. 빈 list 면 빈 문자열."""
+        """facts → system prompt 에 붙일 <user_memory> 블록. 빈 list 면 빈 문자열.
+
+        fact_text 는 사용자 발화에서 추출된 데이터이므로 prompt injection 매개체가
+        될 수 있다. 외곽을 <user_memory> 태그로 감싸고 fact_text 안의 태그 시작
+        문자(<, >)는 escape 해서 LLM 이 명령으로 해석하지 않도록 만든다.
+        system prompt 의 보안 경계 안내문(SECURITY_BOUNDARY)과 짝을 이룬다.
+        """
         if not facts:
             return ""
-        # 최신 fact 우선 (valid_from desc) — 단순히 끝에서 자르도록 reverse
         limited = facts[-_MAX_INJECTED_FACTS:] if len(facts) > _MAX_INJECTED_FACTS else facts
-        lines = ["## 사용자에 대해 알고 있는 사실 (장기 기억)"]
+
+        def _escape(s: Any) -> str:
+            return str(s).replace("<", "&lt;").replace(">", "&gt;")
+
+        lines = ["## 사용자에 대해 알고 있는 사실 (장기 기억)", "<user_memory>"]
         for f in limited:
-            fact_type = f.get("fact_type", "?")
-            fact_text = f.get("fact_text", "?")
+            fact_type = _escape(f.get("fact_type", "?"))
+            fact_text = _escape(f.get("fact_text", "?"))
             lines.append(f"- [{fact_type}] {fact_text}")
+        lines.append("</user_memory>")
         return "\n".join(lines)
 
     def _consolidate_after_turn(
@@ -651,12 +684,27 @@ _DENY_WORDS = frozenset({
 })
 
 
+_CONFIRM_MAX_LEN = 20  # confirmation 으로 보려는 메시지의 최대 길이 (짧은 ack 가정)
+
+
 def _is_denial(msg: str) -> bool:
-    """사용자 메시지가 거부/취소 의사인지 확인."""
+    """사용자 메시지가 거부/취소 의사인지 확인.
+
+    Substring 매칭을 폐기 — '예전에는' 같은 정상 발화가 'yes'/'예'로 잘못 매칭되던
+    문제를 막는다. exact match 또는 짧은 문장에서 단어 경계 매칭만 허용.
+    """
     cleaned = msg.strip().lower()
+    if not cleaned:
+        return False
     if cleaned in _DENY_WORDS:
         return True
-    return any(w in cleaned for w in _DENY_WORDS)
+    # 짧은 메시지(≤ _CONFIRM_MAX_LEN)에서만 토큰 분할 매칭 허용
+    if len(cleaned) > _CONFIRM_MAX_LEN:
+        return False
+    import re as _re
+
+    tokens = [t for t in _re.split(r"[\s.,!?~…]+", cleaned) if t]
+    return any(t in _DENY_WORDS for t in tokens)
 
 
 def _extract_apply_hint_question(skill_name: str, data: Any) -> str | None:
@@ -700,14 +748,20 @@ def _call_signature(skill_name: str, args: dict) -> str:
 def _is_confirmation(msg: str) -> bool:
     """Check if user message is confirming a pending approval.
 
-    Uses substring matching — "응 변경해줘" matches because "응" is in it.
+    Substring 매칭을 폐기 — '예전' 같은 정상 발화가 잘못 confirm 되던 문제를 막는다.
+    exact match 또는 짧은 문장(≤ _CONFIRM_MAX_LEN)에서 단어 경계 매칭만 허용.
     """
     cleaned = msg.strip().lower()
-    # Exact match first
+    if not cleaned:
+        return False
     if cleaned in _CONFIRM_WORDS:
         return True
-    # Substring: any confirm word appears in the message
-    return any(w in cleaned for w in _CONFIRM_WORDS)
+    if len(cleaned) > _CONFIRM_MAX_LEN:
+        return False
+    import re as _re
+
+    tokens = [t for t in _re.split(r"[\s.,!?~…]+", cleaned) if t]
+    return any(t in _CONFIRM_WORDS for t in tokens)
 
 
 def _is_error(data: Any) -> bool:
