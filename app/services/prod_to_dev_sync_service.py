@@ -27,6 +27,13 @@ EXPLICIT_PKS = {
     "wanted": ["group_id", "year", "month"],
 }
 
+# group_id 컬럼이 없는 자식 테이블의 부모 매핑.
+# include_group_ids 모드에서 부모 group_id 로 간접 wipe-by-parent 처리.
+# 형식: { 자식테이블: (부모테이블, FK 컬럼) }
+PARENT_FK_MAP = {
+    "schedule_entries": ("schedules", "schedule_id"),
+}
+
 # (table, mode) — FK 부모 → 자식 순서
 # mode="wipe":  dev 전체 삭제 후 prod 복사 (마스터 — prod 완전 미러)
 # mode="upsert": MERGE (prod row 있으면 UPDATE, 없으면 INSERT, dev-only 보존)
@@ -238,6 +245,43 @@ def _copy_prod_to_dev(
     return {"table": table, "inserted": inserted}
 
 
+def _wipe_by_parent_fk(
+    db: Session,
+    table: str,
+    parent_info: tuple,
+    group_ids: List[str],
+) -> dict:
+    """부모 group_id 로 자식 테이블 DELETE+INSERT (include_group_ids overwrite)."""
+    parent_table, fk_col = parent_info
+    dev_cols = _get_columns(db, DEV_DB, table)
+    prod_cols = set(_get_columns(db, PROD_DB, table))
+    common = [c for c in dev_cols if c in prod_cols]
+    if not common:
+        return {"table": table, "skipped": "no_common_cols", "mode": "wipe_by_parent"}
+    ph = ", ".join(f":ig{i}" for i in range(len(group_ids)))
+    params = {f"ig{i}": g for i, g in enumerate(group_ids)}
+    dev_sub = f"SELECT [{fk_col}] FROM {DEV_DB}.dbo.[{parent_table}] WHERE group_id IN ({ph})"
+    prod_sub = f"SELECT [{fk_col}] FROM {PROD_DB}.dbo.[{parent_table}] WHERE group_id IN ({ph})"
+    del_sql = f"DELETE FROM {DEV_DB}.dbo.[{table}] WHERE [{fk_col}] IN ({dev_sub})"
+    deleted = db.execute(text(del_sql), params).rowcount or 0
+    col_list = ", ".join(f"[{c}]" for c in common)
+    sel_list = ", ".join(f"src.[{c}]" for c in common)
+    ins_sql = (
+        f"INSERT INTO {DEV_DB}.dbo.[{table}] ({col_list}) "
+        f"SELECT {sel_list} FROM {PROD_DB}.dbo.[{table}] AS src "
+        f"WHERE src.[{fk_col}] IN ({prod_sub})"
+    )
+    has_identity = _has_identity(db, DEV_DB, table)
+    if has_identity:
+        db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.[{table}] ON"))
+    try:
+        inserted = db.execute(text(ins_sql), params).rowcount or 0
+    finally:
+        if has_identity:
+            db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.[{table}] OFF"))
+    return {"table": table, "mode": "wipe_by_parent", "deleted": deleted, "inserted": inserted}
+
+
 def _merge_upsert(
     db: Session,
     table: str,
@@ -260,9 +304,14 @@ def _merge_upsert(
     if not common:
         return {"table": table, "skipped": "no_common_cols", "upserted": 0}
 
-    # include_group_ids 지정 시 group_id 컬럼 없는 테이블은 dev 보존 (upsert skip).
+    # include_group_ids 지정 시 group_id 컬럼 없는 테이블 처리:
+    # - PARENT_FK_MAP 매핑 있으면 부모 group_id 기반 wipe-by-parent 강제 (자식 overwrite)
+    # - 매핑 없으면 dev 보존 (skip)
     if include_group_ids and "group_id" not in prod_cols:
-        return {"table": table, "skipped": "no_group_id_with_include", "upserted": 0}
+        parent_info = PARENT_FK_MAP.get(table)
+        if not parent_info:
+            return {"table": table, "skipped": "no_group_id_with_include", "upserted": 0}
+        return _wipe_by_parent_fk(db, table, parent_info, include_group_ids)
 
     src_clause = f"{PROD_DB}.dbo.[{table}]"
     params: dict = {}
@@ -442,7 +491,8 @@ def sync_prod_to_dev(
                 logger.error("[prod→dev sync] UPSERT 실패 %s: %s", table, err)
                 results.append({"table": table, "mode": "upsert", "error": err, "upserted": 0})
             else:
-                r["mode"] = "upsert"
+                # PARENT_FK_MAP fallback 시 _merge_upsert 가 mode="wipe_by_parent" 반환 → 보존
+                r.setdefault("mode", "upsert")
                 results.append(r)
 
     # 4. FK 재활성화
