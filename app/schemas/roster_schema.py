@@ -102,6 +102,9 @@ class RosterRequest(BaseModel):
     config_id: Optional[int] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
+    # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
+    # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.
+    advanced_inference: bool = Field(default=False)
     # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
     # mode:
     # - auto/hybrid: 균등 + 월선호를 함께 고려(기본)
