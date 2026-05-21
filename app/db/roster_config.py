@@ -43,7 +43,30 @@ class NurseRosterConfig:
     # per-day는 allow_soft_fallback=True의 soft penalty 유지(KLD 자유도 보존),
     # 월 누계는 grade demand×D를 거의 강제 → grade 비율 보장.
     # 시화병원처럼 인원 vs demand가 빡센 케이스에서 GRADE 트레이드오프 곡선 확장.
-    grade_monthly_hard: bool = True  # TEMP: 시화병원 6월 테스트용 (배포 시 False)
+    grade_monthly_hard: bool = True
+    # Layer 2 total work target에 grade demand 비례 bias.
+    # nurse target_work = baseline + α × (grade_natural_work - baseline)
+    # α=0: 기존 동작 (모든 nurse가 baseline_work_target 동일)
+    # α=0.5: 잉여 grade는 약하게 work 낮춤, 부족 grade는 약하게 work 높임
+    # 폐기된 grade-aware target과 달리 α로 강도 조절 → OFF 양극화 완화
+    grade_target_bias_alpha: float = 0.0
+    # α 자동 산출 (auto=True): shortage/surplus 비율로 매 solve마다 자동 결정.
+    # 인원 vs demand가 빡센 케이스: α↑ (잉여 grade가 양보), 여유 케이스: α=0 (bias 비활성).
+    # pre-solve feasibility 진단도 함께 수행 (demand > capacity 시 경고 log).
+    # 시화병원 검증 결과 monthly_hard와 결합 시 N/D-E 양극화 부작용 발생.
+    # 기본 비활성. 필요 시 케이스별로 ON 가능.
+    grade_target_bias_alpha_auto: bool = False
+    # Layer 1.5: per-nurse |D-E|, |E-N|, |D-N| balance 직접 minimize (X축 균등).
+    # 기존 KLD는 shift별 따로 균등화 → 한 nurse의 D=10/E=0 같은 양극화 약하게만 페널티.
+    # 이 항은 같은 사람 내 시프트 비대칭을 직접 0에 끌어당김. 전담자(allowed shift 1개)는 제외.
+    # 0: 비활성, 30000~90000: 적정. default는 KLD per-shift weight 수준.
+    kld_balance_weight: int = 0  # X-ratio cap이 X축을 직접 모델링하므로 보조항 비활성
+    # Per-nurse 시프트 상한 soft cap (자동 산출, hardcode 없음):
+    # Y축: N count ≤ N_target × ratio (예: 6.43 × 1.5 = 9.6 → floor 9)
+    # X축: max(D,E) ≤ ratio × min(D,E)
+    # 0이면 비활성. 1.5이면 사용자 목표.
+    shift_ratio_cap: float = 1.5
+    shift_cap_weight: int = 500000
     soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
     soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
     off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)

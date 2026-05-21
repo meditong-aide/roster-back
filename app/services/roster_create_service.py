@@ -5161,7 +5161,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             req,
             shift_manage_data,
             fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
-            time_limit_seconds=60,
+            time_limit_seconds=180,  # TEMP for balance test
             config_override=config_dict,
         )
         # _debug_log(
@@ -5247,7 +5247,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 req,
                 shift_manage_data,
                 fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
-                time_limit_seconds=60,
+                time_limit_seconds=180,  # TEMP for balance test
                 config_override=soft_cfg,
             )
             # 동일 후처리 적용

@@ -298,6 +298,227 @@ def add_kld_distribution_terms(
         )
 
     # ══════════════════════════════════════════════
+    # Layer 1.5: per-nurse 시프트 balance (X축 직접 minimize) — flex-aware
+    # ══════════════════════════════════════════════
+    # 같은 nurse의 |D-E|, |E-N|, |D-N|을 0에 끌어당김.
+    # 단, fixed_wanted/NML로 강제된 카운트는 balance에서 제외 → *flex part*만 균형.
+    # 예: 정아영 D fixed=16 → |D-E| 계산은 (D_total - 16) vs E_total.
+    # 전담자(allowed shift 1개)는 skip.
+    W_BALANCE = int(getattr(cfg, "kld_balance_weight", 0) or 0)
+    if W_BALANCE > 0:
+        # fixed_cells per (nurse, shift_code) 카운트 사전 산출
+        # fixed_source 무관하게 work_code인 모든 fixed cell 카운트 (fixed_wanted, weekly_off 등).
+        fixed_count_by_nc: dict[tuple[int, str], int] = {}
+        fc_total = 0
+        fc_by_source: dict[str, int] = {}
+        for cell in getattr(rs, "fixed_cells", []) or []:
+            if not isinstance(cell, dict):
+                continue
+            n_idx = cell.get("nurse_index")
+            raw = str(cell.get("shift") or "").strip().upper()
+            src = str(cell.get("fixed_source") or "").strip().lower() or "?"
+            fc_total += 1
+            fc_by_source[src] = fc_by_source.get(src, 0) + 1
+            if n_idx is None or raw not in work_codes:
+                continue
+            key = (int(n_idx), raw)
+            fixed_count_by_nc[key] = fixed_count_by_nc.get(key, 0) + 1
+        if stage_label == "메인":
+            print(
+                f"{logger_prefix} [KLD-balance][diag] fixed_cells_total={fc_total}, "
+                f"by_source={fc_by_source}, work_code_count={len(fixed_count_by_nc)}"
+            )
+
+        def _shift_exact_count(nu, prefix: str) -> int:
+            """NML의 exact 또는 min==max인 count 반환. 없으면 0."""
+            ex = getattr(nu, f"{prefix}_exact", None)
+            if ex is not None:
+                try:
+                    return int(ex)
+                except (TypeError, ValueError):
+                    pass
+            mn = getattr(nu, f"{prefix}_min", None)
+            mx = getattr(nu, f"{prefix}_max", None)
+            if mn is not None and mx is not None:
+                try:
+                    if int(mn) == int(mx):
+                        return int(mn)
+                except (TypeError, ValueError):
+                    pass
+            return 0
+
+        balance_pairs = [("D", "E"), ("D", "N"), ("E", "N")]
+        balance_added = 0
+        flex_aware_count = 0
+        for n in normals:
+            nu = rs.nurses[n]
+            allowed = normalize_allowed_shift_codes(
+                getattr(nu, "is_night_nurse", None), use_mid=use_mid,
+            ) or all_codes_set
+            allowed_work = allowed & set(work_codes)
+            if len(allowed_work) <= 1:
+                continue  # 전담자 제외
+            days_n = list(iter_nurse_days(n, join, leave, blocked_by_nurse))
+            for c1, c2 in balance_pairs:
+                if c1 not in allowed_work or c2 not in allowed_work:
+                    continue
+                if c1 not in work_indices or c2 not in work_indices:
+                    continue
+                idx1 = work_indices[c1]
+                idx2 = work_indices[c2]
+                cnt1 = sum(X(n, d, idx1) for d in days_n)
+                cnt2 = sum(X(n, d, idx2) for d in days_n)
+                # fixed/NML로 강제된 카운트
+                fixed_1 = max(
+                    fixed_count_by_nc.get((n, c1), 0),
+                    _shift_exact_count(nu, c1.lower()),
+                )
+                fixed_2 = max(
+                    fixed_count_by_nc.get((n, c2), 0),
+                    _shift_exact_count(nu, c2.lower()),
+                )
+                if fixed_1 > 0 or fixed_2 > 0:
+                    flex_aware_count += 1
+                    # free_c = count - fixed_c. 음수 방지 위해 변수 범위 [0, D].
+                    free_1 = m.NewIntVar(0, D, f"bal_free_{c1}_{stage_label}_{n}")
+                    free_2 = m.NewIntVar(0, D, f"bal_free_{c2}_{stage_label}_{n}")
+                    m.Add(free_1 == cnt1 - fixed_1)
+                    m.Add(free_2 == cnt2 - fixed_2)
+                    diff_lhs = free_1 - free_2
+                else:
+                    # fixed가 없으면 변수 추가 없이 직접 차이만 계산 (이전 동작 유지)
+                    diff_lhs = cnt1 - cnt2
+                diff = m.NewIntVar(-D, D, f"bal_{c1}{c2}_diff_{stage_label}_{n}")
+                m.Add(diff == diff_lhs)
+                abs_diff = m.NewIntVar(0, D, f"bal_{c1}{c2}_abs_{stage_label}_{n}")
+                m.AddAbsEquality(abs_diff, diff)
+                b1 = m.NewIntVar(0, 1, f"bal_{c1}{c2}_b1_{stage_label}_{n}")
+                b2 = m.NewIntVar(0, 2, f"bal_{c1}{c2}_b2_{stage_label}_{n}")
+                b3 = m.NewIntVar(0, D, f"bal_{c1}{c2}_b3_{stage_label}_{n}")
+                m.Add(abs_diff == b1 + b2 + b3)
+                obj.append(-W_BALANCE * b1)
+                obj.append(-3 * W_BALANCE * b2)
+                obj.append(-10 * W_BALANCE * b3)
+                balance_added += 1
+        if balance_added > 0:
+            print(
+                f"{logger_prefix} [KLD-balance] ({stage_label}): "
+                f"per-nurse flex-aware |D-E|/|D-N|/|E-N| 항 추가, pairs={balance_added}, "
+                f"flex_adjusted={flex_aware_count}, W={W_BALANCE}"
+            )
+
+    # ══════════════════════════════════════════════
+    # Layer 1.6: Per-nurse 모든 (s1, s2) pair ratio cap — demand-aware
+    # ══════════════════════════════════════════════
+    # 각 nurse의 allowed shift에 대해 *모든 pair* (D-E, D-N, E-N 등)에
+    # ratio cap = (demand[max]/demand[min]) × buffer 자동 산출.
+    # - 시화 6:6:6 → 모든 pair target=1.0, cap=1.0×buffer.
+    # - 8:4 같은 비대칭 → 자동으로 cap=2.0×buffer.
+    # - 정아영처럼 D+N만 가능: D-N pair만 적용 (E 자동 skip).
+    SHIFT_RATIO_BUFFER = float(getattr(cfg, "shift_ratio_cap", 0.0) or 0.0)
+    W_CAP = int(getattr(cfg, "shift_cap_weight", 0) or 0)
+    if SHIFT_RATIO_BUFFER > 0 and W_CAP > 0:
+        import itertools
+        from fractions import Fraction
+
+        # 전역 demand 추출
+        daily_req = getattr(cfg, "daily_shift_requirements", None) or {}
+        shift_demand: dict[str, int] = {}
+        for c in work_codes:
+            try:
+                shift_demand[c] = int(daily_req.get(c, 0))
+            except Exception:
+                shift_demand[c] = 0
+
+        pair_added = 0
+        for n in normals:
+            allowed = normalize_allowed_shift_codes(
+                getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+            ) or all_codes_set
+            allowed_work = sorted(allowed & set(work_codes))
+            if len(allowed_work) <= 1:
+                continue  # 전담자 skip
+            days_n = list(iter_nurse_days(n, join, leave, blocked_by_nurse))
+            cnt_vars: dict[str, object] = {}
+            for c in allowed_work:
+                cv = m.NewIntVar(0, D, f"sr_cnt_{c}_{stage_label}_{n}")
+                m.Add(cv == sum(X(n, d, work_indices[c]) for d in days_n))
+                cnt_vars[c] = cv
+            for s1, s2 in itertools.combinations(allowed_work, 2):
+                d1 = shift_demand.get(s1, 0)
+                d2 = shift_demand.get(s2, 0)
+                if d1 <= 0 or d2 <= 0:
+                    continue
+                # ratio target = demand_max / demand_min, × buffer
+                ratio_target = max(d1, d2) / min(d1, d2)
+                ratio_cap = ratio_target * SHIFT_RATIO_BUFFER
+                frac = Fraction(ratio_cap).limit_denominator(10)
+                num, den = frac.numerator, frac.denominator
+                max_v = m.NewIntVar(0, D, f"sr_max_{s1}{s2}_{stage_label}_{n}")
+                min_v = m.NewIntVar(0, D, f"sr_min_{s1}{s2}_{stage_label}_{n}")
+                m.AddMaxEquality(max_v, [cnt_vars[s1], cnt_vars[s2]])
+                m.AddMinEquality(min_v, [cnt_vars[s1], cnt_vars[s2]])
+                viol = m.NewIntVar(0, den * D, f"sr_viol_{s1}{s2}_{stage_label}_{n}")
+                m.Add(viol >= den * max_v - num * min_v)
+                obj.append(-W_CAP * viol)
+                pair_added += 1
+        if pair_added > 0:
+            print(
+                f"{logger_prefix} [shift-ratio] ({stage_label}): "
+                f"demand-aware all pairs, buffer={SHIFT_RATIO_BUFFER}, "
+                f"demand={shift_demand}, pairs={pair_added}, W={W_CAP}"
+            )
+
+        # ── Per-shift 양방향 cap (floor/ceiling) — 단일 시프트 outlier 직접 차단 ──
+        # target = total_need[c] / eligible_count
+        # floor = floor(target / buffer), cap = floor(target × buffer)
+        # 어떤 시프트도 [floor, cap] 영역 벗어나면 soft penalty.
+        # pair ratio cap이 *간접* 차단, 이 항이 *직접* 차단 → 솔버 신호 강화.
+        shift_floor: dict[str, int] = {}
+        shift_cap_int: dict[str, int] = {}
+        for c in work_codes:
+            if c not in total_need:
+                continue
+            eligible_cnt = 0
+            for n in normals:
+                a = normalize_allowed_shift_codes(
+                    getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+                ) or all_codes_set
+                if c in a:
+                    eligible_cnt += 1
+            if eligible_cnt == 0:
+                continue
+            t = total_need[c] / eligible_cnt
+            shift_floor[c] = int(t / SHIFT_RATIO_BUFFER)
+            shift_cap_int[c] = int(t * SHIFT_RATIO_BUFFER)
+
+        bidir_added = 0
+        for n in normals:
+            allowed = normalize_allowed_shift_codes(
+                getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+            ) or all_codes_set
+            days_n = list(iter_nurse_days(n, join, leave, blocked_by_nurse))
+            for c in work_codes:
+                if c not in allowed or c not in shift_floor or c not in work_indices:
+                    continue
+                cnt_expr = sum(X(n, d, work_indices[c]) for d in days_n)
+                # over: 시프트 cap 초과
+                over = m.NewIntVar(0, D, f"sc_over_{c}_{stage_label}_{n}")
+                m.Add(over >= cnt_expr - shift_cap_int[c])
+                obj.append(-W_CAP * over)
+                # under: 시프트 floor 미달
+                under = m.NewIntVar(0, D, f"sc_under_{c}_{stage_label}_{n}")
+                m.Add(under >= shift_floor[c] - cnt_expr)
+                obj.append(-W_CAP * under)
+                bidir_added += 1
+        if bidir_added > 0:
+            print(
+                f"{logger_prefix} [shift-bidir] ({stage_label}): "
+                f"floor={shift_floor}, cap={shift_cap_int}, "
+                f"per_nurse_shift_pairs={bidir_added}, W={W_CAP}"
+            )
+
+    # ══════════════════════════════════════════════
     # Layer 2: 총 근무수(D+E+N) 균등화 — NML-aware per-nurse target
     # ══════════════════════════════════════════════
     # NML(nurse_monthly_limit) 강제값을 인지하여 각 nurse 별 target 산정:
@@ -348,19 +569,122 @@ def add_kld_distribution_terms(
     total_work_need = sum(total_need[c] for c in work_codes)
     baseline_work_target = max(1, D - int(getattr(cfg, "off_days", 10) or 10))
 
-    # A.3 (grade-aware target) 폐기: prod COMBINED 환경에서 grade demand 기반 target 이
-    # grade 별 work 양극화를 유발 → G2 OFF<baseline → off_swap excess≤0 → FB 변환 skip.
-    # baseline 일률 적용이 cross-grade range 가 더 좁고 FB 분배가 고름.
-    # 메모리: [[kld-a3-grade-aware-discarded-20260513]]
+    # A.3 (grade-aware target) 폐기 사유: 100% grade demand target이 양극화 유발.
+    # 새 변형: α-blending으로 *약하게* grade demand bias.
+    # target_n = baseline + α × (grade_natural_work - baseline)
+    # α=0이면 폐기 이전과 동일. α∈(0,1)이면 부드럽게 grade 방향으로 끌어당김.
+    grade_alpha_cfg = float(getattr(cfg, "grade_target_bias_alpha", 0.0) or 0.0)
+    grade_alpha_auto = bool(getattr(cfg, "grade_target_bias_alpha_auto", False))
+    grade_alpha: float = grade_alpha_cfg  # auto 모드면 아래에서 override
+    grade_natural_by_idx: dict[int, float] = {}
+    if grade_alpha_cfg > 0 or grade_alpha_auto:
+        gs = str(getattr(rs, "grade_strategy", "") or "").upper()
+        gc = getattr(rs, "grade_config", None) or {}
+        gconstraints = gc.get("constraints_json") or gc.get("constraints") or {}
+        if gconstraints and gs in ("GRADE", "COMBINED"):
+            by_g: dict[int, list[int]] = {}
+            for i, nu in enumerate(rs.nurses):
+                g = getattr(nu, "grade", None)
+                try:
+                    gi = int(g) if g is not None else None
+                except Exception:
+                    gi = None
+                if gi is not None:
+                    by_g.setdefault(gi, []).append(i)
+            grade_demand_by_g: dict[int, int] = {}
+            for gi, idxs in by_g.items():
+                if not idxs:
+                    continue
+                demand = 0
+                for c in work_codes:
+                    gmap = gconstraints.get(c) or {}
+                    base = gmap.get(str(gi))
+                    if base is None:
+                        base = gmap.get(gi)
+                    try:
+                        demand += int(base or 0) * D
+                    except Exception:
+                        pass
+                grade_demand_by_g[gi] = demand
+                if demand <= 0:
+                    continue
+                natural_work = demand / len(idxs)
+                for i in idxs:
+                    grade_natural_by_idx[i] = natural_work
+
+            # ── 자동 α 산출 + pre-solve feasibility 진단 ──
+            if grade_alpha_auto:
+                shortage_total = 0
+                surplus_total = 0
+                max_off_hard = int(getattr(cfg, "off_days", 9) or 9)
+                max_work_per_nurse = max(1, D - max_off_hard)
+                feasibility_alerts: list[tuple[int, int, int, int]] = []
+                for gi, idxs in by_g.items():
+                    cnt = len(idxs)
+                    if cnt == 0:
+                        continue
+                    demand_g = grade_demand_by_g.get(gi, 0)
+                    if demand_g <= 0:
+                        continue
+                    capacity_g = cnt * max_work_per_nurse
+                    if demand_g > capacity_g:
+                        feasibility_alerts.append(
+                            (gi, demand_g, capacity_g, demand_g - capacity_g)
+                        )
+                    baseline_total_g = cnt * baseline_work_target
+                    if demand_g > baseline_total_g:
+                        shortage_total += demand_g - baseline_total_g
+                    elif baseline_total_g > demand_g:
+                        surplus_total += baseline_total_g - demand_g
+                if surplus_total > 0:
+                    grade_alpha = min(1.0, shortage_total / surplus_total)
+                else:
+                    grade_alpha = 0.0
+                print(
+                    f"{logger_prefix} [KLD-grade-alpha-auto] α*={grade_alpha:.3f} "
+                    f"(shortage={shortage_total}, surplus={surplus_total}, "
+                    f"max_work/nurse={max_work_per_nurse})"
+                )
+                for gi, demand_g, capacity_g, deficit in feasibility_alerts:
+                    print(
+                        f"{logger_prefix} [GradeFeasibility][WARN] "
+                        f"grade={gi}: demand={demand_g} > capacity={capacity_g} "
+                        f"({deficit}명-day 구조적 부족) — 인원/demand 조정 필요"
+                    )
+                if shortage_total > surplus_total:
+                    print(
+                        f"{logger_prefix} [GradeFeasibility][WARN] "
+                        f"시스템 부족: shortage={shortage_total} > surplus={surplus_total}, "
+                        f"잉여 grade의 양보로도 충족 불가"
+                    )
+
     nurse_total_target: dict[int, int] = {}
     nml_count = 0
+    grade_biased_count = 0
     for n in normals:
         forced = _nml_forced_work(rs.nurses[n])
         if forced is not None:
             nurse_total_target[n] = max(0, min(D, forced))
             nml_count += 1
+        elif grade_alpha > 0 and n in grade_natural_by_idx:
+            natural = grade_natural_by_idx[n]
+            # Asymmetric: 잉여 grade(natural < baseline)만 target 낮춤.
+            # 부족 grade(natural ≥ baseline)는 baseline 유지 → 솔버가 max work 시도.
+            # 이러면 N 양극화 회피하면서 잉여 grade가 부족 grade에게 자리 양보.
+            if natural < baseline_work_target:
+                biased = baseline_work_target + grade_alpha * (natural - baseline_work_target)
+                nurse_total_target[n] = max(0, min(D, int(round(biased))))
+                grade_biased_count += 1
+            else:
+                nurse_total_target[n] = baseline_work_target
         else:
             nurse_total_target[n] = baseline_work_target
+    if grade_alpha > 0 and grade_biased_count > 0:
+        print(
+            f"{logger_prefix} [KLD-총근무-grade-bias] α={grade_alpha}, "
+            f"biased_nurses={grade_biased_count}/{len(normals)}, "
+            f"baseline={baseline_work_target}"
+        )
 
     max_work = m.NewIntVar(0, D, f"kld_tw_max_{stage_label}")
     min_work = m.NewIntVar(0, D, f"kld_tw_min_{stage_label}")
