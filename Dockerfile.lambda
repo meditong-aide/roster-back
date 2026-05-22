@@ -16,8 +16,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 # ───────── Stage 2: Runtime ─────────
 FROM public.ecr.aws/lambda/python:3.12
 
-# 한국 timezone (Lambda Python base는 tzdata 포함)
-ENV TZ=Asia/Seoul
+# 한국 timezone + Python stdout unbuffered (CloudWatch 실시간 flush) + UTF-8
+ENV TZ=Asia/Seoul \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=UTF-8
 
 # 빌드 단계에서 install된 의존성을 LAMBDA_TASK_ROOT 으로 복사
 COPY --from=builder /opt/python ${LAMBDA_TASK_ROOT}

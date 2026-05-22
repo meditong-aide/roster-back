@@ -11,6 +11,9 @@ on:
       - 'requirements.lambda.txt'
       - 'Dockerfile.lambda'
       - '.github/workflows/deploy-lambda.yml'
+  # force-reset/rewind 등으로 paths 필터가 동작 안 할 때 수동 재배포용.
+  # ref 기준으로 ENV 자동 판정 (main→prod, dev→dev).
+  workflow_dispatch:
 
 concurrency:
   group: deploy-lambda-${{ github.ref_name }}
