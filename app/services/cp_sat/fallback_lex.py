@@ -760,7 +760,14 @@ def optimize_fallback_lex_hard_first(
                     m.Add(X(n, d, w_idx) == 0)
         # 순수 O 4연속 금지 (fixed로 이미 4O면 경고만 남기고 스킵)
         # cfg.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3)
-        if off_idx is not None:
+        # cfg.enforce_4o_hard=False 또는 env ROSTER_DISABLE_4O_HARD=1 이면 4O hard 전체 비활성(테스트/완화).
+        import os as _os_4o_env_fb
+        _enforce_4o_hard_eff_fb = bool(getattr(cfg, "enforce_4o_hard", True))
+        if _os_4o_env_fb.environ.get("ROSTER_DISABLE_4O_HARD"):
+            _enforce_4o_hard_eff_fb = False
+        if not _enforce_4o_hard_eff_fb:
+            print(f"{logger_prefix} [4O-hard] DISABLED (cfg.enforce_4o_hard={getattr(cfg, 'enforce_4o_hard', True)}, env={_os_4o_env_fb.environ.get('ROSTER_DISABLE_4O_HARD')})")
+        if off_idx is not None and _enforce_4o_hard_eff_fb:
             vac_cells = set(off_exception_vacation_cells)
             skip_4o_hard_first_days = int(getattr(cfg, "skip_4o_hard_first_days", 3) or 0)
             for n in range(N):
@@ -801,6 +808,8 @@ def optimize_fallback_lex_hard_first(
         print(f"{logger_prefix} [4O-cross-month-debug] prev_off_tail_by_idx keys={list(prev_off_tail.keys())}, "
               f"values={dict(prev_off_tail)}, N={N}")
         for n in range(N):
+            if not _enforce_4o_hard_eff_fb:
+                break
             if _is_preceptee_at(n):
                 continue
             t = prev_off_tail.get(n, 0)

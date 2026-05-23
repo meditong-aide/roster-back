@@ -165,3 +165,33 @@ objective += -w_ms × viol
 
 ### 7-6. 남은 dead code (후속 청소 대상)
 `_force_grade_max_soft_fallback` 플래그 consumer 4곳(라인 2818-2821, 2877-2882 일부)은 그대로 두었음. 외부에서 이 플래그를 주입하는 경로가 없으므로 사실상 dead. 후속 cleanup에서 제거 가능.
+
+---
+
+## 8. 4O hard 제약 해제 (디폴트 False) (2026-05-23)
+
+### 8-1. 의도
+"순수 OFF 4연속 금지" hard 제약(당월 내 + 월경계)을 디폴트로 해제. 운영 측에서 4O 자체를 막을 필요가 약하다고 판단.
+
+### 8-2. 변경 파일
+
+| 파일 | 변경 |
+|---|---|
+| `app/db/roster_config.py` | `enforce_4o_hard: bool = False` 추가 (디폴트 해제) |
+| `app/services/cp_sat_basic.py` | config 주입 + 4O hard 블록 2곳(`:2557~`, `:2604~`)에 게이트. 환경변수 `ROSTER_DISABLE_4O_HARD` escape hatch도 함께 |
+| `app/services/cp_sat/fallback_lex.py` | 폴백 경로의 4O hard 블록 2곳(`:761~`, `:798~`)에도 동일 게이트 |
+
+### 8-3. 검증 결과 (`ROSTER_DISABLE_4O_HARD=1`로 강제 해제, 2026-06)
+
+| 그룹 | 활성 인원 | 4O 발생 | 비율 | 최대 OFF run 길이 |
+|---|---|---|---|---|
+| 9B | 15 | 2명 | 13% | 4일 (5+ 없음) |
+| ICU | 28 | 3명 | 11% | 4일 (5+ 없음) |
+
+→ 솔버가 자발적으로 4O를 만들지는 않고, 다른 제약(OFF cap, 월 OFF 총량, KLD 분배 등)이 ~10-13% 수준으로 자연 억제.
+
+### 8-4. 재활성화 방법
+운영 요구로 다시 hard로 돌리려면:
+- 그룹별: 후속 작업에서 RosterConfig DB에 `enforce_4o_hard` 컬럼 추가 후 그룹별 True로
+- 일회성 테스트: 환경변수 `ROSTER_DISABLE_4O_HARD=0` 또는 미설정 + cfg default True로 변경
+- 코드 디폴트: `roster_config.py:148`을 다시 `True`로

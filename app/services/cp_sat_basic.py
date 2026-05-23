@@ -599,6 +599,8 @@ class CPSATBasicEngine:
             # 같은 시프트(D/E/N) 연속 ≤3 soft
             max_same_shift=bool(config_data.get("max_same_shift", True)),
             max_same_shift_penalty_weight=int(config_data.get("max_same_shift_penalty_weight", 300) or 0),
+            # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
+            enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
             # 분배 정책 모드/월단위 선호 가중치
             distribution_mode=str(config_data.get("distribution_mode", "hybrid") or "hybrid"),
             monthly_preference_weight=int(config_data.get("monthly_preference_weight", 60) or 0),
@@ -2556,7 +2558,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
     # config.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3 → 1~3일 시작 윈도우는 4연속 O 허용)
-    if off_idx_full is not None:
+    # config.enforce_4o_hard=False 또는 env ROSTER_DISABLE_4O_HARD=1 이면 4O hard 전체 비활성(테스트/완화).
+    import os as _os_4o_env
+    _enforce_4o_hard_eff = bool(getattr(rs.config, "enforce_4o_hard", True))
+    if _os_4o_env.environ.get("ROSTER_DISABLE_4O_HARD"):
+        _enforce_4o_hard_eff = False
+    if not _enforce_4o_hard_eff:
+        print(f"[CP-SAT-Basic] [4O-hard] DISABLED (cfg.enforce_4o_hard={getattr(rs.config, 'enforce_4o_hard', True)}, env={_os_4o_env.environ.get('ROSTER_DISABLE_4O_HARD')})")
+    if off_idx_full is not None and _enforce_4o_hard_eff:
         vac_cells = set(vacation_off_cells)
         off_or_weekly = {cell for cell in structural_off_cells if cell not in vac_cells}
         skip_4o_hard_first_days = int(getattr(rs.config, "skip_4o_hard_first_days", 3) or 0)
@@ -2594,7 +2603,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
     # ── 4O 월경계 제약: 전월 꼬리 연속 OFF + 현월 초 연속 OFF 합산 4 이상 금지 ──
     _4o_cross_affected: set[int] = set()  # OffCap 보정 대상
-    if off_idx_full is not None:
+    if off_idx_full is not None and _enforce_4o_hard_eff:
         prev_off_tail = getattr(rs, "prev_month_off_tail_by_idx", {}) or {}
         print(f"[CP-SAT-Basic] [4O-cross-month-debug] prev_off_tail keys={list(prev_off_tail.keys())}, "
               f"values={dict(prev_off_tail)}, N={N}")
