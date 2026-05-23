@@ -320,6 +320,32 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
+    # N 블록 종료 → 다음 N 블록 시작 간격 soft (대칭, target=10일)
+    try:
+        n2n_target = int(getattr(cfg, "n_to_n_interval_target", 0) or 0)
+        n2n_w = int(getattr(cfg, "n_to_n_interval_penalty_weight", 0) or 0)
+        n2n_win = int(getattr(cfg, "n_to_n_interval_max_window", 0) or 0)
+        if n2n_target > 0 and n2n_w > 0 and n2n_win >= 2 and "N" in cfg.shift_types:
+            n_idx = cfg.shift_types.index("N")
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                for d1 in range(T0, T1):
+                    for d2 in range(d1 + 2, min(d1 + n2n_win + 1, T1 + 1)):
+                        gap = d2 - d1
+                        dist = abs(gap - n2n_target)
+                        if dist == 0:
+                            continue
+                        pair = m.NewBoolVar(f"n2n_fb_{n}_{d1}_{d2}")
+                        m.Add(pair <= X(n, d1, n_idx))
+                        m.Add(pair <= X(n, d2, n_idx))
+                        for k in range(d1 + 1, d2):
+                            m.Add(pair <= 1 - X(n, k, n_idx))
+                        between_sum = sum(X(n, k, n_idx) for k in range(d1 + 1, d2))
+                        m.Add(pair >= X(n, d1, n_idx) + X(n, d2, n_idx) - 1 - between_sum)
+                        obj.append(-n2n_w * dist * pair)
+    except Exception:
+        pass
+
     # 경력자 부족 약벌
     for d in range(D):
         for code in ("D", "E", "N"):

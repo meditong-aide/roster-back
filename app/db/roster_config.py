@@ -75,6 +75,11 @@ class NurseRosterConfig:
     # 4O 연속 휴무 hard 제약(당월 내 + 월경계). True면 4연속 OFF 금지. False면 제약 제거.
     # 디폴트는 False(해제): 운영 검증 결과 자연 발생률 ~10-13%로 무리 없는 수준.
     enforce_4o_hard: bool = False
+    # N 블록 종료 → 다음 N 블록 시작 사이 간격 soft. 대칭 페널티(많아도 적어도). 동일 블록 내부는 제외.
+    # 목표 10일에서 멀어질수록 |gap - target| × weight 누적. 낮은 weight로 약하게 유도.
+    n_to_n_interval_target: int = 10
+    n_to_n_interval_penalty_weight: int = 50
+    n_to_n_interval_max_window: int = 15
     off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)
     off_first: bool = False  # off_first=False(default): OFF 규칙 우선(OFF cap 충족 + max coverage 무시 + 남는 셀 근무 배정 + fixed_wanted 차감) / off_first=True: 근무 규칙 우선(현행 min-max coverage 균등화 유지, min 근접 배정)
     distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off

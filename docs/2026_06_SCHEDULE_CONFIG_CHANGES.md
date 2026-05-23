@@ -195,3 +195,44 @@ objective += -w_ms × viol
 - 그룹별: 후속 작업에서 RosterConfig DB에 `enforce_4o_hard` 컬럼 추가 후 그룹별 True로
 - 일회성 테스트: 환경변수 `ROSTER_DISABLE_4O_HARD=0` 또는 미설정 + cfg default True로 변경
 - 코드 디폴트: `roster_config.py:148`을 다시 `True`로
+
+---
+
+## 9. N 블록 종료 → 다음 N 블록 시작 간격 soft (2026-05-23)
+
+### 9-1. 의도
+간호사별 "야간 블록 종료 후 다음 야간 블록 시작까지의 간격"을 target=10일로 유도. 너무 짧으면(연속 야간 부담) 페널티, 너무 길면(야간 분포 편향) 페널티. **대칭 페널티**.
+
+### 9-2. 새 cfg 필드 (`roster_config.py`)
+
+| 필드 | 디폴트 | 설명 |
+|---|---|---|
+| `n_to_n_interval_target` | 10 | 목표 gap(일) |
+| `n_to_n_interval_penalty_weight` | 50 | 거리당 페널티 가중치 (낮게) |
+| `n_to_n_interval_max_window` | 15 | pair 모델링에 고려할 최대 gap. 이보다 멀면 무시 |
+
+### 9-3. 수식
+
+각 간호사 n, day 쌍 (d1, d2)에 대해 d1+2 ≤ d2 ≤ d1+max_window 범위에서:
+```
+pair(n,d1,d2) = X(n,d1,N) ∧ X(n,d2,N) ∧ Π_{k∈(d1,d2)} ¬X(n,k,N)
+```
+즉 X(d1)=N, X(d2)=N, 그 사이 모든 날이 N이 아님 → "N 블록 종료 → 다음 N 블록 시작" 자연 포착.
+
+페널티: `obj += -weight × |gap - target| × pair`. gap=target이면 페널티 0.
+
+### 9-4. 모델링 비용
+약 N × D × win = 28 × 30 × 15 = 12,600 pair 변수, 각 ~10개 제약 → 약 130K 추가 제약. 실측에서 solve 시간 영향 없음(OPTIMAL relax_level=0 유지).
+
+### 9-5. 검증 결과 (2026-06)
+
+| 그룹 | pair 수 | 평균 gap | target±1 (9~11일) 비율 |
+|---|---|---|---|
+| 9B | 13 | 9.31일 | 31% (엄애란 N-only가 평균 끌어내림) |
+| ICU | 44 | 9.14일 | **39% (gap=10에 8개 peak)** |
+
+낮은 weight(50)로도 ICU 분포에서 target=10 주변 명확한 모달리티 형성. 짧은 gap(4-5일)은 월 N 상한(`n_max=7`) 제약 + 야간 몰아넣기로 구조적으로 발생.
+
+### 9-6. 후속 옵션
+- weight를 100~200 수준으로 올리면 더 강하게 target에 수렴(다른 soft와 트레이드오프 발생 가능).
+- 월경계 N 간격(전월 마지막 N 블록 → 당월 첫 N 블록) 미반영 — 후속 작업에서 cross-month 항 추가 검토.

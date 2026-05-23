@@ -601,6 +601,10 @@ class CPSATBasicEngine:
             max_same_shift_penalty_weight=int(config_data.get("max_same_shift_penalty_weight", 300) or 0),
             # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
             enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
+            # N 블록 간 간격 soft (목표 10일, 대칭 페널티)
+            n_to_n_interval_target=int(config_data.get("n_to_n_interval_target", 10) or 0),
+            n_to_n_interval_penalty_weight=int(config_data.get("n_to_n_interval_penalty_weight", 50) or 0),
+            n_to_n_interval_max_window=int(config_data.get("n_to_n_interval_max_window", 15) or 0),
             # 분배 정책 모드/월단위 선호 가중치
             distribution_mode=str(config_data.get("distribution_mode", "hybrid") or "hybrid"),
             monthly_preference_weight=int(config_data.get("monthly_preference_weight", 60) or 0),
