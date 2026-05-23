@@ -92,3 +92,44 @@
 | ICU | 6월 | 폴백 0~9 전 단계 INFEASIBLE | OPTIMAL (`relax_level=0`) | HTTP 200 + `applied_relaxations=['grade_hard_to_soft']`, grade_min 위반 50건 |
 
 본 변경 적용 이후 9B 재실행은 아직 수행하지 않음. 다음 단계에서 표유진 처리와 함께 재검증 예정.
+
+---
+
+## 6. `max_same_shift` 소프트 항 추가 (2026-05-23, 후속)
+
+### 6-1. 의도
+같은 시프트(D/E/N)가 4일 이상 연속되는 패턴을 억제. 예: `D D D D` 발생 시 페널티.
+
+### 6-2. 변경 파일
+
+| 파일 | 변경 |
+|---|---|
+| `app/db/roster_config.py` | `NurseRosterConfig`에 `max_same_shift: bool = True`, `max_same_shift_penalty_weight: int = 10000` 추가 |
+| `app/services/cp_sat_basic.py` | `config_data → cfg` 주입 추가 (소비 측 cfg 노출) |
+| `app/services/cp_sat/objective_terms.py` | 메인 objective에 4일 윈도우 위반 soft 항 추가 (D/E/N 각각) |
+| `app/services/cp_sat/fallback_objectives.py` | 폴백 objective에도 동일 항 추가 |
+
+### 6-3. 수식
+각 간호사 n, 시프트 s ∈ {D,E,N}, 시작일 d0에 대해:
+```
+sum_s(n, d0, s) = X(n, d0, s) + X(n, d0+1, s) + X(n, d0+2, s) + X(n, d0+3, s)
+viol(n, d0, s) >= sum_s - 3        # 1 iff 4연속
+objective += -w_ms × viol
+```
+- 4연속(`sum_s=4`) 발생 시 `viol=1`, 그 외 `viol=0`.
+- 5연속(`DDDDD`)은 윈도우 2개에서 동시에 `viol=1` → 2×패널티(자연스러운 길이 비례 비용).
+
+### 6-4. ICU 6월 가중치 튜닝 결과
+
+| `max_same_shift_penalty_weight` | 4연속 발생 간호사 / 28 |
+|---|---|
+| 300 (초기) | 6 |
+| 5000 | 5 |
+| **10000 (채택)** | **2** |
+
+- 채택값 10000은 KLD per-shift 가중치(90,000~1,200,000) 대비 약하지만, 대다수 케이스에서 4연속을 회피하기에 충분. 강제 hard로 만들 경우 grade/team_min과 충돌해 INFEASIBLE 위험.
+- 남는 2케이스는 다른 hard 제약(grade 충족, KLD 균등 등)과의 트레이드오프에서 페널티를 감수한 결과로 해석.
+
+### 6-5. 후속 옵션 (섹션 4-B 연장)
+- UI 노출: 그룹별 토글(`max_same_shift`) + 가중치 슬라이더(`max_same_shift_penalty_weight`)로 외부화 후보.
+- 가중치 30,000~90,000 모드(`B 옵션`)는 4연속 회피가 운영상 엄격히 요구되는 그룹에 한해 케이스별 적용.

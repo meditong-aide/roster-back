@@ -1039,6 +1039,25 @@ def build_main_objective_terms(
     except Exception:
         pass
 
+    # (4-0c) 같은 시프트(D/E/N) 연속 ≤3 soft — 4연속(D D D D 등)부터 패널티
+    try:
+        if bool(getattr(cfg, "max_same_shift", True)):
+            w_ms = int(getattr(cfg, "max_same_shift_penalty_weight", 0) or 0)
+            if w_ms > 0:
+                for code in ("D", "E", "N"):
+                    if code not in cfg.shift_types:
+                        continue
+                    s_idx = cfg.shift_types.index(code)
+                    for n in range(N):
+                        T0, T1 = join[n], leave[n]
+                        for d0 in range(T0, T1 - 3):
+                            sum_s = sum(X(n, d0 + t, s_idx) for t in range(4))
+                            viol = m.NewIntVar(0, 1, f"max_same_shift_{code}_{n}_{d0}")
+                            m.Add(viol >= sum_s - 3)
+                            obj.append(-w_ms * viol)
+    except Exception:
+        pass
+
     # (4-1) 경력자 부족
     for d in range(D):
         for code in ("D", "E", "N"):
