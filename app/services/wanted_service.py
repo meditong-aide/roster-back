@@ -102,16 +102,17 @@ def _next_request_id(db: Session, nurse_id: str, month_str: str) -> int:
     return (row[0] + 1) if row else 1
 
 
-def _persist_wanted_request(db: Session, nurse_id: str, month_str: str, request: str | List[str]) -> int:
+def _persist_wanted_request(db: Session, nurse_id: str, month_str: str, request: str | List[str], group_id: str) -> int:
     """wanted_requests 레코드를 저장하고 request_id 를 반환합니다."""
     request_id = _next_request_id(db, nurse_id, month_str)
-    
+
     request_text = ''.join(request) if isinstance(request, list) else request
     request_text = request_text.strip()
-    
+
     wr = WantedRequest(
         nurse_id=nurse_id,
         request_id=request_id,
+        group_id=group_id,
         request=request_text,
         month=month_str,
         is_submitted=0,
@@ -640,18 +641,18 @@ def _persist_shift_results(
     month: int,
     month_str: str,
     shift_map: Dict[str, Dict[int, Dict[str, Any]]],
-    original_request: str = ''
+    original_request: str = '',
+    *,
+    group_id: str,
 ) -> None:
     """shift_map을 nurse_shift_requests에 저장 (UPSERT 방식)"""
     detailed_id = _next_detailed_request_id(db, nurse_id, request_id, table="shift")
     rows = 0
 
     # shifts.id 매핑
-    _nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
-    _grp_id = _nurse_row.group_id if _nurse_row else None
     _shift_id_to_table_id: Dict[str, int] = {}
-    if _grp_id:
-        _shift_q = db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == _grp_id)
+    if group_id:
+        _shift_q = db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == group_id)
         _shift_id_to_table_id = {sid: tid for sid, tid in _shift_q.all()}
 
     print(f"shift_map 저장 시작 (request_id={request_id}): {shift_map}")
@@ -689,6 +690,7 @@ def _persist_shift_results(
                     request_id=request_id,
                     detailed_request_id=detailed_id,
                     shift_date=target_date,
+                    group_id=group_id,
                     shift=shift_code,
                     score=score,
                     partial_request=partial_request,
@@ -708,6 +710,8 @@ def _persist_pair_results(
     request_id: int,
     month_str: str,
     pairs: List[Dict[str, float]],
+    *,
+    group_id: str,
 ) -> None:
     """pair 결과를 nurse_pair_requests 테이블에 저장합니다 (병합 방식).
 
@@ -755,6 +759,7 @@ def _persist_pair_results(
                 month=month_str,
                 detailed_request_id=next_detailed_id,
                 target_id=target_id_str,
+                group_id=group_id,
                 score=float(weight),
                 partial_request=normalize_request_text(request_text),
             ))
@@ -857,6 +862,8 @@ def _copy_existing_requests_to_new(
     month: int,
     month_str: str,
     skip_shift_copy: bool = False,
+    *,
+    group_id: str,
 ) -> Tuple[int, int]:
     """기존 데이터를 새 request_id로 복사
 
@@ -896,6 +903,7 @@ def _copy_existing_requests_to_new(
                 request_id=new_request_id,
                 detailed_request_id=detailed_id_shift,
                 shift_date=old_row.shift_date,
+                group_id=group_id,
                 shift=old_row.shift,
                 score=old_row.score,
                 partial_request=old_row.partial_request,
@@ -924,6 +932,7 @@ def _copy_existing_requests_to_new(
             month=month_str,
             detailed_request_id=detailed_id_pair,
             target_id=old_row.target_id,
+            group_id=group_id,
             score=old_row.score,
             partial_request=old_row.partial_request or '기존 데이터에서 로드됨',
         ))
@@ -1232,7 +1241,7 @@ async def invoke_and_persist_wanted_service(
             }
 
     # 새 request_id 생성
-    new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request)
+    new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request, group_id=group_id)
 
     # 과거 데이터 복사 여부 결정
     copied_shift, copied_pair = 0, 0
@@ -1248,7 +1257,8 @@ async def invoke_and_persist_wanted_service(
             # has_case=False이면 AIDE 텍스트만 있는 경우 → 기존 shift 데이터 유지 필요
             copied_shift, copied_pair = _copy_existing_requests_to_new(
                 db, nurse_id, latest_wr.request_id, new_request_id,
-                req.year, req.month, month_str, skip_shift_copy=has_case
+                req.year, req.month, month_str, skip_shift_copy=has_case,
+                group_id=group_id,
             )
     else:
         print("전체 재작성 또는 더미 request → 과거 데이터 복사 스킵")
@@ -1428,7 +1438,8 @@ async def invoke_and_persist_wanted_service(
     if shift_map:
         _persist_shift_results(
             db, nurse_id, new_request_id, req.year, req.month, month_str,
-            shift_map, original_request_text
+            shift_map, original_request_text,
+            group_id=group_id,
         )
 
     # pair 저장
@@ -1438,7 +1449,7 @@ async def invoke_and_persist_wanted_service(
         # if nurse and nurse.enable_nurse_pair_preference == False:
         #     print(f"[경고] 선호 간호사 기능이 비활성화됨: pair 데이터는 저장되지 않습니다. nurse_id={nurse_id}")
         # else:
-        _persist_pair_results(db, nurse_id, new_request_id, month_str, pref_parsed)
+        _persist_pair_results(db, nurse_id, new_request_id, month_str, pref_parsed, group_id=group_id)
 
     # 최종 커밋
     try:

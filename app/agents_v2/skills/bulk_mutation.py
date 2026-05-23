@@ -27,6 +27,8 @@ def bulk_mutation(db: Session, params: dict) -> Any:
         return _cancel_wanted_request(db, params, preview_only)
     elif scope == "wanted_submissions" and action == "update_deadline":
         return _update_wanted_deadline(db, params, preview_only)
+    elif scope == "wanted_submissions" and action == "clear_deadline":
+        return _clear_wanted_deadline(db, params, preview_only)
     elif scope == "wanted_submissions" and action == "add_shift":
         return _add_wanted_by_date(db, params, preview_only)
     elif scope == "wanted_submissions" and action == "change_shift":
@@ -69,7 +71,7 @@ def _mutate_wanted_adjustments(db, params, mutation, preview_only):
     value = mutation.get("target_value")
 
     return wanted_tools.bulk_update_wanted_adjustments(
-        db, entry_ids, field, value, preview_only=preview_only,
+        db, entry_ids, field, value, group_id=group_id, preview_only=preview_only,
     )
 
 
@@ -77,9 +79,12 @@ def _cancel_wanted_request(db, params, preview_only=False):
     nurse_ids = params.get("nurse_ids", [])
     year = params.get("year")
     month = params.get("month")
+    group_id = params.get("group_id")
 
     if not nurse_ids:
         return {"error": "nurse_id required for cancel"}
+    if not group_id:
+        return {"error": "group_id required for cancel"}
 
     if preview_only:
         return {
@@ -93,7 +98,7 @@ def _cancel_wanted_request(db, params, preview_only=False):
 
     results = []
     for nid in nurse_ids:
-        result = wanted_tools.cancel_wanted_request(db, nid, year, month)
+        result = wanted_tools.cancel_wanted_request(db, nid, group_id, year, month)
         results.append(result)
 
     if len(results) == 1:
@@ -127,6 +132,28 @@ def _update_wanted_deadline(db, params, preview_only=False):
     return wanted_tools.update_wanted_deadline(db, group_id, year, month, new_deadline)
 
 
+def _clear_wanted_deadline(db, params, preview_only=False):
+    """원티드 마감일을 NULL 로 해제. 임의 날짜 추측 차단."""
+    group_id = params["group_id"]
+    year = params.get("year")
+    month = params.get("month")
+
+    if preview_only:
+        current = wanted_tools.get_wanted_status(db, group_id, year, month)
+        if not current:
+            return {"error": f"No wanted campaign found for {year}/{month}"}
+        return {
+            "preview_only": True,
+            "action": "clear_deadline",
+            "current_deadline": current.get("exp_date"),
+            "new_deadline": None,
+            "year": year,
+            "month": month,
+        }
+
+    return wanted_tools.clear_wanted_deadline(db, group_id, year, month)
+
+
 def _delete_wanted_by_date(db, params, preview_only=False):
     nurse_ids = params.get("nurse_ids", [])
     if not nurse_ids:
@@ -134,6 +161,7 @@ def _delete_wanted_by_date(db, params, preview_only=False):
     return wanted_tools.delete_wanted_by_date(
         db,
         nurse_id=nurse_ids[0],
+        group_id=params["group_id"],
         year=params.get("year"),
         month=params.get("month"),
         date=params["date"],
@@ -205,7 +233,7 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
 
     # Single entry update
     if nurse_ids and len(nurse_ids) == 1 and date and new_shift:
-        entry = schedule_tools.find_schedule_entry(db, schedule_id, nurse_ids[0], date)
+        entry = schedule_tools.find_schedule_entry(db, schedule_id, nurse_ids[0], date, group_id)
         if not entry:
             return {"error": f"No entry found for nurse {nurse_ids[0]} on {date}"}
         if preview_only:
@@ -214,7 +242,7 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
                 "entry": entry,
                 "new_shift_id": new_shift,
             }
-        return schedule_tools.update_schedule_entry(db, entry["entry_id"], new_shift)
+        return schedule_tools.update_schedule_entry(db, entry["entry_id"], new_shift, group_id)
 
     # Bulk: get all matching entries and update
     entries = schedule_tools.get_schedule_entries(
@@ -239,7 +267,7 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
 
     results = []
     for e in entries:
-        result = schedule_tools.update_schedule_entry(db, e["entry_id"], new_shift)
+        result = schedule_tools.update_schedule_entry(db, e["entry_id"], new_shift, group_id)
         results.append(result)
 
     return {"affected_count": len(results), "results": results}

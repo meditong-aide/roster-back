@@ -37,9 +37,11 @@ def get_nurses_in_group(db: Session, group_id: str) -> list[dict]:
     return [_nurse_summary(r) for r in rows]
 
 
-def get_nurse_by_id(db: Session, nurse_id: str) -> dict | None:
-    """Get a single nurse by ID."""
-    r = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+def get_nurse_by_id(db: Session, nurse_id: str, group_id: str) -> dict | None:
+    """Get a single nurse by ID, scoped to group_id (RBAC guard)."""
+    r = db.query(Nurse).filter(
+        Nurse.nurse_id == nurse_id, Nurse.group_id == group_id
+    ).first()
     if not r:
         return None
     return _nurse_detail(r)
@@ -286,14 +288,20 @@ def compute_coupled_changes(attribute: str, normalized_value, current_summary: d
 
 
 def check_preceptor_team_consistency(
-    db: Session, nurse_id: str, new_team_id: int | None
+    db: Session, nurse_id: str, group_id: str, new_team_id: int | None
 ) -> dict | None:
     """팀 변경 시 프리셉터-프리셉티 매칭이 깨지는지 검사.
+
+    group_id-scoped: preceptor/preceptee 모두 같은 group_id 내에서만 검사.
 
     Returns None if no conflict. Otherwise dict describing the mismatch:
       {"as_preceptee": {...}, "as_preceptor": [...]}
     """
-    nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    nurse = (
+        db.query(Nurse)
+        .filter(Nurse.nurse_id == nurse_id, Nurse.group_id == group_id)
+        .first()
+    )
     if not nurse:
         return None
     if nurse.team_id == new_team_id:
@@ -305,7 +313,11 @@ def check_preceptor_team_consistency(
     if nurse.preceptor_id:
         preceptor = (
             db.query(Nurse)
-            .filter(Nurse.nurse_id == nurse.preceptor_id, Nurse.active == 1)
+            .filter(
+                Nurse.nurse_id == nurse.preceptor_id,
+                Nurse.group_id == group_id,
+                Nurse.active == 1,
+            )
             .first()
         )
         if preceptor and preceptor.team_id != new_team_id:
@@ -318,7 +330,11 @@ def check_preceptor_team_consistency(
     # (b) 본인이 프리셉터인 경우 → 모든 프리셉티들의 팀과 비교
     preceptees = (
         db.query(Nurse)
-        .filter(Nurse.preceptor_id == nurse_id, Nurse.active == 1)
+        .filter(
+            Nurse.preceptor_id == nurse_id,
+            Nurse.group_id == group_id,
+            Nurse.active == 1,
+        )
         .all()
     )
     mismatched = [
@@ -350,9 +366,11 @@ def detect_state_contradictions(state: dict) -> list[str]:
 
 
 def compute_batch_changeset(
-    db: Session, nurse_id: str, mutations: list[dict]
+    db: Session, nurse_id: str, group_id: str, mutations: list[dict]
 ) -> dict:
     """순차 시뮬레이션으로 최종 변경 세트 계산. DB 미수정.
+
+    group_id-scoped: nurse lookup 시 group_id 격리 (cross-group mutation 방어).
 
     Returns dict with:
       - ok: bool
@@ -380,9 +398,13 @@ def compute_batch_changeset(
             return {"ok": False, "error": err, "field": f, "received": v}
         normalized_muts.append({"field": f, "value": norm})
 
-    nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    nurse = (
+        db.query(Nurse)
+        .filter(Nurse.nurse_id == nurse_id, Nurse.group_id == group_id)
+        .first()
+    )
     if not nurse:
-        return {"ok": False, "error": f"Nurse {nurse_id} not found"}
+        return {"ok": False, "error": f"Nurse {nurse_id} not found in group {group_id}"}
 
     pre_summary = _nurse_summary(nurse)
     state = dict(pre_summary)
@@ -409,7 +431,7 @@ def compute_batch_changeset(
         }
 
     if state.get("team_id") != pre_summary.get("team_id"):
-        conflict = check_preceptor_team_consistency(db, nurse_id, state["team_id"])
+        conflict = check_preceptor_team_consistency(db, nurse_id, group_id, state["team_id"])
         if conflict:
             return {
                 "ok": False,
@@ -447,14 +469,21 @@ def compute_batch_changeset(
 
 
 def update_nurse_attributes_batch(
-    db: Session, nurse_id: str, mutations: list[dict]
+    db: Session, nurse_id: str, group_id: str, mutations: list[dict]
 ) -> dict:
-    """단일 간호사에 여러 mutation을 트랜잭션으로 적용."""
-    cs = compute_batch_changeset(db, nurse_id, mutations)
+    """단일 간호사에 여러 mutation을 트랜잭션으로 적용.
+
+    group_id-scoped: cross-group mutation 차단.
+    """
+    cs = compute_batch_changeset(db, nurse_id, group_id, mutations)
     if not cs["ok"]:
         return {k: v for k, v in cs.items() if k != "ok"}
 
-    nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    nurse = (
+        db.query(Nurse)
+        .filter(Nurse.nurse_id == nurse_id, Nurse.group_id == group_id)
+        .first()
+    )
     for f, v in cs["changed_fields"].items():
         setattr(nurse, f, v)
     db.commit()
@@ -475,11 +504,11 @@ def update_nurse_attributes_batch(
 
 
 def update_nurse_attribute(
-    db: Session, nurse_id: str, attribute: str, value
+    db: Session, nurse_id: str, group_id: str, attribute: str, value
 ) -> dict:
-    """Backward-compat 단일 필드 변경. 내부적으로 batch로 위임."""
+    """단일 필드 변경. 내부적으로 batch로 위임."""
     return update_nurse_attributes_batch(
-        db, nurse_id, [{"field": attribute, "value": value}]
+        db, nurse_id, group_id, [{"field": attribute, "value": value}]
     )
 
 

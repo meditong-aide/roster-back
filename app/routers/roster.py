@@ -2066,9 +2066,17 @@ async def validate_roster(
         if not latest_config_db:
             return {"violations": ["근무표 설정을 찾을 수 없습니다."]}
 
-        max_nig = latest_config_db.max_nig_per_month
-        if max_nig != 15:
-            max_nig = 17
+        # config.max_nig_per_month 를 그대로 사용. 2026-01-15 hotfix (d095cc6d)
+        # `if != 15: = 17` override 는 제거 — DB 값을 신뢰.
+        # 단, 0/None/음수 garbage 값은 INFEASIBLE 유발하므로 15 로 floor.
+        _raw_max_nig_v = latest_config_db.max_nig_per_month
+        max_nig = _raw_max_nig_v if (_raw_max_nig_v is not None) else 15
+        if max_nig <= 0:
+            print(
+                f"[validate_roster][WARN] max_nig_per_month={_raw_max_nig_v!r} → 15 로 보정 "
+                "(DB config 정정 권장)"
+            )
+            max_nig = 15
 
         roster_config_for_engine = NurseRosterConfig(
             daily_shift_requirements=daily_shift_requirements,

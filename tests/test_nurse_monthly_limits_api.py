@@ -81,13 +81,15 @@ def test_monthly_limits_upsert_and_list_round_trip(api):
     assert body["meta"]["target_nurse_count"] == 1
     assert body["meta"]["active_nurse_count"] == 6
 
-    get_resp = api.get("/nurses/monthly-limits", params={"year": 2026, "month": 5})
+    get_resp = api.get(
+        "/nurses/monthly-limits",
+        params={"group_id": "GRP001", "nurse_id": "N001"},
+    )
     assert get_resp.status_code == 200, get_resp.text
     got_body = get_resp.json()
     got = got_body["items"]
     assert len(got) == 1
     assert got[0]["nurse_id"] == "N001"
-    assert got_body["meta"]["target_nurse_count"] == 1
 
 
 def test_monthly_limits_reject_exact_sum_over_capacity(api):
@@ -108,8 +110,11 @@ def test_monthly_limits_reject_exact_sum_over_capacity(api):
         ],
     }
     resp = api.put("/nurses/monthly-limits", json=payload)
-    assert resp.status_code == 400, resp.text
-    assert "exact 합" in resp.json().get("detail", "")
+    assert resp.status_code == 500, resp.text
+    detail = resp.json().get("detail", {})
+    infeas = detail.get("infeasibility") if isinstance(detail, dict) else {}
+    codes = {i.get("reason_code") for i in (infeas or {}).get("preflight_issues", [])}
+    assert "MONTHLY_LIMIT_GROUP_EXACT_SUM_EXCEEDS" in codes
 
 
 def test_monthly_limits_warn_when_override_ratio_exceeds_30_percent(api):
@@ -190,7 +195,10 @@ def test_monthly_limits_delete_row_when_all_bounds_are_null(api):
 
 
 def test_monthly_limits_get_forbidden_for_other_group(api):
-    resp = api.get("/nurses/monthly-limits", params={"year": 2026, "month": 5, "group_id": "GRP999"})
+    resp = api.get(
+        "/nurses/monthly-limits",
+        params={"group_id": "GRP999", "nurse_id": "N001"},
+    )
     assert resp.status_code == 403, resp.text
 
 

@@ -262,9 +262,19 @@ app.include_router(grade.router)
 app.include_router(jobs.router)
 app.include_router(roster_precheck.router)
 
-# Agent v2 test chat UI
+from routers import constraint_impact as constraint_impact_router
+app.include_router(constraint_impact_router.router)
+
+from routers import ontology as ontology_router
+app.include_router(ontology_router.router)
+
+# Agent v2 test chat UI (dev-only — 별도 페이지에서 컨텍스트 수동 선택)
 from agents_v2.test_chat_router import router as agent_test_router
 app.include_router(agent_test_router)
+
+# Agent v2 production chat — 인증 사용자 컨텍스트 자동, floating widget 호출용
+from agents_v2.chat_router import router as agent_chat_router
+app.include_router(agent_chat_router)
 
 import uvicorn
 

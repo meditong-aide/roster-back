@@ -73,6 +73,8 @@ langgraph==1.0.4
 langgraph-sdk==0.2.12
 langgraph-checkpoint==3.0.1
 langgraph-prebuilt==1.0.5
+redis>=5.0.0
+fakeredis>=2.20.0
 # psutil>=5.9.0
 # cryptography>=45.0.5
 # fastapi[standard]>=0.115.12

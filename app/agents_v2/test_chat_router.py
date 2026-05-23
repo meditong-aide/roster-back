@@ -246,6 +246,7 @@ def _seed_test_db(db: Session):
     for nurse_id, is_sub in [("N001", True), ("N002", True), ("N003", False)]:
         db.add(WantedRequest(
             nurse_id=nurse_id, request_id=1, month="2026-04",
+            group_id="GRP001",
             is_submitted=is_sub,
             submitted_at=datetime(2026, 3, 20) if is_sub else None,
         ))
@@ -258,6 +259,7 @@ def _seed_test_db(db: Session):
                 nurse_id=nurse_id, request_id=1,
                 detailed_request_id=day,
                 shift_date=date(2026, 4, day),
+                group_id="GRP001",
                 shift=shift, score=1.0,
             ))
     db.flush()
@@ -320,8 +322,13 @@ def _run_v3(db, req: TestChatRequest) -> dict:
     from agents_v2.llm_client import get_llm_client
     from agents_v2.schemas.session_context import SessionContext
 
-    # Conversation state
-    conv = conversation_store.get_or_create(req.conversation_id)
+    # Conversation state (SessionMemoryRepo-backed — db 필수)
+    conv = conversation_store.get_or_create(
+        db,
+        req.conversation_id,
+        user_id=req.nurse_id,
+        group_id=req.group_id,
+    )
 
     # Session context
     ctx = SessionContext(
@@ -344,12 +351,18 @@ def _run_v3(db, req: TestChatRequest) -> dict:
     result = agent.run(db, req.message, ctx)
 
     # Persist conversation state
-    conversation_store.save_messages(conv.id, result.messages)
-    conversation_store.save_variable_memory(conv.id, result.variable_memory)
-    if result.awaiting_approval:
-        conversation_store.set_pending_approval(conv.id, result.preview)
-    else:
-        conversation_store.set_pending_approval(conv.id, None)
+    conversation_store.save_messages(
+        db, conv.id, result.messages,
+        user_id=req.nurse_id, group_id=req.group_id,
+    )
+    conversation_store.save_variable_memory(
+        db, conv.id, result.variable_memory,
+        user_id=req.nurse_id, group_id=req.group_id,
+    )
+    conversation_store.set_pending_approval(
+        db, conv.id, result.preview if result.awaiting_approval else None,
+        user_id=req.nurse_id, group_id=req.group_id,
+    )
 
     # Response
     resp = result.to_dict()
@@ -461,14 +474,14 @@ def list_groups(office_id: str, use_test_db: bool = True):
 
 @router.get("/nurses")
 def list_nurses(group_id: str, use_test_db: bool = True):
-    """List active nurses in a group (for identity selection)."""
+    """List nurses in a group for identity selection (active + inactive)."""
     from db.models import Nurse
     db = _get_test_db() if use_test_db else _get_real_db()
     try:
         rows = (
             db.query(Nurse)
-            .filter(Nurse.group_id == group_id, Nurse.active == 1)
-            .order_by(Nurse.sequence)
+            .filter(Nurse.group_id == group_id)
+            .order_by(Nurse.active.desc(), Nurse.sequence)
             .all()
         )
         return [
@@ -480,6 +493,7 @@ def list_nurses(group_id: str, use_test_db: bool = True):
                 "hn_auth": r.hn_auth,
                 "role": r.role,
                 "team_id": r.team_id,
+                "active": int(r.active) if r.active is not None else 0,
             }
             for r in rows
         ]

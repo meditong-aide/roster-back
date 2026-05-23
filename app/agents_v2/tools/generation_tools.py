@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
 from db.models import RosterJob
+from agents_v2.tools.narrative_formatter import format_infeasibility, format_infeasibility_response
 
 
 def get_job_status(db: Session, job_id: str) -> dict | None:
@@ -77,7 +80,7 @@ def create_generation_job(
 
 
 def _job_dict(row: RosterJob) -> dict:
-    return {
+    d = {
         "job_id": row.job_id,
         "office_id": row.office_id,
         "group_id": row.group_id,
@@ -89,3 +92,19 @@ def _job_dict(row: RosterJob) -> dict:
         "created_at": str(row.created_at) if row.created_at else None,
         "updated_at": str(row.updated_at) if row.updated_at else None,
     }
+    # error_message 가 JSON 직렬화된 unrecoverable_payload 이면 narrative 추출.
+    # worker.py 가 HTTPException.detail (dict) 를 JSON 으로 저장한다.
+    em = row.error_message
+    if em and em.lstrip().startswith("{"):
+        try:
+            payload = json.loads(em)
+            narrative = format_infeasibility(payload)
+            if narrative:
+                d["infeasibility"] = narrative
+                # 사용자에게 노출되는 한국어 자연어 응답 (raw enum 코드 미노출)
+                d["infeasibility_response"] = format_infeasibility_response(payload)
+                # raw payload 는 debug/trace 용도로 격리
+                d["debug_payload"] = payload
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return d

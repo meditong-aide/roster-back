@@ -12,7 +12,7 @@ from schemas.auth_schema import User as UserSchema
 from datetime import datetime, timezone, timedelta, date
 
 
-def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int, month_str: str):
+def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int, month_str: str, *, group_id: str):
     """
     이전 request_id의 pair(선호/비선호) 데이터를 현재 request_id로 복사합니다.
     현재 request_id에 pair 데이터가 이미 있으면 복사하지 않습니다.
@@ -64,6 +64,7 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
                     month=month_str,
                     detailed_request_id=detailed_id,
                     target_id=row.target_id,
+                    group_id=group_id,
                     score=row.score,
                     partial_request=row.partial_request,
                 ))
@@ -102,6 +103,7 @@ def submit_preferences_service(
         draft = WantedRequest(
             nurse_id=current_user.nurse_id,
             month=month_str,
+            group_id=current_user.group_id,
             request="",
             is_submitted=False,
             created_at=datetime.now()
@@ -308,6 +310,7 @@ def submit_preferences_service(
                 request_id=request_id,
                 detailed_request_id=detailed_id,
                 shift_date=date_str,
+                group_id=current_user.group_id,
                 shift=shift_id,
                 score=1.0,
                 partial_request="",
@@ -343,6 +346,7 @@ def submit_preferences_service(
                 month=month_str,
                 detailed_request_id=pair_detailed_id,
                 target_id=str(target_id),
+                group_id=current_user.group_id,
                 score=float(weight),
                 partial_request=pair.get("request", ""),
             ))
@@ -352,7 +356,7 @@ def submit_preferences_service(
         # preference 배열이 없는 경우 → 이전 request_id에서 pair 데이터 carry-forward
         # 초기화 시 carry-forward 스킵
         if data_to_save or preference_list: # shift나 preference가 있으면 carry-forward 진행
-            _carry_forward_pair_data(db, current_user.nurse_id, request_id, month_str)
+            _carry_forward_pair_data(db, current_user.nurse_id, request_id, month_str, group_id=current_user.group_id)
         else:
             print(f"[pair 초기화] 빈 데이터로 인해 carry-forward 스킵 (request_id={request_id})")
 

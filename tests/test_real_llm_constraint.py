@@ -128,7 +128,7 @@ def run_test(db: Session, query: str):
     from agents_v2.conversation import ConversationStore
 
     store = ConversationStore()
-    conv = store.get_or_create(None)
+    conv = store.get_or_create(db, None, user_id="N001", group_id="GRP001")
 
     ctx = SessionContext(
         office_id="OFF001", group_id="GRP001",

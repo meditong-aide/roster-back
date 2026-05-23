@@ -1,6 +1,7 @@
 import json
 from pydantic import BaseModel
-from typing import List, TypedDict, Annotated, Dict
+from typing import List, Annotated, Dict
+from typing_extensions import TypedDict
 from collections import defaultdict
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI

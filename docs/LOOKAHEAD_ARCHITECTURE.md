@@ -5,6 +5,12 @@
 - **룩어헤드**: 당월을 풀 때 "다음 달 1~K일"을 가상 일자로 포함해, **월말 꼬리**가 다음 달 초 O/N 몰림·infeasible을 줄이기 위한 제약 반영.
 - 이 문서는 **구현 명세**이자 **설계 의사결정 기록**으로, 피드백 반영 내용을 모두 포함한다.
 
+### 관련 설계 문서
+
+- 제약 의미 계층 + 하이퍼그래프 확장 계획은 `ONTOLOGY_GROUNDED_CONSTRAINT_IMPACT_GRAPH_PLAN.md` 참조
+- precheck/진단 구조는 `INFEASIBLE_DIAGNOSTICS_FRONT_BACK_ARCHITECTURE.md` 참조
+- 팀/등급 deterministic precheck 카탈로그는 `TEAM_GRADE_INFEASIBILITY_PRECHECK.md` 참조
+
 ---
 
 ## 1. 목표·역할 정의

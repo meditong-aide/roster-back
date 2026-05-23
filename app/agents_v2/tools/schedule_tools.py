@@ -122,14 +122,26 @@ def update_schedule_entry(
     db: Session,
     entry_id: str,
     new_shift_id: str,
+    group_id: str,
 ) -> dict:
     """Update a single schedule entry's shift code.
 
+    group_id-scoped: ScheduleEntry → Schedule join 으로 group_id 격리 검증
+    (cross-group mutation 차단, defense-in-depth).
+
     Returns the updated entry and its previous value.
     """
-    entry = db.query(ScheduleEntry).filter(ScheduleEntry.entry_id == entry_id).first()
+    entry = (
+        db.query(ScheduleEntry)
+        .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
+        .filter(
+            ScheduleEntry.entry_id == entry_id,
+            Schedule.group_id == group_id,
+        )
+        .first()
+    )
     if not entry:
-        return {"error": f"Entry {entry_id} not found"}
+        return {"error": f"Entry {entry_id} not found in group {group_id}"}
     old_shift = entry.shift_id
     entry.shift_id = new_shift_id
     db.commit()
@@ -148,13 +160,19 @@ def find_schedule_entry(
     schedule_id: str,
     nurse_id: str,
     date_str: str,
+    group_id: str,
 ) -> dict | None:
-    """Find a specific entry by schedule + nurse + date."""
+    """Find a specific entry by schedule + nurse + date.
+
+    group_id-scoped: Schedule join 으로 RBAC 격리.
+    """
     q = (
         db.query(ScheduleEntry)
+        .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
         .filter(
             ScheduleEntry.schedule_id == schedule_id,
             ScheduleEntry.nurse_id == nurse_id,
+            Schedule.group_id == group_id,
         )
     )
     # Cross-DB date comparison: SQLite stores datetime, MSSQL stores date strings

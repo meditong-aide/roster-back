@@ -41,6 +41,10 @@ def update_person_attr(db: Session, params: dict) -> Any:
     if not nurse_ids:
         return {"error": "nurse_id required"}
 
+    group_id = params.get("group_id")
+    if not group_id:
+        return {"error": "group_id required (RBAC scope)"}
+
     mutations = _extract_mutations(params)
     if not mutations:
         return {"error": "mutations (or field+value) required"}
@@ -50,7 +54,7 @@ def update_person_attr(db: Session, params: dict) -> Any:
     results = []
     for nid in nurse_ids:
         if preview_only:
-            cs = compute_batch_changeset(db, nid, mutations)
+            cs = compute_batch_changeset(db, nid, group_id, mutations)
             if not cs.get("ok"):
                 results.append({"nurse_id": nid, **{k: v for k, v in cs.items() if k != "ok"}})
                 continue
@@ -71,7 +75,7 @@ def update_person_attr(db: Session, params: dict) -> Any:
                 preview["coupled_changes"] = cs["coupled_log"]
             results.append(preview)
         else:
-            result = nurse_tools.update_nurse_attributes_batch(db, nid, mutations)
+            result = nurse_tools.update_nurse_attributes_batch(db, nid, group_id, mutations)
             results.append(result)
 
     # 단일 간호사 + 단일 mutation이면 평탄화

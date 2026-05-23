@@ -10,6 +10,8 @@ Pipeline stages:
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -27,6 +29,8 @@ from agents_v2.grounding.internal import (
 )
 from agents_v2.schemas.session_context import SessionContext
 from agents_v2.skills.registry import run_skill
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,6 +67,53 @@ class SkillResult:
     middleware_steps: list[MiddlewareStep] = field(default_factory=list)
 
 
+_AUDIT_ARGS_MAX_LEN = 2000
+
+
+def _safe_args_json(args: dict, max_len: int = _AUDIT_ARGS_MAX_LEN) -> str | None:
+    """args dict → JSON 문자열. 직렬화 실패하거나 너무 길면 truncate/None."""
+    try:
+        s = json.dumps(args, ensure_ascii=False, default=str)
+    except Exception:
+        return None
+    if len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+
+def _write_skill_audit(
+    db: Session,
+    ctx: SessionContext,
+    skill_name: str,
+    args: dict,
+    status: str,
+    error_message: str | None,
+    latency_ms: float,
+) -> None:
+    """Skill 호출 audit row insert. 실패 시 silent — skill 실행 자체에 영향 X.
+
+    의료 도메인 audit 요건 + RBAC 추적 + 디버깅용.
+    """
+    try:
+        from db.models import AgentSkillInvocation
+
+        row = AgentSkillInvocation(
+            agent_run_id=ctx.conversation_id,
+            session_id=ctx.conversation_id,
+            user_id=ctx.nurse_id,
+            group_id=ctx.group_id,
+            skill_name=skill_name,
+            args_json=_safe_args_json(args),
+            status=status,
+            error_message=error_message,
+            latency_ms=latency_ms,
+        )
+        db.add(row)
+        db.flush()
+    except Exception as e:
+        logger.warning("[middleware] skill audit insert failed: %s", e)
+
+
 def execute_skill(
     db: Session,
     skill_name: str,
@@ -72,14 +123,17 @@ def execute_skill(
     """Run the full middleware pipeline and execute the skill."""
     t0 = time.time()
     steps: list[MiddlewareStep] = []
+    args_original = {**args}
 
     # ── ① Permission Check ──
     block = _check_permission(skill_name, args, ctx)
     if block:
         steps.append(MiddlewareStep("permission", "block", detail=block))
+        dt = (time.time() - t0) * 1000
+        _write_skill_audit(db, ctx, skill_name, args_original, "DENIED", block, dt)
         return SkillResult(
             data={"error": block, "permission_denied": True},
-            duration_ms=0,
+            duration_ms=dt,
             skill_name=skill_name,
             grounded_params=args,
             blocked=True,
@@ -112,6 +166,12 @@ def execute_skill(
             detail=clarification.get("question", "ambiguous input"),
         ))
         dt = (time.time() - t0) * 1000
+        _write_skill_audit(
+            db, ctx, skill_name, args,
+            "CLARIFICATION_NEEDED",
+            clarification.get("question", "ambiguous input"),
+            dt,
+        )
         return SkillResult(
             data=clarification,
             duration_ms=dt,
@@ -127,17 +187,24 @@ def execute_skill(
     ))
 
     # ── ④ Skill Execution ──
+    status = "SUCCESS"
+    err_msg: str | None = None
     try:
         result = run_skill(db, skill_name, args)
         steps.append(MiddlewareStep("execution", "ok", detail=skill_name))
     except KeyError as e:
         result = {"error": f"Unknown skill: {e}"}
         steps.append(MiddlewareStep("execution", "error", detail=str(e)))
+        status = "ERROR"
+        err_msg = f"Unknown skill: {e}"
     except Exception as e:
         result = {"error": f"Skill execution error: {str(e)}"}
         steps.append(MiddlewareStep("execution", "error", detail=str(e)))
+        status = "ERROR"
+        err_msg = str(e)
 
     dt = (time.time() - t0) * 1000
+    _write_skill_audit(db, ctx, skill_name, args, status, err_msg, dt)
 
     return SkillResult(
         data=result,
@@ -152,31 +219,64 @@ def execute_skill(
 
 _MUTATION_SKILLS = frozenset({
     "bulk_mutation",
-    "bulk-mutation",
     "update_constraint",
-    "update-constraint",
     "update_person_attr",
-    "update-person-attr",
     "generate_schedule",
-    "generate-schedule",
+    "update_monthly_limit",
 })
+
+_SELF_REFERENCE_ALIASES = ("나", "내", "제", "본인")
+
+
+def _is_head_or_admin(ctx: SessionContext) -> bool:
+    return ctx.user_role in ("HN", "ADM")
 
 
 def _check_permission(
     skill_name: str, args: dict, ctx: SessionContext
 ) -> str | None:
-    """Check permissions. Returns error message if blocked."""
-    normalized = skill_name.replace("-", "_")
+    """Permission gate. router/auth.py 의 is_head_nurse / is_master_admin 와 동일 의미.
 
-    # Non-admin users cannot modify other nurses' data
-    if normalized in _MUTATION_SKILLS and ctx.user_role not in ("HN", "ADM"):
+    규칙:
+      1) 병동 전체 영향 (update_constraint / generate_schedule) — HN/ADM 만.
+      2) bulk_mutation 의 마감일 변경 / 일괄 승인 등 ward-wide action — HN/ADM 만.
+      3) 개인 속성 mutation (update_person_attr) — HN/ADM 또는 본인.
+      4) update_monthly_limit (개인별 N 한도) — HN/ADM 만 (다른 nurse 한도 설정).
+      5) 그 외 mutation 은 본인 데이터 mutation 만 허용.
+    """
+    normalized = skill_name.replace("-", "_")
+    is_hn = _is_head_or_admin(ctx)
+
+    # (1) 병동 전체 영향 mutation
+    if normalized in {"update_constraint", "generate_schedule"} and not is_hn:
+        return "병동 전체 설정 변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (4) 다른 간호사의 월 한도 설정
+    if normalized == "update_monthly_limit" and not is_hn:
+        return "다른 간호사의 월 한도 설정은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (2) bulk_mutation 의 ward-wide action
+    if normalized == "bulk_mutation" and not is_hn:
+        scope = args.get("scope", "")
+        action = args.get("action", "")
+        if scope == "wanted_submissions" and action in ("update_deadline", "clear_deadline"):
+            return "원티드 마감일 변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+        if scope == "wanted_adjustment":
+            # 본인 nurse 만 명시되어 있고 self 인 경우는 허용
+            nurse_ids = args.get("nurse_ids") or []
+            nurse_name = args.get("nurse_name") or ""
+            is_self_target = (
+                (nurse_name in _SELF_REFERENCE_ALIASES)
+                or (nurse_name == ctx.nurse_name)
+                or (ctx.nurse_id and nurse_ids == [ctx.nurse_id])
+            )
+            if not is_self_target:
+                return "원티드 일괄 처리는 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (3, 5) 다른 간호사 data 수정 차단 (기존 로직 유지)
+    if normalized in _MUTATION_SKILLS and not is_hn:
         nurse_name = args.get("nurse_name", "")
-        if nurse_name and nurse_name != ctx.nurse_name and nurse_name not in (
-            "나",
-            "내",
-            "제",
-            "본인",
-        ):
+        if nurse_name and nurse_name != ctx.nurse_name and nurse_name not in _SELF_REFERENCE_ALIASES:
             return f"다른 간호사({nurse_name})의 데이터를 수정할 권한이 없습니다."
 
     return None
