@@ -2874,8 +2874,11 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                     _rs,
                     "_constraint_impact_attempt_meta",
                     {
-                        "attempt_index": 1 if bool(config_dict.get("_force_grade_max_soft_fallback")) else 0,
-                        "label": "grade_max_retry" if bool(config_dict.get("_force_grade_max_soft_fallback")) else "primary",
+                        "attempt_index": 1 if (bool(config_dict.get("_team_min_soft_retry_attempted")) or bool(config_dict.get("_force_grade_max_soft_fallback"))) else 0,
+                        "label": (
+                            "team_min_retry" if bool(config_dict.get("_team_min_soft_retry_attempted"))
+                            else ("grade_max_retry" if bool(config_dict.get("_force_grade_max_soft_fallback")) else "primary")
+                        ),
                         "forced_grade_soft_fallback": bool(config_dict.get("_force_grade_max_soft_fallback")),
                         "config_flags": {
                             "preceptee_on": bool(config_dict.get("preceptee_on", False)),
@@ -5234,10 +5237,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             or ("MAX_CAP_SHORTAGE" in validation_error)
             or ("GRADE_MAX_SUM_BELOW_NEED" in validation_error)
         )
-        if _trigger_soft and not bool(config_dict.get("_force_grade_max_soft_fallback")):
-            print("[GradeFallback] infeasible 감지 → grade hard→soft 자동 전환으로 1회 재시도")
+        if _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
+            print("[TeamMinFallback] infeasible 감지 → team_min hard→soft 자동 전환으로 1회 재시도 (grade hard 유지)")
             soft_cfg = dict(config_dict)
-            soft_cfg["_force_grade_max_soft_fallback"] = True
+            soft_cfg["team_min_soft_fallback"] = True
+            soft_cfg["_team_min_soft_retry_attempted"] = True
             retry_generated, _, retry_rs = _run_cp_sat_basic(
                 db,
                 current_user,
@@ -5290,23 +5294,23 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             if not retry_validation_error:
                 generated = retry_generated
                 roster_system = retry_rs
-                applied_relaxations.append("grade_hard_to_soft")
+                applied_relaxations.append("team_min_hard_to_soft")
                 weekly_off_warnings.append(
                     {
-                        "type": "grade_hard_to_soft_applied",
+                        "type": "team_min_hard_to_soft_applied",
                         "detail": (
-                            "Grade hard 제약이 infeasible로 인해 자동 soft 전환되어 재생성됐습니다. "
-                            "일부 grade 최소가 미충족일 수 있습니다."
+                            "Team_min hard 제약이 infeasible로 인해 자동 soft 전환되어 재생성됐습니다. "
+                            "일부 팀의 일일 D/E 최소가 미충족일 수 있습니다. (grade hard는 유지)"
                         ),
                     }
                 )
                 print(
-                    "[GradeFallback][AUTO-SOFT][success] grade hard→soft 자동 전환으로 근무표 생성. "
-                    "사용자 응답: HTTP 200, severity=warning, applied_relaxations=['grade_hard_to_soft']"
+                    "[TeamMinFallback][AUTO-SOFT][success] team_min hard→soft 자동 전환으로 근무표 생성. "
+                    "사용자 응답: HTTP 200, severity=warning, applied_relaxations=['team_min_hard_to_soft']"
                 )
                 validation_error = None
             else:
-                print(f"[GradeFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
+                print(f"[TeamMinFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
                 validation_error = retry_validation_error
 
     if validation_error:

@@ -133,3 +133,35 @@ objective += -w_ms × viol
 ### 6-5. 후속 옵션 (섹션 4-B 연장)
 - UI 노출: 그룹별 토글(`max_same_shift`) + 가중치 슬라이더(`max_same_shift_penalty_weight`)로 외부화 후보.
 - 가중치 30,000~90,000 모드(`B 옵션`)는 4연속 회피가 운영상 엄격히 요구되는 그룹에 한해 케이스별 적용.
+
+---
+
+## 7. AUTO-SOFT 재시도 정책 변경: grade hard 고정, team_min hard→soft 폴백 (2026-05-23)
+
+### 7-1. 변경 전
+- `roster_create_service.py:5238` 의 AUTO-SOFT 경로가 `NO_ASSIGNMENT`/`MAX_CAP_SHORTAGE`/`GRADE_MAX_SUM_BELOW_NEED` 검출 시 **grade hard → soft**로 강제 전환하고 1회 재시도.
+- ICU 6월에서 이 경로로 자동 풀려 grade-1 51.7% 달성 + `applied_relaxations=['grade_hard_to_soft']` warning 반환.
+
+### 7-2. 변경 후
+- 같은 검출 신호에 대해 이제는 **team_min hard → soft** 1회 재시도로 전환. grade는 끝까지 hard 유지.
+- `applied_relaxations=['team_min_hard_to_soft']`, severity=warning, HTTP 200.
+- 재시도도 실패하면 HTTP 500 (`UNRECOVERABLE`).
+
+### 7-3. 영향
+- **운영 의미**: Grade(자격) 미달은 운영팀이 명시적으로 손볼 때까지 풀지 않고 INFEASIBLE로 노출. Team(D/E 분담)은 인력 결손 등 불가피한 케이스에서 자동 완화.
+- **이전 grade AUTO-SOFT에 의존하던 ICU 케이스**: g2 demand가 supply보다 큰 경우 hard로 즉시 INFEASIBLE → 운영팀이 g2 일일요구를 낮추거나 인력 재배치해야 함. (현재 ICU는 6월 g2 demand를 `{D:1, E:1, N:1}`로 이미 낮춤 → 정상 풀림)
+
+### 7-4. 코드 변경 파일
+
+| 파일 | 변경 |
+|---|---|
+| `app/services/roster_create_service.py` (≈5237) | AUTO-SOFT 블록을 grade flip → team_min flip으로 교체. 가드 플래그를 `_team_min_soft_retry_attempted`로 변경 |
+| `app/services/roster_create_service.py` (≈2877) | snapshot `attempt_meta.label`에 `team_min_retry` 분기 추가 |
+| `app/services/constraint_impact/types.py` | `SolveAttemptLabel`에 `"team_min_retry"` 리터럴 추가 |
+
+### 7-5. 검증 (회귀)
+- 9B 2026-06: 1차 hard에서 OPTIMAL `relax_level=0`, retry 미작동, HTTP 200 (정상)
+- ICU 2026-06: 1차 hard에서 OPTIMAL `relax_level=0`, retry 미작동, HTTP 200 (정상)
+
+### 7-6. 남은 dead code (후속 청소 대상)
+`_force_grade_max_soft_fallback` 플래그 consumer 4곳(라인 2818-2821, 2877-2882 일부)은 그대로 두었음. 외부에서 이 플래그를 주입하는 경로가 없으므로 사실상 dead. 후속 cleanup에서 제거 가능.
