@@ -144,7 +144,9 @@ objective += -w_ms × viol
 
 ### 7-2. 변경 후
 - 같은 검출 신호에 대해 이제는 **team_min hard → soft** 1회 재시도로 전환. grade는 끝까지 hard 유지.
-- `applied_relaxations=['team_min_hard_to_soft']`, severity=warning, HTTP 200.
+- `applied_relaxations=['team_min_hard_to_soft', 'treatment:soft:team_min']`, severity=warning, HTTP 200.
+  - `team_min_hard_to_soft`: legacy 호환 라벨.
+  - `treatment:soft:team_min`: ontology treatment 어휘 (agent-qa-harness 결합 호환).
 - 재시도도 실패하면 HTTP 500 (`UNRECOVERABLE`).
 
 ### 7-3. 영향
@@ -211,20 +213,69 @@ objective += -w_ms × viol
 | `n_to_n_interval_penalty_weight` | 50 | 거리당 페널티 가중치 (낮게) |
 | `n_to_n_interval_max_window` | 15 | pair 모델링에 고려할 최대 gap. 이보다 멀면 무시 |
 
-### 9-3. 수식
+### 9-3. "N 블록"의 정의
 
-각 간호사 n, day 쌍 (d1, d2)에 대해 d1+2 ≤ d2 ≤ d1+max_window 범위에서:
+**N 블록** = 한 간호사의 스케줄에서 `X(n,d,N)=1`이 **연속**된 day들의 **최대** 묶음. 앞·뒤로 non-N day가 있거나(또는 활동 범위 경계) 끊긴다.
+
+예시 (한 명의 30일 스케줄):
 ```
-pair(n,d1,d2) = X(n,d1,N) ∧ X(n,d2,N) ∧ Π_{k∈(d1,d2)} ¬X(n,k,N)
+day:  1 2 3 4 5 6 7 8 9 10 11 12 13 14 ... 22 23 24
+shift:N N N O O O E O O O  O  N  N  O  ... O  N  O
+                                                    
+       └─block1─┘                  └─b2─┘    └─b3─┘
 ```
-즉 X(d1)=N, X(d2)=N, 그 사이 모든 날이 N이 아님 → "N 블록 종료 → 다음 N 블록 시작" 자연 포착.
+- 블록1: days 1-3 (size 3) — block_end = day 3
+- 블록2: days 12-13 (size 2) — block_start = day 12, block_end = day 13
+- 블록3: day 23 (size 1, 단일 N도 블록) — block_start = block_end = day 23
 
-페널티: `obj += -weight × |gap - target| × pair`. gap=target이면 페널티 0.
+### 9-4. "블록 종료 → 다음 블록 시작 간격"의 수식 모델링
 
-### 9-4. 모델링 비용
+각 간호사 n, day 쌍 (d1, d2)에 대해 **d1+2 ≤ d2 ≤ d1+max_window** 범위에서:
+```
+pair(n,d1,d2) = X(n,d1,N) ∧ X(n,d2,N) ∧ Π_{k ∈ (d1+1..d2-1)} ¬X(n,k,N)
+gap            = d2 - d1
+```
+즉 `d1=N`, `d2=N`, 그 사이 모든 날이 non-N. 이 세 조건이 동시에 만족될 때만 `pair=1`.
+
+**왜 자동으로 "블록 종료 → 다음 블록 시작"이 잡히는가**
+- 사이가 non-N이려면 `X(d1+1, N) = 0` → 자동으로 d1은 자기 블록의 **마지막 N day** (블록 종료)
+- 사이가 non-N이려면 `X(d2-1, N) = 0` → 자동으로 d2는 다음 블록의 **첫 N day** (블록 시작)
+- 따라서 별도의 block_end/block_start 인디케이터 변수 없이 단일 boolean pair로 표현
+
+**왜 `d2 ≥ d1+2`인가** (`range(d1+2, …)`로 강제)
+- `d2 = d1+1`이면 두 N day가 연속(같은 블록 내부) → pair는 의미 없음. 이 경우 제외.
+- `d2 = d1+2`이면 두 N day 사이에 1일짜리 non-N(=gap 2) → 별개 블록으로 인정.
+
+**Edge cases**
+- **단일 N day 블록** (예: ...O N O...): 그 N day가 block_end이자 block_start. 전 블록 → 이 N(d2)으로의 pair 1개 + 이 N(d1) → 다음 블록으로의 pair 1개, 두 개 모두 잡힘.
+- **N으로 끝나는 마지막 블록** (이후 다음 블록 없음): 해당 블록 다음 pair는 없음(d2가 없으니 자연 제외).
+- **월경계**: 미반영(전월 마지막 N → 당월 첫 N 간격은 별도 작업 후보 — section 9-7 참조).
+
+**gap 해석 예시**
+| 패턴 (d1..d2) | d2-d1 = gap | target=10 페널티 |
+|---|---|---|
+| `N N` (인접) | 1 | (제외, 같은 블록) |
+| `N O N` | 2 | \|2-10\|=8 → heavy |
+| `N O O O O O O O O O N` (9일 휴식 후) | 10 | 0 (목표 적중) |
+| `N O O ... O N` (12일 휴식 후) | 13 | \|13-10\|=3 |
+
+### 9-5. 페널티
+
+```
+obj += -weight × |gap - target| × pair
+```
+- `gap = target`일 때 `pair=1`이어도 dist=0이므로 항 생략 (코드에서 `if dist == 0: continue`).
+- `pair=0`이면 항 전체 0.
+- 양쪽 방향 모두 선형 페널티 → **대칭**.
+
+### 9-6. 집계 스크립트 동등성
+
+검증 스크립트(`/tmp/...` 인라인)는 결과 배열에 state machine을 돌려 block_start/block_end를 명시적으로 잡지만, 도출되는 gap 정의(`block_start[i+1] - block_end[i]`)는 위 수식의 `d2 - d1`과 **수치적으로 동일**.
+
+### 9-7. 모델링 비용
 약 N × D × win = 28 × 30 × 15 = 12,600 pair 변수, 각 ~10개 제약 → 약 130K 추가 제약. 실측에서 solve 시간 영향 없음(OPTIMAL relax_level=0 유지).
 
-### 9-5. 검증 결과 (2026-06)
+### 9-8. 검증 결과 (2026-06)
 
 | 그룹 | pair 수 | 평균 gap | target±1 (9~11일) 비율 |
 |---|---|---|---|
@@ -233,6 +284,6 @@ pair(n,d1,d2) = X(n,d1,N) ∧ X(n,d2,N) ∧ Π_{k∈(d1,d2)} ¬X(n,k,N)
 
 낮은 weight(50)로도 ICU 분포에서 target=10 주변 명확한 모달리티 형성. 짧은 gap(4-5일)은 월 N 상한(`n_max=7`) 제약 + 야간 몰아넣기로 구조적으로 발생.
 
-### 9-6. 후속 옵션
+### 9-9. 후속 옵션
 - weight를 100~200 수준으로 올리면 더 강하게 target에 수렴(다른 soft와 트레이드오프 발생 가능).
 - 월경계 N 간격(전월 마지막 N 블록 → 당월 첫 N 블록) 미반영 — 후속 작업에서 cross-month 항 추가 검토.

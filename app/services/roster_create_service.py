@@ -5295,6 +5295,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 generated = retry_generated
                 roster_system = retry_rs
                 applied_relaxations.append("team_min_hard_to_soft")
+                # Ontology treatment 어휘로도 노출 (agent-qa-harness와의 결합 호환).
+                # legacy "team_min_hard_to_soft" 도 호환 유지.
+                applied_relaxations.append("treatment:soft:team_min")
                 weekly_off_warnings.append(
                     {
                         "type": "team_min_hard_to_soft_applied",
@@ -5306,7 +5309,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 )
                 print(
                     "[TeamMinFallback][AUTO-SOFT][success] team_min hard→soft 자동 전환으로 근무표 생성. "
-                    "사용자 응답: HTTP 200, severity=warning, applied_relaxations=['team_min_hard_to_soft']"
+                    "사용자 응답: HTTP 200, severity=warning, "
+                    "applied_relaxations=['team_min_hard_to_soft', 'treatment:soft:team_min']"
                 )
                 validation_error = None
             else:
