@@ -201,15 +201,33 @@ curl -X GET http://127.0.0.1:8000/ontology/audit
 
 ### I-4. HARD 위반 0건 SQL (1N 예시)
 ```sql
-WITH seq AS (
+-- ⚠️ 월경계 false positive 발생함: 당월 첫날(1일)의 LAG가 NULL → 단독 N으로 오판
+-- 정확한 cross-month 검사: 전월 latest schedule의 마지막 6일을 병합한 후 평가
+
+DECLARE @first_day DATE = '2026-06-01';
+DECLARE @prev_sid VARCHAR(50);
+SELECT TOP 1 @prev_sid = schedule_id FROM schedules
+  WHERE group_id = :gid AND [year]=2026 AND [month]=5
+  ORDER BY created_at DESC;
+
+WITH all_days AS (
+  SELECT nurse_id, work_date, shift_id
+  FROM schedule_entries WHERE schedule_id = :sid
+  UNION ALL
+  SELECT nurse_id, work_date, shift_id
+  FROM schedule_entries
+  WHERE schedule_id = @prev_sid AND work_date >= DATEADD(DAY,-6,@first_day)
+), seq AS (
   SELECT nurse_id, work_date, shift_id,
     LAG(shift_id) OVER (PARTITION BY nurse_id ORDER BY work_date) prev_s,
     LEAD(shift_id) OVER (PARTITION BY nurse_id ORDER BY work_date) next_s
-  FROM schedule_entries WHERE schedule_id = :sid
+  FROM all_days
 )
 SELECT COUNT(*) FROM seq
-WHERE shift_id='N' AND (prev_s IS NULL OR prev_s<>'N') AND (next_s IS NULL OR next_s<>'N');
+WHERE shift_id='N' AND work_date >= @first_day
+  AND (prev_s IS NULL OR prev_s<>'N') AND (next_s IS NULL OR next_s<>'N');
 -- 합격: 0
+-- 실측 사례 (9B 2026-06): 같은 검증에서 cross-month 미반영 시 1건(이서연 6/1) false positive 발생, 5/31 N 반영 후 0건
 ```
 
 ### I-5. ND/NE/EOD SQL
