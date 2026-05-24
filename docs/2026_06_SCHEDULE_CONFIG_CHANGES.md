@@ -287,3 +287,126 @@ obj += -weight × |gap - target| × pair
 ### 9-9. 후속 옵션
 - weight를 100~200 수준으로 올리면 더 강하게 target에 수렴(다른 soft와 트레이드오프 발생 가능).
 - 월경계 N 간격(전월 마지막 N 블록 → 당월 첫 N 블록) 미반영 — 후속 작업에서 cross-month 항 추가 검토.
+
+---
+
+## 10. 팀 자동 분배 알고리즘 (`team_auto_assign`) (2026-05-24)
+
+### 10-1. 의도
+원티드(OFF/연차) 데이터와 grade 정보로 nurses pool을 팀으로 자동 분배. 운영팀이 매월 손으로 짜던 작업을 자동화 — 기본 룰만 만족(겹침 없음/grade 균등/G1 ≥1/쏠림 X), 비공식 페어링은 운영팀이 결과에 미세 조정.
+
+### 10-2. 신규 모듈
+
+| 파일 | 역할 |
+|---|---|
+| `app/services/team_auto_assign.py` | 핵심 알고리즘 (외부 의존성 0, 순수 Python) |
+
+핵심 자료구조:
+```python
+@dataclass
+class NurseInput:
+    nurse_id: str
+    grade: int | None             # 1=preceptor 시드, 2=일반, 3=preceptee 등
+    preceptor_id: str | None      # preceptee면 preceptor nurse_id
+    off_days: frozenset[int]      # wanted OFF 일자
+    fb_days: frozenset[int]       # wanted FB(연차) 일자
+
+@dataclass
+class TeamAssignResult:
+    teams: dict[int, list[str]]   # team_idx → [nurse_id]
+    objective: float
+    overlap_total: int
+    grade_dev_total: float
+    team_size, team_grade_breakdown
+```
+
+진입점:
+```python
+auto_assign_teams(nurses, num_teams=3, seed_ids=None,
+                  w_overlap=100, w_grade=200.0,
+                  min_size=4, max_size=6, swap_iterations=100)
+```
+
+### 10-3. Hard 제약 (자체 검증 통과 필수)
+| ID | 내용 |
+|---|---|
+| C1 | 각 팀에 grade-1 ≥ 1 (시드 자동 선정 또는 외부 입력) |
+| C2 | 팀 크기 ∈ [min_size, max_size] (디폴트 [4, 6]) |
+| C3 | preceptee → preceptor 같은 팀 (preceptor 시드 여부 무관) — `_enforce_preceptee_follow`로 강제 |
+| C4 | N전담 등 사전 격리 인원은 입력 풀에서 제외 (호출자 책임) |
+
+### 10-4. Soft Objective (minimize, 가중치 튜닝 가능)
+| 항 | 식 | 디폴트 weight |
+|---|---|---|
+| OFF/FB pairwise overlap | `Σ_{a<b ∈ team_t} |OFF(a)∩OFF(b)| + |FB(a)∩FB(b)|` | 100 |
+| Grade L1 deviation | `Σ_{t,g} \|count_g[t] - total_g/num_teams\|` | 200 |
+
+### 10-5. 알고리즘 (2단계)
+
+**Stage 1 — Greedy seed-and-grow**
+- 시드(G1 K명) → 고정 팀
+- preceptee → preceptor와 같은 팀 자동 배정
+- 잔여 인원을 `grade desc → OFF 일수 desc` 순으로 정렬, 각 후보를 모든 팀에 시뮬레이션해 objective 가장 낮은 팀으로 추가
+
+**Stage 2 — Local 2-opt swap**
+- movable 정의: 시드/preceptee/preceptor-of-anyone 모두 제외 (페어 보존 위해)
+- 각 (팀a, 팀b) 페어, 각 movable nurse 페어를 swap해보고 objective 감소 시 반영
+- max_iterations 또는 no improvement 시 종료
+
+**복잡도**: 15명/3팀 기준 < 100ms. CP-SAT 같은 무거운 솔버 불필요.
+
+### 10-6. 검증 (회귀 분석 3단계 적용)
+
+대상: 9A/9B × 2026-04/05 = 4 케이스. `fixed_wanted_entries` 132건 사용 (`/tmp/fixed_wanted_register.py` 적용 후).
+
+**1. 파라미터 확인**: DB nurses + fixed_wanted 정상 로드, grade fallback (None→G2), N전담 외부 제외 (4월 9A: 이윤지, 9B: 엄애란 / 5월 9A: 박춘일, 9B: 박지연)
+
+**2. 조건 적용**: 모든 4 케이스에서 hard 제약 100% 충족 (G1 ≥1/팀, 크기 ∈ [4,6], preceptee follow)
+
+**3. 결과 품질**:
+
+| 케이스 | 팀 크기 | OFF/FB overlap | Grade dev | 팀별 grade |
+|---|---|---|---|---|
+| 9A 4월 | 5/4/4 | **0** | 1.33 | G1=[1,1,1] G2=[4,3,3] |
+| 9A 5월 | 5/4/4 | **0** | 1.33 | G1=[1,1,1] G2=[4,3,3] |
+| 9B 4월 | 6/4/4 | **1** | 3.33 | G1=[2,1,1] G2=[3,2,2] G3=[1,1,1] |
+| 9B 5월 | 6/4/4 | **1** | 3.33 | G1=[2,1,2] G2=[3,2,1] G3=[1,1,1] |
+
+(9B 6명 팀은 preceptee follow hard로 인한 자연 확장)
+
+### 10-7. 정답지 매칭률 한계 (데이터 sparsity)
+
+운영팀 4월/5월 9A/9B 정답지와 비교 (Hungarian best matching):
+
+| 케이스 | 매칭률 |
+|---|---|
+| 9A 4월 | 53.8% (7/13) |
+| 9A 5월 | 57.1% (8/14) |
+| 9B 4월 | 50.0% (7/14) |
+| 9B 5월 | 42.9% (6/14) |
+| **평균** | **~51%** |
+
+**원인은 알고리즘이 아니라 OFF 데이터 sparsity**:
+
+| 케이스 | OFF 신청 인원 | 겹치는 pair 비율 |
+|---|---|---|
+| 9A 4월 | 54% (7/13) | 5% (4/78) |
+| 9A 5월 | 46% (6/13) | 4% (3/78) |
+| 9B 4월 | 64% (9/14) | 13% (12/91) |
+| 9B 5월 | 71% (10/14) | 10% (9/91) |
+
+- 30~54% 인원이 OFF 0건 → 알고리즘이 그들 분배는 임의 결정 (변별 신호 없음)
+- 겹치는 pair가 전체의 4~13% 뿐 → "안 겹치게" 제약 만족 자유도 너무 큼
+- 운영팀의 비공식 페어링 (성격/조합/연차) — 데이터 외 신호, 알고리즘 불가
+
+### 10-8. 운영 모드 제안
+1. **자동 추천 + 운영팀 미세 조정** (현실 권장) — 알고리즘이 기본 룰 만족 분배 제안, 운영팀이 검토·페어 조정
+2. **시드 사용자 지정** — 추가 G1 페어를 명시해서 매칭률 ↑ (예: "김한별과 장세현 같은 팀")
+3. **OFF 데이터 강화** — 모두 2-3건+ 신청 받으면 자연스럽게 정답지 수렴
+
+### 10-9. 후속 작업
+- API: `POST /teams/auto-assign` 엔드포인트 (단일/다중 group_id 지원)
+- DB UPDATE wrapper: 결과를 `nurses.team_id`에 반영
+- 다중 그룹 통합 모드: 여러 group_id를 한 풀로 묶어 분배
+- 시드 자동 선정 개선: 현재는 G1 풀의 첫 K명. 외부 입력 외에도 wanted 분포 기반 자동 선정 시도 가능
+- UI: "팀 자동 분배" 버튼 + dry-run 미리보기
