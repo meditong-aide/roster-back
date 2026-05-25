@@ -20,7 +20,7 @@
 
 | 위반 종류 | 면제 조건 (사전 조회로 자동 확인) |
 |---|---|
-| H-01 1N 단독 | `nml.n_exact=1` 또는 `n_max=1` (memory: `single_n_exemption_from_1n_ban_20260512`) |
+| H-01 1N 단독 | `nml.n_max=1` (solver 3곳 면제 set 적용 — postprocess_off.py:599 주석 + cp_sat_basic.py:3773 hint 근거). n_exact=1만 설정 시에는 면제 안 됨 — n_max=1 동시 필요 |
 | H-02 2N→2OFF 미충족 | `fixed_wanted` / `nml.o_exact` 로 OFF 자리 점유됨 |
 | H-09 N 월 상한 초과 | `nml.n_max` 미설정 시 default `cfg.max_nig_per_month` 적용 |
 | H-13 일별 coverage 미달 | `fixed_wanted` 사전 점유가 daily need 초과 |
@@ -48,7 +48,7 @@
 
 | ID | 항목 | 출처 | 검증 | 합격 |
 |---|---|---|---|---|
-| H-01 | 1N 단독 금지 | CT | 같은 nurse에 N 인접 0 없는 단독 N 탐색. ⚠️ **`nml.n_exact=1` / `n_max=1` nurse 면제** (Q-1 조회로 자동 제외) | 면제 후 0건 |
+| H-01 | 1N 단독 금지 | CT | 같은 nurse에 N 인접 0 없는 단독 N 탐색. ⚠️ **`nml.n_max=1` nurse 면제** (Q-1 조회로 자동 제외, postprocess_off.py:599 + cp_sat_basic.py:3773 근거) | 면제 후 0건 |
 | H-02 | 2N→2OFF 회복 | CT | 2연속 N 후 2연속 OFF 미충족 | 0건 |
 | H-03 | 3N→2OFF 회복 | SC | 3연속 N 후 2연속 OFF 미충족 | 0건 |
 | H-04 | 4N 이상 연속 금지 | CT | N 연속 ≥ 4 발생 | 0건 (cfg.max_consecutive_nights=3) |
@@ -472,12 +472,12 @@ ORDER BY n.name;
 ```
 
 **해석 가이드**:
-- `n_exact=1`/`n_max=1` → H-01 1N 단독 면제 (이 nurse는 자연스럽게 1N 발생)
-- `n_max=0` → 그룹 default(cfg.max_nig_per_month) 적용 (사실상 무제한 가능)
-- `d_exact`/`e_exact` 설정 → L2-05 동일 shift 4+ 연속 면제 가능
+- **`n_max=1` (단독 조건)** → H-01 1N 단독 면제. 솔버 3곳(`cp_sat_basic` + `fallback_lex` + `postprocess_off`)이 `n_max==1` 만 면제 set으로 인식. **n_exact=1 단독은 면제 안 됨** — n_max=1 동시 설정 필요
+- `n_max=0` (또는 NULL) → 그룹 default `cfg.max_nig_per_month` 적용 (해당 nurse 사실상 무제한 — 본 세션 271772 정아영 사례)
+- `d_exact`/`e_exact` 설정 → L2-05 동일 shift 4+ 연속 분포 강제, 면제 후보
 - `o_exact`/`o_min` → H-17/H-18 OFF 정확값 검증 기준
 
-### Q-2. `nurse_shift_requests` — 원티드 (HARD 또는 SOFT)
+### Q-2. `nurse_shift_requests` — 원티드 (점수 기반)
 
 ```sql
 SELECT nsr.nurse_id, n.name, nsr.shift_date, nsr.shift, nsr.score, nsr.partial_request
@@ -490,9 +490,10 @@ ORDER BY n.name, nsr.shift_date;
 ```
 
 **해석 가이드**:
-- score=10 (또는 정책에 따라) → HARD 원티드 (fixed_wanted로 전환됨)
-- score < 10 → soft 원티드 (배정 안 될 수 있음)
-- shift=O/연/휴 → OFF 요청 (해당 일 work 미배정)
+- `score` 는 원티드 선호도. HARD 변환 임계는 정책에 따라 다름 (`wanted_service.py` 별도 확인 필요 — 단순 임계가 아니라 wanted 승인 + `fixed_wanted_entries` 등록 절차로 hard 적용됨)
+- 실제 hard fix는 **Q-3 `fixed_wanted_entries`** 가 진실원천 — 원티드만 봐서는 hard 여부 미확정
+- shift=O/연/휴 → OFF 요청, shift=D/E/N → work 선호
+- 같은 nurse_id 가 여러 row → `partial_request` 기반 다양한 형태 가능
 
 ### Q-3. `fixed_wanted_entries` — 사전 점유 셀
 
@@ -509,7 +510,12 @@ ORDER BY n.name, fwe.shift_date;
 **해석 가이드**:
 - `is_applied=1` row는 솔버에서 hard fix (해당 cell 강제 점유)
 - HARD 검증에서 fixed cell이 위반의 직접 원인이면 → false positive
-- `source_type='wanted'` → 원티드 자동 변환, `'special'` → 휴가/공가/연차 등
+- 실제 `source_type` 값 (wanted_service.py 기준):
+  - `'original'` — wanted 원본 (변경 없음)
+  - `'added'` — 추가된 cell
+  - `'modified'` — 기존에서 수정된 cell
+  - `'weekly_off'` — 주휴 일괄 적용
+  - 기타 값은 wanted_service.py 코드에서 추가 가능
 
 ### Q-4. `nurse_assignment` — 파견/병동이동
 
@@ -585,7 +591,7 @@ WHERE rgc.group_id = :gid ORDER BY rgc.config_id DESC;
 
 ```
 1. Q-5 nurses 조회 → active 멤버 + N-only/specialist 자동 분류
-2. Q-1 nml 조회 → n_exact=1 nurse set 추출 (1N 면제 대상)
+2. Q-1 nml 조회 → **n_max=1** nurse set 추출 (1N 면제 대상, n_exact 단독 불충분)
 3. Q-2/Q-3 원티드/fixed_wanted 조회 → 사전 점유 cell map
 4. Q-4 assignment → inbound/outbound nurse map
 5. Q-6/Q-7 cfg 조회 → 활성 정책 set (어느 HARD 검증할지)
