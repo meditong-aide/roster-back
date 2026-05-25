@@ -2587,7 +2587,7 @@ def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int
         month=month,
     )
 
-def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
+def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
     try:
@@ -5554,6 +5554,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
             time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
             config_override=config_dict,
+            _assignments=_assignments,
+            _inbound_assignments=_inbound_assignments,
+            _outbound_assignments=_outbound_assignments,
         )
         # _debug_log(
         #     "cp_sat_end",
@@ -5641,6 +5644,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
                 time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
                 config_override=soft_cfg,
+                _assignments=_assignments,
+                _inbound_assignments=_inbound_assignments,
+                _outbound_assignments=_outbound_assignments,
             )
             # 동일 후처리 적용
             try:

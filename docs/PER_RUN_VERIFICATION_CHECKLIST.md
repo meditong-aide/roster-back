@@ -9,9 +9,23 @@
 ## 사용법
 
 1. 검증 대상 schedule_id 확보 (DB `schedules` 테이블에서 group_id + year + month로 최신 row)
-2. 카테고리 A → B → C 순으로 검증 (HARD 우선 → SOFT → 정책 변경)
-3. 카테고리 D~F는 PR/CI 게이트 단계에서 추가 적용
-4. 각 항목 결과는 `tools/harness/reports/run-*/summary.json` 에 기록
+2. **사전 데이터 조회 (섹션 Q) — 필수 첫 단계**: NML / 원티드 / fixed_wanted / nurse_assignment 를 *반드시* 먼저 조회. 면제 조건 자동 판정에 사용.
+3. 카테고리 A → B → C 순으로 검증 (HARD 우선 → SOFT → 정책 변경)
+4. 카테고리 D~F는 PR/CI 게이트 단계에서 추가 적용
+5. 각 항목 결과는 `tools/harness/reports/run-*/summary.json` 에 기록
+
+### 위반 vs 운영팀 의도 구분 원칙
+
+검증 시 "위반" 카운트가 발생해도 **사전 조회 데이터 (Q 섹션)에 의해 강제된 결과**라면 false positive 입니다. 반드시 NML/원티드/fixed_wanted 와 cross-check 후 진짜 위반인지 판정.
+
+| 위반 종류 | 면제 조건 (사전 조회로 자동 확인) |
+|---|---|
+| H-01 1N 단독 | `nml.n_exact=1` 또는 `n_max=1` (memory: `single_n_exemption_from_1n_ban_20260512`) |
+| H-02 2N→2OFF 미충족 | `fixed_wanted` / `nml.o_exact` 로 OFF 자리 점유됨 |
+| H-09 N 월 상한 초과 | `nml.n_max` 미설정 시 default `cfg.max_nig_per_month` 적용 |
+| H-13 일별 coverage 미달 | `fixed_wanted` 사전 점유가 daily need 초과 |
+| L2-05 동일 shift 4+ 연속 | `nml.d_exact/e_exact` 강제 분포 |
+| 0 N | 운영팀 NML 미설정 + cfg group default 무제한 (정아영 ICU 사례) |
 
 ## 출처 docs 매핑
 
@@ -34,7 +48,7 @@
 
 | ID | 항목 | 출처 | 검증 | 합격 |
 |---|---|---|---|---|
-| H-01 | 1N 단독 금지 | CT | 같은 nurse에 N 인접 0 없는 단독 N 탐색 | 0건 |
+| H-01 | 1N 단독 금지 | CT | 같은 nurse에 N 인접 0 없는 단독 N 탐색. ⚠️ **`nml.n_exact=1` / `n_max=1` nurse 면제** (Q-1 조회로 자동 제외) | 면제 후 0건 |
 | H-02 | 2N→2OFF 회복 | CT | 2연속 N 후 2연속 OFF 미충족 | 0건 |
 | H-03 | 3N→2OFF 회복 | SC | 3연속 N 후 2연속 OFF 미충족 | 0건 |
 | H-04 | 4N 이상 연속 금지 | CT | N 연속 ≥ 4 발생 | 0건 (cfg.max_consecutive_nights=3) |
@@ -431,4 +445,153 @@ GROUP BY work_date ORDER BY work_date;
 | M. Impact Graph (신규) | 0 | 4 | 4 |
 | N. cfg 키 구체값 (신규) | 0 | 8 | 8 |
 | O. commit 기반 feature (신규) | 0 | 8 | 8 |
-| **합계** | **74** | **35** | **109+** |
+| Q. 사전 데이터 조회 (신규) | 0 | 7 | 7 |
+| **합계** | **74** | **42** | **116+** |
+
+---
+
+## Q. 사전 데이터 조회 SQL (검증 시 필수 첫 단계, 7항)
+
+> 검증 SQL 실행 *전에* 반드시 아래 데이터를 수집합니다. 운영팀이 강제한 값이 위반으로 표시되는 false positive를 자동 제거하기 위함.
+>
+> 사용 변수: `:gid` (group_id), `:yr` (year), `:mo` (month)
+
+### Q-1. `nurse_monthly_limits` — N/D/E/O 강제값 (HARD)
+
+```sql
+SELECT nml.nurse_id, n.name, n.grade,
+  nml.d_min, nml.d_max, nml.d_exact,
+  nml.e_min, nml.e_max, nml.e_exact,
+  nml.n_min, nml.n_max, nml.n_exact,
+  nml.o_min, nml.o_max, nml.o_exact
+FROM nurse_monthly_limits nml
+JOIN nurses n ON n.nurse_id COLLATE Korean_Wansung_CI_AS = nml.nurse_id
+WHERE nml.group_id COLLATE Korean_Wansung_CI_AS = :gid
+  AND nml.[year] = :yr AND nml.[month] = :mo
+ORDER BY n.name;
+```
+
+**해석 가이드**:
+- `n_exact=1`/`n_max=1` → H-01 1N 단독 면제 (이 nurse는 자연스럽게 1N 발생)
+- `n_max=0` → 그룹 default(cfg.max_nig_per_month) 적용 (사실상 무제한 가능)
+- `d_exact`/`e_exact` 설정 → L2-05 동일 shift 4+ 연속 면제 가능
+- `o_exact`/`o_min` → H-17/H-18 OFF 정확값 검증 기준
+
+### Q-2. `nurse_shift_requests` — 원티드 (HARD 또는 SOFT)
+
+```sql
+SELECT nsr.nurse_id, n.name, nsr.shift_date, nsr.shift, nsr.score, nsr.partial_request
+FROM nurse_shift_requests nsr
+JOIN nurses n ON n.nurse_id COLLATE Korean_Wansung_CI_AS = nsr.nurse_id
+WHERE nsr.group_id COLLATE Korean_Wansung_CI_AS = :gid
+  AND nsr.shift_date >= CONCAT(:yr, '-', RIGHT('0' + CAST(:mo AS VARCHAR), 2), '-01')
+  AND nsr.shift_date <  DATEADD(MONTH, 1, CONCAT(:yr, '-', RIGHT('0' + CAST(:mo AS VARCHAR), 2), '-01'))
+ORDER BY n.name, nsr.shift_date;
+```
+
+**해석 가이드**:
+- score=10 (또는 정책에 따라) → HARD 원티드 (fixed_wanted로 전환됨)
+- score < 10 → soft 원티드 (배정 안 될 수 있음)
+- shift=O/연/휴 → OFF 요청 (해당 일 work 미배정)
+
+### Q-3. `fixed_wanted_entries` — 사전 점유 셀
+
+```sql
+SELECT fwe.nurse_id, n.name, fwe.shift_date, fwe.shift_id,
+  fwe.source_type, fwe.is_applied, fwe.reason, fwe.head_nurse_memo
+FROM fixed_wanted_entries fwe
+JOIN nurses n ON n.nurse_id COLLATE Korean_Wansung_CI_AS = fwe.nurse_id
+WHERE fwe.group_id COLLATE Korean_Wansung_CI_AS = :gid
+  AND fwe.[year] = :yr AND fwe.[month] = :mo AND fwe.is_applied = 1
+ORDER BY n.name, fwe.shift_date;
+```
+
+**해석 가이드**:
+- `is_applied=1` row는 솔버에서 hard fix (해당 cell 강제 점유)
+- HARD 검증에서 fixed cell이 위반의 직접 원인이면 → false positive
+- `source_type='wanted'` → 원티드 자동 변환, `'special'` → 휴가/공가/연차 등
+
+### Q-4. `nurse_assignment` — 파견/병동이동
+
+```sql
+SELECT na.nurse_id, n.name, na.source_group_id, na.target_group_id,
+  na.start_date, na.expected_end_date, na.end_date, na.reason, na.status,
+  na.target_fixed_shift, na.target_grade, na.note
+FROM nurse_assignment na
+JOIN nurses n ON n.nurse_id COLLATE Korean_Wansung_CI_AS = na.nurse_id
+WHERE (na.source_group_id COLLATE Korean_Wansung_CI_AS = :gid
+       OR na.target_group_id COLLATE Korean_Wansung_CI_AS = :gid)
+  AND (na.end_date IS NULL OR na.end_date >= CONCAT(:yr, '-', RIGHT('0' + CAST(:mo AS VARCHAR), 2), '-01'))
+ORDER BY na.start_date DESC;
+```
+
+**해석 가이드**:
+- source=group → outbound (해당 nurse 그룹 밖으로)
+- target=group → inbound (해당 nurse 그룹 안으로)
+- `target_fixed_shift` 설정 → 파견 nurse는 해당 shift 강제
+
+### Q-5. `nurses` — 멤버 + 프로필 (active/grade/is_night_nurse/fixed_shift)
+
+```sql
+SELECT n.nurse_id, n.name, n.active, n.grade, n.is_night_nurse, n.fixed_shift,
+  n.work_shifts, n.weekly_off_enabled, n.is_weekend_off, n.preceptor_id, n.team_id
+FROM nurses n
+WHERE n.group_id = :gid ORDER BY n.name;
+```
+
+**해석 가이드**:
+- `active=0` → 비활성 nurse, schedule 대상 X
+- `is_night_nurse=["N"]` → N-only 전담 (H-19 면제, N 부담 흡수)
+- `is_night_nurse=["D","N"]` → D/N 부분전담 (E 배정 불가)
+- `fixed_shift` 설정 → 단일 shift 전담
+- `preceptor_id NOT NULL` → 프리셉티 (S-08 동기화 검증)
+
+### Q-6. `roster_config` — 현재 cfg 적용 값
+
+```sql
+SELECT TOP 1 config_id, max_nig_per_month, max_conseq_work,
+  two_offs_after_two_nig, two_offs_after_three_nig, banned_day_after_eve,
+  nod_noe, not_one_night, off_first, off_swap_enabled, off_days,
+  grade_strategy, use_mid, fixed_wanted_use_yn
+FROM roster_config WHERE group_id = :gid
+ORDER BY config_id DESC;
+```
+
+**해석 가이드**:
+- HARD 검증 항목과 cfg 키 cross-check (예: H-08 EOD 검증 시 `banned_day_after_eve=True` 확인)
+- 비활성 cfg는 해당 검증 항목 자동 skip
+- `not_one_night=False` → H-01 검증 자체 skip 가능
+
+### Q-7. `roster_grade_config` — 등급별 min/max
+
+```sql
+SELECT rgc.config_id, rgc.allow_soft_fallback,
+  rgc.constraints_json AS grade_min_json,
+  rgc.constraints_max_json AS grade_max_json,
+  rgc.default_shifts_json, rgc.use_dynamic_scaling
+FROM roster_grade_config rgc
+WHERE rgc.group_id = :gid ORDER BY rgc.config_id DESC;
+```
+
+**해석 가이드**:
+- H-11 등급별 일일 최소: `constraints_json` 의 D/E/N 별 등급 min 값
+- H-12 등급별 일일 최대: `constraints_max_json`
+- H-20 Grade hard mode: `allow_soft_fallback=0` 확인
+- `use_dynamic_scaling=1` → grade 1 목표가 자동 스케일링 (인력 부족 시 미달 자연 발생)
+
+---
+
+### 검증 워크플로우 예시 (자동화 시)
+
+```
+1. Q-5 nurses 조회 → active 멤버 + N-only/specialist 자동 분류
+2. Q-1 nml 조회 → n_exact=1 nurse set 추출 (1N 면제 대상)
+3. Q-2/Q-3 원티드/fixed_wanted 조회 → 사전 점유 cell map
+4. Q-4 assignment → inbound/outbound nurse map
+5. Q-6/Q-7 cfg 조회 → 활성 정책 set (어느 HARD 검증할지)
+6. A 섹션 HARD 검증 SQL 실행 → 위반 후보 추출
+7. 위반 후보를 Q-1~Q-4 데이터와 cross-check → 면제 대상 제외
+8. 진짜 위반만 보고
+
+자동화 시 Q-1~Q-7 7개 쿼리는 검증 시작 시 캐시. A~F 검증 SQL은 결과만 비교.
+```
