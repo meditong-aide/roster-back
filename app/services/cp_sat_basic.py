@@ -1404,7 +1404,11 @@ class CPSATBasicEngine:
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
             setattr(roster_system, "_used_fallback", False)
-            success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
+            if os.getenv("SKIP_PRIMARY") == "1":
+                print(f"{self.logger_prefix} [Config] SKIP_PRIMARY=1 → primary 스킵, 바로 폴백")
+                success = False
+            else:
+                success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
             # fallback_success = False
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
