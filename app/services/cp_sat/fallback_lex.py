@@ -2890,6 +2890,31 @@ def optimize_fallback_lex_hard_first(
             _log_off_slack_used("stage2", s2, m2)
             # H1: Stage2 lex 3-pass — safety_sum → OFF range → N range 순차 minimize.
             # 각 단계는 이전 cost 동결로 다른 항 영향 0 보장.
+            # lex 재solve 는 cold-start 라 큰 인스턴스에서 시간 내 incumbent 를 못 찾고
+            # UNKNOWN(빈 해)으로 끝날 수 있다. 그러면 downstream(zero-lock/hint/stage3 실패
+            # fallback)이 망가진 s2 를 읽어 빈 roster 를 만든다. → 성공한 마지막 해를
+            # 스냅샷에 보존하고(downstream 은 이 스냅샷을 읽음), 재solve 전 warm-start hint 로
+            # 직전 feasible 해를 주입해 빈 해 반환 자체를 막는다.
+            lex_x2_val: dict = {}
+            lex_safety_val: dict = {}
+
+            def _capture_lex_solution() -> None:
+                for _n in range(N):
+                    for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse):
+                        for _s in range(S):
+                            lex_x2_val[(_n, _d, _s)] = int(s2.Value(X2(_n, _d, _s)))
+                for _k, _arr in safety2.items():
+                    lex_safety_val[_k] = [int(s2.Value(_v)) for _v in _arr]
+
+            def _hint_lex_solution() -> None:
+                try:
+                    m2.ClearHints()
+                    for (_n, _d, _s), _val in lex_x2_val.items():
+                        m2.AddHint(X2(_n, _d, _s), _val)
+                except Exception:
+                    pass
+
+            _capture_lex_solution()  # stage2 해 보존: lex 전부 실패해도 이 해로 복원
             try:
                 flat_safety = []
                 for arr in safety2.values():
@@ -2926,8 +2951,10 @@ def optimize_fallback_lex_hard_first(
                             m2.Add(cnt >= min_off_lex)
                         m2.Minimize(max_off_lex - min_off_lex)
                         s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                        _hint_lex_solution()
                         st2_off = s2.Solve(m2)
                         if st2_off in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                            _capture_lex_solution()
                             best_off_range = int(s2.Value(max_off_lex) - s2.Value(min_off_lex))
                             print(
                                 f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
@@ -2957,8 +2984,10 @@ def optimize_fallback_lex_hard_first(
                                         m2.Add(cnt >= min_n_lex)
                                     m2.Minimize(max_n_lex - min_n_lex)
                                     s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                                    _hint_lex_solution()
                                     st2_n = s2.Solve(m2)
                                     if st2_n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                        _capture_lex_solution()
                                         best_n_range = int(
                                             s2.Value(max_n_lex) - s2.Value(min_n_lex)
                                         )
@@ -2997,17 +3026,14 @@ def optimize_fallback_lex_hard_first(
         stage2_zero_locks = {}
         best_safe_sum = 0
         for k, arr in safety2.items():
-            zeros = []
-            for v in arr:
-                val = s2.Value(v)
-                if val == 0:
-                    zeros.append(v)
-                best_safe_sum += int(val)
+            vals = lex_safety_val.get(k) or [int(s2.Value(v)) for v in arr]
+            zeros = [v for v, val in zip(arr, vals) if val == 0]
+            best_safe_sum += sum(int(val) for val in vals)
             stage2_zero_locks[k] = zeros
         print(f"{logger_prefix} 최소 안전 위반 합: {best_safe_sum}")
         try:
             for k, arr in safety2.items():
-                total_k = sum(int(s2.Value(v)) for v in arr)
+                total_k = sum(lex_safety_val.get(k) or [int(s2.Value(v)) for v in arr])
                 if total_k > 0:
                     print(f"{logger_prefix} [Stage2 위반] {k} = {total_k}")
             short_items = [
@@ -3054,7 +3080,7 @@ def optimize_fallback_lex_hard_first(
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
                     try:
-                        m3.AddHint(X3(n, d, s), s2.Value(X2(n, d, s)))
+                        m3.AddHint(X3(n, d, s), lex_x2_val.get((n, d, s), 0))
                     except Exception:
                         pass
         s3 = cp_model.CpSolver()
@@ -3084,7 +3110,7 @@ def optimize_fallback_lex_hard_first(
             for n in range(N):
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     for s in range(S):
-                        if s2.Value(X2(n, d, s)):
+                        if lex_x2_val.get((n, d, s), 0):
                             roster_system.roster[n, d, s] = 1
             _log_weekend_work_assignments(
                 roster_system=roster_system,
