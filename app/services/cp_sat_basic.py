@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta
 import logging
 import math
+import os
 import time
 import numpy as np
 from typing import List, Dict, Optional, Tuple
@@ -1932,6 +1933,8 @@ class CPSATBasicEngine:
                 f"best_viol={best_viol}, remaining={remaining}s"
             )
             return best_viol == 0
+        no_progress = 0
+        NO_PROGRESS_LIMIT = int(os.getenv("PRIMARY_NO_PROGRESS_LIMIT", "2"))
         for it in range(max_iter):
             try:
                 n_sel, d_sel = policy.select()
@@ -1984,6 +1987,16 @@ class CPSATBasicEngine:
             if best_viol == 0:
                 print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
                 break
+            if improved:
+                no_progress = 0
+            else:
+                no_progress += 1
+                if no_progress >= NO_PROGRESS_LIMIT:
+                    print(
+                        f"{self.logger_prefix} [Progress] early-stop: "
+                        f"{NO_PROGRESS_LIMIT}회 연속 무개선 → 폴백 진입"
+                    )
+                    break
         roster_system.roster = best_roster
         try:
             _fnc, _fnt, _fnmx = _row_commit_counts(roster_system, best_roster)
