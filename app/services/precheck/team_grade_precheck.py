@@ -132,7 +132,12 @@ def check_mid_required_missing(inp: PrecheckInput) -> List[Dict]:
     if not bool(cfg.get("use_mid", False)):
         return []
     dsr = cfg.get("daily_shift_requirements") or {}
-    if "M" not in dsr or int(dsr.get("M", 0) or 0) <= 0:
+    base_m = int(dsr.get("M", 0) or 0)
+    # base(shift_manages 파생)에 M 이 없어도, per-day 요구치(DailyShift)에 M>0 인 날이
+    # 하나라도 있으면 MID 가 실제로 요구된 것 → 통과. (형제 디텍터들과 동일하게 per-day 참조)
+    by_day = cfg.get("daily_shift_requirements_by_day") or []
+    per_day_m = any(int((d or {}).get("M", 0) or 0) > 0 for d in by_day if isinstance(d, dict))
+    if base_m <= 0 and not per_day_m:
         return [_issue("MID_REQUIRED_MISSING", {"daily_shift_requirements": dict(dsr)})]
     return []
 
