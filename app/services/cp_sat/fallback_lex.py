@@ -2888,6 +2888,97 @@ def optimize_fallback_lex_hard_first(
         print(f"{logger_prefix} 폴백2 결과: status={_cp_sat_status_to_text(st2)}")
         if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             _log_off_slack_used("stage2", s2, m2)
+            # H1: Stage2 lex 3-pass — safety_sum → OFF range → N range 순차 minimize.
+            # 각 단계는 이전 cost 동결로 다른 항 영향 0 보장.
+            try:
+                flat_safety = []
+                for arr in safety2.values():
+                    flat_safety.extend(arr)
+                if flat_safety:
+                    best_sum2 = sum(int(s2.Value(v)) for v in flat_safety)
+                    m2.Add(sum(flat_safety) <= best_sum2)
+                    use_mid_h1 = bool(getattr(cfg, "use_mid", False))
+                    off_count_vars = []
+                    nightonly_excluded_idx: set[int] = set()
+                    for n_lex in range(N):
+                        if leave[n_lex] < join[n_lex]:
+                            continue
+                        nu = roster_system.nurses[n_lex]
+                        try:
+                            is_n_only_lex = is_n_only_profile(
+                                getattr(nu, "is_night_nurse", None), use_mid=use_mid_h1
+                            )
+                        except Exception:
+                            is_n_only_lex = False
+                        if is_n_only_lex:
+                            nightonly_excluded_idx.add(n_lex)
+                            continue
+                        cnt = sum(
+                            X2(n_lex, d, off_idx)
+                            for d in iter_nurse_days(n_lex, join, leave, blocked_by_nurse)
+                        )
+                        off_count_vars.append((n_lex, cnt))
+                    if off_count_vars:
+                        max_off_lex = m2.NewIntVar(0, D, "lex_max_off")
+                        min_off_lex = m2.NewIntVar(0, D, "lex_min_off")
+                        for _, cnt in off_count_vars:
+                            m2.Add(cnt <= max_off_lex)
+                            m2.Add(cnt >= min_off_lex)
+                        m2.Minimize(max_off_lex - min_off_lex)
+                        s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                        st2_off = s2.Solve(m2)
+                        if st2_off in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                            best_off_range = int(s2.Value(max_off_lex) - s2.Value(min_off_lex))
+                            print(
+                                f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
+                                f"status={_cp_sat_status_to_text(st2_off)} range={best_off_range}"
+                            )
+                            m2.Add(max_off_lex - min_off_lex <= best_off_range)
+                            night_idx_h1 = (
+                                cfg.shift_types.index("N") if "N" in cfg.shift_types else None
+                            )
+                            if night_idx_h1 is not None:
+                                n_count_vars = []
+                                for n_lex in range(N):
+                                    if leave[n_lex] < join[n_lex]:
+                                        continue
+                                    if n_lex in nightonly_excluded_idx:
+                                        continue
+                                    cnt_n = sum(
+                                        X2(n_lex, d, night_idx_h1)
+                                        for d in iter_nurse_days(n_lex, join, leave, blocked_by_nurse)
+                                    )
+                                    n_count_vars.append(cnt_n)
+                                if n_count_vars:
+                                    max_n_lex = m2.NewIntVar(0, D, "lex_max_n")
+                                    min_n_lex = m2.NewIntVar(0, D, "lex_min_n")
+                                    for cnt in n_count_vars:
+                                        m2.Add(cnt <= max_n_lex)
+                                        m2.Add(cnt >= min_n_lex)
+                                    m2.Minimize(max_n_lex - min_n_lex)
+                                    s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                                    st2_n = s2.Solve(m2)
+                                    if st2_n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                        best_n_range = int(
+                                            s2.Value(max_n_lex) - s2.Value(min_n_lex)
+                                        )
+                                        print(
+                                            f"{logger_prefix} 폴백2 lex 3-pass (N range): "
+                                            f"status={_cp_sat_status_to_text(st2_n)} "
+                                            f"range={best_n_range}"
+                                        )
+                                    else:
+                                        print(
+                                            f"{logger_prefix} 폴백2 lex 3-pass (N range): "
+                                            f"status={_cp_sat_status_to_text(st2_n)} — 2nd 결과 유지"
+                                        )
+                        else:
+                            print(
+                                f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
+                                f"status={_cp_sat_status_to_text(st2_off)} — 1st 결과 유지"
+                            )
+            except Exception as _h1_e:
+                print(f"{logger_prefix} 폴백2 lex H1 예외: {_h1_e}")
         if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백2 실패: 단계 불가능 → 1단계 해 사용")
             roster_system.roster.fill(0)
