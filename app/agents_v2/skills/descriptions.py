@@ -531,9 +531,11 @@ SKILL_TOOLS: list[dict] = [
             "- '병동 전체 야간 균등 배분 켜줘' → 병동 정책 → update_constraint\n\n"
 
             "─────────── 정책 영역 (의미적 그룹) ───────────\n"
-            "[A] **시프트별 필요인원 (RosterConfig)**\n"
+            "[A] **시프트별 필요인원·경력 (RosterConfig)**\n"
             "  • day_req / eve_req / nig_req — 각 시프트 기본 필요인원 (정수)\n"
-            "  • off_days — 월 오프 일수 (정수)\n\n"
+            "  • off_days — 월 오프 일수 (정수)\n"
+            "  • min_exp_per_shift — 교대당 필요한 최소 경력 '연수' (정수, 예 3 = 3년차 이상). ⚠️ 사람 '수'가 아니라 '연차'.\n"
+            "  • req_exp_nurses — 교대당 필요한 경력 간호사 '수' (정수). ⚠️ 위 min_exp_per_shift(연차)와 구분.\n\n"
             "[B] **연속·휴무 규칙**\n"
             "  • max_nig_per_month — 월 야간 최대 횟수 (정수)\n"
             "  • max_conseq_work — 연속 근무 최대 일수 (정수)\n"
@@ -541,10 +543,14 @@ SKILL_TOOLS: list[dict] = [
             "  • two_offs_after_three_nig / two_offs_after_two_nig — 야간 후 2일 휴무 (bool)\n"
             "  • two_offs_per_week — 주 2회 오프 보장 (bool)\n"
             "  • banned_day_after_eve — 이브닝 다음날 데이 금지 (bool)\n"
+            "  • not_one_night — 단발성 야간(하루짜리 N) 금지 (bool)\n"
+            "  • nod_noe — 야간 다음 데이/이브닝(N→O→D/E) 패턴 최소화 (bool)\n"
+            "  • ban_night_before_fixed_off — 고정 오프 전날 야간 금지 (bool)\n"
             "  • sequential_offs — 오프 연속 배치 선호 (bool)\n"
             "  • even_nights — 야간 균등 배분 (bool)\n\n"
             "[C] **구조 정책**\n"
             "  • preceptee_on — 프리셉터-프리셉티 매칭 활성 (bool)\n"
+            "  • preceptee_shift_count — 프리셉티를 시프트 필요인원 카운트에 포함 (bool, preceptee_on=true 일 때만 유효)\n"
             "  • team_balance_enable / team_balance_gauge — 팀 밸런스 활성/강도(0~10)\n\n"
             "[D] **시프트 슬롯별 인원 (ShiftManage)** — 슬롯 단위 미세 조정\n"
             "  • field='manpower' + nurse_class('RN'/'AN') + shift_slot(정수) + value=정수\n"
@@ -564,6 +570,10 @@ SKILL_TOOLS: list[dict] = [
             "- '팀 밸런스 켜줘' → field='team_balance_enable', value=true\n"
             "- '팀 밸런스 강도 7' → field='team_balance_gauge', value=7\n"
             "- '데이 필요인원 4명' → field='day_req', value=4\n"
+            "- '시프트당 3년차 이상 경력자 필수' → field='min_exp_per_shift', value=3\n"
+            "- '교대마다 경력 간호사 2명은 있어야 해' → field='req_exp_nurses', value=2\n"
+            "- '단발 나이트 금지' → field='not_one_night', value=true\n"
+            "- '고정 오프 전날 나이트 빼줘' → field='ban_night_before_fixed_off', value=true\n"
             "- 'RN 데이 1슬롯 인원 5명' → field='manpower', nurse_class='RN', shift_slot=1, value=5\n\n"
 
             "⛔ 거절 예시 (update_person_attr 영역):\n"
@@ -847,6 +857,163 @@ SKILL_TOOLS: list[dict] = [
                 },
             },
             "required": ["nurse_ids", "year", "month"],
+        },
+    },
+    {
+        "name": "manage_grade",
+        "description": (
+            "병동의 **등급(grade)별 근무 정책**을 조회·수정합니다. 등급은 간호사의 역량 레벨이며, "
+            "근무표 생성 시 '특정 시프트에 특정 등급을 몇 명 배치할지'를 결정합니다.\n\n"
+
+            "─────────── 무엇을 다루나 ───────────\n"
+            "1) **등급별 최소 인원** — '나이트에 시니어 최소 2명'처럼 시프트마다 등급별 하한.\n"
+            "2) **등급별 최대 인원(anti-pair)** — '야간에 1년차는 최대 1명'처럼 상한.\n"
+            "3) **제약 완화(soft) 여부** — 등급 정원 때문에 근무표가 안 짜질 때 완화할지(soft) "
+            "엄격히 지킬지(hard). '등급 때문에 표가 안 나오면 좀 느슨하게' → 완화. '등급 꼭 지켜줘' → 엄격.\n"
+            "4) **등급 이름** — 등급 번호에 표시 이름 부여. '1등급을 주니어로'.\n\n"
+
+            "⚠️ 적용 시점: 다음 근무표 생성부터 반영. 이미 확정된 근무표는 자동으로 바뀌지 않음.\n"
+            "⚠️ 변경(set_*)은 preview_only=true(기본)로 먼저 미리보기 → 사용자 동의 후 적용.\n"
+            "⛔ **조회(read)를 포함한 모든 작업이 수간호사(HN)·관리자(ADM) 전용**입니다. "
+            "등급(역량) 정보는 일반 간호사에게 노출되어선 안 되는 민감 정보이므로 권한 없는 요청은 거부됩니다.\n"
+            "⛔ **사용자에게 등급 '번호'나 내부 JSON 을 노출하지 마세요. 항상 등급 '이름'으로 말하세요.** "
+            "등급 이름이 설정돼 있지 않으면 스킬이 재질의합니다.\n"
+            "⛔ 아직 등급에 **위계(순서)가 없습니다.** '맨 위 등급', '제일 높은 등급' 같은 표현은 "
+            "임의로 해석하지 말고, 어떤 등급인지 사용자에게 되물으세요.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 개인의 야간전담/고정근무 등 **한 사람 속성** → update_person_attr\n"
+            "- 시프트 전체 필요인원(day_req 등)·연속근무·팀밸런스 등 **등급 무관 정책** → update_constraint\n"
+            "- 단순 현재 등급 설정 **조회만** → operation='read'\n\n"
+
+            "─────────── operation 별 파라미터 ───────────\n"
+            "[read] 현재 등급 정책 조회 (파라미터 없음).\n"
+            "[set_requirement] 등급별 인원 설정. shift_name(자연어 '나이트/데이/이브닝/미드') + "
+            "grade_name(등급 이름, 예 '시니어') + min_count 와/또는 max_count.\n"
+            "  · '최소 인원 제한 없애줘' → min_count=0.  '최대 인원 제한 없애줘' → max_count=-1.\n"
+            "[set_soft_fallback] soft_enabled=true(완화) / false(엄격).\n"
+            "[set_grade_name] target_grade_name(기존 이름 또는 번호) + new_name.\n\n"
+
+            "─────────── 예시 (입력 → operation/파라미터) ───────────\n"
+            "- '나이트에 시니어 최소 2명은 꼭 넣어줘' → set_requirement, shift_name='나이트', grade_name='시니어', min_count=2\n"
+            "- '데이에 신규 한 명은 있어야 해' → set_requirement, shift_name='데이', grade_name='신규', min_count=1\n"
+            "- '야간에 1년차는 최대 1명만' → set_requirement, shift_name='나이트', grade_name='1년차', max_count=1\n"
+            "- '나이트 시니어 최소 2명, 최대 3명' → set_requirement, shift_name='나이트', grade_name='시니어', min_count=2, max_count=3\n"
+            "- '등급 때문에 근무표가 안 짜지면 좀 느슨하게 해줘' → set_soft_fallback, soft_enabled=true\n"
+            "- '등급 제약 꼭 지켜줘' → set_soft_fallback, soft_enabled=false\n"
+            "- '등급별 인원 설정 어떻게 돼있어?' → read\n"
+            "- '1등급을 주니어로 바꿔줘' → set_grade_name, target_grade_name='1', new_name='주니어'\n"
+            "- '맨 위 등급한테 나이트 몰아줘' → (위계 없음) 어떤 등급인지 사용자에게 되물을 것\n"
+            "- '시니어 좀 더 넣어줘' → (수량 모호) 몇 명으로 할지 되물을 것"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["read", "set_requirement", "set_soft_fallback", "set_grade_name"],
+                    "description": "수행할 작업. 조회=read, 인원 설정=set_requirement, 완화 토글=set_soft_fallback, 이름 설정=set_grade_name.",
+                },
+                "shift_name": {
+                    "type": "string",
+                    "description": "set_requirement 시 대상 근무. 자연어 '데이/이브닝/나이트/미드'.",
+                },
+                "grade_name": {
+                    "type": "string",
+                    "description": "set_requirement 시 대상 등급의 이름(예 '시니어'). 등급 번호도 가능.",
+                },
+                "min_count": {
+                    "type": "integer",
+                    "description": "등급별 최소 인원. 제한 해제는 0.",
+                },
+                "max_count": {
+                    "type": "integer",
+                    "description": "등급별 최대 인원(anti-pair). 제한 없음은 -1.",
+                },
+                "soft_enabled": {
+                    "type": "boolean",
+                    "description": "set_soft_fallback 시 true=완화(soft) / false=엄격(hard).",
+                },
+                "target_grade_name": {
+                    "type": "string",
+                    "description": "set_grade_name 시 이름을 바꿀 대상 등급(기존 이름 또는 번호).",
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "set_grade_name 시 새 표시 이름.",
+                },
+                "preview_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "true 면 변경 미리보기만(DB 미적용). 사용자 동의 후 false 로 적용.",
+                },
+            },
+            "required": ["operation"],
+        },
+    },
+    {
+        "name": "manage_team_min",
+        "description": (
+            "**팀별 시프트 최소 인원**(특정 팀이 각 근무에 매일 최소 몇 명)을 조회·수정합니다. "
+            "예: 'A팀은 나이트에 최소 2명은 있어야 해'.\n\n"
+
+            "─────────── 무엇을 다루나 ───────────\n"
+            "- 팀별 시프트 최소 인원 **조회** (operation='read')\n"
+            "- 팀별 시프트 최소 인원 **설정** (operation='set_min')\n"
+            "- 특정 시프트(또는 팀 전체) 최소 인원 **해제** (operation='clear_min')\n\n"
+
+            "⚠️ 적용 시점: 다음 근무표 생성부터 반영.\n"
+            "⚠️ 변경(set_min/clear_min)은 preview_only=true(기본)로 미리보기 → 사용자 동의 후 적용.\n"
+            "⛔ **조회(read) 포함 모든 작업이 수간호사(HN)·관리자(ADM) 전용**입니다. 권한 없는 요청은 거부됩니다.\n"
+            "⛔ 사용자에게 팀 내부 id·JSON 을 노출하지 마세요. 항상 팀 '이름'으로 말하세요.\n\n"
+
+            "─────────── 인접 스킬과의 경계 (혼동 주의) ───────────\n"
+            "- '팀 밸런스(팀 간 균형)를 켜라/강도' → **update_constraint** (team_balance_enable / team_balance_gauge). "
+            "이건 '한 팀의 최소 인원'이 아니라 '팀들 사이 균형 정책'이라 다른 스킬.\n"
+            "- '간호사를 어느 팀에 배정/이동' → 팀 멤버 관리(이 스킬 아님).\n"
+            "- 등급별 최소 인원 → manage_grade.\n"
+            "- 시프트 전체 필요인원(병동 day_req 등) → update_constraint.\n"
+            "- 팀별 최소 인원 **조회·설정**만 이 스킬.\n\n"
+
+            "─────────── 그라운딩 ───────────\n"
+            "- 팀은 이름 그대로 team_name 에 ('A팀','1팀'). 스킬이 내부에서 팀을 찾습니다. 못 찾으면 재질의.\n"
+            "- 시프트는 자연어 shift_name 에 ('데이/이브닝/나이트/미드') → 내부 D/E/N/M 변환.\n"
+            "- 한 번에 한 팀씩. '전 팀 일괄'은 팀 목록을 먼저 read 한 뒤 팀별로 처리.\n\n"
+
+            "─────────── 예시 ───────────\n"
+            "- 'A팀은 데이에 최소 2명' → set_min, team_name='A팀', shift_name='데이', min_count=2\n"
+            "- '1팀 나이트 최소 1명으로' → set_min, team_name='1팀', shift_name='나이트', min_count=1\n"
+            "- 'B팀 이브닝 최소 인원 제한 없애줘' → clear_min, team_name='B팀', shift_name='이브닝'\n"
+            "- 'A팀 최소 인원 다 풀어줘' → clear_min, team_name='A팀' (shift_name 생략 = 전체 해제)\n"
+            "- '팀별 최소 인원 어떻게 돼있어?' → read\n"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["read", "set_min", "clear_min"],
+                    "description": "조회=read, 최소 인원 설정=set_min, 해제=clear_min.",
+                },
+                "team_name": {
+                    "type": "string",
+                    "description": "대상 팀 이름 (예 'A팀', '1팀').",
+                },
+                "shift_name": {
+                    "type": "string",
+                    "description": "대상 근무 자연어 ('데이/이브닝/나이트/미드'). clear_min 에서 생략하면 팀 전체 해제.",
+                },
+                "min_count": {
+                    "type": "integer",
+                    "description": "set_min 시 최소 인원 (0 이상 정수).",
+                },
+                "preview_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "true 면 변경 미리보기만(DB 미적용). 사용자 동의 후 false 로 적용.",
+                },
+            },
+            "required": ["operation"],
         },
     },
 ]

@@ -223,6 +223,8 @@ _MUTATION_SKILLS = frozenset({
     "update_person_attr",
     "generate_schedule",
     "update_monthly_limit",
+    "manage_grade",
+    "manage_team_min",
 })
 
 _SELF_REFERENCE_ALIASES = ("나", "내", "제", "본인")
@@ -254,6 +256,15 @@ def _check_permission(
     # (4) 다른 간호사의 월 한도 설정
     if normalized == "update_monthly_limit" and not is_hn:
         return "다른 간호사의 월 한도 설정은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (1b) 등급 정책 — 조회·변경 모두 HN/ADM 전용.
+    # 등급(역량) 정보는 일반 간호사에게 노출되어선 안 되는 민감 정보.
+    if normalized == "manage_grade" and not is_hn:
+        return "등급 정책 조회·변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (1c) 팀 최소 인원 — 조회·변경 모두 HN/ADM 전용.
+    if normalized == "manage_team_min" and not is_hn:
+        return "팀 최소 인원 조회·변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
 
     # (2) bulk_mutation 의 ward-wide action
     if normalized == "bulk_mutation" and not is_hn:
@@ -294,6 +305,8 @@ def _inject_context(args: dict, ctx: SessionContext) -> dict:
     args.setdefault("office_id", ctx.office_id)
     args.setdefault("year", ctx.year)
     args.setdefault("month", ctx.month)
+    # 변경 주체 (audit / updated_by 용). mutation skill 이 참조.
+    args.setdefault("acting_user_id", ctx.nurse_id)
 
     # "나/내/제/본인" → current user
     if args.get("nurse_name") in ("나", "내", "제", "본인"):
