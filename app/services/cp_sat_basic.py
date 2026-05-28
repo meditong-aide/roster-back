@@ -1404,8 +1404,10 @@ class CPSATBasicEngine:
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
             setattr(roster_system, "_used_fallback", False)
-            if os.getenv("SKIP_PRIMARY") == "1":
-                print(f"{self.logger_prefix} [Config] SKIP_PRIMARY=1 → primary 스킵, 바로 폴백")
+            # default: primary 스킵 후 바로 폴백 (검증: fix fallback 과 함께 9B/ICU/NA-LP
+            # 10런 coverage 0/10, 시간 -54~61%, 원티드 100% 유지). primary 강제는 SKIP_PRIMARY=0.
+            if os.getenv("SKIP_PRIMARY", "1") != "0":
+                print(f"{self.logger_prefix} [Config] primary 스킵(default), 바로 폴백 (해제: SKIP_PRIMARY=0)")
                 success = False
             else:
                 success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)

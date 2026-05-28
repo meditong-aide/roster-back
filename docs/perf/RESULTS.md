@@ -48,7 +48,24 @@ lex 2/3-pass 가 같은 solver `s2` 를 **warm-start 없이 cold 로 2초만 재
 RUN_TAG=fix_icu_v1 python tools/run_june_gen_icu.py   # ICU
 RUN_TAG=fix_9b_v1  python tools/run_june_gen_9b.py    # 9B
 # baseline 격리: AC stash + git checkout 8c79576~1 -- app/services/cp_sat/fallback_lex.py
+# 원티드 병동: GROUP_ID=101358af4a2e MONTH=6 OUT_DIR=debug_nalp RUN_TAG=nalp_A_v1 python tools/run_june_gen_group.py
 ```
+
+### 9-7. A+C(SKIP_PRIMARY) 재검증 — fix 적용 후
+
+fix 이후 A+C(primary 스킵)가 A 대비 어떤지 10런 재측정. 깨진 fallback 시절의 "A+C coverage 위험"은 fallback 버그였지 C 자체가 아니었음을 확인.
+
+| 병동 | 구성 | cov 실패 | OFF_ex | 시간 절약 | wanted 충족 |
+|---|---|---|---|---|---|
+| 9B (14명) | A+C+fix | 0/10 | 0.00 | -59% (38.7→15.7s) | — |
+| ICU (28명) | A+C+fix | 0/10 | 2.30 (A는 4.40) | -54% (51.6→23.5s) | — |
+| **NA/LP (18명, 고정 66셀)** | A+C+fix | 0/10 | 2.10 | -61% (37.7→14.8s) | **100% (10/10런, min 100%)** |
+
+→ 세 병동 모두 A+C+fix 가 coverage·품질 동급↑ + 시간 -54~61%. **원티드 병동(NA/LP)에서 하드고정 66셀 100% 보존** — primary 스킵해도 원티드 안 깨짐 (하드 고정은 최적화 전 pre-place 라 경로 무관).
+
+### 9-8. SKIP_PRIMARY default-ON 승격
+§9-7 근거로 `SKIP_PRIMARY` 를 **default ON**(primary 스킵이 기본)으로 전환. primary 강제는 `SKIP_PRIMARY=0`.
+**잔여 리스크**: 스코어형 소프트 선호(`nurse_shift_requests`)가 많은 병동은 미검증(실데이터상 희박). fallback stage3 가 선호 처리는 하나 primary 와의 parity 는 추후 확인. 문제 시 `SKIP_PRIMARY=0` 또는 revert.
 
 ---
 
