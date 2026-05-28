@@ -4631,6 +4631,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         print(f"[Assignment] id={_a.id}, nurse_id={_a.nurse_id}, reason={_a.reason}, source={_a.source_group_id}, target={_a.target_group_id}, start={_a.start_date}, end={_a.end_date}")
     # ── 인바운드: source/target 독립 생성 — 모든 인바운드를 엔진에 추가 ──
     _inbound_assignments = []
+    _outbound_assignments = []
     for a in _assignments:
         if a.reason not in ("파견", "병동이동"):
             continue
