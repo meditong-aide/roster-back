@@ -6,6 +6,7 @@ from ortools.sat.python import cp_model
 
 from services.cp_sat.hardcoded_weights import (
     FALLBACK_EXPERIENCE_SHORT_PENALTY,
+    ISOLATED_WORK_PENALTY,
     N_ONLY_NIGHT_BONUS,
     PREFER_3N_BLOCK_PENALTY,
     PREFERENCE_SCORE_SCALE,
@@ -317,6 +318,26 @@ def build_fallback_stage3_objective_terms(
                             viol = m.NewIntVar(0, 1, f"max_same_shift_fb_{code}_{n}_{d0}")
                             m.Add(viol >= sum_s - 3)
                             obj.append(-w_ms * viol)
+    except Exception:
+        pass
+
+    # 고립 근무 (O W O: OFF 사이 단일 근무 "퐁당퐁당") soft — N 제외(not_one_night 별도 관리).
+    # 경계일(d=T0/T1)은 양옆 OFF 확인 불가라 자연히 제외(range(T0+1, T1)).
+    try:
+        if bool(getattr(cfg, "sequential_offs", True)) and "O" in cfg.shift_types:
+            _iw_off = cfg.shift_types.index("O")
+            _iw_has_n = "N" in cfg.shift_types
+            _iw_night = cfg.shift_types.index("N") if _iw_has_n else None
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                for d in range(T0 + 1, T1):
+                    _iw_mid = 1 - X(n, d, _iw_off) - (X(n, d, _iw_night) if _iw_has_n else 0)
+                    _iw = m.NewBoolVar(f"isow_fb_{n}_{d}")
+                    m.Add(_iw <= X(n, d - 1, _iw_off))
+                    m.Add(_iw <= X(n, d + 1, _iw_off))
+                    m.Add(_iw <= _iw_mid)
+                    m.Add(_iw >= X(n, d - 1, _iw_off) + X(n, d + 1, _iw_off) + _iw_mid - 2)
+                    obj.append(-ISOLATED_WORK_PENALTY * _iw)
     except Exception:
         pass
 

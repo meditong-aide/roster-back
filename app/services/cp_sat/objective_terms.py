@@ -10,6 +10,7 @@ from services.cp_sat.hardcoded_weights import (
     EXPERIENCE_SHORT_PENALTY,
     FALLBACK_COVERAGE_SHORT_WEIGHT,
     ISOLATED_OFF_PENALTY,
+    ISOLATED_WORK_PENALTY,
     NIGHT_DEVIATION_PENALTY,
     NOD_NOE_PENALTY,
     N_ONLY_NIGHT_BONUS,
@@ -1149,6 +1150,21 @@ def build_main_objective_terms(
                 m.Add(iso <= 1 - X(n, d - 1, off))
                 m.Add(iso <= 1 - X(n, d + 1, off))
                 obj.append(-ISOLATED_OFF_PENALTY * iso)
+
+    # (4-5c) 고립 근무 (O W O: 단일 근무가 OFF 사이에 낀 "퐁당퐁당") — N 제외.
+    # 단일 N(O N O)은 not_one_night(1N 금지)이 별도 관리하고 n_max==1 면제와 충돌하므로 제외.
+    if getattr(cfg, "sequential_offs", True):
+        _has_night = "N" in cfg.shift_types
+        for n in range(N):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                # mid_work = D/E/M 근무 (off도 아니고 night도 아님)
+                mid_work = 1 - X(n, d, off) - (X(n, d, night) if _has_night else 0)
+                isw = m.NewIntVar(0, 1, f"isow_{n}_{d}")
+                m.Add(isw <= X(n, d - 1, off))
+                m.Add(isw <= X(n, d + 1, off))
+                m.Add(isw <= mid_work)
+                m.Add(isw >= X(n, d - 1, off) + X(n, d + 1, off) + mid_work - 2)
+                obj.append(-ISOLATED_WORK_PENALTY * isw)
 
     # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
     if getattr(cfg, "sequential_offs", True):
