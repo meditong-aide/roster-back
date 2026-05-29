@@ -42,6 +42,19 @@ def gaps_under(path, target):
                 median=(statistics.median(mins) if mins else None))
 
 
+def shift_ranges(path):
+    """간호사 간 시프트 횟수 편차(range=max-min). D/E는 KLD soft만 관리(lex 고정 X)라 watchlist 대상."""
+    d = json.load(open(path, encoding="utf-8"))
+    out = {}
+    for code in ("D", "E", "N", "O"):
+        cnts = []
+        for nu in d.get("nurses", []):
+            s = [str(x).upper() for x in (nu.get("schedule") or [])]
+            cnts.append(s.count(code))
+        out[code] = (max(cnts) - min(cnts)) if cnts else None
+    return out
+
+
 _RESP = re.compile(r"\[RosterGenerate\]\[response\] HTTP (\d+), severity=(\S+), .*violations=(\{.*\})")
 _OFFQ = re.compile(r"\[Stage3 위반\] off_quota_excess = (\d+)")
 _OFFRANGE = re.compile(r"lex 2-pass \(OFF range\): status=\S+ range=(\d+)")
@@ -99,6 +112,21 @@ def main():
     if unders:
         print(f"  ── n2n 요약: under(<{target}) avg={statistics.mean(unders):.1f} min={min(unders)} max={max(unders)} | "
               f"deficit avg={statistics.mean(deficits):.1f} | worst-gap전체={min(worsts) if worsts else '-'} | median중앙={statistics.median(medians) if medians else '-'}")
+
+    # 시프트별 사람 간 편차(range). N/OFF는 lex로 고정(~1/0), D/E는 KLD soft만이라 큼 — 회귀 감시 대상.
+    rng_agg = {c: [] for c in "DENO"}
+    for p in jsons:
+        r = shift_ranges(p)
+        for c in "DENO":
+            if r[c] is not None:
+                rng_agg[c].append(r[c])
+    if any(rng_agg.values()):
+        parts = []
+        for c in "DENO":
+            v = rng_agg[c]
+            if v:
+                parts.append(f"{c}range avg={statistics.mean(v):.1f}(max{max(v)})")
+        print("  ── 시프트 균등(range, 작을수록 균등): " + " | ".join(parts))
 
     if logs:
         print(f"  ── 회귀/품질 (logs n={len(logs)}):")
