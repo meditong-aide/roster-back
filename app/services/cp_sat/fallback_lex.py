@@ -2996,6 +2996,56 @@ def optimize_fallback_lex_hard_first(
                                             f"status={_cp_sat_status_to_text(st2_n)} "
                                             f"range={best_n_range}"
                                         )
+                                        # H1 4-pass: N 블록 간 간격(n2n) deficit 최소화.
+                                        # 안전·OFF range·N range 를 동결한 뒤, 그 품질을 깨지 않는
+                                        # 범위에서만 야간 간격(target 미만)을 벌린다. soft 항은 KLD에
+                                        # 눌려 무시되므로 lex 우선순위로 끌어올린다.
+                                        _n2n_tgt = int(getattr(cfg, "n_to_n_interval_target", 0) or 0)
+                                        if _n2n_tgt >= 2:
+                                            try:
+                                                m2.Add(max_n_lex - min_n_lex <= best_n_range)
+                                                _n2n_terms = []
+                                                for _n in range(N):
+                                                    if leave[_n] < join[_n]:
+                                                        continue
+                                                    _aset = set(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                                                    for _d1 in sorted(_aset):
+                                                        for _gap in range(2, _n2n_tgt):
+                                                            _d2 = _d1 + _gap
+                                                            if _d2 not in _aset:
+                                                                continue
+                                                            _btw = [_d1 + _k for _k in range(1, _gap)]
+                                                            if any(_b not in _aset for _b in _btw):
+                                                                continue
+                                                            _pair = m2.NewBoolVar(f"lex_n2n_{_n}_{_d1}_{_d2}")
+                                                            m2.Add(_pair <= X2(_n, _d1, night_idx_h1))
+                                                            m2.Add(_pair <= X2(_n, _d2, night_idx_h1))
+                                                            for _b in _btw:
+                                                                m2.Add(_pair <= 1 - X2(_n, _b, night_idx_h1))
+                                                            _btw_sum = sum(X2(_n, _b, night_idx_h1) for _b in _btw)
+                                                            m2.Add(_pair >= X2(_n, _d1, night_idx_h1) + X2(_n, _d2, night_idx_h1) - 1 - _btw_sum)
+                                                            _n2n_terms.append((_n2n_tgt - _gap) * _pair)
+                                                if _n2n_terms:
+                                                    m2.Minimize(sum(_n2n_terms))
+                                                    import os as _os
+                                                    _n2n_frac = float(_os.getenv("N2N_LEX_TIME_FRAC", "0.5"))
+                                                    s2.parameters.max_time_in_seconds = max(8.0, float(tl2) * _n2n_frac)
+                                                    _hint_lex_solution()
+                                                    st2_n2n = s2.Solve(m2)
+                                                    if st2_n2n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                                        _capture_lex_solution()
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
+                                                            f"status={_cp_sat_status_to_text(st2_n2n)} "
+                                                            f"deficit={int(s2.ObjectiveValue())}"
+                                                        )
+                                                    else:
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
+                                                            f"status={_cp_sat_status_to_text(st2_n2n)} — 3rd 결과 유지"
+                                                        )
+                                            except Exception as _n2n_e:
+                                                print(f"{logger_prefix} 폴백2 lex 4-pass 예외: {_n2n_e}")
                                     else:
                                         print(
                                             f"{logger_prefix} 폴백2 lex 3-pass (N range): "

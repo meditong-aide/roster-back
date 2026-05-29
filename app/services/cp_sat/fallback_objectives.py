@@ -320,7 +320,8 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
-    # N 블록 종료 → 다음 N 블록 시작 간격 soft (대칭, target=10일)
+    # N 블록 종료 → 다음 N 블록 시작 간격 soft (한쪽, target=10일)
+    # 간격이 target보다 *짧을* 때만 벌점. 더 멀면 휴식이 충분하므로 벌하지 않는다.
     try:
         n2n_target = int(getattr(cfg, "n_to_n_interval_target", 0) or 0)
         n2n_w = int(getattr(cfg, "n_to_n_interval_penalty_weight", 0) or 0)
@@ -332,8 +333,8 @@ def build_fallback_stage3_objective_terms(
                 for d1 in range(T0, T1):
                     for d2 in range(d1 + 2, min(d1 + n2n_win + 1, T1 + 1)):
                         gap = d2 - d1
-                        dist = abs(gap - n2n_target)
-                        if dist == 0:
+                        deficit = n2n_target - gap
+                        if deficit <= 0:
                             continue
                         pair = m.NewBoolVar(f"n2n_fb_{n}_{d1}_{d2}")
                         m.Add(pair <= X(n, d1, n_idx))
@@ -342,7 +343,7 @@ def build_fallback_stage3_objective_terms(
                             m.Add(pair <= 1 - X(n, k, n_idx))
                         between_sum = sum(X(n, k, n_idx) for k in range(d1 + 1, d2))
                         m.Add(pair >= X(n, d1, n_idx) + X(n, d2, n_idx) - 1 - between_sum)
-                        obj.append(-n2n_w * dist * pair)
+                        obj.append(-n2n_w * deficit * pair)
     except Exception:
         pass
 
