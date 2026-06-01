@@ -1,0 +1,171 @@
+"""간호사 attribute의 시점-effective 값 lookup 헬퍼.
+
+핵심 룰:
+- 활성 `NurseAssignment` row가 as_of 시점에 효력 있으면 그 `target_*` 값 우선
+- 그렇지 않으면 `Nurse` 테이블 값 폴백
+
+활성 조건:
+    status='active' AND start_date <= as_of AND (end_date IS NULL OR as_of <= end_date)
+
+여러 row 활성 시: 가장 최근 `start_date` 우선 (Phase 1.4에서 kind 도입 후 더 정밀화 예정).
+
+참조: docs/NURSE_GROUP_CHANGE_MODEL.md §1, §9.
+"""
+from __future__ import annotations
+
+from datetime import date
+from typing import Any, Iterable
+
+from sqlalchemy.orm import Session
+
+from db.models import Nurse, NurseAssignment
+
+
+# attr 이름 → NurseAssignment의 target_* 컬럼 매핑.
+# kind/payload 컬럼 추가 전이라 기존 target_* 컬럼만 사용 (Phase 1.4 이후 payload JSON 병용 예정).
+_ATTR_TO_TARGET_COL: dict[str, str] = {
+    "group_id": "target_group_id",
+    "team_id": "target_team_id",
+    "grade": "target_grade",
+    "is_weekend_off": "target_weekly_off_enabled",  # TINYINT 0/1
+    "allowed_shifts": "target_shift_types",         # JSON list
+    "fixed_shift": "target_fixed_shift",
+    "wanted_max_requests": "target_wanted_max_requests",
+}
+
+# Nurse 테이블엔 있지만 NurseAssignment target_*에 매핑이 없는 attr (현재 폴백만)
+_NURSE_ONLY_ATTRS: set[str] = {
+    "is_night_nurse",
+    "active",
+    "name",
+    "account_id",
+    "experience_years",
+    "office_id",
+    "original_group_id",
+}
+
+
+def get_active_assignment(
+    db: Session,
+    nurse_id: str,
+    as_of: date,
+) -> NurseAssignment | None:
+    """as_of 시점에 활성인 `NurseAssignment` row 1건 반환.
+
+    여러 활성 row가 있으면 가장 최근 `start_date` 우선.
+    """
+    return (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == nurse_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.start_date <= as_of,
+            (
+                (NurseAssignment.end_date.is_(None))
+                | (NurseAssignment.end_date >= as_of)
+            ),
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .first()
+    )
+
+
+def get_active_assignments_batch(
+    db: Session,
+    nurse_ids: Iterable[str],
+    as_of: date,
+) -> dict[str, NurseAssignment]:
+    """여러 nurse의 활성 assignment를 한 번에 조회 (N+1 방지).
+
+    각 nurse_id에 대해 가장 최근 start_date 활성 row 1건만 dict로 반환.
+    """
+    nurse_ids = list(nurse_ids)
+    if not nurse_ids:
+        return {}
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id.in_(nurse_ids),
+            NurseAssignment.status == "active",
+            NurseAssignment.start_date <= as_of,
+            (
+                (NurseAssignment.end_date.is_(None))
+                | (NurseAssignment.end_date >= as_of)
+            ),
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .all()
+    )
+    out: dict[str, NurseAssignment] = {}
+    for r in rows:
+        # 같은 nurse_id의 첫 row(가장 최근 start_date)만 유지
+        if r.nurse_id not in out:
+            out[r.nurse_id] = r
+    return out
+
+
+def get_nurse_effective_attr(
+    db: Session,
+    nurse: Nurse,
+    attr: str,
+    as_of: date,
+    *,
+    _assignment_cache: NurseAssignment | None | object = ...,  # 내부 캐싱용
+) -> Any:
+    """nurse의 attr 값을 as_of 시점 기준으로 반환.
+
+    1. NurseAssignment 활성 row가 있고 매핑된 target_* 값이 None이 아니면 → 그 값
+    2. 아니면 Nurse 테이블 attr 폴백
+
+    Args:
+        _assignment_cache: 호출자가 미리 조회한 NurseAssignment를 전달하면 재조회 안 함.
+                          명시적 None = "활성 assignment 없음을 안다" (조회 생략).
+    """
+    if attr in _ATTR_TO_TARGET_COL:
+        if _assignment_cache is ...:
+            assignment = get_active_assignment(db, nurse.nurse_id, as_of)
+        else:
+            assignment = _assignment_cache  # type: ignore[assignment]
+        if assignment is not None:
+            target_col = _ATTR_TO_TARGET_COL[attr]
+            val = getattr(assignment, target_col, None)
+            if val is not None:
+                return val
+    return getattr(nurse, attr, None)
+
+
+def apply_effective_attrs_to_nurse(
+    db: Session,
+    nurse: Nurse,
+    as_of: date,
+    *,
+    assignment: NurseAssignment | None | object = ...,
+    attrs: Iterable[str] | None = None,
+) -> Nurse:
+    """nurse 객체의 attribute들을 as_of 시점의 effective 값으로 in-place 갱신.
+
+    엔진 입력 빌더(Phase 1.2)에서 사용: 솔버에 넘기기 전 한 번 호출하면
+    솔버 본체는 `nurse.x`를 그대로 read해도 시점-effective 값을 봄.
+
+    Args:
+        assignment: 미리 조회된 활성 assignment (호출자가 batch로 가져와 넘기면 효율적).
+                    ... = 직접 조회, None = 활성 없음.
+        attrs: 적용할 attribute 화이트리스트. None이면 _ATTR_TO_TARGET_COL의 모든 키.
+
+    Returns:
+        in-place 갱신된 nurse (편의용 반환).
+    """
+    if assignment is ...:
+        assignment = get_active_assignment(db, nurse.nurse_id, as_of)
+    if assignment is None:
+        return nurse  # 활성 없음 → 폴백 그대로
+
+    targets = attrs if attrs is not None else _ATTR_TO_TARGET_COL.keys()
+    for attr in targets:
+        if attr not in _ATTR_TO_TARGET_COL:
+            continue
+        target_col = _ATTR_TO_TARGET_COL[attr]
+        val = getattr(assignment, target_col, None)
+        if val is not None:
+            setattr(nurse, attr, val)
+    return nurse
