@@ -80,10 +80,11 @@ def test_effective_attr_fallback_when_no_assignment(db):
 
 
 def test_effective_attr_override_when_active(db):
-    n = _mk_nurse(db, group_id=GID_A)
-    _mk_assignment(db, target=GID_B, start=date(2026, 5, 1))
-    val = get_nurse_effective_attr(db, n, "group_id", date(2026, 6, 1))
-    assert val == GID_B
+    # team_id 는 override 대상 (target_team_id). group_id 는 override 아님.
+    n = _mk_nurse(db, team_id=1)
+    _mk_assignment(db, target_team_id=7, start=date(2026, 5, 1))
+    val = get_nurse_effective_attr(db, n, "team_id", date(2026, 6, 1))
+    assert val == 7
 
 
 def test_effective_attr_empty_list_falls_back(db):
@@ -100,10 +101,18 @@ def test_effective_attr_empty_list_falls_back(db):
 
 def test_effective_attr_out_of_range_falls_back(db):
     """assignment 기간 밖이면 폴백."""
+    n = _mk_nurse(db, team_id=1)
+    _mk_assignment(db, target_team_id=7, start=date(2026, 7, 1))  # 미래
+    val = get_nurse_effective_attr(db, n, "team_id", date(2026, 6, 1))
+    assert val == 1
+
+
+def test_effective_group_id_never_overridden(db):
+    """group_id 는 override 대상 아님 — 활성 assignment 가 있어도 항상 Nurse 값."""
     n = _mk_nurse(db, group_id=GID_A)
-    _mk_assignment(db, target=GID_B, start=date(2026, 7, 1))  # 미래
+    _mk_assignment(db, target=GID_B, start=date(2026, 5, 1))  # target_group_id=B
     val = get_nurse_effective_attr(db, n, "group_id", date(2026, 6, 1))
-    assert val == GID_A
+    assert val == GID_A  # override 안 됨
 
 
 # ── 3. apply_effective_attrs_to_nurse ───────────────────────
@@ -117,10 +126,11 @@ def test_apply_skips_empty_list(db):
 
 
 def test_apply_applies_real_value(db):
-    n = _mk_nurse(db, group_id=GID_A)
-    a = _mk_assignment(db, target=GID_B)
+    n = _mk_nurse(db, team_id=1)
+    a = _mk_assignment(db, target_team_id=7)
     apply_effective_attrs_to_nurse(db, n, date(2026, 6, 1), assignment=a)
-    assert n.group_id == GID_B
+    assert n.team_id == 7
+    assert n.group_id == GID_A  # group_id 는 override 안 됨
 
 
 # ── 4. reconcile_nurse_attrs (빈 리스트 false-positive 회귀) ──
@@ -134,12 +144,12 @@ def test_reconcile_no_mismatch_for_empty_list(db):
 
 
 def test_reconcile_detects_real_mismatch(db):
-    """실제 불일치(Nurse.group != active transfer target)는 잡아야 한다."""
-    _mk_nurse(db, nurse_id="m1", group_id=GID_A)
-    _mk_assignment(db, nurse_id="m1", reason="병동이동", target=GID_B, start=date(2026, 5, 1))
+    """실제 불일치(Nurse.team_id != active assignment target_team_id)는 잡아야 한다."""
+    _mk_nurse(db, nurse_id="m1", team_id=1)
+    _mk_assignment(db, nurse_id="m1", reason="병동이동", target_team_id=7, start=date(2026, 5, 1))
     result = reconcile_nurse_attrs(db, as_of=date(2026, 6, 1))
     attrs = {m["attr"] for m in result["mismatches"] if m["nurse_id"] == "m1"}
-    assert "group_id" in attrs
+    assert "team_id" in attrs
 
 
 def test_reconcile_batch_lookup_latest(db):

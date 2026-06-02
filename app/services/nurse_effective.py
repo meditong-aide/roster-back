@@ -23,19 +23,36 @@ from db.models import Nurse, NurseAssignment
 
 # attr 이름 → NurseAssignment의 target_* 컬럼 매핑.
 # kind/payload 컬럼 추가 전이라 기존 target_* 컬럼만 사용 (Phase 1.4 이후 payload JSON 병용 예정).
+#
+# 권위 있는 출처: roster_create_service.py:4665~4671 inbound override 블록과 1:1 일치.
+# 엔진이 실제로 각 target_* 를 어느 Nurse 속성에 주입하는지를 그대로 반영한다.
+#   d['team_id']           = target_team_id
+#   d['grade']             = target_grade
+#   d['weekly_off_enabled']= target_weekly_off_enabled
+#   d['weekly_off_type']   = target_weekly_off_type      (런타임 주입 속성, 실컬럼 아님)
+#   d['weekly_off_weekday']= target_weekly_off_weekday
+#   d['is_night_nurse']    = target_shift_types           (허용 시프트 코드 리스트, []=전부 허용)
+#   d['fixed_shift']       = target_fixed_shift
+#
+# 의도적으로 제외된 것:
+#   - group_id: override 아님. 병동이동은 flush가 Nurse.group_id를 직접 바꾸고,
+#               파견은 본가 group_id 유지(엔진에 inbound로 추가). 별도 메커니즘.
+#   - is_weekend_off: target_is_weekend_off 컬럼 자체가 없음 → 항상 Nurse 폴백.
+#   - wanted_max_requests: target 컬럼은 있으나 inbound override가 주입하지 않음(엔진 미사용).
 _ATTR_TO_TARGET_COL: dict[str, str] = {
-    "group_id": "target_group_id",
     "team_id": "target_team_id",
     "grade": "target_grade",
-    "is_weekend_off": "target_weekly_off_enabled",  # TINYINT 0/1
-    "allowed_shifts": "target_shift_types",         # JSON list
+    "weekly_off_enabled": "target_weekly_off_enabled",
+    "weekly_off_type": "target_weekly_off_type",
+    "weekly_off_weekday": "target_weekly_off_weekday",
+    "is_night_nurse": "target_shift_types",
     "fixed_shift": "target_fixed_shift",
-    "wanted_max_requests": "target_wanted_max_requests",
 }
 
-# Nurse 테이블엔 있지만 NurseAssignment target_*에 매핑이 없는 attr (현재 폴백만)
+# Nurse 값만 보는 attr (NurseAssignment override 대상 아님 → 항상 폴백)
 _NURSE_ONLY_ATTRS: set[str] = {
-    "is_night_nurse",
+    "group_id",          # 병동이동 flush가 직접 변경 / 파견은 본가 유지
+    "is_weekend_off",    # target 컬럼 없음
     "active",
     "name",
     "account_id",
