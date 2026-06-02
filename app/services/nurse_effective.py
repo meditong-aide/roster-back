@@ -45,6 +45,23 @@ _NURSE_ONLY_ATTRS: set[str] = {
 }
 
 
+def _is_unset_override(val: Any) -> bool:
+    """target_* 값이 "미설정"인지 판정 — 폴백 여부 결정용.
+
+    None과 빈 컨테이너([], "", {})는 미설정 → Nurse 폴백.
+    단 0/False는 의미 있는 값(예: target_weekly_off_enabled=0 = 주말휴무 OFF)이라 설정으로 본다.
+
+    배경: target_shift_types 컬럼 기본값이 `[]`(default=list)라, 빈 리스트는
+    "모든 시프트 금지"가 아니라 "override 없음"을 뜻한다. 엔진도 `(... or [])` 패턴으로
+    None/[]를 동일하게 "제약 없음"으로 취급한다 (roster_create_service.py:3205).
+    """
+    if val is None:
+        return True
+    if isinstance(val, (list, dict, str)) and len(val) == 0:
+        return True
+    return False
+
+
 def get_active_assignment(
     db: Session,
     nurse_id: str,
@@ -129,7 +146,7 @@ def get_nurse_effective_attr(
         if assignment is not None:
             target_col = _ATTR_TO_TARGET_COL[attr]
             val = getattr(assignment, target_col, None)
-            if val is not None:
+            if not _is_unset_override(val):
                 return val
     return getattr(nurse, attr, None)
 
@@ -166,6 +183,6 @@ def apply_effective_attrs_to_nurse(
             continue
         target_col = _ATTR_TO_TARGET_COL[attr]
         val = getattr(assignment, target_col, None)
-        if val is not None:
+        if not _is_unset_override(val):
             setattr(nurse, attr, val)
     return nurse

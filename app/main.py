@@ -70,6 +70,7 @@ async def _daily_flush_scheduler():
                 flush_expired_preceptees,
                 flush_expired_dispatches,
                 flush_expired_leaves,
+                reconcile_nurse_attrs,
             )
             from services.nurse_service import flush_resigned_nurses
             count = flush_all_pending_transfers(db)
@@ -87,6 +88,13 @@ async def _daily_flush_scheduler():
             res_count = flush_resigned_nurses(db)
             if res_count > 0:
                 _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
+            # Nurses 캐시 vs NurseAssignment effective 값 정합성 점검 (read-only)
+            recon = reconcile_nurse_attrs(db)
+            if recon.get("mismatch_count", 0) > 0:
+                _scheduler_logger.warning(
+                    "[Scheduler] reconcile 불일치 %d건 (검사 %d명) — 자동 동기화 없음, 운영자 확인 필요",
+                    recon["mismatch_count"], recon["total_checked"],
+                )
         except Exception as e:
             _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
         finally:
