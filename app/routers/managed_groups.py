@@ -39,7 +39,9 @@ async def get_roster_create_summary(
     - latest_schedule_id / latest_version / latest_status: version DESC LIMIT 1
     - has_draft: status='draft' 가 1개 이상 존재
     - has_issued: status='issued' 가 1개 이상 존재
-    - schedule 미존재 시 latest_* 는 모두 null, has_* 는 false
+    - default_schedule_id: 첫 오픈 기본값. 마감(issued) 중 최신 우선, 없으면 전체 최신
+    - versions: 해당 월 전체 버전 목록 [{schedule_id, version, status}] (version DESC)
+    - schedule 미존재 시 latest_*/default_schedule_id 는 null, has_* 는 false, versions 는 []
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
@@ -88,6 +90,10 @@ async def get_roster_create_summary(
         has_draft = any((r.status or "") == "draft" for r in rows)
         has_issued = any((r.status or "") == "issued" for r in rows)
 
+        # 첫 오픈 기본값: 마감(issued) 중 최신 우선, 없으면 전체 최신
+        issued_rows = [r for r in rows if (r.status or "") == "issued"]
+        default = issued_rows[0] if issued_rows else latest
+
         data.append({
             "group_id": str(g.group_id),
             "group_name": str(g.group_name),
@@ -96,6 +102,15 @@ async def get_roster_create_summary(
             "latest_status": latest.status if latest else None,
             "has_draft": has_draft,
             "has_issued": has_issued,
+            "default_schedule_id": str(default.schedule_id) if default else None,
+            "versions": [
+                {
+                    "schedule_id": str(r.schedule_id),
+                    "version": int(r.version or 0),
+                    "status": r.status,
+                }
+                for r in rows
+            ],
         })
 
     return JSONResponse(

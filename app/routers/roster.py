@@ -1117,8 +1117,21 @@ async def get_schedule_versions(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    # 대상 그룹 결정: ADM(query 그대로) → HN multi-group managed → 본인 home group.
     if current_user.is_master_admin:
         target_group_id = group_id
+    elif current_user.is_head_nurse and current_user.group_id:
+        target_group_id = current_user.group_id
+        if group_id and str(group_id) != str(target_group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                )
     else:
         target_group_id = current_user.group_id
 
@@ -1133,7 +1146,6 @@ async def get_schedule_versions(
         .order_by(Schedule.version.desc())
         .all()
     )
-    print("[roster.py - get_schedule_versions] target_group_id", target_group_id)
 
     return [
         {
@@ -1167,6 +1179,17 @@ async def get_roster_for_month(
     # 대상 그룹 결정
     if current_user.is_head_nurse and current_user.group_id:
         target_group_id = current_user.group_id
+        # HN multi-group 통합보기: managed group 이면 param 허용, 아니면 403
+        if group_id and str(group_id) != str(target_group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                )
     else:
         # if not getattr(current_user, 'is_master_admin', False):
         #     raise HTTPException(status_code=403, detail="Permission denied")
@@ -1185,7 +1208,6 @@ async def get_roster_for_month(
                 status_code=403, detail="Group does not belong to your office"
             )
         target_group_id = g.group_id
-    print("target_group_id1", target_group_id)
     # Get latest issued schedule for the month
     schedule_info = (
         db.query(Schedule)
