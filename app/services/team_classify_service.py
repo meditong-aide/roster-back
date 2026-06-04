@@ -25,21 +25,43 @@ from services.team_auto_assign import NurseInput, auto_assign_teams
 _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
 
 
-def _load_pool_and_inputs(
-    db: Session, group_id: str, year: int, month: int
-) -> tuple[list[NurseModel], list[NurseInput]]:
-    """병동 간호사(풀) + auto_assign 입력 NurseInput 구성.
+def _is_night_only(n: NurseModel) -> bool:
+    return (n.is_night_nurse or []) == ["N"]
 
-    N전담(is_night_nurse==['N'])은 풀에서 제외.
-    off_days = 확정 원티드 OFF 일자, fb_days = 확정 원티드 연차(휴가 type) 일자.
+
+def _load_pool_and_inputs(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+    participant_ids: Optional[list[str]] = None,
+) -> tuple[list[NurseModel], list[NurseInput], list[NurseModel], list[NurseModel]]:
+    """참여 풀 + NurseInput + 미지정(미참여 적격) + 제외(N전담) 구성.
+
+    participant_ids 미지정 → 비 N전담 전원 참여(전체 재편), 미지정 없음.
+    participant_ids 지정 → 그 집합만 참여(클러스터링), 나머지 적격은 '미지정',
+      N전담도 participant_ids 에 있으면 참여(override, apply 시 해제 동반).
+    off_days = 확정 원티드 OFF, fb_days = 확정 원티드 연차(휴가 type).
     """
     nurses = (
         db.query(NurseModel)
         .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
         .all()
     )
-    # N전담 제외 (is_night_nurse 가 N 전용 리스트면 일반 팀 배정 대상 아님)
-    pool = [n for n in nurses if (n.is_night_nurse or []) != ["N"]]
+    if participant_ids is None:
+        pool = [n for n in nurses if not _is_night_only(n)]
+        unassigned: list[NurseModel] = []
+        excluded_night = [n for n in nurses if _is_night_only(n)]
+    else:
+        pset = set(participant_ids)
+        pool = [n for n in nurses if n.nurse_id in pset]
+        unassigned = [
+            n for n in nurses
+            if n.nurse_id not in pset and not _is_night_only(n)
+        ]
+        excluded_night = [
+            n for n in nurses if _is_night_only(n) and n.nurse_id not in pset
+        ]
 
     # 휴가 type shift_id 집합 (연차/FB 판별용) — 그룹 기준
     vacation_codes = {
@@ -83,7 +105,7 @@ def _load_pool_and_inputs(
         )
         for n in pool
     ]
-    return pool, inputs
+    return pool, inputs, unassigned, excluded_night
 
 
 def _current_team_ids(pool: list[NurseModel]) -> list[int]:
@@ -125,23 +147,39 @@ def _map_clusters_to_team_ids(
 
 
 def preview_team_classification(
-    db: Session, *, group_id: str, year: int, month: int
+    db: Session,
+    *,
+    group_id: str,
+    year: int,
+    month: int,
+    participant_ids: Optional[list[str]] = None,
 ) -> dict:
     """원티드 기반 팀 분류 미리보기 (read-only, DB 변경 없음).
 
-    Returns: {
-        target_month, num_teams, num_pool, num_excluded_night,
-        teams: {team_id: [nurse_id]}, changes: [{nurse_id, name, from, to}],
-        num_changed, stats: {objective, overlap_total, grade_dev_total},
-    }
+    participant_ids 지정 시 그 집합만 팀에 배치, 미참여 적격은 '미지정'.
+    N전담은 기본 제외(권장)이나 participant_ids 에 포함하면 참여(apply 시 해제 동반).
     """
-    pool, inputs = _load_pool_and_inputs(db, group_id, year, month)
+    pool, inputs, unassigned, excluded_night = _load_pool_and_inputs(
+        db, group_id, year, month, participant_ids
+    )
     if not pool:
-        raise ValueError("분류 대상 간호사가 없습니다.")
-    team_ids = _current_team_ids(pool)
+        raise ValueError("분류(참여) 대상 간호사가 없습니다.")
+    # 팀 목록은 그룹 전체 기준 (참여자만으로 좁히지 않음)
+    team_ids = sorted({
+        t for (t,) in db.query(NurseModel.team_id)
+        .filter(NurseModel.group_id == group_id, NurseModel.active == 1,
+                NurseModel.team_id.isnot(None))
+        .distinct()
+    })
     if not team_ids:
         raise ValueError("병동에 설정된 팀(team_id)이 없습니다.")
     num_teams = len(team_ids)
+    g1_count = sum(1 for n in pool if n.grade == 1)
+    if g1_count < num_teams:
+        raise ValueError(
+            f"참여 인원 중 시니어(G1) {g1_count}명 < 팀 수 {num_teams}. "
+            f"각 팀에 시니어가 가도록 참여 인원을 조정하세요."
+        )
 
     result = auto_assign_teams(inputs, num_teams=num_teams)
     current_team = {n.nurse_id: n.team_id for n in pool}
@@ -161,18 +199,17 @@ def preview_team_classification(
                     "from": cur, "to": tid,
                 })
 
-    excluded = [
-        {"nurse_id": n.nurse_id, "name": n.name}
-        for n in db.query(NurseModel)
-        .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
-        if (n.is_night_nurse or []) == ["N"]
-    ]
     return {
         "target_month": f"{year}-{month:02d}",
         "num_teams": num_teams,
         "num_pool": len(pool),
-        "num_excluded_night": len(excluded),
-        "excluded_night": excluded,
+        "num_excluded_night": len(excluded_night),
+        "excluded_night": [
+            {"nurse_id": n.nurse_id, "name": n.name} for n in excluded_night
+        ],
+        "unassigned": [
+            {"nurse_id": n.nurse_id, "name": n.name} for n in unassigned
+        ],
         "teams": {str(t): members for t, members in proposed.items()},
         "changes": changes,
         "num_changed": len(changes),
@@ -204,8 +241,8 @@ def apply_team_classification(
     비교는 반드시 str() 정규화로 한다 (안 그러면 무변경도 이벤트 생성됨).
     """
     effective = date(year, month, 1)
-    cur = {
-        n.nurse_id: n.team_id
+    cur_nurses = {
+        n.nurse_id: n
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id)
     }
 
@@ -219,15 +256,19 @@ def apply_team_classification(
     for a in assignments:
         nid = a["nurse_id"]
         new_team = a["team_id"]
-        if nid not in cur:
+        nurse = cur_nurses.get(nid)
+        if nurse is None:
             skipped += 1
             continue
-        if _same(cur[nid], new_team):
+        # N전담을 팀에 편입하면 N전담 해제 동반(is_night_nurse=[]) — 발효일 기반
+        is_n_override = (nurse.is_night_nurse or []) == ["N"]
+        if _same(nurse.team_id, new_team) and not is_n_override:
             skipped += 1
             continue
         create_permanent_change(
             db, nurse_id=nid, group_id=group_id, office_id=office_id,
             start_date=effective, new_team_id=new_team,
+            new_shift_types=[] if is_n_override else None,
             note=note or f"원티드 팀분류 {year}-{month:02d}",
         )
         created += 1

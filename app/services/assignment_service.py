@@ -1445,17 +1445,19 @@ def create_permanent_change(
     start_date: date,
     new_team_id: Optional[int] = None,
     new_grade: Optional[int] = None,
+    new_shift_types: Optional[list] = None,
     note: Optional[str] = None,
 ) -> NurseAssignment:
-    """병동 내 영구 속성변경(team/grade) 이벤트 생성.
+    """병동 내 영구 속성변경(team/grade/shift_types) 이벤트 생성.
 
     존재 이벤트(파견/병동이동)가 아니라 '속성 이벤트'다. 같은 병동 내 변경이므로
     source==target==group_id 이고, overlap·transfer 검증을 거치지 않는다.
-    되돌리기를 위해 payload 에 직전 값(prev_team_id/prev_grade)을 박아둔다.
+    되돌리기를 위해 payload 에 직전 값을 박아둔다.
+    new_shift_types: is_night_nurse(허용 shift 목록). N전담 해제 시 [] 전달.
     발효(start_date 도래)는 flush_pending_permanent_changes 가 처리한다.
     """
-    if new_team_id is None and new_grade is None:
-        raise HTTPException(status_code=400, detail="변경할 속성(team/grade)이 없습니다.")
+    if new_team_id is None and new_grade is None and new_shift_types is None:
+        raise HTTPException(status_code=400, detail="변경할 속성(team/grade/shift_types)이 없습니다.")
     nurse = (
         db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
     )
@@ -1473,7 +1475,12 @@ def create_permanent_change(
         status="active",
         target_team_id=new_team_id,
         target_grade=new_grade,
-        payload={"prev_team_id": nurse.team_id, "prev_grade": nurse.grade},
+        target_shift_types=new_shift_types,
+        payload={
+            "prev_team_id": nurse.team_id,
+            "prev_grade": nurse.grade,
+            "prev_shift_types": nurse.is_night_nurse,
+        },
         note=note,
     )
     db.add(row)
@@ -1516,6 +1523,9 @@ def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -
                 nurse.team_id = row.target_team_id
             if row.target_grade is not None:
                 nurse.grade = row.target_grade
+            # target_shift_types 지정 시 is_night_nurse 갱신 (N전담 해제 = [] 등)
+            if row.target_shift_types is not None:
+                nurse.is_night_nurse = row.target_shift_types
         row.status = "completed"
         row.end_date = today
         count += 1

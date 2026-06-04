@@ -42,7 +42,8 @@ def test_create_permanent_change_row(seed):
     assert row.source_group_id == row.target_group_id == "A"  # 병동 내
     assert row.status == "active"
     assert row.target_team_id == 3 and row.target_grade == 1
-    assert row.payload == {"prev_team_id": 1, "prev_grade": 2}  # 되돌리기용 직전값
+    # 되돌리기용 직전값 (prev_shift_types 포함)
+    assert row.payload["prev_team_id"] == 1 and row.payload["prev_grade"] == 2
 
 
 def test_create_requires_some_attr(seed):

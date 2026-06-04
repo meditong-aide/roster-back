@@ -114,3 +114,38 @@ def test_flush_applies_team_changes(ward):
     for nid, tid in proposed.items():
         nurse = db.query(Nurse).filter(Nurse.nurse_id == nid).first()
         assert nurse.team_id == tid
+
+
+def test_participant_subset_puts_others_in_unassigned(ward):
+    db = ward
+    # 일부만 참여(g1a,g1b 시드 + n1,n4) → 나머지 적격은 미지정, night는 제외
+    participants = ["g1a", "g1b", "n1", "n4"]
+    pv = preview_team_classification(
+        db, group_id="A", year=2026, month=8, participant_ids=participants,
+    )
+    assigned = [nid for members in pv["teams"].values() for nid in members]
+    assert sorted(assigned) == sorted(participants)
+    unassigned_ids = {u["nurse_id"] for u in pv["unassigned"]}
+    assert unassigned_ids == {"n2", "n3", "n5", "n6"}  # 미참여 적격
+    assert {e["nurse_id"] for e in pv["excluded_night"]} == {"night"}
+
+
+def test_n_nurse_override_includes_and_releases(ward):
+    db = ward
+    # night(N전담)을 참여에 포함(override) → 풀에 들어오고, apply 시 N전담 해제 동반
+    participants = ["g1a", "g1b", "n1", "n2", "n3", "n4", "n5", "n6", "night"]
+    pv = preview_team_classification(
+        db, group_id="A", year=2026, month=8, participant_ids=participants,
+    )
+    assigned = [nid for members in pv["teams"].values() for nid in members]
+    assert "night" in assigned                       # 팀에 편입됨
+    assert pv["num_excluded_night"] == 0             # 더 이상 제외 아님
+
+    flat = [{"nurse_id": nid, "team_id": int(t)}
+            for t, members in pv["teams"].items() for nid in members]
+    apply_team_classification(
+        db, group_id="A", office_id="o1", year=2026, month=8, assignments=flat,
+    )
+    flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
+    night = db.query(Nurse).filter(Nurse.nurse_id == "night").first()
+    assert (night.is_night_nurse or []) == []        # N전담 해제됨

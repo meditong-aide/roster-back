@@ -91,8 +91,13 @@ def _objective(teams: dict[int, list[NurseInput]], grade_counts: dict[int, int],
 def _build_seeds_and_followers(
     nurses: list[NurseInput],
     seed_ids: list[str],
+    fixed_ids: set[str] | None = None,
 ) -> tuple[list[NurseInput], dict[str, list[NurseInput]], list[NurseInput]]:
-    """지정된 seed_ids로 시드 추출 + preceptee → preceptor 매핑 + 잔여 인원."""
+    """지정된 seed_ids로 시드 추출 + preceptee → preceptor 매핑 + 잔여 인원.
+
+    fixed_ids(미참여=현재 클러스터 고정 인원)는 follower/remaining 에서 제외 — 호출부가 직접 배치.
+    """
+    fixed_ids = fixed_ids or set()
     by_id = {n.nurse_id: n for n in nurses}
     seeds: list[NurseInput] = []
     for sid in seed_ids:
@@ -104,12 +109,19 @@ def _build_seeds_and_followers(
         seeds.append(s)
     followers: dict[str, list[NurseInput]] = {s.nurse_id: [] for s in seeds}
     assigned_ids: set[str] = set(s.nurse_id for s in seeds)
-    # preceptees 매핑 (preceptor가 시드인 경우만; 시드 아닌 preceptor에 묶인 preceptee는 둘 다 일반 풀로)
+    # preceptees 매핑 (preceptor가 시드인 경우만; 고정 인원은 제외 — 호출부가 직접 배치)
     for n in nurses:
-        if n.preceptor_id and n.preceptor_id in followers:
+        if (
+            n.preceptor_id
+            and n.preceptor_id in followers
+            and n.nurse_id not in fixed_ids
+        ):
             followers[n.preceptor_id].append(n)
             assigned_ids.add(n.nurse_id)
-    remaining = [n for n in nurses if n.nurse_id not in assigned_ids]
+    remaining = [
+        n for n in nurses
+        if n.nurse_id not in assigned_ids and n.nurse_id not in fixed_ids
+    ]
     return seeds, followers, remaining
 
 
@@ -124,6 +136,7 @@ def _greedy_assign(
     min_sizes: list[int] | None = None,
     home_cluster: dict[str, int] | None = None,
     w_churn: float = 0.0,
+    fixed: dict[str, int] | None = None,
 ) -> dict[int, list[NurseInput]]:
     """1단계: 시드 + preceptee 고정 후 잔여를 greedy로 분배.
     팀 수 = len(seed_ids). 시드 외 grade-1은 일반 풀에 섞임 (정상).
@@ -131,11 +144,20 @@ def _greedy_assign(
     max_sizes/min_sizes 가 주어지면 클러스터별(인덱스=시드 순서) 상/하한을 적용한다
     (옵션2 그룹별 정원). 없으면 균일 min_size/max_size.
     home_cluster/w_churn: 원래 cluster 유지 보상(옵션2 이동 억제).
+    fixed(nurse_id→cluster idx): 미참여=현재 클러스터 고정. 미리 배치하고 잔여 분배에서 제외.
     """
-    seeds, followers, remaining = _build_seeds_and_followers(nurses, seed_ids)
+    fixed = fixed or {}
+    by_id = {n.nurse_id: n for n in nurses}
+    seeds, followers, remaining = _build_seeds_and_followers(
+        nurses, seed_ids, fixed_ids=set(fixed.keys())
+    )
     teams: dict[int, list[NurseInput]] = {}
     for i, s in enumerate(seeds):
         teams[i] = [s] + followers[s.nurse_id]
+    # 고정 인원 pre-place (현재 클러스터에 그대로)
+    for nid, ci in fixed.items():
+        if nid in by_id and ci in teams:
+            teams[ci].append(by_id[nid])
 
     grade_counts = _grade_count_total(nurses)
     cap = lambda t: (max_sizes[t] if max_sizes else max_size)  # noqa: E731
@@ -164,7 +186,7 @@ def _greedy_assign(
 
     if min_sizes:
         _min_fill(teams, seed_ids, nurses, min_sizes, w_overlap, w_grade,
-                  grade_counts, home_cluster, w_churn)
+                  grade_counts, home_cluster, w_churn, set(fixed.keys()))
     return teams
 
 
@@ -178,14 +200,17 @@ def _min_fill(
     grade_counts: dict[int, int],
     home_cluster: dict[str, int] | None = None,
     w_churn: float = 0.0,
+    fixed_ids: set[str] | None = None,
 ) -> None:
     """클러스터별 하한(min_sizes) 미달 시, 자기 하한 위에 있는 클러스터에서
     movable 간호사를 objective 증가 최소가 되도록 옮겨 채운다 (in-place)."""
     seedset = set(seed_ids)
+    fixed_ids = fixed_ids or set()
     has_pre = {n.preceptor_id for n in nurses if n.preceptor_id}
 
     def movable(n: NurseInput) -> bool:
         return (n.nurse_id not in seedset
+                and n.nurse_id not in fixed_ids
                 and n.preceptor_id is None
                 and n.nurse_id not in has_pre)
 
@@ -251,20 +276,23 @@ def _local_swap_optimize(
     max_iterations: int = 100,
     home_cluster: dict[str, int] | None = None,
     w_churn: float = 0.0,
+    fixed_ids: set[str] | None = None,
 ) -> dict[int, list[NurseInput]]:
     """2-opt swap: 시드/preceptee가 아닌 간호사 페어를 swap해서 obj 감소 시 반영.
     preceptor를 가진 nurse(=preceptee)는 단독 swap 금지 (preceptor와 같은 팀 hard 유지).
-    Preceptees가 있는 preceptor도 단독 swap 금지 (preceptee가 따라와야 하므로)."""
+    Preceptees가 있는 preceptor도 단독 swap 금지 (preceptee가 따라와야 하므로).
+    fixed_ids(미참여 고정)도 swap 금지."""
     grade_counts = _grade_count_total(nurses)
     by_id = {n.nurse_id: n for n in nurses}
+    fixed_ids = fixed_ids or set()
     has_preceptees = set()
     for n in nurses:
         if n.preceptor_id:
             has_preceptees.add(n.preceptor_id)
 
     def is_movable(n: NurseInput) -> bool:
-        if n.nurse_id in seed_ids:
-            return False  # 시드 고정
+        if n.nurse_id in seed_ids or n.nurse_id in fixed_ids:
+            return False  # 시드/고정 인원
         if n.preceptor_id is not None:
             return False  # preceptee는 단독 swap 금지 (preceptor 따라감)
         if n.nurse_id in has_preceptees:
@@ -323,6 +351,7 @@ def auto_assign_teams(
     min_sizes: list[int] | None = None,
     home_cluster: dict[str, int] | None = None,
     w_churn: float = 0.0,
+    fixed: dict[str, int] | None = None,
 ) -> TeamAssignResult:
     """팀 자동 분배 진입점.
 
@@ -344,12 +373,14 @@ def auto_assign_teams(
         raise ValueError("max_sizes 길이가 클러스터 수와 다릅니다.")
     if min_sizes is not None and len(min_sizes) != len(seed_ids):
         raise ValueError("min_sizes 길이가 클러스터 수와 다릅니다.")
+    _fixed_ids = set(fixed.keys()) if fixed else None
     teams = _greedy_assign(nurses, seed_ids, w_overlap, w_grade, min_size, max_size,
                            max_sizes=max_sizes, min_sizes=min_sizes,
-                           home_cluster=home_cluster, w_churn=w_churn)
+                           home_cluster=home_cluster, w_churn=w_churn, fixed=fixed)
     teams = _enforce_preceptee_follow(teams, nurses)
     teams = _local_swap_optimize(teams, nurses, set(seed_ids), w_overlap, w_grade,
-                                 swap_iterations, home_cluster=home_cluster, w_churn=w_churn)
+                                 swap_iterations, home_cluster=home_cluster,
+                                 w_churn=w_churn, fixed_ids=_fixed_ids)
     teams = _enforce_preceptee_follow(teams, nurses)  # swap 후 재검증
     grade_counts = _grade_count_total(nurses)
     obj, overlap, dev = _objective(teams, grade_counts, w_overlap, w_grade)

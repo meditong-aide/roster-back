@@ -25,6 +25,7 @@ class TeamClassifyPreviewRequest(BaseModel):
     year: int
     month: int
     group_id: str | None = None  # master_admin 만 타 그룹 지정 가능
+    participant_ids: list[str] | None = None  # 참여 인원(미지정 시 전원). 미참여=미지정
 
 
 class TeamAssignmentItem(BaseModel):
@@ -176,6 +177,7 @@ async def classify_preview(
     try:
         return preview_team_classification(
             db, group_id=target_group_id, year=body.year, month=body.month,
+            participant_ids=body.participant_ids,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
