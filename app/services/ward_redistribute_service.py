@@ -22,7 +22,9 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from db.models import FixedWantedEntry, Group, Nurse as NurseModel, Shift
+from db.models import (
+    FixedWantedEntry, Group, Nurse as NurseModel, NurseAssignment, Shift,
+)
 from schemas.roster_schema import NurseAssignmentCreate
 from services.assignment_service import create_assignment, create_permanent_change
 from services.team_auto_assign import NurseInput, auto_assign_teams
@@ -43,7 +45,30 @@ def _load_pool(
         .filter(NurseModel.group_id.in_(group_ids), NurseModel.active == 1)
         .all()
     )
-    pool = [n for n in nurses if (n.is_night_nurse or []) != ["N"]]
+    night = [n for n in nurses if (n.is_night_nurse or []) == ["N"]]
+
+    # 기간 겹침 제외: 대상 발효일(month-1)부터와 겹치는 active 파견/병동이동 보유자.
+    # (새 transfer 는 발효일부터 open-ended → 기존 presence 의 effective_end 가
+    #  None 또는 >= 발효일이면 겹쳐서 transfer 생성 불가 → 재분배 대상에서 제외)
+    target_date = date(year, month, 1)
+    all_ids = [n.nurse_id for n in nurses]
+    overlap_ids: set[str] = set()
+    if all_ids:
+        for a in db.query(NurseAssignment).filter(
+            NurseAssignment.nurse_id.in_(all_ids),
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(["파견", "병동이동"]),
+        ):
+            eff_end = a.end_date or a.expected_end_date
+            if eff_end is None or eff_end >= target_date:
+                overlap_ids.add(a.nurse_id)
+
+    night_ids = {n.nurse_id for n in night}
+    pool = [
+        n for n in nurses
+        if n.nurse_id not in night_ids and n.nurse_id not in overlap_ids
+    ]
+    excluded_overlap = [n for n in nurses if n.nurse_id in overlap_ids]
     current_group = {n.nurse_id: n.group_id for n in pool}
 
     # 휴가 type shift_id 집합 (풀 병동 전체)
@@ -87,7 +112,7 @@ def _load_pool(
         )
         for n in pool
     ]
-    return pool, inputs, current_group
+    return pool, inputs, current_group, night, excluded_overlap
 
 
 def _map_clusters_to_wards(
@@ -202,7 +227,9 @@ def preview_ward_redistribution(
     ward_ids = sorted(set(group_ids))
     if len(ward_ids) < 2:
         raise ValueError("재분배는 2개 이상의 병동이 필요합니다.")
-    pool, inputs, current_group = _load_pool(db, ward_ids, year, month)
+    pool, inputs, current_group, night, excluded_overlap = _load_pool(
+        db, ward_ids, year, month
+    )
     if not pool:
         raise ValueError("재분배 대상 간호사가 없습니다.")
 
@@ -299,9 +326,11 @@ def preview_ward_redistribution(
 
     excluded = [
         {"nurse_id": n.nurse_id, "name": n.name, "group_id": n.group_id}
-        for n in db.query(NurseModel)
-        .filter(NurseModel.group_id.in_(ward_ids), NurseModel.active == 1)
-        if (n.is_night_nurse or []) == ["N"]
+        for n in night
+    ]
+    excluded_overlap_out = [
+        {"nurse_id": n.nurse_id, "name": n.name, "group_id": n.group_id}
+        for n in excluded_overlap
     ]
     return {
         "target_month": f"{year}-{month:02d}",
@@ -310,6 +339,8 @@ def preview_ward_redistribution(
         "num_pool": total,
         "num_excluded_night": len(excluded),
         "excluded_night": excluded,
+        "num_excluded_overlap": len(excluded_overlap_out),
+        "excluded_overlap": excluded_overlap_out,
         "capacity_mode": capacity_mode,
         "size_bounds": size_bounds,
         "warnings": warnings,
@@ -352,7 +383,10 @@ def apply_ward_redistribution(
         흐름 재사용(FixedWanted 재배치·정합성·알림 포함).
       - 같은 병동인데 team_id 만 바뀌면 → permanent_change(team_id).
       - 둘 다 동일 → skip.
-    Returns: {transfers, team_changes, skipped, effective_date}
+    Returns: {transfers, team_changes, skipped, failed, effective_date}
+
+    per-nurse graceful: 한 명이 기간겹침(409) 등으로 실패해도 그 사람만 건너뛰고
+    failed 에 사유와 함께 담는다 (배치 전체가 중단되지 않음).
     """
     effective = date(year, month, 1)
     nurses = {
@@ -361,6 +395,7 @@ def apply_ward_redistribution(
     }
     _note = note or f"원티드 병동재분배 {year}-{month:02d}"
     transfers = team_changes = skipped = 0
+    failed: list[dict] = []
     for a in assignments:
         nid = a.get("nurse_id")
         to_g = a.get("to_group_id")
@@ -371,25 +406,32 @@ def apply_ward_redistribution(
             skipped += 1
             continue
         cur_g = n.group_id
-        if cur_g != to_g:
-            req = NurseAssignmentCreate(
-                nurse_id=nid, source_group_id=cur_g, target_group_id=to_g,
-                office_id=n.office_id, start_date=effective, reason="병동이동",
-                target_team_id=team, note=_note,
-            )
-            create_assignment(req, db, current_user)
-            transfers += 1
-        elif team is not None and not _same_team(n.team_id, team):
-            create_permanent_change(
-                db, nurse_id=nid, group_id=cur_g, office_id=n.office_id,
-                start_date=effective, new_team_id=team, note=_note,
-            )
-            team_changes += 1
-        else:
-            skipped += 1
+        try:
+            if cur_g != to_g:
+                req = NurseAssignmentCreate(
+                    nurse_id=nid, source_group_id=cur_g, target_group_id=to_g,
+                    office_id=n.office_id, start_date=effective, reason="병동이동",
+                    target_team_id=team, note=_note,
+                )
+                create_assignment(req, db, current_user)
+                transfers += 1
+            elif team is not None and not _same_team(n.team_id, team):
+                create_permanent_change(
+                    db, nurse_id=nid, group_id=cur_g, office_id=n.office_id,
+                    start_date=effective, new_team_id=team, note=_note,
+                )
+                team_changes += 1
+            else:
+                skipped += 1
+        except Exception as e:  # 기간겹침(409) 등 — 그 사람만 스킵
+            # create_assignment 의 검증(_raise_if_overlap 등)은 db.add 이전에 raise 하므로
+            # 부분 커밋이 없다 → 세션 무효화(rollback) 없이 다음 사람 진행.
+            detail = getattr(e, "detail", None) or str(e)
+            failed.append({"nurse_id": nid, "reason": str(detail)})
     return {
         "transfers": transfers,
         "team_changes": team_changes,
         "skipped": skipped,
+        "failed": failed,
         "effective_date": effective.isoformat(),
     }

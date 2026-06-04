@@ -213,3 +213,51 @@ def test_role_mix_warning(db):
     db.flush()
     pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
     assert any("역할" in w for w in pv["warnings"]), pv["warnings"]
+
+
+def test_period_overlap_excludes_and_past_included(db):
+    from datetime import date as _d
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    db.add(Team(office_id="o1", group_id="A", team_id=1, team_name="1팀"))
+    db.add(Team(office_id="o1", group_id="B", team_id=1, team_name="1팀"))
+    _mk_nurse(db, "a_g1", "A", 1)
+    _mk_nurse(db, "a0", "A", 2)
+    _mk_nurse(db, "b_g1", "B", 1)
+    _mk_nurse(db, "b0", "B", 2)
+    _mk_nurse(db, "disp", "A", 2)   # 진행중 파견(겹침) → 제외
+    _mk_nurse(db, "past", "A", 2)   # 과거 파견(안겹침) → 포함
+    db.add(NurseAssignment(nurse_id="disp", source_group_id="A", target_group_id="B",
+                           office_id="o1", start_date=_d(2026, 7, 1), reason="파견",
+                           status="active"))  # open-ended → 8월과 겹침
+    db.add(NurseAssignment(nurse_id="past", source_group_id="A", target_group_id="B",
+                           office_id="o1", start_date=_d(2026, 5, 1),
+                           expected_end_date=_d(2026, 6, 30), reason="파견",
+                           status="active"))  # 6/30 종료 → 8월 안겹침
+    db.flush()
+    pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=8)
+    assert {e["nurse_id"] for e in pv["excluded_overlap"]} == {"disp"}
+    assigned = [nid for w in pv["wards"].values() for nid in w["nurse_ids"]]
+    assert "disp" not in assigned
+    assert "past" in assigned  # 과거 파견은 재분배 대상
+
+
+def test_apply_graceful_skips_conflict(db):
+    from datetime import date as _d
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    _mk_nurse(db, "x", "A", 2)   # 진행중 파견 → transfer 생성 시 409
+    _mk_nurse(db, "ok", "A", 2)
+    db.add(NurseAssignment(nurse_id="x", source_group_id="A", target_group_id="B",
+                           office_id="o1", start_date=_d(2026, 7, 1), reason="파견",
+                           status="active"))
+    db.flush()
+    res = apply_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=8,
+        assignments=[{"nurse_id": "x", "to_group_id": "B"},
+                     {"nurse_id": "ok", "to_group_id": "B"}],
+    )
+    assert res["transfers"] == 1               # ok 성공
+    assert any(f["nurse_id"] == "x" for f in res["failed"])  # x 만 실패
