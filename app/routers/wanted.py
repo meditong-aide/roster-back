@@ -778,12 +778,15 @@ async def delete_excess_off_api(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    if not current_user.is_master_admin:
+    if not current_user:
+        raise HTTPException(403, "권한이 없습니다.")
+    if current_user.is_master_admin:
         pass
     elif current_user.is_head_nurse and current_user.group_id:
-        target_nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
-        if not target_nurse or target_nurse.group_id != current_user.group_id:
-            raise HTTPException(403, "현재 속한 병동 내 간호사가 아닙니다.")
+        # home + 관리병동(managed) 범위 간호사만 허용 (통합보기 일관)
+        from services.group_access import can_caller_access_nurse
+        if not can_caller_access_nurse(db, current_user, nurse_id):
+            raise HTTPException(403, "관리 병동 내 간호사가 아닙니다.")
     else:
         raise HTTPException(403, "권한이 없습니다.")
 
