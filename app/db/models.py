@@ -202,6 +202,10 @@ class NurseAssignment(Base):
     expected_end_date = Column(DATE, nullable=True)
     end_date = Column(DATE, nullable=True)
     reason = Column(NVARCHAR(200), nullable=False)
+    # kind: reason(한글) 기반 명시적 분류 (DDL Phase 1.4). DB DEFAULT 'transfer'.
+    kind = Column(VARCHAR(30), nullable=False, server_default="transfer")
+    # payload: 영구속성 변경 등 신규 케이스용 JSON (Phase 2에서 사용 시작, 그 전엔 NULL)
+    payload = Column(JSON(none_as_null=True), nullable=True)
     status = Column(VARCHAR(10), nullable=False, default="active")
     note = Column(NVARCHAR(1000), nullable=True)
     # target 그룹 전용 설정

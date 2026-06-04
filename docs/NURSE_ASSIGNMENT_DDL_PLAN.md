@@ -37,15 +37,19 @@ CREATE INDEX idx_na_target_active
   ON nurse_assignment (target_group_id, status, start_date, end_date);
 ```
 
-### 1.2. kind 값 정의 (코드 enum과 동기화)
-| 값 | 의미 | Nurses 동기화 |
-|---|---|---|
-| `transfer` | 영구 병동이동 | 발효 시 `group_id` 업데이트 |
-| `dispatch` | 시간 한정 파견 (본가 유지) | 안 함 |
-| `dispatch_override` | 파견 기간 한정 속성 변경 | 안 함 (assignment row만) |
-| `permanent_change` | 영구 속성 변경 | 발효 시 attribute 업데이트 |
-| `leave` | 휴직 | 발효 시 `active=0` |
-| `return` | 복직 | 발효 시 `active=1` |
+### 1.2. kind 값 정의 (코드 enum과 동기화 — `assignment_service.REASON_TO_KIND`)
+| 값 | 한글 reason | 의미 | Nurses 동기화 |
+|---|---|---|---|
+| `transfer` | 병동이동 | 영구 병동이동 | 발효 시 `group_id` 업데이트 |
+| `dispatch` | 파견 | 시간 한정 파견 (본가 유지) | 안 함 |
+| `preceptee` | 프리셉티 | 신규 교육 배정 (그룹·속성 변경 없음) | 안 함 |
+| `leave` | 휴직 | 휴직 | 발효 시 `active=0` |
+| `return` | 복직 | 복직 | 발효 시 `active=1` |
+| `resign` | 퇴사 | 퇴사 (별도 `flush_resigned_nurses` 처리) | 발효 시 삭제/비활성 |
+| `dispatch_override` | (Phase 2) | 파견 기간 한정 속성 변경 | 안 함 (assignment row만) |
+| `permanent_change` | (Phase 2) | 영구 속성 변경 | 발효 시 attribute 업데이트 |
+
+> **`transfer`는 DB DEFAULT이자 미분류 fallback이다.** 신규 reason 추가 시 `REASON_TO_KIND`와 본 표를 함께 갱신해야 default 오염을 막는다.
 
 ---
 
@@ -61,21 +65,20 @@ ORDER BY cnt DESC;
 → reason 텍스트 종류를 운영자가 검토. 매핑 규칙 정밀화.
 
 ### 2.2. 매핑 UPDATE (배치, 1000건/회)
+실측 분포(2026-06-04): 프리셉티 11 / 파견 10 / 병동이동 3 (총 24행).
+프리셉티가 최대 그룹이라 백필 누락 시 `transfer`로 오염됨 → `preceptee` 분류 필수.
 ```sql
-UPDATE nurse_assignment SET kind='dispatch'
-  WHERE reason LIKE N'%파견%' AND kind='transfer';
-
-UPDATE nurse_assignment SET kind='transfer'
-  WHERE reason LIKE N'%이동%' AND kind='transfer';
-
-UPDATE nurse_assignment SET kind='leave'
-  WHERE reason LIKE N'%휴직%' AND kind='transfer';
-
-UPDATE nurse_assignment SET kind='return'
-  WHERE reason LIKE N'%복직%' AND kind='transfer';
-
--- 분류 안 된 나머지는 default 'transfer' 유지 (또는 운영자 수동 분류 후 처리)
+UPDATE nurse_assignment SET kind='preceptee' WHERE reason LIKE N'%프리셉%' AND kind='transfer';
+UPDATE nurse_assignment SET kind='dispatch'  WHERE reason LIKE N'%파견%'   AND kind='transfer';
+UPDATE nurse_assignment SET kind='transfer'  WHERE reason LIKE N'%이동%'   AND kind='transfer';
+UPDATE nurse_assignment SET kind='leave'     WHERE reason LIKE N'%휴직%'   AND kind='transfer';
+UPDATE nurse_assignment SET kind='return'    WHERE reason LIKE N'%복직%'   AND kind='transfer';
+UPDATE nurse_assignment SET kind='resign'    WHERE reason LIKE N'%퇴사%'   AND kind='transfer';
+-- 적용 후 기대 분포: preceptee 11 / dispatch 10 / transfer 3, 잔여 default 0
 ```
+
+> **인덱스(§1.1 ③④)는 현재 24행 규모에선 생략.** 옵티마이저가 스캔을 택하므로 이득 없음.
+> `nurse_assignment`가 수백 행 이상으로 커지면 그때 `idx_na_nurse_kind_date`만 추가.
 
 ### 2.3. 검증
 ```sql

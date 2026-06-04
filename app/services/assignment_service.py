@@ -27,6 +27,27 @@ _REALLOCATE_OPEN_WINDOW_CAP_MONTHS = 12
 # 파견/병동이동 이관 사유 (nurse_service._INBOUND_REASONS와 동일 정책)
 _INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
 
+# nurse_assignment.kind enum (DDL Phase 1.4) ↔ 한글 reason 매핑.
+# 매칭 안 되는 reason 은 DB DEFAULT 'transfer' 로 떨어지므로, 신규 reason 추가 시 여기도 갱신할 것.
+REASON_TO_KIND: dict[str, str] = {
+    "병동이동": "transfer",
+    "파견": "dispatch",
+    "프리셉티": "preceptee",
+    "휴직": "leave",
+    "복직": "return",
+    "퇴사": "resign",
+}
+
+
+def kind_for_reason(reason: Optional[str]) -> str:
+    """한글 reason 을 kind enum 으로 변환. 부분일치(LIKE 백필과 동일 의미)로 변형 표기도 흡수."""
+    if not reason:
+        return "transfer"
+    for key, kind in REASON_TO_KIND.items():
+        if key in reason:
+            return kind
+    return "transfer"
+
 
 def _assert_caller_owns_source(
     current_user: Optional[UserSchema],
@@ -362,6 +383,7 @@ def create_assignment(
         start_date=req.start_date,
         expected_end_date=req.expected_end_date,
         reason=req.reason,
+        kind=kind_for_reason(req.reason),
         status="active",
         note=req.note,
         target_weekly_off_type=req.target_weekly_off_type,
