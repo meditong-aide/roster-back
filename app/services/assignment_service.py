@@ -36,7 +36,12 @@ REASON_TO_KIND: dict[str, str] = {
     "휴직": "leave",
     "복직": "return",
     "퇴사": "resign",
+    "속성변경": "permanent_change",
 }
+
+# 속성 이벤트(무엇인가) — 존재 이벤트(어디 있나: 파견/병동이동)와 달리 기간 겹침 허용.
+# overlap·transfer 검증기에서 제외하고, 발효 시 Nurse 속성을 직접 갱신한다.
+ATTRIBUTE_CHANGE_KINDS: frozenset[str] = frozenset({"permanent_change"})
 
 
 def kind_for_reason(reason: Optional[str]) -> str:
@@ -538,7 +543,11 @@ def _raise_if_overlap(
     my_end_upper: Optional[date],
     exclude_id: Optional[int] = None,
 ) -> None:
-    """동일 간호사의 active 배정 중 기간 겹침이 있으면 409."""
+    """동일 간호사의 active 존재 배정 중 기간 겹침이 있으면 409.
+
+    속성 이벤트(ATTRIBUTE_CHANGE_KINDS: team/grade 변경)는 '어디 있나'가 아니라 '무엇인가'라
+    겹침 검사 대상이 아니다 — 팀이 바뀐 채로도 파견될 수 있으므로 제외한다.
+    """
     from sqlalchemy import case
     _eff_end = case(
         (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
@@ -547,6 +556,7 @@ def _raise_if_overlap(
     _filters = [
         NurseAssignment.nurse_id == nurse_id,
         NurseAssignment.status == "active",
+        NurseAssignment.kind.notin_(ATTRIBUTE_CHANGE_KINDS),
         or_(_eff_end.is_(None), _eff_end >= my_start),
     ]
     if my_end_upper is not None:
@@ -1424,6 +1434,95 @@ def flush_expired_leaves(db: Session) -> int:
     db.commit()
     logger.info("[Scheduler] 휴직 자동 디엑티브 %d건", len(rows))
     return len(rows)
+
+
+def create_permanent_change(
+    db: Session,
+    *,
+    nurse_id: str,
+    group_id: str,
+    office_id: str,
+    start_date: date,
+    new_team_id: Optional[int] = None,
+    new_grade: Optional[int] = None,
+    note: Optional[str] = None,
+) -> NurseAssignment:
+    """병동 내 영구 속성변경(team/grade) 이벤트 생성.
+
+    존재 이벤트(파견/병동이동)가 아니라 '속성 이벤트'다. 같은 병동 내 변경이므로
+    source==target==group_id 이고, overlap·transfer 검증을 거치지 않는다.
+    되돌리기를 위해 payload 에 직전 값(prev_team_id/prev_grade)을 박아둔다.
+    발효(start_date 도래)는 flush_pending_permanent_changes 가 처리한다.
+    """
+    if new_team_id is None and new_grade is None:
+        raise HTTPException(status_code=400, detail="변경할 속성(team/grade)이 없습니다.")
+    nurse = (
+        db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    )
+    if not nurse:
+        raise HTTPException(status_code=404, detail=f"간호사를 찾을 수 없습니다. (nurse_id={nurse_id})")
+
+    row = NurseAssignment(
+        nurse_id=nurse_id,
+        source_group_id=group_id,
+        target_group_id=group_id,  # 병동 내 → source==target
+        office_id=office_id,
+        start_date=start_date,
+        reason="속성변경",
+        kind="permanent_change",
+        status="active",
+        target_team_id=new_team_id,
+        target_grade=new_grade,
+        payload={"prev_team_id": nurse.team_id, "prev_grade": nurse.grade},
+        note=note,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    logger.info(
+        "속성변경 등록: nurse_id=%s, team %s→%s, grade %s→%s, 발효=%s",
+        nurse_id, nurse.team_id, new_team_id, nurse.grade, new_grade, start_date,
+    )
+    return row
+
+
+def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -> int:
+    """영구 속성변경 발효 (스케줄러용).
+
+    조건: kind='permanent_change' AND status='active' AND start_date <= today
+    처리: Nurse.team_id/grade ← target_* (None 인 속성은 미변경), status='completed', end_date=today.
+    Returns: 처리된 건수
+    """
+    today = as_of or date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.kind == "permanent_change",
+            NurseAssignment.status == "active",
+            NurseAssignment.start_date <= today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    count = 0
+    for row in rows:
+        nurse = (
+            db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
+        )
+        if nurse:
+            if row.target_team_id is not None:
+                nurse.team_id = row.target_team_id
+            if row.target_grade is not None:
+                nurse.grade = row.target_grade
+        row.status = "completed"
+        row.end_date = today
+        count += 1
+
+    db.commit()
+    logger.info("[Scheduler] 영구 속성변경 발효 %d건", count)
+    return count
 
 
 def transfer_shifts_on_publish(
