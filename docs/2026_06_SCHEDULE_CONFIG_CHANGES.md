@@ -502,6 +502,50 @@ auto_assign_teams(nurses, num_teams=3, seed_ids=None,
 
 ### 11-8. 후속
 
-- 옵션2(특정 N 병동 간 재분배 = 대량 transfer): kind=transfer 모델 위에 권한·정원·풀 정의 추가하여 별도 구현.
+- 옵션2(특정 N 병동 간 재분배 = 대량 transfer): kind=transfer 모델 위에 권한·정원·풀 정의 추가하여 별도 구현. → §12에서 구현.
 - 발효된 permanent_change 되돌리기 전용 함수(payload prev 복원)를 cancel과 별도로 정식화 검토.
 - master_admin 경로(`get_nurses_filtered_service`)에도 전출자 가시성 적용 여부.
+
+---
+
+## 12. 원티드 기반 병동 간 재분배 (옵션2) (2026-06-04)
+
+> 수간호사가 화면에서 **여러 그룹을 선택**하면 그 풀 안에서 클러스터링해 각 그룹(=버킷)에 배정.
+> 옵션1(team_id만, 병동 내)과 달리 **group_id 변경(병동이동)** 을 동반. preview→확인→apply 구조.
+
+### 12-1. 신규 모듈 (`ward_redistribute_service.py`)
+
+| 함수 | 동작 |
+|---|---|
+| `preview_ward_redistribution` | **read-only**. 선택 그룹 풀+확정원티드로 클러스터링 → 각 그룹 버킷 + **그룹→팀→간호사 중첩** + 이동 diff + 통계 |
+| `apply_ward_redistribution` | 이동 간호사 → 병동이동(transfer, target_team_id 동반), 잔류+팀변경 → permanent_change, 동일 → skip |
+
+### 12-2. 정원(capacity) 모드
+- `even`: 균등분할(총원/N) ± tolerance
+- `explicit`: 그룹별 목표 인원 `{group_id: 인원}` ± tolerance. cluster i ↔ ward i 고정(시드=그룹 G1), 풀이 [Σmin, Σmax] 안에 들어야 함.
+
+### 12-3. 핵심 안전장치
+| 항목 | 내용 |
+|---|---|
+| **churn 페널티** | 현재 병동 유지 보상(`home_cluster`/`w_churn`, 기본 500). 같은 정원에서 실DB 이동 **15→1** |
+| **G1 사전검증** | 시니어 없는 병동 있으면 `WardSetupError` → **422 + `needs_g1_setup`**(병동목록), 프론트가 시니어 지정 유도. 차출로 얼버무리지 않음 |
+| **role 혼합 경고** | AN/RN 등 직역 섞이면 경고 |
+| **권한** | `_assert_groups_managed`: 관리자 + **선택 그룹 전부 ⊆ 관리 그룹**(아니면 403) |
+
+### 12-4. 엔드포인트 (`routers/teams.py`)
+- `POST /teams/redistribute/preview` (read-only, G1 미설정 시 422)
+- `POST /teams/redistribute/apply`
+
+### 12-5. team_auto_assign 확장 (옵션1·2 공통)
+- 클러스터별 정원(`max_sizes`/`min_sizes`) + min-fill
+- churn 페널티(`home_cluster`/`w_churn`)
+- **스왑 mutate-while-iterate 버그픽스** (실DB가 잡은 크래시)
+
+### 12-6. 검증
+- 단위/통합: ward_redistribute 14 + API 5, 전체 스위트 **1251/1251**
+- **실DB**: preview 양 모드(even/explicit) read-only 확인. explicit churn 500 → 이동 1.
+  apply는 미래월(2026-08) 1명 이동 이벤트 생성→검증→**flush 없이 삭제로 완전 원복**(group_id 불변).
+
+### 12-7. 후속
+- explicit 모드 within-ward 팀(team_id)까지 apply에 반영(현재 transfer의 target_team_id로만 동반).
+- 발효 후 대량 transfer 운영 가이드(롤백·알림 묶음).

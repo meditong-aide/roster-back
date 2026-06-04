@@ -12,8 +12,10 @@ import pytest
 from db.models import (
     FixedWantedEntry, Group, Nurse, NurseAssignment, Office, Shift, Team,
 )
+from db.models import NurseAssignment
 from services.ward_redistribute_service import (
     WardSetupError,
+    apply_ward_redistribution,
     preview_ward_redistribution,
 )
 
@@ -159,6 +161,40 @@ def test_churn_weight_reduces_moves(db):
                                      churn_weight=0.0)
     # 현재 정원과 동일 목표 → churn 높으면 이동 0에 수렴, 낮으면 더 많음
     assert hi["num_moved"] <= lo["num_moved"]
+
+
+def test_apply_creates_transfer_and_team_events(pool):
+    db = pool
+    assignments = [
+        {"nurse_id": "a0", "to_group_id": "B", "team_id": 1},   # 이동 → transfer
+        {"nurse_id": "a1", "to_group_id": "A", "team_id": 2},   # 잔류+팀변경 → permanent_change
+        {"nurse_id": "a2", "to_group_id": "A", "team_id": 1},   # 동일 → skip
+    ]
+    res = apply_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7, assignments=assignments,
+    )
+    assert res["transfers"] == 1
+    assert res["team_changes"] == 1
+    assert res["skipped"] == 1
+    assert res["effective_date"] == "2026-07-01"
+
+    rows = {(r.nurse_id, r.kind): r for r in db.query(NurseAssignment).all()}
+    # 이동 = 병동이동(transfer), target=B, target_team_id=1
+    mv = rows[("a0", "transfer")]
+    assert mv.reason == "병동이동" and mv.target_group_id == "B" and mv.target_team_id == 1
+    # 팀변경 = permanent_change, target_team_id=2, source==target==A
+    tc = rows[("a1", "permanent_change")]
+    assert tc.target_team_id == 2 and tc.source_group_id == tc.target_group_id == "A"
+
+
+def test_apply_skips_unknown_or_no_target(pool):
+    db = pool
+    res = apply_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7,
+        assignments=[{"nurse_id": "ghost", "to_group_id": "B"},
+                     {"nurse_id": "a0", "to_group_id": None}],
+    )
+    assert res["transfers"] == 0 and res["skipped"] == 2
 
 
 def test_role_mix_warning(db):

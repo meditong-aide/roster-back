@@ -10,6 +10,11 @@ from services.team_classify_service import (
     preview_team_classification,
     apply_team_classification,
 )
+from services.ward_redistribute_service import (
+    preview_ward_redistribution,
+    apply_ward_redistribution,
+    WardSetupError,
+)
 from services.group_access import resolve_managed_group_ids
 
 
@@ -33,6 +38,44 @@ class TeamClassifyApplyRequest(BaseModel):
     assignments: list[TeamAssignmentItem]
     group_id: str | None = None
     note: str | None = None
+
+
+class WardRedistributePreviewRequest(BaseModel):
+    group_ids: list[str]
+    year: int
+    month: int
+    capacity_mode: str = "even"           # "even" | "explicit"
+    target_sizes: dict[str, int] | None = None
+    size_tolerance: int = 2
+    churn_weight: float = 500.0
+
+
+class WardAssignmentItem(BaseModel):
+    nurse_id: str
+    to_group_id: str
+    team_id: int | None = None
+
+
+class WardRedistributeApplyRequest(BaseModel):
+    group_ids: list[str]
+    year: int
+    month: int
+    assignments: list[WardAssignmentItem]
+    note: str | None = None
+
+
+def _assert_groups_managed(
+    db: Session, current_user: UserSchema, group_ids: list[str]
+) -> None:
+    """병동 간 재분배: 관리자 + 모든 선택 그룹이 관리 그룹에 포함돼야 함."""
+    if not _is_manager(current_user):
+        raise HTTPException(status_code=403, detail="재분배 권한이 없습니다.")
+    if len(set(group_ids)) < 2:
+        raise HTTPException(status_code=400, detail="재분배는 2개 이상의 병동이 필요합니다.")
+    managed = set(resolve_managed_group_ids(db, current_user))
+    bad = [g for g in group_ids if g not in managed]
+    if bad:
+        raise HTTPException(status_code=403, detail=f"관리 권한이 없는 그룹: {bad}")
 
 
 def _is_manager(u: UserSchema) -> bool:
@@ -155,6 +198,50 @@ async def classify_apply(
             month=body.month,
             assignments=[a.model_dump() for a in body.assignments],
             note=body.note,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/redistribute/preview")
+async def redistribute_preview(
+    body: WardRedistributePreviewRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """병동 간 재분배 미리보기 (read-only). 그룹→팀→간호사 + 이동 diff 반환.
+
+    G1 미지정 병동이 있으면 422 + needs_g1_setup(병동 목록) — 프론트가 '시니어 지정' 유도.
+    """
+    _assert_groups_managed(db, current_user, body.group_ids)
+    try:
+        return preview_ward_redistribution(
+            db, group_ids=body.group_ids, year=body.year, month=body.month,
+            capacity_mode=body.capacity_mode, target_sizes=body.target_sizes,
+            size_tolerance=body.size_tolerance, churn_weight=body.churn_weight,
+        )
+    except WardSetupError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(e), "needs_g1_setup": e.wards},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/redistribute/apply")
+async def redistribute_apply(
+    body: WardRedistributeApplyRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """승인된 병동 간 재분배 발행: 이동→병동이동(transfer), 팀변경→permanent_change."""
+    _assert_groups_managed(db, current_user, body.group_ids)
+    try:
+        return apply_ward_redistribution(
+            db, group_ids=body.group_ids, year=body.year, month=body.month,
+            assignments=[a.model_dump() for a in body.assignments],
+            current_user=current_user, note=body.note,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

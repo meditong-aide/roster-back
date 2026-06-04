@@ -16,12 +16,15 @@ N전담(is_night_nurse==['N'])은 풀에서 제외.
 
 from __future__ import annotations
 
+from datetime import date
 from math import ceil
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from db.models import FixedWantedEntry, Group, Nurse as NurseModel, Shift
+from schemas.roster_schema import NurseAssignmentCreate
+from services.assignment_service import create_assignment, create_permanent_change
 from services.team_auto_assign import NurseInput, auto_assign_teams
 
 _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
@@ -322,4 +325,71 @@ def preview_ward_redistribution(
             "overlap_total": result.overlap_total,
             "grade_dev_total": result.grade_dev_total,
         },
+    }
+
+
+def _same_team(a, b) -> bool:
+    """team_id 비교 — varchar/int 혼재 대비 str() 정규화."""
+    if a is None or b is None:
+        return a is None and b is None
+    return str(a) == str(b)
+
+
+def apply_ward_redistribution(
+    db: Session,
+    *,
+    group_ids: list[str],
+    year: int,
+    month: int,
+    assignments: list[dict],
+    current_user=None,
+    note: Optional[str] = None,
+) -> dict:
+    """승인된 병동 간 재분배를 이벤트로 발행 (대상월 1일 발효).
+
+    assignments: [{nurse_id, to_group_id, team_id?}] — team_id 는 정수만 적용(없으면 무시).
+      - 병동이 바뀌면 → 병동이동(transfer) 이벤트(target_team_id 동반). 기존 create_assignment
+        흐름 재사용(FixedWanted 재배치·정합성·알림 포함).
+      - 같은 병동인데 team_id 만 바뀌면 → permanent_change(team_id).
+      - 둘 다 동일 → skip.
+    Returns: {transfers, team_changes, skipped, effective_date}
+    """
+    effective = date(year, month, 1)
+    nurses = {
+        n.nurse_id: n
+        for n in db.query(NurseModel).filter(NurseModel.group_id.in_(group_ids))
+    }
+    _note = note or f"원티드 병동재분배 {year}-{month:02d}"
+    transfers = team_changes = skipped = 0
+    for a in assignments:
+        nid = a.get("nurse_id")
+        to_g = a.get("to_group_id")
+        team = a.get("team_id")
+        team = team if isinstance(team, int) else None  # '전체'/None 등은 팀 미적용
+        n = nurses.get(nid)
+        if n is None or not to_g:
+            skipped += 1
+            continue
+        cur_g = n.group_id
+        if cur_g != to_g:
+            req = NurseAssignmentCreate(
+                nurse_id=nid, source_group_id=cur_g, target_group_id=to_g,
+                office_id=n.office_id, start_date=effective, reason="병동이동",
+                target_team_id=team, note=_note,
+            )
+            create_assignment(req, db, current_user)
+            transfers += 1
+        elif team is not None and not _same_team(n.team_id, team):
+            create_permanent_change(
+                db, nurse_id=nid, group_id=cur_g, office_id=n.office_id,
+                start_date=effective, new_team_id=team, note=_note,
+            )
+            team_changes += 1
+        else:
+            skipped += 1
+    return {
+        "transfers": transfers,
+        "team_changes": team_changes,
+        "skipped": skipped,
+        "effective_date": effective.isoformat(),
     }
