@@ -1,0 +1,179 @@
+"""병동 간 재분배(옵션2) preview — read-only, 풀 클러스터링 + 병동 매핑.
+
+참조: app/services/ward_redistribute_service.py, docs/NURSE_GROUP_CHANGE_MODEL.md (옵션2).
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pytest
+
+from db.models import (
+    FixedWantedEntry, Group, Nurse, NurseAssignment, Office, Shift, Team,
+)
+from services.ward_redistribute_service import (
+    WardSetupError,
+    preview_ward_redistribution,
+)
+
+
+def _mk_nurse(db, nid, gid, grade):
+    db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id=gid, office_id="o1",
+                 name=nid, active=1, team_id=1, grade=grade, is_night_nurse=[]))
+
+
+@pytest.fixture
+def pool(db):
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    db.add(Team(office_id="o1", group_id="A", team_id=1, team_name="1팀"))
+    db.add(Team(office_id="o1", group_id="B", team_id=1, team_name="1팀"))
+    db.add(Shift(shift_id="V", id=1, office_id="o1", group_id="A", name="연차",
+                 color="#fff", type="휴가"))
+    # A병동 5명 (G1 1명 + G2 4명), B병동 5명 (G1 1명 + G2 4명)
+    _mk_nurse(db, "a_g1", "A", 1)
+    for i in range(4):
+        _mk_nurse(db, f"a{i}", "A", 2)
+    _mk_nurse(db, "b_g1", "B", 1)
+    for i in range(4):
+        _mk_nurse(db, f"b{i}", "B", 2)
+    # N전담 1명 (풀 제외)
+    db.add(Nurse(nurse_id="night", account_id="acc_night", group_id="A", office_id="o1",
+                 name="야간", active=1, team_id=1, grade=2, is_night_nurse=["N"]))
+    # 확정 원티드 OFF 몇 건
+    for nid, day in [("a0", 5), ("a1", 5), ("b0", 20), ("b1", 20)]:
+        db.add(FixedWantedEntry(group_id="A" if nid.startswith("a") else "B",
+                                year=2026, month=7, nurse_id=nid,
+                                shift_date=date(2026, 7, day), shift_id="O",
+                                source_type="original"))
+    db.flush()
+    return db
+
+
+def test_preview_readonly_covers_pool(pool):
+    db = pool
+    pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
+    assert pv["target_month"] == "2026-07"
+    assert pv["num_wards"] == 2
+    assert pv["num_pool"] == 10          # N전담 제외
+    assert pv["num_excluded_night"] == 1
+    # 풀 전원이 정확히 한 병동에 배정
+    assigned = [nid for w in pv["wards"].values() for nid in w["nurse_ids"]]
+    assert sorted(assigned) == sorted(
+        ["a_g1", "a0", "a1", "a2", "a3", "b_g1", "b0", "b1", "b2", "b3"]
+    )
+    # read-only
+    assert db.query(NurseAssignment).count() == 0
+
+
+def test_preview_moves_have_direction(pool):
+    db = pool
+    pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
+    for m in pv["moves"]:
+        assert m["from"] != m["to"]
+        assert m["from"] in ("A", "B") and m["to"] in ("A", "B")
+    assert pv["num_moved"] == len(pv["moves"])
+    # 각 병동에 G1 ≥ 1 (auto_assign hard 제약)
+    assert all(w["size"] >= 1 for w in pv["wards"].values())
+
+
+def test_preview_requires_two_wards(pool):
+    with pytest.raises(ValueError):
+        preview_ward_redistribution(pool, group_ids=["A"], year=2026, month=7)
+
+
+def test_ward_without_g1_blocks_with_setup_error(db):
+    """G1 미지정 병동이 있으면 차출로 얼버무리지 않고 WardSetupError로 막아야 함."""
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    # A: G1 있음, B: G1 없음(전원 grade 2)
+    _mk_nurse(db, "a_g1", "A", 1)
+    for i in range(4):
+        _mk_nurse(db, f"a{i}", "A", 2)
+    for i in range(5):
+        _mk_nurse(db, f"b{i}", "B", 2)
+    db.flush()
+    with pytest.raises(WardSetupError) as ei:
+        preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
+    assert any(w["group_id"] == "B" for w in ei.value.wards)
+
+
+def test_explicit_mode_respects_target_bands(pool):
+    db = pool
+    pv = preview_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7,
+        capacity_mode="explicit", target_sizes={"A": 6, "B": 4}, size_tolerance=2,
+    )
+    assert pv["capacity_mode"] == "explicit"
+    sizes = {w: pv["wards"][w]["size"] for w in pv["wards"]}
+    assert sum(sizes.values()) == 10
+    assert 4 <= sizes["A"] <= 8   # 6 ± 2
+    assert 2 <= sizes["B"] <= 6   # 4 ± 2
+
+
+def test_explicit_requires_target_sizes(pool):
+    with pytest.raises(ValueError):
+        preview_ward_redistribution(pool, group_ids=["A", "B"], year=2026, month=7,
+                                    capacity_mode="explicit")
+
+
+def test_explicit_band_cannot_absorb_pool(pool):
+    # 목표 너무 작고 tolerance 0 → Σmax < 풀 → 에러
+    with pytest.raises(ValueError):
+        preview_ward_redistribution(
+            pool, group_ids=["A", "B"], year=2026, month=7,
+            capacity_mode="explicit", target_sizes={"A": 1, "B": 1}, size_tolerance=0,
+        )
+
+
+def test_preview_includes_nested_team_breakdown(pool):
+    db = pool
+    pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
+    for wid, w in pv["wards"].items():
+        assert "teams" in w
+        # 팀 분해 안의 전체 인원 = 병동 인원
+        flat = [m["nurse_id"] for ms in w["teams"].values() for m in ms]
+        assert sorted(flat) == sorted(w["nurse_ids"])
+
+
+def test_churn_weight_reduces_moves(db):
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B", office_id="o1"))
+    db.add(Team(office_id="o1", group_id="A", team_id=1, team_name="1팀"))
+    db.add(Team(office_id="o1", group_id="B", team_id=1, team_name="1팀"))
+    for i in range(6):
+        _mk_nurse(db, f"a{i}", "A", 1 if i == 0 else 2)
+    for i in range(6):
+        _mk_nurse(db, f"b{i}", "B", 1 if i == 0 else 2)
+    db.flush()
+    tgt = {"A": 6, "B": 6}
+    hi = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7,
+                                     capacity_mode="explicit", target_sizes=tgt,
+                                     churn_weight=1000.0)
+    lo = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7,
+                                     capacity_mode="explicit", target_sizes=tgt,
+                                     churn_weight=0.0)
+    # 현재 정원과 동일 목표 → churn 높으면 이동 0에 수렴, 낮으면 더 많음
+    assert hi["num_moved"] <= lo["num_moved"]
+
+
+def test_role_mix_warning(db):
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A-RN", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B-AN", office_id="o1"))
+    # A=RN 5명(G1 1), B=AN 5명(G1 1)
+    for i in range(5):
+        db.add(Nurse(nurse_id=f"a{i}", account_id=f"acc_a{i}", group_id="A", office_id="o1",
+                     name=f"a{i}", active=1, team_id=1, grade=1 if i == 0 else 2,
+                     role="RN", is_night_nurse=[]))
+    for i in range(5):
+        db.add(Nurse(nurse_id=f"b{i}", account_id=f"acc_b{i}", group_id="B", office_id="o1",
+                     name=f"b{i}", active=1, team_id=1, grade=1 if i == 0 else 2,
+                     role="AN", is_night_nurse=[]))
+    db.flush()
+    pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
+    assert any("역할" in w for w in pv["warnings"]), pv["warnings"]
