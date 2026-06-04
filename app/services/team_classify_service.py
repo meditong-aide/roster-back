@@ -57,7 +57,8 @@ def _load_pool_and_inputs(
             FixedWantedEntry.group_id == group_id,
             FixedWantedEntry.year == year,
             FixedWantedEntry.month == month,
-            FixedWantedEntry.is_applied.is_(True),
+            # MSSQL BIT 컬럼은 IS 1 구문 오류 → '= 1' 로 비교 (.is_(True) 금지)
+            FixedWantedEntry.is_applied == True,  # noqa: E712
         )
         .all()
     )
@@ -198,12 +199,21 @@ def apply_team_classification(
     assignments: [{nurse_id, team_id}] — 변경 대상만(또는 전체) 전달.
     현재 team_id 와 같으면 스킵. 이벤트 생성만, Nurse 즉시 변경은 flush 가 발효일에.
     Returns: {created, skipped, effective_date}
+
+    주의: nurses.team_id 는 프로덕션에서 varchar(문자열), 제안 team_id 는 int 일 수 있어
+    비교는 반드시 str() 정규화로 한다 (안 그러면 무변경도 이벤트 생성됨).
     """
     effective = date(year, month, 1)
     cur = {
         n.nurse_id: n.team_id
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id)
     }
+
+    def _same(a, b) -> bool:
+        if a is None or b is None:
+            return a is None and b is None
+        return str(a) == str(b)
+
     created = 0
     skipped = 0
     for a in assignments:
@@ -212,7 +222,7 @@ def apply_team_classification(
         if nid not in cur:
             skipped += 1
             continue
-        if cur[nid] == new_team:
+        if _same(cur[nid], new_team):
             skipped += 1
             continue
         create_permanent_change(
