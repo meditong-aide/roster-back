@@ -196,14 +196,46 @@ async def get_config_versions(
 async def get_config_by_version(
     config_version: str,
     group_id: Optional[str] = None,
+    schedule_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """Get the latest config for a specific version"""
-    print("[/config/version/{config_version}] group_id", group_id)
-    print("[/config/version/{config_version}] current_user", current_user.__dict__)
+    """버전(또는 schedule_id) 기준 config 조회.
+
+    - schedule_id 제공 시: 그 schedule 이 생성에 사용한 roster_config 반환
+      (이전 설정 사용하기 — 특정 근무표의 설정 불러오기). 스코프는 schedule 그룹 기준.
+    - 미제공 시: 대상 그룹의 최신 config 반환.
+    """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # schedule_id 기준: 그 근무표가 사용한 config 로드
+    if schedule_id:
+        schedule = (
+            db.query(Schedule)
+            .filter(Schedule.schedule_id == schedule_id, Schedule.dropped == False)
+            .first()
+        )
+        if not schedule:
+            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+        from services.group_access import assert_caller_can_access_group
+        assert_caller_can_access_group(db, current_user, schedule.group_id)
+        if not schedule.config_id:
+            raise HTTPException(
+                status_code=404, detail="이 근무표에 연결된 설정이 없습니다."
+            )
+        sched_config = (
+            db.query(RosterConfigModel)
+            .filter(RosterConfigModel.config_id == schedule.config_id)
+            .first()
+        )
+        if not sched_config:
+            raise HTTPException(status_code=404, detail="설정을 찾을 수 없습니다.")
+        return {
+            c.name: getattr(sched_config, c.name)
+            for c in sched_config.__table__.columns
+        }
+
     if current_user.is_master_admin:
         target_group_id = group_id
         target_office_id = current_user.office_id
@@ -363,48 +395,6 @@ async def get_config_by_version(
     except Exception as e:
         print("error", e)
         raise HTTPException(status_code=500, detail=f"Failed to get config: {str(e)}")
-
-
-# [Config] - 특정 schedule 이 사용한 roster_config 불러오기 (이전 설정 사용하기)
-@router.get("/config/by-schedule/{schedule_id}")
-async def get_config_by_schedule(
-    schedule_id: str,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db),
-):
-    """특정 schedule 이 생성에 사용한 roster_config 를 반환한다.
-
-    schedule.config_id → roster_config. 스코프: 호출자가 해당 schedule 의 그룹에
-    접근 가능한지 검증(ADM/HN home·managed). 응답은 RosterConfig 컬럼 dict
-    (프론트 RosterConfigObject 와 동일 필드명).
-    """
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    schedule = (
-        db.query(Schedule)
-        .filter(Schedule.schedule_id == schedule_id, Schedule.dropped == False)
-        .first()
-    )
-    if not schedule:
-        raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
-
-    from services.group_access import assert_caller_can_access_group
-    assert_caller_can_access_group(db, current_user, schedule.group_id)
-
-    if not schedule.config_id:
-        raise HTTPException(
-            status_code=404, detail="이 근무표에 연결된 설정이 없습니다."
-        )
-    config = (
-        db.query(RosterConfigModel)
-        .filter(RosterConfigModel.config_id == schedule.config_id)
-        .first()
-    )
-    if not config:
-        raise HTTPException(status_code=404, detail="설정을 찾을 수 없습니다.")
-
-    return {c.name: getattr(config, c.name) for c in config.__table__.columns}
 
 
 # [Schedules] - 최신 월과 버전의 스케줄 정보 조회 (수간호사용)
