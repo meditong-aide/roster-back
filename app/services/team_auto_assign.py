@@ -62,19 +62,33 @@ def _grade_dev(teams: dict[int, list[NurseInput]], grade_counts: dict[int, int])
     for g, cnt_total in grade_counts.items():
         target = cnt_total / num_teams
         for t, members in teams.items():
-            cnt_t = sum(1 for n in members if n.grade == g)
+            # grade_counts 는 None→-1 로 집계하므로 멤버 비교도 동일 정규화해야
+            # None(미입력) 간호사가 0으로 오판돼 균등화에서 빠지지 않는다.
+            cnt_t = sum(1 for n in members
+                        if (n.grade if n.grade is not None else -1) == g)
             total += abs(cnt_t - target)
     return total
+
+
+def _size_dev(teams: dict[int, list[NurseInput]]) -> float:
+    """팀 크기의 L1 편차 합 (target=total/num_teams). 0이면 완전 균등."""
+    k = len(teams)
+    if k == 0:
+        return 0.0
+    total = sum(len(m) for m in teams.values())
+    target = total / k
+    return sum(abs(len(m) - target) for m in teams.values())
 
 
 def _objective(teams: dict[int, list[NurseInput]], grade_counts: dict[int, int],
                w_overlap: int, w_grade: float,
                home_cluster: dict[str, int] | None = None,
-               w_churn: float = 0.0) -> tuple[float, int, float]:
-    """obj = w_overlap·OFF겹침 + w_grade·grade편차 + w_churn·이동수.
+               w_churn: float = 0.0, w_size: float = 0.0) -> tuple[float, int, float]:
+    """obj = w_overlap·OFF겹침 + w_grade·grade편차 + w_size·인원편차 + w_churn·이동수.
 
     home_cluster(nurse_id→원래 cluster idx)와 w_churn 지정 시, 원래 cluster가 아닌 곳에
-    배정된 간호사 수만큼 페널티 (옵션2: 불필요한 병동 이동 억제)."""
+    배정된 간호사 수만큼 페널티 (옵션2: 불필요한 병동 이동 억제).
+    w_size 지정 시 팀 크기 편차(_size_dev)도 최소화 — 인원 균등."""
     overlap = sum(_team_overlap_sum(m) for m in teams.values())
     dev = _grade_dev(teams, grade_counts)
     churn = 0
@@ -84,7 +98,8 @@ def _objective(teams: dict[int, list[NurseInput]], grade_counts: dict[int, int],
                 h = home_cluster.get(n.nurse_id)
                 if h is not None and h != t:
                     churn += 1
-    obj = w_overlap * overlap + w_grade * dev + w_churn * churn
+    size_pen = w_size * _size_dev(teams) if w_size else 0.0
+    obj = w_overlap * overlap + w_grade * dev + w_churn * churn + size_pen
     return obj, overlap, dev
 
 
@@ -137,6 +152,7 @@ def _greedy_assign(
     home_cluster: dict[str, int] | None = None,
     w_churn: float = 0.0,
     fixed: dict[str, int] | None = None,
+    w_size: float = 0.0,
 ) -> dict[int, list[NurseInput]]:
     """1단계: 시드 + preceptee 고정 후 잔여를 greedy로 분배.
     팀 수 = len(seed_ids). 시드 외 grade-1은 일반 풀에 섞임 (정상).
@@ -174,7 +190,7 @@ def _greedy_assign(
                 continue
             teams[t].append(n)
             obj, _, _ = _objective(teams, grade_counts, w_overlap, w_grade,
-                                   home_cluster, w_churn)
+                                   home_cluster, w_churn, w_size)
             if obj < best_obj:
                 best_obj = obj
                 best_t = t
@@ -277,6 +293,7 @@ def _local_swap_optimize(
     home_cluster: dict[str, int] | None = None,
     w_churn: float = 0.0,
     fixed_ids: set[str] | None = None,
+    w_size: float = 0.0,
 ) -> dict[int, list[NurseInput]]:
     """2-opt swap: 시드/preceptee가 아닌 간호사 페어를 swap해서 obj 감소 시 반영.
     preceptor를 가진 nurse(=preceptee)는 단독 swap 금지 (preceptor와 같은 팀 hard 유지).
@@ -300,7 +317,7 @@ def _local_swap_optimize(
         return True
 
     current_obj, _, _ = _objective(teams, grade_counts, w_overlap, w_grade,
-                                    home_cluster, w_churn)
+                                    home_cluster, w_churn, w_size)
     for _ in range(max_iterations):
         # 한 번의 개선 swap을 적용하면 즉시 스캔을 재시작한다.
         # (accept 시 teams 멤버십이 바뀌므로 변형된 리스트를 계속 순회하면
@@ -319,7 +336,7 @@ def _local_swap_optimize(
                         teams[ta].remove(na); teams[ta].append(nb)
                         teams[tb].remove(nb); teams[tb].append(na)
                         new_obj, _, _ = _objective(teams, grade_counts, w_overlap, w_grade,
-                                                   home_cluster, w_churn)
+                                                   home_cluster, w_churn, w_size)
                         if new_obj < current_obj - 1e-6:
                             current_obj = new_obj
                             found = True
@@ -338,6 +355,66 @@ def _local_swap_optimize(
     return teams
 
 
+def _balance_sizes(
+    teams: dict[int, list[NurseInput]],
+    nurses: list[NurseInput],
+    seed_ids: set[str],
+    w_overlap: int,
+    w_grade: float,
+    w_size: float,
+    grade_counts: dict[int, int],
+    home_cluster: dict[str, int] | None = None,
+    w_churn: float = 0.0,
+    fixed_ids: set[str] | None = None,
+    max_sizes: list[int] | None = None,
+    min_sizes: list[int] | None = None,
+) -> dict[int, list[NurseInput]]:
+    """인원 균등화 — 1:1 swap이 못 하는 크기 조정. 가장 큰 팀에서 movable 1명을
+    가장 작은 팀으로 이동(obj 최소가 되는 인원 선택)해 max−min ≤ 1 까지.
+
+    movable: 시드/고정/프리셉티/프리셉터(짝) 제외 → G1 시드는 안 옮겨져 각 팀 G1≥1 유지,
+    프리셉터 짝도 분리되지 않음. max_sizes/min_sizes(옵션2 정원밴드) 범위는 위반하지 않는다.
+    """
+    fixed_ids = fixed_ids or set()
+    has_pre = {n.preceptor_id for n in nurses if n.preceptor_id}
+
+    def movable(n: NurseInput) -> bool:
+        return (n.nurse_id not in seed_ids
+                and n.nurse_id not in fixed_ids
+                and n.preceptor_id is None
+                and n.nurse_id not in has_pre)
+
+    def lo(t: int) -> int:
+        return min_sizes[t] if min_sizes else 0
+
+    def hi(t: int) -> int:
+        return max_sizes[t] if max_sizes else 10**9
+
+    for _ in range(1000):  # 안전 상한
+        sizes = {t: len(m) for t, m in teams.items()}
+        t_big = max(sizes, key=lambda t: sizes[t])
+        t_small = min(sizes, key=lambda t: sizes[t])
+        if sizes[t_big] - sizes[t_small] <= 1:
+            break
+        # 정원밴드 위반 방지: 큰 팀이 하한 초과 & 작은 팀이 상한 미만일 때만
+        if sizes[t_big] <= lo(t_big) or sizes[t_small] >= hi(t_small):
+            break
+        best = None  # (obj, nurse)
+        for n in list(teams[t_big]):
+            if not movable(n):
+                continue
+            teams[t_big].remove(n); teams[t_small].append(n)
+            obj, _, _ = _objective(teams, grade_counts, w_overlap, w_grade,
+                                   home_cluster, w_churn, w_size)
+            teams[t_small].remove(n); teams[t_big].append(n)
+            if best is None or obj < best[0]:
+                best = (obj, n)
+        if best is None:
+            break  # 큰 팀에 옮길 movable 없음
+        teams[t_big].remove(best[1]); teams[t_small].append(best[1])
+    return teams
+
+
 def auto_assign_teams(
     nurses: list[NurseInput],
     num_teams: int | None = None,
@@ -352,11 +429,12 @@ def auto_assign_teams(
     home_cluster: dict[str, int] | None = None,
     w_churn: float = 0.0,
     fixed: dict[str, int] | None = None,
+    w_size: float = 50.0,
 ) -> TeamAssignResult:
     """팀 자동 분배 진입점.
 
     Hard: 각 팀에 grade-1 ≥ 1, 팀 크기 [min_size, max_size], preceptee→preceptor 같은 팀.
-    Soft: OFF/FB 겹침 minimize, grade 분포 균등.
+    Soft: OFF/FB 겹침 minimize, grade 분포 균등, 인원 균등(w_size).
     N전담 미배정 인원은 입력 단계에서 제외하고 전달.
 
     seed_ids 지정 시 그걸 시드로. 안 주면 grade-1 중 첫 num_teams명 자동 선정.
@@ -374,15 +452,20 @@ def auto_assign_teams(
     if min_sizes is not None and len(min_sizes) != len(seed_ids):
         raise ValueError("min_sizes 길이가 클러스터 수와 다릅니다.")
     _fixed_ids = set(fixed.keys()) if fixed else None
+    grade_counts = _grade_count_total(nurses)
     teams = _greedy_assign(nurses, seed_ids, w_overlap, w_grade, min_size, max_size,
                            max_sizes=max_sizes, min_sizes=min_sizes,
-                           home_cluster=home_cluster, w_churn=w_churn, fixed=fixed)
+                           home_cluster=home_cluster, w_churn=w_churn, fixed=fixed,
+                           w_size=w_size)
     teams = _enforce_preceptee_follow(teams, nurses)
+    # 인원 균등화 (1:1 swap이 못 하는 크기 조정) → 정밀 swap → 짝 재검증
+    teams = _balance_sizes(teams, nurses, set(seed_ids), w_overlap, w_grade, w_size,
+                           grade_counts, home_cluster=home_cluster, w_churn=w_churn,
+                           fixed_ids=_fixed_ids, max_sizes=max_sizes, min_sizes=min_sizes)
     teams = _local_swap_optimize(teams, nurses, set(seed_ids), w_overlap, w_grade,
                                  swap_iterations, home_cluster=home_cluster,
-                                 w_churn=w_churn, fixed_ids=_fixed_ids)
+                                 w_churn=w_churn, fixed_ids=_fixed_ids, w_size=w_size)
     teams = _enforce_preceptee_follow(teams, nurses)  # swap 후 재검증
-    grade_counts = _grade_count_total(nurses)
     obj, overlap, dev = _objective(teams, grade_counts, w_overlap, w_grade)
     team_size = {t: len(m) for t, m in teams.items()}
     grade_breakdown: dict[int, dict[int, int]] = {}
