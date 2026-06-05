@@ -149,3 +149,60 @@ def test_n_nurse_override_includes_and_releases(ward):
     flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
     night = db.query(Nurse).filter(Nurse.nurse_id == "night").first()
     assert (night.is_night_nurse or []) == []        # N전담 해제됨
+
+
+def _set_preceptor(db, preceptee, preceptor):
+    db.query(Nurse).filter(Nurse.nurse_id == preceptee).update(
+        {"preceptor_id": preceptor}, synchronize_session=False
+    )
+    db.flush()
+
+
+def test_pair_together_no_split_warning(ward):
+    """둘 다 참여하면 hard follow 로 같은 팀 → 갈라짐 경고 없음."""
+    db = ward
+    _set_preceptor(db, "n3", "g1a")  # n3=프리셉티, g1a=프리셉터
+    pv = preview_team_classification(db, group_id="A", year=2026, month=8)
+    pair = next(p for p in pv["pairs"] if p["preceptee_id"] == "n3")
+    assert pair["status"] == "together"
+    assert not any("갈라" in w for w in pv["warnings"])
+
+
+def test_pair_split_warns_when_preceptor_non_participant(ward):
+    """프리셉터가 미참여(미지정)면 프리셉티가 따라갈 수 없어 짝이 갈라짐 → 경고."""
+    db = ward
+    _set_preceptor(db, "n3", "g1a")
+    # g1b 를 시드로 남기고 g1a(프리셉터) 미참여 → 단 팀 시니어 수 확보 위해 g1b 외 G1 필요.
+    # num_teams=2 이므로 G1 2명 필요 → g1a 빠지면 부족. 대신 프리셉티 n3 를 미참여로.
+    participants = ["g1a", "g1b", "n1", "n2", "n4", "n5", "n6"]  # n3 제외
+    pv = preview_team_classification(
+        db, group_id="A", year=2026, month=8, participant_ids=participants,
+    )
+    pair = next(p for p in pv["pairs"] if p["preceptee_id"] == "n3")
+    assert pair["status"] == "split"
+    assert any("갈라" in w for w in pv["warnings"])
+
+
+def test_pair_release_emits_event_and_flush_clears(ward):
+    """해제(release): apply 시 프리셉터십 종료 이벤트 → flush 후 preceptor_id None."""
+    db = ward
+    _set_preceptor(db, "n3", "g1a")
+    res = apply_team_classification(
+        db, group_id="A", office_id="o1", year=2026, month=8,
+        assignments=[], pair_decisions={"n3": "release"},
+    )
+    assert res["released"] == 1
+    flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
+    n3 = db.query(Nurse).filter(Nurse.nurse_id == "n3").first()
+    assert n3.preceptor_id is None
+
+
+def test_pair_release_drops_follow_in_preview(ward):
+    """해제 선택 시 preview 에서 status=released (강제 follow 대상 아님)."""
+    db = ward
+    _set_preceptor(db, "n3", "g1a")
+    pv = preview_team_classification(
+        db, group_id="A", year=2026, month=8, pair_decisions={"n3": "release"},
+    )
+    pair = next(p for p in pv["pairs"] if p["preceptee_id"] == "n3")
+    assert pair["status"] == "released"

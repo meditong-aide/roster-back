@@ -300,3 +300,42 @@ def test_apply_graceful_skips_conflict(db):
     )
     assert res["transfers"] == 1               # ok 성공
     assert any(f["nurse_id"] == "x" for f in res["failed"])  # x 만 실패
+
+
+def test_fixed_preceptee_not_dragged_by_participant_preceptor(pool):
+    """미참여(fixed) 프리셉티는 참여 프리셉터를 따라가지 않고 현재 병동에 남는다."""
+    db = pool
+    db.query(Nurse).filter(Nurse.nurse_id == "a1").update(
+        {"preceptor_id": "a0"}, synchronize_session=False)
+    db.flush()
+    # a0 만 참여(이동 자유), a1(프리셉티) 포함 나머지는 미참여=현재 병동 고정
+    pv = preview_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7, participant_ids=["a0"],
+    )
+    where = {nid: wid for wid, w in pv["wards"].items() for nid in w["nurse_ids"]}
+    assert where["a1"] == "A"  # fixed → follow 에 끌려가지 않음
+
+
+def test_ward_pair_split_warns_when_preceptor_excluded(db):
+    """프리셉터가 풀에서 빠지면(파견 겹침) 프리셉티와 갈라짐 → 경고."""
+    from datetime import date as _d
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    db.add(Team(office_id="o1", group_id="A", team_id=1, team_name="1팀"))
+    db.add(Team(office_id="o1", group_id="B", team_id=1, team_name="1팀"))
+    _mk_nurse(db, "a_g1", "A", 1)
+    _mk_nurse(db, "a0", "A", 2)      # 프리셉터 — 파견 겹침으로 제외 예정
+    db.add(Nurse(nurse_id="a_pe", account_id="acc_a_pe", group_id="A",
+                 office_id="o1", name="a_pe", active=1, team_id=1, grade=3,
+                 is_night_nurse=[], preceptor_id="a0"))  # 프리셉티
+    _mk_nurse(db, "b_g1", "B", 1)
+    _mk_nurse(db, "b0", "B", 2)
+    db.add(NurseAssignment(nurse_id="a0", source_group_id="A", target_group_id="B",
+                           office_id="o1", start_date=_d(2026, 8, 1), reason="파견",
+                           status="active"))  # 8월 겹침 → a0 제외
+    db.flush()
+    pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=8)
+    pair = next(p for p in pv["pairs"] if p["preceptee_id"] == "a_pe")
+    assert pair["status"] == "split"
+    assert any("갈라" in w for w in pv["warnings"])

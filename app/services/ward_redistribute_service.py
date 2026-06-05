@@ -135,11 +135,20 @@ def _load_pool(
         elif r.shift_id in vacation_codes:
             fb_map.setdefault(r.nurse_id, set()).add(day)
 
+    # 강제 follow 는 '참여자끼리'만 (옵션1과 동일 규칙). 프리셉티나 그 프리셉터가
+    # fixed(미참여) 면 follow 를 끊어 fixed 핀이 끌려가지 않게 한다.
+    def _eff_preceptor(n: NurseModel):
+        if n.preceptor_id is None:
+            return None
+        if n.nurse_id in non_participant_ids or n.preceptor_id in non_participant_ids:
+            return None
+        return n.preceptor_id
+
     inputs = [
         NurseInput(
             nurse_id=n.nurse_id,
             grade=n.grade,
-            preceptor_id=n.preceptor_id,
+            preceptor_id=_eff_preceptor(n),
             off_days=frozenset(off_map.get(n.nurse_id, set())),
             fb_days=frozenset(fb_map.get(n.nurse_id, set())),
         )
@@ -249,6 +258,38 @@ def _team_breakdown(
         return out
     except ValueError:
         return {"전체": _flat(members)}
+
+
+def _detect_ward_pairs(
+    all_nurses: list[NurseModel],
+    nurse_to_ward: dict[str, Optional[str]],
+) -> list[dict]:
+    """원래 같은 병동이던 프리셉티→프리셉터 짝의 재분배 후 상태.
+
+    status: together(결과 같은 병동) / split(다른 병동).
+    moved: 둘 중 하나라도 병동이 바뀌면 True — 병동이동 발효 시 프리셉터십이 자동
+      종료되므로(_apply_target_profile_reset) together 라도 관계는 끊긴다.
+    """
+    name = {n.nurse_id: n.name for n in all_nurses}
+    cur = {n.nurse_id: n.group_id for n in all_nurses}
+    pairs: list[dict] = []
+    for n in all_nurses:
+        if not n.preceptor_id or n.preceptor_id not in name:
+            continue
+        if cur.get(n.nurse_id) != cur.get(n.preceptor_id):
+            continue  # 원래 같은 병동이던 짝만 대상
+        pe, pr = n.nurse_id, n.preceptor_id
+        pe_w, pr_w = nurse_to_ward.get(pe), nurse_to_ward.get(pr)
+        status = "together" if (pe_w is not None and pe_w == pr_w) else "split"
+        moved = (pe_w is not None and pe_w != cur.get(pe)) or \
+                (pr_w is not None and pr_w != cur.get(pr))
+        pairs.append({
+            "preceptee_id": pe, "preceptee_name": name.get(pe),
+            "preceptor_id": pr, "preceptor_name": name.get(pr),
+            "preceptee_to": pe_w, "preceptor_to": pr_w,
+            "status": status, "moved": moved,
+        })
+    return pairs
 
 
 def preview_ward_redistribution(
@@ -396,6 +437,24 @@ def preview_ward_redistribution(
                     "to": wid, "to_name": name_map.get(wid),
                 })
 
+    # 프리셉터 짝 탐지/경고 — 병동을 넘으면 발효 시 프리셉터십 자동 종료
+    nurse_to_ward: dict[str, Optional[str]] = {}
+    for wid, w in wards.items():
+        for nid in w["nurse_ids"]:
+            nurse_to_ward[nid] = wid
+    pairs = _detect_ward_pairs(pool + night + excluded_overlap, nurse_to_ward)
+    for p in pairs:
+        if p["status"] == "split":
+            warnings.append(
+                f"프리셉티 {p['preceptee_name']}–프리셉터 {p['preceptor_name']} 짝이 "
+                f"다른 병동으로 갈라집니다(병동이동 발효 시 프리셉터십 자동 종료)."
+            )
+        elif p["moved"]:
+            warnings.append(
+                f"프리셉티 {p['preceptee_name']}–프리셉터 {p['preceptor_name']}는 함께 "
+                f"이동하지만, 병동이동 발효 시 프리셉터십이 자동 종료됩니다."
+            )
+
     excluded = [
         {"nurse_id": n.nurse_id, "name": n.name, "group_id": n.group_id}
         for n in night
@@ -434,6 +493,7 @@ def preview_ward_redistribution(
         },
         "moves": moves,
         "num_moved": len(moves),
+        "pairs": pairs,
         "stats": {
             "objective": result.objective,
             "overlap_total": result.overlap_total,

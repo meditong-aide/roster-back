@@ -92,6 +92,39 @@ def test_flush_none_attr_not_overwritten(seed):
     assert nurse.grade == 2  # grade 는 target None → 미변경
 
 
+def test_release_preceptor_only(seed):
+    """프리셉터십 해제 전용 이벤트 — 다른 속성 없이 release 만으로 생성 가능."""
+    db = seed
+    db.add(Nurse(
+        nurse_id="pe", account_id="acc_pe", group_id="A", office_id="o1",
+        name="신입", active=1, team_id=1, grade=3, preceptor_id="n1",
+    ))
+    db.flush()
+    row = create_permanent_change(
+        db, nurse_id="pe", group_id="A", office_id="o1",
+        start_date=date(2026, 8, 1), release_preceptor=True,
+    )
+    assert row.kind == "permanent_change"
+    assert row.payload["release_preceptor"] is True
+    assert row.payload["prev_preceptor_id"] == "n1"
+
+
+def test_flush_applies_preceptor_release(seed):
+    db = seed
+    db.add(Nurse(
+        nurse_id="pe", account_id="acc_pe", group_id="A", office_id="o1",
+        name="신입", active=1, team_id=1, grade=3, preceptor_id="n1",
+    ))
+    db.flush()
+    create_permanent_change(
+        db, nurse_id="pe", group_id="A", office_id="o1",
+        start_date=date(2026, 8, 1), release_preceptor=True,
+    )
+    flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
+    pe = db.query(Nurse).filter(Nurse.nurse_id == "pe").first()
+    assert pe.preceptor_id is None  # 발효 후 프리셉터십 종료
+
+
 def test_permanent_change_does_not_block_presence_event(seed):
     """active 속성변경이 있어도 파견/이동 같은 존재 이벤트 생성을 막지 않아야 함."""
     db = seed

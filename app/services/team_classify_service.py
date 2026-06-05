@@ -35,6 +35,7 @@ def _load_pool_and_inputs(
     year: int,
     month: int,
     participant_ids: Optional[list[str]] = None,
+    pair_decisions: Optional[dict[str, str]] = None,
 ) -> tuple[list[NurseModel], list[NurseInput], list[NurseModel], list[NurseModel]]:
     """참여 풀 + NurseInput + 미지정(미참여 적격) + 제외(N전담) 구성.
 
@@ -95,11 +96,15 @@ def _load_pool_and_inputs(
         elif r.shift_id in vacation_codes:
             fb_map.setdefault(r.nurse_id, set()).add(day)
 
+    # 해제(release)로 표시된 프리셉티는 강제 follow 대상에서 제외(preceptor_id 무시)
+    released = {
+        pid for pid, d in (pair_decisions or {}).items() if d == "release"
+    }
     inputs = [
         NurseInput(
             nurse_id=n.nurse_id,
             grade=n.grade,
-            preceptor_id=n.preceptor_id,
+            preceptor_id=None if n.nurse_id in released else n.preceptor_id,
             off_days=frozenset(off_map.get(n.nurse_id, set())),
             fb_days=frozenset(fb_map.get(n.nurse_id, set())),
         )
@@ -146,6 +151,41 @@ def _map_clusters_to_team_ids(
     return result
 
 
+def _detect_pairs(
+    all_nurses: list[NurseModel],
+    pool_ids: set[str],
+    nurse_to_team: dict[str, Optional[int]],
+    pair_decisions: Optional[dict[str, str]],
+) -> list[dict]:
+    """현재 병동의 프리셉티→프리셉터 짝 + 분류 후 상태.
+
+    status: released(해제 선택) / split(한쪽 미참여 또는 다른 팀) / together(같은 팀).
+    split 은 경고 대상 — 짝이 갈라짐.
+    """
+    decisions = pair_decisions or {}
+    name = {n.nurse_id: n.name for n in all_nurses}
+    pairs: list[dict] = []
+    for n in all_nurses:
+        if not n.preceptor_id or n.preceptor_id not in name:
+            continue  # preceptor 가 같은 병동 활성 간호사가 아니면 짝으로 보지 않음
+        pe, pr = n.nurse_id, n.preceptor_id
+        decision = decisions.get(pe, "keep")
+        if decision == "release":
+            status = "released"
+        elif not (pe in pool_ids and pr in pool_ids):
+            status = "split"  # 한쪽이라도 미참여 → 갈라짐
+        elif nurse_to_team.get(pe) != nurse_to_team.get(pr):
+            status = "split"
+        else:
+            status = "together"
+        pairs.append({
+            "preceptee_id": pe, "preceptee_name": name.get(pe),
+            "preceptor_id": pr, "preceptor_name": name.get(pr),
+            "decision": decision, "status": status,
+        })
+    return pairs
+
+
 def preview_team_classification(
     db: Session,
     *,
@@ -153,14 +193,17 @@ def preview_team_classification(
     year: int,
     month: int,
     participant_ids: Optional[list[str]] = None,
+    pair_decisions: Optional[dict[str, str]] = None,
 ) -> dict:
     """원티드 기반 팀 분류 미리보기 (read-only, DB 변경 없음).
 
     participant_ids 지정 시 그 집합만 팀에 배치, 미참여 적격은 '미지정'.
     N전담은 기본 제외(권장)이나 participant_ids 에 포함하면 참여(apply 시 해제 동반).
+    pair_decisions {preceptee_id: "keep"|"release"} — release 면 프리셉티가 프리셉터를
+    따라가지 않고 독립 분류(apply 시 프리셉터십 해제). 갈라지는 짝은 warnings 로 안내.
     """
     pool, inputs, unassigned, excluded_night = _load_pool_and_inputs(
-        db, group_id, year, month, participant_ids
+        db, group_id, year, month, participant_ids, pair_decisions
     )
     if not pool:
         raise ValueError("분류(참여) 대상 간호사가 없습니다.")
@@ -188,16 +231,30 @@ def preview_team_classification(
 
     proposed: dict[int, list[str]] = {}
     changes: list[dict] = []
+    nurse_to_team: dict[str, Optional[int]] = {}
     for ci, members in result.teams.items():
         tid = idx_to_team[ci]
         proposed[tid] = members
         for nid in members:
+            nurse_to_team[nid] = tid
             cur = current_team.get(nid)
             if cur != tid:
                 changes.append({
                     "nurse_id": nid, "name": name_map.get(nid),
                     "from": cur, "to": tid,
                 })
+
+    # 프리셉터 짝 탐지 — 전체 활성 = 풀 + 미지정 + N전담제외
+    all_nurses = pool + unassigned + excluded_night
+    pool_ids = {n.nurse_id for n in pool}
+    pairs = _detect_pairs(all_nurses, pool_ids, nurse_to_team, pair_decisions)
+    warnings: list[str] = []
+    for p in pairs:
+        if p["status"] == "split":
+            warnings.append(
+                f"프리셉티 {p['preceptee_name']}–프리셉터 {p['preceptor_name']} 짝이 "
+                f"갈라집니다. 유지하려면 둘 다 참여시키고, 끊으려면 '해제'를 선택하세요."
+            )
 
     return {
         "target_month": f"{year}-{month:02d}",
@@ -213,6 +270,8 @@ def preview_team_classification(
         "teams": {str(t): members for t, members in proposed.items()},
         "changes": changes,
         "num_changed": len(changes),
+        "pairs": pairs,
+        "warnings": warnings,
         "stats": {
             "objective": result.objective,
             "overlap_total": result.overlap_total,
@@ -229,13 +288,16 @@ def apply_team_classification(
     year: int,
     month: int,
     assignments: list[dict],
+    pair_decisions: Optional[dict[str, str]] = None,
     note: Optional[str] = None,
 ) -> dict:
     """승인된 팀 분류를 permanent_change 이벤트로 발행 (대상월 1일 발효).
 
     assignments: [{nurse_id, team_id}] — 변경 대상만(또는 전체) 전달.
     현재 team_id 와 같으면 스킵. 이벤트 생성만, Nurse 즉시 변경은 flush 가 발효일에.
-    Returns: {created, skipped, effective_date}
+    pair_decisions {preceptee_id: "release"} — 해당 프리셉티의 프리셉터십 종료(발효일).
+      팀변경과 같은 nurse 면 한 이벤트로 묶고, 아니면 해제 전용 이벤트를 추가 발행.
+    Returns: {created, skipped, released, effective_date}
 
     주의: nurses.team_id 는 프로덕션에서 varchar(문자열), 제안 team_id 는 int 일 수 있어
     비교는 반드시 str() 정규화로 한다 (안 그러면 무변경도 이벤트 생성됨).
@@ -245,6 +307,7 @@ def apply_team_classification(
         n.nurse_id: n
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id)
     }
+    released = {pid for pid, d in (pair_decisions or {}).items() if d == "release"}
 
     def _same(a, b) -> bool:
         if a is None or b is None:
@@ -253,6 +316,8 @@ def apply_team_classification(
 
     created = 0
     skipped = 0
+    handled_release: set[str] = set()
+    _note = note or f"원티드 팀분류 {year}-{month:02d}"
     for a in assignments:
         nid = a["nurse_id"]
         new_team = a["team_id"]
@@ -262,18 +327,35 @@ def apply_team_classification(
             continue
         # N전담을 팀에 편입하면 N전담 해제 동반(is_night_nurse=[]) — 발효일 기반
         is_n_override = (nurse.is_night_nurse or []) == ["N"]
-        if _same(nurse.team_id, new_team) and not is_n_override:
+        rel = nid in released
+        if _same(nurse.team_id, new_team) and not is_n_override and not rel:
             skipped += 1
             continue
         create_permanent_change(
             db, nurse_id=nid, group_id=group_id, office_id=office_id,
             start_date=effective, new_team_id=new_team,
             new_shift_types=[] if is_n_override else None,
-            note=note or f"원티드 팀분류 {year}-{month:02d}",
+            release_preceptor=rel,
+            note=_note,
         )
+        if rel:
+            handled_release.add(nid)
         created += 1
+
+    # assignments 에 없던 해제 대상 → 해제 전용 이벤트
+    for nid in released - handled_release:
+        if cur_nurses.get(nid) is None:
+            continue
+        create_permanent_change(
+            db, nurse_id=nid, group_id=group_id, office_id=office_id,
+            start_date=effective, release_preceptor=True, note=_note,
+        )
+        handled_release.add(nid)
+        created += 1
+
     return {
         "created": created,
         "skipped": skipped,
+        "released": len(handled_release),
         "effective_date": effective.isoformat(),
     }

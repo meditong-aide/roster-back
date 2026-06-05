@@ -26,6 +26,7 @@ class TeamClassifyPreviewRequest(BaseModel):
     month: int
     group_id: str | None = None  # master_admin 만 타 그룹 지정 가능
     participant_ids: list[str] | None = None  # 참여 인원(미지정 시 전원). 미참여=미지정
+    pair_decisions: dict[str, str] | None = None  # {preceptee_id: "keep"|"release"}
 
 
 class TeamAssignmentItem(BaseModel):
@@ -38,6 +39,7 @@ class TeamClassifyApplyRequest(BaseModel):
     month: int
     assignments: list[TeamAssignmentItem]
     group_id: str | None = None
+    pair_decisions: dict[str, str] | None = None  # {preceptee_id: "release"} 프리셉터십 종료
     note: str | None = None
 
 
@@ -179,6 +181,7 @@ async def classify_preview(
         return preview_team_classification(
             db, group_id=target_group_id, year=body.year, month=body.month,
             participant_ids=body.participant_ids,
+            pair_decisions=body.pair_decisions,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -200,6 +203,7 @@ async def classify_apply(
             year=body.year,
             month=body.month,
             assignments=[a.model_dump() for a in body.assignments],
+            pair_decisions=body.pair_decisions,
             note=body.note,
         )
     except ValueError as e:
