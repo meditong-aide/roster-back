@@ -123,3 +123,88 @@ def compare_graph_and_evaluator(*, snapshot: SemanticsSnapshot, current_atoms: l
         evaluator_summary={"hard_keys": len(evaluator_hard), "risk_keys": len(evaluator_risk)},
         graph_summary={"hard_keys": len(graph_hard), "risk_keys": len(graph_risk)},
     )
+
+
+# ---- Phase B parity: solver-emitted vs snapshot-derived (graph) -------------------
+
+
+@dataclass(slots=True)
+class SolverGraphParityReport:
+    family: str
+    matched: list[str] = field(default_factory=list)
+    solver_only: list[str] = field(default_factory=list)
+    graph_only: list[str] = field(default_factory=list)
+    mode_mismatches: list[dict[str, Any]] = field(default_factory=list)
+    solver_count: int = 0
+    graph_count: int = 0
+
+
+def _solver_emitted_key(rec) -> str:
+    """Stable key for an EmittedConstraint of the BoundaryTransitionBan family."""
+    sc = rec.scope or {}
+    return f"transition:{sc.get('nurse_index')}:{sc.get('day')}:{sc.get('transition')}"
+
+
+def _graph_node_key_for_transition_ban(node) -> str | None:
+    """Stable key for a graph ConstraintNode of family transition_ban."""
+    if str(node.family) != "transition_ban":
+        return None
+    sc = node.scope or {}
+    return f"transition:{sc.get('nurse_index')}:{sc.get('day')}:{node.target}"
+
+
+def compare_solver_emitted_vs_graph_derived(
+    *,
+    snapshot,
+    solver_emitted: list,
+    family: str = "BoundaryTransitionBan",
+    graph_family_alias: str = "transition_ban",
+) -> SolverGraphParityReport:
+    """For one family, compare what the solver actually emitted vs what the
+    snapshot-derived graph predicts. v1 supports BoundaryTransitionBan only —
+    extend the per-family key extractors as more families get the emit treatment."""
+    from services.constraint_impact.atoms import build_assignment_atoms
+    from services.constraint_impact.graph_builder import build_constraint_nodes
+
+    if family != "BoundaryTransitionBan":
+        return SolverGraphParityReport(family=family)
+
+    solver_records = [r for r in (solver_emitted or []) if getattr(r, "family", None) == family]
+    solver_keys: dict[str, Any] = {_solver_emitted_key(r): r for r in solver_records}
+
+    atoms = []
+    rs = getattr(snapshot, "_rs_handle", None)
+    if rs is not None:
+        try:
+            atoms = build_assignment_atoms(snapshot, rs.roster)
+        except Exception:
+            atoms = []
+    nodes = build_constraint_nodes(snapshot=snapshot, atoms=atoms)
+    graph_keys: dict[str, Any] = {}
+    for n in nodes:
+        k = _graph_node_key_for_transition_ban(n)
+        if k:
+            graph_keys[k] = n
+
+    matched: list[str] = []
+    mode_mismatches: list[dict[str, Any]] = []
+    for k, srec in solver_keys.items():
+        if k in graph_keys:
+            matched.append(k)
+            gnode_mode = str(graph_keys[k].mode)
+            if gnode_mode != srec.mode:
+                mode_mismatches.append(
+                    {"key": k, "solver_mode": srec.mode, "graph_mode": gnode_mode}
+                )
+    solver_only = sorted(set(solver_keys) - set(graph_keys))
+    graph_only = sorted(set(graph_keys) - set(solver_keys))
+
+    return SolverGraphParityReport(
+        family=family,
+        matched=sorted(matched),
+        solver_only=solver_only,
+        graph_only=graph_only,
+        mode_mismatches=mode_mismatches,
+        solver_count=len(solver_records),
+        graph_count=len(graph_keys),
+    )

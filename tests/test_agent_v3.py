@@ -285,34 +285,44 @@ class TestDeterministicClient:
 
 
 class TestConversationStore:
-    def test_create_and_get(self):
-        store = ConversationStore()
-        conv = store.create()
-        assert store.get(conv.id) is not None
-        assert store.get(conv.id).id == conv.id
+    """ConversationStore is now SessionMemoryRepo-backed (US-A2).
+    All methods require db Session — group_id 격리 강제.
+    """
 
-    def test_get_nonexistent(self):
+    def test_create_and_get(self, db):
         store = ConversationStore()
-        assert store.get("nonexistent") is None
+        conv = store.create(db, user_id="u1", group_id="G1")
+        assert store.get(db, conv.id, group_id="G1") is not None
+        assert store.get(db, conv.id, group_id="G1").id == conv.id
 
-    def test_get_or_create(self):
+    def test_get_nonexistent(self, db):
         store = ConversationStore()
-        conv1 = store.get_or_create(None)
+        assert store.get(db, "nonexistent") is None
+
+    def test_get_or_create(self, db):
+        store = ConversationStore()
+        conv1 = store.get_or_create(db, None, user_id="u1", group_id="G1")
         assert conv1 is not None
-        conv2 = store.get_or_create(conv1.id)
+        conv2 = store.get_or_create(db, conv1.id, user_id="u1", group_id="G1")
         assert conv2.id == conv1.id
 
-    def test_save_messages(self):
+    def test_save_messages(self, db):
         store = ConversationStore()
-        conv = store.create()
-        store.save_messages(conv.id, [{"role": "user", "content": "hi"}])
-        assert len(store.get(conv.id).messages) == 1
+        conv = store.create(db, user_id="u1", group_id="G1")
+        store.save_messages(
+            db, conv.id, [{"role": "user", "content": "hi"}],
+            user_id="u1", group_id="G1",
+        )
+        assert len(store.get(db, conv.id, group_id="G1").messages) == 1
 
-    def test_variable_memory_persistence(self):
+    def test_variable_memory_persistence(self, db):
         store = ConversationStore()
-        conv = store.create()
-        store.save_variable_memory(conv.id, {"schedule_id": 42})
-        assert store.get(conv.id).variable_memory["schedule_id"] == 42
+        conv = store.create(db, user_id="u1", group_id="G1")
+        store.save_variable_memory(
+            db, conv.id, {"schedule_id": 42},
+            user_id="u1", group_id="G1",
+        )
+        assert store.get(db, conv.id, group_id="G1").variable_memory["schedule_id"] == 42
 
 
 # ── Skill Descriptions ──────���───────────────────────────────
@@ -320,7 +330,7 @@ class TestConversationStore:
 
 class TestSkillDescriptions:
     def test_count(self):
-        assert len(SKILL_TOOLS) == 9
+        assert len(SKILL_TOOLS) == 10
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:
@@ -333,6 +343,7 @@ class TestSkillDescriptions:
         assert "query_schedule" in names
         assert "bulk_mutation" in names
         assert "generate_schedule" in names
+        assert "update_monthly_limit" in names
 
 
 # ── Scope Routing (Bug #35) ────────────────────────────────
@@ -433,6 +444,84 @@ class TestSchedulingAgentE2E:
             assert "name" in stage
             assert "status" in stage
             assert "duration_ms" in stage
+
+
+# ── Preview natural-language answer ─────────────────────────
+
+
+class _PreviewScriptedClient:
+    """첫 호출은 update_deadline preview tool_call, 두 번째 호출은 사전 텍스트 반환.
+
+    tools=[] 로 호출되는 두 번째 chat 에서 답변 텍스트를 검증하기 위함.
+    auto_answer 패턴 없이 정확한 호출 순서 제어.
+    """
+
+    def __init__(self, second_text: str | None):
+        self.second_text = second_text
+        self.idx = 0
+        self.last_tools_arg: list | None = None
+
+    def chat(self, messages, tools, *, tool_choice="auto"):
+        self.last_tools_arg = tools
+        if self.idx == 0:
+            self.idx += 1
+            return LLMResponse(
+                type="tool_call",
+                tool_calls=[
+                    ToolCall(
+                        name="bulk_mutation",
+                        args={
+                            "scope": "wanted_submissions",
+                            "action": "update_deadline",
+                            "new_deadline": "2026-05-30",
+                            "preview_only": True,
+                            "year": 2026,
+                            "month": 4,
+                        },
+                        call_id="call_0",
+                    )
+                ],
+            )
+        self.idx += 1
+        if self.second_text is None:
+            return LLMResponse(type="text", text="")
+        return LLMResponse(type="text", text=self.second_text)
+
+
+class TestPreviewNaturalLanguageAnswer:
+    """Preview mutation 결과를 LLM 으로 자연어 요약하는 흐름 검증."""
+
+    def test_preview_uses_llm_generated_answer(self, db, seed_data, ctx):
+        scripted_text = "원티드 마감일을 2026-05-30로 변경합니다. 진행하시겠습니까? (응 / 취소)"
+        client = _PreviewScriptedClient(second_text=scripted_text)
+        agent = SchedulingAgent(client, enable_user_memory=False)
+
+        result = agent.run(db, "마감일 5월 30일로 해줘", ctx)
+
+        assert result.awaiting_approval is True
+        assert result.preview is not None
+        assert result.preview.get("skill_name") == "bulk_mutation"
+        assert result.answer == scripted_text
+        # tools=[] 가 두 번째 호출에 전달됐는지 — LLM 이 추가 tool_call 못 하게.
+        assert client.last_tools_arg == []
+        # trace 에 preview_summary 스테이지가 ok 로 기록됐는지.
+        summary_stages = [s for s in result.trace if s.name == "preview_summary"]
+        assert len(summary_stages) == 1
+        assert summary_stages[0].status == "ok"
+
+    def test_preview_falls_back_when_llm_returns_empty(self, db, seed_data, ctx):
+        client = _PreviewScriptedClient(second_text="")
+        agent = SchedulingAgent(client, enable_user_memory=False)
+
+        result = agent.run(db, "마감일 5월 30일로 해줘", ctx)
+
+        assert result.awaiting_approval is True
+        assert result.preview is not None
+        # Hardcoded fallback 이 사용됐는지.
+        assert "진행하시겠습니까" in result.answer
+        summary_stages = [s for s in result.trace if s.name == "preview_summary"]
+        assert len(summary_stages) == 1
+        assert summary_stages[0].status == "fallback"
 
 
 # ── Abbreviation Resolution Pipeline ────────────────────────
@@ -1130,7 +1219,12 @@ class TestWantedPerDateCRUD:
 class TestConstraintUpdate:
     """Test update_constraint skill with flat field/value params."""
 
-    def test_preview_integer_field(self, db, seed_data):
+    def test_preview_integer_field_policy_locked(self, db, seed_data):
+        """QA §B1 — max_nig_per_month 는 정책-고정 field. preview 도 거절.
+
+        과거에는 preview 정상 통과했으나 운영 정책 위반 회귀 방지를 위해
+        policy_locked 응답을 검증한다 (QA 시나리오 docs/AGENT_QA_SCENARIOS_2026-05-18.md §B1).
+        """
         from agents_v2.skills import run_skill
 
         result = run_skill(db, "update-constraint", {
@@ -1139,11 +1233,9 @@ class TestConstraintUpdate:
             "value": 5,
             "preview_only": True,
         })
-        assert result.get("preview") is True
-        assert "max_nig_per_month" in result.get("changes", {})
-        change = result["changes"]["max_nig_per_month"]
-        assert change["old"] == 7  # seed_data default
-        assert change["new"] == 5
+        assert result.get("error") == "policy_locked"
+        assert result.get("field") == "max_nig_per_month"
+        assert "update_monthly_limit" in result.get("alternative", "")
 
     def test_execute_integer_field(self, db, seed_data):
         from agents_v2.skills import run_skill

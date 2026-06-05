@@ -124,7 +124,7 @@ def _seed(db: Session):
 
     # N001 submitted wanted for May
     db.add(WantedRequest(
-        nurse_id="N001", request_id=1, month="2026-05",
+        nurse_id="N001", request_id=1, month="2026-05", group_id="GRP001",
         is_submitted=True, submitted_at=datetime(2026, 4, 10),
     ))
     db.flush()
@@ -132,13 +132,15 @@ def _seed(db: Session):
     for day, shift in [(3, "D"), (10, "N"), (15, "E")]:
         db.add(NurseShiftRequest(
             nurse_id="N001", request_id=1, detailed_request_id=day,
-            shift_date=date(2026, 5, day), shift=shift, score=1.0,
+            shift_date=date(2026, 5, day), group_id="GRP001",
+            shift=shift, score=1.0,
         ))
 
     # Pair data for N001
     db.add(NursePairRequest(
         nurse_id="N001", request_id=1, month="2026-05",
-        detailed_request_id=1, target_id="N002", score=1.5,
+        detailed_request_id=1, target_id="N002", group_id="GRP001",
+        score=1.5,
         partial_request="같이 근무 선호",
     ))
     db.flush()
@@ -153,7 +155,7 @@ def run_test(db: Session, query: str, nurse_id: str = "N001", nurse_name: str = 
     from agents_v2.conversation import ConversationStore
 
     store = ConversationStore()
-    conv = store.get_or_create(None)
+    conv = store.get_or_create(db, None, user_id=nurse_id, group_id="GRP001")
 
     ctx = SessionContext(
         office_id="OFF001",

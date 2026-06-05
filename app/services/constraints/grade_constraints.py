@@ -121,6 +121,7 @@ def add_grade_constraints(
                     by_grade=by_grade,
                     day_idx=d,
                     shift_idx=s_idx,
+                    shift_code=s_code,
                     target=target,
                     allow_soft_fallback=scaling["allow_soft_fallback"],
                     penalty_weight=scaling["grade_penalty_weight"],
@@ -145,6 +146,7 @@ def add_grade_constraints(
                     by_grade=by_grade,
                     day_idx=d,
                     shift_idx=s_idx,
+                    shift_code=s_code,
                     max_by_grade=max_by_grade,
                     allow_soft_fallback=scaling["allow_soft_fallback"],
                     penalty_weight=scaling["grade_penalty_weight"],
@@ -476,6 +478,7 @@ def _add_minimum_constraints(
     by_grade: dict[int, list[int]],
     day_idx: int,
     shift_idx: int,
+    shift_code: str,
     target: dict[int, int],
     allow_soft_fallback: bool,
     penalty_weight: int,
@@ -486,6 +489,14 @@ def _add_minimum_constraints(
     False이면 기존처럼 하드 제약을 유지한다.
     """
     obj_terms: list = []
+    # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
+    _registry = getattr(m, "_cpsat_assumption_registry", None)
+    _add_hard_fn = None
+    if _registry is not None and not allow_soft_fallback:
+        try:
+            from services.cp_sat.hard_assumption import add_hard as _add_hard_fn
+        except Exception:
+            _add_hard_fn = None
     for g, t in target.items():
         if int(t) <= 0:
             continue
@@ -496,7 +507,28 @@ def _add_minimum_constraints(
             m.Add(vars_sum + slack >= int(t))
             obj_terms.append(-penalty_weight * slack)
         else:
-            m.Add(vars_sum >= int(t))
+            if _add_hard_fn is not None and _registry is not None:
+                # 같은 (grade, shift) 의 모든 날짜를 하나의 assumption literal로 묶음.
+                # → MUS 추출 시 "grade {g} {shift_code} 최소치"라는 단일 코어로 묶여 노출.
+                _sc = str(shift_code or "").upper()
+                _name = f"GradeMin:{_sc}:grade_{g}"
+                _meta = {
+                    "node_id": f"grade_min:{_sc.lower()}:grade_{g}",
+                    "type": "GradeMinNode",
+                    "label": f"Grade {g} {_sc} min ≥ {int(t)}",
+                    "value": {"grade": g, "shift": _sc, "min": int(t)},
+                    "scope": "grade",
+                    "scope_key": f"grade_{g}_{_sc.lower()}_min",
+                    "pattern": "grade_min",
+                    "human_message_ko": f"Grade {g} 등급의 {_sc} 시프트 최소 인원 정책",
+                    "resolution_hint": (
+                        f"Grade {g} 의 {_sc} 최소치({int(t)})를 낮추거나 "
+                        f"grade_min 을 soft fallback 으로 전환하세요."
+                    ),
+                }
+                _add_hard_fn(m, _registry, name=_name, constraint_expr=(vars_sum >= int(t)), meta=_meta)
+            else:
+                m.Add(vars_sum >= int(t))
     return obj_terms
 
 
@@ -506,6 +538,7 @@ def _add_maximum_constraints(
     by_grade: dict[int, list[int]],
     day_idx: int,
     shift_idx: int,
+    shift_code: str,
     max_by_grade: dict[int, int],
     allow_soft_fallback: bool,
     penalty_weight: int,
@@ -517,6 +550,14 @@ def _add_maximum_constraints(
     False이면 하드 제약 (`vars_sum <= max_t`).
     """
     obj_terms: list = []
+    # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
+    _registry = getattr(m, "_cpsat_assumption_registry", None)
+    _add_hard_fn = None
+    if _registry is not None and not allow_soft_fallback:
+        try:
+            from services.cp_sat.hard_assumption import add_hard as _add_hard_fn
+        except Exception:
+            _add_hard_fn = None
     for g, max_t in max_by_grade.items():
         nurses = by_grade.get(g, [])
         if not nurses:
@@ -535,5 +576,24 @@ def _add_maximum_constraints(
             m.Add(vars_sum - slack_over <= mt)
             obj_terms.append(-penalty_weight * slack_over)
         else:
-            m.Add(vars_sum <= mt)
+            if _add_hard_fn is not None and _registry is not None:
+                _sc = str(shift_code or "").upper()
+                _name = f"GradeMax:{_sc}:grade_{g}"
+                _meta = {
+                    "node_id": f"grade_max:{_sc.lower()}:grade_{g}",
+                    "type": "GradeMaxNode",
+                    "label": f"Grade {g} {_sc} max ≤ {mt}",
+                    "value": {"grade": g, "shift": _sc, "max": mt},
+                    "scope": "grade",
+                    "scope_key": f"grade_{g}_{_sc.lower()}_max",
+                    "pattern": "grade_max",
+                    "human_message_ko": f"Grade {g} 등급의 {_sc} 시프트 최대 인원 정책",
+                    "resolution_hint": (
+                        f"Grade {g} 의 {_sc} 최대치({mt})를 높이거나 "
+                        f"grade_max 을 soft fallback 으로 전환하세요."
+                    ),
+                }
+                _add_hard_fn(m, _registry, name=_name, constraint_expr=(vars_sum <= mt), meta=_meta)
+            else:
+                m.Add(vars_sum <= mt)
     return obj_terms

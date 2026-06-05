@@ -259,7 +259,41 @@ def optimize_fallback_lex_hard_first(
 
     fixed, fixed_cnt = {}, [[0] * S for _ in range(D)]
     fixed_type_by_cell: dict[tuple[int, int], Optional[str]] = {}
+    fixed_source_by_cell: dict[tuple[int, int], str] = {}
     fixed_wanted_cells: set[tuple[int, int]] = set()
+
+    def _normalize_fixed_source(
+        raw_source: object,
+        shift_type: Optional[str],
+        shift_main: str,
+    ) -> str:
+        src = str(raw_source or "").strip().lower()
+        if src:
+            if src == "fixed_wanted":
+                return "fixed_wanted"
+            if src == "2n2off_recovery":
+                return "recovery_2n2off"
+            if src == "3n2off_recovery":
+                return "recovery_3n2off"
+            if src == "recovery_off":
+                return "recovery_off"
+            if src in {"weekly_off", "weekoff", "weekly_off_fixed"}:
+                return "weekly_off"
+            if src in {"special_fixed", "special", "vacation", "leave"}:
+                return "special"
+            return src
+        st = str(shift_type or "").strip()
+        if st == "주휴":
+            return "weekly_off"
+        if st in {"휴가", "공가", "휴무"}:
+            return "special"
+        if shift_main == "O":
+            return "off_fixed"
+        return "manual"
+
+    def _fixed_pattern_from_source(source: str) -> str:
+        return f"fixed_assignment:{source or 'manual'}"
+
     # print('이미 있음 fixed_type_by_cell', fixed_type_by_cell)
     for c in getattr(roster_system, "fixed_cells", []) or []:
         
@@ -283,6 +317,11 @@ def optimize_fallback_lex_hard_first(
             (c.get("shift_type") or "").strip()
             or code2type.get(raw_code)
             or code2type.get(s_main)
+        )
+        fixed_source_by_cell[(n, d)] = _normalize_fixed_source(
+            c.get("fixed_source"),
+            fixed_type_by_cell[(n, d)],
+            s_main,
         )
         if str(c.get("fixed_source") or "").strip().lower() == "fixed_wanted":
             fixed_wanted_cells.add((n, d))
@@ -480,14 +519,35 @@ def optimize_fallback_lex_hard_first(
         coverage_eq: Optional[int] = None,
         over_le: Optional[int] = None,
         stage2_zero_locks: Optional[Dict[str, list]] = None,
-        relax_level: int = 0,
+        broad_soft: bool = False,
     ):
         m = cp_model.CpModel()
+        # per-nurse OFF cap slack 추적: post-solve 시 어느 nurse 가 슬랙을 실제로
+        # 사용했는지 로그하기 위함.
+        m._off_slack_lower_by_n = {}  # type: ignore[attr-defined]
+        m._off_slack_upper_by_n = {}  # type: ignore[attr-defined]
+        # HardAssumptionRegistry — MUS (UNSAT core) 추출 인프라.
+        # 모든 hard 식을 BoolVar + OnlyEnforceIf(lit) 로 reify 하므로 모델 사이즈와
+        # search branching 이 늘어나 wall-time 비용이 상당하다. INFEASIBLE 케이스가
+        # 드문 운영 환경에서는 비용 대비 효용이 낮아 **기본 OFF**.
+        # MUS 추출이 필요하면 `AIDE_ENABLE_MUS_REGISTRY=1` 로 명시 활성화.
+        _add_hard_fb = None
+        _assume_registry_fb = None
+        try:
+            import os as _os_fb
+            if _os_fb.environ.get("AIDE_ENABLE_MUS_REGISTRY") == "1":
+                from services.cp_sat.hard_assumption import HardAssumptionRegistry, add_hard as _add_hard_fb
+                _assume_registry_fb = HardAssumptionRegistry(m)
+                m._cpsat_assumption_registry = _assume_registry_fb  # type: ignore[attr-defined]
+                print(f"[FallbackLex] AIDE_ENABLE_MUS_REGISTRY=1 — registry wrapping ON (stage={stage})")
+        except Exception as _ar_fb_exc:
+            print(f"[FallbackLex] HardAssumptionRegistry init failed (ignore): {_ar_fb_exc}")
+            _assume_registry_fb = None
         soft_coverage = bool(getattr(cfg, "soften_daily_coverage", False))
         coverage_soft_slack = int(getattr(cfg, "coverage_soft_slack", 0) or 0)
-        # 정책 (2026-05-13 이후): relax_level 여부와 무관하게 max coverage / M min 일괄 HARD 유지.
-        # 이전: relax_level >= 3 일 때 soft 전환했으나, 운영상 max coverage 가 무너지면 품질 저하 →
-        # relax 단계에서도 hard 유지. 인원 부족 시에는 다른 hard(team_min, grade 등) 를 먼저 soft 로 풀어야 함.
+        # 정책 (2026-05-13, HanJongjun): max coverage / M min 은 어떤 단계든 HARD 유지.
+        # 무너지면 환자 안전 영향 큼 → relax 시에는 다른 hard(team/grade) 를 먼저 풀어야 함.
+        # ralph 의 broad_soft 트리거는 폐기 (사용자 정책 결정 2026-05-17).
         _relax_coverage = False
         coverage_soft_weight = int(
             getattr(cfg, "coverage_soft_penalty_weight", 120000) or 120000
@@ -557,7 +617,7 @@ def optimize_fallback_lex_hard_first(
 
         # weekly_off_by_idx, cross-month 등
         # 👉 여기서만 structural_off_cells에 추가
-        if stage == 1 and relax_level == 0:
+        if stage == 1 and not broad_soft:
             try:
                 mapping_logs = []
                 for idx, nu in enumerate(roster_system.nurses):
@@ -689,7 +749,7 @@ def optimize_fallback_lex_hard_first(
                         f"avail_days={avail_days}"
                     )
                     if is_n_only:
-                        max_off_allowed = max(0, avail_days - 15) + relax_level
+                        max_off_allowed = max(0, avail_days - 15)
                         # print(f'is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     else:
                         vacation_cnt = sum(
@@ -708,7 +768,7 @@ def optimize_fallback_lex_hard_first(
                             weekend_only=bool(getattr(nu, "is_weekend_off", False)),
                             weekend_slots_nonvac=weekend_slots_nonvac,
                         )
-                        max_off_allowed = int(off_bounds["max_off_allowed"]) + relax_level
+                        max_off_allowed = int(off_bounds["max_off_allowed"])
                         # print(f'not is_n_only, 간호사 n: {n}, max_off_allowed: {max_off_allowed}')
                     if forced_off_cnt > max_off_allowed:
                         # print(f'forced_off_cnt > max_off_allowed, 간호사 n: {n}, forced_off_cnt: {forced_off_cnt}, max_off_allowed: {max_off_allowed}')
@@ -741,14 +801,60 @@ def optimize_fallback_lex_hard_first(
         active_days = build_active_days(N, join, leave, blocked_by_nurse)
         # 고정 셀
         for (n, d), s_idx in fixed.items():
+            _fixed_source = fixed_source_by_cell.get((n, d), "manual")
+            _fixed_pattern = _fixed_pattern_from_source(_fixed_source)
             if (n, d) not in active_days:
                 continue
             if _is_preceptee_at(n):
                 continue
-            m.Add(X(n, d, s_idx) == 1)
+            _fixed_expr = (X(n, d, s_idx) == 1)
+            if _assume_registry_fb is not None and _add_hard_fb is not None:
+                _add_hard_fb(
+                    m,
+                    _assume_registry_fb,
+                    name=f"FixedCell:nurse_{n}:day_{d}",
+                    constraint_expr=_fixed_expr,
+                    meta={
+                        "node_id": f"fixed_cell:nurse_{n}:day_{d}",
+                        "type": "FixedWantedNode",
+                        "label": "fixed_assignment",
+                        "value": {"day": d + 1, "shift_idx": int(s_idx)},
+                        "fixed_source": _fixed_source,
+                        "scope": "nurse",
+                        "scope_key": f"nurse_{n}",
+                        "pattern": _fixed_pattern,
+                        "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                        "human_message_ko": f"{d + 1}일 고정 근무를 유지해야 합니다.",
+                        "resolution_hint": "해당 날짜 고정 근무를 해제하거나 충돌 정책을 완화하세요.",
+                    },
+                )
+            else:
+                m.Add(_fixed_expr)
             for s in range(S):
                 if s != s_idx:
-                    m.Add(X(n, d, s) == 0)
+                    _ban_expr = (X(n, d, s) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"FixedCellBan:nurse_{n}:day_{d}",
+                            constraint_expr=_ban_expr,
+                            meta={
+                                "node_id": f"fixed_cell_ban:nurse_{n}:day_{d}",
+                                "type": "FixedWantedNode",
+                                "label": "fixed_assignment_exclusive",
+                                "value": {"day": d + 1, "fixed_shift_idx": int(s_idx)},
+                                "fixed_source": _fixed_source,
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": _fixed_pattern,
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": f"{d + 1}일 고정 근무와 다른 시프트는 금지됩니다.",
+                                "resolution_hint": "고정 근무 또는 다른 하드 제약 중 하나를 조정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_ban_expr)
         # W(특별 근무)는 고정 셀 외에는 전부 금지
         if has_w and w_idx is not None:
             for n in range(N):
@@ -757,10 +863,38 @@ def optimize_fallback_lex_hard_first(
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     if (n, d) in fixed and fixed[(n, d)] == w_idx:
                         continue
-                    m.Add(X(n, d, w_idx) == 0)
+                    _w_ban_expr = (X(n, d, w_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"SpecialShiftBanW:nurse_{n}:day_{d}",
+                            constraint_expr=_w_ban_expr,
+                            meta={
+                                "node_id": f"special_shift_ban_w:nurse_{n}:day_{d}",
+                                "type": "ForbiddenCellNode",
+                                "label": "ban_unfixed_w_shift",
+                                "value": {"day": d + 1, "shift": "W"},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "forbidden_shift",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "고정되지 않은 W(특별 근무)는 배정할 수 없습니다.",
+                                "resolution_hint": "W 배정이 필요하면 해당 셀을 고정 근무로 지정하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_w_ban_expr)
         # 순수 O 4연속 금지 (fixed로 이미 4O면 경고만 남기고 스킵)
         # cfg.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3)
-        if off_idx is not None:
+        # cfg.enforce_4o_hard=False 또는 env ROSTER_DISABLE_4O_HARD=1 이면 4O hard 전체 비활성(테스트/완화).
+        import os as _os_4o_env_fb
+        _enforce_4o_hard_eff_fb = bool(getattr(cfg, "enforce_4o_hard", True))
+        if _os_4o_env_fb.environ.get("ROSTER_DISABLE_4O_HARD"):
+            _enforce_4o_hard_eff_fb = False
+        if not _enforce_4o_hard_eff_fb:
+            print(f"{logger_prefix} [4O-hard] DISABLED (cfg.enforce_4o_hard={getattr(cfg, 'enforce_4o_hard', True)}, env={_os_4o_env_fb.environ.get('ROSTER_DISABLE_4O_HARD')})")
+        if off_idx is not None and _enforce_4o_hard_eff_fb:
             vac_cells = set(off_exception_vacation_cells)
             skip_4o_hard_first_days = int(getattr(cfg, "skip_4o_hard_first_days", 3) or 0)
             for n in range(N):
@@ -801,6 +935,8 @@ def optimize_fallback_lex_hard_first(
         print(f"{logger_prefix} [4O-cross-month-debug] prev_off_tail_by_idx keys={list(prev_off_tail.keys())}, "
               f"values={dict(prev_off_tail)}, N={N}")
         for n in range(N):
+            if not _enforce_4o_hard_eff_fb:
+                break
             if _is_preceptee_at(n):
                 continue
             t = prev_off_tail.get(n, 0)
@@ -967,7 +1103,7 @@ def optimize_fallback_lex_hard_first(
         #                 left_pos = d - 1
         #                 right_pos = d + 1
         #                 # if left_pos >= T0 and left_pos not in shortage_days:
-        #                 allow_shortage_off = relax_level >= 3
+                #                 allow_shortage_off = broad_soft
 
         #                 if left_pos >= T0 and (allow_shortage_off or left_pos not in shortage_days):
         #                     neighbours.append(("left", X(n, left_pos, off_idx)))
@@ -1018,7 +1154,28 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) in fixed:
                             # 유저 고정 셀 우선: 해당 날 전체 금지 무시
                             continue
-                        m.Add(X(n, d, s_idx) == 0)
+                        _if_expr = (X(n, d, s_idx) == 0)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"InitialForbidden:nurse_{n}:day_{d}",
+                                constraint_expr=_if_expr,
+                                meta={
+                                    "node_id": f"initial_forbidden:nurse_{n}:day_{d}",
+                                    "type": "ForbiddenCellNode",
+                                    "label": "initial_forbidden_shift",
+                                    "value": {"day": d + 1, "shift": code},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "initial_forbidden",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": f"초기 금지 규칙에 의해 {d + 1}일 {code} 배정이 금지됩니다.",
+                                    "resolution_hint": "초기 금지 규칙을 해제하거나 다른 하드 제약을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_if_expr)
         except Exception as e:
             print(f"{logger_prefix} 초기 금지 셀 적용 중 오류: {e}")
 
@@ -1336,17 +1493,80 @@ def optimize_fallback_lex_hard_first(
                 if getattr(cfg, "ban_n_to_d", True):
                     # fixed_cells로 N→D가 명시적으로 고정된 경우 제약 면제
                     if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == day_idx):
-                        m.Add(xn + xd <= 1)
+                        _n2d_expr = (xn + xd <= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"TransitionBanN2D:nurse_{n}:day_{d}",
+                                constraint_expr=_n2d_expr,
+                                meta={
+                                    "node_id": f"transition_ban_n2d:nurse_{n}:day_{d}",
+                                    "type": "TransitionBanNode",
+                                    "label": "ban_n_to_d",
+                                    "value": {"day": d + 1, "transition": "N->D"},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "transition_ban",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "N 다음날 D 전이는 금지됩니다.",
+                                    "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_n2d_expr)
                 if getattr(cfg, "ban_e_to_d", True):
                     xe = X(n, d - 1, eve_idx)
                     # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
                     if not (fixed.get((n, d-1)) == eve_idx and fixed.get((n, d)) == day_idx):
-                        m.Add(xe + xd <= 1)
+                        _e2d_expr = (xe + xd <= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"TransitionBanE2D:nurse_{n}:day_{d}",
+                                constraint_expr=_e2d_expr,
+                                meta={
+                                    "node_id": f"transition_ban_e2d:nurse_{n}:day_{d}",
+                                    "type": "TransitionBanNode",
+                                    "label": "ban_e_to_d",
+                                    "value": {"day": d + 1, "transition": "E->D"},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "transition_ban",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "E 다음날 D 전이는 금지됩니다.",
+                                    "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_e2d_expr)
                 if getattr(cfg, "ban_n_to_e", True):
                     xe2 = X(n, d, eve_idx)
                     # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
                     if not (fixed.get((n, d-1)) == night_idx and fixed.get((n, d)) == eve_idx):
-                        m.Add(xn + xe2 <= 1)
+                        _n2e_expr = (xn + xe2 <= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"TransitionBanN2E:nurse_{n}:day_{d}",
+                                constraint_expr=_n2e_expr,
+                                meta={
+                                    "node_id": f"transition_ban_n2e:nurse_{n}:day_{d}",
+                                    "type": "TransitionBanNode",
+                                    "label": "ban_n_to_e",
+                                    "value": {"day": d + 1, "transition": "N->E"},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "transition_ban",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "N 다음날 E 전이는 금지됩니다.",
+                                    "resolution_hint": "전이 금지 설정을 완화하거나 해당 날짜 고정을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_n2e_expr)
                 if mid_idx is not None:
                     m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
                 # if getattr(cfg, "ban_d_to_n", True):
@@ -1450,7 +1670,28 @@ def optimize_fallback_lex_hard_first(
                         if not free_days_w:
                             print(f"{logger_prefix} off_window 무시 (유저 고정 우선, fallback): n={n}, window=[{left+1},{right+1}] 전체 고정")
                             continue
-                        m.Add(sum(X(n, d, off_idx) for d in free_days_w) >= 1)
+                        _ow_expr_fb = (sum(X(n, d, off_idx) for d in free_days_w) >= 1)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"OffWindowRequirement:nurse_{n}:left_{left}:right_{right}",
+                                constraint_expr=_ow_expr_fb,
+                                meta={
+                                    "node_id": f"off_window_requirement:nurse_{n}:left_{left}:right_{right}",
+                                    "type": "OffWindowNode",
+                                    "label": "off_window_min_off",
+                                    "value": {"left_day": left + 1, "right_day": right + 1},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "off_window_requirement",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "월초 보정 구간 내 최소 1회 OFF가 필요합니다.",
+                                    "resolution_hint": "해당 구간의 고정 근무를 일부 해제하거나 OFF 배정 여유를 확보하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_ow_expr_fb)
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
@@ -1471,7 +1712,28 @@ def optimize_fallback_lex_hard_first(
                     continue
                 if any((n, d) in fixed and fixed[(n, d)] == off_idx for d in window):
                     continue
-                m.Add(sum(X(n, d, off_idx) for d in window) >= 1)
+                _mcw_expr_fb = (sum(X(n, d, off_idx) for d in window) >= 1)
+                if _assume_registry_fb is not None and _add_hard_fb is not None:
+                    _add_hard_fb(
+                        m,
+                        _assume_registry_fb,
+                        name=f"MaxConsecutiveWorkWindow:nurse_{n}:start_{d0}:k_{K}",
+                        constraint_expr=_mcw_expr_fb,
+                        meta={
+                            "node_id": f"max_consecutive_work:nurse_{n}:start_{d0}:k_{K}",
+                            "type": "ConsecutiveWorkNode",
+                            "label": "max_consecutive_work_min_off",
+                            "value": {"start_day": d0 + 1, "window_size": K + 1},
+                            "scope": "nurse",
+                            "scope_key": f"nurse_{n}",
+                            "pattern": "max_consecutive_work",
+                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "연속 근무 제한 구간(K+1)에는 최소 1회 OFF가 필요합니다.",
+                            "resolution_hint": "연속 근무 구간의 고정 배정을 완화하거나 OFF를 추가하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_mcw_expr_fb)
 
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
@@ -1490,22 +1752,84 @@ def optimize_fallback_lex_hard_first(
                         continue
                     days_in_window = list(range(T0, min(T0 + april_window_end + 1, T1 + 1)))
                     if days_in_window:
-                        m.Add(sum(X(n, d, night_idx) for d in days_in_window) <= cap)
+                        _cn_edge_expr_fb = (sum(X(n, d, night_idx) for d in days_in_window) <= cap)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"ConsecutiveNightCapEdge:nurse_{n}:w_{w}",
+                                constraint_expr=_cn_edge_expr_fb,
+                                meta={
+                                    "node_id": f"consecutive_night_cap_edge:nurse_{n}:w_{w}",
+                                    "type": "ConsecutiveNightCapNode",
+                                    "label": "consecutive_night_cap_edge",
+                                    "value": {"window_len": len(days_in_window), "cap": int(cap)},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "consecutive_night_cap",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "월경계 연속 야간 상한을 초과할 수 없습니다.",
+                                    "resolution_hint": "해당 구간의 N 고정을 완화하거나 야간 배정을 분산하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_cn_edge_expr_fb)
             for d0 in range(T0, T1 - L + 1):
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
                 exc = m.NewIntVar(0, L + 1, f"cnight_exc_{n}_{d0}")
                 m.Add(exc >= sum_n - L)
                 # 연속 N 상한 L 하드: three_seq_nig False면 L=2(3N 금지), True면 L=3(3N 허용)
-                m.Add(sum_n <= L)
+                _cn_expr_fb = (sum_n <= L)
+                if _assume_registry_fb is not None and _add_hard_fb is not None:
+                    _add_hard_fb(
+                        m,
+                        _assume_registry_fb,
+                        name=f"ConsecutiveNightCap:nurse_{n}:start_{d0}:L_{L}",
+                        constraint_expr=_cn_expr_fb,
+                        meta={
+                            "node_id": f"consecutive_night_cap:nurse_{n}:start_{d0}:L_{L}",
+                            "type": "ConsecutiveNightCapNode",
+                            "label": "consecutive_night_cap",
+                            "value": {"start_day": d0 + 1, "window_size": L + 1, "cap": int(L)},
+                            "scope": "nurse",
+                            "scope_key": f"nurse_{n}",
+                            "pattern": "consecutive_night_cap",
+                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "연속 야간 상한을 초과할 수 없습니다.",
+                            "resolution_hint": "연속 야간 구간의 고정을 완화하거나 다른 간호사로 분산하세요.",
+                        },
+                    )
+                else:
+                    m.Add(_cn_expr_fb)
                 safety["cnight_excess"].append(exc)
 
-        # 월 Night 상한 초과량
+        # 월 Night 상한 초과량 — MUS 추출용 assumption literal로 wrap
         for n in range(N):
             if _is_preceptee_at(n):
                 continue
             T0, T1 = join[n], leave[n]
             sum_m = sum(X(n, d, night_idx) for d in range(T0, T1 + 1))
-            m.Add(sum_m <= cfg.max_night_shifts_per_month)
+            _fb_mn_expr = (sum_m <= cfg.max_night_shifts_per_month)
+            if _assume_registry_fb is not None and _add_hard_fb is not None:
+                _fb_nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
+                _add_hard_fb(
+                    m, _assume_registry_fb,
+                    name=f"MaxNight:nurse_{n}",
+                    constraint_expr=_fb_mn_expr,
+                    meta={
+                        "node_id": f"max_night:nurse_{n}",
+                        "type": "NightCapNode",
+                        "label": "max_night_shifts_per_month",
+                        "value": int(cfg.max_night_shifts_per_month or 0),
+                        "scope": "nurse", "scope_key": f"nurse_{n}",
+                        "pattern": "max_night",
+                        "nurse_id": str(getattr(_fb_nu, "nurse_id", n)) if _fb_nu else str(n),
+                        "human_message_ko": f"월간 N 상한 {int(cfg.max_night_shifts_per_month or 0)}일",
+                        "resolution_hint": "월간 N 상한을 늘리거나 이 간호사의 N 부담을 다른 인력에 분산하세요.",
+                    },
+                )
+            else:
+                m.Add(_fb_mn_expr)
 
         # N 전담: D/E 하드 금지 (메인 모델과 동일)
         for n, nu in enumerate(roster_system.nurses):
@@ -1518,13 +1842,97 @@ def optimize_fallback_lex_hard_first(
             T0, T1 = join[n], leave[n]
             for d in range(T0, T1 + 1):
                 if "D" not in allowed:
-                    m.Add(X(n, d, day_idx) == 0)
+                    _allow_d_expr = (X(n, d, day_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanD:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_d_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_D",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "D", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 D 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_d_expr)
                 if "E" not in allowed:
-                    m.Add(X(n, d, eve_idx) == 0)
+                    _allow_e_expr = (X(n, d, eve_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanE:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_e_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_E",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "E", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 E 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_e_expr)
                 if "N" not in allowed:
-                    m.Add(X(n, d, night_idx) == 0)
+                    _allow_n_expr = (X(n, d, night_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanN:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_n_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_N",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "N", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 N 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_n_expr)
                 if mid_idx is not None and "M" not in allowed:
-                    m.Add(X(n, d, mid_idx) == 0)
+                    _allow_m_expr = (X(n, d, mid_idx) == 0)
+                    if _assume_registry_fb is not None and _add_hard_fb is not None:
+                        _add_hard_fb(
+                            m,
+                            _assume_registry_fb,
+                            name=f"AllowedShiftMaskBanM:nurse_{n}:day_{d}",
+                            constraint_expr=_allow_m_expr,
+                            meta={
+                                "node_id": f"allowed_shift_mask:nurse_{n}:day_{d}:shift_M",
+                                "type": "AllowedShiftMaskNode",
+                                "label": "allowed_shift_mask_ban",
+                                "value": {"day": d + 1, "shift": "M", "allowed": sorted(allowed)},
+                                "scope": "nurse",
+                                "scope_key": f"nurse_{n}",
+                                "pattern": "allowed_shift_mask",
+                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                "human_message_ko": "해당 간호사는 M 근무 허용 대상이 아닙니다.",
+                                "resolution_hint": "간호사 허용 시프트 설정을 변경하거나 해당 배정을 제거하세요.",
+                            },
+                        )
+                    else:
+                        m.Add(_allow_m_expr)
 
         # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
         # for n, nu in enumerate(roster_system.nurses):
@@ -1567,13 +1975,47 @@ def optimize_fallback_lex_hard_first(
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0, T0 + 1)):
                         if _3n_rem >= 2:
-                            m.Add(
-                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
-                            ).OnlyEnforceIf([end_prev_block])
+                            _co_3n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2)
+                            if _assume_registry_fb is not None:
+                                _co_lit_fb = _assume_registry_fb.create_literal(
+                                    f"CarryoverRecovery3N2OFF:nurse_{n}:day_{T0}",
+                                    meta={
+                                        "node_id": f"carryover_recovery_3n2off:nurse_{n}:day_{T0}",
+                                        "type": "CarryoverTransitionNode",
+                                        "label": "prev_month 3N2OFF boundary",
+                                        "value": {"day": T0 + 1, "remaining_off_needed": 2},
+                                        "scope": "nurse",
+                                        "scope_key": f"nurse_{n}",
+                                        "pattern": "carryover_boundary",
+                                        "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                        "human_message_ko": "전월 3N 꼬리로 월초 2OFF 회복이 필요합니다.",
+                                        "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
+                                    },
+                                )
+                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                            else:
+                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
-                            m.Add(
-                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1
-                            ).OnlyEnforceIf([end_prev_block])
+                            _co_3n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1)
+                            if _assume_registry_fb is not None:
+                                _co_lit_fb = _assume_registry_fb.create_literal(
+                                    f"CarryoverRecovery3N2OFFPartial:nurse_{n}:day_{T0}",
+                                    meta={
+                                        "node_id": f"carryover_recovery_3n2off_partial:nurse_{n}:day_{T0}",
+                                        "type": "CarryoverTransitionNode",
+                                        "label": "prev_month 3N2OFF boundary partial",
+                                        "value": {"day": T0 + 1, "remaining_off_needed": 1},
+                                        "scope": "nurse",
+                                        "scope_key": f"nurse_{n}",
+                                        "pattern": "carryover_boundary",
+                                        "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                        "human_message_ko": "전월 3N 꼬리 회복 OFF가 월초에 추가로 필요합니다.",
+                                        "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                    },
+                                )
+                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                            else:
+                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
                     print(f"{logger_prefix} [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
                 elif n_tail >= 3 and _3n_rem == 0:
@@ -1581,20 +2023,73 @@ def optimize_fallback_lex_hard_first(
                           f"offs_after={n_offs_after_3n} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
                 if n_tail >= 2 and n_offs_after_3n < 2 and (T0 + 2) <= T1:
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 1, T0 + 2)):
-                        m.Add(
-                            X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
-                        ).OnlyEnforceIf([X(n, T0, night_idx)])
+                        _expr_3n_tail2_fb = (X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _co_lit_fb = _assume_registry_fb.create_literal(
+                                f"CarryoverRecovery3N2OFFTail2:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_3n2off_tail2:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 3N2OFF boundary tail2",
+                                    "value": {"day": T0 + 2, "remaining_off_needed": 2},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "전월 N 꼬리로 월초 회복 OFF 2일이 필요합니다.",
+                                    "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                },
+                            )
+                            m.Add(_expr_3n_tail2_fb).OnlyEnforceIf([X(n, T0, night_idx), _co_lit_fb])
+                        else:
+                            m.Add(_expr_3n_tail2_fb).OnlyEnforceIf([X(n, T0, night_idx)])
                 if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 2, T0 + 3)):
-                        m.Add(
-                            X(n, T0 + 2, off_idx) + X(n, T0 + 3, off_idx) == 2
-                        ).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
+                        _expr_3n_tail1_fb = (X(n, T0 + 2, off_idx) + X(n, T0 + 3, off_idx) == 2)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _co_lit_fb = _assume_registry_fb.create_literal(
+                                f"CarryoverRecovery3N2OFFTail1:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_3n2off_tail1:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 3N2OFF boundary tail1",
+                                    "value": {"day": T0 + 3, "remaining_off_needed": 2},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "전월 N 꼬리 회복을 위해 월초 OFF 2일이 필요합니다.",
+                                    "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                },
+                            )
+                            m.Add(_expr_3n_tail1_fb).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx), _co_lit_fb])
+                        else:
+                            m.Add(_expr_3n_tail1_fb).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
                 for d in range(T0 + 2, T1 - 1):
                     if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (d + 1, d + 2)):
                         # 회복 OFF 슬롯에 non-OFF fixed_wanted → 3N 블록 자체를 금지
-                        m.Add(
-                            X(n, d, night_idx) + X(n, d - 1, night_idx) + X(n, d - 2, night_idx) <= 2
-                        )
+                        _guard_3n_expr_fb = (X(n, d, night_idx) + X(n, d - 1, night_idx) + X(n, d - 2, night_idx) <= 2)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m,
+                                _assume_registry_fb,
+                                name=f"CarryoverRecovery3N2OFFGuard:nurse_{n}:day_{d}",
+                                constraint_expr=_guard_3n_expr_fb,
+                                meta={
+                                    "node_id": f"carryover_recovery_3n2off_guard:nurse_{n}:day_{d}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "carryover 3N block guard",
+                                    "value": {"day": d + 1, "blocked_by_fixed": True},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "회복 OFF 슬롯 고정과 3N 블록이 충돌합니다.",
+                                    "resolution_hint": "해당 고정 배정 또는 회복 규칙을 조정하세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_guard_3n_expr_fb)
                         continue
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
@@ -1618,14 +2113,48 @@ def optimize_fallback_lex_hard_first(
                     m.Add(end_prev_block == X(n, T0, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0, T0 + 1)):
                         if _2n_rem >= 2:
-                            m.Add(
-                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2
-                            ).OnlyEnforceIf([end_prev_block])
+                            _co_2n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2)
+                            if _assume_registry_fb is not None:
+                                _co_lit_fb = _assume_registry_fb.create_literal(
+                                    f"CarryoverRecovery2N2OFF:nurse_{n}:day_{T0}",
+                                    meta={
+                                        "node_id": f"carryover_recovery_2n2off:nurse_{n}:day_{T0}",
+                                        "type": "CarryoverTransitionNode",
+                                        "label": "prev_month 2N2OFF boundary",
+                                        "value": {"day": T0 + 1, "remaining_off_needed": 2},
+                                        "scope": "nurse",
+                                        "scope_key": f"nurse_{n}",
+                                        "pattern": "carryover_boundary",
+                                        "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                        "human_message_ko": "전월 2N 꼬리로 월초 2OFF 회복이 필요합니다.",
+                                        "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
+                                    },
+                                )
+                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                            else:
+                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
                             # _2n_rem == 1: 1개만 추가 필요
-                            m.Add(
-                                X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1
-                            ).OnlyEnforceIf([end_prev_block])
+                            _co_2n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1)
+                            if _assume_registry_fb is not None:
+                                _co_lit_fb = _assume_registry_fb.create_literal(
+                                    f"CarryoverRecovery2N2OFFPartial:nurse_{n}:day_{T0}",
+                                    meta={
+                                        "node_id": f"carryover_recovery_2n2off_partial:nurse_{n}:day_{T0}",
+                                        "type": "CarryoverTransitionNode",
+                                        "label": "prev_month 2N2OFF boundary partial",
+                                        "value": {"day": T0 + 1, "remaining_off_needed": 1},
+                                        "scope": "nurse",
+                                        "scope_key": f"nurse_{n}",
+                                        "pattern": "carryover_boundary",
+                                        "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                        "human_message_ko": "전월 2N 꼬리 회복 OFF가 월초에 추가로 필요합니다.",
+                                        "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                    },
+                                )
+                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                            else:
+                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
                     print(f"{logger_prefix} [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after}, rem={_2n_rem}")
                 elif n_tail >= 2 and _2n_rem == 0:
@@ -1635,9 +2164,26 @@ def optimize_fallback_lex_hard_first(
                     end_block_b0 = m.NewBoolVar(f"end_2n_soft_b0_{n}")
                     m.Add(end_block_b0 == X(n, T0 + 1, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 1, T0 + 2)):
-                        m.Add(
-                            X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2
-                        ).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
+                        _expr_2n_b0_fb = (X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _co_lit_fb = _assume_registry_fb.create_literal(
+                                f"CarryoverRecovery2N2OFFBoundary:nurse_{n}:day_{T0}",
+                                meta={
+                                    "node_id": f"carryover_recovery_2n2off_boundary:nurse_{n}:day_{T0}",
+                                    "type": "CarryoverTransitionNode",
+                                    "label": "prev_month 2N2OFF boundary enforce",
+                                    "value": {"day": T0 + 2, "remaining_off_needed": 2},
+                                    "scope": "nurse",
+                                    "scope_key": f"nurse_{n}",
+                                    "pattern": "carryover_boundary",
+                                    "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                                    "human_message_ko": "전월 2N 꼬리 회복 OFF가 월초에 강제됩니다.",
+                                    "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
+                                },
+                            )
+                            m.Add(_expr_2n_b0_fb).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0, _co_lit_fb])
+                        else:
+                            m.Add(_expr_2n_b0_fb).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
                 for d in range(T0 + 1, T1 - 1):
                     if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (d + 1, d + 2)):
                         # 회복 OFF 슬롯에 non-OFF fixed_wanted → 이 위치에서 2N 블록 종료 금지
@@ -1884,9 +2430,28 @@ def optimize_fallback_lex_hard_first(
                         for d in range(T0, T1 + 1)
                         if (n, d) not in vacation_off_cells
                     )
-                    # relax_level에 따라 부분 하드: relax_level=0이면 완전 하드, 1이면 1일 부족 허용 …
-                    hard_lower = max(0, min_off_required - relax_level)
-                    m.Add(offs >= hard_lower)
+                    hard_lower = int(min_off_required)
+                    # per-nurse 1일 lower slack (페널티 무거움) — 솔버가 min_off 1일
+                    # 부족한 nurse 만 자동 풀어줌. 글로벌 -1 (구 relax_level=1) 의
+                    # 항상-ON per-nurse 버전. 9B 2026-07 등 min_off=11 hard 가
+                    # combinatorial 로 막히는 케이스 회복.
+                    _lower_slack_max = 1
+                    _lower_slack_weight = 100000
+                    if _lower_slack_max > 0:
+                        min_off_lower_slack = m.NewIntVar(
+                            0, _lower_slack_max, f"min_off_lower_slack_{n}"
+                        )
+                        m.Add(offs + min_off_lower_slack >= hard_lower)
+                        _lower_weighted = m.NewIntVar(
+                            0,
+                            _lower_slack_max * _lower_slack_weight,
+                            f"min_off_lower_slack_weighted_{n}",
+                        )
+                        m.Add(_lower_weighted == min_off_lower_slack * _lower_slack_weight)
+                        safety["off_cap_bounded_slack"].append(_lower_weighted)
+                        m._off_slack_lower_by_n[n] = min_off_lower_slack  # type: ignore[attr-defined]
+                    else:
+                        m.Add(offs >= hard_lower)
                     miss = m.NewIntVar(0, D, f"min_off_miss_{n}")
                     m.Add(miss >= min_off_required - offs)
                     min_off_miss_by_n[n] = miss
@@ -1898,7 +2463,7 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) not in vacation_off_cells
                     )
                     if is_n_only:
-                        # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                        # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
                         total_cap_effective = max(0, avail_days - 15)
                     else:
                         # 2N2O/3N2O 하드 제약으로 인한 추가 OFF를 OffCap에 반영 (미반영 시 INFEASIBLE)
@@ -1930,7 +2495,7 @@ def optimize_fallback_lex_hard_first(
                             base_cap += _off_cap_relax_extra
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
                             total_cap_effective = min(base_cap, avail_days)
                             # max coverage 자동 조정: max_off cap
                             if _fb_auto_max_off is not None:
@@ -1943,23 +2508,22 @@ def optimize_fallback_lex_hard_first(
                             base_cap = min_off_required + _extra_off_fb + _off_cap_relax_extra
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
-                            # 글로벌 +relax_level 제거 — per-nurse cap_slack 으로 대체
+                            # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
                             total_cap_effective = min(base_cap, avail_days)
                             total_cap_effective = max(total_cap_effective, min_off_required)
                     # OFF cap slack 결정 정책:
                     # 1) cfg gate (off_cap_bounded_slack_enable=True) → 기존 cfg max/weight 사용
-                    # 2) gate False AND relax_level > 0 → per-nurse fallback 슬랙
-                    #    (글로벌 +relax_level 폐지 후 위반 nurse 만 cap 풀어주는 구조)
-                    # 3) gate False AND relax_level == 0 → cap hard (slack 없음)
+                    # 2) gate False → **per-nurse 1일 slack 기본 활성** (페널티 무거움)
+                    #    → 솔버가 cap 부족한 nurse 만 자동으로 1일 풀어줌. 나머지는 0.
+                    #    이전 relax_level=1 의 글로벌 retry 단계를 항상-ON 형태로 대체
+                    #    (9B 2026-07 등 정적 cap 진단은 통과하지만 combinatorial 로 막히는
+                    #    케이스 회복).
                     if off_cap_bounded_slack_enable and off_cap_bounded_slack_max > 0:
                         _slack_max = int(off_cap_bounded_slack_max)
                         _slack_weight = int(off_cap_bounded_slack_weight)
-                    elif int(relax_level or 0) > 0:
-                        _slack_max = int(relax_level)
-                        _slack_weight = 100000
                     else:
-                        _slack_max = 0
-                        _slack_weight = 0
+                        _slack_max = 1
+                        _slack_weight = 100000
                     if _slack_max > 0:
                         cap_slack = m.NewIntVar(0, _slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(
@@ -1970,8 +2534,29 @@ def optimize_fallback_lex_hard_first(
                         m.Add(weighted == cap_slack * _slack_weight)
                         safety["off_cap_bounded_slack"].append(weighted)
                         m.Add(nonvac_offs <= total_cap_effective + cap_slack)
+                        m._off_slack_upper_by_n[n] = cap_slack  # type: ignore[attr-defined]
                     else:
-                        m.Add(nonvac_offs <= total_cap_effective)
+                        # OFF cap hard branch — MUS 추출용 assumption literal로 wrap
+                        _fb_oc_expr = (nonvac_offs <= total_cap_effective)
+                        if _assume_registry_fb is not None and _add_hard_fb is not None:
+                            _add_hard_fb(
+                                m, _assume_registry_fb,
+                                name=f"OffCap:nurse_{n}",
+                                constraint_expr=_fb_oc_expr,
+                                meta={
+                                    "node_id": f"off_cap:nurse_{n}",
+                                    "type": "OffCapNode",
+                                    "label": "max_off (effective)",
+                                    "value": int(total_cap_effective),
+                                    "scope": "nurse", "scope_key": f"nurse_{n}",
+                                    "pattern": "off_cap",
+                                    "nurse_id": str(nurse_id) if nurse_id is not None else str(n),
+                                    "human_message_ko": f"이 간호사 OFF 상한 {int(total_cap_effective)}일",
+                                    "resolution_hint": "이 간호사 OFF 상한을 늘리세요.",
+                                },
+                            )
+                        else:
+                            m.Add(_fb_oc_expr)
                     if stage == 3:
                         print(
                             f"{logger_prefix} [OffCap][total] n={n}, id={nurse_id}, name={nurse_name}, "
@@ -2136,19 +2721,51 @@ def optimize_fallback_lex_hard_first(
             min_off_miss_by_n,
         )
     ############################################################## build model 끝 ##############################################################
-    
-    # ───── 1단계: 커버리지 (완화 재시도 포함) ─────
+
+    def _log_off_slack_used(stage_label, solver, model):
+        """post-solve: 어느 nurse 가 OFF cap slack 을 실제 사용했는지 stdout 로그."""
+        try:
+            lo = getattr(model, "_off_slack_lower_by_n", {}) or {}
+            hi = getattr(model, "_off_slack_upper_by_n", {}) or {}
+            rows = []
+            for n in sorted(set(list(lo.keys()) + list(hi.keys()))):
+                lv = solver.Value(lo[n]) if n in lo else 0
+                uv = solver.Value(hi[n]) if n in hi else 0
+                if lv > 0 or uv > 0:
+                    nu = roster_system.nurses[n] if 0 <= n < len(roster_system.nurses) else None
+                    nid = getattr(nu, "nurse_id", "?") if nu else "?"
+                    name = getattr(nu, "name", "?") if nu else "?"
+                    rows.append((n, nid, name, int(lv), int(uv)))
+            if rows:
+                print(
+                    f"{logger_prefix} [OffCapSlack][used][{stage_label}] "
+                    f"count={len(rows)} (페널티 100K 강제 trigger — combinatorial 회피)"
+                )
+                for n, nid, name, lv, uv in rows:
+                    parts = []
+                    if lv > 0:
+                        parts.append(f"min_off -{lv}")
+                    if uv > 0:
+                        parts.append(f"max_off +{uv}")
+                    print(
+                        f"{logger_prefix} [OffCapSlack][used][{stage_label}]   "
+                        f"nurse_idx={n}, id={nid}, name={name}, {', '.join(parts)}"
+                    )
+        except Exception as _slack_exc:
+            print(f"{logger_prefix} [OffCapSlack][log] 실패(무시): {_slack_exc}")
+
+    # ───── 1단계: 커버리지 (hard 1회 → broad soft 1회) ─────
     m1, X1, short1, over1, safety1 = None, None, None, None, None
     short_map1 = {}
     over_map1 = {}
     s1 = None
     best_short, best_over = None, None
-    used_relax_level = 0  # 1단계에서 성공한 완화 레벨
-    max_relax_attempts = 10  # 최대 10회까지 완화 재시도
-    time_per_attempt = max(3, tl1 // max_relax_attempts)  # 각 시도당 시간 (최소 3초)
+    used_broad_soft = False
+    attempt_specs = [(False, "hard"), (True, "broad_soft")]
+    time_per_attempt = max(5, tl1 // len(attempt_specs))
 
-    for relax_level in range(max_relax_attempts):
-        with timer_cls(f"폴백 1단계: 커버리지 부족 최소화 (완화레벨={relax_level})"):
+    for broad_soft, attempt_label in attempt_specs:
+        with timer_cls(f"폴백 1단계: 커버리지 부족 최소화 ({attempt_label})"):
             (
                 m1,
                 X1,
@@ -2162,28 +2779,38 @@ def optimize_fallback_lex_hard_first(
                 _,
                 _,
             ) = build_model(
-                stage=1, relax_level=relax_level
+                stage=1, broad_soft=broad_soft
             )
             s1 = cp_model.CpSolver()
             s1.parameters.max_time_in_seconds = time_per_attempt
             s1.parameters.num_search_workers = 8
             s1.parameters.relative_gap_limit = 0.15
+            # MUS 추출용 assumption registry attach
+            _reg_s1 = getattr(m1, "_cpsat_assumption_registry", None)
+            if _reg_s1 is not None:
+                _reg_s1.attach_to_model()
             st = s1.Solve(m1)
+            if st == cp_model.INFEASIBLE and _reg_s1 is not None:
+                try:
+                    _fb_cores = _reg_s1.extract_conflict_cores(s1, solver_phase="fallback")
+                    if _fb_cores:
+                        roster_system._cpsat_conflict_cores = (
+                            list(getattr(roster_system, "_cpsat_conflict_cores", []) or []) + _fb_cores
+                        )
+                        print(f"[FallbackLex][stage1] MUS cores: {len(_fb_cores)}")
+                except Exception as _mus_exc:
+                    print(f"[FallbackLex][stage1] MUS 추출 실패(무시): {_mus_exc}")
             print(
-                f"{logger_prefix} 폴백1 결과: relax_level={relax_level}, "
+                f"{logger_prefix} 폴백1 결과: attempt={attempt_label}, "
                 f"status={_cp_sat_status_to_text(st)}"
             )
             if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                _log_off_slack_used(f"stage1:{attempt_label}", s1, m1)
                 best_short = int(s1.Value(sum(short1)))
                 best_over = int(s1.Value(sum(over1)))
-                used_relax_level = relax_level
-                if relax_level > 0:
-                    _relax_desc = f"OFF상한+{relax_level}"
-                    if relax_level >= 3:
-                        _relax_desc += ", max coverage soft, M min soft"
-                    print(
-                        f"{logger_prefix} 폴백1 성공: 완화레벨 {relax_level} 적용 ({_relax_desc})"
-                    )
+                used_broad_soft = broad_soft
+                if broad_soft:
+                    print(f"{logger_prefix} 폴백1 성공: broad soft 적용 (max coverage soft, M min soft)")
                 print(f"{logger_prefix} 최소 커버리지 부족: {best_short}, 과잉: {best_over}")
                 try:
                     short_items = []
@@ -2211,10 +2838,10 @@ def optimize_fallback_lex_hard_first(
                 except Exception as exc:
                     print(f"{logger_prefix} [Stage1 상세로그 실패]: {exc}")
                 break
-            if relax_level < max_relax_attempts - 1:
-                print(f"{logger_prefix} 폴백1 실패 (완화레벨={relax_level}): 재시도...")
+            if not broad_soft:
+                print(f"{logger_prefix} 폴백1 실패 ({attempt_label}): broad soft 1회 재시도...")
             else:
-                print(f"{logger_prefix} 폴백1 최종 실패: 모든 완화 시도 실패")
+                print(f"{logger_prefix} 폴백1 최종 실패: hard/broad soft 모두 실패")
 
     if best_short is None or best_over is None:
         print(f"{logger_prefix} 폴백 중단: 1단계 해를 찾지 못함")
@@ -2238,14 +2865,199 @@ def optimize_fallback_lex_hard_first(
             stage=2,
             coverage_eq=best_short,
             over_le=best_over,
-            relax_level=used_relax_level,
+            broad_soft=used_broad_soft,
         )
         s2 = cp_model.CpSolver()
         s2.parameters.max_time_in_seconds = tl2
         s2.parameters.num_search_workers = 8
         s2.parameters.relative_gap_limit = 0.15
+        _reg_s2 = getattr(m2, "_cpsat_assumption_registry", None)
+        if _reg_s2 is not None:
+            _reg_s2.attach_to_model()
         st2 = s2.Solve(m2)
+        if st2 == cp_model.INFEASIBLE and _reg_s2 is not None:
+            try:
+                _fb_cores = _reg_s2.extract_conflict_cores(s2, solver_phase="fallback")
+                if _fb_cores:
+                    roster_system._cpsat_conflict_cores = (
+                        list(getattr(roster_system, "_cpsat_conflict_cores", []) or []) + _fb_cores
+                    )
+                    print(f"[FallbackLex][stage2] MUS cores: {len(_fb_cores)}")
+            except Exception as _mus_exc:
+                print(f"[FallbackLex][stage2] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백2 결과: status={_cp_sat_status_to_text(st2)}")
+        if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            _log_off_slack_used("stage2", s2, m2)
+            # H1: Stage2 lex 3-pass — safety_sum → OFF range → N range 순차 minimize.
+            # 각 단계는 이전 cost 동결로 다른 항 영향 0 보장.
+            # lex 재solve 는 cold-start 라 큰 인스턴스에서 시간 내 incumbent 를 못 찾고
+            # UNKNOWN(빈 해)으로 끝날 수 있다. 그러면 downstream(zero-lock/hint/stage3 실패
+            # fallback)이 망가진 s2 를 읽어 빈 roster 를 만든다. → 성공한 마지막 해를
+            # 스냅샷에 보존하고(downstream 은 이 스냅샷을 읽음), 재solve 전 warm-start hint 로
+            # 직전 feasible 해를 주입해 빈 해 반환 자체를 막는다.
+            lex_x2_val: dict = {}
+            lex_safety_val: dict = {}
+
+            def _capture_lex_solution() -> None:
+                for _n in range(N):
+                    for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse):
+                        for _s in range(S):
+                            lex_x2_val[(_n, _d, _s)] = int(s2.Value(X2(_n, _d, _s)))
+                for _k, _arr in safety2.items():
+                    lex_safety_val[_k] = [int(s2.Value(_v)) for _v in _arr]
+
+            def _hint_lex_solution() -> None:
+                try:
+                    m2.ClearHints()
+                    for (_n, _d, _s), _val in lex_x2_val.items():
+                        m2.AddHint(X2(_n, _d, _s), _val)
+                except Exception:
+                    pass
+
+            _capture_lex_solution()  # stage2 해 보존: lex 전부 실패해도 이 해로 복원
+            try:
+                flat_safety = []
+                for arr in safety2.values():
+                    flat_safety.extend(arr)
+                if flat_safety:
+                    best_sum2 = sum(int(s2.Value(v)) for v in flat_safety)
+                    m2.Add(sum(flat_safety) <= best_sum2)
+                    use_mid_h1 = bool(getattr(cfg, "use_mid", False))
+                    off_count_vars = []
+                    nightonly_excluded_idx: set[int] = set()
+                    for n_lex in range(N):
+                        if leave[n_lex] < join[n_lex]:
+                            continue
+                        nu = roster_system.nurses[n_lex]
+                        try:
+                            is_n_only_lex = is_n_only_profile(
+                                getattr(nu, "is_night_nurse", None), use_mid=use_mid_h1
+                            )
+                        except Exception:
+                            is_n_only_lex = False
+                        if is_n_only_lex:
+                            nightonly_excluded_idx.add(n_lex)
+                            continue
+                        cnt = sum(
+                            X2(n_lex, d, off_idx)
+                            for d in iter_nurse_days(n_lex, join, leave, blocked_by_nurse)
+                        )
+                        off_count_vars.append((n_lex, cnt))
+                    if off_count_vars:
+                        max_off_lex = m2.NewIntVar(0, D, "lex_max_off")
+                        min_off_lex = m2.NewIntVar(0, D, "lex_min_off")
+                        for _, cnt in off_count_vars:
+                            m2.Add(cnt <= max_off_lex)
+                            m2.Add(cnt >= min_off_lex)
+                        m2.Minimize(max_off_lex - min_off_lex)
+                        s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                        _hint_lex_solution()
+                        st2_off = s2.Solve(m2)
+                        if st2_off in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                            _capture_lex_solution()
+                            best_off_range = int(s2.Value(max_off_lex) - s2.Value(min_off_lex))
+                            print(
+                                f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
+                                f"status={_cp_sat_status_to_text(st2_off)} range={best_off_range}"
+                            )
+                            m2.Add(max_off_lex - min_off_lex <= best_off_range)
+                            night_idx_h1 = (
+                                cfg.shift_types.index("N") if "N" in cfg.shift_types else None
+                            )
+                            if night_idx_h1 is not None:
+                                n_count_vars = []
+                                for n_lex in range(N):
+                                    if leave[n_lex] < join[n_lex]:
+                                        continue
+                                    if n_lex in nightonly_excluded_idx:
+                                        continue
+                                    cnt_n = sum(
+                                        X2(n_lex, d, night_idx_h1)
+                                        for d in iter_nurse_days(n_lex, join, leave, blocked_by_nurse)
+                                    )
+                                    n_count_vars.append(cnt_n)
+                                if n_count_vars:
+                                    max_n_lex = m2.NewIntVar(0, D, "lex_max_n")
+                                    min_n_lex = m2.NewIntVar(0, D, "lex_min_n")
+                                    for cnt in n_count_vars:
+                                        m2.Add(cnt <= max_n_lex)
+                                        m2.Add(cnt >= min_n_lex)
+                                    m2.Minimize(max_n_lex - min_n_lex)
+                                    s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                                    _hint_lex_solution()
+                                    st2_n = s2.Solve(m2)
+                                    if st2_n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                        _capture_lex_solution()
+                                        best_n_range = int(
+                                            s2.Value(max_n_lex) - s2.Value(min_n_lex)
+                                        )
+                                        print(
+                                            f"{logger_prefix} 폴백2 lex 3-pass (N range): "
+                                            f"status={_cp_sat_status_to_text(st2_n)} "
+                                            f"range={best_n_range}"
+                                        )
+                                        # H1 4-pass: N 블록 간 간격(n2n) deficit 최소화.
+                                        # 안전·OFF range·N range 를 동결한 뒤, 그 품질을 깨지 않는
+                                        # 범위에서만 야간 간격(target 미만)을 벌린다. soft 항은 KLD에
+                                        # 눌려 무시되므로 lex 우선순위로 끌어올린다.
+                                        _n2n_tgt = int(getattr(cfg, "n_to_n_interval_target", 0) or 0)
+                                        if _n2n_tgt >= 2:
+                                            try:
+                                                m2.Add(max_n_lex - min_n_lex <= best_n_range)
+                                                _n2n_terms = []
+                                                for _n in range(N):
+                                                    if leave[_n] < join[_n]:
+                                                        continue
+                                                    _aset = set(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                                                    for _d1 in sorted(_aset):
+                                                        for _gap in range(2, _n2n_tgt):
+                                                            _d2 = _d1 + _gap
+                                                            if _d2 not in _aset:
+                                                                continue
+                                                            _btw = [_d1 + _k for _k in range(1, _gap)]
+                                                            if any(_b not in _aset for _b in _btw):
+                                                                continue
+                                                            _pair = m2.NewBoolVar(f"lex_n2n_{_n}_{_d1}_{_d2}")
+                                                            m2.Add(_pair <= X2(_n, _d1, night_idx_h1))
+                                                            m2.Add(_pair <= X2(_n, _d2, night_idx_h1))
+                                                            for _b in _btw:
+                                                                m2.Add(_pair <= 1 - X2(_n, _b, night_idx_h1))
+                                                            _btw_sum = sum(X2(_n, _b, night_idx_h1) for _b in _btw)
+                                                            m2.Add(_pair >= X2(_n, _d1, night_idx_h1) + X2(_n, _d2, night_idx_h1) - 1 - _btw_sum)
+                                                            _n2n_terms.append((_n2n_tgt - _gap) * _pair)
+                                                if _n2n_terms:
+                                                    m2.Minimize(sum(_n2n_terms))
+                                                    import os as _os
+                                                    _n2n_frac = float(_os.getenv("N2N_LEX_TIME_FRAC", "0.5"))
+                                                    s2.parameters.max_time_in_seconds = max(8.0, float(tl2) * _n2n_frac)
+                                                    _hint_lex_solution()
+                                                    st2_n2n = s2.Solve(m2)
+                                                    if st2_n2n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                                        _capture_lex_solution()
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
+                                                            f"status={_cp_sat_status_to_text(st2_n2n)} "
+                                                            f"deficit={int(s2.ObjectiveValue())}"
+                                                        )
+                                                    else:
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
+                                                            f"status={_cp_sat_status_to_text(st2_n2n)} — 3rd 결과 유지"
+                                                        )
+                                            except Exception as _n2n_e:
+                                                print(f"{logger_prefix} 폴백2 lex 4-pass 예외: {_n2n_e}")
+                                    else:
+                                        print(
+                                            f"{logger_prefix} 폴백2 lex 3-pass (N range): "
+                                            f"status={_cp_sat_status_to_text(st2_n)} — 2nd 결과 유지"
+                                        )
+                        else:
+                            print(
+                                f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
+                                f"status={_cp_sat_status_to_text(st2_off)} — 1st 결과 유지"
+                            )
+            except Exception as _h1_e:
+                print(f"{logger_prefix} 폴백2 lex H1 예외: {_h1_e}")
         if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백2 실패: 단계 불가능 → 1단계 해 사용")
             roster_system.roster.fill(0)
@@ -2264,17 +3076,14 @@ def optimize_fallback_lex_hard_first(
         stage2_zero_locks = {}
         best_safe_sum = 0
         for k, arr in safety2.items():
-            zeros = []
-            for v in arr:
-                val = s2.Value(v)
-                if val == 0:
-                    zeros.append(v)
-                best_safe_sum += int(val)
+            vals = lex_safety_val.get(k) or [int(s2.Value(v)) for v in arr]
+            zeros = [v for v, val in zip(arr, vals) if val == 0]
+            best_safe_sum += sum(int(val) for val in vals)
             stage2_zero_locks[k] = zeros
         print(f"{logger_prefix} 최소 안전 위반 합: {best_safe_sum}")
         try:
             for k, arr in safety2.items():
-                total_k = sum(int(s2.Value(v)) for v in arr)
+                total_k = sum(lex_safety_val.get(k) or [int(s2.Value(v)) for v in arr])
                 if total_k > 0:
                     print(f"{logger_prefix} [Stage2 위반] {k} = {total_k}")
             short_items = [
@@ -2313,7 +3122,7 @@ def optimize_fallback_lex_hard_first(
             coverage_eq=best_short,
             over_le=best_over,
             stage2_zero_locks=stage2_zero_locks,
-            relax_level=used_relax_level,
+            broad_soft=used_broad_soft,
         )
         for k in safety3.keys():
             m3.Add(sum(safety3[k]) == sum(safety2[k]))
@@ -2321,22 +3130,37 @@ def optimize_fallback_lex_hard_first(
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
                     try:
-                        m3.AddHint(X3(n, d, s), s2.Value(X2(n, d, s)))
+                        m3.AddHint(X3(n, d, s), lex_x2_val.get((n, d, s), 0))
                     except Exception:
                         pass
         s3 = cp_model.CpSolver()
         s3.parameters.max_time_in_seconds = tl3
         s3.parameters.num_search_workers = 8
         s3.parameters.relative_gap_limit = 0.05
+        _reg_s3 = getattr(m3, "_cpsat_assumption_registry", None)
+        if _reg_s3 is not None:
+            _reg_s3.attach_to_model()
         st3 = s3.Solve(m3)
+        if st3 == cp_model.INFEASIBLE and _reg_s3 is not None:
+            try:
+                _fb_cores = _reg_s3.extract_conflict_cores(s3, solver_phase="fallback")
+                if _fb_cores:
+                    roster_system._cpsat_conflict_cores = (
+                        list(getattr(roster_system, "_cpsat_conflict_cores", []) or []) + _fb_cores
+                    )
+                    print(f"[FallbackLex][stage3] MUS cores: {len(_fb_cores)}")
+            except Exception as _mus_exc:
+                print(f"[FallbackLex][stage3] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백3 결과: status={_cp_sat_status_to_text(st3)}")
+        if st3 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            _log_off_slack_used("stage3", s3, m3)
         if st3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"{logger_prefix} 폴백3 실패: 선호 단계 불가능 → 2단계 해 사용")
             roster_system.roster.fill(0)
             for n in range(N):
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     for s in range(S):
-                        if s2.Value(X2(n, d, s)):
+                        if lex_x2_val.get((n, d, s), 0):
                             roster_system.roster[n, d, s] = 1
             _log_weekend_work_assignments(
                 roster_system=roster_system,

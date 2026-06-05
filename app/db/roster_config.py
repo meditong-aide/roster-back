@@ -69,6 +69,17 @@ class NurseRosterConfig:
     shift_cap_weight: int = 500000
     soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
     soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
+    # 같은 시프트(D/E/N) 연속 ≤3 soft. True면 4연속 같은 시프트 (예: D D D D)에 패널티.
+    max_same_shift: bool = True
+    max_same_shift_penalty_weight: int = 10000
+    # 4O 연속 휴무 hard 제약(당월 내 + 월경계). True면 4연속 OFF 금지. False면 제약 제거.
+    # 디폴트는 False(해제): 운영 검증 결과 자연 발생률 ~10-13%로 무리 없는 수준.
+    enforce_4o_hard: bool = False
+    # N 블록 종료 → 다음 N 블록 시작 사이 간격 soft. 대칭 페널티(많아도 적어도). 동일 블록 내부는 제외.
+    # 목표 10일에서 멀어질수록 |gap - target| × weight 누적. 낮은 weight로 약하게 유도.
+    n_to_n_interval_target: int = 10
+    n_to_n_interval_penalty_weight: int = 50
+    n_to_n_interval_max_window: int = 15
     off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)
     off_first: bool = False  # off_first=False(default): OFF 규칙 우선(OFF cap 충족 + max coverage 무시 + 남는 셀 근무 배정 + fixed_wanted 차감) / off_first=True: 근무 규칙 우선(현행 min-max coverage 균등화 유지, min 근접 배정)
     distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off
@@ -141,7 +152,7 @@ class NurseRosterConfig:
     # 팀마다 개별 min 설정 가능. use_mid=True 일 때 'M' 키 사용 가능.
     # 팀이 맵에 없거나 값이 {} 이면 "제약 없음".
     team_min_by_team: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    team_min_soft_fallback: bool = False  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
+    team_min_soft_fallback: bool = True  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
     team_min_penalty_weight: int = 500   # 소프트 모드에서 팀 미달 슬랙 패널티
     # ── 팀 내 인계 제한(handoff restrictions) ──
     # team_handoff_policy_by_team[team_id_str] = {

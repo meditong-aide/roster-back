@@ -1,0 +1,113 @@
+name: Harness Dev Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Target year (e.g. 2026)"
+        required: true
+        default: "2026"
+      month:
+        description: "Target month (1-12)"
+        required: true
+        default: "5"
+      strategy:
+        description: "Grade strategy"
+        required: true
+        default: "COMBINED"
+      repeats:
+        description: "Repeat runs"
+        required: true
+        default: "2"
+
+  push:
+    branches:
+      - dev
+      - feat/**
+    paths:
+      - 'tools/harness/**'
+      - 'docs/ROSTER_GENERATION_HARNESS_SPEC.md'
+      - 'docs/HARNESS_CHECKLIST_COVERAGE_MATRIX.md'
+      - '.github/workflows/harness-dev-gate.yml'
+
+jobs:
+  harness-dev-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HARNESS_BASE_URL: ${{ secrets.HARNESS_BASE_URL }}
+      HARNESS_ACCESS_TOKEN: ${{ secrets.HARNESS_ACCESS_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate required secrets
+        run: |
+          if [ -z "$HARNESS_BASE_URL" ]; then
+            echo "HARNESS_BASE_URL secret is required" >&2
+            exit 1
+          fi
+          if [ -z "$HARNESS_ACCESS_TOKEN" ]; then
+            echo "HARNESS_ACCESS_TOKEN secret is required" >&2
+            exit 1
+          fi
+
+      - name: Resolve run parameters
+        id: params
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "YEAR=${{ inputs.year }}" >> "$GITHUB_OUTPUT"
+            echo "MONTH=${{ inputs.month }}" >> "$GITHUB_OUTPUT"
+            echo "STRATEGY=${{ inputs.strategy }}" >> "$GITHUB_OUTPUT"
+            echo "REPEATS=${{ inputs.repeats }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "YEAR=$(date +%Y)" >> "$GITHUB_OUTPUT"
+            echo "MONTH=$(date +%-m)" >> "$GITHUB_OUTPUT"
+            echo "STRATEGY=COMBINED" >> "$GITHUB_OUTPUT"
+            echo "REPEATS=2" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run harness strict gate
+        run: |
+          python tools/harness/runner.py \
+            --base-url "$HARNESS_BASE_URL" \
+            --token "$HARNESS_ACCESS_TOKEN" \
+            --year "${{ steps.params.outputs.YEAR }}" \
+            --month "${{ steps.params.outputs.MONTH }}" \
+            --strategy "${{ steps.params.outputs.STRATEGY }}" \
+            --repeats "${{ steps.params.outputs.REPEATS }}" \
+            --strict
+
+      - name: Resolve latest harness report dir
+        id: report
+        shell: bash
+        run: |
+          latest=$(ls -dt tools/harness/reports/run-* | head -n 1)
+          if [ -z "$latest" ]; then
+            echo "No harness report directory found" >&2
+            exit 1
+          fi
+          echo "path=$latest" >> "$GITHUB_OUTPUT"
+          echo "Latest report: $latest"
+
+      - name: Upload harness artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-report-${{ github.run_id }}
+          path: |
+            ${{ steps.report.outputs.path }}/run_result.json
+            ${{ steps.report.outputs.path }}/summary.json
+            ${{ steps.report.outputs.path }}/graph_export.json
+            ${{ steps.report.outputs.path }}/triage.md

@@ -32,4 +32,6 @@ dependencies = [
     "timer>=0.3.0",
     "uvicorn>=0.34.2",
     "xlrd>=2.0.2",
+    "redis>=5.0.0",
+    "fakeredis>=2.20.0",
 ]

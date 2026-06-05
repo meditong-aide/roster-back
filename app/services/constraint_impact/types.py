@@ -42,6 +42,6 @@ AtomSource = Literal[
     "preceptee_sync",
 ]
 
-SolveAttemptLabel = Literal["primary", "grade_max_retry"]
+SolveAttemptLabel = Literal["primary", "grade_max_retry", "team_min_retry"]
 
 SimulationSeverity = Literal["ok", "warning", "hard_violation"]

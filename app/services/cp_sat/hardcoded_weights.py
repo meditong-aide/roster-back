@@ -31,6 +31,11 @@ NOD_NOE_PENALTY = 300
 # 고립 OFF 패널티
 ISOLATED_OFF_PENALTY = 100
 
+# 고립 근무 패널티 (O W O: 단일 근무가 OFF 사이에 낀 "퐁당퐁당" — N 제외, not_one_night이 별도 관리)
+# weight 스윕(ICU 10회) 결과 1500이 knee: 고립근무 3.1→1.0, n2n deficit 14→8(동반 개선),
+# 공정성 무손상. 2000은 과해서 1500보다 나빠짐.
+ISOLATED_WORK_PENALTY = 1500
+
 # 2N 블록 패널티 (3N 유도): 2N2O+3N2O 동시 활성 시 3N 블록 선호
 PREFER_3N_BLOCK_PENALTY = 80
 

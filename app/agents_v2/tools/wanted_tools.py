@@ -156,25 +156,31 @@ def get_wanted_adjustments(
 def get_submission_status(
     db: Session, group_id: str, year: int, month: int
 ) -> dict:
-    """Get submission status summary — who submitted, who didn't."""
+    """Get submission status summary — who submitted, who didn't.
+
+    group_id-scoped single outerjoin: 한 쿼리로 DB-level filter, RBAC 격리.
+    """
     from db.models import Nurse
 
     month_str = _wanted_request_month_str(year, month)
-    all_nurses = (
-        db.query(Nurse.nurse_id, Nurse.name)
+    rows = (
+        db.query(Nurse.nurse_id, Nurse.name, WantedRequest.is_submitted)
+        .outerjoin(
+            WantedRequest,
+            (WantedRequest.nurse_id == Nurse.nurse_id)
+            & (WantedRequest.month == month_str)
+            & (WantedRequest.group_id == group_id)
+            & (WantedRequest.is_submitted == True),
+        )
         .filter(Nurse.group_id == group_id, Nurse.active == 1)
         .all()
     )
-    submitted_ids = set(
-        r[0]
-        for r in db.query(WantedRequest.nurse_id)
-        .filter(WantedRequest.month == month_str, WantedRequest.is_submitted == True)
-        .all()
-    )
-    submitted = [{"nurse_id": n.nurse_id, "name": n.name} for n in all_nurses if n.nurse_id in submitted_ids]
-    not_submitted = [{"nurse_id": n.nurse_id, "name": n.name} for n in all_nurses if n.nurse_id not in submitted_ids]
+    submitted, not_submitted = [], []
+    for nurse_id, name, is_sub in rows:
+        bucket = submitted if is_sub else not_submitted
+        bucket.append({"nurse_id": nurse_id, "name": name})
     return {
-        "total": len(all_nurses),
+        "total": len(rows),
         "submitted_count": len(submitted),
         "not_submitted_count": len(not_submitted),
         "submitted": submitted,
@@ -188,12 +194,20 @@ def bulk_update_wanted_adjustments(
     field: str,
     value,
     *,
+    group_id: str,
     preview_only: bool = False,
 ) -> dict:
-    """Bulk update fixed wanted entries. Returns affected count."""
+    """Bulk update fixed wanted entries. Returns affected count.
+
+    group_id-scoped: 전달된 entry_ids 중 group_id 가 일치하는 것만 적용
+    (cross-group mutation 차단).
+    """
     rows = (
         db.query(FixedWantedEntry)
-        .filter(FixedWantedEntry.id.in_(entry_ids))
+        .filter(
+            FixedWantedEntry.id.in_(entry_ids),
+            FixedWantedEntry.group_id == group_id,
+        )
         .all()
     )
     if preview_only:
@@ -245,13 +259,48 @@ def update_wanted_deadline(
     }
 
 
-def cancel_wanted_request(
-    db: Session, nurse_id: str, year: int, month: int, request_id: int | None = None
+def clear_wanted_deadline(
+    db: Session, group_id: str, year: int, month: int
 ) -> dict:
-    """Cancel (retract) a wanted request submission."""
+    """Clear wanted campaign deadline (set exp_date to NULL).
+
+    DB 컬럼 자체가 nullable 이므로 마감일 해제는 정상 운영 경로.
+    "마감일 없애줘 / 제거 / 삭제" 같은 의도에 대응한다.
+    """
+    row = (
+        db.query(Wanted)
+        .filter(
+            Wanted.group_id == group_id,
+            Wanted.year == year,
+            Wanted.month == month,
+        )
+        .first()
+    )
+    if not row:
+        return {"error": "Wanted campaign not found"}
+    old_deadline = str(row.exp_date) if row.exp_date else None
+    row.exp_date = None
+    db.commit()
+    return {
+        "group_id": group_id,
+        "year": year,
+        "month": month,
+        "old_deadline": old_deadline,
+        "new_deadline": None,
+    }
+
+
+def cancel_wanted_request(
+    db: Session, nurse_id: str, group_id: str, year: int, month: int, request_id: int | None = None
+) -> dict:
+    """Cancel (retract) a wanted request submission.
+
+    group_id 필터로 cross-group mutation 차단 (defense-in-depth).
+    """
     month_str = _wanted_request_month_str(year, month)
     q = db.query(WantedRequest).filter(
         WantedRequest.nurse_id == nurse_id,
+        WantedRequest.group_id == group_id,
         WantedRequest.month == month_str,
         WantedRequest.is_submitted == True,
     )
@@ -284,13 +333,17 @@ def _parse_date(val) -> date_type:
 
 
 def _get_latest_submitted_request(
-    db: Session, nurse_id: str, month_str: str
+    db: Session, nurse_id: str, group_id: str, month_str: str
 ) -> WantedRequest | None:
-    """Find the latest submitted WantedRequest for a nurse+month."""
+    """Find the latest submitted WantedRequest for a nurse+month.
+
+    group_id-scoped: cross-group read 차단 (RBAC defense-in-depth).
+    """
     return (
         db.query(WantedRequest)
         .filter(
             WantedRequest.nurse_id == nurse_id,
+            WantedRequest.group_id == group_id,
             WantedRequest.month == month_str,
             WantedRequest.is_submitted == True,
         )
@@ -305,6 +358,7 @@ def _create_draft_with_copy(
     month_str: str,
     old_request_id: int | None,
     *,
+    group_id: str,
     exclude_date: str | None = None,
     modify_date: str | None = None,
     modify_shift: str | None = None,
@@ -335,6 +389,7 @@ def _create_draft_with_copy(
         nurse_id=nurse_id,
         request_id=new_request_id,
         month=month_str,
+        group_id=group_id,
         request="",
         is_submitted=False,
         created_at=datetime.now(),
@@ -372,6 +427,7 @@ def _create_draft_with_copy(
                 request_id=new_request_id,
                 detailed_request_id=detailed_id,
                 shift_date=row.shift_date,
+                group_id=group_id,
                 shift=shift,
                 shifts_table_id=s_table_id,
                 score=row.score,
@@ -388,6 +444,7 @@ def _create_draft_with_copy(
             request_id=new_request_id,
             detailed_request_id=detailed_id,
             shift_date=parsed_date,
+            group_id=group_id,
             shift=add_shift,
             shifts_table_id=add_shifts_table_id,
             score=1.0,
@@ -415,6 +472,7 @@ def _create_draft_with_copy(
                 month=month_str,
                 detailed_request_id=pair_id,
                 target_id=p.target_id,
+                group_id=group_id,
                 score=p.score,
                 partial_request=p.partial_request,
             ))
@@ -442,12 +500,12 @@ def _submit_draft(db: Session, draft: WantedRequest) -> None:
 
 
 def delete_wanted_by_date(
-    db: Session, nurse_id: str, year: int, month: int, date: str,
+    db: Session, nurse_id: str, group_id: str, year: int, month: int, date: str,
     *, preview_only: bool = True,
 ) -> dict:
     """Delete a specific date from wanted submissions."""
     month_str = _wanted_request_month_str(year, month)
-    old_wr = _get_latest_submitted_request(db, nurse_id, month_str)
+    old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     if not old_wr:
         return {"error": "제출된 원티드가 없습니다."}
 
@@ -477,6 +535,7 @@ def delete_wanted_by_date(
 
     draft, count = _create_draft_with_copy(
         db, nurse_id, month_str, old_wr.request_id,
+        group_id=group_id,
         exclude_date=date,
     )
     _submit_draft(db, draft)
@@ -498,7 +557,7 @@ def add_wanted_by_date(
 ) -> dict:
     """Add a new date to wanted submissions."""
     month_str = _wanted_request_month_str(year, month)
-    old_wr = _get_latest_submitted_request(db, nurse_id, month_str)
+    old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     old_rid = old_wr.request_id if old_wr else None
 
     # Check duplicate
@@ -533,6 +592,7 @@ def add_wanted_by_date(
 
     draft, count = _create_draft_with_copy(
         db, nurse_id, month_str, old_rid,
+        group_id=group_id,
         add_date=date,
         add_shift=shift_code,
         add_shifts_table_id=shifts_table_id,
@@ -558,7 +618,7 @@ def modify_wanted_by_date(
 ) -> dict:
     """Modify the shift of an existing wanted date."""
     month_str = _wanted_request_month_str(year, month)
-    old_wr = _get_latest_submitted_request(db, nurse_id, month_str)
+    old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     if not old_wr:
         return {"error": "제출된 원티드가 없습니다."}
 
@@ -594,6 +654,7 @@ def modify_wanted_by_date(
 
     draft, count = _create_draft_with_copy(
         db, nurse_id, month_str, old_wr.request_id,
+        group_id=group_id,
         modify_date=date,
         modify_shift=new_shift_code,
         modify_shifts_table_id=new_shifts_table_id,

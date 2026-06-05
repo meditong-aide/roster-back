@@ -26,8 +26,15 @@ SKILL_TOOLS: list[dict] = [
             "─────────── scope (조회 도메인) ───────────\n"
             "scope는 **'어떤 종류의 데이터를 보고 싶은가'**를 의미합니다. 키워드 매칭이 아니라, "
             "사용자가 묻는 정보가 어느 데이터 도메인에 속하는지 판단해서 고르세요.\n\n"
+            "- `wanted_campaign` — **원티드 캠페인 자체의 운영 메타**(wanted 테이블). "
+            "  마감일(exp_date), 운영 상태(status: requested/closed), 캠페인 존재 여부. "
+            "  '원티드 마감 언제야', '제출 기한 언제까지', '4월 원티드 닫혔어?', "
+            "  '캠페인 열려있어?', '원티드 마감일 알려줘'처럼 **신청 내용·제출자가 아니라 캠페인 일정 자체**를 묻는 경우. "
+            "  ⚠️ '마감/기한/언제까지/열렸어/닫혔어/캠페인' 같은 운영 일정 단어가 핵심이면 이 scope. "
+            "  '미제출자 명단'(누가)·'신청 내용'(무엇)과 의미적으로 다른 축임을 구분.\n"
             "- `wanted_submissions` — **제출 메타데이터 전용**: 누가 제출했는지/안 했는지, 제출 시각. "
-            "  '미제출자 누구야', '몇 명 제출했어', '제출 현황'처럼 **제출 여부·집계**만 묻는 경우.\n"
+            "  '미제출자 누구야', '몇 명 제출했어', '제출 현황'처럼 **제출 여부·집계**만 묻는 경우. "
+            "  ※ 마감일은 여기서 안 나옴 → `wanted_campaign` 으로.\n"
             "- `wanted_adjustment` — **원티드 신청 내역의 정식 조회 경로**(fixed_wanted_entries 테이블). "
             "  간호사가 신청한 시프트의 날짜·코드, 수간호사 조정 결과를 모두 담고 있음. "
             "  '4월 원티드 신청 내역', '김민지 4월 원티드 뭐 냈어', '5/3 원티드 어떻게 돼있어' 등 "
@@ -78,6 +85,9 @@ SKILL_TOOLS: list[dict] = [
             "─────────── 예시 ───────────\n"
             "- '4월 원티드 미제출자 리스트업' → scope=wanted_submissions, operation=count\n"
             "- '몇 명 제출했어' → scope=wanted_submissions, operation=count\n"
+            "- '원티드 제출 마감 언제야' → scope=wanted_campaign\n"
+            "- '4월 원티드 닫혔어?' → scope=wanted_campaign\n"
+            "- '캠페인 기한 알려줘' → scope=wanted_campaign\n"
             "- '4월 원티드 신청 내역 보여줘' → scope=wanted_adjustment\n"
             "- '김민지 4월 원티드 뭐 냈어' → scope=wanted_adjustment, nurse_name='김민지'\n"
             "- '4월 첫째 주 김민지가 낸 원티드' → scope=wanted_adjustment, "
@@ -95,6 +105,7 @@ SKILL_TOOLS: list[dict] = [
                 "scope": {
                     "type": "string",
                     "enum": [
+                        "wanted_campaign",
                         "wanted_submissions",
                         "wanted_adjustment",
                         "schedule",
@@ -102,14 +113,17 @@ SKILL_TOOLS: list[dict] = [
                         "shift_definitions",
                         "constraint_config",
                         "generation_job",
+                        "monthly_limit",
                     ],
                     "description": (
                         "조회 도메인. 사용자가 묻는 정보가 어느 데이터 영역에 속하는지로 결정. "
+                        "원티드 **캠페인 운영 메타**(마감일·status·열림 여부)=wanted_campaign, "
                         "원티드 **제출 여부·집계**=wanted_submissions, "
                         "원티드 **신청 내용**(시프트·날짜)=wanted_adjustment, "
                         "근무표 셀=schedule, 간호사 인사정보=nurse_info, "
                         "시프트 정의=shift_definitions, 제약 설정=constraint_config, "
-                        "생성잡 상태=generation_job"
+                        "생성잡 상태=generation_job, "
+                        "**개인별 월 한도** (예: '김민지 5월 N 몇 번', '5월 D 정확히 설정한 간호사')=monthly_limit"
                     ),
                 },
                 "operation": {
@@ -210,7 +224,7 @@ SKILL_TOOLS: list[dict] = [
             "- 'wanted_adjustment': 원티드 조정판 (수간호사가 신청들을 모아 조율하는 단계).\n"
             "- 'schedule': 확정된 근무표의 시프트 셀.\n\n"
             "scope × action 유효 조합:\n"
-            "- wanted_submissions: cancel / approve / reject / add_shift / change_shift / update_deadline\n"
+            "- wanted_submissions: cancel / approve / reject / add_shift / change_shift / update_deadline / clear_deadline\n"
             "- wanted_adjustment: apply / unapply_off\n"
             "- schedule: change_shift / add_shift / remove_shift\n\n"
             "날짜 포맷:\n"
@@ -224,12 +238,22 @@ SKILL_TOOLS: list[dict] = [
             "⚠️ '한도'와 '마감일' 혼동 주의:\n"
             "- '원티드 최대 횟수/한도' (간호사 개인 설정) → update_person_attr.wanted_max_requests\n"
             "- '원티드 마감일/제출 기한' (운영 일정) → bulk_mutation action='update_deadline'\n\n"
+
+            "⚠️ '마감일 없애/제거/삭제/해제/취소/풀어' = NULL 클리어:\n"
+            "- 마감일을 **해제**(설정값 자체를 비우기) 의도면 반드시 action='clear_deadline'.\n"
+            "- 이때 new_deadline 파라미터는 **절대 채우지 말 것**. 직전 값으로 되돌린다 같은 추측도 금지.\n"
+            "- 즉 사용자가 '없애줘 / 다시 원래대로 / 마감일 풀어줘 / clear / 삭제' 라고 하면 임의로\n"
+            "  과거 값을 골라 update_deadline 하지 말고 clear_deadline 으로 NULL 시킬 것.\n"
+            "- 사용자가 '되돌려'라고만 했고 직전 값이 명백하지 않으면, 임의 추측보다 clear 우선 또는\n"
+            "  사용자에게 명확화 요청.\n\n"
             "예시:\n"
             "- '5/3 원티드 취소' → scope='wanted_submissions', action='cancel', date='2026-05-03'\n"
             "- '5/15에 Oz 원티드 추가' → scope='wanted_submissions', action='add_shift', date='2026-05-15', shift_name='Oz'\n"
             "- '5/3 원티드 D를 N으로' → scope='wanted_submissions', action='change_shift', date='2026-05-03', new_shift_name='N'\n"
             "- '원티드 전체 취소' → scope='wanted_submissions', action='cancel' (date 없이)\n"
             "- '원티드 마감일 수정' → scope='wanted_submissions', action='update_deadline', new_deadline='2026-04-18'\n"
+            "- '원티드 마감일 없애줘 / 그냥 없애 / 마감 풀어줘 / 마감일 삭제' → "
+            "scope='wanted_submissions', action='clear_deadline' (new_deadline 미지정)\n"
             "- '조정판 쉬는사람 해제' → scope='wanted_adjustment', action='unapply_off'\n"
             "- '김민지 4/5 D→E' → scope='schedule', action='change_shift'\n\n"
             "⛔ 다음은 bulk_mutation 아님 (update_person_attr로):\n"
@@ -258,10 +282,12 @@ SKILL_TOOLS: list[dict] = [
                         "add_shift",
                         "remove_shift",
                         "update_deadline",
+                        "clear_deadline",
                     ],
                     "description": (
                         "수행할 작업. 원티드 날짜별: cancel(취소), add_shift(추가), change_shift(변경). "
-                        "근무표: change_shift, add_shift, remove_shift. 조정판: unapply_off, apply."
+                        "근무표: change_shift, add_shift, remove_shift. 조정판: unapply_off, apply. "
+                        "마감일: update_deadline(새 값 설정), clear_deadline(마감일 해제 — NULL)."
                     ),
                 },
                 "nurse_name": {"type": "string"},
@@ -716,7 +742,9 @@ SKILL_TOOLS: list[dict] = [
             "병동의 **근무표를 자동 생성하는 비동기 잡**을 큐에 등록합니다. "
             "사용자가 '근무표 생성', '자동으로 짜줘', '돌려줘'처럼 신규 생성 의도를 표현할 때 사용.\n\n"
 
-            "⚠️ **고위험·비동기**: 잡 등록 후 SQS를 통해 백그라운드에서 실행됨. 결과는 즉시 나오지 않음.\n"
+            "⚠️ **고위험·비동기**: 잡 등록 후 SQS를 통해 백그라운드에서 실행됨. 결과는 즉시 나오지 않음. "
+            "보통 15~30초 정도 소요됨 — 잡 등록 직후 사용자에게 예상 소요 시간(약 15~30초)을 자연스럽게 안내하고, "
+            "사용자가 '어떻게 됐어?'/'결과 보여줘' 등으로 물으면 get_job_status (또는 query_schedule scope='generation_job')로 확인할 것.\n"
             "⚠️ 사전 조건:\n"
             "  • 해당 병동의 RosterConfig가 존재해야 함 (없으면 update_constraint로 먼저 설정 필요).\n"
             "  • 같은 병동에 QUEUED/RUNNING 상태 잡이 없어야 함 (있으면 충돌 거부).\n"
@@ -727,6 +755,16 @@ SKILL_TOOLS: list[dict] = [
             "- preview: {preview:true, group_id, year, month, config_id, message}\n"
             "- 실제 등록: 잡 레코드 + _sqs_dispatch_required + _generation_params(year,month,config_id). "
             "실제 SQS 디스패치는 호출 레이어가 담당.\n\n"
+
+            "🔎 **결과 추적 (FAILED 시)**: 잡이 FAILED 상태면 get_job_status (또는 query_schedule scope='generation_job') "
+            "의 결과에 `infeasibility` 필드가 포함됨. 이 필드에는:\n"
+            "  • summary_ko: 한 줄 요약\n"
+            "  • problems[]: 왜 못 만들었는지 (한국어 문장 리스트)\n"
+            "  • actions[]: 어떻게 해결할지 (한국어 문장 리스트)\n"
+            "  • trade_offs[]: 각 해결책의 부작용\n"
+            "  • hard_case: 어려운 케이스 분류 (true면 운영자 검토 권장)\n"
+            "  • apply_hint: 재시도용 설정 변경 힌트\n"
+            "사용자에게 답할 때는 narrative 필드를 활용해 '왜 실패했고 어떻게 풀 수 있는지' 자연스럽게 설명할 것.\n\n"
 
             "─────────── 인접 스킬과의 경계 ───────────\n"
             "- 기존 근무표 진단·교체 제안 → repair_schedule (재생성 아님)\n"
@@ -754,6 +792,61 @@ SKILL_TOOLS: list[dict] = [
                 },
             },
             "required": ["year", "month"],
+        },
+    },
+    {
+        "name": "update_monthly_limit",
+        "description": (
+            "**간호사 개인의 월 시프트 한도**(D/E/N/O × min/max/exact)를 설정/수정합니다. "
+            "예: '김민지 5월 야간 4번으로 맞춰줘' / '박혜미 5월 D 최소 8회' / '이영희 5월 N 최대 5회로 제한'.\n\n"
+
+            "⚠️ 권한: 수간호사(HN) 또는 관리자(ADM) 만 가능 (다른 간호사 한도 조정).\n"
+            "⚠️ 변경 전 반드시 preview_only=true 로 영향 범위 표시 → 사용자 동의 후 preview_only=false 로 재호출.\n\n"
+
+            "─────────── 필드 매핑 ───────────\n"
+            "  • 'N 몇 번'/'야간 정확히'   → n_exact (정수)\n"
+            "  • 'N 최대'/'야간 한도'      → n_max (정수)\n"
+            "  • 'N 최소'/'야간 최소'      → n_min (정수)\n"
+            "  • D / E / O 도 동일 패턴 (d_exact, d_min, d_max, e_*, o_*)\n\n"
+
+            "─────────── 인접 skill 과의 경계 ───────────\n"
+            "- '병동 전체 야간 최대 7회' (정책) → update_constraint (max_nig_per_month)\n"
+            "- '김민지 야간 전담' (개인 속성) → update_person_attr (is_night_nurse)\n"
+            "- '김민지 5월 야간 4번' (개인 월 한도) → update_monthly_limit (n_exact)\n\n"
+
+            "예시:\n"
+            "- '김민지 5월 야간 4번' → nurse_ids=['김민지의 nurse_id'], year=2026, month=5, n_exact=4\n"
+            "- '박혜미 5월 D 최소 8회' → nurse_ids=[...], year=2026, month=5, d_min=8"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "nurse_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "대상 간호사 ID. 보통 단일.",
+                },
+                "year": {"type": "integer"},
+                "month": {"type": "integer"},
+                "d_exact": {"type": "integer", "description": "데이 정확히 몇 번"},
+                "d_min": {"type": "integer"},
+                "d_max": {"type": "integer"},
+                "e_exact": {"type": "integer", "description": "이브닝 정확히 몇 번"},
+                "e_min": {"type": "integer"},
+                "e_max": {"type": "integer"},
+                "n_exact": {"type": "integer", "description": "야간 정확히 몇 번"},
+                "n_min": {"type": "integer"},
+                "n_max": {"type": "integer"},
+                "o_exact": {"type": "integer", "description": "오프 정확히 몇 번"},
+                "o_min": {"type": "integer"},
+                "o_max": {"type": "integer"},
+                "preview_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "true 면 미리보기, false 면 적용.",
+                },
+            },
+            "required": ["nurse_ids", "year", "month"],
         },
     },
 ]

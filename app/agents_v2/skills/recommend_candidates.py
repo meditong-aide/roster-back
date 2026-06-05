@@ -55,7 +55,7 @@ def recommend_candidates(db: Session, params: dict) -> Any:
     # Enrich with nurse details
     enriched = []
     for nid in candidates:
-        nurse = nurse_tools.get_nurse_by_id(db, nid)
+        nurse = nurse_tools.get_nurse_by_id(db, nid, group_id)
         if not nurse:
             continue
 

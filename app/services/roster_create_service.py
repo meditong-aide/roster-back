@@ -46,6 +46,7 @@ from services.assignment_service import get_active_assignments_for_month, flush_
 from services.day_windows import build_blocked_days
 from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_by_nurse
 from services.cp_sat.mid_feasibility import validate_mid_hard_feasibility as _validate_mid_hard_feasibility_impl
+from services.semantics import attach_reason_code_ontology
 
 logger = logging.getLogger(__name__)
 # from db.client2 import _get_mssql_session
@@ -1452,6 +1453,7 @@ def _build_special_fixed_cells(
                 "day_index": day - 1,
                 "shift": shift_id,
                 "shift_type": shift_type,
+                "fixed_source": "special_fixed",
             }
         )
     # for f in fixed_cells:
@@ -2585,7 +2587,7 @@ def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int
         month=month,
     )
 
-def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None):
+def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
     try:
@@ -2726,7 +2728,15 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         for nurse_id in day0_n_fixed_nurse_ids:
             n_idx = nurse_idx_map.get(str(nurse_id))
             if n_idx is not None:
-                fixed_list.append({"nurse_index": n_idx, "day_index": 0, "shift": "N"})
+                fixed_list.append(
+                    {
+                        "nurse_index": n_idx,
+                        "day_index": 0,
+                        "shift": "N",
+                        "shift_type": "근무",
+                        "fixed_source": "carryover_day0_n",
+                    }
+                )
         config_dict["fixed_cells"] = fixed_list
     prev_month_last_is_off = cross_month_constraints.get("prev_month_last_is_off") or {}
     if prev_month_last_is_off:
@@ -2874,8 +2884,11 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                     _rs,
                     "_constraint_impact_attempt_meta",
                     {
-                        "attempt_index": 1 if bool(config_dict.get("_force_grade_max_soft_fallback")) else 0,
-                        "label": "grade_max_retry" if bool(config_dict.get("_force_grade_max_soft_fallback")) else "primary",
+                        "attempt_index": 1 if (bool(config_dict.get("_team_min_soft_retry_attempted")) or bool(config_dict.get("_force_grade_max_soft_fallback"))) else 0,
+                        "label": (
+                            "team_min_retry" if bool(config_dict.get("_team_min_soft_retry_attempted"))
+                            else ("grade_max_retry" if bool(config_dict.get("_force_grade_max_soft_fallback")) else "primary")
+                        ),
                         "forced_grade_soft_fallback": bool(config_dict.get("_force_grade_max_soft_fallback")),
                         "config_flags": {
                             "preceptee_on": bool(config_dict.get("preceptee_on", False)),
@@ -3136,6 +3149,155 @@ def _build_validation_shift_main_map(roster_system) -> dict[str, str]:
     return shift_main_map
 
 
+def _collect_validator_evidence(
+    generated: dict[str, list[str]] | None,
+    roster_system,
+    shift_main_map: dict[str, str] | None = None,
+) -> dict:
+    """validator 실패 해석용 근거 스냅샷(경량).
+
+    - day/shift 단위로 required/assigned/eligible를 수집
+    - top_failed_cells(최대 50) 샘플 생성
+    """
+    try:
+        cfg = getattr(roster_system, "config", None)
+        if cfg is None or not isinstance(generated, dict):
+            return {}
+
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        nurse_count = len(nurses)
+        num_days = int(getattr(roster_system, "num_days", 0) or 0)
+        if num_days <= 0:
+            num_days = max((len(v or []) for v in generated.values()), default=0)
+        if num_days <= 0:
+            return {}
+
+        join = list(getattr(roster_system, "join", []) or [])
+        leave = list(getattr(roster_system, "leave", []) or [])
+        blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
+
+        def _req_by_day(day_idx: int) -> dict[str, int]:
+            by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+            if isinstance(by_day, list) and day_idx < len(by_day) and isinstance(by_day[day_idx], dict):
+                return {str(k).upper(): int(v or 0) for k, v in by_day[day_idx].items()}
+            base = getattr(cfg, "daily_shift_requirements", None)
+            if isinstance(base, dict):
+                return {str(k).upper(): int(v or 0) for k, v in base.items()}
+            return {}
+
+        # assigned counter by day/shift
+        assigned_map: dict[tuple[int, str], int] = defaultdict(int)
+        for shifts in generated.values():
+            for d, raw in enumerate(shifts or []):
+                code = _normalize_assigned_code_for_validation(raw, shift_main_map)
+                if code in {"-", "O"}:
+                    continue
+                assigned_map[(d, code)] += 1
+
+        def _is_eligible(n_idx: int, d: int, code: str) -> bool:
+            if n_idx < len(join) and n_idx < len(leave):
+                if not (join[n_idx] <= d <= leave[n_idx]):
+                    return False
+            if d in (blocked_by_nurse.get(n_idx, set()) or set()):
+                return False
+            if n_idx < nurse_count:
+                nu = nurses[n_idx]
+                allowed = set(str(x).upper() for x in (getattr(nu, "allowed_shifts", None) or []))
+                if allowed and code not in allowed:
+                    return False
+                if code in {"D", "E"} and bool(getattr(nu, "is_night_nurse", 0) == 3):
+                    return False
+            return True
+
+        cells: list[dict] = []
+        for d in range(num_days):
+            req = _req_by_day(d)
+            for code, need in req.items():
+                code_u = str(code).upper()
+                if code_u == "O":
+                    continue
+                n_need = int(need or 0)
+                if n_need <= 0:
+                    continue
+                assigned = int(assigned_map.get((d, code_u), 0) or 0)
+                eligible = 0
+                if nurse_count > 0:
+                    for n_idx in range(nurse_count):
+                        if _is_eligible(n_idx, d, code_u):
+                            eligible += 1
+                cells.append(
+                    {
+                        "day": d + 1,
+                        "shift": code_u,
+                        "required": n_need,
+                        "assigned": assigned,
+                        "eligible": eligible,
+                        "shortage": max(0, n_need - assigned),
+                        "eligible_gap": max(0, n_need - eligible),
+                    }
+                )
+
+        failed = [c for c in cells if c["assigned"] < c["required"]]
+        failed.sort(key=lambda x: (x["shortage"], x["eligible_gap"]), reverse=True)
+        top_failed = failed[:50]
+
+        # Attach blocking_axes per cell (S3)
+        _shift_to_capacity_axis = {
+            "N": "night_capacity",
+            "D": "day_capacity",
+            "E": "evening_capacity",
+            "M": "mid_capacity",
+        }
+        for c in top_failed:
+            sh = str(c.get("shift") or "").upper()
+            primary = _shift_to_capacity_axis.get(sh)
+            blocking: list[str] = []
+            if primary:
+                blocking.append(primary)
+            eligible = int(c.get("eligible") or 0)
+            required = int(c.get("required") or 0)
+            assigned = int(c.get("assigned") or 0)
+            # Eligibility lock: 후보 자체가 부족
+            if eligible < required:
+                blocking.append("allowed_shift_mask")
+            # Coverage-but-eligible: 후보는 있지만 배정 안 됨 → fixed/carryover/team_min 의심
+            elif eligible >= required and assigned < required:
+                # team_min / fixed_lock / carryover_lock 중 후속 단계에서 분기. 일단 capacity 만 표시.
+                pass
+            c["blocking_axes"] = blocking
+            c["blocking_detail"] = {
+                "primary_axis": primary,
+                "eligibility_gap": max(0, required - eligible),
+                "assignment_gap": max(0, required - assigned),
+                "shift": sh,
+            }
+
+        # fixed/forbidden 및 carryover 단서 집계
+        merged_ic = getattr(roster_system, "_constraint_impact_merged_initial_constraints", None) or {}
+        forbidden_map = (merged_ic or {}).get("forbidden") or {}
+        fixed_forbidden_count = 0
+        if isinstance(forbidden_map, dict):
+            for day_map in forbidden_map.values():
+                if not isinstance(day_map, dict):
+                    continue
+                for codes in day_map.values():
+                    fixed_forbidden_count += len(list(codes or []))
+
+        carryover_artifacts = getattr(roster_system, "_constraint_impact_carryover_artifacts", None) or []
+        carryover_artifact_count = len(list(carryover_artifacts or []))
+
+        return {
+            "total_failed_cells": len(failed),
+            "top_failed_cells": top_failed,
+            "eligible_zero_cells": sum(1 for c in failed if c["eligible"] <= 0),
+            "required_minus_assigned_total": sum(int(c["shortage"]) for c in failed),
+            "fixed_forbidden_count": int(fixed_forbidden_count),
+            "carryover_artifact_count": int(carryover_artifact_count),
+        }
+    except Exception:
+        return {}
+
+
 def _normalize_assigned_code_for_validation(
     raw_shift: object,
     shift_main_map: dict[str, str] | None = None,
@@ -3150,6 +3312,107 @@ def _normalize_assigned_code_for_validation(
     if code in {"D", "E", "N", "O", "M", "W"}:
         return code
     return code
+
+
+def _extract_unrecoverable_violated_constraints(
+    roster_system,
+    generated: dict[str, list[str]] | None,
+    validation_error: str | None,
+) -> list[dict]:
+    """Unrecoverable infeasibility 케이스에서 인과 제약 리스트를 추출한다.
+
+    출처:
+      1. validation_error 문자열의 reason_code 패턴 (예: `[reason_code=NO_ASSIGNMENT]`)
+      2. _build_infeasible_diagnosis(roster_system, generated)의 reason_code
+      3. _probe_first_grade_hard_blocker(roster_system) — grade-hard 충돌
+      4. roster_system.blocked_by_nurse — 해당 nurse가 전부 차단된 케이스
+
+    반환 항목 형식:
+        {"node_id", "slack", "details", "reason_code", "human_message_ko"}
+
+    node_id prefix 컨벤션은 ontology dashboard의 _ctype_from_id가
+    typed ConstraintNode로 매핑한다.
+    """
+    import re
+
+    out: list[dict] = []
+    seen_codes: set[str] = set()
+    err = str(validation_error or "")
+
+    REASON_TO_NODE = {
+        "CAPACITY_TOTAL_SHORTAGE": ("infeasibility:capacity_total", "ConstraintNode"),
+        "N_CAPACITY_SHORTAGE":     ("infeasibility:n_capacity", "ConstraintNode"),
+        "MAX_CAP_SHORTAGE":        ("infeasibility:max_cap_shortage", "ConstraintNode"),
+        "GRADE_MAX_SUM_BELOW_NEED":("grade_max:sum_below_need", "GradeMaxNode"),
+        "GRADE_HARD_PROBE":        ("grade_max:hard_probe", "GradeMaxNode"),
+    }
+
+    def _push(reason_code: str, human_msg: str | None, slack=None, details=None):
+        if not reason_code or reason_code in seen_codes:
+            return
+        seen_codes.add(reason_code)
+        node_id, _ = REASON_TO_NODE.get(reason_code, (f"infeasibility:{reason_code.lower()}", "ConstraintNode"))
+        out.append({
+            "node_id": node_id,
+            "reason_code": reason_code,
+            "slack": slack,
+            "details": details or {},
+            "human_message_ko": (human_msg or "")[:400] if human_msg else None,
+        })
+
+    for m in re.finditer(r"\[reason_code=([A-Z_]+)\]", err):
+        _push(m.group(1), err, details={"source": "validation_error"})
+
+    # NO_ASSIGNMENT* 4축 라벨 추론 코드 제거됨 (US-10):
+    # 미배정 cell 자체는 "결과(symptom)" 이며 cause 가 아니다.
+    # 실제 cause 는 team_grade_precheck 의 산술 detector + cause_inferer 의
+    # MUS pattern 추론 가 구체 cause_id 로 만들어준다.
+
+    try:
+        diag = _build_infeasible_diagnosis(roster_system, generated)
+        if diag:
+            m = re.search(r"\[reason_code=([A-Z_]+)\]", diag)
+            if m:
+                _push(m.group(1), diag, details={"source": "diagnosis"})
+    except Exception:
+        pass
+
+    try:
+        probe = _probe_first_grade_hard_blocker(roster_system)
+        if probe:
+            _push("GRADE_HARD_PROBE", probe, details={"source": "grade_hard_probe"})
+    except Exception:
+        pass
+
+    try:
+        blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
+        nurses = list(getattr(roster_system, "nurses", []) or [])
+        for idx, blocked_days in blocked_by_nurse.items():
+            try:
+                if not blocked_days:
+                    continue
+                if idx < len(nurses):
+                    nurse_id = str(getattr(nurses[idx], "nurse_id", idx))
+                else:
+                    nurse_id = str(idx)
+                node_id = f"nurse:{nurse_id}"
+                if node_id in {x.get("node_id") for x in out}:
+                    continue
+                out.append({
+                    "node_id": node_id,
+                    "reason_code": "NURSE_BLOCKED_DAYS",
+                    "slack": -len(blocked_days),
+                    "details": {"blocked_day_count": len(blocked_days), "source": "blocked_by_nurse"},
+                    "human_message_ko": f"간호사 {nurse_id}가 {len(blocked_days)}일 차단됨",
+                })
+                if len(out) >= 50:
+                    return out
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return out[:50]
 
 
 def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] | None) -> str | None:
@@ -3427,8 +3690,25 @@ def _validate_generated_roster(
     예시:
         총 750칸 중 실근무 0칸이거나 위반 1500건(750×2) 이상 → 메시지 반환.
     """
+    def _with_ontology(msg: str | None) -> str | None:
+        if msg and roster_system is not None:
+            try:
+                setattr(roster_system, "_ontology_last_reason", attach_reason_code_ontology(message=msg, severity="hard"))
+            except Exception:
+                pass
+        return msg
+
     shift_main_map = _build_validation_shift_main_map(roster_system)
     total_cells, work_cells = _count_work_assignments(generated, shift_main_map)
+    try:
+        if roster_system is not None:
+            setattr(
+                roster_system,
+                "_validator_evidence",
+                _collect_validator_evidence(generated, roster_system, shift_main_map),
+            )
+    except Exception:
+        pass
 
     if total_cells > 0 and work_cells == 0:
         diag = _build_infeasible_diagnosis(roster_system, generated)
@@ -3457,21 +3737,21 @@ def _validate_generated_roster(
         if cp_probe_msg:
             if diag:
                 if probe_comment:
-                    return f"{diag} | [cp_probe={cp_probe_msg}] | {probe_comment}"
-                return f"{diag} | [cp_probe={cp_probe_msg}]"
+                    return _with_ontology(f"{diag} | [cp_probe={cp_probe_msg}] | {probe_comment}")
+                return _with_ontology(f"{diag} | [cp_probe={cp_probe_msg}]")
             if probe_comment:
-                return (
+                return _with_ontology(
                     "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
                     f"| [cp_probe={cp_probe_msg}] | {probe_comment}"
                 )
-            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]"
+            return _with_ontology(f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]")
         # TEMP-PROBE-DELETE: NO_ASSIGNMENT 시 grade hard 충돌 일자/교대를 임시 탐색
         probe_msg = _probe_first_grade_hard_blocker(roster_system)
         if probe_msg:
             print(f"[InfeasibleProbe] {probe_msg}")
             if diag:
-                return f"{diag} | {probe_msg}"
-            return f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}"
+                return _with_ontology(f"{diag} | {probe_msg}")
+            return _with_ontology(f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}")
 
         # probe로 못 잡힌 경우, grade_max 산술 상한만으로도 즉시 불가능한 케이스를 보조 진단한다.
         try:
@@ -3532,22 +3812,22 @@ def _validate_generated_roster(
                                 f"limits={constrained}"
                             )
                             if diag:
-                                return f"{diag} | {aux}"
-                            return (
+                                return _with_ontology(f"{diag} | {aux}")
+                            return _with_ontology(
                                 "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
                                 f"| {aux} | [comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮습니다. "
                                 "grade_max 중요도를 soft로 낮추거나 상한 완화를 검토하세요."
                             )
         except Exception as _aux_exc:
             print(f"[InfeasibleProbe][aux] grade_max 보조진단 실패(무시): {_aux_exc}")
-        return diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다."
+        return _with_ontology(diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다.")
 
-    # 일 단위 커버리지가 전부 0인 날이 있는지 확인 (필수 인원 대비 실배정 0)
+    # day-zero coverage 감지 — symptom 라벨은 throw 하지 않고 cause probe 4축을 강제 실행.
+    # cause 가 식별되면 그것만 반환, 모든 probe 가 침묵하면 UNDIAGNOSED sentinel + evidence dump.
     try:
         cfg = getattr(roster_system, "config", None)
         num_days = getattr(roster_system, "num_days", 0) or 0
         shift_types = list(getattr(cfg, "shift_types", []) or [])
-        off_alias = {"-", "O", "OFF", "주"}
 
         def _required_by_day(day_idx: int) -> dict[str, int]:
             if isinstance(getattr(cfg, "daily_shift_requirements_by_day", None), list):
@@ -3582,11 +3862,23 @@ def _validate_generated_roster(
                 if total_actual == 0:
                     diag = _build_infeasible_diagnosis(roster_system, generated)
                     if diag:
-                        return diag
+                        return _with_ontology(diag)
+                    probe = _probe_first_grade_hard_blocker(roster_system)
+                    if probe:
+                        return _with_ontology(f"[reason_code=GRADE_HARD_PROBE] {probe}")
+                    ev = getattr(roster_system, "_validator_evidence", None) or {}
                     req_msg = ", ".join(f"{k}={v}" for k, v in req.items())
-                    return (
-                        f"[reason_code=DAY_ZERO_COVERAGE] Infeasible 진단: "
-                        f"{d + 1}일 필수 근무 미배정 (요구: {req_msg})"
+                    ev_brief = {
+                        "day": d + 1,
+                        "required": req,
+                        "total_failed_cells": ev.get("total_failed_cells"),
+                        "eligible_zero_cells": ev.get("eligible_zero_cells"),
+                        "fixed_forbidden_count": ev.get("fixed_forbidden_count"),
+                        "carryover_artifact_count": ev.get("carryover_artifact_count"),
+                    }
+                    return _with_ontology(
+                        f"[reason_code=UNDIAGNOSED] day-zero trigger fired but no root cause identified "
+                        f"(day={d + 1}, req={req_msg}). evidence={ev_brief}"
                     )
 
     except Exception:
@@ -3710,6 +4002,77 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         used_fallback = bool(getattr(roster_system, "_used_fallback", False))
         coverage_gaps = _compute_coverage_gaps(roster_system)
+
+        # Phase B: surface solver-attach-point emit recordings.
+        # Outcome-conditional retention:
+        #   SAT  → aggregate + interesting_events (bypassed_by_fixed) only
+        #   UNSAT/infeasibility → full granular records + ConflictProbeReport
+        emit_rec = getattr(roster_system, "_constraint_impact_solver_emit_recorder", None)
+        emit_summary: dict[str, dict[str, int]] = {}
+        interesting_events: list[dict] = []
+        full_records_for_unsat: list[dict] = []
+        conflict_probe_payload: dict | None = None
+        outcome_label = "sat" if analysis.valid_under_current_semantics else "unsat"
+        if emit_rec is not None:
+            try:
+                records = emit_rec.records()
+                for r in records:
+                    fam = emit_summary.setdefault(r.family, {})
+                    fam[r.mode] = fam.get(r.mode, 0) + 1
+                    if r.mode != "enforced":
+                        interesting_events.append(r.to_dict())
+                if outcome_label == "unsat":
+                    # cap per family to keep payload bounded; agents can re-fetch via dedicated endpoint
+                    per_family_cap = 50
+                    counter: dict[str, int] = {}
+                    for r in records:
+                        c = counter.get(r.family, 0)
+                        if c >= per_family_cap:
+                            continue
+                        counter[r.family] = c + 1
+                        full_records_for_unsat.append(r.to_dict())
+                    from services.constraint_impact.conflict_probe import (
+                        build_conflict_probe_report,
+                    )
+                    probe = build_conflict_probe_report(emit_records=records)
+                    conflict_probe_payload = {
+                        "ranked_candidates": [
+                            {
+                                "family": c.family,
+                                "score": c.score,
+                                "relaxation_priority": c.relaxation_priority,
+                                "scope_explosion": c.scope_explosion,
+                                "emit_count": c.emit_count,
+                                "matched_scenario_ids": c.matched_scenario_ids,
+                                "reasons": c.reasons,
+                                "sample_records": c.sample_records,
+                            }
+                            for c in probe.ranked_candidates
+                        ],
+                        "matched_scenarios": [
+                            {
+                                "scenario_id": s.scenario_id,
+                                "involved_families": s.involved_families,
+                                "confidence": s.confidence,
+                                "suggested_relaxation": s.suggested_relaxation,
+                                "why_infeasible": s.why_infeasible,
+                                "detection_hint": s.detection_hint,
+                            }
+                            for s in probe.matched_scenarios
+                        ],
+                        "probe_plan": [
+                            {
+                                "order": p.order,
+                                "family": p.family,
+                                "action": p.action,
+                                "rationale": p.rationale,
+                            }
+                            for p in probe.probe_plan
+                        ],
+                        "notes": probe.notes,
+                    }
+            except Exception:
+                pass
         return {
             "enabled": True,
             "timing_ms": elapsed_ms,
@@ -3751,6 +4114,11 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
             },
             "solver_status": "fallback" if used_fallback else "primary",
             "coverage_gaps": coverage_gaps,
+            "outcome": outcome_label,
+            "solver_emitted_summary": emit_summary,
+            "interesting_emit_events": interesting_events,
+            "solver_emitted_nodes": full_records_for_unsat,
+            "conflict_probe": conflict_probe_payload,
         }
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -4263,6 +4631,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         print(f"[Assignment] id={_a.id}, nurse_id={_a.nurse_id}, reason={_a.reason}, source={_a.source_group_id}, target={_a.target_group_id}, start={_a.start_date}, end={_a.end_date}")
     # ── 인바운드: source/target 독립 생성 — 모든 인바운드를 엔진에 추가 ──
     _inbound_assignments = []
+    _outbound_assignments = []
     for a in _assignments:
         if a.reason not in ("파견", "병동이동"):
             continue
@@ -4746,7 +5115,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             day_list = sorted(day_set)
             print(f"[WeeklyOff] 간호사 {nurse_name}({nurse_id}, index={n_idx}): 주휴 day_idx={day_list} (실제 날짜: {[d+1 for d in day_list]})")
             for d in day_list:
-                weekly_off_fixed_cells.append({"nurse_index": n_idx, "day_index": d, "shift": "O"})
+                weekly_off_fixed_cells.append(
+                    {
+                        "nurse_index": n_idx,
+                        "day_index": d,
+                        "shift": "O",
+                        "shift_type": "주휴",
+                        "fixed_source": "weekly_off",
+                    }
+                )
     config_dict["weekly_off_map"] = {k: sorted(list(v)) for k, v in weekly_off_map.items()}
 
     # 룩어헤드: 다음 달 1~K일 주휴 고정 OFF 셀(당월 weekly_off_by_idx와 별도로 재계산)
@@ -5063,8 +5440,23 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             build_blocking_payload,
         )
         _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
+        # `n.__dict__` 은 SQLAlchemy 의 이미 로딩된 attr 만 담아서 team_id /
+        # is_night_nurse 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
+        # 풀에서 사용할 키를 모두 일관되게 채운다.
         _nurses_dict_for_precheck = [
-            (n.__dict__ if hasattr(n, "__dict__") else dict(n))
+            {
+                "nurse_id": getattr(n, "nurse_id", None),
+                "db_id": getattr(n, "nurse_id", None),
+                "team_id": getattr(n, "team_id", None),
+                "grade": getattr(n, "grade", None),
+                "is_night_nurse": getattr(n, "is_night_nurse", None),
+                "work_shifts": getattr(n, "work_shifts", None),
+                "joining_date": getattr(n, "joining_date", None),
+                "resignation_date": getattr(n, "resignation_date", None),
+                "personal_off_adjustment": getattr(n, "personal_off_adjustment", 0),
+                "is_weekend_off": getattr(n, "is_weekend_off", False),
+                "weekly_off_weekday": getattr(n, "weekly_off_weekday", None),
+            }
             for n in (nurses_for_engine or [])
         ]
         # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
@@ -5163,6 +5555,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
             time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
             config_override=config_dict,
+            _assignments=_assignments,
+            _inbound_assignments=_inbound_assignments,
+            _outbound_assignments=_outbound_assignments,
         )
         # _debug_log(
         #     "cp_sat_end",
@@ -5234,10 +5629,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             or ("MAX_CAP_SHORTAGE" in validation_error)
             or ("GRADE_MAX_SUM_BELOW_NEED" in validation_error)
         )
-        if _trigger_soft and not bool(config_dict.get("_force_grade_max_soft_fallback")):
-            print("[GradeFallback] infeasible 감지 → grade hard→soft 자동 전환으로 1회 재시도")
+        if _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
+            print("[TeamMinFallback] infeasible 감지 → team_min hard→soft 자동 전환으로 1회 재시도 (grade hard 유지)")
             soft_cfg = dict(config_dict)
-            soft_cfg["_force_grade_max_soft_fallback"] = True
+            soft_cfg["team_min_soft_fallback"] = True
+            soft_cfg["_team_min_soft_retry_attempted"] = True
             retry_generated, _, retry_rs = _run_cp_sat_basic(
                 db,
                 current_user,
@@ -5249,6 +5645,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
                 time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
                 config_override=soft_cfg,
+                _assignments=_assignments,
+                _inbound_assignments=_inbound_assignments,
+                _outbound_assignments=_outbound_assignments,
             )
             # 동일 후처리 적용
             try:
@@ -5290,23 +5689,28 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             if not retry_validation_error:
                 generated = retry_generated
                 roster_system = retry_rs
-                applied_relaxations.append("grade_hard_to_soft")
+                # 정책: AUTO-SOFT는 team_min만 풀고 grade는 끝까지 hard 유지 (2026-05-23).
+                # agent-qa-harness의 grade flip 패턴은 의도적으로 폐기됨.
+                applied_relaxations.append("team_min_hard_to_soft")
+                # Ontology treatment 어휘로도 노출 (agent-qa-harness의 dispatch 카탈로그 호환).
+                applied_relaxations.append("treatment:soft:team_min")
                 weekly_off_warnings.append(
                     {
-                        "type": "grade_hard_to_soft_applied",
+                        "type": "team_min_hard_to_soft_applied",
                         "detail": (
-                            "Grade hard 제약이 infeasible로 인해 자동 soft 전환되어 재생성됐습니다. "
-                            "일부 grade 최소가 미충족일 수 있습니다."
+                            "Team_min hard 제약이 infeasible로 인해 자동 soft 전환되어 재생성됐습니다. "
+                            "일부 팀의 일일 D/E 최소가 미충족일 수 있습니다. (grade hard는 유지)"
                         ),
                     }
                 )
                 print(
-                    "[GradeFallback][AUTO-SOFT][success] grade hard→soft 자동 전환으로 근무표 생성. "
-                    "사용자 응답: HTTP 200, severity=warning, applied_relaxations=['grade_hard_to_soft']"
+                    "[TeamMinFallback][AUTO-SOFT][success] team_min hard→soft 자동 전환으로 근무표 생성. "
+                    "사용자 응답: HTTP 200, severity=warning, "
+                    "applied_relaxations=['team_min_hard_to_soft', 'treatment:soft:team_min']"
                 )
                 validation_error = None
             else:
-                print(f"[GradeFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
+                print(f"[TeamMinFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
                 validation_error = retry_validation_error
 
     if validation_error:
@@ -5320,16 +5724,102 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         try:
             from services.precheck import build_unrecoverable_payload
             from fastapi import HTTPException
+            try:
+                _violated = _extract_unrecoverable_violated_constraints(
+                    roster_system, generated, validation_error
+                )
+            except Exception:
+                _violated = []
+            try:
+                from services.precheck.conflict_detector import run_conflict_detectors
+                _conflict_cores = run_conflict_detectors(roster_system)
+            except Exception as _cc_exc:
+                print(f"[ConflictDetector] failed (ignore): {_cc_exc}")
+                _conflict_cores = []
+            # CP-SAT MUS 가 추출한 conflict cores 도 합쳐서 같은 리스트로 노출.
+            # fallback의 multi-stage retry로 같은 core_id가 여러 번 emit될 수 있어
+            # core_id 단위 dedup (affected_count 가장 큰 entry keep).
+            _cpsat_cores_raw = list(getattr(roster_system, "_cpsat_conflict_cores", []) or [])
+            _cpsat_by_id: dict = {}
+            for _c in _cpsat_cores_raw:
+                _cid = _c.get("core_id")
+                if not _cid:
+                    continue
+                _existing = _cpsat_by_id.get(_cid)
+                if _existing is None or (_c.get("affected_count") or 0) > (_existing.get("affected_count") or 0):
+                    _cpsat_by_id[_cid] = _c
+            _cpsat_cores = list(_cpsat_by_id.values())
+            if _cpsat_cores:
+                print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores_raw)}건 → dedup {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
+                _conflict_cores = _conflict_cores + _cpsat_cores
+            # Pool 그래프 스냅샷 — TeamPool / GradePool / CommonPool capacity vs demand
+            # 분석을 통한 root cause 표면화. shortage 가 발견되면 conflict_cores 에 합류.
+            _pool_snapshot_dict: dict[str, Any] = {}
+            try:
+                from services.ontology_pool import build_pool_snapshot_from_runtime
+                _pool_snap = build_pool_snapshot_from_runtime(
+                    nurses_dict=_nurses_dict_for_precheck,
+                    config_dict=precheck_config,
+                    grade_config=_engine_grade_config,
+                    fixed_cells=combined_fixed_cells,
+                    year=req.year,
+                    month=req.month,
+                )
+                _pool_snapshot_dict = _pool_snap.to_dict()
+                _shortage_cores = list(_pool_snapshot_dict.get("shortages") or [])
+                if _shortage_cores:
+                    print(
+                        f"[PoolGraph] shortages 발견: {len(_shortage_cores)}건 — "
+                        f"pools={len(_pool_snapshot_dict.get('pools') or [])}, "
+                        f"edges={len(_pool_snapshot_dict.get('nurse_pool_edges') or [])}"
+                    )
+                    _conflict_cores = _shortage_cores + _conflict_cores
+            except Exception as _pool_exc:
+                print(f"[PoolGraph] build 실패(무시): {_pool_exc}")
+            # nurse_index_map: enricher 가 node_id (예: off_cap:nurse_5) 의 idx 를
+            # 실제 이름+사번 으로 치환할 수 있도록 engine 순서로 매핑 빌드.
+            _nurse_index_map: dict[str, dict] = {}
+            try:
+                for _i, _n in enumerate(nurses_for_engine or []):
+                    _nurse_index_map[str(_i)] = {
+                        "nurse_id": str(getattr(_n, "nurse_id", "") or ""),
+                        "name": getattr(_n, "name", "") or "",
+                        "team_id": getattr(_n, "team_id", None),
+                        "grade": getattr(_n, "grade", None),
+                    }
+            except Exception as _nim_exc:
+                print(f"[UNRECOVERABLE] nurse_index_map build 실패(무시): {_nim_exc}")
+                _nurse_index_map = {}
             unrecoverable = build_unrecoverable_payload(
                 precheck_result=precheck_result,
                 applied_relaxations=applied_relaxations,
                 last_error_reason=str(validation_error),
+                violated_constraints=_violated,
+                conflict_cores=_conflict_cores,
+                pool_snapshot=_pool_snapshot_dict,
+                nurse_index_map=_nurse_index_map,
             )
             inf = unrecoverable.get("infeasibility", {})
             print(
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
                 f"message={inf.get('summary_message_ko')}"
             )
+            try:
+                from services.live_graph_export import dump_live_graph_export
+
+                dump_live_graph_export(
+                    group_id=str(getattr(current_user, "group_id", "") or ""),
+                    year=int(req.year),
+                    month=int(req.month),
+                    conflict_cores=_conflict_cores,
+                    pool_snapshot=_pool_snapshot_dict,
+                    violated_constraints=_violated,
+                    applied_relaxations=applied_relaxations,
+                    last_error_reason=str(validation_error),
+                    unrecoverable_payload=unrecoverable,
+                )
+            except Exception as _lg_exc:
+                print(f"[LiveGraphExport] hook 실패(무시): {_lg_exc}")
             raise HTTPException(status_code=500, detail=unrecoverable)
         except HTTPException:
             raise

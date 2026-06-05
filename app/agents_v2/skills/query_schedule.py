@@ -14,6 +14,7 @@ from agents_v2.tools import (
     shift_tools,
     constraint_tools,
     generation_tools,
+    nurse_monthly_limit_tools,
 )
 
 
@@ -25,7 +26,9 @@ def query_schedule(db: Session, params: dict) -> Any:
     year = params.get("year")
     month = params.get("month")
 
-    if scope == "wanted_submissions":
+    if scope == "wanted_campaign":
+        return _query_wanted_campaign(db, group_id, year, month)
+    elif scope == "wanted_submissions":
         return _query_wanted_submissions(db, group_id, year, month, params)
     elif scope == "wanted_adjustment":
         return _query_wanted_adjustments(db, group_id, year, month, params)
@@ -39,9 +42,68 @@ def query_schedule(db: Session, params: dict) -> Any:
         return constraint_tools.get_roster_config(db, group_id)
     elif scope == "generation_job":
         return generation_tools.get_latest_job(db, group_id)
+    elif scope == "monthly_limit":
+        return _query_monthly_limits(db, group_id, year, month, params)
     else:
         # Fallback: try schedule
         return _query_schedule_entries(db, group_id, year, month, params)
+
+
+def _query_monthly_limits(db, group_id, year, month, params):
+    """NurseMonthlyLimit 조회 — 단일 nurse 또는 그룹 전체."""
+    if year is None or month is None:
+        return {"error": "year/month required for monthly_limit scope"}
+    nurse_ids = params.get("nurse_ids")
+    if nurse_ids and len(nurse_ids) == 1:
+        single = nurse_monthly_limit_tools.get_monthly_limit(
+            db, nurse_ids[0], group_id, year, month
+        )
+        if single is None:
+            return {
+                "nurse_id": nurse_ids[0],
+                "year": year,
+                "month": month,
+                "limit_set": False,
+                "message": "해당 간호사의 월 한도 설정 없음.",
+            }
+        return {**single, "limit_set": True}
+    return {
+        "year": year,
+        "month": month,
+        "limits": nurse_monthly_limit_tools.list_monthly_limits(
+            db, group_id, year, month, nurse_ids=nurse_ids
+        ),
+    }
+
+
+def _query_wanted_campaign(db, group_id, year, month):
+    """원티드 캠페인 운영 메타 — 마감일, status, 열림 여부."""
+    if year is None or month is None:
+        return {"error": "year/month required for wanted_campaign scope"}
+    status = wanted_tools.get_wanted_status(db, group_id, year, month)
+    if status is None:
+        return {
+            "group_id": group_id,
+            "year": year,
+            "month": month,
+            "campaign_exists": False,
+            "message": "해당 월의 원티드 캠페인이 아직 생성되지 않았습니다.",
+        }
+    from datetime import datetime as _dt
+
+    exp_date = status.get("exp_date")
+    is_open = None
+    if exp_date:
+        try:
+            deadline = _dt.fromisoformat(exp_date.replace(" ", "T")).date()
+            is_open = _dt.now().date() <= deadline
+        except (ValueError, AttributeError):
+            is_open = None
+    return {
+        **status,
+        "campaign_exists": True,
+        "is_open": is_open,
+    }
 
 
 def _query_wanted_submissions(db, group_id, year, month, params):
@@ -247,7 +309,7 @@ def _summarize_entries(entries: list[dict], year: int, month: int) -> dict:
 def _query_nurses(db, group_id, params):
     nurse_ids = params.get("nurse_ids")
     if nurse_ids and len(nurse_ids) == 1:
-        return nurse_tools.get_nurse_by_id(db, nurse_ids[0])
+        return nurse_tools.get_nurse_by_id(db, nurse_ids[0], group_id)
     if nurse_ids:
-        return [nurse_tools.get_nurse_by_id(db, nid) for nid in nurse_ids]
+        return [nurse_tools.get_nurse_by_id(db, nid, group_id) for nid in nurse_ids]
     return nurse_tools.get_nurses_in_group(db, group_id)
