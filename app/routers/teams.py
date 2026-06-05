@@ -49,6 +49,7 @@ class WardRedistributePreviewRequest(BaseModel):
     target_sizes: dict[str, int] | None = None
     size_tolerance: int = 2
     churn_weight: float = 500.0
+    participant_ids: list[str] | None = None  # 참여(이동 대상). 미지정=전원, 미참여=현재병동 고정
 
 
 class WardAssignmentItem(BaseModel):
@@ -221,6 +222,7 @@ async def redistribute_preview(
             db, group_ids=body.group_ids, year=body.year, month=body.month,
             capacity_mode=body.capacity_mode, target_sizes=body.target_sizes,
             size_tolerance=body.size_tolerance, churn_weight=body.churn_weight,
+            participant_ids=body.participant_ids,
         )
     except WardSetupError as e:
         raise HTTPException(

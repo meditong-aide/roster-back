@@ -243,6 +243,45 @@ def test_period_overlap_excludes_and_past_included(db):
     assert "past" in assigned  # 과거 파견은 재분배 대상
 
 
+def test_participant_subset_fixes_non_participants(pool):
+    """participant_ids 지정 시: 그 집합만 이동 자유, 미참여자는 현재 병동에 고정."""
+    db = pool
+    pv = preview_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7,
+        participant_ids=["a0", "a1"],
+    )
+    assert pv["num_participants"] == 2
+    # 미참여 = 풀(10) - 참여(2) = 8, 모두 fixed_stay 로 노출
+    assert pv["num_fixed_stay"] == 8
+    fixed_ids = {f["nurse_id"] for f in pv["fixed_stay"]}
+    assert fixed_ids == {"a_g1", "a2", "a3", "b_g1", "b0", "b1", "b2", "b3"}
+    # 미참여자는 전부 현재 병동에 그대로 남아야 함
+    where = {nid: wid for wid, w in pv["wards"].items() for nid in w["nurse_ids"]}
+    cur = {n.nurse_id: n.group_id for n in db.query(Nurse).all()}
+    for nid in fixed_ids:
+        assert where[nid] == cur[nid], f"{nid} 고정 위반: {where[nid]} != {cur[nid]}"
+
+
+def test_no_participants_raises(pool):
+    """참여 인원 0명(빈 선택) → 이동 대상이 없으므로 막아야 함."""
+    with pytest.raises(ValueError):
+        preview_ward_redistribution(
+            pool, group_ids=["A", "B"], year=2026, month=7, participant_ids=[],
+        )
+
+
+def test_night_override_participates_when_selected(pool):
+    """N전담도 participant_ids 에 넣으면 풀에 포함(override) — 제외 명단에서 빠짐."""
+    db = pool
+    pv = preview_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7,
+        participant_ids=["a0", "night"],
+    )
+    assert pv["num_excluded_night"] == 0
+    assigned = [nid for w in pv["wards"].values() for nid in w["nurse_ids"]]
+    assert "night" in assigned
+
+
 def test_apply_graceful_skips_conflict(db):
     from datetime import date as _d
     db.add(Office(office_id="o1", office_name="병원"))

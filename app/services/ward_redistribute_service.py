@@ -33,19 +33,46 @@ _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
 
 
 def _load_pool(
-    db: Session, group_ids: list[str], year: int, month: int
-) -> tuple[list[NurseModel], list[NurseInput], dict[str, str]]:
-    """풀(N병동) 간호사 + NurseInput + nurse_id→현재 group_id 맵.
+    db: Session, group_ids: list[str], year: int, month: int,
+    participant_ids: Optional[list[str]] = None,
+) -> tuple[
+    list[NurseModel], list[NurseInput], dict[str, str],
+    list[NurseModel], list[NurseModel], set[str],
+]:
+    """풀(N병동) 간호사 + NurseInput + nurse_id→현재 group_id 맵 + 제외/미참여.
 
-    N전담 제외. off_days=확정 원티드 OFF, fb_days=확정 원티드 연차(휴가 type).
+    off_days=확정 원티드 OFF, fb_days=확정 원티드 연차(휴가 type).
     원티드는 각 간호사의 현재 소속 병동 기준으로 조회된다.
+
+    participant_ids:
+      - None → 비 N전담·비겹침 전원 재분배(미참여 없음).
+      - 지정 → 그 집합만 자유 이동, 나머지 적격자는 풀에 포함하되 '미참여'(현재 병동 고정).
+        N전담은 기본 제외이나 participant_ids 에 있으면 참여(override, apply 시 해제).
+
+    옵션1과 달리 미참여를 '미지정'으로 빼지 않고 현재 병동에 고정하는 이유:
+      (1) group_id(병동)는 null 불가 — 간호사는 반드시 어떤 병동에 속한다. team_id 는
+          null 가능이라 옵션1은 '미지정'이 성립하지만 병동은 아니다.
+      (2) 정원 점유 — 잔류자를 풀에서 빼면 정원 계산이 틀어져 참여자가 이미 찬 병동에
+          과배치된다. 풀에 두되 fixed 로 핀 고정해 자리는 점유하되 못 움직이게 한다.
+
+    Returns: (pool, inputs, current_group, excluded_night, excluded_overlap,
+              non_participant_ids) — non_participant_ids 는 풀에 있으나 현재 병동에
+              고정될(앵커) 대상. participant_ids None 이면 빈 set.
     """
+    pset: Optional[set[str]] = set(participant_ids) if participant_ids is not None else None
     nurses = (
         db.query(NurseModel)
         .filter(NurseModel.group_id.in_(group_ids), NurseModel.active == 1)
         .all()
     )
-    night = [n for n in nurses if (n.is_night_nurse or []) == ["N"]]
+    if pset is None:
+        night = [n for n in nurses if (n.is_night_nurse or []) == ["N"]]
+    else:
+        # 참여로 명시된 N전담은 풀에 포함(override) — 나머지 N전담만 제외
+        night = [
+            n for n in nurses
+            if (n.is_night_nurse or []) == ["N"] and n.nurse_id not in pset
+        ]
 
     # 기간 겹침 제외: 대상 발효일(month-1)부터와 겹치는 active 파견/병동이동 보유자.
     # (새 transfer 는 발효일부터 open-ended → 기존 presence 의 effective_end 가
@@ -70,6 +97,12 @@ def _load_pool(
     ]
     excluded_overlap = [n for n in nurses if n.nurse_id in overlap_ids]
     current_group = {n.nurse_id: n.group_id for n in pool}
+
+    # 미참여 = 풀에 있으나 참여로 선택되지 않은 적격자 → 현재 병동에 고정(앵커)
+    if pset is None:
+        non_participant_ids: set[str] = set()
+    else:
+        non_participant_ids = {n.nurse_id for n in pool if n.nurse_id not in pset}
 
     # 휴가 type shift_id 집합 (풀 병동 전체)
     vacation_codes = {
@@ -112,7 +145,7 @@ def _load_pool(
         )
         for n in pool
     ]
-    return pool, inputs, current_group, night, excluded_overlap
+    return pool, inputs, current_group, night, excluded_overlap, non_participant_ids
 
 
 def _map_clusters_to_wards(
@@ -167,6 +200,22 @@ def _wards_missing_g1(
     return [{"group_id": w, "name": name_map.get(w)} for w in ward_ids if not has_g1[w]]
 
 
+def _ward_seed(
+    pool: list[NurseModel], current_group: dict[str, str], ward: str,
+    non_participant_ids: set[str],
+) -> str:
+    """병동의 grade-1 앵커 시드 1명. 미참여(고정) G1 을 우선 — 참여자는 이동 자유를 유지.
+
+    (_wards_missing_g1 통과 전제 → 각 병동에 G1 ≥ 1 보장)
+    """
+    cands = [n.nurse_id for n in pool
+             if current_group.get(n.nurse_id) == ward and n.grade == 1]
+    for nid in cands:
+        if nid in non_participant_ids:
+            return nid
+    return cands[0]
+
+
 def _team_breakdown(
     db: Session,
     ward_id: str,
@@ -212,6 +261,7 @@ def preview_ward_redistribution(
     target_sizes: Optional[dict[str, int]] = None,
     size_tolerance: int = 2,
     churn_weight: float = 500.0,
+    participant_ids: Optional[list[str]] = None,
 ) -> dict:
     """병동 간 재분배 미리보기 (read-only, DB 변경 없음).
 
@@ -221,17 +271,26 @@ def preview_ward_redistribution(
         시드는 각 그룹의 현재 grade-1 1명으로 고정(cluster i ↔ ward i), 정원 밴드 적용.
         풀 인원이 [Σmin, Σmax] 안에 들어야 함(여유 흡수).
 
-    Returns: {target_month, ward_ids, num_wards, num_pool, num_excluded_night,
-              capacity_mode, size_bounds, warnings, wards, moves, num_moved, stats}
+    participant_ids 지정 시 '선택 재분배': 그 집합만 자유 이동, 미참여 적격자는 현재
+    병동에 고정(fixed). 고정을 위해 cluster↔ward 를 결정적으로 묶어야 하므로 even/explicit
+    공통으로 병동별 G1 앵커 시드를 사용한다(앵커 모드).
+
+    Returns: {target_month, ward_ids, num_wards, num_pool, num_participants,
+              num_excluded_night, num_excluded_overlap, fixed_stay, capacity_mode,
+              size_bounds, warnings, wards, moves, num_moved, stats}
     """
     ward_ids = sorted(set(group_ids))
     if len(ward_ids) < 2:
         raise ValueError("재분배는 2개 이상의 병동이 필요합니다.")
-    pool, inputs, current_group, night, excluded_overlap = _load_pool(
-        db, ward_ids, year, month
+    pool, inputs, current_group, night, excluded_overlap, non_participant_ids = (
+        _load_pool(db, ward_ids, year, month, participant_ids)
     )
     if not pool:
         raise ValueError("재분배 대상 간호사가 없습니다.")
+    anchored = participant_ids is not None
+    num_participants = len(pool) - len(non_participant_ids)
+    if anchored and num_participants < 1:
+        raise ValueError("참여(이동 대상) 인원이 없습니다. 한 명 이상 선택하세요.")
 
     num_wards = len(ward_ids)
     total = len(pool)
@@ -259,19 +318,27 @@ def preview_ward_redistribution(
             f"선택 그룹에 역할이 섞여 있습니다({sorted(roles)}). 같은 직역끼리 재분배를 권장합니다."
         )
 
+    # cluster i ↔ ward_ids[i] 결정적 바인딩 (explicit 또는 앵커 모드에서 사용).
+    # 미참여자는 현재 병동 클러스터에 고정(fixed) → 참여자만 자유 이동.
+    ward_index = {w: i for i, w in enumerate(ward_ids)}
+    home_cluster = {
+        nid: ward_index[current_group[nid]]
+        for nid in current_group if current_group[nid] in ward_index
+    }
+    fixed = (
+        {nid: ward_index[current_group[nid]] for nid in non_participant_ids}
+        if anchored else None
+    )
+
     if capacity_mode == "explicit":
         if not target_sizes:
             raise ValueError("explicit 모드는 target_sizes(그룹별 목표 인원)가 필요합니다.")
         missing = [w for w in ward_ids if w not in target_sizes]
         if missing:
             raise ValueError(f"target_sizes 에 누락된 그룹: {missing}")
-        # 각 그룹의 현재 grade-1 1명을 앵커 시드로 (cluster i ↔ ward i 고정).
+        # 각 그룹의 현재 grade-1 1명을 앵커 시드로 (미참여 G1 우선).
         # 사전 검증(_wards_missing_g1)을 통과했으므로 모든 병동에 G1이 보장된다.
-        seeds = [
-            next(n.nurse_id for n in pool
-                 if current_group[n.nurse_id] == w and n.grade == 1)
-            for w in ward_ids
-        ]
+        seeds = [_ward_seed(pool, current_group, w, non_participant_ids) for w in ward_ids]
         min_sizes = [max(1, target_sizes[w] - size_tolerance) for w in ward_ids]
         max_sizes = [target_sizes[w] + size_tolerance for w in ward_ids]
         if not (sum(min_sizes) <= total <= sum(max_sizes)):
@@ -280,20 +347,25 @@ def preview_ward_redistribution(
                 f"Σmin={sum(min_sizes)}, Σmax={sum(max_sizes)}, 목표합={sum(target_sizes.values())}. "
                 f"인원 또는 허용치(±{size_tolerance})를 조정하세요."
             )
-        # cluster i ↔ ward_ids[i] 고정 → 현재 병동 유지 보상(churn 억제)
-        ward_index = {w: i for i, w in enumerate(ward_ids)}
-        home_cluster = {
-            nid: ward_index[current_group[nid]]
-            for nid in current_group if current_group[nid] in ward_index
-        }
         result = auto_assign_teams(
             inputs, seed_ids=seeds, min_sizes=min_sizes, max_sizes=max_sizes,
-            home_cluster=home_cluster, w_churn=churn_weight,
+            home_cluster=home_cluster, w_churn=churn_weight, fixed=fixed,
         )
         idx_to_ward = {i: ward_ids[i] for i in range(num_wards)}
         size_bounds = {"mode": "explicit", "tolerance": size_tolerance,
                        "targets": {w: target_sizes[w] for w in ward_ids}}
-    else:  # even
+    elif anchored:  # even 분할이되 cluster↔ward 결정적 바인딩(미참여 고정 위해)
+        avg = total // num_wards
+        min_size = max(1, avg - size_tolerance)
+        max_size = ceil(total / num_wards) + size_tolerance
+        seeds = [_ward_seed(pool, current_group, w, non_participant_ids) for w in ward_ids]
+        result = auto_assign_teams(
+            inputs, seed_ids=seeds, min_size=min_size, max_size=max_size,
+            home_cluster=home_cluster, w_churn=churn_weight, fixed=fixed,
+        )
+        idx_to_ward = {i: ward_ids[i] for i in range(num_wards)}
+        size_bounds = {"mode": "even-anchored", "min": min_size, "max": max_size, "avg": avg}
+    else:  # even, 전원 재분배 (cluster→ward 사후 매핑)
         avg = total // num_wards
         min_size = max(1, avg - size_tolerance)
         max_size = ceil(total / num_wards) + size_tolerance
@@ -332,15 +404,26 @@ def preview_ward_redistribution(
         {"nurse_id": n.nurse_id, "name": n.name, "group_id": n.group_id}
         for n in excluded_overlap
     ]
+    # 미참여(현재 병동 고정) — 풀에 있으나 이동 대상이 아닌 적격자
+    name_all = {n.nurse_id: n.name for n in pool}
+    fixed_stay = [
+        {"nurse_id": nid, "name": name_all.get(nid),
+         "group_id": current_group.get(nid),
+         "group_name": name_map.get(current_group.get(nid))}
+        for nid in sorted(non_participant_ids)
+    ]
     return {
         "target_month": f"{year}-{month:02d}",
         "ward_ids": ward_ids,
         "num_wards": num_wards,
         "num_pool": total,
+        "num_participants": num_participants,
         "num_excluded_night": len(excluded),
         "excluded_night": excluded,
         "num_excluded_overlap": len(excluded_overlap_out),
         "excluded_overlap": excluded_overlap_out,
+        "num_fixed_stay": len(fixed_stay),
+        "fixed_stay": fixed_stay,
         "capacity_mode": capacity_mode,
         "size_bounds": size_bounds,
         "warnings": warnings,
