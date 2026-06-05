@@ -29,6 +29,40 @@ def _is_night_only(n: NurseModel) -> bool:
     return (n.is_night_nurse or []) == ["N"]
 
 
+def _build_pool_roster(
+    nurses: list[NurseModel], include_group: bool = False
+) -> list[dict]:
+    """참여 선택 로스터 — 간호사별 grade/프리셉터/근무코드.
+
+    shift: is_night_nurse []=전체, 그 외 근무코드(예: 'N', 'D E').
+    preceptor_name: 프리셉티면 그 프리셉터 이름(같은 풀 내).
+    is_preceptor: 이 간호사를 프리셉터로 둔 프리셉티가 풀에 있으면 True.
+    옵션1/2 공용 — HN 이 /nurses 로 타 병동 nurse 를 못 읽어 preview 가 운반한다.
+    """
+    name_by = {n.nurse_id: n.name for n in nurses}
+    preceptor_ids = {n.preceptor_id for n in nurses if n.preceptor_id}
+
+    def _shift(n: NurseModel) -> str:
+        s = n.is_night_nurse or []
+        return "전체" if len(s) == 0 else " ".join(s)
+
+    out: list[dict] = []
+    for n in nurses:
+        m = {
+            "nurse_id": n.nurse_id,
+            "name": n.name,
+            "grade": n.grade,
+            "shift": _shift(n),
+            "is_night": (n.is_night_nurse or []) == ["N"],
+            "preceptor_name": name_by.get(n.preceptor_id) if n.preceptor_id else None,
+            "is_preceptor": n.nurse_id in preceptor_ids,
+        }
+        if include_group:
+            m["group_id"] = n.group_id
+        out.append(m)
+    return out
+
+
 def _load_pool_and_inputs(
     db: Session,
     group_id: str,
@@ -248,6 +282,10 @@ def preview_team_classification(
     all_nurses = pool + unassigned + excluded_night
     pool_ids = {n.nurse_id for n in pool}
     pairs = _detect_pairs(all_nurses, pool_ids, nurse_to_team, pair_decisions)
+
+    # 참여 선택 로스터 — 전체 활성 간호사 + grade/프리셉터/근무코드.
+    # 프론트가 group_id 로 nurse 를 직접 못 읽는 경우(HN 권한)가 있어 preview 가 운반.
+    pool_roster = _build_pool_roster(all_nurses)
     warnings: list[str] = []
     for p in pairs:
         if p["status"] == "split":
@@ -271,6 +309,7 @@ def preview_team_classification(
         "changes": changes,
         "num_changed": len(changes),
         "pairs": pairs,
+        "pool_roster": pool_roster,
         "warnings": warnings,
         "stats": {
             "objective": result.objective,

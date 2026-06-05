@@ -206,3 +206,22 @@ def test_pair_release_drops_follow_in_preview(ward):
     )
     pair = next(p for p in pv["pairs"] if p["preceptee_id"] == "n3")
     assert pair["status"] == "released"
+
+
+def test_preview_pool_roster_has_shift_grade_preceptor(ward):
+    """pool_roster: 근무코드(is_night []=전체) + grade + 프리셉터 정보."""
+    db = ward
+    _set_preceptor(db, "n3", "g1a")  # n3=프리셉티, g1a=프리셉터
+    pv = preview_team_classification(db, group_id="A", year=2026, month=8)
+    roster = {r["nurse_id"]: r for r in pv["pool_roster"]}
+    assert "night" in roster and "g1a" in roster
+    # 근무코드
+    assert roster["night"]["shift"] == "N" and roster["night"]["is_night"] is True
+    assert roster["g1a"]["shift"] == "전체" and roster["g1a"]["is_night"] is False
+    # grade
+    assert roster["g1a"]["grade"] == 1 and roster["n3"]["grade"] == 3
+    # 프리셉터: n3 는 g1a(수간A)의 프리셉티, g1a 는 프리셉터
+    assert roster["n3"]["preceptor_name"] == "수간A"
+    assert roster["g1a"]["is_preceptor"] is True
+    assert roster["n3"]["is_preceptor"] is False
+    assert all(r.get("name") for r in pv["pool_roster"])

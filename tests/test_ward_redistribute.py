@@ -339,3 +339,16 @@ def test_ward_pair_split_warns_when_preceptor_excluded(db):
     pair = next(p for p in pv["pairs"] if p["preceptee_id"] == "a_pe")
     assert pair["status"] == "split"
     assert any("갈라" in w for w in pv["warnings"])
+
+
+def test_preview_pool_roster_with_group_and_grade(pool):
+    """옵션2 pool_roster: 풀(이동+고정) 간호사 + group_id/grade/근무코드."""
+    db = pool
+    pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
+    roster = {r["nurse_id"]: r for r in pv["pool_roster"]}
+    assert "a_g1" in roster and "b_g1" in roster
+    assert roster["a_g1"]["group_id"] == "A" and roster["a_g1"]["grade"] == 1
+    assert roster["b0"]["group_id"] == "B" and roster["b0"]["grade"] == 2
+    assert all("shift" in r and r.get("name") for r in pv["pool_roster"])
+    # N전담은 풀에서 제외 → roster 에 없음
+    assert "night" not in roster

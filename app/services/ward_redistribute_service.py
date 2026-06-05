@@ -28,6 +28,7 @@ from db.models import (
 from schemas.roster_schema import NurseAssignmentCreate
 from services.assignment_service import create_assignment, create_permanent_change
 from services.team_auto_assign import NurseInput, auto_assign_teams
+from services.team_classify_service import _build_pool_roster
 
 _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
 
@@ -494,6 +495,7 @@ def preview_ward_redistribution(
         "moves": moves,
         "num_moved": len(moves),
         "pairs": pairs,
+        "pool_roster": _build_pool_roster(pool, include_group=True),
         "stats": {
             "objective": result.objective,
             "overlap_total": result.overlap_total,
