@@ -10,13 +10,77 @@ nurses 테이블의 실제 소속 group_id 를 우선한다 (routers/groups.py �
 my-admin-groups 패턴과 동일).
 """
 
-from typing import List
+from typing import List, Optional, Set
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from db.models import Group as GroupModel
 from db.models import Nurse as NurseModel
+from db.models import NurseAssignment as NurseAssignmentModel
 from schemas.auth_schema import User as UserSchema
+
+
+_INBOUND_REASONS = ("파견", "병동이동")
+
+
+def resolve_accessible_group_ids(
+    db: Session, current_user: UserSchema
+) -> Set[str]:
+    """호출자가 접근 가능한 group_id 집합 (home + HN multi-group managed)."""
+    accessible: Set[str] = set()
+    if current_user is None:
+        return accessible
+    if getattr(current_user, "group_id", None):
+        accessible.add(str(current_user.group_id))
+    if str(getattr(current_user, "hn_auth", "") or "").upper() == "HN":
+        accessible.update(str(g) for g in resolve_managed_group_ids(db, current_user))
+    return accessible
+
+
+def can_caller_access_nurse(
+    db: Session, current_user: UserSchema, nurse_id: str
+) -> bool:
+    """호출자가 해당 간호사를 조회/수정할 수 있는지 통합 판단.
+
+    통과 경로:
+    - ADM(is_master_admin): 모든 간호사
+    - self: 본인 자기 자신 (str 비교)
+    - 간호사 home group 이 caller 의 accessible groups 안에 있음
+    - 간호사가 caller 의 accessible groups 중 하나로 inbound (파견/병동이동) 되어 있음
+
+    accessible = home group + (hn_auth=='HN' 이면 managed groups)
+    """
+    if current_user is None:
+        return False
+    if bool(getattr(current_user, "is_master_admin", False)):
+        return True
+    if str(nurse_id) == str(getattr(current_user, "nurse_id", "")):
+        return True
+
+    accessible = resolve_accessible_group_ids(db, current_user)
+    if not accessible:
+        return False
+
+    nurse = (
+        db.query(NurseModel)
+        .filter(NurseModel.nurse_id == nurse_id)
+        .first()
+    )
+    if nurse and str(nurse.group_id or "") in accessible:
+        return True
+
+    inbound = (
+        db.query(NurseAssignmentModel)
+        .filter(
+            NurseAssignmentModel.nurse_id == nurse_id,
+            NurseAssignmentModel.target_group_id.in_(list(accessible)),
+            NurseAssignmentModel.status == "active",
+            NurseAssignmentModel.reason.in_(_INBOUND_REASONS),
+        )
+        .first()
+    )
+    return inbound is not None
 
 
 def resolve_managed_group_ids(db: Session, current_user: UserSchema) -> List[str]:
@@ -70,3 +134,44 @@ def resolve_managed_group_ids(db: Session, current_user: UserSchema) -> List[str
         return managed
 
     return [str(current_user.group_id)] if current_user.group_id else []
+
+
+def assert_caller_can_access_group(
+    db: Session,
+    current_user: UserSchema,
+    target_group_id: Optional[str],
+) -> None:
+    """호출자가 target_group_id 그룹에 접근 가능한지 검증. 외부면 403 raise.
+
+    통과 조건 (OR):
+    - ADM(is_master_admin)
+    - target_group_id 가 None / 빈 문자열 (호출 측이 caller.group_id fallback 처리)
+    - target_group_id == caller.group_id (home)
+    - target_group_id == caller.original_group_id (view 전환 중)
+    - target_group_id ∈ resolve_managed_group_ids(caller)  — HN multi-group
+
+    사용처: grade/teams/weekly-off/issued_roster 등 단일 그룹 선택형 endpoint.
+    HN multi-group 통합페이지의 managed group dropdown 선택을 지원하기 위함.
+    """
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if bool(getattr(current_user, "is_master_admin", False)):
+        return
+    if not target_group_id:
+        return
+    caller_gid = getattr(current_user, "group_id", None)
+    if caller_gid and str(target_group_id) == str(caller_gid):
+        return
+    caller_original = getattr(current_user, "original_group_id", None)
+    if caller_original and str(target_group_id) == str(caller_original):
+        return
+    managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+    if str(target_group_id) in managed:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"권한 없음: 그룹({target_group_id}) 은 본인이 관리하는 병동이 아닙니다. "
+            f"(caller={caller_gid})"
+        ),
+    )

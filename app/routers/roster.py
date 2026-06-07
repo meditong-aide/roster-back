@@ -196,14 +196,46 @@ async def get_config_versions(
 async def get_config_by_version(
     config_version: str,
     group_id: Optional[str] = None,
+    schedule_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """Get the latest config for a specific version"""
-    print("[/config/version/{config_version}] group_id", group_id)
-    print("[/config/version/{config_version}] current_user", current_user.__dict__)
+    """버전(또는 schedule_id) 기준 config 조회.
+
+    - schedule_id 제공 시: 그 schedule 이 생성에 사용한 roster_config 반환
+      (이전 설정 사용하기 — 특정 근무표의 설정 불러오기). 스코프는 schedule 그룹 기준.
+    - 미제공 시: 대상 그룹의 최신 config 반환.
+    """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # schedule_id 기준: 그 근무표가 사용한 config 로드
+    if schedule_id:
+        schedule = (
+            db.query(Schedule)
+            .filter(Schedule.schedule_id == schedule_id, Schedule.dropped == False)
+            .first()
+        )
+        if not schedule:
+            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+        from services.group_access import assert_caller_can_access_group
+        assert_caller_can_access_group(db, current_user, schedule.group_id)
+        if not schedule.config_id:
+            raise HTTPException(
+                status_code=404, detail="이 근무표에 연결된 설정이 없습니다."
+            )
+        sched_config = (
+            db.query(RosterConfigModel)
+            .filter(RosterConfigModel.config_id == schedule.config_id)
+            .first()
+        )
+        if not sched_config:
+            raise HTTPException(status_code=404, detail="설정을 찾을 수 없습니다.")
+        return {
+            c.name: getattr(sched_config, c.name)
+            for c in sched_config.__table__.columns
+        }
+
     if current_user.is_master_admin:
         target_group_id = group_id
         target_office_id = current_user.office_id
@@ -405,13 +437,20 @@ async def get_issued_schedules(
     try:
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
+        # ADM: query 그대로. HN multi-group: managed 안이면 query 그대로, 외엔 403.
+        # 일반 수간호사/간호사: 본인 home group 강제.
         if current_user.is_master_admin:
             target_group_id = group_id
         else:
-            target_group_id = current_user.group_id
+            target_group_id = group_id or current_user.group_id
+            if target_group_id and str(target_group_id) != str(current_user.group_id):
+                from services.group_access import assert_caller_can_access_group
+                assert_caller_can_access_group(db, current_user, target_group_id)
         return get_issued_schedules_service(
             current_user, db, target_group_id=target_group_id
         )
+    except HTTPException:
+        raise
     except Exception as e:
         print("[/issued] error", e)
         raise HTTPException(
@@ -437,54 +476,61 @@ async def get_issued_roster_snapshot(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     try:
-        # 대상 그룹 결정
+        # 대상 그룹 결정.
+        # 우선순위: ADM(query 그대로) → HN multi-group managed → 본인 파견 inbound → 본인 home group.
         if current_user.is_master_admin:
             target_group_id = group_id
         else:
             target_group_id = current_user.group_id
-            # 본인 파견/병동이동 target_group_id 도 허용 (병동 전환 Select 용).
-            # 조회월(±6일 N_tail 버퍼) 과 파견 기간 overlap 체크:
-            # - 5/1~5/8 파견 → 4월(prev context) + 5월 허용
-            # - 5/1~5/31 파견 → 5월 + 6월(tail context) 허용
-            # - 조회월에 전혀 무관한 파견은 403
             if group_id and group_id != target_group_id:
-                _my_nid = getattr(current_user, "nurse_id", None)
-                _my_dispatch = None
-                if _my_nid:
-                    from datetime import date as _date, timedelta as _td
-                    from calendar import monthrange as _mr
-                    from sqlalchemy import or_ as _or_, case as _case
-                    _lookback = 6
-                    _m_start = _date(year, month, 1)
-                    _m_end = _date(year, month, _mr(year, month)[1])
-                    _view_start = _m_start - _td(days=_lookback)
-                    _view_end = _m_end + _td(days=_lookback)
-                    _eff_end = _case(
-                        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
-                        else_=NurseAssignment.expected_end_date,
-                    )
-                    _my_dispatch = (
-                        db.query(NurseAssignment)
-                        .filter(
-                            NurseAssignment.nurse_id == _my_nid,
-                            NurseAssignment.target_group_id == group_id,
-                            NurseAssignment.reason.in_(["파견", "병동이동"]),
-                            NurseAssignment.status == "active",
-                            NurseAssignment.start_date <= _view_end,
-                            _or_(
-                                _eff_end.is_(None),
-                                _eff_end >= _view_start,
-                            ),
-                        )
-                        .first()
-                    )
-                if _my_dispatch:
+                # HN multi-group 통합페이지: managed groups 안이면 통과.
+                from services.group_access import resolve_managed_group_ids
+                _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+                if str(group_id) in _managed:
                     target_group_id = group_id
                 else:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="해당 그룹 근무표 조회 권한이 없습니다.",
-                    )
+                    # 본인 파견/병동이동 target_group_id 도 허용 (병동 전환 Select 용).
+                    # 조회월(±6일 N_tail 버퍼) 과 파견 기간 overlap 체크:
+                    # - 5/1~5/8 파견 → 4월(prev context) + 5월 허용
+                    # - 5/1~5/31 파견 → 5월 + 6월(tail context) 허용
+                    # - 조회월에 전혀 무관한 파견은 403
+                    _my_nid = getattr(current_user, "nurse_id", None)
+                    _my_dispatch = None
+                    if _my_nid:
+                        from datetime import date as _date, timedelta as _td
+                        from calendar import monthrange as _mr
+                        from sqlalchemy import or_ as _or_, case as _case
+                        _lookback = 6
+                        _m_start = _date(year, month, 1)
+                        _m_end = _date(year, month, _mr(year, month)[1])
+                        _view_start = _m_start - _td(days=_lookback)
+                        _view_end = _m_end + _td(days=_lookback)
+                        _eff_end = _case(
+                            (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+                            else_=NurseAssignment.expected_end_date,
+                        )
+                        _my_dispatch = (
+                            db.query(NurseAssignment)
+                            .filter(
+                                NurseAssignment.nurse_id == _my_nid,
+                                NurseAssignment.target_group_id == group_id,
+                                NurseAssignment.reason.in_(["파견", "병동이동"]),
+                                NurseAssignment.status == "active",
+                                NurseAssignment.start_date <= _view_end,
+                                _or_(
+                                    _eff_end.is_(None),
+                                    _eff_end >= _view_start,
+                                ),
+                            )
+                            .first()
+                        )
+                    if _my_dispatch:
+                        target_group_id = group_id
+                    else:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                        )
 
         snapshot = get_issued_roster_snapshot_service(
             year=year,
@@ -736,6 +782,17 @@ async def get_schedule_status(
             raise HTTPException(status_code=401, detail="Not authenticated")
         if current_user.is_head_nurse and current_user.group_id:
             override_gid = None
+            # HN multi-group 통합보기: managed group 이면 param 허용
+            if group_id and str(group_id) != str(current_user.group_id):
+                from services.group_access import resolve_managed_group_ids
+                _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+                if str(group_id) in _managed:
+                    override_gid = group_id
+                else:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                    )
         elif getattr(current_user, "is_master_admin", False):
             if not group_id:
                 raise HTTPException(
@@ -777,6 +834,17 @@ async def drop_schedule(
     # 대상 그룹 결정
     if current_user.is_head_nurse and current_user.group_id:
         target_group_id = current_user.group_id
+        # HN multi-group 통합보기: managed group 이면 param 허용
+        if group_id and str(group_id) != str(target_group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표에 대한 권한이 없습니다.",
+                )
     else:
         if not getattr(current_user, "is_master_admin", False):
             raise HTTPException(status_code=403, detail="Permission denied")
@@ -824,12 +892,9 @@ async def get_roster_by_schedule_id(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # 대상 그룹 결정
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, "is_master_admin", False):
-            raise HTTPException(status_code=403, detail="Permission denied")
+    # 대상 그룹 결정.
+    # 우선순위: ADM(query 그대로) → HN multi-group managed → 본인 home group.
+    if current_user.is_master_admin:
         if not group_id:
             raise HTTPException(
                 status_code=400, detail="group_id is required for admin"
@@ -845,6 +910,21 @@ async def get_roster_by_schedule_id(
                 status_code=403, detail="Group does not belong to your office"
             )
         target_group_id = g.group_id
+    elif current_user.is_head_nurse and current_user.group_id:
+        target_group_id = current_user.group_id
+        if group_id and group_id != target_group_id:
+            # HN multi-group 통합페이지: managed groups 안이면 통과.
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                )
+    else:
+        raise HTTPException(status_code=403, detail="Permission denied")
 
     # Get schedule info
     schedule = (
@@ -1091,8 +1171,21 @@ async def get_schedule_versions(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    # 대상 그룹 결정: ADM(query 그대로) → HN multi-group managed → 본인 home group.
     if current_user.is_master_admin:
         target_group_id = group_id
+    elif current_user.is_head_nurse and current_user.group_id:
+        target_group_id = current_user.group_id
+        if group_id and str(group_id) != str(target_group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                )
     else:
         target_group_id = current_user.group_id
 
@@ -1107,7 +1200,6 @@ async def get_schedule_versions(
         .order_by(Schedule.version.desc())
         .all()
     )
-    print("[roster.py - get_schedule_versions] target_group_id", target_group_id)
 
     return [
         {
@@ -1141,6 +1233,17 @@ async def get_roster_for_month(
     # 대상 그룹 결정
     if current_user.is_head_nurse and current_user.group_id:
         target_group_id = current_user.group_id
+        # HN multi-group 통합보기: managed group 이면 param 허용, 아니면 403
+        if group_id and str(group_id) != str(target_group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                )
     else:
         # if not getattr(current_user, 'is_master_admin', False):
         #     raise HTTPException(status_code=403, detail="Permission denied")
@@ -1159,7 +1262,6 @@ async def get_roster_for_month(
                 status_code=403, detail="Group does not belong to your office"
             )
         target_group_id = g.group_id
-    print("target_group_id1", target_group_id)
     # Get latest issued schedule for the month
     schedule_info = (
         db.query(Schedule)
@@ -1696,6 +1798,17 @@ async def save_roster(
     # 대상 그룹 결정
     if current_user.is_head_nurse and current_user.group_id:
         target_group_id = current_user.group_id
+        # HN multi-group 통합보기: managed group 이면 param 허용
+        if group_id and str(group_id) != str(target_group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표에 대한 권한이 없습니다.",
+                )
     else:
         if not group_id:
             raise HTTPException(
@@ -1992,6 +2105,17 @@ async def validate_roster(
         if current_user.is_head_nurse and current_user.group_id:
             office_id = current_user.office_id
             target_group_id = current_user.group_id
+            # HN multi-group 통합보기: managed group 이면 param 허용
+            if group_id and str(group_id) != str(target_group_id):
+                from services.group_access import resolve_managed_group_ids
+                _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+                if str(group_id) in _managed:
+                    target_group_id = group_id
+                else:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                    )
         else:
             if not group_id:
                 raise HTTPException(
@@ -2284,6 +2408,17 @@ async def update_schedule_name(
         # 스케줄 조회
         if current_user.is_head_nurse and current_user.group_id:
             target_group_id = current_user.group_id
+            # HN multi-group 통합보기: managed group 이면 param 허용
+            if group_id and str(group_id) != str(target_group_id):
+                from services.group_access import resolve_managed_group_ids
+                _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+                if str(group_id) in _managed:
+                    target_group_id = group_id
+                else:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="해당 그룹 근무표에 대한 권한이 없습니다.",
+                    )
         else:
             if not group_id:
                 raise HTTPException(
@@ -2348,11 +2483,22 @@ async def export_schedule_excel(
     - 파일명: roster_{year}_{month}_v{version}.xlsx
     """
 
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (
+        getattr(current_user, "is_head_nurse", False)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="권한이 없습니다.")
+
+    # 대상 그룹 결정 (HN home/managed, ADM office 검증) — IDOR 방지
+    target_group_id = _get_target_group_id(current_user, group_id, db)
+
     schedule = (
         db.query(Schedule)
         .filter(
             Schedule.schedule_id == schedule_id,
-            # Schedule.group_id == target_group_id,
+            Schedule.group_id == target_group_id,
             Schedule.dropped == False,
         )
         .first()
@@ -2362,10 +2508,6 @@ async def export_schedule_excel(
     try:
         from services.excel_service import export_schedule_excel_bytes
 
-        if group_id in [None, "", "null", "undefined", "None"]:
-            target_group_id = current_user.group_id
-        else:
-            target_group_id = group_id
         data = export_schedule_excel_bytes(
             schedule_id, current_user, db, target_group_id
         )
@@ -2388,6 +2530,16 @@ def _get_target_group_id(
 ) -> str:
     """대상 그룹 결정 로직 (기존 코드 재사용)"""
     if current_user.is_head_nurse and current_user.group_id:
+        # HN multi-group 통합보기: managed group 이면 param 허용
+        if group_id_param and str(group_id_param) != str(current_user.group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id_param) in _managed:
+                return group_id_param
+            raise HTTPException(
+                status_code=403,
+                detail="해당 그룹 근무표에 대한 권한이 없습니다.",
+            )
         return current_user.group_id
 
     if not getattr(current_user, "is_master_admin", False):

@@ -251,7 +251,7 @@ class Schedule(Base):
     created_by = Column(VARCHAR(50), ForeignKey("nurses.account_id"))
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
-    status = Column(VARCHAR(10))  # e.g., 'requested', 'issued'
+    status = Column(VARCHAR(10))  # e.g., 'draft', 'issued'
     dropped = Column(BOOLEAN, nullable=False, default=False)
     name = Column(VARCHAR(50))
     # violations = Column(JSON, nullable=True) # 임시로 주석 처리 - DB 스키마 업데이트 후 활성화 예정

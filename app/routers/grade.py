@@ -12,6 +12,7 @@ from services.grade_service import (
     get_grade_config_service,
     upsert_grade_config_service,
 )
+from services.group_access import assert_caller_can_access_group
 
 router = APIRouter(
     prefix="/grade",
@@ -22,13 +23,18 @@ router = APIRouter(
 def _resolve_group_and_office(
     db: Session, current_user: UserSchema = Depends(get_current_user_from_cookie), group_id: Optional[str] = None
 ) -> tuple[str, str]:
-    """유효한 group_id와 office_id를 반환합니다."""
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id가 필요합니다.")
-        target_group_id = group_id
+    """유효한 group_id와 office_id를 반환합니다.
+
+    정책:
+    - query group_id 우선. 없으면 current_user.group_id fallback.
+    - ADM/HN multi-group 의 경우 managed groups 안에 있어야 통과 (403 그 외).
+    - office 경계 검증 유지.
+    """
+    target_group_id = group_id or getattr(current_user, "group_id", None)
+    if not target_group_id:
+        raise HTTPException(status_code=400, detail="group_id가 필요합니다.")
+
+    assert_caller_can_access_group(db, current_user, target_group_id)
 
     group = db.query(Group).filter(Group.group_id == target_group_id).first()
     if not group:

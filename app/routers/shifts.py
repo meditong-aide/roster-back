@@ -23,6 +23,7 @@ from typing import Optional, Any, List
 import os
 import tempfile
 from services.shift_service_mssql import get_shifts_service as get_shifts_service_mssql
+from services.group_access import resolve_managed_group_ids
 from datetime import timedelta, datetime
 
 # def convert_time(value):
@@ -67,8 +68,11 @@ async def get_shifts(
         backend = os.getenv("DB_BACKEND", "mysql").lower()
         override_gid = None
         if group_id:
-            if not current_user or not getattr(current_user, 'is_master_admin', False):
-                raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 조회가 가능합니다.")
+            if not current_user:
+                raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+            allowed = resolve_managed_group_ids(db, current_user)
+            if group_id not in allowed:
+                raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
             g = db.query(Group).filter(Group.group_id == group_id).first()
             if not g or g.office_id != current_user.office_id:
                 raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
@@ -83,6 +87,8 @@ async def get_shifts(
             shift["start_time"] = convert_time(shift["start_time"])
             shift["end_time"] = convert_time(shift["end_time"])
         return shifts
+    except HTTPException:
+        raise
     except Exception as e:
         print(e)
         raise HTTPException(status_code=500, detail=f"시프트 정보 조회 실패: {str(e)}")
@@ -148,6 +154,8 @@ async def remove_shift(
 ):
     try:
         return remove_shift_service(req, current_user, db, group_id)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"근무코드 삭제 실패: {str(e)}")
 
@@ -161,6 +169,8 @@ async def move_shift(
     try:
         print('[shifts/move] group_id', group_id)
         return move_shift_service(req, current_user, db, group_id)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"근무코드 순서 변경 실패: {str(e)}")
 
@@ -178,6 +188,8 @@ async def download_shift_template(
             filename="근무코드_업로드_템플릿.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"템플릿 생성 실패: {str(e)}")
 
@@ -312,8 +324,9 @@ async def get_shift_manage(
         raise HTTPException(status_code=401, detail="Not authenticated")
     # 대상 그룹/오피스 결정
     if group_id:
-        if not current_user or not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 조회가 가능합니다.")
+        allowed = resolve_managed_group_ids(db, current_user)
+        if group_id not in allowed:
+            raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
         g = db.query(Group).filter(Group.group_id == group_id).first()
         if not g or g.office_id != current_user.office_id:
             raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
@@ -406,8 +419,9 @@ async def save_shift_manage(
         
         # Get current user's office_id
         if group_id:
-            if not getattr(current_user, 'is_master_admin', False):
-                raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 저장이 가능합니다.")
+            allowed = resolve_managed_group_ids(db, current_user)
+            if group_id not in allowed:
+                raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
             g = db.query(Group).filter(Group.group_id == group_id).first()
             if not g or g.office_id != current_user.office_id:
                 raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
@@ -447,6 +461,8 @@ async def save_shift_manage(
             db.add(shift_manage)
         print(3)
         db.commit()
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"시프트 관리 설정 저장 실패: {str(e)}")

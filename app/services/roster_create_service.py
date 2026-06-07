@@ -420,12 +420,30 @@ def _load_shift_lookup(db: Session, office_id: str, group_id: str) -> dict[str, 
 
 
 def _fetch_latest_config(db: Session, req: RosterRequest, current_user):
-    """요청의 config_id 우선, 없으면 그룹 최신 config을 가져온다."""
+    """요청의 config_id 우선, 없으면 그룹 최신 config을 가져온다.
+
+    cross-group 가드: req.config_id 가 현재 그룹 소유가 아니면(타 그룹 config)
+    무시하고 현재 그룹 최신 config 으로 폴백한다. 같은 office 내 다른 병동의
+    config_id 가 그룹 전환 후 잔존 상태로 전달돼 schedule 에 오염 스탬핑되던
+    버그(타 그룹 config_id 무검증 사용) 방어.
+    """
+    latest_config = None
     if req.config_id:
         latest_config = (
             db.query(RosterConfig).filter(RosterConfig.config_id == req.config_id).first()
         )
-    else:
+        if latest_config is not None and str(latest_config.group_id) != str(
+            current_user.group_id
+        ):
+            logger.warning(
+                "[_fetch_latest_config] cross-group config_id 무시: config_id=%s "
+                "(config_group=%s) != current_group=%s → 그룹 최신 config 로 폴백",
+                req.config_id,
+                latest_config.group_id,
+                current_user.group_id,
+            )
+            latest_config = None
+    if latest_config is None:
         latest_config = (
             db.query(RosterConfig)
             .filter(RosterConfig.group_id == current_user.group_id)
@@ -5939,15 +5957,29 @@ def request_schedule_service(req: RosterRequest, current_user, db: Session):
     nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
     if not nurse or not nurse.group:
         raise Exception("User group information not found")
-    # config_id가 제공된 경우 해당 config 사용, 아니면 최신 config 사용
+    # config_id가 제공된 경우 해당 config 사용, 아니면 최신 config 사용.
+    # cross-group 가드: config 는 반드시 생성 대상 그룹(current_user.group_id) 소유여야 한다.
+    # req.config_id 가 타 그룹 것이거나 폴백 시에도 current_user.group_id 기준으로만 조회해,
+    # 같은 office 의 다른 병동 config 가 schedule 에 오염 스탬핑되던 버그를 차단한다.
+    latest_config = None
     if req.config_id:
         latest_config = db.query(RosterConfig).filter(
             RosterConfig.config_id == req.config_id
         ).first()
-    else:
+        if latest_config is not None and str(latest_config.group_id) != str(
+            current_user.group_id
+        ):
+            logger.warning(
+                "[request_schedule_service] cross-group config_id 무시: config_id=%s "
+                "(config_group=%s) != current_group=%s → 그룹 최신 config 로 폴백",
+                req.config_id,
+                latest_config.group_id,
+                current_user.group_id,
+            )
+            latest_config = None
+    if latest_config is None:
         latest_config = db.query(RosterConfig).filter(
-            RosterConfig.office_id == nurse.group.office_id,
-            RosterConfig.group_id == nurse.group_id
+            RosterConfig.group_id == current_user.group_id
         ).order_by(RosterConfig.created_at.desc()).first()
     print('latest_config', latest_config)
     # if not latest_config :

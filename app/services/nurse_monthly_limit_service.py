@@ -172,10 +172,8 @@ def list_nurse_monthly_limits_service(
     group_id: str,
     nurse_id: str,
 ) -> List[NurseMonthlyLimitItem]:
-    if (
-        not current_user.is_master_admin
-        and str(group_id) != str(current_user.group_id)
-    ):
+    from services.group_access import can_caller_access_nurse
+    if not can_caller_access_nurse(db, current_user, nurse_id):
         raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 조회할 수 없습니다.")
     rows = (
         db.query(NurseMonthlyLimit)
@@ -233,12 +231,20 @@ def upsert_nurse_monthly_limits_service(
 
     normalized: List[Dict[str, Any]] = []
     seen_scopes = set()
+    _managed_cache: Optional[set] = None
     for raw in limits:
         row = _normalize_row(raw)
         if int(row.get("year")) != year or int(row.get("month")) != month:
             raise HTTPException(status_code=400, detail="요청 year/month와 항목 year/month가 일치해야 합니다.")
-        if not current_user.is_master_admin and str(row.get("group_id")) != str(current_user.group_id):
-            raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 수정할 수 없습니다.")
+        if not current_user.is_master_admin:
+            row_gid = str(row.get("group_id"))
+            if row_gid != str(current_user.group_id):
+                # HN multi-group: 본인이 관리하는 group 인지 검증
+                if _managed_cache is None:
+                    from services.group_access import resolve_managed_group_ids
+                    _managed_cache = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+                if row_gid not in _managed_cache:
+                    raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 수정할 수 없습니다.")
         scope = (
             str(row.get("nurse_id")),
             str(row.get("group_id")),

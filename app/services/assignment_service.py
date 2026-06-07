@@ -38,9 +38,10 @@ def _assert_caller_owns_source(
     통과 조건 (OR):
     - current_user is None → system/admin 경로로 간주
     - is_master_admin
-    - caller.group_id == source_group_id (현재 view가 source)
+    - caller.group_id == source_group_id (현재 view 가 source)
     - caller.original_group_id == source_group_id (원본 소속이 source — view 전환 중)
-    - caller.nurse_id ∈ groups[source_group_id].hn_id (해당 그룹의 등록된 그룹 관리자)
+    - source_group_id ∈ resolve_managed_group_ids(caller)
+      (HN multi-group: home + group.hn_id JSON 에 본인이 등록된 모든 그룹)
     """
     if current_user is None:
         return
@@ -52,11 +53,10 @@ def _assert_caller_owns_source(
     caller_original = getattr(current_user, "original_group_id", None)
     if caller_original and caller_original == source_group_id:
         return
-    caller_nid = getattr(current_user, "nurse_id", None)
-    if db is not None and caller_nid:
-        src_group = db.query(Group).filter(Group.group_id == source_group_id).first()
-        hn_ids = list(src_group.hn_id or []) if src_group is not None else []
-        if str(caller_nid) in {str(x) for x in hn_ids}:
+    if db is not None:
+        from services.group_access import resolve_managed_group_ids
+        managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+        if str(source_group_id) in managed:
             return
     raise HTTPException(
         status_code=403,
@@ -315,6 +315,51 @@ def _reallocate_fixed_wanted_on_assignment_change(
     return total
 
 
+def _validate_assignment_team_grade_or_raise(
+    db: Session,
+    *,
+    nurse_id: str,
+    target_group_id: Optional[str],
+    old_target_team_id: Optional[int],
+    new_target_team_id: Optional[int],
+    old_target_grade: Optional[int],
+    new_target_grade: Optional[int],
+) -> None:
+    """inbound assignment 의 target_team_id / target_grade 변경 정합성 검증.
+
+    사이드프로필(PATCH /nurses/{id}.target_*) 와 동일 정책. target_group_id 미설정
+    (휴직/퇴사/프리셉티 등) 인 경우 skip.
+    """
+    if not target_group_id:
+        return
+    if (
+        old_target_team_id == new_target_team_id
+        and old_target_grade == new_target_grade
+    ):
+        return
+    from services.precheck.nurse_change_validators import validate_nurse_change
+
+    result = validate_nurse_change(
+        db,
+        group_id=str(target_group_id),
+        swap_nurse_id=str(nurse_id),
+        old_team_id=old_target_team_id,
+        new_team_id=new_target_team_id,
+        old_grade=old_target_grade,
+        new_grade=new_target_grade,
+        scope="target",
+    )
+    if not result.get("saveable", True):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "TEAM_GRADE_VALIDATION_FAILED",
+                "message": "팀/Grade 변경이 인원 정합성을 충족하지 못합니다.",
+                "issues": result.get("issues", []),
+            },
+        )
+
+
 def create_assignment(
     req: NurseAssignmentCreate,
     db: Session,
@@ -353,6 +398,18 @@ def create_assignment(
 
     # 동일 target_group_id 재파견/재병동이동 시 이전 row 의 target_*/note 자동 승계
     _inherit_target_fields_from_prior(db, req)
+
+    # 신규 inbound: target_group 의 team/grade 정합성 검증 (사이드프로필과 동일 정책)
+    if req.reason in _INBOUND_REASONS:
+        _validate_assignment_team_grade_or_raise(
+            db,
+            nurse_id=req.nurse_id,
+            target_group_id=req.target_group_id,
+            old_target_team_id=None,
+            new_target_team_id=req.target_team_id,
+            old_target_grade=None,
+            new_target_grade=req.target_grade,
+        )
 
     row = NurseAssignment(
         nurse_id=req.nurse_id,
@@ -598,6 +655,24 @@ def update_assignment(
         _new_exp = req.expected_end_date if req.expected_end_date is not None else row.expected_end_date
         _eff_upper = _new_end if _new_end is not None else _new_exp
         _raise_if_overlap(db, row.nurse_id, _new_start, _eff_upper, exclude_id=row.id)
+
+    # team/grade 변경 정합성 검증 (사이드프로필과 동일 정책)
+    if _new_reason in _INBOUND_REASONS and _new_status == "active":
+        _new_team_for_check = (
+            req.target_team_id if req.target_team_id is not None else row.target_team_id
+        )
+        _new_grade_for_check = (
+            req.target_grade if req.target_grade is not None else row.target_grade
+        )
+        _validate_assignment_team_grade_or_raise(
+            db,
+            nurse_id=row.nurse_id,
+            target_group_id=_new_target_gid,
+            old_target_team_id=row.target_team_id,
+            new_target_team_id=_new_team_for_check,
+            old_target_grade=row.target_grade,
+            new_target_grade=_new_grade_for_check,
+        )
 
     if req.start_date is not None:
         row.start_date = req.start_date

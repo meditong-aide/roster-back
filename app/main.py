@@ -4,7 +4,7 @@ from datetime import datetime
 
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from routers import teams, groups
+from routers import teams, groups, managed_groups
 from routers import daily_shift as daily_shift_router
 
 import os
@@ -257,6 +257,7 @@ app.include_router(dashboard.router)
 app.include_router(daily_shift_router.router)
 app.include_router(teams.router)
 app.include_router(groups.router)
+app.include_router(managed_groups.router)
 app.include_router(weekly_off.router)  # 추가
 app.include_router(grade.router)
 app.include_router(jobs.router)

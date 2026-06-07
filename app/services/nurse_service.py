@@ -206,15 +206,20 @@ def _load_preceptees_map(db: Session, nurses) -> Dict[str, List[Dict[str, Any]]]
 def get_nurses_in_group_service(
     current_user, db: Session, nurse_id: Optional[str] = None,
     skip_group_filter: bool = False,
+    override_group_id: Optional[str] = None,
 ):
     """
     그룹 내 간호사 목록 조회 서비스 함수
     특정 nurse_id가 제공되면 해당 간호사만 반환, 그렇지 않으면 그룹 내 모든 간호사 반환
     birth_date (VARCHAR)를 파싱하여 만 나이를 age로 추가
     skip_group_filter: True면 group_id 필터 스킵 (파견/병동이동 인바운드 조회용)
+    override_group_id: HN 등이 query param 으로 다른 그룹 조회 시 사용. 권한 검증은 라우터 책임.
     """
     if not current_user:
         raise Exception("Not authenticated")
+
+    # 다른 그룹 view 강제 시 override_group_id 우선, 아니면 토큰 group_id
+    effective_group_id = override_group_id or current_user.group_id
 
     query = db.query(NurseModel)
 
@@ -222,11 +227,11 @@ def get_nurses_in_group_service(
     # 정책: status='active' 인 inbound assignment 가 있는 nurse 는 미래 시작 여부와 무관하게 노출.
     #   - source 측: Nurse.group_id 매칭으로 outbound nurse 도 자연 노출 (양쪽 노출).
     #   - 실근무 일자가 아닌 셀은 솔버의 active_window/blocked_days 로 제외되므로 안전.
-    if not skip_group_filter and current_user.group_id:
+    if not skip_group_filter and effective_group_id:
         _inbound_subq = (
             db.query(NurseAssignment.nurse_id)
             .filter(
-                NurseAssignment.target_group_id == current_user.group_id,
+                NurseAssignment.target_group_id == effective_group_id,
                 NurseAssignment.status == "active",
                 NurseAssignment.reason.in_(_INBOUND_REASONS),
             )
@@ -234,7 +239,7 @@ def get_nurses_in_group_service(
         )
         query = query.filter(
             or_(
-                NurseModel.group_id == current_user.group_id,
+                NurseModel.group_id == effective_group_id,
                 NurseModel.nurse_id.in_(select(_inbound_subq.c.nurse_id)),
             )
         )
@@ -256,8 +261,8 @@ def get_nurses_in_group_service(
     if nurse_id and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
 
-    # roster_config에서 표시 설정 플래그 조회
-    display_flags = _get_display_flags(db, current_user.group_id)
+    # roster_config에서 표시 설정 플래그 조회 (override 그룹이면 그쪽 flag)
+    display_flags = _get_display_flags(db, effective_group_id)
 
     # 만 나이 계산
     current_date = date.today()
@@ -285,8 +290,8 @@ def get_nurses_in_group_service(
     inbound_blocks: Dict[str, Dict[str, Any]] = {}
     if nurses:
         _nids = [n.nurse_id for n in nurses]
-        if current_user.group_id:
-            inbound_map = _load_inbound_map(db, current_user.group_id, _nids)
+        if effective_group_id:
+            inbound_map = _load_inbound_map(db, effective_group_id, _nids)
         inbound_blocks = _build_inbound_blocks(db, _nids)
 
     # preceptor → preceptees 배치 로드 (프리셉터 사이드 프로필에 N명 노출용)
@@ -1210,22 +1215,57 @@ def update_nurse_profile_service(
         }
 
     # 호출 view 의 group_id 결정 (target view 에서 inbound nurse 수정 시 명시 필요).
-    # 권한 검증:
+    # 권한 검증 (사이드프로필 / source 모두 동일):
     #   - 본인 group 과 동일하면 OK
-    #   - 다른 group 인 경우 master_admin 또는 hn_auth=='HN'(그룹 관리자) 만 허용
+    #   - 다른 group 인 경우 ADM 또는 HN multi-group 의 managed groups 안에 있어야 함
     _caller_view_group = view_group_id or current_user.group_id
+    if view_group_id and view_group_id != current_user.group_id and not is_admin:
+        is_hn_multi = str(getattr(current_user, "hn_auth", "") or "").upper() == "HN"
+        if not is_hn_multi:
+            raise HTTPException(
+                status_code=403,
+                detail="다른 그룹 view 에서 nurse 수정 권한이 없습니다 (HN/admin 필요).",
+            )
+        from services.group_access import resolve_managed_group_ids
+        _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+        if str(view_group_id) not in _managed:
+            raise HTTPException(
+                status_code=403,
+                detail="해당 view 그룹은 본인이 관리하는 그룹이 아닙니다.",
+            )
+
+    # HN multi-group 자동 보정: view_group_id 미전송 시 nurse 의 home/inbound 가
+    # managed groups 안에 있으면 _caller_view_group 자동 매핑 (통합보기 / 프론트가
+    # view_group_id 안 보내는 경우 대응).
     if (
-        view_group_id
-        and view_group_id != current_user.group_id
+        not view_group_id
         and not is_admin
-        and str(getattr(current_user, "hn_auth", "") or "").upper() != "HN"
+        and str(getattr(current_user, "hn_auth", "") or "").upper() == "HN"
+        and str(nurse.group_id) != str(current_user.group_id)
     ):
-        raise HTTPException(
-            status_code=403,
-            detail="다른 그룹 view 에서 nurse 수정 권한이 없습니다 (HN/admin 필요).",
-        )
+        from services.group_access import resolve_managed_group_ids
+        _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+        if str(nurse.group_id) in _managed:
+            _caller_view_group = nurse.group_id  # source view 자동
+        else:
+            _inbound_match = (
+                db.query(NurseAssignment)
+                .filter(
+                    NurseAssignment.nurse_id == nurse_id,
+                    NurseAssignment.target_group_id.in_(list(_managed)),
+                    NurseAssignment.status == "active",
+                    NurseAssignment.reason.in_(_INBOUND_REASONS),
+                )
+                .order_by(NurseAssignment.start_date.desc())
+                .first()
+            )
+            if _inbound_match is not None:
+                _caller_view_group = _inbound_match.target_group_id  # target view 자동
     # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
     if is_admin:
+        _validate_team_grade_change_or_raise(
+            db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
+        )
         _apply_source_nurse_update(nurse, fields)
         db.commit()
         db.refresh(nurse)
@@ -1237,10 +1277,18 @@ def update_nurse_profile_service(
                 status_code=403, detail="해당 간호사를 수정할 권한이 없습니다."
             )
         if mode == "target" and assign_row is not None:
+            _validate_team_grade_change_or_raise(
+                db, nurse, fields, scope="target",
+                group_id=assign_row.target_group_id,
+                assign_row=assign_row,
+            )
             _apply_target_update(assign_row, fields)
             db.commit()
             db.refresh(assign_row)
         else:
+            _validate_team_grade_change_or_raise(
+                db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
+            )
             _apply_source_nurse_update(nurse, fields)
             # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
             # 프론트가 view_group_id 안 보내도 source view 호출 한 번으로 inbound 모두 동기화.
@@ -1316,6 +1364,58 @@ def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> Non
     for key, value in fields.items():
         if hasattr(nurse, key):
             setattr(nurse, key, value)
+
+
+def _validate_team_grade_change_or_raise(
+    db: Session,
+    nurse: NurseModel,
+    fields: Dict[str, Any],
+    *,
+    scope: str,  # 'source' | 'target'
+    group_id: str,
+    assign_row: Optional[NurseAssignment] = None,
+) -> None:
+    """fields 에 team_id/grade 변경 포함 시 인원 정합성 검증. 위반 시 422 raise.
+
+    scope='source': nurses.* 직접 수정 (변경 전 값 = nurse.team_id / nurse.grade)
+    scope='target': nurse_assignment.target_* 수정 (변경 전 값 = assign_row.target_team_id / .target_grade)
+    """
+    has_team = "team_id" in fields
+    has_grade = "grade" in fields
+    if not has_team and not has_grade:
+        return
+    if scope == "source":
+        old_team = nurse.team_id
+        old_grade = nurse.grade
+    else:
+        if assign_row is None:
+            return
+        old_team = assign_row.target_team_id
+        old_grade = assign_row.target_grade
+    new_team = fields["team_id"] if has_team else old_team
+    new_grade = fields["grade"] if has_grade else old_grade
+
+    from services.precheck.nurse_change_validators import validate_nurse_change
+
+    result = validate_nurse_change(
+        db,
+        group_id=group_id,
+        swap_nurse_id=str(nurse.nurse_id),
+        old_team_id=old_team,
+        new_team_id=new_team,
+        old_grade=old_grade,
+        new_grade=new_grade,
+        scope=scope,
+    )
+    if not result.get("saveable", True):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "TEAM_GRADE_VALIDATION_FAILED",
+                "message": "팀/Grade 변경이 인원 정합성을 충족하지 못합니다.",
+                "issues": result.get("issues", []),
+            },
+        )
 
 
 _ASSIGNMENT_CREATE_FIELDS: Tuple[str, ...] = (

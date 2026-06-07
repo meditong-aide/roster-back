@@ -13,32 +13,55 @@ from schemas.grade_schema import (
 def _resolve_grade_names(
     grade_names_raw: Any,
     constraints: Optional[Dict[str, Dict[Any, int]]],
-) -> Optional[Dict[str, str]]:
-    """grade_names_json이 비어있으면 constraints_json 키로 기본 매핑을 생성한다.
+) -> Optional[Dict[str, Optional[str]]]:
+    """모든 grade slot 키를 응답에 포함하고, 명시값 없는 키는 None 으로 채운다.
 
-    fallback 시 value를 빈 문자열로 둠 — 프론트의 trim().length>0 분기에서
-    "Grade N" 자동 라벨이 살아있도록 한다(사용자 미입력 상태 보존).
+    Slot 키 수집:
+      - constraints_json 각 shift 의 grade key 합집합
+      - grade_names_json 자체 키
+      위 두 집합의 합집합을 응답 키 목록으로 사용.
+    값:
+      - grade_names_json 의 값이 비어있지 않은 문자열이면 그대로 사용
+      - 그 외는 None
+    Slot 자체가 하나도 없으면 None 반환.
     """
-    if isinstance(grade_names_raw, dict) and grade_names_raw:
-        return {str(k): str(v) for k, v in grade_names_raw.items()}
-
-    if not isinstance(constraints, dict) or not constraints:
-        return None
+    raw_dict: Dict[str, Any] = {}
+    if isinstance(grade_names_raw, dict):
+        raw_dict = {str(k): v for k, v in grade_names_raw.items()}
 
     grade_keys: set[str] = set()
-    for grades_map in constraints.values():
-        if not isinstance(grades_map, dict):
-            continue
-        for g_key in grades_map.keys():
-            try:
-                grade_keys.add(str(int(g_key)))
-            except (TypeError, ValueError):
+    if isinstance(constraints, dict):
+        for grades_map in constraints.values():
+            if not isinstance(grades_map, dict):
                 continue
+            for g_key in grades_map.keys():
+                try:
+                    grade_keys.add(str(int(g_key)))
+                except (TypeError, ValueError):
+                    continue
+    for k in raw_dict.keys():
+        try:
+            grade_keys.add(str(int(k)))
+        except (TypeError, ValueError):
+            grade_keys.add(str(k))
 
     if not grade_keys:
         return None
 
-    return {key: "" for key in sorted(grade_keys, key=lambda x: int(x))}
+    def _sort_key(x: str) -> tuple[int, int, str]:
+        try:
+            return (0, int(x), "")
+        except (TypeError, ValueError):
+            return (1, 0, x)
+
+    result: Dict[str, Optional[str]] = {}
+    for key in sorted(grade_keys, key=_sort_key):
+        v = raw_dict.get(key)
+        if isinstance(v, str) and v.strip():
+            result[key] = v
+        else:
+            result[key] = None
+    return result
 
 
 def get_grade_config_service(db: Session, group_id: str) -> GradeConfigResponse:

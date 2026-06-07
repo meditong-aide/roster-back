@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import UploadFile, File, Query
 from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Dict
@@ -17,6 +18,8 @@ from db.client2 import get_db, msdb_manager
 from db.models import Nurse as NurseModel
 from db.models import Office as OfficeModel
 from db.models import Team as TeamModel
+from db.models import Group as GroupModel
+from db.models import NurseAssignment
 from schemas.roster_schema import (
     NurseProfile,
     MoveNurseRequest,
@@ -71,6 +74,7 @@ from services.nurse_monthly_limit_service import (
     list_nurse_monthly_limits_service,
     upsert_nurse_monthly_limits_service,
 )
+from services.group_access import resolve_managed_group_ids
 from services.excel_service import (
     create_nurse_template,
     # process_excel_upload,
@@ -90,6 +94,100 @@ from utils.utils import set_sms
 
 
 router = APIRouter(prefix="/nurses", tags=["nurses"])
+
+
+@router.get("/managed-groups/summary")
+async def get_managed_groups_summary(
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """현재 사용자가 관리 가능한 그룹 목록 + 간호사 카운트 요약.
+
+    권한별 노출 그룹:
+    - ADM(is_master_admin): 같은 office_id 의 모든 그룹
+    - HN(hn_auth=='HN'): home group + group.hn_id 에 등록된 그룹
+    - 그 외(수간호사·일반 간호사, HN 권한 없음): 토큰 group_id 1개
+
+    카운트 기준 (group_id 축, distinct nurse_id):
+    - active_nurse_count: home 소속(nurses.group_id==G_x) + inbound
+      (NurseAssignment.target_group_id==G_x AND status='active') 중
+      nurses.resignation_date IS NULL 인 간호사. 같은 nurse 가 home·inbound
+      양쪽에 잡혀도 1회만 카운트.
+    - inactive_nurse_count: home 소속이며 resignation_date IS NOT NULL.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+    group_ids = resolve_managed_group_ids(db, current_user)
+    if not group_ids:
+        return JSONResponse(
+            content=jsonable_encoder([]),
+            media_type="application/json; charset=utf-8",
+        )
+
+    groups = (
+        db.query(GroupModel)
+        .filter(GroupModel.group_id.in_(group_ids))
+        .all()
+    )
+    groups_map = {g.group_id: g for g in groups}
+
+    home_rows = (
+        db.query(
+            NurseModel.nurse_id,
+            NurseModel.group_id,
+            NurseModel.resignation_date,
+            NurseModel.active,
+        )
+        .filter(NurseModel.group_id.in_(group_ids))
+        .all()
+    )
+
+    inbound_rows = (
+        db.query(NurseAssignment.nurse_id, NurseAssignment.target_group_id)
+        .join(NurseModel, NurseModel.nurse_id == NurseAssignment.nurse_id)
+        .filter(
+            NurseAssignment.target_group_id.in_(group_ids),
+            NurseAssignment.status == "active",
+            NurseModel.resignation_date.is_(None),
+            NurseModel.active == 1,
+        )
+        .all()
+    )
+
+    active_set: dict = {gid: set() for gid in group_ids}
+    inactive_set: dict = {gid: set() for gid in group_ids}
+
+    # 비활성 정의: active=0 OR resignation_date IS NOT NULL (합집합)
+    for nid, gid, resigned, is_active in home_rows:
+        if gid not in active_set:
+            continue
+        if (resigned is not None) or (not bool(is_active)):
+            inactive_set[gid].add(nid)
+        else:
+            active_set[gid].add(nid)
+
+    for nid, tgid in inbound_rows:
+        if tgid in active_set:
+            active_set[tgid].add(nid)
+
+    data = []
+    for gid in group_ids:
+        g = groups_map.get(gid)
+        if not g:
+            continue
+        data.append({
+            "group_id": str(g.group_id),
+            "group_name": str(g.group_name),
+            "office_id": str(g.office_id),
+            "active_nurse_count": len(active_set[gid]),
+            "inactive_nurse_count": len(inactive_set[gid]),
+        })
+
+    return JSONResponse(
+        content=jsonable_encoder(data),
+        media_type="application/json; charset=utf-8",
+    )
 
 
 @router.get("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
@@ -193,7 +291,7 @@ async def get_nurses_in_group(
         current_user.office_id,
     )
     try:
-        # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
+        # ADM: 필터링 옵션 자유. HN: resolve_managed_group_ids 안의 그룹만 query 허용.
         if current_user.is_master_admin:
             response = get_nurses_filtered_service(
                 current_user,
@@ -203,10 +301,20 @@ async def get_nurses_in_group(
                 nurse_id=nurse_id,  # nurse_id 전달
             )
             return response
+        # HN/수간호사/일반: query group_id 있으면 권한 검증 후 override, 없으면 토큰 group_id
+        override_gid: Optional[str] = None
+        if group_id:
+            allowed = resolve_managed_group_ids(db, current_user)
+            if group_id not in allowed:
+                raise HTTPException(
+                    status_code=403, detail="해당 병동에 접근할 수 없습니다."
+                )
+            override_gid = group_id
         return get_nurses_in_group_service(
             current_user,
             db,
             nurse_id=nurse_id,  # nurse_id 전달
+            override_group_id=override_gid,
         )
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)
@@ -1058,40 +1166,36 @@ async def delete_nurse_assignment(
 @router.get("/{nurse_id}", response_model=NurseProfile)
 async def get_nurse_by_id(
     nurse_id: str,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """단일 간호사 프로필 조회 (파견/병동이동 인바운드 간호사도 조회 허용)"""
+    """단일 간호사 프로필 조회.
+
+    통합 권한 헬퍼(can_caller_access_nurse)로 ADM / self / home·managed source /
+    inbound (파견·병동이동) 모두 통과시킨 뒤, 그룹 필터를 건너뛰고 직접 조회한다.
+
+    group_id (Optional):
+        사이드프로필 view 컨텍스트. 명시 시 해당 그룹의 inbound assignment 기준으로
+        target_* overlay 가 적용됨. 본인 home group 외 값이면 managed groups 검증.
+    """
     try:
-        result = None
+        from services.group_access import can_caller_access_nurse, assert_caller_can_access_group
+        if not can_caller_access_nurse(db, current_user, nurse_id):
+            raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
+
+        if group_id and str(group_id) != str(getattr(current_user, "group_id", "")):
+            assert_caller_can_access_group(db, current_user, group_id)
+
         if current_user.is_master_admin:
             result = get_nurses_filtered_service(
-                current_user,
-                db,
-                nurse_id=nurse_id,
+                current_user, db, nurse_id=nurse_id,
             )
         else:
-            try:
-                result = get_nurses_in_group_service(
-                    current_user,
-                    db,
-                    nurse_id=nurse_id,
-                )
-            except Exception:
-                result = None
-        # 같은 그룹에 없으면 → 파견/병동이동 인바운드 여부 확인 후 직접 조회
-        if not result:
-            from db.models import NurseAssignment
-            has_inbound = db.query(NurseAssignment).filter(
-                NurseAssignment.nurse_id == nurse_id,
-                NurseAssignment.target_group_id == current_user.group_id,
-                NurseAssignment.reason.in_(["파견", "병동이동"]),
-                NurseAssignment.status == "active",
-            ).first()
-            if has_inbound:
-                result = get_nurses_in_group_service(
-                    current_user, db, nurse_id=nurse_id, skip_group_filter=True,
-                )
+            result = get_nurses_in_group_service(
+                current_user, db, nurse_id=nurse_id, skip_group_filter=True,
+                override_group_id=group_id,
+            )
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
         return result[0]
