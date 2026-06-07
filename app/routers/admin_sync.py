@@ -22,6 +22,7 @@ class ProdToDevSyncRequest(BaseModel):
     tables: Optional[List[str]] = None
     include_group_ids: Optional[List[str]] = None
     exclude_group_ids: Optional[List[str]] = None
+    include_office_ids: Optional[List[str]] = None
 
 
 @router.post("/prod-to-dev")
@@ -47,4 +48,5 @@ async def trigger_prod_to_dev_sync(
         tables=req.tables,
         include_group_ids=req.include_group_ids,
         exclude_group_ids=req.exclude_group_ids,
+        include_office_ids=req.include_office_ids,
     )

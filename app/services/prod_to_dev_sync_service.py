@@ -148,6 +148,62 @@ def _group_filter_clause(
     return where, params
 
 
+# office 마이그에서 명시적으로 건너뛸 테이블 (글로벌/로그 — office 개념 없음, dev 보존).
+OFFICE_SKIP_TABLES = {"notices", "sticker", "shift_transfer_logs"}
+
+
+def _office_where(
+    db: Session,
+    db_name: str,
+    table: str,
+    office_ids: List[str],
+    alias: str = "",
+) -> tuple:
+    """office_ids 기준 해당 테이블의 WHERE 절 + params 반환 (office 마이그용).
+
+    **컬럼은 db_name(dev/prod) 별로 확인** — prod/dev 스키마 drift 에 견고.
+    (예: nurse_shift_requests 등은 dev=office_id, prod=nurse_id 라 양쪽이 다른 컬럼으로
+     같은 office 스코프를 잡음.)
+
+    분기 우선순위:
+    1. OFFICE_SKIP_TABLES → (None, None) → skip (notices/sticker/shift_transfer_logs)
+    2. office_id O → office_id IN (...)
+    3. group_id O → group_id IN (SELECT group_id FROM <db>.groups WHERE office_id IN (...))
+    4. schedule_entries → schedule_id IN (SELECT ... FROM <db>.schedules WHERE office_id IN (...))
+    5. nurse_id O → nurse_id IN (SELECT nurse_id FROM <db>.nurses WHERE office_id IN (...))
+       (prod 에 office_id/group_id 가 없는 request 계열 테이블 fallback)
+    6. 그 외 → (None, None) → skip
+    """
+    if table in OFFICE_SKIP_TABLES:
+        return None, None
+    prefix = f"{alias}." if alias else ""
+    ph = ", ".join(f":of{i}" for i in range(len(office_ids)))
+    params = {f"of{i}": o for i, o in enumerate(office_ids)}
+    if _table_has_column(db, db_name, table, "office_id"):
+        return f" WHERE {prefix}office_id IN ({ph})", params
+    # 서브쿼리 비교는 COLLATE DATABASE_DEFAULT 로 collation 충돌 방지
+    # (같은 DB 내 컬럼 간 collation 이 달라도 안전 — 기존 MERGE 와 동일 정책).
+    if _table_has_column(db, db_name, table, "group_id"):
+        sub = (
+            f"SELECT group_id COLLATE DATABASE_DEFAULT FROM {db_name}.dbo.[groups] "
+            f"WHERE office_id IN ({ph})"
+        )
+        return f" WHERE {prefix}group_id COLLATE DATABASE_DEFAULT IN ({sub})", params
+    if table == "schedule_entries":
+        sub = (
+            f"SELECT schedule_id COLLATE DATABASE_DEFAULT FROM {db_name}.dbo.[schedules] "
+            f"WHERE office_id IN ({ph})"
+        )
+        return f" WHERE {prefix}schedule_id COLLATE DATABASE_DEFAULT IN ({sub})", params
+    if _table_has_column(db, db_name, table, "nurse_id"):
+        sub = (
+            f"SELECT nurse_id COLLATE DATABASE_DEFAULT FROM {db_name}.dbo.[nurses] "
+            f"WHERE office_id IN ({ph})"
+        )
+        return f" WHERE {prefix}nurse_id COLLATE DATABASE_DEFAULT IN ({sub})", params
+    return None, None
+
+
 def _disable_fk(db: Session, table: str) -> None:
     db.execute(text(f"ALTER TABLE {DEV_DB}.dbo.[{table}] NOCHECK CONSTRAINT ALL"))
 
@@ -183,7 +239,15 @@ def _delete_dev(
     table: str,
     include_group_ids: Optional[List[str]] = None,
     exclude_group_ids: Optional[List[str]] = None,
+    include_office_ids: Optional[List[str]] = None,
 ) -> int:
+    # office 모드 우선: office 스코프 행만 삭제. 스코프 불가 테이블은 dev 보존(skip).
+    if include_office_ids:
+        where, params = _office_where(db, DEV_DB, table, include_office_ids)
+        if where is None:
+            return 0
+        result = db.execute(text(f"DELETE FROM {DEV_DB}.dbo.[{table}]{where}"), params)
+        return result.rowcount if result.rowcount is not None else -1
     has_grp = _table_has_column(db, DEV_DB, table, "group_id")
     # include_group_ids 지정 시 group_id 컬럼 없는 테이블은 dev 보존 (delete skip).
     if include_group_ids and not has_grp:
@@ -200,6 +264,7 @@ def _copy_prod_to_dev(
     table: str,
     include_group_ids: Optional[List[str]] = None,
     exclude_group_ids: Optional[List[str]] = None,
+    include_office_ids: Optional[List[str]] = None,
 ) -> dict:
     """dev 에 prod 내용을 그대로 INSERT. 공통 컬럼만 복사."""
     if not _table_exists(db, PROD_DB, table):
@@ -213,20 +278,27 @@ def _copy_prod_to_dev(
     if not common:
         return {"table": table, "skipped": "no_common_cols", "inserted": 0}
 
-    # include_group_ids 지정 시 group_id 컬럼 없는 테이블은 dev 보존 (insert skip).
-    if include_group_ids and "group_id" not in prod_cols:
-        return {"table": table, "skipped": "no_group_id_with_include", "inserted": 0}
+    # 스코프 WHERE 결정 (office 모드 우선)
+    if include_office_ids:
+        where, params = _office_where(
+            db, PROD_DB, table, include_office_ids, alias="src"
+        )
+        if where is None:
+            return {"table": table, "skipped": "no_office_scope", "inserted": 0}
+    else:
+        # include_group_ids 지정 시 group_id 컬럼 없는 테이블은 dev 보존 (insert skip).
+        if include_group_ids and "group_id" not in prod_cols:
+            return {"table": table, "skipped": "no_group_id_with_include", "inserted": 0}
+        where, params = "", {}
+        if "group_id" in prod_cols and (include_group_ids or exclude_group_ids):
+            where, params = _group_filter_clause(
+                include_group_ids, exclude_group_ids, alias="src"
+            )
 
     col_list = ", ".join(f"[{c}]" for c in common)
     sel_list = ", ".join(f"src.[{c}]" for c in common)
 
     has_identity = _has_identity(db, DEV_DB, table)
-
-    where, params = "", {}
-    if "group_id" in prod_cols and (include_group_ids or exclude_group_ids):
-        where, params = _group_filter_clause(
-            include_group_ids, exclude_group_ids, alias="src"
-        )
 
     sql = (
         f"INSERT INTO {DEV_DB}.dbo.[{table}] ({col_list}) "
@@ -400,6 +472,7 @@ def sync_prod_to_dev(
     tables: Optional[List[str]] = None,
     include_group_ids: Optional[List[str]] = None,
     exclude_group_ids: Optional[List[str]] = None,
+    include_office_ids: Optional[List[str]] = None,
 ) -> dict:
     """마스터=wipe+copy / 트랜잭션=upsert(MERGE).
 
@@ -417,9 +490,19 @@ def sync_prod_to_dev(
                 prod 에서 가져오지 않고 dev wipe 대상에서도 제외 (dev 기존 데이터 보존).
                 group_id 컬럼이 없는 테이블은 영향 없음 (full wipe+copy).
     """
+    # office 모드: group 필터는 무시(우선순위). 완전 교체이므로 모든 대상 테이블을
+    # scoped wipe(office 스코프 삭제 + prod 복사)로 처리. office 스코프 불가 테이블
+    # (notices/sticker/shift_transfer_logs 등)은 _office_where=None → 자동 skip(보존).
+    if include_office_ids:
+        include_group_ids = None
+        exclude_group_ids = None
+
     # 모드 lookup
     mode_map = {t: m for t, m in SYNC_TABLES}
-    if tables:
+    if include_office_ids:
+        base = tables or [t for t, _ in SYNC_TABLES]
+        target_pairs = [(t, "wipe") for t in base]
+    elif tables:
         target_pairs = [(t, mode_map.get(t, "wipe")) for t in tables]
     else:
         target_pairs = list(SYNC_TABLES)
@@ -455,7 +538,9 @@ def sync_prod_to_dev(
     deleted_summary: dict = {}
     for table in reversed(wipe_tables):
         cnt, err = _run_in_session(
-            lambda s, t=table: _delete_dev(s, t, include_group_ids, exclude_group_ids)
+            lambda s, t=table: _delete_dev(
+                s, t, include_group_ids, exclude_group_ids, include_office_ids
+            )
         )
         if err:
             errors.append({"phase": "delete", "table": table, "error": err})
@@ -468,7 +553,7 @@ def sync_prod_to_dev(
         if mode == "wipe":
             r, err = _run_in_session(
                 lambda s, t=table: _copy_prod_to_dev(
-                    s, t, include_group_ids, exclude_group_ids
+                    s, t, include_group_ids, exclude_group_ids, include_office_ids
                 )
             )
             if err:
