@@ -5607,6 +5607,44 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     except Exception as _exc:
         print(f"[Infeasibility] payload 빌드 실패(무시): {_exc}")
 
+    # ── A1: 표는 나왔으나 hard 위반(hv>0) → 위반 0 으로 만드는 완화 옵션 probe (opt-in) ──
+    # UNDIAGNOSED probe 와 동일 메커니즘. 성공조건만 feasible → hard_viol==0.
+    # 흔한 케이스라 req.suggest_fixes=True 일 때만 실행(매 생성 지연 방지). kill-switch 동일.
+    try:
+        import os as _os_a1
+        _ci_a1 = roster_data.get("constraint_impact") or {}
+        _hv_cnt = int(_ci_a1.get("hard_violation_count") or 0)
+        _inf_a1 = roster_data.get("infeasibility")
+        if (bool(getattr(req, "suggest_fixes", False)) and _hv_cnt > 0
+                and isinstance(_inf_a1, dict)
+                and _os_a1.getenv("UNDIAG_PROBE_DISABLE") != "1"):
+            from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
+            _a1_base = getattr(roster_system, "_effective_config_snapshot", None)
+            if _a1_base:
+                def _a1_resolve(_relaxed_cfg):
+                    _g2, _, _rs2 = _run_cp_sat_basic(
+                        db, current_user, nurses_for_engine, preferences, latest_config, req,
+                        shift_manage_data,
+                        fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                        time_limit_seconds=60, config_override=_relaxed_cfg,
+                        _assignments=_assignments, _inbound_assignments=_inbound_assignments,
+                        _outbound_assignments=_outbound_assignments,
+                    )
+                    try:
+                        _ci2 = _build_constraint_impact_payload(_rs2, req)
+                        _hv2 = int((_ci2 or {}).get("hard_violation_count") or 0)
+                    except Exception:
+                        _hv2 = 1
+                    return (_hv2 == 0), {"hard_viol": _hv2}
+
+                _a1_res = probe_relaxations(dict(_a1_base), _a1_resolve)
+                _inf_a1["resolution_options"] = to_resolution_options(_a1_res, _a1_base)
+                _inf_a1["probe_found"] = _a1_res.get("found", False)
+                print(f"[A1Probe] hv={_hv_cnt} → found={_a1_res.get('found')} "
+                      f"options={[o['option_id'] for o in (_inf_a1.get('resolution_options') or [])]}")
+    except Exception as _a1_exc:
+        print(f"[A1Probe] failed (ignore): {_a1_exc}")
+
     # ── assignment 대상자 근무표 생성 알림 (S09) ──
     try:
         from utils.utils import send_assignment_roster_created_push
