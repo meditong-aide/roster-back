@@ -80,6 +80,11 @@ class NurseRosterConfig:
     n_to_n_interval_target: int = 10
     n_to_n_interval_penalty_weight: int = 50
     n_to_n_interval_max_window: int = 15
+    # D/E(데이·이브닝) per-nurse 균등 — fallback stage2 lex 5-pass.
+    # OFF/N/n2n 동결 후 nurse별 |D-E| 의 tolerance 초과분만 최소화(완전 동일이 아닌 밴드).
+    # 수렴된 균등해가 stage3 warm-start hint로 상속되어 X축(D/E 1.5배) 균형을 안정화한다.
+    de_balance_enable: bool = True
+    de_balance_tolerance: int = 2  # |D-E| 허용 밴드(일). 초과분만 soft 벌점.
     off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)
     off_first: bool = False  # off_first=False(default): OFF 규칙 우선(OFF cap 충족 + max coverage 무시 + 남는 셀 근무 배정 + fixed_wanted 차감) / off_first=True: 근무 규칙 우선(현행 min-max coverage 균등화 유지, min 근접 배정)
     distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off

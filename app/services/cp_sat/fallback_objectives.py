@@ -341,6 +341,9 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
+    # (D/E per-nurse 균등은 stage2 lex 5-pass(DE_LEX)로 처리 — 수렴된 hint가 stage3로
+    #  상속되므로 stage3 페널티 항은 불필요. 제거됨.)
+
     # N 블록 종료 → 다음 N 블록 시작 간격 soft (한쪽, target=10일)
     # 간격이 target보다 *짧을* 때만 벌점. 더 멀면 휴식이 충분하므로 벌하지 않는다.
     try:
