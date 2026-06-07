@@ -3039,6 +3039,11 @@ def optimize_fallback_lex_hard_first(
                                                             f"status={_cp_sat_status_to_text(st2_n2n)} "
                                                             f"deficit={int(s2.ObjectiveValue())}"
                                                         )
+                                                        # n2n 동결: 후속 D/E 패스가 n2n을 망가뜨리지 않도록 lex 잠금
+                                                        try:
+                                                            m2.Add(sum(_n2n_terms) <= int(s2.ObjectiveValue()))
+                                                        except Exception:
+                                                            pass
                                                     else:
                                                         print(
                                                             f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
@@ -3046,6 +3051,49 @@ def optimize_fallback_lex_hard_first(
                                                         )
                                             except Exception as _n2n_e:
                                                 print(f"{logger_prefix} 폴백2 lex 4-pass 예외: {_n2n_e}")
+                                        # H1 5-pass: D/E per-nurse 균등(X축). OFF/N/n2n 동결 후 잔여 자유도로만.
+                                        # lex_x2_val(stage3 warm-start hint)이 D/E까지 균등해져 stage3가 균등 hint 상속.
+                                        # config de_balance_enable(기본 ON)을 따르며, env DE_LEX_ENABLE 로 override 가능.
+                                        # tol 초과분만 벌해 "완전동일" 아님(밴드).
+                                        try:
+                                            import os as _os_de
+                                            _de_env = _os_de.getenv("DE_LEX_ENABLE")
+                                            _de_on = (_de_env == "1") if _de_env is not None else bool(getattr(cfg, "de_balance_enable", True))
+                                            if _de_on and "E" in cfg.shift_types:
+                                                _de_tol = int(_os_de.getenv("DE_BALANCE_TOL", str(getattr(cfg, "de_balance_tolerance", 2))) or 0)
+                                                _de_d_idx = cfg.shift_types.index("D")
+                                                _de_e_idx = cfg.shift_types.index("E")
+                                                _de_excs = []
+                                                for _n in range(N):
+                                                    if leave[_n] < join[_n] or _n in nightonly_excluded_idx:
+                                                        continue
+                                                    _ad = list(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                                                    _td = sum(X2(_n, d, _de_d_idx) for d in _ad)
+                                                    _te = sum(X2(_n, d, _de_e_idx) for d in _ad)
+                                                    _df = m2.NewIntVar(0, D, f"lex_de_diff_{_n}")
+                                                    m2.Add(_df >= _td - _te)
+                                                    m2.Add(_df >= _te - _td)
+                                                    _ex = m2.NewIntVar(0, D, f"lex_de_exc_{_n}")
+                                                    m2.Add(_ex >= _df - _de_tol)
+                                                    _de_excs.append(_ex)
+                                                if _de_excs:
+                                                    m2.Minimize(sum(_de_excs))
+                                                    s2.parameters.max_time_in_seconds = max(5.0, float(tl2) * 0.3)
+                                                    _hint_lex_solution()
+                                                    st2_de = s2.Solve(m2)
+                                                    if st2_de in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                                        _capture_lex_solution()
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
+                                                            f"status={_cp_sat_status_to_text(st2_de)} excess={int(s2.ObjectiveValue())}"
+                                                        )
+                                                    else:
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
+                                                            f"status={_cp_sat_status_to_text(st2_de)} — 4th 결과 유지"
+                                                        )
+                                        except Exception as _de_e:
+                                            print(f"{logger_prefix} 폴백2 lex 5-pass 예외: {_de_e}")
                                     else:
                                         print(
                                             f"{logger_prefix} 폴백2 lex 3-pass (N range): "
