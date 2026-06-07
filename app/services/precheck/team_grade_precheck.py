@@ -138,7 +138,10 @@ def check_mid_required_missing(inp: PrecheckInput) -> List[Dict]:
     by_day = cfg.get("daily_shift_requirements_by_day") or []
     per_day_m = any(int((d or {}).get("M", 0) or 0) > 0 for d in by_day if isinstance(d, dict))
     if base_m <= 0 and not per_day_m:
-        return [_issue("MID_REQUIRED_MISSING", {"daily_shift_requirements": dict(dsr)})]
+        # use_mid=True 인데 M 수요가 전무 = 모순 설정이지만, 차단(hard) 대신 경고(warning)로
+        # 흡수한다. M coverage=0 이라 솔버는 M 없이 정상 생성 가능 → 유저가 use_mid 끄는 걸
+        # 깜빡해도 생성이 막히지 않는다. (의도: 오설정을 막지 말고 안내만)
+        return [_issue("MID_REQUIRED_MISSING", {"daily_shift_requirements": dict(dsr)}, severity="warning")]
     return []
 
 
