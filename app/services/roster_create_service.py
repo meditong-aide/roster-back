@@ -2857,6 +2857,21 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             if _rs is not None:
                 setattr(_rs, "_constraint_impact_preflight_alerts", list(preflight_alerts or []))
                 setattr(_rs, "_constraint_impact_mid_feasibility_error", mid_feasibility_error)
+                # 엔진에 실제로 들어간 유효 config 스냅샷(하드규칙+조립분 전부 포함).
+                # UNDIAGNOSED probe 가 충실한 base 로 재완화하는 데 쓴다(실패 시점 메모리는
+                # ORM 만료·stale 라 부정확하므로 solve 시점에 박아둔다). _sa_* 는 제외.
+                try:
+                    _eff_snap: dict = {}
+                    for _ck, _cv in config_dict.items():
+                        if str(_ck).startswith("_sa_"):
+                            continue
+                        try:
+                            _eff_snap[_ck] = deepcopy(_cv)
+                        except Exception:
+                            _eff_snap[_ck] = _cv
+                    setattr(_rs, "_effective_config_snapshot", _eff_snap)
+                except Exception as _eff_exc:
+                    print(f"[EffectiveConfigSnapshot] 실패(무시): {_eff_exc}")
                 setattr(_rs, "_constraint_impact_merged_initial_constraints", deepcopy(config_dict.get("initial_constraints") or {}))
                 setattr(_rs, "_constraint_impact_special_fixed_requests", deepcopy(config_dict.get("special_fixed_requests") or []))
                 setattr(
@@ -5438,6 +5453,61 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 pool_snapshot=_pool_snapshot_dict,
                 nurse_index_map=_nurse_index_map,
             )
+            # ── UNDIAGNOSED 블랙박스 probe ──
+            # 분석(MUS/산술/max-flow)이 원인을 못 짚은 경우, 결합제약을 하나씩 풀어
+            # 엔진을 재실행해 "무엇을 풀면 feasible 해지는가"를 실측한다(verified resolution).
+            # UNDIAGNOSED(원인 미식별) 상황이면 자동 실행. kill-switch(UNDIAG_PROBE_DISABLE=1)
+            # 로만 끈다. 실패해도 기존 payload 그대로(graceful). 이미 실패한 케이스에만 타므로
+            # 정상 생성에는 영향 없음. (※ 동기 경로는 probe 시간만큼 응답 지연 — async 권장)
+            try:
+                import os as _os_undiag
+                _inf_pre = unrecoverable.get("infeasibility", {}) or {}
+                _sd_pre = _inf_pre.get("structural_diagnosis", {}) or {}
+                _codes_pre = (_sd_pre.get("signals") or {}).get("reason_codes") or []
+                _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not (_sd_pre.get("primary_causes") or [])
+                if _is_undiag and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
+                    from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
+
+                    def _undiag_resolve(_relaxed_cfg):
+                        _g, _, _rs = _run_cp_sat_basic(
+                            db, current_user, nurses_for_engine, preferences, latest_config, req,
+                            shift_manage_data,
+                            fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                            time_limit_seconds=60,
+                            config_override=_relaxed_cfg,
+                            _assignments=_assignments,
+                            _inbound_assignments=_inbound_assignments,
+                            _outbound_assignments=_outbound_assignments,
+                        )
+                        _err = _validate_generated_roster(
+                            _g, _rs,
+                            nurses_context=list(nurses_for_engine or []),
+                            config_context=_relaxed_cfg,
+                            grade_config_context=_fetch_grade_config_dict(
+                                db, current_user.office_id, current_user.group_id),
+                        )
+                        return (_err is None), {"validation_error": (str(_err)[:80] if _err else None)}
+
+                    # probe base: solve 시점에 박아둔 유효 config 스냅샷(하드규칙+조립분 포함, 충실).
+                    # 실패 시점 메모리(config_dict)는 ORM 만료·stale 라 부정확하므로 스냅샷 우선.
+                    _probe_base = getattr(roster_system, "_effective_config_snapshot", None)
+                    if not _probe_base:
+                        _probe_base = {k: v for k, v in dict(config_dict).items()
+                                       if not str(k).startswith("_sa_")}
+                    _probe_base = dict(_probe_base)
+                    _probe_res = probe_relaxations(_probe_base, _undiag_resolve)
+                    unrecoverable["infeasibility"]["probe_resolutions"] = _probe_res.get("resolutions", [])
+                    unrecoverable["infeasibility"]["probe_combo"] = _probe_res.get("combo")
+                    unrecoverable["infeasibility"]["probe_found"] = _probe_res.get("found", False)
+                    # 프론트용 통합 옵션 카드(probe 결과 → 검증된 resolution_options)
+                    unrecoverable["infeasibility"]["resolution_options"] = to_resolution_options(
+                        _probe_res, _probe_base)
+                    _combo = _probe_res.get("combo")
+                    print(f"[UndiagProbe] found={_probe_res.get('found')} "
+                          f"resolutions={[r['id'] for r in _probe_res.get('resolutions', [])]} "
+                          f"combo={_combo.get('id') if _combo else None}")
+            except Exception as _undiag_exc:
+                print(f"[UndiagProbe] failed (ignore): {_undiag_exc}")
             inf = unrecoverable.get("infeasibility", {})
             print(
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "

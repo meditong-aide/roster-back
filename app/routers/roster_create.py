@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db.client2 import get_db
+from db.models import RosterConfig
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest
@@ -249,6 +250,83 @@ async def generate_roster_endpoint(
         print('error', e)
         payload = _fallback_unrecoverable_from_exception(f"근무표 생성 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=payload)
+
+
+class ApplyResolutionRequest(BaseModel):
+    """infeasibility 해결 옵션을 적용해 재생성하는 요청.
+
+    apply 는 /roster_create/generate 의 infeasibility.resolution_options[*].apply 를
+    그대로 echo 한 것(RosterConfig 컬럼 delta, 예: {"max_nig_per_month": 18}).
+    """
+    year: int
+    month: int
+    grade_strategy: Optional[str] = None
+    apply: Dict[str, Any]
+    option_id: Optional[str] = None
+
+
+@router.post("/roster_create/apply-resolution")
+async def apply_resolution_endpoint(
+    req: ApplyResolutionRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """선택한 해결 옵션(설정 delta)을 **이번 생성에만 transient 적용**해 재생성한다.
+
+    동작: RosterConfig 컬럼 snapshot → delta 적용(commit) → generate_roster_service →
+    finally 에서 원복(commit). 영구 저장하지 않으므로 사용자가 여러 옵션을 부담 없이 시도
+    가능. 적용 후에도 실패하면 새 resolution_options 가 담긴 infeasibility(500)가 전파된다.
+
+    주의: 적용~원복 사이 동안 해당 group 의 config 가 일시 변경되므로, 동일 group 의 동시
+    생성과는 경합 가능(수간호사 월간 생성 빈도상 위험 낮음). 영구 반영은 별도 설정 저장 단계.
+    """
+    delta = {k: v for k, v in (req.apply or {}).items()}
+    if not delta:
+        raise HTTPException(status_code=400, detail="apply(설정 변경)가 비어 있습니다.")
+    allowed = {c.name for c in RosterConfig.__table__.columns}
+    bad = [k for k in delta if k not in allowed]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"적용 불가한 설정 키: {bad}")
+    rc = (
+        db.query(RosterConfig)
+        .filter(RosterConfig.group_id == current_user.group_id)
+        .order_by(RosterConfig.config_id.desc())
+        .first()
+    )
+    if rc is None:
+        raise HTTPException(status_code=404, detail="roster_config 를 찾을 수 없습니다.")
+    cid = rc.config_id
+    snapshot = {k: getattr(rc, k) for k in delta}
+    gen_req = RosterRequest(year=req.year, month=req.month, grade_strategy=req.grade_strategy)
+    try:
+        for k, v in delta.items():
+            setattr(rc, k, v)
+        db.commit()
+        result = generate_roster_service(gen_req, current_user, db)
+        if isinstance(result, dict):
+            result["applied_resolution"] = {
+                "option_id": req.option_id, "changes": delta, "persisted": False,
+            }
+        return result
+    except HTTPException:
+        raise  # 여전히 infeasible → 새 옵션 포함 payload 전파
+    except Exception as e:
+        print("apply-resolution error", e)
+        payload = _fallback_unrecoverable_from_exception(f"해결책 적용 재생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=payload)
+    finally:
+        try:
+            rc2 = db.query(RosterConfig).filter(RosterConfig.config_id == cid).first()
+            if rc2 is not None:
+                for k, v in snapshot.items():
+                    setattr(rc2, k, v)
+                db.commit()
+        except Exception as _re:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print("apply-resolution restore failed", _re)
 
 
     # [Schedules] - 수간호사가 근무표 생성 요청

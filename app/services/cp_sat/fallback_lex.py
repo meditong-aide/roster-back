@@ -3151,6 +3151,31 @@ def optimize_fallback_lex_hard_first(
         except Exception as exc:
             print(f"{logger_prefix} [Stage2 상세로그 실패]: {exc}")
 
+    # ── verify-mode: stage3(선호/공정성) 건너뛰고 stage2 해로 즉시 반환 ──
+    # hard_viol(커버리지+안전)은 stage2 에서 확정되고, stage3 는 이를 동결한 채
+    # (아래 m3.Add(sum(safety3)==sum(safety2))) 선호만 최적화하므로 "되나/안되나"
+    # 검증에는 stage2 해로 충분하다. 가장 무거운 stage3 를 건너뛰어 지연을 제거한다.
+    # 기본 OFF(env gate). 일반 생성 경로는 영향 없음.
+    import os as _os_vfb
+    if _os_vfb.getenv("FB_VERIFY_SKIP_STAGE3") == "1":
+        roster_system.roster.fill(0)
+        for n in range(N):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                for s in range(S):
+                    if lex_x2_val.get((n, d, s), 0):
+                        roster_system.roster[n, d, s] = 1
+        _log_weekend_work_assignments(
+            roster_system=roster_system,
+            weekend_days=weekend_days,
+            off_idx=off_idx,
+            logger_prefix=logger_prefix,
+        )
+        print(
+            f"{logger_prefix} [verify-mode] stage3 skip → stage2 해 반환 "
+            f"(best_short={best_short}, best_safe_sum={best_safe_sum})"
+        )
+        return best_short == 0 and best_safe_sum == 0
+
     # ───── 3단계: 선호/공정성 ─────
     with timer_cls("폴백 3단계: 선호/공정성 최대화"):
         (
