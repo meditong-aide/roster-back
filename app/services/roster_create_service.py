@@ -4210,7 +4210,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -5201,6 +5201,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         #         "engine_nurses": len(nurses_for_engine),
         #     },
         # )
+        # ── ontology treatment 적용: 선택된 treatment_ids 를 config 에 패치(재생성용) ──
+        # apply_treatments 가 force_soft_mode/disable_module/set_threshold 를 patched_config 로
+        # 반영(대부분 런타임 플래그). data_correction_required(manual)는 적용 안 됨.
+        if treatment_ids:
+            try:
+                from services.treatment_applicator import apply_treatments
+                _clean_cfg = {k: v for k, v in config_dict.items() if not str(k).startswith("_sa_")}
+                _tres = apply_treatments(list(treatment_ids), _clean_cfg)
+                config_dict = _tres.patched_config
+                print(f"[TreatmentApply] applied={_tres.applied_treatment_ids} "
+                      f"manual={_tres.manual_required} unresolved={_tres.unresolved_treatment_ids}")
+            except Exception as _tapp_exc:
+                print(f"[TreatmentApply] 실패(무시): {_tapp_exc}")
         generated, satisfaction_data, roster_system = _run_cp_sat_basic(
             db,
             current_user,
@@ -5499,15 +5512,25 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                     unrecoverable["infeasibility"]["probe_resolutions"] = _probe_res.get("resolutions", [])
                     unrecoverable["infeasibility"]["probe_combo"] = _probe_res.get("combo")
                     unrecoverable["infeasibility"]["probe_found"] = _probe_res.get("found", False)
-                    # 프론트용 통합 옵션 카드(probe 결과 → 검증된 resolution_options)
-                    unrecoverable["infeasibility"]["resolution_options"] = to_resolution_options(
-                        _probe_res, _probe_base)
+                    # 프론트용 통합 옵션 카드: probe(검증됨)를 앞에, 기존 ontology 옵션
+                    # (build_unrecoverable_payload 가 treatment 로 채운 것) 뒤에 prepend.
+                    _probe_opts = to_resolution_options(_probe_res, _probe_base)
+                    _exist_opts = unrecoverable["infeasibility"].get("resolution_options") or []
+                    unrecoverable["infeasibility"]["resolution_options"] = _probe_opts + _exist_opts
+                    # 정합성: probe 가 검증된(verified) 옵션을 찾았으면 "해를 못 찾음, 점검하세요"
+                    # 메시지와 모순되므로, 적용 가능한 옵션이 있음을 알리는 문구로 교정.
+                    if any(o.get("verified") for o in _probe_opts):
+                        unrecoverable["infeasibility"]["summary_message_ko"] = (
+                            "자동 진단으로는 원인을 특정하지 못했지만, 아래 옵션 중 하나를 "
+                            "적용하면 근무표를 생성할 수 있습니다. 적용할 옵션을 선택해주세요."
+                        )
                     _combo = _probe_res.get("combo")
                     print(f"[UndiagProbe] found={_probe_res.get('found')} "
                           f"resolutions={[r['id'] for r in _probe_res.get('resolutions', [])]} "
                           f"combo={_combo.get('id') if _combo else None}")
             except Exception as _undiag_exc:
                 print(f"[UndiagProbe] failed (ignore): {_undiag_exc}")
+            # (ontology treatment → resolution_options 는 build_unrecoverable_payload 에서 처리됨)
             inf = unrecoverable.get("infeasibility", {})
             print(
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
@@ -5638,8 +5661,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                     return (_hv2 == 0), {"hard_viol": _hv2}
 
                 _a1_res = probe_relaxations(dict(_a1_base), _a1_resolve)
-                _inf_a1["resolution_options"] = to_resolution_options(_a1_res, _a1_base)
+                _a1_opts = to_resolution_options(_a1_res, _a1_base)
+                _inf_a1["resolution_options"] = _a1_opts
                 _inf_a1["probe_found"] = _a1_res.get("found", False)
+                # 정합성: 위반표(hv>0) warning 메시지에, 위반을 0 으로 만드는 검증된
+                # 옵션이 있음을 덧붙여 안내(기존 위반 요약 메시지는 유지).
+                if any(o.get("verified") for o in _a1_opts):
+                    _base_msg = (_inf_a1.get("summary_message_ko") or "").rstrip()
+                    _add_msg = ("아래 옵션 중 하나를 적용하면 위반 없이 다시 생성할 수 있습니다.")
+                    _inf_a1["summary_message_ko"] = (
+                        f"{_base_msg} {_add_msg}" if _base_msg else _add_msg
+                    )
                 print(f"[A1Probe] hv={_hv_cnt} → found={_a1_res.get('found')} "
                       f"options={[o['option_id'] for o in (_inf_a1.get('resolution_options') or [])]}")
     except Exception as _a1_exc:

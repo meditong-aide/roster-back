@@ -261,10 +261,13 @@ class ApplyResolutionRequest(BaseModel):
     year: int
     month: int
     grade_strategy: Optional[str] = None
-    apply: Dict[str, Any]
+    # probe 옵션: RosterConfig 컬럼 delta(예: {"max_nig_per_month": 18}).
+    apply: Dict[str, Any] = {}
+    # ontology 옵션: 적용할 treatment_id 리스트(런타임 플래그라 DB 미변경, 이번 생성만).
+    treatment_ids: Optional[List[str]] = None
     option_id: Optional[str] = None
     # True 면 재생성 성공 시 설정 변경을 영구 반영("이 설정 저장"). 기본은 transient(미리보기).
-    # 실패(여전히 infeasible)면 persist 여부와 무관하게 원복.
+    # 실패(여전히 infeasible)면 persist 여부와 무관하게 원복. (treatment_ids 경로엔 미적용)
     persist: bool = False
 
 
@@ -285,8 +288,28 @@ async def apply_resolution_endpoint(
     생성과는 경합 가능(수간호사 월간 생성 빈도상 위험 낮음). 영구 반영은 별도 설정 저장 단계.
     """
     delta = {k: v for k, v in (req.apply or {}).items()}
-    if not delta:
-        raise HTTPException(status_code=400, detail="apply(설정 변경)가 비어 있습니다.")
+    treatment_ids = list(req.treatment_ids or [])
+    if not delta and not treatment_ids:
+        raise HTTPException(status_code=400, detail="apply(컬럼 delta) 또는 treatment_ids 가 필요합니다.")
+    gen_req = RosterRequest(year=req.year, month=req.month, grade_strategy=req.grade_strategy)
+
+    # ── ontology treatment 경로: 런타임 적용(DB 미변경, 이번 생성만, persist N/A) ──
+    if treatment_ids:
+        try:
+            result = generate_roster_service(gen_req, current_user, db, treatment_ids=treatment_ids)
+            if isinstance(result, dict):
+                result["applied_resolution"] = {
+                    "option_id": req.option_id, "treatment_ids": treatment_ids, "persisted": False,
+                }
+            return result
+        except HTTPException:
+            raise  # 여전히 infeasible → 새 옵션 payload 전파
+        except Exception as e:
+            print("apply-resolution(treatment) error", e)
+            payload = _fallback_unrecoverable_from_exception(f"treatment 적용 재생성 실패: {str(e)}")
+            raise HTTPException(status_code=500, detail=payload)
+
+    # ── 컬럼 delta 경로(probe 옵션): snapshot → 적용 → 재생성 → persist/원복 ──
     allowed = {c.name for c in RosterConfig.__table__.columns}
     bad = [k for k in delta if k not in allowed]
     if bad:
@@ -301,7 +324,6 @@ async def apply_resolution_endpoint(
         raise HTTPException(status_code=404, detail="roster_config 를 찾을 수 없습니다.")
     cid = rc.config_id
     snapshot = {k: getattr(rc, k) for k in delta}
-    gen_req = RosterRequest(year=req.year, month=req.month, grade_strategy=req.grade_strategy)
     _keep = False  # persist 요청 + 재생성 성공 시에만 True → 원복 생략(영구 반영)
     try:
         for k, v in delta.items():

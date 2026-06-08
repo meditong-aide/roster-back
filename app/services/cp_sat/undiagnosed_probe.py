@@ -100,6 +100,40 @@ def to_resolution_options(probe_result: dict[str, Any], base_config: dict[str, A
     return opts
 
 
+def treatments_to_resolution_options(treatment_recommendations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ontology treatment_recommendations(번들) → 프론트용 통합 옵션 카드.
+
+    각 번들의 자동적용 가능(force_soft_mode/disable_module/set_threshold/narrow_scope)
+    treatment 들을 하나의 옵션으로 묶는다. data_correction_required(수동)는 manual_required 로
+    분리. probe 옵션과 달리 verified=False(클릭 시 재생성으로 실검증), apply(컬럼) 대신
+    treatment_ids 로 적용한다.
+    """
+    def _lbl(t: dict[str, Any]) -> str:
+        return t.get("config_key_label_ko") or t.get("target_family") or t.get("treatment_id") or "?"
+
+    opts: list[dict[str, Any]] = []
+    for b in (treatment_recommendations or []):
+        treatments = b.get("treatments") or []
+        auto = [t for t in treatments if t.get("action_type") != "data_correction_required"]
+        manual = [t for t in treatments if t.get("action_type") == "data_correction_required"]
+        if not auto:
+            continue  # 전부 수동(data_correction_required)이면 자동 적용 불가 → 옵션 제외
+        _bid = str(b.get("bundle_id") or "?")
+        opts.append({
+            "option_id": _bid if _bid.startswith("bundle") else "bundle:" + _bid,
+            "kind": "treatment_bundle", "source": "ontology", "verified": False,
+            "title_ko": " + ".join(_lbl(t) for t in auto),
+            "changes": [{"config_key": t.get("config_key"), "label_ko": _lbl(t),
+                         "direction": t.get("direction_label_ko") or t.get("direction"),
+                         "rationale_ko": t.get("rationale_ko")} for t in auto],
+            "trade_off_ko": " / ".join([t.get("trade_off_ko") for t in auto if t.get("trade_off_ko")]),
+            "treatment_ids": [t.get("treatment_id") for t in auto],
+            "manual_required": [t.get("treatment_id") for t in manual],
+            "apply": {},
+        })
+    return opts
+
+
 def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
     """완화 집합을 base 위에 적용(각 delta 는 base 기준으로 계산 — 누적 드리프트 방지)."""
     cfg = dict(base)
