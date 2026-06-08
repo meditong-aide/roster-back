@@ -97,7 +97,7 @@ from services.roster_service import (
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
-from services.group_access import resolve_effective_group
+from services.group_access import resolve_effective_group, resolve_home_group_id
 from services.weekly_off_service import get_nurses_weekly_off_service
 from services.assignment_service import transfer_shifts_on_publish, get_transfer_logs, get_transferred_wanted
 from utils.utils import send_roster_publish_push, send_roster_republish_push
@@ -164,12 +164,11 @@ async def get_config_versions(
     """현재 대상 그룹의 설정 버전 목록 조회 (HN/ADM)."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if current_user.is_master_admin:
-        target_group_id = group_id
-        target_office_id = current_user.office_id
-    else:
-        target_group_id = current_user.group_id
-        target_office_id = current_user.office_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 office-wide(None).
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
+    target_office_id = current_user.office_id
 
     try:
         versions = (
@@ -205,12 +204,11 @@ async def get_config_by_version(
     print("[/config/version/{config_version}] current_user", current_user.__dict__)
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if current_user.is_master_admin:
-        target_group_id = group_id
-        target_office_id = current_user.office_id
-    else:
-        target_group_id = current_user.group_id
-        target_office_id = current_user.office_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 office-wide(None).
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
+    target_office_id = current_user.office_id
 
     # load latest config for target
     config = (
@@ -376,13 +374,15 @@ async def get_latest_schedule(
     try:
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        if current_user.is_master_admin:
-            target_group_id = group_id
-        else:
-            target_group_id = current_user.group_id
+        # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 office-wide(None).
+        target_group_id = resolve_effective_group(
+            db, current_user, group_id, require_group=False
+        )
         return get_latest_schedule_service(
             current_user, db, override_group_id=target_group_id
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         print(
             "[DEBUG] [roster.py - get_latest_schedule] current_user",
@@ -698,27 +698,10 @@ async def get_schedule_status(
     db: Session = Depends(get_db),
 ):
     try:
-        override_gid: Optional[str] = None
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        if current_user.is_head_nurse and current_user.group_id:
-            override_gid = None
-        elif getattr(current_user, "is_master_admin", False):
-            if not group_id:
-                raise HTTPException(
-                    status_code=400, detail="group_id is required for admin"
-                )
-            g = db.query(Group).filter(Group.group_id == group_id).first()
-            if not g:
-                raise HTTPException(status_code=404, detail="Group not found")
-            if (
-                getattr(current_user, "office_id", None)
-                and current_user.office_id != g.office_id
-            ):
-                raise HTTPException(
-                    status_code=403, detail="Group does not belong to your office"
-                )
-            override_gid = g.group_id
+        # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+        override_gid = resolve_effective_group(db, current_user, group_id)
         return get_schedule_status_service(
             year, month, current_user, db, override_group_id=override_gid
         )
@@ -1044,10 +1027,10 @@ async def get_schedule_versions(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if current_user.is_master_admin:
-        target_group_id = group_id
-    else:
-        target_group_id = current_user.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 office-wide(None).
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
 
     schedules = (
         db.query(Schedule)
@@ -1091,27 +1074,8 @@ async def get_roster_for_month(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # 대상 그룹 결정
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        # if not getattr(current_user, 'is_master_admin', False):
-        #     raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(
-                status_code=400, detail="group_id is required for admin"
-            )
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if (
-            getattr(current_user, "office_id", None)
-            and current_user.office_id != g.office_id
-        ):
-            raise HTTPException(
-                status_code=403, detail="Group does not belong to your office"
-            )
-        target_group_id = g.group_id
+    # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+    target_group_id = resolve_effective_group(db, current_user, group_id)
     print("target_group_id1", target_group_id)
     # Get latest issued schedule for the month
     schedule_info = (
@@ -1523,27 +1487,13 @@ async def get_roster_for_month(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹 결정
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, "is_master_admin", False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(
-                status_code=400, detail="group_id is required for admin"
-            )
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if (
-            getattr(current_user, "office_id", None)
-            and current_user.office_id != g.office_id
-        ):
-            raise HTTPException(
-                status_code=403, detail="Group does not belong to your office"
-            )
-        target_group_id = g.group_id
+    # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    if not (
+        current_user.is_head_nurse
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     # Get latest issued schedule for the month
     schedule_info = (
@@ -1754,11 +1704,10 @@ async def get_submission_statuses(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
-    if group_id:
-        target_group_id = group_id
-    else:
-        target_group_id = current_user.group_id
+    # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(비ADM 은 managed 검증).
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
 
     # 대상 그룹의 간호사 수집
     nurses_in_group = (
@@ -1804,24 +1753,8 @@ async def get_schedule_status(
     if getattr(current_user, "is_head_nurse", False) or getattr(
         current_user, "is_master_admin", False
     ):
-        if current_user.is_head_nurse and current_user.group_id:
-            target_group_id = current_user.group_id
-        else:
-            if not group_id:
-                raise HTTPException(
-                    status_code=400, detail="group_id is required for admin"
-                )
-            g = db.query(Group).filter(Group.group_id == group_id).first()
-            if not g:
-                raise HTTPException(status_code=404, detail="Group not found")
-            if (
-                getattr(current_user, "office_id", None)
-                and current_user.office_id != g.office_id
-            ):
-                raise HTTPException(
-                    status_code=403, detail="Group does not belong to your office"
-                )
-            target_group_id = g.group_id
+        # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+        target_group_id = resolve_effective_group(db, current_user, group_id)
         schedules = (
             db.query(Schedule)
             .filter(
@@ -1839,11 +1772,12 @@ async def get_schedule_status(
             "schedule_count": len(schedules),
         }
 
-    # 일반 간호사인 경우 - 최신 선호도 데이터 조회
+    # 일반 간호사인 경우 - 최신 선호도 데이터 조회. 본인 그룹은 토큰 대신 DB home.
+    _home_gid = resolve_home_group_id(db, current_user)
     schedule = (
         db.query(Schedule)
         .filter(
-            Schedule.group_id == current_user.group_id,
+            Schedule.group_id == _home_gid,
             Schedule.year == year,
             Schedule.month == month,
         )
@@ -1938,34 +1872,17 @@ async def validate_roster(
             status_code=400, detail="Missing required fields: year, month, roster"
         )
 
+    # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+    # (try 밖에서 호출해 403/400 이 except Exception 에 500 으로 먹히지 않게 함)
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+    office_id = current_user.office_id
+
     try:
         # ──────────────────────── 1. “base-code ↔️ 파생코드” 매핑 만들기 ────────────────────────
         #
         #  * 같은 nurse_class라도, 사전에 등록된 교대(slot) 기준으로만 조회
         #  * codes 열(JSON) 에 들어있는 파생 코드를 본교대(main_code) 로 매핑
         from db.models import ShiftManage, Nurse, RosterConfig  # local import
-
-        # 대상 그룹/오피스 결정
-        if current_user.is_head_nurse and current_user.group_id:
-            office_id = current_user.office_id
-            target_group_id = current_user.group_id
-        else:
-            if not group_id:
-                raise HTTPException(
-                    status_code=400, detail="group_id is required for admin"
-                )
-            g = db.query(Group).filter(Group.group_id == group_id).first()
-            if not g:
-                raise HTTPException(status_code=404, detail="Group not found")
-            if (
-                getattr(current_user, "office_id", None)
-                and current_user.office_id != g.office_id
-            ):
-                raise HTTPException(
-                    status_code=403, detail="Group does not belong to your office"
-                )
-            office_id = g.office_id
-            target_group_id = g.group_id
 
         shift_rows = (
             db.query(ShiftManage)
@@ -2319,10 +2236,11 @@ async def export_schedule_excel(
     try:
         from services.excel_service import export_schedule_excel_bytes
 
-        if group_id in [None, "", "null", "undefined", "None"]:
-            target_group_id = current_user.group_id
-        else:
-            target_group_id = group_id
+        # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(비ADM 은 managed 검증).
+        _gid = None if group_id in [None, "", "null", "undefined", "None"] else group_id
+        target_group_id = resolve_effective_group(
+            db, current_user, _gid, require_group=False
+        )
         data = export_schedule_excel_bytes(
             schedule_id, current_user, db, target_group_id
         )
@@ -2335,6 +2253,8 @@ async def export_schedule_excel(
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         print(f"[export_schedule_excel] 오류: {e}")
         raise HTTPException(status_code=500, detail=f"엑셀 생성 실패: {str(e)}")
@@ -2343,29 +2263,13 @@ async def export_schedule_excel(
 def _get_target_group_id(
     current_user: UserSchema, group_id_param: Optional[str], db: Session
 ) -> str:
-    """대상 그룹 결정 로직 (기존 코드 재사용)"""
-    if current_user.is_head_nurse and current_user.group_id:
-        return current_user.group_id
-
-    if not getattr(current_user, "is_master_admin", False):
-        raise HTTPException(status_code=403, detail="Permission denied")
-
-    if not group_id_param:
-        raise HTTPException(status_code=400, detail="group_id is required for admin")
-
-    g = db.query(Group).filter(Group.group_id == group_id_param).first()
-    if not g:
-        raise HTTPException(status_code=404, detail="Group not found")
-
-    if (
-        getattr(current_user, "office_id", None)
-        and current_user.office_id != g.office_id
+    """대상 그룹 결정 (관리자 전용). 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석."""
+    if not (
+        current_user.is_head_nurse
+        or getattr(current_user, "is_master_admin", False)
     ):
-        raise HTTPException(
-            status_code=403, detail="Group does not belong to your office"
-        )
-
-    return g.group_id
+        raise HTTPException(status_code=403, detail="Permission denied")
+    return resolve_effective_group(db, current_user, group_id_param)
 
 
 def _get_next_version(db: Session, group_id: str, year: int, month: int) -> int:
