@@ -1421,6 +1421,8 @@ class CPSATBasicEngine:
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
+                # 폴백 결과 진단 — primary 경로의 [N균등-결과]/[HardViolations]를 폴백에도 노출(log-only, 솔버 무영향)
+                _log_post_solve_result_diagnostics(roster_system, self.logger_prefix)
             # if not success and not fallback_success:
             #     raise RuntimeError("HARD_INFEASIBLE: stage1/fallback 모두 해 없음")
         # 9-1. 불필요 OFF 정리 (N-only 제외)
@@ -4944,6 +4946,48 @@ def _log_grade_hard_blocker_probe(
         print(f"[CP-SAT-Basic][Diag][GradeHardProbe] probe failed: {exc}")
         setattr(rs, "_grade_hard_probe_msg", f"[PROBE_ERROR] {exc}")
 # TEMP-PROBE-DELETE-END
+
+
+# 폴백 결과 진단용 하드위반 타입 — primary 경로의 로컬 HARD_TYPES(동일 의미)와 동기화 유지
+_FALLBACK_DIAG_HARD_TYPES = {
+    'shift_requirement', 'night_consecutive',
+    'consecutive_work', 'night_nd', 'night_ne',
+    'eve_ed', 'night_month_limit',
+    'not_one_night', 'rec_2n2o', 'rec_3n2o',
+    'initial_forbidden', 'weekend_off_only',
+    'consecutive_4off', 'cross_month_4off',
+}
+
+
+def _log_post_solve_result_diagnostics(roster_system, logger_prefix: str) -> None:
+    """최종 roster 결과 진단(N 균등 분배 + 하드위반 요약)을 로깅한다.
+
+    solve 종료 후 결과 roster만 읽어 출력하므로 솔버 동작/시간/품질에 무영향(log-only).
+    primary 경로의 [N균등-결과]/[HardViolations] 로그를 폴백 경로에도 동일 노출하기 위함.
+    """
+    try:
+        log_n_even_distribution(roster_system, logger_prefix)
+    except Exception as exc:
+        print(f"{logger_prefix} [N균등-결과] 로그 실패(무시): {exc}")
+    try:
+        violations = [
+            v for v in roster_system._find_violations()
+            if v.get('type') in _FALLBACK_DIAG_HARD_TYPES
+        ]
+        by_type: dict[str, int] = {}
+        for v in violations:
+            t = str(v.get('type') or 'unknown')
+            by_type[t] = by_type.get(t, 0) + 1
+        print(f"{logger_prefix} [HardViolations] total={len(violations)}, by_type={by_type}")
+        for v in violations[:12]:
+            print(
+                f"{logger_prefix} [HardViolations] "
+                f"type={v.get('type')}, "
+                f"nurse={v.get('nurse_name') or v.get('name') or '?'}({v.get('nurse_id') or '?'}), "
+                f"day={v.get('day')}, detail={v.get('detail') or v.get('message') or ''}"
+            )
+    except Exception as exc:
+        print(f"{logger_prefix} [HardViolations] 로그 실패(무시): {exc}")
 
 
 def _log_shift_requirement_gaps(rs) -> None:
