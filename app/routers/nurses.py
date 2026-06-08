@@ -72,6 +72,7 @@ from services.nurse_monthly_limit_service import (
     list_nurse_monthly_limits_service,
     upsert_nurse_monthly_limits_service,
 )
+from services.group_access import resolve_home_group_id, resolve_effective_group
 from services.excel_service import (
     create_nurse_template,
     # process_excel_upload,
@@ -235,6 +236,7 @@ async def get_nurses_in_group(
 @router.post("/sequence/save")
 async def save_nurse_sequence(
     req: NurseSequenceUpdate,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -242,9 +244,13 @@ async def save_nurse_sequence(
     단일 간호사 이동/상태변경 (드래그앤드롭 중간 저장 용도)
     """
     try:
+        # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
+        gid = resolve_effective_group(db, current_user, group_id)
         return move_nurse_with_active_service(
-            req.nurse_id, req.new_sequence, req.active, current_user, db
+            req.nurse_id, req.new_sequence, req.active, current_user, db, group_id=gid
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 순서 변경 실패: {str(e)}")
 
@@ -252,6 +258,7 @@ async def save_nurse_sequence(
 @router.post("/sequence/reorder")
 async def reorder_nurses(
     payload: ReorderPayload,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -260,9 +267,13 @@ async def reorder_nurses(
     프론트에서는 active 리스트와 inactive 리스트의 nurse_id 배열을 넘겨주세요.
     """
     try:
+        # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
+        gid = resolve_effective_group(db, current_user, group_id)
         return reorder_nurses_service(
-            payload.active_order, payload.inactive_order, current_user, db
+            payload.active_order, payload.inactive_order, current_user, db, group_id=gid
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"일괄 재정렬 실패: {str(e)}")
 
@@ -275,10 +286,13 @@ async def bulk_update_nurses(
     db: Session = Depends(get_db),
 ):
     try:
-        # ADM이 group_id를 지정하면 해당 병동을 대상으로 업데이트 허용
+        # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 None(서비스 폴백).
+        gid = resolve_effective_group(db, current_user, group_id, require_group=False)
         return bulk_update_nurses_service(
-            nurses_data, current_user, db, override_group_id=group_id
+            nurses_data, current_user, db, override_group_id=gid
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         print("error1", e)
         raise HTTPException(
@@ -502,8 +516,10 @@ async def add_nurses_to_group(
                 status_code=400, detail="office_id를 확인할 수 없습니다."
             )
 
+        # 대상 그룹을 호출자가 관리하는지 검증(HN=groups.hn_id / ADM=office). 토큰 group_id 무관.
+        target_gid = resolve_effective_group(db, current_user, payload.group_id)
         result = add_nurses_to_group_service(
-            payload.nurse_ids, payload.group_id, office_id, db
+            payload.nurse_ids, target_gid, office_id, db
         )
         return result
     except HTTPException:
@@ -1121,12 +1137,14 @@ async def get_nurse_by_id(
                 )
             except Exception:
                 result = None
-        # 같은 그룹에 없으면 → 파견/병동이동 인바운드 여부 확인 후 직접 조회
+        # 같은 그룹에 없으면 → 파견/병동이동 인바운드 여부 확인 후 직접 조회.
+        # 보는 그룹은 토큰 group_id 대신 nurse_id→DB home group 으로 판정(그룹전환 안전).
         if not result:
             from db.models import NurseAssignment
+            _viewer_gid = resolve_home_group_id(db, current_user)
             has_inbound = db.query(NurseAssignment).filter(
                 NurseAssignment.nurse_id == nurse_id,
-                NurseAssignment.target_group_id == current_user.group_id,
+                NurseAssignment.target_group_id == _viewer_gid,
                 NurseAssignment.reason.in_(["파견", "병동이동"]),
                 NurseAssignment.status == "active",
             ).first()

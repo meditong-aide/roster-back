@@ -97,6 +97,7 @@ from services.roster_service import (
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
+from services.group_access import resolve_effective_group
 from services.weekly_off_service import get_nurses_weekly_off_service
 from services.assignment_service import transfer_shifts_on_publish, get_transfer_logs, get_transferred_wanted
 from utils.utils import send_roster_publish_push, send_roster_republish_push
@@ -405,13 +406,16 @@ async def get_issued_schedules(
     try:
         if not current_user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        if current_user.is_master_admin:
-            target_group_id = group_id
-        else:
-            target_group_id = current_user.group_id
+        # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
+        # ADM 은 group_id 미지정 시 office-wide(None).
+        target_group_id = resolve_effective_group(
+            db, current_user, group_id, require_group=False
+        )
         return get_issued_schedules_service(
             current_user, db, target_group_id=target_group_id
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         print("[/issued] error", e)
         raise HTTPException(
@@ -437,54 +441,17 @@ async def get_issued_roster_snapshot(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     try:
-        # 대상 그룹 결정
-        if current_user.is_master_admin:
-            target_group_id = group_id
-        else:
-            target_group_id = current_user.group_id
-            # 본인 파견/병동이동 target_group_id 도 허용 (병동 전환 Select 용).
-            # 조회월(±6일 N_tail 버퍼) 과 파견 기간 overlap 체크:
-            # - 5/1~5/8 파견 → 4월(prev context) + 5월 허용
-            # - 5/1~5/31 파견 → 5월 + 6월(tail context) 허용
-            # - 조회월에 전혀 무관한 파견은 403
-            if group_id and group_id != target_group_id:
-                _my_nid = getattr(current_user, "nurse_id", None)
-                _my_dispatch = None
-                if _my_nid:
-                    from datetime import date as _date, timedelta as _td
-                    from calendar import monthrange as _mr
-                    from sqlalchemy import or_ as _or_, case as _case
-                    _lookback = 6
-                    _m_start = _date(year, month, 1)
-                    _m_end = _date(year, month, _mr(year, month)[1])
-                    _view_start = _m_start - _td(days=_lookback)
-                    _view_end = _m_end + _td(days=_lookback)
-                    _eff_end = _case(
-                        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
-                        else_=NurseAssignment.expected_end_date,
-                    )
-                    _my_dispatch = (
-                        db.query(NurseAssignment)
-                        .filter(
-                            NurseAssignment.nurse_id == _my_nid,
-                            NurseAssignment.target_group_id == group_id,
-                            NurseAssignment.reason.in_(["파견", "병동이동"]),
-                            NurseAssignment.status == "active",
-                            NurseAssignment.start_date <= _view_end,
-                            _or_(
-                                _eff_end.is_(None),
-                                _eff_end >= _view_start,
-                            ),
-                        )
-                        .first()
-                    )
-                if _my_dispatch:
-                    target_group_id = group_id
-                else:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="해당 그룹 근무표 조회 권한이 없습니다.",
-                    )
+        # 대상 그룹 결정: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+        # 본인 파견/병동이동(active) target 그룹은 조회월(±6일) overlap 시 허용(병동전환 Select).
+        # ADM 은 group_id 미지정 시 office-wide(None).
+        target_group_id = resolve_effective_group(
+            db,
+            current_user,
+            group_id,
+            require_group=False,
+            allow_assignment_target=True,
+            assignment_window=(year, month),
+        )
 
         snapshot = get_issued_roster_snapshot_service(
             year=year,
@@ -824,27 +791,13 @@ async def get_roster_by_schedule_id(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # 대상 그룹 결정
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, "is_master_admin", False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(
-                status_code=400, detail="group_id is required for admin"
-            )
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if (
-            getattr(current_user, "office_id", None)
-            and current_user.office_id != g.office_id
-        ):
-            raise HTTPException(
-                status_code=403, detail="Group does not belong to your office"
-            )
-        target_group_id = g.group_id
+    # 관리자(HN/ADM)만 조회 가능. 그룹은 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    if not (
+        current_user.is_head_nurse
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     # Get schedule info
     schedule = (
@@ -1271,12 +1224,16 @@ async def get_prev_month_tail(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
     return get_prev_month_tail_service(
         year=year,
         month=month,
         schedule_id=schedule_id,
         tail_days=tail_days,
-        group_id=group_id,
+        group_id=target_group_id,
         current_user=current_user,
         db=db,
     )

@@ -20,6 +20,7 @@ from schemas.roster_schema import (
     ToggleEntryResponse,
 )
 from services.graph_service import graph_service
+from services.group_access import resolve_effective_group
 from routers.auth import get_current_user_from_cookie
 from utils.utils import send_wanted_close_push, send_wanted_deadline_update_push
 from db.client2 import get_db
@@ -810,18 +811,8 @@ async def get_wanted_adjustment(
     if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
-    # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
         result = get_wanted_adjustment_service(db, target_group_id, year, month)
@@ -1043,19 +1034,13 @@ async def get_all_shift_requests(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 관리자(HN/ADM)만 조회. 그룹은 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    if not (
+        getattr(current_user, 'is_head_nurse', False)
+        or getattr(current_user, 'is_master_admin', False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     results = get_shift_requests_service(db, target_group_id, year, month, shift_type)
     return {"results": results}

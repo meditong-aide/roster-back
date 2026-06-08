@@ -532,6 +532,7 @@ def move_nurse_with_active_service(
     target_active: Optional[int],
     current_user,
     db: Session,
+    group_id: Optional[str] = None,
 ):
     """
     간호사 이동/상태변경을 단일 트랜잭션으로 처리.
@@ -539,16 +540,27 @@ def move_nurse_with_active_service(
     - target_active가 0/1이면 해당 상태 리스트로 이동 후 삽입
     """
     if not current_user:
-        raise Exception("Not authenticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
     # 수간호사 또는 마스터관리자만 허용
     if not (
         getattr(current_user, "is_head_nurse", False)
         or getattr(current_user, "is_master_admin", False)
     ):
-        raise Exception("Permission denied")
+        raise HTTPException(status_code=403, detail="Permission denied")
 
-    # ADM은 group_id가 없을 수 있으므로 nurse_id만으로 조회 후 대상 그룹을 결정
-    if getattr(current_user, "is_master_admin", False) and not getattr(
+    # 그룹 결정 우선순위: (1) 라우터가 검증해 넘긴 group_id(토큰 무관, nurse_id→DB+hn_id),
+    # (2) ADM 무지정 시 nurse_id 로 조회, (3) 레거시 토큰 group_id.
+    if group_id:
+        target_group_id = group_id
+        nurse = (
+            db.query(NurseModel)
+            .filter(
+                NurseModel.group_id == group_id,
+                NurseModel.nurse_id == nurse_id,
+            )
+            .first()
+        )
+    elif getattr(current_user, "is_master_admin", False) and not getattr(
         current_user, "group_id", None
     ):
         nurse = (
@@ -603,7 +615,11 @@ def move_nurse_with_active_service(
 
 
 def reorder_nurses_service(
-    active_order: List[str], inactive_order: List[str], current_user, db: Session
+    active_order: List[str],
+    inactive_order: List[str],
+    current_user,
+    db: Session,
+    group_id: Optional[str] = None,
 ):
     """
     드래그앤드롭 완료 시점에 한 번 호출하여
@@ -612,11 +628,12 @@ def reorder_nurses_service(
     - 전달되지 않은 간호사는 상태/순서 변경하지 않음(React 측에서 전체 보냄을 권장)
     """
     if not current_user:
-        raise Exception("Not authenticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
     if not current_user.is_head_nurse:
-        raise Exception("Permission denied")
+        raise HTTPException(status_code=403, detail="Permission denied")
 
-    group_id = current_user.group_id
+    # 라우터가 검증해 넘긴 group_id(토큰 무관) 우선, 없으면 레거시 토큰 폴백.
+    group_id = group_id or current_user.group_id
     id_to_nurse = {
         n.nurse_id: n
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id).all()

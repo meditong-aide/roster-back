@@ -783,8 +783,13 @@ def get_my_issued_roster_service(
     로그인 사용자 본인의 발행된 근무표만 조회합니다.
     snapshot의 roster_json에서 nurse_id 기준으로 추출.
     """
+    # 토큰 group_id 대신 nurse_id→DB home group 으로 스냅샷 조회(그룹전환/소속변경 안전).
+    from services.group_access import resolve_home_group_id
+
+    home_gid = resolve_home_group_id(db, current_user)
     snapshot_data = get_issued_roster_snapshot_service(
-        year=year, month=month, current_user=current_user, db=db
+        year=year, month=month, current_user=current_user, db=db,
+        target_group_id=home_gid,
     )
     if not snapshot_data:
         return None
@@ -810,7 +815,7 @@ def get_my_issued_roster_service(
     days_in_month = monthrange(year, month)[1]
     m_start = date(year, month, 1)
     m_end = date(year, month, days_in_month)
-    src_gid = getattr(current_user, "group_id", "") or ""
+    src_gid = home_gid or ""
     src_group_row = (
         db.query(Group).filter(Group.group_id == src_gid).first() if src_gid else None
     )
