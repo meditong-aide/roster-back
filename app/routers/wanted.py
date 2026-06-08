@@ -104,21 +104,13 @@ async def get_wanted_status(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        from db.models import Group
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    if not (
+        getattr(current_user, 'is_head_nurse', False)
+        or getattr(current_user, 'is_master_admin', False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     wanted = db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
@@ -147,21 +139,13 @@ async def get_submission_statuses(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        from db.models import Group
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    if not (
+        getattr(current_user, 'is_head_nurse', False)
+        or getattr(current_user, 'is_master_admin', False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     # Get all nurses in the target group
     nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
@@ -196,11 +180,12 @@ async def get_all_wanted(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
+    # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(비ADM 은 managed 검증).
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
     wanted_list = db.query(Wanted).filter(
-        Wanted.group_id == current_user.group_id
+        Wanted.group_id == target_group_id
     ).order_by(Wanted.year.desc(), Wanted.month.desc()).all()
     return [{
         "year": wanted.year,
@@ -549,18 +534,8 @@ async def get_wanted_config_endpoint(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹 결정
-    if getattr(current_user, 'is_master_admin', False) and group_id:
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
-    elif current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        raise HTTPException(status_code=400, detail="소속 그룹이 없습니다. group_id를 지정해주세요.")
+    # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     # 필터 구성
     filters = {}
@@ -727,20 +702,13 @@ async def validate_wanted_limits_endpoint(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    if not (
+        getattr(current_user, 'is_head_nurse', False)
+        or getattr(current_user, 'is_master_admin', False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
         # 문자열 날짜를 date 객체로 변환
@@ -980,18 +948,8 @@ async def get_fixed_wanted(
     if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
-    # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
         # 엔트리 목록 조회 (단일 테이블)
