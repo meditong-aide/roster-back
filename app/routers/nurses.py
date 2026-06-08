@@ -178,8 +178,9 @@ async def get_nurses_in_group(
         getattr(current_user, "office_id", None),
         getattr(current_user, "office_name", None),
     )
+    # 그룹 스코프: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(비ADM 은 managed 검증).
+    _group = resolve_effective_group(db, current_user, group_id, require_group=False)
     # 병동이동 레이지 체크
-    _group = group_id or getattr(current_user, "group_id", None)
     if _group:
         flush_pending_transfers(db, _group)
     # 프리셉티 만료 레이지 체크
@@ -209,6 +210,7 @@ async def get_nurses_in_group(
             current_user,
             db,
             nurse_id=nurse_id,  # nurse_id 전달
+            view_group_id=_group,
         )
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)

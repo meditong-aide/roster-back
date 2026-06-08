@@ -6,6 +6,7 @@ from db.client2 import get_db
 from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie
+from services.group_access import resolve_effective_group
 from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
 from services.shift_service import (
     get_shifts_service as get_shifts_service_mysql,
@@ -310,26 +311,12 @@ async def get_shift_manage(
     except Exception as e:
         print('[/shift-manage/{class_name}]:', e)
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # 대상 그룹/오피스 결정
-    if group_id:
-        if not current_user or not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 조회가 가능합니다.")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g or g.office_id != current_user.office_id:
-            raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
-        office_id = g.office_id
-        target_group_id = g.group_id
-    else:
-        # 토큰 정보 우선 활용(ADM과 같이 Nurse 레코드가 없는 경우 대비)
-        if getattr(current_user, 'office_id', None) and getattr(current_user, 'group_id', None):
-            office_id = current_user.office_id
-            target_group_id = current_user.group_id
-        else:
-            nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-            if not nurse or not nurse.group:
-                raise HTTPException(status_code=404, detail="User group information not found")
-            office_id = nurse.group.office_id
-            target_group_id = current_user.group_id
+    # 대상 그룹/오피스: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    # (ADM=office 내 임의 / HN=관리 그룹 / 일반=home, 미지정 시 home)
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
+    office_id = current_user.office_id
 
     # class_name 정규화: '', 'null', 'undefined'를 미지정으로 간주
     raw_class = class_name.strip().lower() if isinstance(class_name, str) else None

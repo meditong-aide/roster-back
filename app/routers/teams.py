@@ -15,7 +15,7 @@ from services.ward_redistribute_service import (
     apply_ward_redistribution,
     WardSetupError,
 )
-from services.group_access import resolve_managed_group_ids
+from services.group_access import resolve_managed_group_ids, resolve_effective_group
 
 
 router = APIRouter(prefix="/teams", tags=["teams"])
@@ -123,11 +123,13 @@ async def get_teams(
     db: Session = Depends(get_db),
 ):
     try:
-        if current_user.is_master_admin:
-            target_group_id = group_id
-        else:
-            target_group_id = current_user.group_id
+        # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 office-wide None).
+        target_group_id = resolve_effective_group(
+            db, current_user, group_id, require_group=False
+        )
         return list_teams_with_members(db, current_user.office_id, target_group_id)
+    except HTTPException:
+        raise
     except Exception as e:
         print('[DEBUG] [teams.py - get_teams] office_id', current_user.office_id)
         print('[DEBUG] [teams.py - get_teams] group_id', group_id)

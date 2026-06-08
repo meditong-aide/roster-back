@@ -206,6 +206,7 @@ def _load_preceptees_map(db: Session, nurses) -> Dict[str, List[Dict[str, Any]]]
 def get_nurses_in_group_service(
     current_user, db: Session, nurse_id: Optional[str] = None,
     skip_group_filter: bool = False,
+    view_group_id: Optional[str] = None,
 ):
     """
     그룹 내 간호사 목록 조회 서비스 함수
@@ -216,17 +217,21 @@ def get_nurses_in_group_service(
     if not current_user:
         raise Exception("Not authenticated")
 
+    # 그룹 스코프: 라우터가 검증해 넘긴 view_group_id(토큰 무관, nurse_id→DB+hn_id) 우선,
+    # 없으면 레거시 토큰 group_id 폴백.
+    _gid = view_group_id or getattr(current_user, "group_id", None)
+
     query = db.query(NurseModel)
 
     # 그룹 ID 필터링: source(nurses.group_id) + inbound(assignment.target_group_id)
     # 정책: status='active' 인 inbound assignment 가 있는 nurse 는 미래 시작 여부와 무관하게 노출.
     #   - source 측: Nurse.group_id 매칭으로 outbound nurse 도 자연 노출 (양쪽 노출).
     #   - 실근무 일자가 아닌 셀은 솔버의 active_window/blocked_days 로 제외되므로 안전.
-    if not skip_group_filter and current_user.group_id:
+    if not skip_group_filter and _gid:
         _inbound_subq = (
             db.query(NurseAssignment.nurse_id)
             .filter(
-                NurseAssignment.target_group_id == current_user.group_id,
+                NurseAssignment.target_group_id == _gid,
                 NurseAssignment.status == "active",
                 NurseAssignment.reason.in_(_INBOUND_REASONS),
             )
@@ -238,15 +243,15 @@ def get_nurses_in_group_service(
         _outbound_transfer_subq = (
             db.query(NurseAssignment.nurse_id)
             .filter(
-                NurseAssignment.source_group_id == current_user.group_id,
-                NurseAssignment.target_group_id != current_user.group_id,
+                NurseAssignment.source_group_id == _gid,
+                NurseAssignment.target_group_id != _gid,
                 NurseAssignment.reason == "병동이동",
             )
             .subquery()
         )
         query = query.filter(
             or_(
-                NurseModel.group_id == current_user.group_id,
+                NurseModel.group_id == _gid,
                 NurseModel.nurse_id.in_(select(_inbound_subq.c.nurse_id)),
                 NurseModel.nurse_id.in_(select(_outbound_transfer_subq.c.nurse_id)),
             )
