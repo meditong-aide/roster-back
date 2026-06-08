@@ -1421,7 +1421,8 @@ class CPSATBasicEngine:
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
-                # 폴백 결과 진단 — primary 경로의 [N균등-결과]/[HardViolations]를 폴백에도 노출(log-only, 솔버 무영향)
+                # 폴백 결과 진단(log-only, 솔버 무영향) — [HardViolations] 요약 노출.
+                # N균등([N균등-결과])은 fallback_lex.py stage3에서 이미 출력하므로 여기선 제외.
                 _log_post_solve_result_diagnostics(roster_system, self.logger_prefix)
             # if not success and not fallback_success:
             #     raise RuntimeError("HARD_INFEASIBLE: stage1/fallback 모두 해 없음")
@@ -4960,15 +4961,11 @@ _FALLBACK_DIAG_HARD_TYPES = {
 
 
 def _log_post_solve_result_diagnostics(roster_system, logger_prefix: str) -> None:
-    """최종 roster 결과 진단(N 균등 분배 + 하드위반 요약)을 로깅한다.
+    """폴백 최종 roster의 [HardViolations] 요약을 로깅한다.
 
     solve 종료 후 결과 roster만 읽어 출력하므로 솔버 동작/시간/품질에 무영향(log-only).
-    primary 경로의 [N균등-결과]/[HardViolations] 로그를 폴백 경로에도 동일 노출하기 위함.
+    N 균등 분배([N균등-결과])는 폴백 stage3(fallback_lex.py)에서 이미 출력하므로 여기선 중복 제외.
     """
-    try:
-        log_n_even_distribution(roster_system, logger_prefix)
-    except Exception as exc:
-        print(f"{logger_prefix} [N균등-결과] 로그 실패(무시): {exc}")
     try:
         violations = [
             v for v in roster_system._find_violations()
