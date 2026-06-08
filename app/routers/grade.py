@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from db.client2 import get_db
 from db.models import Group
 from routers.auth import get_current_user_from_cookie
+from services.group_access import resolve_effective_group
 from schemas.auth_schema import User as UserSchema
 from schemas.grade_schema import GradeConfigResponse, GradeConfigUpsert
 from services.grade_service import (
@@ -22,22 +23,9 @@ router = APIRouter(
 def _resolve_group_and_office(
     db: Session, current_user: UserSchema = Depends(get_current_user_from_cookie), group_id: Optional[str] = None
 ) -> tuple[str, str]:
-    """유효한 group_id와 office_id를 반환합니다."""
-    if current_user.is_head_nurse and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id가 필요합니다.")
-        target_group_id = group_id
-
-    group = db.query(Group).filter(Group.group_id == target_group_id).first()
-    if not group:
-        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
-
-    if getattr(current_user, "office_id", None) and group.office_id != current_user.office_id:
-        raise HTTPException(status_code=403, detail="다른 오피스의 그룹입니다.")
-
-    return group.group_id, group.office_id
+    """유효한 group_id와 office_id를 반환합니다. 토큰 group_id 대신 nurse_id→DB + groups.hn_id."""
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+    return target_group_id, current_user.office_id
 
 
 @router.get("/config", response_model=GradeConfigResponse)
