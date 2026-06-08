@@ -147,10 +147,10 @@ async def put_teams(
 ):
     # if not current_user or (not current_user.is_head_nurse and not current_user.is_master_admin):
     #     raise HTTPException(status_code=403, detail="권한 없음")
-    if current_user.is_master_admin:
-        target_group_id = group_id
-    else:
-        target_group_id = current_user.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(비ADM 은 managed 검증).
+    target_group_id = resolve_effective_group(
+        db, current_user, group_id, require_group=False
+    )
     try:
         payload = [t.model_dump() for t in body.teams]
         return apply_team_ops(

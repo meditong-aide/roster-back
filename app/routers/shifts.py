@@ -391,21 +391,10 @@ async def save_shift_manage(
         if not current_user or (not current_user.is_head_nurse and not getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="Permission denied")
         
-        # Get current user's office_id
-        if group_id:
-            if not getattr(current_user, 'is_master_admin', False):
-                raise HTTPException(status_code=403, detail="마스터 관리자만 다른 병동 저장이 가능합니다.")
-            g = db.query(Group).filter(Group.group_id == group_id).first()
-            if not g or g.office_id != current_user.office_id:
-                raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
-            office_id = g.office_id
-            target_group_id = g.group_id
-        else:
-            nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-            if not nurse or not nurse.group:
-                raise HTTPException(status_code=404, detail="User group information not found")
-            office_id = nurse.group.office_id
-            target_group_id = current_user.group_id
+        # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+        # HN 도 관리(hn_id) 그룹이면 저장 가능.
+        target_group_id = resolve_effective_group(db, current_user, group_id)
+        office_id = current_user.office_id
         print(1)
         # 기존 데이터 삭제 (특정 클래스의 모든 슬롯)
         db.query(ShiftManage).filter(
@@ -434,6 +423,8 @@ async def save_shift_manage(
             db.add(shift_manage)
         print(3)
         db.commit()
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"시프트 관리 설정 저장 실패: {str(e)}")

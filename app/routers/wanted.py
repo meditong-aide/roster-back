@@ -20,7 +20,7 @@ from schemas.roster_schema import (
     ToggleEntryResponse,
 )
 from services.graph_service import graph_service
-from services.group_access import resolve_effective_group
+from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id
 from routers.auth import get_current_user_from_cookie
 from utils.utils import send_wanted_close_push, send_wanted_deadline_update_push
 from db.client2 import get_db
@@ -71,21 +71,13 @@ async def request_wanted_shifts(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # 대상 그룹 결정 (HN: 본인 그룹, ADM: 쿼리로 지정)
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        override_gid = None
-    else:
-        if not getattr(current_user, 'is_master_admin', False):
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        from db.models import Group
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        override_gid = g.group_id
+    # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
+    if not (
+        getattr(current_user, 'is_head_nurse', False)
+        or getattr(current_user, 'is_master_admin', False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    override_gid = resolve_effective_group(db, current_user, group_id)
     try:
         result = request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
         return result
@@ -209,25 +201,15 @@ async def close_wanted_request(
     if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        from db.models import Group
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     wanted = db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == year,
         Wanted.month == month
     ).first()
-    
+
     if not wanted:
         raise HTTPException(status_code=404, detail="해당 월의 wanted 요청을 찾을 수 없습니다.")
     
@@ -261,18 +243,8 @@ async def update_wanted_deadline(
     if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        from db.models import Group
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400). 관리자 게이트는 상단 pre-gate.
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     wanted = db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
@@ -574,17 +546,8 @@ async def upsert_wanted_config_endpoint(
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400). 관리자 게이트는 상단 pre-gate.
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
         configs_list = [c.model_dump(exclude_unset=True) for c in config_data]
@@ -615,17 +578,8 @@ async def delete_wanted_config_endpoint(
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400). 관리자 게이트는 상단 pre-gate.
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     # 필터 구성
     filters = {}
@@ -664,17 +618,8 @@ async def delete_wanted_config_by_month_endpoint(
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400). 관리자 게이트는 상단 pre-gate.
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
         deleted_count = delete_wanted_config_by_month(db, target_group_id, year, month)
@@ -747,12 +692,14 @@ async def delete_excess_off_api(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    if not current_user.is_master_admin:
+    if current_user.is_master_admin:
         pass
-    elif current_user.is_head_nurse and current_user.group_id:
+    elif current_user.is_head_nurse:
+        # 토큰 group 대신 nurse_id→DB + groups.hn_id 로 관리 그룹 판정.
         target_nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
-        if not target_nurse or target_nurse.group_id != current_user.group_id:
-            raise HTTPException(403, "현재 속한 병동 내 간호사가 아닙니다.")
+        _managed = resolve_managed_group_ids(db, current_user)
+        if not target_nurse or str(target_nurse.group_id) not in _managed:
+            raise HTTPException(403, "관리하는 병동 내 간호사가 아닙니다.")
     else:
         raise HTTPException(403, "권한이 없습니다.")
 
@@ -810,17 +757,8 @@ async def save_fixed_wanted(
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400). 관리자 게이트는 상단 pre-gate.
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
         entries = save_fixed_wanted_service(db, target_group_id, current_user.nurse_id, req)
@@ -871,9 +809,10 @@ async def toggle_fixed_wanted_entry(
     if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
+    # 본인 병동(home)은 토큰 대신 nurse_id→DB 로 판정. ADM 은 None(office 범위).
     caller_group_id: Optional[str] = None
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        caller_group_id = current_user.group_id
+    if getattr(current_user, 'is_head_nurse', False):
+        caller_group_id = resolve_home_group_id(db, current_user)
 
     try:
         entry = toggle_fixed_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)
@@ -911,17 +850,8 @@ async def reset_fixed_wanted(
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
-    if getattr(current_user, 'is_head_nurse', False) and current_user.group_id:
-        target_group_id = current_user.group_id
-    else:
-        if not group_id:
-            raise HTTPException(status_code=400, detail="group_id is required for admin")
-        g = db.query(Group).filter(Group.group_id == group_id).first()
-        if not g:
-            raise HTTPException(status_code=404, detail="Group not found")
-        if getattr(current_user, 'office_id', None) and current_user.office_id != g.office_id:
-            raise HTTPException(status_code=403, detail="Group does not belong to your office")
-        target_group_id = g.group_id
+    # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400). 관리자 게이트는 상단 pre-gate.
+    target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
         result = reset_fixed_wanted_service(db, target_group_id, year, month)
