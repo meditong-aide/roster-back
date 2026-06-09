@@ -6,7 +6,7 @@ from db.client2 import get_db
 from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie
-from services.group_access import resolve_effective_group
+from services.group_access import resolve_effective_group, caller_is_head_nurse
 from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
 from services.shift_service import (
     get_shifts_service as get_shifts_service_mysql,
@@ -192,7 +192,7 @@ async def shift_upload_validate_endpoint(
 ):
     """근무코드 엑셀 업로드 - 검증"""
     try:
-        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+        if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
             content = await file.read()
@@ -218,7 +218,7 @@ async def shift_upload_confirm_endpoint(
 ):
     """근무코드 엑셀 업로드 - 확정 저장"""
     try:
-        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+        if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
 
         target_group_id = group_id
@@ -244,7 +244,7 @@ async def get_available_shift_imports(
 ):
     """현재 그룹에 없는 동일 오피스 내 다른 병동 근무코드 목록 조회"""
     try:
-        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+        if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
 
         office_id = getattr(current_user, "office_id", None)
@@ -267,7 +267,7 @@ async def import_shifts_to_group_endpoint(
 ):
     """선택된 근무코드를 동일 오피스 내 다른 병동에서 현재 그룹으로 가져오기"""
     try:
-        if not current_user or not (current_user.is_head_nurse or getattr(current_user, "is_master_admin", False)):
+        if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
 
         office_id = getattr(current_user, "office_id", None)
@@ -388,7 +388,7 @@ async def save_shift_manage(
     """
     print('current_user', current_user)
     try:
-        if not current_user or (not current_user.is_head_nurse and not getattr(current_user, "is_master_admin", False)):
+        if not current_user or (not caller_is_head_nurse(db, current_user) and not getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="Permission denied")
         
         # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).

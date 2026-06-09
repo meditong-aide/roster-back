@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from db.models import Nurse, NurseAssignment, NurseMonthlyLimit, RosterConfig
 from schemas.auth_schema import User as UserSchema
+from services.group_access import caller_is_head_nurse, resolve_home_group_id
 from schemas.roster_schema import (
     NurseMonthlyLimitItem,
     NurseMonthlyLimitMeta,
@@ -174,7 +175,7 @@ def list_nurse_monthly_limits_service(
 ) -> List[NurseMonthlyLimitItem]:
     if (
         not current_user.is_master_admin
-        and str(group_id) != str(current_user.group_id)
+        and str(group_id) != str(resolve_home_group_id(db, current_user))
     ):
         raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 조회할 수 없습니다.")
     rows = (
@@ -195,7 +196,7 @@ def _list_by_year_month(
     month: int,
     group_id: Optional[str] = None,
 ) -> Tuple[List[NurseMonthlyLimitItem], Optional[NurseMonthlyLimitMeta], List[NurseMonthlyLimitWarning]]:
-    gid = group_id or current_user.group_id
+    gid = group_id or resolve_home_group_id(db, current_user)
     q = db.query(NurseMonthlyLimit).filter(
         NurseMonthlyLimit.year == year,
         NurseMonthlyLimit.month == month,
@@ -225,7 +226,7 @@ def upsert_nurse_monthly_limits_service(
     month: int,
     limits: List[Dict[str, Any]],
 ) -> Tuple[List[NurseMonthlyLimitItem], Optional[NurseMonthlyLimitMeta], List[NurseMonthlyLimitWarning]]:
-    if not current_user.is_master_admin and not current_user.is_head_nurse:
+    if not current_user.is_master_admin and not caller_is_head_nurse(db, current_user):
         raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 수정할 수 있습니다.")
 
     if not limits:
@@ -237,7 +238,7 @@ def upsert_nurse_monthly_limits_service(
         row = _normalize_row(raw)
         if int(row.get("year")) != year or int(row.get("month")) != month:
             raise HTTPException(status_code=400, detail="요청 year/month와 항목 year/month가 일치해야 합니다.")
-        if not current_user.is_master_admin and str(row.get("group_id")) != str(current_user.group_id):
+        if not current_user.is_master_admin and str(row.get("group_id")) != str(resolve_home_group_id(db, current_user)):
             raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 수정할 수 없습니다.")
         scope = (
             str(row.get("nurse_id")),

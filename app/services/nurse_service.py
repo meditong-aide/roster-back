@@ -16,7 +16,7 @@ from db.models import (
     Shift,
 )
 from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP
-from services.group_access import resolve_managed_group_ids
+from services.group_access import resolve_managed_group_ids, caller_is_head_nurse, resolve_home_group_id, caller_is_hn
 from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any, Tuple
@@ -219,7 +219,7 @@ def get_nurses_in_group_service(
 
     # 그룹 스코프: 라우터가 검증해 넘긴 view_group_id(토큰 무관, nurse_id→DB+hn_id) 우선,
     # 없으면 레거시 토큰 group_id 폴백.
-    _gid = view_group_id or getattr(current_user, "group_id", None)
+    _gid = view_group_id or resolve_home_group_id(db, current_user)
 
     query = db.query(NurseModel)
 
@@ -275,7 +275,7 @@ def get_nurses_in_group_service(
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
 
     # roster_config에서 표시 설정 플래그 조회
-    display_flags = _get_display_flags(db, current_user.group_id)
+    display_flags = _get_display_flags(db, _gid)
 
     # 만 나이 계산
     current_date = date.today()
@@ -303,9 +303,9 @@ def get_nurses_in_group_service(
     inbound_blocks: Dict[str, Dict[str, Any]] = {}
     if nurses:
         _nids = [n.nurse_id for n in nurses]
-        if current_user.group_id:
-            inbound_map = _load_inbound_map(db, current_user.group_id, _nids)
-        inbound_blocks = _build_inbound_blocks(db, _nids, caller_group_id=current_user.group_id)
+        if _gid:
+            inbound_map = _load_inbound_map(db, _gid, _nids)
+        inbound_blocks = _build_inbound_blocks(db, _nids, caller_group_id=_gid)
 
     # preceptor → preceptees 배치 로드 (프리셉터 사이드 프로필에 N명 노출용)
     preceptees_map: Dict[str, List[Dict[str, Any]]] = _load_preceptees_map(db, nurses)
@@ -548,7 +548,7 @@ def move_nurse_with_active_service(
         raise HTTPException(status_code=401, detail="Not authenticated")
     # 수간호사 또는 마스터관리자만 허용
     if not (
-        getattr(current_user, "is_head_nurse", False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -634,11 +634,11 @@ def reorder_nurses_service(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not current_user.is_head_nurse:
+    if not caller_is_head_nurse(db, current_user):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 라우터가 검증해 넘긴 group_id(토큰 무관) 우선, 없으면 레거시 토큰 폴백.
-    group_id = group_id or current_user.group_id
+    group_id = group_id or resolve_home_group_id(db, current_user)
     id_to_nurse = {
         n.nurse_id: n
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id).all()
@@ -893,7 +893,7 @@ def move_nurse_service(req, current_user, db: Session):
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not current_user.is_head_nurse:
+    if not caller_is_head_nurse(db, current_user):
         raise Exception("Permission denied")
 
     nurse_to_move = (
@@ -1191,7 +1191,7 @@ def update_nurse_profile_service(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     is_admin = current_user.is_master_admin
-    is_head = current_user.is_head_nurse
+    is_head = caller_is_head_nurse(db, current_user)
 
     if not (is_admin or is_head):
         raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 수정할 수 있습니다.")
@@ -1248,12 +1248,12 @@ def update_nurse_profile_service(
     # 권한 검증:
     #   - 본인 group 과 동일하면 OK
     #   - 다른 group 인 경우 master_admin 또는 hn_auth=='HN'(그룹 관리자) 만 허용
-    _caller_view_group = view_group_id or current_user.group_id
+    _caller_view_group = view_group_id or resolve_home_group_id(db, current_user)
     if (
         view_group_id
         and view_group_id != current_user.group_id
         and not is_admin
-        and str(getattr(current_user, "hn_auth", "") or "").upper() != "HN"
+        and not caller_is_hn(db, current_user)
     ):
         raise HTTPException(
             status_code=403,
@@ -1683,7 +1683,7 @@ def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
         raise Exception("Not authenticated")
 
     # 권한 체크
-    if not (current_user.is_head_nurse or current_user.is_master_admin):
+    if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise Exception("Permission denied")
 
     # 대상 간호사 조회
@@ -1872,7 +1872,7 @@ def upload_profile_image_service(
         nurse.office_id or getattr(current_user, "office_id", None) or "unknown"
     )
     group_id = str(
-        nurse.group_id or getattr(current_user, "group_id", None) or "unknown"
+        nurse.group_id or resolve_home_group_id(db, current_user) or "unknown"
     )
     nurse_id = str(nurse.nurse_id)
     object_key = f"og-images/{office_id}/{group_id}/{nurse_id}/my-profile/{secrets.token_hex(16)}{ext}"

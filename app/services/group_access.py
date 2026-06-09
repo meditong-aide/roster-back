@@ -37,6 +37,46 @@ def resolve_home_group_id(db: Session, current_user: UserSchema) -> Optional[str
     return (nurse.group_id if nurse and nurse.group_id else current_user.group_id) or None
 
 
+def _caller_nurse(db: Session, current_user: UserSchema) -> Optional[NurseModel]:
+    """호출자의 nurses 행(account_id 기준). 없으면 None(ADM 등)."""
+    if current_user is None or not getattr(current_user, "account_id", None):
+        return None
+    return (
+        db.query(NurseModel)
+        .filter(NurseModel.account_id == current_user.account_id)
+        .first()
+    )
+
+
+def caller_is_head_nurse(db: Session, current_user: UserSchema) -> bool:
+    """수간호사 여부 — 토큰 대신 nurses(DB)에서 판정. ADM 은 nurse 행이 없어 False.
+
+    토큰 is_head_nurse 는 승급/강등 시 재발행 전까지 stale 하므로 DB 를 진실로 삼는다.
+    """
+    n = _caller_nurse(db, current_user)
+    return bool(n.is_head_nurse) if n else False
+
+
+def caller_is_hn(db: Session, current_user: UserSchema) -> bool:
+    """그룹관리자(HN) 여부 — 토큰 대신 nurses(DB).hn_auth 로 판정."""
+    n = _caller_nurse(db, current_user)
+    return bool(n) and str(n.hn_auth or "").upper() == "HN"
+
+
+def caller_is_manager(db: Session, current_user: UserSchema) -> bool:
+    """관리 권한 보유 여부: ADM(토큰 EmpAuthGbn) 또는 수간호사/그룹관리자(DB).
+
+    ADM 판정만 토큰을 쓴다(권위가 외부 mWorks 이고 인앱 그룹전환으로 stale 되지 않음).
+    수간호사/HN 은 DB 기준 — 토큰 재발행 없이 즉시 반영.
+    """
+    if current_user is not None and bool(current_user.is_master_admin):
+        return True
+    n = _caller_nurse(db, current_user)
+    if n is None:
+        return False
+    return bool(n.is_head_nurse) or str(n.hn_auth or "").upper() == "HN"
+
+
 def resolve_managed_group_ids(db: Session, current_user: UserSchema) -> List[str]:
     """관리 가능한 group_id 리스트 (office 내부, 중복 제거).
 
@@ -48,7 +88,7 @@ def resolve_managed_group_ids(db: Session, current_user: UserSchema) -> List[str
         return []
 
     is_admin = bool(current_user.is_master_admin)
-    is_hn = str(current_user.hn_auth or "").upper() == "HN"
+    is_hn = caller_is_hn(db, current_user)  # 토큰 대신 DB hn_auth
 
     rows = (
         db.query(GroupModel)

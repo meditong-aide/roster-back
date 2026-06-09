@@ -58,6 +58,19 @@ def seeded(db):
 
 
 def _client(db, user):
+    # 권한 게이트가 토큰 대신 nurses(DB)를 보므로 호출자 nurse 행을 시드한다.
+    # (분류 풀에 섞이지 않도록 active=0; 권한 판정은 active 무관)
+    if user.account_id and not db.query(Nurse).filter(
+        Nurse.account_id == user.account_id
+    ).first():
+        db.add(Nurse(
+            nurse_id=user.nurse_id, account_id=user.account_id,
+            group_id=user.group_id, office_id=user.office_id, name=user.name,
+            active=0, is_head_nurse=bool(user.is_head_nurse),
+            hn_auth=user.hn_auth, is_night_nurse=[],
+        ))
+        db.flush()
+
     app = FastAPI()
     app.include_router(teams_router)
 

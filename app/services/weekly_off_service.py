@@ -14,6 +14,7 @@ from schemas.weekly_off_schema import (
     MyWeeklyOffResponse
 )
 from schemas.auth_schema import User as UserSchema
+from services.group_access import caller_is_head_nurse
 
 # ------------------------------------------------------------------
 # 1. 공통 계산 함수 (Core Logic)
@@ -443,8 +444,8 @@ def get_my_weekly_off_service(
     target_nurse_id: Optional[str] = None  # nurse_id가 str이므로 str로 변경
 ) -> MyWeeklyOffResponse:
 
-    # 권한 플래그
-    is_head_nurse = user.is_head_nurse
+    # 권한 플래그 (수간호사 여부는 토큰 대신 DB)
+    is_head_nurse = caller_is_head_nurse(db, user)
     is_master_admin = user.is_master_admin
 
     # 조회 대상 nurse 결정

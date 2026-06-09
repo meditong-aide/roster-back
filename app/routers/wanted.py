@@ -20,7 +20,7 @@ from schemas.roster_schema import (
     ToggleEntryResponse,
 )
 from services.graph_service import graph_service
-from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id
+from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse
 from routers.auth import get_current_user_from_cookie
 from utils.utils import send_wanted_close_push, send_wanted_deadline_update_push
 from db.client2 import get_db
@@ -73,7 +73,7 @@ async def request_wanted_shifts(
         raise HTTPException(status_code=401, detail="Not authenticated")
     # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        getattr(current_user, 'is_head_nurse', False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, 'is_master_admin', False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -98,7 +98,7 @@ async def get_wanted_status(
 
     # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        getattr(current_user, 'is_head_nurse', False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, 'is_master_admin', False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -133,7 +133,7 @@ async def get_submission_statuses(
 
     # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        getattr(current_user, 'is_head_nurse', False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, 'is_master_admin', False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -198,7 +198,7 @@ async def close_wanted_request(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
@@ -240,7 +240,7 @@ async def update_wanted_deadline(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400). 관리자 게이트는 상단 pre-gate.
@@ -542,7 +542,7 @@ async def upsert_wanted_config_endpoint(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # 권한 확인 (수간호사 또는 관리자만)
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
@@ -574,7 +574,7 @@ async def delete_wanted_config_endpoint(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # 권한 확인 (수간호사 또는 관리자만)
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
@@ -614,7 +614,7 @@ async def delete_wanted_config_by_month_endpoint(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
@@ -649,7 +649,7 @@ async def validate_wanted_limits_endpoint(
 
     # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        getattr(current_user, 'is_head_nurse', False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, 'is_master_admin', False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -676,8 +676,8 @@ async def get_over_limit_nurses_api(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
-    # 관리자 권한 체크
-    if not (current_user.is_head_nurse or current_user.is_master_admin):
+    # 관리자 권한 체크 (수간호사 여부는 토큰 대신 DB)
+    if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise HTTPException(403, "권한이 없습니다.")
 
     result = get_over_limit_nurses(db, year, month, group_id)
@@ -694,7 +694,7 @@ async def delete_excess_off_api(
 ):
     if current_user.is_master_admin:
         pass
-    elif current_user.is_head_nurse:
+    elif caller_is_head_nurse(db, current_user):
         # 토큰 group 대신 nurse_id→DB + groups.hn_id 로 관리 그룹 판정.
         target_nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
         _managed = resolve_managed_group_ids(db, current_user)
@@ -723,7 +723,7 @@ async def get_wanted_adjustment(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
@@ -753,7 +753,7 @@ async def save_fixed_wanted(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
@@ -806,12 +806,12 @@ async def toggle_fixed_wanted_entry(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 본인 병동(home)은 토큰 대신 nurse_id→DB 로 판정. ADM 은 None(office 범위).
     caller_group_id: Optional[str] = None
-    if getattr(current_user, 'is_head_nurse', False):
+    if caller_is_head_nurse(db, current_user):
         caller_group_id = resolve_home_group_id(db, current_user)
 
     try:
@@ -846,7 +846,7 @@ async def reset_fixed_wanted(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹 결정
@@ -875,7 +875,7 @@ async def get_fixed_wanted(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise HTTPException(status_code=403, detail="Permission denied")
 
     # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
@@ -924,7 +924,7 @@ async def get_all_shift_requests(
     # 대상 그룹 결정
     # 관리자(HN/ADM)만 조회. 그룹은 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        getattr(current_user, 'is_head_nurse', False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, 'is_master_admin', False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")

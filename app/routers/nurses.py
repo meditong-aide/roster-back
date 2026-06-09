@@ -72,7 +72,7 @@ from services.nurse_monthly_limit_service import (
     list_nurse_monthly_limits_service,
     upsert_nurse_monthly_limits_service,
 )
-from services.group_access import resolve_home_group_id, resolve_effective_group
+from services.group_access import resolve_home_group_id, resolve_effective_group, caller_is_head_nurse
 from services.excel_service import (
     create_nurse_template,
     # process_excel_upload,
@@ -305,10 +305,11 @@ async def bulk_update_nurses(
 @router.get("/template-download")
 async def download_template(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
 ):
     """엑셀 템플릿 파일 다운로드"""
     try:
-        if not current_user or not current_user.is_head_nurse:
+        if not current_user or not caller_is_head_nurse(db, current_user):
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         template_path = create_nurse_template()
         return FileResponse(
@@ -507,7 +508,7 @@ async def add_nurses_to_group(
     - nurses 테이블에 미존재: MSSQL 멤버 정보로 신규 생성
     """
     try:
-        if not current_user.is_head_nurse and not current_user.is_master_admin:
+        if not caller_is_head_nurse(db, current_user) and not current_user.is_master_admin:
             raise HTTPException(
                 status_code=403, detail="수간호사 또는 관리자만 접근 가능합니다."
             )
@@ -578,7 +579,7 @@ async def validate_excel_data_endpoint(
 ):
     """업로드된 데이터 유효성 검증"""
     try:
-        if not current_user or not current_user.is_head_nurse:
+        if not current_user or not caller_is_head_nurse(db, current_user):
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         result = validate_excel_data(request.data, current_user, db)
         return result
@@ -594,7 +595,7 @@ async def confirm_upload(
 ):
     """검증된 데이터 최종 저장"""
     try:
-        if not current_user or not current_user.is_head_nurse:
+        if not current_user or not caller_is_head_nurse(db, current_user):
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         filtered_data = [
             data
@@ -1026,7 +1027,7 @@ async def get_nurse_assignments(
     office_id = getattr(current_user, "office_id", None)
     if not office_id:
         raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
-    _group = group_id or getattr(current_user, "group_id", None)
+    _group = group_id or resolve_home_group_id(db, current_user)
     _status = None if status == "all" else status
     items = get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=_status)
     counts = get_assignment_status_counts(db, office_id, group_id=_group, nurse_id=nurse_id)

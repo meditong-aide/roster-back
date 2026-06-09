@@ -97,7 +97,7 @@ from services.roster_service import (
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
-from services.group_access import resolve_effective_group, resolve_home_group_id
+from services.group_access import resolve_effective_group, resolve_home_group_id, caller_is_head_nurse
 from services.weekly_off_service import get_nurses_weekly_off_service
 from services.assignment_service import transfer_shifts_on_publish, get_transfer_logs, get_transferred_wanted
 from utils.utils import send_roster_publish_push, send_roster_republish_push
@@ -127,7 +127,7 @@ async def save_roster_config(
 
     # 권한/대상 그룹 결정
     override_gid: Optional[str] = None
-    if user.is_head_nurse and user.group_id:
+    if caller_is_head_nurse(db, user) and user.group_id:
         override_gid = None  # HN은 본인 그룹 저장
     else:
         if not is_admin:
@@ -726,7 +726,7 @@ async def drop_schedule(
 
     # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        current_user.is_head_nurse
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -762,7 +762,7 @@ async def get_roster_by_schedule_id(
         raise HTTPException(status_code=401, detail="Not authenticated")
     # 관리자(HN/ADM)만 조회 가능. 그룹은 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        current_user.is_head_nurse
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -1380,7 +1380,7 @@ async def unpublish_roster(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not (
-        getattr(current_user, "is_head_nurse", False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -1445,7 +1445,7 @@ async def get_roster_for_month(
 
     # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
     if not (
-        current_user.is_head_nurse
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -1539,7 +1539,7 @@ async def save_roster(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not (
-        getattr(current_user, "is_head_nurse", False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -1689,7 +1689,7 @@ async def get_schedule_status(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # 수간호사/관리자: 그룹 요약 조회
-    if getattr(current_user, "is_head_nurse", False) or getattr(
+    if caller_is_head_nurse(db, current_user) or getattr(
         current_user, "is_master_admin", False
     ):
         # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
@@ -1792,7 +1792,7 @@ async def validate_roster(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not (
-        getattr(current_user, "is_head_nurse", False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -2088,7 +2088,7 @@ async def update_schedule_name(
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not (
-        getattr(current_user, "is_head_nurse", False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -2187,7 +2187,7 @@ def _get_target_group_id(
 ) -> str:
     """대상 그룹 결정 (관리자 전용). 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석."""
     if not (
-        current_user.is_head_nurse
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -2219,7 +2219,7 @@ async def copy_schedule_to_new_version(
     db: Session = Depends(get_db),
 ):
     if not current_user or not (
-        current_user.is_head_nurse or current_user.is_master_admin
+        caller_is_head_nurse(db, current_user) or current_user.is_master_admin
     ):
         raise HTTPException(status_code=403, detail="권한이 없습니다.")
 
@@ -2346,7 +2346,7 @@ async def create_empty_roster(
     - ScheduleEntry 생성 X → 완전 빈 근무표
     """
     if not current_user or not (
-        current_user.is_head_nurse or current_user.is_master_admin
+        caller_is_head_nurse(db, current_user) or current_user.is_master_admin
     ):
         raise HTTPException(status_code=403, detail="권한이 없습니다.")
 
@@ -2422,7 +2422,7 @@ async def create_roster_with_weekly_off(
     현재 보고 있는 연/월에 주휴일만 포함된 신규 빈 근무표 생성
     """
     if not current_user or not (
-        current_user.is_head_nurse or current_user.is_master_admin
+        caller_is_head_nurse(db, current_user) or current_user.is_master_admin
     ):
         raise HTTPException(status_code=403, detail="권한이 없습니다.")
 
@@ -2952,7 +2952,7 @@ def get_shift_transfers(
     db: Session = Depends(get_db),
 ):
     """전달 이력 조회 (운영자: group_id / 당사자: nurse_id)"""
-    _group = group_id or user.group_id
+    _group = group_id or resolve_home_group_id(db, user)
     _nurse = nurse_id or None
     logs = get_transfer_logs(db, year=year, month=month, group_id=_group, nurse_id=_nurse)
     return {"transfers": logs}

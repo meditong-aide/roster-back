@@ -35,6 +35,7 @@ from db.nurse_config import Nurse as NurseEngine
 from routers.utils import get_days_in_month
 from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequest
 from services.roster_system import RosterSystem
+from services.group_access import caller_is_head_nurse, resolve_home_group_id
 from services.shift_service_mssql import _to_time_str
 def save_roster_config_service(
     config_data: RosterConfigCreate,
@@ -189,10 +190,10 @@ def get_latest_schedule_service(current_user, db: Session, override_group_id: st
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
 
-    target_group_id = override_group_id or current_user.group_id
+    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
 
@@ -249,8 +250,8 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
         raise Exception("Not authenticated")
 
     # HN/ADM 그룹 요약
-    if getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False):
-        target_group_id = override_group_id or current_user.group_id
+    if caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False):
+        target_group_id = override_group_id or resolve_home_group_id(db, current_user)
         if not target_group_id:
             raise Exception("대상 그룹이 없습니다.")
         schedules = db.query(Schedule).filter(
@@ -323,7 +324,7 @@ def get_prev_month_tail_service(
     current_user,
     db: Session,
 ):
-    if current_user.is_head_nurse and current_user.group_id:
+    if caller_is_head_nurse(db, current_user) and current_user.group_id:
         target_group_id = current_user.group_id
     else:
         if not group_id:
@@ -1996,7 +1997,7 @@ def revoke_schedule_share_link_service(db: Session, current_user, token: str) ->
         raise LookupError("Share link not found")
 
     is_master_admin = bool(getattr(current_user, "is_master_admin", False))
-    is_head_nurse = bool(getattr(current_user, "is_head_nurse", False))
+    is_head_nurse = caller_is_head_nurse(db, current_user)
     if not (is_master_admin or is_head_nurse):
         raise PermissionError("Permission denied")
     if is_master_admin and getattr(current_user, "office_id", None) and share_row.get("office_id") != getattr(current_user, "office_id", None):

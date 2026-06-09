@@ -41,6 +41,7 @@ import calendar
 from sqlalchemy import text
 from db.client2 import get_db
 from services.cp_sat.off_policy import resolve_effective_off_days
+from services.group_access import caller_is_head_nurse, resolve_effective_group
 from services.cp_sat.off_swap import postprocess_off_swap
 from services.assignment_service import get_active_assignments_for_month, flush_pending_transfers
 from services.day_windows import build_blocked_days
@@ -4557,8 +4558,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user or not caller_is_head_nurse(db, current_user):
         raise Exception("Permission denied")
+    # 대상 그룹: 토큰 group_id 대신 req.group_id(없으면 DB home)로 해석·검증.
+    # 이후 모든 current_user.group_id 참조가 검증된 대상 그룹을 가리킨다(HN home 외 관리 그룹 포함).
+    current_user.group_id = resolve_effective_group(
+        db, current_user, getattr(req, "group_id", None)
+    )
     wanted = (
         db.query(Wanted)
         .filter(
@@ -5934,8 +5940,12 @@ def request_schedule_service(req: RosterRequest, current_user, db: Session):
     """
     스케줄 생성 서비스 함수
     """
-    if not current_user or not current_user.is_head_nurse:
+    if not current_user or not caller_is_head_nurse(db, current_user):
         raise Exception("Permission denied")
+    # 대상 그룹: 토큰 대신 req.group_id(없으면 DB home)로 해석·검증.
+    current_user.group_id = resolve_effective_group(
+        db, current_user, getattr(req, "group_id", None)
+    )
     nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
     if not nurse or not nurse.group:
         raise Exception("User group information not found")

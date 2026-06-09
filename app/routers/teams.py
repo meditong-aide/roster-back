@@ -15,7 +15,11 @@ from services.ward_redistribute_service import (
     apply_ward_redistribution,
     WardSetupError,
 )
-from services.group_access import resolve_managed_group_ids, resolve_effective_group
+from services.group_access import (
+    resolve_managed_group_ids,
+    resolve_effective_group,
+    caller_is_manager,
+)
 
 
 router = APIRouter(prefix="/teams", tags=["teams"])
@@ -72,7 +76,7 @@ def _assert_groups_managed(
     db: Session, current_user: UserSchema, group_ids: list[str]
 ) -> None:
     """병동 간 재분배: 관리자 + 모든 선택 그룹이 관리 그룹에 포함돼야 함."""
-    if not _is_manager(current_user):
+    if not caller_is_manager(db, current_user):
         raise HTTPException(status_code=403, detail="재분배 권한이 없습니다.")
     if len(set(group_ids)) < 2:
         raise HTTPException(status_code=400, detail="재분배는 2개 이상의 병동이 필요합니다.")
@@ -80,15 +84,6 @@ def _assert_groups_managed(
     bad = [g for g in group_ids if g not in managed]
     if bad:
         raise HTTPException(status_code=403, detail=f"관리 권한이 없는 그룹: {bad}")
-
-
-def _is_manager(u: UserSchema) -> bool:
-    """팀 분류는 관리 작업 — ADM / 수간호사 / 그룹관리자(hn_auth=='HN')만 허용."""
-    return bool(
-        u.is_master_admin
-        or u.is_head_nurse
-        or str(u.hn_auth or "").upper() == "HN"
-    )
 
 
 def _resolve_managed_target(
@@ -100,7 +95,7 @@ def _resolve_managed_target(
     (resolve_managed_group_ids). 지정한 group_id 가 관리 목록에 없으면 403.
     관리 그룹이 여럿인데 미지정이면 모호하므로 400.
     """
-    if not _is_manager(current_user):
+    if not caller_is_manager(db, current_user):
         raise HTTPException(status_code=403, detail="팀 분류 권한이 없습니다.")
     managed = resolve_managed_group_ids(db, current_user)
     if not managed:

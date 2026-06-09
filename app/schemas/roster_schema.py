@@ -98,6 +98,9 @@ class RosterRequest(BaseModel):
 
     year: int
     month: int
+    # 대상 병동 그룹. 미지정 시 호출자 DB home 으로 해석(토큰 group_id 에 의존하지 않음).
+    # HN(그룹관리자)이 home 외 관리 그룹을 선택해 생성할 때 사용.
+    group_id: Optional[str] = None
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
