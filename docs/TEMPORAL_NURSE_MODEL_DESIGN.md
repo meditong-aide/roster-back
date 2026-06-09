@@ -186,7 +186,7 @@ period는 희소(델타)지만 **변경 시 옛 구간을 삭제하지 않고 cl
 |---|---|---|
 | **1. team** | `nurse_team_period` 생성 + 현재 `nurses.team_id` backfill(open 구간) + `resolve_team`(ward-aware) + 생성기 team read 전환 + 재분배 apply→period. (v1 `nurse_month_profile` 코드 교체) | 9B 7월 재생성이 재분배 팀 반영 |
 | **2. shiftrule** | `nurse_shiftrule_period` + 생성기 per-day 셀 금지 | 교육 사례(D→DE) |
-| **3. grade** | `nurse_grade_period` + backfill + read | 회귀: 기존 생성 동일 |
+| **3. grade** | ~~`nurse_grade_period`~~ **폐기(2026-06)** → 경량: 캐시 `nurses.grade` + assignment `target_grade` override(team B2 이전 방식). 룰은 G1≥1 hard→soft. | 이동자 grade=target_grade 반영, 룰 회귀 |
 | **4. 근무자관리 표시** | 월 셀렉터 + 소속 필터 + 상태 배지 + 헤드카운트 분리 + 사이드 as-of | §3 매트릭스 |
 | **5. preceptorship** | 관계 테이블 + backfill + 종료 자동화 | N:1·기간 |
 | **6. assignment 정리** | `target_team_id/grade/속성변경` 이관 후 deprecate | 참조 없음 |
@@ -209,7 +209,11 @@ period는 희소(델타)지만 **변경 시 옛 구간을 삭제하지 않고 cl
 
 ## 8. 결정 사항 (확정)
 
-1. **grade 스코프 = 병동귀속.** 실제로 병동마다 등급이 다를 수 있음 → `nurse_grade_period.group_id` 유지(현 설계대로).
+1. ~~**grade 스코프 = 병동귀속** → `nurse_grade_period.group_id`~~ **(2026-06 폐기 — 경량 전환)**
+   - **이유**: grade(연차/시니어)는 team과 달리 **드물게·거칠게** 변함. 일자 단위 period는 과도하고(UI 날짜편집 까다로움, 작은 날짜오차가 커버리지 흔듦), team처럼 월중 잦은 변경(병동이동)이 없음. → **시점 테이블 안 만듦.**
+   - **대안(경량)**: ① 속성은 `nurses.grade`(캐시) + 병동이동/속성변경의 **`target_grade` override**(`roster_create_service.py:4347`, team B2 이전 방식 그대로 — 이미 동작·검증). 이동자는 병동별 grade 적용됨(병동귀속 요구 충족). ② 갭(미래 속성변경 grade가 flush 전 안 보임)은 grade 변경이 드물어 **발효 후 재생성으로 커버**. 빈번해지면 그때 **월 단위 override**(monthly_limit식 month-grain) 추가 — **일자 구간은 안 감.**
+   - **룰**: grade min(예: G1≥1/shift)은 **hard 단독이 아니라 hard→soft**(team_min식: primary hard, 깊은 fallback에서만 완화)로 둬 G1 부족 달에 즉시 infeasible 안 되게. `allow_soft_fallback`을 escape hatch로 유지. (순수 hard가 "예민함"의 실제 원인)
+   - team=period / grade=캐시+override 비대칭은 **현상별 granularity 매칭**이라 정당(n_exact를 period로 안 옮긴 것과 동일 논리).
 2. **솔버 per-day team = 우선 gap만.** 미지정일 팀 min 제외. 같은 병동 월중 team 변경 전체 지원은 수요 시 확장.
 3. **split 월 "내 근무표" = 통합 캘린더.** 기존 `get_my_issued_roster_service`가 이미 target overlay(복수 assignment) 머지 로직 보유(`roster_service.py`) → 그 위에 통합 캘린더 렌더. (문제 없어 보임)
 4. **휴직 원티드 = per-day** (휴직일 막고 근무일 제출·배정). **전제**: §7-10 휴직 구간 처리(blocked-days [start,end]) 재구현. 부분 휴직 = 근무일만 정상.

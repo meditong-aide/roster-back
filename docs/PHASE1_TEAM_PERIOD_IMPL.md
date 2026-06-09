@@ -118,6 +118,13 @@ for _en in engine_nurses:
 **수정**(`team_service.py`): 삭제 시 해당 team_id 의 `nurse_team_period` 행도 삭제(캐시 None 과 동일 의미). 테스트 `test_delete_team_clears_team_period`.
 **남은 별개 리스크(미적용)**: `next_team_id=max+1` 이라 최고 team_id 삭제 후 신규 생성 시 id 재사용 가능 → 옛 period 가 다른 팀을 가리킴. 근본 차단은 all-time-max 또는 soft-delete(active=0) — 더 큰 결정이라 분리.
 
+## Phase 2 (grade) — **폐기, 경량 전환** (2026-06 결정)
+`nurse_grade_period`(시점 테이블) **만들지 않음.** grade는 team과 달리 드물게·거칠게 변해 일자 단위 period가 과도(UI 날짜편집 부담, 작은 날짜오차가 커버리지 흔듦, 월중 잦은 변경 없음).
+- **속성**: `nurses.grade`(캐시) + 병동이동/속성변경 **`target_grade` override**(`roster_create_service.py:4347`) — team B2 이전 방식 그대로, **이미 동작·검증**. 이동자 병동별 grade 적용됨. 새 코드/DDL/백필 **없음**.
+- **갭**: 미래 속성변경 grade가 flush 전 안 보임 → grade 변경이 드물어 **발효 후 재생성으로 커버**. 빈번해지면 month-grain override 추가(일자 구간 X).
+- **룰**: grade min(G1≥1 등)은 **hard→soft**(team_min식)로. `allow_soft_fallback` escape hatch 유지 → G1 부족 달 즉시 infeasible 방지(순수 hard가 "예민함" 원인).
+- 상세·근거: `TEMPORAL_NURSE_MODEL_DESIGN.md` §8-1(개정).
+
 ### B4 (문제 A — 전출 source 경계) [적용됨]
 **증상**: 9B 7월 생성 시 전출(병동이동, src=9B) 7명이 엔진에 남아 **"31일 전체 차단"**(NURSE_BLOCKED_DAYS)으로 잔류 → 팀/등급 풀 유효 인력 왜곡 → 커버리지 구조적 infeasible.
 **원인**: 엔진은 active_range 클리핑을 **휴직/퇴사만** 수행(`roster_create_service.py` ~4740). 병동이동 source-side 는 day-block(파견 복귀용 로직)으로만 처리돼 영구 전출도 "차단된 채 잔류".
