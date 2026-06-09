@@ -27,6 +27,32 @@ _REALLOCATE_OPEN_WINDOW_CAP_MONTHS = 12
 # 파견/병동이동 이관 사유 (nurse_service._INBOUND_REASONS와 동일 정책)
 _INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
 
+# nurse_assignment.kind enum (DDL Phase 1.4) ↔ 한글 reason 매핑.
+# 매칭 안 되는 reason 은 DB DEFAULT 'transfer' 로 떨어지므로, 신규 reason 추가 시 여기도 갱신할 것.
+REASON_TO_KIND: dict[str, str] = {
+    "병동이동": "transfer",
+    "파견": "dispatch",
+    "프리셉티": "preceptee",
+    "휴직": "leave",
+    "복직": "return",
+    "퇴사": "resign",
+    "속성변경": "permanent_change",
+}
+
+# 속성 이벤트(무엇인가) — 존재 이벤트(어디 있나: 파견/병동이동)와 달리 기간 겹침 허용.
+# overlap·transfer 검증기에서 제외하고, 발효 시 Nurse 속성을 직접 갱신한다.
+ATTRIBUTE_CHANGE_KINDS: frozenset[str] = frozenset({"permanent_change"})
+
+
+def kind_for_reason(reason: Optional[str]) -> str:
+    """한글 reason 을 kind enum 으로 변환. 부분일치(LIKE 백필과 동일 의미)로 변형 표기도 흡수."""
+    if not reason:
+        return "transfer"
+    for key, kind in REASON_TO_KIND.items():
+        if key in reason:
+            return kind
+    return "transfer"
+
 
 def _assert_caller_owns_source(
     current_user: Optional[UserSchema],
@@ -419,6 +445,7 @@ def create_assignment(
         start_date=req.start_date,
         expected_end_date=req.expected_end_date,
         reason=req.reason,
+        kind=kind_for_reason(req.reason),
         status="active",
         note=req.note,
         target_weekly_off_type=req.target_weekly_off_type,
@@ -573,7 +600,11 @@ def _raise_if_overlap(
     my_end_upper: Optional[date],
     exclude_id: Optional[int] = None,
 ) -> None:
-    """동일 간호사의 active 배정 중 기간 겹침이 있으면 409."""
+    """동일 간호사의 active 존재 배정 중 기간 겹침이 있으면 409.
+
+    속성 이벤트(ATTRIBUTE_CHANGE_KINDS: team/grade 변경)는 '어디 있나'가 아니라 '무엇인가'라
+    겹침 검사 대상이 아니다 — 팀이 바뀐 채로도 파견될 수 있으므로 제외한다.
+    """
     from sqlalchemy import case
     _eff_end = case(
         (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
@@ -582,6 +613,7 @@ def _raise_if_overlap(
     _filters = [
         NurseAssignment.nurse_id == nurse_id,
         NurseAssignment.status == "active",
+        NurseAssignment.kind.notin_(ATTRIBUTE_CHANGE_KINDS),
         or_(_eff_end.is_(None), _eff_end >= my_start),
     ]
     if my_end_upper is not None:
@@ -886,6 +918,263 @@ def get_active_assignments_for_month(
         )
         .all()
     )
+
+
+def preview_assignment_impact(
+    db: Session,
+    *,
+    nurse_id: str,
+    reason: str,
+    start_date: date,
+    target_group_id: Optional[str] = None,
+    expected_end_date: Optional[date] = None,
+    exclude_id: Optional[int] = None,
+) -> dict:
+    """배정(파견/병동이동/휴직/등) 생성 전 영향 분석 (dry-run).
+
+    실제 DB 변경 없이 영향만 계산해 반환. UI 확정 직전 운영자가 영향을 확인하는 용도.
+
+    참조: docs/NURSE_GROUP_CHANGE_MODEL.md §2.6, NURSE_ASSIGNMENT_CRON_DESIGN.md §5.
+
+    Returns:
+        dict with:
+          - nurse_id / nurse_name / source_group_id / target_group_id / reason / 기간
+          - conflicts: 기간 겹침 active 배정 리스트 (raise 안 함)
+          - nml_affected: 발효 월 이후의 NML 중 group_id가 옛 그룹인 것 (자동 update 대상)
+          - wanted_affected: 발효 월 이후 wanted 카운트 (정책: 안 건드림, generate가 자연 무시)
+          - schedules_to_check: 발효 월 이후 이미 생성된 schedule (재생성 검토)
+          - notifications: 알림 대상 (self / source_hn / target_hn)
+    """
+    from sqlalchemy import case
+    from db.models import NurseMonthlyLimit, WantedRequest, Schedule
+
+    nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    if not nurse:
+        raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
+    source_group_id = nurse.group_id
+
+    # 1. 기간 겹침 (raise 안 함, 목록 반환) — _raise_if_overlap 로직 재사용
+    _eff_end = case(
+        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+        else_=NurseAssignment.expected_end_date,
+    )
+    _filters = [
+        NurseAssignment.nurse_id == nurse_id,
+        NurseAssignment.status == "active",
+        or_(_eff_end.is_(None), _eff_end >= start_date),
+    ]
+    if expected_end_date is not None:
+        _filters.append(NurseAssignment.start_date <= expected_end_date)
+    if exclude_id is not None:
+        _filters.append(NurseAssignment.id != exclude_id)
+    overlaps = db.query(NurseAssignment).filter(*_filters).all()
+    conflicts = [
+        {
+            "id": o.id,
+            "reason": o.reason,
+            "start_date": o.start_date.isoformat(),
+            "end_date": (o.end_date or o.expected_end_date).isoformat()
+                        if (o.end_date or o.expected_end_date) else None,
+            "target_group_id": o.target_group_id,
+            "status": o.status,
+        }
+        for o in overlaps
+    ]
+
+    start_y, start_m = start_date.year, start_date.month
+    start_ym = f"{start_y:04d}-{start_m:02d}"
+
+    # 2. NML 영향 — 병동이동 시 발효 월 이후 NML group_id 자동 update 대상
+    nml_affected = []
+    if reason == "병동이동" and target_group_id and target_group_id != source_group_id:
+        rows = (
+            db.query(NurseMonthlyLimit)
+            .filter(
+                NurseMonthlyLimit.nurse_id == nurse_id,
+                NurseMonthlyLimit.group_id == source_group_id,
+                or_(
+                    NurseMonthlyLimit.year > start_y,
+                    and_(
+                        NurseMonthlyLimit.year == start_y,
+                        NurseMonthlyLimit.month >= start_m,
+                    ),
+                ),
+            )
+            .all()
+        )
+        nml_affected = [
+            {
+                "year": r.year,
+                "month": r.month,
+                "current_group_id": r.group_id,
+                "will_become": target_group_id,
+            }
+            for r in rows
+        ]
+
+    # 3. wanted 영향 — 정책: 안 건드림. 단 발효 월 이후 wanted 수를 노출 (운영자 인지용)
+    wanted_count = 0
+    wanted_range = None
+    try:
+        if reason == "병동이동" and target_group_id:
+            wq = (
+                db.query(WantedRequest)
+                .filter(
+                    WantedRequest.nurse_id == nurse_id,
+                    WantedRequest.group_id == source_group_id,
+                    WantedRequest.month >= start_ym,
+                )
+                .all()
+            )
+            wanted_count = len(wq)
+            if wq:
+                months = sorted(w.month for w in wq)
+                wanted_range = {"earliest": months[0], "latest": months[-1]}
+    except Exception as e:
+        logger.warning("preview wanted 조회 실패: %s", e)
+    wanted_affected = {
+        "count": wanted_count,
+        "range": wanted_range,
+        "policy_note": "이동 시 안 건드림 — generate가 새 group_id로 필터하므로 옛 그룹 wanted는 자연 무시",
+    }
+
+    # 4. 발효 월 이후 이미 생성된 schedule (재생성 검토 대상)
+    schedules_to_check = []
+    try:
+        group_ids = [source_group_id]
+        if target_group_id and target_group_id != source_group_id:
+            group_ids.append(target_group_id)
+        sched_rows = (
+            db.query(Schedule)
+            .filter(
+                Schedule.group_id.in_(group_ids),
+                or_(
+                    Schedule.year > start_y,
+                    and_(Schedule.year == start_y, Schedule.month >= start_m),
+                ),
+                Schedule.dropped == False,  # noqa: E712
+            )
+            .all()
+        )
+        schedules_to_check = [
+            {
+                "schedule_id": s.schedule_id,
+                "year": s.year,
+                "month": s.month,
+                "group_id": s.group_id,
+            }
+            for s in sched_rows
+        ]
+    except Exception as e:
+        logger.warning("preview schedule 조회 실패: %s", e)
+
+    # 5. 알림 대상
+    notifications = ["self"]
+    if source_group_id:
+        notifications.append(f"head_nurse:{source_group_id}")
+    if target_group_id and target_group_id != source_group_id:
+        notifications.append(f"head_nurse:{target_group_id}")
+
+    return {
+        "nurse_id": nurse_id,
+        "nurse_name": nurse.name,
+        "source_group_id": source_group_id,
+        "target_group_id": target_group_id,
+        "reason": reason,
+        "start_date": start_date.isoformat(),
+        "expected_end_date": expected_end_date.isoformat() if expected_end_date else None,
+        "conflicts": conflicts,
+        "nml_affected": nml_affected,
+        "wanted_affected": wanted_affected,
+        "schedules_to_check": schedules_to_check,
+        "notifications": notifications,
+    }
+
+
+def reconcile_nurse_attrs(
+    db: Session,
+    *,
+    as_of: Optional[date] = None,
+    sample_limit: int = 0,
+) -> dict:
+    """야간 reconcile — Nurses 테이블 캐시와 시점-effective 값의 일관성 검증.
+
+    read-only. 불일치 발견 시 로그·반환만, 자동 동기화 없음.
+    (자동 동기화는 Phase 1.4 DDL 적용 + kind 기반 정밀화 후에 도입.)
+
+    Args:
+        as_of: 비교 기준 일자 (기본 오늘)
+        sample_limit: 0이면 전체 검사, N>0이면 N명 샘플
+
+    Returns:
+        {
+          "as_of": "YYYY-MM-DD",
+          "total_checked": N,
+          "mismatches": [{nurse_id, name, attr, nurse_value, effective_value, assignment_id}],
+          "mismatch_count": M,
+        }
+
+    참조: docs/NURSE_ASSIGNMENT_CRON_DESIGN.md §1.2 reconcile_nurse_attrs.
+    """
+    from services.nurse_effective import (
+        get_active_assignments_batch,
+        _ATTR_TO_TARGET_COL,
+        _is_unset_override,
+    )
+
+    if as_of is None:
+        as_of = date.today()
+
+    q = db.query(NurseModel).filter(NurseModel.active == 1)
+    if sample_limit > 0:
+        q = q.limit(sample_limit)
+    nurses = q.all()
+
+    ids = [n.nurse_id for n in nurses]
+    cache = get_active_assignments_batch(db, ids, as_of)
+
+    mismatches: list[dict] = []
+    for n in nurses:
+        asg = cache.get(n.nurse_id)
+        if asg is None:
+            continue  # 활성 assignment 없으면 폴백 = Nurses 값 그대로, 불일치 정의 X
+        for attr, target_col in _ATTR_TO_TARGET_COL.items():
+            target_val = getattr(asg, target_col, None)
+            if _is_unset_override(target_val):
+                continue  # target 미설정(None/[]/"")이면 폴백, Nurses와 비교 의미 없음
+            nurse_val = getattr(n, attr, None)
+            # 정규화 — TINYINT 0/1 ↔ bool 비교
+            if isinstance(nurse_val, bool) and isinstance(target_val, int):
+                cmp_val = bool(target_val)
+            elif isinstance(target_val, bool) and isinstance(nurse_val, int):
+                cmp_val = bool(nurse_val)
+                target_val = bool(target_val)
+                nurse_val = cmp_val
+            else:
+                cmp_val = nurse_val
+            if cmp_val != target_val:
+                mismatches.append({
+                    "nurse_id": n.nurse_id,
+                    "name": n.name,
+                    "attr": attr,
+                    "nurse_value": repr(nurse_val),
+                    "effective_value": repr(target_val),
+                    "assignment_id": asg.id,
+                    "assignment_reason": asg.reason,
+                })
+
+    result = {
+        "as_of": as_of.isoformat(),
+        "total_checked": len(nurses),
+        "mismatches": mismatches,
+        "mismatch_count": len(mismatches),
+    }
+    if mismatches:
+        logger.warning(
+            "[reconcile_nurse_attrs] 불일치 %d건 발견 (총 %d명 검사). 상세: %s",
+            len(mismatches), len(nurses), mismatches[:5],
+        )
+    return result
 
 
 def _apply_target_profile_reset(
@@ -1220,6 +1509,120 @@ def flush_expired_leaves(db: Session) -> int:
     db.commit()
     logger.info("[Scheduler] 휴직 자동 디엑티브 %d건", len(rows))
     return len(rows)
+
+
+def create_permanent_change(
+    db: Session,
+    *,
+    nurse_id: str,
+    group_id: str,
+    office_id: str,
+    start_date: date,
+    new_team_id: Optional[int] = None,
+    new_grade: Optional[int] = None,
+    new_shift_types: Optional[list] = None,
+    release_preceptor: bool = False,
+    note: Optional[str] = None,
+) -> NurseAssignment:
+    """병동 내 영구 속성변경(team/grade/shift_types/프리셉터십 해제) 이벤트 생성.
+
+    존재 이벤트(파견/병동이동)가 아니라 '속성 이벤트'다. 같은 병동 내 변경이므로
+    source==target==group_id 이고, overlap·transfer 검증을 거치지 않는다.
+    되돌리기를 위해 payload 에 직전 값을 박아둔다.
+    new_shift_types: is_night_nurse(허용 shift 목록). N전담 해제 시 [] 전달.
+    release_preceptor: 프리셉티의 preceptor_id 를 비움(프리셉터십 공식 종료). 전용
+      target 컬럼이 없어 payload 로 운반하고 flush 가 nurse.preceptor_id=None 적용.
+    발효(start_date 도래)는 flush_pending_permanent_changes 가 처리한다.
+    """
+    if (new_team_id is None and new_grade is None and new_shift_types is None
+            and not release_preceptor):
+        raise HTTPException(
+            status_code=400,
+            detail="변경할 속성(team/grade/shift_types/프리셉터십 해제)이 없습니다.",
+        )
+    nurse = (
+        db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+    )
+    if not nurse:
+        raise HTTPException(status_code=404, detail=f"간호사를 찾을 수 없습니다. (nurse_id={nurse_id})")
+
+    payload = {
+        "prev_team_id": nurse.team_id,
+        "prev_grade": nurse.grade,
+        "prev_shift_types": nurse.is_night_nurse,
+    }
+    if release_preceptor:
+        payload["release_preceptor"] = True
+        payload["prev_preceptor_id"] = nurse.preceptor_id
+
+    row = NurseAssignment(
+        nurse_id=nurse_id,
+        source_group_id=group_id,
+        target_group_id=group_id,  # 병동 내 → source==target
+        office_id=office_id,
+        start_date=start_date,
+        reason="속성변경",
+        kind="permanent_change",
+        status="active",
+        target_team_id=new_team_id,
+        target_grade=new_grade,
+        target_shift_types=new_shift_types,
+        payload=payload,
+        note=note,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    logger.info(
+        "속성변경 등록: nurse_id=%s, team %s→%s, grade %s→%s, 발효=%s",
+        nurse_id, nurse.team_id, new_team_id, nurse.grade, new_grade, start_date,
+    )
+    return row
+
+
+def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -> int:
+    """영구 속성변경 발효 (스케줄러용).
+
+    조건: kind='permanent_change' AND status='active' AND start_date <= today
+    처리: Nurse.team_id/grade ← target_* (None 인 속성은 미변경), status='completed', end_date=today.
+    Returns: 처리된 건수
+    """
+    today = as_of or date.today()
+    rows = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.kind == "permanent_change",
+            NurseAssignment.status == "active",
+            NurseAssignment.start_date <= today,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+
+    count = 0
+    for row in rows:
+        nurse = (
+            db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
+        )
+        if nurse:
+            if row.target_team_id is not None:
+                nurse.team_id = row.target_team_id
+            if row.target_grade is not None:
+                nurse.grade = row.target_grade
+            # target_shift_types 지정 시 is_night_nurse 갱신 (N전담 해제 = [] 등)
+            if row.target_shift_types is not None:
+                nurse.is_night_nurse = row.target_shift_types
+            # payload.release_preceptor → 프리셉터십 공식 종료 (preceptor_id 비움)
+            if (row.payload or {}).get("release_preceptor"):
+                nurse.preceptor_id = None
+        row.status = "completed"
+        row.end_date = today
+        count += 1
+
+    db.commit()
+    logger.info("[Scheduler] 영구 속성변경 발효 %d건", count)
+    return count
 
 
 def transfer_shifts_on_publish(

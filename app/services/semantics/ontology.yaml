@@ -912,7 +912,7 @@ treatments:
     label: "월간 N cap 상향"
     action_type: set_threshold
     target_family: MonthlyNightCap
-    config_key: max_night_shifts_per_month
+    config_key: max_nig_per_month
     direction: increase
     rationale_ko: "개인당 월 최대 야간 횟수를 1 증가."
     trade_off_ko: "개인별 야간 부담 증가. 다음 달 분산으로 균형 회복 권장."
@@ -1096,3 +1096,65 @@ treatments:
     applies_to_causes:
       - cause:eligibility:role_only_oversupply
       - cause:fixed:initial_forbidden_concentration
+
+# ── 소프트 제약 카탈로그 ──────────────────────────────────────────────────────
+# objective weight 로만 존재하던 소프트 제약을 온톨로지 1급으로 등재.
+# weight_constant: hardcoded_weights.py 상수 / config_key: 런타임 control 노브
+# lex_stage: fallback 3-stage 계층 (safety > quality; coverage 는 하드)
+soft_constraints:
+  night_deviation:
+    label: 야간 분배 편차
+    severity: soft
+    weight_constant: NIGHT_DEVIATION_PENALTY
+    config_key: night_minmax_primary_weight
+    lex_stage: safety
+    rationale_ko: "간호사 간 N 횟수 편차를 줄인다(공정성·피로 분산)."
+    aliases: [NIGHT_DEVIATION]
+  isolated_work:
+    label: 고립 근무 (O W O)
+    severity: soft
+    weight_constant: ISOLATED_WORK_PENALTY
+    config_key: isolated_work_penalty_weight
+    lex_stage: safety
+    rationale_ko: "OFF 사이 단일 근무(고립근무)를 억제한다."
+    aliases: [ISOLATED_WORK]
+  isolated_off:
+    label: 고립 OFF (W O W)
+    severity: soft
+    weight_constant: ISOLATED_OFF_PENALTY
+    config_key: isolated_off_penalty_weight
+    lex_stage: quality
+    rationale_ko: "근무 사이 단일 OFF(고립 OFF)를 억제한다."
+    aliases: [ISOLATED_OFF]
+  nod_noe:
+    label: N-OFF-D / N-OFF-E 패턴
+    severity: soft
+    weight_constant: NOD_NOE_PENALTY
+    config_key: nod_noe_penalty_weight
+    lex_stage: safety
+    rationale_ko: "야간 후 짧은 회복(NOD/NOE) 패턴을 억제한다."
+    aliases: [NOD_NOE]
+  experience_short:
+    label: 경력 부족 커버
+    severity: soft
+    weight_constant: EXPERIENCE_SHORT_PENALTY
+    config_key: experience_short_penalty_weight
+    lex_stage: quality
+    rationale_ko: "교대별 경력(숙련) 최소 확보 미달을 페널티화."
+    aliases: [EXPERIENCE_SHORT]
+  week_off_short:
+    label: 주간 OFF 부족
+    severity: soft
+    weight_constant: WEEK_OFF_SHORT_PENALTY
+    config_key: week_off_short_penalty_weight
+    lex_stage: quality
+    rationale_ko: "주 단위 최소 OFF 미달을 페널티화."
+    aliases: [WEEK_OFF_SHORT]
+  kld_distribution:
+    label: 근무 분포 균등(KLD)
+    severity: soft
+    weight_constant: null
+    config_key: kld_range_weight
+    lex_stage: quality
+    rationale_ko: "간호사 간 시프트 분포 균등화(KLD range)."
+    aliases: [KLD_DISTRIBUTION]

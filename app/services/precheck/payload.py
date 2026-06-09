@@ -329,6 +329,13 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
     treatment_recommendations, resolution_narrative, hard_case_dict, graph = (
         _build_treatments_narrative_and_hard_case(causes, observed_symptoms, evidence)
     )
+    # ontology treatment 추천 → 프론트용 통합 옵션 카드(precheck 차단/post-gen 모든 경로 공통).
+    # probe(검증됨) 옵션은 서비스 레벨에서 앞에 추가된다.
+    try:
+        from services.cp_sat.undiagnosed_probe import treatments_to_resolution_options
+        _resolution_options = treatments_to_resolution_options(treatment_recommendations)
+    except Exception:
+        _resolution_options = []
 
     return {
         "infeasibility": {
@@ -342,6 +349,7 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
             "observed_symptoms": observed_symptoms,
             "evidence": evidence,
             "treatment_recommendations": treatment_recommendations,
+            "resolution_options": _resolution_options,
             "resolution_narrative": resolution_narrative,
             "hard_case": hard_case_dict,
             "graph": graph,
@@ -495,6 +503,13 @@ def build_unrecoverable_payload(
     treatment_recommendations, resolution_narrative, hard_case_dict, graph = (
         _build_treatments_narrative_and_hard_case(causes, observed_symptoms, evidence)
     )
+    # ontology treatment 추천 → 프론트용 통합 옵션 카드(precheck 차단/post-gen 모든 경로 공통).
+    # probe(검증됨) 옵션은 서비스 레벨에서 앞에 추가된다.
+    try:
+        from services.cp_sat.undiagnosed_probe import treatments_to_resolution_options
+        _resolution_options = treatments_to_resolution_options(treatment_recommendations)
+    except Exception:
+        _resolution_options = []
 
     return {
         "infeasibility": {
@@ -513,6 +528,7 @@ def build_unrecoverable_payload(
             "evidence": evidence,
             # US-9 신규 2 필드 (treatment 추천 + 자연어 narrative)
             "treatment_recommendations": treatment_recommendations,
+            "resolution_options": _resolution_options,
             "resolution_narrative": resolution_narrative,
             # U-3 / U-5 신규 2 필드 (hard_case 판정 + 명확한 그래프)
             "hard_case": hard_case_dict,

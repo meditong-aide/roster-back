@@ -52,6 +52,7 @@ from services.assignment_service import (
     flush_expired_preceptees,
     flush_expired_dispatches,
     flush_expired_leaves,
+    preview_assignment_impact,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
@@ -1125,6 +1126,47 @@ async def get_nurse_assignments(
         counts=counts,
         total=total,
         applied_status=status,
+    )
+
+
+class AssignmentPreviewRequest(BaseModel):
+    """배정 dry-run 영향 분석 요청.
+
+    실제 DB 변경 없이 영향만 계산. 확정 직전 운영자가 보는 용도.
+    """
+    nurse_id: str
+    reason: str  # 파견 / 병동이동 / 휴직 / 복직 / 프리셉티 등
+    start_date: date
+    target_group_id: Optional[str] = None
+    expected_end_date: Optional[date] = None
+    exclude_id: Optional[int] = None  # update 시 자기 자신 제외용
+
+
+@router.post("/assignments/preview")
+async def preview_nurse_assignment(
+    req: AssignmentPreviewRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 생성/수정 전 영향 분석 (dry-run).
+
+    돌려보지 않고 영향만 계산해 반환:
+    - conflicts: 기간 겹침 active 배정
+    - nml_affected: 자동 group_id update 대상 NML
+    - wanted_affected: 발효 월 이후 wanted 카운트 (안 건드림, 인지용)
+    - schedules_to_check: 재생성 검토 대상 schedule
+    - notifications: 알림 대상
+
+    참조: docs/NURSE_ASSIGNMENT_CRON_DESIGN.md §5
+    """
+    return preview_assignment_impact(
+        db,
+        nurse_id=req.nurse_id,
+        reason=req.reason,
+        start_date=req.start_date,
+        target_group_id=req.target_group_id,
+        expected_end_date=req.expected_end_date,
+        exclude_id=req.exclude_id,
     )
 
 
