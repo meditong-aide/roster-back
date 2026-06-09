@@ -19,6 +19,7 @@ from services.group_access import (
     resolve_managed_group_ids,
     resolve_effective_group,
     caller_is_manager,
+    assert_caller_can_access_group,
 )
 
 

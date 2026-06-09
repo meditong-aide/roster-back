@@ -108,6 +108,10 @@ class RosterRequest(BaseModel):
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
     # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.
     advanced_inference: bool = Field(default=False)
+    # A1: 표는 나왔지만 hard 위반(hv>0)이 있을 때, 위반을 0으로 만드는 완화 옵션을
+    # probe 로 실측해 infeasibility.resolution_options 로 함께 반환한다. 흔한 케이스라
+    # 매 생성마다 돌면 느려지므로 기본 OFF(프론트 "위반 해결책 보기" 시 opt-in, async 권장).
+    suggest_fixes: bool = Field(default=False)
     # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
     # mode:
     # - auto/hybrid: 균등 + 월선호를 함께 고려(기본)

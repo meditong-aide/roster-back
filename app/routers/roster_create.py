@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db.client2 import get_db
+from db.models import RosterConfig
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest
@@ -257,6 +258,116 @@ async def generate_roster_endpoint(
         print('error', e)
         payload = _fallback_unrecoverable_from_exception(f"근무표 생성 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=payload)
+
+
+class ApplyResolutionRequest(BaseModel):
+    """infeasibility 해결 옵션을 적용해 재생성하는 요청.
+
+    apply 는 /roster_create/generate 의 infeasibility.resolution_options[*].apply 를
+    그대로 echo 한 것(RosterConfig 컬럼 delta, 예: {"max_nig_per_month": 18}).
+    """
+    year: int
+    month: int
+    grade_strategy: Optional[str] = None
+    # probe 옵션: RosterConfig 컬럼 delta(예: {"max_nig_per_month": 18}).
+    apply: Dict[str, Any] = {}
+    # ontology 옵션: 적용할 treatment_id 리스트(런타임 플래그라 DB 미변경, 이번 생성만).
+    treatment_ids: Optional[List[str]] = None
+    option_id: Optional[str] = None
+    # True 면 재생성 성공 시 설정 변경을 영구 반영("이 설정 저장"). 기본은 transient(미리보기).
+    # 실패(여전히 infeasible)면 persist 여부와 무관하게 원복. (treatment_ids 경로엔 미적용)
+    persist: bool = False
+
+
+@router.post("/roster_create/apply-resolution")
+async def apply_resolution_endpoint(
+    req: ApplyResolutionRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """선택한 해결 옵션(설정 delta)을 **이번 생성에만 transient 적용**해 재생성한다.
+
+    동작: RosterConfig 컬럼 snapshot → delta 적용(commit) → generate_roster_service →
+    (persist=False) finally 에서 원복 / (persist=True 이고 성공) 원복 생략(영구 반영).
+    기본 transient 라 여러 옵션을 부담 없이 미리보기 가능, 마음에 들면 persist=True 로 저장.
+    적용 후에도 실패하면 persist 와 무관하게 원복하고 새 infeasibility(500)가 전파된다.
+
+    주의: 적용~원복 사이 동안 해당 group 의 config 가 일시 변경되므로, 동일 group 의 동시
+    생성과는 경합 가능(수간호사 월간 생성 빈도상 위험 낮음). 영구 반영은 별도 설정 저장 단계.
+    """
+    delta = {k: v for k, v in (req.apply or {}).items()}
+    treatment_ids = list(req.treatment_ids or [])
+    if not delta and not treatment_ids:
+        raise HTTPException(status_code=400, detail="apply(컬럼 delta) 또는 treatment_ids 가 필요합니다.")
+    gen_req = RosterRequest(year=req.year, month=req.month, grade_strategy=req.grade_strategy)
+
+    # ── ontology treatment 경로: 런타임 적용(DB 미변경, 이번 생성만, persist N/A) ──
+    if treatment_ids:
+        try:
+            result = generate_roster_service(gen_req, current_user, db, treatment_ids=treatment_ids)
+            if isinstance(result, dict):
+                result["applied_resolution"] = {
+                    "option_id": req.option_id, "treatment_ids": treatment_ids, "persisted": False,
+                }
+            return result
+        except HTTPException:
+            raise  # 여전히 infeasible → 새 옵션 payload 전파
+        except Exception as e:
+            print("apply-resolution(treatment) error", e)
+            payload = _fallback_unrecoverable_from_exception(f"treatment 적용 재생성 실패: {str(e)}")
+            raise HTTPException(status_code=500, detail=payload)
+
+    # ── 컬럼 delta 경로(probe 옵션): snapshot → 적용 → 재생성 → persist/원복 ──
+    allowed = {c.name for c in RosterConfig.__table__.columns}
+    bad = [k for k in delta if k not in allowed]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"적용 불가한 설정 키: {bad}")
+    rc = (
+        db.query(RosterConfig)
+        .filter(RosterConfig.group_id == current_user.group_id)
+        .order_by(RosterConfig.config_id.desc())
+        .first()
+    )
+    if rc is None:
+        raise HTTPException(status_code=404, detail="roster_config 를 찾을 수 없습니다.")
+    cid = rc.config_id
+    snapshot = {k: getattr(rc, k) for k in delta}
+    _keep = False  # persist 요청 + 재생성 성공 시에만 True → 원복 생략(영구 반영)
+    try:
+        for k, v in delta.items():
+            setattr(rc, k, v)
+        db.commit()
+        result = generate_roster_service(gen_req, current_user, db)
+        if bool(getattr(req, "persist", False)):
+            _keep = True  # 성공 후에만 도달 → 영구 유지
+        if isinstance(result, dict):
+            result["applied_resolution"] = {
+                "option_id": req.option_id, "changes": delta, "persisted": _keep,
+            }
+        return result
+    except HTTPException:
+        raise  # 여전히 infeasible → _keep=False → finally 원복, 새 옵션 payload 전파
+    except Exception as e:
+        print("apply-resolution error", e)
+        payload = _fallback_unrecoverable_from_exception(f"해결책 적용 재생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=payload)
+    finally:
+        if _keep:
+            # persist: 원복 생략(영구 반영). 변경은 이미 commit 됨.
+            print(f"[apply-resolution] persisted: config_id={cid} delta={delta}")
+        else:
+            try:
+                rc2 = db.query(RosterConfig).filter(RosterConfig.config_id == cid).first()
+                if rc2 is not None:
+                    for k, v in snapshot.items():
+                        setattr(rc2, k, v)
+                    db.commit()
+            except Exception as _re:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                print("apply-resolution restore failed", _re)
 
 
     # [Schedules] - 수간호사가 근무표 생성 요청

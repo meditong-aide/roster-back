@@ -2876,6 +2876,21 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             if _rs is not None:
                 setattr(_rs, "_constraint_impact_preflight_alerts", list(preflight_alerts or []))
                 setattr(_rs, "_constraint_impact_mid_feasibility_error", mid_feasibility_error)
+                # 엔진에 실제로 들어간 유효 config 스냅샷(하드규칙+조립분 전부 포함).
+                # UNDIAGNOSED probe 가 충실한 base 로 재완화하는 데 쓴다(실패 시점 메모리는
+                # ORM 만료·stale 라 부정확하므로 solve 시점에 박아둔다). _sa_* 는 제외.
+                try:
+                    _eff_snap: dict = {}
+                    for _ck, _cv in config_dict.items():
+                        if str(_ck).startswith("_sa_"):
+                            continue
+                        try:
+                            _eff_snap[_ck] = deepcopy(_cv)
+                        except Exception:
+                            _eff_snap[_ck] = _cv
+                    setattr(_rs, "_effective_config_snapshot", _eff_snap)
+                except Exception as _eff_exc:
+                    print(f"[EffectiveConfigSnapshot] 실패(무시): {_eff_exc}")
                 setattr(_rs, "_constraint_impact_merged_initial_constraints", deepcopy(config_dict.get("initial_constraints") or {}))
                 setattr(_rs, "_constraint_impact_special_fixed_requests", deepcopy(config_dict.get("special_fixed_requests") or []))
                 setattr(
@@ -3342,9 +3357,11 @@ def _extract_unrecoverable_violated_constraints(
 
     출처:
       1. validation_error 문자열의 reason_code 패턴 (예: `[reason_code=NO_ASSIGNMENT]`)
-      2. _build_infeasible_diagnosis(roster_system, generated)의 reason_code
-      3. _probe_first_grade_hard_blocker(roster_system) — grade-hard 충돌
-      4. roster_system.blocked_by_nurse — 해당 nurse가 전부 차단된 케이스
+      2. roster_system.blocked_by_nurse — 해당 nurse가 전부 차단된 케이스
+
+    주의: 여기서 가짜 원인을 휴리스틱으로 추측하지 않는다. 실제 cause 는
+    하류 build_unrecoverable_payload (pool snapshot · conflict_detector ·
+    structural_diagnosis · CP-SAT MUS) 가 결정론적으로 만든다.
 
     반환 항목 형식:
         {"node_id", "slack", "details", "reason_code", "human_message_ko"}
@@ -3382,26 +3399,10 @@ def _extract_unrecoverable_violated_constraints(
     for m in re.finditer(r"\[reason_code=([A-Z_]+)\]", err):
         _push(m.group(1), err, details={"source": "validation_error"})
 
-    # NO_ASSIGNMENT* 4축 라벨 추론 코드 제거됨 (US-10):
     # 미배정 cell 자체는 "결과(symptom)" 이며 cause 가 아니다.
-    # 실제 cause 는 team_grade_precheck 의 산술 detector + cause_inferer 의
-    # MUS pattern 추론 가 구체 cause_id 로 만들어준다.
-
-    try:
-        diag = _build_infeasible_diagnosis(roster_system, generated)
-        if diag:
-            m = re.search(r"\[reason_code=([A-Z_]+)\]", diag)
-            if m:
-                _push(m.group(1), diag, details={"source": "diagnosis"})
-    except Exception:
-        pass
-
-    try:
-        probe = _probe_first_grade_hard_blocker(roster_system)
-        if probe:
-            _push("GRADE_HARD_PROBE", probe, details={"source": "grade_hard_probe"})
-    except Exception:
-        pass
+    # 가짜 원인을 추측하던 _build_infeasible_diagnosis / _probe_first_grade_hard_blocker
+    # 휴리스틱은 제거됨. 실제 cause 는 team_grade_precheck 의 산술 detector +
+    # cause_inferer 의 MUS pattern 추론이 구체 cause_id 로 만든다.
 
     try:
         blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
@@ -3432,261 +3433,6 @@ def _extract_unrecoverable_violated_constraints(
         pass
 
     return out[:50]
-
-
-def _build_infeasible_diagnosis(roster_system, generated: dict[str, list[str]] | None) -> str | None:
-    try:
-        cfg = getattr(roster_system, "config", None)
-        if cfg is None:
-            return None
-        num_days = int(getattr(roster_system, "num_days", 0) or 0)
-        if num_days <= 0:
-            return None
-        nurses = list(getattr(roster_system, "nurses", []) or [])
-        nurse_count = len(nurses) if nurses else len(generated or {})
-        if nurse_count <= 0:
-            return None
-
-        shift_types = list(getattr(cfg, "shift_types", []) or [])
-
-        def _required_by_day(day_idx: int) -> dict[str, int]:
-            by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
-            if isinstance(by_day, list) and day_idx < len(by_day) and isinstance(by_day[day_idx], dict):
-                return {str(k).upper(): int(v or 0) for k, v in by_day[day_idx].items()}
-            base = getattr(cfg, "daily_shift_requirements", None)
-            if isinstance(base, dict):
-                return {str(k).upper(): int(v or 0) for k, v in base.items()}
-            return {}
-
-        total_required = 0
-        n_required = 0
-        for d in range(num_days):
-            req = _required_by_day(d)
-            for code, val in req.items():
-                if code == "O":
-                    continue
-                if shift_types and code not in shift_types:
-                    continue
-                v = int(val or 0)
-                if v <= 0:
-                    continue
-                total_required += v
-                if code == "N":
-                    n_required += v
-
-        effective_off_days, off_source = resolve_effective_off_days(cfg)
-        # max coverage가 있으면 auto_max로 off_days 클램핑
-        max_by_day = getattr(cfg, "daily_shift_requirements_max_by_day", None)
-        _has_max = isinstance(max_by_day, list) and any(
-            any(int(v or 0) > 0 for v in dm.values())
-            for dm in max_by_day if isinstance(dm, dict)
-        )
-        if _has_max:
-            import math
-            _blocked_set_diag = set()
-            blocked_by_nurse_diag = getattr(roster_system, "blocked_by_nurse", None) or {}
-            if blocked_by_nurse_diag:
-                _blocked_set_diag = set(blocked_by_nurse_diag.keys())
-            _total_capacity_diag = 0
-            for _dd in range(num_days):
-                _day_min_sum = 0
-                by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
-                if isinstance(by_day, list) and _dd < len(by_day) and isinstance(by_day[_dd], dict):
-                    _day_min_sum = sum(int(v or 0) for v in by_day[_dd].values())
-                elif hasattr(cfg, "daily_shift_requirements") and isinstance(cfg.daily_shift_requirements, dict):
-                    _day_min_sum = sum(int(v or 0) for v in cfg.daily_shift_requirements.values())
-                join = getattr(roster_system, "join", None) or []
-                leave = getattr(roster_system, "leave", None) or []
-                N = len(nurses)
-                _day_active = sum(
-                    1 for nn in range(N)
-                    if nn < len(join) and nn < len(leave)
-                    and join[nn] <= _dd <= leave[nn]
-                    and _dd not in (blocked_by_nurse_diag.get(nn, set()))
-                )
-                _total_capacity_diag += max(0, _day_active - _day_min_sum)
-            _n_full = max(1, sum(1 for nn in range(len(nurses)) if nn not in _blocked_set_diag))
-            _auto_max_diag = max(1, int(_total_capacity_diag / _n_full))
-            if _auto_max_diag < int(effective_off_days or 0):
-                effective_off_days = _auto_max_diag
-                off_source = f"auto_max(coverage)"
-        # off_first=True: off_days(월 OFF 수) 무시하고 daily_shift 커버리지 충족만 검증.
-        #   잔여 셀이 OFF로 자연 회수되는 정책이므로 사전 capacity 검증에서 OFF 차감 제거.
-        _off_first = bool(getattr(cfg, "off_first", False))
-        if _off_first:
-            max_work_per_nurse = num_days
-        else:
-            max_work_per_nurse = max(0, num_days - int(effective_off_days or 0))
-        total_capacity = nurse_count * max_work_per_nurse
-        if total_required > total_capacity:
-            return (
-                "[reason_code=CAPACITY_TOTAL_SHORTAGE] "
-                "Infeasible 진단: 월 총 필요 근무 슬롯이 공급 상한을 초과했습니다. "
-                f"(요구={total_required}, 공급상한={total_capacity}, 간호사={nurse_count}, "
-                f"days={num_days}, off_days={effective_off_days}, off_first={_off_first}, source={off_source})"
-            )
-
-        max_night_per_nurse = int(getattr(cfg, "max_night_shifts_per_month", 0) or 0)
-        if max_night_per_nurse > 0 and n_required > (nurse_count * max_night_per_nurse):
-            return (
-                "[reason_code=N_CAPACITY_SHORTAGE] "
-                "Infeasible 진단: 월간 N 수요가 N 상한 용량을 초과했습니다. "
-                f"(N요구={n_required}, N용량상한={nurse_count * max_night_per_nurse}, "
-                f"간호사={nurse_count}, max_night_per_month={max_night_per_nurse})"
-            )
-
-        return None
-    except Exception:
-        return None
-
-
-# TEMP-PROBE-DELETE-START
-def _probe_first_grade_hard_blocker(roster_system) -> str | None:
-    """임시 프로브: Grade hard 제약의 일자/교대별 첫 충돌 지점을 찾는다.
-
-    삭제 가이드:
-      - TEMP-PROBE-DELETE-START ~ TEMP-PROBE-DELETE-END 전체 삭제
-      - _validate_generated_roster 내 호출부(동일 태그 주석)도 함께 삭제
-    """
-    try:
-        cfg = getattr(roster_system, "config", None)
-        if cfg is None:
-            return None
-        gc = getattr(roster_system, "grade_config", None) or {}
-        min_map = (gc.get("constraints_json") or gc.get("constraints") or {})
-        max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
-        if not min_map and not max_map:
-            return None
-
-        nurses = list(getattr(roster_system, "nurses", []) or [])
-        if not nurses:
-            return None
-        num_days = int(getattr(roster_system, "num_days", 0) or 0)
-        if num_days <= 0:
-            return None
-
-        shift_types = set(str(s).upper() for s in (getattr(cfg, "shift_types", []) or []))
-        join = list(getattr(roster_system, "join", []) or [])
-        leave = list(getattr(roster_system, "leave", []) or [])
-        if len(join) != len(nurses) or len(leave) != len(nurses):
-            # CP-SAT 내부 join/leave가 객체에 노출되지 않는 경로 보정
-            join = [0 for _ in nurses]
-            leave = [num_days - 1 for _ in nurses]
-        blocked_by_nurse = getattr(roster_system, "blocked_by_nurse", None) or {}
-
-        req_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
-        req_base = getattr(cfg, "daily_shift_requirements", None) or {}
-
-        # 제약에 명시된 grade만 추출(미명시 grade는 중립)
-        constrained_grades = set()
-        for mp in (min_map, max_map):
-            if not isinstance(mp, dict):
-                continue
-            for by_g in mp.values():
-                if not isinstance(by_g, dict):
-                    continue
-                for gk in by_g.keys():
-                    try:
-                        constrained_grades.add(int(gk))
-                    except Exception:
-                        continue
-        if not constrained_grades:
-            return None
-
-        def _day_req(day_idx: int, shift_code: str) -> int:
-            if isinstance(req_by_day, list) and day_idx < len(req_by_day) and isinstance(req_by_day[day_idx], dict):
-                return int((req_by_day[day_idx] or {}).get(shift_code, 0) or 0)
-            return int((req_base or {}).get(shift_code, 0) or 0)
-
-        def _is_active(n_idx: int, day_idx: int, shift_code: str) -> bool:
-            if n_idx >= len(join) or n_idx >= len(leave):
-                return False
-            if not (join[n_idx] <= day_idx <= leave[n_idx]):
-                return False
-            if day_idx in (blocked_by_nurse.get(n_idx, set()) or set()):
-                return False
-            if shift_code in {"D", "E"} and bool(getattr(nurses[n_idx], "is_night_nurse", 0) == 3):
-                return False
-            return True
-
-        for d in range(num_days):
-            for s_code in sorted(set([str(k).upper() for k in list(min_map.keys()) + list(max_map.keys())])):
-                if shift_types and s_code not in shift_types:
-                    continue
-                req = _day_req(d, s_code)
-                if req <= 0:
-                    continue
-
-                active_total = 0
-                active_by_grade = defaultdict(int)
-                active_unconstrained = 0
-                for i, n in enumerate(nurses):
-                    if not _is_active(i, d, s_code):
-                        continue
-                    active_total += 1
-                    g = getattr(n, "grade", None)
-                    try:
-                        gi = int(g) if g is not None else None
-                    except Exception:
-                        gi = None
-                    if gi in constrained_grades:
-                        active_by_grade[gi] += 1
-                    else:
-                        active_unconstrained += 1
-
-                if active_total < req:
-                    return (
-                        f"[probe=GRADE_HARD_ACTIVE_SHORTAGE] day={d+1} shift={s_code} "
-                        f"active={active_total} < req={req}"
-                    )
-
-                min_by_g_raw = (min_map.get(s_code) or {}) if isinstance(min_map, dict) else {}
-                min_sum = 0
-                for gk, tv in min_by_g_raw.items():
-                    try:
-                        gi = int(gk)
-                        t = int(tv or 0)
-                    except Exception:
-                        continue
-                    if t <= 0:
-                        continue
-                    avail = int(active_by_grade.get(gi, 0))
-                    if avail < t:
-                        return (
-                            f"[probe=GRADE_HARD_MIN_BLOCK] day={d+1} shift={s_code} grade={gi} "
-                            f"need={t} avail={avail} req={req}"
-                        )
-                    min_sum += t
-                if min_sum > req:
-                    return (
-                        f"[probe=GRADE_HARD_MIN_OVER_NEED] day={d+1} shift={s_code} "
-                        f"min_sum={min_sum} > req={req}"
-                    )
-
-                max_by_g_raw = (max_map.get(s_code) or {}) if isinstance(max_map, dict) else {}
-                if isinstance(max_by_g_raw, dict) and max_by_g_raw:
-                    capped = active_unconstrained
-                    for gk, uv in max_by_g_raw.items():
-                        try:
-                            gi = int(gk)
-                            u = int(uv)
-                        except Exception:
-                            continue
-                        if u < 0:
-                            continue
-                        capped += min(int(active_by_grade.get(gi, 0)), u)
-                    for gi in constrained_grades:
-                        if str(gi) not in {str(k) for k in max_by_g_raw.keys()}:
-                            capped += int(active_by_grade.get(gi, 0))
-                    if capped < req:
-                        return (
-                            f"[probe=GRADE_HARD_MAX_CAP_SHORTAGE] day={d+1} shift={s_code} "
-                            f"cap={capped} < req={req} (unconstrained={active_unconstrained}, by_grade={dict(active_by_grade)})"
-                        )
-        return None
-    except Exception as exc:
-        return f"[probe=GRADE_HARD_PROBE_ERROR] {exc}"
-# TEMP-PROBE-DELETE-END
 
 
 def _validate_generated_roster(
@@ -3730,116 +3476,27 @@ def _validate_generated_roster(
         pass
 
     if total_cells > 0 and work_cells == 0:
-        diag = _build_infeasible_diagnosis(roster_system, generated)
-        cp_probe_msg = getattr(roster_system, "_grade_hard_probe_msg", None)
-
-        def _grade_probe_comment(msg: str | None) -> str | None:
-            if not msg:
-                return None
-            if "MAX_CAP_SHORTAGE" not in msg:
-                return None
-            day_m = re.search(r"day=(\d+)", msg)
-            shift_m = re.search(r"shift=([A-Z]+)", msg)
-            cap_m = re.search(r"cap=(\d+)", msg)
-            req_m = re.search(r"req=(\d+)", msg)
-            day = day_m.group(1) if day_m else "?"
-            shift = shift_m.group(1) if shift_m else "?"
-            cap = cap_m.group(1) if cap_m else "?"
-            req = req_m.group(1) if req_m else "?"
-            return (
-                "[comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮아 infeasible 발생 "
-                f"(day={day}, shift={shift}, cap={cap}, req={req}). "
-                "grade_max 중요도를 낮춘 soft fallback 또는 상한 완화가 필요합니다."
-            )
-
-        probe_comment = _grade_probe_comment(cp_probe_msg)
-        if cp_probe_msg:
-            if diag:
-                if probe_comment:
-                    return _with_ontology(f"{diag} | [cp_probe={cp_probe_msg}] | {probe_comment}")
-                return _with_ontology(f"{diag} | [cp_probe={cp_probe_msg}]")
-            if probe_comment:
-                return _with_ontology(
-                    "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
-                    f"| [cp_probe={cp_probe_msg}] | {probe_comment}"
-                )
-            return _with_ontology(f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | [cp_probe={cp_probe_msg}]")
-        # TEMP-PROBE-DELETE: NO_ASSIGNMENT 시 grade hard 충돌 일자/교대를 임시 탐색
-        probe_msg = _probe_first_grade_hard_blocker(roster_system)
-        if probe_msg:
-            print(f"[InfeasibleProbe] {probe_msg}")
-            if diag:
-                return _with_ontology(f"{diag} | {probe_msg}")
-            return _with_ontology(f"[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. | {probe_msg}")
-
-        # probe로 못 잡힌 경우, grade_max 산술 상한만으로도 즉시 불가능한 케이스를 보조 진단한다.
+        # 엔진이 실근무를 한 건도 배정하지 못함 = infeasible 의 '증상(symptom)'.
+        # 여기서 가짜 원인(grade_max cap 추측 등)을 만들어내지 않는다. 실제 cause 는
+        # 하류 build_unrecoverable_payload (pool snapshot · conflict_detector ·
+        # structural_diagnosis · CP-SAT MUS) 가 결정론적으로 진단한다.
+        # _infeasible_empty 플래그는 soft-fallback 자동재시도의 '실제 신호'다
+        # (NO_ASSIGNMENT 문자열 매칭 대신 사용).
         try:
-            cfg = getattr(roster_system, "config", None)
-            gc = getattr(roster_system, "grade_config", None) or {}
-            if cfg is None and isinstance(config_context, dict):
-                class _CfgProxy:
-                    pass
-                _p = _CfgProxy()
-                setattr(_p, "daily_shift_requirements", config_context.get("daily_shift_requirements") or {})
-                setattr(_p, "daily_shift_requirements_by_day", config_context.get("daily_shift_requirements_by_day"))
-                cfg = _p
-            if (not gc) and isinstance(grade_config_context, dict):
-                gc = grade_config_context
-            max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
-            if cfg and isinstance(max_map, dict) and max_map:
-                nurses = list(getattr(roster_system, "nurses", []) or [])
-                if not nurses and isinstance(nurses_context, list):
-                    nurses = list(nurses_context)
-                grade_counts: dict[int, int] = defaultdict(int)
-                for nu in nurses:
-                    try:
-                        grade_counts[int(getattr(nu, "grade", None))] += 1
-                    except Exception:
-                        continue
-
-                ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
-                base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
-
-                def _req(day_idx: int, shift_code: str) -> int:
-                    if isinstance(ds_by_day, list) and day_idx < len(ds_by_day) and isinstance(ds_by_day[day_idx], dict):
-                        return int((ds_by_day[day_idx] or {}).get(shift_code, 0) or 0)
-                    return int((base_req or {}).get(shift_code, 0) or 0)
-
-                days = int(getattr(roster_system, "num_days", 0) or 0)
-                if days <= 0 and isinstance(ds_by_day, list):
-                    days = len(ds_by_day)
-                for d in range(days):
-                    for s_code, limits_raw in max_map.items():
-                        if not isinstance(limits_raw, dict):
-                            continue
-                        shift_code = str(s_code or "").strip().upper()
-                        req = _req(d, shift_code)
-                        if req <= 0:
-                            continue
-
-                        constrained = {int(gk): int(v or 0) for gk, v in limits_raw.items() if str(gk).isdigit()}
-                        cap = 0
-                        for g, cnt in grade_counts.items():
-                            if g in constrained:
-                                cap += min(cnt, max(0, constrained[g]))
-                            else:
-                                cap += cnt
-                        if cap < req:
-                            aux = (
-                                "[reason_code=GRADE_MAX_SUM_BELOW_NEED] "
-                                f"day={d+1} shift={shift_code} req={req} cap={cap} "
-                                f"limits={constrained}"
-                            )
-                            if diag:
-                                return _with_ontology(f"{diag} | {aux}")
-                            return _with_ontology(
-                                "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다. "
-                                f"| {aux} | [comment] grade_max 상한으로 유효 인원 cap이 요구치보다 낮습니다. "
-                                "grade_max 중요도를 soft로 낮추거나 상한 완화를 검토하세요."
-                            )
-        except Exception as _aux_exc:
-            print(f"[InfeasibleProbe][aux] grade_max 보조진단 실패(무시): {_aux_exc}")
-        return _with_ontology(diag or "[reason_code=NO_ASSIGNMENT] Infeasible 진단: 실근무 배정이 0건입니다.")
+            setattr(roster_system, "_infeasible_empty", True)
+        except Exception:
+            pass
+        ev = getattr(roster_system, "_validator_evidence", None) or {}
+        ev_brief = {
+            "total_failed_cells": ev.get("total_failed_cells"),
+            "required_minus_assigned_total": ev.get("required_minus_assigned_total"),
+            "eligible_zero_cells": ev.get("eligible_zero_cells"),
+            "fixed_forbidden_count": ev.get("fixed_forbidden_count"),
+            "carryover_artifact_count": ev.get("carryover_artifact_count"),
+        }
+        return _with_ontology(
+            f"[reason_code=NO_ASSIGNMENT] 실근무 배정 0건(증상). 원인은 구조진단에서 결정. evidence={ev_brief}"
+        )
 
     # day-zero coverage 감지 — symptom 라벨은 throw 하지 않고 cause probe 4축을 강제 실행.
     # cause 가 식별되면 그것만 반환, 모든 probe 가 침묵하면 UNDIAGNOSED sentinel + evidence dump.
@@ -3879,12 +3536,12 @@ def _validate_generated_roster(
 
                 total_actual = sum(actual.values())
                 if total_actual == 0:
-                    diag = _build_infeasible_diagnosis(roster_system, generated)
-                    if diag:
-                        return _with_ontology(diag)
-                    probe = _probe_first_grade_hard_blocker(roster_system)
-                    if probe:
-                        return _with_ontology(f"[reason_code=GRADE_HARD_PROBE] {probe}")
+                    # 특정일 coverage 0 = 증상. 가짜 원인 추측 없이 plain symptom +
+                    # evidence 만 반환하고, 실제 cause 는 하류 구조진단이 결정한다.
+                    try:
+                        setattr(roster_system, "_infeasible_empty", True)
+                    except Exception:
+                        pass
                     ev = getattr(roster_system, "_validator_evidence", None) or {}
                     req_msg = ", ".join(f"{k}={v}" for k, v in req.items())
                     ev_brief = {
@@ -4572,7 +4229,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -5595,6 +5252,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
         #         "engine_nurses": len(nurses_for_engine),
         #     },
         # )
+        # ── ontology treatment 적용: 선택된 treatment_ids 를 config 에 패치(재생성용) ──
+        # apply_treatments 가 force_soft_mode/disable_module/set_threshold 를 patched_config 로
+        # 반영(대부분 런타임 플래그). data_correction_required(manual)는 적용 안 됨.
+        if treatment_ids:
+            try:
+                from services.treatment_applicator import apply_treatments
+                _clean_cfg = {k: v for k, v in config_dict.items() if not str(k).startswith("_sa_")}
+                _tres = apply_treatments(list(treatment_ids), _clean_cfg)
+                config_dict = _tres.patched_config
+                print(f"[TreatmentApply] applied={_tres.applied_treatment_ids} "
+                      f"manual={_tres.manual_required} unresolved={_tres.unresolved_treatment_ids}")
+            except Exception as _tapp_exc:
+                print(f"[TreatmentApply] 실패(무시): {_tapp_exc}")
         generated, satisfaction_data, roster_system = _run_cp_sat_basic(
             db,
             current_user,
@@ -5674,12 +5344,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     )
     applied_relaxations: list[str] = []
     if validation_error:
-        # 자연 soft 트리거: NO_ASSIGNMENT 또는 grade_max 병목, 그리고 아직 soft 미적용
-        _trigger_soft = (
-            ("NO_ASSIGNMENT" in validation_error)
-            or ("MAX_CAP_SHORTAGE" in validation_error)
-            or ("GRADE_MAX_SUM_BELOW_NEED" in validation_error)
-        )
+        # 자연 soft 트리거: 엔진이 실근무를 못 배정한 infeasible-empty 신호(실제 플래그)
+        # 를 본다. 과거처럼 휴리스틱이 만든 NO_ASSIGNMENT/grade_max 문자열을 매칭하지 않음.
+        _trigger_soft = bool(getattr(roster_system, "_infeasible_empty", False))
         if _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
             print("[TeamMinFallback] infeasible 감지 → team_min hard→soft 자동 전환으로 1회 재시도 (grade hard 유지)")
             soft_cfg = dict(config_dict)
@@ -5850,6 +5517,71 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
                 pool_snapshot=_pool_snapshot_dict,
                 nurse_index_map=_nurse_index_map,
             )
+            # ── UNDIAGNOSED 블랙박스 probe ──
+            # 분석(MUS/산술/max-flow)이 원인을 못 짚은 경우, 결합제약을 하나씩 풀어
+            # 엔진을 재실행해 "무엇을 풀면 feasible 해지는가"를 실측한다(verified resolution).
+            # UNDIAGNOSED(원인 미식별) 상황이면 자동 실행. kill-switch(UNDIAG_PROBE_DISABLE=1)
+            # 로만 끈다. 실패해도 기존 payload 그대로(graceful). 이미 실패한 케이스에만 타므로
+            # 정상 생성에는 영향 없음. (※ 동기 경로는 probe 시간만큼 응답 지연 — async 권장)
+            try:
+                import os as _os_undiag
+                _inf_pre = unrecoverable.get("infeasibility", {}) or {}
+                _sd_pre = _inf_pre.get("structural_diagnosis", {}) or {}
+                _codes_pre = (_sd_pre.get("signals") or {}).get("reason_codes") or []
+                _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not (_sd_pre.get("primary_causes") or [])
+                if _is_undiag and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
+                    from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
+
+                    def _undiag_resolve(_relaxed_cfg):
+                        _g, _, _rs = _run_cp_sat_basic(
+                            db, current_user, nurses_for_engine, preferences, latest_config, req,
+                            shift_manage_data,
+                            fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                            time_limit_seconds=60,
+                            config_override=_relaxed_cfg,
+                            _assignments=_assignments,
+                            _inbound_assignments=_inbound_assignments,
+                            _outbound_assignments=_outbound_assignments,
+                        )
+                        _err = _validate_generated_roster(
+                            _g, _rs,
+                            nurses_context=list(nurses_for_engine or []),
+                            config_context=_relaxed_cfg,
+                            grade_config_context=_fetch_grade_config_dict(
+                                db, current_user.office_id, current_user.group_id),
+                        )
+                        return (_err is None), {"validation_error": (str(_err)[:80] if _err else None)}
+
+                    # probe base: solve 시점에 박아둔 유효 config 스냅샷(하드규칙+조립분 포함, 충실).
+                    # 실패 시점 메모리(config_dict)는 ORM 만료·stale 라 부정확하므로 스냅샷 우선.
+                    _probe_base = getattr(roster_system, "_effective_config_snapshot", None)
+                    if not _probe_base:
+                        _probe_base = {k: v for k, v in dict(config_dict).items()
+                                       if not str(k).startswith("_sa_")}
+                    _probe_base = dict(_probe_base)
+                    _probe_res = probe_relaxations(_probe_base, _undiag_resolve)
+                    unrecoverable["infeasibility"]["probe_resolutions"] = _probe_res.get("resolutions", [])
+                    unrecoverable["infeasibility"]["probe_combo"] = _probe_res.get("combo")
+                    unrecoverable["infeasibility"]["probe_found"] = _probe_res.get("found", False)
+                    # 프론트용 통합 옵션 카드: probe(검증됨)를 앞에, 기존 ontology 옵션
+                    # (build_unrecoverable_payload 가 treatment 로 채운 것) 뒤에 prepend.
+                    _probe_opts = to_resolution_options(_probe_res, _probe_base)
+                    _exist_opts = unrecoverable["infeasibility"].get("resolution_options") or []
+                    unrecoverable["infeasibility"]["resolution_options"] = _probe_opts + _exist_opts
+                    # 정합성: probe 가 검증된(verified) 옵션을 찾았으면 "해를 못 찾음, 점검하세요"
+                    # 메시지와 모순되므로, 적용 가능한 옵션이 있음을 알리는 문구로 교정.
+                    if any(o.get("verified") for o in _probe_opts):
+                        unrecoverable["infeasibility"]["summary_message_ko"] = (
+                            "자동 진단으로는 원인을 특정하지 못했지만, 아래 옵션 중 하나를 "
+                            "적용하면 근무표를 생성할 수 있습니다. 적용할 옵션을 선택해주세요."
+                        )
+                    _combo = _probe_res.get("combo")
+                    print(f"[UndiagProbe] found={_probe_res.get('found')} "
+                          f"resolutions={[r['id'] for r in _probe_res.get('resolutions', [])]} "
+                          f"combo={_combo.get('id') if _combo else None}")
+            except Exception as _undiag_exc:
+                print(f"[UndiagProbe] failed (ignore): {_undiag_exc}")
+            # (ontology treatment → resolution_options 는 build_unrecoverable_payload 에서 처리됨)
             inf = unrecoverable.get("infeasibility", {})
             print(
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
@@ -5948,6 +5680,53 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
             print(f"[RosterGenerate][response][message] {_inf['summary_message_ko']}")
     except Exception as _exc:
         print(f"[Infeasibility] payload 빌드 실패(무시): {_exc}")
+
+    # ── A1: 표는 나왔으나 hard 위반(hv>0) → 위반 0 으로 만드는 완화 옵션 probe (opt-in) ──
+    # UNDIAGNOSED probe 와 동일 메커니즘. 성공조건만 feasible → hard_viol==0.
+    # 흔한 케이스라 req.suggest_fixes=True 일 때만 실행(매 생성 지연 방지). kill-switch 동일.
+    try:
+        import os as _os_a1
+        _ci_a1 = roster_data.get("constraint_impact") or {}
+        _hv_cnt = int(_ci_a1.get("hard_violation_count") or 0)
+        _inf_a1 = roster_data.get("infeasibility")
+        if (bool(getattr(req, "suggest_fixes", False)) and _hv_cnt > 0
+                and isinstance(_inf_a1, dict)
+                and _os_a1.getenv("UNDIAG_PROBE_DISABLE") != "1"):
+            from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
+            _a1_base = getattr(roster_system, "_effective_config_snapshot", None)
+            if _a1_base:
+                def _a1_resolve(_relaxed_cfg):
+                    _g2, _, _rs2 = _run_cp_sat_basic(
+                        db, current_user, nurses_for_engine, preferences, latest_config, req,
+                        shift_manage_data,
+                        fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                        time_limit_seconds=60, config_override=_relaxed_cfg,
+                        _assignments=_assignments, _inbound_assignments=_inbound_assignments,
+                        _outbound_assignments=_outbound_assignments,
+                    )
+                    try:
+                        _ci2 = _build_constraint_impact_payload(_rs2, req)
+                        _hv2 = int((_ci2 or {}).get("hard_violation_count") or 0)
+                    except Exception:
+                        _hv2 = 1
+                    return (_hv2 == 0), {"hard_viol": _hv2}
+
+                _a1_res = probe_relaxations(dict(_a1_base), _a1_resolve)
+                _a1_opts = to_resolution_options(_a1_res, _a1_base)
+                _inf_a1["resolution_options"] = _a1_opts
+                _inf_a1["probe_found"] = _a1_res.get("found", False)
+                # 정합성: 위반표(hv>0) warning 메시지에, 위반을 0 으로 만드는 검증된
+                # 옵션이 있음을 덧붙여 안내(기존 위반 요약 메시지는 유지).
+                if any(o.get("verified") for o in _a1_opts):
+                    _base_msg = (_inf_a1.get("summary_message_ko") or "").rstrip()
+                    _add_msg = ("아래 옵션 중 하나를 적용하면 위반 없이 다시 생성할 수 있습니다.")
+                    _inf_a1["summary_message_ko"] = (
+                        f"{_base_msg} {_add_msg}" if _base_msg else _add_msg
+                    )
+                print(f"[A1Probe] hv={_hv_cnt} → found={_a1_res.get('found')} "
+                      f"options={[o['option_id'] for o in (_inf_a1.get('resolution_options') or [])]}")
+    except Exception as _a1_exc:
+        print(f"[A1Probe] failed (ignore): {_a1_exc}")
 
     # ── assignment 대상자 근무표 생성 알림 (S09) ──
     try:

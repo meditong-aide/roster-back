@@ -1,0 +1,150 @@
+{
+  "ward": "9B",
+  "year": 2026,
+  "month": 5,
+  "baseline_feasible": true,
+  "baseline_work_cells": 295,
+  "cases": {
+    "C1": {
+      "case": "C1",
+      "injected": {
+        "case": "C1",
+        "day": 0,
+        "shift": "N",
+        "amount": 99,
+        "family": "CoverageMin",
+        "knob": "daily_shift_requirements",
+        "baseline": 2
+      },
+      "injected_feasible": false,
+      "valid_injection": true,
+      "n_actions": 2,
+      "top_action": {
+        "family": "CoverageMin",
+        "action_type": "set_threshold",
+        "config_key": "daily_shift_requirements",
+        "is_primary": true,
+        "delta": {
+          "kind": "set_threshold",
+          "config_key": "daily_shift_requirements",
+          "direction": "decrease",
+          "amount": 90
+        }
+      },
+      "E1_action_emitted": true,
+      "E5_honest_cause": true,
+      "E2_solvable": true,
+      "fixed_work_cells": 292,
+      "E3_minimal_change": true,
+      "E4_no_regression": true,
+      "resolved": true
+    },
+    "C2": {
+      "case": "C2",
+      "injected": {
+        "case": "C2",
+        "team": "2",
+        "team_size": 6,
+        "family": "TeamMin",
+        "knob": "team_min_by_team",
+        "baseline": {
+          "D": 1,
+          "E": 1
+        },
+        "shifts": [
+          "D",
+          "E",
+          "N"
+        ]
+      },
+      "injected_feasible": false,
+      "valid_injection": true,
+      "n_actions": 4,
+      "top_action": {
+        "family": "TeamMin",
+        "action_type": "set_threshold",
+        "config_key": "team_min_by_team",
+        "is_primary": true,
+        "delta": {
+          "kind": "set_threshold",
+          "config_key": "team_min_by_team",
+          "direction": "decrease",
+          "amount": 12
+        }
+      },
+      "E1_action_emitted": true,
+      "E5_honest_cause": true,
+      "E2_solvable": true,
+      "fixed_work_cells": 292,
+      "E3_minimal_change": true,
+      "E4_no_regression": true,
+      "resolved": true
+    },
+    "C3": {
+      "case": "C3",
+      "injected": {
+        "case": "C3",
+        "shift": "N",
+        "family": "GradeMax",
+        "knob": "constraints_max_json",
+        "baseline": {}
+      },
+      "injected_feasible": false,
+      "valid_injection": true,
+      "n_actions": 1,
+      "top_action": {
+        "family": "GradeMax",
+        "action_type": "force_soft_mode",
+        "config_key": "_force_grade_max_soft_fallback",
+        "is_primary": true,
+        "delta": {
+          "kind": "force_soft_mode",
+          "config_key": "_force_grade_max_soft_fallback",
+          "value": true
+        }
+      },
+      "E1_action_emitted": true,
+      "E5_honest_cause": true,
+      "E2_solvable": true,
+      "fixed_work_cells": 292,
+      "E3_minimal_change": true,
+      "E4_no_regression": true,
+      "resolved": true
+    },
+    "C4": {
+      "case": "C4",
+      "injected": {
+        "case": "C4",
+        "cap": 1,
+        "family": "MonthlyNightCap",
+        "knob": "max_nig_per_month",
+        "baseline": 15
+      },
+      "injected_feasible": false,
+      "valid_injection": true,
+      "n_actions": 1,
+      "top_action": {
+        "family": "MonthlyNightCap",
+        "action_type": "set_threshold",
+        "config_key": "max_nig_per_month",
+        "is_primary": true,
+        "delta": {
+          "kind": "set_threshold",
+          "config_key": "max_nig_per_month",
+          "direction": "increase",
+          "amount": 47
+        }
+      },
+      "E1_action_emitted": true,
+      "E5_honest_cause": true,
+      "E2_solvable": true,
+      "fixed_work_cells": 292,
+      "E3_minimal_change": true,
+      "E4_no_regression": true,
+      "resolved": true
+    }
+  },
+  "n_valid_cases": 4,
+  "n_na_cases": 0,
+  "all_passed": true
+}
