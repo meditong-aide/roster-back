@@ -933,16 +933,22 @@ def group_members_in_month(
     - 영구 전출(병동이동, start<=월초)로 완전히 떠난 사람 → 제외(그 달 미표시).
     - 전출 transition(병동이동, start 월중) → status='outbound', marker='←'.
     - 파견 나감(source==group) → status='dispatch_out', badge='파견 중'.
-    - 휴직/퇴사(source==group) → status='leave'/'resigned'.
-    - 인바운드(target==group, source!=group) → status='inbound', marker='→', as-of team/grade=target_*.
+    - 휴직/퇴사(source==group) → status='leave'/'resigned' (지속 상태 배지).
+    - 인바운드(target==group, source!=group), as-of team/grade=target_*:
+      · 병동이동 = 일회성 전이 → start ∈ 그 달(이동月)에만 status='inbound'/marker='→',
+        지난 달 발효(정착)면 status='active'(마커 없음). flush 전이어도 명단 포함.
+      · 파견 = 지속 상태 → 기간 내내 status='inbound'/badge='파견'(마커 없음).
+    마커(←/→)=일회성 전이(병동이동) / 배지(파견/휴직)=지속 상태. 라는 원칙.
     각 멤버: as_of_team(resolve_team), as_of_grade(캐시/override — grade는 경량, period 없음).
 
     Returns: {"members":[...], "headcount":{"regular","moving","leave"}}
     참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §3 정책 매트릭스.
     """
+    from calendar import monthrange
     from services.team_period import resolve_team
 
     month_start = date(year, month, 1)
+    month_end = date(year, month, monthrange(year, month)[1])
     assignments = get_active_assignments_for_month(db, group_id, year, month)
 
     inbound: dict[str, NurseAssignment] = {}
@@ -1007,8 +1013,16 @@ def group_members_in_month(
             continue
         team = a.target_team_id if a.target_team_id is not None else resolve_team(db, nid, group_id, month_start)
         grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
-        badge = "파견" if a.reason == "파견" else None
-        members.append(_row(n, "inbound", "→", badge, team, grade))
+        if a.reason == "파견":
+            # 파견(일시·복귀 예정) = 지속 상태 → 기간 내내 '파견' 배지(전이 아님, 마커 없음).
+            members.append(_row(n, "inbound", None, "파견", team, grade))
+        elif a.start_date is not None and month_start <= a.start_date <= month_end:
+            # 병동이동 = 일회성 전이 → 이동月(start ∈ 그 달)에만 전입(→).
+            members.append(_row(n, "inbound", "→", None, team, grade))
+        else:
+            # 이미 이동 완료(지난 달 발효) → 정착 일반 멤버(마커 없음).
+            #   캐시(nurses.group_id) flush 전이어도 그 병동 소속이므로 명단엔 포함한다.
+            members.append(_row(n, "active", None, None, team, grade))
 
     headcount = {
         "regular": sum(1 for m in members if m["membership_status"] == "active"),

@@ -82,3 +82,39 @@ def test_no_assignments_all_active(seeded):
     # 홈 A 5명 전원 active, 인바운드 없음
     assert statuses == {"active1": "active", "moved_full": "active", "moved_mid": "active",
                         "dispatch1": "active", "leave1": "active"}
+
+
+def test_transition_marker_only_in_move_month(seeded):
+    """병동이동 전입(→)은 이동月에만. 다음 달엔 정착(active, 마커 없음) — 명단엔 유지."""
+    db = seeded
+    jul = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
+    aug = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 8)["members"]}
+    # 7월(이동月): 전입 →
+    assert jul["inbound1"]["membership_status"] == "inbound"
+    assert jul["inbound1"]["marker"] == "→"
+    # 8월(정착): active, 마커 없음 — 그래도 명단엔 존재
+    assert "inbound1" in aug
+    assert aug["inbound1"]["membership_status"] == "active"
+    assert aug["inbound1"]["marker"] is None
+
+
+def test_dispatch_out_badge_persists_across_months(seeded):
+    """파견 나감(지속 상태)은 이동月 다음 달에도 '파견 중' 배지 유지(전이 아님)."""
+    db = seeded
+    for mon in (7, 8):
+        by_id = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, mon)["members"]}
+        assert by_id["dispatch1"]["membership_status"] == "dispatch_out"
+        assert by_id["dispatch1"]["badge"] == "파견 중"
+
+
+def test_dispatch_inbound_badge_persists(seeded):
+    """파견 인바운드(target측)도 지속 → 다음 달에도 '파견' 배지, 마커 없음."""
+    db = seeded
+    _nurse(db, "dispatch_in", "B")
+    _asg(db, "dispatch_in", "파견", "B", "A", date(2026, 7, 1))
+    db.flush()
+    for mon in (7, 8):
+        by_id = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, mon)["members"]}
+        assert by_id["dispatch_in"]["membership_status"] == "inbound"
+        assert by_id["dispatch_in"]["badge"] == "파견"
+        assert by_id["dispatch_in"]["marker"] is None
