@@ -49,7 +49,8 @@ def _ward_aware_fallback(db: Session, nurse_id: str, group_id: str) -> Optional[
         .filter(NurseModel.nurse_id == nurse_id)
         .first()
     )
-    if row and str(row[0]) == str(group_id):
+    # MSSQL CHAR 컬럼 트레일링 공백/포맷 차이 방어: strip 후 비교.
+    if row and str(row[0] or "").strip() == str(group_id or "").strip():
         return row[1]
     return None
 
