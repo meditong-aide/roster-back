@@ -276,6 +276,48 @@ def _check_night_dedicated(
     return issues
 
 
+# N전담이 가용일의 절반 이하로 N이 묶이면 사실상 대부분 OFF → 가용성 신호로 본다.
+_NIGHT_LOW_N_RATIO = 0.5
+
+
+def warn_night_dedicated_low_n(
+    row: Mapping[str, Any],
+    *,
+    nurse_id: str,
+    nurse_name: Optional[str],
+    nurse: Nurse,
+    cap_days: int,
+) -> List[Dict[str, Any]]:
+    """Soft 경고(하드 차단 아님): N전담인데 N 한도(n_exact 우선, 없으면 n_max)가 낮아
+    사실상 대부분 OFF가 되는 경우.
+
+    이 모순은 *항상* infeasible은 아니다 — 그 병동 야간을 다른 간호사가 채우면 풀린다
+    (커버리지 의존). 따라서 저장 자체는 막지 않고, 설정 시점에 경고만 띄워
+    "단기 부재라면 제한가용/휴직으로 모델링" 하도록 유도한다. 최종 하드 게이트는
+    생성 precheck(`cause:config:monthly_limit_n_exact_unattainable`)가 담당한다.
+    """
+    if not _is_night_dedicated(nurse):
+        return []
+    n_exact = _row_value(row, "n_exact")
+    n_max = _row_value(row, "n_max")
+    n_cap = n_exact if n_exact is not None else n_max
+    if n_cap is None or cap_days <= 0:
+        return []
+    if n_cap <= int(cap_days * _NIGHT_LOW_N_RATIO):
+        implied_off = max(0, cap_days - n_cap)
+        label = "정확" if n_exact is not None else "최대"
+        return [{
+            "code": "MONTHLY_LIMIT_NIGHT_DEDICATED_LOW_N",
+            "message": (
+                f"{nurse_name or nurse_id} 간호사는 N 전담인데 N {label} 한도가 {n_cap}회로 "
+                f"낮아, 가용 {cap_days}일 중 약 {implied_off}일이 강제 OFF가 됩니다. "
+                f"야간 커버리지가 부족하면 근무표 생성이 실패할 수 있습니다. "
+                f"단기 부재라면 N 한도 대신 제한가용/휴직 구간으로 설정하는 것을 권장합니다."
+            ),
+        }]
+    return []
+
+
 def _check_work_shifts(
     row: Mapping[str, Any],
     *,

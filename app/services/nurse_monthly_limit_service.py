@@ -9,7 +9,11 @@ from sqlalchemy.orm import Session
 
 from db.models import Nurse, NurseAssignment, NurseMonthlyLimit, RosterConfig
 from schemas.auth_schema import User as UserSchema
-from services.group_access import caller_is_head_nurse, resolve_home_group_id
+from services.group_access import (
+    assert_caller_can_access_group,
+    caller_is_head_nurse,
+    resolve_home_group_id,
+)
 from schemas.roster_schema import (
     NurseMonthlyLimitItem,
     NurseMonthlyLimitMeta,
@@ -173,11 +177,8 @@ def list_nurse_monthly_limits_service(
     group_id: str,
     nurse_id: str,
 ) -> List[NurseMonthlyLimitItem]:
-    if (
-        not current_user.is_master_admin
-        and str(group_id) != str(resolve_home_group_id(db, current_user))
-    ):
-        raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 조회할 수 없습니다.")
+    # HN multi-group: 홈/original/관리 그룹(파견·병동이동 HN 포함)이면 허용. 홈 한정이 아니다.
+    assert_caller_can_access_group(db, current_user, group_id)
     rows = (
         db.query(NurseMonthlyLimit)
         .filter(
@@ -239,8 +240,8 @@ def upsert_nurse_monthly_limits_service(
         row = _normalize_row(raw)
         if int(row.get("year")) != year or int(row.get("month")) != month:
             raise HTTPException(status_code=400, detail="요청 year/month와 항목 year/month가 일치해야 합니다.")
-        if not current_user.is_master_admin and str(row.get("group_id")) != str(resolve_home_group_id(db, current_user)):
-            raise HTTPException(status_code=403, detail="현재 그룹 외 limits는 수정할 수 없습니다.")
+        # HN multi-group: 홈/original/관리 그룹이면 수정 허용(조회와 동일 스코프).
+        assert_caller_can_access_group(db, current_user, row.get("group_id"))
         scope = (
             str(row.get("nurse_id")),
             str(row.get("group_id")),
@@ -261,6 +262,7 @@ def upsert_nurse_monthly_limits_service(
     # cross-group consistency / capacity checks per nurse-month
     from services.precheck.monthly_limit_validator import (
         validate_monthly_limit_row,
+        warn_night_dedicated_low_n,
         build_validation_payload,
     )
 
@@ -269,6 +271,8 @@ def upsert_nurse_monthly_limits_service(
         by_nurse.setdefault(str(r["nurse_id"]), []).append(r)
 
     issues_all: List[Dict[str, Any]] = []
+    # soft 경고(저장은 허용, 프론트 토스트로 안내). 하드 차단 issues_all 과 분리.
+    soft_warnings: List[Dict[str, Any]] = []
 
     def _push_issue(code: str, nurse_id: str, nurse_name: Optional[str], evidence: Dict[str, Any], msg: str, fixes: List[str]):
         issues_all.append({
@@ -326,6 +330,12 @@ def upsert_nurse_monthly_limits_service(
             issues_all.extend(
                 validate_monthly_limit_row(
                     row=rr, nurse=nurse, cap_days=cap_days, year=year, month=month,
+                )
+            )
+            # soft 경고: N전담 + 낮은 N 한도(커버리지 의존이라 차단 대신 안내)
+            soft_warnings.extend(
+                warn_night_dedicated_low_n(
+                    rr, nurse_id=nurse_id, nurse_name=nurse_name, nurse=nurse, cap_days=cap_days,
                 )
             )
 
@@ -476,7 +486,8 @@ def upsert_nurse_monthly_limits_service(
         )
         for i in issues_all[:5]:
             print(f"[MonthlyLimit][BLOCKING][message] {i.get('human_message_ko')}")
-        raise HTTPException(status_code=500, detail=payload)
+        # 사용자 데이터 모순 → 422(서버 오류 500 아님).
+        raise HTTPException(status_code=422, detail=payload)
 
     # upsert/delete
     for row in normalized:
@@ -515,13 +526,24 @@ def upsert_nurse_monthly_limits_service(
 
     db.commit()
     groups_touched = {str(r.get("group_id")) for r in normalized}
-    return _list_by_year_month(
+    items, meta, warnings = _list_by_year_month(
         db,
         current_user,
         year,
         month,
         group_id=next(iter(groups_touched)) if len(groups_touched) == 1 else None,
     )
+    # soft 경고 병합(중복 message 제거). 프론트는 onSuccess 에서 warnings 를 토스트로 띄운다.
+    if soft_warnings:
+        merged = list(warnings or [])
+        _seen_msgs = {w.message for w in merged}
+        for sw in soft_warnings:
+            if sw["message"] in _seen_msgs:
+                continue
+            _seen_msgs.add(sw["message"])
+            merged.append(NurseMonthlyLimitWarning(code=sw["code"], message=sw["message"]))
+        warnings = merged
+    return items, meta, warnings
 
 
 def fetch_effective_monthly_limits_by_nurse(
