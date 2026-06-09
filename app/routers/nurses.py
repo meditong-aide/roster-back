@@ -53,6 +53,7 @@ from services.assignment_service import (
     flush_expired_dispatches,
     flush_expired_leaves,
     preview_assignment_impact,
+    group_members_in_month,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
@@ -260,6 +261,29 @@ def _ensure_office_exists(
     except IntegrityError:
         # 동시 요청 등으로 이미 생성된 경우를 대비
         db.rollback()
+
+
+@router.get("/members")
+async def get_group_members_in_month(
+    group_id: str,
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """근무자관리 월 셀렉터 — 선택 월 '소속' 명단 + 상태 플래그 + 헤드카운트.
+
+    소속(근무일 수 아님) 기준. 영구 전출은 그 달 미표시, 비근무 멤버는 상태 배지
+    (휴직/파견 중/이동 ←→). HN multi-group: 관리 병동이면 조회 가능.
+    Returns: {"members":[{nurse_id,name,membership_status,marker,badge,as_of_team,as_of_grade}], "headcount":{regular,moving,leave}}
+    참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §3 정책 매트릭스.
+    """
+    gid = resolve_effective_group(db, current_user, group_id)
+    # 레이지 flush(캐시 == as-of-today 동기화) — 다른 조회 엔드포인트와 동일.
+    flush_pending_transfers(db, gid)
+    flush_expired_dispatches(db)
+    flush_expired_leaves(db)
+    return group_members_in_month(db, gid, year, month)
 
 
 @router.get("", response_model=List[NurseProfile])

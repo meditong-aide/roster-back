@@ -920,6 +920,104 @@ def get_active_assignments_for_month(
     )
 
 
+def group_members_in_month(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+) -> dict:
+    """선택 월 '소속' 명단 + 상태 플래그 (근무자관리 월 셀렉터용, Phase 4).
+
+    가시성=소속(근무일 수 아님). assignment 등록 즉시 적용(cancelled 제외).
+    - 홈 재직자(nurses.group_id==group, active=1) 기준.
+    - 영구 전출(병동이동, start<=월초)로 완전히 떠난 사람 → 제외(그 달 미표시).
+    - 전출 transition(병동이동, start 월중) → status='outbound', marker='←'.
+    - 파견 나감(source==group) → status='dispatch_out', badge='파견 중'.
+    - 휴직/퇴사(source==group) → status='leave'/'resigned'.
+    - 인바운드(target==group, source!=group) → status='inbound', marker='→', as-of team/grade=target_*.
+    각 멤버: as_of_team(resolve_team), as_of_grade(캐시/override — grade는 경량, period 없음).
+
+    Returns: {"members":[...], "headcount":{"regular","moving","leave"}}
+    참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §3 정책 매트릭스.
+    """
+    from services.team_period import resolve_team
+
+    month_start = date(year, month, 1)
+    assignments = get_active_assignments_for_month(db, group_id, year, month)
+
+    inbound: dict[str, NurseAssignment] = {}
+    outbound: dict[str, NurseAssignment] = {}
+    leave: dict[str, NurseAssignment] = {}
+    for a in assignments:
+        nid = str(a.nurse_id)
+        if a.reason in ("파견", "병동이동"):
+            if a.target_group_id == group_id and a.source_group_id != group_id:
+                inbound[nid] = a
+            elif a.source_group_id == group_id and a.target_group_id != group_id:
+                outbound[nid] = a
+        elif a.reason in ("휴직", "퇴사") and a.source_group_id == group_id:
+            leave[nid] = a
+
+    home = (
+        db.query(NurseModel)
+        .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
+        .all()
+    )
+
+    def _row(n, status, marker, badge, team, grade):
+        return {
+            "nurse_id": str(n.nurse_id),
+            "name": getattr(n, "name", None),
+            "membership_status": status,   # active|outbound|dispatch_out|leave|resigned|inbound
+            "marker": marker,              # '←'(전출) | '→'(전입) | None
+            "badge": badge,                # '파견 중' | '휴직' | '퇴사' | '파견' | None
+            "as_of_team": team,
+            "as_of_grade": grade,
+        }
+
+    members: list[dict] = []
+    seen: set[str] = set()
+    for n in home:
+        nid = str(n.nurse_id)
+        seen.add(nid)
+        team = resolve_team(db, nid, group_id, month_start)
+        grade = getattr(n, "grade", None)
+        if nid in outbound:
+            a = outbound[nid]
+            if a.reason == "병동이동":
+                if a.start_date <= month_start:
+                    continue  # 완전 전출 → 그 달 미표시
+                members.append(_row(n, "outbound", "←", None, team, grade))
+            else:  # 파견 나감 — home 유지
+                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade))
+        elif nid in leave:
+            a = leave[nid]
+            if a.reason == "퇴사":
+                members.append(_row(n, "resigned", None, "퇴사", team, grade))
+            else:
+                members.append(_row(n, "leave", None, "휴직", team, grade))
+        else:
+            members.append(_row(n, "active", None, None, team, grade))
+
+    for nid, a in inbound.items():
+        if nid in seen:
+            continue
+        n = db.query(NurseModel).filter(NurseModel.nurse_id == nid).first()
+        if n is None:
+            continue
+        team = a.target_team_id if a.target_team_id is not None else resolve_team(db, nid, group_id, month_start)
+        grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
+        badge = "파견" if a.reason == "파견" else None
+        members.append(_row(n, "inbound", "→", badge, team, grade))
+
+    headcount = {
+        "regular": sum(1 for m in members if m["membership_status"] == "active"),
+        "moving": sum(1 for m in members if m["membership_status"] in ("outbound", "dispatch_out", "inbound")),
+        "leave": sum(1 for m in members if m["membership_status"] in ("leave", "resigned")),
+    }
+    return {"members": members, "headcount": headcount}
+
+
 def preview_assignment_impact(
     db: Session,
     *,
