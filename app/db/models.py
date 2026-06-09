@@ -146,29 +146,26 @@ class Nurse(Base):
     # office_id는 컬럼으로 관리
 
 
-class NurseMonthProfile(Base):
-    """월(月) 단위 시점 속성 (team/grade/shift_rule/weekend_off).
+class NurseTeamPeriod(Base):
+    """team 시점 구간 (병동귀속). effective-dated [valid_from, valid_to).
 
-    nurses 는 '현재값' 캐시이고, 월별로 달라지는 로스터 속성의 진실은 이 테이블이다.
-    행이 없으면 nurses(현재값) 으로 폴백한다(델타만 저장). 근무표 발행 시 그 달을
-    source='frozen' 으로 동결해 과거를 보존한다.
-    참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §2.3·§4.6.
+    nurses.team_id 는 '현재값' 캐시이고, 월별/기간별 team 의 진실은 이 테이블이다.
+    - 변경 = close-before-open(옛 구간 valid_to 닫고 새 구간 open), 삭제 금지(완전 타임라인).
+    - 겹침 금지, gap(미지정) 허용. valid_to=null 은 열린(계속) 구간.
+    - 폴백은 ward-aware: 구간 없으면 nurses.group_id==group 일 때만 nurses.team_id, 아니면 None.
+    참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §2.3·§4.6 (v3).
     """
 
-    __tablename__ = "nurse_month_profile"
+    __tablename__ = "nurse_team_period"
 
-    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), primary_key=True)
-    year = Column(SMALLINT, primary_key=True)
-    month = Column(TINYINT, primary_key=True)
-
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    valid_from = Column(DATE, nullable=False)
+    valid_to = Column(DATE, nullable=True)   # null = 열린(계속) 구간
     # team_id 는 (group_id, team_id)->teams 이지만 DB레벨 복합 FK 는 마이그레이션에서 결정.
     team_id = Column(INTEGER, nullable=True)
-    grade = Column(INTEGER, nullable=True)
-    shift_rule = Column(JSON, nullable=True)        # 허용 shift 목록(현 is_night_nurse 대체)
-    weekend_off = Column(TINYINT, nullable=True)    # 현 is_weekend_off 대체
-    # inherited|carry_forward|edited|redistribute|frozen
-    source = Column(VARCHAR(20), nullable=False, default="inherited")
+    source = Column(VARCHAR(20), nullable=False, default="edited")  # inherited|edited|redistribute
     note = Column(TEXT, nullable=True)
 
     created_at = Column(DATETIME, default=func.now())
@@ -178,7 +175,8 @@ class NurseMonthProfile(Base):
     group = relationship("Group", foreign_keys=[group_id])
 
     __table_args__ = (
-        Index("ix_nmp_group_ym", "group_id", "year", "month"),
+        Index("ix_ntp_nurse", "nurse_id", "valid_from"),
+        Index("ix_ntp_group", "group_id", "valid_from"),
     )
 
 
