@@ -959,31 +959,90 @@ def move_nurse_service(req, current_user, db: Session):
     return {"message": "간호사 순서 변경 완료"}
 
 
-def _encode_available_member_cursor(nurse_id: str) -> str:
-    raw = json.dumps({"nurse_id": nurse_id}, separators=(",", ":")).encode("utf-8")
+def _encode_available_member_cursor(
+    nurse_id: str, name: Optional[str] = None
+) -> str:
+    payload: Dict[str, str] = {"nurse_id": nurse_id}
+    if name is not None:
+        payload["name"] = name
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _decode_available_member_cursor(cursor: Optional[str]) -> Optional[str]:
+def _decode_available_member_cursor(
+    cursor: Optional[str],
+) -> Dict[str, Optional[str]]:
     if not cursor:
-        return None
+        return {"nurse_id": None, "name": None}
     try:
         padded = cursor + ("=" * (-len(cursor) % 4))
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
         nurse_id = payload.get("nurse_id")
-        return str(nurse_id) if nurse_id else None
+        name = payload.get("name")
+        return {
+            "nurse_id": str(nurse_id) if nurse_id else None,
+            "name": str(name) if name is not None else None,
+        }
     except Exception:
+        return {"nurse_id": None, "name": None}
+
+
+def _normalize_search_text(value: Any) -> str:
+    return str(value or "").replace(" ", "").strip()
+
+
+def _available_member_row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
+    emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
+    if not emp_seq_no:
         return None
+    return {
+        "nurse_id": str(emp_seq_no),
+        "emp_num": _available_member_row_value(row, "OfficeEmpNum"),
+        "account_id": _available_member_row_value(row, "MemberID"),
+        "name": _available_member_row_value(row, "EmployeeName"),
+        "duty": _available_member_row_value(row, "duty"),
+        "career": _available_member_row_value(row, "career"),
+        "is_head_nurse": _available_member_row_value(row, "headnurse"),
+        "joining_date": _available_member_row_value(row, "joindate"),
+        "birth_date": _available_member_row_value(row, "DateOfBirth"),
+        "phone_number": _available_member_row_value(row, "PortableTel"),
+        "gender": _available_member_row_value(row, "Gender"),
+        "big_kind_name": _available_member_row_value(row, "big_kind_name"),
+        "middle_kind_name": _available_member_row_value(row, "middle_kind_name"),
+        "small_kind_name": _available_member_row_value(row, "small_kind_name"),
+        "mb_part_name": _available_member_row_value(row, "mb_part_name"),
+    }
 
 
 def _available_member_row_value(row: Any, key: str) -> Any:
     return row.get(key) if isinstance(row, dict) else getattr(row, key, None)
 
 
+def _get_office_registered_nurse_ids(office_id: str, db: Session) -> set[str]:
+    """오피스에 이미 근무자로 등록된 nurse_id 집합 (available-members 제외용)."""
+    office_id = str(office_id)
+    office_group_ids = select(Group.group_id).where(Group.office_id == office_id)
+    rows = (
+        db.query(NurseModel.nurse_id)
+        .filter(
+            or_(
+                NurseModel.office_id == office_id,
+                NurseModel.group_id.in_(office_group_ids),
+            )
+        )
+        .all()
+    )
+    return {str(row[0]) for row in rows if row[0] is not None}
+
+
 def _available_member_matches_search(
     row: Any, normalized_q: str, search_by: str
 ) -> bool:
     if not normalized_q:
+        return True
+
+    query = _normalize_search_text(normalized_q)
+    if not query:
         return True
 
     if search_by == "affiliation":
@@ -993,10 +1052,10 @@ def _available_member_matches_search(
             _available_member_row_value(row, "small_kind_name"),
             _available_member_row_value(row, "mb_part_name"),
         ]
-        return any(normalized_q in str(value or "") for value in values)
+        return any(query in _normalize_search_text(value) for value in values)
 
     name = _available_member_row_value(row, "EmployeeName")
-    return normalized_q in str(name or "")
+    return query in _normalize_search_text(name)
 
 
 def get_available_members_service(
@@ -1010,10 +1069,10 @@ def get_available_members_service(
     pagination: Optional[str] = None,
 ) -> List[Dict[str, Any]] | Dict[str, Any]:
     """
-    동일 오피스의 전체 멤버 중 현재 그룹에 속하지 않은 멤버 목록 반환.
+    동일 오피스의 전체 멤버 중 nurses에 미등록된 멤버 목록 반환.
     - MSSQL Member 테이블에서 오피스 전체 멤버 조회
-    - MySQL nurses 테이블에서 해당 group_id에 이미 등록된 nurse_id 조회
-    - 이미 등록된 멤버를 제외한 나머지 반환
+    - MySQL nurses 테이블에서 해당 office_id에 이미 등록된 nurse_id 조회
+    - 다른 병동을 포함해 이미 등록된 멤버를 제외한 나머지 반환
     """
     print(
         "[DEBUG] available-members service params",
@@ -1030,13 +1089,7 @@ def get_available_members_service(
     if pagination == "cursor":
         limit = max(1, min(int(limit or 20), 100))
         decoded_cursor = _decode_available_member_cursor(cursor)
-        existing_nurse_ids = set(
-            str(row[0])
-            for row in db.query(NurseModel.nurse_id)
-            .filter(NurseModel.group_id == group_id)
-            .all()
-            if row[0] is not None
-        )
+        existing_nurse_ids = _get_office_registered_nurse_ids(office_id, db)
 
         base_sql = Member.member_export_by_office().strip()
         where_clauses = []
@@ -1044,6 +1097,8 @@ def get_available_members_service(
         normalized_q = (q or "").strip()
         normalized_search_by = "affiliation" if search_by == "affiliation" else "name"
 
+        # MSSQL(EUC-KR) + UTF-8 LIKE 파라미터 조합에서 한글 검색이 깨지므로
+        # 검색(q)은 Member 전체 조회 후 Python에서 필터한다.
         if normalized_q:
             all_members = (
                 msdb_manager.fetch_all(
@@ -1052,43 +1107,36 @@ def get_available_members_service(
                 or []
             )
             matched_rows = []
+            cursor_name = decoded_cursor.get("name")
+            cursor_nurse_id = decoded_cursor.get("nurse_id")
             for row in all_members:
                 emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
                 if not emp_seq_no or str(emp_seq_no) in existing_nurse_ids:
-                    continue
-                if decoded_cursor and str(emp_seq_no) <= decoded_cursor:
                     continue
                 if not _available_member_matches_search(
                     row, normalized_q, normalized_search_by
                 ):
                     continue
+                row_name = str(_available_member_row_value(row, "EmployeeName") or "")
+                if cursor_name is not None and cursor_nurse_id:
+                    row_key = (row_name, str(emp_seq_no))
+                    cursor_key = (cursor_name, str(cursor_nurse_id))
+                    if row_key <= cursor_key:
+                        continue
                 matched_rows.append(row)
 
-            matched_rows.sort(key=lambda row: str(_available_member_row_value(row, "EmpSeqNo") or ""))
+            matched_rows.sort(
+                key=lambda row: (
+                    str(_available_member_row_value(row, "EmployeeName") or ""),
+                    str(_available_member_row_value(row, "EmpSeqNo") or ""),
+                )
+            )
             page_rows = matched_rows[: limit + 1]
             items = []
             for row in page_rows[:limit]:
-                emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
-                if not emp_seq_no:
-                    continue
-                member_dict = {
-                    "nurse_id": str(emp_seq_no),
-                    "emp_num": _available_member_row_value(row, "OfficeEmpNum"),
-                    "account_id": _available_member_row_value(row, "MemberID"),
-                    "name": _available_member_row_value(row, "EmployeeName"),
-                    "duty": _available_member_row_value(row, "duty"),
-                    "career": _available_member_row_value(row, "career"),
-                    "is_head_nurse": _available_member_row_value(row, "headnurse"),
-                    "joining_date": _available_member_row_value(row, "joindate"),
-                    "birth_date": _available_member_row_value(row, "DateOfBirth"),
-                    "phone_number": _available_member_row_value(row, "PortableTel"),
-                    "gender": _available_member_row_value(row, "Gender"),
-                    "big_kind_name": _available_member_row_value(row, "big_kind_name"),
-                    "middle_kind_name": _available_member_row_value(row, "middle_kind_name"),
-                    "small_kind_name": _available_member_row_value(row, "small_kind_name"),
-                    "mb_part_name": _available_member_row_value(row, "mb_part_name"),
-                }
-                items.append(member_dict)
+                member_dict = _available_member_row_to_dict(row)
+                if member_dict:
+                    items.append(member_dict)
 
             print(
                 "[DEBUG] available-members q rows",
@@ -1104,7 +1152,13 @@ def get_available_members_service(
                 },
             )
             has_next = len(page_rows) > limit
-            next_cursor = _encode_available_member_cursor(items[-1]["nurse_id"]) if has_next and items else None
+            if has_next and items:
+                last_item = items[-1]
+                next_cursor = _encode_available_member_cursor(
+                    last_item["nurse_id"], name=str(last_item.get("name") or "")
+                )
+            else:
+                next_cursor = None
             return {
                 "items": items,
                 "next_cursor": next_cursor,
@@ -1113,18 +1167,23 @@ def get_available_members_service(
 
         if existing_nurse_ids:
             placeholders = ", ".join(["%s"] * len(existing_nurse_ids))
-            where_clauses.append(f"CAST(base.EmpSeqNo AS VARCHAR(50)) NOT IN ({placeholders})")
+            where_clauses.append(
+                f"CAST(base.EmpSeqNo AS VARCHAR(50)) NOT IN ({placeholders})"
+            )
             params.extend(sorted(existing_nurse_ids))
 
-        if decoded_cursor:
+        cursor_nurse_id = decoded_cursor.get("nurse_id")
+        if cursor_nurse_id:
             where_clauses.append("CAST(base.EmpSeqNo AS VARCHAR(50)) > %s")
-            params.append(decoded_cursor)
+            params.append(cursor_nurse_id)
+        order_sql = "ORDER BY CAST(base.EmpSeqNo AS VARCHAR(50)) ASC"
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         print(
             "[DEBUG] available-members cursor query",
             {
                 "normalized_q": normalized_q,
+                "search_by": normalized_search_by,
                 "decoded_cursor": decoded_cursor,
                 "where_sql": where_sql,
                 "params": params,
@@ -1136,7 +1195,7 @@ def get_available_members_service(
             SELECT *
               FROM ({base_sql}) AS base
               {where_sql}
-             ORDER BY CAST(base.EmpSeqNo AS VARCHAR(50)) ASC
+             {order_sql}
              OFFSET 0 ROWS FETCH NEXT %s ROWS ONLY
         """
         rows = msdb_manager.fetch_all(page_sql, params=(*params, limit + 1)) or []
@@ -1145,40 +1204,21 @@ def get_available_members_service(
             {
                 "raw_count": len(rows),
                 "sample_names": [
-                    row.get("EmployeeName")
-                    if isinstance(row, dict)
-                    else getattr(row, "EmployeeName", None)
-                    for row in rows[:5]
+                    _available_member_row_value(row, "EmployeeName") for row in rows[:5]
                 ],
             },
         )
-        page_rows = rows[:limit]
         items = []
-        for row in page_rows:
-            emp_seq_no = row.get("EmpSeqNo") if isinstance(row, dict) else getattr(row, "EmpSeqNo", None)
-            if not emp_seq_no:
-                continue
-            member_dict = {
-                "nurse_id": str(emp_seq_no),
-                "emp_num": row.get("OfficeEmpNum") if isinstance(row, dict) else getattr(row, "OfficeEmpNum", None),
-                "account_id": row.get("MemberID") if isinstance(row, dict) else getattr(row, "MemberID", None),
-                "name": row.get("EmployeeName") if isinstance(row, dict) else getattr(row, "EmployeeName", None),
-                "duty": row.get("duty") if isinstance(row, dict) else getattr(row, "duty", None),
-                "career": row.get("career") if isinstance(row, dict) else getattr(row, "career", None),
-                "is_head_nurse": row.get("headnurse") if isinstance(row, dict) else getattr(row, "headnurse", None),
-                "joining_date": row.get("joindate") if isinstance(row, dict) else getattr(row, "joindate", None),
-                "birth_date": row.get("DateOfBirth") if isinstance(row, dict) else getattr(row, "DateOfBirth", None),
-                "phone_number": row.get("PortableTel") if isinstance(row, dict) else getattr(row, "PortableTel", None),
-                "gender": row.get("Gender") if isinstance(row, dict) else getattr(row, "Gender", None),
-                "big_kind_name": row.get("big_kind_name") if isinstance(row, dict) else getattr(row, "big_kind_name", None),
-                "middle_kind_name": row.get("middle_kind_name") if isinstance(row, dict) else getattr(row, "middle_kind_name", None),
-                "small_kind_name": row.get("small_kind_name") if isinstance(row, dict) else getattr(row, "small_kind_name", None),
-                "mb_part_name": row.get("mb_part_name") if isinstance(row, dict) else getattr(row, "mb_part_name", None),
-            }
-            items.append(member_dict)
+        for row in rows[:limit]:
+            member_dict = _available_member_row_to_dict(row)
+            if member_dict:
+                items.append(member_dict)
 
         has_next = len(rows) > limit
-        next_cursor = _encode_available_member_cursor(items[-1]["nurse_id"]) if has_next and items else None
+        if has_next and items:
+            next_cursor = _encode_available_member_cursor(items[-1]["nurse_id"])
+        else:
+            next_cursor = None
         return {
             "items": items,
             "next_cursor": next_cursor,
@@ -1193,13 +1233,8 @@ def get_available_members_service(
         or []
     )
 
-    # 2. 현재 group_id에 이미 등록된 간호사의 nurse_id 집합
-    existing_nurse_ids = set(
-        row[0]
-        for row in db.query(NurseModel.nurse_id)
-        .filter(NurseModel.group_id == group_id)
-        .all()
-    )
+    # 2. 오피스에 이미 등록된 간호사의 nurse_id 집합
+    existing_nurse_ids = _get_office_registered_nurse_ids(office_id, db)
 
     # 3. 이미 등록된 멤버 제외
     available = []
