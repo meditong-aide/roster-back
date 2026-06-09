@@ -146,6 +146,42 @@ class Nurse(Base):
     # office_id는 컬럼으로 관리
 
 
+class NurseMonthProfile(Base):
+    """월(月) 단위 시점 속성 (team/grade/shift_rule/weekend_off).
+
+    nurses 는 '현재값' 캐시이고, 월별로 달라지는 로스터 속성의 진실은 이 테이블이다.
+    행이 없으면 nurses(현재값) 으로 폴백한다(델타만 저장). 근무표 발행 시 그 달을
+    source='frozen' 으로 동결해 과거를 보존한다.
+    참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §2.3·§4.6.
+    """
+
+    __tablename__ = "nurse_month_profile"
+
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), primary_key=True)
+    year = Column(SMALLINT, primary_key=True)
+    month = Column(TINYINT, primary_key=True)
+
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    # team_id 는 (group_id, team_id)->teams 이지만 DB레벨 복합 FK 는 마이그레이션에서 결정.
+    team_id = Column(INTEGER, nullable=True)
+    grade = Column(INTEGER, nullable=True)
+    shift_rule = Column(JSON, nullable=True)        # 허용 shift 목록(현 is_night_nurse 대체)
+    weekend_off = Column(TINYINT, nullable=True)    # 현 is_weekend_off 대체
+    # inherited|carry_forward|edited|redistribute|frozen
+    source = Column(VARCHAR(20), nullable=False, default="inherited")
+    note = Column(TEXT, nullable=True)
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    group = relationship("Group", foreign_keys=[group_id])
+
+    __table_args__ = (
+        Index("ix_nmp_group_ym", "group_id", "year", "month"),
+    )
+
+
 class NurseMonthlyLimit(Base):
     """월별/그룹별 간호사 개인 근무 개수 제한.
 
