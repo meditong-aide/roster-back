@@ -4747,6 +4747,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     )
     if _leave_clipped_main:
         print(f"[Assignment][Leave] 휴직/퇴사 active_range 클리핑: {_leave_clipped_main}")
+    # [B4] 영구 전출(병동이동) source-side: start_date 경계로 active_range 클리핑 → 엔진에서 제외.
+    #   영구 이동은 source 병동에서 그 날부터 빠져야 한다. 그렇지 않으면 전출자가 "전 일자 차단"
+    #   상태로 엔진에 잔류해 팀/등급 풀의 유효 인력을 갉아먹고 커버리지를 구조적으로 막는다.
+    #   파견(일시)은 복귀하므로 제외하지 않고 기존 day-block(아래)을 유지한다 — 병동이동만 분기.
+    _transfer_out_main = [
+        a for a in _assignments
+        if a.reason == "병동이동"
+        and a.source_group_id == current_user.group_id
+        and a.target_group_id != current_user.group_id
+    ]
+    _transfer_clipped_main = _clip_active_range_for_leaves(
+        active_range_candidates, _transfer_out_main, month_start, days_in_month
+    )
+    if _transfer_clipped_main:
+        print(f"[Assignment][TransferOut] 영구 전출 active_range 클리핑(엔진 제외): {_transfer_clipped_main}")
     excluded_engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is None
     ]

@@ -8,10 +8,10 @@
 | 증분 | 내용 | 상태 |
 |---|---|---|
 | **B1** | 모델 `NurseTeamPeriod` + 리졸버(`team_period.py`) + 테스트 | ✅ 코드 완료 (SQLite 6 passed) |
-| B-dev | dev 테이블 생성(DDL) + 백필 | ⏳ 사용자 실행 (§1·§3) |
-| **B2** | 생성기 team read 전환(`roster_create_service.py:5474,5811` → `resolve_team_for_roster`) | ⏳ |
+| B-dev | dev 테이블 생성(DDL) + 백필 | ✅ MSSQL 적재 확인 (9B: t1=5,t2=4,t3=4) |
+| **B2** | 생성기 team read 전환(engine_nurses 일괄 → `resolve_team_for_roster`, 비회귀: None이면 기존값 유지) | ✅ 코드 적용 (9B 라이브 검증 대기) |
 | **B3** | 재분배 apply → `set_team_period`(close-before-open) | ⏳ |
-| **B4** | 문제 A: 전출(병동이동) source 경계=start_date, 파견 분기 | ⏳ |
+| **B4** | 문제 A: 전출(병동이동) source 경계=start_date, 파견 분기 | ✅ 코드 적용·라이브 검증 (전출자 엔진 제외, NURSE_BLOCKED_DAYS 소멸) |
 | 검증 | 9B 7월 재생성이 재분배 팀 반영 | ⏳ (테이블+백필 후) |
 
 ## 1. DDL (dev = **MSSQL** 실행)
@@ -91,17 +91,18 @@ DROP TABLE nurse_team_period;   -- 가산적이라 이것만으로 원복
 - 이게 `engine_nurses` → `nurse_data['team_id']`(`cp_sat_basic.py:786`) → 팀 제약(`team_min_by_team`, teams 2641~2674)으로 흐름.
 - `5474`(precheck)·`5811`(진단맵)은 부차적(같이 바꾸면 일관).
 
-### B2 (read 전환) — engine_nurses 조립 후 일괄
-`_inbound_nurses` 추가까지 끝난 뒤(≈4697 이후), **모든 engine_nurses 를 한 번에**:
+### B2 (read 전환) — engine_nurses 조립 후 일괄 [적용됨, 비회귀 변형]
+`_inbound_nurses` 추가까지 끝난 뒤(`active_range_candidates` 직전, ≈4714), **모든 engine_nurses 를 한 번에** resolve:
 ```python
-for n in engine_nurses:
-    n.__dict__['team_id'] = resolve_team_for_roster(
-        db, str(n.nurse_id), current_user.group_id, req.year, req.month
-    )
+from services.team_period import resolve_team_for_roster
+for _en in engine_nurses:
+    _rt = resolve_team_for_roster(db, str(_en.nurse_id), current_user.group_id, req.year, req.month)
+    if _rt is not None:
+        _en.__dict__['team_id'] = _rt
 ```
-그리고 **`4689` 의 `d['team_id'] = _a.target_team_id` 제거**(team 은 이제 period 가 진실). `target_grade` 등 나머지 override 는 grade Phase 까지 유지.
-- period 없으면 `resolve_team_for_roster` 가 ward-aware 폴백 → 홈 그룹 간호사는 **현행과 동일**(`nurses.team_id`).
-- 인바운드(group≠home)는 period 없으면 None → **B3로 period 가 세팅돼야 팀이 잡힘**(그래서 B2·B3 동시).
+- **비회귀 결정**: 원안은 `4689` 의 `d['team_id'] = _a.target_team_id` 를 제거하는 것이었으나, B3(인바운드 period 쓰기) 전에는 인바운드 team 이 사라진다. → **`4689` 유지 + period None 이면 기존값 보존**으로 변경. period 가 덮으면 그 값으로 확정.
+- 홈 그룹: 백필로 period 가 모든 날 덮음 → 캐시와 동일값(현행 유지) + SSOT 가 period 로 이동.
+- 인바운드(group≠home): 9B period 없음 → None → `4689` 의 `target_team_id` 유지. **B3 가 9B period 를 쓰면 그때 period 우선**.
 
 ### B3 (재분배 apply → period)
 `ward_redistribute_service` apply 의 팀 변경: `create_permanent_change(target_team_id=…)` / `create_assignment(target_team_id=…)` 대신
@@ -110,8 +111,33 @@ set_team_period(db, nurse_id=…, group_id=대상병동, valid_from=발효일, t
 ```
 병동 변경 자체(존재)는 그대로 `nurse_assignment(병동이동)`. **team 만 period 로**.
 
-### B4 (문제 A — 전출 source 경계)
-`get_active_assignments_for_month`(`assignment_service.py:888`)는 effective_end 기준 → 영구 이동의 옛 병동에 무기한 잔류. **전출(병동이동) source-side 는 start_date 경계**로 끊고, **파견은 source 유지**(복귀) — reason 분기.
+### B4 (문제 A — 전출 source 경계) [적용됨]
+**증상**: 9B 7월 생성 시 전출(병동이동, src=9B) 7명이 엔진에 남아 **"31일 전체 차단"**(NURSE_BLOCKED_DAYS)으로 잔류 → 팀/등급 풀 유효 인력 왜곡 → 커버리지 구조적 infeasible.
+**원인**: 엔진은 active_range 클리핑을 **휴직/퇴사만** 수행(`roster_create_service.py` ~4740). 병동이동 source-side 는 day-block(파견 복귀용 로직)으로만 처리돼 영구 전출도 "차단된 채 잔류".
+**수정**: 휴직/퇴사 클리핑 직후, **reason=="병동이동" & source==현재그룹 & target!=현재그룹** 인 전출 assignment 를 `_clip_active_range_for_leaves` 로 start_date 경계 클리핑 → 월초 이전 시작이면 active_range=None → 엔진에서 제외. **파견은 제외 안 함**(복귀, 기존 day-block 유지).
+**검증**(라이브 9B 2026-07): NURSE_BLOCKED_DAYS 7건 소멸, 엔진 22→15명, team dist {None:4,t2:3,t1:6,t3:2} 정상화.
+
+### B4 잔여 — 별개의 데이터 이슈 (코드 아님)
+B4 적용 후에도 9B 7월은 `NO_ASSIGNMENT` 잔존. 단일 conflict core = **박지연(303196)**:
+- N전담(`is_night_nurse=['N']`) + `nurse_monthly_limit(2026-7).n_exact=2` → "N=2" vs OFF상한 유도 "N≥15" 모순 → 모델 UNSAT.
+- 6월은 monthly_limit 행이 없어 정상 생성(6월 OK/7월 NO 의 직접 원인).
+- **조치 = 데이터**: 박지연 7월 n_exact 제거/조정 또는 N전담 해제 또는 (실제 2일만 근무면) 제한가용/휴직 표기. → 사용자 결정.
+
+## 부수 수정 (이 세션 디버깅 중 발견 — 시점 모델과 별개)
+
+### S1. monthly-limits 엔드포인트 관리그룹 권한 (403 → 관리그룹 허용)
+**증상**: 9B HN(전도연, DB home=9A·`original_group_id`)이 9B 간호사 고급설정의 월간 한도를 **조회/수정 모두 403** → 프론트에 한 줄도 안 보임(박지연 7월 n_exact 도 안 보였던 원인).
+**원인**: `GET/PUT /nurses/monthly-limits` 권한 체크가 **홈 그룹 한정**(`group_id != resolve_home_group_id`)이라 HN multi-group(관리 병동)을 거부.
+**수정**(`nurse_monthly_limit_service.py`): 홈-한정 체크를 **`assert_caller_can_access_group`**(홈 + original + 관리그룹 허용)으로 교체 — GET·PUT 동일. schedule_id·사이드프로필과 같은 group-scope 패턴, 이 엔드포인트만 누락돼 있었음.
+**검증**: 403 → 200, 5월·7월 행 정상 반환.
+
+### S2. N전담 + 낮은 N 한도 = 저장 시점 soft 경고
+**목적**: 박지연형(N전담인데 n_exact/n_max 낮음)을 **설정 시점에** 안내(생성 때 가서야 infeasible 발견하는 일 방지).
+**구현**:
+- `precheck/monthly_limit_validator.py`: `warn_night_dedicated_low_n()` — N전담 & N한도 ≤ 가용일×0.5 면 경고 dict 반환.
+- `nurse_monthly_limit_service.py`(PUT): 하드 차단(`issues_all`)과 **분리**한 `soft_warnings`로 수집 → 저장은 허용, 응답 `warnings`에 병합. 프론트(`useNurseMonthlyLimits.ts`)가 onSuccess 에서 `warnings`를 `toast.info`로 이미 표시 → 프론트 수정 불필요.
+- 하드 차단 status `500 → 422`(사용자 데이터 모순).
+**설계 결정**: 이 모순은 *항상* infeasible이 아님(다른 간호사가 야간 채우면 가능, 커버리지 의존) → **하드 차단 아닌 경고**. 명백한 산술 모순(N전담에 D/E 양수 등)은 기존대로 하드 차단. 최종 하드 게이트는 생성 precheck.
 
 ### 검증 (dev 테이블+백필 후)
 1. 9B 7월 `/roster_create/generate` → infeasibility 의 team None 해소 확인.
