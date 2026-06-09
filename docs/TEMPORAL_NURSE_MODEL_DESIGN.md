@@ -180,6 +180,21 @@ period는 희소(델타)지만 **변경 시 옛 구간을 삭제하지 않고 cl
 - **근무표 그리드**: shift제한 per-cell **잠김**(교육: 1–21일 E·N 잠김, 22일~ E 가능). 병동이동은 타병동 일자 마스킹 + "내 근무표" 세그먼트 머지.
 - **그룹키 일관**: 모든 조회 selectedGroupId 명시.
 
+### 5.1 근무자관리 구현 설계 (Phase 4 — B 단계, 프론트)
+
+**현황**: P4-1(백엔드 `GET /nurses/members`) + P4-2-step1(월 셀렉터 + 헤드카운트, 추가형) 완료. 명단(행)은 아직 기존 `useNurses` 기반(월/상태 미반영).
+
+**데이터 결합**: 테이블은 `NurseManagementTables`가 내부 `useNurses(group)`(full nurse: role/grade/team_id/sequence)로 렌더 — 이 fetch 유지. 상태는 `useGroupMembers(group,y,m).members` → `Map<nurse_id, member>` 로 join.
+**부착 지점**: ALL=`ManagerTable→NurseTableRow`, TEAM=`NurseManagementTables`가 `n.team_id` 그룹핑→같은 `NurseTableRow`. 배지는 `NurseTableRow` 이름 셀(`:595`) 한 곳 → ALL·TEAM 동시.
+
+| 티어 | 내용 | 위험 | 커밋 |
+|---|---|---|---|
+| **B-1** | 배지 오버레이만: `memberStatusMap?` 옵셔널 prop → `NurseTableRow`에 `membership?` → status≠active일 때 이름 옆 배지(←/→·파견 중·휴직·퇴사·파견). prop 없으면 오늘과 100% 동일(no-op). | 저 | **별도** |
+| **B-2** | 월-정확 명단: 표시 행=membership 집합(완전전출 숨김+인바운드 노출), TEAM 그룹핑을 `as_of_team`으로. 팀 라벨(1/2/3 vs A/B/C) 정합 동반. | 중 | **별도** |
+
+**롤백**: B-1=옵셔널 prop(default undefined) no-op → prop 전달+배지 span 제거 한 커밋 revert. B-2=명단/팀 버킷 변경이라 별도 커밋 revert로 격리. **B-1·B-2 각각 독립 커밋**(언제든 단독 롤백).
+**순서**: B-1 → 확인 → B-2 → (별개) P4-3 사이드프로필 as-of.
+
 ## 6. 마이그레이션 (점진 — 빅뱅 금지)
 
 | Phase | 내용 | 검증 |
