@@ -1,0 +1,49 @@
+{
+  "summary": "온톨로지 안정화 폐루프 — 전 병동×월 (4-노드 완전연결 그래프)",
+  "all_cells_passed": true,
+  "cells": {
+    "9B_202605": {
+      "all_passed": true,
+      "resolved": [
+        "C1",
+        "C2",
+        "C3",
+        "C4"
+      ],
+      "na": []
+    },
+    "9B_202606": {
+      "all_passed": true,
+      "resolved": [
+        "C1",
+        "C2",
+        "C4"
+      ],
+      "na": [
+        "C3"
+      ]
+    },
+    "ICU_202605": {
+      "all_passed": true,
+      "resolved": [
+        "C1",
+        "C3",
+        "C4"
+      ],
+      "na": [
+        "C2"
+      ]
+    },
+    "ICU_202606": {
+      "all_passed": true,
+      "resolved": [
+        "C1",
+        "C3",
+        "C4"
+      ],
+      "na": [
+        "C2"
+      ]
+    }
+  }
+}
