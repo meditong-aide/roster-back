@@ -28,7 +28,9 @@ from datalayer.member import Member
 import logging
 import os
 import secrets
+import time
 import boto3
+from threading import Lock
 from urllib.parse import quote
 import base64
 import json
@@ -991,6 +993,107 @@ def _normalize_search_text(value: Any) -> str:
     return str(value or "").replace(" ", "").strip()
 
 
+# 근무자 추가 모달의 오피스 멤버 조회(groupware MSSQL, 행마다 T_Team 상관 서브쿼리)
+# 결과를 짧은 TTL 로 캐시한다. 검색 경로는 매 페이지마다 전체 멤버를 다시 조회하므로
+# (한글 LIKE 깨짐 회피) 대형 오피스에서 페이지/검색이 느려진다 → 첫 페이지만 실제 조회.
+_OFFICE_MEMBERS_TTL = 60.0  # 초. HR 로스터는 자주 안 바뀌므로 안전.
+_office_members_cache: Dict[str, Tuple[float, List[Any]]] = {}
+_office_members_fetch_locks: Dict[str, Lock] = {}  # 오피스별 실제 조회 직렬화
+_office_members_lock = Lock()  # 위 두 dict 를 함께 보호(짧게만 점유)
+
+
+def _office_fetch_lock(key: str) -> Lock:
+    """오피스별 fetch lock 반환(없으면 생성). cache stampede 방지용."""
+    with _office_members_lock:
+        lk = _office_members_fetch_locks.get(key)
+        if lk is None:
+            lk = Lock()
+            _office_members_fetch_locks[key] = lk
+        return lk
+
+
+def _prune_expired_office_cache(now: float) -> None:
+    """만료된 오피스의 멤버 캐시(메모리의 대부분=수천 행)를 제거해 바운딩한다.
+    호출 측이 _office_members_lock 을 보유한 채 호출한다.
+
+    fetch lock(_office_members_fetch_locks)은 일부러 제거하지 않는다: 조회 중인
+    lock 을 지우면 새 요청이 새 lock 을 만들어 동일 오피스 stampede 직렬화가 깨지기
+    때문이다. lock 은 오피스(=병원 tenant) 수만큼만 생기는 경량 객체라 자연 bounded 이고,
+    메모리의 실질 비중인 멤버 리스트는 여기서 제거되므로 사실상 영향이 없다."""
+    expired = [
+        k for k, (ts, _) in _office_members_cache.items()
+        if now - ts >= _OFFICE_MEMBERS_TTL
+    ]
+    for k in expired:
+        _office_members_cache.pop(k, None)
+
+
+def _fetch_office_members_cached(office_id: str) -> List[Any]:
+    """오피스 전체 멤버를 TTL 캐시로 조회. 동일 office 의 후속 페이지·검색 키 입력은
+    캐시 스냅샷을 재사용한다(제외집합 existing_nurse_ids 는 호출 측에서 live 로 계산).
+
+    동일 오피스의 TTL 만료 시 동시 요청이 모두 MSSQL 전체 조회를 실행하는
+    cache stampede 를 막기 위해 오피스별 fetch lock 으로 실제 조회를 1회로 직렬화한다.
+    """
+    key = str(office_id)
+    now = time.monotonic()
+    with _office_members_lock:
+        entry = _office_members_cache.get(key)
+        if entry is not None and now - entry[0] < _OFFICE_MEMBERS_TTL:
+            return entry[1]
+
+    # 동일 오피스 동시 요청은 한 번만 실제 조회(나머지는 아래 double-check 에서 캐시 적중).
+    with _office_fetch_lock(key):
+        with _office_members_lock:
+            entry = _office_members_cache.get(key)
+            if entry is not None and time.monotonic() - entry[0] < _OFFICE_MEMBERS_TTL:
+                return entry[1]
+        rows = (
+            msdb_manager.fetch_all(
+                Member.member_export_by_office(), params=(key,)
+            )
+            or []
+        )
+        stored_at = time.monotonic()
+        with _office_members_lock:
+            _office_members_cache[key] = (stored_at, rows)
+            _prune_expired_office_cache(stored_at)
+        return rows
+
+
+# 한글 초성 검색(ㄱㅁㅈ → 김민지)용 초성 테이블.
+_CHOSUNG_LIST = [
+    "ㄱ", "ㄲ", "ㄴ", "ㄷ", "ㄸ", "ㄹ", "ㅁ", "ㅂ", "ㅃ", "ㅅ",
+    "ㅆ", "ㅇ", "ㅈ", "ㅉ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ",
+]
+
+
+def _extract_chosung(text: str) -> str:
+    """완성형 한글 문자열에서 초성만 추출(가→ㄱ). 비한글 문자는 그대로 둔다."""
+    out: List[str] = []
+    for ch in text:
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:  # 가 ~ 힣
+            out.append(_CHOSUNG_LIST[(code - 0xAC00) // 588])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _chosung_or_substr_match(query: str, text: Any) -> bool:
+    """text 부분일치 또는 text 초성 부분일치로 매칭(이름·소속 공통).
+
+    초성은 '질의 전체가 초성'일 때만이 아니라 항상 함께 검사한다. 그래야 숫자/영문이
+    섞인 소속명(예: '105병동' → 초성 '105ㅂㄷ')을 'ㅂㄷ'(부분 초성) 또는 '105ㅂㄷ'
+    (혼합)로도 찾을 수 있고, 순수 초성('ㅇㄱ'→외과)·리터럴('병동')도 모두 매칭된다."""
+    norm = _normalize_search_text(text)
+    if not norm:
+        return False
+    if query in norm:
+        return True
+    return query in _extract_chosung(norm)
+
+
 def _available_member_row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
     emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
     if not emp_seq_no:
@@ -1052,10 +1155,18 @@ def _available_member_matches_search(
             _available_member_row_value(row, "small_kind_name"),
             _available_member_row_value(row, "mb_part_name"),
         ]
-        return any(query in _normalize_search_text(value) for value in values)
+        # 소속도 초성 검색 지원(ㅇㄱ → 외과)
+        return any(_chosung_or_substr_match(query, value) for value in values)
 
-    name = _available_member_row_value(row, "EmployeeName")
-    return query in _normalize_search_text(name)
+    # 이름: 초성(ㄱㅁㅈ → 김민지) 또는 부분일치
+    if _chosung_or_substr_match(query, _available_member_row_value(row, "EmployeeName")):
+        return True
+    # 사번/EmpSeqNo: 숫자가 포함된 질의일 때만 매칭(이름 검색어가 사번에 오탐되는 것 방지)
+    if any(ch.isdigit() for ch in query):
+        emp_num = _normalize_search_text(_available_member_row_value(row, "OfficeEmpNum"))
+        emp_seq = _normalize_search_text(_available_member_row_value(row, "EmpSeqNo"))
+        return query in emp_num or query in emp_seq
+    return False
 
 
 def get_available_members_service(
@@ -1091,21 +1202,13 @@ def get_available_members_service(
         decoded_cursor = _decode_available_member_cursor(cursor)
         existing_nurse_ids = _get_office_registered_nurse_ids(office_id, db)
 
-        base_sql = Member.member_export_by_office().strip()
-        where_clauses = []
-        params: List[Any] = [str(office_id)]
         normalized_q = (q or "").strip()
         normalized_search_by = "affiliation" if search_by == "affiliation" else "name"
 
         # MSSQL(EUC-KR) + UTF-8 LIKE 파라미터 조합에서 한글 검색이 깨지므로
-        # 검색(q)은 Member 전체 조회 후 Python에서 필터한다.
+        # 검색(q)은 Member 전체(TTL 캐시) 조회 후 Python에서 필터한다.
         if normalized_q:
-            all_members = (
-                msdb_manager.fetch_all(
-                    Member.member_export_by_office(), params=(str(office_id),)
-                )
-                or []
-            )
+            all_members = _fetch_office_members_cached(office_id)
             matched_rows = []
             cursor_name = decoded_cursor.get("name")
             cursor_nurse_id = decoded_cursor.get("nurse_id")
@@ -1165,56 +1268,46 @@ def get_available_members_service(
                 "has_next": has_next,
             }
 
-        if existing_nurse_ids:
-            placeholders = ", ".join(["%s"] * len(existing_nurse_ids))
-            where_clauses.append(
-                f"CAST(base.EmpSeqNo AS VARCHAR(50)) NOT IN ({placeholders})"
-            )
-            params.extend(sorted(existing_nurse_ids))
-
+        # 검색어 없음: 전체 멤버(TTL 캐시)에서 Python 페이지네이션.
+        # 기존 NOT IN(%s,...) 방식은 등록 간호사 수만큼 파라미터를 생성해
+        # MSSQL 2100 파라미터 한도로 대형 오피스에서 실패할 수 있어 제거한다.
+        # 정렬·커서는 기존과 동일하게 EmpSeqNo 문자열 오름차순 + nurse_id 커서를 유지.
+        all_members = _fetch_office_members_cached(office_id)
         cursor_nurse_id = decoded_cursor.get("nurse_id")
-        if cursor_nurse_id:
-            where_clauses.append("CAST(base.EmpSeqNo AS VARCHAR(50)) > %s")
-            params.append(cursor_nurse_id)
-        order_sql = "ORDER BY CAST(base.EmpSeqNo AS VARCHAR(50)) ASC"
+        filtered = []
+        for row in all_members:
+            emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
+            if not emp_seq_no:
+                continue
+            emp_seq_str = str(emp_seq_no)
+            if emp_seq_str in existing_nurse_ids:
+                continue
+            if cursor_nurse_id and emp_seq_str <= str(cursor_nurse_id):
+                continue
+            filtered.append((emp_seq_str, row))
 
-        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-        print(
-            "[DEBUG] available-members cursor query",
-            {
-                "normalized_q": normalized_q,
-                "search_by": normalized_search_by,
-                "decoded_cursor": decoded_cursor,
-                "where_sql": where_sql,
-                "params": params,
-                "limit": limit,
-                "excluded_count": len(existing_nurse_ids),
-            },
-        )
-        page_sql = f"""
-            SELECT *
-              FROM ({base_sql}) AS base
-              {where_sql}
-             {order_sql}
-             OFFSET 0 ROWS FETCH NEXT %s ROWS ONLY
-        """
-        rows = msdb_manager.fetch_all(page_sql, params=(*params, limit + 1)) or []
+        filtered.sort(key=lambda pair: pair[0])
+        page_rows = filtered[: limit + 1]
         print(
             "[DEBUG] available-members cursor rows",
             {
-                "raw_count": len(rows),
+                "normalized_search_by": normalized_search_by,
+                "decoded_cursor": decoded_cursor,
+                "excluded_count": len(existing_nurse_ids),
+                "raw_count": len(page_rows),
                 "sample_names": [
-                    _available_member_row_value(row, "EmployeeName") for row in rows[:5]
+                    _available_member_row_value(row, "EmployeeName")
+                    for _, row in page_rows[:5]
                 ],
             },
         )
         items = []
-        for row in rows[:limit]:
+        for _, row in page_rows[:limit]:
             member_dict = _available_member_row_to_dict(row)
             if member_dict:
                 items.append(member_dict)
 
-        has_next = len(rows) > limit
+        has_next = len(page_rows) > limit
         if has_next and items:
             next_cursor = _encode_available_member_cursor(items[-1]["nurse_id"])
         else:
@@ -1225,13 +1318,8 @@ def get_available_members_service(
             "has_next": has_next,
         }
 
-    # 1. MSSQL에서 오피스 전체 멤버 조회 (export-members와 동일 쿼리)
-    all_members = (
-        msdb_manager.fetch_all(
-            Member.member_export_by_office(), params=(str(office_id),)
-        )
-        or []
-    )
+    # 1. MSSQL에서 오피스 전체 멤버 조회 (export-members와 동일 쿼리, TTL 캐시)
+    all_members = _fetch_office_members_cached(office_id)
 
     # 2. 오피스에 이미 등록된 간호사의 nurse_id 집합
     existing_nurse_ids = _get_office_registered_nurse_ids(office_id, db)
