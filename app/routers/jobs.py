@@ -4,12 +4,13 @@ from datetime import datetime
 from threading import Lock
 from typing import Dict, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from db.client2 import SessionLocal
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
+from services.group_access import resolve_effective_group
 from services.job_status_service import get_latest_job_record
 
 router = APIRouter(tags=["jobs"])
@@ -98,6 +99,8 @@ def _fetch_latest_job(office_id: Optional[str], group_id: Optional[str], nurse_i
 
 @router.get("/jobs/status/latest", response_model=JobStatusResponse)
 async def get_latest_job_status(
+    response: Response,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
 ):
     """현재 사용자(office/group/nurse) 기준 가장 최신 Job 상태.
@@ -115,7 +118,25 @@ async def get_latest_job_status(
     예외:
         404: 해당 사용자/그룹의 Job이 없을 때.
     """
-    key = _user_key(current_user.office_id, current_user.group_id, current_user.nurse_id)
+    # 폴링 응답이 브라우저/CloudFront 디스크 캐시에 stale 로 남아 폴링이 멈추는 것 방지
+    response.headers["Cache-Control"] = "no-store"
+    if current_user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="인증이 필요합니다.",
+            headers={"Cache-Control": "no-store"},
+        )
+    # 그룹 스코프: 생성(roster_create_async)과 동일하게 resolve_effective_group 로 해석
+    # (토큰 group_id 가 아니라 요청 group_id / nurse_id→DB home 기준 → job 생성 그룹과 일치)
+    # 단발 세션으로 해석 후 즉시 close (long-poll 25초간 커넥션 점유 회피 — _fetch_latest_job 동일 정책)
+    _resolve_db = SessionLocal()
+    try:
+        target_group_id = resolve_effective_group(
+            _resolve_db, current_user, group_id, require_group=False
+        )
+    finally:
+        _resolve_db.close()
+    key = _user_key(current_user.office_id, target_group_id, current_user.nurse_id)
     deadline = time.monotonic() + _LONG_POLL_WAIT
     last_seen = _get_last_seen(key)
 
@@ -123,11 +144,15 @@ async def get_latest_job_status(
         job = await asyncio.to_thread(
             _fetch_latest_job,
             current_user.office_id,
-            current_user.group_id,
+            target_group_id,
             current_user.nurse_id,
         )
         if not job:
-            raise HTTPException(status_code=404, detail="해당 사용자/그룹의 Job이 없습니다.")
+            raise HTTPException(
+                status_code=404,
+                detail="해당 사용자/그룹의 Job이 없습니다.",
+                headers={"Cache-Control": "no-store"},
+            )
 
         current = (job.job_id, job.status)
 
