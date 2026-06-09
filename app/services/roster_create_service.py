@@ -4762,6 +4762,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session):
     )
     if _transfer_clipped_main:
         print(f"[Assignment][TransferOut] 영구 전출 active_range 클리핑(엔진 제외): {_transfer_clipped_main}")
+    # [Phase1-B2] team read 전환: nurse_team_period(SSOT) 가 진실.
+    #   period 가 그 달을 덮으면 그 값으로 team_id 를 확정한다(재분배 B3가 기록한 미래 팀 포함).
+    #   None(구간 없음)이면 기존 값 유지 — 홈은 ward-aware 폴백=캐시(현행 동일),
+    #   인바운드는 4689 의 target_team_id 보존(period 없을 때 비회귀).
+    from services.team_period import resolve_team_for_roster
+    for _en in engine_nurses:
+        _rt = resolve_team_for_roster(
+            db, str(_en.nurse_id), current_user.group_id, req.year, req.month
+        )
+        if _rt is not None:
+            # team_id 컨벤션은 문자열('2'). period(INT)→str 캐스팅으로 캐시/team_coverage 키와 일치.
+            _en.__dict__['team_id'] = str(_rt)
     excluded_engine_nurses = [
         n for n in engine_nurses if active_range_candidates.get(str(n.nurse_id)) is None
     ]

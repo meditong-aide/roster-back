@@ -187,6 +187,41 @@ def test_apply_creates_transfer_and_team_events(pool):
     assert tc.target_team_id == 2 and tc.source_group_id == tc.target_group_id == "A"
 
 
+def test_apply_writes_team_period_for_target_month(pool):
+    """[B3] 재분배 apply 가 팀 변경을 nurse_team_period 에 기록한다(대상월 1일 발효).
+
+    flush(start_date 도래) 전에도 resolve_team_for_roster 가 대상월의 새 팀을 읽어,
+    미래 월 근무표에 재분배 팀이 반영되게 한다(= '재분배해도 팀 안 바뀐다' 해소).
+    """
+    from db.models import NurseTeamPeriod
+    from services.team_period import resolve_team, resolve_team_for_roster
+
+    db = pool
+    apply_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7,
+        assignments=[
+            {"nurse_id": "a0", "to_group_id": "B", "team_id": 1},   # 이동 → B, 팀1
+            {"nurse_id": "a1", "to_group_id": "A", "team_id": 2},   # 잔류 팀변경 → 팀2
+            {"nurse_id": "a2", "to_group_id": "A", "team_id": 1},   # 동일 → skip(기록X)
+        ],
+    )
+    periods = {(p.nurse_id, p.group_id): p for p in db.query(NurseTeamPeriod).all()}
+    # 이동: B 그룹 period, 팀1, 7/1 발효
+    assert ("a0", "B") in periods
+    assert periods[("a0", "B")].team_id == 1
+    assert periods[("a0", "B")].valid_from == date(2026, 7, 1)
+    assert periods[("a0", "B")].source == "redistribute"
+    # 팀변경: A 그룹 period, 팀2
+    assert periods[("a1", "A")].team_id == 2
+    # skip(동일)은 기록 안 함
+    assert ("a2", "A") not in periods
+
+    # resolve: 7월(발효 후)엔 새 팀, 6월(발효 전)엔 캐시 폴백(팀1)
+    assert resolve_team_for_roster(db, "a1", "A", 2026, 7) == 2
+    assert resolve_team(db, "a1", "A", date(2026, 6, 15)) == 1   # gap → ward-aware 폴백
+    assert resolve_team_for_roster(db, "a0", "B", 2026, 7) == 1
+
+
 def test_apply_skips_unknown_or_no_target(pool):
     db = pool
     res = apply_ward_redistribution(

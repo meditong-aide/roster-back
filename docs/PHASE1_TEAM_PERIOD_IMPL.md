@@ -9,8 +9,8 @@
 |---|---|---|
 | **B1** | 모델 `NurseTeamPeriod` + 리졸버(`team_period.py`) + 테스트 | ✅ 코드 완료 (SQLite 6 passed) |
 | B-dev | dev 테이블 생성(DDL) + 백필 | ✅ MSSQL 적재 확인 (9B: t1=5,t2=4,t3=4) |
-| **B2** | 생성기 team read 전환(engine_nurses 일괄 → `resolve_team_for_roster`, 비회귀: None이면 기존값 유지) | ✅ 코드 적용 (9B 라이브 검증 대기) |
-| **B3** | 재분배 apply → `set_team_period`(close-before-open) | ⏳ |
+| **B2** | 생성기 team read 전환(engine_nurses 일괄 → `resolve_team_for_roster`, 비회귀: None이면 기존값 유지, **결과는 str 캐스팅**) | ✅ 라이브 검증(9B 7월 정상, 회귀 없음) |
+| **B3** | 재분배 apply → `set_team_period`(close-before-open) | ✅ 코드+테스트(`test_apply_writes_team_period_for_target_month`) |
 | **B4** | 문제 A: 전출(병동이동) source 경계=start_date, 파견 분기 | ✅ 코드 적용·라이브 검증 (전출자 엔진 제외, NURSE_BLOCKED_DAYS 소멸) |
 | 검증 | 9B 7월 재생성이 재분배 팀 반영 | ⏳ (테이블+백필 후) |
 
@@ -104,12 +104,14 @@ for _en in engine_nurses:
 - 홈 그룹: 백필로 period 가 모든 날 덮음 → 캐시와 동일값(현행 유지) + SSOT 가 period 로 이동.
 - 인바운드(group≠home): 9B period 없음 → None → `4689` 의 `target_team_id` 유지. **B3 가 9B period 를 쓰면 그때 period 우선**.
 
-### B3 (재분배 apply → period)
-`ward_redistribute_service` apply 의 팀 변경: `create_permanent_change(target_team_id=…)` / `create_assignment(target_team_id=…)` 대신
-```python
-set_team_period(db, nurse_id=…, group_id=대상병동, valid_from=발효일, team_id=새팀, source="redistribute")
-```
-병동 변경 자체(존재)는 그대로 `nurse_assignment(병동이동)`. **team 만 period 로**.
+### B2/B3 (적용됨) — 핵심 타입 함정 포함
+**B3** (`ward_redistribute_service.apply_ward_redistribution`): 병동이동/속성변경으로 팀이 바뀌면 기존 assignment 생성에 더해 **`set_team_period(group_id=대상병동, valid_from=발효일, team_id=새팀, source="redistribute")`** 를 호출(close-before-open). 병동 변경(존재)은 그대로 `nurse_assignment`. team 미지정('전체')은 기록 안 함.
+- **효과**: `create_permanent_change`(속성변경)는 nurses.team_id 를 flush(발효일 도래) 전엔 안 바꾸므로, 6월에 7월 표를 만들면 캐시가 옛 팀이라 "재분배해도 팀 안 바뀜"이었다. period 에 기록하면 B2 가 대상월 시점 팀을 읽어 **발효 전에도 미래 월에 반영**된다.
+
+**B2** (`roster_create_service`, engine_nurses 조립 후): 각 engine nurse 를 `resolve_team_for_roster(현재그룹, 연, 월)` 로 해석, period 가 있으면 그 값으로 team_id 확정. None 이면 기존값 유지(홈=캐시, 인바운드=target_team_id) → 비회귀.
+- ⚠ **타입 함정(중요)**: 실DB `nurses.team_id` 는 **문자열('2')** 로 반환되는데 `nurse_team_period.team_id` 는 INT → resolve 는 **int 2** 반환. precheck `check_team_size_insufficient` 는 `team_coverage` 키(str '2')로 `members_by_team.get`. int 로 덮으면 매칭 실패 → **team_size=0 오탐**(라이브에서 실제 발생). → **B2 는 `str(_rt)` 로 캐스팅**해 컨벤션(str) 유지. (period 테이블은 INT 유지, 엔진/precheck 는 str)
+
+검증(라이브 9B 2026-07): B2 str 캐스팅 후 정상 생성(22명, violations 0). B3 는 SQLite 통합테스트로 period 기록 + resolve 새 팀 확인.
 
 ### B4 (문제 A — 전출 source 경계) [적용됨]
 **증상**: 9B 7월 생성 시 전출(병동이동, src=9B) 7명이 엔진에 남아 **"31일 전체 차단"**(NURSE_BLOCKED_DAYS)으로 잔류 → 팀/등급 풀 유효 인력 왜곡 → 커버리지 구조적 infeasible.

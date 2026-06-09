@@ -27,6 +27,7 @@ from db.models import (
 )
 from schemas.roster_schema import NurseAssignmentCreate
 from services.assignment_service import create_assignment, create_permanent_change
+from services.team_period import set_team_period
 from services.team_auto_assign import NurseInput, auto_assign_teams
 from services.team_classify_service import _build_pool_roster
 
@@ -552,6 +553,7 @@ def apply_ward_redistribution(
             continue
         cur_g = n.group_id
         try:
+            _tp_group: Optional[str] = None
             if cur_g != to_g:
                 req = NurseAssignmentCreate(
                     nurse_id=nid, source_group_id=cur_g, target_group_id=to_g,
@@ -560,14 +562,26 @@ def apply_ward_redistribution(
                 )
                 create_assignment(req, db, current_user)
                 transfers += 1
+                _tp_group = to_g
             elif team is not None and not _same_team(n.team_id, team):
                 create_permanent_change(
                     db, nurse_id=nid, group_id=cur_g, office_id=n.office_id,
                     start_date=effective, new_team_id=team, note=_note,
                 )
                 team_changes += 1
+                _tp_group = cur_g
             else:
                 skipped += 1
+                continue
+            # [B3] 팀 변경을 시점 테이블(nurse_team_period)에 기록 (close-before-open).
+            #   생성기는 resolve_team_for_roster 로 대상월 시점 팀을 여기서 읽으므로(B2),
+            #   start_date 도래 전(flush 전)에도 미래 월 근무표에 새 팀이 반영된다.
+            #   team 미지정('전체'/None)은 기록하지 않는다(기존 거동 유지).
+            if team is not None and _tp_group is not None:
+                set_team_period(
+                    db, nurse_id=nid, group_id=_tp_group, valid_from=effective,
+                    team_id=team, source="redistribute", note=_note,
+                )
         except Exception as e:  # 기간겹침(409) 등 — 그 사람만 스킵
             # create_assignment 의 검증(_raise_if_overlap 등)은 db.add 이전에 raise 하므로
             # 부분 커밋이 없다 → 세션 무효화(rollback) 없이 다음 사람 진행.
