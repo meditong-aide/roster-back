@@ -164,7 +164,7 @@ group_members_in_month(db, group_id, year, month) -> [...]   # 소속 기준 명
 
 ### 4.4 생성기 read 전환 (핵심)
 - **shift제한**: 일자별 `resolve_shift_rule(nurse, day)` → 허용 외 shift **셀 금지** 주입(솔버 per-cell 지원). → 교육 사례.
-- **team/grade**: per-day로 읽되 **gap(미지정)일은 팀 min에서 제외**(option a). 이로써 같은 병동 월중 team 변경도 자연 처리(per-day team). → §7-1 제약이 사실상 해소되는 방향(솔버 per-day team 주입 작업 필요).
+- **team/grade**: per-day로 읽되 **gap(미지정)일은 팀 min에서 제외**(option a, **우선 gap만** — §8-2). 같은 병동 월중 team 변경 전체 지원은 수요 시 확장.
 - 현 읽기 지점: `roster_create_service.py:5474, 5811`.
 
 ### 4.5 발효 cron 역할 재정의
@@ -205,11 +205,14 @@ period는 희소(델타)지만 **변경 시 옛 구간을 삭제하지 않고 cl
 7. **캐시를 진실로 삼지 말 것** — 생성기는 as-of 리졸버(9B infeasible 원인). 과거는 닫힌 구간.
 8. **정의 재사용 OK** — teams/roster_grade_config는 FK/해석 타깃.
 9. **MSSQL 전환** — JSON→NVARCHAR(MAX), TINYINT/TEXT/백틱 방언, AUTO_INCREMENT→IDENTITY.
+10. **휴직 부분/구간 처리** ⚠ — 현 `_clip_active_range_for_leaves`(`roster_create_service.py:889`)는 휴직 start 로 active_range 를 잘라 **"휴직 시작 → 월말 전부 off"** 단방향만 표현. **부분 휴직(1–15 휴직·16–31 근무)·월초 휴직 후 복귀 미지원**(근무일이 통째로 날아감). → #4 결정(per-day) 구현 시 휴직을 **`[start,end]` blocked-days 구간**으로 다뤄 그 기간만 막고 나머지는 근무 가능하게 재구현 필요.
 
-## 8. 미해결 / 결정 필요
+## 8. 결정 사항 (확정)
 
-1. **grade 스코프**: 병동귀속(현재 설계) vs 간호사귀속.
-2. **솔버 per-day team** 주입 범위(option a): 어디까지 적용(gap만 vs 월중 변경 전체).
-3. split 월 "내 근무표" 머지 UI: 통합 캘린더 vs 병동별 탭.
-4. 휴직 중 원티드: 보기만 vs 부분 휴직(월 일부) 처리.
-5. 미래 target 병동 "전체 근무표" 노출 시작 시점(assignment 등록 즉시 vs 승인 후).
+1. **grade 스코프 = 병동귀속.** 실제로 병동마다 등급이 다를 수 있음 → `nurse_grade_period.group_id` 유지(현 설계대로).
+2. **솔버 per-day team = 우선 gap만.** 미지정일 팀 min 제외. 같은 병동 월중 team 변경 전체 지원은 수요 시 확장.
+3. **split 월 "내 근무표" = 통합 캘린더.** 기존 `get_my_issued_roster_service`가 이미 target overlay(복수 assignment) 머지 로직 보유(`roster_service.py`) → 그 위에 통합 캘린더 렌더. (문제 없어 보임)
+4. **휴직 원티드 = per-day** (휴직일 막고 근무일 제출·배정). **전제**: §7-10 휴직 구간 처리(blocked-days [start,end]) 재구현. 부분 휴직 = 근무일만 정상.
+5. **미래 전체근무표 노출 = 등록 즉시** (assignment active 시. 별도 승인 단계 없음 가정 — 생기면 승인 후로 조정).
+
+> 남은 진짜 작업 의존성: **§7-10(휴직 구간 처리)** 은 #4의 전제라 Phase(휴직 관련)에서 함께 해결.
