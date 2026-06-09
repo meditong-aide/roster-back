@@ -14,30 +14,31 @@
 | **B4** | 문제 A: 전출(병동이동) source 경계=start_date, 파견 분기 | ⏳ |
 | 검증 | 9B 7월 재생성이 재분배 팀 반영 | ⏳ (테이블+백필 후) |
 
-## 1. DDL (dev MySQL 실행)
+## 1. DDL (dev = **MSSQL** 실행)
 
 ```sql
 CREATE TABLE nurse_team_period (
-    id          INTEGER NOT NULL AUTO_INCREMENT,
+    id          INT IDENTITY(1,1) NOT NULL,
     nurse_id    VARCHAR(50) NOT NULL,
     group_id    VARCHAR(50) NOT NULL,
     valid_from  DATE NOT NULL,
     valid_to    DATE NULL,                 -- null = 열린(계속) 구간
-    team_id     INTEGER NULL,
-    source      VARCHAR(20) NOT NULL DEFAULT 'inherited',  -- inherited|edited|redistribute
-    note        TEXT NULL,
-    created_at  DATETIME,
-    updated_at  DATETIME,
-    PRIMARY KEY (id),
-    FOREIGN KEY (nurse_id) REFERENCES nurses (nurse_id),
-    FOREIGN KEY (group_id) REFERENCES `groups` (group_id)
+    team_id     INT NULL,
+    source      VARCHAR(20) NOT NULL CONSTRAINT df_ntp_source DEFAULT 'inherited',  -- inherited|edited|redistribute
+    note        NVARCHAR(MAX) NULL,
+    created_at  DATETIME NULL CONSTRAINT df_ntp_created DEFAULT GETDATE(),
+    updated_at  DATETIME NULL,
+    CONSTRAINT pk_nurse_team_period PRIMARY KEY (id),
+    CONSTRAINT fk_ntp_nurse FOREIGN KEY (nurse_id) REFERENCES nurses (nurse_id),
+    CONSTRAINT fk_ntp_group FOREIGN KEY (group_id) REFERENCES [groups] (group_id)
 );
 CREATE INDEX ix_ntp_nurse ON nurse_team_period (nurse_id, valid_from);
 CREATE INDEX ix_ntp_group ON nurse_team_period (group_id, valid_from);
 ```
 - 가산적(신규 테이블) — 기존 테이블/데이터 무영향.
 - `team_id` 복합 FK `(group_id,team_id)→teams` 는 DB레벨 미적용(앱 리졸버가 무결성 보장).
-- MSSQL: `JSON` 없음(여긴 미사용), `TEXT→NVARCHAR(MAX)`, `AUTO_INCREMENT→IDENTITY(1,1)`, `` `groups` ``→`[groups]`.
+- 타입: `note`=NVARCHAR(MAX)(TEXT deprecated), `id`=IDENTITY(1,1), `created_at/updated_at`=DATETIME(ORM 매핑과 일치), `[groups]` 대괄호.
+- **로컬 dev 가 MySQL 인 경우(대안)**: `INT IDENTITY(1,1)`→`INTEGER AUTO_INCREMENT`, `NVARCHAR(MAX)`→`TEXT`, `GETDATE()`→`NOW()`, `[groups]`→`` `groups` ``, CONSTRAINT 인라인 생략 가능.
 
 ## 2. 백업 (실행 전 권장)
 
@@ -51,11 +52,13 @@ mysqldump -h <host> -u <user> -p meditong_roster nurses nurse_assignment \
 ## 3. 백필 (현재 `nurses.team_id` → open 구간)
 
 ```sql
+-- MSSQL (id 는 IDENTITY 라 미지정)
 INSERT INTO nurse_team_period
   (nurse_id, group_id, valid_from, valid_to, team_id, source, created_at, updated_at)
-SELECT nurse_id, group_id, '2000-01-01', NULL, team_id, 'inherited', NOW(), NOW()
+SELECT nurse_id, group_id, '2000-01-01', NULL, team_id, 'inherited', GETDATE(), GETDATE()
 FROM nurses
 WHERE active = 1 AND team_id IS NOT NULL;
+-- (로컬 MySQL 이면 GETDATE() → NOW())
 ```
 - **의미**: 현재 팀을 "기록 이래(2000-01-01) 계속(open)"으로 깐다. 이후 변경은 `set_team_period`가 **close-before-open**으로 닫아 미래 history 가 정확해진다.
 - **과거**: 과거 실제 근무표는 `IssuedRosterSnapshot`(격자)에 보존되므로, 백필이 과거를 '현재 팀'으로 칠해도 발행본 표시에는 영향 없음. (resolve 폴백은 백필 후엔 거의 쓰이지 않음 — 구간이 모든 날을 덮음)
