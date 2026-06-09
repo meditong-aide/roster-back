@@ -185,7 +185,7 @@ period는 희소(델타)지만 **변경 시 옛 구간을 삭제하지 않고 cl
 | Phase | 내용 | 검증 |
 |---|---|---|
 | **1. team** | `nurse_team_period` 생성 + 현재 `nurses.team_id` backfill(open 구간) + `resolve_team`(ward-aware) + 생성기 team read 전환 + 재분배 apply→period. (v1 `nurse_month_profile` 코드 교체) | 9B 7월 재생성이 재분배 팀 반영 |
-| **2. shiftrule** | `nurse_shiftrule_period` + 생성기 per-day 셀 금지 | 교육 사례(D→DE) |
+| **2. shiftrule** | `nurse_shiftrule_period` + 생성기 per-day 셀 금지 | 교육 사례(D→DE) — **보류(2026-06)**: period 자체는 정당하나(월중 phased=교육 D→DE→DEN·임시제한·N전담 전환은 캐시 단일 마스크로 표현 불가), 진짜 비용이 **솔버 per-(day,shift) 금지 주입**(team/grade보다 최중량)이라 당장은 미룸. 휴직 구간(§7-10)과 한 묶음. 재개 전 "솔버 per-day shift 금지 지원 현황 + 실제 필요 케이스" 조사부터. |
 | **3. grade** | ~~`nurse_grade_period`~~ **폐기(2026-06)** → 경량: 캐시 `nurses.grade` + assignment `target_grade` override(team B2 이전 방식). 룰은 G1≥1 hard→soft. | 이동자 grade=target_grade 반영, 룰 회귀 |
 | **4. 근무자관리 표시** | 월 셀렉터 + 소속 필터 + 상태 배지 + 헤드카운트 분리 + 사이드 as-of | §3 매트릭스 |
 | **5. preceptorship** | 관계 테이블 + backfill + 종료 자동화 | N:1·기간 |
