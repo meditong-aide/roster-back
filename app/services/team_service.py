@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
-from db.models import Team, Nurse
+from db.models import Team, Nurse, NurseTeamPeriod
 from services.precheck.team_min_shift_capacity_validator import validate_team_min_shift_capacity
 
 
@@ -198,6 +198,13 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
         print('delete_team_ids', delete_team_ids)
         # 멤버 해제 후 팀 행 삭제(하드 삭제)
         db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.team_id.in_(delete_team_ids)).update({Nurse.team_id: None}, synchronize_session=False)
+        # 시점 모델 정합: 삭제된 팀을 가리키는 nurse_team_period 도 제거.
+        #   안 하면 캐시(team_id)는 None인데 period 는 옛 팀을 가리켜 resolve 가 '없는 팀'을
+        #   반환(고아). 캐시 None 처리와 동일 의미로 period 행을 삭제한다.
+        db.query(NurseTeamPeriod).filter(
+            NurseTeamPeriod.group_id == group_id,
+            NurseTeamPeriod.team_id.in_(delete_team_ids),
+        ).delete(synchronize_session=False)
         db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id, Team.team_id.in_(delete_team_ids)).delete(synchronize_session=False)
 
     db.commit()

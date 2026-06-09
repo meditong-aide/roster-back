@@ -92,3 +92,27 @@ def test_reset_same_start_updates_in_place(seeded):
     cnt = db.query(NurseTeamPeriod).filter(NurseTeamPeriod.nurse_id == "n1").count()
     assert cnt == 1
     assert resolve_team(db, "n1", "A", date(2026, 7, 5)) == 3
+
+
+def test_delete_team_clears_team_period(seeded):
+    """팀 삭제(apply_team_ops)는 그 team_id 의 nurse_team_period 도 제거 →
+    캐시(team_id=None)와 일관, resolve 가 '없는 팀'을 반환하지 않음(고아 방지)."""
+    from db.models import Team
+    from services.team_service import apply_team_ops
+
+    db = seeded
+    db.add(Team(office_id="o1", group_id="A", team_id=2, team_name="2팀", active=1))
+    # n1 을 실제 팀2 멤버로(캐시) + 팀2 period
+    db.query(Nurse).filter(Nurse.nurse_id == "n1").update({Nurse.team_id: 2})
+    set_team_period(db, nurse_id="n1", group_id="A", valid_from=date(2026, 7, 1), team_id=2)
+    db.commit()
+    assert resolve_team(db, "n1", "A", date(2026, 7, 10)) == 2
+
+    apply_team_ops(db, office_id="o1", group_id="A", payload=[], delete_team_ids=[2])
+
+    # period 행 제거됨 + 캐시 None + resolve None(ward-aware 폴백→캐시 None)
+    assert db.query(NurseTeamPeriod).filter(
+        NurseTeamPeriod.group_id == "A", NurseTeamPeriod.team_id == 2
+    ).count() == 0
+    assert db.query(Nurse).filter(Nurse.nurse_id == "n1").first().team_id is None
+    assert resolve_team(db, "n1", "A", date(2026, 7, 10)) is None

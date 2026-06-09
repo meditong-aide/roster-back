@@ -113,6 +113,11 @@ for _en in engine_nurses:
 
 검증(라이브 9B 2026-07): B2 str 캐스팅 후 정상 생성(22명, violations 0). B3 는 SQLite 통합테스트로 period 기록 + resolve 새 팀 확인.
 
+### B5 (팀 삭제 시 period 정리) — SSOT 무결성
+팀 이름 변경(rename)은 team_id 가 유지되고 resolve/생성기가 team_id 로만 동작하므로 **무관(안전)**. 단 **팀 삭제**(`apply_team_ops` delete_team_ids)는 `Nurse.team_id→None` 만 하고 `nurse_team_period` 는 안 건드려, 캐시는 None인데 period 가 삭제된 팀을 가리키는 **고아**가 생겼다(resolve 가 없는 팀 반환).
+**수정**(`team_service.py`): 삭제 시 해당 team_id 의 `nurse_team_period` 행도 삭제(캐시 None 과 동일 의미). 테스트 `test_delete_team_clears_team_period`.
+**남은 별개 리스크(미적용)**: `next_team_id=max+1` 이라 최고 team_id 삭제 후 신규 생성 시 id 재사용 가능 → 옛 period 가 다른 팀을 가리킴. 근본 차단은 all-time-max 또는 soft-delete(active=0) — 더 큰 결정이라 분리.
+
 ### B4 (문제 A — 전출 source 경계) [적용됨]
 **증상**: 9B 7월 생성 시 전출(병동이동, src=9B) 7명이 엔진에 남아 **"31일 전체 차단"**(NURSE_BLOCKED_DAYS)으로 잔류 → 팀/등급 풀 유효 인력 왜곡 → 커버리지 구조적 infeasible.
 **원인**: 엔진은 active_range 클리핑을 **휴직/퇴사만** 수행(`roster_create_service.py` ~4740). 병동이동 source-side 는 day-block(파견 복귀용 로직)으로만 처리돼 영구 전출도 "차단된 채 잔류".
