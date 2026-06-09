@@ -1246,6 +1246,13 @@ async def get_nurse_by_id(
         if group_id and str(group_id) != str(getattr(current_user, "group_id", "")):
             assert_caller_can_access_group(db, current_user, group_id)
 
+        # 권한은 can_caller_access_nurse 로 이미 통과 → 조회는 그룹필터 없이 직접 한다
+        # (docstring 의도). 라우터가 home 그룹으로만 필터하면 HN 의 비-home 관리병동 간호사가
+        # 404 로 숨던 버그가 있었다. group_id 는 overlay(파견·병동이동 target_*) view 컨텍스트로만
+        # 넘기고, 미지정 시엔 home overlay 로 폴백한다.
+        _view_gid = (
+            None if group_id in (None, "", "null", "undefined", "None") else group_id
+        )
         if current_user.is_master_admin:
             result = get_nurses_filtered_service(
                 current_user, db, nurse_id=nurse_id,
@@ -1253,27 +1260,12 @@ async def get_nurse_by_id(
         else:
             try:
                 result = get_nurses_in_group_service(
-                    current_user,
-                    db,
-                    nurse_id=nurse_id,
+                    current_user, db, nurse_id=nurse_id,
+                    view_group_id=_view_gid,
+                    skip_group_filter=True,
                 )
             except Exception:
                 result = None
-        # 같은 그룹에 없으면 → 파견/병동이동 인바운드 여부 확인 후 직접 조회.
-        # 보는 그룹은 토큰 group_id 대신 nurse_id→DB home group 으로 판정(그룹전환 안전).
-        if not result:
-            from db.models import NurseAssignment
-            _viewer_gid = resolve_home_group_id(db, current_user)
-            has_inbound = db.query(NurseAssignment).filter(
-                NurseAssignment.nurse_id == nurse_id,
-                NurseAssignment.target_group_id == _viewer_gid,
-                NurseAssignment.reason.in_(["파견", "병동이동"]),
-                NurseAssignment.status == "active",
-            ).first()
-            if has_inbound:
-                result = get_nurses_in_group_service(
-                    current_user, db, nurse_id=nurse_id, skip_group_filter=True,
-                )
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
         return result[0]
