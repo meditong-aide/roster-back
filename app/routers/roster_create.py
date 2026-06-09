@@ -23,6 +23,7 @@ from services.roster_create_service import (
     request_schedule_service,
 )
 from services.job_status_service import create_job_record
+from services.group_access import resolve_effective_group
 
 router = APIRouter(tags=["roster_create"])
 
@@ -171,6 +172,13 @@ async def roster_create_async(
         year=2025, month=3 요청, wait_for_result=True → 동기 생성 결과 반환.
     """
 
+    # 대상 그룹: 토큰 group_id 대신 req.group_id(없으면 DB home)로 해석·검증(권한 없으면 403).
+    # 워커가 params 로 동일 그룹을 재현하도록 req.group_id 에 되써 둔다.
+    target_group_id = resolve_effective_group(
+        _db, current_user, getattr(req, "group_id", None)
+    )
+    req.group_id = target_group_id
+
     if wait_for_result:
         # 동기로 바로 생성(레거시/테스트 용). CPU 부하는 EC2에 남습니다.
         try:
@@ -192,7 +200,7 @@ async def roster_create_async(
         "nurse_id": current_user.nurse_id,
         "account_id": current_user.account_id,
         "office_id": current_user.office_id,
-        "group_id": current_user.group_id,
+        "group_id": target_group_id,
         "params": req.dict(),
         "requested_at": datetime.utcnow().isoformat(),
     }
@@ -203,7 +211,7 @@ async def roster_create_async(
             db=_db,
             job_id=job_body["job_id"],
             office_id=current_user.office_id,
-            group_id=current_user.group_id,
+            group_id=target_group_id,
             nurse_id=current_user.nurse_id,
         )
     except Exception as exc:

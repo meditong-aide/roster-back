@@ -5,7 +5,7 @@
 """
 
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, select
+from sqlalchemy import or_, and_, select
 from fastapi import HTTPException
 from db.models import (
     Nurse as NurseModel,
@@ -16,7 +16,7 @@ from db.models import (
     Shift,
 )
 from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP
-from services.group_access import resolve_managed_group_ids
+from services.group_access import resolve_managed_group_ids, caller_is_head_nurse, resolve_home_group_id, caller_is_hn
 from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any, Tuple
@@ -206,7 +206,7 @@ def _load_preceptees_map(db: Session, nurses) -> Dict[str, List[Dict[str, Any]]]
 def get_nurses_in_group_service(
     current_user, db: Session, nurse_id: Optional[str] = None,
     skip_group_filter: bool = False,
-    override_group_id: Optional[str] = None,
+    view_group_id: Optional[str] = None,
 ):
     """
     그룹 내 간호사 목록 조회 서비스 함수
@@ -218,8 +218,9 @@ def get_nurses_in_group_service(
     if not current_user:
         raise Exception("Not authenticated")
 
-    # 다른 그룹 view 강제 시 override_group_id 우선, 아니면 토큰 group_id
-    effective_group_id = override_group_id or current_user.group_id
+    # 그룹 스코프: 라우터가 검증해 넘긴 view_group_id(토큰 무관, nurse_id→DB+hn_id) 우선,
+    # 없으면 레거시 토큰 group_id 폴백.
+    _gid = view_group_id or resolve_home_group_id(db, current_user)
 
     query = db.query(NurseModel)
 
@@ -227,20 +228,33 @@ def get_nurses_in_group_service(
     # 정책: status='active' 인 inbound assignment 가 있는 nurse 는 미래 시작 여부와 무관하게 노출.
     #   - source 측: Nurse.group_id 매칭으로 outbound nurse 도 자연 노출 (양쪽 노출).
     #   - 실근무 일자가 아닌 셀은 솔버의 active_window/blocked_days 로 제외되므로 안전.
-    if not skip_group_filter and effective_group_id:
+    if not skip_group_filter and _gid:
         _inbound_subq = (
             db.query(NurseAssignment.nurse_id)
             .filter(
-                NurseAssignment.target_group_id == effective_group_id,
+                NurseAssignment.target_group_id == _gid,
                 NurseAssignment.status == "active",
                 NurseAssignment.reason.in_(_INBOUND_REASONS),
             )
             .subquery()
         )
+        # 전출(병동이동) 나간 간호사: 발효 완료되면 nurses.group_id 가 target 으로 바뀌어
+        # 위 두 조건에 안 걸린다. source 가 나(=출발지)인 병동이동 행으로 역으로 잡아
+        # 명단에 '전출함'으로 노출 (상세 차단·회색 처리는 프론트가 inbound 항목 방향으로 판단).
+        _outbound_transfer_subq = (
+            db.query(NurseAssignment.nurse_id)
+            .filter(
+                NurseAssignment.source_group_id == _gid,
+                NurseAssignment.target_group_id != _gid,
+                NurseAssignment.reason == "병동이동",
+            )
+            .subquery()
+        )
         query = query.filter(
             or_(
-                NurseModel.group_id == effective_group_id,
+                NurseModel.group_id == _gid,
                 NurseModel.nurse_id.in_(select(_inbound_subq.c.nurse_id)),
+                NurseModel.nurse_id.in_(select(_outbound_transfer_subq.c.nurse_id)),
             )
         )
 
@@ -261,8 +275,8 @@ def get_nurses_in_group_service(
     if nurse_id and not nurses:
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
 
-    # roster_config에서 표시 설정 플래그 조회 (override 그룹이면 그쪽 flag)
-    display_flags = _get_display_flags(db, effective_group_id)
+    # roster_config에서 표시 설정 플래그 조회
+    display_flags = _get_display_flags(db, _gid)
 
     # 만 나이 계산
     current_date = date.today()
@@ -290,9 +304,9 @@ def get_nurses_in_group_service(
     inbound_blocks: Dict[str, Dict[str, Any]] = {}
     if nurses:
         _nids = [n.nurse_id for n in nurses]
-        if effective_group_id:
-            inbound_map = _load_inbound_map(db, effective_group_id, _nids)
-        inbound_blocks = _build_inbound_blocks(db, _nids)
+        if _gid:
+            inbound_map = _load_inbound_map(db, _gid, _nids)
+        inbound_blocks = _build_inbound_blocks(db, _nids, caller_group_id=_gid)
 
     # preceptor → preceptees 배치 로드 (프리셉터 사이드 프로필에 N명 노출용)
     preceptees_map: Dict[str, List[Dict[str, Any]]] = _load_preceptees_map(db, nurses)
@@ -524,6 +538,7 @@ def move_nurse_with_active_service(
     target_active: Optional[int],
     current_user,
     db: Session,
+    group_id: Optional[str] = None,
 ):
     """
     간호사 이동/상태변경을 단일 트랜잭션으로 처리.
@@ -531,16 +546,27 @@ def move_nurse_with_active_service(
     - target_active가 0/1이면 해당 상태 리스트로 이동 후 삽입
     """
     if not current_user:
-        raise Exception("Not authenticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
     # 수간호사 또는 마스터관리자만 허용
     if not (
-        getattr(current_user, "is_head_nurse", False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
-        raise Exception("Permission denied")
+        raise HTTPException(status_code=403, detail="Permission denied")
 
-    # ADM은 group_id가 없을 수 있으므로 nurse_id만으로 조회 후 대상 그룹을 결정
-    if getattr(current_user, "is_master_admin", False) and not getattr(
+    # 그룹 결정 우선순위: (1) 라우터가 검증해 넘긴 group_id(토큰 무관, nurse_id→DB+hn_id),
+    # (2) ADM 무지정 시 nurse_id 로 조회, (3) 레거시 토큰 group_id.
+    if group_id:
+        target_group_id = group_id
+        nurse = (
+            db.query(NurseModel)
+            .filter(
+                NurseModel.group_id == group_id,
+                NurseModel.nurse_id == nurse_id,
+            )
+            .first()
+        )
+    elif getattr(current_user, "is_master_admin", False) and not getattr(
         current_user, "group_id", None
     ):
         nurse = (
@@ -595,7 +621,11 @@ def move_nurse_with_active_service(
 
 
 def reorder_nurses_service(
-    active_order: List[str], inactive_order: List[str], current_user, db: Session
+    active_order: List[str],
+    inactive_order: List[str],
+    current_user,
+    db: Session,
+    group_id: Optional[str] = None,
 ):
     """
     드래그앤드롭 완료 시점에 한 번 호출하여
@@ -604,11 +634,12 @@ def reorder_nurses_service(
     - 전달되지 않은 간호사는 상태/순서 변경하지 않음(React 측에서 전체 보냄을 권장)
     """
     if not current_user:
-        raise Exception("Not authenticated")
-    if not current_user.is_head_nurse:
-        raise Exception("Permission denied")
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not caller_is_head_nurse(db, current_user):
+        raise HTTPException(status_code=403, detail="Permission denied")
 
-    group_id = current_user.group_id
+    # 라우터가 검증해 넘긴 group_id(토큰 무관) 우선, 없으면 레거시 토큰 폴백.
+    group_id = group_id or resolve_home_group_id(db, current_user)
     id_to_nurse = {
         n.nurse_id: n
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id).all()
@@ -863,7 +894,7 @@ def move_nurse_service(req, current_user, db: Session):
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not current_user.is_head_nurse:
+    if not caller_is_head_nurse(db, current_user):
         raise Exception("Permission denied")
 
     nurse_to_move = (
@@ -1161,7 +1192,7 @@ def update_nurse_profile_service(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     is_admin = current_user.is_master_admin
-    is_head = current_user.is_head_nurse
+    is_head = caller_is_head_nurse(db, current_user)
 
     if not (is_admin or is_head):
         raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 수정할 수 있습니다.")
@@ -1217,31 +1248,12 @@ def update_nurse_profile_service(
     # 호출 view 의 group_id 결정 (target view 에서 inbound nurse 수정 시 명시 필요).
     # 권한 검증 (사이드프로필 / source 모두 동일):
     #   - 본인 group 과 동일하면 OK
-    #   - 다른 group 인 경우 ADM 또는 HN multi-group 의 managed groups 안에 있어야 함
-    _caller_view_group = view_group_id or current_user.group_id
-    if view_group_id and view_group_id != current_user.group_id and not is_admin:
-        is_hn_multi = str(getattr(current_user, "hn_auth", "") or "").upper() == "HN"
-        if not is_hn_multi:
-            raise HTTPException(
-                status_code=403,
-                detail="다른 그룹 view 에서 nurse 수정 권한이 없습니다 (HN/admin 필요).",
-            )
-        from services.group_access import resolve_managed_group_ids
-        _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
-        if str(view_group_id) not in _managed:
-            raise HTTPException(
-                status_code=403,
-                detail="해당 view 그룹은 본인이 관리하는 그룹이 아닙니다.",
-            )
-
-    # HN multi-group 자동 보정: view_group_id 미전송 시 nurse 의 home/inbound 가
-    # managed groups 안에 있으면 _caller_view_group 자동 매핑 (통합보기 / 프론트가
-    # view_group_id 안 보내는 경우 대응).
+    #   - 다른 group 인 경우 master_admin 또는 hn_auth=='HN'(그룹 관리자) 만 허용
+    _caller_view_group = view_group_id or resolve_home_group_id(db, current_user)
     if (
         not view_group_id
         and not is_admin
-        and str(getattr(current_user, "hn_auth", "") or "").upper() == "HN"
-        and str(nurse.group_id) != str(current_user.group_id)
+        and not caller_is_hn(db, current_user)
     ):
         from services.group_access import resolve_managed_group_ids
         _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
@@ -1748,7 +1760,7 @@ def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
         raise Exception("Not authenticated")
 
     # 권한 체크
-    if not (current_user.is_head_nurse or current_user.is_master_admin):
+    if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise Exception("Permission denied")
 
     # 대상 간호사 조회
@@ -1937,7 +1949,7 @@ def upload_profile_image_service(
         nurse.office_id or getattr(current_user, "office_id", None) or "unknown"
     )
     group_id = str(
-        nurse.group_id or getattr(current_user, "group_id", None) or "unknown"
+        nurse.group_id or resolve_home_group_id(db, current_user) or "unknown"
     )
     nurse_id = str(nurse.nurse_id)
     object_key = f"og-images/{office_id}/{group_id}/{nurse_id}/my-profile/{secrets.token_hex(16)}{ext}"
@@ -2162,6 +2174,7 @@ def _load_inbound_map(
 def _build_inbound_blocks(
     db: Session,
     nurse_ids: List[str],
+    caller_group_id: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """간호사별 활성 파견/병동이동/휴직/퇴사/프리셉티 블록 구성.
 
@@ -2171,14 +2184,28 @@ def _build_inbound_blocks(
     }
     current_assignment: 휴직/퇴사 > 프리셉티 > 파견/병동이동 우선,
     동률 시 start_date DESC (최신).
+
+    caller_group_id: 지정 시, 그 그룹에서 '전출'(병동이동, source==caller)된 completed 행도
+        포함해 과거 병동(source) 명단의 '전출함' 표시를 살린다. 전입처(B) 화면은 오염되지
+        않도록 source==caller 인 completed 만 포함 (None 이면 기존대로 active 만).
     """
     if not nurse_ids:
         return {}
+    _status_clause = NurseAssignment.status == "active"
+    if caller_group_id is not None:
+        _status_clause = or_(
+            NurseAssignment.status == "active",
+            and_(
+                NurseAssignment.status == "completed",
+                NurseAssignment.reason == "병동이동",
+                NurseAssignment.source_group_id == caller_group_id,
+            ),
+        )
     rows = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.nurse_id.in_(nurse_ids),
-            NurseAssignment.status == "active",
+            _status_clause,
             NurseAssignment.reason.in_(_STATUS_DISPLAY_REASONS),
         )
         .order_by(NurseAssignment.start_date.asc())

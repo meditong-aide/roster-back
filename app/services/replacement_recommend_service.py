@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from services.group_access import caller_is_head_nurse, resolve_home_group_id
+
 from db.models import (
     FixedWantedEntry,
     Group,
@@ -293,10 +295,11 @@ def _resolve_target_group(
     current_user,
     requested_group_id: Optional[str],
 ) -> Tuple[str, str]:
-    is_head = bool(getattr(current_user, "is_head_nurse", False))
+    is_head = caller_is_head_nurse(db, current_user)
     is_admin = bool(getattr(current_user, "is_master_admin", False))
-    if is_head and getattr(current_user, "group_id", None):
-        target_group_id = str(current_user.group_id)
+    _home = resolve_home_group_id(db, current_user)
+    if is_head and _home:
+        target_group_id = str(_home)
     elif is_admin:
         if not requested_group_id:
             raise ValueError("group_id is required for admin")

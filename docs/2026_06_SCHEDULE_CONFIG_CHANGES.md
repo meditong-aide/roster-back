@@ -410,3 +410,142 @@ auto_assign_teams(nurses, num_teams=3, seed_ids=None,
 - 다중 그룹 통합 모드: 여러 group_id를 한 풀로 묶어 분배
 - 시드 자동 선정 개선: 현재는 G1 풀의 첫 K명. 외부 입력 외에도 wanted 분포 기반 자동 선정 시도 가능
 - UI: "팀 자동 분배" 버튼 + dry-run 미리보기
+
+---
+
+## 11. 원티드 팀 분류 wire-in + 속성 이벤트 모델 (옵션1) (2026-06-04)
+
+> §10의 `team_auto_assign` 알고리즘을 실제 운영 흐름에 연결. 핵심 원칙: **팀 분류는 병동 내(team_id만) 변경, group_id는 절대 불변**. 병동 간 이동(옵션2)은 별개 흐름.
+
+### 11-1. NurseAssignment kind/payload (DDL Phase 1.4)
+
+| 항목 | 내용 |
+|---|---|
+| `nurse_assignment.kind` | `VARCHAR(30) NOT NULL DEFAULT 'transfer'` — reason(한글) 기반 명시적 분류 |
+| `nurse_assignment.payload` | `NVARCHAR(MAX) NULL` — 속성변경 직전값 등 JSON |
+| kind enum | transfer/dispatch/preceptee/leave/return/resign/**permanent_change** (`assignment_service.REASON_TO_KIND`) |
+
+- 프로덕션 DDL 적용 후 백필 실행: 실측 분포 `preceptee 11 / dispatch 10 / transfer 3` (이전엔 전부 transfer로 오염돼 있었음 → §2.3 경고 케이스).
+- 인덱스는 24행 규모라 생략(수백 행 이상 커지면 `idx_na_nurse_kind_date` 추가).
+
+### 11-2. 속성 이벤트 모델 (permanent_change) — 존재 이벤트와 분리
+
+핵심 통찰: assignment에 **두 종류**가 섞인다.
+
+| 부류 | 예 | 기간 겹침 |
+|---|---|---|
+| **존재 이벤트**(어디 있나) | 파견·병동이동 | 동시 active 1개 (한 몸이 두 병동 불가) |
+| **속성 이벤트**(무엇인가) | team/grade 변경 | **겹쳐도 됨** (팀 바뀐 채로도 파견 가능) |
+
+| 함수(`assignment_service.py`) | 동작 |
+|---|---|
+| `create_permanent_change(...)` | 병동 내 team/grade 변경 이벤트. `source==target==group_id`, `payload={prev_team_id, prev_grade}`(되돌리기) |
+| `flush_pending_permanent_changes(as_of)` | 발효일(`start_date<=as_of`)에 `Nurse.team_id/grade` 갱신 → **엔진은 현재값만 읽어 헬퍼 wire-in 위험 회피** |
+| `_raise_if_overlap` | `ATTRIBUTE_CHANGE_KINDS` 제외 → 팀변경이 파견 생성 막지 않음 |
+
+- 일일 스케줄러(`main.py`)에 발효 flush 연결.
+
+### 11-3. 팀 분류 wire-in (`team_classify_service.py`)
+
+| 함수 | 동작 |
+|---|---|
+| `preview_team_classification(group_id, year, month)` | **read-only**. 확정 원티드(`FixedWantedEntry`, OFF=shift∈{O,OFF,주}, 연차=Shift.type='휴가')로 `auto_assign_teams` 실행 → 제안 팀 + 현재팀 대비 diff + 통계 |
+| `apply_team_classification(...)` | 변경분만 `permanent_change` 발행(대상월 1일 발효). 무변경 skip |
+
+- num_teams = 현재 병동 distinct team_id 수. N전담(`is_night_nurse==['N']`) 풀 제외.
+- **churn 최소화**: 제안 클러스터 → 현재 소속 중복 최대로 실제 team_id 매핑 (불필요한 팀 이동 억제).
+
+### 11-4. 엔드포인트 + 권한 (`routers/teams.py`)
+
+| 엔드포인트 | 권한 |
+|---|---|
+| `POST /teams/classify/preview` | 관리 그룹 한정 (read-only) |
+| `POST /teams/classify/apply` | 관리자(ADM/수간호사/hn_auth) + 관리 그룹 한정 |
+
+- **그룹관리자 개념 반영**: `group_access.resolve_managed_group_ids` 재사용 — HN은 home 그룹 + `Group.hn_id`에 본인이 등록된 그룹 전부 관리. 관리 목록 밖 그룹 지정 시 403, 다중 관리 그룹 미지정 시 400.
+- **단, 분류는 group_id 불변** — 관리 그룹이 여럿이어도 각 그룹의 team_id만 재배치. 그룹 간 인원 이동 불가.
+
+### 11-5. 전출자 과거병동 read-only 가시성 (`nurse_service.py`)
+
+전출(병동이동) 발효 시 `nurses.group_id`가 target으로 바뀌어 과거 병동(source) 명단에서 사라지는 문제. 기존 inbound 메커니즘을 **역방향 재사용**:
+- 리스트 쿼리에 `source==나 AND target≠나 AND reason='병동이동'` 갈래 추가 → 전출자 명단 노출
+- `_build_inbound_blocks(caller_group_id=...)` — source==caller인 completed 병동이동 포함(전입처 B는 비오염)
+- 프론트는 inbound 항목의 source/target 방향으로 '전출' 판단, 상세 차단(B-local 속성 leak 방지)
+
+### 11-6. 실DB 통합 테스트 (2026-06-04, 그룹 `1019076bd1f7` 전도연 수간호사)
+
+**팀 분류 preview/apply (확정원티드 2026-05 기준)**: 3팀, 풀 17명(N전담 2 제외), 변경 11명, overlap=1, 팀 5/6/6 균형. apply 11건 생성/skip 6 정상.
+
+**team·grade 라이프사이클 (생성→발효→해제, 끝나고 원복)**:
+
+| # | 케이스 | 결과 |
+|---|---|---|
+| 1-3 | team/grade/동시 기간설정 생성 | ✅ |
+| 4 | payload 직전값 저장 | ✅ |
+| 5 | 발효 前 flush = no-op (현재값 유지) | ✅ |
+| 6 | 발효일 flush → team/grade 적용 | ✅ |
+| 7 | 발효 행 status=completed | ✅ |
+| 8 | 해제-1: pending 취소 → 미발효 | ✅ |
+| 9 | 해제-2: 발효분 payload로 원복 | ✅ |
+| 10 | 정리: 원상복구 + 행삭제 | ✅ |
+
+→ **10/10 성공**. 테스트 데이터·간호사 속성 전부 원복(프로덕션 무영향).
+
+### 11-7. 실DB로 잡은 버그 (SQLite 더블은 놓침)
+
+| 버그 | 원인 | 수정 |
+|---|---|---|
+| `FixedWantedEntry.is_applied.is_(True)` | MSSQL이 BIT를 `IS 1`로 렌더 → 구문오류 | `== True` |
+| apply가 무변경(4→4)도 이벤트 생성 | `nurses.team_id`=varchar vs 제안 team_id=int 비교 불일치 | `str()` 정규화 |
+
+> 메모리 원칙("OPTIMAL/HTTP 200만 보고 끝내지 말 것") 그대로, 실DB 연동에서만 드러난 케이스.
+
+### 11-8. 후속
+
+- 옵션2(특정 N 병동 간 재분배 = 대량 transfer): kind=transfer 모델 위에 권한·정원·풀 정의 추가하여 별도 구현. → §12에서 구현.
+- 발효된 permanent_change 되돌리기 전용 함수(payload prev 복원)를 cancel과 별도로 정식화 검토.
+- master_admin 경로(`get_nurses_filtered_service`)에도 전출자 가시성 적용 여부.
+
+---
+
+## 12. 원티드 기반 병동 간 재분배 (옵션2) (2026-06-04)
+
+> 수간호사가 화면에서 **여러 그룹을 선택**하면 그 풀 안에서 클러스터링해 각 그룹(=버킷)에 배정.
+> 옵션1(team_id만, 병동 내)과 달리 **group_id 변경(병동이동)** 을 동반. preview→확인→apply 구조.
+
+### 12-1. 신규 모듈 (`ward_redistribute_service.py`)
+
+| 함수 | 동작 |
+|---|---|
+| `preview_ward_redistribution` | **read-only**. 선택 그룹 풀+확정원티드로 클러스터링 → 각 그룹 버킷 + **그룹→팀→간호사 중첩** + 이동 diff + 통계 |
+| `apply_ward_redistribution` | 이동 간호사 → 병동이동(transfer, target_team_id 동반), 잔류+팀변경 → permanent_change, 동일 → skip |
+
+### 12-2. 정원(capacity) 모드
+- `even`: 균등분할(총원/N) ± tolerance
+- `explicit`: 그룹별 목표 인원 `{group_id: 인원}` ± tolerance. cluster i ↔ ward i 고정(시드=그룹 G1), 풀이 [Σmin, Σmax] 안에 들어야 함.
+
+### 12-3. 핵심 안전장치
+| 항목 | 내용 |
+|---|---|
+| **churn 페널티** | 현재 병동 유지 보상(`home_cluster`/`w_churn`, 기본 500). 같은 정원에서 실DB 이동 **15→1** |
+| **G1 사전검증** | 시니어 없는 병동 있으면 `WardSetupError` → **422 + `needs_g1_setup`**(병동목록), 프론트가 시니어 지정 유도. 차출로 얼버무리지 않음 |
+| **role 혼합 경고** | AN/RN 등 직역 섞이면 경고 |
+| **권한** | `_assert_groups_managed`: 관리자 + **선택 그룹 전부 ⊆ 관리 그룹**(아니면 403) |
+
+### 12-4. 엔드포인트 (`routers/teams.py`)
+- `POST /teams/redistribute/preview` (read-only, G1 미설정 시 422)
+- `POST /teams/redistribute/apply`
+
+### 12-5. team_auto_assign 확장 (옵션1·2 공통)
+- 클러스터별 정원(`max_sizes`/`min_sizes`) + min-fill
+- churn 페널티(`home_cluster`/`w_churn`)
+- **스왑 mutate-while-iterate 버그픽스** (실DB가 잡은 크래시)
+
+### 12-6. 검증
+- 단위/통합: ward_redistribute 14 + API 5, 전체 스위트 **1251/1251**
+- **실DB**: preview 양 모드(even/explicit) read-only 확인. explicit churn 500 → 이동 1.
+  apply는 미래월(2026-08) 1명 이동 이벤트 생성→검증→**flush 없이 삭제로 완전 원복**(group_id 불변).
+
+### 12-7. 후속
+- explicit 모드 within-ward 팀(team_id)까지 apply에 반영(현재 transfer의 target_team_id로만 동반).
+- 발효 후 대량 transfer 운영 가이드(롤백·알림 묶음).

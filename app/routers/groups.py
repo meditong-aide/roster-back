@@ -10,6 +10,7 @@ from db.client2 import get_db
 from db.models import Group as GroupModel, Office as OfficeModel, Nurse as NurseModel
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie
+from services.group_access import caller_is_head_nurse, caller_is_hn
 
 router = APIRouter(
     prefix="/groups",
@@ -165,8 +166,8 @@ async def list_groups_by_office(
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
 
     _is_admin = bool(current_user.is_master_admin)
-    _is_hn = str(current_user.hn_auth or '').upper() == 'HN'
-    _is_head = bool(getattr(current_user, "is_head_nurse", False))
+    _is_hn = caller_is_hn(db, current_user)  # 토큰 대신 DB hn_auth
+    _is_head = caller_is_head_nurse(db, current_user)  # 토큰 대신 DB is_head_nurse
     if not (_is_admin or _is_hn or _is_head):
         raise HTTPException(status_code=403, detail="관리자/그룹관리자/수간호사만 접근 가능합니다.")
 
