@@ -454,18 +454,40 @@ def _fetch_latest_config(db: Session, req: RosterRequest, current_user):
     return latest_config
 
 
+def _ensure_grade1_default(constraints: dict | None) -> dict:
+    """[GRADE_DEFAULT_111] 정책(2026-06): 모든 그룹은 grade 등록 여부와 무관하게
+    grade-1 이 D/E/N 각 1명 이상 배치되도록 '기본 floor'를 보장한다.
+
+    - 등록값이 더 크면(예: grade-1 D:2) 그대로 유지(floor 만 보장, override 아님).
+    - grade 인원이 부족하거나 미등록이면 _add_minimum_constraints 의 누적 cascade 가
+      자동으로 하위 등급/soft 로 흘려보내므로 infeasible 위험 없음.
+    원복: 이 함수 호출부(_fetch_grade_config_dict)에서 래핑만 제거.
+    """
+    out = dict(constraints or {})
+    for sc in ("D", "E", "N"):
+        tier = dict(out.get(sc) or {})
+        try:
+            cur = int(tier.get("1", 0) or 0)
+        except (TypeError, ValueError):
+            cur = 0
+        if cur < 1:
+            tier["1"] = 1
+        out[sc] = tier
+    return out
+
+
 def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict:
     """그룹의 Grade 설정을 엔진 전달용 dict로 구성한다.
 
     Notes:
-        - DB에 설정이 없으면 기본값을 반환한다.
-        - Grade 제약은 `cp_sat_basic`에서 grade_strategy="GRADE"일 때만 적용된다.
+        - DB에 설정이 없으면 기본값을 반환한다(grade-1 D/E/N 각 1 floor).
+        - Grade 제약은 `cp_sat_basic`에서 grade_strategy="GRADE/COMBINED"일 때 적용된다.
     """
     def _default() -> dict:
         return {
             "use_dynamic_scaling": True,
-            "allow_soft_fallback": False,
-            "constraints_json": {},
+            "allow_soft_fallback": True,
+            "constraints_json": _ensure_grade1_default({}),
             "constraints_max_json": {},
         }
 
@@ -518,7 +540,10 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     return {
         "use_dynamic_scaling": bool(getattr(row, "use_dynamic_scaling", True)),
         "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
-        "constraints_json": _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json"),
+        # [GRADE_DEFAULT_111] 등록 config 에도 grade-1 D/E/N 각 1 floor 를 보장.
+        "constraints_json": _ensure_grade1_default(
+            _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json")
+        ),
         "constraints_max_json": _safe_json_obj(getattr(row, "constraints_max_json_text", None), "constraints_max_json"),
     }
 
@@ -573,6 +598,15 @@ def _resolve_grade_strategy(
     Returns:
         (grade_strategy, grade_config_or_none)
     """
+    # [ALWAYS_COMBINED] 정책(2026-06): 전략은 항상 COMBINED(team+grade 동시).
+    #   프론트/DB의 grade_strategy 컬럼이 BASE 여도 백엔드가 COMBINED 로 해석하여
+    #   roster_grade_config(grade min/max)를 항상 로드·적용한다.
+    #   - grade_config 에 제약이 없으면 grade 항은 자동 no-op(부작용 없음).
+    #   - team 항은 team_min/team 데이터 있을 때만 활성(없으면 no-op).
+    #   원복: 이 블록만 제거하면 아래 레거시(컬럼 우선 + 구버전 폴백) 로직으로 복귀.
+    _gc_always = _fetch_grade_config_dict(db, office_id, group_id)
+    return "COMBINED", _gc_always
+
     # 1) DB 컬럼 우선
     s = _fetch_grade_strategy_from_roster_config(db, roster_config_id)
     if s in ("BASE", "TEAM", "GRADE", "COMBINED"):

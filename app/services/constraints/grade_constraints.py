@@ -532,6 +532,18 @@ def _clamp_targets_to_available(
         target[g] = a
 
 
+# [GRADE_CASCADE] ②: 누적 등급 cascade. 요구 시니어(grade g)를 못 채우면 한 단계씩
+#   하위 등급으로 내려가며(grade g → g+1 → ...) "가능한 최고 등급"을 시프트마다 보장한다.
+#   - off 0(요구 등급 부재): penalty_weight(호출자) = x/y '아래' → x/y 우선, 시니어 과로 안 함.
+#   - off 1(차상위까지 부재): W_NEXT = x/y '위' → 한 단계 떨어지는 건 강하게 억제.
+#   - off>=2(시니어 전무/인원부족): W_NONE = 사실상 hard.
+#   → "x/y 우선 + 최고등급 최대 + 혼자 안 뜀 + infeasible 안전" 동시 충족(단일 패스).
+#   원복: _GRADE_CASCADE_ENABLED=False 로 두면 아래 레거시(binary hard/soft) 경로로 복귀.
+_GRADE_CASCADE_ENABLED = True
+GRADE_CASCADE_W_NEXT = 2_000_000   # 차상위까지 부재 (x/y range 1.2M 위 → near-hard)
+GRADE_CASCADE_W_NONE = 6_000_000   # 시니어 전무 (사실상 hard)
+
+
 def _add_minimum_constraints(
     m,
     X,
@@ -545,10 +557,42 @@ def _add_minimum_constraints(
 ) -> list:
     """모델에 grade 최소 인원 제약을 추가한다.
 
-    allow_soft_fallback=True 이면 slack을 허용하여 infeasible을 방지하고,
-    False이면 기존처럼 하드 제약을 유지한다.
+    기본(_GRADE_CASCADE_ENABLED): 누적 등급 cascade — 요구 등급을 못 채우면 하위 등급이
+      대체하되 등급이 내려갈수록 패널티가 가팔라진다(off0<off1<off2). 단일 solve.
+    레거시(flag False): allow_soft_fallback=True면 slack soft, False면 하드.
     """
     obj_terms: list = []
+    if _GRADE_CASCADE_ENABLED:
+        grade_domain = sorted(by_grade.keys())  # 오름차순: 1(최상위)..N
+        for g, t in target.items():
+            t = int(t)
+            if t <= 0:
+                continue
+            ceilings = [c for c in grade_domain if c >= g]
+            if not ceilings:
+                # 요구 등급이 도메인에 없음 → 안전하게 그 등급 합으로 하드(기존 동작).
+                m.Add(sum(X(n, day_idx, shift_idx) for n in by_grade.get(g, [])) >= t)
+                continue
+            for off, c in enumerate(ceilings):
+                # ceiling c 까지(=grade ≤ c, 더 시니어 등급 포함) 누적 인원.
+                members = [
+                    n for j in grade_domain if j <= c for n in by_grade.get(j, [])
+                ]
+                if not members:
+                    continue
+                cum = sum(X(n, day_idx, shift_idx) for n in members)
+                short = m.NewIntVar(
+                    0, t, f"gcasc_d{day_idx}_s{shift_idx}_g{g}_c{c}"
+                )
+                m.Add(short >= t - cum)  # short = max(0, t - 누적)
+                if off == 0:
+                    w = penalty_weight
+                elif off == 1:
+                    w = GRADE_CASCADE_W_NEXT
+                else:
+                    w = GRADE_CASCADE_W_NONE
+                obj_terms.append(-w * short)
+        return obj_terms
     # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
     _registry = getattr(m, "_cpsat_assumption_registry", None)
     _add_hard_fn = None
