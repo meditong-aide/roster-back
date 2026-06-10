@@ -155,6 +155,8 @@ async def put_teams(
             target_group_id,
             payload,
             delete_team_ids=body.delete_team_ids,
+            year=body.year,
+            month=body.month,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

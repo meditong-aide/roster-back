@@ -102,8 +102,17 @@ def list_teams_with_members(db: Session, office_id: str, group_id: str) -> List[
     return result
 
 
-def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dict], delete_team_ids: List[int] | None = None) -> List[Dict]:
-    """증분 오퍼레이션을 적용한다: create/rename/add/remove/delete."""
+def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dict], delete_team_ids: List[int] | None = None, year: int | None = None, month: int | None = None) -> List[Dict]:
+    """증분 오퍼레이션을 적용한다: create/rename/add/remove/delete.
+
+    year/month 가 주어지면 멤버 add/remove 를 nurse_team_period 에 valid_from=그 달 1일로
+    기록한다(월 단위 팀 지정, close-before-open). 없으면 기존처럼 캐시(nurse.team_id)만 갱신.
+    """
+    _period_from = None
+    if year and month:
+        from datetime import date as _date
+        from services.team_period import set_team_period as _set_tp
+        _period_from = _date(int(year), int(month), 1)
     existing = db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id).all()
     by_id = {t.team_id: t for t in existing}
     by_name = {t.team_name: t for t in existing if t.active == 1}
@@ -188,10 +197,20 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
         # add: 타깃 팀으로 이동(원팀 자동 해제)
         if add_ids:
             db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(add_ids)).update({Nurse.team_id: team.team_id}, synchronize_session=False)
+            if _period_from is not None:
+                for _nid in add_ids:
+                    _set_tp(db, nurse_id=str(_nid), group_id=group_id,
+                            valid_from=_period_from, team_id=int(team.team_id),
+                            source="team_setting", commit=False)
 
         # remove: 미배정 처리
         if remove_ids:
             db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(remove_ids)).update({Nurse.team_id: None}, synchronize_session=False)
+            if _period_from is not None:
+                for _nid in remove_ids:
+                    _set_tp(db, nurse_id=str(_nid), group_id=group_id,
+                            valid_from=_period_from, team_id=None,
+                            source="team_setting", commit=False)
 
     # 2) 팀 삭제(soft) + 멤버 해제
     if delete_team_ids:

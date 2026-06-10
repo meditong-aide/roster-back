@@ -123,6 +123,51 @@ def test_single_ward_invariant_past_open_period_closed(seeded):
     assert resolve_team_for_roster(db, "n1", "B", 2026, 8) == 3
 
 
+def test_coerce_team_int_normalizes_mssql_str():
+    """MSSQL(pymssql)이 nurses.team_id 를 str '2' 로 돌려줘도 int 로 정규화 →
+    period(int)/캐시폴백 타입 섞임 방지(프론트 Map 키 매칭 깨짐 버그 차단)."""
+    from services.team_period import _coerce_team_int
+    assert _coerce_team_int("2") == 2
+    assert _coerce_team_int(" 3 ") == 3
+    assert _coerce_team_int(1) == 1
+    assert _coerce_team_int(None) is None
+    assert _coerce_team_int("") is None
+    assert _coerce_team_int("전체") is None
+
+
+def test_apply_team_ops_writes_period_for_month(seeded):
+    """팀 설정 모달(B): year/month 주면 add/remove 를 nurse_team_period(valid_from=1일)로 기록."""
+    from db.models import Team
+    from services.team_service import apply_team_ops
+    db = seeded
+    db.add(Team(office_id="o1", group_id="A", team_id=1, team_name="1팀", active=1))
+    db.add(Team(office_id="o1", group_id="A", team_id=2, team_name="2팀", active=1))
+    db.flush()
+    # n1 을 team2 로 add (2026-07) → period team2
+    apply_team_ops(db, "o1", "A",
+                   [{"team_id": 2, "team_name": "2팀", "add": ["n1"], "remove": []}],
+                   year=2026, month=7)
+    assert resolve_team_for_roster(db, "n1", "A", 2026, 7) == 2
+    # remove → 미지정(None) period
+    apply_team_ops(db, "o1", "A",
+                   [{"team_id": 2, "team_name": "2팀", "add": [], "remove": ["n1"]}],
+                   year=2026, month=7)
+    assert resolve_team_for_roster(db, "n1", "A", 2026, 7) is None
+
+
+def test_apply_team_ops_no_month_skips_period(seeded):
+    """year/month 없으면(레거시) period 기록 안 함 — 캐시만 갱신."""
+    from db.models import Team
+    from services.team_service import apply_team_ops
+    db = seeded
+    db.add(Team(office_id="o1", group_id="A", team_id=2, team_name="2팀", active=1))
+    db.flush()
+    apply_team_ops(db, "o1", "A",
+                   [{"team_id": 2, "team_name": "2팀", "add": ["n1"], "remove": []}])
+    # period 행 없음 → ward-aware 폴백(cache team_id=2)
+    assert db.query(NurseTeamPeriod).filter(NurseTeamPeriod.nurse_id == "n1").count() == 0
+
+
 def test_delete_team_clears_team_period(seeded):
     """팀 삭제(apply_team_ops)는 그 team_id 의 nurse_team_period 도 제거 →
     캐시(team_id=None)와 일관, resolve 가 '없는 팀'을 반환하지 않음(고아 방지)."""

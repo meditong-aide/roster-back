@@ -42,6 +42,21 @@ def get_team_period_on(
     )
 
 
+def _coerce_team_int(value) -> Optional[int]:
+    """team_id 를 int 로 정규화(실패 시 None).
+
+    MSSQL(pymssql)이 nurses.team_id 를 문자열 '1'/'2' 로 돌려주는 트랩 방어 —
+    period(INT 컬럼)는 int, 캐시 폴백은 str 라 resolve 결과 타입이 섞이면 프론트의
+    Map 키(team.team_id 숫자) 매칭이 깨져 '팀 비어 보임' 버그가 난다. 항상 int 로 통일.
+    """
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _ward_aware_fallback(db: Session, nurse_id: str, group_id: str) -> Optional[int]:
     """구간 없을 때: nurses.group_id==group 일 때만 nurses.team_id, 아니면 None."""
     row = (
@@ -51,7 +66,7 @@ def _ward_aware_fallback(db: Session, nurse_id: str, group_id: str) -> Optional[
     )
     # MSSQL CHAR 컬럼 트레일링 공백/포맷 차이 방어: strip 후 비교.
     if row and str(row[0] or "").strip() == str(group_id or "").strip():
-        return row[1]
+        return _coerce_team_int(row[1])
     return None
 
 
@@ -61,7 +76,7 @@ def resolve_team(
     """그 날짜의 유효 team_id. 구간 우선, 없으면 ward-aware 폴백."""
     p = get_team_period_on(db, nurse_id, group_id, on_date)
     if p is not None:
-        return p.team_id
+        return _coerce_team_int(p.team_id)
     return _ward_aware_fallback(db, nurse_id, group_id)
 
 
@@ -92,7 +107,7 @@ def resolve_team_for_roster(
             p for p in periods
             if p.valid_from <= m_start and (p.valid_to is None or p.valid_to > m_start)
         ]
-        return (covering[0] if covering else periods[0]).team_id
+        return _coerce_team_int((covering[0] if covering else periods[0]).team_id)
     return _ward_aware_fallback(db, nurse_id, group_id)
 
 
