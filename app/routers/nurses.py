@@ -590,22 +590,47 @@ async def upload2_confirm_endpoint(
 @router.get("/available-members")
 async def get_available_members(
     group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
+    pagination: Optional[str] = Query(None, description="Use cursor pagination"),
+    q: Optional[str] = Query(None, description="Name search query"),
+    search_by: str = Query("name", description="Search target: name or affiliation"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor"),
+    limit: int = Query(20, ge=1, le=100, description="Page size"),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
     """
-    현재 그룹에 속하지 않은 동일 오피스 멤버 목록 조회.
+    nurses에 미등록된 동일 오피스 멤버 목록 조회.
     - 근무자 등록 모달에서 사용
-    - MSSQL 전체 멤버 중 현재 group_id에 이미 등록된 간호사를 제외하고 반환
+    - MSSQL 전체 멤버 중 nurses에 이미 등록된 간호사(다른 병동 포함)를 제외하고 반환
     """
     try:
+        print(
+            "[DEBUG] available-members query",
+            {
+                "group_id": group_id,
+                "pagination": pagination,
+                "q": q,
+                "search_by": search_by,
+                "cursor": cursor,
+                "limit": limit,
+            },
+        )
         office_id = current_user.office_id
         if not office_id:
             raise HTTPException(
                 status_code=400, detail="office_id를 확인할 수 없습니다."
             )
 
-        result = get_available_members_service(office_id, group_id, db)
+        result = get_available_members_service(
+            office_id=office_id,
+            group_id=group_id,
+            db=db,
+            q=q,
+            search_by=search_by,
+            cursor=cursor,
+            limit=limit,
+            pagination=pagination,
+        )
         if isinstance(result, list) and result:
             unique_nurse_ids = set(
                 item.get("nurse_id") for item in result if item.get("nurse_id")
