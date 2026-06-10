@@ -136,6 +136,26 @@ def test_night_dedicated_robust_string_form(db):
     assert by_id["night2"]["as_of_team"] is None
 
 
+def test_as_of_team_uses_period_over_cache(db):
+    """[Perf 배치 회귀] nurse_team_period 구간이 있으면 as_of_team 은 캐시(nurses.team_id)가
+    아니라 구간 팀. 배치 로드(_resolved_team)가 resolve_team(구간 우선·시점)과 동일함을 고정."""
+    from services.team_period import set_team_period
+
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    _nurse(db, "n_period", "A", team=1)   # 캐시 team=1
+    _nurse(db, "n_cache", "A", team=3)    # 구간 없음 → 캐시 폴백
+    db.flush()
+    set_team_period(db, nurse_id="n_period", group_id="A",
+                    valid_from=date(2026, 7, 1), team_id=2)
+    jul = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
+    assert jul["n_period"]["as_of_team"] == 2   # 구간 우선(캐시 1 아님)
+    assert jul["n_cache"]["as_of_team"] == 3     # 구간 없음 → 캐시 폴백
+    # 7/1 구간은 6월엔 미적용 → 폴백(캐시 1)
+    jun = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 6)["members"]}
+    assert jun["n_period"]["as_of_team"] == 1
+
+
 def test_dispatch_inbound_badge_persists(seeded):
     """파견 인바운드(target측)도 지속 → 다음 달에도 '파견' 배지, 마커 없음."""
     db = seeded

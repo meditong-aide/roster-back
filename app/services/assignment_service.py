@@ -945,7 +945,9 @@ def group_members_in_month(
     참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §3 정책 매트릭스.
     """
     from calendar import monthrange
-    from services.team_period import resolve_team
+    from sqlalchemy import or_
+    from db.models import NurseTeamPeriod
+    from services.team_period import _coerce_team_int
     from services.cp_sat.allowed_shift_types import is_n_only_profile
 
     month_start = date(year, month, 1)
@@ -971,6 +973,36 @@ def group_members_in_month(
         .all()
     )
 
+    # [Perf] resolve_team N+1 제거: nurse_team_period 를 그룹 단위로 1번에 배치 로드.
+    #   month_start 를 덮는 구간만, valid_from desc 첫 행 = get_team_period_on 과 동일.
+    #   폴백(구간 없음)은 이미 로드한 nurse 객체의 team_id 를 메모리에서 읽는다(NurseModel 재조회 X).
+    _periods = (
+        db.query(NurseTeamPeriod)
+        .filter(
+            NurseTeamPeriod.group_id == group_id,
+            NurseTeamPeriod.valid_from <= month_start,
+            or_(
+                NurseTeamPeriod.valid_to.is_(None),
+                NurseTeamPeriod.valid_to > month_start,
+            ),
+        )
+        .order_by(NurseTeamPeriod.valid_from.desc())
+        .all()
+    )
+    _period_team_by_nurse: dict[str, Optional[int]] = {}
+    for _p in _periods:
+        _pid = str(_p.nurse_id)
+        if _pid not in _period_team_by_nurse:  # valid_from desc 첫 등장 = 구간 우선
+            _period_team_by_nurse[_pid] = _coerce_team_int(_p.team_id)
+
+    def _resolved_team(nid: str, n_obj) -> Optional[int]:
+        """resolve_team 메모리판: 구간 우선(있으면 team_id=None 도 그대로), 없으면 ward-aware 폴백."""
+        if nid in _period_team_by_nurse:
+            return _period_team_by_nurse[nid]
+        if n_obj is not None and str(getattr(n_obj, "group_id", "") or "").strip() == str(group_id or "").strip():
+            return _coerce_team_int(getattr(n_obj, "team_id", None))
+        return None
+
     def _row(n, status, marker, badge, team, grade):
         # N전담(허용 shift=N뿐)은 팀 로테이션 비참여 → 미지정(as_of_team=None) + 'N전담' 배지.
         #   파생 규칙(is_night_nurse 기반) — team_period 데이터는 안 건드림(전담 해제 시 자동 복귀).
@@ -995,7 +1027,7 @@ def group_members_in_month(
     for n in home:
         nid = str(n.nurse_id)
         seen.add(nid)
-        team = resolve_team(db, nid, group_id, month_start)
+        team = _resolved_team(nid, n)
         grade = getattr(n, "grade", None)
         if nid in outbound:
             a = outbound[nid]
@@ -1014,13 +1046,19 @@ def group_members_in_month(
         else:
             members.append(_row(n, "active", None, None, team, grade))
 
+    # [Perf] inbound 도 nurse_id IN 배치 1쿼리 (간호사별 NurseModel 재조회 제거)
+    _inbound_ids = [nid for nid in inbound if nid not in seen]
+    _inbound_nurses: dict[str, NurseModel] = {}
+    if _inbound_ids:
+        for _n in db.query(NurseModel).filter(NurseModel.nurse_id.in_(_inbound_ids)):
+            _inbound_nurses[str(_n.nurse_id)] = _n
     for nid, a in inbound.items():
         if nid in seen:
             continue
-        n = db.query(NurseModel).filter(NurseModel.nurse_id == nid).first()
+        n = _inbound_nurses.get(nid)
         if n is None:
             continue
-        team = a.target_team_id if a.target_team_id is not None else resolve_team(db, nid, group_id, month_start)
+        team = a.target_team_id if a.target_team_id is not None else _resolved_team(nid, n)
         grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
         if a.reason == "파견":
             # 파견(일시·복귀 예정) = 지속 상태 → 기간 내내 '파견' 배지(전이 아님, 마커 없음).
