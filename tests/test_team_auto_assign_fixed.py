@@ -67,6 +67,44 @@ def test_sizes_are_balanced_max_minus_min_le_1():
         assert any(m in g1 for m in members)
 
 
+def test_g1_shortage_degrades_gracefully_not_raises():
+    """G1 < num_teams 면 막지 말고(과거 ValueError) 비-G1 앵커로 시드 보충 →
+    전원 팀 배정. '팀마다 G1' 은 가능한 만큼만 충족."""
+    # 팀 3개 요청인데 G1 1명뿐 + 정규(2) 3 + 신규(0) 2
+    nurses = [
+        _n("g1", grade=1),
+        _n("r0", grade=2), _n("r1", grade=2), _n("r2", grade=2),
+        _n("x0", grade=0), _n("x1", grade=0),
+    ]
+    res = auto_assign_teams(nurses, num_teams=3, min_size=1, max_size=4)
+    # 3팀 모두 생성 + 전원 정확히 1회 배치(무팀 NULL 없음)
+    assert len(res.teams) == 3
+    allids = sorted(x for m in res.teams.values() for x in m)
+    assert allids == ["g1", "r0", "r1", "r2", "x0", "x1"]
+    # 비-G1 앵커는 정규(grade-2) 우선 — 신규(0/None)는 앵커로 안 뽑힘
+    seeds_present = {m[0] if m else None for m in res.teams.values()}  # 참고용(순서 무관)
+    # G1 1명은 반드시 어떤 팀의 멤버
+    assert any("g1" in m for m in res.teams.values())
+    # 신규 2명은 시드가 아니어야(정규가 앵커 우선) — 최소한 둘 다 시드가 되진 않음
+    assert not ({"x0", "x1"} <= seeds_present)
+
+
+def test_g1_shortage_with_preceptee_not_seeded():
+    """프리셉티는 비-G1 앵커로 선발되지 않고 preceptor 팀을 따라간다."""
+    nurses = [
+        _n("g1", grade=1),
+        _n("r0", grade=2), _n("r1", grade=2),
+        NurseInput(nurse_id="pe", grade=0, preceptor_id="r0"),
+    ]
+    res = auto_assign_teams(nurses, num_teams=3, min_size=1, max_size=4)
+    # pe 는 r0 와 같은 팀
+    for members in res.teams.values():
+        if "r0" in members:
+            assert "pe" in members
+    allids = sorted(x for m in res.teams.values() for x in m)
+    assert allids == ["g1", "pe", "r0", "r1"]
+
+
 def test_none_grade_nurses_are_balanced():
     """grade=None(미입력) 간호사도 균등 분포 → grade_dev 작게 (오판 0 카운트 회귀 방지)."""
     nurses = [_n(f"g1_{i}", grade=1) for i in range(3)] + [

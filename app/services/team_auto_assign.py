@@ -107,10 +107,14 @@ def _build_seeds_and_followers(
     nurses: list[NurseInput],
     seed_ids: list[str],
     fixed_ids: set[str] | None = None,
+    allow_non_g1_seed: bool = False,
 ) -> tuple[list[NurseInput], dict[str, list[NurseInput]], list[NurseInput]]:
     """지정된 seed_ids로 시드 추출 + preceptee → preceptor 매핑 + 잔여 인원.
 
     fixed_ids(미참여=현재 클러스터 고정 인원)는 follower/remaining 에서 제외 — 호출부가 직접 배치.
+
+    allow_non_g1_seed=True 면 grade!=1 시드도 허용한다. G1 인원이 팀 수보다 적을 때
+    auto_assign_teams 가 비-G1 앵커로 시드를 보충하는 graceful 경로용(막지 않고 있는 대로 분배).
     """
     fixed_ids = fixed_ids or set()
     by_id = {n.nurse_id: n for n in nurses}
@@ -119,7 +123,7 @@ def _build_seeds_and_followers(
         if sid not in by_id:
             raise ValueError(f"seed nurse_id {sid} not in pool")
         s = by_id[sid]
-        if s.grade != 1:
+        if s.grade != 1 and not allow_non_g1_seed:
             raise ValueError(f"seed {sid} grade={s.grade} != 1 (시드는 grade-1이어야 함)")
         seeds.append(s)
     followers: dict[str, list[NurseInput]] = {s.nurse_id: [] for s in seeds}
@@ -153,6 +157,7 @@ def _greedy_assign(
     w_churn: float = 0.0,
     fixed: dict[str, int] | None = None,
     w_size: float = 0.0,
+    allow_non_g1_seed: bool = False,
 ) -> dict[int, list[NurseInput]]:
     """1단계: 시드 + preceptee 고정 후 잔여를 greedy로 분배.
     팀 수 = len(seed_ids). 시드 외 grade-1은 일반 풀에 섞임 (정상).
@@ -165,7 +170,8 @@ def _greedy_assign(
     fixed = fixed or {}
     by_id = {n.nurse_id: n for n in nurses}
     seeds, followers, remaining = _build_seeds_and_followers(
-        nurses, seed_ids, fixed_ids=set(fixed.keys())
+        nurses, seed_ids, fixed_ids=set(fixed.keys()),
+        allow_non_g1_seed=allow_non_g1_seed,
     )
     teams: dict[int, list[NurseInput]] = {}
     for i, s in enumerate(seeds):
@@ -433,20 +439,44 @@ def auto_assign_teams(
 ) -> TeamAssignResult:
     """팀 자동 분배 진입점.
 
-    Hard: 각 팀에 grade-1 ≥ 1, 팀 크기 [min_size, max_size], preceptee→preceptor 같은 팀.
-    Soft: OFF/FB 겹침 minimize, grade 분포 균등, 인원 균등(w_size).
+    Hard: 팀 크기 [min_size, max_size], preceptee→preceptor 같은 팀.
+    Soft: 각 팀에 grade-1 ≥ 1(가능한 만큼), OFF/FB 겹침 minimize, grade 분포 균등, 인원 균등.
     N전담 미배정 인원은 입력 단계에서 제외하고 전달.
 
     seed_ids 지정 시 그걸 시드로. 안 주면 grade-1 중 첫 num_teams명 자동 선정.
+      G1 인원이 num_teams 보다 적으면 막지 않고(과거엔 ValueError) 비-G1 앵커로 시드를
+      보충해 전원 팀 배정을 보장한다 — '이동자 팀마다 G1' 은 best-effort, 없으면 없는 대로.
     max_sizes/min_sizes (클러스터=시드 순서) 지정 시 클러스터별 정원 밴드 적용(옵션2).
     """
+    allow_non_g1_seed = False
     if seed_ids is None:
         if num_teams is None:
             raise ValueError("num_teams 또는 seed_ids 중 하나는 필요")
         g1 = [n for n in nurses if n.grade == 1]
-        if len(g1) < num_teams:
-            raise ValueError(f"grade-1 인원({len(g1)}) < num_teams({num_teams}). 모든 팀에 G1 ≥1 불가.")
-        seed_ids = [n.nurse_id for n in g1[:num_teams]]
+        seeds_sel = list(g1[:num_teams])
+        if len(seeds_sel) < num_teams:
+            # G1 부족: 막지 않고(과거엔 ValueError) 비-G1 앵커로 시드를 보충한다.
+            #   "이동자 팀마다 G1" 은 가능한 만큼만(soft) 충족하고, 부족분은 정규(grade-2)
+            #   →신규 순으로 앵커를 세워 전원이 숫자팀을 받게 한다(없으면 없는 대로 분배).
+            #   프리셉티는 시드 금지 — preceptor 와 같은 팀을 따라가야 하므로.
+            allow_non_g1_seed = True
+            chosen = {n.nurse_id for n in seeds_sel}
+            fillers = sorted(
+                (n for n in nurses
+                 if n.nurse_id not in chosen and not n.preceptor_id),
+                key=lambda n: (n.grade is None or n.grade == 0, str(n.nurse_id)),
+            )
+            for n in fillers:
+                if len(seeds_sel) >= num_teams:
+                    break
+                seeds_sel.append(n)
+            # 인원 자체가 팀 수보다 적으면 가능한 팀 수로 축소(빈 팀 생성 방지)
+            num_teams = len(seeds_sel)
+            print(
+                f"[TeamAssign] G1({len(g1)}) < 팀수 → 비-G1 앵커 보충(graceful): "
+                f"seeds={len(seeds_sel)} (요청 num_teams 일부는 비-G1 시드)"
+            )
+        seed_ids = [n.nurse_id for n in seeds_sel]
     if max_sizes is not None and len(max_sizes) != len(seed_ids):
         raise ValueError("max_sizes 길이가 클러스터 수와 다릅니다.")
     if min_sizes is not None and len(min_sizes) != len(seed_ids):
@@ -456,7 +486,7 @@ def auto_assign_teams(
     teams = _greedy_assign(nurses, seed_ids, w_overlap, w_grade, min_size, max_size,
                            max_sizes=max_sizes, min_sizes=min_sizes,
                            home_cluster=home_cluster, w_churn=w_churn, fixed=fixed,
-                           w_size=w_size)
+                           w_size=w_size, allow_non_g1_seed=allow_non_g1_seed)
     teams = _enforce_preceptee_follow(teams, nurses)
     # 인원 균등화 (1:1 swap이 못 하는 크기 조정) → 정밀 swap → 짝 재검증
     teams = _balance_sizes(teams, nurses, set(seed_ids), w_overlap, w_grade, w_size,
