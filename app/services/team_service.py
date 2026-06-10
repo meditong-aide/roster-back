@@ -195,22 +195,28 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
                 raise ValueError(f"[{code}] {msg}")
 
         # add: 타깃 팀으로 이동(원팀 자동 해제)
+        #   period 모드(year/month 지정): SSOT=nurse_team_period 에만 기록하고
+        #     캐시(nurse.team_id)는 건드리지 않는다. 미래월 지정이 현재 캐시로 새지 않게 —
+        #     resolve_team 은 period 우선, period 공백일 때만 캐시 폴백이므로 월별로 정확.
+        #   레거시 모드(월 미지정): 기존대로 캐시만 갱신.
         if add_ids:
-            db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(add_ids)).update({Nurse.team_id: team.team_id}, synchronize_session=False)
             if _period_from is not None:
                 for _nid in add_ids:
                     _set_tp(db, nurse_id=str(_nid), group_id=group_id,
                             valid_from=_period_from, team_id=int(team.team_id),
                             source="team_setting", commit=False)
+            else:
+                db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(add_ids)).update({Nurse.team_id: team.team_id}, synchronize_session=False)
 
         # remove: 미배정 처리
         if remove_ids:
-            db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(remove_ids)).update({Nurse.team_id: None}, synchronize_session=False)
             if _period_from is not None:
                 for _nid in remove_ids:
                     _set_tp(db, nurse_id=str(_nid), group_id=group_id,
                             valid_from=_period_from, team_id=None,
                             source="team_setting", commit=False)
+            else:
+                db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(remove_ids)).update({Nurse.team_id: None}, synchronize_session=False)
 
     # 2) 팀 삭제(soft) + 멤버 해제
     if delete_team_ids:

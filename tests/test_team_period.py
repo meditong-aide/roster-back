@@ -168,6 +168,26 @@ def test_apply_team_ops_no_month_skips_period(seeded):
     assert db.query(NurseTeamPeriod).filter(NurseTeamPeriod.nurse_id == "n1").count() == 0
 
 
+def test_apply_team_ops_future_month_no_cache_leak(seeded):
+    """미래월(8월) 팀 지정은 period 만 기록하고 캐시(nurse.team_id)는 안 건드린다.
+    → 현재월(7월)은 옛 값으로, 미래월(8월)만 새 팀으로 resolve (미래→현재 누수 차단)."""
+    from db.models import Team
+    from services.team_service import apply_team_ops
+    db = seeded  # n1: home=A, cache team_id=1
+    db.add(Team(office_id="o1", group_id="A", team_id=2, team_name="2팀", active=1))
+    db.flush()
+    # 8월(미래)로 team2 지정
+    apply_team_ops(db, "o1", "A",
+                   [{"team_id": 2, "team_name": "2팀", "add": ["n1"], "remove": []}],
+                   year=2026, month=8)
+    # 캐시는 그대로 1 (미래 지정이 현재 캐시를 오염시키지 않음)
+    assert db.query(Nurse).filter(Nurse.nurse_id == "n1").first().team_id == 1
+    # 7월(현재): 덮는 period 없음 → ward-aware 폴백(캐시 1), 미래 팀 2 가 아님
+    assert resolve_team_for_roster(db, "n1", "A", 2026, 7) == 1
+    # 8월(미래): period team2
+    assert resolve_team_for_roster(db, "n1", "A", 2026, 8) == 2
+
+
 def test_delete_team_clears_team_period(seeded):
     """팀 삭제(apply_team_ops)는 그 team_id 의 nurse_team_period 도 제거 →
     캐시(team_id=None)와 일관, resolve 가 '없는 팀'을 반환하지 않음(고아 방지)."""
