@@ -4424,7 +4424,14 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     #   None(구간 없음)이면 기존 값 유지 — 홈은 ward-aware 폴백=캐시(현행 동일),
     #   인바운드는 4689 의 target_team_id 보존(period 없을 때 비회귀).
     from services.team_period import resolve_team_for_roster
+    from services.cp_sat.allowed_shift_types import is_n_only_profile
     for _en in engine_nurses:
+        # N전담(허용 shift=N뿐)은 팀 D/E 커버리지 로테이션에 참여 불가 → 미지정(team None).
+        #   team_id=None 이면 team_constraints 가 자동 스킵 → 유령 멤버로 팀 인원/커버리지를
+        #   부풀리지 않는다. 야간 수급은 글로벌(nig_req)이라 영향 없음.
+        if is_n_only_profile(getattr(_en, 'is_night_nurse', None)):
+            _en.__dict__['team_id'] = None
+            continue
         _rt = resolve_team_for_roster(
             db, str(_en.nurse_id), current_user.group_id, req.year, req.month
         )

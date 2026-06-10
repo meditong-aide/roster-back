@@ -946,6 +946,7 @@ def group_members_in_month(
     """
     from calendar import monthrange
     from services.team_period import resolve_team
+    from services.cp_sat.allowed_shift_types import is_n_only_profile
 
     month_start = date(year, month, 1)
     month_end = date(year, month, monthrange(year, month)[1])
@@ -971,14 +972,22 @@ def group_members_in_month(
     )
 
     def _row(n, status, marker, badge, team, grade):
+        # N전담(허용 shift=N뿐)은 팀 로테이션 비참여 → 미지정(as_of_team=None) + 'N전담' 배지.
+        #   파생 규칙(is_night_nurse 기반) — team_period 데이터는 안 건드림(전담 해제 시 자동 복귀).
+        night_dedicated = is_n_only_profile(getattr(n, "is_night_nurse", None))
+        if night_dedicated:
+            team = None
+            if badge is None:
+                badge = "N전담"
         return {
             "nurse_id": str(n.nurse_id),
             "name": getattr(n, "name", None),
             "membership_status": status,   # active|outbound|dispatch_out|leave|resigned|inbound
             "marker": marker,              # '←'(전출) | '→'(전입) | None
-            "badge": badge,                # '파견 중' | '휴직' | '퇴사' | '파견' | None
+            "badge": badge,                # '파견 중' | '휴직' | '퇴사' | '파견' | 'N전담' | None
             "as_of_team": team,
             "as_of_grade": grade,
+            "is_night_dedicated": night_dedicated,
         }
 
     members: list[dict] = []
