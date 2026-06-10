@@ -139,6 +139,29 @@ def set_team_period(
             valid_to=None, team_id=team_id, source=source, note=note,
         )
         db.add(row)
+    # 단일 병동 불변식: 한 간호사는 한 시점에 한 병동에만 속한다. 새 구간을 열 때
+    #   다른 그룹의 열린/겹침 구간(valid_from 이전 시작)을 valid_from 에서 닫고,
+    #   같은 날 시작하는 다른 그룹 구간은 모순이므로 제거한다.
+    #   (병동이동 시 출발 병동 구간 자동 종료 + 재분배 재실행 시 옛 구간 정리 — group-scoped
+    #    close 만으로는 cross-ward stale 구간이 영구히 열려 resolve_team 오염되던 버그 차단.)
+    others = (
+        db.query(NurseTeamPeriod)
+        .filter(
+            NurseTeamPeriod.nurse_id == nurse_id,
+            NurseTeamPeriod.group_id != group_id,
+            NurseTeamPeriod.valid_from <= valid_from,
+            or_(
+                NurseTeamPeriod.valid_to.is_(None),
+                NurseTeamPeriod.valid_to > valid_from,
+            ),
+        )
+        .all()
+    )
+    for o in others:
+        if o.valid_from == valid_from:
+            db.delete(o)
+        else:
+            o.valid_to = valid_from
     if commit:
         db.commit()
         db.refresh(row)

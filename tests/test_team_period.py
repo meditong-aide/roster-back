@@ -94,6 +94,35 @@ def test_reset_same_start_updates_in_place(seeded):
     assert resolve_team(db, "n1", "A", date(2026, 7, 5)) == 3
 
 
+def test_single_ward_invariant_same_date_removes_other_group(seeded):
+    """다른 그룹에 같은 날 시작 구간이 있으면 새 구간이 그걸 제거 → 한 시점 한 병동."""
+    db = seeded
+    set_team_period(db, nurse_id="n1", group_id="A", valid_from=date(2026, 7, 1), team_id=1)
+    # 같은 날 B 로 이동 → A 의 7/1 구간은 모순이므로 제거되어야
+    set_team_period(db, nurse_id="n1", group_id="B", valid_from=date(2026, 7, 1), team_id=2)
+    rows = (db.query(NurseTeamPeriod)
+            .filter(NurseTeamPeriod.nurse_id == "n1",
+                    NurseTeamPeriod.valid_from == date(2026, 7, 1)).all())
+    groups = {r.group_id for r in rows}
+    assert groups == {"B"}, [(r.group_id, r.team_id) for r in rows]
+    assert resolve_team_for_roster(db, "n1", "B", 2026, 7) == 2
+
+
+def test_single_ward_invariant_past_open_period_closed(seeded):
+    """다른 그룹의 과거-시작 열린 구간은 새 구간 시작일에 닫힌다(영구 stale 방지)."""
+    db = seeded
+    set_team_period(db, nurse_id="n1", group_id="A", valid_from=date(2026, 7, 1), team_id=1)
+    # 8/1 에 B 로 이동 → A 의 [7/1, None) 은 [7/1, 8/1) 로 닫혀야
+    set_team_period(db, nurse_id="n1", group_id="B", valid_from=date(2026, 8, 1), team_id=3)
+    a_row = (db.query(NurseTeamPeriod)
+             .filter(NurseTeamPeriod.nurse_id == "n1", NurseTeamPeriod.group_id == "A",
+                     NurseTeamPeriod.valid_from == date(2026, 7, 1)).first())
+    assert a_row.valid_to == date(2026, 8, 1)
+    # 7월엔 A=1, 8월엔 B=3 / 8월 A 는 닫혀서 period 없음
+    assert resolve_team_for_roster(db, "n1", "A", 2026, 7) == 1
+    assert resolve_team_for_roster(db, "n1", "B", 2026, 8) == 3
+
+
 def test_delete_team_clears_team_period(seeded):
     """팀 삭제(apply_team_ops)는 그 team_id 의 nurse_team_period 도 제거 →
     캐시(team_id=None)와 일관, resolve 가 '없는 팀'을 반환하지 않음(고아 방지)."""
