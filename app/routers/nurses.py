@@ -57,6 +57,7 @@ from services.assignment_service import (
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
+    attach_n_exact_to_nurses,
     bulk_update_nurses_service,
     move_nurse_service,
     move_nurse_with_active_service,
@@ -291,6 +292,8 @@ async def get_nurses_in_group(
     office_id: Optional[str] = None,
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,  # 신규 파라미터
+    year: Optional[int] = None,   # 근무자관리에서만 전달: 주면 nurse_monthly_limits.n_exact 조인
+    month: Optional[int] = None,  # year 와 함께 주어질 때만 n_exact 주입
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -326,22 +329,26 @@ async def get_nurses_in_group(
                 group_id=group_id,
                 nurse_id=nurse_id,  # nurse_id 전달
             )
-            return response
-        # HN/수간호사/일반: query group_id 있으면 권한 검증 후 override, 없으면 토큰 group_id
-        override_gid: Optional[str] = None
-        if group_id:
-            allowed = resolve_managed_group_ids(db, current_user)
-            if group_id not in allowed:
-                raise HTTPException(
-                    status_code=403, detail="해당 병동에 접근할 수 없습니다."
-                )
-            override_gid = group_id
-        return get_nurses_in_group_service(
-            current_user,
-            db,
-            nurse_id=nurse_id,  # nurse_id 전달
-            view_group_id=_group,
-        )
+        else:
+            # HN/수간호사/일반: query group_id 있으면 권한 검증 후 override, 없으면 토큰 group_id
+            override_gid: Optional[str] = None
+            if group_id:
+                allowed = resolve_managed_group_ids(db, current_user)
+                if group_id not in allowed:
+                    raise HTTPException(
+                        status_code=403, detail="해당 병동에 접근할 수 없습니다."
+                    )
+                override_gid = group_id
+            response = get_nurses_in_group_service(
+                current_user,
+                db,
+                nurse_id=nurse_id,  # nurse_id 전달
+                view_group_id=_group,
+            )
+        # 근무자관리에서 year/month 가 함께 오면 nurse_monthly_limits 의 n_exact 를 주입.
+        if year is not None and month is not None:
+            attach_n_exact_to_nurses(db, response, year, month)
+        return response
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)
         print("[DEBUG] [nurses.py - get_nurses_in_group] group_id", group_id)

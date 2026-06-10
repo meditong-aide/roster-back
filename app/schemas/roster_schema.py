@@ -460,6 +460,8 @@ class NurseProfile(BaseModel):
     weekly_off_weekday: Optional[int] = None
     nurse_memo: Optional[str] = None
     grade: Optional[int] = None
+    # 근무자관리 get-nurse 에 year/month 가 주어질 때만 채워지는 월별 야간 정확값(nurse_monthly_limits.n_exact)
+    n_exact: Optional[int] = None
     emp_num: Optional[str] = None
     # Side-Profile 추가 컬럼
     birth_date: Optional[str] = None

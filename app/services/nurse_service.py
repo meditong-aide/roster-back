@@ -9,6 +9,7 @@ from sqlalchemy import or_, and_, select
 from fastapi import HTTPException
 from db.models import (
     Nurse as NurseModel,
+    NurseMonthlyLimit,
     Group,
     DeletedNurseHistory,
     NurseAssignment,
@@ -375,6 +376,55 @@ def get_nurses_in_group_service(
         result.append(nurse_dict)
 
     return result
+
+
+def attach_n_exact_to_nurses(
+    db: Session,
+    nurses: list,
+    year: Optional[int],
+    month: Optional[int],
+) -> list:
+    """근무자관리 get-nurse 응답에 월별 n_exact(야간 정확값)를 주입한다.
+
+    - year/month 가 주어진 경우에만 동작(없으면 그대로 반환).
+    - nurse_monthly_limits 를 (nurse_id, year, month) 로 조회해 각 간호사 dict 에
+      'n_exact' 키를 채운다. unique scope 가 (nurse_id, group_id, year, month) 이므로
+      간호사의 group_id 와 정확히 일치하는 행을 우선 사용하고, 없으면 동일 nurse_id 의
+      임의 행으로 폴백한다. 해당 행이 없으면 키를 설정하지 않아 스키마 기본값(None)을 따른다.
+    """
+    if not nurses or year is None or month is None:
+        return nurses
+    nids = [n.get("nurse_id") for n in nurses if isinstance(n, dict) and n.get("nurse_id")]
+    if not nids:
+        return nurses
+    rows = (
+        db.query(
+            NurseMonthlyLimit.nurse_id,
+            NurseMonthlyLimit.group_id,
+            NurseMonthlyLimit.n_exact,
+        )
+        .filter(
+            NurseMonthlyLimit.year == int(year),
+            NurseMonthlyLimit.month == int(month),
+            NurseMonthlyLimit.nurse_id.in_(nids),
+        )
+        .all()
+    )
+    exact_map: dict = {}
+    any_map: dict = {}
+    for nid, gid, n_exact in rows:
+        exact_map[(nid, gid)] = n_exact
+        any_map.setdefault(nid, n_exact)
+    for n in nurses:
+        if not isinstance(n, dict):
+            continue
+        nid = n.get("nurse_id")
+        gid = n.get("group_id")
+        if (nid, gid) in exact_map:
+            n["n_exact"] = exact_map[(nid, gid)]
+        elif nid in any_map:
+            n["n_exact"] = any_map[nid]
+    return nurses
 
 
 def get_nurses_filtered_service(
