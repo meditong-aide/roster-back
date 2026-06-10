@@ -116,6 +116,32 @@ def test_flush_applies_team_changes(ward):
         assert nurse.team_id == tid
 
 
+def test_apply_records_team_period_before_flush(ward):
+    """[B3 회귀] apply 가 nurse_team_period 에 기록 → flush(발효) 전에도 resolve_team
+    이 새 팀 반환. classify 가 set_team_period 를 빠뜨려 단일 group 팀변경이
+    nurse_team_period 에 안 들어가던 버그(화면/생성기 미반영) 방지. 재분배와 동일 SSOT."""
+    from db.models import NurseTeamPeriod
+    from services.team_period import resolve_team
+
+    db = ward
+    pv = preview_team_classification(db, group_id="A", year=2026, month=8)
+    flat = [{"nurse_id": nid, "team_id": int(t)}
+            for t, members in pv["teams"].items() for nid in members]
+    res = apply_team_classification(
+        db, group_id="A", office_id="o1", year=2026, month=8, assignments=flat,
+    )
+    # 변경분(created)이 nurse_team_period(발효일=2026-08-01)에 기록됨
+    period_cnt = db.query(NurseTeamPeriod).filter(
+        NurseTeamPeriod.group_id == "A",
+        NurseTeamPeriod.valid_from == date(2026, 8, 1),
+    ).count()
+    assert period_cnt == res["created"]
+    # flush 전인데도 resolve_team(발효일)이 제안 팀과 일치(화면·생성기 즉시 반영)
+    proposed = {nid: int(t) for t, members in pv["teams"].items() for nid in members}
+    for nid, tid in proposed.items():
+        assert resolve_team(db, nid, "A", date(2026, 8, 1)) == tid
+
+
 def test_participant_subset_puts_others_in_unassigned(ward):
     db = ward
     # 일부만 참여(g1a,g1b 시드 + n1,n4) → 나머지 적격은 미지정, night는 제외

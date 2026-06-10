@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from db.models import FixedWantedEntry, Nurse as NurseModel, Shift
 from services.assignment_service import create_permanent_change
+from services.team_period import set_team_period
 from services.team_auto_assign import NurseInput, auto_assign_teams
 
 _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
@@ -377,6 +378,14 @@ def apply_team_classification(
             release_preceptor=rel,
             note=_note,
         )
+        # [B3] 재분배(ward_redistribute)와 동일: 팀을 시점 테이블(nurse_team_period)
+        #   에도 기록 → flush(발효) 전에도 화면(resolve_team)·생성기(resolve_team_for_roster)
+        #   에 새 팀이 즉시 반영된다. team 미지정(None)은 기록하지 않음(기존 거동 유지).
+        if new_team is not None:
+            set_team_period(
+                db, nurse_id=nid, group_id=group_id, valid_from=effective,
+                team_id=new_team, source="classify", note=_note,
+            )
         if rel:
             handled_release.add(nid)
         created += 1
