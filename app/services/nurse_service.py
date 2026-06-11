@@ -1144,7 +1144,9 @@ def _chosung_or_substr_match(query: str, text: Any) -> bool:
     return query in _extract_chosung(norm)
 
 
-def _available_member_row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
+def _available_member_row_to_dict(
+    row: Any, registered_info: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
     emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
     if not emp_seq_no:
         return None
@@ -1164,6 +1166,10 @@ def _available_member_row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
         "middle_kind_name": _available_member_row_value(row, "middle_kind_name"),
         "small_kind_name": _available_member_row_value(row, "small_kind_name"),
         "mb_part_name": _available_member_row_value(row, "mb_part_name"),
+        # 타 병동 등록 여부(additive). 등록자는 프론트에서 선택 불가 처리.
+        "is_registered": bool(registered_info),
+        "registered_group_id": (registered_info or {}).get("group_id"),
+        "registered_group_name": (registered_info or {}).get("group_name"),
     }
 
 
@@ -1186,6 +1192,36 @@ def _get_office_registered_nurse_ids(office_id: str, db: Session) -> set[str]:
         .all()
     )
     return {str(row[0]) for row in rows if row[0] is not None}
+
+
+def _get_office_registered_nurse_map(office_id: str, db: Session) -> Dict[str, Dict[str, Any]]:
+    """오피스에 이미 등록된 nurse_id → 소속 그룹 정보 매핑 (available-members 표시용).
+
+    범위는 `_get_office_registered_nurse_ids`와 동일(office_id 또는 office 소속 group).
+    각 값은 {"group_id": ..., "group_name": ...}.
+    """
+    office_id = str(office_id)
+    office_group_ids = select(Group.group_id).where(Group.office_id == office_id)
+    rows = (
+        db.query(NurseModel.nurse_id, NurseModel.group_id, Group.group_name)
+        .outerjoin(Group, Group.group_id == NurseModel.group_id)
+        .filter(
+            or_(
+                NurseModel.office_id == office_id,
+                NurseModel.group_id.in_(office_group_ids),
+            )
+        )
+        .all()
+    )
+    registered: Dict[str, Dict[str, Any]] = {}
+    for nurse_id, group_id, group_name in rows:
+        if nurse_id is None:
+            continue
+        registered[str(nurse_id)] = {
+            "group_id": str(group_id) if group_id is not None else None,
+            "group_name": group_name,
+        }
+    return registered
 
 
 def _available_member_matches_search(
@@ -1250,7 +1286,7 @@ def get_available_members_service(
     if pagination == "cursor":
         limit = max(1, min(int(limit or 20), 100))
         decoded_cursor = _decode_available_member_cursor(cursor)
-        existing_nurse_ids = _get_office_registered_nurse_ids(office_id, db)
+        registered_map = _get_office_registered_nurse_map(office_id, db)
 
         normalized_q = (q or "").strip()
         normalized_search_by = "affiliation" if search_by == "affiliation" else "name"
@@ -1264,8 +1300,9 @@ def get_available_members_service(
             cursor_nurse_id = decoded_cursor.get("nurse_id")
             for row in all_members:
                 emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
-                if not emp_seq_no or str(emp_seq_no) in existing_nurse_ids:
+                if not emp_seq_no:
                     continue
+                # 타 병동 등록자도 목록에 노출(선택 불가 표시용)하므로 제외하지 않는다.
                 if not _available_member_matches_search(
                     row, normalized_q, normalized_search_by
                 ):
@@ -1287,7 +1324,9 @@ def get_available_members_service(
             page_rows = matched_rows[: limit + 1]
             items = []
             for row in page_rows[:limit]:
-                member_dict = _available_member_row_to_dict(row)
+                emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
+                registered_info = registered_map.get(str(emp_seq_no)) if emp_seq_no else None
+                member_dict = _available_member_row_to_dict(row, registered_info)
                 if member_dict:
                     items.append(member_dict)
 
@@ -1330,8 +1369,7 @@ def get_available_members_service(
             if not emp_seq_no:
                 continue
             emp_seq_str = str(emp_seq_no)
-            if emp_seq_str in existing_nurse_ids:
-                continue
+            # 타 병동 등록자도 목록에 노출(선택 불가 표시용)하므로 제외하지 않는다.
             if cursor_nurse_id and emp_seq_str <= str(cursor_nurse_id):
                 continue
             filtered.append((emp_seq_str, row))
@@ -1343,7 +1381,7 @@ def get_available_members_service(
             {
                 "normalized_search_by": normalized_search_by,
                 "decoded_cursor": decoded_cursor,
-                "excluded_count": len(existing_nurse_ids),
+                "registered_count": len(registered_map),
                 "raw_count": len(page_rows),
                 "sample_names": [
                     _available_member_row_value(row, "EmployeeName")
@@ -1352,8 +1390,9 @@ def get_available_members_service(
             },
         )
         items = []
-        for _, row in page_rows[:limit]:
-            member_dict = _available_member_row_to_dict(row)
+        for emp_seq_str, row in page_rows[:limit]:
+            registered_info = registered_map.get(emp_seq_str)
+            member_dict = _available_member_row_to_dict(row, registered_info)
             if member_dict:
                 items.append(member_dict)
 
@@ -1371,10 +1410,10 @@ def get_available_members_service(
     # 1. MSSQL에서 오피스 전체 멤버 조회 (export-members와 동일 쿼리, TTL 캐시)
     all_members = _fetch_office_members_cached(office_id)
 
-    # 2. 오피스에 이미 등록된 간호사의 nurse_id 집합
-    existing_nurse_ids = _get_office_registered_nurse_ids(office_id, db)
+    # 2. 오피스에 이미 등록된 간호사 → 소속 그룹 매핑
+    registered_map = _get_office_registered_nurse_map(office_id, db)
 
-    # 3. 이미 등록된 멤버 제외
+    # 3. 타 병동 등록자도 목록에 노출(선택 불가 표시용)하므로 제외하지 않는다.
     available = []
     normalized_q = (q or "").strip()
     normalized_search_by = "affiliation" if search_by == "affiliation" else "name"
@@ -1384,63 +1423,22 @@ def get_available_members_service(
             if isinstance(row, dict)
             else getattr(row, "EmpSeqNo", None)
         )
-        if emp_seq_no and str(emp_seq_no) not in existing_nurse_ids:
+        if emp_seq_no:
             if not _available_member_matches_search(
                 row, normalized_q, normalized_search_by
             ):
                 continue
-            member_dict = {
-                "nurse_id": str(emp_seq_no),
-                "emp_num": row.get("OfficeEmpNum")
-                if isinstance(row, dict)
-                else getattr(row, "OfficeEmpNum", None),
-                "account_id": row.get("MemberID")
-                if isinstance(row, dict)
-                else getattr(row, "MemberID", None),
-                "name": row.get("EmployeeName")
-                if isinstance(row, dict)
-                else getattr(row, "EmployeeName", None),
-                "duty": row.get("duty")
-                if isinstance(row, dict)
-                else getattr(row, "duty", None),
-                "career": row.get("career")
-                if isinstance(row, dict)
-                else getattr(row, "career", None),
-                "is_head_nurse": row.get("headnurse")
-                if isinstance(row, dict)
-                else getattr(row, "headnurse", None),
-                "joining_date": row.get("joindate")
-                if isinstance(row, dict)
-                else getattr(row, "joindate", None),
-                "birth_date": row.get("DateOfBirth")
-                if isinstance(row, dict)
-                else getattr(row, "DateOfBirth", None),
-                "phone_number": row.get("PortableTel")
-                if isinstance(row, dict)
-                else getattr(row, "PortableTel", None),
-                "gender": row.get("Gender")
-                if isinstance(row, dict)
-                else getattr(row, "Gender", None),
-                "big_kind_name": row.get("big_kind_name")
-                if isinstance(row, dict)
-                else getattr(row, "big_kind_name", None),
-                "middle_kind_name": row.get("middle_kind_name")
-                if isinstance(row, dict)
-                else getattr(row, "middle_kind_name", None),
-                "small_kind_name": row.get("small_kind_name")
-                if isinstance(row, dict)
-                else getattr(row, "small_kind_name", None),
-                "mb_part_name": row.get("mb_part_name")
-                if isinstance(row, dict)
-                else getattr(row, "mb_part_name", None),
-            }
-            available.append(member_dict)
+            registered_info = registered_map.get(str(emp_seq_no))
+            member_dict = _available_member_row_to_dict(row, registered_info)
+            if member_dict:
+                available.append(member_dict)
 
     print(
         "[DEBUG] available-members legacy rows",
         {
             "normalized_q": normalized_q,
             "search_by": normalized_search_by,
+            "registered_count": len(registered_map),
             "count": len(available),
             "sample_names": [item.get("name") for item in available[:5]],
         },
@@ -1480,6 +1478,15 @@ def add_nurses_to_group_service(
         if emp_seq:
             member_map[str(emp_seq)] = row
 
+    # 동일 오피스에 속한 그룹 집합(타 병동 이동 차단 판정용).
+    office_group_ids = {
+        str(row[0])
+        for row in db.query(Group.group_id)
+        .filter(Group.office_id == str(office_id))
+        .all()
+        if row[0] is not None
+    }
+
     for nid in nurse_ids:
         try:
             # nurses 테이블에서 해당 nurse_id 조회 (group_id 무관)
@@ -1488,6 +1495,25 @@ def add_nurses_to_group_service(
             )
 
             if existing_nurse:
+                # 타 병동(동일 오피스 내 다른 그룹) 소속이면 이동시키지 않고 차단.
+                # 병동 간 정식 이동은 별도 재분배 기능을 사용한다.
+                current_gid = (
+                    str(existing_nurse.group_id)
+                    if existing_nurse.group_id is not None
+                    else None
+                )
+                if (
+                    current_gid is not None
+                    and current_gid != str(group_id)
+                    and current_gid in office_group_ids
+                ):
+                    errors.append(
+                        {
+                            "nurse_id": nid,
+                            "reason": "타 병동 소속 근무자입니다. 병동이동 기능을 사용하세요.",
+                        }
+                    )
+                    continue
                 # 이미 nurses 테이블에 존재 → group_id만 변경
                 existing_nurse.group_id = group_id
                 # sequence는 현재 그룹 + role 그룹 활성 목록의 마지막으로 배치
