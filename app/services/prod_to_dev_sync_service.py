@@ -34,6 +34,14 @@ PARENT_FK_MAP = {
     "schedule_entries": ("schedules", "schedule_id"),
 }
 
+# group_id 컬럼이 없지만 다른 컬럼(들)으로 group 스코프가 가능한 테이블.
+# 값이 리스트면 OR 스코프: (col1 IN (...) OR col2 IN (...)).
+# (예: nurse_assignment 은 group_id 없이 source_group_id/target_group_id 만 보유 →
+#  해당 group 이 source 이거나 target 인 배정 이력 모두 가져옴)
+GROUP_COL_OVERRIDE = {
+    "nurse_assignment": ["source_group_id", "target_group_id"],
+}
+
 # (table, mode) — FK 부모 → 자식 순서
 # mode="wipe":  dev 전체 삭제 후 prod 복사 (마스터 — prod 완전 미러)
 # mode="upsert": MERGE (prod row 있으면 UPDATE, 없으면 INSERT, dev-only 보존)
@@ -43,6 +51,7 @@ SYNC_TABLES: List[tuple] = [
     ("groups", "wipe"),
     ("teams", "wipe"),
     ("nurses", "wipe"),
+    ("nurse_team_period", "wipe"),  # 팀 시점 타임라인(근무자 내역) — group_id 스코프
     ("roster_config", "wipe"),
     ("roster_grade_config", "wipe"),
     ("wanted_config", "wipe"),
@@ -121,14 +130,16 @@ def _group_filter_clause(
     include_group_ids: Optional[List[str]] = None,
     exclude_group_ids: Optional[List[str]] = None,
     alias: str = "",
+    cols: Optional[List[str]] = None,
 ) -> tuple:
     """include/exclude group_ids 를 결합해 WHERE 절 + params 반환.
 
-    - include_group_ids 만 있으면: WHERE group_id IN (...)
-    - exclude_group_ids 만 있으면: WHERE group_id NOT IN (...)
-    - 둘 다 있으면: WHERE group_id IN (...) AND group_id NOT IN (...)
+    - cols: 스코프 기준 컬럼(들). 기본 ["group_id"]. 여러 개면 OR 스코프.
+      include → (col1 IN (...) OR col2 IN (...))
+      exclude → (col1 NOT IN (...) AND col2 NOT IN (...))  # 어느 컬럼도 매칭 안 됨
     - 둘 다 없으면: ("", {}).
     """
+    cols = cols or ["group_id"]
     if not include_group_ids and not exclude_group_ids:
         return "", {}
     prefix = f"{alias}." if alias else ""
@@ -136,12 +147,14 @@ def _group_filter_clause(
     params: dict = {}
     if include_group_ids:
         ph = ", ".join(f":ig{i}" for i in range(len(include_group_ids)))
-        conds.append(f"{prefix}group_id IN ({ph})")
+        ors = " OR ".join(f"{prefix}{c} IN ({ph})" for c in cols)
+        conds.append(f"({ors})")
         for i, g in enumerate(include_group_ids):
             params[f"ig{i}"] = g
     if exclude_group_ids:
         ph = ", ".join(f":xg{i}" for i in range(len(exclude_group_ids)))
-        conds.append(f"{prefix}group_id NOT IN ({ph})")
+        ands = " AND ".join(f"{prefix}{c} NOT IN ({ph})" for c in cols)
+        conds.append(f"({ands})")
         for i, g in enumerate(exclude_group_ids):
             params[f"xg{i}"] = g
     where = " WHERE " + " AND ".join(conds)
@@ -379,7 +392,12 @@ def _merge_upsert(
     # include_group_ids 지정 시 group_id 컬럼 없는 테이블 처리:
     # - PARENT_FK_MAP 매핑 있으면 부모 group_id 기반 wipe-by-parent 강제 (자식 overwrite)
     # - 매핑 없으면 dev 보존 (skip)
-    if include_group_ids and "group_id" not in prod_cols:
+    # group_id 컬럼이 없어도 override 컬럼(들)으로 스코프
+    # (예: nurse_assignment → source_group_id OR target_group_id). prod 에 실재하는 컬럼만 사용.
+    raw_override = GROUP_COL_OVERRIDE.get(table, "group_id")
+    group_cols = raw_override if isinstance(raw_override, list) else [raw_override]
+    present_cols = [c for c in group_cols if c in prod_cols]
+    if include_group_ids and not present_cols:
         parent_info = PARENT_FK_MAP.get(table)
         if not parent_info:
             return {"table": table, "skipped": "no_group_id_with_include", "upserted": 0}
@@ -387,8 +405,10 @@ def _merge_upsert(
 
     src_clause = f"{PROD_DB}.dbo.[{table}]"
     params: dict = {}
-    if "group_id" in prod_cols and (include_group_ids or exclude_group_ids):
-        where, params = _group_filter_clause(include_group_ids, exclude_group_ids)
+    if present_cols and (include_group_ids or exclude_group_ids):
+        where, params = _group_filter_clause(
+            include_group_ids, exclude_group_ids, cols=present_cols
+        )
         src_clause = f"(SELECT * FROM {PROD_DB}.dbo.[{table}]{where})"
 
     # 문자열 PK 컬럼의 collation 충돌 방지 (prod/dev DB 기본 collation 다를 수 있음)
