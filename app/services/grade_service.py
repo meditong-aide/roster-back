@@ -182,6 +182,16 @@ def upsert_grade_config_service(
         cleaned = dict(payload.constraints or {})
         if not use_mid:
             cleaned.pop("M", None)
+        # [GRADE_MIN_ONLY_G1] grade 수와 무관하게 min 은 grade "1" 만 1, 나머지 등급은 0.
+        #   (빈/미등록 상위 등급에 min 이 남아 precheck GRADE_MIN_AVAILABLE_SHORTAGE 로
+        #    infeasible 되는 것을 원천 차단. 등급 cascade/soft 는 엔진단에서 처리.)
+        for _shift, _per_grade in list(cleaned.items()):
+            if not isinstance(_per_grade, dict):
+                continue
+            cleaned[_shift] = {
+                str(_g): (1 if str(_g) == "1" else 0)
+                for _g in _per_grade.keys()
+            }
         config.constraints_json = cleaned
 
     if "constraints_max" in provided_fields:
