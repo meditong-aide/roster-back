@@ -436,6 +436,7 @@ def auto_assign_teams(
     w_churn: float = 0.0,
     fixed: dict[str, int] | None = None,
     w_size: float = 50.0,
+    allow_non_g1_seed: bool = False,
 ) -> TeamAssignResult:
     """팀 자동 분배 진입점.
 
@@ -448,7 +449,8 @@ def auto_assign_teams(
       보충해 전원 팀 배정을 보장한다 — '이동자 팀마다 G1' 은 best-effort, 없으면 없는 대로.
     max_sizes/min_sizes (클러스터=시드 순서) 지정 시 클러스터별 정원 밴드 적용(옵션2).
     """
-    allow_non_g1_seed = False
+    # 명시 seed_ids 라도 호출자가 허용하면(allow_non_g1_seed) 비-G1 시드 통과.
+    #   자동 선택(seed_ids=None) + G1 부족 시엔 아래에서 True 로 승격.
     if seed_ids is None:
         if num_teams is None:
             raise ValueError("num_teams 또는 seed_ids 중 하나는 필요")

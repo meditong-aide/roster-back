@@ -57,12 +57,20 @@ class WardRedistributePreviewRequest(BaseModel):
     size_tolerance: int = 2
     churn_weight: float = 500.0
     participant_ids: list[str] | None = None  # 참여(이동 대상). 미지정=전원, 미참여=현재병동 고정
+    # [옵션B] 팀 없는 병동을 N개로 '가분할' 미리보기: {group_id: N}. 정의된 팀이 있으면 무시.
+    #   가분할 버킷은 team_id=null 로 내려가며, 저장 시 team_label("1"…)로 팀이 생성된다.
+    team_counts: dict[str, int] | None = None
+    # G1(시니어) 없는 병동도 막지 않고 진행(true). 기본 false = 422 로 '시니어 지정' 유도.
+    allow_missing_g1: bool = False
 
 
 class WardAssignmentItem(BaseModel):
     nurse_id: str
     to_group_id: str
     team_id: int | None = None
+    # [옵션B] 팀이 없는 병동에 '번호 팀' 자동 생성: team_id 대신 라벨("1","2"…)을 보내면
+    #   apply 가 그 병동에 동명 팀을 생성/재사용(멱등)하고 team_id 로 해석해 그 달 배정한다.
+    team_label: str | None = None
 
 
 class WardRedistributeApplyRequest(BaseModel):
@@ -226,7 +234,8 @@ async def redistribute_preview(
             db, group_ids=body.group_ids, year=body.year, month=body.month,
             capacity_mode=body.capacity_mode, target_sizes=body.target_sizes,
             size_tolerance=body.size_tolerance, churn_weight=body.churn_weight,
-            participant_ids=body.participant_ids,
+            participant_ids=body.participant_ids, team_counts=body.team_counts,
+            allow_missing_g1=body.allow_missing_g1,
         )
     except WardSetupError as e:
         raise HTTPException(

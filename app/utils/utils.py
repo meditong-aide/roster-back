@@ -152,12 +152,31 @@ def set_mlink_push(empseqno: str, officecode: str, str_to_arr: str, contents: st
         return {"result": "fail", "message": "받는사람 사람 오류"}
 
 
+_PUSH_PRODUCTION_ENVS = frozenset({"production", "prod"})
+
+
+def push_enabled() -> bool:
+    """실제 앱 푸시 발송 여부 — 운영(ENVIRONMENT=production|prod)에서만 True.
+
+    개발/스테이징에서는 실제 사용자 단말로 푸시가 나가지 않도록 차단(로그만).
+    redis_client._is_production 과 동일 규약(ENVIRONMENT 기본 'dev').
+    """
+    return os.getenv("ENVIRONMENT", "dev").strip().lower() in _PUSH_PRODUCTION_ENVS
+
+
 def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
                  sendEmpSeqNo: str, sendMemberId: str, receiveEmpSeqNo: str,
                  pushMessage: str, orgPushMessage: str, linkUrl: str, linkCode: str):
     """
     앱 푸시 보내기, receiveEmpSeqNo는 콤마(,)로 구분하여 여러명에게 보낼 수 있음
     """
+    # [env-gate] 운영에서만 실제 발송. 개발/스테이징은 단말로 안 나가게 스킵(로그만).
+    if not push_enabled():
+        print(
+            f"[push][skipped:non-prod] code={pushCode}/{pushSubCode} "
+            f"to={receiveEmpSeqNo} msg={pushMessage!r}"
+        )
+        return {"result": "skipped", "message": "non-production: push 미발송"}
     if not sendEmpSeqNo:
         return {"result" : "fail", "message": "sendEmpSeqNo가 없습니다."}
     if not officeCode:

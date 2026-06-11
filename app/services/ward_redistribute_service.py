@@ -16,6 +16,7 @@ N전담(is_night_nurse==['N'])은 풀에서 제외.
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from math import ceil
 from typing import Optional
@@ -23,13 +24,15 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from db.models import (
-    FixedWantedEntry, Group, Nurse as NurseModel, NurseAssignment, Shift,
+    FixedWantedEntry, Group, Nurse as NurseModel, NurseAssignment, Shift, Team,
 )
 from schemas.roster_schema import NurseAssignmentCreate
 from services.assignment_service import create_assignment, create_permanent_change
 from services.team_period import set_team_period
 from services.team_auto_assign import NurseInput, auto_assign_teams
 from services.team_classify_service import _build_pool_roster
+
+logger = logging.getLogger(__name__)
 
 _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
 
@@ -215,12 +218,14 @@ def _ward_seed(
     pool: list[NurseModel], current_group: dict[str, str], ward: str,
     non_participant_ids: set[str],
 ) -> str:
-    """병동의 grade-1 앵커 시드 1명. 미참여(고정) G1 을 우선 — 참여자는 이동 자유를 유지.
+    """병동 앵커 시드 1명 — G1 우선, 없으면 그 병동 아무 인원으로 폴백.
+    미참여(고정) 후보를 우선(참여자는 이동 자유 유지).
 
-    (_wards_missing_g1 통과 전제 → 각 병동에 G1 ≥ 1 보장)
+    (allow_missing_g1 로 G1 없는 병동도 진행 가능 → G1 부재 시 비-G1 앵커로 클러스터 바인딩만 유지.)
     """
-    cands = [n.nurse_id for n in pool
-             if current_group.get(n.nurse_id) == ward and n.grade == 1]
+    g1 = [n.nurse_id for n in pool
+          if current_group.get(n.nurse_id) == ward and n.grade == 1]
+    cands = g1 or [n.nurse_id for n in pool if current_group.get(n.nurse_id) == ward]
     for nid in cands:
         if nid in non_participant_ids:
             return nid
@@ -233,33 +238,54 @@ def _team_breakdown(
     member_ids: list[str],
     by_input: dict[str, NurseInput],
     nurse_name: dict[str, str],
-) -> dict[str, list[dict]]:
-    """재분배된 병동 안에서 팀(team_id) 분해 — 옵션1 로직 재사용.
+    forced_count: Optional[int] = None,
+) -> dict[str, dict]:
+    """재분배된 병동 안에서 팀 분해 — 옵션1 로직 재사용.
 
-    팀 수 = 병동의 현재 distinct team_id 수. G1 부족 등으로 분해 불가 시 단일 '전체' 폴백.
+    반환 = `{label: {"team_id": int|None, "members": [{nurse_id, name}]}}`.
+      - 정의된 활성 팀(Team)이 있으면 그 수만큼 분할, label=team_id, **team_id=실제 값**.
+      - 정의된 팀이 없고 `forced_count>=2` 면 그 수만큼 '가분할', label="1".."N",
+        **team_id=None**(아직 미존재 — 저장 시 team_label 로 생성). 옵션B.
+      - 그 외(팀 0~1개 & 강제분할 없음, 또는 멤버<2) → 단일 '전체'(team_id=None).
+
+    팀 수를 멤버의 현재 배정(`nurses.team_id`)으로 세지 않는다 — 재분배는 정의된 팀으로
+    전원을 다시 균등배치하는 것이라 현재 누가 어느 팀인지는 무관하고, 무엇보다 팀 관리
+    (PUT /teams)가 period 모드로만 기록해 캐시 team_id 가 NULL 이어도(team_service.
+    apply_team_ops) Team 정의행은 항상 생성되므로 정의 기준이 정확하다.
     """
     members = [by_input[nid] for nid in member_ids if nid in by_input]
-    team_ids = sorted({
-        t for (t,) in db.query(NurseModel.team_id)
-        .filter(NurseModel.group_id == ward_id, NurseModel.team_id.isnot(None))
-        .distinct()
-    })
-    k = len(team_ids) if team_ids else 1
+    team_ids = sorted(
+        t for (t,) in db.query(Team.team_id)
+        .filter(Team.group_id == ward_id, Team.active == 1)
+        .all()
+    )
 
     def _flat(ms):
         return [{"nurse_id": m.nurse_id, "name": nurse_name.get(m.nurse_id)} for m in ms]
 
+    # (label, team_id) 쌍 — 정의된 팀 우선, 없으면 강제분할(가분할, team_id=None).
+    if team_ids:
+        labels: list[tuple[str, Optional[int]]] = [(str(t), t) for t in team_ids]
+    elif forced_count and forced_count >= 2:
+        labels = [(str(i + 1), None) for i in range(int(forced_count))]
+    else:
+        labels = []
+
+    k = len(labels)
     if k <= 1 or len(members) < 2:
-        return {"전체": _flat(members)}
+        return {"전체": {"team_id": None, "members": _flat(members)}}
     try:
         res = auto_assign_teams(members, num_teams=k)
-        out: dict[str, list[dict]] = {}
+        out: dict[str, dict] = {}
         for i, ids in res.teams.items():
-            label = str(team_ids[i]) if i < len(team_ids) else f"팀{i + 1}"
-            out[label] = [{"nurse_id": nid, "name": nurse_name.get(nid)} for nid in ids]
+            label, tid = labels[i] if i < len(labels) else (f"팀{i + 1}", None)
+            out[label] = {
+                "team_id": tid,
+                "members": [{"nurse_id": nid, "name": nurse_name.get(nid)} for nid in ids],
+            }
         return out
     except ValueError:
-        return {"전체": _flat(members)}
+        return {"전체": {"team_id": None, "members": _flat(members)}}
 
 
 def _detect_ward_pairs(
@@ -305,6 +331,8 @@ def preview_ward_redistribution(
     size_tolerance: int = 2,
     churn_weight: float = 500.0,
     participant_ids: Optional[list[str]] = None,
+    team_counts: Optional[dict[str, int]] = None,
+    allow_missing_g1: bool = False,
 ) -> dict:
     """병동 간 재분배 미리보기 (read-only, DB 변경 없음).
 
@@ -345,12 +373,17 @@ def preview_ward_redistribution(
     # 사전 검증: 모든 선택 병동에 시니어(G1)가 있어야 함.
     # 없으면 alg가 차출로 얼버무리지 않고 막아, 프론트가 '시니어 지정'을 유도하게 한다.
     missing_g1 = _wards_missing_g1(pool, current_group, ward_ids, name_map)
-    if missing_g1:
+    if missing_g1 and not allow_missing_g1:
         names = ", ".join(w["name"] or w["group_id"] for w in missing_g1)
         raise WardSetupError(
             f"다음 병동에 시니어(grade-1)가 지정되어 있지 않습니다: {names}. "
             f"재분배 전에 각 병동에 시니어를 먼저 지정하세요.",
             wards=missing_g1,
+        )
+    if missing_g1:  # allow_missing_g1 → 막지 않고 경고만(없는 대로 진행, 팀별 시니어 보장 안 됨)
+        _names = ", ".join(w["name"] or w["group_id"] for w in missing_g1)
+        warnings.append(
+            f"시니어(G1) 없는 병동: {_names} — 시니어 없이 진행합니다(팀마다 시니어 배치가 보장되지 않음)."
         )
 
     # 역할 혼합 경고 (AN/RN 등 직역이 섞이면 운영상 위험 — 선택이 곧 안전장치이나 경고)
@@ -393,6 +426,7 @@ def preview_ward_redistribution(
         result = auto_assign_teams(
             inputs, seed_ids=seeds, min_sizes=min_sizes, max_sizes=max_sizes,
             home_cluster=home_cluster, w_churn=churn_weight, fixed=fixed,
+            allow_non_g1_seed=allow_missing_g1,
         )
         idx_to_ward = {i: ward_ids[i] for i in range(num_wards)}
         size_bounds = {"mode": "explicit", "tolerance": size_tolerance,
@@ -405,6 +439,7 @@ def preview_ward_redistribution(
         result = auto_assign_teams(
             inputs, seed_ids=seeds, min_size=min_size, max_size=max_size,
             home_cluster=home_cluster, w_churn=churn_weight, fixed=fixed,
+            allow_non_g1_seed=allow_missing_g1,
         )
         idx_to_ward = {i: ward_ids[i] for i in range(num_wards)}
         size_bounds = {"mode": "even-anchored", "min": min_size, "max": max_size, "avg": avg}
@@ -428,7 +463,10 @@ def preview_ward_redistribution(
         wards[wid] = {
             "name": name_map.get(wid),
             "nurse_ids": members,
-            "teams": _team_breakdown(db, wid, members, by_input, nurse_name),
+            "teams": _team_breakdown(
+                db, wid, members, by_input, nurse_name,
+                forced_count=(team_counts or {}).get(wid),
+            ),
         }
         for nid in members:
             cur = current_group.get(nid)
@@ -512,6 +550,40 @@ def _same_team(a, b) -> bool:
     return str(a) == str(b)
 
 
+def _ensure_numbered_teams(
+    db: Session, office_id: str, group_id: str, labels: list[str],
+) -> dict[str, int]:
+    """이름(번호) 팀들이 존재하도록 보장 — 없으면 생성, 활성 동명이면 재사용. {label: team_id}.
+
+    멱등: 같은 이름은 재사용하므로 두 번 저장해도 team_id 가 늘지 않는다(결정 4).
+    하드 삭제(다른 달 period 동반 소실)는 하지 않는다 — 팀 정의는 영구, 배정만 월-스코프(결정 3).
+    """
+    existing = {
+        t.team_name: t.team_id
+        for t in db.query(Team)
+        .filter(Team.office_id == office_id, Team.group_id == group_id, Team.active == 1)
+        .all()
+    }
+    max_row = (
+        db.query(Team.team_id)
+        .filter(Team.office_id == office_id, Team.group_id == group_id)
+        .order_by(Team.team_id.desc())
+        .first()
+    )
+    next_id = (max_row[0] + 1) if max_row else 1
+    out: dict[str, int] = {}
+    for label in labels:
+        tid = existing.get(label)
+        if tid is None:
+            db.add(Team(office_id=office_id, group_id=group_id, team_id=next_id,
+                        team_name=label, active=1))
+            db.flush()
+            existing[label] = tid = next_id
+            next_id += 1
+        out[label] = tid
+    return out
+
+
 def apply_ward_redistribution(
     db: Session,
     *,
@@ -524,12 +596,15 @@ def apply_ward_redistribution(
 ) -> dict:
     """승인된 병동 간 재분배를 이벤트로 발행 (대상월 1일 발효).
 
-    assignments: [{nurse_id, to_group_id, team_id?}] — team_id 는 정수만 적용(없으면 무시).
+    assignments: [{nurse_id, to_group_id, team_id?, team_label?}].
+      - team_id(정수): 기존 팀에 적용. team_label("1"…): 그 병동에 동명 번호 팀을 생성/재사용
+        (멱등)하고 team_id 로 해석 — '팀 없는 병동'을 저장 한 번에 N개로 나눠 배정(옵션B).
+        team_id 가 오면 그대로 쓰고 team_label 은 무시. 둘 다 없으면 팀 미적용('전체').
       - 병동이 바뀌면 → 병동이동(transfer) 이벤트(target_team_id 동반). 기존 create_assignment
         흐름 재사용(FixedWanted 재배치·정합성·알림 포함).
-      - 같은 병동인데 team_id 만 바뀌면 → permanent_change(team_id).
+      - 같은 병동인데 team 만 바뀌면 → permanent_change(team_id).
       - 둘 다 동일 → skip.
-    Returns: {transfers, team_changes, skipped, failed, effective_date}
+    Returns: {transfers, team_changes, skipped, failed, effective_date, created_teams}
 
     per-nurse graceful: 한 명이 기간겹침(409) 등으로 실패해도 그 사람만 건너뛰고
     failed 에 사유와 함께 담는다 (배치 전체가 중단되지 않음).
@@ -540,6 +615,34 @@ def apply_ward_redistribution(
         for n in db.query(NurseModel).filter(NurseModel.group_id.in_(group_ids))
     }
     _note = note or f"원티드 병동재분배 {year}-{month:02d}"
+
+    # [옵션B] phase 0 — team_label 로 들어온 배정의 병동에 번호 팀을 생성/재사용(멱등).
+    #   team_id(정수)가 직접 온 항목은 라벨 무시. 라벨→실제 team_id 해석 맵을 만든다.
+    #   팀을 먼저 만들어 team_id 를 확보한 뒤(아래 루프의 transfer/period 가 참조)에 진행(결정 1·5).
+    _label_team_id: dict[tuple[str, str], int] = {}
+    _ward_labels: dict[str, list[str]] = {}
+    for a in assignments:
+        if isinstance(a.get("team_id"), int):
+            continue
+        _lbl = str(a.get("team_label") or "").strip()
+        _tg = a.get("to_group_id")
+        if _lbl and _tg:
+            _ward_labels.setdefault(_tg, [])
+            if _lbl not in _ward_labels[_tg]:
+                _ward_labels[_tg].append(_lbl)
+    created_teams: dict[str, dict[str, int]] = {}
+    for _tg, _labels in _ward_labels.items():
+        _oid = next(
+            (nurses[a["nurse_id"]].office_id for a in assignments
+             if a.get("to_group_id") == _tg and a.get("nurse_id") in nurses), None
+        ) or getattr(current_user, "office_id", None)
+        if _oid is None:
+            continue
+        _resolved = _ensure_numbered_teams(db, _oid, _tg, _labels)
+        created_teams[_tg] = _resolved
+        for _lbl, _tid in _resolved.items():
+            _label_team_id[(_tg, _lbl)] = _tid
+
     transfers = team_changes = skipped = 0
     failed: list[dict] = []
     for a in assignments:
@@ -547,6 +650,10 @@ def apply_ward_redistribution(
         to_g = a.get("to_group_id")
         team = a.get("team_id")
         team = team if isinstance(team, int) else None  # '전체'/None 등은 팀 미적용
+        if team is None:
+            _lbl = str(a.get("team_label") or "").strip()
+            if _lbl and to_g:
+                team = _label_team_id.get((to_g, _lbl))
         n = nurses.get(nid)
         if n is None or not to_g:
             skipped += 1
@@ -560,7 +667,7 @@ def apply_ward_redistribution(
                     office_id=n.office_id, start_date=effective, reason="병동이동",
                     target_team_id=team, note=_note,
                 )
-                create_assignment(req, db, current_user)
+                create_assignment(req, db, current_user, notify=False)
                 transfers += 1
                 _tp_group = to_g
             elif team is not None and not _same_team(n.team_id, team):
@@ -587,10 +694,41 @@ def apply_ward_redistribution(
             # 부분 커밋이 없다 → 세션 무효화(rollback) 없이 다음 사람 진행.
             detail = getattr(e, "detail", None) or str(e)
             failed.append({"nurse_id": nid, "reason": str(detail)})
+    # 알림: 개별 N건(create_assignment 는 notify=False) 대신 관련 병동 수간호사에게 요약 1건.
+    #   운영(ENVIRONMENT=production)에서만 실제 발송 — set_app_push 가 dev 를 자체 스킵.
+    if transfers or team_changes:
+        try:
+            from services.assignment_service import _get_head_nurse_ids
+            from utils.utils import set_app_push
+
+            _hns: set[str] = set()
+            for _g in set(group_ids):
+                for _h in _get_head_nurse_ids(db, _g):
+                    _hns.add(str(_h))
+            _sender = str(getattr(current_user, "nurse_id", "") or "")
+            _office = (
+                getattr(current_user, "office_id", None)
+                or next((n.office_id for n in nurses.values()), "")
+            )
+            if _hns and _sender and _office:
+                _msg = (
+                    f"{year}-{month:02d} 병동재분배: 이동 {transfers}명 · 팀변경 {team_changes}명 "
+                    f"({month}월 발효 예약)"
+                )
+                set_app_push(
+                    pushCode="P30", pushSubCode="S06", officeCode=_office,
+                    sendEmpSeqNo=_sender, sendMemberId=_sender,
+                    receiveEmpSeqNo=",".join(sorted(_hns)),
+                    pushMessage=_msg, orgPushMessage=_msg, linkUrl="", linkCode="",
+                )
+        except Exception as e:
+            logger.error("재분배 요약 알림 발송 실패: %s", e, exc_info=True)
+
     return {
         "transfers": transfers,
         "team_changes": team_changes,
         "skipped": skipped,
         "failed": failed,
         "effective_date": effective.isoformat(),
+        "created_teams": created_teams,  # {group_id: {team_name: team_id}} (옵션B로 생성/재사용)
     }

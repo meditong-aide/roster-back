@@ -103,6 +103,42 @@ def test_ward_without_g1_blocks_with_setup_error(db):
     assert any(w["group_id"] == "B" for w in ei.value.wards)
 
 
+def test_ward_without_g1_proceeds_when_allowed(db):
+    """allow_missing_g1=True → G1 없는 병동도 막지 않고 경고만 + 정상 미리보기."""
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    _mk_nurse(db, "a_g1", "A", 1)
+    for i in range(4):
+        _mk_nurse(db, f"a{i}", "A", 2)
+    for i in range(5):
+        _mk_nurse(db, f"b{i}", "B", 2)  # B: G1 없음
+    db.flush()
+    pv = preview_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7, allow_missing_g1=True
+    )
+    # 차단 안 됨: 풀 전원 배치 + 시니어 부재 경고 포함.
+    assert pv["num_pool"] == 10
+    assert any("시니어" in w for w in pv["warnings"])
+
+
+def test_ward_without_g1_proceeds_when_allowed_anchored(db):
+    """앵커(참여 선택) 모드도 G1 없는 병동에서 _ward_seed 폴백으로 크래시 없이 진행."""
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    for i in range(5):
+        _mk_nurse(db, f"a{i}", "A", 2)  # 양쪽 다 G1 없음
+    for i in range(5):
+        _mk_nurse(db, f"b{i}", "B", 2)
+    db.flush()
+    pv = preview_ward_redistribution(
+        db, group_ids=["A", "B"], year=2026, month=7,
+        participant_ids=["a0", "b0"], allow_missing_g1=True,  # 앵커 모드
+    )
+    assert pv["num_pool"] == 10
+
+
 def test_explicit_mode_respects_target_bands(pool):
     db = pool
     pv = preview_ward_redistribution(
@@ -136,8 +172,8 @@ def test_preview_includes_nested_team_breakdown(pool):
     pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
     for wid, w in pv["wards"].items():
         assert "teams" in w
-        # 팀 분해 안의 전체 인원 = 병동 인원
-        flat = [m["nurse_id"] for ms in w["teams"].values() for m in ms]
+        # 버킷 = {label: {"team_id": int|None, "members": [...]}}. 전체 인원 = 병동 인원.
+        flat = [m["nurse_id"] for b in w["teams"].values() for m in b["members"]]
         assert sorted(flat) == sorted(w["nurse_ids"])
 
 
@@ -387,3 +423,141 @@ def test_preview_pool_roster_with_group_and_grade(pool):
     assert all("shift" in r and r.get("name") for r in pv["pool_roster"])
     # N전담은 풀에서 제외 → roster 에 없음
     assert "night" not in roster
+
+
+def test_team_breakdown_splits_by_defined_teams_even_when_cache_null(db):
+    """[운영 회귀 + 옵션A] 병동에 '정의된' 팀(Team) 수만큼 자동 분배된다 —
+    멤버의 캐시 team_id 가 NULL 이고 period 배정이 없어도(= 빈 번호 팀만 만들어둔 상태).
+
+    팀 관리(PUT /teams)가 period 모드면 캐시 team_id 는 NULL 이지만 Team 정의행은 생성된다.
+    캐시 distinct 를 세던 과거 코드는 운영에서 k=1('전체')로 붕괴 → Team 정의 기준으로 수정.
+    '팀 없는 병동'은 번호 팀(1,2,…)만 만들면 그 수만큼 자동 배치됨을 보장.
+    """
+    from services.ward_redistribute_service import _team_breakdown
+    from services.team_auto_assign import NurseInput
+
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    # 번호 팀 2개 정의(멤버 배정/period 없음 — '빈 팀').
+    db.add(Team(office_id="o1", group_id="A", team_id=1, team_name="1", active=1))
+    db.add(Team(office_id="o1", group_id="A", team_id=2, team_name="2", active=1))
+    ids = ["a0", "a1", "a2", "a3", "a4", "a5"]
+    for nid in ids:
+        # team_id=None → 캐시 비어 있음(운영 상태).
+        db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
+                     name=nid, active=1, team_id=None,
+                     grade=1 if nid in ("a0", "a1") else 2, is_night_nurse=[]))
+    db.flush()
+
+    by_input = {
+        nid: NurseInput(nurse_id=nid, grade=1 if nid in ("a0", "a1") else 2,
+                        preceptor_id=None, off_days=frozenset(), fb_days=frozenset())
+        for nid in ids
+    }
+    res = _team_breakdown(db, "A", ids, by_input, {nid: nid for nid in ids})
+    # 정의된 팀 2개 기준으로 갈라져야 함(붕괴 X). 라벨 = 실제 team_id, team_id 값도 실제.
+    assert set(res.keys()) == {"1", "2"}, res
+    assert res["1"]["team_id"] == 1 and res["2"]["team_id"] == 2
+    flat = sorted(m["nurse_id"] for b in res.values() for m in b["members"])
+    assert flat == sorted(ids)
+
+
+def test_team_breakdown_forced_count_provisional_when_no_teams(db):
+    """[옵션B preview] 팀 정의 0개여도 forced_count 로 가분할 — label "1".."N",
+    team_id=None(미존재). 저장 시 team_label 로 팀 생성될 버킷.
+    """
+    from services.ward_redistribute_service import _team_breakdown
+    from services.team_auto_assign import NurseInput
+
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    ids = ["a0", "a1", "a2", "a3", "a4", "a5"]
+    for nid in ids:
+        db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
+                     name=nid, active=1, team_id=None,
+                     grade=1 if nid in ("a0", "a1") else 2, is_night_nurse=[]))
+    db.flush()
+    by_input = {
+        nid: NurseInput(nurse_id=nid, grade=1 if nid in ("a0", "a1") else 2,
+                        preceptor_id=None, off_days=frozenset(), fb_days=frozenset())
+        for nid in ids
+    }
+    res = _team_breakdown(db, "A", ids, by_input, {nid: nid for nid in ids}, forced_count=2)
+    assert set(res.keys()) == {"1", "2"}, res
+    # 가분할이라 team_id 는 아직 None.
+    assert res["1"]["team_id"] is None and res["2"]["team_id"] is None
+    flat = sorted(m["nurse_id"] for b in res.values() for m in b["members"])
+    assert flat == sorted(ids)
+
+
+def test_team_breakdown_collapses_to_all_without_defined_teams(db):
+    """대조군: 정의된 팀이 없으면 '전체' 단일 폴백 — '팀 없는 병동'에선 헛동작 안 함.
+    → 옵션A: 번호 팀을 만들기 전까지는 전체 1개, 만들면 그 수만큼 분배.
+    """
+    from services.ward_redistribute_service import _team_breakdown
+    from services.team_auto_assign import NurseInput
+
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    ids = ["a0", "a1", "a2", "a3"]
+    for nid in ids:
+        db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
+                     name=nid, active=1, team_id=None, grade=2, is_night_nurse=[]))
+    db.flush()
+
+    by_input = {
+        nid: NurseInput(nurse_id=nid, grade=2, preceptor_id=None,
+                        off_days=frozenset(), fb_days=frozenset())
+        for nid in ids
+    }
+    res = _team_breakdown(db, "A", ids, by_input, {nid: nid for nid in ids})
+    assert set(res.keys()) == {"전체"}, res
+    assert res["전체"]["team_id"] is None
+
+
+def test_apply_creates_numbered_teams_and_assigns_for_month(db):
+    """[옵션B] team_label 배정 → 팀 없는 병동에 번호 팀(1,2) 생성 + 그 달 period 배정.
+    저장 한 번에 '최종 팀 생성 + 그 달 할당'. 재실행해도 team_id 가 안 늘어남(멱등).
+    """
+    from db.models import NurseTeamPeriod
+    from services.ward_redistribute_service import apply_ward_redistribution
+
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    # 팀 정의 0개 + 캐시 team_id None (= 9A 운영 상태)
+    ids = ["a0", "a1", "a2", "a3"]
+    for nid in ids:
+        db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
+                     name=nid, active=1, team_id=None, grade=2, is_night_nurse=[]))
+    db.flush()
+
+    assignments = [
+        {"nurse_id": "a0", "to_group_id": "A", "team_label": "1"},
+        {"nurse_id": "a1", "to_group_id": "A", "team_label": "1"},
+        {"nurse_id": "a2", "to_group_id": "A", "team_label": "2"},
+        {"nurse_id": "a3", "to_group_id": "A", "team_label": "2"},
+    ]
+    res = apply_ward_redistribution(
+        db, group_ids=["A"], year=2026, month=7, assignments=assignments
+    )
+
+    # 번호 팀 2개 생성
+    teams = db.query(Team).filter(Team.group_id == "A", Team.active == 1).all()
+    assert {t.team_name for t in teams} == {"1", "2"}
+    tid = {t.team_name: t.team_id for t in teams}
+    assert res["created_teams"]["A"] == tid
+    # 빈 병동이라 team_id 1,2 부터 부여
+    assert set(tid.values()) == {1, 2}
+
+    # 그 달(2026-07-01) period 에 배정
+    periods = {p.nurse_id: p for p in
+               db.query(NurseTeamPeriod).filter(NurseTeamPeriod.group_id == "A").all()}
+    assert periods["a0"].team_id == tid["1"] and periods["a2"].team_id == tid["2"]
+    assert periods["a0"].valid_from == date(2026, 7, 1)
+
+    # 멱등: 같은 저장 재실행 → 팀 수 그대로(team_id 안 늘어남)
+    apply_ward_redistribution(
+        db, group_ids=["A"], year=2026, month=7, assignments=assignments
+    )
+    teams2 = db.query(Team).filter(Team.group_id == "A", Team.active == 1).all()
+    assert {t.team_name for t in teams2} == {"1", "2"} and len(teams2) == 2

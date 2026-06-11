@@ -390,8 +390,12 @@ def create_assignment(
     req: NurseAssignmentCreate,
     db: Session,
     current_user: Optional[UserSchema] = None,
+    notify: bool = True,
 ) -> NurseAssignmentResponse:
-    """배정/상태 변경 등록"""
+    """배정/상태 변경 등록.
+
+    notify=False: 개별 알림(S06) 생략 — 벌크 호출(병동재분배)에서 끝에 요약 1건으로 묶기 위함.
+    """
     _assert_caller_owns_source(current_user, req.source_group_id, db=db)
 
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
@@ -481,26 +485,27 @@ def create_assignment(
             logger.error("FixedWantedEntry 재배치 실패(create): %s", e, exc_info=True)
             db.rollback()
 
-    # 알림 발송 (S06)
-    try:
-        from utils.utils import send_assignment_created_push
-        _recipients = _collect_assignment_recipients(
-            db, req.nurse_id, req.source_group_id, req.target_group_id
-        )
-        send_assignment_created_push(
-            nurse_name=nurse.name,
-            reason=req.reason,
-            start_date=str(req.start_date),
-            end_date=str(req.expected_end_date),
-            source_group_name=_get_group_name(db, req.source_group_id) or req.source_group_id,
-            target_group_name=_get_group_name(db, req.target_group_id),
-            recipients=_recipients,
-            office_code=req.office_id,
-            sender_emp_seq_no=req.nurse_id,
-            sender_member_id=req.nurse_id,
-        )
-    except Exception as e:
-        logger.error("배정 생성 알림 발송 실패: %s", e, exc_info=True)
+    # 알림 발송 (S06) — notify=False(벌크/재분배)면 개별 발송 생략(끝에 요약 1건).
+    if notify:
+        try:
+            from utils.utils import send_assignment_created_push
+            _recipients = _collect_assignment_recipients(
+                db, req.nurse_id, req.source_group_id, req.target_group_id
+            )
+            send_assignment_created_push(
+                nurse_name=nurse.name,
+                reason=req.reason,
+                start_date=str(req.start_date),
+                end_date=str(req.expected_end_date),
+                source_group_name=_get_group_name(db, req.source_group_id) or req.source_group_id,
+                target_group_name=_get_group_name(db, req.target_group_id),
+                recipients=_recipients,
+                office_code=req.office_id,
+                sender_emp_seq_no=req.nurse_id,
+                sender_member_id=req.nurse_id,
+            )
+        except Exception as e:
+            logger.error("배정 생성 알림 발송 실패: %s", e, exc_info=True)
 
     return _to_response(row, nurse.name)
 
