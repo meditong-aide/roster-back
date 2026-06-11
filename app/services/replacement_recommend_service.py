@@ -9,11 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from services.group_access import caller_is_head_nurse, resolve_home_group_id
+from services.group_access import assert_caller_can_access_group
 
 from db.models import (
     FixedWantedEntry,
-    Group,
     Nurse,
     NurseAssignment,
     NursePairRequest,
@@ -288,34 +287,6 @@ def _resolve_shift_semantic_with_reason(
         return WORK_SHIFT_GB_TO_MAIN.get(shift_gb, "W"), False, False, False, None
 
     return "W", False, False, False, "unresolved_shift_type"
-
-
-def _resolve_target_group(
-    db: Session,
-    current_user,
-    requested_group_id: Optional[str],
-) -> Tuple[str, str]:
-    is_head = caller_is_head_nurse(db, current_user)
-    is_admin = bool(getattr(current_user, "is_master_admin", False))
-    _home = resolve_home_group_id(db, current_user)
-    if is_head and _home:
-        target_group_id = str(_home)
-    elif is_admin:
-        if not requested_group_id:
-            raise ValueError("group_id is required for admin")
-        grp = db.query(Group).filter(Group.group_id == requested_group_id).first()
-        if not grp:
-            raise ValueError("group not found")
-        if getattr(current_user, "office_id", None) and current_user.office_id != grp.office_id:
-            raise PermissionError("group does not belong to your office")
-        target_group_id = str(grp.group_id)
-    else:
-        raise PermissionError("permission denied")
-
-    grp = db.query(Group).filter(Group.group_id == target_group_id).first()
-    if not grp:
-        raise ValueError("group not found")
-    return target_group_id, str(grp.office_id)
 
 
 def _build_schedule_map(entries: List[Any], days_in_month: int) -> Dict[str, List[str]]:
@@ -1388,25 +1359,39 @@ def _final_score(ctx: CandidateContext) -> float:
     )
 
 
-def recommend_replacement_candidates(
-    req: ReplacementRecommendRequest,
-    current_user,
-    db: Session,
-    requested_group_id: Optional[str] = None,
-) -> ReplacementRecommendResponse:
-    target_group_id, _target_office_id = _resolve_target_group(db, current_user, requested_group_id)
+def _load_schedule_for_caller(db: Session, current_user, schedule_id: str) -> Schedule:
+    """schedule_id(PK)로 스케줄을 로드하고 호출자의 그룹 접근 권한을 검증한다.
 
+    그룹 스코프의 진실은 '스케줄 행의 group_id'다(schedule_id 가 그룹을 이미 확정).
+    호출자-resolve group 을 쿼리 필터로 쓰면 HN 의 비-home 관리병동 스케줄이 home 으로
+    해석돼 "not found" 로 숨는다(긴급대체 "스케줄 없음" 버그) → 스코프는 행에서 가져오고
+    권한은 assert_caller_can_access_group 으로 별도 검증한다. roster.py 의 동명 SSOT
+    헬퍼와 같은 패턴(서비스→라우터 역의존 회피 위해 별도 구현).
+    """
     schedule = (
         db.query(Schedule)
         .filter(
-            Schedule.schedule_id == req.schedule_id,
-            Schedule.group_id == target_group_id,
+            Schedule.schedule_id == schedule_id,
             Schedule.dropped == False,
         )
         .first()
     )
     if not schedule:
         raise ValueError("schedule not found")
+    assert_caller_can_access_group(db, current_user, schedule.group_id)
+    return schedule
+
+
+def recommend_replacement_candidates(
+    req: ReplacementRecommendRequest,
+    current_user,
+    db: Session,
+    requested_group_id: Optional[str] = None,
+) -> ReplacementRecommendResponse:
+    # 그룹은 스케줄 행에서, 권한은 별도 검증(비-home 관리병동 스케줄 숨김 방지).
+    # requested_group_id 는 더 이상 그룹 스코프 결정에 쓰지 않는다(행의 group_id 가 진실).
+    schedule = _load_schedule_for_caller(db, current_user, req.schedule_id)
+    target_group_id = str(schedule.group_id)
 
     config = None
     config_id = getattr(schedule, "config_id", None)
