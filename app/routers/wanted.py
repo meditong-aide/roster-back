@@ -78,10 +78,15 @@ async def request_wanted_shifts(
     ):
         raise HTTPException(status_code=403, detail="Permission denied")
     override_gid = resolve_effective_group(db, current_user, group_id)
+    # [DEBUG] 프론트가 group_id 를 실제로 보냈는지 확정. raw=None 이면 프론트 미전송 → home 폴백.
+    print(f"[/wanted/request] raw group_id={group_id!r} -> resolved={override_gid!r} "
+          f"nurse_id={current_user.nurse_id} y={payload.year} m={payload.month}")
     try:
         result = request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
         return result
     except Exception as e:
+        import traceback as _tb
+        print(f"[/wanted/request] 500: {e}\n{_tb.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Wanted 작성 요청 실패: {str(e)}")
 
 

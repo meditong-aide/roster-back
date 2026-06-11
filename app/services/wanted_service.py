@@ -1509,7 +1509,7 @@ def request_wanted_shifts_service(
     target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
-
+    print(target_group_id, req.year, req.month)
     if db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == req.year,
@@ -1532,7 +1532,14 @@ def request_wanted_shifts_service(
     # 푸시 알림
     group_row = db.query(Group).filter(Group.group_id == target_group_id).first()
     office_id = group_row.office_id if group_row and group_row.office_id else current_user.office_id
-    nurse_ids = [row.nurse_id for row in db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()]
+    # 수신자 명단: nurses.group_id 캐시 대신 해당 월 실제 소속(group member 모듈).
+    #   → 비활성/퇴사 제외 + 전입(파견/병동이동 inbound) 포함. 전출/휴직/파견나감은 제외.
+    from services.assignment_service import group_members_in_month
+    _members = group_members_in_month(db, target_group_id, req.year, req.month)["members"]
+    nurse_ids = [
+        m["nurse_id"] for m in _members
+        if m["membership_status"] in ("active", "inbound")
+    ]
 
     send_wanted_request_push(
         year=req.year,
