@@ -589,12 +589,24 @@ def check_group_n_pool(
 
 
 def build_validation_payload(issues: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """validate_monthly_limit_row 결과를 HTTP 500 detail 페이로드로 변환."""
-    summary = (
-        issues[0]["human_message_ko"]
-        if issues
-        else "월 시프트 한도 입력에 산술적으로 불가능한 항목이 있습니다."
-    )
+    """validate_monthly_limit_row / check_group_n_pool 결과를 HTTP 422 detail 페이로드로 변환.
+
+    일괄 저장 시 여러 nurse 의 issue 가 함께 올 수 있으므로, human_message_ko 들을
+    중복 제거 후 줄바꿈으로 조합해 summary 로 노출한다(단건이면 메시지 그대로).
+    """
+    msgs: List[str] = []
+    seen_msgs: Set[str] = set()
+    for it in issues:
+        m = it.get("human_message_ko")
+        if m and m not in seen_msgs:
+            seen_msgs.add(m)
+            msgs.append(m)
+    if not msgs:
+        summary = "월 시프트 한도 입력에 산술적으로 불가능한 항목이 있습니다."
+    elif len(msgs) == 1:
+        summary = msgs[0]
+    else:
+        summary = f"{len(msgs)}건의 설정이 불가합니다:\n" + "\n".join(f"- {m}" for m in msgs)
     fix_suggestions: List[str] = []
     seen: Set[str] = set()
     for it in issues:

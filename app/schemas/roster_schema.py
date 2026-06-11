@@ -460,8 +460,10 @@ class NurseProfile(BaseModel):
     weekly_off_weekday: Optional[int] = None
     nurse_memo: Optional[str] = None
     grade: Optional[int] = None
-    # 근무자관리 get-nurse 에 year/month 가 주어질 때만 채워지는 월별 야간 정확값(nurse_monthly_limits.n_exact)
+    # 근무자관리 get-nurse 에 year/month 가 주어질 때만 채워지는 월별 야간 한도(nurse_monthly_limits)
+    # n_exact=고정(정확값), n_max=최대(상한). 행마다 한쪽만 유효(고정 우선 해석).
     n_exact: Optional[int] = None
+    n_max: Optional[int] = None
     emp_num: Optional[str] = None
     # Side-Profile 추가 컬럼
     birth_date: Optional[str] = None
@@ -676,6 +678,19 @@ class NurseMonthlyLimitBulkUpsertRequest(BaseModel):
     year: int = Field(ge=2000, le=2100)
     month: int = Field(ge=1, le=12)
     limits: List[NurseMonthlyLimitItem]
+
+
+class NightBulkApplyRequest(BaseModel):
+    """나이트 개수(월 한도) 일괄 적용 — 현재 병동/월의 야간 가능 근무자 전체에
+    하나의 값을 고정(n_exact) 또는 최대(n_max)로 일괄 반영."""
+
+    group_id: str
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+    kind: Literal["fixed", "max"] = Field(
+        description="fixed=고정(n_exact), max=최대(n_max)"
+    )
+    value: int = Field(ge=0, description="전 야간가능 근무자에 적용할 나이트 개수")
 
 
 class NurseMonthlyLimitWarning(BaseModel):
