@@ -286,7 +286,7 @@ obj += -weight × |gap - target| × pair
 
 ### 9-9. 후속 옵션
 - weight를 100~200 수준으로 올리면 더 강하게 target에 수렴(다른 soft와 트레이드오프 발생 가능).
-- 월경계 N 간격(전월 마지막 N 블록 → 당월 첫 N 블록) 미반영 — 후속 작업에서 cross-month 항 추가 검토.
+- 월경계 N 간격(전월 마지막 N 블록 → 당월 첫 N 블록) 미반영 — 후속 작업에서 cross-month 항 추가 검토. → **§13-4/5에서 양 엔진 시제품+실측: 소규모·빠듯한 N 그룹(`101358f4ef48`)은 N 커버리지 제약으로 경계 간격이 안 밀려 구조적 무효 → 코드 미적용(폐기). weight는 fallback(lex minimize)엔 무관. 대규모/N여유 그룹 재검토는 향후 과제.**
 
 ---
 
@@ -549,3 +549,53 @@ auto_assign_teams(nurses, num_teams=3, seed_ids=None,
 ### 12-7. 후속
 - explicit 모드 within-ward 팀(team_id)까지 apply에 반영(현재 transfer의 target_team_id로만 동반).
 - 발효 후 대량 transfer 운영 가이드(롤백·알림 묶음).
+
+---
+
+## 13. N tail(전월 경계) 회복 정합(NOD 해결, 적용) + N블록 간격 cross-month(검토·미적용) (2026-06-11)
+
+### 13-1. 배경 (버그)
+전월 N tail 회복(2N→2OFF=하드락 ⑤, 3N→2OFF=하드락 ④)의 **partial 분기**(`_rem==1`, 전월에 회복 OFF를 이미 1개 소비한 경우 = `offs_after==1`)가 남은 1개 OFF를
+`countable_off(T0) + countable_off(T0+1) >= 1`("월초 2일 중 아무 1일 OFF")로만 요구하고 `OnlyEnforceIf([end_prev_block])`로 게이트했다.
+→ 솔버가 OFF를 **T0+1**에 주고 **T0(월초 첫날)에 근무(D)를 자유 배정** → 전월 마지막 OFF와 **연속이 깨져** 회복 위반 + N tail **NOD**(`N N O | D`) 발생. `end_prev_block`(=T0≠N) 게이트는 T0=N 탈출까지 허용.
+
+실증: group `101358f4ef48` 2026-07, 박지은(383440) 6월 tail `… N N O`(cons_n=2, offs_after=1) → 7월 `D …` = 경계 `N N O | D D`.
+
+### 13-2. 변경 — 회복 partial을 "경계 직후일 OFF 강제"로 정정
+
+| 파일 | 변경 |
+|---|---|
+| `app/services/cp_sat_basic.py` (`:4276` 3N partial, `:4428` 2N partial) | expr `off(T0)+off(T0+1) >= 1` → **`off(T0) >= 1`**(경계 직후일 강제). `OnlyEnforceIf`에서 **`end_prev_block` 제거**(MUS용 `_co_lit`만 유지). |
+| `app/services/cp_sat/fallback_lex.py` (3N·2N partial) | 동일 수정 — **기본 엔진(`SKIP_PRIMARY=1`)이 fallback_lex이므로 이 쪽이 실효 경로.** primary/fallback parity 유지. |
+
+- 원리: `_rem==1` ⟺ `offs_after==1` ⟺ 전월 마지막날이 이미 OFF(=T0 직전 인접). 남은 회복 OFF는 **반드시 T0**여야 `전월OFF + T0OFF` = 연속 2OFF가 성립.
+- **`==2`(rem≥2, offs_after==0) 분기는 무변경** — 양일 OFF(`== 2`) 강제가 이미 정확하고, `end_prev_block` 게이트도 타당(T0=N이면 3N 블록으로 넘어감).
+- 하드락 정책 준수: 소프트화·플래그 종속 아님, **하드 제약을 정확히 강화**.
+
+### 13-3. 검증
+- group `101358f4ef48` 2026-07 재생성(v12·v13 동일): 박지은 경계 **`N N O O`**(연속 2OFF) → 하드락 ⑤ 충족, NOD 해소. `cp_sat_simple_test` 위반 0.
+- ★부수효과(불가피): 박지은이 7/1 OFF로 빠지며 **7/1 D 커버리지 1 감소**. 실측상 7/1 D 가능자 = 유은혜 1명뿐(박지은=회복OFF, 한수아=N→D금지, 김원아·표유진·김민진=E→D금지[6/30=E, **issued 기준**], 장세현=N전담) → **D2 물리적 불가 = 하드락 준수의 불가피한 비용**(v6의 D2는 박지은 7/1=D=회복위반으로 메웠던 것). 솔버 동작 정상, 추가 코드수정 불필요. 운영 선택지: 7/1 D요구 2→1 하향 / 인력 재배치 / 수용.
+- 함정 메모: inbound 간호사의 전월 tail은 source 병동의 **마감(issued, `status='issued'`) 근무표** 기준(`_query_prev_month_schedule_id`, `roster_create_service.py:1655`·inbound `:1969`). 최신 draft가 아님.
+
+### 13-4. N블록 간격 cross-month 항 (§9-4/§9-9 후속) — 검토·실측 후 **미적용(폐기)**
+§9의 "월경계 미반영 — 후속 작업 후보"를 시제품으로 구현(primary `objective_terms.py` + fallback `fallback_lex.py` n2n lex pass: 전월 N tail seed로 가상 block_end `pe=T0-1-offs_after` 산출 → 당월 첫 N까지 gap<target이면 soft 벌점)해 §13-5에서 실측 → **이 그룹엔 구조적 무효** + 타 그룹 실효 미검증 → **코드 폐기**(미커밋 변경 `git restore`). 회복(§13-2, 커밋 a60addd)은 무관하게 유지.
+
+설계·실측 지식(향후 재검토용으로 보존):
+- ★**weight 적용 범위**: `n_to_n_interval_penalty_weight`(기본 **300**, cp_sat_basic.py:614 — docs §9-2 "50"은 드리프트)는 **primary 목적함수에만** 곱해짐. **fallback n2n은 weightless lex minimize**(`m2.Minimize(sum((target-gap)*pair))`)라 weight 무관 → weight 튜닝은 기본 엔진(fallback) 출력에 영향 0. 게다가 **기본 엔진=fallback(`SKIP_PRIMARY=1`)** 이라 primary n2n 항 자체가 dormant.
+- prepend 미구현 → 전월 day는 X변수 없음(seed 상수로만 표현 가능).
+
+### 13-5. 실측 평가 (group `101358f4ef48` 2026-07) — 이 그룹은 구조적으로 효과 無
+cross-month 항을 양 엔진에 넣고 fallback 재생성해 경계 N 간격(전월 마지막 N→당월 첫 N) 이동 여부를 실측. **세 가지 시도 모두 경계 placement 불변:**
+
+| 시도 | 결과 |
+|---|---|
+| weight 50→300 | fallback weightless라 무효(primary는 dormant) |
+| cross-month 항 추가 | 박지은 첫N=7/5(gap6)·표유진 첫N=7/3(gap6) **불변**, n2n deficit 29→35(항만 추가) |
+| n2n lex N-range freeze +2 | N range 5 유지(여유 미사용), 경계 **불변** |
+
+- binding 제약은 N-range freeze가 아니라 **N 커버리지**(1 N/day, N가능 5~6명, N전담1) — 월초 N 슬롯을 메우려면 일부 간호사가 N을 일찍 할 수밖에 없음. docs §9-8("짧은 gap은 N상한+야간몰아넣기로 구조적")과 일치.
+- 결론: **소규모·빠듯한 N 그룹에선 경계 간격을 못 늘림(구조적).** → cross-month 항 **미적용(폐기)** — 효과 미검증이라 코드 미보존, §13-4/5의 설계·실측만 지식으로 남김. 박지은 NN OO 회복(§13-2, 커밋)은 정상 유지. (대규모/N여유 그룹 재검토는 향후 과제.)
+
+### 13-6. day0 경계 커버리지 미달(불가피)의 운영 처리
+- 7/1 D 미달(필요2·확보1)은 §13-3대로 하드락(회복+ED/ND+N전담) 준수의 불가피한 산술 결과(D 가능자=유은혜 1명).
+- **처리: 7/1 일별 D 요구를 2→1 하향** = `daily_shift` 일별 정원 설정(`daily_shift_requirements_by_day`, roster_create_service.py:742) 조정 = **운영 데이터**(솔버 코드 아님). 코드 자동완화는 실제 부족까지 가릴 위험으로 비채택.
