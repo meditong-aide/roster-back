@@ -958,6 +958,27 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         Nurse.group_id == target_group_id
     ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
 
+    # 병동이동(전입) 간호사 포함: 이 schedule의 ScheduleEntry에는 있으나 현재 group 멤버가
+    # 아닌 간호사(이동 발효 전 nurses.group_id 미반영 등)를 추가한다. 근무표 조회 화면
+    # (get_roster_by_schedule_id)과 동일한 union 기준으로, 화면엔 보이나 엑셀에서 누락되던
+    # 이동 근무자를 동일하게 노출한다.
+    _home_nurse_ids = {n.nurse_id for n in nurses}
+    _entry_nurse_ids = {
+        row.nurse_id
+        for row in db.query(ScheduleEntry.nurse_id)
+        .filter(ScheduleEntry.schedule_id == schedule_id)
+        .distinct()
+        .all()
+    }
+    _inbound_ids = _entry_nurse_ids - _home_nurse_ids
+    if _inbound_ids:
+        inbound_nurses = db.query(
+            Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role
+        ).filter(
+            Nurse.nurse_id.in_(_inbound_ids)
+        ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
+        nurses = list(nurses) + list(inbound_nurses)
+
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
 
     # alias_map 생성
