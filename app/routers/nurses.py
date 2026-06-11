@@ -39,6 +39,7 @@ from schemas.roster_schema import (
     NurseAssignmentListResponse,
     NurseMonthlyLimitBulkUpsertRequest,
     NurseMonthlyLimitListResponse,
+    NightBulkApplyRequest,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -76,6 +77,7 @@ from services.nurse_service import (
 from services.nurse_monthly_limit_service import (
     list_nurse_monthly_limits_service,
     upsert_nurse_monthly_limits_service,
+    night_bulk_apply_service,
 )
 from services.group_access import resolve_home_group_id, resolve_effective_group, caller_is_head_nurse, resolve_managed_group_ids
 from services.excel_service import (
@@ -223,6 +225,26 @@ async def put_monthly_limits(
         limits=[x.model_dump() for x in body.limits],
     )
     _items, _meta, _warnings = items
+    return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
+
+
+@router.post("/monthly-limits/night-bulk", response_model=NurseMonthlyLimitListResponse)
+async def night_bulk_apply(
+    body: NightBulkApplyRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """나이트 개수 일괄 적용: 현재 병동/월의 야간 가능 근무자 전체에 하나의 값을
+    고정(n_exact) 또는 최대(n_max)로 일괄 반영. 검증 실패 시 422 + 조합 _ko 메시지."""
+    _items, _meta, _warnings = night_bulk_apply_service(
+        db=db,
+        current_user=current_user,
+        group_id=body.group_id,
+        year=body.year,
+        month=body.month,
+        kind=body.kind,
+        value=body.value,
+    )
     return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
 
 

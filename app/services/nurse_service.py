@@ -384,7 +384,7 @@ def attach_n_exact_to_nurses(
     year: Optional[int],
     month: Optional[int],
 ) -> list:
-    """근무자관리 get-nurse 응답에 월별 n_exact(야간 정확값)를 주입한다.
+    """근무자관리 get-nurse 응답에 월별 야간 한도(n_exact=고정, n_max=최대)를 주입한다.
 
     - year/month 가 주어진 경우에만 동작(없으면 그대로 반환).
     - nurse_monthly_limits 를 (nurse_id, year, month) 로 조회해 각 간호사 dict 에
@@ -402,6 +402,7 @@ def attach_n_exact_to_nurses(
             NurseMonthlyLimit.nurse_id,
             NurseMonthlyLimit.group_id,
             NurseMonthlyLimit.n_exact,
+            NurseMonthlyLimit.n_max,
         )
         .filter(
             NurseMonthlyLimit.year == int(year),
@@ -411,10 +412,14 @@ def attach_n_exact_to_nurses(
         .all()
     )
     exact_map: dict = {}
-    any_map: dict = {}
-    for nid, gid, n_exact in rows:
+    any_exact_map: dict = {}
+    max_map: dict = {}
+    any_max_map: dict = {}
+    for nid, gid, n_exact, n_max in rows:
         exact_map[(nid, gid)] = n_exact
-        any_map.setdefault(nid, n_exact)
+        any_exact_map.setdefault(nid, n_exact)
+        max_map[(nid, gid)] = n_max
+        any_max_map.setdefault(nid, n_max)
     for n in nurses:
         if not isinstance(n, dict):
             continue
@@ -422,8 +427,10 @@ def attach_n_exact_to_nurses(
         gid = n.get("group_id")
         if (nid, gid) in exact_map:
             n["n_exact"] = exact_map[(nid, gid)]
-        elif nid in any_map:
-            n["n_exact"] = any_map[nid]
+            n["n_max"] = max_map[(nid, gid)]
+        elif nid in any_exact_map:
+            n["n_exact"] = any_exact_map[nid]
+            n["n_max"] = any_max_map.get(nid)
     return nurses
 
 

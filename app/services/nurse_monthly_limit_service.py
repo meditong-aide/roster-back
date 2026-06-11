@@ -53,17 +53,20 @@ def _group_active_capacity_days(
     year: int,
     month: int,
     inbound: bool,
+    assignments: Optional[List[NurseAssignment]] = None,
 ) -> int:
     month_start = date(year, month, 1)
     days_in_month = monthrange(year, month)[1]
-    assignments = (
-        db.query(NurseAssignment)
-        .filter(
-            NurseAssignment.nurse_id == nurse_id,
-            NurseAssignment.status != "cancelled",
+    # assignments 가 주어지면(배치 prefetch) 재조회하지 않는다(N+1 제거).
+    if assignments is None:
+        assignments = (
+            db.query(NurseAssignment)
+            .filter(
+                NurseAssignment.nurse_id == nurse_id,
+                NurseAssignment.status != "cancelled",
+            )
+            .all()
         )
-        .all()
-    )
     blocked = build_blocked_days(
         assignments=assignments,
         nurse_db_id=str(nurse_id),
@@ -237,6 +240,14 @@ def upsert_nurse_monthly_limits_service(
     seen_scopes = set()
     _managed_cache: Optional[set] = None
     for raw in limits:
+        # [야간 고정/최대 상호배타] 한 행에 n_exact·n_max 동시 입력 금지.
+        # (프론트에서 원천 차단하지만, normalize 가 exact→max 동기화로 n_max 를 덮어써
+        #  조용히 손실되므로 방어적으로 명시 차단한다.)
+        if raw.get("n_exact") is not None and raw.get("n_max") is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="야간 개수는 '고정'(n_exact) 또는 '최대'(n_max) 중 하나만 입력할 수 있습니다.",
+            )
         row = _normalize_row(raw)
         if int(row.get("year")) != year or int(row.get("month")) != month:
             raise HTTPException(status_code=400, detail="요청 year/month와 항목 year/month가 일치해야 합니다.")
@@ -270,6 +281,43 @@ def upsert_nurse_monthly_limits_service(
     for r in normalized:
         by_nurse.setdefault(str(r["nurse_id"]), []).append(r)
 
+    # ── 배치 prefetch (N+1 제거) — 간호사/기존한도/배정을 한 번에 조회 ──
+    #   일괄 저장(수십 명) 시 간호사별 개별 쿼리가 누적돼 느려지던 문제 해소.
+    _nurse_ids = list(by_nurse.keys())
+    pf_ids = set(_nurse_ids)
+    pf_nurses: Dict[str, Nurse] = {
+        str(n.nurse_id): n
+        for n in db.query(Nurse).filter(Nurse.nurse_id.in_(_nurse_ids)).all()
+    }
+    _existing_all = (
+        db.query(NurseMonthlyLimit)
+        .filter(
+            NurseMonthlyLimit.nurse_id.in_(_nurse_ids),
+            NurseMonthlyLimit.year == year,
+            NurseMonthlyLimit.month == month,
+        )
+        .all()
+    )
+    pf_existing_by_nurse: Dict[str, List[NurseMonthlyLimit]] = {}
+    pf_rec_map: Dict[Tuple[str, str], NurseMonthlyLimit] = {}
+    for _e in _existing_all:
+        pf_existing_by_nurse.setdefault(str(_e.nurse_id), []).append(_e)
+        pf_rec_map[(str(_e.nurse_id), str(_e.group_id))] = _e
+    pf_assignments: Dict[str, List[NurseAssignment]] = {}
+    for _a in (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id.in_(_nurse_ids),
+            NurseAssignment.status != "cancelled",
+        )
+        .all()
+    ):
+        pf_assignments.setdefault(str(_a.nurse_id), []).append(_a)
+
+    def _cap_assignments(nid: str) -> Optional[List[NurseAssignment]]:
+        # prefetch 대상이면 캐시(없으면 빈 리스트=배정 없음), 아니면 None→개별 조회 폴백.
+        return pf_assignments.get(nid, []) if nid in pf_ids else None
+
     issues_all: List[Dict[str, Any]] = []
     # soft 경고(저장은 허용, 프론트 토스트로 안내). 하드 차단 issues_all 과 분리.
     soft_warnings: List[Dict[str, Any]] = []
@@ -284,20 +332,12 @@ def upsert_nurse_monthly_limits_service(
         })
 
     for nurse_id, rows in by_nurse.items():
-        nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+        nurse = pf_nurses.get(str(nurse_id))
         if nurse is None:
             raise HTTPException(status_code=404, detail=f"간호사를 찾을 수 없습니다: {nurse_id}")
 
         # combine with existing other-group rows not included in this request
-        existing = (
-            db.query(NurseMonthlyLimit)
-            .filter(
-                NurseMonthlyLimit.nurse_id == nurse_id,
-                NurseMonthlyLimit.year == year,
-                NurseMonthlyLimit.month == month,
-            )
-            .all()
-        )
+        existing = pf_existing_by_nurse.get(str(nurse_id), [])
         req_keys = {(str(r["group_id"])) for r in rows}
         merged_rows = [dict(
             nurse_id=e.nurse_id,
@@ -323,6 +363,7 @@ def upsert_nurse_monthly_limits_service(
                 year=year,
                 month=month,
                 inbound=inbound,
+                assignments=_cap_assignments(str(nurse_id)),
             )
             total_active_est += cap_days
 
@@ -454,6 +495,7 @@ def upsert_nurse_monthly_limits_service(
                 inbound = False
                 cap = _group_active_capacity_days(
                     db, nurse_id=nid, group_id=gid, year=year, month=month, inbound=inbound,
+                    assignments=_cap_assignments(nid),
                 )
 
                 if n_exact is not None:
@@ -491,16 +533,7 @@ def upsert_nurse_monthly_limits_service(
 
     # upsert/delete
     for row in normalized:
-        rec = (
-            db.query(NurseMonthlyLimit)
-            .filter(
-                NurseMonthlyLimit.nurse_id == row["nurse_id"],
-                NurseMonthlyLimit.group_id == row["group_id"],
-                NurseMonthlyLimit.year == year,
-                NurseMonthlyLimit.month == month,
-            )
-            .first()
-        )
+        rec = pf_rec_map.get((str(row["nurse_id"]), str(row["group_id"])))
         payload = {
             "d_min": row.get("d_min"), "d_max": row.get("d_max"), "d_exact": row.get("d_exact"),
             "e_min": row.get("e_min"), "e_max": row.get("e_max"), "e_exact": row.get("e_exact"),
@@ -544,6 +577,55 @@ def upsert_nurse_monthly_limits_service(
             merged.append(NurseMonthlyLimitWarning(code=sw["code"], message=sw["message"]))
         warnings = merged
     return items, meta, warnings
+
+
+def night_bulk_apply_service(
+    db: Session,
+    current_user: UserSchema,
+    *,
+    group_id: str,
+    year: int,
+    month: int,
+    kind: str,
+    value: int,
+) -> Tuple[List[NurseMonthlyLimitItem], Optional[NurseMonthlyLimitMeta], List[NurseMonthlyLimitWarning]]:
+    """현재 병동(group_id)·현재월(year/month)의 야간 가능 active 근무자 '전체'에
+    동일한 나이트 한도를 일괄 적용한다(kind=fixed→n_exact 고정, max→n_max 최대).
+
+    검증(필드별)·조합 에러(_ko)·upsert 는 upsert_nurse_monthly_limits_service 를
+    그대로 재사용한다(단일 진실원천). 여기서는 명단 resolve + 균일 limits 조립만 한다.
+    나이트 개수는 N 가능자에게만 의미가 있으므로 check_group_n_pool 과 동일 기준으로
+    N 가능 근무자만 대상으로 한다.
+    """
+    from services.precheck.monthly_limit_validator import _allowed_work_shifts
+
+    field = "n_exact" if kind == "fixed" else "n_max"
+
+    nurses = (
+        db.query(Nurse)
+        .filter(Nurse.group_id == group_id, Nurse.active == 1)
+        .all()
+    )
+    n_capable = [
+        nu for nu in nurses
+        if "N" in (_allowed_work_shifts(nu) or {"D", "E", "N"})
+    ]
+    if not n_capable:
+        raise HTTPException(
+            status_code=400, detail="해당 병동에 야간 가능 근무자가 없습니다."
+        )
+
+    limits = [
+        {
+            "nurse_id": str(nu.nurse_id),
+            "group_id": group_id,
+            "year": year,
+            "month": month,
+            field: value,
+        }
+        for nu in n_capable
+    ]
+    return upsert_nurse_monthly_limits_service(db, current_user, year, month, limits)
 
 
 def fetch_effective_monthly_limits_by_nurse(
