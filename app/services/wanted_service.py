@@ -1509,7 +1509,6 @@ def request_wanted_shifts_service(
     target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
-    print(target_group_id, req.year, req.month)
     if db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == req.year,
