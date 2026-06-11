@@ -1996,7 +1996,8 @@ def optimize_fallback_lex_hard_first(
                             else:
                                 m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
-                            _co_3n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1)
+                            # _3n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
+                            _co_3n_expr_fb = (X(n, T0, off_idx) >= 1)
                             if _assume_registry_fb is not None:
                                 _co_lit_fb = _assume_registry_fb.create_literal(
                                     f"CarryoverRecovery3N2OFFPartial:nurse_{n}:day_{T0}",
@@ -2013,9 +2014,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([_co_lit_fb])
                             else:
-                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
+                                m.Add(_co_3n_expr_fb)
                     print(f"{logger_prefix} [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
                 elif n_tail >= 3 and _3n_rem == 0:
@@ -2134,8 +2135,8 @@ def optimize_fallback_lex_hard_first(
                             else:
                                 m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
-                            # _2n_rem == 1: 1개만 추가 필요
-                            _co_2n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1)
+                            # _2n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
+                            _co_2n_expr_fb = (X(n, T0, off_idx) >= 1)
                             if _assume_registry_fb is not None:
                                 _co_lit_fb = _assume_registry_fb.create_literal(
                                     f"CarryoverRecovery2N2OFFPartial:nurse_{n}:day_{T0}",
@@ -2152,9 +2153,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([_co_lit_fb])
                             else:
-                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
+                                m.Add(_co_2n_expr_fb)
                     print(f"{logger_prefix} [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after}, rem={_2n_rem}")
                 elif n_tail >= 2 and _2n_rem == 0:
