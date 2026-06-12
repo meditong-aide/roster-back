@@ -34,3 +34,7 @@ class SessionContext:
 
     # Variable Memory (Routine step 간 파라미터 전달)
     variable_memory: dict = field(default_factory=dict)
+
+    # 프론트 현재 화면 컨텍스트 (front→back readable) — 상대적 안내·프리필터용.
+    # 예: {"current_route": "/roster_view", "month": 5}
+    ui_metadata: dict | None = None

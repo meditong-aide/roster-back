@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from agents_v2.skills.registry import register
 from agents_v2.tools import nurse_tools
 from agents_v2.tools.nurse_tools import compute_batch_changeset
+from services.team_service import list_teams_with_members
 
 
 def _extract_mutations(params: dict) -> list[dict]:
@@ -34,6 +35,59 @@ def _extract_mutations(params: dict) -> list[dict]:
     return []
 
 
+def _resolve_team_value(value: Any, teams: list[dict]) -> tuple[Any, dict | None]:
+    """team_id mutation 값을 정수 team_id 로 해석. int/숫자문자열은 그대로, 팀 이름은 매핑.
+
+    Returns (resolved_value, clarification_or_None).
+    """
+    if isinstance(value, bool) or value is None:
+        return value, None
+    if isinstance(value, int):
+        return value, None
+    if isinstance(value, str):
+        s = value.strip()
+        if s.lstrip("-").isdigit():
+            return int(s), None
+        key = s.lower()
+        matches = [t for t in teams if str(t["team_name"]).strip().lower() == key]
+        if len(matches) == 1:
+            return matches[0]["team_id"], None
+        names = [t["team_name"] for t in teams]
+        if len(matches) > 1:
+            return None, {
+                "needs_clarification": True,
+                "question": f"'{s}'에 해당하는 팀이 여러 개입니다. 어느 팀인가요?",
+                "options": names,
+            }
+        return None, {
+            "needs_clarification": True,
+            "question": f"'{s}' 팀을 찾지 못했습니다. 어느 팀인가요?",
+            "options": names,
+        }
+    return value, None
+
+
+def _ground_team_mutations(
+    db: Session, office_id: str | None, group_id: str, mutations: list[dict]
+) -> tuple[list[dict], dict | None]:
+    """team_id mutation 의 value 가 팀 이름이면 내부 DB 조회로 team_id 매핑."""
+    if not any(m.get("field") == "team_id" for m in mutations):
+        return mutations, None
+    if not office_id:
+        return mutations, None
+    teams = list_teams_with_members(db, office_id, group_id)
+    grounded: list[dict] = []
+    for m in mutations:
+        if m.get("field") != "team_id":
+            grounded.append(m)
+            continue
+        resolved, clar = _resolve_team_value(m.get("value"), teams)
+        if clar is not None:
+            return mutations, clar
+        grounded.append({"field": "team_id", "value": resolved})
+    return grounded, None
+
+
 @register("update-person-attr")
 def update_person_attr(db: Session, params: dict) -> Any:
     """Update one or more nurse attributes (transactional per nurse)."""
@@ -48,6 +102,12 @@ def update_person_attr(db: Session, params: dict) -> Any:
     mutations = _extract_mutations(params)
     if not mutations:
         return {"error": "mutations (or field+value) required"}
+
+    mutations, clar = _ground_team_mutations(
+        db, params.get("office_id"), group_id, mutations
+    )
+    if clar is not None:
+        return clar
 
     preview_only = params.get("preview_only", False)
 

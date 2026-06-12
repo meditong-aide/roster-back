@@ -16,6 +16,7 @@ from agents_v2.tools import (
     generation_tools,
     nurse_monthly_limit_tools,
 )
+from agents_v2.tools.nurse_tools import normalize_shift_codes as _normalize_shift_codes  # noqa: F401
 
 
 @register("query-schedule")
@@ -25,6 +26,13 @@ def query_schedule(db: Session, params: dict) -> Any:
     group_id = params["group_id"]
     year = params.get("year")
     month = params.get("month")
+
+    # shift_codes 정규화 + 검증 (B5). 모르는 코드는 즉시 clarification.
+    normalized_codes, clar = _normalize_shift_codes(params.get("shift_codes"))
+    if clar is not None:
+        return clar
+    if normalized_codes is not None:
+        params = {**params, "shift_codes": normalized_codes}
 
     if scope == "wanted_campaign":
         return _query_wanted_campaign(db, group_id, year, month)

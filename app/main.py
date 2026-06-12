@@ -292,4 +292,8 @@ app.include_router(agent_chat_router)
 import uvicorn
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    # PORT/RELOAD 를 env 로 덮어쓸 수 있게 (기본은 기존과 동일: 8000, reload on).
+    # 다른 포트로 동시 기동 테스트: PORT=8001 RELOAD=0 python app/main.py
+    _port = int(os.getenv("PORT", "8000"))
+    _reload = os.getenv("RELOAD", "1").lower() not in ("0", "false", "no")
+    uvicorn.run("main:app", host="0.0.0.0", port=_port, reload=_reload)

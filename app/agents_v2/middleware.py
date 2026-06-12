@@ -17,8 +17,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-
-
 from sqlalchemy.orm import Session
 
 from agents_v2.grounding.internal import (
@@ -81,6 +79,12 @@ def _safe_args_json(args: dict, max_len: int = _AUDIT_ARGS_MAX_LEN) -> str | Non
     return s
 
 
+# audit 테이블 존재 여부 프로브 캐시 (process-wide).
+# None=미확인, True/False=확인됨. 운영 MSSQL 에 agent_skill_invocation 이 아직
+# 마이그레이션 안 됐을 때 매 스킬마다 실패 INSERT 로 세션을 오염시키는 것을 막는다.
+_audit_table_present: bool | None = None
+
+
 def _write_skill_audit(
     db: Session,
     ctx: SessionContext,
@@ -90,12 +94,33 @@ def _write_skill_audit(
     error_message: str | None,
     latency_ms: float,
 ) -> None:
-    """Skill 호출 audit row insert. 실패 시 silent — skill 실행 자체에 영향 X.
+    """Skill 호출 audit row insert. 실패해도 skill 실행/세션에 절대 영향 X.
 
     의료 도메인 audit 요건 + RBAC 추적 + 디버깅용.
+
+    견고성: 실패한 INSERT 의 flush 는 SQLAlchemy 세션을 오염(PendingRollbackError)시켜
+    같은 턴의 다음 스킬 쿼리를 500 으로 만든다(운영 MSSQL 에 테이블 미마이그레이션 시 발생).
+    그래서 테이블 존재를 has_table 로 1회 프로브해서 **부재면 INSERT 자체를 회피**(영구 skip)한다.
+    INSERT 시도 자체가 없으니 세션이 오염될 일도 없다.
     """
+    global _audit_table_present
+    if _audit_table_present is False:
+        return
     try:
+        from sqlalchemy import inspect as _sa_inspect
+
         from db.models import AgentSkillInvocation
+
+        if _audit_table_present is None:
+            _audit_table_present = _sa_inspect(db.get_bind()).has_table(
+                AgentSkillInvocation.__tablename__
+            )
+            if not _audit_table_present:
+                logger.warning(
+                    "[middleware] agent_skill_invocation 테이블이 없습니다 — skill audit "
+                    "비활성화 (이후 skip). 마이그레이션(2026_05_19_add_agent_memory_tables) 적용 필요."
+                )
+                return
 
         row = AgentSkillInvocation(
             agent_run_id=ctx.conversation_id,
@@ -111,6 +136,11 @@ def _write_skill_audit(
         db.add(row)
         db.flush()
     except Exception as e:
+        # 의도적으로 db.rollback() 하지 않는다: 스킬은 자체 commit 을 하지 않으므로
+        # 이 시점에 미커밋 mutation 이 세션에 남아 있을 수 있고, 롤백하면 그 변경이
+        # 조용히 사라진다. 테이블 부재(운영의 실제 원인)는 위 has_table 프로브가 이미
+        # INSERT 자체를 막으므로 여기 도달하지 않는다. 테이블이 존재하는데도 INSERT 가
+        # 실패하는 경우(스키마 정상 가정상 드묾)는 audit 만 포기하고 로그로 남긴다.
         logger.warning("[middleware] skill audit insert failed: %s", e)
 
 
@@ -248,6 +278,13 @@ def _check_permission(
     """
     normalized = skill_name.replace("-", "_")
     is_hn = _is_head_or_admin(ctx)
+
+    # (0) client-action (navigate/prefill) — HN 전용 화면 게이팅.
+    # target 별 hn_only 여부는 client_actions 모듈(route SSOT 매핑)이 소유.
+    if normalized in ("navigate", "prefill"):
+        from agents_v2.skills.client_actions import target_permission_error
+
+        return target_permission_error(args.get("target"), ctx)
 
     # (1) 병동 전체 영향 mutation
     if normalized in {"update_constraint", "generate_schedule"} and not is_hn:

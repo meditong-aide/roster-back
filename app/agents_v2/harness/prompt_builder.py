@@ -18,15 +18,21 @@ from agents_v2.schemas.session_context import SessionContext
 _AIDE_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".aide"
 
 
-def build_system_prompt(ctx: SessionContext) -> str:
-    """Assemble the full system prompt."""
+def build_system_prompt(
+    ctx: SessionContext, allowed_tools: list[str] | None = None
+) -> str:
+    """Assemble the full system prompt.
+
+    allowed_tools: 라우터가 추출한 tool 이름 subset. 주어지면 '## 사용 가능한 도구'
+    섹션에 해당 tool 만 렌더(프롬프트 토큰 절감). None 이면 전체(기존과 동일).
+    """
     parts = [
         _build_role_section(ctx),
         _build_security_boundary_section(),
         _load_domain_knowledge(ctx),
         _load_abbreviation_dict(),
         _build_routine_definitions(),
-        _build_tool_descriptions_section(),
+        _build_tool_descriptions_section(allowed_tools),
         _build_few_shot_section(),
         _build_rules_section(ctx),
     ]
@@ -122,16 +128,21 @@ def _build_routine_definitions() -> str:
 # ── [4] Tool Descriptions ───────────────────────────────────
 
 
-def _build_tool_descriptions_section() -> str:
+def _build_tool_descriptions_section(allowed_tools: list[str] | None = None) -> str:
     """Convert tool schemas to human-readable supplementary text.
 
     Note: The actual JSON schemas are passed via the LLM API's `tools` parameter.
     This section provides additional guidance in the system prompt.
+
+    allowed_tools: 주어지면 해당 이름의 tool 설명만 렌더(라우터 스코핑). None=전체.
     """
     from agents_v2.skills.descriptions import SKILL_TOOLS
 
+    allow = set(allowed_tools) if allowed_tools is not None else None
     lines = ["## 사용 가능한 도구\n"]
     for tool in SKILL_TOOLS:
+        if allow is not None and tool["name"] not in allow:
+            continue
         lines.append(f"### {tool['name']}")
         lines.append(tool["description"])
         lines.append("")

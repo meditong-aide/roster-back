@@ -19,10 +19,14 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from agents_v2.harness.dev_query_log import log_dev_query
 from agents_v2.harness.prompt_builder import build_system_prompt
-from agents_v2.llm_client import LLMClient, LLMResponse
-from agents_v2.middleware import SkillResult, execute_skill
+from agents_v2.llm_client import LLMClient
+from agents_v2.middleware import SkillResult, _check_permission, execute_skill
+from agents_v2.router import route
 from agents_v2.schemas.session_context import SessionContext
+from agents_v2.usage import record_llm_usage
+from agents_v2.skills.client_actions import build_ui_action, is_client_action
 from agents_v2.skills.descriptions import SKILL_TOOLS
 from agents_v2.variable_memory import VariableMemory
 from services.memory.extractor import MemoryExtractor
@@ -95,6 +99,7 @@ class AgentResult:
     options: list[str] = field(default_factory=list)
     awaiting_approval: bool = False
     preview: dict | None = None
+    ui_actions: list[dict] = field(default_factory=list)
     trace: list[Stage] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
     variable_memory: dict = field(default_factory=dict)
@@ -108,6 +113,7 @@ class AgentResult:
         if self.awaiting_approval:
             d["awaiting_approval"] = True
             d["preview"] = self.preview
+        d["ui_actions"] = self.ui_actions
         d["pipeline_stages"] = [s.to_dict() for s in self.trace]
         d["total_time_ms"] = round(
             sum(s.duration_ms for s in self.trace), 1
@@ -130,6 +136,7 @@ class SchedulingAgent:
         llm_client: LLMClient,
         memory_extractor: MemoryExtractor | None = None,
         enable_user_memory: bool = True,
+        router_llm: LLMClient | None = None,
     ):
         """SchedulingAgent.
 
@@ -137,12 +144,15 @@ class SchedulingAgent:
             llm_client: 메인 turn LLM (도구 호출 + 응답 생성).
             memory_extractor: US-A4 Tier-2 fact extractor. 없으면 llm_client 재사용.
             enable_user_memory: False 면 inject/consolidate 모두 스킵 (테스트/긴급용).
+            router_llm: 2단계 tool 스코핑용 분류 LLM. None 이면 라우팅 OFF(전체 tool,
+                추가 LLM 호출 없음 — scripted 테스트 더블 시퀀스 보존). prod 에서만 주입.
         """
         self.llm = llm_client
         self.enable_user_memory = enable_user_memory
         if memory_extractor is None and enable_user_memory:
             memory_extractor = MemoryExtractor(llm_client)
         self.memory_extractor = memory_extractor
+        self.router_llm = router_llm
 
     def run(
         self,
@@ -247,12 +257,45 @@ class SchedulingAgent:
         tools = SKILL_TOOLS
         trace: list[Stage] = []
         vm = VariableMemory()
-        _prev_calls: set[str] = set()  # dedup signatures
-        _failed_shift_terms: list[str] = []  # Track failed shift names for auto-learn
+        ui_actions: list[dict] = []
+        _prev_calls: set[str] = set()
+        _failed_shift_terms: list[str] = []
 
         # Restore VM from previous turns
         if ctx.variable_memory:
             vm._store.update(ctx.variable_memory)
+
+        # ── US-R2: Router (2단계 tool 스코핑) — main path only ──
+        # 질의를 LLM이 카테고리로 분류 → scoped tool subset 으로 (a) system prompt 의
+        # '## 사용 가능한 도구' 섹션, (b) chat(tools=) 둘 다 스코핑. fallback(분류 실패/
+        # 저신뢰)이면 전체 tool 유지(턴 안 깨짐). pending_approval 턴은 tools= 를 안 쓰므로 스킵.
+        if self.router_llm is not None and not ctx.pending_approval:
+            t_route = time.time()
+            router_result = route(self.router_llm, user_message)
+            route_ms = (time.time() - t_route) * 1000
+            log_dev_query(
+                router_result.categories, user_message, ctx.conversation_id
+            )
+            if not router_result.fallback_used:
+                allowed = router_result.tool_names
+                scoped_prompt = build_system_prompt(ctx, allowed_tools=allowed)
+                if self.enable_user_memory:
+                    mb = self._format_memory_block(current_user_facts)
+                    if mb:
+                        scoped_prompt = f"{scoped_prompt}\n\n---\n\n{mb}"
+                if messages and messages[0].get("role") == "system":
+                    messages[0] = {"role": "system", "content": scoped_prompt}
+                allowed_set = set(allowed)
+                tools = [t for t in SKILL_TOOLS if t["name"] in allowed_set]
+            trace.append(
+                Stage("routing", "ok", router_result.to_dict(), route_ms)
+            )
+            record_llm_usage(
+                db, conversation_id=ctx.conversation_id, group_id=ctx.group_id,
+                user_id=ctx.nurse_id, model=router_result.model, purpose="router",
+                input_tokens=router_result.input_tokens,
+                output_tokens=router_result.output_tokens,
+            )
 
         for turn in range(self.MAX_TURNS):
             # ── LLM call ──
@@ -263,6 +306,13 @@ class SchedulingAgent:
             response = self.llm.chat(inject_messages, tools=tools)
             llm_ms = (time.time() - t0) * 1000
 
+            record_llm_usage(
+                db, conversation_id=ctx.conversation_id, group_id=ctx.group_id,
+                user_id=ctx.nurse_id, model=response.model, purpose="turn",
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+            )
+
             # ── Text response → final answer ──
             if response.is_text:
                 trace.append(
@@ -270,6 +320,7 @@ class SchedulingAgent:
                 )
                 return AgentResult(
                     answer=response.text or "",
+                    ui_actions=ui_actions,
                     trace=trace,
                     messages=messages,
                     variable_memory=vm.to_dict(),
@@ -317,6 +368,42 @@ class SchedulingAgent:
                         )
                     )
 
+                    # ── Client-action tool (navigate/prefill) — 프론트 위임, 서버 실행 X ──
+                    if is_client_action(skill_name):
+                        perm_err = _check_permission(skill_name, skill_args, ctx)
+                        ui_action = None
+                        ca_err = perm_err
+                        if not perm_err:
+                            ui_action, ca_err = build_ui_action(skill_name, skill_args)
+                        if ca_err:
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.call_id,
+                                "content": json.dumps(
+                                    {"error": ca_err, **({"permission_denied": True} if perm_err else {})},
+                                    ensure_ascii=False,
+                                ),
+                            })
+                            trace.append(Stage(
+                                "execution", "error",
+                                {"skill": skill_name, "result": {"error": ca_err}}, 0.0,
+                            ))
+                            continue
+                        ui_actions.append(ui_action)
+                        vm.store(skill_name, {"dispatched": True, "action": ui_action})
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.call_id,
+                            "content": json.dumps(
+                                {"dispatched": True, "action": ui_action}, ensure_ascii=False
+                            ),
+                        })
+                        trace.append(Stage(
+                            "execution", "ok",
+                            {"skill": skill_name, "result": {"ui_action": ui_action}}, 0.0,
+                        ))
+                        continue
+
                     # ── Execute via middleware ──
                     result = execute_skill(db, skill_name, skill_args, ctx)
 
@@ -363,6 +450,7 @@ class SchedulingAgent:
                             awaiting_approval=True,
                             preview=pending,
                             answer=apply_hint_q,
+                            ui_actions=ui_actions,
                             trace=trace,
                             messages=messages,
                             variable_memory=vm.to_dict(),
@@ -386,6 +474,7 @@ class SchedulingAgent:
                             awaiting_approval=True,
                             preview=preview_with_context,
                             answer=preview_answer,
+                            ui_actions=ui_actions,
                             trace=trace,
                             messages=messages,
                             variable_memory=vm.to_dict(),
@@ -402,6 +491,7 @@ class SchedulingAgent:
 
         return AgentResult(
             answer="처리 단계가 너무 많습니다. 좀 더 구체적으로 말씀해 주세요.",
+            ui_actions=ui_actions,
             trace=trace,
             messages=messages,
             variable_memory=vm.to_dict(),
@@ -721,6 +811,20 @@ _CONFIRM_WORDS = frozenset({
     "실행해",
     "변경해",
     "확인했어",
+    # 2026-06-01 추가: 일상 발화에서 자주 쓰는 컨펌. "그래"가 누락돼 LLM 추론에
+    # 의존했고, 일관성 낮은 처리가 발견됨(S5.B).
+    "그래",
+    "그렇게",
+    "그렇게 해",
+    "그렇게해",
+    "맞아",
+    "맞아요",
+    "맞습니다",
+    "오케이",
+    "okay",
+    "응응",
+    "yep",
+    "y",
 })
 
 
@@ -928,8 +1032,13 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
 #
 # 정책:
 #   - system message (index 0) 항상 head 에 유지
-#   - 최신 메시지 (마지막) 항상 유지 — LLM 호출이 의미를 가지려면 최소 latest user 보존
+#   - 최신 unit (마지막) 항상 유지 — LLM 호출이 의미를 가지려면 최소 latest 보존
 #   - 중간 history 는 budget 안에서 최신순으로 포함
+#   - tool-call group (assistant.tool_calls + 뒤따르는 tool 메시지들) 은 분리 불가:
+#     truncation 이 group 을 쪼개 tool 메시지를 부모 assistant 와 떼어놓으면
+#     OpenAI 가 "messages with role 'tool' must be a response to a preceding
+#     message with 'tool_calls'" 400 을 던진다. 그래서 message 단위가 아니라
+#     unit(=group) 단위로 자른다.
 
 _MAX_INJECT_CHARS = 96000  # ≈ 24k tokens
 
@@ -947,12 +1056,34 @@ def _message_size(m: dict) -> int:
     return n
 
 
+def _group_message_units(rest: list[dict]) -> list[list[dict]]:
+    """메시지 시퀀스를 truncation 원자 단위(unit)로 묶는다.
+
+    - assistant(tool_calls) + 뒤따르는 연속 tool 메시지 → 하나의 unit (분리 금지)
+    - 그 외(user, tool_calls 없는 assistant, orphan tool) → 단독 unit
+    """
+    units: list[list[dict]] = []
+    i, n = 0, len(rest)
+    while i < n:
+        m = rest[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            while j < n and rest[j].get("role") == "tool":
+                j += 1
+            units.append(rest[i:j])
+            i = j
+        else:
+            units.append([rest[i]])
+            i += 1
+    return units
+
+
 def _truncate_for_llm(
     messages: list[dict], *, max_chars: int = _MAX_INJECT_CHARS
 ) -> list[dict]:
-    """LLM injection 용 messages truncation — system + latest 필수 + 중간 history budget.
+    """LLM injection 용 messages truncation — system + latest unit 필수 + budget.
 
-    원본 messages list 는 변경하지 않음. 영구 저장 흐름과 분리.
+    tool-call group 을 쪼개지 않도록 unit 단위로 자른다. 원본 list/ dict 는 변경 안 함.
     """
     if not messages:
         return []
@@ -967,23 +1098,24 @@ def _truncate_for_llm(
     if not rest:
         return head
 
-    # 최신 메시지는 반드시 보존 (LLM 호출의 baseline)
-    latest = rest[-1]
-    older = rest[:-1]
-    must_chars = sum(_message_size(m) for m in head) + _message_size(latest)
+    budget = max_chars - sum(_message_size(m) for m in head)
+    units = _group_message_units(rest)
 
-    if must_chars >= max_chars or not older:
-        # 예산 초과해도 필수만 반환 / older 없으면 즉시 반환
-        return head + [latest]
-
-    budget = max_chars - must_chars
-    selected_reversed: list[dict] = []
+    # 최신 unit 부터 역순으로 budget 안에서 포함 (첫 unit 은 예산 초과해도 무조건 보존).
+    selected: list[list[dict]] = []
     used = 0
-    for m in reversed(older):
-        size = _message_size(m)
-        if used + size > budget:
+    for unit in reversed(units):
+        size = sum(_message_size(m) for m in unit)
+        if selected and used + size > budget:
             break
-        selected_reversed.append(m)
+        selected.append(unit)
         used += size
+    selected.reverse()
 
-    return head + list(reversed(selected_reversed)) + [latest]
+    flat = [m for unit in selected for m in unit]
+
+    # 안전장치: 손상된 history(앞단 orphan tool)가 들어와도 무효 chain 을 만들지 않음.
+    while flat and flat[0].get("role") == "tool":
+        flat.pop(0)
+
+    return head + flat

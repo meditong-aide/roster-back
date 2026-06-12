@@ -8,6 +8,10 @@ from sqlalchemy.orm import Session
 
 from agents_v2.skills.registry import register
 from agents_v2.tools import schedule_tools, wanted_tools
+from agents_v2.tools.nurse_tools import (
+    normalize_shift_codes,
+    normalize_single_shift_code,
+)
 
 
 @register("bulk-mutation")
@@ -17,6 +21,26 @@ def bulk_mutation(db: Session, params: dict) -> Any:
     mutation = params.get("mutation", {})
     action = params.get("action") or mutation.get("action", "")
     preview_only = params.get("preview_only", False)
+
+    # B4 (2026-06-01): shift_codes/new_shift_code 정규화 + 모르는 값 즉시 clarification.
+    # 기존엔 silent skip → 사용자에겐 "변경 없음" 으로 보이는 dead-end 회귀.
+    codes, clar = normalize_shift_codes(params.get("shift_codes"))
+    if clar is not None:
+        return clar
+    if codes is not None:
+        params = {**params, "shift_codes": codes}
+    new_shift, clar = normalize_single_shift_code(params.get("new_shift_code"))
+    if clar is not None:
+        return clar
+    if new_shift is not None:
+        params = {**params, "new_shift_code": new_shift}
+    # shift_name (add_shift) 도 단일 코드로 정규화 — _add_wanted_by_date 가 사용.
+    sn, clar = normalize_single_shift_code(params.get("shift_name"))
+    if clar is not None:
+        return clar
+    if sn is not None:
+        # shift_name 자리에는 정규화된 코드를 넣어 두면 _add_wanted_by_date 가 그대로 통과
+        params = {**params, "shift_name": sn}
 
     if scope == "wanted_adjustment":
         return _mutate_wanted_adjustments(db, params, mutation, preview_only)

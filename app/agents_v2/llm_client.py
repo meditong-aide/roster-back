@@ -40,6 +40,10 @@ class LLMResponse:
     text: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     thinking: str | None = None
+    # 토큰 사용량/모델 — 비용 산출(cost.py)·사용량 기록(agent_llm_usage)용. 미제공 시 0/None.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str | None = None
     _raw: Any = field(default=None, repr=False)
 
     # ── Convenience accessors (backward compat for single-call) ──
@@ -140,6 +144,10 @@ class OpenAIClient:
             max_completion_tokens=2048,
         )
         choice = response.choices[0]
+        usage = getattr(response, "usage", None)
+        in_tok = getattr(usage, "prompt_tokens", 0) or 0
+        out_tok = getattr(usage, "completion_tokens", 0) or 0
+        used_model = getattr(response, "model", None) or self.model
 
         if choice.message.tool_calls:
             calls = [
@@ -153,11 +161,17 @@ class OpenAIClient:
             return LLMResponse(
                 type="tool_call",
                 tool_calls=calls,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                model=used_model,
                 _raw=choice.message,
             )
         return LLMResponse(
             type="text",
             text=choice.message.content or "",
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            model=used_model,
             _raw=choice.message,
         )
 
@@ -247,6 +261,9 @@ class AnthropicClient:
             kwargs["tools"] = anthropic_tools
 
         response = self.client.messages.create(**kwargs)
+        usage = getattr(response, "usage", None)
+        in_tok = getattr(usage, "input_tokens", 0) or 0
+        out_tok = getattr(usage, "output_tokens", 0) or 0
 
         calls = [
             ToolCall(name=b.name, args=b.input, call_id=b.id)
@@ -254,12 +271,20 @@ class AnthropicClient:
             if b.type == "tool_use"
         ]
         if calls:
-            return LLMResponse(type="tool_call", tool_calls=calls, _raw=response)
+            return LLMResponse(
+                type="tool_call", tool_calls=calls,
+                input_tokens=in_tok, output_tokens=out_tok, model=self.model,
+                _raw=response,
+            )
 
         text = next(
             (b.text for b in response.content if b.type == "text"), ""
         )
-        return LLMResponse(type="text", text=text, _raw=response)
+        return LLMResponse(
+            type="text", text=text,
+            input_tokens=in_tok, output_tokens=out_tok, model=self.model,
+            _raw=response,
+        )
 
 
 # ── Deterministic (test) ────────────────────────────────────
@@ -453,3 +478,17 @@ def get_llm_client(provider: str = "openai") -> LLMClient:
     if provider == "anthropic":
         return AnthropicClient()
     return OpenAIClient()
+
+
+def get_router_llm_client(provider: str = "openai") -> LLMClient:
+    """라우터(질의 분류) 전용 클라이언트 — 저렴·빠른 모델.
+
+    벤치마크(2026-05-29, scripts/router_model_bench.py)상 gpt-5.4-nano 가 분기 정확도
+    100% + 최저가($0.118/1k calls, 메인 gpt-5.5 대비 ~12x↓) + 4x 빠름. 분류는 소형 모델로
+    충분하므로 메인 turn 모델과 분리. ROUTER_MODEL env 로 override 가능.
+    """
+    if provider == "deterministic":
+        return DeterministicClient()
+    if provider == "anthropic":
+        return AnthropicClient()
+    return OpenAIClient(model=os.getenv("ROUTER_MODEL", "gpt-5.4-nano"))

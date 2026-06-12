@@ -29,6 +29,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.compiler import compiles as sa_compiles
 from sqlalchemy.dialects.mysql import TINYINT
+from sqlalchemy.pool import StaticPool
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,14 @@ def _get_test_db() -> Session:
     global _test_engine, _test_session_factory
     if _test_engine is None:
         _ensure_sqlite_compat()
-        _test_engine = create_engine("sqlite:///:memory:")
+        # StaticPool + check_same_thread=False: 단일 공유 in-memory DB.
+        # 기본 SingletonThreadPool 은 스레드마다 별도 :memory: DB 라 FastAPI 워커
+        # 스레드가 바뀌면 setup-db 가 시드한 테이블이 안 보임("no such table"). conftest 와 동일 패턴.
+        _test_engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
 
         @event.listens_for(_test_engine, "connect")
         def _pragma(dbapi_conn, rec):
@@ -345,9 +353,15 @@ def _run_v3(db, req: TestChatRequest) -> dict:
         variable_memory=conv.variable_memory,
     )
 
-    # Agent
+    # Agent — router_llm 주입으로 2단계 tool 스코핑 ON. 라우터는 저렴 전용 모델(gpt-5.4-nano).
+    # deterministic provider 는 text 분류를 못 내므로 라우터 OFF(불필요한 호출/trace 오염 방지).
+    from agents_v2.llm_client import get_router_llm_client
     client = get_llm_client(req.llm_provider)
-    agent = SchedulingAgent(client)
+    router_llm = (
+        get_router_llm_client(req.llm_provider)
+        if req.llm_provider != "deterministic" else None
+    )
+    agent = SchedulingAgent(client, router_llm=router_llm)
     result = agent.run(db, req.message, ctx)
 
     # Persist conversation state

@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from agents_v2.agent_v3 import SchedulingAgent
 from agents_v2.conversation import ConversationStore
-from agents_v2.llm_client import get_llm_client
+from agents_v2.llm_client import get_llm_client, get_router_llm_client
 from agents_v2.schemas.session_context import SessionContext
 from db.client2 import get_db
 from routers.auth import get_current_user_from_cookie
@@ -48,7 +48,11 @@ def _get_store() -> ConversationStore:
 def _get_agent() -> SchedulingAgent:
     global _agent
     if _agent is None:
-        _agent = SchedulingAgent(get_llm_client())
+        # router_llm 주입 → 2단계 tool 스코핑 ON (prod). 라우터는 저렴·빠른 전용 모델
+        # (gpt-5.4-nano, 벤치 100% 정확도/최저가). 메인 turn 은 gpt-5.5.
+        _agent = SchedulingAgent(
+            get_llm_client(), router_llm=get_router_llm_client()
+        )
     return _agent
 
 
@@ -84,6 +88,8 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     year: Optional[int] = None
     month: Optional[int] = None
+    # 프론트 현재 화면 컨텍스트 (예: {"current_route": "/roster_view", "month": 5})
+    ui_metadata: Optional[dict] = None
 
 
 class ChatResponse(BaseModel):
@@ -91,6 +97,10 @@ class ChatResponse(BaseModel):
     conversation_id: str
     awaiting_approval: bool = False
     preview: Optional[dict] = None
+    # client-action(navigate/prefill) — 프론트가 실행할 UI 의도. 없으면 빈 리스트.
+    ui_actions: list[dict] = []
+    # 답형 조회결과 (인라인 렌더용). 현재 미사용 — 후속 단계에서 채움.
+    data: Optional[dict] = None
 
 
 class WhoAmIResponse(BaseModel):
@@ -159,6 +169,7 @@ async def send_message(
     ctx.messages = conv.messages
     ctx.variable_memory = conv.variable_memory or {}
     ctx.pending_approval = conv.pending_approval
+    ctx.ui_metadata = req.ui_metadata
 
     # Agent run
     try:
@@ -198,6 +209,7 @@ async def send_message(
         conversation_id=conv_id,
         awaiting_approval=bool(result.awaiting_approval),
         preview=result.preview if result.awaiting_approval else None,
+        ui_actions=result.ui_actions,
     )
 
 

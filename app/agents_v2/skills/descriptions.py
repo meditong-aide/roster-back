@@ -47,7 +47,13 @@ SKILL_TOOLS: list[dict] = [
             "    사용자 발화('순수 신청만' / '조정 후 모습' / '전체')에 맞춰 자연어로 분기 응답.\n"
             "    필요 시 `source_types` 파라미터로 사전 필터링도 가능.\n"
             "- `schedule` — 생성·확정된 **근무표 셀**(누가 언제 무슨 근무인지). "
+            "  **특정 간호사·날짜·시프트 등 조건이 있는** 근무표 조회에 사용. "
             "  '4/15 데이 누가야', '김민지 4월 근무', '이번 달 나이트 명단'.\n"
+            # [NAV_FIRST 2026-05-29] 조건 없는 '전체 근무표 보여줘/열어줘/보러가자'(화면 이동 의도)는
+            #   navigate(roster_view) 로 위임. 원복(백엔드 단독 복귀): 이 주석 + 바로 아래 ⛔ 한 줄을
+            #   제거하고, NAV_FIRST 마커가 달린 다른 구간(예시 line~95, validate line~339,
+            #   navigate desc line~1024/1031/1038/1049)도 함께 되돌리면 query_schedule 이 '보여줘'를 재전담.
+            "  ⛔ 조건이 전혀 없는 '전체 근무표 보여줘/열어줘'는 화면 이동 의도 → navigate(roster_view) 사용.\n"
             "- `nurse_info` — **간호사 인사 정보**(이름·등급·팀·직급·야간전담·고정근무·메모 등). "
             "  '김민지 정보', '신규 간호사 누구', '팀 구성', '프리셉터 매칭'.\n"
             "- `shift_definitions` — 병동의 **시프트 정의**(D/E/N/O/M, 한글명, 카테고리). "
@@ -94,6 +100,8 @@ SKILL_TOOLS: list[dict] = [
             "nurse_name='김민지', date_range='2026-04-01~2026-04-07'\n"
             "- '김민지 4월 근무 보여줘' → scope=schedule, nurse_name='김민지'\n"
             "- '4/15 나이트 누구야' → scope=schedule, date='2026-04-15', shift_name='나이트'\n"
+            # [NAV_FIRST 2026-05-29] 조건 없는 전체 근무표 보기는 query_schedule 이 아니라 navigate.
+            "- '5월 근무표 보여줘'(특정 간호사/날짜 없음) → navigate(target=roster_view) (query_schedule 아님)\n"
             "- '신규 간호사 누구야' → scope=nurse_info (등급 분포 먼저 확인)\n"
             "- '현재 제약 설정' → scope=constraint_config\n"
             "- '자동생성 어디까지 됐어' → scope=generation_job\n"
@@ -336,7 +344,9 @@ SKILL_TOOLS: list[dict] = [
             "─────────── 인접 스킬과의 경계 ───────────\n"
             "- '왜 이 위반이 생겼는지·어떻게 고칠지' → validate 결과를 바탕으로 repair_schedule\n"
             "- '시프트별 분포·공정성 통계가 보고 싶다' → analyze_report (위반 여부 아님)\n"
-            "- '단순히 근무표 셀이 보고 싶다' → query_schedule(scope='schedule')\n\n"
+            # [NAV_FIRST 2026-05-29] 원복 시 아래를 "- '단순히 근무표 셀이 보고 싶다' → query_schedule(scope='schedule')" 로 되돌릴 것.
+            "- '특정 간호사·날짜의 근무 셀이 보고 싶다' → query_schedule(scope='schedule'); "
+            "'전체 근무표 화면을 열어보고 싶다' → navigate(roster_view)\n\n"
 
             "예시:\n"
             "- '4월 근무표 위반사항 뭐야' → year=2026, month=4\n"
@@ -561,7 +571,11 @@ SKILL_TOOLS: list[dict] = [
             "DB 필드명을 `field`에, 정규화 값을 `value`에 넣으세요. "
             "bool 필드의 '켜줘/허용/적용' → true, '꺼줘/금지/해제' → false. "
             "필드명이 모호한 표현('야간 최대'='max_nig_per_month' vs '야간 필요인원'='nig_req')은 "
-            "사용자에게 의미를 한 번 더 확인.\n\n"
+            "사용자에게 의미를 한 번 더 확인.\n"
+            "⚠️ **혼합 발화 처리(B3 후속, 2026-06-01)**: 사용자가 한 메시지에서 "
+            "'어떻게 설정하는지 모르겠어' (meta) + '11개로 해줘봐' (요청) 처럼 두 절을 "
+            "함께 보낼 때, **요청 절('해줘'/'바꿔')에 우선순위를 두고 바로 update_constraint 호출**. "
+            "'수정 도구가 연결돼 있지 않습니다' 같은 false claim 금지 — 이 스킬이 바로 수정 도구.\n\n"
 
             "─────────── 예시 ───────────\n"
             "- '야간 최대 7회로' → field='max_nig_per_month', value=7\n"
@@ -627,12 +641,14 @@ SKILL_TOOLS: list[dict] = [
             "- 직급/등급/grade → grade (정수)\n"
             "- 경력/연차 → experience (정수)\n"
             "- 직책/역할/role → role (예: 'RN', 'AN')\n"
-            "- 팀/팀이동/팀변경 → team_id (정수)\n"
+            "- 팀/팀이동/팀변경 → team_id (정수 ID 또는 팀 이름 문자열; 스킬이 내부 매핑)\n"
             "- 병동/병동이동 → group_id (문자열)\n"
             "- 수간호사/HN 지정 → is_head_nurse (true/false)\n"
             "- 야간 전담/데이 전담/N전담/시프트 전담 → is_night_nurse (시프트 코드 리스트)\n"
             "- 프리셉터 지정/멘토 지정 → preceptor_id (간호사 ID)\n"
-            "- 데이 고정근무/N 고정근무 (평일만, 주말 휴무) → fixed_shift ('D'/'E'/'N'/'M'/'O', 해제는 '')\n"
+            "- 데이 고정근무/N 고정근무 (평일만, 주말 휴무) → fixed_shift "
+            "(코드 'D'/'E'/'N'/'M'/'O' 또는 한글 '데이'/'이브닝'/'나이트'/'미드'/'오프'; "
+            "스킬이 내부 매핑. 해제는 '')\n"
             "- 주말 오프 → is_weekend_off (true/false)\n"
             "- 메모/비고 → nurse_memo (문자열)\n"
             "- 원티드 최대 횟수 → wanted_max_requests (정수)\n"
@@ -648,7 +664,12 @@ SKILL_TOOLS: list[dict] = [
             "⚠️ team_id 변경 시: 프리셉터-프리셉티는 같은 팀이어야 합니다. "
             "이 도구가 자동으로 검사하며, 매칭이 깨지면 needs_clarification=true 응답을 반환합니다. "
             "이 경우 사용자에게 (1) 프리셉터/프리셉티 관계 해제, (2) 함께 이동, (3) 취소 중 선택을 요청하세요. "
-            "임의로 진행하지 말 것.\n\n"
+            "임의로 진행하지 말 것.\n"
+            "✅ **사용자 선택 후 묶음 confirm 원칙(B3, 2026-06-01)**: 옵션 1/2 모두 두 간호사를 동시에 수정해야 하므로 "
+            "(옵션 1=프리셉터 해제 + 본인 팀 이동 / 옵션 2=본인 팀 이동 + 짝꿍 팀 이동) "
+            "**두 update_person_attr 호출의 preview 를 한 turn 안에 함께 제시**하고 사용자에게 **한 번의 confirm** 만 요청. "
+            "예: '김예빈 프리셉터 관계 해제 + 이유림 A팀 이동 — 진행할까요?' "
+            "각 변경마다 별도 preview/confirm 으로 쪼개지 말 것(불필요한 turn 증가 + 일관성 손실).\n\n"
             "⚠️ '전담' vs '고정근무' 구분 (중요):\n"
             "  • '전담' (예: '데이 전담', 'N 전담', '야간 전담') → is_night_nurse 필드. "
             "    매일(주말 포함) 해당 시프트만 근무.\n"
@@ -661,8 +682,10 @@ SKILL_TOOLS: list[dict] = [
             "필드별 추가 가이드:\n"
             "- group_id: 병동 식별자 문자열 (VARCHAR, 예: '101358f6de7b'). "
             "사용자가 '9A 병동'처럼 부르면 먼저 query_schedule로 그룹 ID를 조회. 사용자에게 ID 직접 묻지 말 것.\n"
-            "- team_id: 정수. 사용자는 보통 '1팀', 'B팀', '문지영이 있는 팀'처럼 부름 → "
-            "먼저 query_schedule로 팀 목록/멤버 조회하여 ID 매핑. 모호하면 사용자에게 후보 제시.\n"
+            "- team_id: 정수 ID **또는** 팀 이름 문자열 (예: '1팀', 'A팀', 'B팀'). "
+            "팀 이름은 스킬이 내부에서 team_id 로 매핑합니다 — query_schedule 선조회 불필요. "
+            "이름이 모호하거나 없으면 스킬이 needs_clarification 으로 후보 반환. "
+            "단, '문지영이 있는 팀'처럼 멤버 기반 지칭은 먼저 query_schedule 로 팀 식별 필요.\n"
             "- preceptor_id: 다른 간호사의 nurse_id 문자열. 이름으로 들어오면 먼저 query_schedule로 ID 조회. "
             "해제는 빈 문자열 ''.\n"
             "- role: 통상 'RN'(Registered Nurse) / 'AN'(Aide/Assistant Nurse). 그 외 코드는 사용자가 명시한 값을 그대로 전달.\n"
@@ -1014,6 +1037,121 @@ SKILL_TOOLS: list[dict] = [
                 },
             },
             "required": ["operation"],
+        },
+    },
+    {
+        "name": "navigate",
+        "description": (
+            "사용자를 특정 **화면/섹션으로 이동**시킵니다 (프론트 화면 전환). "
+            "'팀 어디서 바꿔?', '원티드 어디서 봐?', '등급 설정 띄워줘', '근무표 만들러 가자', "
+            "'대시보드 보여줘'처럼 **위치를 묻거나 화면 이동을 원하는** 의도에 사용하세요.\n"
+            # [NAV_FIRST 2026-05-29] 조건 없는 '근무표 보여줘'도 화면 이동 의도로 보고 roster_view 로.
+            "특히 특정 간호사/날짜 조건 없이 '근무표 보여줘 / 5월 근무표 보여줘 / 근무표 보러가자'처럼 "
+            "**전체 근무표를 보고 싶다**는 흐름은 query_schedule 이 아니라 navigate(target=roster_view) 입니다.\n\n"
+
+            "⚠️ 데이터를 텍스트로 답하는 것과 다릅니다 — 이 도구는 실제 화면을 옮깁니다. "
+            "조회 결과 자체가 필요하면 query_schedule 을 쓰고, '어디서/어디로/띄워/가자' 처럼 "
+            "**화면 이동 의도**가 명확할 때 navigate 를 쓰세요.\n"
+            "⚠️ target enum 에 없는 화면(예: 급여, 출퇴근 기록, 통계청 등)은 호출하지 말고, "
+            "그런 화면은 없다고 텍스트로 답하세요.\n"
+            # [NAV_FIRST 2026-05-29] 기본값 규칙 추가. 원복 시 이 마커 + 아래 '기본값:' 문장 제거.
+            "기본값: 조건 없는 '근무표 보여줘/보러가자'는 roster_view(전체), '내 근무표'는 roster_view_my. "
+            "⚠️ 그래도 진짜 모호하면(전체/내근무표/대시보드 중 가늠 불가) "
+            "호출하지 말고 어떤 화면인지 되물으세요.\n\n"
+
+            "─────────── target (이동할 화면) ───────────\n"
+            "- `home` — 홈\n"
+            "- `dashboard` — 분석 대시보드 (간호사용)\n"
+            "- `wanted` — 원티드(희망근무) 화면\n"
+            # [NAV_FIRST 2026-05-29] roster_view 가 조건 없는 '근무표 보여줘'의 기본 목적지.
+            "- `roster_view` — 전체 근무표 조회 (조건 없는 '근무표 보여줘'의 기본 목적지) / "
+            "`roster_view_my` — 내 근무표\n"
+            "- `nurse_management` — 근무자 관리 (HN/ADM 전용). "
+            "sub=`team_setting`(팀 설정)·`grade_setting`(등급 설정)\n"
+            "- `roster_create` — 근무표 만들기 (HN/ADM 전용)\n"
+            "- `config` — 병동 설정 (HN/ADM 전용). "
+            "sub=`shift_codes`(근무코드)·`weekoff`(자동 주휴=weekly_off_*)·"
+            "`wanted_setting`(원티드 설정)·`month_off`(월 오프수 제한=off_days 정책, "
+            "근무표 설정 탭).\n"
+            "  ⚠️ `weekoff` ≠ `month_off`: '주휴'는 매주 자동 휴무 정책(weekly_off_enabled/weekday). "
+            "'월 오프수 제한'은 한 달 OFF 총량 정책(off_days). '오프' 단어만으로 weekoff 로 가지 말 것.\n"
+            "- `mypage` — 마이페이지 / `support` — 고객센터\n\n"
+
+            "예) '팀 어디서 바꿔?' → target=nurse_management, sub=team_setting\n"
+            "예) '등급 설정 화면 띄워줘' → target=nurse_management, sub=grade_setting\n"
+            "예) '원티드 보러 가자' → target=wanted\n"
+            # [NAV_FIRST 2026-05-29] 아래 roster_view 예시 추가. 원복 시 이 줄 제거.
+            "예) '근무표 보여줘' / '5월 근무표 보여줘' → target=roster_view\n"
+            "예) '내 근무표 보여줘' → target=roster_view_my\n"
+            "예) '근무표 새로 만들래' → target=roster_create"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": [
+                        "home", "dashboard", "wanted", "roster_view",
+                        "roster_view_my", "nurse_management", "roster_create",
+                        "config", "mypage", "support",
+                    ],
+                    "description": "이동할 화면 (closed enum). 목록에 없는 화면은 호출 금지.",
+                },
+                "sub": {
+                    "type": "string",
+                    "enum": [
+                        "team_setting", "grade_setting",
+                        "shift_codes", "weekoff", "wanted_setting", "month_off",
+                    ],
+                    "description": (
+                        "화면 내 섹션/탭/모달. "
+                        "nurse_management→team_setting|grade_setting, "
+                        "config→shift_codes|weekoff|wanted_setting|month_off."
+                    ),
+                },
+                "query": {
+                    "type": "object",
+                    "description": "진입 시 프리필터 (예: {\"month\": 5, \"team\": \"A팀\"}).",
+                },
+            },
+            "required": ["target"],
+        },
+    },
+    {
+        "name": "prefill",
+        "description": (
+            "특정 설정 화면으로 이동하면서 **입력 폼을 미리 채워** 사용자가 확인만 누르면 되는 "
+            "상태로 만듭니다. 변경 의도가 명확하고 해당 설정 화면이 존재할 때 사용하세요. "
+            "⚠️ 이 도구는 **저장하지 않습니다** — 실제 적용은 사용자가 화면에서 직접 누릅니다.\n"
+            "예) 'A팀 나이트 최소 1명으로 바꾸려고' → target=nurse_management, sub=team_setting, "
+            "values={\"team\": \"A팀\", \"shift\": \"나이트\", \"min_count\": 1}"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": [
+                        "home", "dashboard", "wanted", "roster_view",
+                        "roster_view_my", "nurse_management", "roster_create",
+                        "config", "mypage", "support",
+                    ],
+                    "description": "폼이 있는 화면 (closed enum).",
+                },
+                "sub": {
+                    "type": "string",
+                    "enum": [
+                        "team_setting", "grade_setting",
+                        "shift_codes", "weekoff", "wanted_setting", "month_off",
+                    ],
+                    "description": "화면 내 섹션/탭/모달.",
+                },
+                "values": {
+                    "type": "object",
+                    "description": "폼에 미리 채울 값 (이름 기반, 내부 id 금지).",
+                },
+            },
+            "required": ["target"],
         },
     },
 ]

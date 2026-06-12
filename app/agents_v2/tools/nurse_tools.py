@@ -100,11 +100,12 @@ UPDATABLE_FIELDS = {
 _VALID_SHIFT_CODES = {"D", "E", "N", "M"}
 
 _KOREAN_PHRASE_ALIASES = {
-    # Korean substring matches (compound phrases like '야간 전담')
-    "야간": "N", "나이트": "N",
-    "데이": "D",
-    "이브닝": "E",
-    "미드": "M",
+    # Korean substring matches (compound phrases like '야간 전담').
+    # 2026-06-01: '주간'/'저녁'/'낮'/'밤' 추가 — _shift_category.SHIFT_CATEGORY 와 정렬.
+    "야간": "N", "나이트": "N", "밤": "N",
+    "데이": "D", "주간": "D", "낮": "D",
+    "이브닝": "E", "저녁": "E", "초번": "E",
+    "미드": "M", "미들": "M", "중간": "M",
 }
 _LATIN_TOKEN_ALIASES = {
     # Exact lowercase match (avoids false positives like 'invalid' → 'n')
@@ -124,9 +125,22 @@ _INT_FIELDS = {
 _VALID_FIXED_SHIFT_CODES = {"D", "E", "N", "M", "O"}
 
 
+_FIXED_SHIFT_OFF_ALIASES = {"오프", "휴무", "쉼", "쉬는날", "off", "o"}
+
+
 def _normalize_fixed_shift(value):
-    """fixed_shift는 단일 enum. 한글 별칭 매핑은 LLM에 위임 (description으로 강제).
-    빈 문자열/None → '' (해제).
+    """fixed_shift는 단일 enum (D/E/N/M/O). 한글 별칭도 직접 수용.
+
+    값 매핑:
+      None / '' / '해제' / '없음' → '' (해제)
+      'D'/'데이'/'주간'           → 'D'
+      'E'/'이브닝'/'저녁'         → 'E'
+      'N'/'나이트'/'야간'         → 'N'
+      'M'/'미드'                  → 'M'
+      'O'/'오프'/'휴무'/'쉼'      → 'O'
+
+    2026-06-01: LLM 위임에서 직접 수용으로 전환 — [[skill-internal-grounding]] 원칙
+    일관화. is_night_nurse 는 _coerce_shift_code 로 이미 한글 받음, fixed_shift 만 누락.
     """
     if value is None:
         return ""
@@ -135,9 +149,19 @@ def _normalize_fixed_shift(value):
     s = value.strip()
     if s == "":
         return ""
+    low = s.lower()
+    if low in _CLEAR_TOKENS:
+        return ""
     up = s.upper()
     if up in _VALID_FIXED_SHIFT_CODES:
         return up
+    # 'O' alias (fixed_shift 전용 — is_night_nurse 엔 'O' 없음)
+    if low in _FIXED_SHIFT_OFF_ALIASES:
+        return "O"
+    # D/E/N/M 한글 별칭 — _coerce_shift_code 재사용
+    coerced = _coerce_shift_code(s)
+    if coerced in _VALID_FIXED_SHIFT_CODES:
+        return coerced
     return None
 
 
@@ -161,7 +185,68 @@ def _coerce_shift_code(raw) -> str | None:
     upper = s.upper()
     if upper in _VALID_SHIFT_CODES:
         return upper
+    # middleware 가 이미 해석한 shift_id (예: "N_GRP001", "OFF_GRP001", "N2_GRP001") 통과.
+    # group_id 마커("_GRP") 를 명시 인장으로 사용 — 사용자 입력엔 나오지 않는 패턴.
+    if "_GRP" in upper:
+        return upper
     return None
+
+
+# ── Shift-grounding helpers (B4/B5 공용) ────────────────────────
+# query_schedule / bulk_mutation 등에서 LLM 이 보내는 shift 코드·이름을 정규화하고
+# 모르는 값은 needs_clarification 으로 즉시 반환. silent skip 회귀 차단.
+
+_SHIFT_CLARIFY_OPTIONS = ["D (데이)", "E (이브닝)", "N (나이트)", "M (미드)"]
+
+
+def normalize_shift_codes(codes: Any) -> tuple[list[str] | None, dict | None]:
+    """codes(list/str/None) → 정규화된 ['D','N',...] 또는 (None, clarification).
+
+    None → (None, None) passthrough. 빈 list → ([], None).
+    한글/별칭/대소문자 수용. 인식 불가 1개라도 있으면 즉시 clarification.
+    """
+    if codes is None:
+        return None, None
+    if not isinstance(codes, (list, tuple)):
+        codes = [codes]
+    if len(codes) == 0:
+        return [], None
+    out: list[str] = []
+    unrecognized: list[str] = []
+    for raw in codes:
+        norm = _coerce_shift_code(raw)
+        if norm in (None, ""):
+            unrecognized.append(str(raw))
+        elif norm not in out:
+            out.append(norm)
+    if unrecognized:
+        return None, {
+            "needs_clarification": True,
+            "question": (
+                f"'{', '.join(unrecognized)}' 근무 코드를 인식하지 못했습니다. "
+                "어떤 근무인가요?"
+            ),
+            "options": _SHIFT_CLARIFY_OPTIONS,
+        }
+    return out, None
+
+
+def normalize_single_shift_code(value: Any) -> tuple[str | None, dict | None]:
+    """단일 shift → 'D' 등 또는 (None, clarification). None passthrough.
+
+    is_night_nurse/fixed_shift 가 아닌, 단일 '근무 코드'(예: bulk_mutation 의 new_shift_code,
+    add_shift 의 shift)용. 'O'(off) 도 허용.
+    """
+    if value is None or value == "":
+        return None, None
+    norm = _coerce_shift_code(value)
+    if norm in (None, ""):
+        return None, {
+            "needs_clarification": True,
+            "question": f"'{value}' 근무 코드를 인식하지 못했습니다. 어떤 근무인가요?",
+            "options": _SHIFT_CLARIFY_OPTIONS,
+        }
+    return norm, None
 
 
 def _normalize_is_night_nurse(value) -> list[str] | None:

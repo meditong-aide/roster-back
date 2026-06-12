@@ -128,6 +128,18 @@ def db(engine) -> Session:
     connection.close()
 
 
+@pytest.fixture(autouse=True)
+def _reset_skill_audit_cache():
+    """middleware._audit_table_present 는 process-wide 캐시 — 테스트 간 누수 방지.
+
+    한 테스트(예: 테이블 없는 격리 세션)가 False 로 둔 채 끝나면 다음 테스트가
+    audit 를 건너뛰어 오탐할 수 있으므로, 매 테스트 시작 시 None 으로 초기화한다.
+    """
+    import agents_v2.middleware as _mw
+    _mw._audit_table_present = None
+    yield
+
+
 @pytest.fixture
 def seed_data(db: Session) -> dict:
     """Seed a complete hospital ward dataset for E2E testing.
