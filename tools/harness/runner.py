@@ -1924,7 +1924,7 @@ def main() -> None:
             "carryover.prev_transition_violation_count": prev_transition_violation_count,
             "carryover.prev_n_recovery_violation_count": prev_n_recovery_violation_count,
             "carryover.prev_conseq_work_overflow_count": prev_conseq_work_overflow_count,
-            "carryover.dropped_ref_count": 1 if str((prev_tail or {}).get("data", {}).get("schedule_status") or "").lower() == "dropped" else 0,
+            "carryover.dropped_ref_count": 1 if str(((prev_tail or {}).get("data") or {}).get("schedule_status") or "").lower() == "dropped" else 0,
             "config.max_enabled_inconsistency_count": _max_enabled_inconsistency_count(daily if isinstance(daily, dict) else {}),
             "fixed.changed_cell_count": fixed_changed_cell_count,
             "fixed.n_before_fixed_off_violation_count": fixed_n_before_off_violation_count,

@@ -98,6 +98,9 @@ class RosterRequest(BaseModel):
 
     year: int
     month: int
+    # 대상 병동 그룹. 미지정 시 호출자 DB home 으로 해석(토큰 group_id 에 의존하지 않음).
+    # HN(그룹관리자)이 home 외 관리 그룹을 선택해 생성할 때 사용.
+    group_id: Optional[str] = None
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
@@ -105,6 +108,10 @@ class RosterRequest(BaseModel):
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
     # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.
     advanced_inference: bool = Field(default=False)
+    # A1: 표는 나왔지만 hard 위반(hv>0)이 있을 때, 위반을 0으로 만드는 완화 옵션을
+    # probe 로 실측해 infeasibility.resolution_options 로 함께 반환한다. 흔한 케이스라
+    # 매 생성마다 돌면 느려지므로 기본 OFF(프론트 "위반 해결책 보기" 시 opt-in, async 권장).
+    suggest_fixes: bool = Field(default=False)
     # ── Shift 분배 정책(임시: UI 대신 req로 제어) ──
     # mode:
     # - auto/hybrid: 균등 + 월선호를 함께 고려(기본)
@@ -453,6 +460,10 @@ class NurseProfile(BaseModel):
     weekly_off_weekday: Optional[int] = None
     nurse_memo: Optional[str] = None
     grade: Optional[int] = None
+    # 근무자관리 get-nurse 에 year/month 가 주어질 때만 채워지는 월별 야간 한도(nurse_monthly_limits)
+    # n_exact=고정(정확값), n_max=최대(상한). 행마다 한쪽만 유효(고정 우선 해석).
+    n_exact: Optional[int] = None
+    n_max: Optional[int] = None
     emp_num: Optional[str] = None
     # Side-Profile 추가 컬럼
     birth_date: Optional[str] = None
@@ -604,6 +615,7 @@ class NurseProfileUpdate(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     grade: Optional[int] = None
+    team_id: Optional[int] = None
     birth_date: Optional[str] = None
     phone_number: Optional[str] = None
     email: Optional[EmailStr] = None
@@ -666,6 +678,19 @@ class NurseMonthlyLimitBulkUpsertRequest(BaseModel):
     year: int = Field(ge=2000, le=2100)
     month: int = Field(ge=1, le=12)
     limits: List[NurseMonthlyLimitItem]
+
+
+class NightBulkApplyRequest(BaseModel):
+    """나이트 개수(월 한도) 일괄 적용 — 현재 병동/월의 야간 가능 근무자 전체에
+    하나의 값을 고정(n_exact) 또는 최대(n_max)로 일괄 반영."""
+
+    group_id: str
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+    kind: Literal["fixed", "max"] = Field(
+        description="fixed=고정(n_exact), max=최대(n_max)"
+    )
+    value: int = Field(ge=0, description="전 야간가능 근무자에 적용할 나이트 개수")
 
 
 class NurseMonthlyLimitWarning(BaseModel):

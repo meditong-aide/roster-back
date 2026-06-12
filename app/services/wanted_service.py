@@ -13,6 +13,7 @@ from dateutil.relativedelta import relativedelta
 from fastapi import HTTPException
 from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
+from services.group_access import caller_is_head_nurse, resolve_home_group_id
 
 # 파견/병동이동 이관 사유 목록 (nurse_service._INBOUND_REASONS와 동일 정책)
 _INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
@@ -1502,13 +1503,12 @@ def request_wanted_shifts_service(
 
     관리자(ADM)의 경우 `override_group_id`로 대상 그룹을 지정합니다.
     """
-    if not current_user or not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
 
-    target_group_id = override_group_id or current_user.group_id
+    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
-
     if db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == req.year,
@@ -1531,7 +1531,14 @@ def request_wanted_shifts_service(
     # 푸시 알림
     group_row = db.query(Group).filter(Group.group_id == target_group_id).first()
     office_id = group_row.office_id if group_row and group_row.office_id else current_user.office_id
-    nurse_ids = [row.nurse_id for row in db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()]
+    # 수신자 명단: nurses.group_id 캐시 대신 해당 월 실제 소속(group member 모듈).
+    #   → 비활성/퇴사 제외 + 전입(파견/병동이동 inbound) 포함. 전출/휴직/파견나감은 제외.
+    from services.assignment_service import group_members_in_month
+    _members = group_members_in_month(db, target_group_id, req.year, req.month)["members"]
+    nurse_ids = [
+        m["nurse_id"] for m in _members
+        if m["membership_status"] in ("active", "inbound")
+    ]
 
     send_wanted_request_push(
         year=req.year,

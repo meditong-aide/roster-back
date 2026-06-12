@@ -4,7 +4,7 @@ from datetime import datetime
 from threading import Lock
 from typing import Dict, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from db.client2 import SessionLocal
@@ -98,6 +98,7 @@ def _fetch_latest_job(office_id: Optional[str], group_id: Optional[str], nurse_i
 
 @router.get("/jobs/status/latest", response_model=JobStatusResponse)
 async def get_latest_job_status(
+    response: Response,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
 ):
     """현재 사용자(office/group/nurse) 기준 가장 최신 Job 상태.
@@ -115,6 +116,14 @@ async def get_latest_job_status(
     예외:
         404: 해당 사용자/그룹의 Job이 없을 때.
     """
+    # 폴링 응답이 브라우저/CloudFront 디스크 캐시에 stale 상태로 남아 폴링이 멈추는 것을 방지
+    response.headers["Cache-Control"] = "no-store"
+    if current_user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="인증이 필요합니다.",
+            headers={"Cache-Control": "no-store"},
+        )
     key = _user_key(current_user.office_id, current_user.group_id, current_user.nurse_id)
     deadline = time.monotonic() + _LONG_POLL_WAIT
     last_seen = _get_last_seen(key)
@@ -127,7 +136,11 @@ async def get_latest_job_status(
             current_user.nurse_id,
         )
         if not job:
-            raise HTTPException(status_code=404, detail="해당 사용자/그룹의 Job이 없습니다.")
+            raise HTTPException(
+                status_code=404,
+                detail="해당 사용자/그룹의 Job이 없습니다.",
+                headers={"Cache-Control": "no-store"},
+            )
 
         current = (job.job_id, job.status)
 

@@ -93,6 +93,14 @@ def postprocess_off_swap(
 
     fixed_set = _load_fixed_wanted_set(db, schedule.group_id, req.year, req.month)
     nurses = _load_nurses(db, schedule.group_id)
+    # 타병동 전입(inbound) 간호사는 nurses.group_id 가 source 병동이라 위 group 조회에
+    #   안 잡혀 nu=None 으로 연차 변환에서 통째로 스킵되던 버그. generated(=이 근무표의
+    #   실제 배정 대상)에 있는데 group 조회에 누락된 nurse_id 를 group 무관하게 보충 로드.
+    _missing_nids = [str(_nid) for _nid in generated.keys() if str(_nid) not in nurses]
+    if _missing_nids:
+        for _n in db.query(Nurse).filter(Nurse.nurse_id.in_(_missing_nids)).all():
+            nurses[str(_n.nurse_id)] = _n
+        print(f"[OffSwap] inbound 전입 간호사 보충 로드: {_missing_nids}")
     use_mid = bool(getattr(latest_config, "use_mid", False))
 
     converted_total = 0

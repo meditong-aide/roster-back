@@ -87,6 +87,25 @@ class OntologyTreatment:
     applies_to_causes: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class OntologySoftConstraint:
+    """소프트 제약 family. 하드와 달리 objective weight 로만 존재하던 것을
+    온톨로지 1급 노드로 등재해 통합 그래프에서 체크·통제 가능하게 한다.
+
+    weight_constant: hardcoded_weights.py 의 상수명 (기본 가중치).
+    config_key: 런타임에 가중치를 조절하는 control 노브 (set_threshold 대상).
+    lex_stage: fallback 3-stage 계층 (safety | quality). coverage 는 하드라 제외.
+    """
+    soft_id: str
+    label: str
+    severity: str           # 항상 "soft"
+    weight_constant: str | None
+    config_key: str | None
+    lex_stage: str          # safety | quality
+    rationale_ko: str = ""
+    aliases: list[str] = field(default_factory=list)
+
+
 # ── 친화 라벨링 (사용자 dashboard 노출용) ─────────────────────────────────
 # raw setting key 가 사용자에게 jargon 으로 보이지 않도록 한국어 운영 어휘로 매핑.
 # yaml 미수정 — 코드 측 중앙 사전.
@@ -98,6 +117,7 @@ CONFIG_KEY_LABELS_KO: dict[str, str] = {
     "team_min_by_team":               "팀 최소 인원",
     "daily_shift_requirements":       "일별 시프트 요구 인원",
     "max_night_shifts_per_month":     "월 야간 한도",
+    "max_nig_per_month":              "월 야간 한도(개인)",
     "max_consecutive_work_days":      "최대 연속 근무일",
     "ban_n_to_d":                     "야간→주간 전이 금지",
     "ban_night_before_fixed_off":     "고정 OFF 직전 N 금지",
@@ -200,6 +220,8 @@ class ConstraintOntology:
         self.causes: dict[str, OntologyCause] = {}
         self.treatments: dict[str, OntologyTreatment] = {}
         self._cause_alias_to_id: dict[str, str] = {}
+        # soft 제약 카탈로그 (objective weight → 온톨로지 1급 등재)
+        self.soft_constraints: dict[str, OntologySoftConstraint] = {}
         self._load()
 
     def _load(self) -> None:
@@ -299,6 +321,21 @@ class ConstraintOntology:
                 trade_off_ko=str(body.get("trade_off_ko") or "").strip(),
                 applies_to_causes=list(body.get("applies_to_causes") or []),
             )
+        for sid, body in (raw.get("soft_constraints") or {}).items():
+            entry = OntologySoftConstraint(
+                soft_id=sid,
+                label=str(body.get("label") or sid),
+                severity=str(body.get("severity") or "soft"),
+                weight_constant=body.get("weight_constant"),
+                config_key=body.get("config_key"),
+                lex_stage=str(body.get("lex_stage") or "quality"),
+                rationale_ko=str(body.get("rationale_ko") or "").strip(),
+                aliases=list(body.get("aliases") or []),
+            )
+            self.soft_constraints[sid] = entry
+            self._alias_to_id[sid.upper()] = sid
+            for alias in entry.aliases:
+                self._alias_to_id[str(alias).upper()] = sid
 
     # ---- US-6 (v4) — cause/treatment API ----
     def get_cause(self, cause_id_or_alias: str) -> OntologyCause | None:

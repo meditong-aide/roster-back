@@ -18,6 +18,11 @@ from sqlalchemy import func
 
 from db.models import Shift, Nurse, Group, ShiftManage, ScheduleEntry
 from schemas.auth_schema import User as UserSchema
+from services.group_access import (
+    caller_is_head_nurse,
+    resolve_effective_group,
+    resolve_home_group_id,
+)
 
 
 def _assert_off_swap_target_valid(
@@ -246,7 +251,7 @@ def get_shifts_service(current_user, db: Session, override_group_id: str | None 
     if not current_user:
         raise Exception("Not authenticated")
     
-    target_group_id = override_group_id or current_user.group_id
+    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     shifts = db.query(Shift).filter(Shift.group_id == target_group_id).order_by(Shift.sequence.asc()).all()
     if shifts:
         has_mid = any(str(getattr(s, "default_shift", "") or "").upper() == "M" for s in shifts)
@@ -398,9 +403,10 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
     시프트 등록 서비스 함수
     """
     print('----------------------------------[add_shift_service] group_id', override_group_id)
-    if not current_user or not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
+    if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
-    target_group_id = override_group_id or current_user.group_id
+    # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
+    target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
     if override_group_id:
         g = db.query(Group).filter(Group.group_id == target_group_id).first()
         if not g:
@@ -469,12 +475,13 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     """
     시프트 수정 서비스 함수
     """
-    if not current_user or not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
+    if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
 
-    target_group_id = override_group_id or current_user.group_id
+    # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
+    # (HN 그룹 전환 시 home 강제 필터로 근무코드 미발견 → None 접근 크래시 나던 버그 회귀 방지)
+    target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
     existing_shift = db.query(Shift).filter(Shift.id == req.id, Shift.group_id == target_group_id).first()
-    print('existing_shift.shift_gb before', existing_shift.shift_gb)
     if not existing_shift:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
     # off_swap_target 정책 검증 — 변경 후 (type, off_swap_target) 조합 기준.
@@ -508,7 +515,6 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     # 초과 OFF 변환 타깃 업데이트 (None 이면 기존 값 유지)
     if hasattr(req, "off_swap_target") and req.off_swap_target is not None:
         existing_shift.off_swap_target = bool(req.off_swap_target)
-    print('existing_shift.shift_gb after', existing_shift.shift_gb)
     db.commit()
     db.refresh(existing_shift)
     _append_shift_manage_code(
@@ -536,9 +542,10 @@ def remove_shift_service(req, current_user, db, override_group_id: str | None = 
     """
     시프트 삭제 서비스 함수
     """
-    if not current_user or not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
+    if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
-    target_group_id = override_group_id or current_user.group_id
+    # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
+    target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
     existing_shift = db.query(Shift).filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id).first()
     if not existing_shift:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
@@ -558,9 +565,10 @@ def move_shift_service(req, current_user, db, override_group_id: str | None = No
     """
     시프트 순서 이동 서비스 함수
     """
-    if not current_user or not (current_user.is_head_nurse or getattr(current_user, 'is_master_admin', False)):
+    if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
-    target_group_id = override_group_id or current_user.group_id
+    # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
+    target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
     shift_to_move = db.query(Shift).filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id).first()
     if not shift_to_move:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")

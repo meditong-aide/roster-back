@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta
 import logging
 import math
+import os
 import time
 import numpy as np
 from typing import List, Dict, Optional, Tuple
@@ -608,9 +609,9 @@ class CPSATBasicEngine:
             max_same_shift_penalty_weight=int(config_data.get("max_same_shift_penalty_weight", 300) or 0),
             # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
             enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
-            # N 블록 간 간격 soft (목표 10일, 대칭 페널티)
+            # N 블록 간 간격 soft (목표 10일, 한쪽 페널티: 10일 미만만 벌점)
             n_to_n_interval_target=int(config_data.get("n_to_n_interval_target", 10) or 0),
-            n_to_n_interval_penalty_weight=int(config_data.get("n_to_n_interval_penalty_weight", 50) or 0),
+            n_to_n_interval_penalty_weight=int(config_data.get("n_to_n_interval_penalty_weight", 300) or 0),
             n_to_n_interval_max_window=int(config_data.get("n_to_n_interval_max_window", 15) or 0),
             # 분배 정책 모드/월단위 선호 가중치
             distribution_mode=str(config_data.get("distribution_mode", "hybrid") or "hybrid"),
@@ -1403,7 +1404,13 @@ class CPSATBasicEngine:
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
             setattr(roster_system, "_used_fallback", False)
-            success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
+            # default: primary 스킵 후 바로 폴백 (검증: fix fallback 과 함께 9B/ICU/NA-LP
+            # 10런 coverage 0/10, 시간 -54~61%, 원티드 100% 유지). primary 강제는 SKIP_PRIMARY=0.
+            if os.getenv("SKIP_PRIMARY", "1") != "0":
+                print(f"{self.logger_prefix} [Config] primary 스킵(default), 바로 폴백 (해제: SKIP_PRIMARY=0)")
+                success = False
+            else:
+                success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
             # fallback_success = False
             if not success:
                 print(f"{self.logger_prefix} 개선된 제약사항으로 실패, 기본 알고리즘으로 폴백...")
@@ -1414,6 +1421,9 @@ class CPSATBasicEngine:
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
+                # 폴백 결과 진단(log-only, 솔버 무영향) — [HardViolations] 요약 노출.
+                # N균등([N균등-결과])은 fallback_lex.py stage3에서 이미 출력하므로 여기선 제외.
+                _log_post_solve_result_diagnostics(roster_system, self.logger_prefix)
             # if not success and not fallback_success:
             #     raise RuntimeError("HARD_INFEASIBLE: stage1/fallback 모두 해 없음")
         # 9-1. 불필요 OFF 정리 (N-only 제외)
@@ -1932,6 +1942,8 @@ class CPSATBasicEngine:
                 f"best_viol={best_viol}, remaining={remaining}s"
             )
             return best_viol == 0
+        no_progress = 0
+        NO_PROGRESS_LIMIT = int(os.getenv("PRIMARY_NO_PROGRESS_LIMIT", "2"))
         for it in range(max_iter):
             try:
                 n_sel, d_sel = policy.select()
@@ -1984,6 +1996,16 @@ class CPSATBasicEngine:
             if best_viol == 0:
                 print(f"{self.logger_prefix} [Progress] 하드 위반 0 달성, 종료")
                 break
+            if improved:
+                no_progress = 0
+            else:
+                no_progress += 1
+                if no_progress >= NO_PROGRESS_LIMIT:
+                    print(
+                        f"{self.logger_prefix} [Progress] early-stop: "
+                        f"{NO_PROGRESS_LIMIT}회 연속 무개선 → 폴백 진입"
+                    )
+                    break
         roster_system.roster = best_roster
         try:
             _fnc, _fnt, _fnmx = _row_commit_counts(roster_system, best_roster)
@@ -2384,8 +2406,6 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             D_phys,
             D - 1,
         )
-    # TEMP-PROBE-DELETE: join/leave/blocked 확정 시점의 grade hard blocker 진단
-    _log_grade_hard_blocker_probe(rs, join, leave, blocked_by_nurse)
     # 고정 셀 (수간호사 등)
     code2main = {
         str(c).strip().upper(): str(r["main_code"]).strip().upper()
@@ -4252,7 +4272,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         else:
                             m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block])
                     else:
-                        _co_3n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) >= 1)
+                        # _3n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
+                        _co_3n_expr = (countable_off(n, T0) >= 1)
                         if _assume_registry is not None:
                             _co_lit = _assume_registry.create_literal(
                                 f"CarryoverRecovery3N2OFFPartial:nurse_{n}:day_{T0}",
@@ -4269,9 +4290,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                     "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                 },
                             )
-                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                            m.Add(_co_3n_expr).OnlyEnforceIf([_co_lit])
                         else:
-                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block])
+                            m.Add(_co_3n_expr)
                 print(f"[CP-SAT-Basic] [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
             elif n_tail >= 3 and _3n_rem == 0:
@@ -4403,8 +4424,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         else:
                             m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block])
                     else:
-                        # _2n_rem == 1: 1개만 추가 필요
-                        _co_2n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) >= 1)
+                        # _2n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
+                        _co_2n_expr = (countable_off(n, T0) >= 1)
                         if _assume_registry is not None:
                             _co_lit = _assume_registry.create_literal(
                                 f"CarryoverRecovery2N2OFFPartial:nurse_{n}:day_{T0}",
@@ -4421,9 +4442,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                     "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                 },
                             )
-                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                            m.Add(_co_2n_expr).OnlyEnforceIf([_co_lit])
                         else:
-                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block])
+                            m.Add(_co_2n_expr)
                 print(f"[CP-SAT-Basic] [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after}, rem={_2n_rem}")
             elif n_tail >= 2 and _2n_rem == 0:
@@ -4770,161 +4791,44 @@ def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dic
         print(f"[CP-SAT-Basic][Diag][N-Capacity] 분석 실패: {exc}")
 
 
-# TEMP-PROBE-DELETE-START
-def _log_grade_hard_blocker_probe(
-    rs,
-    join: list[int],
-    leave: list[int],
-    blocked_by_nurse: Optional[dict[int, set[int]]],
-) -> None:
-    """임시 프로브: grade hard 제약의 첫 일자/교대 충돌 후보를 로깅한다.
 
-    삭제 가이드:
-      - TEMP-PROBE-DELETE-START ~ TEMP-PROBE-DELETE-END 전체 삭제
-      - _build_full_model 내 호출부(TEMP-PROBE-DELETE 태그)도 함께 삭제
+
+# 폴백 결과 진단용 하드위반 타입 — primary 경로의 로컬 HARD_TYPES(동일 의미)와 동기화 유지
+_FALLBACK_DIAG_HARD_TYPES = {
+    'shift_requirement', 'night_consecutive',
+    'consecutive_work', 'night_nd', 'night_ne',
+    'eve_ed', 'night_month_limit',
+    'not_one_night', 'rec_2n2o', 'rec_3n2o',
+    'initial_forbidden', 'weekend_off_only',
+    'consecutive_4off', 'cross_month_4off',
+}
+
+
+def _log_post_solve_result_diagnostics(roster_system, logger_prefix: str) -> None:
+    """폴백 최종 roster의 [HardViolations] 요약을 로깅한다.
+
+    solve 종료 후 결과 roster만 읽어 출력하므로 솔버 동작/시간/품질에 무영향(log-only).
+    N 균등 분배([N균등-결과])는 폴백 stage3(fallback_lex.py)에서 이미 출력하므로 여기선 중복 제외.
     """
     try:
-        gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        gc = getattr(rs, "grade_config", None) or {}
-        allow_soft = bool((gc or {}).get("allow_soft_fallback", False))
-        if gs not in ("GRADE", "COMBINED") or allow_soft:
-            return
-
-        min_map = (gc.get("constraints_json") or gc.get("constraints") or {})
-        max_map = (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
-        if not isinstance(min_map, dict) or not isinstance(max_map, dict):
-            return
-        if not min_map and not max_map:
-            return
-
-        cfg = rs.config
-        shift_types = set(str(s).upper() for s in (getattr(cfg, "shift_types", []) or []))
-        day_reqs = getattr(cfg, "daily_shift_requirements_by_day", None)
-        base_reqs = getattr(cfg, "daily_shift_requirements", {}) or {}
-
-        constrained_grades: set[int] = set()
-        for mp in (min_map, max_map):
-            for by_g in (mp or {}).values():
-                if not isinstance(by_g, dict):
-                    continue
-                for gk in by_g.keys():
-                    try:
-                        constrained_grades.add(int(gk))
-                    except Exception:
-                        continue
-        if not constrained_grades:
-            return
-
-        def _req(day_idx: int, s_code: str) -> int:
-            if isinstance(day_reqs, list) and day_idx < len(day_reqs) and isinstance(day_reqs[day_idx], dict):
-                return int((day_reqs[day_idx] or {}).get(s_code, 0) or 0)
-            return int((base_reqs or {}).get(s_code, 0) or 0)
-
-        block = blocked_by_nurse or {}
-        keys = sorted(set([str(k).upper() for k in list(min_map.keys()) + list(max_map.keys())]))
-        for d in range(rs.num_days):
-            for s_code in keys:
-                if shift_types and s_code not in shift_types:
-                    continue
-                req = _req(d, s_code)
-                if req <= 0:
-                    continue
-
-                active_total = 0
-                active_by_grade = defaultdict(int)
-                active_unconstrained = 0
-                for n_idx, nurse in enumerate(rs.nurses):
-                    if not (join[n_idx] <= d <= leave[n_idx]):
-                        continue
-                    if d in (block.get(n_idx, set()) if block else set()):
-                        continue
-                    if s_code in {"D", "E"} and bool(getattr(nurse, "is_night_nurse", 0) == 3):
-                        continue
-                    active_total += 1
-                    try:
-                        gi = int(getattr(nurse, "grade", None))
-                    except Exception:
-                        gi = None
-                    if gi in constrained_grades:
-                        active_by_grade[gi] += 1
-                    else:
-                        active_unconstrained += 1
-
-                if active_total < req:
-                    msg = (
-                        f"[ACTIVE_SHORTAGE] day={d+1} shift={s_code} active={active_total} req={req}"
-                    )
-                    print(
-                        "[CP-SAT-Basic][Diag][GradeHardProbe] "
-                        f"{msg}"
-                    )
-                    setattr(rs, "_grade_hard_probe_msg", msg)
-                    return
-
-                min_by_g = (min_map.get(s_code) or {}) if isinstance(min_map.get(s_code), dict) else {}
-                min_sum = 0
-                for gk, tv in min_by_g.items():
-                    try:
-                        gi = int(gk)
-                        t = int(tv or 0)
-                    except Exception:
-                        continue
-                    if t <= 0:
-                        continue
-                    avail = int(active_by_grade.get(gi, 0))
-                    if avail < t:
-                        msg = (
-                            f"[MIN_BLOCK] day={d+1} shift={s_code} grade={gi} need={t} avail={avail} req={req}"
-                        )
-                        print(
-                            "[CP-SAT-Basic][Diag][GradeHardProbe] "
-                            f"{msg}"
-                        )
-                        setattr(rs, "_grade_hard_probe_msg", msg)
-                        return
-                    min_sum += t
-                if min_sum > req:
-                    msg = f"[MIN_OVER_NEED] day={d+1} shift={s_code} min_sum={min_sum} req={req}"
-                    print(
-                        "[CP-SAT-Basic][Diag][GradeHardProbe] "
-                        f"{msg}"
-                    )
-                    setattr(rs, "_grade_hard_probe_msg", msg)
-                    return
-
-                max_by_g = (max_map.get(s_code) or {}) if isinstance(max_map.get(s_code), dict) else {}
-                if max_by_g:
-                    capped = active_unconstrained
-                    max_keys = {str(k) for k in max_by_g.keys()}
-                    for gk, uv in max_by_g.items():
-                        try:
-                            gi = int(gk)
-                            u = int(uv)
-                        except Exception:
-                            continue
-                        if u < 0:
-                            continue
-                        capped += min(int(active_by_grade.get(gi, 0)), u)
-                    for gi in constrained_grades:
-                        if str(gi) not in max_keys:
-                            capped += int(active_by_grade.get(gi, 0))
-                    if capped < req:
-                        msg = (
-                            f"[MAX_CAP_SHORTAGE] day={d+1} shift={s_code} cap={capped} req={req} "
-                            f"unconstrained={active_unconstrained} by_grade={dict(active_by_grade)}"
-                        )
-                        print(
-                            "[CP-SAT-Basic][Diag][GradeHardProbe] "
-                            f"{msg}"
-                        )
-                        setattr(rs, "_grade_hard_probe_msg", msg)
-                        return
-        print("[CP-SAT-Basic][Diag][GradeHardProbe] blocker not detected in fast probe")
-        setattr(rs, "_grade_hard_probe_msg", None)
+        violations = [
+            v for v in roster_system._find_violations()
+            if v.get('type') in _FALLBACK_DIAG_HARD_TYPES
+        ]
+        by_type: dict[str, int] = {}
+        for v in violations:
+            t = str(v.get('type') or 'unknown')
+            by_type[t] = by_type.get(t, 0) + 1
+        print(f"{logger_prefix} [HardViolations] total={len(violations)}, by_type={by_type}")
+        for v in violations[:12]:
+            print(
+                f"{logger_prefix} [HardViolations] "
+                f"type={v.get('type')}, "
+                f"nurse={v.get('nurse_name') or v.get('name') or '?'}({v.get('nurse_id') or '?'}), "
+                f"day={v.get('day')}, detail={v.get('detail') or v.get('message') or ''}"
+            )
     except Exception as exc:
-        print(f"[CP-SAT-Basic][Diag][GradeHardProbe] probe failed: {exc}")
-        setattr(rs, "_grade_hard_probe_msg", f"[PROBE_ERROR] {exc}")
-# TEMP-PROBE-DELETE-END
+        print(f"{logger_prefix} [HardViolations] 로그 실패(무시): {exc}")
 
 
 def _log_shift_requirement_gaps(rs) -> None:

@@ -24,6 +24,10 @@ class TeamBulkOpsRequest(BaseModel):
     """
     teams: List[TeamOps] = Field(default_factory=list)
     delete_team_ids: List[int] = Field(default_factory=list)
+    # 선택 월(있으면 멤버 add/remove 를 nurse_team_period 에 valid_from=그 달 1일로 기록).
+    #   UI 는 일자별 미지원 → 월 단위만. 없으면(레거시) 캐시(nurse.team_id)만 갱신.
+    year: Optional[int] = None
+    month: Optional[int] = None
 
 
 class TeamWithMembers(BaseModel):

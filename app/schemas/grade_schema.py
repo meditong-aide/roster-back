@@ -40,9 +40,13 @@ class GradeConfigBase(BaseModel):
         default_factory=dict,
         description="Shift별 Grade 최대 인원(anti-pair). 예: {'N': {1: 2}} → N에 grade 1 최대 2명. 값 -1/음수는 '제한 없음'으로 처리.",
     )
-    grade_names: Optional[Dict[str, str]] = Field(
+    grade_names: Optional[Dict[str, Optional[str]]] = Field(
         default=None,
-        description="Grade 번호별 표시 이름 예: {'1': '주니어', '2': '시니어'}. null이면 숫자 그대로 표시.",
+        description=(
+            "Grade 번호별 표시 이름. 응답은 constraints / grade_names 합집합의 모든 grade slot 키를 포함하며, "
+            "사용자가 명시하지 않은 슬롯은 값이 null 로 내려옵니다. 예: {'1': '주니어', '2': null, '3': null}. "
+            "전체가 null 매핑(슬롯 자체가 없음)이면 키 자체가 비어 옵니다."
+        ),
     )
     use_mid: bool = Field(
         default=False,

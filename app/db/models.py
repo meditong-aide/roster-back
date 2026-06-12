@@ -146,6 +146,40 @@ class Nurse(Base):
     # office_id는 컬럼으로 관리
 
 
+class NurseTeamPeriod(Base):
+    """team 시점 구간 (병동귀속). effective-dated [valid_from, valid_to).
+
+    nurses.team_id 는 '현재값' 캐시이고, 월별/기간별 team 의 진실은 이 테이블이다.
+    - 변경 = close-before-open(옛 구간 valid_to 닫고 새 구간 open), 삭제 금지(완전 타임라인).
+    - 겹침 금지, gap(미지정) 허용. valid_to=null 은 열린(계속) 구간.
+    - 폴백은 ward-aware: 구간 없으면 nurses.group_id==group 일 때만 nurses.team_id, 아니면 None.
+    참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §2.3·§4.6 (v3).
+    """
+
+    __tablename__ = "nurse_team_period"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    valid_from = Column(DATE, nullable=False)
+    valid_to = Column(DATE, nullable=True)   # null = 열린(계속) 구간
+    # team_id 는 (group_id, team_id)->teams 이지만 DB레벨 복합 FK 는 마이그레이션에서 결정.
+    team_id = Column(INTEGER, nullable=True)
+    source = Column(VARCHAR(20), nullable=False, default="edited")  # inherited|edited|redistribute
+    note = Column(TEXT, nullable=True)
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    group = relationship("Group", foreign_keys=[group_id])
+
+    __table_args__ = (
+        Index("ix_ntp_nurse", "nurse_id", "valid_from"),
+        Index("ix_ntp_group", "group_id", "valid_from"),
+    )
+
+
 class NurseMonthlyLimit(Base):
     """월별/그룹별 간호사 개인 근무 개수 제한.
 
@@ -202,6 +236,10 @@ class NurseAssignment(Base):
     expected_end_date = Column(DATE, nullable=True)
     end_date = Column(DATE, nullable=True)
     reason = Column(NVARCHAR(200), nullable=False)
+    # kind: reason(한글) 기반 명시적 분류 (DDL Phase 1.4). DB DEFAULT 'transfer'.
+    kind = Column(VARCHAR(30), nullable=False, server_default="transfer")
+    # payload: 영구속성 변경 등 신규 케이스용 JSON (Phase 2에서 사용 시작, 그 전엔 NULL)
+    payload = Column(JSON(none_as_null=True), nullable=True)
     status = Column(VARCHAR(10), nullable=False, default="active")
     note = Column(NVARCHAR(1000), nullable=True)
     # target 그룹 전용 설정
@@ -251,7 +289,7 @@ class Schedule(Base):
     created_by = Column(VARCHAR(50), ForeignKey("nurses.account_id"))
     created_at = Column(DATETIME, default=func.now())
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
-    status = Column(VARCHAR(10))  # e.g., 'requested', 'issued'
+    status = Column(VARCHAR(10))  # e.g., 'draft', 'issued'
     dropped = Column(BOOLEAN, nullable=False, default=False)
     name = Column(VARCHAR(50))
     # violations = Column(JSON, nullable=True) # 임시로 주석 처리 - DB 스키마 업데이트 후 활성화 예정

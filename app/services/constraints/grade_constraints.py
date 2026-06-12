@@ -38,6 +38,10 @@ def add_grade_constraints(
         return []
 
     constraints_map, max_constraints_map, scaling = _parse_grade_config(grade_config)
+    # [GradeCascade] config 의 grade 인원이 0이면 다음 상위(존재) grade 로 '시니어 ≥N' 요구 이양.
+    #   grade 1 없으면 2, 2 없으면 3... — '설정 grade 부재'만으로 hard 가 헛 infeasible 나는 것 방지.
+    #   min 만 적용(max=anti-pair 상한은 이양하면 의미 왜곡).
+    constraints_map = _cascade_constraints_to_existing_grades(rs, constraints_map)
     # grade_strategy=GRADE 이면 grade weight 가중치를 끌어올림(선호 신호).
     gs = str(grade_strategy or "").upper()
     if gs == "GRADE":
@@ -288,6 +292,62 @@ def _extract_grade_values_from_constraints(*constraints_maps: Any) -> list[int]:
     return sorted(grades)
 
 
+def _cascade_constraints_to_existing_grades(rs: RosterSystem, constraints_map: Any) -> Any:
+    """min constraints_map({shift:{grade:count}}) 에서 '실제 인원이 0인 grade' 의 요구를
+    다음 상위(숫자 큰) '인원이 있는' grade 로 이양(cascade)한다.
+
+    정책: grade 1 = 최상위(시니어). grade 1 인원이 없으면 2, 2도 없으면 3... 으로
+    '시니어 ≥ N' 요구가 내려간다. 더 내려갈 등급이 없으면 원래 grade 유지(진짜 불가는 노출).
+      - 인원이 있는 grade 는 그대로.
+      - 같은 목표 grade 로 겹치면 max 로 합쳐 demand 부풀림 방지('1씩' 의미 유지).
+      - max constraints(anti-pair 상한)에는 적용하지 않는다(상한 이양은 의미 왜곡).
+
+    '설정한 grade 가 그 병동에 없다'는 이유만으로 hard 제약이 헛 infeasible 나는 것을 막는다.
+    """
+    if not isinstance(constraints_map, dict) or not constraints_map:
+        return constraints_map
+    pop: dict[int, int] = {}
+    for n in rs.nurses:
+        g = _normalize_grade_int(getattr(n, "grade", None))
+        if g is not None:
+            pop[g] = pop.get(g, 0) + 1
+    existing = sorted(g for g, c in pop.items() if c > 0)
+    if not existing:
+        return constraints_map
+
+    def _target_grade(g: int) -> int:
+        if pop.get(g, 0) > 0:
+            return g
+        higher = [e for e in existing if e > g]
+        return higher[0] if higher else g
+
+    out: dict = {}
+    changed = False
+    for shift, grade_map in constraints_map.items():
+        if not isinstance(grade_map, dict):
+            out[shift] = grade_map
+            continue
+        new_gm: dict = {}
+        for gk, cnt in grade_map.items():
+            gi = _normalize_grade_int(gk)
+            if gi is None:
+                new_gm[gk] = cnt
+                continue
+            tg = _target_grade(gi)
+            if tg != gi:
+                changed = True
+            try:
+                c = int(cnt)
+            except Exception:
+                new_gm[tg] = cnt
+                continue
+            new_gm[tg] = max(new_gm[tg], c) if isinstance(new_gm.get(tg), int) else c
+        out[shift] = new_gm
+    if changed:
+        print(f"[GradeCascade] 인원 0 grade → 상위 존재 grade 이양: {constraints_map} → {out}")
+    return out
+
+
 def _parse_grade_config(grade_config: dict[str, Any]) -> tuple[dict, dict, dict]:
     """grade_config 딕셔너리에서 제약/스케일 파라미터를 추출한다.
 
@@ -472,6 +532,18 @@ def _clamp_targets_to_available(
         target[g] = a
 
 
+# [GRADE_CASCADE] ②: 누적 등급 cascade. 요구 시니어(grade g)를 못 채우면 한 단계씩
+#   하위 등급으로 내려가며(grade g → g+1 → ...) "가능한 최고 등급"을 시프트마다 보장한다.
+#   - off 0(요구 등급 부재): penalty_weight(호출자) = x/y '아래' → x/y 우선, 시니어 과로 안 함.
+#   - off 1(차상위까지 부재): W_NEXT = x/y '위' → 한 단계 떨어지는 건 강하게 억제.
+#   - off>=2(시니어 전무/인원부족): W_NONE = 사실상 hard.
+#   → "x/y 우선 + 최고등급 최대 + 혼자 안 뜀 + infeasible 안전" 동시 충족(단일 패스).
+#   원복: _GRADE_CASCADE_ENABLED=False 로 두면 아래 레거시(binary hard/soft) 경로로 복귀.
+_GRADE_CASCADE_ENABLED = True
+GRADE_CASCADE_W_NEXT = 2_000_000   # 차상위까지 부재 (x/y range 1.2M 위 → near-hard)
+GRADE_CASCADE_W_NONE = 6_000_000   # 시니어 전무 (사실상 hard)
+
+
 def _add_minimum_constraints(
     m,
     X,
@@ -485,10 +557,42 @@ def _add_minimum_constraints(
 ) -> list:
     """모델에 grade 최소 인원 제약을 추가한다.
 
-    allow_soft_fallback=True 이면 slack을 허용하여 infeasible을 방지하고,
-    False이면 기존처럼 하드 제약을 유지한다.
+    기본(_GRADE_CASCADE_ENABLED): 누적 등급 cascade — 요구 등급을 못 채우면 하위 등급이
+      대체하되 등급이 내려갈수록 패널티가 가팔라진다(off0<off1<off2). 단일 solve.
+    레거시(flag False): allow_soft_fallback=True면 slack soft, False면 하드.
     """
     obj_terms: list = []
+    if _GRADE_CASCADE_ENABLED:
+        grade_domain = sorted(by_grade.keys())  # 오름차순: 1(최상위)..N
+        for g, t in target.items():
+            t = int(t)
+            if t <= 0:
+                continue
+            ceilings = [c for c in grade_domain if c >= g]
+            if not ceilings:
+                # 요구 등급이 도메인에 없음 → 안전하게 그 등급 합으로 하드(기존 동작).
+                m.Add(sum(X(n, day_idx, shift_idx) for n in by_grade.get(g, [])) >= t)
+                continue
+            for off, c in enumerate(ceilings):
+                # ceiling c 까지(=grade ≤ c, 더 시니어 등급 포함) 누적 인원.
+                members = [
+                    n for j in grade_domain if j <= c for n in by_grade.get(j, [])
+                ]
+                if not members:
+                    continue
+                cum = sum(X(n, day_idx, shift_idx) for n in members)
+                short = m.NewIntVar(
+                    0, t, f"gcasc_d{day_idx}_s{shift_idx}_g{g}_c{c}"
+                )
+                m.Add(short >= t - cum)  # short = max(0, t - 누적)
+                if off == 0:
+                    w = penalty_weight
+                elif off == 1:
+                    w = GRADE_CASCADE_W_NEXT
+                else:
+                    w = GRADE_CASCADE_W_NONE
+                obj_terms.append(-w * short)
+        return obj_terms
     # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
     _registry = getattr(m, "_cpsat_assumption_registry", None)
     _add_hard_fn = None

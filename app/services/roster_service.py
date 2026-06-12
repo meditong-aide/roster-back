@@ -35,6 +35,7 @@ from db.nurse_config import Nurse as NurseEngine
 from routers.utils import get_days_in_month
 from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequest
 from services.roster_system import RosterSystem
+from services.group_access import caller_is_head_nurse, resolve_home_group_id
 from services.shift_service_mssql import _to_time_str
 def save_roster_config_service(
     config_data: RosterConfigCreate,
@@ -189,10 +190,10 @@ def get_latest_schedule_service(current_user, db: Session, override_group_id: st
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not (getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False)):
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
         raise Exception("Permission denied")
 
-    target_group_id = override_group_id or current_user.group_id
+    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
 
@@ -249,8 +250,8 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
         raise Exception("Not authenticated")
 
     # HN/ADM 그룹 요약
-    if getattr(current_user, 'is_head_nurse', False) or getattr(current_user, 'is_master_admin', False):
-        target_group_id = override_group_id or current_user.group_id
+    if caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False):
+        target_group_id = override_group_id or resolve_home_group_id(db, current_user)
         if not target_group_id:
             raise Exception("대상 그룹이 없습니다.")
         schedules = db.query(Schedule).filter(
@@ -314,6 +315,55 @@ def get_schedule_status_service(year: int, month: int, current_user, db: Session
     }
 
 
+def _build_inbound_prev_tail_nurses(
+    db: Session,
+    ref_schedule_id,
+    group_nurse_ids: set,
+    tail_day_list: list,
+    load_target_prev_tail,
+) -> list:
+    """현재월 schedule 의 인바운드(타 그룹 소속) 간호사들의 home 그룹 전월 tail 구성.
+
+    아웃바운드(_load_target_prev_tail 로 파견 간 병동 조회)의 거울상.
+    인바운드는 본인 home 그룹(Nurse.group_id)의 전월 발행 근무표 tail 을 채워
+    월 경계 연속성(연속근무·ND/NE·나이트 회복 OFF 등)을 볼 수 있게 한다.
+    """
+    if not ref_schedule_id:
+        return []
+    ref_entry_ids = {
+        row.nurse_id
+        for row in db.query(ScheduleEntry.nurse_id)
+        .filter(ScheduleEntry.schedule_id == ref_schedule_id)
+        .distinct()
+        .all()
+    }
+    inbound_ids = [nid for nid in ref_entry_ids if nid not in group_nurse_ids]
+    if not inbound_ids:
+        return []
+    inbound_nurses = (
+        db.query(Nurse.nurse_id, Nurse.name, Nurse.group_id)
+        .filter(Nurse.nurse_id.in_(inbound_ids))
+        .all()
+    )
+    result = []
+    for inb in inbound_nurses:
+        home_map = {}
+        if inb.group_id:
+            home_payload = load_target_prev_tail(inb.group_id)
+            home_map = (home_payload.get("entries_by_nurse") or {}).get(
+                inb.nurse_id, {}
+            )
+        result.append({
+            "nurse_id": inb.nurse_id,
+            "name": inb.name,
+            "shifts": {str(d): home_map.get(d) for d in tail_day_list},
+            "assignments": [],
+            "is_inbound": True,
+            "home_group_id": inb.group_id,
+        })
+    return result
+
+
 def get_prev_month_tail_service(
     year: int,
     month: int,
@@ -323,8 +373,19 @@ def get_prev_month_tail_service(
     current_user,
     db: Session,
 ):
-    if current_user.is_head_nurse and current_user.group_id:
+    if caller_is_head_nurse(db, current_user) and current_user.group_id:
         target_group_id = current_user.group_id
+        # HN multi-group 통합보기: managed group 이면 param 허용, 아니면 403
+        if group_id and str(group_id) != str(target_group_id):
+            from services.group_access import resolve_managed_group_ids
+            _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+            if str(group_id) in _managed:
+                target_group_id = group_id
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="해당 그룹 근무표 조회 권한이 없습니다.",
+                )
     else:
         if not group_id:
             raise HTTPException(status_code=400, detail="group_id is required for admin")
@@ -530,6 +591,17 @@ def get_prev_month_tail_service(
                 "assignments": nurse_assignments,
             }
         )
+
+    # 인바운드(타 그룹 소속) 간호사: home 그룹 전월 tail 로 경계 연속성 채움
+    nurse_list.extend(
+        _build_inbound_prev_tail_nurses(
+            db,
+            ref_schedule_id,
+            {n.nurse_id for n in nurses},
+            tail_day_list,
+            _load_target_prev_tail,
+        )
+    )
 
     return {
         "prev_year": prev_year,
@@ -783,8 +855,13 @@ def get_my_issued_roster_service(
     로그인 사용자 본인의 발행된 근무표만 조회합니다.
     snapshot의 roster_json에서 nurse_id 기준으로 추출.
     """
+    # 토큰 group_id 대신 nurse_id→DB home group 으로 스냅샷 조회(그룹전환/소속변경 안전).
+    from services.group_access import resolve_home_group_id
+
+    home_gid = resolve_home_group_id(db, current_user)
     snapshot_data = get_issued_roster_snapshot_service(
-        year=year, month=month, current_user=current_user, db=db
+        year=year, month=month, current_user=current_user, db=db,
+        target_group_id=home_gid,
     )
     if not snapshot_data:
         return None
@@ -810,7 +887,7 @@ def get_my_issued_roster_service(
     days_in_month = monthrange(year, month)[1]
     m_start = date(year, month, 1)
     m_end = date(year, month, days_in_month)
-    src_gid = getattr(current_user, "group_id", "") or ""
+    src_gid = home_gid or ""
     src_group_row = (
         db.query(Group).filter(Group.group_id == src_gid).first() if src_gid else None
     )
@@ -1991,7 +2068,7 @@ def revoke_schedule_share_link_service(db: Session, current_user, token: str) ->
         raise LookupError("Share link not found")
 
     is_master_admin = bool(getattr(current_user, "is_master_admin", False))
-    is_head_nurse = bool(getattr(current_user, "is_head_nurse", False))
+    is_head_nurse = caller_is_head_nurse(db, current_user)
     if not (is_master_admin or is_head_nurse):
         raise PermissionError("Permission denied")
     if is_master_admin and getattr(current_user, "office_id", None) and share_row.get("office_id") != getattr(current_user, "office_id", None):

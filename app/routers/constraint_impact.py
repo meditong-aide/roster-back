@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from db.client2 import get_db
 from db.models import RosterConfig, Team
 from routers.auth import get_current_user_from_cookie
+from services.group_access import resolve_home_group_id
 from schemas.auth_schema import User as UserSchema
 from services.constraint_impact.control import (
     find_constraint_instances,
@@ -187,7 +188,7 @@ def get_modules(
     """List ontology constraint modules with effective mode + supported actions."""
     try:
         snapshot = _build_listing_snapshot(
-            db, current_user.office_id, current_user.group_id, year, month
+            db, current_user.office_id, resolve_home_group_id(db, current_user), year, month
         )
         modules = list_constraint_modules(snapshot)
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -196,7 +197,7 @@ def get_modules(
         return {
             "year": year,
             "month": month,
-            "group_id": current_user.group_id,
+            "group_id": resolve_home_group_id(db, current_user),
             "module_count": len(modules),
             "modules": [asdict(m) for m in modules],
             "grouped_by_parent": grouped,
@@ -226,7 +227,7 @@ def preview_adjustments(
         from services.constraint_impact.control import apply_adjustments_to_config
 
         snapshot = _build_listing_snapshot(
-            db, current_user.office_id, current_user.group_id, body.year, body.month
+            db, current_user.office_id, resolve_home_group_id(db, current_user), body.year, body.month
         )
         before = dict(snapshot.config_payload)
         after = apply_adjustments_to_config(before, body.constraint_adjustments)
@@ -268,7 +269,7 @@ def get_instances(
     """Search constraint instances by family + scope filter."""
     try:
         snapshot = _build_listing_snapshot(
-            db, current_user.office_id, current_user.group_id, year, month
+            db, current_user.office_id, resolve_home_group_id(db, current_user), year, month
         )
         scope_filter: dict[str, Any] = {}
         if team is not None:

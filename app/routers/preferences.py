@@ -1,5 +1,6 @@
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from routers.auth import get_current_user_from_cookie
+from services.group_access import resolve_home_group_id
 from db.client2 import get_db
 from db.models import ShiftPreference, Nurse, Shift
 from schemas.auth_schema import User as UserSchema
@@ -50,7 +51,7 @@ async def submit_preferences(
         if preferences:
             allowed_shifts = {
                 row[0] for row in db.query(Shift.shift_id).filter(
-                    Shift.group_id == current_user.group_id,
+                    Shift.group_id == resolve_home_group_id(db, current_user),
                     Shift.show_in_preference == True
                 ).all()
             }

@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
-from db.models import Team, Nurse
+from db.models import Team, Nurse, NurseTeamPeriod
 from services.precheck.team_min_shift_capacity_validator import validate_team_min_shift_capacity
 
 
@@ -102,8 +102,17 @@ def list_teams_with_members(db: Session, office_id: str, group_id: str) -> List[
     return result
 
 
-def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dict], delete_team_ids: List[int] | None = None) -> List[Dict]:
-    """증분 오퍼레이션을 적용한다: create/rename/add/remove/delete."""
+def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dict], delete_team_ids: List[int] | None = None, year: int | None = None, month: int | None = None) -> List[Dict]:
+    """증분 오퍼레이션을 적용한다: create/rename/add/remove/delete.
+
+    year/month 가 주어지면 멤버 add/remove 를 nurse_team_period 에 valid_from=그 달 1일로
+    기록한다(월 단위 팀 지정, close-before-open). 없으면 기존처럼 캐시(nurse.team_id)만 갱신.
+    """
+    _period_from = None
+    if year and month:
+        from datetime import date as _date
+        from services.team_period import set_team_period as _set_tp
+        _period_from = _date(int(year), int(month), 1)
     existing = db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id).all()
     by_id = {t.team_id: t for t in existing}
     by_name = {t.team_name: t for t in existing if t.active == 1}
@@ -186,18 +195,41 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
                 raise ValueError(f"[{code}] {msg}")
 
         # add: 타깃 팀으로 이동(원팀 자동 해제)
+        #   period 모드(year/month 지정): SSOT=nurse_team_period 에만 기록하고
+        #     캐시(nurse.team_id)는 건드리지 않는다. 미래월 지정이 현재 캐시로 새지 않게 —
+        #     resolve_team 은 period 우선, period 공백일 때만 캐시 폴백이므로 월별로 정확.
+        #   레거시 모드(월 미지정): 기존대로 캐시만 갱신.
         if add_ids:
-            db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(add_ids)).update({Nurse.team_id: team.team_id}, synchronize_session=False)
+            if _period_from is not None:
+                for _nid in add_ids:
+                    _set_tp(db, nurse_id=str(_nid), group_id=group_id,
+                            valid_from=_period_from, team_id=int(team.team_id),
+                            source="team_setting", commit=False)
+            else:
+                db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(add_ids)).update({Nurse.team_id: team.team_id}, synchronize_session=False)
 
         # remove: 미배정 처리
         if remove_ids:
-            db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(remove_ids)).update({Nurse.team_id: None}, synchronize_session=False)
+            if _period_from is not None:
+                for _nid in remove_ids:
+                    _set_tp(db, nurse_id=str(_nid), group_id=group_id,
+                            valid_from=_period_from, team_id=None,
+                            source="team_setting", commit=False)
+            else:
+                db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.nurse_id.in_(remove_ids)).update({Nurse.team_id: None}, synchronize_session=False)
 
     # 2) 팀 삭제(soft) + 멤버 해제
     if delete_team_ids:
         print('delete_team_ids', delete_team_ids)
         # 멤버 해제 후 팀 행 삭제(하드 삭제)
         db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.team_id.in_(delete_team_ids)).update({Nurse.team_id: None}, synchronize_session=False)
+        # 시점 모델 정합: 삭제된 팀을 가리키는 nurse_team_period 도 제거.
+        #   안 하면 캐시(team_id)는 None인데 period 는 옛 팀을 가리켜 resolve 가 '없는 팀'을
+        #   반환(고아). 캐시 None 처리와 동일 의미로 period 행을 삭제한다.
+        db.query(NurseTeamPeriod).filter(
+            NurseTeamPeriod.group_id == group_id,
+            NurseTeamPeriod.team_id.in_(delete_team_ids),
+        ).delete(synchronize_session=False)
         db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id, Team.team_id.in_(delete_team_ids)).delete(synchronize_session=False)
 
     db.commit()

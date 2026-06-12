@@ -5,10 +5,11 @@
 """
 
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, select
+from sqlalchemy import or_, and_, select
 from fastapi import HTTPException
 from db.models import (
     Nurse as NurseModel,
+    NurseMonthlyLimit,
     Group,
     DeletedNurseHistory,
     NurseAssignment,
@@ -16,7 +17,7 @@ from db.models import (
     Shift,
 )
 from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP
-from services.group_access import resolve_managed_group_ids
+from services.group_access import resolve_managed_group_ids, caller_is_head_nurse, resolve_home_group_id, caller_is_hn
 from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
 from typing import List, Optional, Dict, Any, Tuple
@@ -28,8 +29,12 @@ from datalayer.member import Member
 import logging
 import os
 import secrets
+import time
 import boto3
+from threading import Lock
 from urllib.parse import quote
+import base64
+import json
 
 
 def _build_profile_image_url(image_key: Optional[str]) -> Optional[str]:
@@ -206,15 +211,21 @@ def _load_preceptees_map(db: Session, nurses) -> Dict[str, List[Dict[str, Any]]]
 def get_nurses_in_group_service(
     current_user, db: Session, nurse_id: Optional[str] = None,
     skip_group_filter: bool = False,
+    view_group_id: Optional[str] = None,
 ):
     """
     그룹 내 간호사 목록 조회 서비스 함수
     특정 nurse_id가 제공되면 해당 간호사만 반환, 그렇지 않으면 그룹 내 모든 간호사 반환
     birth_date (VARCHAR)를 파싱하여 만 나이를 age로 추가
     skip_group_filter: True면 group_id 필터 스킵 (파견/병동이동 인바운드 조회용)
+    override_group_id: HN 등이 query param 으로 다른 그룹 조회 시 사용. 권한 검증은 라우터 책임.
     """
     if not current_user:
         raise Exception("Not authenticated")
+
+    # 그룹 스코프: 라우터가 검증해 넘긴 view_group_id(토큰 무관, nurse_id→DB+hn_id) 우선,
+    # 없으면 레거시 토큰 group_id 폴백.
+    _gid = view_group_id or resolve_home_group_id(db, current_user)
 
     query = db.query(NurseModel)
 
@@ -222,20 +233,33 @@ def get_nurses_in_group_service(
     # 정책: status='active' 인 inbound assignment 가 있는 nurse 는 미래 시작 여부와 무관하게 노출.
     #   - source 측: Nurse.group_id 매칭으로 outbound nurse 도 자연 노출 (양쪽 노출).
     #   - 실근무 일자가 아닌 셀은 솔버의 active_window/blocked_days 로 제외되므로 안전.
-    if not skip_group_filter and current_user.group_id:
+    if not skip_group_filter and _gid:
         _inbound_subq = (
             db.query(NurseAssignment.nurse_id)
             .filter(
-                NurseAssignment.target_group_id == current_user.group_id,
+                NurseAssignment.target_group_id == _gid,
                 NurseAssignment.status == "active",
                 NurseAssignment.reason.in_(_INBOUND_REASONS),
             )
             .subquery()
         )
+        # 전출(병동이동) 나간 간호사: 발효 완료되면 nurses.group_id 가 target 으로 바뀌어
+        # 위 두 조건에 안 걸린다. source 가 나(=출발지)인 병동이동 행으로 역으로 잡아
+        # 명단에 '전출함'으로 노출 (상세 차단·회색 처리는 프론트가 inbound 항목 방향으로 판단).
+        _outbound_transfer_subq = (
+            db.query(NurseAssignment.nurse_id)
+            .filter(
+                NurseAssignment.source_group_id == _gid,
+                NurseAssignment.target_group_id != _gid,
+                NurseAssignment.reason == "병동이동",
+            )
+            .subquery()
+        )
         query = query.filter(
             or_(
-                NurseModel.group_id == current_user.group_id,
+                NurseModel.group_id == _gid,
                 NurseModel.nurse_id.in_(select(_inbound_subq.c.nurse_id)),
+                NurseModel.nurse_id.in_(select(_outbound_transfer_subq.c.nurse_id)),
             )
         )
 
@@ -257,7 +281,7 @@ def get_nurses_in_group_service(
         raise Exception(f"Nurse with nurse_id {nurse_id} not found")
 
     # roster_config에서 표시 설정 플래그 조회
-    display_flags = _get_display_flags(db, current_user.group_id)
+    display_flags = _get_display_flags(db, _gid)
 
     # 만 나이 계산
     current_date = date.today()
@@ -285,9 +309,9 @@ def get_nurses_in_group_service(
     inbound_blocks: Dict[str, Dict[str, Any]] = {}
     if nurses:
         _nids = [n.nurse_id for n in nurses]
-        if current_user.group_id:
-            inbound_map = _load_inbound_map(db, current_user.group_id, _nids)
-        inbound_blocks = _build_inbound_blocks(db, _nids)
+        if _gid:
+            inbound_map = _load_inbound_map(db, _gid, _nids)
+        inbound_blocks = _build_inbound_blocks(db, _nids, caller_group_id=_gid)
 
     # preceptor → preceptees 배치 로드 (프리셉터 사이드 프로필에 N명 노출용)
     preceptees_map: Dict[str, List[Dict[str, Any]]] = _load_preceptees_map(db, nurses)
@@ -352,6 +376,62 @@ def get_nurses_in_group_service(
         result.append(nurse_dict)
 
     return result
+
+
+def attach_n_exact_to_nurses(
+    db: Session,
+    nurses: list,
+    year: Optional[int],
+    month: Optional[int],
+) -> list:
+    """근무자관리 get-nurse 응답에 월별 야간 한도(n_exact=고정, n_max=최대)를 주입한다.
+
+    - year/month 가 주어진 경우에만 동작(없으면 그대로 반환).
+    - nurse_monthly_limits 를 (nurse_id, year, month) 로 조회해 각 간호사 dict 에
+      'n_exact' 키를 채운다. unique scope 가 (nurse_id, group_id, year, month) 이므로
+      간호사의 group_id 와 정확히 일치하는 행을 우선 사용하고, 없으면 동일 nurse_id 의
+      임의 행으로 폴백한다. 해당 행이 없으면 키를 설정하지 않아 스키마 기본값(None)을 따른다.
+    """
+    if not nurses or year is None or month is None:
+        return nurses
+    nids = [n.get("nurse_id") for n in nurses if isinstance(n, dict) and n.get("nurse_id")]
+    if not nids:
+        return nurses
+    rows = (
+        db.query(
+            NurseMonthlyLimit.nurse_id,
+            NurseMonthlyLimit.group_id,
+            NurseMonthlyLimit.n_exact,
+            NurseMonthlyLimit.n_max,
+        )
+        .filter(
+            NurseMonthlyLimit.year == int(year),
+            NurseMonthlyLimit.month == int(month),
+            NurseMonthlyLimit.nurse_id.in_(nids),
+        )
+        .all()
+    )
+    exact_map: dict = {}
+    any_exact_map: dict = {}
+    max_map: dict = {}
+    any_max_map: dict = {}
+    for nid, gid, n_exact, n_max in rows:
+        exact_map[(nid, gid)] = n_exact
+        any_exact_map.setdefault(nid, n_exact)
+        max_map[(nid, gid)] = n_max
+        any_max_map.setdefault(nid, n_max)
+    for n in nurses:
+        if not isinstance(n, dict):
+            continue
+        nid = n.get("nurse_id")
+        gid = n.get("group_id")
+        if (nid, gid) in exact_map:
+            n["n_exact"] = exact_map[(nid, gid)]
+            n["n_max"] = max_map[(nid, gid)]
+        elif nid in any_exact_map:
+            n["n_exact"] = any_exact_map[nid]
+            n["n_max"] = any_max_map.get(nid)
+    return nurses
 
 
 def get_nurses_filtered_service(
@@ -519,6 +599,7 @@ def move_nurse_with_active_service(
     target_active: Optional[int],
     current_user,
     db: Session,
+    group_id: Optional[str] = None,
 ):
     """
     간호사 이동/상태변경을 단일 트랜잭션으로 처리.
@@ -526,16 +607,27 @@ def move_nurse_with_active_service(
     - target_active가 0/1이면 해당 상태 리스트로 이동 후 삽입
     """
     if not current_user:
-        raise Exception("Not authenticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
     # 수간호사 또는 마스터관리자만 허용
     if not (
-        getattr(current_user, "is_head_nurse", False)
+        caller_is_head_nurse(db, current_user)
         or getattr(current_user, "is_master_admin", False)
     ):
-        raise Exception("Permission denied")
+        raise HTTPException(status_code=403, detail="Permission denied")
 
-    # ADM은 group_id가 없을 수 있으므로 nurse_id만으로 조회 후 대상 그룹을 결정
-    if getattr(current_user, "is_master_admin", False) and not getattr(
+    # 그룹 결정 우선순위: (1) 라우터가 검증해 넘긴 group_id(토큰 무관, nurse_id→DB+hn_id),
+    # (2) ADM 무지정 시 nurse_id 로 조회, (3) 레거시 토큰 group_id.
+    if group_id:
+        target_group_id = group_id
+        nurse = (
+            db.query(NurseModel)
+            .filter(
+                NurseModel.group_id == group_id,
+                NurseModel.nurse_id == nurse_id,
+            )
+            .first()
+        )
+    elif getattr(current_user, "is_master_admin", False) and not getattr(
         current_user, "group_id", None
     ):
         nurse = (
@@ -590,7 +682,11 @@ def move_nurse_with_active_service(
 
 
 def reorder_nurses_service(
-    active_order: List[str], inactive_order: List[str], current_user, db: Session
+    active_order: List[str],
+    inactive_order: List[str],
+    current_user,
+    db: Session,
+    group_id: Optional[str] = None,
 ):
     """
     드래그앤드롭 완료 시점에 한 번 호출하여
@@ -599,11 +695,12 @@ def reorder_nurses_service(
     - 전달되지 않은 간호사는 상태/순서 변경하지 않음(React 측에서 전체 보냄을 권장)
     """
     if not current_user:
-        raise Exception("Not authenticated")
-    if not current_user.is_head_nurse:
-        raise Exception("Permission denied")
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not caller_is_head_nurse(db, current_user):
+        raise HTTPException(status_code=403, detail="Permission denied")
 
-    group_id = current_user.group_id
+    # 라우터가 검증해 넘긴 group_id(토큰 무관) 우선, 없으면 레거시 토큰 폴백.
+    group_id = group_id or resolve_home_group_id(db, current_user)
     id_to_nurse = {
         n.nurse_id: n
         for n in db.query(NurseModel).filter(NurseModel.group_id == group_id).all()
@@ -858,7 +955,7 @@ def move_nurse_service(req, current_user, db: Session):
     """
     if not current_user:
         raise Exception("Not authenticated")
-    if not current_user.is_head_nurse:
+    if not caller_is_head_nurse(db, current_user):
         raise Exception("Permission denied")
 
     nurse_to_move = (
@@ -921,87 +1018,438 @@ def move_nurse_service(req, current_user, db: Session):
     return {"message": "간호사 순서 변경 완료"}
 
 
-def get_available_members_service(
-    office_id: str, group_id: str, db: Session
-) -> List[Dict[str, Any]]:
-    """
-    동일 오피스의 전체 멤버 중 현재 그룹에 속하지 않은 멤버 목록 반환.
-    - MSSQL Member 테이블에서 오피스 전체 멤버 조회
-    - MySQL nurses 테이블에서 해당 group_id에 이미 등록된 nurse_id 조회
-    - 이미 등록된 멤버를 제외한 나머지 반환
-    """
-    # 1. MSSQL에서 오피스 전체 멤버 조회 (export-members와 동일 쿼리)
-    all_members = (
-        msdb_manager.fetch_all(
-            Member.member_export_by_office(), params=(str(office_id),)
-        )
-        or []
-    )
+def _encode_available_member_cursor(
+    nurse_id: str, name: Optional[str] = None
+) -> str:
+    payload: Dict[str, str] = {"nurse_id": nurse_id}
+    if name is not None:
+        payload["name"] = name
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-    # 2. 현재 group_id에 이미 등록된 간호사의 nurse_id 집합
-    existing_nurse_ids = set(
-        row[0]
-        for row in db.query(NurseModel.nurse_id)
-        .filter(NurseModel.group_id == group_id)
+
+def _decode_available_member_cursor(
+    cursor: Optional[str],
+) -> Dict[str, Optional[str]]:
+    if not cursor:
+        return {"nurse_id": None, "name": None}
+    try:
+        padded = cursor + ("=" * (-len(cursor) % 4))
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        nurse_id = payload.get("nurse_id")
+        name = payload.get("name")
+        return {
+            "nurse_id": str(nurse_id) if nurse_id else None,
+            "name": str(name) if name is not None else None,
+        }
+    except Exception:
+        return {"nurse_id": None, "name": None}
+
+
+def _normalize_search_text(value: Any) -> str:
+    return str(value or "").replace(" ", "").strip()
+
+
+# 근무자 추가 모달의 오피스 멤버 조회(groupware MSSQL, 행마다 T_Team 상관 서브쿼리)
+# 결과를 짧은 TTL 로 캐시한다. 검색 경로는 매 페이지마다 전체 멤버를 다시 조회하므로
+# (한글 LIKE 깨짐 회피) 대형 오피스에서 페이지/검색이 느려진다 → 첫 페이지만 실제 조회.
+_OFFICE_MEMBERS_TTL = 60.0  # 초. HR 로스터는 자주 안 바뀌므로 안전.
+_office_members_cache: Dict[str, Tuple[float, List[Any]]] = {}
+_office_members_fetch_locks: Dict[str, Lock] = {}  # 오피스별 실제 조회 직렬화
+_office_members_lock = Lock()  # 위 두 dict 를 함께 보호(짧게만 점유)
+
+
+def _office_fetch_lock(key: str) -> Lock:
+    """오피스별 fetch lock 반환(없으면 생성). cache stampede 방지용."""
+    with _office_members_lock:
+        lk = _office_members_fetch_locks.get(key)
+        if lk is None:
+            lk = Lock()
+            _office_members_fetch_locks[key] = lk
+        return lk
+
+
+def _prune_expired_office_cache(now: float) -> None:
+    """만료된 오피스의 멤버 캐시(메모리의 대부분=수천 행)를 제거해 바운딩한다.
+    호출 측이 _office_members_lock 을 보유한 채 호출한다.
+
+    fetch lock(_office_members_fetch_locks)은 일부러 제거하지 않는다: 조회 중인
+    lock 을 지우면 새 요청이 새 lock 을 만들어 동일 오피스 stampede 직렬화가 깨지기
+    때문이다. lock 은 오피스(=병원 tenant) 수만큼만 생기는 경량 객체라 자연 bounded 이고,
+    메모리의 실질 비중인 멤버 리스트는 여기서 제거되므로 사실상 영향이 없다."""
+    expired = [
+        k for k, (ts, _) in _office_members_cache.items()
+        if now - ts >= _OFFICE_MEMBERS_TTL
+    ]
+    for k in expired:
+        _office_members_cache.pop(k, None)
+
+
+def _fetch_office_members_cached(office_id: str) -> List[Any]:
+    """오피스 전체 멤버를 TTL 캐시로 조회. 동일 office 의 후속 페이지·검색 키 입력은
+    캐시 스냅샷을 재사용한다(제외집합 existing_nurse_ids 는 호출 측에서 live 로 계산).
+
+    동일 오피스의 TTL 만료 시 동시 요청이 모두 MSSQL 전체 조회를 실행하는
+    cache stampede 를 막기 위해 오피스별 fetch lock 으로 실제 조회를 1회로 직렬화한다.
+    """
+    key = str(office_id)
+    now = time.monotonic()
+    with _office_members_lock:
+        entry = _office_members_cache.get(key)
+        if entry is not None and now - entry[0] < _OFFICE_MEMBERS_TTL:
+            return entry[1]
+
+    # 동일 오피스 동시 요청은 한 번만 실제 조회(나머지는 아래 double-check 에서 캐시 적중).
+    with _office_fetch_lock(key):
+        with _office_members_lock:
+            entry = _office_members_cache.get(key)
+            if entry is not None and time.monotonic() - entry[0] < _OFFICE_MEMBERS_TTL:
+                return entry[1]
+        rows = (
+            msdb_manager.fetch_all(
+                Member.member_export_by_office(), params=(key,)
+            )
+            or []
+        )
+        stored_at = time.monotonic()
+        with _office_members_lock:
+            _office_members_cache[key] = (stored_at, rows)
+            _prune_expired_office_cache(stored_at)
+        return rows
+
+
+# 한글 초성 검색(ㄱㅁㅈ → 김민지)용 초성 테이블.
+_CHOSUNG_LIST = [
+    "ㄱ", "ㄲ", "ㄴ", "ㄷ", "ㄸ", "ㄹ", "ㅁ", "ㅂ", "ㅃ", "ㅅ",
+    "ㅆ", "ㅇ", "ㅈ", "ㅉ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ",
+]
+
+
+def _extract_chosung(text: str) -> str:
+    """완성형 한글 문자열에서 초성만 추출(가→ㄱ). 비한글 문자는 그대로 둔다."""
+    out: List[str] = []
+    for ch in text:
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:  # 가 ~ 힣
+            out.append(_CHOSUNG_LIST[(code - 0xAC00) // 588])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _chosung_or_substr_match(query: str, text: Any) -> bool:
+    """text 부분일치 또는 text 초성 부분일치로 매칭(이름·소속 공통).
+
+    초성은 '질의 전체가 초성'일 때만이 아니라 항상 함께 검사한다. 그래야 숫자/영문이
+    섞인 소속명(예: '105병동' → 초성 '105ㅂㄷ')을 'ㅂㄷ'(부분 초성) 또는 '105ㅂㄷ'
+    (혼합)로도 찾을 수 있고, 순수 초성('ㅇㄱ'→외과)·리터럴('병동')도 모두 매칭된다."""
+    norm = _normalize_search_text(text)
+    if not norm:
+        return False
+    if query in norm:
+        return True
+    return query in _extract_chosung(norm)
+
+
+def _available_member_row_to_dict(
+    row: Any, registered_info: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
+    if not emp_seq_no:
+        return None
+    return {
+        "nurse_id": str(emp_seq_no),
+        "emp_num": _available_member_row_value(row, "OfficeEmpNum"),
+        "account_id": _available_member_row_value(row, "MemberID"),
+        "name": _available_member_row_value(row, "EmployeeName"),
+        "duty": _available_member_row_value(row, "duty"),
+        "career": _available_member_row_value(row, "career"),
+        "is_head_nurse": _available_member_row_value(row, "headnurse"),
+        "joining_date": _available_member_row_value(row, "joindate"),
+        "birth_date": _available_member_row_value(row, "DateOfBirth"),
+        "phone_number": _available_member_row_value(row, "PortableTel"),
+        "gender": _available_member_row_value(row, "Gender"),
+        "big_kind_name": _available_member_row_value(row, "big_kind_name"),
+        "middle_kind_name": _available_member_row_value(row, "middle_kind_name"),
+        "small_kind_name": _available_member_row_value(row, "small_kind_name"),
+        "mb_part_name": _available_member_row_value(row, "mb_part_name"),
+        # 타 병동 등록 여부(additive). 등록자는 프론트에서 선택 불가 처리.
+        "is_registered": bool(registered_info),
+        "registered_group_id": (registered_info or {}).get("group_id"),
+        "registered_group_name": (registered_info or {}).get("group_name"),
+    }
+
+
+def _available_member_row_value(row: Any, key: str) -> Any:
+    return row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+
+
+def _get_office_registered_nurse_ids(office_id: str, db: Session) -> set[str]:
+    """오피스에 이미 근무자로 등록된 nurse_id 집합 (available-members 제외용)."""
+    office_id = str(office_id)
+    office_group_ids = select(Group.group_id).where(Group.office_id == office_id)
+    rows = (
+        db.query(NurseModel.nurse_id)
+        .filter(
+            or_(
+                NurseModel.office_id == office_id,
+                NurseModel.group_id.in_(office_group_ids),
+            )
+        )
         .all()
     )
+    return {str(row[0]) for row in rows if row[0] is not None}
 
-    # 3. 이미 등록된 멤버 제외
+
+def _get_office_registered_nurse_map(office_id: str, db: Session) -> Dict[str, Dict[str, Any]]:
+    """오피스에 이미 등록된 nurse_id → 소속 그룹 정보 매핑 (available-members 표시용).
+
+    범위는 `_get_office_registered_nurse_ids`와 동일(office_id 또는 office 소속 group).
+    각 값은 {"group_id": ..., "group_name": ...}.
+    """
+    office_id = str(office_id)
+    office_group_ids = select(Group.group_id).where(Group.office_id == office_id)
+    rows = (
+        db.query(NurseModel.nurse_id, NurseModel.group_id, Group.group_name)
+        .outerjoin(Group, Group.group_id == NurseModel.group_id)
+        .filter(
+            or_(
+                NurseModel.office_id == office_id,
+                NurseModel.group_id.in_(office_group_ids),
+            )
+        )
+        .all()
+    )
+    registered: Dict[str, Dict[str, Any]] = {}
+    for nurse_id, group_id, group_name in rows:
+        if nurse_id is None:
+            continue
+        registered[str(nurse_id)] = {
+            "group_id": str(group_id) if group_id is not None else None,
+            "group_name": group_name,
+        }
+    return registered
+
+
+def _available_member_matches_search(
+    row: Any, normalized_q: str, search_by: str
+) -> bool:
+    if not normalized_q:
+        return True
+
+    query = _normalize_search_text(normalized_q)
+    if not query:
+        return True
+
+    if search_by == "affiliation":
+        values = [
+            _available_member_row_value(row, "big_kind_name"),
+            _available_member_row_value(row, "middle_kind_name"),
+            _available_member_row_value(row, "small_kind_name"),
+            _available_member_row_value(row, "mb_part_name"),
+        ]
+        # 소속도 초성 검색 지원(ㅇㄱ → 외과)
+        return any(_chosung_or_substr_match(query, value) for value in values)
+
+    # 이름: 초성(ㄱㅁㅈ → 김민지) 또는 부분일치
+    if _chosung_or_substr_match(query, _available_member_row_value(row, "EmployeeName")):
+        return True
+    # 사번/EmpSeqNo: 숫자가 포함된 질의일 때만 매칭(이름 검색어가 사번에 오탐되는 것 방지)
+    if any(ch.isdigit() for ch in query):
+        emp_num = _normalize_search_text(_available_member_row_value(row, "OfficeEmpNum"))
+        emp_seq = _normalize_search_text(_available_member_row_value(row, "EmpSeqNo"))
+        return query in emp_num or query in emp_seq
+    return False
+
+
+def get_available_members_service(
+    office_id: str,
+    group_id: str,
+    db: Session,
+    q: Optional[str] = None,
+    search_by: str = "name",
+    cursor: Optional[str] = None,
+    limit: int = 20,
+    pagination: Optional[str] = None,
+) -> List[Dict[str, Any]] | Dict[str, Any]:
+    """
+    동일 오피스의 전체 멤버 중 nurses에 미등록된 멤버 목록 반환.
+    - MSSQL Member 테이블에서 오피스 전체 멤버 조회
+    - MySQL nurses 테이블에서 해당 office_id에 이미 등록된 nurse_id 조회
+    - 다른 병동을 포함해 이미 등록된 멤버를 제외한 나머지 반환
+    """
+    print(
+        "[DEBUG] available-members service params",
+        {
+            "office_id": office_id,
+            "group_id": group_id,
+            "pagination": pagination,
+            "q": q,
+            "search_by": search_by,
+            "cursor": cursor,
+            "limit": limit,
+        },
+    )
+    if pagination == "cursor":
+        limit = max(1, min(int(limit or 20), 100))
+        decoded_cursor = _decode_available_member_cursor(cursor)
+        registered_map = _get_office_registered_nurse_map(office_id, db)
+
+        normalized_q = (q or "").strip()
+        normalized_search_by = "affiliation" if search_by == "affiliation" else "name"
+
+        # MSSQL(EUC-KR) + UTF-8 LIKE 파라미터 조합에서 한글 검색이 깨지므로
+        # 검색(q)은 Member 전체(TTL 캐시) 조회 후 Python에서 필터한다.
+        if normalized_q:
+            all_members = _fetch_office_members_cached(office_id)
+            matched_rows = []
+            cursor_name = decoded_cursor.get("name")
+            cursor_nurse_id = decoded_cursor.get("nurse_id")
+            for row in all_members:
+                emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
+                if not emp_seq_no:
+                    continue
+                # 타 병동 등록자도 목록에 노출(선택 불가 표시용)하므로 제외하지 않는다.
+                if not _available_member_matches_search(
+                    row, normalized_q, normalized_search_by
+                ):
+                    continue
+                row_name = str(_available_member_row_value(row, "EmployeeName") or "")
+                if cursor_name is not None and cursor_nurse_id:
+                    row_key = (row_name, str(emp_seq_no))
+                    cursor_key = (cursor_name, str(cursor_nurse_id))
+                    if row_key <= cursor_key:
+                        continue
+                matched_rows.append(row)
+
+            matched_rows.sort(
+                key=lambda row: (
+                    str(_available_member_row_value(row, "EmployeeName") or ""),
+                    str(_available_member_row_value(row, "EmpSeqNo") or ""),
+                )
+            )
+            page_rows = matched_rows[: limit + 1]
+            items = []
+            for row in page_rows[:limit]:
+                emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
+                registered_info = registered_map.get(str(emp_seq_no)) if emp_seq_no else None
+                member_dict = _available_member_row_to_dict(row, registered_info)
+                if member_dict:
+                    items.append(member_dict)
+
+            print(
+                "[DEBUG] available-members q rows",
+                {
+                    "normalized_q": normalized_q,
+                    "search_by": normalized_search_by,
+                    "decoded_cursor": decoded_cursor,
+                    "matched_count": len(matched_rows),
+                    "sample_names": [
+                        _available_member_row_value(row, "EmployeeName")
+                        for row in matched_rows[:5]
+                    ],
+                },
+            )
+            has_next = len(page_rows) > limit
+            if has_next and items:
+                last_item = items[-1]
+                next_cursor = _encode_available_member_cursor(
+                    last_item["nurse_id"], name=str(last_item.get("name") or "")
+                )
+            else:
+                next_cursor = None
+            return {
+                "items": items,
+                "next_cursor": next_cursor,
+                "has_next": has_next,
+            }
+
+        # 검색어 없음: 전체 멤버(TTL 캐시)에서 Python 페이지네이션.
+        # 기존 NOT IN(%s,...) 방식은 등록 간호사 수만큼 파라미터를 생성해
+        # MSSQL 2100 파라미터 한도로 대형 오피스에서 실패할 수 있어 제거한다.
+        # 정렬·커서는 기존과 동일하게 EmpSeqNo 문자열 오름차순 + nurse_id 커서를 유지.
+        all_members = _fetch_office_members_cached(office_id)
+        cursor_nurse_id = decoded_cursor.get("nurse_id")
+        filtered = []
+        for row in all_members:
+            emp_seq_no = _available_member_row_value(row, "EmpSeqNo")
+            if not emp_seq_no:
+                continue
+            emp_seq_str = str(emp_seq_no)
+            # 타 병동 등록자도 목록에 노출(선택 불가 표시용)하므로 제외하지 않는다.
+            if cursor_nurse_id and emp_seq_str <= str(cursor_nurse_id):
+                continue
+            filtered.append((emp_seq_str, row))
+
+        filtered.sort(key=lambda pair: pair[0])
+        page_rows = filtered[: limit + 1]
+        print(
+            "[DEBUG] available-members cursor rows",
+            {
+                "normalized_search_by": normalized_search_by,
+                "decoded_cursor": decoded_cursor,
+                "registered_count": len(registered_map),
+                "raw_count": len(page_rows),
+                "sample_names": [
+                    _available_member_row_value(row, "EmployeeName")
+                    for _, row in page_rows[:5]
+                ],
+            },
+        )
+        items = []
+        for emp_seq_str, row in page_rows[:limit]:
+            registered_info = registered_map.get(emp_seq_str)
+            member_dict = _available_member_row_to_dict(row, registered_info)
+            if member_dict:
+                items.append(member_dict)
+
+        has_next = len(page_rows) > limit
+        if has_next and items:
+            next_cursor = _encode_available_member_cursor(items[-1]["nurse_id"])
+        else:
+            next_cursor = None
+        return {
+            "items": items,
+            "next_cursor": next_cursor,
+            "has_next": has_next,
+        }
+
+    # 1. MSSQL에서 오피스 전체 멤버 조회 (export-members와 동일 쿼리, TTL 캐시)
+    all_members = _fetch_office_members_cached(office_id)
+
+    # 2. 오피스에 이미 등록된 간호사 → 소속 그룹 매핑
+    registered_map = _get_office_registered_nurse_map(office_id, db)
+
+    # 3. 타 병동 등록자도 목록에 노출(선택 불가 표시용)하므로 제외하지 않는다.
     available = []
+    normalized_q = (q or "").strip()
+    normalized_search_by = "affiliation" if search_by == "affiliation" else "name"
     for row in all_members:
         emp_seq_no = (
             row.get("EmpSeqNo")
             if isinstance(row, dict)
             else getattr(row, "EmpSeqNo", None)
         )
-        if emp_seq_no and str(emp_seq_no) not in existing_nurse_ids:
-            member_dict = {
-                "nurse_id": str(emp_seq_no),
-                "emp_num": row.get("OfficeEmpNum")
-                if isinstance(row, dict)
-                else getattr(row, "OfficeEmpNum", None),
-                "account_id": row.get("MemberID")
-                if isinstance(row, dict)
-                else getattr(row, "MemberID", None),
-                "name": row.get("EmployeeName")
-                if isinstance(row, dict)
-                else getattr(row, "EmployeeName", None),
-                "duty": row.get("duty")
-                if isinstance(row, dict)
-                else getattr(row, "duty", None),
-                "career": row.get("career")
-                if isinstance(row, dict)
-                else getattr(row, "career", None),
-                "is_head_nurse": row.get("headnurse")
-                if isinstance(row, dict)
-                else getattr(row, "headnurse", None),
-                "joining_date": row.get("joindate")
-                if isinstance(row, dict)
-                else getattr(row, "joindate", None),
-                "birth_date": row.get("DateOfBirth")
-                if isinstance(row, dict)
-                else getattr(row, "DateOfBirth", None),
-                "phone_number": row.get("PortableTel")
-                if isinstance(row, dict)
-                else getattr(row, "PortableTel", None),
-                "gender": row.get("Gender")
-                if isinstance(row, dict)
-                else getattr(row, "Gender", None),
-                "big_kind_name": row.get("big_kind_name")
-                if isinstance(row, dict)
-                else getattr(row, "big_kind_name", None),
-                "middle_kind_name": row.get("middle_kind_name")
-                if isinstance(row, dict)
-                else getattr(row, "middle_kind_name", None),
-                "small_kind_name": row.get("small_kind_name")
-                if isinstance(row, dict)
-                else getattr(row, "small_kind_name", None),
-                "mb_part_name": row.get("mb_part_name")
-                if isinstance(row, dict)
-                else getattr(row, "mb_part_name", None),
-            }
-            available.append(member_dict)
+        if emp_seq_no:
+            if not _available_member_matches_search(
+                row, normalized_q, normalized_search_by
+            ):
+                continue
+            registered_info = registered_map.get(str(emp_seq_no))
+            member_dict = _available_member_row_to_dict(row, registered_info)
+            if member_dict:
+                available.append(member_dict)
 
+    print(
+        "[DEBUG] available-members legacy rows",
+        {
+            "normalized_q": normalized_q,
+            "search_by": normalized_search_by,
+            "registered_count": len(registered_map),
+            "count": len(available),
+            "sample_names": [item.get("name") for item in available[:5]],
+        },
+    )
     return available
 
 
@@ -1037,6 +1485,15 @@ def add_nurses_to_group_service(
         if emp_seq:
             member_map[str(emp_seq)] = row
 
+    # 동일 오피스에 속한 그룹 집합(타 병동 이동 차단 판정용).
+    office_group_ids = {
+        str(row[0])
+        for row in db.query(Group.group_id)
+        .filter(Group.office_id == str(office_id))
+        .all()
+        if row[0] is not None
+    }
+
     for nid in nurse_ids:
         try:
             # nurses 테이블에서 해당 nurse_id 조회 (group_id 무관)
@@ -1045,6 +1502,25 @@ def add_nurses_to_group_service(
             )
 
             if existing_nurse:
+                # 타 병동(동일 오피스 내 다른 그룹) 소속이면 이동시키지 않고 차단.
+                # 병동 간 정식 이동은 별도 재분배 기능을 사용한다.
+                current_gid = (
+                    str(existing_nurse.group_id)
+                    if existing_nurse.group_id is not None
+                    else None
+                )
+                if (
+                    current_gid is not None
+                    and current_gid != str(group_id)
+                    and current_gid in office_group_ids
+                ):
+                    errors.append(
+                        {
+                            "nurse_id": nid,
+                            "reason": "타 병동 소속 근무자입니다. 병동이동 기능을 사용하세요.",
+                        }
+                    )
+                    continue
                 # 이미 nurses 테이블에 존재 → group_id만 변경
                 existing_nurse.group_id = group_id
                 # sequence는 현재 그룹 + role 그룹 활성 목록의 마지막으로 배치
@@ -1156,7 +1632,7 @@ def update_nurse_profile_service(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     is_admin = current_user.is_master_admin
-    is_head = current_user.is_head_nurse
+    is_head = caller_is_head_nurse(db, current_user)
 
     if not (is_admin or is_head):
         raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 수정할 수 있습니다.")
@@ -1210,22 +1686,38 @@ def update_nurse_profile_service(
         }
 
     # 호출 view 의 group_id 결정 (target view 에서 inbound nurse 수정 시 명시 필요).
-    # 권한 검증:
+    # 권한 검증 (사이드프로필 / source 모두 동일):
     #   - 본인 group 과 동일하면 OK
     #   - 다른 group 인 경우 master_admin 또는 hn_auth=='HN'(그룹 관리자) 만 허용
-    _caller_view_group = view_group_id or current_user.group_id
+    _caller_view_group = view_group_id or resolve_home_group_id(db, current_user)
     if (
-        view_group_id
-        and view_group_id != current_user.group_id
+        not view_group_id
         and not is_admin
-        and str(getattr(current_user, "hn_auth", "") or "").upper() != "HN"
+        and not caller_is_hn(db, current_user)
     ):
-        raise HTTPException(
-            status_code=403,
-            detail="다른 그룹 view 에서 nurse 수정 권한이 없습니다 (HN/admin 필요).",
-        )
+        from services.group_access import resolve_managed_group_ids
+        _managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+        if str(nurse.group_id) in _managed:
+            _caller_view_group = nurse.group_id  # source view 자동
+        else:
+            _inbound_match = (
+                db.query(NurseAssignment)
+                .filter(
+                    NurseAssignment.nurse_id == nurse_id,
+                    NurseAssignment.target_group_id.in_(list(_managed)),
+                    NurseAssignment.status == "active",
+                    NurseAssignment.reason.in_(_INBOUND_REASONS),
+                )
+                .order_by(NurseAssignment.start_date.desc())
+                .first()
+            )
+            if _inbound_match is not None:
+                _caller_view_group = _inbound_match.target_group_id  # target view 자동
     # ADM는 기존 경로 (권한 체크만 통과시키면 nurses.*에 직접 저장)
     if is_admin:
+        _validate_team_grade_change_or_raise(
+            db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
+        )
         _apply_source_nurse_update(nurse, fields)
         db.commit()
         db.refresh(nurse)
@@ -1237,10 +1729,18 @@ def update_nurse_profile_service(
                 status_code=403, detail="해당 간호사를 수정할 권한이 없습니다."
             )
         if mode == "target" and assign_row is not None:
+            _validate_team_grade_change_or_raise(
+                db, nurse, fields, scope="target",
+                group_id=assign_row.target_group_id,
+                assign_row=assign_row,
+            )
             _apply_target_update(assign_row, fields)
             db.commit()
             db.refresh(assign_row)
         else:
+            _validate_team_grade_change_or_raise(
+                db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
+            )
             _apply_source_nurse_update(nurse, fields)
             # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
             # 프론트가 view_group_id 안 보내도 source view 호출 한 번으로 inbound 모두 동기화.
@@ -1316,6 +1816,58 @@ def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> Non
     for key, value in fields.items():
         if hasattr(nurse, key):
             setattr(nurse, key, value)
+
+
+def _validate_team_grade_change_or_raise(
+    db: Session,
+    nurse: NurseModel,
+    fields: Dict[str, Any],
+    *,
+    scope: str,  # 'source' | 'target'
+    group_id: str,
+    assign_row: Optional[NurseAssignment] = None,
+) -> None:
+    """fields 에 team_id/grade 변경 포함 시 인원 정합성 검증. 위반 시 422 raise.
+
+    scope='source': nurses.* 직접 수정 (변경 전 값 = nurse.team_id / nurse.grade)
+    scope='target': nurse_assignment.target_* 수정 (변경 전 값 = assign_row.target_team_id / .target_grade)
+    """
+    has_team = "team_id" in fields
+    has_grade = "grade" in fields
+    if not has_team and not has_grade:
+        return
+    if scope == "source":
+        old_team = nurse.team_id
+        old_grade = nurse.grade
+    else:
+        if assign_row is None:
+            return
+        old_team = assign_row.target_team_id
+        old_grade = assign_row.target_grade
+    new_team = fields["team_id"] if has_team else old_team
+    new_grade = fields["grade"] if has_grade else old_grade
+
+    from services.precheck.nurse_change_validators import validate_nurse_change
+
+    result = validate_nurse_change(
+        db,
+        group_id=group_id,
+        swap_nurse_id=str(nurse.nurse_id),
+        old_team_id=old_team,
+        new_team_id=new_team,
+        old_grade=old_grade,
+        new_grade=new_grade,
+        scope=scope,
+    )
+    if not result.get("saveable", True):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "TEAM_GRADE_VALIDATION_FAILED",
+                "message": "팀/Grade 변경이 인원 정합성을 충족하지 못합니다.",
+                "issues": result.get("issues", []),
+            },
+        )
 
 
 _ASSIGNMENT_CREATE_FIELDS: Tuple[str, ...] = (
@@ -1648,7 +2200,7 @@ def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
         raise Exception("Not authenticated")
 
     # 권한 체크
-    if not (current_user.is_head_nurse or current_user.is_master_admin):
+    if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise Exception("Permission denied")
 
     # 대상 간호사 조회
@@ -1837,7 +2389,7 @@ def upload_profile_image_service(
         nurse.office_id or getattr(current_user, "office_id", None) or "unknown"
     )
     group_id = str(
-        nurse.group_id or getattr(current_user, "group_id", None) or "unknown"
+        nurse.group_id or resolve_home_group_id(db, current_user) or "unknown"
     )
     nurse_id = str(nurse.nurse_id)
     object_key = f"og-images/{office_id}/{group_id}/{nurse_id}/my-profile/{secrets.token_hex(16)}{ext}"
@@ -2062,6 +2614,7 @@ def _load_inbound_map(
 def _build_inbound_blocks(
     db: Session,
     nurse_ids: List[str],
+    caller_group_id: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """간호사별 활성 파견/병동이동/휴직/퇴사/프리셉티 블록 구성.
 
@@ -2071,14 +2624,28 @@ def _build_inbound_blocks(
     }
     current_assignment: 휴직/퇴사 > 프리셉티 > 파견/병동이동 우선,
     동률 시 start_date DESC (최신).
+
+    caller_group_id: 지정 시, 그 그룹에서 '전출'(병동이동, source==caller)된 completed 행도
+        포함해 과거 병동(source) 명단의 '전출함' 표시를 살린다. 전입처(B) 화면은 오염되지
+        않도록 source==caller 인 completed 만 포함 (None 이면 기존대로 active 만).
     """
     if not nurse_ids:
         return {}
+    _status_clause = NurseAssignment.status == "active"
+    if caller_group_id is not None:
+        _status_clause = or_(
+            NurseAssignment.status == "active",
+            and_(
+                NurseAssignment.status == "completed",
+                NurseAssignment.reason == "병동이동",
+                NurseAssignment.source_group_id == caller_group_id,
+            ),
+        )
     rows = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.nurse_id.in_(nurse_ids),
-            NurseAssignment.status == "active",
+            _status_clause,
             NurseAssignment.reason.in_(_STATUS_DISPLAY_REASONS),
         )
         .order_by(NurseAssignment.start_date.asc())

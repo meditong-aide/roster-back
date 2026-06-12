@@ -1996,7 +1996,8 @@ def optimize_fallback_lex_hard_first(
                             else:
                                 m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
-                            _co_3n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1)
+                            # _3n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
+                            _co_3n_expr_fb = (X(n, T0, off_idx) >= 1)
                             if _assume_registry_fb is not None:
                                 _co_lit_fb = _assume_registry_fb.create_literal(
                                     f"CarryoverRecovery3N2OFFPartial:nurse_{n}:day_{T0}",
@@ -2013,9 +2014,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([_co_lit_fb])
                             else:
-                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
+                                m.Add(_co_3n_expr_fb)
                     print(f"{logger_prefix} [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
                 elif n_tail >= 3 and _3n_rem == 0:
@@ -2134,8 +2135,8 @@ def optimize_fallback_lex_hard_first(
                             else:
                                 m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
-                            # _2n_rem == 1: 1개만 추가 필요
-                            _co_2n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) >= 1)
+                            # _2n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
+                            _co_2n_expr_fb = (X(n, T0, off_idx) >= 1)
                             if _assume_registry_fb is not None:
                                 _co_lit_fb = _assume_registry_fb.create_literal(
                                     f"CarryoverRecovery2N2OFFPartial:nurse_{n}:day_{T0}",
@@ -2152,9 +2153,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([_co_lit_fb])
                             else:
-                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
+                                m.Add(_co_2n_expr_fb)
                     print(f"{logger_prefix} [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after}, rem={_2n_rem}")
                 elif n_tail >= 2 and _2n_rem == 0:
@@ -2890,6 +2891,31 @@ def optimize_fallback_lex_hard_first(
             _log_off_slack_used("stage2", s2, m2)
             # H1: Stage2 lex 3-pass — safety_sum → OFF range → N range 순차 minimize.
             # 각 단계는 이전 cost 동결로 다른 항 영향 0 보장.
+            # lex 재solve 는 cold-start 라 큰 인스턴스에서 시간 내 incumbent 를 못 찾고
+            # UNKNOWN(빈 해)으로 끝날 수 있다. 그러면 downstream(zero-lock/hint/stage3 실패
+            # fallback)이 망가진 s2 를 읽어 빈 roster 를 만든다. → 성공한 마지막 해를
+            # 스냅샷에 보존하고(downstream 은 이 스냅샷을 읽음), 재solve 전 warm-start hint 로
+            # 직전 feasible 해를 주입해 빈 해 반환 자체를 막는다.
+            lex_x2_val: dict = {}
+            lex_safety_val: dict = {}
+
+            def _capture_lex_solution() -> None:
+                for _n in range(N):
+                    for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse):
+                        for _s in range(S):
+                            lex_x2_val[(_n, _d, _s)] = int(s2.Value(X2(_n, _d, _s)))
+                for _k, _arr in safety2.items():
+                    lex_safety_val[_k] = [int(s2.Value(_v)) for _v in _arr]
+
+            def _hint_lex_solution() -> None:
+                try:
+                    m2.ClearHints()
+                    for (_n, _d, _s), _val in lex_x2_val.items():
+                        m2.AddHint(X2(_n, _d, _s), _val)
+                except Exception:
+                    pass
+
+            _capture_lex_solution()  # stage2 해 보존: lex 전부 실패해도 이 해로 복원
             try:
                 flat_safety = []
                 for arr in safety2.values():
@@ -2926,8 +2952,10 @@ def optimize_fallback_lex_hard_first(
                             m2.Add(cnt >= min_off_lex)
                         m2.Minimize(max_off_lex - min_off_lex)
                         s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                        _hint_lex_solution()
                         st2_off = s2.Solve(m2)
                         if st2_off in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                            _capture_lex_solution()
                             best_off_range = int(s2.Value(max_off_lex) - s2.Value(min_off_lex))
                             print(
                                 f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
@@ -2957,8 +2985,10 @@ def optimize_fallback_lex_hard_first(
                                         m2.Add(cnt >= min_n_lex)
                                     m2.Minimize(max_n_lex - min_n_lex)
                                     s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
+                                    _hint_lex_solution()
                                     st2_n = s2.Solve(m2)
                                     if st2_n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                        _capture_lex_solution()
                                         best_n_range = int(
                                             s2.Value(max_n_lex) - s2.Value(min_n_lex)
                                         )
@@ -2967,6 +2997,104 @@ def optimize_fallback_lex_hard_first(
                                             f"status={_cp_sat_status_to_text(st2_n)} "
                                             f"range={best_n_range}"
                                         )
+                                        # H1 4-pass: N 블록 간 간격(n2n) deficit 최소화.
+                                        # 안전·OFF range·N range 를 동결한 뒤, 그 품질을 깨지 않는
+                                        # 범위에서만 야간 간격(target 미만)을 벌린다. soft 항은 KLD에
+                                        # 눌려 무시되므로 lex 우선순위로 끌어올린다.
+                                        _n2n_tgt = int(getattr(cfg, "n_to_n_interval_target", 0) or 0)
+                                        if _n2n_tgt >= 2:
+                                            try:
+                                                m2.Add(max_n_lex - min_n_lex <= best_n_range)
+                                                _n2n_terms = []
+                                                for _n in range(N):
+                                                    if leave[_n] < join[_n]:
+                                                        continue
+                                                    _aset = set(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                                                    for _d1 in sorted(_aset):
+                                                        for _gap in range(2, _n2n_tgt):
+                                                            _d2 = _d1 + _gap
+                                                            if _d2 not in _aset:
+                                                                continue
+                                                            _btw = [_d1 + _k for _k in range(1, _gap)]
+                                                            if any(_b not in _aset for _b in _btw):
+                                                                continue
+                                                            _pair = m2.NewBoolVar(f"lex_n2n_{_n}_{_d1}_{_d2}")
+                                                            m2.Add(_pair <= X2(_n, _d1, night_idx_h1))
+                                                            m2.Add(_pair <= X2(_n, _d2, night_idx_h1))
+                                                            for _b in _btw:
+                                                                m2.Add(_pair <= 1 - X2(_n, _b, night_idx_h1))
+                                                            _btw_sum = sum(X2(_n, _b, night_idx_h1) for _b in _btw)
+                                                            m2.Add(_pair >= X2(_n, _d1, night_idx_h1) + X2(_n, _d2, night_idx_h1) - 1 - _btw_sum)
+                                                            _n2n_terms.append((_n2n_tgt - _gap) * _pair)
+                                                if _n2n_terms:
+                                                    m2.Minimize(sum(_n2n_terms))
+                                                    import os as _os
+                                                    _n2n_frac = float(_os.getenv("N2N_LEX_TIME_FRAC", "0.5"))
+                                                    s2.parameters.max_time_in_seconds = max(8.0, float(tl2) * _n2n_frac)
+                                                    _hint_lex_solution()
+                                                    st2_n2n = s2.Solve(m2)
+                                                    if st2_n2n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                                        _capture_lex_solution()
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
+                                                            f"status={_cp_sat_status_to_text(st2_n2n)} "
+                                                            f"deficit={int(s2.ObjectiveValue())}"
+                                                        )
+                                                        # n2n 동결: 후속 D/E 패스가 n2n을 망가뜨리지 않도록 lex 잠금
+                                                        try:
+                                                            m2.Add(sum(_n2n_terms) <= int(s2.ObjectiveValue()))
+                                                        except Exception:
+                                                            pass
+                                                    else:
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
+                                                            f"status={_cp_sat_status_to_text(st2_n2n)} — 3rd 결과 유지"
+                                                        )
+                                            except Exception as _n2n_e:
+                                                print(f"{logger_prefix} 폴백2 lex 4-pass 예외: {_n2n_e}")
+                                        # H1 5-pass: D/E per-nurse 균등(X축). OFF/N/n2n 동결 후 잔여 자유도로만.
+                                        # lex_x2_val(stage3 warm-start hint)이 D/E까지 균등해져 stage3가 균등 hint 상속.
+                                        # config de_balance_enable(기본 ON)을 따르며, env DE_LEX_ENABLE 로 override 가능.
+                                        # tol 초과분만 벌해 "완전동일" 아님(밴드).
+                                        try:
+                                            import os as _os_de
+                                            _de_env = _os_de.getenv("DE_LEX_ENABLE")
+                                            _de_on = (_de_env == "1") if _de_env is not None else bool(getattr(cfg, "de_balance_enable", True))
+                                            if _de_on and "E" in cfg.shift_types:
+                                                _de_tol = int(_os_de.getenv("DE_BALANCE_TOL", str(getattr(cfg, "de_balance_tolerance", 2))) or 0)
+                                                _de_d_idx = cfg.shift_types.index("D")
+                                                _de_e_idx = cfg.shift_types.index("E")
+                                                _de_excs = []
+                                                for _n in range(N):
+                                                    if leave[_n] < join[_n] or _n in nightonly_excluded_idx:
+                                                        continue
+                                                    _ad = list(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                                                    _td = sum(X2(_n, d, _de_d_idx) for d in _ad)
+                                                    _te = sum(X2(_n, d, _de_e_idx) for d in _ad)
+                                                    _df = m2.NewIntVar(0, D, f"lex_de_diff_{_n}")
+                                                    m2.Add(_df >= _td - _te)
+                                                    m2.Add(_df >= _te - _td)
+                                                    _ex = m2.NewIntVar(0, D, f"lex_de_exc_{_n}")
+                                                    m2.Add(_ex >= _df - _de_tol)
+                                                    _de_excs.append(_ex)
+                                                if _de_excs:
+                                                    m2.Minimize(sum(_de_excs))
+                                                    s2.parameters.max_time_in_seconds = max(5.0, float(tl2) * 0.3)
+                                                    _hint_lex_solution()
+                                                    st2_de = s2.Solve(m2)
+                                                    if st2_de in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                                        _capture_lex_solution()
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
+                                                            f"status={_cp_sat_status_to_text(st2_de)} excess={int(s2.ObjectiveValue())}"
+                                                        )
+                                                    else:
+                                                        print(
+                                                            f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
+                                                            f"status={_cp_sat_status_to_text(st2_de)} — 4th 결과 유지"
+                                                        )
+                                        except Exception as _de_e:
+                                            print(f"{logger_prefix} 폴백2 lex 5-pass 예외: {_de_e}")
                                     else:
                                         print(
                                             f"{logger_prefix} 폴백2 lex 3-pass (N range): "
@@ -2997,17 +3125,14 @@ def optimize_fallback_lex_hard_first(
         stage2_zero_locks = {}
         best_safe_sum = 0
         for k, arr in safety2.items():
-            zeros = []
-            for v in arr:
-                val = s2.Value(v)
-                if val == 0:
-                    zeros.append(v)
-                best_safe_sum += int(val)
+            vals = lex_safety_val.get(k) or [int(s2.Value(v)) for v in arr]
+            zeros = [v for v, val in zip(arr, vals) if val == 0]
+            best_safe_sum += sum(int(val) for val in vals)
             stage2_zero_locks[k] = zeros
         print(f"{logger_prefix} 최소 안전 위반 합: {best_safe_sum}")
         try:
             for k, arr in safety2.items():
-                total_k = sum(int(s2.Value(v)) for v in arr)
+                total_k = sum(lex_safety_val.get(k) or [int(s2.Value(v)) for v in arr])
                 if total_k > 0:
                     print(f"{logger_prefix} [Stage2 위반] {k} = {total_k}")
             short_items = [
@@ -3026,6 +3151,31 @@ def optimize_fallback_lex_hard_first(
                 print(f"{logger_prefix} [Stage2 과잉 참고] day,shift,over =", sorted(over_items))
         except Exception as exc:
             print(f"{logger_prefix} [Stage2 상세로그 실패]: {exc}")
+
+    # ── verify-mode: stage3(선호/공정성) 건너뛰고 stage2 해로 즉시 반환 ──
+    # hard_viol(커버리지+안전)은 stage2 에서 확정되고, stage3 는 이를 동결한 채
+    # (아래 m3.Add(sum(safety3)==sum(safety2))) 선호만 최적화하므로 "되나/안되나"
+    # 검증에는 stage2 해로 충분하다. 가장 무거운 stage3 를 건너뛰어 지연을 제거한다.
+    # 기본 OFF(env gate). 일반 생성 경로는 영향 없음.
+    import os as _os_vfb
+    if _os_vfb.getenv("FB_VERIFY_SKIP_STAGE3") == "1":
+        roster_system.roster.fill(0)
+        for n in range(N):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                for s in range(S):
+                    if lex_x2_val.get((n, d, s), 0):
+                        roster_system.roster[n, d, s] = 1
+        _log_weekend_work_assignments(
+            roster_system=roster_system,
+            weekend_days=weekend_days,
+            off_idx=off_idx,
+            logger_prefix=logger_prefix,
+        )
+        print(
+            f"{logger_prefix} [verify-mode] stage3 skip → stage2 해 반환 "
+            f"(best_short={best_short}, best_safe_sum={best_safe_sum})"
+        )
+        return best_short == 0 and best_safe_sum == 0
 
     # ───── 3단계: 선호/공정성 ─────
     with timer_cls("폴백 3단계: 선호/공정성 최대화"):
@@ -3054,7 +3204,7 @@ def optimize_fallback_lex_hard_first(
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
                     try:
-                        m3.AddHint(X3(n, d, s), s2.Value(X2(n, d, s)))
+                        m3.AddHint(X3(n, d, s), lex_x2_val.get((n, d, s), 0))
                     except Exception:
                         pass
         s3 = cp_model.CpSolver()
@@ -3084,7 +3234,7 @@ def optimize_fallback_lex_hard_first(
             for n in range(N):
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     for s in range(S):
-                        if s2.Value(X2(n, d, s)):
+                        if lex_x2_val.get((n, d, s), 0):
                             roster_system.roster[n, d, s] = 1
             _log_weekend_work_assignments(
                 roster_system=roster_system,

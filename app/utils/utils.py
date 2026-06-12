@@ -152,12 +152,41 @@ def set_mlink_push(empseqno: str, officecode: str, str_to_arr: str, contents: st
         return {"result": "fail", "message": "받는사람 사람 오류"}
 
 
+_PUSH_PRODUCTION_ENVS = frozenset({"production", "prod"})
+
+# 그룹웨어 알림을 발송하는 "운영" roster DB 이름. 이 DB가 아니면(dev/localhost: eun_roster_dev 등)
+# 그룹웨어 알림 테이블에 일절 기록/발송하지 않는다. EUN_DB_NAME(=실제 접속 중인 roster DB)으로 판정.
+_PUSH_PRODUCTION_ROSTER_DB = "eun_roster"
+
+
+def push_enabled() -> bool:
+    """실제 앱 푸시(그룹웨어 알림) 발송 여부.
+
+    운영 roster DB(EUN_DB_NAME=eun_roster) + ENVIRONMENT=production|prod 일 때만 True.
+    dev/localhost(EUN_DB_NAME=eun_roster_dev 등)에서는 ENVIRONMENT 값과 무관하게
+    그룹웨어 알림 테이블(eun_gw TB_Mobile_Push_History_*, TB_FCM)에 아무것도 쓰지 않는다.
+    redis_client._is_production 과 동일 규약(ENVIRONMENT 기본 'dev').
+    """
+    # [db-gate] 운영 roster DB가 아니면(dev/localhost) ENVIRONMENT 무관하게 무조건 차단 — 그룹웨어 오염 방지.
+    if os.getenv("EUN_DB_NAME", "").strip().lower() != _PUSH_PRODUCTION_ROSTER_DB:
+        return False
+    # [env-gate] 기존 규약 유지: 운영 DB에서도 ENVIRONMENT=production|prod 일 때만 실제 발송.
+    return os.getenv("ENVIRONMENT", "dev").strip().lower() in _PUSH_PRODUCTION_ENVS
+
+
 def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
                  sendEmpSeqNo: str, sendMemberId: str, receiveEmpSeqNo: str,
                  pushMessage: str, orgPushMessage: str, linkUrl: str, linkCode: str):
     """
     앱 푸시 보내기, receiveEmpSeqNo는 콤마(,)로 구분하여 여러명에게 보낼 수 있음
     """
+    # [env-gate] 운영에서만 실제 발송. 개발/스테이징은 단말로 안 나가게 스킵(로그만).
+    if not push_enabled():
+        print(
+            f"[push][skipped:non-prod] code={pushCode}/{pushSubCode} "
+            f"to={receiveEmpSeqNo} msg={pushMessage!r}"
+        )
+        return {"result": "skipped", "message": "non-production: push 미발송"}
     if not sendEmpSeqNo:
         return {"result" : "fail", "message": "sendEmpSeqNo가 없습니다."}
     if not officeCode:

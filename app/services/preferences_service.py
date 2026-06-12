@@ -9,6 +9,7 @@ from sqlalchemy import String, cast, extract
 from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
+from services.group_access import resolve_home_group_id
 from datetime import datetime, timezone, timedelta, date
 
 
@@ -86,7 +87,10 @@ def submit_preferences_service(
     희망근무 저장/제출 통합 서비스
     """
     month_str = f"{req.year}-{req.month:02d}"
-    
+
+    # 본인 소속 그룹은 토큰 대신 DB(nurses.group_id)에서 — 토큰 stale 시에도 정합.
+    home_gid = resolve_home_group_id(db, current_user)
+
     # data가 None이거나 없으면 빈 딕셔너리로 안전하게 처리
     preference_data = req.data if req.data is not None else {}
     
@@ -103,7 +107,7 @@ def submit_preferences_service(
         draft = WantedRequest(
             nurse_id=current_user.nurse_id,
             month=month_str,
-            group_id=current_user.group_id,
+            group_id=home_gid,
             request="",
             is_submitted=False,
             created_at=datetime.now()
@@ -134,7 +138,7 @@ def submit_preferences_service(
 
     # ==================== WantedConfig 검증 (최종 제출 시에만) ====================
     if not is_draft and data_to_save:
-        group_id = current_user.group_id
+        group_id = home_gid
         nurse_id = current_user.nurse_id
 
         # # 1. GLOBAL 설정 확인 - 더 이상 사용하지 않음 (nurses 테이블로 이동됨)
@@ -310,7 +314,7 @@ def submit_preferences_service(
                 request_id=request_id,
                 detailed_request_id=detailed_id,
                 shift_date=date_str,
-                group_id=current_user.group_id,
+                group_id=home_gid,
                 shift=shift_id,
                 score=1.0,
                 partial_request="",
@@ -346,7 +350,7 @@ def submit_preferences_service(
                 month=month_str,
                 detailed_request_id=pair_detailed_id,
                 target_id=str(target_id),
-                group_id=current_user.group_id,
+                group_id=home_gid,
                 score=float(weight),
                 partial_request=pair.get("request", ""),
             ))
@@ -356,7 +360,7 @@ def submit_preferences_service(
         # preference 배열이 없는 경우 → 이전 request_id에서 pair 데이터 carry-forward
         # 초기화 시 carry-forward 스킵
         if data_to_save or preference_list: # shift나 preference가 있으면 carry-forward 진행
-            _carry_forward_pair_data(db, current_user.nurse_id, request_id, month_str, group_id=current_user.group_id)
+            _carry_forward_pair_data(db, current_user.nurse_id, request_id, month_str, group_id=home_gid)
         else:
             print(f"[pair 초기화] 빈 데이터로 인해 carry-forward 스킵 (request_id={request_id})")
 
@@ -520,7 +524,7 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
         raise Exception("Not authenticated")
     month_str = f"{year}-{month:02d}"
 
-    target_group_id = override_group_id or current_user.group_id
+    target_group_id = override_group_id or home_gid
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
     # ✅ 1️⃣ 그룹 내 간호사 목록 가져오기

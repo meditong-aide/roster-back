@@ -34,3 +34,13 @@ ruff.toml
 
 # Harness run artifacts (generated)
 tools/harness/reports/
+
+# Personal scaffolding / scratch (not for VCS)
+.mlxenv/
+artifacts/
+capture*.png
+*.base
+tools/e2e_*.py
+tools/run_june_*.py
+tools/verify_*.py
+tools/harness/run_*.py

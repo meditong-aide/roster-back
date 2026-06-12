@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from db.client2 import get_db
 from schemas.auth_schema import User
 from routers.auth import get_current_user_from_cookie
+from services.group_access import resolve_home_group_id
 from services.dashboard_service import (
     get_roster_analytics_summary,
     get_individual_analytics,
@@ -33,7 +34,7 @@ async def get_dashboard_summary(
             raise HTTPException(status_code=401, detail="인증이 필요합니다.")
         
         summary = get_roster_analytics_summary(
-            group_id=current_user.group_id,
+            group_id=resolve_home_group_id(db, current_user),
             year=year,
             month=month,
             db=db
@@ -59,7 +60,7 @@ async def get_individual_dashboard(
             raise HTTPException(status_code=401, detail="인증이 필요합니다.")
         
         individual_data = get_individual_analytics(
-            group_id=current_user.group_id,
+            group_id=resolve_home_group_id(db, current_user),
             year=year,
             month=month,
             db=db
@@ -84,7 +85,7 @@ async def get_monthly_trend(
             raise HTTPException(status_code=401, detail="인증이 필요합니다.")
         
         trends = get_monthly_trends(
-            group_id=current_user.group_id,
+            group_id=resolve_home_group_id(db, current_user),
             months=months,
             db=db
         )

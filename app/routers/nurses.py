@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import UploadFile, File, Query
 from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Dict
@@ -17,6 +18,8 @@ from db.client2 import get_db, msdb_manager
 from db.models import Nurse as NurseModel
 from db.models import Office as OfficeModel
 from db.models import Team as TeamModel
+from db.models import Group as GroupModel
+from db.models import NurseAssignment
 from schemas.roster_schema import (
     NurseProfile,
     MoveNurseRequest,
@@ -36,6 +39,7 @@ from schemas.roster_schema import (
     NurseAssignmentListResponse,
     NurseMonthlyLimitBulkUpsertRequest,
     NurseMonthlyLimitListResponse,
+    NightBulkApplyRequest,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -49,9 +53,12 @@ from services.assignment_service import (
     flush_expired_preceptees,
     flush_expired_dispatches,
     flush_expired_leaves,
+    preview_assignment_impact,
+    group_members_in_month,
 )
 from services.nurse_service import (
     get_nurses_in_group_service,
+    attach_n_exact_to_nurses,
     bulk_update_nurses_service,
     move_nurse_service,
     move_nurse_with_active_service,
@@ -70,7 +77,9 @@ from services.nurse_service import (
 from services.nurse_monthly_limit_service import (
     list_nurse_monthly_limits_service,
     upsert_nurse_monthly_limits_service,
+    night_bulk_apply_service,
 )
+from services.group_access import resolve_home_group_id, resolve_effective_group, caller_is_head_nurse, resolve_managed_group_ids
 from services.excel_service import (
     create_nurse_template,
     # process_excel_upload,
@@ -90,6 +99,100 @@ from utils.utils import set_sms
 
 
 router = APIRouter(prefix="/nurses", tags=["nurses"])
+
+
+@router.get("/managed-groups/summary")
+async def get_managed_groups_summary(
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """현재 사용자가 관리 가능한 그룹 목록 + 간호사 카운트 요약.
+
+    권한별 노출 그룹:
+    - ADM(is_master_admin): 같은 office_id 의 모든 그룹
+    - HN(hn_auth=='HN'): home group + group.hn_id 에 등록된 그룹
+    - 그 외(수간호사·일반 간호사, HN 권한 없음): 토큰 group_id 1개
+
+    카운트 기준 (group_id 축, distinct nurse_id):
+    - active_nurse_count: home 소속(nurses.group_id==G_x) + inbound
+      (NurseAssignment.target_group_id==G_x AND status='active') 중
+      nurses.resignation_date IS NULL 인 간호사. 같은 nurse 가 home·inbound
+      양쪽에 잡혀도 1회만 카운트.
+    - inactive_nurse_count: home 소속이며 resignation_date IS NOT NULL.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+    group_ids = resolve_managed_group_ids(db, current_user)
+    if not group_ids:
+        return JSONResponse(
+            content=jsonable_encoder([]),
+            media_type="application/json; charset=utf-8",
+        )
+
+    groups = (
+        db.query(GroupModel)
+        .filter(GroupModel.group_id.in_(group_ids))
+        .all()
+    )
+    groups_map = {g.group_id: g for g in groups}
+
+    home_rows = (
+        db.query(
+            NurseModel.nurse_id,
+            NurseModel.group_id,
+            NurseModel.resignation_date,
+            NurseModel.active,
+        )
+        .filter(NurseModel.group_id.in_(group_ids))
+        .all()
+    )
+
+    inbound_rows = (
+        db.query(NurseAssignment.nurse_id, NurseAssignment.target_group_id)
+        .join(NurseModel, NurseModel.nurse_id == NurseAssignment.nurse_id)
+        .filter(
+            NurseAssignment.target_group_id.in_(group_ids),
+            NurseAssignment.status == "active",
+            NurseModel.resignation_date.is_(None),
+            NurseModel.active == 1,
+        )
+        .all()
+    )
+
+    active_set: dict = {gid: set() for gid in group_ids}
+    inactive_set: dict = {gid: set() for gid in group_ids}
+
+    # 비활성 정의: active=0 OR resignation_date IS NOT NULL (합집합)
+    for nid, gid, resigned, is_active in home_rows:
+        if gid not in active_set:
+            continue
+        if (resigned is not None) or (not bool(is_active)):
+            inactive_set[gid].add(nid)
+        else:
+            active_set[gid].add(nid)
+
+    for nid, tgid in inbound_rows:
+        if tgid in active_set:
+            active_set[tgid].add(nid)
+
+    data = []
+    for gid in group_ids:
+        g = groups_map.get(gid)
+        if not g:
+            continue
+        data.append({
+            "group_id": str(g.group_id),
+            "group_name": str(g.group_name),
+            "office_id": str(g.office_id),
+            "active_nurse_count": len(active_set[gid]),
+            "inactive_nurse_count": len(inactive_set[gid]),
+        })
+
+    return JSONResponse(
+        content=jsonable_encoder(data),
+        media_type="application/json; charset=utf-8",
+    )
 
 
 @router.get("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
@@ -122,6 +225,26 @@ async def put_monthly_limits(
         limits=[x.model_dump() for x in body.limits],
     )
     _items, _meta, _warnings = items
+    return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
+
+
+@router.post("/monthly-limits/night-bulk", response_model=NurseMonthlyLimitListResponse)
+async def night_bulk_apply(
+    body: NightBulkApplyRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """나이트 개수 일괄 적용: 현재 병동/월의 야간 가능 근무자 전체에 하나의 값을
+    고정(n_exact) 또는 최대(n_max)로 일괄 반영. 검증 실패 시 422 + 조합 _ko 메시지."""
+    _items, _meta, _warnings = night_bulk_apply_service(
+        db=db,
+        current_user=current_user,
+        group_id=body.group_id,
+        year=body.year,
+        month=body.month,
+        kind=body.kind,
+        value=body.value,
+    )
     return NurseMonthlyLimitListResponse(items=_items, meta=_meta, warnings=_warnings)
 
 
@@ -163,11 +286,36 @@ def _ensure_office_exists(
         db.rollback()
 
 
+@router.get("/members")
+async def get_group_members_in_month(
+    group_id: str,
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """근무자관리 월 셀렉터 — 선택 월 '소속' 명단 + 상태 플래그 + 헤드카운트.
+
+    소속(근무일 수 아님) 기준. 영구 전출은 그 달 미표시, 비근무 멤버는 상태 배지
+    (휴직/파견 중/이동 ←→). HN multi-group: 관리 병동이면 조회 가능.
+    Returns: {"members":[{nurse_id,name,membership_status,marker,badge,as_of_team,as_of_grade}], "headcount":{regular,moving,leave}}
+    참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §3 정책 매트릭스.
+    """
+    gid = resolve_effective_group(db, current_user, group_id)
+    # 레이지 flush(캐시 == as-of-today 동기화) — 다른 조회 엔드포인트와 동일.
+    flush_pending_transfers(db, gid)
+    flush_expired_dispatches(db)
+    flush_expired_leaves(db)
+    return group_members_in_month(db, gid, year, month)
+
+
 @router.get("", response_model=List[NurseProfile])
 async def get_nurses_in_group(
     office_id: Optional[str] = None,
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,  # 신규 파라미터
+    year: Optional[int] = None,   # 근무자관리에서만 전달: 주면 nurse_monthly_limits.n_exact 조인
+    month: Optional[int] = None,  # year 와 함께 주어질 때만 n_exact 주입
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -176,8 +324,9 @@ async def get_nurses_in_group(
         getattr(current_user, "office_id", None),
         getattr(current_user, "office_name", None),
     )
+    # 그룹 스코프: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(비ADM 은 managed 검증).
+    _group = resolve_effective_group(db, current_user, group_id, require_group=False)
     # 병동이동 레이지 체크
-    _group = group_id or getattr(current_user, "group_id", None)
     if _group:
         flush_pending_transfers(db, _group)
     # 프리셉티 만료 레이지 체크
@@ -193,7 +342,7 @@ async def get_nurses_in_group(
         current_user.office_id,
     )
     try:
-        # ADM는 필터링 옵션 허용, 일반/수간호사는 자신의 그룹만
+        # ADM: 필터링 옵션 자유. HN: resolve_managed_group_ids 안의 그룹만 query 허용.
         if current_user.is_master_admin:
             response = get_nurses_filtered_service(
                 current_user,
@@ -202,12 +351,26 @@ async def get_nurses_in_group(
                 group_id=group_id,
                 nurse_id=nurse_id,  # nurse_id 전달
             )
-            return response
-        return get_nurses_in_group_service(
-            current_user,
-            db,
-            nurse_id=nurse_id,  # nurse_id 전달
-        )
+        else:
+            # HN/수간호사/일반: query group_id 있으면 권한 검증 후 override, 없으면 토큰 group_id
+            override_gid: Optional[str] = None
+            if group_id:
+                allowed = resolve_managed_group_ids(db, current_user)
+                if group_id not in allowed:
+                    raise HTTPException(
+                        status_code=403, detail="해당 병동에 접근할 수 없습니다."
+                    )
+                override_gid = group_id
+            response = get_nurses_in_group_service(
+                current_user,
+                db,
+                nurse_id=nurse_id,  # nurse_id 전달
+                view_group_id=_group,
+            )
+        # 근무자관리에서 year/month 가 함께 오면 nurse_monthly_limits 의 n_exact 를 주입.
+        if year is not None and month is not None:
+            attach_n_exact_to_nurses(db, response, year, month)
+        return response
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)
         print("[DEBUG] [nurses.py - get_nurses_in_group] group_id", group_id)
@@ -234,6 +397,7 @@ async def get_nurses_in_group(
 @router.post("/sequence/save")
 async def save_nurse_sequence(
     req: NurseSequenceUpdate,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -241,9 +405,13 @@ async def save_nurse_sequence(
     단일 간호사 이동/상태변경 (드래그앤드롭 중간 저장 용도)
     """
     try:
+        # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
+        gid = resolve_effective_group(db, current_user, group_id)
         return move_nurse_with_active_service(
-            req.nurse_id, req.new_sequence, req.active, current_user, db
+            req.nurse_id, req.new_sequence, req.active, current_user, db, group_id=gid
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 순서 변경 실패: {str(e)}")
 
@@ -251,6 +419,7 @@ async def save_nurse_sequence(
 @router.post("/sequence/reorder")
 async def reorder_nurses(
     payload: ReorderPayload,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -259,9 +428,13 @@ async def reorder_nurses(
     프론트에서는 active 리스트와 inactive 리스트의 nurse_id 배열을 넘겨주세요.
     """
     try:
+        # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(그룹전환 안전).
+        gid = resolve_effective_group(db, current_user, group_id)
         return reorder_nurses_service(
-            payload.active_order, payload.inactive_order, current_user, db
+            payload.active_order, payload.inactive_order, current_user, db, group_id=gid
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"일괄 재정렬 실패: {str(e)}")
 
@@ -274,10 +447,13 @@ async def bulk_update_nurses(
     db: Session = Depends(get_db),
 ):
     try:
-        # ADM이 group_id를 지정하면 해당 병동을 대상으로 업데이트 허용
+        # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 None(서비스 폴백).
+        gid = resolve_effective_group(db, current_user, group_id, require_group=False)
         return bulk_update_nurses_service(
-            nurses_data, current_user, db, override_group_id=group_id
+            nurses_data, current_user, db, override_group_id=gid
         )
+    except HTTPException:
+        raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
         print("error1", e)
         raise HTTPException(
@@ -288,10 +464,11 @@ async def bulk_update_nurses(
 @router.get("/template-download")
 async def download_template(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
 ):
     """엑셀 템플릿 파일 다운로드"""
     try:
-        if not current_user or not current_user.is_head_nurse:
+        if not current_user or not caller_is_head_nurse(db, current_user):
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         template_path = create_nurse_template()
         return FileResponse(
@@ -442,22 +619,47 @@ async def upload2_confirm_endpoint(
 @router.get("/available-members")
 async def get_available_members(
     group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
+    pagination: Optional[str] = Query(None, description="Use cursor pagination"),
+    q: Optional[str] = Query(None, description="Name search query"),
+    search_by: str = Query("name", description="Search target: name or affiliation"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor"),
+    limit: int = Query(20, ge=1, le=100, description="Page size"),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
     """
-    현재 그룹에 속하지 않은 동일 오피스 멤버 목록 조회.
+    nurses에 미등록된 동일 오피스 멤버 목록 조회.
     - 근무자 등록 모달에서 사용
-    - MSSQL 전체 멤버 중 현재 group_id에 이미 등록된 간호사를 제외하고 반환
+    - MSSQL 전체 멤버 중 nurses에 이미 등록된 간호사(다른 병동 포함)를 제외하고 반환
     """
     try:
+        print(
+            "[DEBUG] available-members query",
+            {
+                "group_id": group_id,
+                "pagination": pagination,
+                "q": q,
+                "search_by": search_by,
+                "cursor": cursor,
+                "limit": limit,
+            },
+        )
         office_id = current_user.office_id
         if not office_id:
             raise HTTPException(
                 status_code=400, detail="office_id를 확인할 수 없습니다."
             )
 
-        result = get_available_members_service(office_id, group_id, db)
+        result = get_available_members_service(
+            office_id=office_id,
+            group_id=group_id,
+            db=db,
+            q=q,
+            search_by=search_by,
+            cursor=cursor,
+            limit=limit,
+            pagination=pagination,
+        )
         if isinstance(result, list) and result:
             unique_nurse_ids = set(
                 item.get("nurse_id") for item in result if item.get("nurse_id")
@@ -490,7 +692,7 @@ async def add_nurses_to_group(
     - nurses 테이블에 미존재: MSSQL 멤버 정보로 신규 생성
     """
     try:
-        if not current_user.is_head_nurse and not current_user.is_master_admin:
+        if not caller_is_head_nurse(db, current_user) and not current_user.is_master_admin:
             raise HTTPException(
                 status_code=403, detail="수간호사 또는 관리자만 접근 가능합니다."
             )
@@ -501,8 +703,10 @@ async def add_nurses_to_group(
                 status_code=400, detail="office_id를 확인할 수 없습니다."
             )
 
+        # 대상 그룹을 호출자가 관리하는지 검증(HN=groups.hn_id / ADM=office). 토큰 group_id 무관.
+        target_gid = resolve_effective_group(db, current_user, payload.group_id)
         result = add_nurses_to_group_service(
-            payload.nurse_ids, payload.group_id, office_id, db
+            payload.nurse_ids, target_gid, office_id, db
         )
         return result
     except HTTPException:
@@ -559,7 +763,7 @@ async def validate_excel_data_endpoint(
 ):
     """업로드된 데이터 유효성 검증"""
     try:
-        if not current_user or not current_user.is_head_nurse:
+        if not current_user or not caller_is_head_nurse(db, current_user):
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         result = validate_excel_data(request.data, current_user, db)
         return result
@@ -575,7 +779,7 @@ async def confirm_upload(
 ):
     """검증된 데이터 최종 저장"""
     try:
-        if not current_user or not current_user.is_head_nurse:
+        if not current_user or not caller_is_head_nurse(db, current_user):
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         filtered_data = [
             data
@@ -1007,7 +1211,7 @@ async def get_nurse_assignments(
     office_id = getattr(current_user, "office_id", None)
     if not office_id:
         raise HTTPException(status_code=400, detail="office_id가 필요합니다.")
-    _group = group_id or getattr(current_user, "group_id", None)
+    _group = group_id or resolve_home_group_id(db, current_user)
     _status = None if status == "all" else status
     items = get_assignments(db, office_id, group_id=_group, nurse_id=nurse_id, status=_status)
     counts = get_assignment_status_counts(db, office_id, group_id=_group, nurse_id=nurse_id)
@@ -1017,6 +1221,47 @@ async def get_nurse_assignments(
         counts=counts,
         total=total,
         applied_status=status,
+    )
+
+
+class AssignmentPreviewRequest(BaseModel):
+    """배정 dry-run 영향 분석 요청.
+
+    실제 DB 변경 없이 영향만 계산. 확정 직전 운영자가 보는 용도.
+    """
+    nurse_id: str
+    reason: str  # 파견 / 병동이동 / 휴직 / 복직 / 프리셉티 등
+    start_date: date
+    target_group_id: Optional[str] = None
+    expected_end_date: Optional[date] = None
+    exclude_id: Optional[int] = None  # update 시 자기 자신 제외용
+
+
+@router.post("/assignments/preview")
+async def preview_nurse_assignment(
+    req: AssignmentPreviewRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """배정 생성/수정 전 영향 분석 (dry-run).
+
+    돌려보지 않고 영향만 계산해 반환:
+    - conflicts: 기간 겹침 active 배정
+    - nml_affected: 자동 group_id update 대상 NML
+    - wanted_affected: 발효 월 이후 wanted 카운트 (안 건드림, 인지용)
+    - schedules_to_check: 재생성 검토 대상 schedule
+    - notifications: 알림 대상
+
+    참조: docs/NURSE_ASSIGNMENT_CRON_DESIGN.md §5
+    """
+    return preview_assignment_impact(
+        db,
+        nurse_id=req.nurse_id,
+        reason=req.reason,
+        start_date=req.start_date,
+        target_group_id=req.target_group_id,
+        expected_end_date=req.expected_end_date,
+        exclude_id=req.exclude_id,
     )
 
 
@@ -1058,40 +1303,47 @@ async def delete_nurse_assignment(
 @router.get("/{nurse_id}", response_model=NurseProfile)
 async def get_nurse_by_id(
     nurse_id: str,
+    group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """단일 간호사 프로필 조회 (파견/병동이동 인바운드 간호사도 조회 허용)"""
+    """단일 간호사 프로필 조회.
+
+    통합 권한 헬퍼(can_caller_access_nurse)로 ADM / self / home·managed source /
+    inbound (파견·병동이동) 모두 통과시킨 뒤, 그룹 필터를 건너뛰고 직접 조회한다.
+
+    group_id (Optional):
+        사이드프로필 view 컨텍스트. 명시 시 해당 그룹의 inbound assignment 기준으로
+        target_* overlay 가 적용됨. 본인 home group 외 값이면 managed groups 검증.
+    """
     try:
-        result = None
+        from services.group_access import can_caller_access_nurse, assert_caller_can_access_group
+        if not can_caller_access_nurse(db, current_user, nurse_id):
+            raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
+
+        if group_id and str(group_id) != str(getattr(current_user, "group_id", "")):
+            assert_caller_can_access_group(db, current_user, group_id)
+
+        # 권한은 can_caller_access_nurse 로 이미 통과 → 조회는 그룹필터 없이 직접 한다
+        # (docstring 의도). 라우터가 home 그룹으로만 필터하면 HN 의 비-home 관리병동 간호사가
+        # 404 로 숨던 버그가 있었다. group_id 는 overlay(파견·병동이동 target_*) view 컨텍스트로만
+        # 넘기고, 미지정 시엔 home overlay 로 폴백한다.
+        _view_gid = (
+            None if group_id in (None, "", "null", "undefined", "None") else group_id
+        )
         if current_user.is_master_admin:
             result = get_nurses_filtered_service(
-                current_user,
-                db,
-                nurse_id=nurse_id,
+                current_user, db, nurse_id=nurse_id,
             )
         else:
             try:
                 result = get_nurses_in_group_service(
-                    current_user,
-                    db,
-                    nurse_id=nurse_id,
+                    current_user, db, nurse_id=nurse_id,
+                    view_group_id=_view_gid,
+                    skip_group_filter=True,
                 )
             except Exception:
                 result = None
-        # 같은 그룹에 없으면 → 파견/병동이동 인바운드 여부 확인 후 직접 조회
-        if not result:
-            from db.models import NurseAssignment
-            has_inbound = db.query(NurseAssignment).filter(
-                NurseAssignment.nurse_id == nurse_id,
-                NurseAssignment.target_group_id == current_user.group_id,
-                NurseAssignment.reason.in_(["파견", "병동이동"]),
-                NurseAssignment.status == "active",
-            ).first()
-            if has_inbound:
-                result = get_nurses_in_group_service(
-                    current_user, db, nurse_id=nurse_id, skip_group_filter=True,
-                )
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
         return result[0]
