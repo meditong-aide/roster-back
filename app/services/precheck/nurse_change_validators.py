@@ -48,24 +48,15 @@ def _team_members_after_swap(
       - new_team_id == team_id → team_id 의 멤버에 추가
       - new_team_id != team_id → team_id 의 멤버에서 제거
     """
-    native_ids = {
-        nid
-        for (nid,) in db.query(Nurse.nurse_id)
-        .filter(Nurse.group_id == group_id, Nurse.team_id == team_id, Nurse.active == 1)
-        .all()
+    # 멤버십은 시점(period) 기준 — nurses.team_id·nurse_assignment.target_team_id 는 NULL
+    #   이행 대상이라 캐시로 세면 0명. resolve_teams_for_month 가 home + 전입(이 그룹 period)
+    #   을 합산해 그 시점 팀 소속을 준다(전입자도 [B3] period 가 이 그룹에 기록됨).
+    from datetime import date as _d
+    from services.team_period import resolve_teams_for_month as _rtfm
+    members = {
+        nid for nid, tid in _rtfm(db, group_id, _d.today()).items()
+        if tid is not None and int(tid) == int(team_id)
     }
-    inbound_ids = {
-        nid
-        for (nid,) in db.query(NurseAssignment.nurse_id)
-        .filter(
-            NurseAssignment.target_group_id == group_id,
-            NurseAssignment.target_team_id == team_id,
-            NurseAssignment.status == "active",
-            NurseAssignment.reason.in_(_INBOUND_REASONS),
-        )
-        .all()
-    }
-    members = native_ids | inbound_ids
     if swap_nurse_id is not None:
         if swap_new_team_id == team_id:
             members.add(swap_nurse_id)

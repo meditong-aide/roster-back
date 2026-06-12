@@ -63,7 +63,14 @@ def filter_nurses(
     if grade is not None:
         q = q.filter(Nurse.grade == grade)
     if team_id is not None:
-        q = q.filter(Nurse.team_id == team_id)
+        # 팀 소속은 시점(period) 기준 — nurses.team_id 는 NULL 이행 대상이라 캐시 비교 불가.
+        from datetime import date as _d
+        from services.team_period import resolve_teams_for_month as _rtfm
+        _tids = {
+            nid for nid, tv in _rtfm(db, group_id, _d.today()).items()
+            if tv is not None and int(tv) == int(team_id)
+        }
+        q = q.filter(Nurse.nurse_id.in_(_tids or [""]))
     if has_preceptor is True:
         q = q.filter(Nurse.preceptor_id.isnot(None))
     elif has_preceptor is False:

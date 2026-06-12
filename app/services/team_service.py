@@ -200,11 +200,14 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
 
         # min_shift 저장 전 검증 (현재 요청의 add/remove 반영한 projected members 기준)
         if update_ms:
+            # 현재 멤버십은 시점(period) 기준 — nurses.team_id 는 NULL 이행 대상이라 캐시로
+            #   세면 항상 0명이 되어 오탐(TEAM_EMPTY_BUT_MIN_SET). period(as_of) 로 집계한다.
+            from datetime import date as _vdate
+            from services.team_period import resolve_teams_for_month as _rtfm
+            _on = _vdate(int(year), int(month), 1) if (year and month) else _vdate.today()
             current_member_ids = {
-                str(x[0])
-                for x in db.query(Nurse.nurse_id)
-                .filter(Nurse.group_id == group_id, Nurse.team_id == team.team_id)
-                .all()
+                nid for nid, tid in _rtfm(db, group_id, _on).items()
+                if tid is not None and int(tid) == int(team.team_id)
             }
             projected_ids = (current_member_ids | set(add_ids)) - set(remove_ids)
             vr = validate_team_min_shift_capacity(
