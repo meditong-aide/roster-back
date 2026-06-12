@@ -172,8 +172,10 @@ def _set_requirement(
     if preview_only:
         return {"preview": True, "changes": changes, "note": _APPLY_NOTE}
 
+    # 명시적 사용자 지정 → grade-1-only 정규화 우회 (skip_min_normalization=True).
     upsert_grade_config_service(
-        db, office_id, group_id, GradeConfigUpsert(**payload_kwargs), user_id or ""
+        db, office_id, group_id, GradeConfigUpsert(**payload_kwargs), user_id or "",
+        skip_min_normalization=True,
     )
     return {"preview": False, "applied": True, "changes": changes, "note": _APPLY_NOTE}
 

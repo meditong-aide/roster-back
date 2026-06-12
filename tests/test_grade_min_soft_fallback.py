@@ -42,8 +42,15 @@ def test_grade_min_soft_feasible_when_g1_short():
     assert len(terms) == 1  # slack penalty 항 노출(목적함수에서 차감)
 
 
-def test_grade_min_hard_infeasible_when_g1_short():
-    """같은 부족 상황 + hard → INFEASIBLE (= 순수 hard 의 '예민함')."""
+def test_grade_min_hard_infeasible_when_g1_short(monkeypatch):
+    """같은 부족 상황 + hard → INFEASIBLE (= 순수 hard 의 '예민함').
+
+    dev cascade(default=ON)는 hard 라도 누적 페널티로 흡수하므로,
+    레거시 binary hard/soft 경로를 검증하려면 cascade 를 꺼야 한다.
+    """
+    monkeypatch.setattr(
+        "services.constraints.grade_constraints._GRADE_CASCADE_ENABLED", False
+    )
     m, x, terms = _build(target_g1=2, n_g1_nurses=1, allow_soft=False)
     status = cp_model.CpSolver().Solve(m)
     assert status == cp_model.INFEASIBLE

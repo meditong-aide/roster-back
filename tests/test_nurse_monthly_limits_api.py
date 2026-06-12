@@ -110,7 +110,8 @@ def test_monthly_limits_reject_exact_sum_over_capacity(api):
         ],
     }
     resp = api.put("/nurses/monthly-limits", json=payload)
-    assert resp.status_code == 500, resp.text
+    # dev: preflight 가 구조적 422 로 반환 (이전 500). 본문에 structured 사유 유지.
+    assert resp.status_code == 422, resp.text
     detail = resp.json().get("detail", {})
     infeas = detail.get("infeasibility") if isinstance(detail, dict) else {}
     codes = {i.get("reason_code") for i in (infeas or {}).get("preflight_issues", [])}

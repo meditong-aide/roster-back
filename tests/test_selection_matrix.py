@@ -85,10 +85,14 @@ def test_A06_seed_not_g1_raises():
         auto_assign_teams(ns, seed_ids=["s0", "s1"], min_size=1, max_size=4)
 
 
-def test_A07_g1_lt_numteams_raises():
+def test_A07_g1_lt_numteams_graceful_seeds():
+    """dev: G1 < num_teams 라도 비-G1 앵커로 graceful 보충 — ValueError 안 던짐.
+
+    이전엔 raise; 1020142 team_auto_assign 도입 후 graceful 폴백.
+    """
     ns = [_n("s0", 1)] + [_n(f"p{i}") for i in range(5)]
-    with pytest.raises(ValueError):
-        auto_assign_teams(ns, num_teams=3, min_size=1, max_size=4)
+    res = auto_assign_teams(ns, num_teams=3, min_size=1, max_size=4)
+    assert len(res.teams) == 3
 
 
 def test_A08_fixed_pinned():

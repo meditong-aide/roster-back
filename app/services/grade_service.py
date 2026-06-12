@@ -128,8 +128,15 @@ def upsert_grade_config_service(
     group_id: str,
     payload: GradeConfigUpsert,
     user_id: str,
+    *,
+    skip_min_normalization: bool = False,
 ) -> GradeConfigResponse:
-    """Grade 설정을 생성 또는 갱신합니다."""
+    """Grade 설정을 생성 또는 갱신합니다.
+
+    skip_min_normalization=True 면 [GRADE_MIN_ONLY_G1] 정규화를 우회한다.
+    agent skill 의 명시적 사용자 지정(set_requirement)·테스트 seed 처럼
+    호출자가 의도적으로 임의 grade 값을 보낼 때 사용. UI form upsert 는 False 유지.
+    """
     group = db.query(Group).filter(Group.group_id == group_id).first()
     if not group:
         raise ValueError("존재하지 않는 그룹입니다.")
@@ -185,13 +192,15 @@ def upsert_grade_config_service(
         # [GRADE_MIN_ONLY_G1] grade 수와 무관하게 min 은 grade "1" 만 1, 나머지 등급은 0.
         #   (빈/미등록 상위 등급에 min 이 남아 precheck GRADE_MIN_AVAILABLE_SHORTAGE 로
         #    infeasible 되는 것을 원천 차단. 등급 cascade/soft 는 엔진단에서 처리.)
-        for _shift, _per_grade in list(cleaned.items()):
-            if not isinstance(_per_grade, dict):
-                continue
-            cleaned[_shift] = {
-                str(_g): (1 if str(_g) == "1" else 0)
-                for _g in _per_grade.keys()
-            }
+        #   skip_min_normalization=True 면 호출자가 명시 지정한 값을 보존.
+        if not skip_min_normalization:
+            for _shift, _per_grade in list(cleaned.items()):
+                if not isinstance(_per_grade, dict):
+                    continue
+                cleaned[_shift] = {
+                    str(_g): (1 if str(_g) == "1" else 0)
+                    for _g in _per_grade.keys()
+                }
         config.constraints_json = cleaned
 
     if "constraints_max" in provided_fields:

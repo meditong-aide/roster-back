@@ -25,8 +25,10 @@ def _seed_grade_config(db, *, constraints=None, constraints_max=None, names=True
         kwargs["constraints"] = constraints
     if constraints_max is not None:
         kwargs["constraints_max"] = constraints_max
+    # seed 는 명시적 fixture 상태 — dev 의 grade-1-only 정규화 우회.
     upsert_grade_config_service(
-        db, "OFF001", "GRP001", GradeConfigUpsert(**kwargs), "N001"
+        db, "OFF001", "GRP001", GradeConfigUpsert(**kwargs), "N001",
+        skip_min_normalization=True,
     )
 
 
