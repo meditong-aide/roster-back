@@ -42,6 +42,14 @@ GROUP_COL_OVERRIDE = {
     "nurse_assignment": ["source_group_id", "target_group_id"],
 }
 
+# include_group_ids 모드에서 dev/prod 가 갈려(간호사 타그룹 이동·id 불일치) PK/UNIQUE 충돌이
+# 나는 테이블 — 들어올 prod(그 group 스코프) 행과 아래 키가 겹치는 dev 행을 선삭제한다
+# (cross-group/cross-id 정리). dev 에 nurses FK 없음 확인 → 안전.
+CONFLICT_DELETE_KEYS = {
+    "nurses": ["nurse_id"],                                             # PK cross-group
+    "nurse_monthly_limits": ["nurse_id", "group_id", "year", "month"],  # UNIQUE(id 불일치)
+}
+
 # (table, mode) — FK 부모 → 자식 순서
 # mode="wipe":  dev 전체 삭제 후 prod 복사 (마스터 — prod 완전 미러)
 # mode="upsert": MERGE (prod row 있으면 UPDATE, 없으면 INSERT, dev-only 보존)
@@ -272,6 +280,43 @@ def _delete_dev(
     return result.rowcount if result.rowcount is not None else -1
 
 
+def _delete_dev_conflicts(
+    db: Session, table: str, keys: List[str], include_group_ids: List[str]
+) -> int:
+    """include_group_ids 선삭제: 들어올 prod(그 group 스코프) 행과 keys 가 겹치는 dev 행 삭제.
+    dev/prod 가 갈려(간호사 타그룹·id 불일치) 생기는 PK/UNIQUE 위반 방지."""
+    raw_override = GROUP_COL_OVERRIDE.get(table, "group_id")
+    group_cols = raw_override if isinstance(raw_override, list) else [raw_override]
+    prod_cols = set(_get_columns(db, PROD_DB, table))
+    present = [c for c in group_cols if c in prod_cols]
+    if not present:
+        return 0
+    where, params = _group_filter_clause(
+        include_group_ids, None, alias="src", cols=present
+    )
+    str_types = {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
+    type_rows = db.execute(
+        text(
+            f"SELECT COLUMN_NAME, DATA_TYPE FROM {DEV_DB}.INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=:t"
+        ),
+        {"t": table},
+    ).fetchall()
+    col_types = {r[0]: r[1] for r in type_rows}
+    joins = []
+    for c in keys:
+        if col_types.get(c, "") in str_types:
+            joins.append(f"d.[{c}] = src.[{c}] COLLATE DATABASE_DEFAULT")
+        else:
+            joins.append(f"d.[{c}] = src.[{c}]")
+    sql = (
+        f"DELETE d FROM {DEV_DB}.dbo.[{table}] AS d "
+        f"WHERE EXISTS (SELECT 1 FROM {PROD_DB}.dbo.[{table}] AS src{where} "
+        f"AND {' AND '.join(joins)})"
+    )
+    return db.execute(text(sql), params).rowcount or 0
+
+
 def _copy_prod_to_dev(
     db: Session,
     table: str,
@@ -307,6 +352,10 @@ def _copy_prod_to_dev(
             where, params = _group_filter_clause(
                 include_group_ids, exclude_group_ids, alias="src"
             )
+
+    # cross-group/cross-id 충돌 dev 행 선삭제 (PK 위반 방지)
+    if include_group_ids and table in CONFLICT_DELETE_KEYS:
+        _delete_dev_conflicts(db, table, CONFLICT_DELETE_KEYS[table], include_group_ids)
 
     col_list = ", ".join(f"[{c}]" for c in common)
     sel_list = ", ".join(f"src.[{c}]" for c in common)
@@ -410,6 +459,10 @@ def _merge_upsert(
             include_group_ids, exclude_group_ids, cols=present_cols
         )
         src_clause = f"(SELECT * FROM {PROD_DB}.dbo.[{table}]{where})"
+
+    # cross-group/cross-id 충돌 dev 행 선삭제 (UNIQUE 위반 방지 — id 매칭 MERGE 한계 보완)
+    if include_group_ids and table in CONFLICT_DELETE_KEYS:
+        _delete_dev_conflicts(db, table, CONFLICT_DELETE_KEYS[table], include_group_ids)
 
     # 문자열 PK 컬럼의 collation 충돌 방지 (prod/dev DB 기본 collation 다를 수 있음)
     str_types = {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
