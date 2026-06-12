@@ -86,16 +86,37 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
-def list_teams_with_members(db: Session, office_id: str, group_id: str) -> List[Dict]:
-    """팀 목록과 각 팀 멤버 nurse_id 리스트를 반환한다."""
-    teams = db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id, Team.active == 1).all()
+def list_teams_with_members(
+    db: Session, office_id: str, group_id: str,
+    year: int | None = None, month: int | None = None,
+) -> List[Dict]:
+    """팀 목록 + 각 팀 멤버 nurse_id 리스트.
+
+    멤버 집계는 **시점 팀(period SSOT)** 기준: year/month(없으면 오늘) 시점의
+    nurse_team_period 를 우선 해석하고, 구간 없으면 ward-aware 캐시(nurses.team_id) 폴백.
+    → nurses.team_id 일괄 NULL 이행 후에는 폴백이 자동으로 사라져 period-only 가 된다.
+    """
+    from datetime import date as _date
+    from services.team_period import resolve_teams_for_month
+
+    teams = db.query(Team).filter(
+        Team.office_id == office_id, Team.group_id == group_id, Team.active == 1
+    ).all()
+    on_date = _date(int(year), int(month), 1) if (year and month) else _date.today()
+
+    # 멤버 = on_date 시점 팀(period 우선 + ward-aware 캐시 폴백) 기준 그룹핑.
+    team_by_nurse = resolve_teams_for_month(db, group_id, on_date)
+    members_by_team: dict[int, list] = {}
+    for nid, tid in team_by_nurse.items():
+        if tid is not None:
+            members_by_team.setdefault(tid, []).append(nid)
+
     result = []
     for t in teams:
-        members = db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id, Nurse.team_id == t.team_id).all()
         result.append({
             'team_id': t.team_id,
             'team_name': t.team_name,
-            'team_members': [m[0] for m in members],
+            'team_members': members_by_team.get(t.team_id, []),
             'min_shift': t.min_shift if isinstance(t.min_shift, dict) else None,
             'handoff_policy': t.handoff_policy if isinstance(t.handoff_policy, dict) else None,
         })
@@ -117,6 +138,14 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
     by_id = {t.team_id: t for t in existing}
     by_name = {t.team_name: t for t in existing if t.active == 1}
     print('payload', payload)
+    # [이동 보호] 한 nurse가 A팀 remove + B팀 add 로 동시에 들어오면(이동), payload 팀 순서에 따라
+    #   remove(team_id=None)가 add(실제팀)를 set_team_period last-write-wins(team_period.py:135)로 덮어써
+    #   미배정(NULL)이 되던 버그 차단. period 모드에서 '어떤 팀에든 add 되는 nurse'는 NULL 기록을
+    #   스킵한다(이동 ≠ 미배정 — target 팀 add 가 권위).
+    _moved_in_ids: set[str] = set()
+    if _period_from is not None:
+        for _it in payload:
+            _moved_in_ids.update(str(_x) for _x in (_it.get('add') or []))
     # 1) 팀별 ops 처리
     for item in payload:
         team_id = item.get('team_id')
@@ -212,6 +241,9 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
         if remove_ids:
             if _period_from is not None:
                 for _nid in remove_ids:
+                    # 다른 팀으로 이동(add)된 nurse면 NULL 기록 스킵 — target 팀 add 가 권위(이동 ≠ 미배정)
+                    if str(_nid) in _moved_in_ids:
+                        continue
                     _set_tp(db, nurse_id=str(_nid), group_id=group_id,
                             valid_from=_period_from, team_id=None,
                             source="team_setting", commit=False)
@@ -233,5 +265,6 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
         db.query(Team).filter(Team.office_id == office_id, Team.group_id == group_id, Team.team_id.in_(delete_team_ids)).delete(synchronize_session=False)
 
     db.commit()
-    return list_teams_with_members(db, office_id, group_id)
+    # 저장 직후 응답도 시점 팀(period) 기준 — 방금 쓴 그 달(year/month) 멤버십을 반영.
+    return list_teams_with_members(db, office_id, group_id, year, month)
 

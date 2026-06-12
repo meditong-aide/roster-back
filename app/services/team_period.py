@@ -111,6 +111,43 @@ def resolve_team_for_roster(
     return _ward_aware_fallback(db, nurse_id, group_id)
 
 
+def resolve_teams_for_month(
+    db: Session, group_id: str, on_date: date
+) -> dict:
+    """그룹 전체 활성 간호사의 on_date 시점 팀 — period 우선 + ward-aware 캐시 폴백.
+
+    배치(2쿼리)로 N+1 회피. 반환 {nurse_id(str): team_id(int)|None}.
+    nurses.team_id 일괄 NULL 이행 후엔 캐시가 비어 자동으로 period-only 가 된다.
+    """
+    cache = {
+        str(nid): _coerce_team_int(tid)
+        for nid, tid in db.query(NurseModel.nurse_id, NurseModel.team_id)
+        .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
+        .all()
+    }
+    period: dict[str, Optional[int]] = {}
+    for p in (
+        db.query(NurseTeamPeriod)
+        .filter(
+            NurseTeamPeriod.group_id == group_id,
+            NurseTeamPeriod.valid_from <= on_date,
+            or_(
+                NurseTeamPeriod.valid_to.is_(None),
+                NurseTeamPeriod.valid_to > on_date,
+            ),
+        )
+        .order_by(NurseTeamPeriod.valid_from.desc())
+        .all()
+    ):
+        pid = str(p.nurse_id)
+        if pid not in period:  # valid_from desc 첫 등장 = 구간 우선
+            period[pid] = _coerce_team_int(p.team_id)
+    return {
+        nid: (period[nid] if nid in period else cache[nid])
+        for nid in cache
+    }
+
+
 def set_team_period(
     db: Session,
     *,

@@ -124,6 +124,8 @@ def _resolve_managed_target(
 async def get_teams(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     group_id: str | None = None,
+    year: int | None = None,
+    month: int | None = None,
     db: Session = Depends(get_db),
 ):
     try:
@@ -131,7 +133,10 @@ async def get_teams(
         target_group_id = resolve_effective_group(
             db, current_user, group_id, require_group=False
         )
-        return list_teams_with_members(db, current_user.office_id, target_group_id)
+        # year/month 주면 그 시점 period 기준 멤버, 없으면 오늘 시점(둘 다 period 우선+캐시 폴백).
+        return list_teams_with_members(
+            db, current_user.office_id, target_group_id, year, month
+        )
     except HTTPException:
         raise
     except Exception as e:
