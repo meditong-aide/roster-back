@@ -320,4 +320,8 @@ def _query_nurses(db, group_id, params):
         return nurse_tools.get_nurse_by_id(db, nurse_ids[0], group_id)
     if nurse_ids:
         return [nurse_tools.get_nurse_by_id(db, nid, group_id) for nid in nurse_ids]
-    return nurse_tools.get_nurses_in_group(db, group_id)
+    # year/month 가 주어지면 그 달 effective 멤버만 반환 (전입/전출 SSOT 반영).
+    return nurse_tools.get_nurses_in_group(
+        db, group_id,
+        year=params.get("year"), month=params.get("month"),
+    )

@@ -135,7 +135,10 @@ def update_person_attr(db: Session, params: dict) -> Any:
                 preview["coupled_changes"] = cs["coupled_log"]
             results.append(preview)
         else:
-            result = nurse_tools.update_nurse_attributes_batch(db, nid, group_id, mutations)
+            result = nurse_tools.update_nurse_attributes_batch(
+                db, nid, group_id, mutations,
+                year=params.get("year"), month=params.get("month"),
+            )
             results.append(result)
 
     # 단일 간호사 + 단일 mutation이면 평탄화

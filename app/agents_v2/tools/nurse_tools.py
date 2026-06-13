@@ -1,4 +1,11 @@
-"""Nurse data tools — search, filter, read nurse info."""
+"""Nurse data tools — search, filter, read nurse info.
+
+[Phase 0 / Group Scope] year/month 가 주어지면 시점 기반 SSOT 를 사용한다.
+- 멤버십: services.assignment_service.group_members_in_month (전입/전출 반영)
+- 팀: services.team_period.resolve_team_for_roster (NurseTeamPeriod SSOT)
+year/month 가 None 이면 기존 캐시 컬럼(Nurse.group_id / Nurse.team_id) 동작 보존 —
+호출부가 시점 컨텍스트 없이 부르는 경우의 후방 호환.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +15,51 @@ from sqlalchemy import func as sa_func
 from db.models import Nurse, Team
 
 
-def search_nurses_by_name(db: Session, group_id: str, name_query: str) -> list[dict]:
+def _month_member_ids(
+    db: Session, group_id: str, year: int | None, month: int | None
+) -> set[str] | None:
+    """year/month 가 모두 주어지면 그 달 effective 멤버 nurse_id set 반환.
+
+    소속 외(전출/휴직/퇴사) 는 제외 — group_members_in_month 정책 그대로 위임.
+    한쪽이라도 None 이면 None 반환 → 호출부는 캐시 경로 사용.
+    """
+    if year is None or month is None:
+        return None
+    try:
+        from services.assignment_service import group_members_in_month
+
+        snap = group_members_in_month(db, group_id, int(year), int(month))
+        return {m["nurse_id"] for m in snap.get("members", [])}
+    except Exception:
+        # SSOT 헬퍼가 실패하면 캐시 경로로 폴백 (silent — 안전).
+        return None
+
+
+def _resolve_month_team(
+    db: Session, nurse_id: str, group_id: str, year: int | None, month: int | None
+) -> int | None:
+    """year/month 가 있으면 NurseTeamPeriod SSOT 로 effective team_id."""
+    if year is None or month is None:
+        return None
+    try:
+        from services.team_period import resolve_team_for_roster
+
+        return resolve_team_for_roster(db, nurse_id, group_id, int(year), int(month))
+    except Exception:
+        return None
+
+
+def search_nurses_by_name(
+    db: Session,
+    group_id: str,
+    name_query: str,
+    *,
+    year: int | None = None,
+    month: int | None = None,
+) -> list[dict]:
     """Search nurses in a group by name (partial match).
 
+    year/month 가 주어지면 그 달 effective 멤버로 한정 (전입/전출 반영).
     Returns list of candidates with nurse_id, name, team, grade, experience.
     """
     rows = (
@@ -23,17 +72,32 @@ def search_nurses_by_name(db: Session, group_id: str, name_query: str) -> list[d
         .order_by(Nurse.sequence)
         .all()
     )
+    month_ids = _month_member_ids(db, group_id, year, month)
+    if month_ids is not None:
+        rows = [r for r in rows if r.nurse_id in month_ids]
     return [_nurse_summary(r) for r in rows]
 
 
-def get_nurses_in_group(db: Session, group_id: str) -> list[dict]:
-    """Return all active nurses in a group."""
+def get_nurses_in_group(
+    db: Session,
+    group_id: str,
+    *,
+    year: int | None = None,
+    month: int | None = None,
+) -> list[dict]:
+    """Return all active nurses in a group.
+
+    year/month 가 주어지면 그 달 effective 멤버만 반환(전입/전출 반영).
+    """
     rows = (
         db.query(Nurse)
         .filter(Nurse.group_id == group_id, Nurse.active == 1)
         .order_by(Nurse.sequence)
         .all()
     )
+    month_ids = _month_member_ids(db, group_id, year, month)
+    if month_ids is not None:
+        rows = [r for r in rows if r.nurse_id in month_ids]
     return [_nurse_summary(r) for r in rows]
 
 
@@ -57,12 +121,21 @@ def filter_nurses(
     has_preceptor: bool | None = None,
     joined_after: str | None = None,
     joined_before: str | None = None,
+    year: int | None = None,
+    month: int | None = None,
 ) -> list[dict]:
-    """Filter nurses by various attributes."""
+    """Filter nurses by various attributes.
+
+    year/month 주어지면:
+      - 멤버십: group_members_in_month (전입/전출 반영)
+      - team_id 필터: NurseTeamPeriod SSOT 시점 매칭 (캐시 컬럼 의존 해소)
+    """
     q = db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.active == 1)
     if grade is not None:
         q = q.filter(Nurse.grade == grade)
-    if team_id is not None:
+    # team_id 필터 — year/month 가 있으면 Python 단에서 시점 SSOT 로 후필터
+    use_period_team = team_id is not None and year is not None and month is not None
+    if team_id is not None and not use_period_team:
         q = q.filter(Nurse.team_id == team_id)
     if has_preceptor is True:
         q = q.filter(Nurse.preceptor_id.isnot(None))
@@ -73,6 +146,19 @@ def filter_nurses(
     if joined_before:
         q = q.filter(Nurse.joining_date <= joined_before)
     rows = q.order_by(Nurse.sequence).all()
+
+    # 멤버십 시점 필터
+    month_ids = _month_member_ids(db, group_id, year, month)
+    if month_ids is not None:
+        rows = [r for r in rows if r.nurse_id in month_ids]
+
+    # team_id 시점 필터 (SSOT 우선)
+    if use_period_team:
+        rows = [
+            r for r in rows
+            if _resolve_month_team(db, r.nurse_id, group_id, year, month) == team_id
+        ]
+
     result = [_nurse_summary(r) for r in rows]
     if is_night_nurse is not None:
         # is_night_nurse is JSON list; filter in Python
@@ -554,11 +640,22 @@ def compute_batch_changeset(
 
 
 def update_nurse_attributes_batch(
-    db: Session, nurse_id: str, group_id: str, mutations: list[dict]
+    db: Session,
+    nurse_id: str,
+    group_id: str,
+    mutations: list[dict],
+    *,
+    year: int | None = None,
+    month: int | None = None,
 ) -> dict:
     """단일 간호사에 여러 mutation을 트랜잭션으로 적용.
 
     group_id-scoped: cross-group mutation 차단.
+
+    team_id 변경 시:
+      - year/month 가 주어지면 그 달 1일을 valid_from 으로 NurseTeamPeriod SSOT 기록
+      - 미지정 시 오늘 날짜로 SSOT 기록
+      - Nurse.team_id 캐시도 함께 갱신 (구 화면 호환).
     """
     cs = compute_batch_changeset(db, nurse_id, group_id, mutations)
     if not cs["ok"]:
@@ -569,8 +666,38 @@ def update_nurse_attributes_batch(
         .filter(Nurse.nurse_id == nurse_id, Nurse.group_id == group_id)
         .first()
     )
-    for f, v in cs["changed_fields"].items():
+    changed_fields = cs["changed_fields"]
+    team_change = "team_id" in changed_fields
+    for f, v in changed_fields.items():
         setattr(nurse, f, v)
+
+    if team_change:
+        try:
+            from datetime import date as _date
+
+            from services.team_period import set_team_period
+
+            if year is not None and month is not None:
+                valid_from = _date(int(year), int(month), 1)
+            else:
+                valid_from = _date.today()
+            set_team_period(
+                db,
+                nurse_id=nurse_id,
+                group_id=group_id,
+                valid_from=valid_from,
+                team_id=changed_fields["team_id"],
+                source="agent",
+                commit=False,
+            )
+        except Exception:
+            # SSOT 기록 실패해도 캐시는 이미 갱신됨 — 부분 안전. 로그만.
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "[nurse_tools] set_team_period SSOT 기록 실패 nurse=%s group=%s",
+                nurse_id, group_id,
+            )
+
     db.commit()
     db.refresh(nurse)
 
