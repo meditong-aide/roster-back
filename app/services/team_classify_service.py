@@ -18,9 +18,9 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from db.models import FixedWantedEntry, Nurse as NurseModel, Shift
+from db.models import FixedWantedEntry, Nurse as NurseModel, Shift, Team as TeamModel
 from services.assignment_service import create_permanent_change
-from services.team_period import set_team_period
+from services.team_period import resolve_teams_for_month, set_team_period
 from services.team_auto_assign import NurseInput, auto_assign_teams
 
 _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
@@ -243,11 +243,13 @@ def preview_team_classification(
     if not pool:
         raise ValueError("분류(참여) 대상 간호사가 없습니다.")
     # 팀 목록은 그룹 전체 기준 (참여자만으로 좁히지 않음)
+    # 팀 정의는 teams 테이블(정의된 팀)이 권위 — nurses.team_id(캐시)로 세지 않는다.
+    #   (ward_redistribute 와 동일 원칙. nurses.team_id 일괄 NULL 이행 후에도 동작.)
     team_ids = sorted({
-        t for (t,) in db.query(NurseModel.team_id)
-        .filter(NurseModel.group_id == group_id, NurseModel.active == 1,
-                NurseModel.team_id.isnot(None))
+        int(t) for (t,) in db.query(TeamModel.team_id)
+        .filter(TeamModel.group_id == group_id, TeamModel.active == 1)
         .distinct()
+        if t is not None
     })
     if not team_ids:
         raise ValueError("병동에 설정된 팀(team_id)이 없습니다.")
@@ -260,7 +262,9 @@ def preview_team_classification(
         )
 
     result = auto_assign_teams(inputs, num_teams=num_teams)
-    current_team = {n.nurse_id: n.team_id for n in pool}
+    # 현재 팀 = 시점(period) 기준 (NULL 이행 후에도 정확). 클러스터→팀 라벨 안정화에 사용.
+    _team_now = resolve_teams_for_month(db, group_id, date(year, month, 1))
+    current_team = {n.nurse_id: _team_now.get(str(n.nurse_id)) for n in pool}
     name_map = {n.nurse_id: n.name for n in pool}
     idx_to_team = _map_clusters_to_team_ids(result.teams, current_team, team_ids)
 
@@ -358,6 +362,9 @@ def apply_team_classification(
     skipped = 0
     handled_release: set[str] = set()
     _note = note or f"원티드 팀분류 {year}-{month:02d}"
+    # 현재 팀 = 시점(period) 기준 — raw nurse.team_id 는 period 기록 후 갱신 안 돼 재실행 시
+    #   skip 실패(non-idempotent). period 로 정확·멱등 비교(NULL 이행 후에도 동작).
+    _team_now = resolve_teams_for_month(db, group_id, effective)
     for a in assignments:
         nid = a["nurse_id"]
         new_team = a["team_id"]
@@ -368,7 +375,7 @@ def apply_team_classification(
         # N전담을 팀에 편입하면 N전담 해제 동반(is_night_nurse=[]) — 발효일 기반
         is_n_override = (nurse.is_night_nurse or []) == ["N"]
         rel = nid in released
-        if _same(nurse.team_id, new_team) and not is_n_override and not rel:
+        if _same(_team_now.get(str(nid)), new_team) and not is_n_override and not rel:
             skipped += 1
             continue
         create_permanent_change(

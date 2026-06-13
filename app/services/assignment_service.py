@@ -1771,6 +1771,9 @@ def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -
         )
         if nurse:
             if row.target_team_id is not None:
+                # team SSOT 는 nurse_team_period(생성시 [B3] 로 이미 기록됨). 아래 캐시 갱신은
+                #   레거시 호환용 — nurses.team_id 일괄 NULL 이행 후엔 모든 리더가 period 를
+                #   보므로 이 값은 무시된다(컬럼 DROP 시 이 writer 도 함께 제거 예정).
                 nurse.team_id = row.target_team_id
             if row.target_grade is not None:
                 nurse.grade = row.target_grade

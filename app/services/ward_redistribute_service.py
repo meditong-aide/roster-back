@@ -28,7 +28,7 @@ from db.models import (
 )
 from schemas.roster_schema import NurseAssignmentCreate
 from services.assignment_service import create_assignment, create_permanent_change
-from services.team_period import set_team_period
+from services.team_period import resolve_team, set_team_period
 from services.team_auto_assign import NurseInput, auto_assign_teams
 from services.team_classify_service import _build_pool_roster
 
@@ -670,7 +670,9 @@ def apply_ward_redistribution(
                 create_assignment(req, db, current_user, notify=False)
                 transfers += 1
                 _tp_group = to_g
-            elif team is not None and not _same_team(n.team_id, team):
+            elif team is not None and not _same_team(
+                resolve_team(db, nid, cur_g, effective), team
+            ):
                 create_permanent_change(
                     db, nurse_id=nid, group_id=cur_g, office_id=n.office_id,
                     start_date=effective, new_team_id=team, note=_note,

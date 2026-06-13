@@ -133,10 +133,21 @@ def filter_nurses(
     q = db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.active == 1)
     if grade is not None:
         q = q.filter(Nurse.grade == grade)
-    # team_id 필터 — year/month 가 있으면 Python 단에서 시점 SSOT 로 후필터
-    use_period_team = team_id is not None and year is not None and month is not None
-    if team_id is not None and not use_period_team:
-        q = q.filter(Nurse.team_id == team_id)
+    if team_id is not None:
+        # 팀 소속은 시점(period) 기준 — nurses.team_id 는 NULL 이행 대상이라 캐시 비교 불가.
+        # year/month 가 주어지면 그 달 1일, 아니면 오늘 기준 SSOT 조회.
+        from datetime import date as _d
+        from services.team_period import resolve_teams_for_month as _rtfm
+        on_date = (
+            _d(int(year), int(month), 1)
+            if year is not None and month is not None
+            else _d.today()
+        )
+        _tids = {
+            nid for nid, tv in _rtfm(db, group_id, on_date).items()
+            if tv is not None and int(tv) == int(team_id)
+        }
+        q = q.filter(Nurse.nurse_id.in_(_tids or [""]))
     if has_preceptor is True:
         q = q.filter(Nurse.preceptor_id.isnot(None))
     elif has_preceptor is False:
@@ -147,17 +158,10 @@ def filter_nurses(
         q = q.filter(Nurse.joining_date <= joined_before)
     rows = q.order_by(Nurse.sequence).all()
 
-    # 멤버십 시점 필터
+    # 멤버십 시점 필터 (전입/전출 반영)
     month_ids = _month_member_ids(db, group_id, year, month)
     if month_ids is not None:
         rows = [r for r in rows if r.nurse_id in month_ids]
-
-    # team_id 시점 필터 (SSOT 우선)
-    if use_period_team:
-        rows = [
-            r for r in rows
-            if _resolve_month_team(db, r.nurse_id, group_id, year, month) == team_id
-        ]
 
     result = [_nurse_summary(r) for r in rows]
     if is_night_nurse is not None:
