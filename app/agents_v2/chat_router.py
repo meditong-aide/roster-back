@@ -26,6 +26,11 @@ from agents_v2.agent_v3 import SchedulingAgent
 from agents_v2.conversation import ConversationStore
 from agents_v2.llm_client import get_llm_client, get_router_llm_client
 from agents_v2.schemas.session_context import SessionContext
+from agents_v2.security import (
+    InputVerdict,
+    check_output,
+    classify_input,
+)
 from db.client2 import get_db
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User
@@ -153,6 +158,26 @@ async def send_message(
     if not req.message or not req.message.strip():
         raise HTTPException(status_code=400, detail="메시지가 비어 있습니다.")
 
+    # Layer A — 입력 분류. MALICIOUS 는 LLM/도구 호출 전에 차단.
+    input_check = classify_input(req.message)
+    if input_check.verdict is InputVerdict.MALICIOUS:
+        logger.warning(
+            "[security] input blocked user=%s reasons=%s",
+            current_user.nurse_id, input_check.reason_codes,
+        )
+        return ChatResponse(
+            answer=input_check.block_message or "처리할 수 없는 요청입니다.",
+            conversation_id=req.conversation_id or str(uuid.uuid4()),
+            awaiting_approval=False,
+            preview=None,
+            ui_actions=[],
+        )
+    if input_check.verdict is InputVerdict.SUSPICIOUS:
+        logger.info(
+            "[security] input suspicious user=%s reasons=%s",
+            current_user.nurse_id, input_check.reason_codes,
+        )
+
     conv_id = req.conversation_id or str(uuid.uuid4())
     store = _get_store()
     agent = _get_agent()
@@ -204,12 +229,33 @@ async def send_message(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[chat] save failed (silent) conv_id=%s: %s", conv_id, exc)
 
+    # Layer B — 출력 누출 검사. 시스템 sentinel/내부 경로/크로스-테넌트 group_id 등.
+    raw_answer = result.answer or ""
+    output_check = check_output(raw_answer, user_group_id=current_user.group_id)
+    if output_check.reason_codes:
+        logger.warning(
+            "[security] output flagged user=%s verdict=%s reasons=%s",
+            current_user.nurse_id, output_check.verdict.value, output_check.reason_codes,
+        )
+
+    # B7: 답형 조회 결과를 인라인 렌더용 data 로 노출. output 검열이 BLOCKED 면
+    # data 도 보내지 않음 (전체 응답이 generic 으로 치환된 상태).
+    safe_data: Any | None = None
+    if output_check.verdict.value != "blocked":
+        raw_data = result.data
+        # dict 면 그대로, list 면 {"items": [...]} 래핑 (스키마 일관성).
+        if isinstance(raw_data, dict):
+            safe_data = raw_data
+        elif isinstance(raw_data, list):
+            safe_data = {"items": raw_data}
+
     return ChatResponse(
-        answer=result.answer or "",
+        answer=output_check.answer,
         conversation_id=conv_id,
         awaiting_approval=bool(result.awaiting_approval),
         preview=result.preview if result.awaiting_approval else None,
         ui_actions=result.ui_actions,
+        data=safe_data,
     )
 
 
