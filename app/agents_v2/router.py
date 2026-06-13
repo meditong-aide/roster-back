@@ -95,6 +95,9 @@ class RouterResult:
     input_tokens: int = 0
     output_tokens: int = 0
     model: str | None = None
+    # B14: 분류 신뢰도 — 1.0(단일 카테고리, 명확) / 0.7(2~3 복합) / 0.4(4+ 과다)
+    # / 0.0(fallback). LLM 자체 confidence 가 아닌 분류 결과 shape 기반 휴리스틱.
+    confidence: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -102,6 +105,7 @@ class RouterResult:
             "tool_count": len(self.tool_names),
             "tool_names": self.tool_names,
             "fallback_used": self.fallback_used,
+            "confidence": self.confidence,
         }
 
 
@@ -146,21 +150,48 @@ def classify(llm: LLMClient, message: str) -> list[str]:
     return _classify_raw(llm, message)[0]
 
 
+def _confidence_for(categories: list[str]) -> float:
+    """카테고리 결과 shape → 신뢰도 휴리스틱.
+
+    fallback(빈 list) = 0.0
+    1개 카테고리 = 1.0 (명확)
+    2~3개 = 0.7 (복합 의도)
+    4개+ = 0.4 (LLM 과다 선택 — 노이즈 의심)
+    """
+    n = len(categories)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return 1.0
+    if n <= 3:
+        return 0.7
+    return 0.4
+
+
 def route(llm: LLMClient, message: str) -> RouterResult:
     """발화 → RouterResult. 분류가 비면 fallback(전체 tool). 토큰/모델도 함께 반환."""
     cats, resp = _classify_raw(llm, message)
     it = resp.input_tokens if resp else 0
     ot = resp.output_tokens if resp else 0
     mdl = resp.model if resp else None
+    confidence = _confidence_for(cats)
     if not cats:
-        return RouterResult(
+        result = RouterResult(
             categories=[], tool_names=list(ALL_TOOL_NAMES), fallback_used=True,
-            input_tokens=it, output_tokens=ot, model=mdl,
+            input_tokens=it, output_tokens=ot, model=mdl, confidence=confidence,
         )
-    return RouterResult(
-        categories=cats, tool_names=resolve_tools(cats), fallback_used=False,
-        input_tokens=it, output_tokens=ot, model=mdl,
+    else:
+        result = RouterResult(
+            categories=cats, tool_names=resolve_tools(cats), fallback_used=False,
+            input_tokens=it, output_tokens=ot, model=mdl, confidence=confidence,
+        )
+    # B14: 한 줄 구조화 로그 — 디버깅/품질 모니터링용.
+    logger.info(
+        "[router] cats=%s conf=%.2f tools=%d fallback=%s tokens=%d/%d model=%s",
+        result.categories, result.confidence, len(result.tool_names),
+        result.fallback_used, it, ot, mdl,
     )
+    return result
 
 
 def _parse_categories(text: str) -> list[str]:
