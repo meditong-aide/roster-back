@@ -234,6 +234,9 @@ class MemoryExtractor:
         chat(messages, tools, *, tool_choice) -> LLMResponse 인터페이스 가정.
         """
         self.llm = llm_client
+        # 마지막 extract_facts 호출의 토큰/모델 — agent_v3 가 record_llm_usage 로
+        # purpose="memory_consolidate" 사용량 기록할 때 읽음. 호출 전엔 (0, 0, None).
+        self.last_usage: tuple[int, int, str | None] = (0, 0, None)
 
     def extract_facts(
         self,
@@ -278,7 +281,15 @@ class MemoryExtractor:
             )
         except Exception as e:
             logger.warning("[extractor] LLM call failed: %s", e)
+            self.last_usage = (0, 0, None)
             return []
+
+        # 호출 직후 사용량 노출 — agent_v3._consolidate_after_turn 가 record.
+        self.last_usage = (
+            int(getattr(response, "input_tokens", 0) or 0),
+            int(getattr(response, "output_tokens", 0) or 0),
+            getattr(response, "model", None),
+        )
 
         # tool_call 우선
         raw_facts: list[dict] = []

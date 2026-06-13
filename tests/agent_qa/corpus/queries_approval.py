@@ -82,3 +82,38 @@ FALSE_POSITIVE_TRAPS: list[str] = [
     # "네 어쩌고" 가 너무 길면 ack 가 아닌 일반 답변 — _CONFIRM_MAX_LEN 초과
     "네 그런데 이번에는 다른 옵션도 같이 보여줄 수 있을까요? 좀 더 자세한 설명이 필요해요",
 ]
+
+
+# ── B9: apply_hint 흐름 전용 corpus ─────────────────────────
+# infeasibility resolver 가 "soft 모드로 바꾸면 풀려요. 적용할까요?" 같은
+# 옵션을 제시했을 때 사용자가 자연스럽게 답하는 발화.
+# CONFIRM/DENY 의 일반 corpus 와 별개로, apply_hint 컨텍스트에서 빈도 높은 표현.
+
+APPLY_HINT_CONFIRM_PHRASES: list[str] = [
+    "그렇게 해",
+    "그렇게 해줘",
+    "적용해",
+    "적용해줘",
+    "그렇게 진행해",
+    "응 그 옵션",
+    "그래 그렇게",
+]
+
+APPLY_HINT_DENY_PHRASES: list[str] = [
+    "아니 다른 방법",
+    "그건 싫어",
+    "그 옵션 말고",
+    "원래대로 해줘",
+    "취소 다른 방법은?",
+    "아니 그건 안 돼",
+]
+
+# 모호 — agent 가 question 을 다시 띄워야 함 (pending_approval 유지)
+APPLY_HINT_AMBIGUOUS_PHRASES: list[str] = [
+    "그게 뭐야?",
+    "어떻게 바뀌어?",
+    "soft 모드가 뭐야?",
+    "어떤 영향이 있어?",
+    "더 자세히 알려줘",
+    "다른 옵션은 뭐가 있어?",
+]

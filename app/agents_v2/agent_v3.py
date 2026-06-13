@@ -103,6 +103,9 @@ class AgentResult:
     trace: list[Stage] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
     variable_memory: dict = field(default_factory=dict)
+    # B7: 인라인 렌더용 답형 조회결과. 마지막 성공 조회 스킬 결과를 누적해
+    # ChatResponse.data 로 전달 (프론트가 카드/테이블로 시각화).
+    data: dict | list | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"answer": self.answer}
@@ -260,6 +263,8 @@ class SchedulingAgent:
         ui_actions: list[dict] = []
         _prev_calls: set[str] = set()
         _failed_shift_terms: list[str] = []
+        # B7: 마지막 성공 조회 결과 — 인라인 렌더용 ChatResponse.data 채움.
+        last_query_data: dict | list | None = None
 
         # Restore VM from previous turns
         if ctx.variable_memory:
@@ -324,6 +329,7 @@ class SchedulingAgent:
                     trace=trace,
                     messages=messages,
                     variable_memory=vm.to_dict(),
+                    data=last_query_data,
                 )
 
             # ── Tool call(s) → middleware pipeline ──
@@ -425,6 +431,16 @@ class SchedulingAgent:
 
                     # Store result in Variable Memory
                     vm.store(skill_name, result.data)
+
+                    # B7: 인라인 렌더용 데이터 누적 — 마지막 성공 조회 결과가 이긴다.
+                    # error / needs_clarification / preview 는 데이터 의미가 없어 제외.
+                    if (
+                        result.data is not None
+                        and not _is_error(result.data)
+                        and not _needs_clarification(result.data)
+                        and not _is_preview_result(result.data)
+                    ):
+                        last_query_data = result.data
 
                     # ── Auto-learn abbreviation tracking ──
                     _track_shift_learning(
@@ -600,6 +616,27 @@ class SchedulingAgent:
             messages=recent,
             existing_facts=existing_facts,
         )
+
+        # B6: memory consolidate LLM 호출 사용량 회계. decisions 가 비어도(=NOOP)
+        # 토큰은 소비됐으므로 항상 기록.
+        in_tok, out_tok, ext_model = getattr(
+            self.memory_extractor, "last_usage", (0, 0, None)
+        )
+        if in_tok or out_tok:
+            try:
+                record_llm_usage(
+                    db,
+                    conversation_id=getattr(ctx, "conversation_id", None),
+                    group_id=ctx.group_id,
+                    user_id=user_id,
+                    model=ext_model,
+                    purpose="memory_consolidate",
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                )
+            except Exception as e:
+                logger.warning("[agent_v3] memory usage record failed: %s", e)
+
         if not decisions:
             return
 
@@ -825,6 +862,10 @@ _CONFIRM_WORDS = frozenset({
     "응응",
     "yep",
     "y",
+    # B9 (2026-06-12): apply_hint 컨텍스트에서 제안된 옵션 적용을 표하는 어휘.
+    "적용",
+    "적용해",
+    "적용해줘",
 })
 
 
@@ -842,6 +883,10 @@ _DENY_WORDS = frozenset({
     "괜찮아",
     "skip",
     "건너뛰기",
+    # B9 (2026-06-12): apply_hint 컨텍스트에서 옵션 거부를 표하는 어휘.
+    "싫어",
+    "말고",
+    "원래대로",
 })
 
 
