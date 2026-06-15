@@ -58,37 +58,42 @@ def _assert_caller_owns_source(
     current_user: Optional[UserSchema],
     source_group_id: str,
     db: Optional[Session] = None,
+    target_group_id: Optional[str] = None,
 ) -> None:
     """파견/병동이동/휴직 등 assignment 조작 권한 검증.
 
     통과 조건 (OR):
     - current_user is None → system/admin 경로로 간주
     - is_master_admin
-    - caller.group_id == source_group_id (현재 view 가 source)
-    - caller.original_group_id == source_group_id (원본 소속이 source — view 전환 중)
-    - source_group_id ∈ resolve_managed_group_ids(caller)
-      (HN multi-group: home + group.hn_id JSON 에 본인이 등록된 모든 그룹)
+    - caller 가 source_group_id 소유 (group_id / original_group_id / managed)
+    - **target_group_id 가 주어지면**(취소 등) caller 가 target_group_id 소유여도 통과.
+      A→B 파견을 전입 받은 B(target)에서도 취소→재등록할 수 있게. 생성·수정 호출은
+      target_group_id 를 넘기지 않으므로 기존대로 **source 전용**으로 유지된다.
     """
     if current_user is None:
         return
     if getattr(current_user, "is_master_admin", False):
         return
+    _allowed = {str(source_group_id)}
+    if target_group_id is not None:
+        _allowed.add(str(target_group_id))
     caller_gid = getattr(current_user, "group_id", None)
-    if caller_gid == source_group_id:
+    if str(caller_gid) in _allowed:
         return
     caller_original = getattr(current_user, "original_group_id", None)
-    if caller_original and caller_original == source_group_id:
+    if caller_original and str(caller_original) in _allowed:
         return
     if db is not None:
         from services.group_access import resolve_managed_group_ids
         managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
-        if str(source_group_id) in managed:
+        if _allowed & managed:
             return
     raise HTTPException(
         status_code=403,
         detail=(
-            f"권한 없음: source 병동({source_group_id})의 수간호사 또는 그룹 관리자만 "
-            f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
+            f"권한 없음: 해당 배정의 source({source_group_id})"
+            f"{'/target(' + str(target_group_id) + ')' if target_group_id else ''} "
+            f"병동 수간호사·그룹 관리자만 조작할 수 있습니다. (caller={caller_gid})"
         ),
     )
 
@@ -778,7 +783,11 @@ def cancel_assignment(
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
-    _assert_caller_owns_source(current_user, row.source_group_id, db=db)
+    # 취소는 source(기존 병동) + target(전입 받은 병동) 양쪽 허용 — target 그룹이 잘못
+    # 들어온 전입자 파견을 직접 취소→재등록 가능하게. (생성·수정은 source 전용 유지)
+    _assert_caller_owns_source(
+        current_user, row.source_group_id, db=db, target_group_id=row.target_group_id
+    )
 
     _old_window = (row.start_date, _effective_end_date(row))
     _old_reason = row.reason
