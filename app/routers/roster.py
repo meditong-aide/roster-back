@@ -810,6 +810,21 @@ async def get_roster_by_schedule_id(
         .all()
     }
     _inbound_ids = _all_entry_nurse_ids - _group_nurse_ids
+    # 빈 근무표(ScheduleEntry 없음)에도 전입자가 명단에 들어오도록, 근무자관리
+    # (get_nurses_in_group_service)와 동일하게 NurseAssignment(target=group, active,
+    # 파견/병동이동) 기반 inbound 도 합친다. (entry union 만으로는 빈 근무표에서 전입자 누락)
+    from services.group_access import _INBOUND_REASONS
+    _assign_inbound_ids = {
+        r.nurse_id
+        for r in db.query(NurseAssignment.nurse_id)
+        .filter(
+            NurseAssignment.target_group_id == target_group_id,
+            NurseAssignment.status == "active",
+            NurseAssignment.reason.in_(_INBOUND_REASONS),
+        )
+        .distinct()
+    } - _group_nurse_ids
+    _inbound_ids = _inbound_ids | _assign_inbound_ids
     if _inbound_ids:
         _inbound_nurses = (
             db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
