@@ -422,7 +422,13 @@ def _merge_upsert(
     include_group_ids: Optional[List[str]] = None,
     exclude_group_ids: Optional[List[str]] = None,
 ) -> dict:
-    """MERGE 로 prod → dev upsert. dev-only row 보존 (DELETE 절 없음)."""
+    """MERGE 로 prod → dev upsert.
+
+    - 기본(전체 sync / exclude 모드): dev-only row 보존 (DELETE 절 없음).
+    - include_group_ids 지정 시: 해당 group 스코프의 dev-only(prod 에 없는) 행은
+      `WHEN NOT MATCHED BY SOURCE` 로 제거 → 지정 group 을 prod 와 완전 동일하게(잔존 방지).
+      다른 group 의 dev 행은 스코프 밖이라 보존.
+    """
     if not _table_exists(db, PROD_DB, table):
         return {"table": table, "skipped": "prod_missing", "upserted": 0}
     if not _table_exists(db, DEV_DB, table):
@@ -492,13 +498,24 @@ def _merge_upsert(
         update_set = ", ".join(f"dst.[{c}] = src.[{c}]" for c in non_pk)
         update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
 
+    # include_group_ids 스코프 동기화: prod 에 없는 dev-only(해당 group) 행 제거 →
+    # 지정 group 을 prod 와 완전 동일하게(잔존 방지). exclude/전체 sync 는 기존대로 보존.
+    delete_clause = ""
+    if include_group_ids and present_cols and not exclude_group_ids:
+        for i, v in enumerate(include_group_ids):
+            params[f"d_inc_{i}"] = v
+        _ph = ",".join(f":d_inc_{i}" for i in range(len(include_group_ids)))
+        _conds = " OR ".join(f"dst.[{c}] IN ({_ph})" for c in present_cols)
+        delete_clause = f"WHEN NOT MATCHED BY SOURCE AND ({_conds}) THEN DELETE"
+
     sql = f"""
     MERGE {DEV_DB}.dbo.[{table}] AS dst
     USING {src_clause} AS src
         ON {pk_join}
     {update_clause}
     WHEN NOT MATCHED BY TARGET THEN
-        INSERT ({insert_cols}) VALUES ({insert_vals});
+        INSERT ({insert_cols}) VALUES ({insert_vals})
+    {delete_clause};
     """
 
     has_identity = _has_identity(db, DEV_DB, table)
