@@ -2142,10 +2142,17 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
                 forbidden[nurse_id][0].extend(['D', 'E', 'N'])
                 print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/N), tail={tail_str}")
             else:
-                two_after_two_effective = two_after_two
-                if two_after_two_effective:
-                    forced_off[nurse_id].extend([1, 2])
-                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail → day0 N 허용(off_window day0→[1,end] 시프트)" + (", day1,2 OFF(2N2O)" if two_after_two_effective else "") + f", tail={tail_str}")
+                # day0 N 허용(전월 1N + day0 = 2N). L>=3(3N 허용 설정=three_seq_nig)이면 day1 도 N 허용 →
+                #   day0+day1=3N 까지 구조적으로 가능(N 공급↑·미달일 커버리지 도움; 3N 되면 솔버의 3N2O 가
+                #   day2,3 OFF 처리). L==2(3N 불가)면 현재처럼 day0만 N(2N) + 2N2O 면 day1,2 OFF 강제.
+                if L >= 3:
+                    _n1_msg = "day0~day1 N 허용(최대 3N, three_seq_nig)"
+                else:
+                    two_after_two_effective = two_after_two
+                    if two_after_two_effective:
+                        forced_off[nurse_id].extend([1, 2])
+                    _n1_msg = "day0 N 허용(2N)" + (", day1,2 OFF(2N2O)" if two_after_two_effective else "")
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail → {_n1_msg}(off_window day0→[1,end] 시프트), tail={tail_str}")
 
         # (b) N2/3 → 2OFF
         req_offs = 0
