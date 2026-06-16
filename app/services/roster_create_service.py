@@ -2114,23 +2114,30 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
                     f"K={K} → 월초 0..{window_end}(1~{window_end+1}일) 구간 OFF≥1 제약 추가 "
                     f"(꼬리: {tail_str})"
                 )
-        # (b-0) 1N 금지: 꼬리 N이 1개라면 day0 N 고정 또는 forbidden
-        # day0이 주휴면 forbidden만(주휴 우선). 아니면 day0=N 고정 + 2N2O 시 day1,2 OFF 강제.
+        # (b-0) 1N 금지: 꼬리 N이 1개(1N tail)면 day0 N 으로 이어 2N 을 만들어 1N 금지 충족 +
+        #   day0 N 커버리지를 확보한다. day0 휴식이 '하드'(forced_off day0 직접 / 연속근무 상한으로
+        #   day0 OFF 필수 = off_window [0,0])일 때만 day0 N 을 막고, soft 한 off_window(윈도우 내
+        #   OFF≥1)가 day0 를 덮으면 window_end>=1 일 때 [1,end] 로 시프트(휴식은 day1~ 에서 확보)해
+        #   day0 N 을 허용한다. (1N 금지=하드락이 월초 휴식 soft 윈도우보다 우선)
         if not_one_night and cons_n == 1:
-            has_day0_rest_guard = False
-            if 0 in forced_off.get(nurse_id, []):
-                has_day0_rest_guard = True
-            for _w in off_window_constraints.get(nurse_id, []) or []:
+            has_day0_forced = 0 in forced_off.get(nurse_id, [])
+            day0_off_window_hard = False
+            for _w in list(off_window_constraints.get(nurse_id, []) or []):
                 try:
                     _l, _r = int(_w[0]), int(_w[1])
                 except Exception:
                     continue
                 if _l <= 0 <= _r:
-                    has_day0_rest_guard = True
-                    break
+                    if _r >= 1:
+                        # off_window 가 day0 를 덮지만 day1~ 로 OFF≥1 충족 가능 → day0 만 비켜 시프트
+                        off_window_constraints[nurse_id].remove(_w)
+                        off_window_constraints[nurse_id].append([1, _r])
+                    else:
+                        # [0,0] = day0 OFF 필수(연속근무 상한 도달) → day0 N 불가
+                        day0_off_window_hard = True
             tail_str = ' '.join(tail) if tail else '(없음)'
-            if has_day0_rest_guard:
-                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail이지만 월초 휴식 하드제약(day0 OFF/윈도우) 우선 적용 → day0 N 고정 스킵, tail={tail_str}")
+            if has_day0_forced or day0_off_window_hard:
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 휴식 필수(forced_off/연속근무 상한) → day0 N 고정 스킵, tail={tail_str}")
             elif nurse_id in day0_weekly_off_nurse_ids:
                 forbidden[nurse_id][0].extend(['D', 'E', 'N'])
                 print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/N), tail={tail_str}")
@@ -2138,7 +2145,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
                 two_after_two_effective = two_after_two
                 if two_after_two_effective:
                     forced_off[nurse_id].extend([1, 2])
-                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail → day0 N 허용" + (", day1,2 OFF(2N2O)" if two_after_two_effective else "") + f", tail={tail_str}")
+                print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail → day0 N 허용(off_window day0→[1,end] 시프트)" + (", day1,2 OFF(2N2O)" if two_after_two_effective else "") + f", tail={tail_str}")
 
         # (b) N2/3 → 2OFF
         req_offs = 0
