@@ -932,8 +932,76 @@ def create_groups_and_save_data(data: List[Dict[str, Any]], new_groups_to_create
         } 
 
 
-def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group_id: str) -> bytes:
-    """지정된 schedule_id의 근무표를 엑셀(xlsx) 바이트로 생성하여 반환합니다."""
+def _merge_team_cell(ws, col, first_row, last_row, label, center, border_all, gray_fill):
+    """팀별보기 전용: [first_row, last_row] 의 팀 컬럼(col)을 세로 병합하고 팀명 1개를
+    가운데 정렬로 기입한다. 병합 범위 전 행에 테두리·배경을 둔다."""
+    if last_row > first_row:
+        ws.merge_cells(start_row=first_row, start_column=col, end_row=last_row, end_column=col)
+    cell = ws.cell(row=first_row, column=col, value=label)
+    cell.alignment = center
+    cell.fill = gray_fill
+    cell.border = border_all
+    for r in range(first_row, last_row + 1):
+        cc = ws.cell(row=r, column=col)
+        cc.border = border_all
+        cc.fill = gray_fill
+
+
+def _sort_team_ids_by_name(team_name_map: dict) -> list:
+    """팀 id 들을 근무표 만들기 화면(team-sort-util.sortTeamGroupsByTeamName)과 동일
+    순서로 정렬한다. 1순위 그룹: 한글(0) < 영문(1) < 숫자(2) < 기타(3). 2순위: 자연
+    정렬(숫자 런은 int 로 비교)+소문자. 3순위: team_id.
+    (export 엔 활성 실팀만 오므로 미배정/임시팀 분기는 불필요.)
+    """
+    import re as _re
+
+    def _group_rank(name: str) -> int:
+        first = (name or "").strip()[:1]
+        if not first:
+            return 3
+        if "가" <= first <= "힣":
+            return 0
+        if first.isascii() and first.isalpha():
+            return 1
+        if first.isdigit():
+            return 2
+        return 3
+
+    def _natural_key(name: str) -> list:
+        # Intl.Collator({numeric:true}) 근사: 숫자 런은 (0,int), 그 외는 (1,소문자).
+        # 토큰 타입을 앞에 둬 int/str 직접 비교(TypeError)를 원천 차단.
+        out = []
+        for tok in _re.findall(r"\d+|\D+", name or ""):
+            out.append((0, int(tok)) if tok.isdigit() else (1, tok.casefold()))
+        return out
+
+    def _key(tid):
+        name = team_name_map.get(tid) or ""
+        return (_group_rank(name), _natural_key(name), tid)
+
+    return sorted(team_name_map.keys(), key=_key)
+
+
+def export_schedule_excel_bytes(
+    schedule_id: str, current_user, db, target_group_id: str, group_by_team: bool = False
+) -> tuple[bytes, bool]:
+    """지정된 schedule_id의 근무표를 엑셀(xlsx) 바이트로 생성하여 (bytes, team_view) 로 반환.
+
+    group_by_team=True 이고 실제 팀 배정이 있으면 '팀별보기' 레이아웃으로 그린다:
+    기존 레이아웃과 동일하되 맨 앞(컬럼1)에 팀 세로병합 컬럼 1개를 추가한다.
+
+    팀 구분은 **근무표 만들기 화면의 '팀별보기'(filterTeam)와 완전 동일한 규칙**으로 한다:
+      teamId = is_night_dedicated ? None : (as_of_team ?? nurses.team_id 캐시)
+    - 소속·N전담·시점팀(as_of_team)은 화면과 같은 group_members_in_month 를 재사용한다.
+      → N전담은 팀 로테이션 비참여 → '미등록'.
+    - 활성 팀(Team.active==1, /teams 와 동일 소스)에 없는 team_id 는 '미등록'으로 둔다.
+    - 팀 블록 순서는 화면(sortTeamGroupsByTeamName)과 동일한 팀명 기준 + 미등록 맨 끝.
+    같은 팀 간호사 행들의 컬럼1을 세로 병합해 팀명 1개만 표시한다(팀 내부는 기존 순서 유지).
+
+    반환 team_view 는 실제로 팀별보기 레이아웃이 적용됐는지 여부(파일명/헤더 판정용).
+    팀 배정이 전무(전원 미등록)하거나 group_by_team=False 이면 기존 레이아웃과
+    완전히 동일하게 그리고 team_view=False 를 반환한다(회귀 0).
+    """
     from io import BytesIO
     from datetime import date
     from openpyxl import Workbook
@@ -958,10 +1026,9 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         Nurse.group_id == target_group_id
     ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
 
-    # 병동이동(전입) 간호사 포함: 이 schedule의 ScheduleEntry에는 있으나 현재 group 멤버가
-    # 아닌 간호사(이동 발효 전 nurses.group_id 미반영 등)를 추가한다. 근무표 조회 화면
-    # (get_roster_by_schedule_id)과 동일한 union 기준으로, 화면엔 보이나 엑셀에서 누락되던
-    # 이동 근무자를 동일하게 노출한다.
+    # ───────── 전입자(인바운드) union — 팀별보기·기본 모두 동일하게 적용 ─────────
+    # 이 schedule의 ScheduleEntry에는 있으나 현재 group 멤버가 아닌 간호사(이동 발효 전
+    # nurses.group_id 미반영 등)를 추가한다. 화면(get_roster_by_schedule_id)과 동일 기준.
     _home_nurse_ids = {n.nurse_id for n in nurses}
     _entry_nurse_ids = {
         row.nurse_id
@@ -978,6 +1045,71 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
             Nurse.nurse_id.in_(_inbound_ids)
         ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
         nurses = list(nurses) + list(inbound_nurses)
+
+    # ───────── 팀별보기 분기 결정 ─────────
+    # 근무표 만들기 화면 '팀별보기'(filterTeam)와 **완전 동일 규칙**으로 팀을 구분한다:
+    #   teamId = is_night_dedicated ? None : (as_of_team ?? nurses.team_id 캐시)
+    #   gate: teamId 가 활성 팀(Team.active==1) 목록에 없으면 미등록(None).
+    # 소속·N전담·시점팀(as_of_team)은 화면과 같은 group_members_in_month 를 그대로 재사용한다.
+    # 전원 미등록(팀 배정 전무)이거나 group_by_team=False 면 기존 레이아웃으로 폴백.
+    team_view = False
+    team_of: dict[str, Optional[int]] = {}     # nurse_id(str) -> gated team_id(int)|None
+    nurse_team_label: dict[str, str] = {}      # nurse_id(str) -> 팀명/"미등록"
+    if group_by_team:
+        from services.assignment_service import group_members_in_month
+        from services.team_period import _coerce_team_int
+        from db.models import Team
+
+        # (1) 화면 memberStatusMap 동치: as_of_team(시점 팀, N전담=None) + is_night_dedicated.
+        _member_map = {
+            m["nurse_id"]: m
+            for m in group_members_in_month(db, target_group_id, year, month)["members"]
+        }
+        # (2) knownTeamIds·팀명 = 활성 팀(useTeamsQuery/list_teams_with_members 와 동일 소스).
+        _team_name_map = {
+            t.team_id: t.team_name
+            for t in db.query(Team.team_id, Team.team_name).filter(
+                Team.office_id == current_user.office_id,
+                Team.group_id == target_group_id,
+                Team.active == 1,
+            ).all()
+        }
+        _known_team_ids = set(_team_name_map.keys())
+        # (3) as_of_team 이 없을 때의 캐시 폴백(nurses.team_id) — filterTeam 의 `?? nurse.team_id`.
+        _cache_team = {
+            str(nid): _coerce_team_int(tid)
+            for nid, tid in db.query(Nurse.nurse_id, Nurse.team_id).filter(
+                Nurse.nurse_id.in_([str(n.nurse_id) for n in nurses])
+            ).all()
+        }
+
+        for n in nurses:
+            nid = str(n.nurse_id)
+            m = _member_map.get(nid)
+            if m and m.get("is_night_dedicated"):
+                tid = None                         # N전담 → 미등록(팀 로테이션 비참여)
+            else:
+                as_of = m.get("as_of_team") if m else None
+                tid = as_of if as_of is not None else _cache_team.get(nid)
+            # 활성 팀 메타에 없으면(미존재/비활성/타그룹 캐시) 미등록으로 안전 배치(누락 방지).
+            team_of[nid] = tid if (tid is not None and tid in _known_team_ids) else None
+
+        if any(tid is not None for tid in team_of.values()):
+            team_view = True
+            # 팀 블록 순서 = 화면 sortTeamGroupsByTeamName(팀명 기준) + 미등록 맨 끝.
+            #   stable sort → 같은 팀(또는 미등록) 내부는 기존 sequence 순서 유지.
+            _ordered = _sort_team_ids_by_name(_team_name_map)
+            _rank = {tid: i for i, tid in enumerate(_ordered)}
+            _unassigned_rank = len(_ordered)
+            nurses = sorted(
+                nurses,
+                key=lambda n: _rank.get(team_of.get(str(n.nurse_id)), _unassigned_rank),
+            )
+            for n in nurses:
+                tid = team_of.get(str(n.nurse_id))
+                nurse_team_label[str(n.nurse_id)] = (
+                    "미등록" if tid is None else (_team_name_map.get(tid) or f"팀 {tid}")
+                )
 
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
 
@@ -1044,7 +1176,14 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
 
     # ───────── 4) 제목 영역 ─────────
     title = f"{year}년 {month}월 근무표"
-    static_cols = 4
+    # 팀별보기면 맨 앞(컬럼1)에 팀 컬럼 1개 추가 → static_cols 4→5.
+    # 배치: 팀(1) · 번호(2) · 이름(3) · 구분(4) · 경력(5). 기본: 번호(1) · 이름(2) · 구분(3) · 경력(4).
+    # 날짜 시작열·spacer·요약열은 static_cols 에서 파생되므로 자동 보정.
+    static_cols = 5 if team_view else 4
+    idx_col  = 2 if team_view else 1  # 번호 컬럼
+    name_col = 3 if team_view else 2  # 이름 컬럼
+    role_col = name_col + 1           # 구분
+    exp_col  = name_col + 2           # 경력
     spacer_cols = 2
     total_cols = static_cols + days_in_month + spacer_cols + summary_cols
 
@@ -1054,10 +1193,14 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
 
     # ───────── 5) 헤더 행 ─────────
     header_row = 7
-    ws.cell(row=header_row, column=1, value="번호").font = header_font
-    ws.cell(row=header_row, column=2, value="이름").font = header_font
-    ws.cell(row=header_row, column=3, value="구분").font = header_font
-    ws.cell(row=header_row, column=4, value="경력").font = header_font
+    if team_view:
+        ws.cell(row=header_row, column=1, value="팀").font = header_font
+        ws.cell(row=header_row, column=2, value="번호").font = header_font
+    else:
+        ws.cell(row=header_row, column=1, value="번호").font = header_font
+    ws.cell(row=header_row, column=name_col, value="이름").font = header_font
+    ws.cell(row=header_row, column=role_col, value="구분").font = header_font
+    ws.cell(row=header_row, column=exp_col, value="경력").font = header_font
 
     for c in range(1, static_cols + 1):
         cell = ws.cell(row=header_row, column=c)
@@ -1082,11 +1225,15 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
         cell.border = border_all
         cell.fill = gray_fill
 
-    # 열 너비
-    ws.column_dimensions['A'].width = 5
-    ws.column_dimensions['B'].width = 12
-    ws.column_dimensions['C'].width = 6
-    ws.column_dimensions['D'].width = 6
+    # 열 너비 (팀별보기: A=팀8, B=번호5 / 기본: A=번호5)
+    if team_view:
+        ws.column_dimensions['A'].width = 8  # 팀
+        ws.column_dimensions['B'].width = 5  # 번호
+    else:
+        ws.column_dimensions['A'].width = 5  # 번호
+    ws.column_dimensions[get_column_letter(name_col)].width = 12  # 이름
+    ws.column_dimensions[get_column_letter(role_col)].width = 6   # 구분
+    ws.column_dimensions[get_column_letter(exp_col)].width = 6    # 경력
     for d in range(1, days_in_month + 1):
         ws.column_dimensions[get_column_letter(static_cols + d)].width = 4
     for s in range(spacer_cols):
@@ -1099,14 +1246,15 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     start_row = header_row + 1
     daily_counts = {d: {code: 0 for code in tail_labels} for d in range(1, days_in_month + 1)}
 
-    for idx, n in enumerate(nurses, start=1):
-        r = start_row + idx - 1
+    def write_nurse_row(n, r: int, idx: int):
+        """간호사 1명을 r 행에 작성하고 daily_counts 를 누적한다."""
         is_current_user = (str(n.nurse_id) == str(current_user.nurse_id))
 
-        ws.cell(row=r, column=1, value=idx)
-        ws.cell(row=r, column=2, value=n.name)
-        ws.cell(row=r, column=3, value=n.role)
-        ws.cell(row=r, column=4, value=n.experience)
+        ws.cell(row=r, column=idx_col, value=idx)
+        ws.cell(row=r, column=name_col, value=n.name)
+        ws.cell(row=r, column=role_col, value=n.role)
+        ws.cell(row=r, column=exp_col, value=n.experience)
+        # 팀 컬럼(col1)은 본문 작성 후 팀 그룹 경계로 세로병합하므로 여기선 비워둔다.
 
         for c in range(1, static_cols + 1):
             cell = ws.cell(row=r, column=c)
@@ -1141,14 +1289,41 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
             if is_current_user:
                 cell.fill = highlight_fill
 
+    # 본문은 팀별보기·기본 모두 동일한 연속 행으로 작성한다(레이아웃 동일). 팀별보기면
+    # 작성하면서 같은 팀 라벨의 연속 행 구간을 모아 컬럼2를 세로 병합한다.
+    for idx, n in enumerate(nurses, start=1):
+        write_nurse_row(n, start_row + idx - 1, idx)
     last_row = start_row + len(nurses) - 1
 
+    if team_view and nurses:
+        # 정렬된 nurses 를 순회하며 같은 team_id 의 연속 구간(첫행~끝행)을 모아 컬럼1을
+        # 세로 병합한다. 그룹 키는 team_of(gated team_id, None=미등록) — 팀명이 우연히 같아도
+        # 다른 팀은 합치지 않는다. 표시 라벨은 nurse_team_label(팀명/"미등록") 사용.
+        col_team = 1
+        _UNASSIGNED = object()  # None 과 "구간 미시작" 을 구분하기 위한 센티넬
+        run_key = _UNASSIGNED
+        run_start = start_row
+        run_label = "미등록"
+        for idx, n in enumerate(nurses):
+            r = start_row + idx
+            tid = team_of.get(str(n.nurse_id))  # int|None
+            label = nurse_team_label.get(str(n.nurse_id), "미등록")
+            if run_key is _UNASSIGNED:
+                run_key, run_start, run_label = tid, r, label
+            elif tid != run_key:
+                _merge_team_cell(ws, col_team, run_start, r - 1, run_label,
+                                 center, border_all, gray_fill)
+                run_key, run_start, run_label = tid, r, label
+        _merge_team_cell(ws, col_team, run_start, last_row, run_label,
+                         center, border_all, gray_fill)
+
     # ───────── 7) 풋터 ─────────
+    # 라벨 위치는 이름/구분 컬럼에 맞춰 팀별보기 시 한 칸씩 밀린다(레이아웃 동일).
     footer_start = last_row + 2
-    ws.cell(row=footer_start, column=2, value="일일 근무 현황").font = header_font
+    ws.cell(row=footer_start, column=name_col, value="일일 근무 현황").font = header_font
 
     def write_footer_row(label: str, values: list[int], row_idx: int):
-        ws.cell(row=row_idx, column=3, value=label).font = header_font
+        ws.cell(row=row_idx, column=role_col, value=label).font = header_font
         for c in range(1, static_cols):
             ws.cell(row=row_idx, column=c).border = border_all
 
@@ -1179,7 +1354,7 @@ def export_schedule_excel_bytes(schedule_id: str, current_user, db, target_group
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return bio.getvalue()
+    return bio.getvalue(), team_view
 
 
 def export_members_excel_bytes(office_id: str) -> bytes:

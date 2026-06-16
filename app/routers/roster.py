@@ -2115,12 +2115,15 @@ async def update_schedule_name(
 async def export_schedule_excel(
     schedule_id: str,
     group_id: Optional[str] = None,
+    group_by_team: bool = False,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
     """
     - 근무표 엑셀 내보내기
     - 파일명: roster_{year}_{month}_v{version}.xlsx
+    - group_by_team=True 이고 실제 팀 배정이 있으면 팀별보기(팀 세로병합 컬럼) 적용 +
+      파일명에 "_팀별보기" suffix. 팀 배정 전무면 기존 레이아웃·기존 파일명으로 폴백.
     """
 
     if not current_user:
@@ -2137,9 +2140,12 @@ async def export_schedule_excel(
     try:
         from services.excel_service import export_schedule_excel_bytes
 
-        data = export_schedule_excel_bytes(
-            schedule_id, current_user, db, target_group_id
+        data, team_view_applied = export_schedule_excel_bytes(
+            schedule_id, current_user, db, target_group_id, group_by_team=group_by_team
         )
+        # 팀별보기 적용 여부는 export 가 화면(filterTeam)과 동일 규칙으로 판정한 값을 그대로 쓴다.
+        # (라우터가 has_team_assignment 로 따로 세면 N전담·비활성팀 게이트가 빠져 화면과 불일치.)
+        # 파일명은 프론트(excel.ts)가 결정하므로 Content-Disposition 은 단순 ASCII 고정.
         filename = f"roster_{schedule.year}_{schedule.month}_v{schedule.version}.xlsx"
         from io import BytesIO
 
@@ -2147,7 +2153,11 @@ async def export_schedule_excel(
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Roster-TeamView": "1" if team_view_applied else "0",
+                "Access-Control-Expose-Headers": "X-Roster-TeamView",
+            },
         )
     except HTTPException:
         raise  # 403/400(권한·그룹) 은 그대로 전파
