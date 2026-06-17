@@ -331,6 +331,22 @@ def upsert_nurse_monthly_limits_service(
             "fix_suggestions_ko": fixes,
         })
 
+    # 그룹별 월간 N 상한(roster_config.max_nig_per_month) lazy 캐시.
+    # 0/None은 솔버 런타임 보정(cp_sat_basic: <=0 → 15)과 동일하게 15로 본다.
+    _max_night_cache: Dict[str, int] = {}
+
+    def _group_max_night(gid: str) -> int:
+        if gid not in _max_night_cache:
+            _cfg = (
+                db.query(RosterConfig)
+                .filter(RosterConfig.group_id == gid)
+                .order_by(RosterConfig.config_id.desc())
+                .first()
+            )
+            _raw = int(getattr(_cfg, "max_nig_per_month", 0) or 0) if _cfg is not None else 0
+            _max_night_cache[gid] = _raw if _raw > 0 else 15
+        return _max_night_cache[gid]
+
     for nurse_id, rows in by_nurse.items():
         nurse = pf_nurses.get(str(nurse_id))
         if nurse is None:
@@ -371,6 +387,7 @@ def upsert_nurse_monthly_limits_service(
             issues_all.extend(
                 validate_monthly_limit_row(
                     row=rr, nurse=nurse, cap_days=cap_days, year=year, month=month,
+                    max_night=_group_max_night(str(rr.get("group_id"))),
                 )
             )
             # soft 경고: N전담 + 낮은 N 한도(커버리지 의존이라 차단 대신 안내)

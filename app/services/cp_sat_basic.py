@@ -56,7 +56,10 @@ from services.cp_sat.off_policy import (
     off_cap_semantics_label,
     resolve_effective_off_days,
 )
-from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
+from services.cp_sat.allowed_shift_types import (
+    effective_night_cap,
+    normalize_allowed_shift_codes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4099,8 +4102,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                 if extra_allowed >= 0 and phys_range_off:
                     if is_n_only:
+                        # OFF=avail-N 항등식 → off-cap = avail - 실효 N상한
+                        # (min(글로벌 max_night, n_max/n_exact)). n_exact로 N이 낮게 고정되면
+                        # forced OFF가 커지므로 cap 확장(미반영 시 INFEASIBLE). 폴백 경로와 동일 공식.
+                        _global_mn = int(getattr(cfg, "max_night_shifts_per_month", 15) or 15)
                         max_off_allowed_n_only = min(
-                            max(0, avail_days - 15),
+                            max(0, avail_days - effective_night_cap(nu, _global_mn)),
                             nonvac_active_days,
                         )
                         _off_cap_expr = (
