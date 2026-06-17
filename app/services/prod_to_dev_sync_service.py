@@ -557,6 +557,56 @@ def _run_in_session(fn) -> tuple:
             pass
 
 
+def _copy_inbound_nurses(db: Session, group_ids: List[str]) -> dict:
+    """include_group_ids 보강: 대상 group 의 스케줄/배정에 등장하지만 nurses.group_id 가
+    그 group 이 아닌 **전입(inbound) 간호사**의 nurses 행을 추가 복사한다.
+
+    group_id=G 스코프만으로는 전입 간호사(홈 병동이 G 아님)의 nurses 마스터 행이 빠져,
+    dev 스케줄이 dev.nurses 에 없는 nurse_id 를 참조하게 된다(이름·프로필 미해석). 이를 메운다.
+    전입 판정 = G 스케줄의 schedule_entries ∪ nurse_assignment(target/source=G) 에 등장 + group_id≠G.
+    dev.nurses 는 FK 없음(CONFLICT_DELETE_KEYS 주석 참조) → nurse_id 선삭제 후 INSERT(refresh) 안전.
+    """
+    ph = ", ".join(f":g{i}" for i in range(len(group_ids)))
+    params = {f"g{i}": g for i, g in enumerate(group_ids)}
+    inbound_ids_sql = (
+        f"SELECT n.nurse_id FROM {PROD_DB}.dbo.nurses n "
+        f"WHERE n.group_id NOT IN ({ph}) AND n.nurse_id IN ("
+        f" SELECT e.nurse_id FROM {PROD_DB}.dbo.schedule_entries e "
+        f" WHERE e.schedule_id IN (SELECT schedule_id FROM {PROD_DB}.dbo.schedules WHERE group_id IN ({ph})) "
+        f" UNION "
+        f" SELECT a.nurse_id FROM {PROD_DB}.dbo.nurse_assignment a "
+        f" WHERE a.target_group_id IN ({ph}) OR a.source_group_id IN ({ph}))"
+    )
+    dev_cols = _get_columns(db, DEV_DB, "nurses")
+    prod_cols = set(_get_columns(db, PROD_DB, "nurses"))
+    common = [c for c in dev_cols if c in prod_cols]
+    if not common:
+        return {"table": "nurses(inbound)", "skipped": "no_common_cols"}
+    # dev 선삭제(nurse_id 매칭) — 이미 있으면 prod 기준 refresh, PK 중복 방지.
+    deleted = db.execute(
+        text(
+            f"DELETE d FROM {DEV_DB}.dbo.nurses d WHERE d.nurse_id COLLATE DATABASE_DEFAULT "
+            f"IN (SELECT nurse_id COLLATE DATABASE_DEFAULT FROM ({inbound_ids_sql}) x)"
+        ),
+        params,
+    ).rowcount or 0
+    col_list = ", ".join(f"[{c}]" for c in common)
+    sel_list = ", ".join(f"src.[{c}]" for c in common)
+    ins_sql = (
+        f"INSERT INTO {DEV_DB}.dbo.nurses ({col_list}) "
+        f"SELECT {sel_list} FROM {PROD_DB}.dbo.nurses src WHERE src.nurse_id IN ({inbound_ids_sql})"
+    )
+    has_identity = _has_identity(db, DEV_DB, "nurses")
+    if has_identity:
+        db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.nurses ON"))
+    try:
+        inserted = db.execute(text(ins_sql), params).rowcount or 0
+    finally:
+        if has_identity:
+            db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.nurses OFF"))
+    return {"table": "nurses(inbound)", "mode": "inbound", "deleted": deleted, "inserted": inserted}
+
+
 def sync_prod_to_dev(
     db: Session = None,
     tables: Optional[List[str]] = None,
@@ -669,6 +719,16 @@ def sync_prod_to_dev(
                 # PARENT_FK_MAP fallback 시 _merge_upsert 가 mode="wipe_by_parent" 반환 → 보존
                 r.setdefault("mode", "upsert")
                 results.append(r)
+
+    # 3.5 전입(inbound) 간호사 nurses 보강 — include_group_ids 모드 + nurses 동기화 대상일 때만.
+    #     G 스코프로는 홈 병동이 다른 전입 간호사의 nurses 행이 빠져 dev 스케줄이 미존재 nurse 참조.
+    if include_group_ids and not include_office_ids and "nurses" in {t for t, _ in target_existing}:
+        r, err = _run_in_session(lambda s: _copy_inbound_nurses(s, include_group_ids))
+        if err:
+            errors.append({"phase": "inbound_nurses", "error": err})
+            logger.error("[prod→dev sync] inbound nurses 실패: %s", err)
+        elif r:
+            results.append(r)
 
     # 4. FK 재활성화
     for table in [t for t, _ in target_existing]:
