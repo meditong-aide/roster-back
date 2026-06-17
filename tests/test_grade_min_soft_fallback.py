@@ -42,12 +42,14 @@ def test_grade_min_soft_feasible_when_g1_short():
     assert len(terms) == 1  # slack penalty 항 노출(목적함수에서 차감)
 
 
-def test_grade_min_hard_infeasible_when_g1_short():
-    """같은 부족 상황 + hard → INFEASIBLE (= 순수 hard 의 '예민함')."""
+def test_grade_min_no_hard_infeasible_when_g1_short():
+    """grade-min 순수 하드 경로는 폐기 — cascade(soft degrade)가 기본
+    (_GRADE_CASCADE_ENABLED=True). allow_soft_fallback=False여도 cascade가 slack으로
+    흡수해 즉시 INFEASIBLE 되지 않는다(= '예민함' 제거)."""
     m, x, terms = _build(target_g1=2, n_g1_nurses=1, allow_soft=False)
     status = cp_model.CpSolver().Solve(m)
-    assert status == cp_model.INFEASIBLE
-    assert terms == []  # hard 는 목적 항 없음
+    assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    assert len(terms) == 1  # cascade penalty 항 노출
 
 
 def test_grade_min_soft_zero_penalty_when_available():
