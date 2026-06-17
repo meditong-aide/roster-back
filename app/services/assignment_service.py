@@ -434,6 +434,12 @@ def create_assignment(
     # 동일 target_group_id 재파견/재병동이동 시 이전 row 의 target_*/note 자동 승계
     _inherit_target_fields_from_prior(db, req)
 
+    # [팀 절연] 파견(임시)은 팀과 엮지 않는다. team SSOT 는 nurse_team_period 이며 파견은
+    #   팀 로테이션 비참여(team None) — 생성기에서 team=None 으로 D/E 커버리지 풀에서 빠진다.
+    #   승계/명시 어느 경로로 team 이 들어와도 여기서 강제로 비운다.
+    if req.reason == "파견":
+        req.target_team_id = None
+
     # 신규 inbound: target_group 의 team/grade 정합성 검증 (사이드프로필과 동일 정책)
     if req.reason in _INBOUND_REASONS:
         _validate_assignment_team_grade_or_raise(
@@ -469,6 +475,20 @@ def create_assignment(
     db.add(row)
     db.commit()
     db.refresh(row)
+
+    # [팀 SSOT] 병동이동의 target 팀을 nurse_team_period(target_group)에 일원화 기록.
+    #   수동 병동이동(프로필 패널 _dispatch_assignment_payload 등)은 외부 set_team_period 가
+    #   없어 이 기록이 없으면 period 공백→화면/생성기에 팀 미반영(원 버그와 동종). 팩토리 안에서
+    #   보장한다. 파견은 team None(절연)이라 해당 없음. ward_redistribute 의 외부 호출과는
+    #   valid_from 동일 → 멱등(same-row upsert).
+    if req.reason == "병동이동" and req.target_team_id is not None:
+        from services.team_period import set_team_period
+        set_team_period(
+            db, nurse_id=req.nurse_id, group_id=req.target_group_id,
+            valid_from=req.start_date, team_id=req.target_team_id,
+            source="transfer", note=req.note,
+        )
+
     logger.info(
         "배정 등록: nurse_id=%s, reason=%s, start=%s",
         req.nurse_id, req.reason, req.start_date,
@@ -665,6 +685,11 @@ def update_assignment(
         req.target_group_id if req.target_group_id is not None else row.target_group_id
     )
 
+    # [팀 절연] 최종 reason 이 파견이면 team 검증 입력을 비워 곧 버릴 팀을 검사하지 않게 한다.
+    #   (영속 클리어는 함수 끝단 가드가 담당 — setattr 루프는 None 을 건너뛰므로.)
+    if _new_reason == "파견":
+        req.target_team_id = None
+
     # 파견/병동이동: 최종 target_group_id 필수 + source != target 검증
     # (reason 또는 target_group_id 변경 시 재검증, 또는 기존 reason이 파견/병동이동인데 invalid state인 경우 차단)
     if _new_reason in _INBOUND_REASONS and (
@@ -744,6 +769,11 @@ def update_assignment(
         _v = getattr(req, _f, None)
         if _v is not None:
             setattr(row, _f, _v)
+
+    # [팀 절연] 파견(임시)은 팀과 엮지 않는다(create_assignment 와 동일 정책).
+    #   reason 변경/팀 setattr 어느 경로로 들어와도 파견 row 는 team None 으로 수렴.
+    if row.reason == "파견":
+        row.target_team_id = None
 
     db.commit()
     db.refresh(row)
@@ -1746,6 +1776,17 @@ def create_permanent_change(
     db.add(row)
     db.commit()
     db.refresh(row)
+
+    # [팀 SSOT] 속성변경의 팀 변경을 nurse_team_period 에 일원화 기록(발효 전이어도 resolve_team/
+    #   생성기가 즉시 반영). 외부 호출자(team_classify/ward_redistribute)도 동일 호출을 하지만
+    #   valid_from 동일 → 멱등. 어느 경로로 만들든 period 가 보장되도록 팩토리 안에서 기록한다.
+    if new_team_id is not None:
+        from services.team_period import set_team_period
+        set_team_period(
+            db, nurse_id=nurse_id, group_id=group_id, valid_from=start_date,
+            team_id=new_team_id, source="permanent_change", note=note,
+        )
+
     logger.info(
         "속성변경 등록: nurse_id=%s, team %s→%s, grade %s→%s, 발효=%s",
         nurse_id, nurse.team_id, new_team_id, nurse.grade, new_grade, start_date,
