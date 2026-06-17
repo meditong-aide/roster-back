@@ -1048,13 +1048,14 @@ def group_members_in_month(
         return None
 
     def _row(n, status, marker, badge, team, grade):
-        # N전담(허용 shift=N뿐)은 팀 로테이션 비참여 → 미지정(as_of_team=None) + 'N전담' 배지.
-        #   파생 규칙(is_night_nurse 기반) — team_period 데이터는 안 건드림(전담 해제 시 자동 복귀).
+        # N전담(허용 shift=N뿐): 'N전담' 배지 + is_night_dedicated 플래그만 부여하고
+        #   as_of_team 은 직접 배정한 팀(period)을 그대로 노출한다. 직접 저장한 팀이 화면에
+        #   안 보이던 문제 해소 — N전담은 시점(period) 모델이 아직 없어 팀까지 가리던 휴리스틱을
+        #   제거(전담의 '시기'는 별도 shift-type period 테이블로 추후 분리). 단 생성기는
+        #   여전히 N전담을 팀 D/E 커버리지에서 제외(roster_create_service)한다.
         night_dedicated = is_n_only_profile(getattr(n, "is_night_nurse", None))
-        if night_dedicated:
-            team = None
-            if badge is None:
-                badge = "N전담"
+        if night_dedicated and badge is None:
+            badge = "N전담"
         return {
             "nurse_id": str(n.nurse_id),
             "name": getattr(n, "name", None),
