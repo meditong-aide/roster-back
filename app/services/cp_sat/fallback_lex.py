@@ -2365,7 +2365,27 @@ def optimize_fallback_lex_hard_first(
                     m.Add(target_o - assigned_o <= slack_short)
                     m.Add(assigned_o - target_o <= slack_excess)
                     safety["off_quota_short"].append(slack_short)
-                    safety["off_quota_excess"].append(slack_excess)
+                    # [OffLevelLock] off_first=False(=근무 oversupply 의도) 실효화:
+                    # OFF 상한(target 초과=잉여)을 floor와 대칭으로 가중한다. 기존엔 excess만
+                    # raw(weight 1)라, stage2 safety의 pre-scaled 항(isolated_off 300K,
+                    # min_off_lower 100K 등)에 묻혀 OFF가 cap까지 드리프트했다. scaled 슬랙을
+                    # safety에 넣어 stage2(OPTIMAL, KLD/grade 이전)에서 OFF 수준을 target에
+                    # 고정 → stage3가 zero-lock으로 보존. "수준"만 잠그고 배치/예외는 soft라
+                    # 유지(하드 고정 아님). 원복: off_quota_excess_weight=0.
+                    import os as _os
+                    _oqx_w = int(
+                        _os.environ.get(
+                            "OFF_QUOTA_EXCESS_WEIGHT",
+                            getattr(cfg, "off_quota_excess_weight", 100000),
+                        )
+                        or 0
+                    )
+                    if _oqx_w > 1 and not bool(getattr(cfg, "off_first", False)):
+                        _ex_scaled = m.NewIntVar(0, D * _oqx_w, f"off_quota_excess_cost_{n}")
+                        m.Add(_ex_scaled == slack_excess * _oqx_w)
+                        safety["off_quota_excess"].append(_ex_scaled)
+                    else:
+                        safety["off_quota_excess"].append(slack_excess)
                     off_quota_short_by_n[n] = slack_short
                     off_quota_excess_by_n[n] = slack_excess
                     target_o_by_n[n] = target_o

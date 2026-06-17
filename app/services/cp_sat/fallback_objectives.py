@@ -341,6 +341,27 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
+    # 단일 E 패널티 (lone-E): E를 "쌍"으로 유도 → DDDE→DDEE, DDDDE→DDDEE.
+    # 외톨이 E(양옆 둘다 E 아님)에 패널티. 단 E→N(정방향 로테이션)은 예외로 보존(옵션 B).
+    # 경계일(T0/T1)은 양옆 확인 불가라 제외(range(T0+1, T1)). 원복: lone_e_penalty_weight=0.
+    try:
+        import os as _os_le
+        _le_w = int(_os_le.environ.get("LONE_E_PENALTY_WEIGHT", getattr(cfg, "lone_e_penalty_weight", 500)) or 0)
+        if _le_w > 0 and "E" in cfg.shift_types:
+            _le_e = cfg.shift_types.index("E")
+            _le_has_n = "N" in cfg.shift_types
+            _le_n = cfg.shift_types.index("N") if _le_has_n else None
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                for d in range(T0 + 1, T1):
+                    _le = m.NewBoolVar(f"lone_e_fb_{n}_{d}")
+                    # E[d]=1, E[d-1]=0, E[d+1]=0, (E→N 로테이션이면 면제: -N[d+1])
+                    _next_n = X(n, d + 1, _le_n) if _le_has_n else 0
+                    m.Add(_le >= X(n, d, _le_e) - X(n, d - 1, _le_e) - X(n, d + 1, _le_e) - _next_n)
+                    obj.append(-_le_w * _le)
+    except Exception:
+        pass
+
     # (D/E per-nurse 균등은 stage2 lex 5-pass(DE_LEX)로 처리 — 수렴된 hint가 stage3로
     #  상속되므로 stage3 페널티 항은 불필요. 제거됨.)
 
