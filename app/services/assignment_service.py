@@ -1820,11 +1820,8 @@ def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -
             db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
         )
         if nurse:
-            if row.target_team_id is not None:
-                # team SSOT 는 nurse_team_period(생성시 [B3] 로 이미 기록됨). 아래 캐시 갱신은
-                #   레거시 호환용 — nurses.team_id 일괄 NULL 이행 후엔 모든 리더가 period 를
-                #   보므로 이 값은 무시된다(컬럼 DROP 시 이 writer 도 함께 제거 예정).
-                nurse.team_id = row.target_team_id
+            # [팀 절연] team 은 create_permanent_change 시점에 nurse_team_period(SSOT)에
+            #   이미 기록됨. nurses.team_id 캐시는 더 이상 쓰지 않는다(컬럼 DROP 예정).
             if row.target_grade is not None:
                 nurse.grade = row.target_grade
             # target_shift_types 지정 시 is_night_nurse 갱신 (N전담 해제 = [] 등)
