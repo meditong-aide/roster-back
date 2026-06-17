@@ -1086,11 +1086,11 @@ def export_schedule_excel_bytes(
         for n in nurses:
             nid = str(n.nurse_id)
             m = _member_map.get(nid)
-            if m and m.get("is_night_dedicated"):
-                tid = None                         # N전담 → 미등록(팀 로테이션 비참여)
-            else:
-                as_of = m.get("as_of_team") if m else None
-                tid = as_of if as_of is not None else _cache_team.get(nid)
+            # N전담도 직접 배정한 팀(as_of_team=period)을 그대로 표시 — 직접 저장한 팀이
+            #   '미지정'으로 가려지던 문제 해소. 프론트도 동일하게
+            #   `is_night_dedicated ? None : as_of_team` → `as_of_team` 으로 맞춰야 한다.
+            as_of = m.get("as_of_team") if m else None
+            tid = as_of if as_of is not None else _cache_team.get(nid)
             # 활성 팀 메타에 없으면(미존재/비활성/타그룹 캐시) 미등록으로 안전 배치(누락 방지).
             team_of[nid] = tid if (tid is not None and tid in _known_team_ids) else None
 
