@@ -29,6 +29,8 @@ RELAX_CATALOG: list[dict[str, Any]] = [
      "apply": lambda c: {"two_offs_after_three_nig": False}},
     {"id": "raise_max_consec_work", "family": "consecutive", "label_ko": "연속근무 상한 완화",
      "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3}},
+    {"id": "relax_consecutive_nights", "family": "night_consecutive", "label_ko": "연속 야간 상한 완화(+1)",
+     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1}},
     {"id": "disable_not_one_night", "family": "night_pattern", "label_ko": "단일 야간 금지 해제",
      "apply": lambda c: {"not_one_night": False}},
     {"id": "disable_ban_n_before_fixed_off", "family": "night_pattern", "label_ko": "고정OFF 직전 야간 금지 해제",
@@ -37,6 +39,8 @@ RELAX_CATALOG: list[dict[str, Any]] = [
      "apply": lambda c: {"banned_day_after_eve": False}},
     {"id": "lower_off_days", "family": "off_budget", "label_ko": "월 OFF 요구일수 완화(-3)",
      "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)}},
+    {"id": "disable_preceptee_sync", "family": "coupling", "label_ko": "프리셉티 동반(팔로우) 해제",
+     "apply": lambda c: {"preceptee_on": False}},
 ]
 
 
@@ -46,16 +50,19 @@ TRADEOFF_KO: dict[str, str] = {
     "disable_2n2off": "야간 2회 후 2일 휴식 보장이 약해집니다.",
     "disable_3n2off": "야간 3회 후 2일 휴식 보장이 약해집니다.",
     "raise_max_consec_work": "연속 근무일이 늘어날 수 있습니다.",
+    "relax_consecutive_nights": "야간을 더 길게 연속으로 서게 될 수 있습니다.",
     "disable_not_one_night": "단일 야간(1N) 근무가 생길 수 있습니다.",
     "disable_ban_n_before_fixed_off": "고정 휴무 직전에 야간이 배치될 수 있습니다.",
     "disable_banned_day_after_eve": "이브닝 다음날 데이 전이가 생길 수 있습니다.",
     "lower_off_days": "월 휴무일이 줄어듭니다.",
+    "disable_preceptee_sync": "프리셉티가 프리셉터와 동반(팔로우)하지 않게 됩니다(교육 동반 약화).",
 }
 COL_LABEL_KO: dict[str, str] = {
     "max_nig_per_month": "월 야간 상한", "two_offs_after_two_nig": "2N→2OFF 회복",
     "two_offs_after_three_nig": "3N→2OFF 회복", "max_conseq_work": "연속근무 상한",
     "not_one_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
     "banned_day_after_eve": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
+    "max_consecutive_nights": "연속 야간 상한", "preceptee_on": "프리셉티 동반(팔로우)",
 }
 
 
