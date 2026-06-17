@@ -1110,6 +1110,7 @@ def _compute_weekly_off_day_indices_for_month(
     group_id: str,
     year: int,
     month: int,
+    inbound_nurses: list | None = None,
 ) -> tuple[dict[str, set[int]], list[dict]]:
     """주휴 설정을 기반으로 대상 월의 주휴 날짜를 계산한다.
 
@@ -1209,6 +1210,17 @@ def _compute_weekly_off_day_indices_for_month(
     except Exception as e:
         warnings.append({"type": "nurses_query_failed", "detail": str(e)})
         return nurse_to_days, warnings
+
+    # 전입자(비-flush inbound) 주휴 보충: nurses 행이 source 그룹이라 위 group_id 필터
+    # 쿼리에서 빠진다. 엔진 객체엔 assignment target_weekly_off_*(enabled/weekday)가 이미
+    # overlay 돼 있고 is_weekend_off 는 본인 nurses 행 값이 그대로 있으므로, 그 객체를 rows
+    # 에 추가해 동일 루프로 처리한다(flush된 병동이동은 이미 target 행이라 rows 에 포함→제외).
+    if inbound_nurses:
+        _wo_existing_ids = {str(getattr(_r, "nurse_id", "")) for _r in rows}
+        rows = list(rows) + [
+            _n for _n in inbound_nurses
+            if str(getattr(_n, "nurse_id", "")) not in _wo_existing_ids
+        ]
 
     for r in rows:
         nurse_id = str(r.nurse_id)
@@ -4524,6 +4536,26 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             nurse_ids=[str(n.nurse_id) for n in engine_nurses],
             group_id=str(current_user.group_id),
         )
+        # 전입자(병동이동/파견 inbound) 월한도 보충: 한도가 source 그룹에 저장돼 있어
+        # 위 target group_id 필터에서 누락된다(flush된 병동이동도 NurseMonthlyLimit.group_id
+        # 미이관이라 동일). source 그룹 기준으로 추가 조회해 target 에 없던 nurse 만 채운다.
+        # (전월 tail 보충과 동일한 _inbound_source 패턴.)
+        _limit_src_by_nurse = {
+            str(_a.nurse_id): str(_a.source_group_id)
+            for _a in _inbound_assignments
+            if getattr(_a, "source_group_id", None)
+        }
+        _limit_missing_by_src = {}
+        for _nid, _src_gid in _limit_src_by_nurse.items():
+            if _nid not in _limit_map:
+                _limit_missing_by_src.setdefault(_src_gid, []).append(_nid)
+        for _src_gid, _src_nids in _limit_missing_by_src.items():
+            _src_limit_map = fetch_effective_monthly_limits_by_nurse(
+                db=db, year=req.year, month=req.month,
+                nurse_ids=_src_nids, group_id=_src_gid,
+            )
+            for _nid, _lim in _src_limit_map.items():
+                _limit_map.setdefault(_nid, _lim)
         for _n in engine_nurses:
             _lim = _limit_map.get(str(_n.nurse_id))
             if not _lim:
@@ -4793,6 +4825,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         group_id=current_user.group_id,
         year=req.year,
         month=req.month,
+        # 전입자(inbound)는 nurses 행이 source 그룹이라 group_id 필터 쿼리에서 빠지므로,
+        # target_weekly_off_* 가 overlay 된 엔진 객체를 넘겨 주휴 셀을 보충한다.
+        inbound_nurses=[n for n in nurses_for_engine if getattr(n, "is_inbound", False)],
     )
     # weekly_off_settings의 activate 값을 config_dict에 추가
     try:
