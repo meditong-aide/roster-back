@@ -160,6 +160,56 @@ def _is_guide_row(row: pd.Series) -> bool:
     return False
 
 
+# shift_gb(영문 D/E/N/M 또는 한글) → ShiftManage.shift_slot
+_SHIFT_GB_TO_SLOT = {"D": 1, "E": 2, "N": 3, "M": 5, "데이": 1, "이브닝": 2, "나이트": 3, "미드": 5}
+# shift_gb(한글) → main_code(영문). 영문 키는 그대로 통과한다.
+_SHIFT_GB_TO_MAIN_CODE = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
+
+
+def _resolve_slot_main(shift_gb: str | None) -> tuple[int | None, str | None]:
+    """shift_gb → (shift_slot, main_code). 매핑이 없으면 (None, None)."""
+    if shift_gb not in _SHIFT_GB_TO_SLOT:
+        return None, None
+    return _SHIFT_GB_TO_SLOT[shift_gb], _SHIFT_GB_TO_MAIN_CODE.get(shift_gb, shift_gb)
+
+
+def _remove_shift_manage_code(
+    db: Session,
+    office_id: str | None,
+    group_id: str,
+    shift_id: str | None,
+    shift_gb: str | None,
+) -> bool:
+    """
+    shift_manage.codes 에서 shift_id 를 제거합니다(슬롯=shift_gb 매핑).
+
+    - 근무코드 삭제/변경 시 orphan code 가 codes 에 남지 않도록 정리하는 공용 헬퍼.
+    - 커밋은 호출자 책임(원자적 트랜잭션 보존).
+    """
+    if not office_id or not shift_id:
+        return False
+    target_slot, main_code = _resolve_slot_main(shift_gb)
+    if target_slot is None:
+        return False
+    rows = (
+        db.query(ShiftManage)
+        .filter(
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == group_id,
+            ShiftManage.shift_slot == target_slot,
+            ShiftManage.main_code == main_code,
+        )
+        .all()
+    )
+    removed = False
+    for shift_manage in rows:
+        codes = shift_manage.codes or []
+        if shift_id in codes:
+            shift_manage.codes = [code for code in codes if code != shift_id]
+            removed = True
+    return removed
+
+
 def _append_shift_manage_code(
     db: Session,
     office_id: str | None,
@@ -172,47 +222,17 @@ def _append_shift_manage_code(
     """
     shift_manage.codes에 근무코드를 중복 없이 추가합니다.
 
-    - shift_gb가 D/E/N일 때만 동작하며, slot은 1/2/3에 매핑됩니다.
+    - shift_gb가 D/E/N/M(또는 한글)일 때만 동작하며, slot은 1/2/3/5에 매핑됩니다.
     - 기존에 코드가 있으면 추가하지 않습니다.
     - update 시 shift_id 또는 shift_gb가 바뀌면 이전 슬롯에서 제거한 뒤 새 슬롯에 추가합니다.
     """
-    slot_map = {"D": 1, "E": 2, "N": 3, "M": 5, "데이": 1, "이브닝": 2, "나이트": 3, "미드": 5}
-    # shift_gb 한글 → ShiftManage.main_code 영문 변환
-    _gb_to_main = {"데이": "D", "이브닝": "E", "나이트": "N", "미드": "M"}
     if not office_id:
         return
 
-    def _resolve_main(gb: str | None) -> str | None:
-        return _gb_to_main.get(gb, gb)
-
-    def _remove(target_gb: str | None, target_id: str | None) -> bool:
-        if target_gb not in slot_map or not target_id:
-            return False
-        target_slot = slot_map[target_gb]
-        main_code = _resolve_main(target_gb)
-        shift_manages = (
-            db.query(ShiftManage)
-            .filter(
-                ShiftManage.office_id == office_id,
-                ShiftManage.group_id == group_id,
-                ShiftManage.shift_slot == target_slot,
-                ShiftManage.main_code == main_code,
-            )
-            .all()
-        )
-        removed = False
-        for shift_manage in shift_manages:
-            codes = shift_manage.codes or []
-            if target_id in codes:
-                shift_manage.codes = [code for code in codes if code != target_id]
-                removed = True
-        return removed
-
     def _append(target_gb: str | None, target_id: str) -> bool:
-        if target_gb not in slot_map:
+        target_slot, main_code = _resolve_slot_main(target_gb)
+        if target_slot is None:
             return False
-        target_slot = slot_map[target_gb]
-        main_code = _resolve_main(target_gb)
         shift_manages = (
             db.query(ShiftManage)
             .filter(
@@ -233,7 +253,7 @@ def _append_shift_manage_code(
 
     removed_any = False
     if old_shift_id and (old_shift_id != shift_id or old_shift_gb != shift_gb):
-        removed_any = _remove(old_shift_gb, old_shift_id)
+        removed_any = _remove_shift_manage_code(db, office_id, group_id, old_shift_id, old_shift_gb)
 
     added_any = _append(shift_gb, shift_id)
 
@@ -555,6 +575,14 @@ def remove_shift_service(req, current_user, db, override_group_id: str | None = 
     if schedule_entries_count > 0:
         raise Exception("해당 근무코드는 현재 사용 중이므로 삭제할 수 없습니다.")
     deleted_sequence = existing_shift.sequence
+    # 근무코드 삭제 시 shift_manage.codes 에 남는 orphan code 를 정리한다(같은 트랜잭션 커밋).
+    _remove_shift_manage_code(
+        db,
+        existing_shift.office_id,
+        target_group_id,
+        existing_shift.shift_id,
+        getattr(existing_shift, "shift_gb", None),
+    )
     db.delete(existing_shift)
     db.query(Shift).filter(Shift.group_id == target_group_id, Shift.sequence > deleted_sequence).update({"sequence": Shift.sequence - 1})
     db.commit()

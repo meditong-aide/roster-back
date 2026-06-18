@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Query
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from db.client2 import get_db
 from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
@@ -113,6 +114,12 @@ def _is_weekly_off_slot(slot_data: dict[str, Any]) -> bool:
     shift_slot = slot_data.get("shift_slot")
     codes = slot_data.get("codes") or []
     return main_code == "O" and shift_slot == 4 and any(code == "주" for code in codes)
+
+
+# 기본 슬롯 자동생성을 허용하는 유효 간호사 클래스(화이트리스트).
+# 과거 `GET /shift-manage/save` 같은 오호출이 class_name='save' 로 junk 행을 자동생성한
+# 사례가 있어, 알 수 없는 클래스에는 자동생성을 하지 않는다.
+VALID_NURSE_CLASSES = {"RN", "AN", "보조"}
 
 @router.post("/shifts/add")
 async def add_shift(
@@ -344,8 +351,14 @@ async def get_shift_manage(
 
     shift_manages = query.order_by(ShiftManage.shift_slot.asc()).all()
 
-    # 데이터가 없을 때 기본 슬롯 생성: 클래스가 지정된 경우에만 생성
-    if not shift_manages and has_class_filter:
+    # 데이터가 없을 때 기본 슬롯 생성: 유효 클래스(화이트리스트)일 때만 생성한다.
+    # (junk 클래스 차단 + 동시 첫 로드 race 는 IntegrityError 재조회로 수렴)
+    auto_create_allowed = (
+        not shift_manages
+        and has_class_filter
+        and class_name.strip().upper() in {c.upper() for c in VALID_NURSE_CLASSES}
+    )
+    if auto_create_allowed:
         default_slots = [
             {"shift_slot": 1, "main_code": "D", "codes": [], "manpower": 3},
             {"shift_slot": 2, "main_code": "E", "codes": [], "manpower": 3},
@@ -354,17 +367,22 @@ async def get_shift_manage(
         ]
 
         for slot_data in default_slots:
-            shift_manage = ShiftManage(
-                office_id=office_id,
-                group_id=target_group_id,
-                nurse_class=class_name,
-                shift_slot=slot_data["shift_slot"],
-                main_code=slot_data["main_code"],
-                codes=slot_data["codes"],
-                manpower=slot_data["manpower"],
+            db.add(
+                ShiftManage(
+                    office_id=office_id,
+                    group_id=target_group_id,
+                    nurse_class=class_name,
+                    shift_slot=slot_data["shift_slot"],
+                    main_code=slot_data["main_code"],
+                    codes=slot_data["codes"],
+                    manpower=slot_data["manpower"],
+                )
             )
-            db.add(shift_manage)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # 다른 요청이 먼저 동일 슬롯을 생성함(UNIQUE 충돌) → 롤백 후 재조회로 수렴.
+            db.rollback()
 
         shift_manages = query.order_by(ShiftManage.shift_slot.asc()).all()
     # for shift in shifts:
@@ -385,6 +403,54 @@ async def get_shift_manage(
     return response
 
 
+def _upsert_shift_manage_slots(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    class_name: str,
+    slots: list[dict[str, Any]],
+) -> None:
+    """
+    슬롯별 비파괴 upsert(슬롯당 1행으로 collapse). UNIQUE(office,group,nurse_class,slot) 전제.
+
+    - 기존 행이 있으면 최근(최대 id) 행을 보존해 payload 로 덮어쓰고, 나머지 중복행은 삭제.
+      (보존 행 선택을 로더의 manpower 채택 규칙=최대 id 와 일치시켜 동작을 결정적으로 맞춤)
+    - 없으면 insert.
+    """
+    for slot_data in slots:
+        rows = (
+            db.query(ShiftManage)
+            .filter(
+                ShiftManage.office_id == office_id,
+                ShiftManage.group_id == group_id,
+                ShiftManage.nurse_class == class_name,
+                ShiftManage.shift_slot == slot_data["shift_slot"],
+            )
+            .order_by(ShiftManage.id.asc())
+            .all()
+        )
+        if rows:
+            row = rows[-1]  # 최대 id(최근) 행 보존
+            row.nurse_class = class_name
+            row.main_code = slot_data.get("main_code")
+            row.codes = slot_data.get("codes") or []
+            row.manpower = slot_data.get("manpower") or 0
+            for extra in rows[:-1]:
+                db.delete(extra)
+        else:
+            db.add(
+                ShiftManage(
+                    office_id=office_id,
+                    group_id=group_id,
+                    nurse_class=class_name,
+                    shift_slot=slot_data["shift_slot"],
+                    main_code=slot_data.get("main_code"),
+                    codes=slot_data.get("codes") or [],
+                    manpower=slot_data.get("manpower") or 0,
+                )
+            )
+
+
 @router.post("/shift-manage/save")
 async def save_shift_manage(
     req: ShiftManageSaveRequest,
@@ -398,43 +464,29 @@ async def save_shift_manage(
 
     - 프론트에서 합산해주는 주휴 슬롯(shift_slot=4, main_code='O')은 DB에 저장하지 않고 무시합니다.
     """
-    print('current_user', current_user)
     try:
         if not current_user or (not caller_is_head_nurse(db, current_user) and not getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="Permission denied")
-        
+
         # 대상 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석(ADM 무지정 시 400).
         # HN 도 관리(hn_id) 그룹이면 저장 가능.
         target_group_id = resolve_effective_group(db, current_user, group_id)
         office_id = current_user.office_id
-        print(1)
-        # 기존 데이터 삭제 (특정 클래스의 모든 슬롯)
-        db.query(ShiftManage).filter(
-            ShiftManage.office_id == office_id,
-            ShiftManage.group_id == target_group_id,
-            ShiftManage.nurse_class == req.class_name,
-            # ShiftManage.config_version == config_version
-        ).delete()
-        print(2)
+
+        # 비파괴 upsert(슬롯당 1행 collapse). 프론트가 합산하는 주휴(slot4)는 저장 제외.
+        # 슬롯 코드 멤버십은 /shifts/update 의 _append_shift_manage_code 가 이미 동기화한다.
         slots_to_save = [
             slot_data for slot_data in req.slots
             if not _is_weekly_off_slot(slot_data)
         ]
-        # 새 데이터 저장
-        for slot_data in slots_to_save:
-            shift_manage = ShiftManage(
-                office_id=office_id,
-                group_id=target_group_id,
-                nurse_class=req.class_name,
-                shift_slot=slot_data["shift_slot"],
-                main_code=slot_data.get("main_code"),
-                codes=slot_data.get("codes") or [],
-                manpower=slot_data.get("manpower") or 0,
-                # config_version=config_version
-            )
-            db.add(shift_manage)
-        print(3)
-        db.commit()
+        _upsert_shift_manage_slots(db, office_id, target_group_id, req.class_name, slots_to_save)
+        try:
+            db.commit()
+        except IntegrityError:
+            # 동시 저장 race(UNIQUE 충돌) → 롤백 후 재조회 upsert 로 멱등 재시도.
+            db.rollback()
+            _upsert_shift_manage_slots(db, office_id, target_group_id, req.class_name, slots_to_save)
+            db.commit()
     except HTTPException:
         raise  # 403/400(권한·그룹) 은 그대로 전파
     except Exception as e:
