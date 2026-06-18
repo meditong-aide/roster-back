@@ -383,14 +383,16 @@ def attach_n_exact_to_nurses(
     nurses: list,
     year: Optional[int],
     month: Optional[int],
+    view_group_id: Optional[str] = None,
 ) -> list:
     """근무자관리 get-nurse 응답에 월별 야간 한도(n_exact=고정, n_max=최대)를 주입한다.
 
     - year/month 가 주어진 경우에만 동작(없으면 그대로 반환).
-    - nurse_monthly_limits 를 (nurse_id, year, month) 로 조회해 각 간호사 dict 에
-      'n_exact' 키를 채운다. unique scope 가 (nurse_id, group_id, year, month) 이므로
-      간호사의 group_id 와 정확히 일치하는 행을 우선 사용하고, 없으면 동일 nurse_id 의
-      임의 행으로 폴백한다. 해당 행이 없으면 키를 설정하지 않아 스키마 기본값(None)을 따른다.
+    - 주입 기준 그룹 = view_group_id(조회 중인 병동). 없으면 각 간호사 자기 group_id.
+      unique scope 가 (nurse_id, group_id, year, month) 이므로 그 그룹의 행만 사용한다.
+    - ★파견 inbound 간호사가 home 그룹 한도를 끌어오지 않도록 cross-group(임의 group)
+      폴백을 두지 않는다. 해당 그룹에 행이 없으면 키 미설정(스키마 기본값 None).
+      (예: 9B에 n_exact=1 인 inbound 간호사를 9A 목록에서 조회해도 9A엔 안 보인다.)
     """
     if not nurses or year is None or month is None:
         return nurses
@@ -412,25 +414,20 @@ def attach_n_exact_to_nurses(
         .all()
     )
     exact_map: dict = {}
-    any_exact_map: dict = {}
     max_map: dict = {}
-    any_max_map: dict = {}
     for nid, gid, n_exact, n_max in rows:
         exact_map[(nid, gid)] = n_exact
-        any_exact_map.setdefault(nid, n_exact)
         max_map[(nid, gid)] = n_max
-        any_max_map.setdefault(nid, n_max)
     for n in nurses:
         if not isinstance(n, dict):
             continue
         nid = n.get("nurse_id")
-        gid = n.get("group_id")
+        # 조회 중인 병동(view_group_id) 기준으로만 주입. inbound 간호사도 '보는 병동'의
+        # 한도만 노출되며, home 그룹 값으로 폴백하지 않는다.
+        gid = view_group_id or n.get("group_id")
         if (nid, gid) in exact_map:
             n["n_exact"] = exact_map[(nid, gid)]
-            n["n_max"] = max_map[(nid, gid)]
-        elif nid in any_exact_map:
-            n["n_exact"] = any_exact_map[nid]
-            n["n_max"] = any_max_map.get(nid)
+            n["n_max"] = max_map.get((nid, gid))
     return nurses
 
 

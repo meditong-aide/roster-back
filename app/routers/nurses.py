@@ -368,8 +368,10 @@ async def get_nurses_in_group(
                 view_group_id=_group,
             )
         # 근무자관리에서 year/month 가 함께 오면 nurse_monthly_limits 의 n_exact 를 주입.
+        # view_group_id=_group(조회 중인 병동) 기준으로만 주입해 파견 inbound 간호사가
+        # home 그룹 한도를 끌어오는 cross-group 누수를 막는다.
         if year is not None and month is not None:
-            attach_n_exact_to_nurses(db, response, year, month)
+            attach_n_exact_to_nurses(db, response, year, month, view_group_id=_group)
         return response
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)
