@@ -928,6 +928,46 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 시작: {year}년 {month}월")
         
+        # [WInjectFix] shift_types(D/E/N/O)에 없는 '근무' type fixed_wanted 코드(예: 미드 M)는
+        # 솔버가 표현할 수 없어 solve에서 미배치되고 후처리에서만 재적용된다 → 커버리지 붕괴.
+        # 이런 코드가 있으면 W(0요구 근무) 시프트를 보장해 솔버가 해당 인원을 '예약'(W)하고
+        # 나머지 인원으로 D/E/N을 맞추거나 stage1에서 정직하게 shortage를 띄우게 한다.
+        try:
+            _wfx_defs = config_data.get("shift_definitions") if isinstance(config_data, dict) else None
+            _wfx_s2m, _ = _build_shift_normalizer(_wfx_defs)
+            _wfx_type = {}
+            for _r in (_wfx_defs or []):
+                _sid = str(_r.get("shift_id") or "").strip().upper()
+                if _sid:
+                    _wfx_type[_sid] = str(_r.get("type") or "").strip()
+            _wfx_need = False
+            for _c in (config_data.get("fixed_cells") or []):
+                _raw = str(_c.get("shift") or "").strip()
+                if not _raw:
+                    continue
+                # 권위 있는 shifts 정의 type 만 사용 (fixed_wanted 셀의 shift_type 은 일괄 '근무'로 오라벨됨)
+                _ctype = _wfx_type.get(_raw.upper(), "")
+                if _ctype != "근무":
+                    continue
+                _nm = _normalize_shift_code(_raw, _wfx_s2m)
+                if (not _nm) or (str(_nm).upper() not in {"D", "E", "N", "O"}):
+                    _wfx_need = True
+                    break
+            if _wfx_need:
+                _dsr = config_data.get("daily_shift_requirements")
+                if not isinstance(_dsr, dict) or not _dsr:
+                    _dsr = {"D": config_data.get("day_req", 0), "E": config_data.get("eve_req", 0), "N": config_data.get("nig_req", 0)}
+                if "W" not in _dsr:
+                    config_data["daily_shift_requirements"] = {**_dsr, "W": 0}
+                _dbd = config_data.get("daily_shift_requirements_by_day")
+                if isinstance(_dbd, list):
+                    config_data["daily_shift_requirements_by_day"] = [
+                        ({**dm, "W": 0} if (isinstance(dm, dict) and "W" not in dm) else dm) for dm in _dbd
+                    ]
+                print(f"{self.logger_prefix} [WInjectFix] shift_types 외 '근무' fixed 코드 감지 → W(0요구) 시프트 주입")
+        except Exception as _wfx_e:
+            print(f"{self.logger_prefix} [WInjectFix] 사전 W 주입 실패(무시): {_wfx_e}")
+
         # 1. 설정 객체 생성
         with Timer("설정 생성"):
             config = self.create_config_from_db(config_data)
@@ -1089,6 +1129,25 @@ class CPSATBasicEngine:
                     print('[line 641] error!!!!!!!', e)
                     original_shift = ''
                 normalized_shift = _normalize_shift_code(original_shift, shift_id_to_main)
+                # [WInjectFix] shift_types에 없는 '근무' type 코드는 W(0요구 근무)로 매핑한다.
+                # 솔버가 해당 셀을 W로 고정 → 그 인원은 D/E/N 커버 풀에서 빠지고, 표시는 원본 코드로 복원.
+                _wfx_ct = shift_id_to_type.get(str(original_shift).upper(), '')
+                if (
+                    _wfx_ct == '근무'
+                    and 'W' in config.shift_types
+                    and ((not normalized_shift) or (normalized_shift not in config.shift_types))
+                ):
+                    try:
+                        _wn = int(c.get('nurse_index'))
+                        _wd = int(c.get('day_index'))
+                        fixed_original_shift_map[(_wn, _wd)] = original_shift
+                    except Exception:
+                        pass
+                    print(
+                        f"{self.logger_prefix} [WInjectFix] '근무' 고정셀 W 매핑: shift={original_shift} "
+                        f"nurse_index={c.get('nurse_index')}, day_index={c.get('day_index')}"
+                    )
+                    normalized_shift = 'W'
                 if not normalized_shift:
                     print(
                         f"{self.logger_prefix} 고정 셀 무시: 알 수 없는 근무코드 shift={original_shift}, "
