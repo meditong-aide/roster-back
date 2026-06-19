@@ -109,11 +109,12 @@ def test_flush_applies_team_changes(ward):
     # 발효일: 적용
     n = flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
     assert n == pv["num_changed"]
-    # 발효 후 실제 team_id 가 제안과 일치
+    # 발효 후 실제 team SSOT(nurse_team_period) 가 제안과 일치
+    # 4f8cd20 "팀 절연": nurses.team_id 캐시는 폐기 대상 — resolve_team(period) 으로 확인.
+    from services.team_period import resolve_team
     proposed = {nid: int(t) for t, members in pv["teams"].items() for nid in members}
     for nid, tid in proposed.items():
-        nurse = db.query(Nurse).filter(Nurse.nurse_id == nid).first()
-        assert nurse.team_id == tid
+        assert resolve_team(db, nid, "A", date(2026, 8, 1)) == tid
 
 
 def test_apply_records_team_period_before_flush(ward):

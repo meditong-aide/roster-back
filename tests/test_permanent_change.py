@@ -74,8 +74,11 @@ def test_flush_on_effective_date_applies(seed):
     )
     n = flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
     assert n == 1
+    # 4f8cd20 "팀 절연": team 은 nurse_team_period SSOT 기준 (nurses.team_id 캐시 폐기 대상).
+    from services.team_period import resolve_team
+    assert resolve_team(db, "n1", "A", date(2026, 8, 1)) == 3
     nurse = db.query(Nurse).filter(Nurse.nurse_id == "n1").first()
-    assert nurse.team_id == 3 and nurse.grade == 1
+    assert nurse.grade == 1
     row = db.query(NurseAssignment).filter(NurseAssignment.nurse_id == "n1").first()
     assert row.status == "completed" and row.end_date == date(2026, 8, 1)
 
@@ -87,8 +90,10 @@ def test_flush_none_attr_not_overwritten(seed):
         start_date=date(2026, 8, 1), new_team_id=3,  # grade 미지정
     )
     flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
+    # team 은 SSOT 로 확인 (cache 쓰기 제거 — 4f8cd20)
+    from services.team_period import resolve_team
+    assert resolve_team(db, "n1", "A", date(2026, 8, 1)) == 3
     nurse = db.query(Nurse).filter(Nurse.nurse_id == "n1").first()
-    assert nurse.team_id == 3
     assert nurse.grade == 2  # grade 는 target None → 미변경
 
 

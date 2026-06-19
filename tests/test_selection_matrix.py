@@ -297,7 +297,9 @@ def test_B12_flush_on_applies(ward):
     apply_team_classification(ward, group_id="A", office_id="o1", year=2026,
                               month=8, assignments=[{"nurse_id": "n1", "team_id": 2}])
     flush_pending_permanent_changes(ward, as_of=date(2026, 8, 1))
-    assert str(ward.query(Nurse).filter(Nurse.nurse_id == "n1").first().team_id) == "2"
+    # 4f8cd20 "팀 절연": team SSOT 는 nurse_team_period (nurses.team_id 캐시 폐기 대상).
+    from services.team_period import resolve_team
+    assert resolve_team(ward, "n1", "A", date(2026, 8, 1)) == 2
 
 
 def test_B13_preview_readonly(ward):
