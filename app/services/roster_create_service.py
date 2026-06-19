@@ -2712,21 +2712,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             )
             team_min_by_team: dict[str, dict[str, int]] = {}
             team_handoff_policy_by_team: dict[str, dict] = {}
+            # teams.min_shift 는 현재 저장 수단/디폴트가 없어 보지 않는다. 존재하는 활성 팀마다
+            # 디폴트 최소인원(D:1, E:1, N:0[, use_mid면 M:0])을 적용한다. 0(=무제약)은 제외하므로
+            # 실효 제약은 팀별 D≥1·E≥1. (N/M 은 최소 0 = 제약 없음.)
+            _use_mid = bool(config_dict.get("use_mid", False))
+            _default_team_min: dict[str, int] = {"D": 1, "E": 1, "N": 0}
+            if _use_mid:
+                _default_team_min["M"] = 0
             for t in team_rows:
-                ms = t.min_shift if isinstance(t.min_shift, dict) else None
-                if ms:
-                    cleaned: dict[str, int] = {}
-                    for k, v in ms.items():
-                        if k not in ("D", "E", "N", "M"):
-                            continue
-                        try:
-                            iv = int(v)
-                        except (TypeError, ValueError):
-                            continue
-                        if iv > 0:
-                            cleaned[k] = iv
-                    if cleaned:
-                        team_min_by_team[str(t.team_id)] = cleaned
+                cleaned = {k: v for k, v in _default_team_min.items() if v > 0}
+                if cleaned:
+                    team_min_by_team[str(t.team_id)] = cleaned
                 hp = t.handoff_policy if isinstance(t.handoff_policy, dict) else None
                 if hp and isinstance(hp.get("restrictions"), list) and hp["restrictions"]:
                     team_handoff_policy_by_team[str(t.team_id)] = hp
@@ -5274,20 +5270,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     .all()
                 )
                 _team_min_by_team: dict[str, dict[str, int]] = {}
+                # teams.min_shift 미사용 — 존재하는 활성 팀에 디폴트 최소(D:1, E:1, N:0[, use_mid면 M:0]).
+                _use_mid = bool(precheck_config.get("use_mid", False))
+                _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
+                if _use_mid:
+                    _default_tm["M"] = 0
                 for _t in _team_rows:
-                    _ms = _t.min_shift if isinstance(_t.min_shift, dict) else None
-                    if not _ms:
-                        continue
-                    _cleaned: dict[str, int] = {}
-                    for _k, _v in _ms.items():
-                        if _k not in ("D", "E", "N", "M"):
-                            continue
-                        try:
-                            _iv = int(_v)
-                        except (TypeError, ValueError):
-                            continue
-                        if _iv > 0:
-                            _cleaned[_k] = _iv
+                    _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
                     if _cleaned:
                         _team_min_by_team[str(_t.team_id)] = _cleaned
                 if _team_min_by_team:
