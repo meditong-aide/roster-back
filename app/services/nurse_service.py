@@ -1719,6 +1719,11 @@ def update_nurse_profile_service(
             db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
         )
         _apply_source_nurse_update(nurse, fields)
+        if "team_id" in fields:
+            _persist_team_period_change(
+                db, nurse_id=nurse_id, group_id=nurse.group_id,
+                new_team_id=fields["team_id"],
+            )
         db.commit()
         db.refresh(nurse)
         applied_source = True
@@ -1734,6 +1739,8 @@ def update_nurse_profile_service(
                 group_id=assign_row.target_group_id,
                 assign_row=assign_row,
             )
+            # 전환기: inbound 팀은 아직 assignment.target_team_id 로 저장/표시(읽기 period
+            #   이행 전). home(source) 만 period 일원화. inbound→period 는 백필과 함께 다음 단계.
             _apply_target_update(assign_row, fields)
             db.commit()
             db.refresh(assign_row)
@@ -1742,7 +1749,13 @@ def update_nurse_profile_service(
                 db, nurse, fields, scope="source", group_id=nurse.group_id, assign_row=None,
             )
             _apply_source_nurse_update(nurse, fields)
+            if "team_id" in fields:
+                _persist_team_period_change(
+                    db, nurse_id=nurse_id, group_id=nurse.group_id,
+                    new_team_id=fields["team_id"],
+                )
             # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
+            # (team_id 는 _apply_target_update 에서 제외 — team SSOT=period 라 assignment 미관여)
             # 프론트가 view_group_id 안 보내도 source view 호출 한 번으로 inbound 모두 동기화.
             _cascade_inbounds = (
                 db.query(NurseAssignment)
@@ -1811,11 +1824,39 @@ def _sanitize_resignation_fields(fields: Dict[str, Any]) -> None:
 
 
 def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> None:
-    """Source 모드 nurses.* 직접 저장 (update_nurse_profile_service 전용 분리)"""
+    """Source 모드 nurses.* 직접 저장 (update_nurse_profile_service 전용 분리)
+
+    team_id 는 더 이상 캐시(nurses.team_id)에 쓰지 않는다 — team SSOT 는 nurse_team_period.
+    팀 변경은 호출부에서 _persist_team_period_change 로 period 에 기록한다.
+    """
     _sanitize_resignation_fields(fields)
     for key, value in fields.items():
+        if key == "team_id":
+            continue  # team 은 nurse_team_period 에만 기록 (캐시 미사용)
         if hasattr(nurse, key):
             setattr(nurse, key, value)
+
+
+def _persist_team_period_change(
+    db: Session, *, nurse_id: str, group_id: str, new_team_id: Optional[int]
+) -> None:
+    """프로필 팀 변경을 nurse_team_period(SSOT)에 기록.
+
+    valid_from=당월 1일(팀 모달과 동일 입도 — 그 달 근무표 전체에 적용).
+    commit 은 호출부(update_nurse_profile_service)가 일괄 수행하므로 commit=False.
+    """
+    from datetime import date as _date
+    from services.team_period import set_team_period
+    _t = _date.today()
+    set_team_period(
+        db,
+        nurse_id=str(nurse_id),
+        group_id=str(group_id),
+        valid_from=_date(_t.year, _t.month, 1),
+        team_id=int(new_team_id) if new_team_id is not None else None,
+        source="profile_edit",
+        commit=False,
+    )
 
 
 def _validate_team_grade_change_or_raise(
@@ -1837,11 +1878,19 @@ def _validate_team_grade_change_or_raise(
     if not has_team and not has_grade:
         return
     if scope == "source":
-        old_team = nurse.team_id
+        # home 팀 권위 = nurse_team_period(SSOT). nurses.team_id 캐시는 stale 가능하므로
+        #   변경 전 값을 period 에서 읽는다(첫 변경 시엔 ward-aware 폴백=현재 캐시값).
+        from datetime import date as _vdate
+        from services.team_period import resolve_team as _resolve_team
+        _t = _vdate.today()
+        old_team = _resolve_team(
+            db, str(nurse.nurse_id), group_id, _vdate(_t.year, _t.month, 1)
+        )
         old_grade = nurse.grade
     else:
         if assign_row is None:
             return
+        # inbound 팀은 (전환기) assignment.target_team_id 가 권위 — 읽기 period 이행 전.
         old_team = assign_row.target_team_id
         old_grade = assign_row.target_grade
     new_team = fields["team_id"] if has_team else old_team

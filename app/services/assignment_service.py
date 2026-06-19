@@ -58,37 +58,42 @@ def _assert_caller_owns_source(
     current_user: Optional[UserSchema],
     source_group_id: str,
     db: Optional[Session] = None,
+    target_group_id: Optional[str] = None,
 ) -> None:
     """파견/병동이동/휴직 등 assignment 조작 권한 검증.
 
     통과 조건 (OR):
     - current_user is None → system/admin 경로로 간주
     - is_master_admin
-    - caller.group_id == source_group_id (현재 view 가 source)
-    - caller.original_group_id == source_group_id (원본 소속이 source — view 전환 중)
-    - source_group_id ∈ resolve_managed_group_ids(caller)
-      (HN multi-group: home + group.hn_id JSON 에 본인이 등록된 모든 그룹)
+    - caller 가 source_group_id 소유 (group_id / original_group_id / managed)
+    - **target_group_id 가 주어지면**(취소 등) caller 가 target_group_id 소유여도 통과.
+      A→B 파견을 전입 받은 B(target)에서도 취소→재등록할 수 있게. 생성·수정 호출은
+      target_group_id 를 넘기지 않으므로 기존대로 **source 전용**으로 유지된다.
     """
     if current_user is None:
         return
     if getattr(current_user, "is_master_admin", False):
         return
+    _allowed = {str(source_group_id)}
+    if target_group_id is not None:
+        _allowed.add(str(target_group_id))
     caller_gid = getattr(current_user, "group_id", None)
-    if caller_gid == source_group_id:
+    if str(caller_gid) in _allowed:
         return
     caller_original = getattr(current_user, "original_group_id", None)
-    if caller_original and caller_original == source_group_id:
+    if caller_original and str(caller_original) in _allowed:
         return
     if db is not None:
         from services.group_access import resolve_managed_group_ids
         managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
-        if str(source_group_id) in managed:
+        if _allowed & managed:
             return
     raise HTTPException(
         status_code=403,
         detail=(
-            f"권한 없음: source 병동({source_group_id})의 수간호사 또는 그룹 관리자만 "
-            f"배정을 생성/수정할 수 있습니다. (caller={caller_gid})"
+            f"권한 없음: 해당 배정의 source({source_group_id})"
+            f"{'/target(' + str(target_group_id) + ')' if target_group_id else ''} "
+            f"병동 수간호사·그룹 관리자만 조작할 수 있습니다. (caller={caller_gid})"
         ),
     )
 
@@ -429,6 +434,12 @@ def create_assignment(
     # 동일 target_group_id 재파견/재병동이동 시 이전 row 의 target_*/note 자동 승계
     _inherit_target_fields_from_prior(db, req)
 
+    # [팀 절연] 파견(임시)은 팀과 엮지 않는다. team SSOT 는 nurse_team_period 이며 파견은
+    #   팀 로테이션 비참여(team None) — 생성기에서 team=None 으로 D/E 커버리지 풀에서 빠진다.
+    #   승계/명시 어느 경로로 team 이 들어와도 여기서 강제로 비운다.
+    if req.reason == "파견":
+        req.target_team_id = None
+
     # 신규 inbound: target_group 의 team/grade 정합성 검증 (사이드프로필과 동일 정책)
     if req.reason in _INBOUND_REASONS:
         _validate_assignment_team_grade_or_raise(
@@ -464,6 +475,20 @@ def create_assignment(
     db.add(row)
     db.commit()
     db.refresh(row)
+
+    # [팀 SSOT] 병동이동의 target 팀을 nurse_team_period(target_group)에 일원화 기록.
+    #   수동 병동이동(프로필 패널 _dispatch_assignment_payload 등)은 외부 set_team_period 가
+    #   없어 이 기록이 없으면 period 공백→화면/생성기에 팀 미반영(원 버그와 동종). 팩토리 안에서
+    #   보장한다. 파견은 team None(절연)이라 해당 없음. ward_redistribute 의 외부 호출과는
+    #   valid_from 동일 → 멱등(same-row upsert).
+    if req.reason == "병동이동" and req.target_team_id is not None:
+        from services.team_period import set_team_period
+        set_team_period(
+            db, nurse_id=req.nurse_id, group_id=req.target_group_id,
+            valid_from=req.start_date, team_id=req.target_team_id,
+            source="transfer", note=req.note,
+        )
+
     logger.info(
         "배정 등록: nurse_id=%s, reason=%s, start=%s",
         req.nurse_id, req.reason, req.start_date,
@@ -660,6 +685,11 @@ def update_assignment(
         req.target_group_id if req.target_group_id is not None else row.target_group_id
     )
 
+    # [팀 절연] 최종 reason 이 파견이면 team 검증 입력을 비워 곧 버릴 팀을 검사하지 않게 한다.
+    #   (영속 클리어는 함수 끝단 가드가 담당 — setattr 루프는 None 을 건너뛰므로.)
+    if _new_reason == "파견":
+        req.target_team_id = None
+
     # 파견/병동이동: 최종 target_group_id 필수 + source != target 검증
     # (reason 또는 target_group_id 변경 시 재검증, 또는 기존 reason이 파견/병동이동인데 invalid state인 경우 차단)
     if _new_reason in _INBOUND_REASONS and (
@@ -740,6 +770,11 @@ def update_assignment(
         if _v is not None:
             setattr(row, _f, _v)
 
+    # [팀 절연] 파견(임시)은 팀과 엮지 않는다(create_assignment 와 동일 정책).
+    #   reason 변경/팀 setattr 어느 경로로 들어와도 파견 row 는 team None 으로 수렴.
+    if row.reason == "파견":
+        row.target_team_id = None
+
     db.commit()
     db.refresh(row)
 
@@ -778,7 +813,11 @@ def cancel_assignment(
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
-    _assert_caller_owns_source(current_user, row.source_group_id, db=db)
+    # 취소는 source(기존 병동) + target(전입 받은 병동) 양쪽 허용 — target 그룹이 잘못
+    # 들어온 전입자 파견을 직접 취소→재등록 가능하게. (생성·수정은 source 전용 유지)
+    _assert_caller_owns_source(
+        current_user, row.source_group_id, db=db, target_group_id=row.target_group_id
+    )
 
     _old_window = (row.start_date, _effective_end_date(row))
     _old_reason = row.reason
@@ -1009,13 +1048,14 @@ def group_members_in_month(
         return None
 
     def _row(n, status, marker, badge, team, grade):
-        # N전담(허용 shift=N뿐)은 팀 로테이션 비참여 → 미지정(as_of_team=None) + 'N전담' 배지.
-        #   파생 규칙(is_night_nurse 기반) — team_period 데이터는 안 건드림(전담 해제 시 자동 복귀).
+        # N전담(허용 shift=N뿐): 'N전담' 배지 + is_night_dedicated 플래그만 부여하고
+        #   as_of_team 은 직접 배정한 팀(period)을 그대로 노출한다. 직접 저장한 팀이 화면에
+        #   안 보이던 문제 해소 — N전담은 시점(period) 모델이 아직 없어 팀까지 가리던 휴리스틱을
+        #   제거(전담의 '시기'는 별도 shift-type period 테이블로 추후 분리). 단 생성기는
+        #   여전히 N전담을 팀 D/E 커버리지에서 제외(roster_create_service)한다.
         night_dedicated = is_n_only_profile(getattr(n, "is_night_nurse", None))
-        if night_dedicated:
-            team = None
-            if badge is None:
-                badge = "N전담"
+        if night_dedicated and badge is None:
+            badge = "N전담"
         return {
             "nurse_id": str(n.nurse_id),
             "name": getattr(n, "name", None),
@@ -1737,6 +1777,17 @@ def create_permanent_change(
     db.add(row)
     db.commit()
     db.refresh(row)
+
+    # [팀 SSOT] 속성변경의 팀 변경을 nurse_team_period 에 일원화 기록(발효 전이어도 resolve_team/
+    #   생성기가 즉시 반영). 외부 호출자(team_classify/ward_redistribute)도 동일 호출을 하지만
+    #   valid_from 동일 → 멱등. 어느 경로로 만들든 period 가 보장되도록 팩토리 안에서 기록한다.
+    if new_team_id is not None:
+        from services.team_period import set_team_period
+        set_team_period(
+            db, nurse_id=nurse_id, group_id=group_id, valid_from=start_date,
+            team_id=new_team_id, source="permanent_change", note=note,
+        )
+
     logger.info(
         "속성변경 등록: nurse_id=%s, team %s→%s, grade %s→%s, 발효=%s",
         nurse_id, nurse.team_id, new_team_id, nurse.grade, new_grade, start_date,
@@ -1770,11 +1821,8 @@ def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -
             db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
         )
         if nurse:
-            if row.target_team_id is not None:
-                # team SSOT 는 nurse_team_period(생성시 [B3] 로 이미 기록됨). 아래 캐시 갱신은
-                #   레거시 호환용 — nurses.team_id 일괄 NULL 이행 후엔 모든 리더가 period 를
-                #   보므로 이 값은 무시된다(컬럼 DROP 시 이 writer 도 함께 제거 예정).
-                nurse.team_id = row.target_team_id
+            # [팀 절연] team 은 create_permanent_change 시점에 nurse_team_period(SSOT)에
+            #   이미 기록됨. nurses.team_id 캐시는 더 이상 쓰지 않는다(컬럼 DROP 예정).
             if row.target_grade is not None:
                 nurse.grade = row.target_grade
             # target_shift_types 지정 시 is_night_nurse 갱신 (N전담 해제 = [] 등)

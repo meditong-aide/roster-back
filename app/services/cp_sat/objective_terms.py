@@ -1166,6 +1166,26 @@ def build_main_objective_terms(
                 m.Add(isw >= X(n, d - 1, off) + X(n, d + 1, off) + mid_work - 2)
                 obj.append(-ISOLATED_WORK_PENALTY * isw)
 
+    # (4-5d) 단일 E 패널티 (lone-E): E를 쌍으로 유도(DDDE→DDEE). E→N 로테이션은 면제(옵션 B).
+    # primary는 기본 SKIP이라 실제 효과는 fallback_objectives 의 동명 항이 담당(여기는 정합용).
+    # 원복: lone_e_penalty_weight=0.
+    try:
+        import os as _os_le
+        _le_w = int(_os_le.environ.get("LONE_E_PENALTY_WEIGHT", getattr(cfg, "lone_e_penalty_weight", 500)) or 0)
+        if _le_w > 0 and "E" in cfg.shift_types:
+            _le_e = cfg.shift_types.index("E")
+            _le_has_n = "N" in cfg.shift_types
+            _le_n = cfg.shift_types.index("N") if _le_has_n else None
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                for d in range(T0 + 1, T1):
+                    _le = m.NewBoolVar(f"lone_e_{n}_{d}")
+                    _next_n = X(n, d + 1, _le_n) if _le_has_n else 0
+                    m.Add(_le >= X(n, d, _le_e) - X(n, d - 1, _le_e) - X(n, d + 1, _le_e) - _next_n)
+                    obj.append(-_le_w * _le)
+    except Exception:
+        pass
+
     # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
     if getattr(cfg, "sequential_offs", True):
         SEQUENTIAL_OFF_BONUS = 50000  # 연속 휴무 보너스 가중치 (KLD 균등과 균형)

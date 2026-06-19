@@ -32,6 +32,10 @@ from __future__ import annotations
 
 from typing import Any, List, Dict
 
+# 솔버(fallback_lex / cp_sat_basic)의 night-only off-cap 정의와 동일 공식을 공유한다.
+# (leaf 모듈이라 순환참조 없음.)
+from services.cp_sat.allowed_shift_types import effective_night_cap
+
 
 def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
     try:
@@ -107,39 +111,57 @@ def detect_nurse_overconstrained(rs: Any) -> List[Dict[str, Any]]:
             continue
         sole_shift = allowed_work[0]
 
-        # CP-SAT 솔버의 실제 OFF 상한 규칙:
+        # CP-SAT 솔버의 실제 OFF 상한 규칙(솔버와 동일 공식 공유):
         #   - 일반 nurse: max_off_per_nurse[idx] (= max_off_arr 값)
-        #   - N-only nurse: max(0, avail_days - max_night_shifts_per_month)
-        #                   (cp_sat_basic.py:3583 의 "N전담 예외" 분기와 정합)
+        #   - N-only nurse: avail_days - effective_night_cap(nu, max_night)
+        #     effective_night_cap = min(글로벌 max_night, per-nurse n_max/n_exact).
+        #     OFF=avail-N 항등식 → n_exact 등으로 N이 낮게 고정되면 forced OFF가 커지고
+        #     솔버 off-cap도 그만큼 확장된다(fallback_lex/cp_sat_basic의 N전담 분기).
+        #     ⇒ 여기서도 동일 공식을 써야 수정 후 false-positive(해소된 케이스 재경보)를 막는다.
         is_night_only = sole_shift.upper() == "N"
         raw_max_off = int(max_off_arr[idx]) if idx < len(max_off_arr) else None
-        if is_night_only and max_night_global > 0:
-            max_off = max(0, num_days - max_night_global)
-            max_off_source = f"avail_days({num_days}) - max_night({max_night_global})"
-        else:
-            max_off = raw_max_off
-            max_off_source = "max_off_per_nurse"
 
         n_exact = _safe_attr(nu, "n_exact", None)
         n_min = _safe_attr(nu, "n_min", None)
         n_max_nurse = _safe_attr(nu, "n_max", None)
+
+        if is_night_only and max_night_global > 0:
+            eff_ncap = effective_night_cap(nu, max_night_global)
+            max_off = max(0, num_days - eff_ncap)
+            max_off_source = f"avail_days({num_days}) - 실효N상한({eff_ncap})"
+        else:
+            max_off = raw_max_off
+            max_off_source = "max_off_per_nurse"
+
         # work 가능 일수 = num_days - OFF
         min_work_days = num_days - (max_off if max_off is not None else num_days)
         max_work_days = num_days  # OFF 0일 가정
 
         if is_night_only:
-            # N + OFF = 31
-            n_lower = min_work_days
+            # N + OFF = num_days. N 가용 구간 [n_lower, n_upper] 계산.
             n_upper = num_days if max_night_global <= 0 else min(num_days, max_night_global)
             if n_max_nurse is not None:
                 n_upper = min(n_upper, int(n_max_nurse))
+            n_lower = min_work_days
             if n_min is not None:
                 n_lower = max(n_lower, int(n_min))
+            # n_exact: N==n_exact 로 고정. 단 max_night 천장을 초과하면(달성 불가)
+            #   n_lower만 n_exact로 올려 구간을 빈집합으로 만들어 진짜 모순으로 검출한다.
+            #   (off-cap 확장으로도 해소 불가한 케이스 — 솔버에서도 sum(N)==n_exact vs
+            #    sum(N)<=max_night 충돌로 INFEASIBLE.)
+            n_exact_over_night = (
+                n_exact is not None and max_night_global > 0 and int(n_exact) > max_night_global
+            )
             if n_exact is not None:
-                n_lower = n_upper = int(n_exact)
+                if n_exact_over_night:
+                    n_lower = int(n_exact)
+                    n_upper = min(n_upper, max_night_global)
+                else:
+                    n_lower = n_upper = int(n_exact)
 
-            # 추가 검산: OFF 범위 — N + OFF = num_days, OFF ≤ max_off
-            # 최소 OFF = num_days - n_upper. 이 값이 max_off보다 크면 또한 모순.
+            # OFF 범위 검산: min_OFF = num_days - n_upper. max_off 초과면 모순.
+            # (off-cap을 effective_night_cap로 이미 보정했으므로, n_exact가 천장 내면
+            #  off_conflict 는 False가 되어 정상적으로 통과한다.)
             min_off_required = num_days - n_upper
             off_conflict = (max_off is not None) and (min_off_required > int(max_off))
 
@@ -193,10 +215,15 @@ def detect_nurse_overconstrained(rs: Any) -> List[Dict[str, Any]]:
 
                 hints: List[Dict[str, Any]] = []
                 if max_night_global > 0:
+                    _night_to = max(
+                        int(min_work_days),
+                        int(n_exact) if n_exact is not None else 0,
+                        int(n_lower),
+                    )
                     hints.append({
                         "action": "increase_max_night_shifts_per_month",
-                        "params": {"from": max_night_global, "to_min": min_work_days},
-                        "human_message_ko": f"월간 N 상한을 {max_night_global} → {min_work_days}+ 로 늘리세요.",
+                        "params": {"from": max_night_global, "to_min": _night_to},
+                        "human_message_ko": f"월간 N 상한을 {max_night_global} → {_night_to}+ 로 늘리세요.",
                     })
                 if max_off is not None:
                     needed_off = num_days - n_upper

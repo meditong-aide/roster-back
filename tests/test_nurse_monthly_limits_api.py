@@ -110,7 +110,7 @@ def test_monthly_limits_reject_exact_sum_over_capacity(api):
         ],
     }
     resp = api.put("/nurses/monthly-limits", json=payload)
-    # dev: preflight 가 구조적 422 로 반환 (이전 500). 본문에 structured 사유 유지.
+    # 사용자 데이터 모순은 422(Unprocessable Entity)로 거부 — 서버오류 500 아님.
     assert resp.status_code == 422, resp.text
     detail = resp.json().get("detail", {})
     infeas = detail.get("infeasibility") if isinstance(detail, dict) else {}

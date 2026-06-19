@@ -253,10 +253,43 @@ def _check_night_dedicated(
     nurse_id: str,
     nurse_name: Optional[str],
     nurse: Nurse,
+    max_night: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
     if not _is_night_dedicated(nurse):
         return issues
+
+    # N전담 + N 하한(n_exact 우선, 없으면 n_min)이 월간 N 상한(max_night)을 초과 →
+    # 물리적으로 달성 불가(sum(N)>=floor > max_night >= sum(N)) → 저장 시점 하드 차단.
+    # (낮은 N은 커버리지 의존이라 warn_night_dedicated_low_n 소프트 경고로 두지만,
+    #  상한 초과는 커버리지와 무관한 결정론적 모순이므로 저장을 막는다.)
+    if max_night is not None and int(max_night) > 0:
+        n_exact_v = _row_value(row, "n_exact")
+        n_floor = n_exact_v if n_exact_v is not None else _row_value(row, "n_min")
+        if n_floor is not None and int(n_floor) > int(max_night):
+            is_exact = n_exact_v is not None
+            label = "정확" if is_exact else "최소"
+            issues.append(_make_issue(
+                "MONTHLY_LIMIT_NIGHT_DEDICATED_N_OVER_MAX_NIGHT",
+                nurse_id=nurse_id, nurse_name=nurse_name,
+                evidence={
+                    "n_floor": int(n_floor),
+                    "max_night": int(max_night),
+                    "kind": "exact" if is_exact else "min",
+                },
+                human_message_ko=(
+                    f"{nurse_name or nurse_id} 간호사는 N 전담인데 월간 N {label} 한도가 "
+                    f"{int(n_floor)}회로 월간 N 상한 {int(max_night)}회를 초과합니다. "
+                    f"야간 전담은 한 달에 N을 {int(max_night)}회 넘게 배정할 수 없어 "
+                    f"근무표를 생성할 수 없습니다."
+                ),
+                fix_suggestions_ko=[
+                    f"월간 N {label} 한도를 {int(max_night)} 이하로 낮추세요.",
+                    f"월간 N 상한(max_night)을 {int(n_floor)} 이상으로 올리세요.",
+                    "N 전담을 해제해 D/E도 가능하게 하세요.",
+                ],
+            ))
+
     for p in ("d", "e"):
         mn = _row_value(row, f"{p}_min")
         ex = _row_value(row, f"{p}_exact")
@@ -440,6 +473,7 @@ def validate_monthly_limit_row(
     cap_days: int,
     year: int,
     month: int,
+    max_night: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """단일 (nurse, group, year, month) row에 대한 산술 모순 검사.
 
@@ -448,6 +482,8 @@ def validate_monthly_limit_row(
         nurse: Nurse ORM 객체 (work_shifts, is_night_nurse, is_weekend_off, weekly_off_weekday 등)
         cap_days: 그룹 활성 가용일 (build_blocked_days 반영, vacation 제외 전)
         year/month: 검증 대상 월
+        max_night: 그룹 월간 N 상한(roster_config.max_nig_per_month). N전담 + N하한 초과
+            모순을 저장 시점에 차단하기 위해 사용(None이면 해당 검사 skip)
 
     Returns:
         list of issue dicts. 빈 리스트면 통과.
@@ -476,7 +512,7 @@ def validate_monthly_limit_row(
     issues: List[Dict[str, Any]] = []
     issues.extend(_check_single_bounds(row, nurse_id=nurse_id, nurse_name=nurse_name, cap_days=cap_days))
     issues.extend(_check_sum_coverage(row, nurse_id=nurse_id, nurse_name=nurse_name, active_days_for_limits=active_days_for_limits))
-    issues.extend(_check_night_dedicated(row, nurse_id=nurse_id, nurse_name=nurse_name, nurse=nurse))
+    issues.extend(_check_night_dedicated(row, nurse_id=nurse_id, nurse_name=nurse_name, nurse=nurse, max_night=max_night))
     issues.extend(_check_work_shifts(row, nurse_id=nurse_id, nurse_name=nurse_name, nurse=nurse))
     issues.extend(_check_forced_off(
         row,
