@@ -112,6 +112,9 @@ constraints:
     relaxation_priority: 3
     tier: T2
     scope_explosion: high
+    # [2026-06-19] TeamMin 패턴과 동일 — 엔진 자동 escalation.
+    runtime_lever: false
+    runtime_note: "엔진(constraint_impact)이 hard→soft 자동 escalate (_force_grade_min_soft_fallback)."
 
   GradeMax:
     label: Grade Maximum Coverage
@@ -125,6 +128,9 @@ constraints:
     relaxation_priority: 2
     tier: T2
     scope_explosion: high
+    # [2026-06-19] 운영 미사용 family. resolve_infeasibility 옵션 노출 금지.
+    runtime_lever: false
+    runtime_note: "운영 미사용 family — 사용자/엔진 어느 쪽도 활용 안 함."
 
   TeamGradeHandoff:
     label: Team Grade Handoff
@@ -138,6 +144,9 @@ constraints:
     relaxation_priority: 1
     tier: T2
     scope_explosion: medium
+    # [2026-06-19] 운영 미사용 family. resolve_infeasibility 옵션 노출 금지.
+    runtime_lever: false
+    runtime_note: "운영 미사용 family — 사용자/엔진 어느 쪽도 활용 안 함."
 
   ConsecutiveWorkLimit:
     label: Consecutive Work Limit
@@ -838,6 +847,9 @@ treatments:
     rationale_ko: "등급 상한을 hard 에서 soft 로 전환. 일부 시프트에서 등급 한계 1~2명 초과 가능."
     trade_off_ko: "특정 (day, shift)에서 grade=N 간호사가 max 를 초과 가능. 다음 달 운영에서 보정 권장."
     applies_to_causes: [cause:grade:max_sum_below_need]
+    # [2026-06-19] GradeMax family 운영 미사용. lever 효력 없음.
+    runtime_lever: false
+    runtime_note: "운영 미사용 family — lever 효력 없음."
 
   treatment:soft:grade_min:
     label: "Grade min 을 soft fallback"
@@ -848,6 +860,9 @@ treatments:
     rationale_ko: "등급 최저 인원을 soft 화. 특정 day 에서 일부 등급이 1~2명 부족할 수 있음."
     trade_off_ko: "선임 grade 부족 시프트가 일부 발생 — 위험 시점 manual check 필요."
     applies_to_causes: [cause:grade:min_sum_over_need]
+    # [2026-06-19] 엔진(constraint_impact)이 hard→soft 자동 escalate. 사용자 토글 없음.
+    runtime_lever: false
+    runtime_note: "엔진 자동 처리 — 사용자 lever 아님."
 
   treatment:soft:team_min:
     label: "팀 최소 인원을 soft fallback"
@@ -872,6 +887,9 @@ treatments:
     rationale_ko: "팀-등급 인계 일관성 제약을 soft. 인계 품질이 일부 저하될 수 있음."
     trade_off_ko: "인계 셋이 부분적으로 깨질 수 있음. 안전 운영 매뉴얼로 보정."
     applies_to_causes: [cause:grade:max_sum_below_need, cause:team:min_over_need]
+    # [2026-06-19] TeamGradeHandoff family 운영 미사용. lever 효력 없음.
+    runtime_lever: false
+    runtime_note: "운영 미사용 family — lever 효력 없음."
 
   treatment:disable:team_min:
     label: "팀 최소 인원 비활성화"
