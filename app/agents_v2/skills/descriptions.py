@@ -1258,6 +1258,49 @@ SKILL_TOOLS: list[dict] = [
         },
     },
     {
+        "name": "resolve_infeasibility",
+        "description": (
+            "근무표 자동 생성이 **실패**했을 때, 어떤 변경을 하면 풀 수 있는지 **해결 옵션 카탈로그**를 보여줍니다. "
+            "예: '이번 실패 어떻게 풀어?', '7월 근무표 실패 해결 방법 알려줘', '원인 알겠고 옵션 뭐 있어?'.\n\n"
+
+            "─────────── 무엇을 다루나 ───────────\n"
+            "- 최근 FAILED 생성 job 의 솔버 unrecoverable payload 를 읽어 "
+            "해결 옵션(action_levers) + 부작용(trade_offs) 카탈로그를 한국어로 노출.\n"
+            "- 각 옵션은 어떤 설정 키(config_key)를 어느 방향(direction)으로 조절할지 명시.\n"
+            "- 적용 자체는 본 스킬이 아니라 후속 mutation 스킬(manage_team_min/manage_grade/"
+            "update_constraint 등)에 LLM 이 chain 으로 위임.\n\n"
+
+            "⛔ read-only 스킬. DB 변경 없음.\n"
+            "⛔ 사용자에게 raw enum / treatment_id / job_id 노출 금지. 한국어 rationale 만.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 진행 상태/실패 사유 한 줄 요약 → query_generation_job.\n"
+            "- 옵션 선택 후 실제 변경 → manage_team_min(팀 최소인원) / manage_grade(등급) / "
+            "update_constraint(제약) / update_monthly_limit(월 한도) 등.\n"
+            "- 검증/교정 흐름은 validate_schedule / repair_schedule.\n"
+            "- 본 스킬은 '실패 → 옵션 카탈로그' 단계에만 한정.\n\n"
+
+            "─────────── 그라운딩 ───────────\n"
+            "- 대상은 **가장 최근 생성 job**(FAILED 여야 함). 다른 시점 지정은 현재 미지원.\n"
+            "- 옵션 목록이 비어있으면 '실패 원인부터 확인 필요' 라고 안내.\n\n"
+
+            "─────────── 예시 ───────────\n"
+            "- '이번 실패 어떻게 풀어?' → operation='list_options'\n"
+            "- '7월 근무표 실패 해결 옵션 알려줘' → operation='list_options'\n"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["list_options"],
+                    "description": "현재는 옵션 카탈로그 조회(list_options)만 지원.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "navigate",
         "description": (
             "사용자를 특정 **화면/섹션으로 이동**시킵니다 (프론트 화면 전환). "

@@ -26,6 +26,10 @@ class OntologyConstraintEntry:
     scope_explosion: str | None = None
     tier: str | None = None
     causal_layer: str | None = None
+    # 운영 모델 갱신 메타. false 면 사용자 lever 무효 (엔진 자동 처리).
+    runtime_lever: bool = True
+    runtime_note: str | None = None
+    value_source: str | None = None
 
 
 @dataclass(slots=True)
@@ -85,6 +89,9 @@ class OntologyTreatment:
     rationale_ko: str
     trade_off_ko: str
     applies_to_causes: list[str] = field(default_factory=list)
+    # false 면 사용자 lever 효력 없음 (엔진 자동 처리 또는 DB 컬럼 무력화).
+    runtime_lever: bool = True
+    runtime_note: str | None = None
 
 
 @dataclass(slots=True)
@@ -256,6 +263,9 @@ class ConstraintOntology:
                 scope_explosion=body.get("scope_explosion"),
                 tier=body.get("tier"),
                 causal_layer=causal_layer,
+                runtime_lever=bool(body.get("runtime_lever", True)),
+                runtime_note=body.get("runtime_note"),
+                value_source=body.get("value_source"),
             )
             self.constraints[cid] = entry
             self._alias_to_id[cid.upper()] = cid
@@ -320,6 +330,8 @@ class ConstraintOntology:
                 rationale_ko=str(body.get("rationale_ko") or "").strip(),
                 trade_off_ko=str(body.get("trade_off_ko") or "").strip(),
                 applies_to_causes=list(body.get("applies_to_causes") or []),
+                runtime_lever=bool(body.get("runtime_lever", True)),
+                runtime_note=body.get("runtime_note"),
             )
         for sid, body in (raw.get("soft_constraints") or {}).items():
             entry = OntologySoftConstraint(

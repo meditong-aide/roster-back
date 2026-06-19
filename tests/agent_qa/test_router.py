@@ -41,7 +41,8 @@ def test_all_tools_covered():
         covered.update(tools)
     # Wave-1 (2026-06-19): query_generation_job + manage_wanted_deadline → 16.
     # Wave-2 (2026-06-19): manage_teams + manage_wanted_limits → 18.
-    assert len(ALL_TOOL_NAMES) == 18
+    # Wave-3 (2026-06-19): resolve_infeasibility → 19.
+    assert len(ALL_TOOL_NAMES) == 19
     missing = set(ALL_TOOL_NAMES) - covered
     assert not missing, f"카테고리 미커버 tool: {missing}"
     # 맵의 tool 이름이 전부 실제 tool 이름인지(오타 방지)

@@ -68,4 +68,5 @@ def _ensure_loaded():
     import agents_v2.skills.manage_wanted_deadline
     import agents_v2.skills.manage_teams
     import agents_v2.skills.manage_wanted_limits
+    import agents_v2.skills.resolve_infeasibility
     _loaded = True

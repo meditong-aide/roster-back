@@ -42,9 +42,16 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     ],
     # 근무표 자동 생성 (생성 vs roster_create 화면 gray → navigate 번들)
     # query_generation_job: '생성 어디까지?' 같은 상태 조회 동반 가능.
-    "generate": ["generate_schedule", "query_generation_job", "navigate", "query_schedule"],
-    # 제약 위반 검증 / 교정 제안
-    "validate_repair": ["validate_schedule", "repair_schedule", "query_schedule"],
+    # resolve_infeasibility: 실패 후 '어떻게 풀어?' 해결 옵션 카탈로그.
+    "generate": [
+        "generate_schedule", "query_generation_job",
+        "resolve_infeasibility", "navigate", "query_schedule",
+    ],
+    # 제약 위반 검증 / 교정 제안 (실패 후 해결 옵션 흐름도 인접 — resolve_infeasibility 번들)
+    "validate_repair": [
+        "validate_schedule", "repair_schedule",
+        "resolve_infeasibility", "query_schedule",
+    ],
     # 분포·공정성·통계 분석
     "analyze": ["analyze_report", "query_schedule"],
     # 대체/교체 간호사 추천
