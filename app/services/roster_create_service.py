@@ -2719,13 +2719,22 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             _default_team_min: dict[str, int] = {"D": 1, "E": 1, "N": 0}
             if _use_mid:
                 _default_team_min["M"] = 0
+            # 멤버가 배정된 팀에만 team_min 적용 — 솔버(team_members)·precheck(members_by_team)와
+            # 동일 기준. 인원 0 팀에 디폴트를 넣으면 precheck 가 TEAM_SIZE_INSUFFICIENT 로 오블로킹.
+            _member_team_ids = {
+                str(getattr(n, "team_id", None))
+                for n in nurses_in_group
+                if getattr(n, "team_id", None) not in (None, "", 0)
+            }
             for t in team_rows:
-                cleaned = {k: v for k, v in _default_team_min.items() if v > 0}
-                if cleaned:
-                    team_min_by_team[str(t.team_id)] = cleaned
+                _tid = str(t.team_id)
+                if _tid in _member_team_ids:
+                    cleaned = {k: v for k, v in _default_team_min.items() if v > 0}
+                    if cleaned:
+                        team_min_by_team[_tid] = cleaned
                 hp = t.handoff_policy if isinstance(t.handoff_policy, dict) else None
                 if hp and isinstance(hp.get("restrictions"), list) and hp["restrictions"]:
-                    team_handoff_policy_by_team[str(t.team_id)] = hp
+                    team_handoff_policy_by_team[_tid] = hp
             if team_min_by_team:
                 config_dict["team_min_by_team"] = team_min_by_team
             if team_handoff_policy_by_team:
@@ -5270,12 +5279,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     .all()
                 )
                 _team_min_by_team: dict[str, dict[str, int]] = {}
-                # teams.min_shift 미사용 — 존재하는 활성 팀에 디폴트 최소(D:1, E:1, N:0[, use_mid면 M:0]).
+                # teams.min_shift 미사용 — 활성 팀 중 '멤버가 배정된 팀'에만 디폴트 최소
+                # (D:1, E:1, N:0[, use_mid면 M:0]). 인원 0 팀은 솔버가 무시하므로 team_min 에서도
+                # 제외(안 그러면 TEAM_SIZE_INSUFFICIENT 로 오블로킹). 멤버십은 솔버와 동일 기준.
                 _use_mid = bool(precheck_config.get("use_mid", False))
                 _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
                 if _use_mid:
                     _default_tm["M"] = 0
+                _member_team_ids = {
+                    str(_n.get("team_id"))
+                    for _n in _nurses_dict_for_precheck
+                    if _n.get("team_id") not in (None, "", 0)
+                }
                 for _t in _team_rows:
+                    if str(_t.team_id) not in _member_team_ids:
+                        continue
                     _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
                     if _cleaned:
                         _team_min_by_team[str(_t.team_id)] = _cleaned
