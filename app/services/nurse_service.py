@@ -1736,9 +1736,16 @@ def update_nurse_profile_service(
                 group_id=assign_row.target_group_id,
                 assign_row=assign_row,
             )
-            # 전환기: inbound 팀은 아직 assignment.target_team_id 로 저장/표시(읽기 period
-            #   이행 전). home(source) 만 period 일원화. inbound→period 는 백필과 함께 다음 단계.
-            _apply_target_update(assign_row, fields)
+            # team SSOT=nurse_team_period: inbound 팀도 period 에 기록(target_team_id 미사용 — 이행 완료).
+            #   team_id 는 _apply_target_update(target_*) 에서 제외하고 set_team_period 로 보낸다.
+            if "team_id" in fields:
+                _persist_team_period_change(
+                    db, nurse_id=nurse_id, group_id=assign_row.target_group_id,
+                    new_team_id=fields["team_id"],
+                )
+            _apply_target_update(
+                assign_row, {k: v for k, v in fields.items() if k != "team_id"}
+            )
             db.commit()
             db.refresh(assign_row)
         else:
@@ -1887,8 +1894,14 @@ def _validate_team_grade_change_or_raise(
     else:
         if assign_row is None:
             return
-        # inbound 팀은 (전환기) assignment.target_team_id 가 권위 — 읽기 period 이행 전.
-        old_team = assign_row.target_team_id
+        # team SSOT=nurse_team_period: inbound 도 변경 전 팀을 period 에서 읽는다(target_team_id 미사용).
+        from datetime import date as _vdate2
+        from services.team_period import resolve_team as _resolve_team2
+        _t2 = _vdate2.today()
+        old_team = _resolve_team2(
+            db, str(nurse.nurse_id), assign_row.target_group_id,
+            _vdate2(_t2.year, _t2.month, 1),
+        )
         old_grade = assign_row.target_grade
     new_team = fields["team_id"] if has_team else old_team
     new_grade = fields["grade"] if has_grade else old_grade

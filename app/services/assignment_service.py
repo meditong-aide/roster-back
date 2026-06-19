@@ -1103,7 +1103,9 @@ def group_members_in_month(
         n = _inbound_nurses.get(nid)
         if n is None:
             continue
-        team = a.target_team_id if a.target_team_id is not None else _resolved_team(nid, n)
+        # team SSOT = nurse_team_period. inbound 도 period 만 본다(target_team_id 미사용 — 팀 이행 완료).
+        # period 가 그 달을 덮으면 그 팀, 없으면 None(미배정). 팀설정 변경이 곧바로 반영된다.
+        team = _resolved_team(nid, n)
         grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
         if a.reason == "파견":
             # 파견(일시·복귀 예정) = 지속 상태 → 기간 내내 '파견' 배지(전이 아님, 마커 없음).

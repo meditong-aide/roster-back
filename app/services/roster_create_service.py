@@ -4403,7 +4403,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _a = _assignment_by_nurse.get(str(n.nurse_id))
             if _a:
                 d = n.__dict__
-                d['team_id'] = _a.target_team_id
+                # team SSOT = nurse_team_period. 아래 resolve_team_for_roster 가 period 로 채운다
+                # (없으면 None=팀 미배정). target_team_id 는 더 이상 team 결정에 쓰지 않는다.
+                d['team_id'] = None
                 d['grade'] = _a.target_grade
                 d['weekly_off_enabled'] = bool(_a.target_weekly_off_enabled or 0)
                 d['weekly_off_type'] = _a.target_weekly_off_type
