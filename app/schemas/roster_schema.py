@@ -464,6 +464,14 @@ class NurseProfile(BaseModel):
     # n_exact=고정(정확값), n_max=최대(상한). 행마다 한쪽만 유효(고정 우선 해석).
     n_exact: Optional[int] = None
     n_max: Optional[int] = None
+    # /members(group_members_in_month) 배지 병합 — year/month 가 함께 주어질 때만 채워진다.
+    # 프론트가 /nurses 한 번으로 명단+월배지를 받도록 nurse_id 기준 부착(없으면 None).
+    membership_status: Optional[str] = None
+    marker: Optional[str] = None
+    badge: Optional[str] = None
+    as_of_team: Optional[int] = None
+    as_of_grade: Optional[int] = None
+    is_night_dedicated: Optional[bool] = None
     emp_num: Optional[str] = None
     # Side-Profile 추가 컬럼
     birth_date: Optional[str] = None
