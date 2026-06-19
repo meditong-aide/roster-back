@@ -785,9 +785,13 @@ SKILL_TOOLS: list[dict] = [
             "사용자 동의를 받고, 동의 시 preview_only=false로 재호출하여 실제 잡 생성.\n\n"
 
             "출력:\n"
-            "- preview: {preview:true, group_id, year, month, config_id, message}\n"
-            "- 실제 등록: 잡 레코드 + _sqs_dispatch_required + _generation_params(year,month,config_id). "
-            "실제 SQS 디스패치는 호출 레이어가 담당.\n\n"
+            "- preview: {preview:true, year, month, message, _internal:{group_id, config_id}}\n"
+            "- 실제 등록: {year, month, status:'queued', message, _internal:{job_id, sqs_dispatch_required, generation_params}}. "
+            "실제 SQS 디스패치는 호출 레이어가 _internal 을 읽어 처리.\n\n"
+
+            "⚠️ **사용자에게 절대 노출 금지**: job_id / sqs / config_id / _internal.* 같은 시스템 식별자. "
+            "사용자 응답은 반드시 message 필드의 자연어만 활용 — '근무표 생성 시작했어요. 완료되면 알려드릴게요.' "
+            "처럼 자연스럽게. ID 나 status 코드(QUEUED/RUNNING)를 한국어 답변에 그대로 넣지 말 것.\n\n"
 
             "🔎 **결과 추적 (FAILED 시)**: 잡이 FAILED 상태면 get_job_status (또는 query_schedule scope='generation_job') "
             "의 결과에 `infeasibility` 필드가 포함됨. 이 필드에는:\n"
@@ -1037,6 +1041,100 @@ SKILL_TOOLS: list[dict] = [
                 },
             },
             "required": ["operation"],
+        },
+    },
+    {
+        "name": "query_generation_job",
+        "description": (
+            "근무표 **자동 생성 작업(job) 의 최신 상태**를 조회합니다 (읽기 전용). "
+            "예: '근무표 생성 어디까지?', '생성 됐어?', '마지막 생성 결과'.\n\n"
+
+            "─────────── 무엇을 다루나 ───────────\n"
+            "- generate_schedule 로 시작한 job 의 status (QUEUED/RUNNING/SUCCESS/FAILED) + progress + 시각\n"
+            "- 그룹 단위로 가장 **최근 1건** 만 반환\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 새 근무표 생성을 **트리거** → generate_schedule.\n"
+            "- 생성된 근무표 **내용 조회** → query_schedule.\n"
+            "- 본 스킬은 'job 진행 상태'에 한정. infeasibility/제약 분석은 validate_schedule.\n\n"
+
+            "─────────── 그라운딩 ───────────\n"
+            "- group_id 는 세션 컨텍스트에서 자동 주입. 사용자가 별도 식별자 입력 불필요.\n\n"
+
+            "─────────── 예시 ───────────\n"
+            "- '근무표 생성 어디까지?' → query_generation_job\n"
+            "- '생성 끝났어?' → query_generation_job\n"
+            "- '마지막 job 상태' → query_generation_job\n"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "office_id": {
+                    "type": "string",
+                    "description": "선택. 그룹 외 추가 스코프 필요 시.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "manage_wanted_deadline",
+        "description": (
+            "원티드(간호사 희망 근무) 요청의 **마감일 변경** 또는 **즉시 마감**. "
+            "예: '7월 원티드 마감일 7월 10일로', '이번 달 원티드 마감해줘'.\n\n"
+
+            "─────────── 무엇을 다루나 ───────────\n"
+            "- 현재 상태/마감일 **조회** (operation='read')\n"
+            "- 마감일 **변경** (operation='set_deadline')\n"
+            "- 즉시 **마감** (operation='close')\n\n"
+
+            "⚠️ 변경/마감은 preview_only=true(기본)로 미리보기 → 사용자 동의 후 적용.\n"
+            "⛔ **수간호사(HN)·관리자(ADM) 전용**. 권한 없는 요청은 거부됩니다.\n"
+            "⛔ 이미 마감(closed)된 원티드는 마감일 변경 불가.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 개별 원티드 항목 승인/거부 → bulk_mutation (scope=wanted).\n"
+            "- 원티드 한도/연간 정책 → update_constraint.\n"
+            "- 원티드 제출 현황 조회 → query_schedule (scope=wanted_submissions).\n"
+            "- 본 스킬은 '마감일/마감 상태'에 한정.\n\n"
+
+            "─────────── 그라운딩 ───────────\n"
+            "- year/month 는 필수. '이번 달'/'다음 달' 은 호출부에서 해석.\n"
+            "- exp_date 는 'YYYY-MM-DD'. None/빈문자열 → '마감일 없음'으로 해석.\n\n"
+
+            "─────────── 예시 ───────────\n"
+            "- '7월 원티드 마감일 7월 10일로' → set_deadline, year=2026, month=7, exp_date='2026-07-10'\n"
+            "- '이번 달 원티드 마감일 없애줘' → set_deadline, exp_date=null\n"
+            "- '7월 원티드 마감해' → close, year=2026, month=7\n"
+            "- '7월 원티드 상태 보여줘' → read, year=2026, month=7\n"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["read", "set_deadline", "close"],
+                    "description": "조회=read, 마감일 변경=set_deadline, 즉시 마감=close.",
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "대상 연도 (예 2026).",
+                },
+                "month": {
+                    "type": "integer",
+                    "description": "대상 월 (1~12).",
+                },
+                "exp_date": {
+                    "type": ["string", "null"],
+                    "description": "set_deadline 시 새 마감일 ('YYYY-MM-DD'). null/빈문자열 = '마감일 없음'.",
+                },
+                "preview_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "true 면 변경 미리보기만(DB 미적용). 사용자 동의 후 false 로 적용.",
+                },
+            },
+            "required": ["operation", "year", "month"],
         },
     },
     {

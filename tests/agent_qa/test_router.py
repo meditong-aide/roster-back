@@ -34,12 +34,13 @@ class _FakeLLM:
 
 # ── coverage ──
 
-def test_all_14_tools_covered():
-    """14개 tool 이 각각 최소 1개 카테고리에 등장."""
+def test_all_tools_covered():
+    """모든 tool 이 각각 최소 1개 카테고리에 등장."""
     covered = set()
     for tools in CATEGORY_TOOLS.values():
         covered.update(tools)
-    assert len(ALL_TOOL_NAMES) == 14
+    # Wave-1 (2026-06-19): query_generation_job + manage_wanted_deadline 추가 → 16.
+    assert len(ALL_TOOL_NAMES) == 16
     missing = set(ALL_TOOL_NAMES) - covered
     assert not missing, f"카테고리 미커버 tool: {missing}"
     # 맵의 tool 이름이 전부 실제 tool 이름인지(오타 방지)

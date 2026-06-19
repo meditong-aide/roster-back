@@ -34,10 +34,11 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     "navigation": ["navigate", "prefill"],
     # 근무표/원티드/간호사/시프트/설정값 조회 (view-vs-derive gray → navigate 번들)
     "read": ["query_schedule", "navigate"],
-    # 근무/원티드 변경
-    "mutate": ["bulk_mutation", "query_schedule"],
+    # 근무/원티드 변경 (manage_wanted_deadline: 마감일 변경 / 즉시 마감)
+    "mutate": ["bulk_mutation", "manage_wanted_deadline", "query_schedule"],
     # 근무표 자동 생성 (생성 vs roster_create 화면 gray → navigate 번들)
-    "generate": ["generate_schedule", "navigate", "query_schedule"],
+    # query_generation_job: '생성 어디까지?' 같은 상태 조회 동반 가능.
+    "generate": ["generate_schedule", "query_generation_job", "navigate", "query_schedule"],
     # 제약 위반 검증 / 교정 제안
     "validate_repair": ["validate_schedule", "repair_schedule", "query_schedule"],
     # 분포·공정성·통계 분석

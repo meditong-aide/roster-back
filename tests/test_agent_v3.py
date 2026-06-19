@@ -330,8 +330,9 @@ class TestConversationStore:
 
 class TestSkillDescriptions:
     def test_count(self):
-        # 12 skills + 2 client-action tools (navigate, prefill)
-        assert len(SKILL_TOOLS) == 14
+        # 12 domain skills + 2 Wave-1 (query_generation_job, manage_wanted_deadline)
+        # + 2 client-action tools (navigate, prefill) = 16.
+        assert len(SKILL_TOOLS) == 16
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:
