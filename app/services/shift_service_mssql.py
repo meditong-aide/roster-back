@@ -2,11 +2,13 @@ from typing import List, Dict, Any
 
 
 import os
+import base64
+import json
 import datetime as _dt
 
 from db.models import Shift, Nurse, Group, Office, ScheduleEntry, ShiftManage
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine, func, or_
 _MSSQL_SESSION_MAKER: sessionmaker | None = None
 
 
@@ -289,6 +291,99 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
         ]
     finally:
         pass
+
+
+# ── 근무코드 목록 cursor 페이징(읽기 전용) ──────────────────────────────────
+# get_shifts_service 와 달리 기본코드/MID 자동생성 등 부수효과 없이 순수 조회만 한다.
+# 정렬은 sequence ASC, id ASC 안정정렬(기본코드는 낮은 sequence 라 자연히 상단).
+# 커서는 마지막 행의 (sequence, id) 를 base64url(json) 으로 인코딩한 불투명 토큰이다.
+def _encode_shift_cursor(sequence: int | None, row_id: int | None) -> str:
+    raw = json.dumps({"sequence": sequence, "id": row_id}, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_shift_cursor(cursor: str | None):
+    """커서 → (sequence, id). 손상/형식오류면 None(=처음부터)."""
+    if not cursor:
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        return (data.get("sequence"), data.get("id"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _shift_row_to_dict(s: Shift) -> Dict[str, Any]:
+    """get_shifts_service 와 동일한 항목 형태(시간은 _to_time_str 문자열)."""
+    return {
+        "shift_id": s.shift_id,
+        "name": s.name,
+        "color": s.color,
+        "start_time": _to_time_str(s.start_time),
+        "end_time": _to_time_str(s.end_time),
+        "type": s.type,
+        "allday": s.allday,
+        "auto_schedule": s.auto_schedule,
+        "duration": s.duration,
+        "sequence": s.sequence,
+        "shift_gb": getattr(s, "shift_gb", None),
+        "default_shift": getattr(s, "default_shift", s.shift_id),
+        "id": getattr(s, "id", None),
+        "show_in_preference": s.show_in_preference,
+        "off_swap_target": bool(getattr(s, "off_swap_target", False)),
+    }
+
+
+def get_shifts_paged_service(
+    current_user,
+    db: Session,
+    group_id: str,
+    cursor: str | None = None,
+    limit: int = 20,
+    q: str | None = None,
+) -> Dict[str, Any]:
+    """근무코드 목록 cursor 페이징(읽기 전용).
+
+    - 정렬: sequence ASC, id ASC(안정정렬). 기본코드는 낮은 sequence 라 자연히 상단.
+    - cursor: 직전 응답 nextCursor 그대로 전달(불투명). 없으면 첫 페이지.
+    - q: shift_id 또는 name 부분일치(대소문자 무시).
+    - 반환: {items, nextCursor, total}. nextCursor=None 이면 마지막 페이지.
+    - get_shifts_service 와 달리 기본코드/MID 자동생성 부수효과 없음.
+    """
+    if not current_user:
+        raise Exception("Not authenticated")
+    limit = max(1, min(int(limit or 20), 100))  # 방어적 클램프 1..100
+    base = db.query(Shift).filter(
+        Shift.office_id == current_user.office_id,
+        Shift.group_id == group_id,
+    )
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        base = base.filter(or_(Shift.shift_id.ilike(like), Shift.name.ilike(like)))
+
+    total = base.count()
+
+    page_q = base.order_by(Shift.sequence.asc(), Shift.id.asc())
+    decoded = _decode_shift_cursor(cursor)
+    if decoded is not None and decoded[0] is not None and decoded[1] is not None:
+        c_seq, c_id = decoded
+        # keyset: (sequence, id) > (c_seq, c_id)
+        page_q = page_q.filter(
+            or_(
+                Shift.sequence > c_seq,
+                (Shift.sequence == c_seq) & (Shift.id > c_id),
+            )
+        )
+    rows = page_q.limit(limit + 1).all()
+
+    has_next = len(rows) > limit
+    page_rows = rows[:limit]
+    items = [_shift_row_to_dict(s) for s in page_rows]
+    next_cursor = None
+    if has_next and page_rows:
+        last = page_rows[-1]
+        next_cursor = _encode_shift_cursor(last.sequence, getattr(last, "id", None))
+    return {"items": items, "nextCursor": next_cursor, "total": int(total)}
 
 
 def add_shift_service(req, current_user, db: Session | None = None):

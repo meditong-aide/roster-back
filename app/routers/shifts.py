@@ -23,7 +23,7 @@ from services.shift_service import (
 from typing import Optional, Any, List
 import os
 import tempfile
-from services.shift_service_mssql import get_shifts_service as get_shifts_service_mssql
+from services.shift_service_mssql import get_shifts_service as get_shifts_service_mssql, get_shifts_paged_service
 from services.group_access import resolve_managed_group_ids
 from datetime import timedelta, datetime
 
@@ -93,6 +93,45 @@ async def get_shifts(
     except Exception as e:
         print(e)
         raise HTTPException(status_code=500, detail=f"시프트 정보 조회 실패: {str(e)}")
+
+
+@router.get("/shifts/paged")
+async def get_shifts_paged(
+    group_id: str,
+    cursor: Optional[str] = None,
+    limit: int = 20,
+    q: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """근무코드 목록 cursor 페이징(읽기 전용) — 기존 /shifts 와 별개의 추가 엔드포인트.
+
+    응답: {"result": {"items": [...], "nextCursor": str|None, "total": int}}.
+    nextCursor 가 None 이면 마지막 페이지. cursor 는 직전 응답값을 그대로 전달한다.
+    정렬은 서버 고정(sequence ASC, id ASC) — 프론트 재정렬 금지.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    allowed = resolve_managed_group_ids(db, current_user)
+    if group_id not in allowed:
+        raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
+    g = db.query(Group).filter(Group.group_id == group_id).first()
+    if not g or g.office_id != current_user.office_id:
+        raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
+    try:
+        page = get_shifts_paged_service(
+            current_user, db, group_id, cursor=cursor, limit=limit, q=q
+        )
+        for item in page["items"]:
+            item["start_time"] = convert_time(item["start_time"])
+            item["end_time"] = convert_time(item["end_time"])
+        return {"result": page}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=f"시프트 페이징 조회 실패: {str(e)}")
+
 
 def _format_time_display(shift):
     """근무 시간 정보를 표시용으로 포맷팅"""
