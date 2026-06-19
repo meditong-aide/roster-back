@@ -1047,13 +1047,13 @@ def group_members_in_month(
             return _coerce_team_int(getattr(n_obj, "team_id", None))
         return None
 
-    def _row(n, status, marker, badge, team, grade):
-        # N전담(허용 shift=N뿐): 'N전담' 배지 + is_night_dedicated 플래그만 부여하고
-        #   as_of_team 은 직접 배정한 팀(period)을 그대로 노출한다. 직접 저장한 팀이 화면에
-        #   안 보이던 문제 해소 — N전담은 시점(period) 모델이 아직 없어 팀까지 가리던 휴리스틱을
-        #   제거(전담의 '시기'는 별도 shift-type period 테이블로 추후 분리). 단 생성기는
-        #   여전히 N전담을 팀 D/E 커버리지에서 제외(roster_create_service)한다.
-        night_dedicated = is_n_only_profile(getattr(n, "is_night_nurse", None))
+    def _row(n, status, marker, badge, team, grade, night_profile=...):
+        # N전담(허용 shift=N뿐) 판정 → 'N전담' 배지 + is_night_dedicated.
+        # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.is_night_nurse 가
+        #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
+        #   night_profile 미지정(home) 은 base 사용. (생성기는 N전담을 팀 D/E 커버리지에서 제외.)
+        _np = getattr(n, "is_night_nurse", None) if night_profile is ... else night_profile
+        night_dedicated = is_n_only_profile(_np)
         if night_dedicated and badge is None:
             badge = "N전담"
         return {
@@ -1107,16 +1107,18 @@ def group_members_in_month(
         # period 가 그 달을 덮으면 그 팀, 없으면 None(미배정). 팀설정 변경이 곧바로 반영된다.
         team = _resolved_team(nid, n)
         grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
+        # 파견지 유효 근무형태(target_shift_types) — N전담 배지 판정용. []=전체(비N전담), 엔진/`/nurses`와 동일.
+        _np = a.target_shift_types or []
         if a.reason == "파견":
             # 파견(일시·복귀 예정) = 지속 상태 → 기간 내내 '파견' 배지(전이 아님, 마커 없음).
-            members.append(_row(n, "inbound", None, "파견", team, grade))
+            members.append(_row(n, "inbound", None, "파견", team, grade, night_profile=_np))
         elif a.start_date is not None and month_start <= a.start_date <= month_end:
             # 병동이동 = 일회성 전이 → 이동月(start ∈ 그 달)에만 전입(→).
-            members.append(_row(n, "inbound", "→", None, team, grade))
+            members.append(_row(n, "inbound", "→", None, team, grade, night_profile=_np))
         else:
             # 이미 이동 완료(지난 달 발효) → 정착 일반 멤버(마커 없음).
             #   캐시(nurses.group_id) flush 전이어도 그 병동 소속이므로 명단엔 포함한다.
-            members.append(_row(n, "active", None, None, team, grade))
+            members.append(_row(n, "active", None, None, team, grade, night_profile=_np))
 
     headcount = {
         "regular": sum(1 for m in members if m["membership_status"] == "active"),
