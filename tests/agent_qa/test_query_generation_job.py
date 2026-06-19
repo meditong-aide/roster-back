@@ -60,6 +60,98 @@ def test_returns_job_status_when_present(db, seed_data):
     assert "message" in res and "%" in res["message"] and "42" in res["message"]
 
 
+def test_failed_job_with_json_payload_attaches_ontology(db, seed_data):
+    """worker.py 가 저장하는 JSON unrecoverable payload → query_generation_job 응답에
+    1) 한국어 narrative (message)
+    2) _internal.failure_ontology (reason_code → Constraint 매핑)
+    가 잘 흘러나오는지 가드.
+    """
+    import json
+    from db.models import RosterJob
+    from agents_v2.skills.registry import run_skill
+
+    payload = {
+        "infeasibility": {
+            "severity": "hard",
+            "causes": [
+                {"reason_code": "TEAM_MIN_EXCEEDS_GLOBAL_NEED", "node_id": "A팀"},
+            ],
+            "resolution_narrative": {
+                "summary_ko": "A팀 최소 인원이 전체 수요를 초과합니다.",
+                "problem_list": [
+                    {"rendered_ko": "A팀 최소 2명 × 5일 = 10명 필요"},
+                ],
+                "action_levers": [
+                    {"rationale_ko": "A팀 최소 인원을 1명으로 낮추기"},
+                ],
+                "trade_offs": [],
+            },
+            "hard_case": {"is_hard": False},
+        }
+    }
+    job = RosterJob(
+        job_id="job-fail-json",
+        office_id=seed_data["office_id"],
+        group_id=seed_data["group_id"],
+        nurse_id="N001",
+        status="FAILED",
+        progress=100,
+        error_message=json.dumps(payload, ensure_ascii=False),
+    )
+    db.add(job)
+    db.flush()
+
+    res = run_skill(db, "query-generation-job", {"group_id": seed_data["group_id"]})
+    assert res["status"] == "FAILED"
+
+    # 1) narrative 가 메시지에 반영됨 (raw enum 미노출).
+    msg = res["message"]
+    assert "근무표 생성이 실패" in msg
+    assert "TEAM_MIN_EXCEEDS_GLOBAL_NEED" not in msg  # raw 코드 누출 금지
+
+    # 2) infeasibility narrative dict 가 노출됨.
+    assert "infeasibility" in res
+    assert res["infeasibility"]["severity"] == "hard"
+
+    # 3) ontology 부착이 _internal 에 격리됨.
+    ont = res["_internal"]["failure_ontology"]
+    assert ont["reason_code"] == "TEAM_MIN_EXCEEDS_GLOBAL_NEED"
+    assert ont["severity"] == "hard"
+    assert ont["ontology"]["constraint_id"] == "TeamMin"
+    assert ont["ontology"]["mode"] == "precheck_blocked"
+
+    # 4) raw debug_payload 도 _internal 격리.
+    assert "debug_payload" in res["_internal"]
+    assert "debug_payload" not in res  # top-level 금지
+
+
+def test_failed_job_with_plain_string_does_not_attach_ontology(db, seed_data):
+    """error_message 가 JSON 아닌 단순 문자열이면 ontology 부착 없이도 안전 fallback."""
+    from db.models import RosterJob
+    from agents_v2.skills.registry import run_skill
+
+    job = RosterJob(
+        job_id="job-fail-plain",
+        office_id=seed_data["office_id"],
+        group_id=seed_data["group_id"],
+        nurse_id="N001",
+        status="FAILED",
+        progress=100,
+        error_message="DB connection lost",
+    )
+    db.add(job)
+    db.flush()
+
+    res = run_skill(db, "query-generation-job", {"group_id": seed_data["group_id"]})
+    assert res["status"] == "FAILED"
+    # narrative 없음 → fallback 문구.
+    assert "사유 메시지를 확인" in res["message"]
+    # ontology 부착 없음.
+    assert "failure_ontology" not in res["_internal"]
+    assert "debug_payload" not in res["_internal"]
+    assert "infeasibility" not in res
+
+
 @pytest.mark.parametrize(
     "raw_status,expected_human",
     [
