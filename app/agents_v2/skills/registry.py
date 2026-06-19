@@ -66,4 +66,6 @@ def _ensure_loaded():
     import agents_v2.skills.manage_team_min
     import agents_v2.skills.query_generation_job
     import agents_v2.skills.manage_wanted_deadline
+    import agents_v2.skills.manage_teams
+    import agents_v2.skills.manage_wanted_limits
     _loaded = True

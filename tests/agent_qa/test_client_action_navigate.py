@@ -130,6 +130,17 @@ def test_query_team_setting(db):
     assert res.ui_actions == [{"action": "navigate", "target": "nurse_management", "sub": "team_setting"}]
 
 
+# [NAV_FIRST_TEAMS 2026-06-19] 조건 없는 팀 목록 발화는 nav 으로 빠지는 carve 가드.
+def test_team_list_query_routes_to_team_setting(db):
+    res = _nav_session(db, target="nurse_management", sub="team_setting").send("팀 목록 보여줘")
+    assert res.ui_actions == [{"action": "navigate", "target": "nurse_management", "sub": "team_setting"}]
+
+
+def test_team_state_query_routes_to_team_setting(db):
+    res = _nav_session(db, target="nurse_management", sub="team_setting").send("우리 병동 팀 어떻게 돼있어?")
+    assert res.ui_actions == [{"action": "navigate", "target": "nurse_management", "sub": "team_setting"}]
+
+
 def test_query_grade_setting(db):
     res = _nav_session(db, target="nurse_management", sub="grade_setting").send("등급 설정 화면 띄워줘")
     assert res.ui_actions == [{"action": "navigate", "target": "nurse_management", "sub": "grade_setting"}]

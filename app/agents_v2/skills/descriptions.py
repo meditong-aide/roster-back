@@ -1138,6 +1138,126 @@ SKILL_TOOLS: list[dict] = [
         },
     },
     {
+        "name": "manage_teams",
+        "description": (
+            "**팀 자체의 라이프사이클** (추가·이름변경·삭제·단일 조회) 을 다룹니다. "
+            "예: 'A팀 추가', 'B팀 이름을 신생아실로', 'C팀 삭제', 'A팀 멤버 누구야?'.\n\n"
+
+            "─────────── 무엇을 다루나 ───────────\n"
+            "- 팀 목록 + 멤버 **조회** (operation='read')\n"
+            "- 새 팀 **추가** (operation='add', team_name)\n"
+            "- 팀 이름 **변경** (operation='rename', team_name → new_name)\n"
+            "- 팀 **삭제** (operation='delete', team_name)\n\n"
+
+            "⚠️ 변경(add/rename/delete)은 preview_only=true(기본)로 미리보기 → 사용자 동의 후 적용.\n"
+            "⛔ **수간호사(HN)·관리자(ADM) 전용** mutation. 권한 없는 요청은 거부됩니다.\n"
+            "⛔ 사용자에게 internal team_id 노출 금지. 항상 team_name 으로 말하세요.\n\n"
+
+            # [NAV_FIRST_TEAMS 2026-06-19] 조건 없는 목록은 navigate 가 우선. 원복 시 이 줄 제거.
+            "─────────── nav-first carve ───────────\n"
+            "- 무필터 목록 요청('팀 목록 보여줘', '우리 병동 팀 어떻게 돼있어?')은 **navigate(nurse_management/team_setting)** 가 우선. "
+            "본 스킬은 단일 팀 조회('A팀 멤버 누구야?')·mutation(추가/이름변경/삭제)에 사용하세요.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 팀별 **최소 인원** ('A팀 나이트 최소 2명') → manage_team_min.\n"
+            "- 간호사를 어느 팀에 **배정/이동** → update_person_attr (team_id 변경).\n"
+            "- 등급별 인원 → manage_grade.\n"
+            "- 팀 자동 분배·재분배 (수십명 대상 일괄) → UI 흐름 유지 권장(향후 별도 스킬).\n"
+            "- 본 스킬은 '팀 자체의 라이프사이클'에 한정.\n\n"
+
+            "─────────── 그라운딩 ───────────\n"
+            "- team_name 은 사용자가 말한 그대로 ('A팀','1팀','신생아실'). 스킬이 내부에서 매칭.\n"
+            "- 못 찾으면 needs_clarification 으로 팀 목록 제시.\n\n"
+
+            "─────────── 예시 ───────────\n"
+            "- 'A팀 멤버 누구야?' → read (단일 팀 확인)\n"
+            "- '신생아실 팀 추가해' → add, team_name='신생아실'\n"
+            "- 'A팀 이름을 응급실로 바꿔줘' → rename, team_name='A팀', new_name='응급실'\n"
+            "- 'C팀 없애줘' → delete, team_name='C팀'\n"
+            # [NAV_FIRST_TEAMS 2026-06-19]
+            "- (참고) '팀 목록 보여줘' 같은 무필터 목록은 본 스킬이 아니라 navigate 가 처리.\n"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["read", "add", "rename", "delete"],
+                    "description": "조회=read, 추가=add, 이름변경=rename, 삭제=delete.",
+                },
+                "team_name": {
+                    "type": "string",
+                    "description": "대상 팀 이름 (add 에선 새 이름, rename/delete 에선 기존 이름).",
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "rename 시 새 이름.",
+                },
+                "preview_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "true 면 변경 미리보기만(DB 미적용). 사용자 동의 후 false 로 적용.",
+                },
+            },
+            "required": ["operation"],
+        },
+    },
+    {
+        "name": "manage_wanted_limits",
+        "description": (
+            "원티드(간호사 희망 근무) **한도 초과** 처리. "
+            "예: '원티드 한도 넘은 사람 누구야?', '박지은 원티드 초과분 정리해줘'.\n\n"
+
+            "─────────── 무엇을 다루나 ───────────\n"
+            "- 한도 초과자 **목록** 조회 (operation='list_over_limit')\n"
+            "- 특정 간호사의 초과분 OFF **삭제** (operation='delete_excess_off', preview/apply)\n\n"
+
+            "⚠️ delete_excess_off 는 preview_only=true(기본)로 미리보기 → 사용자 동의 후 적용.\n"
+            "⛔ **수간호사(HN)·관리자(ADM) 전용** mutation. 권한 없는 요청은 거부됩니다.\n"
+            "⛔ 사용자에게 internal nurse_id 노출 금지. 이름으로 말하세요.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 원티드 마감일 변경/즉시 마감 → manage_wanted_deadline.\n"
+            "- 원티드 한도(개인별 wanted_max_requests) **정책 자체** 변경 → update_person_attr.\n"
+            "- 원티드 제출 현황 조회 → query_schedule (scope=wanted_submissions).\n"
+            "- 본 스킬은 '한도 초과 → 정리'에 한정.\n\n"
+
+            "─────────── 그라운딩 ───────────\n"
+            "- year/month 는 필수. '이번 달'/'다음 달' 은 호출부에서 해석.\n"
+            "- nurse_id 가 필요한 경우 사용자 이름은 query_schedule(scope=nurses) 로 먼저 매핑.\n\n"
+
+            "─────────── 예시 ───────────\n"
+            "- '7월 원티드 한도 넘은 사람' → list_over_limit, year=2026, month=7\n"
+            "- '박지은 7월 원티드 초과분 정리' → delete_excess_off, nurse_id=...,  preview→confirm\n"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["list_over_limit", "delete_excess_off"],
+                    "description": "목록=list_over_limit, 정리=delete_excess_off.",
+                },
+                "year": {"type": "integer", "description": "대상 연도."},
+                "month": {"type": "integer", "description": "대상 월 (1~12)."},
+                "nurse_id": {
+                    "type": "string",
+                    "description": "delete_excess_off 시 대상 간호사 식별자.",
+                },
+                "nurse_name": {
+                    "type": "string",
+                    "description": "delete_excess_off — UI 응답용 라벨 (없으면 nurse_id 노출).",
+                },
+                "preview_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "true 면 변경 미리보기만(DB 미적용). 사용자 동의 후 false 로 적용.",
+                },
+            },
+            "required": ["operation", "year", "month"],
+        },
+    },
+    {
         "name": "navigate",
         "description": (
             "사용자를 특정 **화면/섹션으로 이동**시킵니다 (프론트 화면 전환). "
@@ -1176,6 +1296,8 @@ SKILL_TOOLS: list[dict] = [
             "- `mypage` — 마이페이지 / `support` — 고객센터\n\n"
 
             "예) '팀 어디서 바꿔?' → target=nurse_management, sub=team_setting\n"
+            # [NAV_FIRST_TEAMS 2026-06-19] 무필터 목록도 화면 이동 의도로 본다. 원복 시 이 줄 제거.
+            "예) '팀 목록 보여줘' / '우리 병동 팀 어떻게 돼있어?' → target=nurse_management, sub=team_setting\n"
             "예) '등급 설정 화면 띄워줘' → target=nurse_management, sub=grade_setting\n"
             "예) '원티드 보러 가자' → target=wanted\n"
             # [NAV_FIRST 2026-05-29] 아래 roster_view 예시 추가. 원복 시 이 줄 제거.

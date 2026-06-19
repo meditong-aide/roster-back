@@ -256,6 +256,8 @@ _MUTATION_SKILLS = frozenset({
     "manage_grade",
     "manage_team_min",
     "manage_wanted_deadline",
+    "manage_teams",
+    "manage_wanted_limits",
 })
 
 _SELF_REFERENCE_ALIASES = ("나", "내", "제", "본인")
