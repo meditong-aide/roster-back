@@ -177,7 +177,15 @@ EUN_DB_NAME = os.getenv("EUN_DB_NAME")
 
 DATABASE_URL = f"mssql+pymssql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{EUN_DB_NAME}"
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=1800)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    # 원격 DB(49.50.163.159) 콜드커넥트 ~276ms(로그인 핸드셰이크) 회피 — warm 연결을
+    # 더 많이 유지해 동시 요청이 재로그인 대신 재사용하도록 풀 확대(env 로 조정).
+    pool_size=int(os.getenv("DB_POOL_SIZE", "20")),
+    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "30")),
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

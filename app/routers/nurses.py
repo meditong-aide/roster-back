@@ -335,12 +335,6 @@ async def get_nurses_in_group(
     flush_expired_dispatches(db)
     # 휴직 만료 레이지 체크 (status change only, 안전 작업)
     flush_expired_leaves(db)
-    print(
-        "current_user",
-        current_user.nurse_id,
-        current_user.group_id,
-        current_user.office_id,
-    )
     try:
         # ADM: 필터링 옵션 자유. HN: resolve_managed_group_ids 안의 그룹만 query 허용.
         if current_user.is_master_admin:
@@ -350,6 +344,8 @@ async def get_nurses_in_group(
                 office_id=office_id,
                 group_id=group_id,
                 nurse_id=nurse_id,  # nurse_id 전달
+                year=year,    # year/month 동반 시 /members 월배지 병합(group_id 필터 있을 때만)
+                month=month,
             )
         else:
             # HN/수간호사/일반: query group_id 있으면 권한 검증 후 override, 없으면 토큰 group_id
@@ -366,6 +362,8 @@ async def get_nurses_in_group(
                 db,
                 nurse_id=nurse_id,  # nurse_id 전달
                 view_group_id=_group,
+                year=year,    # year/month 동반 시 /members 월배지 병합(_group 기준)
+                month=month,
             )
         # 근무자관리에서 year/month 가 함께 오면 nurse_monthly_limits 의 n_exact 를 주입.
         # view_group_id=_group(조회 중인 병동) 기준으로만 주입해 파견 inbound 간호사가

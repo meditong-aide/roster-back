@@ -36,9 +36,6 @@ def get_grade_config(
     db: Session = Depends(get_db),
 ):
     """그룹의 Grade 설정을 조회합니다."""
-
-    print('[DEBUG] [grade.py - get_grade_config] group_id', group_id)
-    print('[DEBUG] [grade.py - get_grade_config] current_user', current_user)
     try:
         target_group_id, _ = _resolve_group_and_office(db, current_user, group_id)
         return get_grade_config_service(db, target_group_id)

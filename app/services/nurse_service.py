@@ -16,7 +16,7 @@ from db.models import (
     RosterConfig as RosterConfigModel,
     Shift,
 )
-from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP
+from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP, group_members_in_month
 from services.group_access import resolve_managed_group_ids, caller_is_head_nurse, resolve_home_group_id, caller_is_hn
 from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
@@ -208,10 +208,61 @@ def _load_preceptees_map(db: Session, nurses) -> Dict[str, List[Dict[str, Any]]]
     return out
 
 
+# /members(group_members_in_month) 로 부착하는 월배지 6필드.
+# NurseProfile 의 Optional 키와 1:1 대응(없으면 None 유지).
+_MEMBER_BADGE_FIELDS: Tuple[str, ...] = (
+    "membership_status",
+    "marker",
+    "badge",
+    "as_of_team",
+    "as_of_grade",
+    "is_night_dedicated",
+)
+
+
+def attach_member_badges_to_nurses(
+    db: Session,
+    nurses: list,
+    group_id: Optional[str],
+    year: Optional[int],
+    month: Optional[int],
+    nurse_pool: Optional[dict] = None,
+) -> list:
+    """get-nurse 응답에 /members(group_members_in_month) 월배지 6필드를 nurse_id 기준 병합.
+
+    프론트가 /nurses 한 번으로 명단 + 월 소속/배지를 받도록, 기존 /members 가 주던
+    membership_status/marker/badge/as_of_team/as_of_grade/is_night_dedicated 를 부착한다.
+
+    - year/month 가 모두 주어졌을 때만 동작(없으면 그대로 반환 — 6필드 None 유지).
+    - group_id 는 호출 서비스가 이미 nurse 조회에 쓴 그 그룹(caller/effective). 권한 재해석 안 함.
+      group_id 가 없으면(ADM office-wide 등) members 는 그룹단위라 병합 스킵.
+    - group_members_in_month 내부 로직/반환은 그대로 재사용(member dict 의 키와 동일).
+      그 명단에 없는 nurse(전출 완료 등)는 6필드 미설정(None 유지).
+    - nurse_pool: 호출자가 이미 로드한 {nurse_id(str)→NurseModel}. group_members_in_month
+      가 home·inbound 를 재쿼리하지 않고 이 풀을 재사용하도록 전달(중복 쿼리 제거).
+      None 이면 group_members_in_month 가 기존대로 DB 조회(출력 동일).
+    """
+    if not nurses or year is None or month is None or not group_id:
+        return nurses
+    result = group_members_in_month(db, group_id, int(year), int(month), nurse_pool=nurse_pool)
+    member_by_id = {str(m["nurse_id"]): m for m in result.get("members", [])}
+    for n in nurses:
+        if not isinstance(n, dict):
+            continue
+        member = member_by_id.get(str(n.get("nurse_id")))
+        if member is None:
+            continue
+        for key in _MEMBER_BADGE_FIELDS:
+            n[key] = member.get(key)
+    return nurses
+
+
 def get_nurses_in_group_service(
     current_user, db: Session, nurse_id: Optional[str] = None,
     skip_group_filter: bool = False,
     view_group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
 ):
     """
     그룹 내 간호사 목록 조회 서비스 함수
@@ -375,6 +426,13 @@ def get_nurses_in_group_service(
             nurse_dict["current_assignment"] = None
         result.append(nurse_dict)
 
+    # /members 월배지 병합(year/month 동반 시). 그룹 = 이미 nurse 조회에 쓴 _gid.
+    # [Perf] main 쿼리로 이미 로드한 raw NurseModel 을 nurse_pool 로 넘겨
+    #   group_members_in_month 의 home·inbound 재쿼리(~2쿼리)를 제거한다.
+    #   이 쿼리 집합 ⊇ home+inbound(/nurses ⊇ /members), 누락 inbound 는 폴백 쿼리로 보존.
+    _nurse_pool = {str(n.nurse_id): n for n in nurses}
+    attach_member_badges_to_nurses(db, result, _gid, year, month, nurse_pool=_nurse_pool)
+
     return result
 
 
@@ -437,6 +495,8 @@ def get_nurses_filtered_service(
     office_id: Optional[str] = None,
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
 ):
     """ADM 전용 필터 조회: office_id, group_id, nurse_id 기준으로 간호사 목록 조회"""
     if not current_user:
@@ -553,6 +613,9 @@ def get_nurses_filtered_service(
             **display_flags,
         }
         result.append(nurse_dict)
+
+    # /members 월배지 병합 — ADM 은 group_id 필터가 있을 때만(office-wide 조회는 그룹단위라 스킵).
+    attach_member_badges_to_nurses(db, result, group_id, year, month)
 
     return result
 

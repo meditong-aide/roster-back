@@ -969,6 +969,7 @@ def group_members_in_month(
     group_id: str,
     year: int,
     month: int,
+    nurse_pool: Optional[dict] = None,
 ) -> dict:
     """선택 월 '소속' 명단 + 상태 플래그 (근무자관리 월 셀렉터용, Phase 4).
 
@@ -987,6 +988,11 @@ def group_members_in_month(
 
     Returns: {"members":[...], "headcount":{"regular","moving","leave"}}
     참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §3 정책 매트릭스.
+
+    nurse_pool: {nurse_id(str) → NurseModel}. 호출자(get_nurses_in_group_service)가 이미
+      로드한 nurse 객체를 재사용해 중복 쿼리(home·inbound 조회)를 제거하기 위한 optional 입력.
+      None(standalone /members 등)이면 기존과 100% 동일하게 DB 에서 조회한다.
+      배지/membership/as_of_team/headcount 계산은 NurseModel 의 '출처'만 바뀔 뿐 로직 무변경.
     """
     from calendar import monthrange
     from sqlalchemy import or_
@@ -1011,11 +1017,21 @@ def group_members_in_month(
         elif a.reason in ("휴직", "퇴사") and a.source_group_id == group_id:
             leave[nid] = a
 
-    home = (
-        db.query(NurseModel)
-        .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
-        .all()
-    )
+    if nurse_pool is not None:
+        # 호출자가 이미 로드한 nurse 재사용 → home 조회 쿼리 제거.
+        #   SQL(group_id==group_id AND active==1) 과 동치인 in-memory 필터.
+        home = [
+            n
+            for n in nurse_pool.values()
+            if str(getattr(n, "group_id", "") or "").strip() == str(group_id or "").strip()
+            and getattr(n, "active", None) == 1
+        ]
+    else:
+        home = (
+            db.query(NurseModel)
+            .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
+            .all()
+        )
 
     # [Perf] resolve_team N+1 제거: nurse_team_period 를 그룹 단위로 1번에 배치 로드.
     #   month_start 를 덮는 구간만, valid_from desc 첫 행 = get_team_period_on 과 동일.
@@ -1094,6 +1110,13 @@ def group_members_in_month(
     # [Perf] inbound 도 nurse_id IN 배치 1쿼리 (간호사별 NurseModel 재조회 제거)
     _inbound_ids = [nid for nid in inbound if nid not in seen]
     _inbound_nurses: dict[str, NurseModel] = {}
+    if _inbound_ids and nurse_pool is not None:
+        # 호출자 풀에 이미 있는 inbound 은 재사용. 풀에 없는 id 만 폴백 쿼리.
+        for nid in _inbound_ids:
+            _pooled = nurse_pool.get(nid)
+            if _pooled is not None:
+                _inbound_nurses[nid] = _pooled
+        _inbound_ids = [nid for nid in _inbound_ids if nid not in _inbound_nurses]
     if _inbound_ids:
         for _n in db.query(NurseModel).filter(NurseModel.nurse_id.in_(_inbound_ids)):
             _inbound_nurses[str(_n.nurse_id)] = _n
