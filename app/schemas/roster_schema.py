@@ -434,6 +434,27 @@ class PreceptorPeer(BaseModel):
     assignment: Optional[PreceptorPeerAssignment] = None
 
 
+class NurseMembership(BaseModel):
+    """근무자관리 표시용 월 기준 소속/배지 묶음(nested).
+
+    기존 /nurses/members(group_members_in_month)가 주던 월 소속 정보를 nurse row 안에
+    nested 로 제공해, 프론트가 /nurses 한 번으로 명단+월소속을 받아 memberStatusMap/
+    synthInbound 합성 없이 렌더하도록 한다. 월 명단에 없는 nurse(전출 완료 등)는 membership=None.
+    """
+    status: Optional[str] = Field(
+        default=None,
+        description="월 기준 소속 상태: active/inbound/outbound/dispatch_out/leave/resigned",
+    )
+    marker: Optional[str] = Field(default=None, description="방향 마커(전입 →, 전출 ← 등)")
+    badge: Optional[str] = Field(default=None, description="표시 배지(병동이동/파견 중/휴직/N전담 등)")
+    as_of_team: Optional[int] = Field(default=None, description="해당 월 기준 소속 팀(nurse_team_period)")
+    as_of_grade: Optional[int] = Field(default=None, description="해당 월 기준 직급")
+    is_night_dedicated: Optional[bool] = Field(default=None, description="N전담 여부")
+    display_group_id: Optional[str] = Field(
+        default=None, description="이 membership 이 표시되는 기준 그룹(선택/조회 그룹)"
+    )
+
+
 class NurseProfile(BaseModel):
     office_id: str
     # EmpAuthGbn: Optional[str] = None
@@ -472,6 +493,8 @@ class NurseProfile(BaseModel):
     as_of_team: Optional[int] = None
     as_of_grade: Optional[int] = None
     is_night_dedicated: Optional[bool] = None
+    # 위 flat 6필드를 묶은 nested 표현(프론트 단일 소스용). flat 은 전환기 호환 유지.
+    membership: Optional[NurseMembership] = None
     emp_num: Optional[str] = None
     # Side-Profile 추가 컬럼
     birth_date: Optional[str] = None

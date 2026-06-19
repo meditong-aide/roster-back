@@ -254,6 +254,17 @@ def attach_member_badges_to_nurses(
             continue
         for key in _MEMBER_BADGE_FIELDS:
             n[key] = member.get(key)
+        # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
+        # display_group_id = 이 membership 이 표시되는 기준 그룹(조회/선택 그룹).
+        n["membership"] = {
+            "status": member.get("membership_status"),
+            "marker": member.get("marker"),
+            "badge": member.get("badge"),
+            "as_of_team": member.get("as_of_team"),
+            "as_of_grade": member.get("as_of_grade"),
+            "is_night_dedicated": member.get("is_night_dedicated"),
+            "display_group_id": group_id,
+        }
     return nurses
 
 
