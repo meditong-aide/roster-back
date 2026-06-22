@@ -8,7 +8,7 @@ import datetime as _dt
 
 from db.models import Shift, Nurse, Group, Office, ScheduleEntry, ShiftManage
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy import create_engine, func, or_
+from sqlalchemy import create_engine, func, or_, and_, case
 _MSSQL_SESSION_MAKER: sessionmaker | None = None
 
 
@@ -295,20 +295,20 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
 
 # ── 근무코드 목록 cursor 페이징(읽기 전용) ──────────────────────────────────
 # get_shifts_service 와 달리 기본코드/MID 자동생성 등 부수효과 없이 순수 조회만 한다.
-# 정렬은 sequence ASC, id ASC 안정정렬(기본코드는 낮은 sequence 라 자연히 상단).
-# 커서는 마지막 행의 (sequence, id) 를 base64url(json) 으로 인코딩한 불투명 토큰이다.
-def _encode_shift_cursor(sequence: int | None, row_id: int | None) -> str:
-    raw = json.dumps({"sequence": sequence, "id": row_id}, separators=(",", ":")).encode("utf-8")
+# 정렬은 기본코드 상단고정(default_rank) → sequence ASC → id ASC 안정정렬.
+# 커서는 마지막 행의 (default_rank, sequence, id) 를 base64url(json) 으로 인코딩한 불투명 토큰이다.
+def _encode_shift_cursor(rank: int, sequence: int | None, row_id: int | None) -> str:
+    raw = json.dumps({"d": rank, "sequence": sequence, "id": row_id}, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
 def _decode_shift_cursor(cursor: str | None):
-    """커서 → (sequence, id). 손상/형식오류면 None(=처음부터)."""
+    """커서 → (default_rank, sequence, id). 손상/형식오류면 None(=처음부터)."""
     if not cursor:
         return None
     try:
         data = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
-        return (data.get("sequence"), data.get("id"))
+        return (data.get("d"), data.get("sequence"), data.get("id"))
     except (ValueError, TypeError):
         return None
 
@@ -344,7 +344,7 @@ def get_shifts_paged_service(
 ) -> Dict[str, Any]:
     """근무코드 목록 cursor 페이징(읽기 전용).
 
-    - 정렬: sequence ASC, id ASC(안정정렬). 기본코드는 낮은 sequence 라 자연히 상단.
+    - 정렬: 기본코드 상단고정(default_rank) → sequence ASC → id ASC(안정정렬).
     - cursor: 직전 응답 nextCursor 그대로 전달(불투명). 없으면 첫 페이지.
     - q: shift_id 또는 name 부분일치(대소문자 무시).
     - 반환: {items, nextCursor, total}. nextCursor=None 이면 마지막 페이지.
@@ -363,15 +363,19 @@ def get_shifts_paged_service(
 
     total = base.count()
 
-    page_q = base.order_by(Shift.sequence.asc(), Shift.id.asc())
+    # 기본코드(default_shift NOT NULL) 상단고정 → default_rank ASC, sequence ASC, id ASC.
+    #   일부 그룹은 기본코드 sequence 가 일반코드보다 커서 sequence 만으론 밀리므로 rank 를 1순위로 둔다.
+    _default_rank = case((Shift.default_shift.is_(None), 1), else_=0)
+    page_q = base.order_by(_default_rank.asc(), Shift.sequence.asc(), Shift.id.asc())
     decoded = _decode_shift_cursor(cursor)
-    if decoded is not None and decoded[0] is not None and decoded[1] is not None:
-        c_seq, c_id = decoded
-        # keyset: (sequence, id) > (c_seq, c_id)
+    if decoded is not None and all(v is not None for v in decoded):
+        c_d, c_seq, c_id = decoded
+        # keyset: (default_rank, sequence, id) > (c_d, c_seq, c_id)
         page_q = page_q.filter(
             or_(
-                Shift.sequence > c_seq,
-                (Shift.sequence == c_seq) & (Shift.id > c_id),
+                _default_rank > c_d,
+                and_(_default_rank == c_d, Shift.sequence > c_seq),
+                and_(_default_rank == c_d, Shift.sequence == c_seq, Shift.id > c_id),
             )
         )
     rows = page_q.limit(limit + 1).all()
@@ -382,7 +386,8 @@ def get_shifts_paged_service(
     next_cursor = None
     if has_next and page_rows:
         last = page_rows[-1]
-        next_cursor = _encode_shift_cursor(last.sequence, getattr(last, "id", None))
+        last_rank = 0 if getattr(last, "default_shift", None) is not None else 1
+        next_cursor = _encode_shift_cursor(last_rank, last.sequence, getattr(last, "id", None))
     return {"items": items, "nextCursor": next_cursor, "total": int(total)}
 
 
