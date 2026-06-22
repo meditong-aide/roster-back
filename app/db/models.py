@@ -224,6 +224,61 @@ class NurseMonthlyLimit(Base):
     )
 
 
+class EffectiveDatedPeriodMixin:
+    """시점 속성(effective-dated) 공통 컬럼.
+
+    규칙: `[valid_from, valid_to)` 반열림 · 겹침 금지 · gap(미지정) 허용 ·
+    변경=close-before-open(옛 구간 valid_to 닫고 새 구간 open, 삭제 금지).
+    진실=이 테이블, `nurses` 캐시 컬럼=단방향 투영(앱 직접쓰기 금지).
+    설계: docs/NURSE_ATTRIBUTE_PERIOD_DESIGN.md.
+    """
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    valid_from = Column(DATE, nullable=False)
+    valid_to = Column(DATE, nullable=True)            # null = 열린(계속) 구간
+    source = Column(VARCHAR(20), nullable=False, default="edited")  # inherited|edited|redistribute
+    note = Column(TEXT, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+
+class NurseGradePeriod(Base, EffectiveDatedPeriodMixin):
+    """grade 시점 구간 (병동귀속). 해석 스케일=roster_grade_config."""
+
+    __tablename__ = "nurse_grade_period"
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    grade = Column(INTEGER, nullable=True)
+    __table_args__ = (
+        Index("ix_ngp_nurse", "nurse_id", "valid_from"),
+        Index("ix_ngp_group", "group_id", "valid_from"),
+    )
+
+
+class NurseAllowedShiftPeriod(Base, EffectiveDatedPeriodMixin):
+    """허용 근무형(전담 포함) 시점 구간 (간호사귀속). ["D"]/["D","E"]/["N"]."""
+
+    __tablename__ = "nurse_allowed_shift_period"
+    allowed_shifts = Column(JSON, nullable=False)
+    __table_args__ = (Index("ix_nasp_nurse", "nurse_id", "valid_from"),)
+
+
+class NurseWeekendOffPeriod(Base, EffectiveDatedPeriodMixin):
+    """주말휴무 시점 구간 (간호사귀속)."""
+
+    __tablename__ = "nurse_weekendoff_period"
+    weekend_off = Column(TINYINT, nullable=True)
+    __table_args__ = (Index("ix_nwop_nurse", "nurse_id", "valid_from"),)
+
+
+class NurseFixedShiftPeriod(Base, EffectiveDatedPeriodMixin):
+    """고정 근무형 시점 구간 (간호사귀속). shifts.shift_id 코드."""
+
+    __tablename__ = "nurse_fixedshift_period"
+    fixed_shift = Column(VARCHAR(20), nullable=True)
+    __table_args__ = (Index("ix_nfsp_nurse", "nurse_id", "valid_from"),)
+
+
 class NurseAssignment(Base):
     """간호사 배정/상태 변경 이력 (파견/휴직/퇴사/프리셉티/병동이동)"""
     __tablename__ = "nurse_assignment"
