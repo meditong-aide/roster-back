@@ -1596,21 +1596,28 @@ def _share_fetch_s3_image_bytes(image_url: str) -> tuple[bytes, str]:
 
 
 def _share_resolve_target_scope(current_user, db: Session, override_group_id: str | None = None):
-    is_master_admin = bool(getattr(current_user, "is_master_admin", False))
-    if override_group_id:
-        if not is_master_admin:
-            raise PermissionError("Only admin can specify group_id")
-        group_row = db.query(Group).filter(Group.group_id == override_group_id).first()
-        if not group_row:
-            raise LookupError("Group not found")
-        if getattr(current_user, "office_id", None) and group_row.office_id != current_user.office_id:
-            raise PermissionError("Group does not belong to your office")
-        return group_row.group_id, group_row.office_id
-    group_id = getattr(current_user, "group_id", None)
-    office_id = getattr(current_user, "office_id", None)
-    if not group_id or not office_id:
-        raise ValueError("group_id or office_id is missing on current user")
-    return group_id, office_id
+    # 그룹 스코프 단일 해석점(resolve_effective_group) 사용.
+    # 토큰 group_id 가 아니라 nurse_id→DB + groups.hn_id 로 해석한다
+    # (2026-06 토큰→DB 그룹스코프 마이그와 정합. 프론트가 group_id 를 상시 전송하므로
+    #  일반/HN 도 관리 그룹이면 본인 근무표 공유 가능, ADM 은 office 내 임의 그룹 지정 가능).
+    from fastapi import HTTPException
+    from services.group_access import resolve_effective_group
+
+    try:
+        target_group_id = resolve_effective_group(
+            db, current_user, override_group_id, require_group=True
+        )
+    except HTTPException as e:
+        if e.status_code == 403:
+            raise PermissionError(e.detail)
+        if e.status_code == 404:
+            raise LookupError(e.detail)
+        raise ValueError(e.detail)
+
+    group_row = db.query(Group).filter(Group.group_id == target_group_id).first()
+    if not group_row:
+        raise LookupError("Group not found")
+    return group_row.group_id, group_row.office_id
 
 
 
