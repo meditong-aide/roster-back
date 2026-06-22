@@ -116,18 +116,21 @@ def update_shift_manage_manpower(
     preview_only: bool = False,
 ) -> dict:
     """Update manpower requirement for a specific shift slot."""
-    row = (
+    # 중복행이 남아있을 수 있으므로 매칭되는 모든 행을 갱신한다(.first() 면 1행만 바뀌어
+    # 로더의 최대 id 채택값과 stale 불일치 발생). old 값은 로더가 읽는 최대 id 행 기준.
+    rows = (
         db.query(ShiftManage)
         .filter(
             ShiftManage.group_id == group_id,
             ShiftManage.nurse_class == nurse_class,
             ShiftManage.shift_slot == shift_slot,
         )
-        .first()
+        .order_by(ShiftManage.id.asc())
+        .all()
     )
-    if not row:
+    if not rows:
         return {"error": "ShiftManage entry not found"}
-    old_manpower = row.manpower
+    old_manpower = rows[-1].manpower
     if preview_only:
         return {
             "preview": True,
@@ -136,7 +139,8 @@ def update_shift_manage_manpower(
             "old_manpower": old_manpower,
             "new_manpower": new_manpower,
         }
-    row.manpower = new_manpower
+    for row in rows:
+        row.manpower = new_manpower
     db.commit()
     return {
         "preview": False,

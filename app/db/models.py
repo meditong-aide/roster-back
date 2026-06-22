@@ -364,17 +364,35 @@ class RosterJob(Base):
 
 class ShiftManage(Base):
     __tablename__ = "shift_manage"
-    # ── 복합 PRIMARY KEY ──────────────────────────────
-    office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"), primary_key=True)
-    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), primary_key=True)
-    nurse_class = Column(VARCHAR(10), nullable=False)  # 'RN', 'AN', '보조'
-    shift_slot = Column(
-        INTEGER, nullable=False, primary_key=True
-    )  # 슬롯 번호 (1, 2, 3...)
-    main_code = Column(VARCHAR(10), nullable=True)  # 메인 근무코드 (하나만)
-    codes = Column(JSON, nullable=True)  # 근무코드 리스트 ['D', 'E', 'N']
-    # config_version = Column(VARCHAR(20), primary_key=True)
+    # 실DB 정합: 실제 PK 는 id(IDENTITY) 단독이다. 모델이 (office,group,slot) 복합 PK 로
+    # 선언돼 있던 탓에 ORM identity-map 이 중복행을 같은 PK 로 병합해 비결정적으로 동작했다.
+    # 유일성은 아래 UniqueConstraint 로 보장한다. (slot 1=D,2=E,3=N,4=OFF(응답 합성),5=M)
+    # 실DB는 bigint IDENTITY 지만, 모델 타입은 읽기/테스트(SQLite) 호환을 위해 INTEGER 로 둔다
+    # (테이블은 이미 존재 → 모델로 생성하지 않음. SQLite autoincrement 는 INTEGER PK 만 지원).
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"), nullable=False)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    nurse_class = Column(NVARCHAR(16), nullable=False)  # 'RN', 'AN', '보조'
+    shift_slot = Column(INTEGER, nullable=False)  # 슬롯 번호
+    main_code = Column(NVARCHAR(10), nullable=False)  # 메인 근무코드 (하나만)
+    codes = Column(JSON, nullable=False)  # 근무코드(shift_id) 리스트 ['D', 'E', 'N']
     manpower = Column(INTEGER, nullable=False, default=0)  # 인력 수
+    # 실DB 존재 컬럼(현재 전부 NULL=미사용, 정합용으로만 선언). per-month 전환 시 활용.
+    year = Column(SMALLINT, nullable=True)
+    month = Column(INTEGER, nullable=True)
+    config_version = Column(VARCHAR(20), nullable=True)
+    created_at = Column(DATETIME, nullable=True)
+    updated_at = Column(DATETIME, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "office_id",
+            "group_id",
+            "nurse_class",
+            "shift_slot",
+            name="UQ_shift_manage_slot",
+        ),
+    )
 
     office = relationship("Office")
     group = relationship("Group")

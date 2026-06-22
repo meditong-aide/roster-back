@@ -2258,15 +2258,33 @@ class CPSATBasicEngine:
     def _log_final_roster(self, nurses: List[Nurse], roster_map: Dict[str, List[str]]) -> None:
         """최종 근무표를 간호사별로 출력합니다.
 
+        폴백은 여러 번(team_min hard→soft 등) 시도되며 각 시도마다 본 함수가 호출된다.
+        해를 못 찾은 시도(근무 배정이 거의 없는 빈 표)까지 전체 배정표를 덤프하면 같은
+        형태의 빈 표가 반복돼 **최종 배정표가 로그에 묻힌다**. 그래서 실패 시도는 한 줄
+        요약으로 생략하고, 성공 배정표만 마커(FINAL ROSTER)로 감싸 CloudWatch 에서 바로
+        찾을 수 있게 한다.
+
         Args:
             nurses: 간호사 객체 리스트
             roster_map: DB ID를 키로 하는 간호사별 근무표
         """
         try:
+            # 근무(O/공란 제외) 셀 수. 강제 OFF·고정셀만 있는 실패 해는 인원수 미만이다.
+            work_cells = sum(
+                1
+                for sched in roster_map.values()
+                for s in (sched or [])
+                if s and s not in ("-", "O")
+            )
+            if work_cells < len(nurses):
+                print(f"{self.logger_prefix} (이번 시도 해 미발견 — 배정표 출력 생략)")
+                return
+            print(f"{self.logger_prefix} ===== 최종 배정표 (FINAL ROSTER) =====")
             for nurse in nurses:
                 schedule = roster_map.get(nurse.db_id, [])
                 schedule_str = " ".join(schedule) if schedule else "-"
                 print(f"{self.logger_prefix} 배정표 {nurse.name}({nurse.db_id}): {schedule_str}")
+            print(f"{self.logger_prefix} ===== 최종 배정표 끝 (/FINAL ROSTER) =====")
         except Exception as exc:
             print(f"{self.logger_prefix} 근무표 출력 중 오류: {exc}")
     

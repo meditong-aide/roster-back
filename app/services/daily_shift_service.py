@@ -31,6 +31,7 @@ def _read_template_from_shift_manage(db: Session, office_id: str, group_id: str)
             ShiftManage.nurse_class == 'RN',
             ShiftManage.shift_slot.in_([1, 2, 3, 5]),
         )
+        .order_by(ShiftManage.id.asc())  # 중복행 결정성: 슬롯별 최대 id(최근) 행 채택
         .all()
     )
     if not slots or len(slots) < 3:
