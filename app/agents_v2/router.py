@@ -33,12 +33,19 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # 순수 화면 이동/폼 프리필
     "navigation": ["navigate", "prefill"],
     # 근무표/원티드/간호사/시프트/설정값 조회 (view-vs-derive gray → navigate 번들)
-    "read": ["query_schedule", "navigate"],
+    # [LIVE_LLM_CARVE 2026-06-22] '생성 끝났어?' / '마감일 어때?' / '한도 넘은 사람' 같은
+    # 조회 발화가 read 직격 시그널이라 read 카테고리에 mutation 스킬의 조회 op 도 번들.
+    "read": [
+        "query_schedule", "navigate",
+        "query_generation_job", "manage_wanted_deadline", "manage_wanted_limits",
+    ],
     # 근무/원티드 변경
     #   manage_wanted_deadline: 마감일 변경 / 즉시 마감
     #   manage_wanted_limits: 한도 초과자 조회 / 초과분 정리
+    # [LIVE_LLM_CARVE 2026-06-22] '팀 추가/삭제' = mutate 본질이라 manage_teams 도 번들.
     "mutate": [
-        "bulk_mutation", "manage_wanted_deadline", "manage_wanted_limits", "query_schedule",
+        "bulk_mutation", "manage_wanted_deadline", "manage_wanted_limits",
+        "manage_teams", "query_schedule",
     ],
     # 근무표 자동 생성 (생성 vs roster_create 화면 gray → navigate 번들)
     # query_generation_job: '생성 어디까지?' 같은 상태 조회 동반 가능.

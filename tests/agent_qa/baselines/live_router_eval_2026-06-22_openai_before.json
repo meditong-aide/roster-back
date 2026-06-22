@@ -1,0 +1,536 @@
+{
+  "provider": "openai",
+  "corpus": [
+    "wave1",
+    "wave2",
+    "wave3",
+    "read"
+  ],
+  "n": 28,
+  "hits": 16,
+  "fallbacks": 0,
+  "avg_latency_s": 1.0109868720464874,
+  "by_category": {
+    "generate": {
+      "hit": 2,
+      "total": 5
+    },
+    "mutate": {
+      "hit": 5,
+      "total": 11
+    },
+    "settings_people": {
+      "hit": 3,
+      "total": 6
+    },
+    "validate_repair": {
+      "hit": 6,
+      "total": 6
+    }
+  },
+  "by_tool": {
+    "query_generation_job": {
+      "hit": 2,
+      "total": 5
+    },
+    "manage_wanted_deadline": {
+      "hit": 4,
+      "total": 6
+    },
+    "manage_teams": {
+      "hit": 3,
+      "total": 6
+    },
+    "manage_wanted_limits": {
+      "hit": 1,
+      "total": 5
+    },
+    "resolve_infeasibility": {
+      "hit": 6,
+      "total": 6
+    }
+  },
+  "rows": [
+    {
+      "phrase": "근무표 생성 어디까지 갔어?",
+      "expected_tool": "query_generation_job",
+      "categories": [
+        "generate",
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "generate_schedule",
+        "query_generation_job",
+        "resolve_infeasibility",
+        "navigate"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 0.7,
+      "latency_s": 1.893101833993569
+    },
+    {
+      "phrase": "생성 끝났어?",
+      "expected_tool": "query_generation_job",
+      "categories": [
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.7830983330495656
+    },
+    {
+      "phrase": "마지막 생성 job 상태",
+      "expected_tool": "query_generation_job",
+      "categories": [
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.6622725420165807
+    },
+    {
+      "phrase": "근무표 자동 생성 진행 상황",
+      "expected_tool": "query_generation_job",
+      "categories": [
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 1.7150207909289747
+    },
+    {
+      "phrase": "생성 됐나?",
+      "expected_tool": "query_generation_job",
+      "categories": [
+        "generate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "generate_schedule",
+        "query_generation_job",
+        "resolve_infeasibility",
+        "navigate"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.9305956249590963
+    },
+    {
+      "phrase": "7월 원티드 마감일 7월 10일로 바꿔줘",
+      "expected_tool": "manage_wanted_deadline",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.7113334159366786
+    },
+    {
+      "phrase": "이번 달 원티드 마감일 없애줘",
+      "expected_tool": "manage_wanted_deadline",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.820486958953552
+    },
+    {
+      "phrase": "7월 원티드 마감해줘",
+      "expected_tool": "manage_wanted_deadline",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.7214842500397936
+    },
+    {
+      "phrase": "원티드 즉시 마감",
+      "expected_tool": "manage_wanted_deadline",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.5609843340935186
+    },
+    {
+      "phrase": "7월 원티드 마감일 현재 어떻게 돼있어?",
+      "expected_tool": "manage_wanted_deadline",
+      "categories": [
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.6269886250374839
+    },
+    {
+      "phrase": "이번 달 원티드 상태 보여줘",
+      "expected_tool": "manage_wanted_deadline",
+      "categories": [
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.8811971669783816
+    },
+    {
+      "phrase": "A팀 멤버 누구야?",
+      "expected_tool": "manage_teams",
+      "categories": [
+        "settings_people",
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "update_person_attr",
+        "manage_grade",
+        "manage_team_min",
+        "manage_teams",
+        "navigate",
+        "prefill"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 0.7,
+      "latency_s": 1.0066754160216078
+    },
+    {
+      "phrase": "신생아실 팀 추가해줘",
+      "expected_tool": "manage_teams",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.9201328330673277
+    },
+    {
+      "phrase": "A팀 이름을 응급실로 바꿔줘",
+      "expected_tool": "manage_teams",
+      "categories": [
+        "settings_people"
+      ],
+      "tool_names": [
+        "update_person_attr",
+        "manage_grade",
+        "manage_team_min",
+        "manage_teams",
+        "navigate",
+        "prefill"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 3.7073157909326255
+    },
+    {
+      "phrase": "C팀 삭제해줘",
+      "expected_tool": "manage_teams",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.5476831669220701
+    },
+    {
+      "phrase": "B팀 없애줘",
+      "expected_tool": "manage_teams",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.6321770830545574
+    },
+    {
+      "phrase": "1팀 추가해",
+      "expected_tool": "manage_teams",
+      "categories": [
+        "settings_people"
+      ],
+      "tool_names": [
+        "update_person_attr",
+        "manage_grade",
+        "manage_team_min",
+        "manage_teams",
+        "navigate",
+        "prefill"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.8096872080350295
+    },
+    {
+      "phrase": "7월 원티드 한도 넘은 사람 누구야?",
+      "expected_tool": "manage_wanted_limits",
+      "categories": [
+        "read",
+        "analyze"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "analyze_report",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 0.7,
+      "latency_s": 0.8806177499936894
+    },
+    {
+      "phrase": "이번 달 원티드 한도 초과자 보여줘",
+      "expected_tool": "manage_wanted_limits",
+      "categories": [
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.7921285420889035
+    },
+    {
+      "phrase": "박지은 7월 원티드 초과분 정리해줘",
+      "expected_tool": "manage_wanted_limits",
+      "categories": [
+        "read",
+        "analyze"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "analyze_report",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 0.7,
+      "latency_s": 0.9183158749947324
+    },
+    {
+      "phrase": "김민지 원티드 초과 삭제",
+      "expected_tool": "manage_wanted_limits",
+      "categories": [
+        "mutate"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "bulk_mutation",
+        "manage_wanted_deadline",
+        "manage_wanted_limits"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.8206968340091407
+    },
+    {
+      "phrase": "이번 달 원티드 한도 넘은 명단",
+      "expected_tool": "manage_wanted_limits",
+      "categories": [
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "navigate"
+      ],
+      "hit": false,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.6241338329855353
+    },
+    {
+      "phrase": "이번 실패 어떻게 풀어",
+      "expected_tool": "resolve_infeasibility",
+      "categories": [
+        "validate_repair"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "validate_schedule",
+        "repair_schedule",
+        "resolve_infeasibility"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 1.1173151669790968
+    },
+    {
+      "phrase": "7월 근무표 실패 해결 옵션 알려줘",
+      "expected_tool": "resolve_infeasibility",
+      "categories": [
+        "validate_repair",
+        "recommend",
+        "read"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "validate_schedule",
+        "recommend_candidates",
+        "repair_schedule",
+        "resolve_infeasibility",
+        "navigate"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 0.7,
+      "latency_s": 1.8137026670156047
+    },
+    {
+      "phrase": "원인 알겠고 옵션 뭐 있어?",
+      "expected_tool": "resolve_infeasibility",
+      "categories": [
+        "validate_repair",
+        "recommend"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "validate_schedule",
+        "recommend_candidates",
+        "repair_schedule",
+        "resolve_infeasibility"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 0.7,
+      "latency_s": 0.8795924161095172
+    },
+    {
+      "phrase": "infeasible 어떻게 풀까",
+      "expected_tool": "resolve_infeasibility",
+      "categories": [
+        "validate_repair"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "validate_schedule",
+        "repair_schedule",
+        "resolve_infeasibility"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.9908228340791538
+    },
+    {
+      "phrase": "이번 실패 옵션 보여줘",
+      "expected_tool": "resolve_infeasibility",
+      "categories": [
+        "read",
+        "validate_repair"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "validate_schedule",
+        "repair_schedule",
+        "resolve_infeasibility",
+        "navigate"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 0.7,
+      "latency_s": 0.8773648340720683
+    },
+    {
+      "phrase": "실패 해결 방법",
+      "expected_tool": "resolve_infeasibility",
+      "categories": [
+        "validate_repair"
+      ],
+      "tool_names": [
+        "query_schedule",
+        "validate_schedule",
+        "repair_schedule",
+        "resolve_infeasibility"
+      ],
+      "hit": true,
+      "fallback_used": false,
+      "confidence": 1.0,
+      "latency_s": 0.6627062909537926
+    }
+  ]
+}
