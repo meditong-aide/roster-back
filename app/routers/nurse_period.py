@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -26,7 +26,7 @@ from db.models import (
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from services.group_access import assert_caller_can_access_group
-from services.nurse_period_resolver import upsert_period
+from services.nurse_period_resolver import upsert_period, resolve_asof
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
 
 router = APIRouter(prefix="/nurse-period", tags=["nurse-period"])
@@ -37,18 +37,20 @@ def _allowed_value(n: Nurse):
     return sorted(normalize_allowed_shift_codes(getattr(n, "is_night_nurse", None)))
 
 
-# 속성별 backfill 스펙: model · 값컬럼 · ward귀속 · nurses→value 변환
+# 속성별 스펙: model · 값컬럼 · ward귀속 · nurses캐시컬럼(투영) · nurses→value 변환(backfill용)
 _ATTR_SPECS: dict[str, dict] = {
     "allowed_shifts": dict(model=NurseAllowedShiftPeriod, value_attr="allowed_shifts",
-                           group_bound=False, value_fn=_allowed_value),
+                           group_bound=False, cache_attr="is_night_nurse",
+                           value_fn=_allowed_value),
     "weekend_off": dict(model=NurseWeekendOffPeriod, value_attr="weekend_off",
-                        group_bound=False,
+                        group_bound=False, cache_attr="is_weekend_off",
                         value_fn=lambda n: 1 if getattr(n, "is_weekend_off", False) else 0),
     "fixed_shift": dict(model=NurseFixedShiftPeriod, value_attr="fixed_shift",
-                        group_bound=False,
+                        group_bound=False, cache_attr="fixed_shift",
                         value_fn=lambda n: getattr(n, "fixed_shift", None)),
     "grade": dict(model=NurseGradePeriod, value_attr="grade",
-                  group_bound=True, value_fn=lambda n: getattr(n, "grade", None)),
+                  group_bound=True, cache_attr="grade",
+                  value_fn=lambda n: getattr(n, "grade", None)),
 }
 
 
@@ -112,3 +114,62 @@ async def backfill_nurse_periods(
     }
     return BackfillResult(group_id=group_id, valid_from=valid_from,
                           nurse_count=len(nurses), rows=rows)
+
+
+class ChangeRequest(BaseModel):
+    attribute: str                             # allowed_shifts | weekend_off | fixed_shift | grade
+    nurse_id: str
+    valid_from: date                           # 이 날부터 value 적용(close-before-open)
+    value: Any = None                          # allowed_shifts=list / weekend_off=0|1 / fixed_shift=str / grade=int
+    group_id: Optional[str] = None             # grade(ward귀속)에 필요
+    note: Optional[str] = None
+
+
+class ChangeResult(BaseModel):
+    attribute: str
+    nurse_id: str
+    valid_from: date
+    value: Any
+    today_value: Any                           # 변경 후 오늘 기준 as-of 값(투영 확인용)
+
+
+@router.post("/change", response_model=ChangeResult)
+async def change_nurse_period(
+    payload: ChangeRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """한 간호사의 한 속성을 valid_from 부터 변경(close-before-open) + 단방향 캐시 투영."""
+    spec = _ATTR_SPECS.get(payload.attribute)
+    if spec is None:
+        raise HTTPException(status_code=400, detail=f"알 수 없는 속성: {payload.attribute}")
+
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == payload.nurse_id).first()
+    if nurse is None:
+        raise HTTPException(status_code=404, detail=f"간호사 없음: {payload.nurse_id}")
+
+    # 권한: ward귀속(grade)은 명시 group_id, 그 외는 간호사 소속 그룹 기준
+    group_id = payload.group_id or getattr(nurse, "group_id", None)
+    assert_caller_can_access_group(db, current_user, group_id)
+
+    if payload.attribute == "allowed_shifts" and not isinstance(payload.value, list):
+        raise HTTPException(status_code=400, detail="allowed_shifts 는 리스트여야 합니다")
+
+    upsert_period(
+        db, spec["model"], payload.nurse_id, payload.valid_from,
+        spec["value_attr"], payload.value,
+        group_id=group_id if spec["group_bound"] else None,
+        nurse=nurse, cache_attr=spec["cache_attr"], source="edited",
+    )
+    db.commit()
+
+    # 변경 후 오늘 기준 as-of 값(미래발효면 gap/직전 구간, 캐시 투영 검증용)
+    rows = (
+        db.query(spec["model"]).filter(spec["model"].nurse_id == payload.nurse_id)
+        .order_by(spec["model"].valid_from.asc()).all()
+    )
+    today_value = resolve_asof(rows, date.today(), spec["value_attr"], default=None)
+
+    return ChangeResult(attribute=payload.attribute, nurse_id=payload.nurse_id,
+                        valid_from=payload.valid_from, value=payload.value,
+                        today_value=today_value)
