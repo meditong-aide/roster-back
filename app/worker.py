@@ -196,9 +196,13 @@ def process_job(payload: dict) -> dict:
         exc_obj = sys.exc_info()[1]
         # generate_roster_service 가 raise 한 구조화 infeasibility payload 가 있으면
         # error_message 에 JSON 으로 보존 → get_job_status 가 narrative 추출 가능.
+        # 추가로 month 식별을 위해 _year/_month 메타 키 끼움 (RosterJob 모델 변경 회피).
         if isinstance(exc_obj, _HTTPException) and isinstance(exc_obj.detail, dict):
             try:
-                err_msg = _json.dumps(exc_obj.detail, ensure_ascii=False)
+                detail_with_meta = dict(exc_obj.detail)  # 원본 dict side-effect 회피
+                detail_with_meta.setdefault("_year", getattr(req, "year", None))
+                detail_with_meta.setdefault("_month", getattr(req, "month", None))
+                err_msg = _json.dumps(detail_with_meta, ensure_ascii=False)
             except (TypeError, ValueError):
                 err_msg = str(exc_obj.detail)
         else:

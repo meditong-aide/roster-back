@@ -125,6 +125,49 @@ def test_failed_job_with_json_payload_attaches_ontology(db, seed_data):
     assert "debug_payload" not in res  # top-level 금지
 
 
+def test_failed_job_with_year_month_meta_surfaces_in_response(db, seed_data):
+    """worker.py 가 끼운 _year/_month 메타가 응답의 year/month 로 노출.
+
+    RosterJob 모델 변경 없이 month 식별 가능하게 한 경로 가드.
+    """
+    import json
+    from db.models import RosterJob
+    from agents_v2.skills.registry import run_skill
+
+    payload = {
+        "_year": 2026,
+        "_month": 7,
+        "infeasibility": {
+            "severity": "hard",
+            "causes": [{"reason_code": "TEAM_MIN_EXCEEDS_GLOBAL_NEED"}],
+            "resolution_narrative": {
+                "summary_ko": "...",
+                "problem_list": [],
+                "action_levers": [],
+                "trade_offs": [],
+            },
+            "hard_case": {"is_hard": False},
+        },
+    }
+    job = RosterJob(
+        job_id="job-fail-meta",
+        office_id=seed_data["office_id"],
+        group_id=seed_data["group_id"],
+        nurse_id="N001",
+        status="FAILED",
+        progress=100,
+        error_message=json.dumps(payload, ensure_ascii=False),
+    )
+    db.add(job)
+    db.flush()
+
+    res = run_skill(db, "query-generation-job", {"group_id": seed_data["group_id"]})
+    assert res["year"] == 2026
+    assert res["month"] == 7
+    # message 도 month 반영
+    assert "2026" in res["message"] and "7월" in res["message"]
+
+
 def test_failed_job_with_plain_string_does_not_attach_ontology(db, seed_data):
     """error_message 가 JSON 아닌 단순 문자열이면 ontology 부착 없이도 안전 fallback."""
     from db.models import RosterJob
