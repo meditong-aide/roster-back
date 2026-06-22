@@ -201,15 +201,52 @@ def process_job(payload: dict) -> dict:
             result_roster_id=result_id,
         )
         roster_nurses_count = len(roster_data.get("nurses", [])) if isinstance(roster_data, dict) else 0
+
+        # 품질 요약(하네스 스타일): shortage/하드위반/N블록/공정성(y축).
+        # best-effort — 실패해도 job 완료 처리에 영향 없음.
+        quality_lines: list[str] = []
+        quality_metrics: dict = {}
+        try:
+            from utils.roster_quality import summarize
+            _q = summarize(roster_data if isinstance(roster_data, dict) else {})
+            quality_lines = _q.get("lines", [])
+            quality_metrics = _q.get("metrics", {})
+        except Exception as exc_q:
+            print(f"[worker] 품질 요약 계산 실패(무시): {exc_q}", file=sys.stderr)
+
+        # office_id → office_name 해석 (실패해도 무시).
+        office_name = None
+        try:
+            from db.models import Office
+            _off = db.query(Office.office_name).filter(Office.office_id == current_user.office_id).first()
+            office_name = str(_off.office_name) if _off and _off.office_name else None
+        except Exception as exc_o:
+            print(f"[worker] office_name 조회 실패(무시): {exc_o}", file=sys.stderr)
+
         logger.info(
             "작업 완료",
             extra={
                 "result_roster_id": result_id,
                 "roster_nurses_count": roster_nurses_count,
+                "quality": quality_metrics,
             },
         )
         # 최종 배정표를 로그 맨 끝에 재출력 — CloudWatch tail 에서 바로 보이도록.
         _log_final_roster_tail(roster_data, job_id, result_id)
+        # 모니터링 알림(fire-and-forget): 전송 실패해도 job 처리에 영향 없음.
+        from utils.slack_notify import notify_roster_result
+        notify_roster_result(
+            ok=True,
+            job_id=job_id,
+            group_id=current_user.group_id,
+            office_id=current_user.office_id,
+            office_name=office_name,
+            nurse_id=nurse_id,
+            year=getattr(req, "year", None),
+            month=getattr(req, "month", None),
+            result_roster_id=result_id,
+            quality_lines=quality_lines,
+        )
         return {"status": "success", "job_id": job_id, "result_id": result_id}
 
     except Exception:
@@ -258,6 +295,19 @@ def process_job(payload: dict) -> dict:
                     db_retry.close()
             except Exception as exc3:
                 print(f"[worker] Job 상태 업데이트 재시도 실패(FAILED): {exc3}", file=sys.stderr)
+        # 모니터링 알림(fire-and-forget). current_user 는 로드 실패 시 미정의일 수 있어 방어적 접근.
+        _cu = locals().get("current_user")
+        from utils.slack_notify import notify_roster_result
+        notify_roster_result(
+            ok=False,
+            job_id=job_id,
+            group_id=getattr(_cu, "group_id", None) or job_group_id,
+            office_id=getattr(_cu, "office_id", None),
+            nurse_id=nurse_id,
+            year=getattr(req, "year", None),
+            month=getattr(req, "month", None),
+            error_message=err_msg,
+        )
         # transient 오류(DB 일시 단절, 네트워크 등)도 영구 ack 되지 않도록 caller에 전파한다.
         raise
 
