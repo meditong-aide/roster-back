@@ -141,14 +141,42 @@ def _compose_options(
     return out
 
 
+def _partition_options(
+    options: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """runtime_lever 기준 분리.
+
+    actionable: 사용자가 실제로 누를 수 있는 옵션
+    auto_resolved: 엔진 자동 처리되거나 운영 미사용인 옵션 (engine_self_resolves=True)
+    """
+    actionable: list[dict[str, Any]] = []
+    auto: list[dict[str, Any]] = []
+    for opt in options:
+        if opt.get("engine_self_resolves") is True:
+            auto.append(opt)
+        else:
+            actionable.append(opt)
+    return actionable, auto
+
+
 def _compose_message(
     year: int | None,
     month: int | None,
-    options: list[dict[str, Any]],
+    actionable: list[dict[str, Any]],
+    auto_resolved: list[dict[str, Any]],
     summary_ko: str | None,
 ) -> str:
     period = f"{year}년 {month}월 " if year and month else ""
-    if not options:
+    auto_n = len(auto_resolved)
+    auto_suffix = (
+        f" (그 외 {auto_n}건은 엔진이 자동으로 처리합니다.)" if auto_n else ""
+    )
+    if not actionable:
+        if auto_n:
+            return (
+                f"{period}사용자가 직접 조정할 해결 옵션은 없어요. "
+                f"{auto_n}건은 엔진이 자동으로 처리합니다."
+            )
         return (
             f"{period}근무표 실패의 해결 옵션을 찾지 못했어요. "
             "실패 원인부터 확인이 필요해요."
@@ -156,15 +184,15 @@ def _compose_message(
     head = (summary_ko or "").strip()
     head = f"{head} " if head else ""
     bullets = []
-    for i, opt in enumerate(options[:5], start=1):
+    for i, opt in enumerate(actionable[:5], start=1):
         rationale = (opt.get("rationale_ko") or "").strip()
         if rationale:
             bullets.append(f"{i}) {rationale}")
     bullet_text = " ".join(bullets) if bullets else ""
-    suffix = " 어떤 옵션으로 진행할까요?"
+    suffix = f" 어떤 옵션으로 진행할까요?{auto_suffix}"
     if bullet_text:
-        return f"{head}{period}해결 옵션 {len(options)}개가 있어요: {bullet_text}.{suffix}"
-    return f"{head}{period}해결 옵션 {len(options)}개가 있어요.{suffix}"
+        return f"{head}{period}해결 옵션 {len(actionable)}개가 있어요: {bullet_text}.{suffix}"
+    return f"{head}{period}해결 옵션 {len(actionable)}개가 있어요.{suffix}"
 
 
 @register("resolve-infeasibility")
@@ -212,7 +240,8 @@ def resolve_infeasibility(db: Session, params: dict) -> Any:
         if isinstance(payload, dict) else None
     summary_ko = (narrative or {}).get("summary_ko") if isinstance(narrative, dict) else None
 
-    options = _compose_options(narrative, _trade_offs_by_treatment(narrative))
+    all_options = _compose_options(narrative, _trade_offs_by_treatment(narrative))
+    actionable, auto_resolved = _partition_options(all_options)
     apply_hints = _treatment_apply_hints(payload)
     year = job.get("year")
     month = job.get("month")
@@ -229,8 +258,10 @@ def resolve_infeasibility(db: Session, params: dict) -> Any:
         "year": year,
         "month": month,
         "summary_ko": summary_ko,
-        "options": options,
+        # 사용자가 직접 누를 수 있는 옵션만 노출. runtime_lever=false 는 분리.
+        "options": actionable,
+        "auto_resolved_options": auto_resolved,
         "verified": bool((narrative or {}).get("verified")) if isinstance(narrative, dict) else False,
-        "message": _compose_message(year, month, options, summary_ko),
+        "message": _compose_message(year, month, actionable, auto_resolved, summary_ko),
         "_internal": internal,
     }

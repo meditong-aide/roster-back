@@ -164,44 +164,46 @@ def test_failed_job_lists_options_from_payload(db, seed_data):
     assert res["verified"] is True
     assert res["summary_ko"] == "A팀 최소 인원이 전체 수요를 초과합니다"
 
-    opts = res["options"]
-    assert len(opts) == 2
-    ids = [o["treatment_id"] for o in opts]
-    assert "lower_team_min_A" in ids and "increase_team_size_A" in ids
+    # D1-A: runtime_lever=False 인 TeamMin 옵션은 auto_resolved_options 로 분리.
+    actionable = res["options"]
+    auto_resolved = res["auto_resolved_options"]
+    assert len(actionable) == 1
+    assert actionable[0]["treatment_id"] == "increase_team_size_A"
+    assert len(auto_resolved) == 1
+    assert auto_resolved[0]["treatment_id"] == "lower_team_min_A"
 
-    # trade_off 가 treatment_id 로 조인됐는지
-    lower = next(o for o in opts if o["treatment_id"] == "lower_team_min_A")
+    # trade_off 가 treatment_id 로 조인됐는지 (auto_resolved 쪽 검증)
+    lower = auto_resolved[0]
     assert lower["config_key"] == "team_min"
     assert lower["direction"] == "decrease"
     assert "빠듯" in lower["trade_off_ko"]
-    inc = next(o for o in opts if o["treatment_id"] == "increase_team_size_A")
+    inc = actionable[0]
     assert "trade_off_ko" not in inc  # 매칭 없음
 
     # message 친화 텍스트 — raw enum 미노출
     msg = res["message"]
-    assert "A팀 최소 인원을 1명으로 낮추기" in msg
+    # actionable 옵션 1건의 rationale 만 message 에 노출 (TeamSize 보강)
+    assert "A팀 활성 인원 보강" in msg
+    # auto_resolved 1건은 카운트만 노출
+    assert "1건은 엔진이 자동으로 처리" in msg
     assert "TEAM_MIN_EXCEEDS_GLOBAL_NEED" not in msg
     assert "어떤 옵션으로 진행할까요" in msg
 
-    # apply_hints 는 _internal 격리
+    # apply_hints 는 _internal 격리 (auto_resolved 도 포함됨 — 디버깅용)
     hints = res["_internal"]["apply_hints"]
     assert hints["lower_team_min_A"]["values"]["team"] == "A팀"
     assert hints["increase_team_size_A"]["action"] == "navigate"
 
-    # treatment_id 같은 시스템 식별자는 top-level options 에는 노출되지만
     # raw payload 는 _internal 격리.
     assert "debug_payload" in res["_internal"]
     assert "debug_payload" not in res
 
-    # ontology 부착: TeamMin family + runtime_lever=False (yaml 마킹된 stale lever)
-    for opt in opts:
-        if opt["target_family"] == "TeamMin":
-            ont = opt.get("constraint")
-            assert ont is not None
-            assert ont["constraint_id"] == "TeamMin"
-            assert ont["group"] == "CoverageConstraint"
-            assert ont["default_severity"] == "hard"
-            # treatment 단(또는 constraint 단)에서 runtime_lever=False 가 와야 함
-            assert ont["runtime_lever"] is False
-            # 사용자 노출용 라벨
-            assert opt.get("engine_self_resolves") is True
+    # ontology 부착: auto_resolved 의 TeamMin 옵션은 runtime_lever=False + engine_self_resolves=True
+    ont = lower["constraint"]
+    assert ont["constraint_id"] == "TeamMin"
+    assert ont["group"] == "CoverageConstraint"
+    assert ont["default_severity"] == "hard"
+    assert ont["runtime_lever"] is False
+    assert lower["engine_self_resolves"] is True
+    # actionable 옵션(TeamSize)은 ontology 에 없어 constraint 메타 없음 또는 runtime_lever 미지정.
+    assert inc.get("engine_self_resolves") is not True
