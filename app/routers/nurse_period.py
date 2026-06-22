@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,7 +26,7 @@ from db.models import (
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from services.group_access import assert_caller_can_access_group
-from services.nurse_period_resolver import upsert_period, resolve_asof
+from services.nurse_period_resolver import upsert_period, resolve_asof, fetch_periods
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
 
 router = APIRouter(prefix="/nurse-period", tags=["nurse-period"])
@@ -173,3 +173,67 @@ async def change_nurse_period(
     return ChangeResult(attribute=payload.attribute, nurse_id=payload.nurse_id,
                         valid_from=payload.valid_from, value=payload.value,
                         today_value=today_value)
+
+
+class RollRequest(BaseModel):
+    group_id: Optional[str] = None
+    as_of: Optional[date] = None               # 기준일(기본=오늘). 미래발효 발효일 처리용
+    attributes: Optional[list[str]] = None
+
+
+class RollResult(BaseModel):
+    group_id: str
+    as_of: date
+    nurse_count: int
+    updated: dict[str, int]                    # 속성 → 캐시값이 바뀐 간호사 수
+
+
+@router.post("/roll", response_model=RollResult)
+async def roll_nurse_cache(
+    payload: RollRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """as_of(기본 오늘) 기준 period 값을 nurses 캐시 컬럼에 투영(단방향 동기화).
+
+    미래발효 변경이 발효일에 캐시에 반영되도록 일일 호출(cron)용. 멱등.
+    구간이 as_of 를 안 덮으면(gap) 캐시는 건드리지 않는다.
+    """
+    group_id = payload.group_id or getattr(current_user, "group_id", None)
+    if not group_id:
+        raise HTTPException(status_code=400, detail="group_id 가 필요합니다")
+    assert_caller_can_access_group(db, current_user, group_id)
+
+    attrs = payload.attributes or list(_ATTR_SPECS.keys())
+    unknown = [a for a in attrs if a not in _ATTR_SPECS]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"알 수 없는 속성: {unknown}")
+
+    as_of = payload.as_of or date.today()
+    nurses = (
+        db.query(Nurse)
+        .filter(Nurse.group_id == group_id, Nurse.active == 1)
+        .all()
+    )
+    nurse_ids = [n.nurse_id for n in nurses]
+    nurse_by_id = {n.nurse_id: n for n in nurses}
+
+    updated = {a: 0 for a in attrs}
+    for a in attrs:
+        spec = _ATTR_SPECS[a]
+        by_nurse = fetch_periods(
+            db, spec["model"], nurse_ids, as_of, as_of + timedelta(days=1),
+            group_id=group_id if spec["group_bound"] else None,
+        ) if nurse_ids else {}
+        for nid, rows in by_nurse.items():
+            val = resolve_asof(rows, as_of, spec["value_attr"], default=None)
+            if val is None:
+                continue                       # gap → 캐시 유지
+            n = nurse_by_id.get(nid)
+            if n is not None and getattr(n, spec["cache_attr"], None) != val:
+                setattr(n, spec["cache_attr"], val)
+                updated[a] += 1
+    db.commit()
+
+    return RollResult(group_id=group_id, as_of=as_of,
+                      nurse_count=len(nurses), updated=updated)
