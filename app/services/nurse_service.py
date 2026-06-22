@@ -945,21 +945,30 @@ def bulk_update_nurses_service(
 
         # === 프론트에서 보내준 값으로 일괄 업데이트 ===
         for key, value in update_data.items():
+            if key == "is_night_nurse":
+                continue  # 아래에서 period(nurse_allowed_shift_period)로 일원화 — 컬럼 직접 쓰기 금지
             if hasattr(db_nurse, key):
                 setattr(db_nurse, key, value)
 
-        # === 후처리: is_night_nurse (전체 선택 시 빈 배열) ===
-        # 각 shift_id를 상위 그룹(D/E/N/M)으로 정규화 후 중복 제거
-        # use_mid=False: D,E,N 3종 전부 선택 시 빈 배열
-        # use_mid=True:  D,E,N,M 4종 전부 선택 시 빈 배열
+        # === is_night_nurse(허용 근무형) → nurse_allowed_shift_period 일원화 ===
+        # 진실=period, nurses.is_night_nurse 컬럼은 upsert 의 단방향 투영으로만 갱신(양방향 충돌 제거).
+        # '현재값 변경'이라 valid_from=오늘. 미래발효는 POST /nurse-period/change 사용.
+        # 전체 선택(D/E/N[/M] 전부)=제한 없음([]) 정규화 유지.
         if "is_night_nurse" in update_data:
             night_shifts = update_data["is_night_nurse"]
+            final_night = night_shifts if isinstance(night_shifts, list) else []
             if isinstance(night_shifts, list) and night_shifts:
                 normalized = {shift_to_group.get(s, s) for s in night_shifts}
                 if normalized == ALL_SHIFTS:
-                    db_nurse.is_night_nurse = []
-            elif night_shifts is None:
-                db_nurse.is_night_nurse = []
+                    final_night = []
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _date.today(),
+                "allowed_shifts", final_night,
+                nurse=db_nurse, cache_attr="is_night_nurse", source="edited",
+            )
 
         # === 후처리: work_shifts (None → 빈 배열) ===
         if "work_shifts" in update_data and update_data["work_shifts"] is None:

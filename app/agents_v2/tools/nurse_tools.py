@@ -492,7 +492,18 @@ def update_nurse_attributes_batch(
         .first()
     )
     for f, v in cs["changed_fields"].items():
-        setattr(nurse, f, v)
+        if f == "is_night_nurse":
+            # 허용 근무형 → nurse_allowed_shift_period 일원화. 컬럼은 단방향 투영(직접쓰기 금지).
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, nurse.nurse_id, _date.today(),
+                "allowed_shifts", v if isinstance(v, list) else [],
+                nurse=nurse, cache_attr="is_night_nurse", source="edited",
+            )
+        else:
+            setattr(nurse, f, v)
     db.commit()
     db.refresh(nurse)
 
