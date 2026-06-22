@@ -91,6 +91,27 @@ def load_current_user_by_nurse_id(
         official_title_name=getattr(nurse, "official_title_name", None),
     )
 
+def _log_final_roster_tail(roster_data: dict, job_id, result_id) -> None:
+    """성공한 최종 배정표를 로그 맨 끝(작업 종료 직전)에 재출력한다.
+
+    솔버 내부 출력은 폴백(team_min hard→soft 등) 중간 로그에 묻히므로, CloudWatch tail
+    에서 스크롤만으로 바로 확인할 수 있도록 성공 결과를 한 번 더 마커로 감싸 찍는다.
+    """
+    try:
+        nurses = roster_data.get("nurses") if isinstance(roster_data, dict) else None
+        if not nurses:
+            return
+        print(f"[CP-SAT-Basic] ===== 최종 배정표 (FINAL ROSTER) job={job_id} sched={result_id} =====")
+        for n in nurses:
+            cells = n.get("schedule") or []
+            if not any(c and c != "-" for c in cells):
+                continue  # 배정 없는 행(전출자 등) 은 생략
+            print(f"[CP-SAT-Basic] 배정표 {n.get('name')}({n.get('id')}): {' '.join(cells)}")
+        print("[CP-SAT-Basic] ===== 최종 배정표 끝 (/FINAL ROSTER) =====")
+    except Exception as exc:
+        print(f"[CP-SAT-Basic] 최종 배정표 tail 출력 실패: {exc}")
+
+
 # =========================================================
 # 핵심 워커 실행
 # =========================================================
@@ -187,6 +208,8 @@ def process_job(payload: dict) -> dict:
                 "roster_nurses_count": roster_nurses_count,
             },
         )
+        # 최종 배정표를 로그 맨 끝에 재출력 — CloudWatch tail 에서 바로 보이도록.
+        _log_final_roster_tail(roster_data, job_id, result_id)
         return {"status": "success", "job_id": job_id, "result_id": result_id}
 
     except Exception:
