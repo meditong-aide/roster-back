@@ -147,12 +147,13 @@ def _format_time_display(shift):
 
 def _is_weekly_off_slot(slot_data: dict[str, Any]) -> bool:
     """
-    프론트 표시용 주휴 슬롯(main_code='O', shift_slot=4, codes에 '주') 여부를 판별합니다.
+    프론트 표시용 주휴(OFF) 슬롯(shift_slot=4, main_code='O') 여부를 판별합니다.
+
+    slot 4 는 GET 응답이 항상 합성해서 덧붙이는 표시 전용 OFF 슬롯이다(자동생성은 1/2/3/5 만
+    저장). 따라서 저장 대상이 아니다. codes 값(병동별 O 시프트 default_shift)은 '주'가 아닐 수도
+    있으므로(예: 'O'), codes 내용과 무관하게 (shift_slot=4 + main_code='O') 만으로 판별한다.
     """
-    main_code = slot_data.get("main_code")
-    shift_slot = slot_data.get("shift_slot")
-    codes = slot_data.get("codes") or []
-    return main_code == "O" and shift_slot == 4 and any(code == "주" for code in codes)
+    return slot_data.get("main_code") == "O" and str(slot_data.get("shift_slot")) == "4"
 
 
 # 기본 슬롯 자동생성을 허용하는 유효 간호사 클래스(화이트리스트).
