@@ -661,7 +661,9 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
             ShiftManage.nurse_class == 'RN',
             # ShiftManage.config_version == latest_config.config_version,
         )
-        .order_by(ShiftManage.shift_slot.asc())
+        # 중복행이 남아있어도 결정적이도록 id 까지 정렬: 같은 슬롯이면 최대 id(최근 저장) 행이
+        # 마지막에 와서 manpower 를 덮어쓴다(코드 합집합은 _build_code_to_main_map 가 전 행 병합).
+        .order_by(ShiftManage.shift_slot.asc(), ShiftManage.id.asc())
         .all()
     )
     shift_manage_data = [s.__dict__ for s in shift_manages]

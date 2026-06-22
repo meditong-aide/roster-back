@@ -1822,7 +1822,8 @@ async def validate_roster(
                 ShiftManage.group_id == target_group_id,
                 ShiftManage.nurse_class == "RN",
             )
-            .order_by(ShiftManage.shift_slot.asc())
+            # 중복행 결정성: 같은 슬롯이면 최대 id(최근) 행이 manpower 를 덮어쓴다.
+            .order_by(ShiftManage.shift_slot.asc(), ShiftManage.id.asc())
             .all()
         )
         #    예) { 'D': 'D', 'D1': 'D', 'MD': 'D',  'E': 'E', … }

@@ -70,7 +70,7 @@ def save_roster_config_service(
             ShiftManage.office_id == target_office_id,
             ShiftManage.group_id == target_group_id,
             ShiftManage.nurse_class == 'RN',
-        ).all()
+        ).order_by(ShiftManage.id.asc()).all()  # 중복행 결정성: 슬롯별 최대 id(최근) 행 채택
         day_req = eve_req = nig_req = 0
         if shift_manages:
             for sm in shift_manages:
