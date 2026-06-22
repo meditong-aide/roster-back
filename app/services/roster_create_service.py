@@ -2531,6 +2531,7 @@ def build_allowed_shift_type_constraints(
     shift_manage_data: list[dict] | None,
     fixed_cells: list[dict] | None,
     use_mid: bool,
+    db=None,
 ) -> dict:
     """간호사별 허용 근무유형(D/E/N) 하드 제약을 forbidden 형태로 생성한다.
 
@@ -2602,31 +2603,56 @@ def build_allowed_shift_type_constraints(
                     f"nurse_id={nurse_id}, days={day_list}"
                 )
 
+    # ── 일자별 허용 해석: NurseAllowedShiftPeriod(시점) 우선, gap이면 캐시 폴백 ──
+    # (P3) db 가 있으면 period 를 bulk fetch 해 day-grain 으로 금지셀을 만든다.
+    # 구간 없음(미backfill/gap)이면 nurses 캐시값으로 폴백 → 무회귀(기존 동작과 동일).
+    periods_by_nurse: dict[str, list] = {}
+    _resolve = None
+    if db is not None:
+        try:
+            from services.nurse_period_resolver import fetch_periods, resolve_asof as _resolve
+            from db.models import NurseAllowedShiftPeriod
+            month_end = date(year, month, days_in_month) + timedelta(days=1)
+            periods_by_nurse = fetch_periods(
+                db, NurseAllowedShiftPeriod,
+                list(nurse_id_to_allowed.keys()), month_start, month_end,
+            )
+        except Exception as exc:
+            print(f"[AllowedShiftTypes] period fetch 실패 → 캐시 폴백: {exc}")
+            periods_by_nurse, _resolve = {}, None
+
     forbidden: dict[str, dict[int, list[str]]] = {}
     all_codes = set(allowed_main_codes)
-    for nurse_id, allowed in nurse_id_to_allowed.items():
+    used_period = False
+    for nurse_id, cache_allowed in nurse_id_to_allowed.items():
         active_range = nurse_id_to_active_range.get(nurse_id)
         if not active_range:
             continue
         start_idx, end_idx = active_range
-        if not allowed:
-            continue  # 제한 없음
-        disallowed_set = set(all_codes - set(allowed))
-        disallowed = sorted(disallowed_set)
-        if not disallowed:
-            continue
-        day_map: dict[int, list[str]] = {}
         override_days = override_days_by_nurse.get(nurse_id, set())
+        rows = periods_by_nurse.get(nurse_id)
+        day_map: dict[int, list[str]] = {}
         for d in range(start_idx, end_idx + 1):
             if d in override_days:
                 continue
-            day_map[d] = disallowed
+            # period 우선(없으면 캐시). val=[] 는 '제한 없음', val=None 은 gap.
+            val = _resolve(rows, date(year, month, d + 1), "allowed_shifts", None) \
+                if (_resolve and rows) else None
+            if val is not None:
+                used_period = True
+            allowed_day = set(val) if val is not None else set(cache_allowed)
+            if not allowed_day:
+                continue  # 제한 없음
+            disallowed = sorted(all_codes - allowed_day)
+            if disallowed:
+                day_map[d] = disallowed
         if day_map:
             forbidden[nurse_id] = day_map
 
-    forb_cnt = sum(len(v) * len(next(iter(v.values()), [])) for v in forbidden.values())
+    forb_cnt = sum(len(codes) for v in forbidden.values() for codes in v.values())
     if forbidden:
-        print(f"[AllowedShiftTypes] 금지 셀(월 전체) 적용: nurses={len(forbidden)}, approx_cnt={forb_cnt}")
+        src = "period+캐시" if used_period else "캐시(월전체)"
+        print(f"[AllowedShiftTypes] 금지 셀 적용({src}): nurses={len(forbidden)}, cnt={forb_cnt}")
     return {"forced_off": {}, "forbidden": forbidden}
 
 
@@ -2796,6 +2822,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         shift_manage_data=shift_manage_data,
         fixed_cells=config_dict.get("fixed_cells"),
         use_mid=bool(config_dict.get("use_mid", False)),
+        db=db,
     )
 
     # ── 2) cross-month 경계 제약 생성 ──
