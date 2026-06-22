@@ -47,6 +47,92 @@ def test_no_recent_job(db, seed_data):
     assert "기록이 없" in res["message"]
 
 
+def test_year_month_filter_finds_failed_job_for_month(db, seed_data):
+    """year/month 지정 시 그 달의 FAILED job 만 식별. 다른 month FAILED 무시.
+
+    worker._year/_month 메타 → _job_dict 의 year/month 노출 → 여기서 활용.
+    """
+    import json
+    from db.models import RosterJob
+
+    # 8월 FAILED — 식별 대상이 아님
+    payload_aug = {
+        "_year": 2026, "_month": 8,
+        "infeasibility": {
+            "severity": "hard", "causes": [{"reason_code": "X"}],
+            "resolution_narrative": {"summary_ko": "8월 다른 실패", "action_levers": [], "trade_offs": [], "problem_list": []},
+            "hard_case": {"is_hard": False},
+        },
+    }
+    # 7월 FAILED — 진짜 대상
+    payload_jul = {
+        "_year": 2026, "_month": 7,
+        "infeasibility": {
+            "severity": "hard", "causes": [{"reason_code": "Y"}],
+            "resolution_narrative": {
+                "summary_ko": "7월 A팀 최소 초과",
+                "action_levers": [{"treatment_id": "t1", "target_family": "CoverageMin",
+                                   "config_key": "daily_shift_requirements", "direction": "decrease",
+                                   "rationale_ko": "일별 수요 1 낮추기", "covers_causes": ["Y"]}],
+                "trade_offs": [], "problem_list": [],
+            },
+            "hard_case": {"is_hard": False},
+        },
+    }
+    db.add(RosterJob(
+        job_id="job-aug", office_id=seed_data["office_id"], group_id=seed_data["group_id"],
+        nurse_id="N001", status="FAILED", progress=100,
+        error_message=json.dumps(payload_aug, ensure_ascii=False),
+    ))
+    db.add(RosterJob(
+        job_id="job-jul", office_id=seed_data["office_id"], group_id=seed_data["group_id"],
+        nurse_id="N001", status="FAILED", progress=100,
+        error_message=json.dumps(payload_jul, ensure_ascii=False),
+    ))
+    db.flush()
+
+    res = run_skill(db, "resolve-infeasibility", {
+        "group_id": seed_data["group_id"], "year": 2026, "month": 7,
+    })
+    assert res["found"] is True
+    assert res["year"] == 2026
+    assert res["month"] == 7
+    assert res["summary_ko"] == "7월 A팀 최소 초과"
+    assert len(res["options"]) == 1
+    assert res["options"][0]["target_family"] == "CoverageMin"
+
+
+def test_year_month_filter_empty_when_no_failed_for_month(db, seed_data):
+    """year/month 지정했는데 그 달 FAILED 없으면 친화 안내."""
+    import json
+    from db.models import RosterJob
+
+    # 8월만 FAILED 있고, 사용자는 7월 요청
+    payload = {
+        "_year": 2026, "_month": 8,
+        "infeasibility": {
+            "severity": "hard", "causes": [{"reason_code": "X"}],
+            "resolution_narrative": {"summary_ko": "...", "action_levers": [], "trade_offs": [], "problem_list": []},
+            "hard_case": {"is_hard": False},
+        },
+    }
+    db.add(RosterJob(
+        job_id="job-aug", office_id=seed_data["office_id"], group_id=seed_data["group_id"],
+        nurse_id="N001", status="FAILED", progress=100,
+        error_message=json.dumps(payload, ensure_ascii=False),
+    ))
+    db.flush()
+
+    res = run_skill(db, "resolve-infeasibility", {
+        "group_id": seed_data["group_id"], "year": 2026, "month": 7,
+    })
+    assert res["found"] is False
+    assert res["year"] == 2026
+    assert res["month"] == 7
+    assert "2026" in res["message"] and "7월" in res["message"]
+    assert "찾지 못했" in res["message"]
+
+
 def test_recent_job_not_failed(db, seed_data):
     from db.models import RosterJob
     job = RosterJob(

@@ -1281,12 +1281,12 @@ SKILL_TOOLS: list[dict] = [
             "- 본 스킬은 '실패 → 옵션 카탈로그' 단계에만 한정.\n\n"
 
             "─────────── 그라운딩 ───────────\n"
-            "- 대상은 **가장 최근 생성 job**(FAILED 여야 함). 다른 시점 지정은 현재 미지원.\n"
+            "- year/month 지정 시 그 달의 가장 최근 FAILED job 대상. 미지정 시 그룹의 가장 최근 job.\n"
             "- 옵션 목록이 비어있으면 '실패 원인부터 확인 필요' 라고 안내.\n\n"
 
             "─────────── 예시 ───────────\n"
-            "- '이번 실패 어떻게 풀어?' → operation='list_options'\n"
-            "- '7월 근무표 실패 해결 옵션 알려줘' → operation='list_options'\n"
+            "- '이번 실패 어떻게 풀어?' → operation='list_options' (year/month 생략 → 최근 job)\n"
+            "- '7월 근무표 실패 해결 옵션 알려줘' → operation='list_options', year=2026, month=7\n"
         ),
         "parameters": {
             "type": "object",
@@ -1295,6 +1295,14 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "enum": ["list_options"],
                     "description": "현재는 옵션 카탈로그 조회(list_options)만 지원.",
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "특정 month 의 FAILED job 식별 시 사용. month 와 함께. 미지정 시 가장 최근 job.",
+                },
+                "month": {
+                    "type": "integer",
+                    "description": "특정 month 의 FAILED job 식별 시 사용. year 와 함께. 미지정 시 가장 최근 job.",
                 },
             },
             "required": [],

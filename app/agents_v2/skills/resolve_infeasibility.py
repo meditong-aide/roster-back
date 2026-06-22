@@ -216,24 +216,54 @@ def resolve_infeasibility(db: Session, params: dict) -> Any:
             "options": ["해결 옵션 목록 보기 (list_options)"],
         }
 
-    job = generation_tools.get_latest_job(
-        db, group_id, office_id=params.get("office_id"),
-    )
-    if not job:
-        return {
-            "found": False,
-            "operation": "list_options",
-            "message": "최근 근무표 생성 기록이 없어요. 근무표를 만들어보시면 실패 원인과 해결 옵션을 보여드릴게요.",
-        }
-    if (job.get("status") or "").upper() != "FAILED":
-        return {
-            "found": False,
-            "operation": "list_options",
-            "status": job.get("status"),
-            "message": (
-                "최근 근무표 생성은 실패하지 않았어요. 해결 옵션이 필요한 시점이 아닙니다."
-            ),
-        }
+    # year/month 가 지정되면 그 달의 가장 최근 FAILED job 우선 검색.
+    # (worker.py 의 _year/_month 메타가 generation_tools._job_dict 에서
+    #  year/month 필드로 노출됨.)
+    year_p = params.get("year")
+    month_p = params.get("month")
+    office_id = params.get("office_id")
+
+    if year_p is not None and month_p is not None:
+        year_i, month_i = int(year_p), int(month_p)
+        recent = generation_tools.list_recent_jobs(
+            db, group_id, status_filter="FAILED", limit=20,
+        )
+        if office_id:
+            recent = [r for r in recent if r.get("office_id") == office_id]
+        job = next(
+            (r for r in recent
+             if r.get("year") == year_i and r.get("month") == month_i),
+            None,
+        )
+        if not job:
+            return {
+                "found": False,
+                "operation": "list_options",
+                "year": year_i, "month": month_i,
+                "message": (
+                    f"{year_i}년 {month_i}월 근무표 생성 실패 기록을 찾지 못했어요. "
+                    "다른 month 거나 아직 그 달 실패 시도가 없을 수 있어요."
+                ),
+            }
+    else:
+        job = generation_tools.get_latest_job(
+            db, group_id, office_id=office_id,
+        )
+        if not job:
+            return {
+                "found": False,
+                "operation": "list_options",
+                "message": "최근 근무표 생성 기록이 없어요. 근무표를 만들어보시면 실패 원인과 해결 옵션을 보여드릴게요.",
+            }
+        if (job.get("status") or "").upper() != "FAILED":
+            return {
+                "found": False,
+                "operation": "list_options",
+                "status": job.get("status"),
+                "message": (
+                    "최근 근무표 생성은 실패하지 않았어요. 해결 옵션이 필요한 시점이 아닙니다."
+                ),
+            }
 
     payload = _parse_payload(job.get("error_message"))
     narrative = (payload or {}).get("infeasibility", {}).get("resolution_narrative") \
