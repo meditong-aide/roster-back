@@ -155,6 +155,19 @@ async def change_nurse_period(
     if payload.attribute == "allowed_shifts" and not isinstance(payload.value, list):
         raise HTTPException(status_code=400, detail="allowed_shifts 는 리스트여야 합니다")
 
+    # cross-attribute 모순 검증(저장 시점 hard gate): 그 달 월한도·고정근무와 충돌이면 422.
+    if payload.attribute == "allowed_shifts":
+        from services.nurse_period_validator import validate_allowed_shift_period
+        issues = validate_allowed_shift_period(
+            db, payload.nurse_id, group_id, payload.value, payload.valid_from,
+        )
+        blocking = [i for i in issues if i.get("severity", "blocking") == "blocking"]
+        if blocking:
+            raise HTTPException(status_code=422, detail={
+                "message": "허용 근무형이 월 한도/고정근무 설정과 모순됩니다.",
+                "issues": blocking,
+            })
+
     upsert_period(
         db, spec["model"], payload.nurse_id, payload.valid_from,
         spec["value_attr"], payload.value,

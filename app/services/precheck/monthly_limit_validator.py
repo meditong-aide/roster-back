@@ -351,6 +351,69 @@ def warn_night_dedicated_low_n(
     return []
 
 
+def check_allowed_vs_limits(
+    allowed_set: Optional[Set[str]],
+    row: Mapping[str, Any],
+    *,
+    nurse_id: str,
+    nurse_name: Optional[str] = None,
+    max_night: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """allowed_set(가능 D/E/N) vs 월 한도 row 모순 검사 — 양방향 공용 SSOT.
+
+    monthly_limit 저장(allowed=nurse 기준)과 allowed_shifts 저장(allowed=새 값) 양쪽이
+    같은 로직을 쓰도록 allowed_set 을 명시 인자로 받는다. None=제한 없음(통과).
+
+    검출:
+        - MONTHLY_LIMIT_NOT_IN_WORK_SHIFTS : 허용 밖 시프트에 min/exact 양수
+        - MONTHLY_LIMIT_NIGHT_DEDICATED_N_OVER_MAX_NIGHT : N전담 + n하한 > max_night
+    """
+    issues: List[Dict[str, Any]] = []
+    if allowed_set is None:
+        return issues
+
+    for p in _WORK_PREFIXES:
+        if p.upper() in allowed_set:
+            continue
+        mn = _row_value(row, f"{p}_min")
+        ex = _row_value(row, f"{p}_exact")
+        if (mn is not None and mn > 0) or (ex is not None and ex > 0):
+            issues.append(_make_issue(
+                "MONTHLY_LIMIT_NOT_IN_WORK_SHIFTS",
+                nurse_id=nurse_id, nurse_name=nurse_name,
+                evidence={"shift": p.upper(), "min": mn, "exact": ex, "allowed": sorted(allowed_set)},
+                human_message_ko=(
+                    f"{nurse_name or nurse_id} 간호사의 가능 시프트는 {sorted(allowed_set)} 입니다. "
+                    f"{_SHIFT_LABEL[p]} min/exact 양수 설정은 불가능합니다."
+                ),
+                fix_suggestions_ko=[
+                    f"{_SHIFT_LABEL[p]} min/exact를 0으로 두거나 가능 시프트에 {p.upper()}를 추가하세요.",
+                ],
+            ))
+
+    if allowed_set == {"N"} and max_night is not None and int(max_night) > 0:
+        n_exact_v = _row_value(row, "n_exact")
+        n_floor = n_exact_v if n_exact_v is not None else _row_value(row, "n_min")
+        if n_floor is not None and int(n_floor) > int(max_night):
+            is_exact = n_exact_v is not None
+            label = "정확" if is_exact else "최소"
+            issues.append(_make_issue(
+                "MONTHLY_LIMIT_NIGHT_DEDICATED_N_OVER_MAX_NIGHT",
+                nurse_id=nurse_id, nurse_name=nurse_name,
+                evidence={"n_floor": int(n_floor), "max_night": int(max_night),
+                          "kind": "exact" if is_exact else "min"},
+                human_message_ko=(
+                    f"{nurse_name or nurse_id} 간호사는 N 전담인데 월간 N {label} 한도가 "
+                    f"{int(n_floor)}회로 월간 N 상한 {int(max_night)}회를 초과합니다."
+                ),
+                fix_suggestions_ko=[
+                    f"월간 N {label} 한도를 {int(max_night)} 이하로 낮추세요.",
+                    "N 전담을 해제해 D/E도 가능하게 하세요.",
+                ],
+            ))
+    return issues
+
+
 def _check_work_shifts(
     row: Mapping[str, Any],
     *,
