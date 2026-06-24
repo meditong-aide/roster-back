@@ -511,8 +511,20 @@ class RosterConfig(Base):
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
     off_swap_enabled = Column(BOOLEAN, nullable=False, default=False)
+    # ── 설정 프리셋 (저장한 설정 모달) ──
+    # version: 그룹(office+group)별 0부터 시작하는 프리셋 버전.
+    #   기능 이전(legacy) row 는 NULL → 프리셋 아님(목록 비노출). 신규 저장 및
+    #   생성 materialize(="새로운 설정n") 는 항상 값을 부여한다(익명 row 없음).
+    version = Column(INTEGER, nullable=True)
+    config_name = Column(NVARCHAR(100), nullable=True)  # 프리셋 이름. '새로운 설정n' 자동분 포함
+    config_memo = Column(NVARCHAR(500), nullable=True)  # 간단 메모
+    # 마지막 저장 시각 — upsert(in-place 수정) 시 갱신. created_at 은 최초 생성 고정.
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
     office = relationship("Office")
     group = relationship("Group")
+    # NOTE: 그룹별 version 유일성 인덱스(ux_roster_config_group_version,
+    #   WHERE version IS NOT NULL 필터드 유니크)는 개발 마무리 후 추가 예정.
+    #   현재는 version 할당이 MAX+1(앱) 단독 — 동시 저장 충돌은 실무상 희박해 보류.
 
 
 class RosterGradeConfig(Base):
