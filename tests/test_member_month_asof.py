@@ -11,8 +11,10 @@ import pytest
 
 from db.models import (
     Office, Group, Nurse, NurseGradePeriod, NurseAllowedShiftPeriod,
+    NurseWeekendOffPeriod,
 )
 from services.assignment_service import group_members_in_month
+from services.nurse_service import attach_member_badges_to_nurses
 
 
 @pytest.fixture
@@ -56,3 +58,37 @@ def test_night_dedicated_shows_asof_month(seeded):
     aug = _m(group_members_in_month(db, "A", 2026, 8), "n1")
     assert jul["is_night_dedicated"] is False and jul["badge"] != "N전담"
     assert aug["is_night_dedicated"] is True and aug["badge"] == "N전담"
+
+
+def test_weekend_and_fixed_show_asof_month(seeded):
+    db = seeded
+    # 8월부터 주말휴무 + 고정근무 D
+    db.add(NurseWeekendOffPeriod(nurse_id="n1", valid_from=date(2026, 8, 1),
+           valid_to=None, weekend_off=1))
+    db.add(NurseAllowedShiftPeriod(nurse_id="n1", valid_from=date(2026, 8, 1),
+           valid_to=None, allowed_shifts=[], fixed_shift="D"))
+    db.flush()
+    jul = _m(group_members_in_month(db, "A", 2026, 7), "n1")
+    aug = _m(group_members_in_month(db, "A", 2026, 8), "n1")
+    assert jul["as_of_weekend_off"] == 0 and jul["as_of_fixed_shift"] is None  # gap→캐시
+    assert aug["as_of_weekend_off"] == 1 and aug["as_of_fixed_shift"] == "D"
+
+
+def test_nurses_base_fields_overwritten_by_asof(seeded):
+    db = seeded  # 캐시: grade=2, is_weekend_off=False, fixed_shift=None, is_night_nurse=[]
+    db.add(NurseGradePeriod(nurse_id="n1", group_id="A",
+           valid_from=date(2026, 8, 1), valid_to=None, grade=5))
+    db.add(NurseWeekendOffPeriod(nurse_id="n1", valid_from=date(2026, 8, 1),
+           valid_to=None, weekend_off=1))
+    db.add(NurseAllowedShiftPeriod(nurse_id="n1", valid_from=date(2026, 8, 1),
+           valid_to=None, allowed_shifts=["N"], fixed_shift="N"))
+    db.flush()
+    # /nurses base dict (캐시값) → 월 병합 시 as-of 로 덮어써야 함
+    rows = [{"nurse_id": "n1", "grade": 2, "is_weekend_off": False,
+             "fixed_shift": None, "is_night_nurse": [], "team_id": 9}]
+    attach_member_badges_to_nurses(db, rows, "A", 2026, 8)
+    r = rows[0]
+    assert r["grade"] == 5              # 캐시 2 → as-of 5
+    assert r["is_weekend_off"] is True  # False → 1
+    assert r["fixed_shift"] == "N"      # None → N
+    assert r["is_night_nurse"] == ["N"]  # [] → ["N"]

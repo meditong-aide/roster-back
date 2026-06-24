@@ -217,6 +217,9 @@ _MEMBER_BADGE_FIELDS: Tuple[str, ...] = (
     "as_of_team",
     "as_of_grade",
     "is_night_dedicated",
+    "as_of_is_night_nurse",
+    "as_of_weekend_off",
+    "as_of_fixed_shift",
 )
 
 
@@ -254,6 +257,15 @@ def attach_member_badges_to_nurses(
             continue
         for key in _MEMBER_BADGE_FIELDS:
             n[key] = member.get(key)
+        # ── nurses 배선 일원화(kill): year/month 동반 시 base 속성 필드를 월 as-of 로 덮어쓴다.
+        #   캐시(오늘값)·inbound overlay 가 아니라 period as-of 가 SSOT — 월 이동하면 그 달 값이 보임.
+        n["grade"] = member.get("as_of_grade")
+        n["team_id"] = member.get("as_of_team")
+        _aon = member.get("as_of_is_night_nurse")
+        if _aon is not None:                       # [] = 제한없음(유효값) → 덮어씀
+            n["is_night_nurse"] = _aon
+        n["fixed_shift"] = member.get("as_of_fixed_shift")
+        n["is_weekend_off"] = bool(member.get("as_of_weekend_off"))
         # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
         # display_group_id = 이 membership 이 표시되는 기준 그룹(조회/선택 그룹).
         n["membership"] = {

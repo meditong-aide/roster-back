@@ -1069,12 +1069,16 @@ def group_members_in_month(
     from services.nurse_period_resolver import (
         fetch_periods as _fetch_periods, resolve_asof as _resolve_asof,
     )
-    from db.models import NurseGradePeriod as _NGP, NurseAllowedShiftPeriod as _NASP
+    from db.models import (
+        NurseGradePeriod as _NGP, NurseAllowedShiftPeriod as _NASP,
+        NurseWeekendOffPeriod as _NWOP,
+    )
 
     _home_ids = [str(n.nurse_id) for n in home]
     _asof_next = month_start + _timedelta(days=1)
     _grade_periods = _fetch_periods(db, _NGP, _home_ids, month_start, _asof_next, group_id=group_id)
     _allowed_periods = _fetch_periods(db, _NASP, _home_ids, month_start, _asof_next)
+    _weekend_periods = _fetch_periods(db, _NWOP, _home_ids, month_start, _asof_next)
 
     def _asof_grade(nid: str, n_obj):
         v = _resolve_asof(_grade_periods.get(nid), month_start, "grade", default=None)
@@ -1084,12 +1088,24 @@ def group_members_in_month(
         v = _resolve_asof(_allowed_periods.get(nid), month_start, "allowed_shifts", default=None)
         return v if v is not None else getattr(n_obj, "is_night_nurse", None)
 
-    def _row(n, status, marker, badge, team, grade, night_profile=...):
+    def _asof_fixed(nid: str, n_obj):
+        # fixed_shift 는 allowed satellite 의 형제 컬럼(같은 row)
+        v = _resolve_asof(_allowed_periods.get(nid), month_start, "fixed_shift", default=None)
+        return v if v is not None else getattr(n_obj, "fixed_shift", None)
+
+    def _asof_weekend(nid: str, n_obj):
+        v = _resolve_asof(_weekend_periods.get(nid), month_start, "weekend_off", default=None)
+        return v if v is not None else (1 if getattr(n_obj, "is_weekend_off", False) else 0)
+
+    def _row(n, status, marker, badge, team, grade, night_profile=...,
+             weekend_off=..., fixed_shift=...):
         # N전담(허용 shift=N뿐) 판정 → 'N전담' 배지 + is_night_dedicated.
         # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.is_night_nurse 가
         #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
         #   night_profile 미지정(home) 은 base 사용. (생성기는 N전담을 팀 D/E 커버리지에서 제외.)
         _np = getattr(n, "is_night_nurse", None) if night_profile is ... else night_profile
+        _wo = (1 if getattr(n, "is_weekend_off", False) else 0) if weekend_off is ... else weekend_off
+        _fx = getattr(n, "fixed_shift", None) if fixed_shift is ... else fixed_shift
         night_dedicated = is_n_only_profile(_np)
         if night_dedicated and badge is None:
             badge = "N전담"
@@ -1102,6 +1118,9 @@ def group_members_in_month(
             "as_of_team": team,
             "as_of_grade": grade,
             "is_night_dedicated": night_dedicated,
+            "as_of_is_night_nurse": _np,   # 월 as-of 전담 프로필(raw, /nurses base 덮어쓰기용)
+            "as_of_weekend_off": _wo,
+            "as_of_fixed_shift": _fx,
         }
 
     members: list[dict] = []
@@ -1112,22 +1131,25 @@ def group_members_in_month(
         team = _resolved_team(nid, n)
         grade = _asof_grade(nid, n)      # 월 as-of (gap→nurses.grade)
         _np = _asof_night(nid, n)        # 월 as-of 전담 프로필 (gap→nurses.is_night_nurse)
+        _wo = _asof_weekend(nid, n)      # 월 as-of 주말휴무 (gap→nurses.is_weekend_off)
+        _fx = _asof_fixed(nid, n)        # 월 as-of 고정근무 (gap→nurses.fixed_shift)
+        _kw = dict(night_profile=_np, weekend_off=_wo, fixed_shift=_fx)
         if nid in outbound:
             a = outbound[nid]
             if a.reason == "병동이동":
                 if a.start_date <= month_start:
                     continue  # 완전 전출 → 그 달 미표시
-                members.append(_row(n, "outbound", "←", None, team, grade, night_profile=_np))
+                members.append(_row(n, "outbound", "←", None, team, grade, **_kw))
             else:  # 파견 나감 — home 유지
-                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, night_profile=_np))
+                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, **_kw))
         elif nid in leave:
             a = leave[nid]
             if a.reason == "퇴사":
-                members.append(_row(n, "resigned", None, "퇴사", team, grade, night_profile=_np))
+                members.append(_row(n, "resigned", None, "퇴사", team, grade, **_kw))
             else:
-                members.append(_row(n, "leave", None, "휴직", team, grade, night_profile=_np))
+                members.append(_row(n, "leave", None, "휴직", team, grade, **_kw))
         else:
-            members.append(_row(n, "active", None, None, team, grade, night_profile=_np))
+            members.append(_row(n, "active", None, None, team, grade, **_kw))
 
     # [Perf] inbound 도 nurse_id IN 배치 1쿼리 (간호사별 NurseModel 재조회 제거)
     _inbound_ids = [nid for nid in inbound if nid not in seen]
@@ -1154,16 +1176,19 @@ def group_members_in_month(
         grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
         # 파견지 유효 근무형태(target_shift_types) — N전담 배지 판정용. []=전체(비N전담), 엔진/`/nurses`와 동일.
         _np = a.target_shift_types or []
+        # 고정근무도 파견지 override(target_fixed_shift) 우선, 없으면 base. 주말휴무는 override 없어 base.
+        _fx = a.target_fixed_shift if a.target_fixed_shift is not None else getattr(n, "fixed_shift", None)
+        _kw = dict(night_profile=_np, fixed_shift=_fx)
         if a.reason == "파견":
             # 파견(일시·복귀 예정) = 지속 상태 → 기간 내내 '파견' 배지(전이 아님, 마커 없음).
-            members.append(_row(n, "inbound", None, "파견", team, grade, night_profile=_np))
+            members.append(_row(n, "inbound", None, "파견", team, grade, **_kw))
         elif a.start_date is not None and month_start <= a.start_date <= month_end:
             # 병동이동 = 일회성 전이 → 이동月(start ∈ 그 달)에만 전입(→).
-            members.append(_row(n, "inbound", "→", None, team, grade, night_profile=_np))
+            members.append(_row(n, "inbound", "→", None, team, grade, **_kw))
         else:
             # 이미 이동 완료(지난 달 발효) → 정착 일반 멤버(마커 없음).
             #   캐시(nurses.group_id) flush 전이어도 그 병동 소속이므로 명단엔 포함한다.
-            members.append(_row(n, "active", None, None, team, grade, night_profile=_np))
+            members.append(_row(n, "active", None, None, team, grade, **_kw))
 
     headcount = {
         "regular": sum(1 for m in members if m["membership_status"] == "active"),
