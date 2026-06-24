@@ -502,6 +502,16 @@ def update_nurse_attributes_batch(
                 "allowed_shifts", v if isinstance(v, list) else [],
                 nurse=nurse, cache_attr="is_night_nurse", source="edited",
             )
+        elif f == "grade":
+            # grade → nurse_grade_period 일원화(병동귀속). 컬럼은 단방향 투영(직접쓰기 금지).
+            from datetime import date as _date
+            from db.models import NurseGradePeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseGradePeriod, nurse.nurse_id, _date.today(),
+                "grade", v, group_id=group_id,
+                nurse=nurse, cache_attr="grade", source="edited",
+            )
         else:
             setattr(nurse, f, v)
     db.commit()

@@ -945,8 +945,8 @@ def bulk_update_nurses_service(
 
         # === 프론트에서 보내준 값으로 일괄 업데이트 ===
         for key, value in update_data.items():
-            if key == "is_night_nurse":
-                continue  # 아래에서 period(nurse_allowed_shift_period)로 일원화 — 컬럼 직접 쓰기 금지
+            if key in ("is_night_nurse", "grade"):
+                continue  # 아래에서 period 로 일원화 — 컬럼 직접 쓰기 금지
             if hasattr(db_nurse, key):
                 setattr(db_nurse, key, value)
 
@@ -968,6 +968,20 @@ def bulk_update_nurses_service(
                 db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _date.today(),
                 "allowed_shifts", final_night,
                 nurse=db_nurse, cache_attr="is_night_nurse", source="edited",
+            )
+
+        # === grade → nurse_grade_period 일원화(병동귀속) ===
+        # 진실=period, nurses.grade 컬럼은 upsert 의 단방향 투영으로만 갱신.
+        # '현재값 변경'이라 valid_from=오늘. 미래발효는 POST /nurse-period/change 사용.
+        if "grade" in update_data:
+            from datetime import date as _date
+            from db.models import NurseGradePeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseGradePeriod, db_nurse.nurse_id, _date.today(),
+                "grade", update_data["grade"],
+                group_id=db_nurse.group_id,
+                nurse=db_nurse, cache_attr="grade", source="edited",
             )
 
         # === 후처리: work_shifts (None → 빈 배열) ===
