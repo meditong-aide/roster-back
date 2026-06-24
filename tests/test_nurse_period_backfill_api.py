@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from db.client2 import get_db
 from db.models import (
     Office, Group, Nurse,
-    NurseAllowedShiftPeriod, NurseWeekendOffPeriod, NurseFixedShiftPeriod, NurseGradePeriod,
+    NurseAllowedShiftPeriod, NurseWeekendOffPeriod, NurseGradePeriod,
 )
 from routers.auth import get_current_user_from_cookie
 from routers.nurse_period import router as nurse_period_router
@@ -89,8 +89,8 @@ def test_backfill_seeds_period_rows(seeded):
     assert resolve_asof(by_wo["n1"], date(2026, 7, 10), "weekend_off") == 1
     assert resolve_asof(by_wo["n2"], date(2026, 7, 10), "weekend_off") == 0
 
-    by_fx = fetch_periods(db, NurseFixedShiftPeriod, ["n1", "n2"], MS, ME)
-    assert resolve_asof(by_fx["n2"], date(2026, 7, 10), "fixed_shift") == "D_A"
+    # fixed_shift 는 allowed satellite 의 형제 컬럼(같은 row) — by_as 로 확인
+    assert resolve_asof(by_as["n2"], date(2026, 7, 10), "fixed_shift") == "D_A"
 
     by_gr = fetch_periods(db, NurseGradePeriod, ["n1", "n2"], MS, ME, group_id="A")
     assert resolve_asof(by_gr["n1"], date(2026, 7, 10), "grade") == 1

@@ -21,7 +21,6 @@ from db.models import (
     NurseGradePeriod,
     NurseAllowedShiftPeriod,
     NurseWeekendOffPeriod,
-    NurseFixedShiftPeriod,
 )
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
@@ -38,16 +37,19 @@ def _allowed_value(n: Nurse):
 
 
 # 속성별 스펙: model · 값컬럼 · ward귀속 · nurses캐시컬럼(투영) · nurses→value 변환(backfill용)
+#   · carry_attrs: 같은 satellite 의 형제 value 컬럼(새 구간 열 때 carry-forward)
+# allowed_shifts 와 fixed_shift 는 한 테이블(nurse_allowed_shift_period)의 두 컬럼 = 결합 satellite.
 _ATTR_SPECS: dict[str, dict] = {
     "allowed_shifts": dict(model=NurseAllowedShiftPeriod, value_attr="allowed_shifts",
                            group_bound=False, cache_attr="is_night_nurse",
-                           value_fn=_allowed_value),
+                           value_fn=_allowed_value, carry_attrs=["fixed_shift"]),
+    "fixed_shift": dict(model=NurseAllowedShiftPeriod, value_attr="fixed_shift",
+                        group_bound=False, cache_attr="fixed_shift",
+                        value_fn=lambda n: getattr(n, "fixed_shift", None),
+                        carry_attrs=["allowed_shifts"]),
     "weekend_off": dict(model=NurseWeekendOffPeriod, value_attr="weekend_off",
                         group_bound=False, cache_attr="is_weekend_off",
                         value_fn=lambda n: 1 if getattr(n, "is_weekend_off", False) else 0),
-    "fixed_shift": dict(model=NurseFixedShiftPeriod, value_attr="fixed_shift",
-                        group_bound=False, cache_attr="fixed_shift",
-                        value_fn=lambda n: getattr(n, "fixed_shift", None)),
     "grade": dict(model=NurseGradePeriod, value_attr="grade",
                   group_bound=True, cache_attr="grade",
                   value_fn=lambda n: getattr(n, "grade", None)),
@@ -98,7 +100,7 @@ async def backfill_nurse_periods(
                 db, spec["model"], n.nurse_id, valid_from,
                 spec["value_attr"], spec["value_fn"](n),
                 group_id=group_id if spec["group_bound"] else None,
-                source="inherited",
+                source="inherited", carry_attrs=spec.get("carry_attrs"),
             )
     db.commit()
 
@@ -173,6 +175,7 @@ async def change_nurse_period(
         spec["value_attr"], payload.value,
         group_id=group_id if spec["group_bound"] else None,
         nurse=nurse, cache_attr=spec["cache_attr"], source="edited",
+        carry_attrs=spec.get("carry_attrs"),
     )
     db.commit()
 

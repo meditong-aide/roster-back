@@ -40,8 +40,8 @@ from db.models import (  # noqa: E402
     NurseGradePeriod,
     NurseAllowedShiftPeriod,
     NurseWeekendOffPeriod,
-    NurseFixedShiftPeriod,
 )
+# NOTE: NurseFixedShiftPeriod 는 폐기됨 — fixed_shift 는 nurse_allowed_shift_period 컬럼으로 통합.
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -51,7 +51,6 @@ NEW_TABLES = [
     NurseGradePeriod.__table__,
     NurseAllowedShiftPeriod.__table__,
     NurseWeekendOffPeriod.__table__,
-    NurseFixedShiftPeriod.__table__,
 ]
 
 

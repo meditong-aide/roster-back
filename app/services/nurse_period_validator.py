@@ -16,7 +16,7 @@ from sqlalchemy import or_
 
 from db.models import (
     Nurse, RosterConfig, NurseMonthlyLimit,
-    NurseAllowedShiftPeriod, NurseFixedShiftPeriod,
+    NurseAllowedShiftPeriod,
 )
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
 from services.precheck.monthly_limit_validator import check_allowed_vs_limits, _make_issue
@@ -93,13 +93,14 @@ def validate_allowed_shift_period(
             iss["evidence"]["month"] = r.month
         issues.extend(month_issues)
 
-    # ── 2) fixed_shift(period) 교차: 고정 근무형이 허용 밖이면 모순 ──
+    # ── 2) fixed_shift 교차: 고정 근무형이 허용 밖이면 모순 ──
+    # fixed_shift 는 같은 satellite(nurse_allowed_shift_period)의 형제 컬럼.
     fx_rows = (
-        db.query(NurseFixedShiftPeriod)
-        .filter(NurseFixedShiftPeriod.nurse_id == nurse_id,
-                NurseFixedShiftPeriod.valid_from < (end or date(9999, 12, 31)),
-                or_(NurseFixedShiftPeriod.valid_to.is_(None),
-                    NurseFixedShiftPeriod.valid_to > valid_from))
+        db.query(NurseAllowedShiftPeriod)
+        .filter(NurseAllowedShiftPeriod.nurse_id == nurse_id,
+                NurseAllowedShiftPeriod.valid_from < (end or date(9999, 12, 31)),
+                or_(NurseAllowedShiftPeriod.valid_to.is_(None),
+                    NurseAllowedShiftPeriod.valid_to > valid_from))
         .all()
     )
     for fx in fx_rows:

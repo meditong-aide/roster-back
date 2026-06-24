@@ -74,15 +74,21 @@ def open_span_covering(db, Model, nurse_id: str, valid_from: date,
 def upsert_period(db, Model, nurse_id: str, valid_from: date, value_attr: str,
                   value: Any, group_id: str | None = None, *,
                   nurse=None, cache_attr: str | None = None,
-                  source: str = "edited", today: date | None = None):
+                  source: str = "edited", today: date | None = None,
+                  carry_attrs: list[str] | None = None):
     """valid_from 부터 value 로 변경(close-before-open). 단방향 캐시 투영 포함.
 
     - 같은 시작일 구간이 이미 있으면 제자리 갱신(empty span 방지).
     - 직전 열린 구간은 valid_to=valid_from 으로 닫음.
     - 동일값이면 no-op.
     - nurse+cache_attr 주어지고 valid_from<=today 면 nurses 컬럼에 동기 투영.
+    - carry_attrs: 한 row 가 여러 value 컬럼을 갖는 satellite(예: allowed_shifts+fixed_shift)에서,
+      새 구간을 열 때 명시 안 한 형제 컬럼을 직전 구간(cur)에서 승계(carry-forward)한다.
     반환: 생성/갱신된 row.
     """
+    # 같은 txn 의 직전 pending 쓰기(예: 통합 satellite 의 allowed→fixed 순차 upsert)를
+    # open_span_covering 이 보도록 강제 flush. SessionLocal(autoflush=False)에서도 자기일관.
+    db.flush()
     cur = open_span_covering(db, Model, nurse_id, valid_from, group_id)
 
     if cur is not None and getattr(cur, value_attr) == value:
@@ -99,6 +105,11 @@ def upsert_period(db, Model, nurse_id: str, valid_from: date, value_attr: str,
         }
         if group_id is not None and hasattr(Model, "group_id"):
             kwargs["group_id"] = group_id
+        # 형제 value 컬럼 carry-forward (다컬럼 satellite)
+        if carry_attrs and cur is not None:
+            for _a in carry_attrs:
+                if _a != value_attr:
+                    kwargs.setdefault(_a, getattr(cur, _a))
         row = Model(**kwargs)
         db.add(row)
 

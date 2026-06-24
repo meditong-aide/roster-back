@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from db.client2 import get_db
 from db.models import (
-    Office, Group, Nurse, NurseMonthlyLimit, RosterConfig, NurseFixedShiftPeriod,
+    Office, Group, Nurse, NurseMonthlyLimit, RosterConfig, NurseAllowedShiftPeriod,
 )
 from routers.auth import get_current_user_from_cookie
 from routers.nurse_period import router as nurse_period_router
@@ -56,8 +56,9 @@ def test_night_dedicated_over_max_night_blocks(base):
 
 def test_allowed_vs_fixed_shift_blocks(base):
     db = base
-    db.add(NurseFixedShiftPeriod(nurse_id="n1", valid_from=date(2026, 7, 1),
-           valid_to=None, fixed_shift="N_A"))
+    # fixed_shift 는 allowed satellite 의 형제 컬럼 (allowed_shifts NOT NULL)
+    db.add(NurseAllowedShiftPeriod(nurse_id="n1", valid_from=date(2026, 7, 1),
+           valid_to=None, allowed_shifts=["N"], fixed_shift="N_A"))
     db.flush()
     issues = validate_allowed_shift_period(db, "n1", "A", ["D", "E"], date(2026, 7, 1))
     assert "ALLOWED_VS_FIXED_SHIFT_CONFLICT" in _codes(issues)

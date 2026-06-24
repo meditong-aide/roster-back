@@ -256,10 +256,18 @@ class NurseGradePeriod(Base, EffectiveDatedPeriodMixin):
 
 
 class NurseAllowedShiftPeriod(Base, EffectiveDatedPeriodMixin):
-    """허용 근무형(전담 포함) 시점 구간 (간호사귀속). ["D"]/["D","E"]/["N"]."""
+    """근무형(shift-form) 시점 구간 (간호사귀속).
+
+    한 row 가 (allowed_shifts, fixed_shift) 쌍을 함께 담는다 — 둘은 결합 속성:
+    고정 간호사의 allowed 는 사실상 {fixed_code} 이고 같이 변하므로 한 satellite 로 통합.
+    - allowed_shifts: 허용 근무형 집합. ["D"]/["D","E"]/["N"]/[](제한없음).
+    - fixed_shift: 값이 있으면 그 코드로 '고정'(솔버 우회·평일=코드/주말=OFF). NULL=일반 스케줄.
+    한쪽만 바꿔도 다른쪽은 직전 구간값 carry-forward (upsert_period carry_attrs).
+    """
 
     __tablename__ = "nurse_allowed_shift_period"
     allowed_shifts = Column(JSON, nullable=False)
+    fixed_shift = Column(VARCHAR(20), nullable=True)
     __table_args__ = (Index("ix_nasp_nurse", "nurse_id", "valid_from"),)
 
 
@@ -269,14 +277,6 @@ class NurseWeekendOffPeriod(Base, EffectiveDatedPeriodMixin):
     __tablename__ = "nurse_weekendoff_period"
     weekend_off = Column(TINYINT, nullable=True)
     __table_args__ = (Index("ix_nwop_nurse", "nurse_id", "valid_from"),)
-
-
-class NurseFixedShiftPeriod(Base, EffectiveDatedPeriodMixin):
-    """고정 근무형 시점 구간 (간호사귀속). shifts.shift_id 코드."""
-
-    __tablename__ = "nurse_fixedshift_period"
-    fixed_shift = Column(VARCHAR(20), nullable=True)
-    __table_args__ = (Index("ix_nfsp_nurse", "nurse_id", "valid_from"),)
 
 
 class NurseAssignment(Base):
