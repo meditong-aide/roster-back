@@ -266,7 +266,9 @@ class NurseAllowedShiftPeriod(Base, EffectiveDatedPeriodMixin):
     """
 
     __tablename__ = "nurse_allowed_shift_period"
-    allowed_shifts = Column(JSON, nullable=False)
+    # default=list: fixed_shift 만 설정해 새 구간 생성 시(carry 대상 allowed 부재) []로 채움
+    # ([] = 제한없음. 고정 간호사는 솔버 우회라 안전한 기본값).
+    allowed_shifts = Column(JSON, nullable=False, default=list)
     fixed_shift = Column(VARCHAR(20), nullable=True)
     __table_args__ = (Index("ix_nasp_nurse", "nurse_id", "valid_from"),)
 

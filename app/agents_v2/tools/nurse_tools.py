@@ -512,6 +512,26 @@ def update_nurse_attributes_batch(
                 "grade", v, group_id=group_id,
                 nurse=nurse, cache_attr="grade", source="edited",
             )
+        elif f == "fixed_shift":
+            # 고정 근무형 → nurse_allowed_shift_period(통합 satellite)의 fixed_shift 컬럼.
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, nurse.nurse_id, _date.today(),
+                "fixed_shift", v, nurse=nurse, cache_attr="fixed_shift",
+                carry_attrs=["allowed_shifts"], source="edited",
+            )
+        elif f == "is_weekend_off":
+            # 주말휴무 → nurse_weekendoff_period. 컬럼은 단방향 투영(직접쓰기 금지).
+            from datetime import date as _date
+            from db.models import NurseWeekendOffPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseWeekendOffPeriod, nurse.nurse_id, _date.today(),
+                "weekend_off", 1 if v else 0,
+                nurse=nurse, cache_attr="is_weekend_off", source="edited",
+            )
         else:
             setattr(nurse, f, v)
     db.commit()

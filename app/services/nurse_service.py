@@ -945,7 +945,7 @@ def bulk_update_nurses_service(
 
         # === 프론트에서 보내준 값으로 일괄 업데이트 ===
         for key, value in update_data.items():
-            if key in ("is_night_nurse", "grade"):
+            if key in ("is_night_nurse", "grade", "fixed_shift", "is_weekend_off"):
                 continue  # 아래에서 period 로 일원화 — 컬럼 직접 쓰기 금지
             if hasattr(db_nurse, key):
                 setattr(db_nurse, key, value)
@@ -982,6 +982,29 @@ def bulk_update_nurses_service(
                 "grade", update_data["grade"],
                 group_id=db_nurse.group_id,
                 nurse=db_nurse, cache_attr="grade", source="edited",
+            )
+
+        # === fixed_shift → nurse_allowed_shift_period(통합 satellite) ===
+        if "fixed_shift" in update_data:
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _date.today(),
+                "fixed_shift", update_data["fixed_shift"],
+                nurse=db_nurse, cache_attr="fixed_shift",
+                carry_attrs=["allowed_shifts"], source="edited",
+            )
+
+        # === is_weekend_off → nurse_weekendoff_period ===
+        if "is_weekend_off" in update_data:
+            from datetime import date as _date
+            from db.models import NurseWeekendOffPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseWeekendOffPeriod, db_nurse.nurse_id, _date.today(),
+                "weekend_off", 1 if update_data["is_weekend_off"] else 0,
+                nurse=db_nurse, cache_attr="is_weekend_off", source="edited",
             )
 
         # === 후처리: work_shifts (None → 빈 배열) ===
