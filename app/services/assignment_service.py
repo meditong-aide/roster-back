@@ -1063,6 +1063,27 @@ def group_members_in_month(
             return _coerce_team_int(getattr(n_obj, "team_id", None))
         return None
 
+    # [Perf] grade·allowed_shifts(전담) 도 월 as-of 로 배치 해석(team 과 동일 원칙).
+    #   home(소속) 간호사만 — inbound 는 파견지 override(target_*) 사용. gap→캐시 폴백(무회귀).
+    from datetime import timedelta as _timedelta
+    from services.nurse_period_resolver import (
+        fetch_periods as _fetch_periods, resolve_asof as _resolve_asof,
+    )
+    from db.models import NurseGradePeriod as _NGP, NurseAllowedShiftPeriod as _NASP
+
+    _home_ids = [str(n.nurse_id) for n in home]
+    _asof_next = month_start + _timedelta(days=1)
+    _grade_periods = _fetch_periods(db, _NGP, _home_ids, month_start, _asof_next, group_id=group_id)
+    _allowed_periods = _fetch_periods(db, _NASP, _home_ids, month_start, _asof_next)
+
+    def _asof_grade(nid: str, n_obj):
+        v = _resolve_asof(_grade_periods.get(nid), month_start, "grade", default=None)
+        return v if v is not None else getattr(n_obj, "grade", None)
+
+    def _asof_night(nid: str, n_obj):
+        v = _resolve_asof(_allowed_periods.get(nid), month_start, "allowed_shifts", default=None)
+        return v if v is not None else getattr(n_obj, "is_night_nurse", None)
+
     def _row(n, status, marker, badge, team, grade, night_profile=...):
         # N전담(허용 shift=N뿐) 판정 → 'N전담' 배지 + is_night_dedicated.
         # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.is_night_nurse 가
@@ -1089,23 +1110,24 @@ def group_members_in_month(
         nid = str(n.nurse_id)
         seen.add(nid)
         team = _resolved_team(nid, n)
-        grade = getattr(n, "grade", None)
+        grade = _asof_grade(nid, n)      # 월 as-of (gap→nurses.grade)
+        _np = _asof_night(nid, n)        # 월 as-of 전담 프로필 (gap→nurses.is_night_nurse)
         if nid in outbound:
             a = outbound[nid]
             if a.reason == "병동이동":
                 if a.start_date <= month_start:
                     continue  # 완전 전출 → 그 달 미표시
-                members.append(_row(n, "outbound", "←", None, team, grade))
+                members.append(_row(n, "outbound", "←", None, team, grade, night_profile=_np))
             else:  # 파견 나감 — home 유지
-                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade))
+                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, night_profile=_np))
         elif nid in leave:
             a = leave[nid]
             if a.reason == "퇴사":
-                members.append(_row(n, "resigned", None, "퇴사", team, grade))
+                members.append(_row(n, "resigned", None, "퇴사", team, grade, night_profile=_np))
             else:
-                members.append(_row(n, "leave", None, "휴직", team, grade))
+                members.append(_row(n, "leave", None, "휴직", team, grade, night_profile=_np))
         else:
-            members.append(_row(n, "active", None, None, team, grade))
+            members.append(_row(n, "active", None, None, team, grade, night_profile=_np))
 
     # [Perf] inbound 도 nurse_id IN 배치 1쿼리 (간호사별 NurseModel 재조회 제거)
     _inbound_ids = [nid for nid in inbound if nid not in seen]
