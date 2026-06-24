@@ -58,7 +58,7 @@ from db.models import (  # noqa: E402
     Schedule, ScheduleEntry, RosterConfig, RosterJob,
     Wanted, WantedRequest, NurseShiftRequest, NursePairRequest, FixedWantedEntry,
     IssuedRoster, ShiftManage, RosterGradeConfig, NurseMonthlyLimit, NurseAssignment,
-    NurseTeamPeriod,
+    NurseTeamPeriod, WeeklyOffSetting,
     AgentConversation, AgentConversationMessage, AgentUserMemory,
     AgentMemoryAudit, AgentSkillInvocation,
 )
@@ -86,6 +86,7 @@ _REQUIRED_TABLES = [
     NursePairRequest.__table__,
     FixedWantedEntry.__table__, ShiftManage.__table__, IssuedRoster.__table__,
     NurseMonthlyLimit.__table__, NurseAssignment.__table__, NurseTeamPeriod.__table__,
+    WeeklyOffSetting.__table__,
     AgentConversation.__table__, AgentConversationMessage.__table__,
     AgentUserMemory.__table__,
     AgentMemoryAudit.__table__,
