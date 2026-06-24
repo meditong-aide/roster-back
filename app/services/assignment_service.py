@@ -1115,7 +1115,9 @@ def group_members_in_month(
             "membership_status": status,   # active|outbound|dispatch_out|leave|resigned|inbound
             "marker": marker,              # '←'(전출) | '→'(전입) | None
             "badge": badge,                # '파견 중' | '휴직' | '퇴사' | '파견' | 'N전담' | None
-            "as_of_team": team,
+            # N전담(허용=N뿐)은 팀 배정 풀에서 제외 → 근무자관리에 팀 미배정(None) 표시.
+            #   commit 6f066ff 의도였으나 team SSOT→period 리팩터 때 누락됨. as-of 기준으로 복원.
+            "as_of_team": None if night_dedicated else team,
             "as_of_grade": grade,
             "is_night_dedicated": night_dedicated,
             "as_of_is_night_nurse": _np,   # 월 as-of 전담 프로필(raw, /nurses base 덮어쓰기용)
