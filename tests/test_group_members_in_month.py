@@ -107,8 +107,8 @@ def test_dispatch_out_badge_persists_across_months(seeded):
         assert by_id["dispatch1"]["badge"] == "파견 중"
 
 
-def test_night_dedicated_is_unassigned(db):
-    """N전담(is_night_nurse=['N'])은 as_of_team=None + 'N전담' 배지 + is_night_dedicated=True."""
+def test_night_dedicated_keeps_team(db):
+    """N전담(is_night_nurse=['N'])도 팀 소속 가능(정책 변경) → as_of_team=팀 유지 + 'N전담' 배지."""
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="reg", account_id="acc_reg", group_id="A", office_id="o1",
@@ -118,7 +118,7 @@ def test_night_dedicated_is_unassigned(db):
     db.flush()
     by_id = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
     assert by_id["night"]["is_night_dedicated"] is True
-    assert by_id["night"]["as_of_team"] is None
+    assert by_id["night"]["as_of_team"] == 2     # 팀 소속 유지(None 강제 안 함)
     assert by_id["night"]["badge"] == "N전담"
     assert by_id["reg"]["is_night_dedicated"] is False
     assert by_id["reg"]["as_of_team"] == 1
@@ -133,7 +133,7 @@ def test_night_dedicated_robust_string_form(db):
     db.flush()
     by_id = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
     assert by_id["night2"]["is_night_dedicated"] is True
-    assert by_id["night2"]["as_of_team"] is None
+    assert by_id["night2"]["as_of_team"] == 1    # N전담도 팀 소속 유지(정책 변경)
 
 
 def test_as_of_team_uses_period_over_cache(db):
