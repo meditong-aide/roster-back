@@ -79,15 +79,36 @@
 - 기존 커플링 유지: **`fixed_shift` 코드 설정 → `is_weekend_off` 자동 True**, 해제 → False.
   프론트가 fixed 설정 시 주말휴무 토글도 따라 바뀜을 예상할 것.
 
-## 5. ⚠️ 백엔드 갭 (프론트 요구 시 추가 필요)
+## 5. 근무자관리 월 셀렉터 — 속성이 그 달 값으로 보임 (읽기 계약 변경)
 
-현재 period 라우터는 **쓰기(POST)만** 있음 — backfill / change / roll.
-**한 간호사의 속성 타임라인을 조회(GET)하는 엔드포인트가 없다.**
-- "이 간호사: 3월까지 D, 4월부터 D·E" 처럼 **미래발효 변경을 화면에 표시**하려면
-  `GET /nurse-period?nurse_id=&attribute=` (구간 목록) 신설이 필요.
-- 현재값만 보여줄 거면 기존 `nurses` 컬럼으로 충분(갭 아님).
+`GET /nurses` 와 `GET /members` 를 **`year`/`month` 와 함께** 호출하면, 응답의 **base 속성
+필드가 그 달 기준 as-of 값으로 내려간다**(캐시=오늘값이 아니라 period as-of). 즉 월 셀렉터를
+8월로 옮기면 8월 발효값이 그대로 그 필드들에 보인다.
 
-→ 프론트에서 시점 변경 이력을 보여줄 계획이면 알려주세요. GET 엔드포인트 추가하겠습니다.
+월 as-of 로 덮어쓰는 필드(year/month 동반 시):
+| 필드 | 의미 |
+|---|---|
+| `grade` | 그 달 등급 |
+| `is_night_nurse` | 그 달 허용 근무형(전담) — `["N"]`=N전담 등 |
+| `is_weekend_off` | 그 달 주말휴무 |
+| `fixed_shift` | 그 달 고정근무 |
+| `team_id` / `as_of_team` | 그 달 팀 |
+| `is_night_dedicated` | 그 달 N전담 여부(배지) |
+
+- **프론트는 필드명 그대로 읽으면 됨** — 월만 같이 보내면 값이 그 달로 바뀐다. 별도 `as_of_*`
+  필드도 함께 옴(`as_of_grade`/`as_of_weekend_off`/`as_of_fixed_shift`/`as_of_is_night_nurse`).
+- **`year`/`month` 미동반 시**: 기존대로 캐시(오늘값). (변경 없음)
+- gap(그 달 구간 없음) → 캐시 폴백(무회귀).
+
+**예외 — 주휴(weekly_off)는 월 as-of 아님**: `weekly_off_enabled` / `weekly_off_weekday` 는
+period 가 없고 그룹 설정(주휴 적용 토글)에 구동되므로 **항상 캐시값**이다. is_weekend_off(주말휴무)
+와 다른 속성임에 주의(이건 월 as-of 됨).
+
+## 6. ⚠️ 남은 갭 — 속성 타임라인 조회(GET)
+
+월 "한 시점"의 값은 §5 로 보이지만, **한 간호사의 변경 이력 전체(구간 목록)를 조회하는
+GET 엔드포인트는 아직 없다**. "3월까지 D, 4월부터 D·E" 같은 **타임라인 UI** 를 그리려면
+`GET /nurse-period?nurse_id=&attribute=` (구간 목록) 신설이 필요. 필요하면 알려주세요.
 
 ---
 
