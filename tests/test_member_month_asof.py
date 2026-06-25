@@ -22,7 +22,7 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="a1", group_id="A", office_id="o1",
-                 name="n1", active=1, grade=2, is_night_nurse=[]))
+                 name="n1", active=1, grade=2, allowed_shifts=[]))
     db.flush()
     return db
 
@@ -75,7 +75,7 @@ def test_weekend_and_fixed_show_asof_month(seeded):
 
 
 def test_nurses_base_fields_overwritten_by_asof(seeded):
-    db = seeded  # 캐시: grade=2, is_weekend_off=False, fixed_shift=None, is_night_nurse=[]
+    db = seeded  # 캐시: grade=2, is_weekend_off=False, fixed_shift=None, allowed_shifts=[]
     db.add(NurseGradePeriod(nurse_id="n1", group_id="A",
            valid_from=date(2026, 8, 1), valid_to=None, grade=5))
     db.add(NurseWeekendOffPeriod(nurse_id="n1", valid_from=date(2026, 8, 1),
@@ -85,10 +85,10 @@ def test_nurses_base_fields_overwritten_by_asof(seeded):
     db.flush()
     # /nurses base dict (캐시값) → 월 병합 시 as-of 로 덮어써야 함
     rows = [{"nurse_id": "n1", "grade": 2, "is_weekend_off": False,
-             "fixed_shift": None, "is_night_nurse": [], "team_id": 9}]
+             "fixed_shift": None, "allowed_shifts": [], "team_id": 9}]
     attach_member_badges_to_nurses(db, rows, "A", 2026, 8)
     r = rows[0]
     assert r["grade"] == 5              # 캐시 2 → as-of 5
     assert r["is_weekend_off"] is True  # False → 1
     assert r["fixed_shift"] == "N"      # None → N
-    assert r["is_night_nurse"] == ["N"]  # [] → ["N"]
+    assert r["allowed_shifts"] == ["N"]  # [] → ["N"]

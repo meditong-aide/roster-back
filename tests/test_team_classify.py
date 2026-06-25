@@ -22,7 +22,7 @@ from services.team_classify_service import (
 def _mk_nurse(db, nid, team_id, grade, name):
     db.add(Nurse(
         nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
-        name=name, active=1, team_id=team_id, grade=grade, is_night_nurse=[],
+        name=name, active=1, team_id=team_id, grade=grade, allowed_shifts=[],
     ))
 
 
@@ -46,7 +46,7 @@ def ward(db):
     # N전담 1명 (풀 제외 대상)
     db.add(Nurse(nurse_id="night", account_id="acc_night", group_id="A",
                  office_id="o1", name="야간전담", active=1, team_id=1,
-                 grade=2, is_night_nurse=["N"]))
+                 grade=2, allowed_shifts=["N"]))
     # 확정 원티드 OFF 몇 건 (겹침 신호)
     for nid, day in [("n1", 5), ("n2", 5), ("n3", 12), ("n4", 20), ("n5", 20)]:
         db.add(FixedWantedEntry(
@@ -174,7 +174,7 @@ def test_n_nurse_override_includes_and_releases(ward):
     )
     flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
     night = db.query(Nurse).filter(Nurse.nurse_id == "night").first()
-    assert (night.is_night_nurse or []) == []        # N전담 해제됨
+    assert (night.allowed_shifts or []) == []        # N전담 해제됨
 
 
 def _set_preceptor(db, preceptee, preceptor):

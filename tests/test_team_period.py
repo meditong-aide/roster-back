@@ -28,7 +28,7 @@ def seeded(db):
     db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
     # nurses 현재값(캐시): home=A, team_id=1
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1",
-                 name="간호1", active=1, team_id=1, is_night_nurse=[]))
+                 name="간호1", active=1, team_id=1, allowed_shifts=[]))
     db.flush()
     return db
 

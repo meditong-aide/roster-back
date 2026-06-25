@@ -475,8 +475,8 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    # is_night_nurse: List[CodeMapp] = Field(default_factory=list, max_items = 2)
-    is_night_nurse: List[str] = Field(default_factory=list)
+    # allowed_shifts: List[CodeMapp] = Field(default_factory=list, max_items = 2)
+    allowed_shifts: List[str] = Field(default_factory=list)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
@@ -672,7 +672,7 @@ class NurseProfileUpdate(BaseModel):
     weekly_off_weekday: Optional[int] = None
     weekly_off_type: Optional[str] = None
     is_weekend_off: Optional[bool] = None
-    is_night_nurse: Optional[List[str]] = None
+    allowed_shifts: Optional[List[str]] = None
     work_shifts: Optional[List[str]] = None
     enable_nurse_pair_preference: Optional[bool] = None
     enable_aide: Optional[bool] = None

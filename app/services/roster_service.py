@@ -101,9 +101,9 @@ def apply_config_side_effects(db, *, office_id, group_id, weekly_off_group, use_
 
         nurses = db.query(Nurse).filter(Nurse.group_id == group_id).all()
         for nurse_row in nurses:
-            raw_types = getattr(nurse_row, 'is_night_nurse', None)
+            raw_types = getattr(nurse_row, 'allowed_shifts', None)
             if isinstance(raw_types, list) and raw_types:
-                nurse_row.is_night_nurse = [
+                nurse_row.allowed_shifts = [
                     t for t in raw_types if str(t).strip().upper() != 'M'
                 ]
 
@@ -1504,7 +1504,7 @@ def create_issued_roster_snapshot(
                 "level_": n.level_,
                 "is_head_nurse": n.is_head_nurse,
                 "emp_auth_gbn": n.emp_auth_gbn,
-                "is_night_nurse": n.is_night_nurse,
+                "allowed_shifts": n.allowed_shifts,
                 "personal_off_adjustment": n.personal_off_adjustment,
                 "preceptor_id": n.preceptor_id,
                 "joining_date": n.joining_date.isoformat()

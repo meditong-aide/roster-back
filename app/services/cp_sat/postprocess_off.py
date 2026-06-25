@@ -333,7 +333,7 @@ def postprocess_trim_extra_offs(
     target_cap_global = max(base_min_off, min(base_min_off + extra_off, 10))
 
     def is_n_only(nurse: Nurse) -> bool:
-        raw = getattr(nurse, "is_night_nurse", None)
+        raw = getattr(nurse, "allowed_shifts", None)
         return is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
 
     def count_vacation_days(n_idx: int) -> int:

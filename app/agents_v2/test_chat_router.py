@@ -159,7 +159,7 @@ def _seed_test_db(db: Session):
             hn_auth=hn_auth, active=1, sequence=int(nid[1:]),
             joining_date=datetime(2025, 1, 1),
             is_weekend_off=False, work_shifts=["D", "E", "N"],
-            is_night_nurse=[], fixed_shift=None, enable_aide=True,
+            allowed_shifts=[], fixed_shift=None, enable_aide=True,
         ))
     db.flush()
 

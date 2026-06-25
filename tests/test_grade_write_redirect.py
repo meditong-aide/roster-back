@@ -1,7 +1,7 @@
 """grade 쓰기 경로를 nurse_grade_period 로 일원화 (P7, grade).
 
 agent/업데이트 경로가 컬럼 직접쓰기 대신 period 에 쓰고 nurses.grade 는 단방향 투영만
-받는지 검증. is_night_nurse(allowed_shifts) 선례와 동일 패턴.
+받는지 검증. allowed_shifts(allowed_shifts) 선례와 동일 패턴.
 참조: app/agents_v2/tools/nurse_tools.py, app/services/nurse_service.py.
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1",
-                 name="n1", active=1, grade=2, is_night_nurse=[]))
+                 name="n1", active=1, grade=2, allowed_shifts=[]))
     db.flush()
     return db
 

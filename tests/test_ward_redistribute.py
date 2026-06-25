@@ -22,7 +22,7 @@ from services.ward_redistribute_service import (
 
 def _mk_nurse(db, nid, gid, grade):
     db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id=gid, office_id="o1",
-                 name=nid, active=1, team_id=1, grade=grade, is_night_nurse=[]))
+                 name=nid, active=1, team_id=1, grade=grade, allowed_shifts=[]))
 
 
 @pytest.fixture
@@ -43,7 +43,7 @@ def pool(db):
         _mk_nurse(db, f"b{i}", "B", 2)
     # N전담 1명 (풀 제외)
     db.add(Nurse(nurse_id="night", account_id="acc_night", group_id="A", office_id="o1",
-                 name="야간", active=1, team_id=1, grade=2, is_night_nurse=["N"]))
+                 name="야간", active=1, team_id=1, grade=2, allowed_shifts=["N"]))
     # 확정 원티드 OFF 몇 건
     for nid, day in [("a0", 5), ("a1", 5), ("b0", 20), ("b1", 20)]:
         db.add(FixedWantedEntry(group_id="A" if nid.startswith("a") else "B",
@@ -276,11 +276,11 @@ def test_role_mix_warning(db):
     for i in range(5):
         db.add(Nurse(nurse_id=f"a{i}", account_id=f"acc_a{i}", group_id="A", office_id="o1",
                      name=f"a{i}", active=1, team_id=1, grade=1 if i == 0 else 2,
-                     role="RN", is_night_nurse=[]))
+                     role="RN", allowed_shifts=[]))
     for i in range(5):
         db.add(Nurse(nurse_id=f"b{i}", account_id=f"acc_b{i}", group_id="B", office_id="o1",
                      name=f"b{i}", active=1, team_id=1, grade=1 if i == 0 else 2,
-                     role="AN", is_night_nurse=[]))
+                     role="AN", allowed_shifts=[]))
     db.flush()
     pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7)
     assert any("역할" in w for w in pv["warnings"]), pv["warnings"]
@@ -399,7 +399,7 @@ def test_ward_pair_split_warns_when_preceptor_excluded(db):
     _mk_nurse(db, "a0", "A", 2)      # 프리셉터 — 파견 겹침으로 제외 예정
     db.add(Nurse(nurse_id="a_pe", account_id="acc_a_pe", group_id="A",
                  office_id="o1", name="a_pe", active=1, team_id=1, grade=3,
-                 is_night_nurse=[], preceptor_id="a0"))  # 프리셉티
+                 allowed_shifts=[], preceptor_id="a0"))  # 프리셉티
     _mk_nurse(db, "b_g1", "B", 1)
     _mk_nurse(db, "b0", "B", 2)
     db.add(NurseAssignment(nurse_id="a0", source_group_id="A", target_group_id="B",
@@ -446,7 +446,7 @@ def test_team_breakdown_splits_by_defined_teams_even_when_cache_null(db):
         # team_id=None → 캐시 비어 있음(운영 상태).
         db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
                      name=nid, active=1, team_id=None,
-                     grade=1 if nid in ("a0", "a1") else 2, is_night_nurse=[]))
+                     grade=1 if nid in ("a0", "a1") else 2, allowed_shifts=[]))
     db.flush()
 
     by_input = {
@@ -475,7 +475,7 @@ def test_team_breakdown_forced_count_provisional_when_no_teams(db):
     for nid in ids:
         db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
                      name=nid, active=1, team_id=None,
-                     grade=1 if nid in ("a0", "a1") else 2, is_night_nurse=[]))
+                     grade=1 if nid in ("a0", "a1") else 2, allowed_shifts=[]))
     db.flush()
     by_input = {
         nid: NurseInput(nurse_id=nid, grade=1 if nid in ("a0", "a1") else 2,
@@ -502,7 +502,7 @@ def test_team_breakdown_collapses_to_all_without_defined_teams(db):
     ids = ["a0", "a1", "a2", "a3"]
     for nid in ids:
         db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
-                     name=nid, active=1, team_id=None, grade=2, is_night_nurse=[]))
+                     name=nid, active=1, team_id=None, grade=2, allowed_shifts=[]))
     db.flush()
 
     by_input = {
@@ -528,7 +528,7 @@ def test_apply_creates_numbered_teams_and_assigns_for_month(db):
     ids = ["a0", "a1", "a2", "a3"]
     for nid in ids:
         db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
-                     name=nid, active=1, team_id=None, grade=2, is_night_nurse=[]))
+                     name=nid, active=1, team_id=None, grade=2, allowed_shifts=[]))
     db.flush()
 
     assignments = [

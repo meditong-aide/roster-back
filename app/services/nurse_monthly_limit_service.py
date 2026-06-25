@@ -32,7 +32,7 @@ class _EffectiveNurseView:
     """파견 인바운드 capability 오버레이를 입힌 읽기전용 nurse 뷰.
 
     세션의 Nurse 객체를 변형하지 않고 지정 attr만 override, 나머지는 원본에 위임한다.
-    monthly-limit 검증이 파견 '대상 그룹' 기준의 유효 capability(is_night_nurse=target_shift_types)를
+    monthly-limit 검증이 파견 '대상 그룹' 기준의 유효 capability(allowed_shifts=target_shift_types)를
     보도록 하기 위함. (엔진 roster_create_service 의 inbound override 와 동일 규칙)
     """
 
@@ -55,7 +55,7 @@ def _effective_nurse_for_group(
     """파견 인바운드면 해당 대상 그룹의 capability 오버레이를 입힌 effective nurse 뷰 반환.
 
     그 달에 group_id 를 target 으로 하는 활성 NurseAssignment 가 있으면
-    is_night_nurse(←target_shift_types)·fixed_shift(←target_fixed_shift) 를 override.
+    allowed_shifts(←target_shift_types)·fixed_shift(←target_fixed_shift) 를 override.
     없으면 원본 nurse 그대로 폴백. (월말 as_of 기준 — 파견이 월 중 시작해도 포함)
     """
     as_of = date(year, month, monthrange(year, month)[1])
@@ -64,7 +64,7 @@ def _effective_nurse_for_group(
         return nurse
     overrides: Dict[str, Any] = {
         attr: get_nurse_effective_attr(db, nurse, attr, as_of, _assignment_cache=assignment)
-        for attr in ("is_night_nurse", "fixed_shift")
+        for attr in ("allowed_shifts", "fixed_shift")
     }
     return _EffectiveNurseView(nurse, overrides)
 
@@ -426,7 +426,7 @@ def upsert_nurse_monthly_limits_service(
             total_active_est += cap_days
 
             # 파견 인바운드 행은 대상 그룹 capability 오버레이(target_shift_types)를 반영한
-            # effective nurse 로 검증한다. base nurses.is_night_nurse 만 보면 파견지에서
+            # effective nurse 로 검증한다. base nurses.allowed_shifts 만 보면 파견지에서
             # 가능해진 N 을 불가로 오판해 MONTHLY_LIMIT_NOT_IN_WORK_SHIFTS 로 오차단된다.
             eff_nurse = (
                 _effective_nurse_for_group(db, nurse, str(rr.get("group_id")), year, month)

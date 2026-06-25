@@ -32,8 +32,8 @@ router = APIRouter(prefix="/nurse-period", tags=["nurse-period"])
 
 
 def _allowed_value(n: Nurse):
-    # is_night_nurse(JSON) → 허용 근무형 집합으로 정규화(현 솔버와 동일 의미)
-    return sorted(normalize_allowed_shift_codes(getattr(n, "is_night_nurse", None)))
+    # allowed_shifts(JSON) → 허용 근무형 집합으로 정규화(현 솔버와 동일 의미)
+    return sorted(normalize_allowed_shift_codes(getattr(n, "allowed_shifts", None)))
 
 
 # 속성별 스펙: model · 값컬럼 · ward귀속 · nurses캐시컬럼(투영) · nurses→value 변환(backfill용)
@@ -41,7 +41,7 @@ def _allowed_value(n: Nurse):
 # allowed_shifts 와 fixed_shift 는 한 테이블(nurse_allowed_shift_period)의 두 컬럼 = 결합 satellite.
 _ATTR_SPECS: dict[str, dict] = {
     "allowed_shifts": dict(model=NurseAllowedShiftPeriod, value_attr="allowed_shifts",
-                           group_bound=False, cache_attr="is_night_nurse",
+                           group_bound=False, cache_attr="allowed_shifts",
                            value_fn=_allowed_value, carry_attrs=["fixed_shift"]),
     "fixed_shift": dict(model=NurseAllowedShiftPeriod, value_attr="fixed_shift",
                         group_bound=False, cache_attr="fixed_shift",

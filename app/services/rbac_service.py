@@ -580,7 +580,7 @@ def init_master_admin(
         role=None,
         level_=None,
         is_head_nurse=False,
-        is_night_nurse=False
+        allowed_shifts=False
     )
     db.add(master_user)
     db.flush()

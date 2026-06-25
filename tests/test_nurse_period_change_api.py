@@ -37,9 +37,9 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="HN", account_id="acc_HN", group_id="A", office_id="o1",
-                 name="수간", active=0, is_head_nurse=True, hn_auth="HN", is_night_nurse=[]))
+                 name="수간", active=0, is_head_nurse=True, hn_auth="HN", allowed_shifts=[]))
     db.add(Nurse(nurse_id="edu", account_id="acc_edu", group_id="A", office_id="o1",
-                 name="교육", active=1, is_night_nurse=[]))
+                 name="교육", active=1, allowed_shifts=[]))
     db.flush()
     return db
 
@@ -86,14 +86,14 @@ def test_change_builds_education_timeline(seeded):
 
 
 def test_change_future_does_not_touch_cache(seeded):
-    # valid_from(미래) > today → 캐시(is_night_nurse) 투영 안 함
+    # valid_from(미래) > today → 캐시(allowed_shifts) 투영 안 함
     db = seeded
     c = _client(db, _user())
     r = c.post("/nurse-period/change", json={
         "attribute": "allowed_shifts", "nurse_id": "edu",
         "valid_from": "2026-07-01", "value": ["N"]})
     assert r.status_code == 200
-    assert db.query(Nurse).filter_by(nurse_id="edu").first().is_night_nurse == []  # 캐시 그대로
+    assert db.query(Nurse).filter_by(nurse_id="edu").first().allowed_shifts == []  # 캐시 그대로
 
 
 def test_change_past_projects_cache(seeded):
@@ -105,7 +105,7 @@ def test_change_past_projects_cache(seeded):
         "valid_from": "2020-01-01", "value": ["N"]})
     assert r.status_code == 200
     assert r.json()["today_value"] == ["N"]
-    assert db.query(Nurse).filter_by(nurse_id="edu").first().is_night_nurse == ["N"]
+    assert db.query(Nurse).filter_by(nurse_id="edu").first().allowed_shifts == ["N"]
 
 
 def test_change_unknown_attribute_400(seeded):

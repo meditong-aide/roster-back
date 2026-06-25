@@ -385,7 +385,7 @@ def _load_pair_score_map(db: Session, nurse_ids: List[str], month_key: str) -> D
 
 
 def _nurse_is_night_capable(nurse: Any) -> bool:
-    raw = getattr(nurse, "is_night_nurse", None)
+    raw = getattr(nurse, "allowed_shifts", None)
     if isinstance(raw, list):
         return len(raw) > 0
     if raw is None:

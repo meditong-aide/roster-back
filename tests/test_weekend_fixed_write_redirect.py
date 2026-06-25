@@ -2,7 +2,7 @@
 
 - fixed_shift → nurse_allowed_shift_period(통합 satellite). 기존 allowed 구간 없으면 []로 채움.
 - is_weekend_off → nurse_weekendoff_period.
-컬럼은 단방향 투영. is_night_nurse·grade 선례와 동일.
+컬럼은 단방향 투영. allowed_shifts·grade 선례와 동일.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1",
-                 name="n1", active=1, is_night_nurse=[], fixed_shift=None,
+                 name="n1", active=1, allowed_shifts=[], fixed_shift=None,
                  is_weekend_off=False))
     db.flush()
     return db

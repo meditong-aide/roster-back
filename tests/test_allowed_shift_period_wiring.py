@@ -17,9 +17,9 @@ from services.roster_create_service import build_allowed_shift_type_constraints
 Y, M = 2026, 7  # 31일
 
 
-def _nurse(db, nid, is_night_nurse):
+def _nurse(db, nid, allowed_shifts):
     n = Nurse(nurse_id=nid, account_id=f"acc_{nid}", name=nid, group_id=None,
-              is_night_nurse=is_night_nurse, joining_date=None, resignation_date=None,
+              allowed_shifts=allowed_shifts, joining_date=None, resignation_date=None,
               active=1)
     db.add(n); db.flush()
     return n

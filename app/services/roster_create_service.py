@@ -2476,7 +2476,7 @@ def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, s
 def _normalize_allowed_shift_types(raw_value: object, use_mid: bool = False) -> set[str]:
     if raw_value is None:
         return set()
-    # 레거시 타입은 무시(요구사항: 기존 is_night_nurse 의미는 무시)
+    # 레거시 타입은 무시(요구사항: 기존 allowed_shifts 의미는 무시)
     if isinstance(raw_value, (int, float, bool)):
         return set()
     if not isinstance(raw_value, list):
@@ -2552,7 +2552,7 @@ def build_allowed_shift_type_constraints(
         if not nurse_id:
             continue
         allowed = _normalize_allowed_shift_types(
-            getattr(n, "is_night_nurse", None),
+            getattr(n, "allowed_shifts", None),
             use_mid=bool(use_mid),
         )
         nurse_id_to_allowed[nurse_id] = allowed
@@ -3323,8 +3323,6 @@ def _collect_validator_evidence(
                 nu = nurses[n_idx]
                 allowed = set(str(x).upper() for x in (getattr(nu, "allowed_shifts", None) or []))
                 if allowed and code not in allowed:
-                    return False
-                if code in {"D", "E"} and bool(getattr(nu, "is_night_nurse", 0) == 3):
                     return False
             return True
 
@@ -4435,7 +4433,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 d['weekly_off_enabled'] = bool(_a.target_weekly_off_enabled or 0)
                 d['weekly_off_type'] = _a.target_weekly_off_type
                 d['weekly_off_weekday'] = _a.target_weekly_off_weekday
-                d['is_night_nurse'] = _a.target_shift_types or []
+                d['allowed_shifts'] = _a.target_shift_types or []
                 d['fixed_shift'] = _a.target_fixed_shift
         engine_nurses.extend(_inbound_nurses)
         nurses_in_group.extend(_inbound_nurses)
@@ -4516,7 +4514,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         # N전담(허용 shift=N뿐)은 팀 D/E 커버리지 로테이션에 참여 불가 → 미지정(team None).
         #   team_id=None 이면 team_constraints 가 자동 스킵 → 유령 멤버로 팀 인원/커버리지를
         #   부풀리지 않는다. 야간 수급은 글로벌(nig_req)이라 영향 없음.
-        if is_n_only_profile(getattr(_en, 'is_night_nurse', None)):
+        if is_n_only_profile(getattr(_en, 'allowed_shifts', None)):
             _en.__dict__['team_id'] = None
             continue
         _rt = resolve_team_for_roster(
@@ -5266,7 +5264,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         )
         _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
         # `n.__dict__` 은 SQLAlchemy 의 이미 로딩된 attr 만 담아서 team_id /
-        # is_night_nurse 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
+        # allowed_shifts 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
         # 풀에서 사용할 키를 모두 일관되게 채운다.
         _nurses_dict_for_precheck = [
             {
@@ -5274,7 +5272,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 "db_id": getattr(n, "nurse_id", None),
                 "team_id": getattr(n, "team_id", None),
                 "grade": getattr(n, "grade", None),
-                "is_night_nurse": getattr(n, "is_night_nurse", None),
+                "allowed_shifts": getattr(n, "allowed_shifts", None),
                 "work_shifts": getattr(n, "work_shifts", None),
                 "joining_date": getattr(n, "joining_date", None),
                 "resignation_date": getattr(n, "resignation_date", None),

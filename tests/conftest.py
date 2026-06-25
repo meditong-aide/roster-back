@@ -188,7 +188,7 @@ def seed_data(db: Session) -> dict:
             preceptor_id="N002" if nid == "N006" else None,
             is_weekend_off=False,
             work_shifts=["D", "E", "N"],
-            is_night_nurse=[],
+            allowed_shifts=[],
             fixed_shift=None,
             enable_aide=True,
         )

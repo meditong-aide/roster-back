@@ -88,7 +88,7 @@ def _normalize_shift_list(raw: Any) -> Set[str]:
 def _allowed_work_shifts(nurse: Nurse) -> Optional[Set[str]]:
     """nurse가 가능한 D/E/N 시프트 집합. None이면 모든 시프트 가능."""
     universe = {"D", "E", "N"}
-    nn_set = _normalize_shift_list(getattr(nurse, "is_night_nurse", None)) & universe
+    nn_set = _normalize_shift_list(getattr(nurse, "allowed_shifts", None)) & universe
     ws_set = _normalize_shift_list(getattr(nurse, "work_shifts", None)) & universe
     if nn_set and ws_set:
         return nn_set & ws_set or None
@@ -542,7 +542,7 @@ def validate_monthly_limit_row(
 
     Args:
         row: limit row dict ({d_min, d_max, d_exact, ...})
-        nurse: Nurse ORM 객체 (work_shifts, is_night_nurse, is_weekend_off, weekly_off_weekday 등)
+        nurse: Nurse ORM 객체 (work_shifts, allowed_shifts, is_weekend_off, weekly_off_weekday 등)
         cap_days: 그룹 활성 가용일 (build_blocked_days 반영, vacation 제외 전)
         year/month: 검증 대상 월
         max_night: 그룹 월간 N 상한(roster_config.max_nig_per_month). N전담 + N하한 초과

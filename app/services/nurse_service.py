@@ -217,7 +217,7 @@ _MEMBER_BADGE_FIELDS: Tuple[str, ...] = (
     "as_of_team",
     "as_of_grade",
     "is_night_dedicated",
-    "as_of_is_night_nurse",
+    "as_of_allowed_shifts",
     "as_of_weekend_off",
     "as_of_fixed_shift",
 )
@@ -261,9 +261,9 @@ def attach_member_badges_to_nurses(
         #   캐시(오늘값)·inbound overlay 가 아니라 period as-of 가 SSOT — 월 이동하면 그 달 값이 보임.
         n["grade"] = member.get("as_of_grade")
         n["team_id"] = member.get("as_of_team")
-        _aon = member.get("as_of_is_night_nurse")
+        _aon = member.get("as_of_allowed_shifts")
         if _aon is not None:                       # [] = 제한없음(유효값) → 덮어씀
-            n["is_night_nurse"] = _aon
+            n["allowed_shifts"] = _aon
         n["fixed_shift"] = member.get("as_of_fixed_shift")
         n["is_weekend_off"] = bool(member.get("as_of_weekend_off"))
         # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
@@ -393,7 +393,7 @@ def get_nurses_in_group_service(
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
-        is_night_nurse = nurse.is_night_nurse or []
+        allowed_shifts = nurse.allowed_shifts or []
 
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
@@ -406,7 +406,7 @@ def get_nurses_in_group_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": is_night_nurse,
+            "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
@@ -593,7 +593,7 @@ def get_nurses_filtered_service(
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
-        is_night_nurse = nurse.is_night_nurse or []
+        allowed_shifts = nurse.allowed_shifts or []
 
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
@@ -606,7 +606,7 @@ def get_nurses_filtered_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": is_night_nurse,
+            "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
@@ -957,17 +957,17 @@ def bulk_update_nurses_service(
 
         # === 프론트에서 보내준 값으로 일괄 업데이트 ===
         for key, value in update_data.items():
-            if key in ("is_night_nurse", "grade", "fixed_shift", "is_weekend_off"):
+            if key in ("allowed_shifts", "grade", "fixed_shift", "is_weekend_off"):
                 continue  # 아래에서 period 로 일원화 — 컬럼 직접 쓰기 금지
             if hasattr(db_nurse, key):
                 setattr(db_nurse, key, value)
 
-        # === is_night_nurse(허용 근무형) → nurse_allowed_shift_period 일원화 ===
-        # 진실=period, nurses.is_night_nurse 컬럼은 upsert 의 단방향 투영으로만 갱신(양방향 충돌 제거).
+        # === allowed_shifts(허용 근무형) → nurse_allowed_shift_period 일원화 ===
+        # 진실=period, nurses.allowed_shifts 컬럼은 upsert 의 단방향 투영으로만 갱신(양방향 충돌 제거).
         # '현재값 변경'이라 valid_from=오늘. 미래발효는 POST /nurse-period/change 사용.
         # 전체 선택(D/E/N[/M] 전부)=제한 없음([]) 정규화 유지.
-        if "is_night_nurse" in update_data:
-            night_shifts = update_data["is_night_nurse"]
+        if "allowed_shifts" in update_data:
+            night_shifts = update_data["allowed_shifts"]
             final_night = night_shifts if isinstance(night_shifts, list) else []
             if isinstance(night_shifts, list) and night_shifts:
                 normalized = {shift_to_group.get(s, s) for s in night_shifts}
@@ -979,7 +979,7 @@ def bulk_update_nurses_service(
             upsert_period(
                 db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _date.today(),
                 "allowed_shifts", final_night,
-                nurse=db_nurse, cache_attr="is_night_nurse", source="edited",
+                nurse=db_nurse, cache_attr="allowed_shifts", source="edited",
             )
 
         # === grade → nurse_grade_period 일원화(병동귀속) ===
@@ -2938,10 +2938,10 @@ def _overlay_inbound_fields(
 
     정책: Target 병동 시점에서는 매핑된 모든 컬럼을 assignment.target_* 값으로 교체.
     target_*가 NULL이어도 NULL 그대로 노출(= nurses.*로 fallback 하지 않음).
-    is_night_nurse만 프론트 호환을 위해 None → [] 처리.
+    allowed_shifts만 프론트 호환을 위해 None → [] 처리.
     """
     nurse_dict["is_inbound"] = True
     for src_key, tgt_key in _SOURCE_TO_TARGET_FIELD_MAP.items():
         nurse_dict[src_key] = getattr(row, tgt_key, None)
-    if nurse_dict.get("is_night_nurse") is None:
-        nurse_dict["is_night_nurse"] = []
+    if nurse_dict.get("allowed_shifts") is None:
+        nurse_dict["allowed_shifts"] = []

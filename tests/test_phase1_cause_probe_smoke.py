@@ -54,7 +54,7 @@ class _MockNurse:
     db_id: int = 1
     grade: int = 1
     allowed_shifts: list = field(default_factory=list)
-    is_night_nurse: int = 0
+    allowed_shifts: int = 0
     personal_off_adjustment: int = 0
 
 

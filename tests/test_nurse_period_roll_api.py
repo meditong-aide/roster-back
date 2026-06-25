@@ -36,9 +36,9 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="HN", account_id="acc_HN", group_id="A", office_id="o1",
-                 name="수간", active=0, is_head_nurse=True, hn_auth="HN", is_night_nurse=[]))
+                 name="수간", active=0, is_head_nurse=True, hn_auth="HN", allowed_shifts=[]))
     db.add(Nurse(nurse_id="w1", account_id="acc_w1", group_id="A", office_id="o1",
-                 name="w1", active=1, is_weekend_off=False, grade=2, is_night_nurse=[]))
+                 name="w1", active=1, is_weekend_off=False, grade=2, allowed_shifts=[]))
     db.flush()
     return db
 

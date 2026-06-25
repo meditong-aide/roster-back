@@ -301,8 +301,8 @@ def get_next_sequence(group_id: str, active_status: int, db: Session, role: str 
 #                     'role': str(row[get_excel_column_by_field('role', flexible_mapping)]).strip(),
 #                     'level_': str(row[get_excel_column_by_field('level_', flexible_mapping)]).strip(),
 #                     'is_head_nurse': parse_boolean(row[get_excel_column_by_field('is_head_nurse', flexible_mapping)]),
-#                     # 'is_night_nurse': False,  # 기본값
-#                     'is_night_nurse': [],  # 기본값
+#                     # 'allowed_shifts': False,  # 기본값
+#                     'allowed_shifts': [],  # 기본값
 #                     'personal_off_adjustment': 0,  # 기본값
 #                     'preceptor_id': None,  # 기본값
 #                     'joining_date': None,  # 기본값
@@ -529,7 +529,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
                     'nurse_id': allowed[account_id][2],
                     'birth_date': birth_date,
                     'phone_number': phone_num,
-                    'is_night_nurse': [],
+                    'allowed_shifts': [],
                     'gender': gender,
                     'email': email_val,
                 })
@@ -593,7 +593,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
 #             birth_dt = item.get('birth_date')
 #             phone_number = item.get('phone_number')
 #             gender = item.get('gender')
-#             is_night_nurse = item.get('is_night_nurse', [])
+#             allowed_shifts = item.get('allowed_shifts', [])
 #             work_shifts_val = item.get('work_shifts', [])
 
 #             print(f"   • account_id     : {account_id}")
@@ -646,7 +646,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
 #                 existing.birth_date = birth_dt
 #                 existing.phone_number = phone_number
 #                 existing.gender = gender
-#                 existing.is_night_nurse = is_night_nurse
+#                 existing.allowed_shifts = allowed_shifts
 #                 existing.work_shifts = work_shifts_val
                 
 #                 updated += 1
@@ -669,7 +669,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
 #                     role=role if role is not None else '',
 #                     level_='일반',
 #                     is_head_nurse=is_head,
-#                     is_night_nurse=is_night_nurse,
+#                     allowed_shifts=allowed_shifts,
 #                     personal_off_adjustment=0,
 #                     preceptor_id=None,
 #                     joining_date=pd.to_datetime(jd).to_pydatetime() if jd else None,
@@ -1480,7 +1480,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
             gender = str(item.get('gender', '')).strip()[:3] or None
             email = str(item.get('email', '')).strip()[:100] or None
 
-            is_night_nurse = item.get('is_night_nurse', []) or []
+            allowed_shifts = item.get('allowed_shifts', []) or []
             work_shifts = item.get('work_shifts', []) or []
 
             nurse_id = item.get('nurse_id')
@@ -1507,7 +1507,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                 existing.phone_number = phone_number
                 existing.gender = gender
                 existing.email = email
-                existing.is_night_nurse = is_night_nurse
+                existing.allowed_shifts = allowed_shifts
                 existing.work_shifts = work_shifts
                 updated += 1
             else:
@@ -1525,7 +1525,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                         role=role,
                         level_='일반',
                         is_head_nurse=is_head_nurse,
-                        is_night_nurse=is_night_nurse,
+                        allowed_shifts=allowed_shifts,
                         personal_off_adjustment=0,
                         preceptor_id=None,
                         joining_date=joining_dt,
@@ -1629,7 +1629,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
 #                 'nurse_id': allowed.get(account_id, ('', '', str(uuid.uuid4())))[2],
 #                 'birth_date': row.get('birth_date'),
 #                 'phone_number': row.get('phone_number'),
-#                 'is_night_nurse': row.get('is_night_nurse', []),
+#                 'allowed_shifts': row.get('allowed_shifts', []),
 #                 'gender': row.get('gender')
 #             })
 

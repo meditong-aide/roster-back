@@ -11,6 +11,7 @@ import math
 from typing import Any
 
 from services.roster_system import RosterSystem
+from services.cp_sat.allowed_shift_types import is_n_only_profile
 
 
 def add_grade_constraints(
@@ -255,7 +256,7 @@ def _available_by_grade_for_day_shift(
 
     정의(간단 버전):
         - join/leave 범위 내에 있는 간호사만 후보
-        - 야간전담(is_night_nurse==3)은 D/E 불가로 제외
+        - 야간전담(allowed_shifts==3)은 D/E 불가로 제외
         - 고정셀은 변수로 이미 고정되어 있으므로, 여기서는 '후보 가능 여부'만 본다
 
     Returns:
@@ -396,7 +397,7 @@ def _build_grade_groups(
         if g in grade_values:
             by_grade.setdefault(g, []).append(idx)
 
-    is_night_only = [bool(getattr(n, "is_night_nurse", 0) == 3) for n in rs.nurses]
+    is_night_only = [is_n_only_profile(getattr(n, "allowed_shifts", None)) for n in rs.nurses]
     return by_grade, is_night_only
 
 

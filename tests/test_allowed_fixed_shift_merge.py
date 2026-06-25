@@ -18,7 +18,7 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1",
-                 name="n1", active=1, is_night_nurse=[], fixed_shift=None))
+                 name="n1", active=1, allowed_shifts=[], fixed_shift=None))
     db.flush()
     return db
 
@@ -28,7 +28,7 @@ def test_changing_fixed_carries_forward_allowed(seeded):
     # 1) allowed 변경(7/1) → row1: allowed=["N"], fixed=None
     upsert_period(db, NurseAllowedShiftPeriod, "n1", date(2026, 7, 1),
                   "allowed_shifts", ["N"], nurse=db.query(Nurse).get("n1"),
-                  cache_attr="is_night_nurse", carry_attrs=["fixed_shift"],
+                  cache_attr="allowed_shifts", carry_attrs=["fixed_shift"],
                   today=date(2026, 7, 1))
     # 2) fixed 변경(8/1, 미래 구간) → 새 구간, allowed 캐리포워드
     upsert_period(db, NurseAllowedShiftPeriod, "n1", date(2026, 8, 1),
@@ -53,7 +53,7 @@ def test_same_day_two_attrs_share_one_row(seeded):
     n = db.query(Nurse).get("n1")
     # 같은 날 allowed + fixed → 한 row 에 둘 다 (backfill 패턴)
     upsert_period(db, NurseAllowedShiftPeriod, "n1", date(2026, 7, 1),
-                  "allowed_shifts", ["D"], nurse=n, cache_attr="is_night_nurse",
+                  "allowed_shifts", ["D"], nurse=n, cache_attr="allowed_shifts",
                   carry_attrs=["fixed_shift"], today=date(2026, 7, 1))
     upsert_period(db, NurseAllowedShiftPeriod, "n1", date(2026, 7, 1),
                   "fixed_shift", "D_A", nurse=n, cache_attr="fixed_shift",

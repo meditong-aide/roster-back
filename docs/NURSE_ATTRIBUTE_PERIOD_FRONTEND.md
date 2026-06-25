@@ -18,10 +18,23 @@
 
 ---
 
+## ⚠️ BREAKING — 필드명 변경 `is_night_nurse` → `allowed_shifts`
+
+`nurses`의 전담 필드는 사실 **허용 근무형 리스트**(`[]`=제한없음, `["N"]`=N전담, `["D","E","N"]`=세 개)
+였는데 이름이 boolean 처럼 보여 혼란을 줬다. DB 컬럼·API 요청/응답·badge를 **`allowed_shifts`로 통일**.
+값 **형식·의미는 불변**(JSON 리스트 그대로), **이름만** 바뀜.
+
+| 구 이름 | 신 이름 |
+|---|---|
+| `nurses.is_night_nurse` (요청/응답 필드) | `allowed_shifts` |
+| `as_of_is_night_nurse` (월 as-of badge) | `as_of_allowed_shifts` |
+
+→ 프론트는 **`is_night_nurse` 키를 `allowed_shifts`로 치환**하면 끝. (`is_night_dedicated` 배지는 이름 유지)
+
 ## 1. 변경 없음 — 현재값 수정
 
 간호사 등급/전담/주말휴무/고정근무를 **지금 시점으로 바꾸는 것**은 기존 그대로다.
-- 기존 간호사 수정 API에 필드 그대로 전송(`grade`, `is_night_nurse`, `is_weekend_off`, `fixed_shift`).
+- 기존 간호사 수정 API에 필드 그대로 전송(`grade`, `allowed_shifts`, `is_weekend_off`, `fixed_shift`).
 - 백엔드가 period(`valid_from=오늘`)에 기록 + `nurses` 컬럼에 투영.
 - 프론트는 응답/조회에서 **`nurses` 컬럼을 그대로 읽으면 됨** (값 형식 불변).
 
@@ -89,14 +102,14 @@
 | 필드 | 의미 |
 |---|---|
 | `grade` | 그 달 등급 |
-| `is_night_nurse` | 그 달 허용 근무형(전담) — `["N"]`=N전담 등 |
+| `allowed_shifts` | 그 달 허용 근무형(전담) — `["N"]`=N전담 등 |
 | `is_weekend_off` | 그 달 주말휴무 |
 | `fixed_shift` | 그 달 고정근무 |
 | `team_id` / `as_of_team` | 그 달 팀 |
 | `is_night_dedicated` | 그 달 N전담 여부(배지) |
 
 - **프론트는 필드명 그대로 읽으면 됨** — 월만 같이 보내면 값이 그 달로 바뀐다. 별도 `as_of_*`
-  필드도 함께 옴(`as_of_grade`/`as_of_weekend_off`/`as_of_fixed_shift`/`as_of_is_night_nurse`).
+  필드도 함께 옴(`as_of_grade`/`as_of_weekend_off`/`as_of_fixed_shift`/`as_of_allowed_shifts`).
 - **`year`/`month` 미동반 시**: 기존대로 캐시(오늘값). (변경 없음)
 - gap(그 달 구간 없음) → 캐시 폴백(무회귀).
 
