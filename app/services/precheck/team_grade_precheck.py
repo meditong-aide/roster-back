@@ -584,6 +584,11 @@ def check_grade_min_available_shortage(inp: PrecheckInput) -> List[Dict]:
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     gc_min = (inp.grade_constraints or {}).get("minimum_by_shift") or {}
     issues: List[Dict] = []
+    # 그룹에 해당 grade 간호사가 0명이면 GRADE_DEFAULT_111(강제 grade-1 floor)는
+    # 솔버 _add_minimum_constraints cascade 가 soft/하위 등급으로 흘려보내는 것이 정책 의도이므로
+    # (roster_create_service._ensure_grade1_default 주석 참조) precheck 에서 하드 차단하지 않는다.
+    # 차단하면 grade 미등록 병동(해당 grade 0명)은 생성 자체가 불가해진다.
+    grades_present = {int(n.grade) for n in inp.nurses if n.grade is not None}
     for s in S:
         per_grade = gc_min.get(s) or {}
         for g_raw, req_raw in per_grade.items():
@@ -593,6 +598,8 @@ def check_grade_min_available_shortage(inp: PrecheckInput) -> List[Dict]:
             except (TypeError, ValueError):
                 continue
             if req <= 0:
+                continue
+            if g not in grades_present:
                 continue
             for d in range(inp.num_days):
                 avail = 0
