@@ -57,19 +57,10 @@ logger = logging.getLogger(__name__)
 try:
     from services.random_sampling import generate_roster
     from services.cp_sat_basic import generate_roster_cp_sat
-    from services.cp_sat_main_v3 import generate_roster_cp_sat_main_v3
-    from services.cp_sat_main_v2 import generate_roster_cp_sat_main_v2
-    from services.cp_sat_adaptive import generate_roster_cp_sat_adaptive
     CPSAT_AVAILABLE = True
-    CPSAT_MAIN_V3_AVAILABLE = True
-    CPSAT_MAIN_V2_AVAILABLE = True
-    CPSAT_ADAPTIVE_AVAILABLE = True
 except ImportError as e:
     print(f"CP-SAT 엔진 import 실패: {e}")
     CPSAT_AVAILABLE = False
-    CPSAT_MAIN_V3_AVAILABLE = False
-    CPSAT_MAIN_V2_AVAILABLE = False
-    CPSAT_ADAPTIVE_AVAILABLE = False
 
 # ───────────────────────────── 공통 헬퍼 ─────────────────────────────
 
