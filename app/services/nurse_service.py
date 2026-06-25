@@ -1759,6 +1759,8 @@ def update_nurse_profile_service(
     current_user: UserSchema,
     db: Session,
     view_group_id: Optional[str] = None,
+    effective_year: Optional[int] = None,
+    effective_month: Optional[int] = None,
 ):
     """
     nurse_id 기반 단건 프로필 업데이트 서비스 (근무자 관리 사이드 프로필용)
@@ -1783,6 +1785,12 @@ def update_nurse_profile_service(
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
 
     fields = update_data.dict(exclude_unset=True)
+    # period 쓰기 valid_from = 선택월 1일(월 셀렉터). 미동반 시 today(현재값 변경).
+    from datetime import date as _eff_date
+    _eff_vf = (
+        _eff_date(int(effective_year), int(effective_month), 1)
+        if effective_year and effective_month else _eff_date.today()
+    )
     # assignment payload는 별도 브랜치로 분리 후 source/target 저장 단계에서 제외.
     # 단건(assignment) + 다건(assignments) 모두 지원 — 다건 먼저 적용 후 단건.
     assignment_payload = fields.pop("assignment", None)
@@ -1867,6 +1875,7 @@ def update_nurse_profile_service(
             )
         _persist_profile_period_change(
             db, nurse_id=nurse_id, group_id=nurse.group_id, nurse=nurse, fields=fields,
+            valid_from=_eff_vf,
         )
         db.commit()
         db.refresh(nurse)
@@ -1893,7 +1902,7 @@ def update_nurse_profile_service(
             # grade/allowed_shifts/fixed_shift → target_group period(SSOT). 캐시 미투영(홈 아님).
             _persist_profile_period_change(
                 db, nurse_id=nurse_id, group_id=assign_row.target_group_id,
-                nurse=nurse, fields=fields,
+                nurse=nurse, fields=fields, valid_from=_eff_vf,
             )
             _apply_target_update(
                 assign_row, {k: v for k, v in fields.items() if k != "team_id"}
@@ -2030,7 +2039,7 @@ def _persist_profile_period_change(
     valid_from 기본=당월1일. commit 은 호출부 일괄.
     """
     from datetime import date as _date
-    from db.models import NurseGradePeriod, NurseAllowedShiftPeriod
+    from db.models import NurseGradePeriod, NurseAllowedShiftPeriod, NurseWeekendOffPeriod
     from services.nurse_period_resolver import upsert_period
     _t = _date.today()
     vf = valid_from or _date(_t.year, _t.month, 1)
@@ -2057,10 +2066,17 @@ def _persist_profile_period_change(
             nurse=nurse, cache_attr="fixed_shift", source=source,
             carry_attrs=["allowed_shifts"],
         )
+    if "is_weekend_off" in fields:
+        # 주말휴무(group 무관 전역 속성) → nurse_weekendoff_period. 캐시 투영 OK.
+        upsert_period(
+            db, NurseWeekendOffPeriod, str(nurse_id), vf, "weekend_off",
+            1 if fields["is_weekend_off"] else 0,
+            nurse=nurse, cache_attr="is_weekend_off", source=source,
+        )
 
 
 # period 로 일원화된 속성 — _apply_*_update / target_* 에서 제외하고 _persist_profile_period_change 로 보낸다.
-_PERIOD_OWNED_FIELDS = ("grade", "allowed_shifts", "fixed_shift")
+_PERIOD_OWNED_FIELDS = ("grade", "allowed_shifts", "fixed_shift", "is_weekend_off")
 
 
 def _validate_team_grade_change_or_raise(

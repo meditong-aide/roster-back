@@ -1362,6 +1362,8 @@ async def update_nurse_profile(
     nurse_id: str,
     update_data: NurseProfileUpdate,
     group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -1374,6 +1376,7 @@ async def update_nurse_profile(
     try:
         return update_nurse_profile_service(
             nurse_id, update_data, current_user, db, view_group_id=group_id,
+            effective_year=year, effective_month=month,
         )
     except HTTPException:
         raise
