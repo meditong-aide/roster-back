@@ -1853,6 +1853,9 @@ def update_nurse_profile_service(
                 db, nurse_id=nurse_id, group_id=nurse.group_id,
                 new_team_id=fields["team_id"],
             )
+        _persist_profile_period_change(
+            db, nurse_id=nurse_id, group_id=nurse.group_id, nurse=nurse, fields=fields,
+        )
         db.commit()
         db.refresh(nurse)
         applied_source = True
@@ -1875,6 +1878,11 @@ def update_nurse_profile_service(
                     db, nurse_id=nurse_id, group_id=assign_row.target_group_id,
                     new_team_id=fields["team_id"],
                 )
+            # grade/allowed_shifts/fixed_shift → target_group period(SSOT). 캐시 미투영(홈 아님).
+            _persist_profile_period_change(
+                db, nurse_id=nurse_id, group_id=assign_row.target_group_id,
+                nurse=nurse, fields=fields,
+            )
             _apply_target_update(
                 assign_row, {k: v for k, v in fields.items() if k != "team_id"}
             )
@@ -1890,6 +1898,9 @@ def update_nurse_profile_service(
                     db, nurse_id=nurse_id, group_id=nurse.group_id,
                     new_team_id=fields["team_id"],
                 )
+            _persist_profile_period_change(
+                db, nurse_id=nurse_id, group_id=nurse.group_id, nurse=nurse, fields=fields,
+            )
             # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
             # (team_id 는 _apply_target_update 에서 제외 — team SSOT=period 라 assignment 미관여)
             # 프론트가 view_group_id 안 보내도 source view 호출 한 번으로 inbound 모두 동기화.
@@ -1967,8 +1978,8 @@ def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> Non
     """
     _sanitize_resignation_fields(fields)
     for key, value in fields.items():
-        if key == "team_id":
-            continue  # team 은 nurse_team_period 에만 기록 (캐시 미사용)
+        if key == "team_id" or key in _PERIOD_OWNED_FIELDS:
+            continue  # team/grade/allowed_shifts/fixed_shift 은 period(SSOT)에만 — 캐시 직접쓰기 금지
         if hasattr(nurse, key):
             setattr(nurse, key, value)
 
@@ -1993,6 +2004,51 @@ def _persist_team_period_change(
         source="profile_edit",
         commit=False,
     )
+
+
+def _persist_profile_period_change(
+    db: Session, *, nurse_id: str, group_id: str, nurse: NurseModel,
+    fields: Dict[str, Any], valid_from: Optional[date] = None, source: str = "profile_edit",
+) -> None:
+    """grade/allowed_shifts/fixed_shift 변경을 period(SSOT)에 기록 (team 과 동일 패턴).
+
+    - grade: nurse_grade_period(병동귀속). 캐시 투영은 group_id==홈(nurse.group_id)일 때만
+      — inbound(타깃) 편집이 홈 캐시 grade 를 덮지 않게. valid_from 미래면 upsert 가 자동 미투영.
+    - allowed_shifts/fixed_shift: nurse_allowed_shift_period(결합 satellite, group 무관). 전역 속성이라 투영 OK.
+    valid_from 기본=당월1일. commit 은 호출부 일괄.
+    """
+    from datetime import date as _date
+    from db.models import NurseGradePeriod, NurseAllowedShiftPeriod
+    from services.nurse_period_resolver import upsert_period
+    _t = _date.today()
+    vf = valid_from or _date(_t.year, _t.month, 1)
+    _home = str(group_id) == str(getattr(nurse, "group_id", "") or "")
+    if "grade" in fields:
+        upsert_period(
+            db, NurseGradePeriod, str(nurse_id), vf, "grade", fields["grade"],
+            group_id=str(group_id),
+            nurse=(nurse if _home else None),
+            cache_attr=("grade" if _home else None),
+            source=source,
+        )
+    if "allowed_shifts" in fields:
+        upsert_period(
+            db, NurseAllowedShiftPeriod, str(nurse_id), vf, "allowed_shifts",
+            fields["allowed_shifts"] if fields["allowed_shifts"] is not None else [],
+            nurse=nurse, cache_attr="allowed_shifts", source=source,
+            carry_attrs=["fixed_shift"],
+        )
+    if "fixed_shift" in fields:
+        upsert_period(
+            db, NurseAllowedShiftPeriod, str(nurse_id), vf, "fixed_shift",
+            fields["fixed_shift"],
+            nurse=nurse, cache_attr="fixed_shift", source=source,
+            carry_attrs=["allowed_shifts"],
+        )
+
+
+# period 로 일원화된 속성 — _apply_*_update / target_* 에서 제외하고 _persist_profile_period_change 로 보낸다.
+_PERIOD_OWNED_FIELDS = ("grade", "allowed_shifts", "fixed_shift")
 
 
 def _validate_team_grade_change_or_raise(
@@ -2034,7 +2090,14 @@ def _validate_team_grade_change_or_raise(
             db, str(nurse.nurse_id), assign_row.target_group_id,
             _vdate2(_t2.year, _t2.month, 1),
         )
-        old_grade = assign_row.target_grade
+        # grade SSOT=nurse_grade_period: 변경 전 grade 도 period(target group)에서 읽는다(target_grade 미사용).
+        from datetime import timedelta as _tdv
+        from services.nurse_period_resolver import fetch_periods as _fpv, resolve_asof as _rav
+        from db.models import NurseGradePeriod as _NGPv
+        _msv = _vdate2(_t2.year, _t2.month, 1)
+        _gpv = _fpv(db, _NGPv, [str(nurse.nurse_id)], _msv, _msv + _tdv(days=1),
+                    group_id=assign_row.target_group_id)
+        old_grade = _rav(_gpv.get(str(nurse.nurse_id)), _msv, "grade", default=nurse.grade)
     new_team = fields["team_id"] if has_team else old_team
     new_grade = fields["grade"] if has_grade else old_grade
 

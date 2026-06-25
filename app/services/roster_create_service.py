@@ -4429,12 +4429,27 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 # team SSOT = nurse_team_period. 아래 resolve_team_for_roster 가 period 로 채운다
                 # (없으면 None=팀 미배정). target_team_id 는 더 이상 team 결정에 쓰지 않는다.
                 d['team_id'] = None
-                d['grade'] = _a.target_grade
                 d['weekly_off_enabled'] = bool(_a.target_weekly_off_enabled or 0)
                 d['weekly_off_type'] = _a.target_weekly_off_type
                 d['weekly_off_weekday'] = _a.target_weekly_off_weekday
-                d['allowed_shifts'] = _a.target_shift_types or []
-                d['fixed_shift'] = _a.target_fixed_shift
+                if _a.reason == "파견":
+                    # 파견 = 임시 overlay(period 미관여) → dispatch 프로필(target_*) 사용.
+                    d['grade'] = _a.target_grade
+                    d['allowed_shifts'] = _a.target_shift_types or []
+                    d['fixed_shift'] = _a.target_fixed_shift
+                else:
+                    # 병동이동(영구) = period as-of(target group=현 그룹). __dict__ 직접주입(영속화 회피).
+                    from services.nurse_period_resolver import fetch_periods as _fp, resolve_asof as _ra
+                    from db.models import NurseGradePeriod as _GP2, NurseAllowedShiftPeriod as _AP2
+                    _nid2 = str(n.nurse_id)
+                    _nx2 = month_start + timedelta(days=1)
+                    _g2 = _fp(db, _GP2, [_nid2], month_start, _nx2, group_id=current_user.group_id)
+                    d['grade'] = _ra(_g2.get(_nid2), month_start, "grade", default=getattr(n, "grade", None))
+                    _ap2 = _fp(db, _AP2, [_nid2], month_start, _nx2)
+                    d['allowed_shifts'] = _ra(_ap2.get(_nid2), month_start, "allowed_shifts",
+                                              default=(getattr(n, "allowed_shifts", None) or []))
+                    d['fixed_shift'] = _ra(_ap2.get(_nid2), month_start, "fixed_shift",
+                                           default=getattr(n, "fixed_shift", None))
         engine_nurses.extend(_inbound_nurses)
         nurses_in_group.extend(_inbound_nurses)
         print(
