@@ -81,7 +81,9 @@ class Nurse(Base):
     is_head_nurse = Column(BOOLEAN, default=False)
     # 마스터 관리자 구분 코드(ADM/HDN/...) - 실제 컬럼명 EmpAuthGbn 매핑
     emp_auth_gbn = Column(VARCHAR(3), name="EmpAuthGbn", nullable=True)
-    allowed_shifts = Column(JSON, nullable=True, default=list)
+    # 허용 근무형 리스트(JSON). 물리 컬럼명은 is_night_nurse 유지(공유 DB·타 브랜치 호환) —
+    # 코드/Python 속성만 allowed_shifts 로 수렴. 물리 rename 은 전 브랜치 머지 후 별도 마이그레이션.
+    allowed_shifts = Column(JSON, name="is_night_nurse", key="allowed_shifts", nullable=True, default=list)
     personal_off_adjustment = Column(TINYINT, default=0)
     preceptor_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"))
     joining_date = Column(DATETIME, nullable=True)
