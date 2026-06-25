@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fastapi import HTTPException
@@ -60,13 +60,40 @@ def _effective_nurse_for_group(
     """
     as_of = date(year, month, monthrange(year, month)[1])
     assignment = get_active_assignment(db, str(nurse.nurse_id), as_of)
-    if assignment is None or str(getattr(assignment, "target_group_id", "")) != str(group_id):
-        return nurse
-    overrides: Dict[str, Any] = {
-        attr: get_nurse_effective_attr(db, nurse, attr, as_of, _assignment_cache=assignment)
-        for attr in ("allowed_shifts", "fixed_shift")
-    }
-    return _EffectiveNurseView(nurse, overrides)
+    if assignment is not None and str(getattr(assignment, "target_group_id", "")) == str(group_id):
+        # 파견 inbound: 대상 그룹 capability = assignment.target_* (생성기 파견 처리와 동일).
+        overrides: Dict[str, Any] = {
+            attr: get_nurse_effective_attr(db, nurse, attr, as_of, _assignment_cache=assignment)
+            for attr in ("allowed_shifts", "fixed_shift")
+        }
+        return _EffectiveNurseView(nurse, overrides)
+    # home(또는 비대상): allowed/fixed 를 period as-of 로 해석 — 생성기와 동일 SSOT.
+    #   구 resolver(get_nurse_effective_attr=assignment.target_*→캐시)는 period 를 안 봐서
+    #   미래발효 변경이 생성과 검증에서 어긋났다(P4). 구간 없으면 캐시 폴백(무회귀).
+    overrides = _period_asof_overrides(db, str(nurse.nurse_id), as_of)
+    return _EffectiveNurseView(nurse, overrides) if overrides else nurse
+
+
+def _period_asof_overrides(db: Session, nurse_id: str, as_of: date) -> Dict[str, Any]:
+    """NurseAllowedShiftPeriod 에서 allowed_shifts/fixed_shift 를 as_of 로 해석.
+
+    구간 있으면 override dict 에 담고, gap 이면 키 생략(→ _EffectiveNurseView 가 캐시 폴백).
+    생성기의 period-우선·캐시-폴백 해석과 동일 SSOT.
+    """
+    from services.nurse_period_resolver import fetch_periods, resolve_asof
+    from db.models import NurseAllowedShiftPeriod
+    rows = fetch_periods(
+        db, NurseAllowedShiftPeriod, [nurse_id], as_of, as_of + timedelta(days=1)
+    ).get(nurse_id)
+    out: Dict[str, Any] = {}
+    _SENT = object()
+    a = resolve_asof(rows, as_of, "allowed_shifts", _SENT)
+    if a is not _SENT:
+        out["allowed_shifts"] = a
+    f = resolve_asof(rows, as_of, "fixed_shift", _SENT)
+    if f is not _SENT:
+        out["fixed_shift"] = f
+    return out
 
 
 def _normalize_row(row: Mapping[str, Any]) -> Dict[str, Any]:

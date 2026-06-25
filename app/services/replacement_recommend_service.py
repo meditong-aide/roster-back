@@ -384,6 +384,34 @@ def _load_pair_score_map(db: Session, nurse_ids: List[str], month_key: str) -> D
     return {k: sum(v) / len(v) for k, v in pair_score.items() if v}
 
 
+def _overlay_candidate_capability_asof(db: Any, nurses: List[Any], as_of: date) -> None:
+    """대체 후보 nurse 들의 allowed_shifts/fixed_shift 를 as_of period 값으로 in-place 오버레이.
+
+    구간 있으면 __dict__ 주입, gap 이면 캐시 유지(무회귀). 추천 흐름은 읽기전용이라
+    세션 객체 in-place 주입이 안전(생성기 _overlay_home_profile_asof 와 동일 방식).
+    """
+    try:
+        from services.nurse_period_resolver import fetch_periods, resolve_asof
+        from db.models import NurseAllowedShiftPeriod
+    except Exception:
+        return
+    ids = [str(n.nurse_id) for n in nurses]
+    if not ids:
+        return
+    ap = fetch_periods(db, NurseAllowedShiftPeriod, ids, as_of, as_of + timedelta(days=1))
+    _SENT = object()
+    for n in nurses:
+        rows = ap.get(str(n.nurse_id))
+        if not rows:
+            continue
+        a = resolve_asof(rows, as_of, "allowed_shifts", _SENT)
+        if a is not _SENT:
+            n.__dict__["allowed_shifts"] = a
+        f = resolve_asof(rows, as_of, "fixed_shift", _SENT)
+        if f is not _SENT:
+            n.__dict__["fixed_shift"] = f
+
+
 def _nurse_is_night_capable(nurse: Any) -> bool:
     raw = getattr(nurse, "allowed_shifts", None)
     if isinstance(raw, list):
@@ -1435,6 +1463,12 @@ def recommend_replacement_candidates(
         raise ValueError("target_nurse_id not found in schedule entries")
 
     nurses = db.query(Nurse).filter(Nurse.group_id == target_group_id).order_by(Nurse.nurse_id).all()
+    # (P5) 대체 후보 capability(allowed_shifts/fixed_shift)를 대상 스케줄 월 as-of 로 오버레이.
+    #   캐시(오늘값) 대신 그 달 period 값으로 야간가능·고정근무를 판정 — 생성기와 동일 SSOT.
+    #   구간 없으면 캐시 유지(무회귀). 생성기 _overlay_home_profile_asof 와 동일하게 __dict__ 주입.
+    _overlay_candidate_capability_asof(
+        db, nurses, date(year_value, month_value, days_in_month)
+    )
     nurse_by_id = {str(n.nurse_id): n for n in nurses}
 
     assignment_blocked = _build_assignment_blocked_dates(

@@ -1436,6 +1436,23 @@ def export_members_excel_bytes(office_id: str) -> bytes:
     return bio.read()
 
 
+def _excel_upsert_allowed(db: Session, nurse, allowed_shifts) -> None:
+    """엑셀 업로드의 allowed_shifts 를 period(SSOT) 경유로 기록 + 캐시 단방향 투영.
+
+    엑셀은 월 컨텍스트가 없어 valid_from=today(현재값 변경). upsert 가 동일값이면 no-op,
+    캐시(nurses.allowed_shifts)는 내부에서 투영하므로 직접 대입은 제거.
+    """
+    from datetime import date as _date
+    from services.nurse_period_resolver import upsert_period
+    from db.models import NurseAllowedShiftPeriod
+    upsert_period(
+        db, NurseAllowedShiftPeriod, str(nurse.nurse_id), _date.today(),
+        "allowed_shifts", allowed_shifts if allowed_shifts is not None else [],
+        nurse=nurse, cache_attr="allowed_shifts", source="excel_upload",
+        carry_attrs=["fixed_shift"],
+    )
+
+
 def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, target_group_id: str) -> Dict[str, Any]:
     """업로드2: 검증된 행을 nurses 테이블에 저장 (신규/업데이트)"""
     print("[upload2_confirm] 함수 시작")
@@ -1507,7 +1524,10 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                 existing.phone_number = phone_number
                 existing.gender = gender
                 existing.email = email
-                existing.allowed_shifts = allowed_shifts
+                # allowed_shifts 는 period(SSOT) 경유 — 캐시 직접쓰기는 생성기(period as-of)와
+                #   어긋난다(P2). 엑셀은 월 컨텍스트가 없어 valid_from=today(현재값 변경).
+                #   upsert 가 nurses.allowed_shifts 캐시에 단방향 투영한다.
+                _excel_upsert_allowed(db, existing, allowed_shifts)
                 existing.work_shifts = work_shifts
                 updated += 1
             else:
@@ -1538,6 +1558,9 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                         work_shifts=work_shifts,
                     )
                     db.add(new_nurse)
+                    # 신규도 allowed_shifts 를 period 에 시드 — 생성기 per-day 해석이 캐시 폴백이
+                    #   아니라 명시 구간을 읽게(P2). gap 폴백도 동작하지만 SSOT 일관성 위해 기록.
+                    _excel_upsert_allowed(db, new_nurse, allowed_shifts)
                     saved += 1
                 except Exception as inner_e:
                     errors.append({"row": item.get('row', 0), "reason": str(inner_e)})
