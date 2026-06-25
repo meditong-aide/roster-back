@@ -2473,6 +2473,40 @@ def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, s
     return code2main
 
 
+def _overlay_home_profile_asof(db, nurses, group_id, month_start) -> None:
+    """home 간호사 grade/weekend_off/fixed_shift 를 대상월 period as-of 로 __dict__ 오버레이.
+
+    생성기가 캐시(오늘값)가 아니라 '그 달 값'으로 돌도록 — allowed 가 per-day period 인 것과
+    동일 원칙. 미래월을 미리 생성해도 미래발효 변경이 반영된다.
+    - gap(그 달 구간 없음) → 캐시 유지(비회귀). 구간이 값 None 이면 그 None 을 적용(명시적 해제).
+    - fixed_shift 는 호출부에서 _split_fixed_nurses 이전에 적용해야 분기 정합(여기선 값만 주입).
+    - inbound 는 별도 경로(target_*/period)로 주입되므로 여기 대상 아님(home 만 전달할 것).
+    """
+    from datetime import timedelta as _td
+    from services.nurse_period_resolver import fetch_periods, resolve_asof
+    from db.models import NurseGradePeriod, NurseWeekendOffPeriod, NurseAllowedShiftPeriod
+    _SENT = object()
+    ids = [str(n.nurse_id) for n in nurses]
+    if not ids:
+        return
+    nx = month_start + _td(days=1)
+    gp = fetch_periods(db, NurseGradePeriod, ids, month_start, nx, group_id=group_id)
+    wp = fetch_periods(db, NurseWeekendOffPeriod, ids, month_start, nx)
+    ap = fetch_periods(db, NurseAllowedShiftPeriod, ids, month_start, nx)
+    for n in nurses:
+        nid = str(n.nurse_id)
+        d = n.__dict__
+        g = resolve_asof(gp.get(nid), month_start, "grade", default=_SENT)
+        if g is not _SENT:
+            d["grade"] = g
+        w = resolve_asof(wp.get(nid), month_start, "weekend_off", default=None)
+        if w is not None:
+            d["is_weekend_off"] = bool(w)
+        fx = resolve_asof(ap.get(nid), month_start, "fixed_shift", default=_SENT)
+        if fx is not _SENT:
+            d["fixed_shift"] = fx
+
+
 def _normalize_allowed_shift_types(raw_value: object, use_mid: bool = False) -> set[str]:
     if raw_value is None:
         return set()
@@ -4352,6 +4386,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         ]
         print(f"[RosterCreate] 비활성 간호사 엔진 제외: {excluded_names}")
     nurses_in_group = active_nurses_in_group
+    # [속성 SSOT] home 간호사 grade/weekend/fixed 를 대상월 period as-of 로 오버레이(캐시 대신 그 달 값).
+    #   fixed_shift 가 아래 _split_fixed_nurses 분기를 좌우하므로 split 이전에 적용한다.
+    #   inbound 는 하단에서 별도 as-of 주입 → 여기는 home(nurses_in_group) 만 대상.
+    try:
+        _overlay_home_profile_asof(
+            db, nurses_in_group, current_user.group_id, date(req.year, req.month, 1)
+        )
+    except Exception as _e_home_asof:
+        print(f"[PeriodAsOf][home] grade/weekend/fixed 오버레이 실패(캐시 유지로 진행): {_e_home_asof}")
     # _debug_log(
     #     "collect_done",
     #     {
