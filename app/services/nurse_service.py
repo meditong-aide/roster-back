@@ -817,9 +817,14 @@ def bulk_update_nurses_service(
     current_user: UserSchema,
     db: Session,
     override_group_id: Optional[str] = None,
+    effective_year: Optional[int] = None,
+    effective_month: Optional[int] = None,
 ):
     """
     간호사 일괄 업데이트 서비스 함수
+
+    effective_year/month: 월 셀렉터가 보낸 선택월. period 쓰기의 valid_from 을 그 달 1일로
+      잡는다(미동반 시 today). 예) 8월 뷰에서 저장 → 기존 구간 close-before-open, 8월부터 발효.
     """
     if not current_user:
         raise Exception("Not authenticated")
@@ -832,6 +837,13 @@ def bulk_update_nurses_service(
 
     if not target_group_id:
         raise Exception("그룹 ID를 확인할 수 없습니다.")
+
+    # period 쓰기의 valid_from = 선택월 1일(월 셀렉터). 미동반 시 today(현재값 변경).
+    from datetime import date as _vf_date
+    _effective_vf = (
+        _vf_date(int(effective_year), int(effective_month), 1)
+        if effective_year and effective_month else _vf_date.today()
+    )
 
     # 그룹 내 모든 간호사 + inbound 간호사까지 미리 로드 (target 모드 지원)
     _inbound_ids = [
@@ -977,7 +989,7 @@ def bulk_update_nurses_service(
             from db.models import NurseAllowedShiftPeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _date.today(),
+                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _effective_vf,
                 "allowed_shifts", final_night,
                 nurse=db_nurse, cache_attr="allowed_shifts", source="edited",
             )
@@ -990,7 +1002,7 @@ def bulk_update_nurses_service(
             from db.models import NurseGradePeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseGradePeriod, db_nurse.nurse_id, _date.today(),
+                db, NurseGradePeriod, db_nurse.nurse_id, _effective_vf,
                 "grade", update_data["grade"],
                 group_id=db_nurse.group_id,
                 nurse=db_nurse, cache_attr="grade", source="edited",
@@ -1002,7 +1014,7 @@ def bulk_update_nurses_service(
             from db.models import NurseAllowedShiftPeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _date.today(),
+                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _effective_vf,
                 "fixed_shift", update_data["fixed_shift"],
                 nurse=db_nurse, cache_attr="fixed_shift",
                 carry_attrs=["allowed_shifts"], source="edited",
@@ -1014,7 +1026,7 @@ def bulk_update_nurses_service(
             from db.models import NurseWeekendOffPeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseWeekendOffPeriod, db_nurse.nurse_id, _date.today(),
+                db, NurseWeekendOffPeriod, db_nurse.nurse_id, _effective_vf,
                 "weekend_off", 1 if update_data["is_weekend_off"] else 0,
                 nurse=db_nurse, cache_attr="is_weekend_off", source="edited",
             )

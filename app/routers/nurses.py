@@ -443,14 +443,18 @@ async def reorder_nurses(
 async def bulk_update_nurses(
     nurses_data: List[NurseProfile],
     group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
     try:
         # 그룹: 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 None(서비스 폴백).
         gid = resolve_effective_group(db, current_user, group_id, require_group=False)
+        # year/month = 월 셀렉터 선택월 → period valid_from(미동반 시 today).
         return bulk_update_nurses_service(
-            nurses_data, current_user, db, override_group_id=gid
+            nurses_data, current_user, db, override_group_id=gid,
+            effective_year=year, effective_month=month,
         )
     except HTTPException:
         raise  # 403/400(권한·그룹) 은 그대로 전파
