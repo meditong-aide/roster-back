@@ -1921,6 +1921,7 @@ def update_nurse_profile_service(
                 )
             _persist_profile_period_change(
                 db, nurse_id=nurse_id, group_id=nurse.group_id, nurse=nurse, fields=fields,
+                valid_from=_eff_vf,
             )
             # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
             # (team_id 는 _apply_target_update 에서 제외 — team SSOT=period 라 assignment 미관여)
@@ -2029,20 +2030,22 @@ def _persist_team_period_change(
 
 def _persist_profile_period_change(
     db: Session, *, nurse_id: str, group_id: str, nurse: NurseModel,
-    fields: Dict[str, Any], valid_from: Optional[date] = None, source: str = "profile_edit",
+    fields: Dict[str, Any], valid_from: date, source: str = "profile_edit",
 ) -> None:
     """grade/allowed_shifts/fixed_shift 변경을 period(SSOT)에 기록 (team 과 동일 패턴).
 
     - grade: nurse_grade_period(병동귀속). 캐시 투영은 group_id==홈(nurse.group_id)일 때만
       — inbound(타깃) 편집이 홈 캐시 grade 를 덮지 않게. valid_from 미래면 upsert 가 자동 미투영.
     - allowed_shifts/fixed_shift: nurse_allowed_shift_period(결합 satellite, group 무관). 전역 속성이라 투영 OK.
-    valid_from 기본=당월1일. commit 은 호출부 일괄.
+
+    valid_from 은 **필수**다. "당월 vs 선택월" 결정은 호출부 단일 지점(_eff_vf)에서만 한다.
+    과거엔 default=None→당월1일 폴백이 있어, 한 분기(source)가 값을 빼먹어도 조용히 당월로
+    써버려 미래월 발효가 깨졌다. 이제 빼먹으면 TypeError 로 즉시 터진다(거짓 그린 차단).
+    commit 은 호출부 일괄.
     """
-    from datetime import date as _date
     from db.models import NurseGradePeriod, NurseAllowedShiftPeriod, NurseWeekendOffPeriod
     from services.nurse_period_resolver import upsert_period
-    _t = _date.today()
-    vf = valid_from or _date(_t.year, _t.month, 1)
+    vf = valid_from
     _home = str(group_id) == str(getattr(nurse, "group_id", "") or "")
     if "grade" in fields:
         upsert_period(

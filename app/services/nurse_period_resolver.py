@@ -71,6 +71,23 @@ def open_span_covering(db, Model, nurse_id: str, valid_from: date,
     return q.order_by(Model.valid_from.desc()).first()
 
 
+def _next_span_start(db, Model, nurse_id: str, valid_from: date,
+                     group_id: str | None = None) -> date | None:
+    """valid_from 보다 뒤에서 시작하는 가장 가까운 구간의 시작일. 없으면 None.
+
+    gap(앞쪽 미지정 구간)에 새 구간을 열 때, 뒤에 이미 있는 변경점을 삼키지 않도록
+    새 구간의 valid_to 를 여기까지로 잘라준다.
+    """
+    q = db.query(Model).filter(
+        Model.nurse_id == nurse_id,
+        Model.valid_from > valid_from,
+    )
+    if group_id is not None and hasattr(Model, "group_id"):
+        q = q.filter(Model.group_id == group_id)
+    nxt = q.order_by(Model.valid_from.asc()).first()
+    return nxt.valid_from if nxt is not None else None
+
+
 def upsert_period(db, Model, nurse_id: str, valid_from: date, value_attr: str,
                   value: Any, group_id: str | None = None, *,
                   nurse=None, cache_attr: str | None = None,
@@ -98,9 +115,16 @@ def upsert_period(db, Model, nurse_id: str, valid_from: date, value_attr: str,
         row = cur
     else:
         if cur is not None:
+            # 분할: 새 구간은 기존 구간의 끝을 승계해야 뒤의 변경점(예: 8/1)을 보존한다.
+            # 과거엔 valid_to=None 으로 열어 [6/1,8/1) 중간(7/1) 편집 시 새 [7/1,None) 이
+            # 기존 [8/1,...) 를 덮어 8월 편집이 영영 안 보이는 겹침 버그가 났다.
+            new_valid_to = cur.valid_to
             cur.valid_to = valid_from               # close-before-open
+        else:
+            # gap(앞쪽 미지정)에 새 구간 — 뒤에 이미 있는 변경점까지만 연다.
+            new_valid_to = _next_span_start(db, Model, nurse_id, valid_from, group_id)
         kwargs: dict[str, Any] = {
-            "nurse_id": nurse_id, "valid_from": valid_from, "valid_to": None,
+            "nurse_id": nurse_id, "valid_from": valid_from, "valid_to": new_valid_to,
             value_attr: value, "source": source,
         }
         if group_id is not None and hasattr(Model, "group_id"):
