@@ -339,9 +339,25 @@ async def get_config_by_version(
             )
             .first()
         )
+        if pconf is None:
+            # version 매칭 실패 → config_id 로 폴백.
+            #   프론트 다수 경로가 config_id 를 version 자리에 넘긴다(currentConfigVer 가 실제로는
+            #   response.configs.config_id, verList[].config_id 도 config_id). 특히 ad-hoc(version
+            #   NULL) 그룹은 version 매칭이 영영 불가하므로, 같은 그룹 스코프의 config_id 로 해석한다.
+            #   (group 필터가 있어 타 그룹 config_id 오해석은 없음.)
+            pconf = (
+                db.query(RosterConfigModel)
+                .filter(
+                    RosterConfigModel.office_id == target_office_id,
+                    RosterConfigModel.group_id == target_group_id,
+                    RosterConfigModel.config_id == _ver_int,
+                )
+                .first()
+            )
         if not pconf:
             raise HTTPException(
-                status_code=404, detail=f"version={_ver_int} 설정을 찾을 수 없습니다."
+                status_code=404,
+                detail=f"version/config_id={_ver_int} 설정을 찾을 수 없습니다.",
             )
         return _roster_config_to_dict(pconf)
 
