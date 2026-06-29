@@ -72,7 +72,7 @@ _TOOL_NAME_RE = re.compile(
     r"\b(manage_grade|manage_team_min|bulk_mutation|query_schedule|"
     r"update_constraint|update_person_attr|generate_schedule|"
     r"validate_schedule|recommend_candidates|repair_schedule|"
-    r"analyze_report|navigate|prefill)\s*\([^)]*\)",
+    r"analyze_report|navigate|prefill|switch_ward)\s*\([^)]*\)",
 )
 
 # 길이 임계: base64/hex 같은 50자+ 토큰류 (시크릿 흔적)

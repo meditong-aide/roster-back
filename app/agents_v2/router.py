@@ -30,8 +30,8 @@ ALL_TOOL_NAMES: list[str] = [t["name"] for t in SKILL_TOOLS]
 # ── 카테고리 → tool 배선 맵 (wiring, NL 파싱 아님) ──
 # gray-zone 도메인엔 navigate/prefill 을 번들해 메인 프롬프트가 화면이동 vs 조회/실행을 가른다.
 CATEGORY_TOOLS: dict[str, list[str]] = {
-    # 순수 화면 이동/폼 프리필
-    "navigation": ["navigate", "prefill"],
+    # 순수 화면 이동/폼 프리필/병동 컨텍스트 전환
+    "navigation": ["navigate", "prefill", "switch_ward"],
     # 근무표/원티드/간호사/시프트/설정값 조회 (view-vs-derive gray → navigate 번들)
     # [LIVE_LLM_CARVE 2026-06-22] '생성 끝났어?' / '마감일 어때?' / '한도 넘은 사람' 같은
     # 조회 발화가 read 직격 시그널이라 read 카테고리에 mutation 스킬의 조회 op 도 번들.

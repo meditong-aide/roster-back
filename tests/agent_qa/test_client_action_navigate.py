@@ -52,6 +52,7 @@ def _nav_session(db, *, role: str = "HN", name: str = "navigate", **args) -> Age
 def test_is_client_action():
     assert is_client_action("navigate")
     assert is_client_action("prefill")
+    assert is_client_action("switch_ward")
     assert not is_client_action("query_schedule")
     assert not is_client_action("manage_team_min")
 
@@ -212,3 +213,48 @@ def test_to_dict_includes_ui_actions(db):
     d = res.to_dict()
     assert "ui_actions" in d
     assert d["ui_actions"] == [{"action": "navigate", "target": "wanted"}]
+
+
+# ── switch_ward — 상단 셀렉터 컨텍스트 전환 ──────────────
+
+
+def test_build_switch_ward_ok():
+    action, err = build_ui_action("switch_ward", {"ward_name": "9A"})
+    assert err is None
+    assert action == {"action": "switch_ward", "ward_name": "9A"}
+
+
+def test_build_switch_ward_strips_whitespace():
+    action, err = build_ui_action("switch_ward", {"ward_name": "  9B병동  "})
+    assert err is None
+    assert action == {"action": "switch_ward", "ward_name": "9B병동"}
+
+
+def test_build_switch_ward_missing_name_errors():
+    action, err = build_ui_action("switch_ward", {})
+    assert action is None
+    assert err and "병동" in err
+
+
+def test_build_switch_ward_empty_name_errors():
+    action, err = build_ui_action("switch_ward", {"ward_name": "  "})
+    assert action is None
+    assert err
+
+
+def test_permission_switch_ward_open_to_all_roles():
+    # switch_ward 는 백엔드 권한 게이트 없음 — 프론트 셀렉터(접근 가능 ward 목록)가 SSOT.
+    assert _check_permission("switch_ward", {"ward_name": "9A"}, _ctx("nurse")) is None
+    assert _check_permission("switch_ward", {"ward_name": "9A"}, _ctx("HN")) is None
+    assert _check_permission("switch_ward", {"ward_name": "9A"}, _ctx("ADM")) is None
+
+
+def test_switch_ward_e2e(db):
+    res = _nav_session(db, name="switch_ward", ward_name="9A").send("9A병동으로 이동해줘")
+    assert res.ui_actions == [{"action": "switch_ward", "ward_name": "9A"}]
+
+
+def test_switch_ward_recorded_in_trace(db):
+    sess = _nav_session(db, name="switch_ward", ward_name="9B")
+    sess.send("9B병동으로 바꿔줘")
+    sess.assert_tool_called("switch_ward", {"ward_name": "9B"})

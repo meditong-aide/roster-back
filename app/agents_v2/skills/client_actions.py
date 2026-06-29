@@ -35,7 +35,10 @@ NAVIGATE_TARGETS: dict[str, dict[str, Any]] = {
 }
 
 # client-action tool 이름 (registry skill 과 구분). hyphen/underscore 모두 허용.
-_CLIENT_ACTION_NAMES = frozenset({"navigate", "prefill"})
+# - navigate/prefill: 화면 이동/폼 프리필 (route SSOT 기반 closed enum).
+# - switch_ward: 상단 병동 셀렉터 컨텍스트 전환. route 변경 X, group_id 전환.
+#   ward_name 은 freeform — 프론트가 자신의 ward 셀렉터 목록과 매칭(SSOT).
+_CLIENT_ACTION_NAMES = frozenset({"navigate", "prefill", "switch_ward"})
 
 
 def normalize_action_name(name: str) -> str:
@@ -55,6 +58,8 @@ def target_permission_error(target: Any, ctx: Any) -> str | None:
     """HN 전용 target 을 일반 간호사가 navigate/prefill 하려 하면 차단 메시지.
 
     알 수 없는 target 은 None (권한 문제 아님 — build 단계에서 '화면 없음' 처리).
+    switch_ward 는 target 이 없는 client-action 이므로 본 함수가 항상 None 반환 — 권한은
+    프론트의 셀렉터(접근 가능 ward 목록)가 SSOT 로 강제.
     """
     meta = NAVIGATE_TARGETS.get(target)
     if not meta:
@@ -73,6 +78,14 @@ def build_ui_action(name: str, args: dict) -> tuple[dict | None, str | None]:
     norm = normalize_action_name(name)
     args = args or {}
 
+    # switch_ward: 화면 이동이 아니라 상단 셀렉터 컨텍스트 전환. target enum 적용 X.
+    if norm == "switch_ward":
+        ward_name = (args.get("ward_name") or "").strip()
+        if not ward_name:
+            return None, "전환할 병동 이름이 필요합니다 (예: '9A')."
+        action: dict[str, Any] = {"action": norm, "ward_name": ward_name}
+        return action, None
+
     target = args.get("target")
     meta = NAVIGATE_TARGETS.get(target)
     if meta is None:
@@ -83,7 +96,7 @@ def build_ui_action(name: str, args: dict) -> tuple[dict | None, str | None]:
         allowed = ", ".join(sorted(meta["subs"])) or "없음"
         return None, f"'{target}' 화면에는 '{sub}' 섹션이 없습니다. (가능: {allowed})"
 
-    action: dict[str, Any] = {"action": norm, "target": target}
+    action = {"action": norm, "target": target}
     if sub is not None:
         action["sub"] = sub
     query = args.get("query")

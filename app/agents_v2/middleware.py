@@ -282,9 +282,10 @@ def _check_permission(
     normalized = skill_name.replace("-", "_")
     is_hn = _is_head_or_admin(ctx)
 
-    # (0) client-action (navigate/prefill) — HN 전용 화면 게이팅.
+    # (0) client-action (navigate/prefill/switch_ward) — HN 전용 화면 게이팅.
     # target 별 hn_only 여부는 client_actions 모듈(route SSOT 매핑)이 소유.
-    if normalized in ("navigate", "prefill"):
+    # switch_ward 는 target 없는 컨텍스트 전환 — 권한은 프론트 셀렉터(접근 가능 ward 목록)가 강제.
+    if normalized in ("navigate", "prefill", "switch_ward"):
         from agents_v2.skills.client_actions import target_permission_error
 
         return target_permission_error(args.get("target"), ctx)
