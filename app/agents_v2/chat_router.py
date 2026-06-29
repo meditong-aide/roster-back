@@ -32,7 +32,9 @@ from agents_v2.security import (
     classify_input,
 )
 from db.client2 import get_db
+from db.models import Group, Office
 from routers.auth import get_current_user_from_cookie
+from services.group_access import resolve_managed_group_ids
 from schemas.auth_schema import User
 
 logger = logging.getLogger(__name__)
@@ -69,16 +71,75 @@ def _resolve_role(user: User) -> str:
     return "NURSE"
 
 
+def _resolve_org_names(
+    db: Session, office_id: Optional[str], group_id: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """병동/병원 id → 사람이 읽는 이름. 조회 실패해도 채팅은 막지 않는다."""
+    group_name: Optional[str] = None
+    office_name: Optional[str] = None
+    try:
+        if group_id:
+            group_name = (
+                db.query(Group.group_name)
+                .filter(Group.group_id == group_id)
+                .scalar()
+            )
+        if office_id:
+            office_name = (
+                db.query(Office.office_name)
+                .filter(Office.office_id == office_id)
+                .scalar()
+            )
+    except Exception:  # noqa: BLE001 — 이름 조회 실패가 채팅을 깨면 안 됨
+        logger.warning(
+            "[chat] org name lookup failed office_id=%s group_id=%s",
+            office_id, group_id, exc_info=True,
+        )
+    return group_name, office_name
+
+
+def _resolve_managed_group_names(
+    db: Session, user: User, current_group_id: Optional[str]
+) -> list[str]:
+    """HN 이 관리하는 병동 이름들. 단일(현재 병동뿐)이면 빈 리스트(중복 안내 방지)."""
+    try:
+        managed_ids = resolve_managed_group_ids(db, user)
+        if len(managed_ids) <= 1:
+            return []
+        rows = (
+            db.query(Group.group_id, Group.group_name)
+            .filter(Group.group_id.in_(managed_ids))
+            .all()
+        )
+        # resolve_managed_group_ids 순서(home 우선) 유지
+        by_id = {str(gid): name for gid, name in rows}
+        return [by_id[gid] for gid in managed_ids if gid in by_id]
+    except Exception:  # noqa: BLE001 — 관리 병동 조회 실패가 채팅을 깨면 안 됨
+        logger.warning(
+            "[chat] managed group lookup failed nurse_id=%s", user.nurse_id,
+            exc_info=True,
+        )
+        return []
+
+
 def _build_session_ctx(
-    user: User, conv_id: str, year: Optional[int], month: Optional[int]
+    db: Session, user: User, conv_id: str, year: Optional[int], month: Optional[int]
 ) -> SessionContext:
     today = date.today()
+    role = _resolve_role(user)
+    group_name, office_name = _resolve_org_names(db, user.office_id, user.group_id)
+    managed_group_names = (
+        _resolve_managed_group_names(db, user, user.group_id) if role == "HN" else []
+    )
     return SessionContext(
         office_id=user.office_id,
+        office_name=office_name,
         group_id=user.group_id,
+        group_name=group_name,
+        managed_group_names=managed_group_names,
         year=year or today.year,
         month=month or today.month,
-        user_role=_resolve_role(user),
+        user_role=role,
         nurse_id=user.nurse_id,
         nurse_name=user.name,
         conversation_id=conv_id,
@@ -190,7 +251,7 @@ async def send_message(
     )
 
     # SessionContext 자동 구성 + 이전 상태 복원
-    ctx = _build_session_ctx(current_user, conv_id, req.year, req.month)
+    ctx = _build_session_ctx(db, current_user, conv_id, req.year, req.month)
     ctx.messages = conv.messages
     ctx.variable_memory = conv.variable_memory or {}
     ctx.pending_approval = conv.pending_approval
