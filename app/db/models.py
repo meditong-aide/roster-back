@@ -179,6 +179,15 @@ class NurseTeamPeriod(Base):
     __table_args__ = (
         Index("ix_ntp_nurse", "nurse_id", "valid_from"),
         Index("ix_ntp_group", "group_id", "valid_from"),
+        # 한 간호사는 한 병동에서 같은 시작일로 두 구간을 가질 수 없다(close-before-open
+        #   타임라인 불변식). set_team_period 의 upsert 키와 동일 → 과거 더블인서트로 생긴
+        #   완전중복 행(완전 동일 행 2개)을 DB 레벨에서 영구 차단.
+        UniqueConstraint(
+            "nurse_id",
+            "group_id",
+            "valid_from",
+            name="uq_ntp_nurse_group_from",
+        ),
     )
 
 
