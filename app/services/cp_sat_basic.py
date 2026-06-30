@@ -1404,6 +1404,15 @@ class CPSATBasicEngine:
             valid_ids = {row.get('nurse_id') for row in nurses_data}
             seen_pairs = set()  # 중복 방지 (무방향)
             added_cnt = 0
+            # 멤버십: nurse_preceptee_period 맵 있으면 그 달 active 프리셉티만 페어링(종료자 제외),
+            # 없으면(백필 전) 캐시 기반 전체 — 무회귀. 설계 §6.
+            _pte_map = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
+            _active_pte_ids = None
+            if _pte_map:
+                _active_pte_ids = {
+                    str(k) for k, v in _pte_map.items()
+                    if (v.get("days") if isinstance(v, dict) else v)
+                }
             # 프리셉터-멘티 함께 근무 가중치: 기본 페어링 대비 강화
             preceptor_pair_weight = float(getattr(config, 'pair_preference_weight', 3.0)) * 2.5
             for row in nurses_data:
@@ -1411,6 +1420,8 @@ class CPSATBasicEngine:
                 preceptor_id = row.get('preceptor_id')
                 if not mentee_id or not preceptor_id:
                     continue
+                if _active_pte_ids is not None and str(mentee_id) not in _active_pte_ids:
+                    continue  # 권위 모드: 그 달 프리셉티 아님 → 페어링 제외
                 if preceptor_id not in valid_ids or preceptor_id == mentee_id:
                     continue
                 key = frozenset((mentee_id, preceptor_id))
@@ -1624,7 +1635,10 @@ class CPSATBasicEngine:
 
                 for n, nu in enumerate(roster_system.nurses):
                     pid = getattr(nu, 'preceptor_id', None)
-                    if not pid or pid not in id_to_idx:
+                    _follow = _pp_follow_days.get(n)
+                    # 권위 모드: 맵에 없는(종료) 프리셉티는 비-프리셉티 취급(본인 fixed 유지).
+                    _is_pte = (bool(_follow) if _has_pte_map else bool(pid and pid in id_to_idx))
+                    if not pid or pid not in id_to_idx or not _is_pte:
                         # 프리셉티 아닌 경우 기존 유지
                         for cell in fixed_cells:
                             if cell.get("nurse_index") == n:
@@ -1632,7 +1646,8 @@ class CPSATBasicEngine:
                         continue
 
                     ptr_idx = id_to_idx[pid]
-                    for d in range(roster_system.num_days):
+                    _days = sorted(_follow) if (_has_pte_map and _follow) else range(roster_system.num_days)
+                    for d in _days:
                         key = (ptr_idx, d)
                         if key in preceptor_fixed:
                             copied = preceptor_fixed[key].copy()
