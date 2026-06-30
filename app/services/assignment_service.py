@@ -1530,6 +1530,13 @@ def _apply_target_profile_reset(
     )
     if nurse.preceptor_id is not None:
         nurse.preceptor_id = None
+    # write-through: 병동이동 발효일에 관련 preceptee period close (SSOT).
+    from services.preceptee_period import close_all_for_preceptor, close_preceptee_period
+    _eff = row.start_date or date.today()
+    close_all_for_preceptor(db, preceptor_id=row.nurse_id, close_date=_eff,
+                            end_reason="preceptor_transfer", today=_eff)  # 이 간호사가 프리셉터
+    close_preceptee_period(db, nurse_id=row.nurse_id, close_date=_eff,
+                           end_reason="preceptor_transfer", nurse=nurse, today=_eff)  # 본인이 프리셉티
     return int(detached or 0)
 
 
@@ -1957,9 +1964,11 @@ def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -
             #   이미 기록됨. nurses.team_id 캐시는 더 이상 쓰지 않는다(컬럼 DROP 예정).
             # grade/allowed_shifts/fixed_shift 도 period(SSOT)에서 투영(assignment.target_* 미사용).
             _project_profile_period_to_cache(db, nurse, row.target_group_id, today)
-            # payload.release_preceptor → 프리셉터십 공식 종료 (preceptor_id 비움)
+            # payload.release_preceptor → 프리셉터십 공식 종료 (period close + 캐시 None 투영)
             if (row.payload or {}).get("release_preceptor"):
-                nurse.preceptor_id = None
+                from services.preceptee_period import close_preceptee_period
+                close_preceptee_period(db, nurse_id=row.nurse_id, close_date=today,
+                                       end_reason="released", nurse=nurse, today=today)
         row.status = "completed"
         row.end_date = today
         count += 1

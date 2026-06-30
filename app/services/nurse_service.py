@@ -2248,8 +2248,17 @@ def _dispatch_preceptees_payload(
             reason="프리셉티",
             note=note,
         )
-        _create_assignment(req, db, current_user=current_user)
+        created = _create_assignment(req, db, current_user=current_user)
         target.preceptor_id = preceptor_nurse_id
+        # write-through: nurse_preceptee_period SSOT (WHO+WHEN). 캐시는 위에서 명시 set(전환기).
+        from services.preceptee_period import open_preceptee_period, end_date_to_valid_to
+        open_preceptee_period(
+            db, nurse_id=target_nurse_id, preceptor_id=preceptor_nurse_id,
+            office_id=target.office_id, valid_from=start_date,
+            valid_to=end_date_to_valid_to(expected_end_date),
+            source_assignment_id=getattr(created, "id", None), source="assignment",
+            nurse=None,  # 캐시는 명시 set 유지(전환기) — 이중 갱신 방지
+        )
         db.commit()
     elif op == "update":
         if not assignment_id:
@@ -2320,7 +2329,13 @@ def _dispatch_preceptees_payload(
                 NurseAssignment.status == "active",
             ).first()
             if not still_active:
-                target.preceptor_id = None
+                # write-through: 열린 period close(end_reason=cancelled) + 캐시 None 투영.
+                from datetime import date as _date
+                from services.preceptee_period import close_preceptee_period
+                close_preceptee_period(
+                    db, nurse_id=row.nurse_id, close_date=_date.today(),
+                    end_reason="cancelled", nurse=target,
+                )
                 db.commit()
     else:
         raise HTTPException(status_code=400, detail=f"preceptees_assignment.operation 값이 올바르지 않습니다: {op!r}")
