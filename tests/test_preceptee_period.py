@@ -113,6 +113,23 @@ def test_close_projects_cache_none(db, seed_data):
     assert rows[0].valid_to == date(2026, 6, 30) and rows[0].end_reason == "cancelled"
 
 
+def test_resolver_to_engine_context_excludes_ended(db):
+    """통합: period rows → resolve_preceptee_days_for_month → build_preceptee_context.
+    종료자는 엔진 컨텍스트에서 제외, active/무기한은 올바른 preceptor_idx 로 포함."""
+    from types import SimpleNamespace
+    from services.cp_sat.preceptee_context import build_preceptee_context
+    # ENDED(6/1~7/14), OPEN(무기한), MENTOR
+    _open(db, "ENDED", "MENTOR", date(2026, 6, 1), exp_end=date(2026, 7, 14))
+    _open(db, "OPEN", "MENTOR", date(2026, 6, 12), exp_end=None)
+    db.flush()
+    cmap = resolve_preceptee_days_for_month(db, ["ENDED", "OPEN", "MENTOR"], 2026, 8)
+    # solver 명단: idx0=ENDED, idx1=OPEN, idx2=MENTOR
+    nurses = [SimpleNamespace(db_id=x, nurse_id=x) for x in ("ENDED", "OPEN", "MENTOR")]
+    ctx = build_preceptee_context(nurses, cmap, num_days=31)
+    assert 0 not in ctx                      # ENDED 8월 제외
+    assert ctx[1] == (2, frozenset(range(31)))  # OPEN → MENTOR(idx2), 전체월
+
+
 def test_backfill_from_assignments(db, seed_data):
     """기존 active 프리셉티 assignment + 캐시 → period 백필. 종료월 경계도 보존."""
     from datetime import date as _d

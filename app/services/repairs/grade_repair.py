@@ -344,11 +344,17 @@ def _find_candidates(rs, roster, nurse_grades, day_idx, shift_code, g, move_coun
     s_idx = shift_types.index(shift_code)
     candidates = []
     _preceptee_on = bool(getattr(rs.config, 'preceptee_on', False))
+    # 멤버십: nurse_preceptee_period 맵(rs.preceptee_follow_days) 있으면 그것(종료자 제외),
+    # 없으면 캐시(preceptor_id) 폴백. 엔진과 동일 정책. 설계 §6.
+    _pp_fd_gr = getattr(rs, 'preceptee_follow_days', {}) or {}
+    _has_map_gr = bool(_pp_fd_gr)
     for n_idx, ng in enumerate(nurse_grades):
         if ng != g:
             continue
         # 프리셉티는 프리셉터를 따라가므로 독립 이동 금지
-        if _preceptee_on and getattr(rs.nurses[n_idx], 'preceptor_id', None):
+        _is_pte_gr = (bool(_pp_fd_gr.get(n_idx)) if _has_map_gr
+                      else bool(getattr(rs.nurses[n_idx], 'preceptor_id', None)))
+        if _preceptee_on and _is_pte_gr:
             continue
         if move_count.get(n_idx, 0) >= max_moves_per_nurse:
             continue
