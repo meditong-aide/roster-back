@@ -343,7 +343,7 @@ def optimize_fallback_lex_hard_first(
     preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
     _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
     preceptee_follow_days: dict[int, set[int]] = getattr(roster_system, "preceptee_follow_days", {}) or {}
-    _has_preceptee_period = bool(preceptee_follow_days)
+    _has_preceptee_period = bool(getattr(roster_system, "preceptee_period_authoritative", False))
     if _has_preceptee_period:
         preceptee_indices: set[int] = {n for n, days in preceptee_follow_days.items() if days}
     else:

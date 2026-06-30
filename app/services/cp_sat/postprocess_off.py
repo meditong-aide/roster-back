@@ -253,7 +253,7 @@ def postprocess_trim_extra_offs(
     id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
     # 멤버십: nurse_preceptee_period 맵 있으면 그것만(종료자 제외), 없으면 캐시 폴백. 설계 §6.
     _pp_fd = getattr(roster_system, "preceptee_follow_days", {}) or {}
-    if _pp_fd:
+    if bool(getattr(roster_system, "preceptee_period_authoritative", False)):
         preceptee_indices: set[int] = {n for n, days in _pp_fd.items() if days}
     else:
         preceptee_indices = {

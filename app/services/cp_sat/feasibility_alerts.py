@@ -277,9 +277,10 @@ def run_preflight_feasibility_alerts(
         if preceptee_on and use_mid:
             id_to_idx = {nurse_ids[i]: i for i in range(len(nurse_ids))}
             # 멤버십: nurse_preceptee_period 맵 있으면 그 달 active 만(종료자 제외), 없으면 캐시. 설계 §6.
+            _pte_auth_f = bool(config_dict.get("preceptee_period_authoritative"))
             _pte_map = config_dict.get("preceptee_period_by_nurse_id")
-            _active_pte = ({str(k) for k, v in _pte_map.items()
-                            if (v.get("days") if isinstance(v, dict) else v)} if _pte_map else None)
+            _active_pte = ({str(k) for k, v in (_pte_map or {}).items()
+                            if (v.get("days") if isinstance(v, dict) else v)} if _pte_auth_f else None)
             preceptor_to_members: dict[str, list[int]] = {}
             for idx, nurse in enumerate(nurses_in_group or []):
                 pid = str(getattr(nurse, "preceptor_id", "") or "")

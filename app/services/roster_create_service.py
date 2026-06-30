@@ -4815,14 +4815,22 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     # 형태: {nurse_id: {"preceptor_id": pid, "days": set(0-based)}}. 그 달 미겹침=키 부재(=독립).
     # 종료월 다음달은 resolver 가 구조적으로 제외 → "기간 종료 후 follow" 버그 원천 차단.
     from services.preceptee_period import resolve_preceptee_days_for_month as _resolve_pte_days
-    _preceptee_period = _resolve_pte_days(
-        db, [str(n.nurse_id) for n in nurses_for_engine], req.year, req.month
+    from db.models import NursePrecepteePeriod as _NPP
+    _pte_nids = [str(n.nurse_id) for n in nurses_for_engine]
+    _preceptee_period = _resolve_pte_days(db, _pte_nids, req.year, req.month)
+    # 권위 판정: 이 그룹 간호사에 period row 가 하나라도 있으면(=백필됨) period 가 진실.
+    # → 빈 맵이어도 '권위 모드'로 보내 종료자(캐시 잔존)를 확실히 제외. period 전무면(pre-backfill)
+    #   엔진이 캐시 폴백(무회귀). bool(map) 만으로는 '데이터 없음'과 '활성자 없음'을 구분 못함(버그 원인).
+    _pte_authoritative = bool(
+        _pte_nids and db.query(_NPP.id).filter(_NPP.nurse_id.in_(_pte_nids)).first() is not None
     )
-    if _preceptee_period:
-        config_dict["preceptee_period_by_nurse_id"] = _preceptee_period
-        for _nid, _info in _preceptee_period.items():
-            print(f"[Assignment][Preceptee] nurse_id={_nid}, preceptor={_info['preceptor_id']}, "
-                  f"follow_days={sorted(_info['days'])}")
+    config_dict["preceptee_period_authoritative"] = _pte_authoritative
+    if _pte_authoritative or _preceptee_period:
+        config_dict["preceptee_period_by_nurse_id"] = _preceptee_period  # 빈 dict 도 설정(권위 모드)
+    for _nid, _info in _preceptee_period.items():
+        print(f"[Assignment][Preceptee] nurse_id={_nid}, preceptor={_info['preceptor_id']}, "
+              f"follow_days={sorted(_info['days'])}")
+    print(f"[Assignment][Preceptee] authoritative={_pte_authoritative}, active={len(_preceptee_period)}")
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
     # _debug_log(
     #     "config_ready",

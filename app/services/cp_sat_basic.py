@@ -1055,16 +1055,17 @@ class CPSATBasicEngine:
             # 형태: {nurse_id: {"preceptor_id": pid, "days": set}}. 중앙 빌더로 일원화
             # (캐시 미사용·full-month 그대로 유지·종료자 부재=제외). 설계 §6.
             _pperiod_id = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
-            if _pperiod_id:
+            _pte_auth = bool(config_data.get("preceptee_period_authoritative")) if isinstance(config_data, dict) else False
+            setattr(roster_system, "preceptee_period_authoritative", _pte_auth)
+            if _pperiod_id is not None:
                 from services.cp_sat.preceptee_context import build_preceptee_context
                 _id_to_idx = getattr(roster_system, '_id_to_idx', None) or {str(nu.db_id): i for i, nu in enumerate(nurses)}
                 _ctx = build_preceptee_context(nurses, _pperiod_id, roster_system.num_days, id_to_idx=_id_to_idx)
-                if _ctx:
-                    setattr(roster_system, "preceptee_follow_days", {i: set(d) for i, (p, d) in _ctx.items()})
-                    setattr(roster_system, "preceptee_preceptor_idx",
-                            {i: p for i, (p, d) in _ctx.items() if p is not None})
-                    for i, (p, d) in _ctx.items():
-                        print(f"[Assignment][Solver] preceptee_period: solver_idx={i}, preceptor_idx={p}, days={sorted(d)}")
+                setattr(roster_system, "preceptee_follow_days", {i: set(d) for i, (p, d) in _ctx.items()})
+                setattr(roster_system, "preceptee_preceptor_idx",
+                        {i: p for i, (p, d) in _ctx.items() if p is not None})
+                for i, (p, d) in _ctx.items():
+                    print(f"[Assignment][Solver] preceptee_period: solver_idx={i}, preceptor_idx={p}, days={sorted(d)}")
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # cross-group OFF cap 조정용
             _other_group_offs = config_data.get("other_group_offs") if isinstance(config_data, dict) else None
@@ -1406,11 +1407,12 @@ class CPSATBasicEngine:
             added_cnt = 0
             # 멤버십: nurse_preceptee_period 맵 있으면 그 달 active 프리셉티만 페어링(종료자 제외),
             # 없으면(백필 전) 캐시 기반 전체 — 무회귀. 설계 §6.
+            _pte_auth_pair = bool(config_data.get("preceptee_period_authoritative")) if isinstance(config_data, dict) else False
             _pte_map = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
             _active_pte_ids = None
-            if _pte_map:
+            if _pte_auth_pair:  # 권위 모드: 그 달 active 만(빈 맵이면 전부 제외). 폴백이면 None(캐시 전체).
                 _active_pte_ids = {
-                    str(k) for k, v in _pte_map.items()
+                    str(k) for k, v in (_pte_map or {}).items()
                     if (v.get("days") if isinstance(v, dict) else v)
                 }
             # 프리셉터-멘티 함께 근무 가중치: 기본 페어링 대비 강화
@@ -1517,7 +1519,7 @@ class CPSATBasicEngine:
             _pte_fw_map = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
             _fw_restored = 0
             _pp_follow_days = getattr(roster_system, 'preceptee_follow_days', {}) or {}
-            _has_pte_map = bool(_pp_follow_days)  # 권위 모드(맵 있음) vs 전환 폴백
+            _has_pte_map = bool(getattr(roster_system, "preceptee_period_authoritative", False))  # 권위 vs 폴백
             for n, nu in enumerate(roster_system.nurses):
                 pid = getattr(nu, 'preceptor_id', None)
                 if not pid or pid not in id_to_idx:
@@ -1852,6 +1854,10 @@ class CPSATBasicEngine:
                     continue
                 _n_final = _id2i_final.get(nu.db_id)
                 _final_follow_set = _pp_fw_final.get(_n_final) if _n_final is not None else None
+                # 권위 모드(period 백필됨): 맵에 없는(종료/미겹침) 프리셉티는 동기화 안 함.
+                # 캐시(preceptor_id) 잔존을 무시 — 기간 종료 후 follow 누수 차단.
+                if bool(getattr(roster_system, 'preceptee_period_authoritative', False)) and not _final_follow_set:
+                    continue
                 changed = False
                 for d_i in range(min(len(ptr_sched), len(pte_sched))):
                     # 기간 제한: follow 기간 외 day는 skip
@@ -2696,7 +2702,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     preceptee_follow = bool(getattr(rs.config, 'preceptee_on', False))
     _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
     preceptee_follow_days: dict[int, set[int]] = getattr(rs, "preceptee_follow_days", {}) or {}
-    _has_preceptee_period = bool(preceptee_follow_days)
+    # 권위 플래그(builder 가 그룹의 period row 존재로 판정). bool(맵) 아님 — 활성자 0이어도 권위 유지.
+    _has_preceptee_period = bool(getattr(rs, "preceptee_period_authoritative", False))
     if _has_preceptee_period:
         preceptee_indices: set[int] = {n for n, days in preceptee_follow_days.items() if days}
     else:

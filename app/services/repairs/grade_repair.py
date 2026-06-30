@@ -347,7 +347,7 @@ def _find_candidates(rs, roster, nurse_grades, day_idx, shift_code, g, move_coun
     # 멤버십: nurse_preceptee_period 맵(rs.preceptee_follow_days) 있으면 그것(종료자 제외),
     # 없으면 캐시(preceptor_id) 폴백. 엔진과 동일 정책. 설계 §6.
     _pp_fd_gr = getattr(rs, 'preceptee_follow_days', {}) or {}
-    _has_map_gr = bool(_pp_fd_gr)
+    _has_map_gr = bool(getattr(rs, 'preceptee_period_authoritative', False))
     for n_idx, ng in enumerate(nurse_grades):
         if ng != g:
             continue
