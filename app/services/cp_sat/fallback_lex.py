@@ -337,53 +337,33 @@ def optimize_fallback_lex_hard_first(
         else {}
     )
 
-    # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
+    # ── 프리셉티 인덱스/기간 (cp_sat_basic 와 동일 정책 — nurse_preceptee_period SSOT) ──
+    # 맵 있음=권위 모드(맵만 신뢰, default=follow 없음), 맵 없음=전환 폴백(캐시 기반 무회귀).
+    # 설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md §6.
     preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
-    preceptee_indices: set[int] = set()
     _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-    for n, nu in enumerate(roster_system.nurses):
-        pid = getattr(nu, 'preceptor_id', None)
-        if pid:
-            preceptee_indices.add(n)
-    # 프리셉티 기간 제한: assignment 기간 내에만 follow (기간 외 독립 배정)
     preceptee_follow_days: dict[int, set[int]] = getattr(roster_system, "preceptee_follow_days", {}) or {}
-    # 안전망: 월 전체 cover entry 는 default 동작(전체 월 follow)과 동등 → 솔버 hard 제약
-    # 인스턴스화 시 capacity 모순 회피를 위해 dict 에서 제거하고 default 분기로 위임한다.
-    _full_month_set_fb = set(range(roster_system.num_days))
-    _full_keys_fb = [n for n, days in preceptee_follow_days.items() if set(days) == _full_month_set_fb]
-    for n in _full_keys_fb:
-        del preceptee_follow_days[n]
-    if _full_keys_fb:
-        print(f"{logger_prefix} [Fallback] 프리셉티 전체월 follow → default 위임: solver_idx={_full_keys_fb}")
     _has_preceptee_period = bool(preceptee_follow_days)
-    # dispatch(assignment) 기반 프리셉티도 인덱스에 포함
     if _has_preceptee_period:
-        for n in preceptee_follow_days:
-            if n not in preceptee_indices:
-                preceptee_indices.add(n)
+        preceptee_indices: set[int] = {n for n, days in preceptee_follow_days.items() if days}
+    else:
+        preceptee_indices = {n for n, nu in enumerate(roster_system.nurses) if getattr(nu, 'preceptor_id', None)}
     if preceptee_indices:
-        print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
-    # 기간이 빈 set인 프리셉티 = 해당 월에서 프리셉티 아님 → preceptee_indices에서 제거
-    if _has_preceptee_period:
-        _empty_period = {n for n, days in preceptee_follow_days.items() if len(days) == 0}
-        if _empty_period:
-            preceptee_indices -= _empty_period
-            print(f"{logger_prefix} [Fallback] 프리셉티 기간 종료 → 인덱스 제거: {_empty_period}")
+        print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 "
+              f"(follow={preceptee_follow}, period_map={_has_preceptee_period})")
 
     def _is_preceptee_at(n: int, d: int = -1) -> bool:
-        """(n, d)가 프리셉티 follow 대상인지 판별.
-        d=-1: nurse-level. 기간 미설정이면 True(전체 follow), 기간 설정이면 False(day별 판별 필요)
-        d>=0: day-level (해당 day가 기간 내인지)
-        """
+        """(n, d)가 프리셉티 follow 대상인지. 맵 없으면 전체월 follow(폴백), 맵 있으면 day별."""
         if not preceptee_follow or n not in preceptee_indices:
             return False
         if not _has_preceptee_period:
-            return True  # 기간 미설정 → 전체 월 follow (기존 동작)
-        if n not in preceptee_follow_days:
-            return True  # 이 간호사에 대한 기간 미설정 → 전체 월 follow
+            return True  # 폴백(맵 없음): 전체월 follow
+        days = preceptee_follow_days.get(n)
+        if not days:
+            return False  # 그 달 프리셉티 아님(종료/미겹침)
         if d < 0:
-            return False  # nurse-level: 기간 설정됨 → 제약 skip 안 함 (day별 판별 필요)
-        return d in preceptee_follow_days[n]
+            return False  # nurse-level: day별 판별 필요
+        return d in days
 
     exclude_preceptee_from_den = (not getattr(cfg, 'preceptee_shift_count', True)) and bool(preceptee_indices)
     coverage_exclude_cells: set[tuple[int, int]] = getattr(roster_system, "coverage_exclude_cells", set()) or set()
@@ -3363,13 +3343,18 @@ def optimize_fallback_lex_hard_first(
             if not pid or pid not in _fb_id_to_idx:
                 continue
             ptr_idx = _fb_id_to_idx[pid]
-            roster_system.roster[pte_idx] = roster_system.roster[ptr_idx].copy()
-            # 특수코드 일자는 프리셉티를 OFF로 전환
+            # 권위 모드면 nurse_preceptee_period 기간 내 day만, 폴백이면 전체월 복사.
+            _fb_follow = preceptee_follow_days.get(pte_idx)
+            _fb_days_iter = (sorted(_fb_follow) if (_has_preceptee_period and _fb_follow)
+                             else list(range(roster_system.num_days)))
+            for _cd in _fb_days_iter:
+                roster_system.roster[pte_idx, _cd, :] = roster_system.roster[ptr_idx, _cd, :]
+            # 특수코드 일자는 프리셉티를 OFF로 전환 (복사한 day 한정)
             # 단, type=근무 + shift_gb=D/E/N 계열 하위코드는 근무이므로 그대로 유지
             _fb_work_sub = getattr(roster_system, '_work_sub_ids', set())
             _fb_orig_map = getattr(roster_system, '_fixed_original_shift_map', {})
             if _fb_off_idx is not None:
-                for d in range(roster_system.num_days):
+                for d in _fb_days_iter:
                     # 프리셉티 fixed_wanted 일자는 프리셉터 복사 대신 본인 값 적용
                     if (pte_idx, d) in _fb_pte_fw:
                         _fw_code = _fb_pte_fw[(pte_idx, d)].strip().upper()

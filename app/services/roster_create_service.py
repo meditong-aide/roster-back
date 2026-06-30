@@ -4809,66 +4809,20 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             config_dict["coverage_exclude_nurse_days"] = _cov_exclude
             for nid, days in _cov_exclude.items():
                 print(f"[Assignment][CovExclude] nurse_id={nid}, days={sorted(days)}")
-        # ── 프리셉티 기간: assignment 기간 내에만 프리셉터 follow 적용 ──
-        # 프리셉티 assignment가 존재하는 간호사는 해당 월과 겹치는 기간만 follow,
-        # 겹치지 않으면 빈 set (독립 배정). assignment 미조회 월에도 적용되도록
-        # DB에서 해당 간호사의 active 프리셉티 assignment를 직접 조회.
-        _preceptee_period: dict[str, set[int]] = {}
-        # 1) 현재 _assignments에서 프리셉티 추출
-        for a in _assignments:
-            if a.reason != "프리셉티" or a.status == "cancelled":
-                continue
-            nid = str(a.nurse_id)
-            _a_start = a.start_date
-            _a_end = a.end_date or a.expected_end_date or (month_start + timedelta(days=days_in_month - 1))
-            _month_end = month_start + timedelta(days=days_in_month - 1)
-            if _a_end < month_start or _a_start > _month_end:
-                _preceptee_period.setdefault(nid, set())
-                continue
-            _s = max(_a_start, month_start)
-            _e = min(_a_end, _month_end)
-            for d in range((_s - month_start).days, (_e - month_start).days + 1):
-                _preceptee_period.setdefault(nid, set()).add(d)
-        # 2) preceptor_id가 있지만 _assignments에 프리셉티 레코드가 없는 간호사도 체크
-        #    (assignment 기간이 다른 월이라 조회 안 된 경우)
-        from db.models import NurseAssignment as _NA
-        for n in nurses_for_engine:
-            nid = str(n.nurse_id)
-            if nid in _preceptee_period:
-                continue  # 이미 처리됨
-            if not getattr(n, 'preceptor_id', None):
-                continue
-            # DB에서 이 간호사의 active 프리셉티 assignment가 존재하는지 확인
-            _has_pte = db.query(_NA.id).filter(
-                _NA.nurse_id == nid,
-                _NA.reason == "프리셉티",
-                _NA.status == "active",
-            ).first()
-            if _has_pte:
-                _preceptee_period[nid] = set()  # 해당 월 겹침 없음 → 빈 set (독립 배정)
-        if _preceptee_period:
-            config_dict["preceptee_period_by_nurse_id"] = _preceptee_period
-            for nid, days in _preceptee_period.items():
-                print(f"[Assignment][Preceptee] nurse_id={nid}, follow_days={sorted(days)}")
-    # ── 프리셉티 기간 체크 2단계: _assignments가 비어도 DB에서 직접 확인 ──
-    if "preceptee_period_by_nurse_id" not in config_dict:
-        from db.models import NurseAssignment as _NA2
-        _preceptee_period_2: dict[str, set[int]] = {}
-        for n in nurses_for_engine:
-            nid = str(n.nurse_id)
-            if not getattr(n, 'preceptor_id', None):
-                continue
-            _has_pte = db.query(_NA2.id).filter(
-                _NA2.nurse_id == nid,
-                _NA2.reason == "프리셉티",
-                _NA2.status == "active",
-            ).first()
-            if _has_pte:
-                _preceptee_period_2[nid] = set()
-        if _preceptee_period_2:
-            config_dict["preceptee_period_by_nurse_id"] = _preceptee_period_2
-            for nid, days in _preceptee_period_2.items():
-                print(f"[Assignment][Preceptee] nurse_id={nid}, follow_days={sorted(days)} (DB직접조회)")
+        # 프리셉티 기간은 아래 nurse_preceptee_period(SSOT) as-of 빌드로 일원화한다
+        # (이전의 _assignments/preceptor_id 캐시 직독 블록 제거 — follow 누수 원인이었음).
+    # ── 프리셉티 기간: nurse_preceptee_period(SSOT) as-of 대상월 (캐시·assignment 직독 안 함) ──
+    # 형태: {nurse_id: {"preceptor_id": pid, "days": set(0-based)}}. 그 달 미겹침=키 부재(=독립).
+    # 종료월 다음달은 resolver 가 구조적으로 제외 → "기간 종료 후 follow" 버그 원천 차단.
+    from services.preceptee_period import resolve_preceptee_days_for_month as _resolve_pte_days
+    _preceptee_period = _resolve_pte_days(
+        db, [str(n.nurse_id) for n in nurses_for_engine], req.year, req.month
+    )
+    if _preceptee_period:
+        config_dict["preceptee_period_by_nurse_id"] = _preceptee_period
+        for _nid, _info in _preceptee_period.items():
+            print(f"[Assignment][Preceptee] nurse_id={_nid}, preceptor={_info['preceptor_id']}, "
+                  f"follow_days={sorted(_info['days'])}")
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
     # _debug_log(
     #     "config_ready",

@@ -250,12 +250,16 @@ def postprocess_trim_extra_offs(
     # 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요)
     preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
     _pte_shift_count = bool(getattr(cfg, 'preceptee_shift_count', True))
-    preceptee_indices: set[int] = set()
     id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-    for n, nu in enumerate(roster_system.nurses):
-        pid = getattr(nu, 'preceptor_id', None)
-        if pid and pid in id_to_idx:
-            preceptee_indices.add(n)
+    # 멤버십: nurse_preceptee_period 맵 있으면 그것만(종료자 제외), 없으면 캐시 폴백. 설계 §6.
+    _pp_fd = getattr(roster_system, "preceptee_follow_days", {}) or {}
+    if _pp_fd:
+        preceptee_indices: set[int] = {n for n, days in _pp_fd.items() if days}
+    else:
+        preceptee_indices = {
+            n for n, nu in enumerate(roster_system.nurses)
+            if getattr(nu, 'preceptor_id', None) and getattr(nu, 'preceptor_id', None) in id_to_idx
+        }
     # preceptee_shift_count=False → 커버리지 계산에서 프리셉티 제외
     exclude_preceptee_from_coverage = (not _pte_shift_count) and bool(preceptee_indices)
     # 후처리 OFF 변경 스킵 조건: 팔로우 모드 또는 커버리지 제외
