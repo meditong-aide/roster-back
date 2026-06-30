@@ -419,7 +419,7 @@ def optimize_fallback_lex_hard_first(
         n_allowed_indices: list[int] = []
         n_only_cnt = 0
         for i, nu in enumerate(roster_system.nurses):
-            raw = getattr(nu, "is_night_nurse", None)
+            raw = getattr(nu, "allowed_shifts", None)
             allowed = normalize_allowed_shift_codes(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
             if not allowed:
                 n_allowed_indices.append(i)
@@ -740,7 +740,7 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) in structural_off_cells and d not in _blocked_set
                     )
                     nu = roster_system.nurses[n]
-                    raw = getattr(nu, "is_night_nurse", None)
+                    raw = getattr(nu, "allowed_shifts", None)
                     is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
                     # 디버그: 강제 OFF 개수 로그
                     print(
@@ -1379,7 +1379,7 @@ def optimize_fallback_lex_hard_first(
                     _nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
                     if _nu is not None and bool(getattr(_nu, "is_weekend_off", False)):
                         continue
-                    _raw_nn = getattr(_nu, "is_night_nurse", None) if _nu is not None else None
+                    _raw_nn = getattr(_nu, "allowed_shifts", None) if _nu is not None else None
                     if isinstance(_raw_nn, (set, list, tuple)) and set(_raw_nn) == {"N"}:
                         continue
                 # off_first=False 경로의 nonvac_offs 식과 동일한 도메인:
@@ -1839,7 +1839,7 @@ def optimize_fallback_lex_hard_first(
         for n, nu in enumerate(roster_system.nurses):
             if _is_preceptee_at(n):
                 continue
-            raw = getattr(nu, "is_night_nurse", None)
+            raw = getattr(nu, "allowed_shifts", None)
             allowed = normalize_allowed_shift_codes(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
             if not allowed:
                 continue
@@ -1940,7 +1940,7 @@ def optimize_fallback_lex_hard_first(
 
         # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
         # for n, nu in enumerate(roster_system.nurses):
-        #     if nu.is_night_nurse != 0:
+        #     if nu.allowed_shifts != 0:
         #         continue
         #     T0, T1 = join[n], leave[n]
         #     for d in range(T0, T1 + 1):
@@ -2311,7 +2311,7 @@ def optimize_fallback_lex_hard_first(
                     if _is_preceptee_at(n):
                         continue
                     nu = roster_system.nurses[n]
-                    raw = getattr(nu, "is_night_nurse", None)
+                    raw = getattr(nu, "allowed_shifts", None)
                     is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
                     if is_n_only:
                         continue
@@ -2403,7 +2403,7 @@ def optimize_fallback_lex_hard_first(
                     continue
                 T0, T1 = join[n], leave[n]
                 nu = roster_system.nurses[n]
-                raw = getattr(nu, "is_night_nurse", None)
+                raw = getattr(nu, "allowed_shifts", None)
                 is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
                 nurse_name = getattr(nu, "name", "?")
                 nurse_id = getattr(nu, "nurse_id", "?")
@@ -2961,7 +2961,7 @@ def optimize_fallback_lex_hard_first(
                         nu = roster_system.nurses[n_lex]
                         try:
                             is_n_only_lex = is_n_only_profile(
-                                getattr(nu, "is_night_nurse", None), use_mid=use_mid_h1
+                                getattr(nu, "allowed_shifts", None), use_mid=use_mid_h1
                             )
                         except Exception:
                             is_n_only_lex = False

@@ -81,7 +81,9 @@ class Nurse(Base):
     is_head_nurse = Column(BOOLEAN, default=False)
     # 마스터 관리자 구분 코드(ADM/HDN/...) - 실제 컬럼명 EmpAuthGbn 매핑
     emp_auth_gbn = Column(VARCHAR(3), name="EmpAuthGbn", nullable=True)
-    is_night_nurse = Column(JSON, nullable=True, default=list)
+    # 허용 근무형 리스트(JSON). 물리 컬럼명은 is_night_nurse 유지(공유 DB·타 브랜치 호환) —
+    # 코드/Python 속성만 allowed_shifts 로 수렴. 물리 rename 은 전 브랜치 머지 후 별도 마이그레이션.
+    allowed_shifts = Column(JSON, name="is_night_nurse", key="allowed_shifts", nullable=True, default=list)
     personal_off_adjustment = Column(TINYINT, default=0)
     preceptor_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"))
     joining_date = Column(DATETIME, nullable=True)
@@ -177,6 +179,15 @@ class NurseTeamPeriod(Base):
     __table_args__ = (
         Index("ix_ntp_nurse", "nurse_id", "valid_from"),
         Index("ix_ntp_group", "group_id", "valid_from"),
+        # 한 간호사는 한 병동에서 같은 시작일로 두 구간을 가질 수 없다(close-before-open
+        #   타임라인 불변식). set_team_period 의 upsert 키와 동일 → 과거 더블인서트로 생긴
+        #   완전중복 행(완전 동일 행 2개)을 DB 레벨에서 영구 차단.
+        UniqueConstraint(
+            "nurse_id",
+            "group_id",
+            "valid_from",
+            name="uq_ntp_nurse_group_from",
+        ),
     )
 
 
@@ -222,6 +233,63 @@ class NurseMonthlyLimit(Base):
             "nurse_id", "group_id", "year", "month", name="ux_nurse_monthly_limits_scope"
         ),
     )
+
+
+class EffectiveDatedPeriodMixin:
+    """시점 속성(effective-dated) 공통 컬럼.
+
+    규칙: `[valid_from, valid_to)` 반열림 · 겹침 금지 · gap(미지정) 허용 ·
+    변경=close-before-open(옛 구간 valid_to 닫고 새 구간 open, 삭제 금지).
+    진실=이 테이블, `nurses` 캐시 컬럼=단방향 투영(앱 직접쓰기 금지).
+    설계: docs/NURSE_ATTRIBUTE_PERIOD_DESIGN.md.
+    """
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    valid_from = Column(DATE, nullable=False)
+    valid_to = Column(DATE, nullable=True)            # null = 열린(계속) 구간
+    source = Column(VARCHAR(20), nullable=False, default="edited")  # inherited|edited|redistribute
+    note = Column(TEXT, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+
+class NurseGradePeriod(Base, EffectiveDatedPeriodMixin):
+    """grade 시점 구간 (병동귀속). 해석 스케일=roster_grade_config."""
+
+    __tablename__ = "nurse_grade_period"
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    grade = Column(INTEGER, nullable=True)
+    __table_args__ = (
+        Index("ix_ngp_nurse", "nurse_id", "valid_from"),
+        Index("ix_ngp_group", "group_id", "valid_from"),
+    )
+
+
+class NurseAllowedShiftPeriod(Base, EffectiveDatedPeriodMixin):
+    """근무형(shift-form) 시점 구간 (간호사귀속).
+
+    한 row 가 (allowed_shifts, fixed_shift) 쌍을 함께 담는다 — 둘은 결합 속성:
+    고정 간호사의 allowed 는 사실상 {fixed_code} 이고 같이 변하므로 한 satellite 로 통합.
+    - allowed_shifts: 허용 근무형 집합. ["D"]/["D","E"]/["N"]/[](제한없음).
+    - fixed_shift: 값이 있으면 그 코드로 '고정'(솔버 우회·평일=코드/주말=OFF). NULL=일반 스케줄.
+    한쪽만 바꿔도 다른쪽은 직전 구간값 carry-forward (upsert_period carry_attrs).
+    """
+
+    __tablename__ = "nurse_allowed_shift_period"
+    # default=list: fixed_shift 만 설정해 새 구간 생성 시(carry 대상 allowed 부재) []로 채움
+    # ([] = 제한없음. 고정 간호사는 솔버 우회라 안전한 기본값).
+    allowed_shifts = Column(JSON, nullable=False, default=list)
+    fixed_shift = Column(VARCHAR(20), nullable=True)
+    __table_args__ = (Index("ix_nasp_nurse", "nurse_id", "valid_from"),)
+
+
+class NurseWeekendOffPeriod(Base, EffectiveDatedPeriodMixin):
+    """주말휴무 시점 구간 (간호사귀속)."""
+
+    __tablename__ = "nurse_weekendoff_period"
+    weekend_off = Column(TINYINT, nullable=True)
+    __table_args__ = (Index("ix_nwop_nurse", "nurse_id", "valid_from"),)
 
 
 class NurseAssignment(Base):
@@ -456,8 +524,20 @@ class RosterConfig(Base):
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
     off_swap_enabled = Column(BOOLEAN, nullable=False, default=False)
+    # ── 설정 프리셋 (저장한 설정 모달) ──
+    # version: 그룹(office+group)별 0부터 시작하는 프리셋 버전.
+    #   기능 이전(legacy) row 는 NULL → 프리셋 아님(목록 비노출). 신규 저장 및
+    #   생성 materialize(="새로운 설정n") 는 항상 값을 부여한다(익명 row 없음).
+    version = Column(INTEGER, nullable=True)
+    config_name = Column(NVARCHAR(100), nullable=True)  # 프리셋 이름. '새로운 설정n' 자동분 포함
+    config_memo = Column(NVARCHAR(500), nullable=True)  # 간단 메모
+    # 마지막 저장 시각 — upsert(in-place 수정) 시 갱신. created_at 은 최초 생성 고정.
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
     office = relationship("Office")
     group = relationship("Group")
+    # NOTE: 그룹별 version 유일성 인덱스(ux_roster_config_group_version,
+    #   WHERE version IS NOT NULL 필터드 유니크)는 개발 마무리 후 추가 예정.
+    #   현재는 version 할당이 MAX+1(앱) 단독 — 동시 저장 충돌은 실무상 희박해 보류.
 
 
 class RosterGradeConfig(Base):

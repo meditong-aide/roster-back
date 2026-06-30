@@ -148,16 +148,7 @@ def check_service_dependencies_service():
         dependencies["cp_sat_basic"] = "unavailable"
         errors.append(f"cp_sat_basic: {str(e)}")
         logger.warning(f"CP-SAT Basic 엔진 의존성 체크 실패: {str(e)}")
-    
-    try:
-        from app.services.cp_sat_main_v3 import generate_roster_cp_sat_main_v3
-        dependencies["cp_sat_main_v3"] = "available"
-        logger.info("CP-SAT Main V3 엔진 의존성 체크 성공")
-    except ImportError as e:
-        dependencies["cp_sat_main_v3"] = "unavailable"
-        errors.append(f"cp_sat_main_v3: {str(e)}")
-        logger.warning(f"CP-SAT Main V3 엔진 의존성 체크 실패: {str(e)}")
-    
+
     try:
         from app.services.random_sampling import generate_roster
         dependencies["random_sampling"] = "available"

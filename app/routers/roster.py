@@ -108,6 +108,55 @@ router = APIRouter(prefix="/roster", tags=["roster"])
 templates = Jinja2Templates(directory="app/templates")
 
 
+def _roster_config_to_dict(config) -> dict:
+    """RosterConfig ORM → 모달 로드용 dict (프리셋 메타 + 전체 파라미터)."""
+    return {
+        "config_id": config.config_id,
+        "version": config.version,
+        "config_name": config.config_name,
+        "config_memo": config.config_memo,
+        "day_req": config.day_req,
+        "eve_req": config.eve_req,
+        "nig_req": config.nig_req,
+        "min_exp_per_shift": config.min_exp_per_shift,
+        "req_exp_nurses": config.req_exp_nurses,
+        "two_offs_per_week": config.two_offs_per_week,
+        "max_nig_per_month": config.max_nig_per_month,
+        "three_seq_nig": config.three_seq_nig,
+        "two_offs_after_three_nig": config.two_offs_after_three_nig,
+        "two_offs_after_two_nig": config.two_offs_after_two_nig,
+        "banned_day_after_eve": config.banned_day_after_eve,
+        "max_conseq_work": config.max_conseq_work,
+        "off_days": config.off_days,
+        "shift_priority": config.shift_priority,
+        "weekend_shift_ratio": config.weekend_shift_ratio,
+        "patient_amount": config.patient_amount,
+        "sequential_offs": config.sequential_offs,
+        "even_nights": config.even_nights,
+        "created_at": config.created_at.isoformat() if config.created_at else None,
+        "updated_at": config.updated_at.isoformat()
+        if getattr(config, "updated_at", None)
+        else None,
+        "nod_noe": config.nod_noe,
+        "preceptor_gauge": config.preceptor_gauge,
+        "preceptee_on": config.preceptee_on,
+        "preceptee_shift_count": config.preceptee_shift_count,
+        "weekly_off_group": config.weekly_off_group,
+        "off_placement_mode": config.off_placement_mode,
+        "not_one_night": config.not_one_night,
+        "use_mid": bool(getattr(config, "use_mid", False)),
+        "fixed_wanted_use_yn": config.fixed_wanted_use_yn,
+        "show_level": config.show_level,
+        "show_preceptor": config.show_preceptor,
+        "off_first": bool(getattr(config, "off_first", False)),
+        "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
+        "team_balance_enable": bool(getattr(config, "team_balance_enable", False)),
+        "team_balance_gauge": getattr(config, "team_balance_gauge", 0),
+        "team_balance_mode": getattr(config, "team_balance_mode", "balanced"),
+        "config_version": config.config_version,
+    }
+
+
 @router.post("/config/save")
 async def save_roster_config(
     config_data: RosterConfigCreate,
@@ -161,7 +210,11 @@ async def get_config_versions(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """현재 대상 그룹의 설정 버전 목록 조회 (HN/ADM)."""
+    """대상 그룹의 저장된 설정 프리셋 목록 (저장한 설정 탭).
+
+    version 이 부여된 row(=프리셋)만 반환. legacy/ad-hoc(version NULL) 은 제외.
+    각 프리셋의 요약(D/E/N·OFF), 메모, 마지막 저장, 최근 적용 근무표를 포함.
+    """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     # 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석. ADM 무지정 시 office-wide(None).
@@ -171,21 +224,58 @@ async def get_config_versions(
     target_office_id = current_user.office_id
 
     try:
-        versions = (
-            db.query(
-                RosterConfigModel.config_id,
-                func.max(RosterConfigModel.created_at).label("latest_created_at"),
-            )
+        presets = (
+            db.query(RosterConfigModel)
             .filter(
                 RosterConfigModel.office_id == target_office_id,
                 RosterConfigModel.group_id == target_group_id,
-                RosterConfigModel.config_id.isnot(None),
+                RosterConfigModel.version.isnot(None),
             )
-            .group_by(RosterConfigModel.config_id)
-            .order_by(func.max(RosterConfigModel.created_at).desc())
+            .order_by(RosterConfigModel.version.desc())
             .all()
         )
-        return [{"config_id": v.config_id} for v in versions]
+        if not presets:
+            return []
+
+        # 최근 적용: config_id 별 최신 schedule (created_at desc) — 기존 FK 조인만으로 산출
+        config_ids = [p.config_id for p in presets]
+        last_applied: dict = {}
+        sched_rows = (
+            db.query(
+                Schedule.config_id, Schedule.year, Schedule.month,
+                Schedule.version, Schedule.created_at,
+            )
+            .filter(Schedule.config_id.in_(config_ids))
+            .order_by(Schedule.created_at.desc())
+            .all()
+        )
+        for r in sched_rows:
+            if r.config_id not in last_applied:
+                last_applied[r.config_id] = {
+                    "year": r.year, "month": r.month, "schedule_version": r.version,
+                }
+
+        result = []
+        for p in presets:
+            ts = p.updated_at or p.created_at
+            result.append({
+                "config_id": p.config_id,
+                "version": p.version,
+                "config_name": p.config_name,
+                "config_memo": p.config_memo,
+                "summary": {
+                    "day_req": p.day_req,
+                    "eve_req": p.eve_req,
+                    "nig_req": p.nig_req,
+                    "off_days": p.off_days,
+                    "weekly_off_group": p.weekly_off_group,
+                    "fixed_wanted_use_yn": p.fixed_wanted_use_yn,
+                    "use_mid": bool(getattr(p, "use_mid", False)),
+                },
+                "last_saved_at": ts.isoformat() if ts else None,
+                "last_applied": last_applied.get(p.config_id),
+            })
+        return result
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to get config versions: {str(e)}"
@@ -200,11 +290,11 @@ async def get_config_by_version(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
-    """버전(또는 schedule_id) 기준 config 조회.
+    """설정 불러오기 — 선택자 우선순위로 config 조회.
 
-    - schedule_id 제공 시: 그 schedule 이 생성에 사용한 roster_config 반환
-      (이전 설정 사용하기 — 특정 근무표의 설정 불러오기). 스코프는 schedule 그룹 기준.
-    - 미제공 시: 대상 그룹의 최신 config 반환.
+    1) schedule_id 제공 시: 그 근무표가 생성에 사용한 roster_config 반환(이전 설정 불러오기).
+    2) config_version 이 정수면: 대상 그룹의 해당 version 프리셋 반환(저장한 설정 불러오기).
+    3) 그 외(sentinel, 예: 'latest'): 대상 그룹 최신 config, 없으면 DEFAULT 생성 후 반환.
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -213,6 +303,63 @@ async def get_config_by_version(
         db, current_user, group_id, require_group=False
     )
     target_office_id = current_user.office_id
+
+    # ── 선택자 우선순위: schedule_id → version(정수) → (sentinel) 최신/DEFAULT ──
+    if schedule_id:
+        sched = (
+            db.query(Schedule)
+            .filter(Schedule.schedule_id == schedule_id)
+            .first()
+        )
+        if not sched or sched.config_id is None:
+            raise HTTPException(
+                status_code=404, detail="해당 근무표의 설정을 찾을 수 없습니다."
+            )
+        sconf = (
+            db.query(RosterConfigModel)
+            .filter(RosterConfigModel.config_id == sched.config_id)
+            .first()
+        )
+        if not sconf:
+            raise HTTPException(status_code=404, detail="Config not found")
+        return _roster_config_to_dict(sconf)
+
+    # config_version 이 정수면 해당 프리셋(version) 로드, 아니면(sentinel) 아래 최신/DEFAULT
+    try:
+        _ver_int = int(config_version)
+    except (TypeError, ValueError):
+        _ver_int = None
+    if _ver_int is not None:
+        pconf = (
+            db.query(RosterConfigModel)
+            .filter(
+                RosterConfigModel.office_id == target_office_id,
+                RosterConfigModel.group_id == target_group_id,
+                RosterConfigModel.version == _ver_int,
+            )
+            .first()
+        )
+        if pconf is None:
+            # version 매칭 실패 → config_id 로 폴백.
+            #   프론트 다수 경로가 config_id 를 version 자리에 넘긴다(currentConfigVer 가 실제로는
+            #   response.configs.config_id, verList[].config_id 도 config_id). 특히 ad-hoc(version
+            #   NULL) 그룹은 version 매칭이 영영 불가하므로, 같은 그룹 스코프의 config_id 로 해석한다.
+            #   (group 필터가 있어 타 그룹 config_id 오해석은 없음.)
+            pconf = (
+                db.query(RosterConfigModel)
+                .filter(
+                    RosterConfigModel.office_id == target_office_id,
+                    RosterConfigModel.group_id == target_group_id,
+                    RosterConfigModel.config_id == _ver_int,
+                )
+                .first()
+            )
+        if not pconf:
+            raise HTTPException(
+                status_code=404,
+                detail=f"version/config_id={_ver_int} 설정을 찾을 수 없습니다.",
+            )
+        return _roster_config_to_dict(pconf)
 
     # load latest config for target
     config = (
@@ -274,95 +421,11 @@ async def get_config_by_version(
 
             db.refresh(new_config)
 
-            return {
-                "config_id": new_config.config_id,
-                # "config_version": new_config.config_version,
-                # "day_req": new_config.day_req,
-                # "eve_req": new_config.eve_req,
-                # "nig_req": new_config.nig_req,
-                "min_exp_per_shift": new_config.min_exp_per_shift,
-                "req_exp_nurses": new_config.req_exp_nurses,
-                "two_offs_per_week": new_config.two_offs_per_week,
-                "max_nig_per_month": new_config.max_nig_per_month,
-                "three_seq_nig": new_config.three_seq_nig,
-                "two_offs_after_three_nig": new_config.two_offs_after_three_nig,
-                "two_offs_after_two_nig": new_config.two_offs_after_two_nig,
-                "banned_day_after_eve": new_config.banned_day_after_eve,
-                "max_conseq_work": new_config.max_conseq_work,
-                "off_days": new_config.off_days,
-                "shift_priority": new_config.shift_priority,
-                "weekend_shift_ratio": new_config.weekend_shift_ratio,
-                "patient_amount": new_config.patient_amount,
-                "sequential_offs": new_config.sequential_offs,
-                "even_nights": new_config.even_nights,
-                "created_at": new_config.created_at.isoformat()
-                if new_config.created_at
-                else None,
-                "nod_noe": new_config.nod_noe,
-                "preceptor_gauge": new_config.preceptor_gauge,
-                "preceptee_on": new_config.preceptee_on,
-                "preceptee_shift_count": new_config.preceptee_shift_count,
-                "weekly_off_group": new_config.weekly_off_group,
-                "off_placement_mode": new_config.off_placement_mode,
-                "not_one_night": new_config.not_one_night,
-                "use_mid": bool(getattr(new_config, "use_mid", False)),
-                "fixed_wanted_use_yn": new_config.fixed_wanted_use_yn,
-                "show_level": new_config.show_level,
-                "show_preceptor": new_config.show_preceptor,
-                "off_first": bool(getattr(new_config, "off_first", False)),
-                "off_swap_enabled": bool(getattr(new_config, "off_swap_enabled", False)),
-            }
+            return _roster_config_to_dict(new_config)
         else:
-            config = (
-                db.query(RosterConfigModel)
-                .filter(
-                    RosterConfigModel.office_id == target_office_id,
-                    RosterConfigModel.group_id == target_group_id,
-                )
-                .order_by(RosterConfigModel.created_at.desc())
-                .first()
-            )
-            if not config:
-                raise HTTPException(status_code=404, detail="Config not found")
-            pprint.pprint(config)
-            return {
-                "config_id": config.config_id,
-                # "config_version": config.config_version,
-                # "day_req": config.day_req,
-                # "eve_req": config.eve_req,
-                # "nig_req": config.nig_req,
-                "min_exp_per_shift": config.min_exp_per_shift,
-                "req_exp_nurses": config.req_exp_nurses,
-                "two_offs_per_week": config.two_offs_per_week,
-                "max_nig_per_month": config.max_nig_per_month,
-                "three_seq_nig": config.three_seq_nig,
-                "two_offs_after_three_nig": config.two_offs_after_three_nig,
-                "two_offs_after_two_nig": config.two_offs_after_two_nig,
-                "banned_day_after_eve": config.banned_day_after_eve,
-                "max_conseq_work": config.max_conseq_work,
-                "off_days": config.off_days,
-                "shift_priority": config.shift_priority,
-                "weekend_shift_ratio": config.weekend_shift_ratio,
-                "patient_amount": config.patient_amount,
-                "sequential_offs": config.sequential_offs,
-                "even_nights": config.even_nights,
-                "created_at": config.created_at.isoformat()
-                if config.created_at
-                else None,
-                "nod_noe": config.nod_noe,
-                "preceptor_gauge": config.preceptor_gauge,
-                "preceptee_on": config.preceptee_on,
-                "preceptee_shift_count": config.preceptee_shift_count,
-                "weekly_off_group": config.weekly_off_group,
-                "off_placement_mode": config.off_placement_mode,
-                "not_one_night": config.not_one_night,
-                "use_mid": bool(getattr(config, "use_mid", False)),
-                "fixed_wanted_use_yn": config.fixed_wanted_use_yn,
-                "show_level": config.show_level,
-                "show_preceptor": config.show_preceptor,
-                "off_first": bool(getattr(config, "off_first", False)),
-                "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
-            }
+            return _roster_config_to_dict(config)
+    except HTTPException:
+        raise
     except Exception as e:
         print("error", e)
         raise HTTPException(status_code=500, detail=f"Failed to get config: {str(e)}")

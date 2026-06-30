@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fastapi import HTTPException
@@ -32,7 +32,7 @@ class _EffectiveNurseView:
     """파견 인바운드 capability 오버레이를 입힌 읽기전용 nurse 뷰.
 
     세션의 Nurse 객체를 변형하지 않고 지정 attr만 override, 나머지는 원본에 위임한다.
-    monthly-limit 검증이 파견 '대상 그룹' 기준의 유효 capability(is_night_nurse=target_shift_types)를
+    monthly-limit 검증이 파견 '대상 그룹' 기준의 유효 capability(allowed_shifts=target_shift_types)를
     보도록 하기 위함. (엔진 roster_create_service 의 inbound override 와 동일 규칙)
     """
 
@@ -55,18 +55,45 @@ def _effective_nurse_for_group(
     """파견 인바운드면 해당 대상 그룹의 capability 오버레이를 입힌 effective nurse 뷰 반환.
 
     그 달에 group_id 를 target 으로 하는 활성 NurseAssignment 가 있으면
-    is_night_nurse(←target_shift_types)·fixed_shift(←target_fixed_shift) 를 override.
+    allowed_shifts(←target_shift_types)·fixed_shift(←target_fixed_shift) 를 override.
     없으면 원본 nurse 그대로 폴백. (월말 as_of 기준 — 파견이 월 중 시작해도 포함)
     """
     as_of = date(year, month, monthrange(year, month)[1])
     assignment = get_active_assignment(db, str(nurse.nurse_id), as_of)
-    if assignment is None or str(getattr(assignment, "target_group_id", "")) != str(group_id):
-        return nurse
-    overrides: Dict[str, Any] = {
-        attr: get_nurse_effective_attr(db, nurse, attr, as_of, _assignment_cache=assignment)
-        for attr in ("is_night_nurse", "fixed_shift")
-    }
-    return _EffectiveNurseView(nurse, overrides)
+    if assignment is not None and str(getattr(assignment, "target_group_id", "")) == str(group_id):
+        # 파견 inbound: 대상 그룹 capability = assignment.target_* (생성기 파견 처리와 동일).
+        overrides: Dict[str, Any] = {
+            attr: get_nurse_effective_attr(db, nurse, attr, as_of, _assignment_cache=assignment)
+            for attr in ("allowed_shifts", "fixed_shift")
+        }
+        return _EffectiveNurseView(nurse, overrides)
+    # home(또는 비대상): allowed/fixed 를 period as-of 로 해석 — 생성기와 동일 SSOT.
+    #   구 resolver(get_nurse_effective_attr=assignment.target_*→캐시)는 period 를 안 봐서
+    #   미래발효 변경이 생성과 검증에서 어긋났다(P4). 구간 없으면 캐시 폴백(무회귀).
+    overrides = _period_asof_overrides(db, str(nurse.nurse_id), as_of)
+    return _EffectiveNurseView(nurse, overrides) if overrides else nurse
+
+
+def _period_asof_overrides(db: Session, nurse_id: str, as_of: date) -> Dict[str, Any]:
+    """NurseAllowedShiftPeriod 에서 allowed_shifts/fixed_shift 를 as_of 로 해석.
+
+    구간 있으면 override dict 에 담고, gap 이면 키 생략(→ _EffectiveNurseView 가 캐시 폴백).
+    생성기의 period-우선·캐시-폴백 해석과 동일 SSOT.
+    """
+    from services.nurse_period_resolver import fetch_periods, resolve_asof
+    from db.models import NurseAllowedShiftPeriod
+    rows = fetch_periods(
+        db, NurseAllowedShiftPeriod, [nurse_id], as_of, as_of + timedelta(days=1)
+    ).get(nurse_id)
+    out: Dict[str, Any] = {}
+    _SENT = object()
+    a = resolve_asof(rows, as_of, "allowed_shifts", _SENT)
+    if a is not _SENT:
+        out["allowed_shifts"] = a
+    f = resolve_asof(rows, as_of, "fixed_shift", _SENT)
+    if f is not _SENT:
+        out["fixed_shift"] = f
+    return out
 
 
 def _normalize_row(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -426,7 +453,7 @@ def upsert_nurse_monthly_limits_service(
             total_active_est += cap_days
 
             # 파견 인바운드 행은 대상 그룹 capability 오버레이(target_shift_types)를 반영한
-            # effective nurse 로 검증한다. base nurses.is_night_nurse 만 보면 파견지에서
+            # effective nurse 로 검증한다. base nurses.allowed_shifts 만 보면 파견지에서
             # 가능해진 N 을 불가로 오판해 MONTHLY_LIMIT_NOT_IN_WORK_SHIFTS 로 오차단된다.
             eff_nurse = (
                 _effective_nurse_for_group(db, nurse, str(rr.get("group_id")), year, month)

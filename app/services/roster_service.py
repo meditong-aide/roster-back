@@ -7,6 +7,7 @@
 
 from datetime import date, datetime, timedelta
 import calendar
+import re
 import uuid
 
 from fastapi import HTTPException
@@ -37,16 +38,190 @@ from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequ
 from services.roster_system import RosterSystem
 from services.group_access import caller_is_head_nurse, resolve_home_group_id
 from services.shift_service_mssql import _to_time_str
+def _next_config_version(db: Session, office_id: str, group_id: str) -> int:
+    """그룹(office+group)별 다음 프리셋 version (0부터). 동시 충돌은 호출측 재시도로 처리."""
+    cur = (
+        db.query(func.max(RosterConfigModel.version))
+        .filter(
+            RosterConfigModel.office_id == office_id,
+            RosterConfigModel.group_id == group_id,
+        )
+        .scalar()
+    )
+    return 0 if cur is None else int(cur) + 1
+
+
+def apply_config_side_effects(db, *, office_id, group_id, weekly_off_group, use_mid):
+    """선택된 설정을 라이브 테이블에 반영(=적용). 생성 시점에만 호출.
+
+    솔버가 roster_config 가 아닌 라이브 테이블(WeeklyOffSetting/ShiftManage/Nurse/
+    RosterGradeConfig)에서 weekly_off·use_mid 를 읽으므로, 생성 직전 선택 설정 값으로
+    동기화한다. 저장(프리셋 북마크)에서는 호출하지 않는다(순수).
+    """
+    # weekly_off 동기화
+    db.query(WeeklyOffSetting).filter(
+        WeeklyOffSetting.office_id == office_id,
+        WeeklyOffSetting.group_id == group_id,
+    ).update({'activate': 1 if weekly_off_group else 0})
+    if weekly_off_group is not None:
+        db.query(Nurse).filter(
+            Nurse.group_id == group_id
+        ).update(
+            {Nurse.weekly_off_enabled: 1 if weekly_off_group else 0},
+            synchronize_session=False,
+        )
+
+    # use_mid (M근무) 동기화
+    if use_mid:
+        grade_cfg = db.query(RosterGradeConfig).filter(
+            RosterGradeConfig.office_id == office_id,
+            RosterGradeConfig.group_id == group_id,
+        ).first()
+        if grade_cfg and isinstance(grade_cfg.constraints_json, dict):
+            cj = dict(grade_cfg.constraints_json)
+            if 'M' not in cj and cj:
+                sample = cj.get('D') or cj.get('E') or cj.get('N') or {}
+                cj['M'] = {g: 0 for g in sample}
+                grade_cfg.constraints_json = cj
+        if grade_cfg:
+            ds = list(grade_cfg.default_shifts_json or [])
+            if not any(
+                isinstance(it, dict) and str(it.get('code', '')).upper() == 'M'
+                for it in ds
+            ):
+                ds.append({'code': 'M', 'shift_table_id': None})
+                grade_cfg.default_shifts_json = ds
+    else:
+        db.query(ShiftManage).filter(
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == group_id,
+            ShiftManage.nurse_class == 'RN',
+            ShiftManage.shift_slot == 5,
+        ).update({ShiftManage.manpower: 0}, synchronize_session=False)
+
+        nurses = db.query(Nurse).filter(Nurse.group_id == group_id).all()
+        for nurse_row in nurses:
+            raw_types = getattr(nurse_row, 'allowed_shifts', None)
+            if isinstance(raw_types, list) and raw_types:
+                nurse_row.allowed_shifts = [
+                    t for t in raw_types if str(t).strip().upper() != 'M'
+                ]
+
+        grade_cfg = db.query(RosterGradeConfig).filter(
+            RosterGradeConfig.office_id == office_id,
+            RosterGradeConfig.group_id == group_id,
+        ).first()
+        if grade_cfg and isinstance(grade_cfg.constraints_json, dict):
+            cleaned = dict(grade_cfg.constraints_json)
+            if 'M' in cleaned:
+                cleaned.pop('M', None)
+                grade_cfg.constraints_json = cleaned
+        if grade_cfg:
+            ds = list(grade_cfg.default_shifts_json or [])
+            filtered = [
+                it for it in ds
+                if not (isinstance(it, dict) and str(it.get('code', '')).upper() == 'M')
+            ]
+            if len(filtered) != len(ds):
+                grade_cfg.default_shifts_json = filtered
+
+
+# materialize 비교에서 제외: 메타 + ShiftManage 파생(day/eve/nig)
+_COMPARE_EXCLUDE = {
+    'config_id', 'config_name', 'config_memo', 'config_version',
+    'day_req', 'eve_req', 'nig_req',
+}
+
+
+def _next_auto_config_name(db, office_id, group_id) -> str:
+    """'새로운 설정n' 다음 이름 — 기존 최대 n+1 (없으면 1)."""
+    rows = (
+        db.query(RosterConfigModel.config_name)
+        .filter(
+            RosterConfigModel.office_id == office_id,
+            RosterConfigModel.group_id == group_id,
+            RosterConfigModel.config_name.like('새로운 설정%'),
+        )
+        .all()
+    )
+    max_n = 0
+    for (name,) in rows:
+        m = re.match(r'^새로운 설정(\d+)$', (name or '').strip())
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return f'새로운 설정{max_n + 1}'
+
+
+def materialize_generation_config(
+    db, payload: RosterConfigCreate, user, *, override_group_id=None
+):
+    """생성 시점: payload 를 config row 로 굳히고(변경 시 '새로운 설정n') 라이브 동기화.
+
+    - payload 가 baseline(config_id) 과 동일 → 기존 row 재사용(새 row 없음).
+    - 다르거나 baseline 없음 → '새로운 설정n' 신규 row(version=MAX+1).
+    - 어느 경우든 결정된 설정으로 라이브 동기화(apply_config_side_effects)를 항상 수행.
+    반환: 결정된 RosterConfig row (호출측은 row.config_id 를 솔버에 전달).
+    """
+    if override_group_id:
+        grp = db.query(Group).filter(Group.group_id == override_group_id).first()
+        if not grp:
+            raise Exception("지정한 그룹을 찾을 수 없습니다.")
+        office_id, group_id = grp.office_id, grp.group_id
+    else:
+        nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
+        office_id, group_id = nurse.office_id, user.group_id
+
+    baseline = None
+    if payload.config_id is not None:
+        baseline = db.query(RosterConfigModel).filter(
+            RosterConfigModel.config_id == payload.config_id,
+            RosterConfigModel.office_id == office_id,
+            RosterConfigModel.group_id == group_id,
+        ).first()
+
+    pdict = {
+        k: v for k, v in payload.model_dump().items() if k not in _COMPARE_EXCLUDE
+    }
+    differs = True
+    if baseline is not None:
+        differs = any(getattr(baseline, k, None) != v for k, v in pdict.items())
+
+    if baseline is not None and not differs:
+        resolved = baseline
+    else:
+        auto_name = _next_auto_config_name(db, office_id, group_id)
+        new_payload = payload.model_copy(
+            update={'config_id': None, 'config_name': auto_name}
+        )
+        res = save_roster_config_service(
+            new_payload, user, db, override_group_id=group_id
+        )
+        resolved = db.query(RosterConfigModel).filter(
+            RosterConfigModel.config_id == res['config_id']
+        ).first()
+
+    # 항상 라이브 동기화(적용)
+    apply_config_side_effects(
+        db, office_id=office_id, group_id=group_id,
+        weekly_off_group=resolved.weekly_off_group,
+        use_mid=bool(getattr(resolved, 'use_mid', False)),
+    )
+    db.commit()
+    db.refresh(resolved)
+    return resolved
+
+
 def save_roster_config_service(
     config_data: RosterConfigCreate,
     user,
     db: Session,
     override_group_id: str | None = None,
 ):
-    """
-    근무표 설정 저장 서비스 함수.
+    """근무표 설정 저장 (프리셋 upsert).
 
-    관리자(ADM) 사용자의 경우 `override_group_id`를 통해 저장 대상 그룹을 지정합니다.
+    - config_id 있으면 해당 프리셋 in-place 수정(version 유지), 없으면 신규 INSERT(version=MAX+1).
+    - 관리자(ADM)는 `override_group_id`로 저장 대상 그룹을 지정.
+    NOTE: version 유일성 인덱스는 개발 마무리 후 추가 예정 — 추가 시 IntegrityError 재시도 가드 복원.
     """
     try:
         # 1) 저장 대상 그룹/오피스 결정
@@ -83,100 +258,55 @@ def save_roster_config_service(
         else:
             day_req = eve_req = nig_req = 3
 
-        # 3) 설정 저장
+        # 3) 설정 저장 (프리셋 upsert)
         config_dict = config_data.model_dump()
-        use_mid = bool(config_dict.get('use_mid', False))
+        # 메타 필드는 컬럼 직접매핑에서 분리 — version 은 서버가 할당
+        req_config_id = config_dict.pop('config_id', None)
+        config_name = config_dict.pop('config_name', None)
+        config_memo = config_dict.pop('config_memo', None)
         config_dict.update({
             'day_req': day_req,
             'eve_req': eve_req,
             'nig_req': nig_req
         })
-        db_config = RosterConfigModel(
-            **config_dict,
-            office_id=target_office_id,
-            group_id=target_group_id,
-        )
-        print('db_config', db_config.__dict__)
-        weekly_off_group = config_dict.get('weekly_off_group')
-        db.query(WeeklyOffSetting).filter(
-            WeeklyOffSetting.office_id == target_office_id,
-            WeeklyOffSetting.group_id == target_group_id,
-        ).update(
-            {
-                'activate': 1 if weekly_off_group else 0
-            }
-        )
-        if weekly_off_group is not None:
-            new_enabled = 1 if weekly_off_group else 0
-            db.query(Nurse).filter(
-                Nurse.group_id == target_group_id
-            ).update(
-                {Nurse.weekly_off_enabled: new_enabled},
-                synchronize_session=False
+
+        if req_config_id is not None:
+            # 기존 프리셋 수정 (in-place upsert) — config_id·version 유지
+            db_config = db.query(RosterConfigModel).filter(
+                RosterConfigModel.config_id == req_config_id,
+                RosterConfigModel.office_id == target_office_id,
+                RosterConfigModel.group_id == target_group_id,
+            ).first()
+            if db_config is None:
+                raise Exception("수정할 설정(config_id)을 찾을 수 없습니다.")
+            for _key, _val in config_dict.items():
+                setattr(db_config, _key, _val)
+            if config_name is not None:
+                db_config.config_name = config_name
+            if config_memo is not None:
+                db_config.config_memo = config_memo
+        else:
+            # 신규 프리셋 — 그룹(office+group)별 version = MAX+1 (0부터)
+            db_config = RosterConfigModel(
+                **config_dict,
+                office_id=target_office_id,
+                group_id=target_group_id,
+                version=_next_config_version(db, target_office_id, target_group_id),
+                config_name=config_name,
+                config_memo=config_memo,
             )
-
-        if use_mid:
-            # use_mid=True: grade_config 에 M 키 없으면 자동 추가 (각 grade 0명)
-            grade_cfg = db.query(RosterGradeConfig).filter(
-                RosterGradeConfig.office_id == target_office_id,
-                RosterGradeConfig.group_id == target_group_id,
-            ).first()
-            if grade_cfg and isinstance(grade_cfg.constraints_json, dict):
-                cj = dict(grade_cfg.constraints_json)
-                if 'M' not in cj and cj:
-                    # 기존 D 키에서 grade 번호 추출해서 M 기본값 생성
-                    sample = cj.get('D') or cj.get('E') or cj.get('N') or {}
-                    cj['M'] = {g: 0 for g in sample}
-                    grade_cfg.constraints_json = cj
-            # default_shifts 에 M 항목 없으면 자동 추가 (shift_table_id=None)
-            if grade_cfg:
-                ds = list(grade_cfg.default_shifts_json or [])
-                if not any(
-                    isinstance(it, dict) and str(it.get('code', '')).upper() == 'M'
-                    for it in ds
-                ):
-                    ds.append({'code': 'M', 'shift_table_id': None})
-                    grade_cfg.default_shifts_json = ds
-
-        if not use_mid:
-            db.query(ShiftManage).filter(
-                ShiftManage.office_id == target_office_id,
-                ShiftManage.group_id == target_group_id,
-                ShiftManage.nurse_class == 'RN',
-                ShiftManage.shift_slot == 5,
-            ).update({ShiftManage.manpower: 0}, synchronize_session=False)
-
-            nurses = db.query(Nurse).filter(Nurse.group_id == target_group_id).all()
-            for nurse_row in nurses:
-                raw_types = getattr(nurse_row, 'is_night_nurse', None)
-                if isinstance(raw_types, list) and raw_types:
-                    nurse_row.is_night_nurse = [
-                        t for t in raw_types if str(t).strip().upper() != 'M'
-                    ]
-
-            grade_cfg = db.query(RosterGradeConfig).filter(
-                RosterGradeConfig.office_id == target_office_id,
-                RosterGradeConfig.group_id == target_group_id,
-            ).first()
-            if grade_cfg and isinstance(grade_cfg.constraints_json, dict):
-                cleaned = dict(grade_cfg.constraints_json)
-                if 'M' in cleaned:
-                    cleaned.pop('M', None)
-                    grade_cfg.constraints_json = cleaned
-            # default_shifts 에서 M 항목 제거
-            if grade_cfg:
-                ds = list(grade_cfg.default_shifts_json or [])
-                filtered = [
-                    it for it in ds
-                    if not (isinstance(it, dict) and str(it.get('code', '')).upper() == 'M')
-                ]
-                if len(filtered) != len(ds):
-                    grade_cfg.default_shifts_json = filtered
-
-        db.add(db_config)
+            db.add(db_config)
+        # NOTE: 저장(프리셋 북마크)은 순수 — 라이브 테이블(WeeklyOffSetting/ShiftManage/
+        # Nurse/grade) 동기화는 생성 시점의 apply_config_side_effects 로 이전됨.
         db.commit()
         db.refresh(db_config)
-        return {"message": "Configuration saved successfully"}
+        return {
+            "message": "Configuration saved successfully",
+            "config_id": db_config.config_id,
+            "version": db_config.version,
+            "config_name": db_config.config_name,
+            "config_memo": db_config.config_memo,
+        }
     except Exception as e:
         print(f'설정 저장 오류: {str(e)}')
         db.rollback()
@@ -1374,7 +1504,7 @@ def create_issued_roster_snapshot(
                 "level_": n.level_,
                 "is_head_nurse": n.is_head_nurse,
                 "emp_auth_gbn": n.emp_auth_gbn,
-                "is_night_nurse": n.is_night_nurse,
+                "allowed_shifts": n.allowed_shifts,
                 "personal_off_adjustment": n.personal_off_adjustment,
                 "preceptor_id": n.preceptor_id,
                 "joining_date": n.joining_date.isoformat()

@@ -217,6 +217,9 @@ _MEMBER_BADGE_FIELDS: Tuple[str, ...] = (
     "as_of_team",
     "as_of_grade",
     "is_night_dedicated",
+    "as_of_allowed_shifts",
+    "as_of_weekend_off",
+    "as_of_fixed_shift",
 )
 
 
@@ -254,6 +257,15 @@ def attach_member_badges_to_nurses(
             continue
         for key in _MEMBER_BADGE_FIELDS:
             n[key] = member.get(key)
+        # ── nurses 배선 일원화(kill): year/month 동반 시 base 속성 필드를 월 as-of 로 덮어쓴다.
+        #   캐시(오늘값)·inbound overlay 가 아니라 period as-of 가 SSOT — 월 이동하면 그 달 값이 보임.
+        n["grade"] = member.get("as_of_grade")
+        n["team_id"] = member.get("as_of_team")
+        _aon = member.get("as_of_allowed_shifts")
+        if _aon is not None:                       # [] = 제한없음(유효값) → 덮어씀
+            n["allowed_shifts"] = _aon
+        n["fixed_shift"] = member.get("as_of_fixed_shift")
+        n["is_weekend_off"] = bool(member.get("as_of_weekend_off"))
         # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
         # display_group_id = 이 membership 이 표시되는 기준 그룹(조회/선택 그룹).
         n["membership"] = {
@@ -381,7 +393,7 @@ def get_nurses_in_group_service(
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
-        is_night_nurse = nurse.is_night_nurse or []
+        allowed_shifts = nurse.allowed_shifts or []
 
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
@@ -394,7 +406,7 @@ def get_nurses_in_group_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": is_night_nurse,
+            "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
@@ -581,7 +593,7 @@ def get_nurses_filtered_service(
     # 결과 변환: NurseProfile과 호환
     result = []
     for nurse in nurses:
-        is_night_nurse = nurse.is_night_nurse or []
+        allowed_shifts = nurse.allowed_shifts or []
 
         nurse_dict = {
             "nurse_id": nurse.nurse_id,
@@ -594,7 +606,7 @@ def get_nurses_filtered_service(
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
-            "is_night_nurse": is_night_nurse,
+            "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
@@ -805,9 +817,14 @@ def bulk_update_nurses_service(
     current_user: UserSchema,
     db: Session,
     override_group_id: Optional[str] = None,
+    effective_year: Optional[int] = None,
+    effective_month: Optional[int] = None,
 ):
     """
     간호사 일괄 업데이트 서비스 함수
+
+    effective_year/month: 월 셀렉터가 보낸 선택월. period 쓰기의 valid_from 을 그 달 1일로
+      잡는다(미동반 시 today). 예) 8월 뷰에서 저장 → 기존 구간 close-before-open, 8월부터 발효.
     """
     if not current_user:
         raise Exception("Not authenticated")
@@ -820,6 +837,13 @@ def bulk_update_nurses_service(
 
     if not target_group_id:
         raise Exception("그룹 ID를 확인할 수 없습니다.")
+
+    # period 쓰기의 valid_from = 선택월 1일(월 셀렉터). 미동반 시 today(현재값 변경).
+    from datetime import date as _vf_date
+    _effective_vf = (
+        _vf_date(int(effective_year), int(effective_month), 1)
+        if effective_year and effective_month else _vf_date.today()
+    )
 
     # 그룹 내 모든 간호사 + inbound 간호사까지 미리 로드 (target 모드 지원)
     _inbound_ids = [
@@ -945,21 +969,67 @@ def bulk_update_nurses_service(
 
         # === 프론트에서 보내준 값으로 일괄 업데이트 ===
         for key, value in update_data.items():
+            if key in ("allowed_shifts", "grade", "fixed_shift", "is_weekend_off"):
+                continue  # 아래에서 period 로 일원화 — 컬럼 직접 쓰기 금지
             if hasattr(db_nurse, key):
                 setattr(db_nurse, key, value)
 
-        # === 후처리: is_night_nurse (전체 선택 시 빈 배열) ===
-        # 각 shift_id를 상위 그룹(D/E/N/M)으로 정규화 후 중복 제거
-        # use_mid=False: D,E,N 3종 전부 선택 시 빈 배열
-        # use_mid=True:  D,E,N,M 4종 전부 선택 시 빈 배열
-        if "is_night_nurse" in update_data:
-            night_shifts = update_data["is_night_nurse"]
+        # === allowed_shifts(허용 근무형) → nurse_allowed_shift_period 일원화 ===
+        # 진실=period, nurses.allowed_shifts 컬럼은 upsert 의 단방향 투영으로만 갱신(양방향 충돌 제거).
+        # '현재값 변경'이라 valid_from=오늘. 미래발효는 POST /nurse-period/change 사용.
+        # 전체 선택(D/E/N[/M] 전부)=제한 없음([]) 정규화 유지.
+        if "allowed_shifts" in update_data:
+            night_shifts = update_data["allowed_shifts"]
+            final_night = night_shifts if isinstance(night_shifts, list) else []
             if isinstance(night_shifts, list) and night_shifts:
                 normalized = {shift_to_group.get(s, s) for s in night_shifts}
                 if normalized == ALL_SHIFTS:
-                    db_nurse.is_night_nurse = []
-            elif night_shifts is None:
-                db_nurse.is_night_nurse = []
+                    final_night = []
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _effective_vf,
+                "allowed_shifts", final_night,
+                nurse=db_nurse, cache_attr="allowed_shifts", source="edited",
+            )
+
+        # === grade → nurse_grade_period 일원화(병동귀속) ===
+        # 진실=period, nurses.grade 컬럼은 upsert 의 단방향 투영으로만 갱신.
+        # '현재값 변경'이라 valid_from=오늘. 미래발효는 POST /nurse-period/change 사용.
+        if "grade" in update_data:
+            from datetime import date as _date
+            from db.models import NurseGradePeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseGradePeriod, db_nurse.nurse_id, _effective_vf,
+                "grade", update_data["grade"],
+                group_id=db_nurse.group_id,
+                nurse=db_nurse, cache_attr="grade", source="edited",
+            )
+
+        # === fixed_shift → nurse_allowed_shift_period(통합 satellite) ===
+        if "fixed_shift" in update_data:
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, db_nurse.nurse_id, _effective_vf,
+                "fixed_shift", update_data["fixed_shift"],
+                nurse=db_nurse, cache_attr="fixed_shift",
+                carry_attrs=["allowed_shifts"], source="edited",
+            )
+
+        # === is_weekend_off → nurse_weekendoff_period ===
+        if "is_weekend_off" in update_data:
+            from datetime import date as _date
+            from db.models import NurseWeekendOffPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseWeekendOffPeriod, db_nurse.nurse_id, _effective_vf,
+                "weekend_off", 1 if update_data["is_weekend_off"] else 0,
+                nurse=db_nurse, cache_attr="is_weekend_off", source="edited",
+            )
 
         # === 후처리: work_shifts (None → 빈 배열) ===
         if "work_shifts" in update_data and update_data["work_shifts"] is None:
@@ -1689,6 +1759,8 @@ def update_nurse_profile_service(
     current_user: UserSchema,
     db: Session,
     view_group_id: Optional[str] = None,
+    effective_year: Optional[int] = None,
+    effective_month: Optional[int] = None,
 ):
     """
     nurse_id 기반 단건 프로필 업데이트 서비스 (근무자 관리 사이드 프로필용)
@@ -1713,6 +1785,12 @@ def update_nurse_profile_service(
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
 
     fields = update_data.dict(exclude_unset=True)
+    # period 쓰기 valid_from = 선택월 1일(월 셀렉터). 미동반 시 today(현재값 변경).
+    from datetime import date as _eff_date
+    _eff_vf = (
+        _eff_date(int(effective_year), int(effective_month), 1)
+        if effective_year and effective_month else _eff_date.today()
+    )
     # assignment payload는 별도 브랜치로 분리 후 source/target 저장 단계에서 제외.
     # 단건(assignment) + 다건(assignments) 모두 지원 — 다건 먼저 적용 후 단건.
     assignment_payload = fields.pop("assignment", None)
@@ -1795,6 +1873,10 @@ def update_nurse_profile_service(
                 db, nurse_id=nurse_id, group_id=nurse.group_id,
                 new_team_id=fields["team_id"],
             )
+        _persist_profile_period_change(
+            db, nurse_id=nurse_id, group_id=nurse.group_id, nurse=nurse, fields=fields,
+            valid_from=_eff_vf,
+        )
         db.commit()
         db.refresh(nurse)
         applied_source = True
@@ -1817,6 +1899,11 @@ def update_nurse_profile_service(
                     db, nurse_id=nurse_id, group_id=assign_row.target_group_id,
                     new_team_id=fields["team_id"],
                 )
+            # grade/allowed_shifts/fixed_shift → target_group period(SSOT). 캐시 미투영(홈 아님).
+            _persist_profile_period_change(
+                db, nurse_id=nurse_id, group_id=assign_row.target_group_id,
+                nurse=nurse, fields=fields, valid_from=_eff_vf,
+            )
             _apply_target_update(
                 assign_row, {k: v for k, v in fields.items() if k != "team_id"}
             )
@@ -1832,6 +1919,10 @@ def update_nurse_profile_service(
                     db, nurse_id=nurse_id, group_id=nurse.group_id,
                     new_team_id=fields["team_id"],
                 )
+            _persist_profile_period_change(
+                db, nurse_id=nurse_id, group_id=nurse.group_id, nurse=nurse, fields=fields,
+                valid_from=_eff_vf,
+            )
             # source 변경 시 active inbound assignment 의 target_* 도 자동 cascade.
             # (team_id 는 _apply_target_update 에서 제외 — team SSOT=period 라 assignment 미관여)
             # 프론트가 view_group_id 안 보내도 source view 호출 한 번으로 inbound 모두 동기화.
@@ -1909,8 +2000,8 @@ def _apply_source_nurse_update(nurse: NurseModel, fields: Dict[str, Any]) -> Non
     """
     _sanitize_resignation_fields(fields)
     for key, value in fields.items():
-        if key == "team_id":
-            continue  # team 은 nurse_team_period 에만 기록 (캐시 미사용)
+        if key == "team_id" or key in _PERIOD_OWNED_FIELDS:
+            continue  # team/grade/allowed_shifts/fixed_shift 은 period(SSOT)에만 — 캐시 직접쓰기 금지
         if hasattr(nurse, key):
             setattr(nurse, key, value)
 
@@ -1935,6 +2026,60 @@ def _persist_team_period_change(
         source="profile_edit",
         commit=False,
     )
+
+
+def _persist_profile_period_change(
+    db: Session, *, nurse_id: str, group_id: str, nurse: NurseModel,
+    fields: Dict[str, Any], valid_from: date, source: str = "profile_edit",
+) -> None:
+    """grade/allowed_shifts/fixed_shift 변경을 period(SSOT)에 기록 (team 과 동일 패턴).
+
+    - grade: nurse_grade_period(병동귀속). 캐시 투영은 group_id==홈(nurse.group_id)일 때만
+      — inbound(타깃) 편집이 홈 캐시 grade 를 덮지 않게. valid_from 미래면 upsert 가 자동 미투영.
+    - allowed_shifts/fixed_shift: nurse_allowed_shift_period(결합 satellite, group 무관). 전역 속성이라 투영 OK.
+
+    valid_from 은 **필수**다. "당월 vs 선택월" 결정은 호출부 단일 지점(_eff_vf)에서만 한다.
+    과거엔 default=None→당월1일 폴백이 있어, 한 분기(source)가 값을 빼먹어도 조용히 당월로
+    써버려 미래월 발효가 깨졌다. 이제 빼먹으면 TypeError 로 즉시 터진다(거짓 그린 차단).
+    commit 은 호출부 일괄.
+    """
+    from db.models import NurseGradePeriod, NurseAllowedShiftPeriod, NurseWeekendOffPeriod
+    from services.nurse_period_resolver import upsert_period
+    vf = valid_from
+    _home = str(group_id) == str(getattr(nurse, "group_id", "") or "")
+    if "grade" in fields:
+        upsert_period(
+            db, NurseGradePeriod, str(nurse_id), vf, "grade", fields["grade"],
+            group_id=str(group_id),
+            nurse=(nurse if _home else None),
+            cache_attr=("grade" if _home else None),
+            source=source,
+        )
+    if "allowed_shifts" in fields:
+        upsert_period(
+            db, NurseAllowedShiftPeriod, str(nurse_id), vf, "allowed_shifts",
+            fields["allowed_shifts"] if fields["allowed_shifts"] is not None else [],
+            nurse=nurse, cache_attr="allowed_shifts", source=source,
+            carry_attrs=["fixed_shift"],
+        )
+    if "fixed_shift" in fields:
+        upsert_period(
+            db, NurseAllowedShiftPeriod, str(nurse_id), vf, "fixed_shift",
+            fields["fixed_shift"],
+            nurse=nurse, cache_attr="fixed_shift", source=source,
+            carry_attrs=["allowed_shifts"],
+        )
+    if "is_weekend_off" in fields:
+        # 주말휴무(group 무관 전역 속성) → nurse_weekendoff_period. 캐시 투영 OK.
+        upsert_period(
+            db, NurseWeekendOffPeriod, str(nurse_id), vf, "weekend_off",
+            1 if fields["is_weekend_off"] else 0,
+            nurse=nurse, cache_attr="is_weekend_off", source=source,
+        )
+
+
+# period 로 일원화된 속성 — _apply_*_update / target_* 에서 제외하고 _persist_profile_period_change 로 보낸다.
+_PERIOD_OWNED_FIELDS = ("grade", "allowed_shifts", "fixed_shift", "is_weekend_off")
 
 
 def _validate_team_grade_change_or_raise(
@@ -1976,7 +2121,14 @@ def _validate_team_grade_change_or_raise(
             db, str(nurse.nurse_id), assign_row.target_group_id,
             _vdate2(_t2.year, _t2.month, 1),
         )
-        old_grade = assign_row.target_grade
+        # grade SSOT=nurse_grade_period: 변경 전 grade 도 period(target group)에서 읽는다(target_grade 미사용).
+        from datetime import timedelta as _tdv
+        from services.nurse_period_resolver import fetch_periods as _fpv, resolve_asof as _rav
+        from db.models import NurseGradePeriod as _NGPv
+        _msv = _vdate2(_t2.year, _t2.month, 1)
+        _gpv = _fpv(db, _NGPv, [str(nurse.nurse_id)], _msv, _msv + _tdv(days=1),
+                    group_id=assign_row.target_group_id)
+        old_grade = _rav(_gpv.get(str(nurse.nurse_id)), _msv, "grade", default=nurse.grade)
     new_team = fields["team_id"] if has_team else old_team
     new_grade = fields["grade"] if has_grade else old_grade
 
@@ -2880,10 +3032,10 @@ def _overlay_inbound_fields(
 
     정책: Target 병동 시점에서는 매핑된 모든 컬럼을 assignment.target_* 값으로 교체.
     target_*가 NULL이어도 NULL 그대로 노출(= nurses.*로 fallback 하지 않음).
-    is_night_nurse만 프론트 호환을 위해 None → [] 처리.
+    allowed_shifts만 프론트 호환을 위해 None → [] 처리.
     """
     nurse_dict["is_inbound"] = True
     for src_key, tgt_key in _SOURCE_TO_TARGET_FIELD_MAP.items():
         nurse_dict[src_key] = getattr(row, tgt_key, None)
-    if nurse_dict.get("is_night_nurse") is None:
-        nurse_dict["is_night_nurse"] = []
+    if nurse_dict.get("allowed_shifts") is None:
+        nurse_dict["allowed_shifts"] = []

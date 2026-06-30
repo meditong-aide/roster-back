@@ -103,7 +103,7 @@ def _active_range(nurse, first_day: date, last_day: date) -> tuple[int, int] | N
 
 
 def _nurse_profile_blocks_code(nurse, code: str, use_mid: bool) -> bool:
-    raw = getattr(nurse, "is_night_nurse", None)
+    raw = getattr(nurse, "allowed_shifts", None)
     return is_code_blocked_by_profile(raw, code, use_mid=use_mid)
 
 

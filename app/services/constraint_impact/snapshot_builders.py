@@ -30,7 +30,7 @@ def _collect_nurse_facts(rs, join: list[int], leave: list[int]) -> list[NurseFac
     use_mid = bool(getattr(rs.config, "use_mid", False))
     facts: list[NurseFact] = []
     for idx, nurse in enumerate(rs.nurses):
-        allowed = normalize_allowed_shift_codes(getattr(nurse, "is_night_nurse", None), use_mid=use_mid) or set(rs.config.shift_types)
+        allowed = normalize_allowed_shift_codes(getattr(nurse, "allowed_shifts", None), use_mid=use_mid) or set(rs.config.shift_types)
         grade_val = getattr(nurse, "grade", None)
         try:
             grade_val = int(grade_val) if grade_val is not None else None

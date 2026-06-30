@@ -281,6 +281,9 @@ app.include_router(constraint_impact_router.router)
 from routers import ontology as ontology_router
 app.include_router(ontology_router.router)
 
+from routers import nurse_period as nurse_period_router
+app.include_router(nurse_period_router.router)
+
 # Agent v2 test chat UI (dev-only — 별도 페이지에서 컨텍스트 수동 선택)
 from agents_v2.test_chat_router import router as agent_test_router
 app.include_router(agent_test_router)

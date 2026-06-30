@@ -71,7 +71,7 @@ def build_fallback_stage3_objective_terms(
     P = roster_system.preference_matrix
     for n in range(N):
         nu = roster_system.nurses[n]
-        raw = getattr(nu, "is_night_nurse", None)
+        raw = getattr(nu, "allowed_shifts", None)
         is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
         for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
             for s in range(S):

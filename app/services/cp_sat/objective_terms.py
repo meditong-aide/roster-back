@@ -38,7 +38,7 @@ def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
         t0, t1 = join[n], leave[n]
         if t0 > t1:
             continue
-        raw = getattr(rs.nurses[n], "is_night_nurse", None)
+        raw = getattr(rs.nurses[n], "allowed_shifts", None)
         allowed = normalize_allowed_shift_codes(raw, use_mid=bool(getattr(rs.config, "use_mid", False)))
         if allowed and "N" not in allowed:
             n_forbid_n.add(n)
@@ -157,7 +157,7 @@ def add_kld_distribution_terms(
     # ── 간호사 분류 ──
     normals: list[int] = []
     for i, nu in enumerate(rs.nurses):
-        raw = getattr(nu, "is_night_nurse", None)
+        raw = getattr(nu, "allowed_shifts", None)
         if not is_n_only_profile(raw, use_mid=use_mid):
             normals.append(i)
     if len(normals) < 2:
@@ -195,7 +195,7 @@ def add_kld_distribution_terms(
             if c == "N" and n in n_forbid_n:
                 continue
             allowed = normalize_allowed_shift_codes(
-                getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+                getattr(rs.nurses[n], "allowed_shifts", None), use_mid=use_mid,
             ) or all_codes_set
             if c not in allowed:
                 continue
@@ -354,7 +354,7 @@ def add_kld_distribution_terms(
         for n in normals:
             nu = rs.nurses[n]
             allowed = normalize_allowed_shift_codes(
-                getattr(nu, "is_night_nurse", None), use_mid=use_mid,
+                getattr(nu, "allowed_shifts", None), use_mid=use_mid,
             ) or all_codes_set
             allowed_work = allowed & set(work_codes)
             if len(allowed_work) <= 1:
@@ -434,7 +434,7 @@ def add_kld_distribution_terms(
         pair_added = 0
         for n in normals:
             allowed = normalize_allowed_shift_codes(
-                getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+                getattr(rs.nurses[n], "allowed_shifts", None), use_mid=use_mid,
             ) or all_codes_set
             allowed_work = sorted(allowed & set(work_codes))
             if len(allowed_work) <= 1:
@@ -483,7 +483,7 @@ def add_kld_distribution_terms(
             eligible_cnt = 0
             for n in normals:
                 a = normalize_allowed_shift_codes(
-                    getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+                    getattr(rs.nurses[n], "allowed_shifts", None), use_mid=use_mid,
                 ) or all_codes_set
                 if c in a:
                     eligible_cnt += 1
@@ -496,7 +496,7 @@ def add_kld_distribution_terms(
         bidir_added = 0
         for n in normals:
             allowed = normalize_allowed_shift_codes(
-                getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+                getattr(rs.nurses[n], "allowed_shifts", None), use_mid=use_mid,
             ) or all_codes_set
             days_n = list(iter_nurse_days(n, join, leave, blocked_by_nurse))
             for c in work_codes:
@@ -691,7 +691,7 @@ def add_kld_distribution_terms(
     min_work = m.NewIntVar(0, D, f"kld_tw_min_{stage_label}")
     for n in normals:
         allowed = normalize_allowed_shift_codes(
-            getattr(rs.nurses[n], "is_night_nurse", None), use_mid=use_mid,
+            getattr(rs.nurses[n], "allowed_shifts", None), use_mid=use_mid,
         ) or all_codes_set
         if len(allowed) <= 1:
             continue
@@ -774,7 +774,7 @@ def add_even_mid_distribution_terms(
 
     candidates: list[int] = []
     for n, nu in enumerate(rs.nurses):
-        raw = getattr(nu, "is_night_nurse", None)
+        raw = getattr(nu, "allowed_shifts", None)
         is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
         if is_n_only:
             continue
@@ -848,7 +848,7 @@ def add_even_night_minmax_distribution_terms(
 
     normals: list[int] = []
     for i, nu in enumerate(rs.nurses):
-        raw = getattr(nu, "is_night_nurse", None)
+        raw = getattr(nu, "allowed_shifts", None)
         is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
         if not is_n_only:
             normals.append(i)
@@ -979,7 +979,7 @@ def build_main_objective_terms(
 
     for n in range(N):
         nu = rs.nurses[n]
-        raw = getattr(nu, "is_night_nurse", None)
+        raw = getattr(nu, "allowed_shifts", None)
         is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
 
         for d in iter_nurse_days(n, join, leave, blocked_by_nurse):

@@ -103,6 +103,10 @@ class RosterRequest(BaseModel):
     group_id: Optional[str] = None
     # algorithm: str = "cp_sat"  # "cp_sat" or "random_sampling"
     config_id: Optional[int] = None
+    # 모달의 현재(편집 포함) 설정 payload. 제공 시 생성 직전 materialize 로 config row 를
+    # 굳히고(변경 시 '새로운 설정n') 라이브 동기화 후 config_id 를 결정한다. dict 로 받아
+    # 서버에서 RosterConfigCreate 로 검증(스키마 정의 순서상 forward-ref 회피).
+    config: Optional[Dict[str, Any]] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
@@ -269,6 +273,11 @@ class RosterConfigBase(BaseModel):
 
 class RosterConfigCreate(RosterConfigBase):
     config_version: Optional[str] = None
+    # ── 설정 프리셋(저장한 설정 모달) ──
+    # config_id 있으면 해당 프리셋 UPDATE(in-place upsert), 없으면 신규 INSERT(version=MAX+1).
+    config_id: Optional[int] = None
+    config_name: Optional[str] = None  # 프리셋 이름
+    config_memo: Optional[str] = None  # 간단 메모
     # pass
 
 
@@ -466,8 +475,8 @@ class NurseProfile(BaseModel):
     role: Optional[str] = None
     level_: Optional[str] = None
     is_head_nurse: bool = Field(default=False)
-    # is_night_nurse: List[CodeMapp] = Field(default_factory=list, max_items = 2)
-    is_night_nurse: List[str] = Field(default_factory=list)
+    # allowed_shifts: List[CodeMapp] = Field(default_factory=list, max_items = 2)
+    allowed_shifts: List[str] = Field(default_factory=list)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
     joining_date: Optional[datetime] = None
@@ -663,7 +672,7 @@ class NurseProfileUpdate(BaseModel):
     weekly_off_weekday: Optional[int] = None
     weekly_off_type: Optional[str] = None
     is_weekend_off: Optional[bool] = None
-    is_night_nurse: Optional[List[str]] = None
+    allowed_shifts: Optional[List[str]] = None
     work_shifts: Optional[List[str]] = None
     enable_nurse_pair_preference: Optional[bool] = None
     enable_aide: Optional[bool] = None

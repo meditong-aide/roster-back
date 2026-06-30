@@ -58,7 +58,8 @@ from db.models import (  # noqa: E402
     Schedule, ScheduleEntry, RosterConfig, RosterJob,
     Wanted, WantedRequest, NurseShiftRequest, NursePairRequest, FixedWantedEntry,
     IssuedRoster, ShiftManage, RosterGradeConfig, NurseMonthlyLimit, NurseAssignment,
-    NurseTeamPeriod,
+    NurseTeamPeriod, WeeklyOffSetting,
+    NurseGradePeriod, NurseAllowedShiftPeriod, NurseWeekendOffPeriod,
     AgentConversation, AgentConversationMessage, AgentUserMemory,
     AgentMemoryAudit, AgentSkillInvocation,
 )
@@ -86,6 +87,9 @@ _REQUIRED_TABLES = [
     NursePairRequest.__table__,
     FixedWantedEntry.__table__, ShiftManage.__table__, IssuedRoster.__table__,
     NurseMonthlyLimit.__table__, NurseAssignment.__table__, NurseTeamPeriod.__table__,
+    WeeklyOffSetting.__table__,
+    NurseGradePeriod.__table__, NurseAllowedShiftPeriod.__table__,
+    NurseWeekendOffPeriod.__table__,
     AgentConversation.__table__, AgentConversationMessage.__table__,
     AgentUserMemory.__table__,
     AgentMemoryAudit.__table__,
@@ -184,7 +188,7 @@ def seed_data(db: Session) -> dict:
             preceptor_id="N002" if nid == "N006" else None,
             is_weekend_off=False,
             work_shifts=["D", "E", "N"],
-            is_night_nurse=[],
+            allowed_shifts=[],
             fixed_shift=None,
             enable_aide=True,
         )

@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 import numpy as np
 from functools import lru_cache
 from services.holiday_pack import get_weekends   # ← 주말 헬퍼
+from services.cp_sat.allowed_shift_types import is_n_only_profile
 
 # ────────────────────────────────────────────────────────────────
 # 주말‑셋 캐시  (month 단위로 한 번만 계산)
@@ -21,7 +22,7 @@ class Nurse:
     db_id: str  # 데이터베이스의 원래 ID
     grade: Optional[int] = None  # 역량 등급(1~3), 미지정은 None
     team_id: Optional[int] = None
-    is_night_nurse: int = 0
+    allowed_shifts: Optional[List[str]] = None  # 허용 근무형 리스트(빈/None=제한없음, ["N"]=N전담)
     is_head_nurse: bool = False
     is_weekend_off: bool = False
     fixed_shift: Optional[str] = None
@@ -54,7 +55,7 @@ class Nurse:
             experience_years=db_nurse.experience,
             grade=getattr(db_nurse, "grade", None),
             team_id=getattr(db_nurse, "team_id", None),
-            is_night_nurse=db_nurse.is_night_nurse,
+            allowed_shifts=db_nurse.allowed_shifts,
             is_head_nurse=db_nurse.is_head_nurse,
             is_weekend_off=bool(getattr(db_nurse, "is_weekend_off", False)),
             fixed_shift=getattr(db_nurse, "fixed_shift", None),
@@ -108,7 +109,7 @@ class Nurse:
         preferences[off_idx] *= config.off_shift_ratio
         
         # 간호사 유형에 따른 기본 선호도
-        if self.is_night_nurse == 3:
+        if is_n_only_profile(self.allowed_shifts):
             preferences[night_idx] *= config.night_nurse_weight
             preferences[evening_idx] *= config.night_nurse_weight * 0.2
             preferences[d_idx] *= 0.2  # 주간 근무 비선호
@@ -122,4 +123,4 @@ class Nurse:
         return preferences
         
     def __str__(self) -> str:
-        return f"Nurse(id={self.id}, name={self.name}, exp={self.experience_years}yrs, night={self.is_night_nurse})" 
+        return f"Nurse(id={self.id}, name={self.name}, exp={self.experience_years}yrs, night={self.allowed_shifts})" 

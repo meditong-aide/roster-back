@@ -103,7 +103,7 @@ def _assert_caller_owns_source(
 _SOURCE_TO_TARGET_FIELD_MAP: dict[str, str] = {
     "grade": "target_grade",
     "fixed_shift": "target_fixed_shift",
-    "is_night_nurse": "target_shift_types",
+    "allowed_shifts": "target_shift_types",
     "team_id": "target_team_id",
     "weekly_off_enabled": "target_weekly_off_enabled",
     "weekly_off_type": "target_weekly_off_type",
@@ -488,6 +488,25 @@ def create_assignment(
             valid_from=req.start_date, team_id=req.target_team_id,
             source="transfer", note=req.note,
         )
+
+    # [속성 SSOT] 병동이동의 target grade/allowed/fixed 도 period(target_group)에 일원화 기록.
+    #   assignment.target_* 는 더 이상 source 로 읽지 않는다(period 가 진실). 캐시 미투영
+    #   (nurse 는 아직 source 소속) — 발효 flush 가 그 시점에 캐시로 투영한다.
+    if req.reason == "병동이동":
+        from db.models import NurseGradePeriod, NurseAllowedShiftPeriod
+        from services.nurse_period_resolver import upsert_period
+        if req.target_grade is not None:
+            upsert_period(db, NurseGradePeriod, req.nurse_id, req.start_date, "grade",
+                          req.target_grade, group_id=req.target_group_id, source="transfer")
+        if req.target_shift_types is not None:
+            upsert_period(db, NurseAllowedShiftPeriod, req.nurse_id, req.start_date,
+                          "allowed_shifts", req.target_shift_types or [], source="transfer",
+                          carry_attrs=["fixed_shift"])
+        if req.target_fixed_shift is not None:
+            upsert_period(db, NurseAllowedShiftPeriod, req.nurse_id, req.start_date,
+                          "fixed_shift", req.target_fixed_shift, source="transfer",
+                          carry_attrs=["allowed_shifts"])
+        db.commit()
 
     logger.info(
         "배정 등록: nurse_id=%s, reason=%s, start=%s",
@@ -1063,12 +1082,53 @@ def group_members_in_month(
             return _coerce_team_int(getattr(n_obj, "team_id", None))
         return None
 
-    def _row(n, status, marker, badge, team, grade, night_profile=...):
+    # [Perf] grade·allowed_shifts(전담) 도 월 as-of 로 배치 해석(team 과 동일 원칙).
+    #   home(소속) 간호사만 — inbound 는 파견지 override(target_*) 사용. gap→캐시 폴백(무회귀).
+    from datetime import timedelta as _timedelta
+    from services.nurse_period_resolver import (
+        fetch_periods as _fetch_periods, resolve_asof as _resolve_asof,
+    )
+    from db.models import (
+        NurseGradePeriod as _NGP, NurseAllowedShiftPeriod as _NASP,
+        NurseWeekendOffPeriod as _NWOP,
+    )
+
+    _home_ids = [str(n.nurse_id) for n in home]
+    # inbound(전입/파견 인바운드)도 period as-of 로 해석 — 조회 그룹이 곧 그들의 target group이라
+    #   grade(group-bound) 도 group_id=조회그룹 으로 같이 fetch 하면 해석됨. (assignment.target_* 미사용)
+    _home_set = set(_home_ids)
+    _period_ids = _home_ids + [str(_nid) for _nid in inbound if str(_nid) not in _home_set]
+    _asof_next = month_start + _timedelta(days=1)
+    _grade_periods = _fetch_periods(db, _NGP, _period_ids, month_start, _asof_next, group_id=group_id)
+    _allowed_periods = _fetch_periods(db, _NASP, _period_ids, month_start, _asof_next)
+    _weekend_periods = _fetch_periods(db, _NWOP, _period_ids, month_start, _asof_next)
+
+    def _asof_grade(nid: str, n_obj):
+        v = _resolve_asof(_grade_periods.get(nid), month_start, "grade", default=None)
+        return v if v is not None else getattr(n_obj, "grade", None)
+
+    def _asof_night(nid: str, n_obj):
+        v = _resolve_asof(_allowed_periods.get(nid), month_start, "allowed_shifts", default=None)
+        return v if v is not None else getattr(n_obj, "allowed_shifts", None)
+
+    def _asof_fixed(nid: str, n_obj):
+        # fixed_shift 는 allowed satellite 의 형제 컬럼(같은 row)
+        v = _resolve_asof(_allowed_periods.get(nid), month_start, "fixed_shift", default=None)
+        return v if v is not None else getattr(n_obj, "fixed_shift", None)
+
+    def _asof_weekend(nid: str, n_obj):
+        v = _resolve_asof(_weekend_periods.get(nid), month_start, "weekend_off", default=None)
+        return v if v is not None else (1 if getattr(n_obj, "is_weekend_off", False) else 0)
+
+    def _row(n, status, marker, badge, team, grade, night_profile=...,
+             weekend_off=..., fixed_shift=...):
         # N전담(허용 shift=N뿐) 판정 → 'N전담' 배지 + is_night_dedicated.
-        # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.is_night_nurse 가
+        # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.allowed_shifts 가
         #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
         #   night_profile 미지정(home) 은 base 사용. (생성기는 N전담을 팀 D/E 커버리지에서 제외.)
-        _np = getattr(n, "is_night_nurse", None) if night_profile is ... else night_profile
+        _np = getattr(n, "allowed_shifts", None) if night_profile is ... else night_profile
+        _wo = (1 if getattr(n, "is_weekend_off", False) else 0) if weekend_off is ... else weekend_off
+        _fx = getattr(n, "fixed_shift", None) if fixed_shift is ... else fixed_shift
         night_dedicated = is_n_only_profile(_np)
         if night_dedicated and badge is None:
             badge = "N전담"
@@ -1078,9 +1138,12 @@ def group_members_in_month(
             "membership_status": status,   # active|outbound|dispatch_out|leave|resigned|inbound
             "marker": marker,              # '←'(전출) | '→'(전입) | None
             "badge": badge,                # '파견 중' | '휴직' | '퇴사' | '파견' | 'N전담' | None
-            "as_of_team": team,
+            "as_of_team": team,            # N전담도 팀 소속 가능(정책 변경) — 팀 None 강제 안 함
             "as_of_grade": grade,
             "is_night_dedicated": night_dedicated,
+            "as_of_allowed_shifts": _np,   # 월 as-of 전담 프로필(raw, /nurses base 덮어쓰기용)
+            "as_of_weekend_off": _wo,
+            "as_of_fixed_shift": _fx,
         }
 
     members: list[dict] = []
@@ -1089,23 +1152,27 @@ def group_members_in_month(
         nid = str(n.nurse_id)
         seen.add(nid)
         team = _resolved_team(nid, n)
-        grade = getattr(n, "grade", None)
+        grade = _asof_grade(nid, n)      # 월 as-of (gap→nurses.grade)
+        _np = _asof_night(nid, n)        # 월 as-of 전담 프로필 (gap→nurses.allowed_shifts)
+        _wo = _asof_weekend(nid, n)      # 월 as-of 주말휴무 (gap→nurses.is_weekend_off)
+        _fx = _asof_fixed(nid, n)        # 월 as-of 고정근무 (gap→nurses.fixed_shift)
+        _kw = dict(night_profile=_np, weekend_off=_wo, fixed_shift=_fx)
         if nid in outbound:
             a = outbound[nid]
             if a.reason == "병동이동":
                 if a.start_date <= month_start:
                     continue  # 완전 전출 → 그 달 미표시
-                members.append(_row(n, "outbound", "←", None, team, grade))
+                members.append(_row(n, "outbound", "←", None, team, grade, **_kw))
             else:  # 파견 나감 — home 유지
-                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade))
+                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, **_kw))
         elif nid in leave:
             a = leave[nid]
             if a.reason == "퇴사":
-                members.append(_row(n, "resigned", None, "퇴사", team, grade))
+                members.append(_row(n, "resigned", None, "퇴사", team, grade, **_kw))
             else:
-                members.append(_row(n, "leave", None, "휴직", team, grade))
+                members.append(_row(n, "leave", None, "휴직", team, grade, **_kw))
         else:
-            members.append(_row(n, "active", None, None, team, grade))
+            members.append(_row(n, "active", None, None, team, grade, **_kw))
 
     # [Perf] inbound 도 nurse_id IN 배치 1쿼리 (간호사별 NurseModel 재조회 제거)
     _inbound_ids = [nid for nid in inbound if nid not in seen]
@@ -1129,19 +1196,27 @@ def group_members_in_month(
         # team SSOT = nurse_team_period. inbound 도 period 만 본다(target_team_id 미사용 — 팀 이행 완료).
         # period 가 그 달을 덮으면 그 팀, 없으면 None(미배정). 팀설정 변경이 곧바로 반영된다.
         team = _resolved_team(nid, n)
-        grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
-        # 파견지 유효 근무형태(target_shift_types) — N전담 배지 판정용. []=전체(비N전담), 엔진/`/nurses`와 동일.
-        _np = a.target_shift_types or []
+        if a.reason == "파견":
+            # 파견 = 임시 overlay(영구 속성 아님, period 미관여) → dispatch 프로필(target_*) 사용.
+            grade = a.target_grade if a.target_grade is not None else getattr(n, "grade", None)
+            _np = a.target_shift_types or []
+            _fx = a.target_fixed_shift if a.target_fixed_shift is not None else getattr(n, "fixed_shift", None)
+        else:
+            # 병동이동(영구) = period as-of (조회 그룹=target group). assignment.target_* 미사용.
+            grade = _asof_grade(nid, n)
+            _np = _asof_night(nid, n)
+            _fx = _asof_fixed(nid, n)
+        _kw = dict(night_profile=_np, fixed_shift=_fx)
         if a.reason == "파견":
             # 파견(일시·복귀 예정) = 지속 상태 → 기간 내내 '파견' 배지(전이 아님, 마커 없음).
-            members.append(_row(n, "inbound", None, "파견", team, grade, night_profile=_np))
+            members.append(_row(n, "inbound", None, "파견", team, grade, **_kw))
         elif a.start_date is not None and month_start <= a.start_date <= month_end:
             # 병동이동 = 일회성 전이 → 이동月(start ∈ 그 달)에만 전입(→).
-            members.append(_row(n, "inbound", "→", None, team, grade, night_profile=_np))
+            members.append(_row(n, "inbound", "→", None, team, grade, **_kw))
         else:
             # 이미 이동 완료(지난 달 발효) → 정착 일반 멤버(마커 없음).
             #   캐시(nurses.group_id) flush 전이어도 그 병동 소속이므로 명단엔 포함한다.
-            members.append(_row(n, "active", None, None, team, grade, night_profile=_np))
+            members.append(_row(n, "active", None, None, team, grade, **_kw))
 
     headcount = {
         "regular": sum(1 for m in members if m["membership_status"] == "active"),
@@ -1408,6 +1483,26 @@ def reconcile_nurse_attrs(
     return result
 
 
+def _project_profile_period_to_cache(
+    db: Session, nurse: NurseModel, target_group_id: Optional[str], as_of: date,
+) -> None:
+    """발효 시 grade/allowed_shifts/fixed_shift 를 period(SSOT)→nurse 캐시로 투영.
+
+    assignment.target_* 대신 period 가 source. gap(그 시점 구간 없음) → 현재 캐시 유지(비회귀).
+    """
+    from datetime import timedelta as _td
+    from db.models import NurseGradePeriod, NurseAllowedShiftPeriod
+    from services.nurse_period_resolver import fetch_periods, resolve_asof
+    nid = str(nurse.nurse_id)
+    _nx = as_of + _td(days=1)
+    gp = fetch_periods(db, NurseGradePeriod, [nid], as_of, _nx, group_id=target_group_id)
+    nurse.grade = resolve_asof(gp.get(nid), as_of, "grade", default=nurse.grade)
+    ap = fetch_periods(db, NurseAllowedShiftPeriod, [nid], as_of, _nx)
+    nurse.allowed_shifts = resolve_asof(
+        ap.get(nid), as_of, "allowed_shifts", default=(nurse.allowed_shifts or []))
+    nurse.fixed_shift = resolve_asof(ap.get(nid), as_of, "fixed_shift", default=nurse.fixed_shift)
+
+
 def _apply_target_profile_reset(
     db: Session,
     nurse: NurseModel,
@@ -1418,10 +1513,8 @@ def _apply_target_profile_reset(
     프리셉터/프리셉티 비대칭도 함께 해제.
     Returns: 해제된 하위 프리셉티 수 (로깅용).
     """
-    nurse.grade = row.target_grade
-    nurse.fixed_shift = row.target_fixed_shift
-    # is_night_nurse는 네이밍과 달리 실제로 근무 가능 shift 타입 JSON list 저장용 컬럼임
-    nurse.is_night_nurse = row.target_shift_types if row.target_shift_types is not None else []
+    # grade/allowed_shifts/fixed_shift 는 period(SSOT)에서 투영(assignment.target_* 미사용).
+    _project_profile_period_to_cache(db, nurse, row.target_group_id, date.today())
     nurse.weekly_off_enabled = (
         row.target_weekly_off_enabled if row.target_weekly_off_enabled is not None else False
     )
@@ -1760,7 +1853,7 @@ def create_permanent_change(
     존재 이벤트(파견/병동이동)가 아니라 '속성 이벤트'다. 같은 병동 내 변경이므로
     source==target==group_id 이고, overlap·transfer 검증을 거치지 않는다.
     되돌리기를 위해 payload 에 직전 값을 박아둔다.
-    new_shift_types: is_night_nurse(허용 shift 목록). N전담 해제 시 [] 전달.
+    new_shift_types: allowed_shifts(허용 shift 목록). N전담 해제 시 [] 전달.
     release_preceptor: 프리셉티의 preceptor_id 를 비움(프리셉터십 공식 종료). 전용
       target 컬럼이 없어 payload 로 운반하고 flush 가 nurse.preceptor_id=None 적용.
     발효(start_date 도래)는 flush_pending_permanent_changes 가 처리한다.
@@ -1780,7 +1873,7 @@ def create_permanent_change(
     payload = {
         "prev_team_id": nurse.team_id,
         "prev_grade": nurse.grade,
-        "prev_shift_types": nurse.is_night_nurse,
+        "prev_shift_types": nurse.allowed_shifts,
     }
     if release_preceptor:
         payload["release_preceptor"] = True
@@ -1814,6 +1907,18 @@ def create_permanent_change(
             db, nurse_id=nurse_id, group_id=group_id, valid_from=start_date,
             team_id=new_team_id, source="permanent_change", note=note,
         )
+
+    # [속성 SSOT] grade/allowed_shifts 도 period 에 일원화(team 과 동일). 캐시 투영은 발효 flush 가.
+    #   assignment.target_* 는 더 이상 source 로 읽지 않는다(period 가 진실).
+    from db.models import NurseGradePeriod, NurseAllowedShiftPeriod
+    from services.nurse_period_resolver import upsert_period
+    if new_grade is not None:
+        upsert_period(db, NurseGradePeriod, nurse_id, start_date, "grade", new_grade,
+                      group_id=group_id, source="permanent_change")
+    if new_shift_types is not None:
+        upsert_period(db, NurseAllowedShiftPeriod, nurse_id, start_date, "allowed_shifts",
+                      new_shift_types or [], source="permanent_change", carry_attrs=["fixed_shift"])
+    db.commit()
 
     logger.info(
         "속성변경 등록: nurse_id=%s, team %s→%s, grade %s→%s, 발효=%s",
@@ -1850,11 +1955,8 @@ def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -
         if nurse:
             # [팀 절연] team 은 create_permanent_change 시점에 nurse_team_period(SSOT)에
             #   이미 기록됨. nurses.team_id 캐시는 더 이상 쓰지 않는다(컬럼 DROP 예정).
-            if row.target_grade is not None:
-                nurse.grade = row.target_grade
-            # target_shift_types 지정 시 is_night_nurse 갱신 (N전담 해제 = [] 등)
-            if row.target_shift_types is not None:
-                nurse.is_night_nurse = row.target_shift_types
+            # grade/allowed_shifts/fixed_shift 도 period(SSOT)에서 투영(assignment.target_* 미사용).
+            _project_profile_period_to_cache(db, nurse, row.target_group_id, today)
             # payload.release_preceptor → 프리셉터십 공식 종료 (preceptor_id 비움)
             if (row.payload or {}).get("release_preceptor"):
                 nurse.preceptor_id = None

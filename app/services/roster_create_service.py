@@ -57,19 +57,10 @@ logger = logging.getLogger(__name__)
 try:
     from services.random_sampling import generate_roster
     from services.cp_sat_basic import generate_roster_cp_sat
-    from services.cp_sat_main_v3 import generate_roster_cp_sat_main_v3
-    from services.cp_sat_main_v2 import generate_roster_cp_sat_main_v2
-    from services.cp_sat_adaptive import generate_roster_cp_sat_adaptive
     CPSAT_AVAILABLE = True
-    CPSAT_MAIN_V3_AVAILABLE = True
-    CPSAT_MAIN_V2_AVAILABLE = True
-    CPSAT_ADAPTIVE_AVAILABLE = True
 except ImportError as e:
     print(f"CP-SAT 엔진 import 실패: {e}")
     CPSAT_AVAILABLE = False
-    CPSAT_MAIN_V3_AVAILABLE = False
-    CPSAT_MAIN_V2_AVAILABLE = False
-    CPSAT_ADAPTIVE_AVAILABLE = False
 
 # ───────────────────────────── 공통 헬퍼 ─────────────────────────────
 
@@ -2482,10 +2473,44 @@ def _build_code_to_main_map(shift_manage_data: list[dict] | None) -> dict[str, s
     return code2main
 
 
+def _overlay_home_profile_asof(db, nurses, group_id, month_start) -> None:
+    """home 간호사 grade/weekend_off/fixed_shift 를 대상월 period as-of 로 __dict__ 오버레이.
+
+    생성기가 캐시(오늘값)가 아니라 '그 달 값'으로 돌도록 — allowed 가 per-day period 인 것과
+    동일 원칙. 미래월을 미리 생성해도 미래발효 변경이 반영된다.
+    - gap(그 달 구간 없음) → 캐시 유지(비회귀). 구간이 값 None 이면 그 None 을 적용(명시적 해제).
+    - fixed_shift 는 호출부에서 _split_fixed_nurses 이전에 적용해야 분기 정합(여기선 값만 주입).
+    - inbound 는 별도 경로(target_*/period)로 주입되므로 여기 대상 아님(home 만 전달할 것).
+    """
+    from datetime import timedelta as _td
+    from services.nurse_period_resolver import fetch_periods, resolve_asof
+    from db.models import NurseGradePeriod, NurseWeekendOffPeriod, NurseAllowedShiftPeriod
+    _SENT = object()
+    ids = [str(n.nurse_id) for n in nurses]
+    if not ids:
+        return
+    nx = month_start + _td(days=1)
+    gp = fetch_periods(db, NurseGradePeriod, ids, month_start, nx, group_id=group_id)
+    wp = fetch_periods(db, NurseWeekendOffPeriod, ids, month_start, nx)
+    ap = fetch_periods(db, NurseAllowedShiftPeriod, ids, month_start, nx)
+    for n in nurses:
+        nid = str(n.nurse_id)
+        d = n.__dict__
+        g = resolve_asof(gp.get(nid), month_start, "grade", default=_SENT)
+        if g is not _SENT:
+            d["grade"] = g
+        w = resolve_asof(wp.get(nid), month_start, "weekend_off", default=None)
+        if w is not None:
+            d["is_weekend_off"] = bool(w)
+        fx = resolve_asof(ap.get(nid), month_start, "fixed_shift", default=_SENT)
+        if fx is not _SENT:
+            d["fixed_shift"] = fx
+
+
 def _normalize_allowed_shift_types(raw_value: object, use_mid: bool = False) -> set[str]:
     if raw_value is None:
         return set()
-    # 레거시 타입은 무시(요구사항: 기존 is_night_nurse 의미는 무시)
+    # 레거시 타입은 무시(요구사항: 기존 allowed_shifts 의미는 무시)
     if isinstance(raw_value, (int, float, bool)):
         return set()
     if not isinstance(raw_value, list):
@@ -2531,6 +2556,7 @@ def build_allowed_shift_type_constraints(
     shift_manage_data: list[dict] | None,
     fixed_cells: list[dict] | None,
     use_mid: bool,
+    db=None,
 ) -> dict:
     """간호사별 허용 근무유형(D/E/N) 하드 제약을 forbidden 형태로 생성한다.
 
@@ -2560,7 +2586,7 @@ def build_allowed_shift_type_constraints(
         if not nurse_id:
             continue
         allowed = _normalize_allowed_shift_types(
-            getattr(n, "is_night_nurse", None),
+            getattr(n, "allowed_shifts", None),
             use_mid=bool(use_mid),
         )
         nurse_id_to_allowed[nurse_id] = allowed
@@ -2602,31 +2628,56 @@ def build_allowed_shift_type_constraints(
                     f"nurse_id={nurse_id}, days={day_list}"
                 )
 
+    # ── 일자별 허용 해석: NurseAllowedShiftPeriod(시점) 우선, gap이면 캐시 폴백 ──
+    # (P3) db 가 있으면 period 를 bulk fetch 해 day-grain 으로 금지셀을 만든다.
+    # 구간 없음(미backfill/gap)이면 nurses 캐시값으로 폴백 → 무회귀(기존 동작과 동일).
+    periods_by_nurse: dict[str, list] = {}
+    _resolve = None
+    if db is not None:
+        try:
+            from services.nurse_period_resolver import fetch_periods, resolve_asof as _resolve
+            from db.models import NurseAllowedShiftPeriod
+            month_end = date(year, month, days_in_month) + timedelta(days=1)
+            periods_by_nurse = fetch_periods(
+                db, NurseAllowedShiftPeriod,
+                list(nurse_id_to_allowed.keys()), month_start, month_end,
+            )
+        except Exception as exc:
+            print(f"[AllowedShiftTypes] period fetch 실패 → 캐시 폴백: {exc}")
+            periods_by_nurse, _resolve = {}, None
+
     forbidden: dict[str, dict[int, list[str]]] = {}
     all_codes = set(allowed_main_codes)
-    for nurse_id, allowed in nurse_id_to_allowed.items():
+    used_period = False
+    for nurse_id, cache_allowed in nurse_id_to_allowed.items():
         active_range = nurse_id_to_active_range.get(nurse_id)
         if not active_range:
             continue
         start_idx, end_idx = active_range
-        if not allowed:
-            continue  # 제한 없음
-        disallowed_set = set(all_codes - set(allowed))
-        disallowed = sorted(disallowed_set)
-        if not disallowed:
-            continue
-        day_map: dict[int, list[str]] = {}
         override_days = override_days_by_nurse.get(nurse_id, set())
+        rows = periods_by_nurse.get(nurse_id)
+        day_map: dict[int, list[str]] = {}
         for d in range(start_idx, end_idx + 1):
             if d in override_days:
                 continue
-            day_map[d] = disallowed
+            # period 우선(없으면 캐시). val=[] 는 '제한 없음', val=None 은 gap.
+            val = _resolve(rows, date(year, month, d + 1), "allowed_shifts", None) \
+                if (_resolve and rows) else None
+            if val is not None:
+                used_period = True
+            allowed_day = set(val) if val is not None else set(cache_allowed)
+            if not allowed_day:
+                continue  # 제한 없음
+            disallowed = sorted(all_codes - allowed_day)
+            if disallowed:
+                day_map[d] = disallowed
         if day_map:
             forbidden[nurse_id] = day_map
 
-    forb_cnt = sum(len(v) * len(next(iter(v.values()), [])) for v in forbidden.values())
+    forb_cnt = sum(len(codes) for v in forbidden.values() for codes in v.values())
     if forbidden:
-        print(f"[AllowedShiftTypes] 금지 셀(월 전체) 적용: nurses={len(forbidden)}, approx_cnt={forb_cnt}")
+        src = "period+캐시" if used_period else "캐시(월전체)"
+        print(f"[AllowedShiftTypes] 금지 셀 적용({src}): nurses={len(forbidden)}, cnt={forb_cnt}")
     return {"forced_off": {}, "forbidden": forbidden}
 
 
@@ -2796,6 +2847,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         shift_manage_data=shift_manage_data,
         fixed_cells=config_dict.get("fixed_cells"),
         use_mid=bool(config_dict.get("use_mid", False)),
+        db=db,
     )
 
     # ── 2) cross-month 경계 제약 생성 ──
@@ -3305,8 +3357,6 @@ def _collect_validator_evidence(
                 nu = nurses[n_idx]
                 allowed = set(str(x).upper() for x in (getattr(nu, "allowed_shifts", None) or []))
                 if allowed and code not in allowed:
-                    return False
-                if code in {"D", "E"} and bool(getattr(nu, "is_night_nurse", 0) == 3):
                     return False
             return True
 
@@ -4336,6 +4386,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         ]
         print(f"[RosterCreate] 비활성 간호사 엔진 제외: {excluded_names}")
     nurses_in_group = active_nurses_in_group
+    # [속성 SSOT] home 간호사 grade/weekend/fixed 를 대상월 period as-of 로 오버레이(캐시 대신 그 달 값).
+    #   fixed_shift 가 아래 _split_fixed_nurses 분기를 좌우하므로 split 이전에 적용한다.
+    #   inbound 는 하단에서 별도 as-of 주입 → 여기는 home(nurses_in_group) 만 대상.
+    try:
+        _overlay_home_profile_asof(
+            db, nurses_in_group, current_user.group_id, date(req.year, req.month, 1)
+        )
+    except Exception as _e_home_asof:
+        print(f"[PeriodAsOf][home] grade/weekend/fixed 오버레이 실패(캐시 유지로 진행): {_e_home_asof}")
     # _debug_log(
     #     "collect_done",
     #     {
@@ -4413,12 +4472,27 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 # team SSOT = nurse_team_period. 아래 resolve_team_for_roster 가 period 로 채운다
                 # (없으면 None=팀 미배정). target_team_id 는 더 이상 team 결정에 쓰지 않는다.
                 d['team_id'] = None
-                d['grade'] = _a.target_grade
                 d['weekly_off_enabled'] = bool(_a.target_weekly_off_enabled or 0)
                 d['weekly_off_type'] = _a.target_weekly_off_type
                 d['weekly_off_weekday'] = _a.target_weekly_off_weekday
-                d['is_night_nurse'] = _a.target_shift_types or []
-                d['fixed_shift'] = _a.target_fixed_shift
+                if _a.reason == "파견":
+                    # 파견 = 임시 overlay(period 미관여) → dispatch 프로필(target_*) 사용.
+                    d['grade'] = _a.target_grade
+                    d['allowed_shifts'] = _a.target_shift_types or []
+                    d['fixed_shift'] = _a.target_fixed_shift
+                else:
+                    # 병동이동(영구) = period as-of(target group=현 그룹). __dict__ 직접주입(영속화 회피).
+                    from services.nurse_period_resolver import fetch_periods as _fp, resolve_asof as _ra
+                    from db.models import NurseGradePeriod as _GP2, NurseAllowedShiftPeriod as _AP2
+                    _nid2 = str(n.nurse_id)
+                    _nx2 = month_start + timedelta(days=1)
+                    _g2 = _fp(db, _GP2, [_nid2], month_start, _nx2, group_id=current_user.group_id)
+                    d['grade'] = _ra(_g2.get(_nid2), month_start, "grade", default=getattr(n, "grade", None))
+                    _ap2 = _fp(db, _AP2, [_nid2], month_start, _nx2)
+                    d['allowed_shifts'] = _ra(_ap2.get(_nid2), month_start, "allowed_shifts",
+                                              default=(getattr(n, "allowed_shifts", None) or []))
+                    d['fixed_shift'] = _ra(_ap2.get(_nid2), month_start, "fixed_shift",
+                                           default=getattr(n, "fixed_shift", None))
         engine_nurses.extend(_inbound_nurses)
         nurses_in_group.extend(_inbound_nurses)
         print(
@@ -4498,7 +4572,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         # N전담(허용 shift=N뿐)은 팀 D/E 커버리지 로테이션에 참여 불가 → 미지정(team None).
         #   team_id=None 이면 team_constraints 가 자동 스킵 → 유령 멤버로 팀 인원/커버리지를
         #   부풀리지 않는다. 야간 수급은 글로벌(nig_req)이라 영향 없음.
-        if is_n_only_profile(getattr(_en, 'is_night_nurse', None)):
+        if is_n_only_profile(getattr(_en, 'allowed_shifts', None)):
             _en.__dict__['team_id'] = None
             continue
         _rt = resolve_team_for_roster(
@@ -5248,7 +5322,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         )
         _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
         # `n.__dict__` 은 SQLAlchemy 의 이미 로딩된 attr 만 담아서 team_id /
-        # is_night_nurse 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
+        # allowed_shifts 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
         # 풀에서 사용할 키를 모두 일관되게 채운다.
         _nurses_dict_for_precheck = [
             {
@@ -5256,7 +5330,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 "db_id": getattr(n, "nurse_id", None),
                 "team_id": getattr(n, "team_id", None),
                 "grade": getattr(n, "grade", None),
-                "is_night_nurse": getattr(n, "is_night_nurse", None),
+                "allowed_shifts": getattr(n, "allowed_shifts", None),
                 "work_shifts": getattr(n, "work_shifts", None),
                 "joining_date": getattr(n, "joining_date", None),
                 "resignation_date": getattr(n, "resignation_date", None),

@@ -52,7 +52,7 @@ def filter_nurses(
     group_id: str,
     *,
     grade: int | None = None,
-    is_night_nurse: bool | None = None,
+    night_only: bool | None = None,
     team_id: int | None = None,
     has_preceptor: bool | None = None,
     joined_after: str | None = None,
@@ -81,18 +81,18 @@ def filter_nurses(
         q = q.filter(Nurse.joining_date <= joined_before)
     rows = q.order_by(Nurse.sequence).all()
     result = [_nurse_summary(r) for r in rows]
-    if is_night_nurse is not None:
-        # is_night_nurse is JSON list; filter in Python
+    if night_only is not None:
+        # N전담 = allowed_shifts == ["N"] (리스트 기준). Python 측 필터.
         result = [
             n for n in result
-            if bool(n.get("is_night_nurse")) == is_night_nurse
+            if ((n.get("allowed_shifts") or []) == ["N"]) == night_only
         ]
     return result
 
 
 UPDATABLE_FIELDS = {
     "grade", "experience", "role",
-    "is_head_nurse", "is_night_nurse",
+    "is_head_nurse", "allowed_shifts",
     "preceptor_id", "fixed_shift",
     "is_weekend_off", "nurse_memo",
     "enable_aide", "wanted_max_requests",
@@ -171,7 +171,7 @@ def _coerce_shift_code(raw) -> str | None:
     return None
 
 
-def _normalize_is_night_nurse(value) -> list[str] | None:
+def _normalize_allowed_shifts(value) -> list[str] | None:
     """Normalize various inputs to a list of valid shift codes.
 
     Returns None if input is uninterpretable.
@@ -194,7 +194,7 @@ def _normalize_is_night_nurse(value) -> list[str] | None:
                 if p.strip().strip("'\"")
             ]
             if len(parts) > 1:
-                return _normalize_is_night_nurse(parts)
+                return _normalize_allowed_shifts(parts)
             value = parts[0] if parts else ""
         coerced = _coerce_shift_code(value)
         if coerced is None:
@@ -246,11 +246,11 @@ def _coerce_int(value):
 
 def _normalize_value(field: str, value):
     """Normalize value per field. Returns (normalized, error_msg)."""
-    if field == "is_night_nurse":
-        norm = _normalize_is_night_nurse(value)
+    if field == "allowed_shifts":
+        norm = _normalize_allowed_shifts(value)
         if norm is None:
             return None, (
-                f"is_night_nurse 값 '{value}'을(를) 해석할 수 없습니다. "
+                f"allowed_shifts 값 '{value}'을(를) 해석할 수 없습니다. "
                 "예: ['N'](야간 전담), ['D'](데이 전담), ['D','E'](N 제외), [](해제)."
             )
         return norm, None
@@ -492,7 +492,48 @@ def update_nurse_attributes_batch(
         .first()
     )
     for f, v in cs["changed_fields"].items():
-        setattr(nurse, f, v)
+        if f == "allowed_shifts":
+            # 허용 근무형 → nurse_allowed_shift_period 일원화. 컬럼은 단방향 투영(직접쓰기 금지).
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, nurse.nurse_id, _date.today(),
+                "allowed_shifts", v if isinstance(v, list) else [],
+                nurse=nurse, cache_attr="allowed_shifts", source="edited",
+            )
+        elif f == "grade":
+            # grade → nurse_grade_period 일원화(병동귀속). 컬럼은 단방향 투영(직접쓰기 금지).
+            from datetime import date as _date
+            from db.models import NurseGradePeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseGradePeriod, nurse.nurse_id, _date.today(),
+                "grade", v, group_id=group_id,
+                nurse=nurse, cache_attr="grade", source="edited",
+            )
+        elif f == "fixed_shift":
+            # 고정 근무형 → nurse_allowed_shift_period(통합 satellite)의 fixed_shift 컬럼.
+            from datetime import date as _date
+            from db.models import NurseAllowedShiftPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseAllowedShiftPeriod, nurse.nurse_id, _date.today(),
+                "fixed_shift", v, nurse=nurse, cache_attr="fixed_shift",
+                carry_attrs=["allowed_shifts"], source="edited",
+            )
+        elif f == "is_weekend_off":
+            # 주말휴무 → nurse_weekendoff_period. 컬럼은 단방향 투영(직접쓰기 금지).
+            from datetime import date as _date
+            from db.models import NurseWeekendOffPeriod
+            from services.nurse_period_resolver import upsert_period
+            upsert_period(
+                db, NurseWeekendOffPeriod, nurse.nurse_id, _date.today(),
+                "weekend_off", 1 if v else 0,
+                nurse=nurse, cache_attr="is_weekend_off", source="edited",
+            )
+        else:
+            setattr(nurse, f, v)
     db.commit()
     db.refresh(nurse)
 
@@ -531,7 +572,7 @@ def _nurse_summary(r: Nurse) -> dict:
         "role": r.role,
         "team_id": r.team_id,
         "is_head_nurse": bool(r.is_head_nurse),
-        "is_night_nurse": r.is_night_nurse,
+        "allowed_shifts": r.allowed_shifts,
         "preceptor_id": r.preceptor_id,
         "fixed_shift": r.fixed_shift,
         "is_weekend_off": bool(r.is_weekend_off),

@@ -781,7 +781,7 @@ class CPSATBasicEngine:
                 'is_head_nurse': nurse_data.get('is_head_nurse', False),
                 # 주말 고정 휴무(True)이면 토/일은 OFF('O')만 허용(하드 제약은 모델 빌더에서 적용)
                 'is_weekend_off': bool(nurse_data.get('is_weekend_off', False)),
-                'is_night_nurse': nurse_data.get('is_night_nurse', 0),
+                'allowed_shifts': nurse_data.get('allowed_shifts', 0),
                 'personal_off_adjustment': nurse_data.get('personal_off_adjustment', 0),
                 'remaining_off_days': 0,  # 초기화, 나중에 계산됨
                 'joining_date': _to_date(nurse_data.get('joining_date')),
@@ -3274,7 +3274,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 _nu = rs.nurses[n] if n < len(rs.nurses) else None
                 if _nu is not None and bool(getattr(_nu, "is_weekend_off", False)):
                     continue
-                _raw_nn = getattr(_nu, "is_night_nurse", None) if _nu is not None else None
+                _raw_nn = getattr(_nu, "allowed_shifts", None) if _nu is not None else None
                 if isinstance(_raw_nn, (set, list, tuple)) and set(_raw_nn) == {"N"}:
                     continue
             # off_first=False 경로의 OFF cap 식과 동일한 도메인:
@@ -3722,7 +3722,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
 
         # Night-전담 (레거시 + 새로운 방식 모두 고려)
         is_n_only = False
-        raw = getattr(nu, "is_night_nurse", None)
+        raw = getattr(nu, "allowed_shifts", None)
         allowed = _allowed_shift_codes(raw)
         if allowed:
             is_n_only = allowed == {"N"}
@@ -4848,7 +4848,7 @@ def _log_infeasible_n_capacity(rs, join: list[int], leave: list[int], fixed: dic
                     if fixed_shift == night_idx:
                         cap += 1
                     continue
-                raw = getattr(rs.nurses[n], "is_night_nurse", None)
+                raw = getattr(rs.nurses[n], "allowed_shifts", None)
                 if isinstance(raw, list):
                     allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
                     if allowed and "N" not in allowed:

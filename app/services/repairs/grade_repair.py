@@ -312,7 +312,7 @@ def _compute_feasible_targets(
 
 def _is_night_only(nurse) -> bool:
     """N 전담 여부. 리스트 ['N'] 또는 레거시 3과 동일하게 판별."""
-    raw = getattr(nurse, "is_night_nurse", None)
+    raw = getattr(nurse, "allowed_shifts", None)
     if isinstance(raw, list):
         allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
         return allowed == {"N"}

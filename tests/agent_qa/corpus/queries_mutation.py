@@ -73,7 +73,7 @@ MUTATION_QUERIES: list[dict] = [
         "query": "김민지 야간 전담으로 바꿔줘",
         "expected_skill": "update_person_attr",
         "expected_action": None,
-        "expected_field_or_scope": "is_night_nurse",
+        "expected_field_or_scope": "allowed_shifts",
         "expected_params_subset": {},
         "sensitivity": "high",
         "category": "person_attr",

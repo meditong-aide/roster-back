@@ -13,14 +13,14 @@
 
 ## 1. 테이블 목록
 
-| 테이블 | 값 컬럼 | group_id | 솔버 경로 | 상태 |
-|---|---|---|---|---|
-| `nurse_team_period` | team_id INT | ✅ | per-day team min | 있음 |
-| `nurse_grade_period` | grade INT | ✅ (병동귀속) | grade min hard→soft | **신규** |
-| `nurse_allowed_shift_period` | allowed_shifts JSON | ✗ | **forbidden 셀**(가동중) | **신규** |
-| `nurse_weekendoff_period` | weekend_off TINYINT | ✗ | 주휴 고정셀 + weekday rotation | **신규** |
-| `nurse_fixedshift_period` | fixed_shift VARCHAR(20) | ✗ | fixed 셀 빌드 | **신규** |
-| `nurse_monthly_limits` | d/e/n min·max·exact | ✅ | 월 단위 | 있음 |
+| 테이블                          | 값 컬럼                    | group_id | 솔버 경로                     | 상태     |
+| ---------------------------- | ----------------------- | -------- | ------------------------- | ------ |
+| `nurse_team_period`          | team_id INT             | ✅        | per-day team min          | 있음     |
+| `nurse_grade_period`         | grade INT               | ✅ (병동귀속) | grade min hard→soft       | **신규** |
+| `nurse_allowed_shift_period` | allowed_shifts JSON     | ✗        | **forbidden 셀**(가동중)      | **신규** |
+| `nurse_weekendoff_period`    | weekend_off TINYINT     | ✗        | 주휴 고정셀 + weekday rotation | **신규** |
+| `nurse_fixedshift_period`    | fixed_shift VARCHAR(20) | ✗        | fixed 셀 빌드                | **신규** |
+| `nurse_monthly_limits`       | d/e/n min·max·exact     | ✅        | 월 단위                      | 있음     |
 
 신규 **4개**.
 

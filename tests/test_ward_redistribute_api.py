@@ -33,7 +33,7 @@ def _user(*, group_id="A", is_head_nurse=True, is_master_admin=False):
 
 def _mk_nurse(db, nid, gid, grade):
     db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id=gid, office_id="o1",
-                 name=nid, active=1, team_id=1, grade=grade, is_night_nurse=[]))
+                 name=nid, active=1, team_id=1, grade=grade, allowed_shifts=[]))
 
 
 @pytest.fixture

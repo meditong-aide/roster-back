@@ -21,7 +21,7 @@ from services.assignment_service import group_members_in_month
 
 def _nurse(db, nid, gid, team=1, grade=1):
     db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id=gid, office_id="o1",
-                 name=nid, active=1, team_id=team, grade=grade, is_night_nurse=[]))
+                 name=nid, active=1, team_id=team, grade=grade, allowed_shifts=[]))
 
 
 def _asg(db, nid, reason, src, tgt, start):
@@ -107,33 +107,33 @@ def test_dispatch_out_badge_persists_across_months(seeded):
         assert by_id["dispatch1"]["badge"] == "파견 중"
 
 
-def test_night_dedicated_is_unassigned(db):
-    """N전담(is_night_nurse=['N'])은 as_of_team=None + 'N전담' 배지 + is_night_dedicated=True."""
+def test_night_dedicated_keeps_team(db):
+    """N전담(allowed_shifts=['N'])도 팀 소속 가능(정책 변경) → as_of_team=팀 유지 + 'N전담' 배지."""
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="reg", account_id="acc_reg", group_id="A", office_id="o1",
-                 name="일반", active=1, team_id=1, grade=1, is_night_nurse=[]))
+                 name="일반", active=1, team_id=1, grade=1, allowed_shifts=[]))
     db.add(Nurse(nurse_id="night", account_id="acc_night", group_id="A", office_id="o1",
-                 name="야간", active=1, team_id=2, grade=2, is_night_nurse=["N"]))
+                 name="야간", active=1, team_id=2, grade=2, allowed_shifts=["N"]))
     db.flush()
     by_id = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
     assert by_id["night"]["is_night_dedicated"] is True
-    assert by_id["night"]["as_of_team"] is None
+    assert by_id["night"]["as_of_team"] == 2     # 팀 소속 유지(None 강제 안 함)
     assert by_id["night"]["badge"] == "N전담"
     assert by_id["reg"]["is_night_dedicated"] is False
     assert by_id["reg"]["as_of_team"] == 1
 
 
 def test_night_dedicated_robust_string_form(db):
-    """is_night_nurse 가 문자열 '[\"N\"]'(MSSQL JSON-as-string)이어도 N전담 인식."""
+    """allowed_shifts 가 문자열 '[\"N\"]'(MSSQL JSON-as-string)이어도 N전담 인식."""
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="night2", account_id="acc_n2", group_id="A", office_id="o1",
-                 name="야간2", active=1, team_id=1, grade=2, is_night_nurse='["N"]'))
+                 name="야간2", active=1, team_id=1, grade=2, allowed_shifts='["N"]'))
     db.flush()
     by_id = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
     assert by_id["night2"]["is_night_dedicated"] is True
-    assert by_id["night2"]["as_of_team"] is None
+    assert by_id["night2"]["as_of_team"] == 1    # N전담도 팀 소속 유지(정책 변경)
 
 
 def test_as_of_team_uses_period_over_cache(db):
