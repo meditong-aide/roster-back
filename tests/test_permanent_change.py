@@ -13,6 +13,7 @@ import pytest
 from fastapi import HTTPException
 
 from db.models import Group, Nurse, NurseAssignment, Office
+from services.team_period import resolve_team  # team SSOT=nurse_team_period (캐시 team_id 폐기)
 from services.assignment_service import (
     create_permanent_change,
     flush_pending_permanent_changes,
@@ -75,7 +76,8 @@ def test_flush_on_effective_date_applies(seed):
     n = flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
     assert n == 1
     nurse = db.query(Nurse).filter(Nurse.nurse_id == "n1").first()
-    assert nurse.team_id == 3 and nurse.grade == 1
+    # team SSOT=nurse_team_period (캐시 nurses.team_id 는 더 이상 투영 안 함). grade 는 캐시 유지.
+    assert resolve_team(db, "n1", "A", date(2026, 8, 1)) == 3 and nurse.grade == 1
     row = db.query(NurseAssignment).filter(NurseAssignment.nurse_id == "n1").first()
     assert row.status == "completed" and row.end_date == date(2026, 8, 1)
 
@@ -88,7 +90,7 @@ def test_flush_none_attr_not_overwritten(seed):
     )
     flush_pending_permanent_changes(db, as_of=date(2026, 8, 1))
     nurse = db.query(Nurse).filter(Nurse.nurse_id == "n1").first()
-    assert nurse.team_id == 3
+    assert resolve_team(db, "n1", "A", date(2026, 8, 1)) == 3  # team SSOT=period
     assert nurse.grade == 2  # grade 는 target None → 미변경
 
 

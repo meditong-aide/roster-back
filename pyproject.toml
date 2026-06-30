@@ -35,3 +35,10 @@ dependencies = [
     "redis>=5.0.0",
     "fakeredis>=2.20.0",
 ]
+
+[tool.pytest.ini_options]
+# 실제 테스트는 tests/ 에만 둔다. app/ 의 test_*.py 는 테스트가 아니라 앱 모듈이다:
+#   - app/agents_v2/test_chat_router.py : /agent/test 챗 UI 라우터(핸들러명이 test_*)
+#   - app/test_server.py                : dev 실행 스크립트
+# bare `pytest` 가 이들을 테스트로 오수집(async 핸들러→"async 미지원" 등)하던 것을 차단.
+testpaths = ["tests"]
