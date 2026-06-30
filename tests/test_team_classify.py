@@ -111,9 +111,9 @@ def test_flush_applies_team_changes(ward):
     assert n == pv["num_changed"]
     # 발효 후 실제 team_id 가 제안과 일치
     proposed = {nid: int(t) for t, members in pv["teams"].items() for nid in members}
+    from services.team_period import resolve_team  # team SSOT=nurse_team_period (캐시 team_id 폐기)
     for nid, tid in proposed.items():
-        nurse = db.query(Nurse).filter(Nurse.nurse_id == nid).first()
-        assert nurse.team_id == tid
+        assert resolve_team(db, nid, "A", date(2026, 8, 1)) == tid
 
 
 def test_apply_records_team_period_before_flush(ward):
