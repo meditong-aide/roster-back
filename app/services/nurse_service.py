@@ -220,6 +220,7 @@ _MEMBER_BADGE_FIELDS: Tuple[str, ...] = (
     "as_of_allowed_shifts",
     "as_of_weekend_off",
     "as_of_fixed_shift",
+    "as_of_preceptor",
 )
 
 
@@ -266,6 +267,7 @@ def attach_member_badges_to_nurses(
             n["allowed_shifts"] = _aon
         n["fixed_shift"] = member.get("as_of_fixed_shift")
         n["is_weekend_off"] = bool(member.get("as_of_weekend_off"))
+        n["preceptor_id"] = member.get("as_of_preceptor")  # 월 as-of 프리셉터(종료월=None=관계 해제)
         # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
         # display_group_id = 이 membership 이 표시되는 기준 그룹(조회/선택 그룹).
         n["membership"] = {
@@ -277,6 +279,17 @@ def attach_member_badges_to_nurses(
             "is_night_dedicated": member.get("is_night_dedicated"),
             "display_group_id": group_id,
         }
+    # 역방향 일관성: 프리셉터의 preceptees 목록도 월 as-of 로 필터(종료된 관계 제외).
+    #   forward(preceptor_id)와 동일 SSOT(nurse_preceptee_period) — 공통 헬퍼 재사용.
+    from datetime import date as _date
+    from services.preceptee_period import resolve_preceptees_asof
+    _ms = _date(int(year), int(month), 1)
+    _all_ids = [str(n.get("nurse_id")) for n in nurses if isinstance(n, dict)]
+    _pte_asof = resolve_preceptees_asof(db, _all_ids, _ms)
+    for n in nurses:
+        if isinstance(n, dict) and isinstance(n.get("preceptees"), list) and n["preceptees"]:
+            _act = set(_pte_asof.get(str(n.get("nurse_id")), []))
+            n["preceptees"] = [p for p in n["preceptees"] if str(p.get("nurse_id")) in _act]
     return nurses
 
 

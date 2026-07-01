@@ -1102,6 +1102,11 @@ def group_members_in_month(
     _grade_periods = _fetch_periods(db, _NGP, _period_ids, month_start, _asof_next, group_id=group_id)
     _allowed_periods = _fetch_periods(db, _NASP, _period_ids, month_start, _asof_next)
     _weekend_periods = _fetch_periods(db, _NWOP, _period_ids, month_start, _asof_next)
+    # [Perf] preceptor(프리셉티→프리셉터) 도 월 as-of 배치 해석 (grade/team 과 동일 원칙).
+    #   nurse_preceptee_period SSOT 를 month_start 시점으로 해석 — 공통 헬퍼 재사용.
+    #   gap(그 달 관계 없음)→None → _row 에서 캐시 폴백 없이 그대로(해제 표시).
+    from services.preceptee_period import resolve_preceptor_asof as _resolve_pre_asof
+    _preceptor_asof = _resolve_pre_asof(db, _period_ids, month_start)
 
     def _asof_grade(nid: str, n_obj):
         v = _resolve_asof(_grade_periods.get(nid), month_start, "grade", default=None)
@@ -1144,6 +1149,7 @@ def group_members_in_month(
             "as_of_allowed_shifts": _np,   # 월 as-of 전담 프로필(raw, /nurses base 덮어쓰기용)
             "as_of_weekend_off": _wo,
             "as_of_fixed_shift": _fx,
+            "as_of_preceptor": _preceptor_asof.get(str(n.nurse_id)),  # 월 as-of 프리셉터(종료월엔 None)
         }
 
     members: list[dict] = []
