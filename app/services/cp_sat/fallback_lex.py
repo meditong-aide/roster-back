@@ -789,7 +789,9 @@ def optimize_fallback_lex_hard_first(
             _fixed_pattern = _fixed_pattern_from_source(_fixed_source)
             if (n, d) not in active_days:
                 continue
-            if _is_preceptee_at(n):
+            # day-aware: 팔로우 day의 프리셉티 고정셀만 스킵(팔로우가 지배). primary(cp_sat_basic:3089)와 동일.
+            # day-less 는 authoritative 에서 항상 False→고정셀이 hard로 적용돼 팔로우와 모순(INFEASIBLE) 유발.
+            if _is_preceptee_at(n, d):
                 continue
             _fixed_expr = (X(n, d, s_idx) == 1)
             if _assume_registry_fb is not None and _add_hard_fb is not None:
@@ -1173,12 +1175,19 @@ def optimize_fallback_lex_hard_first(
         # 프리셉티 팔로우 제약 (fallback) — assignment 기간 내에만 적용
         if preceptee_follow and preceptee_indices:
             _fb_id_map = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+            _fb_pre_ptr_idx = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
             for n in sorted(preceptee_indices):
                 nu = roster_system.nurses[n]
-                pid = getattr(nu, 'preceptor_id', None)
-                if not pid or pid not in _fb_id_map:
-                    continue
-                p = _fb_id_map[pid]
+                # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티도 solve 반영).
+                if _has_preceptee_period:
+                    p = _fb_pre_ptr_idx.get(n)
+                    if p is None:
+                        continue
+                else:
+                    pid = getattr(nu, 'preceptor_id', None)
+                    if not pid or pid not in _fb_id_map:
+                        continue
+                    p = _fb_id_map[pid]
                 d_start = max(join[n], join[p])
                 d_end = min(leave[n], leave[p])
                 for d in range(d_start, d_end + 1):
@@ -3338,11 +3347,18 @@ def optimize_fallback_lex_hard_first(
         synced = 0
         special_converted = 0
         _fb_fw_restored = 0
+        _fb_pre_ptr_idx2 = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
         for pte_idx in preceptee_indices:
-            pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
-            if not pid or pid not in _fb_id_to_idx:
-                continue
-            ptr_idx = _fb_id_to_idx[pid]
+            # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티 누락 방지).
+            if _has_preceptee_period:
+                ptr_idx = _fb_pre_ptr_idx2.get(pte_idx)
+                if ptr_idx is None:
+                    continue
+            else:
+                pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
+                if not pid or pid not in _fb_id_to_idx:
+                    continue
+                ptr_idx = _fb_id_to_idx[pid]
             # 권위 모드면 nurse_preceptee_period 기간 내 day만, 폴백이면 전체월 복사.
             _fb_follow = preceptee_follow_days.get(pte_idx)
             _fb_days_iter = (sorted(_fb_follow) if (_has_preceptee_period and _fb_follow)

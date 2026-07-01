@@ -3044,7 +3044,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                         ),
                         "forced_grade_soft_fallback": bool(config_dict.get("_force_grade_max_soft_fallback")),
                         "config_flags": {
-                            "preceptee_on": bool(config_dict.get("preceptee_on", False)),
+                            "preceptee_on": bool(config_dict.get("preceptee_on", True)),
                             "preceptee_shift_count": bool(config_dict.get("preceptee_shift_count", True)),
                             "use_mid": bool(config_dict.get("use_mid", False)),
                             "off_first": bool(config_dict.get("off_first", False)),
@@ -4936,7 +4936,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     # 프리셉티는 프리셉터를 100% 팔로우하므로 별도 주휴 고정 셀이 불필요.
     # 고정 셀이 있으면 result_mapping에서 fixed_lookup이 우선하여 "주" 코드가 그대로 노출됨.
     # → 프리셉티를 weekly_off_map에서 제거하여 고정 셀 미생성 + 팔로우 동기화로 OFF 처리.
-    if config_dict.get('preceptee_on', False):
+    if config_dict.get('preceptee_on', True):
         for nurse in nurses_for_engine:
             nid = str(nurse.nurse_id)
             pid = getattr(nurse, 'preceptor_id', None)
@@ -5089,7 +5089,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             f"하드 고정={len(fw_fixed_cells)}건 {dict(_fw_code_counts)}, "
             f"스킵(특수코드 중복={_fw_skip_special}, 엔진 미포함 간호사={_fw_skip_nurse}, 활동범위 밖={_fw_skip_range})"
         )
-        _preceptee_on_val = config_dict.get("preceptee_on", False)
+        # 정책(사용자 지시): preceptee 팔로우 기본 활성. 값 없으면 True (우발적 False 방지).
+        _preceptee_on_val = config_dict.get("preceptee_on", True)
         print(
             f"[RosterCreate] 프리셉티 fixed_wanted 맵 구성 조건: preceptee_on={_preceptee_on_val}, all_fixed_entries={len(all_fixed_entries)}건"
         )

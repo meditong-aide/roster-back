@@ -587,7 +587,9 @@ class CPSATBasicEngine:
             preceptor_top_days=config_data.get('preceptor_top_days', 12),
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
-            preceptee_on=bool(config_data.get('preceptee_on', False)),
+            # 정책(사용자 지시): preceptee 팔로우는 기본 활성. config에 값이 없으면 True로 처리
+            # (미설정/만료로 인한 우발적 False 방지). 명시적 False는 그대로 유지됨.
+            preceptee_on=bool(config_data.get('preceptee_on', True)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
             use_mid=bool(config_data.get('use_mid', False)),
             # team_balance_* 는 DB 의 team_balance_enable / team_balance_gauge 를 그대로 따른다.
@@ -1506,7 +1508,7 @@ class CPSATBasicEngine:
         # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
         # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
         #       프리셉터의 특수코드(법,생,휴 등 원티드) → 프리셉티는 OFF
-        preceptee_follow = bool(getattr(roster_system.config, 'preceptee_on', False))
+        preceptee_follow = bool(getattr(roster_system.config, 'preceptee_on', True))
         if preceptee_follow and hasattr(roster_system, 'nurses'):
             _shift_types = roster_system.config.shift_types
             _off_s_idx = _shift_types.index('O') if 'O' in _shift_types else None
@@ -1520,11 +1522,19 @@ class CPSATBasicEngine:
             _fw_restored = 0
             _pp_follow_days = getattr(roster_system, 'preceptee_follow_days', {}) or {}
             _has_pte_map = bool(getattr(roster_system, "preceptee_period_authoritative", False))  # 권위 vs 폴백
+            _pp_ptr_idx = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT: 프리셉티 idx→프리셉터 idx
             for n, nu in enumerate(roster_system.nurses):
-                pid = getattr(nu, 'preceptor_id', None)
-                if not pid or pid not in id_to_idx:
-                    continue
-                ptr_idx = id_to_idx[pid]
+                # 권위 모드: period SSOT(preceptee_preceptor_idx)로 프리셉터 결정. 캐시(preceptor_id)는
+                # period-native 프리셉티에서 NULL 이라 여기서 스킵되던 팔로우 누락 버그 수정. 폴백만 캐시 사용.
+                if _has_pte_map:
+                    ptr_idx = _pp_ptr_idx.get(n)
+                    if ptr_idx is None:
+                        continue
+                else:
+                    pid = getattr(nu, 'preceptor_id', None)
+                    if not pid or pid not in id_to_idx:
+                        continue
+                    ptr_idx = id_to_idx[pid]
                 # 1단계: 프리셉터 roster 복사 (nurse_preceptee_period 기간 제한)
                 _follow_set = _pp_follow_days.get(n)
                 if _has_pte_map:
@@ -1844,15 +1854,22 @@ class CPSATBasicEngine:
             _pte_fw_raw_final = _preceptee_fixed_wanted_map_raw
             _pte_fw_norm_final = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
             _pp_fw_final = getattr(roster_system, 'preceptee_follow_days', {}) or {}
+            _pp_ptr_idx_final = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}
+            _auth_final = bool(getattr(roster_system, 'preceptee_period_authoritative', False))
             for nu in nurses:
-                _pid_f = getattr(nu, 'preceptor_id', None)
+                _n_final = _id2i_final.get(nu.db_id)
+                # 권위 모드: period SSOT 로 프리셉터 db_id 결정(캐시 미사용 — NULL 캐시 프리셉티 누락 방지).
+                if _auth_final:
+                    _ptr_i_f = _pp_ptr_idx_final.get(_n_final) if _n_final is not None else None
+                    _pid_f = nurses[_ptr_i_f].db_id if _ptr_i_f is not None else None
+                else:
+                    _pid_f = getattr(nu, 'preceptor_id', None)
                 if not _pid_f or _pid_f not in _id2i_final:
                     continue
                 ptr_sched = result.get(_pid_f, [])
                 pte_sched = result.get(nu.db_id, [])
                 if not ptr_sched or not pte_sched:
                     continue
-                _n_final = _id2i_final.get(nu.db_id)
                 _final_follow_set = _pp_fw_final.get(_n_final) if _n_final is not None else None
                 # 권위 모드(period 백필됨): 맵에 없는(종료/미겹침) 프리셉티는 동기화 안 함.
                 # 캐시(preceptor_id) 잔존을 무시 — 기간 종료 후 follow 누수 차단.
@@ -3080,13 +3097,21 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
           f"preceptee_follow={preceptee_follow}, preceptee_indices={len(preceptee_indices)}명")
     if preceptee_follow and preceptee_indices:
         id_to_idx = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
+        _pre_ptr_idx = getattr(rs, 'preceptee_preceptor_idx', {}) or {}  # period SSOT: 프리셉티 idx→프리셉터 idx
         constraint_count = 0
         for n in sorted(preceptee_indices):
             nu = rs.nurses[n]
-            pid = getattr(nu, 'preceptor_id', None)
-            if not pid or pid not in id_to_idx:
-                continue
-            p = id_to_idx[pid]
+            # 권위 모드: period SSOT 로 프리셉터 결정 — 캐시(preceptor_id)가 NULL 인 period-native
+            # 프리셉티도 solve 단계에서 follow 반영(누락 시 후처리 덮어쓰기로 커버리지 붕괴 방지).
+            if _has_preceptee_period:
+                p = _pre_ptr_idx.get(n)
+                if p is None:
+                    continue
+            else:
+                pid = getattr(nu, 'preceptor_id', None)
+                if not pid or pid not in id_to_idx:
+                    continue
+                p = id_to_idx[pid]
             preceptor_nurse = rs.nurses[p]
             d_start = max(join[n], join[p])
             d_end = min(leave[n], leave[p])

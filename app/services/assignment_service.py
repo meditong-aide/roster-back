@@ -1722,6 +1722,24 @@ def flush_expired_preceptees(db: Session) -> int:
             )
             nurse.preceptor_id = None
 
+        # period SSOT 종료(write-through). 캐시만 지우고 nurse_preceptee_period 를 안 닫으면
+        # 생성기가 stale open period 를 읽어 '종료된 프리셉티'를 계속 팔로우함
+        # (2026-07 중환자실1 6쌍 회귀의 원인). close 실패는 로깅만 하고 flush 는 계속.
+        try:
+            from services.preceptee_period import close_preceptee_period, end_date_to_valid_to
+            close_preceptee_period(
+                db,
+                nurse_id=row.nurse_id,
+                close_date=end_date_to_valid_to(row.expected_end_date) or today,
+                end_reason="completed",
+                nurse=nurse,
+            )
+        except Exception as _pp_exc:
+            logger.error(
+                "[Scheduler] 프리셉티 period 종료 write-through 실패: nurse_id=%s, %s",
+                row.nurse_id, _pp_exc, exc_info=True,
+            )
+
         row.status = "completed"
         row.end_date = row.expected_end_date
         count += 1
@@ -1783,6 +1801,16 @@ def flush_orphan_preceptee_assignments(db: Session) -> int:
         row.status = "cancelled"
         if row.end_date is None:
             row.end_date = today
+        # period SSOT 도 함께 닫는다(비대칭 정리 시 nurse_preceptee_period 잔존 방지 —
+        # 생성기가 stale open period 를 읽어 취소된 프리셉티를 팔로우하는 회귀 차단).
+        try:
+            from services.preceptee_period import close_preceptee_period
+            close_preceptee_period(db, nurse_id=row.nurse_id, close_date=today, end_reason="cancelled")
+        except Exception as _pp_exc:
+            logger.error(
+                "[Lazy] orphan 프리셉티 period 종료 실패: nurse_id=%s, %s",
+                row.nurse_id, _pp_exc, exc_info=True,
+            )
     db.commit()
     logger.info("[Lazy] orphan 프리셉티 assignment 정리: %d건", len(rows))
     return len(rows)
