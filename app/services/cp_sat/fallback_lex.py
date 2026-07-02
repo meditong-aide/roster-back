@@ -1176,6 +1176,11 @@ def optimize_fallback_lex_hard_first(
         if preceptee_follow and preceptee_indices:
             _fb_id_map = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
             _fb_pre_ptr_idx = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
+            # Option C: 프리셉티 1급 시민화 — 등가는 (a)프리셉티 fixed일 제외 (b)프리셉터 특수코드일엔 OFF
+            _pte_std = {'D', 'E', 'N', 'O'} | ({'M'} if mid_idx is not None else set())
+            _pte_orig_map = getattr(roster_system, '_fixed_original_shift_map', {}) or {}
+            _pte_work_sub = {str(x).upper() for x in (getattr(roster_system, '_work_sub_ids', set()) or set())}
+            _pte_fw_map = getattr(roster_system, '_preceptee_fixed_wanted_map', {}) or {}
             for n in sorted(preceptee_indices):
                 nu = roster_system.nurses[n]
                 # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티도 solve 반영).
@@ -1193,12 +1198,42 @@ def optimize_fallback_lex_hard_first(
                 for d in range(d_start, d_end + 1):
                     if not _is_preceptee_at(n, d):
                         continue
+                    # (a) 프리셉티 fixed일: 등가 제외(본인 고정값은 아래 하드고정 블록이 처리)
+                    if (n, d) in _pte_fw_map:
+                        continue
+                    # (b) 프리셉터가 비표준 fixed코드(휴가/공가/W 등)면 등가 대신 프리셉티 OFF
+                    _p_special = False
+                    if (p, d) in fixed:
+                        _p_orig = _pte_orig_map.get((p, d))
+                        if _p_orig:
+                            _pou = str(_p_orig).upper()
+                            _p_special = (_pou not in _pte_std and _pou not in _pte_work_sub)
+                        else:
+                            _p_special = fixed[(p, d)] not in (day_idx, eve_idx, night_idx, off_idx, mid_idx)
+                    if _p_special:
+                        _xo = X(n, d, off_idx)
+                        if not isinstance(_xo, int):
+                            m.Add(_xo == 1)
+                        continue
                     for s in range(S):
                         xn = X(n, d, s)
                         xp = X(p, d, s)
                         if isinstance(xn, int) or isinstance(xp, int):
                             continue
                         m.Add(xn == xp)
+            # Option C: 프리셉티 fixed_wanted 프리솔브 하드고정 → fixed일 인접을 솔버가 조율/불가보고
+            for (_pte_n, _pte_d), _pte_code in _pte_fw_map.items():
+                if _pte_n not in preceptee_indices:
+                    continue
+                if not (join[_pte_n] <= _pte_d <= leave[_pte_n]):
+                    continue
+                _cu = str(_pte_code).strip().upper()
+                if _cu not in roster_system.config.shift_types:
+                    continue
+                _ci = roster_system.config.shift_types.index(_cu)
+                _xv = X(_pte_n, _pte_d, _ci)
+                if not isinstance(_xv, int):
+                    m.Add(_xv == 1)
 
         # DEN 커버리지에서 프리셉티 제외 시 fixed_cnt 보정
         if exclude_preceptee_from_den:
@@ -1475,10 +1510,8 @@ def optimize_fallback_lex_hard_first(
                     else:
                         safety["isolated_off_slack"].append(slack)
 
-        # 전이 위반: 정확한 reification (iff)
+        # 전이 위반: 정확한 reification (iff) — Option C: 프리셉티도 적용(등가로 프리셉터에 전파)
         for n in range(N):
-            if _is_preceptee_at(n):
-                continue
             T0, T1 = join[n], leave[n]
             for d in range(T0 + 1, T1 + 1):
                 xn = X(n, d - 1, night_idx)
@@ -1579,13 +1612,15 @@ def optimize_fallback_lex_hard_first(
             print(f"{logger_prefix} [1N금지] single_n allowed set 계산 실패(무시): {_e_sn}")
             _single_n_allowed_lex = set()
         if bool(not_one_night_val):
+            _pte_fw_1n = getattr(roster_system, '_preceptee_fixed_wanted_map', {}) or {}
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 if n in _single_n_allowed_lex:
                     continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
+                    # 프리셉티 fixed셀은 1N 강제 제외(사용자: 고정 단독N 존중, 복사된 단독N만 방지)
+                    if (n, d) in _pte_fw_1n:
+                        continue
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night_idx:
                         continue
                     if d == 0 and prev_month_n_tail_by_idx.get(n, 0) > 0:
@@ -1605,8 +1640,6 @@ def optimize_fallback_lex_hard_first(
         _BAN_N_TYPES = {"휴가", "공가"}
         if bool(getattr(cfg, "ban_night_before_fixed_off", False)):
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 _ban_n_cnt = 0
                 for d in range(T0 + 1, T1 + 1):
@@ -1695,8 +1728,6 @@ def optimize_fallback_lex_hard_first(
         #   - 그 외: 전체 윈도우에 대해 enforce. 유저가 K+1 연속 근무를 fixed_wanted로 지정했다면 INFEASIBLE로 보고.
         K = cfg.max_consecutive_work_days
         for n in range(N):
-            if _is_preceptee_at(n):
-                continue
             T0, T1 = join[n], leave[n]
             _blocked = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
             for d0 in range(T0, T1 - K + 1):
@@ -1731,8 +1762,6 @@ def optimize_fallback_lex_hard_first(
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
         for n in range(N):
-            if _is_preceptee_at(n):
-                continue
             T0, T1 = join[n], leave[n]
             n_tail = prev_month_n_tail_by_idx.get(n, 0)
             _n_offs_after_cnight = (getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}).get(n, 0)
@@ -1956,8 +1985,6 @@ def optimize_fallback_lex_hard_first(
         if cfg.two_offs_after_three_nig:
             _n_offs_after_map_3n = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 _blocked_3n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
@@ -2094,8 +2121,6 @@ def optimize_fallback_lex_hard_first(
         if cfg.two_offs_after_two_nig:
             _n_offs_after_map = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
@@ -2199,8 +2224,6 @@ def optimize_fallback_lex_hard_first(
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 - 2):
                     v1 = m.NewIntVar(0, 1, f"nod_{n}_{d}")
