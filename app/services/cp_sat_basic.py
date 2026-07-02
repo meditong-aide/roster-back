@@ -587,7 +587,9 @@ class CPSATBasicEngine:
             preceptor_top_days=config_data.get('preceptor_top_days', 12),
             preceptor_min_pair_weight=config_data.get('preceptor_min_pair_weight', 5.0),
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
-            preceptee_on=bool(config_data.get('preceptee_on', False)),
+            # 정책(사용자 지시): preceptee 팔로우는 기본 활성. config에 값이 없으면 True로 처리
+            # (미설정/만료로 인한 우발적 False 방지). 명시적 False는 그대로 유지됨.
+            preceptee_on=bool(config_data.get('preceptee_on', True)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
             use_mid=bool(config_data.get('use_mid', False)),
             # team_balance_* 는 DB 의 team_balance_enable / team_balance_gauge 를 그대로 따른다.
@@ -1051,26 +1053,21 @@ class CPSATBasicEngine:
                 if _cov_excl_cells:
                     setattr(roster_system, "coverage_exclude_cells", _cov_excl_cells)
                     print(f"[Assignment][Solver] coverage_exclude_cells: {len(_cov_excl_cells)}건")
-            # preceptee_period: 프리셉티 기간 (nurse_id → solver_idx 변환)
-            # 월 전체를 cover하는 entry는 default 동작(preceptor_id 기반 전체 월 follow)과
-            # 동등하면서도 솔버 hard 제약 인스턴스화 단계에서 capacity 모순을 유발하는 사례가 있어
-            # 명시 등록을 생략하고 default 분기로 위임한다. 부분 기간만 명시적으로 등록.
+            # preceptee_period: nurse_preceptee_period(SSOT) 유래 맵 → solver idx 컨텍스트.
+            # 형태: {nurse_id: {"preceptor_id": pid, "days": set}}. 중앙 빌더로 일원화
+            # (캐시 미사용·full-month 그대로 유지·종료자 부재=제외). 설계 §6.
             _pperiod_id = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
-            if _pperiod_id:
-                _id_to_idx = getattr(roster_system, '_id_to_idx', None) or {nu.db_id: i for i, nu in enumerate(nurses)}
-                _pperiod_idx: dict[int, set[int]] = {}
-                _full_month_set = set(range(roster_system.num_days))
-                for nid, days in _pperiod_id.items():
-                    idx = _id_to_idx.get(str(nid))
-                    if idx is None:
-                        continue
-                    if days and set(days) == _full_month_set:
-                        print(f"[Assignment][Solver] preceptee_period 전체월→default 위임: nurse_id={nid}, solver_idx={idx}")
-                        continue
-                    _pperiod_idx[idx] = set(days)
-                    print(f"[Assignment][Solver] preceptee_period: nurse_id={nid}, solver_idx={idx}, days={sorted(days)}")
-                if _pperiod_idx:
-                    setattr(roster_system, "preceptee_follow_days", _pperiod_idx)
+            _pte_auth = bool(config_data.get("preceptee_period_authoritative")) if isinstance(config_data, dict) else False
+            setattr(roster_system, "preceptee_period_authoritative", _pte_auth)
+            if _pperiod_id is not None:
+                from services.cp_sat.preceptee_context import build_preceptee_context
+                _id_to_idx = getattr(roster_system, '_id_to_idx', None) or {str(nu.db_id): i for i, nu in enumerate(nurses)}
+                _ctx = build_preceptee_context(nurses, _pperiod_id, roster_system.num_days, id_to_idx=_id_to_idx)
+                setattr(roster_system, "preceptee_follow_days", {i: set(d) for i, (p, d) in _ctx.items()})
+                setattr(roster_system, "preceptee_preceptor_idx",
+                        {i: p for i, (p, d) in _ctx.items() if p is not None})
+                for i, (p, d) in _ctx.items():
+                    print(f"[Assignment][Solver] preceptee_period: solver_idx={i}, preceptor_idx={p}, days={sorted(d)}")
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # cross-group OFF cap 조정용
             _other_group_offs = config_data.get("other_group_offs") if isinstance(config_data, dict) else None
@@ -1410,6 +1407,16 @@ class CPSATBasicEngine:
             valid_ids = {row.get('nurse_id') for row in nurses_data}
             seen_pairs = set()  # 중복 방지 (무방향)
             added_cnt = 0
+            # 멤버십: nurse_preceptee_period 맵 있으면 그 달 active 프리셉티만 페어링(종료자 제외),
+            # 없으면(백필 전) 캐시 기반 전체 — 무회귀. 설계 §6.
+            _pte_auth_pair = bool(config_data.get("preceptee_period_authoritative")) if isinstance(config_data, dict) else False
+            _pte_map = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
+            _active_pte_ids = None
+            if _pte_auth_pair:  # 권위 모드: 그 달 active 만(빈 맵이면 전부 제외). 폴백이면 None(캐시 전체).
+                _active_pte_ids = {
+                    str(k) for k, v in (_pte_map or {}).items()
+                    if (v.get("days") if isinstance(v, dict) else v)
+                }
             # 프리셉터-멘티 함께 근무 가중치: 기본 페어링 대비 강화
             preceptor_pair_weight = float(getattr(config, 'pair_preference_weight', 3.0)) * 2.5
             for row in nurses_data:
@@ -1417,6 +1424,8 @@ class CPSATBasicEngine:
                 preceptor_id = row.get('preceptor_id')
                 if not mentee_id or not preceptor_id:
                     continue
+                if _active_pte_ids is not None and str(mentee_id) not in _active_pte_ids:
+                    continue  # 권위 모드: 그 달 프리셉티 아님 → 페어링 제외
                 if preceptor_id not in valid_ids or preceptor_id == mentee_id:
                     continue
                 key = frozenset((mentee_id, preceptor_id))
@@ -1499,7 +1508,7 @@ class CPSATBasicEngine:
         # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
         # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
         #       프리셉터의 특수코드(법,생,휴 등 원티드) → 프리셉티는 OFF
-        preceptee_follow = bool(getattr(roster_system.config, 'preceptee_on', False))
+        preceptee_follow = bool(getattr(roster_system.config, 'preceptee_on', True))
         if preceptee_follow and hasattr(roster_system, 'nurses'):
             _shift_types = roster_system.config.shift_types
             _off_s_idx = _shift_types.index('O') if 'O' in _shift_types else None
@@ -1512,21 +1521,36 @@ class CPSATBasicEngine:
             _pte_fw_map = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
             _fw_restored = 0
             _pp_follow_days = getattr(roster_system, 'preceptee_follow_days', {}) or {}
+            _has_pte_map = bool(getattr(roster_system, "preceptee_period_authoritative", False))  # 권위 vs 폴백
+            _pp_ptr_idx = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT: 프리셉티 idx→프리셉터 idx
             for n, nu in enumerate(roster_system.nurses):
-                pid = getattr(nu, 'preceptor_id', None)
-                if not pid or pid not in id_to_idx:
-                    continue
-                ptr_idx = id_to_idx[pid]
-                # 1단계: 프리셉터 roster 복사 (기간 제한 적용)
+                # 권위 모드: period SSOT(preceptee_preceptor_idx)로 프리셉터 결정. 캐시(preceptor_id)는
+                # period-native 프리셉티에서 NULL 이라 여기서 스킵되던 팔로우 누락 버그 수정. 폴백만 캐시 사용.
+                if _has_pte_map:
+                    ptr_idx = _pp_ptr_idx.get(n)
+                    if ptr_idx is None:
+                        continue
+                else:
+                    pid = getattr(nu, 'preceptor_id', None)
+                    if not pid or pid not in id_to_idx:
+                        continue
+                    ptr_idx = id_to_idx[pid]
+                # 1단계: 프리셉터 roster 복사 (nurse_preceptee_period 기간 제한)
                 _follow_set = _pp_follow_days.get(n)
-                print(f"[PrecepteeSync] n={n}, nurse={nu.name}({nu.db_id}), _follow_set={'set('+str(sorted(_follow_set))+')' if _follow_set is not None else 'None'}, _pp_follow_days_keys={list(_pp_follow_days.keys())}")
-                if _follow_set is not None:
-                    # 기간 내 day만 프리셉터 복사
+                if _has_pte_map:
+                    # 권위 모드: 맵에 없으면(종료/미겹침) 복사 안 함 — default=full-copy 제거.
+                    if not _follow_set:
+                        continue
+                    for d in _follow_set:
+                        if d < roster_system.num_days:
+                            roster_system.roster[n, d, :] = roster_system.roster[ptr_idx, d, :]
+                elif _follow_set is not None:
+                    # 폴백: 부분기간만 복사
                     for d in _follow_set:
                         if d < roster_system.num_days:
                             roster_system.roster[n, d, :] = roster_system.roster[ptr_idx, d, :]
                 else:
-                    # 기간 미설정 → 전체 월 복사 (기존 동작)
+                    # 폴백(맵 없음, 기간 미설정) → 전체 월 복사 (기존 동작)
                     roster_system.roster[n] = roster_system.roster[ptr_idx].copy()
                 # 2단계: 특수코드 일자는 프리셉티를 OFF로 전환
                 if _off_s_idx is not None:
@@ -1623,7 +1647,10 @@ class CPSATBasicEngine:
 
                 for n, nu in enumerate(roster_system.nurses):
                     pid = getattr(nu, 'preceptor_id', None)
-                    if not pid or pid not in id_to_idx:
+                    _follow = _pp_follow_days.get(n)
+                    # 권위 모드: 맵에 없는(종료) 프리셉티는 비-프리셉티 취급(본인 fixed 유지).
+                    _is_pte = (bool(_follow) if _has_pte_map else bool(pid and pid in id_to_idx))
+                    if not pid or pid not in id_to_idx or not _is_pte:
                         # 프리셉티 아닌 경우 기존 유지
                         for cell in fixed_cells:
                             if cell.get("nurse_index") == n:
@@ -1631,7 +1658,8 @@ class CPSATBasicEngine:
                         continue
 
                     ptr_idx = id_to_idx[pid]
-                    for d in range(roster_system.num_days):
+                    _days = sorted(_follow) if (_has_pte_map and _follow) else range(roster_system.num_days)
+                    for d in _days:
                         key = (ptr_idx, d)
                         if key in preceptor_fixed:
                             copied = preceptor_fixed[key].copy()
@@ -1826,16 +1854,27 @@ class CPSATBasicEngine:
             _pte_fw_raw_final = _preceptee_fixed_wanted_map_raw
             _pte_fw_norm_final = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
             _pp_fw_final = getattr(roster_system, 'preceptee_follow_days', {}) or {}
+            _pp_ptr_idx_final = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}
+            _auth_final = bool(getattr(roster_system, 'preceptee_period_authoritative', False))
             for nu in nurses:
-                _pid_f = getattr(nu, 'preceptor_id', None)
+                _n_final = _id2i_final.get(nu.db_id)
+                # 권위 모드: period SSOT 로 프리셉터 db_id 결정(캐시 미사용 — NULL 캐시 프리셉티 누락 방지).
+                if _auth_final:
+                    _ptr_i_f = _pp_ptr_idx_final.get(_n_final) if _n_final is not None else None
+                    _pid_f = nurses[_ptr_i_f].db_id if _ptr_i_f is not None else None
+                else:
+                    _pid_f = getattr(nu, 'preceptor_id', None)
                 if not _pid_f or _pid_f not in _id2i_final:
                     continue
                 ptr_sched = result.get(_pid_f, [])
                 pte_sched = result.get(nu.db_id, [])
                 if not ptr_sched or not pte_sched:
                     continue
-                _n_final = _id2i_final.get(nu.db_id)
                 _final_follow_set = _pp_fw_final.get(_n_final) if _n_final is not None else None
+                # 권위 모드(period 백필됨): 맵에 없는(종료/미겹침) 프리셉티는 동기화 안 함.
+                # 캐시(preceptor_id) 잔존을 무시 — 기간 종료 후 follow 누수 차단.
+                if bool(getattr(roster_system, 'preceptee_period_authoritative', False)) and not _final_follow_set:
+                    continue
                 changed = False
                 for d_i in range(min(len(ptr_sched), len(pte_sched))):
                     # 기간 제한: follow 기간 외 day는 skip
@@ -2672,50 +2711,36 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         pass
     isolated_off_slacks: list = []
 
-    # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
+    # ── 프리셉티 인덱스/기간 사전 계산 ──
+    # 진실 = nurse_preceptee_period(SSOT) 유래 preceptee_follow_days(맵). 캐시(preceptor_id) 미사용.
+    #   - 맵 있음(권위 모드): 맵의 day 집합만 신뢰. 종료자는 맵에 부재 → 미follow. default=follow 없음.
+    #   - 맵 없음(전환 폴백, 백필 전): 기존 캐시 기반(preceptor_id) + 전체월 follow 로 무회귀.
+    # 설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md §6.
     preceptee_follow = bool(getattr(rs.config, 'preceptee_on', False))
-    preceptee_indices: set[int] = set()
     _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
-    for n, nu in enumerate(rs.nurses):
-        pid = getattr(nu, 'preceptor_id', None)
-        if pid:
-            preceptee_indices.add(n)
-    # 프리셉티 기간 제한
     preceptee_follow_days: dict[int, set[int]] = getattr(rs, "preceptee_follow_days", {}) or {}
-    # 안전망: 월 전체 cover entry 는 default 동작(전체 월 follow)과 동등 → 솔버 hard 제약
-    # 인스턴스화 시 capacity 모순 회피를 위해 dict 에서 제거하고 default 분기로 위임한다.
-    _full_month_set_pre = set(range(rs.num_days))
-    _full_keys_pre = [n for n, days in preceptee_follow_days.items() if set(days) == _full_month_set_pre]
-    for n in _full_keys_pre:
-        del preceptee_follow_days[n]
-    if _full_keys_pre:
-        print(f"[FIX] 프리셉티 전체월 follow → default 위임: solver_idx={_full_keys_pre}")
-    _has_preceptee_period = bool(preceptee_follow_days)
-    # dispatch(assignment) 기반 프리셉티도 인덱스에 포함
+    # 권위 플래그(builder 가 그룹의 period row 존재로 판정). bool(맵) 아님 — 활성자 0이어도 권위 유지.
+    _has_preceptee_period = bool(getattr(rs, "preceptee_period_authoritative", False))
     if _has_preceptee_period:
-        for n in preceptee_follow_days:
-            if n not in preceptee_indices:
-                preceptee_indices.add(n)
-    preceptee_indices = set(preceptee_indices)
+        preceptee_indices: set[int] = {n for n, days in preceptee_follow_days.items() if days}
+    else:
+        # 폴백: period 맵 없음 → 캐시(preceptor_id) 보유자 = 전체월 follow (기존 동작 보존).
+        preceptee_indices = {n for n, nu in enumerate(rs.nurses) if getattr(nu, 'preceptor_id', None)}
     if preceptee_indices:
-        print(f"[FIX] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
-    # 기간이 빈 set인 프리셉티 = 해당 월에서 프리셉티 아님 → preceptee_indices에서 제거
-    if _has_preceptee_period:
-        _empty_period = {n for n, days in preceptee_follow_days.items() if len(days) == 0}
-        if _empty_period:
-            preceptee_indices -= _empty_period
-            print(f"[FIX] 프리셉티 기간 종료 → 인덱스 제거: {_empty_period}")
+        print(f"[FIX] 프리셉티 인덱스: {len(preceptee_indices)}명 "
+              f"(follow={preceptee_follow}, period_map={_has_preceptee_period})")
 
     def _is_preceptee_at(n: int, d: int = -1) -> bool:
         if not preceptee_follow or n not in preceptee_indices:
             return False
         if not _has_preceptee_period:
-            return True  # 기간 미설정 → 전체 월 follow
-        if n not in preceptee_follow_days:
-            return True  # 이 간호사에 대한 기간 미설정 → 전체 월 follow
+            return True  # 폴백(맵 없음): 전체월 follow
+        days = preceptee_follow_days.get(n)
+        if not days:
+            return False  # 그 달 프리셉티 아님(종료/미겹침)
         if d < 0:
-            return False  # nurse-level: 기간 설정됨 → 제약 skip 안 함 (day별 판별 필요)
-        return d in preceptee_follow_days[n]
+            return False  # nurse-level: day별 판별 필요
+        return d in days
 
     # ───────────── 2-A. 고정 셀  ─────────────
     for (n,d),s_idx in fixed.items():
@@ -3072,13 +3097,21 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
           f"preceptee_follow={preceptee_follow}, preceptee_indices={len(preceptee_indices)}명")
     if preceptee_follow and preceptee_indices:
         id_to_idx = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
+        _pre_ptr_idx = getattr(rs, 'preceptee_preceptor_idx', {}) or {}  # period SSOT: 프리셉티 idx→프리셉터 idx
         constraint_count = 0
         for n in sorted(preceptee_indices):
             nu = rs.nurses[n]
-            pid = getattr(nu, 'preceptor_id', None)
-            if not pid or pid not in id_to_idx:
-                continue
-            p = id_to_idx[pid]
+            # 권위 모드: period SSOT 로 프리셉터 결정 — 캐시(preceptor_id)가 NULL 인 period-native
+            # 프리셉티도 solve 단계에서 follow 반영(누락 시 후처리 덮어쓰기로 커버리지 붕괴 방지).
+            if _has_preceptee_period:
+                p = _pre_ptr_idx.get(n)
+                if p is None:
+                    continue
+            else:
+                pid = getattr(nu, 'preceptor_id', None)
+                if not pid or pid not in id_to_idx:
+                    continue
+                p = id_to_idx[pid]
             preceptor_nurse = rs.nurses[p]
             d_start = max(join[n], join[p])
             d_end = min(leave[n], leave[p])

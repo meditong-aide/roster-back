@@ -1102,6 +1102,11 @@ def group_members_in_month(
     _grade_periods = _fetch_periods(db, _NGP, _period_ids, month_start, _asof_next, group_id=group_id)
     _allowed_periods = _fetch_periods(db, _NASP, _period_ids, month_start, _asof_next)
     _weekend_periods = _fetch_periods(db, _NWOP, _period_ids, month_start, _asof_next)
+    # [Perf] preceptor(프리셉티→프리셉터) 도 월 as-of 배치 해석 (grade/team 과 동일 원칙).
+    #   nurse_preceptee_period SSOT 를 month_start 시점으로 해석 — 공통 헬퍼 재사용.
+    #   gap(그 달 관계 없음)→None → _row 에서 캐시 폴백 없이 그대로(해제 표시).
+    from services.preceptee_period import resolve_preceptor_asof as _resolve_pre_asof
+    _preceptor_asof = _resolve_pre_asof(db, _period_ids, month_start)
 
     def _asof_grade(nid: str, n_obj):
         v = _resolve_asof(_grade_periods.get(nid), month_start, "grade", default=None)
@@ -1144,6 +1149,7 @@ def group_members_in_month(
             "as_of_allowed_shifts": _np,   # 월 as-of 전담 프로필(raw, /nurses base 덮어쓰기용)
             "as_of_weekend_off": _wo,
             "as_of_fixed_shift": _fx,
+            "as_of_preceptor": _preceptor_asof.get(str(n.nurse_id)),  # 월 as-of 프리셉터(종료월엔 None)
         }
 
     members: list[dict] = []
@@ -1530,6 +1536,13 @@ def _apply_target_profile_reset(
     )
     if nurse.preceptor_id is not None:
         nurse.preceptor_id = None
+    # write-through: 병동이동 발효일에 관련 preceptee period close (SSOT).
+    from services.preceptee_period import close_all_for_preceptor, close_preceptee_period
+    _eff = row.start_date or date.today()
+    close_all_for_preceptor(db, preceptor_id=row.nurse_id, close_date=_eff,
+                            end_reason="preceptor_transfer", today=_eff)  # 이 간호사가 프리셉터
+    close_preceptee_period(db, nurse_id=row.nurse_id, close_date=_eff,
+                           end_reason="preceptor_transfer", nurse=nurse, today=_eff)  # 본인이 프리셉티
     return int(detached or 0)
 
 
@@ -1709,6 +1722,24 @@ def flush_expired_preceptees(db: Session) -> int:
             )
             nurse.preceptor_id = None
 
+        # period SSOT 종료(write-through). 캐시만 지우고 nurse_preceptee_period 를 안 닫으면
+        # 생성기가 stale open period 를 읽어 '종료된 프리셉티'를 계속 팔로우함
+        # (2026-07 중환자실1 6쌍 회귀의 원인). close 실패는 로깅만 하고 flush 는 계속.
+        try:
+            from services.preceptee_period import close_preceptee_period, end_date_to_valid_to
+            close_preceptee_period(
+                db,
+                nurse_id=row.nurse_id,
+                close_date=end_date_to_valid_to(row.expected_end_date) or today,
+                end_reason="completed",
+                nurse=nurse,
+            )
+        except Exception as _pp_exc:
+            logger.error(
+                "[Scheduler] 프리셉티 period 종료 write-through 실패: nurse_id=%s, %s",
+                row.nurse_id, _pp_exc, exc_info=True,
+            )
+
         row.status = "completed"
         row.end_date = row.expected_end_date
         count += 1
@@ -1770,6 +1801,16 @@ def flush_orphan_preceptee_assignments(db: Session) -> int:
         row.status = "cancelled"
         if row.end_date is None:
             row.end_date = today
+        # period SSOT 도 함께 닫는다(비대칭 정리 시 nurse_preceptee_period 잔존 방지 —
+        # 생성기가 stale open period 를 읽어 취소된 프리셉티를 팔로우하는 회귀 차단).
+        try:
+            from services.preceptee_period import close_preceptee_period
+            close_preceptee_period(db, nurse_id=row.nurse_id, close_date=today, end_reason="cancelled")
+        except Exception as _pp_exc:
+            logger.error(
+                "[Lazy] orphan 프리셉티 period 종료 실패: nurse_id=%s, %s",
+                row.nurse_id, _pp_exc, exc_info=True,
+            )
     db.commit()
     logger.info("[Lazy] orphan 프리셉티 assignment 정리: %d건", len(rows))
     return len(rows)
@@ -1957,9 +1998,11 @@ def flush_pending_permanent_changes(db: Session, as_of: Optional[date] = None) -
             #   이미 기록됨. nurses.team_id 캐시는 더 이상 쓰지 않는다(컬럼 DROP 예정).
             # grade/allowed_shifts/fixed_shift 도 period(SSOT)에서 투영(assignment.target_* 미사용).
             _project_profile_period_to_cache(db, nurse, row.target_group_id, today)
-            # payload.release_preceptor → 프리셉터십 공식 종료 (preceptor_id 비움)
+            # payload.release_preceptor → 프리셉터십 공식 종료 (period close + 캐시 None 투영)
             if (row.payload or {}).get("release_preceptor"):
-                nurse.preceptor_id = None
+                from services.preceptee_period import close_preceptee_period
+                close_preceptee_period(db, nurse_id=row.nurse_id, close_date=today,
+                                       end_reason="released", nurse=nurse, today=today)
         row.status = "completed"
         row.end_date = today
         count += 1

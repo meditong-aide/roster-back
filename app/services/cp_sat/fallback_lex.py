@@ -337,53 +337,33 @@ def optimize_fallback_lex_hard_first(
         else {}
     )
 
-    # ── 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요) ──
+    # ── 프리셉티 인덱스/기간 (cp_sat_basic 와 동일 정책 — nurse_preceptee_period SSOT) ──
+    # 맵 있음=권위 모드(맵만 신뢰, default=follow 없음), 맵 없음=전환 폴백(캐시 기반 무회귀).
+    # 설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md §6.
     preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
-    preceptee_indices: set[int] = set()
     _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-    for n, nu in enumerate(roster_system.nurses):
-        pid = getattr(nu, 'preceptor_id', None)
-        if pid:
-            preceptee_indices.add(n)
-    # 프리셉티 기간 제한: assignment 기간 내에만 follow (기간 외 독립 배정)
     preceptee_follow_days: dict[int, set[int]] = getattr(roster_system, "preceptee_follow_days", {}) or {}
-    # 안전망: 월 전체 cover entry 는 default 동작(전체 월 follow)과 동등 → 솔버 hard 제약
-    # 인스턴스화 시 capacity 모순 회피를 위해 dict 에서 제거하고 default 분기로 위임한다.
-    _full_month_set_fb = set(range(roster_system.num_days))
-    _full_keys_fb = [n for n, days in preceptee_follow_days.items() if set(days) == _full_month_set_fb]
-    for n in _full_keys_fb:
-        del preceptee_follow_days[n]
-    if _full_keys_fb:
-        print(f"{logger_prefix} [Fallback] 프리셉티 전체월 follow → default 위임: solver_idx={_full_keys_fb}")
-    _has_preceptee_period = bool(preceptee_follow_days)
-    # dispatch(assignment) 기반 프리셉티도 인덱스에 포함
+    _has_preceptee_period = bool(getattr(roster_system, "preceptee_period_authoritative", False))
     if _has_preceptee_period:
-        for n in preceptee_follow_days:
-            if n not in preceptee_indices:
-                preceptee_indices.add(n)
+        preceptee_indices: set[int] = {n for n, days in preceptee_follow_days.items() if days}
+    else:
+        preceptee_indices = {n for n, nu in enumerate(roster_system.nurses) if getattr(nu, 'preceptor_id', None)}
     if preceptee_indices:
-        print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 (follow={preceptee_follow})")
-    # 기간이 빈 set인 프리셉티 = 해당 월에서 프리셉티 아님 → preceptee_indices에서 제거
-    if _has_preceptee_period:
-        _empty_period = {n for n, days in preceptee_follow_days.items() if len(days) == 0}
-        if _empty_period:
-            preceptee_indices -= _empty_period
-            print(f"{logger_prefix} [Fallback] 프리셉티 기간 종료 → 인덱스 제거: {_empty_period}")
+        print(f"{logger_prefix} [Fallback] 프리셉티 인덱스: {len(preceptee_indices)}명 "
+              f"(follow={preceptee_follow}, period_map={_has_preceptee_period})")
 
     def _is_preceptee_at(n: int, d: int = -1) -> bool:
-        """(n, d)가 프리셉티 follow 대상인지 판별.
-        d=-1: nurse-level. 기간 미설정이면 True(전체 follow), 기간 설정이면 False(day별 판별 필요)
-        d>=0: day-level (해당 day가 기간 내인지)
-        """
+        """(n, d)가 프리셉티 follow 대상인지. 맵 없으면 전체월 follow(폴백), 맵 있으면 day별."""
         if not preceptee_follow or n not in preceptee_indices:
             return False
         if not _has_preceptee_period:
-            return True  # 기간 미설정 → 전체 월 follow (기존 동작)
-        if n not in preceptee_follow_days:
-            return True  # 이 간호사에 대한 기간 미설정 → 전체 월 follow
+            return True  # 폴백(맵 없음): 전체월 follow
+        days = preceptee_follow_days.get(n)
+        if not days:
+            return False  # 그 달 프리셉티 아님(종료/미겹침)
         if d < 0:
-            return False  # nurse-level: 기간 설정됨 → 제약 skip 안 함 (day별 판별 필요)
-        return d in preceptee_follow_days[n]
+            return False  # nurse-level: day별 판별 필요
+        return d in days
 
     exclude_preceptee_from_den = (not getattr(cfg, 'preceptee_shift_count', True)) and bool(preceptee_indices)
     coverage_exclude_cells: set[tuple[int, int]] = getattr(roster_system, "coverage_exclude_cells", set()) or set()
@@ -809,7 +789,9 @@ def optimize_fallback_lex_hard_first(
             _fixed_pattern = _fixed_pattern_from_source(_fixed_source)
             if (n, d) not in active_days:
                 continue
-            if _is_preceptee_at(n):
+            # day-aware: 팔로우 day의 프리셉티 고정셀만 스킵(팔로우가 지배). primary(cp_sat_basic:3089)와 동일.
+            # day-less 는 authoritative 에서 항상 False→고정셀이 hard로 적용돼 팔로우와 모순(INFEASIBLE) 유발.
+            if _is_preceptee_at(n, d):
                 continue
             _fixed_expr = (X(n, d, s_idx) == 1)
             if _assume_registry_fb is not None and _add_hard_fb is not None:
@@ -1193,16 +1175,45 @@ def optimize_fallback_lex_hard_first(
         # 프리셉티 팔로우 제약 (fallback) — assignment 기간 내에만 적용
         if preceptee_follow and preceptee_indices:
             _fb_id_map = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+            _fb_pre_ptr_idx = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
+            # Option C: 프리셉티 1급 시민화 — 등가는 (a)프리셉티 fixed일 제외 (b)프리셉터 특수코드일엔 OFF
+            _pte_std = {'D', 'E', 'N', 'O'} | ({'M'} if mid_idx is not None else set())
+            _pte_orig_map = getattr(roster_system, '_fixed_original_shift_map', {}) or {}
+            _pte_work_sub = {str(x).upper() for x in (getattr(roster_system, '_work_sub_ids', set()) or set())}
+            _pte_fw_map = getattr(roster_system, '_preceptee_fixed_wanted_map', {}) or {}
             for n in sorted(preceptee_indices):
                 nu = roster_system.nurses[n]
-                pid = getattr(nu, 'preceptor_id', None)
-                if not pid or pid not in _fb_id_map:
-                    continue
-                p = _fb_id_map[pid]
+                # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티도 solve 반영).
+                if _has_preceptee_period:
+                    p = _fb_pre_ptr_idx.get(n)
+                    if p is None:
+                        continue
+                else:
+                    pid = getattr(nu, 'preceptor_id', None)
+                    if not pid or pid not in _fb_id_map:
+                        continue
+                    p = _fb_id_map[pid]
                 d_start = max(join[n], join[p])
                 d_end = min(leave[n], leave[p])
                 for d in range(d_start, d_end + 1):
                     if not _is_preceptee_at(n, d):
+                        continue
+                    # (a) 프리셉티 fixed일: 등가 제외(본인 고정값은 아래 하드고정 블록이 처리)
+                    if (n, d) in _pte_fw_map:
+                        continue
+                    # (b) 프리셉터가 비표준 fixed코드(휴가/공가/W 등)면 등가 대신 프리셉티 OFF
+                    _p_special = False
+                    if (p, d) in fixed:
+                        _p_orig = _pte_orig_map.get((p, d))
+                        if _p_orig:
+                            _pou = str(_p_orig).upper()
+                            _p_special = (_pou not in _pte_std and _pou not in _pte_work_sub)
+                        else:
+                            _p_special = fixed[(p, d)] not in (day_idx, eve_idx, night_idx, off_idx, mid_idx)
+                    if _p_special:
+                        _xo = X(n, d, off_idx)
+                        if not isinstance(_xo, int):
+                            m.Add(_xo == 1)
                         continue
                     for s in range(S):
                         xn = X(n, d, s)
@@ -1210,6 +1221,19 @@ def optimize_fallback_lex_hard_first(
                         if isinstance(xn, int) or isinstance(xp, int):
                             continue
                         m.Add(xn == xp)
+            # Option C: 프리셉티 fixed_wanted 프리솔브 하드고정 → fixed일 인접을 솔버가 조율/불가보고
+            for (_pte_n, _pte_d), _pte_code in _pte_fw_map.items():
+                if _pte_n not in preceptee_indices:
+                    continue
+                if not (join[_pte_n] <= _pte_d <= leave[_pte_n]):
+                    continue
+                _cu = str(_pte_code).strip().upper()
+                if _cu not in roster_system.config.shift_types:
+                    continue
+                _ci = roster_system.config.shift_types.index(_cu)
+                _xv = X(_pte_n, _pte_d, _ci)
+                if not isinstance(_xv, int):
+                    m.Add(_xv == 1)
 
         # DEN 커버리지에서 프리셉티 제외 시 fixed_cnt 보정
         if exclude_preceptee_from_den:
@@ -1486,10 +1510,8 @@ def optimize_fallback_lex_hard_first(
                     else:
                         safety["isolated_off_slack"].append(slack)
 
-        # 전이 위반: 정확한 reification (iff)
+        # 전이 위반: 정확한 reification (iff) — Option C: 프리셉티도 적용(등가로 프리셉터에 전파)
         for n in range(N):
-            if _is_preceptee_at(n):
-                continue
             T0, T1 = join[n], leave[n]
             for d in range(T0 + 1, T1 + 1):
                 xn = X(n, d - 1, night_idx)
@@ -1590,13 +1612,15 @@ def optimize_fallback_lex_hard_first(
             print(f"{logger_prefix} [1N금지] single_n allowed set 계산 실패(무시): {_e_sn}")
             _single_n_allowed_lex = set()
         if bool(not_one_night_val):
+            _pte_fw_1n = getattr(roster_system, '_preceptee_fixed_wanted_map', {}) or {}
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 if n in _single_n_allowed_lex:
                     continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
+                    # 프리셉티 fixed셀은 1N 강제 제외(사용자: 고정 단독N 존중, 복사된 단독N만 방지)
+                    if (n, d) in _pte_fw_1n:
+                        continue
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night_idx:
                         continue
                     if d == 0 and prev_month_n_tail_by_idx.get(n, 0) > 0:
@@ -1616,8 +1640,6 @@ def optimize_fallback_lex_hard_first(
         _BAN_N_TYPES = {"휴가", "공가"}
         if bool(getattr(cfg, "ban_night_before_fixed_off", False)):
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 _ban_n_cnt = 0
                 for d in range(T0 + 1, T1 + 1):
@@ -1706,8 +1728,6 @@ def optimize_fallback_lex_hard_first(
         #   - 그 외: 전체 윈도우에 대해 enforce. 유저가 K+1 연속 근무를 fixed_wanted로 지정했다면 INFEASIBLE로 보고.
         K = cfg.max_consecutive_work_days
         for n in range(N):
-            if _is_preceptee_at(n):
-                continue
             T0, T1 = join[n], leave[n]
             _blocked = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
             for d0 in range(T0, T1 - K + 1):
@@ -1742,8 +1762,6 @@ def optimize_fallback_lex_hard_first(
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
         for n in range(N):
-            if _is_preceptee_at(n):
-                continue
             T0, T1 = join[n], leave[n]
             n_tail = prev_month_n_tail_by_idx.get(n, 0)
             _n_offs_after_cnight = (getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}).get(n, 0)
@@ -1967,8 +1985,6 @@ def optimize_fallback_lex_hard_first(
         if cfg.two_offs_after_three_nig:
             _n_offs_after_map_3n = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 _blocked_3n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
@@ -2105,8 +2121,6 @@ def optimize_fallback_lex_hard_first(
         if cfg.two_offs_after_two_nig:
             _n_offs_after_map = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
@@ -2210,8 +2224,6 @@ def optimize_fallback_lex_hard_first(
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):
             for n in range(N):
-                if _is_preceptee_at(n):
-                    continue
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 - 2):
                     v1 = m.NewIntVar(0, 1, f"nod_{n}_{d}")
@@ -3358,18 +3370,30 @@ def optimize_fallback_lex_hard_first(
         synced = 0
         special_converted = 0
         _fb_fw_restored = 0
+        _fb_pre_ptr_idx2 = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
         for pte_idx in preceptee_indices:
-            pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
-            if not pid or pid not in _fb_id_to_idx:
-                continue
-            ptr_idx = _fb_id_to_idx[pid]
-            roster_system.roster[pte_idx] = roster_system.roster[ptr_idx].copy()
-            # 특수코드 일자는 프리셉티를 OFF로 전환
+            # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티 누락 방지).
+            if _has_preceptee_period:
+                ptr_idx = _fb_pre_ptr_idx2.get(pte_idx)
+                if ptr_idx is None:
+                    continue
+            else:
+                pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
+                if not pid or pid not in _fb_id_to_idx:
+                    continue
+                ptr_idx = _fb_id_to_idx[pid]
+            # 권위 모드면 nurse_preceptee_period 기간 내 day만, 폴백이면 전체월 복사.
+            _fb_follow = preceptee_follow_days.get(pte_idx)
+            _fb_days_iter = (sorted(_fb_follow) if (_has_preceptee_period and _fb_follow)
+                             else list(range(roster_system.num_days)))
+            for _cd in _fb_days_iter:
+                roster_system.roster[pte_idx, _cd, :] = roster_system.roster[ptr_idx, _cd, :]
+            # 특수코드 일자는 프리셉티를 OFF로 전환 (복사한 day 한정)
             # 단, type=근무 + shift_gb=D/E/N 계열 하위코드는 근무이므로 그대로 유지
             _fb_work_sub = getattr(roster_system, '_work_sub_ids', set())
             _fb_orig_map = getattr(roster_system, '_fixed_original_shift_map', {})
             if _fb_off_idx is not None:
-                for d in range(roster_system.num_days):
+                for d in _fb_days_iter:
                     # 프리셉티 fixed_wanted 일자는 프리셉터 복사 대신 본인 값 적용
                     if (pte_idx, d) in _fb_pte_fw:
                         _fw_code = _fb_pte_fw[(pte_idx, d)].strip().upper()

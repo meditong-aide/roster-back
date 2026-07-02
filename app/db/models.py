@@ -19,7 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.mysql import TINYINT
 from sqlalchemy.orm import relationship, deferred
 from db.client2 import Base
-from sqlalchemy import DATE, DECIMAL, TEXT, Time
+from sqlalchemy import DATE, DECIMAL, TEXT, Time, text
 from datetime import datetime
 
 
@@ -290,6 +290,34 @@ class NurseWeekendOffPeriod(Base, EffectiveDatedPeriodMixin):
     __tablename__ = "nurse_weekendoff_period"
     weekend_off = Column(TINYINT, nullable=True)
     __table_args__ = (Index("ix_nwop_nurse", "nurse_id", "valid_from"),)
+
+
+class NursePrecepteePeriod(Base, EffectiveDatedPeriodMixin):
+    """프리셉터↔프리셉티 관계 시점 구간 (SSOT).
+
+    한 row = (프리셉티 nurse_id) 가 [valid_from, valid_to) 동안 preceptor_id 를 따른다.
+    - WHO = preceptor_id, WHEN = [valid_from, valid_to). valid_to=계획종료일(무기한이면 NULL).
+    - 진실 = 이 테이블. nurses.preceptor_id = as-of 오늘 단방향 투영(앱 직접쓰기 금지).
+    - 1:1: 한 간호사는 동시점 최대 1개 open 구간 (filtered unique).
+    - end_reason: 종료 사유(expired|cancelled|released|preceptor_transfer) — 알림/감사용.
+    설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md.
+    """
+
+    __tablename__ = "nurse_preceptee_period"
+    preceptor_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"), nullable=False)
+    end_reason = Column(VARCHAR(30), nullable=True)
+    source_assignment_id = Column(INTEGER, nullable=True)  # write-through 추적(감사)
+    __table_args__ = (
+        Index("ix_npp_nurse", "nurse_id", "valid_from"),
+        Index("ix_npp_preceptor", "preceptor_id", "valid_to"),
+        # 1:1: 동시점 open(=valid_to NULL) 구간은 간호사당 1개. 양 dialect partial unique.
+        Index(
+            "uq_npp_open_per_nurse", "nurse_id", unique=True,
+            mssql_where=text("valid_to IS NULL"),
+            sqlite_where=text("valid_to IS NULL"),
+        ),
+    )
 
 
 class NurseAssignment(Base):

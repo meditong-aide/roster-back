@@ -60,6 +60,7 @@ from db.models import (  # noqa: E402
     IssuedRoster, ShiftManage, RosterGradeConfig, NurseMonthlyLimit, NurseAssignment,
     NurseTeamPeriod, WeeklyOffSetting,
     NurseGradePeriod, NurseAllowedShiftPeriod, NurseWeekendOffPeriod,
+    NursePrecepteePeriod,
     AgentConversation, AgentConversationMessage, AgentUserMemory,
     AgentMemoryAudit, AgentSkillInvocation,
 )
@@ -89,7 +90,7 @@ _REQUIRED_TABLES = [
     NurseMonthlyLimit.__table__, NurseAssignment.__table__, NurseTeamPeriod.__table__,
     WeeklyOffSetting.__table__,
     NurseGradePeriod.__table__, NurseAllowedShiftPeriod.__table__,
-    NurseWeekendOffPeriod.__table__,
+    NurseWeekendOffPeriod.__table__, NursePrecepteePeriod.__table__,
     AgentConversation.__table__, AgentConversationMessage.__table__,
     AgentUserMemory.__table__,
     AgentMemoryAudit.__table__,
