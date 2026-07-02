@@ -30,6 +30,7 @@ from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterConfigCreate, PublishRequest
 from services.roster_service import (
     save_roster_config_service,
+    unsave_roster_config_service,
     get_latest_schedule_service,
     get_issued_schedules_service,
     get_schedule_status_service,
@@ -201,6 +202,51 @@ async def save_roster_config(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Configuration save failed: {str(e)}"
+        )
+
+
+@router.delete("/config/{config_id}")
+async def unsave_roster_config(
+    config_id: int,
+    group_id: Optional[str] = None,
+    user: User = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """저장 설정(프리셋) 미노출 — version=NULL 로 되돌려 일반(ad-hoc) 설정으로 변경.
+
+    row/config_id/설정값은 유지(FK·근무표 이력 무영향). /config/versions 목록에서만 빠지고,
+    재저장 시 다시 채번되어 복귀. 권한: HN=본인 그룹 / ADM=group_id 지정.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    is_admin = bool(getattr(user, "is_master_admin", False))
+    override_gid: Optional[str] = None
+    if caller_is_head_nurse(db, user) and user.group_id:
+        override_gid = None  # HN은 본인 그룹
+    else:
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not group_id:
+            raise HTTPException(status_code=400, detail="group_id is required for admin")
+        g = db.query(Group).filter(Group.group_id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if getattr(user, "office_id", None) and user.office_id != g.office_id:
+            raise HTTPException(
+                status_code=403, detail="Group does not belong to your office"
+            )
+        override_gid = g.group_id
+
+    try:
+        return unsave_roster_config_service(
+            config_id, user, db, override_group_id=override_gid
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Configuration unsave failed: {str(e)}"
         )
 
 
@@ -377,7 +423,11 @@ async def get_config_by_version(
 
             cfg = DEFAULT_CONFIG
             # DEFAULT 설정으로 RosterConfig 레코드 생성 및 저장
+            # ★version 부여: 미부여 시 version=NULL(ad-hoc)로 남아 /config/versions 프리셋 목록서 누락됨
+            from services.roster_service import _next_config_version
             new_config = RosterConfigModel(
+                version=_next_config_version(db, target_office_id, target_group_id),
+                config_name="기본 설정",
                 # config_version="default",
                 office_id=target_office_id,
                 group_id=target_group_id,
