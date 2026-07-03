@@ -169,6 +169,10 @@ def optimize_fallback_lex_hard_first(
     tl1 = max(5, int(time_limit_seconds * 0.45))
     tl2 = max(5, int(time_limit_seconds * 0.35))
     tl3 = max(3, time_limit_seconds - tl1 - tl2)
+    import os as _os_tl3
+    _tl3_override = int(_os_tl3.environ.get("AIDE_FB_TL3", 0) or 0)
+    if _tl3_override > 0:
+        tl3 = _tl3_override
 
     N, D, S = len(roster_system.nurses), roster_system.num_days, roster_system.config.num_shifts
     cfg = roster_system.config
@@ -2747,6 +2751,11 @@ def optimize_fallback_lex_hard_first(
                         obj.append(-60 * _adj)
             if _fb_max_cov_off_equalize_terms:
                 obj.extend(_fb_max_cov_off_equalize_terms)
+            # 최종 lex 패스(옵션)용: stage3 목적식 항을 side-channel 에 보존.
+            try:
+                m._stage3_obj_terms = list(obj)  # type: ignore[attr-defined]
+            except Exception:
+                pass
             m.Maximize(sum(obj))
 
         return (
@@ -3284,6 +3293,56 @@ def optimize_fallback_lex_hard_first(
                 logger_prefix=logger_prefix,
             )
             return best_short == 0 and best_safe_sum == 0
+        # ── 최종 lex 패스: DDDDD 보장 강화 (기본 자동 ON, AIDE_D5_LEX=0 으로 끔) ──
+        # stage3 목적값을 동결(무회귀)한 뒤 D5 viol 합만 최소화하는 별도 solve.
+        # 자기-게이트: 잔여 D5=0 이면 스킵(무비용) → DDDDD 남은 병동에서만 자동 재-solve.
+        # payload/사용자 입력 불필요. (주의) postprocess/preceptee 경로 재유입은 별도.
+        #
+        # 인원수 게이트: 대형 병동은 freeze 재-solve 가 시간 내 못 풀고(UNKNOWN) 헛돎 →
+        # lex 가 실제로 잘 듣고 빠른 소인원 병동(기본 N<=15)에서만 자동 실행.
+        # AIDE_D5_LEX_MAXN 으로 임계 조절, AIDE_D5_LEX=0 으로 완전 비활성.
+        _lex_maxn = int(_os_tl3.environ.get("AIDE_D5_LEX_MAXN", 15) or 15)
+        _lex_on = (_os_tl3.environ.get("AIDE_D5_LEX", "1") != "0") and (N <= _lex_maxn)
+        if _lex_on:
+            _d5_vars = getattr(m3, "_ms_d5_lex_vars", None) or []
+            _obj_terms = getattr(m3, "_stage3_obj_terms", None)
+            if _d5_vars and _obj_terms is not None:
+                class _SkipLex(Exception):
+                    pass
+                try:
+                    _obj_val = int(round(s3.ObjectiveValue()))
+                    _d5_before = sum(int(s3.Value(v)) for v in _d5_vars)
+                    if _d5_before == 0:
+                        raise _SkipLex  # 잔여 DDDDD 없음 → 재-solve 불필요(대형병동 비용 0)
+                    m3.Add(sum(_obj_terms) >= _obj_val)  # maximize 라 품질 무회귀
+                    m3.Minimize(sum(_d5_vars))
+                    # 직전 stage3 해를 hint 로 seed → 재solve 가 feasible incumbent 에서 출발
+                    # (없으면 tight freeze 로 짧은 시간에 UNKNOWN → 개선 실패).
+                    m3.ClearHints()
+                    for _hn in range(N):
+                        for _hd in iter_nurse_days(_hn, join, leave, blocked_by_nurse):
+                            for _hs in range(S):
+                                try:
+                                    m3.AddHint(X3(_hn, _hd, _hs), int(s3.Value(X3(_hn, _hd, _hs))))
+                                except Exception:
+                                    pass
+                    _s3b = cp_model.CpSolver()
+                    _s3b.parameters.max_time_in_seconds = max(8, int(tl3))
+                    _s3b.parameters.num_search_workers = 8
+                    _st3b = _s3b.Solve(m3)
+                    if _st3b in (cp_model.OPTIMAL, cp_model.FEASIBLE) and \
+                            sum(int(_s3b.Value(v)) for v in _d5_vars) <= _d5_before:
+                        s3 = _s3b  # 개선(또는 동률)일 때만 채택
+                        print(f"{logger_prefix} 폴백3 D5-lex 패스: "
+                              f"status={_cp_sat_status_to_text(_st3b)} "
+                              f"D5 {_d5_before}→{int(round(_s3b.ObjectiveValue()))}")
+                    else:
+                        print(f"{logger_prefix} 폴백3 D5-lex 패스 실패("
+                              f"{_cp_sat_status_to_text(_st3b)}) → 원 해 유지")
+                except _SkipLex:
+                    pass  # 잔여 D5=0 → 스킵(무비용)
+                except Exception as _lex_e:
+                    print(f"{logger_prefix} 폴백3 D5-lex 패스 예외: {_lex_e}")
         try:
             short_items = [
                 (d, code, int(s3.Value(var)))

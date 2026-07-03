@@ -11,7 +11,7 @@ from services.cp_sat.hardcoded_weights import (
     PREFER_3N_BLOCK_PENALTY,
     PREFERENCE_SCORE_SCALE,
 )
-from services.cp_sat.allowed_shift_types import is_n_only_profile
+from services.cp_sat.allowed_shift_types import is_n_only_profile, normalize_allowed_shift_codes
 from services.constraints.team_constraints import add_team_min_constraints
 from services.constraints.team_grade_handoff_constraints import (
     add_team_grade_handoff_constraints,
@@ -302,22 +302,86 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
-    # 같은 시프트(D/E/N) 연속 ≤3 soft — 4연속(D D D D 등)부터 패널티
+    # 같은 시프트(D/E/N) 연속 soft — 4연속부터, 길이가 길수록 준지수 급증.
+    # 겹치는 다중 길이 창(4..K)마다 길이별 급증 가중치 → 런 길이 L의 총비용 f(L)이 볼록.
+    #   base=300, factor=4 → DDDD=300, DDDDD=1800, DDDDDD=8100 (4 현행 유지, 5+ 폭증).
+    # D전담/N전담(단일 시프트 전담)은 해당 코드 연속을 강제당하므로 제외(유령 페널티 방지).
     try:
         if bool(getattr(cfg, "max_same_shift", True)):
-            w_ms = int(getattr(cfg, "max_same_shift_penalty_weight", 0) or 0)
-            if w_ms > 0:
-                for code in ("D", "E", "N"):
-                    if code not in cfg.shift_types:
-                        continue
-                    s_idx = cfg.shift_types.index(code)
-                    for n in range(N):
-                        T0, T1 = join[n], leave[n]
-                        for d0 in range(T0, T1 - 3):
-                            sum_s = sum(X(n, d0 + t, s_idx) for t in range(4))
-                            viol = m.NewIntVar(0, 1, f"max_same_shift_fb_{code}_{n}_{d0}")
-                            m.Add(viol >= sum_s - 3)
-                            obj.append(-w_ms * viol)
+            import os as _os_ms
+            w_ms_base = int(_os_ms.environ.get(
+                "AIDE_SAME_SHIFT_BASE",
+                getattr(cfg, "max_same_shift_penalty_weight", 0)) or 0)
+            if w_ms_base > 0:
+                _use_mid_ms = bool(getattr(cfg, "use_mid", False))
+                _ms_mode = _os_ms.environ.get("AIDE_SAME_SHIFT_MODE", "d5add")
+                _ms_factor = float(_os_ms.environ.get(
+                    "AIDE_SAME_SHIFT_FACTOR",
+                    getattr(cfg, "max_same_shift_growth_factor", 4)) or 4)
+                _ms_K = int(getattr(cfg, "max_consecutive_work_days", 5) or 5)
+                _ms_kmax = int(_os_ms.environ.get("AIDE_SAME_SHIFT_KMAX", 0) or 0) or max(4, min(_ms_K, 6))
+                # D5 가중치는 ISOLATED_WORK_PENALTY(1500) 아래로 유지 (고립근무 > 5연속D).
+                _d5_w = int(_os_ms.environ.get(
+                    "AIDE_D5_WEIGHT", getattr(cfg, "d5_penalty_weight", 1200)) or 0)
+                _d5_lex_vars = []  # D 5연속 viol 핸들(옵션 최종 lex 패스용)
+
+                def _allowed_ms(n):
+                    return normalize_allowed_shift_codes(
+                        getattr(roster_system.nurses[n], "allowed_shifts", None), use_mid=_use_mid_ms)
+
+                if _ms_mode == "d5add":
+                    # Case 2: 원래 단일 win4(균등 base) + D 전용 win5 고weight 1개 추가.
+                    for code in ("D", "E", "N"):
+                        if code not in cfg.shift_types:
+                            continue
+                        s_idx = cfg.shift_types.index(code)
+                        for n in range(N):
+                            if _allowed_ms(n) == {code}:
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - 3):
+                                sum_s = sum(X(n, d0 + t, s_idx) for t in range(4))
+                                viol = m.NewIntVar(0, 1, f"max_same_shift_fb_{code}_{n}_{d0}")
+                                m.Add(viol >= sum_s - 3)
+                                obj.append(-w_ms_base * viol)
+                    if _d5_w > 0 and "D" in cfg.shift_types:
+                        d_idx = cfg.shift_types.index("D")
+                        for n in range(N):
+                            if _allowed_ms(n) == {"D"}:
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - 4):
+                                sum_d = sum(X(n, d0 + t, d_idx) for t in range(5))
+                                v5 = m.NewIntVar(0, 1, f"d5_fb_{n}_{d0}")
+                                m.Add(v5 >= sum_d - 4)
+                                obj.append(-_d5_w * v5)
+                                _d5_lex_vars.append(v5)
+                else:
+                    # escalate(기본): 겹치는 다중 길이 창(4..K) + 길이별 급증 가중치.
+                    for code in ("D", "E", "N"):
+                        if code not in cfg.shift_types:
+                            continue
+                        s_idx = cfg.shift_types.index(code)
+                        for wlen in range(4, _ms_kmax + 1):
+                            w_ms = int(round(w_ms_base * (_ms_factor ** (wlen - 4))))
+                            if w_ms <= 0:
+                                continue
+                            for n in range(N):
+                                if _allowed_ms(n) == {code}:
+                                    continue  # 단일 시프트 전담: 해당 코드 연속 강제 → 제외
+                                T0, T1 = join[n], leave[n]
+                                for d0 in range(T0, T1 - (wlen - 1)):
+                                    sum_s = sum(X(n, d0 + t, s_idx) for t in range(wlen))
+                                    viol = m.NewIntVar(0, 1, f"max_same_shift_fb_{code}_{wlen}_{n}_{d0}")
+                                    m.Add(viol >= sum_s - (wlen - 1))
+                                    obj.append(-w_ms * viol)
+                                    if code == "D" and wlen == 5:
+                                        _d5_lex_vars.append(viol)
+                # 최종 lex 패스(옵션)용 D5 viol 핸들을 모델 side-channel 에 stash.
+                try:
+                    m._ms_d5_lex_vars = _d5_lex_vars  # type: ignore[attr-defined]
+                except Exception:
+                    pass
     except Exception:
         pass
 

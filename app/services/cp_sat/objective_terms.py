@@ -1040,22 +1040,79 @@ def build_main_objective_terms(
     except Exception:
         pass
 
-    # (4-0c) 같은 시프트(D/E/N) 연속 ≤3 soft — 4연속(D D D D 등)부터 패널티
+    # (4-0c) 같은 시프트(D/E/N) 연속 soft.
+    # 기본(d5add): 원래 4연속 균등 페널티(base) + D 전용 5연속(DDDDD) 고가중(D5) 1개.
+    #   → DDDD 는 완만(base=300), DDDDD 는 강하게(+2000). 실측상 급증(escalate)보다
+    #     수렴 손상 없이 unwanted DDDDD 를 실질 0으로 억제(2026-07 시화 A/B).
+    # escalate(옵션): 다중 길이 창(4..K) 급증 가중치. env AIDE_SAME_SHIFT_MODE=escalate.
+    # D전담/N전담 등 단일 시프트 전담은 해당 코드 연속을 강제당하므로 제외(유령 페널티 방지).
     try:
         if bool(getattr(cfg, "max_same_shift", True)):
-            w_ms = int(getattr(cfg, "max_same_shift_penalty_weight", 0) or 0)
-            if w_ms > 0:
-                for code in ("D", "E", "N"):
-                    if code not in cfg.shift_types:
-                        continue
-                    s_idx = cfg.shift_types.index(code)
-                    for n in range(N):
-                        T0, T1 = join[n], leave[n]
-                        for d0 in range(T0, T1 - 3):
-                            sum_s = sum(X(n, d0 + t, s_idx) for t in range(4))
-                            viol = m.NewIntVar(0, 1, f"max_same_shift_{code}_{n}_{d0}")
-                            m.Add(viol >= sum_s - 3)
-                            obj.append(-w_ms * viol)
+            import os as _os_ms
+            w_ms_base = int(_os_ms.environ.get(
+                "AIDE_SAME_SHIFT_BASE",
+                getattr(cfg, "max_same_shift_penalty_weight", 0)) or 0)
+            if w_ms_base > 0:
+                _use_mid_ms = bool(getattr(cfg, "use_mid", False))
+                _ms_mode = _os_ms.environ.get("AIDE_SAME_SHIFT_MODE", "d5add")
+                _ms_factor = float(_os_ms.environ.get(
+                    "AIDE_SAME_SHIFT_FACTOR",
+                    getattr(cfg, "max_same_shift_growth_factor", 4)) or 4)
+                _ms_K = int(getattr(cfg, "max_consecutive_work_days", 5) or 5)
+                _ms_kmax = int(_os_ms.environ.get("AIDE_SAME_SHIFT_KMAX", 0) or 0) or max(4, min(_ms_K, 6))
+                # D5 가중치는 ISOLATED_WORK_PENALTY(1500) 아래로 유지 — 고립근무가
+                # 5연속D보다 더 나쁜 quality 이므로 D5 회피가 고립근무를 만들지 않게 한다.
+                # (lone_e 500 · n2n 300 위, isolated_work 1500 아래 = 1200.)
+                _d5_w = int(_os_ms.environ.get(
+                    "AIDE_D5_WEIGHT", getattr(cfg, "d5_penalty_weight", 1200)) or 0)
+
+                def _allowed_ms(n):
+                    return normalize_allowed_shift_codes(
+                        getattr(rs.nurses[n], "allowed_shifts", None), use_mid=_use_mid_ms)
+
+                if _ms_mode == "d5add":
+                    for code in ("D", "E", "N"):
+                        if code not in cfg.shift_types:
+                            continue
+                        s_idx = cfg.shift_types.index(code)
+                        for n in range(N):
+                            if _allowed_ms(n) == {code}:
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - 3):
+                                sum_s = sum(X(n, d0 + t, s_idx) for t in range(4))
+                                viol = m.NewIntVar(0, 1, f"max_same_shift_{code}_{n}_{d0}")
+                                m.Add(viol >= sum_s - 3)
+                                obj.append(-w_ms_base * viol)
+                    if _d5_w > 0 and "D" in cfg.shift_types:
+                        d_idx = cfg.shift_types.index("D")
+                        for n in range(N):
+                            if _allowed_ms(n) == {"D"}:
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - 4):
+                                sum_d = sum(X(n, d0 + t, d_idx) for t in range(5))
+                                v5 = m.NewIntVar(0, 1, f"d5_{n}_{d0}")
+                                m.Add(v5 >= sum_d - 4)
+                                obj.append(-_d5_w * v5)
+                else:
+                    for code in ("D", "E", "N"):
+                        if code not in cfg.shift_types:
+                            continue
+                        s_idx = cfg.shift_types.index(code)
+                        for wlen in range(4, _ms_kmax + 1):
+                            w_ms = int(round(w_ms_base * (_ms_factor ** (wlen - 4))))
+                            if w_ms <= 0:
+                                continue
+                            for n in range(N):
+                                if _allowed_ms(n) == {code}:
+                                    continue  # 단일 시프트 전담: 해당 코드 연속 강제 → 제외
+                                T0, T1 = join[n], leave[n]
+                                for d0 in range(T0, T1 - (wlen - 1)):
+                                    sum_s = sum(X(n, d0 + t, s_idx) for t in range(wlen))
+                                    viol = m.NewIntVar(0, 1, f"max_same_shift_{code}_{wlen}_{n}_{d0}")
+                                    m.Add(viol >= sum_s - (wlen - 1))
+                                    obj.append(-w_ms * viol)
     except Exception:
         pass
 
