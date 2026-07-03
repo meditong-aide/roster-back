@@ -5,6 +5,7 @@ from db.client2 import get_db
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
 from schemas.daily_shift_schema import DailyShiftReplace
+from services.group_access import resolve_effective_group
 from services.daily_shift_service import (
     get_or_init_month,
     replace_month_data,
@@ -29,8 +30,14 @@ async def get_month(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="인증 필요")
+    # 그룹 스코프 가드: 토큰 group_id 대신 nurse_id→DB + hn_id 로 해석/검증(외부 병동 403).
+    # office_id 도 caller 소속으로 고정해 (엉뚱한 office 로 seeding 되는 것 차단).
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+    office_id = current_user.office_id
     try:
-        return get_or_init_month(db, office_id, group_id, year, month)
+        return get_or_init_month(db, office_id, target_group_id, year, month)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"월 데이터 조회 실패: {e}")
 
@@ -49,13 +56,16 @@ async def put_month(
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="인증 필요")
+    # 그룹 스코프 가드: body.group_id 를 해석/검증(외부 병동 403), office_id 는 caller 소속으로 고정.
+    target_group_id = resolve_effective_group(db, current_user, body.group_id)
+    office_id = current_user.office_id
     try:
         bulk = body.month_summary.model_dump() if body.month_summary is not None else None
         if body.apply_summary_to_days:
             return apply_bulk_to_days(
                 db,
-                office_id=body.office_id,
-                group_id=body.group_id,
+                office_id=office_id,
+                group_id=target_group_id,
                 year=body.year,
                 month=body.month,
                 bulk=bulk,
@@ -67,8 +77,8 @@ async def put_month(
         m_list = body.date.M_count if body.date.M_count else [0] * len(d_list)
         return replace_month_data(
             db,
-            office_id=body.office_id,
-            group_id=body.group_id,
+            office_id=office_id,
+            group_id=target_group_id,
             year=body.year,
             month=body.month,
             d_list=d_list,
