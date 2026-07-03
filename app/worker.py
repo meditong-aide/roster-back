@@ -155,6 +155,8 @@ def process_job(payload: dict) -> dict:
         f"[worker][CallerTrace] job_id={job_id} nurse_id={nurse_id} "
         f"group_id={job_group_id} account_id={payload.get('account_id')} "
         f"office_id={payload.get('office_id')} requested_at={payload.get('requested_at')} "
+        f"client_ip={payload.get('client_ip')} x_forwarded_for={payload.get('x_forwarded_for')!r} "
+        f"user_agent={payload.get('user_agent')!r} "
         f"payload_keys={list(payload.keys())}"
     )
 

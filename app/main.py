@@ -260,15 +260,15 @@ async def _trace_roster_create_callers(request: Request, call_next):
         real_ip = xff.split(",")[0].strip() if xff else (
             request.client.host if request.client else "-"
         )
-        _scheduler_logger.warning(
-            "[CallerTrace] %s %s client_ip=%s xff=%r ua=%r referer=%r cookie_present=%s",
-            request.method,
-            path,
-            real_ip,
-            xff,
-            request.headers.get("user-agent", "-"),
-            request.headers.get("referer", "-"),
-            "access_token" in (request.headers.get("cookie", "") or ""),
+        # print 사용: 워커에서 print 는 CloudWatch 에 확실히 떴다(logging.warning 은 앱
+        # 로깅 설정에 따라 stdout 으로 안 나갈 수 있음). flush=True 로 버퍼링 방지.
+        print(
+            f"[CallerTrace] {request.method} {path} "
+            f"client_ip={real_ip} xff={xff!r} "
+            f"ua={request.headers.get('user-agent', '-')!r} "
+            f"referer={request.headers.get('referer', '-')!r} "
+            f"cookie_present={'access_token' in (request.headers.get('cookie', '') or '')}",
+            flush=True,
         )
     return await call_next(request)
 

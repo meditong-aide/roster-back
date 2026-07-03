@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 import dotenv
 from anyio import to_thread
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -152,6 +152,7 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
 @router.post("/roster_create/async")
 async def roster_create_async(
     req: RosterRequest,
+    request: Request,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     _db: Session = Depends(get_db),
     wait_for_result: bool = False,
@@ -217,6 +218,15 @@ async def roster_create_async(
                 status_code=500, detail=f"근무표 생성 실패: {exc}"
             ) from exc
 
+    # 진단용: 호출자 추적. 백엔드 stdout 로그 파이프에 의존하지 않고, 클라이언트 IP/UA 를
+    # SQS 페이로드에 실어 워커(검증된 람다 로그 파이프)에서 찍는다.
+    # ALB/CloudFront 뒤 실제 IP 는 X-Forwarded-For 첫 항목.
+    _xff = request.headers.get("x-forwarded-for", "")
+    _client_ip = _xff.split(",")[0].strip() if _xff else (
+        request.client.host if request.client else "-"
+    )
+    _user_agent = request.headers.get("user-agent", "-")
+
     job_body: Dict[str, Any] = {
         "job_id": (
             f"job-{current_user.nurse_id}-"
@@ -229,6 +239,9 @@ async def roster_create_async(
         "group_id": target_group_id,
         "params": req.dict(),
         "requested_at": datetime.utcnow().isoformat(),
+        "client_ip": _client_ip,
+        "x_forwarded_for": _xff,
+        "user_agent": _user_agent,
     }
 
     # 상태 테이블에 Job 생성(QUEUED)
