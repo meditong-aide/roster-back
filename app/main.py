@@ -246,6 +246,33 @@ app.add_middleware(
 )
 
 
+# --- 진단용: /roster_create 계열 요청의 실제 호출자(IP/UA) 추적 ---
+# 442171 유령 job 원인 추적. SQS 재전송 경로(SQS→Lambda→worker)는 이 미들웨어를
+# 절대 거치지 않으므로: 여기에 로그가 찍히면 "살아있는 HTTP 재-POST" 라는 결정적 증거이고,
+# 안 찍히는데도 슬랙 실패 알림이 계속 뜨면 "순수 SQS 재전송" 이 확정된다.
+# ALB access log 부재로 최초 요청 IP 는 유실됐지만, 다음 HTTP 호출은 여기서 잡는다.
+@app.middleware("http")
+async def _trace_roster_create_callers(request: Request, call_next):
+    path = request.url.path
+    if "/roster_create/" in path:
+        xff = request.headers.get("x-forwarded-for", "")
+        # ALB 뒤에서는 request.client.host 가 LB IP → 진짜 클라이언트는 XFF 첫 항목.
+        real_ip = xff.split(",")[0].strip() if xff else (
+            request.client.host if request.client else "-"
+        )
+        _scheduler_logger.warning(
+            "[CallerTrace] %s %s client_ip=%s xff=%r ua=%r referer=%r cookie_present=%s",
+            request.method,
+            path,
+            real_ip,
+            xff,
+            request.headers.get("user-agent", "-"),
+            request.headers.get("referer", "-"),
+            "access_token" in (request.headers.get("cookie", "") or ""),
+        )
+    return await call_next(request)
+
+
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 app.include_router(contact_router)

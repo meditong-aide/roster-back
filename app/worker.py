@@ -148,6 +148,16 @@ def process_job(payload: dict) -> dict:
     job_group_id = payload.get("group_id")
     params = payload.get("params", {})
 
+    # --- 진단용: 유령 job(442171) 원점 추적 ---
+    # SQS 메시지엔 최초 enqueue 시각(requested_at)이 그대로 보존되므로, 매 재전송마다
+    # 이 로그가 원래 요청 시각 + 전체 컨텍스트를 남긴다. DB created_at 이 갱신돼도 원점 특정 가능.
+    print(
+        f"[worker][CallerTrace] job_id={job_id} nurse_id={nurse_id} "
+        f"group_id={job_group_id} account_id={payload.get('account_id')} "
+        f"office_id={payload.get('office_id')} requested_at={payload.get('requested_at')} "
+        f"payload_keys={list(payload.keys())}"
+    )
+
     if not nurse_id:
         raise ValueError("nurse_id 값이 필요합니다")
 
