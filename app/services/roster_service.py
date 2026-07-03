@@ -285,6 +285,10 @@ def save_roster_config_service(
                 db_config.config_name = config_name
             if config_memo is not None:
                 db_config.config_memo = config_memo
+            # ★version 이 NULL(레거시/default-seed 프리셋)이면 저장 시 채번 —
+            #   업데이트 경로엔 원래 채번이 없어 NULL 프리셋이 저장해도 계속 NULL(=/config/versions 목록 누락)이었음.
+            if db_config.version is None:
+                db_config.version = _next_config_version(db, target_office_id, target_group_id)
         else:
             # 신규 프리셋 — 그룹(office+group)별 version = MAX+1 (0부터)
             db_config = RosterConfigModel(
@@ -311,6 +315,39 @@ def save_roster_config_service(
         print(f'설정 저장 오류: {str(e)}')
         db.rollback()
         raise
+
+
+def unsave_roster_config_service(
+    config_id: int,
+    current_user,
+    db: Session,
+    override_group_id: str | None = None,
+):
+    """저장 설정(프리셋) 미노출 — version 을 NULL 로 되돌려 일반(ad-hoc) 설정으로 변경.
+
+    row/config_id/설정값은 그대로 유지(FK·근무표 이력·재사용 영향 없음). /config/versions
+    프리셋 목록에서만 빠진다. 다시 저장하면 _next_config_version 로 재채번되어 목록에 복귀.
+    """
+    # 권한은 엔드포인트(DELETE /config/{id})에서 검증(HN 본인그룹 / ADM group_id) — save 서비스와 동일 패턴(서비스 무검증).
+    if override_group_id:
+        group_row = db.query(Group).filter(Group.group_id == override_group_id).first()
+        if not group_row:
+            raise HTTPException(status_code=404, detail="지정한 그룹을 찾을 수 없습니다.")
+        target_group_id, target_office_id = group_row.group_id, group_row.office_id
+    else:
+        nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
+        target_group_id, target_office_id = current_user.group_id, nurse.office_id
+    cfg = db.query(RosterConfigModel).filter(
+        RosterConfigModel.config_id == config_id,
+        RosterConfigModel.office_id == target_office_id,
+        RosterConfigModel.group_id == target_group_id,
+    ).first()
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="해당 설정(config_id)을 찾을 수 없습니다.")
+    cfg.version = None
+    db.commit()
+    return {"message": "저장 설정 해제 — 일반 설정으로 변경", "config_id": config_id}
+
 
 def get_latest_schedule_service(current_user, db: Session, override_group_id: str | None = None):
     """

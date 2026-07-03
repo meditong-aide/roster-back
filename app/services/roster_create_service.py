@@ -4357,6 +4357,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     current_user.group_id = resolve_effective_group(
         db, current_user, getattr(req, "group_id", None)
     )
+    # 모달 payload(req.config) 제공 시 생성 직전 config row 로 materialize(굳히기) → req.config_id 세팅.
+    #   /async 라우터는 이미 materialize 후 req.config=None 으로 넘겨 여기선 no-op(이중 생성 방지).
+    #   /roster_create/generate(로컬 sync) 등 config 를 실어 직접 호출하는 경로는 여기서 materialize 되어
+    #   ① config row('새로운 설정n' 또는 baseline 재사용)가 생성/확정되고 ② 편집값으로 생성된다(기존엔 baseline 무시 버그).
+    if getattr(req, "config", None):
+        from services.roster_service import materialize_generation_config
+        from schemas.roster_schema import RosterConfigCreate
+        _mat = materialize_generation_config(
+            db, RosterConfigCreate(**req.config), current_user,
+            override_group_id=current_user.group_id,
+        )
+        req.config_id = _mat.config_id
+        req.config = None
     wanted = (
         db.query(Wanted)
         .filter(
