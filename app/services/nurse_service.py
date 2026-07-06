@@ -349,6 +349,25 @@ def get_nurses_in_group_service(
                 NurseModel.nurse_id.in_(select(_outbound_transfer_subq.c.nurse_id)),
             )
         )
+        # [전출 제외] 조회 월(月) 기준 이미 떠난 사람은 목록에서 뺀다(/members 와 동일 기준).
+        #   병동이동 start_date <= 월초 이면 그 달 내내 소속이 target → source 목록에서 제외.
+        #   flush 전(미래 발효)이라 nurses.group_id 가 아직 source 여도 위 조건1 로 잡히던 것을 차단.
+        #   month 미제공(일반 목록)에는 월 기준이 없어 적용하지 않는다(기존 동작 유지).
+        if year and month:
+            _outbound_effective_subq = (
+                db.query(NurseAssignment.nurse_id)
+                .filter(
+                    NurseAssignment.source_group_id == _gid,
+                    NurseAssignment.target_group_id != _gid,
+                    NurseAssignment.reason == "병동이동",
+                    NurseAssignment.status == "active",
+                    NurseAssignment.start_date <= date(year, month, 1),
+                )
+                .subquery()
+            )
+            query = query.filter(
+                ~NurseModel.nurse_id.in_(select(_outbound_effective_subq.c.nurse_id))
+            )
 
     # 특정 nurse_id 필터링
     if nurse_id:
