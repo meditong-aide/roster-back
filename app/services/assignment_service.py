@@ -948,6 +948,28 @@ def get_assignment_status_counts(
     return AssignmentStatusCounts(**counts)
 
 
+def month_overlap_assignment_clauses(year: int, month: int) -> list:
+    """assignment 이 (year, month) 와 기간이 겹치는지 판정하는 SQLAlchemy 필터절 목록.
+
+    effective_end = end_date ?? expected_end_date. NULL(무기한 파견/휴직·퇴사·open 프리셉티 등)
+    이면 시작월부터 계속 포함(미래월 유지), 확정 종료일이 있으면 그 월 이후 제외.
+    get_active_assignments_for_month 와 nurse_service 인바운드 빌더가 공유하는 단일 술어
+    (요청 월과 무관한 과거 파견/이동 항목이 응답에 누수되는 것을 차단).
+    """
+    from calendar import monthrange
+    from sqlalchemy import case
+    month_start = date(year, month, 1)
+    month_end = date(year, month, monthrange(year, month)[1])
+    _effective_end = case(
+        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+        else_=NurseAssignment.expected_end_date,
+    )
+    return [
+        NurseAssignment.start_date <= month_end,
+        or_(_effective_end.is_(None), _effective_end >= month_start),
+    ]
+
+
 def get_active_assignments_for_month(
     db: Session,
     group_id: str,
@@ -955,25 +977,11 @@ def get_active_assignments_for_month(
     month: int,
 ) -> list[NurseAssignment]:
     """특정 월 기준 배정 레코드 조회 (active + completed 포함, flush 후에도 유지)"""
-    from calendar import monthrange
-    month_start = date(year, month, 1)
-    month_end = date(year, month, monthrange(year, month)[1])
-
-    # end_date 또는 expected_end_date 중 확정된 값이 해당 월 이전이면 제외
-    from sqlalchemy import case, func as sa_func
-    _effective_end = case(
-        (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
-        else_=NurseAssignment.expected_end_date,
-    )
     return (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.status.in_(["active", "completed"]),
-            NurseAssignment.start_date <= month_end,
-            or_(
-                _effective_end.is_(None),
-                _effective_end >= month_start,
-            ),
+            *month_overlap_assignment_clauses(year, month),
             or_(
                 NurseAssignment.source_group_id == group_id,
                 NurseAssignment.target_group_id == group_id,

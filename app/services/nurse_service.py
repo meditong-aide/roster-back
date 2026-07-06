@@ -16,7 +16,7 @@ from db.models import (
     RosterConfig as RosterConfigModel,
     Shift,
 )
-from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP, group_members_in_month
+from services.assignment_service import _SOURCE_TO_TARGET_FIELD_MAP, group_members_in_month, month_overlap_assignment_clauses
 from services.group_access import resolve_managed_group_ids, caller_is_head_nurse, resolve_home_group_id, caller_is_hn
 from schemas.roster_schema import NurseProfile, NurseProfileUpdate
 from schemas.auth_schema import User as UserSchema
@@ -397,8 +397,10 @@ def get_nurses_in_group_service(
     if nurses:
         _nids = [n.nurse_id for n in nurses]
         if _gid:
-            inbound_map = _load_inbound_map(db, _gid, _nids)
-        inbound_blocks = _build_inbound_blocks(db, _nids, caller_group_id=_gid)
+            inbound_map = _load_inbound_map(db, _gid, _nids, year=year, month=month)
+        inbound_blocks = _build_inbound_blocks(
+            db, _nids, caller_group_id=_gid, year=year, month=month
+        )
 
     # preceptor → preceptees 배치 로드 (프리셉터 사이드 프로필에 N명 노출용)
     preceptees_map: Dict[str, List[Dict[str, Any]]] = _load_preceptees_map(db, nurses)
@@ -2901,11 +2903,20 @@ def _apply_target_update(
 
 
 def _load_inbound_map(
-    db: Session, caller_group_id: str, nurse_ids: List[str]
+    db: Session, caller_group_id: str, nurse_ids: List[str],
+    year: Optional[int] = None, month: Optional[int] = None,
 ) -> Dict[str, NurseAssignment]:
-    """caller_group_id가 target인 간호사들의 최신 active inbound assignment 일괄 로드."""
+    """caller_group_id가 target인 간호사들의 최신 active inbound assignment 일괄 로드.
+
+    year/month 지정 시 요청 월과 기간이 겹치는 assignment 만 반환(비파견 월 누수 차단).
+    """
     if not nurse_ids:
         return {}
+    _month_clauses = (
+        month_overlap_assignment_clauses(year, month)
+        if year is not None and month is not None
+        else []
+    )
     rows = (
         db.query(NurseAssignment)
         .filter(
@@ -2913,6 +2924,7 @@ def _load_inbound_map(
             NurseAssignment.target_group_id == caller_group_id,
             NurseAssignment.status == "active",
             NurseAssignment.reason.in_(_INBOUND_REASONS),
+            *_month_clauses,
         )
         .order_by(NurseAssignment.start_date.desc())
         .all()
@@ -2928,6 +2940,8 @@ def _build_inbound_blocks(
     db: Session,
     nurse_ids: List[str],
     caller_group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """간호사별 활성 파견/병동이동/휴직/퇴사/프리셉티 블록 구성.
 
@@ -2954,12 +2968,18 @@ def _build_inbound_blocks(
                 NurseAssignment.source_group_id == caller_group_id,
             ),
         )
+    _month_clauses = (
+        month_overlap_assignment_clauses(year, month)
+        if year is not None and month is not None
+        else []
+    )
     rows = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.nurse_id.in_(nurse_ids),
             _status_clause,
             NurseAssignment.reason.in_(_STATUS_DISPLAY_REASONS),
+            *_month_clauses,
         )
         .order_by(NurseAssignment.start_date.asc())
         .all()
