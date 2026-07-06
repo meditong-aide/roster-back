@@ -2242,13 +2242,10 @@ async def export_schedule_excel(
 
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if not (
-        getattr(current_user, "is_head_nurse", False)
-        or getattr(current_user, "is_master_admin", False)
-    ):
-        raise HTTPException(status_code=403, detail="권한이 없습니다.")
 
-    # 그룹은 스케줄 행에서, 권한은 assert_caller_can_access_group 으로 검증 — IDOR 방지.
+    # 근무표 조회는 일반 근무자도 보는 탭이므로 다운로드도 그룹원 전체에 허용한다.
+    # HN/ADM 코스 게이트 제거 — 권한은 _load_schedule_for_caller → assert_caller_can_access_group
+    # 으로 그룹 스코프만 검증한다(자기 그룹/관리 그룹/ADM 만 통과, 타 그룹은 403 = IDOR 방지).
     schedule = _load_schedule_for_caller(db, current_user, schedule_id)
     target_group_id = schedule.group_id
     try:
@@ -2271,6 +2268,9 @@ async def export_schedule_excel(
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "X-Roster-TeamView": "1" if team_view_applied else "0",
                 "Access-Control-Expose-Headers": "X-Roster-TeamView",
+                # 다운로드는 항상 최신본 — Cache-Control 부재 시 CloudFront/브라우저가 캐싱해
+                # 조건부요청에 304 를 돌려주고 fetch(response.ok=false)가 다운로드 실패 처리함(cf. jobs.py).
+                "Cache-Control": "no-store",
             },
         )
     except HTTPException:
