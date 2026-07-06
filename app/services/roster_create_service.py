@@ -1097,6 +1097,56 @@ def _overlay_fixed_roster_with_special_requests(
     return fixed_roster
 
 
+def _overlay_fixed_roster_with_fixed_wanted(
+    db: Session,
+    fixed_roster: dict[str, list[str]],
+    group_id: str,
+    year: int,
+    month: int,
+) -> dict[str, list[str]]:
+    """고정 근무자 스케줄에 확정 원티드(fixed_wanted_entries)를 덮어씌운다.
+
+    고정 근무자는 솔버를 우회해 평일=fixed_shift 로 채워지므로, 수간호사가 확정한
+    간호사별·날짜별 근무(예: 특정 평일 OFF)가 반영되지 않던 누락을 보정한다.
+    is_applied=True 항목만, shift_date 의 일(day)을 인덱스로 shift_id 를 적용한다.
+    """
+    if not fixed_roster:
+        return fixed_roster
+    nurse_ids = list(fixed_roster.keys())
+    if not nurse_ids:
+        return fixed_roster
+    days_in_month = calendar.monthrange(year, month)[1]
+    entries = (
+        db.query(FixedWantedEntry)
+        .filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            # MSSQL BIT: == True(=1) 사용. .is_(True) 는 'IS 1' 로 렌더돼 MSSQL 오류.
+            FixedWantedEntry.is_applied == True,  # noqa: E712
+            FixedWantedEntry.nurse_id.in_(nurse_ids),
+        )
+        .all()
+    )
+    for e in entries:
+        nurse_id = str(e.nurse_id)
+        row = fixed_roster.get(nurse_id)
+        if not row or e.shift_date is None:
+            continue
+        day = e.shift_date.day
+        if day <= 0 or day > days_in_month:
+            continue
+        day_idx = day - 1
+        if day_idx >= len(row):
+            continue
+        code = str(e.shift_id or "").strip()
+        if not code:
+            continue
+        row[day_idx] = code
+        fixed_roster[nurse_id] = row
+    return fixed_roster
+
+
 def _compute_weekly_off_day_indices_for_month(
     db: Session,
     office_id: str,
@@ -5468,6 +5518,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         sunday_code="주",
         shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
         weekly_off_active=bool(config_dict.get("weekly_off_settings_activate", False)),
+    )
+    # 확정 원티드(fixed_wanted_entries, is_applied=True) 오버레이 — 고정근무자 평일 확정근무(예: OFF) 반영.
+    # 솔버 우회로 평일=fixed_shift 만 채워지던 누락을 보정. 특수요청(휴가/교육)은 아래에서 최종 우선.
+    fixed_roster = _overlay_fixed_roster_with_fixed_wanted(
+        db, fixed_roster, current_user.group_id, req.year, req.month,
     )
     fixed_roster = _overlay_fixed_roster_with_special_requests(
         fixed_roster=fixed_roster,
