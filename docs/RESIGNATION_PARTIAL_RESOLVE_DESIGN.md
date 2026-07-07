@@ -244,8 +244,10 @@ CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 groundin
 
 - **A. 설계 문서화** (본 문서) — 완료
 - **B. draft/버전 메커니즘 조사** → 저장 전략 확정 (§6.2) — 완료(기존 draft/version/issued 재사용, 신규 테이블 0)
-- **C. 앵커 목적항 PoC** — fallback objective에 변경 페널티 term 실제 삽입, 소규모 재현
-- **D. 오케스트레이션 서비스 + diff 산출**
+- **C. 앵커 목적항 PoC** — 완료.
+  - 구현: `fallback_objectives.py` return 직전, `roster_system.partial_resolve_anchor` 있을 때만 형태A(w_cell)/B(w_nurse) 항 추가. 속성 없으면 no-op(회귀 0, 솔버 테스트 10개 통과 확인).
+  - 검증: `tests/test_partial_resolve_anchor.py` — 앵커만으로 원본 재현(변경0) / 퇴사 시 n1·n2 원본 유지 + 빈자리 최소 변경 흡수 / 형태B 인원 집중. 3 passed.
+- **D. 오케스트레이션 서비스 + diff 산출** — `partial_resolve_anchor` 채우기(원본 entries→{(n,d):s_idx}), resignation_date 세팅, 프리셉터 period 재지정, 특수근무 drop, warm-start hint, draft 저장
 - **E. `resolve-resignation` 스킬**
 - **F. 회귀 검증** — 파라미터→조건 적용→결과 품질 3단계, 통계 보존 확인
 

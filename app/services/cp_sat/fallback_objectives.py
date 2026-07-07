@@ -585,4 +585,47 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
+    # ── 부분 재생성: 변경 최소화 앵커 (partial_resolve_anchor 있을 때만) ──
+    # 퇴사자 대응 부분 재생성에서 "원본 근무표에 가장 가까운 해"를 tie-breaker로
+    # 선택하기 위한 Stage 3 최하위 목적항. 속성이 없으면 완전 no-op(정상 생성 회귀 0).
+    #   roster_system.partial_resolve_anchor = {
+    #       "orig": {(n_idx, d_idx): s_idx, ...},  # 자유 셀의 원본 시프트 인덱스
+    #       "w_cell": int,   # 형태 A(셀 Hamming) weight, 기본 1
+    #       "w_nurse": int,  # 형태 B(건드린 인원) weight, 기본 0(=미사용)
+    #   }
+    # weight 조건: w_cell·(자유셀수) 및 w_nurse·(인원수)가 기존 S3 최소 weight보다 작아야
+    #   tie-breaker로만 작동(원티드/공정성 불침해). 설계문서 §4.1① 합성보장 참조.
+    try:
+        _anchor = getattr(roster_system, "partial_resolve_anchor", None)
+        if _anchor:
+            _orig = _anchor.get("orig") or {}
+            _w_cell = int(_anchor.get("w_cell", 1) or 0)
+            _w_nurse = int(_anchor.get("w_nurse", 0) or 0)
+            _by_nurse: dict[int, list[tuple[int, int]]] = {}
+            _cnt = 0
+            for (n, d), s_star in _orig.items():
+                n, d, s_star = int(n), int(d), int(s_star)
+                if not (0 <= n < N and 0 <= d < D and 0 <= s_star < S):
+                    continue
+                if d < join[n] or d > leave[n]:
+                    continue
+                # 형태 A: 원본 유지 보상(=변경 시 보상 상실). X(n,d,s*)가 원본 유지 지시자.
+                if _w_cell > 0:
+                    obj.append(_w_cell * X(n, d, s_star))
+                _by_nurse.setdefault(n, []).append((d, s_star))
+                _cnt += 1
+            # 형태 B: 건드린 인원 최소화. touched_n >= 1 - X(n,d,s*) → 하나라도 바뀌면 1.
+            if _w_nurse > 0:
+                for n, cells in _by_nurse.items():
+                    touched = m.NewBoolVar(f"anchor_touched_{n}")
+                    for (d, s_star) in cells:
+                        m.Add(touched >= 1 - X(n, d, s_star))
+                    obj.append(-_w_nurse * touched)
+            print(
+                f"{logger_prefix} [PartialResolveAnchor] free_cells={_cnt} "
+                f"nurses={len(_by_nurse)} w_cell={_w_cell} w_nurse={_w_nurse}"
+            )
+    except Exception as _anchor_exc:
+        print(f"{logger_prefix} [PartialResolveAnchor] 앵커 항 실패(무시): {_anchor_exc}")
+
     return obj
