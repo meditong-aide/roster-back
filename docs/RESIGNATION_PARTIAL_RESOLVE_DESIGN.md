@@ -133,7 +133,9 @@ subject to  S1 잠금(커버리지=최적, 등식) · S2 잠금(ND/NE·연속·�
   - (a) weight 바운딩 — 간단, 초기 채택.
   - (b) 별도 Stage 3.5 lex 패스(원티드·공정성 고정 후 앵커만 최소화) — tie-breaker를 수학적으로 100% 보장, 회귀 시 승격.
 
-**② 오케스트레이션 서비스** `partial_resolve_on_resignation(schedule_id, resigned_nurse_id, cutoff_date)`
+**② 부분 재생성 서비스 (wrapper)** `partial_resolve_on_resignation(schedule_id, resigned_nurse_id, cutoff_date)`
+
+> 트리거는 **UI → REST**다. 관리자가 화면에서 "N일 퇴사 → 재조정"을 실행하면 프론트가 엔드포인트(`POST /roster_create/partial-resolve/resignation`)를 직접 호출한다. 이 서비스는 기존 생성(`generate_roster_service`)을 감싸 앞[동결 준비]·뒤[diff]를 붙인 **얇은 wrapper**일 뿐, **에이전트(agents_v2)·스킬·챗과 무관**하다.
 
 1. 기존 `ScheduleEntry` 로드 → cutoff 이전 셀을 `fixed_cells`로 변환 (`cp_sat_basic.py:2591` 소비 포맷 그대로).
 2. 퇴사자를 cutoff 이후 공급에서 제외 → **엔진 기존 `resignation_date` 메커니즘 재사용** (`fallback_lex.py:216-232`이 `nu.resignation_date` 이후 변수 생성을 스킵). 별도 OFF 핀 불필요. 퇴사자의 cutoff 이후 fixed_wanted/특수근무·프리셉터 관계는 이 단계에서 정리(§6.3, §6.4).
@@ -150,9 +152,9 @@ subject to  S1 잠금(커버리지=최적, 등식) · S2 잠금(ND/NE·연속·�
 - 원티드: `NurseShiftRequest` score → objective
 - 공정성(나이트/OFF 균등, KLD grade balance): 기존 fallback objective 항
 
-### 4.3 신규 스킬 `resolve-resignation`
+### 4.3 트리거 = UI → REST (에이전트 스킬은 스코프 아웃)
 
-CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 grounding(퇴사자 이름→id, "3월 15일"→date를 스킬 내부에서 해석). auto-apply 안 하고 diff 제안 반환 (현행 `repair-schedule` 철학과 일치, `app/agents_v2/skills/repair_schedule.py:15-19`).
+본 기능은 **UI-driven**이다. 관리자 화면의 "N일 퇴사 → 재조정" 액션이 REST 엔드포인트를 직접 호출한다. 에이전트 챗/스킬로 트리거하는 `resolve-resignation` 스킬은 **현재 스코프에서 제외**한다(에이전트 작업과 결합 회피). 추후 에이전트 트리거가 필요하면 grounding 스킬을 별도 추가하면 되지만, 지금은 만들지 않는다.
 
 ## 5. 백필 정책
 
@@ -247,13 +249,13 @@ CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 groundin
 - **C. 앵커 목적항 PoC** — 완료.
   - 구현: `fallback_objectives.py` return 직전, `roster_system.partial_resolve_anchor` 있을 때만 형태A(w_cell)/B(w_nurse) 항 추가. 속성 없으면 no-op(회귀 0, 솔버 테스트 10개 통과 확인).
   - 검증: `tests/test_partial_resolve_anchor.py` — 앵커만으로 원본 재현(변경0) / 퇴사 시 n1·n2 원본 유지 + 빈자리 최소 변경 흡수 / 형태B 인원 집중. 3 passed.
-- **D. 오케스트레이션 서비스 + diff 산출** — 완료.
+- **D. 부분 재생성 서비스(wrapper) + diff 산출** — 완료.
   - `resignation_partial_resolve_service.partial_resolve_on_resignation` + 엔드포인트 `POST /roster_create/partial-resolve/resignation`.
   - `roster_create_service._apply_partial_resolve_context`: 원본 entries → prefix `fixed_cells`(동결) + suffix anchor `orig`(시프트 **코드** 저장, 인덱스 해석은 소비측 `cfg.shift_types` 기준 — shift_types 순서 가정 제거). nurse_index는 `_build_engine_nurse_index_map`(솔버 정렬키 동일)로 정합.
   - resignation_date = **cutoff-1**(inclusive last-active 규약), 프리셉터 `nurse_preceptee_period` 이관/해제, 동결 prefix는 원본 entries로 **verbatim 복원**(변형·수동편집 보존).
   - diff: `cells_changed`(퇴사자 vacated 제외) / `nurses_touched` / `kind` 분류 / **커버리지 미달 warnings**(§6.1 가시화, draft 그리드 직접 스캔).
   - 검증: `tests/test_resignation_orchestration.py`(매핑·복원·diff) + `tests/test_resignation_coverage_warnings.py`. 회귀: 솔버 13개 통과.
-- **E. `resolve-resignation` 스킬** — 미착수(엔드포인트는 있음. agentic 스킬 래핑 잔여).
+- ~~**E. `resolve-resignation` 스킬**~~ — **스코프 아웃**. 기능은 UI→REST로 완결, 에이전트와 분리(§4.3). 필요 시 후속.
 - **F. 회귀 검증** — 파라미터→조건 적용→결과 품질 3단계, 통계 보존 확인(실 병동 e2e 잔여).
 
 ## 9. 변경 인원 표시 (Diff Response) 설계
