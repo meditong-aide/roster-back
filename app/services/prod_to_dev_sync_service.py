@@ -59,6 +59,17 @@ CONFLICT_DELETE_KEYS = {
     "nurse_monthly_limits": ["nurse_id", "group_id", "year", "month"],  # UNIQUE(id 불일치)
 }
 
+# leaf satellite (자기 id 를 FK 로 참조하는 곳 없음) — 마이그 시 prod id 를 보존하지 않고
+# dev 가 identity 재발번한다. dev/prod 가 독립 identity 라 id 를 보존하면 스코프 밖
+# 다른 nurse/group 행과 PK 충돌(2627). 정합성·스코프는 nurse_id/group_id+valid_from 으로
+# 유지되므로 surrogate id 는 버려도 안전.
+REGENERATE_ID_TABLES = {
+    "nurse_grade_period",
+    "nurse_allowed_shift_period",
+    "nurse_weekendoff_period",
+    "nurse_preceptee_period",
+}
+
 # (table, mode) — FK 부모 → 자식 순서
 # mode="wipe":  dev 전체 삭제 후 prod 복사 (마스터 — prod 완전 미러)
 # mode="upsert": MERGE (prod row 있으면 UPDATE, 없으면 INSERT, dev-only 보존)
@@ -348,6 +359,8 @@ def _copy_prod_to_dev(
     dev_cols = _get_columns(db, DEV_DB, table)
     prod_cols = set(_get_columns(db, PROD_DB, table))
     common = [c for c in dev_cols if c in prod_cols]
+    if table in REGENERATE_ID_TABLES:  # id 재발번 — prod id 미보존(cross-nurse/group 충돌 회피)
+        common = [c for c in common if c.lower() != "id"]
     if not common:
         return {"table": table, "skipped": "no_common_cols", "inserted": 0}
 
@@ -375,7 +388,7 @@ def _copy_prod_to_dev(
     col_list = ", ".join(f"[{c}]" for c in common)
     sel_list = ", ".join(f"src.[{c}]" for c in common)
 
-    has_identity = _has_identity(db, DEV_DB, table)
+    has_identity = _has_identity(db, DEV_DB, table) and table not in REGENERATE_ID_TABLES
 
     sql = (
         f"INSERT INTO {DEV_DB}.dbo.[{table}] ({col_list}) "
@@ -405,6 +418,8 @@ def _wipe_by_parent_fk(
     dev_cols = _get_columns(db, DEV_DB, table)
     prod_cols = set(_get_columns(db, PROD_DB, table))
     common = [c for c in dev_cols if c in prod_cols]
+    if table in REGENERATE_ID_TABLES:  # id 재발번 — prod id 미보존(충돌 회피)
+        common = [c for c in common if c.lower() != "id"]
     if not common:
         return {"table": table, "skipped": "no_common_cols", "mode": "wipe_by_parent"}
     ph = ", ".join(f":ig{i}" for i in range(len(group_ids)))
@@ -420,7 +435,7 @@ def _wipe_by_parent_fk(
         f"SELECT {sel_list} FROM {PROD_DB}.dbo.[{table}] AS src "
         f"WHERE src.[{fk_col}] IN ({prod_sub})"
     )
-    has_identity = _has_identity(db, DEV_DB, table)
+    has_identity = _has_identity(db, DEV_DB, table) and table not in REGENERATE_ID_TABLES
     if has_identity:
         db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.[{table}] ON"))
     try:
@@ -429,6 +444,27 @@ def _wipe_by_parent_fk(
         if has_identity:
             db.execute(text(f"SET IDENTITY_INSERT {DEV_DB}.dbo.[{table}] OFF"))
     return {"table": table, "mode": "wipe_by_parent", "deleted": deleted, "inserted": inserted}
+
+
+def _full_mirror_regen(db: Session, table: str) -> dict:
+    """REGENERATE_ID_TABLES 전체 미러: dev 전체 DELETE + prod 전체 INSERT(id 제외 재발번).
+    group_id 없는 leaf satellite → full-sync/exclude 모드에서 스코프 대상 아님(전체 교체).
+    id 를 보존하지 않으므로 IDENTITY_INSERT 불필요(dev auto-gen), cross-dev/prod PK 충돌 없음."""
+    dev_cols = _get_columns(db, DEV_DB, table)
+    prod_cols = set(_get_columns(db, PROD_DB, table))
+    common = [c for c in dev_cols if c in prod_cols and c.lower() != "id"]
+    if not common:
+        return {"table": table, "skipped": "no_common_cols", "mode": "full_regen"}
+    deleted = db.execute(text(f"DELETE FROM {DEV_DB}.dbo.[{table}]")).rowcount or 0
+    col_list = ", ".join(f"[{c}]" for c in common)
+    sel_list = ", ".join(f"src.[{c}]" for c in common)
+    inserted = db.execute(
+        text(
+            f"INSERT INTO {DEV_DB}.dbo.[{table}] ({col_list}) "
+            f"SELECT {sel_list} FROM {PROD_DB}.dbo.[{table}] AS src"
+        )
+    ).rowcount or 0
+    return {"table": table, "mode": "full_regen", "deleted": deleted, "inserted": inserted}
 
 
 def _merge_upsert(
@@ -458,6 +494,14 @@ def _merge_upsert(
     common = [c for c in dev_cols if c in prod_cols]
     if not common:
         return {"table": table, "skipped": "no_common_cols", "upserted": 0}
+
+    # REGENERATE_ID_TABLES(leaf satellite): id 재발번이라 id 매칭 MERGE 불가(id 의미 dev/prod 독립).
+    #   group 스코프 → PARENT_FK wipe-by-parent, 그 외(full/exclude) → 전체 미러(id 재발번).
+    if table in REGENERATE_ID_TABLES:
+        parent_info = PARENT_FK_MAP.get(table)
+        if include_group_ids and parent_info:
+            return _wipe_by_parent_fk(db, table, parent_info, include_group_ids)
+        return _full_mirror_regen(db, table)
 
     # include_group_ids 지정 시 group_id 컬럼 없는 테이블 처리:
     # - PARENT_FK_MAP 매핑 있으면 부모 group_id 기반 wipe-by-parent 강제 (자식 overwrite)
