@@ -158,6 +158,10 @@ def _config_dict(row: RosterConfig) -> dict:
     return {
         "config_id": row.config_id,
         "config_version": row.config_version,
+        # 프리셋 식별(2026-06 preset 기능) — 어떤 저장 설정/버전이 활성인지 사용자 대면 노출.
+        "version": row.version,
+        "config_name": row.config_name,
+        "config_memo": row.config_memo,
         "office_id": row.office_id,
         "group_id": row.group_id,
         "day_req": row.day_req,

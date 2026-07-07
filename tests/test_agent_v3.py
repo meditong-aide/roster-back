@@ -333,8 +333,8 @@ class TestSkillDescriptions:
         # 12 domain + 2 Wave-1 (query_generation_job, manage_wanted_deadline)
         # + 2 Wave-2 (manage_teams, manage_wanted_limits)
         # + 1 Wave-3 (resolve_infeasibility)
-        # + 2 client-action (navigate, prefill) = 19.
-        assert len(SKILL_TOOLS) == 19
+        # + 3 client-action (navigate, prefill, switch_ward) = 20.
+        assert len(SKILL_TOOLS) == 20
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:

@@ -111,7 +111,7 @@ def postprocess_off_swap(
         nu = nurses.get(str(nurse_id))
         if nu is None:
             continue
-        if is_n_only_profile(getattr(nu, "is_night_nurse", None), use_mid=use_mid):
+        if is_n_only_profile(getattr(nu, "allowed_shifts", None), use_mid=use_mid):
             skipped_n_only += 1
             continue
 

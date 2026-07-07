@@ -29,7 +29,8 @@ def test_get_roster_config_covers_all_model_columns(db, seed_data):
     from db.models import RosterConfig
 
     cfg = constraint_tools.get_roster_config(db, "GRP001")
-    skip = {"created_at", "config", "group", "office"}
+    # updated_at 은 created_at 과 같은 메타 타임스탬프 → 노출 제외.
+    skip = {"created_at", "updated_at", "config", "group", "office"}
     model_cols = {c.name for c in RosterConfig.__table__.columns} - skip
     missing = model_cols - set(cfg.keys())
     assert not missing, f"조회에서 누락된 컬럼: {missing}"

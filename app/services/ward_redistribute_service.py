@@ -10,7 +10,7 @@
 - preview(read-only): 제안 병동 + 현재병동 대비 이동 diff + 통계
 - apply: 병동이 바뀌는 간호사 → 병동이동(transfer) 이벤트 (Phase B)
 
-N전담(is_night_nurse==['N'])은 풀에서 제외.
+N전담(allowed_shifts==['N'])은 풀에서 제외.
 참조: docs/NURSE_GROUP_CHANGE_MODEL.md (옵션2), team_classify_service.py (옵션1).
 """
 
@@ -71,12 +71,12 @@ def _load_pool(
         .all()
     )
     if pset is None:
-        night = [n for n in nurses if (n.is_night_nurse or []) == ["N"]]
+        night = [n for n in nurses if (n.allowed_shifts or []) == ["N"]]
     else:
         # 참여로 명시된 N전담은 풀에 포함(override) — 나머지 N전담만 제외
         night = [
             n for n in nurses
-            if (n.is_night_nurse or []) == ["N"] and n.nurse_id not in pset
+            if (n.allowed_shifts or []) == ["N"] and n.nurse_id not in pset
         ]
 
     # 기간 겹침 제외: 대상 발효일(month-1)부터와 겹치는 active 파견/병동이동 보유자.

@@ -33,7 +33,7 @@ def _user(*, group_id="A", office_id="o1", is_head_nurse=True, is_master_admin=F
 
 def _mk_nurse(db, nid, team_id, grade):
     db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id="A", office_id="o1",
-                 name=nid, active=1, team_id=team_id, grade=grade, is_night_nurse=[]))
+                 name=nid, active=1, team_id=team_id, grade=grade, allowed_shifts=[]))
 
 
 @pytest.fixture
@@ -67,7 +67,7 @@ def _client(db, user):
             nurse_id=user.nurse_id, account_id=user.account_id,
             group_id=user.group_id, office_id=user.office_id, name=user.name,
             active=0, is_head_nurse=bool(user.is_head_nurse),
-            hn_auth=user.hn_auth, is_night_nurse=[],
+            hn_auth=user.hn_auth, allowed_shifts=[],
         ))
         db.flush()
 

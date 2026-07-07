@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 import dotenv
 from anyio import to_thread
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -17,7 +17,7 @@ from db.client2 import get_db
 from db.models import RosterConfig
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
-from schemas.roster_schema import RosterRequest
+from schemas.roster_schema import RosterRequest, RosterConfigCreate
 from services.roster_create_service import (
     generate_roster_service,
     # generate_roster_service_with_fixed_cells,
@@ -152,6 +152,7 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
 @router.post("/roster_create/async")
 async def roster_create_async(
     req: RosterRequest,
+    request: Request,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     _db: Session = Depends(get_db),
     wait_for_result: bool = False,
@@ -180,17 +181,51 @@ async def roster_create_async(
     )
     req.group_id = target_group_id
 
+    # 모달 payload 제공 시: config 굳히기(materialize) + 라이브 동기화(apply).
+    # 변경 시 '새로운 설정n' 신규 row, 동일 시 baseline 재사용. 이후 req.config_id 로 진행.
+    materialized = None
+    if getattr(req, "config", None):
+        from services.roster_service import materialize_generation_config
+        try:
+            payload_cfg = RosterConfigCreate(**req.config)
+            resolved = materialize_generation_config(
+                _db, payload_cfg, current_user, override_group_id=target_group_id
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"설정 materialize 실패: {exc}"
+            ) from exc
+        req.config_id = resolved.config_id
+        req.config = None  # 워커는 config_id 만 사용 — job_body 슬림화
+        materialized = {
+            "config_id": resolved.config_id,
+            "version": resolved.version,
+            "config_name": resolved.config_name,
+        }
+
     if wait_for_result:
         # 동기로 바로 생성(레거시/테스트 용). CPU 부하는 EC2에 남습니다.
         try:
             return {
                 "mode": "sync",
                 "result": generate_roster_service(req, current_user, _db),
+                "materialized_config": materialized,
             }
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"근무표 생성 실패: {exc}"
             ) from exc
+
+    # 진단용: 호출자 추적. 백엔드 stdout 로그 파이프에 의존하지 않고, 클라이언트 IP/UA 를
+    # SQS 페이로드에 실어 워커(검증된 람다 로그 파이프)에서 찍는다.
+    # ALB/CloudFront 뒤 실제 IP 는 X-Forwarded-For 첫 항목.
+    _xff = request.headers.get("x-forwarded-for", "")
+    _client_ip = _xff.split(",")[0].strip() if _xff else (
+        request.client.host if request.client else "-"
+    )
+    _user_agent = request.headers.get("user-agent", "-")
 
     job_body: Dict[str, Any] = {
         "job_id": (
@@ -204,6 +239,9 @@ async def roster_create_async(
         "group_id": target_group_id,
         "params": req.dict(),
         "requested_at": datetime.utcnow().isoformat(),
+        "client_ip": _client_ip,
+        "x_forwarded_for": _xff,
+        "user_agent": _user_agent,
     }
 
     # 상태 테이블에 Job 생성(QUEUED)
@@ -224,6 +262,7 @@ async def roster_create_async(
         "message": "✅ Job submitted to SQS",
         "job": job_body,
         "sqs_message_id": response.get("MessageId"),
+        "materialized_config": materialized,
     }
 
 

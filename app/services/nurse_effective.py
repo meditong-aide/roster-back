@@ -31,7 +31,7 @@ from db.models import Nurse, NurseAssignment
 #   d['weekly_off_enabled']= target_weekly_off_enabled
 #   d['weekly_off_type']   = target_weekly_off_type      (런타임 주입 속성, 실컬럼 아님)
 #   d['weekly_off_weekday']= target_weekly_off_weekday
-#   d['is_night_nurse']    = target_shift_types           (허용 시프트 코드 리스트, []=전부 허용)
+#   d['allowed_shifts']    = target_shift_types           (허용 시프트 코드 리스트, []=전부 허용)
 #   d['fixed_shift']       = target_fixed_shift
 #
 # 의도적으로 제외된 것:
@@ -45,7 +45,7 @@ _ATTR_TO_TARGET_COL: dict[str, str] = {
     "weekly_off_enabled": "target_weekly_off_enabled",
     "weekly_off_type": "target_weekly_off_type",
     "weekly_off_weekday": "target_weekly_off_weekday",
-    "is_night_nurse": "target_shift_types",
+    "allowed_shifts": "target_shift_types",
     "fixed_shift": "target_fixed_shift",
 }
 

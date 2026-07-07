@@ -591,7 +591,7 @@ SKILL_TOOLS: list[dict] = [
             "- 'RN 데이 1슬롯 인원 5명' → field='manpower', nurse_class='RN', shift_slot=1, value=5\n\n"
 
             "⛔ 거절 예시 (update_person_attr 영역):\n"
-            "- '박춘일 야간 전담' → update_person_attr (is_night_nurse)\n"
+            "- '박춘일 야간 전담' → update_person_attr (allowed_shifts)\n"
             "- '김민지 데이 고정근무' → update_person_attr (fixed_shift)"
         ),
         "parameters": {
@@ -644,7 +644,7 @@ SKILL_TOOLS: list[dict] = [
             "- 팀/팀이동/팀변경 → team_id (정수 ID 또는 팀 이름 문자열; 스킬이 내부 매핑)\n"
             "- 병동/병동이동 → group_id (문자열)\n"
             "- 수간호사/HN 지정 → is_head_nurse (true/false)\n"
-            "- 야간 전담/데이 전담/N전담/시프트 전담 → is_night_nurse (시프트 코드 리스트)\n"
+            "- 야간 전담/데이 전담/N전담/시프트 전담 → allowed_shifts (시프트 코드 리스트)\n"
             "- 프리셉터 지정/멘토 지정 → preceptor_id (간호사 ID)\n"
             "- 데이 고정근무/N 고정근무 (평일만, 주말 휴무) → fixed_shift "
             "(코드 'D'/'E'/'N'/'M'/'O' 또는 한글 '데이'/'이브닝'/'나이트'/'미드'/'오프'; "
@@ -655,7 +655,7 @@ SKILL_TOOLS: list[dict] = [
             "- 주휴 활성화 → weekly_off_enabled (true/false)\n"
             "- 주휴 요일 → weekly_off_weekday (정수 0~6, 월=0)\n"
             "- AIDE 기능 → enable_aide (true/false)\n\n"
-            "⚠️ is_night_nurse는 시프트 코드의 리스트입니다 (true/false 아님).\n"
+            "⚠️ allowed_shifts는 시프트 코드의 리스트입니다 (true/false 아님).\n"
             "  • 야간 전담/N 전담 → ['N']\n"
             "  • 데이 전담/D 전담 → ['D']\n"
             "  • 이브닝 전담 → ['E']\n"
@@ -671,7 +671,7 @@ SKILL_TOOLS: list[dict] = [
             "예: '김예빈 프리셉터 관계 해제 + 이유림 A팀 이동 — 진행할까요?' "
             "각 변경마다 별도 preview/confirm 으로 쪼개지 말 것(불필요한 turn 증가 + 일관성 손실).\n\n"
             "⚠️ '전담' vs '고정근무' 구분 (중요):\n"
-            "  • '전담' (예: '데이 전담', 'N 전담', '야간 전담') → is_night_nurse 필드. "
+            "  • '전담' (예: '데이 전담', 'N 전담', '야간 전담') → allowed_shifts 필드. "
             "    매일(주말 포함) 해당 시프트만 근무.\n"
             "  • '고정근무' (예: '데이 고정근무', '평일 데이 고정', '주말 휴무 + N 고정') → fixed_shift 필드. "
             "    평일만 해당 시프트, 주말은 휴무. 사용자 발화에 '평일', '주말 쉬어/휴무', '고정근무' 단어가 있으면 fixed_shift.\n"
@@ -719,9 +719,9 @@ SKILL_TOOLS: list[dict] = [
             "- (모순 케이스) '데이 고정근무인데 주말도 일하게' → 거부됨 (contradictory_state)\n\n"
             "예시 (단일):\n"
             "- '김민지 직급 3으로' → field='grade', value=3\n"
-            "- '한혜선 데이 전담 고정' → field='is_night_nurse', value=['D']\n"
-            "- '박춘일 야간 전담 지정' → field='is_night_nurse', value=['N']\n"
-            "- '이윤지 야간 전담 해제' → field='is_night_nurse', value=[]\n"
+            "- '한혜선 데이 전담 고정' → field='allowed_shifts', value=['D']\n"
+            "- '박춘일 야간 전담 지정' → field='allowed_shifts', value=['N']\n"
+            "- '이윤지 야간 전담 해제' → field='allowed_shifts', value=[]\n"
             "- '한혜선 데이 고정근무로 (평일만, 주말 휴무)' → field='fixed_shift', value='D' "
             "(is_weekend_off=true 자동 동반)\n"
             "- '박춘일 N 고정근무 해제' → field='fixed_shift', value='' "
@@ -744,7 +744,7 @@ SKILL_TOOLS: list[dict] = [
                 },
                 "value": {
                     "description": (
-                        "단일 필드 변경 시. 필드 타입에 맞는 값. is_night_nurse는 리스트 "
+                        "단일 필드 변경 시. 필드 타입에 맞는 값. allowed_shifts는 리스트 "
                         "(예: ['N'], ['D'], ['D','E'], []), boolean 필드는 true/false, "
                         "숫자 필드는 정수, 문자열 필드는 문자열."
                     ),
@@ -848,7 +848,7 @@ SKILL_TOOLS: list[dict] = [
 
             "─────────── 인접 skill 과의 경계 ───────────\n"
             "- '병동 전체 야간 최대 7회' (정책) → update_constraint (max_nig_per_month)\n"
-            "- '김민지 야간 전담' (개인 속성) → update_person_attr (is_night_nurse)\n"
+            "- '김민지 야간 전담' (개인 속성) → update_person_attr (allowed_shifts)\n"
             "- '김민지 5월 야간 4번' (개인 월 한도) → update_monthly_limit (n_exact)\n\n"
 
             "예시:\n"

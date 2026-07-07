@@ -7,6 +7,7 @@ from sqlalchemy import select, and_, update
 from datetime import datetime
 
 from db.models import DailyShift, ShiftManage, Nurse, Wanted
+from services.shift_manage_defaults import ensure_default_shift_manage
 
 
 def _get_month_days(year: int, month: int) -> int:
@@ -18,12 +19,9 @@ def _get_month_days(year: int, month: int) -> int:
     return monthrange(year, month)[1]
 
 
-def _read_template_from_shift_manage(db: Session, office_id: str, group_id: str) -> Tuple[int, int, int, int]:
-    """shift_manage에서 RN 클래스의 슬롯(1:D,2:E,3:N,5:M)별 manpower를 읽어옵니다.
-    - 반환: (day, evening, night, mid)
-    - 예시: (3,2,2,0)
-    """
-    slots = (
+def _query_rn_slots(db: Session, office_id: str, group_id: str) -> List[ShiftManage]:
+    """shift_manage 에서 RN 클래스의 슬롯(1:D,2:E,3:N,5:M) 행을 읽어옵니다."""
+    return (
         db.query(ShiftManage)
         .filter(
             ShiftManage.office_id == office_id,
@@ -34,6 +32,20 @@ def _read_template_from_shift_manage(db: Session, office_id: str, group_id: str)
         .order_by(ShiftManage.id.asc())  # 중복행 결정성: 슬롯별 최대 id(최근) 행 채택
         .all()
     )
+
+
+def _read_template_from_shift_manage(db: Session, office_id: str, group_id: str) -> Tuple[int, int, int, int]:
+    """shift_manage에서 RN 클래스의 슬롯(1:D,2:E,3:N,5:M)별 manpower를 읽어옵니다.
+    - 반환: (day, evening, night, mid)
+    - 예시: (3,2,2,0)
+    - 템플릿이 아예 없으면(시프트 관리 화면 미개봉 병동) 기본 슬롯을 seeding 후 재조회한다.
+      (부분 등록으로 slot 수가 3 미만인 손상 상태는 seeding no-op 이므로 여전히 에러 → 수동 점검 필요)
+    """
+    slots = _query_rn_slots(db, office_id, group_id)
+    if not slots or len(slots) < 3:
+        # 템플릿 미존재 → 기본값(D3/E3/N2/M0) seeding 후 재조회. shifts 라우터 lazy 생성과 동일 기준.
+        ensure_default_shift_manage(db, office_id, group_id, "RN")
+        slots = _query_rn_slots(db, office_id, group_id)
     if not slots or len(slots) < 3:
         raise ValueError("shift_manage 템플릿(RN)이 없습니다.")
     slot_to_value: Dict[int, int] = {}

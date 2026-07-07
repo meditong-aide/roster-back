@@ -48,7 +48,7 @@ def _to_day_index(value: Any, year: int, month: int, days_in_month: int) -> Opti
 def _allowed_shifts_for(nurse: dict, use_mid: bool) -> Optional[List[str]]:
     """해당 간호사가 가능한 시프트 코드 집합을 반환한다(공집합/기본=None).
 
-    현재 schema: ``is_night_nurse`` 는 허용 시프트 코드 list (예: ``["N"]`` = N전담,
+    현재 schema: ``allowed_shifts`` 는 허용 시프트 코드 list (예: ``["N"]`` = N전담,
     ``[]`` = 전부 가능). ``work_shifts`` 는 일부 legacy 데이터에서만 채워진다.
     """
     universe = {"D", "E", "N"}
@@ -68,7 +68,7 @@ def _allowed_shifts_for(nurse: dict, use_mid: bool) -> Optional[List[str]]:
         return cleaned or None
 
     # 현재 schema 우선
-    raw_nights = nurse.get("is_night_nurse")
+    raw_nights = nurse.get("allowed_shifts")
     if isinstance(raw_nights, (list, tuple, set)):
         # 빈 list 는 "제한 없음" — None 으로 둬 universe 전체 허용
         return _normalize(raw_nights)
@@ -78,7 +78,7 @@ def _allowed_shifts_for(nurse: dict, use_mid: bool) -> Optional[List[str]]:
     if raw_shifts is not None:
         return _normalize(raw_shifts)
 
-    # 레거시: is_night_nurse 가 int/bool 인 경우
+    # 레거시: allowed_shifts 가 int/bool 인 경우
     if isinstance(raw_nights, bool):
         return ["N"] if raw_nights else None
     if isinstance(raw_nights, (int, float)):

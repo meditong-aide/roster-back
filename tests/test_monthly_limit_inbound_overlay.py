@@ -1,6 +1,6 @@
 """파견 인바운드 간호사 monthly-limit capability 오버레이 회귀 테스트.
 
-버그: monthly-limit preflight 가 base `nurses.is_night_nurse`(예 ["D"])만 보고
+버그: monthly-limit preflight 가 base `nurses.allowed_shifts`(예 ["D"])만 보고
 파견 대상 그룹의 `nurse_assignment.target_shift_types`(예 ["D","N"])를 무시 →
 파견지에서 가능해진 N 의 min/exact 설정이 MONTHLY_LIMIT_NOT_IN_WORK_SHIFTS 로 오차단.
 수정: inbound 행은 effective nurse(오버레이 적용)로 검증.
@@ -23,7 +23,7 @@ TARGET = "tgt1"
 def _nurse(db, is_night):
     n = Nurse(
         nurse_id="450065", account_id="a450065", group_id=HOME, office_id="o1",
-        name="전수빈", active=1, is_night_nurse=is_night, work_shifts=[],
+        name="전수빈", active=1, allowed_shifts=is_night, work_shifts=[],
     )
     db.add(n)
     db.flush()
@@ -57,7 +57,7 @@ def test_effective_view_overrides_capability(db):
     _dispatch(db, shift_types=["D", "N"])
     eff = _effective_nurse_for_group(db, n, TARGET, 2026, 6)
     assert isinstance(eff, _EffectiveNurseView)
-    assert set(eff.is_night_nurse) == {"D", "N"}  # 오버레이 적용
+    assert set(eff.allowed_shifts) == {"D", "N"}  # 오버레이 적용
     assert eff.name == "전수빈" and eff.nurse_id == "450065"  # 나머지는 위임
 
 

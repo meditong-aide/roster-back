@@ -95,7 +95,7 @@ def _seed(db: Session):
             active=1, sequence=int(nid[1:]),
             joining_date=datetime(2025, 1, 1) if not is_new else datetime(2026, 3, 1),
             is_weekend_off=False, work_shifts=["D", "E", "N"],
-            is_night_nurse=[], fixed_shift=None, enable_aide=True,
+            allowed_shifts=[], fixed_shift=None, enable_aide=True,
         ))
     db.flush()
 

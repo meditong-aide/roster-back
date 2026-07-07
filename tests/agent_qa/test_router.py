@@ -42,7 +42,8 @@ def test_all_tools_covered():
     # Wave-1 (2026-06-19): query_generation_job + manage_wanted_deadline → 16.
     # Wave-2 (2026-06-19): manage_teams + manage_wanted_limits → 18.
     # Wave-3 (2026-06-19): resolve_infeasibility → 19.
-    assert len(ALL_TOOL_NAMES) == 19
+    # switch_ward client-action (2026-06-24) → 20.
+    assert len(ALL_TOOL_NAMES) == 20
     missing = set(ALL_TOOL_NAMES) - covered
     assert not missing, f"카테고리 미커버 tool: {missing}"
     # 맵의 tool 이름이 전부 실제 tool 이름인지(오타 방지)
@@ -142,7 +143,7 @@ def test_route_scoped_when_classified():
     res = route(_FakeLLM('["navigation"]'), "팀 어디서 바꿔")
     assert res.fallback_used is False
     assert res.categories == ["navigation"]
-    assert set(res.tool_names) == {"navigate", "prefill"}
+    assert set(res.tool_names) == {"navigate", "prefill", "switch_ward"}
 
 
 def test_route_exception_falls_back():
@@ -182,7 +183,7 @@ def test_agent_scopes_tools_when_router_injected():
     result = agent.run(None, "팀 어디서 바꿔", _ctx())
 
     # 메인 루프는 scoped tool 만 받았다
-    assert main.seen_tool_names == ["navigate", "prefill"]
+    assert main.seen_tool_names == ["navigate", "prefill", "switch_ward"]
     # routing trace stage 가 있고 categories/ fallback 기록
     routing = [s for s in result.trace if s.name == "routing"]
     assert routing, "routing stage 없음"

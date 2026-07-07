@@ -48,7 +48,7 @@ def seeded(db):
     # 호출자: DB home = A, hn_auth=HN
     db.add(Nurse(nurse_id="HN", account_id="acc_HN", group_id="A", office_id="o1",
                  name="수간", active=1, is_head_nurse=True, hn_auth="HN",
-                 is_night_nurse=[]))
+                 allowed_shifts=[]))
     db.flush()
     return db
 

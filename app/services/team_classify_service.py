@@ -7,7 +7,7 @@
 - 출력(preview): 제안 팀 + 현재팀 대비 변경 diff + 통계 (read-only)
 - 적용(apply): 변경되는 간호사마다 permanent_change 이벤트 생성 → 대상월 1일 발효
 
-N전담(is_night_nurse==['N'])은 팀 배정 풀에서 제외한다.
+N전담(allowed_shifts==['N'])은 팀 배정 풀에서 제외한다.
 참조: docs/NURSE_GROUP_CHANGE_MODEL.md (옵션1), team_auto_assign.py.
 """
 
@@ -27,7 +27,7 @@ _OFF_SHIFT_CODES = frozenset({"O", "OFF", "주"})
 
 
 def _is_night_only(n: NurseModel) -> bool:
-    return (n.is_night_nurse or []) == ["N"]
+    return (n.allowed_shifts or []) == ["N"]
 
 
 def _build_pool_roster(
@@ -35,7 +35,7 @@ def _build_pool_roster(
 ) -> list[dict]:
     """참여 선택 로스터 — 간호사별 grade/프리셉터/근무코드.
 
-    shift: is_night_nurse []=전체, 그 외 근무코드(예: 'N', 'D E').
+    shift: allowed_shifts []=전체, 그 외 근무코드(예: 'N', 'D E').
     preceptor_name: 프리셉티면 그 프리셉터 이름(같은 풀 내).
     is_preceptor: 이 간호사를 프리셉터로 둔 프리셉티가 풀에 있으면 True.
     옵션1/2 공용 — HN 이 /nurses 로 타 병동 nurse 를 못 읽어 preview 가 운반한다.
@@ -44,7 +44,7 @@ def _build_pool_roster(
     preceptor_ids = {n.preceptor_id for n in nurses if n.preceptor_id}
 
     def _shift(n: NurseModel) -> str:
-        s = n.is_night_nurse or []
+        s = n.allowed_shifts or []
         return "전체" if len(s) == 0 else " ".join(s)
 
     out: list[dict] = []
@@ -54,7 +54,7 @@ def _build_pool_roster(
             "name": n.name,
             "grade": n.grade,
             "shift": _shift(n),
-            "is_night": (n.is_night_nurse or []) == ["N"],
+            "is_night": (n.allowed_shifts or []) == ["N"],
             "preceptor_name": name_by.get(n.preceptor_id) if n.preceptor_id else None,
             "is_preceptor": n.nurse_id in preceptor_ids,
         }
@@ -372,8 +372,8 @@ def apply_team_classification(
         if nurse is None:
             skipped += 1
             continue
-        # N전담을 팀에 편입하면 N전담 해제 동반(is_night_nurse=[]) — 발효일 기반
-        is_n_override = (nurse.is_night_nurse or []) == ["N"]
+        # N전담을 팀에 편입하면 N전담 해제 동반(allowed_shifts=[]) — 발효일 기반
+        is_n_override = (nurse.allowed_shifts or []) == ["N"]
         rel = nid in released
         if _same(_team_now.get(str(nid)), new_team) and not is_n_override and not rel:
             skipped += 1

@@ -246,6 +246,33 @@ app.add_middleware(
 )
 
 
+# --- 진단용: /roster_create 계열 요청의 실제 호출자(IP/UA) 추적 ---
+# 442171 유령 job 원인 추적. SQS 재전송 경로(SQS→Lambda→worker)는 이 미들웨어를
+# 절대 거치지 않으므로: 여기에 로그가 찍히면 "살아있는 HTTP 재-POST" 라는 결정적 증거이고,
+# 안 찍히는데도 슬랙 실패 알림이 계속 뜨면 "순수 SQS 재전송" 이 확정된다.
+# ALB access log 부재로 최초 요청 IP 는 유실됐지만, 다음 HTTP 호출은 여기서 잡는다.
+@app.middleware("http")
+async def _trace_roster_create_callers(request: Request, call_next):
+    path = request.url.path
+    if "/roster_create/" in path:
+        xff = request.headers.get("x-forwarded-for", "")
+        # ALB 뒤에서는 request.client.host 가 LB IP → 진짜 클라이언트는 XFF 첫 항목.
+        real_ip = xff.split(",")[0].strip() if xff else (
+            request.client.host if request.client else "-"
+        )
+        # print 사용: 워커에서 print 는 CloudWatch 에 확실히 떴다(logging.warning 은 앱
+        # 로깅 설정에 따라 stdout 으로 안 나갈 수 있음). flush=True 로 버퍼링 방지.
+        print(
+            f"[CallerTrace] {request.method} {path} "
+            f"client_ip={real_ip} xff={xff!r} "
+            f"ua={request.headers.get('user-agent', '-')!r} "
+            f"referer={request.headers.get('referer', '-')!r} "
+            f"cookie_present={'access_token' in (request.headers.get('cookie', '') or '')}",
+            flush=True,
+        )
+    return await call_next(request)
+
+
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 app.include_router(contact_router)
@@ -280,6 +307,9 @@ app.include_router(constraint_impact_router.router)
 
 from routers import ontology as ontology_router
 app.include_router(ontology_router.router)
+
+from routers import nurse_period as nurse_period_router
+app.include_router(nurse_period_router.router)
 
 # Agent v2 test chat UI (dev-only — 별도 페이지에서 컨텍스트 수동 선택)
 from agents_v2.test_chat_router import router as agent_test_router

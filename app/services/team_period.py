@@ -165,6 +165,11 @@ def set_team_period(
     - 아니면 valid_from 을 덮는 직전 열린/겹침 구간들을 valid_to=valid_from 으로 닫고,
       [valid_from, null) 새 구간을 연다. (삭제 없음 — 완전 타임라인)
     """
+    # 같은 txn 의 직전 pending 쓰기를 same/covering 쿼리가 보도록 강제 flush.
+    #   SessionLocal(autoflush=False)에서 apply_team_ops 가 한 nurse 를 두 번 처리하면
+    #   (payload 중복 item / 이동을 두 op 로 표현 등) 두 번째 호출의 same 쿼리가 첫 INSERT 를
+    #   못 봐서 동일행을 또 INSERT → 완전중복 행. upsert_period 와 동일하게 flush 로 차단.
+    db.flush()
     base = db.query(NurseTeamPeriod).filter(
         NurseTeamPeriod.nurse_id == nurse_id,
         NurseTeamPeriod.group_id == group_id,

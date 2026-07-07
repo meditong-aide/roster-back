@@ -8,6 +8,7 @@ from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Gr
 from schemas.auth_schema import User as UserSchema
 from routers.auth import get_current_user_from_cookie
 from services.group_access import resolve_effective_group, caller_is_head_nurse
+from services.shift_manage_defaults import ensure_default_shift_manage
 from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
 from services.shift_service import (
     get_shifts_service as get_shifts_service_mysql,
@@ -399,31 +400,8 @@ async def get_shift_manage(
         and class_name.strip().upper() in {c.upper() for c in VALID_NURSE_CLASSES}
     )
     if auto_create_allowed:
-        default_slots = [
-            {"shift_slot": 1, "main_code": "D", "codes": [], "manpower": 3},
-            {"shift_slot": 2, "main_code": "E", "codes": [], "manpower": 3},
-            {"shift_slot": 3, "main_code": "N", "codes": [], "manpower": 2},
-            {"shift_slot": 5, "main_code": "M", "codes": [], "manpower": 0},
-        ]
-
-        for slot_data in default_slots:
-            db.add(
-                ShiftManage(
-                    office_id=office_id,
-                    group_id=target_group_id,
-                    nurse_class=class_name,
-                    shift_slot=slot_data["shift_slot"],
-                    main_code=slot_data["main_code"],
-                    codes=slot_data["codes"],
-                    manpower=slot_data["manpower"],
-                )
-            )
-        try:
-            db.commit()
-        except IntegrityError:
-            # 다른 요청이 먼저 동일 슬롯을 생성함(UNIQUE 충돌) → 롤백 후 재조회로 수렴.
-            db.rollback()
-
+        # 기본 슬롯 생성은 공용 헬퍼(단일 소스)로 위임. daily_shift 초기화 fallback 과 값 일치 보장.
+        ensure_default_shift_manage(db, office_id, target_group_id, class_name)
         shift_manages = query.order_by(ShiftManage.shift_slot.asc()).all()
     # for shift in shifts:
     #     shift_manages.append({'shift_slot': 4, 'main_code': 'O', 'codes': [shift.default_shift], 'manpower': 0})

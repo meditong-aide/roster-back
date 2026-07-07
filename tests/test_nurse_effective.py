@@ -88,15 +88,15 @@ def test_effective_attr_override_when_active(db):
 
 
 def test_effective_attr_empty_list_falls_back(db):
-    """target_shift_types=[] 는 override 아님 → Nurse 폴백 (핵심 회귀).
+    """target_shift_types=[] 는 override 아님 → Nurse 실값 폴백 (핵심 회귀).
 
-    참고: allowed_shifts 는 Nurse 실컬럼이 아니라 런타임 주입 속성이라
-    getattr 기본값 None 으로 폴백된다.
+    참고: allowed_shifts 는 이제 nurses 실컬럼(is_night_nurse→allowed_shifts 수렴, default=[]).
+    빈 override([])는 무시되고 간호사 본인 값으로 폴백한다.
     """
-    n = _mk_nurse(db, group_id=GID_A)
+    n = _mk_nurse(db, group_id=GID_A, allowed_shifts=["N"])
     _mk_assignment(db, reason="프리셉티", target=None, target_shift_types=[])
     val = get_nurse_effective_attr(db, n, "allowed_shifts", date(2026, 6, 1))
-    assert val is None  # [] override 무시, Nurse 폴백(getattr 기본 None)
+    assert val == ["N"]  # [] override 무시 → Nurse 실값 폴백
 
 
 def test_effective_attr_out_of_range_falls_back(db):
@@ -118,11 +118,13 @@ def test_effective_group_id_never_overridden(db):
 # ── 3. apply_effective_attrs_to_nurse ───────────────────────
 
 def test_apply_skips_empty_list(db):
-    n = _mk_nurse(db, group_id=GID_A)
+    # allowed_shifts 는 이제 nurses 실컬럼(default=[]). 빈 baseline 대신 실값으로
+    # "[] override 가 실값을 덮지 않음"을 검증한다.
+    n = _mk_nurse(db, group_id=GID_A, allowed_shifts=["D", "E"])
     a = _mk_assignment(db, reason="프리셉티", target=None, target_shift_types=[])
     apply_effective_attrs_to_nurse(db, n, date(2026, 6, 1), assignment=a)
-    assert getattr(n, "allowed_shifts", None) is None  # [] 안 박힘
-    assert n.group_id == GID_A                         # target=None 안 박힘
+    assert n.allowed_shifts == ["D", "E"]  # [] override 안 박힘(실값 보존)
+    assert n.group_id == GID_A             # target=None 안 박힘
 
 
 def test_apply_applies_real_value(db):

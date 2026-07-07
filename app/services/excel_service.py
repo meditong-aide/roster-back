@@ -301,8 +301,8 @@ def get_next_sequence(group_id: str, active_status: int, db: Session, role: str 
 #                     'role': str(row[get_excel_column_by_field('role', flexible_mapping)]).strip(),
 #                     'level_': str(row[get_excel_column_by_field('level_', flexible_mapping)]).strip(),
 #                     'is_head_nurse': parse_boolean(row[get_excel_column_by_field('is_head_nurse', flexible_mapping)]),
-#                     # 'is_night_nurse': False,  # 기본값
-#                     'is_night_nurse': [],  # 기본값
+#                     # 'allowed_shifts': False,  # 기본값
+#                     'allowed_shifts': [],  # 기본값
 #                     'personal_off_adjustment': 0,  # 기본값
 #                     'preceptor_id': None,  # 기본값
 #                     'joining_date': None,  # 기본값
@@ -529,7 +529,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
                     'nurse_id': allowed[account_id][2],
                     'birth_date': birth_date,
                     'phone_number': phone_num,
-                    'is_night_nurse': [],
+                    'allowed_shifts': [],
                     'gender': gender,
                     'email': email_val,
                 })
@@ -593,7 +593,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
 #             birth_dt = item.get('birth_date')
 #             phone_number = item.get('phone_number')
 #             gender = item.get('gender')
-#             is_night_nurse = item.get('is_night_nurse', [])
+#             allowed_shifts = item.get('allowed_shifts', [])
 #             work_shifts_val = item.get('work_shifts', [])
 
 #             print(f"   • account_id     : {account_id}")
@@ -646,7 +646,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
 #                 existing.birth_date = birth_dt
 #                 existing.phone_number = phone_number
 #                 existing.gender = gender
-#                 existing.is_night_nurse = is_night_nurse
+#                 existing.allowed_shifts = allowed_shifts
 #                 existing.work_shifts = work_shifts_val
                 
 #                 updated += 1
@@ -669,7 +669,7 @@ def upload2_validate(file_path: str, user: UserSchema, db: Session, group_id: st
 #                     role=role if role is not None else '',
 #                     level_='일반',
 #                     is_head_nurse=is_head,
-#                     is_night_nurse=is_night_nurse,
+#                     allowed_shifts=allowed_shifts,
 #                     personal_off_adjustment=0,
 #                     preceptor_id=None,
 #                     joining_date=pd.to_datetime(jd).to_pydatetime() if jd else None,
@@ -1436,6 +1436,23 @@ def export_members_excel_bytes(office_id: str) -> bytes:
     return bio.read()
 
 
+def _excel_upsert_allowed(db: Session, nurse, allowed_shifts) -> None:
+    """엑셀 업로드의 allowed_shifts 를 period(SSOT) 경유로 기록 + 캐시 단방향 투영.
+
+    엑셀은 월 컨텍스트가 없어 valid_from=today(현재값 변경). upsert 가 동일값이면 no-op,
+    캐시(nurses.allowed_shifts)는 내부에서 투영하므로 직접 대입은 제거.
+    """
+    from datetime import date as _date
+    from services.nurse_period_resolver import upsert_period
+    from db.models import NurseAllowedShiftPeriod
+    upsert_period(
+        db, NurseAllowedShiftPeriod, str(nurse.nurse_id), _date.today(),
+        "allowed_shifts", allowed_shifts if allowed_shifts is not None else [],
+        nurse=nurse, cache_attr="allowed_shifts", source="excel_upload",
+        carry_attrs=["fixed_shift"],
+    )
+
+
 def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, target_group_id: str) -> Dict[str, Any]:
     """업로드2: 검증된 행을 nurses 테이블에 저장 (신규/업데이트)"""
     print("[upload2_confirm] 함수 시작")
@@ -1480,7 +1497,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
             gender = str(item.get('gender', '')).strip()[:3] or None
             email = str(item.get('email', '')).strip()[:100] or None
 
-            is_night_nurse = item.get('is_night_nurse', []) or []
+            allowed_shifts = item.get('allowed_shifts', []) or []
             work_shifts = item.get('work_shifts', []) or []
 
             nurse_id = item.get('nurse_id')
@@ -1507,7 +1524,10 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                 existing.phone_number = phone_number
                 existing.gender = gender
                 existing.email = email
-                existing.is_night_nurse = is_night_nurse
+                # allowed_shifts 는 period(SSOT) 경유 — 캐시 직접쓰기는 생성기(period as-of)와
+                #   어긋난다(P2). 엑셀은 월 컨텍스트가 없어 valid_from=today(현재값 변경).
+                #   upsert 가 nurses.allowed_shifts 캐시에 단방향 투영한다.
+                _excel_upsert_allowed(db, existing, allowed_shifts)
                 existing.work_shifts = work_shifts
                 updated += 1
             else:
@@ -1525,7 +1545,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                         role=role,
                         level_='일반',
                         is_head_nurse=is_head_nurse,
-                        is_night_nurse=is_night_nurse,
+                        allowed_shifts=allowed_shifts,
                         personal_off_adjustment=0,
                         preceptor_id=None,
                         joining_date=joining_dt,
@@ -1538,6 +1558,9 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
                         work_shifts=work_shifts,
                     )
                     db.add(new_nurse)
+                    # 신규도 allowed_shifts 를 period 에 시드 — 생성기 per-day 해석이 캐시 폴백이
+                    #   아니라 명시 구간을 읽게(P2). gap 폴백도 동작하지만 SSOT 일관성 위해 기록.
+                    _excel_upsert_allowed(db, new_nurse, allowed_shifts)
                     saved += 1
                 except Exception as inner_e:
                     errors.append({"row": item.get('row', 0), "reason": str(inner_e)})
@@ -1629,7 +1652,7 @@ def upload2_confirm(rows: List[Dict[str, Any]], user: UserSchema, db: Session, t
 #                 'nurse_id': allowed.get(account_id, ('', '', str(uuid.uuid4())))[2],
 #                 'birth_date': row.get('birth_date'),
 #                 'phone_number': row.get('phone_number'),
-#                 'is_night_nurse': row.get('is_night_nurse', []),
+#                 'allowed_shifts': row.get('allowed_shifts', []),
 #                 'gender': row.get('gender')
 #             })
 

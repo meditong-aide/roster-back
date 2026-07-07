@@ -8,6 +8,7 @@ import logging
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
 from db.nurse_config import Nurse
 from services.holiday_pack import get_weekends   # ← 주말 헬퍼
+from services.cp_sat.allowed_shift_types import is_n_only_profile
 
 def _weekend_set(year: int, month: int) -> set[int]:
     """해당 월의 주말 날짜(1‑based)를 {0‑based day_idx} 로 반환."""
@@ -908,7 +909,7 @@ class RosterSystem:
         
         # 5. Night nurse constraints - night nurses CANNOT work day shifts (HARD constraint 유지)
         for n_idx, nurse in enumerate(self.nurses):
-            if nurse.is_night_nurse == 3:
+            if is_n_only_profile(nurse.allowed_shifts):
                 d_idx = self.config.shift_types.index('D')
                 e_idx = self.config.shift_types.index('E')
                 for day in range(self.num_days):
@@ -1023,7 +1024,7 @@ class RosterSystem:
         # 10.2 Night nurse specialization bonus - 동적 가중치 적용
         night_nurse_bonus = int(500 * preference_boost_factor)
         for n_idx, nurse in enumerate(self.nurses):
-            if nurse.is_night_nurse == 3:
+            if is_n_only_profile(nurse.allowed_shifts):
                 # Bonus for night nurses working night shifts
                 night_bonus = sum(night_nurse_bonus * x[n_idx, day, night_idx] for day in range(self.num_days))
                 objective_terms.append(night_bonus)
@@ -1916,7 +1917,7 @@ class RosterSystem:
                 
         # 4. Night nurse constraints (HARD) - night nurses CANNOT work day shifts
         for n_idx, nurse in enumerate(self.nurses):
-            if nurse.is_night_nurse == 3:
+            if is_n_only_profile(nurse.allowed_shifts):
                 d_idx = self.config.shift_types.index('D')
                 E_idx = self.config.shift_types.index('E')
                 for day in range(self.num_days):
@@ -1998,7 +1999,7 @@ class RosterSystem:
         
         # Night nurse specialization bonus
         for n_idx, nurse in enumerate(self.nurses):
-            if nurse.is_night_nurse == 3:
+            if is_n_only_profile(nurse.allowed_shifts):
                 night_bonus = sum(200 * x[n_idx, day, night_idx] for day in range(self.num_days))
                 objective_terms.append(night_bonus)
         

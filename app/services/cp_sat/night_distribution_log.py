@@ -43,7 +43,7 @@ def log_n_even_distribution(
 
         normals: list[int] = []
         for i, nu in enumerate(roster_system.nurses):
-            raw = getattr(nu, "is_night_nurse", None)
+            raw = getattr(nu, "allowed_shifts", None)
             is_n_only = is_n_only_profile(raw, use_mid=bool(getattr(cfg, "use_mid", False)))
             if not is_n_only:
                 normals.append(i)

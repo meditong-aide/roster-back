@@ -187,7 +187,7 @@ def test_A18_overlap_pushed_apart():
 def _mk(db, nid, team_id, grade, night=False, gid="A"):
     db.add(Nurse(nurse_id=nid, account_id=f"acc_{nid}", group_id=gid,
                  office_id="o1", name=nid, active=1, team_id=team_id,
-                 grade=grade, is_night_nurse=["N"] if night else []))
+                 grade=grade, allowed_shifts=["N"] if night else []))
 
 
 @pytest.fixture
@@ -244,7 +244,7 @@ def test_B05_night_override_released_on_flush(ward):
                               month=8, assignments=flat)
     flush_pending_permanent_changes(ward, as_of=date(2026, 8, 1))
     assert (ward.query(Nurse).filter(Nurse.nurse_id == "night").first()
-            .is_night_nurse or []) == []
+            .allowed_shifts or []) == []
 
 
 def test_B06_participant_g1_lt_teams_raises(ward):
@@ -271,7 +271,7 @@ def test_B08_empty_participant_raises(ward):
 def test_B09_apply_skips_unchanged(ward):
     # 전원 현재 팀 그대로 주면 변경 0
     cur = {n.nurse_id: n.team_id for n in ward.query(Nurse).filter(
-        Nurse.group_id == "A", Nurse.is_night_nurse == [])}
+        Nurse.group_id == "A", Nurse.allowed_shifts == [])}
     flat = [{"nurse_id": nid, "team_id": int(t)} for nid, t in cur.items()
             if t is not None]
     res = apply_team_classification(ward, group_id="A", office_id="o1",
@@ -297,8 +297,7 @@ def test_B12_flush_on_applies(ward):
     apply_team_classification(ward, group_id="A", office_id="o1", year=2026,
                               month=8, assignments=[{"nurse_id": "n1", "team_id": 2}])
     flush_pending_permanent_changes(ward, as_of=date(2026, 8, 1))
-    # 4f8cd20 "팀 절연": team SSOT 는 nurse_team_period (nurses.team_id 캐시 폐기 대상).
-    from services.team_period import resolve_team
+    from services.team_period import resolve_team  # team SSOT=nurse_team_period (캐시 team_id 폐기)
     assert resolve_team(ward, "n1", "A", date(2026, 8, 1)) == 2
 
 
@@ -322,7 +321,7 @@ def solo(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A", office_id="o1"))
     db.add(Nurse(nurse_id="n", account_id="acc_n", group_id="A", office_id="o1",
-                 name="n", active=1, team_id=1, grade=2, is_night_nurse=["N"]))
+                 name="n", active=1, team_id=1, grade=2, allowed_shifts=["N"]))
     db.flush()
     return db
 
@@ -364,7 +363,7 @@ def test_C06_flush_applies_shift_release(solo):
                             start_date=date(2026, 8, 1), new_shift_types=[])
     flush_pending_permanent_changes(solo, as_of=date(2026, 8, 1))
     assert (solo.query(Nurse).filter(Nurse.nurse_id == "n").first()
-            .is_night_nurse or []) == []
+            .allowed_shifts or []) == []
 
 
 def test_C07_cancel_pending_not_flushed(solo):
