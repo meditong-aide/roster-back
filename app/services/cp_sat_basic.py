@@ -1068,6 +1068,15 @@ class CPSATBasicEngine:
                         {i: p for i, (p, d) in _ctx.items() if p is not None})
                 for i, (p, d) in _ctx.items():
                     print(f"[Assignment][Solver] preceptee_period: solver_idx={i}, preceptor_idx={p}, days={sorted(d)}")
+            # 상호 근무 배제(mutual exclusion): config map → 솔버 idx 페어(양방향 dedup·days 합집합).
+            _mutex_map = config_data.get("mutual_exclusion_by_nurse_id") if isinstance(config_data, dict) else None
+            if _mutex_map:
+                from services.cp_sat.mutual_exclusion_context import build_mutual_exclusion_context
+                _mx_id_to_idx = getattr(roster_system, '_id_to_idx', None) or {str(nu.db_id): i for i, nu in enumerate(nurses)}
+                _mx_pairs = build_mutual_exclusion_context(nurses, _mutex_map, roster_system.num_days, id_to_idx=_mx_id_to_idx)
+                setattr(roster_system, "mutual_exclusion_pairs", _mx_pairs)
+                for (_a, _b, _dd) in _mx_pairs:
+                    print(f"[Assignment][Solver] mutual_exclusion: a={_a}, b={_b}, days={sorted(_dd)}")
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # cross-group OFF cap 조정용
             _other_group_offs = config_data.get("other_group_offs") if isinstance(config_data, dict) else None

@@ -270,6 +270,10 @@ def attach_member_badges_to_nurses(
         return nurses
     result = group_members_in_month(db, group_id, int(year), int(month), nurse_pool=nurse_pool)
     member_by_id = {str(m["nurse_id"]): m for m in result.get("members", [])}
+    # 상호 근무 배제 파트너 as-of(월초) 일괄 리졸브 — 근무자관리 되읽기용(preceptor as_of 미러).
+    from datetime import date as _date_mx
+    from services.mutual_exclusion_period import resolve_partner_asof as _resolve_mx_partner
+    _mx_asof = _resolve_mx_partner(db, list(member_by_id.keys()), _date_mx(int(year), int(month), 1))
     for n in nurses:
         if not isinstance(n, dict):
             continue
@@ -288,6 +292,7 @@ def attach_member_badges_to_nurses(
         n["fixed_shift"] = member.get("as_of_fixed_shift")
         n["is_weekend_off"] = bool(member.get("as_of_weekend_off"))
         n["preceptor_id"] = member.get("as_of_preceptor")  # 월 as-of 프리셉터(종료월=None=관계 해제)
+        n["exclusion_partner_id"] = _mx_asof.get(str(n.get("nurse_id")))  # 월 as-of 상호배제 파트너
         # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
         # display_group_id = 이 membership 이 표시되는 기준 그룹(조회/선택 그룹).
         n["membership"] = {
@@ -446,6 +451,7 @@ def get_nurses_in_group_service(
             "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
+            "exclusion_partner_id": None,  # 년/월 동반 시 attach_member_badges as-of 오버레이로 실제값 주입
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
             "preceptee_period": self_period_map.get(nurse.nurse_id),
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
@@ -648,6 +654,7 @@ def get_nurses_filtered_service(
             "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
+            "exclusion_partner_id": None,  # 년/월 동반 시 attach_member_badges as-of 오버레이로 실제값 주입
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
             "preceptee_period": self_period_map.get(nurse.nurse_id),
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
@@ -937,6 +944,8 @@ def bulk_update_nurses_service(
     updated_count = 0
     # source 경로에서 preceptor_id 변경된 간호사 기록 (commit 후 프리셉티 assignment 동기화용)
     preceptor_changes: List[Tuple[NurseModel, Optional[str], Optional[str]]] = []
+    # source 경로에서 exclusion_partner_id 받은 간호사 기록 (commit 후 상호배제 period 양방향 동기화용)
+    exclusion_changes: List[Tuple[NurseModel, Optional[str]]] = []
 
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
@@ -949,6 +958,9 @@ def bulk_update_nurses_service(
         # 단건(assignment) + 다건(assignments) 모두 지원. 다건이 먼저 적용된 후 단건이 뒤따른다.
         assignment_payload = update_data.pop("assignment", None)
         assignments_payload = update_data.pop("assignments", None)
+        # 상호 근무 배제 파트너: nurses 컬럼 아님(진실=nurse_mutual_exclusion_period). 소스모드 commit 후 동기화.
+        _exclusion_field_present = "exclusion_partner_id" in update_data
+        _exclusion_after = update_data.pop("exclusion_partner_id", None)
         _payloads_to_apply: List[Dict[str, Any]] = []
         if assignments_payload:
             _payloads_to_apply.extend([p for p in assignments_payload if p])
@@ -988,6 +1000,8 @@ def bulk_update_nurses_service(
         # preceptor_id 변경 탐지 (commit 후 프리셉티 assignment 자동 동기화용)
         _preceptor_field_present = "preceptor_id" in update_data
         _preceptor_before = db_nurse.preceptor_id if _preceptor_field_present else None
+        if _exclusion_field_present:
+            exclusion_changes.append((db_nurse, _exclusion_after))
 
         # active 또는 role 변경 시 sequence 자동 조정
         old_active = db_nurse.active
@@ -1123,6 +1137,19 @@ def bulk_update_nurses_service(
                 "[bulk_preceptee_sync] 실패 nurse=%s: %s",
                 _nurse.nurse_id, e,
             )
+
+    # === commit 후: 상호 근무 배제 파트너 동기화 (양방향 period write-through) ===
+    if exclusion_changes:
+        from services.mutual_exclusion_period import set_mutual_exclusion
+        for _nurse, _partner_id in exclusion_changes:
+            try:
+                set_mutual_exclusion(
+                    db, nurse_id=_nurse.nurse_id, partner_id=_partner_id,
+                    office_id=_nurse.office_id,
+                )
+            except Exception as e:
+                logging.warning("[bulk_mutex_sync] 실패 nurse=%s: %s", _nurse.nurse_id, e)
+        db.commit()
 
     return {
         "message": "간호사 정보가 성공적으로 업데이트되었습니다.",
@@ -1878,6 +1905,9 @@ def update_nurse_profile_service(
     # preceptor_id 변경 탐지 (source 경로에서만 유효; assignment payload 반영 후 값 기준)
     _preceptor_field_present = "preceptor_id" in fields
     _preceptor_before = nurse.preceptor_id if _preceptor_field_present else None
+    # 상호 근무 배제 파트너(nurses 컬럼 아님·진실=period). fields 유지(_apply_source_nurse_update 가 hasattr 가드로 skip).
+    _exclusion_field_present = "exclusion_partner_id" in fields
+    _exclusion_after = fields.get("exclusion_partner_id")
 
     if not fields:
         return {
@@ -2010,6 +2040,19 @@ def update_nurse_profile_service(
                 "[preceptee_sync] 전체 실패 nurse=%s: %s",
                 nurse_id, e,
             )
+
+    # source 경로에서 exclusion_partner_id 받으면 상호배제 period(양방향) 동기화.
+    if applied_source and _exclusion_field_present:
+        try:
+            from services.mutual_exclusion_period import set_mutual_exclusion
+            set_mutual_exclusion(
+                db, nurse_id=nurse.nurse_id, partner_id=_exclusion_after,
+                office_id=nurse.office_id,
+            )
+            db.commit()
+            db.refresh(nurse)
+        except Exception as e:
+            logging.warning("[mutex_sync] 단건 실패 nurse=%s: %s", nurse_id, e)
 
     # email 변경 시 MSSQL dual write는 source/admin 경로에서만 수행
     # (target 모드는 nurses.email을 건드리지 않으므로 Member.Email과의 정합성을 깨뜨리지 않기 위해 skip)
