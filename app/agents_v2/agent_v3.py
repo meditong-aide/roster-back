@@ -19,6 +19,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from agents_v2.errors import (
+    ErrorType,
+    classify as _classify_outcome,
+    extract_apply_hint_question as _extract_apply_hint_question,
+    is_error as _is_error,
+)
 from agents_v2.harness.dev_query_log import log_dev_query
 from agents_v2.harness.prompt_builder import build_system_prompt
 from agents_v2.llm_client import LLMClient
@@ -434,11 +440,10 @@ class SchedulingAgent:
 
                     # B7: 인라인 렌더용 데이터 누적 — 마지막 성공 조회 결과가 이긴다.
                     # error / needs_clarification / preview 는 데이터 의미가 없어 제외.
+                    # §3.C: 3개 판별식을 outcome taxonomy 단일 분류(OK)로 통합.
                     if (
                         result.data is not None
-                        and not _is_error(result.data)
-                        and not _needs_clarification(result.data)
-                        and not _is_preview_result(result.data)
+                        and _classify_outcome(result.data) is ErrorType.OK
                     ):
                         last_query_data = result.data
 
@@ -473,7 +478,8 @@ class SchedulingAgent:
                         )
 
                     # ── Approval flow (preview) — must exit for user confirmation ──
-                    if _is_preview_result(result.data):
+                    # §3.C: outcome taxonomy 단일 분류로 dispatch.
+                    if _classify_outcome(result.data) is ErrorType.PREVIEW:
                         preview_with_context = {
                             **result.data,
                             "skill_name": skill_name,
@@ -913,34 +919,6 @@ def _is_denial(msg: str) -> bool:
     return any(t in _DENY_WORDS for t in tokens)
 
 
-def _extract_apply_hint_question(skill_name: str, data: Any) -> str | None:
-    """generate_schedule 결과에 user_actionable apply_hint가 있으면 재시도 질문 반환.
-
-    None 반환 시 apply_hint 흐름 미진입.
-    """
-    if skill_name not in ("generate_schedule", "generate-schedule"):
-        return None
-    if not isinstance(data, dict):
-        return None
-
-    infeasibility = data.get("infeasibility")
-    if not isinstance(infeasibility, dict):
-        return None
-
-    apply_hint = infeasibility.get("apply_hint")
-    if not isinstance(apply_hint, dict):
-        return None
-
-    # user_consent_required=True 인 경우만 사용자에게 질의
-    if not apply_hint.get("user_consent_required", False):
-        return None
-
-    human_msg = apply_hint.get("human_message_ko") or ""
-    if human_msg:
-        return human_msg
-    return "제약 조건을 조정하고 근무표 생성을 재시도하시겠습니까?"
-
-
 def _call_signature(skill_name: str, args: dict) -> str:
     """Deterministic signature for duplicate call detection.
 
@@ -968,20 +946,6 @@ def _is_confirmation(msg: str) -> bool:
 
     tokens = [t for t in _re.split(r"[\s.,!?~…]+", cleaned) if t]
     return any(t in _CONFIRM_WORDS for t in tokens)
-
-
-def _is_error(data: Any) -> bool:
-    return isinstance(data, dict) and "error" in data
-
-
-def _needs_clarification(data: Any) -> bool:
-    return isinstance(data, dict) and data.get("needs_clarification") is True
-
-
-def _is_preview_result(data: Any) -> bool:
-    return isinstance(data, dict) and (
-        data.get("preview_only") is True or data.get("preview") is True
-    )
 
 
 def _truncate(data: Any, max_len: int = 500) -> Any:
