@@ -1337,7 +1337,13 @@ SKILL_TOOLS: list[dict] = [
             "`roster_view_my` — 내 근무표\n"
             "- `nurse_management` — 근무자 관리 (HN/ADM 전용). "
             "sub=`team_setting`(팀 설정)·`grade_setting`(등급 설정)\n"
-            "- `roster_create` — 근무표 만들기 (HN/ADM 전용)\n"
+            "- `roster_create` — 근무표 만들기 (HN/ADM 전용). 모달 중심 워크스페이스. "
+            "sub=`manpower`(필요인원/인력 설정)·`wanted_config`(원티드 반영 설정)·"
+            "`deadline`(원티드 마감일)·`off_request`(오프 요청 목록)·`quick_config`(생성 옵션)·"
+            "`emergency`(긴급 대체 찾기)·`version`(버전 선택). "
+            "특정 설정을 '열어줘/설정하러 가자'면 해당 sub 로 바로 모달을 연다.\n"
+            "  ⚠️ 발행/저장/삭제/빈근무표생성 같은 '실행' 요청은 sub 로 못 한다 — roster_create 로 "
+            "화면만 열고(sub 없이) 사용자가 버튼을 누르게 안내하라. 단 '엑셀 다운로드'는 invoke 사용.\n"
             "- `config` — 병동 설정 (HN/ADM 전용). "
             "sub=`shift_codes`(근무코드)·`weekoff`(자동 주휴=weekly_off_*)·"
             "`wanted_setting`(원티드 설정)·`month_off`(월 오프수 제한=off_days 정책, "
@@ -1379,6 +1385,8 @@ SKILL_TOOLS: list[dict] = [
                     "enum": [
                         "team_setting", "grade_setting",
                         "shift_codes", "weekoff", "wanted_setting", "month_off",
+                        "manpower", "wanted_config", "deadline", "off_request",
+                        "quick_config", "emergency", "version",
                     ],
                     "description": (
                         "화면 내 섹션/탭/모달. "
@@ -1420,6 +1428,8 @@ SKILL_TOOLS: list[dict] = [
                     "enum": [
                         "team_setting", "grade_setting",
                         "shift_codes", "weekoff", "wanted_setting", "month_off",
+                        "manpower", "wanted_config", "deadline", "off_request",
+                        "quick_config", "emergency", "version",
                     ],
                     "description": "화면 내 섹션/탭/모달.",
                 },
@@ -1465,4 +1475,52 @@ SKILL_TOOLS: list[dict] = [
             "required": ["ward_name"],
         },
     },
+    {
+        "name": "invoke",
+        "description": (
+            "화면의 '버튼 클릭'을 대신 실행하는 비파괴 명령입니다 (부수효과 없는 액션만). "
+            "현재 사용자가 보고 있는 근무표 워크스페이스 상태에 대해 동작합니다.\n\n"
+
+            "⚠️ 등록된 안전 명령만 실행할 수 있습니다. 아래 command enum 밖(발행/저장/삭제/"
+            "빈 근무표 생성 등 데이터를 바꾸는 파괴적 액션)은 절대 호출하지 마세요. 그런 요청은 "
+            "navigate(target=roster_create)로 화면만 열고 '화면에서 직접 눌러 주세요'라고 안내하세요.\n\n"
+
+            "─────────── command (실행할 안전 명령) ───────────\n"
+            "- `excel_download` — 현재 표시 중인 근무표를 엑셀 파일로 내보내기(다운로드). "
+            "'근무표 엑셀로 뽑아줘', '이거 다운로드 해줘', '엑셀로 받고 싶어' 같은 흐름.\n\n"
+
+            "예) '근무표 엑셀로 다운로드해줘' → invoke(command=\"excel_download\")"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["excel_download"],
+                    "description": "실행할 안전 명령 (closed enum). 목록에 없으면 호출 금지.",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "명령에 필요한 부가 파라미터 (선택). 내부 id 금지, 이름 기반.",
+                },
+            },
+            "required": ["command"],
+        },
+    },
 ]
+
+
+# ── 매니페스트 파생 병합 ────────────────────────────────────────
+# @skill 로 선언된 신규 스킬의 스키마를 SKILL_TOOLS 에 자동 편입한다.
+# 기존 21개(위 리터럴)는 그대로, 매니페스트 스킬만 뒤에 붙는다. 순서: 리터럴 → 매니페스트.
+def _merge_manifest_tools() -> None:
+    from agents_v2.skills.manifest import load_manifest_skills, manifest_tools
+
+    load_manifest_skills()
+    existing = {t["name"] for t in SKILL_TOOLS}
+    for schema in manifest_tools():
+        if schema["name"] not in existing:
+            SKILL_TOOLS.append(schema)
+
+
+_merge_manifest_tools()

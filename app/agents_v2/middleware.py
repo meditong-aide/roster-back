@@ -290,6 +290,30 @@ def _check_permission(
 
         return target_permission_error(args.get("target"), ctx)
 
+    # invoke: 비파괴 UI 명령 대행. command 별 hn_only 게이트(client_actions SSOT).
+    if normalized == "invoke":
+        from agents_v2.skills.client_actions import command_permission_error
+
+        return command_permission_error(args.get("command"), ctx)
+
+    # 매니페스트 스킬: 권한을 SkillSpec 에서 파생 — 하드코딩 불필요.
+    # (신규 스킬은 @skill(mutation=..., hn_only=...) 선언만으로 게이트가 걸린다.)
+    from agents_v2.skills.manifest import SKILL_SPECS
+
+    spec = SKILL_SPECS.get(normalized)
+    if spec is not None:
+        if spec.hn_only and not is_hn:
+            return "이 작업은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+        if spec.mutation and not is_hn:
+            nurse_name = args.get("nurse_name", "")
+            if (
+                nurse_name
+                and nurse_name != ctx.nurse_name
+                and nurse_name not in _SELF_REFERENCE_ALIASES
+            ):
+                return f"다른 간호사({nurse_name})의 데이터를 수정할 권한이 없습니다."
+        return None
+
     # (1) 병동 전체 영향 mutation
     if normalized in {"update_constraint", "generate_schedule"} and not is_hn:
         return "병동 전체 설정 변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."

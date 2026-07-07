@@ -25,7 +25,23 @@ NAVIGATE_TARGETS: dict[str, dict[str, Any]] = {
     "roster_view": {"subs": set(), "hn_only": False},
     "roster_view_my": {"subs": set(), "hn_only": False},
     "nurse_management": {"subs": {"team_setting", "grade_setting"}, "hn_only": True},
-    "roster_create": {"subs": set(), "hn_only": True},
+    # roster_create: 2026-07 프론트 개편으로 '근무표 만들기'가 모달 중심 워크스페이스가
+    # 됐다. 설정이 별도 route(config)가 아니라 이 화면 안 모달로 들어옴. 각 sub 는 프론트의
+    # 모달 1:1 매핑(핸드오프 계약: docs/AGENT_ROSTER_CREATE_NAV_HANDOFF_2026-07-07.md).
+    #   manpower      → ModalManpower (필요인원/인력 설정)
+    #   wanted_config → ModalWantedConfig (원티드 반영 설정)
+    #   deadline      → SetDeadLine (원티드 마감일 설정)
+    #   off_request   → ModalOffRequestList (오프 요청 목록)
+    #   quick_config  → RosterCreateConfigModal (생성 옵션 퀵 설정)
+    #   emergency     → ModalEmergencyReplacement (긴급 대체 찾기)
+    #   version       → 버전 선택 패널
+    "roster_create": {
+        "subs": {
+            "manpower", "wanted_config", "deadline",
+            "off_request", "quick_config", "emergency", "version",
+        },
+        "hn_only": True,
+    },
     # month_off: 월 오프수 제한(off_days 등 RosterConfig 정책). 전용 화면이 아직 없어
     # 근무표 설정 탭(tab 0)에 묻혀 있는 상태 — LLM 이 의미적으로 정확히 지정할 수 있도록
     # sub 추가하고 프론트에선 tab 0 으로 라우팅. (B 시리즈 후속, 2026-06-01)
@@ -34,11 +50,20 @@ NAVIGATE_TARGETS: dict[str, dict[str, Any]] = {
     "support": {"subs": set(), "hn_only": False},
 }
 
+# invoke 안전 명령 레지스트리 — 화면의 '버튼 클릭'을 에이전트가 대행하는 client-action.
+# ⚠️ 부수효과 없는(비파괴) 명령만 등록한다. 발행/저장/삭제 같은 파괴적 액션은 여기 없다 —
+# 그런 요청은 navigate 로 화면만 열고 사용자가 직접 UI 확인모달에서 누른다(설계 결정 2026-07-07).
+#   excel_download: 현재 워크스페이스에 표시 중인 근무표를 엑셀로 내보내기(읽기 전용).
+INVOKE_COMMANDS: dict[str, dict[str, Any]] = {
+    "excel_download": {"hn_only": True},
+}
+
 # client-action tool 이름 (registry skill 과 구분). hyphen/underscore 모두 허용.
 # - navigate/prefill: 화면 이동/폼 프리필 (route SSOT 기반 closed enum).
 # - switch_ward: 상단 병동 셀렉터 컨텍스트 전환. route 변경 X, group_id 전환.
 #   ward_name 은 freeform — 프론트가 자신의 ward 셀렉터 목록과 매칭(SSOT).
-_CLIENT_ACTION_NAMES = frozenset({"navigate", "prefill", "switch_ward"})
+# - invoke: 비파괴 UI 명령 대행 (INVOKE_COMMANDS closed enum).
+_CLIENT_ACTION_NAMES = frozenset({"navigate", "prefill", "switch_ward", "invoke"})
 
 
 def normalize_action_name(name: str) -> str:
@@ -69,6 +94,19 @@ def target_permission_error(target: Any, ctx: Any) -> str | None:
     return None
 
 
+def command_permission_error(command: Any, ctx: Any) -> str | None:
+    """HN 전용 invoke 명령을 일반 간호사가 호출하면 차단 메시지.
+
+    알 수 없는 command 는 None (권한 문제 아님 — build 단계에서 '실행 불가' 처리).
+    """
+    meta = INVOKE_COMMANDS.get(command)
+    if not meta:
+        return None
+    if meta["hn_only"] and not _is_hn(ctx):
+        return "해당 기능은 수간호사(HN) 또는 관리자(ADM) 전용입니다."
+    return None
+
+
 def build_ui_action(name: str, args: dict) -> tuple[dict | None, str | None]:
     """client-action tool 호출 → ui_action dict. ``(ui_action, error)`` 반환.
 
@@ -85,6 +123,18 @@ def build_ui_action(name: str, args: dict) -> tuple[dict | None, str | None]:
             return None, "전환할 병동 이름이 필요합니다 (예: '9A')."
         action: dict[str, Any] = {"action": norm, "ward_name": ward_name}
         return action, None
+
+    # invoke: 비파괴 UI 명령 대행 (엑셀 다운로드 등). target enum 대신 command enum.
+    if norm == "invoke":
+        command = args.get("command")
+        if command not in INVOKE_COMMANDS:
+            allowed = ", ".join(sorted(INVOKE_COMMANDS)) or "없음"
+            return None, f"'{command}'는 실행 가능한 명령이 아닙니다. (가능: {allowed})"
+        invoke_action: dict[str, Any] = {"action": norm, "command": command}
+        params = args.get("params")
+        if params:
+            invoke_action["params"] = params
+        return invoke_action, None
 
     target = args.get("target")
     meta = NAVIGATE_TARGETS.get(target)

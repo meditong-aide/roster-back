@@ -30,13 +30,13 @@ ALL_TOOL_NAMES: list[str] = [t["name"] for t in SKILL_TOOLS]
 # ── 카테고리 → tool 배선 맵 (wiring, NL 파싱 아님) ──
 # gray-zone 도메인엔 navigate/prefill 을 번들해 메인 프롬프트가 화면이동 vs 조회/실행을 가른다.
 CATEGORY_TOOLS: dict[str, list[str]] = {
-    # 순수 화면 이동/폼 프리필/병동 컨텍스트 전환
-    "navigation": ["navigate", "prefill", "switch_ward"],
+    # 순수 화면 이동/폼 프리필/병동 컨텍스트 전환 + 비파괴 UI 명령(엑셀 다운로드 등)
+    "navigation": ["navigate", "prefill", "switch_ward", "invoke"],
     # 근무표/원티드/간호사/시프트/설정값 조회 (view-vs-derive gray → navigate 번들)
     # [LIVE_LLM_CARVE 2026-06-22] '생성 끝났어?' / '마감일 어때?' / '한도 넘은 사람' 같은
     # 조회 발화가 read 직격 시그널이라 read 카테고리에 mutation 스킬의 조회 op 도 번들.
     "read": [
-        "query_schedule", "navigate",
+        "query_schedule", "navigate", "invoke",
         "query_generation_job", "manage_wanted_deadline", "manage_wanted_limits",
     ],
     # 근무/원티드 변경
@@ -52,7 +52,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # resolve_infeasibility: 실패 후 '어떻게 풀어?' 해결 옵션 카탈로그.
     "generate": [
         "generate_schedule", "query_generation_job",
-        "resolve_infeasibility", "navigate", "query_schedule",
+        "resolve_infeasibility", "navigate", "query_schedule", "invoke",
     ],
     # 제약 위반 검증 / 교정 제안 (실패 후 해결 옵션 흐름도 인접 — resolve_infeasibility 번들)
     "validate_repair": [
@@ -74,6 +74,26 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
         "navigate", "prefill",
     ],
 }
+
+
+# ── 매니페스트 파생 병합 ────────────────────────────────────────
+# @skill 로 선언된 신규 스킬의 categories 를 CATEGORY_TOOLS 에 자동 병합.
+# (VALID_CATEGORIES 계산 전에 수행 — 매니페스트가 새 카테고리를 쓰더라도 포함되도록.)
+def _merge_manifest_categories() -> None:
+    from agents_v2.skills.manifest import (
+        load_manifest_skills,
+        manifest_category_tools,
+    )
+
+    load_manifest_skills()
+    for cat, names in manifest_category_tools().items():
+        bucket = CATEGORY_TOOLS.setdefault(cat, [])
+        for n in names:
+            if n not in bucket:
+                bucket.append(n)
+
+
+_merge_manifest_categories()
 
 VALID_CATEGORIES: frozenset[str] = frozenset(CATEGORY_TOOLS)
 

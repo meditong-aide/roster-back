@@ -181,6 +181,36 @@ POLICY: dict[str, dict[ErrorType, Action]] = {
   `action = POLICY[ctx.autonomy_mode].get(err_type, MANUAL_DEFAULT)` 단일 dispatch로 대체.
 - `manual` 매트릭스가 현행 분기와 1:1 동치가 되도록 매핑 → **행동 변화 0 (회귀 안전)**.
 
+### 3.D Skill Manifest — 선언 단일화 (2026-07-07 구현)
+
+**문제**: 스킬 하나 추가 = 최대 5곳 수동 동기(descriptions 스키마 · registry @register ·
+router CATEGORY_TOOLS · middleware 권한 · grounding). 백엔드 기능이 늘 때마다 이 세금을
+반복 → "에이전트가 따라붙어 고생"하는 구조적 원인. 실행층(execute_skill·grounding·
+taxonomy)은 DRY인데 **선언층에 단일 소스가 없었다.**
+
+**해법**: `app/agents_v2/skills/manifest.py` — `@skill(name, schema, categories=,
+mutation=, hn_only=, grounds=)` 하나로 선언하면 소비 지점들이 **파생(derive)**:
+
+```python
+@skill("manage_assignment", SCHEMA,
+       categories=["settings_people"], mutation=True, hn_only=True,
+       grounds=["nurse_name", "group_name"])
+def manage_assignment(db, params): ...
+```
+
+- 핸들러 → 기존 `SKILL_REGISTRY`(run_skill 무변경)
+- `manifest_tools()` → descriptions.`SKILL_TOOLS` 병합
+- `manifest_category_tools()` → router.`CATEGORY_TOOLS` 병합
+- `manifest_mutation_skills()`/`manifest_hn_only_skills()` → middleware `_check_permission` 파생
+
+**성질**: 기존 17개(@register)는 무변경(무위험). 신규 스킬만 @skill → **준비물 ②(권한)·
+③(라우터)이 자동**. client_actions 의 dump→프론트 브릿지와 같은 '단일 소스 → 파생' 패턴을
+내부에 적용. 부수 효과로 **SKILL_TOOLS↔SKILL_REGISTRY 정합 테스트**를 추가해 드리프트
+(스키마만 있고 핸들러 없음 → 런타임 KeyError)를 사전 차단.
+
+**남은 준비물 ①**: 병동/그룹 이름→group_id 그라운딩 헬퍼(`resolve_group`)는 manage_assignment
+구현 시 함께. 매니페스트 `grounds=` 는 현재 문서/검증용이며, 자동 그라운딩 배선은 후속.
+
 ## 4. Rollout Order (회귀 리스크 오름차순)
 
 1. **`errors.py` taxonomy + `classify_error`** — 기존 산발 분기를 통합하되 `manual`

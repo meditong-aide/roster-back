@@ -334,7 +334,8 @@ class TestSkillDescriptions:
         # + 2 Wave-2 (manage_teams, manage_wanted_limits)
         # + 1 Wave-3 (resolve_infeasibility)
         # + 3 client-action (navigate, prefill, switch_ward) = 20.
-        assert len(SKILL_TOOLS) == 20
+        # + 1 client-action (invoke, 2026-07-07 비파괴 UI 명령/엑셀) = 21.
+        assert len(SKILL_TOOLS) == 21
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:

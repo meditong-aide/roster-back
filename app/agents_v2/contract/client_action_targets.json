@@ -31,7 +31,15 @@
       "hn_only": true
     },
     "roster_create": {
-      "subs": [],
+      "subs": [
+        "deadline",
+        "emergency",
+        "manpower",
+        "off_request",
+        "quick_config",
+        "version",
+        "wanted_config"
+      ],
       "hn_only": true
     },
     "roster_view": {

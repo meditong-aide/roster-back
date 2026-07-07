@@ -16,6 +16,7 @@ from agents_v2.middleware import _check_permission
 from agents_v2.schemas.session_context import SessionContext
 from agents_v2.skills.client_actions import (
     build_ui_action,
+    command_permission_error,
     is_client_action,
     target_permission_error,
 )
@@ -53,6 +54,7 @@ def test_is_client_action():
     assert is_client_action("navigate")
     assert is_client_action("prefill")
     assert is_client_action("switch_ward")
+    assert is_client_action("invoke")
     assert not is_client_action("query_schedule")
     assert not is_client_action("manage_team_min")
 
@@ -258,3 +260,83 @@ def test_switch_ward_recorded_in_trace(db):
     sess = _nav_session(db, name="switch_ward", ward_name="9B")
     sess.send("9B병동으로 바꿔줘")
     sess.assert_tool_called("switch_ward", {"ward_name": "9B"})
+
+
+# ── roster_create 모달 서브 (2026-07 프론트 개편) ─────────
+
+
+def test_build_roster_create_modal_sub_ok():
+    # '인력 설정 열어줘' → roster_create / manpower 모달
+    action, err = build_ui_action("navigate", {"target": "roster_create", "sub": "manpower"})
+    assert err is None
+    assert action == {"action": "navigate", "target": "roster_create", "sub": "manpower"}
+
+
+def test_build_roster_create_all_modal_subs_valid():
+    for sub in ("manpower", "wanted_config", "deadline", "off_request",
+                "quick_config", "emergency", "version"):
+        action, err = build_ui_action("navigate", {"target": "roster_create", "sub": sub})
+        assert err is None, f"{sub}: {err}"
+        assert action["sub"] == sub
+
+
+def test_build_roster_create_invalid_sub_errors():
+    action, err = build_ui_action("navigate", {"target": "roster_create", "sub": "payroll"})
+    assert action is None
+    assert err and "섹션이 없습니다" in err
+
+
+def test_roster_create_manpower_e2e(db):
+    res = _nav_session(db, target="roster_create", sub="manpower").send("인력 설정 열어줘")
+    assert res.ui_actions == [{"action": "navigate", "target": "roster_create", "sub": "manpower"}]
+
+
+def test_roster_create_sub_hn_only(db):
+    # roster_create 는 HN 전용 → 일반 간호사는 모달 서브도 차단
+    res = _nav_session(db, role="nurse", target="roster_create", sub="deadline").send("마감일 설정 열어줘")
+    assert res.ui_actions == []
+
+
+# ── invoke — 비파괴 UI 명령 대행 (엑셀 다운로드) ──────────
+
+
+def test_build_invoke_excel_ok():
+    action, err = build_ui_action("invoke", {"command": "excel_download"})
+    assert err is None
+    assert action == {"action": "invoke", "command": "excel_download"}
+
+
+def test_build_invoke_with_params():
+    action, err = build_ui_action("invoke", {"command": "excel_download", "params": {"month": 5}})
+    assert err is None
+    assert action["params"] == {"month": 5}
+
+
+def test_build_invoke_unknown_command_errors():
+    # 파괴적/미등록 명령은 emit 불가 (closed enum)
+    action, err = build_ui_action("invoke", {"command": "publish"})
+    assert action is None
+    assert err and "실행 가능한 명령이 아닙니다" in err
+
+
+def test_permission_invoke_excel_nurse_blocked():
+    # excel_download 는 HN 전용
+    err = command_permission_error("excel_download", _ctx("nurse"))
+    assert err is not None and ("수간호사" in err or "ADM" in err)
+    # middleware 경유도 동일
+    assert _check_permission("invoke", {"command": "excel_download"}, _ctx("nurse")) is not None
+
+
+def test_permission_invoke_excel_hn_allowed():
+    assert command_permission_error("excel_download", _ctx("HN")) is None
+    assert _check_permission("invoke", {"command": "excel_download"}, _ctx("ADM")) is None
+
+
+def test_permission_invoke_unknown_command_not_a_block():
+    # 미등록 command 는 권한 문제 아님(None) — build 단계에서 '실행 불가' 처리.
+    assert command_permission_error("publish", _ctx("nurse")) is None
+
+
+def test_invoke_excel_e2e(db):
+    res = _nav_session(db, name="invoke", command="excel_download").send("근무표 엑셀로 다운로드해줘")
+    assert res.ui_actions == [{"action": "invoke", "command": "excel_download"}]
