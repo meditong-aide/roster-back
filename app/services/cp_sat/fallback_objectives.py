@@ -589,10 +589,13 @@ def build_fallback_stage3_objective_terms(
     # 퇴사자 대응 부분 재생성에서 "원본 근무표에 가장 가까운 해"를 tie-breaker로
     # 선택하기 위한 Stage 3 최하위 목적항. 속성이 없으면 완전 no-op(정상 생성 회귀 0).
     #   roster_system.partial_resolve_anchor = {
-    #       "orig": {(n_idx, d_idx): s_idx, ...},  # 자유 셀의 원본 시프트 인덱스
+    #       "orig": {(n_idx, d_idx): "D"|s_idx, ...},  # 자유 셀의 원본 시프트(코드 권장, int도 허용)
     #       "w_cell": int,   # 형태 A(셀 Hamming) weight, 기본 1
     #       "w_nurse": int,  # 형태 B(건드린 인원) weight, 기본 0(=미사용)
     #   }
+    # orig 값은 시프트 '코드'(D/E/N/O/M/W …) 권장 — 여기서 cfg.shift_types 기준으로 인덱스를
+    #   해석하므로 상위 서비스가 shift_types 순서를 가정할 필요가 없다. 코드가 이 병동
+    #   shift_types에 없으면(예: 미드 미사용) 해당 셀은 앵커에서 자연 제외. (int는 하위호환.)
     # weight 조건: w_cell·(자유셀수) 및 w_nurse·(인원수)가 기존 S3 최소 weight보다 작아야
     #   tie-breaker로만 작동(원티드/공정성 불침해). 설계문서 §4.1① 합성보장 참조.
     try:
@@ -601,10 +604,20 @@ def build_fallback_stage3_objective_terms(
             _orig = _anchor.get("orig") or {}
             _w_cell = int(_anchor.get("w_cell", 1) or 0)
             _w_nurse = int(_anchor.get("w_nurse", 0) or 0)
+            _st_index = {
+                str(code).strip().upper(): i
+                for i, code in enumerate(roster_system.config.shift_types)
+            }
             _by_nurse: dict[int, list[tuple[int, int]]] = {}
             _cnt = 0
-            for (n, d), s_star in _orig.items():
-                n, d, s_star = int(n), int(d), int(s_star)
+            for (n, d), s_val in _orig.items():
+                n, d = int(n), int(d)
+                if isinstance(s_val, str):
+                    s_star = _st_index.get(s_val.strip().upper())
+                else:
+                    s_star = int(s_val)
+                if s_star is None:
+                    continue
                 if not (0 <= n < N and 0 <= d < D and 0 <= s_star < S):
                     continue
                 if d < join[n] or d > leave[n]:

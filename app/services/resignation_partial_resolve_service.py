@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -223,7 +224,9 @@ def build_resignation_diff_response(
     changed_nurses: list[dict[str, Any]] = []
     cells_changed = 0
     touched_non_resigned = 0
+    resigned_id_str = str(resigned_nurse.nurse_id)
     for nurse_id in nurse_ids:
+        is_resigned = nurse_id == resigned_id_str
         before_row = base_grid.get(nurse_id, ["-"] * days_in_month)
         after_row = draft_grid.get(nurse_id, ["-"] * days_in_month)
         changes: list[dict[str, Any]] = []
@@ -232,7 +235,10 @@ def build_resignation_diff_response(
             after = after_row[day_idx]
             if before == after:
                 continue
-            cells_changed += 1
+            # cells_changed는 앵커 ChangeCells(비퇴사자 자유 셀)와 일치시킨다.
+            # 퇴사자의 vacated 셀은 churn이 아니라 결원이므로 카운트 제외(표시는 유지).
+            if not is_resigned:
+                cells_changed += 1
             changes.append(
                 {
                     "day": day_idx + 1,
@@ -251,7 +257,7 @@ def build_resignation_diff_response(
                 }
             )
         if changes:
-            if nurse_id != str(resigned_nurse.nurse_id):
+            if not is_resigned:
                 touched_non_resigned += 1
             meta = nurse_meta.get(
                 nurse_id,
@@ -350,6 +356,48 @@ def _transfer_or_close_preceptee_periods(
     return warnings
 
 
+def _restore_prefix_from_base(
+    *,
+    db: Session,
+    base_schedule: Schedule,
+    draft_schedule: Schedule,
+    cutoff_date: date,
+) -> int:
+    """동결 prefix(cutoff 이전)를 원본 entries로 verbatim 복원한다.
+
+    솔버는 prefix를 main-code(D/E/N/O)로 재저장하므로 원본의 특정 변형(D2 등)이나
+    수동 편집을 잃을 수 있다. cutoff 이전은 이미 확정된 과거라 원본과 100% 동일해야
+    하므로, draft의 prefix entries를 지우고 원본 entries를 그대로 복사한다.
+    (diff는 cutoff 이후만 비교하므로 복원은 diff에 영향 없음.)
+    """
+    cutoff_dt = datetime.combine(cutoff_date, datetime.min.time())
+    db.query(ScheduleEntry).filter(
+        ScheduleEntry.schedule_id == draft_schedule.schedule_id,
+        ScheduleEntry.work_date < cutoff_dt,
+    ).delete(synchronize_session=False)
+    base_prefix = (
+        db.query(ScheduleEntry)
+        .filter(
+            ScheduleEntry.schedule_id == base_schedule.schedule_id,
+            ScheduleEntry.work_date < cutoff_dt,
+        )
+        .all()
+    )
+    for entry in base_prefix:
+        db.add(
+            ScheduleEntry(
+                entry_id=str(uuid.uuid4().hex)[:16],
+                schedule_id=draft_schedule.schedule_id,
+                nurse_id=entry.nurse_id,
+                work_date=entry.work_date,
+                shift_id=entry.shift_id,
+                id=entry.id,
+            )
+        )
+    db.flush()
+    return len(base_prefix)
+
+
 def partial_resolve_on_resignation(
     *,
     db: Session,
@@ -431,6 +479,14 @@ def partial_resolve_on_resignation(
     )
     if draft_schedule is None:
         raise HTTPException(status_code=500, detail="부분 재생성 draft 저장 결과를 찾을 수 없습니다.")
+
+    # 동결 prefix를 원본과 100% 동일하게 복원(변형/수동편집 보존).
+    _restore_prefix_from_base(
+        db=db,
+        base_schedule=base_schedule,
+        draft_schedule=draft_schedule,
+        cutoff_date=cutoff_date,
+    )
 
     diff = build_resignation_diff_response(
         db=db,

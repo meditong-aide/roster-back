@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from copy import deepcopy
+from typing import Any
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
@@ -1421,6 +1422,185 @@ def _build_engine_nurse_index_map(nurses_in_group: list[Nurse]) -> dict[str, int
         ),
     )
     return {r["nurse_id"]: i for i, r in enumerate(sorted_rows)}
+
+
+def _coerce_date(value: Any) -> date | None:
+    """date/datetime/ISO 문자열을 date로 정규화한다."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        text_value = value.strip()
+        if not text_value:
+            return None
+        try:
+            return datetime.fromisoformat(text_value).date()
+        except ValueError:
+            try:
+                return date.fromisoformat(text_value[:10])
+            except ValueError:
+                return None
+    return None
+
+
+def _overlay_partial_resignation_on_nurses(
+    nurses: list[Nurse],
+    partial_resolve_context: dict[str, Any] | None,
+) -> None:
+    """부분 재생성 실행에서만 퇴사자를 cutoff 당일부터 공급 제외한다."""
+    if not partial_resolve_context:
+        return
+    resigned_nurse_id = str(partial_resolve_context.get("resigned_nurse_id") or "")
+    cutoff = _coerce_date(partial_resolve_context.get("cutoff_date"))
+    if not resigned_nurse_id or cutoff is None:
+        return
+    # 기존 active-range/fallback 일부 경로가 resignation_date를 inclusive last-active
+    # day로 해석하므로, solver 입력에는 cutoff 전날을 넣어 cutoff 당일부터 제외한다.
+    effective_last_day = cutoff - timedelta(days=1)
+    effective_dt = datetime.combine(effective_last_day, datetime.min.time())
+    for nurse in nurses or []:
+        if str(getattr(nurse, "nurse_id", "")) == resigned_nurse_id:
+            nurse.__dict__["resignation_date"] = effective_dt
+            print(
+                "[PartialResolve] 퇴사자 solver 공급 제외: "
+                f"nurse_id={resigned_nurse_id}, cutoff={cutoff}, "
+                f"effective_last_day={effective_last_day}"
+            )
+            return
+
+
+def _normalize_shift_main_for_partial(shift_id: Any, shift_lookup: dict[str, Shift]) -> str:
+    """ScheduleEntry shift_id를 solver main shift(D/E/N/O/W)로 정규화한다."""
+    code = str(shift_id or "").strip()
+    upper = code.upper()
+    if upper in {"OFF", "O", "주"}:
+        return "O"
+    shift = shift_lookup.get(upper)
+    if shift is None:
+        if upper in {"D", "E", "M", "N"}:
+            return upper
+        return "W"
+    shift_type = str(getattr(shift, "type", "") or "").strip()
+    shift_gb = str(getattr(shift, "shift_gb", "") or "").strip().upper()
+    default_shift = str(getattr(shift, "default_shift", "") or "").strip().upper()
+    if shift_type == "휴무":
+        return "O"
+    if shift_type in {"휴가", "공가"}:
+        return "O"
+    if shift_type == "근무":
+        if shift_gb in {"D", "데이"}:
+            return "D"
+        if shift_gb in {"E", "이브닝"}:
+            return "E"
+        if shift_gb in {"N", "나이트"}:
+            return "N"
+        if shift_gb in {"M", "미드"}:
+            return "M"
+        if default_shift in {"D", "E", "M", "N", "O"}:
+            return default_shift
+        if upper in {"D", "E", "M", "N", "O"}:
+            return upper
+    return "W"
+
+
+def _apply_partial_resolve_context(
+    *,
+    db: Session,
+    current_user,
+    req: RosterRequest,
+    nurses_for_engine: list[Nurse],
+    config_dict: dict,
+    combined_fixed_cells: list[dict],
+    partial_resolve_context: dict[str, Any] | None,
+) -> list[dict]:
+    """원본 근무표 기반 prefix fixed_cells와 suffix anchor를 생성한다."""
+    if not partial_resolve_context:
+        return combined_fixed_cells
+    base_schedule_id = str(partial_resolve_context.get("base_schedule_id") or "")
+    resigned_nurse_id = str(partial_resolve_context.get("resigned_nurse_id") or "")
+    cutoff = _coerce_date(partial_resolve_context.get("cutoff_date"))
+    if not base_schedule_id or not resigned_nurse_id or cutoff is None:
+        return combined_fixed_cells
+
+    month_start = date(req.year, req.month, 1)
+    days_in_month = calendar.monthrange(req.year, req.month)[1]
+    cutoff_idx = max(0, min(days_in_month, (cutoff - month_start).days))
+    nurse_idx_map = _build_engine_nurse_index_map(nurses_for_engine)
+    resigned_idx = nurse_idx_map.get(resigned_nurse_id)
+
+    if resigned_idx is not None:
+        combined_fixed_cells = [
+            c for c in combined_fixed_cells
+            if not (
+                int(c.get("nurse_index", -1)) == int(resigned_idx)
+                and int(c.get("day_index", -1)) >= cutoff_idx
+            )
+        ]
+
+    entries = (
+        db.query(ScheduleEntry)
+        .filter(ScheduleEntry.schedule_id == base_schedule_id)
+        .all()
+    )
+    shift_lookup = _load_shift_lookup(db, current_user.office_id, current_user.group_id)
+    # anchor orig는 시프트 '코드'(D/E/N/O/M/W)를 담는다. 인덱스 해석은 소비측
+    # (fallback_objectives)이 cfg.shift_types 기준으로 수행 → shift_types 순서 가정 제거.
+    orig: dict[tuple[int, int], str] = {}
+    prefix_fixed: list[dict] = []
+    seen_fixed: set[tuple[int, int]] = {
+        (int(c.get("nurse_index")), int(c.get("day_index")))
+        for c in combined_fixed_cells
+        if c.get("nurse_index") is not None and c.get("day_index") is not None
+    }
+
+    for entry in entries:
+        nurse_id = str(getattr(entry, "nurse_id", "") or "")
+        n_idx = nurse_idx_map.get(nurse_id)
+        if n_idx is None:
+            continue
+        work_date = _coerce_date(getattr(entry, "work_date", None))
+        if work_date is None:
+            continue
+        d_idx = (work_date - month_start).days
+        if d_idx < 0 or d_idx >= days_in_month:
+            continue
+        main_shift = _normalize_shift_main_for_partial(entry.shift_id, shift_lookup)
+        if d_idx < cutoff_idx:
+            key = (n_idx, d_idx)
+            if key not in seen_fixed:
+                prefix_fixed.append(
+                    {
+                        "nurse_index": n_idx,
+                        "day_index": d_idx,
+                        "shift": main_shift,
+                        "shift_type": getattr(
+                            shift_lookup.get(str(entry.shift_id).upper()),
+                            "type",
+                            None,
+                        ),
+                        "fixed_source": "partial_resolve_prefix",
+                    }
+                )
+                seen_fixed.add(key)
+        elif nurse_id != resigned_nurse_id:
+            orig[(n_idx, d_idx)] = main_shift
+
+    combined_fixed_cells = list(combined_fixed_cells) + prefix_fixed
+    config_dict["partial_resolve_anchor"] = {
+        "orig": orig,
+        "w_cell": int(partial_resolve_context.get("w_cell", 1) or 1),
+        "w_nurse": int(partial_resolve_context.get("w_nurse", 5) or 0),
+    }
+    print(
+        "[PartialResolve] context applied: "
+        f"base={base_schedule_id}, cutoff={cutoff}, "
+        f"prefix_fixed={len(prefix_fixed)}, anchor_cells={len(orig)}, "
+        f"resigned_idx={resigned_idx}"
+    )
+    return combined_fixed_cells
 
 
 def _exclude_alloff_nurses(
@@ -4346,7 +4526,13 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None):
+def generate_roster_service(
+    req: RosterRequest,
+    current_user,
+    db: Session,
+    treatment_ids=None,
+    partial_resolve_context: dict[str, Any] | None = None,
+):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4524,6 +4710,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             f"[Assignment][FlushedTransfer] 병동이동 flush된 간호사 {len(_flushed_transfer_ids)}명 활동범위 클리핑 대상: "
             f"{_flushed_names}"
         )
+    _overlay_partial_resignation_on_nurses(engine_nurses, partial_resolve_context)
     active_range_candidates = {
         str(n.nurse_id): _active_range_in_month(n, month_start, days_in_month)
         for n in engine_nurses
@@ -5286,6 +5473,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             nurses_for_engine, combined_fixed_cells, off_exception_cells,
             config_dict, days_in_month,
         )
+    )
+    combined_fixed_cells = _apply_partial_resolve_context(
+        db=db,
+        current_user=current_user,
+        req=req,
+        nurses_for_engine=nurses_for_engine,
+        config_dict=config_dict,
+        combined_fixed_cells=combined_fixed_cells,
+        partial_resolve_context=partial_resolve_context,
     )
 
     # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──

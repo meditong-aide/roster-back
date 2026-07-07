@@ -247,11 +247,69 @@ CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 groundin
 - **C. 앵커 목적항 PoC** — 완료.
   - 구현: `fallback_objectives.py` return 직전, `roster_system.partial_resolve_anchor` 있을 때만 형태A(w_cell)/B(w_nurse) 항 추가. 속성 없으면 no-op(회귀 0, 솔버 테스트 10개 통과 확인).
   - 검증: `tests/test_partial_resolve_anchor.py` — 앵커만으로 원본 재현(변경0) / 퇴사 시 n1·n2 원본 유지 + 빈자리 최소 변경 흡수 / 형태B 인원 집중. 3 passed.
-- **D. 오케스트레이션 서비스 + diff 산출** — `partial_resolve_anchor` 채우기(원본 entries→{(n,d):s_idx}), resignation_date 세팅, 프리셉터 period 재지정, 특수근무 drop, warm-start hint, draft 저장
-- **E. `resolve-resignation` 스킬**
-- **F. 회귀 검증** — 파라미터→조건 적용→결과 품질 3단계, 통계 보존 확인
+- **D. 오케스트레이션 서비스 + diff 산출** — 완료.
+  - `resignation_partial_resolve_service.partial_resolve_on_resignation` + 엔드포인트 `POST /roster_create/partial-resolve/resignation`.
+  - `roster_create_service._apply_partial_resolve_context`: 원본 entries → prefix `fixed_cells`(동결) + suffix anchor `orig`(시프트 **코드** 저장, 인덱스 해석은 소비측 `cfg.shift_types` 기준 — shift_types 순서 가정 제거). nurse_index는 `_build_engine_nurse_index_map`(솔버 정렬키 동일)로 정합.
+  - resignation_date = **cutoff-1**(inclusive last-active 규약), 프리셉터 `nurse_preceptee_period` 이관/해제, 동결 prefix는 원본 entries로 **verbatim 복원**(변형·수동편집 보존).
+  - diff: `cells_changed`(퇴사자 vacated 제외) / `nurses_touched` / `kind` 분류 / **커버리지 미달 warnings**(§6.1 가시화, draft 그리드 직접 스캔).
+  - 검증: `tests/test_resignation_orchestration.py`(매핑·복원·diff) + `tests/test_resignation_coverage_warnings.py`. 회귀: 솔버 13개 통과.
+- **E. `resolve-resignation` 스킬** — 미착수(엔드포인트는 있음. agentic 스킬 래핑 잔여).
+- **F. 회귀 검증** — 파라미터→조건 적용→결과 품질 3단계, 통계 보존 확인(실 병동 e2e 잔여).
 
-## 9. 미해결/추후 결정
+## 9. 변경 인원 표시 (Diff Response) 설계
+
+프론트가 "누가 무엇에서 무엇으로 바뀌었나"를 그리드에 표시하기 위한 응답. 기존 컨벤션 재사용:
+- 그리드: nurse 리스트 × `schedule[day]` 배열 (`roster.py:1710`, `{nurse_id, schedule:[shift/day], schedule_ids:[int/day]}`)
+- 변경셋 선례: `moves:[{nurse_id, name, from, from_name, to, to_name}]` + `warnings` (`ward_redistribute_service.py:474`)
+
+### 계산 (backend)
+
+1. **원본 그리드** = 원본 issued의 `ScheduleEntry` → `{nurse_id: [shift/day]}` (`_build_schedule_map` 재사용, `replacement_recommend_service.py:292`).
+2. **draft 그리드** = 재생성 결과 동일 형태.
+3. 각 nurse × day(≥cutoff)에서 `orig[n][d] != new[n][d]`인 셀 수집.
+4. **kind 분류**(색상용): `off_to_work`(빈자리 메움), `work_to_off`, `shift_change`(D↔E↔N), `resigned`(퇴사자 행). shift 의미는 `_resolve_shift_semantic_with_reason` 재사용.
+5. **degrade 가시화**(§6.1): `roster_system._constraint_impact_constraint_modes`에서 team `skipped_by_capacity` 수집 + grade near-hard(6M) shortfall 셀 → `warnings`.
+
+### Response 스키마
+
+```jsonc
+{
+  "schedule_id": "<새 draft>",
+  "base_schedule_id": "<원본 issued>",
+  "cutoff_date": "2026-03-15",
+  "resigned_nurse": {"nurse_id": "...", "name": "..."},
+  "summary": {
+    "nurses_touched": 3,          // = NursesTouched (앵커 형태B 값과 일치)
+    "cells_changed": 7,           // = ChangeCells
+    "warnings": ["3/20 팀2 나이트 최소 미달", "grade-1 1명 부족"]
+  },
+  "changed_nurses": [             // moves 선례 확장, num_changes desc 정렬
+    {
+      "nurse_id": "...", "name": "김간호사", "grade": 2, "team_id": "1",
+      "num_changes": 3,
+      "changes": [
+        {"day": 16, "date": "2026-03-16",
+         "from": "O", "from_name": "오프", "to": "D", "to_name": "데이",
+         "kind": "off_to_work"}
+      ]
+    }
+  ]
+}
+```
+
+`nurses_touched`/`cells_changed`는 **앵커 목적항 값을 그대로 리포트**(§4.1 검증)하고, `changed_nurses`를 원본 vs draft Hamming으로 교차검증한다.
+
+### 표시 (frontend)
+
+- **그리드**: 새 draft 로스터를 기존 월조회 컴포넌트로 그대로 렌더.
+- **셀 하이라이트**: `changed_nurses[].changes[].day` 셀에 색/뱃지. `kind`로 색 구분(off_to_work=강조, shift_change=약). `from→to`는 tooltip.
+- **사이드 패널 "변경된 인원"**: `changed_nurses` 목록(이름·grade·team·num_changes), 클릭 시 해당 행 스크롤/포커스.
+- **배너**: `nurses_touched`명·`cells_changed`칸 변경 + `warnings`(커버리지/팀/등급 미달).
+- **퇴사자 행**: cutoff 이후 회색/취소선(`kind=resigned`).
+
+> 프론트가 원본 그리드를 이미 갖고 있어 자체 diff도 가능하나, **backend가 kind·warnings까지 authoritative하게 계산**해 내려주는 편을 권장(색상 규칙·미달 경고 일원화).
+
+## 10. 미해결/추후 결정
 
 - 커버리지 vs 변경최소화: 완전 서열 유지 vs 가중합 노브 (§3 튜닝 노브)
 - cutoff 경계 semantics: cutoff = 퇴사일 (퇴사일 포함하여 그날부터 변경, 전날까지 동결) — 구현 시 최종 확정
