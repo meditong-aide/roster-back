@@ -85,18 +85,61 @@ Stage 3 안에서는 **공정성(통계 보존) > 앵커(변경최소화)** 로 
 
 **① 변경 최소화 앵커 목적항 (신규 solver term)**
 
-- 자유 셀(비퇴사자 × cutoff 이후)에 대해 `원래값 != 새값`이면 페널티.
-- warm-start는 기존 `AddHint` 재사용 (`app/services/cp_sat/fallback_lex.py:2964`, `:3257`).
+변수 `X[n,d,s] ∈ {0,1}`, 셀마다 `Σ_s X[n,d,s] = 1`. 원본 시프트를 `s*(n,d)`라 하면 **`X[n,d,s*]`가 곧 "원본 유지" 지시자**다 (새 변수 불필요). 자유 셀 `F = {(n,d): n≠퇴사자, d≥cutoff}`.
+
+*형태 A — 셀 단위 변경 수 (Hamming)*
+```
+ChangeCells = Σ_(n,d)∈F (1 − X[n,d,s*(n,d)])
+목적항: + W_cell · Σ_(n,d)∈F X[n,d,s*(n,d)]   (원본 유지 보상)
+```
+
+*형태 B — 건드린 인원 수*
+```
+touched_n ≥ 1 − X[n,d,s*(n,d)]   ∀ d s.t. (n,d)∈F
+NursesTouched = Σ_n touched_n
+```
+
+*권장: 하이브리드 (사람 우선, 칸 보조)*
+```
+목적항 = − W_nurse · NursesTouched − W_cell · ChangeCells
+         (W_nurse ≫ W_cell, 둘 다 공정성 weight 아래)
+```
+A만: 변경이 여러 명에 흩어짐. B만: 한 명에 몰림. 하이브리드 = "되도록 적은 사람만, 그 안에서 총 변경 칸 최소" → "확정 근무표 최대한 안 건드림"에 대응.
+
+*옵션: 변경 종류별 가중치 (여전히 선형)*
+```
+CellPenalty(n,d) = Σ_s c(s*(n,d), s) · X[n,d,s]
+  c(a,a)=0, c(OFF,근무)=高, c(D,E)=低 …
+```
+형태 A는 모든 c=1인 특수형. 초기엔 A로 시작, 필요 시 c 테이블로 정교화.
+
+*구현*
 - **Stage 3** 목적항으로 추가 (`build_fallback_stage3_objective_terms`, `app/services/cp_sat/fallback_objectives.py`). Stage 1(커버리지)·Stage 2(안전)는 손대지 않는다.
 - Stage 3 내부 weight: 공정성 항보다 아래 (공정성 > 앵커).
+- warm-start `AddHint(X[n,d,s*], 1)` 재사용 (`fallback_lex.py:2964`, `:3257`) → 원본 근처 출발 + 수렴 가속.
+
+*검증*: solve 후 `NursesTouched`/`ChangeCells` 값을 리포트. 원본 entries vs draft entries Hamming 비교로 교차검증. 전체 재생성 대비 ChangeCells 감소 배수로 효과 정량화.
+
+*합성 보장 (중요): 앵커는 독립 loss가 아니라 기존 목적함수에 얹는 "한 개 항"*
+
+최소변경은 **Grade·Team·원티드·설정기준(연속·나이트)·개별속성을 모두 지킨 조건 하에서의 최소변경**이다. 기존 Stage 3 목적함수(원티드 + 공정성 + grade cascade + team_min)를 그대로 두고, 그 합에 앵커 한 항만 더한다:
+```
+maximize [ 기존 Stage3 항 전부 ] + ( − W_nurse·NursesTouched − W_cell·ChangeCells )
+subject to  S1 잠금(커버리지=최적, 등식) · S2 잠금(ND/NE·연속·월나이트·회복=최적, 위반0셀 고정)
+            · 항상 하드(fixed_cells, Σ_s X=1, join/leave, grade/team hard)
+```
+- **하드는 하드대로.** 앵커는 Stage 3에 살아 S1/S2를 못 건드린다. 특히 Stage 3는 "위반=0 셀 0 고정 + 새 위반 생성 금지"(`fallback_lex.py:149`)라 **앵커가 ND/NE를 새로 만들어 변경을 줄이는 것은 불가능**. ND/NE가 0인 해공간 안에서만 tie-break.
+- **weight 조건 (tie-breaker 보장)**: `W_cell·(자유셀 최대수) < 기존 S3 최소 weight`. 미충족 시 앵커가 원티드/공정성을 이겨 "원본 유지하려 원티드 희생"이 생김.
+  - (a) weight 바운딩 — 간단, 초기 채택.
+  - (b) 별도 Stage 3.5 lex 패스(원티드·공정성 고정 후 앵커만 최소화) — tie-breaker를 수학적으로 100% 보장, 회귀 시 승격.
 
 **② 오케스트레이션 서비스** `partial_resolve_on_resignation(schedule_id, resigned_nurse_id, cutoff_date)`
 
 1. 기존 `ScheduleEntry` 로드 → cutoff 이전 셀을 `fixed_cells`로 변환 (`cp_sat_basic.py:2591` 소비 포맷 그대로).
 2. 퇴사자를 cutoff 이후 공급에서 제외 → **엔진 기존 `resignation_date` 메커니즘 재사용** (`fallback_lex.py:216-232`이 `nu.resignation_date` 이후 변수 생성을 스킵). 별도 OFF 핀 불필요. 퇴사자의 cutoff 이후 fixed_wanted/특수근무·프리셉터 관계는 이 단계에서 정리(§6.3, §6.4).
 3. 원본을 hint + anchor로 주입, 기존 생성 파이프라인 재호출.
-4. **diff 산출** (누가·언제·무엇→무엇) → 미승인 draft로 반환.
-5. 승인 시에만 DB 반영.
+4. 결과를 **정상 생성과 동일하게 새 draft Schedule로 저장** (별도 승인/발행 게이트 없음 — "추가 생성"과 같은 취급).
+5. **diff 산출** (누가·언제·무엇→무엇)은 관리자가 변경을 **보는 정보용**. 발행은 기존 draft→issued 흐름 그대로.
 
 ### 4.2 재사용 (신규 코드 0)
 
@@ -136,9 +179,24 @@ CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 groundin
 - 관리자가 팀 재배정/외부 인력 여부를 판단. 조용히 넘어가지 않게 하는 것이 핵심.
 - 드문 진짜 INFEASIBLE만 max-flow 원인 진단(Infeasibility Resolver)으로 설명.
 
-### 6.2 draft 저장 위치 (구현 전 확인 필요 — Phase B)
+### 6.2 draft 저장 — 기존 메커니즘으로 해결 (Phase B 완료, 신규 테이블 0)
 
-미리보기를 위해 원본을 덮지 않고 재생성 결과를 어디 담을지. Schedule 버전/스냅샷 메커니즘 유무 확인. 없으면 in-memory diff → 승인 시 write.
+조사 결과 미리보기·승인에 필요한 구조가 **이미 전부 있다**:
+
+- **`schedules`** (`db/models.py:376-394`): `version`(BIGINT) + `status`(`'draft'`|`'issued'`) + `dropped`(bool). 같은 (group, year, month)에 여러 버전 공존 가능.
+- **`ScheduleEntry`**는 `schedule_id`로 키됨 → **새 schedule_id = 완전히 독립된 셀 집합**. 원본 덮어쓰기 불필요.
+- **생성 파이프라인이 이미 새 draft를 만든다**: `Schedule(..., version=latest_version+1, status='draft')` (`roster_create_service.py:5961-5970`). 즉 정상 생성도 원본을 안 덮고 새 draft를 쌓는 구조.
+- **조회 우선순위**: `status='issued' > 최신 version(draft)` (`roster_create_service.py:1664-1703`).
+- **발행**: `IssuedRoster`(office,group,version 복합PK, is_active) + `IssuedRosterSnapshot`(roster_json 등 전체 스냅샷) (`db/models.py:639-688`).
+
+**전략 (신규 저장소 없음)**:
+1. 부분 재생성 결과를 **기존 생성과 동일하게 새 draft Schedule**로 저장 (freeze+anchor만 다름). 원본 issued 무손상.
+2. **diff** = 원본 issued의 `schedule_entries` vs draft의 `schedule_entries` (둘 다 schedule_id·nurse_id·work_date 키).
+3. **승인** = draft→issued 승격(기존 발행 흐름 + IssuedRoster/snapshot). **거부** = draft `dropped=True`.
+
+**preview 계약 선례**: `ward_redistribute_service.preview_ward_redistribution`(`:323`)이 이미 "read-only 변경셋 반환, DB 무변경" 패턴 + 프리셉티↔프리셉터 짝 처리(`_detect_ward_pairs`)를 갖고 있다. diff/preview API 형태는 이를 따른다.
+
+**권장**: 생성이 비동기(SQS)라 워커가 draft를 영속화하는 흐름이 자연스러움 → *persist-as-draft* 방식. **별도 승인/발행 게이트는 만들지 않는다** — 재생성은 "추가 생성"과 동일하게 새 draft를 쌓고, 관리자는 기존 draft 조회/발행 UI로 확인·발행한다. diff는 정보 표시용이지 게이트가 아니다. (거부는 기존 `dropped=True` 재사용.)
 
 ### 6.3 퇴사자가 프리셉터인 경우 — period 테이블로 재지정
 
@@ -185,7 +243,7 @@ CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 groundin
 ## 8. 구현 순서
 
 - **A. 설계 문서화** (본 문서) — 완료
-- **B. draft/버전 메커니즘 조사** → 저장 전략 확정 (리스크 6.2)
+- **B. draft/버전 메커니즘 조사** → 저장 전략 확정 (§6.2) — 완료(기존 draft/version/issued 재사용, 신규 테이블 0)
 - **C. 앵커 목적항 PoC** — fallback objective에 변경 페널티 term 실제 삽입, 소규모 재현
 - **D. 오케스트레이션 서비스 + diff 산출**
 - **E. `resolve-resignation` 스킬**
@@ -195,4 +253,4 @@ CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 groundin
 
 - 커버리지 vs 변경최소화: 완전 서열 유지 vs 가중합 노브 (§3 튜닝 노브)
 - cutoff 경계 semantics: cutoff = 퇴사일 (퇴사일 포함하여 그날부터 변경, 전날까지 동결) — 구현 시 최종 확정
-- draft 저장 전략 (Phase B 결과에 의존)
+- ~~draft 저장 전략~~ → §6.2에서 확정 (기존 draft/version/issued 재사용)
