@@ -849,4 +849,49 @@ SKILL_TOOLS: list[dict] = [
             "required": ["nurse_ids", "year", "month"],
         },
     },
+    {
+        "name": "resolve_resignation",
+        "description": (
+            "특정 근무자가 **갑자기 퇴사**했을 때, 이미 확정·공지된 근무표를 처음부터 다시 "
+            "만들지 않고 **퇴사일(cutoff) 이전은 동결하고 이후만 최소 변경으로 재조정**하는 "
+            "부분 재생성을 준비합니다.\n\n"
+
+            "사용자가 '김민지 퇴사했는데 근무표 어떻게 해', '3월 16일부터 이영희 빠지는데 메꿔줘', "
+            "'퇴사자 자리 재조정해줘'처럼 **한 명이 특정 날짜부터 빠지는 상황**일 때 사용.\n\n"
+
+            "동작: 퇴사자 이름→id, 대상 근무표, 퇴사일을 그라운딩한 뒤 부분 재생성 액션을 준비합니다. "
+            "cutoff 이전 근무는 그대로 두고, 이후는 원티드·연속근무·나이트 한도·등급/팀을 지키면서 "
+            "남은 인원으로 빈자리를 메우되 **기존 근무 변경을 최소화**합니다. 실제 반영 전 변경 내역(diff)을 냅니다.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 퇴사가 아니라 **하루/한 자리 대타**만 필요 → recommend_candidates\n"
+            "- 퇴사와 무관하게 **전체를 새로** 생성 → generate_schedule\n"
+            "- 이미 있는 표의 **불균형 개선 제안**만 → repair_schedule\n\n"
+
+            "예시:\n"
+            "- '3월 16일부터 김민지 퇴사, 재조정' → resigned_nurse='김민지', cutoff_date='2026-03-16'\n"
+            "- '이영희 프리셉터였는데 박서준으로 넘기고 재생성' → resigned_nurse='이영희', "
+            "replacement_preceptor='박서준'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "resigned_nurse": {
+                    "type": "string",
+                    "description": "퇴사자 이름(병동 내 grounding으로 nurse_id 해석).",
+                },
+                "cutoff_date": {
+                    "type": "string",
+                    "description": "퇴사일자. 이 날부터 변경, 전날까지 동결. ISO 권장(예: '2026-03-16').",
+                },
+                "year": {"type": "integer", "description": "대상 연도"},
+                "month": {"type": "integer", "description": "대상 월(1~12)"},
+                "replacement_preceptor": {
+                    "type": "string",
+                    "description": "(선택) 퇴사자가 프리셉터였을 때 남은 기간을 넘겨받을 새 프리셉터 이름.",
+                },
+            },
+            "required": ["resigned_nurse", "cutoff_date"],
+        },
+    },
 ]

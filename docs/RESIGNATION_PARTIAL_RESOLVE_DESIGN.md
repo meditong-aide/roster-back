@@ -253,7 +253,11 @@ CLAUDE.md agentic 원칙 준수 — self-describing description, 내부 groundin
   - resignation_date = **cutoff-1**(inclusive last-active 규약), 프리셉터 `nurse_preceptee_period` 이관/해제, 동결 prefix는 원본 entries로 **verbatim 복원**(변형·수동편집 보존).
   - diff: `cells_changed`(퇴사자 vacated 제외) / `nurses_touched` / `kind` 분류 / **커버리지 미달 warnings**(§6.1 가시화, draft 그리드 직접 스캔).
   - 검증: `tests/test_resignation_orchestration.py`(매핑·복원·diff) + `tests/test_resignation_coverage_warnings.py`. 회귀: 솔버 13개 통과.
-- **E. `resolve-resignation` 스킬** — 미착수(엔드포인트는 있음. agentic 스킬 래핑 잔여).
+- **E. `resolve-resignation` 스킬** — 완료(grounding 계층).
+  - `agents_v2/skills/resolve_resignation.py` + registry 등록 + `descriptions.py` SKILL_TOOLS 설명.
+  - 내부 grounding: 퇴사자/대체프리셉터 이름→id(`search_nurses_by_name`), 근무표 해석(`resolve_target_schedule`), 퇴사일 파싱(ISO/한국어).
+  - `generate-schedule`과 동일하게 실행은 상위 레이어에 위임: `_partial_resolve_required` + `_partial_resolve_params` 반환. **잔여**: 상위(chat 실행 레이어)가 이 플래그를 받아 `partial_resolve_on_resignation`(current_user 권한)로 dispatch하는 배선 — `_sqs_dispatch_required` 소비부와 동일하게 agent v2 백로그.
+  - 검증: `tests/test_resolve_resignation_skill.py` 5 passed(등록·grounding·날짜파싱·에러·dispatch).
 - **F. 회귀 검증** — 파라미터→조건 적용→결과 품질 3단계, 통계 보존 확인(실 병동 e2e 잔여).
 
 ## 9. 변경 인원 표시 (Diff Response) 설계
