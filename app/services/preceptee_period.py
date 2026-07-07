@@ -39,8 +39,25 @@ def _overlap_filter(q, day_lo: date, day_hi_excl: date):
     )
 
 
+def _cancelled_source_assignment_ids(db, rows) -> set:
+    """period rows 중 source_assignment_id 가 **cancelled 프리셉티 assignment** 를 가리키는
+    것들의 assignment id 집합. → 취소된 관계는 솔버·화면에 주입하지 않는다(assignment 상태가 진실).
+    valid_to close 여부와 무관하게 배제하므로 write-through 지연/누락에도 견고하다."""
+    sids = {r.source_assignment_id for r in rows if r.source_assignment_id is not None}
+    if not sids:
+        return set()
+    from db.models import NurseAssignment
+    return {row[0] for row in db.query(NurseAssignment.id).filter(
+        NurseAssignment.id.in_(list(sids)),
+        NurseAssignment.status == "cancelled",
+    ).all()}
+
+
 def resolve_preceptor_asof(db, nurse_ids, as_of: date) -> dict[str, str | None]:
-    """프리셉티 nurse_id → 그 시점 preceptor_id (관계 없으면 None)."""
+    """프리셉티 nurse_id → 그 시점 preceptor_id (관계 없으면 None).
+
+    cancelled 프리셉티 assignment 로 취소된 관계는 제외한다(솔버·화면 공통 게이트).
+    """
     ids = [str(n) for n in (nurse_ids or [])]
     out: dict[str, str | None] = {nid: None for nid in ids}
     if not ids:
@@ -51,13 +68,19 @@ def resolve_preceptor_asof(db, nurse_ids, as_of: date) -> dict[str, str | None]:
         or_(NursePrecepteePeriod.valid_to.is_(None),
             NursePrecepteePeriod.valid_to > as_of),
     ).all()
+    _cancelled = _cancelled_source_assignment_ids(db, rows)
     for r in rows:
+        if r.source_assignment_id in _cancelled:
+            continue
         out[str(r.nurse_id)] = str(r.preceptor_id)
     return out
 
 
 def resolve_preceptees_asof(db, preceptor_ids, as_of: date) -> dict[str, list[str]]:
-    """프리셉터 nurse_id → 그 시점 프리셉티 nurse_id 리스트."""
+    """프리셉터 nurse_id → 그 시점 프리셉티 nurse_id 리스트.
+
+    cancelled 프리셉티 assignment 로 취소된 관계는 제외(resolve_preceptor_asof 미러).
+    """
     ids = [str(p) for p in (preceptor_ids or [])]
     if not ids:
         return {}
@@ -67,8 +90,11 @@ def resolve_preceptees_asof(db, preceptor_ids, as_of: date) -> dict[str, list[st
         or_(NursePrecepteePeriod.valid_to.is_(None),
             NursePrecepteePeriod.valid_to > as_of),
     ).all()
+    _cancelled = _cancelled_source_assignment_ids(db, rows)
     out: dict[str, list[str]] = defaultdict(list)
     for r in rows:
+        if r.source_assignment_id in _cancelled:
+            continue
         out[str(r.preceptor_id)].append(str(r.nurse_id))
     return dict(out)
 
@@ -78,6 +104,9 @@ def resolve_preceptee_days_for_month(db, nurse_ids, year: int, month: int) -> di
 
     엔진 config map(`preceptee_period_by_nurse_id`) 빌드용. 겹치지 않으면 키 자체가 없다
     (= 그 달 프리셉티 아님 = 독립 배정). days 는 그 달 내 0-based day index.
+
+    cancelled 프리셉티 assignment 로 취소된 관계는 제외한다 — 취소된 관계는 솔버에 주입하지
+    않는다(assignment 상태가 진실, valid_to close 여부 무관).
     """
     ids = [str(n) for n in (nurse_ids or [])]
     if not ids:
@@ -90,8 +119,12 @@ def resolve_preceptee_days_for_month(db, nurse_ids, year: int, month: int) -> di
         db.query(NursePrecepteePeriod).filter(NursePrecepteePeriod.nurse_id.in_(ids)),
         ms, me + timedelta(days=1),
     ).order_by(NursePrecepteePeriod.valid_from.asc()).all()
+    _cancelled = _cancelled_source_assignment_ids(db, rows)
     out: dict[str, dict] = {}
     for r in rows:
+        # 취소된 관계(source assignment=cancelled) 제외 — 솔버에 주입 안 함.
+        if r.source_assignment_id in _cancelled:
+            continue
         s = max(r.valid_from, ms)
         # valid_to 배타 → 마지막 포함일 = valid_to - 1day. 무기한이면 월말까지.
         e = me if r.valid_to is None else min(r.valid_to - timedelta(days=1), me)

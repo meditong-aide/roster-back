@@ -4880,6 +4880,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     from services.preceptee_period import resolve_preceptee_days_for_month as _resolve_pte_days
     from db.models import NursePrecepteePeriod as _NPP
     _pte_nids = [str(n.nurse_id) for n in nurses_for_engine]
+    # cancelled 프리셉티 assignment 로 취소된 관계는 리졸버가 자체 제외(솔버 미주입).
     _preceptee_period = _resolve_pte_days(db, _pte_nids, req.year, req.month)
     # 권위 판정: 이 그룹 간호사에 period row 가 하나라도 있으면(=백필됨) period 가 진실.
     # → 빈 맵이어도 '권위 모드'로 보내 종료자(캐시 잔존)를 확실히 제외. period 전무면(pre-backfill)

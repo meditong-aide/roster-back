@@ -2516,6 +2516,8 @@ def _sync_preceptee_assignment(
                     "[preceptee_sync] cancel 실패 nurse=%s id=%s: %s",
                     nurse.nurse_id, existing.id, e,
                 )
+        # 관계 종료는 assignment status=cancelled 로 충분: 리졸버(솔버·화면 공통)가
+        # source_assignment_id→cancelled 인 period 를 자체 제외한다(valid_to close 불필요).
         return
 
     if previous_preceptor_id == new_preceptor_id:
@@ -2526,16 +2528,28 @@ def _sync_preceptee_assignment(
         if existings:
             return
         try:
+            _start = date.today()
             req = _CreateReq(
                 nurse_id=nurse.nurse_id,
                 source_group_id=nurse.group_id,
                 target_group_id=None,
                 office_id=nurse.office_id,
-                start_date=date.today(),
+                start_date=_start,
                 expected_end_date=None,
                 reason="프리셉티",
             )
-            _create_assignment(req, db, current_user=current_user)
+            created = _create_assignment(req, db, current_user=current_user)
+            # write-through: nurse_preceptee_period(SSOT) 도 함께 open (모달 op=create 와 동일).
+            #   이게 없으면 assignment·캐시만 생기고 period 미생성 → 리졸버(솔버·화면=period 기준)가
+            #   새 관계를 못 본다. 캐시는 caller 가 이미 set 했으므로 nurse=None(이중 갱신 방지).
+            from services.preceptee_period import open_preceptee_period
+            open_preceptee_period(
+                db, nurse_id=nurse.nurse_id, preceptor_id=new_preceptor_id,
+                office_id=nurse.office_id, valid_from=_start, valid_to=None,
+                source_assignment_id=getattr(created, "id", None), source="assignment",
+                nurse=None,
+            )
+            db.commit()
         except HTTPException:
             raise
         except Exception as e:
