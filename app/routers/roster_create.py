@@ -3,6 +3,7 @@ import os
 import re
 import uuid
 from datetime import datetime
+from datetime import date as date_type
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +24,7 @@ from services.roster_create_service import (
     # generate_roster_service_with_fixed_cells,
     request_schedule_service,
 )
+from services.resignation_partial_resolve_service import partial_resolve_on_resignation
 from services.job_status_service import create_job_record
 from services.group_access import resolve_effective_group
 
@@ -100,6 +102,15 @@ class HoldGenerateRequest(BaseModel):
     oversupply_balance_gauge: Optional[int] = Field(default=6, ge=0, le=10)
     monthly_preference_gauge: Optional[int] = Field(default=3, ge=0, le=10)
     monthly_shift_preferences: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+class ResignationPartialResolveRequest(BaseModel):
+    """퇴사자 대응 부분 재생성 요청."""
+
+    schedule_id: str
+    resigned_nurse_id: str
+    cutoff_date: date_type
+    replacement_preceptor_id: Optional[str] = None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 dotenv.load_dotenv(BASE_DIR / ".env")
@@ -297,6 +308,29 @@ async def generate_roster_endpoint(
         print('error', e)
         payload = _fallback_unrecoverable_from_exception(f"근무표 생성 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=payload)
+
+
+@router.post("/roster_create/partial-resolve/resignation")
+async def resignation_partial_resolve_endpoint(
+    req: ResignationPartialResolveRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """퇴사자 cutoff 이후만 부분 재생성하고 새 draft와 diff를 반환한다."""
+    try:
+        return partial_resolve_on_resignation(
+            db=db,
+            current_user=current_user,
+            schedule_id=req.schedule_id,
+            resigned_nurse_id=req.resigned_nurse_id,
+            cutoff_date=req.cutoff_date,
+            replacement_preceptor_id=req.replacement_preceptor_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("resignation partial resolve error", exc)
+        raise HTTPException(status_code=500, detail=f"퇴사자 부분 재생성 실패: {exc}") from exc
 
 
 class ApplyResolutionRequest(BaseModel):

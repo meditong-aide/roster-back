@@ -1081,6 +1081,12 @@ class CPSATBasicEngine:
                     setattr(roster_system, "monthly_shift_preferences", msp)
             except Exception:
                 pass
+            try:
+                partial_anchor = config_data.get("partial_resolve_anchor")
+                if isinstance(partial_anchor, dict) and partial_anchor.get("orig"):
+                    setattr(roster_system, "partial_resolve_anchor", partial_anchor)
+            except Exception:
+                pass
             # Grade/Team/BASE 전략(모델 빌더에서 참조)
             # - 상위 서비스(roster_create_service)에서 roster_config 기반으로 결정된 값을 전달받는다.
             setattr(roster_system, "grade_strategy", str(grade_strategy or "BASE").upper())
