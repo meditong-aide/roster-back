@@ -34,6 +34,7 @@ from services.roster_service import (
     get_latest_schedule_service,
     get_issued_schedules_service,
     get_schedule_status_service,
+    build_month_meta_service,
 )
 from services.roster_system import RosterSystem
 
@@ -1186,6 +1187,40 @@ async def get_schedule_versions(
         }
         for schedule in schedules
     ]
+
+
+@router.get("/meta/{year:int}/{month:int}")
+async def get_month_meta(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """근무표 만들기 화면용 월 단위 메타 — 버전 목록 + 각 버전의 생성 설정 provenance.
+
+    versions[].config(schedules.config_id 기반)로 프론트는 최신 설정 추론 없이
+    '사용 설정'을 정확히 표시한다. 스케줄 본문은 포함하지 않는다(기존
+    /roster/schedule/{schedule_id} 와 캐시 단위 분리). 권한: HN/ADM.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+    group = db.query(Group).filter(Group.group_id == target_group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return build_month_meta_service(
+        db,
+        year=year,
+        month=month,
+        office_id=group.office_id,
+        group_id=target_group_id,
+    )
 
 
 # [Roster] - 특정 월의 근무표 조회

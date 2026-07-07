@@ -12,7 +12,7 @@ import uuid
 
 from fastapi import HTTPException
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from db.models import (
     RosterConfig as RosterConfigModel,
@@ -27,6 +27,7 @@ from db.models import (
     Wanted,
     IssuedRoster,
     ShiftManage,
+    DailyShift,
     IssuedRosterSnapshot,
     WeeklyOffSetting,
     RosterGradeConfig,
@@ -414,6 +415,127 @@ def unsave_roster_config_service(
     cfg.version = None
     db.commit()
     return {"message": "저장 설정 해제 — 일반 설정으로 변경", "config_id": config_id}
+
+
+def _config_meta_brief(cfg) -> dict | None:
+    """RosterConfig → 요약 메타(provenance 표시용). cfg 가 None 이면 None."""
+    if cfg is None:
+        return None
+    return {
+        "config_id": cfg.config_id,
+        "version": cfg.version,
+        "config_name": cfg.config_name,
+        "config_memo": cfg.config_memo,
+    }
+
+
+def _month_manpower_summary(db, office_id, group_id, year, month) -> dict:
+    """월 인력 요약: 최소기준(D/E/N) + max 사용 여부.
+
+    월 day=0 bulk row(daily_shift)를 우선 사용하고, 없으면 ShiftManage RN 템플릿을
+    읽는다. 둘 다 읽기전용 — 이 경로는 seeding/쓰기를 하지 않는다.
+    """
+    bulk = (
+        db.query(DailyShift)
+        .filter(
+            DailyShift.office_id == office_id,
+            DailyShift.group_id == group_id,
+            DailyShift.year == year,
+            DailyShift.month == month,
+            DailyShift.day == 0,
+        )
+        .first()
+    )
+    if bulk is not None:
+        return {
+            "min": {
+                "D": int(bulk.d_count or 0),
+                "E": int(bulk.e_count or 0),
+                "N": int(bulk.n_count or 0),
+            },
+            "use_max": bool(bulk.max_enabled),
+        }
+    slots = (
+        db.query(ShiftManage)
+        .filter(
+            ShiftManage.office_id == office_id,
+            ShiftManage.group_id == group_id,
+            ShiftManage.nurse_class == 'RN',
+            ShiftManage.shift_slot.in_([1, 2, 3]),
+        )
+        .all()
+    )
+    by_slot = {int(s.shift_slot): int(s.manpower or 0) for s in slots}
+    return {
+        "min": {"D": by_slot.get(1, 0), "E": by_slot.get(2, 0), "N": by_slot.get(3, 0)},
+        "use_max": False,
+    }
+
+
+def build_month_meta_service(db, *, year, month, office_id, group_id) -> dict:
+    """근무표 만들기 화면용 월 단위 메타(단일 계약).
+
+    - versions[]: 해당 월 스케줄 버전 + 각 버전이 생성 시 사용한 config provenance
+      (schedules.config_id → roster_config). 설정 없이 생성된 스케줄은 config=None.
+    - current_config: 그룹 최신 설정(신규 생성 baseline, created_at.desc = serverConfig 기준).
+    - wanted_status: 해당 월 원티드 상태.
+    - manpower_summary: 인력 최소기준(D/E/N) + max 사용 여부.
+    스케줄 본문(entries)은 포함하지 않는다 — 표 데이터는 기존 /roster/schedule/{id} 로 분리.
+    """
+    schedules = (
+        db.query(Schedule)
+        .options(joinedload(Schedule.roster_config))
+        .filter(
+            Schedule.group_id == group_id,
+            Schedule.year == year,
+            Schedule.month == month,
+            Schedule.dropped == False,
+        )
+        .order_by(Schedule.version.desc())
+        .all()
+    )
+    versions = [
+        {
+            "schedule_id": s.schedule_id,
+            "version": s.version,
+            "name": s.name,
+            "status": s.status,
+            "config": _config_meta_brief(s.roster_config),
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        }
+        for s in schedules
+    ]
+
+    current = (
+        db.query(RosterConfigModel)
+        .filter(
+            RosterConfigModel.office_id == office_id,
+            RosterConfigModel.group_id == group_id,
+        )
+        .order_by(RosterConfigModel.created_at.desc())
+        .first()
+    )
+
+    wanted = (
+        db.query(Wanted)
+        .filter(
+            Wanted.group_id == group_id,
+            Wanted.year == year,
+            Wanted.month == month,
+        )
+        .first()
+    )
+
+    return {
+        "year": year,
+        "month": month,
+        "group_id": group_id,
+        "versions": versions,
+        "current_config": _config_meta_brief(current),
+        "wanted_status": {"status": wanted.status if wanted else None},
+        "manpower_summary": _month_manpower_summary(db, office_id, group_id, year, month),
+    }
 
 
 def get_latest_schedule_service(current_user, db: Session, override_group_id: str | None = None):
