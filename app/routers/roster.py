@@ -197,7 +197,8 @@ async def save_roster_config(
 
     try:
         return save_roster_config_service(
-            config_data, user, db, override_group_id=override_gid
+            config_data, user, db, override_group_id=override_gid,
+            sync_use_mid_live=True,
         )
     except Exception as e:
         raise HTTPException(

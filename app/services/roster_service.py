@@ -71,7 +71,23 @@ def apply_config_side_effects(db, *, office_id, group_id, weekly_off_group, use_
             synchronize_session=False,
         )
 
-    # use_mid (M근무) 동기화
+    # use_mid (M근무) 동기화 — 생성/저장 공용 헬퍼로 위임
+    _apply_use_mid_live(db, office_id=office_id, group_id=group_id, use_mid=use_mid)
+
+
+def _apply_use_mid_live(db, *, office_id, group_id, use_mid):
+    """use_mid(M근무) 값을 라이브 테이블(RosterGradeConfig/ShiftManage/Nurse)에 반영.
+
+    솔버·daily-shift 가 라이브 테이블에서 M 근무를 읽으므로, use_mid 가 바뀌면
+    이 값을 즉시 라이브에 동기화한다. 생성 시점(apply_config_side_effects)과
+    저장 시점(save_roster_config_service) 양쪽에서 재사용한다.
+
+    - True: grade constraints_json/default_shifts_json 에 'M' 을 추가(없으면).
+    - False: ShiftManage M 슬롯(5) manpower=0, Nurse.allowed_shifts 에서 M 제거,
+      grade constraints_json/default_shifts_json 에서 M 제거.
+    NOTE: True 로 전환해도 ShiftManage M 슬롯 manpower 는 복원하지 않는다
+      (인력값은 근무설정(daily-shift) 인력 편집기가 관리 — 기존 생성 동작과 동일).
+    """
     if use_mid:
         grade_cfg = db.query(RosterGradeConfig).filter(
             RosterGradeConfig.office_id == office_id,
@@ -126,10 +142,39 @@ def apply_config_side_effects(db, *, office_id, group_id, weekly_off_group, use_
                 grade_cfg.default_shifts_json = filtered
 
 
-# materialize 비교에서 제외: 메타 + ShiftManage 파생(day/eve/nig)
+def _group_canonical_use_mid(db, office_id, group_id) -> bool:
+    """그룹의 정본 use_mid — 최신 config 기준(저장이 전체 전파하므로 모든 config 동일).
+
+    생성 포크는 이 값을 준수하고 payload 의 use_mid 는 무시한다(그룹 단일 진실).
+    """
+    row = (
+        db.query(RosterConfigModel.use_mid)
+        .filter(
+            RosterConfigModel.office_id == office_id,
+            RosterConfigModel.group_id == group_id,
+        )
+        .order_by(RosterConfigModel.config_id.desc())
+        .first()
+    )
+    return bool(row[0]) if row and row[0] is not None else False
+
+
+def _propagate_use_mid_all_configs(db, office_id, group_id, use_mid) -> None:
+    """그룹의 모든 config use_mid 를 정본값으로 통일(전파). 저장/생성 공용.
+
+    use_mid 는 병동 단위 설정이므로 per-config 로 갈리면 안 된다. 어떤 config 를
+    조회·포크·생성하더라도 동일 값이 되도록 그룹 전체를 한 번에 맞춘다.
+    """
+    db.query(RosterConfigModel).filter(
+        RosterConfigModel.office_id == office_id,
+        RosterConfigModel.group_id == group_id,
+    ).update({RosterConfigModel.use_mid: bool(use_mid)}, synchronize_session=False)
+
+
+# materialize 비교에서 제외: 메타 + ShiftManage 파생(day/eve/nig) + use_mid(그룹 정본)
 _COMPARE_EXCLUDE = {
     'config_id', 'config_name', 'config_memo', 'config_version',
-    'day_req', 'eve_req', 'nig_req',
+    'day_req', 'eve_req', 'nig_req', 'use_mid',
 }
 
 
@@ -171,6 +216,9 @@ def materialize_generation_config(
         nurse = db.query(Nurse).filter(Nurse.nurse_id == user.nurse_id).first()
         office_id, group_id = nurse.office_id, user.group_id
 
+    # use_mid 정본을 포크 생성 전에 읽어둔다(그룹 최신 config 기준). 생성은 이 값을 준수.
+    canonical_use_mid = _group_canonical_use_mid(db, office_id, group_id)
+
     baseline = None
     if payload.config_id is not None:
         baseline = db.query(RosterConfigModel).filter(
@@ -200,11 +248,15 @@ def materialize_generation_config(
             RosterConfigModel.config_id == res['config_id']
         ).first()
 
-    # 항상 라이브 동기화(적용)
+    # use_mid 는 그룹 정본을 준수 — payload/포크의 값 무시, 전체 config 로 전파.
+    resolved.use_mid = bool(canonical_use_mid)
+    _propagate_use_mid_all_configs(db, office_id, group_id, canonical_use_mid)
+
+    # 항상 라이브 동기화(적용) — use_mid 는 정본값으로
     apply_config_side_effects(
         db, office_id=office_id, group_id=group_id,
         weekly_off_group=resolved.weekly_off_group,
-        use_mid=bool(getattr(resolved, 'use_mid', False)),
+        use_mid=canonical_use_mid,
     )
     db.commit()
     db.refresh(resolved)
@@ -216,11 +268,14 @@ def save_roster_config_service(
     user,
     db: Session,
     override_group_id: str | None = None,
+    sync_use_mid_live: bool = False,
 ):
     """근무표 설정 저장 (프리셋 upsert).
 
     - config_id 있으면 해당 프리셋 in-place 수정(version 유지), 없으면 신규 INSERT(version=MAX+1).
     - 관리자(ADM)는 `override_group_id`로 저장 대상 그룹을 지정.
+    - sync_use_mid_live=True: 저장 즉시 use_mid 를 라이브 테이블에 동기화(사용자 대면 저장 경로).
+      생성 시점(materialize)의 apply_config_side_effects 는 자체 동기화하므로 기본 False.
     NOTE: version 유일성 인덱스는 개발 마무리 후 추가 예정 — 추가 시 IntegrityError 재시도 가드 복원.
     """
     try:
@@ -300,8 +355,20 @@ def save_roster_config_service(
                 config_memo=config_memo,
             )
             db.add(db_config)
-        # NOTE: 저장(프리셋 북마크)은 순수 — 라이브 테이블(WeeklyOffSetting/ShiftManage/
-        # Nurse/grade) 동기화는 생성 시점의 apply_config_side_effects 로 이전됨.
+        # NOTE: weekly_off 등 나머지 라이브 동기화는 생성 시점(apply_config_side_effects)에
+        #   수행. 단, use_mid 는 daily-shift/솔버가 라이브에서 읽어 저장-생성 사이 stale 이
+        #   되므로, 사용자 대면 저장(sync_use_mid_live=True)에서는 즉시 동기화한다.
+        if sync_use_mid_live:
+            # 저장 = use_mid 의 유일한 변경 지점. 저장값을 그룹 정본으로 삼아
+            #   전체 config 전파 + 라이브 동기화 → 이후 조회·생성이 모두 이 값을 따른다.
+            _um = bool(getattr(db_config, 'use_mid', False))
+            _propagate_use_mid_all_configs(db, target_office_id, target_group_id, _um)
+            _apply_use_mid_live(
+                db,
+                office_id=target_office_id,
+                group_id=target_group_id,
+                use_mid=_um,
+            )
         db.commit()
         db.refresh(db_config)
         return {
