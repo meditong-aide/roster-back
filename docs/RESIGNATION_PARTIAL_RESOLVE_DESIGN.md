@@ -260,6 +260,29 @@ subject to  S1 잠금(커버리지=최적, 등식) · S2 잠금(ND/NE·연속·�
 
 ## 9. 변경 인원 표시 (Diff Response) 설계
 
+### 9.0 API 계약 (프론트 연동)
+
+**엔드포인트**: `POST /roster_create/partial-resolve/resignation` (`roster_create.py:314`)
+**인증**: 로그인 쿠키 + 수간호사 권한(`caller_is_head_nurse`) + 대상 그룹 접근(`assert_caller_can_access_group`).
+
+**요청 body** (`ResignationPartialResolveRequest`):
+```jsonc
+{
+  "schedule_id": "abc123def456",   // 현재 보고 있는 근무표 (issued 권장)
+  "resigned_nurse_id": "n_0007",   // 퇴사자 nurse_id
+  "cutoff_date": "2026-03-21",     // 이 날부터 변경, 전날까지 동결 (ISO date)
+  "replacement_preceptor_id": null // (선택) 퇴사자가 프리셉터였을 때 인계할 새 프리셉터 id
+}
+```
+> UI가 이미 `schedule_id`(현재 화면)와 `resigned_nurse_id`(선택한 간호사)를 쥐고 있으므로 **ID를 직접 전달**한다(이름→id 그라운딩 불필요 → 에이전트 스킬도 불필요). `cutoff_date`는 "21일 퇴사" 클릭 시 해당 월의 21일을 ISO로.
+
+**응답 200**: §9.1의 diff 스키마(`schedule_id`(새 draft)·`changed_nurses`·`summary`·`resigned_nurse`).
+**에러**: `403` 권한, `404` schedule/퇴사자 없음, `400` cutoff 월 범위 밖·replacement 무효, `500` 재생성 실패.
+
+**프론트 흐름**: 퇴사 액션 → 이 API 호출 → 반환된 `schedule_id`(새 draft) 그리드 렌더 + `changed_nurses` 하이라이트 + `summary.warnings` 배너 → 관리자가 기존 draft 발행 UI로 확정.
+
+### 9.1 Diff 계산·표시
+
 프론트가 "누가 무엇에서 무엇으로 바뀌었나"를 그리드에 표시하기 위한 응답. 기존 컨벤션 재사용:
 - 그리드: nurse 리스트 × `schedule[day]` 배열 (`roster.py:1710`, `{nurse_id, schedule:[shift/day], schedule_ids:[int/day]}`)
 - 변경셋 선례: `moves:[{nurse_id, name, from, from_name, to, to_name}]` + `warnings` (`ward_redistribute_service.py:474`)
