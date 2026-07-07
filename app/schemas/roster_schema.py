@@ -479,6 +479,10 @@ class NurseProfile(BaseModel):
     allowed_shifts: List[str] = Field(default_factory=list)
     personal_off_adjustment: int = Field(default=0)
     preceptor_id: Optional[str] = None
+    exclusion_partner_id: Optional[str] = Field(
+        default=None,
+        description="상호 근무 배제 파트너 nurse_id(같은날 같은근무조 회피·소프트). None=해제. 미전달 시 무변경",
+    )
     joining_date: Optional[datetime] = None
     resignation_date: Optional[datetime] = None
     resignation_reason: Optional[str] = None
@@ -667,6 +671,10 @@ class NurseProfileUpdate(BaseModel):
     nurse_memo: Optional[str] = None
     is_head_nurse: Optional[bool] = None
     preceptor_id: Optional[str] = None
+    exclusion_partner_id: Optional[str] = Field(
+        default=None,
+        description="상호 근무 배제 파트너 nurse_id(같은날 같은근무조 회피·소프트). None=해제. 미전달 시 무변경",
+    )
     fixed_shift: Optional[str] = None
     weekly_off_enabled: Optional[int] = None
     weekly_off_weekday: Optional[int] = None

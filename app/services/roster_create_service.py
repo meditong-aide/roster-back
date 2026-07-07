@@ -4894,6 +4894,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         print(f"[Assignment][Preceptee] nurse_id={_nid}, preceptor={_info['preceptor_id']}, "
               f"follow_days={sorted(_info['days'])}")
     print(f"[Assignment][Preceptee] authoritative={_pte_authoritative}, active={len(_preceptee_period)}")
+    # ── 상호 근무 배제: nurse_mutual_exclusion_period(SSOT) as-of 대상월 ──
+    # 형태: {nurse_id: {"partner_id": pid, "days": set(0-based)}}. 프리셉티 follow 의 배반(같은날 같은근무조 회피·소프트).
+    try:
+        from services.mutual_exclusion_period import (
+            resolve_mutual_exclusion_days_for_month as _resolve_mutex_days,
+        )
+        _mutex_period = _resolve_mutex_days(db, _pte_nids, req.year, req.month)
+        if _mutex_period:
+            config_dict["mutual_exclusion_by_nurse_id"] = _mutex_period
+            for _nid, _info in _mutex_period.items():
+                print(f"[Assignment][MutualExcl] nurse_id={_nid}, partner={_info['partner_id']}, "
+                      f"days={sorted(_info['days'])}")
+        print(f"[Assignment][MutualExcl] active={len(_mutex_period)}")
+    except Exception as _e_mx:
+        print(f"[Assignment][MutualExcl] 로딩 실패(무시): {_e_mx}")
     print("cp_sat_basic 엔진으로 근무표 생성 시작")
     # _debug_log(
     #     "config_ready",
