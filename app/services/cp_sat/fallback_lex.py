@@ -3302,6 +3302,57 @@ def optimize_fallback_lex_hard_first(
         # lex 가 실제로 잘 듣고 빠른 소인원 병동(기본 N<=15)에서만 자동 실행.
         # AIDE_D5_LEX_MAXN 으로 임계 조절, AIDE_D5_LEX=0 으로 완전 비활성.
         _lex_maxn = int(_os_tl3.environ.get("AIDE_D5_LEX_MAXN", 15) or 15)
+        # ── mutex lex 패스(D5-lex 앞=상위 우선): "grade/team 바로 밑" ──
+        # grade/team 소프트 품질을 동결(무회귀)한 뒤 상호배제 위반합만 최소화 →
+        # mutex 가 선호/야간분포보다 위, grade/team·하드보다 아래. 동결 부등식이라 infeasible 불가(soft).
+        # 자기게이트(mutex=0 skip)·인원게이트(N<=_lex_maxn)는 D5-lex 와 동일.
+        # mutex-lex 는 grade/team 만 동결(총품질 아님)해 D5 보다 가벼움 + 자기게이트(위반 0 skip)
+        # + 타임리밋(초과 시 원해 유지)이라, D5(15)보다 높은 40 을 기본으로 실병동(19·35명 등) 커버.
+        _mx_lex_maxn = int(_os_tl3.environ.get("AIDE_MUTEX_LEX_MAXN", 40) or 40)
+        _mx_lex_on = (_os_tl3.environ.get("AIDE_MUTEX_LEX", "1") != "0") and (N <= _mx_lex_maxn)
+        if _mx_lex_on:
+            _mx_vars = getattr(m3, "_mutex_lex_vars", None) or []
+            _gt_terms = getattr(m3, "_grade_team_lex_terms", None)
+            if _mx_vars and _gt_terms:
+                class _MxSkipLex(Exception):
+                    pass
+                try:
+                    _mx_before = sum(int(s3.Value(v)) for v in _mx_vars)
+                    print(f"{logger_prefix} 폴백3 mutex-lex 진입: stage3 위반 {_mx_before}건 "
+                          f"(페어변수 {len(_mx_vars)}개)")
+                    if _mx_before == 0:
+                        raise _MxSkipLex  # 위반 0 → 재-solve 불필요(무비용)
+                    _gt_val = int(round(s3.Value(sum(_gt_terms))))
+                    m3.Add(sum(_gt_terms) >= _gt_val)   # grade/team 무회귀(penalty=음수 → >= 로 최소보장)
+                    m3.Minimize(sum(_mx_vars))
+                    m3.ClearHints()
+                    for _hn in range(N):
+                        for _hd in iter_nurse_days(_hn, join, leave, blocked_by_nurse):
+                            for _hs in range(S):
+                                try:
+                                    m3.AddHint(X3(_hn, _hd, _hs), int(s3.Value(X3(_hn, _hd, _hs))))
+                                except Exception:
+                                    pass
+                    _s3m = cp_model.CpSolver()
+                    _s3m.parameters.max_time_in_seconds = max(8, int(tl3))
+                    _s3m.parameters.num_search_workers = 8
+                    _st3m = _s3m.Solve(m3)
+                    if _st3m in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                        _mx_after = sum(int(_s3m.Value(v)) for v in _mx_vars)
+                        if _mx_after <= _mx_before:
+                            m3.Add(sum(_mx_vars) <= _mx_after)  # 이후 D5 패스가 mutex 되돌리지 못하게 락
+                            s3 = _s3m
+                            print(f"{logger_prefix} 폴백3 mutex-lex 패스: "
+                                  f"status={_cp_sat_status_to_text(_st3m)} mutex {_mx_before}→{_mx_after}")
+                        else:
+                            print(f"{logger_prefix} 폴백3 mutex-lex 패스 미개선 → 원 해 유지")
+                    else:
+                        print(f"{logger_prefix} 폴백3 mutex-lex 패스 실패("
+                              f"{_cp_sat_status_to_text(_st3m)}) → 원 해 유지")
+                except _MxSkipLex:
+                    pass  # 위반 0 → 스킵
+                except Exception as _mx_lex_e:
+                    print(f"{logger_prefix} 폴백3 mutex-lex 패스 예외: {_mx_lex_e}")
         _lex_on = (_os_tl3.environ.get("AIDE_D5_LEX", "1") != "0") and (N <= _lex_maxn)
         if _lex_on:
             _d5_vars = getattr(m3, "_ms_d5_lex_vars", None) or []
@@ -3310,7 +3361,8 @@ def optimize_fallback_lex_hard_first(
                 class _SkipLex(Exception):
                     pass
                 try:
-                    _obj_val = int(round(s3.ObjectiveValue()))
+                    # mutex-lex 패스가 앞서 m3 목적을 바꿨을 수 있으므로 ObjectiveValue 대신 항 합으로 총품질 계산
+                    _obj_val = int(round(s3.Value(sum(_obj_terms))))
                     _d5_before = sum(int(s3.Value(v)) for v in _d5_vars)
                     if _d5_before == 0:
                         raise _SkipLex  # 잔여 DDDDD 없음 → 재-solve 불필요(대형병동 비용 0)
