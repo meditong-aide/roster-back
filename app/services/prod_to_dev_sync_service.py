@@ -25,6 +25,11 @@ EXPLICIT_PKS = {
     "nurse_pair_requests": ["nurse_id", "request_id", "month"],
     "issued_roster": ["office_id", "group_id", "version"],
     "wanted": ["group_id", "year", "month"],
+    # attribute period SSOT (id identity PK — _wipe_by_parent_fk 의 pk 가드 통과용)
+    "nurse_preceptee_period": ["id"],
+    "nurse_allowed_shift_period": ["id"],
+    "nurse_weekendoff_period": ["id"],
+    "nurse_grade_period": ["id"],
 }
 
 # group_id 컬럼이 없는 자식 테이블의 부모 매핑.
@@ -32,6 +37,10 @@ EXPLICIT_PKS = {
 # 형식: { 자식테이블: (부모테이블, FK 컬럼) }
 PARENT_FK_MAP = {
     "schedule_entries": ("schedules", "schedule_id"),
+    # nurse 귀속 attribute period (group_id 없음) → nurse_id 로 nurses.group_id 간접 스코프
+    "nurse_preceptee_period": ("nurses", "nurse_id"),
+    "nurse_allowed_shift_period": ("nurses", "nurse_id"),
+    "nurse_weekendoff_period": ("nurses", "nurse_id"),
 }
 
 # group_id 컬럼이 없지만 다른 컬럼(들)으로 group 스코프가 가능한 테이블.
@@ -60,6 +69,7 @@ SYNC_TABLES: List[tuple] = [
     ("teams", "wipe"),
     ("nurses", "wipe"),
     ("nurse_team_period", "wipe"),  # 팀 시점 타임라인(근무자 내역) — group_id 스코프
+    ("nurse_grade_period", "wipe"),  # grade 시점 SSOT — group_id 스코프
     ("roster_config", "wipe"),
     ("roster_grade_config", "wipe"),
     ("wanted_config", "wipe"),
@@ -81,6 +91,11 @@ SYNC_TABLES: List[tuple] = [
     ("schedule_entries", "upsert"),
     ("daily_shift", "upsert"),
     ("nurse_assignment", "upsert"),
+    # nurse 귀속 attribute period SSOT (group_id 없음) — group 모드는 PARENT_FK_MAP
+    # (nurse_id→nurses.group_id) 로 wipe-by-parent, office 모드는 _office_where nurse 서브쿼리.
+    ("nurse_allowed_shift_period", "upsert"),
+    ("nurse_weekendoff_period", "upsert"),
+    ("nurse_preceptee_period", "upsert"),
     ("nurse_monthly_limits", "upsert"),
     ("messages", "upsert"),
     ("deleted_nurse_history", "upsert"),
