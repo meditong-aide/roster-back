@@ -1126,7 +1126,8 @@ def group_members_in_month(
         return v if v is not None else (1 if getattr(n_obj, "is_weekend_off", False) else 0)
 
     def _row(n, status, marker, badge, team, grade, night_profile=...,
-             weekend_off=..., fixed_shift=...):
+             weekend_off=..., fixed_shift=...,
+             status_start=None, status_end=None, status_reason=None):
         # N전담(허용 shift=N뿐) 판정 → 'N전담' 배지 + is_night_dedicated.
         # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.allowed_shifts 가
         #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
@@ -1150,7 +1151,18 @@ def group_members_in_month(
             "as_of_weekend_off": _wo,
             "as_of_fixed_shift": _fx,
             "as_of_preceptor": _preceptor_asof.get(str(n.nurse_id)),  # 월 as-of 프리셉터(종료월엔 None)
+            "status_start_date": status_start,  # 상태(퇴사/휴직/파견/병동이동) 적용 시작일 YYYY-MM-DD(UI 표시 기준). active=None
+            "status_end_date": status_end,      # 종료일(없으면 None=지속)
+            "status_reason": status_reason,     # '퇴사'|'휴직'|'파견'|'병동이동'|None
         }
+
+    def _status_dates(a):
+        """assignment → (start_iso, end_iso). 종료일 = end_date or expected_end_date(없으면 None=지속)."""
+        if a is None:
+            return None, None
+        _s = getattr(a, "start_date", None)
+        _e = getattr(a, "end_date", None) or getattr(a, "expected_end_date", None)
+        return (_s.isoformat() if _s else None), (_e.isoformat() if _e else None)
 
     members: list[dict] = []
     seen: set[str] = set()
@@ -1165,18 +1177,30 @@ def group_members_in_month(
         _kw = dict(night_profile=_np, weekend_off=_wo, fixed_shift=_fx)
         if nid in outbound:
             a = outbound[nid]
+            _ss, _se = _status_dates(a)
             if a.reason == "병동이동":
                 if a.start_date <= month_start:
                     continue  # 완전 전출 → 그 달 미표시
-                members.append(_row(n, "outbound", "←", None, team, grade, **_kw))
+                members.append(_row(n, "outbound", "←", None, team, grade, **_kw,
+                                    status_start=_ss, status_end=_se, status_reason=a.reason))
             else:  # 파견 나감 — home 유지
-                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, **_kw))
+                members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, **_kw,
+                                    status_start=_ss, status_end=_se, status_reason=a.reason))
         elif nid in leave:
             a = leave[nid]
             if a.reason == "퇴사":
-                members.append(_row(n, "resigned", None, "퇴사", team, grade, **_kw))
+                # 퇴사 시작일 = nurses.resignation_date(정본, synthetic 퇴사엔트리와 동일 소스). 폴백 a.start_date.
+                _resign = getattr(n, "resignation_date", None) or a.start_date
+                # 정책: 퇴사월만 노출 — 퇴사가 이전 달이면(=조회월 시작 전) 명단에서 제외.
+                if _resign is not None and _resign < month_start:
+                    continue
+                _rs = _resign.isoformat() if _resign else None
+                members.append(_row(n, "resigned", None, "퇴사", team, grade, **_kw,
+                                    status_start=_rs, status_end=None, status_reason="퇴사"))
             else:
-                members.append(_row(n, "leave", None, "휴직", team, grade, **_kw))
+                _ss, _se = _status_dates(a)
+                members.append(_row(n, "leave", None, "휴직", team, grade, **_kw,
+                                    status_start=_ss, status_end=_se, status_reason=a.reason))
         else:
             members.append(_row(n, "active", None, None, team, grade, **_kw))
 
@@ -1215,10 +1239,14 @@ def group_members_in_month(
         _kw = dict(night_profile=_np, fixed_shift=_fx)
         if a.reason == "파견":
             # 파견(일시·복귀 예정) = 지속 상태 → 기간 내내 '파견' 배지(전이 아님, 마커 없음).
-            members.append(_row(n, "inbound", None, "파견", team, grade, **_kw))
+            _ss, _se = _status_dates(a)
+            members.append(_row(n, "inbound", None, "파견", team, grade, **_kw,
+                                status_start=_ss, status_end=_se, status_reason=a.reason))
         elif a.start_date is not None and month_start <= a.start_date <= month_end:
             # 병동이동 = 일회성 전이 → 이동月(start ∈ 그 달)에만 전입(→).
-            members.append(_row(n, "inbound", "→", None, team, grade, **_kw))
+            _ss, _se = _status_dates(a)
+            members.append(_row(n, "inbound", "→", None, team, grade, **_kw,
+                                status_start=_ss, status_end=_se, status_reason=a.reason))
         else:
             # 이미 이동 완료(지난 달 발효) → 정착 일반 멤버(마커 없음).
             #   캐시(nurses.group_id) flush 전이어도 그 병동 소속이므로 명단엔 포함한다.
