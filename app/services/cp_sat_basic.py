@@ -2741,7 +2741,13 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if not days:
             return False  # 그 달 프리셉티 아님(종료/미겹침)
         if d < 0:
-            return False  # nurse-level: day별 판별 필요
+            # nurse-level 면제(개별 하드제약: max_night/n2n/even_nights/4O/고립OFF 등).
+            # 이 달 프리셉티인 nurse 는 follow 구간에 프리셉터를 미러링(xn==xp)하므로,
+            # 자기(주니어)의 N-한도/야간분배 제약이 미러를 타고 **프리셉터의 N 을 묶어**
+            # 실인원 N 커버리지를 붕괴시켰다(preceptee_shift_count=False 에서 D:10/N:3).
+            # → 프리셉티는 개별 하드제약 면제(True). period 전환 전 캐시-폴백과 동일 동작.
+            # (비-follow 구간 15~31 은 soft 목적함수가 잡아 실측상 정상 패턴 유지.)
+            return True
         return d in days
 
     # ───────────── 2-A. 고정 셀  ─────────────
