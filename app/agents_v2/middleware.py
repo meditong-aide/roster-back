@@ -298,8 +298,12 @@ def _check_permission(
 
     # 매니페스트 스킬: 권한을 SkillSpec 에서 파생 — 하드코딩 불필요.
     # (신규 스킬은 @skill(mutation=..., hn_only=...) 선언만으로 게이트가 걸린다.)
-    from agents_v2.skills.manifest import SKILL_SPECS
+    # load 보장: execute_skill 은 _check_permission(초반)→run_skill(후반 로드) 순서라,
+    # 프로세스 첫 스킬 호출 시 매니페스트가 아직 로드 안 됐을 수 있다. idempotent 로드로
+    # 권한 게이트가 스킵되는 것을 방지(방어적).
+    from agents_v2.skills.manifest import SKILL_SPECS, load_manifest_skills
 
+    load_manifest_skills()
     spec = SKILL_SPECS.get(normalized)
     if spec is not None:
         if spec.hn_only and not is_hn:

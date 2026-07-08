@@ -117,8 +117,9 @@ def manifest_hn_only_skills() -> set[str]:
 
 # ── 매니페스트 스킬 모듈 로딩 ────────────────────────────────────
 # @skill 로 등록하는 신규 스킬 모듈 경로. 여기 추가하면 5곳이 자동 구성된다.
-# (예: "agents_v2.skills.manage_assignment")
-_MANIFEST_MODULES: list[str] = []
+_MANIFEST_MODULES: list[str] = [
+    "agents_v2.skills.manage_assignment",
+]
 
 _loaded = False
 

@@ -44,7 +44,8 @@ def test_all_tools_covered():
     # Wave-3 (2026-06-19): resolve_infeasibility → 19.
     # switch_ward client-action (2026-06-24) → 20.
     # invoke client-action (2026-07-07, 엑셀 등 비파괴 UI 명령) → 21.
-    assert len(ALL_TOOL_NAMES) == 21
+    # manage_assignment (2026-07-08, 매니페스트 첫 시민, 파견) → 22.
+    assert len(ALL_TOOL_NAMES) == 22
     missing = set(ALL_TOOL_NAMES) - covered
     assert not missing, f"카테고리 미커버 tool: {missing}"
     # 맵의 tool 이름이 전부 실제 tool 이름인지(오타 방지)

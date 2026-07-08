@@ -70,6 +70,57 @@ def resolve_nurse(db: Session, group_id: str, name: str) -> ResolveResult:
     return ResolveResult(error=f"'{name}' 간호사를 찾을 수 없습니다.")
 
 
+# ── Group / Ward Resolution ─────────────────────────────────
+
+
+def resolve_group(
+    db: Session, office_id: str, name: str, *, exclude_group_id: str | None = None
+) -> ResolveResult:
+    """Resolve ward/group name → group_id within an office.
+
+    병동 이동/파견 스킬이 "중환자실2" 같은 이름을 target group_id 로 해석할 때 쓴다.
+    동명/모호 시 clarification. exclude_group_id 를 주면(예: source 병동) 후보에서 제외.
+    """
+    from db.models import Group
+
+    if not office_id or not name:
+        return ResolveResult(error="병동 이름 또는 병원 정보가 없습니다.")
+
+    rows = (
+        db.query(Group)
+        .filter(Group.office_id == office_id)
+        .all()
+    )
+    candidates = [g for g in rows if g.group_id != exclude_group_id]
+
+    key = name.strip()
+    exact = [g for g in candidates if str(g.group_name).strip() == key]
+    if len(exact) == 1:
+        return ResolveResult(resolved=True, value=exact[0].group_id)
+    if len(exact) > 1:
+        return ResolveResult(
+            needs_clarification=True,
+            question=f"'{name}' 병동이 {len(exact)}개입니다. 어느 병동인가요?",
+            options=[g.group_name for g in exact],
+        )
+
+    # 부분 일치 (포함 관계) — 모호하면 되묻는다
+    partial = [
+        g for g in candidates
+        if key in str(g.group_name) or str(g.group_name) in key
+    ]
+    if len(partial) == 1:
+        return ResolveResult(resolved=True, value=partial[0].group_id)
+    if len(partial) > 1:
+        return ResolveResult(
+            needs_clarification=True,
+            question=f"'{name}'와 비슷한 병동이 여러 개입니다. 어느 병동인가요?",
+            options=[g.group_name for g in partial[:6]],
+        )
+
+    return ResolveResult(error=f"'{name}' 병동을 찾을 수 없습니다.")
+
+
 # ── Shift Resolution ────────────────────────────────────────
 
 _SHIFT_ALIASES: dict[str, str] = {

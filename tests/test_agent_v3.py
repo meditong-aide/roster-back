@@ -335,7 +335,8 @@ class TestSkillDescriptions:
         # + 1 Wave-3 (resolve_infeasibility)
         # + 3 client-action (navigate, prefill, switch_ward) = 20.
         # + 1 client-action (invoke, 2026-07-07 비파괴 UI 명령/엑셀) = 21.
-        assert len(SKILL_TOOLS) == 21
+        # + 1 manifest 첫 시민 (manage_assignment, 파견) = 22.
+        assert len(SKILL_TOOLS) == 22
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:
