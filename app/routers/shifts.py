@@ -11,7 +11,6 @@ from services.group_access import resolve_effective_group, caller_is_head_nurse
 from services.shift_manage_defaults import ensure_default_shift_manage
 from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
 from services.shift_service import (
-    get_shifts_service as get_shifts_service_mysql,
     add_shift_service,
     update_shift_service,
     remove_shift_service,
@@ -68,7 +67,6 @@ async def get_shifts(
 ):
 
     try:
-        backend = os.getenv("DB_BACKEND", "mysql").lower()
         override_gid = None
         if group_id:
             if not current_user:
@@ -80,12 +78,7 @@ async def get_shifts(
             if not g or g.office_id != current_user.office_id:
                 raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
             override_gid = group_id
-        backend = 'mssql'
-        if backend == "mssql":
-            
-            shifts = get_shifts_service_mssql(current_user, db, override_gid)
-        else:
-            shifts = get_shifts_service_mysql(current_user, db, override_gid)
+        shifts = get_shifts_service_mssql(current_user, db, override_gid)
         for shift in shifts:
             shift["start_time"] = convert_time(shift["start_time"])
             shift["end_time"] = convert_time(shift["end_time"])

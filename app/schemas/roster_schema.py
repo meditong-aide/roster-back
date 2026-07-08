@@ -56,6 +56,7 @@ class ShiftUpdateRequest(BaseModel):
     # 추가
     show_in_preference: Optional[bool] = None  # None이면 기존 값 유지
     off_swap_target: Optional[bool] = None  # None이면 기존 값 유지 (초과 OFF 변환 타깃)
+    description: Optional[str] = None  # 근무코드 설명. None이면 기존 값 유지
 
 
 class ShiftAddRequest(BaseModel):
@@ -79,6 +80,7 @@ class ShiftAddRequest(BaseModel):
         False  # 기본 False, 프론트에서 안 보내면 자동 숨김
     )
     off_swap_target: Optional[bool] = False  # 초과 OFF 변환 타깃 (그룹당 1개)
+    description: Optional[str] = None  # 근무코드 설명
 
 
 class ShiftUploadConfirmRequest(BaseModel):

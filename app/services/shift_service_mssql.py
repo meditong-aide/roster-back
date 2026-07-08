@@ -202,6 +202,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                     # 추가
                     "show_in_preference": s.show_in_preference, # True/False 또는 1/0
                     "off_swap_target": bool(getattr(s, "off_swap_target", False)),
+                    "description": getattr(s, "description", None),
                 }
                 for s in shifts
             ]
@@ -286,6 +287,7 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 # 추가
                 "show_in_preference": s.show_in_preference,
                 "off_swap_target": bool(getattr(s, "off_swap_target", False)),
+                "description": getattr(s, "description", None),
             }
             for s in shifts
         ]
@@ -331,6 +333,7 @@ def _shift_row_to_dict(s: Shift) -> Dict[str, Any]:
         "id": getattr(s, "id", None),
         "show_in_preference": s.show_in_preference,
         "off_swap_target": bool(getattr(s, "off_swap_target", False)),
+        "description": getattr(s, "description", None),
     }
 
 
@@ -427,6 +430,7 @@ def add_shift_service(req, current_user, db: Session | None = None):
             auto_schedule=req.auto_schedule,
             sequence=max_sequence + 1,
             shift_gb=req.shift_gb,
+            description=getattr(req, "description", None),
         )
         session.add(new_shift)
         session.commit()
@@ -446,6 +450,7 @@ def add_shift_service(req, current_user, db: Session | None = None):
                 "color": new_shift.color,
                 "sequence": new_shift.sequence,
                 "shift_gb": new_shift.shift_gb,
+                "description": new_shift.description,
             },
         }
     finally:
@@ -478,6 +483,8 @@ def update_shift_service(req, current_user, db: Session | None = None):
         existing_shift.allday = req.allday
         existing_shift.auto_schedule = req.auto_schedule
         existing_shift.shift_gb = req.shift_gb
+        # 근무코드 설명 업데이트 — 프론트가 빈 값을 null 로 전송하므로 클리어 허용(항상 반영).
+        existing_shift.description = getattr(req, "description", None)
 
         session.commit()
         session.refresh(existing_shift)
@@ -498,6 +505,7 @@ def update_shift_service(req, current_user, db: Session | None = None):
                 "color": existing_shift.color,
                 "sequence": existing_shift.sequence,
             "shift_gb": existing_shift.shift_gb,
+            "description": existing_shift.description,
             }
         }
     finally:

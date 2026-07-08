@@ -433,6 +433,8 @@ class Shift(Base):
         default=False,
     )
     off_swap_target = Column(BOOLEAN, nullable=False, default=False)
+    # 근무코드 설명(자유 텍스트). MSSQL NVARCHAR(MAX) = NVARCHAR(-1).
+    description = Column(NVARCHAR(None), nullable=True)
 
     office = relationship("Office")
     group = relationship("Group")
