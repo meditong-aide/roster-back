@@ -164,10 +164,25 @@ def resolve_tools(categories: list[str]) -> list[str]:
     return scoped or list(ALL_TOOL_NAMES)
 
 
+# 실험 토글: 매니페스트 trigger_hint 를 분류 프롬프트에 주입할지. 기본 True(프로덕션).
+# 라우팅 recall 전/후 측정 시 False 로 내려 baseline 을 잰다.
+INJECT_MANIFEST_HINTS = True
+
+
+def _build_classify_system() -> str:
+    """분류 system 프롬프트 = 기본 + 매니페스트 신규 스킬 트리거 어휘(파생)."""
+    if not INJECT_MANIFEST_HINTS:
+        return _CLASSIFY_SYSTEM
+    from agents_v2.skills.manifest import load_manifest_skills, manifest_router_hints
+
+    load_manifest_skills()
+    return _CLASSIFY_SYSTEM + manifest_router_hints()
+
+
 def _classify_raw(llm: LLMClient, message: str):
     """분류 1회 — (categories, LLMResponse|None). 실패 시 ([], None)."""
     messages = [
-        {"role": "system", "content": _CLASSIFY_SYSTEM},
+        {"role": "system", "content": _build_classify_system()},
         {"role": "user", "content": message},
     ]
     try:

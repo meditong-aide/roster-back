@@ -41,6 +41,11 @@ class SkillSpec:
     mutation: bool = False              # 쓰기 스킬 여부(권한 게이트)
     hn_only: bool = False               # HN/ADM 전용 여부(권한 게이트)
     grounds: tuple[str, ...] = ()        # 필요한 grounding 필드(문서/검증용)
+    # trigger_hint: 이 스킬의 category 를 발화에서 알아채도록 라우터 분류 프롬프트에
+    # 주입할 자연어 트리거. category→tool 배선만 자동화하면 라우터가 "이 발화가 그
+    # category 인지"를 모른다(신규 스킬 어휘 미학습) → tool 이 조용히 미검색된다.
+    # 이 필드가 그 vocabulary 갭을 메운다.
+    trigger_hint: str = ""
 
 
 # name → SkillSpec. @skill 이 채운다.
@@ -55,6 +60,7 @@ def skill(
     mutation: bool = False,
     hn_only: bool = False,
     grounds: tuple[str, ...] | list[str] = (),
+    trigger_hint: str = "",
 ) -> Callable[[SkillFunc], SkillFunc]:
     """스킬 단일 소스 등록 데코레이터.
 
@@ -77,6 +83,7 @@ def skill(
             mutation=mutation,
             hn_only=hn_only,
             grounds=tuple(grounds),
+            trigger_hint=trigger_hint,
         )
         SKILL_SPECS[name] = spec
         # 기존 dispatch 재사용 — run_skill 이 그대로 찾는다.
@@ -113,6 +120,26 @@ def manifest_mutation_skills() -> set[str]:
 def manifest_hn_only_skills() -> set[str]:
     """HN/ADM 전용 스킬 이름 집합 (middleware 권한 게이트가 소비)."""
     return {s.name for s in SKILL_SPECS.values() if s.hn_only}
+
+
+def manifest_router_hints() -> str:
+    """신규 스킬의 trigger_hint 를 라우터 분류 프롬프트에 붙일 텍스트로 파생.
+
+    category→tool 배선(manifest_category_tools)만으로는 라우터가 "이 발화가 그 category
+    인지"를 모른다. trigger_hint 를 분류 프롬프트에 주입해 신규 스킬의 어휘를 라우터가
+    학습하게 한다(vocabulary propagation). trigger_hint 가 없으면 빈 문자열.
+    """
+    lines = [
+        f"- {s.trigger_hint} → {', '.join(s.categories)}"
+        for s in SKILL_SPECS.values()
+        if s.trigger_hint and s.categories
+    ]
+    if not lines:
+        return ""
+    return (
+        "\n\n[신규 스킬 트리거 — 아래 표현은 지정된 카테고리로 분류하라]\n"
+        + "\n".join(lines)
+    )
 
 
 # ── 매니페스트 스킬 모듈 로딩 ────────────────────────────────────

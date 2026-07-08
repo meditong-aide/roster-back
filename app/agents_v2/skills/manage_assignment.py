@@ -291,10 +291,14 @@ def _cancel(db: Session, params: dict) -> Any:
 @skill(
     "manage_assignment",
     MANAGE_ASSIGNMENT_SCHEMA,
-    categories=["settings_people"],
+    # settings_people(주) + mutate(파견 등록/취소는 본질이 mutation → '취소'가 mutate 로
+    # 분류돼도 tool 이 스코프에 있도록). recall A/B(2026-07-08)에서 '취소'가 mutate 로
+    # 새던 문제를 이 다중배선 + trigger_hint 로 함께 잡는다.
+    categories=["settings_people", "mutate"],
     mutation=True,
     hn_only=True,
     grounds=["nurse_name", "target_ward"],
+    trigger_hint="간호사 파견(다른 병동으로 임시 근무) 등록·취소, 파견자 명단/현황 조회, 병동 배정",
 )
 def manage_assignment(db: Session, params: dict) -> Any:
     op = (params.get("operation") or "list").lower()
