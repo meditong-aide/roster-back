@@ -67,7 +67,6 @@ async def _daily_flush_scheduler():
         try:
             from services.assignment_service import (
                 flush_all_pending_transfers,
-                flush_expired_preceptees,
                 flush_expired_dispatches,
                 flush_expired_leaves,
                 flush_pending_permanent_changes,
@@ -77,9 +76,7 @@ async def _daily_flush_scheduler():
             count = flush_all_pending_transfers(db)
             if count > 0:
                 _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
-            pte_count = flush_expired_preceptees(db)
-            if pte_count > 0:
-                _scheduler_logger.info("[Scheduler] 프리셉티 자동 해제: %d건", pte_count)
+            # [도려내기] 프리셉티 만료 flush 제거 — nurse_preceptee_period as-of resolver 가 자동 처리.
             disp_count = flush_expired_dispatches(db)
             if disp_count > 0:
                 _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)

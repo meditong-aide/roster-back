@@ -405,6 +405,10 @@ def test_ward_pair_split_warns_when_preceptor_excluded(db):
     db.add(NurseAssignment(nurse_id="a0", source_group_id="A", target_group_id="B",
                            office_id="o1", start_date=_d(2026, 8, 1), reason="파견",
                            status="active"))  # 8월 겹침 → a0 제외
+    # 로직은 period(SSOT) as-of 를 읽으므로 프리셉티 관계 period row 시드(2026-08 커버)
+    from db.models import NursePrecepteePeriod
+    db.add(NursePrecepteePeriod(nurse_id="a_pe", preceptor_id="a0", office_id="o1",
+                                valid_from=_d(2026, 8, 1), valid_to=_d(2026, 9, 1), source="test"))
     db.flush()
     pv = preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=8)
     pair = next(p for p in pv["pairs"] if p["preceptee_id"] == "a_pe")

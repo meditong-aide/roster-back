@@ -4491,10 +4491,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         print(f"[WeekendOff] 대상 간호사 로깅 실패: {e}")
     month_start = date(req.year, req.month, 1)
     days_in_month = calendar.monthrange(req.year, req.month)[1]
-    # ── 병동이동 레이지 체크 + 프리셉티 만료 체크 + assignment 기반 blocked_by_nurse 구성 ──
+    # ── 병동이동 레이지 체크 + assignment 기반 blocked_by_nurse 구성 ──
+    #   [도려내기] 프리셉티 만료 flush 제거 — period as-of resolver(아래 preceptee_period 빌드)가 자동 처리.
     flush_pending_transfers(db, current_user.group_id)
-    from services.assignment_service import flush_expired_preceptees
-    flush_expired_preceptees(db)
     _assignments = get_active_assignments_for_month(db, current_user.group_id, req.year, req.month)
     print(f"[Assignment] group_id={current_user.group_id}, year={req.year}, month={req.month}, assignments_count={len(_assignments)}")
     for _a in _assignments:
@@ -5000,10 +4999,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     # 고정 셀이 있으면 result_mapping에서 fixed_lookup이 우선하여 "주" 코드가 그대로 노출됨.
     # → 프리셉티를 weekly_off_map에서 제거하여 고정 셀 미생성 + 팔로우 동기화로 OFF 처리.
     if config_dict.get('preceptee_on', True):
+        # 프리셉티 판정 = nurse_preceptee_period(SSOT) 그 달 as-of 맵(캐시 preceptor_id 안 봄).
+        _pte_month_ids = set((config_dict.get("preceptee_period_by_nurse_id") or {}).keys())
         for nurse in nurses_for_engine:
             nid = str(nurse.nurse_id)
-            pid = getattr(nurse, 'preceptor_id', None)
-            if not pid:
+            if nid not in _pte_month_ids:
                 continue
             if nid in weekly_off_map:
                 print(f"[WeeklyOff] 프리셉티 {nurse.name}({nid}) → 주휴 고정 셀 제거 (프리셉터 팔로우로 대체)")
@@ -5161,10 +5161,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _pte_fw_map: dict[tuple[int, int], str] = {}
             _pte_ids = set()
             _pte_names: dict[str, str] = {}
+            # 프리셉티 판정 = nurse_preceptee_period(SSOT) 그 달 as-of 맵(캐시 preceptor_id 안 봄).
+            _pte_period_map = config_dict.get("preceptee_period_by_nurse_id") or {}
             for nurse in nurses_for_engine:
-                if getattr(nurse, "preceptor_id", None):
-                    _pte_ids.add(str(nurse.nurse_id))
-                    _pte_names[str(nurse.nurse_id)] = getattr(nurse, "name", "?")
+                _nid = str(nurse.nurse_id)
+                if _nid in _pte_period_map:
+                    _pte_ids.add(_nid)
+                    _pte_names[_nid] = getattr(nurse, "name", "?")
             print(
                 f"[RosterCreate] 프리셉티 목록: {len(_pte_ids)}명 → {[(nid, _pte_names.get(nid, '?')) for nid in sorted(_pte_ids)]}"
             )

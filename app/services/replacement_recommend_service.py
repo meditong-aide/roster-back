@@ -135,10 +135,10 @@ def _build_assignment_blocked_dates(
     month: int,
     days_in_month: int,
 ) -> Dict[str, set]:
-    """해당 월의 active NurseAssignment에서 간호사별 blocked date 집합을 구성한다.
+    """해당 월의 간호사별 blocked date 집합을 구성한다.
 
-    파견/병동이동/휴직: source_group_id == group_id인 아웃바운드 기간
-    프리셉티: preceptor_id가 있는 간호사의 assignment 기간
+    파견/병동이동/휴직: source_group_id == group_id인 아웃바운드 기간(NurseAssignment)
+    프리셉티: nurse_preceptee_period(SSOT) 의 그 달 겹치는 구간(assignment 안 봄 — 도려내기)
     """
     month_start = date(year, month, 1)
     month_end = date(year, month, days_in_month)
@@ -173,14 +173,18 @@ def _build_assignment_blocked_dates(
                 blocked[nid].add(d)
                 d += timedelta(days=1)
 
-        # 프리셉티 — 해당 기간 blocked
-        if a.reason == "프리셉티":
-            if nid not in blocked:
-                blocked[nid] = set()
-            d = overlap_start
-            while d <= overlap_end:
-                blocked[nid].add(d)
-                d += timedelta(days=1)
+    # 프리셉티 — nurse_preceptee_period(SSOT) 의 그 달 겹치는 날짜를 blocked.
+    #   resolver 는 {nid: {"days": set(0-based day index)}} 반환 → date 로 환산.
+    from services.preceptee_period import resolve_preceptee_days_for_month
+    _grp_nurse_ids = [
+        str(nid) for (nid,) in db.query(Nurse.nurse_id)
+        .filter(Nurse.group_id == group_id).all()
+    ]
+    _pte_days = resolve_preceptee_days_for_month(db, _grp_nurse_ids, year, month)
+    for nid, info in _pte_days.items():
+        s = blocked.setdefault(str(nid), set())
+        for d0 in info.get("days", set()):
+            s.add(month_start + timedelta(days=int(d0)))
 
     # fixed_wanted_entries — 고정 셀이 있는 날짜는 추천 제외
     fixed_entries = (

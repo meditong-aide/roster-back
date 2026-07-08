@@ -1,7 +1,8 @@
 """프리셉터↔프리셉티 관계 시점(period) SSOT 리졸버 + write-through 헬퍼.
 
-진실 = `nurse_preceptee_period`. `nurses.preceptor_id` = as-of 오늘 단방향 투영(앱 직접쓰기 금지).
-규칙: `[valid_from, valid_to)` 반열림(valid_to 배타) · 겹침 금지 · 무기한 = valid_to NULL.
+진실 = `nurse_preceptee_period`. `nurses.preceptor_id` = as-of 오늘 단방향 투영(전환기; 캐시 폐지 예정).
+규칙: `[valid_from, valid_to)` 반열림(valid_to 배타) · 겹침 금지 · **valid_to 필수(무기한 폐지)**.
+취소 = row 삭제(delete_preceptee_period), 자연종료/병동이동 = close(이력 보존).
 
 주의(경계 시맨틱): assignment.expected_end_date 는 **포함(inclusive)** 의미였다
 (기존 roster_create_service step1 의 day range 가 _a_end 를 포함). 이 테이블의 valid_to 는
@@ -104,29 +105,66 @@ def resolve_preceptee_days_for_month(db, nurse_ids, year: int, month: int) -> di
     return out
 
 
+def list_preceptee_periods_for_month(db, nurse_ids, year: int, month: int) -> list[dict]:
+    """그 달과 겹치는 프리셉티 구간 목록 (로스터 생성/뷰 프리셉티 표시용).
+
+    반환: [{"nurse_id", "preceptor_id", "start_date", "expected_end_date"(inclusive)}].
+    프론트 getPrecepteeDaysByNurseId 가 그 달 교집합 day 를 계산한다(구간 원본 그대로 전달).
+    """
+    ids = [str(n) for n in (nurse_ids or [])]
+    if not ids:
+        return []
+    ms = date(year, month, 1)
+    me = date(year, month, monthrange(year, month)[1])
+    rows = _overlap_filter(
+        db.query(NursePrecepteePeriod).filter(NursePrecepteePeriod.nurse_id.in_(ids)),
+        ms, me + timedelta(days=1),
+    ).all()
+    out: list[dict] = []
+    for r in rows:
+        end_incl = (r.valid_to - timedelta(days=1)) if r.valid_to else None
+        out.append({
+            "nurse_id": str(r.nurse_id),
+            "preceptor_id": str(r.preceptor_id),
+            "start_date": r.valid_from.isoformat() if r.valid_from else None,
+            "expected_end_date": end_incl.isoformat() if end_incl else None,
+        })
+    return out
+
+
 # ── 쓰기 (write-through) ───────────────────────────────────────────────────────
 def open_preceptee_period(db, *, nurse_id, preceptor_id, office_id, valid_from: date,
-                          valid_to: date | None = None, source_assignment_id: int | None = None,
+                          valid_to: date, source_assignment_id: int | None = None,
                           source: str = "edited", nurse=None, today: date | None = None):
-    """새 프리셉티 구간 open + as-of 캐시 투영. 기존 open 구간이 있으면 닫고 연다(1:1)."""
+    """새 프리셉티 구간 open + as-of 캐시 투영.
+
+    **valid_to(종료일 exclusive) 필수** — 무기한 프리셉티는 폐지됐다. None 이면 ValueError.
+    같은 간호사의 겹치는(current/future) 구간이 있으면 삭제하고 새로 넣는다(1:1 upsert).
+    이미 종료된 과거 구간(valid_to <= valid_from)은 이력 보존을 위해 건드리지 않는다.
+    """
+    if valid_to is None:
+        raise ValueError("open_preceptee_period: valid_to(종료일)는 필수입니다 (무기한 프리셉티 폐지).")
+    if valid_to <= valid_from:
+        raise ValueError(f"open_preceptee_period: valid_to({valid_to}) 는 valid_from({valid_from}) 보다 뒤여야 합니다.")
     db.flush()
     today = today or _today()
     nid, pid = str(nurse_id), str(preceptor_id)
-    # 1:1 방어: 같은 간호사의 기존 open 구간을 새 시작일로 닫는다.
+    # 1:1 upsert: 같은 간호사의 새 구간과 겹치는 기존 구간을 삭제(취소=삭제 정책과 일관).
+    #   [valid_from, valid_to) 반열림 겹침 = existing.valid_from < valid_to AND existing.valid_to > valid_from.
     for r in db.query(NursePrecepteePeriod).filter(
         NursePrecepteePeriod.nurse_id == nid,
-        NursePrecepteePeriod.valid_to.is_(None),
+        NursePrecepteePeriod.valid_from < valid_to,
+        NursePrecepteePeriod.valid_to > valid_from,
     ).all():
-        r.valid_to = max(valid_from, r.valid_from)  # 음수구간 방지(백데이팅 시)
-        r.end_reason = r.end_reason or "released"
+        db.delete(r)
     row = NursePrecepteePeriod(
         nurse_id=nid, preceptor_id=pid, office_id=str(office_id),
         valid_from=valid_from, valid_to=valid_to,
         source=source, source_assignment_id=source_assignment_id,
     )
     db.add(row)
-    # 단방향 캐시 투영: 오늘이 구간 내면 set. 미래발효/이미종료는 투영 안 함(roll/close 가 처리).
-    if nurse is not None and valid_from <= today and (valid_to is None or today < valid_to):
+    # 단방향 캐시 투영(전환기): 오늘이 구간 내면 set. 미래발효는 투영 안 함(roll 이 처리).
+    if nurse is not None and valid_from <= today < valid_to:
         nurse.preceptor_id = pid
     return row
 
@@ -157,6 +195,33 @@ def close_preceptee_period(db, *, nurse_id, close_date: date, end_reason: str = 
     if nurse is not None and close_date <= today:
         nurse.preceptor_id = None
     return closed
+
+
+def delete_preceptee_period(db, *, nurse_id, preceptor_id=None, nurse=None,
+                            today: date | None = None) -> int:
+    """프리셉티 관계 **취소 = row 삭제**. 사용자가 명시적으로 취소한 경우.
+
+    current/future 구간(valid_to > today)을 삭제한다. 이미 종료된 과거 구간은 이력
+    보존을 위해 남긴다(그 달 근무표 재생성 정합). 오늘이 삭제 구간에 걸렸으면 캐시 None 투영.
+    반환: 삭제된 row 수.
+    """
+    db.flush()
+    today = today or _today()
+    nid = str(nurse_id)
+    q = db.query(NursePrecepteePeriod).filter(
+        NursePrecepteePeriod.nurse_id == nid,
+        NursePrecepteePeriod.valid_to > today,
+    )
+    if preceptor_id is not None:
+        q = q.filter(NursePrecepteePeriod.preceptor_id == str(preceptor_id))
+    rows = q.all()
+    covered_today = any(r.valid_from <= today < r.valid_to for r in rows)
+    for r in rows:
+        db.delete(r)
+    # 캐시 투영(전환기): 오늘 걸친 관계를 지웠으면 None.
+    if nurse is not None and covered_today:
+        nurse.preceptor_id = None
+    return len(rows)
 
 
 def backfill_from_assignments(db, *, today: date | None = None) -> dict:
@@ -222,9 +287,11 @@ def close_all_for_preceptor(db, *, preceptor_id, close_date: date,
     db.flush()
     today = today or _today()
     pid = str(preceptor_id)
+    # close_date 이후까지 걸친 구간(무기한 NULL 또는 유한 future)을 close_date 로 절단.
     rows = db.query(NursePrecepteePeriod).filter(
         NursePrecepteePeriod.preceptor_id == pid,
-        NursePrecepteePeriod.valid_to.is_(None),
+        or_(NursePrecepteePeriod.valid_to.is_(None),
+            NursePrecepteePeriod.valid_to > close_date),
     ).all()
     closed = []
     for r in rows:
