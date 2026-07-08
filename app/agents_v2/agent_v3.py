@@ -343,6 +343,13 @@ class SchedulingAgent:
                 # Append the single assistant message (may contain N tool_calls)
                 messages.append(response.as_assistant_message())
 
+                # 병렬 tool_call 배치 중 preview/apply_hint 가 나와도 즉시 return 하지 않고
+                # 여기 capture 해둔다. 그 자리에서 return 하면 같은 assistant 메시지의 나머지
+                # tool_call 이 tool 응답 없이 남아 메시지 체인이 무효화된다(OpenAI 400).
+                # 배치를 끝까지 실행해 모든 tool_call 응답을 채운 뒤(체인 완결) return 한다.
+                pending_preview: dict | None = None
+                pending_apply_hint: dict | None = None
+
                 # Execute each tool call (parallel calls executed sequentially)
                 for tc in response.tool_calls:
                     skill_name = tc.name
@@ -452,55 +459,38 @@ class SchedulingAgent:
                         skill_args, result, _failed_shift_terms,
                     )
 
-                    # ── apply_hint 흐름 — generate_schedule INFEASIBLE 재시도 ──
+                    # ── apply_hint 흐름 — capture, don't return (배치 완결 후 처리) ──
                     apply_hint_q = _extract_apply_hint_question(skill_name, result.data)
                     if apply_hint_q is not None:
-                        hint_data = result.data["infeasibility"]["apply_hint"]
-                        pending = {
-                            "type": "apply_hint",
-                            "apply_hint": hint_data,
-                            "original_args": skill_args,
-                            "question": apply_hint_q,
-                        }
+                        if pending_apply_hint is None:
+                            pending_apply_hint = {
+                                "type": "apply_hint",
+                                "apply_hint": result.data["infeasibility"]["apply_hint"],
+                                "original_args": skill_args,
+                                "question": apply_hint_q,
+                            }
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.call_id,
                             "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         })
-                        return AgentResult(
-                            awaiting_approval=True,
-                            preview=pending,
-                            answer=apply_hint_q,
-                            ui_actions=ui_actions,
-                            trace=trace,
-                            messages=messages,
-                            variable_memory=vm.to_dict(),
-                        )
+                        continue
 
-                    # ── Approval flow (preview) — must exit for user confirmation ──
-                    # §3.C: outcome taxonomy 단일 분류로 dispatch.
+                    # ── Approval flow (preview) — capture, don't return (배치 완결 후 처리) ──
+                    # §3.C: outcome taxonomy 단일 분류로 dispatch. 첫 preview 만 surface.
                     if _classify_outcome(result.data) is ErrorType.PREVIEW:
-                        preview_with_context = {
-                            **result.data,
-                            "skill_name": skill_name,
-                            "args": skill_args,
-                        }
-                        # Still need to append result for message consistency
+                        if pending_preview is None:
+                            pending_preview = {
+                                **result.data,
+                                "skill_name": skill_name,
+                                "args": skill_args,
+                            }
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.call_id,
                             "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         })
-                        preview_answer = self._generate_preview_answer(messages, trace)
-                        return AgentResult(
-                            awaiting_approval=True,
-                            preview=preview_with_context,
-                            answer=preview_answer,
-                            ui_actions=ui_actions,
-                            trace=trace,
-                            messages=messages,
-                            variable_memory=vm.to_dict(),
-                        )
+                        continue
 
                     # ── Append tool result for LLM to observe ──
                     messages.append(
@@ -509,6 +499,31 @@ class SchedulingAgent:
                             "tool_call_id": tc.call_id,
                             "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         }
+                    )
+
+                # ── 배치 완결 후: pending 승인 처리 (메시지 체인 무결성 보존) ──
+                # 모든 tool_call 이 응답을 가진 상태이므로 _generate_preview_answer 의
+                # LLM 호출이 400 나지 않는다. apply_hint 우선(생성 재시도).
+                if pending_apply_hint is not None:
+                    return AgentResult(
+                        awaiting_approval=True,
+                        preview=pending_apply_hint,
+                        answer=pending_apply_hint["question"],
+                        ui_actions=ui_actions,
+                        trace=trace,
+                        messages=messages,
+                        variable_memory=vm.to_dict(),
+                    )
+                if pending_preview is not None:
+                    preview_answer = self._generate_preview_answer(messages, trace)
+                    return AgentResult(
+                        awaiting_approval=True,
+                        preview=pending_preview,
+                        answer=preview_answer,
+                        ui_actions=ui_actions,
+                        trace=trace,
+                        messages=messages,
+                        variable_memory=vm.to_dict(),
                     )
 
         return AgentResult(
