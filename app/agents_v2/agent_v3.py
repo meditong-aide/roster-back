@@ -347,7 +347,7 @@ class SchedulingAgent:
                 # 여기 capture 해둔다. 그 자리에서 return 하면 같은 assistant 메시지의 나머지
                 # tool_call 이 tool 응답 없이 남아 메시지 체인이 무효화된다(OpenAI 400).
                 # 배치를 끝까지 실행해 모든 tool_call 응답을 채운 뒤(체인 완결) return 한다.
-                pending_preview: dict | None = None
+                pending_previews: list[dict] = []
                 pending_apply_hint: dict | None = None
 
                 # Execute each tool call (parallel calls executed sequentially)
@@ -476,15 +476,15 @@ class SchedulingAgent:
                         })
                         continue
 
-                    # ── Approval flow (preview) — capture, don't return (배치 완결 후 처리) ──
-                    # §3.C: outcome taxonomy 단일 분류로 dispatch. 첫 preview 만 surface.
+                    # ── Approval flow (preview) — capture all, don't return (배치 완결 후 처리) ──
+                    # §3.C: outcome taxonomy 단일 분류로 dispatch. consolidated 승인을 위해
+                    # 배치의 모든 mutation preview 를 모은다(다중 mutation 도 1회 승인으로).
                     if _classify_outcome(result.data) is ErrorType.PREVIEW:
-                        if pending_preview is None:
-                            pending_preview = {
-                                **result.data,
-                                "skill_name": skill_name,
-                                "args": skill_args,
-                            }
+                        pending_previews.append({
+                            **result.data,
+                            "skill_name": skill_name,
+                            "args": skill_args,
+                        })
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.call_id,
@@ -514,11 +514,20 @@ class SchedulingAgent:
                         messages=messages,
                         variable_memory=vm.to_dict(),
                     )
-                if pending_preview is not None:
+                if pending_previews:
+                    # 단일이면 기존 shape 유지(하위호환). 다중이면 consolidated batch.
+                    if len(pending_previews) == 1:
+                        preview_payload = pending_previews[0]
+                    else:
+                        preview_payload = {
+                            "type": "batch",
+                            "count": len(pending_previews),
+                            "items": pending_previews,
+                        }
                     preview_answer = self._generate_preview_answer(messages, trace)
                     return AgentResult(
                         awaiting_approval=True,
-                        preview=pending_preview,
+                        preview=preview_payload,
                         answer=preview_answer,
                         ui_actions=ui_actions,
                         trace=trace,
@@ -796,6 +805,10 @@ class SchedulingAgent:
         if not approval:
             return AgentResult(answer="승인 대기 중인 작업이 없습니다.", messages=messages)
 
+        # consolidated batch 승인 — 여러 mutation 을 한 번에 실행 (multi-mutation 복합 쿼리).
+        if approval.get("type") == "batch":
+            return self._execute_approval_batch(db, ctx, messages, approval.get("items", []))
+
         # Re-execute with preview_only=false
         args = {**approval.get("args", {}), "preview_only": False}
         skill_name = approval.get("skill_name", "bulk_mutation")
@@ -849,6 +862,75 @@ class SchedulingAgent:
             trace=trace,
             messages=messages,
         )
+
+    def _execute_approval_batch(
+        self,
+        db: Session,
+        ctx: SessionContext,
+        messages: list[dict],
+        items: list[dict],
+    ) -> AgentResult:
+        """Consolidated 승인 — 여러 mutation preview 를 순차 실행(각각 preview_only=False).
+
+        복합 쿼리에서 한 턴에 여러 변경이 preview 됐을 때, 사용자 1회 승인으로 전부 실행.
+        schedule mutation 이 하나라도 있으면 끝에 proactive 검증 1회.
+        """
+        trace: list[Stage] = []
+        done: list[str] = []
+        errors: list[str] = []
+        needs_validate = False
+
+        for item in items:
+            skill_name = item.get("skill_name", "bulk_mutation")
+            args = {**item.get("args", {}), "preview_only": False}
+            result = execute_skill(db, skill_name, args, ctx)
+            trace.append(
+                Stage(
+                    "execution",
+                    "error" if _is_error(result.data) else "ok",
+                    {"skill": skill_name, "result": _truncate(result.data)},
+                    result.duration_ms,
+                )
+            )
+            if _is_error(result.data):
+                errors.append(f"{skill_name}: {result.data.get('error', '')}")
+            else:
+                done.append(skill_name)
+                if skill_name in ("bulk_mutation", "bulk-mutation") and args.get(
+                    "scope"
+                ) in ("schedule", "draft_schedule", "published_schedule"):
+                    needs_validate = True
+
+        parts = []
+        if done:
+            parts.append(f"{len(done)}건의 변경을 완료했습니다.")
+        if errors:
+            parts.append("일부 변경은 실패했습니다: " + "; ".join(errors))
+        answer = " ".join(parts) or "실행할 변경이 없습니다."
+
+        if needs_validate:
+            val = execute_skill(
+                db, "validate_schedule",
+                {"group_id": ctx.group_id, "year": ctx.year, "month": ctx.month},
+                ctx,
+            )
+            trace.append(
+                Stage(
+                    "auto_validation",
+                    "error" if _is_error(val.data) else "ok",
+                    {"result": _truncate(val.data)},
+                    val.duration_ms,
+                )
+            )
+            if not _is_error(val.data):
+                v_count = val.data.get("violation_count", 0)
+                answer += (
+                    f"\n\n⚠️ 자동 검증: {v_count}건의 제약조건 위반이 감지되었습니다."
+                    if v_count > 0
+                    else "\n\n✅ 자동 검증 완료: 제약조건 위반 없음."
+                )
+
+        return AgentResult(answer=answer, trace=trace, messages=messages)
 
 
 # ── Helpers ─────────────────────────────────────────────────

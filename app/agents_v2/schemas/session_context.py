@@ -36,6 +36,13 @@ class SessionContext:
     # Approval flow (preview → confirm)
     pending_approval: dict | None = None
 
+    # 자율성 모드 (HITL 3-tier). mutation 승인 정책을 고른다.
+    #   "manual"      — 모든 mutation 은 preview→사용자 승인 (현행, 안전 기본)
+    #   "auto"        — read/navigate 자동, mutation 은 여전히 승인 (추후)
+    #   "auto_accept" — mutation 도 자동 실행 (HN 한정, 위험 — 추후)
+    # 지금은 manual 만 활성. auto tier 는 스캐폴드.
+    autonomy_mode: str = "manual"
+
     # Variable Memory (Routine step 간 파라미터 전달)
     variable_memory: dict = field(default_factory=dict)
 
