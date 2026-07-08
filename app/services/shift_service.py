@@ -261,163 +261,6 @@ def _append_shift_manage_code(
         db.commit()
 
 
-def get_shifts_service(current_user, db: Session, override_group_id: str | None = None):
-    """
-    그룹 내 모든 시프트 정보 조회 서비스 함수
-
-    - 만약 해당 그룹에 시프트가 하나도 없으면, 기본 4개 시프트(O/E/N/D)를
-      현재 사용자의 office_id, group_id 로 DB에 생성한 뒤 반환합니다.
-    """
-    if not current_user:
-        raise Exception("Not authenticated")
-    
-    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
-    shifts = db.query(Shift).filter(Shift.group_id == target_group_id).order_by(Shift.sequence.asc()).all()
-    if shifts:
-        has_mid = any(str(getattr(s, "default_shift", "") or "").upper() == "M" for s in shifts)
-        if not has_mid:
-            if override_group_id:
-                g = db.query(Group).filter(Group.group_id == override_group_id).first()
-                if not g:
-                    raise Exception("Group not found")
-                office_id = g.office_id
-                group_id = override_group_id
-            else:
-                nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-                if not nurse or not nurse.group:
-                    raise Exception("User group information not found")
-                office_id = nurse.group.office_id
-                group_id = current_user.group_id
-
-            mid_shift = Shift(
-                shift_id="M",
-                office_id=office_id,
-                group_id=group_id,
-                name="미드",
-                color="#E6A817",
-                start_time="09:00",
-                end_time="17:00",
-                type="근무",
-                allday=0,
-                auto_schedule=1,
-                duration=None,
-                sequence=5,
-                default_shift="M",
-                shift_gb="미드",
-            )
-            db.add(mid_shift)
-            db.commit()
-            _append_shift_manage_code(
-                db=db,
-                office_id=office_id,
-                group_id=group_id,
-                shift_id="M",
-                shift_gb="미드",
-            )
-            shifts = db.query(Shift).filter(Shift.group_id == target_group_id).order_by(Shift.sequence.asc()).all()
-        return [
-            {
-                "shift_id": shift.shift_id,
-                "name": shift.name,
-                "color": shift.color,
-                "start_time": shift.start_time,
-                "end_time": shift.end_time,
-                "type": shift.type,
-                "allday": shift.allday,
-                "auto_schedule": shift.auto_schedule,
-                "duration": shift.duration,
-                "sequence": shift.sequence,
-                "shift_gb": getattr(shift, "shift_gb", None),
-                "default_shift" : shift.default_shift,
-                "id": shift.id,
-                # time_display는 라우터에서 포맷팅 함수로 처리할 수 있음
-            }
-            for shift in shifts
-        ]
-    else:
-        # 기본 시프트 자동 생성
-        if override_group_id:
-            g = db.query(Group).filter(Group.group_id == override_group_id).first()
-            if not g:
-                raise Exception("Group not found")
-            office_id = g.office_id
-            group_id = override_group_id
-        else:
-            nurse = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
-            if not nurse or not nurse.group:
-                raise Exception("User group information not found")
-            office_id = nurse.group.office_id
-            group_id = current_user.group_id
-
-        def _hhmm(t: str | None) -> str | None:
-            """HH:MM:SS → HH:MM 포맷으로 보정."""
-            if not t:
-                return None
-            if len(t) >= 5 and ":" in t:
-                parts = t.split(":")
-                if len(parts) >= 2:
-                    return f"{parts[0]}:{parts[1]}"
-            return t
-
-        defaults = [
-            # shift_id, name, color, start, end, type, allday, auto_schedule, duration, sequence, default_shift, shift_gb
-            ("O", "Off", "#ffa0d2", None, None, "휴무", 1, 1, None, 5, "O", "O"),
-            ("E", "Evening", "#72bfff", "14:00:00", "22:00:00", "근무", 0, 1, None, 2, "E", "이브닝"),
-            ("N", "Night", "#bab0f0", "22:00:00", "06:00:00", "근무", 0, 1, None, 3, "N", "나이트"),
-            ("D", "Day", "#59dbd7", "06:00:00", "14:00:00", "근무", 0, 1, None, 1, "D", "데이"),
-            ("M", "미드", "#E6A817", "09:00:00", "17:00:00", "근무", 0, 1, None, 4, "M", "미드"),
-        ]
-
-        created = []
-        for sid, name, color, st, et, typ, allday, auto_s, dur, seq, default_shift, shift_gb in defaults:
-            new_shift = Shift(
-                shift_id=sid,
-                office_id=office_id,
-                group_id=group_id,
-                name=name,
-                color=color,
-                start_time=_hhmm(st),
-                end_time=_hhmm(et),
-                type=typ,
-                allday=allday,
-                auto_schedule=auto_s,
-                duration=dur,
-                sequence=seq,
-                default_shift=default_shift,
-                shift_gb=shift_gb,
-            )
-            db.add(new_shift)
-            created.append(new_shift)
-        db.commit()
-        for shift in created:
-            _append_shift_manage_code(
-                db=db,
-                office_id=office_id,
-                group_id=group_id,
-                shift_id=shift.shift_id,
-                shift_gb=getattr(shift, "shift_gb", None),
-            )
-        # 정렬된 결과 반환
-        created_sorted = db.query(Shift).filter(Shift.group_id == group_id).order_by(Shift.sequence.asc()).all()
-        return [
-            {
-                "shift_id": shift.shift_id,
-                "name": shift.name,
-                "color": shift.color,
-                "start_time": shift.start_time,
-                "end_time": shift.end_time,
-                "type": shift.type,
-                "allday": shift.allday,
-                "auto_schedule": shift.auto_schedule,
-                "duration": shift.duration,
-                "sequence": shift.sequence,
-                "shift_gb": getattr(shift, "shift_gb", None),
-                "default_shift": shift.default_shift,
-            }
-            for shift in created_sorted
-        ]
-
-
 def add_shift_service(req, current_user, db, override_group_id: str | None = None):
     """
     시프트 등록 서비스 함수
@@ -468,6 +311,7 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         # 추가
         show_in_preference=getattr(req, "show_in_preference", False), # 프론트 미 전송 시 False
         off_swap_target=bool(getattr(req, "off_swap_target", False) or False),
+        description=getattr(req, "description", None),
     )
     db.add(new_shift)
     db.commit()
@@ -487,6 +331,7 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
             "color": new_shift.color,
             "sequence": new_shift.sequence,
             "shift_gb": new_shift.shift_gb,
+            "description": new_shift.description,
         }
     }
 
@@ -535,6 +380,8 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     # 초과 OFF 변환 타깃 업데이트 (None 이면 기존 값 유지)
     if hasattr(req, "off_swap_target") and req.off_swap_target is not None:
         existing_shift.off_swap_target = bool(req.off_swap_target)
+    # 근무코드 설명 업데이트 — 프론트가 빈 값을 null 로 전송하므로 클리어 허용(항상 반영).
+    existing_shift.description = getattr(req, "description", None)
     db.commit()
     db.refresh(existing_shift)
     _append_shift_manage_code(
@@ -554,6 +401,7 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
             "color": existing_shift.color,
             "sequence": existing_shift.sequence,
             "shift_gb": existing_shift.shift_gb,
+            "description": existing_shift.description,
         }
     }
 
