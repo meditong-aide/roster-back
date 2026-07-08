@@ -46,6 +46,10 @@ class SkillSpec:
     # category 인지"를 모른다(신규 스킬 어휘 미학습) → tool 이 조용히 미검색된다.
     # 이 필드가 그 vocabulary 갭을 메운다.
     trigger_hint: str = ""
+    # postcondition: 실행 성공 조건(5요소의 '검증' 게이트). 스킬이 error 없이 반환해도
+    # 이 predicate 가 False 면 VERIFICATION_FAILED 로 승격(silent 부분실패 차단).
+    # None 이면 검증 스킵. middleware.execute_skill 가 소비.
+    postcondition: Callable[[Any], bool] | None = None
 
 
 # name → SkillSpec. @skill 이 채운다.
@@ -61,6 +65,7 @@ def skill(
     hn_only: bool = False,
     grounds: tuple[str, ...] | list[str] = (),
     trigger_hint: str = "",
+    postcondition: Callable[[Any], bool] | None = None,
 ) -> Callable[[SkillFunc], SkillFunc]:
     """스킬 단일 소스 등록 데코레이터.
 
@@ -84,6 +89,7 @@ def skill(
             hn_only=hn_only,
             grounds=tuple(grounds),
             trigger_hint=trigger_hint,
+            postcondition=postcondition,
         )
         SKILL_SPECS[name] = spec
         # 기존 dispatch 재사용 — run_skill 이 그대로 찾는다.

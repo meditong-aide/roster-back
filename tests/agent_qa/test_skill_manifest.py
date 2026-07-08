@@ -145,3 +145,60 @@ def test_manifest_specs_schema_name_consistency():
     """모든 SkillSpec 의 schema['name'] 이 spec.name 과 일치 — 구조 불변식."""
     for name, spec in SKILL_SPECS.items():
         assert spec.schema.get("name") == name == spec.name
+
+
+# ── postcondition 검증 게이트 (5요소의 '검증') ────────────────
+
+_PC_NAME = "manifest_postcond_skill"
+_PC_SCHEMA = {"name": _PC_NAME, "parameters": {"type": "object", "properties": {}}}
+
+
+def test_postcondition_failure_becomes_verification_failed():
+    from agents_v2.errors import ErrorType, classify
+    from agents_v2.middleware import execute_skill
+
+    @skill(_PC_NAME, _PC_SCHEMA, postcondition=lambda d: d.get("count", 0) > 0)
+    def _h(db, params):
+        return {"count": 0}  # error 없지만 성공조건(count>0) 미충족
+
+    try:
+        res = execute_skill(None, _PC_NAME, {}, _ctx("HN"))
+        assert res.data.get("verification_failed") is True
+        assert classify(res.data) is ErrorType.VERIFICATION_FAILED
+        # 미들웨어 trace 에 verification 스텝 기록
+        assert any(s.name == "verification" for s in res.middleware_steps)
+    finally:
+        SKILL_SPECS.pop(_PC_NAME, None)
+        SKILL_REGISTRY.pop(_PC_NAME, None)
+
+
+def test_postcondition_pass_returns_result():
+    from agents_v2.errors import ErrorType, classify
+    from agents_v2.middleware import execute_skill
+
+    @skill(_PC_NAME, _PC_SCHEMA, postcondition=lambda d: d.get("count", 0) > 0)
+    def _h(db, params):
+        return {"count": 5}
+
+    try:
+        res = execute_skill(None, _PC_NAME, {}, _ctx("HN"))
+        assert res.data == {"count": 5}
+        assert classify(res.data) is ErrorType.OK
+    finally:
+        SKILL_SPECS.pop(_PC_NAME, None)
+        SKILL_REGISTRY.pop(_PC_NAME, None)
+
+
+def test_no_postcondition_skips_gate():
+    from agents_v2.middleware import execute_skill
+
+    @skill(_PC_NAME, _PC_SCHEMA)  # postcondition 없음
+    def _h(db, params):
+        return {"count": 0}
+
+    try:
+        res = execute_skill(None, _PC_NAME, {}, _ctx("HN"))
+        assert res.data == {"count": 0}  # 검증 스킵 → 그대로 통과
+    finally:
+        SKILL_SPECS.pop(_PC_NAME, None)
+        SKILL_REGISTRY.pop(_PC_NAME, None)

@@ -35,20 +35,23 @@ class ErrorType(str, Enum):
     CLARIFICATION = "clarification"          # 1급 — 모호, 사용자 선택 필요
     PERMISSION_DENIED = "permission_denied"  # 1급 — 권한 차단
     PREVIEW = "preview"                      # mutation 미리보기 (승인 대기)
+    VERIFICATION_FAILED = "verification_failed"  # postcondition 위반 (성공조건 미충족)
     GENERIC_ERROR = "generic_error"          # 그 외 "error" 키를 가진 실패
 
 
 def classify(data: Any) -> ErrorType:
     """스킬 결과 data → outcome 타입 (data 기반 단일 분류).
 
-    우선순위: permission_denied → generic error → clarification → preview → ok.
-    permission_denied 결과는 {"error": ..., "permission_denied": True} 형태(=error 이면서
-    동시에 permission)라 permission 을 먼저 본다. 이 순서가 기존 루프 분기 순서와 동치.
+    우선순위: permission_denied → verification_failed → generic error → clarification
+    → preview → ok. permission_denied·verification_failed 결과는 "error" 키도 갖는 형태라
+    generic error 보다 먼저 본다(더 구체적인 분류 우선).
     """
     if not isinstance(data, dict):
         return ErrorType.OK
     if data.get("permission_denied") is True:
         return ErrorType.PERMISSION_DENIED
+    if data.get("verification_failed") is True:
+        return ErrorType.VERIFICATION_FAILED
     if "error" in data:
         return ErrorType.GENERIC_ERROR
     if data.get("needs_clarification") is True:

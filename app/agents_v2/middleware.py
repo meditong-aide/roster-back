@@ -19,6 +19,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from agents_v2.errors import ErrorType, classify
 from agents_v2.grounding.internal import (
     resolve_date,
     resolve_date_range,
@@ -232,6 +233,32 @@ def execute_skill(
         steps.append(MiddlewareStep("execution", "error", detail=str(e)))
         status = "ERROR"
         err_msg = str(e)
+
+    # ── ④b Postcondition 검증 (5요소의 '검증' 게이트) ──
+    # 매니페스트 스킬이 postcondition 을 선언했고, error/preview/clarification 이 아닌
+    # 완료 결과(classify OK)인데 성공조건을 통과 못 하면 VERIFICATION_FAILED 로 승격한다.
+    # silent 부분실패(error 없이 반환했으나 실제로 성립 안 함)를 차단.
+    if status == "SUCCESS" and classify(result) is ErrorType.OK:
+        from agents_v2.skills.manifest import SKILL_SPECS, load_manifest_skills
+
+        load_manifest_skills()
+        spec = SKILL_SPECS.get(skill_name.replace("-", "_"))
+        if spec is not None and spec.postcondition is not None:
+            try:
+                passed = bool(spec.postcondition(result))
+            except Exception as e:  # noqa: BLE001
+                passed = False
+                logger.warning("[middleware] postcondition raised for %s: %s", skill_name, e)
+            if not passed:
+                result = {
+                    "error": "실행 결과가 성공 조건(postcondition)을 통과하지 못했습니다.",
+                    "verification_failed": True,
+                }
+                steps.append(
+                    MiddlewareStep("verification", "block", detail="postcondition failed")
+                )
+                status = "VERIFICATION_FAILED"
+                err_msg = "postcondition failed"
 
     dt = (time.time() - t0) * 1000
     _write_skill_audit(db, ctx, skill_name, args, status, err_msg, dt)

@@ -299,6 +299,10 @@ def _cancel(db: Session, params: dict) -> Any:
     hn_only=True,
     grounds=["nurse_name", "target_ward"],
     trigger_hint="간호사 파견(다른 병동으로 임시 근무) 등록·취소, 파견자 명단/현황 조회, 병동 배정",
+    # 검증(5요소): 완료 결과는 조회(assignments/dispatches) 또는 실행 성공(ok=True) 이어야.
+    # error/preview/clarification 은 classify 단계에서 이미 걸러져 여기 안 옴.
+    postcondition=lambda d: isinstance(d, dict)
+    and (d.get("ok") is True or "assignments" in d or "dispatches" in d),
 )
 def manage_assignment(db: Session, params: dict) -> Any:
     op = (params.get("operation") or "list").lower()
