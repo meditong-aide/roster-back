@@ -1218,7 +1218,11 @@ async def invoke_and_persist_wanted_service(
                 year=req.year,
                 month=req.month,
                 allowed_shifts=", ".join(allowed_shift_map.keys()),
-                allowed_shift_map=allowed_shift_map
+                allowed_shift_map=allowed_shift_map,
+                # 원티드 agent LLM 사용량을 agent_llm_usage(purpose='wanted')로 통합 적재.
+                db=db,
+                group_id=group_id,
+                user_id=nurse_id,
             )
             if isinstance(raw_response, str):
                 raw_response = json.loads(raw_response)

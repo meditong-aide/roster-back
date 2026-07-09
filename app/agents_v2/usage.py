@@ -75,6 +75,39 @@ def record_llm_usage(
         logger.warning("[usage] llm usage insert failed: %s", e)
 
 
+def record_graph_usage(
+    db: Session,
+    *,
+    group_id: str | None,
+    user_id: str | None,
+    usage_metadata: dict | None,
+    purpose: str = "wanted",
+    conversation_id: str | None = None,
+) -> None:
+    """LangChain UsageMetadataCallbackHandler.usage_metadata → agent_llm_usage 적재.
+
+    원티드 agent(app/agents, LangGraph)의 LLM 사용량을 agents_v2 와 같은 테이블로 통합해
+    사용량 대시보드(by=purpose)에서 함께 보이게 한다. usage_metadata 형식:
+        {model_name: {"input_tokens": N, "output_tokens": N, "total_tokens": N, ...}, ...}
+    모델별 1행. 실패해도 호출 흐름에 영향 X (record_llm_usage 가 has_table 가드 + graceful).
+    """
+    if not usage_metadata or not group_id:
+        return
+    for model, m in usage_metadata.items():
+        if not isinstance(m, dict):
+            continue
+        record_llm_usage(
+            db,
+            conversation_id=conversation_id,
+            group_id=group_id,
+            user_id=user_id,
+            model=model,
+            purpose=purpose,
+            input_tokens=int(m.get("input_tokens", 0) or 0),
+            output_tokens=int(m.get("output_tokens", 0) or 0),
+        )
+
+
 def usage_summary(
     db: Session,
     *,

@@ -89,3 +89,35 @@ def test_empty_usage_ok(db):
     res = get_usage(by="group", days=None, current_user=_adm(), db=db)
     assert res["rows"] == []
     assert res["total"]["cost_usd"] == 0
+
+
+# ── 원티드 agent 통합: record_graph_usage (LangChain usage_metadata → agent_llm_usage) ──
+
+
+def test_record_graph_usage_creates_rows_per_model(db):
+    from agents_v2.usage import record_graph_usage
+
+    usage_metadata = {
+        "gpt-4o": {"input_tokens": 1500, "output_tokens": 300, "total_tokens": 1800},
+        "claude-haiku-4-5": {"input_tokens": 500, "output_tokens": 100},
+    }
+    record_graph_usage(db, group_id="GRP001", user_id="N001",
+                       usage_metadata=usage_metadata, purpose="wanted")
+
+    rows = db.query(AgentLlmUsage).filter(AgentLlmUsage.purpose == "wanted").all()
+    assert len(rows) == 2  # 모델별 1행
+    assert {r.model for r in rows} == {"gpt-4o", "claude-haiku-4-5"}
+    assert sum(r.input_tokens for r in rows) == 2000
+
+    # 대시보드 by=purpose 에 원티드가 잡힘
+    res = get_usage(by="purpose", days=None, current_user=_adm(), db=db)
+    assert "wanted" in {r["key"] for r in res["rows"]}
+
+
+def test_record_graph_usage_noop_on_empty(db):
+    from agents_v2.usage import record_graph_usage
+
+    record_graph_usage(db, group_id="GRP001", user_id="N", usage_metadata=None, purpose="wanted")
+    record_graph_usage(db, group_id=None, user_id="N",
+                       usage_metadata={"m": {"input_tokens": 1}}, purpose="wanted")
+    assert db.query(AgentLlmUsage).count() == 0
