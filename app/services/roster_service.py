@@ -778,6 +778,17 @@ def get_prev_month_tail_service(
         _target_prev_cache[_t_gid] = _out
         return _out
 
+    def _coerce_date(v):
+        """date/datetime/문자열(날짜 또는 'YYYY-MM-DD HH:MM:SS' 등) → date. None 안전."""
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        # 문자열: 시간 포함 datetime 문자열도 앞 10자(YYYY-MM-DD)로 파싱
+        return date.fromisoformat(str(v)[:10])
+
     nurse_list = []
     for nurse in nurses:
         shifts = {
@@ -788,8 +799,11 @@ def get_prev_month_tail_service(
         _a_list = _prev_assignments.get(nurse.nurse_id, [])
         nurse_assignments: list[dict] = []
         for _a in _a_list:
-            _a_start = date.fromisoformat(_a["start_date"]) if isinstance(_a["start_date"], str) else _a["start_date"]
-            _a_end = date.fromisoformat(_a["end_date"]) if _a.get("end_date") else None
+            _a_start = _coerce_date(_a.get("start_date"))
+            _a_end = _coerce_date(_a.get("end_date"))
+            if _a_start is None:
+                # start_date 없는 비정상 행은 건너뜀(비교 불가)
+                continue
             _overlap_days: list[int] = []
             for d in tail_day_list:
                 _cell_date = date(prev_year, prev_month, d)
