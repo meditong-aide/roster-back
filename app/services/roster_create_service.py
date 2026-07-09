@@ -467,6 +467,32 @@ def _ensure_grade1_default(constraints: dict | None) -> dict:
     return out
 
 
+def _group_has_graded_nurses(db: Session, office_id: str, group_id: str) -> bool:
+    """그룹에 등급(grade)이 하나라도 부여된 재직 간호사가 있는지.
+
+    [GRADE_DEFAULT_111] 기본 grade-1 floor 는 채울 등급 간호사가 있어야 의미가 있다.
+    등급 전무(nurses.grade 전부 NULL + nurse_grade_period 없음)면 floor 를 걸어도 충족 불가능
+    (cascade 흘릴 하위 등급도 없음) → 스퍼리어스 '등급 최소인원 부족'만 남는다. 이 경우 floor 를 생략.
+    조회 실패 시엔 보수적으로 True(기존 동작=floor 주입) 반환.
+    """
+    try:
+        r = db.execute(
+            text("SELECT TOP 1 1 FROM nurses "
+                 "WHERE office_id = :o AND group_id = :g AND active = 1 AND grade IS NOT NULL"),
+            {"o": office_id, "g": group_id},
+        ).fetchone()
+        if r:
+            return True
+        r2 = db.execute(
+            text("SELECT TOP 1 1 FROM nurse_grade_period WHERE group_id = :g"),
+            {"g": group_id},
+        ).fetchone()
+        return bool(r2)
+    except Exception as e:
+        print(f"[GradeConfig][WARN] graded-nurse 조회 실패, 기본 floor 유지: {e}")
+        return True
+
+
 def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict:
     """그룹의 Grade 설정을 엔진 전달용 dict로 구성한다.
 
@@ -474,11 +500,14 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
         - DB에 설정이 없으면 기본값을 반환한다(grade-1 D/E/N 각 1 floor).
         - Grade 제약은 `cp_sat_basic`에서 grade_strategy="GRADE/COMBINED"일 때 적용된다.
     """
+    has_grades = _group_has_graded_nurses(db, office_id, group_id)
+
     def _default() -> dict:
         return {
             "use_dynamic_scaling": True,
             "allow_soft_fallback": True,
-            "constraints_json": _ensure_grade1_default({}),
+            # 등급 간호사가 있을 때만 grade-1 floor 주입. 전무 그룹은 grade 제약 생략(스퍼리어스 방지).
+            "constraints_json": _ensure_grade1_default({}) if has_grades else {},
             "constraints_max_json": {},
         }
 
@@ -528,13 +557,13 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     if not row:
         return _default()
 
+    _cj_raw = _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json")
     return {
         "use_dynamic_scaling": bool(getattr(row, "use_dynamic_scaling", True)),
         "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
-        # [GRADE_DEFAULT_111] 등록 config 에도 grade-1 D/E/N 각 1 floor 를 보장.
-        "constraints_json": _ensure_grade1_default(
-            _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json")
-        ),
+        # [GRADE_DEFAULT_111] 등록 config 에도 grade-1 floor 보장 — 단 등급 간호사가 있을 때만.
+        #   등급 전무 그룹은 등록값을 그대로 둬(floor 미주입) 스퍼리어스 위반을 막는다.
+        "constraints_json": (_ensure_grade1_default(_cj_raw) if has_grades else _cj_raw),
         "constraints_max_json": _safe_json_obj(getattr(row, "constraints_max_json_text", None), "constraints_max_json"),
     }
 
