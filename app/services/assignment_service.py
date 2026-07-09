@@ -1033,22 +1033,28 @@ def group_members_in_month(
                 inbound[nid] = a
             elif a.source_group_id == group_id and a.target_group_id != group_id:
                 outbound[nid] = a
-        elif a.reason in ("휴직", "퇴사") and a.source_group_id == group_id:
+        elif a.reason == "휴직" and a.source_group_id == group_id:
+            # 퇴사는 assignment 를 보지 않는다 — nurses.resignation_date 단독 SSOT (아래 home 루프에서 판정).
             leave[nid] = a
 
+    # home = active=1 재직자 + 퇴사자(resignation_date 존재). 퇴사자는 프로드에서 active=0 으로
+    #   비활성화될 수도 있으므로(프론트가 퇴사 시 active 토글 병행하는 케이스) active 조건만으로
+    #   거르지 않는다. 정확한 월 판정(퇴사月=표시 / 그 외 비활성=제외)은 아래 루프가 수행한다.
     if nurse_pool is not None:
         # 호출자가 이미 로드한 nurse 재사용 → home 조회 쿼리 제거.
-        #   SQL(group_id==group_id AND active==1) 과 동치인 in-memory 필터.
         home = [
             n
             for n in nurse_pool.values()
             if str(getattr(n, "group_id", "") or "").strip() == str(group_id or "").strip()
-            and getattr(n, "active", None) == 1
+            and (getattr(n, "active", None) == 1 or getattr(n, "resignation_date", None) is not None)
         ]
     else:
         home = (
             db.query(NurseModel)
-            .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
+            .filter(
+                NurseModel.group_id == group_id,
+                or_(NurseModel.active == 1, NurseModel.resignation_date.isnot(None)),
+            )
             .all()
         )
 
@@ -1126,7 +1132,7 @@ def group_members_in_month(
         return v if v is not None else (1 if getattr(n_obj, "is_weekend_off", False) else 0)
 
     def _row(n, status, marker, badge, team, grade, night_profile=...,
-             weekend_off=..., fixed_shift=...):
+             weekend_off=..., fixed_shift=..., resign_date=None):
         # N전담(허용 shift=N뿐) 판정 → 'N전담' 배지 + is_night_dedicated.
         # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.allowed_shifts 가
         #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
@@ -1150,6 +1156,10 @@ def group_members_in_month(
             "as_of_weekend_off": _wo,
             "as_of_fixed_shift": _fx,
             "as_of_preceptor": _preceptor_asof.get(str(n.nurse_id)),  # 월 as-of 프리셉터(종료월엔 None)
+            # 퇴사月(status=='resigned')에만 채워지는 월 스코프 퇴사 정보(nurses.resignation_date SSOT).
+            # 그 외 월/상태는 None. 프론트는 이 값이 있으면 해당 일자에 퇴사 표시.
+            "resign_date": resign_date.isoformat() if resign_date is not None else None,
+            "resign_reason": getattr(n, "resignation_reason", None) if resign_date is not None else None,
         }
 
     members: list[dict] = []
@@ -1157,12 +1167,28 @@ def group_members_in_month(
     for n in home:
         nid = str(n.nurse_id)
         seen.add(nid)
+        # 퇴사: nurses.resignation_date 단독 SSOT (assignment 미참조).
+        #   resign < 월초  → 퇴사 다음 달부터 명단 완전 제외 (_active_range_in_month 와 동일 규칙)
+        #   월초 <= resign <= 월말 → 퇴사月: status='resigned' + 퇴사일 표시
+        #   resign > 월말(미래) → 아직 재직 → 아래 일반 분기로 진행
+        _resign = getattr(n, "resignation_date", None)
+        _resign_d = _resign.date() if hasattr(_resign, "date") else _resign
+        if _resign_d is not None and _resign_d < month_start:
+            continue  # 퇴사 다음 달부터 명단 완전 제외
+        _resign_this_month = _resign_d is not None and _resign_d <= month_end
+        # active=0(비활성)은 '이 달 퇴사자' 일 때만 표시. 그 외 비활성(미래 퇴사·수동 비활성 등)은
+        #   명단에서 제외 — home 을 (active OR resignation) 으로 넓게 로드했으므로 여기서 정리한다.
+        if getattr(n, "active", None) != 1 and not _resign_this_month:
+            continue
         team = _resolved_team(nid, n)
         grade = _asof_grade(nid, n)      # 월 as-of (gap→nurses.grade)
         _np = _asof_night(nid, n)        # 월 as-of 전담 프로필 (gap→nurses.allowed_shifts)
         _wo = _asof_weekend(nid, n)      # 월 as-of 주말휴무 (gap→nurses.is_weekend_off)
         _fx = _asof_fixed(nid, n)        # 월 as-of 고정근무 (gap→nurses.fixed_shift)
         _kw = dict(night_profile=_np, weekend_off=_wo, fixed_shift=_fx)
+        if _resign_this_month:
+            members.append(_row(n, "resigned", None, "퇴사", team, grade, resign_date=_resign_d, **_kw))
+            continue
         if nid in outbound:
             a = outbound[nid]
             if a.reason == "병동이동":
@@ -1172,11 +1198,8 @@ def group_members_in_month(
             else:  # 파견 나감 — home 유지
                 members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, **_kw))
         elif nid in leave:
-            a = leave[nid]
-            if a.reason == "퇴사":
-                members.append(_row(n, "resigned", None, "퇴사", team, grade, **_kw))
-            else:
-                members.append(_row(n, "leave", None, "휴직", team, grade, **_kw))
+            # leave 에는 이제 휴직만 담긴다(퇴사는 위 resignation_date 분기에서 처리).
+            members.append(_row(n, "leave", None, "휴직", team, grade, **_kw))
         else:
             members.append(_row(n, "active", None, None, team, grade, **_kw))
 

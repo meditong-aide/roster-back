@@ -298,6 +298,9 @@ def attach_member_badges_to_nurses(
             "as_of_grade": member.get("as_of_grade"),
             "is_night_dedicated": member.get("is_night_dedicated"),
             "display_group_id": group_id,
+            # 월 스코프 퇴사 정보 — 퇴사月에만 채워지고, 다음 달엔 member 자체가 없어 자연 소멸.
+            "resign_date": member.get("resign_date"),
+            "resign_reason": member.get("resign_reason"),
         }
     # 역방향 일관성: 프리셉터의 preceptees 목록도 월 as-of 로 필터(종료된 관계 제외).
     #   forward(preceptor_id)와 동일 SSOT(nurse_preceptee_period) — 공통 헬퍼 재사용.
