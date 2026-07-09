@@ -50,7 +50,6 @@ from services.assignment_service import (
     get_assignments,
     get_assignment_status_counts,
     flush_pending_transfers,
-    flush_expired_preceptees,
     flush_expired_dispatches,
     flush_expired_leaves,
     preview_assignment_impact,
@@ -309,6 +308,35 @@ async def get_group_members_in_month(
     return group_members_in_month(db, gid, year, month)
 
 
+@router.get("/preceptee-periods")
+async def get_preceptee_periods(
+    group_id: str,
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """그 달과 겹치는 프리셉티 구간 목록 (로스터 생성/뷰 프리셉티 표시용, period SSOT).
+
+    반환: {"items": [{nurse_id, preceptor_id, start_date, expected_end_date(inclusive)}]}.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    managed = set(resolve_managed_group_ids(db, current_user))
+    if group_id not in managed:
+        raise HTTPException(status_code=403, detail="해당 그룹에 접근 권한이 없습니다.")
+    from services.preceptee_period import list_preceptee_periods_for_month
+    nurse_ids = [
+        nid for (nid,) in db.query(NurseModel.nurse_id)
+        .filter(NurseModel.group_id == group_id, NurseModel.active == 1).all()
+    ]
+    items = list_preceptee_periods_for_month(db, nurse_ids, int(year), int(month))
+    return JSONResponse(
+        content=jsonable_encoder({"items": items}),
+        media_type="application/json; charset=utf-8",
+    )
+
+
 @router.get("", response_model=List[NurseProfile])
 async def get_nurses_in_group(
     office_id: Optional[str] = None,
@@ -329,8 +357,7 @@ async def get_nurses_in_group(
     # 병동이동 레이지 체크
     if _group:
         flush_pending_transfers(db, _group)
-    # 프리셉티 만료 레이지 체크
-    flush_expired_preceptees(db)
+    # [도려내기] 프리셉티 만료 레이지 체크 제거 — period as-of resolver 가 자동 처리.
     # 파견 만료 레이지 체크 (status change only, 안전 작업)
     flush_expired_dispatches(db)
     # 휴직 만료 레이지 체크 (status change only, 안전 작업)

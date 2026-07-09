@@ -26,6 +26,19 @@ def _active_days_map(join: list[int], leave: list[int], blocked_by_nurse: dict[i
     return out
 
 
+def _preceptor_id_from_period(rs, idx: int) -> str | None:
+    """period SSOT(preceptee_preceptor_idx: 프리셉티 idx→프리셉터 idx)에서 프리셉터 nurse_id.
+
+    캐시(nurses.preceptor_id) 미사용 — 온톨로지 관계도 period 유래로 일원화.
+    """
+    pmap = getattr(rs, "preceptee_preceptor_idx", {}) or {}
+    p = pmap.get(idx)
+    if p is None or not (0 <= p < len(rs.nurses)):
+        return None
+    pn = rs.nurses[p]
+    return str(getattr(pn, "db_id", getattr(pn, "nurse_id", p)))
+
+
 def _collect_nurse_facts(rs, join: list[int], leave: list[int]) -> list[NurseFact]:
     use_mid = bool(getattr(rs.config, "use_mid", False))
     facts: list[NurseFact] = []
@@ -45,7 +58,7 @@ def _collect_nurse_facts(rs, join: list[int], leave: list[int]) -> list[NurseFac
                 grade=grade_val,
                 is_weekend_off=bool(getattr(nurse, "is_weekend_off", False)),
                 allowed_shift_codes=set(allowed),
-                preceptor_id=str(getattr(nurse, "preceptor_id", "")) or None,
+                preceptor_id=_preceptor_id_from_period(rs, idx),
                 is_inbound=bool(getattr(nurse, "is_inbound", False)),
                 join_day=join[idx],
                 leave_day=leave[idx],
@@ -82,20 +95,30 @@ def _collect_fixed_cells(snapshot_year: int, snapshot_month: int, rs, fixed_type
 
 
 def _collect_preceptee_facts(rs, active_days_by_nurse: dict[int, set[int]], coverage_exclude_cells: set[tuple[int, int]]) -> list[PrecepteeFact]:
-    id_to_idx = {str(getattr(n, "db_id", getattr(n, "nurse_id", i))): i for i, n in enumerate(rs.nurses)}
+    """프리셉티 fact = nurse_preceptee_period(SSOT) 유래 엔진 맵에서 생성(캐시 preceptor_id 안 봄).
+
+    rs.preceptee_follow_days: {preceptee_idx: set(follow day_idx)} — 그 달 겹치는 구간.
+    rs.preceptee_preceptor_idx: {preceptee_idx: preceptor_idx} — WHO.
+    days 가 비면 그 달 프리셉티 아님(제외). period 는 항상 명시적 days → full_month_default=False.
+    """
     follow_days_raw = getattr(rs, "preceptee_follow_days", {}) or {}
+    preceptor_idx_map = getattr(rs, "preceptee_preceptor_idx", {}) or {}
     preceptee_shift_count = bool(getattr(rs.config, "preceptee_shift_count", True))
     follow_enabled = bool(getattr(rs.config, "preceptee_on", False))
     pte_fw = getattr(rs, "_preceptee_fixed_wanted_map", {}) or {}
     out: list[PrecepteeFact] = []
-    for idx, nurse in enumerate(rs.nurses):
-        pid = getattr(nurse, "preceptor_id", None)
-        if not pid:
+    for idx, days in follow_days_raw.items():
+        follow_days = set(days or set())
+        if not follow_days:
+            continue  # 그 달 프리셉티 아님(종료/미겹침)
+        if not (0 <= idx < len(rs.nurses)):
             continue
-        pid_str = str(pid)
-        p_idx = id_to_idx.get(pid_str)
-        follow_days = set(follow_days_raw.get(idx, set()) or set())
-        full_month_default = idx not in follow_days_raw
+        nurse = rs.nurses[idx]
+        p_idx = preceptor_idx_map.get(idx)
+        preceptor_id = None
+        if p_idx is not None and 0 <= p_idx < len(rs.nurses):
+            pn = rs.nurses[p_idx]
+            preceptor_id = str(getattr(pn, "db_id", getattr(pn, "nurse_id", p_idx)))
         override_days = {d for (n, d), _ in pte_fw.items() if n == idx}
         counts_to_coverage = preceptee_shift_count and not any((idx, d) in coverage_exclude_cells for d in active_days_by_nurse.get(idx, set()))
         out.append(
@@ -103,10 +126,10 @@ def _collect_preceptee_facts(rs, active_days_by_nurse: dict[int, set[int]], cove
                 nurse_index=idx,
                 nurse_id=str(getattr(nurse, "db_id", getattr(nurse, "nurse_id", idx))),
                 preceptor_index=p_idx,
-                preceptor_id=pid_str,
+                preceptor_id=preceptor_id,
                 follow_enabled=follow_enabled,
                 follow_days=follow_days,
-                full_month_default_follow=full_month_default,
+                full_month_default_follow=False,  # period SSOT: 항상 명시적 days
                 counts_to_coverage=counts_to_coverage,
                 fixed_wanted_override_days=override_days,
             )

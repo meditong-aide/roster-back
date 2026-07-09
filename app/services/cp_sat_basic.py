@@ -1421,7 +1421,9 @@ class CPSATBasicEngine:
             preceptor_pair_weight = float(getattr(config, 'pair_preference_weight', 3.0)) * 2.5
             for row in nurses_data:
                 mentee_id = row.get('nurse_id')
-                preceptor_id = row.get('preceptor_id')
+                # period SSOT(그 달 preceptor) 우선 — 캐시 preceptor_id 는 폴백(authoritative 아닐 때만).
+                _pinfo = (_pte_map or {}).get(str(mentee_id)) if _pte_map else None
+                preceptor_id = (_pinfo.get("preceptor_id") if isinstance(_pinfo, dict) else None) or row.get('preceptor_id')
                 if not mentee_id or not preceptor_id:
                     continue
                 if _active_pte_ids is not None and str(mentee_id) not in _active_pte_ids:

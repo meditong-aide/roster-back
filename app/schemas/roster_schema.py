@@ -439,10 +439,21 @@ class PreceptorPeerAssignment(BaseModel):
 
 
 class PreceptorPeer(BaseModel):
-    """프리셉터 본인의 사이드 프로필에 N명 노출되는 프리셉티 1명."""
+    """프리셉터 본인의 사이드 프로필에 N명 노출되는 프리셉티 1명 (period SSOT).
+
+    식별 = nurse_id (assignment_id 폐기). 기간 = start_date/expected_end_date(inclusive).
+    """
     nurse_id: str
     name: str
-    assignment: Optional[PreceptorPeerAssignment] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+
+
+class PrecepteeSelfPeriodRead(BaseModel):
+    """이 간호사(프리셉티 본인)의 현재 유효 프리셉터 관계 + 기간 (사이드 프로필 폼 바인딩)."""
+    preceptor_id: Optional[str] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
 
 
 class NurseMembership(BaseModel):
@@ -464,6 +475,10 @@ class NurseMembership(BaseModel):
     display_group_id: Optional[str] = Field(
         default=None, description="이 membership 이 표시되는 기준 그룹(선택/조회 그룹)"
     )
+    # 월 스코프 퇴사 정보(status=='resigned' 인 퇴사月에만 채워짐, nurses.resignation_date SSOT).
+    # 다음 달부터는 명단에서 제외되어 membership 자체가 None 이므로 여기도 자연히 사라진다.
+    resign_date: Optional[str] = Field(default=None, description="퇴사일(ISO, 퇴사月에만)")
+    resign_reason: Optional[str] = Field(default=None, description="퇴사 사유(퇴사月에만)")
 
 
 class NurseProfile(BaseModel):
@@ -549,7 +564,12 @@ class NurseProfile(BaseModel):
     # 본인이 프리셉터인 경우 자기를 따르는 N명의 프리셉티. preceptee 이거나 0명이면 [].
     preceptees: List[PreceptorPeer] = Field(
         default_factory=list,
-        description="본인이 preceptor 일 때 자기를 따르는 N명. 각자 active 프리셉티 nurse_assignment 메타 포함.",
+        description="본인이 preceptor 일 때 자기를 따르는 N명(period SSOT, start/end 포함).",
+    )
+    # 본인이 프리셉티인 경우 자기 프리셉터 관계 + 기간(현재 유효). 관계 없으면 None.
+    preceptee_period: Optional[PrecepteeSelfPeriodRead] = Field(
+        default=None,
+        description="본인이 프리셉티일 때 프리셉터+기간(현재 유효, 사이드 프로필 폼 바인딩용).",
     )
     # 일괄 업데이트(POST /bulk-update) 시 동반 전달 가능한 배정 payload
     assignment: Optional[NurseAssignmentPayload] = Field(
@@ -634,19 +654,33 @@ class PersonnelUpdate(BaseModel):
 
 
 class PreceptorPeerUpdate(BaseModel):
-    """프리셉터 사이드 프로필 PATCH 시 preceptees N명 변경 1건.
+    """프리셉터 사이드 프로필 PATCH 시 preceptees N명 변경 1건 (nurse_preceptee_period 직접 write).
 
-    operation 별 필수 필드:
-    - create: target_nurse_id, start_date (assignment_id 불요)
-    - update: assignment_id (+ 선택: start_date / expected_end_date / note)
-    - cancel: assignment_id 만 필수
+    대상 식별 = **target_nurse_id** (프리셉티 1:1 이라 assignment_id 불요·폐기).
+    operation 별 필수:
+    - create/update: target_nurse_id, start_date, **expected_end_date(종료예정일 필수 — 무기한 폐지)**
+    - cancel: target_nurse_id 만
     """
     operation: Literal["create", "update", "cancel"]
     target_nurse_id: str
-    assignment_id: Optional[int] = None
+    assignment_id: Optional[int] = None  # deprecated(무시) — 하위호환 위해 수용만
     start_date: Optional[date] = None
     expected_end_date: Optional[date] = None
     note: Optional[str] = None
+
+
+class PrecepteeSelfPeriod(BaseModel):
+    """이 간호사(프로필 owner)가 **프리셉티**일 때 프리셉터+기간 지정 (preceptee-self).
+
+    nurse_preceptee_period(SSOT) 로 직접 write — assignment 미경유.
+    operation 별 필수:
+    - create/update: preceptor_id, start_date, **expected_end_date(필수 — 무기한 폐지)**
+    - cancel: (owner 의 현재/미래 구간 삭제)
+    """
+    operation: Literal["create", "update", "cancel"]
+    preceptor_id: Optional[str] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
 
 
 class NurseProfileUpdate(BaseModel):
@@ -689,7 +723,11 @@ class NurseProfileUpdate(BaseModel):
     )
     preceptees_assignment: Optional[List[PreceptorPeerUpdate]] = Field(
         default=None,
-        description="프리셉터 본인 입장에서 N명 preceptees 의 nurse_assignment(reason='프리셉티') 일괄 create/update/cancel",
+        description="프리셉터 본인 입장에서 N명 preceptees 관계를 nurse_preceptee_period 로 일괄 create/update/cancel (target_nurse_id 기반)",
+    )
+    preceptee_period: Optional[PrecepteeSelfPeriod] = Field(
+        default=None,
+        description="이 간호사가 프리셉티일 때 프리셉터+기간(start/end 필수) 지정 — nurse_preceptee_period 직접 write",
     )
 
 

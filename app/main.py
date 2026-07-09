@@ -71,19 +71,15 @@ async def _daily_flush_scheduler():
         try:
             from services.assignment_service import (
                 flush_all_pending_transfers,
-                flush_expired_preceptees,
                 flush_expired_dispatches,
                 flush_expired_leaves,
                 flush_pending_permanent_changes,
                 reconcile_nurse_attrs,
             )
-            from services.nurse_service import flush_resigned_nurses
             count = flush_all_pending_transfers(db)
             if count > 0:
                 _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
-            pte_count = flush_expired_preceptees(db)
-            if pte_count > 0:
-                _scheduler_logger.info("[Scheduler] 프리셉티 자동 해제: %d건", pte_count)
+            # [도려내기] 프리셉티 만료 flush 제거 — nurse_preceptee_period as-of resolver 가 자동 처리.
             disp_count = flush_expired_dispatches(db)
             if disp_count > 0:
                 _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
@@ -93,9 +89,12 @@ async def _daily_flush_scheduler():
             pc_count = flush_pending_permanent_changes(db)
             if pc_count > 0:
                 _scheduler_logger.info("[Scheduler] 영구 속성변경 발효: %d건", pc_count)
-            res_count = flush_resigned_nurses(db)
-            if res_count > 0:
-                _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
+            # [퇴사자 삭제 비활성화] 퇴사자는 nurses.resignation_date 로만 관리하고 레코드는 보존한다.
+            #   월 명단 노출/미노출은 group_members_in_month 가 resignation_date 로 판정(퇴사月=표시,
+            #   다음 달=제외). hard delete 하면 퇴사月 표시도 사라지고 데이터도 잃으므로 호출하지 않는다.
+            # res_count = flush_resigned_nurses(db)
+            # if res_count > 0:
+            #     _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
             # Nurses 캐시 vs NurseAssignment effective 값 정합성 점검 (read-only)
             recon = reconcile_nurse_attrs(db)
             if recon.get("mismatch_count", 0) > 0:

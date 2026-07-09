@@ -178,9 +178,18 @@ def test_n_nurse_override_includes_and_releases(ward):
 
 
 def _set_preceptor(db, preceptee, preceptor):
+    from datetime import date as _date
+    from db.models import NursePrecepteePeriod
     db.query(Nurse).filter(Nurse.nurse_id == preceptee).update(
         {"preceptor_id": preceptor}, synchronize_session=False
     )
+    # 로직은 nurse_preceptee_period(SSOT as-of) 를 읽으므로 period row 도 시드(2026-08 커버).
+    n = db.query(Nurse).filter(Nurse.nurse_id == preceptee).first()
+    db.add(NursePrecepteePeriod(
+        nurse_id=preceptee, preceptor_id=preceptor,
+        office_id=(getattr(n, "office_id", None) or "o1"),
+        valid_from=_date(2026, 8, 1), valid_to=_date(2026, 9, 1), source="test",
+    ))
     db.flush()
 
 
