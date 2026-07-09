@@ -274,6 +274,14 @@ def attach_member_badges_to_nurses(
     from datetime import date as _date_mx
     from services.mutual_exclusion_period import resolve_partner_asof as _resolve_mx_partner
     _mx_asof = _resolve_mx_partner(db, list(member_by_id.keys()), _date_mx(int(year), int(month), 1))
+    # 파트너 이름은 현재 목록(member_by_id)이 아니라 office-wide 로 조회한다.
+    #   상대가 필터/타그룹/비활성/퇴사로 목록에 없어도 이름이 깨지지 않도록(프론트 요청 완료기준 3).
+    _mx_partner_ids = {pid for pid in _mx_asof.values() if pid}
+    _mx_name_by_id = (
+        {str(nid): nm for nid, nm in db.query(NurseModel.nurse_id, NurseModel.name)
+         .filter(NurseModel.nurse_id.in_(_mx_partner_ids)).all()}
+        if _mx_partner_ids else {}
+    )
     for n in nurses:
         if not isinstance(n, dict):
             continue
@@ -292,7 +300,9 @@ def attach_member_badges_to_nurses(
         n["fixed_shift"] = member.get("as_of_fixed_shift")
         n["is_weekend_off"] = bool(member.get("as_of_weekend_off"))
         n["preceptor_id"] = member.get("as_of_preceptor")  # 월 as-of 프리셉터(종료월=None=관계 해제)
-        n["exclusion_partner_id"] = _mx_asof.get(str(n.get("nurse_id")))  # 월 as-of 상호배제 파트너
+        _mx_pid = _mx_asof.get(str(n.get("nurse_id")))
+        n["exclusion_partner_id"] = _mx_pid  # 월 as-of 상호배제 파트너
+        n["exclusion_partner_name"] = _mx_name_by_id.get(str(_mx_pid)) if _mx_pid else None
         # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
         # display_group_id = 이 membership 이 표시되는 기준 그룹(조회/선택 그룹).
         n["membership"] = {
@@ -2041,13 +2051,16 @@ def update_nurse_profile_service(
                 nurse_id, e,
             )
 
-    # source 경로에서 exclusion_partner_id 받으면 상호배제 period(양방향) 동기화.
-    if applied_source and _exclusion_field_present:
+    # 상호배제는 nurses 컬럼/period-owned 필드가 아니라 nurse_mutual_exclusion_period(SSOT).
+    #   source/target/inbound/admin 무관하게, 권한 검증 통과(여기 도달=이미 통과) 후 필드 존재 시 항상 동기화.
+    #   applied_source 게이트에 묶으면 target(인바운드) 편집에서 해제 payload 가 유실된다(period close 누락).
+    #   partner_id="..."=설정 / partner_id=None=해제. valid_from=선택월 1일(_eff_vf, year/month 미동반 시 today).
+    if _exclusion_field_present:
         try:
             from services.mutual_exclusion_period import set_mutual_exclusion
             set_mutual_exclusion(
                 db, nurse_id=nurse.nurse_id, partner_id=_exclusion_after,
-                office_id=nurse.office_id,
+                office_id=nurse.office_id, valid_from=_eff_vf,
             )
             db.commit()
             db.refresh(nurse)

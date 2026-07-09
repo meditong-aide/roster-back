@@ -1398,6 +1398,21 @@ async def get_nurse_by_id(
                 if isinstance(_nurse, dict):
                     _nurse["preceptee_period"] = _rel["preceptee_period"]
                     _nurse["preceptor_periods"] = _rel["preceptor_periods"]
+            # 상호배제: list/row(attach_member_badges)와 동일한 월 as-of(선택월 1일) 기준으로 상세에 부착.
+            #   period SSOT(nurse_mutual_exclusion_period)라 그룹 무관 — 이 간호사의 그 달 파트너를 직접 리졸브.
+            #   상세(Select 초기값)와 리스트가 같은 partner id 를 반환하도록 정합.
+            from services.mutual_exclusion_period import resolve_partner_asof
+            from datetime import date as _mx_date
+            _mx_pid = resolve_partner_asof(
+                db, [nurse_id], _mx_date(int(year), int(month), 1)
+            ).get(str(nurse_id))
+            if isinstance(_nurse, dict):
+                _nurse["exclusion_partner_id"] = _mx_pid
+                _nurse["exclusion_partner_name"] = (
+                    db.query(NurseModel.name)
+                    .filter(NurseModel.nurse_id == _mx_pid).scalar()
+                    if _mx_pid else None
+                )
         return _nurse
     except HTTPException:
         raise

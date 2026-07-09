@@ -516,6 +516,10 @@ class NurseProfile(BaseModel):
         default=None,
         description="상호 근무 배제 파트너 nurse_id(같은날 같은근무조 회피·소프트). None=해제. 미전달 시 무변경",
     )
+    exclusion_partner_name: Optional[str] = Field(
+        default=None,
+        description="상호배제 파트너 이름(exclusion_partner_id 와 동일 월 as-of, office-wide 조회). 관계 없으면 None. 읽기전용",
+    )
     joining_date: Optional[datetime] = None
     resignation_date: Optional[datetime] = None
     resignation_reason: Optional[str] = None
