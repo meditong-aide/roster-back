@@ -1137,9 +1137,9 @@ async def get_roster_by_schedule_id(
                 for _a in _a_list:
                     if _a["reason"] not in ("파견", "병동이동"):
                         continue
-                    _as = _date.fromisoformat(_a["start_date"])
-                    _ae = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
-                    if _day < _as:
+                    _as = _to_date(_a["start_date"])
+                    _ae = _to_date(_a["end_date"])
+                    if _as is None or _day < _as:
                         continue
                     if _ae is not None and _day > _ae:
                         continue
