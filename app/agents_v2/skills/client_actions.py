@@ -42,10 +42,11 @@ NAVIGATE_TARGETS: dict[str, dict[str, Any]] = {
         },
         "hn_only": True,
     },
-    # month_off: 월 오프수 제한(off_days 등 RosterConfig 정책). 전용 화면이 아직 없어
-    # 근무표 설정 탭(tab 0)에 묻혀 있는 상태 — LLM 이 의미적으로 정확히 지정할 수 있도록
-    # sub 추가하고 프론트에선 tab 0 으로 라우팅. (B 시리즈 후속, 2026-06-01)
-    "config": {"subs": {"shift_codes", "weekoff", "wanted_setting", "month_off"}, "hn_only": True},
+    # config = /roster_configure. 2026-07 dev 리팩터로 이 화면이 '근무코드 설정'(ConfTab1)
+    # 단일 뷰로 평탄화됨(탭 제거). weekoff/wanted_setting/month_off 는 roster_create 모달
+    # 등으로 이동 → config 서브에서 제거(잘못 도착 방지). 원티드 설정은 roster_create 의
+    # wanted_config 서브로 안내. (주휴/월오프의 새 위치는 확인 후 remap — 후속)
+    "config": {"subs": {"shift_codes"}, "hn_only": True},
     "mypage": {"subs": set(), "hn_only": False},
     "support": {"subs": set(), "hn_only": False},
 }

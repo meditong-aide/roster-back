@@ -1344,12 +1344,10 @@ SKILL_TOOLS: list[dict] = [
             "특정 설정을 '열어줘/설정하러 가자'면 해당 sub 로 바로 모달을 연다.\n"
             "  ⚠️ 발행/저장/삭제/빈근무표생성 같은 '실행' 요청은 sub 로 못 한다 — roster_create 로 "
             "화면만 열고(sub 없이) 사용자가 버튼을 누르게 안내하라. 단 '엑셀 다운로드'는 invoke 사용.\n"
-            "- `config` — 병동 설정 (HN/ADM 전용). "
-            "sub=`shift_codes`(근무코드)·`weekoff`(자동 주휴=weekly_off_*)·"
-            "`wanted_setting`(원티드 설정)·`month_off`(월 오프수 제한=off_days 정책, "
-            "근무표 설정 탭).\n"
-            "  ⚠️ `weekoff` ≠ `month_off`: '주휴'는 매주 자동 휴무 정책(weekly_off_enabled/weekday). "
-            "'월 오프수 제한'은 한 달 OFF 총량 정책(off_days). '오프' 단어만으로 weekoff 로 가지 말 것.\n"
+            "- `config` — 근무코드 설정 화면(=/roster_configure, HN/ADM 전용). sub=`shift_codes`. "
+            "근무표에 쓰는 코드·시간·원티드 반영 여부를 관리.\n"
+            "  ⚠️ '원티드 반영 설정'은 roster_create 의 `wanted_config` 로, '월 오프수/주휴' 등 생성 "
+            "관련 정책은 roster_create 모달로 안내하세요(config 에 더는 그 탭이 없음).\n"
             "- `mypage` — 마이페이지 / `support` — 고객센터\n\n"
 
             "예) '팀 어디서 바꿔?' → target=nurse_management, sub=team_setting\n"
@@ -1384,14 +1382,14 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "enum": [
                         "team_setting", "grade_setting",
-                        "shift_codes", "weekoff", "wanted_setting", "month_off",
+                        "shift_codes",
                         "manpower", "wanted_config", "deadline", "off_request",
                         "quick_config", "emergency", "version",
                     ],
                     "description": (
                         "화면 내 섹션/탭/모달. "
                         "nurse_management→team_setting|grade_setting, "
-                        "config→shift_codes|weekoff|wanted_setting|month_off."
+                        "config→shift_codes."
                     ),
                 },
                 "query": {
@@ -1427,7 +1425,7 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "enum": [
                         "team_setting", "grade_setting",
-                        "shift_codes", "weekoff", "wanted_setting", "month_off",
+                        "shift_codes",
                         "manpower", "wanted_config", "deadline", "off_request",
                         "quick_config", "emergency", "version",
                     ],
