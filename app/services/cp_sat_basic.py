@@ -629,7 +629,7 @@ class CPSATBasicEngine:
             # 팀별 최소 시프트 커버리지(팀 단위 per-team 제약)
             team_min_by_team=config_data.get("team_min_by_team") or {},
             team_min_soft_fallback=bool(config_data.get("team_min_soft_fallback", False)),
-            team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 500) or 0),
+            team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 80000) or 0),
             # 팀 내 인계 제한 정책(팀별)
             team_handoff_policy_by_team=config_data.get("team_handoff_policy_by_team") or {},
             team_handoff_soft_fallback=bool(config_data.get("team_handoff_soft_fallback", True)),

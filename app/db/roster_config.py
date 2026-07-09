@@ -158,7 +158,7 @@ class NurseRosterConfig:
     # 팀이 맵에 없거나 값이 {} 이면 "제약 없음".
     team_min_by_team: Dict[str, Dict[str, int]] = field(default_factory=dict)
     team_min_soft_fallback: bool = True  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
-    team_min_penalty_weight: int = 500   # 소프트 모드에서 팀 미달 슬랙 패널티
+    team_min_penalty_weight: int = 80000   # 소프트 모드 팀 미달 슬랙 패널티. grade(160000)의 절반 = 한 단계 아래
     # ── 팀 내 인계 제한(handoff restrictions) ──
     # team_handoff_policy_by_team[team_id_str] = {
     #   "restrictions": [
@@ -168,7 +168,7 @@ class NurseRosterConfig:
     # }
     team_handoff_policy_by_team: Dict[str, Dict] = field(default_factory=dict)
     team_handoff_soft_fallback: bool = True
-    team_handoff_penalty_weight: int = 80000  # grade(160000)와 team_min(500) 사이
+    team_handoff_penalty_weight: int = 80000  # grade(160000) 아래, team_min(80000)과 동급
     def __post_init__(self):
         if self.daily_shift_requirements is None:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
