@@ -297,7 +297,10 @@ async def get_group_members_in_month(
 
     소속(근무일 수 아님) 기준. 영구 전출은 그 달 미표시, 비근무 멤버는 상태 배지
     (휴직/파견 중/이동 ←→). HN multi-group: 관리 병동이면 조회 가능.
-    Returns: {"members":[{nurse_id,name,membership_status,marker,badge,as_of_team,as_of_grade}], "headcount":{regular,moving,leave}}
+    Returns: {"members":[{nurse_id,name,membership_status,marker,badge,as_of_team,as_of_grade,
+             status_start_date,status_end_date,status_reason,resign_date,resign_reason}], "headcount":{regular,moving,leave}}
+    - status_start_date/end/reason: 상태(퇴사/휴직/파견/병동이동) 적용 시작/종료일·사유(전 상태 공통·UI 표시 기준). active=None.
+      퇴사 시작일=nurses.resignation_date(퇴사月만·다음달 제외). resign_date/reason 은 퇴사 전용 하위호환 필드.
     참조: docs/TEMPORAL_NURSE_MODEL_DESIGN.md §3 정책 매트릭스.
     """
     gid = resolve_effective_group(db, current_user, group_id)

@@ -66,6 +66,12 @@ def test_membership_status_and_exclusion(seeded):
     assert by_id["leave1"]["membership_status"] == "leave" and by_id["leave1"]["badge"] == "휴직"
     # 인바운드(홈 B → A)
     assert by_id["inbound1"]["membership_status"] == "inbound" and by_id["inbound1"]["marker"] == "→"
+    # [status_* 필드] 상태 적용 시작일/사유(전 상태 공통). seeded 는 종료일 없어 status_end_date=None.
+    assert by_id["moved_mid"]["status_start_date"] == "2026-07-15" and by_id["moved_mid"]["status_reason"] == "병동이동"
+    assert by_id["dispatch1"]["status_start_date"] == "2026-07-01" and by_id["dispatch1"]["status_reason"] == "파견"
+    assert by_id["leave1"]["status_start_date"] == "2026-07-01" and by_id["leave1"]["status_reason"] == "휴직"
+    assert by_id["inbound1"]["status_start_date"] == "2026-07-01" and by_id["inbound1"]["status_reason"] == "병동이동"
+    assert by_id["active1"]["status_start_date"] is None and by_id["active1"]["status_reason"] is None
 
 
 def test_headcount_split(seeded):
@@ -129,6 +135,9 @@ def test_resignation_from_nurses_field_month_scoped(db):
     assert jul["resign1"]["badge"] == "퇴사"
     assert jul["resign1"]["resign_date"] == "2026-07-20"
     assert jul["resign1"]["resign_reason"] == "개인사유"
+    # [status_* 필드] 퇴사 시작일=resignation_date, 종료일 None, 사유='퇴사'.
+    assert jul["resign1"]["status_start_date"] == "2026-07-20" and jul["resign1"]["status_end_date"] is None
+    assert jul["resign1"]["status_reason"] == "퇴사"
     # 퇴사월 headcount: leave 버킷에 집계
     assert group_members_in_month(db, "A", 2026, 7)["headcount"]["leave"] == 1
 

@@ -479,6 +479,10 @@ class NurseMembership(BaseModel):
     # 다음 달부터는 명단에서 제외되어 membership 자체가 None 이므로 여기도 자연히 사라진다.
     resign_date: Optional[str] = Field(default=None, description="퇴사일(ISO, 퇴사月에만)")
     resign_reason: Optional[str] = Field(default=None, description="퇴사 사유(퇴사月에만)")
+    # FE 스펙(전 상태 공통): 상태 적용 시작/종료일 + 사유. 퇴사=resignation_date, 휴직/파견/병동이동=assignment.
+    status_start_date: Optional[str] = Field(default=None, description="상태 적용 시작일(ISO·UI 표시 기준). active=None")
+    status_end_date: Optional[str] = Field(default=None, description="상태 종료일(ISO, 없으면 None=지속)")
+    status_reason: Optional[str] = Field(default=None, description="상태 사유(퇴사/휴직/파견/병동이동/None)")
 
 
 class NurseProfile(BaseModel):
