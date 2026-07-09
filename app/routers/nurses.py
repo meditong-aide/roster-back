@@ -1335,6 +1335,8 @@ async def delete_nurse_assignment(
 async def get_nurse_by_id(
     nurse_id: str,
     group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -1346,6 +1348,11 @@ async def get_nurse_by_id(
     group_id (Optional):
         사이드프로필 view 컨텍스트. 명시 시 해당 그룹의 inbound assignment 기준으로
         target_* overlay 가 적용됨. 본인 home group 외 값이면 managed groups 검증.
+
+    year/month (Optional):
+        동반 시 이 응답의 `preceptee_period`/`preceptor_periods` 를
+        `/nurses/preceptee-periods` 와 **동일 필드·필터**(group_id · year · month · 겹침)로
+        채운다. 사이드 프로필이 상세 응답만으로 그 달 프리셉티/프리셉터 관계를 판단하도록 함.
     """
     try:
         from services.group_access import can_caller_access_nurse, assert_caller_can_access_group
@@ -1377,7 +1384,21 @@ async def get_nurse_by_id(
                 result = None
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
-        return result[0]
+        _nurse = result[0]
+        # 상세 응답에 프리셉티/프리셉터 관계를 /nurses/preceptee-periods 와 동일 필드·필터로 부착.
+        # year·month 동반 시에만(그 달 겹침). group 스코프 = view group_id → 없으면 간호사 home.
+        if year is not None and month is not None:
+            from services.preceptee_period import resolve_relationship_for_detail
+            _gid = _view_gid or (
+                _nurse.get("group_id") if isinstance(_nurse, dict)
+                else getattr(_nurse, "group_id", None)
+            )
+            if _gid:
+                _rel = resolve_relationship_for_detail(db, _gid, nurse_id, year, month)
+                if isinstance(_nurse, dict):
+                    _nurse["preceptee_period"] = _rel["preceptee_period"]
+                    _nurse["preceptor_periods"] = _rel["preceptor_periods"]
+        return _nurse
     except HTTPException:
         raise
     except Exception as e:

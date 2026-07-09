@@ -1835,7 +1835,12 @@ def update_nurse_profile_service(
     # 단건(assignment) + 다건(assignments) 모두 지원 — 다건 먼저 적용 후 단건.
     assignment_payload = fields.pop("assignment", None)
     assignments_payload = fields.pop("assignments", None)
-    preceptees_assignment_payload = fields.pop("preceptees_assignment", None)
+    # 프리셉터-사이드 write: preceptor_periods (구명 preceptees_assignment 는 전환기 fallback)
+    preceptees_assignment_payload = fields.pop("preceptor_periods", None)
+    if preceptees_assignment_payload is None:
+        preceptees_assignment_payload = fields.pop("preceptees_assignment", None)
+    else:
+        fields.pop("preceptees_assignment", None)
     _payloads_to_apply: List[Dict[str, Any]] = []
     if assignments_payload:
         _payloads_to_apply.extend([p for p in assignments_payload if p])
@@ -2394,7 +2399,7 @@ def _dispatch_assignment_payload(
     if (payload or {}).get("reason") == "프리셉티":
         raise HTTPException(
             status_code=400,
-            detail="프리셉티는 assignment 로 처리하지 않습니다. preceptees_assignment(period) 경로를 사용하세요.",
+            detail="프리셉티는 assignment 로 처리하지 않습니다. preceptor_periods(period) 경로를 사용하세요.",
         )
     if op == "create":
         data = {k: payload.get(k) for k in _ASSIGNMENT_CREATE_FIELDS}
@@ -2769,18 +2774,18 @@ def delete_profile_image_service(current_user, db: Session) -> Dict[str, Any]:
 # nurse 원본 대신 nurse_assignment.target_* 필드에 저장해야 한다.
 
 _INBOUND_REASONS = ("파견", "병동이동")
-# GET 응답 표시용(inbound_list + current_assignment): 5종 전부 노출.
-# (transfer 의미의 _INBOUND_REASONS 와 분리 — 휴직/퇴사/프리셉티는 target_group_id 없음)
+# GET 응답 표시용(inbound_list + current_assignment): 근무상태 4종만 노출.
+# 프리셉티 '관계'는 여기서 제외 — preceptee_period/preceptor_periods 로만 표현한다
+# (current_assignment 는 근무상태(휴직/퇴사/파견/병동이동) 전용, 관계와 혼동 금지).
+# (transfer 의미의 _INBOUND_REASONS 와 분리 — 휴직/퇴사는 target_group_id 없음)
 _STATUS_DISPLAY_REASONS: Tuple[str, ...] = _INBOUND_REASONS + (
     "휴직",
     "퇴사",
-    "프리셉티",
 )
 # current_assignment 대표 1건 우선순위: 숫자 작을수록 우선.
 _ASSIGNMENT_PRIORITY: Dict[str, int] = {
     "휴직": 0,
     "퇴사": 0,
-    "프리셉티": 1,
     "파견": 2,
     "병동이동": 2,
 }
@@ -2911,14 +2916,14 @@ def _build_inbound_blocks(
     nurse_ids: List[str],
     caller_group_id: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """간호사별 활성 파견/병동이동/휴직/퇴사/프리셉티 블록 구성.
+    """간호사별 활성 파견/병동이동/휴직/퇴사 블록 구성.
 
     Returns: dict[nurse_id] = {
         "inbound_list": [InboundEntry dict, ...],
         "current_assignment": {CurrentAssignment dict} or None,
     }
-    current_assignment: 휴직/퇴사 > 프리셉티 > 파견/병동이동 우선,
-    동률 시 start_date DESC (최신).
+    current_assignment: 휴직/퇴사 > 파견/병동이동 우선, 동률 시 start_date DESC (최신).
+    프리셉티 관계는 여기 미포함(preceptee_period/preceptor_periods 로 표현).
 
     caller_group_id: 지정 시, 그 그룹에서 '전출'(병동이동, source==caller)된 completed 행도
         포함해 과거 병동(source) 명단의 '전출함' 표시를 살린다. 전입처(B) 화면은 오염되지

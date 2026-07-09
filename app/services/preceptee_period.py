@@ -132,6 +132,28 @@ def list_preceptee_periods_for_month(db, nurse_ids, year: int, month: int) -> li
     return out
 
 
+def resolve_relationship_for_detail(db, group_id, nurse_id, year: int, month: int) -> dict:
+    """선택 nurse_id 상세용 — `/nurses/preceptee-periods` 와 **동일 필터**로 관계를 방향 분해.
+
+    같은 필터(그 group_id 의 active 간호사 · year·month 겹침) 로 그 달 구간을 뽑고,
+    선택 간호사를 기준으로 두 방향으로 나눈다.
+
+    반환:
+        {"preceptee_period": item|None,   # 내가 프리셉티 (nurse_id == 나)
+         "preceptor_periods": [item,...]}  # 내가 프리셉터 (preceptor_id == 나)
+    item 필드 = list_preceptee_periods_for_month 와 동일(nurse_id, preceptor_id, start_date, expected_end_date).
+    """
+    nid = str(nurse_id)
+    ids = [
+        str(n) for (n,) in db.query(Nurse.nurse_id)
+        .filter(Nurse.group_id == group_id, Nurse.active == 1).all()
+    ]
+    items = list_preceptee_periods_for_month(db, ids, int(year), int(month))
+    self_pp = next((it for it in items if str(it["nurse_id"]) == nid), None)
+    as_preceptor = [it for it in items if str(it["preceptor_id"]) == nid]
+    return {"preceptee_period": self_pp, "preceptor_periods": as_preceptor}
+
+
 # ── 쓰기 (write-through) ───────────────────────────────────────────────────────
 def open_preceptee_period(db, *, nurse_id, preceptor_id, office_id, valid_from: date,
                           valid_to: date, source_assignment_id: int | None = None,
