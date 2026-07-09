@@ -514,6 +514,32 @@ class SchedulingAgent:
                         messages=messages,
                         variable_memory=vm.to_dict(),
                     )
+                # ── autonomy_mode "auto": auto_safe mutation 은 승인 없이 즉시 commit ──
+                # manual(기본)이면 no-op. auto 여도 auto_safe=True 스킬만 자동(안전 opt-in).
+                auto_committed: list[tuple[str, Any]] = []
+                if pending_previews and getattr(ctx, "autonomy_mode", "manual") == "auto":
+                    from agents_v2.skills.manifest import SKILL_SPECS, load_manifest_skills
+
+                    load_manifest_skills()
+                    still_pending: list[dict] = []
+                    for p in pending_previews:
+                        spec = SKILL_SPECS.get(str(p.get("skill_name", "")).replace("-", "_"))
+                        if spec is not None and spec.auto_safe:
+                            r = execute_skill(
+                                db, p["skill_name"],
+                                {**p.get("args", {}), "preview_only": False}, ctx,
+                            )
+                            trace.append(Stage(
+                                "auto_execution",
+                                "error" if _is_error(r.data) else "ok",
+                                {"skill": p["skill_name"], "result": _truncate(r.data)},
+                                r.duration_ms,
+                            ))
+                            auto_committed.append((p["skill_name"], r.data))
+                        else:
+                            still_pending.append(p)
+                    pending_previews = still_pending
+
                 if pending_previews:
                     # 단일이면 기존 shape 유지(하위호환). 다중이면 consolidated batch.
                     if len(pending_previews) == 1:
@@ -525,6 +551,12 @@ class SchedulingAgent:
                             "items": pending_previews,
                         }
                     preview_answer = self._generate_preview_answer(messages, trace)
+                    if auto_committed:
+                        ok_n = sum(1 for _, d in auto_committed if not _is_error(d))
+                        preview_answer = (
+                            f"{ok_n}건은 자동 실행했습니다. 나머지는 확인이 필요합니다.\n\n"
+                            + preview_answer
+                        )
                     return AgentResult(
                         awaiting_approval=True,
                         preview=preview_payload,
@@ -533,6 +565,22 @@ class SchedulingAgent:
                         trace=trace,
                         messages=messages,
                         variable_memory=vm.to_dict(),
+                    )
+
+                if auto_committed:
+                    # 전부 auto_safe → 승인 없이 실행 완료 (text 답변)
+                    ok_n = sum(1 for _, d in auto_committed if not _is_error(d))
+                    err_n = len(auto_committed) - ok_n
+                    ans = f"{ok_n}건의 변경을 자동 실행했습니다."
+                    if err_n:
+                        ans += f" ({err_n}건 실패)"
+                    return AgentResult(
+                        answer=ans,
+                        ui_actions=ui_actions,
+                        trace=trace,
+                        messages=messages,
+                        variable_memory=vm.to_dict(),
+                        data=last_query_data,
                     )
 
         return AgentResult(

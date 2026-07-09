@@ -50,6 +50,10 @@ class SkillSpec:
     # 이 predicate 가 False 면 VERIFICATION_FAILED 로 승격(silent 부분실패 차단).
     # None 이면 검증 스킵. middleware.execute_skill 가 소비.
     postcondition: Callable[[Any], bool] | None = None
+    # auto_safe: autonomy_mode="auto" 에서 이 mutation 을 승인 없이 즉시 실행해도 되는가.
+    # HITL 3-tier 의 auto/notify 티어. 기본 False(=항상 승인). '어느 변경이 안전한가'는
+    # 위험한 결정이라 스킬별 명시 opt-in 으로만 켠다.
+    auto_safe: bool = False
 
 
 # name → SkillSpec. @skill 이 채운다.
@@ -66,6 +70,7 @@ def skill(
     grounds: tuple[str, ...] | list[str] = (),
     trigger_hint: str = "",
     postcondition: Callable[[Any], bool] | None = None,
+    auto_safe: bool = False,
 ) -> Callable[[SkillFunc], SkillFunc]:
     """스킬 단일 소스 등록 데코레이터.
 
@@ -90,6 +95,7 @@ def skill(
             grounds=tuple(grounds),
             trigger_hint=trigger_hint,
             postcondition=postcondition,
+            auto_safe=auto_safe,
         )
         SKILL_SPECS[name] = spec
         # 기존 dispatch 재사용 — run_skill 이 그대로 찾는다.
