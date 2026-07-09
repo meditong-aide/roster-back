@@ -439,10 +439,32 @@ class PreceptorPeerAssignment(BaseModel):
 
 
 class PreceptorPeer(BaseModel):
-    """프리셉터 본인의 사이드 프로필에 N명 노출되는 프리셉티 1명."""
+    """프리셉터 본인의 사이드 프로필에 N명 노출되는 프리셉티 1명 (period SSOT).
+
+    식별 = nurse_id (assignment_id 폐기). 기간 = start_date/expected_end_date(inclusive).
+    """
     nurse_id: str
     name: str
-    assignment: Optional[PreceptorPeerAssignment] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+
+
+class PrecepteePeriodItem(BaseModel):
+    """프리셉티 구간 1건 — `/nurses/preceptee-periods` 응답 item 과 **동일 필드**.
+
+    관계 방향 무관 공용 모델:
+    - preceptee_period(내가 프리셉티): nurse_id = 나, preceptor_id = 내 프리셉터
+    - preceptor_periods[](내가 프리셉터): nurse_id = 내 프리셉티, preceptor_id = 나
+    nurse_id 는 리스트 as-of 경로 호환 위해 Optional(상세/엔드포인트 응답에선 항상 채워짐).
+    """
+    nurse_id: Optional[str] = None
+    preceptor_id: Optional[str] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+
+
+# [deprecated] 구명 — 상세 preceptee_period 는 PrecepteePeriodItem 로 이전.
+PrecepteeSelfPeriodRead = PrecepteePeriodItem
 
 
 class NurseMembership(BaseModel):
@@ -464,6 +486,10 @@ class NurseMembership(BaseModel):
     display_group_id: Optional[str] = Field(
         default=None, description="이 membership 이 표시되는 기준 그룹(선택/조회 그룹)"
     )
+    # 월 스코프 퇴사 정보(status=='resigned' 인 퇴사月에만 채워짐, nurses.resignation_date SSOT).
+    # 다음 달부터는 명단에서 제외되어 membership 자체가 None 이므로 여기도 자연히 사라진다.
+    resign_date: Optional[str] = Field(default=None, description="퇴사일(ISO, 퇴사月에만)")
+    resign_reason: Optional[str] = Field(default=None, description="퇴사 사유(퇴사月에만)")
 
 
 class NurseProfile(BaseModel):
@@ -480,7 +506,20 @@ class NurseProfile(BaseModel):
     # allowed_shifts: List[CodeMapp] = Field(default_factory=list, max_items = 2)
     allowed_shifts: List[str] = Field(default_factory=list)
     personal_off_adjustment: int = Field(default=0)
-    preceptor_id: Optional[str] = None
+    # [deprecated] 프리셉티 관계는 preceptee_period / preceptor_periods 로 판단.
+    #   as-of-오늘 캐시 단방향 투영값(전환기 유지). 관계 SSOT 아님.
+    preceptor_id: Optional[str] = Field(
+        default=None,
+        description="[deprecated] 관계는 preceptee_period/preceptor_periods 사용. as-of 캐시값.",
+    )
+    exclusion_partner_id: Optional[str] = Field(
+        default=None,
+        description="상호 근무 배제 파트너 nurse_id(같은날 같은근무조 회피·소프트). None=해제. 미전달 시 무변경",
+    )
+    exclusion_partner_name: Optional[str] = Field(
+        default=None,
+        description="상호배제 파트너 이름(exclusion_partner_id 와 동일 월 as-of, office-wide 조회). 관계 없으면 None. 읽기전용",
+    )
     joining_date: Optional[datetime] = None
     resignation_date: Optional[datetime] = None
     resignation_reason: Optional[str] = None
@@ -544,12 +583,24 @@ class NurseProfile(BaseModel):
     # 현재 대표 1건 flat 요약 (프론트 폼 바인딩용)
     current_assignment: Optional["CurrentAssignment"] = Field(
         default=None,
-        description="휴직/퇴사 > 프리셉티 > 파견/병동이동 우선, 동률 시 start_date DESC",
+        description="근무상태 전용: 휴직/퇴사 > 파견/병동이동 우선, 동률 시 start_date DESC (프리셉티 관계 미포함).",
     )
-    # 본인이 프리셉터인 경우 자기를 따르는 N명의 프리셉티. preceptee 이거나 0명이면 [].
+    # [deprecated] 본인이 프리셉터인 경우 자기를 따르는 N명. → preceptor_periods 로 대체.
     preceptees: List[PreceptorPeer] = Field(
         default_factory=list,
-        description="본인이 preceptor 일 때 자기를 따르는 N명. 각자 active 프리셉티 nurse_assignment 메타 포함.",
+        description="[deprecated] preceptor_periods 사용. as-of-오늘 프리셉티 목록(전환기).",
+    )
+    # 본인이 프리셉티인 경우 자기 프리셉터 관계 + 기간. 관계 없으면 None.
+    #   상세(/nurses/{id}, year·month 동반) 응답에서 /nurses/preceptee-periods 와
+    #   동일 필드·필터로 채워진다(그 달 겹침). 리스트 경로는 as-of-오늘 값(전환기).
+    preceptee_period: Optional[PrecepteePeriodItem] = Field(
+        default=None,
+        description="본인이 프리셉티일 때: /nurses/preceptee-periods 와 동일 필드(nurse_id=나, preceptor_id=내 프리셉터).",
+    )
+    # 본인이 프리셉터인 경우 자기를 따르는 프리셉티 구간들. 상세(year·month) 응답에서만 채워짐.
+    preceptor_periods: List[PrecepteePeriodItem] = Field(
+        default_factory=list,
+        description="본인이 프리셉터일 때: 나를 따르는 프리셉티 구간들(/nurses/preceptee-periods 와 동일 필드·필터). 상세 응답 전용.",
     )
     # 일괄 업데이트(POST /bulk-update) 시 동반 전달 가능한 배정 payload
     assignment: Optional[NurseAssignmentPayload] = Field(
@@ -634,19 +685,33 @@ class PersonnelUpdate(BaseModel):
 
 
 class PreceptorPeerUpdate(BaseModel):
-    """프리셉터 사이드 프로필 PATCH 시 preceptees N명 변경 1건.
+    """프리셉터 사이드 프로필 PATCH 시 preceptees N명 변경 1건 (nurse_preceptee_period 직접 write).
 
-    operation 별 필수 필드:
-    - create: target_nurse_id, start_date (assignment_id 불요)
-    - update: assignment_id (+ 선택: start_date / expected_end_date / note)
-    - cancel: assignment_id 만 필수
+    대상 식별 = **target_nurse_id** (프리셉티 1:1 이라 assignment_id 불요·폐기).
+    operation 별 필수:
+    - create/update: target_nurse_id, start_date, **expected_end_date(종료예정일 필수 — 무기한 폐지)**
+    - cancel: target_nurse_id 만
     """
     operation: Literal["create", "update", "cancel"]
     target_nurse_id: str
-    assignment_id: Optional[int] = None
+    assignment_id: Optional[int] = None  # deprecated(무시) — 하위호환 위해 수용만
     start_date: Optional[date] = None
     expected_end_date: Optional[date] = None
     note: Optional[str] = None
+
+
+class PrecepteeSelfPeriod(BaseModel):
+    """이 간호사(프로필 owner)가 **프리셉티**일 때 프리셉터+기간 지정 (preceptee-self).
+
+    nurse_preceptee_period(SSOT) 로 직접 write — assignment 미경유.
+    operation 별 필수:
+    - create/update: preceptor_id, start_date, **expected_end_date(필수 — 무기한 폐지)**
+    - cancel: (owner 의 현재/미래 구간 삭제)
+    """
+    operation: Literal["create", "update", "cancel"]
+    preceptor_id: Optional[str] = None
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
 
 
 class NurseProfileUpdate(BaseModel):
@@ -669,6 +734,10 @@ class NurseProfileUpdate(BaseModel):
     nurse_memo: Optional[str] = None
     is_head_nurse: Optional[bool] = None
     preceptor_id: Optional[str] = None
+    exclusion_partner_id: Optional[str] = Field(
+        default=None,
+        description="상호 근무 배제 파트너 nurse_id(같은날 같은근무조 회피·소프트). None=해제. 미전달 시 무변경",
+    )
     fixed_shift: Optional[str] = None
     weekly_off_enabled: Optional[int] = None
     weekly_off_weekday: Optional[int] = None
@@ -687,9 +756,18 @@ class NurseProfileUpdate(BaseModel):
         default=None,
         description="사이드 프로필에서 여러 파견을 한 번에 create/update/cancel — 다건",
     )
+    preceptor_periods: Optional[List[PreceptorPeerUpdate]] = Field(
+        default=None,
+        description="프리셉터 본인 입장에서 나를 따르는 프리셉티 관계를 nurse_preceptee_period 로 일괄 create/update/cancel (target_nurse_id 기반). 읽기 preceptor_periods 와 대칭.",
+    )
+    # [deprecated] 구명 — preceptor_periods 로 대체. 전환기 동안만 수용.
     preceptees_assignment: Optional[List[PreceptorPeerUpdate]] = Field(
         default=None,
-        description="프리셉터 본인 입장에서 N명 preceptees 의 nurse_assignment(reason='프리셉티') 일괄 create/update/cancel",
+        description="[deprecated] preceptor_periods 로 대체됨.",
+    )
+    preceptee_period: Optional[PrecepteeSelfPeriod] = Field(
+        default=None,
+        description="이 간호사가 프리셉티일 때 프리셉터+기간(start/end 필수) 지정 — nurse_preceptee_period 직접 write",
     )
 
 

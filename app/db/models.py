@@ -320,6 +320,33 @@ class NursePrecepteePeriod(Base, EffectiveDatedPeriodMixin):
     )
 
 
+class NurseMutualExclusionPeriod(Base, EffectiveDatedPeriodMixin):
+    """상호 근무 배제 관계 시점 구간 (SSOT).
+
+    한 row = (nurse_id) 가 [valid_from, valid_to) 동안 partner_id 와 **같은 날 같은
+    근무조에 배정되지 않도록** 솔버가 소프트 회피한다(프리셉티↔프리셉터 '함께근무'의 배반적 개념).
+    - WHO = partner_id, WHEN = [valid_from, valid_to). valid_to=종료(무기한이면 NULL=지속).
+    - 1:1: 한 간호사는 동시점 최대 1개 open 구간(한사람당 한명씩). **양방향 저장**(A→B, B→A).
+    - end_reason: 종료 사유(released|cancelled|replaced) — 감사용.
+    - **하드 아님**: 솔버 stage3 objective 소프트 페널티. grade/team 하드가 lexicographic 상위라 항상 우선.
+    설계: NursePrecepteePeriod(프리셉티 SSOT) 패턴 미러.
+    """
+
+    __tablename__ = "nurse_mutual_exclusion_period"
+    partner_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"), nullable=False)
+    end_reason = Column(VARCHAR(30), nullable=True)
+    __table_args__ = (
+        # 1:1: 동시점 open(=valid_to NULL) 구간은 간호사당 1개("한사람당 한명씩"). 양 dialect partial unique.
+        # 일반 인덱스는 생략 — 배제쌍은 소수라 테이블이 작고, as-of 조회도 이 필터 유니크로 충분.
+        Index(
+            "uq_nmep_open_per_nurse", "nurse_id", unique=True,
+            mssql_where=text("valid_to IS NULL"),
+            sqlite_where=text("valid_to IS NULL"),
+        ),
+    )
+
+
 class NurseAssignment(Base):
     """간호사 배정/상태 변경 이력 (파견/휴직/퇴사/프리셉티/병동이동)"""
     __tablename__ = "nurse_assignment"

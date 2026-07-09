@@ -588,11 +588,21 @@ async def get_issued_roster_snapshot(
         )
         snapshot["assignments"] = _assignments
         if _assignments:
-            from datetime import date as _date
+            from datetime import date as _date, datetime as _datetime
             from calendar import monthrange as _mr
             _days = _mr(year, month)[1]
             _m_start = _date(year, month, 1)
             _m_end = _date(year, month, _days)
+
+            def _coerce_date(v):
+                """date/datetime/문자열(시간 포함 'YYYY-MM-DD HH:MM:SS' 등) → date. None 안전."""
+                if v is None:
+                    return None
+                if isinstance(v, _datetime):
+                    return v.date()
+                if isinstance(v, _date):
+                    return v
+                return _date.fromisoformat(str(v)[:10])
             _roster = snapshot.get("roster") or {}
             _s_colors = _roster.get("shift_colors")
             # 본인이 파견/병동이동 대상자일 때 target 스냅샷 조회
@@ -696,8 +706,11 @@ async def get_issued_roster_snapshot(
 
                 # 각 assignment별 셀 overlay
                 for _a in _a_list:
-                    _a_start = _date.fromisoformat(_a["start_date"])
-                    _a_end = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
+                    _a_start = _coerce_date(_a.get("start_date"))
+                    _a_end = _coerce_date(_a.get("end_date"))
+                    if _a_start is None:
+                        # start_date 없는 비정상 행은 overlay 스킵(비교 불가)
+                        continue
                     # 월내 실제 overlap 계산 (N_tail 버퍼-only 파견 → in_month=False, overlay 스킵)
                     _overlap_start = max(_a_start, _m_start)
                     _overlap_end = min(_a_end, _m_end) if _a_end else _m_end
@@ -1124,9 +1137,9 @@ async def get_roster_by_schedule_id(
                 for _a in _a_list:
                     if _a["reason"] not in ("파견", "병동이동"):
                         continue
-                    _as = _date.fromisoformat(_a["start_date"])
-                    _ae = _date.fromisoformat(_a["end_date"]) if _a["end_date"] else None
-                    if _day < _as:
+                    _as = _to_date(_a["start_date"])
+                    _ae = _to_date(_a["end_date"])
+                    if _as is None or _day < _as:
                         continue
                     if _ae is not None and _day > _ae:
                         continue

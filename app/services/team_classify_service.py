@@ -131,6 +131,9 @@ def _load_pool_and_inputs(
         elif r.shift_id in vacation_codes:
             fb_map.setdefault(r.nurse_id, set()).add(day)
 
+    # 프리셉터 = nurse_preceptee_period(SSOT) as-of 대상월 (캐시 preceptor_id 안 봄).
+    from services.preceptee_period import resolve_preceptor_asof
+    _pre_asof = resolve_preceptor_asof(db, [n.nurse_id for n in pool], date(year, month, 1))
     # 해제(release)로 표시된 프리셉티는 강제 follow 대상에서 제외(preceptor_id 무시)
     released = {
         pid for pid, d in (pair_decisions or {}).items() if d == "release"
@@ -139,7 +142,7 @@ def _load_pool_and_inputs(
         NurseInput(
             nurse_id=n.nurse_id,
             grade=n.grade,
-            preceptor_id=None if n.nurse_id in released else n.preceptor_id,
+            preceptor_id=None if n.nurse_id in released else _pre_asof.get(str(n.nurse_id)),
             off_days=frozenset(off_map.get(n.nurse_id, set())),
             fb_days=frozenset(fb_map.get(n.nurse_id, set())),
         )
@@ -191,19 +194,23 @@ def _detect_pairs(
     pool_ids: set[str],
     nurse_to_team: dict[str, Optional[int]],
     pair_decisions: Optional[dict[str, str]],
+    preceptor_asof: Optional[dict[str, Optional[str]]] = None,
 ) -> list[dict]:
     """현재 병동의 프리셉티→프리셉터 짝 + 분류 후 상태.
 
     status: released(해제 선택) / split(한쪽 미참여 또는 다른 팀) / together(같은 팀).
     split 은 경고 대상 — 짝이 갈라짐.
+    preceptor_asof: nurse_id→preceptor_id (period SSOT as-of 대상월). None 이면 빈 맵.
     """
     decisions = pair_decisions or {}
     name = {n.nurse_id: n.name for n in all_nurses}
+    _pre = preceptor_asof or {}
     pairs: list[dict] = []
     for n in all_nurses:
-        if not n.preceptor_id or n.preceptor_id not in name:
+        pr = _pre.get(str(n.nurse_id))  # 캐시 preceptor_id 안 봄 — period as-of
+        if not pr or pr not in name:
             continue  # preceptor 가 같은 병동 활성 간호사가 아니면 짝으로 보지 않음
-        pe, pr = n.nurse_id, n.preceptor_id
+        pe = n.nurse_id
         decision = decisions.get(pe, "keep")
         if decision == "release":
             status = "released"
@@ -286,7 +293,9 @@ def preview_team_classification(
     # 프리셉터 짝 탐지 — 전체 활성 = 풀 + 미지정 + N전담제외
     all_nurses = pool + unassigned + excluded_night
     pool_ids = {n.nurse_id for n in pool}
-    pairs = _detect_pairs(all_nurses, pool_ids, nurse_to_team, pair_decisions)
+    from services.preceptee_period import resolve_preceptor_asof
+    _pre_asof = resolve_preceptor_asof(db, [n.nurse_id for n in all_nurses], date(year, month, 1))
+    pairs = _detect_pairs(all_nurses, pool_ids, nurse_to_team, pair_decisions, preceptor_asof=_pre_asof)
 
     # 참여 선택 로스터 — 전체 활성 간호사 + grade/프리셉터/근무코드.
     # 프론트가 group_id 로 nurse 를 직접 못 읽는 경우(HN 권한)가 있어 preview 가 운반.

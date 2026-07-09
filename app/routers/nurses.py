@@ -50,7 +50,6 @@ from services.assignment_service import (
     get_assignments,
     get_assignment_status_counts,
     flush_pending_transfers,
-    flush_expired_preceptees,
     flush_expired_dispatches,
     flush_expired_leaves,
     preview_assignment_impact,
@@ -309,6 +308,35 @@ async def get_group_members_in_month(
     return group_members_in_month(db, gid, year, month)
 
 
+@router.get("/preceptee-periods")
+async def get_preceptee_periods(
+    group_id: str,
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """그 달과 겹치는 프리셉티 구간 목록 (로스터 생성/뷰 프리셉티 표시용, period SSOT).
+
+    반환: {"items": [{nurse_id, preceptor_id, start_date, expected_end_date(inclusive)}]}.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    managed = set(resolve_managed_group_ids(db, current_user))
+    if group_id not in managed:
+        raise HTTPException(status_code=403, detail="해당 그룹에 접근 권한이 없습니다.")
+    from services.preceptee_period import list_preceptee_periods_for_month
+    nurse_ids = [
+        nid for (nid,) in db.query(NurseModel.nurse_id)
+        .filter(NurseModel.group_id == group_id, NurseModel.active == 1).all()
+    ]
+    items = list_preceptee_periods_for_month(db, nurse_ids, int(year), int(month))
+    return JSONResponse(
+        content=jsonable_encoder({"items": items}),
+        media_type="application/json; charset=utf-8",
+    )
+
+
 @router.get("", response_model=List[NurseProfile])
 async def get_nurses_in_group(
     office_id: Optional[str] = None,
@@ -329,8 +357,7 @@ async def get_nurses_in_group(
     # 병동이동 레이지 체크
     if _group:
         flush_pending_transfers(db, _group)
-    # 프리셉티 만료 레이지 체크
-    flush_expired_preceptees(db)
+    # [도려내기] 프리셉티 만료 레이지 체크 제거 — period as-of resolver 가 자동 처리.
     # 파견 만료 레이지 체크 (status change only, 안전 작업)
     flush_expired_dispatches(db)
     # 휴직 만료 레이지 체크 (status change only, 안전 작업)
@@ -1308,6 +1335,8 @@ async def delete_nurse_assignment(
 async def get_nurse_by_id(
     nurse_id: str,
     group_id: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -1319,6 +1348,11 @@ async def get_nurse_by_id(
     group_id (Optional):
         사이드프로필 view 컨텍스트. 명시 시 해당 그룹의 inbound assignment 기준으로
         target_* overlay 가 적용됨. 본인 home group 외 값이면 managed groups 검증.
+
+    year/month (Optional):
+        동반 시 이 응답의 `preceptee_period`/`preceptor_periods` 를
+        `/nurses/preceptee-periods` 와 **동일 필드·필터**(group_id · year · month · 겹침)로
+        채운다. 사이드 프로필이 상세 응답만으로 그 달 프리셉티/프리셉터 관계를 판단하도록 함.
     """
     try:
         from services.group_access import can_caller_access_nurse, assert_caller_can_access_group
@@ -1350,7 +1384,36 @@ async def get_nurse_by_id(
                 result = None
         if not result:
             raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다")
-        return result[0]
+        _nurse = result[0]
+        # 상세 응답에 프리셉티/프리셉터 관계를 /nurses/preceptee-periods 와 동일 필드·필터로 부착.
+        # year·month 동반 시에만(그 달 겹침). group 스코프 = view group_id → 없으면 간호사 home.
+        if year is not None and month is not None:
+            from services.preceptee_period import resolve_relationship_for_detail
+            _gid = _view_gid or (
+                _nurse.get("group_id") if isinstance(_nurse, dict)
+                else getattr(_nurse, "group_id", None)
+            )
+            if _gid:
+                _rel = resolve_relationship_for_detail(db, _gid, nurse_id, year, month)
+                if isinstance(_nurse, dict):
+                    _nurse["preceptee_period"] = _rel["preceptee_period"]
+                    _nurse["preceptor_periods"] = _rel["preceptor_periods"]
+            # 상호배제: list/row(attach_member_badges)와 동일한 월 as-of(선택월 1일) 기준으로 상세에 부착.
+            #   period SSOT(nurse_mutual_exclusion_period)라 그룹 무관 — 이 간호사의 그 달 파트너를 직접 리졸브.
+            #   상세(Select 초기값)와 리스트가 같은 partner id 를 반환하도록 정합.
+            from services.mutual_exclusion_period import resolve_partner_asof
+            from datetime import date as _mx_date
+            _mx_pid = resolve_partner_asof(
+                db, [nurse_id], _mx_date(int(year), int(month), 1)
+            ).get(str(nurse_id))
+            if isinstance(_nurse, dict):
+                _nurse["exclusion_partner_id"] = _mx_pid
+                _nurse["exclusion_partner_name"] = (
+                    db.query(NurseModel.name)
+                    .filter(NurseModel.nurse_id == _mx_pid).scalar()
+                    if _mx_pid else None
+                )
+        return _nurse
     except HTTPException:
         raise
     except Exception as e:

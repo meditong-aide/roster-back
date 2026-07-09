@@ -92,3 +92,32 @@ def test_nurses_base_fields_overwritten_by_asof(seeded):
     assert r["is_weekend_off"] is True  # False → 1
     assert r["fixed_shift"] == "N"      # None → N
     assert r["allowed_shifts"] == ["N"]  # [] → ["N"]
+
+
+def test_exclusion_partner_name_resolved_office_wide(seeded):
+    """상호배제 파트너 이름은 현재 목록에 없어도(타그룹) office-wide 로 해석돼야 한다."""
+    from services.mutual_exclusion_period import set_mutual_exclusion
+    db = seeded  # n1 ∈ A병동
+    # 파트너 n2 는 다른 그룹 B병동 소속 → A병동 월 멤버 목록엔 없음
+    db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
+    db.add(Nurse(nurse_id="n2", account_id="a2", group_id="B", office_id="o1",
+                 name="이영희", active=1, grade=2, allowed_shifts=[]))
+    db.flush()
+    set_mutual_exclusion(db, nurse_id="n1", partner_id="n2", office_id="o1",
+                         valid_from=date(2026, 8, 1))
+    db.flush()
+    rows = [{"nurse_id": "n1", "grade": 2, "allowed_shifts": [], "team_id": 9}]
+    attach_member_badges_to_nurses(db, rows, "A", 2026, 8)
+    r = rows[0]
+    assert r["exclusion_partner_id"] == "n2"
+    assert r["exclusion_partner_name"] == "이영희"  # 타그룹이라 목록에 없어도 이름 해석됨
+
+
+def test_exclusion_partner_name_none_when_no_relation(seeded):
+    """관계 없으면 id·name 모두 None."""
+    db = seeded
+    rows = [{"nurse_id": "n1", "grade": 2, "allowed_shifts": [], "team_id": 9}]
+    attach_member_badges_to_nurses(db, rows, "A", 2026, 8)
+    r = rows[0]
+    assert r["exclusion_partner_id"] is None
+    assert r["exclusion_partner_name"] is None

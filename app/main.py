@@ -1,6 +1,9 @@
 import sys, os
+import time
+import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+import boto3
 
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +40,7 @@ from routers import (
 )
 from routers.contact import contact_router
 from routers import messages
+from routers import events
 from routers.sticker import sticker_router
 from routers.setting import router as setting_router
 from routers.member import member_router
@@ -67,19 +71,15 @@ async def _daily_flush_scheduler():
         try:
             from services.assignment_service import (
                 flush_all_pending_transfers,
-                flush_expired_preceptees,
                 flush_expired_dispatches,
                 flush_expired_leaves,
                 flush_pending_permanent_changes,
                 reconcile_nurse_attrs,
             )
-            from services.nurse_service import flush_resigned_nurses
             count = flush_all_pending_transfers(db)
             if count > 0:
                 _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
-            pte_count = flush_expired_preceptees(db)
-            if pte_count > 0:
-                _scheduler_logger.info("[Scheduler] 프리셉티 자동 해제: %d건", pte_count)
+            # [도려내기] 프리셉티 만료 flush 제거 — nurse_preceptee_period as-of resolver 가 자동 처리.
             disp_count = flush_expired_dispatches(db)
             if disp_count > 0:
                 _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
@@ -89,9 +89,12 @@ async def _daily_flush_scheduler():
             pc_count = flush_pending_permanent_changes(db)
             if pc_count > 0:
                 _scheduler_logger.info("[Scheduler] 영구 속성변경 발효: %d건", pc_count)
-            res_count = flush_resigned_nurses(db)
-            if res_count > 0:
-                _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
+            # [퇴사자 삭제 비활성화] 퇴사자는 nurses.resignation_date 로만 관리하고 레코드는 보존한다.
+            #   월 명단 노출/미노출은 group_members_in_month 가 resignation_date 로 판정(퇴사月=표시,
+            #   다음 달=제외). hard delete 하면 퇴사月 표시도 사라지고 데이터도 잃으므로 호출하지 않는다.
+            # res_count = flush_resigned_nurses(db)
+            # if res_count > 0:
+            #     _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
             # Nurses 캐시 vs NurseAssignment effective 값 정합성 점검 (read-only)
             recon = reconcile_nurse_attrs(db)
             if recon.get("mismatch_count", 0) > 0:
@@ -273,6 +276,95 @@ async def _trace_roster_create_callers(request: Request, call_next):
     return await call_next(request)
 
 
+# --- 호출별 사용자 액션 로그 (변경요청 → 단일 JSON 이벤트 → Firehose → S3 → Athena) ---
+# 감사(audit) 아님, "사용자가 무슨 액션을 했나" 분석용. 요청 흐름을 절대 막지 않도록 전 구간 try/except.
+# env(CALL_HISTORY_FIREHOSE_STREAM) 설정 시 그 스트림으로 Firehose→S3 (dev=dev스트림/prod=prod스트림·테이블 분리).
+# 미설정(로컬)이면 stdout 으로만. CloudWatch 는 roster 생성 백로그 전용(call_history 로 오염 안 시킴). 앱 DB 무부하.
+# PII 최소화: 본문 미저장(path+query 만), 민감 경로는 아래 prefix 로 제외.
+_LOG_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_LOG_EXCLUDE_PREFIX = ("/static", "/health", "/docs", "/openapi", "/favicon", "/redoc")
+
+
+def _log_user_from_cookie(request: Request) -> dict:
+    """access_token 쿠키(JWT) 디코드 → 유저 필드 (DB 히트 없음). 실패 시 {}."""
+    raw = request.cookies.get("access_token") or ""
+    tok = raw.replace("Bearer ", "").strip()
+    if not tok:
+        return {}
+    try:
+        from routers.auth import SECRET_KEY, ALGORITHM
+        from jose import jwt as _jwt
+        p = _jwt.decode(tok, SECRET_KEY, algorithms=[ALGORITHM])
+        return {
+            "account_id": p.get("account_id"), "nurse_id": p.get("nurse_id"),
+            "name": p.get("name"), "office_id": p.get("office_id"),
+            "group_id": p.get("group_id"),
+            "role": p.get("hn_auth") or p.get("EmpAuthGbn"),
+        }
+    except Exception:
+        return {}
+
+
+# Firehose 직송(옵션): 스트림명 env 설정 시 S3(→Athena)로 전송. 미설정이면 CloudWatch print 만.
+_firehose = boto3.client("firehose", region_name="ap-northeast-2")
+_CALL_HISTORY_STREAM = os.getenv("CALL_HISTORY_FIREHOSE_STREAM")
+
+
+def _firehose_put(line: str) -> None:
+    """이벤트 1줄을 Firehose 로 전송(백그라운드 스레드). 실패는 로그만·요청 무영향."""
+    try:
+        _firehose.put_record(
+            DeliveryStreamName=_CALL_HISTORY_STREAM,
+            Record={"Data": line.encode("utf-8")},
+        )
+    except Exception as e:
+        print(f"[call_history][WARN] Firehose put 실패: {e}", flush=True)
+
+
+@app.middleware("http")
+async def _call_action_logger(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    try:
+        method = request.method
+        path = request.url.path
+        if method in _LOG_METHODS and not path.startswith(_LOG_EXCLUDE_PREFIX):
+            xff = request.headers.get("x-forwarded-for", "")
+            ip = xff.split(",")[0].strip() if xff else (
+                request.client.host if request.client else None
+            )
+            u = _log_user_from_cookie(request)
+            qs = str(request.url.query) or None
+            # 단일 이벤트 형식(JSON 1줄) — Firehose 가 그대로 S3(→Athena)로 전달.
+            #   log="call_history" 는 CloudWatch 구독필터 {$.log="call_history"} 매칭용 태그.
+            event = {
+                "log": "call_history",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "method": method,
+                "path": path[:500],
+                "query": (qs[:1000] if qs else None),
+                "status": getattr(response, "status_code", None),
+                "dur_ms": int((time.perf_counter() - start) * 1000),
+                "account_id": u.get("account_id"),
+                "nurse_id": u.get("nurse_id"),
+                "name": u.get("name"),
+                "office_id": u.get("office_id"),
+                "group_id": u.get("group_id"),
+                "role": (str(u.get("role"))[:20] if u.get("role") else None),
+                "ip": (str(ip)[:64] if ip else None),
+                "ua": (request.headers.get("user-agent", "") or "")[:300],
+                "req_id": ((request.headers.get("x-amzn-trace-id") or "")[:80] or None),
+            }
+            line = json.dumps(event, ensure_ascii=False)
+            if _CALL_HISTORY_STREAM:  # env 스트림으로 Firehose → S3 (dev/prod 각자 스트림·테이블)
+                asyncio.create_task(asyncio.to_thread(_firehose_put, line + "\n"))
+            else:  # env 미설정(로컬)일 때만 stdout
+                print(line, flush=True)
+    except Exception as e:
+        print(f"[call_history][WARN] 로거 예외(무시): {e}", flush=True)
+    return response
+
+
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 app.include_router(contact_router)
@@ -297,6 +389,7 @@ app.include_router(daily_shift_router.router)
 app.include_router(teams.router)
 app.include_router(groups.router)
 app.include_router(managed_groups.router)
+app.include_router(events.router)
 app.include_router(weekly_off.router)  # 추가
 app.include_router(grade.router)
 app.include_router(jobs.router)

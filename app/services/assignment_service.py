@@ -1033,22 +1033,28 @@ def group_members_in_month(
                 inbound[nid] = a
             elif a.source_group_id == group_id and a.target_group_id != group_id:
                 outbound[nid] = a
-        elif a.reason in ("휴직", "퇴사") and a.source_group_id == group_id:
+        elif a.reason == "휴직" and a.source_group_id == group_id:
+            # 퇴사는 assignment 를 보지 않는다 — nurses.resignation_date 단독 SSOT (아래 home 루프에서 판정).
             leave[nid] = a
 
+    # home = active=1 재직자 + 퇴사자(resignation_date 존재). 퇴사자는 프로드에서 active=0 으로
+    #   비활성화될 수도 있으므로(프론트가 퇴사 시 active 토글 병행하는 케이스) active 조건만으로
+    #   거르지 않는다. 정확한 월 판정(퇴사月=표시 / 그 외 비활성=제외)은 아래 루프가 수행한다.
     if nurse_pool is not None:
         # 호출자가 이미 로드한 nurse 재사용 → home 조회 쿼리 제거.
-        #   SQL(group_id==group_id AND active==1) 과 동치인 in-memory 필터.
         home = [
             n
             for n in nurse_pool.values()
             if str(getattr(n, "group_id", "") or "").strip() == str(group_id or "").strip()
-            and getattr(n, "active", None) == 1
+            and (getattr(n, "active", None) == 1 or getattr(n, "resignation_date", None) is not None)
         ]
     else:
         home = (
             db.query(NurseModel)
-            .filter(NurseModel.group_id == group_id, NurseModel.active == 1)
+            .filter(
+                NurseModel.group_id == group_id,
+                or_(NurseModel.active == 1, NurseModel.resignation_date.isnot(None)),
+            )
             .all()
         )
 
@@ -1126,7 +1132,7 @@ def group_members_in_month(
         return v if v is not None else (1 if getattr(n_obj, "is_weekend_off", False) else 0)
 
     def _row(n, status, marker, badge, team, grade, night_profile=...,
-             weekend_off=..., fixed_shift=...):
+             weekend_off=..., fixed_shift=..., resign_date=None):
         # N전담(허용 shift=N뿐) 판정 → 'N전담' 배지 + is_night_dedicated.
         # ★inbound 은 파견지 유효 근무형태(target_shift_types)로 판정해야 한다(base nurses.allowed_shifts 가
         #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
@@ -1150,6 +1156,10 @@ def group_members_in_month(
             "as_of_weekend_off": _wo,
             "as_of_fixed_shift": _fx,
             "as_of_preceptor": _preceptor_asof.get(str(n.nurse_id)),  # 월 as-of 프리셉터(종료월엔 None)
+            # 퇴사月(status=='resigned')에만 채워지는 월 스코프 퇴사 정보(nurses.resignation_date SSOT).
+            # 그 외 월/상태는 None. 프론트는 이 값이 있으면 해당 일자에 퇴사 표시.
+            "resign_date": resign_date.isoformat() if resign_date is not None else None,
+            "resign_reason": getattr(n, "resignation_reason", None) if resign_date is not None else None,
         }
 
     members: list[dict] = []
@@ -1157,12 +1167,28 @@ def group_members_in_month(
     for n in home:
         nid = str(n.nurse_id)
         seen.add(nid)
+        # 퇴사: nurses.resignation_date 단독 SSOT (assignment 미참조).
+        #   resign < 월초  → 퇴사 다음 달부터 명단 완전 제외 (_active_range_in_month 와 동일 규칙)
+        #   월초 <= resign <= 월말 → 퇴사月: status='resigned' + 퇴사일 표시
+        #   resign > 월말(미래) → 아직 재직 → 아래 일반 분기로 진행
+        _resign = getattr(n, "resignation_date", None)
+        _resign_d = _resign.date() if hasattr(_resign, "date") else _resign
+        if _resign_d is not None and _resign_d < month_start:
+            continue  # 퇴사 다음 달부터 명단 완전 제외
+        _resign_this_month = _resign_d is not None and _resign_d <= month_end
+        # active=0(비활성)은 '이 달 퇴사자' 일 때만 표시. 그 외 비활성(미래 퇴사·수동 비활성 등)은
+        #   명단에서 제외 — home 을 (active OR resignation) 으로 넓게 로드했으므로 여기서 정리한다.
+        if getattr(n, "active", None) != 1 and not _resign_this_month:
+            continue
         team = _resolved_team(nid, n)
         grade = _asof_grade(nid, n)      # 월 as-of (gap→nurses.grade)
         _np = _asof_night(nid, n)        # 월 as-of 전담 프로필 (gap→nurses.allowed_shifts)
         _wo = _asof_weekend(nid, n)      # 월 as-of 주말휴무 (gap→nurses.is_weekend_off)
         _fx = _asof_fixed(nid, n)        # 월 as-of 고정근무 (gap→nurses.fixed_shift)
         _kw = dict(night_profile=_np, weekend_off=_wo, fixed_shift=_fx)
+        if _resign_this_month:
+            members.append(_row(n, "resigned", None, "퇴사", team, grade, resign_date=_resign_d, **_kw))
+            continue
         if nid in outbound:
             a = outbound[nid]
             if a.reason == "병동이동":
@@ -1172,11 +1198,8 @@ def group_members_in_month(
             else:  # 파견 나감 — home 유지
                 members.append(_row(n, "dispatch_out", None, "파견 중", team, grade, **_kw))
         elif nid in leave:
-            a = leave[nid]
-            if a.reason == "퇴사":
-                members.append(_row(n, "resigned", None, "퇴사", team, grade, **_kw))
-            else:
-                members.append(_row(n, "leave", None, "휴직", team, grade, **_kw))
+            # leave 에는 이제 휴직만 담긴다(퇴사는 위 resignation_date 분기에서 처리).
+            members.append(_row(n, "leave", None, "휴직", team, grade, **_kw))
         else:
             members.append(_row(n, "active", None, None, team, grade, **_kw))
 
@@ -1678,142 +1701,10 @@ def flush_all_pending_transfers(db: Session) -> int:
     return count
 
 
-def flush_expired_preceptees(db: Session) -> int:
-    """프리셉티 기간 만료 자동 해제 (스케줄러용).
-
-    expected_end_date < 오늘인 active 프리셉티 assignment를 찾아:
-    - nurses.preceptor_id = NULL
-    - assignment status = completed, end_date = expected_end_date
-    - 알림 발송 (운영자, 해당 간호사, 프리셉터)
-    """
-    today = date.today()
-    rows = (
-        db.query(NurseAssignment)
-        .filter(
-            NurseAssignment.reason == "프리셉티",
-            NurseAssignment.status == "active",
-            NurseAssignment.expected_end_date.isnot(None),
-            NurseAssignment.expected_end_date < today,
-        )
-        .all()
-    )
-    if not rows:
-        return 0
-
-    count = 0
-    for row in rows:
-        nurse = (
-            db.query(NurseModel)
-            .filter(NurseModel.nurse_id == row.nurse_id)
-            .first()
-        )
-        preceptor_id = nurse.preceptor_id if nurse else None
-        preceptor = (
-            db.query(NurseModel)
-            .filter(NurseModel.nurse_id == preceptor_id)
-            .first()
-        ) if preceptor_id else None
-
-        # preceptor_id 해제
-        if nurse and nurse.preceptor_id:
-            logger.info(
-                "[Scheduler] 프리셉티 해제: nurse_id=%s, preceptor_id=%s → NULL",
-                row.nurse_id, nurse.preceptor_id,
-            )
-            nurse.preceptor_id = None
-
-        # period SSOT 종료(write-through). 캐시만 지우고 nurse_preceptee_period 를 안 닫으면
-        # 생성기가 stale open period 를 읽어 '종료된 프리셉티'를 계속 팔로우함
-        # (2026-07 중환자실1 6쌍 회귀의 원인). close 실패는 로깅만 하고 flush 는 계속.
-        try:
-            from services.preceptee_period import close_preceptee_period, end_date_to_valid_to
-            close_preceptee_period(
-                db,
-                nurse_id=row.nurse_id,
-                close_date=end_date_to_valid_to(row.expected_end_date) or today,
-                end_reason="completed",
-                nurse=nurse,
-            )
-        except Exception as _pp_exc:
-            logger.error(
-                "[Scheduler] 프리셉티 period 종료 write-through 실패: nurse_id=%s, %s",
-                row.nurse_id, _pp_exc, exc_info=True,
-            )
-
-        row.status = "completed"
-        row.end_date = row.expected_end_date
-        count += 1
-
-        # 알림 발송
-        try:
-            from utils.utils import set_app_push
-            nurse_name = nurse.name if nurse else str(row.nurse_id)
-            preceptor_name = preceptor.name if preceptor else "?"
-            _group_name = _get_group_name(db, row.source_group_id) or str(row.source_group_id)
-            push_message = f"{nurse_name} 프리셉티 기간 종료 (프리셉터: {preceptor_name}, {_group_name})"
-
-            _recipients = {str(row.nurse_id)}
-            if preceptor_id:
-                _recipients.add(str(preceptor_id))
-            for nid in _get_head_nurse_ids(db, row.source_group_id):
-                _recipients.add(nid)
-
-            set_app_push(
-                pushCode="P30", pushSubCode="S13",
-                officeCode=row.office_id,
-                sendEmpSeqNo=row.nurse_id,
-                sendMemberId=row.nurse_id,
-                receiveEmpSeqNo=",".join(map(str, _recipients)),
-                pushMessage=push_message, orgPushMessage=push_message,
-                linkUrl="", linkCode="",
-            )
-        except Exception as e:
-            logger.error("[Scheduler] 프리셉티 해제 알림 실패: %s", e, exc_info=True)
-
-    if count > 0:
-        db.commit()
-        logger.info("[Scheduler] 프리셉티 자동 해제 완료: %d건", count)
-
-    return count
-
-
-def flush_orphan_preceptee_assignments(db: Session) -> int:
-    """nurses.preceptor_id=NULL 이지만 active 프리셉티 assignment 가 떠있는 비대칭을 정리.
-
-    원인: 외부 경로(직접 INSERT, 프론트 가드로 PATCH 누락 등)로 nurses.preceptor_id 와
-    nurse_assignment 가 어긋난 경우. lazy 체크 시점에 active row 를 모두 cancelled 로 정리.
-    알림은 발송하지 않는다(자동 정리는 사용자 의도 변경이 아님).
-    """
-    rows = (
-        db.query(NurseAssignment)
-        .join(NurseModel, NurseModel.nurse_id == NurseAssignment.nurse_id)
-        .filter(
-            NurseAssignment.reason == "프리셉티",
-            NurseAssignment.status == "active",
-            NurseModel.preceptor_id.is_(None),
-        )
-        .all()
-    )
-    if not rows:
-        return 0
-    today = date.today()
-    for row in rows:
-        row.status = "cancelled"
-        if row.end_date is None:
-            row.end_date = today
-        # period SSOT 도 함께 닫는다(비대칭 정리 시 nurse_preceptee_period 잔존 방지 —
-        # 생성기가 stale open period 를 읽어 취소된 프리셉티를 팔로우하는 회귀 차단).
-        try:
-            from services.preceptee_period import close_preceptee_period
-            close_preceptee_period(db, nurse_id=row.nurse_id, close_date=today, end_reason="cancelled")
-        except Exception as _pp_exc:
-            logger.error(
-                "[Lazy] orphan 프리셉티 period 종료 실패: nurse_id=%s, %s",
-                row.nurse_id, _pp_exc, exc_info=True,
-            )
-    db.commit()
-    logger.info("[Lazy] orphan 프리셉티 assignment 정리: %d건", len(rows))
-    return len(rows)
+# [도려내기] flush_expired_preceptees / flush_orphan_preceptee_assignments 제거됨.
+#   프리셉티는 nurse_preceptee_period(SSOT) 단독 관리 — 만료는 as-of resolver 가
+#   valid_to 로 자동 처리(별도 flush 잡 불필요), 만료 알림은 정책상 폐지.
+#   (assignment reason="프리셉티" row 는 더 이상 생성되지 않음.)
 
 
 def flush_expired_dispatches(db: Session) -> int:

@@ -144,67 +144,87 @@ def get_personnel_basic_info_service(current_user, db: Session):
 
 
 def _load_preceptees_map(db: Session, nurses) -> Dict[str, List[Dict[str, Any]]]:
-    """view 안의 nurses 가 preceptor 인 경우 그들을 가리키는 모든 preceptees 를
-    preceptor_id 별 리스트로 빌드한다. (단건 GET 에서도 작동하도록 cross-조회)
+    """view 안의 nurses 가 preceptor 인 경우 그들을 가리키는 preceptees 를
+    preceptor_id 별 리스트로 빌드한다. **진실 = nurse_preceptee_period(SSOT)** — 캐시/assignment 안 봄.
 
-    테넌시 경계: preceptor 와 같은 office_id 인 preceptee 만 응답에 노출한다.
-    응답 dict 의 "preceptees" 키로 그대로 들어간다.
+    as-of = 오늘(현재 유효 구간). 월 뷰 필터는 attach_member_badges_to_nurses 가 별도로 적용.
+    테넌시 경계: preceptor 와 같은 office 인 preceptee 만 노출.
+    응답 peer 형태(신규 계약): {nurse_id, name, start_date, expected_end_date}.
+      (assignment_id 폐기 — 프리셉티는 1:1 이라 target_nurse_id 로 식별.
+       expected_end_date = valid_to − 1day 로 inclusive 종료일 환산.)
     """
+    from datetime import date as _date, timedelta as _td
+    from db.models import NursePrecepteePeriod as _NPP
+
     nurse_id_to_name: Dict[str, str] = {n.nurse_id: n.name for n in nurses}
     view_office_by_nurse: Dict[str, Optional[str]] = {n.nurse_id: n.office_id for n in nurses}
     view_nurse_ids = list(nurse_id_to_name.keys())
-    preceptor_to_pte: Dict[str, List[str]] = {}
-    pte_ids: List[str] = []
-
-    if view_nurse_ids:
-        cross_rows = (
-            db.query(NurseModel)
-            .filter(
-                NurseModel.preceptor_id.in_(view_nurse_ids),
-                NurseModel.nurse_id != NurseModel.preceptor_id,
-            )
-            .all()
-        )
-        for n in cross_rows:
-            expected_office = view_office_by_nurse.get(n.preceptor_id)
-            if expected_office is None or n.office_id != expected_office:
-                continue  # office 경계 위반 노출 차단
-            nurse_id_to_name.setdefault(n.nurse_id, n.name)
-            preceptor_to_pte.setdefault(n.preceptor_id, []).append(n.nurse_id)
-            pte_ids.append(n.nurse_id)
-
-    if not pte_ids:
+    if not view_nurse_ids:
         return {}
 
+    today = _date.today()
     rows = (
-        db.query(NurseAssignment)
+        db.query(_NPP)
         .filter(
-            NurseAssignment.nurse_id.in_(pte_ids),
-            NurseAssignment.reason == "프리셉티",
-            NurseAssignment.status == "active",
+            _NPP.preceptor_id.in_(view_nurse_ids),
+            _NPP.valid_from <= today,
+            _NPP.valid_to > today,
         )
         .all()
     )
-    assignment_map: Dict[str, NurseAssignment] = {r.nurse_id: r for r in rows}
+    if not rows:
+        return {}
+
+    # preceptee 이름 보강(뷰 밖 간호사일 수 있음)
+    pte_ids = [str(r.nurse_id) for r in rows]
+    for n in db.query(NurseModel.nurse_id, NurseModel.name).filter(
+        NurseModel.nurse_id.in_(pte_ids)
+    ).all():
+        nurse_id_to_name.setdefault(n.nurse_id, n.name)
 
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for pre_id, pte_list in preceptor_to_pte.items():
-        peers: List[Dict[str, Any]] = []
-        for pte_id in pte_list:
-            a = assignment_map.get(pte_id)
-            peers.append({
-                "nurse_id": pte_id,
-                "name": nurse_id_to_name.get(pte_id, ""),
-                "assignment": None if not a else {
-                    "assignment_id": a.id,
-                    "start_date": a.start_date.isoformat() if a.start_date else None,
-                    "expected_end_date": a.expected_end_date.isoformat() if a.expected_end_date else None,
-                    "end_date": a.end_date.isoformat() if a.end_date else None,
-                    "status": a.status,
-                    "note": a.note,
-                },
-            })
-        out[pre_id] = peers
+    for r in rows:
+        pre_id = str(r.preceptor_id)
+        # office 경계: preceptee(period.office_id) 와 preceptor(view office) 일치만 노출.
+        expected_office = view_office_by_nurse.get(pre_id)
+        if expected_office is not None and str(r.office_id) != str(expected_office):
+            continue
+        _end_incl = (r.valid_to - _td(days=1)) if r.valid_to else None
+        out.setdefault(pre_id, []).append({
+            "nurse_id": str(r.nurse_id),
+            "name": nurse_id_to_name.get(str(r.nurse_id), ""),
+            "start_date": r.valid_from.isoformat() if r.valid_from else None,
+            "expected_end_date": _end_incl.isoformat() if _end_incl else None,
+        })
+    return out
+
+
+def _load_self_period_map(db: Session, nurses) -> Dict[str, Dict[str, Any]]:
+    """각 간호사(프리셉티 본인)의 **현재 유효** 프리셉터 관계 + 기간 (as-of 오늘).
+
+    사이드 프로필 '프리셉티 지정' 모드 폼 바인딩용. nurse_preceptee_period(SSOT) 직독.
+    반환: {nurse_id: {"preceptor_id", "start_date", "expected_end_date"}}.
+      expected_end_date = valid_to − 1day(inclusive 종료일). 관계 없으면 키 부재.
+    """
+    from datetime import date as _date, timedelta as _td
+    from db.models import NursePrecepteePeriod as _NPP
+    ids = [n.nurse_id for n in nurses]
+    if not ids:
+        return {}
+    today = _date.today()
+    rows = db.query(_NPP).filter(
+        _NPP.nurse_id.in_(ids),
+        _NPP.valid_from <= today,
+        _NPP.valid_to > today,
+    ).all()
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        end_incl = (r.valid_to - _td(days=1)) if r.valid_to else None
+        out[str(r.nurse_id)] = {
+            "preceptor_id": str(r.preceptor_id),
+            "start_date": r.valid_from.isoformat() if r.valid_from else None,
+            "expected_end_date": end_incl.isoformat() if end_incl else None,
+        }
     return out
 
 
@@ -250,6 +270,18 @@ def attach_member_badges_to_nurses(
         return nurses
     result = group_members_in_month(db, group_id, int(year), int(month), nurse_pool=nurse_pool)
     member_by_id = {str(m["nurse_id"]): m for m in result.get("members", [])}
+    # 상호 근무 배제 파트너 as-of(월초) 일괄 리졸브 — 근무자관리 되읽기용(preceptor as_of 미러).
+    from datetime import date as _date_mx
+    from services.mutual_exclusion_period import resolve_partner_asof as _resolve_mx_partner
+    _mx_asof = _resolve_mx_partner(db, list(member_by_id.keys()), _date_mx(int(year), int(month), 1))
+    # 파트너 이름은 현재 목록(member_by_id)이 아니라 office-wide 로 조회한다.
+    #   상대가 필터/타그룹/비활성/퇴사로 목록에 없어도 이름이 깨지지 않도록(프론트 요청 완료기준 3).
+    _mx_partner_ids = {pid for pid in _mx_asof.values() if pid}
+    _mx_name_by_id = (
+        {str(nid): nm for nid, nm in db.query(NurseModel.nurse_id, NurseModel.name)
+         .filter(NurseModel.nurse_id.in_(_mx_partner_ids)).all()}
+        if _mx_partner_ids else {}
+    )
     for n in nurses:
         if not isinstance(n, dict):
             continue
@@ -268,6 +300,9 @@ def attach_member_badges_to_nurses(
         n["fixed_shift"] = member.get("as_of_fixed_shift")
         n["is_weekend_off"] = bool(member.get("as_of_weekend_off"))
         n["preceptor_id"] = member.get("as_of_preceptor")  # 월 as-of 프리셉터(종료월=None=관계 해제)
+        _mx_pid = _mx_asof.get(str(n.get("nurse_id")))
+        n["exclusion_partner_id"] = _mx_pid  # 월 as-of 상호배제 파트너
+        n["exclusion_partner_name"] = _mx_name_by_id.get(str(_mx_pid)) if _mx_pid else None
         # flat 6필드를 nested membership 로도 제공(프론트 /nurses 단일 소스용).
         # display_group_id = 이 membership 이 표시되는 기준 그룹(조회/선택 그룹).
         n["membership"] = {
@@ -278,6 +313,9 @@ def attach_member_badges_to_nurses(
             "as_of_grade": member.get("as_of_grade"),
             "is_night_dedicated": member.get("is_night_dedicated"),
             "display_group_id": group_id,
+            # 월 스코프 퇴사 정보 — 퇴사月에만 채워지고, 다음 달엔 member 자체가 없어 자연 소멸.
+            "resign_date": member.get("resign_date"),
+            "resign_reason": member.get("resign_reason"),
         }
     # 역방향 일관성: 프리셉터의 preceptees 목록도 월 as-of 로 필터(종료된 관계 제외).
     #   forward(preceptor_id)와 동일 SSOT(nurse_preceptee_period) — 공통 헬퍼 재사용.
@@ -402,6 +440,7 @@ def get_nurses_in_group_service(
 
     # preceptor → preceptees 배치 로드 (프리셉터 사이드 프로필에 N명 노출용)
     preceptees_map: Dict[str, List[Dict[str, Any]]] = _load_preceptees_map(db, nurses)
+    self_period_map: Dict[str, Dict[str, Any]] = _load_self_period_map(db, nurses)
 
     # 결과 변환: NurseProfile과 호환
     result = []
@@ -422,7 +461,9 @@ def get_nurses_in_group_service(
             "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
+            "exclusion_partner_id": None,  # 년/월 동반 시 attach_member_badges as-of 오버레이로 실제값 주입
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
+            "preceptee_period": self_period_map.get(nurse.nurse_id),
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
             "resignation_date": nurse.resignation_date.isoformat() if nurse.resignation_date else None,
             "resignation_reason": nurse.resignation_reason,
@@ -602,6 +643,7 @@ def get_nurses_filtered_service(
 
     # preceptor → preceptees 배치 로드 (프리셉터 사이드 프로필에 N명 노출용)
     preceptees_map: Dict[str, List[Dict[str, Any]]] = _load_preceptees_map(db, nurses)
+    self_period_map: Dict[str, Dict[str, Any]] = _load_self_period_map(db, nurses)
 
     # 결과 변환: NurseProfile과 호환
     result = []
@@ -622,7 +664,9 @@ def get_nurses_filtered_service(
             "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
+            "exclusion_partner_id": None,  # 년/월 동반 시 attach_member_badges as-of 오버레이로 실제값 주입
             "preceptees": preceptees_map.get(nurse.nurse_id, []),
+            "preceptee_period": self_period_map.get(nurse.nurse_id),
             "joining_date": nurse.joining_date.isoformat() if nurse.joining_date else None,
             "resignation_date": nurse.resignation_date.isoformat() if nurse.resignation_date else None,
             "resignation_reason": nurse.resignation_reason,
@@ -910,6 +954,8 @@ def bulk_update_nurses_service(
     updated_count = 0
     # source 경로에서 preceptor_id 변경된 간호사 기록 (commit 후 프리셉티 assignment 동기화용)
     preceptor_changes: List[Tuple[NurseModel, Optional[str], Optional[str]]] = []
+    # source 경로에서 exclusion_partner_id 받은 간호사 기록 (commit 후 상호배제 period 양방향 동기화용)
+    exclusion_changes: List[Tuple[NurseModel, Optional[str]]] = []
 
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
@@ -922,6 +968,9 @@ def bulk_update_nurses_service(
         # 단건(assignment) + 다건(assignments) 모두 지원. 다건이 먼저 적용된 후 단건이 뒤따른다.
         assignment_payload = update_data.pop("assignment", None)
         assignments_payload = update_data.pop("assignments", None)
+        # 상호 근무 배제 파트너: nurses 컬럼 아님(진실=nurse_mutual_exclusion_period). 소스모드 commit 후 동기화.
+        _exclusion_field_present = "exclusion_partner_id" in update_data
+        _exclusion_after = update_data.pop("exclusion_partner_id", None)
         _payloads_to_apply: List[Dict[str, Any]] = []
         if assignments_payload:
             _payloads_to_apply.extend([p for p in assignments_payload if p])
@@ -961,6 +1010,8 @@ def bulk_update_nurses_service(
         # preceptor_id 변경 탐지 (commit 후 프리셉티 assignment 자동 동기화용)
         _preceptor_field_present = "preceptor_id" in update_data
         _preceptor_before = db_nurse.preceptor_id if _preceptor_field_present else None
+        if _exclusion_field_present:
+            exclusion_changes.append((db_nurse, _exclusion_after))
 
         # active 또는 role 변경 시 sequence 자동 조정
         old_active = db_nurse.active
@@ -1096,6 +1147,19 @@ def bulk_update_nurses_service(
                 "[bulk_preceptee_sync] 실패 nurse=%s: %s",
                 _nurse.nurse_id, e,
             )
+
+    # === commit 후: 상호 근무 배제 파트너 동기화 (양방향 period write-through) ===
+    if exclusion_changes:
+        from services.mutual_exclusion_period import set_mutual_exclusion
+        for _nurse, _partner_id in exclusion_changes:
+            try:
+                set_mutual_exclusion(
+                    db, nurse_id=_nurse.nurse_id, partner_id=_partner_id,
+                    office_id=_nurse.office_id,
+                )
+            except Exception as e:
+                logging.warning("[bulk_mutex_sync] 실패 nurse=%s: %s", _nurse.nurse_id, e)
+        db.commit()
 
     return {
         "message": "간호사 정보가 성공적으로 업데이트되었습니다.",
@@ -1808,7 +1872,12 @@ def update_nurse_profile_service(
     # 단건(assignment) + 다건(assignments) 모두 지원 — 다건 먼저 적용 후 단건.
     assignment_payload = fields.pop("assignment", None)
     assignments_payload = fields.pop("assignments", None)
-    preceptees_assignment_payload = fields.pop("preceptees_assignment", None)
+    # 프리셉터-사이드 write: preceptor_periods (구명 preceptees_assignment 는 전환기 fallback)
+    preceptees_assignment_payload = fields.pop("preceptor_periods", None)
+    if preceptees_assignment_payload is None:
+        preceptees_assignment_payload = fields.pop("preceptees_assignment", None)
+    else:
+        fields.pop("preceptees_assignment", None)
     _payloads_to_apply: List[Dict[str, Any]] = []
     if assignments_payload:
         _payloads_to_apply.extend([p for p in assignments_payload if p])
@@ -1833,6 +1902,12 @@ def update_nurse_profile_service(
                 _dispatch_preceptees_payload(db, nurse_id, _peer, current_user)
         db.refresh(nurse)
 
+    # 이 간호사(owner)가 프리셉티일 때: 프리셉터+기간 지정을 period 로 직접 write.
+    preceptee_period_payload = fields.pop("preceptee_period", None)
+    if preceptee_period_payload:
+        _dispatch_preceptee_self_period(db, nurse_id, preceptee_period_payload, current_user)
+        db.refresh(nurse)
+
     email_changed = "email" in fields
     new_email = fields.get("email")
     applied_source = False
@@ -1840,6 +1915,9 @@ def update_nurse_profile_service(
     # preceptor_id 변경 탐지 (source 경로에서만 유효; assignment payload 반영 후 값 기준)
     _preceptor_field_present = "preceptor_id" in fields
     _preceptor_before = nurse.preceptor_id if _preceptor_field_present else None
+    # 상호 근무 배제 파트너(nurses 컬럼 아님·진실=period). fields 유지(_apply_source_nurse_update 가 hasattr 가드로 skip).
+    _exclusion_field_present = "exclusion_partner_id" in fields
+    _exclusion_after = fields.get("exclusion_partner_id")
 
     if not fields:
         return {
@@ -1972,6 +2050,22 @@ def update_nurse_profile_service(
                 "[preceptee_sync] 전체 실패 nurse=%s: %s",
                 nurse_id, e,
             )
+
+    # 상호배제는 nurses 컬럼/period-owned 필드가 아니라 nurse_mutual_exclusion_period(SSOT).
+    #   source/target/inbound/admin 무관하게, 권한 검증 통과(여기 도달=이미 통과) 후 필드 존재 시 항상 동기화.
+    #   applied_source 게이트에 묶으면 target(인바운드) 편집에서 해제 payload 가 유실된다(period close 누락).
+    #   partner_id="..."=설정 / partner_id=None=해제. valid_from=선택월 1일(_eff_vf, year/month 미동반 시 today).
+    if _exclusion_field_present:
+        try:
+            from services.mutual_exclusion_period import set_mutual_exclusion
+            set_mutual_exclusion(
+                db, nurse_id=nurse.nurse_id, partner_id=_exclusion_after,
+                office_id=nurse.office_id, valid_from=_eff_vf,
+            )
+            db.commit()
+            db.refresh(nurse)
+        except Exception as e:
+            logging.warning("[mutex_sync] 단건 실패 nurse=%s: %s", nurse_id, e)
 
     # email 변경 시 MSSQL dual write는 source/admin 경로에서만 수행
     # (target 모드는 nurses.email을 건드리지 않으므로 Member.Email과의 정합성을 깨뜨리지 않기 위해 skip)
@@ -2193,165 +2287,144 @@ def _dispatch_preceptees_payload(
     current_user: UserSchema,
 ) -> None:
     """preceptees_assignment 1건 처리 — preceptor 사이드 프로필 입장에서 N명 중 1명에 대한
-    create/update/cancel 을 nurse_assignment(reason='프리셉티') 로 위임 + nurses.preceptor_id 동기화.
+    create/update/cancel 을 **nurse_preceptee_period(SSOT) 로 직접** 처리한다.
+    (assignment 절대 경유 금지 — 도려내기. 캐시 nurses.preceptor_id 는 전환기 단방향 투영.)
 
-    1:1 단방향 강제: target 에 이미 active 프리셉티 row 가 있으면 422.
+    계약: 대상 식별 = target_nurse_id (프리셉티는 1:1 이라 assignment_id 불필요).
+      - create/update: start_date + expected_end_date **둘 다 필수** (무기한 폐지).
+        open_preceptee_period 가 겹치는 기존 구간을 삭제하고 새로 넣는다(upsert).
+      - cancel: delete_preceptee_period (row 삭제).
     권한: caller 의 resolve_managed_group_ids 결과 안에 target 의 group_id 가 있어야 함.
     """
+    from datetime import date as _date
+    from services.preceptee_period import (
+        open_preceptee_period, delete_preceptee_period,
+        end_date_to_valid_to, resolve_preceptor_asof,
+    )
+
     op = (peer or {}).get("operation")
     target_nurse_id = (peer or {}).get("target_nurse_id")
-    assignment_id = (peer or {}).get("assignment_id")
     start_date = (peer or {}).get("start_date")
     expected_end_date = (peer or {}).get("expected_end_date")
-    note = (peer or {}).get("note")
 
     if not op:
         raise HTTPException(status_code=400, detail="preceptees_assignment.operation 필수")
-
-    from services.assignment_service import (
-        create_assignment as _create_assignment,
-        update_assignment as _update_assignment,
-        cancel_assignment as _cancel_assignment,
-    )
-    from schemas.roster_schema import NurseAssignmentCreate, NurseAssignmentUpdate
+    if not target_nurse_id:
+        raise HTTPException(status_code=400, detail="preceptees_assignment.target_nurse_id 필수")
 
     caller_office_id = getattr(current_user, "office_id", None)
 
-    if op == "create":
-        if not target_nurse_id:
-            raise HTTPException(status_code=400, detail="create 시 target_nurse_id 필수")
-        if not start_date:
-            raise HTTPException(status_code=400, detail="create 시 start_date 필수")
+    # ── 공통 검증 (target 조회 + office/group 권한) ──
+    target = db.query(NurseModel).filter(NurseModel.nurse_id == target_nurse_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail=f"preceptee 간호사를 찾을 수 없습니다: {target_nurse_id}")
+    if caller_office_id and target.office_id and target.office_id != caller_office_id:
+        raise HTTPException(status_code=403, detail=f"office 경계 위반: target 간호사({target_nurse_id})가 다른 office 소속입니다.")
+    allowed_groups = set(resolve_managed_group_ids(db, current_user))
+    if target.group_id not in allowed_groups:
+        raise HTTPException(status_code=403, detail=f"해당 간호사({target_nurse_id})에 접근 권한이 없습니다.")
+
+    if op in ("create", "update"):
         if target_nurse_id == preceptor_nurse_id:
             raise HTTPException(status_code=400, detail="자기 자신을 preceptee 로 등록할 수 없습니다.")
-        target = db.query(NurseModel).filter(NurseModel.nurse_id == target_nurse_id).first()
-        if not target:
-            raise HTTPException(status_code=404, detail=f"preceptee 간호사를 찾을 수 없습니다: {target_nurse_id}")
-        if caller_office_id and target.office_id and target.office_id != caller_office_id:
-            raise HTTPException(status_code=403, detail=f"office 경계 위반: target 간호사({target_nurse_id})가 다른 office 소속입니다.")
+        if not start_date:
+            raise HTTPException(status_code=400, detail=f"{op} 시 start_date(시작일) 필수")
+        if not expected_end_date:
+            raise HTTPException(status_code=400, detail=f"{op} 시 expected_end_date(종료예정일) 필수 — 무기한 프리셉티는 등록할 수 없습니다.")
         preceptor_nurse = db.query(NurseModel).filter(NurseModel.nurse_id == preceptor_nurse_id).first()
         if preceptor_nurse and preceptor_nurse.office_id and target.office_id and preceptor_nurse.office_id != target.office_id:
             raise HTTPException(status_code=403, detail="preceptor 와 preceptee 의 office 가 일치해야 합니다.")
-        allowed_groups = set(resolve_managed_group_ids(db, current_user))
-        if target.group_id not in allowed_groups:
-            raise HTTPException(status_code=403, detail=f"해당 간호사({target_nurse_id})에 접근 권한이 없습니다.")
-        existing = db.query(NurseAssignment).filter(
-            NurseAssignment.nurse_id == target_nurse_id,
-            NurseAssignment.reason == "프리셉티",
-            NurseAssignment.status == "active",
-        ).first()
-        if existing:
-            raise HTTPException(
-                status_code=422,
-                detail=f"이미 활성 프리셉티 관계가 있습니다. (assignment_id={existing.id})",
-            )
-        # nurses.preceptor_id legacy link (다른 preceptor) 가 이미 있는 경우 차단 — 1:1 단방향 강제
-        if target.preceptor_id and target.preceptor_id != preceptor_nurse_id:
-            raise HTTPException(
-                status_code=422,
-                detail=f"이미 다른 preceptor({target.preceptor_id}) 와 link 되어 있습니다. 먼저 해제 후 등록해 주세요.",
-            )
-        req = NurseAssignmentCreate(
-            nurse_id=target_nurse_id,
-            source_group_id=target.group_id,
-            target_group_id=None,
-            office_id=target.office_id,
-            start_date=start_date,
-            expected_end_date=expected_end_date,
-            reason="프리셉티",
-            note=note,
-        )
-        created = _create_assignment(req, db, current_user=current_user)
-        target.preceptor_id = preceptor_nurse_id
-        # write-through: nurse_preceptee_period SSOT (WHO+WHEN). 캐시는 위에서 명시 set(전환기).
-        from services.preceptee_period import open_preceptee_period, end_date_to_valid_to
+        _sd = start_date if isinstance(start_date, _date) else _date.fromisoformat(str(start_date))
+        _ed = expected_end_date if isinstance(expected_end_date, _date) else _date.fromisoformat(str(expected_end_date))
+        # 1:1 단방향: create 는 다른 preceptor 와 현재 관계가 있으면 차단. update 는 대체(재지정) 허용.
+        if op == "create":
+            _cur = resolve_preceptor_asof(db, [target_nurse_id], _date.today()).get(str(target_nurse_id))
+            if _cur and _cur != preceptor_nurse_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"이미 다른 preceptor({_cur}) 와 관계가 있습니다. 먼저 취소 후 등록해 주세요.",
+                )
         open_preceptee_period(
             db, nurse_id=target_nurse_id, preceptor_id=preceptor_nurse_id,
-            office_id=target.office_id, valid_from=start_date,
-            valid_to=end_date_to_valid_to(expected_end_date),
-            source_assignment_id=getattr(created, "id", None), source="assignment",
-            nurse=None,  # 캐시는 명시 set 유지(전환기) — 이중 갱신 방지
+            office_id=target.office_id, valid_from=_sd,
+            valid_to=end_date_to_valid_to(_ed), source="edited",
+            nurse=target,  # 캐시 단방향 투영(전환기)
         )
         db.commit()
-    elif op == "update":
-        if not assignment_id:
-            raise HTTPException(status_code=400, detail="update 시 assignment_id 필수")
-        row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
-        if not row:
-            raise HTTPException(status_code=404, detail=f"assignment_id={assignment_id} 를 찾을 수 없습니다.")
-        if row.reason != "프리셉티":
-            raise HTTPException(status_code=400, detail=f"assignment_id={assignment_id} 는 프리셉티 reason 이 아닙니다.")
-        target = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
-        if not target:
-            raise HTTPException(status_code=404, detail=f"assignment 의 nurse({row.nurse_id}) 를 찾을 수 없습니다.")
-        if caller_office_id and target.office_id and target.office_id != caller_office_id:
-            raise HTTPException(status_code=403, detail=f"office 경계 위반: target 간호사({row.nurse_id})가 다른 office 소속입니다.")
-        # 본 PATCH 의 preceptor 와 row 의 실제 preceptor 일치 검증 (타 preceptor 의 row 변조 차단)
-        if target.preceptor_id and target.preceptor_id != preceptor_nurse_id:
-            raise HTTPException(status_code=403, detail=f"해당 assignment 는 다른 preceptor({target.preceptor_id}) 소속입니다.")
-        allowed_groups = set(resolve_managed_group_ids(db, current_user))
-        if target.group_id not in allowed_groups:
-            raise HTTPException(status_code=403, detail=f"해당 간호사({row.nurse_id})에 접근 권한이 없습니다.")
-        # start_date 는 NOT NULL 이라 explicit null 전달 차단
-        if "start_date" in peer and peer["start_date"] is None:
-            raise HTTPException(status_code=400, detail="start_date 는 null 로 변경할 수 없습니다.")
-        # 1단계: 일반 필드 변경은 _update_assignment 위임 (overlap·기간 정합성 등 공통 검증 보존).
-        #   None=no-change 시맨틱이라 explicit null 은 여기서 적용되지 않는다.
-        upd = NurseAssignmentUpdate(
-            start_date=peer.get("start_date"),
-            expected_end_date=peer.get("expected_end_date"),
-            note=peer.get("note"),
-        )
-        _update_assignment(assignment_id, upd, db, current_user=current_user)
-        # 2단계: explicit null 필드 (key 있고 value None) 만 row 직접 NULL 처리.
-        #   _update_assignment 통과 후 적용되므로 검증 우회 아님.
-        explicit_null_changed = False
-        row_after = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
-        if row_after is not None:
-            if "expected_end_date" in peer and peer["expected_end_date"] is None:
-                row_after.expected_end_date = None
-                explicit_null_changed = True
-            if "note" in peer and peer["note"] is None:
-                row_after.note = None
-                explicit_null_changed = True
-            if explicit_null_changed:
-                db.commit()
     elif op == "cancel":
-        if not assignment_id:
-            raise HTTPException(status_code=400, detail="cancel 시 assignment_id 필수")
-        row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
-        if not row:
-            raise HTTPException(status_code=404, detail=f"assignment_id={assignment_id} 를 찾을 수 없습니다.")
-        if row.reason != "프리셉티":
-            raise HTTPException(status_code=400, detail=f"assignment_id={assignment_id} 는 프리셉티 reason 이 아닙니다.")
-        target = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
-        if not target:
-            raise HTTPException(status_code=404, detail=f"assignment 의 nurse({row.nurse_id}) 를 찾을 수 없습니다.")
-        if caller_office_id and target.office_id and target.office_id != caller_office_id:
-            raise HTTPException(status_code=403, detail=f"office 경계 위반: target 간호사({row.nurse_id})가 다른 office 소속입니다.")
-        if target.preceptor_id and target.preceptor_id != preceptor_nurse_id:
-            raise HTTPException(status_code=403, detail=f"해당 assignment 는 다른 preceptor({target.preceptor_id}) 소속입니다.")
-        allowed_groups = set(resolve_managed_group_ids(db, current_user))
-        if target.group_id not in allowed_groups:
-            raise HTTPException(status_code=403, detail=f"해당 간호사({row.nurse_id})에 접근 권한이 없습니다.")
-        _cancel_assignment(assignment_id, db, current_user=current_user)
-        if target.preceptor_id == preceptor_nurse_id:
-            still_active = db.query(NurseAssignment).filter(
-                NurseAssignment.nurse_id == row.nurse_id,
-                NurseAssignment.reason == "프리셉티",
-                NurseAssignment.status == "active",
-            ).first()
-            if not still_active:
-                # write-through: 열린 period close(end_reason=cancelled) + 캐시 None 투영.
-                from datetime import date as _date
-                from services.preceptee_period import close_preceptee_period
-                close_preceptee_period(
-                    db, nurse_id=row.nurse_id, close_date=_date.today(),
-                    end_reason="cancelled", nurse=target,
-                )
-                db.commit()
+        delete_preceptee_period(
+            db, nurse_id=target_nurse_id, preceptor_id=preceptor_nurse_id, nurse=target,
+        )
+        db.commit()
     else:
         raise HTTPException(status_code=400, detail=f"preceptees_assignment.operation 값이 올바르지 않습니다: {op!r}")
+
+
+def _dispatch_preceptee_self_period(
+    db: Session,
+    owner_nurse_id: str,
+    payload: Dict[str, Any],
+    current_user: UserSchema,
+) -> None:
+    """이 간호사(owner=프리셉티)의 프리셉터+기간 지정을 nurse_preceptee_period 로 직접 write.
+
+    assignment 절대 경유 금지. create/update: end 필수(무기한 폐지). cancel: 현재/미래 구간 삭제.
+    권한: owner 의 group_id 가 caller 의 관리 그룹 안에 있어야 함.
+    """
+    from datetime import date as _date
+    from services.preceptee_period import (
+        open_preceptee_period, delete_preceptee_period,
+        end_date_to_valid_to, resolve_preceptor_asof,
+    )
+
+    op = (payload or {}).get("operation")
+    preceptor_id = (payload or {}).get("preceptor_id")
+    start_date = (payload or {}).get("start_date")
+    expected_end_date = (payload or {}).get("expected_end_date")
+    if not op:
+        raise HTTPException(status_code=400, detail="preceptee_period.operation 필수")
+
+    caller_office_id = getattr(current_user, "office_id", None)
+    owner = db.query(NurseModel).filter(NurseModel.nurse_id == owner_nurse_id).first()
+    if not owner:
+        raise HTTPException(status_code=404, detail=f"간호사를 찾을 수 없습니다: {owner_nurse_id}")
+    if caller_office_id and owner.office_id and owner.office_id != caller_office_id:
+        raise HTTPException(status_code=403, detail=f"office 경계 위반: 간호사({owner_nurse_id})가 다른 office 소속입니다.")
+    allowed_groups = set(resolve_managed_group_ids(db, current_user))
+    if owner.group_id not in allowed_groups:
+        raise HTTPException(status_code=403, detail=f"해당 간호사({owner_nurse_id})에 접근 권한이 없습니다.")
+
+    if op in ("create", "update"):
+        if not preceptor_id:
+            raise HTTPException(status_code=400, detail=f"{op} 시 preceptor_id 필수")
+        if str(preceptor_id) == str(owner_nurse_id):
+            raise HTTPException(status_code=400, detail="자기 자신을 프리셉터로 지정할 수 없습니다.")
+        if not start_date:
+            raise HTTPException(status_code=400, detail=f"{op} 시 start_date(시작일) 필수")
+        if not expected_end_date:
+            raise HTTPException(status_code=400, detail=f"{op} 시 expected_end_date(종료예정일) 필수 — 무기한 프리셉티는 등록할 수 없습니다.")
+        preceptor = db.query(NurseModel).filter(NurseModel.nurse_id == str(preceptor_id)).first()
+        if not preceptor:
+            raise HTTPException(status_code=404, detail=f"프리셉터 간호사를 찾을 수 없습니다: {preceptor_id}")
+        if preceptor.office_id and owner.office_id and preceptor.office_id != owner.office_id:
+            raise HTTPException(status_code=403, detail="프리셉터와 프리셉티의 office 가 일치해야 합니다.")
+        _sd = start_date if isinstance(start_date, _date) else _date.fromisoformat(str(start_date))
+        _ed = expected_end_date if isinstance(expected_end_date, _date) else _date.fromisoformat(str(expected_end_date))
+        if op == "create":
+            _cur = resolve_preceptor_asof(db, [owner_nurse_id], _date.today()).get(str(owner_nurse_id))
+            if _cur and str(_cur) != str(preceptor_id):
+                raise HTTPException(status_code=422, detail=f"이미 다른 preceptor({_cur}) 와 관계가 있습니다. 먼저 취소 후 등록해 주세요.")
+        open_preceptee_period(
+            db, nurse_id=owner_nurse_id, preceptor_id=str(preceptor_id),
+            office_id=owner.office_id, valid_from=_sd,
+            valid_to=end_date_to_valid_to(_ed), source="edited", nurse=owner,
+        )
+        db.commit()
+    elif op == "cancel":
+        delete_preceptee_period(db, nurse_id=owner_nurse_id, nurse=owner)
+        db.commit()
+    else:
+        raise HTTPException(status_code=400, detail=f"preceptee_period.operation 값이 올바르지 않습니다: {op!r}")
 
 
 def _dispatch_assignment_payload(
@@ -2377,6 +2450,13 @@ def _dispatch_assignment_payload(
     )
 
     op = (payload or {}).get("operation")
+    # 도려내기: 프리셉티는 절대 assignment 경로로 만들지 않는다(period SSOT 전용).
+    #   프론트가 assignment/assignments 로 reason="프리셉티" 를 보내면 명시적으로 차단.
+    if (payload or {}).get("reason") == "프리셉티":
+        raise HTTPException(
+            status_code=400,
+            detail="프리셉티는 assignment 로 처리하지 않습니다. preceptor_periods(period) 경로를 사용하세요.",
+        )
     if op == "create":
         data = {k: payload.get(k) for k in _ASSIGNMENT_CREATE_FIELDS}
         data["nurse_id"] = nurse_id
@@ -2434,72 +2514,35 @@ def _sync_preceptee_assignment(
     new_preceptor_id: Optional[str],
     current_user: UserSchema,
 ) -> None:
-    """nurses.preceptor_id 변경에 맞춰 nurse_assignment(reason='프리셉티')를 자동 동기화.
+    """nurses.preceptor_id(캐시) 변경에 맞춰 nurse_preceptee_period(SSOT)를 동기화.
 
-    - 해제 (new=None): nurses.preceptor_id가 NULL이면 active 프리셉티 row 전부 cancel.
-      이전 값이 None이었더라도 (state 비대칭 reconcile) active row가 떠있으면 정리한다.
-    - 신규 (previous=None, new=값): active row가 없으면 새로 생성.
-    - 변경 (valueA → valueB): assignment row에 preceptor_id 저장 필드가 없으므로 no-op.
+    도려내기 정책: 프리셉티 **관계 생성은 오직 날짜 있는 period UI(사이드 프로필) 경유**.
+    source/import 경로의 bare preceptor_id 변경은 날짜가 없으므로:
+    - 해제 (new=None): 현재/미래 period 구간 삭제(delete). 캐시도 None(호출자가 이미 set).
+    - 신규 (previous=None, new=값): **날짜 없이는 period 를 만들 수 없어 skip + 경고 로그.**
+      (관계는 사이드 프로필에서 start/end 지정해 등록해야 SSOT 에 반영됨.)
+    - 변경 (valueA → valueB): 마찬가지로 period 신규생성 skip(날짜 부재).
+    ※ 캐시 컬럼 폐지 후에는 이 함수와 호출부(preceptor_changes) 전체가 제거될 예정.
     """
-    from schemas.roster_schema import NurseAssignmentCreate as _CreateReq
-    from services.assignment_service import (
-        create_assignment as _create_assignment,
-        cancel_assignment as _cancel_assignment,
-    )
+    from services.preceptee_period import delete_preceptee_period
 
-    existings = (
-        db.query(NurseAssignment)
-        .filter(
-            NurseAssignment.nurse_id == nurse.nurse_id,
-            NurseAssignment.reason == "프리셉티",
-            NurseAssignment.status == "active",
-        )
-        .order_by(NurseAssignment.start_date.desc())
-        .all()
-    )
-
-    # 해제: nurses.preceptor_id가 NULL인 모든 케이스에서 active row 정리.
-    # (값→None) 정상 해제 + (None→None) state reconcile 둘 다 처리.
+    # 해제: 현재/미래 period 삭제 (값→None + None→None reconcile 둘 다).
     if new_preceptor_id is None:
-        for existing in existings:
-            try:
-                _cancel_assignment(existing.id, db, current_user=current_user)
-            except HTTPException:
-                raise
-            except Exception as e:
-                logging.warning(
-                    "[preceptee_sync] cancel 실패 nurse=%s id=%s: %s",
-                    nurse.nurse_id, existing.id, e,
-                )
+        try:
+            delete_preceptee_period(db, nurse_id=nurse.nurse_id)
+        except Exception as e:
+            logging.warning("[preceptee_sync] period 삭제 실패 nurse=%s: %s", nurse.nurse_id, e)
         return
 
     if previous_preceptor_id == new_preceptor_id:
         return
 
-    # (None → 값): 신규 생성 (이미 active면 no-op)
-    if previous_preceptor_id is None:
-        if existings:
-            return
-        try:
-            req = _CreateReq(
-                nurse_id=nurse.nurse_id,
-                source_group_id=nurse.group_id,
-                target_group_id=None,
-                office_id=nurse.office_id,
-                start_date=date.today(),
-                expected_end_date=None,
-                reason="프리셉티",
-            )
-            _create_assignment(req, db, current_user=current_user)
-        except HTTPException:
-            raise
-        except Exception as e:
-            logging.warning(
-                "[preceptee_sync] create 실패 nurse=%s: %s",
-                nurse.nurse_id, e,
-            )
-        return
-    # (valueA → valueB): 현 스키마상 변경 기록 없음 — assignment row는 유지
+    # (None→값) / (값→값): 날짜 없는 관계 지정은 period SSOT 에 기록하지 않는다.
+    logging.warning(
+        "[preceptee_sync] bare preceptor_id 지정 skip (날짜 없음) — 사이드 프로필에서 "
+        "start/end 로 등록 필요. nurse=%s preceptor=%s",
+        nurse.nurse_id, new_preceptor_id,
+    )
 
 
 def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
@@ -2787,18 +2830,18 @@ def delete_profile_image_service(current_user, db: Session) -> Dict[str, Any]:
 # nurse 원본 대신 nurse_assignment.target_* 필드에 저장해야 한다.
 
 _INBOUND_REASONS = ("파견", "병동이동")
-# GET 응답 표시용(inbound_list + current_assignment): 5종 전부 노출.
-# (transfer 의미의 _INBOUND_REASONS 와 분리 — 휴직/퇴사/프리셉티는 target_group_id 없음)
+# GET 응답 표시용(inbound_list + current_assignment): 근무상태 4종만 노출.
+# 프리셉티 '관계'는 여기서 제외 — preceptee_period/preceptor_periods 로만 표현한다
+# (current_assignment 는 근무상태(휴직/퇴사/파견/병동이동) 전용, 관계와 혼동 금지).
+# (transfer 의미의 _INBOUND_REASONS 와 분리 — 휴직/퇴사는 target_group_id 없음)
 _STATUS_DISPLAY_REASONS: Tuple[str, ...] = _INBOUND_REASONS + (
     "휴직",
     "퇴사",
-    "프리셉티",
 )
 # current_assignment 대표 1건 우선순위: 숫자 작을수록 우선.
 _ASSIGNMENT_PRIORITY: Dict[str, int] = {
     "휴직": 0,
     "퇴사": 0,
-    "프리셉티": 1,
     "파견": 2,
     "병동이동": 2,
 }
@@ -2929,14 +2972,14 @@ def _build_inbound_blocks(
     nurse_ids: List[str],
     caller_group_id: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """간호사별 활성 파견/병동이동/휴직/퇴사/프리셉티 블록 구성.
+    """간호사별 활성 파견/병동이동/휴직/퇴사 블록 구성.
 
     Returns: dict[nurse_id] = {
         "inbound_list": [InboundEntry dict, ...],
         "current_assignment": {CurrentAssignment dict} or None,
     }
-    current_assignment: 휴직/퇴사 > 프리셉티 > 파견/병동이동 우선,
-    동률 시 start_date DESC (최신).
+    current_assignment: 휴직/퇴사 > 파견/병동이동 우선, 동률 시 start_date DESC (최신).
+    프리셉티 관계는 여기 미포함(preceptee_period/preceptor_periods 로 표현).
 
     caller_group_id: 지정 시, 그 그룹에서 '전출'(병동이동, source==caller)된 completed 행도
         포함해 과거 병동(source) 명단의 '전출함' 표시를 살린다. 전입처(B) 화면은 오염되지

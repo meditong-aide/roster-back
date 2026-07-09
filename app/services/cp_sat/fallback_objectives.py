@@ -497,11 +497,64 @@ def build_fallback_stage3_objective_terms(
         print("preceptor_objective_terms 예외 발생")
         print("e", e)
         pass
+
+    # 상호 근무 배제(mutual exclusion) soft: 같은 날 같은 근무조 co-assignment 페널티.
+    # 프리셉터 together 보너스의 배반(부호 반대). grade/team 하드가 lexicographic 상위·등식락이라 침범 불가.
+    # z >= X(a,d,s)+X(b,d,s)-1 : 둘 다 같은 근무조 배정 시에만 z=1 강제 → Maximize 라 음수계수로 회피 유도.
+    try:
+        _mx_pairs = getattr(roster_system, "mutual_exclusion_pairs", None)
+        if _mx_pairs:
+            _cfg_mx = roster_system.config
+            # 기본 300,000: 실인스턴스(COMBINED)에서 grade soft(1.6M)·OFF균등(100k)와 경쟁해
+            # 실효를 내되 grade/team 하드는 절대 못 이기는 수준. 라이브 튜닝(dev 2026-08): 8→4건.
+            import os as _os_mx
+            _w_mx = int(_os_mx.getenv("MUTEX_W")
+                        or getattr(_cfg_mx, "mutual_exclusion_penalty_weight", 300000) or 0)
+            if _w_mx > 0:
+                _use_mid_mx = bool(getattr(_cfg_mx, "use_mid", False))
+                _shift_types_mx = list(_cfg_mx.shift_types or [])
+                _shift_idx_mx = [
+                    _shift_types_mx.index(c)
+                    for c in _cfg_mx.daily_shift_requirements.keys()
+                    if c in _shift_types_mx
+                ]
+
+                def _is_dedicated_mx(_idx):
+                    # N전담 등 '단일 근무조 전담'(allowed_shifts=1종) 은 배반 규칙 제외 —
+                    # 특정 조에 묶여 있어 배제가 무의미/과도. 시점가변이라 생성 시점(as-of)에 판별.
+                    _raw = getattr(roster_system.nurses[_idx], "allowed_shifts", None)
+                    return len(normalize_allowed_shift_codes(_raw, use_mid=_use_mid_mx)) == 1
+
+                _mutex_lex_z = []  # "grade/team 바로 밑" lex 패스용 위반변수 stash(전담 제외 통과분만)
+                for (_a, _b, _days_mx) in _mx_pairs:
+                    if _is_dedicated_mx(_a) or _is_dedicated_mx(_b):
+                        print(f"[MutualExcl][SKIP] 전담(단일근무조) 포함 페어 제외: a={_a}, b={_b}")
+                        continue
+                    _d_lo = max(join[_a], join[_b])
+                    _d_hi = min(leave[_a], leave[_b])
+                    for _d in range(_d_lo, _d_hi + 1):
+                        if _d not in _days_mx:
+                            continue
+                        for _s in _shift_idx_mx:
+                            _z = m.NewBoolVar(f"mutex_viol_fb_{_a}_{_b}_{_d}_{_s}")
+                            m.Add(_z >= X(_a, _d, _s) + X(_b, _d, _s) - 1)
+                            obj.append(-_w_mx * _z)
+                            _mutex_lex_z.append(_z)
+                if _mutex_lex_z:
+                    m._mutex_lex_vars = _mutex_lex_z  # type: ignore[attr-defined]
+    except Exception as _e_mx:
+        print("mutual_exclusion_objective_terms 예외 발생", _e_mx)
+
     grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
     print("grade_strategy", grade_strategy)
+    # "grade/team 바로 밑" lex 패스용: 이 소프트 품질 항들을 동결한 뒤 mutex 위반만 최소화.
+    # (team_min 은 하드 m.Add 로 이미 강제되므로 freeze 대상에서 제외 — team_balance/grade/handoff 만.)
+    _gt_lex_terms = []
     try:
         if grade_strategy in ("TEAM", "COMBINED"):
-            obj.extend(add_team_balance_terms_fn(m, roster_system, X, join, leave))
+            _tb_terms = add_team_balance_terms_fn(m, roster_system, X, join, leave)
+            obj.extend(_tb_terms)
+            _gt_lex_terms.extend(_tb_terms or [])
     except Exception as e:
         print("team_balance_objective_terms 예외 발생")
         print("e", e)
@@ -523,6 +576,7 @@ def build_fallback_stage3_objective_terms(
             grade_config=getattr(roster_system, "grade_config", None),
         )
         obj.extend(grade_terms or [])
+        _gt_lex_terms.extend(grade_terms or [])
     except Exception as e:
         print("grade_constraints 예외 발생")
         print("e", e)
@@ -532,13 +586,15 @@ def build_fallback_stage3_objective_terms(
     try:
         _gs_h = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
         if _gs_h == "COMBINED":
-            obj.extend(
-                add_team_grade_handoff_constraints(
-                    m, roster_system, X, join, leave, grade_strategy=_gs_h
-                )
+            _hf_terms = add_team_grade_handoff_constraints(
+                m, roster_system, X, join, leave, grade_strategy=_gs_h
             )
+            obj.extend(_hf_terms)
+            _gt_lex_terms.extend(_hf_terms or [])
     except Exception as e:
         print("team_grade_handoff_constraints(fallback) 예외 발생", e)
+    if _gt_lex_terms:
+        m._grade_team_lex_terms = _gt_lex_terms  # type: ignore[attr-defined]
 
     # 3N 블록 유도: 2N2O+3N2O 동시 활성 시 2N 블록에 소프트 페널티
     try:

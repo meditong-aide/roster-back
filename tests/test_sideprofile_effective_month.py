@@ -109,3 +109,52 @@ def test_sideprofile_grade_selected_month_source(seeded):
                                  effective_year=2026, effective_month=8)
     assert _gr(db, date(2026, 7, 15), "A") == 2   # 7월 유지
     assert _gr(db, date(2026, 8, 15), "A") == 3   # 8월부터 3
+
+
+def _partner(db, nid, day):
+    from services.mutual_exclusion_period import resolve_partner_asof
+    return resolve_partner_asof(db, [nid], day).get(nid)
+
+
+@pytest.mark.parametrize("label,caller", _ROLES, ids=[r[0] for r in _ROLES])
+def test_mutual_exclusion_set_and_release_all_roles(seeded, label, caller):
+    """★회귀: 어느 역할(admin/source/target)로 저장해도 상호배제 설정·해제가 선택월 1일 발효로 반영.
+
+    특히 target(인바운드) 편집에서 해제(null) payload 가 유실되면 안 된다 — 기존엔
+    set_mutual_exclusion 이 `applied_source` 게이트에 묶여 target 모드에서 스킵됐다.
+    """
+    db = seeded
+    # 배제 파트너 n2 (홈 A)
+    db.add(Nurse(nurse_id="n2", account_id="acc_n2", group_id="A", office_id="o1",
+                 name="이영희", active=1, is_weekend_off=False, allowed_shifts=[], grade=1))
+    db.flush()
+
+    # 6월 1일 발효로 설정
+    update_nurse_profile_service("n1", NurseProfileUpdate(exclusion_partner_id="n2"), caller, db,
+                                 effective_year=2026, effective_month=6)
+    assert _partner(db, "n1", date(2026, 6, 1)) == "n2", f"[{label}] 설정 미반영"
+    assert _partner(db, "n2", date(2026, 6, 1)) == "n1", f"[{label}] 양방향 미반영"
+    assert _partner(db, "n1", date(2026, 5, 31)) is None, f"[{label}] valid_from 이 선택월 1일 아님"
+
+    # 8월 1일 발효로 해제(null) — target 모드에서도 반드시 실행돼야 함
+    update_nurse_profile_service("n1", NurseProfileUpdate(exclusion_partner_id=None), caller, db,
+                                 effective_year=2026, effective_month=8)
+    assert _partner(db, "n1", date(2026, 8, 1)) is None, f"[{label}] 해제 미반영(target 유실 회귀)"
+    assert _partner(db, "n2", date(2026, 8, 1)) is None, f"[{label}] 양방향 해제 미반영"
+    assert _partner(db, "n1", date(2026, 7, 15)) == "n2", f"[{label}] 과거 배제 구간 소실"
+
+
+def test_mutual_exclusion_field_omitted_no_change(seeded):
+    """★필드 생략(≠null) PATCH 는 기존 상호배제 관계를 변경하지 않는다."""
+    db = seeded
+    u = _user(nurse_id="HN_A", account_id="acc_HN_A", group_id="A",
+              is_head_nurse=True, hn_auth="HN")
+    db.add(Nurse(nurse_id="n2", account_id="acc_n2", group_id="A", office_id="o1",
+                 name="이영희", active=1, is_weekend_off=False, allowed_shifts=[], grade=1))
+    db.flush()
+    update_nurse_profile_service("n1", NurseProfileUpdate(exclusion_partner_id="n2"), u, db,
+                                 effective_year=2026, effective_month=6)
+    # exclusion_partner_id 를 생략한 다른 필드만 수정 → 관계 유지
+    update_nurse_profile_service("n1", NurseProfileUpdate(grade=3), u, db,
+                                 effective_year=2026, effective_month=6)
+    assert _partner(db, "n1", date(2026, 6, 1)) == "n2"  # 생략 → 무변경

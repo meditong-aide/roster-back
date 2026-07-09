@@ -629,7 +629,7 @@ class CPSATBasicEngine:
             # 팀별 최소 시프트 커버리지(팀 단위 per-team 제약)
             team_min_by_team=config_data.get("team_min_by_team") or {},
             team_min_soft_fallback=bool(config_data.get("team_min_soft_fallback", False)),
-            team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 500) or 0),
+            team_min_penalty_weight=int(config_data.get("team_min_penalty_weight", 80000) or 0),
             # 팀 내 인계 제한 정책(팀별)
             team_handoff_policy_by_team=config_data.get("team_handoff_policy_by_team") or {},
             team_handoff_soft_fallback=bool(config_data.get("team_handoff_soft_fallback", True)),
@@ -1068,6 +1068,15 @@ class CPSATBasicEngine:
                         {i: p for i, (p, d) in _ctx.items() if p is not None})
                 for i, (p, d) in _ctx.items():
                     print(f"[Assignment][Solver] preceptee_period: solver_idx={i}, preceptor_idx={p}, days={sorted(d)}")
+            # 상호 근무 배제(mutual exclusion): config map → 솔버 idx 페어(양방향 dedup·days 합집합).
+            _mutex_map = config_data.get("mutual_exclusion_by_nurse_id") if isinstance(config_data, dict) else None
+            if _mutex_map:
+                from services.cp_sat.mutual_exclusion_context import build_mutual_exclusion_context
+                _mx_id_to_idx = getattr(roster_system, '_id_to_idx', None) or {str(nu.db_id): i for i, nu in enumerate(nurses)}
+                _mx_pairs = build_mutual_exclusion_context(nurses, _mutex_map, roster_system.num_days, id_to_idx=_mx_id_to_idx)
+                setattr(roster_system, "mutual_exclusion_pairs", _mx_pairs)
+                for (_a, _b, _dd) in _mx_pairs:
+                    print(f"[Assignment][Solver] mutual_exclusion: a={_a}, b={_b}, days={sorted(_dd)}")
             setattr(roster_system, "shift_id_to_main", dict(shift_id_to_main or {}))
             # cross-group OFF cap 조정용
             _other_group_offs = config_data.get("other_group_offs") if isinstance(config_data, dict) else None
@@ -1421,7 +1430,9 @@ class CPSATBasicEngine:
             preceptor_pair_weight = float(getattr(config, 'pair_preference_weight', 3.0)) * 2.5
             for row in nurses_data:
                 mentee_id = row.get('nurse_id')
-                preceptor_id = row.get('preceptor_id')
+                # period SSOT(그 달 preceptor) 우선 — 캐시 preceptor_id 는 폴백(authoritative 아닐 때만).
+                _pinfo = (_pte_map or {}).get(str(mentee_id)) if _pte_map else None
+                preceptor_id = (_pinfo.get("preceptor_id") if isinstance(_pinfo, dict) else None) or row.get('preceptor_id')
                 if not mentee_id or not preceptor_id:
                     continue
                 if _active_pte_ids is not None and str(mentee_id) not in _active_pte_ids:

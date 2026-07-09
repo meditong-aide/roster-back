@@ -107,6 +107,70 @@ def test_dispatch_out_badge_persists_across_months(seeded):
         assert by_id["dispatch1"]["badge"] == "파견 중"
 
 
+def test_resignation_from_nurses_field_month_scoped(db):
+    """퇴사는 nurses.resignation_date 단독 SSOT(assignment 미참조).
+
+    - 퇴사月(7/20): status='resigned' + resign_date 채움 (표시)
+    - 그 다음 달(8월): 명단에서 완전 제외
+    - 미래 퇴사(다음달 조회는 아직 재직): 퇴사월 이전(6월)엔 active
+    """
+    from datetime import datetime
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    _nurse(db, "keep", "A")
+    db.add(Nurse(nurse_id="resign1", account_id="acc_resign1", group_id="A", office_id="o1",
+                 name="resign1", active=1, team_id=1, grade=1, allowed_shifts=[],
+                 resignation_date=datetime(2026, 7, 20), resignation_reason="개인사유"))
+    db.flush()
+
+    # 퇴사월(7월): resigned + 퇴사일 표시
+    jul = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
+    assert jul["resign1"]["membership_status"] == "resigned"
+    assert jul["resign1"]["badge"] == "퇴사"
+    assert jul["resign1"]["resign_date"] == "2026-07-20"
+    assert jul["resign1"]["resign_reason"] == "개인사유"
+    # 퇴사월 headcount: leave 버킷에 집계
+    assert group_members_in_month(db, "A", 2026, 7)["headcount"]["leave"] == 1
+
+    # 다음 달(8월): 명단 완전 제외
+    aug = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 8)["members"]}
+    assert "resign1" not in aug
+    assert "keep" in aug
+
+    # 퇴사 이전 달(6월): 아직 재직 → active, 퇴사정보 없음
+    jun = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 6)["members"]}
+    assert jun["resign1"]["membership_status"] == "active"
+    assert jun["resign1"]["resign_date"] is None
+
+
+def test_resignation_visible_even_if_active_zero(db):
+    """프로드가 퇴사 시 active=0 을 병행 세팅해도 퇴사月엔 표시되고 다음 달엔 제외.
+
+    home 필터가 active==1 만 봤다면 active=0 퇴사자는 퇴사月에도 사라짐 → (active OR resign)
+    으로 넓게 로드 후 루프에서 월 판정하도록 견고화한 것을 고정.
+    """
+    from datetime import datetime
+    db.add(Office(office_id="o1", office_name="병원"))
+    db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    _nurse(db, "keep", "A")
+    # 퇴사 + active=0 (프론트가 비활성 토글 병행한 케이스)
+    db.add(Nurse(nurse_id="resign0", account_id="acc_resign0", group_id="A", office_id="o1",
+                 name="resign0", active=0, team_id=1, grade=1, allowed_shifts=[],
+                 resignation_date=datetime(2026, 7, 20)))
+    db.flush()
+
+    # 퇴사月(7월): active=0 이어도 resigned 로 표시 + 퇴사일
+    jul = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 7)["members"]}
+    assert jul["resign0"]["membership_status"] == "resigned"
+    assert jul["resign0"]["resign_date"] == "2026-07-20"
+    # 다음 달(8월): 제외
+    aug = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 8)["members"]}
+    assert "resign0" not in aug
+    # 퇴사 이전 달(6월): active=0 이고 이 달 퇴사 아님 → 명단 제외(비활성 정리)
+    jun = {m["nurse_id"]: m for m in group_members_in_month(db, "A", 2026, 6)["members"]}
+    assert "resign0" not in jun
+
+
 def test_night_dedicated_keeps_team(db):
     """N전담(allowed_shifts=['N'])도 팀 소속 가능(정책 변경) → as_of_team=팀 유지 + 'N전담' 배지."""
     db.add(Office(office_id="o1", office_name="병원"))

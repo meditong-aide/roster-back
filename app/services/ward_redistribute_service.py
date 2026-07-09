@@ -140,14 +140,18 @@ def _load_pool(
         elif r.shift_id in vacation_codes:
             fb_map.setdefault(r.nurse_id, set()).add(day)
 
+    # 프리셉터 = nurse_preceptee_period(SSOT) as-of 대상월 (캐시 preceptor_id 안 봄).
+    from services.preceptee_period import resolve_preceptor_asof
+    _pre_asof = resolve_preceptor_asof(db, [n.nurse_id for n in pool], date(year, month, 1))
     # 강제 follow 는 '참여자끼리'만 (옵션1과 동일 규칙). 프리셉티나 그 프리셉터가
     # fixed(미참여) 면 follow 를 끊어 fixed 핀이 끌려가지 않게 한다.
     def _eff_preceptor(n: NurseModel):
-        if n.preceptor_id is None:
+        pid = _pre_asof.get(str(n.nurse_id))
+        if pid is None:
             return None
-        if n.nurse_id in non_participant_ids or n.preceptor_id in non_participant_ids:
+        if n.nurse_id in non_participant_ids or pid in non_participant_ids:
             return None
-        return n.preceptor_id
+        return pid
 
     inputs = [
         NurseInput(
@@ -291,22 +295,26 @@ def _team_breakdown(
 def _detect_ward_pairs(
     all_nurses: list[NurseModel],
     nurse_to_ward: dict[str, Optional[str]],
+    preceptor_asof: Optional[dict[str, Optional[str]]] = None,
 ) -> list[dict]:
     """원래 같은 병동이던 프리셉티→프리셉터 짝의 재분배 후 상태.
 
     status: together(결과 같은 병동) / split(다른 병동).
     moved: 둘 중 하나라도 병동이 바뀌면 True — 병동이동 발효 시 프리셉터십이 자동
       종료되므로(_apply_target_profile_reset) together 라도 관계는 끊긴다.
+    preceptor_asof: nurse_id→preceptor_id (period SSOT as-of). 캐시 preceptor_id 안 봄.
     """
     name = {n.nurse_id: n.name for n in all_nurses}
     cur = {n.nurse_id: n.group_id for n in all_nurses}
+    _pre = preceptor_asof or {}
     pairs: list[dict] = []
     for n in all_nurses:
-        if not n.preceptor_id or n.preceptor_id not in name:
+        pr = _pre.get(str(n.nurse_id))
+        if not pr or pr not in name:
             continue
-        if cur.get(n.nurse_id) != cur.get(n.preceptor_id):
+        if cur.get(n.nurse_id) != cur.get(pr):
             continue  # 원래 같은 병동이던 짝만 대상
-        pe, pr = n.nurse_id, n.preceptor_id
+        pe = n.nurse_id
         pe_w, pr_w = nurse_to_ward.get(pe), nurse_to_ward.get(pr)
         status = "together" if (pe_w is not None and pe_w == pr_w) else "split"
         moved = (pe_w is not None and pe_w != cur.get(pe)) or \
@@ -482,7 +490,10 @@ def preview_ward_redistribution(
     for wid, w in wards.items():
         for nid in w["nurse_ids"]:
             nurse_to_ward[nid] = wid
-    pairs = _detect_ward_pairs(pool + night + excluded_overlap, nurse_to_ward)
+    _pair_nurses = pool + night + excluded_overlap
+    from services.preceptee_period import resolve_preceptor_asof
+    _pre_asof_pairs = resolve_preceptor_asof(db, [n.nurse_id for n in _pair_nurses], date(year, month, 1))
+    pairs = _detect_ward_pairs(_pair_nurses, nurse_to_ward, preceptor_asof=_pre_asof_pairs)
     for p in pairs:
         if p["status"] == "split":
             warnings.append(
