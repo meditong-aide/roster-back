@@ -21,7 +21,7 @@ from agents_v2.cost import compute_cost
 logger = logging.getLogger(__name__)
 
 _usage_table_present: bool | None = None
-_BY_COLUMN = {"group": "group_id", "nurse": "user_id", "model": "model"}
+_BY_COLUMN = {"group": "group_id", "nurse": "user_id", "model": "model", "purpose": "purpose"}
 
 
 def record_llm_usage(

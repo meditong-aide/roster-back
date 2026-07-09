@@ -412,6 +412,10 @@ app.include_router(agent_test_router)
 from agents_v2.chat_router import router as agent_chat_router
 app.include_router(agent_chat_router)
 
+# Agent 사용량 대시보드 — LLM 토큰/비용 집계 (HN/ADM 전용)
+from agents_v2.usage_router import router as agent_usage_router
+app.include_router(agent_usage_router)
+
 import uvicorn
 
 if __name__ == "__main__":
