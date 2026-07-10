@@ -200,11 +200,14 @@ def _query_wanted_adjustments(db, group_id, year, month, params):
 
 def _query_schedule_entries(db, group_id, year, month, params):
     schedule_id = params.get("schedule_id")
+    roster_published = False
     if not schedule_id:
         meta = schedule_tools.resolve_target_schedule(db, group_id, year, month)
         if not meta:
             return {"error": f"No schedule found for {year}/{month}"}
         schedule_id = meta["schedule_id"]
+        # 확정본(IssuedRoster) 여부 — bulk_mutation 선행조건 트리거가 볼 수 있게 노출.
+        roster_published = bool(meta.get("is_published"))
 
     entries = schedule_tools.get_schedule_entries(
         db,
@@ -233,8 +236,17 @@ def _query_schedule_entries(db, group_id, year, month, params):
         "date_range_start", "shift_codes", "shift_name",
     ))
     if not has_filter and len(entries) > 60:
-        return _summarize_entries(entries, year, month)
+        result = _summarize_entries(entries, year, month)
+        if roster_published and isinstance(result, dict):
+            result["roster_source"] = "확정본(IssuedRoster·마감됨)"
+        return result
 
+    # 확정본이면 상태를 함께 노출(선행조건 트리거용). 작업본(미확정)은 기존 list 그대로.
+    if roster_published:
+        return {
+            "roster_source": "확정본(IssuedRoster·마감됨) — 직접 변경 전 사용자 확인 권장",
+            "entries": entries,
+        }
     return entries
 
 
