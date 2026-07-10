@@ -149,3 +149,112 @@ def usage_summary(
         }
         for r in q.all()
     ]
+
+
+def usage_by_office(db: Session, *, since: datetime | None = None) -> list[dict]:
+    """office 별 총합 + 그 안의 group 별 내역(롤업).
+
+    agent_llm_usage 엔 office_id 가 없으므로 group_id 집계 후 groups→offices 로 매핑.
+    반환: [{office_id, office_name, calls, input_tokens, output_tokens, cost_usd,
+            groups: [{group_id, group_name, calls, ...}]}, ...] (비용 내림차순).
+    """
+    from db.models import Group, Office
+
+    rows = usage_summary(db, by="group", since=since)
+    if not rows:
+        return []
+
+    gids = [r["key"] for r in rows if r["key"]]
+    groups = {g.group_id: g for g in db.query(Group).filter(Group.group_id.in_(gids)).all()}
+    offices = {o.office_id: o.office_name for o in db.query(Office).all()}
+
+    by_office: dict = {}
+    for r in rows:
+        g = groups.get(r["key"])
+        oid = g.office_id if g else None
+        oname = offices.get(oid) or ("(병원 미상)" if oid else "(그룹 미매핑)")
+        gname = g.group_name if g else (r["key"] or "(미상)")
+        o = by_office.setdefault(
+            oid or "__none__",
+            {
+                "office_id": oid,
+                "office_name": oname,
+                "calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                "groups": [],
+            },
+        )
+        o["calls"] += r["calls"]
+        o["input_tokens"] += r["input_tokens"]
+        o["output_tokens"] += r["output_tokens"]
+        o["cost_usd"] += r["cost_usd"]
+        o["groups"].append({
+            "group_id": r["key"], "group_name": gname,
+            "calls": r["calls"], "input_tokens": r["input_tokens"],
+            "output_tokens": r["output_tokens"], "cost_usd": r["cost_usd"],
+        })
+
+    result = list(by_office.values())
+    for o in result:
+        o["cost_usd"] = round(o["cost_usd"], 6)
+        o["groups"].sort(key=lambda x: x["cost_usd"], reverse=True)
+    result.sort(key=lambda x: x["cost_usd"], reverse=True)
+    return result
+
+
+def usage_timeseries(
+    db: Session, *, bucket: str = "day", since: datetime | None = None
+) -> list[dict]:
+    """일자/월 버킷 집계 + 누적. bucket='day'|'month'.
+
+    DB 종속 date 함수(MSSQL FORMAT vs SQLite strftime)를 피하려 Python 에서 버킷팅.
+    반환: [{bucket:'YYYY-MM-DD'|'YYYY-MM', calls, input_tokens, output_tokens, cost_usd,
+            cum_cost_usd, cum_tokens, cum_calls}, ...] (시간 오름차순).
+    """
+    from db.models import AgentLlmUsage
+
+    if bucket not in ("day", "month"):
+        raise ValueError(f"bucket must be 'day' or 'month', got {bucket!r}")
+    fmt = "%Y-%m-%d" if bucket == "day" else "%Y-%m"
+
+    q = db.query(
+        AgentLlmUsage.timestamp,
+        AgentLlmUsage.input_tokens,
+        AgentLlmUsage.output_tokens,
+        AgentLlmUsage.cost_usd,
+    )
+    if since:
+        q = q.filter(AgentLlmUsage.timestamp >= since)
+
+    buckets: dict = {}
+    for ts, itok, otok, cost in q.all():
+        if ts is None:
+            continue
+        key = ts.strftime(fmt)
+        b = buckets.setdefault(
+            key, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        )
+        b["calls"] += 1
+        b["input_tokens"] += itok or 0
+        b["output_tokens"] += otok or 0
+        b["cost_usd"] += cost or 0.0
+
+    out: list = []
+    cum_cost = 0.0
+    cum_tok = 0
+    cum_calls = 0
+    for key in sorted(buckets):
+        b = buckets[key]
+        cum_cost += b["cost_usd"]
+        cum_tok += b["input_tokens"] + b["output_tokens"]
+        cum_calls += b["calls"]
+        out.append({
+            "bucket": key,
+            "calls": b["calls"],
+            "input_tokens": b["input_tokens"],
+            "output_tokens": b["output_tokens"],
+            "cost_usd": round(b["cost_usd"], 6),
+            "cum_cost_usd": round(cum_cost, 6),
+            "cum_tokens": cum_tok,
+            "cum_calls": cum_calls,
+        })
+    return out
