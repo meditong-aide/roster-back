@@ -103,6 +103,17 @@ def update_person_attr(db: Session, params: dict) -> Any:
     if not mutations:
         return {"error": "mutations (or field+value) required"}
 
+    # 퇴사 처리는 반드시 퇴사일이 있어야 한다 — 값 없이 오면 날짜를 되묻는다.
+    # (명시적 '해제'/'취소' 는 값이 있으므로 통과 → 퇴사 취소로 처리)
+    for m in mutations:
+        if m.get("field") == "resignation_date":
+            v = m.get("value")
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                return {
+                    "needs_clarification": True,
+                    "question": "퇴사일을 알려주세요. (예: 2026-08-31)",
+                }
+
     mutations, clar = _ground_team_mutations(
         db, params.get("office_id"), group_id, mutations
     )

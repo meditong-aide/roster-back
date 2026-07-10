@@ -184,6 +184,7 @@ UPDATABLE_FIELDS = {
     "weekly_off_enabled", "weekly_off_weekday",
     "personal_off_adjustment",
     "team_id", "group_id",
+    "resignation_date",
 }
 
 
@@ -209,6 +210,7 @@ _LATIN_TOKEN_ALIASES = {
 
 _CLEAR_TOKENS = {"해제", "없음", "off", "none", "전담해제", "해지", ""}
 
+_DATE_FIELDS = {"resignation_date"}  # DATETIME 컬럼 — 문자열 날짜 → datetime 파싱
 _BOOL_FIELDS = {"is_head_nurse", "is_weekend_off", "weekly_off_enabled", "enable_aide"}
 _INT_FIELDS = {
     "grade", "experience", "wanted_max_requests",
@@ -414,8 +416,31 @@ def _coerce_int(value):
     return None
 
 
+def _coerce_date(value):
+    """문자열/None → datetime|None. 빈값/해제 토큰 → None(퇴사일 해제). 반환 (dt|None, err|None)."""
+    from datetime import datetime as _dt
+
+    if value is None:
+        return None, None
+    if isinstance(value, _dt):
+        return value, None
+    s = str(value).strip()
+    if s == "" or s.lower() in {"해제", "취소", "none", "null"}:
+        return None, None
+    for sep in ("-", ".", "/"):
+        s = s.replace(sep, "-")
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m"):
+        try:
+            return _dt.strptime(s, fmt), None
+        except ValueError:
+            continue
+    return None, f"퇴사일은 YYYY-MM-DD 형식이어야 합니다 (받은 값: {value!r})."
+
+
 def _normalize_value(field: str, value):
     """Normalize value per field. Returns (normalized, error_msg)."""
+    if field in _DATE_FIELDS:
+        return _coerce_date(value)
     if field == "allowed_shifts":
         norm = _normalize_allowed_shifts(value)
         if norm is None:
