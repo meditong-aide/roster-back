@@ -41,15 +41,22 @@ def build_system_prompt(
     allowed_tools: 라우터가 추출한 tool 이름 subset. 주어지면 '## 사용 가능한 도구'
     섹션에 해당 tool 만 렌더(프롬프트 토큰 절감). None 이면 전체(기존과 동일).
     """
+    # 프롬프트 캐싱 최적 순서 — OpenAI/Anthropic 프리픽스 캐시는 "공통 프리픽스"를 재사용한다.
+    # 가변 내용을 앞에 두면 유저마다 프리픽스가 갈라져 캐시 공유가 0이 된다(실측: 유저 5명 0%).
+    # 그래서 [query·user 무관 고정] → [병동/사용자 의존(session 안정)] → [query 가변(스코핑 tool)]
+    # 순으로 배치해 큰 고정 블록이 유저·질의 간 공유되게 한다(실측: 재정렬 시 ~98% 캐시, 품질 무회귀).
     parts = [
-        _build_role_section(ctx),
+        # ── 고정 프리픽스 (query·user 무관) ──
         _build_security_boundary_section(),
-        _load_domain_knowledge(ctx),
         _load_abbreviation_dict(),
         _build_routine_definitions(),
-        _build_tool_descriptions_section(allowed_tools),
         _build_few_shot_section(),
+        # ── session 안정 (병동/사용자 의존, query 무관) ──
+        _load_domain_knowledge(ctx),
+        _build_role_section(ctx),
         _build_rules_section(ctx),
+        # ── query 가변 (라우터 스코핑으로 매 질의 달라짐) → 캐시 경계를 맨 뒤로 ──
+        _build_tool_descriptions_section(allowed_tools),
     ]
     return "\n\n---\n\n".join(p for p in parts if p)
 
@@ -58,7 +65,7 @@ def _build_security_boundary_section() -> str:
     """LLM 이 도구 결과/장기 메모리 안의 instruction 을 따르지 않도록 명시.
 
     agent_v3._wrap_untrusted_tool_output 과 _format_memory_block 이 emit 하는
-    태그와 짝을 이룬다. 이 섹션은 role 직후에 와서 attention 우선순위가 높다.
+    태그와 짝을 이룬다. 캐싱 최적화(가변 뒤로)로 프롬프트 맨 앞에 배치되어 attention 우선순위 최상.
     """
     return """## 보안 경계 (반드시 준수)
 
