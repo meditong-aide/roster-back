@@ -284,6 +284,11 @@ async def _trace_roster_create_callers(request: Request, call_next):
 _LOG_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _LOG_EXCLUDE_PREFIX = ("/static", "/health", "/docs", "/openapi", "/favicon", "/redoc")
 
+# 경로→(page/section/action) 라벨 + 요청본문 화이트리스트 카탈로그(의미 보강용).
+import call_action_catalog as _catalog
+
+_BODY_TAP_CAP = 32 * 1024  # 본문 캡처 상한(대용량 생성 payload 방어)
+
 
 def _log_user_from_cookie(request: Request) -> dict:
     """access_token 쿠키(JWT) 디코드 → 유저 필드 (DB 히트 없음). 실패 시 {}."""
@@ -355,6 +360,22 @@ async def _call_action_logger(request: Request, call_next):
                 "ua": (request.headers.get("user-agent", "") or "")[:300],
                 "req_id": ((request.headers.get("x-amzn-trace-id") or "")[:80] or None),
             }
+            # 의미 보강: 경로가 카탈로그에 있으면 page/section/action + 본문 화이트리스트(changes) 부착.
+            #   본문은 아래 _CallBodyTapMiddleware 가 매칭 경로에 한해 tee 로 캡처(라우트 흐름 무영향).
+            _m = _catalog.match(method, path)
+            if _m is not None:
+                _entry, _pp = _m
+                _chunks = request.scope.get("_call_body_chunks")
+                _body_obj = None
+                if _chunks:
+                    try:
+                        _body_obj = json.loads(b"".join(_chunks) or b"null")
+                    except Exception:
+                        _body_obj = None
+                try:
+                    event.update(_catalog.enrich(_entry, _pp, _body_obj))
+                except Exception:
+                    pass
             line = json.dumps(event, ensure_ascii=False)
             if _CALL_HISTORY_STREAM:  # env 스트림으로 Firehose → S3 (dev/prod 각자 스트림·테이블)
                 asyncio.create_task(asyncio.to_thread(_firehose_put, line + "\n"))
@@ -364,6 +385,39 @@ async def _call_action_logger(request: Request, call_next):
         print(f"[call_history][WARN] 로거 예외(무시): {e}", flush=True)
     return response
 
+
+class _CallBodyTapMiddleware:
+    """카탈로그 매칭 변경요청에 한해 요청 본문을 non-consuming tee 로 캡처.
+    라우트는 본문을 정상적으로 읽고, 사본(bytes 청크)만 scope['_call_body_chunks'] 에 남긴다.
+    미매칭/비변경 요청은 손대지 않음(오버헤드 0). 캡처 상한 _BODY_TAP_CAP."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+        if method not in _LOG_METHODS or _catalog.match(method, path) is None:
+            return await self.app(scope, receive, send)
+        chunks: list = []
+        state = {"size": 0}
+        scope["_call_body_chunks"] = chunks
+
+        async def _tap_receive():
+            message = await receive()
+            if message.get("type") == "http.request":
+                body = message.get("body", b"")
+                if body and state["size"] < _BODY_TAP_CAP:
+                    chunks.append(body)
+                    state["size"] += len(body)
+            return message
+
+        return await self.app(scope, _tap_receive, send)
+
+
+app.add_middleware(_CallBodyTapMiddleware)
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
