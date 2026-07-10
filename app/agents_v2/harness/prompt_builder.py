@@ -11,11 +11,26 @@ Prompt structure (order matters for LLM attention):
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from agents_v2.schemas.session_context import SessionContext
 
 _AIDE_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".aide"
+
+# ── 스킬설명 렌더 모드 ──────────────────────────────────────────────────────
+# 각 tool 의 description(단서 포함 전문)은 API `tools` 파라미터의 function.description 으로
+# 이미 매 요청 전송된다. 그런데 '## 사용 가능한 도구' 섹션이 **같은 텍스트를 한 번 더**
+# 시스템프롬프트에 출력해 왔다 → 완전 중복(요청당 ~15k 토큰). 라이브 A/B(2026-07-10, 스코핑
+# 경로 N=24) 결과: 마크다운을 '이름만'으로 줄여도 툴선택·슬롯충족 **무회귀**(세 지표 동일),
+# 입력토큰 -28.5%. (첫줄만 남기는 'oneline' 은 오히려 오도하는 단서로 회귀 1건이라 폐기.)
+#
+#   "full"  = 설명 전문 렌더(현행). 마크다운·JSON 이중 정의.
+#   "names" = 이름만 렌더(중복 제거). 상세는 JSON function.description 이 담당.
+#
+# 기본 full = 현행과 100% 동일. env(AIDE_TOOL_DESC_MODE=names)로 즉시 전환/원복.
+# 관련: docs/AGENT_TOOL_SELECTION_RESEARCH.md #1(EASYTOOL, 정의 단일화)
+TOOL_DESC_MODE = os.getenv("AIDE_TOOL_DESC_MODE", "full")  # full | names
 
 
 def build_system_prompt(
@@ -147,13 +162,22 @@ def _build_tool_descriptions_section(allowed_tools: list[str] | None = None) -> 
     from agents_v2.skills.descriptions import SKILL_TOOLS
 
     allow = set(allowed_tools) if allowed_tools is not None else None
-    lines = ["## 사용 가능한 도구\n"]
+    names_only = TOOL_DESC_MODE == "names"
+    # names 모드: 설명 전문은 JSON function.description 이 담당하므로 여기선 이름만(중복 제거).
+    header = (
+        "## 사용 가능한 도구 (상세 정의는 함수 스키마 참조)\n"
+        if names_only else "## 사용 가능한 도구\n"
+    )
+    lines = [header]
     for tool in SKILL_TOOLS:
         if allow is not None and tool["name"] not in allow:
             continue
-        lines.append(f"### {tool['name']}")
-        lines.append(tool["description"])
-        lines.append("")
+        if names_only:
+            lines.append(f"- {tool['name']}")
+        else:
+            lines.append(f"### {tool['name']}")
+            lines.append(tool["description"])
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -214,7 +238,7 @@ def _build_rules_section(ctx: SessionContext) -> str:
 4. 데이터 수정 흐름: query_schedule로 현재 상태 조회 → bulk_mutation(preview_only=true) 호출 → 시스템이 미리보기 생성 → 사용자 확인 → 실행. ⚠️ 텍스트로 "변경할까요?"라고 묻지 마세요. 반드시 bulk_mutation(preview_only=true)를 호출하세요.
 5. 근무표 조회 시 마감 근무표(IssuedRoster) 우선, 없으면 최신 버전.
 6. 모호한 요청은 clarification 먼저 (Domain Knowledge의 clarification 트리거 참조).
-7. 답변은 한국어, 간결하게. 표가 적절하면 마크다운 표 사용.
+7. 답변은 한국어로 간결하게, **평문으로** 작성하세요. 볼드/강조 기호(`**`, `__`)나 헤딩(`#`) 마크업을 쓰지 마세요 — 강조가 필요하면 기호 없이 문장으로 표현합니다. 목록은 `- ` 로, 표는 정말 필요할 때만 사용하세요.
 8. 조회 결과가 없으면 왜 없는지 설명하세요.
 9. 알려진 처리 패턴(Routine)에 해당하면 정해진 단계를 따르세요.
 10. ⚠️ 간호사 이름이 포함된 요청은 반드시 도구를 호출하세요. 이름의 존재 여부를 직접 판단하지 말고, 시스템 grounding이 처리합니다. 오타나 유사 이름도 시스템이 자동으로 교정/제안합니다.
