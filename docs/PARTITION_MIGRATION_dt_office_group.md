@@ -94,7 +94,9 @@ office_id/group_id 는 백엔드=JWT, 프론트 ui_events=쿠키에서 채워짐
 3. 앱 env 무변경(스트림명 동일).
 - 장점: 앱/워크플로 무변경. 단점: 삭제~생성 사이 짧은 로그유실(fire-and-forget이라 사용자 무영향).
 
-## 6. Athena(Glue) 재정의 — 3키 파티션
+## 6. Athena(Glue) 재정의
+
+> ★최종 적용(2026-07-10 실행 결과): 처음엔 아래 injected projection(3키)으로 만들었으나, "조회 시 `office_id`·`group_id` 등호 WHERE 필수"(`CONSTRAINT_VIOLATION`) 제약이 커서 **office_id/group_id 를 파티션에서 데이터 컬럼으로 전환**했다. 최종 파티션은 **`dt` 하나(projection date)** 뿐이고 office_id/group_id 는 일반 컬럼(레코드 JSON에서 읽음). S3 3키 물리 레이아웃(`dt=…/office_id=…/group_id=…/`)은 그대로이며 Athena 가 `dt` 하위 중첩경로를 재귀로 읽는다. 이러면 WHERE 없이 전체·크로스테넌트 조회가 가능하고(테넌트 필터는 선택), 재생성 전 옛 flat 데이터도 조회된다. 비로그인 레코드는 office_id 컬럼이 NULL(경로는 `none`). 실제 적용 DDL 은 `scratchpad/athena_convert.sh`, 조회뷰(v_*)는 `athena_views.sh`. 아래 injected DDL 은 엄격 테넌트 스코프가 필요할 때의 대안으로 남겨둔다.
 
 기존 테이블은 파티션키가 `dt` 1개뿐이라 **DROP + CREATE**(7월 신설·데이터 극소). S3 데이터는 유지됨.
 office_id/group_id 는 **파티션키로 승격**(데이터컬럼에서 제거·JSON엔 남지만 serde가 무시). 백엔드 신규 컬럼 `page/section/action/summary` 추가.
