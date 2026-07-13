@@ -73,29 +73,59 @@ class _BM25:
         return s
 
 
-# 색인 1회 (모듈 로드 시). 청크당 title+keywords+body 를 문서로.
-_DOC_TOKENS = [
-    _tokenize(f"{c['title']} {c['keywords']} {c['body']}") for c in HELP_CHUNKS
-]
-_BM = _BM25(_DOC_TOKENS)
+class Retriever:
+    """임의 청크(help 하드코딩 / PDF 인제스트 등) 위에 BM25 검색. 재사용 가능."""
+
+    def __init__(self, chunks: list[dict]):
+        self.chunks = chunks
+        self._bm = _BM25([
+            _tokenize(f"{c['title']} {c.get('keywords', '')} {c['body']}") for c in chunks
+        ])
+
+    def retrieve(self, query: str, k: int = 2, min_score: float = 1.0) -> list[dict]:
+        q = _tokenize(query)
+        scored = sorted(
+            ((self._bm.score(q, i), i) for i in range(len(self.chunks))),
+            key=lambda x: x[0], reverse=True,
+        )
+        if not scored or scored[0][0] < min_score:
+            return []
+        out = []
+        for sc, i in scored[:k]:
+            if sc <= 0:
+                break
+            c = self.chunks[i]
+            out.append({"id": c.get("id"), "title": c["title"], "body": c["body"], "score": round(sc, 3)})
+        return out
+
+
+def _load_pdf_chunks() -> list[dict]:
+    """guide/docs/*.pdf 를 기능-단위 청크로 자동 인제스트. 없거나 실패해도 무해([])."""
+    import logging
+    import os
+
+    docs_dir = os.path.join(os.path.dirname(__file__), "docs")
+    if not os.path.isdir(docs_dir):
+        return []
+    out: list[dict] = []
+    try:
+        from agents_v2.guide.pdf_ingest import ingest_pdf
+    except Exception:
+        return []
+    for fn in sorted(os.listdir(docs_dir)):
+        if not fn.lower().endswith(".pdf"):
+            continue
+        try:
+            out.extend(ingest_pdf(os.path.join(docs_dir, fn)))
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger(__name__).warning("[guide] PDF 인제스트 실패 %s: %s", fn, e)
+    return out
+
+
+# 기본 인스턴스 = 하드코딩 help corpus + guide/docs 의 PDF 자동 인제스트.
+_DEFAULT = Retriever(HELP_CHUNKS + _load_pdf_chunks())
 
 
 def retrieve(query: str, k: int = 2, min_score: float = 1.0) -> list[dict]:
-    """질의 → 관련 help 청크 top-k. 최고점 < min_score 면 빈 리스트(=정보 없음).
-
-    반환: [{id, title, body, score}, ...] (점수 내림차순).
-    """
-    q = _tokenize(query)
-    scored = sorted(
-        ((_BM.score(q, i), i) for i in range(len(HELP_CHUNKS))),
-        key=lambda x: x[0], reverse=True,
-    )
-    if not scored or scored[0][0] < min_score:
-        return []
-    out = []
-    for sc, i in scored[:k]:
-        if sc <= 0:
-            break
-        c = HELP_CHUNKS[i]
-        out.append({"id": c["id"], "title": c["title"], "body": c["body"], "score": round(sc, 3)})
-    return out
+    """질의 → 관련 help 청크 top-k. 최고점 < min_score 면 빈 리스트(=정보 없음)."""
+    return _DEFAULT.retrieve(query, k=k, min_score=min_score)
