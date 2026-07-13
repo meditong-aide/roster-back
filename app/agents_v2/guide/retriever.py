@@ -24,6 +24,11 @@ _ALIASES = {
     "명단": "근무자", "직원": "근무자", "인력": "근무자",
     "빼기": "삭제", "빼줘": "삭제", "제외": "삭제", "없애": "삭제", "지워": "삭제",
     "만들": "생성", "짜": "생성",
+    # 접속/기기 패러프레이즈 (guide_eval 실패 근거)
+    "컴퓨터": "웹 pc", "pc": "웹", "데스크탑": "웹",
+    "폰": "모바일", "핸드폰": "모바일", "스마트폰": "모바일", "앱": "모바일 app",
+    "들어가": "접속", "접속하": "접속", "로그인": "접속",
+    "등록": "추가", "신규": "추가",
 }
 
 _TOKEN_RE = re.compile(r"[가-힣]+|[a-zA-Z0-9]+")
@@ -138,3 +143,43 @@ _DEFAULT = Retriever(HELP_CHUNKS + _load_pdf_chunks())
 def retrieve(query: str, k: int = 2, min_score: float = 1.0) -> list[dict]:
     """질의 → 관련 help 청크 top-k. 최고점 < min_score 면 빈 리스트(=정보 없음)."""
     return _DEFAULT.retrieve(query, k=k, min_score=min_score)
+
+
+def rerank(query: str, candidates: list[dict], llm, top_k: int = 2) -> list[dict]:
+    """LLM 리랭커 — BM25 recall 후보를 질의 적합순으로 재정렬(패러프레이즈/의미 이해).
+
+    candidates 는 retrieve() 결과(넓게). llm.chat([...], tools=[]) 로 관련순 인덱스만 받는다.
+    파싱 실패 시 원래 순서 유지(안전).
+    """
+    if not candidates:
+        return []
+    menu = "\n".join(
+        f"{i}. [{c['title']}] {(c['body'] or '')[:140]}" for i, c in enumerate(candidates)
+    )
+    prompt = (
+        f"질문: {query}\n\n후보 도움말:\n{menu}\n\n"
+        f"질문에 가장 잘 답하는 후보 번호를 관련순으로 최대 {top_k}개, 쉼표로만 출력 "
+        f"(예: 2,0). 관련 있는 게 없으면 'none'."
+    )
+    try:
+        resp = llm.chat([{"role": "user", "content": prompt}], tools=[])
+        txt = (resp.text or "").strip().lower()
+        if "none" in txt:
+            return []
+        import re
+        idxs = [int(x) for x in re.findall(r"\d+", txt)]
+        seen, order = set(), []
+        for i in idxs:
+            if 0 <= i < len(candidates) and i not in seen:
+                seen.add(i)
+                order.append(candidates[i])
+        return order[:top_k] or candidates[:top_k]
+    except Exception:
+        return candidates[:top_k]
+
+
+def retrieve_rerank(query: str, llm, recall_k: int = 6, top_k: int = 2,
+                    min_score: float = 1.0) -> list[dict]:
+    """2단계: BM25 recall(넓게) → LLM rerank(정밀). 우리 규모용 실용 파이프라인."""
+    cands = _DEFAULT.retrieve(query, k=recall_k, min_score=min_score)
+    return rerank(query, cands, llm, top_k=top_k)
