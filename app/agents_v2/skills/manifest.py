@@ -158,6 +158,7 @@ def manifest_router_hints() -> str:
 # @skill 로 등록하는 신규 스킬 모듈 경로. 여기 추가하면 5곳이 자동 구성된다.
 _MANIFEST_MODULES: list[str] = [
     "agents_v2.skills.manage_assignment",
+    "agents_v2.skills.lookup_guide",
 ]
 
 _loaded = False
