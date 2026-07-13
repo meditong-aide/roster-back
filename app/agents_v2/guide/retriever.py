@@ -100,7 +100,12 @@ class Retriever:
 
 
 def _load_pdf_chunks() -> list[dict]:
-    """guide/docs/*.pdf 를 기능-단위 청크로 자동 인제스트. 없거나 실패해도 무해([])."""
+    """guide/docs 의 도움말 PDF → 청크. 전처리 캐시(<pdf>.chunks.json) 우선 로드,
+
+    없으면 텍스트 인제스트(pdfplumber) 폴백. VLM/OCR 같은 무거운 전처리는 오프라인 1회로
+    <pdf>.chunks.json 을 만들어 두면 여기서 그대로 재사용(매 기동 재실행 안 함). 실패해도 무해.
+    """
+    import json
     import logging
     import os
 
@@ -108,17 +113,21 @@ def _load_pdf_chunks() -> list[dict]:
     if not os.path.isdir(docs_dir):
         return []
     out: list[dict] = []
-    try:
-        from agents_v2.guide.pdf_ingest import ingest_pdf
-    except Exception:
-        return []
+    log = logging.getLogger(__name__)
     for fn in sorted(os.listdir(docs_dir)):
         if not fn.lower().endswith(".pdf"):
             continue
+        path = os.path.join(docs_dir, fn)
+        cache = os.path.splitext(path)[0] + ".chunks.json"
         try:
-            out.extend(ingest_pdf(os.path.join(docs_dir, fn)))
+            if os.path.exists(cache):
+                with open(cache, encoding="utf-8") as f:
+                    out.extend(json.load(f))  # 전처리 캐시(VLM 등) 재사용
+            else:
+                from agents_v2.guide.pdf_ingest import ingest_pdf
+                out.extend(ingest_pdf(path))  # 폴백: 텍스트 인제스트
         except Exception as e:  # noqa: BLE001
-            logging.getLogger(__name__).warning("[guide] PDF 인제스트 실패 %s: %s", fn, e)
+            log.warning("[guide] 도움말 인제스트 실패 %s: %s", fn, e)
     return out
 
 
