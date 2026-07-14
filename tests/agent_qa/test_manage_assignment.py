@@ -124,7 +124,52 @@ def test_transfer_create_preview(db, seed_data, target_ward):
     assert d.get("preview") is True
     assert d["summary"]["reason"] == "병동이동"
     assert "영구" in d["summary"]["period"]  # end_date 무시 → 영구
+    assert d["summary"]["effective_month"] == "2026-08"  # 발효월 확인용
+    # group_id 로 해석돼 target 병동이 이름으로 표시(그룹명 그대로 저장 아님)
+    assert d["summary"]["to_ward"] == "중환자실2"
     assert classify(d) is ErrorType.PREVIEW
+
+
+def test_transfer_normalizes_midmonth(db, seed_data, target_ward):
+    # 병동이동은 월 단위 발효 → 월 중간 날짜도 그 달 1일(발효월)로 정규화
+    res = execute_skill(
+        db, "manage_assignment",
+        {
+            "operation": "create", "kind": "병동이동", "nurse_name": "김민지",
+            "target_ward": "중환자실2", "start_date": "2026-08-15", "preview_only": True,
+        },
+        _hn_ctx(),
+    )
+    assert res.data["summary"]["effective_month"] == "2026-08"
+    assert "8월" in res.data["summary"]["period"]
+
+
+def test_transfer_clarifies_missing_month(db, seed_data, target_ward):
+    # 발효월을 모르면 임의로 넣지 말고 되물어야 한다 (assignment 오삽입 방지)
+    res = execute_skill(
+        db, "manage_assignment",
+        {
+            "operation": "create", "kind": "병동이동", "nurse_name": "김민지",
+            "target_ward": "중환자실2", "preview_only": True,
+        },
+        _hn_ctx(),
+    )
+    assert res.data.get("needs_clarification") is True
+    assert "월" in res.data["question"]
+
+
+def test_transfer_clarifies_missing_ward(db, seed_data):
+    # 병동 미지정 → 에러가 아니라 clarify
+    res = execute_skill(
+        db, "manage_assignment",
+        {
+            "operation": "create", "kind": "병동이동", "nurse_name": "김민지",
+            "start_date": "2026-08-01", "preview_only": True,
+        },
+        _hn_ctx(),
+    )
+    assert res.data.get("needs_clarification") is True
+    assert "병동" in res.data["question"]
 
 
 def test_update_person_attr_rejects_group_id(db, seed_data):
