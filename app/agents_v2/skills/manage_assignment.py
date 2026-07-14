@@ -20,31 +20,41 @@ from agents_v2.grounding.internal import resolve_date, resolve_group
 from agents_v2.skills.manifest import skill
 from services import assignment_service
 
-_REASON = "파견"
+_REASON = "파견"  # 기본(하위호환)
+
+
+def _reason_of(params: dict) -> str:
+    """kind 파라미터 → reason. '이동'/'transfer' 포함이면 병동이동, 그 외 파견."""
+    k = str(params.get("kind") or "").strip().lower()
+    return "병동이동" if ("이동" in k or "transfer" in k or "move" in k) else "파견"
 
 
 MANAGE_ASSIGNMENT_SCHEMA: dict = {
     "name": "manage_assignment",
     "description": (
-        "간호사 **파견**(다른 병동으로 임시 근무) 배정을 조회·등록·취소합니다. (HN/ADM 전용)\n\n"
-        "⚠️ 이 스킬은 '파견'만 다룹니다. 영구 병동이동/휴직/퇴사는 아직 지원하지 않습니다.\n"
+        "간호사 **파견**(임시 근무) 또는 **병동이동**(영구 소속 변경) 배정을 조회·등록·취소합니다. (HN/ADM 전용)\n\n"
+        "kind 로 구분: `파견`=다른 병동에서 임시 근무(종료일 있음, 소속 유지) / "
+        "`병동이동`=소속 병동을 영구 변경(종료일 없음, 지정 시점부터 발효).\n"
+        "⚠️ '병동이동/병동 옮기기/소속 변경'은 반드시 이 스킬(kind=병동이동)로 처리하라. "
+        "간호사 속성(update_person_attr)의 group_id 직접 변경으로 하지 마라 — 그건 월 발효·팀/등급 이관을 못 한다.\n"
         "⚠️ 등록/취소는 preview_only=true 로 먼저 호출해 미리보기를 만들고, 사용자 확인 후 실행됩니다.\n\n"
 
         "─────────── operation ───────────\n"
-        "- `list` — 파견/배정 현황 조회. 간호사 이름을 주면 그 사람 배정 이력, 없으면 이번 달 "
-        "병동 배정 현황. '이번 달 파견자 명단', '김민지 파견 상태' 등.\n"
-        "- `create` — 파견 등록. nurse_name + target_ward + start_date(+ end_date) 필요. "
-        "'김민지 8월 1일부터 중환자실2로 파견'.\n"
-        "- `cancel` — 활성 파견 취소. nurse_name 으로 대상 파견을 찾습니다. '김민지 파견 취소'.\n\n"
+        "- `list` — 파견/이동 현황 조회. 간호사 이름 주면 그 사람 이력, 없으면 이번 달 현황.\n"
+        "- `create` — 등록. nurse_name + target_ward + start_date 필요. (파견은 end_date 도 가능)\n"
+        "- `cancel` — 활성 배정 취소. nurse_name 으로 대상을 찾습니다.\n\n"
 
         "─────────── 파라미터 ───────────\n"
+        "- `kind` — '파견' 또는 '병동이동'. 기본 '파견'.\n"
         "- `nurse_name` — 간호사 이름(그대로). 내부에서 id 로 해석.\n"
-        "- `target_ward` — 파견 보낼 병동 이름(예: '중환자실2', '9B'). 내부에서 해석.\n"
-        "- `start_date` / `end_date` — YYYY-MM-DD. end_date 는 선택(미지정 가능).\n"
-        "- `note` — 파견 사유/메모(선택).\n\n"
+        "- `target_ward` — 보낼/옮길 병동 이름(예: '중환자실2', '9B'). 내부에서 해석.\n"
+        "- `start_date` — YYYY-MM-DD. 발효 시작일. '8월부터'=2026-08-01.\n"
+        "- `end_date` — 파견 종료일(선택). **병동이동은 무시**(영구).\n"
+        "- `note` — 사유/메모(선택).\n\n"
 
-        "예) '김민지 8/1~8/31 중환자실2 파견' → operation=create, nurse_name=김민지, "
-        "target_ward=중환자실2, start_date=2026-08-01, end_date=2026-08-31\n"
+        "예) '신솔희 8월부터 중환자실2로 병동이동' → operation=create, kind=병동이동, nurse_name=신솔희, "
+        "target_ward=중환자실2, start_date=2026-08-01\n"
+        "예) '김민지 8/1~8/31 중환자실2 파견' → operation=create, kind=파견, start_date=2026-08-01, end_date=2026-08-31\n"
         "예) '이번 달 파견 나간 사람' → operation=list"
     ),
     "parameters": {
@@ -53,13 +63,18 @@ MANAGE_ASSIGNMENT_SCHEMA: dict = {
             "operation": {
                 "type": "string",
                 "enum": ["list", "create", "cancel"],
-                "description": "list=조회, create=파견 등록, cancel=파견 취소. 기본 list",
+                "description": "list=조회, create=등록, cancel=취소. 기본 list",
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["파견", "병동이동"],
+                "description": "파견=임시근무 / 병동이동=영구 소속변경. 기본 파견",
             },
             "nurse_name": {"type": "string", "description": "간호사 이름 (한글). 내부에서 id 로 해석"},
-            "target_ward": {"type": "string", "description": "파견 보낼 병동 이름 (예: '중환자실2')"},
-            "start_date": {"type": "string", "description": "파견 시작일 YYYY-MM-DD"},
-            "end_date": {"type": "string", "description": "파견 종료일 YYYY-MM-DD (선택)"},
-            "note": {"type": "string", "description": "파견 사유/메모 (선택)"},
+            "target_ward": {"type": "string", "description": "보낼/옮길 병동 이름 (예: '중환자실2')"},
+            "start_date": {"type": "string", "description": "발효 시작일 YYYY-MM-DD ('8월부터'=2026-08-01)"},
+            "end_date": {"type": "string", "description": "파견 종료일 YYYY-MM-DD (선택, 병동이동은 무시)"},
+            "note": {"type": "string", "description": "사유/메모 (선택)"},
             "preview_only": {"type": "boolean", "default": True},
         },
         "required": ["operation"],
@@ -165,14 +180,18 @@ def _resolve_nurse_id(params: dict) -> str | None:
 
 
 def _create(db: Session, params: dict) -> Any:
+    reason = _reason_of(params)
+    is_transfer = reason == "병동이동"
+    verb = "병동이동" if is_transfer else "파견"
+
     office_id = params.get("office_id")
     nurse_id = _resolve_nurse_id(params)
     if not nurse_id:
-        return {"error": "파견할 간호사를 지정해 주세요 (예: '김민지')."}
+        return {"error": f"{verb} 대상 간호사를 지정해 주세요 (예: '김민지')."}
 
     target_ward = params.get("target_ward")
     if not target_ward:
-        return {"error": "파견 보낼 병동을 지정해 주세요 (예: '중환자실2')."}
+        return {"error": f"{'옮길' if is_transfer else '파견 보낼'} 병동을 지정해 주세요 (예: '중환자실2')."}
 
     src_group = params.get("group_id")
     rg = resolve_group(db, office_id, target_ward, exclude_group_id=src_group)
@@ -184,8 +203,10 @@ def _create(db: Session, params: dict) -> Any:
 
     start = _iso(params.get("start_date"), params)
     if not start:
-        return {"needs_clarification": True, "question": "파견 시작일을 알려주세요 (예: 8월 1일).", "options": []}
-    end = _iso(params.get("end_date"), params)
+        q = "병동이동 발효 시점을 알려주세요 (예: 8월 1일)." if is_transfer else "파견 시작일을 알려주세요 (예: 8월 1일)."
+        return {"needs_clarification": True, "question": q, "options": []}
+    # 병동이동은 영구 이동 → 종료일 없음.
+    end = None if is_transfer else _iso(params.get("end_date"), params)
 
     from db.models import Nurse
 
@@ -202,7 +223,7 @@ def _create(db: Session, params: dict) -> Any:
             impact = assignment_service.preview_assignment_impact(
                 db,
                 nurse_id=nurse_id,
-                reason=_REASON,
+                reason=reason,
                 start_date=date.fromisoformat(start),
                 target_group_id=target_group_id,
                 expected_end_date=date.fromisoformat(end) if end else None,
@@ -214,10 +235,10 @@ def _create(db: Session, params: dict) -> Any:
             "operation": "create",
             "summary": {
                 "nurse": nurse.name,
-                "reason": _REASON,
+                "reason": reason,
                 "from_ward": gmap.get(source_group_id, source_group_id),
                 "to_ward": gmap.get(target_group_id, target_group_id),
-                "period": _humanize_period(start, end),
+                "period": _humanize_period(start, end) if not is_transfer else f"{start}부터 (영구)",
             },
             "impact": _humanize_impact(impact, gmap),
         }
@@ -231,38 +252,41 @@ def _create(db: Session, params: dict) -> Any:
         target_group_id=target_group_id,
         start_date=date.fromisoformat(start),
         expected_end_date=date.fromisoformat(end) if end else None,
-        reason=_REASON,
+        reason=reason,
         note=params.get("note"),
     )
     try:
         assignment_service.create_assignment(req, db, current_user=None, notify=True)
     except Exception as e:  # noqa: BLE001
         return {"error": _clean_error(e)}
-    return {
-        "ok": True,
-        "message": f"{nurse.name} 간호사를 {gmap.get(target_group_id, target_group_id)}(으)로 파견 등록했습니다.",
-        "period": _humanize_period(start, end),
-    }
+    to_ward = gmap.get(target_group_id, target_group_id)
+    msg = (f"{nurse.name} 간호사를 {start}부터 {to_ward}(으)로 병동이동 처리했습니다."
+           if is_transfer else
+           f"{nurse.name} 간호사를 {to_ward}(으)로 파견 등록했습니다.")
+    return {"ok": True, "message": msg,
+            "period": f"{start}부터 (영구)" if is_transfer else _humanize_period(start, end)}
 
 
 def _cancel(db: Session, params: dict) -> Any:
+    reason = _reason_of(params)
+    verb = "병동이동" if reason == "병동이동" else "파견"
     office_id = params.get("office_id")
     nurse_id = _resolve_nurse_id(params)
     if not nurse_id:
-        return {"error": "파견을 취소할 간호사를 지정해 주세요."}
+        return {"error": f"{verb}을 취소할 간호사를 지정해 주세요."}
 
     rows = assignment_service.get_assignments(
         db, office_id=office_id, nurse_id=nurse_id, status="active"
     )
-    dispatches = [r for r in rows if getattr(r, "reason", None) == _REASON]
+    dispatches = [r for r in rows if getattr(r, "reason", None) == reason]
     if not dispatches:
-        return {"error": "취소할 활성 파견이 없습니다."}
+        return {"error": f"취소할 활성 {verb}이(가) 없습니다."}
 
     gmap = _group_name_map(db, office_id)
     if len(dispatches) > 1:
         return {
             "needs_clarification": True,
-            "question": "취소할 파견이 여러 건입니다. 어느 파견인가요?",
+            "question": f"취소할 {verb}이(가) 여러 건입니다. 어느 것인가요?",
             "options": [
                 f"{gmap.get(r.target_group_id, r.target_group_id)} ({_humanize_period(r.start_date, r.end_date or r.expected_end_date)})"
                 for r in dispatches
@@ -284,7 +308,7 @@ def _cancel(db: Session, params: dict) -> Any:
         return {"error": _clean_error(e)}
     return {
         "ok": True,
-        "message": f"{getattr(target, 'nurse_name', '')} 간호사의 파견을 취소했습니다.",
+        "message": f"{getattr(target, 'nurse_name', '')} 간호사의 {verb}을(를) 취소했습니다.",
     }
 
 
@@ -298,7 +322,8 @@ def _cancel(db: Session, params: dict) -> Any:
     mutation=True,
     hn_only=True,
     grounds=["nurse_name", "target_ward"],
-    trigger_hint="간호사 파견(다른 병동으로 임시 근무) 등록·취소, 파견자 명단/현황 조회, 병동 배정",
+    trigger_hint=("간호사 파견(임시 근무) 등록·취소·조회, "
+                  "병동이동/병동 옮기기/소속 병동 변경(영구), 파견자·이동자 명단/현황, 병동 배정"),
     # 검증(5요소): 완료 결과는 조회(assignments/dispatches) 또는 실행 성공(ok=True) 이어야.
     # error/preview/clarification 은 classify 단계에서 이미 걸러져 여기 안 옴.
     postcondition=lambda d: isinstance(d, dict)

@@ -103,6 +103,15 @@ def update_person_attr(db: Session, params: dict) -> Any:
     if not mutations:
         return {"error": "mutations (or field+value) required"}
 
+    # 병동이동(소속 group_id 변경)은 이 스킬이 아니라 assignment transfer(월 발효·팀/등급 이관).
+    # 여기서 group_id 를 직접 덮어쓰면 그라운딩·RBAC·월 개념이 없어 실패/거짓완료가 난다 → 차단.
+    if any(m.get("field") == "group_id" for m in mutations):
+        return {
+            "error": "병동이동(소속 병동 변경)은 이 기능으로 처리하지 않습니다. "
+                     "병동이동 처리(manage_assignment)로 해주세요 — "
+                     "예: '신솔희 8월부터 중환자실2로 병동이동'.",
+        }
+
     # 퇴사 처리는 반드시 퇴사일이 있어야 한다 — 값 없이 오면 날짜를 되묻는다.
     # (명시적 '해제'/'취소' 는 값이 있으므로 통과 → 퇴사 취소로 처리)
     for m in mutations:

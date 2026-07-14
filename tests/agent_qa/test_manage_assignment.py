@@ -101,6 +101,42 @@ def test_create_preview_shape(db, seed_data, target_ward):
     assert classify(d) is ErrorType.PREVIEW
 
 
+def test_reason_of_kind():
+    from agents_v2.skills.manage_assignment import _reason_of
+    assert _reason_of({"kind": "병동이동"}) == "병동이동"
+    assert _reason_of({"kind": "파견"}) == "파견"
+    assert _reason_of({}) == "파견"  # 기본
+
+
+def test_transfer_create_preview(db, seed_data, target_ward):
+    # 병동이동: reason=병동이동, 영구(종료일 무시), preview
+    res = execute_skill(
+        db, "manage_assignment",
+        {
+            "operation": "create", "kind": "병동이동", "nurse_name": "김민지",
+            "target_ward": "중환자실2", "start_date": "2026-08-01",
+            "end_date": "2026-08-31",  # 병동이동은 무시돼야
+            "preview_only": True,
+        },
+        _hn_ctx(),
+    )
+    d = res.data
+    assert d.get("preview") is True
+    assert d["summary"]["reason"] == "병동이동"
+    assert "영구" in d["summary"]["period"]  # end_date 무시 → 영구
+    assert classify(d) is ErrorType.PREVIEW
+
+
+def test_update_person_attr_rejects_group_id(db, seed_data):
+    # 병동이동을 update_person_attr(group_id)로 시도 → 차단(병동이동 스킬로 유도)
+    from agents_v2.skills.update_person_attr import update_person_attr
+    res = update_person_attr(db, {
+        "nurse_ids": ["N001"], "group_id": "GRP001",
+        "field": "group_id", "value": "GRP002",
+    })
+    assert "error" in res and "병동이동" in res["error"]
+
+
 def test_create_unknown_ward_errors(db, seed_data):
     res = execute_skill(
         db, "manage_assignment",
