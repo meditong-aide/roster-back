@@ -707,35 +707,34 @@ def apply_ward_redistribution(
             # 부분 커밋이 없다 → 세션 무효화(rollback) 없이 다음 사람 진행.
             detail = getattr(e, "detail", None) or str(e)
             failed.append({"nurse_id": nid, "reason": str(detail)})
-    # 알림: 개별 N건(create_assignment 는 notify=False) 대신 관련 병동 수간호사에게 요약 1건.
-    #   운영(ENVIRONMENT=production)에서만 실제 발송 — set_app_push 가 dev 를 자체 스킵.
-    if transfers or team_changes:
-        try:
-            from services.assignment_service import _get_head_nurse_ids
-            from utils.utils import set_app_push
-
-            _hns: set[str] = set()
-            for _g in set(group_ids):
-                for _h in _get_head_nurse_ids(db, _g):
-                    _hns.add(str(_h))
-            _sender = str(getattr(current_user, "nurse_id", "") or "")
-            _office = (
-                getattr(current_user, "office_id", None)
-                or next((n.office_id for n in nurses.values()), "")
-            )
-            if _hns and _sender and _office:
-                _msg = (
-                    f"{year}-{month:02d} 병동재분배: 이동 {transfers}명 · 팀변경 {team_changes}명 "
-                    f"({month}월 발효 예약)"
-                )
-                set_app_push(
-                    pushCode="P30", pushSubCode="S06", officeCode=_office,
-                    sendEmpSeqNo=_sender, sendMemberId=_sender,
-                    receiveEmpSeqNo=",".join(sorted(_hns)),
-                    pushMessage=_msg, orgPushMessage=_msg, linkUrl="", linkCode="",
-                )
-        except Exception as e:
-            logger.error("재분배 요약 알림 발송 실패: %s", e, exc_info=True)
+    # 병동재분배 요약 알림 제외 — assignment 알림 전체 제외 정책에 맞춰 발송 안 함 (주석처리).
+    # if transfers or team_changes:
+    #     try:
+    #         from services.assignment_service import _get_head_nurse_ids
+    #         from utils.utils import set_app_push
+    #
+    #         _hns: set[str] = set()
+    #         for _g in set(group_ids):
+    #             for _h in _get_head_nurse_ids(db, _g):
+    #                 _hns.add(str(_h))
+    #         _sender = str(getattr(current_user, "nurse_id", "") or "")
+    #         _office = (
+    #             getattr(current_user, "office_id", None)
+    #             or next((n.office_id for n in nurses.values()), "")
+    #         )
+    #         if _hns and _sender and _office:
+    #             _msg = (
+    #                 f"{year}-{month:02d} 병동재분배: 이동 {transfers}명 · 팀변경 {team_changes}명 "
+    #                 f"({month}월 발효 예약)"
+    #             )
+    #             set_app_push(
+    #                 pushCode="P30", pushSubCode="S06", officeCode=_office,
+    #                 sendEmpSeqNo=_sender, sendMemberId=_sender,
+    #                 receiveEmpSeqNo=",".join(sorted(_hns)),
+    #                 pushMessage=_msg, orgPushMessage=_msg, linkUrl="", linkCode="",
+    #             )
+    #     except Exception as e:
+    #         logger.error("재분배 요약 알림 발송 실패: %s", e, exc_info=True)
 
     return {
         "transfers": transfers,
