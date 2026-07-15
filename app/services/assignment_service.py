@@ -536,18 +536,20 @@ def create_assignment(
             _recipients = _collect_assignment_recipients(
                 db, req.nurse_id, req.source_group_id, req.target_group_id
             )
-            send_assignment_created_push(
-                nurse_name=nurse.name,
-                reason=req.reason,
-                start_date=str(req.start_date),
-                end_date=str(req.expected_end_date),
-                source_group_name=_get_group_name(db, req.source_group_id) or req.source_group_id,
-                target_group_name=_get_group_name(db, req.target_group_id),
-                recipients=_recipients,
-                office_code=req.office_id,
-                sender_emp_seq_no=req.nurse_id,
-                sender_member_id=req.nurse_id,
-            )
+            # 병동이동 단건은 일단 알림 발송 제외 (주석처리). 다른 사유는 그대로 발송.
+            if req.reason != "병동이동":
+                send_assignment_created_push(
+                    nurse_name=nurse.name,
+                    reason=req.reason,
+                    start_date=str(req.start_date),
+                    end_date=str(req.expected_end_date),
+                    source_group_name=_get_group_name(db, req.source_group_id) or req.source_group_id,
+                    target_group_name=_get_group_name(db, req.target_group_id),
+                    recipients=_recipients,
+                    office_code=req.office_id,
+                    sender_emp_seq_no=req.nurse_id,
+                    sender_member_id=req.nurse_id,
+                )
         except Exception as e:
             logger.error("배정 생성 알림 발송 실패: %s", e, exc_info=True)
 
