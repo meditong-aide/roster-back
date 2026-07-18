@@ -227,3 +227,31 @@ def test_wanted_cancel_passes_when_retracted(db, seed_data):
     result = {"nurse_id": "N001", "request_id": 9002, "status": "retracted"}
     vr = run_readback(db, "bulk_mutation", _wcancel_params(), result)
     assert vr.ok is True
+
+
+# ── L2 answer-consistency judge (라이브 nano — 답변↔데이터 정합) ──
+import os  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+from dotenv import load_dotenv as _load  # noqa: E402
+_load(_Path(__file__).resolve().parents[2] / ".env")
+
+import pytest as _pytest  # noqa: E402
+from agents_v2.verify import judge_answer_consistency  # noqa: E402
+from agents_v2.llm_client import get_router_llm_client  # noqa: E402
+
+_HAS_KEY = bool(os.getenv("OPENAI_API_KEY"))
+_DATA = {"nurse": "김민지", "nights": 3}
+
+
+@_pytest.mark.skipif(not _HAS_KEY, reason="OPENAI_API_KEY 필요(라이브)")
+def test_l2_passes_consistent_answer():
+    llm = get_router_llm_client("openai")
+    r = judge_answer_consistency(llm, "김민지 야간 몇 개야?", _DATA, "김민지 야간은 3개입니다.")
+    assert r.consistent is True
+
+
+@_pytest.mark.skipif(not _HAS_KEY, reason="OPENAI_API_KEY 필요(라이브)")
+def test_l2_catches_hallucinated_number():
+    llm = get_router_llm_client("openai")
+    r = judge_answer_consistency(llm, "김민지 야간 몇 개야?", _DATA, "김민지 야간은 5개입니다.")
+    assert r.consistent is False and r.reason

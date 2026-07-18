@@ -326,11 +326,43 @@ class SchedulingAgent:
 
             # ── Text response → final answer ──
             if response.is_text:
-                trace.append(
-                    Stage("answer", "ok", {"text": response.text}, llm_ms)
-                )
+                answer_text = response.text or ""
+                # ── L2 answer-consistency: 조회 데이터가 있으면 답변↔데이터 정합성 검증 ──
+                # (read 답변의 환각 방지. mutation "완료"류는 last_query_data 없어 skip → L1 담당)
+                if last_query_data is not None and answer_text.strip():
+                    from agents_v2.verify import judge_answer_consistency
+
+                    judge_llm = self.router_llm or self.llm
+                    cons = judge_answer_consistency(
+                        judge_llm, user_message, last_query_data, answer_text
+                    )
+                    trace.append(Stage(
+                        "answer_consistency",
+                        "ok" if cons.consistent else "block",
+                        {"reason": cons.reason}, 0,
+                    ))
+                    if not cons.consistent:
+                        # LLM-Modulo 루프: 어긋나면 데이터에만 근거해 1회 재생성.
+                        fix = inject_messages + [{
+                            "role": "system",
+                            "content": (
+                                f"[검증] 직전 답변이 도구 데이터와 어긋난다: {cons.reason}. "
+                                "도구가 반환한 데이터에만 근거해 다시 답하라. "
+                                "데이터에 없는 수치·이름·상태를 지어내지 마라."
+                            ),
+                        }]
+                        try:
+                            regen = self.llm.chat(fix, tools=[])
+                            if regen.is_text and (regen.text or "").strip():
+                                answer_text = regen.text
+                                trace.append(Stage(
+                                    "answer_regenerated", "ok", {"text": answer_text}, 0
+                                ))
+                        except Exception:  # noqa: BLE001
+                            pass
+                trace.append(Stage("answer", "ok", {"text": answer_text}, llm_ms))
                 return AgentResult(
-                    answer=response.text or "",
+                    answer=answer_text,
                     ui_actions=ui_actions,
                     trace=trace,
                     messages=messages,

@@ -50,3 +50,52 @@ def run_readback(db: Session, skill_name: str, params: dict, result: Any) -> Ver
         return fn(db, params, result)
     except Exception as e:  # noqa: BLE001
         return VerifyResult(False, f"read-back 예외: {e}")
+
+
+# ── L2 answer-consistency judge ──────────────────────────────
+# read-back(L1)이 'DB↔의도'를 본다면, 이건 '답변↔데이터'를 본다. tool 데이터는 맞는데
+# 최종 자연어 답변이 그걸 틀리게 말하는 것(환각 숫자, "3명인데 5명", 실패인데 "완료")을 잡는다.
+# reference-grounded: judge 에게 진실 데이터를 주고 대조시킨다(자유 판단 아님).
+# 조언적 층 — judge 실패/예외는 통과(답변을 깨지 않는다). 확실히 어긋날 때만 INCONSISTENT.
+
+
+@dataclass
+class ConsistencyResult:
+    consistent: bool
+    reason: str = ""
+
+
+def judge_answer_consistency(llm: Any, question: str, data: Any, answer: str) -> ConsistencyResult:
+    """답변의 사실 주장이 tool 데이터로 뒷받침되는지 nano judge 로 대조."""
+    import json
+
+    if not answer or not answer.strip():
+        return ConsistencyResult(True)
+    try:
+        data_str = json.dumps(data, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        data_str = str(data)
+    data_str = data_str[:4000]  # 토큰 상한(초과 시 부분 — judge 는 확실한 모순만 잡음)
+
+    sys = (
+        "너는 답변 검증기다. 사용자 질문, 도구가 반환한 데이터(=진실), 에이전트의 답변이 주어진다.\n"
+        "답변의 사실 주장(숫자·이름·상태·완료여부)이 데이터로 뒷받침되는지 판정하라.\n"
+        "- 데이터에 없거나 데이터와 어긋나는 주장이 있으면 INCONSISTENT.\n"
+        "- 표현 차이·요약·자연스러운 말투·데이터를 그대로 옮긴 것은 문제없음(CONSISTENT).\n"
+        "- 데이터가 일부만 주어졌을 수 있으니, 확실히 모순될 때만 INCONSISTENT.\n"
+        "반드시 첫 줄에 'CONSISTENT' 또는 'INCONSISTENT: <무엇이 어긋났는지 한 줄>' 만 출력."
+    )
+    user = f"[질문]\n{question}\n\n[데이터(진실)]\n{data_str}\n\n[답변]\n{answer}"
+    try:
+        resp = llm.chat(
+            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            tools=[],
+        )
+        text = (getattr(resp, "text", None) or "").strip()
+    except Exception as e:  # noqa: BLE001
+        return ConsistencyResult(True, f"judge 예외(무해통과): {e}")
+
+    if text.upper().startswith("INCONSISTENT"):
+        reason = text.split(":", 1)[1].strip() if ":" in text else text
+        return ConsistencyResult(False, reason or "답변이 데이터와 어긋남")
+    return ConsistencyResult(True)
