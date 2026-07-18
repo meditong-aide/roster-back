@@ -409,10 +409,35 @@ def _verify_manage_assignment(db: Session, params: dict, result: Any) -> VerifyR
     # 실제 apply(ok=True)만 대상. preview/clarification/error 는 검증 안 함(통과).
     if not (isinstance(result, dict) and result.get("ok") is True):
         return VerifyResult(True)
-    # create 만 read-back(cancel 은 '없어져야 함' 검증이라 프로토타입 범위 밖 → 통과).
-    if (params.get("operation") or "").lower() != "create":
-        return VerifyResult(True)
+    op = (params.get("operation") or "").lower()
+    if op == "create":
+        return _verify_assignment_create(db, params, result)
+    if op == "cancel":
+        return _verify_assignment_cancel(db, params, result)
+    return VerifyResult(True)
 
+
+def _verify_assignment_cancel(db: Session, params: dict, result: Any) -> VerifyResult:
+    # 취소 성공이면 그 reason 의 active 배정이 남아있으면 안 됨(부재 확인).
+    # _cancel 은 정확히 1건일 때만 ok(2건 이상은 clarification) → 취소 후 active-of-reason = 0.
+    nurse_ids = params.get("nurse_ids") or []
+    if not nurse_ids:
+        return VerifyResult(True)
+    nurse_id, office_id = nurse_ids[0], params.get("office_id")
+    reason = _reason_of(params)
+    rows = assignment_service.get_assignments(
+        db, office_id=office_id, nurse_id=nurse_id, status="active"
+    )
+    for r in rows:
+        if getattr(r, "reason", None) == reason:
+            return VerifyResult(
+                False,
+                f"{reason} 취소가 반영되지 않았습니다 (nurse={nurse_id}, 여전히 active).",
+            )
+    return VerifyResult(True)
+
+
+def _verify_assignment_create(db: Session, params: dict, result: Any) -> VerifyResult:
     nurse_ids = params.get("nurse_ids") or []
     if not nurse_ids:
         return VerifyResult(True)

@@ -169,3 +169,61 @@ def test_wanted_readback_skips_unparseable_value(db, seed_data):
     ids = _wanted_ids(db, applied=False)
     vr = run_readback(db, "bulk_mutation", _wanted_params("아마도"), _wanted_result(ids))
     assert vr.ok is True
+
+
+import agents_v2.skills.manage_assignment  # noqa: F401,E402  (@readback 등록 트리거)
+
+
+# ── cancel류 read-back (부재 확인 방향) ──
+from datetime import date as _date  # noqa: E402
+from db.models import NurseAssignment, WantedRequest  # noqa: E402
+
+
+def _mk_assignment(db, status):
+    a = NurseAssignment(nurse_id="N001", source_group_id="GRP001", office_id="OFF001",
+                        start_date=_date(2026, 8, 1), reason="파견", kind="dispatch", status=status)
+    db.add(a); db.flush(); return a
+
+
+def _cancel_params():
+    return {"operation": "cancel", "kind": "파견", "nurse_ids": ["N001"],
+            "office_id": "OFF001", "group_id": "GRP001"}
+
+
+def test_assignment_cancel_catches_still_active(db, seed_data):
+    _mk_assignment(db, "active")  # 취소했다 보고했으나 여전히 active
+    vr = run_readback(db, "manage_assignment", _cancel_params(),
+                      {"ok": True, "message": "파견을 취소했습니다."})
+    assert vr.ok is False and "취소" in vr.reason
+
+
+def test_assignment_cancel_passes_when_gone(db, seed_data):
+    _mk_assignment(db, "cancelled")  # 실제 취소됨(active 아님)
+    vr = run_readback(db, "manage_assignment", _cancel_params(),
+                      {"ok": True, "message": "파견을 취소했습니다."})
+    assert vr.ok is True
+
+
+def _mk_wanted_req(db, rid, submitted):
+    w = WantedRequest(nurse_id="N001", request_id=rid, month="2026-04",
+                      group_id="GRP001", is_submitted=1 if submitted else 0)
+    db.add(w); db.flush(); return w
+
+
+def _wcancel_params():
+    return {"scope": "wanted_submissions", "action": "cancel",
+            "group_id": "GRP001", "nurse_ids": ["N001"]}
+
+
+def test_wanted_cancel_catches_still_submitted(db, seed_data):
+    _mk_wanted_req(db, 9001, submitted=True)  # 취소했다 보고했으나 여전히 제출됨
+    result = {"nurse_id": "N001", "request_id": 9001, "status": "retracted"}
+    vr = run_readback(db, "bulk_mutation", _wcancel_params(), result)
+    assert vr.ok is False and "취소" in vr.reason
+
+
+def test_wanted_cancel_passes_when_retracted(db, seed_data):
+    _mk_wanted_req(db, 9002, submitted=False)  # 실제 취소됨
+    result = {"nurse_id": "N001", "request_id": 9002, "status": "retracted"}
+    vr = run_readback(db, "bulk_mutation", _wcancel_params(), result)
+    assert vr.ok is True

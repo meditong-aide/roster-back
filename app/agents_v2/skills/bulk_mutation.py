@@ -324,10 +324,41 @@ def _bool_or_none(v: Any) -> bool | None:
 @readback("bulk_mutation")
 def _verify_bulk_mutation(db: Session, params: dict, result: Any) -> VerifyResult:
     scope = params.get("scope", "")
+    action = params.get("action") or (params.get("mutation") or {}).get("action", "")
     if scope == "wanted_adjustment":
         return _verify_wanted_adjustments(db, params, result)
+    if scope == "wanted_submissions" and action == "cancel":
+        return _verify_wanted_cancel(db, params, result)
     if scope in ("schedule", "draft_schedule", "published_schedule"):
         return _verify_schedule_cells(db, params, result)
+    return VerifyResult(True)
+
+
+def _verify_wanted_cancel(db: Session, params: dict, result: Any) -> VerifyResult:
+    # 원티드 취소(retract) = WantedRequest.is_submitted → False. 부재 확인:
+    # 결과의 request_id 를 되읽어 여전히 제출상태(is_submitted=True)면 취소 미반영.
+    items = result.get("results") if isinstance(result.get("results"), list) else [result]
+    from db.models import WantedRequest
+    for it in items:
+        if not isinstance(it, dict) or "error" in it:
+            continue
+        rid = it.get("request_id")
+        if rid is None:
+            continue
+        row = (
+            db.query(WantedRequest)
+            .filter(
+                WantedRequest.request_id == rid,
+                WantedRequest.group_id == params.get("group_id"),
+            )
+            .first()
+        )
+        if row is None:
+            continue  # 못 읽으면 애매 → 통과(오탐 방지)
+        if bool(getattr(row, "is_submitted", False)):  # 여전히 제출됨 → 취소 미반영
+            return VerifyResult(
+                False, f"원티드 취소가 반영되지 않았습니다 (request={rid}, 여전히 제출됨)."
+            )
     return VerifyResult(True)
 
 
