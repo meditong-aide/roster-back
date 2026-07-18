@@ -271,6 +271,9 @@ class SchedulingAgent:
         _failed_shift_terms: list[str] = []
         # B7: 마지막 성공 조회 결과 — 인라인 렌더용 ChatResponse.data 채움.
         last_query_data: dict | list | None = None
+        # 이번 턴의 모든 OK 조회 결과 — L2 는 (마지막 하나가 아니라) 턴 전체 데이터로 대조해야
+        # 복합쿼리("A랑 B 각각")에서 오탐이 안 난다.
+        turn_query_data: list = []
 
         # Restore VM from previous turns
         if ctx.variable_memory:
@@ -328,13 +331,21 @@ class SchedulingAgent:
             if response.is_text:
                 answer_text = response.text or ""
                 # ── L2 answer-consistency: 조회 데이터가 있으면 답변↔데이터 정합성 검증 ──
-                # (read 답변의 환각 방지. mutation "완료"류는 last_query_data 없어 skip → L1 담당)
-                if last_query_data is not None and answer_text.strip():
-                    from agents_v2.verify import judge_answer_consistency
+                # (read 답변의 환각 방지. mutation "완료"류는 조회 데이터 없어 skip → L1 담당)
+                #
+                # 정합성 최우선(오탐 금지):
+                #  - 턴 '전체' 조회 데이터로 대조(복합쿼리 오탐 방지). 마지막 하나만 보면
+                #    "A랑 B" 답변에서 A 를 근거없다고 오탐한다.
+                #  - 데이터가 크면(잘림 불가피) judge 가 '부분만 보고' 오탐하므로 skip.
+                #    대용량 조회는 L2 미적용(recall↓ 감수, false-positive 0 우선).
+                from agents_v2.verify import judge_answer_consistency, l2_data_fits
 
+                _judge_data = (turn_query_data[0] if len(turn_query_data) == 1
+                               else turn_query_data)
+                if turn_query_data and answer_text.strip() and l2_data_fits(_judge_data):
                     judge_llm = self.router_llm or self.llm
                     cons = judge_answer_consistency(
-                        judge_llm, user_message, last_query_data, answer_text
+                        judge_llm, user_message, _judge_data, answer_text
                     )
                     trace.append(Stage(
                         "answer_consistency",
@@ -485,6 +496,7 @@ class SchedulingAgent:
                         and _classify_outcome(result.data) is ErrorType.OK
                     ):
                         last_query_data = result.data
+                        turn_query_data.append(result.data)
 
                     # ── Auto-learn abbreviation tracking ──
                     _track_shift_learning(

@@ -55,6 +55,13 @@ CASES = [
      "answer": "박지은 간호사의 등급은 2입니다.", "label": False, "note": "다른 간호사 언급"},
     {"q": "간호사 몇 명이야?", "data": {"nurses": [1, 2, 3, 4, 5, 6]},
      "answer": "총 9명입니다.", "label": False, "note": "카운트 환각"},
+    # ── 복합(list 데이터) — 턴 전체 대조 ──
+    {"q": "김민지랑 박지은 야간 몇 개?",
+     "data": [{"nurse": "김민지", "nights": 4}, {"nurse": "박지은", "nights": 2}],
+     "answer": "김민지 4개, 박지은 2개입니다.", "label": True, "note": "복합 둘 다 일치"},
+    {"q": "김민지랑 박지은 야간 몇 개?",
+     "data": [{"nurse": "김민지", "nights": 4}, {"nurse": "박지은", "nights": 2}],
+     "answer": "김민지 4개, 박지은 5개입니다.", "label": False, "note": "복합 중 하나 환각"},
 ]
 
 

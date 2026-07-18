@@ -65,6 +65,21 @@ class ConsistencyResult:
     reason: str = ""
 
 
+# L2 는 데이터 '전체'를 judge 에 줘야 한다. 크면 잘려서 judge 가 부분만 보고 정상 답변을
+# 오탐(FP)한다 → 그럴 땐 L2 를 건너뛴다(대용량 조회는 미적용, false-positive 0 우선).
+_L2_MAX_DATA_CHARS = 3500
+
+
+def l2_data_fits(data: Any) -> bool:
+    """L2 대조에 쓸 데이터가 잘리지 않고 통째로 judge 에 들어갈 만큼 작은가."""
+    import json
+
+    try:
+        return len(json.dumps(data, ensure_ascii=False, default=str)) <= _L2_MAX_DATA_CHARS
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def judge_answer_consistency(llm: Any, question: str, data: Any, answer: str) -> ConsistencyResult:
     """답변의 사실 주장이 tool 데이터로 뒷받침되는지 nano judge 로 대조."""
     import json
