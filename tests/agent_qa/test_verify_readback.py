@@ -121,3 +121,51 @@ def test_bulk_readback_skips_wanted_scope(db, seed_data):
     vr = run_readback(db, "bulk_mutation",
                       {"scope": "wanted_adjustment", "group_id": "GRP001"}, result)
     assert vr.ok is True
+
+
+# ── bulk_mutation · 원티드 승인/거부 read-back ──
+from db.models import FixedWantedEntry  # noqa: E402
+
+
+def _wanted_ids(db, applied: bool):
+    return [r.id for r in db.query(FixedWantedEntry)
+            .filter(FixedWantedEntry.group_id == "GRP001").all()
+            if bool(r.is_applied) is applied]
+
+
+def _wanted_params(target_value):
+    return {"scope": "wanted_adjustment", "group_id": "GRP001",
+            "mutation": {"target_field": "is_applied", "target_value": target_value}}
+
+
+def _wanted_result(entry_ids):
+    return {"preview": False, "affected_count": len(entry_ids), "entry_ids": entry_ids}
+
+
+def test_wanted_readback_passes_when_applied(db, seed_data):
+    # is_applied=True 인 엔트리에 승인(True) 주장 → 일치 → 통과
+    ids = _wanted_ids(db, applied=True)
+    vr = run_readback(db, "bulk_mutation", _wanted_params(True), _wanted_result(ids))
+    assert vr.ok is True
+
+
+def test_wanted_readback_catches_unpersisted(db, seed_data):
+    # is_applied=False 인 엔트리(N002)를 '승인했다'(True)고 거짓 주장 → 포착
+    ids = _wanted_ids(db, applied=False)
+    assert ids  # seed 에 False 엔트리(N002 4/15) 존재
+    vr = run_readback(db, "bulk_mutation", _wanted_params(True), _wanted_result(ids))
+    assert vr.ok is False and "승인" in vr.reason
+
+
+def test_wanted_readback_reject_matches(db, seed_data):
+    # is_applied=False 엔트리에 거부(False) 주장 → 일치 → 통과
+    ids = _wanted_ids(db, applied=False)
+    vr = run_readback(db, "bulk_mutation", _wanted_params(False), _wanted_result(ids))
+    assert vr.ok is True
+
+
+def test_wanted_readback_skips_unparseable_value(db, seed_data):
+    # target_value 해석 불가(애매) → 스킵(오탐 방지)
+    ids = _wanted_ids(db, applied=False)
+    vr = run_readback(db, "bulk_mutation", _wanted_params("아마도"), _wanted_result(ids))
+    assert vr.ok is True

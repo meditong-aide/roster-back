@@ -306,12 +306,66 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
 #   - 스킬과 동일한 resolve_target_schedule + find_schedule_entry 경로로 되읽음.
 #   - false-fail-safe: 되읽기 성공했는데 값이 다를 때만 실패. 못 읽으면(애매) 통과.
 # 원티드/deadline 스코프는 방향·필드가 달라 1차 범위 밖(통과).
+def _bool_or_none(v: Any) -> bool | None:
+    """승인/거부 값 해석. bool/int/명확한 문자열만, 애매하면 None(검증 스킵)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "y", "t"):
+            return True
+        if s in ("false", "0", "no", "n", "f"):
+            return False
+    return None
+
+
 @readback("bulk_mutation")
 def _verify_bulk_mutation(db: Session, params: dict, result: Any) -> VerifyResult:
     scope = params.get("scope", "")
-    if scope not in ("schedule", "draft_schedule", "published_schedule"):
-        return VerifyResult(True)
+    if scope == "wanted_adjustment":
+        return _verify_wanted_adjustments(db, params, result)
+    if scope in ("schedule", "draft_schedule", "published_schedule"):
+        return _verify_schedule_cells(db, params, result)
+    return VerifyResult(True)
 
+
+def _verify_wanted_adjustments(db: Session, params: dict, result: Any) -> VerifyResult:
+    # 원티드 일괄 승인/거부(is_applied)만. 실제 적용(preview 아님)만 검증.
+    # 결과의 entry_ids(실제 적용된 id)를 되읽어 is_applied 가 요청값인지 대조.
+    if result.get("preview"):
+        return VerifyResult(True)
+    entry_ids = result.get("entry_ids")
+    if not entry_ids:
+        return VerifyResult(True)
+    mutation = params.get("mutation") or {}
+    if mutation.get("target_field", "is_applied") != "is_applied":
+        return VerifyResult(True)  # 1차: 승인/거부만
+    want = _bool_or_none(mutation.get("target_value"))
+    if want is None:
+        return VerifyResult(True)  # 값 해석 불가 → 스킵(오탐 방지)
+
+    from db.models import FixedWantedEntry
+    rows = (
+        db.query(FixedWantedEntry)
+        .filter(
+            FixedWantedEntry.id.in_(entry_ids),
+            FixedWantedEntry.group_id == params.get("group_id"),
+        )
+        .all()
+    )
+    for row in rows:
+        # bool 비교(강제변환 안전) — 요청한 승인/거부 상태와 실제가 다르면 미반영.
+        if bool(getattr(row, "is_applied", None)) != want:
+            return VerifyResult(
+                False,
+                f"원티드 {'승인' if want else '거부'}이 반영되지 않았습니다 (entry={row.id}).",
+            )
+    return VerifyResult(True)
+
+
+def _verify_schedule_cells(db: Session, params: dict, result: Any) -> VerifyResult:
     # 적용 결과 아이템(단일 평탄화 / 다중 results). 셀 변경을 '주장'한 것만.
     items = result.get("results") if isinstance(result.get("results"), list) else [result]
     claims = [
