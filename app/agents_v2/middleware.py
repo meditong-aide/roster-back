@@ -260,6 +260,24 @@ def execute_skill(
                 status = "VERIFICATION_FAILED"
                 err_msg = "postcondition failed"
 
+    # ── ④c Read-back 검증 (L1) — 실행 후 DB 대조로 '조용한 거짓완료' 차단 ──
+    # postcondition(shape 검사)을 통과했어도, 등록된 read-back 이 실제 DB 반영을 확인한다.
+    # (postcondition 이 이미 실패했으면 result 에 verification_failed 가 있어 classify≠OK → 건너뜀)
+    if status == "SUCCESS" and classify(result) is ErrorType.OK:
+        from agents_v2.verify import run_readback
+
+        vr = run_readback(db, skill_name, args, result)
+        if not vr.ok:
+            result = {
+                "error": f"실행됐다고 보고됐으나 실제 반영이 확인되지 않았습니다: {vr.reason}",
+                "verification_failed": True,
+            }
+            steps.append(
+                MiddlewareStep("verification", "block", detail=f"readback: {vr.reason}")
+            )
+            status = "VERIFICATION_FAILED"
+            err_msg = f"readback failed: {vr.reason}"
+
     dt = (time.time() - t0) * 1000
     _write_skill_audit(db, ctx, skill_name, args, status, err_msg, dt)
 

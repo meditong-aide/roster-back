@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from agents_v2.grounding.internal import resolve_date, resolve_group
 from agents_v2.skills.manifest import skill
+from agents_v2.verify import VerifyResult, readback
 from services import assignment_service
 
 _REASON = "파견"  # 기본(하위호환)
@@ -398,3 +399,42 @@ def manage_assignment(db: Session, params: dict) -> Any:
     if op == "cancel":
         return _cancel(db, params)
     return {"error": f"지원하지 않는 작업입니다: {op}"}
+
+
+# ── L1 read-back 검증 ────────────────────────────────────────
+# 실제 적용(ok=True)을 보고했으면, DB 를 되읽어 '의도한 배정'이 정말 존재하는지 대조한다.
+# 스킬이 예외 없이 ok 를 반환했지만 실제로는 반영이 안 된 '조용한 거짓완료'(신솔희류)를 잡는다.
+@readback("manage_assignment")
+def _verify_manage_assignment(db: Session, params: dict, result: Any) -> VerifyResult:
+    # 실제 apply(ok=True)만 대상. preview/clarification/error 는 검증 안 함(통과).
+    if not (isinstance(result, dict) and result.get("ok") is True):
+        return VerifyResult(True)
+    # create 만 read-back(cancel 은 '없어져야 함' 검증이라 프로토타입 범위 밖 → 통과).
+    if (params.get("operation") or "").lower() != "create":
+        return VerifyResult(True)
+
+    nurse_ids = params.get("nurse_ids") or []
+    if not nurse_ids:
+        return VerifyResult(True)
+    nurse_id, office_id = nurse_ids[0], params.get("office_id")
+    reason = _reason_of(params)
+
+    # 의도한 target 을 다시 해석(스킬 실행과 동일 경로) — 못 풀면 애초에 실행됐을 리 없으니 통과.
+    rg = resolve_group(db, office_id, params.get("target_ward"),
+                       exclude_group_id=params.get("group_id"))
+    if not rg.resolved:
+        return VerifyResult(True)
+    target_group_id = rg.value
+
+    rows = assignment_service.get_assignments(
+        db, office_id=office_id, nurse_id=nurse_id, status="active"
+    )
+    for r in rows:
+        if (getattr(r, "target_group_id", None) == target_group_id
+                and getattr(r, "reason", None) == reason):
+            return VerifyResult(True)  # 의도한 배정이 DB 에 실재 → 통과
+    return VerifyResult(
+        False,
+        f"{reason} 배정이 DB 에 반영되지 않았습니다 "
+        f"(nurse={nurse_id} → {target_group_id}).",
+    )
