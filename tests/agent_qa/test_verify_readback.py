@@ -69,3 +69,55 @@ def test_person_attr_readback_skips_period_field(db, seed_data):
     vr = run_readback(db, "update_person_attr", {"group_id": "GRP001"},
                       _pa_result("grade", 1, 3))
     assert vr.ok is True
+
+
+# ── bulk_mutation read-back (근무표 셀 변경, 정합성 최우선) ──
+import agents_v2.skills.bulk_mutation  # noqa: F401,E402  (@readback 등록 트리거)
+from agents_v2.tools import schedule_tools  # noqa: E402
+
+
+def _sched_params():
+    return {"scope": "schedule", "group_id": "GRP001", "schedule_id": "SCH202604V1"}
+
+
+def _cell(db, nid="N001", d="2026-04-01"):
+    return schedule_tools.find_schedule_entry(db, "SCH202604V1", nid, d, "GRP001")
+
+
+def test_bulk_readback_passes_when_shift_matches(db, seed_data):
+    # 실제 셀 값을 그대로 '주장' → DB 와 일치 → 통과
+    c = _cell(db)
+    result = {"entry_id": c["entry_id"], "nurse_id": "N001",
+              "work_date": "2026-04-01", "new_shift_id": c["shift_id"]}
+    assert run_readback(db, "bulk_mutation", _sched_params(), result).ok is True
+
+
+def test_bulk_readback_catches_unpersisted(db, seed_data):
+    # 셀은 안 바뀌었는데 다른 시프트로 '바꿨다'고 거짓 주장 → 포착
+    c = _cell(db)
+    bogus = "N_GRP001" if c["shift_id"] != "N_GRP001" else "D_GRP001"
+    result = {"entry_id": c["entry_id"], "nurse_id": "N001",
+              "work_date": "2026-04-01", "new_shift_id": bogus}
+    vr = run_readback(db, "bulk_mutation", _sched_params(), result)
+    assert vr.ok is False and "반영" in vr.reason
+
+
+def test_bulk_readback_catches_partial_in_batch(db, seed_data):
+    # 다중 결과 중 하나만 미반영(거짓 주장) → 전체를 미반영으로 포착
+    c1, c2 = _cell(db, "N001", "2026-04-01"), _cell(db, "N002", "2026-04-02")
+    bogus = "N_GRP001" if c2["shift_id"] != "N_GRP001" else "D_GRP001"
+    result = {"affected_count": 2, "results": [
+        {"entry_id": c1["entry_id"], "nurse_id": "N001", "work_date": "2026-04-01",
+         "new_shift_id": c1["shift_id"]},                                  # 정상
+        {"entry_id": c2["entry_id"], "nurse_id": "N002", "work_date": "2026-04-02",
+         "new_shift_id": bogus},                                          # 거짓
+    ]}
+    assert run_readback(db, "bulk_mutation", _sched_params(), result).ok is False
+
+
+def test_bulk_readback_skips_wanted_scope(db, seed_data):
+    # 원티드 스코프는 1차 범위 밖 → 통과(오탐 없음)
+    result = {"affected_count": 1, "results": [{"entry_id": "x", "new_shift_id": "D_GRP001"}]}
+    vr = run_readback(db, "bulk_mutation",
+                      {"scope": "wanted_adjustment", "group_id": "GRP001"}, result)
+    assert vr.ok is True

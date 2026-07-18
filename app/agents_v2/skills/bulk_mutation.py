@@ -12,6 +12,7 @@ from agents_v2.tools.nurse_tools import (
     normalize_shift_codes,
     normalize_single_shift_code,
 )
+from agents_v2.verify import VerifyResult, readback
 
 
 @register("bulk-mutation")
@@ -295,3 +296,54 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
         results.append(result)
 
     return {"affected_count": len(results), "results": results}
+
+
+# ── L1 read-back 검증 (근무표 셀 변경) ────────────────────────
+# 스킬이 '셀을 new_shift 로 바꿨다'(new_shift_id 주장)고 보고하면, 같은 스케줄 resolve 경로로
+# 셀을 되읽어 shift_id 가 실제로 그 값인지 대조. '조용한 거짓완료'(보고했으나 미반영) 차단.
+# 정합성 최우선 설계:
+#   - 스킬 자신의 주장(결과의 new_shift_id)을 진실값과 대조 → 값 재해석 없음(불일치 원천 제거).
+#   - 스킬과 동일한 resolve_target_schedule + find_schedule_entry 경로로 되읽음.
+#   - false-fail-safe: 되읽기 성공했는데 값이 다를 때만 실패. 못 읽으면(애매) 통과.
+# 원티드/deadline 스코프는 방향·필드가 달라 1차 범위 밖(통과).
+@readback("bulk_mutation")
+def _verify_bulk_mutation(db: Session, params: dict, result: Any) -> VerifyResult:
+    scope = params.get("scope", "")
+    if scope not in ("schedule", "draft_schedule", "published_schedule"):
+        return VerifyResult(True)
+
+    # 적용 결과 아이템(단일 평탄화 / 다중 results). 셀 변경을 '주장'한 것만.
+    items = result.get("results") if isinstance(result.get("results"), list) else [result]
+    claims = [
+        it for it in items
+        if isinstance(it, dict) and it.get("entry_id")
+        and it.get("new_shift_id") is not None and "error" not in it
+    ]
+    if not claims:
+        return VerifyResult(True)
+
+    # 스킬과 동일하게 schedule_id 재해석(못 찾으면 애초에 실행됐을 리 없음 → 통과).
+    group_id = params.get("group_id")
+    schedule_id = params.get("schedule_id")
+    if not schedule_id:
+        meta = schedule_tools.resolve_target_schedule(
+            db, group_id, params.get("year"), params.get("month")
+        )
+        if not meta:
+            return VerifyResult(True)
+        schedule_id = meta["schedule_id"]
+
+    for it in claims:
+        nid, wdate, want = it.get("nurse_id"), it.get("work_date"), it.get("new_shift_id")
+        if not (nid and wdate):
+            continue
+        fresh = schedule_tools.find_schedule_entry(db, schedule_id, nid, wdate, group_id)
+        if not isinstance(fresh, dict) or "error" in fresh:
+            continue  # 못 읽으면 애매 → 통과(오탐 방지)
+        if fresh.get("shift_id") != want:
+            return VerifyResult(
+                False,
+                f"근무표 변경이 반영되지 않았습니다 "
+                f"(nurse={nid}, {wdate}: 기대={want}, 실제={fresh.get('shift_id')}).",
+            )
+    return VerifyResult(True)
