@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from agents_v2.skills.registry import register
 from agents_v2.tools import nurse_tools
 from agents_v2.tools.nurse_tools import compute_batch_changeset
+from agents_v2.verify import VerifyResult, readback
 from services.team_service import list_teams_with_members
 
 
@@ -165,3 +166,45 @@ def update_person_attr(db: Session, params: dict) -> Any:
     if len(results) == 1:
         return results[0]
     return {"affected_count": len(results), "results": results}
+
+
+# ── L1 read-back 검증 ────────────────────────────────────────
+# 속성 변경(ok)을 보고했으면 간호사를 되읽어 실제로 값이 바뀌었는지 대조.
+# period 필드(grade/allowed_shifts/fixed_shift/is_weekend_off/team_id)는 '시점 발효'라
+# 캐시 투영이 지연될 수 있어 스킵(오탐 방지). 나머지 직접 컬럼만 검사.
+# false-fail-safe: '변경 요청했는데 여전히 이전값'일 때만 실패, 애매하면 통과.
+_READBACK_SKIP_FIELDS = frozenset(
+    {"grade", "allowed_shifts", "fixed_shift", "is_weekend_off", "team_id"}
+)
+
+
+@readback("update_person_attr")
+def _verify_update_person_attr(db: Session, params: dict, result: Any) -> VerifyResult:
+    from db.models import Nurse
+
+    # 적용 결과 아이템 목록화(단일 평탄화 / 다중 results 모두 수용).
+    items = result.get("results") if isinstance(result.get("results"), list) else [result]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        muts = item.get("applied_mutations")
+        nid = item.get("nurse_id")
+        if not muts or not nid:  # preview·비적용 결과는 대상 아님
+            continue
+        fresh = db.query(Nurse).filter(Nurse.nurse_id == nid).first()
+        if fresh is None:
+            continue
+        summ = nurse_tools._nurse_summary(fresh)
+        for m in muts:
+            f, frm, to = m.get("field"), m.get("from"), m.get("to")
+            if f in _READBACK_SKIP_FIELDS or f not in summ:
+                continue
+            cur = summ[f]
+            if cur == to:  # 반영됨
+                continue
+            if frm != to and cur == frm:  # 변경 요청했는데 여전히 이전값 → 미반영
+                return VerifyResult(
+                    False, f"{nid}의 {f} 변경이 반영되지 않았습니다 ({frm}→{to})."
+                )
+            # 그 외(값 강제변환 등 애매) → 통과(오탐 방지)
+    return VerifyResult(True)
