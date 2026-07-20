@@ -1040,6 +1040,23 @@ def build_main_objective_terms(
     except Exception:
         pass
 
+    # (4-0b') 연속 OFF 소프트 상한 (max_consecutive_off_days).
+    # (k+1)연속 OFF 창마다 고weight 벌점 → hard처럼 억제하되, soft라 불가피 시 양보
+    # (OFF 과잉/하드 제약 충돌 시에도 절대 infeasible 유발 안 함). 연속근무 soft의 미러.
+    try:
+        soft_off_k = int(getattr(cfg, "max_conseq_off", 0) or 0)
+        w_soft_off = int(getattr(cfg, "max_conseq_off_penalty_weight", 0) or 0)
+        if soft_off_k > 0 and w_soft_off > 0:
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                for d0 in range(T0, T1 - soft_off_k + 1):
+                    sum_off = sum(X(n, d0 + t, off) for t in range(soft_off_k + 1))
+                    over = m.NewIntVar(0, 1, f"soft_coff_over_{n}_{d0}")
+                    m.Add(over >= sum_off - soft_off_k)
+                    obj.append(-w_soft_off * over)
+    except Exception:
+        pass
+
     # (4-0c) 같은 시프트(D/E/N) 연속 soft.
     # 기본(d5add): 원래 4연속 균등 페널티(base) + D 전용 5연속(DDDDD) 고가중(D5) 1개.
     #   → DDDD 는 완만(base=300), DDDDD 는 강하게(+2000). 실측상 급증(escalate)보다

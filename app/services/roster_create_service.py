@@ -2988,13 +2988,16 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             off_pen = config_dict.get("extra_off_penalty_weight")
             soft_k = config_dict.get("soft_max_consecutive_work_days")
             soft_w = config_dict.get("soft_consecutive_work_penalty_weight")
+            soft_off_k = config_dict.get("max_conseq_off")
+            soft_off_w = config_dict.get("max_conseq_off_penalty_weight")
             print(
                 "[ShiftDistributionPolicy] "
                 f"mode={mode}, oversupply_gauge={og}, monthly_pref_gauge={mg}, "
                 f"oversupply_equalize=({oe},{ow}), monthly_pref_weight={mw}, "
                 f"monthly_pref_cnt={mp_cnt}, "
                 f"max_extra_off_days={max_extra}, extra_off_penalty_weight={off_pen}, "
-                f"soft_cwork=(k={soft_k},w={soft_w})"
+                f"soft_cwork=(k={soft_k},w={soft_w}), "
+                f"soft_coff=(k={soft_off_k},w={soft_off_w})"
             )
         except Exception as _log_exc:
             print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")

@@ -231,6 +231,7 @@ class RosterConfigBase(BaseModel):
     banned_day_after_eve: bool
     max_conseq_work: int
     off_days: int
+    max_conseq_off: int = 3  # 연속 OFF 최대 개수(soft). 기본 3 = 4연속+ 벌점
     shift_priority: float
     weekend_shift_ratio: float
     patient_amount: int
