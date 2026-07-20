@@ -5746,6 +5746,39 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             if _cpsat_cores:
                 print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores_raw)}건 → dedup {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
                 _conflict_cores = _conflict_cores + _cpsat_cores
+            # ── 실패-시-한번 MUS 진단 재solve ──
+            # primary 는 성능 위해 MUS off(기본). INFEASIBLE 인데 아직 MUS 코어가 없으면
+            # AIDE_ENABLE_MUS_REGISTRY 를 켜고 1회 재solve 해 wrap 된 하드제약(전이/회복/연속/
+            # coverage/off-cap/night-cap 등 20종)의 UNSAT core 를 추출한다. 이미 실패한 케이스만
+            # 타므로 정상 생성엔 영향 없음. graceful. (env 토글은 async 워커=단일작업 전제; 동시성
+            # 우려 시 per-call 플래그로 대체 예정. kill: MUS_DIAG_DISABLE=1.)
+            if not _cpsat_cores:
+                try:
+                    import os as _os_mus
+                    if _os_mus.getenv("MUS_DIAG_DISABLE") != "1":
+                        _prev_mus = _os_mus.environ.get("AIDE_ENABLE_MUS_REGISTRY")
+                        _os_mus.environ["AIDE_ENABLE_MUS_REGISTRY"] = "1"
+                        _mus_base = getattr(roster_system, "_effective_config_snapshot", None)
+                        try:
+                            _mg, _, _mrs = _run_cp_sat_basic(
+                                db, current_user, nurses_for_engine, preferences, latest_config, req,
+                                shift_manage_data,
+                                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                time_limit_seconds=int(_os_mus.getenv("MUS_DIAG_TIME", "30") or 30),
+                                config_override=_mus_base,
+                            )
+                            _mus_cores = list(getattr(_mrs, "_cpsat_conflict_cores", []) or [])
+                            if _mus_cores:
+                                print(f"[MUS-Diag] 진단 재solve → conflict cores {len(_mus_cores)}건")
+                                _cpsat_cores = _mus_cores
+                                _conflict_cores = _conflict_cores + _mus_cores
+                        finally:
+                            if _prev_mus is None:
+                                _os_mus.environ.pop("AIDE_ENABLE_MUS_REGISTRY", None)
+                            else:
+                                _os_mus.environ["AIDE_ENABLE_MUS_REGISTRY"] = _prev_mus
+                except Exception as _mus_exc:
+                    print(f"[MUS-Diag] 진단 재solve 실패(무시): {_mus_exc}")
             # Pool 그래프 스냅샷 — TeamPool / GradePool / CommonPool capacity vs demand
             # 분석을 통한 root cause 표면화. shortage 가 발견되면 conflict_cores 에 합류.
             _pool_snapshot_dict: dict[str, Any] = {}
