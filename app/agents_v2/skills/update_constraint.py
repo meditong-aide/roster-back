@@ -17,6 +17,12 @@ _POLICY_LOCKED_FIELDS: dict[str, dict[str, str]] = {
         "label_ko": "야간 최대 횟수",
         "alternative": "개인별 한도가 필요하시면 `update_monthly_limit` 으로 간호사별 N 한도를 설정할 수 있습니다.",
     },
+    # 프리셉터 게이지 — 사용하지 않는(무의미) 설정. 에이전트가 손도 못 대게 차단.
+    # (update_roster_config 는 화이트리스트가 없어 컬럼이면 그대로 setattr → 여기서 원천 봉쇄)
+    "preceptor_gauge": {
+        "label_ko": "프리셉터 게이지",
+        "alternative": "프리셉터 게이지는 현재 사용하지 않는 설정이라 변경 대상이 아닙니다.",
+    },
 }
 
 
