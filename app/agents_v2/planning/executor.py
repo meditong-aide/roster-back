@@ -99,15 +99,21 @@ def execute_plan(
         # 1) reads — 세션 격리 병렬(2개+ & factory 있을 때), 아니면 순차.
         if session_factory is not None and len(reads) > 1:
             def _iso(task: PlanTask):
-                sess = session_factory()
+                # 스레드 내 예외를 밖으로 전파하면 ex.map 이 turn 을 깨뜨린다 →
+                # error 결과로 변환(해당 task 만 STOP). 세션은 예외/정상 모두 확실히 close.
+                sess = None
                 try:
+                    sess = session_factory()
                     data, _ = _run_task(sess, task, ctx, execute_fn, res.outputs, dry_run_mutations)
                     return task, data
+                except Exception as e:  # noqa: BLE001
+                    return task, {"error": f"병렬 read 오류: {e}"}
                 finally:
-                    try:
-                        sess.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    if sess is not None:
+                        try:
+                            sess.close()
+                        except Exception:  # noqa: BLE001
+                            pass
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 for task, data in list(ex.map(_iso, reads)):  # 메인에서 병합(순서 무관)
                     _record(task, data, None, False)

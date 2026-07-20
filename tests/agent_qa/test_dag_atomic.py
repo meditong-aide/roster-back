@@ -90,3 +90,18 @@ def test_generate_not_run_on_rollback(db, seed_data, monkeypatch):
     res = _agent().run(db, "응", ctx)
     assert calls["n"] == 0, "롤백인데 생성 실행됨"
     assert "롤백" in res.answer or "취소" in res.answer
+
+
+# ── #5 승인 staleness: 미리보기와 커밋 시점 다르면 재확인(커밋 안 함) ──
+def test_staleness_reconfirm_on_mismatch(db, seed_data):
+    ctx = _ctx()
+    # 오래된(불일치) 지문 → 현재 dry-run 과 다름 → 재확인
+    ctx.pending_approval = {"type": "plan", "user_message": "8월 데이7", "preview_fp": "STALE_FP",
+        "plan": {"tasks": [{"id": "t1", "skill": "manage_daily_shift", "kind": "mutate",
+                            "args": {"scope": "month", "d_count": 7}}]}}
+    res = _agent().run(db, "응", ctx)
+    assert res.awaiting_approval is True, "재확인 안 함"
+    assert ctx.pending_approval and ctx.pending_approval["type"] == "plan"  # 다시 대기
+    # 커밋 안 됨 → d=7 반영 없어야
+    rows = [r for r in db.query(DailyShift).filter_by(group_id="GRP001", year=2026, month=8).all() if int(r.day) > 0]
+    assert all(int(r.d_count) != 7 for r in rows), "재확인인데 커밋됨"

@@ -213,7 +213,7 @@ class SchedulingAgent:
         """의존 복합이면 plan→execute. read-only 는 즉시 답변, mutate 는 승인 대기.
         plan 없음/실패면 None → 호출부가 ReAct 로 진행."""
         from agents_v2.middleware import execute_skill
-        from agents_v2.planning.orchestrate import join_answer, try_plan_run
+        from agents_v2.planning.orchestrate import preview_fingerprint, try_plan_run
         from db.client2 import SessionLocal
 
         # 계획은 복합 의존 추론이라 **메인 LLM** 사용(nano 라우터는 과생성/오류).
@@ -231,7 +231,8 @@ class SchedulingAgent:
         last = run.exec.outputs.get(run.plan.tasks[-1].id) if run.plan.tasks else None
         if run.needs_approval:
             ctx.pending_approval = {"type": "plan", "plan": run.plan.to_dict(),
-                                    "user_message": user_message}
+                                    "user_message": user_message,
+                                    "preview_fp": preview_fingerprint(run.exec.previews)}
             previews = run.exec.previews
             preview = ({"type": "batch", "count": len(previews), "items": previews}
                        if len(previews) > 1 else previews[0])
@@ -261,13 +262,42 @@ class SchedulingAgent:
         """계획 승인 후 mutate 를 위상순서로 실제 commit(dry_run 해제) → 답변 합성."""
         from agents_v2.middleware import execute_skill
         from agents_v2.planning.executor import PlanExecResult, execute_plan
-        from agents_v2.planning.orchestrate import PlanRun, join_answer
+        from agents_v2.planning.orchestrate import PlanRun, preview_fingerprint
         from agents_v2.planning.plan import Plan, resolve_args
 
         pending = ctx.pending_approval or {}
         plan = Plan.from_dict(pending.get("plan") or {})
         orig = pending.get("user_message", user_message)
+        approved_fp = pending.get("preview_fp")
         ctx.pending_approval = None
+
+        # ── #5 staleness: 승인 시점 미리보기와 지금이 다르면 커밋 말고 재확인 ──
+        # dry-run 을 flush+rollback 로 재실행(부수효과 없이) → 지문 비교.
+        if approved_fp is not None:
+            _rc = db.commit
+            db.commit = db.flush  # type: ignore[method-assign]
+            try:
+                dry = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=True)
+            except Exception:  # noqa: BLE001
+                dry = None
+            finally:
+                db.commit = _rc  # type: ignore[method-assign]
+                try:
+                    db.rollback()  # dry-run 부수효과(get_or_init 등) 되돌림
+                except Exception:  # noqa: BLE001
+                    pass
+            if dry is not None and not dry.failed and preview_fingerprint(dry.previews) != approved_fp:
+                fresh_fp = preview_fingerprint(dry.previews)
+                ctx.pending_approval = {"type": "plan", "plan": plan.to_dict(),
+                                        "user_message": orig, "preview_fp": fresh_fp}
+                previews = dry.previews
+                preview = ({"type": "batch", "count": len(previews), "items": previews}
+                           if len(previews) > 1 else (previews[0] if previews else None))
+                return AgentResult(
+                    awaiting_approval=True, preview=preview,
+                    answer="승인 이후 상황이 바뀌어 미리보기가 달라졌습니다. 바뀐 내용으로 진행할까요?",
+                    trace=[Stage("plan_staleness", "block", {}, 0)],
+                    messages=messages, variable_memory=ctx.variable_memory)
 
         # ── 원자성: 플랜의 전 mutation 을 한 트랜잭션으로 ──
         # 스킬/서비스가 내부에서 부르는 db.commit() 을 flush() 로 리다이렉트해 트랜잭션을 유지.

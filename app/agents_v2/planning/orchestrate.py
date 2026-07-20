@@ -20,6 +20,17 @@ from agents_v2.planning.planner import build_plan
 logger = logging.getLogger(__name__)
 
 
+def preview_fingerprint(previews: list[dict]) -> str:
+    """미리보기 요약의 지문 — 승인 시점 대비 커밋 시점 상태 변화(staleness) 감지용."""
+    import hashlib
+
+    key = json.dumps(
+        [[p.get("task"), (p.get("data") or {}).get("summary")] for p in (previews or [])],
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return hashlib.md5(key.encode()).hexdigest()
+
+
 @dataclass
 class PlanRun:
     plan: Plan
