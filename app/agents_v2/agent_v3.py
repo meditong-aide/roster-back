@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -162,6 +163,8 @@ class SchedulingAgent:
             memory_extractor = MemoryExtractor(llm_client)
         self.memory_extractor = memory_extractor
         self.router_llm = router_llm
+        # DAG 계획(의존 복합) — opt-in. 기본 OFF → ReAct 무변경. env 로 켠다.
+        self._dag_planning = os.getenv("AIDE_DAG_PLANNING", "").lower() in ("1", "true", "on")
 
     def run(
         self,
@@ -191,6 +194,60 @@ class SchedulingAgent:
                 )
 
         return result
+
+    # ── DAG 계획 (opt-in) ────────────────────────────────────
+    def _try_dag_plan(self, db, user_message, ctx, messages):
+        """의존 복합이면 plan→execute. read-only 는 즉시 답변, mutate 는 승인 대기.
+        plan 없음/실패면 None → 호출부가 ReAct 로 진행."""
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.orchestrate import join_answer, try_plan_run
+
+        planner_llm = self.router_llm or self.llm
+        try:
+            run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[agent_v3] DAG plan 실패 → ReAct: %s", e)
+            return None
+        if run is None or run.failed:
+            return None
+        trace = [Stage("plan", "ok",
+                       {"tasks": [(t.id, t.skill, t.kind, t.deps) for t in run.plan.tasks]}, 0)]
+        last = run.exec.outputs.get(run.plan.tasks[-1].id) if run.plan.tasks else None
+        if run.needs_approval:
+            ctx.pending_approval = {"type": "plan", "plan": run.plan.to_dict(),
+                                    "user_message": user_message}
+            previews = run.exec.previews
+            preview = ({"type": "batch", "count": len(previews), "items": previews}
+                       if len(previews) > 1 else previews[0])
+            answer = join_answer(self.llm, user_message, run) + "\n\n진행할까요?"
+            return AgentResult(awaiting_approval=True, preview=preview, answer=answer,
+                               trace=trace, messages=messages,
+                               variable_memory=ctx.variable_memory, data=last)
+        return AgentResult(answer=join_answer(self.llm, user_message, run), trace=trace,
+                           messages=messages, variable_memory=ctx.variable_memory, data=last)
+
+    def _commit_plan(self, db, user_message, ctx, messages):
+        """계획 승인 후 mutate 를 위상순서로 실제 commit(dry_run 해제) → 답변 합성."""
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.executor import execute_plan
+        from agents_v2.planning.orchestrate import PlanRun, join_answer
+        from agents_v2.planning.plan import Plan
+
+        pending = ctx.pending_approval or {}
+        plan = Plan.from_dict(pending.get("plan") or {})
+        orig = pending.get("user_message", user_message)
+        ctx.pending_approval = None
+        exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False)
+        trace = [Stage("plan_commit", "error" if exec_res.failed else "ok",
+                       {"order": exec_res.order}, 0)]
+        if exec_res.failed:
+            err = (exec_res.failed.get("data") or {})
+            return AgentResult(answer=f"실행 중 문제가 발생했습니다: {err.get('error', '')}",
+                               trace=trace, messages=messages, variable_memory=ctx.variable_memory)
+        run = PlanRun(plan=plan, exec=exec_res)
+        last = exec_res.outputs.get(plan.tasks[-1].id) if plan.tasks else None
+        return AgentResult(answer=join_answer(self.llm, orig, run), trace=trace,
+                           messages=messages, variable_memory=ctx.variable_memory, data=last)
 
     def _run_impl(
         self,
@@ -233,6 +290,14 @@ class SchedulingAgent:
         # ── Handle pending approval ──
         if ctx.pending_approval:
             ptype = ctx.pending_approval.get("type")
+            if ptype == "plan":
+                # DAG 계획 승인 라운드트립: 확인이면 mutate 를 위상순서로 실제 commit.
+                if _is_confirmation(user_message):
+                    return self._commit_plan(db, user_message, ctx, messages)
+                if _is_denial(user_message):
+                    ctx.pending_approval = None
+                    return AgentResult(answer="계획을 취소했습니다. 다음에 무엇을 할까요?",
+                                       messages=messages, variable_memory=ctx.variable_memory)
             if ptype == "apply_hint":
                 # apply_hint 재시도 흐름: 확인/거부/모호 분기
                 if _is_denial(user_message):
@@ -262,6 +327,12 @@ class SchedulingAgent:
                     messages=messages,
                     variable_memory=ctx.variable_memory,
                 )
+
+        # ── DAG 계획 (opt-in, 의존 복합) — plan 없음/실패면 아래 ReAct 로 fallthrough ──
+        if self._dag_planning and not ctx.pending_approval:
+            planned = self._try_dag_plan(db, user_message, ctx, messages)
+            if planned is not None:
+                return planned
 
         tools = SKILL_TOOLS
         trace: list[Stage] = []

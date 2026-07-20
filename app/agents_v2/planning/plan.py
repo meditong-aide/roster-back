@@ -29,6 +29,17 @@ class Plan:
     def by_id(self) -> dict[str, PlanTask]:
         return {t.id: t for t in self.tasks}
 
+    def to_dict(self) -> dict:
+        return {"tasks": [{"id": t.id, "skill": t.skill, "args": t.args,
+                           "deps": t.deps, "kind": t.kind} for t in self.tasks]}
+
+    @staticmethod
+    def from_dict(d: dict) -> "Plan":
+        return Plan(tasks=[PlanTask(
+            id=t["id"], skill=t["skill"], args=t.get("args") or {},
+            deps=t.get("deps") or [], kind=t.get("kind", "read"),
+        ) for t in (d or {}).get("tasks", [])])
+
     def validate(self) -> None:
         """중복 id·미존재 dep·순환을 검출(있으면 ValueError)."""
         ids = [t.id for t in self.tasks]
