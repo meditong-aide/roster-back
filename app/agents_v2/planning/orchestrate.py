@@ -38,14 +38,20 @@ def try_plan_run(
     db: Any, user_message: str, ctx: Any,
     planner_llm: Any, skill_tools: list[dict],
     execute_fn: Callable[[Any, str, dict, Any], Any],
+    *,
+    session_factory: Callable[[], Any] | None = None,
 ) -> PlanRun | None:
-    """의존 복합이면 plan 생성·실행(mutate=dry-run). 아니면 None(ReAct fallback)."""
+    """의존 복합이면 plan 생성·실행(mutate=dry-run). 아니면 None(ReAct fallback).
+
+    session_factory: 주면 레벨 내 read 를 세션 격리 병렬 실행(mutate 는 순차).
+    """
     plan = build_plan(planner_llm, user_message, skill_tools)
     if plan is None:
         return None
     logger.info("[plan] %d tasks: %s", len(plan.tasks),
                 [(t.id, t.skill, t.kind, t.deps) for t in plan.tasks])
-    return PlanRun(plan=plan, exec=execute_plan(db, plan, ctx, execute_fn))
+    return PlanRun(plan=plan, exec=execute_plan(
+        db, plan, ctx, execute_fn, session_factory=session_factory))
 
 
 def join_answer(llm: Any, user_message: str, run: PlanRun) -> str:

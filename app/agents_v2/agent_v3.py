@@ -201,10 +201,12 @@ class SchedulingAgent:
         plan 없음/실패면 None → 호출부가 ReAct 로 진행."""
         from agents_v2.middleware import execute_skill
         from agents_v2.planning.orchestrate import join_answer, try_plan_run
+        from db.client2 import SessionLocal
 
         planner_llm = self.router_llm or self.llm
         try:
-            run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill)
+            run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill,
+                               session_factory=SessionLocal)  # read 세션 격리 병렬
         except Exception as e:  # noqa: BLE001
             logger.warning("[agent_v3] DAG plan 실패 → ReAct: %s", e)
             return None
@@ -232,12 +234,14 @@ class SchedulingAgent:
         from agents_v2.planning.executor import execute_plan
         from agents_v2.planning.orchestrate import PlanRun, join_answer
         from agents_v2.planning.plan import Plan
+        from db.client2 import SessionLocal
 
         pending = ctx.pending_approval or {}
         plan = Plan.from_dict(pending.get("plan") or {})
         orig = pending.get("user_message", user_message)
         ctx.pending_approval = None
-        exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False)
+        exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False,
+                                session_factory=SessionLocal)  # read 병렬, mutate 순차
         trace = [Stage("plan_commit", "error" if exec_res.failed else "ok",
                        {"order": exec_res.order}, 0)]
         if exec_res.failed:

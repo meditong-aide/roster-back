@@ -49,3 +49,60 @@ def test_failure_short_circuits():
     assert res.failed is not None and res.failed["task"] == "t1"
     assert res.order == ["t1"]  # t2 스킵
     assert len(fn.calls) == 1
+
+
+# ── read 병렬(세션 격리) + mutate 순차 + plain-dict 병합 ──
+class _FakeSession:
+    def __init__(self): self.closed = False
+    def close(self): self.closed = True
+
+
+def test_reads_parallel_isolated_and_merge():
+    passed_db = object()
+    seen = {}
+    def fn(db, skill, args, ctx):
+        seen[skill] = db
+        if skill == "recommend_candidates":
+            return {"candidates": [{"name": "이수정"}]}
+        if skill == "query_schedule":
+            return {"count": 6}
+        if skill == "bulk_mutation":
+            return {"preview": True, "got_nurse": args.get("nurse"), "got_count": args.get("cnt")}
+        return {"ok": True}
+    sessions = []
+    def factory():
+        s = _FakeSession(); sessions.append(s); return s
+
+    # t1,t2 병렬 read → t3 mutate 가 둘 다 참조
+    plan = Plan([
+        PlanTask("t1", "recommend_candidates", kind="read"),
+        PlanTask("t2", "query_schedule", kind="read"),
+        PlanTask("t3", "bulk_mutation", kind="mutate", deps=["t1", "t2"],
+                 args={"nurse": "$t1.candidates[0].name", "cnt": "$t2.count"}),
+    ])
+    res = execute_plan(passed_db, plan, None, fn, session_factory=factory)
+
+    # 병렬 read 는 fresh·서로 다른 세션(공유 db 아님)
+    assert seen["recommend_candidates"] is not passed_db
+    assert seen["query_schedule"] is not passed_db
+    assert seen["recommend_candidates"] is not seen["query_schedule"]
+    # mutate 는 공유 db 순차
+    assert seen["bulk_mutation"] is passed_db
+    # plain-dict 병합 + 참조 치환(양쪽 read 출력이 t3 로 합쳐짐)
+    assert res.outputs["t3"]["got_nurse"] == "이수정"
+    assert res.outputs["t3"]["got_count"] == 6
+    # 병렬 세션 전부 닫힘(누수 없음)
+    assert sessions and all(s.closed for s in sessions)
+    assert res.failed is None and len(res.previews) == 1
+
+
+def test_no_factory_stays_sequential():
+    # session_factory 없으면 전부 공유 db(하위호환)
+    passed_db = object()
+    seen = []
+    def fn(db, skill, args, ctx):
+        seen.append(db); return {"ok": True}
+    plan = Plan([PlanTask("t1", "query_schedule", kind="read"),
+                 PlanTask("t2", "analyze_report", kind="read")])
+    execute_plan(passed_db, plan, None, fn)  # factory 없음
+    assert all(d is passed_db for d in seen)
