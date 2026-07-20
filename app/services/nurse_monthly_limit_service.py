@@ -222,12 +222,19 @@ def _compute_override_meta_and_warnings(
     return meta, warnings
 
 
-def _row_to_item(r: NurseMonthlyLimit) -> NurseMonthlyLimitItem:
+def _row_to_item(
+    r: NurseMonthlyLimit,
+    *,
+    as_of_year: Optional[int] = None,
+    as_of_month: Optional[int] = None,
+) -> NurseMonthlyLimitItem:
+    # as_of_year/month 지정 시 '표시 월'을 그 값으로 스탬프한다(값은 이월 원본 r 에서 온다).
+    # 미지정이면 원본 행의 월 그대로(예: 특정 nurse 의 월별 이력 조회).
     return NurseMonthlyLimitItem(
         nurse_id=str(r.nurse_id),
         group_id=str(r.group_id),
-        year=int(r.year),
-        month=int(r.month),
+        year=int(as_of_year if as_of_year is not None else r.year),
+        month=int(as_of_month if as_of_month is not None else r.month),
         d_min=r.d_min,
         d_max=r.d_max,
         d_exact=r.d_exact,
@@ -270,16 +277,27 @@ def _list_by_year_month(
     group_id: Optional[str] = None,
 ) -> Tuple[List[NurseMonthlyLimitItem], Optional[NurseMonthlyLimitMeta], List[NurseMonthlyLimitWarning]]:
     gid = group_id or resolve_home_group_id(db, current_user)
+    # as-of 이월: 대상 (year, month) 이하 '가장 최근' 행을 (nurse, group)별 1건으로 표시한다.
+    # 월별 재설정을 안 해도 마지막 설정이 유지돼 보인다 — 생성 로더
+    # (fetch_effective_monthly_limits_by_nurse)와 동일 의미. 표시 월은 대상월로 스탬프.
+    target_ym = year * 12 + month
     q = db.query(NurseMonthlyLimit).filter(
-        NurseMonthlyLimit.year == year,
-        NurseMonthlyLimit.month == month,
+        (NurseMonthlyLimit.year * 12 + NurseMonthlyLimit.month) <= target_ym,
     )
     if current_user.is_master_admin:
         if group_id:
             q = q.filter(NurseMonthlyLimit.group_id == group_id)
     else:
         q = q.filter(NurseMonthlyLimit.group_id == gid)
-    items = [_row_to_item(r) for r in q.all()]
+    q = q.order_by(NurseMonthlyLimit.year.desc(), NurseMonthlyLimit.month.desc())
+    _seen: set = set()
+    items: List[NurseMonthlyLimitItem] = []
+    for r in q.all():
+        _key = (str(r.nurse_id), str(r.group_id))
+        if _key in _seen:
+            continue  # 이미 더 최근(대상월에 가까운) 행을 담음
+        _seen.add(_key)
+        items.append(_row_to_item(r, as_of_year=year, as_of_month=month))
     meta: Optional[NurseMonthlyLimitMeta] = None
     warnings: List[NurseMonthlyLimitWarning] = []
     if gid and (not current_user.is_master_admin or group_id is not None):
@@ -731,19 +749,27 @@ def fetch_effective_monthly_limits_by_nurse(
 ) -> Dict[str, Dict[str, Optional[int]]]:
     if not nurse_ids:
         return {}
+    # as-of 이월: 대상 (year, month) 이하의 '가장 최근' 한도 행을 nurse별로 적용한다.
+    # 월별 재설정을 안 해도 마지막 설정이 유지된다(팀/등급 period 캐시와 동일한 as-of 의미).
+    # 예: 7월 n_max=4 설정 후 8월 미설정 → 8월 생성 시 7월 4 를 적용(과거 exact-month 는
+    # 8월 행이 없으면 무제한이라 상한이 새어나갔다).
+    target_ym = year * 12 + month
     rows = (
         db.query(NurseMonthlyLimit)
         .filter(
-            NurseMonthlyLimit.year == year,
-            NurseMonthlyLimit.month == month,
             NurseMonthlyLimit.group_id == group_id,
             NurseMonthlyLimit.nurse_id.in_(nurse_ids),
+            (NurseMonthlyLimit.year * 12 + NurseMonthlyLimit.month) <= target_ym,
         )
+        .order_by(NurseMonthlyLimit.year.desc(), NurseMonthlyLimit.month.desc())
         .all()
     )
     out: Dict[str, Dict[str, Optional[int]]] = {}
     for r in rows:
-        out[str(r.nurse_id)] = {
+        nid = str(r.nurse_id)
+        if nid in out:
+            continue  # 이미 더 최근(대상월에 가까운) 행을 담음 → 과거 행은 무시
+        out[nid] = {
             "d_min": r.d_min, "d_max": r.d_max, "d_exact": r.d_exact,
             "e_min": r.e_min, "e_max": r.e_max, "e_exact": r.e_exact,
             "n_min": r.n_min, "n_max": r.n_max, "n_exact": r.n_exact,
