@@ -54,12 +54,18 @@ def try_plan_run(
         db, plan, ctx, execute_fn, session_factory=session_factory))
 
 
-def join_answer(llm: Any, user_message: str, run: PlanRun) -> str:
-    """전 task 출력으로 최종 답변 합성 (LLMCompiler [4] Joiner). 데이터에만 근거."""
+def join_answer(llm: Any, user_message: str, run: PlanRun, correction: str | None = None) -> str:
+    """전 task 출력으로 최종 답변 합성 (LLMCompiler [4] Joiner). 데이터에만 근거.
+
+    correction: L2 검증이 직전 답변의 불일치를 지적하면, 그 사유를 넣어 데이터에 더 엄격히 재생성.
+    """
     payload = {tid: out for tid, out in run.exec.outputs.items()}
     blob = json.dumps(payload, ensure_ascii=False, default=str)[:4000]
     sys = ("너는 계획 실행 결과를 사용자에게 자연어로 답하는 역할이다. "
            "아래 task 출력 데이터에만 근거해 간결·정확히 답하라. 데이터에 없는 것을 지어내지 마라.")
+    if correction:
+        sys += (f"\n[검증] 직전 답변이 데이터와 어긋났다: {correction}. "
+                "데이터에 없는 수치·이름·상태·완료여부를 절대 말하지 마라.")
     user = f"[사용자 요청]\n{user_message}\n\n[task 실행 결과]\n{blob}"
     try:
         resp = llm.chat([{"role": "system", "content": sys},

@@ -196,6 +196,19 @@ class SchedulingAgent:
         return result
 
     # ── DAG 계획 (opt-in) ────────────────────────────────────
+    def _plan_answer(self, user_message, run) -> str:
+        """플랜 답변 합성 + L2 정합성 검증(답변↔task 출력). 어긋나면 데이터 근거로 1회 재생성."""
+        from agents_v2.planning.orchestrate import join_answer
+        from agents_v2.verify import judge_answer_consistency, l2_data_fits
+
+        answer = join_answer(self.llm, user_message, run)
+        data = run.exec.outputs
+        if answer.strip() and data and l2_data_fits(data):
+            cons = judge_answer_consistency(self.router_llm or self.llm, user_message, data, answer)
+            if not cons.consistent:
+                answer = join_answer(self.llm, user_message, run, correction=cons.reason) or answer
+        return answer
+
     def _try_dag_plan(self, db, user_message, ctx, messages):
         """의존 복합이면 plan→execute. read-only 는 즉시 답변, mutate 는 승인 대기.
         plan 없음/실패면 None → 호출부가 ReAct 로 진행."""
@@ -222,7 +235,7 @@ class SchedulingAgent:
             previews = run.exec.previews
             preview = ({"type": "batch", "count": len(previews), "items": previews}
                        if len(previews) > 1 else previews[0])
-            answer = join_answer(self.llm, user_message, run)
+            answer = self._plan_answer(user_message, run)
             if run.exec.deferred:  # 승인 시 커밋 후 생성 등 async 시작 예정
                 answer += " (승인하면 설정 반영 후 근무표 생성이 시작됩니다.)"
             answer += "\n\n진행할까요?"
@@ -238,7 +251,7 @@ class SchedulingAgent:
                 async_done.append(t.skill)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[agent_v3] deferred %s 실행 실패: %s", t.skill, e)
-        answer = join_answer(self.llm, user_message, run)
+        answer = self._plan_answer(user_message, run)
         if async_done:
             answer += "\n\n(**근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
         return AgentResult(answer=answer, trace=trace, messages=messages,
@@ -302,7 +315,7 @@ class SchedulingAgent:
 
         run = PlanRun(plan=plan, exec=exec_res)
         last = exec_res.outputs.get(plan.tasks[-1].id) if plan.tasks else None
-        answer = join_answer(self.llm, orig, run)
+        answer = self._plan_answer(orig, run)
         if async_done:
             answer += "\n\n(설정을 반영하고 **근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
         return AgentResult(
