@@ -25,9 +25,42 @@ infeasibility 를 감지한다. 결과는 `{reason_code, severity, evidence}` �
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple, Any
 
 from services.semantics import attach_reason_code_ontology
+
+
+@lru_cache(maxsize=None)
+def _rec_go(remaining: int, run: int, off_rem: int, block: int) -> int:
+    """회복 규칙(연속 N `block` 개 후 2 OFF 강제) 하에서 남은 일수로 달성 가능한 최대 N.
+
+    상태: (남은 일, 현재 N 연속수, 강제 OFF 잔여). day 대신 remaining 을 써서 전역 캐시.
+    - OFF: run 리셋, off_rem 1 감소
+    - N(강제 OFF 없을 때만): run+1==block 이면 2 OFF 강제 + run 리셋, 아니면 run+1
+    월말(remaining=0)에 block-run 을 두면 회복 불필요 → 경계 자연 처리.
+    """
+    if remaining <= 0:
+        return 0
+    best = _rec_go(remaining - 1, 0, max(0, off_rem - 1), block)  # OFF
+    if off_rem == 0 and run + 1 <= block:
+        if run + 1 == block:
+            best = max(best, 1 + _rec_go(remaining - 1, 0, 2, block))
+        else:
+            best = max(best, 1 + _rec_go(remaining - 1, run + 1, 0, block))
+    return best
+
+
+def max_nights_under_recovery(span: int, block: int) -> int:
+    """span 일 내 회복 규칙(`block`연속 N→2OFF) 하 달성 가능한 **정확한** 최대 N.
+
+    닫힌형 근사(예 2·⌈avail/4⌉, 3·⌈avail/5⌉)는 3N→2OFF 처럼 'NN O' 로 트리거를 피해
+    2/3 비율을 낼 수 있는 경우를 과소추정 → precheck blocking 에 쓰면 false positive.
+    DP 로 정확값을 구해 valid upper bound(=실제 최대)와 tightness 를 동시에 보장한다.
+    """
+    if span <= 0:
+        return 0
+    return _rec_go(int(span), 0, 0, int(block))
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +819,23 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
     except (TypeError, ValueError):
         cfg_max_night = None
 
+    # Fix 3 (recovery): 2N→2OFF / 3N→2OFF 회복 규칙이 hard면 야간 후 강제 OFF 때문에
+    # 한 사람이 달성 가능한 N 이 줄어든다. 이를 무시하면 N 공급을 과대계산해 recovery
+    # 유발 infeasible 을 solve 후에야 알게 된다. max_nights_under_recovery(DP)로 정확한
+    # 실효 상한을 구해 min 결합(상한만 조이므로 false positive 없음).
+    # 2N→2OFF(block=2)가 3N→2OFF(block=3)보다 빡빡 → 둘 다 켜지면 2N 이 지배.
+    _rec_block: Optional[int] = None
+    if bool(inp.roster_config.get("two_offs_after_two_nig")):
+        _rec_block = 2
+    elif bool(inp.roster_config.get("two_offs_after_three_nig")):
+        _rec_block = 3
+
+    def _recovery_night_cap(n: PrecheckNurse) -> Optional[int]:
+        if _rec_block is None:
+            return None
+        span = max(0, n.leave_day - n.join_day + 1)
+        return max_nights_under_recovery(span, _rec_block)
+
     def _night_cap_for_nurse(n: PrecheckNurse) -> int:
         cap = _working_capacity(n, inp.roster_config)
         if cfg_max_night is not None and cfg_max_night >= 0:
@@ -794,6 +844,9 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
         # 과대계산해 shortage 를 놓친다. 상한을 조이는 방향이라 false positive 없음.
         if n.night_cap is not None and n.night_cap >= 0:
             cap = min(cap, n.night_cap)
+        _rc = _recovery_night_cap(n)
+        if _rc is not None:
+            cap = min(cap, _rc)
         return cap
 
     cap = sum(_night_cap_for_nurse(n) for n in n_capable)
