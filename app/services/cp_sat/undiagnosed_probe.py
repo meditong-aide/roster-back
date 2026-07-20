@@ -143,17 +143,40 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
         if not auto:
             continue  # 전부 수동(data_correction_required)이면 자동 적용 불가 → 옵션 제외
         _bid = str(b.get("bundle_id") or "?")
+        # magnitude sizing: enricher 가 단일축 precheck 숫자로 실효 목표값을 계산해
+        # t["suggested_value"] 에 담았으면 changes 에 노출 + apply(직접적용 델타)로 승격.
+        # 값이 없으면(조합/미지원) 기존처럼 방향만 제시 + treatment_ids 로 적용.
+        _apply: dict[str, Any] = {}
+        _changes = []
+        for t in auto:
+            ck = t.get("config_key")
+            sv = t.get("suggested_value")
+            ch = {"config_key": ck, "label_ko": _lbl(t),
+                  "direction": t.get("direction_label_ko") or t.get("direction"),
+                  "rationale_ko": t.get("rationale_ko")}
+            if sv is not None:
+                ch["suggested_value"] = sv
+                ch["sizing_ko"] = t.get("sizing_ko")
+                if ck:
+                    _apply[ck] = sv
+            elif t.get("sizing_insufficient"):
+                ch["sizing_ko"] = t.get("sizing_ko")
+                ch["sizing_insufficient"] = True
+            elif t.get("sizing_ko"):
+                # message-only sizing (nested/수요 노브 — 자동 apply 없이 정확한 숫자만)
+                ch["sizing_ko"] = t.get("sizing_ko")
+            _changes.append(ch)
         opts.append({
             "option_id": _bid if _bid.startswith("bundle") else "bundle:" + _bid,
-            "kind": "treatment_bundle", "source": "ontology", "verified": False,
+            "kind": "treatment_bundle", "source": "ontology",
+            # sized 목표값이 있으면 apply 로 바로 적용 가능(수치 확정) → 반쯤 검증된 셈.
+            "verified": False,
             "title_ko": " + ".join(_lbl(t) for t in auto),
-            "changes": [{"config_key": t.get("config_key"), "label_ko": _lbl(t),
-                         "direction": t.get("direction_label_ko") or t.get("direction"),
-                         "rationale_ko": t.get("rationale_ko")} for t in auto],
+            "changes": _changes,
             "trade_off_ko": " / ".join([t.get("trade_off_ko") for t in auto if t.get("trade_off_ko")]),
             "treatment_ids": [t.get("treatment_id") for t in auto],
             "manual_required": [t.get("treatment_id") for t in manual],
-            "apply": {},
+            "apply": _apply,
         })
     return opts
 
