@@ -915,7 +915,9 @@ class CPSATBasicEngine:
         grade_config: dict | None = None,
         time_limit_seconds: int = 60,
         randomize: bool = True,           # ← 추가
-        seed: int | None = None           # ← 추가 (재현 원하면 지정)
+        seed: int | None = None,          # ← 추가 (재현 원하면 지정)
+        probe_only: bool = False,         # ← [Probe] True면 clean CP-SAT 1회 solve 후 status/objective/runtime dict 반환
+        probe_fallback: bool = False      # ← [Probe] probe_only와 함께 True면 프로덕션 fallback_lex 경로로 solve해 MUS conflict_cores 반환
     ) -> Dict[str, List[str]]:
         """
         DB 데이터를 기반으로 CP-SAT를 사용해 근무표를 생성
@@ -1486,6 +1488,44 @@ class CPSATBasicEngine:
             print(f"{self.logger_prefix} 페어링 선호도 적용 중...")
             # 기본값으로 빈 페어링 선호도 설정
             roster_system.apply_pair_preferences(pair_preferences)
+        # [Probe] DS feasibility-probe 모드: fallback/후처리 없이 clean CP-SAT full-model 1회 solve.
+        # SKIP_PRIMARY와 무관하게 primary를 강제한다. _quick_initial_solve가 status/objective/runtime을
+        # roster_system에 stash → 여기서 읽어 dict로 반환. rs/grouped 구성은 위에서 전부 재사용.
+        if probe_only:
+            _probe_seed = seed if seed is not None else 42
+            if probe_fallback:
+                # 프로덕션 fallback_lex 경로로 solve → add_hard 로 감싼 하드 제약의 MUS
+                # conflict_cores 를 roster_system 에 stash. 진단 배선 검증/온톨로지 소비용.
+                try:
+                    self._optimize_fallback_lex_hard_first(
+                        roster_system, time_limit_seconds=max(1, int(time_limit_seconds)),
+                        grouped=grouped, shift_type_map=shift_id_to_type)
+                except Exception as _fbe:
+                    print(f"[Probe-fallback] fallback solve 실패: {_fbe}")
+                _cores = list(getattr(roster_system, "_cpsat_conflict_cores", []) or [])
+                return {"__probe__": {
+                    "status": "FALLBACK",  # fallback 은 soft coverage 라 항상 표 생성 — status 는 clean 아님
+                    "objective": None, "best_bound": None, "wall_time_s": None,
+                    "conflict_cores": _cores,
+                    "nurse_count": len(getattr(roster_system, "nurses", []) or []),
+                    "num_days": int(getattr(roster_system, "num_days", 0) or 0),
+                }}
+            roster_system.is_quick_phase = True
+            try:
+                self._quick_initial_solve(
+                    roster_system, max(1, int(time_limit_seconds)), grouped, _probe_seed)
+            finally:
+                roster_system.is_quick_phase = False
+            return {"__probe__": {
+                "status": getattr(roster_system, "_probe_status", "UNKNOWN"),
+                "objective": getattr(roster_system, "_probe_objective", None),
+                "best_bound": getattr(roster_system, "_probe_best_bound", None),
+                "wall_time_s": getattr(roster_system, "_probe_wall_time_s", None),
+                "conflict_cores": list(getattr(roster_system, "_cpsat_conflict_cores", []) or []),
+                "nurse_count": len(getattr(roster_system, "nurses", []) or []),
+                "num_days": int(getattr(roster_system, "num_days", 0) or 0),
+            }}
+
         # 9. CP-SAT으로 최적화 (새로운 제약사항 포함)
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
@@ -2226,6 +2266,16 @@ class CPSATBasicEngine:
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
             print('stat', stat)
+            # [ProbeInstrument] clean CP-SAT full-model 결과를 rs에 stash (additive, 솔버 무영향).
+            # DS feasibility-probe (probe_feasibility)가 이 값을 읽어 status/objective/runtime을 반환한다.
+            try:
+                _feasible_stat = stat in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                rs._probe_status = solver.StatusName(stat)
+                rs._probe_wall_time_s = float(solver.WallTime())
+                rs._probe_objective = float(solver.ObjectiveValue()) if _feasible_stat else None
+                rs._probe_best_bound = float(solver.BestObjectiveBound()) if _feasible_stat else None
+            except Exception as _probe_exc:
+                print(f"[CP-SAT-Basic] probe stash 실패(무시): {_probe_exc}")
             if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE):
                 # CP-SAT INFEASIBLE → assumption registry MUS 추출해서 roster_system에 stash
                 if stat == cp_model.INFEASIBLE:
@@ -5305,4 +5355,52 @@ def generate_roster_cp_sat(
         time_limit_seconds=time_limit_seconds,
         randomize=randomize,
         seed=seed,
-    ) 
+    )
+
+
+def probe_feasibility(
+    nurses_data,
+    prefs_data,
+    config_data,
+    year,
+    month,
+    shift_manage_data,
+    time_limit_seconds: int = 30,
+    seed: int | None = 42,
+    grade_strategy: str = "BASE",
+    grade_config: dict | None = None,
+    fallback: bool = False,
+) -> dict:
+    """DS feasibility-probe: fallback/후처리 없이 clean CP-SAT full-model 1회 solve.
+
+    generate_roster_cp_sat 와 동일한 입력(plain dict)을 받되, probe_only=True 로
+    호출하여 solver 상태를 그대로 반환한다. Controlled-perturbation 실험의 라벨 소스.
+
+    Returns dict:
+        status:       "OPTIMAL" | "FEASIBLE" | "INFEASIBLE" | "UNKNOWN" | "MODEL_INVALID"
+        objective:    float | None   (feasible 일 때 목적값; soft coverage shortage 포함)
+        best_bound:   float | None
+        wall_time_s:  float | None   (CP-SAT WallTime)
+        conflict_cores: list         (INFEASIBLE 시 MUS assumption cores, 있으면)
+        nurse_count / num_days: 구성된 인스턴스 규모
+    """
+    result = cp_sat_engine.generate_roster(
+        nurses_data,
+        prefs_data,
+        config_data,
+        year,
+        month,
+        shift_manage_data,
+        grade_strategy=grade_strategy,
+        grade_config=grade_config,
+        time_limit_seconds=time_limit_seconds,
+        randomize=(seed is None),
+        seed=seed,
+        probe_only=True,
+        probe_fallback=fallback,
+    )
+    if isinstance(result, dict) and "__probe__" in result:
+        return result["__probe__"]
+    # 방어: probe_only 경로가 우회된 경우
+    return {"status": "UNKNOWN", "objective": None, "best_bound": None,
+            "wall_time_s": None, "conflict_cores": [], "nurse_count": None, "num_days": None}

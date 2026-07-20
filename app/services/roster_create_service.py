@@ -3798,6 +3798,22 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
         ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
         base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
         N = len(roster_system.nurses)
+
+        # 시프트별 '정책상 가능 인원'(allowed_shifts 기준) 캐시 — 부족 원인 분류에 사용.
+        # allowed_shifts 가 빈/None 이면 전 시프트 가용. 특정 코드로 제한되면 그 코드만.
+        def _eligible_for(s_code: str) -> int:
+            cnt = 0
+            for nu in roster_system.nurses:
+                raw = getattr(nu, "allowed_shifts", None)
+                if isinstance(raw, list) and raw:
+                    allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                    allowed = {a for a in allowed if a in shift_types}
+                    if allowed and s_code not in allowed:
+                        continue
+                cnt += 1
+            return cnt
+        _elig_cache: dict[str, int] = {}
+
         gaps: list[dict] = []
         for d in range(roster_system.num_days):
             need_map = (
@@ -3815,12 +3831,20 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
                 s_idx = shift_types.index(s_code)
                 assigned = int(sum(int(roster_system.roster[n, d, s_idx]) for n in range(N)))
                 if assigned < req:
+                    if s_code not in _elig_cache:
+                        _elig_cache[s_code] = _eligible_for(s_code)
+                    eligible = _elig_cache[s_code]
+                    # 원인 분류: 그 시프트 정책상 가능 인원이 요구보다 적으면 eligibility 부족
+                    # (예: 야간 불가 인원 과다 → N 가능 인원 < 요구). 아니면 총 capacity 부족.
+                    reason = "eligibility_shortage" if eligible < req else "capacity_shortage"
                     gaps.append({
                         "day": d + 1,
                         "shift": s_code,
                         "need": req,
                         "assigned": assigned,
                         "short": req - assigned,
+                        "eligible": eligible,
+                        "reason": reason,
                     })
         return gaps
     except Exception as exc:
@@ -5377,6 +5401,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
 
     # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
     precheck_result: dict | None = None
+    presolve_diag: dict | None = None   # 솔버 전 부족 조기진단(advisory) — 응답에 부착
     try:
         from services.precheck import (
             run_runtime_precheck,
@@ -5450,6 +5475,23 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             month=req.month,
             stop_on_config_error=False,
         )
+        # 솔버 전 부족 조기진단(advisory, non-blocking) — max-flow(per-day+월별) 기반.
+        # 개인 속성(allowed_shifts/max_nig/weekend_off)은 불가침 → 복구 선택지는 관리자 노브만.
+        # 실측 부족 수치는 솔버 후 coverage_gaps 가 담당(여기 값은 증명된 하한).
+        try:
+            from services.ontology_graph.presolve_diagnosis import presolve_shortage_diagnosis
+            presolve_diag = presolve_shortage_diagnosis(
+                _nurses_dict_for_precheck, precheck_config, req.year, req.month)
+            if presolve_diag.get("shortages"):
+                print(
+                    f"[Presolve] 부족 예상 {len(presolve_diag['shortages'])}건 "
+                    f"({presolve_diag['elapsed_ms']}ms): "
+                    + "; ".join(
+                        f"{s['shift']} 월부족≥{s['monthly_shortage_lower_bound']}({s['reason']})"
+                        for s in presolve_diag['shortages']))
+        except Exception as _psd_exc:
+            print(f"[Presolve] 진단 실패(무시): {_psd_exc}")
+            presolve_diag = None
         if has_blocking_issues(precheck_result):
             payload = build_blocking_payload(precheck_result)
             inf = payload.get("infeasibility", {})
@@ -5886,6 +5928,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     roster_data["weekly_off_conflicts"] = weekly_off_conflicts
     roster_data["weekly_off_warnings"] = weekly_off_warnings
     roster_data["constraint_impact"] = _build_constraint_impact_payload(roster_system, req)
+    # 솔버 전 부족 조기진단(있으면) 부착 — 실측 부족은 coverage_gaps(constraint_impact 내부),
+    # 여기는 '왜/얼마나(하한) + 관리자 복구 선택지' advisory.
+    if presolve_diag:
+        roster_data["presolve_diagnosis"] = presolve_diag
     # ── infeasibility 페이로드 (precheck warning + applied_relaxations + violation summary) ──
     try:
         from services.precheck import build_success_payload

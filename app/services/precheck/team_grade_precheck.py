@@ -51,6 +51,8 @@ class PrecheckNurse:
     # 동기화 기간 (0-based day index). None → [join_day, leave_day] 전체로 간주.
     sync_window_start: Optional[int] = None
     sync_window_end: Optional[int] = None
+    # per-nurse 야간 상한 (n_exact 우선, 없으면 n_max). None → 전역 상한만 적용.
+    night_cap: Optional[int] = None
 
 
 @dataclass
@@ -112,7 +114,19 @@ def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
 
 def _working_capacity(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     span = max(0, nurse.leave_day - nurse.join_day + 1)
-    return max(0, span - _required_off_days(nurse, cfg))
+    cap = max(0, span - _required_off_days(nurse, cfg))
+    # 연속근무 상한(max_consecutive_work=C)은 실제 근무가능일을 추가로 조인다:
+    # C일 근무 후 최소 1일 휴식 → span 내 최대 근무일 = span - span//(C+1) (상한).
+    # cap 은 항상 상한이어야 하므로(하한이면 false positive) min 으로 결합한다.
+    mcw = cfg.get("max_consecutive_work")
+    if mcw is not None:
+        try:
+            c = int(mcw)
+            if c >= 1:
+                cap = min(cap, max(0, span - span // (c + 1)))
+        except (TypeError, ValueError):
+            pass
+    return cap
 
 
 def _issue(code: str, evidence: Dict[str, Any], severity: str = "hard") -> Dict[str, Any]:
@@ -773,10 +787,14 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
         cfg_max_night = None
 
     def _night_cap_for_nurse(n: PrecheckNurse) -> int:
-        wc = _working_capacity(n, inp.roster_config)
+        cap = _working_capacity(n, inp.roster_config)
         if cfg_max_night is not None and cfg_max_night >= 0:
-            return min(wc, cfg_max_night)
-        return wc
+            cap = min(cap, cfg_max_night)
+        # per-nurse 야간 상한(n_exact/n_max)도 동시에 적용 — 전역 상한만 보면 야간 공급을
+        # 과대계산해 shortage 를 놓친다. 상한을 조이는 방향이라 false positive 없음.
+        if n.night_cap is not None and n.night_cap >= 0:
+            cap = min(cap, n.night_cap)
+        return cap
 
     cap = sum(_night_cap_for_nurse(n) for n in n_capable)
     monthly_need = sum(_need(inp.roster_config, "N", d) for d in range(inp.num_days))
@@ -893,6 +911,18 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
     """
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     by_id: Dict[str, PrecheckNurse] = {n.nurse_id: n for n in inp.nurses}
+    # 상호배제(배반) 맵 — preceptor-preceptee 페어가 동시에 mutex 로 걸리면 '함께근무 + 배반'
+    # 직접 모순(데이터-리딩성 상태 오염 포함). shift/team 이 호환이어도 이건 표현돼야 한다.
+    _mutex_map = inp.roster_config.get("mutual_exclusion_by_nurse_id") or {}
+
+    def _pair_has_mutex(a_id: str, b_id: str) -> bool:
+        for k in (a_id, b_id):
+            info = _mutex_map.get(str(k))
+            if isinstance(info, dict) and info.get("days") \
+                    and str(info.get("partner_id")) in (str(a_id), str(b_id)):
+                return True
+        return False
+
     issues: List[Dict] = []
     for n in inp.nurses:
         if not n.preceptor_id:
@@ -924,6 +954,9 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
             reasons.append("team_mismatch")
         if effective_days <= 0:
             reasons.append("window_empty")
+        # 함께근무(preceptee) 인데 동시에 상호배제(배반) → 직접 모순. shift/team 호환 여부와 무관.
+        if _pair_has_mutex(ptor.nurse_id, n.nurse_id):
+            reasons.append("mutual_exclusion_conflict")
 
         if not reasons:
             continue
