@@ -460,10 +460,18 @@ def check_team_min_exceeds_global_need(inp: PrecheckInput) -> List[Dict]:
         for d in range(inp.num_days):
             nd = _need(inp.roster_config, s, d)
             if tmin_sum > nd:
+                # team_min 초과는 하드 infeasibility 가 아니라 soft 로 해소 가능하므로 선차단하지 않는다.
+                # 엔진이 team_min 하드로 못 풀면 결과가 빈 근무표가 되어 _infeasible_empty
+                # (세팅: roster_create_service.py:3653/3709)가 서고, team_min hard→soft 자동 재시도
+                # (발동: roster_create_service.py:5573-5593)가 팀 미달 슬랙(penalty 80000)으로 해소한다.
+                # 그래서 hard 로 막지 않고 warning 으로만 알린다 — off_first 상한 등과 충돌하는 날
+                # (주말 등)만 한 팀이 min 미달로 배정되고 벌점이 부과된다.
+                # (형제 검사 GRADE_MIN_SUM_EXCEEDS_NEED 등은 동등한 자동 soft 재시도가 없어 hard 유지.)
                 issues.append(
                     _issue(
                         "TEAM_MIN_EXCEEDS_GLOBAL_NEED",
                         {"shift": s, "day": d, "teams_min_sum": tmin_sum, "global_need": nd},
+                        severity="warning",
                     )
                 )
                 break
