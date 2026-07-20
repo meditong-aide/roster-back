@@ -159,6 +159,7 @@ def manifest_router_hints() -> str:
 _MANIFEST_MODULES: list[str] = [
     "agents_v2.skills.manage_assignment",
     "agents_v2.skills.lookup_guide",
+    "agents_v2.skills.manage_daily_shift",
 ]
 
 _loaded = False
