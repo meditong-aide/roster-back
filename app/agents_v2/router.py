@@ -46,6 +46,9 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     "mutate": [
         "bulk_mutation", "manage_wanted_deadline", "manage_wanted_limits",
         "manage_teams", "query_schedule",
+        # [EVAL 2026-07-20] '김민지 5월 N 4번으로 맞춰줘' 같은 개인 월한도 변경이 mutate 로
+        # 분류돼 update_monthly_limit(settings_rules 전용)을 놓쳤음 → 다중 배선으로 recall 복구.
+        "update_monthly_limit",
     ],
     # 근무표 자동 생성 (생성 vs roster_create 화면 gray → navigate 번들)
     # query_generation_job: '생성 어디까지?' 같은 상태 조회 동반 가능.
@@ -73,6 +76,9 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
         "manage_grade", "manage_team_min", "manage_teams", "update_person_attr",
         "query_schedule",  # 속성 조회('야간전담이야?', '프리셉터 누구') → 읽기 tool 필요
         "navigate", "prefill",
+        # [EVAL 2026-07-20] '박혜미 5월 D 최소 8회' 등 개인 월한도가 사람 발화라
+        # settings_people 로 분류돼 update_monthly_limit 을 놓쳤음 → 다중 배선.
+        "update_monthly_limit",
     ],
 }
 
