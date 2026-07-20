@@ -222,19 +222,34 @@ class SchedulingAgent:
             previews = run.exec.previews
             preview = ({"type": "batch", "count": len(previews), "items": previews}
                        if len(previews) > 1 else previews[0])
-            answer = join_answer(self.llm, user_message, run) + "\n\n진행할까요?"
+            answer = join_answer(self.llm, user_message, run)
+            if run.exec.deferred:  # 승인 시 커밋 후 생성 등 async 시작 예정
+                answer += " (승인하면 설정 반영 후 근무표 생성이 시작됩니다.)"
+            answer += "\n\n진행할까요?"
             return AgentResult(awaiting_approval=True, preview=preview, answer=answer,
                                trace=trace, messages=messages,
                                variable_memory=ctx.variable_memory, data=last)
-        return AgentResult(answer=join_answer(self.llm, user_message, run), trace=trace,
-                           messages=messages, variable_memory=ctx.variable_memory, data=last)
+        # read-only(승인 불필요): 커밋할 mutation 이 없으니 deferred(async) 를 바로 실행.
+        from agents_v2.planning.plan import resolve_args
+        async_done: list[str] = []
+        for t in run.exec.deferred:
+            try:
+                execute_skill(db, t.skill, resolve_args(t.args, run.exec.outputs), ctx)
+                async_done.append(t.skill)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[agent_v3] deferred %s 실행 실패: %s", t.skill, e)
+        answer = join_answer(self.llm, user_message, run)
+        if async_done:
+            answer += "\n\n(**근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
+        return AgentResult(answer=answer, trace=trace, messages=messages,
+                           variable_memory=ctx.variable_memory, data=last)
 
     def _commit_plan(self, db, user_message, ctx, messages):
         """계획 승인 후 mutate 를 위상순서로 실제 commit(dry_run 해제) → 답변 합성."""
         from agents_v2.middleware import execute_skill
         from agents_v2.planning.executor import PlanExecResult, execute_plan
         from agents_v2.planning.orchestrate import PlanRun, join_answer
-        from agents_v2.planning.plan import Plan
+        from agents_v2.planning.plan import Plan, resolve_args
 
         pending = ctx.pending_approval or {}
         plan = Plan.from_dict(pending.get("plan") or {})
@@ -274,11 +289,26 @@ class SchedulingAgent:
                 answer=f"커밋 중 오류로 **전체 취소**했습니다: {e}",
                 trace=[Stage("plan_commit", "error", {"atomic": "rolled_back"}, 0)],
                 messages=messages, variable_memory=ctx.variable_memory)
+        # ── 커밋 성공 후: deferred(async, 예: 근무표 생성) 실행 ──
+        # 커밋된 상태를 읽고 enqueue(트랜잭션 밖). 롤백됐으면 여기 안 옴 → 잘못된 설정으로 생성 안 됨.
+        async_done: list[str] = []
+        for t in exec_res.deferred:
+            try:
+                aargs = resolve_args(t.args, exec_res.outputs)
+                execute_skill(db, t.skill, aargs, ctx)
+                async_done.append(t.skill)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[agent_v3] deferred %s 실행 실패: %s", t.skill, e)
+
         run = PlanRun(plan=plan, exec=exec_res)
         last = exec_res.outputs.get(plan.tasks[-1].id) if plan.tasks else None
+        answer = join_answer(self.llm, orig, run)
+        if async_done:
+            answer += "\n\n(설정을 반영하고 **근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
         return AgentResult(
-            answer=join_answer(self.llm, orig, run),
-            trace=[Stage("plan_commit", "ok", {"order": exec_res.order, "atomic": "committed"}, 0)],
+            answer=answer,
+            trace=[Stage("plan_commit", "ok",
+                         {"order": exec_res.order, "atomic": "committed", "async": async_done}, 0)],
             messages=messages, variable_memory=ctx.variable_memory, data=last)
 
     def _run_impl(

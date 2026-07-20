@@ -106,3 +106,19 @@ def test_no_factory_stays_sequential():
                  PlanTask("t2", "analyze_report", kind="read")])
     execute_plan(passed_db, plan, None, fn)  # factory 없음
     assert all(d is passed_db for d in seen)
+
+
+# ── async(generate) defer — 트랜잭션 밖·커밋 후 ──
+def test_async_skill_deferred_not_executed():
+    calls = []
+    def fn(db, skill, args, ctx):
+        calls.append(skill)
+        return {"ok": True}
+    plan = Plan([PlanTask("t1", "manage_daily_shift", kind="mutate"),
+                 PlanTask("t2", "generate_schedule", kind="mutate", deps=["t1"])])
+    res = execute_plan(None, plan, None, fn, dry_run_mutations=False)
+    # generate 는 실행 안 되고 deferred 로 수집
+    assert "generate_schedule" not in calls
+    assert "manage_daily_shift" in calls
+    assert [t.id for t in res.deferred] == ["t2"]
+    assert res.failed is None

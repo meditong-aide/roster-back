@@ -18,12 +18,18 @@ from agents_v2.errors import ErrorType, classify
 from agents_v2.planning.plan import Plan, PlanTask, resolve_args
 
 
+# 비동기·외부 부수효과 skill — 트랜잭션 밖·커밋 후에만 실행(플랜 롤백돼도 enqueue 안 되게,
+# dry-run 미리보기에서 큐 등록 안 되게). executor 는 이들을 실행 않고 deferred 로 넘긴다.
+ASYNC_SKILLS = frozenset({"generate_schedule"})
+
+
 @dataclass
 class PlanExecResult:
     outputs: dict[str, Any] = field(default_factory=dict)   # task_id → 결과 data
     previews: list[dict] = field(default_factory=list)       # mutate dry-run(승인 대상)
     order: list[str] = field(default_factory=list)           # 실행 순서(trace)
     failed: dict | None = None                               # {task, data} 실패 시
+    deferred: list[PlanTask] = field(default_factory=list)   # 커밋 후 실행할 async task
 
 
 # 실행 중단시키는 outcome(사용자 개입/오류 필요).
@@ -54,6 +60,7 @@ def execute_plan(
     dry_run_mutations: bool = True,
     session_factory: Callable[[], Any] | None = None,
     max_workers: int = 4,
+    defer_skills: frozenset[str] = ASYNC_SKILLS,
 ) -> PlanExecResult:
     """plan 을 위상순서로 실행. 레벨 내 **read 는 병렬(세션 격리), mutate 는 순차**.
 
@@ -81,8 +88,13 @@ def execute_plan(
         return False
 
     for level in plan.topo_levels():
-        reads = [t for t in level if t.kind == "read"]
-        mutates = [t for t in level if t.kind == "mutate"]
+        # async skill 은 실행 않고 deferred 로(커밋 후 실행). 원 순서 보존.
+        for t in level:
+            if t.skill in defer_skills:
+                res.deferred.append(t)
+        active = [t for t in level if t.skill not in defer_skills]
+        reads = [t for t in active if t.kind == "read"]
+        mutates = [t for t in active if t.kind == "mutate"]
 
         # 1) reads — 세션 격리 병렬(2개+ & factory 있을 때), 아니면 순차.
         if session_factory is not None and len(reads) > 1:
