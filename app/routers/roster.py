@@ -129,6 +129,10 @@ def _roster_config_to_dict(config) -> dict:
         "banned_day_after_eve": config.banned_day_after_eve,
         "max_conseq_work": config.max_conseq_work,
         "off_days": config.off_days,
+        # 연속 OFF 상한(nullable) — NULL 이면 앱 기본 3 적용(models.py 주석과 일치)
+        "max_conseq_off": config.max_conseq_off
+        if config.max_conseq_off is not None
+        else 3,
         "shift_priority": config.shift_priority,
         "weekend_shift_ratio": config.weekend_shift_ratio,
         "patient_amount": config.patient_amount,
