@@ -1037,6 +1037,58 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
     return issues
 
 
+def check_per_nurse_sequence(inp: PrecheckInput) -> List[Dict]:
+    """개인축: 각 간호사가 혼자서 고정셀 + 시퀀스 규칙(전이금지/연속근무/연속야간/회복/1N)을
+    다 지키는 유효한 근무 배열을 만들 수 있는가. 혼자 불가능 = 전체 불가능(증명).
+
+    aggregate/max-flow 가 못 보는 '고정셀 × 시퀀스' 배치 충돌(예: 고정 N 다음날 고정 D +
+    N→D 금지)을 solve 전에 잡는다. DP 는 '증명된 불가능'만 반환 → false positive 없음.
+    """
+    from services.precheck.per_nurse_sequence_feasibility import nurse_sequence_infeasible
+
+    cfg = inp.roster_config
+    S = _apply_shifts(bool(cfg.get("use_mid", False)))
+    ban_n_to_d = bool(cfg.get("ban_n_to_d", True))
+    ban_e_to_d = bool(cfg.get("banned_day_after_eve", True))
+    ban_n_to_e = bool(cfg.get("ban_n_to_e", True))
+    two2 = bool(cfg.get("two_offs_after_two_nig"))
+    two3 = bool(cfg.get("two_offs_after_three_nig"))
+    not_one = bool(cfg.get("not_one_night"))
+    max_k = cfg.get("max_conseq_work")
+    max_l = 3 if cfg.get("three_seq_nig") else 2
+
+    issues: List[Dict] = []
+    for n in inp.nurses:
+        span = n.leave_day - n.join_day + 1
+        if span <= 0:
+            continue
+        # 고정 근무 + 고정 OFF 를 active span 0-based 로 remap
+        fixed: Dict[int, str] = {}
+        for d, sh in (n.fixed_shift_assignments or {}).items():
+            if n.join_day <= d <= n.leave_day:
+                fixed[d - n.join_day] = str(sh).upper()
+        for d in (n.fixed_off_days or set()):
+            if n.join_day <= d <= n.leave_day and (d - n.join_day) not in fixed:
+                fixed[d - n.join_day] = "O"
+        # 고정셀이 없으면 all-OFF 완성이 항상 가능 → 개인 단독 불가능 없음(스킵, 비용 절약)
+        if not fixed:
+            continue
+        allowed_work = {c for c in _allowed_set(n, S) if c in ("D", "E", "N")}
+        if nurse_sequence_infeasible(
+            num_days=span, allowed=allowed_work, fixed=fixed,
+            max_consecutive_work=max_k, max_consecutive_nights=max_l,
+            ban_n_to_d=ban_n_to_d, ban_e_to_d=ban_e_to_d, ban_n_to_e=ban_n_to_e,
+            two_offs_after_two_nig=two2, two_offs_after_three_nig=two3,
+            not_one_night=not_one,
+            n_min=0, n_max=(n.night_cap if n.night_cap is not None else None),
+        ):
+            issues.append(_issue(
+                "PER_NURSE_SEQUENCE_INFEASIBLE",
+                {"nurse_id": n.nurse_id, "active_days": span, "fixed_cells": len(fixed)},
+            ))
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -1125,6 +1177,7 @@ def run_precheck(
         check_monthly_night_capacity,  # Fix 1 (renamed from check_common_pool_night_capacity)
         check_daily_night_shortage,
         check_preceptee_sync_mismatch,
+        check_per_nurse_sequence,  # 개인축: 고정셀 × 시퀀스 배치 충돌 (증명된 불가능)
     ]
     for fn in day_phase:
         issues.extend(fn(inp))
