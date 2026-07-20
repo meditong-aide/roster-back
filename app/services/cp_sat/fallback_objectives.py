@@ -437,7 +437,15 @@ def build_fallback_stage3_objective_terms(
         n2n_win = int(getattr(cfg, "n_to_n_interval_max_window", 0) or 0)
         if n2n_target > 0 and n2n_w > 0 and n2n_win >= 2 and "N" in cfg.shift_types:
             n_idx = cfg.shift_types.index("N")
+            _use_mid_n2n = bool(getattr(cfg, "use_mid", False))
             for n in range(N):
+                # N전담(N-only)은 야간을 촘촘히 강제당하므로 n2n 간격 벌점에서 제외
+                # (같은 시프트 연속 벌점과 동일 논리 — 유령 페널티 방지).
+                if is_n_only_profile(
+                    getattr(roster_system.nurses[n], "allowed_shifts", None),
+                    use_mid=_use_mid_n2n,
+                ):
+                    continue
                 T0, T1 = join[n], leave[n]
                 for d1 in range(T0, T1):
                     for d2 in range(d1 + 2, min(d1 + n2n_win + 1, T1 + 1)):

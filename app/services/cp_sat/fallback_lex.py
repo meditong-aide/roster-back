@@ -3075,6 +3075,13 @@ def optimize_fallback_lex_hard_first(
                                                 for _n in range(N):
                                                     if leave[_n] < join[_n]:
                                                         continue
+                                                    # N전담(N-only)은 야간 강제 → n2n 간격 벌점 제외
+                                                    # (같은 시프트 연속 벌점과 동일 논리, 유령 페널티 방지).
+                                                    if is_n_only_profile(
+                                                        getattr(roster_system.nurses[_n], "allowed_shifts", None),
+                                                        use_mid=bool(getattr(cfg, "use_mid", False)),
+                                                    ):
+                                                        continue
                                                     _aset = set(iter_nurse_days(_n, join, leave, blocked_by_nurse))
                                                     for _d1 in sorted(_aset):
                                                         for _gap in range(2, _n2n_tgt):
