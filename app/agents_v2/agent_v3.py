@@ -203,7 +203,8 @@ class SchedulingAgent:
         from agents_v2.planning.orchestrate import join_answer, try_plan_run
         from db.client2 import SessionLocal
 
-        planner_llm = self.router_llm or self.llm
+        # 계획은 복합 의존 추론이라 **메인 LLM** 사용(nano 라우터는 과생성/오류).
+        planner_llm = self.llm
         try:
             run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill,
                                session_factory=SessionLocal)  # read 세션 격리 병렬

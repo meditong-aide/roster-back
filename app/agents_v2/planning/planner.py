@@ -50,12 +50,21 @@ task 간 **실제 의존이 있을 때만** deps 를 넣는다. 의존 유형 3�
 
 
 def _skills_brief(skill_tools: list[dict]) -> str:
+    """스킬 이름 + 한줄설명 + **파라미터 스키마(이름·enum)**. args 를 정확히 만들게 하려면 필수."""
     lines = []
     for t in skill_tools:
         name = t.get("name", "")
         desc = (t.get("description") or "").strip().splitlines()
         head = desc[0].strip() if desc else ""
-        lines.append(f"- {name}: {head[:80]}")
+        props = (t.get("parameters") or {}).get("properties") or {}
+        params = []
+        for pk, pv in props.items():
+            enum = pv.get("enum")
+            pdesc = (pv.get("description") or "").strip()
+            tag = f"={enum}" if enum else (f"({pdesc[:24]})" if pdesc else "")
+            params.append(f"{pk}{tag}")
+        pline = ("\n    params: " + ", ".join(params)) if params else ""
+        lines.append(f"- {name}: {head[:80]}{pline}")
     return "\n".join(lines)
 
 
