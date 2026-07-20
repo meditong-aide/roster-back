@@ -34,33 +34,11 @@ class NurseRosterConfig:
     standard_personal_off_days: int = 8  # 간호사별 표준 개인 휴무일 수
     max_extra_off_days: int = 3  # 월 최소 휴무 기준 대비 허용되는 추가 OFF 상한(n)
     extra_off_penalty_weight: int = 80  # 추가 OFF(여유 OFF)를 기피하는 목적함수 패널티 가중치
-    # GRADE/coverage 충족을 위해 per-nurse OFF cap을 추가로 풀어주는 여유 일수.
-    # 솔버는 extra_off_penalty_weight 때문에 *필요할 때만* 이 여유를 사용함.
-    # 후처리(OffSwap, off_swap_enabled=True)가 baseline=off_days 초과분을 연차로 라벨링하므로
-    # 사실상 "연차로 흡수 가능한 추가 OFF" 역할. 기본 0(기존 동작 유지).
-    off_cap_relax_extra: int = 0
     # 월 합계 GRADE hard constraint (soft + 10× weight로 사실상 hard).
     # per-day는 allow_soft_fallback=True의 soft penalty 유지(KLD 자유도 보존),
     # 월 누계는 grade demand×D를 거의 강제 → grade 비율 보장.
     # 시화병원처럼 인원 vs demand가 빡센 케이스에서 GRADE 트레이드오프 곡선 확장.
     grade_monthly_hard: bool = True
-    # Layer 2 total work target에 grade demand 비례 bias.
-    # nurse target_work = baseline + α × (grade_natural_work - baseline)
-    # α=0: 기존 동작 (모든 nurse가 baseline_work_target 동일)
-    # α=0.5: 잉여 grade는 약하게 work 낮춤, 부족 grade는 약하게 work 높임
-    # 폐기된 grade-aware target과 달리 α로 강도 조절 → OFF 양극화 완화
-    grade_target_bias_alpha: float = 0.0
-    # α 자동 산출 (auto=True): shortage/surplus 비율로 매 solve마다 자동 결정.
-    # 인원 vs demand가 빡센 케이스: α↑ (잉여 grade가 양보), 여유 케이스: α=0 (bias 비활성).
-    # pre-solve feasibility 진단도 함께 수행 (demand > capacity 시 경고 log).
-    # 시화병원 검증 결과 monthly_hard와 결합 시 N/D-E 양극화 부작용 발생.
-    # 기본 비활성. 필요 시 케이스별로 ON 가능.
-    grade_target_bias_alpha_auto: bool = False
-    # Layer 1.5: per-nurse |D-E|, |E-N|, |D-N| balance 직접 minimize (X축 균등).
-    # 기존 KLD는 shift별 따로 균등화 → 한 nurse의 D=10/E=0 같은 양극화 약하게만 페널티.
-    # 이 항은 같은 사람 내 시프트 비대칭을 직접 0에 끌어당김. 전담자(allowed shift 1개)는 제외.
-    # 0: 비활성, 30000~90000: 적정. default는 KLD per-shift weight 수준.
-    kld_balance_weight: int = 0  # X-ratio cap이 X축을 직접 모델링하므로 보조항 비활성
     # Per-nurse 시프트 상한 soft cap (자동 산출, hardcode 없음):
     # Y축: N count ≤ N_target × ratio (예: 6.43 × 1.5 = 9.6 → floor 9)
     # X축: max(D,E) ≤ ratio × min(D,E)
@@ -100,8 +78,6 @@ class NurseRosterConfig:
     
     # 선호도 행렬 가중치
     night_nurse_weight: float = 2.0  # 야간 간호사의 야간 근무 가중치
-    experience_weight: float = 1.5  # 경력 간호사 가중치
-    consecutive_shift_penalty: float = -1.0  # 원치 않는 연속 근무에 대한 패널티
     
     # 선호도 가중치
     shift_preference_weights: Dict[str, float] = field(default_factory=lambda: {
@@ -126,14 +102,7 @@ class NurseRosterConfig:
     use_mid: bool = False                               # True 시 DENO → DENMO 커버리지 전환
 
     # --- 신규 Hard Constraint 제어 파라미터 ---
-    enforce_seniority_pairing: bool = True # 시니어-주니어 동반 근무 규칙 강제 여부
     ban_night_before_fixed_off: bool = True  # fixed_wanted 비근무(휴무/휴가/공가 등) 직전일 N 배치 금지
-    junior_pairing_max_experience: int = 2 # 주니어로 간주할 최대 연차
-    senior_pairing_min_experience: int = 6 # 시니어로 간주할 최소 연차
-    enforce_E_after_D_constraint: bool = True # E -> D 근무 금지 규칙 강제 여부
-    
-    # 소프트맥스 샘플링 온도
-    sampling_temperature: float = 2.0
     
     # 근무 요구사항 우선순위 (0~1) - 1에 가까울수록 더 강하게 근무 요구사항 강제
     shift_requirement_priority: float = 0.8  # 근무 요구사항 우선순위

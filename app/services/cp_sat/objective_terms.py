@@ -299,116 +299,6 @@ def add_kld_distribution_terms(
         )
 
     # ══════════════════════════════════════════════
-    # Layer 1.5: per-nurse 시프트 balance (X축 직접 minimize) — flex-aware
-    # ══════════════════════════════════════════════
-    # 같은 nurse의 |D-E|, |E-N|, |D-N|을 0에 끌어당김.
-    # 단, fixed_wanted/NML로 강제된 카운트는 balance에서 제외 → *flex part*만 균형.
-    # 예: 정아영 D fixed=16 → |D-E| 계산은 (D_total - 16) vs E_total.
-    # 전담자(allowed shift 1개)는 skip.
-    W_BALANCE = int(getattr(cfg, "kld_balance_weight", 0) or 0)
-    if W_BALANCE > 0:
-        # fixed_cells per (nurse, shift_code) 카운트 사전 산출
-        # fixed_source 무관하게 work_code인 모든 fixed cell 카운트 (fixed_wanted, weekly_off 등).
-        fixed_count_by_nc: dict[tuple[int, str], int] = {}
-        fc_total = 0
-        fc_by_source: dict[str, int] = {}
-        for cell in getattr(rs, "fixed_cells", []) or []:
-            if not isinstance(cell, dict):
-                continue
-            n_idx = cell.get("nurse_index")
-            raw = str(cell.get("shift") or "").strip().upper()
-            src = str(cell.get("fixed_source") or "").strip().lower() or "?"
-            fc_total += 1
-            fc_by_source[src] = fc_by_source.get(src, 0) + 1
-            if n_idx is None or raw not in work_codes:
-                continue
-            key = (int(n_idx), raw)
-            fixed_count_by_nc[key] = fixed_count_by_nc.get(key, 0) + 1
-        if stage_label == "메인":
-            print(
-                f"{logger_prefix} [KLD-balance][diag] fixed_cells_total={fc_total}, "
-                f"by_source={fc_by_source}, work_code_count={len(fixed_count_by_nc)}"
-            )
-
-        def _shift_exact_count(nu, prefix: str) -> int:
-            """NML의 exact 또는 min==max인 count 반환. 없으면 0."""
-            ex = getattr(nu, f"{prefix}_exact", None)
-            if ex is not None:
-                try:
-                    return int(ex)
-                except (TypeError, ValueError):
-                    pass
-            mn = getattr(nu, f"{prefix}_min", None)
-            mx = getattr(nu, f"{prefix}_max", None)
-            if mn is not None and mx is not None:
-                try:
-                    if int(mn) == int(mx):
-                        return int(mn)
-                except (TypeError, ValueError):
-                    pass
-            return 0
-
-        balance_pairs = [("D", "E"), ("D", "N"), ("E", "N")]
-        balance_added = 0
-        flex_aware_count = 0
-        for n in normals:
-            nu = rs.nurses[n]
-            allowed = normalize_allowed_shift_codes(
-                getattr(nu, "allowed_shifts", None), use_mid=use_mid,
-            ) or all_codes_set
-            allowed_work = allowed & set(work_codes)
-            if len(allowed_work) <= 1:
-                continue  # 전담자 제외
-            days_n = list(iter_nurse_days(n, join, leave, blocked_by_nurse))
-            for c1, c2 in balance_pairs:
-                if c1 not in allowed_work or c2 not in allowed_work:
-                    continue
-                if c1 not in work_indices or c2 not in work_indices:
-                    continue
-                idx1 = work_indices[c1]
-                idx2 = work_indices[c2]
-                cnt1 = sum(X(n, d, idx1) for d in days_n)
-                cnt2 = sum(X(n, d, idx2) for d in days_n)
-                # fixed/NML로 강제된 카운트
-                fixed_1 = max(
-                    fixed_count_by_nc.get((n, c1), 0),
-                    _shift_exact_count(nu, c1.lower()),
-                )
-                fixed_2 = max(
-                    fixed_count_by_nc.get((n, c2), 0),
-                    _shift_exact_count(nu, c2.lower()),
-                )
-                if fixed_1 > 0 or fixed_2 > 0:
-                    flex_aware_count += 1
-                    # free_c = count - fixed_c. 음수 방지 위해 변수 범위 [0, D].
-                    free_1 = m.NewIntVar(0, D, f"bal_free_{c1}_{stage_label}_{n}")
-                    free_2 = m.NewIntVar(0, D, f"bal_free_{c2}_{stage_label}_{n}")
-                    m.Add(free_1 == cnt1 - fixed_1)
-                    m.Add(free_2 == cnt2 - fixed_2)
-                    diff_lhs = free_1 - free_2
-                else:
-                    # fixed가 없으면 변수 추가 없이 직접 차이만 계산 (이전 동작 유지)
-                    diff_lhs = cnt1 - cnt2
-                diff = m.NewIntVar(-D, D, f"bal_{c1}{c2}_diff_{stage_label}_{n}")
-                m.Add(diff == diff_lhs)
-                abs_diff = m.NewIntVar(0, D, f"bal_{c1}{c2}_abs_{stage_label}_{n}")
-                m.AddAbsEquality(abs_diff, diff)
-                b1 = m.NewIntVar(0, 1, f"bal_{c1}{c2}_b1_{stage_label}_{n}")
-                b2 = m.NewIntVar(0, 2, f"bal_{c1}{c2}_b2_{stage_label}_{n}")
-                b3 = m.NewIntVar(0, D, f"bal_{c1}{c2}_b3_{stage_label}_{n}")
-                m.Add(abs_diff == b1 + b2 + b3)
-                obj.append(-W_BALANCE * b1)
-                obj.append(-3 * W_BALANCE * b2)
-                obj.append(-10 * W_BALANCE * b3)
-                balance_added += 1
-        if balance_added > 0:
-            print(
-                f"{logger_prefix} [KLD-balance] ({stage_label}): "
-                f"per-nurse flex-aware |D-E|/|D-N|/|E-N| 항 추가, pairs={balance_added}, "
-                f"flex_adjusted={flex_aware_count}, W={W_BALANCE}"
-            )
-
-    # ══════════════════════════════════════════════
     # Layer 1.6: Per-nurse 모든 (s1, s2) pair ratio cap — demand-aware
     # ══════════════════════════════════════════════
     # 각 nurse의 allowed shift에 대해 *모든 pair* (D-E, D-N, E-N 등)에
@@ -570,122 +460,15 @@ def add_kld_distribution_terms(
     total_work_need = sum(total_need[c] for c in work_codes)
     baseline_work_target = max(1, D - int(getattr(cfg, "off_days", 10) or 10))
 
-    # A.3 (grade-aware target) 폐기 사유: 100% grade demand target이 양극화 유발.
-    # 새 변형: α-blending으로 *약하게* grade demand bias.
-    # target_n = baseline + α × (grade_natural_work - baseline)
-    # α=0이면 폐기 이전과 동일. α∈(0,1)이면 부드럽게 grade 방향으로 끌어당김.
-    grade_alpha_cfg = float(getattr(cfg, "grade_target_bias_alpha", 0.0) or 0.0)
-    grade_alpha_auto = bool(getattr(cfg, "grade_target_bias_alpha_auto", False))
-    grade_alpha: float = grade_alpha_cfg  # auto 모드면 아래에서 override
-    grade_natural_by_idx: dict[int, float] = {}
-    if grade_alpha_cfg > 0 or grade_alpha_auto:
-        gs = str(getattr(rs, "grade_strategy", "") or "").upper()
-        gc = getattr(rs, "grade_config", None) or {}
-        gconstraints = gc.get("constraints_json") or gc.get("constraints") or {}
-        if gconstraints and gs in ("GRADE", "COMBINED"):
-            by_g: dict[int, list[int]] = {}
-            for i, nu in enumerate(rs.nurses):
-                g = getattr(nu, "grade", None)
-                try:
-                    gi = int(g) if g is not None else None
-                except Exception:
-                    gi = None
-                if gi is not None:
-                    by_g.setdefault(gi, []).append(i)
-            grade_demand_by_g: dict[int, int] = {}
-            for gi, idxs in by_g.items():
-                if not idxs:
-                    continue
-                demand = 0
-                for c in work_codes:
-                    gmap = gconstraints.get(c) or {}
-                    base = gmap.get(str(gi))
-                    if base is None:
-                        base = gmap.get(gi)
-                    try:
-                        demand += int(base or 0) * D
-                    except Exception:
-                        pass
-                grade_demand_by_g[gi] = demand
-                if demand <= 0:
-                    continue
-                natural_work = demand / len(idxs)
-                for i in idxs:
-                    grade_natural_by_idx[i] = natural_work
-
-            # ── 자동 α 산출 + pre-solve feasibility 진단 ──
-            if grade_alpha_auto:
-                shortage_total = 0
-                surplus_total = 0
-                max_off_hard = int(getattr(cfg, "off_days", 9) or 9)
-                max_work_per_nurse = max(1, D - max_off_hard)
-                feasibility_alerts: list[tuple[int, int, int, int]] = []
-                for gi, idxs in by_g.items():
-                    cnt = len(idxs)
-                    if cnt == 0:
-                        continue
-                    demand_g = grade_demand_by_g.get(gi, 0)
-                    if demand_g <= 0:
-                        continue
-                    capacity_g = cnt * max_work_per_nurse
-                    if demand_g > capacity_g:
-                        feasibility_alerts.append(
-                            (gi, demand_g, capacity_g, demand_g - capacity_g)
-                        )
-                    baseline_total_g = cnt * baseline_work_target
-                    if demand_g > baseline_total_g:
-                        shortage_total += demand_g - baseline_total_g
-                    elif baseline_total_g > demand_g:
-                        surplus_total += baseline_total_g - demand_g
-                if surplus_total > 0:
-                    grade_alpha = min(1.0, shortage_total / surplus_total)
-                else:
-                    grade_alpha = 0.0
-                print(
-                    f"{logger_prefix} [KLD-grade-alpha-auto] α*={grade_alpha:.3f} "
-                    f"(shortage={shortage_total}, surplus={surplus_total}, "
-                    f"max_work/nurse={max_work_per_nurse})"
-                )
-                for gi, demand_g, capacity_g, deficit in feasibility_alerts:
-                    print(
-                        f"{logger_prefix} [GradeFeasibility][WARN] "
-                        f"grade={gi}: demand={demand_g} > capacity={capacity_g} "
-                        f"({deficit}명-day 구조적 부족) — 인원/demand 조정 필요"
-                    )
-                if shortage_total > surplus_total:
-                    print(
-                        f"{logger_prefix} [GradeFeasibility][WARN] "
-                        f"시스템 부족: shortage={shortage_total} > surplus={surplus_total}, "
-                        f"잉여 grade의 양보로도 충족 불가"
-                    )
-
     nurse_total_target: dict[int, int] = {}
     nml_count = 0
-    grade_biased_count = 0
     for n in normals:
         forced = _nml_forced_work(rs.nurses[n])
         if forced is not None:
             nurse_total_target[n] = max(0, min(D, forced))
             nml_count += 1
-        elif grade_alpha > 0 and n in grade_natural_by_idx:
-            natural = grade_natural_by_idx[n]
-            # Asymmetric: 잉여 grade(natural < baseline)만 target 낮춤.
-            # 부족 grade(natural ≥ baseline)는 baseline 유지 → 솔버가 max work 시도.
-            # 이러면 N 양극화 회피하면서 잉여 grade가 부족 grade에게 자리 양보.
-            if natural < baseline_work_target:
-                biased = baseline_work_target + grade_alpha * (natural - baseline_work_target)
-                nurse_total_target[n] = max(0, min(D, int(round(biased))))
-                grade_biased_count += 1
-            else:
-                nurse_total_target[n] = baseline_work_target
         else:
             nurse_total_target[n] = baseline_work_target
-    if grade_alpha > 0 and grade_biased_count > 0:
-        print(
-            f"{logger_prefix} [KLD-총근무-grade-bias] α={grade_alpha}, "
-            f"biased_nurses={grade_biased_count}/{len(normals)}, "
-            f"baseline={baseline_work_target}"
-        )
 
     max_work = m.NewIntVar(0, D, f"kld_tw_max_{stage_label}")
     min_work = m.NewIntVar(0, D, f"kld_tw_min_{stage_label}")
@@ -1263,43 +1046,36 @@ def build_main_objective_terms(
             obj.extend(preceptor_terms_fn(m, rs, X, join, leave))
         except Exception:
             pass
-        grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        print("grade_strategy", grade_strategy)
-        if grade_strategy in ("TEAM", "COMBINED"):
-            obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
+        obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
 
     # (4-6-tm) team_min 제약: 데이터(team_min_by_team) 존재 여부만으로 활성. strategy는 weight tilt용.
     try:
-        _gs_tm = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy=_gs_tm, blocked_by_nurse=blocked_by_nurse))
+        obj.extend(add_team_min_constraints(m, rs, X, join, leave, grade_strategy="COMBINED", blocked_by_nurse=blocked_by_nurse))
     except Exception as e:
         print("team_min_constraints 예외 발생", e)
 
     # (4-6a) Grade 분배 제약: grade_config 존재 여부만으로 활성. strategy는 weight tilt용.
     try:
-        _gs = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
         grade_terms = add_grade_constraints(
             m=m,
             rs=rs,
             X=X,
             join=join,
             leave=leave,
-            grade_strategy=_gs,
+            grade_strategy="COMBINED",
             grade_config=getattr(rs, "grade_config", None),
         )
         obj.extend(grade_terms or [])
     except Exception:
         pass
 
-    # (4-6b) 팀×Grade handoff 제한 (COMBINED 전략에서만 활성)
+    # (4-6b) 팀×Grade handoff 제한
     try:
-        _gs2 = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
-        if _gs2 == "COMBINED":
-            obj.extend(
-                add_team_grade_handoff_constraints(
-                    m, rs, X, join, leave, grade_strategy=_gs2
-                )
+        obj.extend(
+            add_team_grade_handoff_constraints(
+                m, rs, X, join, leave, grade_strategy="COMBINED"
             )
+        )
     except Exception as e:
         print("team_grade_handoff_constraints 예외 발생", e)
 

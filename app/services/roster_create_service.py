@@ -539,109 +539,6 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     }
 
 
-def _fetch_grade_strategy_from_roster_config(db: Session, config_id: int | None) -> str | None:
-    """roster_config 테이블에서 grade_strategy 값을 조회한다(있으면).
-
-    Notes:
-        - DB에 컬럼이 없을 수 있으므로 INFORMATION_SCHEMA로 확인 후 조회한다.
-        - 값이 없거나 비어있으면 None을 반환한다.
-    """
-    if not config_id:
-        return None
-    if not _column_exists(db, "roster_config", "grade_strategy"):
-        return None
-    try:
-        row = db.execute(
-            text("SELECT grade_strategy FROM roster_config WHERE config_id = :cid"),
-            {"cid": int(config_id)},
-        ).fetchone()
-    except Exception:
-        return None
-    if not row:
-        return None
-    val = getattr(row, "grade_strategy", None)
-    if val is None:
-        try:
-            val = row[0]
-        except Exception:
-            val = None
-    if not val:
-        return None
-    return str(val).upper()
-
-
-def _resolve_grade_strategy(
-    db: Session,
-    config_dict: dict,
-    office_id: str,
-    group_id: str,
-    roster_config_id: int | None,
-) -> tuple[str, dict | None]:
-    """TEAM/GRADE/BASE 전략을 단순하게 결정하고, 필요한 경우 grade_config를 함께 반환한다.
-
-    우선순위:
-        1) roster_config.grade_strategy 컬럼이 있으면 그 값을 최우선 사용한다.
-        2) 없으면(구버전 호환):
-            - team_balance_enable == 1 → TEAM
-            - roster_grade_config.constraints_json이 비어있지 않음 → GRADE
-            - 그 외 → BASE
-
-    Returns:
-        (grade_strategy, grade_config_or_none)
-    """
-    # [ALWAYS_COMBINED] 정책(2026-06): 전략은 항상 COMBINED(team+grade 동시).
-    #   프론트/DB의 grade_strategy 컬럼이 BASE 여도 백엔드가 COMBINED 로 해석하여
-    #   roster_grade_config(grade min/max)를 항상 로드·적용한다.
-    #   - grade_config 에 제약이 없으면 grade 항은 자동 no-op(부작용 없음).
-    #   - team 항은 team_min/team 데이터 있을 때만 활성(없으면 no-op).
-    #   원복: 이 블록만 제거하면 아래 레거시(컬럼 우선 + 구버전 폴백) 로직으로 복귀.
-    _gc_always = _fetch_grade_config_dict(db, office_id, group_id)
-    return "COMBINED", _gc_always
-
-    # 1) DB 컬럼 우선
-    s = _fetch_grade_strategy_from_roster_config(db, roster_config_id)
-    if s in ("BASE", "TEAM", "GRADE", "COMBINED"):
-        if s in ("GRADE", "COMBINED"):
-            gc = _fetch_grade_config_dict(db, office_id, group_id)
-            return s, gc
-        return s, None
-
-    # 2) 구버전 폴백(요청 바디 말고 config_dict 기반)
-    if bool(config_dict.get("team_balance_enable", False)):
-        return "TEAM", None
-
-    gc = _fetch_grade_config_dict(db, office_id, group_id)
-    if bool((gc or {}).get("constraints_json") or {}) or bool((gc or {}).get("constraints_max_json") or {}):
-        return "GRADE", gc
-    return "BASE", None
-
-
-def _has_any_grade_constraints(grade_config: dict | None) -> bool:
-    gc = grade_config or {}
-    return bool(
-        (gc.get("constraints_json") or gc.get("constraints") or {})
-        or (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
-    )
-
-
-def _select_effective_grade_strategy(
-    req_strategy: str,
-    resolved_strategy: str,
-    grade_config: dict | None,
-) -> str:
-    req = str(req_strategy or "").upper()
-    resolved = str(resolved_strategy or "BASE").upper()
-
-    if req == "COMBINED" and _has_any_grade_constraints(grade_config):
-        return "COMBINED"
-    if req == "GRADE" and _has_any_grade_constraints(grade_config):
-        return "GRADE"
-    if req == "TEAM":
-        return "TEAM"
-    if req == "BASE":
-        return "BASE"
-    return resolved
-
 def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
     shift_manages = (
@@ -2998,31 +2895,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             )
         except Exception as _log_exc:
             print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")
-        # 기본 전략은 DB(roster_config.grade_strategy) 기준으로 잡되,
-        # 요청에서 COMBINED/GRADE를 명시하고 grade 제약이 존재하면 해당 전략을 우선 적용한다.
-        grade_strategy, grade_config = _resolve_grade_strategy(
-            db=db,
-            config_dict=config_dict,
-            office_id=current_user.office_id,
-            group_id=current_user.group_id,
-            roster_config_id=getattr(latest_config, "config_id", None),
+        # [ALWAYS_COMBINED] 전략은 항상 COMBINED(team+grade 동시). 요청 바디 grade_strategy 는 무시.
+        #   grade_config 는 항상 로드 — grade 제약 없으면 grade 항 자동 no-op, team 항은 team 데이터 있을 때만 활성.
+        grade_config = _fetch_grade_config_dict(
+            db, current_user.office_id, current_user.group_id
         )
-        # 요청 바디에서 GRADE/COMBINED일 때는 DB에서 grade_config를 조회해 엔진에 전달
         engine_grade_config = grade_config
-        if str(getattr(req, "grade_strategy", "") or "").upper() in ("GRADE", "COMBINED"):
-            engine_grade_config = _fetch_grade_config_dict(
-                db, current_user.office_id, current_user.group_id
-            )
         if bool(config_dict.get("_force_grade_max_soft_fallback")) and isinstance(engine_grade_config, dict):
             engine_grade_config = dict(engine_grade_config)
             engine_grade_config["allow_soft_fallback"] = True
             print("[GradeFallback] force allow_soft_fallback=True (grade_max soft)")
-        req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
-        effective_grade_strategy = _select_effective_grade_strategy(
-            req_strategy=req_strategy,
-            resolved_strategy=grade_strategy,
-            grade_config=engine_grade_config,
-        )
+        effective_grade_strategy = "COMBINED"
         # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
         config_dict["grade_strategy"] = effective_grade_strategy
         cp_sat_result = generate_roster_cp_sat(

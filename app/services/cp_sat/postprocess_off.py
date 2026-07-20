@@ -327,7 +327,7 @@ def postprocess_trim_extra_offs(
 
     pref_matrix = getattr(roster_system, "preference_matrix", None)
     grade_config = getattr(roster_system, "grade_config", None)
-    grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+    grade_strategy = "COMBINED"  # [ALWAYS_COMBINED] 수행모드 폐기
     team_map = {n_idx: getattr(n, "team_id", None) for n_idx, n in enumerate(roster_system.nurses)}
 
     base_min_off = int(

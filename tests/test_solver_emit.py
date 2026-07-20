@@ -123,7 +123,7 @@ def test_parity_helper_detects_solver_only_when_graph_empty():
     class _Attempt:
         attempt_index: int = 0
         label: str = "primary"
-        grade_strategy: str = "BASE"
+        grade_strategy: str = "COMBINED"
         forced_grade_soft_fallback: bool = False
         config_flags: dict = field(default_factory=dict)
 

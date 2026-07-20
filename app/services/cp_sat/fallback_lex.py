@@ -2533,16 +2533,11 @@ def optimize_fallback_lex_hard_first(
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected_fb:
                             _extra_off_fb += 1
-                        # GRADE/coverage 충족을 위해 cap을 풀어주는 여유 일수.
-                        # extra_off_penalty_weight 때문에 솔버는 필요할 때만 이 여유를 사용.
-                        # baseline(off_days) 초과분은 후처리 OffSwap이 연차로 라벨링.
-                        _off_cap_relax_extra = max(0, int(getattr(cfg, "off_cap_relax_extra", 0) or 0))
                         # off_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
                         _off_first_fb = bool(getattr(cfg, "off_first", False))
                         if _off_first_fb:
                             base_cap = max_off_allowed_from_policy
                             base_cap += _extra_off_fb
-                            base_cap += _off_cap_relax_extra
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
                             # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
@@ -2555,7 +2550,7 @@ def optimize_fallback_lex_hard_first(
                                 total_cap_effective = min(total_cap_effective, _scaled_max_fb)
                         else:
                             # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
-                            base_cap = min_off_required + _extra_off_fb + _off_cap_relax_extra
+                            base_cap = min_off_required + _extra_off_fb
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
                             # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
@@ -2634,7 +2629,7 @@ def optimize_fallback_lex_hard_first(
         _tm_cover_slacks: list = []
         if stage in (1, 2):
             try:
-                _gs_tm = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+                _gs_tm = "COMBINED"
                 add_team_min_constraints(
                     m, roster_system, X, join, leave,
                     grade_strategy=_gs_tm,
@@ -2648,7 +2643,7 @@ def optimize_fallback_lex_hard_first(
         # (기존에는 stage3 objective 경로에서만 add_grade_constraints가 호출되어,
         #  stage3 infeasible 시 stage2/1 해로 내려가며 grade hard가 빠질 수 있었다.)
         try:
-            _gs_fb = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+            _gs_fb = "COMBINED"
             _gc_fb = getattr(roster_system, "grade_config", None)
             _allow_soft_fb = True
             if isinstance(_gc_fb, dict):

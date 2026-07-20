@@ -907,7 +907,7 @@ class CPSATBasicEngine:
         year: int, 
         month: int,
         grouped: List[dict],
-        grade_strategy: str = "BASE",
+        grade_strategy: str = "COMBINED",
         grade_config: dict | None = None,
         time_limit_seconds: int = 60,
         randomize: bool = True,           # ← 추가
@@ -1092,7 +1092,7 @@ class CPSATBasicEngine:
                 pass
             # Grade/Team/BASE 전략(모델 빌더에서 참조)
             # - 상위 서비스(roster_create_service)에서 roster_config 기반으로 결정된 값을 전달받는다.
-            setattr(roster_system, "grade_strategy", str(grade_strategy or "BASE").upper())
+            setattr(roster_system, "grade_strategy", "COMBINED")  # [ALWAYS_COMBINED] 전략 단일화(수행모드 폐기)
             setattr(roster_system, "grade_config", grade_config)
             # 고정된 셀 정보 처리
             fixed_cells = list(config_data.get('fixed_cells', []) or [])
@@ -1752,10 +1752,9 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
 
-        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE/COMBINED 전략일 때만)
+        # Grade 배치 요약 출력/CSV 저장 및 로그
         try:
-            grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
+            if grade_config:
                 _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="solve 직후"
@@ -5272,7 +5271,7 @@ def generate_roster_cp_sat(
     time_limit_seconds=60,
     randomize=True,
     seed=None,
-    grade_strategy: str = "BASE",
+    grade_strategy: str = "COMBINED",
     grade_config: dict | None = None,
 ):
     """

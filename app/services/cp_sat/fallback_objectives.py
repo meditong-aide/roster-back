@@ -545,16 +545,14 @@ def build_fallback_stage3_objective_terms(
     except Exception as _e_mx:
         print("mutual_exclusion_objective_terms 예외 발생", _e_mx)
 
-    grade_strategy = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
-    print("grade_strategy", grade_strategy)
+    grade_strategy = "COMBINED"  # [ALWAYS_COMBINED] 수행모드 폐기
     # "grade/team 바로 밑" lex 패스용: 이 소프트 품질 항들을 동결한 뒤 mutex 위반만 최소화.
     # (team_min 은 하드 m.Add 로 이미 강제되므로 freeze 대상에서 제외 — team_balance/grade/handoff 만.)
     _gt_lex_terms = []
     try:
-        if grade_strategy in ("TEAM", "COMBINED"):
-            _tb_terms = add_team_balance_terms_fn(m, roster_system, X, join, leave)
-            obj.extend(_tb_terms)
-            _gt_lex_terms.extend(_tb_terms or [])
+        _tb_terms = add_team_balance_terms_fn(m, roster_system, X, join, leave)
+        obj.extend(_tb_terms)
+        _gt_lex_terms.extend(_tb_terms or [])
     except Exception as e:
         print("team_balance_objective_terms 예외 발생")
         print("e", e)
@@ -572,7 +570,7 @@ def build_fallback_stage3_objective_terms(
             X=X,
             join=join,
             leave=leave,
-            grade_strategy=str(getattr(roster_system, "grade_strategy", "BASE")),
+            grade_strategy="COMBINED",
             grade_config=getattr(roster_system, "grade_config", None),
         )
         obj.extend(grade_terms or [])
@@ -582,15 +580,13 @@ def build_fallback_stage3_objective_terms(
         print("e", e)
         pass
 
-    # 팀×Grade handoff 제한 (COMBINED 전략에서만 활성)
+    # 팀×Grade handoff 제한
     try:
-        _gs_h = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
-        if _gs_h == "COMBINED":
-            _hf_terms = add_team_grade_handoff_constraints(
-                m, roster_system, X, join, leave, grade_strategy=_gs_h
-            )
-            obj.extend(_hf_terms)
-            _gt_lex_terms.extend(_hf_terms or [])
+        _hf_terms = add_team_grade_handoff_constraints(
+            m, roster_system, X, join, leave, grade_strategy="COMBINED"
+        )
+        obj.extend(_hf_terms)
+        _gt_lex_terms.extend(_hf_terms or [])
     except Exception as e:
         print("team_grade_handoff_constraints(fallback) 예외 발생", e)
     if _gt_lex_terms:
