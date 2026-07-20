@@ -6,6 +6,7 @@ from agents_v2.planning import orchestrate, executor
 from agents_v2.planning.plan import Plan, PlanTask
 from agents_v2.planning.executor import PlanExecResult
 from agents_v2.planning.orchestrate import PlanRun
+from agents_v2 import verify
 
 
 def _agent():
@@ -35,14 +36,16 @@ def _mutate_run():
 
 def test_readonly_plan_answers(db, seed_data, monkeypatch):
     monkeypatch.setattr(orchestrate, "try_plan_run", lambda *a, **k: _readonly_run())
-    monkeypatch.setattr(orchestrate, "join_answer", lambda llm, msg, run: "합성 답변")
+    monkeypatch.setattr(orchestrate, "join_answer", lambda llm, msg, run, correction=None: "합성 답변")
+    monkeypatch.setattr(verify, "judge_answer_consistency", lambda *a, **k: verify.ConsistencyResult(True))
     res = _agent().run(db, "복합 조회 질의", _ctx())
     assert res.answer == "합성 답변" and not res.awaiting_approval
 
 
 def test_mutation_plan_awaits_approval(db, seed_data, monkeypatch):
     monkeypatch.setattr(orchestrate, "try_plan_run", lambda *a, **k: _mutate_run())
-    monkeypatch.setattr(orchestrate, "join_answer", lambda llm, msg, run: "이수정 배정안")
+    monkeypatch.setattr(orchestrate, "join_answer", lambda llm, msg, run, correction=None: "이수정 배정안")
+    monkeypatch.setattr(verify, "judge_answer_consistency", lambda *a, **k: verify.ConsistencyResult(True))
     ctx = _ctx()
     res = _agent().run(db, "대체자 찾아 배정", ctx)
     assert res.awaiting_approval is True
@@ -57,7 +60,8 @@ def test_plan_commit_on_confirm(db, seed_data, monkeypatch):
         committed["dry"] = dry_run_mutations
         return PlanExecResult(outputs={"t2": {"ok": True}}, previews=[], order=["t1", "t2"])
     monkeypatch.setattr(executor, "execute_plan", fake_exec)
-    monkeypatch.setattr(orchestrate, "join_answer", lambda llm, msg, run: "배정 완료")
+    monkeypatch.setattr(orchestrate, "join_answer", lambda llm, msg, run, correction=None: "배정 완료")
+    monkeypatch.setattr(verify, "judge_answer_consistency", lambda *a, **k: verify.ConsistencyResult(True))
     ctx = _ctx()
     ctx.pending_approval = {"type": "plan", "user_message": "대체자 배정",
                             "plan": {"tasks": [{"id": "t1", "skill": "recommend_candidates", "kind": "read"},
