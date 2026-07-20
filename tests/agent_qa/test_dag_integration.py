@@ -53,7 +53,7 @@ def test_mutation_plan_awaits_approval(db, seed_data, monkeypatch):
 def test_plan_commit_on_confirm(db, seed_data, monkeypatch):
     # 승인 대기 상태에서 '응' → _commit_plan (execute_plan dry_run=False) → 답변
     committed = {}
-    def fake_exec(db_, plan, ctx_, fn, dry_run_mutations=True):
+    def fake_exec(db_, plan, ctx_, fn, dry_run_mutations=True, session_factory=None, **kw):
         committed["dry"] = dry_run_mutations
         return PlanExecResult(outputs={"t2": {"ok": True}}, previews=[], order=["t1", "t2"])
     monkeypatch.setattr(executor, "execute_plan", fake_exec)
