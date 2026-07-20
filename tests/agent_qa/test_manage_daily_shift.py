@@ -52,3 +52,39 @@ def test_month_apply_bulk(db, seed_data):
 def test_scope_inference_no_counts_clarifies(db, seed_data):
     res = execute_skill(db, "manage_daily_shift", {"date": "2026-08-07"}, _hn())
     assert res.data.get("needs_clarification") is True
+
+
+# ── 요일 패턴 grounding (weekend/weekday) ──
+import calendar
+from agents_v2.grounding.internal import resolve_pattern_days
+
+
+def test_resolve_pattern_days_deterministic():
+    # 2026-08 주말 = 결정적
+    truth = [d for d in range(1, 32) if calendar.weekday(2026, 8, d) in (5, 6)]
+    assert resolve_pattern_days("weekend", 2026, 8) == truth == [1, 2, 8, 9, 15, 16, 22, 23, 29, 30]
+    wk = resolve_pattern_days("weekday", 2026, 8)
+    assert set(wk).isdisjoint(truth) and len(wk) + len(truth) == 31
+    assert resolve_pattern_days("격주", 2026, 8) == []  # 미지원 → 빈 리스트
+
+
+def test_weekend_apply_only_weekends(db, seed_data):
+    res = execute_skill(db, "manage_daily_shift",
+                        {"scope": "weekend", "d_count": 3, "e_count": 2, "n_count": 2,
+                         "preview_only": False}, _hn())
+    assert res.data.get("ok") is True and res.data["scope"] == "weekend"
+    assert res.data["days"] == [1, 2, 8, 9, 15, 16, 22, 23, 29, 30]
+    rows = {int(r.day): r for r in
+            db.query(DailyShift).filter_by(group_id="GRP001", year=2026, month=8).all()
+            if int(r.day) > 0}
+    # 주말(8/2 일)은 322, 평일(8/3 월)은 그대로(≠322 이어야)
+    assert (rows[2].d_count, rows[2].e_count, rows[2].n_count) == (3, 2, 2)
+    assert (rows[3].d_count, rows[3].e_count, rows[3].n_count) != (3, 2, 2)
+
+
+def test_weekend_preview_shows_days(db, seed_data):
+    res = execute_skill(db, "manage_daily_shift",
+                        {"scope": "weekend", "d_count": 3, "e_count": 2, "n_count": 2}, _hn())
+    d = res.data
+    assert d.get("preview") is True and d["scope"] == "weekend"
+    assert d["summary"]["days"] == [1, 2, 8, 9, 15, 16, 22, 23, 29, 30]

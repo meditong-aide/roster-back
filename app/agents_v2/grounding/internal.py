@@ -267,6 +267,28 @@ def resolve_date(text: str, year: int, month: int) -> str | None:
     return None
 
 
+def resolve_pattern_days(pattern: str, year: int, month: int) -> list[int]:
+    """요일 패턴 → 해당 월의 일자 목록(결정적). LLM 캘린더 추론 대신 Python calendar.
+
+    LLM 은 '주말' 같은 패턴을 식별(WHAT)만 하고, 어떤 날짜인지(WHICH)는 여기서
+    결정적으로 계산한다 — mutation 이 잘못된 날짜에 조용히 쓰이는 것을 막는다.
+
+      weekend / 주말 → 토·일
+      weekday / 평일 → 월~금
+    미지원 패턴은 빈 리스트(호출부에서 clarify/error).
+    """
+    import calendar
+
+    p = (pattern or "").strip().lower()
+    days_in_month = calendar.monthrange(year, month)[1]
+    wd = lambda d: calendar.weekday(year, month, d)  # 0=Mon .. 6=Sun  # noqa: E731
+    if p in ("weekend", "주말"):
+        return [d for d in range(1, days_in_month + 1) if wd(d) in (5, 6)]
+    if p in ("weekday", "평일"):
+        return [d for d in range(1, days_in_month + 1) if wd(d) in (0, 1, 2, 3, 4)]
+    return []
+
+
 def resolve_date_range(
     text: str, year: int, month: int
 ) -> tuple[str | None, str | None]:

@@ -17,7 +17,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from agents_v2.grounding.internal import resolve_date
+from agents_v2.grounding.internal import resolve_date, resolve_pattern_days
 from agents_v2.skills.manifest import skill
 from agents_v2.verify import VerifyResult, readback
 from services import daily_shift_service
@@ -29,21 +29,26 @@ MANAGE_DAILY_SHIFT_SCHEMA: dict = {
         "엔진이 근무표 생성 시 실제로 읽는 커버리지는 **일자별(DailyShift)** 이다. "
         "'데이 필요인원'을 병동 정책(update_constraint)으로 바꾸려 하지 마라 — 그건 엔진이 무시한다.\n\n"
         "─────────── scope ───────────\n"
-        "- `day` — **특정일** 필요인원. 예: '8월 7일 D 8, E 7, N 3'. date 필요.\n"
-        "- `month` — **월 전체 일괄**. 예: '8월 데이 전부 5명', '매일 나이트 3명'. date 불필요.\n\n"
+        "- `day` — **특정일**. 예: '8월 7일 D 8, E 7, N 3'. date 필요.\n"
+        "- `weekend` — **주말(토·일) 전부**. 예: '8월 주말 322'. 날짜 계산은 시스템이 함(넌 scope만).\n"
+        "- `weekday` — **평일(월~금) 전부**. 예: '8월 평일 데이 5명'.\n"
+        "- `month` — **월 전체 일괄**. 예: '8월 데이 전부 5명', '매일 나이트 3명'.\n\n"
+        "⚠️ '주말'/'평일' 은 **날짜를 네가 세지 마라** — scope=weekend/weekday 만 주면 시스템이 그 달의 "
+        "정확한 날짜를 계산한다. (LLM 캘린더 추론 금지)\n\n"
         "─────────── 파라미터 ───────────\n"
-        "- `scope` — 'day'(특정일) 또는 'month'(월 일괄). 날짜가 있으면 day, '전부/매일/일괄'이면 month.\n"
-        "- `date` — 대상 일자 YYYY-MM-DD ('8월 7일'=2026-08-07). scope=day 일 때.\n"
+        "- `scope` — day / weekend / weekday / month. 날짜 있으면 day, '주말'이면 weekend, '평일'이면 weekday, '전부/매일'이면 month.\n"
+        "- `date` — 대상 일자 YYYY-MM-DD (scope=day). '8월 7일'=2026-08-07.\n"
         "- `d_count`/`e_count`/`n_count` — 각 시프트 필요인원(정수). 준 것만 바꾸고 나머지는 유지.\n\n"
         "예) '8월 7일 데이 8명 이브닝 7명 나이트 3명' → scope=day, date=2026-08-07, d_count=8, e_count=7, n_count=3\n"
+        "예) '8월 주말 322' → scope=weekend, d_count=3, e_count=2, n_count=2 (date 없음 — 시스템이 주말 날짜 계산)\n"
         "예) '8월 나이트 전부 3명으로' → scope=month, n_count=3\n"
         "⚠️ 등록은 preview_only=true 로 먼저 호출해 미리보기를 만들고 사용자 확인 후 실행됩니다."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "scope": {"type": "string", "enum": ["day", "month"],
-                      "description": "day=특정일 / month=월 일괄. 기본 day"},
+            "scope": {"type": "string", "enum": ["day", "weekend", "weekday", "month"],
+                      "description": "day=특정일 / weekend=주말 / weekday=평일 / month=월 일괄"},
             "date": {"type": "string", "description": "대상 일자 YYYY-MM-DD (scope=day). '8월 7일'=2026-08-07"},
             "d_count": {"type": "integer", "description": "데이(D) 필요인원"},
             "e_count": {"type": "integer", "description": "이브닝(E) 필요인원"},
@@ -76,6 +81,10 @@ def _counts(params: dict) -> dict[str, int]:
 
 def _scope_of(params: dict) -> str:
     s = str(params.get("scope") or "").strip().lower()
+    if s in ("weekend", "주말"):
+        return "weekend"
+    if s in ("weekday", "평일"):
+        return "weekday"
     if s in ("month", "monthly", "all", "bulk", "일괄", "전체"):
         return "month"
     if s == "day":
@@ -103,7 +112,45 @@ def manage_daily_shift(db: Session, params: dict) -> Any:
     scope = _scope_of(params)
     if scope == "month":
         return _apply_month(db, office_id, group_id, params, counts)
+    if scope in ("weekend", "weekday"):
+        return _apply_pattern(db, office_id, group_id, params, counts, scope)
     return _apply_day(db, office_id, group_id, params, counts)
+
+
+def _apply_pattern(db, office_id, group_id, params, counts, pattern) -> Any:
+    # LLM 은 'weekend/weekday' 만 식별, 실제 날짜는 여기서 결정적으로 계산.
+    y, m = params.get("year"), params.get("month")
+    if not (y and m):
+        return {"needs_clarification": True,
+                "question": f"몇 월 {'주말' if pattern == 'weekend' else '평일'}인가요? (예: 8월)", "options": []}
+    days = resolve_pattern_days(pattern, int(y), int(m))
+    if not days:
+        return {"error": f"'{pattern}' 날짜를 계산할 수 없습니다."}
+
+    data = daily_shift_service.get_or_init_month(db, office_id, group_id, int(y), int(m))
+    dd = data["date"]
+    lists = {"D": list(dd["D_count"]), "E": list(dd["E_count"]),
+             "N": list(dd["N_count"]), "M": list(dd["M_count"])}
+    for day in days:
+        idx = day - 1
+        if 0 <= idx < len(lists["D"]):
+            for k, v in counts.items():
+                lists[k][idx] = v
+
+    label = "주말" if pattern == "weekend" else "평일"
+    if params.get("preview_only", True):
+        return {"preview": True, "operation": "set_daily_shift", "scope": pattern,
+                "summary": {"month": f"{y}-{int(m):02d}", "label": label,
+                            "days": days, "to": counts}}
+    daily_shift_service.update_daily(
+        db, office_id=office_id, group_id=group_id, year=int(y), month=int(m),
+        d_list=lists["D"], e_list=lists["E"], n_list=lists["N"], m_list=lists["M"],
+        max_enabled=bool(data.get("max_enabled", False)),
+    )
+    return {"ok": True, "scope": pattern, "year": int(y), "month": int(m),
+            "days": days, "applied": counts,
+            "message": f"{y}년 {m}월 {label}({len(days)}일)의 필요인원을 "
+                       + "·".join(f"{k} {v}" for k, v in counts.items()) + "(으)로 설정했습니다."}
 
 
 def _apply_day(db, office_id, group_id, params, counts) -> Any:
@@ -173,27 +220,37 @@ def _verify_daily_shift(db: Session, params: dict, result: Any) -> VerifyResult:
 
     office_id, group_id = params.get("office_id"), params.get("group_id")
     applied = result.get("applied") or {}
+    scope = result.get("scope")
 
-    if result.get("scope") == "day":
+    # 대조할 (year, month, day) 목록.
+    if scope == "day":
         iso = result.get("date")
         if not iso:
             return VerifyResult(True)
-        y, m, day = int(iso[:4]), int(iso[5:7]), int(iso[8:10])
-    else:  # month: 표본으로 1일 확인(apply_bulk 은 전 날짜 동일값)
-        y, m, day = int(result.get("year")), int(result.get("month")), 1
+        y, m = int(iso[:4]), int(iso[5:7])
+        targets = [int(iso[8:10])]
+    elif scope in ("weekend", "weekday"):
+        y, m = int(result.get("year")), int(result.get("month"))
+        targets = list(result.get("days") or [])  # 계산된 날짜 전부
+    else:  # month: 표본 1일(apply_bulk 은 전 날짜 동일값)
+        y, m = int(result.get("year")), int(result.get("month"))
+        targets = [1]
+    if not targets:
+        return VerifyResult(True)
 
-    row = (
-        db.query(DailyShift)
-        .filter(DailyShift.office_id == office_id, DailyShift.group_id == group_id,
-                DailyShift.year == y, DailyShift.month == m, DailyShift.day == day)
-        .first()
-    )
-    if row is None:
-        return VerifyResult(True)  # 못 읽으면 통과(오탐 방지)
-    for k, col in (("D", "d_count"), ("E", "e_count"), ("N", "n_count")):
-        if k in applied and int(getattr(row, col, -1) or 0) != int(applied[k]):
-            return VerifyResult(
-                False,
-                f"{m}월 {day}일 {k} 필요인원이 반영되지 않았습니다 (기대 {applied[k]}, 실제 {getattr(row, col, None)}).",
-            )
+    for day in targets:
+        row = (
+            db.query(DailyShift)
+            .filter(DailyShift.office_id == office_id, DailyShift.group_id == group_id,
+                    DailyShift.year == y, DailyShift.month == m, DailyShift.day == day)
+            .first()
+        )
+        if row is None:
+            continue  # 못 읽으면 통과(오탐 방지)
+        for k, col in (("D", "d_count"), ("E", "e_count"), ("N", "n_count")):
+            if k in applied and int(getattr(row, col, -1) or 0) != int(applied[k]):
+                return VerifyResult(
+                    False,
+                    f"{m}월 {day}일 {k} 필요인원이 반영되지 않았습니다 (기대 {applied[k]}, 실제 {getattr(row, col, None)}).",
+                )
     return VerifyResult(True)
