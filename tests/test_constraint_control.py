@@ -126,14 +126,6 @@ def test_grade_disable_module_clears_constraints():
     assert out["grade_config"]["constraints_json"] == {}
 
 
-def test_team_grade_handoff_force_soft_sets_flag():
-    out = apply_adjustments_to_config(
-        _baseline_config(),
-        [ConstraintAdjustment(family="TeamGradeHandoff", action="force_soft_mode")],
-    )
-    assert out["team_handoff_soft_fallback"] is True
-
-
 def test_boundary_transition_disable_module_clears_bans():
     out = apply_adjustments_to_config(
         _baseline_config(),

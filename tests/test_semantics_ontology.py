@@ -113,7 +113,6 @@ def test_relaxation_priority_present_for_known_families():
     assert onto.get_relaxation_priority("OffCap") == 5
     assert onto.get_relaxation_priority("NightRecovery") == 5
     # 풀기 쉬운 류는 낮음
-    assert onto.get_relaxation_priority("TeamGradeHandoff") == 1
     assert onto.get_relaxation_priority("TeamMin") == 2
     assert onto.get_relaxation_priority("GradeMax") == 2
 

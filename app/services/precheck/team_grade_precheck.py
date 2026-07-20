@@ -199,10 +199,13 @@ def check_team_size_insufficient(inp: PrecheckInput) -> List[Dict]:
         need_sum = sum(int(tmin.get(s, 0) or 0) for s in S)
         size = len(members_by_team.get(tid, []))
         if size < need_sum:
+            # team_min 은 soft(min(need,팀수)+slack, auto-soft 포함)라 팀 인원 부족은
+            # 최종 infeasibility 가 아니라 벌점으로 흡수된다 → 선차단하지 않고 warning.
             issues.append(
                 _issue(
                     "TEAM_SIZE_INSUFFICIENT",
                     {"team_id": tid, "team_size": size, "team_min_sum": need_sum},
+                    severity="warning",
                 )
             )
     return issues
@@ -498,6 +501,7 @@ def check_team_active_members_insufficient(inp: PrecheckInput) -> List[Dict]:
         for d in range(inp.num_days):
             active_cnt = sum(1 for n in mems if _active(n, d))
             if active_cnt < need_sum:
+                # team_min soft → 팀 미달은 벌점으로 흡수. 선차단하지 않고 warning.
                 issues.append(
                     _issue(
                         "TEAM_ACTIVE_MEMBERS_INSUFFICIENT",
@@ -507,6 +511,7 @@ def check_team_active_members_insufficient(inp: PrecheckInput) -> List[Dict]:
                             "active_count": active_cnt,
                             "required_min_sum": need_sum,
                         },
+                        severity="warning",
                     )
                 )
     return issues
@@ -534,6 +539,7 @@ def check_team_shift_allowed_shortage(inp: PrecheckInput) -> List[Dict]:
                     if _active(n, d) and s in _allowed_set(n, S):
                         count += 1
                 if req > count:
+                    # team_min soft → 팀의 해당 시프트 가용 부족도 벌점 흡수. warning.
                     issues.append(
                         _issue(
                             "TEAM_SHIFT_ALLOWED_SHORTAGE",
@@ -544,6 +550,7 @@ def check_team_shift_allowed_shortage(inp: PrecheckInput) -> List[Dict]:
                                 "required": req,
                                 "allowed_count": count,
                             },
+                            severity="warning",
                         )
                     )
     return issues
@@ -703,6 +710,7 @@ def check_fixed_assign_breaks_team_min(inp: PrecheckInput) -> List[Dict]:
                     continue
                 remaining += 1
             if remaining < need_sum:
+                # team_min soft → 고정 OFF 로 팀이 min 미달이어도 벌점 흡수. warning.
                 issues.append(
                     _issue(
                         "FIXED_ASSIGN_BREAKS_TEAM_MIN",
@@ -712,89 +720,9 @@ def check_fixed_assign_breaks_team_min(inp: PrecheckInput) -> List[Dict]:
                             "remaining_members": remaining,
                             "required_min_sum": need_sum,
                         },
+                        severity="warning",
                     )
                 )
-    return issues
-
-
-def check_team_grade_intersect_shortage(inp: PrecheckInput) -> List[Dict]:
-    """Fix 3: 팀 × Grade 교차 infeasibility.
-
-    팀 t 의 shift s 요구(team_min[t,s]) 를 채울 때, 팀원 중 s 허용자를 grade 제약으로
-    cap 한 유효 배정 가능수가 요구 미달이면 infeasible.
-
-    공식:
-        for each (t, s, d) with team_min[t,s] > 0:
-            by_grade[g] = |{ n ∈ team_t : active(n,d) ∧ s∈allowed(n) ∧ grade(n)==g }|
-            effective = Σ_g min(by_grade[g], max_by_shift[s][g])   # grade 무지정은 cap 없음
-            if effective < team_min[t,s]: infeasible
-    """
-    S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
-    gc_max = (inp.grade_constraints or {}).get("max_by_shift") or {}
-    if not gc_max:
-        return []
-    members_by_team: Dict[Any, List[PrecheckNurse]] = {}
-    for n in inp.nurses:
-        if n.team_id in (None, "", 0):
-            continue
-        members_by_team.setdefault(n.team_id, []).append(n)
-    issues: List[Dict] = []
-    for tid, tmin in (inp.team_coverage or {}).items():
-        if not tmin:
-            continue
-        mems = members_by_team.get(tid, [])
-        for s in S:
-            req = int((tmin or {}).get(s, 0) or 0)
-            if req <= 0:
-                continue
-            per_grade_max_raw = gc_max.get(s) or {}
-            if not per_grade_max_raw:
-                continue  # grade 제약 없으면 B-4 가 커버
-            per_grade_max = {}
-            for g_raw, v in per_grade_max_raw.items():
-                if v is None:
-                    continue
-                try:
-                    per_grade_max[int(g_raw)] = int(v)
-                except (TypeError, ValueError):
-                    continue
-            if not per_grade_max:
-                continue
-            for d in range(inp.num_days):
-                by_grade: Dict[Any, int] = {}
-                for n in mems:
-                    if not _active(n, d):
-                        continue
-                    if s not in _allowed_set(n, S):
-                        continue
-                    g = n.grade
-                    by_grade[g] = by_grade.get(g, 0) + 1
-                effective = 0
-                for g, cnt in by_grade.items():
-                    if g is None:
-                        effective += cnt
-                        continue
-                    try:
-                        gi = int(g)
-                    except (TypeError, ValueError):
-                        effective += cnt
-                        continue
-                    cap = per_grade_max.get(gi)
-                    effective += cnt if cap is None else min(cnt, cap)
-                if effective < req:
-                    issues.append(
-                        _issue(
-                            "TEAM_GRADE_INTERSECT_SHORTAGE",
-                            {
-                                "team_id": tid,
-                                "shift": s,
-                                "day": d,
-                                "effective_capacity": effective,
-                                "required": req,
-                                "by_grade": {str(k): v for k, v in by_grade.items()},
-                            },
-                        )
-                    )
     return issues
 
 
@@ -1107,7 +1035,6 @@ def run_precheck(
         check_grade_max_sum_below_need,
         check_grade_min_available_shortage,
         check_grade_antipair_forces_shortage,
-        check_team_grade_intersect_shortage,  # Fix 3
         check_fixed_assign_breaks_team_min,
         check_monthly_night_capacity,  # Fix 1 (renamed from check_common_pool_night_capacity)
         check_daily_night_shortage,

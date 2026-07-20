@@ -106,15 +106,6 @@ _AXES: tuple[AxisDefinition, ...] = (
         matches_reason_codes=("GRADE_MAX_SUM_BELOW_NEED", "GRADE_ANTIPAIR_FORCES_SHORTAGE"),
     ),
     AxisDefinition(
-        axis_id="team_grade_handoff",
-        family="TeamGradeHandoff",
-        lock_type="capacity_shortage",
-        label_ko="팀-등급 교차 분배",
-        config_lever={"path": "team_grade_handoff", "key": "*", "action": "disable_or_soften"},
-        direction_hint="review",
-        matches_reason_codes=("TEAM_GRADE_INTERSECT_SHORTAGE",),
-    ),
-    AxisDefinition(
         axis_id="monthly_n_cap",
         family="MonthlyNightCap",
         lock_type="capacity_shortage",

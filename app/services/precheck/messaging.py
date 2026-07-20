@@ -78,9 +78,9 @@ _MESSAGES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "TEAM_MIN_EXCEEDS_GLOBAL_NEED": {
-        "msg": "팀별 최소 인원 합계가 해당 시프트의 일별 요구 인원을 초과합니다.",
+        "msg": "한 팀의 최소 인원이 해당 시프트의 일별 요구 인원보다 커서 그 팀만으로는 다 채울 수 없습니다.",
         "fix": [
-            "팀별 최소 인원을 낮추세요.",
+            "해당 팀의 최소 인원을 낮추세요.",
             "일별 요구 인원을 늘리세요.",
         ],
     },
@@ -116,12 +116,6 @@ _MESSAGES: Dict[str, Dict[str, Any]] = {
         "msg": "Grade anti-pair(상한) 제약 + min 제약이 같은 일/시프트에서 서로 충돌해 충족이 불가능합니다.",
         "fix": [
             "Grade max 또는 min 중 하나를 완화하세요.",
-        ],
-    },
-    "TEAM_GRADE_INTERSECT_SHORTAGE": {
-        "msg": "특정 팀과 Grade 교집합 간호사가 해당 시프트 동시 요구를 못 채웁니다.",
-        "fix": [
-            "팀/Grade 분배를 재구성하거나 두 제약 중 하나를 낮추세요.",
         ],
     },
     "FIXED_ASSIGN_BREAKS_TEAM_MIN": {

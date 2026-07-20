@@ -125,7 +125,10 @@ def add_team_min_constraints(
                 if min_t <= 0:
                     continue
                 active = [n for n in team_members[tid] if join[n] <= d <= leave[n]]
-                if not active:
+                # capacity 가드: 활성 멤버가 min_t 보다 적으면 이 팀은 그날 자기 몫을
+                # 채울 수 없으므로 target 카운트에서 제외(hard 모드 헛 infeasible 방지).
+                # min_t=1 이면 `len(active) < 1` == `not active` 로 기존 동작과 동일.
+                if len(active) < min_t:
                     continue
                 member_sum = sum(X(n, d, s_idx) for n in active)
                 present = m.NewBoolVar(f"tmin_present_t{tid}_d{d}_s{s_idx}")

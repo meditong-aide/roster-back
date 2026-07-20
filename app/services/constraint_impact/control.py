@@ -70,7 +70,6 @@ _FAMILY_ACTION_MATRIX: dict[str, set[str]] = {
     "TeamMin": {"disable_module", "force_soft_mode", "set_threshold", "narrow_scope"},
     "GradeMin": {"disable_module", "force_soft_mode"},
     "GradeMax": {"disable_module", "force_soft_mode"},
-    "TeamGradeHandoff": {"force_soft_mode"},
     "CoverageMin": {"set_threshold"},
     "BoundaryTransitionBan": {"disable_module"},
     "ConsecutiveWorkLimit": {"set_threshold"},
@@ -150,8 +149,6 @@ def _module_mode_estimate(family: str, snapshot: SemanticsSnapshot) -> str:
         if family == "GradeMin" and bool(cfg.get("_force_grade_min_soft_fallback", False)):
             return "soft_fallback"
         return "soft_fallback" if bool(gc.get("allow_soft_fallback", False)) else "enforced"
-    if family == "TeamGradeHandoff":
-        return "soft_fallback" if bool(cfg.get("team_handoff_soft_fallback", False)) else "enforced"
     if family == "BoundaryTransitionBan":
         any_active = (
             bool(cfg.get("ban_n_to_d", True))
@@ -318,13 +315,6 @@ def _apply_grade(family: str, cfg: dict[str, Any], adj: ConstraintAdjustment) ->
     raise ValueError(f"unsupported {family} action: {adj.action}")
 
 
-def _apply_team_grade_handoff(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
-    if adj.action == "force_soft_mode":
-        cfg["team_handoff_soft_fallback"] = True
-        return
-    raise ValueError(f"unsupported TeamGradeHandoff action: {adj.action}")
-
-
 def _apply_boundary_transition(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
     if adj.action == "disable_module":
         cfg["ban_n_to_d"] = False
@@ -400,7 +390,6 @@ _DISPATCH: dict[str, Any] = {
     "TeamMin": _apply_team_min,
     "GradeMin": lambda cfg, adj: _apply_grade("GradeMin", cfg, adj),
     "GradeMax": lambda cfg, adj: _apply_grade("GradeMax", cfg, adj),
-    "TeamGradeHandoff": _apply_team_grade_handoff,
     "BoundaryTransitionBan": _apply_boundary_transition,
     "ConsecutiveWorkLimit": lambda cfg, adj: _apply_consec(cfg, "max_consecutive_work_days", adj),
     "ConsecutiveNightLimit": lambda cfg, adj: _apply_consec(cfg, "max_consecutive_nights", adj),

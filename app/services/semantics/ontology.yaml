@@ -119,19 +119,6 @@ constraints:
     tier: T2
     scope_explosion: high
 
-  TeamGradeHandoff:
-    label: Team Grade Handoff
-    parent: CoverageConstraint
-    scope: [team, grade, day, shift]
-    effective_modes: [enforced, soft_fallback, inactive]
-    connects: [AssignmentAtom, Team, Grade, Day, Shift]
-    explanation_template: "{team} 내 {grade} 간 handoff 제약이 적용됩니다."
-    aliases: [TEAM_GRADE_INTERSECT_SHORTAGE]
-    default_severity: hard
-    relaxation_priority: 1
-    tier: T2
-    scope_explosion: medium
-
   ConsecutiveWorkLimit:
     label: Consecutive Work Limit
     parent: NurseLocalConstraint
@@ -851,16 +838,6 @@ treatments:
     rationale_ko: "팀 최소 인원이 반드시 지켜지지 않을 수 있지만 최대한 충족하도록 노력합니다. 일부 시프트에서 팀 부족이 발생할 수 있습니다."
     trade_off_ko: "특정 시프트에서 팀 인원이 min 보다 1~2명 부족할 수 있음. 인계 시 주의 필요."
     applies_to_causes: [cause:team:min_over_need]
-
-  treatment:soft:handoff:
-    label: "팀-등급 인계 제약을 soft"
-    action_type: force_soft_mode
-    target_family: TeamGradeHandoff
-    config_key: team_handoff_soft_fallback
-    direction: enable
-    rationale_ko: "팀-등급 인계 일관성 제약을 soft. 인계 품질이 일부 저하될 수 있음."
-    trade_off_ko: "인계 셋이 부분적으로 깨질 수 있음. 안전 운영 매뉴얼로 보정."
-    applies_to_causes: [cause:grade:max_sum_below_need, cause:team:min_over_need]
 
   treatment:disable:team_min:
     label: "팀 최소 인원 비활성화"
