@@ -200,8 +200,13 @@ def _apply_month(db, office_id, group_id, params, counts) -> Any:
     }
     new = {"D": bulk["D_count"], "E": bulk["E_count"], "N": bulk["N_count"]}
     if params.get("preview_only", True):
+        # from(현재값) 포함 — staleness 지문이 승인→커밋 사이 현재상태 변화를 감지하도록.
+        # (day-scope 와 동일. 없으면 target-only 라 월 일괄 drift 가 지문에 안 잡힘.)
+        old = {"D": int(cur.get("D_count", 0) or 0), "E": int(cur.get("E_count", 0) or 0),
+               "N": int(cur.get("N_count", 0) or 0)}
         return {"preview": True, "operation": "set_daily_shift", "scope": "month",
-                "summary": {"month": f"{y}-{int(m):02d}", "to": new, "note": "전 날짜 일괄 + 기본 인원(manpower) 동기"}}
+                "summary": {"month": f"{y}-{int(m):02d}", "from": old, "to": new,
+                            "note": "전 날짜 일괄 + 기본 인원(manpower) 동기"}}
     # apply_globally=True → DailyShift 전 날짜 + ShiftManage.manpower(fallback) 동기.
     daily_shift_service.apply_bulk_to_days(
         db, office_id=office_id, group_id=group_id, year=int(y), month=int(m),

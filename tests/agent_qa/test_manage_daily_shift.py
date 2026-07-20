@@ -39,6 +39,16 @@ def test_readback_catches_false_complete(db, seed_data, monkeypatch):
     assert classify(res.data) is ErrorType.VERIFICATION_FAILED
 
 
+def test_month_preview_includes_from_for_staleness(db, seed_data):
+    # month-scope 미리보기 summary 에 현재값(from) 이 있어야 staleness 지문이 drift 를 감지.
+    res = execute_skill(db, "manage_daily_shift",
+                        {"scope": "month", "n_count": 3, "preview_only": True}, _hn())
+    s = res.data["summary"]
+    assert res.data.get("preview") is True and res.data["scope"] == "month"
+    assert "from" in s and set(s["from"]) == {"D", "E", "N"}, f"from 누락: {s}"
+    assert s["to"] == {"D": s["from"]["D"], "E": s["from"]["E"], "N": 3}  # 준 N만 바뀌고 나머지 유지
+
+
 def test_month_apply_bulk(db, seed_data):
     res = execute_skill(db, "manage_daily_shift",
                         {"scope": "month", "n_count": 3, "preview_only": False}, _hn())
