@@ -609,6 +609,10 @@ class CPSATBasicEngine:
             # 연속근무 소프트 상한(없으면 hard와 동일)
             soft_max_consecutive_work_days=int(config_data.get("soft_max_consecutive_work_days", max_conseq_work) or max_conseq_work),
             soft_consecutive_work_penalty_weight=int(config_data.get("soft_consecutive_work_penalty_weight", 180) or 0),
+            # 연속 OFF 최대 개수(roster_config.max_conseq_off, 기본 3) — 4연속+ 고weight soft 벌점, 불가피 시 양보
+            # (NULL/0/미설정은 기본 3 적용)
+            max_conseq_off=int(config_data.get("max_conseq_off") or 3),
+            max_conseq_off_penalty_weight=int(config_data.get("max_conseq_off_penalty_weight", 5000) or 0),
             # 같은 시프트(D/E/N) 연속 ≤3 soft
             max_same_shift=bool(config_data.get("max_same_shift", True)),
             max_same_shift_penalty_weight=int(config_data.get("max_same_shift_penalty_weight", 300) or 0),

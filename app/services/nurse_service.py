@@ -534,6 +534,10 @@ def attach_n_exact_to_nurses(
     nids = [n.get("nurse_id") for n in nurses if isinstance(n, dict) and n.get("nurse_id")]
     if not nids:
         return nurses
+    # as-of 이월: 대상월 이하 '가장 최근' 행을 (nurse, group)별 1건으로 주입한다.
+    # 월별 재설정을 안 해도 마지막 설정이 목록에 유지돼 보인다(생성 로더와 동일 의미).
+    # (nurse_id, group_id) 스코프는 그대로 — inbound 간호사가 home 그룹 한도를 끌어오지 않음.
+    _target_ym = int(year) * 12 + int(month)
     rows = (
         db.query(
             NurseMonthlyLimit.nurse_id,
@@ -542,15 +546,19 @@ def attach_n_exact_to_nurses(
             NurseMonthlyLimit.n_max,
         )
         .filter(
-            NurseMonthlyLimit.year == int(year),
-            NurseMonthlyLimit.month == int(month),
+            (NurseMonthlyLimit.year * 12 + NurseMonthlyLimit.month) <= _target_ym,
             NurseMonthlyLimit.nurse_id.in_(nids),
         )
+        .order_by(NurseMonthlyLimit.year.desc(), NurseMonthlyLimit.month.desc())
         .all()
     )
     exact_map: dict = {}
     max_map: dict = {}
+    _seen_ng: set = set()
     for nid, gid, n_exact, n_max in rows:
+        if (nid, gid) in _seen_ng:
+            continue  # 이미 더 최근(대상월에 가까운) 행을 채택
+        _seen_ng.add((nid, gid))
         exact_map[(nid, gid)] = n_exact
         max_map[(nid, gid)] = n_max
     for n in nurses:

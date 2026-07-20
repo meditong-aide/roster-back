@@ -69,6 +69,11 @@ class NurseRosterConfig:
     shift_cap_weight: int = 500000
     soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
     soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
+    # 연속 OFF 최대 개수(max_conseq_off). 기본 3 = 4연속+ OFF만 벌점, 3 이하는 전부 무차별.
+    # (k+1)연속 OFF마다 고weight 벌점 → hard처럼 억제하되, OFF 과잉 등으로 불가피하면
+    # 양보한다(soft라 절대 infeasible 유발 안 함). ORM 컬럼 max_conseq_off 와 동명.
+    max_conseq_off: int = 3
+    max_conseq_off_penalty_weight: int = 5000
     # 같은 시프트(D/E/N) 연속 ≤3 soft. True면 4연속 같은 시프트 (예: D D D D)에 패널티.
     max_same_shift: bool = True
     max_same_shift_penalty_weight: int = 10000

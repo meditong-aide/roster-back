@@ -84,7 +84,6 @@ def _infer_failure_stage(
             "GLOBAL_DAY_CAPACITY_SHORTAGE",
             "TEAM_MIN_EXCEEDS_GLOBAL_NEED",
             "GRADE_MIN_SUM_EXCEEDS_NEED",
-            "TEAM_GRADE_INTERSECT_SHORTAGE",
         }
         or (shifts & {"D", "E", "M"})
     ):
@@ -127,7 +126,6 @@ def _axis_in_stage_scope(axis_id: str, stage: str) -> bool:
             "team_min",
             "grade_min",
             "grade_max",
-            "team_grade_handoff",
             "fixed_excess",
             "fixed_violates_allowed",
             "fixed_breaks_team_min",

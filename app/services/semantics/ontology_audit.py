@@ -164,7 +164,6 @@ _FAMILY_TO_MUS_TOKENS: dict[str, list[str]] = {
     "TeamMin":                 ["TeamMin", "team_min"],
     "GradeMin":                ["GradeMin", "grade_min"],
     "GradeMax":                ["GradeMax", "grade_max"],
-    "TeamGradeHandoff":        ["HandoffAdj", "HandoffSame", "handoff_adj", "handoff_same"],
     "ConsecutiveWorkLimit":    ["MaxConsecutiveWork", "max_consecutive_work"],
     "ConsecutiveNightLimit":   ["ConsecutiveNightCap", "consecutive_night_cap"],
     "NightRecovery":           ["Recovery2N2OFF", "Recovery3N2OFF", "recovery_2n2off", "recovery_3n2off"],

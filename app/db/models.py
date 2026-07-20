@@ -558,6 +558,8 @@ class RosterConfig(Base):
     banned_day_after_eve = Column(BOOLEAN)
     max_conseq_work = Column(INTEGER)
     off_days = Column(INTEGER)
+    # 연속 OFF 최대 개수(soft 상한). NULL=앱 기본 3 적용. (k+1)연속 OFF 고weight 벌점, 불가피 시 양보.
+    max_conseq_off = Column(INTEGER, nullable=True)
     shift_priority = Column(FLOAT)
     weekend_shift_ratio = Column(FLOAT)
     patient_amount = Column(INTEGER)

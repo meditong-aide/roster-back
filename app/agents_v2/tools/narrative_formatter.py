@@ -18,7 +18,6 @@ _CAUSE_CODE_KO: dict[str, str] = {
     "TEAM_ACTIVE_MEMBERS_INSUFFICIENT": "팀 활성 인원 부족",
     "TEAM_SHIFT_ALLOWED_SHORTAGE": "팀 시프트 허용 인원 부족",
     "TEAM_MIN_EXCEEDS_GLOBAL_NEED": "팀 최소 인원이 전체 필요 인원 초과",
-    "TEAM_GRADE_INTERSECT_SHORTAGE": "팀·직급 교집합 인원 부족",
     "GRADE_MAX_SUM_BELOW_NEED": "직급 최대 인원이 필요 인원 미달",
     "GRADE_MIN_AVAILABLE_SHORTAGE": "직급 가용 인원 부족",
     "MONTHLY_NIGHT_CAPACITY": "월간 야간 가능 인원 부족",

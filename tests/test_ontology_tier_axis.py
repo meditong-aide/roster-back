@@ -68,7 +68,6 @@ def test_axis_registry_has_expected_axes():
         "team_min",
         "grade_min",
         "grade_max",
-        "team_grade_handoff",
         "monthly_n_cap",
         "off_cap",
         "allowed_shift_mask",
@@ -335,7 +334,6 @@ def test_fix_plan_axis_sorted_by_priority_asc():
             {"reason_code": "NO_ASSIGNMENT_CAPACITY"},
             {"reason_code": "TEAM_MIN_EXCEEDS_GLOBAL_NEED"},  # team_min prio=2
             {"reason_code": "GRADE_MIN_SUM_EXCEEDS_NEED"},   # grade_min prio=3
-            {"reason_code": "TEAM_GRADE_INTERSECT_SHORTAGE"}, # team_grade_handoff prio=1
         ],
     )
     priorities = [a["relaxation_priority"] for a in p["axis_actions"]]

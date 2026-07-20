@@ -178,10 +178,10 @@ def test_violation_delta_counts_duplicate_codes():
 # ─────────────────────────────────────────────────────────────────────────
 def test_detect_new_causes_finds_side_effect():
     before = [{"reason_code": "GRADE_MAX_SUM_BELOW_NEED"}]
-    after = [{"reason_code": "TEAM_GRADE_INTERSECT_SHORTAGE"}]
+    after = [{"reason_code": "TEAM_MIN_EXCEEDS_GLOBAL_NEED"}]
     new = detect_new_causes(before, after)
     assert len(new) == 1
-    assert new[0]["reason_code"] == "TEAM_GRADE_INTERSECT_SHORTAGE"
+    assert new[0]["reason_code"] == "TEAM_MIN_EXCEEDS_GLOBAL_NEED"
 
 
 def test_detect_new_causes_returns_empty_when_subset():
@@ -244,14 +244,14 @@ def test_evidence_detects_new_cause_as_side_effect():
     ev = build_evidence_from_apply(
         apply_result=apply_r,
         before_causes=[{"reason_code": "GRADE_MAX_SUM_BELOW_NEED"}],
-        after_causes=[{"reason_code": "TEAM_GRADE_INTERSECT_SHORTAGE"}],
+        after_causes=[{"reason_code": "TEAM_MIN_EXCEEDS_GLOBAL_NEED"}],
         solver_status="FEASIBLE",
         witness_schedule_id="sched_44",
     )
-    # GRADE_MAX 해소됐지만 TEAM_GRADE_INTERSECT 새로 등장 → PARTIAL
+    # GRADE_MAX 해소됐지만 TEAM_MIN 새로 등장 → PARTIAL
     assert ev["status"] == "PARTIAL"
     assert len(ev["new_causes"]) == 1
-    assert ev["new_causes"][0]["reason_code"] == "TEAM_GRADE_INTERSECT_SHORTAGE"
+    assert ev["new_causes"][0]["reason_code"] == "TEAM_MIN_EXCEEDS_GLOBAL_NEED"
 
 
 def test_evidence_includes_manual_required_when_present():

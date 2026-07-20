@@ -132,22 +132,6 @@ constraints:
     runtime_lever: false
     runtime_note: "운영 미사용 family — 사용자/엔진 어느 쪽도 활용 안 함."
 
-  TeamGradeHandoff:
-    label: Team Grade Handoff
-    parent: CoverageConstraint
-    scope: [team, grade, day, shift]
-    effective_modes: [enforced, soft_fallback, inactive]
-    connects: [AssignmentAtom, Team, Grade, Day, Shift]
-    explanation_template: "{team} 내 {grade} 간 handoff 제약이 적용됩니다."
-    aliases: [TEAM_GRADE_INTERSECT_SHORTAGE]
-    default_severity: hard
-    relaxation_priority: 1
-    tier: T2
-    scope_explosion: medium
-    # [2026-06-19] 운영 미사용 family. resolve_infeasibility 옵션 노출 금지.
-    runtime_lever: false
-    runtime_note: "운영 미사용 family — 사용자/엔진 어느 쪽도 활용 안 함."
-
   ConsecutiveWorkLimit:
     label: Consecutive Work Limit
     parent: NurseLocalConstraint
@@ -877,19 +861,6 @@ treatments:
     # 사용자 토글 없음. resolve_infeasibility 에서 옵션으로 노출 금지.
     runtime_lever: false
     runtime_note: "엔진 자동 처리 — 사용자 lever 아님."
-
-  treatment:soft:handoff:
-    label: "팀-등급 인계 제약을 soft"
-    action_type: force_soft_mode
-    target_family: TeamGradeHandoff
-    config_key: team_handoff_soft_fallback
-    direction: enable
-    rationale_ko: "팀-등급 인계 일관성 제약을 soft. 인계 품질이 일부 저하될 수 있음."
-    trade_off_ko: "인계 셋이 부분적으로 깨질 수 있음. 안전 운영 매뉴얼로 보정."
-    applies_to_causes: [cause:grade:max_sum_below_need, cause:team:min_over_need]
-    # [2026-06-19] TeamGradeHandoff family 운영 미사용. lever 효력 없음.
-    runtime_lever: false
-    runtime_note: "운영 미사용 family — lever 효력 없음."
 
   treatment:disable:team_min:
     label: "팀 최소 인원 비활성화"
