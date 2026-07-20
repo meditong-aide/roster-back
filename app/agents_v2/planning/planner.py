@@ -95,12 +95,21 @@ def _parse_plan(text: str) -> Plan | None:
     return Plan(tasks=tasks)
 
 
-def build_plan(llm: Any, user_message: str, skill_tools: list[dict]) -> Plan | None:
-    """요청 → DAG plan. 의존 복합만 다중 task, 그 외 None(ReAct fallback)."""
+def build_plan(llm: Any, user_message: str, skill_tools: list[dict],
+               *, feedback: str | None = None) -> Plan | None:
+    """요청 → DAG plan. 의존 복합만 다중 task, 그 외 None(ReAct fallback).
+
+    feedback: 직전 plan 실행이 실패했을 때 그 관찰(어느 task 가 왜 실패, 이전 구조)을 넣어
+    **교정된 plan** 을 다시 만들게 한다(LLMCompiler replan). 여전히 교정 불가면 None → ReAct.
+    """
     sys = _PLANNER_SYS + _skills_brief(skill_tools)
+    user = user_message
+    if feedback:
+        user = (f"{user_message}\n\n[직전 계획 실행 실패 — 교정해서 다시 계획하라]\n{feedback}\n"
+                "위 실패를 피하도록 args/스킬/의존을 고쳐라. 교정이 불가능하면 {\"tasks\": []} 를 반환하라.")
     try:
         resp = llm.chat(
-            [{"role": "system", "content": sys}, {"role": "user", "content": user_message}],
+            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
             tools=[],
         )
     except Exception as e:  # noqa: BLE001

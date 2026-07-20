@@ -45,24 +45,55 @@ class PlanRun:
         return self.exec.failed is not None
 
 
+def _replan_feedback(run: PlanRun) -> str:
+    """실패 관찰 → planner 피드백 문자열. 어느 task 가 왜 실패했는지 + 시도한 구조."""
+    f = run.exec.failed or {}
+    data = f.get("data") or {}
+    reason = data.get("error") or data.get("question") or data.get("block_reason") or "알 수 없는 오류"
+    tried = [{"id": t.id, "skill": t.skill, "kind": t.kind, "deps": t.deps, "args": t.args}
+             for t in run.plan.tasks]
+    return (f"- 실패 task: {f.get('task')} (skill={f.get('skill')})\n"
+            f"- 실패 사유: {reason}\n"
+            f"- 시도한 계획: {json.dumps(tried, ensure_ascii=False, default=str)[:1500]}")
+
+
 def try_plan_run(
     db: Any, user_message: str, ctx: Any,
     planner_llm: Any, skill_tools: list[dict],
     execute_fn: Callable[[Any, str, dict, Any], Any],
     *,
     session_factory: Callable[[], Any] | None = None,
+    max_replans: int = 1,
 ) -> PlanRun | None:
     """의존 복합이면 plan 생성·실행(mutate=dry-run). 아니면 None(ReAct fallback).
 
     session_factory: 주면 레벨 내 read 를 세션 격리 병렬 실행(mutate 는 순차).
+    max_replans: dry-run 실행이 실패하면 실패 관찰을 planner 에 피드백해 **교정 plan** 을
+        최대 이 횟수만큼 재시도(LLMCompiler replan). 여전히 실패하면 그 실패 run 반환(→ ReAct).
+        preview 단계라 mutate 는 preview_only=True → 재시도해도 실제 반영 없음(안전).
     """
     plan = build_plan(planner_llm, user_message, skill_tools)
     if plan is None:
         return None
     logger.info("[plan] %d tasks: %s", len(plan.tasks),
                 [(t.id, t.skill, t.kind, t.deps) for t in plan.tasks])
-    return PlanRun(plan=plan, exec=execute_plan(
+    run = PlanRun(plan=plan, exec=execute_plan(
         db, plan, ctx, execute_fn, session_factory=session_factory))
+
+    attempts = 0
+    while run.failed and attempts < max_replans:
+        attempts += 1
+        feedback = _replan_feedback(run)
+        logger.info("[replan] 시도 %d/%d — 실패 task=%s",
+                    attempts, max_replans, (run.exec.failed or {}).get("task"))
+        new_plan = build_plan(planner_llm, user_message, skill_tools, feedback=feedback)
+        if new_plan is None:
+            break  # 교정 불가(planner 가 포기) → 기존 실패 run 유지 → ReAct
+        logger.info("[replan] 교정 plan %d tasks: %s", len(new_plan.tasks),
+                    [(t.id, t.skill, t.kind, t.deps) for t in new_plan.tasks])
+        run = PlanRun(plan=new_plan, exec=execute_plan(
+            db, new_plan, ctx, execute_fn, session_factory=session_factory))
+    return run
 
 
 def join_answer(llm: Any, user_message: str, run: PlanRun, correction: str | None = None) -> str:
