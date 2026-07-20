@@ -4423,7 +4423,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4751,6 +4751,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
+    # 런타임 config override(비-DB-컬럼 solver 파라미터 포함) — apply-resolution의 probe/비컬럼 옵션이
+    # DB 커밋 없이 이번 생성에만 완화값을 주입할 때 사용. config_dict 최종 병합(가장 우선).
+    if config_override:
+        config_dict.update(config_override)
     # 인바운드 간호사의 source group 매핑 → cross-month tail 보충용
     if _inbound_assignments:
         config_dict["_inbound_source_map"] = {

@@ -23,6 +23,10 @@ class NurseRosterConfig:
     max_consecutive_work_days: int = 6  # 최대 연속 근무일 수
     enforce_two_offs_per_week: bool = False  # 주당 2일 휴무 적용 여부
     banned_day_after_eve: bool = True  # E → D 근무 금지 (법규)
+    # 야간 전이 금지(기본 True). cp_sat_basic/fallback_lex 가 config_data/getattr 로 읽음.
+    # dataclass 필드로 선언해 apply-resolution config_override 화이트리스트에 포함(비-DB-컬럼).
+    ban_n_to_d: bool = True  # N → D 전이 금지
+    ban_n_to_e: bool = True  # N → E 전이 금지
     
     # 병원 내규 (소프트 제약)
     sequential_offs: bool = True  # OFF 연속 배정

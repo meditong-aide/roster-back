@@ -41,6 +41,17 @@ RELAX_CATALOG: list[dict[str, Any]] = [
      "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)}},
     {"id": "disable_preceptee_sync", "family": "coupling", "label_ko": "프리셉티 동반(팔로우) 해제",
      "apply": lambda c: {"preceptee_on": False}},
+    # ── verified 승격(2026-07-20): 기존엔 온톨로지 treatment(verified:false)만 있던 완화들.
+    # probe로 추가해 "재solve로 feasible 확인됨"(verified:true) 승격. apply 키는 비-DB-컬럼
+    # (솔버 config)이라 apply-resolution이 config_override 경로로 라우팅해야 클릭 적용됨.
+    {"id": "disable_weekend_off_only", "family": "weekend_off", "label_ko": "주말휴무 전용 해제",
+     "apply": lambda c: {"weekend_off_only_enable": False}},
+    {"id": "disable_ban_n_to_d", "family": "transition", "label_ko": "야간→주간 전이 금지 해제",
+     "apply": lambda c: {"ban_n_to_d": False}},
+    {"id": "disable_ban_n_to_e", "family": "transition", "label_ko": "야간→저녁 전이 금지 해제",
+     "apply": lambda c: {"ban_n_to_e": False}},
+    {"id": "soften_team_min", "family": "team", "label_ko": "팀 최소 인원 soft 완화",
+     "apply": lambda c: {"team_min_soft_fallback": True}},
 ]
 
 
@@ -56,6 +67,10 @@ TRADEOFF_KO: dict[str, str] = {
     "disable_banned_day_after_eve": "이브닝 다음날 데이 전이가 생길 수 있습니다.",
     "lower_off_days": "월 휴무일이 줄어듭니다.",
     "disable_preceptee_sync": "프리셉티가 프리셉터와 동반(팔로우)하지 않게 됩니다(교육 동반 약화).",
+    "disable_weekend_off_only": "주말휴무 대상자가 평일에도 OFF를 받거나 주말에 근무할 수 있습니다.",
+    "disable_ban_n_to_d": "야간 다음날 주간 전이가 생길 수 있습니다.",
+    "disable_ban_n_to_e": "야간 다음날 저녁 전이가 생길 수 있습니다.",
+    "soften_team_min": "특정 시프트에서 팀 인원이 최소치보다 1~2명 부족할 수 있습니다(인계 시 주의).",
 }
 COL_LABEL_KO: dict[str, str] = {
     "max_nig_per_month": "월 야간 상한", "two_offs_after_two_nig": "2N→2OFF 회복",
@@ -63,6 +78,8 @@ COL_LABEL_KO: dict[str, str] = {
     "not_one_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
     "banned_day_after_eve": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
     "max_consecutive_nights": "연속 야간 상한", "preceptee_on": "프리셉티 동반(팔로우)",
+    "weekend_off_only_enable": "주말휴무 전용", "ban_n_to_d": "N→D 전이 금지",
+    "ban_n_to_e": "N→E 전이 금지", "team_min_soft_fallback": "팀 최소 soft 완화",
 }
 
 
