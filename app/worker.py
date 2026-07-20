@@ -268,13 +268,18 @@ def process_job(payload: dict) -> dict:
         exc_obj = sys.exc_info()[1]
         # generate_roster_service 가 raise 한 구조화 infeasibility payload 가 있으면
         # error_message 에 JSON 으로 보존 → get_job_status 가 narrative 추출 가능.
-        if isinstance(exc_obj, _HTTPException) and isinstance(exc_obj.detail, dict):
+        _has_struct_detail = isinstance(exc_obj, _HTTPException) and isinstance(exc_obj.detail, dict)
+        if _has_struct_detail:
             try:
                 err_msg = _json.dumps(exc_obj.detail, ensure_ascii=False)
             except (TypeError, ValueError):
                 err_msg = str(exc_obj.detail)
         else:
             err_msg = str(exc_obj)
+        # precheck 산술 블로킹·UNRECOVERABLE 등 "결정론적 infeasibility"는 재시도해도
+        # 반드시 동일하게 실패한다(transient 아님). 아래에서 ack(정상 반환)로 종료하여
+        # SQS 좀비 재시도와 중복 Slack 알림을 원천 차단한다. ValueError 와 동일한 정책.
+        is_deterministic_infeasible = _has_struct_detail and "infeasibility" in exc_obj.detail
         # JSON structured log + traceback (powertools 가 stack_trace 자동 포함)
         logger.exception("작업 실패", extra={"error_message": err_msg})
         # stdout 에도 traceback 출력 (기존 호환)
@@ -320,7 +325,16 @@ def process_job(payload: dict) -> dict:
             month=getattr(req, "month", None),
             error_message=err_msg,
         )
-        # transient 오류(DB 일시 단절, 네트워크 등)도 영구 ack 되지 않도록 caller에 전파한다.
+        # 결정론적 infeasibility 는 재시도 무의미 → ack(정상 반환)로 SQS 메시지 삭제.
+        # DB 에는 이미 STATUS_FAILED + narrative 가 기록되어 프론트 조회에는 영향이 없다.
+        if is_deterministic_infeasible:
+            print(
+                f"[worker] 결정론적 infeasibility → 재시도 안 함(ack). job_id={job_id}",
+                file=sys.stderr,
+            )
+            return {"status": "failed", "job_id": job_id, "infeasible": True, "retriable": False}
+        # 그 외(DB 일시 단절·네트워크 등 transient 가능)는 caller 에 전파하여
+        # 영구 손실 없이 SQS 재시도되도록 한다.
         raise
 
     finally:
