@@ -45,7 +45,9 @@ def test_all_tools_covered():
     # switch_ward client-action (2026-06-24) → 20.
     # invoke client-action (2026-07-07, 엑셀 등 비파괴 UI 명령) → 21.
     # manage_assignment (2026-07-08, 매니페스트 첫 시민, 파견) → 22.
-    assert len(ALL_TOOL_NAMES) == 23
+    # lookup_guide (help-doc RAG) → 23.
+    # manage_daily_shift (2026-07, 시프트별 필요인원=DailyShift) → 24.
+    assert len(ALL_TOOL_NAMES) == 24
     missing = set(ALL_TOOL_NAMES) - covered
     assert not missing, f"카테고리 미커버 tool: {missing}"
     # 맵의 tool 이름이 전부 실제 tool 이름인지(오타 방지)
