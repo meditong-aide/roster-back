@@ -33,10 +33,14 @@ _STOP = {ErrorType.GENERIC_ERROR, ErrorType.VERIFICATION_FAILED,
 
 def _run_task(db: Any, task: PlanTask, ctx: Any, execute_fn, outputs: dict,
               dry_run: bool) -> tuple[Any, dict]:
-    """단일 task 실행 — 참조 치환 + (mutate·dry_run 이면) preview_only 주입. (data, args) 반환."""
+    """단일 task 실행 — 참조 치환 + mutate 면 preview_only **명시 주입**. (data, args) 반환.
+
+    dry_run=True → preview_only=True(미리보기), False → preview_only=False(실제 적용).
+    planner 가 args 에 넣은 값에 의존하지 않도록 실행단계가 강제한다(commit 인데 미리보기만 되는 버그 방지).
+    """
     args = resolve_args(task.args, outputs)
-    if task.kind == "mutate" and dry_run:
-        args = {**args, "preview_only": True}
+    if task.kind == "mutate":
+        args = {**args, "preview_only": dry_run}
     raw = execute_fn(db, task.skill, args, ctx)
     return getattr(raw, "data", raw), args
 

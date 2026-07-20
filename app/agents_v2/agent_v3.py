@@ -232,27 +232,54 @@ class SchedulingAgent:
     def _commit_plan(self, db, user_message, ctx, messages):
         """계획 승인 후 mutate 를 위상순서로 실제 commit(dry_run 해제) → 답변 합성."""
         from agents_v2.middleware import execute_skill
-        from agents_v2.planning.executor import execute_plan
+        from agents_v2.planning.executor import PlanExecResult, execute_plan
         from agents_v2.planning.orchestrate import PlanRun, join_answer
         from agents_v2.planning.plan import Plan
-        from db.client2 import SessionLocal
 
         pending = ctx.pending_approval or {}
         plan = Plan.from_dict(pending.get("plan") or {})
         orig = pending.get("user_message", user_message)
         ctx.pending_approval = None
-        exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False,
-                                session_factory=SessionLocal)  # read 병렬, mutate 순차
-        trace = [Stage("plan_commit", "error" if exec_res.failed else "ok",
-                       {"order": exec_res.order}, 0)]
+
+        # ── 원자성: 플랜의 전 mutation 을 한 트랜잭션으로 ──
+        # 스킬/서비스가 내부에서 부르는 db.commit() 을 flush() 로 리다이렉트해 트랜잭션을 유지.
+        # 전부 성공 → 한 번에 commit / 하나라도 실패(read-back 위반 포함) → rollback(부분 반영 방지).
+        # commit 단계는 순차·단일세션(원자성·일관성 우선; 병렬 read 는 dry-run 단계에서 이미 활용).
+        _real_commit = db.commit
+        db.commit = db.flush  # type: ignore[method-assign]
+        try:
+            exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False)
+        except Exception as e:  # noqa: BLE001
+            exec_res = PlanExecResult(failed={"task": "plan", "skill": "", "data": {"error": str(e)}})
+        finally:
+            db.commit = _real_commit  # type: ignore[method-assign]
+
         if exec_res.failed:
-            err = (exec_res.failed.get("data") or {})
-            return AgentResult(answer=f"실행 중 문제가 발생했습니다: {err.get('error', '')}",
-                               trace=trace, messages=messages, variable_memory=ctx.variable_memory)
+            try:
+                db.rollback()  # 전체 되돌림 — 부분 반영 없음
+            except Exception:  # noqa: BLE001
+                pass
+            err = exec_res.failed.get("data") or {}
+            reason = err.get("error") or err.get("question") or "알 수 없는 오류"
+            return AgentResult(
+                answer=f"실행 중 문제가 있어 **전체 취소(롤백)**했습니다 — 부분 반영 없음. ({reason})",
+                trace=[Stage("plan_commit", "error",
+                             {"order": exec_res.order, "atomic": "rolled_back"}, 0)],
+                messages=messages, variable_memory=ctx.variable_memory)
+        try:
+            db.commit()  # 전 mutation 원자 커밋
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            return AgentResult(
+                answer=f"커밋 중 오류로 **전체 취소**했습니다: {e}",
+                trace=[Stage("plan_commit", "error", {"atomic": "rolled_back"}, 0)],
+                messages=messages, variable_memory=ctx.variable_memory)
         run = PlanRun(plan=plan, exec=exec_res)
         last = exec_res.outputs.get(plan.tasks[-1].id) if plan.tasks else None
-        return AgentResult(answer=join_answer(self.llm, orig, run), trace=trace,
-                           messages=messages, variable_memory=ctx.variable_memory, data=last)
+        return AgentResult(
+            answer=join_answer(self.llm, orig, run),
+            trace=[Stage("plan_commit", "ok", {"order": exec_res.order, "atomic": "committed"}, 0)],
+            messages=messages, variable_memory=ctx.variable_memory, data=last)
 
     def _run_impl(
         self,
