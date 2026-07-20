@@ -32,6 +32,10 @@ ruff.toml
 # Editor / IDE
 .obsidian/
 
+# macOS
+.DS_Store
+**/.DS_Store
+
 # Harness run artifacts (generated)
 tools/harness/reports/
 
