@@ -30,6 +30,10 @@ from services.cp_sat.night_distribution_log import log_n_even_distribution
 from services.constraints.team_constraints import add_team_min_constraints
 from services.day_windows import iter_nurse_days, build_active_days
 
+# lex Stage 2 에서 team_min 커버 부족(slack) 1건당 패널티. safety(off-quota 10~30만) 위에
+# 두어 팀 커버를 상위 co-priority 로 만든다(단, 커버리지/안전은 이미 상위 stage 에서 고정).
+TEAM_COVER_LEX_WEIGHT = 300_000
+
 
 def _cp_sat_status_to_text(status: int) -> str:
     """CP-SAT 상태 코드를 사람이 읽을 수 있는 문자열로 변환한다."""
@@ -2624,6 +2628,10 @@ def optimize_fallback_lex_hard_first(
         # team_min hard 제약 — Stage 1, 2 에도 등록한다.
         # Stage 3 는 build_fallback_stage3_objective_terms 가 자체 호출하므로 중복 회피.
         # 누락 시 Stage 3 INFEASIBLE → Stage 2 해 commit 경로에서 team_min 위반이 새어나감.
+        # team_min soft slack 을 stage 목적함수에 주입하기 위해 캡처.
+        # soft 모드에선 add_team_min_constraints 가 slack 제약만 걸고 반환 패널티는
+        # Maximize 용(-w*slack)이라 Minimize stage 에선 버려졌다 → 슬랙을 직접 재가중.
+        _tm_cover_slacks: list = []
         if stage in (1, 2):
             try:
                 _gs_tm = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
@@ -2632,6 +2640,7 @@ def optimize_fallback_lex_hard_first(
                     grade_strategy=_gs_tm,
                     blocked_by_nurse=blocked_by_nurse,
                 )
+                _tm_cover_slacks = list(getattr(roster_system, "_team_min_cover_slacks", []) or [])
             except Exception as e:
                 print(f"{logger_prefix} [Stage{stage}] team_min hard 등록 실패: {e}")
 
@@ -2693,7 +2702,14 @@ def optimize_fallback_lex_hard_first(
             safety_sum = []
             for k, arr in safety.items():
                 safety_sum.extend(arr)
-            m.Minimize(sum(safety_sum))
+            # team_min soft: Stage 3 가 infeasible 이면 이 Stage 2 해가 commit 되므로,
+            # 여기서 팀 커버 부족(slack)을 목적함수에 넣어야 실제로 최소화된다(안 그러면 무력).
+            # 커버리지(coverage_eq)는 이미 고정 → 팀 스프레드는 동일 커버 내 재배치로 개선.
+            # 가중치 TEAM_COVER_LEX_WEIGHT(30만)는 safety(off-quota 10~30만) 상위 co-priority.
+            m.Minimize(
+                sum(safety_sum)
+                + TEAM_COVER_LEX_WEIGHT * sum(_tm_cover_slacks)
+            )
         else:
             if coverage_eq is not None:
                 m.Add(sum(short_terms) == coverage_eq)

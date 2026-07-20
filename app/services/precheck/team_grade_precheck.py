@@ -451,19 +451,29 @@ def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
 
 
 def check_team_min_exceeds_global_need(inp: PrecheckInput) -> List[Dict]:
+    # 규칙: (일, 시프트)마다 요구 인원(need=자리 수)만큼 '서로 다른 팀'을 커버한다
+    #   → target = min(need, 팀수). "2자리·3팀 → 2팀만" 은 정상이므로 팀 min '합계'가
+    #   need 를 넘는 것은 더 이상 검출하지 않는다(주말 등에서 거짓 경고 방지).
+    #
+    # team_min 은 이제 완전 soft(team_constraints: covered+slack>=target, 미달=벌점)라
+    #   어떤 경우도 hard infeasibility 를 만들지 않는다 → 절대 선차단하지 않는다.
+    #   '한 팀의 min 하나가 자리 수(need)보다 큰' 경우만(그 팀은 자기 몫을 다 못 채움)
+    #   정보성 warning 으로 알린다. (dev d511f62 의 'warning 강등' 의도 + 정확한 조건 결합.)
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     issues: List[Dict] = []
     for s in S:
-        tmin_sum = sum(int((tm or {}).get(s, 0) or 0) for tm in (inp.team_coverage or {}).values())
-        if tmin_sum <= 0:
+        per_team = [int((tm or {}).get(s, 0) or 0) for tm in (inp.team_coverage or {}).values()]
+        max_team_min = max(per_team) if per_team else 0
+        if max_team_min <= 0:
             continue
         for d in range(inp.num_days):
             nd = _need(inp.roster_config, s, d)
-            if tmin_sum > nd:
+            if max_team_min > nd:
                 issues.append(
                     _issue(
                         "TEAM_MIN_EXCEEDS_GLOBAL_NEED",
-                        {"shift": s, "day": d, "teams_min_sum": tmin_sum, "global_need": nd},
+                        {"shift": s, "day": d, "single_team_min": max_team_min, "global_need": nd},
+                        severity="warning",
                     )
                 )
                 break

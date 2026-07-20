@@ -85,108 +85,86 @@ def add_team_min_constraints(
 
     shift_types = list(rs.config.shift_types)
     added_cnt = 0
-    skipped_capacity: list[tuple[str, int, str, int, int]] = []  # (tid, day, code, active, min_t)
+    # soft 슬랙 변수 수집 — lex 폴백(fallback_lex)이 Stage 목적함수에 직접 주입할 수 있도록
+    # rs 에 노출한다. (add_team_min_constraints 반환 obj_terms 는 Maximize 용 -w*slack 인데,
+    # fallback_lex Stage1/2 는 Minimize 라 반환값이 버려져 왔음 → 슬랙 자체를 넘겨 재가중.)
+    cover_slacks: list = []
 
-    # MUS 추출용 hard assumption registry — 모델에 attach 된 경우만 wrap.
-    _registry = getattr(m, "_cpsat_assumption_registry", None)
-    _add_hard_fn = None
-    if _registry is not None and not allow_soft:
-        try:
-            from services.cp_sat.hard_assumption import add_hard as _add_hard_fn
-        except Exception:
-            _add_hard_fn = None
+    # per-day 요구 인원(need=자리 수) 조회 — daily_shift_requirements_by_day 우선, 없으면 기본.
+    by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+    base_need = getattr(cfg, "daily_shift_requirements", {}) or {}
 
+    def _need_for(d: int, code: str) -> int:
+        if isinstance(by_day, list) and 0 <= d < len(by_day) and by_day[d]:
+            return int((by_day[d] or {}).get(code, 0) or 0)
+        return int(base_need.get(code, 0) or 0)
+
+    # 팀별 min(코드→명수) 정제 + team_min 이 걸리는 시프트 코드 집합
+    team_min_clean: dict[str, dict[str, int]] = {}
+    codes_with_min: set[str] = set()
     for tid, members in team_members.items():
         if not members:
             continue
-        raw_min = team_min_by_team.get(tid)
-        team_min = _clean_team_min(raw_min, shift_types, use_mid)
-        if not team_min:
-            continue
+        tm = _clean_team_min(team_min_by_team.get(tid), shift_types, use_mid)
+        if tm:
+            team_min_clean[tid] = tm
+            codes_with_min.update(tm.keys())
 
-        shift_indices = [(code, shift_types.index(code)) for code in team_min.keys()]
-
-        for d in range(rs.num_days):
-            active = [n for n in members if join[n] <= d <= leave[n]]
-            if not active:
-                continue
-            for code, s_idx in shift_indices:
-                min_t = team_min[code]
-                upper = len(active)
-                if upper < min_t and not allow_soft:
-                    # 하드 모드에서 데이터 부족으로 강제 불가 → 스킵(INFEASIBLE 방지)
-                    skipped_capacity.append((tid, d, code, upper, min_t))
-                    _impact_modes.append({
-                        "family": "team_min",
-                        "key": f"team_min:{tid}:{d}:{code}",
-                        "configured_mode": "hard",
-                        "effective_mode": "skipped_by_capacity",
-                        "source_file": "app/services/constraints/team_constraints.py",
-                        "reason": "active team members < min_t in hard mode",
-                        "evidence": {"team_id": tid, "day": d + 1, "shift": code, "active": upper, "min_t": min_t},
-                    })
+    # ── 핵심 규칙: (일, 시프트)마다 "서로 다른 팀"을 target=min(need, 팀수)개 커버 ──
+    #   - need(자리 수) >= 팀수 : 모든 팀 커버 요구(평일 D=3, 3팀 → 3팀 전부 1명씩).
+    #   - need < 팀수          : need 개 팀만 커버해도 충분(주말 D=2, 3팀 → 2팀). 남는 1팀 공백은 정상.
+    #   즉 "3자리에 3팀 못 넣음"만 위반이고, "2자리에 2팀"은 위반이 아니다.
+    #   미지정(team_id 없는) 인원은 팀 커버 카운트에서 빠지므로 자연히 잔여 자리(N/OFF)로 밀린다.
+    #   present_t=1 ⟺ 팀 t 가 이 시프트에 min_t 명 이상 배치(자기 팀원으로). covered=Σ present_t.
+    for d in range(rs.num_days):
+        for code in codes_with_min:
+            s_idx = shift_types.index(code)
+            present_vars = []
+            for tid, tm in team_min_clean.items():
+                min_t = int(tm.get(code, 0) or 0)
+                if min_t <= 0:
                     continue
-                vars_sum = sum(X(n, d, s_idx) for n in active)
-                if allow_soft:
-                    slack = m.NewIntVar(0, min_t, f"tmin_slack_t{tid}_d{d}_s{s_idx}")
-                    m.Add(vars_sum + slack >= min_t)
-                    if penalty_weight > 0:
-                        obj_terms.append(-penalty_weight * slack)
-                    _impact_modes.append({
-                        "family": "team_min",
-                        "key": f"team_min:{tid}:{d}:{code}",
-                        "configured_mode": "soft",
-                        "effective_mode": "soft_fallback",
-                        "source_file": "app/services/constraints/team_constraints.py",
-                        "reason": "team_min soft fallback active",
-                        "evidence": {"team_id": tid, "day": d + 1, "shift": code, "min_t": min_t},
-                    })
-                else:
-                    if _add_hard_fn is not None and _registry is not None:
-                        # 같은 (team, shift) 의 모든 day 를 하나의 literal 로 묶음.
-                        _name = f"TeamMin:team_{tid}:{code}"
-                        _meta = {
-                            "node_id": f"team_min:team_{tid}:{code.lower()}",
-                            "type": "TeamMinNode",
-                            "label": f"Team {tid} {code} min ≥ {int(min_t)}",
-                            "value": {"team_id": tid, "shift": code, "min": int(min_t)},
-                            "scope": "team",
-                            "scope_key": f"team_{tid}_{code.lower()}_min",
-                            "pattern": "team_min",
-                            "human_message_ko": f"팀 {tid} 의 {code} 시프트 최소 인원 정책",
-                            "resolution_hint": (
-                                f"팀 {tid} 의 {code} 최소치({int(min_t)}) 를 낮추거나 "
-                                "team_min 을 soft fallback 으로 전환하세요."
-                            ),
-                        }
-                        _add_hard_fn(m, _registry, name=_name,
-                                     constraint_expr=(vars_sum >= min_t), meta=_meta)
-                    else:
-                        m.Add(vars_sum >= min_t)
-                    _impact_modes.append({
-                        "family": "team_min",
-                        "key": f"team_min:{tid}:{d}:{code}",
-                        "configured_mode": "hard",
-                        "effective_mode": "enforced",
-                        "source_file": "app/services/constraints/team_constraints.py",
-                        "reason": "team_min hard constraint added",
-                        "evidence": {"team_id": tid, "day": d + 1, "shift": code, "min_t": min_t},
-                    })
-                added_cnt += 1
+                active = [n for n in team_members[tid] if join[n] <= d <= leave[n]]
+                if not active:
+                    continue
+                member_sum = sum(X(n, d, s_idx) for n in active)
+                present = m.NewBoolVar(f"tmin_present_t{tid}_d{d}_s{s_idx}")
+                # present=1 → 이 팀이 이 시프트에 min_t 명 이상 배치. present=0 → 제약 없음.
+                m.Add(member_sum >= min_t * present)
+                present_vars.append(present)
+            num_teams = len(present_vars)
+            if num_teams == 0:
+                continue
+            need = _need_for(d, code)
+            target = min(need, num_teams)
+            if target <= 0:
+                continue
+            covered = sum(present_vars)
+            if allow_soft:
+                slack = m.NewIntVar(0, target, f"tmin_cover_slack_d{d}_s{s_idx}")
+                m.Add(covered + slack >= target)
+                cover_slacks.append(slack)
+                if penalty_weight > 0:
+                    obj_terms.append(-penalty_weight * slack)
+                eff_mode = "soft_fallback"
+            else:
+                m.Add(covered >= target)
+                eff_mode = "enforced"
+            added_cnt += 1
+            _impact_modes.append({
+                "family": "team_min",
+                "key": f"team_min:cover:{d}:{code}",
+                "configured_mode": "soft" if allow_soft else "hard",
+                "effective_mode": eff_mode,
+                "source_file": "app/services/constraints/team_constraints.py",
+                "reason": "distinct-team coverage target = min(need, num_teams)",
+                "evidence": {"day": d + 1, "shift": code, "need": need, "num_teams": num_teams, "target": target},
+            })
+
+    # lex 폴백이 읽을 수 있도록 이번 호출(=이번 stage 모델)의 soft 슬랙을 노출.
+    setattr(rs, "_team_min_cover_slacks", cover_slacks)
 
     mode = "soft" if allow_soft else "hard"
-    print(
-        f"[TeamMin] mode={mode} teams={len(team_members)} added={added_cnt} "
-        f"skipped_capacity={len(skipped_capacity)}"
-    )
-    if skipped_capacity:
-        sample = skipped_capacity[:10]
-        for tid, d, code, upper, min_t in sample:
-            print(
-                f"[TeamMin][skip-capacity] team={tid} day={d+1} code={code} "
-                f"active={upper} < min={min_t} (hard mode)"
-            )
-        if len(skipped_capacity) > len(sample):
-            print(f"[TeamMin][skip-capacity] ...and {len(skipped_capacity) - len(sample)} more")
+    print(f"[TeamMin] mode={mode} teams={len(team_min_clean)} added={added_cnt} rule=min(need,num_teams)")
 
     return obj_terms

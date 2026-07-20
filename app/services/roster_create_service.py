@@ -5356,6 +5356,22 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         )
     )
 
+    # ── ontology treatment 적용: 선택된 treatment_ids 를 config 에 패치(재생성용) ──
+    # apply_treatments 가 force_soft_mode/disable_module/set_threshold 를 patched_config 로
+    # 반영(대부분 런타임 플래그). data_correction_required(manual)는 적용 안 됨.
+    # ★ precheck 앞에서 적용해야 한다: team_min_soft_fallback 같은 완화가 precheck 의
+    #   team-min 하드 블록을 실제로 풀 수 있어야 하기 때문(적용이 precheck 뒤면 무효).
+    if treatment_ids:
+        try:
+            from services.treatment_applicator import apply_treatments
+            _clean_cfg = {k: v for k, v in config_dict.items() if not str(k).startswith("_sa_")}
+            _tres = apply_treatments(list(treatment_ids), _clean_cfg)
+            config_dict = _tres.patched_config
+            print(f"[TreatmentApply] applied={_tres.applied_treatment_ids} "
+                  f"manual={_tres.manual_required} unresolved={_tres.unresolved_treatment_ids}")
+        except Exception as _tapp_exc:
+            print(f"[TreatmentApply] 실패(무시): {_tapp_exc}")
+
     # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
     precheck_result: dict | None = None
     try:
@@ -5471,19 +5487,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         #         "engine_nurses": len(nurses_for_engine),
         #     },
         # )
-        # ── ontology treatment 적용: 선택된 treatment_ids 를 config 에 패치(재생성용) ──
-        # apply_treatments 가 force_soft_mode/disable_module/set_threshold 를 patched_config 로
-        # 반영(대부분 런타임 플래그). data_correction_required(manual)는 적용 안 됨.
-        if treatment_ids:
-            try:
-                from services.treatment_applicator import apply_treatments
-                _clean_cfg = {k: v for k, v in config_dict.items() if not str(k).startswith("_sa_")}
-                _tres = apply_treatments(list(treatment_ids), _clean_cfg)
-                config_dict = _tres.patched_config
-                print(f"[TreatmentApply] applied={_tres.applied_treatment_ids} "
-                      f"manual={_tres.manual_required} unresolved={_tres.unresolved_treatment_ids}")
-            except Exception as _tapp_exc:
-                print(f"[TreatmentApply] 실패(무시): {_tapp_exc}")
         generated, satisfaction_data, roster_system = _run_cp_sat_basic(
             db,
             current_user,
