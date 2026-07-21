@@ -183,3 +183,23 @@ read-only probe는 stage1-hard만 봐서 "해결책이 실제로 works"를 끝�
 `off_days` 는 애초에 treatment 로 제공되지 않음(capacity_total_shortage 는 manual 증원만). **결론: 자동 apply 가능한 clean scalar 노브는 `max_nig_per_month` 하나. `daily_shift_requirements` 는 message-only 로 정확한 숫자 제공.** 조합(coupled)은 설계상 probe 재solve 담당(이미 됨).
 
 **테스트**: `tests/test_treatment_sizing.py` (7 — night sizing/insufficient/alias/boolean/daily message-only).
+
+---
+
+## 후속 갭 마무리 (원인추적·해결탐색 완성도)
+
+### ⓐ MUS 래핑갭 — within-month 2N2OFF 회복 (커밋 38c9677)
+solve-time 회복 병목이 core 에 안 뜨던 원인 = within-month 2N 회복 강제(cp_sat_basic.py:4677)가 `_assume_2n2off` 리터럴 없이 OnlyEnforceIf(3N·boundary·carryover 는 이미 붙음, 2N만 오버사이트). 리터럴 추가(기본 true=동작무변경). 실증: 100991fe 2N2OFF+N+3 MUS core 에 `RecoveryOffNode` 포함(수정 전 부재) + "two_offs_after_two_nig 완화" 힌트.
+
+### ⓑ probe magnitude-search — 고정 델타 → 최소침습 이분탐색 (커밋 7f3b49b)
+undiag probe 의 숫자 완화가 고정 델타(+8 등)라 진짜 필요값이 크면(부족) 놓치던 것 → 단조 노브(max_nig↑·max_conseq_work↑·max_consecutive_nights↑·off_days↓)를 재solve 이분탐색해 최소 feasible 값을 찾음. 단조라 정당·유한(log), 예산 12(총)·노브당6 으로 상한. 결과=verified 옵션 "from→to" + apply(원클릭). 고정 +8 로 놓치던 케이스 회수 + 과잉 최소화.
+
+### 원인추적 커버리지 요약 (갱신)
+| 상황 | 탐지 | 원인 | 해결 |
+|---|---|---|---|
+| 단일축 산술 | ✅ precheck | ✅ 숫자 | ✅ arithmetic sizing(max_nig 자동적용, daily 안내) |
+| 개인 시퀀스 | ✅ per-nurse DP | ✅ witness | 방향 |
+| flow 결합 | ✅ max-flow | ✅ min-cut | advisory |
+| solve-time 조합 | solve 후 | ✅ MUS core(**회복 포함 확장**) | ✅ probe **magnitude-search**(검증된 최소값) |
+
+**남은 것**: fallback_lex 전용 hard 제약 중 MUS 미포함이 더 있는지 추가 감사(현재 recovery 가 주 후보였고 닫음). daily/team nested 노브 자동 apply(현재 안내만).
