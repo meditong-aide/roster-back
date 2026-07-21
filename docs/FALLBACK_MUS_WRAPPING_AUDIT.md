@@ -16,9 +16,9 @@ create_literal: CarryoverRecovery 2N/3N(+Boundary/Partial/Tail) · **Recovery2N2
 | 3 | 회복 2N/3N within-month | 2228·2126 | two_offs_after_two/three_nig | ✅ **닫음(e7215ce)** |
 | 4 | 월한도/grade/team (위임모듈) | 2713·2694·2675 | n_max·allow_soft_fallback | ⬜ 후속(파일밖, registry threading) |
 | 5 | 프리셉티 follow/sync | 1224·1231·1244 | preceptee_follow | ⬜ 후속 |
-| 6 | 4연속OFF 금지(4O) | 919·925·968 | enforce_4o_hard(기본OFF) | ⬜ 후속(저가치) |
+| 6 | 회복 fixed-wanted 서브분기 | 2255 | (회복 일부) | ⬜ 후속 |
 | 7 | ban_night_before_fixed_off | 1666 | ban_night_before_fixed_off | ⬜ 후속(니치, primary도 미래핑) |
-| 8 | 회복 fixed-wanted 서브분기 | 2255 | (회복 일부) | ⬜ 후속 |
+| — | 4연속OFF(4O) → **max_conseq_off** | 919·968 | max_conseq_off | ❌ **제외**(이제 soft=infeasible 유발 안 함→core 대상 아님. 레거시 enforce_4o_hard 코드만 잔존) |
 | — | M 전이규칙 | 1605 | (노브 없음) | ❌ 제외(완화 불가→core 떠도 제안 불가) |
 
 ## 정상(갭 아님)
@@ -27,7 +27,8 @@ create_literal: CarryoverRecovery 2N/3N(+Boundary/Partial/Tail) · **Recovery2N2
 
 ## 남은 작업 (우선순위)
 1. **#4 위임모듈 registry threading** (HIGH): `add_monthly_limit_constraints`/grade/team 함수에 `_assume_registry_fb` 전달 — 파일밖 작업.
-2. #5 프리셉티, #7 ban_night, #8 회복-fw, #6 4O — 파일내, primary 패턴 복사로 처리 가능.
+2. #5 프리셉티, #6 회복-fw, #7 ban_night — 파일내, primary 패턴 복사로 처리 가능(하드 3건).
+3. 4O는 max_conseq_off(soft)로 이관돼 infeasibility 갭 아님 — 래핑 불필요.
 
 ## 참고: 진단 자체 성능
 fallback MUS는 reify(하드마다 리터럴, 수천 개)로 무겁고 진단 TL=30초(MUS_DIAG_TIME)라, 큰 병동서 UNKNOWN(증명 미완) 가능. 래핑은 "회복/1N/주말이 병목이면 이름이 뜨게" 하는 필요조건이고, 진단이 시간 내 UNSAT 증명해야 실제로 뜬다(별도 성능 갭).
