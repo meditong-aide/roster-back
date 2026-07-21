@@ -85,6 +85,15 @@ def add_team_min_constraints(
 
     shift_types = list(rs.config.shift_types)
     added_cnt = 0
+    # MUS 래핑 인프라 — monthly_limit/grade 와 동일하게 m 에 stash 된 레지스트리를 읽어
+    # 하드 team_min 커버 제약을 assumption 으로 감싼다(병목 시 core 에 TeamMinNode).
+    _registry = getattr(m, "_cpsat_assumption_registry", None)
+    _add_hard_fn = None
+    if _registry is not None:
+        try:
+            from services.cp_sat.hard_assumption import add_hard as _add_hard_fn
+        except Exception:
+            _add_hard_fn = None
     # soft 슬랙 변수 수집 — lex 폴백(fallback_lex)이 Stage 목적함수에 직접 주입할 수 있도록
     # rs 에 노출한다. (add_team_min_constraints 반환 obj_terms 는 Maximize 용 -w*slack 인데,
     # fallback_lex Stage1/2 는 Minimize 라 반환값이 버려져 왔음 → 슬랙 자체를 넘겨 재가중.)
@@ -151,7 +160,23 @@ def add_team_min_constraints(
                     obj_terms.append(-penalty_weight * slack)
                 eff_mode = "soft_fallback"
             else:
-                m.Add(covered >= target)
+                if _add_hard_fn is not None and _registry is not None:
+                    _add_hard_fn(
+                        m, _registry,
+                        name=f"TeamMinCover:d{d}:s{code}",
+                        constraint_expr=(covered >= target),
+                        meta={
+                            "node_id": f"team_min_cover:day_{d}:shift_{code}",
+                            "type": "TeamMinNode", "label": "팀 최소 인원 커버",
+                            "value": {"day": d + 1, "shift": code, "target_teams": target},
+                            "scope": "shift", "scope_key": f"day_{d}:shift_{code}",
+                            "pattern": "team_min_cover",
+                            "human_message_ko": f"{d + 1}일 {code} 시프트에 서로 다른 팀 {target}개 커버 필요",
+                            "resolution_hint": "팀 최소 인원을 soft 로 완화(team_min_soft_fallback=True)하세요.",
+                        },
+                    )
+                else:
+                    m.Add(covered >= target)
                 eff_mode = "enforced"
             added_cnt += 1
             _impact_modes.append({
