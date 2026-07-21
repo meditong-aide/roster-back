@@ -36,5 +36,5 @@ create_literal: CarryoverRecovery 2N/3N(+Boundary/Partial/Tail) · **Recovery2N2
 
 **남은 건 진단 성능뿐**: reify 무거움 + 30초 TL → 큰 병동서 UNKNOWN 가능. 래핑은 필요조건이고, 진단이 시간 내 UNSAT 증명해야 실제로 core 에 뜬다.
 
-## 참고: 진단 자체 성능
-fallback MUS는 reify(하드마다 리터럴, 수천 개)로 무겁고 진단 TL=30초(MUS_DIAG_TIME)라, 큰 병동서 UNKNOWN(증명 미완) 가능. 래핑은 "회복/1N/주말이 병목이면 이름이 뜨게" 하는 필요조건이고, 진단이 시간 내 UNSAT 증명해야 실제로 뜬다(별도 성능 갭).
+## 참고: 진단 성능 — 측정 결과(2026-07-21, 우려 해소)
+실측(100991fe, 28명, fallback): reify OFF 22.5s / ON 28.5s = **오버헤드 ~27%(모듈)**. core 는 `_optimize_fallback_lex_hard_first` 의 **첫 hard solve(cp_sat_basic.py:2267)에서 INFEASIBLE 시 추출 후 return** — stage2/3 최적화 전. 즉 진짜 hard-infeasible 이면 UNSAT 증명(propagation)이 빨라 core 가 빠르게 나온다. 또 MUS 진단은 **생성이 실제 실패(=fallback 도 해 없음)했을 때만** 발동하고, feasible-with-shortage 는 근무표를 만들어 생성 성공→진단 미발동. **앞서 관찰한 UNKNOWN 은 feasible 케이스의 최적화 타임아웃(폴백 stage1 broad_soft)이었지 MUS 증명 실패가 아님.** → "reify 경량화" 근거 약함. 잔여 리스크=초대형 병동 UNSAT 증명 30s 초과(증거 없음), 값싼 헤지=MUS_DIAG_TIME 30→45.
