@@ -32,6 +32,7 @@ from agents_v2.llm_client import LLMClient
 from agents_v2.middleware import SkillResult, _check_permission, execute_skill
 from agents_v2.router import route
 from agents_v2.schemas.session_context import SessionContext
+from agents_v2 import observability as obs
 from agents_v2.usage import record_llm_usage
 from agents_v2.skills.client_actions import build_ui_action, is_client_action
 from agents_v2.skills.descriptions import SKILL_TOOLS
@@ -172,28 +173,43 @@ class SchedulingAgent:
         user_message: str,
         ctx: SessionContext,
     ) -> AgentResult:
-        """Turn entry — inject_user_memory_context → _run_impl → consolidate_after_turn."""
+        """Turn entry — inject_user_memory_context → _run_impl → consolidate_after_turn.
+
+        턴 전체를 Langfuse trace 로 감싼다(키 있을 때만; 없으면 no-op). 내부 LLM 호출은
+        generation, Stage 는 span, 결과 outcome 은 score 로 적재.
+        """
+        from agents_v2.errors import classify
+
         # US-A4 Tier-2 memory inject + run + consolidate 흐름은 _run_impl 이 핸들링.
         # consolidate 는 응답 반환 직전에 호출 (silent on failure).
         current_user_facts: list[dict] = (
             self._load_user_facts(db, ctx) if self.enable_user_memory else []
         )
 
-        result = self._run_impl(db, user_message, ctx, current_user_facts)
+        with obs.turn(conversation_id=getattr(ctx, "conversation_id", None),
+                      user_id=getattr(ctx, "nurse_id", None),
+                      group_id=getattr(ctx, "group_id", None),
+                      user_message=user_message):
+            result = self._run_impl(db, user_message, ctx, current_user_facts)
 
-        # ── US-A4 consolidate_after_turn (turn 종료 후) ──
-        if self.enable_user_memory and self.memory_extractor is not None:
+            # ── US-A4 consolidate_after_turn (turn 종료 후) ──
+            if self.enable_user_memory and self.memory_extractor is not None:
+                try:
+                    self._consolidate_after_turn(
+                        db, ctx, result.messages, current_user_facts
+                    )
+                except Exception as e:
+                    # silent log — agent 응답에 영향 X
+                    logger.warning(
+                        "[agent_v3] consolidate_after_turn failed: %s", e
+                    )
+
             try:
-                self._consolidate_after_turn(
-                    db, ctx, result.messages, current_user_facts
-                )
-            except Exception as e:
-                # silent log — agent 응답에 영향 X
-                logger.warning(
-                    "[agent_v3] consolidate_after_turn failed: %s", e
-                )
-
-        return result
+                obs.finish_turn(result.answer, result.trace,
+                                score_name="outcome", score_value=classify(result.data).name)
+            except Exception:  # noqa: BLE001
+                pass
+            return result
 
     # ── DAG 계획 (opt-in) ────────────────────────────────────
     def _plan_answer(self, user_message, run) -> str:
@@ -219,8 +235,9 @@ class SchedulingAgent:
         # 계획은 복합 의존 추론이라 **메인 LLM** 사용(nano 라우터는 과생성/오류).
         planner_llm = self.llm
         try:
-            run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill,
-                               session_factory=SessionLocal)  # read 세션 격리 병렬
+            with obs.purpose("planner"):
+                run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill,
+                                   session_factory=SessionLocal)  # read 세션 격리 병렬
         except Exception as e:  # noqa: BLE001
             logger.warning("[agent_v3] DAG plan 실패 → ReAct: %s", e)
             return None
@@ -461,7 +478,8 @@ class SchedulingAgent:
         # 저신뢰)이면 전체 tool 유지(턴 안 깨짐). pending_approval 턴은 tools= 를 안 쓰므로 스킵.
         if self.router_llm is not None and not ctx.pending_approval:
             t_route = time.time()
-            router_result = route(self.router_llm, user_message)
+            with obs.purpose("router"):
+                router_result = route(self.router_llm, user_message)
             route_ms = (time.time() - t_route) * 1000
             log_dev_query(
                 router_result.categories, user_message, ctx.conversation_id
@@ -493,7 +511,8 @@ class SchedulingAgent:
             # MSSQL/Redis save_messages 에는 전체 messages 가 저장되어 감사 trail 손실 없음.
             inject_messages = _truncate_for_llm(messages, max_chars=_MAX_INJECT_CHARS)
             t0 = time.time()
-            response = self.llm.chat(inject_messages, tools=tools)
+            with obs.purpose("turn"):
+                response = self.llm.chat(inject_messages, tools=tools)
             llm_ms = (time.time() - t0) * 1000
 
             record_llm_usage(

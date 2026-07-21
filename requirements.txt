@@ -98,4 +98,7 @@ fakeredis>=2.20.0
 # timer>=0.3.0
 # uvicorn>=0.34.2
 # alembic
-# psycopg2-binary 
+# psycopg2-binary
+
+# 관측(옵션) — LANGFUSE_* 키 설정 시에만 활성. self-host 전제(의료데이터 외부유출 없음).
+langfuse>=2.53,<3

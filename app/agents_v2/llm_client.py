@@ -471,13 +471,22 @@ def _tool_call(name: str, args: dict) -> LLMResponse:
 # ── Factory ─────────────────────────────────────────────────
 
 
+def _observed(client: "LLMClient") -> "LLMClient":
+    """Langfuse 관측 래핑(키 있을 때만 — 없으면 원본 그대로, 오버헤드 0)."""
+    try:
+        from agents_v2.observability import wrap_client
+        return wrap_client(client)
+    except Exception:  # noqa: BLE001
+        return client
+
+
 def get_llm_client(provider: str = "openai") -> LLMClient:
     """Create an LLM client by provider name."""
     if provider == "deterministic":
-        return DeterministicClient()
+        return _observed(DeterministicClient())
     if provider == "anthropic":
-        return AnthropicClient()
-    return OpenAIClient()
+        return _observed(AnthropicClient())
+    return _observed(OpenAIClient())
 
 
 def get_router_llm_client(provider: str = "openai") -> LLMClient:
@@ -488,7 +497,7 @@ def get_router_llm_client(provider: str = "openai") -> LLMClient:
     충분하므로 메인 turn 모델과 분리. ROUTER_MODEL env 로 override 가능.
     """
     if provider == "deterministic":
-        return DeterministicClient()
+        return _observed(DeterministicClient())
     if provider == "anthropic":
-        return AnthropicClient()
-    return OpenAIClient(model=os.getenv("ROUTER_MODEL", "gpt-5.4-nano"))
+        return _observed(AnthropicClient())
+    return _observed(OpenAIClient(model=os.getenv("ROUTER_MODEL", "gpt-5.4-nano")))
