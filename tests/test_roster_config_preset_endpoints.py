@@ -35,7 +35,13 @@ def adm_user():
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # py3.13: get_event_loop() 는 deprecated + 스위트 내 닫힌 루프 재사용으로 flaky.
+    # 호출마다 격리된 새 루프 생성/종료로 순서 의존 제거.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _save(db, adm_user, **ov):
