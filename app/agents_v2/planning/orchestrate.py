@@ -57,22 +57,106 @@ def _replan_feedback(run: PlanRun) -> str:
             f"- 시도한 계획: {json.dumps(tried, ensure_ascii=False, default=str)[:1500]}")
 
 
-def build_clarify_form(clarifications: list[dict]) -> dict:
+# ctx 가 자동 주입하는 파라미터 — 되물을 필요 없음(미들웨어 _inject_context 와 일치).
+_CTX_INJECTED = frozenset({"group_id", "office_id", "year", "month", "acting_user_id"})
+
+
+def _enum_nurses(db: Any, ctx: Any) -> list[str]:
+    """병동 소속 간호사 이름 목록(선택 옵션용). 실패/대량이면 빈 리스트."""
+    try:
+        from db.models import Nurse
+        rows = (db.query(Nurse.name)
+                .filter(Nurse.group_id == getattr(ctx, "group_id", None))
+                .limit(80).all())
+        names = [r[0] for r in rows if r[0]]
+        return names if len(names) <= 60 else []  # 너무 많으면 선택 UI 부적합 → 자유입력
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# param 이름 → DB 열거 함수. enum 없는 파라미터를 선택형으로 만드는 지렛대.
+_DB_ENUMERATORS: dict[str, Callable[[Any, Any], list[str]]] = {
+    "nurse_name": _enum_nurses,
+    "nurse_ids": _enum_nurses,
+}
+
+
+def _param_options(param: str, prop: dict, db: Any, ctx: Any) -> list[str]:
+    """선택 옵션 도출 — 스키마 enum 우선, 없으면 DB 열거, 그것도 없으면 빈 리스트."""
+    if prop.get("enum"):
+        return [str(e) for e in prop["enum"]]
+    fn = _DB_ENUMERATORS.get(param)
+    if fn is not None and db is not None and ctx is not None:
+        return fn(db, ctx)
+    return []
+
+
+def _q_type(param: str, options: list[str]) -> str:
+    """질문 위젯 타입 추론: 옵션 있으면 select / 날짜 / 숫자 / 자유입력."""
+    if options:
+        return "select"
+    if "date" in param:
+        return "date"
+    if param in ("year", "month") or "count" in param or param.endswith(("_min", "_max", "_exact")):
+        return "number"
+    return "input"
+
+
+def build_clarify_form(clarifications: list[dict], *, plan: Plan | None = None,
+                       ctx: Any = None, skill_tools: list[dict] | None = None,
+                       db: Any = None) -> dict:
     """수집된 되물음들 → 구조화 clarify_form(프론트 렌더용 named UI-action).
 
-    옵션 있으면 select, 없으면 자유입력. 파라미터명은 스킬 clarification 이 안 주므로
-    task/skill 로만 라벨(옵션 enum 은 스킬이 준 것 사용). 설계 docs/AGENT_CLARIFY_FORM_FRONTEND_TODO.md.
+    **선택형 자동 보강**: 되물음 태스크의 스킬 스키마에서 **누락된 required 파라미터**를 도출하고,
+    그 파라미터의 enum(스키마) 또는 DB 열거(간호사명 등)로 **선택 옵션**을 채운다. 스키마상
+    누락 required 가 없으면(의미 모호 등) 스킬이 준 free-text question 으로 자유입력 fallback.
+    per-skill 코드 수정 없이 스키마+DB 로 선택지를 만든다. 설계 docs/AGENT_CLARIFY_FORM_FRONTEND_TODO.md.
     """
-    questions = []
+    tools = {t.get("name"): t for t in (skill_tools or [])}
+    tasks = {t.id: t for t in (plan.tasks if plan else [])}
+    questions: list[dict] = []
     for c in clarifications:
-        opts = c.get("options") or []
-        questions.append({
-            "task": c.get("task"), "skill": c.get("skill"),
-            "question": c.get("question") or "추가 정보가 필요합니다.",
-            "type": "select" if opts else "input",
-            "options": opts,
-        })
+        skill = c.get("skill")
+        tool = tools.get(skill)
+        task = tasks.get(c.get("task"))
+        added = False
+        if tool is not None and task is not None:
+            params = tool.get("parameters") or {}
+            required = params.get("required") or []
+            props = params.get("properties") or {}
+            for p in required:
+                if p in (task.args or {}) or p in _CTX_INJECTED:
+                    continue  # 이미 있거나 ctx 가 주입 → 안 물음
+                prop = props.get(p, {})
+                opts = _param_options(p, prop, db, ctx)
+                questions.append({
+                    "task": c.get("task"), "skill": skill, "param": p,
+                    "question": (prop.get("description") or f"{p} 값이 필요합니다.").split("\n")[0][:120],
+                    "type": _q_type(p, opts), "options": opts,
+                })
+                added = True
+        if not added:  # 스키마상 누락 required 없음 → 스킬 free-text 로 자유입력
+            opts = c.get("options") or []
+            questions.append({
+                "task": c.get("task"), "skill": skill, "param": None,
+                "question": c.get("question") or "추가 정보가 필요합니다.",
+                "type": "select" if opts else "input", "options": opts,
+            })
     return {"type": "clarify_form", "questions": questions}
+
+
+def apply_clarify_answers(plan_dict: dict, answers: list[dict]) -> dict:
+    """clarify_form 답변(list of {task, param, value})을 plan 의 해당 task args 에 병합.
+
+    param 이 None(자유입력 fallback)인 답변은 특정 태스크에 못 매핑하므로 무시(다음 라운드
+    되물음으로 처리). plan_dict 를 in-place 갱신하고 반환.
+    """
+    tasks = {t.get("id"): t for t in (plan_dict.get("tasks") or [])}
+    for a in (answers or []):
+        tid, p, v = a.get("task"), a.get("param"), a.get("value")
+        if p and tid in tasks and v is not None:
+            tasks[tid].setdefault("args", {})[p] = v
+    return plan_dict
 
 
 def try_plan_run(

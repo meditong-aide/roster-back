@@ -36,6 +36,12 @@ class SessionContext:
     # Approval flow (preview → confirm)
     pending_approval: dict | None = None
 
+    # Clarify flow (다중 되물음 → clarify_form → 답변 병합 재개)
+    #   pending_clarify: {"plan": <plan dict>, "user_message": str} — clarify_form 방출 시 저장
+    #   clarify_answers: [{"task","param","value"}, ...] — 프론트가 채워 보내면 재개 트리거
+    pending_clarify: dict | None = None
+    clarify_answers: list[dict] | None = None
+
     # 자율성 모드 (HITL 3-tier). mutation 승인 정책을 고른다.
     #   "manual"      — 모든 mutation 은 preview→사용자 승인 (현행, 안전 기본)
     #   "auto"        — read/navigate 자동, mutation 은 여전히 승인 (추후)

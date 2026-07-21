@@ -229,8 +229,7 @@ class SchedulingAgent:
         """의존 복합이면 plan→execute. read-only 는 즉시 답변, mutate 는 승인 대기.
         plan 없음/실패면 None → 호출부가 ReAct 로 진행."""
         from agents_v2.middleware import execute_skill
-        from agents_v2.planning.orchestrate import (
-            build_clarify_form, preview_fingerprint, try_plan_run)
+        from agents_v2.planning.orchestrate import try_plan_run
         from db.client2 import SessionLocal
 
         # 계획은 복합 의존 추론이라 **메인 LLM** 사용(nano 라우터는 과생성/오류).
@@ -247,16 +246,55 @@ class SchedulingAgent:
             return None
         if run is None or run.failed:
             return None
+        return self._finalize_plan(run, ctx, user_message, messages, db)
+
+    def _resume_clarify(self, db, ctx, messages):
+        """clarify_form 답변(ctx.clarify_answers)을 계획 args 에 병합 후 재실행.
+
+        여전히 빠진 정보 있으면 다시 clarify_form, 아니면 승인/답변으로 진행.
+        """
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.executor import execute_plan
+        from agents_v2.planning.orchestrate import PlanRun, apply_clarify_answers
+        from agents_v2.planning.plan import Plan
+        from db.client2 import SessionLocal
+
+        pend = ctx.pending_clarify or {}
+        answers = ctx.clarify_answers or []
+        orig = pend.get("user_message", "")
+        plan_dict = apply_clarify_answers(pend.get("plan") or {}, answers)
+        ctx.pending_clarify = None
+        ctx.clarify_answers = None
+        try:
+            plan = Plan.from_dict(plan_dict)
+            run = PlanRun(plan=plan, exec=execute_plan(
+                db, plan, ctx, execute_skill, session_factory=SessionLocal,
+                collect_clarifications=True))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[agent_v3] clarify 재개 실패 → ReAct: %s", e)
+            return self._run_impl(db, orig, ctx, [])
+        if run.failed:
+            return self._run_impl(db, orig, ctx, [])  # 재개 중 STOP → ReAct fallback
+        return self._finalize_plan(run, ctx, orig, messages, db)
+
+    def _finalize_plan(self, run, ctx, user_message, messages, db):
+        """plan 실행 결과 → clarify_form / 승인대기 / 답변 분기(_try_dag_plan·_resume_clarify 공유)."""
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.orchestrate import build_clarify_form, preview_fingerprint
+
         trace = [Stage("plan", "ok",
                        {"tasks": [(t.id, t.skill, t.kind, t.deps) for t in run.plan.tasks]}, 0)]
         last = run.exec.outputs.get(run.plan.tasks[-1].id) if run.plan.tasks else None
         # 되물음 수집됐으면 승인/답변보다 먼저 — 구조화 clarify_form 으로 한 번에 질문.
         if run.exec.clarifications:
-            form = build_clarify_form(run.exec.clarifications)
+            form = build_clarify_form(run.exec.clarifications, plan=run.plan, ctx=ctx,
+                                      skill_tools=SKILL_TOOLS, db=db)
             qs = form["questions"]
             summary = "진행하려면 몇 가지 확인이 필요합니다:\n" + "\n".join(
                 f"- {q['question']}" + (f" (선택: {', '.join(q['options'])})" if q["options"] else "")
                 for q in qs)
+            # 프론트가 답을 채워 보내면(ctx.clarify_answers) _resume_clarify 로 재개.
+            ctx.pending_clarify = {"plan": run.plan.to_dict(), "user_message": user_message}
             return AgentResult(needs_clarification=True, question=summary, ui_actions=[form],
                                trace=trace, messages=messages, variable_memory=ctx.variable_memory)
         if run.needs_approval:
@@ -423,6 +461,10 @@ class SchedulingAgent:
             ]
 
         # ── Handle pending approval ──
+        # clarify 재개: 프론트가 clarify_form 답을 채워 보내면(ctx.clarify_answers) 계획 재실행.
+        if getattr(ctx, "pending_clarify", None) and getattr(ctx, "clarify_answers", None):
+            return self._resume_clarify(db, ctx, messages)
+
         if ctx.pending_approval:
             ptype = ctx.pending_approval.get("type")
             if ptype == "plan":

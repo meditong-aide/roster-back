@@ -3,8 +3,9 @@
 mock execute_fn (LLM 무관). needs_clarification=True → CLARIFICATION 분류.
 """
 from agents_v2.planning.executor import execute_plan
-from agents_v2.planning.orchestrate import build_clarify_form
+from agents_v2.planning.orchestrate import apply_clarify_answers, build_clarify_form
 from agents_v2.planning.plan import Plan, PlanTask
+from agents_v2.skills.descriptions import SKILL_TOOLS
 
 
 def _fn(returns):
@@ -52,6 +53,7 @@ def test_collect_off_stops_at_first_clarification():
 
 
 def test_build_clarify_form_shapes():
+    # plan/skill_tools 없으면 스킬이 준 options 로만(fallback)
     form = build_clarify_form([
         {"task": "t1", "skill": "s", "question": "q1", "options": ["a", "b"]},
         {"task": "t2", "skill": "s2", "question": "q2", "options": []},
@@ -60,3 +62,31 @@ def test_build_clarify_form_shapes():
     q1, q2 = form["questions"]
     assert q1["type"] == "select" and q1["options"] == ["a", "b"]
     assert q2["type"] == "input" and q2["options"] == []
+
+
+def test_form_enriches_enum_from_schema():
+    # 스키마 기반 보강: 누락된 required enum 파라미터 → select + enum 옵션(스킬 코드 수정 없이)
+    plan = Plan([PlanTask("t1", "manage_assignment", kind="mutate", args={})])  # operation 누락
+    clar = [{"task": "t1", "skill": "manage_assignment", "question": "뭘 할까요?", "options": []}]
+    form = build_clarify_form(clar, plan=plan, ctx=None, skill_tools=SKILL_TOOLS, db=None)
+    q = form["questions"][0]
+    assert q["param"] == "operation" and q["type"] == "select"
+    assert "create" in q["options"] and "cancel" in q["options"]
+
+
+def test_form_ctx_injected_params_not_asked():
+    # year/month 는 ctx 주입이라 안 물음 → operation 만
+    plan = Plan([PlanTask("t1", "manage_wanted_deadline", kind="mutate", args={})])
+    clar = [{"task": "t1", "skill": "manage_wanted_deadline", "question": "?", "options": []}]
+    form = build_clarify_form(clar, plan=plan, ctx=None, skill_tools=SKILL_TOOLS, db=None)
+    params = {q["param"] for q in form["questions"]}
+    assert "operation" in params and "year" not in params and "month" not in params
+
+
+def test_apply_clarify_answers_merges():
+    pd = {"tasks": [{"id": "t1", "skill": "manage_assignment", "args": {}}]}
+    apply_clarify_answers(pd, [{"task": "t1", "param": "operation", "value": "create"}])
+    assert pd["tasks"][0]["args"]["operation"] == "create"
+    # param=None(자유입력 fallback)은 무시
+    apply_clarify_answers(pd, [{"task": "t1", "param": None, "value": "x"}])
+    assert "operation" in pd["tasks"][0]["args"] and len(pd["tasks"][0]["args"]) == 1
