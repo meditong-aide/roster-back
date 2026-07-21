@@ -12,6 +12,13 @@ Design principles (research-backed):
 
 from __future__ import annotations
 
+from agents_v2.tools.constraint_tools import _AGENT_SETTABLE_FIELDS
+
+# update_constraint 의 field enum — dev 화이트리스트(단일 출처) + manpower(ShiftManage).
+# 플래너/LLM 이 정확한 컬럼명을 enum 에서 고르게 해 "Unknown config field" STOP 방지
+# (필드명 자유추측이 3건 dropout 의 원인이었음).
+_CONFIG_FIELD_ENUM: list[str] = sorted(_AGENT_SETTABLE_FIELDS) + ["manpower"]
+
 SKILL_TOOLS: list[dict] = [
     {
         "name": "query_schedule",
@@ -606,10 +613,12 @@ SKILL_TOOLS: list[dict] = [
             "properties": {
                 "field": {
                     "type": "string",
+                    "enum": _CONFIG_FIELD_ENUM,
                     "description": (
-                        "변경 대상 정책 필드. RosterConfig 필드명(예: max_nig_per_month, "
-                        "max_conseq_work, banned_day_after_eve, day_req 등) "
-                        "또는 'manpower'(ShiftManage 갱신용)."
+                        "변경 대상 정책 필드 — **반드시 위 enum 중 하나**. 자연어를 정확한 "
+                        "컬럼명으로 매핑: '연속근무'→max_conseq_work, '월 오프'→off_days, "
+                        "'야간 최대'→max_nig_per_month, '데이 필요인원'→day_req, "
+                        "'단발 나이트 금지'→not_one_night. 'manpower'는 ShiftManage(슬롯 인원)."
                     ),
                 },
                 "value": {
