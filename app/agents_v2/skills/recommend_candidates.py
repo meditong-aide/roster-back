@@ -24,6 +24,18 @@ def recommend_candidates(db: Session, params: dict) -> Any:
     shift_codes = params.get("shift_codes", [])
     exclude_ids = params.get("nurse_ids", [])  # nurses to exclude (already assigned)
 
+    # 대타 추천은 **하루 한 자리(언제·누구)**만 — 여러 일자/범위 차단.
+    # '기존 표 빈칸만 채우기'는 지원 안 함(부분 재solve 없음). 여러 날 재배치는 전체 재생성뿐.
+    _multi = (params.get("dates") or params.get("date_range")
+              or params.get("start_date") or params.get("end_date")
+              or (isinstance(date, str) and any(k in date for k in ("~", ",", "부터", "까지"))))
+    if _multi:
+        return {"needs_clarification": True,
+                "question": "대타 추천은 하루의 한 자리만 가능합니다. 어느 날짜의 대타를 찾을까요? "
+                            "(여러 날/빈칸 일괄 충원은 지원하지 않습니다 — 전체 재배치가 필요하면 "
+                            "근무표를 다시 생성하세요)",
+                "options": []}
+
     if not date:
         return {"error": "date required for candidate recommendation"}
 
