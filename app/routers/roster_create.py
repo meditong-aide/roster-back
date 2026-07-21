@@ -210,7 +210,11 @@ async def roster_create_async(
         try:
             return {
                 "mode": "sync",
-                "result": generate_roster_service(req, current_user, _db),
+                "result": generate_roster_service(
+                    req, current_user, _db,
+                    config_override=(getattr(req, "config_override", None) or None),
+                    treatment_ids=(getattr(req, "treatment_ids", None) or None),
+                ),
                 "materialized_config": materialized,
             }
         except Exception as exc:

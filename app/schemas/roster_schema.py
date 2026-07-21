@@ -109,6 +109,12 @@ class RosterRequest(BaseModel):
     # 굳히고(변경 시 '새로운 설정n') 라이브 동기화 후 config_id 를 결정한다. dict 로 받아
     # 서버에서 RosterConfigCreate 로 검증(스키마 정의 순서상 forward-ref 회피).
     config: Optional[Dict[str, Any]] = None
+    # 해결책(resolution) 재생성용: 실패 후 유저가 고른 옵션의 config delta 를 **이번 생성에만**
+    # override 로 주입한다(DB config 미변경, per-job transient). 프론트는 실패 payload 의
+    # resolution_options[i].apply 를 그대로 여기에 실어 /roster_create/async 를 다시 호출.
+    config_override: Optional[Dict[str, Any]] = None
+    # ontology treatment(비-config-key) 옵션 재생성용 — resolution_options[i].treatment_ids.
+    treatment_ids: Optional[List[str]] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
     # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.
