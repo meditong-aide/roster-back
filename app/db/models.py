@@ -567,7 +567,10 @@ class RosterConfig(Base):
     preceptee_shift_count = Column(BOOLEAN, nullable=False, default=True)
     weekly_off_group = Column(BOOLEAN)
     fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
-    ban_night_before_fixed_off = Column(BOOLEAN, nullable=False, default=True)
+    # ban_night_before_fixed_off: ORM 매핑 제거(DDL DROP 대상). 컬럼이 아니라 solver 기본값으로 존속 —
+    #   roster_config.py 의 dataclass 기본값(True) + cp_sat_basic create_config_from_db 의
+    #   config_data.get('ban_night_before_fixed_off', True) 가 컬럼 부재 시 동일 동작 보장(prod 전량 True).
+    #   재추가 금지: FE 미노출·probe/ontology 전용 상수-live 레버라 컬럼 저장 불필요.
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
