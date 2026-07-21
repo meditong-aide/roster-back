@@ -49,25 +49,35 @@ def _codes(cfg, n=20):
 
 
 # ── mapping (unit) ───────────────────────────────────────────────────────────
+# 2026-07-21 키 정규화: precheck config dict 키를 DB/엔진 canonical(max_nig_per_month /
+# max_conseq_work / off_days)로 통일. output/read 모두 DB 키. 구 dataclass 키는 fallback.
 def test_max_nig_per_month_forwarded_to_precheck_key():
-    assert _build(_cfg(2)).roster_config["max_night_shifts_per_month"] == 2
+    assert _build(_cfg(2)).roster_config["max_nig_per_month"] == 2
 
 
 def test_max_nig_zero_floored_to_15_like_engine():
     # 엔진 create_config_from_db: max_nig<=0 → 15. precheck 도 동일해야 false positive 없음.
-    assert _build(_cfg(0)).roster_config["max_night_shifts_per_month"] == 15
+    assert _build(_cfg(0)).roster_config["max_nig_per_month"] == 15
 
 
-def test_explicit_precheck_key_takes_precedence():
+def test_db_canonical_key_takes_precedence():
+    # DB 키(max_nig_per_month)가 canonical → 구 키(max_night_shifts_per_month) 있어도 DB 키 우선.
     cfg = _cfg(2)
     cfg["max_night_shifts_per_month"] = 7
-    assert _build(cfg).roster_config["max_night_shifts_per_month"] == 7
+    assert _build(cfg).roster_config["max_nig_per_month"] == 2
 
 
-def test_max_conseq_work_alias_forwarded():
+def test_legacy_key_still_read_as_fallback():
+    # DB 키가 없고 구 키만 있으면 fallback 으로 읽어 output(canonical)에 실린다.
+    cfg = {"daily_shift_requirements": {"D": 1, "E": 1, "N": 8},
+           "max_night_shifts_per_month": 5}
+    assert _build(cfg).roster_config["max_nig_per_month"] == 5
+
+
+def test_max_conseq_work_forwarded_canonical():
     cfg = _cfg(15)
     cfg["max_conseq_work"] = 4
-    assert _build(cfg).roster_config["max_consecutive_work"] == 4
+    assert _build(cfg).roster_config["max_conseq_work"] == 4
 
 
 # ── end-to-end (the bug it fixes) ────────────────────────────────────────────

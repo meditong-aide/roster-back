@@ -49,7 +49,7 @@ def _is_active_day(nurse: PrecheckNurse, d: int) -> bool:
 def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     return (
         int(cfg.get("global_monthly_off_days", 0) or 0)
-        + int(cfg.get("standard_personal_off_days", 0) or 0)
+        + int(cfg.get("off_days", cfg.get("standard_personal_off_days", 0)) or 0)
         + int(nurse.personal_off_adjustment or 0)
     )
 

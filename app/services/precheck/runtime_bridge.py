@@ -326,28 +326,30 @@ def build_precheck_input(
         "daily_shift_requirements": dict(config_dict.get("daily_shift_requirements") or {}),
         "daily_shift_requirements_by_day": list(config_dict.get("daily_shift_requirements_by_day") or []),
         "global_monthly_off_days": _safe_int(config_dict.get("global_monthly_off_days"), 0),
-        "standard_personal_off_days": _safe_int(config_dict.get("standard_personal_off_days"), 0),
+        # off 예산: DB/엔진 키는 off_days. (구 dataclass 키 standard_personal_off_days 는 fallback)
+        "off_days": _safe_int(
+            config_dict.get("off_days", config_dict.get("standard_personal_off_days")), 0),
     }
-    # closed-loop apply target keys — precheck 내부 체크는 max_night_shifts_per_month /
-    # max_consecutive_work 를 읽지만, 런타임/엔진 config 는 다른 키명(max_nig_per_month /
-    # max_conseq_work)을 쓴다. 필드명 불일치로 check_monthly_night_capacity 의 max_nig 상한
-    # 로직(Fix 2 α)이 실 config 에서 죽어있었다 → 두 표기 모두 해석해 forward 한다.
+    # 키 정규화(2026-07-21): precheck config dict 키를 **DB/엔진 canonical(max_nig_per_month /
+    # max_conseq_work / off_days)** 로 통일한다. 과거 precheck 는 max_night_shifts_per_month /
+    # max_consecutive_work 를 dict 키로 읽어 실 config(DB 키)와 불일치 → 상한 로직이 조용히
+    # 죽던 버그가 있었다. 이제 DB 키를 우선, 구 키는 fallback 으로만 읽고 DB 키로 output.
     #
     # 야간 한도는 엔진(create_config_from_db)과 동일 semantics 로 정규화:
     #   None / <=0  → 15 (엔진이 0·None garbage 를 15로 floor). precheck 가 엔진보다
     #   더 낮은 cap 을 쓰면 false positive 가 나므로, 반드시 동일 floor 를 적용한다.
-    _raw_max_nig = config_dict.get("max_night_shifts_per_month",
-                                   config_dict.get("max_nig_per_month"))
+    _raw_max_nig = config_dict.get("max_nig_per_month",
+                                   config_dict.get("max_night_shifts_per_month"))
     _mn = _safe_int(_raw_max_nig, 0) if _raw_max_nig is not None else None
     if _mn is not None:
-        roster_config["max_night_shifts_per_month"] = _mn if _mn > 0 else 15
+        roster_config["max_nig_per_month"] = _mn if _mn > 0 else 15
 
-    _raw_mcw = config_dict.get("max_consecutive_work",
-                               config_dict.get("max_conseq_work"))
+    _raw_mcw = config_dict.get("max_conseq_work",
+                               config_dict.get("max_consecutive_work"))
     if _raw_mcw is not None:
         _mcw = _safe_int(_raw_mcw, 0)
         if _mcw > 0:
-            roster_config["max_consecutive_work"] = _mcw
+            roster_config["max_conseq_work"] = _mcw
 
     # 상호배제(배반) 맵 forward — check_preceptee_sync_mismatch 가 preceptor-preceptee 페어가
     # 동시에 상호배제로 걸린 모순(함께근무 + 배반)을 탐지하는 데 쓴다.

@@ -140,7 +140,7 @@ def _active(nurse: PrecheckNurse, d: int) -> bool:
 def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     return (
         int(cfg.get("global_monthly_off_days", 0) or 0)
-        + int(cfg.get("standard_personal_off_days", 0) or 0)
+        + int(cfg.get("off_days", cfg.get("standard_personal_off_days", 0)) or 0)
         + int(nurse.personal_off_adjustment or 0)
     )
 
@@ -151,7 +151,7 @@ def _working_capacity(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     # 연속근무 상한(max_consecutive_work=C)은 실제 근무가능일을 추가로 조인다:
     # C일 근무 후 최소 1일 휴식 → span 내 최대 근무일 = span - span//(C+1) (상한).
     # cap 은 항상 상한이어야 하므로(하한이면 false positive) min 으로 결합한다.
-    mcw = cfg.get("max_consecutive_work")
+    mcw = cfg.get("max_conseq_work", cfg.get("max_consecutive_work"))
     if mcw is not None:
         try:
             c = int(mcw)
@@ -813,7 +813,7 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
     """
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     n_capable = [n for n in inp.nurses if "N" in _allowed_set(n, S)]
-    cfg_max_night = inp.roster_config.get("max_night_shifts_per_month")
+    cfg_max_night = inp.roster_config.get("max_nig_per_month", inp.roster_config.get("max_night_shifts_per_month"))
     try:
         cfg_max_night = int(cfg_max_night) if cfg_max_night is not None else None
     except (TypeError, ValueError):
