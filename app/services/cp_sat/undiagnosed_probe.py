@@ -22,15 +22,18 @@ from typing import Any, Callable
 # label_ko 는 사용자 노출용, family 는 그룹핑용. 침습도 낮은(=현실적인) 순서로.
 RELAX_CATALOG: list[dict[str, Any]] = [
     {"id": "raise_max_night_cap", "family": "night_cap", "label_ko": "월 야간 상한 완화",
-     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8}},
+     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8},
+     "search": {"key": "max_nig_per_month", "dir": "up", "hi": 31}},
     {"id": "disable_2n2off", "family": "night_recovery", "label_ko": "2N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_two_nig": False}},
     {"id": "disable_3n2off", "family": "night_recovery", "label_ko": "3N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_three_nig": False}},
     {"id": "raise_max_consec_work", "family": "consecutive", "label_ko": "연속근무 상한 완화",
-     "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3}},
+     "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3},
+     "search": {"key": "max_conseq_work", "dir": "up", "hi": 14}},
     {"id": "relax_consecutive_nights", "family": "night_consecutive", "label_ko": "연속 야간 상한 완화(+1)",
-     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1}},
+     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1},
+     "search": {"key": "max_consecutive_nights", "dir": "up", "hi": 7}},
     {"id": "disable_not_one_night", "family": "night_pattern", "label_ko": "단일 야간 금지 해제",
      "apply": lambda c: {"not_one_night": False}},
     {"id": "disable_ban_n_before_fixed_off", "family": "night_pattern", "label_ko": "고정OFF 직전 야간 금지 해제",
@@ -38,7 +41,8 @@ RELAX_CATALOG: list[dict[str, Any]] = [
     {"id": "disable_banned_day_after_eve", "family": "transition", "label_ko": "E→D 전이 금지 해제",
      "apply": lambda c: {"banned_day_after_eve": False}},
     {"id": "lower_off_days", "family": "off_budget", "label_ko": "월 OFF 요구일수 완화(-3)",
-     "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)}},
+     "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)},
+     "search": {"key": "off_days", "dir": "down", "lo": 0}},
     {"id": "disable_preceptee_sync", "family": "coupling", "label_ko": "프리셉티 동반(팔로우) 해제",
      "apply": lambda c: {"preceptee_on": False}},
     # ── verified 승격(2026-07-20): 기존엔 온톨로지 treatment(verified:false)만 있던 완화들.
@@ -223,6 +227,66 @@ def _find_combo(
     return None
 
 
+def _search_boundary(
+    base: dict[str, Any],
+    spec: dict[str, Any],
+    resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
+    *,
+    budget: int,
+    logger: Callable[[str], None],
+) -> tuple[int | None, int]:
+    """단조 노브의 **최소 침습 feasible 경계값**을 이분탐색.
+
+    고정 델타(+8 등) 대신 "실제로 풀리는 최소값"을 재solve 로 찾는다. 단조성:
+    up(max_nig↑ 등)=값↑→feasible 유지, down(off_days↓)=값↓→feasible 유지.
+    → 이분탐색이 정당하고 log(범위)회에 종료. budget(재solve 상한) 소진 시 현재까지의
+    feasible 경계(항상 유효한 값)를 반환 → graceful. (value, 사용 solves) 반환,
+    상/하한서도 불가면 (None, solves).
+    """
+    key = spec["key"]
+    _cur = base.get(key)
+    try:
+        cur = int(_cur) if _cur is not None else 0
+    except (TypeError, ValueError):
+        cur = 0
+    solves = 0
+
+    def feasible_at(v: int) -> bool:
+        nonlocal solves
+        cfg = dict(base)
+        cfg[key] = v
+        solves += 1
+        try:
+            ok, _ = resolve_fn(cfg)
+        except Exception:
+            ok = False
+        logger(f"[UndiagProbe][search] {key}={v} feasible={ok}")
+        return bool(ok)
+
+    if spec["dir"] == "up":
+        lo, hi = cur + 1, int(spec.get("hi", cur + 20))
+        if lo > hi or not feasible_at(hi):
+            return None, solves            # 상한서도 불가 → 이 노브 단독으로 못 풂
+        while lo < hi and solves < budget:  # hi 는 항상 feasible 유지(불변식)
+            mid = (lo + hi) // 2
+            if feasible_at(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return hi, solves                   # 최소 feasible 값
+    else:  # down
+        lo, hi = int(spec.get("lo", 0)), cur - 1
+        if lo > hi or not feasible_at(lo):
+            return None, solves            # 하한서도 불가
+        while lo < hi and solves < budget:  # lo 는 항상 feasible 유지
+            mid = (lo + hi + 1) // 2
+            if feasible_at(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, solves                   # 최소 침습(최대) feasible 값
+
+
 def probe_relaxations(
     base_config: dict[str, Any],
     resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
@@ -231,6 +295,7 @@ def probe_relaxations(
     verify: bool = True,
     try_combo: bool = True,
     max_combo: int = 3,
+    search_budget: int = 12,
     logger: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """결합제약을 하나씩 완화해 resolve_fn 으로 feasible 여부를 실측.
@@ -250,8 +315,40 @@ def probe_relaxations(
     all_probed: list[dict[str, Any]] = []
     resolutions: list[dict[str, Any]] = []
     combo: dict[str, Any] | None = None
+    _remaining = int(search_budget)
     try:
         for item in cat:
+            spec = item.get("search")
+            # ── 단조 노브: 고정 델타 대신 최소침습 feasible 값 이분탐색 ──
+            if spec and _remaining > 0:
+                val, used = _search_boundary(
+                    base_config, spec, resolve_fn,
+                    budget=min(6, _remaining), logger=logger,
+                )
+                _remaining -= used
+                if val is not None:
+                    delta = {spec["key"]: val}
+                    if all(base_config.get(k) == v for k, v in delta.items()):
+                        continue  # 이미 그 값(noop)
+                    logger(f"[UndiagProbe] {item['id']:30s} SEARCH→{spec['key']}={val} (solves={used})")
+                    all_probed.append({
+                        "id": item["id"], "family": item["family"], "label_ko": item["label_ko"],
+                        "delta": delta, "feasible": True,
+                        "info": {"searched": True, "value": val, "solves": used},
+                    })
+                else:
+                    # 상/하한서도 못 풂 → 이 노브 단독 불가(참고용 fixed delta 로 기록)
+                    try:
+                        delta = item["apply"](base_config)
+                    except Exception:
+                        continue
+                    all_probed.append({
+                        "id": item["id"], "family": item["family"], "label_ko": item["label_ko"],
+                        "delta": delta, "feasible": False,
+                        "info": {"searched": True, "found": False, "solves": used},
+                    })
+                continue
+            # ── (search 없음 또는 예산 소진) 기존 고정 델타 경로 ──
             try:
                 delta = item["apply"](base_config)
             except Exception as exc:  # 카탈로그 항목 자체 오류는 건너뜀
