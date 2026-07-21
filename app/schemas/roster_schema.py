@@ -853,7 +853,6 @@ class FixedWantedEntryCreate(BaseModel):
     source_type: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
     original_shift_id: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
     reason: Optional[str] = None
-    head_nurse_memo: Optional[str] = None
 
 
 class FixedWantedCreate(BaseModel):
@@ -879,7 +878,6 @@ class FixedWantedEntryResponse(BaseModel):
     source_type: str
     original_shift_id: Optional[str] = None
     reason: Optional[str] = None
-    head_nurse_memo: Optional[str] = None
     created_by: Optional[str] = None
 
     class Config:

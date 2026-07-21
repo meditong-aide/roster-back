@@ -2240,7 +2240,6 @@ def get_wanted_adjustment_service(
                     source_type=fe.source_type,
                     original_shift_id=fe.original_shift_id,
                     reason=fe.reason,
-                    head_nurse_memo=fe.head_nurse_memo,
                     created_by=fe.created_by,
                 ))
                 if fe.is_applied:
@@ -2278,7 +2277,6 @@ def get_wanted_adjustment_service(
                         source_type='original',
                         original_shift_id=None,
                         reason=sr.comment if sr.comment else None,
-                        head_nurse_memo=None,
                         created_by=None,
                     ))
                     monthly_summary[sr.shift] += 1
@@ -2315,7 +2313,6 @@ def get_wanted_adjustment_service(
                         source_type="weekly_off",
                         original_shift_id=None,
                         reason=None,
-                        head_nurse_memo=None,
                         created_by=None,
                     ))
                 monthly_summary["주"] = len(weekly_off_days)
@@ -2609,7 +2606,6 @@ def _insert_fixed_wanted_entries(
             source_type=resolved_source_type,
             original_shift_id=resolved_original_shift_id,
             reason=entry.reason,
-            head_nurse_memo=entry.head_nurse_memo,
             created_by=created_by,
         )
         db.add(new_entry)

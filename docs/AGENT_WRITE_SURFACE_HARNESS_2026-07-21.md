@@ -54,7 +54,7 @@ roster_config (DB row)
 | 테이블 | 도구 (`agents_v2/tools/`) | 위험 | 우선 | 상태 |
 |---|---|---|---|---|
 | **RosterConfig** | `constraint_tools.update_roster_config` | 자유 setattr → 스코프손상·상수값·하드락 | P0 | ✅ **가드 완료**(화이트리스트+범위+상수-live 제외) |
-| **FixedWantedEntry** | `wanted_tools.bulk_update_wanted_adjustments` | 자유 setattr(LLM `field`) → shift_id/is_applied 임의변경 | P0 | ⬜ 미착수 |
+| **FixedWantedEntry** | `wanted_tools.bulk_update_wanted_adjustments` | 자유 setattr(LLM `field`) → shift_id/is_applied 임의변경 | P0 | ✅ **가드 완료**(is_applied/reason/memo만 허용) |
 | **ShiftManage** | `constraint_tools.update_shift_manage_manpower` | manpower 값범위 무검증 → 과다=infeasible | P1 | ⬜ 미착수 |
 | **Nurse (+ period 위성)** | `nurse_tools.update_nurse_attributes_batch` | 화이트리스트·검증 있음. 단 allowed_shifts에서 N제거 시 기존 n_exact와 역방향 정합 없음 | P1 | 🟡 부분 |
 | **ScheduleEntry** | `schedule_tools.update_schedule_entry` | 셀 직접 덮어쓰기 → 하드제약 사후검증 없음(ND/NE/6연속 우회) | P1 | ⬜ 미착수 |
@@ -104,7 +104,7 @@ roster_config (DB row)
 
 ## 6. 다음 검토 착수 순서
 
-1. **P0 — `wanted_tools.bulk_update_wanted_adjustments`**: FixedWantedEntry 필드 화이트리스트(허용 컬럼만, shift_id 임의변경 차단).
+1. ✅ ~~P0 — `wanted_tools.bulk_update_wanted_adjustments`~~ (완료: is_applied/reason/head_nurse_memo만 허용, shift_id/정체성 차단).
 2. **P1 — `schedule_tools.update_schedule_entry`**: 8대 하드제약 사후검증 훅(셀 편집으로 ND/NE/6연속 생성 차단).
 3. **P1 — Nurse allowed_shifts ↔ NurseMonthlyLimit 역방향 정합**: 근무유형 변경 시 기존 월한도 재검증(`_check_work_shifts` 역적용).
 4. **P1 — ShiftManage.manpower 값범위 검증**.

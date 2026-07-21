@@ -922,9 +922,6 @@ class FixedWantedEntry(Base):
         NVARCHAR(10), nullable=True
     )  # 원본 근무코드 (수정된 경우)
     reason = Column(TEXT, nullable=True)  # 사유 (원본에서 복사 또는 신규 입력)
-    head_nurse_memo = Column(
-        TEXT, nullable=True
-    )  # 수간호사 메모 (반려 사유, 조정 코멘트 등)
     created_by = Column(
         VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=True
     )  # 생성자
