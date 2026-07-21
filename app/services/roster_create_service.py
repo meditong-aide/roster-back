@@ -5746,16 +5746,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             if _cpsat_cores:
                 print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores_raw)}건 → dedup {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
                 _conflict_cores = _conflict_cores + _cpsat_cores
-            # ── 실패-시-한번 MUS 진단 재solve ──
-            # primary 는 성능 위해 MUS off(기본). INFEASIBLE 인데 아직 MUS 코어가 없으면
-            # AIDE_ENABLE_MUS_REGISTRY 를 켜고 1회 재solve 해 wrap 된 하드제약(전이/회복/연속/
-            # coverage/off-cap/night-cap 등 20종)의 UNSAT core 를 추출한다. 이미 실패한 케이스만
-            # 타므로 정상 생성엔 영향 없음. graceful. (env 토글은 async 워커=단일작업 전제; 동시성
-            # 우려 시 per-call 플래그로 대체 예정. kill: MUS_DIAG_DISABLE=1.)
+            # ── 실패-시-한번 MUS 진단 재solve (기본 OFF, opt-in) ──
+            # 실측(2026-07-21): reified 재solve 는 core 추출 지점(cp_sat_basic:2285=첫 hard
+            # solve)이 실제 infeasibility 표면화 단계(broad_soft)를 안 덮어 **0 core** 를 낸다.
+            # 그동안 30~60초를 낭비할 뿐, 뒤의 undiag probe(재solve 탐색)가 원인+검증해결을
+            # 이미 제공한다("완화하면 풀린다"⟺"이게 원인"). 따라서 기본 스킵.
+            # 추출 지점을 broad_soft 까지 확장(별도 후속)한 뒤 MUS_DIAG_ENABLE=1 로 재활성.
             if not _cpsat_cores:
                 try:
                     import os as _os_mus
-                    if _os_mus.getenv("MUS_DIAG_DISABLE") != "1":
+                    if _os_mus.getenv("MUS_DIAG_ENABLE") == "1":
                         _prev_mus = _os_mus.environ.get("AIDE_ENABLE_MUS_REGISTRY")
                         _os_mus.environ["AIDE_ENABLE_MUS_REGISTRY"] = "1"
                         _mus_base = getattr(roster_system, "_effective_config_snapshot", None)
