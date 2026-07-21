@@ -161,6 +161,9 @@ def update_shift_manage_manpower(
     preview_only: bool = False,
 ) -> dict:
     """Update manpower requirement for a specific shift slot."""
+    # 값 무결성: manpower 는 일별 슬롯 요구인원 → 음수/비정상 차단(에이전트 자유입력 sanity).
+    if isinstance(new_manpower, bool) or not isinstance(new_manpower, int) or new_manpower < 0 or new_manpower > 99:
+        return {"error": f"manpower 는 0~99 범위의 정수여야 합니다: {new_manpower!r}"}
     # 중복행이 남아있을 수 있으므로 매칭되는 모든 행을 갱신한다(.first() 면 1행만 바뀌어
     # 로더의 최대 id 채택값과 stale 불일치 발생). old 값은 로더가 읽는 최대 id 행 기준.
     rows = (
