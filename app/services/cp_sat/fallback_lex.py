@@ -1997,6 +1997,21 @@ def optimize_fallback_lex_hard_first(
                 _blocked_3n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
                 n_offs_after_3n = _n_offs_after_map_3n.get(n, 0)
+                # MUS용 per-nurse 3N2OFF 회복 리터럴 (within-month gate)
+                _assume_3n2off_fb = None
+                if _assume_registry_fb is not None:
+                    _assume_3n2off_fb = _assume_registry_fb.create_literal(
+                        f"Recovery3N2OFF:nurse_{n}",
+                        meta={
+                            "node_id": f"recovery_3n2off:nurse_{n}",
+                            "type": "RecoveryOffNode", "label": "3N 후 2OFF 회복",
+                            "value": "3N→2OFF", "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "recovery_3n2off",
+                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "3N 연속 뒤 2OFF 회복 강제",
+                            "resolution_hint": "3N 후 2OFF 회복 정책(two_offs_after_three_nig)을 끄거나 완화하세요.",
+                        },
+                    )
                 _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
                 if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                     end_prev_block = m.NewBoolVar(f"end_3n_prev_soft_{n}")
@@ -2123,9 +2138,12 @@ def optimize_fallback_lex_hard_first(
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
                     xn2 = X(n, d - 2, night_idx)
+                    _enforce_3n_main_fb = [xn0, xn1, xn2]
+                    if _assume_3n2off_fb is not None:
+                        _enforce_3n_main_fb.append(_assume_3n2off_fb)
                     m.Add(
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
-                    ).OnlyEnforceIf([xn0, xn1, xn2])
+                    ).OnlyEnforceIf(_enforce_3n_main_fb)
         if cfg.two_offs_after_two_nig:
             _n_offs_after_map = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
@@ -2133,6 +2151,22 @@ def optimize_fallback_lex_hard_first(
                 _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
                 n_offs_after = _n_offs_after_map.get(n, 0)
+                # MUS용 per-nurse 2N2OFF 회복 리터럴 — within-month 회복 강제를 gate 해
+                # 회복이 병목이면 core 에 RecoveryOffNode 로 뜬다(프로덕션 fallback 경로).
+                _assume_2n2off_fb = None
+                if _assume_registry_fb is not None:
+                    _assume_2n2off_fb = _assume_registry_fb.create_literal(
+                        f"Recovery2N2OFF:nurse_{n}",
+                        meta={
+                            "node_id": f"recovery_2n2off:nurse_{n}",
+                            "type": "RecoveryOffNode", "label": "2N 후 2OFF 회복",
+                            "value": "2N→2OFF", "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "recovery_2n2off",
+                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "2N 연속 뒤 2OFF 회복 강제",
+                            "resolution_hint": "2N 후 2OFF 회복 정책(two_offs_after_two_nig)을 끄거나 완화하세요.",
+                        },
+                    )
                 # 전월 N tail 뒤 이미 소비된 OFF 수를 반영
                 _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
                 if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
@@ -2225,9 +2259,12 @@ def optimize_fallback_lex_hard_first(
                     xn_next = X(n, d + 1, night_idx)
                     end_block = m.NewBoolVar(f"end_2n_hard_{n}_{d}")
                     m.Add(end_block == xn_next.Not())
+                    _enforce_2n_main_fb = [xn_prev, xn_curr, end_block]
+                    if _assume_2n2off_fb is not None:
+                        _enforce_2n_main_fb.append(_assume_2n2off_fb)
                     m.Add(
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
-                    ).OnlyEnforceIf([xn_prev, xn_curr, end_block])
+                    ).OnlyEnforceIf(_enforce_2n_main_fb)
 
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):
