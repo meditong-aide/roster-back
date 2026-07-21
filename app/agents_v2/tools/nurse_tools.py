@@ -491,6 +491,32 @@ def update_nurse_attributes_batch(
         .filter(Nurse.nurse_id == nurse_id, Nurse.group_id == group_id)
         .first()
     )
+    # ④ 역방향 정합: 근무유형(allowed_shifts)을 특정 시프트 제외로 바꾸는데 현재/미래월에
+    #   그 시프트 양수 월한도(min/max/exact)가 있으면 생성 시 infeasible → 저장 차단
+    #   (monthly_limit._check_work_shifts 게이트의 역방향. 과거월은 무관).
+    _new_allowed = cs["changed_fields"].get("allowed_shifts")
+    if _new_allowed is not None:
+        from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
+        from db.models import NurseMonthlyLimit
+        from datetime import date as _d
+        _allowed = normalize_allowed_shift_codes(_new_allowed if isinstance(_new_allowed, list) else [])
+        if _allowed:  # 빈=제한없음 → skip
+            _ym = (lambda t: t.year * 100 + t.month)(_d.today())
+            for _lim in db.query(NurseMonthlyLimit).filter(NurseMonthlyLimit.nurse_id == nurse_id).all():
+                if (int(_lim.year or 0) * 100 + int(_lim.month or 0)) < _ym:
+                    continue
+                for _p in ("d", "e", "n"):
+                    if _p.upper() in _allowed:
+                        continue
+                    for _b in ("min", "max", "exact"):
+                        _val = getattr(_lim, f"{_p}_{_b}", None)
+                        if _val is not None and _val > 0:
+                            return {"error": (
+                                f"근무유형을 {sorted(_allowed)} 로 변경 불가 — {_lim.year}-{_lim.month} 에 "
+                                f"{_p.upper()} 월한도({_p}_{_b}={_val})가 있어 충돌(infeasible). "
+                                f"먼저 해당 월한도를 해제하세요."
+                            )}
+
     for f, v in cs["changed_fields"].items():
         if f == "allowed_shifts":
             # 허용 근무형 → nurse_allowed_shift_period 일원화. 컬럼은 단방향 투영(직접쓰기 금지).

@@ -13,7 +13,6 @@ from collections import defaultdict
 from services.day_windows import iter_nurse_days, build_active_days
 import random
 from services.constraints.grade_constraints import add_grade_constraints
-from services.objectives.team_objective import add_team_balance_objective_terms
 from services.cp_sat.shift_normalizer import (
     build_shift_normalizer as build_shift_normalizer_impl,
     normalize_shift_code as normalize_shift_code_impl,
@@ -482,7 +481,6 @@ class CPSATBasicEngine:
         req_exp_nurses = config_data.get('req_exp_nurses', 1)
         two_offs_per_week = config_data.get('two_offs_per_week', True)
         sequential_offs = config_data.get('sequential_offs', True)
-        even_nights = config_data.get('even_nights', True)
         enforce_clustered_offs = bool(config_data.get("enforce_clustered_offs", False))
         isolated_off_slack_penalty = int(config_data.get("isolated_off_slack_penalty", 300000) or 0)
         # if int(config_data.get('off_placement_mode', 0) or 0) != 0:
@@ -496,13 +494,6 @@ class CPSATBasicEngine:
             'N': 7.0,  # Night Keep은 더 높은 가중치
             'O': 10.0
         })
-        team_balance_enable = bool(config_data.get('team_balance_enable', False))
-        team_balance_gauge = int(config_data.get('team_balance_gauge', 0) or 0)
-        # team_balance_weight = int(config_data.get('team_balance_weight', 0) or 0)
-        # team_balance_top_days = int(config_data.get('team_balance_top_days', 0) or 0)
-        team_balance_focus = config_data.get('team_balance_focus_shifts')
-        team_balance_mode = config_data.get('team_balance_mode', 'balanced')
-        team_balance_shift_weights = config_data.get('team_balance_shift_weights') or {}
 
         def _normalize_requirements(req_map: dict | None) -> dict[str, int]:
             """요구 인력 맵을 D/E/N 기준으로 정규화한다.
@@ -570,7 +561,6 @@ class CPSATBasicEngine:
             two_offs_after_three_nig=two_offs_after_three_nig,
             two_offs_after_two_nig=two_offs_after_two_nig,
             sequential_offs=sequential_offs,
-            even_nights=even_nights,
             nod_noe=config_data.get('nod_noe', True),
             enforce_clustered_offs=enforce_clustered_offs,
             isolated_off_slack_penalty=isolated_off_slack_penalty,
@@ -592,13 +582,6 @@ class CPSATBasicEngine:
             preceptee_on=bool(config_data.get('preceptee_on', True)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
             use_mid=bool(config_data.get('use_mid', False)),
-            # team_balance_* 는 DB 의 team_balance_enable / team_balance_gauge 를 그대로 따른다.
-            # team_balance_top_days, weight 는 __post_init__ 가 gauge 로부터 자동 산출한다.
-            team_balance_enable=team_balance_enable,
-            team_balance_gauge=team_balance_gauge,
-            team_balance_focus_shifts=team_balance_focus,
-            team_balance_mode=team_balance_mode,
-            team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
             # - 빡빡하게 off_days에 맞추다 보면 연속근무가 길어지는 현상이 생길 수 있어,
             #   기본값은 +1 정도의 여유를 두고(필요하면 0으로 낮출 수 있음),
@@ -911,7 +894,7 @@ class CPSATBasicEngine:
         year: int, 
         month: int,
         grouped: List[dict],
-        grade_strategy: str = "BASE",
+        grade_strategy: str = "COMBINED",
         grade_config: dict | None = None,
         time_limit_seconds: int = 60,
         randomize: bool = True,           # ← 추가
@@ -1098,7 +1081,7 @@ class CPSATBasicEngine:
                 pass
             # Grade/Team/BASE 전략(모델 빌더에서 참조)
             # - 상위 서비스(roster_create_service)에서 roster_config 기반으로 결정된 값을 전달받는다.
-            setattr(roster_system, "grade_strategy", str(grade_strategy or "BASE").upper())
+            setattr(roster_system, "grade_strategy", "COMBINED")  # [ALWAYS_COMBINED] 전략 단일화(수행모드 폐기)
             setattr(roster_system, "grade_config", grade_config)
             # 고정된 셀 정보 처리
             fixed_cells = list(config_data.get('fixed_cells', []) or [])
@@ -1416,52 +1399,6 @@ class CPSATBasicEngine:
             shift_preferences, off_requests, pair_preferences = self.parse_preferences_from_db(
                 prefs_data, shift_id_to_main
             )
-        # ────────────────────────────── 프리셉터 페어링 반영 ──────────────────────────────
-        # nurses_data 내 preceptor_id 를 사용해 자동으로 함께 근무 선호를 추가한다.
-        try:
-            valid_ids = {row.get('nurse_id') for row in nurses_data}
-            seen_pairs = set()  # 중복 방지 (무방향)
-            added_cnt = 0
-            # 멤버십: nurse_preceptee_period 맵 있으면 그 달 active 프리셉티만 페어링(종료자 제외),
-            # 없으면(백필 전) 캐시 기반 전체 — 무회귀. 설계 §6.
-            _pte_auth_pair = bool(config_data.get("preceptee_period_authoritative")) if isinstance(config_data, dict) else False
-            _pte_map = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
-            _active_pte_ids = None
-            if _pte_auth_pair:  # 권위 모드: 그 달 active 만(빈 맵이면 전부 제외). 폴백이면 None(캐시 전체).
-                _active_pte_ids = {
-                    str(k) for k, v in (_pte_map or {}).items()
-                    if (v.get("days") if isinstance(v, dict) else v)
-                }
-            # 프리셉터-멘티 함께 근무 가중치: 기본 페어링 대비 강화
-            preceptor_pair_weight = float(getattr(config, 'pair_preference_weight', 3.0)) * 2.5
-            for row in nurses_data:
-                mentee_id = row.get('nurse_id')
-                # period SSOT(그 달 preceptor) 우선 — 캐시 preceptor_id 는 폴백(authoritative 아닐 때만).
-                _pinfo = (_pte_map or {}).get(str(mentee_id)) if _pte_map else None
-                preceptor_id = (_pinfo.get("preceptor_id") if isinstance(_pinfo, dict) else None) or row.get('preceptor_id')
-                if not mentee_id or not preceptor_id:
-                    continue
-                if _active_pte_ids is not None and str(mentee_id) not in _active_pte_ids:
-                    continue  # 권위 모드: 그 달 프리셉티 아님 → 페어링 제외
-                if preceptor_id not in valid_ids or preceptor_id == mentee_id:
-                    continue
-                key = frozenset((mentee_id, preceptor_id))
-                if key in seen_pairs:
-                    continue
-                pair_preferences.setdefault('work_together', [])
-                pair_preferences['work_together'].append({
-                    'nurse_1': mentee_id,
-                    'nurse_2': preceptor_id,
-                    'weight': preceptor_pair_weight,
-                    'source': 'preceptor'
-                })
-                seen_pairs.add(key)
-                added_cnt += 1
-            if added_cnt:
-                print(f"[CP-SAT-Basic] 프리셉터 페어링 {added_cnt}건 추가 적용")
-        except Exception as e:
-            print(f"[CP-SAT-Basic] 프리셉터 페어링 반영 중 오류: {e}")
-        # ────────────────────────────────────────────────────────────────────────
         # 6. 휴무 요청 적용
         if off_requests:
             with Timer("휴무 요청 적용"):
@@ -1796,10 +1733,9 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
 
-        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE/COMBINED 전략일 때만)
+        # Grade 배치 요약 출력/CSV 저장 및 로그
         try:
-            grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
+            if grade_config:
                 _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="solve 직후"
@@ -2232,7 +2168,6 @@ class CPSATBasicEngine:
             logger_prefix=self.logger_prefix,
             timer_cls=Timer,
             add_preceptor_terms_fn=_add_preceptor_objective_terms,
-            add_team_balance_terms_fn=add_team_balance_objective_terms,
             add_grade_constraints_fn=add_grade_constraints,
             postprocess_rebalance_off_fn=(lambda *_args, **_kwargs: None),
             blocked_by_nurse=getattr(roster_system, 'blocked_by_nurse', None),
@@ -5326,7 +5261,7 @@ def generate_roster_cp_sat(
     time_limit_seconds=60,
     randomize=True,
     seed=None,
-    grade_strategy: str = "BASE",
+    grade_strategy: str = "COMBINED",
     grade_config: dict | None = None,
 ):
     """

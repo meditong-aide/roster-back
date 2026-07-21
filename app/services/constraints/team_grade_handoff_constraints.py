@@ -114,7 +114,7 @@ def add_team_grade_handoff_constraints(
     join: list[int],
     leave: list[int],
     *,
-    grade_strategy: str = "BASE",
+    grade_strategy: str = "COMBINED",
 ) -> list:
     """팀×grade 교차 handoff 제약을 추가한다. 목적함수 항 리스트를 반환."""
     obj_terms: list = []
@@ -122,10 +122,6 @@ def add_team_grade_handoff_constraints(
     if _impact_modes is None:
         _impact_modes = []
         setattr(rs, "_constraint_impact_constraint_modes", _impact_modes)
-    gs = str(grade_strategy or "BASE").upper()
-    if gs not in ("COMBINED",):
-        return obj_terms
-
     cfg = rs.config
     policy_by_team: dict[str, dict] = dict(getattr(cfg, "team_handoff_policy_by_team", {}) or {})
     if not policy_by_team:
@@ -150,7 +146,7 @@ def add_team_grade_handoff_constraints(
         "effective_mode": "soft_fallback" if allow_soft else "enforced",
         "source_file": "app/services/constraints/team_grade_handoff_constraints.py",
         "reason": "team grade handoff active",
-        "evidence": {"strategy": gs, "penalty_weight": penalty_weight},
+        "evidence": {"strategy": str(grade_strategy or "COMBINED").upper(), "penalty_weight": penalty_weight},
     })
 
     s_D = _shift_index(rs, "D")

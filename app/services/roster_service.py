@@ -173,7 +173,7 @@ def _propagate_use_mid_all_configs(db, office_id, group_id, use_mid) -> None:
 
 # materialize 비교에서 제외: 메타 + ShiftManage 파생(day/eve/nig) + use_mid(그룹 정본)
 _COMPARE_EXCLUDE = {
-    'config_id', 'config_name', 'config_memo', 'config_version',
+    'config_id', 'config_name', 'config_memo',
     'day_req', 'eve_req', 'nig_req', 'use_mid',
 }
 
@@ -1493,7 +1493,6 @@ def create_issued_roster_snapshot(
         if cfg:
             config_json = {
                 "config_id": cfg.config_id,
-                "config_version": cfg.config_version,
                 "office_id": cfg.office_id,
                 "group_id": cfg.group_id,
                 "day_req": cfg.day_req,
@@ -1510,12 +1509,8 @@ def create_issued_roster_snapshot(
                 "max_conseq_work": cfg.max_conseq_work,
                 "off_days": cfg.off_days,
                 "shift_priority": cfg.shift_priority,
-                "weekend_shift_ratio": cfg.weekend_shift_ratio,
-                "patient_amount": cfg.patient_amount,
                 "sequential_offs": cfg.sequential_offs,
-                "even_nights": cfg.even_nights,
                 "nod_noe": cfg.nod_noe,
-                "preceptor_gauge": cfg.preceptor_gauge,
                 "preceptee_on": cfg.preceptee_on,
                 "preceptee_shift_count": cfg.preceptee_shift_count,
                 "created_at": cfg.created_at.isoformat()

@@ -539,109 +539,6 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     }
 
 
-def _fetch_grade_strategy_from_roster_config(db: Session, config_id: int | None) -> str | None:
-    """roster_config 테이블에서 grade_strategy 값을 조회한다(있으면).
-
-    Notes:
-        - DB에 컬럼이 없을 수 있으므로 INFORMATION_SCHEMA로 확인 후 조회한다.
-        - 값이 없거나 비어있으면 None을 반환한다.
-    """
-    if not config_id:
-        return None
-    if not _column_exists(db, "roster_config", "grade_strategy"):
-        return None
-    try:
-        row = db.execute(
-            text("SELECT grade_strategy FROM roster_config WHERE config_id = :cid"),
-            {"cid": int(config_id)},
-        ).fetchone()
-    except Exception:
-        return None
-    if not row:
-        return None
-    val = getattr(row, "grade_strategy", None)
-    if val is None:
-        try:
-            val = row[0]
-        except Exception:
-            val = None
-    if not val:
-        return None
-    return str(val).upper()
-
-
-def _resolve_grade_strategy(
-    db: Session,
-    config_dict: dict,
-    office_id: str,
-    group_id: str,
-    roster_config_id: int | None,
-) -> tuple[str, dict | None]:
-    """TEAM/GRADE/BASE 전략을 단순하게 결정하고, 필요한 경우 grade_config를 함께 반환한다.
-
-    우선순위:
-        1) roster_config.grade_strategy 컬럼이 있으면 그 값을 최우선 사용한다.
-        2) 없으면(구버전 호환):
-            - team_balance_enable == 1 → TEAM
-            - roster_grade_config.constraints_json이 비어있지 않음 → GRADE
-            - 그 외 → BASE
-
-    Returns:
-        (grade_strategy, grade_config_or_none)
-    """
-    # [ALWAYS_COMBINED] 정책(2026-06): 전략은 항상 COMBINED(team+grade 동시).
-    #   프론트/DB의 grade_strategy 컬럼이 BASE 여도 백엔드가 COMBINED 로 해석하여
-    #   roster_grade_config(grade min/max)를 항상 로드·적용한다.
-    #   - grade_config 에 제약이 없으면 grade 항은 자동 no-op(부작용 없음).
-    #   - team 항은 team_min/team 데이터 있을 때만 활성(없으면 no-op).
-    #   원복: 이 블록만 제거하면 아래 레거시(컬럼 우선 + 구버전 폴백) 로직으로 복귀.
-    _gc_always = _fetch_grade_config_dict(db, office_id, group_id)
-    return "COMBINED", _gc_always
-
-    # 1) DB 컬럼 우선
-    s = _fetch_grade_strategy_from_roster_config(db, roster_config_id)
-    if s in ("BASE", "TEAM", "GRADE", "COMBINED"):
-        if s in ("GRADE", "COMBINED"):
-            gc = _fetch_grade_config_dict(db, office_id, group_id)
-            return s, gc
-        return s, None
-
-    # 2) 구버전 폴백(요청 바디 말고 config_dict 기반)
-    if bool(config_dict.get("team_balance_enable", False)):
-        return "TEAM", None
-
-    gc = _fetch_grade_config_dict(db, office_id, group_id)
-    if bool((gc or {}).get("constraints_json") or {}) or bool((gc or {}).get("constraints_max_json") or {}):
-        return "GRADE", gc
-    return "BASE", None
-
-
-def _has_any_grade_constraints(grade_config: dict | None) -> bool:
-    gc = grade_config or {}
-    return bool(
-        (gc.get("constraints_json") or gc.get("constraints") or {})
-        or (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
-    )
-
-
-def _select_effective_grade_strategy(
-    req_strategy: str,
-    resolved_strategy: str,
-    grade_config: dict | None,
-) -> str:
-    req = str(req_strategy or "").upper()
-    resolved = str(resolved_strategy or "BASE").upper()
-
-    if req == "COMBINED" and _has_any_grade_constraints(grade_config):
-        return "COMBINED"
-    if req == "GRADE" and _has_any_grade_constraints(grade_config):
-        return "GRADE"
-    if req == "TEAM":
-        return "TEAM"
-    if req == "BASE":
-        return "BASE"
-    return resolved
-
 def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
     shift_manages = (
@@ -3001,31 +2898,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             )
         except Exception as _log_exc:
             print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")
-        # 기본 전략은 DB(roster_config.grade_strategy) 기준으로 잡되,
-        # 요청에서 COMBINED/GRADE를 명시하고 grade 제약이 존재하면 해당 전략을 우선 적용한다.
-        grade_strategy, grade_config = _resolve_grade_strategy(
-            db=db,
-            config_dict=config_dict,
-            office_id=current_user.office_id,
-            group_id=current_user.group_id,
-            roster_config_id=getattr(latest_config, "config_id", None),
+        # [ALWAYS_COMBINED] 전략은 항상 COMBINED(team+grade 동시). 요청 바디 grade_strategy 는 무시.
+        #   grade_config 는 항상 로드 — grade 제약 없으면 grade 항 자동 no-op, team 항은 team 데이터 있을 때만 활성.
+        grade_config = _fetch_grade_config_dict(
+            db, current_user.office_id, current_user.group_id
         )
-        # 요청 바디에서 GRADE/COMBINED일 때는 DB에서 grade_config를 조회해 엔진에 전달
         engine_grade_config = grade_config
-        if str(getattr(req, "grade_strategy", "") or "").upper() in ("GRADE", "COMBINED"):
-            engine_grade_config = _fetch_grade_config_dict(
-                db, current_user.office_id, current_user.group_id
-            )
         if bool(config_dict.get("_force_grade_max_soft_fallback")) and isinstance(engine_grade_config, dict):
             engine_grade_config = dict(engine_grade_config)
             engine_grade_config["allow_soft_fallback"] = True
             print("[GradeFallback] force allow_soft_fallback=True (grade_max soft)")
-        req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
-        effective_grade_strategy = _select_effective_grade_strategy(
-            req_strategy=req_strategy,
-            resolved_strategy=grade_strategy,
-            grade_config=engine_grade_config,
-        )
+        effective_grade_strategy = "COMBINED"
         # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
         config_dict["grade_strategy"] = effective_grade_strategy
         cp_sat_result = generate_roster_cp_sat(
@@ -4280,83 +4163,6 @@ def _build_default_shift_mapping(shifts: list[Shift]) -> dict[str, str]:
     return mapping
 
 
-def _apply_preceptor_gauge(config_dict: dict, gauge: int | None) -> None:
-    """프리셉터 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
-
-    Args:
-        config_dict: 엔진에 전달할 설정 딕셔너리 (in-place 수정)
-        gauge: 프론트에서 전달한 게이지 값(0~10). None이면 미적용
-    """
-
-    if gauge is None:
-        return
-    print(f"프리셉터 게이지: {gauge}")
-    g = max(0, min(10, int(gauge)))
-    # 강도: 0→0.2x, 10→2.0x
-    strength = round(0.2 + 0.18 * g, 2)
-    # 상위 일수 K: 0→4, 10→30
-    top_k = int(4 + (30 - 4) * (g / 10.0))
-    # 최소 가중치 하한: 0→10.0, 10→5.0
-    min_w = round(10.0 - 0.5 * g, 2)
-
-    config_dict['preceptor_enable'] = g > 0
-    config_dict['preceptor_strength_multiplier'] = strength
-    config_dict['preceptor_top_days'] = top_k
-    config_dict['preceptor_min_pair_weight'] = min_w
-    # # 교대 포커스: 게이지 낮음→N, 중간→E/N, 높음→D/E/N
-    # if g <= 3:
-    #     config_dict['preceptor_focus_shifts'] = ['N']
-    # elif g <= 6:
-    #     config_dict['preceptor_focus_shifts'] = ['E','N']
-    # else:
-    #     config_dict['preceptor_focus_shifts'] = ['D','E','N']
-    # print(f"[프리셉터 게이지] g={g} → strength={strength}x, top_k={top_k}, min_w={min_w}, focus={config_dict['preceptor_focus_shifts']}")
-    print(f"[프리셉터 게이지] g={g} → strength={strength}x, top_k={top_k}, min_w={min_w}")
-
-
-def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
-    """
-    팀 균등/집중 보너스 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
-    - enable이 False이면 weight/top_days를 0으로 초기화
-    """
-    enable_flag = bool(config_dict.get("team_balance_enable", False))
-    g = gauge if gauge is not None else config_dict.get("team_balance_gauge", 0)
-    g = max(0, min(10, int(g or 0)))
-    enable = enable_flag and g > 0
-    config_dict["team_balance_gauge"] = g
-    config_dict["team_balance_enable"] = enable
-
-    # 정규화된 팀 보너스 강도(soft) 매핑:
-    # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
-    # 식: weight = round(cap * (g/10)^p)
-    # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
-    cap = int(config_dict.get("team_balance_weight_cap", 240) or 240)
-    power = float(config_dict.get("team_balance_weight_power", 1.7) or 1.7)
-    cap = max(0, min(500, cap))  # 안전 상한(임의 폭주 방지)
-    power = max(0.5, min(3.0, power))
-
-    if enable:
-        g_norm = g / 10.0
-        config_dict["team_balance_weight"] = int(round(cap * (g_norm ** power)))
-        config_dict["team_balance_top_days"] = int(6 + (30 - 6) * g_norm)
-    else:
-        config_dict["team_balance_weight"] = 0
-        config_dict["team_balance_top_days"] = 0
-    if "team_balance_focus_shifts" not in config_dict:
-        config_dict["team_balance_focus_shifts"] = None
-    if "team_balance_mode" not in config_dict:
-        config_dict["team_balance_mode"] = "balanced"
-
-    # 모드별 교대 가중치가 비어있으면 기본값을 채운다.
-    if not config_dict.get("team_balance_shift_weights"):
-        mode = str(config_dict.get("team_balance_mode", "balanced") or "balanced").lower()
-        if mode == "focus_d":
-            config_dict["team_balance_shift_weights"] = {"D": 1.5, "E": 0.6, "N": 0.3}
-        elif mode == "focus_de":
-            config_dict["team_balance_shift_weights"] = {"D": 1.2, "E": 1.2, "N": 0.5}
-        else:
-            config_dict["team_balance_shift_weights"] = {"D": 1.0, "E": 1.0, "N": 1.0}
-
 def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
     """req(임시 UI 대체)로 전달된 분배 정책 파라미터를 config_dict에 반영한다.
 
@@ -4791,10 +4597,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         config_dict["max_extra_off_days"] = 6 if _has_2n2o else 1
     if config_dict.get("extra_off_penalty_weight") is None:
         config_dict["extra_off_penalty_weight"] = 80
-    # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──
-    
-    _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
-    _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
     _apply_distribution_policy_from_req(config_dict, req)
     # 경계 제약 기능 기본값
     config_dict.setdefault("cross_month_hard_rules_enable", True)

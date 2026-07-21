@@ -30,7 +30,6 @@ class NurseRosterConfig:
     
     # 병원 내규 (소프트 제약)
     sequential_offs: bool = True  # OFF 연속 배정
-    even_nights: bool = True  # N 개수 균등 배정
     nod_noe: bool = True  # N-O-D/E 패턴 최소화 적용 여부
     
     # 휴무일 관리
@@ -38,33 +37,11 @@ class NurseRosterConfig:
     standard_personal_off_days: int = 8  # 간호사별 표준 개인 휴무일 수
     max_extra_off_days: int = 3  # 월 최소 휴무 기준 대비 허용되는 추가 OFF 상한(n)
     extra_off_penalty_weight: int = 80  # 추가 OFF(여유 OFF)를 기피하는 목적함수 패널티 가중치
-    # GRADE/coverage 충족을 위해 per-nurse OFF cap을 추가로 풀어주는 여유 일수.
-    # 솔버는 extra_off_penalty_weight 때문에 *필요할 때만* 이 여유를 사용함.
-    # 후처리(OffSwap, off_swap_enabled=True)가 baseline=off_days 초과분을 연차로 라벨링하므로
-    # 사실상 "연차로 흡수 가능한 추가 OFF" 역할. 기본 0(기존 동작 유지).
-    off_cap_relax_extra: int = 0
     # 월 합계 GRADE hard constraint (soft + 10× weight로 사실상 hard).
     # per-day는 allow_soft_fallback=True의 soft penalty 유지(KLD 자유도 보존),
     # 월 누계는 grade demand×D를 거의 강제 → grade 비율 보장.
     # 시화병원처럼 인원 vs demand가 빡센 케이스에서 GRADE 트레이드오프 곡선 확장.
     grade_monthly_hard: bool = True
-    # Layer 2 total work target에 grade demand 비례 bias.
-    # nurse target_work = baseline + α × (grade_natural_work - baseline)
-    # α=0: 기존 동작 (모든 nurse가 baseline_work_target 동일)
-    # α=0.5: 잉여 grade는 약하게 work 낮춤, 부족 grade는 약하게 work 높임
-    # 폐기된 grade-aware target과 달리 α로 강도 조절 → OFF 양극화 완화
-    grade_target_bias_alpha: float = 0.0
-    # α 자동 산출 (auto=True): shortage/surplus 비율로 매 solve마다 자동 결정.
-    # 인원 vs demand가 빡센 케이스: α↑ (잉여 grade가 양보), 여유 케이스: α=0 (bias 비활성).
-    # pre-solve feasibility 진단도 함께 수행 (demand > capacity 시 경고 log).
-    # 시화병원 검증 결과 monthly_hard와 결합 시 N/D-E 양극화 부작용 발생.
-    # 기본 비활성. 필요 시 케이스별로 ON 가능.
-    grade_target_bias_alpha_auto: bool = False
-    # Layer 1.5: per-nurse |D-E|, |E-N|, |D-N| balance 직접 minimize (X축 균등).
-    # 기존 KLD는 shift별 따로 균등화 → 한 nurse의 D=10/E=0 같은 양극화 약하게만 페널티.
-    # 이 항은 같은 사람 내 시프트 비대칭을 직접 0에 끌어당김. 전담자(allowed shift 1개)는 제외.
-    # 0: 비활성, 30000~90000: 적정. default는 KLD per-shift weight 수준.
-    kld_balance_weight: int = 0  # X-ratio cap이 X축을 직접 모델링하므로 보조항 비활성
     # Per-nurse 시프트 상한 soft cap (자동 산출, hardcode 없음):
     # Y축: N count ≤ N_target × ratio (예: 6.43 × 1.5 = 9.6 → floor 9)
     # X축: max(D,E) ≤ ratio × min(D,E)
@@ -94,7 +71,6 @@ class NurseRosterConfig:
     # 수렴된 균등해가 stage3 warm-start hint로 상속되어 X축(D/E 1.5배) 균형을 안정화한다.
     de_balance_enable: bool = True
     de_balance_tolerance: int = 2  # |D-E| 허용 밴드(일). 초과분만 soft 벌점.
-    off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)
     off_first: bool = False  # off_first=False(default): OFF 규칙 우선(OFF cap 충족 + max coverage 무시 + 남는 셀 근무 배정 + fixed_wanted 차감) / off_first=True: 근무 규칙 우선(현행 min-max coverage 균등화 유지, min 근접 배정)
     distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off
     monthly_preference_weight: int = 60  # 월단위 선호(개인 입력) 보너스 가중치(soft)
@@ -109,8 +85,6 @@ class NurseRosterConfig:
     
     # 선호도 행렬 가중치
     night_nurse_weight: float = 2.0  # 야간 간호사의 야간 근무 가중치
-    experience_weight: float = 1.5  # 경력 간호사 가중치
-    consecutive_shift_penalty: float = -1.0  # 원치 않는 연속 근무에 대한 패널티
     
     # 선호도 가중치
     shift_preference_weights: Dict[str, float] = field(default_factory=lambda: {
@@ -135,14 +109,7 @@ class NurseRosterConfig:
     use_mid: bool = False                               # True 시 DENO → DENMO 커버리지 전환
 
     # --- 신규 Hard Constraint 제어 파라미터 ---
-    enforce_seniority_pairing: bool = True # 시니어-주니어 동반 근무 규칙 강제 여부
     ban_night_before_fixed_off: bool = True  # fixed_wanted 비근무(휴무/휴가/공가 등) 직전일 N 배치 금지
-    junior_pairing_max_experience: int = 2 # 주니어로 간주할 최대 연차
-    senior_pairing_min_experience: int = 6 # 시니어로 간주할 최소 연차
-    enforce_E_after_D_constraint: bool = True # E -> D 근무 금지 규칙 강제 여부
-    
-    # 소프트맥스 샘플링 온도
-    sampling_temperature: float = 2.0
     
     # 근무 요구사항 우선순위 (0~1) - 1에 가까울수록 더 강하게 근무 요구사항 강제
     shift_requirement_priority: float = 0.8  # 근무 요구사항 우선순위
@@ -153,14 +120,6 @@ class NurseRosterConfig:
     # --- Oversupply(여유 인원) 균등화 제어 ---
     oversupply_equalize_enable: bool = True  # 일별 D/E/N 초과 인원(L1) 균등화 활성화
     oversupply_equalize_weight: int = 120    # L1 차이 패널티 가중치(클수록 균등화 강함)
-    # --- 팀 균등/집중 분배 옵션 ---
-    team_balance_enable: bool = False               # 팀 보너스 활성화
-    team_balance_gauge: int = 0                     # 0~10 게이지
-    team_balance_weight: int = 0                    # 계산된 기본 가중치
-    team_balance_top_days: int = 0                  # 동일 교대 보너스에서 고려할 상위 일수
-    team_balance_focus_shifts: Optional[List[str]] = None  # 교대 제한 (없으면 D/E/N)
-    team_balance_mode: str = "balanced"             # balanced | focus_D | focus_DE
-    team_balance_shift_weights: Dict[str, float] = field(default_factory=dict)  # 모드별 파생 가중치
     # ── 팀별 일일 최소 시프트 커버리지 ──
     # team_min_by_team[team_id_str] = {'D': 1, 'E': 1, 'N': 0}
     # 팀마다 개별 min 설정 가능. use_mid=True 일 때 'M' 키 사용 가능.
@@ -183,33 +142,7 @@ class NurseRosterConfig:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
         if self.soft_max_consecutive_work_days is None:
             self.soft_max_consecutive_work_days = int(self.max_consecutive_work_days)
-        # 팀 게이지 → 가중치/탑K
-        gauge = max(0, min(10, int(self.team_balance_gauge or 0)))
-        if not self.team_balance_enable or gauge == 0:
-            self.team_balance_weight = 0
-            self.team_balance_top_days = 0
-        else:
-            if not self.team_balance_weight:
-                # 정규화된 팀 보너스 강도(soft) 매핑:
-                # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
-                # 식: weight = round(cap * (g/10)^p)
-                # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
-                cap = 240
-                power = 1.7
-                g_norm = gauge / 10.0
-                self.team_balance_weight = int(round(cap * (g_norm ** power)))
-            if not self.team_balance_top_days:
-                self.team_balance_top_days = int(6 + (30 - 6) * (gauge / 10.0))
-        # 모드 기반 shift weight 설정 (없을 때만 세팅)
-        if not self.team_balance_shift_weights:
-            mode = (self.team_balance_mode or "balanced").lower()
-            if mode == "focus_d":
-                self.team_balance_shift_weights = {"D": 1.5, "E": 0.6, "N": 0.3}
-            elif mode == "focus_de":
-                self.team_balance_shift_weights = {"D": 1.2, "E": 1.2, "N": 0.5}
-            else:
-                self.team_balance_shift_weights = {"D": 1.0, "E": 1.0, "N": 1.0}
-            
+
     @property
     def shift_types(self) -> List[str]:
         """휴무일을 포함한 교대 유형 목록을 반환합니다."""

@@ -542,7 +542,6 @@ class ShiftPreference(Base):
 class RosterConfig(Base):
     __tablename__ = "roster_config"
     config_id = Column(INTEGER, primary_key=True, autoincrement=True)
-    config_version = Column(VARCHAR(20))
     office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"))
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
     day_req = Column(INTEGER)
@@ -561,24 +560,19 @@ class RosterConfig(Base):
     # 연속 OFF 최대 개수(soft 상한). NULL=앱 기본 3 적용. (k+1)연속 OFF 고weight 벌점, 불가피 시 양보.
     max_conseq_off = Column(INTEGER, nullable=True)
     shift_priority = Column(FLOAT)
-    weekend_shift_ratio = Column(FLOAT)
-    patient_amount = Column(INTEGER)
     sequential_offs = Column(BOOLEAN)
-    even_nights = Column(BOOLEAN)
     nod_noe = Column(BOOLEAN)
     not_one_night = Column(BOOLEAN, nullable=False, default=False)
     use_mid = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
-    preceptor_gauge = Column(INTEGER, nullable=False, default=5)
     preceptee_on = Column(BOOLEAN, nullable=False, default=False)
     preceptee_shift_count = Column(BOOLEAN, nullable=False, default=True)
     weekly_off_group = Column(BOOLEAN)
-    team_balance_enable = Column(BOOLEAN, nullable=False, default=False)
-    team_balance_gauge = Column(INTEGER, nullable=False, default=0)
-    team_balance_mode = Column(VARCHAR(20), nullable=False, default="balanced")
-    off_placement_mode = Column(INTEGER, nullable=False, default=0)
     fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
-    ban_night_before_fixed_off = Column(BOOLEAN, nullable=False, default=True)
+    # ban_night_before_fixed_off: ORM 매핑 제거(DDL DROP 대상). 컬럼이 아니라 solver 기본값으로 존속 —
+    #   roster_config.py 의 dataclass 기본값(True) + cp_sat_basic create_config_from_db 의
+    #   config_data.get('ban_night_before_fixed_off', True) 가 컬럼 부재 시 동일 동작 보장(prod 전량 True).
+    #   재추가 금지: FE 미노출·probe/ontology 전용 상수-live 레버라 컬럼 저장 불필요.
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
@@ -933,9 +927,6 @@ class FixedWantedEntry(Base):
         NVARCHAR(10), nullable=True
     )  # 원본 근무코드 (수정된 경우)
     reason = Column(TEXT, nullable=True)  # 사유 (원본에서 복사 또는 신규 입력)
-    head_nurse_memo = Column(
-        TEXT, nullable=True
-    )  # 수간호사 메모 (반려 사유, 조정 코멘트 등)
     created_by = Column(
         VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=True
     )  # 생성자

@@ -147,7 +147,6 @@ def get_wanted_adjustments(
             "original_shift_id": r.original_shift_id,
             "is_applied": bool(r.is_applied) if hasattr(r, "is_applied") else True,
             "reason": r.reason,
-            "head_nurse_memo": r.head_nurse_memo,
         }
         for r in rows
     ]
@@ -188,6 +187,27 @@ def get_submission_status(
     }
 
 
+# 에이전트가 원티드 조정(fixed_wanted_entries)으로 설정 가능한 필드 화이트리스트.
+# 의도된 사용 = is_applied(고정원티드 적용/반려, bulk_mutation target_field 기본값).
+# reason = FE 에 실제 표시되는 사유(modal-roster-wanted.tsx). 나머지(id/group_id/year/month/
+# nurse_id/shift_date/shift_id/source_type/original_shift_id/created_*/updated_*/shifts_table_id)는
+# 정체성·스코프·커버리지 직결이라 차단.
+_WANTED_ADJ_SETTABLE = frozenset({"is_applied", "reason"})
+
+
+def _validate_wanted_adj_field(field: str, value) -> str | None:
+    """원티드 조정(FixedWantedEntry) 쓰기 검증. 통과 시 None, 실패 시 에러 메시지."""
+    if field not in _WANTED_ADJ_SETTABLE:
+        return (
+            f"'{field}' 은(는) 원티드 조정으로 설정할 수 없는 필드입니다. "
+            f"허용: {sorted(_WANTED_ADJ_SETTABLE)}"
+        )
+    if field == "is_applied" and not isinstance(value, bool):
+        if value not in (0, 1, "0", "1", "true", "false", "True", "False"):
+            return f"is_applied 는 bool 값이어야 합니다: {value!r}"
+    return None
+
+
 def bulk_update_wanted_adjustments(
     db: Session,
     entry_ids: list[str],
@@ -202,6 +222,9 @@ def bulk_update_wanted_adjustments(
     group_id-scoped: 전달된 entry_ids 중 group_id 가 일치하는 것만 적용
     (cross-group mutation 차단).
     """
+    err = _validate_wanted_adj_field(field, value)
+    if err is not None:
+        return {"error": err}
     rows = (
         db.query(FixedWantedEntry)
         .filter(
