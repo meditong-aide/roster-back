@@ -203,7 +203,7 @@ def _wrap_preflight_alerts(alerts: list[str], mid_error: str | None) -> list[Pre
 
 def _base_constraint_modes(rs, snapshot: SemanticsSnapshot) -> list[ConstraintModeFact]:
     cfg = rs.config
-    grade_strategy = str(getattr(rs, "grade_strategy", "BASE") or "BASE").upper()
+    grade_strategy = str(getattr(rs, "grade_strategy", "COMBINED") or "COMBINED").upper()
     out: list[ConstraintModeFact] = []
     if bool(getattr(cfg, "ban_n_to_d", True)):
         out.append(ConstraintModeFact("transition_ban", "ban_n_to_d", "hard", "enforced", "app/services/cp_sat_basic.py", "N→D 금지 활성"))
@@ -252,7 +252,7 @@ def _config_payload(rs) -> dict[str, Any]:
     out = {}
     for key in keys:
         out[key] = deepcopy(getattr(cfg, key, None))
-    out["grade_strategy"] = str(getattr(rs, "grade_strategy", "BASE") or "BASE")
+    out["grade_strategy"] = str(getattr(rs, "grade_strategy", "COMBINED") or "COMBINED")
     out["grade_config"] = deepcopy(getattr(rs, "grade_config", None))
     return out
 
@@ -286,7 +286,7 @@ def build_semantics_snapshot_from_roster_system(rs, *, year: int | None = None, 
     attempt = SolveAttemptMeta(
         attempt_index=int(attempt_raw.get("attempt_index", 0)),
         label=attempt_raw.get("label", "primary"),
-        grade_strategy=str(getattr(rs, "grade_strategy", "BASE") or "BASE"),
+        grade_strategy=str(getattr(rs, "grade_strategy", "COMBINED") or "COMBINED"),
         forced_grade_soft_fallback=bool(attempt_raw.get("forced_grade_soft_fallback", False)),
         config_flags=attempt_raw.get("config_flags", {}),
     )

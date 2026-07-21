@@ -210,6 +210,153 @@ def compute_supply_demand(
     )
 
 
+def to_monthly_state_nodes(result: "MonthlySupplyDemandResult", num_days: int) -> list[StateNode]:
+    """월별 shortage → StateNode. per-day flow 가 못 본 월 총량·야간cap 부족을 그래프에
+    싣는다. evidence.shortage 는 per-day 등가(ceil(월부족/일수))로 환산 — recommender 의
+    일수요 감축량이 합리적이게 한다.
+    """
+    days = max(1, int(num_days))
+    nodes: list[StateNode] = []
+    for s in result.shifts:
+        if s.shortage <= 0:
+            continue
+        per_day = -(-s.shortage // days)  # ceil
+        nodes.append(
+            StateNode(
+                node_id=f"state:monthly_supply_demand:{s.shift_code}",
+                label=f"{s.shift_code} 월 공급/수요 (월부족 {s.shortage})",
+                state_type="monthly_supply_demand",
+                severity="hard",
+                attrs={"shift_code": s.shift_code, "scope": "monthly"},
+                evidence={
+                    "shortage": per_day,               # per-day 등가(감축량 유도용)
+                    "monthly_shortage": s.shortage,
+                    "required": s.required,
+                    "filled": s.filled,
+                    "eligible_nurses": s.eligible_nurses,
+                },
+            )
+        )
+    return nodes
+
+
+# ── monthly (aggregate) supply/demand ────────────────────────────────────────
+# per-day flow 는 하루 교차경쟁만 본다. 월 총량(간호사당 근무가능일)·월 야간cap(max_nig)·
+# per-shift eligibility 는 못 본다(35명이면 하루 N=14 는 채우지만 월 근무일 총량이 모자랄 수
+# 있음). 이 월별 flow 가 그 층을 담당한다. 두 결과는 상보 — 함께 써야 완전하다.
+
+@dataclass
+class MonthlyShiftResult:
+    shift_code: str
+    required: int          # 월 총 수요 (일수요 × 일수)
+    eligible_nurses: int   # 그 시프트 가능 인원
+    filled: int            # max-flow 가 채운 월 슬롯 수
+    shortage: int          # required - filled
+
+    @property
+    def is_bottleneck(self) -> bool:
+        return self.shortage > 0
+
+
+@dataclass
+class MonthlySupplyDemandResult:
+    shifts: list[MonthlyShiftResult]
+    total_required: int
+    total_filled: int
+
+    def total_shortage(self) -> int:
+        return sum(s.shortage for s in self.shifts)
+
+    @property
+    def bottleneck_shifts(self) -> list[MonthlyShiftResult]:
+        return [s for s in self.shifts if s.is_bottleneck]
+
+
+def compute_monthly_supply_demand(
+    nurses: list[NurseSupply],
+    monthly_demand: dict[str, int],
+    *,
+    workdays_by_nurse: dict[str, int],
+    night_cap_by_nurse: dict[str, int] | None = None,
+    night_shift: str = "N",
+    work_shifts: Iterable[str] = WORK_SHIFTS_DEFAULT,
+) -> MonthlySupplyDemandResult:
+    """월 단위 bipartite max-flow 로 시프트별 월 충족/부족을 산출.
+
+    source ─(cap=근무가능일)─▶ nurse ─(cap: N은 max_nig, 그외 근무가능일; eligible만)─▶
+        shift ─(cap=월 총수요)─▶ sink
+
+    Args:
+        monthly_demand: {shift: 월 총 수요}. 보통 일수요 × 일수.
+        workdays_by_nurse: {nurse_id: 월 근무가능일}(= 일수 − 필요off). 월 총 capacity.
+        night_cap_by_nurse: {nurse_id: 월 야간 상한}(min(max_nig, n_max)). 없으면 근무가능일.
+        night_shift: 야간 상한을 적용할 시프트 코드(기본 "N").
+
+    Returns:
+        MonthlySupplyDemandResult — 시프트별 required/filled/shortage + 총계.
+    """
+    work = tuple(s for s in work_shifts)
+    shifts = [s for s in work if int(monthly_demand.get(s, 0) or 0) > 0]
+    night_cap_by_nurse = night_cap_by_nurse or {}
+
+    # 월별 eligibility: nurse 의 eligible_by_day 합집합(비면 전 work_shifts 가용).
+    def _monthly_elig(nu: NurseSupply) -> set[str]:
+        if not nu.eligible_by_day:
+            return set(work)
+        u: set[str] = set()
+        for ds in nu.eligible_by_day.values():
+            u |= set(ds)
+        return u or set(work)
+
+    N, S = len(nurses), len(shifts)
+    if N == 0 or S == 0:
+        req = {s: int(monthly_demand.get(s, 0) or 0) for s in shifts}
+        return MonthlySupplyDemandResult(
+            shifts=[MonthlyShiftResult(s, req[s], 0, 0, req[s]) for s in shifts],
+            total_required=sum(req.values()), total_filled=0)
+
+    src = 0
+    nurse_node = {i: 1 + i for i in range(N)}
+    shift_node = {s: 1 + N + j for j, s in enumerate(shifts)}
+    sink = 1 + N + S
+    mf = _MaxFlow(sink + 1)
+
+    eligible_count = {s: 0 for s in shifts}
+    for i, nu in enumerate(nurses):
+        wd = int(workdays_by_nurse.get(nu.nurse_id, 0) or 0)
+        if wd <= 0:
+            continue
+        mf.add_edge(src, nurse_node[i], wd)
+        elig = _monthly_elig(nu)
+        for s in shifts:
+            if s not in elig:
+                continue
+            eligible_count[s] += 1
+            if s == night_shift:
+                cap = min(wd, int(night_cap_by_nurse.get(nu.nurse_id, wd)))
+            else:
+                cap = wd
+            mf.add_edge(nurse_node[i], shift_node[s], cap)
+    for s in shifts:
+        mf.add_edge(shift_node[s], sink, int(monthly_demand[s]))
+
+    mf.max_flow(src, sink)
+
+    results: list[MonthlyShiftResult] = []
+    total_filled = 0
+    for s in shifts:
+        required = int(monthly_demand[s])
+        residual = mf.residual_cap(shift_node[s], sink)
+        filled = required - residual
+        total_filled += filled
+        results.append(MonthlyShiftResult(
+            shift_code=s, required=required, eligible_nurses=eligible_count[s],
+            filled=filled, shortage=max(0, required - filled)))
+    return MonthlySupplyDemandResult(
+        shifts=results, total_required=sum(int(monthly_demand[s]) for s in shifts),
+        total_filled=total_filled)
+
+
 # ── StateNode 변환 ────────────────────────────────────────────────────────────
 def to_state_nodes(result: SupplyDemandResult) -> list[StateNode]:
     """SupplyDemandResult → 통합 그래프 StateNode 리스트.

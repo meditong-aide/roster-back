@@ -29,8 +29,6 @@ def add_grade_constraints(
     - Grade는 분배 목적(soft): 목표 = req * base/sum_base, 초과/부족을 패널티로 처리.
     - NULL Grade는 정책에 따라 결정적으로 매핑.
     """
-    print('grade_strategy', grade_strategy)
-    print('grade_config', grade_config)
     _impact_modes = getattr(rs, "_constraint_impact_constraint_modes", None)
     if _impact_modes is None:
         _impact_modes = []
@@ -43,11 +41,6 @@ def add_grade_constraints(
     #   grade 1 없으면 2, 2 없으면 3... — '설정 grade 부재'만으로 hard 가 헛 infeasible 나는 것 방지.
     #   min 만 적용(max=anti-pair 상한은 이양하면 의미 왜곡).
     constraints_map = _cascade_constraints_to_existing_grades(rs, constraints_map)
-    # grade_strategy=GRADE 이면 grade weight 가중치를 끌어올림(선호 신호).
-    gs = str(grade_strategy or "").upper()
-    if gs == "GRADE":
-        scaling = dict(scaling)
-        scaling["grade_penalty_weight"] = int(scaling["grade_penalty_weight"]) * 4
     _impact_modes.append({
         "family": "grade_min",
         "key": "grade_min:global",

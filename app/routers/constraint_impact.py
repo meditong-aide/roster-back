@@ -140,7 +140,7 @@ def _build_listing_snapshot(
         year=int(year),
         month=int(month),
         attempt=SolveAttemptMeta(
-            attempt_index=0, label="primary", grade_strategy="BASE",
+            attempt_index=0, label="primary", grade_strategy="COMBINED",
             forced_grade_soft_fallback=False, config_flags={},
         ),
         shift_types=["D", "E", "N", "O", "M"],

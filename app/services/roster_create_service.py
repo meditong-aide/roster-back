@@ -539,109 +539,6 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     }
 
 
-def _fetch_grade_strategy_from_roster_config(db: Session, config_id: int | None) -> str | None:
-    """roster_config 테이블에서 grade_strategy 값을 조회한다(있으면).
-
-    Notes:
-        - DB에 컬럼이 없을 수 있으므로 INFORMATION_SCHEMA로 확인 후 조회한다.
-        - 값이 없거나 비어있으면 None을 반환한다.
-    """
-    if not config_id:
-        return None
-    if not _column_exists(db, "roster_config", "grade_strategy"):
-        return None
-    try:
-        row = db.execute(
-            text("SELECT grade_strategy FROM roster_config WHERE config_id = :cid"),
-            {"cid": int(config_id)},
-        ).fetchone()
-    except Exception:
-        return None
-    if not row:
-        return None
-    val = getattr(row, "grade_strategy", None)
-    if val is None:
-        try:
-            val = row[0]
-        except Exception:
-            val = None
-    if not val:
-        return None
-    return str(val).upper()
-
-
-def _resolve_grade_strategy(
-    db: Session,
-    config_dict: dict,
-    office_id: str,
-    group_id: str,
-    roster_config_id: int | None,
-) -> tuple[str, dict | None]:
-    """TEAM/GRADE/BASE 전략을 단순하게 결정하고, 필요한 경우 grade_config를 함께 반환한다.
-
-    우선순위:
-        1) roster_config.grade_strategy 컬럼이 있으면 그 값을 최우선 사용한다.
-        2) 없으면(구버전 호환):
-            - team_balance_enable == 1 → TEAM
-            - roster_grade_config.constraints_json이 비어있지 않음 → GRADE
-            - 그 외 → BASE
-
-    Returns:
-        (grade_strategy, grade_config_or_none)
-    """
-    # [ALWAYS_COMBINED] 정책(2026-06): 전략은 항상 COMBINED(team+grade 동시).
-    #   프론트/DB의 grade_strategy 컬럼이 BASE 여도 백엔드가 COMBINED 로 해석하여
-    #   roster_grade_config(grade min/max)를 항상 로드·적용한다.
-    #   - grade_config 에 제약이 없으면 grade 항은 자동 no-op(부작용 없음).
-    #   - team 항은 team_min/team 데이터 있을 때만 활성(없으면 no-op).
-    #   원복: 이 블록만 제거하면 아래 레거시(컬럼 우선 + 구버전 폴백) 로직으로 복귀.
-    _gc_always = _fetch_grade_config_dict(db, office_id, group_id)
-    return "COMBINED", _gc_always
-
-    # 1) DB 컬럼 우선
-    s = _fetch_grade_strategy_from_roster_config(db, roster_config_id)
-    if s in ("BASE", "TEAM", "GRADE", "COMBINED"):
-        if s in ("GRADE", "COMBINED"):
-            gc = _fetch_grade_config_dict(db, office_id, group_id)
-            return s, gc
-        return s, None
-
-    # 2) 구버전 폴백(요청 바디 말고 config_dict 기반)
-    if bool(config_dict.get("team_balance_enable", False)):
-        return "TEAM", None
-
-    gc = _fetch_grade_config_dict(db, office_id, group_id)
-    if bool((gc or {}).get("constraints_json") or {}) or bool((gc or {}).get("constraints_max_json") or {}):
-        return "GRADE", gc
-    return "BASE", None
-
-
-def _has_any_grade_constraints(grade_config: dict | None) -> bool:
-    gc = grade_config or {}
-    return bool(
-        (gc.get("constraints_json") or gc.get("constraints") or {})
-        or (gc.get("constraints_max_json") or gc.get("constraints_max") or {})
-    )
-
-
-def _select_effective_grade_strategy(
-    req_strategy: str,
-    resolved_strategy: str,
-    grade_config: dict | None,
-) -> str:
-    req = str(req_strategy or "").upper()
-    resolved = str(resolved_strategy or "BASE").upper()
-
-    if req == "COMBINED" and _has_any_grade_constraints(grade_config):
-        return "COMBINED"
-    if req == "GRADE" and _has_any_grade_constraints(grade_config):
-        return "GRADE"
-    if req == "TEAM":
-        return "TEAM"
-    if req == "BASE":
-        return "BASE"
-    return resolved
-
 def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
     shift_manages = (
@@ -3001,31 +2898,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             )
         except Exception as _log_exc:
             print(f"[ShiftDistributionPolicy] 로그 출력 실패: {_log_exc}")
-        # 기본 전략은 DB(roster_config.grade_strategy) 기준으로 잡되,
-        # 요청에서 COMBINED/GRADE를 명시하고 grade 제약이 존재하면 해당 전략을 우선 적용한다.
-        grade_strategy, grade_config = _resolve_grade_strategy(
-            db=db,
-            config_dict=config_dict,
-            office_id=current_user.office_id,
-            group_id=current_user.group_id,
-            roster_config_id=getattr(latest_config, "config_id", None),
+        # [ALWAYS_COMBINED] 전략은 항상 COMBINED(team+grade 동시). 요청 바디 grade_strategy 는 무시.
+        #   grade_config 는 항상 로드 — grade 제약 없으면 grade 항 자동 no-op, team 항은 team 데이터 있을 때만 활성.
+        grade_config = _fetch_grade_config_dict(
+            db, current_user.office_id, current_user.group_id
         )
-        # 요청 바디에서 GRADE/COMBINED일 때는 DB에서 grade_config를 조회해 엔진에 전달
         engine_grade_config = grade_config
-        if str(getattr(req, "grade_strategy", "") or "").upper() in ("GRADE", "COMBINED"):
-            engine_grade_config = _fetch_grade_config_dict(
-                db, current_user.office_id, current_user.group_id
-            )
         if bool(config_dict.get("_force_grade_max_soft_fallback")) and isinstance(engine_grade_config, dict):
             engine_grade_config = dict(engine_grade_config)
             engine_grade_config["allow_soft_fallback"] = True
             print("[GradeFallback] force allow_soft_fallback=True (grade_max soft)")
-        req_strategy = str(getattr(req, "grade_strategy", "") or "").upper()
-        effective_grade_strategy = _select_effective_grade_strategy(
-            req_strategy=req_strategy,
-            resolved_strategy=grade_strategy,
-            grade_config=engine_grade_config,
-        )
+        effective_grade_strategy = "COMBINED"
         # 엔진에서도 사용할 수 있게 config_dict에 기록(디버깅/로그용)
         config_dict["grade_strategy"] = effective_grade_strategy
         cp_sat_result = generate_roster_cp_sat(
@@ -3798,6 +3681,22 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
         ds_by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
         base_req = getattr(cfg, "daily_shift_requirements", {}) or {}
         N = len(roster_system.nurses)
+
+        # 시프트별 '정책상 가능 인원'(allowed_shifts 기준) 캐시 — 부족 원인 분류에 사용.
+        # allowed_shifts 가 빈/None 이면 전 시프트 가용. 특정 코드로 제한되면 그 코드만.
+        def _eligible_for(s_code: str) -> int:
+            cnt = 0
+            for nu in roster_system.nurses:
+                raw = getattr(nu, "allowed_shifts", None)
+                if isinstance(raw, list) and raw:
+                    allowed = {str(x).strip().upper() for x in raw if str(x).strip()}
+                    allowed = {a for a in allowed if a in shift_types}
+                    if allowed and s_code not in allowed:
+                        continue
+                cnt += 1
+            return cnt
+        _elig_cache: dict[str, int] = {}
+
         gaps: list[dict] = []
         for d in range(roster_system.num_days):
             need_map = (
@@ -3815,12 +3714,20 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
                 s_idx = shift_types.index(s_code)
                 assigned = int(sum(int(roster_system.roster[n, d, s_idx]) for n in range(N)))
                 if assigned < req:
+                    if s_code not in _elig_cache:
+                        _elig_cache[s_code] = _eligible_for(s_code)
+                    eligible = _elig_cache[s_code]
+                    # 원인 분류: 그 시프트 정책상 가능 인원이 요구보다 적으면 eligibility 부족
+                    # (예: 야간 불가 인원 과다 → N 가능 인원 < 요구). 아니면 총 capacity 부족.
+                    reason = "eligibility_shortage" if eligible < req else "capacity_shortage"
                     gaps.append({
                         "day": d + 1,
                         "shift": s_code,
                         "need": req,
                         "assigned": assigned,
                         "short": req - assigned,
+                        "eligible": eligible,
+                        "reason": reason,
                     })
         return gaps
     except Exception as exc:
@@ -4256,83 +4163,6 @@ def _build_default_shift_mapping(shifts: list[Shift]) -> dict[str, str]:
     return mapping
 
 
-def _apply_preceptor_gauge(config_dict: dict, gauge: int | None) -> None:
-    """프리셉터 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
-
-    Args:
-        config_dict: 엔진에 전달할 설정 딕셔너리 (in-place 수정)
-        gauge: 프론트에서 전달한 게이지 값(0~10). None이면 미적용
-    """
-
-    if gauge is None:
-        return
-    print(f"프리셉터 게이지: {gauge}")
-    g = max(0, min(10, int(gauge)))
-    # 강도: 0→0.2x, 10→2.0x
-    strength = round(0.2 + 0.18 * g, 2)
-    # 상위 일수 K: 0→4, 10→30
-    top_k = int(4 + (30 - 4) * (g / 10.0))
-    # 최소 가중치 하한: 0→10.0, 10→5.0
-    min_w = round(10.0 - 0.5 * g, 2)
-
-    config_dict['preceptor_enable'] = g > 0
-    config_dict['preceptor_strength_multiplier'] = strength
-    config_dict['preceptor_top_days'] = top_k
-    config_dict['preceptor_min_pair_weight'] = min_w
-    # # 교대 포커스: 게이지 낮음→N, 중간→E/N, 높음→D/E/N
-    # if g <= 3:
-    #     config_dict['preceptor_focus_shifts'] = ['N']
-    # elif g <= 6:
-    #     config_dict['preceptor_focus_shifts'] = ['E','N']
-    # else:
-    #     config_dict['preceptor_focus_shifts'] = ['D','E','N']
-    # print(f"[프리셉터 게이지] g={g} → strength={strength}x, top_k={top_k}, min_w={min_w}, focus={config_dict['preceptor_focus_shifts']}")
-    print(f"[프리셉터 게이지] g={g} → strength={strength}x, top_k={top_k}, min_w={min_w}")
-
-
-def _apply_team_balance_gauge(config_dict: dict, gauge: int | None) -> None:
-    """
-    팀 균등/집중 보너스 게이지(0~10)를 엔진 설정 파라미터로 매핑한다.
-    - enable이 False이면 weight/top_days를 0으로 초기화
-    """
-    enable_flag = bool(config_dict.get("team_balance_enable", False))
-    g = gauge if gauge is not None else config_dict.get("team_balance_gauge", 0)
-    g = max(0, min(10, int(g or 0)))
-    enable = enable_flag and g > 0
-    config_dict["team_balance_gauge"] = g
-    config_dict["team_balance_enable"] = enable
-
-    # 정규화된 팀 보너스 강도(soft) 매핑:
-    # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
-    # 식: weight = round(cap * (g/10)^p)
-    # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
-    cap = int(config_dict.get("team_balance_weight_cap", 240) or 240)
-    power = float(config_dict.get("team_balance_weight_power", 1.7) or 1.7)
-    cap = max(0, min(500, cap))  # 안전 상한(임의 폭주 방지)
-    power = max(0.5, min(3.0, power))
-
-    if enable:
-        g_norm = g / 10.0
-        config_dict["team_balance_weight"] = int(round(cap * (g_norm ** power)))
-        config_dict["team_balance_top_days"] = int(6 + (30 - 6) * g_norm)
-    else:
-        config_dict["team_balance_weight"] = 0
-        config_dict["team_balance_top_days"] = 0
-    if "team_balance_focus_shifts" not in config_dict:
-        config_dict["team_balance_focus_shifts"] = None
-    if "team_balance_mode" not in config_dict:
-        config_dict["team_balance_mode"] = "balanced"
-
-    # 모드별 교대 가중치가 비어있으면 기본값을 채운다.
-    if not config_dict.get("team_balance_shift_weights"):
-        mode = str(config_dict.get("team_balance_mode", "balanced") or "balanced").lower()
-        if mode == "focus_d":
-            config_dict["team_balance_shift_weights"] = {"D": 1.5, "E": 0.6, "N": 0.3}
-        elif mode == "focus_de":
-            config_dict["team_balance_shift_weights"] = {"D": 1.2, "E": 1.2, "N": 0.5}
-        else:
-            config_dict["team_balance_shift_weights"] = {"D": 1.0, "E": 1.0, "N": 1.0}
-
 def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
     """req(임시 UI 대체)로 전달된 분배 정책 파라미터를 config_dict에 반영한다.
 
@@ -4399,7 +4229,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4727,6 +4557,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
+    # 런타임 config override(비-DB-컬럼 solver 파라미터 포함) — apply-resolution의 probe/비컬럼 옵션이
+    # DB 커밋 없이 이번 생성에만 완화값을 주입할 때 사용. config_dict 최종 병합(가장 우선).
+    if config_override:
+        config_dict.update(config_override)
     # 인바운드 간호사의 source group 매핑 → cross-month tail 보충용
     if _inbound_assignments:
         config_dict["_inbound_source_map"] = {
@@ -4763,10 +4597,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         config_dict["max_extra_off_days"] = 6 if _has_2n2o else 1
     if config_dict.get("extra_off_penalty_weight") is None:
         config_dict["extra_off_penalty_weight"] = 80
-    # ── 프리셉터 게이지(0~10) → 파라미터 매핑 ──
-    
-    _apply_preceptor_gauge(config_dict, config_dict['preceptor_gauge'])
-    _apply_team_balance_gauge(config_dict, config_dict.get('team_balance_gauge'))
     _apply_distribution_policy_from_req(config_dict, req)
     # 경계 제약 기능 기본값
     config_dict.setdefault("cross_month_hard_rules_enable", True)
@@ -5377,6 +5207,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
 
     # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
     precheck_result: dict | None = None
+    presolve_diag: dict | None = None   # 솔버 전 부족 조기진단(advisory) — 응답에 부착
     try:
         from services.precheck import (
             run_runtime_precheck,
@@ -5450,6 +5281,23 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             month=req.month,
             stop_on_config_error=False,
         )
+        # 솔버 전 부족 조기진단(advisory, non-blocking) — max-flow(per-day+월별) 기반.
+        # 개인 속성(allowed_shifts/max_nig/weekend_off)은 불가침 → 복구 선택지는 관리자 노브만.
+        # 실측 부족 수치는 솔버 후 coverage_gaps 가 담당(여기 값은 증명된 하한).
+        try:
+            from services.ontology_graph.presolve_diagnosis import presolve_shortage_diagnosis
+            presolve_diag = presolve_shortage_diagnosis(
+                _nurses_dict_for_precheck, precheck_config, req.year, req.month)
+            if presolve_diag.get("shortages"):
+                print(
+                    f"[Presolve] 부족 예상 {len(presolve_diag['shortages'])}건 "
+                    f"({presolve_diag['elapsed_ms']}ms): "
+                    + "; ".join(
+                        f"{s['shift']} 월부족≥{s['monthly_shortage_lower_bound']}({s['reason']})"
+                        for s in presolve_diag['shortages']))
+        except Exception as _psd_exc:
+            print(f"[Presolve] 진단 실패(무시): {_psd_exc}")
+            presolve_diag = None
         if has_blocking_issues(precheck_result):
             payload = build_blocking_payload(precheck_result)
             inf = payload.get("infeasibility", {})
@@ -5700,6 +5548,39 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             if _cpsat_cores:
                 print(f"[ConflictCore] CP-SAT MUS: {len(_cpsat_cores_raw)}건 → dedup {len(_cpsat_cores)}건, detector: {len(_conflict_cores)}건 합산")
                 _conflict_cores = _conflict_cores + _cpsat_cores
+            # ── 실패-시-한번 MUS 진단 재solve (기본 OFF, opt-in) ──
+            # 실측(2026-07-21): reified 재solve 는 core 추출 지점(cp_sat_basic:2285=첫 hard
+            # solve)이 실제 infeasibility 표면화 단계(broad_soft)를 안 덮어 **0 core** 를 낸다.
+            # 그동안 30~60초를 낭비할 뿐, 뒤의 undiag probe(재solve 탐색)가 원인+검증해결을
+            # 이미 제공한다("완화하면 풀린다"⟺"이게 원인"). 따라서 기본 스킵.
+            # 추출 지점을 broad_soft 까지 확장(별도 후속)한 뒤 MUS_DIAG_ENABLE=1 로 재활성.
+            if not _cpsat_cores:
+                try:
+                    import os as _os_mus
+                    if _os_mus.getenv("MUS_DIAG_ENABLE") == "1":
+                        _prev_mus = _os_mus.environ.get("AIDE_ENABLE_MUS_REGISTRY")
+                        _os_mus.environ["AIDE_ENABLE_MUS_REGISTRY"] = "1"
+                        _mus_base = getattr(roster_system, "_effective_config_snapshot", None)
+                        try:
+                            _mg, _, _mrs = _run_cp_sat_basic(
+                                db, current_user, nurses_for_engine, preferences, latest_config, req,
+                                shift_manage_data,
+                                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                time_limit_seconds=int(_os_mus.getenv("MUS_DIAG_TIME", "30") or 30),
+                                config_override=_mus_base,
+                            )
+                            _mus_cores = list(getattr(_mrs, "_cpsat_conflict_cores", []) or [])
+                            if _mus_cores:
+                                print(f"[MUS-Diag] 진단 재solve → conflict cores {len(_mus_cores)}건")
+                                _cpsat_cores = _mus_cores
+                                _conflict_cores = _conflict_cores + _mus_cores
+                        finally:
+                            if _prev_mus is None:
+                                _os_mus.environ.pop("AIDE_ENABLE_MUS_REGISTRY", None)
+                            else:
+                                _os_mus.environ["AIDE_ENABLE_MUS_REGISTRY"] = _prev_mus
+                except Exception as _mus_exc:
+                    print(f"[MUS-Diag] 진단 재solve 실패(무시): {_mus_exc}")
             # Pool 그래프 스냅샷 — TeamPool / GradePool / CommonPool capacity vs demand
             # 분석을 통한 root cause 표면화. shortage 가 발견되면 conflict_cores 에 합류.
             _pool_snapshot_dict: dict[str, Any] = {}
@@ -5798,13 +5679,28 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     _probe_opts = to_resolution_options(_probe_res, _probe_base)
                     _exist_opts = unrecoverable["infeasibility"].get("resolution_options") or []
                     unrecoverable["infeasibility"]["resolution_options"] = _probe_opts + _exist_opts
-                    # 정합성: probe 가 검증된(verified) 옵션을 찾았으면 "해를 못 찾음, 점검하세요"
-                    # 메시지와 모순되므로, 적용 가능한 옵션이 있음을 알리는 문구로 교정.
+                    # probe 의 검증된 완화 = 원인 그 자체다: "이걸 완화하면 풀린다" ⟺ "이게 병목".
+                    # MUS core 가 비어도 probe 가 원인(=완화 대상 정책)을 지목한다.
+                    # 단일 완화들 = 각각이 단독 충분한 병목(대안), combo = 함께여야 풀리는 결합 병목.
                     if any(o.get("verified") for o in _probe_opts):
-                        unrecoverable["infeasibility"]["summary_message_ko"] = (
-                            "자동 진단으로는 원인을 특정하지 못했지만, 아래 옵션 중 하나를 "
-                            "적용하면 근무표를 생성할 수 있습니다. 적용할 옵션을 선택해주세요."
-                        )
+                        import re as _re_cause
+                        def _cause_label(_t):
+                            # title 의 액션어(완화/해제/…)를 떼 "원인=정책명"으로 읽히게.
+                            return _re_cause.sub(r"\s*(완화|해제|비활성화|감소|상향)(\(.*?\))?$", "", _t or "").strip() or _t
+                        _v_single = [_cause_label(o.get("title_ko")) for o in _probe_opts
+                                     if o.get("verified") and o.get("kind") != "combo" and o.get("title_ko")]
+                        _v_combo = next((o for o in _probe_opts if o.get("kind") == "combo" and o.get("verified")), None)
+                        if _v_single:
+                            _cause = " / ".join(_v_single[:4])
+                            unrecoverable["infeasibility"]["summary_message_ko"] = (
+                                f"원인: 다음 정책이 현재 인원·설정으로는 동시에 만족될 수 없습니다 — {_cause}. "
+                                f"이 중 하나를 완화하면 근무표를 생성할 수 있습니다(재계산으로 검증됨). 적용할 옵션을 선택해주세요."
+                            )
+                        elif _v_combo:
+                            unrecoverable["infeasibility"]["summary_message_ko"] = (
+                                f"원인: 여러 정책이 얽혀 단일 완화로는 풀리지 않습니다. "
+                                f"'{_v_combo.get('title_ko')}'를 함께 적용하면 근무표를 생성할 수 있습니다(검증됨)."
+                            )
                     _combo = _probe_res.get("combo")
                     print(f"[UndiagProbe] found={_probe_res.get('found')} "
                           f"resolutions={[r['id'] for r in _probe_res.get('resolutions', [])]} "
@@ -5886,6 +5782,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     roster_data["weekly_off_conflicts"] = weekly_off_conflicts
     roster_data["weekly_off_warnings"] = weekly_off_warnings
     roster_data["constraint_impact"] = _build_constraint_impact_payload(roster_system, req)
+    # 솔버 전 부족 조기진단(있으면) 부착 — 실측 부족은 coverage_gaps(constraint_impact 내부),
+    # 여기는 '왜/얼마나(하한) + 관리자 복구 선택지' advisory.
+    if presolve_diag:
+        roster_data["presolve_diagnosis"] = presolve_diag
     # ── infeasibility 페이로드 (precheck warning + applied_relaxations + violation summary) ──
     try:
         from services.precheck import build_success_payload

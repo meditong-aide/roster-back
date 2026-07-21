@@ -50,7 +50,7 @@ def add_team_min_constraints(
     join,
     leave,
     *,
-    grade_strategy: str = "BASE",
+    grade_strategy: str = "COMBINED",
     blocked_by_nurse=None,
 ) -> list:
     obj_terms: list = []
@@ -68,9 +68,7 @@ def add_team_min_constraints(
     use_mid = bool(getattr(cfg, "use_mid", False))
     allow_soft = bool(getattr(cfg, "team_min_soft_fallback", False))
     base_penalty_weight = int(getattr(cfg, "team_min_penalty_weight", 80000) or 0)
-    # grade_strategy=TEAM 이면 team_min weight 가중치를 끌어올림(선호 신호).
-    gs = str(grade_strategy or "").upper()
-    penalty_weight = base_penalty_weight * 4 if gs == "TEAM" else base_penalty_weight
+    penalty_weight = base_penalty_weight
 
     # 팀별 멤버 인덱스 집합
     team_members: dict[str, list[int]] = {}

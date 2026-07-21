@@ -146,13 +146,20 @@ def update_schedule_entry(
     entry.shift_id = new_shift_id
     db.commit()
     db.refresh(entry)
-    return {
+    result = {
         "entry_id": entry.entry_id,
         "nurse_id": entry.nurse_id,
         "work_date": str(entry.work_date.date()) if hasattr(entry.work_date, "date") else str(entry.work_date),
         "old_shift_id": old_shift,
         "new_shift_id": entry.shift_id,
     }
+    # ③ 편집 후 하드락 사후검증(경량·advisory·agent 경로 전용): 위반 시 hard_lock_warnings 로
+    #   노출 → LLM 이 자연어로 알림. enforcement 아님(생성 솔버가 SSOT). 정상 HN 웹편집은
+    #   프론트 useRosterValidation 이 실시간 커버하므로 여기선 agent 셀편집만 보강.
+    warnings = _post_edit_hard_lock_warnings(db, entry.schedule_id, entry.nurse_id, group_id)
+    if warnings:
+        result["hard_lock_warnings"] = warnings
+    return result
 
 
 def find_schedule_entry(
@@ -201,6 +208,115 @@ def find_schedule_entry(
 
 
 # ── private ──────────────────────────────────────────────
+
+
+def _post_edit_hard_lock_warnings(db, schedule_id, nurse_id, group_id) -> list[str]:
+    """셀 편집 후 영향 간호사 근무열의 하드락 위반을 경고 문자열로 반환(경량·advisory).
+
+    ★enforcement 아님(생성 솔버가 SSOT). agent 편집 결과를 LLM 에 노출하기 위한 사후검증.
+    config 비활성(토글 off)인 제약은 검사하지 않는다(하드락 정책의 활성 조건과 동일).
+    """
+    from agents_v2.tools import constraint_tools, shift_tools
+    config = constraint_tools.get_roster_config(db, group_id) or {}
+    cats = _shift_category_map(shift_tools.read_shift_definitions(db, group_id))
+    seq = _load_nurse_sequence(db, schedule_id, nurse_id)
+    if not seq:
+        return []
+    return (
+        _streak_warnings(seq, cats, config)
+        + _adjacency_warnings(seq, cats, config)
+        + _monthly_night_warning(seq, cats, config)
+    )
+
+
+def _load_nurse_sequence(db, schedule_id, nurse_id) -> list[tuple]:
+    """영향 간호사의 해당 스케줄 근무열 → 날짜순 (date, shift_id) 리스트."""
+    rows = (
+        db.query(ScheduleEntry)
+        .filter(ScheduleEntry.schedule_id == schedule_id, ScheduleEntry.nurse_id == nurse_id)
+        .order_by(ScheduleEntry.work_date)
+        .all()
+    )
+    return [
+        (r.work_date.date() if hasattr(r.work_date, "date") else r.work_date, r.shift_id)
+        for r in rows
+    ]
+
+
+def _shift_category_map(shifts: list[dict]) -> dict:
+    """shift_gb/type → 카테고리 집합(N/D/E/근무)."""
+    return {
+        "night": {s["shift_id"] for s in shifts if s.get("shift_gb") == "나이트"},
+        "day": {s["shift_id"] for s in shifts if s.get("shift_gb") == "데이"},
+        "eve": {s["shift_id"] for s in shifts if s.get("shift_gb") == "이브닝"},
+        "work": {s["shift_id"] for s in shifts if s.get("is_working")},
+    }
+
+
+def _category_runs(seq: list[tuple], id_set: set) -> list[tuple]:
+    """근무열에서 id_set 시프트의 날짜-인접 연속 런 → [(length, start_date, end_date)]."""
+    runs, run, prev = [], [], None
+    for d, sid in seq:
+        if sid in id_set and (not run or (d - prev).days == 1):
+            run.append(d)
+        elif sid in id_set:
+            runs.append((len(run), run[0], run[-1]))
+            run = [d]
+        elif run:
+            runs.append((len(run), run[0], run[-1]))
+            run = []
+        prev = d
+    if run:
+        runs.append((len(run), run[0], run[-1]))
+    return runs
+
+
+def _streak_warnings(seq: list[tuple], cats: dict, config: dict) -> list[str]:
+    """연속근무 초과·나이트 연속 초과·단일나이트(1N) 검출."""
+    out = []
+    max_work = config.get("max_conseq_work") or 5
+    max_nig = 3 if config.get("three_seq_nig") else 2
+    for length, s, e in _category_runs(seq, cats["work"]):
+        if length > max_work:
+            out.append(f"연속근무 {length}일({s}~{e}) — 최대 {max_work}일 초과")
+    for length, s, e in _category_runs(seq, cats["night"]):
+        if length > max_nig:
+            out.append(f"연속 나이트 {length}일({s}~{e}) — 최대 {max_nig}일 초과")
+        elif length == 1 and config.get("not_one_night"):
+            out.append(f"단일 나이트(1N) {s} — 나이트는 2회 이상 연속 배정 필요")
+    return out
+
+
+def _adjacency_warnings(seq: list[tuple], cats: dict, config: dict) -> list[str]:
+    """인접일 금지 전환(ND/NE=nod_noe · ED=banned_day_after_eve) 검출."""
+    def cat_of(sid):
+        if sid in cats["night"]:
+            return "N"
+        if sid in cats["eve"]:
+            return "E"
+        if sid in cats["day"]:
+            return "D"
+        return None
+    out = []
+    for i in range(1, len(seq)):
+        (pd, ps), (cd, cs) = seq[i - 1], seq[i]
+        if (cd - pd).days != 1:
+            continue
+        a, b = cat_of(ps), cat_of(cs)
+        if config.get("nod_noe") and a == "N" and b in ("D", "E"):
+            out.append(f"{pd}→{cd} 금지전환 {a}→{b}(나이트 직후 데이/이브닝)")
+        if config.get("banned_day_after_eve") and a == "E" and b == "D":
+            out.append(f"{pd}→{cd} 금지전환 E→D(이브닝 직후 데이)")
+    return out
+
+
+def _monthly_night_warning(seq: list[tuple], cats: dict, config: dict) -> list[str]:
+    """월 나이트 총량 상한(max_nig_per_month) 초과 검출."""
+    cap = config.get("max_nig_per_month")
+    if not cap:
+        return []
+    n_count = sum(1 for _, sid in seq if sid in cats["night"])
+    return [f"월 나이트 {n_count}회 — 상한 {cap}회 초과"] if n_count > cap else []
 
 
 def _schedule_meta(sched: Schedule, is_published: bool = False) -> dict:

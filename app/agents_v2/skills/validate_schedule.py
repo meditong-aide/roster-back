@@ -88,20 +88,6 @@ def validate_schedule(db: Session, params: dict) -> Any:
                     "max_grade_present": m["max_grade_present"],
                 })
 
-    # Check: night shift distribution variance
-    if night_shift_ids and config and config.get("even_nights"):
-        for nid in night_shift_ids:
-            stats = analysis_tools.shift_count_variance(db, schedule_id, nid)
-            if stats.get("variance", 0) > 2.0:
-                violations.append({
-                    "type": "night_distribution_uneven",
-                    "shift_id": nid,
-                    "variance": stats["variance"],
-                    "min": stats["min"],
-                    "max": stats["max"],
-                    "mean": stats["mean"],
-                })
-
     # Enrich violations with nurse names
     if violations:
         from agents_v2.tools import nurse_tools

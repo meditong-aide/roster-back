@@ -94,7 +94,7 @@ class RosterRequest(BaseModel):
     """근무표 생성 요청(임시: UI 미구현 상태에서 req로 정책 파라미터를 주입하기 위한 모델).
 
     Notes:
-        - `preceptor_gauge` 등 기존 게이지와 동일하게, 분배 정책도 req로 주입받아 실행마다 조절한다.
+        - 분배 정책 게이지(oversupply_balance_gauge 등)는 req로 주입받아 실행마다 조절한다.
         - 월단위 선호는 개인 입력값(간호사별)이고, 반영 강도/모드는 수간호사(생성 요청자)가 선택한다.
     """
 
@@ -110,7 +110,6 @@ class RosterRequest(BaseModel):
     # 서버에서 RosterConfigCreate 로 검증(스키마 정의 순서상 forward-ref 회피).
     config: Optional[Dict[str, Any]] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
-    preceptor_gauge: Optional[int] = Field(default=None, ge=0, le=10)
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
     # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.
     advanced_inference: bool = Field(default=False)
@@ -233,14 +232,10 @@ class RosterConfigBase(BaseModel):
     off_days: int
     max_conseq_off: int = 3  # 연속 OFF 최대 개수(soft). 기본 3 = 4연속+ 벌점
     shift_priority: float
-    weekend_shift_ratio: float
-    patient_amount: int
-    even_nights: bool
     sequential_offs: bool
     nod_noe: bool
     not_one_night: bool = Field(default=False, description="야간 단발성(1N) 금지 여부")
     use_mid: bool = Field(default=False)
-    preceptor_gauge: float
     preceptee_on: bool = Field(
         default=False, description="프리셉티 팔로우 모드 (ON 시 프리셉터 근무 따라감)"
     )
@@ -249,12 +244,6 @@ class RosterConfigBase(BaseModel):
         description="프리셉티 커버리지 포함 여부 (ON: DEN 포함, OFF: DEN 제외, preceptee_on=True일 때만 유효)",
     )
     weekly_off_group: bool = Field(default=False)
-    team_balance_enable: bool = Field(default=False)
-    team_balance_gauge: int = Field(default=0, ge=0, le=10)
-    team_balance_mode: str = Field(default="balanced")
-    off_placement_mode: int = Field(
-        default=1, description="주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)"
-    )
     fixed_wanted_use_yn: bool = Field(
         default=False, description="확정 원티드 DENO 전체 고정 여부"
     )
@@ -275,7 +264,6 @@ class RosterConfigBase(BaseModel):
 
 
 class RosterConfigCreate(RosterConfigBase):
-    config_version: Optional[str] = None
     # ── 설정 프리셋(저장한 설정 모달) ──
     # config_id 있으면 해당 프리셋 UPDATE(in-place upsert), 없으면 신규 INSERT(version=MAX+1).
     config_id: Optional[int] = None
@@ -866,7 +854,6 @@ class FixedWantedEntryCreate(BaseModel):
     source_type: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
     original_shift_id: Optional[str] = None  # 백엔드 자동 감지 (프론트 전송 불필요)
     reason: Optional[str] = None
-    head_nurse_memo: Optional[str] = None
 
 
 class FixedWantedCreate(BaseModel):
@@ -892,7 +879,6 @@ class FixedWantedEntryResponse(BaseModel):
     source_type: str
     original_shift_id: Optional[str] = None
     reason: Optional[str] = None
-    head_nurse_memo: Optional[str] = None
     created_by: Optional[str] = None
 
     class Config:

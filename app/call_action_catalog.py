@@ -153,10 +153,10 @@ _CATALOG_RAW = [
     # ────────── 근무표 · 시프트 · 생성 · 선호 (roster/roster_create/shifts/daily-shift/preferences) ──────────
     {"m": "POST", "p": "/roster/config/save", "page": "근무표만들기", "section": "생성 설정 저장",
      "action": "근무표 생성 설정(프리셋) 저장", "shape": "dict",
-     "fields": {"config_id": "프리셋ID", "config_name": "프리셋이름", "config_version": "버전",
+     "fields": {"config_id": "프리셋ID", "config_name": "프리셋이름",
                 "day_req": "D요구", "eve_req": "E요구", "nig_req": "N요구", "max_nig_per_month": "월나이트상한",
                 "max_conseq_work": "최대연속근무", "off_days": "OFF수", "use_mid": "MID사용",
-                "not_one_night": "1N금지", "off_first": "OFF우선", "team_balance_enable": "팀밸런스"}, "masked": {}},
+                "not_one_night": "1N금지", "off_first": "OFF우선"}, "masked": {}},
     {"m": "DELETE", "p": "/roster/config/{config_id}", "page": "근무표만들기", "section": "설정 프리셋 관리",
      "action": "저장 설정 프리셋 미노출", "shape": "none", "fields": {}, "masked": {}},
     {"m": "POST", "p": "/roster_create/async", "page": "근무표만들기", "section": "생성 실행",

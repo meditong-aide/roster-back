@@ -572,8 +572,7 @@ SKILL_TOOLS: list[dict] = [
             "  • even_nights — 야간 균등 배분 (bool)\n\n"
             "[C] 구조 정책\n"
             "  • preceptee_on — 프리셉터-프리셉티 매칭 활성 (bool)\n"
-            "  • preceptee_shift_count — 프리셉티를 시프트 필요인원 카운트에 포함 (bool, preceptee_on=true 일 때만 유효)\n"
-            "  • team_balance_enable / team_balance_gauge — 팀 밸런스 활성/강도(0~10)\n\n"
+            "  • preceptee_shift_count — 프리셉티를 시프트 필요인원 카운트에 포함 (bool, preceptee_on=true 일 때만 유효)\n\n"
             "[D] 시프트 슬롯별 인원 (ShiftManage) — 슬롯 단위 미세 조정\n"
             "  • field='manpower' + nurse_class('RN'/'AN') + shift_slot(정수) + value=정수\n"
             "  • 사용자가 'RN 데이 슬롯 인원 4명으로'처럼 슬롯을 특정할 때.\n\n"
@@ -593,8 +592,6 @@ SKILL_TOOLS: list[dict] = [
             "- '야간 최대 7회로' → field='max_nig_per_month', value=7\n"
             "- '연속 근무 5일 제한' → field='max_conseq_work', value=5\n"
             "- '이브닝 다음날 데이 금지 해제' → field='banned_day_after_eve', value=false\n"
-            "- '팀 밸런스 켜줘' → field='team_balance_enable', value=true\n"
-            "- '팀 밸런스 강도 7' → field='team_balance_gauge', value=7\n"
             "- '데이 필요인원 4명' → field='day_req', value=4\n"
             "- '시프트당 3년차 이상 경력자 필수' → field='min_exp_per_shift', value=3\n"
             "- '교대마다 경력 간호사 2명은 있어야 해' → field='req_exp_nurses', value=2\n"
@@ -613,7 +610,7 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "description": (
                         "변경 대상 정책 필드. RosterConfig 필드명(예: max_nig_per_month, "
-                        "max_conseq_work, banned_day_after_eve, day_req, team_balance_enable 등) "
+                        "max_conseq_work, banned_day_after_eve, day_req 등) "
                         "또는 'manpower'(ShiftManage 갱신용)."
                     ),
                 },
@@ -1013,8 +1010,6 @@ SKILL_TOOLS: list[dict] = [
             "⛔ 사용자에게 팀 내부 id·JSON 을 노출하지 마세요. 항상 팀 '이름'으로 말하세요.\n\n"
 
             "─────────── 인접 스킬과의 경계 (혼동 주의) ───────────\n"
-            "- '팀 밸런스(팀 간 균형)를 켜라/강도' → update_constraint (team_balance_enable / team_balance_gauge). "
-            "이건 '한 팀의 최소 인원'이 아니라 '팀들 사이 균형 정책'이라 다른 스킬.\n"
             "- '간호사를 어느 팀에 배정/이동' → 팀 멤버 관리(이 스킬 아님).\n"
             "- 등급별 최소 인원 → manage_grade.\n"
             "- 시프트 전체 필요인원(병동 day_req 등) → update_constraint.\n"

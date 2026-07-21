@@ -119,7 +119,6 @@ class TestToolLayer:
         assert config is not None
         assert config["day_req"] == 2
         assert config["max_nig_per_month"] == 7
-        assert config["even_nights"] is True
 
     def test_count_shifts_per_nurse(self, db, seed_data):
         from agents_v2.tools.analysis_tools import count_shifts_per_nurse

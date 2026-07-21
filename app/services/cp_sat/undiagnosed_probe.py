@@ -17,20 +17,25 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+from services.cp_sat.fix_location import attach_fix_to_options
+
 
 # 결합제약 완화 카탈로그. apply(cfg)->delta(config_dict 키 기준, DB 컬럼명).
 # label_ko 는 사용자 노출용, family 는 그룹핑용. 침습도 낮은(=현실적인) 순서로.
 RELAX_CATALOG: list[dict[str, Any]] = [
     {"id": "raise_max_night_cap", "family": "night_cap", "label_ko": "월 야간 상한 완화",
-     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8}},
+     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8},
+     "search": {"key": "max_nig_per_month", "dir": "up", "hi": 31}},
     {"id": "disable_2n2off", "family": "night_recovery", "label_ko": "2N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_two_nig": False}},
     {"id": "disable_3n2off", "family": "night_recovery", "label_ko": "3N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_three_nig": False}},
     {"id": "raise_max_consec_work", "family": "consecutive", "label_ko": "연속근무 상한 완화",
-     "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3}},
+     "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3},
+     "search": {"key": "max_conseq_work", "dir": "up", "hi": 14}},
     {"id": "relax_consecutive_nights", "family": "night_consecutive", "label_ko": "연속 야간 상한 완화(+1)",
-     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1}},
+     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1},
+     "search": {"key": "max_consecutive_nights", "dir": "up", "hi": 7}},
     {"id": "disable_not_one_night", "family": "night_pattern", "label_ko": "단일 야간 금지 해제",
      "apply": lambda c: {"not_one_night": False}},
     {"id": "disable_ban_n_before_fixed_off", "family": "night_pattern", "label_ko": "고정OFF 직전 야간 금지 해제",
@@ -38,9 +43,21 @@ RELAX_CATALOG: list[dict[str, Any]] = [
     {"id": "disable_banned_day_after_eve", "family": "transition", "label_ko": "E→D 전이 금지 해제",
      "apply": lambda c: {"banned_day_after_eve": False}},
     {"id": "lower_off_days", "family": "off_budget", "label_ko": "월 OFF 요구일수 완화(-3)",
-     "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)}},
+     "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)},
+     "search": {"key": "off_days", "dir": "down", "lo": 0}},
     {"id": "disable_preceptee_sync", "family": "coupling", "label_ko": "프리셉티 동반(팔로우) 해제",
      "apply": lambda c: {"preceptee_on": False}},
+    # ── verified 승격(2026-07-20): 기존엔 온톨로지 treatment(verified:false)만 있던 완화들.
+    # probe로 추가해 "재solve로 feasible 확인됨"(verified:true) 승격. apply 키는 비-DB-컬럼
+    # (솔버 config)이라 apply-resolution이 config_override 경로로 라우팅해야 클릭 적용됨.
+    {"id": "disable_weekend_off_only", "family": "weekend_off", "label_ko": "주말휴무 전용 해제",
+     "apply": lambda c: {"weekend_off_only_enable": False}},
+    {"id": "disable_ban_n_to_d", "family": "transition", "label_ko": "야간→주간 전이 금지 해제",
+     "apply": lambda c: {"ban_n_to_d": False}},
+    {"id": "disable_ban_n_to_e", "family": "transition", "label_ko": "야간→저녁 전이 금지 해제",
+     "apply": lambda c: {"ban_n_to_e": False}},
+    {"id": "soften_team_min", "family": "team", "label_ko": "팀 최소 인원 soft 완화",
+     "apply": lambda c: {"team_min_soft_fallback": True}},
 ]
 
 
@@ -56,6 +73,10 @@ TRADEOFF_KO: dict[str, str] = {
     "disable_banned_day_after_eve": "이브닝 다음날 데이 전이가 생길 수 있습니다.",
     "lower_off_days": "월 휴무일이 줄어듭니다.",
     "disable_preceptee_sync": "프리셉티가 프리셉터와 동반(팔로우)하지 않게 됩니다(교육 동반 약화).",
+    "disable_weekend_off_only": "주말휴무 대상자가 평일에도 OFF를 받거나 주말에 근무할 수 있습니다.",
+    "disable_ban_n_to_d": "야간 다음날 주간 전이가 생길 수 있습니다.",
+    "disable_ban_n_to_e": "야간 다음날 저녁 전이가 생길 수 있습니다.",
+    "soften_team_min": "특정 시프트에서 팀 인원이 최소치보다 1~2명 부족할 수 있습니다(인계 시 주의).",
 }
 COL_LABEL_KO: dict[str, str] = {
     "max_nig_per_month": "월 야간 상한", "two_offs_after_two_nig": "2N→2OFF 회복",
@@ -63,6 +84,8 @@ COL_LABEL_KO: dict[str, str] = {
     "not_one_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
     "banned_day_after_eve": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
     "max_consecutive_nights": "연속 야간 상한", "preceptee_on": "프리셉티 동반(팔로우)",
+    "weekend_off_only_enable": "주말휴무 전용", "ban_n_to_d": "N→D 전이 금지",
+    "ban_n_to_e": "N→E 전이 금지", "team_min_soft_fallback": "팀 최소 soft 완화",
 }
 
 
@@ -104,7 +127,7 @@ def to_resolution_options(probe_result: dict[str, Any], base_config: dict[str, A
             "title_ko": cb.get("label_ko"), "changes": changes,
             "trade_off_ko": " / ".join(tradeoffs), "apply": merged,
         })
-    return opts
+    return attach_fix_to_options(opts)
 
 
 def treatments_to_resolution_options(treatment_recommendations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -126,19 +149,42 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
         if not auto:
             continue  # 전부 수동(data_correction_required)이면 자동 적용 불가 → 옵션 제외
         _bid = str(b.get("bundle_id") or "?")
+        # magnitude sizing: enricher 가 단일축 precheck 숫자로 실효 목표값을 계산해
+        # t["suggested_value"] 에 담았으면 changes 에 노출 + apply(직접적용 델타)로 승격.
+        # 값이 없으면(조합/미지원) 기존처럼 방향만 제시 + treatment_ids 로 적용.
+        _apply: dict[str, Any] = {}
+        _changes = []
+        for t in auto:
+            ck = t.get("config_key")
+            sv = t.get("suggested_value")
+            ch = {"config_key": ck, "label_ko": _lbl(t),
+                  "direction": t.get("direction_label_ko") or t.get("direction"),
+                  "rationale_ko": t.get("rationale_ko")}
+            if sv is not None:
+                ch["suggested_value"] = sv
+                ch["sizing_ko"] = t.get("sizing_ko")
+                if ck:
+                    _apply[ck] = sv
+            elif t.get("sizing_insufficient"):
+                ch["sizing_ko"] = t.get("sizing_ko")
+                ch["sizing_insufficient"] = True
+            elif t.get("sizing_ko"):
+                # message-only sizing (nested/수요 노브 — 자동 apply 없이 정확한 숫자만)
+                ch["sizing_ko"] = t.get("sizing_ko")
+            _changes.append(ch)
         opts.append({
             "option_id": _bid if _bid.startswith("bundle") else "bundle:" + _bid,
-            "kind": "treatment_bundle", "source": "ontology", "verified": False,
+            "kind": "treatment_bundle", "source": "ontology",
+            # sized 목표값이 있으면 apply 로 바로 적용 가능(수치 확정) → 반쯤 검증된 셈.
+            "verified": False,
             "title_ko": " + ".join(_lbl(t) for t in auto),
-            "changes": [{"config_key": t.get("config_key"), "label_ko": _lbl(t),
-                         "direction": t.get("direction_label_ko") or t.get("direction"),
-                         "rationale_ko": t.get("rationale_ko")} for t in auto],
+            "changes": _changes,
             "trade_off_ko": " / ".join([t.get("trade_off_ko") for t in auto if t.get("trade_off_ko")]),
             "treatment_ids": [t.get("treatment_id") for t in auto],
             "manual_required": [t.get("treatment_id") for t in manual],
-            "apply": {},
+            "apply": _apply,
         })
-    return opts
+    return attach_fix_to_options(opts)
 
 
 def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -183,6 +229,66 @@ def _find_combo(
     return None
 
 
+def _search_boundary(
+    base: dict[str, Any],
+    spec: dict[str, Any],
+    resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
+    *,
+    budget: int,
+    logger: Callable[[str], None],
+) -> tuple[int | None, int]:
+    """단조 노브의 **최소 침습 feasible 경계값**을 이분탐색.
+
+    고정 델타(+8 등) 대신 "실제로 풀리는 최소값"을 재solve 로 찾는다. 단조성:
+    up(max_nig↑ 등)=값↑→feasible 유지, down(off_days↓)=값↓→feasible 유지.
+    → 이분탐색이 정당하고 log(범위)회에 종료. budget(재solve 상한) 소진 시 현재까지의
+    feasible 경계(항상 유효한 값)를 반환 → graceful. (value, 사용 solves) 반환,
+    상/하한서도 불가면 (None, solves).
+    """
+    key = spec["key"]
+    _cur = base.get(key)
+    try:
+        cur = int(_cur) if _cur is not None else 0
+    except (TypeError, ValueError):
+        cur = 0
+    solves = 0
+
+    def feasible_at(v: int) -> bool:
+        nonlocal solves
+        cfg = dict(base)
+        cfg[key] = v
+        solves += 1
+        try:
+            ok, _ = resolve_fn(cfg)
+        except Exception:
+            ok = False
+        logger(f"[UndiagProbe][search] {key}={v} feasible={ok}")
+        return bool(ok)
+
+    if spec["dir"] == "up":
+        lo, hi = cur + 1, int(spec.get("hi", cur + 20))
+        if lo > hi or not feasible_at(hi):
+            return None, solves            # 상한서도 불가 → 이 노브 단독으로 못 풂
+        while lo < hi and solves < budget:  # hi 는 항상 feasible 유지(불변식)
+            mid = (lo + hi) // 2
+            if feasible_at(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return hi, solves                   # 최소 feasible 값
+    else:  # down
+        lo, hi = int(spec.get("lo", 0)), cur - 1
+        if lo > hi or not feasible_at(lo):
+            return None, solves            # 하한서도 불가
+        while lo < hi and solves < budget:  # lo 는 항상 feasible 유지
+            mid = (lo + hi + 1) // 2
+            if feasible_at(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, solves                   # 최소 침습(최대) feasible 값
+
+
 def probe_relaxations(
     base_config: dict[str, Any],
     resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
@@ -191,6 +297,7 @@ def probe_relaxations(
     verify: bool = True,
     try_combo: bool = True,
     max_combo: int = 3,
+    search_budget: int = 12,
     logger: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """결합제약을 하나씩 완화해 resolve_fn 으로 feasible 여부를 실측.
@@ -210,8 +317,40 @@ def probe_relaxations(
     all_probed: list[dict[str, Any]] = []
     resolutions: list[dict[str, Any]] = []
     combo: dict[str, Any] | None = None
+    _remaining = int(search_budget)
     try:
         for item in cat:
+            spec = item.get("search")
+            # ── 단조 노브: 고정 델타 대신 최소침습 feasible 값 이분탐색 ──
+            if spec and _remaining > 0:
+                val, used = _search_boundary(
+                    base_config, spec, resolve_fn,
+                    budget=min(6, _remaining), logger=logger,
+                )
+                _remaining -= used
+                if val is not None:
+                    delta = {spec["key"]: val}
+                    if all(base_config.get(k) == v for k, v in delta.items()):
+                        continue  # 이미 그 값(noop)
+                    logger(f"[UndiagProbe] {item['id']:30s} SEARCH→{spec['key']}={val} (solves={used})")
+                    all_probed.append({
+                        "id": item["id"], "family": item["family"], "label_ko": item["label_ko"],
+                        "delta": delta, "feasible": True,
+                        "info": {"searched": True, "value": val, "solves": used},
+                    })
+                else:
+                    # 상/하한서도 못 풂 → 이 노브 단독 불가(참고용 fixed delta 로 기록)
+                    try:
+                        delta = item["apply"](base_config)
+                    except Exception:
+                        continue
+                    all_probed.append({
+                        "id": item["id"], "family": item["family"], "label_ko": item["label_ko"],
+                        "delta": delta, "feasible": False,
+                        "info": {"searched": True, "found": False, "solves": used},
+                    })
+                continue
+            # ── (search 없음 또는 예산 소진) 기존 고정 델타 경로 ──
             try:
                 delta = item["apply"](base_config)
             except Exception as exc:  # 카탈로그 항목 자체 오류는 건너뜀

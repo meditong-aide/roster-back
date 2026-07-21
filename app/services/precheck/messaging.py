@@ -124,12 +124,35 @@ _MESSAGES: Dict[str, Dict[str, Any]] = {
             "충돌하는 고정 배정을 조정하거나 팀 최소 인원을 낮추세요.",
         ],
     },
+    # 주의: 실제 reason_code 는 MONTHLY_NIGHT_CAPACITY_SHORTAGE 다. 예전엔 키가
+    # MONTHLY_NIGHT_CAPACITY 뿐이라 매칭 실패 → raw 코드로 떨어졌다(필드명 불일치). 둘 다 등록.
+    # 개인 속성(월 N 상한) 변경 제안은 제외 — 개인 속성 불가침 원칙.
     "MONTHLY_NIGHT_CAPACITY": {
         "msg": "야간(N) 시프트의 월간 총 요구가 야간 가능 간호사들의 월간 N 가용 횟수 합계를 초과합니다.",
         "fix": [
             "야간 가능 간호사를 추가 배치하세요.",
             "월간 N 일별 요구를 낮추세요.",
-            "야간 전담 간호사의 월간 N 상한을 늘리세요.",
+        ],
+    },
+    "MONTHLY_NIGHT_CAPACITY_SHORTAGE": {
+        "msg": "야간(N) 시프트의 월간 총 요구가 야간 가능 간호사들의 월간 N 가용 횟수 합계를 초과합니다.",
+        "fix": [
+            "야간 가능 간호사를 추가 배치하세요.",
+            "월간 N 일별 요구를 낮추세요.",
+        ],
+    },
+    "N_CAPACITY_SHORTAGE": {
+        "msg": "특정 일자의 야간(N) 요구 인원이 그 날 야간 가능한 간호사 수보다 많습니다.",
+        "fix": [
+            "야간 가능 간호사를 추가 배치하세요.",
+            "해당 일의 N 요구 인원을 낮추세요.",
+        ],
+    },
+    "PRECEPTEE_SYNC_MISMATCH": {
+        "msg": "프리셉터-프리셉티 페어가 동시 근무할 수 없어(가능 시프트/팀/동기화 기간 불일치 또는 상호배제 공존) 동기화가 불가능합니다.",
+        "fix": [
+            "프리셉터-프리셉티의 가능 시프트/팀/동기화 기간을 일치시키세요.",
+            "해당 페어에 상호배제(배반근무)가 걸려 있으면 해제하세요.",
         ],
     },
 }
@@ -162,6 +185,11 @@ def humanize(issue: Dict[str, Any]) -> Dict[str, Any]:
         suffix_parts.append(
             f"월요구={ev['monthly_demand']} / 월가능={ev['monthly_capacity']}"
         )
+    elif "n_required" in ev and "n_capacity" in ev:
+        _p = f"월요구={ev['n_required']} / 월가능={ev['n_capacity']}"
+        if ev.get("shortage") is not None:
+            _p += f" / 부족={ev['shortage']}"
+        suffix_parts.append(_p)
 
     suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
     out = dict(issue)

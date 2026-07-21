@@ -89,6 +89,27 @@ def upsert_monthly_limit(
         .first()
     )
 
+    # 가능 시프트 게이트 (PUT /monthly-limits 와 동일): 근무유형(allowed_shifts)에 없는
+    # 시프트에 양수 한도(min/max/exact)는 저장 차단 — non-N 간호사에 N 한도를 넣어
+    # 생성 시 infeasible 되는 것을 원천 차단(에이전트/온톨로지 우회 방지).
+    from services.precheck.monthly_limit_validator import _check_work_shifts
+    _nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    if _nurse is not None:
+        _base = {f: getattr(row, f, None) for f in LIMIT_FIELDS} if row is not None else {}
+        _ws_issues = _check_work_shifts(
+            {**_base, **updates},
+            nurse_id=nurse_id,
+            nurse_name=getattr(_nurse, "name", None),
+            nurse=_nurse,
+        )
+        if _ws_issues:
+            return {
+                "error": _ws_issues[0]["human_message_ko"],
+                "reason_code": _ws_issues[0]["reason_code"],
+                "issues": _ws_issues,
+                "blocked": True,
+            }
+
     changes = {}
     if row is None:
         # 신규 row 생성 대상

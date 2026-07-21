@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 
 import routers.roster_create as rc
 from db.models import RosterConfig
@@ -39,9 +40,23 @@ def _mock_sqs(monkeypatch):
     monkeypatch.setattr(rc, "_send_sqs_job", fake_sqs)
 
 
+def _run(coro):
+    # py3.13: get_event_loop() 격리 문제 회피 — 호출마다 새 루프.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def _call(req, adm_user, db):
-    return asyncio.get_event_loop().run_until_complete(
-        rc.roster_create_async(req, current_user=adm_user, _db=db, wait_for_result=False)
+    # request: FastAPI Request — 실서버는 자동 주입(로깅용 x-forwarded-for/client.host/user-agent).
+    # 테스트는 최소 scope mock 으로 직접 주입.
+    request = Request({"type": "http", "headers": [], "client": ("127.0.0.1", 0)})
+    return _run(
+        rc.roster_create_async(
+            req, request, current_user=adm_user, _db=db, wait_for_result=False
+        )
     )
 
 

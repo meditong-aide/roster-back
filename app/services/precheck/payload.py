@@ -51,6 +51,7 @@ _BLOCKING_CODES = {
     "MONTHLY_NIGHT_CAPACITY_SHORTAGE",
     "N_CAPACITY_SHORTAGE",
     "PRECEPTEE_SYNC_MISMATCH",
+    "PER_NURSE_SEQUENCE_INFEASIBLE",
 }
 
 
@@ -316,6 +317,11 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
         normalized.append(item)
     causes, observed_symptoms, _undiag = split_violations(normalized)
     causes = _dedup_causes_by_reason(causes)
+    try:
+        from services.cp_sat.fix_location import attach_fix_to_causes
+        attach_fix_to_causes(causes)
+    except Exception:
+        pass
     observed_symptoms = _dedup_causes_by_reason(observed_symptoms)
     evidence = build_evidence_node(
         applied_relaxations=[],
@@ -486,6 +492,11 @@ def build_unrecoverable_payload(
     # US-1: cause-bucket / symptom-bucket / evidence 분리 노출 (cause 와 symptom 절대 교차 없음)
     causes, observed_symptoms, _undiag_present = split_violations(combined_violations)
     causes = _dedup_causes_by_reason(causes)
+    try:
+        from services.cp_sat.fix_location import attach_fix_to_causes
+        attach_fix_to_causes(causes)
+    except Exception:
+        pass
     observed_symptoms = _dedup_causes_by_reason(observed_symptoms)
     evidence = build_evidence_node(
         applied_relaxations=list(applied_relaxations or []),

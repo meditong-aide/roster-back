@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from fastapi import FastAPI
@@ -87,11 +87,13 @@ def test_change_builds_education_timeline(seeded):
 
 def test_change_future_does_not_touch_cache(seeded):
     # valid_from(미래) > today → 캐시(allowed_shifts) 투영 안 함
+    # ★하드코딩 날짜는 시간이 지나면 과거가 되어 오탐 → today 기준 상대 미래일 사용
     db = seeded
     c = _client(db, _user())
+    future = (date.today() + timedelta(days=365)).isoformat()
     r = c.post("/nurse-period/change", json={
         "attribute": "allowed_shifts", "nurse_id": "edu",
-        "valid_from": "2026-07-01", "value": ["N"]})
+        "valid_from": future, "value": ["N"]})
     assert r.status_code == 200
     assert db.query(Nurse).filter_by(nurse_id="edu").first().allowed_shifts == []  # 캐시 그대로
 

@@ -421,7 +421,12 @@ def _check_work_shifts(
     nurse_name: Optional[str],
     nurse: Nurse,
 ) -> List[Dict[str, Any]]:
-    """C3: nurse.work_shifts에 없는 시프트에 limit 양수가 들어가면 모순."""
+    """C3: nurse.work_shifts에 없는 시프트에 limit 양수(min/max/exact)가 들어가면 불가.
+
+    근무유형(allowed_shifts)에 없는 시프트는 해당 시프트를 아예 배정받을 수 없으므로,
+    양수 하한/고정은 infeasible, 양수 상한은 무의미하다. 세 바운드 모두 저장 차단해
+    에이전트/온톨로지가 non-N(또는 non-D/E) 간호사에 해당 시프트 한도를 넣지 못하게 한다.
+    """
     allowed = _allowed_work_shifts(nurse)
     if allowed is None:
         return []
@@ -431,17 +436,18 @@ def _check_work_shifts(
             continue
         mn = _row_value(row, f"{p}_min")
         ex = _row_value(row, f"{p}_exact")
-        if (mn is not None and mn > 0) or (ex is not None and ex > 0):
+        mx = _row_value(row, f"{p}_max")
+        if (mn is not None and mn > 0) or (ex is not None and ex > 0) or (mx is not None and mx > 0):
             issues.append(_make_issue(
                 "MONTHLY_LIMIT_NOT_IN_WORK_SHIFTS",
                 nurse_id=nurse_id, nurse_name=nurse_name,
-                evidence={"shift": p.upper(), "min": mn, "exact": ex, "allowed": sorted(allowed)},
+                evidence={"shift": p.upper(), "min": mn, "max": mx, "exact": ex, "allowed": sorted(allowed)},
                 human_message_ko=(
                     f"{nurse_name or nurse_id} 간호사의 가능 시프트는 {sorted(allowed)} 입니다. "
-                    f"{_SHIFT_LABEL[p]} min/exact 양수 설정은 불가능합니다."
+                    f"{_SHIFT_LABEL[p]} min/max/exact 양수 설정은 불가능합니다."
                 ),
                 fix_suggestions_ko=[
-                    f"{_SHIFT_LABEL[p]} min/exact를 0으로 두거나 work_shifts에 {p.upper()}를 추가하세요.",
+                    f"{_SHIFT_LABEL[p]} min/max/exact를 0으로 두거나 work_shifts에 {p.upper()}를 추가하세요.",
                 ],
             ))
     return issues
