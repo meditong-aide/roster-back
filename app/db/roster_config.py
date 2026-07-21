@@ -26,7 +26,6 @@ class NurseRosterConfig:
     
     # 병원 내규 (소프트 제약)
     sequential_offs: bool = True  # OFF 연속 배정
-    even_nights: bool = True  # N 개수 균등 배정
     nod_noe: bool = True  # N-O-D/E 패턴 최소화 적용 여부
     
     # 휴무일 관리
@@ -63,7 +62,6 @@ class NurseRosterConfig:
     # 수렴된 균등해가 stage3 warm-start hint로 상속되어 X축(D/E 1.5배) 균형을 안정화한다.
     de_balance_enable: bool = True
     de_balance_tolerance: int = 2  # |D-E| 허용 밴드(일). 초과분만 soft 벌점.
-    off_placement_mode: int = 1  # 주휴 인접 OFF 배치 모드(0=미적용, 1=앞/뒤, 2=앞 우선)
     off_first: bool = False  # off_first=False(default): OFF 규칙 우선(OFF cap 충족 + max coverage 무시 + 남는 셀 근무 배정 + fixed_wanted 차감) / off_first=True: 근무 규칙 우선(현행 min-max coverage 균등화 유지, min 근접 배정)
     distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off
     monthly_preference_weight: int = 60  # 월단위 선호(개인 입력) 보너스 가중치(soft)
@@ -113,14 +111,6 @@ class NurseRosterConfig:
     # --- Oversupply(여유 인원) 균등화 제어 ---
     oversupply_equalize_enable: bool = True  # 일별 D/E/N 초과 인원(L1) 균등화 활성화
     oversupply_equalize_weight: int = 120    # L1 차이 패널티 가중치(클수록 균등화 강함)
-    # --- 팀 균등/집중 분배 옵션 ---
-    team_balance_enable: bool = False               # 팀 보너스 활성화
-    team_balance_gauge: int = 0                     # 0~10 게이지
-    team_balance_weight: int = 0                    # 계산된 기본 가중치
-    team_balance_top_days: int = 0                  # 동일 교대 보너스에서 고려할 상위 일수
-    team_balance_focus_shifts: Optional[List[str]] = None  # 교대 제한 (없으면 D/E/N)
-    team_balance_mode: str = "balanced"             # balanced | focus_D | focus_DE
-    team_balance_shift_weights: Dict[str, float] = field(default_factory=dict)  # 모드별 파생 가중치
     # ── 팀별 일일 최소 시프트 커버리지 ──
     # team_min_by_team[team_id_str] = {'D': 1, 'E': 1, 'N': 0}
     # 팀마다 개별 min 설정 가능. use_mid=True 일 때 'M' 키 사용 가능.
@@ -143,33 +133,7 @@ class NurseRosterConfig:
             self.daily_shift_requirements = {'D': 3, 'E': 3, 'N': 2}
         if self.soft_max_consecutive_work_days is None:
             self.soft_max_consecutive_work_days = int(self.max_consecutive_work_days)
-        # 팀 게이지 → 가중치/탑K
-        gauge = max(0, min(10, int(self.team_balance_gauge or 0)))
-        if not self.team_balance_enable or gauge == 0:
-            self.team_balance_weight = 0
-            self.team_balance_top_days = 0
-        else:
-            if not self.team_balance_weight:
-                # 정규화된 팀 보너스 강도(soft) 매핑:
-                # weight는 개인 선호도 항의 계수(P*100) 스케일을 기준으로 "대략 0~240" 범위에서 동작하도록 캡을 둔다.
-                # 식: weight = round(cap * (g/10)^p)
-                # 예) cap=240, p=1.7, g=5 → 약 74, g=10 → 240
-                cap = 240
-                power = 1.7
-                g_norm = gauge / 10.0
-                self.team_balance_weight = int(round(cap * (g_norm ** power)))
-            if not self.team_balance_top_days:
-                self.team_balance_top_days = int(6 + (30 - 6) * (gauge / 10.0))
-        # 모드 기반 shift weight 설정 (없을 때만 세팅)
-        if not self.team_balance_shift_weights:
-            mode = (self.team_balance_mode or "balanced").lower()
-            if mode == "focus_d":
-                self.team_balance_shift_weights = {"D": 1.5, "E": 0.6, "N": 0.3}
-            elif mode == "focus_de":
-                self.team_balance_shift_weights = {"D": 1.2, "E": 1.2, "N": 0.5}
-            else:
-                self.team_balance_shift_weights = {"D": 1.0, "E": 1.0, "N": 1.0}
-            
+
     @property
     def shift_types(self) -> List[str]:
         """휴무일을 포함한 교대 유형 목록을 반환합니다."""

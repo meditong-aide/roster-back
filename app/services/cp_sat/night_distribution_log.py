@@ -31,7 +31,7 @@ def log_n_even_distribution(
     """
     try:
         cfg = roster_system.config
-        if not getattr(cfg, "even_nights", False):
+        if "N" not in cfg.shift_types:
             return
         night_idx = cfg.shift_types.index("N")
         D = roster_system.num_days

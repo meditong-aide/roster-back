@@ -19,7 +19,6 @@ from services.constraints.team_grade_handoff_constraints import (
 from services.day_windows import iter_nurse_days
 from services.cp_sat.objective_terms import (
     add_even_mid_distribution_terms,
-    add_even_night_minmax_distribution_terms,
     add_kld_distribution_terms,
 )
 
@@ -38,7 +37,6 @@ def build_fallback_stage3_objective_terms(
     weekly_off_by_idx: dict[int, list[int]],
     logger_prefix: str,
     add_preceptor_terms_fn,
-    add_team_balance_terms_fn,
     add_grade_constraints_fn,
     blocked_by_nurse: dict[int, set[int]] | None = None,
 ) -> list:
@@ -57,7 +55,6 @@ def build_fallback_stage3_objective_terms(
         weekly_off_by_idx: 주휴 day_idx 맵
         logger_prefix: 로그 접두사
         add_preceptor_terms_fn: 프리셉터 보너스 항 생성 함수
-        add_team_balance_terms_fn: 팀 밸런스 항 생성 함수
         add_grade_constraints_fn: Grade 제약 항 생성 함수
 
     Returns:
@@ -547,15 +544,8 @@ def build_fallback_stage3_objective_terms(
 
     grade_strategy = "COMBINED"  # [ALWAYS_COMBINED] 수행모드 폐기
     # "grade/team 바로 밑" lex 패스용: 이 소프트 품질 항들을 동결한 뒤 mutex 위반만 최소화.
-    # (team_min 은 하드 m.Add 로 이미 강제되므로 freeze 대상에서 제외 — team_balance/grade/handoff 만.)
+    # (team_min 은 하드 m.Add 로 이미 강제되므로 freeze 대상에서 제외 — grade/handoff 만.)
     _gt_lex_terms = []
-    try:
-        _tb_terms = add_team_balance_terms_fn(m, roster_system, X, join, leave)
-        obj.extend(_tb_terms)
-        _gt_lex_terms.extend(_tb_terms or [])
-    except Exception as e:
-        print("team_balance_objective_terms 예외 발생")
-        print("e", e)
     # team_min 은 데이터(team_min_by_team) 존재 여부로만 활성. strategy는 weight tilt용.
     try:
         obj.extend(add_team_min_constraints(m, roster_system, X, join, leave, grade_strategy=grade_strategy, blocked_by_nurse=blocked_by_nurse))

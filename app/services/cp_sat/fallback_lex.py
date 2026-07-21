@@ -140,7 +140,6 @@ def optimize_fallback_lex_hard_first(
     logger_prefix: str,
     timer_cls,
     add_preceptor_terms_fn,
-    add_team_balance_terms_fn,
     add_grade_constraints_fn,
     postprocess_rebalance_off_fn,
     blocked_by_nurse: dict[int, set[int]] | None = None,
@@ -160,7 +159,6 @@ def optimize_fallback_lex_hard_first(
         logger_prefix: 로그 접두사
         timer_cls: with 구문에 사용할 Timer 클래스
         add_preceptor_terms_fn: 프리셉터 목적함수 항 생성 함수
-        add_team_balance_terms_fn: 팀 밸런스 목적함수 항 생성 함수
         add_grade_constraints_fn: Grade 제약 추가 함수
         postprocess_rebalance_off_fn: 후처리(OFF 재배치) 함수
 
@@ -2727,7 +2725,6 @@ def optimize_fallback_lex_hard_first(
                 weekly_off_by_idx=weekly_off_by_idx,
                 logger_prefix=logger_prefix,
                 add_preceptor_terms_fn=add_preceptor_terms_fn,
-                add_team_balance_terms_fn=add_team_balance_terms_fn,
                 add_grade_constraints_fn=add_grade_constraints_fn,
                 blocked_by_nurse=blocked_by_nurse,
             )

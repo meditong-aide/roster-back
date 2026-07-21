@@ -23,7 +23,6 @@ from services.constraints.team_constraints import add_team_min_constraints
 from services.constraints.team_grade_handoff_constraints import (
     add_team_grade_handoff_constraints,
 )
-from services.objectives.team_objective import add_team_balance_objective_terms
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes, is_n_only_profile
 from services.day_windows import iter_nurse_days, build_active_days
 
@@ -1040,13 +1039,12 @@ def build_main_objective_terms(
                 m.Add(consecutive_bonus >= X(n, d, off) + X(n, d + 1, off) - 1)
                 obj.append(SEQUENTIAL_OFF_BONUS * consecutive_bonus)
 
-    # (4-6) 프리셉터/팀 보너스 항
+    # (4-6) 프리셉터(고가중 페어) 보너스 항
     if include_pair_objective:
         try:
             obj.extend(preceptor_terms_fn(m, rs, X, join, leave))
         except Exception:
             pass
-        obj.extend(add_team_balance_objective_terms(m, rs, X, join, leave, blocked_by_nurse=blocked_by_nurse))
 
     # (4-6-tm) team_min 제약: 데이터(team_min_by_team) 존재 여부만으로 활성. strategy는 weight tilt용.
     try:
