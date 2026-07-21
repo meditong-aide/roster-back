@@ -996,6 +996,22 @@ def optimize_fallback_lex_hard_first(
                     continue
                 if not bool(getattr(nu, "is_weekend_off", False)):
                     continue
+                # MUS용 per-nurse 주말휴무 리터럴 — 강제 OFF/평일 OFF금지가 병목이면
+                # core 에 WeekendOffNode 로 뜬다. 기본 true=동작 무변경.
+                _assume_weekend_off_fb = None
+                if _assume_registry_fb is not None:
+                    _assume_weekend_off_fb = _assume_registry_fb.create_literal(
+                        f"WeekendOffOnly:nurse_{n}",
+                        meta={
+                            "node_id": f"weekend_off_only:nurse_{n}",
+                            "type": "WeekendOffNode", "label": "주말휴무 전용",
+                            "value": True, "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "weekend_off_only",
+                            "nurse_id": str(getattr(nu, "nurse_id", n)),
+                            "human_message_ko": "주말 OFF 강제 / 평일 OFF 금지(주말휴무 전용자)",
+                            "resolution_hint": "주말휴무 전용(weekend_off_only_enable)을 끄거나 이 간호사의 주말휴무 속성을 해제하세요.",
+                        },
+                    )
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     if d in weekend_days:
                         # 주말(토/일): 기본 OFF 강제
@@ -1010,7 +1026,10 @@ def optimize_fallback_lex_hard_first(
                                 f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                             )
                             continue
-                        m.Add(X(n, d, off_idx) == 1)
+                        if _assume_weekend_off_fb is not None:
+                            m.Add(X(n, d, off_idx) == 1).OnlyEnforceIf(_assume_weekend_off_fb)
+                        else:
+                            m.Add(X(n, d, off_idx) == 1)
                     else:
                         # 평일(월~금): OFF 금지(D/E/N만 가능)
                         # 단, 사용자 고정 OFF는 예외로 허용하고 별도 제약을 걸지 않는다.
@@ -1022,7 +1041,10 @@ def optimize_fallback_lex_hard_first(
                         _ow_ranges_fb = (getattr(roster_system, "off_window_constraints", {}) or {}).get(n, []) or []
                         if any(ws <= d <= we for (ws, we) in _ow_ranges_fb):
                             continue
-                        m.Add(X(n, d, off_idx) == 0)
+                        if _assume_weekend_off_fb is not None:
+                            m.Add(X(n, d, off_idx) == 0).OnlyEnforceIf(_assume_weekend_off_fb)
+                        else:
+                            m.Add(X(n, d, off_idx) == 0)
 
         # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
         # if raw_off_placement_mode != 0:
@@ -1624,6 +1646,21 @@ def optimize_fallback_lex_hard_first(
             for n in range(N):
                 if n in _single_n_allowed_lex:
                     continue
+                # MUS용 per-nurse 1N 금지 리터럴 (primary _assume_no1n 대응)
+                _assume_no1n_fb = None
+                if _assume_registry_fb is not None:
+                    _assume_no1n_fb = _assume_registry_fb.create_literal(
+                        f"NotOneNight:nurse_{n}",
+                        meta={
+                            "node_id": f"not_one_night:nurse_{n}",
+                            "type": "NotOneNightNode", "label": "1N 단독 금지",
+                            "value": True, "scope": "nurse", "scope_key": f"nurse_{n}",
+                            "pattern": "not_one_night",
+                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
+                            "human_message_ko": "야간(N) 단독 박힘 금지 (인접일 중 ≥1일 N 필요)",
+                            "resolution_hint": "이 간호사의 n_max 한도를 1로 설정하면 1N 금지에서 면제됩니다.",
+                        },
+                    )
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
                     # 프리셉티 fixed셀은 1N 강제 제외(사용자: 고정 단독N 존중, 복사된 단독N만 방지)
@@ -1640,7 +1677,10 @@ def optimize_fallback_lex_hard_first(
                         neighbors.append(X(n, d + 1, night_idx))
                     if not neighbors:
                         continue
-                    m.Add(X(n, d, night_idx) <= sum(neighbors))
+                    if _assume_no1n_fb is not None:
+                        m.Add(X(n, d, night_idx) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n_fb)
+                    else:
+                        m.Add(X(n, d, night_idx) <= sum(neighbors))
 
         # 휴가/공가 fixed 셀의 직전일 N 금지 (하드, 휴가/공가 보호 정책).
         # fixed_wanted O / 휴무 / 주휴 등은 사용자 자발 OFF 또는 자동 OFF 라 대상 외.
