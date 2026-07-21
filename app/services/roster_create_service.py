@@ -5877,13 +5877,28 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     _probe_opts = to_resolution_options(_probe_res, _probe_base)
                     _exist_opts = unrecoverable["infeasibility"].get("resolution_options") or []
                     unrecoverable["infeasibility"]["resolution_options"] = _probe_opts + _exist_opts
-                    # 정합성: probe 가 검증된(verified) 옵션을 찾았으면 "해를 못 찾음, 점검하세요"
-                    # 메시지와 모순되므로, 적용 가능한 옵션이 있음을 알리는 문구로 교정.
+                    # probe 의 검증된 완화 = 원인 그 자체다: "이걸 완화하면 풀린다" ⟺ "이게 병목".
+                    # MUS core 가 비어도 probe 가 원인(=완화 대상 정책)을 지목한다.
+                    # 단일 완화들 = 각각이 단독 충분한 병목(대안), combo = 함께여야 풀리는 결합 병목.
                     if any(o.get("verified") for o in _probe_opts):
-                        unrecoverable["infeasibility"]["summary_message_ko"] = (
-                            "자동 진단으로는 원인을 특정하지 못했지만, 아래 옵션 중 하나를 "
-                            "적용하면 근무표를 생성할 수 있습니다. 적용할 옵션을 선택해주세요."
-                        )
+                        import re as _re_cause
+                        def _cause_label(_t):
+                            # title 의 액션어(완화/해제/…)를 떼 "원인=정책명"으로 읽히게.
+                            return _re_cause.sub(r"\s*(완화|해제|비활성화|감소|상향)(\(.*?\))?$", "", _t or "").strip() or _t
+                        _v_single = [_cause_label(o.get("title_ko")) for o in _probe_opts
+                                     if o.get("verified") and o.get("kind") != "combo" and o.get("title_ko")]
+                        _v_combo = next((o for o in _probe_opts if o.get("kind") == "combo" and o.get("verified")), None)
+                        if _v_single:
+                            _cause = " / ".join(_v_single[:4])
+                            unrecoverable["infeasibility"]["summary_message_ko"] = (
+                                f"원인: 다음 정책이 현재 인원·설정으로는 동시에 만족될 수 없습니다 — {_cause}. "
+                                f"이 중 하나를 완화하면 근무표를 생성할 수 있습니다(재계산으로 검증됨). 적용할 옵션을 선택해주세요."
+                            )
+                        elif _v_combo:
+                            unrecoverable["infeasibility"]["summary_message_ko"] = (
+                                f"원인: 여러 정책이 얽혀 단일 완화로는 풀리지 않습니다. "
+                                f"'{_v_combo.get('title_ko')}'를 함께 적용하면 근무표를 생성할 수 있습니다(검증됨)."
+                            )
                     _combo = _probe_res.get("combo")
                     print(f"[UndiagProbe] found={_probe_res.get('found')} "
                           f"resolutions={[r['id'] for r in _probe_res.get('resolutions', [])]} "
