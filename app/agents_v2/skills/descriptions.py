@@ -567,7 +567,6 @@ SKILL_TOOLS: list[dict] = [
             "  • banned_day_after_eve — 이브닝 다음날 데이 금지 (bool)\n"
             "  • not_one_night — 단발성 야간(하루짜리 N) 금지 (bool)\n"
             "  • nod_noe — 야간 다음 데이/이브닝(N→O→D/E) 패턴 최소화 (bool)\n"
-            "  • ban_night_before_fixed_off — 고정 오프 전날 야간 금지 (bool)\n"
             "  • sequential_offs — 오프 연속 배치 선호 (bool)\n"
             "  • even_nights — 야간 균등 배분 (bool)\n\n"
             "[C] 구조 정책\n"
@@ -596,7 +595,6 @@ SKILL_TOOLS: list[dict] = [
             "- '시프트당 3년차 이상 경력자 필수' → field='min_exp_per_shift', value=3\n"
             "- '교대마다 경력 간호사 2명은 있어야 해' → field='req_exp_nurses', value=2\n"
             "- '단발 나이트 금지' → field='not_one_night', value=true\n"
-            "- '고정 오프 전날 나이트 빼줘' → field='ban_night_before_fixed_off', value=true\n"
             "- 'RN 데이 1슬롯 인원 5명' → field='manpower', nurse_class='RN', shift_slot=1, value=5\n\n"
 
             "⛔ 거절 예시 (update_person_attr 영역):\n"
