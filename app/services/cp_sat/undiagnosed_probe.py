@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+from services.cp_sat.fix_location import attach_fix_to_options
+
 
 # 결합제약 완화 카탈로그. apply(cfg)->delta(config_dict 키 기준, DB 컬럼명).
 # label_ko 는 사용자 노출용, family 는 그룹핑용. 침습도 낮은(=현실적인) 순서로.
@@ -125,7 +127,7 @@ def to_resolution_options(probe_result: dict[str, Any], base_config: dict[str, A
             "title_ko": cb.get("label_ko"), "changes": changes,
             "trade_off_ko": " / ".join(tradeoffs), "apply": merged,
         })
-    return opts
+    return attach_fix_to_options(opts)
 
 
 def treatments_to_resolution_options(treatment_recommendations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -182,7 +184,7 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
             "manual_required": [t.get("treatment_id") for t in manual],
             "apply": _apply,
         })
-    return opts
+    return attach_fix_to_options(opts)
 
 
 def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
