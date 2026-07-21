@@ -118,12 +118,19 @@ def finish_turn(answer: str | None, stages: list | None = None,
 
 
 def score(name: str, value: Any, comment: str | None = None) -> None:
-    """현재 trace 에 평가 점수 부착(예: 검증결과 outcome, L1/L2 통과여부). 실패 무시."""
+    """현재 trace 에 평가 점수 부착(예: 검증결과 outcome, L1/L2 통과여부). 실패 무시.
+
+    문자열 값(OK/VERIFICATION_FAILED 등)은 **categorical** 로 넣는다(안 그러면 Langfuse 가
+    숫자 score 로 취급해 0 으로 저장됨). 숫자 값은 그대로 numeric.
+    """
     trace = _current_trace.get()
     if trace is None:
         return
     try:
-        trace.score(name=name, value=value, comment=comment)
+        if isinstance(value, str):
+            trace.score(name=name, value=value, data_type="CATEGORICAL", comment=comment)
+        else:
+            trace.score(name=name, value=value, comment=comment)
     except Exception:  # noqa: BLE001
         pass
 
