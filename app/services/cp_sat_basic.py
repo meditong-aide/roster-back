@@ -4674,15 +4674,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     # 회복 OFF 슬롯에 non-OFF/non-N fixed_wanted → 이 위치에서 2N 블록 종료 금지
                     m.Add(xn_prev + xn_curr + end_block <= 2)
                     continue
-                # MUS 추적: within-month 회복(2N→2OFF)도 boundary(위 4640)와 동일하게
-                # _assume_2n2off 로 gate → 회복이 병목이면 core 에 RecoveryOffNode 로 뜬다.
-                # 리터럴은 기본 true(assumed) 라 feasible 동작은 무변경, MUS 때만 완화 대상.
-                _enforce_2n_main = [xn_prev, xn_curr, end_block]
-                if _assume_2n2off is not None:
-                    _enforce_2n_main.append(_assume_2n2off)
                 m.Add(
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
-                ).OnlyEnforceIf(_enforce_2n_main)
+                ).OnlyEnforceIf(
+                    [xn_prev, xn_curr, end_block]
+                )
 
     # ───────────── 3-2. 룩어헤드 전용: 일별 OFF 상한(고정 vs 선택 분리) ───────
     if K_lookahead > 0 and off_idx_full is not None:

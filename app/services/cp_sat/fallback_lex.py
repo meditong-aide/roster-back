@@ -996,22 +996,6 @@ def optimize_fallback_lex_hard_first(
                     continue
                 if not bool(getattr(nu, "is_weekend_off", False)):
                     continue
-                # MUS용 per-nurse 주말휴무 리터럴 — 강제 OFF/평일 OFF금지가 병목이면
-                # core 에 WeekendOffNode 로 뜬다. 기본 true=동작 무변경.
-                _assume_weekend_off_fb = None
-                if _assume_registry_fb is not None:
-                    _assume_weekend_off_fb = _assume_registry_fb.create_literal(
-                        f"WeekendOffOnly:nurse_{n}",
-                        meta={
-                            "node_id": f"weekend_off_only:nurse_{n}",
-                            "type": "WeekendOffNode", "label": "주말휴무 전용",
-                            "value": True, "scope": "nurse", "scope_key": f"nurse_{n}",
-                            "pattern": "weekend_off_only",
-                            "nurse_id": str(getattr(nu, "nurse_id", n)),
-                            "human_message_ko": "주말 OFF 강제 / 평일 OFF 금지(주말휴무 전용자)",
-                            "resolution_hint": "주말휴무 전용(weekend_off_only_enable)을 끄거나 이 간호사의 주말휴무 속성을 해제하세요.",
-                        },
-                    )
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                     if d in weekend_days:
                         # 주말(토/일): 기본 OFF 강제
@@ -1026,10 +1010,7 @@ def optimize_fallback_lex_hard_first(
                                 f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                             )
                             continue
-                        if _assume_weekend_off_fb is not None:
-                            m.Add(X(n, d, off_idx) == 1).OnlyEnforceIf(_assume_weekend_off_fb)
-                        else:
-                            m.Add(X(n, d, off_idx) == 1)
+                        m.Add(X(n, d, off_idx) == 1)
                     else:
                         # 평일(월~금): OFF 금지(D/E/N만 가능)
                         # 단, 사용자 고정 OFF는 예외로 허용하고 별도 제약을 걸지 않는다.
@@ -1041,10 +1022,7 @@ def optimize_fallback_lex_hard_first(
                         _ow_ranges_fb = (getattr(roster_system, "off_window_constraints", {}) or {}).get(n, []) or []
                         if any(ws <= d <= we for (ws, we) in _ow_ranges_fb):
                             continue
-                        if _assume_weekend_off_fb is not None:
-                            m.Add(X(n, d, off_idx) == 0).OnlyEnforceIf(_assume_weekend_off_fb)
-                        else:
-                            m.Add(X(n, d, off_idx) == 0)
+                        m.Add(X(n, d, off_idx) == 0)
 
         # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
         # if raw_off_placement_mode != 0:
@@ -1225,22 +1203,6 @@ def optimize_fallback_lex_hard_first(
                     p = _fb_id_map[pid]
                 d_start = max(join[n], join[p])
                 d_end = min(leave[n], leave[p])
-                # MUS용 per-preceptee 동반(팔로우) 리터럴 — follow/특수OFF가 병목이면
-                # core 에 PrecepteeFollowNode 로 뜬다. 기본 true=동작 무변경.
-                _assume_preceptee_fb = None
-                if _assume_registry_fb is not None:
-                    _assume_preceptee_fb = _assume_registry_fb.create_literal(
-                        f"PrecepteeFollow:nurse_{n}",
-                        meta={
-                            "node_id": f"preceptee_follow:nurse_{n}",
-                            "type": "PrecepteeFollowNode", "label": "프리셉티 동반(팔로우)",
-                            "value": True, "scope": "nurse", "scope_key": f"nurse_{n}",
-                            "pattern": "preceptee_follow",
-                            "nurse_id": str(getattr(nu, "nurse_id", n)),
-                            "human_message_ko": "프리셉티가 프리셉터와 동일 근무를 서야 함(교육 동반)",
-                            "resolution_hint": "프리셉티 동반(preceptee_follow/preceptee_on)을 해제하세요.",
-                        },
-                    )
                 for d in range(d_start, d_end + 1):
                     if not _is_preceptee_at(n, d):
                         continue
@@ -1259,20 +1221,14 @@ def optimize_fallback_lex_hard_first(
                     if _p_special:
                         _xo = X(n, d, off_idx)
                         if not isinstance(_xo, int):
-                            if _assume_preceptee_fb is not None:
-                                m.Add(_xo == 1).OnlyEnforceIf(_assume_preceptee_fb)
-                            else:
-                                m.Add(_xo == 1)
+                            m.Add(_xo == 1)
                         continue
                     for s in range(S):
                         xn = X(n, d, s)
                         xp = X(p, d, s)
                         if isinstance(xn, int) or isinstance(xp, int):
                             continue
-                        if _assume_preceptee_fb is not None:
-                            m.Add(xn == xp).OnlyEnforceIf(_assume_preceptee_fb)
-                        else:
-                            m.Add(xn == xp)
+                        m.Add(xn == xp)
             # Option C: 프리셉티 fixed_wanted 프리솔브 하드고정 → fixed일 인접을 솔버가 조율/불가보고
             for (_pte_n, _pte_d), _pte_code in _pte_fw_map.items():
                 if _pte_n not in preceptee_indices:
@@ -1285,24 +1241,7 @@ def optimize_fallback_lex_hard_first(
                 _ci = roster_system.config.shift_types.index(_cu)
                 _xv = X(_pte_n, _pte_d, _ci)
                 if not isinstance(_xv, int):
-                    if _assume_registry_fb is not None and _add_hard_fb is not None:
-                        _add_hard_fb(
-                            m, _assume_registry_fb,
-                            name=f"PrecepteeFixedWanted:nurse_{_pte_n}:day_{_pte_d}",
-                            constraint_expr=(_xv == 1),
-                            meta={
-                                "node_id": f"preceptee_fixed_wanted:nurse_{_pte_n}:day_{_pte_d}",
-                                "type": "FixedWantedNode", "label": "프리셉티 고정 요청",
-                                "value": {"day": _pte_d + 1, "code": str(_pte_code)},
-                                "scope": "nurse", "scope_key": f"nurse_{_pte_n}",
-                                "pattern": "preceptee_fixed_wanted",
-                                "nurse_id": str(getattr(roster_system.nurses[_pte_n], "nurse_id", _pte_n)),
-                                "human_message_ko": "프리셉티 고정 근무 요청을 유지해야 합니다.",
-                                "resolution_hint": "해당 프리셉티 고정 요청을 해제하세요.",
-                            },
-                        )
-                    else:
-                        m.Add(_xv == 1)
+                    m.Add(_xv == 1)
 
         # DEN 커버리지에서 프리셉티 제외 시 fixed_cnt 보정
         if exclude_preceptee_from_den:
@@ -1685,21 +1624,6 @@ def optimize_fallback_lex_hard_first(
             for n in range(N):
                 if n in _single_n_allowed_lex:
                     continue
-                # MUS용 per-nurse 1N 금지 리터럴 (primary _assume_no1n 대응)
-                _assume_no1n_fb = None
-                if _assume_registry_fb is not None:
-                    _assume_no1n_fb = _assume_registry_fb.create_literal(
-                        f"NotOneNight:nurse_{n}",
-                        meta={
-                            "node_id": f"not_one_night:nurse_{n}",
-                            "type": "NotOneNightNode", "label": "1N 단독 금지",
-                            "value": True, "scope": "nurse", "scope_key": f"nurse_{n}",
-                            "pattern": "not_one_night",
-                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
-                            "human_message_ko": "야간(N) 단독 박힘 금지 (인접일 중 ≥1일 N 필요)",
-                            "resolution_hint": "이 간호사의 n_max 한도를 1로 설정하면 1N 금지에서 면제됩니다.",
-                        },
-                    )
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 + 1):
                     # 프리셉티 fixed셀은 1N 강제 제외(사용자: 고정 단독N 존중, 복사된 단독N만 방지)
@@ -1716,10 +1640,7 @@ def optimize_fallback_lex_hard_first(
                         neighbors.append(X(n, d + 1, night_idx))
                     if not neighbors:
                         continue
-                    if _assume_no1n_fb is not None:
-                        m.Add(X(n, d, night_idx) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n_fb)
-                    else:
-                        m.Add(X(n, d, night_idx) <= sum(neighbors))
+                    m.Add(X(n, d, night_idx) <= sum(neighbors))
 
         # 휴가/공가 fixed 셀의 직전일 N 금지 (하드, 휴가/공가 보호 정책).
         # fixed_wanted O / 휴무 / 주휴 등은 사용자 자발 OFF 또는 자동 OFF 라 대상 외.
@@ -1729,7 +1650,6 @@ def optimize_fallback_lex_hard_first(
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 _ban_n_cnt = 0
-                _assume_ban_n_fixed_fb = None  # lazy: 실제 ban 있는 간호사만 리터럴 생성
                 for d in range(T0 + 1, T1 + 1):
                     if (n, d) not in fixed:
                         continue
@@ -1743,23 +1663,7 @@ def optimize_fallback_lex_hard_first(
                         continue
                     if (n, prev_d) in fixed:
                         continue  # 이미 고정된 셀은 변경 불가
-                    if _assume_ban_n_fixed_fb is None and _assume_registry_fb is not None:
-                        _assume_ban_n_fixed_fb = _assume_registry_fb.create_literal(
-                            f"BanNightBeforeFixedOff:nurse_{n}",
-                            meta={
-                                "node_id": f"ban_night_before_fixed_off:nurse_{n}",
-                                "type": "BanNightBeforeFixedOffNode", "label": "휴가/공가 전날 야간 금지",
-                                "value": True, "scope": "nurse", "scope_key": f"nurse_{n}",
-                                "pattern": "ban_night_before_fixed_off",
-                                "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
-                                "human_message_ko": "휴가/공가 고정 전날 야간(N) 금지",
-                                "resolution_hint": "휴가 직전 야간 금지(ban_night_before_fixed_off)를 끄세요.",
-                            },
-                        )
-                    if _assume_ban_n_fixed_fb is not None:
-                        m.Add(X(n, prev_d, night_idx) == 0).OnlyEnforceIf(_assume_ban_n_fixed_fb)
-                    else:
-                        m.Add(X(n, prev_d, night_idx) == 0)
+                    m.Add(X(n, prev_d, night_idx) == 0)
                     _ban_n_cnt += 1
                 if _ban_n_cnt > 0:
                     print(f"{logger_prefix} [BanNBeforeFixedOff] nurse_idx={n}: {_ban_n_cnt}건 N 금지")
@@ -2093,21 +1997,6 @@ def optimize_fallback_lex_hard_first(
                 _blocked_3n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
                 n_offs_after_3n = _n_offs_after_map_3n.get(n, 0)
-                # MUS용 per-nurse 3N2OFF 회복 리터럴 (within-month gate)
-                _assume_3n2off_fb = None
-                if _assume_registry_fb is not None:
-                    _assume_3n2off_fb = _assume_registry_fb.create_literal(
-                        f"Recovery3N2OFF:nurse_{n}",
-                        meta={
-                            "node_id": f"recovery_3n2off:nurse_{n}",
-                            "type": "RecoveryOffNode", "label": "3N 후 2OFF 회복",
-                            "value": "3N→2OFF", "scope": "nurse", "scope_key": f"nurse_{n}",
-                            "pattern": "recovery_3n2off",
-                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
-                            "human_message_ko": "3N 연속 뒤 2OFF 회복 강제",
-                            "resolution_hint": "3N 후 2OFF 회복 정책(two_offs_after_three_nig)을 끄거나 완화하세요.",
-                        },
-                    )
                 _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
                 if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                     end_prev_block = m.NewBoolVar(f"end_3n_prev_soft_{n}")
@@ -2234,12 +2123,9 @@ def optimize_fallback_lex_hard_first(
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
                     xn2 = X(n, d - 2, night_idx)
-                    _enforce_3n_main_fb = [xn0, xn1, xn2]
-                    if _assume_3n2off_fb is not None:
-                        _enforce_3n_main_fb.append(_assume_3n2off_fb)
                     m.Add(
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
-                    ).OnlyEnforceIf(_enforce_3n_main_fb)
+                    ).OnlyEnforceIf([xn0, xn1, xn2])
         if cfg.two_offs_after_two_nig:
             _n_offs_after_map = getattr(roster_system, "prev_month_n_offs_after_by_idx", {}) or {}
             for n in range(N):
@@ -2247,22 +2133,6 @@ def optimize_fallback_lex_hard_first(
                 _blocked_2n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
                 n_tail = prev_month_n_tail_by_idx.get(n, 0)
                 n_offs_after = _n_offs_after_map.get(n, 0)
-                # MUS용 per-nurse 2N2OFF 회복 리터럴 — within-month 회복 강제를 gate 해
-                # 회복이 병목이면 core 에 RecoveryOffNode 로 뜬다(프로덕션 fallback 경로).
-                _assume_2n2off_fb = None
-                if _assume_registry_fb is not None:
-                    _assume_2n2off_fb = _assume_registry_fb.create_literal(
-                        f"Recovery2N2OFF:nurse_{n}",
-                        meta={
-                            "node_id": f"recovery_2n2off:nurse_{n}",
-                            "type": "RecoveryOffNode", "label": "2N 후 2OFF 회복",
-                            "value": "2N→2OFF", "scope": "nurse", "scope_key": f"nurse_{n}",
-                            "pattern": "recovery_2n2off",
-                            "nurse_id": str(getattr(roster_system.nurses[n], "nurse_id", n)),
-                            "human_message_ko": "2N 연속 뒤 2OFF 회복 강제",
-                            "resolution_hint": "2N 후 2OFF 회복 정책(two_offs_after_two_nig)을 끄거나 완화하세요.",
-                        },
-                    )
                 # 전월 N tail 뒤 이미 소비된 OFF 수를 반영
                 _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
                 if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
@@ -2348,23 +2218,16 @@ def optimize_fallback_lex_hard_first(
                         xn_curr_fw = X(n, d, night_idx)
                         end_block_fw = m.NewBoolVar(f"end_2n_fw_{n}_{d}")
                         m.Add(end_block_fw == X(n, d + 1, night_idx).Not())
-                        # 회복 정책의 fixed-wanted 예외 분기도 동일 리터럴로 gate(MUS 일관)
-                        if _assume_2n2off_fb is not None:
-                            m.Add(xn_prev_fw + xn_curr_fw + end_block_fw <= 2).OnlyEnforceIf(_assume_2n2off_fb)
-                        else:
-                            m.Add(xn_prev_fw + xn_curr_fw + end_block_fw <= 2)
+                        m.Add(xn_prev_fw + xn_curr_fw + end_block_fw <= 2)
                         continue
                     xn_prev = X(n, d - 1, night_idx)
                     xn_curr = X(n, d, night_idx)
                     xn_next = X(n, d + 1, night_idx)
                     end_block = m.NewBoolVar(f"end_2n_hard_{n}_{d}")
                     m.Add(end_block == xn_next.Not())
-                    _enforce_2n_main_fb = [xn_prev, xn_curr, end_block]
-                    if _assume_2n2off_fb is not None:
-                        _enforce_2n_main_fb.append(_assume_2n2off_fb)
                     m.Add(
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
-                    ).OnlyEnforceIf(_enforce_2n_main_fb)
+                    ).OnlyEnforceIf([xn_prev, xn_curr, end_block])
 
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):
