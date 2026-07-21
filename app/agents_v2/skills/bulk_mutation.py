@@ -87,6 +87,17 @@ def _mutate_wanted_adjustments(db, params, mutation, preview_only):
         off_ids = set(predicate["arguments"]["shift_ids"])
         rows = [r for r in rows if r.get("shift_id") in off_ids]
 
+    # source_type 스코프 — "전원 승인"(nurse 필터 없는 is_applied) 시 주휴(weekly_off)·
+    # HN 추가분(added)까지 과승인되는 것 방지. per-nurse 필터도 명시 source_types 도 없으면
+    # 승인 대상을 **간호사 제출분(original/modified)** 으로 한정. (개별 대상 지정 시엔 그대로.)
+    source_types = params.get("source_types")
+    is_approve = mutation.get("target_field", "is_applied") == "is_applied"
+    if not source_types and not nurse_ids and is_approve:
+        source_types = ["original", "modified"]
+    if source_types:
+        st = set(source_types)
+        rows = [r for r in rows if r.get("source_type") in st]
+
     entry_ids = [r["entry_id"] for r in rows if "entry_id" in r]
 
     if not entry_ids:
