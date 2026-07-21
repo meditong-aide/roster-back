@@ -29,5 +29,17 @@
 3. 기존 named UI-action 계약([[project_agent_frontend_handoff]]) 확장선상
 
 ## 상태
-- 백엔드 clarify_form **생성**은 집합값 Tier1 이후 착수 예정
-- 프론트 렌더링은 이 문서로 추후 핸드오프
+- 백엔드 clarify_form **생성 구현 완료**(executor collect 모드 + build_clarify_form +
+  agent_v3 방출, 커밋). 다중 되물음을 한 번에 수집해 `ui_actions:[{type:clarify_form}]` 로 방출.
+- 프론트 렌더링은 이 문서로 추후 핸드오프.
+
+## 후속 필요 (선택형 전면화)
+현재 `clarify_form` 의 각 질문은 **스킬 clarification 이 options 를 줄 때만** select 로 나오고,
+안 주면 input(자유입력). "선택 가능" 을 전면화하려면 둘 중 하나:
+1. **스킬별**: 각 스킬의 needs_clarification 반환에 `param` + `options`(enum/DB 열거) 포함
+2. **스키마 기반**: @skill manifest 의 enum/DB 열거를 question↔param 매핑해 옵션 자동 주입
+→ 백엔드 작업(프론트 무관). 프론트는 select/input/date/number 렌더러만 준비하면 됨.
+
+## 후속 필요 (resume/답변 병합)
+구조화 답변({param:value})을 파라미터로 자동 병합해 계획 재개하는 flow 는 프론트 회신 형식
+확정 후 착수. v1 은 기존 단일-clarify 처럼 다음 턴 대화 히스토리로 재처리.

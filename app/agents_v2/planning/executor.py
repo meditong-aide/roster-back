@@ -30,6 +30,7 @@ class PlanExecResult:
     order: list[str] = field(default_factory=list)           # 실행 순서(trace)
     failed: dict | None = None                               # {task, data} 실패 시
     deferred: list[PlanTask] = field(default_factory=list)   # 커밋 후 실행할 async task
+    clarifications: list[dict] = field(default_factory=list)  # collect 모드: 되물음 모음
 
 
 # 실행 중단시키는 outcome(사용자 개입/오류 필요).
@@ -61,6 +62,7 @@ def execute_plan(
     session_factory: Callable[[], Any] | None = None,
     max_workers: int = 4,
     defer_skills: frozenset[str] = ASYNC_SKILLS,
+    collect_clarifications: bool = False,
 ) -> PlanExecResult:
     """plan 을 위상순서로 실행. 레벨 내 **read 는 병렬(세션 격리), mutate 는 순차**.
 
@@ -74,12 +76,26 @@ def execute_plan(
     """
     plan.validate()
     res = PlanExecResult()
+    blocked: set[str] = set()  # collect 모드: 되물음/스킵된 task → 그 dependents 도 스킵
 
     def _record(task: PlanTask, data: Any, args: dict | None, is_mutate_dry: bool) -> bool:
-        """outputs/order/previews 기록(메인 스레드). STOP outcome 이면 True(중단)."""
+        """outputs/order/previews 기록(메인 스레드). STOP outcome 이면 True(중단).
+
+        collect_clarifications=True 면 CLARIFICATION 은 중단 대신 모아두고(res.clarifications)
+        해당 task 를 blocked 처리(dependents 스킵) — 독립 브랜치의 되물음까지 한 번에 수집.
+        """
         res.outputs[task.id] = data
         res.order.append(task.id)
-        if classify(data) in _STOP:
+        oc = classify(data)
+        if collect_clarifications and oc is ErrorType.CLARIFICATION:
+            res.clarifications.append({
+                "task": task.id, "skill": task.skill,
+                "question": (data or {}).get("question"),
+                "options": (data or {}).get("options") or [],
+            })
+            blocked.add(task.id)
+            return False  # 중단 안 함
+        if oc in _STOP:
             if res.failed is None:
                 res.failed = {"task": task.id, "skill": task.skill, "data": data}
             return True
@@ -87,12 +103,22 @@ def execute_plan(
             res.previews.append({"task": task.id, "skill": task.skill, "args": args, "data": data})
         return False
 
+    def _runnable(tasks: list[PlanTask]) -> list[PlanTask]:
+        """dep 이 blocked 면 실행 못 함 → 그 task 도 blocked 전파(스킵)."""
+        out = []
+        for t in tasks:
+            if any(d in blocked for d in t.deps):
+                blocked.add(t.id)
+            else:
+                out.append(t)
+        return out
+
     for level in plan.topo_levels():
         # async skill 은 실행 않고 deferred 로(커밋 후 실행). 원 순서 보존.
         for t in level:
             if t.skill in defer_skills:
                 res.deferred.append(t)
-        active = [t for t in level if t.skill not in defer_skills]
+        active = _runnable([t for t in level if t.skill not in defer_skills])
         reads = [t for t in active if t.kind == "read"]
         mutates = [t for t in active if t.kind == "mutate"]
 

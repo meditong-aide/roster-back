@@ -229,15 +229,19 @@ class SchedulingAgent:
         """의존 복합이면 plan→execute. read-only 는 즉시 답변, mutate 는 승인 대기.
         plan 없음/실패면 None → 호출부가 ReAct 로 진행."""
         from agents_v2.middleware import execute_skill
-        from agents_v2.planning.orchestrate import preview_fingerprint, try_plan_run
+        from agents_v2.planning.orchestrate import (
+            build_clarify_form, preview_fingerprint, try_plan_run)
         from db.client2 import SessionLocal
 
         # 계획은 복합 의존 추론이라 **메인 LLM** 사용(nano 라우터는 과생성/오류).
         planner_llm = self.llm
         try:
             with obs.purpose("planner"):
+                # collect_clarifications: 여러 태스크가 각각 되물음 필요 시 첫 것에서 안 멈추고
+                # 독립 브랜치의 되물음까지 모아 한 번에 clarify_form 으로 물어본다.
                 run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill,
-                                   session_factory=SessionLocal)  # read 세션 격리 병렬
+                                   session_factory=SessionLocal,  # read 세션 격리 병렬
+                                   collect_clarifications=True)
         except Exception as e:  # noqa: BLE001
             logger.warning("[agent_v3] DAG plan 실패 → ReAct: %s", e)
             return None
@@ -246,6 +250,15 @@ class SchedulingAgent:
         trace = [Stage("plan", "ok",
                        {"tasks": [(t.id, t.skill, t.kind, t.deps) for t in run.plan.tasks]}, 0)]
         last = run.exec.outputs.get(run.plan.tasks[-1].id) if run.plan.tasks else None
+        # 되물음 수집됐으면 승인/답변보다 먼저 — 구조화 clarify_form 으로 한 번에 질문.
+        if run.exec.clarifications:
+            form = build_clarify_form(run.exec.clarifications)
+            qs = form["questions"]
+            summary = "진행하려면 몇 가지 확인이 필요합니다:\n" + "\n".join(
+                f"- {q['question']}" + (f" (선택: {', '.join(q['options'])})" if q["options"] else "")
+                for q in qs)
+            return AgentResult(needs_clarification=True, question=summary, ui_actions=[form],
+                               trace=trace, messages=messages, variable_memory=ctx.variable_memory)
         if run.needs_approval:
             ctx.pending_approval = {"type": "plan", "plan": run.plan.to_dict(),
                                     "user_message": user_message,

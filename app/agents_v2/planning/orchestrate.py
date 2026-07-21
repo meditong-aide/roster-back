@@ -57,6 +57,24 @@ def _replan_feedback(run: PlanRun) -> str:
             f"- 시도한 계획: {json.dumps(tried, ensure_ascii=False, default=str)[:1500]}")
 
 
+def build_clarify_form(clarifications: list[dict]) -> dict:
+    """수집된 되물음들 → 구조화 clarify_form(프론트 렌더용 named UI-action).
+
+    옵션 있으면 select, 없으면 자유입력. 파라미터명은 스킬 clarification 이 안 주므로
+    task/skill 로만 라벨(옵션 enum 은 스킬이 준 것 사용). 설계 docs/AGENT_CLARIFY_FORM_FRONTEND_TODO.md.
+    """
+    questions = []
+    for c in clarifications:
+        opts = c.get("options") or []
+        questions.append({
+            "task": c.get("task"), "skill": c.get("skill"),
+            "question": c.get("question") or "추가 정보가 필요합니다.",
+            "type": "select" if opts else "input",
+            "options": opts,
+        })
+    return {"type": "clarify_form", "questions": questions}
+
+
 def try_plan_run(
     db: Any, user_message: str, ctx: Any,
     planner_llm: Any, skill_tools: list[dict],
@@ -64,6 +82,7 @@ def try_plan_run(
     *,
     session_factory: Callable[[], Any] | None = None,
     max_replans: int = 1,
+    collect_clarifications: bool = False,
 ) -> PlanRun | None:
     """의존 복합이면 plan 생성·실행(mutate=dry-run). 아니면 None(ReAct fallback).
 
@@ -78,7 +97,8 @@ def try_plan_run(
     logger.info("[plan] %d tasks: %s", len(plan.tasks),
                 [(t.id, t.skill, t.kind, t.deps) for t in plan.tasks])
     run = PlanRun(plan=plan, exec=execute_plan(
-        db, plan, ctx, execute_fn, session_factory=session_factory))
+        db, plan, ctx, execute_fn, session_factory=session_factory,
+        collect_clarifications=collect_clarifications))
 
     attempts = 0
     while run.failed and attempts < max_replans:
@@ -92,7 +112,8 @@ def try_plan_run(
         logger.info("[replan] 교정 plan %d tasks: %s", len(new_plan.tasks),
                     [(t.id, t.skill, t.kind, t.deps) for t in new_plan.tasks])
         run = PlanRun(plan=new_plan, exec=execute_plan(
-            db, new_plan, ctx, execute_fn, session_factory=session_factory))
+            db, new_plan, ctx, execute_fn, session_factory=session_factory,
+            collect_clarifications=collect_clarifications))
     return run
 
 
