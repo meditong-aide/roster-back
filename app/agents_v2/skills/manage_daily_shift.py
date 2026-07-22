@@ -38,8 +38,12 @@ MANAGE_DAILY_SHIFT_SCHEMA: dict = {
         "─────────── 파라미터 ───────────\n"
         "- `scope` — day / weekend / weekday / month. 날짜 있으면 day, '주말'이면 weekend, '평일'이면 weekday, '전부/매일'이면 month.\n"
         "- `date` — 대상 일자 YYYY-MM-DD (scope=day). '8월 7일'=2026-08-07.\n"
-        "- `d_count`/`e_count`/`n_count` — 각 시프트 필요인원(정수). 준 것만 바꾸고 나머지는 유지.\n\n"
+        "- `d_count`/`e_count`/`n_count` — 각 시프트 **최소(필요)** 인원(정수). '데이 5명'=최소 기본.\n"
+        "- `d_count_max`/`e_count_max`/`n_count_max` — 각 시프트 **최대(상한)** 인원. '데이 최대 7명' 처럼 "
+        "'최대/상한'을 명시할 때만. 최소/최대 둘 다 주면 '데이 5~7명'(min 5, max 7). 준 것만 바꾸고 나머지 유지.\n\n"
         "예) '8월 7일 데이 8명 이브닝 7명 나이트 3명' → scope=day, date=2026-08-07, d_count=8, e_count=7, n_count=3\n"
+        "예) '8월 7일 데이 최대 10명' → scope=day, date=2026-08-07, d_count_max=10\n"
+        "예) '8월 데이 최소 5 최대 7' → scope=month, d_count=5, d_count_max=7\n"
         "예) '8월 주말 322' → scope=weekend, d_count=3, e_count=2, n_count=2 (date 없음 — 시스템이 주말 날짜 계산)\n"
         "예) '8월 나이트 전부 3명으로' → scope=month, n_count=3\n"
         "⚠️ 등록은 preview_only=true 로 먼저 호출해 미리보기를 만들고 사용자 확인 후 실행됩니다."
@@ -50,9 +54,12 @@ MANAGE_DAILY_SHIFT_SCHEMA: dict = {
             "scope": {"type": "string", "enum": ["day", "weekend", "weekday", "month"],
                       "description": "day=특정일 / weekend=주말 / weekday=평일 / month=월 일괄"},
             "date": {"type": "string", "description": "대상 일자 YYYY-MM-DD (scope=day). '8월 7일'=2026-08-07"},
-            "d_count": {"type": "integer", "description": "데이(D) 필요인원"},
-            "e_count": {"type": "integer", "description": "이브닝(E) 필요인원"},
-            "n_count": {"type": "integer", "description": "나이트(N) 필요인원"},
+            "d_count": {"type": "integer", "description": "데이(D) 최소(필요)인원. '데이 N명'=최소 기본"},
+            "e_count": {"type": "integer", "description": "이브닝(E) 최소(필요)인원"},
+            "n_count": {"type": "integer", "description": "나이트(N) 최소(필요)인원"},
+            "d_count_max": {"type": "integer", "description": "데이(D) 최대(상한)인원. '데이 최대 N명' 명시 시"},
+            "e_count_max": {"type": "integer", "description": "이브닝(E) 최대(상한)인원"},
+            "n_count_max": {"type": "integer", "description": "나이트(N) 최대(상한)인원"},
             "preview_only": {"type": "boolean", "default": True},
         },
         "required": [],
@@ -70,9 +77,19 @@ def _iso(value: Any, params: dict) -> str | None:
 
 
 def _counts(params: dict) -> dict[str, int]:
-    """준 시프트 카운트만 뽑는다(D/E/N)."""
+    """준 시프트 **최소(필요)** 인원만 뽑는다(D/E/N). d_count=최소가 기본."""
     out = {}
     for key, col in (("d_count", "D"), ("e_count", "E"), ("n_count", "N")):
+        v = params.get(key)
+        if v is not None:
+            out[col] = int(v)
+    return out
+
+
+def _counts_max(params: dict) -> dict[str, int]:
+    """준 시프트 **최대(상한)** 인원만 뽑는다(D/E/N). '최대 N명' 명시 시에만."""
+    out = {}
+    for key, col in (("d_count_max", "D"), ("e_count_max", "E"), ("n_count_max", "N")):
         v = params.get(key)
         if v is not None:
             out[col] = int(v)
@@ -106,9 +123,11 @@ def _scope_of(params: dict) -> str:
 def manage_daily_shift(db: Session, params: dict) -> Any:
     office_id, group_id = params.get("office_id"), params.get("group_id")
     counts = _counts(params)
-    if not counts:
+    counts_max = _counts_max(params)
+    if not counts and not counts_max:
         return {"needs_clarification": True,
-                "question": "각 근무 필요인원을 알려주세요 (예: 데이 8, 이브닝 7, 나이트 3).", "options": []}
+                "question": "각 근무 필요인원을 알려주세요 (예: 데이 8, 이브닝 7, 나이트 3). "
+                            "최대 인원 상한은 '데이 최대 10명'처럼 말하면 됩니다.", "options": []}
     scope = _scope_of(params)
     if scope == "month":
         return _apply_month(db, office_id, group_id, params, counts)
@@ -131,26 +150,37 @@ def _apply_pattern(db, office_id, group_id, params, counts, pattern) -> Any:
     dd = data["date"]
     lists = {"D": list(dd["D_count"]), "E": list(dd["E_count"]),
              "N": list(dd["N_count"]), "M": list(dd["M_count"])}
+    maxlists = {"D": list(dd["D_count_max"]), "E": list(dd["E_count_max"]),
+                "N": list(dd["N_count_max"]), "M": list(dd["M_count_max"])}
+    counts_max = _counts_max(params)
     for day in days:
         idx = day - 1
         if 0 <= idx < len(lists["D"]):
             for k, v in counts.items():
                 lists[k][idx] = v
+            for k, v in counts_max.items():
+                maxlists[k][idx] = v
+    max_on = bool(counts_max) or bool(data.get("max_enabled", False))
 
     label = "주말" if pattern == "weekend" else "평일"
     if params.get("preview_only", True):
-        return {"preview": True, "operation": "set_daily_shift", "scope": pattern,
-                "summary": {"month": f"{y}-{int(m):02d}", "label": label,
-                            "days": days, "to": counts}}
+        summary = {"month": f"{y}-{int(m):02d}", "label": label, "days": days, "to": counts}
+        if counts_max:
+            summary["to_max"] = counts_max
+        return {"preview": True, "operation": "set_daily_shift", "scope": pattern, "summary": summary}
     daily_shift_service.update_daily(
         db, office_id=office_id, group_id=group_id, year=int(y), month=int(m),
         d_list=lists["D"], e_list=lists["E"], n_list=lists["N"], m_list=lists["M"],
-        max_enabled=bool(data.get("max_enabled", False)),
+        d_max_list=maxlists["D"], e_max_list=maxlists["E"], n_max_list=maxlists["N"], m_max_list=maxlists["M"],
+        max_enabled=max_on,
     )
+    msg = (f"{y}년 {m}월 {label}({len(days)}일)의 필요인원을 "
+           + "·".join(f"{k} {v}" for k, v in counts.items()) + "(으)로 설정했습니다.")
+    if counts_max:
+        msg += " (최대 " + "·".join(f"{k} {v}" for k, v in counts_max.items()) + ")"
     return {"ok": True, "scope": pattern, "year": int(y), "month": int(m),
             "days": days, "applied": counts,
-            "message": f"{y}년 {m}월 {label}({len(days)}일)의 필요인원을 "
-                       + "·".join(f"{k} {v}" for k, v in counts.items()) + "(으)로 설정했습니다."}
+            "applied_max": counts_max or None, "message": msg}
 
 
 def _apply_day(db, office_id, group_id, params, counts) -> Any:
@@ -164,24 +194,37 @@ def _apply_day(db, office_id, group_id, params, counts) -> Any:
     dd = data["date"]
     lists = {"D": list(dd["D_count"]), "E": list(dd["E_count"]),
              "N": list(dd["N_count"]), "M": list(dd["M_count"])}
+    maxlists = {"D": list(dd["D_count_max"]), "E": list(dd["E_count_max"]),
+                "N": list(dd["N_count_max"]), "M": list(dd["M_count_max"])}
+    counts_max = _counts_max(params)
     idx = day - 1
     if not (0 <= idx < len(lists["D"])):
         return {"error": f"{m}월 {day}일이 유효하지 않습니다."}
     old = {k: lists[k][idx] for k in ("D", "E", "N")}
     for k, v in counts.items():
         lists[k][idx] = v
+    for k, v in counts_max.items():
+        maxlists[k][idx] = v
     new = {k: lists[k][idx] for k in ("D", "E", "N")}
+    max_on = bool(counts_max) or bool(data.get("max_enabled", False))
 
     if params.get("preview_only", True):
-        return {"preview": True, "operation": "set_daily_shift", "scope": "day",
-                "summary": {"date": iso, "from": old, "to": new}}
+        summary = {"date": iso, "from": old, "to": new}
+        if counts_max:
+            summary["to_max"] = {k: maxlists[k][idx] for k in counts_max}
+        return {"preview": True, "operation": "set_daily_shift", "scope": "day", "summary": summary}
     daily_shift_service.update_daily(
         db, office_id=office_id, group_id=group_id, year=y, month=m,
         d_list=lists["D"], e_list=lists["E"], n_list=lists["N"], m_list=lists["M"],
-        max_enabled=bool(data.get("max_enabled", False)),
+        d_max_list=maxlists["D"], e_max_list=maxlists["E"], n_max_list=maxlists["N"], m_max_list=maxlists["M"],
+        max_enabled=max_on,
     )
+    msg = f"{y}년 {m}월 {day}일 필요인원을 D {new['D']}·E {new['E']}·N {new['N']}(으)로 설정했습니다."
+    if counts_max:
+        msg += " (최대 " + "·".join(f"{k} {maxlists[k][idx]}" for k in counts_max) + ")"
     return {"ok": True, "scope": "day", "date": iso, "applied": new,
-            "message": f"{y}년 {m}월 {day}일 필요인원을 D {new['D']}·E {new['E']}·N {new['N']}(으)로 설정했습니다."}
+            "applied_max": {k: maxlists[k][idx] for k in counts_max} if counts_max else None,
+            "message": msg}
 
 
 def _apply_month(db, office_id, group_id, params, counts) -> Any:
@@ -190,13 +233,19 @@ def _apply_month(db, office_id, group_id, params, counts) -> Any:
         return {"needs_clarification": True, "question": "몇 월 일괄로 설정할까요? (예: 8월)", "options": []}
     data = daily_shift_service.get_or_init_month(db, office_id, group_id, int(y), int(m))
     cur = data["month_summary"]
-    # 준 시프트만 갱신, 나머지는 현재 월 요약값 유지.
+    counts_max = _counts_max(params)
+    max_on = bool(counts_max) or bool(cur.get("max_enabled", False))
+    # 준 시프트만 갱신, 나머지는 현재 월 요약값 유지. 최소=*_count, 최대=*_count_max.
     bulk = {
         "D_count": counts.get("D", int(cur.get("D_count", 0) or 0)),
         "E_count": counts.get("E", int(cur.get("E_count", 0) or 0)),
         "N_count": counts.get("N", int(cur.get("N_count", 0) or 0)),
         "M_count": int(cur.get("M_count", 0) or 0),
-        "max_enabled": bool(cur.get("max_enabled", False)),
+        "D_count_max": counts_max.get("D", int(cur.get("D_count_max", 0) or 0)),
+        "E_count_max": counts_max.get("E", int(cur.get("E_count_max", 0) or 0)),
+        "N_count_max": counts_max.get("N", int(cur.get("N_count_max", 0) or 0)),
+        "M_count_max": int(cur.get("M_count_max", 0) or 0),
+        "max_enabled": max_on,
     }
     new = {"D": bulk["D_count"], "E": bulk["E_count"], "N": bulk["N_count"]}
     if params.get("preview_only", True):
@@ -204,9 +253,11 @@ def _apply_month(db, office_id, group_id, params, counts) -> Any:
         # (day-scope 와 동일. 없으면 target-only 라 월 일괄 drift 가 지문에 안 잡힘.)
         old = {"D": int(cur.get("D_count", 0) or 0), "E": int(cur.get("E_count", 0) or 0),
                "N": int(cur.get("N_count", 0) or 0)}
-        return {"preview": True, "operation": "set_daily_shift", "scope": "month",
-                "summary": {"month": f"{y}-{int(m):02d}", "from": old, "to": new,
-                            "note": "전 날짜 일괄 + 기본 인원(manpower) 동기"}}
+        summary = {"month": f"{y}-{int(m):02d}", "from": old, "to": new,
+                   "note": "전 날짜 일괄 + 기본 인원(manpower) 동기"}
+        if counts_max:
+            summary["to_max"] = counts_max
+        return {"preview": True, "operation": "set_daily_shift", "scope": "month", "summary": summary}
     # apply_globally=True → DailyShift 전 날짜 + ShiftManage.manpower(fallback) 동기.
     daily_shift_service.apply_bulk_to_days(
         db, office_id=office_id, group_id=group_id, year=int(y), month=int(m),

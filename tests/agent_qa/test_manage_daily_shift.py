@@ -98,3 +98,40 @@ def test_weekend_preview_shows_days(db, seed_data):
     d = res.data
     assert d.get("preview") is True and d["scope"] == "weekend"
     assert d["summary"]["days"] == [1, 2, 8, 9, 15, 16, 22, 23, 29, 30]
+
+
+# ── 최대(상한) 인원 설정 (d_count_max) ──
+def test_day_max_only_sets_cap_and_enables(db, seed_data):
+    # '데이 최대 10명' — 최소 안 줘도 clarify 안 하고 최대만 설정 + max_enabled
+    res = execute_skill(db, "manage_daily_shift",
+                        {"scope": "day", "date": "2026-08-07", "d_count_max": 10, "preview_only": False}, _hn())
+    assert res.data.get("ok") is True, res.data
+    row = db.query(DailyShift).filter_by(group_id="GRP001", year=2026, month=8, day=7).first()
+    assert row and int(row.d_count_max) == 10 and bool(row.max_enabled) is True
+
+
+def test_day_min_and_max_together(db, seed_data):
+    # '데이 5~7명' — 최소5 최대7
+    res = execute_skill(db, "manage_daily_shift",
+                        {"scope": "day", "date": "2026-08-07", "d_count": 5, "d_count_max": 7,
+                         "preview_only": False}, _hn())
+    assert res.data.get("ok") is True
+    row = db.query(DailyShift).filter_by(group_id="GRP001", year=2026, month=8, day=7).first()
+    assert (int(row.d_count), int(row.d_count_max)) == (5, 7) and bool(row.max_enabled) is True
+
+
+def test_day_max_preview_shape(db, seed_data):
+    res = execute_skill(db, "manage_daily_shift",
+                        {"scope": "day", "date": "2026-08-07", "d_count_max": 9, "preview_only": True}, _hn())
+    s = res.data["summary"]
+    assert res.data.get("preview") is True
+    assert s.get("to_max") == {"D": 9}
+    assert classify(res.data) is ErrorType.PREVIEW
+
+
+def test_month_max_bulk(db, seed_data):
+    res = execute_skill(db, "manage_daily_shift",
+                        {"scope": "month", "n_count": 3, "n_count_max": 5, "preview_only": False}, _hn())
+    assert res.data.get("ok") is True and res.data["scope"] == "month"
+    day_rows = [r for r in db.query(DailyShift).filter_by(group_id="GRP001", year=2026, month=8).all() if int(r.day) > 0]
+    assert day_rows and all(int(r.n_count) == 3 and int(r.n_count_max) == 5 for r in day_rows)
