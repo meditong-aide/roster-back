@@ -5693,13 +5693,14 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         if _v_single:
                             _cause = " / ".join(_v_single[:4])
                             unrecoverable["infeasibility"]["summary_message_ko"] = (
-                                f"원인: 다음 정책이 현재 인원·설정으로는 동시에 만족될 수 없습니다 — {_cause}. "
-                                f"이 중 하나를 완화하면 근무표를 생성할 수 있습니다(재계산으로 검증됨). 적용할 옵션을 선택해주세요."
+                                f"지금 인원·설정으로는 다음 규칙을 한꺼번에 지킬 수 없습니다 — {_cause}. "
+                                f"이 중 하나만 완화하면 근무표를 만들 수 있어요(실제로 다시 계산해 확인했습니다). "
+                                f"적용할 방법을 골라 주세요."
                             )
                         elif _v_combo:
                             unrecoverable["infeasibility"]["summary_message_ko"] = (
-                                f"원인: 여러 정책이 얽혀 단일 완화로는 풀리지 않습니다. "
-                                f"'{_v_combo.get('title_ko')}'를 함께 적용하면 근무표를 생성할 수 있습니다(검증됨)."
+                                f"여러 규칙이 얽혀 있어 하나만 완화해서는 풀리지 않습니다. "
+                                f"'{_v_combo.get('title_ko')}'를 함께 적용하면 근무표를 만들 수 있어요(확인 완료)."
                             )
                     _combo = _probe_res.get("combo")
                     print(f"[UndiagProbe] found={_probe_res.get('found')} "

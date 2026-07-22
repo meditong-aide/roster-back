@@ -344,7 +344,7 @@ def warn_night_dedicated_low_n(
             "message": (
                 f"{nurse_name or nurse_id} 간호사는 N 전담인데 N {label} 한도가 {n_cap}회로 "
                 f"낮아, 가용 {cap_days}일 중 약 {implied_off}일이 강제 OFF가 됩니다. "
-                f"야간 커버리지가 부족하면 근무표 생성이 실패할 수 있습니다. "
+                f"야간 인원이 부족하면 근무표를 만들기 어려울 수 있습니다. "
                 f"단기 부재라면 N 한도 대신 제한가용/휴직 구간으로 설정하는 것을 권장합니다."
             ),
         }]

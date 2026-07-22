@@ -290,7 +290,7 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
     summary = (
         issues[0].get("human_message_ko")
         if issues
-        else "사용자 입력만으로 산술적으로 근무표를 만들 수 없습니다."
+        else "지금 설정 조합으로는 근무표를 만들 수 없습니다. 아래 항목을 조정해 주세요."
     )
     fix_suggestions: List[str] = []
     seen = set()
@@ -549,8 +549,8 @@ def build_unrecoverable_payload(
         "infeasibility": {
             "severity": "blocking",
             "summary_message_ko": (
-                "근무표 자동 완화(soft fallback)까지 시도했지만 해를 찾지 못했습니다. "
-                "제약 설정을 점검해주세요."
+                "일부 조건을 완화해 최대한 맞춰 봤지만, 지금 설정 조합으로는 근무표를 "
+                "만들 수 없습니다. 아래 항목을 조정해 주세요."
             ),
             "preflight_issues": issues,
             "applied_relaxations": list(applied_relaxations or []),

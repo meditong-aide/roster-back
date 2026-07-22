@@ -28,7 +28,8 @@ def test_night_cap_fix_excludes_personal_attribute():
     out = humanize({"reason_code": "MONTHLY_NIGHT_CAPACITY_SHORTAGE", "evidence": {}})
     joined = " ".join(out["fix_suggestions_ko"])
     assert "상한" not in joined
-    assert ("추가" in joined) or ("낮추" in joined)      # 관리자 노브만
+    # 관리자 노브만(인원 보강 / 필요 인원 낮추기) — 개인 속성 제안 없음
+    assert any(k in joined for k in ("추가", "늘려", "보강", "낮추", "낮춰"))
 
 
 def test_previously_missing_codes_now_templated():
