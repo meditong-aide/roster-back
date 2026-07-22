@@ -145,10 +145,25 @@ def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     )
 
 
+def _hard_off_floor(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
+    """근무가능일을 '하드하게' 줄이는 off 만 합산한다.
+
+    ★ 개인 월 휴무(off_days / standard_personal_off_days)는 엔진에서 **소프트**다
+      (fallback_lex: off_quota_short 슬랙 = 목표 미달 시 벌점만, 강제 아님). 따라서
+      hard capacity 상한을 계산할 때 빼면 안 된다(빼면 false CAPACITY_TOTAL_SHORTAGE).
+      cf. 8d2c2a9 회귀: off_days 를 하드 감산해 연속근무 3/5 로도 capacity 가 갇혔음.
+    여기 포함하는 것은 전사 고정 휴무(global)와 개인 하드 조정(personal_off_adjustment)뿐.
+    """
+    return (
+        int(cfg.get("global_monthly_off_days", 0) or 0)
+        + int(nurse.personal_off_adjustment or 0)
+    )
+
+
 def _working_capacity(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     span = max(0, nurse.leave_day - nurse.join_day + 1)
-    cap = max(0, span - _required_off_days(nurse, cfg))
-    # 연속근무 상한(max_consecutive_work=C)은 실제 근무가능일을 추가로 조인다:
+    cap = max(0, span - _hard_off_floor(nurse, cfg))
+    # 연속근무 상한(max_consecutive_work=C)은 HARD 제약(K+1 창에 ≥1 OFF, fallback_lex:1730):
     # C일 근무 후 최소 1일 휴식 → span 내 최대 근무일 = span - span//(C+1) (상한).
     # cap 은 항상 상한이어야 하므로(하한이면 false positive) min 으로 결합한다.
     mcw = cfg.get("max_conseq_work", cfg.get("max_consecutive_work"))
@@ -160,6 +175,35 @@ def _working_capacity(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
         except (TypeError, ValueError):
             pass
     return cap
+
+
+def _capacity_with_mcw(nurses, cfg: Dict[str, Any], mcw: Optional[int]) -> int:
+    """연속근무 상한 mcw(None=무제한) 를 가정했을 때의 총 근무가능일.
+
+    _working_capacity 와 동일 공식(하드 off 만 감산)이되 mcw 를 파라미터로 받아
+    '연속근무 상한을 바꾸면 capacity 가 얼마가 되는가' 를 반사실로 계산한다.
+    """
+    total = 0
+    for n in nurses:
+        span = max(0, n.leave_day - n.join_day + 1)
+        cap = max(0, span - _hard_off_floor(n, cfg))
+        if mcw is not None and mcw >= 1:
+            cap = min(cap, max(0, span - span // (mcw + 1)))
+        total += cap
+    return total
+
+
+def _min_mcw_to_meet(nurses, cfg: Dict[str, Any], total_need: int,
+                     cur_mcw: int, num_days: int) -> Optional[int]:
+    """연속근무 상한을 얼마로 올리면 산술적으로 수요를 충족하는가(최소값).
+
+    cur_mcw+1 부터 num_days(=사실상 무제한) 까지 올려보며 capacity>=need 되는 첫 값.
+    무제한으로도 못 채우면(진짜 인원부족) None.
+    """
+    for cand in range(cur_mcw + 1, max(cur_mcw + 1, num_days) + 1):
+        if _capacity_with_mcw(nurses, cfg, cand) >= total_need:
+            return cand
+    return None
 
 
 def _issue(code: str, evidence: Dict[str, Any], severity: str = "hard") -> Dict[str, Any]:
@@ -459,6 +503,30 @@ def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
     shortage = total_need - total_cap
     avg_daily = total_need / inp.num_days if inp.num_days else 0.0
 
+    # ── 원인 레버 식별: 사용자가 설정한 '연속근무 상한'이 capacity 를 눌러 shortage 를
+    #    만든 경우, 해결책은 '간호사 추가'(수동)가 아니라 '그 값을 올려라'(자동)다.
+    #    상한을 무시(무제한)했을 때 need 를 충족한다면 = 상한이 binding → 최소 완화값 계산.
+    conseq_cap_binding = None
+    _mcw_raw = inp.roster_config.get("max_conseq_work",
+                                     inp.roster_config.get("max_consecutive_work"))
+    try:
+        _cur_mcw = int(_mcw_raw) if _mcw_raw is not None else None
+    except (TypeError, ValueError):
+        _cur_mcw = None
+    if _cur_mcw is not None and _cur_mcw >= 1:
+        cap_uncapped = _capacity_with_mcw(inp.nurses, inp.roster_config, None)
+        if total_need <= cap_uncapped:
+            _star = _min_mcw_to_meet(
+                inp.nurses, inp.roster_config, total_need, _cur_mcw, inp.num_days
+            )
+            if _star is not None:
+                conseq_cap_binding = {
+                    "config_key": "max_conseq_work",
+                    "current": _cur_mcw,
+                    "suggested_value": _star,
+                    "capacity_uncapped": cap_uncapped,
+                }
+
     # 평균 초과 day → bottleneck (동적 임계값)
     bottleneck_days = sorted(
         [dd for dd in daily_demand if dd["demand"] > avg_daily],
@@ -495,6 +563,8 @@ def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
                 "bottleneck_days": bottleneck_days,
                 "lowest_capacity_nurses": lowest_capacity_nurses,
                 "demand_uniform": len(bottleneck_days) == 0,
+                # 연속근무 상한(하드)이 원인이고 그것만 올리면 풀릴 때 자동 완화 근거(없으면 None)
+                "conseq_cap_binding": conseq_cap_binding,
             },
         )
     ]

@@ -341,6 +341,18 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
         _resolution_options = treatments_to_resolution_options(treatment_recommendations)
     except Exception:
         _resolution_options = []
+    # 사용자 설정(연속근무 상한 등)이 산술 차단의 원인이면 그 값을 올리는 auto 옵션을
+    # 앞에 추가하고, 해당 원인의 '간호사 추가'(수동) 오안내는 제거(자동 해결 가능하므로).
+    try:
+        from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+        _lever = config_lever_options_from_issues(issues)
+        if _lever:
+            for _c in causes:
+                if str(_c.get("reason_code") or "").upper() == "CAPACITY_TOTAL_SHORTAGE":
+                    _c.pop("fix", None)
+            _resolution_options = _lever + _resolution_options
+    except Exception:
+        pass
 
     return {
         "infeasibility": {
@@ -520,6 +532,18 @@ def build_unrecoverable_payload(
         _resolution_options = treatments_to_resolution_options(treatment_recommendations)
     except Exception:
         _resolution_options = []
+    # 사용자 설정(연속근무 상한 등)이 산술 차단의 원인이면 그 값을 올리는 auto 옵션을
+    # 앞에 추가하고, 해당 원인의 '간호사 추가'(수동) 오안내는 제거(자동 해결 가능하므로).
+    try:
+        from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+        _lever = config_lever_options_from_issues(issues)
+        if _lever:
+            for _c in causes:
+                if str(_c.get("reason_code") or "").upper() == "CAPACITY_TOTAL_SHORTAGE":
+                    _c.pop("fix", None)
+            _resolution_options = _lever + _resolution_options
+    except Exception:
+        pass
 
     return {
         "infeasibility": {

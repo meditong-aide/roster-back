@@ -187,6 +187,62 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
     return attach_fix_to_options(opts)
 
 
+# 사용자가 설정한 생성 옵션(연속근무 상한 등)이 precheck 산술 차단의 binding 원인일 때,
+# 그 옵션을 직접 조정하는 auto_apply 해결 옵션을 만든다.
+#   evidence key → (config_key, 제목, 트레이드오프)
+_LEVER_BY_EVIDENCE_KEY: dict[str, tuple[str, str, str]] = {
+    "conseq_cap_binding": (
+        "max_conseq_work",
+        "연속근무 상한 완화",
+        "한 사람이 최대 며칠까지 연달아 근무할 수 있는지가 늘어납니다.",
+    ),
+}
+
+
+def config_lever_options_from_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Precheck 차단이 '사용자가 설정한 하드 생성 옵션(연속근무 상한)' 때문일 때 그 값을
+    올리는 auto_apply 옵션 카드.
+
+    capacity 부족을 '간호사 추가'(수동)로만 안내하던 오분류를 보완한다. precheck 가
+    evidence(conseq_cap_binding)에 남긴 값으로 옵션을 만든다(verified=False, 클릭 시
+    재생성으로 실검증). suggested_value 없으면(무제한으로도 미충족 = 진짜 인원부족) 생성
+    안 함. ※ 개인 월 휴무(off_days)는 엔진에서 소프트라 capacity 를 못 바꾼다 → 레버 아님.
+    """
+    opts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for it in issues or []:
+        ev = it.get("evidence")
+        if not isinstance(ev, dict):
+            ev = it.get("details") if isinstance(it.get("details"), dict) else {}
+
+        for ev_key, (config_key, title_ko, trade_off_ko) in _LEVER_BY_EVIDENCE_KEY.items():
+            b = ev.get(ev_key)
+            if not isinstance(b, dict):
+                continue
+            sv = b.get("suggested_value")
+            if sv is None or config_key in seen:
+                continue
+            seen.add(config_key)
+            opts.append({
+                "option_id": "lever:" + config_key,
+                "kind": "config_relax",
+                "source": "precheck_arith",
+                "verified": False,
+                "title_ko": title_ko,
+                "changes": [{
+                    "config_key": config_key,
+                    "label_ko": title_ko,
+                    "from": b.get("current"),
+                    "to": sv,
+                    "suggested_value": sv,
+                }],
+                "trade_off_ko": trade_off_ko,
+                "apply": {config_key: sv},
+            })
+
+    return attach_fix_to_options(opts)
+
+
 def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
     """완화 집합을 base 위에 적용(각 delta 는 base 기준으로 계산 — 누적 드리프트 방지)."""
     cfg = dict(base)
