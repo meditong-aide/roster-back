@@ -115,6 +115,9 @@ class RosterRequest(BaseModel):
     config_override: Optional[Dict[str, Any]] = None
     # ontology treatment(비-config-key) 옵션 재생성용 — resolution_options[i].treatment_ids.
     treatment_ids: Optional[List[str]] = None
+    # per-nurse 주말휴무 해제 옵션 재생성용 — resolution_options[i].weekend_off_release.
+    #   해당 월(발효) 부터 nurse_weekendoff_period 에 해제(0) write(속성 변경) 후 생성.
+    weekend_off_release: Optional[List[str]] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
     # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.

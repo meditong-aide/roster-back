@@ -4208,7 +4208,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4219,6 +4219,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     current_user.group_id = resolve_effective_group(
         db, current_user, getattr(req, "group_id", None)
     )
+    # per-nurse 주말휴무 해제(검증된 resolution 원클릭). 해당 월 발효로 period 에 해제(0) write
+    #   = 개인 속성 변경(영구). nurse_weekendoff_period SSOT. 컬럼 미조회.
+    _wor = weekend_off_release or getattr(req, "weekend_off_release", None)
+    if _wor:
+        from db.models import NurseWeekendOffPeriod as _NWOP
+        from services.nurse_period_resolver import upsert_period as _up
+        from datetime import date as _d
+        _vf = _d(int(req.year), int(req.month), 1)
+        for _nid in _wor:
+            _up(db, _NWOP, str(_nid), _vf, "weekend_off", 0, source="resolution")
+        db.commit()
+        print(f"[RosterGenerate] 주말휴무 해제 적용(period, 발효 {_vf}): {list(_wor)}")
     # 모달 payload(req.config) 제공 시 생성 직전 config row 로 materialize(굳히기) → req.config_id 세팅.
     #   /async 라우터는 이미 materialize 후 req.config=None 으로 넘겨 여기선 no-op(이중 생성 방지).
     #   /roster_create/generate(로컬 sync) 등 config 를 실어 직접 호출하는 경로는 여기서 materialize 되어
@@ -5713,11 +5725,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                                     "trade_off_ko": "그 간호사가 주말에도 근무할 수 있게 됩니다.",
                                     "changes": [{"nurse_id": _culprit, "attr": "weekend_off",
                                                  "from": True, "to": False}],
+                                    # 원클릭 재생성용 — 이 달 발효로 nurse_weekendoff_period 해제 후 생성.
+                                    "weekend_off_release": [_culprit],
                                     "fix": {
-                                        "mode": "manual_navigate",
+                                        "mode": "auto_apply",
                                         "where": "nurse.weekend_off",
                                         "where_label_ko": "간호사 관리 > 해당 간호사 > 주말 휴무",
-                                        "how_ko": f"{_nm} 간호사의 주말 휴무를 해제해 주세요(이 달부터).",
+                                        "how_ko": f"이 방법을 고르면 {_nm} 간호사의 주말 휴무를 해제하고 다시 만듭니다(이 달부터).",
                                         "config_key": None, "target": {"nurse_id": _culprit},
                                     },
                                 }

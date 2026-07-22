@@ -207,6 +207,7 @@ def process_job(payload: dict) -> dict:
             req, current_user, db,
             config_override=getattr(req, "config_override", None) or None,
             treatment_ids=(getattr(req, "treatment_ids", None) or None),
+            weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
         )
         result_id = None
         if isinstance(roster_data, dict):
