@@ -80,7 +80,7 @@ def _seed(db: Session):
         account_id="acc_N001", name="김민지", grade=4, experience=10,
         role="RN", team_id=1, is_head_nurse=True, hn_auth="HN",
         active=1, sequence=1, joining_date=datetime(2025, 1, 1),
-        is_weekend_off=False, work_shifts=["D", "E", "N"],
+        work_shifts=["D", "E", "N"],
         allowed_shifts=[], fixed_shift=None, enable_aide=True,
     ))
     db.flush()

@@ -562,6 +562,7 @@ def validate_monthly_limit_row(
 
     # 강제 OFF 일수 산정 (vacation 제외!)
     weekend_count = 0
+    # TODO(weekend-period): nurse.is_weekend_off 는 호출측이 period as-of 로 주입해야 함
     if bool(getattr(nurse, "is_weekend_off", False)):
         weekend_count = _weekend_count_in_month(year, month)
 

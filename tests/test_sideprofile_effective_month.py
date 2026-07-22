@@ -46,15 +46,15 @@ def seeded(db):
     db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
     # 수정 대상: 홈=A
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1", name="n1",
-                 active=1, is_weekend_off=False, allowed_shifts=[], grade=1))
+                 active=1, allowed_shifts=[], grade=1))
     # A 병동 수간호사(source 호출자)
     db.add(Nurse(nurse_id="HN_A", account_id="acc_HN_A", group_id="A", office_id="o1",
                  name="수간호사A", active=1, is_head_nurse=1, hn_auth="HN",
-                 is_weekend_off=False, allowed_shifts=[], grade=1))
+                 allowed_shifts=[], grade=1))
     # B 병동 수간호사(target 호출자) + n1 을 B 로 파견
     db.add(Nurse(nurse_id="HN_B", account_id="acc_HN_B", group_id="B", office_id="o1",
                  name="수간호사B", active=1, is_head_nurse=1, hn_auth="HN",
-                 is_weekend_off=False, allowed_shifts=[], grade=1))
+                 allowed_shifts=[], grade=1))
     db.add(NurseAssignment(
         nurse_id="n1", source_group_id="A", target_group_id="B", office_id="o1",
         start_date=date(2026, 1, 1), reason="파견", status="active",
@@ -126,7 +126,7 @@ def test_mutual_exclusion_set_and_release_all_roles(seeded, label, caller):
     db = seeded
     # 배제 파트너 n2 (홈 A)
     db.add(Nurse(nurse_id="n2", account_id="acc_n2", group_id="A", office_id="o1",
-                 name="이영희", active=1, is_weekend_off=False, allowed_shifts=[], grade=1))
+                 name="이영희", active=1, allowed_shifts=[], grade=1))
     db.flush()
 
     # 6월 1일 발효로 설정
@@ -150,7 +150,7 @@ def test_mutual_exclusion_field_omitted_no_change(seeded):
     u = _user(nurse_id="HN_A", account_id="acc_HN_A", group_id="A",
               is_head_nurse=True, hn_auth="HN")
     db.add(Nurse(nurse_id="n2", account_id="acc_n2", group_id="A", office_id="o1",
-                 name="이영희", active=1, is_weekend_off=False, allowed_shifts=[], grade=1))
+                 name="이영희", active=1, allowed_shifts=[], grade=1))
     db.flush()
     update_nurse_profile_service("n1", NurseProfileUpdate(exclusion_partner_id="n2"), u, db,
                                  effective_year=2026, effective_month=6)

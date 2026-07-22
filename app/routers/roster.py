@@ -2572,12 +2572,18 @@ async def create_roster_with_weekly_off(
     )
     weekly_off_shift_int_id = weekly_off_shift.id if weekly_off_shift else None
 
-    weekend_off_by_nurse_id = {
-        str(r.nurse_id): bool(getattr(r, "is_weekend_off", False))
-        for r in db.query(Nurse.nurse_id, Nurse.is_weekend_off)
+    # 주말휴무 SSOT = nurse_weekendoff_period (as-of today). nurses.is_weekend_off 컬럼 미조회.
+    from services.nurse_period_resolver import weekend_off_ids_asof
+    from datetime import date as _date
+    _today = _date.today()
+    _active_ids = [
+        str(r.nurse_id)
+        for r in db.query(Nurse.nurse_id)
         .filter(Nurse.group_id == target_group_id, Nurse.active == 1)
         .all()
-    }
+    ]
+    _wids = weekend_off_ids_asof(db, _active_ids, _today.year, _today.month)
+    weekend_off_by_nurse_id = {nid: (nid in _wids) for nid in _active_ids}
 
     nurses = []
     if isinstance(weekly_off_data, dict):

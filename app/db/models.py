@@ -114,7 +114,9 @@ class Nurse(Base):
     gender = Column(NVARCHAR(3), nullable=True)
     profile_image_key = Column(VARCHAR(1000), nullable=True)
     profile_image_updated_at = Column(DATETIME, nullable=True)
-    is_weekend_off = Column(BOOLEAN, default=False)
+    # is_weekend_off: ORM 매핑 제거(2026-07-22). SSOT = nurse_weekendoff_period.
+    #   물리 컬럼은 당분간 DROP 하지 않되(요청), ORM 이 SELECT/read 하지 않도록 언매핑.
+    #   읽기는 services.nurse_period_resolver.is_weekend_off_asof / weekend_off_ids_asof 사용.
     # 추가
     work_shifts = Column(JSON, nullable=True, default=list, server_default="[]")
     # 원티드 설정 (간호사별 개별 설정)

@@ -36,7 +36,7 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1",
-                 name="n1", active=1, grade=1, allowed_shifts=[], is_weekend_off=False))
+                 name="n1", active=1, grade=1, allowed_shifts=[]))
     db.flush()
     return db
 
@@ -76,7 +76,7 @@ def test_inbound_grade_reads_period_over_base(db):
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
     db.add(Nurse(nurse_id="mv", account_id="acc_mv", group_id="B", office_id="o1",
-                 name="mover", active=1, grade=1, allowed_shifts=[], is_weekend_off=False))
+                 name="mover", active=1, grade=1, allowed_shifts=[]))
     db.add(NurseAssignment(nurse_id="mv", source_group_id="B", target_group_id="A",
                            office_id="o1", start_date=date(2026, 7, 1),
                            reason="병동이동", status="active"))
@@ -96,7 +96,7 @@ def test_dispatch_inbound_keeps_target_overlay(db):
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Group(group_id="B", group_name="B병동", office_id="o1"))
     db.add(Nurse(nurse_id="dp", account_id="acc_dp", group_id="B", office_id="o1",
-                 name="disp", active=1, grade=2, allowed_shifts=[], is_weekend_off=False))
+                 name="disp", active=1, grade=2, allowed_shifts=[]))
     db.add(NurseAssignment(nurse_id="dp", source_group_id="B", target_group_id="A",
                            office_id="o1", start_date=date(2026, 7, 1),
                            reason="파견", status="active", target_grade=4))

@@ -134,6 +134,7 @@ def _compile_weekend_off_bundle(ctx: RuleCompileContext) -> PrimitiveRuleBundle:
     weekday_days = set().union(*(ctx.weekday_to_days.get(wd, set()) for wd in range(5)))
     weekend_days = set(ctx.weekday_to_days.get(5, set())) | set(ctx.weekday_to_days.get(6, set()))
     for nurse in ctx.snapshot.nurses:
+        # TODO(weekend-period): period as-of 로 전환 필요(호출측 db 주입)
         if not nurse.is_weekend_off:
             continue
         active_days = ctx.active_days_by_nurse_id.get(nurse.nurse_id, set())

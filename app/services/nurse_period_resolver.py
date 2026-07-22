@@ -57,6 +57,21 @@ def resolve_asof(rows_for_nurse: list | None, day: date, value_attr: str,
     return default
 
 
+def is_weekend_off_asof(db, nurse_id, day: date | None = None) -> bool:
+    """단건: nurse_id 의 주말휴무 여부(as-of day, 기본 today). SSOT=nurse_weekendoff_period.
+
+    nurses.is_weekend_off 컬럼을 절대 읽지 않는다.
+    """
+    from datetime import timedelta
+    from db.models import NurseWeekendOffPeriod
+    if not nurse_id:
+        return False
+    d = day or date.today()
+    # fetch_periods 는 valid_from < month_end 필터라, valid_from==d 구간 포함 위해 +1일.
+    rows = fetch_periods(db, NurseWeekendOffPeriod, [str(nurse_id)], d, d + timedelta(days=1))
+    return bool(resolve_asof(rows.get(str(nurse_id)), d, "weekend_off", default=None))
+
+
 def weekend_off_ids_asof(db, nurse_ids, year: int, month: int) -> set[str]:
     """as-of (year, month) 기준 주말휴무 대상 nurse_id 집합.
 

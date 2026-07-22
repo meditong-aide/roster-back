@@ -105,6 +105,7 @@ def _build_listing_snapshot(
 
     # Pull active nurses for this group (minimal NurseFact)
     from db.models import Nurse
+    from services.nurse_period_resolver import is_weekend_off_asof
 
     nurse_rows = (
         db.query(Nurse)
@@ -125,7 +126,7 @@ def _build_listing_snapshot(
                 name=str(getattr(n, "name", "") or ""),
                 team_id=str(getattr(n, "team_id", "") or "") or None,
                 grade=int(getattr(n, "grade", 0) or 0) or None,
-                is_weekend_off=bool(getattr(n, "is_weekend_off", 0) or False),
+                is_weekend_off=is_weekend_off_asof(db, nurse_id, date(int(year), int(month), 1)),
                 allowed_shift_codes=set(),
                 preceptor_id=None,
                 is_inbound=False,

@@ -589,6 +589,19 @@ def update_nurse_attribute(
 # ── private helpers ──────────────────────────────────────────
 
 
+def _weekend_off_now(r: Nurse) -> bool:
+    """주말휴무 여부(as-of today) — nurse_weekendoff_period(SSOT). 컬럼 미조회.
+
+    ORM 객체의 세션으로 period 를 조회한다(세션 없으면 False).
+    """
+    from sqlalchemy.orm import object_session
+    from services.nurse_period_resolver import is_weekend_off_asof
+    _db = object_session(r)
+    if _db is None:
+        return False
+    return is_weekend_off_asof(_db, r.nurse_id)
+
+
 def _nurse_summary(r: Nurse) -> dict:
     return {
         "nurse_id": r.nurse_id,
@@ -601,7 +614,8 @@ def _nurse_summary(r: Nurse) -> dict:
         "allowed_shifts": r.allowed_shifts,
         "preceptor_id": r.preceptor_id,
         "fixed_shift": r.fixed_shift,
-        "is_weekend_off": bool(r.is_weekend_off),
+        # 주말휴무 SSOT = nurse_weekendoff_period (as-of today). 컬럼 미조회.
+        "is_weekend_off": _weekend_off_now(r),
         "joining_date": str(r.joining_date) if r.joining_date else None,
         "work_shifts": r.work_shifts,
     }

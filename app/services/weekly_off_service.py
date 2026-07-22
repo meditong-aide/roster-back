@@ -239,10 +239,11 @@ def get_nurses_weekly_off_service(
         Nurse.active == 1
     ).order_by(Nurse.sequence.asc(), Nurse.name.asc()).all()
     
+    from services.nurse_period_resolver import is_weekend_off_asof
     items = []
     for n, team_name in nurses:
         base_weekday = resolve_weekly_off_base_weekday(n)
-        is_weekend_off = bool(getattr(n, "is_weekend_off", False))
+        is_weekend_off = is_weekend_off_asof(db, n.nurse_id, date(year, month, 1))
         preview_weekday = None
         
         # 미리보기 계산 (is_weekend_off 여부와 무관하게 동일한 사이클 로직 적용)
@@ -502,7 +503,8 @@ def get_my_weekly_off_service(
         )
 
     preview_weekday = base_weekday
-    is_weekend_off = bool(getattr(nurse, "is_weekend_off", False))
+    from services.nurse_period_resolver import is_weekend_off_asof
+    is_weekend_off = is_weekend_off_asof(db, nurse.nurse_id, date(year, month, 1))
     if not is_weekend_off and setting and setting.use_variable_cycle:
         if setting.cycle_type == 'month' and setting.base_year and setting.base_month:
             preview_weekday = calc_weekly_off_weekday_by_month(
