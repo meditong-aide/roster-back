@@ -1225,14 +1225,16 @@ SKILL_TOOLS: list[dict] = [
     {
         "name": "manage_wanted_limits",
         "description": (
-            "원티드(간호사 희망 근무) 한도 초과 처리. "
-            "예: '원티드 한도 넘은 사람 누구야?', '박지은 원티드 초과분 정리해줘'.\n\n"
+            "원티드(간호사 희망 근무) **일자별 신청 제한** 설정/조회/정리. "
+            "예: '8월 15일 휴무 3명까지', '원티드 한도 넘은 사람 누구야?', '박지은 초과분 정리해줘'.\n\n"
 
             "─────────── 무엇을 다루나 ───────────\n"
+            "- **특정일 신청 최대 개수 설정** (operation='set_daily_limit', preview/apply)\n"
+            "  → 그 날 원티드를 최대 몇 명까지 받을지. shift_type 주면 그 타입만(휴무/휴가), 없으면 그 날 전체.\n"
             "- 한도 초과자 목록 조회 (operation='list_over_limit')\n"
             "- 특정 간호사의 초과분 OFF 삭제 (operation='delete_excess_off', preview/apply)\n\n"
 
-            "⚠️ delete_excess_off 는 preview_only=true(기본)로 미리보기 → 사용자 동의 후 적용.\n"
+            "⚠️ set_daily_limit/delete_excess_off 는 preview_only=true(기본)로 미리보기 → 사용자 동의 후 적용.\n"
             "⛔ 수간호사(HN)·관리자(ADM) 전용 mutation. 권한 없는 요청은 거부됩니다.\n"
             "⛔ 사용자에게 internal nurse_id 노출 금지. 이름으로 말하세요.\n\n"
 
@@ -1247,6 +1249,8 @@ SKILL_TOOLS: list[dict] = [
             "- nurse_id 가 필요한 경우 사용자 이름은 query_schedule(scope=nurses) 로 먼저 매핑.\n\n"
 
             "─────────── 예시 ───────────\n"
+            "- '8월 15일 휴무 신청 3명까지' → set_daily_limit, target_date=2026-08-15, shift_type='휴무', max_requests=3\n"
+            "- '8월 말일 원티드 2개까지만' → set_daily_limit, target_date=2026-08-31, max_requests=2 (shift_type 없음=전체)\n"
             "- '7월 원티드 한도 넘은 사람' → list_over_limit, year=2026, month=7\n"
             "- '박지은 7월 원티드 초과분 정리' → delete_excess_off, nurse_id=...,  preview→confirm\n"
         ),
@@ -1255,11 +1259,14 @@ SKILL_TOOLS: list[dict] = [
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["list_over_limit", "delete_excess_off"],
-                    "description": "목록=list_over_limit, 정리=delete_excess_off.",
+                    "enum": ["set_daily_limit", "list_over_limit", "delete_excess_off"],
+                    "description": "설정=set_daily_limit, 목록=list_over_limit, 정리=delete_excess_off.",
                 },
                 "year": {"type": "integer", "description": "대상 연도."},
                 "month": {"type": "integer", "description": "대상 월 (1~12)."},
+                "target_date": {"type": "string", "description": "set_daily_limit 대상 일자 YYYY-MM-DD."},
+                "max_requests": {"type": "integer", "description": "set_daily_limit — 그 날 최대 신청 개수."},
+                "shift_type": {"type": "string", "description": "set_daily_limit — 제한할 타입(휴무/휴가). 없으면 그 날 전체."},
                 "nurse_id": {
                     "type": "string",
                     "description": "delete_excess_off 시 대상 간호사 식별자.",
