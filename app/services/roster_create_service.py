@@ -4208,7 +4208,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4231,6 +4231,38 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _up(db, _NWOP, str(_nid), _vf, "weekend_off", 0, source="resolution")
         db.commit()
         print(f"[RosterGenerate] 주말휴무 해제 적용(period, 발효 {_vf}): {list(_wor)}")
+    # per-nurse 월 야간 한도 하향(검증된 resolution 원클릭). 해당 월 NurseMonthlyLimit 에 field 하향
+    #   write = 개인 속성 변경. fetch 와 동일 스코프(current_user.group_id)에 써 target-first 로 픽업.
+    _mlr = monthly_limit_release or getattr(req, "monthly_limit_release", None)
+    if _mlr:
+        from db.models import NurseMonthlyLimit as _NML
+        _gid = str(current_user.group_id)
+        _applied = []
+        for _rel in _mlr:
+            _rnid = str(_rel.get("nurse_id") or "")
+            _rfld = _rel.get("field")
+            _rval = _rel.get("value")
+            if not _rnid or _rfld not in ("n_exact", "n_max") or _rval is None:
+                continue
+            _row = (
+                db.query(_NML)
+                .filter(_NML.nurse_id == _rnid, _NML.group_id == _gid,
+                        _NML.year == int(req.year), _NML.month == int(req.month))
+                .first()
+            )
+            if _row is None:
+                _row = _NML(nurse_id=_rnid, group_id=_gid,
+                            year=int(req.year), month=int(req.month))
+                db.add(_row)
+            setattr(_row, _rfld, int(_rval))
+            # 야간 고정/최대 상호배타: 하나를 세팅하면 반대 필드 제거(DB 정합).
+            if _rfld == "n_exact":
+                _row.n_max = None
+            else:
+                _row.n_exact = None
+            _applied.append(f"{_rnid}:{_rfld}={_rval}")
+        db.commit()
+        print(f"[RosterGenerate] 월 야간 한도 하향 적용(NurseMonthlyLimit {req.year}-{req.month}): {_applied}")
     # 모달 payload(req.config) 제공 시 생성 직전 config row 로 materialize(굳히기) → req.config_id 세팅.
     #   /async 라우터는 이미 materialize 후 req.config=None 으로 넘겨 여기선 no-op(이중 생성 방지).
     #   /roster_create/generate(로컬 sync) 등 config 를 실어 직접 호출하는 경로는 여기서 materialize 되어
@@ -4452,6 +4484,38 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     #   period 가 그 달을 덮으면 그 값으로 team_id 를 확정한다(재분배 B3가 기록한 미래 팀 포함).
     #   None(구간 없음)이면 기존 값 유지 — 홈은 ward-aware 폴백=캐시(현행 동일),
     #   인바운드는 4689 의 target_team_id 보존(period 없을 때 비회귀).
+    # ── 허용 근무형(allowed_shifts) 대상월 as-of 오버레이 (regular nurse) ──
+    #   nurses.allowed_shifts 컬럼은 as-of-TODAY 단방향 캐시라 미래월 생성 시 stale 하다.
+    #   예: 6월 N전담(['N'])→8월 해제([])를 미래발효로 저장하면, upsert_period 가 valid_from>today
+    #   인 캐시투영을 건너뛰어 컬럼은 현재값(['N']) 그대로. 8월 생성 시 day-grain 하드제약은 period
+    #   (=[], 제한없음)로 정확하지만, is_n_only_profile·objective·off-cap 은 컬럼(['N'])을 읽어
+    #   8월인데 야간전담으로 오판 → 팀제외+야간편향 → D/E 실종. 대상월 as-of period 값으로 컬럼을
+    #   맞춘다(SSOT 정합). period 미이행(row 없음)이면 컬럼 유지=무회귀. 인바운드는 위에서 처리됨.
+    try:
+        from services.nurse_period_resolver import fetch_periods as _fp_as, resolve_asof as _ra_as
+        from db.models import NurseAllowedShiftPeriod as _AP_as
+        _reg_ids = [str(n.nurse_id) for n in engine_nurses
+                    if not bool(getattr(n, "is_inbound", False))]
+        if _reg_ids:
+            _as_rows = _fp_as(db, _AP_as, _reg_ids, month_start, month_start + timedelta(days=1))
+            _overlaid = []
+            for _en in engine_nurses:
+                if bool(getattr(_en, "is_inbound", False)):
+                    continue
+                _rows = _as_rows.get(str(_en.nurse_id))
+                if not _rows:
+                    continue  # period 미이행 → 컬럼 유지(무회귀)
+                _oldv = getattr(_en, "allowed_shifts", None)
+                _newv = _ra_as(_rows, month_start, "allowed_shifts",
+                               default=(_oldv or []))
+                _en.__dict__['allowed_shifts'] = _newv
+                if list(_newv or []) != list(_oldv or []):
+                    _overlaid.append(f"{_en.nurse_id}:{_oldv}→{_newv}")
+            if _overlaid:
+                print(f"[AllowedShiftAsof] 대상월 as-of 오버레이({req.year}-{req.month}): {_overlaid}")
+    except Exception as _as_exc:
+        print(f"[AllowedShiftAsof] 오버레이 실패(무시): {_as_exc}")
+
     from services.team_period import resolve_team_for_roster
     from services.cp_sat.allowed_shift_types import is_n_only_profile
     for _en in engine_nurses:
@@ -5746,6 +5810,91 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                                       f"(후보 {len(_wk_cands)}, 검사 {min(len(_wk_cands), _PN_K)})")
                         except Exception as _pn_exc:
                             print(f"[UndiagProbe][per-nurse] failed (ignore): {_pn_exc}")
+
+                    # ── per-nurse MCS(월 야간 한도): config 야간 상한 완화가 병목(raise_max_night_cap
+                    #    검증)이면, 어느 간호사의 n_exact/n_max 가 상한과 충돌하는지 1명씩 상한값으로
+                    #    낮춰(1회성 override) 재solve 로 지목. config 상한 완화(전체)와 개인 하향(핀포인트)
+                    #    두 옵션을 모두 제시한다(개인 지목을 앞에).
+                    _nc_feasible = any(
+                        o.get("verified") and (o.get("apply") or {}).get("max_nig_per_month") is not None
+                        for o in _probe_opts
+                    )
+                    if _nc_feasible:
+                        try:
+                            _cfg_mn = int(_probe_base.get("max_nig_per_month") or 0)
+                            # 후보: n_exact 또는 n_max 가 config 야간 상한보다 큰 간호사(그 값을 상한
+                            # 이하로 낮추면 충돌 해소). 야간이 상한을 초과할 수 없으니 이들이 병목 후보.
+                            _nc_cands = []
+                            for _n in (nurses_for_engine or []):
+                                for _fld in ("n_exact", "n_max"):
+                                    _val = getattr(_n, _fld, None)
+                                    if _val is not None and _cfg_mn and int(_val) > _cfg_mn:
+                                        _nc_cands.append(
+                                            (str(getattr(_n, "nurse_id", "")), _fld, int(_val), _n))
+                                        break
+                            _PN_K = 6
+                            _nc_culprit = None
+                            for _cnid, _cfld, _ccur, _cnu in _nc_cands[:_PN_K]:
+                                # nurses_dict = [n.__dict__] 라 객체 dict 를 직접 낮췄다가 finally 로 복원
+                                # (다음 후보 재solve 오염 방지). 엔진은 nd 에서 n_exact/n_max 를 읽는다.
+                                _orig = _cnu.__dict__.get(_cfld)
+                                _cnu.__dict__[_cfld] = _cfg_mn
+                                try:
+                                    _g3, _, _rs3 = _run_cp_sat_basic(
+                                        db, current_user, nurses_for_engine, preferences,
+                                        latest_config, req, shift_manage_data,
+                                        fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                        time_limit_seconds=60,
+                                        _assignments=_assignments,
+                                        _inbound_assignments=_inbound_assignments,
+                                        _outbound_assignments=_outbound_assignments,
+                                    )
+                                    _err3 = _validate_generated_roster(
+                                        _g3, _rs3, nurses_context=list(nurses_for_engine or []),
+                                        config_context=_probe_base,
+                                        grade_config_context=_fetch_grade_config_dict(
+                                            db, current_user.office_id, current_user.group_id),
+                                    )
+                                finally:
+                                    _cnu.__dict__[_cfld] = _orig
+                                if _err3 is None:
+                                    _nc_culprit = (_cnid, _cfld, _ccur)
+                                    break
+                            if _nc_culprit:
+                                _nid, _fld, _cur = _nc_culprit
+                                _nm = next((getattr(n, "name", "") for n in (nurses_for_engine or [])
+                                            if str(getattr(n, "nurse_id", "")) == _nid), "") or _nid
+                                _fld_ko = "야간 고정 횟수" if _fld == "n_exact" else "월 야간 최대"
+                                _nc_opt = {
+                                    "option_id": f"lower_night_limit:{_nid}",
+                                    "kind": "lower_night_limit", "source": "probe", "verified": True,
+                                    "title_ko": f"{_nm} 간호사 {_fld_ko} {_cur}→{_cfg_mn}회로 낮추기",
+                                    "trade_off_ko": f"그 간호사의 월 야간이 {_cfg_mn}회 이하로 제한됩니다.",
+                                    "changes": [{"nurse_id": _nid, "attr": _fld,
+                                                 "from": _cur, "to": _cfg_mn}],
+                                    # 원클릭 재생성용 — 이 달 NurseMonthlyLimit 에 하향 write 후 생성.
+                                    "monthly_limit_release": [
+                                        {"nurse_id": _nid, "field": _fld, "value": _cfg_mn}],
+                                    "fix": {
+                                        "mode": "auto_apply",
+                                        "where": "nurse.monthly_limit.night",
+                                        "where_label_ko": "간호사 관리 > 해당 간호사 > 월 근무 한도(야간)",
+                                        "how_ko": f"이 방법을 고르면 {_nm} 간호사의 {_fld_ko}를 "
+                                                  f"{_cfg_mn}회로 낮추고 다시 만듭니다(이 달).",
+                                        "config_key": None,
+                                        "target": {"nurse_id": _nid, "field": _fld},
+                                    },
+                                }
+                                # config 야간 상한 완화(전체)는 그대로 두고, 개인 지목을 앞에 추가(둘 다 노출).
+                                _opts_now = unrecoverable["infeasibility"].get("resolution_options") or []
+                                unrecoverable["infeasibility"]["resolution_options"] = [_nc_opt] + _opts_now
+                                print(f"[UndiagProbe][per-nurse] 야간한도 병목 지목: "
+                                      f"{_nid}({_nm}) {_fld}={_cur}→{_cfg_mn}")
+                            else:
+                                print(f"[UndiagProbe][per-nurse] 야간한도 단일 하향 미해결 "
+                                      f"(후보 {len(_nc_cands)}, 검사 {min(len(_nc_cands), _PN_K)})")
+                        except Exception as _nc_exc:
+                            print(f"[UndiagProbe][per-nurse] night-limit failed (ignore): {_nc_exc}")
                     # probe 의 검증된 완화 = 원인 그 자체다: "이걸 완화하면 풀린다" ⟺ "이게 병목".
                     # MUS core 가 비어도 probe 가 원인(=완화 대상 정책)을 지목한다.
                     # 단일 완화들 = 각각이 단독 충분한 병목(대안), combo = 함께여야 풀리는 결합 병목.

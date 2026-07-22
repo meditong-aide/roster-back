@@ -215,6 +215,7 @@ async def roster_create_async(
                     config_override=(getattr(req, "config_override", None) or None),
                     treatment_ids=(getattr(req, "treatment_ids", None) or None),
                     weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
+                    monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
                 ),
                 "materialized_config": materialized,
             }

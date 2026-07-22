@@ -118,6 +118,9 @@ class RosterRequest(BaseModel):
     # per-nurse 주말휴무 해제 옵션 재생성용 — resolution_options[i].weekend_off_release.
     #   해당 월(발효) 부터 nurse_weekendoff_period 에 해제(0) write(속성 변경) 후 생성.
     weekend_off_release: Optional[List[str]] = None
+    # per-nurse 월 야간 한도 하향 옵션 재생성용 — resolution_options[i].monthly_limit_release.
+    #   [{nurse_id, field: "n_exact"|"n_max", value}] 를 해당 월 NurseMonthlyLimit 에 write 후 생성.
+    monthly_limit_release: Optional[List[Dict[str, Any]]] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
     # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.
