@@ -643,6 +643,38 @@ SKILL_TOOLS: list[dict] = [
         },
     },
     {
+        "name": "manage_mutual_exclusion",
+        "description": (
+            "두 간호사를 **상호배제**(같은 근무에 함께 배치되지 않게) 설정/해제합니다. "
+            "예: '김민지랑 이수정 같이 근무 안 하게', '박지은 상호배제 풀어줘'.\n\n"
+
+            "⚠️ **1:1 전용**: 한 간호사당 파트너 1명(양방향 대칭). 파트너를 새로 지정하면 이전 짝은 자동 해제.\n"
+            "⚠️ 같은 연차/등급 여러 명을 '나눠서' 는 그룹 배타가 아니라 **페어 단위**로만 됨 "
+            "(3명+ 그룹 전원 배타는 미지원). 두 명씩 지정하세요.\n"
+            "⚠️ preview_only=true(기본) → 미리보기 → 동의 후 false. HN/ADM 전용.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 개인 속성(야간전담/팀/등급/경력) 변경 → update_person_attr.\n"
+            "- 팀 배정/이동 → manage_teams / manage_assignment.\n\n"
+
+            "예시:\n"
+            "- '김민지랑 이수정 같은 근무 피하게' → operation=set, nurse_name=김민지, partner_name=이수정\n"
+            "- '박지은 상호배제 해제' → operation=release, nurse_name=박지은"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["set", "release"],
+                              "description": "설정=set(파트너 지정), 해제=release."},
+                "nurse_name": {"type": "string", "description": "대상 간호사 이름."},
+                "partner_name": {"type": "string", "description": "set 시 상호배제할 상대 간호사 이름."},
+                "preview_only": {"type": "boolean", "default": True,
+                                 "description": "true=미리보기(미적용). 동의 후 false 로 적용."},
+            },
+            "required": ["operation", "nurse_name"],
+        },
+    },
+    {
         "name": "update_person_attr",
         "description": (
             "간호사 개인 속성을 수정합니다. "

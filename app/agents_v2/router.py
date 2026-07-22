@@ -76,6 +76,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # 등급/팀 최소인원/팀 CRUD/개인 속성 (근무자관리 화면 gray → navigate/prefill 번들)
     "settings_people": [
         "manage_grade", "manage_team_min", "manage_teams", "update_person_attr",
+        "manage_mutual_exclusion",
         "query_schedule",  # 속성 조회('야간전담이야?', '프리셉터 누구') → 읽기 tool 필요
         "navigate", "prefill",
         # [EVAL 2026-07-20] '박혜미 5월 D 최소 8회' 등 개인 월한도가 사람 발화라
