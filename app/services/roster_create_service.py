@@ -2645,7 +2645,7 @@ def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int
         month=month,
     )
 
-def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None):
+def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None, weekend_off_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
     try:
@@ -2654,6 +2654,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         # - 이유: ORM 모델/스키마가 아직 확장되지 않은 환경에서도 fallback/하드 제약이 동작해야 한다.
         try:
             # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). 컬럼 미의존, 엔진 입력에 주입.
+            # weekend_off_override(per-nurse MCS 검증용): 지정 간호사만 값 덮어씀(1회성, DB 미변경).
             from services.nurse_period_resolver import weekend_off_ids_asof
             _wids = weekend_off_ids_asof(
                 db,
@@ -2663,7 +2664,10 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             for nd in nurses_dict:
                 nid = str(nd.get("nurse_id") or nd.get("db_id") or "")
                 if nid:
-                    nd["is_weekend_off"] = nid in _wids
+                    _v = nid in _wids
+                    if weekend_off_override and nid in weekend_off_override:
+                        _v = bool(weekend_off_override[nid])
+                    nd["is_weekend_off"] = _v
         except Exception as e:
             print(f"[WeeklyOff] is_weekend_off 주입 실패(무시): {e}")
         # prefs_dict = [p.__dict__ for p in preferences]
@@ -5663,6 +5667,71 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     _probe_opts = to_resolution_options(_probe_res, _probe_base)
                     _exist_opts = unrecoverable["infeasibility"].get("resolution_options") or []
                     unrecoverable["infeasibility"]["resolution_options"] = _probe_opts + _exist_opts
+
+                    # ── per-nurse MCS: 주말휴무가 병목(config probe 가 disable_weekend_off_only 검증)이면,
+                    #    어느 간호사의 주말휴무가 원인인지 1명씩 해제(1회성 override)해 재solve 로 지목.
+                    #    게이팅(병목일 때만)+주말휴무자만+top-K+조기종료 로 비용 억제.
+                    _wk_feasible = any(
+                        o.get("verified") and (o.get("apply") or {}).get("weekend_off_only_enable") is False
+                        for o in _probe_opts
+                    )
+                    if _wk_feasible:
+                        try:
+                            from services.nurse_period_resolver import weekend_off_ids_asof as _wo_ids
+                            _wk_cands = sorted(_wo_ids(
+                                db, [getattr(n, "nurse_id", None) for n in (nurses_for_engine or [])],
+                                req.year, req.month))
+                            _PN_K = 6
+                            _culprit = None
+                            for _cnid in _wk_cands[:_PN_K]:
+                                _g2, _, _rs2 = _run_cp_sat_basic(
+                                    db, current_user, nurses_for_engine, preferences, latest_config, req,
+                                    shift_manage_data,
+                                    fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                    time_limit_seconds=60,
+                                    weekend_off_override={str(_cnid): False},
+                                    _assignments=_assignments,
+                                    _inbound_assignments=_inbound_assignments,
+                                    _outbound_assignments=_outbound_assignments,
+                                )
+                                _err2 = _validate_generated_roster(
+                                    _g2, _rs2, nurses_context=list(nurses_for_engine or []),
+                                    config_context=_probe_base,
+                                    grade_config_context=_fetch_grade_config_dict(
+                                        db, current_user.office_id, current_user.group_id),
+                                )
+                                if _err2 is None:
+                                    _culprit = str(_cnid)
+                                    break
+                            if _culprit:
+                                _nm = next((getattr(n, "name", "") for n in (nurses_for_engine or [])
+                                            if str(getattr(n, "nurse_id", "")) == _culprit), "") or _culprit
+                                _wk_opt = {
+                                    "option_id": f"release_weekend_off:{_culprit}",
+                                    "kind": "release_weekend_off", "source": "probe", "verified": True,
+                                    "title_ko": f"{_nm} 간호사 주말 휴무 해제",
+                                    "trade_off_ko": "그 간호사가 주말에도 근무할 수 있게 됩니다.",
+                                    "changes": [{"nurse_id": _culprit, "attr": "weekend_off",
+                                                 "from": True, "to": False}],
+                                    "fix": {
+                                        "mode": "manual_navigate",
+                                        "where": "nurse.weekend_off",
+                                        "where_label_ko": "간호사 관리 > 해당 간호사 > 주말 휴무",
+                                        "how_ko": f"{_nm} 간호사의 주말 휴무를 해제해 주세요(이 달부터).",
+                                        "config_key": None, "target": {"nurse_id": _culprit},
+                                    },
+                                }
+                                # 그룹 전체 끄는 coarse 옵션(weekend_off_only_enable) 대신 개인 지목을 앞에.
+                                _opts_now = unrecoverable["infeasibility"].get("resolution_options") or []
+                                _opts_now = [o for o in _opts_now
+                                             if (o.get("apply") or {}).get("weekend_off_only_enable") is not False]
+                                unrecoverable["infeasibility"]["resolution_options"] = [_wk_opt] + _opts_now
+                                print(f"[UndiagProbe][per-nurse] 주말휴무 병목 지목: {_culprit}({_nm})")
+                            else:
+                                print(f"[UndiagProbe][per-nurse] 단일 해제로 미해결 "
+                                      f"(후보 {len(_wk_cands)}, 검사 {min(len(_wk_cands), _PN_K)})")
+                        except Exception as _pn_exc:
+                            print(f"[UndiagProbe][per-nurse] failed (ignore): {_pn_exc}")
                     # probe 의 검증된 완화 = 원인 그 자체다: "이걸 완화하면 풀린다" ⟺ "이게 병목".
                     # MUS core 가 비어도 probe 가 원인(=완화 대상 정책)을 지목한다.
                     # 단일 완화들 = 각각이 단독 충분한 병목(대안), combo = 함께여야 풀리는 결합 병목.
