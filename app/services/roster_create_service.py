@@ -5639,7 +5639,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 _inf_pre = unrecoverable.get("infeasibility", {}) or {}
                 _sd_pre = _inf_pre.get("structural_diagnosis", {}) or {}
                 _codes_pre = (_sd_pre.get("signals") or {}).get("reason_codes") or []
-                _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not (_sd_pre.get("primary_causes") or [])
+                # probe 게이트: '사용자에게 줄 actionable 진단(해결옵션 / 수정가능 원인)이 없으면'
+                # 무조건 probe 를 돌린다. 뭉뚱그린 구조 라벨(primary_causes)이 있다는 이유로
+                # probe 를 막지 않는다(그게 capacity_structural 이 진짜 진단을 죽이던 원인).
+                _ui_options_pre = _inf_pre.get("resolution_options") or []
+                _ui_causes_fix = [
+                    _c for _c in (_inf_pre.get("causes") or [])
+                    if isinstance(_c, dict) and _c.get("fix")
+                ]
+                _has_actionable = bool(_ui_options_pre) or bool(_ui_causes_fix)
+                _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not _has_actionable
                 if _is_undiag and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
                     from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
 
