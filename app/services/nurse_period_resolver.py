@@ -57,6 +57,27 @@ def resolve_asof(rows_for_nurse: list | None, day: date, value_attr: str,
     return default
 
 
+def weekend_off_ids_asof(db, nurse_ids, year: int, month: int) -> set[str]:
+    """as-of (year, month) 기준 주말휴무 대상 nurse_id 집합.
+
+    SSOT = nurse_weekendoff_period. nurses.is_weekend_off 컬럼에 의존하지 않는다.
+    (컬럼은 단방향 캐시일 뿐이고, 도려내는 중이므로 읽기는 period 로 일원화.)
+    """
+    import calendar
+    from db.models import NurseWeekendOffPeriod
+    ids = [str(x) for x in (nurse_ids or []) if x is not None and str(x)]
+    if not ids:
+        return set()
+    ms = date(year, month, 1)
+    me = date(year, month, calendar.monthrange(year, month)[1])
+    wp = fetch_periods(db, NurseWeekendOffPeriod, ids, ms, me)
+    out: set[str] = set()
+    for nid in ids:
+        if resolve_asof(wp.get(nid), ms, "weekend_off", default=None):
+            out.add(nid)
+    return out
+
+
 # ── 쓰기 ──────────────────────────────────────────────────────────────────────
 def open_span_covering(db, Model, nurse_id: str, valid_from: date,
                        group_id: str | None = None):

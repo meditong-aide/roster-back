@@ -1111,42 +1111,24 @@ def _compute_weekly_off_day_indices_for_month(
     # 간호사 주휴 요일 조회
     # weekly_off_enabled 컬럼은 선택(없어도 weekday null 여부로 판단)
     has_enabled_col = _column_exists(db, "nurses", "weekly_off_enabled")
-    has_weekend_off_col = _column_exists(db, "nurses", "is_weekend_off")
+    # 주말휴무(is_weekend_off)는 더 이상 컬럼에서 안 읽는다 — SSOT=nurse_weekendoff_period.
     try:
         if has_enabled_col:
-            if has_weekend_off_col:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday, is_weekend_off "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday "
+                    "FROM nurses WHERE group_id = :group_id AND active = 1"
+                ),
+                {"group_id": group_id},
+            ).fetchall()
         else:
-            if has_weekend_off_col:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_weekday, is_weekend_off "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_weekday "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT nurse_id, name, weekly_off_weekday "
+                    "FROM nurses WHERE group_id = :group_id AND active = 1"
+                ),
+                {"group_id": group_id},
+            ).fetchall()
     except Exception as e:
         warnings.append({"type": "nurses_query_failed", "detail": str(e)})
         return nurse_to_days, warnings
@@ -1162,6 +1144,12 @@ def _compute_weekly_off_day_indices_for_month(
             if str(getattr(_n, "nurse_id", "")) not in _wo_existing_ids
         ]
 
+    # 주말휴무 대상 = nurse_weekendoff_period(as-of month)에서 해석. 컬럼 미의존.
+    from services.nurse_period_resolver import weekend_off_ids_asof
+    _wids = weekend_off_ids_asof(
+        db, [str(getattr(_r, "nurse_id", "")) for _r in rows], year, month
+    )
+
     for r in rows:
         nurse_id = str(r.nurse_id)
         name = str(r.name)
@@ -1169,8 +1157,7 @@ def _compute_weekly_off_day_indices_for_month(
         if has_enabled_col:
             enabled = bool(getattr(r, "weekly_off_enabled", 0))
         # 주말 고정 휴무 대상일 때만 "주휴 요일은 주말"을 강제한다.
-        # - 컬럼이 없으면(레거시 DB) False로 간주하여 기존 동작(에러 없음)을 유지한다.
-        is_weekend_off = bool(getattr(r, "is_weekend_off", 0)) if has_weekend_off_col else False
+        is_weekend_off = nurse_id in _wids
 
         base_weekday = getattr(r, "weekly_off_weekday", None)
         # ── 주말 휴무 대상 처리(백그라운드 강제 정책) ──
@@ -1288,11 +1275,7 @@ def _compute_weekly_off_day_indices_for_month(
             )
         nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, month_weekday))
 
-    weekend_off_only = {
-        str(r.nurse_id)
-        for r in rows
-        if has_weekend_off_col and bool(getattr(r, "is_weekend_off", 0))
-    }
+    weekend_off_only = {str(r.nurse_id) for r in rows if str(r.nurse_id) in _wids}
     if weekend_off_only:
         print(f"[WeeklyOff] 주말 휴무 대상 간호사 수={len(weekend_off_only)}")
     return nurse_to_days, warnings
@@ -1984,13 +1967,9 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     # 간호사별 is_weekend_off 정보 조회 (주말 휴무 대상자 필터링용)
     weekend_off_nurse_ids: set[str] = set()
     try:
-        from db.models import Nurse as NurseModel
-        from sqlalchemy import text
-        weekend_off_rows = db.execute(
-            text("SELECT nurse_id FROM nurses WHERE group_id = :group_id AND active = 1 AND is_weekend_off = 1"),
-            {"group_id": current_user.group_id}
-        ).fetchall()
-        weekend_off_nurse_ids = {str(row.nurse_id) for row in weekend_off_rows}
+        # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). nurses.is_weekend_off 컬럼 미의존.
+        from services.nurse_period_resolver import weekend_off_ids_asof
+        weekend_off_nurse_ids = weekend_off_ids_asof(db, nurse_ids, req.year, req.month)
         if weekend_off_nurse_ids:
             print(f"[CrossMonth] 주말 휴무 대상 간호사: {sorted(weekend_off_nurse_ids)}")
     except Exception as e:
@@ -2674,21 +2653,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         # is_weekend_off는 ORM 컬럼 유무와 무관하게, DB에 컬럼이 있으면 직접 조회해서 엔진 입력에 주입한다.
         # - 이유: ORM 모델/스키마가 아직 확장되지 않은 환경에서도 fallback/하드 제약이 동작해야 한다.
         try:
-            if _column_exists(db, "nurses", "is_weekend_off"):
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, is_weekend_off "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": current_user.group_id},
-                ).fetchall()
-                id_to_weekend_off = {str(r.nurse_id): bool(getattr(r, "is_weekend_off", 0)) for r in rows}
-                print('id_to_weekend_off!!!!!', id_to_weekend_off)
-                for nd in nurses_dict:
-                    nid = str(nd.get("nurse_id") or nd.get("db_id") or "")
-                    if not nid:
-                        continue
-                    nd["is_weekend_off"] = bool(id_to_weekend_off.get(nid, False))
+            # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). 컬럼 미의존, 엔진 입력에 주입.
+            from services.nurse_period_resolver import weekend_off_ids_asof
+            _wids = weekend_off_ids_asof(
+                db,
+                [nd.get("nurse_id") or nd.get("db_id") for nd in nurses_dict],
+                req.year, req.month,
+            )
+            for nd in nurses_dict:
+                nid = str(nd.get("nurse_id") or nd.get("db_id") or "")
+                if nid:
+                    nd["is_weekend_off"] = nid in _wids
         except Exception as e:
             print(f"[WeeklyOff] is_weekend_off 주입 실패(무시): {e}")
         # prefs_dict = [p.__dict__ for p in preferences]
@@ -3020,11 +2995,11 @@ def _persist_entries(db: Session, schedule, generated, req):
     shift_id_to_int_id = {s.shift_id: s.id for s in shifts_db}
     weekend_off_nurse_ids: set[str] = set()
     try:
-        rows = db.execute(
-            text("SELECT nurse_id FROM nurses WHERE group_id = :group_id AND active = 1 AND is_weekend_off = 1"),
-            {"group_id": schedule.group_id},
-        ).fetchall()
-        weekend_off_nurse_ids = {str(getattr(r, 'nurse_id', '')) for r in rows if getattr(r, 'nurse_id', None)}
+        # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). 컬럼 미의존.
+        from services.nurse_period_resolver import weekend_off_ids_asof
+        weekend_off_nurse_ids = weekend_off_ids_asof(
+            db, list(generated.keys()), schedule.year, schedule.month
+        )
     except Exception:
         weekend_off_nurse_ids = set()
     for nurse_id, shifts in generated.items():
