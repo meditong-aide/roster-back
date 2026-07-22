@@ -45,7 +45,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # [LIVE_LLM_CARVE 2026-06-22] '팀 추가/삭제' = mutate 본질이라 manage_teams 도 번들.
     "mutate": [
         "bulk_mutation", "manage_wanted_deadline", "manage_wanted_limits",
-        "manage_teams", "query_schedule",
+        "manage_teams", "query_schedule", "publish_schedule",
         # [EVAL 2026-07-20] '김민지 5월 N 4번으로 맞춰줘' 같은 개인 월한도 변경이 mutate 로
         # 분류돼 update_monthly_limit(settings_rules 전용)을 놓쳤음 → 다중 배선으로 recall 복구.
         "update_monthly_limit",
@@ -56,6 +56,8 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     "generate": [
         "generate_schedule", "query_generation_job",
         "resolve_infeasibility", "navigate", "query_schedule", "invoke",
+        # 근무표 확정/발행(생성과 인접한 lifecycle 연산).
+        "publish_schedule",
     ],
     # 제약 위반 검증 / 교정 제안 (실패 후 해결 옵션 흐름도 인접 — resolve_infeasibility 번들)
     "validate_repair": [

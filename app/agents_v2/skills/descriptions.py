@@ -854,6 +854,40 @@ SKILL_TOOLS: list[dict] = [
         },
     },
     {
+        "name": "publish_schedule",
+        "description": (
+            "완성된 근무표를 **확정·발행**합니다 (draft → issued 전환 + 발행 스냅샷 저장). "
+            "사용자가 '이 근무표로 확정해줘', '근무표 발행해줘', '이걸로 확정/게시'처럼 "
+            "최종 확정 의도를 표현할 때 사용.\n\n"
+
+            "⚠️ **위험연산**: 발행하면 간호사에게 공개되고, 같은 달 이전 발행본은 draft 로 내려갑니다.\n"
+            "⚠️ preview/confirm 필수: 첫 호출 preview_only=true 로 대상(year/month/version) 표시 → "
+            "사용자 동의 후 preview_only=false 로 실제 발행. HN/ADM 전용.\n\n"
+
+            "─────────── 인접 스킬과의 경계 ───────────\n"
+            "- 근무표 **생성**(자동 짜기) → generate_schedule (발행 아님)\n"
+            "- 검증/교정 → validate_schedule / repair_schedule\n"
+            "- 발행 대상 근무표는 해당 월의 최신(또는 이미 발행된) 표를 자동 사용.\n\n"
+
+            "예시:\n"
+            "- '8월 근무표 발행해줘' → year=2026, month=8, preview_only=true → 동의 → false\n"
+            "- '이걸로 확정' → 직전 맥락의 year/month 로 발행"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer", "description": "발행 대상 연도"},
+                "month": {"type": "integer", "description": "발행 대상 월 (1~12)"},
+                "issue_comment": {"type": "string", "description": "발행 코멘트(선택)"},
+                "preview_only": {
+                    "type": "boolean", "default": True,
+                    "description": "true=대상만 표시(발행 안 함). 동의 후 false 로 실제 발행.",
+                },
+            },
+            "required": ["year", "month"],
+        },
+    },
+    {
         "name": "update_monthly_limit",
         "description": (
             "간호사 개인의 월 시프트 한도(D/E/N/O × min/max/exact)를 설정/수정합니다. "

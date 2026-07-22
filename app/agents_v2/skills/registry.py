@@ -68,6 +68,7 @@ def _ensure_loaded():
     import agents_v2.skills.manage_wanted_deadline
     import agents_v2.skills.manage_teams
     import agents_v2.skills.manage_wanted_limits
+    import agents_v2.skills.publish_schedule
     import agents_v2.skills.resolve_infeasibility
     # 매니페스트(@skill) 기반 신규 스킬도 로드 — run_skill 이 핸들러를 찾도록.
     from agents_v2.skills.manifest import load_manifest_skills

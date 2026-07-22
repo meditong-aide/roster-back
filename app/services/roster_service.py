@@ -1767,6 +1767,76 @@ def create_issued_roster_snapshot(
     return snapshot
 
 
+def publish_schedule_service(
+    db: Session,
+    schedule_id: int,
+    acting_nurse_id: str,
+    office_id: str,
+    group_id: str,
+    issue_comment: str = "",
+    account_id=None,
+) -> dict:
+    """근무표 발행(확정): status→issued 전환 + IssuedRoster 기록 + 발행 스냅샷 생성. 커밋 포함.
+
+    엔드포인트 publish_roster 의 핵심 오케스트레이션을 서비스로(에이전트 스킬용). 푸시 알림은 제외.
+    한 달에 issued 는 1개만 — 같은 월 기존 issued 는 draft 로 내린다.
+    """
+    schedule = db.query(Schedule).filter(Schedule.schedule_id == schedule_id).first()
+    if not schedule:
+        return {"error": f"schedule {schedule_id} 를 찾을 수 없습니다."}
+
+    # 멱등: 같은 버전이 이미 발행돼 있으면 중복 IssuedRoster(UNIQUE office+group+version) 방지.
+    # (재발행은 보통 새 버전 → 재생성 후 발행. 같은 버전 재발행은 no-op 로 안내.)
+    if (db.query(IssuedRoster)
+            .filter(IssuedRoster.office_id == office_id, IssuedRoster.group_id == group_id,
+                    IssuedRoster.version == schedule.version)
+            .first()):
+        return {"ok": True, "already_issued": True, "version": schedule.version,
+                "year": schedule.year, "month": schedule.month, "schedule_id": schedule_id,
+                "message": (f"{schedule.year}년 {schedule.month}월 근무표(v{schedule.version})는 "
+                            "이미 발행돼 있습니다.")}
+
+    max_seq = (
+        db.query(func.max(IssuedRoster.seq_no))
+        .filter(IssuedRoster.group_id == group_id, IssuedRoster.office_id == office_id)
+        .scalar()
+        or 0
+    )
+    # 같은 월 기존 issued → draft (한 달 1개만 issued 유지)
+    db.query(Schedule).filter(
+        Schedule.group_id == group_id,
+        Schedule.year == schedule.year,
+        Schedule.month == schedule.month,
+        Schedule.status == "issued",
+    ).update({"status": "draft"}, synchronize_session=False)
+    schedule.status = "issued"
+
+    issued = IssuedRoster(
+        seq_no=max_seq + 1, office_id=office_id, group_id=group_id,
+        nurse_id=acting_nurse_id, version=schedule.version, v_name=f"v{schedule.version}",
+        issue_cmmt=issue_comment or "발행", schedule_id=schedule_id,
+    )
+
+    class _ActingUser:  # create_issued_roster_snapshot 은 .nurse_id/.account_id 만 읽음
+        pass
+    _u = _ActingUser()
+    _u.nurse_id = acting_nurse_id
+    _u.account_id = account_id
+
+    snapshot = create_issued_roster_snapshot(
+        schedule=schedule, current_user=_u, year=schedule.year, month=schedule.month,
+        office_id=office_id, group_id=group_id, db=db,
+    )
+    db.add(issued)
+    db.add(snapshot)
+    db.commit()
+    return {
+        "snapshot_id": snapshot.snapshot_id, "seq_no": issued.seq_no,
+        "version": schedule.version, "year": schedule.year, "month": schedule.month,
+        "schedule_id": schedule_id,
+    }
+
+
 
 def _share_now() -> datetime:
     return datetime.now()
