@@ -277,6 +277,27 @@ def has_blocking_issues(precheck_result: Dict[str, Any]) -> bool:
     return False
 
 
+def _default_ui_text() -> Dict[str, str]:
+    """모달 chrome(제목·섹션 헤더·버튼) 문구 단일 소스.
+
+    프론트는 `infeasibility.ui_text.<key>` 가 있으면 그걸, 없으면 자체 기본값을 쓴다
+    (하위호환). 카피를 한 곳에서 관리하기 위해 백엔드가 함께 내려준다.
+    '실패/불가능/에러' 같은 단어는 쓰지 않는다.
+    """
+    return {
+        "title": "지금 조건으로는 근무표를 만들 수 없어요",
+        "description": "아래에서 해결 방법을 고르면 그대로 다시 만들어 드려요. 그냥 닫으면 이 결과는 사라져요.",
+        "options_header": "이렇게 하면 만들 수 있어요",
+        "verified_badge": "확인됨",
+        "apply_button": "이 방법으로 다시 생성",
+        "manual_after_edit": "위 위치에서 직접 수정한 뒤 다시 만들어 주세요.",
+        "causes_header": "직접 수정이 필요한 항목",
+        "issues_header": "확인된 항목",
+        "suggestions_header": "이렇게 조정해 보세요",
+        "close_button": "닫기",
+    }
+
+
 def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
     """Precheck blocking 케이스의 응답 페이로드(HTTP 500 detail로 사용).
 
@@ -357,6 +378,7 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "infeasibility": {
             "severity": "blocking",
+            "ui_text": _default_ui_text(),
             "summary_message_ko": summary,
             "preflight_issues": issues,
             "applied_relaxations": [],
@@ -548,6 +570,7 @@ def build_unrecoverable_payload(
     return {
         "infeasibility": {
             "severity": "blocking",
+            "ui_text": _default_ui_text(),
             "summary_message_ko": (
                 "일부 조건을 완화해 최대한 맞춰 봤지만, 지금 설정 조합으로는 근무표를 "
                 "만들 수 없습니다. 아래 항목을 조정해 주세요."
