@@ -47,7 +47,10 @@ def test_all_tools_covered():
     # manage_assignment (2026-07-08, 매니페스트 첫 시민, 파견) → 22.
     # lookup_guide (help-doc RAG) → 23.
     # manage_daily_shift (2026-07, 시프트별 필요인원=DailyShift) → 24.
-    assert len(ALL_TOOL_NAMES) == 24
+    # publish_schedule (2026-07, 근무표 확정/발행) → 25.
+    # manage_mutual_exclusion (2026-07, 두 간호사 상호배제) → 26.
+    # log_feedback (2026-07, 처리불가 불만/건의/버그 접수 — triage 정책) → 27.
+    assert len(ALL_TOOL_NAMES) == 27
     missing = set(ALL_TOOL_NAMES) - covered
     assert not missing, f"카테고리 미커버 tool: {missing}"
     # 맵의 tool 이름이 전부 실제 tool 이름인지(오타 방지)

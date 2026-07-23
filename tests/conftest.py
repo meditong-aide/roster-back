@@ -62,7 +62,7 @@ from db.models import (  # noqa: E402
     NurseGradePeriod, NurseAllowedShiftPeriod, NurseWeekendOffPeriod,
     NursePrecepteePeriod, NurseMutualExclusionPeriod,
     AgentConversation, AgentConversationMessage, AgentUserMemory,
-    AgentMemoryAudit, AgentSkillInvocation, AgentLlmUsage,
+    AgentMemoryAudit, AgentSkillInvocation, AgentLlmUsage, AgentFeedback,
 )
 
 
@@ -98,6 +98,7 @@ _REQUIRED_TABLES = [
     AgentMemoryAudit.__table__,
     AgentSkillInvocation.__table__,
     AgentLlmUsage.__table__,
+    AgentFeedback.__table__,
 ]
 
 

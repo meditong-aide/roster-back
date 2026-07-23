@@ -481,6 +481,32 @@ SKILL_TOOLS: list[dict] = [
         },
     },
     {
+        "name": "log_feedback",
+        "description": (
+            "에이전트가 **직접 처리할 수 없는** 불만·건의·버그신고를 접수(개발/운영팀 전달)합니다.\n\n"
+
+            "⚠️ **언제 쓰나 (중요)**: 사용자 발화 중 **어떤 스킬로도 실행/조회/진단할 수 없는** 항목 — "
+            "권한/계정 문제, UI·저장 반영 안 됨 같은 시스템 버그, '이런 기능 있으면 좋겠다' 같은 기능 건의. "
+            "이런 항목은 **침묵하거나 고쳤다고 답하지 말고** log_feedback 으로 접수하고 정직하게 안내한다.\n"
+            "⛔ 실행 가능한 요청(설정/근무표/원티드 변경), 조회, 품질 진단(편차·미충원 → validate/analyze)은 "
+            "여기가 아니라 해당 스킬을 써라. log_feedback 은 **오직 처리 불가 항목**의 마지막 경로.\n\n"
+
+            "예시:\n"
+            "- '관리자 권한 사용 제한 생겼어요' → kind='bug', content=원문\n"
+            "- '이런 화면도 있으면 좋겠어요' → kind='suggestion', content=원문\n"
+            "- 'X 기능이 자꾸 안 돼요'(스킬로 못 고침) → kind='bug'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "접수할 원문(사용자 표현 그대로)."},
+                "kind": {"type": "string", "enum": ["bug", "suggestion", "complaint"],
+                         "description": "버그신고=bug / 기능건의=suggestion / 일반불만=complaint."},
+            },
+            "required": ["content"],
+        },
+    },
+    {
         "name": "analyze_report",
         "description": (
             "근무표 또는 원티드 데이터를 분석/집계하여 리포트를 생성합니다. "

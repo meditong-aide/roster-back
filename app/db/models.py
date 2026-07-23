@@ -1177,3 +1177,22 @@ class AgentLlmUsage(Base):
         nullable=False,
         index=True,
     )
+
+
+class AgentFeedback(Base):
+    """수간호사 불만/건의/버그신고 접수 — 에이전트가 못 처리하는 concern 을 적재.
+
+    triage 정책: 스킬로 처리 못 하는 버그신고/기능건의는 log_feedback 스킬이 여기 1행씩
+    적재 → 개발팀이 실사용 피드백을 데이터로 확인. 테이블 부재 시 skill 이 graceful skip.
+    """
+
+    __tablename__ = "agent_feedback"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    conversation_id = Column(VARCHAR(64), nullable=True, index=True)
+    group_id = Column(VARCHAR(64), nullable=True, index=True)
+    nurse_id = Column(VARCHAR(64), nullable=True)
+    kind = Column(VARCHAR(16), nullable=True, index=True)  # bug | suggestion | complaint
+    content = Column(VARCHAR(1000), nullable=False)         # 원문 concern
+    status = Column(VARCHAR(16), nullable=False, default="open")  # open|triaged|resolved
+    created_at = Column(DATETIME, default=datetime.utcnow, nullable=False, index=True)

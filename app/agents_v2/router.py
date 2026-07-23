@@ -37,6 +37,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # 조회 발화가 read 직격 시그널이라 read 카테고리에 mutation 스킬의 조회 op 도 번들.
     "read": [
         "query_schedule", "navigate", "invoke",
+        "log_feedback",
         "query_generation_job", "manage_wanted_deadline", "manage_wanted_limits",
     ],
     # 근무/원티드 변경
@@ -45,6 +46,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # [LIVE_LLM_CARVE 2026-06-22] '팀 추가/삭제' = mutate 본질이라 manage_teams 도 번들.
     "mutate": [
         "bulk_mutation", "manage_wanted_deadline", "manage_wanted_limits",
+        "log_feedback",
         "manage_teams", "query_schedule", "publish_schedule",
         # [EVAL 2026-07-20] '김민지 5월 N 4번으로 맞춰줘' 같은 개인 월한도 변경이 mutate 로
         # 분류돼 update_monthly_limit(settings_rules 전용)을 놓쳤음 → 다중 배선으로 recall 복구.
@@ -62,20 +64,23 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # 제약 위반 검증 / 교정 제안 (실패 후 해결 옵션 흐름도 인접 — resolve_infeasibility 번들)
     "validate_repair": [
         "validate_schedule", "repair_schedule",
+        "log_feedback",
         "resolve_infeasibility", "query_schedule",
     ],
     # 분포·공정성·통계 분석
-    "analyze": ["analyze_report", "query_schedule"],
+    "analyze": ["analyze_report", "query_schedule", "log_feedback"],
     # 대체/교체 간호사 추천
     "recommend": ["recommend_candidates", "query_schedule"],
     # 병동 규칙/제약/월 한도 정책 변경 (설정 화면 gray → navigate/prefill 번들)
     "settings_rules": [
         "update_constraint", "update_monthly_limit",
+        "log_feedback",
         "query_schedule", "navigate", "prefill",
     ],
     # 등급/팀 최소인원/팀 CRUD/개인 속성 (근무자관리 화면 gray → navigate/prefill 번들)
     "settings_people": [
         "manage_grade", "manage_team_min", "manage_teams", "update_person_attr",
+        "log_feedback",
         "manage_mutual_exclusion",
         "query_schedule",  # 속성 조회('야간전담이야?', '프리셉터 누구') → 읽기 tool 필요
         "navigate", "prefill",
