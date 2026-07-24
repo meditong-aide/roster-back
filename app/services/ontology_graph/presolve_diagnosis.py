@@ -56,7 +56,41 @@ def _off_days(config: Dict[str, Any]) -> int:
 
 def _eligible(nu: Dict[str, Any], use_mid: bool) -> set:
     s = normalize_allowed_shift_codes(nu.get("allowed_shifts"), use_mid=use_mid)
-    return s if s else set(WORK)
+    base = s if s else set(WORK)
+    # fixed_shift(고정근무): 그 간호사는 그 시프트만 공급 → 다른 시프트 공급 0(시프트축 관계 반영).
+    fx = nu.get("fixed_shift")
+    if fx:
+        fxs = normalize_allowed_shift_codes([fx], use_mid=use_mid) & set(WORK)
+        if fxs:  # 유효 work 시프트 고정일 때만 제한(OFF/비근무 고정은 무시)
+            base = (base & fxs) or fxs
+    return base
+
+
+def _active_day_set(nu: Dict[str, Any], year: int, month: int, days: int) -> set:
+    """joining/resignation_date 로 이 달의 활성 day 인덱스(0-based) 집합.
+    월중 입사·퇴사자는 활성 범위 밖에서 공급 0 → max-flow 가 부분월 가용을 정확히 본다.
+    (완화 대상 아님 — 정확도용.)
+    """
+    lo, hi = 0, days - 1
+
+    def _d(x):
+        return x.date() if hasattr(x, "date") else x
+
+    jd = nu.get("joining_date")
+    if jd is not None:
+        j = _d(jd)
+        if (j.year, j.month) == (year, month):
+            lo = max(lo, int(j.day) - 1)
+        elif (j.year, j.month) > (year, month):
+            return set()  # 이 달 이후 입사 → 이 달 비활성
+    rd = nu.get("resignation_date")
+    if rd is not None:
+        r = _d(rd)
+        if (r.year, r.month) == (year, month):
+            hi = min(hi, int(r.day) - 1)
+        elif (r.year, r.month) < (year, month):
+            return set()  # 이 달 이전 퇴사 → 이 달 비활성
+    return set(range(lo, hi + 1)) if lo <= hi else set()
 
 
 def presolve_shortage_diagnosis(
@@ -77,6 +111,10 @@ def presolve_shortage_diagnosis(
         max_nig = 15
 
     # eligibility + per-nurse 야간 상한
+    # [관계 모델링] 주말휴무자는 주말 요일에 공급 0(강제OFF)로 요일별 반영 → max-flow 가
+    #   주말 커버리지 부족을 구조적으로 계산(누가·몇 명 풀어야 하는지). 월 capacity 는 전역
+    #   off_days 로 이미 반영되므로 workdays_by 는 안 건드림(주말은 요일축에서만 뺀다).
+    _wk_day_set = {d for d in range(days) if calendar.weekday(year, month, d + 1) >= 5}
     supplies: List[NurseSupply] = []
     workdays_by: Dict[str, int] = {}
     night_cap_by: Dict[str, int] = {}
@@ -84,10 +122,17 @@ def presolve_shortage_diagnosis(
     for nu in nurses_data:
         nid = str(nu.get("nurse_id"))
         elig = _eligible(nu, use_mid)
+        _is_wko = bool(nu.get("is_weekend_off"))
+        _act = _active_day_set(nu, year, month, days)  # 부분월 가용(입퇴사)
+        # 공급 있는 날 = 활성일 AND (주말휴무자면 주말 제외). 나머지 날은 공급 0.
+        _ebd = {d: (set(elig)
+                    if (d in _act and not (_is_wko and d in _wk_day_set))
+                    else set())
+                for d in range(days)}
         supplies.append(NurseSupply(nurse_id=nid, grade=nu.get("grade"),
-                                    team_id=nu.get("team_id"),
-                                    eligible_by_day={d: set(elig) for d in range(days)}))
-        workdays_by[nid] = workdays
+                                    team_id=nu.get("team_id"), eligible_by_day=_ebd))
+        # 월 capacity 도 활성일로 상한(부분월 입퇴사자는 근무 가능일 자체가 적다).
+        workdays_by[nid] = min(workdays, len(_act))
         # per-nurse n_exact/n_max 우선, 없으면 전역 max_nig
         pn = None
         for k in ("n_exact", "n_max"):
@@ -117,6 +162,66 @@ def presolve_shortage_diagnosis(
 
     graph = build_unified_graph(gi, supply_demand=per, monthly_supply_demand=mon)
     actions = recommend_actions(graph)
+
+    # [관계 → 인원] 주말 요일별 부족의 최댓값 = 주말휴무를 풀어야 하는 최소 인원(각 해제가
+    #   주말 매일 +1 공급). 조합 brute-force 없이 max-flow 로 '몇 명'을 직접 산출.
+    weekend_release_needed = max((per.day_shortage.get(d, 0) for d in _wk_day_set), default=0)
+
+    # ── 개인 제약 압박 감지 (제약모순형 병목: 커버리지 max-flow 의 사각지대) ──
+    #   커버리지 부족이 아니어도 개인 제약이 물리적 모순/과부하를 만들면 여기서 잡아
+    #   probe 우선 완화군(pressure_families)으로 넘긴다. 콤보를 앞당겨 재solve 수↓.
+    #   전체 시프트 한도(d/e/n × exact·min) + 주말휴무 + off 예산을 함께 본다(단일 속성만
+    #   보던 사각지대 제거). 각 압박은 실제 완화 레버가 있는 family 로만 매핑한다.
+    #   · night_floor_over_cap : N 하한 > config max_nig → 달성 불가 → night_cap
+    #   · shift_floor_over_workdays : 강제 하한 합 > 근무가능일 → 과결속 → off_budget
+    #   · weekend_off_load : 주말휴무자(주말 전일 강제OFF) → weekend_off
+    _wk_days = sum(1 for d in range(days) if calendar.weekday(year, month, d + 1) >= 5)
+    pressure_families: List[str] = []
+    constraint_flags: List[Dict[str, Any]] = []
+    _pf_seen: set = set()
+
+    def _add_pf(f: str) -> None:
+        if f not in _pf_seen:
+            _pf_seen.add(f)
+            pressure_families.append(f)
+
+    def _floor(nu: Dict[str, Any], s: str):
+        v = nu.get(f"{s}_exact")
+        if v is None:
+            v = nu.get(f"{s}_min")
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    for nu in nurses_data:
+        nid = str(nu.get("nurse_id"))
+        # 이 간호사의 강제 OFF 부담(주말휴무 우선; 없으면 전역 off 예산)
+        forced_off = 0
+        if bool(nu.get("is_weekend_off")):
+            forced_off = _wk_days
+            _add_pf("weekend_off")
+            constraint_flags.append({
+                "nurse_id": nid, "type": "weekend_off_load", "forced_off": _wk_days,
+                # 관계 분석 결과: 주말 커버리지를 맞추려면 몇 명 풀어야 하는지(0=주말 커버리지엔
+                # 여유, 그래도 월 capacity 병목일 수 있어 단일 지목으로 처리).
+                "release_needed": weekend_release_needed})
+        workdays_n = max(0, days - max(off, forced_off))
+        # 시프트별 강제 하한(exact 우선). N 은 config 상한과, 전체 합은 근무가능일과 대조.
+        floors = {s: _floor(nu, s) for s in ("d", "e", "n")}
+        floors = {s: v for s, v in floors.items() if v is not None}
+        n_floor = floors.get("n")
+        if n_floor is not None and n_floor > max_nig:
+            _add_pf("night_cap")
+            constraint_flags.append({
+                "nurse_id": nid, "type": "night_floor_over_cap",
+                "n_floor": n_floor, "max_nig": max_nig})
+        total_floor = sum(floors.values())
+        if total_floor > workdays_n:
+            _add_pf("off_budget")
+            constraint_flags.append({
+                "nurse_id": nid, "type": "shift_floor_over_workdays",
+                "total_floor": total_floor, "workdays": workdays_n, "floors": floors})
 
     # 부족 리스트 (시프트별, 이유 부착)
     shortages: List[Dict[str, Any]] = []
@@ -149,6 +254,11 @@ def presolve_shortage_diagnosis(
     return {
         "shortages": shortages,
         "recovery_options": recovery,
+        # 제약모순형 병목의 완화군 힌트(커버리지 shortages 와 별개). probe 우선순위에 먹인다.
+        "pressure_families": pressure_families,
+        "constraint_flags": constraint_flags,
+        # 주말 요일별 max-flow 로 산출한, 주말휴무를 풀어야 하는 최소 인원(관계 분석 결과).
+        "weekend_release_needed": weekend_release_needed,
         "per_day_bottleneck_cells": len(per.bottleneck_cells),
         "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
     }

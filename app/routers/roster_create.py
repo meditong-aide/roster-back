@@ -295,7 +295,15 @@ async def generate_roster_endpoint(
         year=2025, month=3 요청 시 동기 생성 결과 반환.
     """
     try:
-        return generate_roster_service(req, current_user, db)
+        # 해결책 재생성 파라미터를 서비스로 전달(누락 시 config_override 의 비-DB 솔버키
+        # (예: weekend_off_only_enable)와 weekend_off_release/monthly_limit_release 가 반영 안 됨).
+        return generate_roster_service(
+            req, current_user, db,
+            treatment_ids=(getattr(req, "treatment_ids", None) or None),
+            config_override=(getattr(req, "config_override", None) or None),
+            weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
+            monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
+        )
     except HTTPException:
         # 구조화된 infeasibility 페이로드 등 의도된 HTTPException은 그대로 전파
         raise

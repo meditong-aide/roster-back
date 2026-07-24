@@ -50,8 +50,9 @@ RELAX_CATALOG: list[dict[str, Any]] = [
     # ── verified 승격(2026-07-20): 기존엔 온톨로지 treatment(verified:false)만 있던 완화들.
     # probe로 추가해 "재solve로 feasible 확인됨"(verified:true) 승격. apply 키는 비-DB-컬럼
     # (솔버 config)이라 apply-resolution이 config_override 경로로 라우팅해야 클릭 적용됨.
-    {"id": "disable_weekend_off_only", "family": "weekend_off", "label_ko": "주말휴무 전용 해제",
-     "apply": lambda c: {"weekend_off_only_enable": False}},
+    # [주말휴무는 config 플래그로 끄지 않는다] weekend_off_only_enable 은 주말휴무자 '전원'의
+    # 주말 강제OFF 를 켜고 끄는 global 정책 플래그다. 주말휴무는 개인 속성이므로 완화는
+    # per-nurse(그 간호사만 해제, weekend_off_release)로만 제시한다 → 이 config 레버는 catalog 제외.
     {"id": "disable_ban_n_to_d", "family": "transition", "label_ko": "야간→주간 전이 금지 해제",
      "apply": lambda c: {"ban_n_to_d": False}},
     {"id": "disable_ban_n_to_e", "family": "transition", "label_ko": "야간→저녁 전이 금지 해제",
@@ -73,7 +74,6 @@ TRADEOFF_KO: dict[str, str] = {
     "disable_banned_day_after_eve": "이브닝 다음날 데이 전이가 생길 수 있습니다.",
     "lower_off_days": "월 휴무일이 줄어듭니다.",
     "disable_preceptee_sync": "프리셉티가 프리셉터와 동반(팔로우)하지 않게 됩니다(교육 동반 약화).",
-    "disable_weekend_off_only": "주말휴무 대상자가 평일에도 OFF를 받거나 주말에 근무할 수 있습니다.",
     "disable_ban_n_to_d": "야간 다음날 주간 전이가 생길 수 있습니다.",
     "disable_ban_n_to_e": "야간 다음날 저녁 전이가 생길 수 있습니다.",
     "soften_team_min": "특정 시프트에서 팀 인원이 최소치보다 1~2명 부족할 수 있습니다(인계 시 주의).",
@@ -254,6 +254,19 @@ def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, A
     return cfg
 
 
+def _mk_combo(members: list[dict[str, Any]], base: dict[str, Any]) -> dict[str, Any]:
+    """콤보 members → 결과 dict(id/label_ko/members[delta])."""
+    return {
+        "id": "combo:" + "+".join(m["id"] for m in members),
+        "label_ko": " + ".join(m["label_ko"] for m in members),
+        "members": [
+            {"id": m["id"], "family": m["family"], "label_ko": m["label_ko"],
+             "delta": m["apply"](base)}
+            for m in members
+        ],
+    }
+
+
 def _find_combo(
     base: dict[str, Any],
     resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
@@ -261,23 +274,36 @@ def _find_combo(
     *,
     max_size: int,
     logger: Callable[[str], None],
+    priority_families: list[str] | None = None,
+    first_hit: bool = True,
 ) -> list[dict[str, Any]] | None:
-    """단일완화로 못 풀 때: 크기 2부터 max_size 까지 **전수(combinations)** 로 탐색.
+    """단일완화로 못 풀 때: 크기 2부터 max_size 까지 조합 탐색.
     단일이 모두 실패했으므로, 가장 작은 크기에서 feasible 한 조합은 자동으로 irreducible
-    최소조합이다(black-box MCS). 같은 크기에서 여럿이면 침습도(카탈로그 순서) 합이 가장
-    낮은 것을 고른다. greedy-순서 누적은 뒤쪽 레버가 필요한 조합을 놓치므로 쓰지 않는다."""
+    최소조합이다(black-box MCS).
+
+    속도: priority_families(온톨로지 병목)로 후보를 앞으로 정렬하고, first_hit 이면 첫 feasible
+    조합에서 즉시 종료한다(전수 C(n,2)=수십~백회 → 대개 수회). 정렬로 관련 레버가 앞이라
+    첫 hit 이 곧 최소침습에 가깝다. first_hit=False 면 기존 전수+최소침습 선택.
+    """
     import itertools
 
     # 실제 변화가 있는(non-noop) 후보만
     cands = [it for it in catalog
              if not all(base.get(k) == v for k, v in it["apply"](base).items())]
-    idx = {id(it): i for i, it in enumerate(cands)}  # 침습도 proxy = 카탈로그 순서
+    idx = {id(it): i for i, it in enumerate(cands)}  # 침습도 proxy = 원래 카탈로그 순서
+    if priority_families:
+        _fr = {f: i for i, f in enumerate(priority_families)}
+        # 우선군 먼저, 그 안에선 원래(침습도) 순서
+        cands = sorted(cands, key=lambda it: (_fr.get(it.get("family"), 10**6), idx[id(it)]))
     for size in range(2, max(2, max_size) + 1):
         feasible_combos: list[tuple[int, tuple]] = []
         for combo in itertools.combinations(cands, size):
             ok, _ = resolve_fn(_apply_set(base, list(combo)))
             logger(f"[UndiagProbe][combo-{size}] {[c['id'] for c in combo]} feasible={ok}")
             if ok:
+                if first_hit:
+                    logger(f"[UndiagProbe][combo-{size}] 첫 해결 조합 확보 → 조기 종료")
+                    return list(combo)
                 feasible_combos.append((sum(idx[id(c)] for c in combo), combo))
         if feasible_combos:
             feasible_combos.sort(key=lambda x: x[0])  # 최소 침습 조합
@@ -354,6 +380,9 @@ def probe_relaxations(
     try_combo: bool = True,
     max_combo: int = 3,
     search_budget: int = 12,
+    priority_families: list[str] | None = None,
+    stop_after: int | None = None,
+    hard_filter: bool = False,
     logger: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """결합제약을 하나씩 완화해 resolve_fn 으로 feasible 여부를 실측.
@@ -367,6 +396,20 @@ def probe_relaxations(
         }
     """
     cat = catalog if catalog is not None else RELAX_CATALOG
+    # ── 온톨로지 소프트정렬 ──
+    #   presolve(max-flow) 가 지목한 병목 완화군(priority_families)을 앞으로 당겨 먼저 검증하고,
+    #   거기서 해결책이 나오면 나머지는 생략(soft early-stop). 못 찾으면 나머지도 폴백 검증
+    #   → 완결성은 오늘과 동일, 흔한 케이스는 재solve 수↓. priority 없으면 기존 순서 그대로.
+    _n_prio = 0
+    if priority_families:
+        _fam_rank = {f: i for i, f in enumerate(priority_families)}
+        _prio = [it for it in cat if it.get("family") in _fam_rank]
+        _prio.sort(key=lambda it: _fam_rank.get(it.get("family"), 999))
+        _rest = [it for it in cat if it.get("family") not in _fam_rank]
+        cat = _prio + _rest
+        _n_prio = len(_prio)
+        if _prio:
+            logger(f"[UndiagProbe] 온톨로지 우선 완화군 {[it['id'] for it in _prio]} 먼저 검증(soft)")
     prev_env = os.environ.get("FB_VERIFY_SKIP_STAGE3")
     if verify:
         os.environ["FB_VERIFY_SKIP_STAGE3"] = "1"
@@ -374,8 +417,37 @@ def probe_relaxations(
     resolutions: list[dict[str, Any]] = []
     combo: dict[str, Any] | None = None
     _remaining = int(search_budget)
+    _hard_combo_done = False
     try:
-        for item in cat:
+        for _idx, item in enumerate(cat):
+            _feas_so_far = sum(1 for r in all_probed if r.get("feasible"))
+            # stop_after: 검증된 해결책이 목표치만큼 모이면 즉시 종료(필요한 만큼만 probe).
+            if stop_after and _feas_so_far >= stop_after:
+                logger(f"[UndiagProbe] 해결책 {_feas_so_far}건 확보(stop_after={stop_after}) → 조기 종료")
+                break
+            # 우선 완화군을 다 검증한 경계(_idx == _n_prio).
+            if _n_prio and _idx == _n_prio:
+                if _feas_so_far:
+                    # soft: 우선군 단일 중 하나라도 풀리면 나머지 생략(resolutions 는 루프 후 집계라
+                    # 여기선 all_probed 의 feasible 로 판정).
+                    logger(f"[UndiagProbe] 우선군에서 해결책 {_feas_so_far}건 확보 "
+                           f"→ 나머지 {len(cat) - _n_prio}개 완화 생략(soft)")
+                    break
+                if hard_filter and not _hard_combo_done:
+                    # hard-filter(온톨로지 압박 신뢰): 우선군 단일이 다 실패해도, 나머지 단일로
+                    # 가기 전에 우선군끼리의 콤보를 먼저 시도. 성공하면 종료(나머지 전부 생략),
+                    # 실패해야만 나머지 단일+전체 콤보로 전수 폴백(완결성 보존).
+                    _hard_combo_done = True
+                    _pm = _find_combo(
+                        base_config, resolve_fn, cat[:_n_prio], max_size=max_combo,
+                        logger=logger, priority_families=priority_families, first_hit=True)
+                    if _pm:
+                        combo = _mk_combo(_pm, base_config)
+                        logger("[UndiagProbe] 압박군 콤보로 해결 "
+                               "→ 나머지 단일/전체콤보 생략(hard-filter)")
+                        break
+                    logger("[UndiagProbe] 압박군(단일+콤보) 미해결 "
+                           "→ 나머지 완화 전수 폴백(hard-filter)")
             spec = item.get("search")
             # ── 단조 노브: 고정 델타 대신 최소침습 feasible 값 이분탐색 ──
             if spec and _remaining > 0:
@@ -430,19 +502,15 @@ def probe_relaxations(
             {k: r[k] for k in ("id", "family", "label_ko", "delta", "info")}
             for r in all_probed if r["feasible"]
         ]
-        # 단일완화로 못 풀면 최소조합(black-box MCS) 탐색
-        if not resolutions and try_combo:
-            members = _find_combo(base_config, resolve_fn, cat, max_size=max_combo, logger=logger)
+        # 단일완화로 못 풀면 최소조합(black-box MCS) 탐색.
+        # combo 가 이미 있으면(hard-filter 우선군 콤보로 해결) 재탐색 생략.
+        if not resolutions and try_combo and combo is None:
+            members = _find_combo(
+                base_config, resolve_fn, cat, max_size=max_combo, logger=logger,
+                priority_families=priority_families, first_hit=True,
+            )
             if members:
-                combo = {
-                    "id": "combo:" + "+".join(m["id"] for m in members),
-                    "label_ko": " + ".join(m["label_ko"] for m in members),
-                    "members": [
-                        {"id": m["id"], "family": m["family"], "label_ko": m["label_ko"],
-                         "delta": m["apply"](base_config)}
-                        for m in members
-                    ],
-                }
+                combo = _mk_combo(members, base_config)
     finally:
         if verify:
             if prev_env is None:
