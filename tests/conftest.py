@@ -125,7 +125,15 @@ def engine():
 
 @pytest.fixture
 def db(engine) -> Session:
-    """Provide a transactional DB session that rolls back after each test."""
+    """Provide a transactional DB session that rolls back after each test.
+
+    격리 이중화(StaticPool 단일 in-memory conn 공유):
+      1) 정상 케이스는 transaction.rollback() 으로 테스트 변경 되돌림.
+      2) 코드가 SessionLocal 등으로 **commit** 해 트랜잭션을 escape 하면(예: seed_data 의
+         db.commit(), DAG 병렬세션) 그 행은 rollback 으로 안 지워지고 **다음 테스트 seed 와
+         PK 충돌**(shift_manage UNIQUE 등). 그래서 종료 시 전 테이블을 비우고 commit 해
+         하드 격리한다(FK OFF 라 삭제 순서 무관). 이것이 풀스위트 교차오염(23 errors)의 근본 수정.
+    """
     connection = engine.connect()
     transaction = connection.begin()
     session = Session(bind=connection)
@@ -133,7 +141,14 @@ def db(engine) -> Session:
     yield session
 
     session.close()
-    transaction.rollback()
+    try:
+        transaction.rollback()
+    except Exception:  # 이미 commit 으로 deassociated 됐을 수 있음 — 아래 하드 정리로 커버
+        pass
+    # 하드 정리: escape 한 커밋 행까지 확정 삭제(persisted) → 다음 테스트는 빈 스키마에서 시작.
+    with connection.begin():
+        for table in reversed(_REQUIRED_TABLES):
+            connection.execute(table.delete())
     connection.close()
 
 
