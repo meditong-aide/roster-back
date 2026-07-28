@@ -105,7 +105,7 @@ def test_fetch_periods_empty_ids(db):
 # ── 단방향 캐시 투영 ────────────────────────────────────────────────────────
 def test_projection_past_effective_updates_cache(db):
     nurse = Nurse(nurse_id="p1", account_id="acc_p1", name="투영", group_id=None,
-                  is_weekend_off=False)
+                  )
     db.add(nurse); db.flush()
     # valid_from <= today → 컬럼 투영됨
     upsert_period(db, NurseWeekendOffPeriod, "p1", date(2026, 1, 1),
@@ -116,13 +116,14 @@ def test_projection_past_effective_updates_cache(db):
 
 def test_projection_future_effective_skips_cache(db):
     nurse = Nurse(nurse_id="p2", account_id="acc_p2", name="미래", group_id=None,
-                  is_weekend_off=0)
+                  )
     db.add(nurse); db.flush()
-    # valid_from > today → 컬럼 미투영(일일 roll job 이 발효일에 처리)
+    # valid_from > today → as-of 발효 전엔 미반영(주말휴무 컬럼 언매핑 → period 로 검증)
     upsert_period(db, NurseWeekendOffPeriod, "p2", date(2026, 9, 1),
-                  "weekend_off", 1, nurse=nurse, cache_attr="is_weekend_off",
-                  today=date(2026, 7, 1))
-    assert nurse.is_weekend_off == 0             # 안 바뀜
+                  "weekend_off", 1, today=date(2026, 7, 1))
+    from services.nurse_period_resolver import is_weekend_off_asof
+    assert is_weekend_off_asof(db, "p2", date(2026, 7, 1)) is False   # 발효 전
+    assert is_weekend_off_asof(db, "p2", date(2026, 9, 1)) is True    # 발효 후
 
 
 # ── ward-aware (group_id 있는 grade) ────────────────────────────────────────

@@ -19,7 +19,7 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1", name="n1",
-                 active=1, is_weekend_off=False, allowed_shifts=["D", "E", "N"], grade=1))
+                 active=1, allowed_shifts=["D", "E", "N"], grade=1))
     # 8월부터 야간만(["N"])로 발효되는 미래 변경
     db.add(NurseAllowedShiftPeriod(
         nurse_id="n1", valid_from=date(2026, 8, 1), valid_to=None,

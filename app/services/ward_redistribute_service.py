@@ -545,7 +545,7 @@ def preview_ward_redistribution(
         "moves": moves,
         "num_moved": len(moves),
         "pairs": pairs,
-        "pool_roster": _build_pool_roster(pool, include_group=True),
+        "pool_roster": _build_pool_roster(pool, include_group=True, preceptor_asof=_pre_asof_pairs),
         "stats": {
             "objective": result.objective,
             "overlap_total": result.overlap_total,

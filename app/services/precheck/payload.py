@@ -277,6 +277,28 @@ def has_blocking_issues(precheck_result: Dict[str, Any]) -> bool:
     return False
 
 
+def _default_ui_text() -> Dict[str, str]:
+    """모달 chrome(제목·섹션 헤더·버튼) 문구 단일 소스.
+
+    프론트는 `infeasibility.ui_text.<key>` 가 있으면 그걸, 없으면 자체 기본값을 쓴다
+    (하위호환). 카피를 한 곳에서 관리하기 위해 백엔드가 함께 내려준다.
+    '실패/불가능/에러' 같은 단어는 쓰지 않는다.
+    """
+    return {
+        "title": "조건변경필요: 지금 조건으로는 근무표 생성이 어렵습니다.",
+        "description": "아래에서 해결 방법을 고르면 그대로 다시 만들어 드려요. 그냥 닫으면 이 결과는 사라져요.",
+        # {n} = 프론트가 실제 렌더한 옵션 개수로 치환(dedup/필터 후 개수와 정합 위해 프론트에서 대체).
+        "options_header": "아래 {n}가지 중에 선택하여 조정하시면 근무표가 생성될 수 있습니다.",
+        "verified_badge": "확인됨",
+        "apply_button": "이 방법으로 다시 생성",
+        "manual_after_edit": "위 위치에서 직접 수정한 뒤 다시 만들어 주세요.",
+        "causes_header": "직접 수정이 필요한 항목",
+        "issues_header": "확인된 항목",
+        "suggestions_header": "이렇게 조정해 보세요",
+        "close_button": "닫기",
+    }
+
+
 def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
     """Precheck blocking 케이스의 응답 페이로드(HTTP 500 detail로 사용).
 
@@ -290,7 +312,7 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
     summary = (
         issues[0].get("human_message_ko")
         if issues
-        else "사용자 입력만으로 산술적으로 근무표를 만들 수 없습니다."
+        else "지금 설정 조합으로는 근무표를 만들 수 없습니다. 아래 항목을 조정해 주세요."
     )
     fix_suggestions: List[str] = []
     seen = set()
@@ -341,10 +363,23 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
         _resolution_options = treatments_to_resolution_options(treatment_recommendations)
     except Exception:
         _resolution_options = []
+    # 사용자 설정(연속근무 상한 등)이 산술 차단의 원인이면 그 값을 올리는 auto 옵션을
+    # 앞에 추가하고, 해당 원인의 '간호사 추가'(수동) 오안내는 제거(자동 해결 가능하므로).
+    try:
+        from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+        _lever = config_lever_options_from_issues(issues)
+        if _lever:
+            for _c in causes:
+                if str(_c.get("reason_code") or "").upper() == "CAPACITY_TOTAL_SHORTAGE":
+                    _c.pop("fix", None)
+            _resolution_options = _lever + _resolution_options
+    except Exception:
+        pass
 
     return {
         "infeasibility": {
             "severity": "blocking",
+            "ui_text": _default_ui_text(),
             "summary_message_ko": summary,
             "preflight_issues": issues,
             "applied_relaxations": [],
@@ -520,13 +555,26 @@ def build_unrecoverable_payload(
         _resolution_options = treatments_to_resolution_options(treatment_recommendations)
     except Exception:
         _resolution_options = []
+    # 사용자 설정(연속근무 상한 등)이 산술 차단의 원인이면 그 값을 올리는 auto 옵션을
+    # 앞에 추가하고, 해당 원인의 '간호사 추가'(수동) 오안내는 제거(자동 해결 가능하므로).
+    try:
+        from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+        _lever = config_lever_options_from_issues(issues)
+        if _lever:
+            for _c in causes:
+                if str(_c.get("reason_code") or "").upper() == "CAPACITY_TOTAL_SHORTAGE":
+                    _c.pop("fix", None)
+            _resolution_options = _lever + _resolution_options
+    except Exception:
+        pass
 
     return {
         "infeasibility": {
             "severity": "blocking",
+            "ui_text": _default_ui_text(),
             "summary_message_ko": (
-                "근무표 자동 완화(soft fallback)까지 시도했지만 해를 찾지 못했습니다. "
-                "제약 설정을 점검해주세요."
+                "일부 조건을 완화해 최대한 맞춰 봤지만, 지금 설정 조합으로는 근무표를 "
+                "만들 수 없습니다. 아래 항목을 조정해 주세요."
             ),
             "preflight_issues": issues,
             "applied_relaxations": list(applied_relaxations or []),

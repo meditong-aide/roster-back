@@ -39,6 +39,16 @@ def _allowed_value(n: Nurse):
 # 속성별 스펙: model · 값컬럼 · ward귀속 · nurses캐시컬럼(투영) · nurses→value 변환(backfill용)
 #   · carry_attrs: 같은 satellite 의 형제 value 컬럼(새 구간 열 때 carry-forward)
 # allowed_shifts 와 fixed_shift 는 한 테이블(nurse_allowed_shift_period)의 두 컬럼 = 결합 satellite.
+def _weekend_off_backfill_value(n) -> int:
+    """backfill 시 주말휴무 값 — 현재 period(as-of today)를 읽어 멱등 보존. 컬럼 미조회."""
+    from sqlalchemy.orm import object_session
+    from services.nurse_period_resolver import is_weekend_off_asof
+    _db = object_session(n)
+    if _db is None:
+        return 0
+    return 1 if is_weekend_off_asof(_db, n.nurse_id) else 0
+
+
 _ATTR_SPECS: dict[str, dict] = {
     "allowed_shifts": dict(model=NurseAllowedShiftPeriod, value_attr="allowed_shifts",
                            group_bound=False, cache_attr="allowed_shifts",
@@ -47,9 +57,12 @@ _ATTR_SPECS: dict[str, dict] = {
                         group_bound=False, cache_attr="fixed_shift",
                         value_fn=lambda n: getattr(n, "fixed_shift", None),
                         carry_attrs=["allowed_shifts"]),
+    # 주말휴무: SSOT=period, nurses.is_weekend_off 컬럼 언매핑됨.
+    #   cache_attr 없음(투영 안 함). backfill value_fn 은 현재 period 값을 읽어 멱등(재백필 시
+    #   기존 값 보존, 컬럼 미조회). _weekend_off_backfill_value 참조.
     "weekend_off": dict(model=NurseWeekendOffPeriod, value_attr="weekend_off",
-                        group_bound=False, cache_attr="is_weekend_off",
-                        value_fn=lambda n: 1 if getattr(n, "is_weekend_off", False) else 0),
+                        group_bound=False,
+                        value_fn=lambda n: _weekend_off_backfill_value(n)),
     "grade": dict(model=NurseGradePeriod, value_attr="grade",
                   group_bound=True, cache_attr="grade",
                   value_fn=lambda n: getattr(n, "grade", None)),
@@ -174,7 +187,7 @@ async def change_nurse_period(
         db, spec["model"], payload.nurse_id, payload.valid_from,
         spec["value_attr"], payload.value,
         group_id=group_id if spec["group_bound"] else None,
-        nurse=nurse, cache_attr=spec["cache_attr"], source="edited",
+        nurse=nurse, cache_attr=spec.get("cache_attr"), source="edited",
         carry_attrs=spec.get("carry_attrs"),
     )
     db.commit()
@@ -242,12 +255,15 @@ async def roll_nurse_cache(
             group_id=group_id if spec["group_bound"] else None,
         ) if nurse_ids else {}
         for nid, rows in by_nurse.items():
+            _ca = spec.get("cache_attr")
+            if _ca is None:
+                continue                       # 캐시 없는 속성(주말휴무 등)은 roll 불필요(period fresh 읽음)
             val = resolve_asof(rows, as_of, spec["value_attr"], default=None)
             if val is None:
                 continue                       # gap → 캐시 유지
             n = nurse_by_id.get(nid)
-            if n is not None and getattr(n, spec["cache_attr"], None) != val:
-                setattr(n, spec["cache_attr"], val)
+            if n is not None and getattr(n, _ca, None) != val:
+                setattr(n, _ca, val)
                 updated[a] += 1
     db.commit()
 

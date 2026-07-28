@@ -45,14 +45,17 @@ def seeded(db):
                  name="수간", active=0, is_head_nurse=True, hn_auth="HN", allowed_shifts=[]))
     # 대상 간호사 3명 — 서로 다른 속성값
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1", name="n1",
-                 active=1, grade=1, allowed_shifts=["N"], is_weekend_off=True,
-                 fixed_shift=None))
+                 active=1, grade=1, allowed_shifts=["N"],                  fixed_shift=None))
     db.add(Nurse(nurse_id="n2", account_id="acc_n2", group_id="A", office_id="o1", name="n2",
-                 active=1, grade=2, allowed_shifts=[], is_weekend_off=False,
-                 fixed_shift="D_A"))
+                 active=1, grade=2, allowed_shifts=[],                  fixed_shift="D_A"))
     # active=0 은 제외돼야 함
     db.add(Nurse(nurse_id="nx", account_id="acc_nx", group_id="A", office_id="o1", name="nx",
-                 active=0, grade=3, allowed_shifts=[], is_weekend_off=False))
+                 active=0, grade=3, allowed_shifts=[]))
+    db.flush()
+    # 주말휴무는 컬럼 언매핑 → SSOT=period. n1 은 주말휴무 대상(현재 유효)으로 period 시드.
+    from db.models import NurseWeekendOffPeriod as _NWOP
+    from services.nurse_period_resolver import upsert_period as _up
+    _up(db, _NWOP, "n1", date(2026, 1, 1), "weekend_off", 1)
     db.flush()
     return db
 

@@ -145,6 +145,7 @@ def build_nurse_day_states(*, snapshot: SemanticsSnapshot, atoms_by_nurse_day: d
                     recovery_off_required_after_day=recovery,
                     fatigue_score=fatigue_score,
                     recovery_debt=recovery_debt,
+                    # TODO(weekend-period): period as-of 로 전환 필요(호출측 db 주입)
                     weekend_only_active=nurse.is_weekend_off,
                     n_forbidden=nurse.nurse_index in snapshot.n_forbid_n,
                     off_count_nonvac_so_far=off_count,

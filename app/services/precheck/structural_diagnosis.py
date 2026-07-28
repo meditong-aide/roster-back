@@ -9,19 +9,11 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 
-_STRUCTURAL_CODES = {
-    "NO_ASSIGNMENT",
-    "GRADE_MIN_SUM_EXCEEDS_NEED",
-    "TEAM_MIN_EXCEEDS_GLOBAL_NEED",
-    "GRADE_ANTIPAIR_FORCES_SHORTAGE",
-    "CAPACITY_TOTAL_SHORTAGE",
-    "GLOBAL_DAY_CAPACITY_SHORTAGE",
-    "GLOBAL_SHIFT_ALLOWED_SHORTAGE",
-    "TEAM_ACTIVE_MEMBERS_INSUFFICIENT",
-    "TEAM_SHIFT_ALLOWED_SHORTAGE",
-    "GRADE_MAX_SUM_BELOW_NEED",
-    "GRADE_MIN_AVAILABLE_SHORTAGE",
-}
+# NOTE(2026-07-22): 'capacity_structural' 라벨 제거.
+#   NO_ASSIGNMENT(=배치 0건)은 infeasible 의 '결과/증상'인데 이게 구조 '원인'으로 둔갑해
+#   primary_causes 를 채우고, 그 때문에 진짜 진단(UNDIAGNOSED probe)이 스킵되던 버그의 원흉.
+#   genuine capacity 부족은 precheck(CAPACITY_TOTAL_SHORTAGE 등)이 이미 구체 메시지+해결책을
+#   주므로 이 뭉뚱그린 라벨은 사용자 가치 0. 그래서 append 와 _STRUCTURAL_CODES 를 삭제한다.
 
 _ROLE_CODES = {
     "ALLOWED_SHIFTS_ISOLATES_NURSE",
@@ -87,8 +79,7 @@ def build_structural_diagnosis(
     }
 
     causes: List[str] = []
-    if codes & _STRUCTURAL_CODES or shortages:
-        causes.append("capacity_structural")
+    # 'capacity_structural' 은 결과-라벨이라 제거(위 NOTE 참조). 실제 원인 후보만 남긴다.
     if codes & _ROLE_CODES or any("allowed_shift_mask" in p or "n_only_vs_caps" in p for p in patterns):
         causes.append("role_isolation")
     if codes & _FIXED_CODES or any("fixed_assignment" in p or "initial_forbidden" in p for p in patterns):

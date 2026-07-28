@@ -22,7 +22,7 @@ def seeded(db):
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1",
                  name="n1", active=1, allowed_shifts=[], fixed_shift=None,
-                 is_weekend_off=False))
+                 ))
     db.flush()
     return db
 
@@ -48,4 +48,6 @@ def test_weekend_off_redirects_to_period(seeded):
     assert len(rows) == 1
     assert rows[0].weekend_off == 1
     assert rows[0].valid_from == date.today() and rows[0].valid_to is None
-    assert bool(db.query(Nurse).filter_by(nurse_id="n1").first().is_weekend_off) is True
+    # 컬럼 캐시 제거 — period(as-of today) 로 검증.
+    from services.nurse_period_resolver import is_weekend_off_asof
+    assert is_weekend_off_asof(db, "n1") is True

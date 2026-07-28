@@ -57,6 +57,7 @@ class Nurse:
             team_id=getattr(db_nurse, "team_id", None),
             allowed_shifts=db_nurse.allowed_shifts,
             is_head_nurse=db_nurse.is_head_nurse,
+            # TODO(weekend-period): period as-of 로 전환 필요(호출측 db 주입)
             is_weekend_off=bool(getattr(db_nurse, "is_weekend_off", False)),
             fixed_shift=getattr(db_nurse, "fixed_shift", None),
             personal_off_adjustment=db_nurse.personal_off_adjustment,

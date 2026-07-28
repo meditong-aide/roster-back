@@ -25,14 +25,18 @@ def _codes(nurses, cfg):
 
 # ── 3b: consecutive-work capacity ceiling (unit) ─────────────────────────────
 def test_working_capacity_consec_ceiling():
-    nurse = PrecheckNurse(nurse_id="n", join_day=0, leave_day=30)  # span 31, off=0
+    nurse = PrecheckNurse(nurse_id="n", join_day=0, leave_day=30)  # span 31
     assert _working_capacity(nurse, {}) == 31                       # 제한 없음
     assert _working_capacity(nurse, {"max_consecutive_work": 1}) == 16   # 31 - 31//2
     assert _working_capacity(nurse, {"max_consecutive_work": 5}) == 26   # 31 - 31//6
-    # off 가 더 조이면 off 가 binding
+    # ★ 개인 월 휴무(off_days/standard)는 엔진 소프트 → hard capacity 를 줄이지 않는다.
+    #   (연속근무 상한만 하드 천장. 8d2c2a9 회귀에서 off 를 하드 감산하던 것을 되돌림)
     n2 = PrecheckNurse(nurse_id="n", join_day=0, leave_day=30)
     assert _working_capacity(n2, {"max_consecutive_work": 10,
-                                  "standard_personal_off_days": 20}) == 11   # min(31-20, 31-31//11=29)
+                                  "standard_personal_off_days": 20}) == 29   # min(31, 31-31//11)
+    assert _working_capacity(n2, {"off_days": 20}) == 31                     # off 소프트 → 감산 안 함
+    # 전사 고정 휴무(global)는 하드로 취급 → 감산
+    assert _working_capacity(n2, {"global_monthly_off_days": 5}) == 26       # 31 - 5
 
 
 # ── 3b: end-to-end ───────────────────────────────────────────────────────────
@@ -56,6 +60,72 @@ def test_loose_conseq_no_false_positive():
     # 넉넉한 인원 + 느슨한 연속근무 → shortage 없어야
     codes = _codes(_nurses(30), _cfg(D=2, E=2, N=2, max_consecutive_work=6))
     assert "CAPACITY_TOTAL_SHORTAGE" not in codes
+
+
+# ── 원인 레버(연속근무 상한이 capacity binding) → 자동 완화 옵션 ─────────────────
+def _issues(nurses, cfg):
+    r = run_runtime_precheck(nurses_dict=nurses, config_dict=cfg, grade_config=None,
+                             fixed_cells=None, year=YEAR, month=MONTH, stop_on_config_error=False)
+    return r.get("issues", [])
+
+
+def _cap_issue(issues):
+    return next((i for i in issues if i.get("reason_code") == "CAPACITY_TOTAL_SHORTAGE"), None)
+
+
+# 20명·mcw=1: capped cap=16/명(320) < need 403 ≤ uncapped 21/명(420) → 상한이 binding.
+# 10명·mcw=1·D=E=N=6: uncapped(210) 도 need(558) 미달 → 진짜 인원부족(레버 아님).
+def test_conseq_cap_binding_evidence_when_lever_is_cause():
+    issues = _issues(_nurses(20), _cfg(D=4, E=4, N=5, max_consecutive_work=1))
+    cap = _cap_issue(issues)
+    assert cap is not None
+    b = (cap.get("evidence") or {}).get("conseq_cap_binding")
+    assert isinstance(b, dict)
+    assert b["config_key"] == "max_conseq_work"
+    assert b["current"] == 1
+    assert b["suggested_value"] is not None and b["suggested_value"] > 1
+
+
+def test_no_binding_when_genuinely_short_of_nurses():
+    issues = _issues(_nurses(10), _cfg(D=6, E=6, N=6, max_consecutive_work=1))
+    cap = _cap_issue(issues)
+    assert cap is not None
+    assert (cap.get("evidence") or {}).get("conseq_cap_binding") is None
+
+
+def test_config_lever_option_built_with_auto_fix():
+    from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+    issues = _issues(_nurses(20), _cfg(D=4, E=4, N=5, max_consecutive_work=1))
+    opts = config_lever_options_from_issues(issues)
+    assert len(opts) == 1
+    o = opts[0]
+    assert o["option_id"] == "lever:max_conseq_work"
+    assert o["apply"]["max_conseq_work"] == o["changes"][0]["suggested_value"]
+    assert o["fix"]["mode"] == "auto_apply"
+    assert o["verified"] is False
+
+
+def test_no_lever_option_when_no_binding():
+    from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+    issues = _issues(_nurses(10), _cfg(D=6, E=6, N=6, max_consecutive_work=1))
+    assert config_lever_options_from_issues(issues) == []
+
+
+# ── off_days(소프트)는 capacity 를 못 바꾼다 → CAPACITY_TOTAL 판정에 영향 없음(회귀 가드) ──
+def test_off_days_does_not_affect_capacity_shortage():
+    # 넉넉한 인원·느슨한 연속근무면 off_days 를 크게 줘도 shortage 안 뜬다(예전엔 뜸=버그).
+    codes = _codes(_nurses(30), _cfg(D=2, E=2, N=2, max_consecutive_work=6, off_days=15))
+    assert "CAPACITY_TOTAL_SHORTAGE" not in codes
+
+
+def test_raising_conseq_alone_resolves_off_coupled_case():
+    # 예전 'coupled' 로 오판하던 케이스(off=10 & conseq=2)가 실제론 연속근무 단일 레버로 풀린다.
+    issues = _issues(_nurses(20), _cfg(D=5, E=4, N=5, max_consecutive_work=2, off_days=10))
+    cap = _cap_issue(issues)
+    assert cap is not None
+    b = (cap.get("evidence") or {}).get("conseq_cap_binding")
+    assert isinstance(b, dict)                 # 단일 노브(연속근무)로 풀림
+    assert b["current"] == 2 and b["suggested_value"] > 2
 
 
 # ── 3a: per-nurse night cap ──────────────────────────────────────────────────

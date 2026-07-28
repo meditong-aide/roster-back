@@ -75,7 +75,7 @@ def test_weekend_and_fixed_show_asof_month(seeded):
 
 
 def test_nurses_base_fields_overwritten_by_asof(seeded):
-    db = seeded  # 캐시: grade=2, is_weekend_off=False, fixed_shift=None, allowed_shifts=[]
+    db = seeded  # 캐시: grade=2, fixed_shift=None, allowed_shifts=[]
     db.add(NurseGradePeriod(nurse_id="n1", group_id="A",
            valid_from=date(2026, 8, 1), valid_to=None, grade=5))
     db.add(NurseWeekendOffPeriod(nurse_id="n1", valid_from=date(2026, 8, 1),

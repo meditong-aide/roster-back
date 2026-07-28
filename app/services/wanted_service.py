@@ -446,7 +446,8 @@ def _compute_weekly_off_days(
         return set()
 
     setting = None
-    if nurse_row.is_weekend_off:
+    from services.nurse_period_resolver import is_weekend_off_asof
+    if is_weekend_off_asof(db, nurse_row.nurse_id):
         preview_weekday = 6
     else:
         if group_id:

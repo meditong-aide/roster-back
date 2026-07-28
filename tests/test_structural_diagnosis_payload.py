@@ -11,7 +11,9 @@ def test_structural_diagnosis_hard_block_from_no_assignment_and_shortage():
         applied_relaxations=["soft_fallback"],
     )
     assert d["mode"] == "hard_block_structural"
-    assert "capacity_structural" in d["primary_causes"]
+    # capacity_structural(결과-라벨) 제거됨. core 패턴(allowed_shift_mask)은 role_isolation 로.
+    assert "capacity_structural" not in d["primary_causes"]
+    assert "role_isolation" in d["primary_causes"]
     assert d["signals"]["shortage_count"] == 1
     assert any("RULE_2_MATCH" in x for x in d["decision_trace"])
 
@@ -38,7 +40,8 @@ def test_structural_diagnosis_hard_impossible_code_boosts_mode():
         applied_relaxations=[],
     )
     assert d["mode"] == "hard_block_structural"
-    assert "capacity_structural" in d["primary_causes"]
+    # capacity_structural 제거 — RULE_1(hard-impossible code)로 mode 만 구조결핍, 원인 라벨은 안 붙음.
+    assert "capacity_structural" not in d["primary_causes"]
     assert "GRADE_MIN_SUM_EXCEEDS_NEED" in d["signals"]["reason_codes"]
     assert any("RULE_1_MATCH" in x for x in d["decision_trace"])
 

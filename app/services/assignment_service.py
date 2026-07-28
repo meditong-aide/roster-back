@@ -1018,6 +1018,7 @@ def group_members_in_month(
     from db.models import NurseTeamPeriod
     from services.team_period import _coerce_team_int
     from services.cp_sat.allowed_shift_types import is_n_only_profile
+    from services.nurse_period_resolver import is_weekend_off_asof
 
     month_start = date(year, month, 1)
     month_end = date(year, month, monthrange(year, month)[1])
@@ -1129,7 +1130,7 @@ def group_members_in_month(
 
     def _asof_weekend(nid: str, n_obj):
         v = _resolve_asof(_weekend_periods.get(nid), month_start, "weekend_off", default=None)
-        return v if v is not None else (1 if getattr(n_obj, "is_weekend_off", False) else 0)
+        return v if v is not None else (1 if is_weekend_off_asof(db, n_obj.nurse_id, month_start) else 0)
 
     def _row(n, status, marker, badge, team, grade, night_profile=...,
              weekend_off=..., fixed_shift=..., resign_date=None):
@@ -1138,7 +1139,7 @@ def group_members_in_month(
         #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
         #   night_profile 미지정(home) 은 base 사용. (생성기는 N전담을 팀 D/E 커버리지에서 제외.)
         _np = getattr(n, "allowed_shifts", None) if night_profile is ... else night_profile
-        _wo = (1 if getattr(n, "is_weekend_off", False) else 0) if weekend_off is ... else weekend_off
+        _wo = (1 if is_weekend_off_asof(db, n.nurse_id, month_start) else 0) if weekend_off is ... else weekend_off
         _fx = getattr(n, "fixed_shift", None) if fixed_shift is ... else fixed_shift
         night_dedicated = is_n_only_profile(_np)
         if night_dedicated and badge is None:
@@ -1552,7 +1553,7 @@ def _apply_target_profile_reset(
     nurse.wanted_max_requests = (
         row.target_wanted_max_requests if row.target_wanted_max_requests is not None else 0
     )
-    nurse.is_weekend_off = False
+    # 주말휴무는 nurse_weekendoff_period(SSOT)가 관리 — 컬럼 직접 쓰기 제거.
 
     detached = db.query(NurseModel).filter(NurseModel.preceptor_id == row.nurse_id).update(
         {NurseModel.preceptor_id: None}, synchronize_session=False

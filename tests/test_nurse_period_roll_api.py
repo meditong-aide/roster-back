@@ -38,7 +38,7 @@ def seeded(db):
     db.add(Nurse(nurse_id="HN", account_id="acc_HN", group_id="A", office_id="o1",
                  name="수간", active=0, is_head_nurse=True, hn_auth="HN", allowed_shifts=[]))
     db.add(Nurse(nurse_id="w1", account_id="acc_w1", group_id="A", office_id="o1",
-                 name="w1", active=1, is_weekend_off=False, grade=2, allowed_shifts=[]))
+                 name="w1", active=1, grade=2, allowed_shifts=[]))
     db.flush()
     return db
 
@@ -57,25 +57,21 @@ def _client(db, user):
 
 def test_roll_applies_effective_change_on_date(seeded):
     db = seeded
+    from services.nurse_period_resolver import is_weekend_off_asof
     # 9/1 부터 weekend_off=1 (미래발효)
     db.add(NurseWeekendOffPeriod(nurse_id="w1", valid_from=date(2026, 9, 1),
            valid_to=None, weekend_off=1))
     db.flush()
+    # 주말휴무는 period 단독(컬럼 캐시 없음) → 발효 판정은 period as-of 로.
+    assert is_weekend_off_asof(db, "w1", date(2026, 8, 31)) is False   # 발효 전(gap)
+    assert is_weekend_off_asof(db, "w1", date(2026, 9, 1)) is True     # 발효
+
+    # roll 은 캐시 없는 속성(주말휴무)엔 no-op — 투영할 컬럼이 없음.
     c = _client(db, _user())
-
-    # as_of 8/31 → 아직 발효 전(gap) → 캐시 그대로
-    r0 = c.post("/nurse-period/roll", json={"group_id": "A", "as_of": "2026-08-31",
-                                            "attributes": ["weekend_off"]})
-    assert r0.status_code == 200
-    assert r0.json()["updated"]["weekend_off"] == 0
-    assert db.query(Nurse).filter_by(nurse_id="w1").first().is_weekend_off in (False, 0)
-
-    # as_of 9/1 → 발효 → 캐시 투영
-    r1 = c.post("/nurse-period/roll", json={"group_id": "A", "as_of": "2026-09-01",
-                                            "attributes": ["weekend_off"]})
-    assert r1.status_code == 200
-    assert r1.json()["updated"]["weekend_off"] == 1
-    assert db.query(Nurse).filter_by(nurse_id="w1").first().is_weekend_off == 1
+    r = c.post("/nurse-period/roll", json={"group_id": "A", "as_of": "2026-09-01",
+                                           "attributes": ["weekend_off"]})
+    assert r.status_code == 200
+    assert r.json()["updated"].get("weekend_off", 0) == 0
 
 
 def test_roll_idempotent(seeded):

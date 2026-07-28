@@ -34,7 +34,7 @@ def client(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1", name="n1",
-                 active=1, is_weekend_off=False, allowed_shifts=[], grade=1))
+                 active=1, allowed_shifts=[], grade=1))
     db.flush()
     app = FastAPI()
     app.include_router(nurses_router)
@@ -70,7 +70,7 @@ def test_detail_and_list_exclusion_partner_month_consistent(client):
     """
     c, db = client
     db.add(Nurse(nurse_id="n2", account_id="acc_n2", group_id="A", office_id="o1",
-                 name="이영희", active=1, is_weekend_off=False, allowed_shifts=[], grade=1))
+                 name="이영희", active=1, allowed_shifts=[], grade=1))
     db.flush()
 
     # 6월 1일 발효로 상호배제 설정

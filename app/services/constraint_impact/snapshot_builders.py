@@ -56,6 +56,7 @@ def _collect_nurse_facts(rs, join: list[int], leave: list[int]) -> list[NurseFac
                 name=str(getattr(nurse, "name", "?")),
                 team_id=None if getattr(nurse, "team_id", None) in (None, "", 0) else str(getattr(nurse, "team_id")),
                 grade=grade_val,
+                # TODO(weekend-period): period as-of 로 전환 필요(호출측 db 주입)
                 is_weekend_off=bool(getattr(nurse, "is_weekend_off", False)),
                 allowed_shift_codes=set(allowed),
                 preceptor_id=_preceptor_id_from_period(rs, idx),

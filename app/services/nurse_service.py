@@ -444,6 +444,7 @@ def get_nurses_in_group_service(
 
     # 결과 변환: NurseProfile과 호환
     result = []
+    from services.nurse_period_resolver import is_weekend_off_asof
     for nurse in nurses:
         allowed_shifts = nurse.allowed_shifts or []
 
@@ -480,7 +481,7 @@ def get_nurses_in_group_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
-            "is_weekend_off": nurse.is_weekend_off,
+            "is_weekend_off": is_weekend_off_asof(db, nurse.nurse_id),
             "work_shifts": nurse.work_shifts
             or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
@@ -655,6 +656,7 @@ def get_nurses_filtered_service(
 
     # 결과 변환: NurseProfile과 호환
     result = []
+    from services.nurse_period_resolver import is_weekend_off_asof
     for nurse in nurses:
         allowed_shifts = nurse.allowed_shifts or []
 
@@ -690,7 +692,7 @@ def get_nurses_filtered_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
-            "is_weekend_off": nurse.is_weekend_off,
+            "is_weekend_off": is_weekend_off_asof(db, nurse.nurse_id),
             "work_shifts": nurse.work_shifts
             or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
@@ -1097,10 +1099,11 @@ def bulk_update_nurses_service(
             from datetime import date as _date
             from db.models import NurseWeekendOffPeriod
             from services.nurse_period_resolver import upsert_period
+            # 컬럼 캐시 투영 제거 — nurses.is_weekend_off 를 더 이상 쓰지 않음(period 단독 SSOT).
             upsert_period(
                 db, NurseWeekendOffPeriod, db_nurse.nurse_id, _effective_vf,
                 "weekend_off", 1 if update_data["is_weekend_off"] else 0,
-                nurse=db_nurse, cache_attr="is_weekend_off", source="edited",
+                source="edited",
             )
 
         # === 후처리: work_shifts (None → 빈 배열) ===
@@ -2185,11 +2188,11 @@ def _persist_profile_period_change(
             carry_attrs=["allowed_shifts"],
         )
     if "is_weekend_off" in fields:
-        # 주말휴무(group 무관 전역 속성) → nurse_weekendoff_period. 캐시 투영 OK.
+        # 주말휴무(group 무관 전역 속성) → nurse_weekendoff_period 단독. 컬럼 캐시 투영 제거.
         upsert_period(
             db, NurseWeekendOffPeriod, str(nurse_id), vf, "weekend_off",
             1 if fields["is_weekend_off"] else 0,
-            nurse=nurse, cache_attr="is_weekend_off", source=source,
+            source=source,
         )
 
 

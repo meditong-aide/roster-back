@@ -31,7 +31,8 @@ def _is_night_only(n: NurseModel) -> bool:
 
 
 def _build_pool_roster(
-    nurses: list[NurseModel], include_group: bool = False
+    nurses: list[NurseModel], include_group: bool = False,
+    preceptor_asof: Optional[dict] = None,
 ) -> list[dict]:
     """참여 선택 로스터 — 간호사별 grade/프리셉터/근무코드.
 
@@ -39,9 +40,19 @@ def _build_pool_roster(
     preceptor_name: 프리셉티면 그 프리셉터 이름(같은 풀 내).
     is_preceptor: 이 간호사를 프리셉터로 둔 프리셉티가 풀에 있으면 True.
     옵션1/2 공용 — HN 이 /nurses 로 타 병동 nurse 를 못 읽어 preview 가 운반한다.
+
+    preceptor_asof: nurse_id→preceptor_id(nurse_preceptee_period SSOT as-of 대상월) 맵.
+        주면 이걸로 preceptor 해석(캐시 nurses.preceptor_id 안 봄 → 종료월 stale 방지).
+        None 이면 캐시 폴백(레거시 무회귀).
     """
-    name_by = {n.nurse_id: n.name for n in nurses}
-    preceptor_ids = {n.preceptor_id for n in nurses if n.preceptor_id}
+    name_by = {str(n.nurse_id): n.name for n in nurses}
+
+    def _ptor(n: NurseModel) -> Optional[str]:
+        pid = preceptor_asof.get(str(n.nurse_id)) if preceptor_asof is not None else n.preceptor_id
+        return str(pid) if pid not in (None, "", 0) else None
+
+    ptor_by = {str(n.nurse_id): _ptor(n) for n in nurses}
+    preceptor_ids = {pid for pid in ptor_by.values() if pid}
 
     def _shift(n: NurseModel) -> str:
         s = n.allowed_shifts or []
@@ -49,14 +60,15 @@ def _build_pool_roster(
 
     out: list[dict] = []
     for n in nurses:
+        _pid = ptor_by[str(n.nurse_id)]
         m = {
             "nurse_id": n.nurse_id,
             "name": n.name,
             "grade": n.grade,
             "shift": _shift(n),
             "is_night": (n.allowed_shifts or []) == ["N"],
-            "preceptor_name": name_by.get(n.preceptor_id) if n.preceptor_id else None,
-            "is_preceptor": n.nurse_id in preceptor_ids,
+            "preceptor_name": name_by.get(_pid) if _pid else None,
+            "is_preceptor": str(n.nurse_id) in preceptor_ids,
         }
         if include_group:
             m["group_id"] = n.group_id
@@ -299,7 +311,7 @@ def preview_team_classification(
 
     # 참여 선택 로스터 — 전체 활성 간호사 + grade/프리셉터/근무코드.
     # 프론트가 group_id 로 nurse 를 직접 못 읽는 경우(HN 권한)가 있어 preview 가 운반.
-    pool_roster = _build_pool_roster(all_nurses)
+    pool_roster = _build_pool_roster(all_nurses, preceptor_asof=_pre_asof)
     warnings: list[str] = []
     for p in pairs:
         if p["status"] == "split":

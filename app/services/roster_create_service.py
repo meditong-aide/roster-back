@@ -265,17 +265,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             .first()
         )
 
-        target_wr = submitted_wr or (
-            db.query(WantedRequest)
-            .filter(
-                WantedRequest.nurse_id == nurse_id,
-                WantedRequest.month == month_str,
-            )
-            .order_by(WantedRequest.created_at.asc())
-            .first()
-        )
+        # 제출된 원티드만 반영 — 미제출 draft 폴백 제거.
+        # (미제출=미반영 정합. fixed_wanted_entries 의 노출여부/제출상태와 일치시켜,
+        #  화면상 "미제출"인 원티드가 생성에 하드고정으로 새어들어가는 불일치를 차단.)
+        target_wr = submitted_wr
         if not target_wr:
-            continue  # 기록이 없는 간호사는 건너뜀
+            continue  # 제출된 원티드가 없는 간호사는 건너뜀(미제출 draft 미반영)
 
         # 3️⃣ shift 데이터 수집
         shift_rows = (
@@ -1111,42 +1106,24 @@ def _compute_weekly_off_day_indices_for_month(
     # 간호사 주휴 요일 조회
     # weekly_off_enabled 컬럼은 선택(없어도 weekday null 여부로 판단)
     has_enabled_col = _column_exists(db, "nurses", "weekly_off_enabled")
-    has_weekend_off_col = _column_exists(db, "nurses", "is_weekend_off")
+    # 주말휴무(is_weekend_off)는 더 이상 컬럼에서 안 읽는다 — SSOT=nurse_weekendoff_period.
     try:
         if has_enabled_col:
-            if has_weekend_off_col:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday, is_weekend_off "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT nurse_id, name, weekly_off_enabled, weekly_off_weekday "
+                    "FROM nurses WHERE group_id = :group_id AND active = 1"
+                ),
+                {"group_id": group_id},
+            ).fetchall()
         else:
-            if has_weekend_off_col:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_weekday, is_weekend_off "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, name, weekly_off_weekday "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": group_id},
-                ).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT nurse_id, name, weekly_off_weekday "
+                    "FROM nurses WHERE group_id = :group_id AND active = 1"
+                ),
+                {"group_id": group_id},
+            ).fetchall()
     except Exception as e:
         warnings.append({"type": "nurses_query_failed", "detail": str(e)})
         return nurse_to_days, warnings
@@ -1162,6 +1139,12 @@ def _compute_weekly_off_day_indices_for_month(
             if str(getattr(_n, "nurse_id", "")) not in _wo_existing_ids
         ]
 
+    # 주말휴무 대상 = nurse_weekendoff_period(as-of month)에서 해석. 컬럼 미의존.
+    from services.nurse_period_resolver import weekend_off_ids_asof
+    _wids = weekend_off_ids_asof(
+        db, [str(getattr(_r, "nurse_id", "")) for _r in rows], year, month
+    )
+
     for r in rows:
         nurse_id = str(r.nurse_id)
         name = str(r.name)
@@ -1169,8 +1152,7 @@ def _compute_weekly_off_day_indices_for_month(
         if has_enabled_col:
             enabled = bool(getattr(r, "weekly_off_enabled", 0))
         # 주말 고정 휴무 대상일 때만 "주휴 요일은 주말"을 강제한다.
-        # - 컬럼이 없으면(레거시 DB) False로 간주하여 기존 동작(에러 없음)을 유지한다.
-        is_weekend_off = bool(getattr(r, "is_weekend_off", 0)) if has_weekend_off_col else False
+        is_weekend_off = nurse_id in _wids
 
         base_weekday = getattr(r, "weekly_off_weekday", None)
         # ── 주말 휴무 대상 처리(백그라운드 강제 정책) ──
@@ -1288,11 +1270,7 @@ def _compute_weekly_off_day_indices_for_month(
             )
         nurse_to_days[nurse_id] = set(_weekday_dates_in_month(year, month, month_weekday))
 
-    weekend_off_only = {
-        str(r.nurse_id)
-        for r in rows
-        if has_weekend_off_col and bool(getattr(r, "is_weekend_off", 0))
-    }
+    weekend_off_only = {str(r.nurse_id) for r in rows if str(r.nurse_id) in _wids}
     if weekend_off_only:
         print(f"[WeeklyOff] 주말 휴무 대상 간호사 수={len(weekend_off_only)}")
     return nurse_to_days, warnings
@@ -1984,13 +1962,9 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
     # 간호사별 is_weekend_off 정보 조회 (주말 휴무 대상자 필터링용)
     weekend_off_nurse_ids: set[str] = set()
     try:
-        from db.models import Nurse as NurseModel
-        from sqlalchemy import text
-        weekend_off_rows = db.execute(
-            text("SELECT nurse_id FROM nurses WHERE group_id = :group_id AND active = 1 AND is_weekend_off = 1"),
-            {"group_id": current_user.group_id}
-        ).fetchall()
-        weekend_off_nurse_ids = {str(row.nurse_id) for row in weekend_off_rows}
+        # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). nurses.is_weekend_off 컬럼 미의존.
+        from services.nurse_period_resolver import weekend_off_ids_asof
+        weekend_off_nurse_ids = weekend_off_ids_asof(db, nurse_ids, req.year, req.month)
         if weekend_off_nurse_ids:
             print(f"[CrossMonth] 주말 휴무 대상 간호사: {sorted(weekend_off_nurse_ids)}")
     except Exception as e:
@@ -2666,7 +2640,119 @@ def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int
         month=month,
     )
 
-def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None):
+
+# ── 해결책 탐색(probe) 진행 표시 ─────────────────────────────────────────────
+#   인피저블 해결책 탐색은 재solve(=풀 생성)를 여러 번 돌린다. 각 재solve 가 fallback_lex
+#   stage 로그를 다 찍어 로그가 폭주하므로, 재solve 내부 로그는 삼키고(_quiet_solve) 진행만
+#   한 줄에 제자리(\r) 갱신한다(_probe_step). AIDE_PROBE_QUIET=0 이면 전체 로그 그대로(디버그).
+def _probe_quiet_enabled() -> bool:
+    import os as _o
+    return _o.getenv("AIDE_PROBE_QUIET", "1") != "0"
+
+
+def _probe_step(label: str, i: int, n=None) -> None:
+    """진행을 한 줄에 제자리 갱신(\\r). 숫자만 업데이트되어 로그가 쌓이지 않는다."""
+    if not _probe_quiet_enabled():
+        return
+    import sys as _s
+    try:
+        _out = getattr(_s, "__stdout__", None) or _s.stdout
+        _tail = f"{i}/{n}" if n else f"{i}회"
+        _out.write(f"\r[해결책 탐색] {label} {_tail} 확인 중…                    ")
+        _out.flush()
+    except Exception:
+        pass
+
+
+def _probe_done(msg: str = "") -> None:
+    """진행 줄 마무리(개행) — 이후 결과 로그가 진행 줄을 덮지 않게 한다."""
+    if not _probe_quiet_enabled():
+        return
+    import sys as _s
+    try:
+        _out = getattr(_s, "__stdout__", None) or _s.stdout
+        _out.write("\r" + (msg or "") + " " * 20 + "\n")
+        _out.flush()
+    except Exception:
+        pass
+
+
+def _quiet_solve(fn):
+    """probe 재solve 내부 stage 로그를 삼킨다(진행은 _probe_step 로 표시).
+
+    AIDE_PROBE_QUIET=0 이면 로그 그대로 통과(디버그).
+    """
+    if not _probe_quiet_enabled():
+        return fn()
+    import io as _io2, contextlib as _cx2
+    with _cx2.redirect_stdout(_io2.StringIO()):
+        return fn()
+
+
+def _quiet_verify_solve(fn):
+    """per-nurse 재solve용: 내부 로그 억제 + verify-mode(FB_VERIFY_SKIP_STAGE3)로 feasibility 만
+    빠르게 확인. per-nurse 블록은 probe_relaxations 밖이라 stage3(최적화)를 그대로 돌아 feasible
+    케이스가 time_limit 까지 소비했다 → 병목 지목엔 feasible 여부만 필요하므로 stage3 를 스킵한다.
+    """
+    import os as _o
+    _prev = _o.environ.get("FB_VERIFY_SKIP_STAGE3")
+    _o.environ["FB_VERIFY_SKIP_STAGE3"] = "1"
+    try:
+        return _quiet_solve(fn)
+    finally:
+        if _prev is None:
+            _o.environ.pop("FB_VERIFY_SKIP_STAGE3", None)
+        else:
+            _o.environ["FB_VERIFY_SKIP_STAGE3"] = _prev
+
+
+def _probe_time_limit() -> int:
+    """probe 재solve 1회의 시간 상한(초). 기본 20 — feasible 은 몇 초에 끝나고 infeasible 벽만
+    짧아진다(생성 본solve 60s 와 분리). AIDE_PROBE_TIME_LIMIT 로 조절.
+    """
+    import os as _o
+    try:
+        return max(5, int(_o.getenv("AIDE_PROBE_TIME_LIMIT", "20")))
+    except Exception:
+        return 20
+
+
+def _priority_families_from_presolve(presolve_diag) -> list:
+    """presolve(max-flow) 부족 진단 → probe 우선 완화군(온톨로지 소프트정렬).
+
+    N 부족이면 야간 규칙군을, D/E 부족이면 OFF/연속/팀군을 먼저 검증하도록 순서를 준다.
+    probe 가 우선군에서 못 풀면 나머지도 폴백 검증하므로(soft), 지목이 틀려도 안전.
+    presolve 없음/부족 없음이면 []=기존 동작(전체 순차 검증).
+    """
+    try:
+        _pd = presolve_diag or {}
+        shortages = _pd.get("shortages") or []
+        pressure = _pd.get("pressure_families") or []
+    except Exception:
+        return []
+    fams: list = []
+    # 개인 제약 압박(제약모순형)을 최우선 — 커버리지 shortages 사각지대를 여기서 메운다.
+    fams.extend(pressure)
+    if not shortages and not pressure:
+        return []
+    shifts = {str(s.get("shift")) for s in shortages}
+    reasons = {str(s.get("reason")) for s in shortages}
+    if "N" in shifts:
+        fams += ["night_cap", "night_recovery", "night_consecutive", "night_pattern", "transition"]
+    if shifts & {"D", "E"}:
+        fams += ["off_budget", "consecutive", "weekend_off", "team", "transition"]
+    if "capacity_shortage" in reasons:
+        fams += ["off_budget", "consecutive"]
+    _seen: set = set()
+    out: list = []
+    for f in fams:
+        if f not in _seen:
+            _seen.add(f)
+            out.append(f)
+    return out
+
+
+def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None, weekend_off_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
     try:
@@ -2674,21 +2760,21 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         # is_weekend_off는 ORM 컬럼 유무와 무관하게, DB에 컬럼이 있으면 직접 조회해서 엔진 입력에 주입한다.
         # - 이유: ORM 모델/스키마가 아직 확장되지 않은 환경에서도 fallback/하드 제약이 동작해야 한다.
         try:
-            if _column_exists(db, "nurses", "is_weekend_off"):
-                rows = db.execute(
-                    text(
-                        "SELECT nurse_id, is_weekend_off "
-                        "FROM nurses WHERE group_id = :group_id AND active = 1"
-                    ),
-                    {"group_id": current_user.group_id},
-                ).fetchall()
-                id_to_weekend_off = {str(r.nurse_id): bool(getattr(r, "is_weekend_off", 0)) for r in rows}
-                print('id_to_weekend_off!!!!!', id_to_weekend_off)
-                for nd in nurses_dict:
-                    nid = str(nd.get("nurse_id") or nd.get("db_id") or "")
-                    if not nid:
-                        continue
-                    nd["is_weekend_off"] = bool(id_to_weekend_off.get(nid, False))
+            # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). 컬럼 미의존, 엔진 입력에 주입.
+            # weekend_off_override(per-nurse MCS 검증용): 지정 간호사만 값 덮어씀(1회성, DB 미변경).
+            from services.nurse_period_resolver import weekend_off_ids_asof
+            _wids = weekend_off_ids_asof(
+                db,
+                [nd.get("nurse_id") or nd.get("db_id") for nd in nurses_dict],
+                req.year, req.month,
+            )
+            for nd in nurses_dict:
+                nid = str(nd.get("nurse_id") or nd.get("db_id") or "")
+                if nid:
+                    _v = nid in _wids
+                    if weekend_off_override and nid in weekend_off_override:
+                        _v = bool(weekend_off_override[nid])
+                    nd["is_weekend_off"] = _v
         except Exception as e:
             print(f"[WeeklyOff] is_weekend_off 주입 실패(무시): {e}")
         # prefs_dict = [p.__dict__ for p in preferences]
@@ -3020,11 +3106,11 @@ def _persist_entries(db: Session, schedule, generated, req):
     shift_id_to_int_id = {s.shift_id: s.id for s in shifts_db}
     weekend_off_nurse_ids: set[str] = set()
     try:
-        rows = db.execute(
-            text("SELECT nurse_id FROM nurses WHERE group_id = :group_id AND active = 1 AND is_weekend_off = 1"),
-            {"group_id": schedule.group_id},
-        ).fetchall()
-        weekend_off_nurse_ids = {str(getattr(r, 'nurse_id', '')) for r in rows if getattr(r, 'nurse_id', None)}
+        # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). 컬럼 미의존.
+        from services.nurse_period_resolver import weekend_off_ids_asof
+        weekend_off_nurse_ids = weekend_off_ids_asof(
+            db, list(generated.keys()), schedule.year, schedule.month
+        )
     except Exception:
         weekend_off_nurse_ids = set()
     for nurse_id, shifts in generated.items():
@@ -4229,7 +4315,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4240,6 +4326,50 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     current_user.group_id = resolve_effective_group(
         db, current_user, getattr(req, "group_id", None)
     )
+    # per-nurse 주말휴무 해제(검증된 resolution 원클릭). 해당 월 발효로 period 에 해제(0) write
+    #   = 개인 속성 변경(영구). nurse_weekendoff_period SSOT. 컬럼 미조회.
+    _wor = weekend_off_release or getattr(req, "weekend_off_release", None)
+    if _wor:
+        from db.models import NurseWeekendOffPeriod as _NWOP
+        from services.nurse_period_resolver import upsert_period as _up
+        from datetime import date as _d
+        _vf = _d(int(req.year), int(req.month), 1)
+        for _nid in _wor:
+            _up(db, _NWOP, str(_nid), _vf, "weekend_off", 0, source="resolution")
+        db.commit()
+        print(f"[RosterGenerate] 주말휴무 해제 적용(period, 발효 {_vf}): {list(_wor)}")
+    # per-nurse 월 야간 한도 하향(검증된 resolution 원클릭). 해당 월 NurseMonthlyLimit 에 field 하향
+    #   write = 개인 속성 변경. fetch 와 동일 스코프(current_user.group_id)에 써 target-first 로 픽업.
+    _mlr = monthly_limit_release or getattr(req, "monthly_limit_release", None)
+    if _mlr:
+        from db.models import NurseMonthlyLimit as _NML
+        _gid = str(current_user.group_id)
+        _applied = []
+        for _rel in _mlr:
+            _rnid = str(_rel.get("nurse_id") or "")
+            _rfld = _rel.get("field")
+            _rval = _rel.get("value")
+            if not _rnid or _rfld not in ("n_exact", "n_max") or _rval is None:
+                continue
+            _row = (
+                db.query(_NML)
+                .filter(_NML.nurse_id == _rnid, _NML.group_id == _gid,
+                        _NML.year == int(req.year), _NML.month == int(req.month))
+                .first()
+            )
+            if _row is None:
+                _row = _NML(nurse_id=_rnid, group_id=_gid,
+                            year=int(req.year), month=int(req.month))
+                db.add(_row)
+            setattr(_row, _rfld, int(_rval))
+            # 야간 고정/최대 상호배타: 하나를 세팅하면 반대 필드 제거(DB 정합).
+            if _rfld == "n_exact":
+                _row.n_max = None
+            else:
+                _row.n_exact = None
+            _applied.append(f"{_rnid}:{_rfld}={_rval}")
+        db.commit()
+        print(f"[RosterGenerate] 월 야간 한도 하향 적용(NurseMonthlyLimit {req.year}-{req.month}): {_applied}")
     # 모달 payload(req.config) 제공 시 생성 직전 config row 로 materialize(굳히기) → req.config_id 세팅.
     #   /async 라우터는 이미 materialize 후 req.config=None 으로 넘겨 여기선 no-op(이중 생성 방지).
     #   /roster_create/generate(로컬 sync) 등 config 를 실어 직접 호출하는 경로는 여기서 materialize 되어
@@ -4461,6 +4591,38 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     #   period 가 그 달을 덮으면 그 값으로 team_id 를 확정한다(재분배 B3가 기록한 미래 팀 포함).
     #   None(구간 없음)이면 기존 값 유지 — 홈은 ward-aware 폴백=캐시(현행 동일),
     #   인바운드는 4689 의 target_team_id 보존(period 없을 때 비회귀).
+    # ── 허용 근무형(allowed_shifts) 대상월 as-of 오버레이 (regular nurse) ──
+    #   nurses.allowed_shifts 컬럼은 as-of-TODAY 단방향 캐시라 미래월 생성 시 stale 하다.
+    #   예: 6월 N전담(['N'])→8월 해제([])를 미래발효로 저장하면, upsert_period 가 valid_from>today
+    #   인 캐시투영을 건너뛰어 컬럼은 현재값(['N']) 그대로. 8월 생성 시 day-grain 하드제약은 period
+    #   (=[], 제한없음)로 정확하지만, is_n_only_profile·objective·off-cap 은 컬럼(['N'])을 읽어
+    #   8월인데 야간전담으로 오판 → 팀제외+야간편향 → D/E 실종. 대상월 as-of period 값으로 컬럼을
+    #   맞춘다(SSOT 정합). period 미이행(row 없음)이면 컬럼 유지=무회귀. 인바운드는 위에서 처리됨.
+    try:
+        from services.nurse_period_resolver import fetch_periods as _fp_as, resolve_asof as _ra_as
+        from db.models import NurseAllowedShiftPeriod as _AP_as
+        _reg_ids = [str(n.nurse_id) for n in engine_nurses
+                    if not bool(getattr(n, "is_inbound", False))]
+        if _reg_ids:
+            _as_rows = _fp_as(db, _AP_as, _reg_ids, month_start, month_start + timedelta(days=1))
+            _overlaid = []
+            for _en in engine_nurses:
+                if bool(getattr(_en, "is_inbound", False)):
+                    continue
+                _rows = _as_rows.get(str(_en.nurse_id))
+                if not _rows:
+                    continue  # period 미이행 → 컬럼 유지(무회귀)
+                _oldv = getattr(_en, "allowed_shifts", None)
+                _newv = _ra_as(_rows, month_start, "allowed_shifts",
+                               default=(_oldv or []))
+                _en.__dict__['allowed_shifts'] = _newv
+                if list(_newv or []) != list(_oldv or []):
+                    _overlaid.append(f"{_en.nurse_id}:{_oldv}→{_newv}")
+            if _overlaid:
+                print(f"[AllowedShiftAsof] 대상월 as-of 오버레이({req.year}-{req.month}): {_overlaid}")
+    except Exception as _as_exc:
+        print(f"[AllowedShiftAsof] 오버레이 실패(무시): {_as_exc}")
+
     from services.team_period import resolve_team_for_roster
     from services.cp_sat.allowed_shift_types import is_n_only_profile
     for _en in engine_nurses:
@@ -5215,25 +5377,37 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             build_blocking_payload,
         )
         _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
-        # `n.__dict__` 은 SQLAlchemy 의 이미 로딩된 attr 만 담아서 team_id /
-        # allowed_shifts 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
-        # 풀에서 사용할 키를 모두 일관되게 채운다.
-        _nurses_dict_for_precheck = [
-            {
-                "nurse_id": getattr(n, "nurse_id", None),
-                "db_id": getattr(n, "nurse_id", None),
-                "team_id": getattr(n, "team_id", None),
-                "grade": getattr(n, "grade", None),
-                "allowed_shifts": getattr(n, "allowed_shifts", None),
-                "work_shifts": getattr(n, "work_shifts", None),
-                "joining_date": getattr(n, "joining_date", None),
-                "resignation_date": getattr(n, "resignation_date", None),
-                "personal_off_adjustment": getattr(n, "personal_off_adjustment", 0),
-                "is_weekend_off": getattr(n, "is_weekend_off", False),
-                "weekly_off_weekday": getattr(n, "weekly_off_weekday", None),
-            }
-            for n in (nurses_for_engine or [])
-        ]
+        # 주말휴무(as-of month)를 명시 조회 — 이 시점 엔진 객체엔 아직 미주입일 수 있어
+        # 온톨로지 정찰이 주말 강제OFF 부담을 놓치지 않게 SSOT(period)에서 직접 확정한다.
+        try:
+            from services.nurse_period_resolver import weekend_off_ids_asof as _wo_ids_pre
+            _wk_ids_pre = _wo_ids_pre(
+                db, [getattr(n, "nurse_id", None) for n in (nurses_for_engine or [])],
+                req.year, req.month)
+        except Exception:
+            _wk_ids_pre = set()
+        # [온톨로지 데이터 단일 소스] 정찰/온톨로지에 넘길 nurse 속성은 손으로 고르지 않고
+        # solver 가 보는 전체를 포괄한다. 개별 속성이 누락되면 온톨로지가 그 제약을 못 보는
+        # 사각지대(예: n_exact 누락으로 야간 모순 미검출)가 생기므로, 새 속성 추가 시 아래
+        # 목록 한 곳만 고치면 되게 한다. `getattr` 로 lazy-load 도 강제 로드.
+        #   - 월 한도(d/e/n/o × min/max/exact): 4565 오버레이로 엔진 nurse 에 실림(없으면 None)
+        #   - fixed_shift/allowed_shifts: 대상월 as-of 반영됨
+        #   - is_weekend_off: period SSOT(as-of)로 별도 확정
+        _ONTOLOGY_NURSE_FIELDS = (
+            "nurse_id", "grade", "team_id", "active", "sequence",
+            "joining_date", "resignation_date",
+            "allowed_shifts", "work_shifts", "fixed_shift",
+            "weekly_off_enabled", "weekly_off_weekday", "weekly_off_type",
+            "personal_off_adjustment", "preceptor_id",
+            "d_min", "d_max", "d_exact", "e_min", "e_max", "e_exact",
+            "n_min", "n_max", "n_exact", "o_min", "o_max", "o_exact",
+        )
+        _nurses_dict_for_precheck = []
+        for n in (nurses_for_engine or []):
+            _prof = {f: getattr(n, f, None) for f in _ONTOLOGY_NURSE_FIELDS}
+            _prof["db_id"] = _prof.get("nurse_id")
+            _prof["is_weekend_off"] = str(_prof.get("nurse_id")) in _wk_ids_pre
+            _nurses_dict_for_precheck.append(_prof)
         # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
         # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
         precheck_config = dict(config_dict)
@@ -5639,29 +5813,46 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 _inf_pre = unrecoverable.get("infeasibility", {}) or {}
                 _sd_pre = _inf_pre.get("structural_diagnosis", {}) or {}
                 _codes_pre = (_sd_pre.get("signals") or {}).get("reason_codes") or []
-                _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not (_sd_pre.get("primary_causes") or [])
+                # probe 게이트: '사용자에게 줄 actionable 진단(해결옵션 / 수정가능 원인)이 없으면'
+                # 무조건 probe 를 돌린다. 뭉뚱그린 구조 라벨(primary_causes)이 있다는 이유로
+                # probe 를 막지 않는다(그게 capacity_structural 이 진짜 진단을 죽이던 원인).
+                _ui_options_pre = _inf_pre.get("resolution_options") or []
+                _ui_causes_fix = [
+                    _c for _c in (_inf_pre.get("causes") or [])
+                    if isinstance(_c, dict) and _c.get("fix")
+                ]
+                _has_actionable = bool(_ui_options_pre) or bool(_ui_causes_fix)
+                _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not _has_actionable
                 if _is_undiag and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
                     from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
 
+                    _probe_cnt = [0]
+
                     def _undiag_resolve(_relaxed_cfg):
-                        _g, _, _rs = _run_cp_sat_basic(
-                            db, current_user, nurses_for_engine, preferences, latest_config, req,
-                            shift_manage_data,
-                            fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
-                            time_limit_seconds=60,
-                            config_override=_relaxed_cfg,
-                            _assignments=_assignments,
-                            _inbound_assignments=_inbound_assignments,
-                            _outbound_assignments=_outbound_assignments,
-                        )
-                        _err = _validate_generated_roster(
-                            _g, _rs,
-                            nurses_context=list(nurses_for_engine or []),
-                            config_context=_relaxed_cfg,
-                            grade_config_context=_fetch_grade_config_dict(
-                                db, current_user.office_id, current_user.group_id),
-                        )
-                        return (_err is None), {"validation_error": (str(_err)[:80] if _err else None)}
+                        _probe_cnt[0] += 1
+                        _probe_step("규칙 완화 탐색", _probe_cnt[0])
+
+                        def _do():
+                            _g, _, _rs = _run_cp_sat_basic(
+                                db, current_user, nurses_for_engine, preferences, latest_config, req,
+                                shift_manage_data,
+                                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                time_limit_seconds=_probe_time_limit(),
+                                config_override=_relaxed_cfg,
+                                _assignments=_assignments,
+                                _inbound_assignments=_inbound_assignments,
+                                _outbound_assignments=_outbound_assignments,
+                            )
+                            _err = _validate_generated_roster(
+                                _g, _rs,
+                                nurses_context=list(nurses_for_engine or []),
+                                config_context=_relaxed_cfg,
+                                grade_config_context=_fetch_grade_config_dict(
+                                    db, current_user.office_id, current_user.group_id),
+                            )
+                            return (_err is None), {"validation_error": (str(_err)[:80] if _err else None)}
+
+                        return _quiet_solve(_do)
 
                     # probe base: solve 시점에 박아둔 유효 config 스냅샷(하드규칙+조립분 포함, 충실).
                     # 실패 시점 메모리(config_dict)는 ORM 만료·stale 라 부정확하므로 스냅샷 우선.
@@ -5670,7 +5861,22 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         _probe_base = {k: v for k, v in dict(config_dict).items()
                                        if not str(k).startswith("_sa_")}
                     _probe_base = dict(_probe_base)
-                    _probe_res = probe_relaxations(_probe_base, _undiag_resolve)
+                    # 온톨로지 소프트정렬: presolve(max-flow) 병목 → 우선 완화군을 먼저 검증.
+                    try:
+                        _prio_fams = _priority_families_from_presolve(presolve_diag)
+                    except NameError:
+                        _prio_fams = []
+                    # hard-filter: 온톨로지가 압박군을 지목했으면(=_prio_fams 존재) 그 단일+콤보만
+                    # 먼저 확인하고 안 되면 전수 폴백 → 흔한 케이스 재solve 대폭↓. AIDE_PROBE_HARD_FILTER=0 로 해제.
+                    _hard_filter = bool(_prio_fams) and _os_undiag.getenv("AIDE_PROBE_HARD_FILTER", "1") != "0"
+                    _probe_res = probe_relaxations(
+                        _probe_base, _undiag_resolve,
+                        priority_families=(_prio_fams or None),
+                        # 필요한 만큼만 probe: 검증된 해결책 2건이면 종료(우선군 먼저라 최우선 완화 포함).
+                        stop_after=int(_os_undiag.getenv("AIDE_PROBE_STOP_AFTER", "2") or 2),
+                        hard_filter=_hard_filter,
+                    )
+                    _probe_done(f"[해결책 탐색] 규칙 완화 탐색 {_probe_cnt[0]}회 완료")
                     unrecoverable["infeasibility"]["probe_resolutions"] = _probe_res.get("resolutions", [])
                     unrecoverable["infeasibility"]["probe_combo"] = _probe_res.get("combo")
                     unrecoverable["infeasibility"]["probe_found"] = _probe_res.get("found", False)
@@ -5679,27 +5885,312 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     _probe_opts = to_resolution_options(_probe_res, _probe_base)
                     _exist_opts = unrecoverable["infeasibility"].get("resolution_options") or []
                     unrecoverable["infeasibility"]["resolution_options"] = _probe_opts + _exist_opts
+
+                    # ── per-nurse MCS: 주말휴무가 병목이면 어느 간호사가 원인인지 1명씩 해제(1회성
+                    #    override)해 재solve 로 지목. 게이트는 presolve 가 데이터로 잡은 weekend_off_load
+                    #    (주말휴무자 존재)로 판단 — config 플래그(weekend_off_only_enable)에 의존하지 않는다
+                    #    (그 플래그는 catalog 에서 제외됨). 주말휴무자만+top-K+조기종료 로 비용 억제.
+                    try:
+                        _wk_flags = (presolve_diag or {}).get("constraint_flags") or []
+                    except NameError:
+                        _wk_flags = []
+                    _wk_feasible = any(f.get("type") == "weekend_off_load" for f in _wk_flags)
+                    if _wk_feasible:
+                        try:
+                            from services.nurse_period_resolver import weekend_off_ids_asof as _wo_ids
+                            _wk_cands = sorted(_wo_ids(
+                                db, [getattr(n, "nurse_id", None) for n in (nurses_for_engine or [])],
+                                req.year, req.month))
+                            _PN_K = 6
+                            _culprit = None
+                            _multi = None
+                            # [관계 → 인원] presolve 가 max-flow 로 '주말 몇 명 풀어야 하는지'를 산출.
+                            #   ≥2 면 조합탐색 대신 상위 N명을 '한 번에' 해제·검증(다인 번들).
+                            try:
+                                _wk_need = int((presolve_diag or {}).get("weekend_release_needed") or 0)
+                            except NameError:
+                                _wk_need = 0
+                            if _wk_need >= 2 and len(_wk_cands) >= _wk_need:
+                                _grp = [str(c) for c in _wk_cands[:_wk_need]]
+                                _probe_step("주말휴무 다인 해제", _wk_need, _wk_need)
+
+                                def _do_multi(_grp=_grp):
+                                    _g2, _, _rs2 = _run_cp_sat_basic(
+                                        db, current_user, nurses_for_engine, preferences, latest_config, req,
+                                        shift_manage_data,
+                                        fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                        time_limit_seconds=_probe_time_limit(),
+                                        weekend_off_override={c: False for c in _grp},
+                                        _assignments=_assignments,
+                                        _inbound_assignments=_inbound_assignments,
+                                        _outbound_assignments=_outbound_assignments,
+                                    )
+                                    return _validate_generated_roster(
+                                        _g2, _rs2, nurses_context=list(nurses_for_engine or []),
+                                        config_context=_probe_base,
+                                        grade_config_context=_fetch_grade_config_dict(
+                                            db, current_user.office_id, current_user.group_id),
+                                    )
+
+                                if _quiet_verify_solve(_do_multi) is None:
+                                    _multi = _grp
+                                _probe_done()
+                            # 단일 지목(다인이 아니거나 실패 시): 1명씩 해제해 첫 범인.
+                            if not _multi:
+                                _wk_n = min(len(_wk_cands), _PN_K)
+                                for _wk_i, _cnid in enumerate(_wk_cands[:_PN_K], start=1):
+                                    _probe_step("주말휴무 조정 후보", _wk_i, _wk_n)
+
+                                    def _do_wk(_cnid=_cnid):
+                                        _g2, _, _rs2 = _run_cp_sat_basic(
+                                            db, current_user, nurses_for_engine, preferences, latest_config, req,
+                                            shift_manage_data,
+                                            fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                            time_limit_seconds=_probe_time_limit(),
+                                            weekend_off_override={str(_cnid): False},
+                                            _assignments=_assignments,
+                                            _inbound_assignments=_inbound_assignments,
+                                            _outbound_assignments=_outbound_assignments,
+                                        )
+                                        return _validate_generated_roster(
+                                            _g2, _rs2, nurses_context=list(nurses_for_engine or []),
+                                            config_context=_probe_base,
+                                            grade_config_context=_fetch_grade_config_dict(
+                                                db, current_user.office_id, current_user.group_id),
+                                        )
+
+                                    _err2 = _quiet_verify_solve(_do_wk)
+                                    if _err2 is None:
+                                        _culprit = str(_cnid)
+                                        break
+                                _probe_done()
+                            # 다인 번들 옵션(관계분석 지목): N명 주말 해제를 한 옵션·한 클릭으로.
+                            if _multi:
+                                _mnames = [
+                                    next((getattr(n, "name", "") for n in (nurses_for_engine or [])
+                                          if str(getattr(n, "nurse_id", "")) == c), c) or c
+                                    for c in _multi]
+                                _wk_opt = {
+                                    "option_id": "release_weekend_off_multi:" + "+".join(_multi),
+                                    "kind": "release_weekend_off_multi", "source": "probe", "verified": True,
+                                    "title_ko": f"주말 휴무 {len(_multi)}명 해제 ({', '.join(_mnames)})",
+                                    "trade_off_ko": "그 간호사들이 주말에도 근무할 수 있게 됩니다.",
+                                    "changes": [{"nurse_id": c, "attr": "weekend_off",
+                                                 "from": True, "to": False} for c in _multi],
+                                    "weekend_off_release": _multi,
+                                    "fix": {
+                                        "mode": "auto_apply",
+                                        "where": "nurse.weekend_off",
+                                        "where_label_ko": "간호사 관리 > 주말 휴무",
+                                        "how_ko": f"이 방법을 고르면 {len(_multi)}명({', '.join(_mnames)})의 "
+                                                  f"주말 휴무를 해제하고 다시 만듭니다(이 달).",
+                                        "config_key": None, "target": {"nurse_ids": _multi},
+                                    },
+                                }
+                                _opts_now = unrecoverable["infeasibility"].get("resolution_options") or []
+                                unrecoverable["infeasibility"]["resolution_options"] = [_wk_opt] + _opts_now
+                                print(f"[UndiagProbe][per-nurse] 주말휴무 다인 해제 지목({_wk_need}명): {_multi}")
+                            if _culprit:
+                                _nm = next((getattr(n, "name", "") for n in (nurses_for_engine or [])
+                                            if str(getattr(n, "nurse_id", "")) == _culprit), "") or _culprit
+                                # [데이터 기반 번들] per-nurse 주말 probe 의 feasible 은 검증이 월한도
+                                # (n_exact)를 안 봐서 거짓양성일 수 있다. presolve 가 데이터(산술)로 이미
+                                # 잡은 이 간호사의 다른 하드 모순(night_floor_over_cap: n_exact>max_nig)이
+                                # 있으면, 주말만 풀어선 그 모순이 남아 실패한다 → 야간 하향도 같은 옵션에
+                                # 묶어 "주말 해제 + 야간 낮추기" 한 클릭으로 만든다.
+                                try:
+                                    _cflags = (presolve_diag or {}).get("constraint_flags") or []
+                                except NameError:
+                                    _cflags = []
+                                _nflag = next(
+                                    (f for f in _cflags
+                                     if str(f.get("nurse_id")) == _culprit
+                                     and f.get("type") == "night_floor_over_cap"), None)
+                                if _nflag:
+                                    _mn = int(_nflag.get("max_nig") or 0)
+                                    _nf = int(_nflag.get("n_floor") or 0)
+                                    _wk_opt = {
+                                        "option_id": f"release_weekend_off+lower_night:{_culprit}",
+                                        "kind": "release_weekend_off+lower_night",
+                                        "source": "probe", "verified": True,
+                                        "title_ko": f"{_nm} 간호사 주말 휴무 해제 + 야간 고정 {_nf}→{_mn}회로 낮추기",
+                                        "trade_off_ko": "주말에도 근무 가능해지고, 월 야간이 그 값 이하로 제한됩니다.",
+                                        "changes": [
+                                            {"nurse_id": _culprit, "attr": "weekend_off",
+                                             "from": True, "to": False},
+                                            {"nurse_id": _culprit, "attr": "n_exact",
+                                             "from": _nf, "to": _mn},
+                                        ],
+                                        # 한 클릭에 둘 다 적용(주말 해제 + 야간 고정 하향).
+                                        "weekend_off_release": [_culprit],
+                                        "monthly_limit_release": [
+                                            {"nurse_id": _culprit, "field": "n_exact", "value": _mn}],
+                                        "fix": {
+                                            "mode": "auto_apply",
+                                            "where": "nurse.weekend_off+monthly_limit",
+                                            "where_label_ko": "간호사 관리 > 해당 간호사 > 주말 휴무 · 월 근무 한도(야간)",
+                                            "how_ko": f"이 방법을 고르면 {_nm} 간호사의 주말 휴무를 해제하고 "
+                                                      f"야간 고정을 {_mn}회로 낮춘 뒤 다시 만듭니다(이 달).",
+                                            "config_key": None, "target": {"nurse_id": _culprit},
+                                        },
+                                    }
+                                else:
+                                    _wk_opt = {
+                                        "option_id": f"release_weekend_off:{_culprit}",
+                                        "kind": "release_weekend_off", "source": "probe", "verified": True,
+                                        "title_ko": f"{_nm} 간호사 주말 휴무 해제",
+                                        "trade_off_ko": "그 간호사가 주말에도 근무할 수 있게 됩니다.",
+                                        "changes": [{"nurse_id": _culprit, "attr": "weekend_off",
+                                                     "from": True, "to": False}],
+                                        # 원클릭 재생성용 — 이 달 발효로 nurse_weekendoff_period 해제 후 생성.
+                                        "weekend_off_release": [_culprit],
+                                        "fix": {
+                                            "mode": "auto_apply",
+                                            "where": "nurse.weekend_off",
+                                            "where_label_ko": "간호사 관리 > 해당 간호사 > 주말 휴무",
+                                            "how_ko": f"이 방법을 고르면 {_nm} 간호사의 주말 휴무를 해제하고 다시 만듭니다(이 달부터).",
+                                            "config_key": None, "target": {"nurse_id": _culprit},
+                                        },
+                                    }
+                                # 그룹 전체 끄는 coarse '단독' 옵션(apply 가 weekend_off_only_enable 하나뿐)만
+                                # 개인 지목으로 대체. 콤보(예: weekend_off_only_enable + max_nig 상향)는 유효한
+                                # 대안이므로 남긴다 — 그래야 "개인 낮추기 / config 상한 올리기" 두 갈래가 모두 노출.
+                                _opts_now = unrecoverable["infeasibility"].get("resolution_options") or []
+                                _opts_now = [
+                                    o for o in _opts_now
+                                    if not ((o.get("apply") or {}).get("weekend_off_only_enable") is False
+                                            and len(o.get("apply") or {}) <= 1)
+                                ]
+                                unrecoverable["infeasibility"]["resolution_options"] = [_wk_opt] + _opts_now
+                                print(f"[UndiagProbe][per-nurse] 주말휴무 병목 지목: {_culprit}({_nm})")
+                            else:
+                                print(f"[UndiagProbe][per-nurse] 단일 해제로 미해결 "
+                                      f"(후보 {len(_wk_cands)}, 검사 {min(len(_wk_cands), _PN_K)})")
+                        except Exception as _pn_exc:
+                            print(f"[UndiagProbe][per-nurse] failed (ignore): {_pn_exc}")
+
+                    # ── per-nurse MCS(월 야간 한도): config 야간 상한 완화가 병목(raise_max_night_cap
+                    #    검증)이면, 어느 간호사의 n_exact/n_max 가 상한과 충돌하는지 1명씩 상한값으로
+                    #    낮춰(1회성 override) 재solve 로 지목. config 상한 완화(전체)와 개인 하향(핀포인트)
+                    #    두 옵션을 모두 제시한다(개인 지목을 앞에).
+                    _nc_feasible = any(
+                        o.get("verified") and (o.get("apply") or {}).get("max_nig_per_month") is not None
+                        for o in _probe_opts
+                    )
+                    if _nc_feasible:
+                        try:
+                            _cfg_mn = int(_probe_base.get("max_nig_per_month") or 0)
+                            # 후보: n_exact 또는 n_max 가 config 야간 상한보다 큰 간호사(그 값을 상한
+                            # 이하로 낮추면 충돌 해소). 야간이 상한을 초과할 수 없으니 이들이 병목 후보.
+                            _nc_cands = []
+                            for _n in (nurses_for_engine or []):
+                                for _fld in ("n_exact", "n_max"):
+                                    _val = getattr(_n, _fld, None)
+                                    if _val is not None and _cfg_mn and int(_val) > _cfg_mn:
+                                        _nc_cands.append(
+                                            (str(getattr(_n, "nurse_id", "")), _fld, int(_val), _n))
+                                        break
+                            _PN_K = 6
+                            _nc_culprit = None
+                            _nc_n = min(len(_nc_cands), _PN_K)
+                            for _nc_i, (_cnid, _cfld, _ccur, _cnu) in enumerate(_nc_cands[:_PN_K], start=1):
+                                _probe_step("야간한도 조정 후보", _nc_i, _nc_n)
+                                # nurses_dict = [n.__dict__] 라 객체 dict 를 직접 낮췄다가 finally 로 복원
+                                # (다음 후보 재solve 오염 방지). 엔진은 nd 에서 n_exact/n_max 를 읽는다.
+                                _orig = _cnu.__dict__.get(_cfld)
+                                _cnu.__dict__[_cfld] = _cfg_mn
+                                try:
+                                    def _do_nc():
+                                        _g3, _, _rs3 = _run_cp_sat_basic(
+                                            db, current_user, nurses_for_engine, preferences,
+                                            latest_config, req, shift_manage_data,
+                                            fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                                            time_limit_seconds=_probe_time_limit(),
+                                            _assignments=_assignments,
+                                            _inbound_assignments=_inbound_assignments,
+                                            _outbound_assignments=_outbound_assignments,
+                                        )
+                                        return _validate_generated_roster(
+                                            _g3, _rs3, nurses_context=list(nurses_for_engine or []),
+                                            config_context=_probe_base,
+                                            grade_config_context=_fetch_grade_config_dict(
+                                                db, current_user.office_id, current_user.group_id),
+                                        )
+
+                                    _err3 = _quiet_verify_solve(_do_nc)
+                                finally:
+                                    _cnu.__dict__[_cfld] = _orig
+                                if _err3 is None:
+                                    _nc_culprit = (_cnid, _cfld, _ccur)
+                                    break
+                            _probe_done()
+                            if _nc_culprit:
+                                _nid, _fld, _cur = _nc_culprit
+                                _nm = next((getattr(n, "name", "") for n in (nurses_for_engine or [])
+                                            if str(getattr(n, "nurse_id", "")) == _nid), "") or _nid
+                                _fld_ko = "야간 고정 횟수" if _fld == "n_exact" else "월 야간 최대"
+                                _nc_opt = {
+                                    "option_id": f"lower_night_limit:{_nid}",
+                                    "kind": "lower_night_limit", "source": "probe", "verified": True,
+                                    "title_ko": f"{_nm} 간호사 {_fld_ko} {_cur}→{_cfg_mn}회로 낮추기",
+                                    "trade_off_ko": f"그 간호사의 월 야간이 {_cfg_mn}회 이하로 제한됩니다.",
+                                    "changes": [{"nurse_id": _nid, "attr": _fld,
+                                                 "from": _cur, "to": _cfg_mn}],
+                                    # 원클릭 재생성용 — 이 달 NurseMonthlyLimit 에 하향 write 후 생성.
+                                    "monthly_limit_release": [
+                                        {"nurse_id": _nid, "field": _fld, "value": _cfg_mn}],
+                                    "fix": {
+                                        "mode": "auto_apply",
+                                        "where": "nurse.monthly_limit.night",
+                                        "where_label_ko": "간호사 관리 > 해당 간호사 > 월 근무 한도(야간)",
+                                        "how_ko": f"이 방법을 고르면 {_nm} 간호사의 {_fld_ko}를 "
+                                                  f"{_cfg_mn}회로 낮추고 다시 만듭니다(이 달).",
+                                        "config_key": None,
+                                        "target": {"nurse_id": _nid, "field": _fld},
+                                    },
+                                }
+                                # config 야간 상한 완화(전체)는 그대로 두고, 개인 지목을 앞에 추가(둘 다 노출).
+                                _opts_now = unrecoverable["infeasibility"].get("resolution_options") or []
+                                unrecoverable["infeasibility"]["resolution_options"] = [_nc_opt] + _opts_now
+                                print(f"[UndiagProbe][per-nurse] 야간한도 병목 지목: "
+                                      f"{_nid}({_nm}) {_fld}={_cur}→{_cfg_mn}")
+                            else:
+                                print(f"[UndiagProbe][per-nurse] 야간한도 단일 하향 미해결 "
+                                      f"(후보 {len(_nc_cands)}, 검사 {min(len(_nc_cands), _PN_K)})")
+                        except Exception as _nc_exc:
+                            print(f"[UndiagProbe][per-nurse] night-limit failed (ignore): {_nc_exc}")
                     # probe 의 검증된 완화 = 원인 그 자체다: "이걸 완화하면 풀린다" ⟺ "이게 병목".
                     # MUS core 가 비어도 probe 가 원인(=완화 대상 정책)을 지목한다.
                     # 단일 완화들 = 각각이 단독 충분한 병목(대안), combo = 함께여야 풀리는 결합 병목.
-                    if any(o.get("verified") for o in _probe_opts):
-                        import re as _re_cause
-                        def _cause_label(_t):
-                            # title 의 액션어(완화/해제/…)를 떼 "원인=정책명"으로 읽히게.
-                            return _re_cause.sub(r"\s*(완화|해제|비활성화|감소|상향)(\(.*?\))?$", "", _t or "").strip() or _t
-                        _v_single = [_cause_label(o.get("title_ko")) for o in _probe_opts
-                                     if o.get("verified") and o.get("kind") != "combo" and o.get("title_ko")]
-                        _v_combo = next((o for o in _probe_opts if o.get("kind") == "combo" and o.get("verified")), None)
-                        if _v_single:
-                            _cause = " / ".join(_v_single[:4])
+                    # 원인·해결 요약: config 레버뿐 아니라 per-nurse(주말/야간/번들/다인) 옵션까지
+                    # 전부 읽어 만든다. 검증된 해결책이 하나라도 있으면 NO_ASSIGNMENT 증상 문구를
+                    # 절대 사용자에게 노출하지 않는다(그건 내부 트리거일 뿐).
+                    import re as _re_cause
+                    def _cause_label(_t):
+                        # title 의 액션어(완화/해제/…)를 떼 읽기 쉽게. per-nurse 는 원문 유지.
+                        return _re_cause.sub(r"\s*(완화|해제|비활성화|감소|상향)(\(.*?\))?$", "", _t or "").strip() or _t
+                    _all_opts = unrecoverable["infeasibility"].get("resolution_options") or []
+                    _v_opts = [o for o in _all_opts if o.get("verified") and o.get("title_ko")]
+                    _v_combo = next((o for o in _v_opts if o.get("kind") == "combo"), None)
+                    _v_single = [o for o in _v_opts if o.get("kind") != "combo"]
+                    if _v_single:
+                        _cause = " / ".join(_cause_label(o["title_ko"]) for o in _v_single[:4])
+                        unrecoverable["infeasibility"]["summary_message_ko"] = (
+                            f"지금 인원·설정으로는 근무표를 만들 수 없어요 — {_cause} 중 하나로 "
+                            f"조정하면 만들 수 있습니다(다시 계산해 확인했습니다). 아래에서 골라 주세요."
+                        )
+                    elif _v_combo:
+                        unrecoverable["infeasibility"]["summary_message_ko"] = (
+                            f"여러 조건이 얽혀 있어 하나만 바꿔서는 풀리지 않습니다. "
+                            f"'{_v_combo.get('title_ko')}'를 함께 적용하면 근무표를 만들 수 있어요(확인 완료)."
+                        )
+                    else:
+                        # 검증된 해결책이 하나도 없을 때: 증상('실근무 0건') 대신 행동 안내로 대체.
+                        _cur_msg = unrecoverable["infeasibility"].get("summary_message_ko") or ""
+                        if ("배정 0건" in _cur_msg) or ("NO_ASSIGNMENT" in _cur_msg):
                             unrecoverable["infeasibility"]["summary_message_ko"] = (
-                                f"원인: 다음 정책이 현재 인원·설정으로는 동시에 만족될 수 없습니다 — {_cause}. "
-                                f"이 중 하나를 완화하면 근무표를 생성할 수 있습니다(재계산으로 검증됨). 적용할 옵션을 선택해주세요."
-                            )
-                        elif _v_combo:
-                            unrecoverable["infeasibility"]["summary_message_ko"] = (
-                                f"원인: 여러 정책이 얽혀 단일 완화로는 풀리지 않습니다. "
-                                f"'{_v_combo.get('title_ko')}'를 함께 적용하면 근무표를 생성할 수 있습니다(검증됨)."
+                                "지금 인원·설정으로는 근무표를 만들 수 없어요. 간호사 인원을 보강하거나 "
+                                "설정 > 날짜별 필요 인원을 줄여 다시 시도해 주세요."
                             )
                     _combo = _probe_res.get("combo")
                     print(f"[UndiagProbe] found={_probe_res.get('found')} "
@@ -5708,6 +6199,20 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             except Exception as _undiag_exc:
                 print(f"[UndiagProbe] failed (ignore): {_undiag_exc}")
             # (ontology treatment → resolution_options 는 build_unrecoverable_payload 에서 처리됨)
+            # 최종 안전망: 어떤 경로(probe 스킵/실패 포함)로 왔든 NO_ASSIGNMENT 증상 문구가
+            # 사용자에게 새지 않게 대체한다. 이 코드는 트리거(reason_code)와 무관, 문구만 정리.
+            _fin = unrecoverable.get("infeasibility", {})
+            _fmsg = _fin.get("summary_message_ko") or ""
+            if ("배정 0건" in _fmsg) or ("NO_ASSIGNMENT" in _fmsg):
+                _fv = [o for o in (_fin.get("resolution_options") or [])
+                       if o.get("verified") and o.get("title_ko")]
+                _fin["summary_message_ko"] = (
+                    "지금 인원·설정으로는 근무표를 만들 수 없어요. "
+                    "아래에서 방법을 골라 조정하면 만들 수 있습니다(다시 계산해 확인했습니다)."
+                    if _fv else
+                    "지금 인원·설정으로는 근무표를 만들 수 없어요. 간호사 인원을 보강하거나 "
+                    "설정 > 날짜별 필요 인원을 줄여 다시 시도해 주세요."
+                )
             inf = unrecoverable.get("infeasibility", {})
             print(
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
@@ -5830,7 +6335,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         db, current_user, nurses_for_engine, preferences, latest_config, req,
                         shift_manage_data,
                         fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
-                        time_limit_seconds=60, config_override=_relaxed_cfg,
+                        time_limit_seconds=_probe_time_limit(), config_override=_relaxed_cfg,
                         _assignments=_assignments, _inbound_assignments=_inbound_assignments,
                         _outbound_assignments=_outbound_assignments,
                     )
