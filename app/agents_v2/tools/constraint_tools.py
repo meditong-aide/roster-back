@@ -14,7 +14,7 @@ from db.models import RosterConfig, RosterGradeConfig, ShiftManage
 # 하드락 토글(banned_day_after_eve/three_seq_nig/not_one_night 등)은 HN 정당 설정이라 허용.
 _AGENT_SETTABLE_FIELDS = frozenset({
     "day_req", "eve_req", "nig_req", "min_exp_per_shift", "req_exp_nurses",
-    "two_offs_per_week", "max_nig_per_month", "three_seq_nig",
+    "two_offs_per_week", "three_seq_nig",
     "two_offs_after_three_nig", "two_offs_after_two_nig", "banned_day_after_eve",
     "max_conseq_work", "off_days", "sequential_offs",
     "nod_noe", "not_one_night", "use_mid", "preceptee_on", "preceptee_shift_count",
@@ -22,6 +22,9 @@ _AGENT_SETTABLE_FIELDS = frozenset({
     "show_level", "show_preceptor", "off_first", "off_swap_enabled",
     "config_name", "config_memo",
 })
+# ★제외(policy-locked): max_nig_per_month 는 update_constraint._POLICY_LOCKED_FIELDS 에서
+#   병동 전체 야간 최대를 잠그고 개인 한도(update_monthly_limit)로 redirect 한다. 화이트리스트에
+#   두면 planner field enum(descriptions.py)에 노출돼 "설정 시도→거절" 왕복이 생김 → 제외해 일원화.
 # ★제외(상수-live): shift_priority(prod 전량 0.8)·ban_night_before_fixed_off(prod 전량 True·
 #   FE 미노출·constraint_impact probe 전용 레버) — 운영에서 아무도 안 바꾸는 솔버값이라
 #   에이전트가 건드릴 이유가 없어 화이트리스트에서 제외(값 고정 유지). 컬럼 DROP은 별건(DDL/FE/probe).
@@ -29,7 +32,7 @@ _AGENT_SETTABLE_FIELDS = frozenset({
 _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "day_req": (0, 50), "eve_req": (0, 50), "nig_req": (0, 50),
     "min_exp_per_shift": (0, 50), "req_exp_nurses": (0, 50),
-    "max_nig_per_month": (0, 31), "max_conseq_work": (1, 7), "off_days": (0, 31),
+    "max_conseq_work": (1, 7), "off_days": (0, 31),
 }
 
 

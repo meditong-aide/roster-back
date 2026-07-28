@@ -215,14 +215,14 @@ class SchedulingAgent:
     def _plan_answer(self, user_message, run) -> str:
         """플랜 답변 합성 + L2 정합성 검증(답변↔task 출력). 어긋나면 데이터 근거로 1회 재생성."""
         from agents_v2.planning.orchestrate import join_answer
-        from agents_v2.verify import judge_answer_consistency, l2_data_fits
+        from agents_v2.verify import verify_answer
 
         answer = join_answer(self.llm, user_message, run)
         data = run.exec.outputs
-        if answer.strip() and data and l2_data_fits(data):
-            cons = judge_answer_consistency(self.router_llm or self.llm, user_message, data, answer)
-            if not cons.consistent:
-                answer = join_answer(self.llm, user_message, run, correction=cons.reason) or answer
+        # L2 정합 게이트(공유). 어긋나면 데이터 근거로 1회 재생성(=re-join, 계획 경로 고유).
+        cons = verify_answer(self.router_llm or self.llm, user_message, data, answer)
+        if cons and not cons.consistent:
+            answer = join_answer(self.llm, user_message, run, correction=cons.reason) or answer
         return answer
 
     def _try_dag_plan(self, db, user_message, ctx, messages):
@@ -367,24 +367,20 @@ class SchedulingAgent:
                     trace=[Stage("plan_staleness", "block", {}, 0)],
                     messages=messages, variable_memory=ctx.variable_memory)
 
-        # ── 원자성: 플랜의 전 mutation 을 한 트랜잭션으로 ──
-        # 스킬/서비스가 내부에서 부르는 db.commit() 을 flush() 로 리다이렉트해 트랜잭션을 유지.
-        # 전부 성공 → 한 번에 commit / 하나라도 실패(read-back 위반 포함) → rollback(부분 반영 방지).
-        # commit 단계는 순차·단일세션(원자성·일관성 우선; 병렬 read 는 dry-run 단계에서 이미 활용).
-        _real_commit = db.commit
-        db.commit = db.flush  # type: ignore[method-assign]
+        # ── 원자성: 플랜의 전 mutation 을 한 트랜잭션으로 (공유 경계) ──
+        # atomic_commit 이 내부 db.commit()→flush 리다이렉트 + 단일 commit / 실패 시 rollback 을
+        # 담당. 실패(read-back 위반 포함)는 AbortCommit 로 전체 롤백을 유도한다(부분 반영 방지).
+        from agents_v2.commit_gate import AbortCommit, atomic_commit
         try:
-            exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False)
-        except Exception as e:  # noqa: BLE001
-            exec_res = PlanExecResult(failed={"task": "plan", "skill": "", "data": {"error": str(e)}})
-        finally:
-            db.commit = _real_commit  # type: ignore[method-assign]
-
-        if exec_res.failed:
-            try:
-                db.rollback()  # 전체 되돌림 — 부분 반영 없음
-            except Exception:  # noqa: BLE001
-                pass
+            with atomic_commit(db):
+                try:
+                    exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False)
+                except Exception as e:  # noqa: BLE001
+                    exec_res = PlanExecResult(
+                        failed={"task": "plan", "skill": "", "data": {"error": str(e)}})
+                if exec_res.failed:
+                    raise AbortCommit()  # 전체 롤백
+        except AbortCommit:
             err = exec_res.failed.get("data") or {}
             reason = err.get("error") or err.get("question") or "알 수 없는 오류"
             return AgentResult(
@@ -392,10 +388,7 @@ class SchedulingAgent:
                 trace=[Stage("plan_commit", "error",
                              {"order": exec_res.order, "atomic": "rolled_back"}, 0)],
                 messages=messages, variable_memory=ctx.variable_memory)
-        try:
-            db.commit()  # 전 mutation 원자 커밋
-        except Exception as e:  # noqa: BLE001
-            db.rollback()
+        except Exception as e:  # noqa: BLE001 — commit() 자체 실패(이미 롤백됨)
             return AgentResult(
                 answer=f"커밋 중 오류로 **전체 취소**했습니다: {e}",
                 trace=[Stage("plan_commit", "error", {"atomic": "rolled_back"}, 0)],
@@ -416,11 +409,18 @@ class SchedulingAgent:
         answer = self._plan_answer(orig, run)
         if async_done:
             answer += "\n\n(설정을 반영하고 **근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
-        return AgentResult(
-            answer=answer,
-            trace=[Stage("plan_commit", "ok",
-                         {"order": exec_res.order, "atomic": "committed", "async": async_done}, 0)],
-            messages=messages, variable_memory=ctx.variable_memory, data=last)
+        trace = [Stage("plan_commit", "ok",
+                       {"order": exec_res.order, "atomic": "committed", "async": async_done}, 0)]
+        # ── P5 자동검증(공유): 근무표 셀을 직접 커밋했고, 플랜에 검증 task 도 없고, 생성(async)
+        # 대기도 아니면 ReAct 커밋과 동일하게 proactive validate. (생성 대기면 새 표 미완성이라 보류.)
+        plan_skills = {t.skill for t in plan.tasks}
+        if (any(_is_schedule_mutation(t.skill, t.args) for t in plan.tasks if t.kind == "mutate")
+                and not (plan_skills & {"validate_schedule", "repair_schedule"})
+                and not any(t.skill in ("generate_schedule", "generate-schedule")
+                            for t in exec_res.deferred)):
+            answer += self._auto_validate(db, ctx, trace)
+        return AgentResult(answer=answer, trace=trace,
+                           messages=messages, variable_memory=ctx.variable_memory, data=last)
 
     def _run_impl(
         self,
@@ -588,15 +588,15 @@ class SchedulingAgent:
                 #    "A랑 B" 답변에서 A 를 근거없다고 오탐한다.
                 #  - 데이터가 크면(잘림 불가피) judge 가 '부분만 보고' 오탐하므로 skip.
                 #    대용량 조회는 L2 미적용(recall↓ 감수, false-positive 0 우선).
-                from agents_v2.verify import judge_answer_consistency, l2_data_fits
+                from agents_v2.verify import verify_answer
 
                 _judge_data = (turn_query_data[0] if len(turn_query_data) == 1
                                else turn_query_data)
-                if turn_query_data and answer_text.strip() and l2_data_fits(_judge_data):
-                    judge_llm = self.router_llm or self.llm
-                    cons = judge_answer_consistency(
-                        judge_llm, user_message, _judge_data, answer_text
-                    )
+                # L2 정합 게이트(공유). None=검증 대상 아님(skip). 재생성은 ReAct 고유(=re-chat).
+                cons = verify_answer(
+                    self.router_llm or self.llm, user_message, _judge_data, answer_text
+                )
+                if cons is not None:
                     trace.append(Stage(
                         "answer_consistency",
                         "ok" if cons.consistent else "block",
@@ -1151,9 +1151,32 @@ class SchedulingAgent:
         if approval.get("type") == "batch":
             return self._execute_approval_batch(db, ctx, messages, approval.get("items", []))
 
-        # Re-execute with preview_only=false
-        args = {**approval.get("args", {}), "preview_only": False}
         skill_name = approval.get("skill_name", "bulk_mutation")
+        base_args = approval.get("args", {})
+
+        # ── #5 staleness(ReAct): 승인 시점 미리보기와 지금이 다르면 커밋 말고 재확인 ──
+        # 미리보기를 preview_only 로 재실행(부수효과 없음)해 body 지문 비교. DAG 경로가 하던
+        # staleness 가드를 ReAct 승인에도 대칭 적용(docs/AGENT_SHARED_GATE_REFACTOR.md P2).
+        from agents_v2.verify import approval_body_fp
+        stored_fp = approval_body_fp(approval)
+        if stored_fp:
+            try:
+                fresh = execute_skill(db, skill_name, {**base_args, "preview_only": True}, ctx)
+                fresh_data = fresh.data if isinstance(fresh.data, dict) else {}
+                fresh_fp = approval_body_fp({**fresh_data, "skill_name": skill_name, "args": base_args})
+            except Exception:  # noqa: BLE001 — 재프리뷰 실패 시 기존 동작 보존(통과)
+                fresh_fp = stored_fp
+            if fresh_fp and fresh_fp != stored_fp:
+                fresh_preview = {**fresh_data, "skill_name": skill_name, "args": base_args}
+                ctx.pending_approval = fresh_preview  # 바뀐 미리보기로 갱신
+                return AgentResult(
+                    awaiting_approval=True, preview=fresh_preview,
+                    answer="승인 이후 상황이 바뀌어 미리보기가 달라졌습니다. 바뀐 내용으로 진행할까요?",
+                    trace=[Stage("approval_staleness", "block", {"skill": skill_name}, 0)],
+                    messages=messages, variable_memory=ctx.variable_memory)
+
+        # Re-execute with preview_only=false
+        args = {**base_args, "preview_only": False}
 
         trace: list[Stage] = []
         result = execute_skill(db, skill_name, args, ctx)
@@ -1174,36 +1197,36 @@ class SchedulingAgent:
                 messages=messages,
             )
 
-        # ── Proactive post-mutation validation ──
+        # ── Proactive post-mutation validation (공유 게이트 P5) ──
         answer = "변경이 완료되었습니다."
-        if skill_name in ("bulk_mutation", "bulk-mutation") and args.get("scope") in (
-            "schedule", "draft_schedule", "published_schedule",
-        ):
-            val_result = execute_skill(
-                db, "validate_schedule",
-                {"group_id": ctx.group_id, "year": ctx.year, "month": ctx.month},
-                ctx,
-            )
-            trace.append(
-                Stage(
-                    "auto_validation",
-                    "error" if _is_error(val_result.data) else "ok",
-                    {"result": _truncate(val_result.data)},
-                    val_result.duration_ms,
-                )
-            )
-            if not _is_error(val_result.data):
-                v_count = val_result.data.get("violation_count", 0)
-                if v_count > 0:
-                    answer += f"\n\n⚠️ 자동 검증 결과: {v_count}건의 제약조건 위반이 감지되었습니다. '위반사항 보여줘'로 상세 내역을 확인하세요."
-                else:
-                    answer += "\n\n✅ 자동 검증 완료: 제약조건 위반 없음."
+        if _is_schedule_mutation(skill_name, args):
+            answer += self._auto_validate(db, ctx, trace)
 
         return AgentResult(
             answer=answer,
             trace=trace,
             messages=messages,
         )
+
+    def _auto_validate(self, db, ctx, trace: list) -> str:
+        """스케줄 셀 mutation 커밋 후 proactive validate_schedule — 답변에 붙일 요약 반환.
+
+        세 커밋 경로(단일/배치/DAG plan)가 공유(docs/AGENT_SHARED_GATE_REFACTOR.md P5).
+        이전엔 ReAct 만 자동검증하고 DAG 커밋은 안 해 비대칭이었다.
+        """
+        val = execute_skill(
+            db, "validate_schedule",
+            {"group_id": ctx.group_id, "year": ctx.year, "month": ctx.month}, ctx,
+        )
+        trace.append(Stage("auto_validation", "error" if _is_error(val.data) else "ok",
+                           {"result": _truncate(val.data)}, val.duration_ms))
+        if _is_error(val.data):
+            return ""
+        v_count = val.data.get("violation_count", 0)
+        if v_count > 0:
+            return (f"\n\n⚠️ 자동 검증 결과: {v_count}건의 제약조건 위반이 감지되었습니다. "
+                    "'위반사항 보여줘'로 상세 내역을 확인하세요.")
+        return "\n\n✅ 자동 검증 완료: 제약조건 위반 없음."
 
     def _execute_approval_batch(
         self,
@@ -1212,70 +1235,67 @@ class SchedulingAgent:
         messages: list[dict],
         items: list[dict],
     ) -> AgentResult:
-        """Consolidated 승인 — 여러 mutation preview 를 순차 실행(각각 preview_only=False).
+        """Consolidated 승인 — 여러 mutation preview 를 **원자적으로** 실행(공유 경계).
 
         복합 쿼리에서 한 턴에 여러 변경이 preview 됐을 때, 사용자 1회 승인으로 전부 실행.
-        schedule mutation 이 하나라도 있으면 끝에 proactive 검증 1회.
+        원자성(P4): AIDE_DAG_PLANNING 기본 OFF 라 의존 복합도 이 배치로 오므로, 중간 실패 시
+        **전체 롤백**(부분 반영 방지). 즉 하나라도 실패하면 나머지도 반영 안 됨(all-or-nothing).
+        schedule mutation 이 하나라도 있으면 커밋 후 proactive 검증 1회.
         """
+        from agents_v2.commit_gate import AbortCommit, atomic_commit
+
         trace: list[Stage] = []
         done: list[str] = []
-        errors: list[str] = []
         needs_validate = False
+        fail_reason: str | None = None
 
-        for item in items:
-            skill_name = item.get("skill_name", "bulk_mutation")
-            args = {**item.get("args", {}), "preview_only": False}
-            result = execute_skill(db, skill_name, args, ctx)
-            trace.append(
-                Stage(
-                    "execution",
-                    "error" if _is_error(result.data) else "ok",
-                    {"skill": skill_name, "result": _truncate(result.data)},
-                    result.duration_ms,
-                )
-            )
-            if _is_error(result.data):
-                errors.append(f"{skill_name}: {result.data.get('error', '')}")
-            else:
-                done.append(skill_name)
-                if skill_name in ("bulk_mutation", "bulk-mutation") and args.get(
-                    "scope"
-                ) in ("schedule", "draft_schedule", "published_schedule"):
-                    needs_validate = True
+        try:
+            with atomic_commit(db):
+                for item in items:
+                    skill_name = item.get("skill_name", "bulk_mutation")
+                    args = {**item.get("args", {}), "preview_only": False}
+                    result = execute_skill(db, skill_name, args, ctx)
+                    trace.append(
+                        Stage(
+                            "execution",
+                            "error" if _is_error(result.data) else "ok",
+                            {"skill": skill_name, "result": _truncate(result.data)},
+                            result.duration_ms,
+                        )
+                    )
+                    if _is_error(result.data):
+                        fail_reason = f"{skill_name}: {result.data.get('error', '')}"
+                        raise AbortCommit()  # 전체 롤백 — 부분 반영 없음
+                    done.append(skill_name)
+                    if _is_schedule_mutation(skill_name, args):
+                        needs_validate = True
+        except AbortCommit:
+            return AgentResult(
+                answer=(f"{len(done) + 1}번째 변경('{fail_reason}')이 실패해 "
+                        "**전체 취소(롤백)**했습니다 — 부분 반영 없음. 다시 시도해 주세요."),
+                trace=trace, messages=messages)
+        except Exception as e:  # noqa: BLE001 — commit() 자체 실패(이미 롤백됨)
+            return AgentResult(
+                answer=f"커밋 중 오류로 **전체 취소**했습니다: {e}", trace=trace, messages=messages)
 
-        parts = []
-        if done:
-            parts.append(f"{len(done)}건의 변경을 완료했습니다.")
-        if errors:
-            parts.append("일부 변경은 실패했습니다: " + "; ".join(errors))
-        answer = " ".join(parts) or "실행할 변경이 없습니다."
+        answer = (f"{len(done)}건의 변경을 완료했습니다." if done else "실행할 변경이 없습니다.")
 
-        if needs_validate:
-            val = execute_skill(
-                db, "validate_schedule",
-                {"group_id": ctx.group_id, "year": ctx.year, "month": ctx.month},
-                ctx,
-            )
-            trace.append(
-                Stage(
-                    "auto_validation",
-                    "error" if _is_error(val.data) else "ok",
-                    {"result": _truncate(val.data)},
-                    val.duration_ms,
-                )
-            )
-            if not _is_error(val.data):
-                v_count = val.data.get("violation_count", 0)
-                answer += (
-                    f"\n\n⚠️ 자동 검증: {v_count}건의 제약조건 위반이 감지되었습니다."
-                    if v_count > 0
-                    else "\n\n✅ 자동 검증 완료: 제약조건 위반 없음."
-                )
+        if needs_validate:  # 공유 게이트 P5
+            answer += self._auto_validate(db, ctx, trace)
 
         return AgentResult(answer=answer, trace=trace, messages=messages)
 
 
 # ── Helpers ─────────────────────────────────────────────────
+
+_SCHEDULE_SCOPES = ("schedule", "draft_schedule", "published_schedule")
+
+
+def _is_schedule_mutation(skill_name: str, args: dict) -> bool:
+    """근무표 셀 직접 수정(bulk_mutation schedule scope)인가 — 커밋 후 자동검증 트리거 판정."""
+    return (skill_name in ("bulk_mutation", "bulk-mutation")
+            and (args or {}).get("scope") in _SCHEDULE_SCOPES)
+
 
 _CONFIRM_WORDS = frozenset({
     "응",

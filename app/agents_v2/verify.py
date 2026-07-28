@@ -114,3 +114,42 @@ def judge_answer_consistency(llm: Any, question: str, data: Any, answer: str) ->
         reason = text.split(":", 1)[1].strip() if ":" in text else text
         return ConsistencyResult(False, reason or "답변이 데이터와 어긋남")
     return ConsistencyResult(True)
+
+
+def approval_body_fp(preview: Any) -> str:
+    """단일 mutation 미리보기의 **의미 지문**(제어키 제외한 body 해시). ReAct 승인 staleness용.
+
+    미리보기 본문(예: update_constraint 의 `changes:{field:{old,new}}`)은 live 상태에 의존하므로,
+    승인 시점 지문과 커밋 직전 dry-run 지문이 다르면 = 그 사이 상태가 바뀐 것(stale).
+    실패모드는 **안전측**(달라 보이면 재확인; 잘못 커밋하지 않음). 지문 불가/빈 preview → "".
+    DAG 경로의 `preview_fingerprint`(task+summary 키)에 대응하는 ReAct 판.
+    """
+    import hashlib
+    import json
+
+    if not isinstance(preview, dict):
+        return ""
+    # skill_name/args 와 batch 래핑 키는 body 가 아니라 제어정보 → 제외.
+    body = {k: v for k, v in preview.items()
+            if k not in ("skill_name", "args", "type", "count", "items")}
+    if not body:
+        return ""
+    try:
+        blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        blob = str(body)
+    return hashlib.md5(blob.encode()).hexdigest()
+
+
+def verify_answer(judge_llm: Any, question: str, data: Any, answer: str) -> ConsistencyResult | None:
+    """L2 정합 게이트 — 판정 대상이 아니면 None(검증 skip), 대상이면 판정 결과.
+
+    두 실행 경로(DAG `_plan_answer`, ReAct 인라인)가 **같은 가드+judge** 를 중복 구현하던 것을
+    단일화(공유 게이트, docs/AGENT_SHARED_GATE_REFACTOR.md P1). 재생성(regeneration)은 경로마다
+    다르므로(계획=re-join, ReAct=re-chat) 여기 넣지 않고 호출부가 처리한다.
+
+    가드: 답변이 비었거나 대조 데이터가 없거나/너무 커서(l2_data_fits=False) 오탐 위험이면 None.
+    """
+    if not (answer and answer.strip() and data and l2_data_fits(data)):
+        return None
+    return judge_answer_consistency(judge_llm, question, data, answer)
