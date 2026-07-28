@@ -1190,9 +1190,13 @@ class AgentFeedback(Base):
 
     id = Column(INTEGER, primary_key=True, autoincrement=True)
     conversation_id = Column(VARCHAR(64), nullable=True, index=True)
-    group_id = Column(VARCHAR(64), nullable=True, index=True)
-    nurse_id = Column(VARCHAR(64), nullable=True)
-    kind = Column(VARCHAR(16), nullable=True, index=True)  # bug | suggestion | complaint
-    content = Column(VARCHAR(1000), nullable=False)         # 원문 concern
+    office_id = Column(VARCHAR(64), nullable=True, index=True)   # 병원
+    group_id = Column(VARCHAR(64), nullable=True, index=True)    # 병동
+    nurse_id = Column(VARCHAR(64), nullable=True)                # 제출자 id
+    nurse_name = Column(NVARCHAR(64), nullable=True)             # 제출자 이름(한글)
+    kind = Column(VARCHAR(16), nullable=True, index=True)        # bug | suggestion | complaint
+    content = Column(NVARCHAR(1000), nullable=False)             # 해당 항목(concern) 원문(한글)
+    original_query = Column(NVARCHAR(2000), nullable=True)       # 사용자 원 발화 전체(한글)
+    summary = Column(NVARCHAR(1000), nullable=True)              # 결론/우리가 알아야 할 사항(한글)
     status = Column(VARCHAR(16), nullable=False, default="open")  # open|triaged|resolved
     created_at = Column(DATETIME, default=datetime.utcnow, nullable=False, index=True)

@@ -491,17 +491,22 @@ SKILL_TOOLS: list[dict] = [
             "⛔ 실행 가능한 요청(설정/근무표/원티드 변경), 조회, 품질 진단(편차·미충원 → validate/analyze)은 "
             "여기가 아니라 해당 스킬을 써라. log_feedback 은 **오직 처리 불가 항목**의 마지막 경로.\n\n"
 
+            "함께 넘겨라(수집용): **original_query**=사용자 발화 **전체**(여러 항목 섞였으면 원문 그대로), "
+            "**summary**=이 항목에 대한 **네 판단/결론**(예: '권한 설정 문제 — 에이전트 처리 불가, 담당팀 확인 필요').\n\n"
+
             "예시:\n"
-            "- '관리자 권한 사용 제한 생겼어요' → kind='bug', content=원문\n"
-            "- '이런 화면도 있으면 좋겠어요' → kind='suggestion', content=원문\n"
-            "- 'X 기능이 자꾸 안 돼요'(스킬로 못 고침) → kind='bug'"
+            "- '관리자 권한 사용 제한 생겼어요' → kind='bug', content='관리자 권한 사용 제한', "
+            "original_query=<발화 전체>, summary='권한/계정 설정 문제 — 에이전트 처리 불가'\n"
+            "- '이런 화면도 있으면 좋겠어요' → kind='suggestion', content=원문, summary=<요지>"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "접수할 원문(사용자 표현 그대로)."},
+                "content": {"type": "string", "description": "접수할 해당 항목(사용자 표현 그대로)."},
                 "kind": {"type": "string", "enum": ["bug", "suggestion", "complaint"],
                          "description": "버그신고=bug / 기능건의=suggestion / 일반불만=complaint."},
+                "original_query": {"type": "string", "description": "사용자 발화 전체(원문). 수집용."},
+                "summary": {"type": "string", "description": "이 항목에 대한 결론/우리가 알아야 할 사항."},
             },
             "required": ["content"],
         },

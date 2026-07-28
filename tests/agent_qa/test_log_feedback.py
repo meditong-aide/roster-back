@@ -37,3 +37,18 @@ def test_non_hn_can_submit(db, seed_data):
     # 피드백 접수는 일반 간호사도 가능(HN 전용 mutation 아님)
     res = execute_skill(db, "log_feedback", {"content": "버그요", "kind": "bug"}, _ctx(role="RN"))
     assert res.data.get("ok") is True and not res.data.get("permission_denied")
+
+
+def test_collects_office_query_summary(db, seed_data):
+    # 병원/원 발화/결론 수집 — office_id 는 ctx 주입, original_query/summary 는 LLM 전달
+    res = execute_skill(db, "log_feedback", {
+        "content": "관리자 권한 사용 제한",
+        "kind": "bug",
+        "original_query": "관리자 권한이 제한됐고 근무자 최대/최소도 못 바꿔요",
+        "summary": "권한/계정 설정 문제 — 에이전트 처리 불가, 담당팀 확인 필요",
+    }, _ctx())
+    assert res.data.get("ok") is True
+    row = db.query(AgentFeedback).filter_by(group_id="GRP001").first()
+    assert row.office_id == "OFF001"
+    assert row.original_query and "근무자 최대" in row.original_query
+    assert row.summary and "담당팀" in row.summary

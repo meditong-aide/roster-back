@@ -21,9 +21,26 @@ _feedback_table_present: bool | None = None
 _KINDS = {"bug": "버그 신고", "suggestion": "기능 건의", "complaint": "불만"}
 
 
+def _nurse_name(db: Session, group_id, nurse_id) -> str | None:
+    """제출자 nurse_id → 이름(실패 시 None). ctx.nurse_id 는 실존 안 할 수도 있어 graceful."""
+    if not nurse_id:
+        return None
+    try:
+        from db.models import Nurse
+        n = db.query(Nurse.name).filter(Nurse.nurse_id == nurse_id).first()
+        return n[0] if n else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @register("log-feedback")
 def log_feedback(db: Session, params: dict) -> Any:
-    """불만/건의/버그를 접수. params: content(필수), kind(bug|suggestion|complaint), group_id/nurse_id(ctx)."""
+    """불만/건의/버그를 접수.
+
+    params: content(필수, 해당 항목), kind(bug|suggestion|complaint),
+            original_query(사용자 원 발화 전체), summary(결론/우리가 알아야 할 사항),
+            group_id/office_id/acting_user_id(ctx 주입).
+    """
     content = (params.get("content") or "").strip()
     if not content:
         return {"needs_clarification": True, "question": "어떤 내용을 접수할까요?", "options": []}
@@ -56,11 +73,17 @@ def _persist(db: Session, params: dict, content: str, kind: str) -> bool:
             if not _feedback_table_present:
                 logger.warning("[log_feedback] agent_feedback 테이블 없음 — 적재 skip(마이그레이션 필요).")
                 return False
+        nurse_id = params.get("acting_user_id") or params.get("nurse_id")
         row = AgentFeedback(
-            conversation_id=params.get("conversation_id") or params.get("acting_user_id"),
+            conversation_id=params.get("conversation_id"),
+            office_id=params.get("office_id"),
             group_id=params.get("group_id"),
-            nurse_id=params.get("acting_user_id") or params.get("nurse_id"),
-            kind=kind, content=content[:1000], status="open",
+            nurse_id=nurse_id,
+            nurse_name=_nurse_name(db, params.get("group_id"), nurse_id),
+            kind=kind, content=content[:1000],
+            original_query=(params.get("original_query") or "")[:2000] or None,
+            summary=(params.get("summary") or "")[:1000] or None,
+            status="open",
         )
         db.add(row)
         db.commit()
