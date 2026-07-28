@@ -868,12 +868,42 @@ class FixedWantedEntryCreate(BaseModel):
     reason: Optional[str] = None
 
 
+class BannedWantedEntryCreate(BaseModel):
+    """금지 원티드 항목 생성 요청 (셀당 금지 근무코드 배열)"""
+
+    nurse_id: str
+    shift_date: date
+    banned_shift_ids: List[str]  # 금지 근무코드(D/E/N), 1~2개
+    is_applied: bool = True
+    reason: Optional[str] = None
+
+
+class BannedWantedEntryResponse(BaseModel):
+    """금지 원티드 항목"""
+
+    id: int
+    group_id: str
+    year: int
+    month: int
+    nurse_id: str
+    shift_date: date
+    banned_shift_ids: List[str]
+    is_applied: bool
+    reason: Optional[str] = None
+    created_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class FixedWantedCreate(BaseModel):
     """확정 원티드 저장 요청"""
 
     year: int
     month: int
     entries: List[FixedWantedEntryCreate]
+    # 금지 원티드(선택). None="banned 손대지 않음"(갱신 안 된 프론트 보호), []="전체 해제".
+    banned_entries: Optional[List[BannedWantedEntryCreate]] = None
 
 
 class FixedWantedEntryResponse(BaseModel):
@@ -954,6 +984,8 @@ class AdjustmentNurse(BaseModel):
     nurse_id: str
     name: str
     entries: List[FixedWantedEntryResponse]
+    # 금지 원티드 항목(셀당 금지 근무코드 배열). fixed 와 시각 구분해 렌더.
+    banned_entries: List[BannedWantedEntryResponse] = Field(default_factory=list)
     monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, "주": 4, ...}
     # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자.
     # 프론트는 이 일자를 저장/편집 불가(blocked)로 표기해야 한다.
@@ -967,16 +999,21 @@ class AdjustmentResponse(BaseModel):
 
     nurses: List[AdjustmentNurse]
     has_fixed_wanted: bool = False  # 저장된 확정 원티드 존재 여부
+    has_banned_wanted: bool = False  # 저장된 금지 원티드 존재 여부
 
 
 class FixedWantedListResponse(BaseModel):
-    """확정 원티드 목록 조회 응답 (근무표 생성용)"""
+    """확정 원티드 목록 조회 응답 (근무표 생성용 / 저장 응답)"""
 
     group_id: str
     year: int
     month: int
     entries: List[FixedWantedEntryResponse]
     total_count: int
+    # 금지 원티드 저장 결과(저장 응답에서만 채워짐).
+    banned_entries: List[BannedWantedEntryResponse] = Field(default_factory=list)
+    # 비차단 통지: fixed 셀에 가려 무시된 금지(inert_on_fixed_cell), 용량 위험(coverage_risk) 등.
+    warnings: List[Dict[str, Any]] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

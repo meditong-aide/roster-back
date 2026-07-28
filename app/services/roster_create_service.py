@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from db.models import (
     DailyShift,
     FixedWantedEntry,
+    BannedWantedEntry,
     Group,
     IssuedRoster,
     Nurse,
@@ -2637,6 +2638,62 @@ def _merge_initial_constraints(base: dict | None, extra: dict | None) -> dict:
     return {"forced_off": merged_forced_off_out, "forbidden": merged_forbidden_out}
 
 
+def _build_banned_wanted_constraints(db, current_user, req, nurses_in_group) -> dict:
+    """금지 원티드(banned_wanted) → initial_constraints forbidden 맵으로 변환.
+
+    fixed_cells 경로가 아니다. {"forbidden": {nurse_id:{day_idx:[codes]}}} 를 반환하여
+    _merge_initial_constraints 로 기존 forbidden 과 합집합된 뒤, 하위 파이프가
+    initial_forbidden → m.Add(X==0) 로 하드 enforce 한다. fixed 셀과 겹치면 솔버가
+    해당 셀 forbidden 을 skip 하므로 fixed 가 우선(모순 INFEASIBLE 없음).
+
+    별도 사용 플래그 없이 항상 적용한다 — 저장된 is_applied 금지가 있으면 반영,
+    없으면 빈 맵(무효과). 개별 on/off 는 entry 의 is_applied 로 제어.
+    """
+    empty = {"forced_off": {}, "forbidden": {}}
+    try:
+        rows = db.query(BannedWantedEntry).filter(
+            BannedWantedEntry.group_id == current_user.group_id,
+            BannedWantedEntry.year == req.year,
+            BannedWantedEntry.month == req.month,
+            BannedWantedEntry.is_applied == True,  # noqa: E712
+        ).all()
+    except Exception as e:
+        print(f"[BannedWanted] 조회 실패(무시): {e}")
+        return empty
+    if not rows:
+        return empty
+
+    days_in_month = calendar.monthrange(req.year, req.month)[1]
+    engine_nurse_ids = {str(getattr(n, "nurse_id", "")) for n in nurses_in_group}
+    forbidden: dict[str, dict[int, list[str]]] = {}
+    total = 0
+    for r in rows:
+        nid = str(r.nurse_id)
+        if engine_nurse_ids and nid not in engine_nurse_ids:
+            continue
+        codes = r.banned_shift_ids
+        if isinstance(codes, str):
+            try:
+                codes = json.loads(codes)
+            except (ValueError, TypeError):
+                codes = []
+        codes = [str(c).strip().upper() for c in (codes or []) if str(c).strip()]
+        if not codes:
+            continue
+        day_idx = r.shift_date.day - 1
+        if day_idx < 0 or day_idx >= days_in_month:
+            continue
+        forbidden.setdefault(nid, {}).setdefault(day_idx, [])
+        for c in codes:
+            if c not in forbidden[nid][day_idx]:
+                forbidden[nid][day_idx].append(c)
+                total += 1
+
+    if forbidden:
+        print(f"[BannedWanted] 금지 셀 적용: nurses={len(forbidden)}, cnt={total}")
+    return {"forced_off": {}, "forbidden": forbidden}
+
+
 def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int, month: int) -> str | None:
     return _validate_mid_hard_feasibility_impl(
         nurses_in_group=nurses_in_group,
@@ -2932,9 +2989,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     print('prev_month_last_is_off', prev_month_last_is_off)
 
     # ── 3) 병합 후 주입(금지/강제OFF 합집합) ──
-    config_dict["initial_constraints"] = _merge_initial_constraints(
+    _merged_ic = _merge_initial_constraints(
         base=cross_month_constraints,
         extra=allowed_constraints,
+    )
+    # 금지 원티드(banned_wanted) 를 forbidden producer 로 합류 (fixed_cells 경로 아님).
+    banned_constraints = _build_banned_wanted_constraints(
+        db, current_user, req, nurses_in_group,
+    )
+    config_dict["initial_constraints"] = _merge_initial_constraints(
+        base=_merged_ic,
+        extra=banned_constraints,
     )
     preflight_alerts = []
     try:

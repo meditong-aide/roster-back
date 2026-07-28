@@ -952,6 +952,47 @@ class FixedWantedEntry(Base):
     )
 
 
+# Banned Wanted (금지 원티드) — fixed_wanted 의 배반. 셀 단위로 배정 불가 근무(복수)를 배열로 저장.
+class BannedWantedEntry(Base):
+    """금지 원티드 테이블 — 셀(간호사·날짜)당 금지 근무코드 배열(D/E/N, 최대 2개).
+
+    솔버에서는 initial_forbidden 으로 반영되어 해당 셀에 그 근무 배정이 금지된다.
+    fixed_wanted 와 같은 셀에서 충돌 시 fixed 가 우선(솔버가 fixed 셀의 forbidden 을 skip).
+    """
+
+    __tablename__ = "banned_wanted_entries"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    shift_date = Column(DATE, nullable=False)
+    # 금지 근무코드 배열(main code). 예: ["D","E"]. 1~2개.
+    banned_shift_ids = Column(JSON, nullable=False, default=list)
+    is_applied = Column(BOOLEAN, default=True)  # 적용/미적용 여부
+    reason = Column(TEXT, nullable=True)
+    created_by = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    group = relationship("Group")
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    creator = relationship("Nurse", foreign_keys=[created_by])
+
+    __table_args__ = (
+        Index("idx_banned_entry_group_ym", "group_id", "year", "month"),
+        Index(
+            "idx_banned_entry_nurse_date",
+            "group_id",
+            "year",
+            "month",
+            "nurse_id",
+            "shift_date",
+        ),
+    )
+
+
 class Notice(Base):
     __tablename__ = 'notices'
     id = Column(INTEGER, primary_key=True, autoincrement=True)

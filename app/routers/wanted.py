@@ -46,7 +46,10 @@ from services.wanted_service import (
     delete_excess_off_requests,
     get_wanted_adjustment_service,
     save_fixed_wanted_service,
+    save_banned_wanted_service,
+    _decode_banned_response,
     toggle_fixed_wanted_entry_service,
+    toggle_banned_wanted_entry_service,
     get_fixed_wanted_for_roster_service,
     get_fixed_wanted_entries_service,
     reset_fixed_wanted_service,
@@ -762,6 +765,10 @@ async def save_fixed_wanted(
 
     try:
         entries = save_fixed_wanted_service(db, target_group_id, current_user.nurse_id, req)
+        # 금지 원티드 저장(같은 요청 바디의 banned_entries). None=미변경, []=전체 해제.
+        banned_rows, banned_warnings = save_banned_wanted_service(
+            db, target_group_id, current_user.nurse_id, req
+        )
         return FixedWantedListResponse(
             group_id=target_group_id,
             year=req.year,
@@ -784,6 +791,10 @@ async def save_fixed_wanted(
                 ) for e in entries
             ],
             total_count=len(entries),
+            banned_entries=[
+                _decode_banned_response(b, req.year, req.month) for b in banned_rows
+            ],
+            warnings=banned_warnings,
         )
     except HTTPException:
         db.rollback()
@@ -819,6 +830,43 @@ async def toggle_fixed_wanted_entry(
             id=entry.id,
             is_applied=entry.is_applied,
             message=f"항목이 {'적용' if entry.is_applied else '미적용'}으로 변경되었습니다."
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"토글 실패: {str(e)}")
+
+
+@router.patch("/adjustment/banned/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
+async def toggle_banned_wanted_entry(
+    entry_id: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    금지 원티드 개별 항목 적용/미적용(반려) 토글 API
+    - fixed 토글과 동일 정책. 별도 테이블이라 entry_id 충돌 방지 위해 경로 분리(/banned/).
+    - 수간호사는 본인 병동 entries만 토글 가능. master_admin은 office 범위로 허용.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    caller_group_id: Optional[str] = None
+    if caller_is_head_nurse(db, current_user):
+        caller_group_id = resolve_home_group_id(db, current_user)
+
+    try:
+        entry = toggle_banned_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)
+        return ToggleEntryResponse(
+            id=entry.id,
+            is_applied=entry.is_applied,
+            message=f"금지 항목이 {'적용' if entry.is_applied else '미적용'}으로 변경되었습니다."
         )
     except HTTPException:
         db.rollback()

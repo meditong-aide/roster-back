@@ -20,6 +20,7 @@ _INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
 
 from db.models import (
     FixedWantedEntry,
+    BannedWantedEntry,
     Group,
     Nurse,
     NurseAssignment,
@@ -46,6 +47,8 @@ from schemas.roster_schema import (
     AdjustmentNurse,
     AdjustmentResponse,
     FixedWantedEntryResponse,
+    BannedWantedEntryCreate,
+    BannedWantedEntryResponse,
 )
 from services.graph_service import graph_service
 from services.weekly_off_service import (
@@ -2159,6 +2162,7 @@ def get_wanted_adjustment_service(
     # caller 관할(stored group_id 불문) FixedWantedEntry 존재 여부 (UI 모드 플래그).
     # target caller 가 source 저장 엔트리를 상속받는 케이스 포함.
     fixed_entries_exist = False
+    banned_entries_exist = False
 
     for nurse in nurses:
         _inbound_asgs = inbound_map.get(nurse.nurse_id, [])
@@ -2318,10 +2322,30 @@ def get_wanted_adjustment_service(
                     ))
                 monthly_summary["주"] = len(weekly_off_days)
 
+        # ── 금지 원티드(banned_wanted): caller 관할 일자만, shift_date 기준 최신 id ──
+        banned_out: List[BannedWantedEntryResponse] = []
+        nurse_banned_entries = db.query(BannedWantedEntry).filter(
+            BannedWantedEntry.nurse_id == nurse.nurse_id,
+            BannedWantedEntry.year == year,
+            BannedWantedEntry.month == month,
+        ).all()
+        _banned_by_date: Dict[date, BannedWantedEntry] = {}
+        for be in nurse_banned_entries:
+            if be.shift_date in blocked_set:
+                continue
+            _exist = _banned_by_date.get(be.shift_date)
+            if _exist is None or (be.id or 0) > (_exist.id or 0):
+                _banned_by_date[be.shift_date] = be
+        if _banned_by_date:
+            banned_entries_exist = True
+            for be in _banned_by_date.values():
+                banned_out.append(_decode_banned_response(be, year, month))
+
         nurse_data_list.append(AdjustmentNurse(
             nurse_id=nurse.nurse_id,
             name=nurse.name,
             entries=entries,
+            banned_entries=banned_out,
             monthly_summary=dict(monthly_summary),
             blocked_days=blocked_days,
             assignments=assignment_windows,
@@ -2330,6 +2354,7 @@ def get_wanted_adjustment_service(
     return AdjustmentResponse(
         nurses=nurse_data_list,
         has_fixed_wanted=fixed_entries_exist,
+        has_banned_wanted=banned_entries_exist,
     )
 
 
@@ -2784,6 +2809,205 @@ def save_fixed_wanted_service(
     return new_entries
 
 
+# 금지 원티드에서 다룰 수 있는 근무형(main code). O(OFF) 금지는 fixed_wanted(O)로 처리하므로 제외.
+_BANNED_WORK_CODES = {"D", "E", "N"}
+
+
+def _decode_banned_response(e: BannedWantedEntry, year: int, month: int) -> BannedWantedEntryResponse:
+    """BannedWantedEntry ORM → 응답 스키마 (JSON 컬럼 안전 디코드)."""
+    codes = e.banned_shift_ids
+    if isinstance(codes, str):
+        try:
+            codes = json.loads(codes)
+        except (ValueError, TypeError):
+            codes = []
+    return BannedWantedEntryResponse(
+        id=e.id,
+        group_id=e.group_id,
+        year=e.year,
+        month=e.month,
+        nurse_id=e.nurse_id,
+        shift_date=e.shift_date,
+        banned_shift_ids=[str(c).strip().upper() for c in (codes or [])],
+        is_applied=bool(e.is_applied),
+        reason=e.reason,
+        created_by=e.created_by,
+    )
+
+
+def save_banned_wanted_service(
+    db: Session,
+    group_id: str,
+    nurse_id: str,
+    req: FixedWantedCreate,
+) -> Tuple[List[BannedWantedEntry], List[Dict[str, Any]]]:
+    """금지 원티드 저장 서비스 (fixed_wanted 의 배반).
+
+    정책:
+    - req.banned_entries is None → banned 손대지 않음(갱신 안 된 프론트 보호). 기존 저장분 그대로 반환.
+    - req.banned_entries == [] → caller group 금지 전체 해제.
+    - 셀당 1~2개, 근무코드(D/E/N)만, 중복 불가.
+    - 허용집합 합집합 가드(P3): 간호사 유효 허용근무 제한 ∪ banned 가 {D,E,N} 전체를 덮으면 422.
+    - fixed 충돌 셀: reject 아님(fixed 우선). warnings(inert_on_fixed_cell)로 통지만.
+    - 관할 검증은 fixed 와 동일하게 _validate_cross_save_entries 재사용(교차 셀은 자동 skip).
+    - 저장은 caller group 스냅샷 replace(delete-then-insert). 다른 병동 banned 는 보존.
+
+    반환: (저장된 BannedWantedEntry 목록, warnings)
+    """
+    warnings: List[Dict[str, Any]] = []
+
+    # None = 미변경 → 기존 저장분 반환(응답 노출용)
+    if req.banned_entries is None:
+        existing = db.query(BannedWantedEntry).filter(
+            BannedWantedEntry.group_id == group_id,
+            BannedWantedEntry.year == req.year,
+            BannedWantedEntry.month == req.month,
+        ).all()
+        return existing, warnings
+
+    banned_entries: List[BannedWantedEntryCreate] = list(req.banned_entries)
+    request_nurse_ids = sorted({e.nurse_id for e in banned_entries})
+
+    # 빈 배열 = caller group 금지 전체 해제
+    if not request_nurse_ids:
+        deleted = db.query(BannedWantedEntry).filter(
+            BannedWantedEntry.group_id == group_id,
+            BannedWantedEntry.year == req.year,
+            BannedWantedEntry.month == req.month,
+        ).delete()
+        db.commit()
+        print(f"[BannedWanted] 빈 요청 — caller_group={group_id} {deleted}건 삭제")
+        return [], warnings
+
+    nurse_rows: Dict[str, Nurse] = {
+        n.nurse_id: n
+        for n in db.query(Nurse).filter(Nurse.nurse_id.in_(request_nurse_ids)).all()
+    }
+    nurse_name_map: Dict[str, str] = {
+        nid: (n.name or nid) for nid, n in nurse_rows.items()
+    }
+
+    # ── 1단계: entry 단위 검증 (개수/근무만/중복/허용집합 합집합 가드) ──
+    errors: List[Dict[str, Any]] = []
+    for e in banned_entries:
+        codes = [str(c).strip().upper() for c in (e.banned_shift_ids or [])]
+        sd = e.shift_date.isoformat()
+        # 중복
+        if len(codes) != len(set(codes)):
+            errors.append({"type": "duplicate_shift", "nurse_id": e.nurse_id, "shift_date": sd,
+                           "message": "금지 근무코드가 중복되었습니다."})
+            continue
+        # 개수 1~2
+        if not (1 <= len(codes) <= 2):
+            errors.append({"type": "max_2_bans", "nurse_id": e.nurse_id, "shift_date": sd,
+                           "message": "금지는 셀당 1~2개까지 가능합니다(최소 1개 근무 여지 보장)."})
+            continue
+        # 근무(D/E/N)만 — O 금지 불가
+        if any(c not in _BANNED_WORK_CODES for c in codes):
+            errors.append({"type": "off_ban_not_allowed", "nurse_id": e.nurse_id, "shift_date": sd,
+                           "message": "금지는 근무(D/E/N)만 가능합니다. OFF 강제는 확정 원티드(O)로 하세요."})
+            continue
+        # P3: 허용집합 합집합 가드 — 개인 허용근무 제한 ∪ banned 가 D/E/N 전멸이면 근무 불가
+        nrow = nurse_rows.get(e.nurse_id)
+        allowed = {str(x).strip().upper() for x in (getattr(nrow, "allowed_shifts", None) or [])}
+        forbidden_by_allowed = (_BANNED_WORK_CODES - allowed) if allowed else set()
+        if _BANNED_WORK_CODES <= (forbidden_by_allowed | set(codes)):
+            errors.append({"type": "no_workable_shift_left", "nurse_id": e.nurse_id, "shift_date": sd,
+                           "message": f"{nurse_name_map.get(e.nurse_id, e.nurse_id)} 간호사: 허용근무 제한과 겹쳐 근무 가능한 시프트가 없습니다."})
+            continue
+
+    if errors:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    # ── 2단계: 관할 검증 (fixed 재사용, shift 무관) ──
+    assignment_list_map = _collect_assignment_list_map_for_nurses(db, request_nurse_ids)
+    synth_req = FixedWantedCreate(
+        year=req.year, month=req.month,
+        entries=[
+            FixedWantedEntryCreate(nurse_id=e.nurse_id, shift_date=e.shift_date, shift_id="O")
+            for e in banned_entries
+        ],
+    )
+    cross_errors, _cross_blocked = _validate_cross_save_entries(
+        synth_req, group_id, nurse_rows, assignment_list_map, nurse_name_map,
+    )
+    fatal_cross = [x for x in cross_errors if x.get("type") != "cross_save_blocked"]
+    if fatal_cross:
+        raise HTTPException(status_code=422, detail={"errors": fatal_cross})
+    skipped_pairs: Set[Tuple[str, date]] = set()
+    for x in cross_errors:
+        if x.get("type") == "cross_save_blocked":
+            try:
+                skipped_pairs.add((str(x.get("nurse_id") or ""), date.fromisoformat(str(x.get("shift_date") or ""))))
+            except (ValueError, TypeError):
+                continue
+    kept = [e for e in banned_entries if (e.nurse_id, e.shift_date) not in skipped_pairs]
+    if not kept:
+        print("[BannedWanted] 모든 entries cross-skipped → DB 변경 없음 (early return)")
+        return [], warnings
+
+    # ── 3단계: fixed 충돌 셀 조회 → inert 경고 (P6, fixed 우선) ──
+    fixed_cells: Set[Tuple[str, date]] = {
+        (fw_nid, fw_date)
+        for (fw_nid, fw_date) in db.query(
+            FixedWantedEntry.nurse_id, FixedWantedEntry.shift_date
+        ).filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == req.year,
+            FixedWantedEntry.month == req.month,
+            FixedWantedEntry.is_applied == True,  # noqa: E712
+        ).all()
+    }
+
+    # ── 4단계: caller group 스냅샷 replace (delete-then-insert) ──
+    deleted = db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == req.year,
+        BannedWantedEntry.month == req.month,
+    ).delete()
+
+    new_entries: List[BannedWantedEntry] = []
+    for e in kept:
+        codes = [str(c).strip().upper() for c in e.banned_shift_ids]
+        if (e.nurse_id, e.shift_date) in fixed_cells:
+            # 확정 근무가 있는 셀은 근무가 1개로 확정 → 금지는 의미가 없다.
+            # 죽은 행을 남기지 않도록 저장 자체를 하지 않고(정합성), 비차단 통지만 한다.
+            warnings.append({
+                "nurse_id": e.nurse_id,
+                "shift_date": e.shift_date.isoformat(),
+                "dropped_shift_ids": codes,
+                "reason": "dropped_on_fixed_cell",
+                "message": "확정 근무가 있는 셀이라 금지는 저장하지 않았습니다.",
+            })
+            continue
+        row = BannedWantedEntry(
+            group_id=group_id,
+            year=req.year,
+            month=req.month,
+            nurse_id=e.nurse_id,
+            shift_date=e.shift_date,
+            banned_shift_ids=codes,
+            is_applied=bool(e.is_applied),
+            reason=e.reason,
+            created_by=nurse_id,
+        )
+        db.add(row)
+        new_entries.append(row)
+
+    # TODO(P2, 권장): 저장 시 일·교대별 need 대비 banned 적용 후 공급을 경량 재현하여
+    #   need>공급이면 warnings 에 {"reason": "coverage_risk", ...} 비차단 통지 추가.
+    #   cap 로직은 cp_sat/fallback_lex.py:645-714 참고. (config daily_shift_requirements 필요)
+
+    db.commit()
+    for r in new_entries:
+        db.refresh(r)
+    print(
+        f"[BannedWanted] 저장 caller_group={group_id} {req.year}-{req.month} "
+        f"entries={len(new_entries)}건 (기존 삭제 {deleted}, fixed셀 drop {len(warnings)})"
+    )
+    return new_entries, warnings
+
+
 def toggle_fixed_wanted_entry_service(
     db: Session,
     entry_id: int,
@@ -2822,6 +3046,44 @@ def toggle_fixed_wanted_entry_service(
     return entry
 
 
+def toggle_banned_wanted_entry_service(
+    db: Session,
+    entry_id: int,
+    caller_group_id: Optional[str] = None,
+) -> BannedWantedEntry:
+    """금지 원티드 개별 항목 적용/미적용(반려) 토글 서비스.
+
+    fixed 토글과 동일 정책 — caller_group_id 지정 시 entry.group_id 불일치면 403.
+    미적용(is_applied=False) 항목은 근무표 생성 컨버터가 반영하지 않는다.
+    """
+    entry = db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.id == entry_id
+    ).first()
+
+    if not entry:
+        raise ValueError(f"Entry not found: {entry_id}")
+
+    if caller_group_id is not None and entry.group_id != caller_group_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "errors": [{
+                    "type": "cross_toggle_blocked",
+                    "entry_id": entry_id,
+                    "owner_group_id": entry.group_id,
+                    "message": "다른 병동이 저장한 항목은 토글할 수 없습니다",
+                }]
+            },
+        )
+
+    entry.is_applied = not entry.is_applied
+    db.commit()
+    db.refresh(entry)
+
+    print(f"BannedWantedEntry 토글: id={entry_id}, is_applied={entry.is_applied}")
+    return entry
+
+
 def reset_fixed_wanted_service(
     db: Session,
     group_id: str,
@@ -2838,9 +3100,18 @@ def reset_fixed_wanted_service(
         FixedWantedEntry.year == year,
         FixedWantedEntry.month == month,
     ).delete()
+    # 금지 원티드도 함께 재설정(같은 조정판 리셋 흐름).
+    banned_deleted = db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == year,
+        BannedWantedEntry.month == month,
+    ).delete()
     db.commit()
 
-    print(f"FixedWantedEntry 재설정: group={group_id}, {year}-{month:02d}, 삭제={deleted_count}건")
+    print(
+        f"FixedWantedEntry 재설정: group={group_id}, {year}-{month:02d}, "
+        f"삭제={deleted_count}건 (banned {banned_deleted}건)"
+    )
 
     return get_wanted_adjustment_service(db, group_id, year, month)
 
