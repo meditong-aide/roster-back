@@ -101,6 +101,7 @@ class AgentTestSession:
         nurse_name: str = "김민지",
         user_role: str = "HN",
         client: Any = None,
+        dag: bool = False,
     ):
         self.db = db
         self.ctx = SessionContext(
@@ -117,17 +118,31 @@ class AgentTestSession:
         # US-A4 user-memory consolidate hook 이 같은 client 를 호출하면
         # scripted sequence 가 꼬인다. memory hook 은 명시 테스트에서만 enable.
         self.agent = SchedulingAgent(self.client, enable_user_memory=False)
+        # dag=True 면 DAG 계획 경로 강제(env AIDE_DAG_PLANNING 무관) — 멀티턴 clarify/plan
+        # 라운드트립을 harness 로 구동하기 위함.
+        self.agent._dag_planning = dag
         self.last_result: AgentResult | None = None
         self.all_results: list[AgentResult] = []
 
     # ── interaction ──────────────────────────────────────────
 
-    def send(self, query: str) -> AgentResult:
-        """1턴 진행. ctx.messages 누적 → 다음 send() 는 multi-turn 으로 이어짐."""
+    def send(self, query: str, *, clarify_answers: list[dict] | None = None) -> AgentResult:
+        """1턴 진행. ctx.messages 누적 → 다음 send() 는 multi-turn 으로 이어짐.
+
+        clarify_answers: 직전 턴이 clarify_form 을 냈을 때(needs_clarification=True),
+            프론트가 채워 보내는 답변([{task,param,value}, ...]). 주면 이번 턴이 clarify
+            재개(_resume_clarify)로 들어간다. (pending_clarify 는 agent 가 ctx 에 직접
+            심어두므로 별도 전파 불필요 — 같은 ctx 객체를 재사용.)
+        """
+        if clarify_answers is not None:
+            self.ctx.clarify_answers = clarify_answers
         result = self.agent.run(self.db, query, self.ctx)
         # multi-turn 을 위해 context 의 messages 를 갱신
         self.ctx.messages = result.messages
-        if result.awaiting_approval:
+        # ReAct 미리보기는 agent 가 ctx.pending_approval 을 안 심으므로 harness 가 preview 로 채운다.
+        # 반면 DAG 는 _finalize_plan 이 {"type":"plan",...} 을 이미 심어두므로 덮어쓰면 안 된다
+        # (덮어쓰면 turn2 "응" 이 _commit_plan 대신 ReAct 승인으로 새 → 커밋 깨짐).
+        if result.awaiting_approval and not self.ctx.pending_approval:
             self.ctx.pending_approval = result.preview
         self.last_result = result
         self.all_results.append(result)

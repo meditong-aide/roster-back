@@ -122,3 +122,25 @@ def test_async_skill_deferred_not_executed():
     assert "manage_daily_shift" in calls
     assert [t.id for t in res.deferred] == ["t2"]
     assert res.failed is None
+
+
+# ── 병렬 read 하드닝 (#4): 스레드/세션 예외 → 크래시 대신 error 결과 ──
+def test_parallel_read_session_factory_error_graceful():
+    def bad_factory():
+        raise RuntimeError("conn fail")
+    plan = Plan([PlanTask("t1", "query_schedule", kind="read"),
+                 PlanTask("t2", "analyze_report", kind="read")])
+    res = execute_plan(None, plan, None, lambda *a: {"ok": True}, session_factory=bad_factory)
+    assert res.failed is not None  # 예외가 error 로 변환(크래시 없음)
+    assert "병렬 read 오류" in str(res.failed["data"])
+
+
+def test_parallel_read_skill_exception_graceful():
+    def fn(db, skill, args, ctx):
+        if skill == "analyze_report":
+            raise RuntimeError("skill boom")
+        return {"ok": True}
+    plan = Plan([PlanTask("t1", "query_schedule", kind="read"),
+                 PlanTask("t2", "analyze_report", kind="read")])
+    res = execute_plan(None, plan, None, fn, session_factory=lambda: _FakeSession())
+    assert res.failed is not None  # 스레드 내 skill 예외도 error 로(크래시 없음)
