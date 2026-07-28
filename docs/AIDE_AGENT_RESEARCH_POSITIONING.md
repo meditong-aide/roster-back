@@ -75,6 +75,32 @@ scope·권한·안전성과 함께 매핑**하는 것. 이는 실배포(producti
   **tool이 이미 검색된 뒤 gating**을 다룬다 — **tool을 애초에 찾느냐(라우팅/vocabulary)**는 안 다룸.
   우리 §4.4는 그 **상류(functional) 층**이라 차별된다.
 
+### 3.6 Planning vs Reactive 실행 (DAG 플래너 + ReAct fallback) — ⚠️ 정립된 조합
+우리 실행 계층은 **의존 복합 → DAG 플래너, 단순/독립 → ReAct fallback**을 입력별로 라우팅한다
+(`app/agents_v2/planning/`, opt-in `AIDE_DAG_PLANNING`). 자료조사 결과 이는 **새 발명이 아니라
+두 개의 named 패턴을 합친 것**이며, 단일 표준 명칭만 없다.
+- **LLMCompiler**("An LLM Compiler for Parallel Function Calling", arXiv 2312.04511, ICML 2024):
+  Planner→Task-Fetching→Executor. 플래너가 **task DAG를 스트리밍**하고 의존 해소된 task를 병렬
+  디스패치(변수참조 `${1}`로 앞 출력 소비). ReAct 대비 **지연 3.7x↓·비용 6.7x↓·정확도 ~9%↑**
+  보고 — "의존/병렬 분해 가능하면 planning이 ReAct보다 낫다"의 1차 근거. 우리 DAG 층과 동형.
+- **Plan-and-Execute / ReWOO**(LangChain, langchain.com/blog/planning-agents): 플래너(다단계 계획)와
+  실행자(상위 LLM 재호출 없이 스텝 실행) 분리 → **더 빠름·저렴·고품질**. 우리 planner/executor 분리와 동일.
+- **RP-ReAct**(EmergentMind): Reasoner-Planner를 ReAct **위에** decouple — "플래너 위, ReAct 아래"가
+  published 아키텍처로 존재.
+- **Dynamic/Conditional (gated) Planning**(EmergentMind, "ReAct&Plan"): **계획이 가치있을 때만 계획
+  노력을 할당하는 게이팅** — 우리 "의존성 있을 때만 플래너 발동"의 추상형. "plan globally, act
+  locally… not an either/or"(byaiteam 2025-12)가 모토.
+- **산업 가이드 정합**: Anthropic "Building Effective Agents"(2024-12)의 **Workflow(predefined
+  path, 예측가능)↔Agent(런타임 경로결정)** 구분 + **routing 패턴**("입력 분류 후 특화 후속으로
+  dispatch"); OpenAI 실전가이드의 **code(결정론)↔LLM 오케스트레이션** 선택; LangChain의
+  router-vs-supervisor — 넷 다 "구조화 경로 vs 반응 경로를 입력별로 고르기"를 권장.
+- **정직한 함의**: 패턴 자체는 novelty 아님. 방어 가능한 것은 **분기 기준**(발화 길이/복잡도가
+  아니라 **task 간 의존 구조**로 planner↔ReAct 라우팅)이며, 이는 정식 벤치마크된 named
+  contribution이라기보단 emerging best-practice → 포지셔닝 여지. **문헌이 지적하는 유일한
+  리스크는 두 경로를 두는 것 자체가 아니라, cross-cutting 로직(승인/clarify/검증)을 경로별로
+  복제하면 생기는 drift** — 해법은 "경로 통합"이 아니라 **공유 게이트 1개를 양쪽이 호출**
+  (docs/AGENT_SHARED_GATE_REFACTOR.md, §4.5).
+
 ---
 
 ## 4. 접근 & 기여 (Contributions)
@@ -103,6 +129,14 @@ retrieval이 "실패"가 아니라 애초에 후보에 없다. 우리는 라이�
 > ScaleMCP는 auto-sync를 "주장"하나, 우리는 **실배포에서 이 정합이 깨지는 구체적 실패모드와
 > 측정된 수정**을 제시한다. ToolRet의 "retriever가 신규 tool에 약하다"를 **분류 단계에서**
 > 재확인하고 저비용 수정을 보인 것이 차별점.
+
+### 4.5 실행 계층 — 의존성-트리거 planner↔ReAct 라우팅 + 공유 게이트
+§3.6 참조. 개별 패턴(LLMCompiler/Plan-and-Execute/ReAct)이 아니라 **결합 규칙**이 기여점:
+(a) 분기 기준이 발화 표면이 아니라 **task 의존 구조**(독립·단일→ReAct 병렬배칭, 의존복합→DAG),
+(b) 모든 실패/파싱불가/저신뢰는 ReAct로 **안전 강등**(dead-end 없음). 문헌의 drift 경고에 대한
+우리 대응은 **cross-cutting 게이트(승인/clarify/L2검증) 단일화**(docs/AGENT_SHARED_GATE_REFACTOR.md).
+현 상태는 두 경로가 게이트를 각자 구현해 이미 비대칭(예: staleness 가드는 DAG만, auto-validation은
+ReAct만)이라, 이 통합은 novelty가 아니라 **정합성 부채 상환**으로 위치한다.
 
 ---
 
@@ -212,3 +246,11 @@ tool-level의 상류 격리) + 부트스트랩 95% CI, query당 N회 반복. 토
 - Harnessing Agent Skills — Skill-Mediated Reference Architecture: https://arxiv.org/html/2606.20631v1
 - Autoformalization of Agent Instructions into Policy-as-Code (Cedar): https://arxiv.org/pdf/2606.26649
 - SLA Management in Intent-Driven Systems (functional/non-functional decomposition): https://arxiv.org/pdf/2208.01218
+- LLMCompiler — An LLM Compiler for Parallel Function Calling (ICML 2024): https://arxiv.org/abs/2312.04511 · https://proceedings.mlr.press/v235/kim24y.html · code https://github.com/SqueezeAILab/LLMCompiler
+- LangChain — Plan-and-Execute Agents (Plan-Execute/ReWOO/LLMCompiler): https://www.langchain.com/blog/planning-agents
+- Anthropic — Building Effective Agents (workflow vs agent, routing): https://www.anthropic.com/engineering/building-effective-agents
+- OpenAI — A Practical Guide to Building AI Agents (code vs LLM orchestration): https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/
+- LangChain — Router multi-agent pattern: https://docs.langchain.com/oss/python/langchain/multi-agent/router
+- EmergentMind — RP-ReAct (decoupled planner+ReAct): https://www.emergentmind.com/topics/rp-react-reasoner-planner-react
+- EmergentMind — ReAct&Plan / Conditional(gated) Planning: https://www.emergentmind.com/topics/react-plan-strategy
+- byaiteam — ReAct vs Plan-and-Execute ("plan globally, act locally"): https://byaiteam.com/blog/2025/12/09/ai-agent-planning-react-vs-plan-and-execute-for-reliability/
