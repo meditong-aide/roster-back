@@ -150,7 +150,8 @@ def test_route_scoped_when_classified():
     res = route(_FakeLLM('["navigation"]'), "팀 어디서 바꿔")
     assert res.fallback_used is False
     assert res.categories == ["navigation"]
-    assert set(res.tool_names) == {"navigate", "prefill", "switch_ward", "invoke", "lookup_guide"}
+    assert set(res.tool_names) == {"navigate", "prefill", "switch_ward", "invoke",
+                                   "lookup_guide", "log_feedback"}
 
 
 def test_route_exception_falls_back():
@@ -189,8 +190,9 @@ def test_agent_scopes_tools_when_router_injected():
     )
     result = agent.run(None, "팀 어디서 바꿔", _ctx())
 
-    # 메인 루프는 scoped tool 만 받았다 (SKILL_TOOLS 정의 순서 = invoke 가 마지막)
-    assert main.seen_tool_names == ["navigate", "prefill", "switch_ward", "invoke", "lookup_guide"]
+    # 메인 루프는 scoped tool 만 받았다 (SKILL_TOOLS 정의 순서)
+    assert main.seen_tool_names == ["log_feedback", "navigate", "prefill", "switch_ward",
+                                    "invoke", "lookup_guide"]
     # routing trace stage 가 있고 categories/ fallback 기록
     routing = [s for s in result.trace if s.name == "routing"]
     assert routing, "routing stage 없음"

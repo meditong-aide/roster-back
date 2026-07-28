@@ -31,7 +31,9 @@ ALL_TOOL_NAMES: list[str] = [t["name"] for t in SKILL_TOOLS]
 # gray-zone 도메인엔 navigate/prefill 을 번들해 메인 프롬프트가 화면이동 vs 조회/실행을 가른다.
 CATEGORY_TOOLS: dict[str, list[str]] = {
     # 순수 화면 이동/폼 프리필/병동 컨텍스트 전환 + 비파괴 UI 명령(엑셀 다운로드 등)
-    "navigation": ["navigate", "prefill", "switch_ward", "invoke"],
+    # log_feedback: '이런 화면 있으면 좋겠어요' 같은 기능 건의가 navigation 으로 분류되는
+    # 케이스 커버(triage 접수 sink 는 어느 카테고리로 오분류돼도 도달 가능해야 함).
+    "navigation": ["navigate", "prefill", "switch_ward", "invoke", "log_feedback"],
     # 근무표/원티드/간호사/시프트/설정값 조회 (view-vs-derive gray → navigate 번들)
     # [LIVE_LLM_CARVE 2026-06-22] '생성 끝났어?' / '마감일 어때?' / '한도 넘은 사람' 같은
     # 조회 발화가 read 직격 시그널이라 read 카테고리에 mutation 스킬의 조회 op 도 번들.
@@ -47,6 +49,10 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     "mutate": [
         "bulk_mutation", "manage_wanted_deadline", "manage_wanted_limits",
         "log_feedback",
+        # [BENCH50 2026-07] '상호배제 걸어줘/같이 근무 안 서게 묶어줘'가 mutate 로 분류되는데
+        # manage_mutual_exclusion 이 settings_people 전용이라 놓쳐 log_feedback 로 오폴백 →
+        # mutate 에도 배선(다중 배선으로 recall 복구, mutual-exclusion 도 결국 mutation).
+        "manage_mutual_exclusion",
         "manage_teams", "query_schedule", "publish_schedule",
         # [EVAL 2026-07-20] '김민지 5월 N 4번으로 맞춰줘' 같은 개인 월한도 변경이 mutate 로
         # 분류돼 update_monthly_limit(settings_rules 전용)을 놓쳤음 → 다중 배선으로 recall 복구.
@@ -60,6 +66,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
         "resolve_infeasibility", "navigate", "query_schedule", "invoke",
         # 근무표 확정/발행(생성과 인접한 lifecycle 연산).
         "publish_schedule",
+        "log_feedback",
     ],
     # 제약 위반 검증 / 교정 제안 (실패 후 해결 옵션 흐름도 인접 — resolve_infeasibility 번들)
     "validate_repair": [
@@ -70,7 +77,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
     # 분포·공정성·통계 분석
     "analyze": ["analyze_report", "query_schedule", "log_feedback"],
     # 대체/교체 간호사 추천
-    "recommend": ["recommend_candidates", "query_schedule"],
+    "recommend": ["recommend_candidates", "query_schedule", "log_feedback"],
     # 병동 규칙/제약/월 한도 정책 변경 (설정 화면 gray → navigate/prefill 번들)
     "settings_rules": [
         "update_constraint", "update_monthly_limit",
@@ -140,7 +147,8 @@ _CLASSIFY_SYSTEM = (
     "- settings_people: 등급(grade)별 인원('시니어 최소 2명'), 팀별 최소 인원('A팀 나이트 최소 2명'), "
     "간호사 **개인 속성** 변경·조회. 개인 속성 예: 야간전담·팀 배정·병동 이동·직급·경력·"
     "**프리셉터/멘토 지정**·**고정근무(평일 데이/나이트 고정)**·**메모/비고**·주말휴무·주휴·"
-    "**원티드 최대/한도**·**퇴사 처리(퇴사일)**. "
+    "**원티드 최대/한도**·**퇴사 처리(퇴사일)**·"
+    "**상호배제(두 간호사 같이 근무 안 서게/묶어/함께 배치 금지)**. "
     "이런 속성을 '바꿔/지정/추가'뿐 아니라 '누구야/돼있어/야?'로 **조회**해도 여기.\n\n"
     "복합 의도면 여러 개 고른다. "
     "오직 JSON 배열만 출력한다. 예: [\"read\"] 또는 [\"mutate\",\"recommend\"]. "

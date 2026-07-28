@@ -27,6 +27,7 @@ LABELED_QUERIES: list[tuple[str, list[str], str]] = [
     ("5월 3일 데이 빈자리 대체자 추천", ["recommend"], "recommend_candidates"),
     ("야간 최대 7회로 바꿔줘", ["settings_rules"], "update_constraint"),
     ("김민지 야간전담으로 바꿔줘", ["settings_people"], "update_person_attr"),
+    ("근무표 어떻게 만들어?", ["help"], "lookup_guide"),  # 사용법·절차 안내(온보딩)
 ]
 
 # 복합 의도(multi-label) — 두 tool 모두 scoped set 에 있어야.
