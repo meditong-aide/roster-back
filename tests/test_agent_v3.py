@@ -336,7 +336,10 @@ class TestSkillDescriptions:
         # + 3 client-action (navigate, prefill, switch_ward) = 20.
         # + 1 client-action (invoke, 2026-07-07 비파괴 UI 명령/엑셀) = 21.
         # + 1 manifest 첫 시민 (manage_assignment, 파견) = 22.
-        assert len(SKILL_TOOLS) == 24
+        # + 1 lookup_guide (help-doc RAG) = 23.
+        # + 1 manage_daily_shift (시프트별 필요인원) = 24.
+        # + 3 publish_schedule / manage_mutual_exclusion / log_feedback = 27.
+        assert len(SKILL_TOOLS) == 27
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:
