@@ -1,9 +1,9 @@
 """banned_wanted (금지 원티드) — fixed_wanted 의 배반.
 
 검증 대상:
-- 저장 검증: 개수(max2), 근무만(O 불가), 중복, 허용집합 합집합 가드(P3)
+- 저장 검증: 중복 / 병동 실존 코드(OFF 포함 전부 금지 가능) / 실현가능성(옵션 1개 남기기)
 - None=미변경, []=전체 해제, 스냅샷 replace
-- fixed 충돌 셀 → inert 경고(저장은 진행, fixed 우선)
+- fixed 충돌 셀 → 저장 안 함(정합성), 반려(토글)
 - 컨버터: banned → initial_constraints forbidden 맵(P1 경로)
 """
 from __future__ import annotations
@@ -30,6 +30,11 @@ def seeded(db):
     db.commit = db.flush  # type: ignore[assignment]
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
+    # 병동 근무코드 D/E/N + OFF (banned 검증이 Shift.default_shift 에서 실존 코드를 읽는다)
+    for i, (code, nm, typ) in enumerate([("D", "데이", "근무"), ("E", "이브닝", "근무"),
+                                         ("N", "나이트", "근무"), ("O", "오프", "휴무")], start=1):
+        db.add(Shift(id=i, shift_id=code, office_id="o1", group_id="A", name=nm,
+                     color="#ffffff", type=typ, default_shift=code))
     # n1: 제한 없음. n2: N 만 허용(allowed_shifts=["N"] → D,E 이미 금지)
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1",
                  name="김간호", active=1, allowed_shifts=[]))
@@ -47,19 +52,42 @@ def _cell(nid, day, codes):
     return {"nurse_id": nid, "shift_date": f"2026-08-{day:02d}", "banned_shift_ids": codes}
 
 
-def test_max2_rejects_three_work_shifts(seeded):
+def test_ban_off_allowed_force_work(seeded):
+    """OFF(O) 금지 = 강제근무. 이제 허용된다(full parity)."""
     db = seeded
-    with pytest.raises(HTTPException) as ei:
-        save_banned_wanted_service(db, "A", "n1", _req([_cell("n1", 14, ["D", "E", "N"])]))
-    assert ei.value.status_code == 422
-    assert ei.value.detail["errors"][0]["type"] == "max_2_bans"
+    rows, _ = save_banned_wanted_service(db, "A", "n1", _req([_cell("n1", 14, ["O"])]))
+    assert len(rows) == 1 and rows[0].banned_shift_ids == ["O"]
 
 
-def test_off_ban_not_allowed(seeded):
+def test_ban_all_work_leaves_off_ok(seeded):
+    """근무 전부(D/E/N) 금지 → OFF 남음 → 강제OFF, 허용됨."""
+    db = seeded
+    rows, _ = save_banned_wanted_service(db, "A", "n1", _req([_cell("n1", 14, ["D", "E", "N"])]))
+    assert len(rows) == 1
+
+
+def test_ban_everything_rejected(seeded):
+    """근무+OFF 전부 금지 → 배정 옵션 0 → 422."""
     db = seeded
     with pytest.raises(HTTPException) as ei:
-        save_banned_wanted_service(db, "A", "n1", _req([_cell("n1", 14, ["O"])]))
-    assert ei.value.detail["errors"][0]["type"] == "off_ban_not_allowed"
+        save_banned_wanted_service(db, "A", "n1", _req([_cell("n1", 14, ["D", "E", "N", "O"])]))
+    assert ei.value.detail["errors"][0]["type"] == "no_option_left"
+
+
+def test_no_option_left_with_allowed_restriction(seeded):
+    """n2 는 N 만 허용(근무 옵션=N). banned=[N,O] → 근무·OFF 다 막힘 → 422."""
+    db = seeded
+    with pytest.raises(HTTPException) as ei:
+        save_banned_wanted_service(db, "A", "n2", _req([_cell("n2", 14, ["N", "O"])]))
+    assert ei.value.detail["errors"][0]["type"] == "no_option_left"
+
+
+def test_unknown_shift_code_rejected(seeded):
+    """병동에 없는 코드는 거부."""
+    db = seeded
+    with pytest.raises(HTTPException) as ei:
+        save_banned_wanted_service(db, "A", "n1", _req([_cell("n1", 14, ["X"])]))
+    assert ei.value.detail["errors"][0]["type"] == "unknown_shift_code"
 
 
 def test_duplicate_shift_rejected(seeded):
@@ -67,14 +95,6 @@ def test_duplicate_shift_rejected(seeded):
     with pytest.raises(HTTPException) as ei:
         save_banned_wanted_service(db, "A", "n1", _req([_cell("n1", 14, ["D", "D"])]))
     assert ei.value.detail["errors"][0]["type"] == "duplicate_shift"
-
-
-def test_p3_allowed_union_guard(seeded):
-    """n2 는 N 만 허용(D,E 금지) + banned=[N] → 근무 여지 0 → 422."""
-    db = seeded
-    with pytest.raises(HTTPException) as ei:
-        save_banned_wanted_service(db, "A", "n1", _req([_cell("n2", 14, ["N"])]))
-    assert ei.value.detail["errors"][0]["type"] == "no_workable_shift_left"
 
 
 def test_save_and_snapshot_replace(seeded):

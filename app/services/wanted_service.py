@@ -2809,8 +2809,19 @@ def save_fixed_wanted_service(
     return new_entries
 
 
-# 금지 원티드에서 다룰 수 있는 근무형(main code). O(OFF) 금지는 fixed_wanted(O)로 처리하므로 제외.
-_BANNED_WORK_CODES = {"D", "E", "N"}
+def _ward_main_codes(db: Session, group_id: str) -> Set[str]:
+    """병동에 실존하는 근무형(main code) 집합 — Shift.default_shift distinct.
+
+    fixed 와 동일 소스(Shift 테이블). banned 는 이 코드들(OFF 포함) 전부를 금지 대상으로
+    허용한다(하드코딩 D/E/N 아님). OFF 는 항상 존재하는 옵션이므로 없으면 보강.
+    """
+    rows = db.query(Shift.default_shift).filter(
+        Shift.group_id == group_id,
+        Shift.default_shift.isnot(None),
+    ).distinct().all()
+    mains = {str(ds).strip().upper() for (ds,) in rows if str(ds).strip()}
+    mains.add("O")  # OFF 는 솔버가 항상 배정 가능한 옵션 — 금지 대상/잔여 옵션 계산에 포함
+    return mains
 
 
 def _decode_banned_response(e: BannedWantedEntry, year: int, month: int) -> BannedWantedEntryResponse:
@@ -2887,33 +2898,42 @@ def save_banned_wanted_service(
         nid: (n.name or nid) for nid, n in nurse_rows.items()
     }
 
-    # ── 1단계: entry 단위 검증 (개수/근무만/중복/허용집합 합집합 가드) ──
+    # 병동 실존 근무코드(OFF 포함). 금지 대상은 fixed 와 동일하게 여기서 온다(하드코딩 아님).
+    ward_mains = _ward_main_codes(db, group_id)
+    work_mains = ward_mains - {"O"}  # 근무 메인(OFF 제외) — 잔여 옵션 계산용
+
+    # ── 1단계: entry 단위 검증 (중복/실존코드/실현가능성) ──
     errors: List[Dict[str, Any]] = []
     for e in banned_entries:
         codes = [str(c).strip().upper() for c in (e.banned_shift_ids or [])]
         sd = e.shift_date.isoformat()
+        # 비어있음
+        if not codes:
+            errors.append({"type": "empty_ban", "nurse_id": e.nurse_id, "shift_date": sd,
+                           "message": "금지 코드가 비어 있습니다."})
+            continue
         # 중복
         if len(codes) != len(set(codes)):
             errors.append({"type": "duplicate_shift", "nurse_id": e.nurse_id, "shift_date": sd,
                            "message": "금지 근무코드가 중복되었습니다."})
             continue
-        # 개수 1~2
-        if not (1 <= len(codes) <= 2):
-            errors.append({"type": "max_2_bans", "nurse_id": e.nurse_id, "shift_date": sd,
-                           "message": "금지는 셀당 1~2개까지 가능합니다(최소 1개 근무 여지 보장)."})
+        # 병동 실존 코드인가 (fixed 와 동일 소스; OFF 포함 전부 허용, 없는 코드만 거부)
+        unknown = [c for c in codes if c not in ward_mains]
+        if unknown:
+            errors.append({"type": "unknown_shift_code", "nurse_id": e.nurse_id, "shift_date": sd,
+                           "codes": unknown,
+                           "message": f"병동에 없는 근무코드: {', '.join(unknown)}"})
             continue
-        # 근무(D/E/N)만 — O 금지 불가
-        if any(c not in _BANNED_WORK_CODES for c in codes):
-            errors.append({"type": "off_ban_not_allowed", "nurse_id": e.nurse_id, "shift_date": sd,
-                           "message": "금지는 근무(D/E/N)만 가능합니다. OFF 강제는 확정 원티드(O)로 하세요."})
-            continue
-        # P3: 허용집합 합집합 가드 — 개인 허용근무 제한 ∪ banned 가 D/E/N 전멸이면 근무 불가
+        # 실현가능성 가드: 금지 + 개인 허용근무 제한 후에도 배정 옵션(근무/OFF)이 1개 이상 남아야.
+        #   allowed(개인 허용근무)는 근무 메인만 제한. OFF 는 banned 에 없으면 항상 옵션.
         nrow = nurse_rows.get(e.nurse_id)
         allowed = {str(x).strip().upper() for x in (getattr(nrow, "allowed_shifts", None) or [])}
-        forbidden_by_allowed = (_BANNED_WORK_CODES - allowed) if allowed else set()
-        if _BANNED_WORK_CODES <= (forbidden_by_allowed | set(codes)):
-            errors.append({"type": "no_workable_shift_left", "nurse_id": e.nurse_id, "shift_date": sd,
-                           "message": f"{nurse_name_map.get(e.nurse_id, e.nurse_id)} 간호사: 허용근무 제한과 겹쳐 근무 가능한 시프트가 없습니다."})
+        avail_work = (work_mains & allowed) if allowed else set(work_mains)
+        options = avail_work | {"O"}
+        remaining = options - set(codes)
+        if not remaining:
+            errors.append({"type": "no_option_left", "nurse_id": e.nurse_id, "shift_date": sd,
+                           "message": f"{nurse_name_map.get(e.nurse_id, e.nurse_id)} 간호사: 이 금지 조합이면 배정 가능한 근무/OFF가 없습니다."})
             continue
 
     if errors:

@@ -37,8 +37,7 @@
 | year / month | SMALLINT / TINYINT | |
 | nurse_id | VARCHAR(50) FK | |
 | shift_date | DATE | `(group,nurse,shift_date)` 유니크 |
-| banned_shift_ids | NVARCHAR(50) | JSON 배열 `["D","E"]`, 1~2개 |
-| banned_shifts_table_ids | NVARCHAR(50) | shifts.id 배열(코드 remap 안전) |
+| banned_shift_ids | JSON (MSSQL NVARCHAR(MAX)) | 금지 코드 배열 `["D","E"]`. 병동 실존 코드(OFF 포함) |
 | is_applied | BOOLEAN default True | |
 | reason | TEXT null | |
 | created_by / created_at / updated_at | | |
@@ -84,9 +83,9 @@
 }
 ```
 프론트 전송 규약:
-- `banned_shift_ids`: 근무코드 문자열 배열(`"D"|"E"|"N"`). id 아님. 백엔드가 shifts_table_id 매핑.
-- 셀당 **1~2개**. 3번째 chip은 프론트에서 비활성(백엔드 422 이중 방어).
-- `O` 금지 불가(OFF 강제는 fixed_wanted O). 중복 불가.
+- `banned_shift_ids`: 근무코드(main code) 문자열 배열. **병동에 실존하는 모든 코드(OFF 포함) 금지 가능** — fixed 와 동일 소스(Shift 테이블). 고정 D/E/N 아님. chip 목록은 병동 근무코드로 렌더.
+- **개수 상한 없음.** 단 금지 후 **배정 옵션(근무/OFF)이 최소 1개는 남아야** 함. 전부 금지 시 422 `no_option_left`. 중복 불가.
+- OFF(`O`) 금지 = **강제근무**(그 날 쉴 수 없음) = fixed(O 고정)의 배반. 허용됨.
 - **스냅샷 시맨틱**: `banned_entries`에 없는 셀은 그 월 금지에서 삭제. 그리드 전체 금지 상태를 그대로 전송.
 - ⚠️ **하위호환(P4)**: `banned_entries`는 **Optional, `null`="banned 손대지 않음"**(갱신 안 된 프론트 보호), `[]`="전체 해제". banned 삭제 스코프는 fixed의 `request_nurse_ids`와 **독립적으로** `banned_entries`의 nurse 집합에서 계산할 것. 안 그러면 fixed만 담긴 저장이 banned를 오삭제/오잔존시킨다.
 
@@ -127,15 +126,15 @@
 
 ## 3. 백엔드 검증 (저장 서비스 [wanted_service.py:2617](../app/services/wanted_service.py#L2617) 내부에 banned 브랜치)
 
-`save_fixed_wanted_service`를 **재사용**하고 banned 처리 분기를 추가. auth·group·관할검증·shift매핑은 이미 그 함수 안에 있음.
-1. 개수 `1 ≤ len ≤ 2` 위반 → 422 `max_2_bans`.
-2. 코드 ∈ {D,E,N}, `O` 포함 → 422 `off_ban_not_allowed`.
-3. 배열 내 중복 → 422 `duplicate_shift`.
-4. 관할 밖 셀 → 기존 `_validate_cross_save_entries` **재사용**.
-5. **★ 허용집합 합집합 가드 (P3, 필수)**: max-2 만으로는 근무 여지가 보장되지 않는다. 그 간호사의 **유효 허용근무**(`NurseAllowedShiftPeriod` as-of, 없으면 캐시 `allowed_shifts`)에서 이미 금지된 코드 ∪ banned 가 **{D,E,N} 전체를 덮으면** 강제 OFF/INFEASIBLE.
-   → 합집합이 근무 0개면 **422 `no_workable_shift_left`**(또는 정책상 허용 시 강한 warning). 예: 허용=[N] + banned=[N] → D/E/N 전멸.
-6. **fixed 충돌 → 저장하지 않음(정합성, 백엔드 권위)**: 그 날 fixed가 있으면 근무가 1개로 확정되므로 banned는 **존재 이유가 없다**(모순이든 군더더기든 결과는 fixed 그대로). 프론트 비활성은 UX 편의일 뿐 — stale/버그/직접호출로 fixed 셀 banned가 들어오면 **죽은 행**이 되므로 **백엔드가 저장 자체를 drop**한다. is_applied=True fixed 존재 셀의 banned는 persist하지 않고 `warnings`에 `reason:"dropped_on_fixed_cell"` 통지만(하드 reject 아님, 나머지 정상 저장). 저장 순서상 fixed가 먼저 커밋되어 최신 fixed 상태로 판정됨.
-7. **사전 용량 경고 (P2, 권장)**: banned는 fixed보다 커버리지를 깰 확률이 훨씬 높은데 현재 유일한 용량 점검([fallback_lex.py:645-714](../app/services/cp_sat/fallback_lex.py#L645-L714))은 **`print`만 하는 진단**이라 저장 전 통지가 없다. → 저장 시 같은 cap 로직(일·교대별 `need` vs banned 적용 후 공급)을 경량 재현해 `need>공급`이면 `warnings`에 `reason:"coverage_risk"`로 비차단 통지. 없으면 생성이 조용히 INFEASIBLE로 떨어진다.
+`save_fixed_wanted_service`를 **재사용**하고 banned 처리 분기를 추가. auth·group·관할검증은 이미 그 함수 안에 있음. **금지 대상 코드는 하드코딩 D/E/N 이 아니라 병동 Shift 테이블(`_ward_main_codes`, OFF 포함)에서 온다 — fixed 와 동급.**
+1. 배열 내 중복 → 422 `duplicate_shift`. 빈 배열 → 422 `empty_ban`.
+2. **병동 실존 코드 검사**: 각 코드 ∈ 병동 main code(`Shift.default_shift` distinct ∪ {O}). 없는 코드 → 422 `unknown_shift_code`.
+3. 관할 밖 셀 → 기존 `_validate_cross_save_entries` **재사용**.
+4. **★ 실현가능성 가드 (필수)**: 금지 + 개인 허용근무 제한 후에도 **배정 옵션이 1개 이상 남아야** 한다. `옵션 = (근무 메인 ∩ allowed) ∪ {O}`, `잔여 = 옵션 − banned`. 잔여 0 → 422 `no_option_left`.
+   - 근무 전부 금지·OFF 남김 → 강제OFF(허용). OFF 금지·근무 남김 → 강제근무(허용). **둘 다(근무 전부 + OFF) 금지 → 거부.**
+   - 예: 허용=[N] + banned=[N,O] → 옵션 {N,O} − {N,O} = ∅ → 거부. (이전 max-2/off-ban 규칙을 이 가드 하나로 대체)
+5. **fixed 충돌 → 저장하지 않음(정합성, 백엔드 권위)**: 그 날 fixed가 있으면 근무가 1개로 확정되므로 banned는 **존재 이유가 없다**(모순이든 군더더기든 결과는 fixed 그대로). 프론트 비활성은 UX 편의일 뿐 — stale/버그/직접호출로 fixed 셀 banned가 들어오면 **죽은 행**이 되므로 **백엔드가 저장 자체를 drop**한다. is_applied=True fixed 존재 셀의 banned는 persist하지 않고 `warnings`에 `reason:"dropped_on_fixed_cell"` 통지만(하드 reject 아님, 나머지 정상 저장). 저장 순서상 fixed가 먼저 커밋되어 최신 fixed 상태로 판정됨.
+6. **사전 용량 경고 (P2, 권장)**: banned는 fixed보다 커버리지를 깰 확률이 훨씬 높은데 현재 유일한 용량 점검([fallback_lex.py:645-714](../app/services/cp_sat/fallback_lex.py#L645-L714))은 **`print`만 하는 진단**이라 저장 전 통지가 없다. → 저장 시 같은 cap 로직(일·교대별 `need` vs banned 적용 후 공급)을 경량 재현해 `need>공급`이면 `warnings`에 `reason:"coverage_risk"`로 비차단 통지. 없으면 생성이 조용히 INFEASIBLE로 떨어진다.
 
 저장: 그 (group,year,month) banned 스냅샷 replace (§2.2 P4 스코프 주의).
 
@@ -150,7 +149,7 @@
 - `banned_shifts_table_ids`로 코드 복원 → nurse_id, `shift_date.day-1`→day_idx (fixed 컨버터의 활동범위/일자 경계 검증 [:5144-5153](../app/services/roster_create_service.py#L5144) 미러).
 - `{"forbidden": {nurse_id: {day_idx: [codes]}}}` 형태로 만들어 **[roster_create_service.py:2935](../app/services/roster_create_service.py#L2935) `config_dict["initial_constraints"] = _merge_initial_constraints(...)` 에 base/extra로 합류**. `_merge_initial_constraints`([:2610](../app/services/roster_create_service.py#L2610))가 nurse_id→day_idx→codes 합집합으로 병합.
 - 이후 기존 파이프가 `initial_forbidden → m.Add(X==0)`([cp_sat_basic.py:3059](../app/services/cp_sat_basic.py#L3059), [fallback_lex.py:1149](../app/services/cp_sat/fallback_lex.py#L1149)) 자동 enforce. **추가 솔버 코드 0.**
-- fixed 충돌 셀은 두 솔버가 user-fixed 셀에서 forbidden **통째 skip** → fixed 우선 자동 성립(모순 INFEASIBLE 없음, §3.6).
+- fixed 충돌 셀은 두 솔버가 user-fixed 셀에서 forbidden **통째 skip** → fixed 우선 자동 성립(모순 INFEASIBLE 없음, §3.5).
 - (선택) 진단용 `BannedWantedNode`를 `ForbiddenCellNode`([cp_sat_basic.py:3069](../app/services/cp_sat_basic.py#L3069)) 병렬 태깅.
 
 ---
@@ -166,8 +165,9 @@
 | **`banned_wanted_entries` 테이블 + 플래그** | 신규 | 소 |
 | 스키마 필드 (`banned_entries` Optional, `warnings`) | 신규 | 소 |
 | §3.1-3.4 기본 검증 (max2/근무만/중복/관할) | 신규(관할은 재사용) | 소 |
-| **§3.5 허용집합 합집합 가드 (P3, 필수)** | 신규 | 소~중 |
-| §3.7 사전 용량 경고 (P2, 권장) | 신규(cap 로직 재현) | 중 |
+| **§3.4 실현가능성 가드 (옵션 1개 남기기, 필수)** | 신규 | 소~중 |
+| §3.6 사전 용량 경고 (P2, 권장) | 신규(cap 로직 재현) | 중 |
+| 금지 대상 = 병동 실존 코드(OFF 포함), 하드코딩 D/E/N 제거 | 신규 | 소 |
 | §4 컨버터 브랜치 → `initial_constraints` 병합 (P1) | 신규 | 소 |
 | 반려(토글) `/banned/entry/{id}/toggle` (구현됨) | 신규 | 소 |
 
@@ -179,13 +179,15 @@
 
 **안전 확인**: fixed+banned 동일셀 모순 INFEASIBLE 없음(두 솔버 fixed셀 forbidden skip) · forbidden 병합구조 일치 · 커버리지 precheck가 banned 반영 · save 스냅샷 삭제 동작 확인.
 
-**반영된 수정**: P1(컨버터 경로 정정 →§4) · P3(허용집합 합집합 가드 →§3.5) · P2(사전 용량 경고 →§3.7) · P4(None-guard/독립 삭제스코프 →§2.2) · P6(충돌경고 무해화 →§3.6). 이 중 **P1·P3는 반드시**, P2·P4는 강력 권장.
+**반영된 수정**: P1(컨버터 경로 정정 →§4) · 실현가능성 가드(→§3.4) · P2(사전 용량 경고 →§3.6) · P4(None-guard/독립 삭제스코프 →§2.2) · fixed충돌 drop(→§3.5).
+
+**범위 확장(OFF 포함, full parity)**: 초기엔 D/E/N 하드코딩 + max-2 였으나, fixed 와 동급으로 **병동 실존 코드 전부(OFF 포함) 금지 가능**하도록 전환. OFF 금지=강제근무. max-2·off-ban·허용집합 가드는 **"옵션 1개 남기기"(§3.4) 하나**로 통합. 금지 대상 코드는 `_ward_main_codes`(Shift 테이블)에서 온다.
 
 ---
 
 ## 6. 프론트 체크리스트
-- [ ] 조정판 셀에 D/E/N 금지 chip 토글. 2개 선택 시 3번째 비활성.
+- [ ] 조정판 셀에 금지 chip 토글. chip 목록 = **병동 근무코드(OFF 포함)**, fixed 와 동일 소스. 개수 상한 없음.
 - [ ] `GET /wanted/adjustment` 응답 `banned_entries` 렌더(fixed와 시각 구분).
 - [ ] 저장 시 fixed `entries` + 금지 `banned_entries`를 **한 바디**로 스냅샷 전송.
-- [ ] 응답 `warnings` 처리: fixed에 가려 무시된 금지 셀 배지.
-- [ ] `banned_shift_ids`는 코드 문자열 배열, O 미포함.
+- [ ] 응답 `warnings` 처리: fixed 셀이라 저장 안 된 금지(`dropped_on_fixed_cell`) 배지.
+- [ ] `banned_shift_ids`는 코드 문자열 배열(OFF 포함). 전부 금지(옵션 0)는 백엔드가 422.
