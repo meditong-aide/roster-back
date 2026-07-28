@@ -235,6 +235,9 @@ def _row_to_item(
         group_id=str(r.group_id),
         year=int(as_of_year if as_of_year is not None else r.year),
         month=int(as_of_month if as_of_month is not None else r.month),
+        # 값의 실제 출처 = 원본 행의 연/월(이월이면 표시월과 다르다).
+        applied_from_year=int(r.year),
+        applied_from_month=int(r.month),
         d_min=r.d_min,
         d_max=r.d_max,
         d_exact=r.d_exact,
@@ -552,10 +555,11 @@ def upsert_nurse_monthly_limits_service(
             "n_min": row.get("n_min"), "n_max": row.get("n_max"), "n_exact": row.get("n_exact"),
             "o_min": row.get("o_min"), "o_max": row.get("o_max"), "o_exact": row.get("o_exact"),
         }
-        if _is_all_bounds_empty(payload):
-            if rec is not None:
-                db.delete(rec)
-            continue
+        # all-null 이라도 행을 삭제하지 않는다 — 그 달 '명시적 한도 없음'(묘비)을 보존한다.
+        # 삭제하면 as-of 조회("대상월 이하 최근 행")가 과거 non-null 을 재상속하므로,
+        # 사용자가 이번 달 '설정 안 함'을 저장해도 표현·구분이 불가능해진다.
+        # (묘비 = all-null 행. as-of 가 이 행에서 멈춰 null=해제를 반환하고 과거로 새지 않는다.)
+        # 실제 행 제거(= 상속으로 되돌리기)가 필요하면 '설정 안 함'과 혼동되지 않는 별도 계약으로 제공한다.
         if rec is None:
             rec = NurseMonthlyLimit(
                 nurse_id=row["nurse_id"],

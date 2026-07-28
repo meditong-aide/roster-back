@@ -777,6 +777,11 @@ class NurseMonthlyLimitItem(BaseModel):
     group_id: str
     year: int = Field(ge=2000, le=2100)
     month: int = Field(ge=1, le=12)
+    # 이 값이 실제로 나온 원본 행의 연/월(as-of 이월 출처).
+    # (year, month)=표시월. applied_from != 표시월 이면 과거 행에서 상속된 값,
+    # applied_from == 표시월 이면 그 달에 명시 저장된 값(모든 한도 null 이면 '명시적 해제').
+    applied_from_year: Optional[int] = Field(default=None)
+    applied_from_month: Optional[int] = Field(default=None)
 
     d_min: Optional[int] = Field(default=None, ge=0)
     d_max: Optional[int] = Field(default=None, ge=0)

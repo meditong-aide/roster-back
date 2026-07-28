@@ -148,51 +148,49 @@ def test_monthly_limits_warn_when_override_ratio_exceeds_30_percent(api):
     assert any(w.get("code") == "OVERRIDE_RATIO_EXCEEDED" for w in warnings)
 
 
-def test_monthly_limits_delete_row_when_all_bounds_are_null(api):
-    create_payload = {
-        "year": 2026,
-        "month": 5,
-        "limits": [
-            {
-                "nurse_id": "N001",
-                "group_id": "GRP001",
-                "year": 2026,
-                "month": 5,
-                "o_exact": 8,
-            }
-        ],
-    }
-    create_resp = api.put("/nurses/monthly-limits", json=create_payload)
+def test_monthly_limits_all_null_keeps_tombstone_row(api):
+    """'설정 안 함'(all-null) 저장은 행을 삭제하지 않고 묘비로 보존한다."""
+    create_resp = api.put("/nurses/monthly-limits", json={
+        "year": 2026, "month": 5,
+        "limits": [{"nurse_id": "N001", "group_id": "GRP001",
+                    "year": 2026, "month": 5, "n_max": 5}],
+    })
     assert create_resp.status_code == 200, create_resp.text
-    assert len(create_resp.json()["items"]) == 1
+    assert create_resp.json()["items"][0]["n_max"] == 5
 
-    clear_payload = {
-        "year": 2026,
-        "month": 5,
-        "limits": [
-            {
-                "nurse_id": "N001",
-                "group_id": "GRP001",
-                "year": 2026,
-                "month": 5,
-                "d_min": None,
-                "d_max": None,
-                "d_exact": None,
-                "e_min": None,
-                "e_max": None,
-                "e_exact": None,
-                "n_min": None,
-                "n_max": None,
-                "n_exact": None,
-                "o_min": None,
-                "o_max": None,
-                "o_exact": None,
-            }
-        ],
-    }
-    clear_resp = api.put("/nurses/monthly-limits", json=clear_payload)
+    # 나이트 제한 해제 = n_max/n_exact null 저장
+    clear_resp = api.put("/nurses/monthly-limits", json={
+        "year": 2026, "month": 5,
+        "limits": [{"nurse_id": "N001", "group_id": "GRP001",
+                    "year": 2026, "month": 5, "n_max": None, "n_exact": None}],
+    })
     assert clear_resp.status_code == 200, clear_resp.text
-    assert clear_resp.json()["items"] == []
+    items = clear_resp.json()["items"]
+    assert len(items) == 1  # 삭제 아님 — 묘비 보존
+    it = items[0]
+    assert it["n_max"] is None and it["n_exact"] is None  # 명시적 해제 상태
+    # 출처가 이 달 자신 → 상속이 아니라 이 달 명시(프론트가 '-' 확정 가능)
+    assert it["applied_from_year"] == 2026 and it["applied_from_month"] == 5
+
+
+def test_tombstone_blocks_past_inheritance_in_solver_fetch(db, seed_data):
+    """묘비가 있으면 as-of 조회가 과거 non-null 나이트 제한을 재상속하지 않는다."""
+    from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_by_nurse
+    from db.models import NurseMonthlyLimit
+
+    gid = seed_data["group_id"]
+    nid = "N001"
+    db.add(NurseMonthlyLimit(nurse_id=nid, group_id=gid, year=2026, month=4, n_max=5))
+    db.add(NurseMonthlyLimit(nurse_id=nid, group_id=gid, year=2026, month=5))  # 묘비(all-null)
+    db.flush()
+
+    # 6월 as-of → 5월 묘비에서 멈춤 → n_max None (4월 5 재상속 아님)
+    eff6 = fetch_effective_monthly_limits_by_nurse(db, 2026, 6, [nid], gid)
+    assert eff6[nid]["n_max"] is None
+
+    # 4월 as-of → 아직 5 (묘비는 5월 이후에만 영향)
+    eff4 = fetch_effective_monthly_limits_by_nurse(db, 2026, 4, [nid], gid)
+    assert eff4[nid]["n_max"] == 5
 
 
 def test_monthly_limits_get_forbidden_for_other_group(api):
