@@ -226,6 +226,12 @@ def build_unified_graph(
                     if cid in g.nodes:
                         g.add_edge("pressures", msn.node_id, cid)
                         g.add_edge("requires", cid, msn.node_id)
+                    # 월별 capacity 가 실제 병목(shortage>0)일 때만, 그 shift 의 일별
+                    # 부족 state 를 '월별 근본'에서 파생으로 잇는다(derived_from). blame 이
+                    # 일별 증상 → 월별 root 로 흘러 근본원인이 상위로 뜬다(다중홉의 척추).
+                    daily_cell = state_by_cell.get((day, s))
+                    if daily_cell and int(msn.evidence.get("shortage", 0) or 0) > 0:
+                        g.add_edge("derived_from", daily_cell, msn.node_id)
 
     # ── 4. soft constraint nodes (US-002) ───────────────────────────────────
     for sid, sc in ont.soft_constraints.items():
