@@ -13,6 +13,34 @@ from services.group_access import resolve_home_group_id
 from datetime import datetime, timezone, timedelta, date
 
 
+# ──────────────────────────── 도메인 예외 ────────────────────────────
+# 라우터에서 HTTP 상태로 매핑한다(403/409/422). 그 외 예외는 기존대로 500.
+class PreferenceForbiddenError(Exception):
+    """역할 또는 그룹 불일치 (403)."""
+
+
+class PreferenceConflictError(Exception):
+    """마감되었거나 이미 제출된 원티드 (409)."""
+
+
+class PreferenceValidationError(Exception):
+    """원티드 엔트리 검증 실패 (422). code 로 사유를 구분한다."""
+
+    def __init__(self, message: str, code: str = "invalid_entry"):
+        super().__init__(message)
+        self.code = code
+
+
+def _now_kst() -> datetime:
+    """KST 기준 naive 현재시각.
+
+    wanted.exp_date 는 KST naive 로 저장되는데 API 컨테이너는 TZ 미설정(UTC)이라
+    datetime.now() 로 비교하면 마감이 9시간 느슨해진다. close-expired 라우터와
+    동일하게 UTC+9 로 맞춘다.
+    """
+    return (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=9))
+
+
 def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int, month_str: str, *, group_id: str):
     """
     이전 request_id의 pair(선호/비선호) 데이터를 현재 request_id로 복사합니다.
@@ -77,15 +105,298 @@ def _carry_forward_pair_data(db: Session, nurse_id: str, current_request_id: int
     return 0
 
 
+# ──────────────────── wanted_entries 단일 원본 경로 ────────────────────
+# 임시저장(POST /preferences) 1회 · 제출(POST /preferences/submit) 1회로 저장과
+# 제출을 원자 처리한다. /wanted/invoke(AIDE 자연어 분석) 를 거치지 않는다.
+
+
+def _resolve_write_group_id(db: Session, current_user: UserSchema, requested_group_id) -> str:
+    """저장·제출 대상 그룹. 본인 원티드이므로 home group 이 유일한 정답이다."""
+    home_gid = resolve_home_group_id(db, current_user)
+    if not home_gid:
+        raise PreferenceForbiddenError("소속 그룹을 확인할 수 없습니다.")
+    if requested_group_id and str(requested_group_id) != str(home_gid):
+        raise PreferenceForbiddenError("본인 소속 그룹의 원티드만 저장할 수 있습니다.")
+    return str(home_gid)
+
+
+def _resolve_read_group_id(db: Session, current_user: UserSchema, requested_group_id) -> str:
+    """조회 대상 그룹.
+
+    /preferences/latest 는 '본인' 원티드를 돌려주므로 마감·한도 스코프는 항상 home
+    group 이다. requested_group_id 는 접근 가능한 그룹인지 확인용으로만 쓴다
+    (HN 이 관리 그룹으로 전환한 채 화면을 여는 경우가 있어 403 을 걸지 않는다).
+    """
+    from services.group_access import assert_caller_can_access_group
+
+    if requested_group_id:
+        assert_caller_can_access_group(db, current_user, str(requested_group_id))
+    home_gid = resolve_home_group_id(db, current_user)
+    if not home_gid:
+        raise PreferenceForbiddenError("소속 그룹을 확인할 수 없습니다.")
+    return str(home_gid)
+
+
+def _load_wanted_window(db: Session, group_id: str, year: int, month: int):
+    """해당 그룹/월의 원티드 요청(Wanted) 행. 없으면 None."""
+    return (
+        db.query(Wanted)
+        .filter(Wanted.group_id == group_id, Wanted.year == year, Wanted.month == month)
+        .first()
+    )
+
+
+def _is_wanted_closed(wanted) -> bool:
+    """마감 여부 — status='closed' 이거나 exp_date 경과."""
+    if wanted is None:
+        return False
+    if str(wanted.status or "") == "closed":
+        return True
+    return bool(wanted.exp_date and wanted.exp_date < _now_kst())
+
+
+def _latest_submitted_request(db: Session, nurse_id: str, month_str: str):
+    """해당 간호사/월의 최신 제출본. 없으면 None."""
+    return (
+        db.query(WantedRequest)
+        .filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True,
+        )
+        .order_by(WantedRequest.submitted_at.desc())
+        .first()
+    )
+
+
+def _assert_wanted_writable(wanted, year: int, month: int, submitted_wr) -> None:
+    """마감·중복제출 게이트. 위반 시 409."""
+    if wanted is None:
+        raise PreferenceConflictError(
+            f"{year}년 {month}월 원티드 요청이 아직 생성되지 않았습니다."
+        )
+    if _is_wanted_closed(wanted):
+        raise PreferenceConflictError(f"{year}년 {month}월 원티드가 마감되었습니다.")
+    if submitted_wr is not None:
+        raise PreferenceConflictError(
+            "이미 제출된 원티드입니다. 제출을 철회한 뒤 다시 저장해주세요."
+        )
+
+
+def _normalize_wanted_entries(entries, year: int, month: int, allowed_shift_ids: set) -> list[dict]:
+    """wanted_entries 를 검증·정규화한다(날짜 오름차순, 날짜별 1건).
+
+    intent 는 'wanted'(선호)만 지원한다. 'avoid'(피하고 싶은 근무)는 저장소·솔버 제약이
+    아직 없어 422 로 거절한다(별도 작업).
+
+    Raises:
+        PreferenceValidationError: 월 불일치 / 날짜 중복 / 미허용 근무코드 / avoid.
+    """
+    normalized: dict = {}
+    for item in entries or []:
+        entry_date = item.date
+        if entry_date.year != year or entry_date.month != month:
+            raise PreferenceValidationError(
+                f"{year}년 {month}월에 속하지 않는 날짜입니다: {entry_date.isoformat()}",
+                code="date_out_of_range",
+            )
+        if entry_date in normalized:
+            raise PreferenceValidationError(
+                f"같은 날짜가 중복되었습니다: {entry_date.isoformat()}",
+                code="duplicate_date",
+            )
+        if item.intent != "wanted":
+            raise PreferenceValidationError(
+                "피하고 싶은 근무(avoid)는 아직 지원하지 않습니다.",
+                code="unsupported_intent",
+            )
+        shift_id = (item.shift_id or "").strip()
+        if shift_id not in allowed_shift_ids:
+            raise PreferenceValidationError(
+                f"원티드에 사용할 수 없는 근무코드입니다: {item.shift_id}",
+                code="invalid_shift_id",
+            )
+        normalized[entry_date] = {
+            "date": entry_date,
+            "shift_id": shift_id,
+            "intent": item.intent,
+            "comment": item.comment or "",
+        }
+    return [normalized[key] for key in sorted(normalized)]
+
+
+def _assert_off_limit(entries: list[dict], off_shift_ids: set, max_requests) -> None:
+    """휴무/휴가 요청 개수 상한 검증. 초과 시 422(잘라내지 않고 거절)."""
+    if max_requests is None:
+        return
+    off_used = sum(1 for e in entries if e["shift_id"] in off_shift_ids)
+    if off_used > max_requests:
+        raise PreferenceValidationError(
+            f"휴무/휴가 요청 가능 수({max_requests}개)를 초과했습니다. 요청 {off_used}개.",
+            code="off_limit_exceeded",
+        )
+
+
+def _acquire_draft_request(db: Session, nurse_id: str, month_str: str, group_id: str):
+    """미제출 draft WantedRequest 를 확보한다. 없으면 새로 만든다.
+
+    wanted_requests.request_id 는 IDENTITY 가 아니고 복합 PK 라 SQLAlchemy 가
+    자동 채번하지 않는다. 기존 채번기(_next_request_id)를 그대로 쓴다.
+    """
+    draft = (
+        db.query(WantedRequest)
+        .filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == False,
+        )
+        .order_by(WantedRequest.created_at.desc())
+        .first()
+    )
+    if draft is not None:
+        return draft
+
+    from services.wanted_service import _next_request_id
+
+    draft = WantedRequest(
+        nurse_id=nurse_id,
+        request_id=_next_request_id(db, nurse_id, month_str),
+        month=month_str,
+        group_id=group_id,
+        request="",
+        is_submitted=False,
+        created_at=datetime.now(),
+    )
+    db.add(draft)
+    db.flush()
+    return draft
+
+
+def _replace_shift_requests(
+    db: Session,
+    nurse_id: str,
+    request_id: int,
+    entries: list[dict],
+    *,
+    group_id: str,
+    year: int,
+    month: int,
+) -> None:
+    """해당 월의 nurse_shift_requests 를 entries 로 전량 교체한다."""
+    start_date = date(year, month, 1)
+    end_date = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id == nurse_id,
+        NurseShiftRequest.request_id == request_id,
+        NurseShiftRequest.shift_date >= start_date,
+        NurseShiftRequest.shift_date < end_date,
+    ).delete(synchronize_session=False)
+
+    shift_table_ids = {
+        sid: tid
+        for sid, tid in db.query(Shift.shift_id, Shift.id)
+        .filter(Shift.group_id == group_id)
+        .all()
+    }
+    for detailed_id, entry in enumerate(entries, start=1):
+        db.add(NurseShiftRequest(
+            nurse_id=nurse_id,
+            request_id=request_id,
+            detailed_request_id=detailed_id,
+            shift_date=entry["date"],
+            group_id=group_id,
+            shift=entry["shift_id"],
+            score=10.0,  # 사용자 직접 입력 — /wanted/invoke 의 case 우선순위와 동일
+            partial_request="",
+            comment=entry["comment"],
+            shifts_table_id=shift_table_ids.get(entry["shift_id"]),
+        ))
+
+
+def save_wanted_entries_service(
+    req: PreferenceData,
+    current_user: UserSchema,
+    db: Session,
+    *,
+    is_draft: bool,
+):
+    """wanted_entries 를 단일 원본으로 저장한다. is_draft=False 면 제출까지 원자 처리.
+
+    Returns:
+        canonical wanted snapshot (get_latest_preference_service 와 동일 형태).
+    """
+    from services.wanted_service import _compute_weekly_off_days, _get_off_shift_ids
+
+    year, month = req.year, req.month
+    month_str = f"{year}-{month:02d}"
+    nurse_id = current_user.nurse_id
+    group_id = _resolve_write_group_id(db, current_user, req.group_id)
+
+    wanted = _load_wanted_window(db, group_id, year, month)
+    _assert_wanted_writable(
+        wanted, year, month, _latest_submitted_request(db, nurse_id, month_str)
+    )
+
+    allowed_shift_ids = {
+        row[0]
+        for row in db.query(Shift.shift_id)
+        .filter(Shift.group_id == group_id, Shift.show_in_preference == True)
+        .all()
+    }
+    normalized = _normalize_wanted_entries(req.wanted_entries, year, month, allowed_shift_ids)
+
+    # 주휴일은 원티드 대상이 아니다 — 기존 /wanted/invoke 와 동일하게 조용히 제외.
+    weekly_off_days = _compute_weekly_off_days(db, nurse_id, group_id, year, month)
+    if weekly_off_days:
+        dropped = [e["date"].day for e in normalized if e["date"].day in weekly_off_days]
+        if dropped:
+            print(f"[wanted_entries] 주휴일 엔트리 제외: {sorted(dropped)}")
+        normalized = [e for e in normalized if e["date"].day not in weekly_off_days]
+
+    entries = normalized
+
+    nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    _assert_off_limit(
+        entries,
+        set(_get_off_shift_ids(db, group_id)),
+        nurse_row.wanted_max_requests if nurse_row else None,
+    )
+
+    draft = _acquire_draft_request(db, nurse_id, month_str, group_id)
+    _replace_shift_requests(
+        db, nurse_id, draft.request_id, entries,
+        group_id=group_id, year=year, month=month,
+    )
+    if not is_draft:
+        draft.is_submitted = True
+        draft.submitted_at = datetime.now()
+
+    db.commit()
+    print(
+        f"[wanted_entries] {'제출' if not is_draft else '임시저장'} 완료: "
+        f"nurse={nurse_id}, {month_str}, request_id={draft.request_id}, "
+        f"{len(entries)}건"
+    )
+    return get_latest_preference_service(
+        year, month, current_user, db, override_group_id=group_id
+    )
+
+
 def submit_preferences_service(
-    req: PreferenceData, 
-    current_user: UserSchema, 
+    req: PreferenceData,
+    current_user: UserSchema,
     db: Session,
     is_draft: bool = False
 ):
     """
     희망근무 저장/제출 통합 서비스
+
+    req.wanted_entries 가 오면 단일 원본 경로로 위임한다(신규 계약).
+    없으면 기존 data 기반 경로로 동작한다(AIDE·모바일 하위호환).
     """
+    if req.wanted_entries is not None:
+        return save_wanted_entries_service(req, current_user, db, is_draft=is_draft)
+
     month_str = f"{req.year}-{req.month:02d}"
 
     # 본인 소속 그룹은 토큰 대신 DB(nurses.group_id)에서 — 토큰 stale 시에도 정합.
@@ -104,16 +415,11 @@ def submit_preferences_service(
     if draft:
         request_id = draft.request_id
     else:
-        draft = WantedRequest(
-            nurse_id=current_user.nurse_id,
-            month=month_str,
-            group_id=home_gid,
-            request="",
-            is_submitted=False,
-            created_at=datetime.now()
+        # request_id 는 IDENTITY 가 아니고 복합 PK 라 SQLAlchemy 가 자동 채번하지
+        # 않는다. 생략하면 NULL 로 INSERT 되어 실패하므로 기존 채번기를 쓴다.
+        draft = _acquire_draft_request(
+            db, current_user.nurse_id, month_str, home_gid
         )
-        db.add(draft)
-        db.flush()
         request_id = draft.request_id
     
     # ==================== 핵심: 항상 data_to_save 초기화 (에러 방지) ====================
@@ -137,7 +443,10 @@ def submit_preferences_service(
             data_to_save = preference_data
 
     # ==================== WantedConfig 검증 (최종 제출 시에만) ====================
-    if not is_draft and data_to_save:
+    # 주의: 과거에는 `and data_to_save` 조건이 붙어 있어, 프론트가 {year, month} 만
+    # 보내는 제출(=data 빈 dict)에서는 마감 검증이 통째로 스킵됐다. 마감 이후에도
+    # 제출이 통과하던 버그라 조건에서 제거한다.
+    if not is_draft:
         group_id = home_gid
         nurse_id = current_user.nurse_id
 
@@ -148,29 +457,21 @@ def submit_preferences_service(
         # ).first()
 
         # 2. Wanted 테이블 상태 확인 (해당 월의 원티드 요청이 생성되었는지, 마감되었는지)
-        wanted = db.query(Wanted).filter(
-            Wanted.group_id == group_id,
-            Wanted.year == req.year,
-            Wanted.month == req.month
-        ).first()
+        wanted = _load_wanted_window(db, group_id, req.year, req.month)
 
         # 2-1. Wanted가 존재하지 않으면 (수간호사가 아직 원티드 요청을 생성하지 않음)
         if not wanted:
             print(f"[검증 실패] Wanted 요청이 생성되지 않음: group_id={group_id}, {req.year}-{req.month:02d}")
-            raise Exception(f"{req.year}년 {req.month}월 원티드 요청이 아직 생성되지 않았습니다.")
-
-        # 2-2. status가 'closed'인 경우 (이미 마감됨)
-        if wanted.status == 'closed':
-            print(f"[검증 실패] Wanted가 이미 마감됨: group_id={group_id}, {req.year}-{req.month:02d}")
-            raise Exception(f"{req.year}년 {req.month}월 원티드가 이미 마감되었습니다.")
-
-        # 2-3. exp_date가 지난 경우 (마감일 경과)
-        if wanted.exp_date and wanted.exp_date < datetime.now():
-            print(f"[검증 실패] Wanted 마감일 경과: group_id={group_id}, {req.year}-{req.month:02d}, "
-                  f"마감일={wanted.exp_date.strftime('%Y-%m-%d %H:%M')}")
-            raise Exception(
-                f"{req.year}년 {req.month}월 원티드 마감일({wanted.exp_date.strftime('%Y-%m-%d %H:%M')})이 지났습니다."
+            raise PreferenceConflictError(
+                f"{req.year}년 {req.month}월 원티드 요청이 아직 생성되지 않았습니다."
             )
+
+        # 2-2. 마감 상태(status='closed' 또는 exp_date 경과)
+        if _is_wanted_closed(wanted):
+            print(f"[검증 실패] Wanted 마감: group_id={group_id}, {req.year}-{req.month:02d}, "
+                  f"status={wanted.status}, "
+                  f"마감일={wanted.exp_date.strftime('%Y-%m-%d %H:%M') if wanted.exp_date else 'None'}")
+            raise PreferenceConflictError(f"{req.year}년 {req.month}월 원티드가 마감되었습니다.")
 
         print(f"[검증 통과] Wanted 상태 확인: status={wanted.status}, "
               f"exp_date={wanted.exp_date.strftime('%Y-%m-%d %H:%M') if wanted.exp_date else 'None'}")
@@ -417,15 +718,55 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
     db.commit()
     return {"message": "Submission retracted successfully"}
 
-def get_latest_preference_service(year: int, month: int, current_user, db: Session):
+def _resolve_submission_status(wanted, target_wr) -> str:
+    """submission.status 판정.
+
+    - submitted: 본인 제출 완료(마감 여부와 무관)
+    - empty:     해당 월 원티드 요청(Wanted) 자체가 생성되지 않아 작성 불가
+    - closed:    요청은 있으나 마감(status='closed' 또는 exp_date 경과)
+    - requested: 작성 가능(미제출)
+    """
+    if target_wr is not None and bool(target_wr.is_submitted):
+        return "submitted"
+    if wanted is None:
+        return "empty"
+    if _is_wanted_closed(wanted):
+        return "closed"
+    return "requested"
+
+
+def _build_request_limit(db: Session, nurse_id: str, group_id: str | None, entries: list[dict]) -> dict:
+    """휴무/휴가 요청 한도 사용량. max 는 nurses.wanted_max_requests(없으면 None)."""
+    from services.wanted_service import _get_off_shift_ids
+
+    nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    max_requests = nurse_row.wanted_max_requests if nurse_row else None
+    off_shift_ids = set(_get_off_shift_ids(db, group_id)) if group_id else set()
+    used = sum(1 for e in entries if e["shift_id"] in off_shift_ids)
+    return {"used": used, "max": max_requests}
+
+
+def get_latest_preference_service(
+    year: int,
+    month: int,
+    current_user,
+    db: Session,
+    override_group_id: str | None = None,
+):
     """
     최신 선호도 데이터 조회 서비스 함수 (WantedRequest 기반)
-    Front 기대 출력 형태에 맞게 중첩 구조로 변환하여 반환
+
+    canonical wanted snapshot 을 한 번에 반환한다:
+        preference_data.wanted_entries / submission / request_limit
+    기존 필드(preference_data.shift/preference, is_submitted, created_at,
+    submitted_at)는 모바일·기존 프론트 하위호환을 위해 그대로 유지한다.
     """
     if not current_user:
         raise Exception("Not authenticated")
     nurse_id = current_user.nurse_id
     month_str = f"{year}-{month:02d}"
+    group_id = _resolve_read_group_id(db, current_user, override_group_id)
+    wanted = _load_wanted_window(db, group_id, year, month)
     # 1️⃣ 제출된 요청 중 최신 데이터
     submitted_wr = (
         db.query(WantedRequest)
@@ -448,12 +789,21 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
         .first()
     )
     if not target_wr:
-        # 아무 데이터도 없을 때
+        # 아무 데이터도 없을 때. preference_data=None 은 기존 프론트/모바일의
+        # '빈 제출' 분기 조건이라 유지한다. 신규 계약은 submission.status 로 판단.
         return {
+            "year": year,
+            "month": month,
             "preference_data": None,
             "is_submitted": False,
             "created_at": None,
             "submitted_at": None,
+            "submission": {
+                "status": _resolve_submission_status(wanted, None),
+                "submitted_at": None,
+                "deadline_at": wanted.exp_date.isoformat() if wanted and wanted.exp_date else None,
+            },
+            "request_limit": _build_request_limit(db, nurse_id, group_id, []),
         }
     # 3️⃣ 해당 request_id로 shift / pair 데이터 가져오기
     shift_rows = (
@@ -499,17 +849,42 @@ def get_latest_preference_service(year: int, month: int, current_user, db: Sessi
             "request": p.partial_request,
             "weight": float(p.score) if p.score is not None else 0.0,
         })
-    # 6️⃣ 최종 JSON 구성 (Front 기대 형식)
+    # 6️⃣ wanted_entries — 날짜별 한 건. 저장·조회·제출의 단일 원본.
+    #    이름/색상은 담지 않는다(프론트가 shift_id 로 근무코드 룩업과 조인).
+    wanted_entries = [
+        {
+            "date": s.shift_date.isoformat(),
+            "shift_id": s.shift,
+            "intent": "wanted",  # avoid 는 미지원 — 저장 시 422 로 거절된다
+            "comment": s.comment or "",
+        }
+        for s in shift_rows
+    ]
+    wanted_entries.sort(key=lambda e: e["date"])
+
+    # 7️⃣ 최종 JSON 구성 (Front 기대 형식)
     preference_data = {
         "request": target_wr.request,  # 상위 텍스트 그대로
         "shift": shift_data,
         "preference": pair_data,
+        "wanted_entries": wanted_entries,
     }
     return {
+        "year": year,
+        "month": month,
         "preference_data": preference_data,
         "is_submitted": bool(target_wr.is_submitted),
         "created_at": target_wr.created_at,
         "submitted_at": target_wr.submitted_at,
+        "submission": {
+            "status": _resolve_submission_status(wanted, target_wr),
+            "submitted_at": target_wr.submitted_at.isoformat() if target_wr.submitted_at else None,
+            "deadline_at": wanted.exp_date.isoformat() if wanted and wanted.exp_date else None,
+        },
+        "request_limit": _build_request_limit(
+            db, nurse_id, group_id,
+            [{"shift_id": e["shift_id"]} for e in wanted_entries],
+        ),
     }
 
 def get_all_preferences_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
@@ -524,7 +899,9 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
         raise Exception("Not authenticated")
     month_str = f"{year}-{month:02d}"
 
-    target_group_id = override_group_id or home_gid
+    # override_group_id 미지정 시 호출자 home group. (과거 정의되지 않은 home_gid 를
+    # 참조해 group_id 없이 호출하면 NameError → 500 이었다.)
+    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
     # ✅ 1️⃣ 그룹 내 간호사 목록 가져오기

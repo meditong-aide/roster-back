@@ -154,12 +154,40 @@ class PreferenceSubmit(BaseModel):
     month: int
 
 
+# 필드명 date 와 타입 date 가 같아 pydantic v2 가 어노테이션을 해석하지 못한다.
+# (CaseItem 은 Field() 대입이 없어 우연히 통과) — 별칭으로 충돌을 피한다.
+_EntryDate = date
+
+
+class WantedEntryItem(BaseModel):
+    """원티드 엔트리 1건. 날짜별 한 건이며 근무코드 1개를 가진다.
+
+    Notes:
+        - shift_id 는 shifts.shift_id(근무코드). 이름/색상은 담지 않으며 프론트가
+          근무코드 룩업과 조인해 표시한다.
+        - intent 는 'wanted'(선호)만 지원한다. 'avoid'(피하고 싶은 근무)는 저장
+          스키마·솔버 제약이 아직 없어 422 로 거절한다(별도 작업).
+    """
+
+    date: _EntryDate = Field(description="대상 날짜 (YYYY-MM-DD). 요청 year/month 와 같은 달이어야 한다.")
+    shift_id: str = Field(description="근무코드(shifts.shift_id). 원티드 노출 대상만 허용.")
+    intent: Literal["wanted", "avoid"] = Field(
+        default="wanted", description="wanted=선호, avoid=기피(미지원)"
+    )
+    comment: Optional[str] = Field(default=None, description="사유")
+
+
 class PreferenceData(BaseModel):
     year: int
     month: int
+    # 대상 그룹. 미지정 시 호출자 home group. 지정 시 home 과 다르면 403.
+    group_id: Optional[str] = Field(default=None)
     # data: dict
     data: Dict[str, Any] = Field(default_factory=dict)
     preference: Optional[List[Dict[str, Any]]] = None
+    # 원티드 엔트리 전량(replace-all). 지정 시 이 목록이 저장·조회·제출의 단일 원본이
+    # 되며 data 는 무시한다. 미지정(None) 이면 기존 data 기반 경로로 동작한다.
+    wanted_entries: Optional[List[WantedEntryItem]] = Field(default=None)
 
 
 class PublishRequest(BaseModel):
