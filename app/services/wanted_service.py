@@ -3,6 +3,7 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 - DB 쿼리, 데이터 가공 등 라우터에서 분리
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
+import calendar
 import json
 import traceback
 from collections import defaultdict
@@ -14,6 +15,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
 from services.group_access import caller_is_head_nurse, resolve_home_group_id
+from services.nurse_period_resolver import weekend_off_ids_asof
 
 # 파견/병동이동 이관 사유 목록 (nurse_service._INBOUND_REASONS와 동일 정책)
 _INBOUND_REASONS: Tuple[str, ...] = ("파견", "병동이동")
@@ -2824,6 +2826,94 @@ def _ward_main_codes(db: Session, group_id: str) -> Set[str]:
     return mains
 
 
+# 엔진이 아는 휴무 코드 — roster_create_service._normalize_main_code 와 같은 규칙.
+_BANNED_OFF_ALIASES = {"OFF", "O", "주"}
+
+
+def _normalize_banned_code(raw: object) -> str:
+    """금지 근무코드 → 엔진 코드계. 주입부(`_build_banned_wanted_constraints`)와 동일."""
+    code = str(raw or "").strip().upper()
+    return "O" if code in _BANNED_OFF_ALIASES else code
+
+
+def _solver_enforceable_codes(db: Session, group_id: str) -> Set[str]:
+    """솔버가 금지로 강제할 수 있는 코드 집합.
+
+    `config.shift_types` = `daily_shift_requirements.keys() + ['O']` 이고
+    키는 `["D","E","N"] + (["M"] if use_mid else [])` 다 (roster_create_service:576).
+    """
+    codes = {"D", "E", "N", "O"}
+    row = (
+        db.query(RosterConfig)
+        .filter(RosterConfig.group_id == group_id)
+        .order_by(RosterConfig.config_id.desc())
+        .first()
+    )
+    if row is not None and bool(getattr(row, "use_mid", False)):
+        codes.add("M")
+    return codes
+
+
+def _overlay_allowed_shifts_asof(db: Session, nurses: List[Nurse], year: int, month: int) -> None:
+    """allowed_shifts / fixed_shift 를 대상 월 as-of 값으로 덮는다.
+
+    `nurses` 컬럼은 오늘 값 캐시이고 SSOT 는 `nurse_allowed_shift_period` 다.
+    캐시로 판정하면 그 달에 값이 달랐던 간호사를 잘못 본다
+    (실측: 캐시 `[]` vs as-of `['D','E','N']` 인 간호사 존재).
+    구간이 없으면 캐시를 유지한다(무회귀).
+    """
+    if not nurses:
+        return
+    try:
+        from db.models import NurseAllowedShiftPeriod
+        from services.nurse_period_resolver import fetch_periods, resolve_asof
+    except ImportError:
+        return
+    as_of = date(year, month, calendar.monthrange(year, month)[1])
+    rows_by_nurse = fetch_periods(
+        db, NurseAllowedShiftPeriod, [str(n.nurse_id) for n in nurses],
+        as_of, as_of + timedelta(days=1),
+    )
+    sentinel = object()
+    for nurse in nurses:
+        rows = rows_by_nurse.get(str(nurse.nurse_id))
+        if not rows:
+            continue
+        for attr in ("allowed_shifts", "fixed_shift"):
+            value = resolve_asof(rows, as_of, attr, sentinel)
+            if value is not sentinel:
+                nurse.__dict__[attr] = value
+
+
+def _assignable_options(
+    nurse_id: str,
+    shift_date: date,
+    nurse_row: Optional[Nurse],
+    work_mains: Set[str],
+    weekend_off_ids: Set[str],
+    weekend_days: Set[int],
+) -> Set[str]:
+    """그 간호사가 그 날 실제로 배정받을 수 있는 코드 집합.
+
+    솔버가 하드로 거는 것만 반영한다.
+      - 허용근무(allowed_shifts) : 근무 메인을 제한. 비어 있으면 제한 없음
+      - 고정근무(fixed_shift)    : 그 코드만 가능. 병동 코드계와 안 맞으면 무시(과잉 차단 방지)
+      - 주말휴무                 : 주말은 OFF 강제, 평일은 OFF 금지 (fallback_lex:1011/1023)
+    """
+    allowed = {str(x).strip().upper()
+               for x in (getattr(nurse_row, "allowed_shifts", None) or [])}
+    avail = (work_mains & allowed) if allowed else set(work_mains)
+
+    fixed = str(getattr(nurse_row, "fixed_shift", None) or "").strip().upper()
+    if fixed and fixed in work_mains:
+        avail &= {fixed}
+
+    options = avail | {"O"}
+    if nurse_id in weekend_off_ids:
+        options = {"O"} if shift_date.day in weekend_days else (options - {"O"})
+    return options
+
+
 def _decode_banned_response(e: BannedWantedEntry, year: int, month: int) -> BannedWantedEntryResponse:
     """BannedWantedEntry ORM → 응답 스키마 (JSON 컬럼 안전 디코드)."""
     codes = e.banned_shift_ids
@@ -2902,6 +2992,16 @@ def save_banned_wanted_service(
     ward_mains = _ward_main_codes(db, group_id)
     work_mains = ward_mains - {"O"}  # 근무 메인(OFF 제외) — 잔여 옵션 계산용
 
+    solver_codes = _solver_enforceable_codes(db, group_id)
+
+    # 잔여 옵션 계산 재료 — 루프 밖에서 1회. 솔버가 하드로 거는 것과 같은 기준을 쓴다.
+    _overlay_allowed_shifts_asof(db, list(nurse_rows.values()), req.year, req.month)
+    weekend_off_ids = weekend_off_ids_asof(db, request_nurse_ids, req.year, req.month) or set()
+    weekend_days = {
+        d for d in range(1, calendar.monthrange(req.year, req.month)[1] + 1)
+        if calendar.weekday(req.year, req.month, d) >= 5
+    }
+
     # ── 1단계: entry 단위 검증 (중복/실존코드/실현가능성) ──
     errors: List[Dict[str, Any]] = []
     for e in banned_entries:
@@ -2924,12 +3024,23 @@ def save_banned_wanted_service(
                            "codes": unknown,
                            "message": f"병동에 없는 근무코드: {', '.join(unknown)}"})
             continue
-        # 실현가능성 가드: 금지 + 개인 허용근무 제한 후에도 배정 옵션(근무/OFF)이 1개 이상 남아야.
-        #   allowed(개인 허용근무)는 근무 메인만 제한. OFF 는 banned 에 없으면 항상 옵션.
+        # 솔버가 실제로 강제할 수 있는 코드인가.
+        #   주입부는 `code not in config.shift_types` 면 조용히 스킵한다(fallback_lex:1141).
+        #   병동에는 있지만 shift_types(D/E/N/O[+M])에 없는 코드를 저장하면
+        #   "저장은 됐는데 근무표에는 아무 효과가 없는" 상태가 된다. 그걸 여기서 막는다.
+        unenforceable = [c for c in codes if _normalize_banned_code(c) not in solver_codes]
+        if unenforceable:
+            errors.append({"type": "code_not_enforceable", "nurse_id": e.nurse_id,
+                           "shift_date": sd, "codes": unenforceable,
+                           "message": f"근무표 생성에 반영할 수 없는 근무코드: {', '.join(unenforceable)}"})
+            continue
+        # 실현가능성 가드: 금지 후에도 배정 옵션(근무/OFF)이 1개 이상 남아야 한다.
+        #   허용근무·고정근무·주말휴무를 전부 반영한다. OFF 를 무조건 옵션에 넣으면
+        #   주말휴무자(평일 OFF 금지)를 놓친다.
         nrow = nurse_rows.get(e.nurse_id)
-        allowed = {str(x).strip().upper() for x in (getattr(nrow, "allowed_shifts", None) or [])}
-        avail_work = (work_mains & allowed) if allowed else set(work_mains)
-        options = avail_work | {"O"}
+        options = _assignable_options(
+            e.nurse_id, e.shift_date, nrow, work_mains, weekend_off_ids, weekend_days,
+        )
         remaining = options - set(codes)
         if not remaining:
             errors.append({"type": "no_option_left", "nurse_id": e.nurse_id, "shift_date": sd,

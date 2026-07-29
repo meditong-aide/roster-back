@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from copy import deepcopy
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
@@ -2657,8 +2658,10 @@ def _build_banned_wanted_constraints(db, current_user, req, nurses_in_group) -> 
             BannedWantedEntry.month == req.month,
             BannedWantedEntry.is_applied == True,  # noqa: E712
         ).all()
-    except Exception as e:
-        print(f"[BannedWanted] 조회 실패(무시): {e}")
+    except SQLAlchemyError as e:
+        # 테이블 미배포 등으로 못 읽으면 금지가 통째로 무효가 된다. 조용히 넘기지 않는다.
+        logger.error("[BannedWanted] 조회 실패 — 금지 전량 미적용: %s", e, exc_info=True)
+        db.rollback()
         return empty
     if not rows:
         return empty
@@ -2677,7 +2680,11 @@ def _build_banned_wanted_constraints(db, current_user, req, nurses_in_group) -> 
                 codes = json.loads(codes)
             except (ValueError, TypeError):
                 codes = []
-        codes = [str(c).strip().upper() for c in (codes or []) if str(c).strip()]
+        # 휴무류('주' 등)는 엔진 코드계('D','E','N','O')로 정규화한다.
+        # fixed_cells 경로(:2913)는 이미 같은 정규화를 하는데 banned 만 빠져 있어,
+        # '주' 금지가 저장은 되고 솔버에서는 조용히 스킵되고 있었다.
+        codes = [_normalize_banned_code(c) for c in (codes or []) if str(c).strip()]
+        codes = [c for c in codes if c]
         if not codes:
             continue
         day_idx = r.shift_date.day - 1
@@ -2692,6 +2699,67 @@ def _build_banned_wanted_constraints(db, current_user, req, nurses_in_group) -> 
     if forbidden:
         print(f"[BannedWanted] 금지 셀 적용: nurses={len(forbidden)}, cnt={total}")
     return {"forced_off": {}, "forbidden": forbidden}
+
+
+# 엔진이 아는 휴무 코드. shift_types 는 ['D','E','N','O'](+M) 라 '주' 같은 병동 코드는
+# 그대로 넘기면 `code not in shift_types` 로 조용히 버려진다.
+_BANNED_OFF_ALIASES = {"OFF", "O", "주"}
+
+
+def _normalize_banned_code(raw: object) -> str:
+    """금지 근무코드 → 엔진 코드계. fixed_cells 정규화(:2913)와 같은 규칙."""
+    code = str(raw or "").strip().upper()
+    return "O" if code in _BANNED_OFF_ALIASES else code
+
+
+def _audit_banned_wanted_result(db, current_user, req, generated, roster_system) -> int:
+    """생성 결과가 금지 원티드를 지켰는지 감사한다 — **차단하지 않고 경고만** 남긴다.
+
+    솔버가 `m.Add(X==0)` 로 하드 강제하지만, 고정 셀이 있는 날은 forbidden 을 skip 하는
+    경로(fallback_lex:1146)가 있어 결과에 금지 근무가 남을 수 있다. 사후 검증으로 생성을
+    막으면 이미 만들어진 근무표를 통째로 버리게 되므로 관측만 한다.
+
+    반환: 위반 셀 수(0이면 정상).
+    """
+    if not generated:
+        return 0
+    try:
+        rows = db.query(BannedWantedEntry).filter(
+            BannedWantedEntry.group_id == current_user.group_id,
+            BannedWantedEntry.year == req.year,
+            BannedWantedEntry.month == req.month,
+            BannedWantedEntry.is_applied == True,  # noqa: E712
+        ).all()
+    except SQLAlchemyError:
+        db.rollback()
+        return 0
+    if not rows:
+        return 0
+
+    main_map = _build_validation_shift_main_map(roster_system)
+    violations: list[str] = []
+    for r in rows:
+        codes = r.banned_shift_ids
+        if isinstance(codes, str):
+            try:
+                codes = json.loads(codes)
+            except (ValueError, TypeError):
+                codes = []
+        banned = {_normalize_banned_code(c) for c in (codes or []) if str(c).strip()}
+        row = generated.get(str(r.nurse_id)) or []
+        idx = r.shift_date.day - 1
+        if not banned or idx < 0 or idx >= len(row):
+            continue
+        assigned = str(row[idx] or "").strip().upper()
+        if _normalize_banned_code(main_map.get(assigned, assigned)) in banned:
+            violations.append(f"{r.nurse_id} {r.shift_date} = {assigned}")
+
+    if violations:
+        logger.warning(
+            "[BannedWanted][audit] 금지 위반 %d건 — 고정셀 우선 등으로 skip 되었을 수 있음: %s",
+            len(violations), violations[:10],
+        )
+    return len(violations)
 
 
 def _validate_mid_hard_feasibility(nurses_in_group, config_dict: dict, year: int, month: int) -> str | None:
