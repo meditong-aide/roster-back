@@ -4453,9 +4453,50 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None):
+def _ephemeral_schedule(req: RosterRequest, current_user) -> Schedule:
+    """dry-run 전용 — DB 에 넣지 않는 Schedule.
+
+    생성 파이프라인이 `schedule.schedule_id` 등을 계속 참조하므로 형태만 맞춘 채
+    detached 로 흘려보낸다. 실패 정리 경로의 `db.delete(schedule)` 는 detached 라
+    예외가 나지만 그 자리가 `except: db.rollback()` 으로 감싸여 있어 무해하다.
+    """
+    return Schedule(
+        schedule_id=uuid.uuid4().hex[:12],
+        office_id=getattr(current_user, "office_id", None),
+        group_id=getattr(current_user, "group_id", None),
+        year=int(req.year),
+        month=int(req.month),
+        version=0,
+        status="draft",
+        dropped=False,
+        name="(dry-run)",
+    )
+
+
+def generate_roster_service(
+    req: RosterRequest,
+    current_user,
+    db: Session,
+    treatment_ids=None,
+    config_override: dict | None = None,
+    weekend_off_release=None,
+    monthly_limit_release=None,
+    dry_run: bool = False,
+    lns_fixed_cells: list[dict] | None = None,
+):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
+
+    dry_run:
+        True 면 **아무것도 저장하지 않고** 생성 결과(`generated`)만 돌려준다.
+        Schedule 행 생성·`_persist_entries`·푸시 발송을 전부 건너뛴다.
+        재시도·완화 경로는 그대로 타므로 품질은 실제 생성과 같다.
+        긴급대체 LNS 2단이 "가상 근무표"를 얻는 용도로 쓴다.
+
+    lns_fixed_cells:
+        LNS(Large Neighborhood Search) 고정셀. 기존 근무표를 baseline 으로 고정하고
+        결원 주변만 자유변수로 남기는 데 쓴다. 사용자 확정 셀(fixed_wanted 등)이
+        이미 차지한 좌표는 건너뛰어 기존 고정이 항상 우선한다.
     """
     if not current_user or not caller_is_head_nurse(db, current_user):
         raise Exception("Permission denied")
@@ -4532,7 +4573,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     )
     if not wanted:
         raise Exception("해당 월의 wanted 작성을 먼저 요청해주세요.")
-    schedule = request_schedule_service(req, current_user, db)
+    schedule = (
+        _ephemeral_schedule(req, current_user) if dry_run
+        else request_schedule_service(req, current_user, db)
+    )
     (
         nurses_in_group,
         preferences,
@@ -5376,6 +5420,31 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 f"[OffReason] {info.get('name', nurse_id)}({nurse_id}) "
                 f"weekly_off={weekly_days}, special_off={special_days}, total_fixed_off={total}"
             )
+    # ── LNS 고정셀 합류 ──
+    #   기존 근무표를 baseline 으로 고정하고 결원 주변만 자유변수로 남기는 용도.
+    #   입력은 nurse_id 기반이고 여기서 엔진 인덱스로 바꾼다 — 엔진 목록 순서는
+    #   nurse_id 정렬이 아니라서 밖에서 인덱스를 만들면 엉뚱한 사람에게 고정된다.
+    #   사용자 확정 셀(주휴/특수/fixed_wanted)이 이미 잡은 좌표는 건너뛴다(기존 고정 우선).
+    if lns_fixed_cells:
+        _lns_index_of = _build_engine_nurse_index_map(nurses_for_engine)
+        _taken = {
+            (c.get("nurse_index"), c.get("day_index")) for c in combined_fixed_cells
+        }
+        _added, _skipped = [], 0
+        for _c in lns_fixed_cells:
+            _ni = _lns_index_of.get(str(_c.get("nurse_id")))
+            if _ni is None:
+                _skipped += 1
+                continue
+            if (_ni, _c.get("day_index")) in _taken:
+                _skipped += 1
+                continue
+            _added.append({"nurse_index": _ni, "day_index": _c.get("day_index"),
+                           "shift": _c.get("shift")})
+        combined_fixed_cells.extend(_added)
+        print(f"[LNS] baseline 고정셀 {len(_added)}개 합류 "
+              f"(요청 {len(lns_fixed_cells)}개 중 {_skipped}개 제외: 기존 고정 우선 또는 엔진 목록 밖)")
+
     off_exception_cells = set()
     for c in combined_fixed_cells:
         try:
@@ -6379,16 +6448,30 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             raise Exception(validation_error)
 
     # 초과 OFF → 연차 변환 후처리 (off_swap_enabled=True 일 때만 동작, 보호 4종 적용)
-    print(
-        f"[OffSwap][CALL] schedule_id={schedule.schedule_id} "
-        f"latest_config_id={getattr(latest_config, 'config_id', None)} "
-        f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r} "
-        f"off_days={getattr(latest_config, 'off_days', None)!r}"
-    )
-    try:
-        generated = postprocess_off_swap(db, schedule, generated, latest_config, req)
-    except Exception as _off_swap_exc:
-        print(f"[OffSwap] 후처리 실패 — 변환 미적용 진행: {_off_swap_exc}")
+    #
+    # dry-run 은 건너뛴다. 저장할 근무표를 다듬는 단계라 '결과만 보는' 용도에는 불필요하고,
+    # 내부에서 `_load_prev_month_tail` 을 간호사당 1회씩 도는 N+1 이라 실측 9.8초(전체의 49%)를
+    # 차지한다. 게다가 고정셀까지 건드려 자유 구간 밖 셀이 결과에 섞인다.
+    if dry_run:
+        print("[OffSwap] dry-run — 후처리 생략")
+    else:
+        print(
+            f"[OffSwap][CALL] schedule_id={schedule.schedule_id} "
+            f"latest_config_id={getattr(latest_config, 'config_id', None)} "
+            f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r} "
+            f"off_days={getattr(latest_config, 'off_days', None)!r}"
+        )
+        try:
+            generated = postprocess_off_swap(db, schedule, generated, latest_config, req)
+        except Exception as _off_swap_exc:
+            print(f"[OffSwap] 후처리 실패 — 변환 미적용 진행: {_off_swap_exc}")
+    if dry_run:
+        # 여기부터가 전부 쓰기(엔트리 저장·전입자 병합·알림 발송)다.
+        # dry-run 은 결과만 필요하므로 저장 직전에 끊는다.
+        return {"generated": generated, "dry_run": True,
+                "schedule_id": None, "year": req.year, "month": req.month}
+
+    _audit_banned_wanted_result(db, current_user, req, generated, roster_system)
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──

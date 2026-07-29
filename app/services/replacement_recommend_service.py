@@ -7,6 +7,7 @@ import logging
 from math import exp
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from services.group_access import assert_caller_can_access_group
@@ -35,7 +36,15 @@ from schemas.replacement_schema import (
     ReplacementRecommendRequest,
     ReplacementRecommendResponse,
     ReplacementSlot,
+    SlotChainRecommendation,
     SlotRecommendation,
+)
+from services.replacement_chain_service import (
+    ChainContext,
+    build_chain_context,
+    hard_violation_reasons,
+    recommend_chain_proposals,
+    recommend_lns_repair,
 )
 
 
@@ -1625,6 +1634,9 @@ def recommend_replacement_candidates(
 
     results: List[SlotRecommendation] = []
 
+    # 하드 게이트와 수정안이 같은 판정 재료를 쓰므로 슬롯 전체에서 한 번만 만든다.
+    chain_ctx = _load_chain_context_if_needed(db, schedule, req)
+
     for slot in slots:
         day = slot.date.day
         day_idx = day - 1
@@ -1829,6 +1841,13 @@ def recommend_replacement_candidates(
         for candidate_id, ctx in candidate_pool:
             ctx.fairness = fairness_map.get(candidate_id, 0.5)
 
+        # 하드 게이트 — 솔버가 하드로 막는 후보를 정렬 전에 뺀다.
+        # 정렬 뒤에 걸면 top_k 자리를 위반 후보가 차지한 채 잘려나가 후보 수가 줄어든다.
+        if chain_ctx is not None and getattr(req.options, "enforce_hard_rules", True):
+            candidate_pool = _apply_hard_gate(
+                chain_ctx, req.target_nurse_id, slot, candidate_pool, excluded,
+            )
+
         scored = sorted(candidate_pool, key=lambda item: (_final_score(item[1]), item[1].grade_fit, item[0]), reverse=True)
         if ranking_scope == "ALL":
             non_vacation = [item for item in scored if not item[1].assigned_is_vacation]
@@ -1880,11 +1899,16 @@ def recommend_replacement_candidates(
             )
         )
 
+    chain_results = _build_chain_results(
+        chain_ctx, req, slots, db, schedule, current_user,
+    )
+
     return ReplacementRecommendResponse(
         schedule_id=req.schedule_id,
         mode=req.mode,
         target_nurse_id=req.target_nurse_id,
         results=results,
+        chain_results=chain_results,
         metadata={
             "evaluated_slots": len(slots),
             "candidate_scan_limit": max_scan,
@@ -1893,8 +1917,89 @@ def recommend_replacement_candidates(
             "shift_semantic_fallback_event_count": shift_fallback_event_count,
             "shift_semantic_fallback_reasons": dict(shift_fallback_reason_counts),
             "scoring_policy": "rule_safety_priority_with_grade_fit",
+            "chain_proposals_included": chain_results is not None,
         },
     )
+
+
+def _load_chain_context_if_needed(
+    db: Session, schedule: Schedule, req: ReplacementRecommendRequest,
+) -> Optional[ChainContext]:
+    """하드 게이트나 수정안 중 하나라도 필요하면 판정 재료를 적재한다.
+
+    주휴·월한도·상호배제·원티드를 읽어야 해서 1초 안팎이 든다. 둘 다 꺼져 있으면
+    만들지 않는다. 하나라도 켜져 있으면 한 번 만들어 양쪽이 공유한다.
+    """
+    options = req.options
+    if not (
+        getattr(options, "enforce_hard_rules", True)
+        or getattr(options, "include_chain_proposals", False)
+    ):
+        return None
+    try:
+        return build_chain_context(db, schedule)
+    except SQLAlchemyError:
+        # 판정 재료를 못 읽어도 추천 자체는 계속돼야 한다(게이트만 비활성).
+        logger.warning("[replacement] 하드 게이트 컨텍스트 로드 실패 — 게이트 미적용", exc_info=True)
+        db.rollback()
+        return None
+
+
+def _apply_hard_gate(
+    ctx: ChainContext,
+    target_nurse_id: str,
+    slot: ReplacementSlot,
+    candidate_pool: List[Tuple[str, CandidateContext]],
+    excluded: Dict[str, int],
+) -> List[Tuple[str, CandidateContext]]:
+    """솔버가 하드로 막는 후보를 제외한다.
+
+    기존 점수 로직은 그대로 두고 목록에서만 뺀다. 배제 사유는 `excluded` 에 규칙
+    종류별로 누적돼 프론트가 "왜 후보가 없는지" 설명할 수 있다.
+    """
+    kept: List[Tuple[str, CandidateContext]] = []
+    for candidate_id, candidate_ctx in candidate_pool:
+        reasons = hard_violation_reasons(
+            ctx, target_nurse_id, slot.date, slot.shift, candidate_id,
+        )
+        if not reasons:
+            kept.append((candidate_id, candidate_ctx))
+            continue
+        excluded[f"hard_rule:{reasons[0]}"] += 1
+    return kept
+
+
+def _build_chain_results(
+    ctx: Optional[ChainContext],
+    req: ReplacementRecommendRequest,
+    slots: List[ReplacementSlot],
+    db: Session,
+    schedule: Schedule,
+    current_user,
+) -> Optional[List[SlotChainRecommendation]]:
+    """수정안 — opt-in 일 때만 계산한다.
+
+    1단(당일 1열)으로 안 나오고 `include_lns_fallback` 이 켜져 있으면 2단 LNS 를 탄다.
+    2단은 12~18초 걸리므로 1단이 빈손일 때만 호출한다.
+    """
+    if ctx is None or not getattr(req.options, "include_chain_proposals", False) or not slots:
+        return None
+
+    limit = int(getattr(req.options, "chain_proposal_limit", 10) or 10)
+    use_lns = bool(getattr(req.options, "include_lns_fallback", False))
+    out = []
+    for slot in slots:
+        proposals = recommend_chain_proposals(
+            ctx, req.target_nurse_id, slot.date, slot.shift, limit=limit,
+        )
+        if not proposals and use_lns:
+            lns = recommend_lns_repair(
+                db, ctx, schedule, current_user, req.target_nurse_id, slot.date, slot.shift,
+            )
+            if lns is not None:
+                proposals = [lns]
+        out.append(SlotChainRecommendation(slot=slot, proposals=proposals))
+    return out
 
 
 def _evaluate_single_slot(
