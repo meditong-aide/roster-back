@@ -79,6 +79,30 @@ def test_trace_to_user_options_respects_buckets():
     assert opts["cross_month"]["bucket"] == "tradeoff"          # 유저 결정: cross-month=B
 
 
+def test_cause_to_resolution_options_action_card_for_personal():
+    """personal_infeasible(김수선 13>7) → 그 간호사 지목 action 카드(월한도 조정)."""
+    from services.ontology_graph.mcs_trace import cause_to_resolution_options
+    targets = [{"nurse_id": "n177659", "name": "김수선", "family": "monthly_limit",
+                "detail": "야간 요구 13 > 월 상한 7", "current": 13, "cap": 7}]
+    opts = cause_to_resolution_options("personal_infeasible", "monthly_limit", targets)
+    assert len(opts) == 1
+    o = opts[0]
+    assert o["bucket"] == "action" and o["source"] == "cause"
+    assert "김수선" in o["title_ko"]
+    assert o["fix"]["target"] == {"nurse_id": "n177659"}
+    assert o["where_label_ko"] and "야간" in o["where_label_ko"]
+    assert o["detail_ko"] == "야간 요구 13 > 월 상한 7"
+
+
+def test_cause_to_resolution_options_tradeoff_and_advisory():
+    """tradeoff(회복규칙)=대가 경고, advisory(커버리지)=fix.where None(직접확인)."""
+    from services.ontology_graph.mcs_trace import cause_to_resolution_options
+    to = cause_to_resolution_options("coupled_sequence", "2n2off", [])
+    assert to and to[0]["bucket"] == "tradeoff" and to[0]["trade_off_ko"]
+    ad = cause_to_resolution_options("coverage_shortage", "coverage", [])
+    assert ad and ad[0]["bucket"] == "advisory" and ad[0]["fix"]["where"] is None
+
+
 def test_trace_conflict_reports_outside_model_when_unrelaxable():
     """전체 완화로도 안 풀리면 '모델 밖 원인' 안내."""
     tr = trace_conflict(lambda relaxed: False, ["a", "b"])

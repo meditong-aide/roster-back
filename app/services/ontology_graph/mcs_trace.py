@@ -205,6 +205,61 @@ FAMILY_PRESENTATION: dict[str, dict[str, Any]] = {
 }
 
 
+def cause_to_resolution_options(
+    classification: str, top_family: str | None, targets: list[dict] | None,
+) -> list[dict[str, Any]]:
+    """explain_infeasibility 결과 → 모달 resolution_options 카드.
+
+    per-nurse target 이 있으면 그 간호사를 지목한 action 카드(주말휴무 해제/월한도 조정).
+    없으면 top_family 기준 정책 카드. FAMILY_PRESENTATION 3분류 정책 준수.
+    """
+    targets = targets or []
+    opts: list[dict[str, Any]] = []
+    seen: set = set()
+
+    def _card(family: str, who_name: str | None, who_id: Any):
+        pres = FAMILY_PRESENTATION.get(family, {"bucket": "advisory",
+                                                "advisory": f"'{family}' 설정 확인 필요."})
+        bucket = pres["bucket"]
+        key = (family, who_id)
+        if key in seen:
+            return None
+        seen.add(key)
+        who = who_name or "해당 간호사"
+        opt: dict[str, Any] = {
+            "option_id": f"cause:{family}:{who_id if who_id is not None else 'global'}",
+            "kind": f"cause_{bucket}", "source": "cause", "verified": False,
+            "family": family, "bucket": bucket,
+        }
+        if bucket == "action":
+            opt["title_ko"] = pres["title"].format(who=who)
+            opt["where_label_ko"] = pres.get("where")
+            opt["fix"] = {"mode": "manual", "where": pres.get("where"),
+                          "target": ({"nurse_id": who_id} if who_id is not None else None)}
+        elif bucket == "tradeoff":
+            opt["title_ko"] = pres["title"].format(who=who) if "{who}" in pres.get("title", "") \
+                else (pres.get("title") or f"{family} 규칙 완화")
+            opt["title_ko"] = f"{family} 규칙을 권장으로 낮추기" + (f" ({who})" if who_name else "")
+            opt["trade_off_ko"] = pres["tradeoff"]
+            opt["fix"] = {"mode": "manual", "where": f"설정 > 근무 규칙 > {family}"}
+        else:  # advisory
+            opt["title_ko"] = pres["advisory"]
+            opt["fix"] = {"mode": "manual", "where": None}
+        return opt
+
+    for t in targets:
+        c = _card(t.get("family") or top_family or "unknown", t.get("name"), t.get("nurse_id"))
+        if c:
+            if t.get("detail"):
+                c["detail_ko"] = t["detail"]
+            opts.append(c)
+    if not opts and top_family:                     # target 없으면 family 기준 1장
+        c = _card(top_family, None, None)
+        if c:
+            opts.append(c)
+    return opts
+
+
 def trace_to_user_options(trace: ConflictTrace) -> list[dict[str, Any]]:
     """ConflictTrace → 유저 표시 옵션 리스트. 완화(내부)는 숨기고 행동·대가·안내로 번역."""
     opts: list[dict[str, Any]] = []

@@ -5978,6 +5978,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         #     대체. unknown 일 때만 generic fallback 유지.
                         if _cause.classification != "unknown":
                             unrecoverable["infeasibility"]["fix_suggestions_ko"] = [_cause.certificate]
+                        # (b) cause → 모달 행동카드(resolution_options) 로 번역해 앞에 prepend.
+                        #     "조건변경필요" 모달의 [이 방법으로 다시 생성] 카드로 뜬다.
+                        try:
+                            from services.ontology_graph.mcs_trace import cause_to_resolution_options
+                            _cards = cause_to_resolution_options(
+                                _cause.classification, _cause.top_family, _cause.targets)
+                            if _cards:
+                                _ex = unrecoverable["infeasibility"].get("resolution_options") or []
+                                unrecoverable["infeasibility"]["resolution_options"] = _cards + _ex
+                        except Exception as _cc_exc:
+                            print(f"[Cause] 행동카드 생성 실패(무시): {_cc_exc}")
                         # arithmetic-증명 원인(개인 즉시모순·인원/셀 부족)은 확실 → config
                         # 카탈로그 전수탐색이 무의미. 게이트 무관 **기본 스킵**(377회 회피).
                         # 그 외(정책과제약·coupled)는 추정이라 AIDE_CAUSE_GATE=1 일 때만.

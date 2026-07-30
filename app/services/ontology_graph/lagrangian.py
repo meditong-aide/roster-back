@@ -14,7 +14,7 @@ max-flow 가 못 보는 배열 결합도, 부분배정을 실제로 풀어(각 i
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ortools.sat.python import cp_model
@@ -255,6 +255,7 @@ class InfeasibilityExplanation:
     lambda_by_family: dict[str, float]
     certificate: str                    # 사람이 읽는 '왜 해가 없나'
     arithmetic: dict[str, int]          # cells/coverage/off_budget/off_floor_sum/excess
+    targets: list[dict] = field(default_factory=list)  # 행동카드용: [{nurse_id,name,family,detail}]
 
 
 def explain_infeasibility(
@@ -396,14 +397,20 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
     #   n_exact/n_min > max_nig(개인 야간 요구 > 상한), 강제 근무하한 합 > 가용 근무일
     #   (weekend-off 면 주말 제외). 이게 "13 > 7" 같은 즉시 infeasible 을 이름으로 짚는다.
     personal_conflicts: list[str] = []
+    personal_targets: list[dict] = []
     for i, nu in enumerate(nurses):
-        nm = _nurse_attr(nu, "name") or _nurse_attr(nu, "nurse_id") or f"n{i}"
+        nid = _nurse_attr(nu, "nurse_id")
+        nm = _nurse_attr(nu, "name") or nid or f"n{i}"
         n_floor = _nurse_attr(nu, "n_exact", "n_min")
         if n_floor is not None and max_nig is not None:
             try:
                 if int(n_floor) > max_nig:
                     personal_conflicts.append(
                         f"{nm}: 야간 요구 {int(n_floor)} > 월 상한 {max_nig}")
+                    personal_targets.append({
+                        "nurse_id": nid, "name": nm, "family": "monthly_limit",
+                        "detail": f"야간 요구 {int(n_floor)} > 월 상한 {max_nig}",
+                        "current": int(n_floor), "cap": max_nig})
                     continue
             except (TypeError, ValueError):
                 pass
@@ -420,6 +427,10 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
             _wk = " (주말휴무)" if i in wk_nurses else ""
             personal_conflicts.append(
                 f"{nm}{_wk}: 강제 근무 {floor_sum} > 가용 근무일 {avail}")
+            personal_targets.append({
+                "nurse_id": nid, "name": nm,
+                "family": ("weekend_off" if i in wk_nurses else "monthly_limit"),
+                "detail": f"강제 근무 {floor_sum} > 가용 근무일 {avail}"})
 
     if personal_conflicts:
         cert = ("개인 제약 즉시 모순(집합 무관, 그 간호사 혼자서도 불가): "
@@ -427,7 +438,7 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
                 + " → 해당 간호사의 야간 요구/근무 하한 또는 상한을 조정해야 함.")
         return InfeasibilityExplanation(
             "personal_infeasible", "monthly_limit", {}, cert,
-            {"personal_conflicts": len(personal_conflicts)})
+            {"personal_conflicts": len(personal_conflicts)}, targets=personal_targets)
     wk_days: set[int] | None = None
     if wk_nurses and year and month:
         wk_days = {d for d in range(int(num_days))
@@ -442,7 +453,7 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
         except (TypeError, ValueError):
             pass
 
-    return explain_infeasibility(
+    exp = explain_infeasibility(
         len(nurses), int(num_days), req,
         off_floor=_effective_off_floor(nurses, config),
         night_cap=int(config.get("max_nig_per_month") or 0) or None,
@@ -451,3 +462,13 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
         max_consec=int(mc) if mc else None,
         weekend_off_nurses=(wk_nurses or None), weekend_days=wk_days,
         night_cap_by_nurse=(ncap_by or None), iters=iters)
+
+    # personal_overconstraint(λ가 개인 family 지목) → 해당 간호사들을 target 으로 채움
+    if exp.classification == "personal_overconstraint" and not exp.targets:
+        def _tg(i):
+            return {"nurse_id": _nurse_attr(nurses[i], "nurse_id"),
+                    "name": _nurse_attr(nurses[i], "name") or _nurse_attr(nurses[i], "nurse_id") or f"n{i}",
+                    "family": exp.top_family}
+        idxs = wk_nurses if exp.top_family == "weekend_off" else set(ncap_by)
+        exp.targets = [_tg(i) for i in sorted(idxs)]
+    return exp
