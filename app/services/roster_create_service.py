@@ -2779,6 +2779,20 @@ def _probe_time_limit() -> int:
         return 20
 
 
+_CHANGE_LABEL_KO = {
+    "weekend_off": "주말 휴무",
+    "n_exact": "월 야간 고정(N)",
+    "n_max": "월 야간 상한(N)",
+}
+
+
+def _mk_change(nurse_id, attr, frm, to):
+    """resolution_options.changes[*] 항목. 프론트가 label_ko/config_key 로 라벨을 렌더하므로
+    (attr 만 주면 'undefined 표시') 둘을 함께 채운다."""
+    return {"nurse_id": nurse_id, "attr": attr, "config_key": attr,
+            "label_ko": _CHANGE_LABEL_KO.get(attr, attr), "from": frm, "to": to}
+
+
 def _priority_families_from_presolve(presolve_diag) -> list:
     """presolve(max-flow) 부족 진단 → probe 우선 완화군(온톨로지 소프트정렬).
 
@@ -6124,8 +6138,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                                     "kind": "release_weekend_off_multi", "source": "probe", "verified": True,
                                     "title_ko": f"주말 휴무 {len(_multi)}명 해제 ({', '.join(_mnames)})",
                                     "trade_off_ko": "그 간호사들이 주말에도 근무할 수 있게 됩니다.",
-                                    "changes": [{"nurse_id": c, "attr": "weekend_off",
-                                                 "from": True, "to": False} for c in _multi],
+                                    "changes": [_mk_change(c, "weekend_off", True, False) for c in _multi],
                                     "weekend_off_release": _multi,
                                     "fix": {
                                         "mode": "auto_apply",
@@ -6165,10 +6178,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                                         "title_ko": f"{_nm} 간호사 주말 휴무 해제 + 야간 고정 {_nf}→{_mn}회로 낮추기",
                                         "trade_off_ko": "주말에도 근무 가능해지고, 월 야간이 그 값 이하로 제한됩니다.",
                                         "changes": [
-                                            {"nurse_id": _culprit, "attr": "weekend_off",
-                                             "from": True, "to": False},
-                                            {"nurse_id": _culprit, "attr": "n_exact",
-                                             "from": _nf, "to": _mn},
+                                            _mk_change(_culprit, "weekend_off", True, False),
+                                            _mk_change(_culprit, "n_exact", _nf, _mn),
                                         ],
                                         # 한 클릭에 둘 다 적용(주말 해제 + 야간 고정 하향).
                                         "weekend_off_release": [_culprit],
@@ -6189,8 +6200,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                                         "kind": "release_weekend_off", "source": "probe", "verified": True,
                                         "title_ko": f"{_nm} 간호사 주말 휴무 해제",
                                         "trade_off_ko": "그 간호사가 주말에도 근무할 수 있게 됩니다.",
-                                        "changes": [{"nurse_id": _culprit, "attr": "weekend_off",
-                                                     "from": True, "to": False}],
+                                        "changes": [_mk_change(_culprit, "weekend_off", True, False)],
                                         # 원클릭 재생성용 — 이 달 발효로 nurse_weekendoff_period 해제 후 생성.
                                         "weekend_off_release": [_culprit],
                                         "fix": {
@@ -6283,8 +6293,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                                     "kind": "lower_night_limit", "source": "probe", "verified": True,
                                     "title_ko": f"{_nm} 간호사 {_fld_ko} {_cur}→{_cfg_mn}회로 낮추기",
                                     "trade_off_ko": f"그 간호사의 월 야간이 {_cfg_mn}회 이하로 제한됩니다.",
-                                    "changes": [{"nurse_id": _nid, "attr": _fld,
-                                                 "from": _cur, "to": _cfg_mn}],
+                                    "changes": [_mk_change(_nid, _fld, _cur, _cfg_mn)],
                                     # 원클릭 재생성용 — 이 달 NurseMonthlyLimit 에 하향 write 후 생성.
                                     "monthly_limit_release": [
                                         {"nurse_id": _nid, "field": _fld, "value": _cfg_mn}],

@@ -283,14 +283,12 @@ def explain_infeasibility(
     # ── 1) 결정론 arithmetic 우선 (cheap·exact, solve 불필요) ────────────────
     #   인원/셀 부족·정책 과제약은 닫힌형으로 즉시 판정. λ 는 여기서 washing 되므로 안 씀.
     if num_nurses < daily or off_budget < 0:
-        cert = (f"인원 부족: 일 근무수요 {daily} > 간호사 {num_nurses}명"
+        cert = (f"간호사가 부족해요 (하루 {daily}명 필요, {num_nurses}명)"
                 if num_nurses < daily else
-                f"셀 부족: 근무수요 {coverage} > 총 근무셀 {cells}") + " — 자원부족(설정 아님)."
+                "근무 요구가 너무 많아요") + " — 인원을 늘리거나 필요 인원을 줄이세요."
         return InfeasibilityExplanation("coverage_shortage", None, {}, cert, arithmetic)
     if off_floor and off_budget > 0 and excess > 0:
-        cert = (f"정책 과제약: OFF 강제하한 {off_floor_sum}(={num_nurses}×{off_floor}) > "
-                f"OFF 여유 {off_budget}(=총셀{cells}−근무수요{coverage}) → {excess} 초과. "
-                f"인원 부족이 아니라 OFF 정책(off_floor/off_first)을 낮춰야 해소.")
+        cert = "쉬는 날 요구가 많아 근무를 다 못 채워요 — 월 OFF 일수를 줄이면 돼요."
         return InfeasibilityExplanation("policy_overconstraint", "off_budget", {}, cert, arithmetic)
 
     # ── 2) arithmetic clean → '배열 결합'만 남음. λ 로 시퀀스·weekend·한도 원인 지목 ──
@@ -310,15 +308,14 @@ def explain_infeasibility(
         # 개인 제약 병목 → per-nurse MCS(주말휴무 해제/월 야간 한도 완화) 경로.
         _ko = {"weekend_off": "주말 휴무", "monthly_limit": "월 야간 한도",
                "night_cap": "야간 상한"}[top]
-        cert = (f"개인 제약 병목: '{_ko}'({top}) 압력 최대(λ={fam_mass.get(top)}). "
-                f"특정 간호사의 {_ko}가 커버리지와 충돌 → 그 간호사 {_ko} 완화(per-nurse MCS)로 해소.")
+        cert = f"특정 간호사의 {_ko}가 근무와 겹쳐 안 돼요 — 그 간호사 {_ko}를 조정하세요."
         return InfeasibilityExplanation("personal_overconstraint", top, fam_mass, cert, arithmetic)
     if top:
-        cert = (f"시퀀스 결합 충돌: '{top}' 압력 최대(λ={fam_mass.get(top)}). "
-                f"인원·용량·OFF예산은 되나 배열 규칙(회복·연속·전이)이 서로 모순.")
+        cert = "근무 규칙(야간 회복·연속·전이)이 서로 겹쳐 배치가 안 돼요 — 규칙 하나를 완화하세요."
         return InfeasibilityExplanation("coupled_sequence", top, fam_mass, cert, arithmetic)
-    return InfeasibilityExplanation("unknown", None, {},
-                                    "명확한 구조적 원인 미검출(개별 셀 충돌·복합 하드 모순 가능).", arithmetic)
+    return InfeasibilityExplanation(
+        "unknown", None, {},
+        "지금 설정 조합으로는 만들 수 없어요 — 여러 규칙이 얽혀 있어요. 아래 항목을 확인하세요.", arithmetic)
 
 
 def _daily_req(config: dict) -> dict[str, int]:
@@ -406,7 +403,7 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
             try:
                 if int(n_floor) > max_nig:
                     personal_conflicts.append(
-                        f"{nm}: 야간 요구 {int(n_floor)} > 월 상한 {max_nig}")
+                        f"{nm} 야간 {int(n_floor)}회 필요, 상한 {max_nig}회")
                     personal_targets.append({
                         "nurse_id": nid, "name": nm, "family": "monthly_limit",
                         "detail": f"야간 요구 {int(n_floor)} > 월 상한 {max_nig}",
@@ -424,18 +421,17 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
                 pass
         avail = int(num_days) - off_floor - (wk_day_cnt if i in wk_nurses else 0)
         if floor_sum > 0 and floor_sum > avail:
-            _wk = " (주말휴무)" if i in wk_nurses else ""
+            _wk = "(주말휴무)" if i in wk_nurses else ""
             personal_conflicts.append(
-                f"{nm}{_wk}: 강제 근무 {floor_sum} > 가용 근무일 {avail}")
+                f"{nm}{_wk} 근무 {floor_sum}일 필요, 가능 {avail}일")
             personal_targets.append({
                 "nurse_id": nid, "name": nm,
                 "family": ("weekend_off" if i in wk_nurses else "monthly_limit"),
                 "detail": f"강제 근무 {floor_sum} > 가용 근무일 {avail}"})
 
     if personal_conflicts:
-        cert = ("개인 제약 즉시 모순(집합 무관, 그 간호사 혼자서도 불가): "
-                + "; ".join(personal_conflicts[:6])
-                + " → 해당 간호사의 야간 요구/근무 하한 또는 상한을 조정해야 함.")
+        _more = f" 외 {len(personal_conflicts) - 3}명" if len(personal_conflicts) > 3 else ""
+        cert = "; ".join(personal_conflicts[:3]) + _more + " — 그 간호사 설정만 바꾸면 돼요."
         return InfeasibilityExplanation(
             "personal_infeasible", "monthly_limit", {}, cert,
             {"personal_conflicts": len(personal_conflicts)}, targets=personal_targets)

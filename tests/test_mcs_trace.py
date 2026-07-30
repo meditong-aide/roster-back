@@ -57,7 +57,7 @@ def test_trace_conflict_family_then_instance_drilldown():
     assert tr.feasible_when_all_relaxed
     # 선형: family 6 + 각 family instance drill (3+1, 2+1) = 6+4+3 = 13
     assert tr.solve_count <= 15
-    assert "김수선" in tr.certificate and "weekend_off" in tr.certificate
+    assert "김수선" in tr.certificate and "주말 휴무" in tr.certificate
 
 
 def test_trace_to_user_options_respects_buckets():
@@ -108,4 +108,4 @@ def test_trace_conflict_reports_outside_model_when_unrelaxable():
     tr = trace_conflict(lambda relaxed: False, ["a", "b"])
     assert tr.families == []
     assert not tr.feasible_when_all_relaxed
-    assert "모델 밖" in tr.certificate
+    assert "고정셀" in tr.certificate

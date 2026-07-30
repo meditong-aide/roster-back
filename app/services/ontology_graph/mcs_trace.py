@@ -77,7 +77,7 @@ def trace_conflict(
     if res is None:
         return ConflictTrace(families=[], instances_by_family={}, solve_count=1,
                              feasible_when_all_relaxed=False,
-                             certificate="전체 완화로도 해소 불가 — 모델 밖 원인(데이터/고정셀 등) 의심.")
+                             certificate="지금 설정으론 만들 수 없어요 — 고정셀·데이터를 확인하세요.")
     min_fams, solves = res
     total_solves += solves
 
@@ -100,9 +100,9 @@ def trace_conflict(
     parts = []
     for f in fam_list:
         ci = inst_by_fam.get(f)
-        parts.append(f"{f}" + (f"({', '.join(str(c) for c in ci)})" if ci else ""))
-    cert = ("복합 충돌 추적: 다음을 동시에 풀어야 feasible → " + " + ".join(parts)
-            if fam_list else "충돌 원인 미검출.")
+        parts.append(_FAMILY_KO.get(f, f) + (f"({', '.join(str(c) for c in ci)})" if ci else ""))
+    cert = ("다음을 함께 조정하면 만들 수 있어요: " + ", ".join(parts)
+            if fam_list else "충돌 원인을 못 찾았어요.")
 
     return ConflictTrace(families=fam_list, instances_by_family=inst_by_fam,
                          solve_count=total_solves, feasible_when_all_relaxed=True,
@@ -178,6 +178,13 @@ def build_family_resolver(
 #   action   : "이 설정 바꾸기 [적용]" (관리자 조정 가능)
 #   tradeoff : "풀리지만 대가 X" 경고 후 선택 (품질·안전 규칙)
 #   advisory : auto-apply 없이 "확인하세요" (환자안전/데이터 — 함부로 안 낮춤)
+_FAMILY_KO = {
+    "off_budget": "OFF 일수", "night_cap": "야간 상한", "monthly_limit": "월 야간 한도",
+    "weekend_off": "주말 휴무", "2n2off": "야간 후 2일 휴식", "night_recovery": "야간 회복 휴무",
+    "not_one_night": "고립 야간 금지", "consecutive": "연속근무 상한", "transition": "근무 전환 규칙",
+    "preceptee": "프리셉티 동반", "cross_month": "전월 경계", "coverage": "필요 인원",
+    "grade": "등급 최소", "team": "팀 최소", "fixed_cell": "고정 근무(원티드/휴가)",
+}
 FAMILY_PRESENTATION: dict[str, dict[str, Any]] = {
     "monthly_limit": {"bucket": "action", "title": "{who} 월 야간 한도 조정",
                       "where": "간호사 관리 > 월 근무 한도(야간)"},
@@ -239,7 +246,7 @@ def cause_to_resolution_options(
         elif bucket == "tradeoff":
             opt["title_ko"] = pres["title"].format(who=who) if "{who}" in pres.get("title", "") \
                 else (pres.get("title") or f"{family} 규칙 완화")
-            opt["title_ko"] = f"{family} 규칙을 권장으로 낮추기" + (f" ({who})" if who_name else "")
+            opt["title_ko"] = f"{_FAMILY_KO.get(family, family)} 완화" + (f" ({who})" if who_name else "")
             opt["trade_off_ko"] = pres["tradeoff"]
             opt["fix"] = {"mode": "manual", "where": f"설정 > 근무 규칙 > {family}"}
         else:  # advisory
@@ -275,7 +282,7 @@ def trace_to_user_options(trace: ConflictTrace) -> list[dict[str, Any]]:
             opt["where_ko"] = pres.get("where")
             opt["actionable"] = True
         elif bucket == "tradeoff":
-            opt["title_ko"] = (f"{fam} 규칙을 권장으로 낮추기" + (f" ({who})" if who else ""))
+            opt["title_ko"] = (f"{_FAMILY_KO.get(fam, fam)} 완화" + (f" ({who})" if who else ""))
             opt["trade_off_ko"] = pres["tradeoff"]
             opt["actionable"] = True
         else:  # advisory
