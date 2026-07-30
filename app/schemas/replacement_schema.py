@@ -38,20 +38,24 @@ class ReplacementRecommendOptions(BaseModel):
         ),
     )
     include_chain_proposals: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "결원 칸을 메우는 수정안(1인 스왑 / 다인 연쇄)을 함께 계산할지. "
-            "판정 재료를 추가로 로드하므로 필요할 때만 켠다. SINGLE 모드 전용."
+            "결원 칸을 메우는 수정안(1인 스왑 / 다인 연쇄 / 인접일 재배치)을 함께 계산할지. "
+            "SINGLE 모드 전용. 판정 재료는 `enforce_hard_rules` 가 이미 적재하므로 "
+            "추가 로드 비용이 없다. 끄면 `chain_results` 가 null 로 나간다."
         ),
     )
     chain_proposal_limit: int = Field(
         default=10, ge=1, le=50, description="슬롯당 반환할 수정안 개수 상한",
     )
     include_lns_fallback: bool = Field(
-        default=False,
+        default=True,
         description=(
             "1단(당일 1열)으로 수정안이 안 나올 때 인접 일자까지 열어 다시 푸는 2단. "
-            "나이트 결원용이며 **12~18초** 걸린다. 화면에 진행 표시가 있을 때만 켠다."
+            "나이트 결원은 1열만 봐서는 원리적으로 안 풀려(1N 금지·연속 N 상한·회복이 "
+            "전부 하드라 최소 2일 블록이 필요) 사실상 필수다. "
+            "전용 CP-SAT 모델이라 실측 슬롯당 중앙 53ms · p95 400ms. "
+            "끄면 CP-SAT 을 한 번도 호출하지 않는다."
         ),
     )
     ranking_scope: Literal[
@@ -207,13 +211,15 @@ class ChainMove(BaseModel):
 class ChainProposal(BaseModel):
     """결원 한 칸에 대한 수정안 하나.
 
-    `moves` 를 순서대로 적용하면 결원이 메워지며, 솔버가 하드로 거는 규칙을
-    원본 근무표 대비 새로 깨뜨리지 않는다. 적용은 기존 `POST /save` 로 한다.
+    `moves` 를 순서대로 적용하면 결원이 메워진다. `hard_warnings` 가 비어 있으면
+    솔버가 하드로 거는 규칙을 원본 근무표 대비 새로 깨뜨리지 않는다는 뜻이고,
+    비어 있지 않으면 그 위반을 감수하는 차선안이다. 적용은 기존 `POST /save` 로 한다.
     """
 
     rank: int
-    kind: Literal["SINGLE_SWAP", "CHAIN", "LNS"] = Field(
+    kind: Literal["ABSENCE_ONLY", "SINGLE_SWAP", "CHAIN", "LNS"] = Field(
         description=(
+            "ABSENCE_ONLY=대체 불필요(빼도 인원이 요구치를 만족), "
             "SINGLE_SWAP=대체인력 1명, CHAIN=여러 명이 같은 날 연쇄 이동, "
             "LNS=인접 일자까지 함께 재배치(1단으로 못 푸는 나이트 결원용)"
         ),
@@ -226,11 +232,49 @@ class ChainProposal(BaseModel):
         default_factory=list,
         description="솔버가 소프트로 두는 규칙의 신규 위반. 배제 사유가 아니라 참고용.",
     )
+    hard_warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "이 안이 새로 깨뜨리는 **하드** 근무규칙. 비어 있으면 조건을 다 지키는 안이다. "
+            "비어 있지 않은 안은 조건을 지키는 안이 하나도 없을 때만 나오는 차선안이며, "
+            "화면에서 접힌 영역에 따로 모아 사용자가 보고 고르게 한다. "
+            "인원·등급·팀 같은 구조적 제약은 여기 절대 오지 않는다 — 그건 항상 배제된다."
+        ),
+    )
 
 
 class SlotChainRecommendation(BaseModel):
+    """결원 한 칸에 대한 수정안. **조건을 지키는 안과 아닌 안을 분리해서** 준다.
+
+    섞어 두면 화면에서 구분이 안 돼 위반이 있는 안을 그냥 추천으로 오인한다.
+    `proposals` 가 비어 있다는 것 자체가 "조건을 지키는 방법이 없다" 는 신호다.
+    """
+
     slot: ReplacementSlot
-    proposals: List[ChainProposal] = Field(default_factory=list)
+    proposals: List[ChainProposal] = Field(
+        default_factory=list,
+        description="솔버 하드 규칙을 하나도 새로 깨뜨리지 않는 안. 이것만 정식 추천이다.",
+    )
+    fallback_proposals: List[ChainProposal] = Field(
+        default_factory=list,
+        description=(
+            "`proposals` 가 비었을 때만 채워지는 차선안. 각 안의 `hard_warnings` 에 "
+            "무엇을 감수하는지 들어 있다. 화면에서는 접힌 영역에 따로 모아 "
+            "사용자가 보고 고르게 한다 — 정식 추천과 같은 목록에 두지 않는다."
+        ),
+    )
+    blocked_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "둘 다 비었을 때만 채워지는 한 줄 사유. 그날 근무별 인원 현황을 담는다. "
+            "빈 화면 대신 왜 불가인지 보여줘 다음 조치(연장근무·타 병동 지원)를 "
+            "판단할 수 있게 한다."
+        ),
+    )
+    blocked_detail: Dict[str, int] = Field(
+        default_factory=dict,
+        description="후보가 걸린 사유별 인원 수. 무엇을 풀면 대체가 가능해지는지 가리킨다.",
+    )
 
 
 class ReplacementRecommendResponse(BaseModel):

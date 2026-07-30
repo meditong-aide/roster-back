@@ -43,8 +43,8 @@ from services.replacement_chain_service import (
     ChainContext,
     build_chain_context,
     hard_violation_reasons,
-    recommend_chain_proposals,
-    recommend_lns_repair,
+    explain_no_plan,
+    recommend_repair_plan,
 )
 
 
@@ -1979,8 +1979,9 @@ def _build_chain_results(
 ) -> Optional[List[SlotChainRecommendation]]:
     """수정안 — opt-in 일 때만 계산한다.
 
-    1단(당일 1열)으로 안 나오고 `include_lns_fallback` 이 켜져 있으면 2단 LNS 를 탄다.
-    2단은 12~18초 걸리므로 1단이 빈손일 때만 호출한다.
+    탐색 순서는 `recommend_repair_plan` 이 정한다 —
+    1단 무위반 → 2단 무위반 → 1단 차선안 → 2단 차선안.
+    2단은 `include_lns_fallback` 이 켜져 있을 때만 탄다.
     """
     if ctx is None or not getattr(req.options, "include_chain_proposals", False) or not slots:
         return None
@@ -1989,16 +1990,21 @@ def _build_chain_results(
     use_lns = bool(getattr(req.options, "include_lns_fallback", False))
     out = []
     for slot in slots:
-        proposals = recommend_chain_proposals(
-            ctx, req.target_nurse_id, slot.date, slot.shift, limit=limit,
+        plans = recommend_repair_plan(
+            ctx, req.target_nurse_id, slot.date, slot.shift,
+            limit=limit, use_lns=use_lns,
         )
-        if not proposals and use_lns:
-            lns = recommend_lns_repair(
-                db, ctx, schedule, current_user, req.target_nurse_id, slot.date, slot.shift,
-            )
-            if lns is not None:
-                proposals = [lns]
-        out.append(SlotChainRecommendation(slot=slot, proposals=proposals))
+        clean = [p for p in plans if not p.hard_warnings]
+        fallback = [] if clean else [p for p in plans if p.hard_warnings]
+        reason, detail = ("", {}) if (clean or fallback) else explain_no_plan(
+            ctx, req.target_nurse_id, slot.date, slot.shift)
+        out.append(SlotChainRecommendation(
+            slot=slot,
+            proposals=clean,
+            fallback_proposals=fallback,
+            blocked_reason=reason or None,
+            blocked_detail=detail,
+        ))
     return out
 
 
