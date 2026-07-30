@@ -5936,16 +5936,80 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         _prio_fams = _priority_families_from_presolve(presolve_diag)
                     except NameError:
                         _prio_fams = []
+                    # λ(Lagrangian) 우선순위(opt-in): max-flow 가 놓치는 결합(OFF예산·야간cap 등)
+                    # 을 재solve subgradient 로 실측해 완화 레버를 앞에 배치 → 전수폴백 방지.
+                    # AIDE_PROBE_LAMBDA=1 로 활성. 실패/미설정 시 기존 presolve 순서 그대로.
+                    if _os_undiag.getenv("AIDE_PROBE_LAMBDA") == "1":
+                        try:
+                            import calendar as _cal
+                            from services.ontology_graph.lagrangian import lambda_priority_from_config
+                            _nd = _cal.monthrange(req.year, req.month)[1]
+                            _lam_fams = lambda_priority_from_config(nurses_for_engine, _probe_base, _nd)
+                            if _lam_fams:
+                                _prio_fams = _lam_fams + [f for f in _prio_fams if f not in _lam_fams]
+                                print(f"[UndiagProbe] λ 우선 완화군 {_lam_fams} 선반영")
+                        except Exception as _le:
+                            print(f"[UndiagProbe] λ 우선순위 실패(무시): {_le}")
+                    # ── 원인(cause) → 탐색(repair) 게이팅 ────────────────────────────
+                    #   explain_infeasibility 로 '왜 해가 없나'를 진단 → (a) 항상 payload 에
+                    #   cause_explanation 첨부(미션: 설명), (b) AIDE_CAUSE_GATE=1 이면 탐색 제어:
+                    #     · arithmetic-증명 원인(인원/셀 부족·정책 과제약)=카탈로그 레버 없음 → probe 스킵
+                    #     · coupled_sequence → 그 family 를 최우선(prune) → 전수(377회) 방지
+                    #   이게 '원인 vs 해결책 분리'를 실제로 통합(원인이 repair 탐색을 게이팅)한다.
+                    _skip_probe = False
+                    try:
+                        import calendar as _cal2
+                        from services.ontology_graph.lagrangian import (
+                            explain_infeasibility_from_config,
+                        )
+                        _nd2 = _cal2.monthrange(req.year, req.month)[1]
+                        _cause = explain_infeasibility_from_config(
+                            nurses_for_engine, _probe_base, _nd2,
+                            year=req.year, month=req.month)
+                        unrecoverable["infeasibility"]["cause_explanation"] = {
+                            "classification": _cause.classification,
+                            "top_family": _cause.top_family,
+                            "certificate": _cause.certificate,
+                            "arithmetic": _cause.arithmetic,
+                            "lambda_by_family": _cause.lambda_by_family,
+                        }
+                        print(f"[Cause] {_cause.classification}: {_cause.certificate}")
+                        # arithmetic-증명 원인(개인 즉시모순·인원/셀 부족)은 확실 → config
+                        # 카탈로그 전수탐색이 무의미. 게이트 무관 **기본 스킵**(377회 회피).
+                        # 그 외(정책과제약·coupled)는 추정이라 AIDE_CAUSE_GATE=1 일 때만.
+                        if _cause.classification in ("personal_infeasible", "coverage_shortage"):
+                            _skip_probe = True
+                            unrecoverable["infeasibility"]["resolution_options"] = [{
+                                "option_id": f"cause:{_cause.classification}",
+                                "kind": "cause_explanation", "source": "cause", "verified": True,
+                                "title_ko": _cause.certificate,
+                                "fix": {"mode": "manual", "where": "nurse.monthly_limit",
+                                        "where_label_ko": "간호사 관리 > 해당 간호사 > 월 근무 한도"},
+                            }] + (unrecoverable["infeasibility"].get("resolution_options") or [])
+                            print("[Cause] arithmetic-증명 원인 → probe 스킵(전수탐색 회피, 기본)")
+                        elif _os_undiag.getenv("AIDE_CAUSE_GATE") == "1":
+                            if _cause.classification == "policy_overconstraint":
+                                _skip_probe = True
+                                print("[Cause] 정책 과제약 → probe 스킵")
+                            elif _cause.top_family:
+                                _prio_fams = [_cause.top_family] + [
+                                    f for f in _prio_fams if f != _cause.top_family]
+                    except Exception as _ce:
+                        print(f"[Cause] 진단 실패(무시): {_ce}")
                     # hard-filter: 온톨로지가 압박군을 지목했으면(=_prio_fams 존재) 그 단일+콤보만
                     # 먼저 확인하고 안 되면 전수 폴백 → 흔한 케이스 재solve 대폭↓. AIDE_PROBE_HARD_FILTER=0 로 해제.
                     _hard_filter = bool(_prio_fams) and _os_undiag.getenv("AIDE_PROBE_HARD_FILTER", "1") != "0"
-                    _probe_res = probe_relaxations(
-                        _probe_base, _undiag_resolve,
-                        priority_families=(_prio_fams or None),
-                        # 필요한 만큼만 probe: 검증된 해결책 2건이면 종료(우선군 먼저라 최우선 완화 포함).
-                        stop_after=int(_os_undiag.getenv("AIDE_PROBE_STOP_AFTER", "2") or 2),
-                        hard_filter=_hard_filter,
-                    )
+                    if _skip_probe:
+                        _probe_res = {"found": False, "resolutions": [], "all_probed": [],
+                                      "probed_count": 0, "skipped_by_cause": True}
+                    else:
+                        _probe_res = probe_relaxations(
+                            _probe_base, _undiag_resolve,
+                            priority_families=(_prio_fams or None),
+                            # 필요한 만큼만 probe: 검증된 해결책 2건이면 종료(우선군 먼저라 최우선 완화 포함).
+                            stop_after=int(_os_undiag.getenv("AIDE_PROBE_STOP_AFTER", "2") or 2),
+                            hard_filter=_hard_filter,
+                        )
                     _probe_done(f"[해결책 탐색] 규칙 완화 탐색 {_probe_cnt[0]}회 완료")
                     unrecoverable["infeasibility"]["probe_resolutions"] = _probe_res.get("resolutions", [])
                     unrecoverable["infeasibility"]["probe_combo"] = _probe_res.get("combo")
