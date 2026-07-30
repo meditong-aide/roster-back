@@ -60,6 +60,25 @@ def test_trace_conflict_family_then_instance_drilldown():
     assert "김수선" in tr.certificate and "weekend_off" in tr.certificate
 
 
+def test_trace_to_user_options_respects_buckets():
+    """분류 정책: 개인한도/주말휴무=action, 회복규칙=tradeoff, 커버리지/grade=advisory."""
+    from services.ontology_graph.mcs_trace import ConflictTrace, trace_to_user_options
+
+    tr = ConflictTrace(
+        families=["weekend_off", "2n2off", "coverage", "grade", "fixed_cell", "cross_month"],
+        instances_by_family={"weekend_off": ["김수선"]},
+        solve_count=10, feasible_when_all_relaxed=True)
+    opts = {o["family"]: o for o in trace_to_user_options(tr)}
+
+    assert opts["weekend_off"]["bucket"] == "action" and opts["weekend_off"]["actionable"]
+    assert "김수선" in opts["weekend_off"]["title_ko"]          # 개인 지목
+    assert opts["2n2off"]["bucket"] == "tradeoff" and "휴식" in opts["2n2off"]["trade_off_ko"]
+    assert opts["coverage"]["bucket"] == "advisory" and not opts["coverage"]["actionable"]
+    assert opts["grade"]["bucket"] == "advisory"                # 환자안전 → 안내만
+    assert opts["fixed_cell"]["bucket"] == "action"             # 유저 결정: 고정셀=A
+    assert opts["cross_month"]["bucket"] == "tradeoff"          # 유저 결정: cross-month=B
+
+
 def test_trace_conflict_reports_outside_model_when_unrelaxable():
     """전체 완화로도 안 풀리면 '모델 밖 원인' 안내."""
     tr = trace_conflict(lambda relaxed: False, ["a", "b"])
