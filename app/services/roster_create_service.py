@@ -2788,9 +2788,15 @@ _CHANGE_LABEL_KO = {
 
 def _mk_change(nurse_id, attr, frm, to):
     """resolution_options.changes[*] 항목. 프론트가 label_ko/config_key 로 라벨을 렌더하므로
-    (attr 만 주면 'undefined 표시') 둘을 함께 채운다."""
+    (attr 만 주면 'undefined 표시') 둘을 함께 채운다.
+
+    boolean 은 true/false 대신 '적용/해제'로 표기하고, 생성을 막던 현재값(from)은 생략
+    → 프론트가 목표만 렌더('주말 휴무 해제'). 숫자(야간 13→7)는 from/to 둘 다 유지.
+    (changes 는 표시 전용 — 실제 적용은 weekend_off_release/monthly_limit_release 로.)"""
+    from_val = None if isinstance(frm, bool) else frm
+    to_val = ("적용" if to else "해제") if isinstance(to, bool) else to
     return {"nurse_id": nurse_id, "attr": attr, "config_key": attr,
-            "label_ko": _CHANGE_LABEL_KO.get(attr, attr), "from": frm, "to": to}
+            "label_ko": _CHANGE_LABEL_KO.get(attr, attr), "from": from_val, "to": to_val}
 
 
 def _priority_families_from_presolve(presolve_diag) -> list:
