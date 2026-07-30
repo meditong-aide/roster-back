@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import calendar
+import copy
 import json
 import logging
 import re
@@ -56,12 +57,49 @@ from services.wanted_service import _compute_weekly_off_days
 logger = logging.getLogger(__name__)
 
 # 탐색 파라미터
+#: 차선안에서만 열 수 있는 규칙. **1N 금지 하나뿐이다.**
+#:
+#: 필요인원(커버리지)·등급 최소인원·팀 최소인원도 열지 않는다. 솔버가
+#: `soften_daily_coverage=False` 로 하드 고정하며 "무너지면 환자 안전 영향 큼"
+#: 이라고 못박은 항목이다(`cp_sat/fallback_lex.py:535`).
+#:
+#: 연속근무 상한 · ND/ED/NE 전환금지 · 나이트 연속 상한 · 3N2O/2N2O 회복은
+#: 하드락 정책(CLAUDE.md) 대상이라 어떤 경우에도 열지 않는다. 인원·등급·팀 같은
+#: 구조적 제약도 마찬가지다.
+#:
+#: 실측 근거 — 1N 만 열어도 커버가 83.6%→97.8% 로 올라간다. 나머지를 전부 열어도
+#: 98.7% 라 0.9%p 차이뿐이다. 그 폭을 얻자고 안전 규칙을 열 이유가 없다.
+RELAXABLE_RULES = ("not_one_night",)
+#: 차선안이 감수해도 되는 신규 하드 위반 개수 상한. 넘으면 제안하지 않는다.
+MAX_FALLBACK_VIOLATIONS = 4
+
 MAX_CHAIN_DEPTH = 3      # 연쇄에 동원할 최대 인원
 RAW_PROPOSAL_LIMIT = 60  # 순위 매기기 전 원안 수집 상한
-# 2단 자유 구간 반경(일). 전수 실측(1단 미해결 N 결원 165건) 기준:
-#   K=1  56.4% ·  56ms  |  K=2  91.5% ·  96ms  |  K=3  98.2% · 153ms
-# 셋 다 변경 셀 규모가 비슷해 K=3 이 명백히 낫다.
-LNS_FREE_RADIUS = 3
+# 2단 자유 구간 — 결원일로부터 **앞으로만** 며칠까지 여는가.
+#
+#   과거는 절대 열지 않는다. 긴급대체는 당일·직전에 요청되는데 지나간 날의 근무는
+#   이미 수행됐다. 그걸 바꾸는 제안은 실행 불가능하다.
+#   (±3일로 과거까지 열면 73.4% 가 풀리지만 그 수치는 무효다)
+#
+#   전수 실측(1단 미해결 244건, 결원일 이후만):
+#     +1일 41.0% | +2일 54.9% | +3일 60.7% | +5일 60.7%
+#   +3 이상은 더 안 늘어난다.
+LNS_FORWARD_DAYS = 3
+
+# 한 칸을 비우려고 바꿀 수 있는 최대 셀 수(결원 셀 포함).
+#
+#   상한이 없으면 18칸짜리 안이 나온다 — 한 칸 비우자고 다른 근무자 열일곱 칸을
+#   흔드는 건 현장에서 받아들여지지 않는다.
+#
+#   ★ 상한을 하드 제약으로 걸어도 "더 적게 바꾸는 차선해"는 나오지 않는다.
+#     커버리지·시퀀스가 빡빡해 변경량은 문제 구조가 정하는 값이지 선택이 아니다.
+#     (사후에 버린 수치와 제약으로 건 수치가 완전히 동일)
+#
+#   전수 실측(1단 미해결 244건, 결원일~+3일):
+#     ≤4칸 16.4% | ≤6칸 39.8% | ≤8칸 51.2% | ≤10칸 58.6% | 무제한 60.7%
+#   중앙값은 어느 상한에서도 5칸 — 큰 변경은 소수의 꼬리다.
+LNS_EXPANDED_CELLS = 12
+LNS_MAX_CHANGED_CELLS = 6
 LNS_LOCAL_TIME_LIMIT = 5 # 전용 CP-SAT 모델 solve 상한(초). 실측 74ms 라 넉넉하다
 
 # 소프트 점수 가중치 — 하드로 거른 뒤 남은 안들의 우선순위만 정한다
@@ -93,6 +131,9 @@ _RE_NUM = re.compile(r"\d+")
 Move = Tuple[str, date, str, str]
 # {nurse_id: [(date, shift_id), ...]} — 날짜 오름차순
 Sequences = Dict[str, List[Tuple[date, str]]]
+
+#: (소프트 점수, 이동 목록, 소프트 경고, 신규 하드 위반)
+Scored = Tuple[float, List[Move], List[str], List[str]]
 
 
 @dataclass
@@ -297,11 +338,19 @@ def delta_violations(before: Sequence[str], after: Sequence[str]) -> List[str]:
     """규칙 종류별 '건수 증가분'만 새 위반으로 본다.
 
     메시지에 일수가 박혀 있어 문자열 차집합을 쓰면 '순수 OFF 5연속 → 4연속' 처럼
-    오히려 완화된 경우까지 새 위반으로 잘못 잡는다.
+    오히려 완화된 경우까지 새 위반으로 잘못 잡는다. 그래서 세는 건 정규화한
+    종류로 하되, **돌려주는 건 원문**이다 — 정규화 문자열을 그대로 내보내면
+    화면에 `E 인원 #/#` 처럼 숫자가 지워진 채 나가 판단할 수가 없다.
     """
     before_count = Counter(_kind(m) for m in before)
-    after_count = Counter(_kind(m) for m in after)
-    return [k for k, n in after_count.items() if n > before_count.get(k, 0)]
+    seen: Counter = Counter()
+    out = []
+    for message in after:
+        kind = _kind(message)
+        seen[kind] += 1
+        if seen[kind] > before_count.get(kind, 0):
+            out.append(message)   # 정규화한 키가 아니라 **원문**을 돌려준다
+    return out
 
 
 # ── 상태 조작 ───────────────────────────────────────────────────────────────
@@ -353,8 +402,6 @@ def hard_violations(
     out += _weekend_off_violations(nurse_id, day, shift, ctx)
     if main in ctx.banned.get(nurse_id, set()):
         out.append("기피근무")
-    if (nurse_id, day) in ctx.fixed_cells:
-        out.append("확정 원티드 셀")
     if day.day in ctx.blocked_days.get(nurse_id, set()) and shift in ctx.categories["work"]:
         # 파견·병동이동·휴직 아웃바운드 기간 + 프리셉티 follow 구간.
         # 솔버는 iter_nurse_days 에서 이 날짜를 아예 빼므로 배정 자체가 없다.
@@ -421,6 +468,25 @@ def soft_warnings(moves: Sequence[Move], seqs: Sequences, ctx: ChainContext) -> 
     return out
 
 
+def absence_side_effects(
+    ctx: ChainContext, state: Sequences, target_nurse_id: str, day: date, shift: str,
+) -> List[str]:
+    """결원 처리 **자체**가 결원자에게 만드는 위반.
+
+    예) N N N 가운데를 비우면 앞뒤가 각각 단독 나이트가 되고, 저연차가 빠지면
+    그 근무의 등급 최소인원이 미달된다.
+    추천이 만든 게 아니라 "그날 못 나옴"이라고 한 순간 생기는 것이라 피할 수 없다.
+    배제 사유로 쓰지 않고 경고로만 알린다 — 사용자가 알고 판단해야 한다.
+    """
+    before = hard_violations(target_nurse_id, day, shift, ctx.sequences, ctx)
+    after = hard_violations(target_nurse_id, day, ctx.off_code, state, ctx)
+    out = [f"{_name(ctx, target_nurse_id)}: 결원 처리로 {v}"
+           for v in delta_violations(before, after)]
+    return out + [f"결원 처리로 {v}" for v in delta_violations(
+        _structural_issues(ctx.sequences, ctx, day),
+        _structural_issues(state, ctx, day))]
+
+
 def _name(ctx: ChainContext, nurse_id: str) -> str:
     return ctx.name_of.get(nurse_id, nurse_id)
 
@@ -431,12 +497,22 @@ def _name(ctx: ChainContext, nurse_id: str) -> str:
 def _sweep(
     day: date, shift: str, seqs: Sequences, ctx: ChainContext, exclude: Set[str],
 ) -> List[Tuple[str, str, bool]]:
-    """(day, shift) 를 메울 수 있는 후보 → [(nurse_id, 현재 근무, 빈자리 생김 여부)]."""
+    """(day, shift) 를 메울 수 있는 후보 → [(nurse_id, 현재 근무, 빈자리 생김 여부)].
+
+    차선안을 찾을 때는 `_relaxed_ctx` 사본을 넘긴다. 검사를 건너뛰는 게 아니라
+    **1N 금지만 끈 기준으로 똑같이 검사**한다 — 그래야 ND·회복·연속근무처럼
+    열면 안 되는 규칙이 함께 새지 않는다.
+    """
     main = ctx.main_of.get(shift, shift)
     assignment = _day_assignment(seqs, ctx, day)
     out = []
     for nurse_id in seqs:
         if nurse_id in exclude:
+            continue
+        if (nurse_id, day) in ctx.fixed_cells:
+            # 확정 원티드 셀은 건드리지 않는다. **절대 배제**여야 한다 —
+            # hard_violations 에 넣으면 before/after 양쪽에 잡혀 델타가 0 이 되고
+            # 그대로 통과한다(실측: 중환자실1 19건·42병동 84건이 새고 있었다).
             continue
         current = _shift_at(seqs, nurse_id, day)
         if current is None or ctx.main_of.get(current, current) == main:
@@ -444,7 +520,7 @@ def _sweep(
         moved = _move(seqs, nurse_id, day, shift)
         before = hard_violations(nurse_id, day, current, seqs, ctx)
         if delta_violations(before, hard_violations(nurse_id, day, shift, moved, ctx)):
-            continue  # 원본에 없던 하드 위반이 새로 생긴다
+            continue  # 이 기준에 없던 하드 위반이 새로 생긴다
         out.append((nurse_id, current, _leaves_gap(nurse_id, current, day, assignment, ctx)))
     return out
 
@@ -495,10 +571,12 @@ def _find_chains(
 # ── 재검증 ──────────────────────────────────────────────────────────────────
 
 
-def _state_issues(
-    seqs: Sequences, ctx: ChainContext, day: date, who: Set[str],
-) -> List[str]:
-    """그 날짜 기준 하드 위반 목록 — 커버리지 · 등급 · 관련자 개인규칙."""
+def _structural_issues(seqs: Sequences, ctx: ChainContext, day: date) -> List[str]:
+    """인원 · 등급 · 팀 — **차선안에서도 절대 못 여는** 것.
+
+    이게 깨지면 그 날 근무가 안 돌아간다. 대체를 하는 이유 자체가 사라지므로
+    사용자 판단에 맡길 성질이 아니다.
+    """
     assignment = _day_assignment(seqs, ctx, day)
     out = []
     for main, required in ctx.coverage_req.items():
@@ -507,12 +585,26 @@ def _state_issues(
     for main in ("D", "E", "N"):
         for issue in grade_shortage(assignment[main], ctx.grade_of, (ctx.grade_min or {}).get(main)):
             out.append(f"{main} {issue}")
-    out += team_min_shortage(assignment, ctx)
+    return out + team_min_shortage(assignment, ctx)
+
+
+def _personal_issues(
+    seqs: Sequences, ctx: ChainContext, day: date, who: Set[str],
+) -> List[str]:
+    """관련자 개인 근무규칙 — 차선안에서 **사용자가 보고 감수할 수 있는** 것."""
+    out = []
     for nurse_id in who:
         current = _shift_at(seqs, nurse_id, day) or ctx.off_code
         out += [f"{_name(ctx, nurse_id)}: {v}"
                 for v in hard_violations(nurse_id, day, current, seqs, ctx)]
     return out
+
+
+def _state_issues(
+    seqs: Sequences, ctx: ChainContext, day: date, who: Set[str],
+) -> List[str]:
+    """그 날짜 기준 하드 위반 전체 — 구조 + 개인."""
+    return _structural_issues(seqs, ctx, day) + _personal_issues(seqs, ctx, day, who)
 
 
 def _apply(seqs: Sequences, moves: Sequence[Move]) -> Sequences:
@@ -524,18 +616,42 @@ def _apply(seqs: Sequences, moves: Sequence[Move]) -> Sequences:
 
 def _verify(
     moves: Sequence[Move], base: Sequences, ctx: ChainContext, origin: Sequences,
-) -> List[str]:
-    """제안을 결과 상태로 다시 검사한다. 판정은 '원본 대비 악화 금지'다.
+) -> Tuple[List[str], List[str]]:
+    """제안을 결과 상태로 다시 검사해 **(구조적 위반, 개인규칙 위반)** 을 준다.
 
-    원본 근무표가 이미 깨뜨리고 있는 항목까지 제안 탓으로 돌리면 그 날짜의 모든
-    안이 자동 탈락한다. 새로 생긴 위반만 센다.
+    판정은 '원본 대비 악화 금지'다. 원본 근무표가 이미 깨뜨리고 있는 항목까지
+    제안 탓으로 돌리면 그 날짜의 모든 안이 자동 탈락한다. 새로 생긴 위반만 센다.
+
+    구조/개인을 나누는 이유는 차선안 때문이다. 구조적 위반은 어떤 경우에도
+    제안하지 않지만, 개인규칙 위반은 표시한 뒤 사용자가 고르게 한다.
     """
     day = moves[0][1]
     who = {m[0] for m in moves}
-    return sorted(delta_violations(
-        _state_issues(origin, ctx, day, who),
-        _state_issues(_apply(base, moves), ctx, day, who),
-    ))
+    after = _apply(base, moves)
+    return (
+        sorted(delta_violations(_structural_issues(origin, ctx, day),
+                                _structural_issues(after, ctx, day))),
+        _personal_delta(origin, after, ctx, day, who),
+    )
+
+
+def _personal_delta(
+    before: Sequences, after: Sequences, ctx: ChainContext, day: date, who: Set[str],
+) -> List[str]:
+    """관련자별로 델타를 내고 이름은 **나중에** 붙인다.
+
+    이름을 먼저 붙여 통째로 `delta_violations` 에 넣으면 그 안의 정규화(숫자→#)가
+    이름까지 지운다. 사번이 이름 자리에 들어간 간호사에서 `#: 단일 나이트` 로
+    표시되던 원인이다.
+    """
+    out = []
+    for nurse_id in sorted(who):
+        b = hard_violations(nurse_id, day,
+                            _shift_at(before, nurse_id, day) or ctx.off_code, before, ctx)
+        a = hard_violations(nurse_id, day,
+                            _shift_at(after, nurse_id, day) or ctx.off_code, after, ctx)
+        out += [f"{_name(ctx, nurse_id)}: {v}" for v in delta_violations(b, a)]
+    return sorted(out)
 
 
 def _score(moves: Sequence[Move], ctx: ChainContext, warnings: Sequence[str]) -> float:
@@ -579,6 +695,8 @@ def build_chain_context(db: Session, schedule) -> ChainContext:
     _fill_blocked_days(ctx, db, group_id, year, month)
     _fill_team_rules(ctx, db, group_id, nurses)
     return ctx
+
+
 
 
 def _fill_blocked_days(ctx: ChainContext, db: Session, group_id: str,
@@ -778,83 +896,37 @@ def recommend_lns_repair(
     target_nurse_id: str,
     day: date,
     shift: str,
-    free_radius: int = LNS_FREE_RADIUS,
+    forward_days: int = LNS_FORWARD_DAYS,
+    allow_fallback: bool = True,
 ) -> Optional[ChainProposal]:
-    """2단 — 1단(당일 1열)으로 못 푸는 결원을 인접 일자까지 열어 푼다.
+    """2단 — 1단(당일 1열)으로 못 푸는 결원을 **이후** 날짜까지 열어 푼다.
 
     나이트 결원은 당일 1열만 봐서는 원리적으로 안 풀린다(1N 금지·연속 N 상한·회복이
-    전부 하드라 최소 2일 블록이 필요하다). 결원일 ±`free_radius` 일을 자유변수로 연다.
+    전부 하드라 최소 2일 블록이 필요하다). 결원일부터 `forward_days` 일 뒤까지 연다.
 
-    경로는 둘이다.
-      ① **전용 CP-SAT 모델**(기본) — 자유 구간만 변수로 세운다. 실측 74ms.
-      ② 생성 파이프라인 dry-run(폴백) — ①이 해를 못 내면. 실측 7.8s.
+    전용 CP-SAT 모델로 푼다(실측 72ms). 제약을 이 모듈에서 다시 세우므로 결과를
+    반드시 기존 체커로 재검증한다(`_local_result_ok`) — 물리면 제안하지 않는다.
 
-    ①은 제약을 이 모듈에서 다시 세우므로, 결과를 반드시 기존 체커로 재검증한다
-    (`_local_result_ok`). 체커가 물면 ②로 넘어간다.
+    생성 파이프라인 dry-run 폴백은 **쓰지 않는다.** 그 경로는 과거 날짜를 열고
+    변경량 상한도 못 걸어, 실행 불가능하거나 과도한 제안을 만든다.
+    (`generate_roster_service(dry_run=...)` seam 자체는 남아 있다)
 
     **1단이 빈손일 때만 부른다.**  저장은 하지 않는다.
     """
-    free_dates = _free_dates(day, free_radius, ctx)
-    local = _repair_via_local_cpsat(ctx, target_nurse_id, day, shift, free_dates)
-    if local is not None:
-        return local
-    logger.info("[LNS] 전용 모델 실패 — 생성 파이프라인 dry-run 으로 폴백")
-    return _repair_via_generation(
-        db, ctx, schedule, current_user, target_nurse_id, day, shift, free_radius)
+    free_dates = _free_dates(day, forward_days, ctx)
+    return _repair_via_local_cpsat(ctx, target_nurse_id, day, shift, free_dates,
+                                   allow_fallback)
 
 
-def _free_dates(day: date, radius: int, ctx: ChainContext) -> List[date]:
-    """자유 구간 일자 목록 — 그 달 범위를 벗어나지 않게 자른다."""
+def _free_dates(day: date, forward_days: int, ctx: ChainContext) -> List[date]:
+    """자유 구간 — **결원일부터 앞으로만**. 과거는 이미 수행된 근무라 건드리지 않는다."""
     last = calendar.monthrange(day.year, day.month)[1]
     out = []
-    for offset in range(-radius, radius + 1):
+    for offset in range(0, forward_days + 1):
         d = day + timedelta(days=offset)
-        if 1 <= d.day <= last and d.month == day.month:
+        if d.day <= last and d.month == day.month:
             out.append(d)
     return out
-
-
-def _repair_via_generation(
-    db: Session,
-    ctx: ChainContext,
-    schedule,
-    current_user,
-    target_nurse_id: str,
-    day: date,
-    shift: str,
-    free_radius: int,
-) -> Optional[ChainProposal]:
-    """폴백 — 생성 파이프라인을 dry-run 으로 돌려 결과를 받는다(7.8s)."""
-    from services.roster_create_service import generate_roster_service  # 지연 import(무거움)
-    from schemas.roster_schema import RosterRequest
-
-    baseline = _baseline_cells(ctx)
-    if not baseline:
-        return None
-    free_days = _free_day_indices(day, free_radius, ctx)
-    cells = _lns_fixed_cells(baseline, free_days)
-    if cells is None:
-        return None
-    # 결원 당사자는 그 날 OFF 로 못박는다. 자유변수로 두면 솔버가 원래대로 배정해
-    # "결원이 없는 근무표"를 그대로 돌려준다(대체가 아니다).
-    cells.append({"nurse_id": target_nurse_id, "day_index": day.day - 1,
-                  "shift": ctx.off_code})
-
-    try:
-        result = generate_roster_service(
-            RosterRequest(year=int(schedule.year), month=int(schedule.month),
-                          group_id=str(schedule.group_id)),
-            current_user, db, dry_run=True, lns_fixed_cells=cells,
-        )
-    except Exception:  # noqa: BLE001 — 생성 실패는 '해 없음'으로 흡수한다
-        db.rollback()
-        logger.warning("[LNS] dry-run 생성 실패 — 제안 없음", exc_info=True)
-        return None
-
-    generated = (result or {}).get("generated") or {}
-    return _lns_result_to_proposal(
-        ctx, generated, baseline, target_nurse_id, day, shift, free_days,
-    )
 
 
 # ── 2단 ① 전용 CP-SAT 모델 ────────────────────────────────────────────────
@@ -877,6 +949,25 @@ class _LocalModel:
     free_set: Set[Tuple[str, date]]
     x: Dict[Tuple[str, date, str], Any]
     span: List[date]
+    target_nurse_id: str
+    absence_day: date
+    max_cells: int
+    #: 제약 상대화의 기준 — **결원을 이미 반영한** 근무표.
+    #: 원본을 기준으로 삼으면 "N N N 가운데를 비워서 생긴 1N" 을 추천 탓으로 몰아
+    #: 해를 통째로 버린다. 결원자는 그날 못 나오는 게 전제다.
+    baseline: Sequences
+
+
+def _relaxed_ctx(ctx: ChainContext) -> ChainContext:
+    """차선안 탐색용 사본 — 개인 근무규칙만 끈다.
+
+    얕은 복사라 근무표·명단은 원본과 공유한다(읽기만 한다). `config` 만 갈아끼워
+    `_add_sequence_rules` 가 1N·회복·전환·연속 제약을 걸지 않게 만든다.
+    인원·등급·팀은 건드리지 않으므로 그대로 강제된다.
+    """
+    out = copy.copy(ctx)
+    out.config = {**ctx.config, **{k: False for k in RELAXABLE_RULES}}
+    return out
 
 
 def _repair_via_local_cpsat(
@@ -885,13 +976,35 @@ def _repair_via_local_cpsat(
     day: date,
     shift: str,
     free_dates: List[date],
+    allow_fallback: bool = True,
+    max_cells: int = LNS_MAX_CHANGED_CELLS,
 ) -> Optional[ChainProposal]:
-    """전용 모델로 푼다. 해가 없거나 체커가 물면 None(→ 폴백)."""
+    """전용 모델로 푼다. 조건을 다 지키는 해가 없으면 차선안까지 시도한다."""
     try:
         from ortools.sat.python import cp_model  # 지연 import — 1단 경로는 안 쓴다
     except ImportError:
         return None
-    lm = _build_local_model(cp_model, ctx, target_nurse_id, day, free_dates)
+    proposal = _solve_local_once(cp_model, ctx, target_nurse_id, day, shift,
+                                 free_dates, max_cells)
+    if proposal is not None or not allow_fallback:
+        return proposal
+    proposal = _solve_local_once(cp_model, _relaxed_ctx(ctx), target_nurse_id,
+                                 day, shift, free_dates, max_cells)
+    if proposal is None:
+        return None
+    hard = _proposal_hard_warnings(ctx, proposal, target_nurse_id, day)
+    if len(hard) > MAX_FALLBACK_VIOLATIONS:
+        return None
+    proposal.hard_warnings = hard
+    return proposal
+
+
+def _solve_local_once(
+    cp_model, ctx: ChainContext, target_nurse_id: str, day: date,
+    shift: str, free_dates: List[date], max_cells: int = LNS_MAX_CHANGED_CELLS,
+) -> Optional[ChainProposal]:
+    """주어진 ctx 기준으로 한 번 푼다. 해가 없거나 체커가 물면 None."""
+    lm = _build_local_model(cp_model, ctx, target_nurse_id, day, free_dates, max_cells)
     if lm is None:
         return None
     solution = _solve_local(cp_model, lm)
@@ -903,10 +1016,38 @@ def _repair_via_local_cpsat(
     return _local_solution_to_proposal(ctx, solution, target_nurse_id, day, shift)
 
 
-def _build_local_model(cp_model, ctx, target_nurse_id, day, free_dates) -> Optional[_LocalModel]:
+def _proposal_hard_warnings(
+    ctx: ChainContext, proposal: ChainProposal, target_nurse_id: str, day: date,
+) -> List[str]:
+    """차선안이 **원래 기준으로** 새로 깨뜨리는 개인 근무규칙.
+
+    결원 당사자 몫은 빼고 센다 — 그건 추천이 만든 게 아니라 결원 자체의 결과이며
+    `absence_side_effects` 가 따로 알린다.
+    """
+    origin = _move(ctx.sequences, target_nurse_id, day, ctx.off_code)
+    state = {n: list(seq) for n, seq in origin.items()}
+    for mv in proposal.moves:
+        state[mv.nurse_id] = [(d, mv.to_shift if d == mv.date else code)
+                              for d, code in state[mv.nurse_id]]
+    out: Set[str] = set()
+    for mv in proposal.moves:
+        if mv.is_absence:
+            continue
+        before = hard_violations(mv.nurse_id, mv.date,
+                                 _shift_at(origin, mv.nurse_id, mv.date) or ctx.off_code,
+                                 origin, ctx)
+        after = hard_violations(mv.nurse_id, mv.date,
+                                _shift_at(state, mv.nurse_id, mv.date) or ctx.off_code,
+                                state, ctx)
+        out.update(f"{mv.name}: {v}" for v in delta_violations(before, after))
+    return sorted(out)
+
+
+def _build_local_model(cp_model, ctx, target_nurse_id, day, free_dates,
+                       max_cells: int = LNS_MAX_CHANGED_CELLS) -> Optional[_LocalModel]:
     """변수·제약을 세운다. 결원 칸이 자유 셀이 아니면(휴가 등) 포기한다."""
     codes = sorted({ctx.main_of.get(s, s) for s in ctx.categories["work"]} | {ctx.off_code})
-    free_cells = _local_free_cells(ctx, free_dates, codes)
+    free_cells = _local_free_cells(ctx, free_dates, codes, target_nurse_id)
     free_set = set(free_cells)
     if (target_nurse_id, day) not in free_set:
         return None
@@ -914,7 +1055,9 @@ def _build_local_model(cp_model, ctx, target_nurse_id, day, free_dates) -> Optio
     x = {(n, d, c): model.NewBoolVar(f"x_{n}_{d}_{c}")
          for (n, d) in free_cells for c in codes}
     lm = _LocalModel(ctx=ctx, model=model, codes=codes, free_dates=free_dates,
-                     free_set=free_set, x=x, span=_local_span(free_dates))
+                     free_set=free_set, x=x, span=_local_span(free_dates),
+                     target_nurse_id=target_nurse_id, absence_day=day, max_cells=max_cells,
+                     baseline=_move(ctx.sequences, target_nurse_id, day, ctx.off_code))
     for cell in free_cells:
         model.AddExactlyOne(x[cell[0], cell[1], c] for c in codes)
         _add_cell_rules(lm, *cell)
@@ -928,7 +1071,7 @@ def _build_local_model(cp_model, ctx, target_nurse_id, day, free_dates) -> Optio
 
 
 def _local_free_cells(
-    ctx: ChainContext, free_dates: List[date], codes: List[str],
+    ctx: ChainContext, free_dates: List[date], codes: List[str], target_nurse_id: str,
 ) -> List[Tuple[str, date]]:
     """건드려도 되는 칸 — 원본 코드가 D/E/N/O 계열인 것만.
 
@@ -955,8 +1098,11 @@ def _local_span(free_dates: List[date]) -> List[date]:
 
 
 def _orig(lm: _LocalModel, nurse_id: str, d: date, want: Set[str]) -> int:
-    """원본에서 그 날이 want 집합인가 (0/1)."""
-    current = _shift_at(lm.ctx.sequences, nurse_id, d)
+    """**결원 반영 기준선**에서 그 날이 want 집합인가 (0/1).
+
+    제약 상한을 이 값으로 상대화하므로, 결원 처리로 생긴 위반은 자동 면제된다.
+    """
+    current = _shift_at(lm.baseline, nurse_id, d)
     return 1 if current and lm.ctx.main_of.get(current, current) in want else 0
 
 
@@ -982,7 +1128,8 @@ def _add_cell_rules(lm: _LocalModel, nurse_id: str, d: date) -> None:
         m.Add(x[nurse_id, d, ctx.off_code] == 1)
     if nurse_id in ctx.weekend_off:
         m.Add(x[nurse_id, d, ctx.off_code] == (1 if d.day in ctx.weekend_days else 0))
-    if (nurse_id, d) in ctx.fixed_cells:
+    if (nurse_id, d) in ctx.fixed_cells and not (nurse_id == lm.target_nurse_id and d == lm.absence_day):
+        # 결원 당사자의 결원일은 제외 — OFF 강제와 충돌해 INFEASIBLE 이 된다.
         current = _shift_at(ctx.sequences, nurse_id, d)
         if current:
             m.Add(x[nurse_id, d, ctx.main_of.get(current, current)] == 1)
@@ -994,14 +1141,22 @@ def _add_coverage_rules(lm: _LocalModel) -> None:
     """커버리지·등급 최소인원 — 원본 수준 아래로만 안 떨어지면 된다(악화 금지)."""
     ctx, m = lm.ctx, lm.model
     for d in lm.free_dates:
+        # 원본 기준이어야 한다. baseline(결원 반영)으로 낮추면 '아무도 안 채워도 됨'
+        # 이 되어 사후 검증(원본 인원 유지)과 모순된다.
         assigned = _day_assignment(ctx.sequences, ctx, d)
         for main, need in ctx.coverage_req.items():
             if not need or main not in lm.codes:
                 continue
             m.Add(_headcount(lm, d, main) >= min(need, len(assigned[main])))
+        # 인원과 달리 **등급·팀은 결원 반영 후가 기준**이다. 결원자가 그 근무의
+        # 유일한 저연차였다면 그 요구는 결원으로 이미 깨진 것이고, 대체자가 반드시
+        # 같은 등급이어야 할 이유는 없다. 원본으로 강제하면 "다른 저연차를 데려와라"
+        # 가 되는데 그쪽 근무도 1명뿐이라 빼는 순간 거기가 깨져 INFEASIBLE 이 된다.
+        # (실측: 민지혜 8-09 N — 등급 제약만 빼면 즉시 OPTIMAL)
+        based = _day_assignment(lm.baseline, ctx, d)
         for main in ("D", "E", "N"):
-            _add_grade_rules(lm, d, main, assigned[main])
-        _add_team_min_rules(lm, d, assigned)
+            _add_grade_rules(lm, d, main, based[main])
+        _add_team_min_rules(lm, d, based)
 
 
 def _headcount(lm: _LocalModel, d: date, main: str, only: Optional[Set[str]] = None):
@@ -1168,11 +1323,19 @@ def _add_recovery_rules(lm: _LocalModel, nurse_id: str) -> None:
 
 
 def _add_local_objective(lm: _LocalModel, free_cells: List[Tuple[str, date]]) -> None:
-    """목적 — 원본에서 바뀌는 셀 수 최소화(MPP)."""
+    """목적 — 원본에서 바뀌는 셀 수 최소화(MPP) + 상한 하드.
+
+    상한을 제약으로 걸면 "최적해가 상한을 넘어서 버려지는" 일이 없다.
+    솔버가 상한 안에서 최선을 찾는다.
+    """
     terms = []
     for nurse_id, d in free_cells:
         current = _shift_at(lm.ctx.sequences, nurse_id, d)
         terms.append(1 - lm.x[nurse_id, d, lm.ctx.main_of.get(current, current)])
+    if not terms:
+        return
+    # 결원 셀 1칸은 상한에 이미 포함돼 있다(결원자 OFF 도 변경으로 센다)
+    lm.model.Add(sum(terms) <= lm.max_cells)
     lm.model.Minimize(sum(terms))
 
 
@@ -1187,10 +1350,23 @@ def _solve_local(cp_model, lm: _LocalModel) -> Optional[Dict[Tuple[str, date], s
             for (n, d) in lm.free_set}
 
 
+def _keep_subcode(ctx: ChainContext, current: Optional[str], code: str) -> str:
+    """main 이 그대로면 **원본 코드를 지킨다.** 바뀔 때만 모델이 고른 코드를 쓴다.
+
+    전용 모델은 main(D/E/N/O)만 다룬다. 그대로 얹으면 `Dㅇ` 같은 서브코드가 `D` 로
+    덮여, 실제 근무는 하나도 안 바뀌었는데 변경 셀로 잡힌다(실측: 한 제안에서 22칸이
+    `Dㅇ→D` 였고 변경 상한 6칸을 24칸으로 넘겼다). 적용하면 서브코드도 소실된다.
+    """
+    if current and ctx.main_of.get(current, current) == code:
+        return current
+    return code
+
+
 def _apply_local_solution(ctx: ChainContext, solution: Dict[Tuple[str, date], str]) -> Sequences:
     out = {n: list(seq) for n, seq in ctx.sequences.items()}
     for (nurse_id, d), code in solution.items():
-        out[nurse_id] = [(d2, code if d2 == d else s) for d2, s in out[nurse_id]]
+        out[nurse_id] = [(d2, _keep_subcode(ctx, s, code) if d2 == d else s)
+                         for d2, s in out[nurse_id]]
     return out
 
 
@@ -1212,13 +1388,19 @@ def _local_result_ok(
     if len(_day_assignment(state, ctx, day)[main]) < len(
             _day_assignment(ctx.sequences, ctx, day)[main]):
         return False
+    # 결원자의 기준선은 **결원을 반영한 상태**다.
+    #   `_streak_warnings` 는 시퀀스 전체를 보므로, N N N 가운데를 비우면 앞뒤 1N 이
+    #   어느 날짜로 검사하든 함께 딸려 나온다. 원본과 비교하면 "추천이 만든 위반"으로
+    #   오인해 해를 통째로 버린다(실측: N뭉치 가운데 65건 중 49건이 이 때문에 막혔다).
+    #   앞쪽 1N 은 과거라 고칠 수도 없다. 다른 간호사는 기준선 == 원본이라 영향 없다.
+    origin = _move(ctx.sequences, target_nurse_id, day, ctx.off_code)
     touched = {n for (n, d), c in solution.items()
-               if _shift_at(ctx.sequences, n, d) != c}
+               if _shift_at(origin, n, d) != _keep_subcode(ctx, _shift_at(origin, n, d), c)}
     for nurse_id in touched:
         for d in sorted({d for (n, d) in solution if n == nurse_id}):
             before = hard_violations(
-                nurse_id, d, _shift_at(ctx.sequences, nurse_id, d) or ctx.off_code,
-                ctx.sequences, ctx)
+                nurse_id, d, _shift_at(origin, nurse_id, d) or ctx.off_code,
+                origin, ctx)
             after = hard_violations(
                 nurse_id, d, _shift_at(state, nurse_id, d) or ctx.off_code, state, ctx)
             if delta_violations(before, after):
@@ -1239,6 +1421,7 @@ def _local_solution_to_proposal(
     )]
     for (nurse_id, d), code in sorted(solution.items()):
         before = _shift_at(ctx.sequences, nurse_id, d)
+        code = _keep_subcode(ctx, before, code)
         if before == code or (nurse_id == target_nurse_id and d == day):
             continue
         moves.append(ChainMove(nurse_id=nurse_id, name=_name(ctx, nurse_id), date=d,
@@ -1246,101 +1429,16 @@ def _local_solution_to_proposal(
     if len(moves) < 2:
         return None
     participants = len({m.nurse_id for m in moves if not m.is_absence})
+    warnings = ["여러 날짜가 함께 조정됩니다. 적용 전 변경 셀을 확인하세요."]
+    warnings += absence_side_effects(
+        ctx, _apply_local_solution(ctx, solution), target_nurse_id, day, shift)
     return ChainProposal(
         rank=1, kind="LNS", participant_count=participants,
         changed_cell_count=len(moves),
         score=round(W_CHAIN_STEP * participants + len(moves), 2),
         moves=moves,
-        soft_warnings=["여러 날짜가 함께 조정됩니다. 적용 전 변경 셀을 확인하세요."],
+        soft_warnings=warnings,
     )
-
-
-def _baseline_cells(ctx: ChainContext) -> Dict[Tuple[str, int], str]:
-    """{(nurse_id, day_index): shift_id} — 고정할 원본 근무표."""
-    return {
-        (nurse_id, entry_date.day - 1): shift
-        for nurse_id, seq in ctx.sequences.items()
-        for entry_date, shift in seq
-    }
-
-
-def _free_day_indices(day: date, radius: int, ctx: ChainContext) -> Set[int]:
-    last = calendar.monthrange(day.year, day.month)[1]
-    center = day.day - 1
-    return {d for d in range(center - radius, center + radius + 1) if 0 <= d < last}
-
-
-def _lns_fixed_cells(
-    baseline: Dict[Tuple[str, int], str], free_days: Set[int],
-) -> Optional[List[dict]]:
-    """자유 구간을 뺀 나머지를 고정셀로 만든다.
-
-    **nurse_id 기반으로 넘긴다.** 엔진 목록 순서는 nurse_id 정렬이 아니므로
-    여기서 인덱스를 만들면 엉뚱한 간호사에게 고정돼 INFEASIBLE 이 된다.
-    인덱스 변환은 엔진 목록이 확정된 생성 파이프라인 안에서 한다.
-    """
-    out = [
-        {"nurse_id": nurse_id, "day_index": day_index, "shift": shift}
-        for (nurse_id, day_index), shift in baseline.items()
-        if day_index not in free_days
-    ]
-    return out or None
-
-
-def _lns_result_to_proposal(
-    ctx: ChainContext,
-    generated: Dict[str, List[str]],
-    baseline: Dict[Tuple[str, int], str],
-    target_nurse_id: str,
-    day: date,
-    shift: str,
-    free_days: Set[int],
-) -> Optional[ChainProposal]:
-    """생성 결과를 원본과 대조해 바뀐 셀만 `moves` 로 뽑는다.
-
-    **자유 구간 밖의 변경은 버린다.** 고정셀로 넣었는데도 값이 달라진 칸은
-    후처리(`postprocess_off_swap` 등)가 건드린 것이라 이번 결원과 무관하다.
-    """
-    day_index = day.day - 1
-    filled = _cell_of(generated, target_nurse_id, day_index)
-    if not filled or filled == shift:
-        return None  # 결원자가 그대로면 메워진 게 아니다
-
-    moves: List[ChainMove] = [ChainMove(
-        nurse_id=target_nurse_id, name=_name(ctx, target_nurse_id), date=day,
-        from_shift=shift, to_shift=ctx.off_code, is_absence=True,
-    )]
-    for (nurse_id, idx), before in sorted(baseline.items()):
-        after = _cell_of(generated, nurse_id, idx)
-        if after is None or after == before:
-            continue
-        if idx not in free_days:
-            continue  # 고정 구간인데 바뀐 것 = 후처리 산물. 제안에 넣지 않는다
-        if nurse_id == target_nurse_id and idx == day_index:
-            continue  # 결원 처리로 이미 넣었다
-        moves.append(ChainMove(
-            nurse_id=nurse_id, name=_name(ctx, nurse_id),
-            date=date(day.year, day.month, idx + 1),
-            from_shift=before, to_shift=after,
-        ))
-    if len(moves) < 2:
-        return None
-
-    participants = len({m.nurse_id for m in moves if not m.is_absence})
-    return ChainProposal(
-        rank=1, kind="LNS", participant_count=participants,
-        changed_cell_count=len(moves),
-        score=round(W_CHAIN_STEP * participants + len(moves), 2),
-        moves=moves,
-        soft_warnings=["여러 날짜가 함께 조정됩니다. 적용 전 변경 셀을 확인하세요."],
-    )
-
-
-def _cell_of(generated: Dict[str, List[str]], nurse_id: str, day_index: int) -> Optional[str]:
-    row = generated.get(nurse_id)
-    if not row or day_index < 0 or day_index >= len(row):
-        return None
-    return str(row[day_index] or "").strip() or None
 
 
 def hard_violation_reasons(
@@ -1360,6 +1458,8 @@ def hard_violation_reasons(
     """
     if target_nurse_id not in ctx.sequences or candidate_id not in ctx.sequences:
         return []
+    if (candidate_id, day) in ctx.fixed_cells:
+        return ["확정 원티드 셀"]   # 델타로는 상쇄되므로 여기서 절대 배제
     base = _move(ctx.sequences, target_nurse_id, day, ctx.off_code)
     current = _shift_at(base, candidate_id, day)
     if current is None:
@@ -1372,8 +1472,8 @@ def hard_violation_reasons(
         hard_violations(candidate_id, day, shift, moved, ctx),
     )
     structural = delta_violations(
-        _state_issues(ctx.sequences, ctx, day, {candidate_id}),
-        _state_issues(moved, ctx, day, {candidate_id}),
+        _structural_issues(ctx.sequences, ctx, day),
+        _structural_issues(moved, ctx, day),
     )
     return personal + [s for s in structural if s not in personal]
 
@@ -1384,11 +1484,15 @@ def recommend_chain_proposals(
     day: date,
     shift: str,
     limit: int = 10,
+    allow_fallback: bool = True,
 ) -> List[ChainProposal]:
     """결원 (target_nurse_id, day, shift) 에 대한 수정안 목록.
 
-    1인 스왑과 다인 연쇄를 같은 목록에 담아 (인원수, 점수) 오름차순으로 준다.
-    MPP 목적상 변경 셀이 적은 안이 먼저다.
+    1인 스왑과 다인 연쇄를 같은 목록에 담아 (하드위반 수, 인원수, 점수) 오름차순
+    으로 준다. MPP 목적상 변경 셀이 적은 안이 먼저다.
+
+    `allow_fallback` 이면 조건을 다 지키는 안이 없을 때 개인 근무규칙 위반을
+    감수하는 차선안까지 찾는다. 그 안들은 `hard_warnings` 가 비어 있지 않다.
     """
     if target_nurse_id not in ctx.sequences:
         return []
@@ -1398,24 +1502,211 @@ def recommend_chain_proposals(
 
     raw: List[List[Move]] = []
     _find_chains(day, shift, base, ctx, 1, {target_nurse_id}, [], raw)
+    main = ctx.main_of.get(shift, shift)
+    scored = _score_and_filter(raw, base, ctx, target_main=main)
 
-    scored = _score_and_filter(raw, base, ctx)
-    return [_to_proposal(ctx, moves, warnings, score, rank, target_nurse_id, day, shift)
-            for rank, (score, moves, warnings) in enumerate(_dedupe(scored)[:limit], start=1)]
+    if not scored and allow_fallback:
+        # 조건을 다 지키는 안이 하나도 없다. 개인 근무규칙을 여는 차선안을 찾아
+        # **위반을 명시한 채로** 내놓는다. 판단은 사용자 몫이다.
+        judge = _relaxed_ctx(ctx)
+        raw = []
+        _find_chains(day, shift, base, judge, 1, {target_nurse_id}, [], raw)
+        scored = _score_and_filter(raw, base, ctx, judge, target_main=main)
+
+    return [_to_proposal(ctx, moves, warnings, hard, score, rank,
+                         target_nurse_id, day, shift)
+            for rank, (score, moves, warnings, hard)
+            in enumerate(_dedupe(scored)[:limit], start=1)]
+
+
+def recommend_repair_plan(
+    ctx: ChainContext,
+    target_nurse_id: str,
+    day: date,
+    shift: str,
+    limit: int = 10,
+    use_lns: bool = False,
+    forward_days: int = LNS_FORWARD_DAYS,
+) -> List[ChainProposal]:
+    """결원 한 칸에 대한 수정안 — **규칙을 지키는 안을 끝까지 먼저 찾는다.**
+
+    ① 1단 무위반 → ② 2단 무위반 → ③ 넓힌 2단 무위반 + 1N 차선안
+
+    ②를 ③보다 먼저 두는 게 핵심이다. 반대로 하면 규칙을 다 지키는 2단 해가
+    있는데도 위반을 감수하는 안을 먼저 주게 된다(실측: 그 순서에서 LNS 가
+    122건→10건으로 줄고 조건 준수가 622→504 로 떨어졌다).
+
+    ③은 성격이 다른 두 안을 **함께** 담는다. 정렬이 무위반을 위로 올리므로
+    "규칙 준수·변경 많음" 이 "변경 적음·1N 위반" 보다 앞선다.
+
+    `use_lns` 가 꺼져 있으면 1단 계열만 본다. 2단은 결원당 수십 ms 가 붙는다.
+    """
+    solo = _absence_only_plan(ctx, target_nurse_id, day, shift)
+    clean = recommend_chain_proposals(ctx, target_nurse_id, day, shift, limit,
+                                      allow_fallback=False)
+    if clean:
+        # 대체안이 우선이다. 요구인원은 **최소 안전선**이지 운영 목표가 아니다 —
+        # D 에 8명을 배치해 둔 병동에 "요구 3명은 넘으니 비워도 된다" 를 1순위로
+        # 밀면 안 된다. 비우기는 맨 뒤에 선택지로만 붙인다.
+        out = clean[:limit]
+        if solo is not None and len(out) < limit:
+            out.append(solo)
+        for rank, plan in enumerate(out, start=1):
+            plan.rank = rank
+        return out
+    if solo is not None:
+        return [solo]
+    free = _free_dates(day, forward_days, ctx) if use_lns else []
+    if use_lns:
+        lns = _repair_via_local_cpsat(ctx, target_nurse_id, day, shift, free,
+                                      allow_fallback=False)
+        if lns is not None:
+            return [lns]
+
+    # 여기부터는 무언가를 감수해야 한다. 성격이 다른 두 갈래를 **함께** 내놓는다.
+    #   ㄱ. 규칙은 다 지키되 변경 칸이 많은 안
+    #   ㄴ. 변경은 작지만 1N 을 어기는 안
+    # 어느 쪽이 나은지는 상황에 달렸으므로 고르는 건 사용자 몫이다.
+    # 인원·등급·팀 미달은 여기 없다 — 솔버가 하드로 걸고 "무너지면 환자 안전 영향
+    # 큼"(fallback_lex:535) 이라 명시한 항목이라 감수 대상이 아니다.
+    plans: List[ChainProposal] = []
+    if use_lns:
+        wide = _repair_via_local_cpsat(ctx, target_nurse_id, day, shift, free,
+                                       allow_fallback=False,
+                                       max_cells=LNS_EXPANDED_CELLS)
+        if wide is not None:
+            wide.soft_warnings.insert(
+                0, f"변경 범위가 큽니다 — {wide.changed_cell_count}칸")
+            plans.append(wide)
+    # 무위반 탐색을 한 번 더 돌지만 1단은 결원당 0.04ms 라 무시할 수 있다.
+    plans += recommend_chain_proposals(ctx, target_nurse_id, day, shift, limit,
+                                       allow_fallback=True)
+    if use_lns and not plans:
+        lns = _repair_via_local_cpsat(ctx, target_nurse_id, day, shift, free,
+                                      allow_fallback=True)
+        if lns is not None:
+            plans.append(lns)
+    if not plans:
+        return []
+    plans.sort(key=lambda p: (len(p.hard_warnings), p.changed_cell_count, p.score))
+    for rank, plan in enumerate(plans[:limit], start=1):
+        plan.rank = rank
+    return plans[:limit]
+
+
+def explain_no_plan(
+    ctx: ChainContext, target_nurse_id: str, day: date, shift: str,
+) -> Tuple[str, Dict[str, int]]:
+    """수정안이 하나도 없을 때 **왜인지**.
+
+    빈 화면은 "시스템이 고장났나" 로 읽힌다. 그날 인원 현황과 후보별 탈락 사유를
+    돌려줘, 무엇을 풀어야 대체가 가능해지는지 사용자가 알게 한다.
+    """
+    base = _move(ctx.sequences, target_nurse_id, day, ctx.off_code)
+    assignment = _day_assignment(base, ctx, day)
+    main = ctx.main_of.get(shift, shift)
+    reasons: Counter = Counter()
+    for nurse_id in ctx.sequences:
+        if nurse_id == target_nurse_id:
+            continue
+        current = _shift_at(base, nurse_id, day)
+        if current is None:
+            reasons["그날 배정 없음"] += 1
+            continue
+        if ctx.main_of.get(current, current) == main:
+            reasons["이미 같은 근무"] += 1
+            continue
+        if (nurse_id, day) in ctx.fixed_cells:
+            reasons["확정 원티드 셀"] += 1
+            continue
+        moved = _move(base, nurse_id, day, shift)
+        hit = delta_violations(hard_violations(nurse_id, day, current, base, ctx),
+                               hard_violations(nurse_id, day, shift, moved, ctx))
+        if not hit:
+            reasons["데려오면 원래 근무가 미달"] += 1
+            continue
+        for violation in hit:
+            reasons[_kind(violation)] += 1
+    status = " · ".join(
+        f"{m} {len(assignment[m])}/{ctx.coverage_req.get(m, 0)}" for m in ("D", "E", "N")
+        if ctx.coverage_req.get(m)
+    )
+    return f"{day.month}월 {day.day}일 결원 반영 인원 {status} — 조건을 지키는 대체가 없습니다", dict(reasons)
+
+
+def _absence_only_plan(
+    ctx: ChainContext, target_nurse_id: str, day: date, shift: str,
+) -> Optional[ChainProposal]:
+    """대체가 **필요 없는** 경우 — 결원만 비우고 끝낸다.
+
+    그날 그 근무 인원이 빠지고도 요구치를 만족하면 남을 건드릴 이유가 없다.
+    MPP 원칙상 변경은 0칸(결원 처리 제외)이 최선이다.
+
+    실측: 52병동은 D 요구 4명인데 6명이 배정돼 있어 한 명이 빠져도 5명인데,
+    무조건 대체자를 찾다 못 찾고 빈 화면을 내보내고 있었다(20건).
+    """
+    base = _move(ctx.sequences, target_nurse_id, day, ctx.off_code)
+    if delta_violations(_structural_issues(ctx.sequences, ctx, day),
+                        _structural_issues(base, ctx, day)):
+        return None
+    return ChainProposal(
+        rank=1, kind="ABSENCE_ONLY", participant_count=0, changed_cell_count=1,
+        score=0.0,
+        moves=[ChainMove(nurse_id=target_nurse_id, name=_name(ctx, target_nurse_id),
+                         date=day, from_shift=shift, to_shift=ctx.off_code,
+                         is_absence=True)],
+        soft_warnings=["대체 없이 비워도 인원 기준을 만족합니다."]
+                      + absence_side_effects(ctx, base, target_nurse_id, day, shift),
+    )
 
 
 def _score_and_filter(
     raw: List[List[Move]], base: Sequences, ctx: ChainContext,
-) -> List[Tuple[float, List[Move], List[str]]]:
-    """하드 위반 안을 버리고 소프트 점수를 매긴다."""
+    judge: Optional[ChainContext] = None,
+    target_main: Optional[str] = None,
+) -> List[Scored]:
+    """소프트 점수를 매긴다. 반환은 (점수, 이동, 소프트경고, 하드위반).
+
+    비교 기준선은 **결원을 반영한** `base` 다. 원본과 비교하면 "그 사람이 빠져서"
+    생긴 등급 미달·인원 부족까지 제안 탓으로 돌린다(실측 16건). 결원 자체의
+    여파는 `absence_side_effects` 가 따로 알린다.
+
+    `judge` 는 통과 기준이다. 차선안 탐색이면 1N 금지만 끈 사본이 들어온다.
+    **judge 기준으로는 무위반이어야 통과한다** — 열어 준 규칙 말고 다른 게 깨지면
+    차선안으로도 쓰지 않는다. 사용자에게 보여줄 `hard_warnings` 는 그와 별개로
+    **원래 기준**으로 다시 계산한다.
+    """
+    judge = judge or ctx
+    relaxed = judge is not ctx
     out = []
     for moves in raw:
-        if _verify(moves, base, ctx, ctx.sequences):
+        if target_main and not _restores_headcount(moves, base, ctx, target_main):
+            continue
+        structural, residual = _verify(moves, base, judge, base)
+        if structural or residual:
+            continue   # 인원·등급·팀은 솔버에서 하드다. 어떤 경우에도 열지 않는다.
+        personal = _verify(moves, base, ctx, base)[1] if relaxed else []
+        if len(personal) > MAX_FALLBACK_VIOLATIONS:
             continue
         warnings = _new_soft_warnings(moves, base, ctx)
-        out.append((_score(moves, ctx, warnings), moves, warnings))
-    out.sort(key=lambda item: (len(item[1]), item[0]))
+        out.append((_score(moves, ctx, warnings), moves, warnings, personal))
+    out.sort(key=lambda item: (len(item[3]), len(item[1]), item[0]))
     return out
+
+
+def _restores_headcount(
+    moves: Sequence[Move], base: Sequences, ctx: ChainContext, main: str,
+) -> bool:
+    """결원 근무의 인원이 **원본 수준으로** 돌아오는가.
+
+    기준선이 결원 반영 후(`base`)라 이 검사가 없으면 제자리걸음인 안이 통과한다.
+    실측: "신솔희 E→N + 이나영 N→E" 는 N 을 채웠다 다시 빼서 7/8 그대로인데
+    델타가 0 이라 1순위로 올라왔다.
+    """
+    day = moves[0][1]
+    after = _apply(base, moves)
+    return (len(_day_assignment(after, ctx, day)[main])
+            >= len(_day_assignment(ctx.sequences, ctx, day)[main]))
 
 
 def _new_soft_warnings(
@@ -1427,18 +1718,16 @@ def _new_soft_warnings(
     return sorted(set(after) - set(before))
 
 
-def _dedupe(
-    scored: List[Tuple[float, List[Move], List[str]]],
-) -> List[Tuple[float, List[Move], List[str]]]:
+def _dedupe(scored: List[Scored]) -> List[Scored]:
     """같은 (간호사, 최종 근무) 조합은 한 번만 남긴다."""
     seen: Set[tuple] = set()
     out = []
-    for score, moves, warnings in scored:
-        key = tuple(sorted((m[0], m[3]) for m in moves))
+    for item in scored:
+        key = tuple(sorted((m[0], m[3]) for m in item[1]))
         if key in seen:
             continue
         seen.add(key)
-        out.append((score, moves, warnings))
+        out.append(item)
     return out
 
 
@@ -1446,6 +1735,7 @@ def _to_proposal(
     ctx: ChainContext,
     moves: List[Move],
     warnings: List[str],
+    hard: List[str],
     score: float,
     rank: int,
     target_nurse_id: str,
@@ -1471,6 +1761,10 @@ def _to_proposal(
         )
         for nurse_id, move_day, from_shift, to_shift in moves
     ]
+    side = absence_side_effects(
+        ctx, _apply(_move(ctx.sequences, target_nurse_id, day, ctx.off_code), moves),
+        target_nurse_id, day, shift,
+    )
     return ChainProposal(
         rank=rank,
         kind="SINGLE_SWAP" if len(moves) == 1 else "CHAIN",
@@ -1478,5 +1772,6 @@ def _to_proposal(
         changed_cell_count=len(items),
         score=round(score, 2),
         moves=items,
-        soft_warnings=warnings,
+        soft_warnings=list(warnings) + side,
+        hard_warnings=list(hard),
     )
