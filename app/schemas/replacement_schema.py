@@ -48,14 +48,21 @@ class ReplacementRecommendOptions(BaseModel):
     chain_proposal_limit: int = Field(
         default=10, ge=1, le=50, description="슬롯당 반환할 수정안 개수 상한",
     )
-    include_lns_fallback: bool = Field(
-        default=True,
+    search_scope: Literal["SINGLE_DAY", "WIDE"] = Field(
+        default="SINGLE_DAY",
         description=(
-            "1단(당일 1열)으로 수정안이 안 나올 때 인접 일자까지 열어 다시 푸는 2단. "
-            "나이트 결원은 1열만 봐서는 원리적으로 안 풀려(1N 금지·연속 N 상한·회복이 "
-            "전부 하드라 최소 2일 블록이 필요) 사실상 필수다. "
-            "전용 CP-SAT 모델이라 실측 슬롯당 중앙 53ms · p95 400ms. "
-            "끄면 CP-SAT 을 한 번도 호출하지 않는다."
+            "수정안을 어디까지 찾을지. 기본은 변경이 가장 작은 SINGLE_DAY 이며, "
+            "결과가 없거나 부족하면 사용자가 넓힌다.\n"
+            "- SINGLE_DAY(기본): 결원 **당일 한 열만**. 최대 4칸. CP-SAT 을 호출하지 않는다. "
+            "나이트 결원은 1열로 원리적으로 안 풀려(1N 금지 탓에 최소 2일 블록 필요) "
+            "차선안 비중이 커진다.\n"
+            "- WIDE: 결원일~**+3일**을 열고 최대 **12칸**. 날짜를 더 여는 것은 실측상 "
+            "효과가 없었고(+5일·+7일 모두 0건 추가), 병목은 'N 을 2연속으로 묶을 "
+            "여유 칸' 이었다.\n"
+            "중간 단계(+3일·6칸)는 뒀다가 없앴다 — 전수 33,250건에서 해결률이 12칸과 "
+            "똑같이 96.0% 였고 조건 준수만 272건 적었다.\n"
+            "전수 실측(2026년 87개 근무표 33,250건) — SINGLE_DAY 해결 94.4%"
+            "(준수 28,077·차선 3,313·없음 1,860) / WIDE 96.0%(준수 29,670·차선 2,251·없음 1,329)."
         ),
     )
     ranking_scope: Literal[

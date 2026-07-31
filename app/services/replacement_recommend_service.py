@@ -1918,6 +1918,7 @@ def recommend_replacement_candidates(
             "shift_semantic_fallback_reasons": dict(shift_fallback_reason_counts),
             "scoring_policy": "rule_safety_priority_with_grade_fit",
             "chain_proposals_included": chain_results is not None,
+            "applied_search_scope": getattr(req.options, "search_scope", "SINGLE_DAY"),
         },
     )
 
@@ -1981,21 +1982,25 @@ def _build_chain_results(
 
     탐색 순서는 `recommend_repair_plan` 이 정한다 —
     1단 무위반 → 2단 무위반 → 1단 차선안 → 2단 차선안.
-    2단은 `include_lns_fallback` 이 켜져 있을 때만 탄다.
+    어디까지 찾을지는 `options.search_scope` 가 정한다(SINGLE_DAY / WIDE).
     """
     if ctx is None or not getattr(req.options, "include_chain_proposals", False) or not slots:
         return None
 
     limit = int(getattr(req.options, "chain_proposal_limit", 10) or 10)
-    use_lns = bool(getattr(req.options, "include_lns_fallback", False))
+    scope = str(getattr(req.options, "search_scope", "SINGLE_DAY") or "SINGLE_DAY")
     out = []
     for slot in slots:
         plans = recommend_repair_plan(
             ctx, req.target_nurse_id, slot.date, slot.shift,
-            limit=limit, use_lns=use_lns,
+            limit=limit, scope=scope,
         )
         clean = [p for p in plans if not p.hard_warnings]
-        fallback = [] if clean else [p for p in plans if p.hard_warnings]
+        # 차선안을 숨길지는 **진짜 대체안**이 있느냐로 정한다. ABSENCE_ONLY 는
+        # hard_warnings 가 비어 있어 clean 에 들어가는데, 그걸로 판단하면
+        # "비우세요" 하나 때문에 실제 대체안(1N 차선안)이 통째로 가려진다.
+        has_replacement = any(p.kind != "ABSENCE_ONLY" for p in clean)
+        fallback = [] if has_replacement else [p for p in plans if p.hard_warnings]
         reason, detail = ("", {}) if (clean or fallback) else explain_no_plan(
             ctx, req.target_nurse_id, slot.date, slot.shift)
         out.append(SlotChainRecommendation(
