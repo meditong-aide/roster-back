@@ -369,6 +369,42 @@ def _nurse_attr(nu, *keys):
     return None
 
 
+def detect_banned_off_conflict(nurses: list, config: dict) -> list[dict]:
+    """금지 원티드(banned-OFF) × 강제OFF 개인 모순 — **증명된 산술**(솔버 불필요).
+
+    banned_wanted 로 OFF 가 금지된 날(=강제근무)이, 야간회복 등으로 **강제 OFF 인 날**과
+    겹치면 "그날 반드시 근무 ∧ 반드시 휴무" → 물리적 모순. 특히 N전담(allowed={N})은
+    금지-OFF 가 야간회복 OFF 를 막아 자주 터진다.
+
+    반환: [{nurse_id, name, family, banned_off_days, forced_off_days, clash_days,
+            allowed_shifts, is_night_only}]  (모순 간호사만).
+    """
+    ic = config.get("initial_constraints") or {}
+    fo = ic.get("forced_off") or {}          # {nurse_id: [day_idx]}
+    fb = ic.get("forbidden") or {}           # {nurse_id: {day_idx: [codes]}}
+    by_nid = {str(_nurse_attr(nu, "nurse_id")): nu for nu in nurses}
+    out: list[dict] = []
+    for nid, day_map in (fb or {}).items():
+        banned_off = {int(d) for d, codes in (day_map or {}).items()
+                      if "O" in {str(c).strip().upper() for c in (codes or [])}}
+        if not banned_off:
+            continue
+        forced_off = {int(d) for d in (fo.get(nid) or [])}
+        clash = sorted(banned_off & forced_off)
+        if not clash:
+            continue                          # 겹침 없으면 증명된 모순 아님(스킵)
+        nu = by_nid.get(str(nid))
+        allowed = [str(x).strip().upper() for x in (_nurse_attr(nu, "allowed_shifts") or [])]
+        work_opts = (set(allowed) & {"D", "E", "N"}) if allowed else {"D", "E", "N"}
+        out.append({
+            "nurse_id": str(nid), "name": _nurse_attr(nu, "name") or str(nid),
+            "family": "banned_wanted", "banned_off_days": sorted(banned_off),
+            "forced_off_days": sorted(forced_off), "clash_days": clash,
+            "allowed_shifts": sorted(work_opts), "is_night_only": work_opts == {"N"},
+        })
+    return out
+
+
 def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
                                       *, year: int | None = None, month: int | None = None,
                                       iters: int = 6) -> InfeasibilityExplanation:
@@ -389,6 +425,19 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
     if year and month:
         wk_day_cnt = sum(1 for d in range(int(num_days))
                          if _cal.weekday(int(year), int(month), d + 1) >= 5)
+
+    # ── 0a) 금지근무(banned-OFF) × 강제OFF 모순 (증명, 최우선) ──────────────────
+    #   OFF 금지(강제근무)가 야간회복 강제OFF 와 겹치면 근무∧휴무 동시 → 물리적 모순.
+    #   N전담이 대표 사례. 전역 규칙으론 못 고침 → 그 간호사 금지해제/근무유형추가로 유도.
+    _bw = detect_banned_off_conflict(nurses, config)
+    if _bw:
+        _bnames = "; ".join(f"{t['name']} {t['clash_days'][0] + 1}일" for t in _bw[:3])
+        _bmore = f" 외 {len(_bw) - 3}명" if len(_bw) > 3 else ""
+        cert = (f"{_bnames}{_bmore} — 금지된 근무(OFF 금지)가 필수 휴무와 겹쳐 안 돼요. "
+                f"그 간호사 금지근무를 풀거나 근무유형(D/E)을 추가하면 돼요.")
+        return InfeasibilityExplanation(
+            "personal_infeasible", "banned_wanted", {}, cert,
+            {"banned_conflicts": len(_bw)}, targets=_bw)
 
     # ── 0) per-nurse 산술 모순 (λ·solver 불필요, 가장 명백 → 최우선) ────────────
     #   n_exact/n_min > max_nig(개인 야간 요구 > 상한), 강제 근무하한 합 > 가용 근무일

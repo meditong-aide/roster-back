@@ -5949,6 +5949,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         _probe_base = {k: v for k, v in dict(config_dict).items()
                                        if not str(k).startswith("_sa_")}
                     _probe_base = dict(_probe_base)
+                    # 금지근무(banned)×강제OFF 개인모순 진단이 initial_constraints 를 봐야 하므로
+                    # 스냅샷에 없으면 merged config 에서 승계(금지·강제OFF 합집합 맵).
+                    if "initial_constraints" not in _probe_base:
+                        _probe_base["initial_constraints"] = config_dict.get("initial_constraints")
                     # 온톨로지 소프트정렬: presolve(max-flow) 병목 → 우선 완화군을 먼저 검증.
                     try:
                         _prio_fams = _priority_families_from_presolve(presolve_diag)
