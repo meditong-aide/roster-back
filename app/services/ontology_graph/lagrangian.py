@@ -369,19 +369,82 @@ def _nurse_attr(nu, *keys):
     return None
 
 
-def detect_banned_off_conflict(nurses: list, config: dict) -> list[dict]:
-    """금지 원티드(banned-OFF) × 강제OFF 개인 모순 — **증명된 산술**(솔버 불필요).
+def _night_rules(config: dict) -> tuple[int, int, int]:
+    """야간 시퀀스 규칙 → (최대연속N, 회복트리거런, 최소런). 전이함수의 유일한 규칙 출처.
 
-    banned_wanted 로 OFF 가 금지된 날(=강제근무)이, 야간회복 등으로 **강제 OFF 인 날**과
-    겹치면 "그날 반드시 근무 ∧ 반드시 휴무" → 물리적 모순. 특히 N전담(allowed={N})은
-    금지-OFF 가 야간회복 OFF 를 막아 자주 터진다.
+    · 최대연속N: 3N2OFF→3, 2N2OFF→2, max_consecutive_nights 중 최소.
+    · 회복트리거런: run 이 이 값 이상으로 끝나면 **2 OFF** 필요(2N2OFF→2, 3N2OFF→3).
+    · 최소런: not_one_night 이면 2(고립 1N 금지), 아니면 1.
+    """
+    two2 = bool(config.get("two_offs_after_two_nig"))
+    three2 = bool(config.get("two_offs_after_three_nig"))
+    caps: list[int] = []
+    if three2:
+        caps.append(3)
+    if two2:
+        caps.append(2)
+    for k in ("max_consecutive_nights", "max_consec_nights"):
+        v = config.get(k)
+        try:
+            if v is not None and int(v) > 0:
+                caps.append(int(v))
+        except (TypeError, ValueError):
+            pass
+    max_run = min(caps) if caps else 6
+    recovery_trigger = 2 if two2 else (3 if three2 else 99)   # run>=trigger → 2 OFF
+    min_run = 2 if bool(config.get("not_one_night")) else 1
+    return max_run, recovery_trigger, min_run
+
+
+def per_nurse_night_feasible(banned_off: set, forced_off: set, num_days: int,
+                             config: dict) -> bool:
+    """N전담 1명의 {N,O} 사슬에 **유효 배열이 존재하는가** — 상태 전이 그래프 도달성.
+
+    노드 상태 = (r=현재 N 연속길이, k=회복 OFF 잔여 0/1). 엣지 = 하루 전이.
+    강제: banned-OFF→그날 N만, forced_off→그날 O만. 규칙(_night_rules)은 전이 제약으로만.
+    경로가 하나도 없으면 그 간호사는 개인 infeasible(증명). ①연속초과 ②회복막힘 ③고립1N
+    및 미래 패턴을 **열거 없이** 한 번에 판정한다.
+    """
+    max_run, rec_trig, min_run = _night_rules(config)
+    banned = {int(d) for d in banned_off}
+    forced = {int(d) for d in forced_off}
+    states: set[tuple[int, int]] = {(0, 0)}      # (r, k)
+    for d in range(int(num_days)):
+        must_n = d in banned                     # O 금지 → 반드시 N
+        must_o = d in forced                     # 강제 OFF → 반드시 O
+        if must_n and must_o:
+            return False                         # 셀 자체 모순
+        nxt: set[tuple[int, int]] = set()
+        for (r, k) in states:
+            if not must_n:                       # O 선택
+                if r == 0:
+                    nxt.add((0, max(0, k - 1)))  # 회복 소진
+                elif r >= min_run:               # 런 종료(고립 아님)
+                    nxt.add((0, 1 if r >= rec_trig else 0))
+                # r < min_run → 고립 N → 무효(스킵)
+            if not must_o:                       # N 선택
+                if k == 0 and r + 1 <= max_run:  # 회복빚 없고 연속상한 이내
+                    nxt.add((r + 1, 0))
+        if not nxt:
+            return False                         # 어느 상태도 진행 불가 → infeasible
+        states = nxt
+    return bool(states)                          # 월말 열린 회복빚은 허용(경계)
+
+
+def detect_banned_off_conflict(nurses: list, config: dict, num_days: int) -> list[dict]:
+    """금지 원티드(banned-OFF) 개인 모순 — per-nurse 상태DAG 도달성(솔버 불필요).
+
+    banned_wanted 로 OFF 가 금지된 날 = **강제근무**. N전담(allowed={N})이면 그 날 반드시 N.
+      · 셀 모순(clash): banned-OFF ∩ forced_off (N전담 아니어도 물리 모순).
+      · 시퀀스 모순: N전담의 {N,O} 배열에 유효 경로 없음(연속·회복·고립 패턴 전부).
+    post-solve 진단이라 오탐이 표 생성을 막지 않는다.
 
     반환: [{nurse_id, name, family, banned_off_days, forced_off_days, clash_days,
-            allowed_shifts, is_night_only}]  (모순 간호사만).
+            allowed_shifts, is_night_only, reason}]  (모순 간호사만).
     """
     ic = config.get("initial_constraints") or {}
-    fo = ic.get("forced_off") or {}          # {nurse_id: [day_idx]}
-    fb = ic.get("forbidden") or {}           # {nurse_id: {day_idx: [codes]}}
+    fo = ic.get("forced_off") or {}
+    fb = ic.get("forbidden") or {}
     by_nid = {str(_nurse_attr(nu, "nurse_id")): nu for nu in nurses}
     out: list[dict] = []
     for nid, day_map in (fb or {}).items():
@@ -389,18 +452,21 @@ def detect_banned_off_conflict(nurses: list, config: dict) -> list[dict]:
                       if "O" in {str(c).strip().upper() for c in (codes or [])}}
         if not banned_off:
             continue
-        forced_off = {int(d) for d in (fo.get(nid) or [])}
-        clash = sorted(banned_off & forced_off)
-        if not clash:
-            continue                          # 겹침 없으면 증명된 모순 아님(스킵)
         nu = by_nid.get(str(nid))
         allowed = [str(x).strip().upper() for x in (_nurse_attr(nu, "allowed_shifts") or [])]
         work_opts = (set(allowed) & {"D", "E", "N"}) if allowed else {"D", "E", "N"}
+        n_only = work_opts == {"N"}
+        forced_off = {int(d) for d in (fo.get(nid) or [])}
+        clash = sorted(banned_off & forced_off)
+        seq_bad = n_only and not per_nurse_night_feasible(banned_off, forced_off, num_days, config)
+        if not (clash or seq_bad):
+            continue
         out.append({
             "nurse_id": str(nid), "name": _nurse_attr(nu, "name") or str(nid),
             "family": "banned_wanted", "banned_off_days": sorted(banned_off),
             "forced_off_days": sorted(forced_off), "clash_days": clash,
-            "allowed_shifts": sorted(work_opts), "is_night_only": work_opts == {"N"},
+            "allowed_shifts": sorted(work_opts), "is_night_only": n_only,
+            "reason": "clash" if clash else "sequence_infeasible",
         })
     return out
 
@@ -429,12 +495,16 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
     # ── 0a) 금지근무(banned-OFF) × 강제OFF 모순 (증명, 최우선) ──────────────────
     #   OFF 금지(강제근무)가 야간회복 강제OFF 와 겹치면 근무∧휴무 동시 → 물리적 모순.
     #   N전담이 대표 사례. 전역 규칙으론 못 고침 → 그 간호사 금지해제/근무유형추가로 유도.
-    _bw = detect_banned_off_conflict(nurses, config)
+    _bw = detect_banned_off_conflict(nurses, config, num_days)
     if _bw:
-        _bnames = "; ".join(f"{t['name']} {t['clash_days'][0] + 1}일" for t in _bw[:3])
+        def _bwlabel(t):
+            days = t.get("clash_days") or t.get("banned_off_days") or []
+            return f"{t['name']} {days[0] + 1}일" if days else t["name"]
+        _bnames = "; ".join(_bwlabel(t) for t in _bw[:3])
         _bmore = f" 외 {len(_bw) - 3}명" if len(_bw) > 3 else ""
-        cert = (f"{_bnames}{_bmore} — 금지된 근무(OFF 금지)가 필수 휴무와 겹쳐 안 돼요. "
-                f"그 간호사 금지근무를 풀거나 근무유형(D/E)을 추가하면 돼요.")
+        cert = (f"{_bnames}{_bmore} — N전담 간호사에게 금지된 근무(OFF 금지)가 몰려 "
+                f"야간 회복 규칙을 지킬 배열이 없어요. 그 간호사 금지근무를 풀거나 "
+                f"근무유형(D/E)을 추가하면 돼요.")
         return InfeasibilityExplanation(
             "personal_infeasible", "banned_wanted", {}, cert,
             {"banned_conflicts": len(_bw)}, targets=_bw)
