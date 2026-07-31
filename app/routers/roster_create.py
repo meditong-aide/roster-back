@@ -216,6 +216,8 @@ async def roster_create_async(
                     treatment_ids=(getattr(req, "treatment_ids", None) or None),
                     weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
                     monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
+                    banned_wanted_release=(getattr(req, "banned_wanted_release", None) or None),
+                    allowed_shift_add=(getattr(req, "allowed_shift_add", None) or None),
                 ),
                 "materialized_config": materialized,
             }
@@ -303,6 +305,8 @@ async def generate_roster_endpoint(
             config_override=(getattr(req, "config_override", None) or None),
             weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
             monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
+            banned_wanted_release=(getattr(req, "banned_wanted_release", None) or None),
+            allowed_shift_add=(getattr(req, "allowed_shift_add", None) or None),
         )
     except HTTPException:
         # 구조화된 infeasibility 페이로드 등 의도된 HTTPException은 그대로 전파

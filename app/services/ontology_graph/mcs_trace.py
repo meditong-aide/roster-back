@@ -223,6 +223,40 @@ def cause_to_resolution_options(
     family 안내 카드 1장.
     """
     targets = targets or []
+
+    # ── 금지근무(banned-OFF)×강제OFF 모순 → 대안 2개(HN 선택) ──────────────────
+    #   OFF 금지가 필수 휴무와 겹쳐 안 됨. (A) 그 금지근무 해제  또는  (B) 근무유형에
+    #   D/E 추가(N전담 병목 해소). "또는"이라 한 카드로 묶지 않고 두 옵션으로 제시.
+    bw = [t for t in targets if t.get("family") == "banned_wanted" and t.get("nurse_id")]
+    if bw:
+        n_nurses = len({t["nurse_id"] for t in bw})
+        rel = [{"nurse_id": t["nurse_id"], "days": t.get("clash_days") or t.get("banned_off_days") or []}
+               for t in bw]
+        rel_changes = [{"nurse_id": t["nurse_id"], "config_key": "banned_wanted",
+                        "label_ko": f"{t.get('name') or t['nurse_id']} 금지근무",
+                        "from": None, "to": "해제"} for t in bw]
+        add = [{"nurse_id": t["nurse_id"], "add": ["D", "E"]} for t in bw]
+        add_changes = [{"nurse_id": t["nurse_id"], "config_key": "allowed_shifts",
+                        "label_ko": f"{t.get('name') or t['nurse_id']} 근무유형",
+                        "from": "".join(t.get("allowed_shifts") or ["N"]), "to": "D·E 추가"}
+                       for t in bw]
+        return [
+            {"option_id": "cause:banned_release", "kind": "relax_constraint",
+             "source": "cause", "verified": False,
+             "title_ko": f"문제 간호사 {n_nurses}명 금지근무 해제하고 다시 만들기",
+             "trade_off_ko": "겹치는 날의 금지근무(OFF 금지)를 풀어 필수 휴무가 가능해집니다.",
+             "changes": rel_changes, "banned_wanted_release": rel,
+             "fix": {"mode": "auto_apply", "where": "nurse.banned_wanted",
+                     "where_label_ko": "원티드 조정판 > 금지근무"}},
+            {"option_id": "cause:allowed_add", "kind": "relax_constraint",
+             "source": "cause", "verified": False,
+             "title_ko": f"문제 간호사 {n_nurses}명 근무유형에 D/E 추가하고 다시 만들기",
+             "trade_off_ko": "야간 전담 대신 주간/이브닝도 가능해져 병목이 풀립니다(역할 변경).",
+             "changes": add_changes, "allowed_shift_add": add,
+             "fix": {"mode": "auto_apply", "where": "nurse.allowed_shifts",
+                     "where_label_ko": "간호사 관리 > 근무 유형"}},
+        ]
+
     ml = [t for t in targets
           if t.get("family") in ("monthly_limit", "night_cap")
           and t.get("nurse_id") and t.get("cap") is not None]

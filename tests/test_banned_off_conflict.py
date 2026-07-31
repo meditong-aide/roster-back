@@ -59,3 +59,21 @@ def test_explain_classifies_personal_infeasible_banned_wanted():
     assert e.top_family == "banned_wanted"
     assert "장세현" in e.certificate and "금지근무" in e.certificate
     assert e.targets and e.targets[0]["nurse_id"] == "N1"
+
+
+def test_resolution_offers_two_alternatives():
+    """banned_wanted 원인 → 대안 2카드: (A) 금지근무 해제, (B) 근무유형 D/E 추가."""
+    from services.ontology_graph.mcs_trace import cause_to_resolution_options
+    targets = [{"nurse_id": "N1", "name": "장세현", "family": "banned_wanted",
+                "clash_days": [0, 1], "banned_off_days": [0, 1],
+                "allowed_shifts": ["N"], "is_night_only": True}]
+    cards = cause_to_resolution_options("personal_infeasible", "banned_wanted", targets)
+    assert len(cards) == 2
+    by_id = {c["option_id"]: c for c in cards}
+    # (A) 금지근무 해제 — 겹치는 날 지정
+    rel = by_id["cause:banned_release"]
+    assert rel["banned_wanted_release"] == [{"nurse_id": "N1", "days": [0, 1]}]
+    assert rel["fix"]["mode"] == "auto_apply"
+    # (B) 근무유형 D/E 추가
+    add = by_id["cause:allowed_add"]
+    assert add["allowed_shift_add"] == [{"nurse_id": "N1", "add": ["D", "E"]}]

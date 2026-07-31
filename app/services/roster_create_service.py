@@ -4400,7 +4400,7 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None):
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None, banned_wanted_release=None, allowed_shift_add=None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4458,6 +4458,51 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _applied.append(f"{_rnid}:{_rfld}={_rval}")
         db.commit()
         print(f"[RosterGenerate] 월 야간 한도 하향 적용(NurseMonthlyLimit {req.year}-{req.month}): {_applied}")
+    # per-nurse 금지근무(banned_wanted) 해제(검증된 resolution 원클릭). 겹치는 날의 금지 셀을
+    #   is_applied=False 로(가역) → 필수 휴무가 가능해짐. day_idx→shift_date 변환.
+    _bwr = banned_wanted_release or getattr(req, "banned_wanted_release", None)
+    if _bwr:
+        from datetime import date as _dbw
+        _gid_bw = str(current_user.group_id)
+        _rel_cnt = 0
+        for _rel in _bwr:
+            _rnid = str(_rel.get("nurse_id") or "")
+            for _dy in (_rel.get("days") or []):
+                try:
+                    _sd = _dbw(int(req.year), int(req.month), int(_dy) + 1)
+                except (TypeError, ValueError):
+                    continue
+                for _r in db.query(BannedWantedEntry).filter(
+                        BannedWantedEntry.group_id == _gid_bw,
+                        BannedWantedEntry.nurse_id == _rnid,
+                        BannedWantedEntry.year == int(req.year),
+                        BannedWantedEntry.month == int(req.month),
+                        BannedWantedEntry.shift_date == _sd).all():
+                    _r.is_applied = False
+                    _rel_cnt += 1
+        db.commit()
+        print(f"[RosterGenerate] 금지근무 해제 적용(banned_wanted, {req.year}-{req.month}): {_rel_cnt}건")
+    # per-nurse 근무유형(allowed_shifts)에 D/E 추가(검증된 resolution 원클릭). 현재 허용 ∪ add 를
+    #   NurseAllowedShiftPeriod 에 해당 월 발효로 write(period SSOT). N전담 병목 해소용.
+    _asa = allowed_shift_add or getattr(req, "allowed_shift_add", None)
+    if _asa:
+        from db.models import NurseAllowedShiftPeriod as _NASP, Nurse as _NurseM
+        from services.nurse_period_resolver import upsert_period as _up_as
+        from datetime import date as _das
+        _vf_as = _das(int(req.year), int(req.month), 1)
+        _applied_as = []
+        for _rel in _asa:
+            _rnid = str(_rel.get("nurse_id") or "")
+            _add = [str(x).strip().upper() for x in (_rel.get("add") or []) if str(x).strip()]
+            if not _rnid or not _add:
+                continue
+            _nrow = db.query(_NurseM).filter(_NurseM.nurse_id == _rnid).first()
+            _cur = [str(x).strip().upper() for x in (getattr(_nrow, "allowed_shifts", None) or [])]
+            _new = sorted(set(_cur or ["N"]) | set(_add))
+            _up_as(db, _NASP, _rnid, _vf_as, "allowed_shifts", _new, source="resolution")
+            _applied_as.append(f"{_rnid}:{_new}")
+        db.commit()
+        print(f"[RosterGenerate] 근무유형 추가 적용(NurseAllowedShiftPeriod, 발효 {_vf_as}): {_applied_as}")
     # 모달 payload(req.config) 제공 시 생성 직전 config row 로 materialize(굳히기) → req.config_id 세팅.
     #   /async 라우터는 이미 materialize 후 req.config=None 으로 넘겨 여기선 no-op(이중 생성 방지).
     #   /roster_create/generate(로컬 sync) 등 config 를 실어 직접 호출하는 경로는 여기서 materialize 되어
@@ -6009,11 +6054,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                             if _cards:
                                 _ex = unrecoverable["infeasibility"].get("resolution_options") or []
                                 unrecoverable["infeasibility"]["resolution_options"] = _cards + _ex
-                                # 개인 즉시모순은 전원을 한 카드로 통합한 것(cause:fix_all_personal)이
-                                # 유일 옵션이어야 한다("옵션 많이 주지 말고 하나로"). 이후 per-nurse
-                                # MCS 가 개별카드를 덧붙여도 raise 직전에 이 하나로 최종 override.
-                                if _cards[0].get("option_id") == "cause:fix_all_personal":
+                                # cause 액션카드는 raise 직전 유일(집합) 옵션이어야 한다. 이후 per-nurse
+                                # MCS 가 개별카드를 덧붙여도 이 카드(들)로 최종 override.
+                                #   · fix_all_personal(월한도/주말) = 단일 통합 카드
+                                #   · banned/allowed(금지근무 모순) = 대안 2카드(HN 선택)
+                                _oid0 = _cards[0].get("option_id") or ""
+                                if _oid0 == "cause:fix_all_personal":
                                     unrecoverable["infeasibility"]["_sole_option"] = _cards[0]
+                                elif _oid0 in ("cause:banned_release", "cause:allowed_add"):
+                                    unrecoverable["infeasibility"]["_sole_option"] = list(_cards)
                         except Exception as _cc_exc:
                             print(f"[Cause] 행동카드 생성 실패(무시): {_cc_exc}")
                         # arithmetic-증명 원인(개인 즉시모순·인원/셀 부족)은 확실 → config
@@ -6021,13 +6070,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         # 그 외(정책과제약·coupled)는 추정이라 AIDE_CAUSE_GATE=1 일 때만.
                         if _cause.classification in ("personal_infeasible", "coverage_shortage"):
                             _skip_probe = True
-                            unrecoverable["infeasibility"]["resolution_options"] = [{
-                                "option_id": f"cause:{_cause.classification}",
-                                "kind": "cause_explanation", "source": "cause", "verified": True,
-                                "title_ko": _cause.certificate,
-                                "fix": {"mode": "manual", "where": "nurse.monthly_limit",
-                                        "where_label_ko": "간호사 관리 > 해당 간호사 > 월 근무 한도"},
-                            }] + (unrecoverable["infeasibility"].get("resolution_options") or [])
+                            # cause 액션카드(_sole_option)가 있으면 그게 최종 → generic 설명카드 안 붙임.
+                            if not unrecoverable["infeasibility"].get("_sole_option"):
+                                unrecoverable["infeasibility"]["resolution_options"] = [{
+                                    "option_id": f"cause:{_cause.classification}",
+                                    "kind": "cause_explanation", "source": "cause", "verified": True,
+                                    "title_ko": _cause.certificate,
+                                    "fix": {"mode": "manual", "where": "nurse.monthly_limit",
+                                            "where_label_ko": "간호사 관리 > 해당 간호사 > 월 근무 한도"},
+                                }] + (unrecoverable["infeasibility"].get("resolution_options") or [])
                             print("[Cause] arithmetic-증명 원인 → probe 스킵(전수탐색 회피, 기본)")
                         elif _os_undiag.getenv("AIDE_CAUSE_GATE") == "1":
                             if _cause.classification == "policy_overconstraint":
@@ -6405,10 +6456,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 )
             except Exception as _lg_exc:
                 print(f"[LiveGraphExport] hook 실패(무시): {_lg_exc}")
-            # 개인 즉시모순: 전원 통합 카드 하나만 노출(per-nurse MCS 가 덧붙인 개별카드 제거).
+            # 개인 즉시모순: cause 액션카드만 노출(per-nurse MCS 가 덧붙인 개별카드 제거).
+            #   단일(dict)=월한도/주말 통합, 리스트=금지근무 대안 2카드.
             _so = unrecoverable.get("infeasibility", {}).pop("_sole_option", None)
             if _so:
-                unrecoverable["infeasibility"]["resolution_options"] = [_so]
+                unrecoverable["infeasibility"]["resolution_options"] = _so if isinstance(_so, list) else [_so]
             raise HTTPException(status_code=500, detail=unrecoverable)
         except HTTPException:
             raise
