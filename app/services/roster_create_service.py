@@ -266,17 +266,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             .first()
         )
 
-        target_wr = submitted_wr or (
-            db.query(WantedRequest)
-            .filter(
-                WantedRequest.nurse_id == nurse_id,
-                WantedRequest.month == month_str,
-            )
-            .order_by(WantedRequest.created_at.asc())
-            .first()
-        )
+        # 제출된 원티드만 반영 — 미제출 draft 폴백 제거.
+        # (미제출=미반영 정합. fixed_wanted_entries 의 노출여부/제출상태와 일치시켜,
+        #  화면상 "미제출"인 원티드가 생성에 하드고정으로 새어들어가는 불일치를 차단.)
+        target_wr = submitted_wr
         if not target_wr:
-            continue  # 기록이 없는 간호사는 건너뜀
+            continue  # 제출된 원티드가 없는 간호사는 건너뜀(미제출 draft 미반영)
 
         # 3️⃣ shift 데이터 수집
         shift_rows = (

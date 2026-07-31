@@ -262,13 +262,20 @@ def build_precheck_input(
             d: code for d, code in fixed_map.items() if code not in {"O", "OFF"}
         }
 
-        # preceptor 페어링 — preceptor_id 가 있으면 본인이 preceptee
+        # preceptor 페어링 — preceptor_id 가 있으면 본인이 preceptee.
+        # 캐시(nurses.preceptor_id)는 폐지 예정 전환기 투영이라 엔진과 '동일 규칙'으로 해석한다
+        # (roster_create_service._pte_authoritative 참조):
+        #   authoritative(그룹 백필됨) → period 가 유일 SSOT. 미포함(종료월)=관계 해제 → 캐시 무시.
+        #   비authoritative(pre-backfill·period row 전무) → 캐시 폴백(무회귀).
+        # 과거엔 캐시를 base 로 깔고 period 를 '있을 때만' 덧칠해, 종료월(빈 맵)에 stale 캐시가
+        # 살아남아 precheck 만 엔진(active=0)과 갈리며 PRECEPTEE_SYNC_MISMATCH false-positive 를 냈다.
         raw_ptor = nd.get("preceptor_id")
         _pinfo = _pte_period.get(nid) or _pte_period.get(str(nid))
-        if isinstance(_pinfo, dict) and _pinfo.get("preceptor_id") is not None:
-            # authoritative 이면 period 우선, 아니면 캐시 preceptor_id 없을 때만 폴백 (엔진 규칙과 동일)
-            if _pte_authoritative or raw_ptor in (None, "", 0):
-                raw_ptor = _pinfo.get("preceptor_id")
+        _period_ptor = _pinfo.get("preceptor_id") if isinstance(_pinfo, dict) else None
+        if _pte_authoritative:
+            raw_ptor = _period_ptor  # period 유일 SSOT — 종료월엔 None(해제)
+        elif _period_ptor is not None and raw_ptor in (None, "", 0):
+            raw_ptor = _period_ptor  # 캐시 비었을 때만 period 폴백
         preceptor_id = str(raw_ptor).strip() if raw_ptor not in (None, "", 0) else None
         # 동기 window 는 nurse data 에 명시되지 않으면 None → check 함수가 join/leave 로 채움
         ws_start = nd.get("sync_window_start")
