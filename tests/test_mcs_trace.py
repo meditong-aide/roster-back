@@ -79,19 +79,32 @@ def test_trace_to_user_options_respects_buckets():
     assert opts["cross_month"]["bucket"] == "tradeoff"          # 유저 결정: cross-month=B
 
 
-def test_cause_to_resolution_options_action_card_for_personal():
-    """personal_infeasible(김수선 13>7) → 그 간호사 지목 action 카드(월한도 조정)."""
+def test_cause_to_resolution_options_single_combined_multi_nurse():
+    """다인 혼합: 김수선(주말+야간13), 김도영(주말+야간10), 채미영(주말X+야간8)
+    → 한 카드(auto_apply)에 전원 조정. 채미영은 야간만(주말 무관)."""
     from services.ontology_graph.mcs_trace import cause_to_resolution_options
-    targets = [{"nurse_id": "n177659", "name": "김수선", "family": "monthly_limit",
-                "detail": "야간 요구 13 > 월 상한 7", "current": 13, "cap": 7}]
+    targets = [
+        {"nurse_id": "177659", "name": "김수선", "family": "monthly_limit", "current": 13, "cap": 7},
+        {"nurse_id": "182649", "name": "김도영", "family": "monthly_limit", "current": 10, "cap": 7},
+        {"nurse_id": "chae", "name": "채미영", "family": "monthly_limit", "current": 8, "cap": 7},
+        # 김수선·김도영은 주말휴무 병목이기도 함
+        {"nurse_id": "177659", "name": "김수선", "family": "weekend_off"},
+        {"nurse_id": "182649", "name": "김도영", "family": "weekend_off"},
+    ]
     opts = cause_to_resolution_options("personal_infeasible", "monthly_limit", targets)
-    assert len(opts) == 1
+    assert len(opts) == 1                                  # 카드 하나만
     o = opts[0]
-    assert o["bucket"] == "action" and o["source"] == "cause"
-    assert "김수선" in o["title_ko"]
-    assert o["fix"]["target"] == {"nurse_id": "n177659"}
-    assert o["where_label_ko"] and "야간" in o["where_label_ko"]
-    assert o["detail_ko"] == "야간 요구 13 > 월 상한 7"
+    assert o["fix"]["mode"] == "auto_apply"
+    # 야간 초과 3명 전원 n_max→7 (정확히가 아니라 '최대 7까지'로 완화)
+    mlr = {m["nurse_id"]: m for m in o["monthly_limit_release"]}
+    assert {k: v["value"] for k, v in mlr.items()} == {"177659": 7, "182649": 7, "chae": 7}
+    assert all(v["field"] == "n_max" for v in mlr.values())   # exact 아님 → max
+    # 주말휴무는 김수선·김도영만 (채미영 제외)
+    assert set(o["weekend_off_release"]) == {"177659", "182649"}
+    assert "chae" not in o["weekend_off_release"]          # 채미영 주말 안 건드림
+    # changes 라벨에 이름 + 값
+    labels = " ".join(c["label_ko"] for c in o["changes"])
+    assert "채미영 월 야간 최대" in labels and "김수선 주말 휴무" in labels
 
 
 def test_cause_to_resolution_options_tradeoff_and_advisory():

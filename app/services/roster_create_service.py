@@ -4455,8 +4455,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             # 야간 고정/최대 상호배타: 하나를 세팅하면 반대 필드 제거(DB 정합).
             if _rfld == "n_exact":
                 _row.n_max = None
-            else:
+            else:  # n_max
                 _row.n_exact = None
+                # 하한(n_min)이 새 상한보다 크면 모순(min>max) → 하한 해제해 '최대 N'으로 묶는다.
+                if _row.n_min is not None and int(_row.n_min) > int(_rval):
+                    _row.n_min = None
             _applied.append(f"{_rnid}:{_rfld}={_rval}")
         db.commit()
         print(f"[RosterGenerate] 월 야간 한도 하향 적용(NurseMonthlyLimit {req.year}-{req.month}): {_applied}")
@@ -6007,6 +6010,11 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                             if _cards:
                                 _ex = unrecoverable["infeasibility"].get("resolution_options") or []
                                 unrecoverable["infeasibility"]["resolution_options"] = _cards + _ex
+                                # 개인 즉시모순은 전원을 한 카드로 통합한 것(cause:fix_all_personal)이
+                                # 유일 옵션이어야 한다("옵션 많이 주지 말고 하나로"). 이후 per-nurse
+                                # MCS 가 개별카드를 덧붙여도 raise 직전에 이 하나로 최종 override.
+                                if _cards[0].get("option_id") == "cause:fix_all_personal":
+                                    unrecoverable["infeasibility"]["_sole_option"] = _cards[0]
                         except Exception as _cc_exc:
                             print(f"[Cause] 행동카드 생성 실패(무시): {_cc_exc}")
                         # arithmetic-증명 원인(개인 즉시모순·인원/셀 부족)은 확실 → config
@@ -6398,6 +6406,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 )
             except Exception as _lg_exc:
                 print(f"[LiveGraphExport] hook 실패(무시): {_lg_exc}")
+            # 개인 즉시모순: 전원 통합 카드 하나만 노출(per-nurse MCS 가 덧붙인 개별카드 제거).
+            _so = unrecoverable.get("infeasibility", {}).pop("_sole_option", None)
+            if _so:
+                unrecoverable["infeasibility"]["resolution_options"] = [_so]
             raise HTTPException(status_code=500, detail=unrecoverable)
         except HTTPException:
             raise

@@ -215,56 +215,72 @@ FAMILY_PRESENTATION: dict[str, dict[str, Any]] = {
 def cause_to_resolution_options(
     classification: str, top_family: str | None, targets: list[dict] | None,
 ) -> list[dict[str, Any]]:
-    """explain_infeasibility 결과 → 모달 resolution_options 카드.
+    """explain_infeasibility 결과 → 모달 resolution_options **단일 통합 카드**.
 
-    per-nurse target 이 있으면 그 간호사를 지목한 action 카드(주말휴무 해제/월한도 조정).
-    없으면 top_family 기준 정책 카드. FAMILY_PRESENTATION 3분류 정책 준수.
+    문제 간호사 전원의 조정(야간 한도 초과 → 각자 상한으로 낮춤 + 주말휴무 병목 →
+    해당 간호사만 해제)을 **한 카드**에 담아 원클릭 auto_apply. 간호사별 자기 축만
+    처리(주말휴무 아닌 간호사는 야간만). per-nurse target 없으면(coupled/policy 등)
+    family 안내 카드 1장.
     """
     targets = targets or []
-    opts: list[dict[str, Any]] = []
-    seen: set = set()
+    ml = [t for t in targets
+          if t.get("family") in ("monthly_limit", "night_cap")
+          and t.get("nurse_id") and t.get("cap") is not None]
+    wk = [t for t in targets if t.get("family") == "weekend_off" and t.get("nurse_id")]
 
-    def _card(family: str, who_name: str | None, who_id: Any):
-        pres = FAMILY_PRESENTATION.get(family, {"bucket": "advisory",
-                                                "advisory": f"'{family}' 설정 확인 필요."})
-        bucket = pres["bucket"]
-        key = (family, who_id)
-        if key in seen:
-            return None
-        seen.add(key)
-        who = who_name or "해당 간호사"
-        opt: dict[str, Any] = {
-            "option_id": f"cause:{family}:{who_id if who_id is not None else 'global'}",
-            "kind": f"cause_{bucket}", "source": "cause", "verified": False,
-            "family": family, "bucket": bucket,
-        }
-        if bucket == "action":
-            opt["title_ko"] = pres["title"].format(who=who)
-            opt["where_label_ko"] = pres.get("where")
-            opt["fix"] = {"mode": "manual", "where": pres.get("where"),
-                          "target": ({"nurse_id": who_id} if who_id is not None else None)}
-        elif bucket == "tradeoff":
-            opt["title_ko"] = pres["title"].format(who=who) if "{who}" in pres.get("title", "") \
-                else (pres.get("title") or f"{family} 규칙 완화")
-            opt["title_ko"] = f"{_FAMILY_KO.get(family, family)} 완화" + (f" ({who})" if who_name else "")
-            opt["trade_off_ko"] = pres["tradeoff"]
-            opt["fix"] = {"mode": "manual", "where": f"설정 > 근무 규칙 > {family}"}
-        else:  # advisory
-            opt["title_ko"] = pres["advisory"]
-            opt["fix"] = {"mode": "manual", "where": None}
-        return opt
+    if ml or wk:
+        changes: list[dict[str, Any]] = []
+        monthly_limit_release: list[dict[str, Any]] = []
+        weekend_off_release: list[str] = []
+        for t in ml:
+            nm = t.get("name") or t["nurse_id"]
+            # n_max(상한)로 완화: 야간을 '정확히 N'이 아니라 '최대 N 까지'로 묶는다.
+            # 솔버가 그 아래로 자유롭게 배정 → 근무표 품질 유리. 적용 경로가 하한(n_min)이
+            # 새 상한보다 크면 함께 해제하므로 하한충돌(예: min13 > max7)도 풀린다.
+            monthly_limit_release.append({"nurse_id": t["nurse_id"], "field": "n_max",
+                                          "value": int(t["cap"])})
+            changes.append({"nurse_id": t["nurse_id"], "config_key": "n_max",
+                            "label_ko": f"{nm} 월 야간 최대",
+                            "from": t.get("current"), "to": int(t["cap"])})
+        for t in wk:
+            nm = t.get("name") or t["nurse_id"]
+            weekend_off_release.append(t["nurse_id"])
+            changes.append({"nurse_id": t["nurse_id"], "config_key": "weekend_off",
+                            "label_ko": f"{nm} 주말 휴무", "from": None, "to": "해제"})
+        n_nurses = len({t["nurse_id"] for t in ml + wk})
+        return [{
+            "option_id": "cause:fix_all_personal",
+            "kind": "relax_constraint", "source": "cause", "verified": False,
+            "title_ko": f"문제 간호사 {n_nurses}명 설정 조정하고 다시 만들기",
+            "trade_off_ko": "해당 간호사들의 야간/주말 설정이 아래대로 바뀝니다.",
+            "changes": changes,
+            "monthly_limit_release": monthly_limit_release,
+            "weekend_off_release": weekend_off_release,
+            "fix": {"mode": "auto_apply", "where": "nurse.monthly_limit+weekend_off",
+                    "where_label_ko": "간호사 관리 > 월 근무 한도 · 주말 휴무"},
+        }]
 
-    for t in targets:
-        c = _card(t.get("family") or top_family or "unknown", t.get("name"), t.get("nurse_id"))
-        if c:
-            if t.get("detail"):
-                c["detail_ko"] = t["detail"]
-            opts.append(c)
-    if not opts and top_family:                     # target 없으면 family 기준 1장
-        c = _card(top_family, None, None)
-        if c:
-            opts.append(c)
-    return opts
+    # per-nurse target 없음(coupled/policy/coverage) → family 안내 카드 1장.
+    if not top_family:
+        return []
+    pres = FAMILY_PRESENTATION.get(top_family, {"bucket": "advisory",
+                                                "advisory": f"'{top_family}' 설정을 확인하세요."})
+    bucket = pres["bucket"]
+    opt: dict[str, Any] = {"option_id": f"cause:{top_family}", "kind": "relax_constraint",
+                           "source": "cause", "verified": False,
+                           "family": top_family, "bucket": bucket}
+    if bucket == "tradeoff":
+        opt["title_ko"] = f"{_FAMILY_KO.get(top_family, top_family)} 완화"
+        opt["trade_off_ko"] = pres["tradeoff"]
+        opt["fix"] = {"mode": "manual", "where": f"설정 > 근무 규칙 > {top_family}"}
+    elif bucket == "action":
+        opt["title_ko"] = pres["title"].format(who="해당")
+        opt["where_label_ko"] = pres.get("where")
+        opt["fix"] = {"mode": "manual", "where": pres.get("where")}
+    else:
+        opt["title_ko"] = pres["advisory"]
+        opt["fix"] = {"mode": "manual", "where": None}
+    return [opt]
 
 
 def trace_to_user_options(trace: ConflictTrace) -> list[dict[str, Any]]:
