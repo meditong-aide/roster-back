@@ -29,6 +29,7 @@ def postprocess_off_swap(
     generated: dict,
     latest_config,
     req,
+    previous_codes: dict | None = None,
 ) -> dict:
     """초과 OFF 를 연차 코드로 변환.
 
@@ -38,6 +39,9 @@ def postprocess_off_swap(
         generated: {nurse_id: [shift_code_per_day, ...]} — 1일=index 0
         latest_config: RosterConfig 인스턴스 (off_swap_enabled / off_days / use_mid)
         req: RosterRequest (year, month)
+        previous_codes: {(nurse_id, day_index): shift_code} — **저장 직전 DB 상태**.
+            저장 경로에서만 넘긴다. 사용자가 이번에 연차 칸을 직접 푼 것인지
+            판단하는 데 쓴다.
 
     Returns:
         변환된 generated dict (in-place mutation 후 반환).
@@ -102,9 +106,32 @@ def postprocess_off_swap(
             nurses[str(_n.nurse_id)] = _n
         print(f"[OffSwap] inbound 전입 간호사 보충 로드: {_missing_nids}")
     use_mid = bool(getattr(latest_config, "use_mid", False))
+    # 전월 꼬리는 **한 번에** 긁는다. 간호사당 쿼리를 돌면 35명 기준 실측 9.8초로
+    # 생성 시간의 절반을 먹는다. 저장 경로에서도 쓰게 되면서 더 못 버틴다.
+    prev_tails = _load_prev_month_tails(
+        db, [str(x) for x in generated], schedule.year, schedule.month, n_days=3
+    )
 
     converted_total = 0
     skipped_n_only = 0
+    skipped_manual = 0
+    target_code = str(target.shift_id).strip().upper()
+    # 사용자가 이번 저장에서 **연차 칸을 직접 푼** 간호사 — 후처리를 건너뛴다.
+    #
+    # "FB 를 O 로 바꾸겠다" 는 명시적 의도인데, 초과 OFF 규칙을 그대로 적용하면
+    # 곧바로 다시 FB 가 되어 손으로는 연차를 못 푼다. 변환은 **다른 셀을 건드려
+    # OFF 가 늘어난 경우**에만 걸려야 한다.
+    manual_release: set[str] = set()
+    if previous_codes:
+        for (nid, d_idx), prev in previous_codes.items():
+            if str(prev).strip().upper() != target_code:
+                continue
+            seq = generated.get(nid) or generated.get(str(nid))
+            if seq is None or d_idx >= len(seq):
+                continue
+            if str(seq[d_idx]).strip().upper() != target_code:
+                manual_release.add(str(nid))
+
     print(f"[OffSwap] generated nurses={len(generated)}")
 
     for nurse_id, shifts_seq in generated.items():
@@ -114,10 +141,11 @@ def postprocess_off_swap(
         if is_n_only_profile(getattr(nu, "allowed_shifts", None), use_mid=use_mid):
             skipped_n_only += 1
             continue
+        if str(nurse_id) in manual_release:
+            skipped_manual += 1
+            continue
 
-        prev_tail = _load_prev_month_tail(
-            db, str(nurse_id), schedule.year, schedule.month, n_days=3
-        )
+        prev_tail = prev_tails.get(str(nurse_id), [])
         # 회복 OFF 검사는 'O'+'주' 모두 OFF 로 인정해야 함.
         # (예: N N N 주 O → 주/O 둘 다 회복 OFF, 보호 대상)
         recovery_offs = _identify_recovery_offs(
@@ -130,6 +158,17 @@ def postprocess_off_swap(
         )
         excess = total_off_count - baseline
         if excess <= 0:
+            # OFF 가 baseline 이하다 — **되돌리지 않는다.**
+            #
+            # 한때 역변환(연차 → OFF)을 넣었다가 걷어냈다. 근무표를 고쳐 OFF 가
+            # 줄면 연차 소진도 줄어야 맞지만, **되돌려도 되는 칸인지 판별할 수단이
+            # 없다.** 시스템이 바꾼 연차와 사용자가 손으로 넣은 연차가 저장된 뒤에는
+            # 완전히 같아 보인다. 직전 DB 상태로 가르려 했으나 그건 **그 저장 한
+            # 번만** 유효하다 — 다음 저장에서는 수동 입력분도 "이전에도 연차였음"
+            # 이 되어 조용히 OFF 로 되돌아간다(사용자 입력 소실).
+            #
+            # 구분하려면 `schedule_entries` 에 "시스템이 바꿨음" 을 남기는 컬럼이
+            # 있어야 한다. 그 전까지는 **과잉 소진을 감수하고 데이터를 지킨다.**
             continue
 
         # 변환 후보 — 'O' 만 (주 보호) + fixed_wanted/회복 OFF 제외
@@ -156,7 +195,7 @@ def postprocess_off_swap(
     print(
         f"[OffSwap][DONE] schedule={schedule.schedule_id} converted={converted_total} "
         f"baseline={baseline} target_shift={target.shift_id} "
-        f"skipped_n_only={skipped_n_only}"
+        f"skipped_n_only={skipped_n_only} skipped_manual={skipped_manual}"
     )
     return generated
 
@@ -222,6 +261,57 @@ def _load_fixed_wanted_set(
 def _load_nurses(db: Session, group_id: str) -> dict[str, Nurse]:
     rows = db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.active == 1).all()
     return {str(n.nurse_id): n for n in rows}
+
+
+def _load_prev_month_tails(
+    db: Session, nurse_ids: list[str], year: int, month: int, n_days: int = 3
+) -> dict[str, list[str]]:
+    """전월 마지막 n_days 의 default_shift 코드 — **간호사 전원을 한 번에**.
+
+    `_load_prev_month_tail` 은 간호사당 쿼리라 35명이면 실측 9.8초다(생성 시간의
+    49%). 저장 경로에서도 돌게 되면서 더는 못 쓴다. 선택 규칙은 동일하다 —
+    같은 (nurse, date) 에 dropped=0 스케줄이 여럿이면 version DESC → updated_at DESC.
+    """
+    if not nurse_ids:
+        return {}
+    first_of_month = date(year, month, 1)
+    end = first_of_month - relativedelta(days=1)
+    start = end - relativedelta(days=n_days - 1)
+    join_condition = or_(
+        and_(ScheduleEntry.id.isnot(None), Shift.id == ScheduleEntry.id),
+        and_(
+            ScheduleEntry.id.is_(None),
+            Shift.shift_id == ScheduleEntry.shift_id,
+            Shift.group_id == Schedule.group_id,
+        ),
+    )
+    rows = (
+        db.query(ScheduleEntry.nurse_id, ScheduleEntry.work_date, Shift.default_shift)
+        .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
+        .join(Shift, join_condition)
+        .filter(
+            Schedule.dropped == False,  # noqa: E712
+            ScheduleEntry.nurse_id.in_(nurse_ids),
+            ScheduleEntry.work_date >= start,
+            ScheduleEntry.work_date <= end,
+        )
+        .order_by(
+            ScheduleEntry.work_date.asc(),
+            Schedule.version.desc(),
+            Schedule.updated_at.desc(),
+        )
+        .all()
+    )
+    best: dict[tuple[str, date], str] = {}
+    for nurse_id, work_date, default_shift in rows:
+        wd = work_date.date() if hasattr(work_date, "date") else work_date
+        best.setdefault((str(nurse_id), wd), str(default_shift or "").strip())
+    out: dict[str, list[str]] = {}
+    for i in range(n_days):
+        day = start + relativedelta(days=i)
+        for nurse_id in nurse_ids:
+            out.setdefault(nurse_id, []).append(best.get((nurse_id, day), ""))
+    return out
 
 
 def _load_prev_month_tail(

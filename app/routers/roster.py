@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 # from db.client import get_db
 from db.models import RosterConfig as RosterConfigModel
+from types import SimpleNamespace
+from services.cp_sat.off_swap import postprocess_off_swap
 from db.models import (
     Office,
     Schedule,
@@ -1683,6 +1685,14 @@ async def save_roster(
     )
     target_group_id = schedule.group_id
     schedule.memo = memo
+    # 지우기 **전에** 현재 상태를 떠 둔다. 사용자가 이번 저장에서 연차 칸을 직접
+    # 풀었는지 판단하는 근거다 — 그런 간호사는 초과 OFF 후처리를 건너뛴다.
+    previous_codes = {
+        (str(row.nurse_id), (row.work_date.date() if hasattr(row.work_date, "date")
+                             else row.work_date).day - 1): row.shift_id
+        for row in db.query(ScheduleEntry)
+        .filter(ScheduleEntry.schedule_id == schedule.schedule_id).all()
+    }
     # Clear existing roster entries
     db.query(ScheduleEntry).filter(
         ScheduleEntry.schedule_id == schedule.schedule_id
@@ -1700,6 +1710,64 @@ async def save_roster(
     valid_shift_ids = {s.shift_id for s in shifts_for_group}
     shift_id_to_int_id = {s.shift_id: s.id for s in shifts_for_group}
 
+    # ── 연차 전환 재계산 ────────────────────────────────────────────────
+    # 근무표가 바뀌면 "초과 OFF → 연차" 균형도 다시 맞춰야 한다. 이 후처리는
+    # 생성 파이프라인 마지막 단계에만 있었기 때문에, 저장으로 OFF 가 늘면 초과분이
+    # 연차로 안 잡힌 채 남았다(긴급대체·수동 편집 공통).
+    #
+    # ★ 반대 방향(OFF 감소 → 연차 반환)은 하지 않는다. 시스템이 바꾼 연차와 사용자가
+    #   손으로 넣은 연차를 저장 후에는 구분할 수 없어, 되돌리면 수동 입력이 소실된다.
+    # ★ 사용자가 연차 칸을 **직접 푼** 경우에는 그 간호사를 후처리에서 제외한다.
+    #   안 그러면 손으로 FB→O 로 바꿔도 곧바로 다시 FB 가 되어 해제가 불가능하다.
+    #   그쪽은 연차가 과잉 소진된 채 남는다(`off_swap.py` 주석 참조).
+    # `off_swap_enabled` 가 꺼진 그룹은 함수가 즉시 빠져나온다.
+    swapped_cells: set[tuple[str, int]] = set()
+    generated_after_swap: dict[str, list] = {}
+    # config 는 **이 근무표에 찍힌 것**을 쓴다. 그룹 최신을 쓰면 설정이 바뀐 뒤
+    # 옛 근무표를 저장만 해도 off_days·target·enabled 가 달라져 근무가 바뀐다.
+    # (추천 판정은 반대로 그룹 최신이 맞다 — 생성기와 같은 것을 봐야 하므로.)
+    latest_config = None
+    if getattr(schedule, "config_id", None) is not None:
+        latest_config = (
+            db.query(RosterConfigModel)
+            .filter(RosterConfigModel.config_id == schedule.config_id)
+            .first()
+        )
+    if latest_config is None:
+        latest_config = (
+            db.query(RosterConfigModel)
+            .filter(RosterConfigModel.group_id == target_group_id)
+            .order_by(RosterConfigModel.created_at.desc())
+            .first()
+        )
+    if latest_config is not None and bool(
+        getattr(latest_config, "off_swap_enabled", False)
+    ):
+        before_swap = {}
+        for nurse in roster:
+            nid = nurse.get("nurse_id") or nurse.get("id")
+            if nid:
+                before_swap[str(nid)] = list(nurse.get("schedule", []))
+        try:
+            generated_after_swap = postprocess_off_swap(
+                db, schedule, {n: list(v) for n, v in before_swap.items()},
+                latest_config, SimpleNamespace(year=year, month=month),
+                previous_codes=previous_codes,
+            )
+            for nid, seq in generated_after_swap.items():
+                prev = before_swap.get(nid) or []
+                for i, code in enumerate(seq):
+                    if i >= len(prev) or prev[i] != code:
+                        swapped_cells.add((str(nid), i))
+        except Exception as _swap_exc:
+            # 연차 전환은 부가 정합성이다. 실패해도 저장 자체는 막지 않는다.
+            logger.warning(
+                "[save] 연차 전환 재계산 실패 — 입력 그대로 저장: %s",
+                _swap_exc, exc_info=True,
+            )
+            generated_after_swap = {}
+            swapped_cells = set()
+
     def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
         if raw_shift in valid_shift_ids:
             return raw_shift
@@ -1716,7 +1784,9 @@ async def save_roster(
         if not nurse_id:
             continue  # nurse_id가 없으면 건너뛰기
 
-        schedule_data = nurse.get("schedule", [])
+        schedule_data = generated_after_swap.get(
+            str(nurse_id), nurse.get("schedule", [])
+        )
         schedule_ids = nurse.get("schedule_ids", [])
         for day_index, shift_id in enumerate(schedule_data):
             if shift_id and str(shift_id).strip() and str(shift_id).strip() != '-':
@@ -1724,6 +1794,10 @@ async def save_roster(
                 norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
                 # 기존 schedule_ids 값 우선 사용, 없으면(수동 수정 셀) shift_id로 lookup
                 int_id = schedule_ids[day_index] if day_index < len(schedule_ids) else None
+                if (str(nurse_id), day_index) in swapped_cells:
+                    # 연차 전환으로 코드가 바뀐 칸 — 클라이언트가 보낸 PK 는 이전
+                    # 코드의 것이라 그대로 쓰면 코드와 PK 가 어긋난다.
+                    int_id = None
                 if int_id is None:
                     int_id = shift_id_to_int_id.get(norm_shift)
                 entry = ScheduleEntry(
