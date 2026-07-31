@@ -1,4 +1,5 @@
-from schemas.roster_schema import PreferenceData, PreferenceSubmit
+from schemas.roster_schema import PreferenceData, PreferenceSubmit, WantedEntryItem
+from services.wanted_service import WantedAnalysisError, analyze_wanted_text
 from routers.auth import get_current_user_from_cookie
 from services.group_access import resolve_home_group_id
 from db.client2 import get_db
@@ -20,6 +21,13 @@ from services.preferences_service import (
 )
 from typing import Optional
 
+
+def _with_analysis(result, analysis: Optional[dict]):
+    """응답에 자연어 분석 상태를 얹는다. 성공(None)이면 그대로 둔다."""
+    if analysis and isinstance(result, dict):
+        result["analysis"] = analysis
+    return result
+
 router = APIRouter(
     prefix="/preferences",
     tags=["preferences"]
@@ -39,10 +47,60 @@ def _raise_domain_error(exc: Exception) -> None:
     if isinstance(exc, PreferenceConflictError):
         raise HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, PreferenceValidationError):
-        raise HTTPException(
-            status_code=422, detail={"code": exc.code, "message": str(exc)}
-        )
+        body = {"code": exc.code, "message": str(exc)}
+        # 화면이 어느 날짜를 짚어 줄지 알 수 있게 부가 정보를 함께 내린다.
+        if getattr(exc, "detail", None):
+            body["detail"] = exc.detail
+        raise HTTPException(status_code=422, detail=body)
     raise exc
+
+
+async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Optional[dict]:
+    """`req.request`(자연어)가 있으면 분석해 `req.wanted_entries` 에 병합한다.
+
+    프론트가 `/wanted/invoke` → `/preferences` → `/preferences/submit` 로 나눠 부르던
+    것을 한 번으로 합치기 위한 전처리다. invoke 자체는 모바일이 아직 쓰고 있어
+    그대로 둔다(제거하면 동시 배포 없이 회귀).
+
+    **캘린더로 찍은 항목이 우선**이다. 같은 날짜가 겹치면 분석 결과를 버린다 —
+    사용자가 직접 고른 것이 문장 해석보다 확실하다.
+    분석이 실패하면 저장은 그대로 진행하되 **상태를 돌려준다**(호출자가 응답에 실어
+    화면이 "문장 해석에 실패했습니다" 를 띄우게). 조용히 넘기면 사용자는 저장된 줄
+    안다. 성공이면 None.
+    """
+    text = (getattr(req, "request", None) or "").strip()
+    if not text:
+        return
+    group_id = req.group_id or getattr(current_user, "group_id", None)
+    if not group_id:
+        return
+    try:
+        analyzed = await analyze_wanted_text(
+            db, getattr(current_user, "nurse_id", None), group_id, text,
+            req.year, req.month,
+        )
+    except WantedAnalysisError as exc:
+        print(f"[preferences] 자연어 분석 실패 — 저장은 계속: {exc}")
+        return {
+            "ok": False,
+            "code": "analysis_failed",
+            "message": "문장을 해석하지 못했습니다. 달력에서 직접 선택하거나 다시 시도해 주세요.",
+        }
+    if not analyzed:
+        return None
+    picked = list(req.wanted_entries or [])
+    taken = {e.date.isoformat() if hasattr(e.date, "isoformat") else str(e.date)
+             for e in picked}
+    merged = list(picked)
+    for item in analyzed:
+        if item["date"] in taken:
+            continue
+        taken.add(item["date"])
+        merged.append(WantedEntryItem(**item))
+    req.wanted_entries = merged
+    print(f"[preferences] 자연어 분석 병합: {len(analyzed)}건 중 "
+          f"{len(merged) - len(picked)}건 반영 (캘린더 {len(picked)}건 우선)")
+    return None
 
 
 @router.post("")
@@ -58,7 +116,9 @@ async def save_preference_draft(
     snapshot 을 반환한다(/wanted/invoke 불필요).
     """
     try:
-        return submit_preferences_service(req, current_user, db, is_draft=True)
+        analysis = await _merge_analyzed_request(req, current_user, db)
+        result = submit_preferences_service(req, current_user, db, is_draft=True)
+        return _with_analysis(result, analysis)
     except HTTPException:
         raise
     except (PreferenceForbiddenError, PreferenceConflictError, PreferenceValidationError) as e:
@@ -82,6 +142,8 @@ async def submit_preferences(
     canonical wanted snapshot 을 반환한다.
     """
     try:
+        # 자연어가 함께 오면 분석해 병합한다 — 이 호출 하나로 분석·저장·제출이 끝난다.
+        analysis = await _merge_analyzed_request(req, current_user, db)
         # 허용 근무코드 검증 (기존 data 기반 경로 전용).
         # wanted_entries 경로는 서비스에서 422 로 검증한다.
         preferences = (
@@ -102,7 +164,8 @@ async def submit_preferences(
                     detail=f"허용되지 않은 근무코드: {', '.join(set(invalid_shifts))}"
                 )
 
-        return submit_preferences_service(req, current_user, db, is_draft=False)
+        result = submit_preferences_service(req, current_user, db, is_draft=False)
+        return _with_analysis(result, analysis)
     except HTTPException:
         raise
     except (PreferenceForbiddenError, PreferenceConflictError, PreferenceValidationError) as e:
