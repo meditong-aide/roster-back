@@ -6041,6 +6041,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                             "lambda_by_family": _cause.lambda_by_family,
                         }
                         print(f"[Cause] {_cause.classification}: {_cause.certificate}")
+                        # 연구용 케이스 캡처(게이팅): AIDE_DUMP_CASE=<dir> 설정 시 진단 입력을
+                        # 그대로 JSON 스냅샷(오프라인 재현/실험). 미설정=no-op.
+                        if _os_undiag.getenv("AIDE_DUMP_CASE"):
+                            try:
+                                from services.ontology_graph.case_export import dump_case
+                                dump_case(_os_undiag.getenv("AIDE_DUMP_CASE"),
+                                          year=req.year, month=req.month,
+                                          group_id=str(getattr(current_user, "group_id", "") or ""),
+                                          num_days=_nd2, nurses=nurses_for_engine,
+                                          config=_probe_base, cause=_cause)
+                            except Exception as _dc_exc:
+                                print(f"[CaseDump] hook 실패(무시): {_dc_exc}")
                         # (a) 구체 원인이 있으면 generic 3문구(payload.py 하드코딩)를 그것으로
                         #     대체. unknown 일 때만 generic fallback 유지.
                         if _cause.classification != "unknown":
