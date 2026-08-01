@@ -209,7 +209,12 @@ FAMILY_PRESENTATION: dict[str, dict[str, Any]] = {
                       "advisory": "Grade 최소 인원을 낮추면 등급 인계 품질이 저하됩니다 — 직접 확인하세요."},
     "team":          {"bucket": "advisory",
                       "advisory": "팀 최소 인원을 낮추면 팀 인계 품질이 저하됩니다 — 직접 확인하세요."},
+    "night_coverage":{"bucket": "advisory",
+                      "advisory": "야간 가능 인원이 부족해 회복 규칙상 매일 다 못 섭니다 — "
+                                  "야간 가능 인원을 늘리거나(근무유형에 N 추가) 야간 필요 인원을 "
+                                  "줄여 주세요."},
 }
+_FAMILY_KO["night_coverage"] = "야간 커버리지"
 
 
 def cause_to_resolution_options(

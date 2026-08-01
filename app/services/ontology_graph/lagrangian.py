@@ -554,6 +554,25 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
         return InfeasibilityExplanation(
             "personal_infeasible", "monthly_limit", {}, cert,
             {"personal_conflicts": len(personal_conflicts)}, targets=personal_targets)
+
+    # ── 0b) 다인 N-커버리지 결합 (조인트 frontier DP, bounded-treewidth) ──────────
+    #   "각자는 되는데 같이는 야간을 못 채움" — 단일 상태DAG 로는 못 보는 결합. N-pool 이
+    #   작을 때 정확 판정(sound). infeasible 이면 병목 간호사까지 격리한다.
+    try:
+        from services.ontology_graph.joint_coverage import detect_joint_night_infeasible
+        _jc = detect_joint_night_infeasible(nurses, config, int(num_days))
+    except Exception:
+        _jc = None
+    if _jc:
+        _cn = ", ".join(c["name"] for c in _jc["culprits"][:3])
+        cert = (f"야간 가능 인원 {len(_jc['pool_ids'])}명으로는 하루 야간 {_jc['demand_n']}명을 "
+                f"매일 채울 수 없어요(회복 규칙상 동시에 다 못 섬). 야간 가능 인원을 늘리거나 "
+                f"야간 필요 인원을 줄이면 돼요." + (f" [병목: {_cn}]" if _cn else ""))
+        return InfeasibilityExplanation(
+            "coverage_shortage", "night_coverage", {}, cert,
+            {"n_pool": len(_jc["pool_ids"]), "demand_n": _jc["demand_n"]},
+            targets=_jc["culprits"])
+
     wk_days: set[int] | None = None
     if wk_nurses and year and month:
         wk_days = {d for d in range(int(num_days))

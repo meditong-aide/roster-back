@@ -88,7 +88,14 @@ add("coverage_shortage",
     _pool(4),
     _cfg(daily_shift_requirements={"D": 2, "E": 2, "N": 1}, off_days=1))
 
-# ⑦ feasible 대조군 — 인원 충분·제약 없음(진단=None 기대)
+# ⑦ 다인 N-커버리지 결합 — 각자는 되는데 같이는 못 채움.
+#    N 가능 2명뿐인데 하루 야간 2명 필요 → 3N2OFF상 둘 다 매일 N 불가. D/E는 전담이 커버.
+add("joint_night_coverage",
+    [_nurse("nn1", "야간1", allowed=["N"]), _nurse("nn2", "야간2", allowed=["N"])]
+    + [_nurse(f"de{i}", f"주이브{i}", allowed=["D", "E"]) for i in range(5)],
+    _cfg(daily_shift_requirements={"D": 2, "E": 1, "N": 2}))
+
+# ⑧ feasible 대조군 — 인원 충분·제약 없음(진단=None 기대)
 add("feasible_control",
     _pool(8),
     _cfg())
