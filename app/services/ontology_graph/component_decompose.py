@@ -1,16 +1,23 @@
-"""Separator 컴포넌트 분해 — 큰 결합을 작은 exact 조각으로 (미니 솔버 없이 bounded-width).
+"""Symmetry-Reduced Windowed Frontier Certification — 대형 인스턴스의 **국소** exact 인증.
 
-frontier DP 는 |frontier| 가 넓으면(긴 horizon·다인) UNKNOWN 이 된다. 이를 두 축으로 분해:
+⚠️ 정직한 범위(피드백 반영): 이것은 **진짜 하이퍼그래프 separator conditioning 이 아니다**.
+   실제 separator 분해(factor graph 구성→separator 변수 조건화→독립 component 분리→각 component
+   exact solve→AND 결합)는 미구현이다. 여기 있는 건 두 최적화의 조합이다:
 
-1. **대칭 축소**(frontier_dp.symmetry): 교환가능 간호사 상태를 multiset 로 접어 순열 폭발 제거.
-2. **슬라이딩 window 투영**(여기): 짧은 window 로 시간축을 자른다. window 하위문제는
-   - 모든 간호사 포함(가장 관대), fresh 진입상태(r=k=0, 회복빚 없음 = 가장 관대),
-   - free exit(window 이후 제약 없음)
-   이라 **전체 문제의 완화(relaxation)** 다. 따라서 **window infeasible ⟹ 전체 infeasible**
-   (sound, 한쪽 방향). 어떤 window 도 infeasible 아니면 결론 유보(전체 feasible 증명 아님) → UNKNOWN.
+1. **대칭 축소**(frontier_dp.symmetry): 동일 시그니처(교환가능) 간호사 상태를 multiset 로 접어
+   순열 폭발 제거. randomized 교차검증에서 sound 확인(auto 발동 650건, 오판 0).
+2. **슬라이딩 window 완화**(여기): 짧은 window(모든 간호사·fresh 진입 r=k=0·free exit)는
+   **전체의 완화** → **window infeasible ⟹ 전체 infeasible**(sound, **한쪽 방향만**).
 
-이 조합으로 병목이 짧은 구간·소수 간호사에 국소화되면, 전역이 커도 exact 인증 가능.
-반대방향(전체 feasible)까지 증명하려면 window 간 이음(경계상태 일치)이 필요 → 후속.
+한계(반드시 인지):
+   · 반대방향 불성립: 모든 window feasible 이어도 전체 feasible 아님(window 경계상태 불일치).
+     따라서 전체 **feasible witness 는 못 낸다** — infeasible certificate 만.
+   · window 간 장거리 결합은 놓친다.
+   · fresh-entry 완화의 soundness 는 **현재 규칙집합(max연속N·회복OFF·max연속근무·N→D금지)**
+     에 한해서다. 하한/결합 규칙(최소연속근무·월 최소 N·quota 등) 추가 시 재증명 필요.
+
+정확한 주장: "monolithic DP 가 폭발하는 대형에서도 **국소적으로 존재하는** integer-coupling
+infeasibility 를 exact 하게 인증한다." (전체 exact 해결 아님.)
 """
 
 from __future__ import annotations

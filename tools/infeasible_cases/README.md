@@ -153,3 +153,27 @@ INFEASIBLE 로 오인 안 함) 테스트로 sound 성 잠금(`tests/test_compone
 
 남은 것: window 간 이음(경계상태 일치)으로 **전체 feasible** 까지 증명, 부분-교환 그룹(현재는
 전체 교환일 때만 대칭) 지원.
+
+> ⚠️ 이름 정정(피드백): 이것은 **진짜 하이퍼그래프 separator conditioning 이 아니다**
+> (factor graph→separator 조건화→component 분리→AND 결합은 미구현). 정확히는 **대칭 축소 +
+> sound window 완화**다. 정확한 주장: "대형에서도 **국소** integer-coupling infeasibility 를
+> exact 인증"(전체 exact 해결 아님, feasible witness 못 냄).
+
+## Randomized 교차검증 (정확성 실증)
+
+```bash
+.venv/bin/python tools/infeasible_cases/fuzz_crossval.py 2500     # frontier ⟷ oracle ⟷ CP-SAT
+```
+수천 소형 랜덤 인스턴스로 3자 비교. **실측(seed=7, 2500건)**:
+
+| 지표 | 결과 |
+|---|---|
+| false INFEASIBLE (frontier auto 오판) | **0** |
+| false FEASIBLE (frontier auto 오판) | **0** |
+| 대칭 auto ≠ plain (자동감지 sound) | **0** (대칭 실발동 650건) |
+| CP-SAT ⟷ oracle 불일치 | 17/400 (전부 frontier==oracle, CP-SAT 인코딩 근사) |
+
+→ **독립 구현 2개(frontier DP BFS + backtracking oracle DFS)가 2500/2500 일치** = 코어 판정
+정확성의 강한 증거. 대칭 축소는 650건 실발동하고도 오판 0(sound). CP-SAT 17건은 모두
+frontier==oracle 인 쪽이라 CP-SAT 회복규칙 인코딩 근사 때문(엔진 버그 아님). CI 회귀는
+`tests/test_fuzz_crossval.py`(소량).
