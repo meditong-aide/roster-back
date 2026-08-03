@@ -135,4 +135,21 @@ multi_axis_diagnose 에 exact tier 로 배선(완화 층이 침묵할 때만 호
 frontier DP 가 필요했던 이유를 함께 문서화).
 
 경계: |frontier| 이 cap·전개예산 초과하는 **대형(넓은 separator)** 은 UNKNOWN 반환(무한루프
-아님). 이 경우 **병목 window/간호사 component 로 분해**해 폭을 낮추면 exact 유지 — 다음 단계.
+아님). 이 경우 아래 컴포넌트 분해로 폭을 낮춰 exact 유지.
+
+### separator 컴포넌트 분해 (app/services/ontology_graph/component_decompose.py)
+
+대형 결합을 두 축으로 분해해 exact 를 유지(미니 솔버 없이):
+- **대칭 축소**(frontier_dp.symmetry): 같은 in-window 시그니처(work-set+banned/forced) 간호사는
+  교환가능 → 상태를 정렬(multiset)로 접어 순열 폭발 제거. 폭 792→10 급 축소. sound.
+- **슬라이딩 window 투영**(`windowed_certify`): 모든 간호사·fresh 진입(r=k=0)·free exit 인
+  window 하위문제는 **전체의 완화** → **window infeasible ⟹ 전체 infeasible**(sound, 한쪽).
+  병목 밀집 window 를 먼저 시도. 어떤 window 도 infeasible 아니면 UNKNOWN(전체 feasible 증명 아님).
+
+`decompose_diagnose` = 전체 frontier DP 먼저, UNKNOWN 이면 window 분해로 국소 인증. 실증:
+11명·30일 전역 비교환 인스턴스에서 plain=UNKNOWN(폭발) → 분해=INFEASIBLE_CERTIFIED
+window (20,28). 소형 교차검증에서 대칭 결론=plain=독립 oracle. no-false-positive(feasible 을
+INFEASIBLE 로 오인 안 함) 테스트로 sound 성 잠금(`tests/test_component_decompose.py`).
+
+남은 것: window 간 이음(경계상태 일치)으로 **전체 feasible** 까지 증명, 부분-교환 그룹(현재는
+전체 교환일 때만 대칭) 지원.

@@ -159,9 +159,29 @@ def _collapse_cert(frontier: set, day: int, config: dict, prepped: list,
         witness={"day": day, "req": {"D": reqD, "E": reqE, "N": reqN}})
 
 
+def _interchangeable(prepped: list, day_lo: int, day_hi: int) -> bool:
+    """[day_lo, day_hi) 구간에서 모든 간호사가 교환가능한가 — **동일 in-window 시그니처**.
+
+    무제약일 필요는 없다. 같은 work-set + 같은 in-window banned/forced 패턴이면
+    (동일하게 제약돼도) 교환가능 → 상태 정렬 축소가 sound.
+    """
+    def sig(n):
+        work = frozenset(n["work"])
+        banned = tuple(sorted((d, tuple(sorted(n["banned"][d])))
+                              for d in n["banned"] if day_lo <= d < day_hi))
+        foff = tuple(sorted(d for d in n["foff"] if day_lo <= d < day_hi))
+        return (work, banned, foff)
+
+    return len({sig(n) for n in prepped}) <= 1
+
+
 def diagnose_frontier(nurses: list, config: dict, num_days: int,
-                      cap: int = _CAP) -> FrontierResult:
-    """{D,E,N,O} exact frontier DP 판정 + 붕괴 certificate."""
+                      cap: int = _CAP, symmetry: bool | None = None) -> FrontierResult:
+    """{D,E,N,O} exact frontier DP 판정 + 붕괴 certificate.
+
+    symmetry: 교환가능 간호사의 상태를 정렬(multiset)로 접어 순열 폭발 제거(sound).
+              None=자동 감지(구간 전체 교환가능 시 활성).
+    """
     prepped = _prep(nurses, config)
     max_run, rec_trig, min_run = _night_rules(config)
     track_w = config.get("max_consecutive_work") is not None
@@ -169,7 +189,10 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
     reqD, reqE, reqN = _req(config, "D"), _req(config, "E"), _req(config, "N")
     reqs = (reqD, reqE, reqN)
     k = len(prepped)
-    frontier: set = {tuple((0, 0, 0, "") for _ in range(k))}
+    if symmetry is None:
+        symmetry = _interchangeable(prepped, 0, num_days)
+    canon = (lambda s: tuple(sorted(s))) if symmetry else (lambda s: s)
+    frontier: set = {canon(tuple((0, 0, 0, "") for _ in range(k)))}
     width_max = 1
     spent = 0
     for d in range(num_days):
@@ -191,8 +214,8 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
                     continue
                 if sum(c == "N" for c in combo) < reqN:
                     continue
-                nxt.add(tuple(_step(js[i], combo[i], config, track_w, track_prev)
-                              for i in range(k)))
+                nxt.add(canon(tuple(_step(js[i], combo[i], config, track_w, track_prev)
+                                    for i in range(k))))
                 if len(nxt) > cap:
                     return FrontierResult(UNKNOWN, width_max=len(nxt), reqs=reqs)
         if not nxt:
