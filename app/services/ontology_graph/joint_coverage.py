@@ -100,6 +100,59 @@ def _feasible_over(pool: list[dict], config: dict, num_days: int) -> bool | None
     return True
 
 
+def joint_death_day(pool: list[dict], config: dict, num_days: int) -> dict | None:
+    """frontier 가 소멸하는 **첫 날 + 그날 최대 달성 야간 커버리지**(실제 DP 값).
+
+    `_feasible_over` 와 동일 DP 지만, infeasible 이 확정되는 순간의 **증거값**을 추출한다:
+    소멸일 d, 그날 수요 need, 그날 어떤 배정으로도 낸 최대 야간 max_cov. → 진짜 certificate
+    (NaN·임의값 아님). infeasible 일 때만 dict, feasible/폭발이면 None.
+    """
+    max_run, rec_trig, min_run = _night_rules(config)
+    demand = [_demand_n(config, d) for d in range(num_days)]
+    if max(demand, default=0) == 0:
+        return None
+    k = len(pool)
+    frontier: set[tuple] = {tuple((0, 0) for _ in range(k))}
+    for d in range(num_days):
+        need = demand[d]
+        mustn = [d in p["must_n"] for p in pool]
+        musto = [d in p["must_notn"] for p in pool]
+        nxt: set[tuple] = set()
+        max_cov, any_alive = 0, False
+        for js in frontier:
+            per: list[list[tuple]] = []
+            dead = False
+            for i, (r, kk) in enumerate(js):
+                ch: list[tuple] = []
+                if not musto[i] and kk == 0 and r + 1 <= max_run:
+                    ch.append(((r + 1, 0), 1))
+                if not mustn[i]:
+                    if r == 0:
+                        ch.append(((0, max(0, kk - 1)), 0))
+                    elif r >= min_run:
+                        ch.append(((0, 1 if r >= rec_trig else 0), 0))
+                if not ch:
+                    dead = True
+                    break
+                per.append(ch)
+            if dead:
+                continue
+            any_alive = True
+            for combo in product(*per):
+                cov = sum(c[1] for c in combo)
+                if cov > max_cov:
+                    max_cov = cov
+                if cov >= need:
+                    nxt.add(tuple(c[0] for c in combo))
+                    if len(nxt) > _FRONTIER_CAP:
+                        return None
+        if not nxt:
+            return {"day": d, "demand": need, "max_cov": max_cov,
+                    "all_blocked": not any_alive}
+        frontier = nxt
+    return None
+
+
 def joint_night_coverage_feasible(nurses: list, config: dict, num_days: int):
     """다인 N-커버리지 실현가능성. True/False/None(N-pool 없음·과대 → 판정 유보)."""
     pool = _n_pool(nurses, config)

@@ -65,6 +65,11 @@ def _cert_phrase(c: Certificate) -> str:
     if c.kind == "night_supply_deficit":
         return (f"야간 가능 인원의 월 최대 공급 {int(c.capacity)} < 필요 {int(c.demand)} "
                 f"→ {int(c.deficit)} 부족")
+    if c.kind == "joint_frontier_empty":
+        d = c.witness.get("day")
+        day = f"{d + 1}일" if isinstance(d, int) else "특정일"
+        return (f"결합 배열이 {day}에 붕괴 — 그날 낼 수 있는 최대 야간 {int(c.capacity)} "
+                f"< 필요 {int(c.demand)}(각자는 가능하나 함께는 불가)")
     return c.one_line()
 
 

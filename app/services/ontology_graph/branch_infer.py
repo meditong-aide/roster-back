@@ -9,7 +9,16 @@ IIS 없이 sound·행동가능한 원인 설명 + 검증된 복구 후보.
   Tier3 N-pool DP(정확) → night_supply_deficit(집계) / 결합 판정
   Tier4 정수 분기       → "어느 배정이든 실패"의 proof tree
   Tier7 검증 복구       → antecedent 완화 → N축 재판정으로 검증
-솔버 없음(N축 자기완결). 상태 3개(certificate.py) — UNKNOWN 을 FEASIBLE 로 취급 금지.
+
+**범위(정직)**: Tier4 는 *얕은 1레벨 이분* 설명기다 — 병목일에서 한 간호사 N 여부 0/1 로
+양쪽이 각각 국소 사유를 낼 때만 nurse-pair narrative 를 만든다. 두 변수(A∧B)를 함께
+고정해야 드러나는 **깊은 정수 결합**은 1레벨로 국소화 못 하고, 대신 조인트 DP 의 **소멸일
+증거**(joint_frontier_empty, day-level·sound)를 낸다. 즉 "general proof search" 가 아니라
+"1레벨 이분 + 소멸일 certificate". 더 깊은 결합의 minimal 국소화는 향후 variable-elimination
+/frontier DP 로 확장(관련: axis_diagnose 경계 주석).
+
+솔버 없음(N축 자기완결). 상태 3개(certificate.py) — UNKNOWN 을 FEASIBLE 로 취급 금지
+(verified_repairs 는 st==FEASIBLE 만 verified; UNKNOWN=domain_unproven).
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ from services.ontology_graph.joint_coverage import (
     _demand_n,
     _feasible_over,
     _n_pool,
+    joint_death_day,
 )
 from services.ontology_graph.lagrangian import _night_rules, per_nurse_night_feasible
 
@@ -174,12 +184,20 @@ def diagnose_night_axis(nurses: list, config: dict, num_days: int) -> ProofNode:
                     INFEASIBLE, branch_literal=f"{m['name']} {d + 1}일 야간",
                     children=[ProofNode(INFEASIBLE, certificate=r0),
                               ProofNode(INFEASIBLE, certificate=r1)])
-    # 분기로 깔끔한 이분이 안 나오면: 결합 부족 자체를 certificate 로
-    return ProofNode(INFEASIBLE, certificate=Certificate(
-        kind="joint_night_infeasible", group_id=f"night:pool:{len(pool)}",
-        capacity=float("nan"), demand=_demand_n(config, 0), deficit=1,
-        antecedents=[f"{m['name']}" for m in pool],
-        witness={"pool": [m["nurse_id"] for m in pool]}))
+    # 1레벨 이분이 안 나오는 깊은 결합: NaN 지어내지 말고 조인트 DP 에서 **실제 소멸일 증거**를 추출.
+    death = joint_death_day(pool, config, num_days)
+    if death is not None:
+        d0, need, cov = death["day"], death["demand"], death["max_cov"]
+        ante = (f"{d0 + 1}일 모든 야간가능 간호사가 회복규칙에 막힘"
+                if death["all_blocked"] else
+                f"{d0 + 1}일까지 어떤 배정으로도 최대 야간 {cov} < 필요 {need}")
+        return ProofNode(INFEASIBLE, certificate=Certificate(
+            kind="joint_frontier_empty", group_id=f"night:day:{d0 + 1}",
+            capacity=cov, demand=need, deficit=max(1, need - cov),
+            antecedents=[ante] + [m["name"] for m in pool][:6],
+            witness={"day": d0, "pool": [m["nurse_id"] for m in pool]}))
+    # DP 가 소멸일을 못 집어내면(방어적) — infeasible 확신 못 함. FEASIBLE 취급 금지 → UNKNOWN.
+    return ProofNode(UNKNOWN)
 
 
 # ── 검증된 복구 후보 (antecedent → 완화 → N축 재판정) ────────────────────────────
@@ -209,7 +227,8 @@ def verified_repairs(node: ProofNode, nurses: list, config: dict, num_days: int,
                 if act not in seen:
                     seen.add(act); cands.append({"action": act[0], "nurse_id": nid})
         # 커버리지/공급 부족 → 야간 수요 -1 / 불가 간호사 야간 허용
-        elif c.kind in ("night_coverage_deficit", "night_supply_deficit", "joint_night_infeasible"):
+        elif c.kind in ("night_coverage_deficit", "night_supply_deficit",
+                        "joint_frontier_empty"):
             if ("demand_down", None) not in seen:
                 seen.add(("demand_down", None)); cands.append({"action": "reduce_night_demand"})
             for a in c.antecedents:
@@ -222,7 +241,11 @@ def verified_repairs(node: ProofNode, nurses: list, config: dict, num_days: int,
         if cfg2 is None:
             continue
         st = diagnose_night_axis(nrs2, cfg2, num_days).status
-        cand["verified"] = (st != INFEASIBLE)     # 더는 N축 infeasible 아님 → 유효 후보
+        # soundness: UNKNOWN 을 성공으로 세지 않는다. FEASIBLE(도메인 재판정 통과)만 verified.
+        # UNKNOWN(폭발·판정유보)은 domain_unproven — 실서비스 solver 최종검증 대상.
+        cand["status"] = st
+        cand["verified"] = (st == FEASIBLE)
+        cand["domain_unproven"] = (st == UNKNOWN)
         out.append(cand)
     return out
 

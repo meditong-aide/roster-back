@@ -7,7 +7,13 @@
   · branch-infer : 직접 typed certificate + proof-tree(oracle ~1~수 회, 행동가능 설명).
 
 측정: 원인 격리 성공 여부 · oracle 호출 수 · 산출 형태(제약집합 vs 행동 설명).
-포지셔닝 근거: "우리는 IIS 최소화의 반복 oracle 없이 sound·행동가능 원인을 낸다."
+
+⚠️ 정직한 한계(피드백 반영): 지금 QuickXplain 의 oracle 이 **우리 진단기 자신**이라
+   "우리를 1회 호출 vs 우리를 QuickXplain 안에서 N회 호출"의 구조다. 따라서 이 표는
+   **내부 PoC 검증**(우리 진단기가 IIS 계열보다 적은 재판정으로 같은 결론)일 뿐,
+   "IIS 대비 우수"라는 **연구 결론이 아니다**. 정식 비교엔 양쪽이 공유할 **독립 exact
+   oracle**(CP-SAT feasibility 또는 독립 N-pool DP)이 필요하고, 지표도 호출수만이 아니라
+   실행시간·실코퍼스(합성 아닌)여야 한다. 이는 TODO(baseline_v2).
 """
 
 from __future__ import annotations
@@ -131,6 +137,8 @@ def main():
     print(f"  Tier1(flow-only) 격리:  {agg['t1']}/{agg['n']}  ({100*agg['t1']//n}%)  — 시퀀스·결합 놓침")
     print(f"  QuickXplain 평균 oracle 호출: {agg['qx_calls']/max(1,agg['qx_n']):.1f}회  (제약집합 산출)")
     print(f"  branch-infer 격리:      {agg['bi_certified']}/{agg['n']}  (100%)  1진단 + 행동가능 certificate")
+    print("\n⚠️ 한계: QuickXplain oracle = 우리 진단기 자신(순환). 내부 PoC 검증이지 IIS 대비")
+    print("   우수 결론 아님. 정식 비교엔 독립 oracle(CP-SAT)+실행시간+실코퍼스 필요(baseline_v2 TODO).")
 
 
 if __name__ == "__main__":
