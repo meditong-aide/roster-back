@@ -6041,6 +6041,29 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                             "lambda_by_family": _cause.lambda_by_family,
                         }
                         print(f"[Cause] {_cause.classification}: {_cause.certificate}")
+                        # N축 branch-and-infer: 야간축 원인이면 proof-tree 설명 + 검증된 복구를
+                        # payload 에 **추가**(기존 분류·카드 불변, 실패내성). "각자OK 같이X" 를
+                        # "어느 배정이든 실패" 서사로 보여주고, 복구 후보를 N축 재판정으로 선별.
+                        if _cause.top_family in ("banned_wanted", "night_coverage"):
+                            try:
+                                from services.ontology_graph.branch_infer import (
+                                    diagnose_night_axis, verified_repairs)
+                                from services.ontology_graph.certificate import (
+                                    INFEASIBLE as _INF, render_explanation)
+                                _nd_dicts = [{"nurse_id": str(getattr(_n, "nurse_id", "") or ""),
+                                              "name": getattr(_n, "name", None),
+                                              "allowed_shifts": list(getattr(_n, "allowed_shifts", None) or [])}
+                                             for _n in nurses_for_engine]
+                                _pn = diagnose_night_axis(_nd_dicts, _probe_base, _nd2)
+                                if _pn.status == _INF:
+                                    _ce = unrecoverable["infeasibility"]["cause_explanation"]
+                                    _ce["proof_explanation"] = render_explanation(_pn)
+                                    _ce["verified_repairs"] = [
+                                        r for r in verified_repairs(_pn, _nd_dicts, _probe_base, _nd2)
+                                        if r.get("verified")]
+                                    print(f"[Cause][BranchInfer] {_ce['proof_explanation'][:80]}")
+                            except Exception as _bi_exc:
+                                print(f"[Cause][BranchInfer] 실패(무시): {_bi_exc}")
                         # 연구용 케이스 캡처(게이팅): AIDE_DUMP_CASE=<dir> 설정 시 진단 입력을
                         # 그대로 JSON 스냅샷(오프라인 재현/실험). 미설정=no-op.
                         if _os_undiag.getenv("AIDE_DUMP_CASE"):
