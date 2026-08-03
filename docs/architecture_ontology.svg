@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1520 760" font-family="-apple-system, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">
+  <defs>
+    <marker id="aGray" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#5f6368"/></marker>
+    <marker id="aPurple" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#8430ce"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1520" height="760" fill="#ffffff"/>
+
+  <text x="40" y="46" font-size="24" font-weight="700" fill="#202124">Infeasibility 온톨로지 — 클래스·속성·관계로 원인→해결 연결</text>
+  <text x="40" y="72" font-size="13.5" fill="#5f6368">precheck/솔버가 낸 reason_code를 온톨로지가 cause→family(클래스)→treatment(완화 파라미터)로 해석해, 유저에게 해결 선택지를 주고 적용→재생성한다.</text>
+
+  <!-- ===== 온톨로지 지식베이스 그룹 (cause+family+treatment) ===== -->
+  <rect x="426" y="150" width="602" height="132" rx="14" fill="#F6EEFC" stroke="#8430ce" stroke-width="1.5" stroke-dasharray="7 5"/>
+  <text x="446" y="140" font-size="13.5" font-weight="700" fill="#6b1fb1">온톨로지 지식베이스 · ontology.yaml v4  (constraints · causes · treatments · conflict_scenarios · relations)</text>
+
+  <!-- ===== 체인 박스 (y=182, h=62, cy=213) ===== -->
+  <!-- 1 source -->
+  <g><rect x="30" y="182" width="150" height="62" rx="9" fill="#F1F3F4" stroke="#5f6368" stroke-width="1.4"/>
+    <text x="105" y="208" font-size="12.5" font-weight="600" fill="#3c4043" text-anchor="middle">precheck / 솔버</text>
+    <text x="105" y="226" font-size="11" fill="#5f6368" text-anchor="middle">INFEASIBLE</text></g>
+  <!-- 2 reason_code -->
+  <g><rect x="222" y="182" width="150" height="62" rx="9" fill="#E8EAED" stroke="#5f6368" stroke-width="1.4"/>
+    <text x="297" y="208" font-size="12.5" font-weight="700" fill="#3c4043" text-anchor="middle">reason_code</text>
+    <text x="297" y="226" font-size="10.5" fill="#5f6368" text-anchor="middle">precheck 산출</text></g>
+  <!-- 3 cause -->
+  <g><rect x="440" y="182" width="150" height="62" rx="9" fill="#E8F0FE" stroke="#1a73e8" stroke-width="1.5"/>
+    <text x="515" y="208" font-size="12.5" font-weight="700" fill="#174ea6" text-anchor="middle">cause</text>
+    <text x="515" y="226" font-size="10.5" fill="#5f6368" text-anchor="middle">tier·is_hard·템플릿</text></g>
+  <!-- 4 family (class) -->
+  <g><rect x="638" y="182" width="160" height="62" rx="9" fill="#F3E8FD" stroke="#8430ce" stroke-width="1.9"/>
+    <text x="718" y="208" font-size="12.5" font-weight="700" fill="#6b1fb1" text-anchor="middle">family (클래스)</text>
+    <text x="718" y="226" font-size="10.5" fill="#5f6368" text-anchor="middle">속성 + 관계</text></g>
+  <!-- 5 treatment -->
+  <g><rect x="846" y="182" width="160" height="62" rx="9" fill="#E6F4EA" stroke="#188038" stroke-width="1.5"/>
+    <text x="926" y="208" font-size="12.5" font-weight="700" fill="#0d652d" text-anchor="middle">treatment</text>
+    <text x="926" y="226" font-size="10.5" fill="#5f6368" text-anchor="middle">config_key(완화)</text></g>
+  <!-- 6 resolution_option -->
+  <g><rect x="1058" y="182" width="168" height="62" rx="9" fill="#FEEFE3" stroke="#e8710a" stroke-width="1.5"/>
+    <text x="1142" y="208" font-size="12.5" font-weight="700" fill="#a8500a" text-anchor="middle">resolution_option</text>
+    <text x="1142" y="226" font-size="10.5" fill="#5f6368" text-anchor="middle">유저 선택 카드</text></g>
+  <!-- 7 apply -->
+  <g><rect x="1284" y="182" width="200" height="62" rx="9" fill="#FEEFE3" stroke="#e8710a" stroke-width="1.5"/>
+    <text x="1384" y="208" font-size="12.5" font-weight="700" fill="#a8500a" text-anchor="middle">apply-resolution</text>
+    <text x="1384" y="226" font-size="10.5" fill="#5f6368" text-anchor="middle">config 적용 → 재생성</text></g>
+
+  <!-- 체인 화살표 + 관계 라벨(위) -->
+  <path d="M180,213 L219,213" stroke="#5f6368" stroke-width="2" fill="none" marker-end="url(#aGray)"/>
+  <text x="200" y="205" font-size="10" fill="#5f6368" text-anchor="middle">발행</text>
+  <path d="M372,213 L437,213" stroke="#8430ce" stroke-width="2" fill="none" marker-end="url(#aPurple)"/>
+  <text x="404" y="205" font-size="10.5" fill="#8430ce" text-anchor="middle">aliases</text>
+  <path d="M590,213 L635,213" stroke="#8430ce" stroke-width="2" fill="none" marker-end="url(#aPurple)"/>
+  <text x="612" y="205" font-size="10" fill="#8430ce" text-anchor="middle">속함</text>
+  <path d="M798,213 L843,213" stroke="#8430ce" stroke-width="2" fill="none" marker-end="url(#aPurple)"/>
+  <text x="820" y="205" font-size="9.5" fill="#8430ce" text-anchor="middle">applies_to_causes</text>
+  <path d="M1006,213 L1055,213" stroke="#8430ce" stroke-width="2" fill="none" marker-end="url(#aPurple)"/>
+  <text x="1030" y="205" font-size="10" fill="#8430ce" text-anchor="middle">config_key</text>
+  <path d="M1226,213 L1281,213" stroke="#e8710a" stroke-width="2" fill="none" marker-end="url(#aGray)"/>
+  <text x="1253" y="205" font-size="9.5" fill="#e8710a" text-anchor="middle">apply / ids</text>
+
+  <!-- 구체 예시 행 (y=268) -->
+  <text x="105" y="270" font-size="10.5" fill="#80868b" text-anchor="middle" font-style="italic">제약 충돌</text>
+  <text x="297" y="270" font-size="10" fill="#80868b" text-anchor="middle" font-style="italic">N_CAPACITY_SHORTAGE</text>
+  <text x="515" y="270" font-size="9.5" fill="#80868b" text-anchor="middle" font-style="italic">cause:capacity:daily_night</text>
+  <text x="718" y="270" font-size="10" fill="#80868b" text-anchor="middle" font-style="italic">MonthlyNightCap</text>
+  <text x="926" y="270" font-size="9.5" fill="#80868b" text-anchor="middle" font-style="italic">threshold:monthly_night_cap</text>
+  <text x="1142" y="270" font-size="9.5" fill="#80868b" text-anchor="middle" font-style="italic">{max_nig_per_month +8}</text>
+  <text x="1384" y="270" font-size="10" fill="#80868b" text-anchor="middle" font-style="italic">재생성 → feasible</text>
+
+  <!-- ===== 클래스 해부 (좌) ===== -->
+  <rect x="40" y="326" width="690" height="286" rx="12" fill="#faf7fe" stroke="#8430ce" stroke-width="1.4"/>
+  <text x="62" y="356" font-size="15" font-weight="700" fill="#6b1fb1">클래스(constraint family) 한 개의 구조 — 예: WeekendOffOnly</text>
+  <g font-size="12.5" fill="#3c4043">
+    <text x="62" y="392" font-family="monospace" font-size="12">parent: NurseLocalConstraint</text>
+    <text x="430" y="392" fill="#8430ce">← 상위 클래스 (is-a 택소노미)</text>
+    <text x="62" y="422" font-family="monospace" font-size="12">default_severity: hard · tier: T2 · relaxation_priority: 4</text>
+    <text x="62" y="446" fill="#5f6368" font-size="11.5">      ↑ 속성(attributes): 심각도 · 완화계층(T0~T3) · 완화 우선순위</text>
+    <text x="62" y="478" font-family="monospace" font-size="12">effective_modes: [enforced, inactive]</text>
+    <text x="430" y="478" fill="#5f6368" font-size="11.5">← 상태(모드)</text>
+    <text x="62" y="508" font-family="monospace" font-size="12">connects: [AssignmentAtom, Nurse, Day]</text>
+    <text x="430" y="508" fill="#8430ce" font-size="11.5">← 객체 관계(엔티티)</text>
+    <text x="62" y="538" font-family="monospace" font-size="12">scope: [nurse, weekday]</text>
+    <text x="62" y="574" font-family="monospace" font-size="11">explanation_template: "{nurse}는 평일 OFF 금지 + 주말 OFF 보장"</text>
+    <text x="62" y="596" fill="#5f6368" font-size="11">      → problem/explanation 템플릿이 사용자 한글 메시지를 생성</text>
+  </g>
+
+  <!-- ===== 관계 종류 (우) ===== -->
+  <rect x="758" y="326" width="726" height="286" rx="12" fill="#f7fbff" stroke="#1a73e8" stroke-width="1.4"/>
+  <text x="780" y="356" font-size="15" font-weight="700" fill="#174ea6">온톨로지 관계(relationships) — 4종</text>
+  <g font-size="12.5" fill="#3c4043">
+    <text x="780" y="392" font-weight="700" fill="#8430ce">① parent</text>
+    <text x="880" y="392">is-a 택소노미. WeekendOffOnly → NurseLocalConstraint</text>
+    <text x="780" y="428" font-weight="700" fill="#8430ce">② connects</text>
+    <text x="880" y="428">제약 ↔ 엔티티(AssignmentAtom·Nurse·Day) 객체관계</text>
+    <text x="780" y="464" font-weight="700" fill="#e8710a">③ conflict_scenarios</text>
+    <text x="990" y="464">클래스 간 N항 충돌관계 (왜 infeasible인가)</text>
+    <text x="800" y="486" font-family="monospace" font-size="11" fill="#5f6368">OFFCAP_VS_WEEKEND_OFF = [OffCap, WeekendOffOnly, AssignmentWindow]</text>
+    <text x="780" y="522" font-weight="700" fill="#188038">④ aliases / applies_to_causes</text>
+    <text x="800" y="546" font-size="11.5">reason_code → cause (aliases),  cause → treatment (applies_to_causes)</text>
+    <text x="800" y="568" font-family="monospace" font-size="11" fill="#5f6368">N_CAPACITY_SHORTAGE → cause:...daily_night → treatment(config_key)</text>
+    <text x="780" y="596" fill="#5f6368" font-size="11.5">→ 이 관계 사슬이 "원인 이름짓기 + 완화 파라미터 자동선택"을 만든다.</text>
+  </g>
+
+  <!-- ===== 하단: 두 적용 소스 ===== -->
+  <rect x="40" y="632" width="1444" height="98" rx="12" fill="#fffaf3" stroke="#e8710a" stroke-width="1.4"/>
+  <text x="62" y="660" font-size="14" font-weight="700" fill="#a8500a">resolution_options 두 소스 — 둘 다 apply-resolution이 config_override로 적용(비-컬럼 solver 키도 OK, 컬럼 검증 우회)</text>
+  <g font-size="12.5" fill="#3c4043">
+    <text x="62" y="690" font-weight="700" fill="#188038">treatment (source: ontology)</text>
+    <text x="330" y="690">verified: false · treatment_ids 경로 · applies_to_causes로 자동 매칭</text>
+    <text x="62" y="716" font-weight="700" fill="#8430ce">probe (source: undiagnosed_probe)</text>
+    <text x="330" y="716">verified: true (완화→재solve로 feasible 실측) · RELAX_CATALOG · 방금 승격: weekend_off_only / ban_n_to_d·e / team_min</text>
+  </g>
+</svg>

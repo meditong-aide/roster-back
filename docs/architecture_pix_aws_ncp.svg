@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1410 812" font-family="-apple-system, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">
+  <defs>
+    <marker id="aBlue" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#1a73e8"/></marker>
+    <marker id="aGreen" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#188038"/></marker>
+    <marker id="aGray" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#5f6368"/></marker>
+    <marker id="aOrange" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#e8710a"/></marker>
+    <marker id="aPurple" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#8430ce"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1410" height="812" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="40" y="42" font-size="24" font-weight="700" fill="#202124">PIX (환자경험) 백엔드 · 인프라 아키텍처</text>
+  <text x="40" y="66" font-size="13.5" fill="#5f6368">멀티테넌트 SaaS · 애플리케이션·연산은 AWS 서울, 데이터베이스는 Naver Cloud(roster와 공유 인스턴스) · 외부 SaaS/온프렘은 별도 연동</text>
+
+  <!-- ===================== ZONES ===================== -->
+  <rect x="235" y="95" width="760" height="430" rx="14" fill="#fff8f0" stroke="#ff9900" stroke-width="1.6" stroke-dasharray="7 5"/>
+  <text x="255" y="120" font-size="15" font-weight="700" fill="#b26a00">AWS · 서울 리전 (ap-northeast-2)</text>
+
+  <rect x="1035" y="235" width="340" height="120" rx="14" fill="#f0fff6" stroke="#03c75a" stroke-width="1.6" stroke-dasharray="7 5"/>
+  <text x="1052" y="259" font-size="15" font-weight="700" fill="#03a04a">Naver Cloud · 국내 CSP</text>
+
+  <rect x="1035" y="398" width="340" height="300" rx="14" fill="#fafafa" stroke="#9aa0a6" stroke-width="1.6" stroke-dasharray="7 5"/>
+  <text x="1052" y="422" font-size="15" font-weight="700" fill="#5f6368">외부 SaaS / 온프렘 연동</text>
+
+  <!-- ===================== EDGES ===================== -->
+
+  <!-- Blue request spine -->
+  <path d="M205,251 L266,286" stroke="#1a73e8" stroke-width="2.2" fill="none" marker-end="url(#aBlue)"/>
+  <path d="M205,316 L266,314" stroke="#1a73e8" stroke-width="2.2" fill="none" marker-end="url(#aBlue)"/>
+  <path d="M395,300 L437,300" stroke="#1a73e8" stroke-width="2.2" fill="none" marker-end="url(#aBlue)"/>
+  <path d="M555,300 L597,300" stroke="#1a73e8" stroke-width="2.2" fill="none" marker-end="url(#aBlue)"/>
+
+  <!-- Green DB access (clean straight lane, y=300) -->
+  <path d="M760,300 L1062,300" stroke="#188038" stroke-width="2.2" fill="none" marker-end="url(#aGreen)"/>
+  <text x="910" y="291" font-size="11.5" fill="#188038" text-anchor="middle">R/W (pymssql)</text>
+
+  <!-- Purple CI / deploy / secrets (dashed) -->
+  <path d="M205,171 L557,168" stroke="#8430ce" stroke-width="1.8" fill="none" stroke-dasharray="5 4" marker-end="url(#aPurple)"/>
+  <text x="378" y="161" font-size="11" fill="#8430ce" text-anchor="middle">build · push</text>
+  <path d="M632,200 L662,271" stroke="#8430ce" stroke-width="1.8" fill="none" stroke-dasharray="5 4" marker-end="url(#aPurple)"/>
+  <path d="M805,200 L722,271" stroke="#8430ce" stroke-width="1.8" fill="none" stroke-dasharray="5 4" marker-end="url(#aPurple)"/>
+
+  <!-- Orange external (trunk + branches, lane y=360) -->
+  <path d="M700,327 L700,360 L1017,360 L1017,590" stroke="#e8710a" stroke-width="2" fill="none"/>
+  <text x="782" y="352" font-size="11" fill="#e8710a" text-anchor="middle">외부 API 호출</text>
+  <path d="M1017,461 L1056,461" stroke="#e8710a" stroke-width="2" fill="none" marker-end="url(#aOrange)"/>
+  <path d="M1017,524 L1056,524" stroke="#e8710a" stroke-width="2" fill="none" marker-end="url(#aOrange)"/>
+  <path d="M1017,590 L1056,590" stroke="#e8710a" stroke-width="2" fill="none" marker-end="url(#aOrange)"/>
+  <!-- FCM branch: planned / not wired -->
+  <path d="M1017,590 L1017,654 L1056,654" stroke="#bdc1c6" stroke-width="1.6" fill="none" stroke-dasharray="4 3" marker-end="url(#aGray)"/>
+
+  <!-- Gray storage + logs (dashed) -->
+  <path d="M640,327 L636,418" stroke="#5f6368" stroke-width="1.7" fill="none" stroke-dasharray="5 4" marker-end="url(#aGray)"/>
+  <path d="M742,327 L802,418" stroke="#5f6368" stroke-width="1.7" fill="none" stroke-dasharray="5 4" marker-end="url(#aGray)"/>
+  <text x="752" y="392" font-size="11" fill="#5f6368" text-anchor="end">logs</text>
+
+  <!-- ===================== NODES ===================== -->
+  <!-- Clients -->
+  <g><rect x="45" y="225" width="160" height="52" rx="9" fill="#E8F0FE" stroke="#1a73e8" stroke-width="1.4"/>
+    <text x="125" y="248" font-size="12.5" font-weight="600" fill="#174ea6" text-anchor="middle">모바일 앱</text>
+    <text x="125" y="265" font-size="10.5" fill="#5f6368" text-anchor="middle">환자 · 보호자</text></g>
+
+  <g><rect x="45" y="290" width="160" height="52" rx="9" fill="#E8F0FE" stroke="#1a73e8" stroke-width="1.4"/>
+    <text x="125" y="313" font-size="12.5" font-weight="600" fill="#174ea6" text-anchor="middle">웹 콘솔</text>
+    <text x="125" y="330" font-size="10.5" fill="#5f6368" text-anchor="middle">관리자 · 직원</text></g>
+
+  <g><rect x="45" y="150" width="160" height="50" rx="9" fill="#F3E8FD" stroke="#8430ce" stroke-width="1.4"/>
+    <text x="125" y="172" font-size="12.5" font-weight="600" fill="#6b1fb1" text-anchor="middle">GitHub Actions</text>
+    <text x="125" y="189" font-size="10.5" fill="#5f6368" text-anchor="middle">CI/CD</text></g>
+
+  <!-- CloudFront -->
+  <g><rect x="270" y="273" width="125" height="54" rx="9" fill="#E8F0FE" stroke="#1a73e8" stroke-width="1.4"/>
+    <text x="332" y="296" font-size="12.5" font-weight="600" fill="#174ea6" text-anchor="middle">CloudFront</text>
+    <text x="332" y="314" font-size="10.5" fill="#5f6368" text-anchor="middle">CDN · /api→/v1</text></g>
+
+  <!-- ALB -->
+  <g><rect x="440" y="273" width="115" height="54" rx="9" fill="#E8F0FE" stroke="#1a73e8" stroke-width="1.4"/>
+    <text x="497" y="296" font-size="13" font-weight="600" fill="#174ea6" text-anchor="middle">ALB</text>
+    <text x="497" y="314" font-size="10.5" fill="#5f6368" text-anchor="middle">HTTPS / TLS</text></g>
+
+  <!-- EC2 -->
+  <g><rect x="600" y="273" width="160" height="54" rx="9" fill="#E8F0FE" stroke="#1a73e8" stroke-width="1.9"/>
+    <text x="680" y="296" font-size="13" font-weight="700" fill="#174ea6" text-anchor="middle">EC2 · FastAPI</text>
+    <text x="680" y="314" font-size="10.5" fill="#5f6368" text-anchor="middle">앱 컨테이너 (Docker :8001)</text></g>
+
+  <!-- ECR -->
+  <g><rect x="560" y="150" width="140" height="50" rx="9" fill="#F1F3F4" stroke="#5f6368" stroke-width="1.4"/>
+    <text x="630" y="172" font-size="12.5" font-weight="600" fill="#3c4043" text-anchor="middle">ECR</text>
+    <text x="630" y="189" font-size="10.5" fill="#5f6368" text-anchor="middle">이미지 레지스트리</text></g>
+
+  <!-- SSM -->
+  <g><rect x="720" y="150" width="185" height="50" rx="9" fill="#F1F3F4" stroke="#5f6368" stroke-width="1.4"/>
+    <text x="812" y="172" font-size="12.5" font-weight="600" fill="#3c4043" text-anchor="middle">SSM Run Command</text>
+    <text x="812" y="189" font-size="10.5" fill="#5f6368" text-anchor="middle">EC2 무중단 배포</text></g>
+
+  <!-- S3 -->
+  <g><rect x="560" y="420" width="155" height="52" rx="9" fill="#F1F3F4" stroke="#5f6368" stroke-width="1.4"/>
+    <text x="637" y="442" font-size="12.5" font-weight="600" fill="#3c4043" text-anchor="middle">S3</text>
+    <text x="637" y="459" font-size="10" fill="#5f6368" text-anchor="middle">VOC 사진 · presigned</text></g>
+
+  <!-- CloudWatch -->
+  <g><rect x="735" y="420" width="175" height="52" rx="9" fill="#F1F3F4" stroke="#5f6368" stroke-width="1.4"/>
+    <text x="822" y="442" font-size="12.5" font-weight="600" fill="#3c4043" text-anchor="middle">CloudWatch Logs</text>
+    <text x="822" y="459" font-size="10" fill="#5f6368" text-anchor="middle">관측성</text></g>
+
+  <!-- MSSQL (NCP) -->
+  <g><rect x="1065" y="272" width="285" height="56" rx="10" fill="#CEEAD6" stroke="#188038" stroke-width="1.9"/>
+    <text x="1207" y="296" font-size="13.5" font-weight="700" fill="#0d652d" text-anchor="middle">Cloud DB for MSSQL</text>
+    <text x="1207" y="316" font-size="10.5" fill="#3c4043" text-anchor="middle">eun_pix · eun_gw (roster 공유 인스턴스)</text></g>
+
+  <!-- External nodes -->
+  <g><rect x="1060" y="436" width="290" height="50" rx="9" fill="#FEEFE3" stroke="#e8710a" stroke-width="1.4"/>
+    <text x="1205" y="455" font-size="12.5" font-weight="600" fill="#a8500a" text-anchor="middle">OpenAI · gpt-4.1-mini</text>
+    <text x="1205" y="472" font-size="10.5" fill="#5f6368" text-anchor="middle">AI 답변·요약 · VOC 감성분석(ABSA)</text></g>
+
+  <g><rect x="1060" y="500" width="290" height="48" rx="9" fill="#FEEFE3" stroke="#e8710a" stroke-width="1.4"/>
+    <text x="1205" y="519" font-size="12" font-weight="600" fill="#a8500a" text-anchor="middle">NICE 통합인증</text>
+    <text x="1205" y="535" font-size="10" fill="#5f6368" text-anchor="middle">본인확인 (CI/DI, at-rest 암호화)</text></g>
+
+  <g><rect x="1060" y="562" width="290" height="56" rx="9" fill="#FEEFE3" stroke="#e8710a" stroke-width="1.4"/>
+    <text x="1205" y="585" font-size="12" font-weight="600" fill="#a8500a" text-anchor="middle">Meditong 그룹웨어 · ASP</text>
+    <text x="1205" y="603" font-size="10.5" fill="#5f6368" text-anchor="middle">SSO 검증 · 온보딩 (gw.meditong.com)</text></g>
+
+  <g><rect x="1060" y="632" width="290" height="44" rx="9" fill="#f7f7f7" stroke="#bdc1c6" stroke-width="1.3" stroke-dasharray="4 3"/>
+    <text x="1205" y="651" font-size="12" font-weight="600" fill="#9aa0a6" text-anchor="middle">Firebase FCM · 푸시</text>
+    <text x="1205" y="667" font-size="10" fill="#9aa0a6" text-anchor="middle">계획 · 미연동(stub)</text></g>
+
+  <!-- ===================== LEGEND ===================== -->
+  <g font-size="11.5" fill="#3c4043">
+    <line x1="240" y1="762" x2="270" y2="762" stroke="#1a73e8" stroke-width="2.2"/>
+    <text x="277" y="766">요청·처리 흐름</text>
+    <line x1="395" y1="762" x2="425" y2="762" stroke="#188038" stroke-width="2.2"/>
+    <text x="432" y="766">DB 접근 (MSSQL)</text>
+    <line x1="565" y1="762" x2="595" y2="762" stroke="#5f6368" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <text x="602" y="766">로그·저장 (S3·CW)</text>
+    <line x1="748" y1="762" x2="778" y2="762" stroke="#e8710a" stroke-width="2"/>
+    <text x="785" y="766">외부 API·알림</text>
+    <line x1="915" y1="762" x2="945" y2="762" stroke="#8430ce" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <text x="952" y="766">배포 (CI/CD · SSM)</text>
+  </g>
+
+  <!-- Footnote -->
+  <text x="40" y="789" font-size="10.5" fill="#80868b">* 배포: GitHub Actions → ECR → SSM Run Command → EC2 raw Docker(:8001).  ECS/Fargate(aide-prod-cluster)는 롤백 전용(deprecated).  시크릿은 EC2 /home/ubuntu/pix/.env 로 주입(런타임 SSM 미사용).</text>
+  <text x="40" y="804" font-size="10.5" fill="#80868b">* SMS는 그룹웨어 sc_tran 큐(MSSQL) INSERT → 외부 워커 발송.  인앱 알림은 DB(tb_pix_notification) 저장, 실제 푸시(FCM)·BERT 감성 사이드카는 미연동.  감성분석은 현재 100% OpenAI.</text>
+</svg>
