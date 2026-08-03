@@ -80,3 +80,19 @@ AIDE_DUMP_CASE=tools/infeasible_cases/cases \
 진단 함수(`explain_infeasibility_from_config`, `detect_banned_off_conflict`,
 `per_nurse_night_feasible`, `cause_to_resolution_options`)는 **순수**(DB·솔버 불필요)라
 케이스 dict 만으로 완결적으로 돈다. JSON 을 고치면 진단이 그대로 반응한다.
+
+## Baseline 비교 실험
+
+```bash
+.venv/bin/python tools/infeasible_cases/baseline.py
+```
+같은 N축 부분문제에서 세 방법 정량 비교:
+
+| 방법 | N축 원인 격리 | 비용 | 산출 |
+|---|---|---|---|
+| Tier1 (max-flow only) | 20% | 1 검사 | 시퀀스·결합 놓침 |
+| QuickXplain (IIS) | 100% | ~9.6 oracle 호출 | 제약집합(비행동) |
+| **branch-infer (우리)** | 100% | **1 진단** | 행동가능 typed certificate + proof + 검증복구 |
+
+→ IIS 최소화의 반복 oracle 없이 sound·행동가능 원인. (실서비스 일반축은 oracle=솔버라
+  branch-and-check로 확장; N축은 자기완결.)
