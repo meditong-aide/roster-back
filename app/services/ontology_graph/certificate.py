@@ -70,6 +70,16 @@ def _cert_phrase(c: Certificate) -> str:
         day = f"{d + 1}일" if isinstance(d, int) else "특정일"
         return (f"결합 배열이 {day}에 붕괴 — 그날 낼 수 있는 최대 야간 {int(c.capacity)} "
                 f"< 필요 {int(c.demand)}(각자는 가능하나 함께는 불가)")
+    if c.kind == "recovery_off_starvation":
+        d = c.witness.get("day")
+        day = f"{d + 1}일" if isinstance(d, int) else "특정일"
+        return (f"{day}: 야간 회복(실제 OFF)·강제 OFF 가 인원을 잠식 — 근무 가능 "
+                f"{int(c.capacity)}명 < 필요 슬롯 {int(c.demand)}(회복 OFF vs 커버리지 충돌)")
+    if c.kind == "joint_sequencing_collapse":
+        d = c.witness.get("day")
+        day = f"{d + 1}일" if isinstance(d, int) else "특정일"
+        return (f"{day}: 인원은 충분하나 개인 시퀀스·전이 규칙과 D/E/N 을 **동시**에 "
+                f"만족하는 배정이 없음(정수 결합 붕괴)")
     return c.one_line()
 
 

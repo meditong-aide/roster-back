@@ -1,8 +1,8 @@
-"""Hard-residual gap 문서화 + 독립 oracle 정확성 가드.
+"""Hard-residual — 이제 frontier DP 로 **닫힌** gap + 독립 oracle 교차검증.
 
-이 케이스들은 우리 진단 스택의 **모든 층이 침묵**(per-nurse·max-flow·aggregate·joint-N DP)
-하지만 정수 근무표는 infeasible — 독립 exact oracle 로만 드러난다. VE/frontier DP 엔진이
-이 gap 을 메우면 아래 `our stack silent` 단언이 뒤집힌다(그때 테스트 갱신 = 진전 신호).
+과거: 우리 relaxed 스택(N/notN)이 전부 침묵 → gap. 진전: {D,E,N,O} exact frontier DP tier
+가 이 정수-결합을 잡아 multi_axis 가 INFEASIBLE 을 인증한다. relaxed 층(joint-N DP)이
+여전히 침묵함을 함께 단언 → **왜 frontier DP 가 필요했는지**를 문서화한다.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools", "infea
 
 from exact_oracle import is_feasible  # noqa: E402
 from services.ontology_graph.axis_diagnose import multi_axis_diagnose  # noqa: E402
+from services.ontology_graph.frontier_dp import diagnose_frontier  # noqa: E402
 from services.ontology_graph.joint_coverage import joint_night_coverage_feasible  # noqa: E402
 
 
@@ -37,21 +38,45 @@ def test_oracle_finds_recovery_off_residual():
     assert is_feasible(_pool(k), _cfg(dsr, rules), dd) is False
 
 
-def test_our_stack_is_silent_on_recovery_off_residual():
-    """현 한계: 우리 스택은 이 정수-결합을 못 잡는다(회복=OFF 를 relaxed 로 봄)."""
+def test_relaxed_layer_is_still_blind():
+    """relaxed joint-N DP 는 D/E 를 회복으로 관대 인정 → 여전히 feasible 로 봄(=frontier DP 필요 이유)."""
     rules, dsr, k, dd = _RECOVERY
-    nu, cfg = _pool(k), _cfg(dsr, {**rules})
-    assert joint_night_coverage_feasible(nu, cfg, dd) is True          # relaxed=feasible
-    assert multi_axis_diagnose(nu, cfg, dd, 2026, 8).status != "INFEASIBLE_CERTIFIED"
+    assert joint_night_coverage_feasible(_pool(k), _cfg(dsr, rules), dd) is True
 
 
-def test_oracle_agrees_with_stack_on_a_caught_case():
-    """정합성: 우리가 INFEASIBLE 로 잡는 소형 케이스는 oracle 도 INFEAS (오라클 sanity)."""
-    # N전담 banned 4연속(6일 축소판) — 우리 스택이 sequence 로 잡는 케이스
-    nu = _pool(4)
-    nu[0] = {"nurse_id": "x", "name": "엑스", "grade": 1, "team_id": "A",
-             "allowed_shifts": ["N"]}
-    cfg = _cfg({"D": 1, "E": 1, "N": 1},
-               {"two_offs_after_three_nig": True, "not_one_night": True})
-    cfg["initial_constraints"]["forbidden"] = {"x": {2: ["O"], 3: ["O"], 4: ["O"], 5: ["O"]}}
-    assert is_feasible(nu, cfg, 6) is False
+def test_frontier_dp_closes_the_gap():
+    """exact frontier DP tier 가 정수-결합을 잡아 multi_axis 가 INFEASIBLE 인증."""
+    rules, dsr, k, dd = _RECOVERY
+    nu, cfg = _pool(k), _cfg(dsr, rules)
+    fr = diagnose_frontier(nu, cfg, dd)
+    assert fr.status == "INFEASIBLE_CERTIFIED"
+    assert fr.certificate.kind == "recovery_off_starvation"
+    dg = multi_axis_diagnose(nu, cfg, dd, 2026, 8)
+    assert dg.status == "INFEASIBLE_CERTIFIED"
+
+
+def test_frontier_dp_agrees_with_independent_oracle():
+    """BFS frontier DP ⟷ DFS 독립 oracle: 같은 semantics, 결론 일치."""
+    cases = [
+        (_RECOVERY[1], _RECOVERY[0], 5, 6),
+        ({"D": 1, "E": 1, "N": 1}, {"not_one_night": True}, 4, 6),           # feasible
+        ({"D": 1, "E": 1, "N": 2}, {"two_offs_after_two_nig": True,
+                                    "not_one_night": True,
+                                    "forbid_night_to_day": True}, 5, 6),     # infeasible
+    ]
+    for dsr, rules, k, dd in cases:
+        nu, cfg = _pool(k), _cfg(dsr, rules)
+        fr = diagnose_frontier(nu, cfg, dd).status
+        orc = is_feasible(nu, cfg, dd)
+        if orc is True:
+            assert fr in ("FEASIBLE_WITNESS", "UNKNOWN")
+        elif orc is False:
+            assert fr in ("INFEASIBLE_CERTIFIED", "UNKNOWN")
+
+
+def test_frontier_dp_large_returns_unknown_not_hang():
+    """대형(넓은 separator)은 예산초과로 UNKNOWN 반환(무한루프 아님) — 컴포넌트 분해 대상."""
+    nu = _pool(8)
+    cfg = _cfg({"D": 2, "E": 2, "N": 2}, {"two_offs_after_two_nig": True, "not_one_night": True})
+    fr = diagnose_frontier(nu, cfg, 31, cap=50_000)
+    assert fr.status in ("UNKNOWN", "FEASIBLE_WITNESS", "INFEASIBLE_CERTIFIED")

@@ -119,5 +119,20 @@ notN=D/E 도 회복으로 관대 인정). 그래서 다음을 **모두 통과**(
 | `hard_residual_night_to_day_ban` | ✓ | ✓ | ✓ | ✓feasible | **INFEAS** | 침묵 |
 
 이 gap(정수-결합 잔여)이 **variable-elimination / frontier DP 엔진**(미니 솔버 대체)의 대상이다.
-VE 엔진이 이 케이스를 잡으면 `tests/test_hard_residual.py` 의 "our stack silent" 단언이
-뒤집힌다(= 진전 신호). oracle 은 소형(≤12일·≤8명) 전용 — 대형은 SKIP.
+oracle 은 소형(≤12일·≤8명) 전용 — 대형은 SKIP.
+
+### frontier DP 엔진이 gap 을 닫음 (app/services/ontology_graph/frontier_dp.py)
+
+`diagnose_frontier` 는 {D,E,N,O} 를 **exact** 로 판정하는 frontier DP(=variable elimination/
+bucket DP)다. nurse×day 격자에서 일별 joint 상태 frontier 를 전개, 붕괴하면 **backpointer 로
+원인 certificate** 추출:
+- `recovery_off_starvation` — 야간 회복(실제 OFF)이 인원을 잠식해 그날 슬롯 미달.
+- `joint_sequencing_collapse` — 인원은 되나 시퀀스·전이로 D/E/N 동시배정 불가.
+
+검증: 두 hard-residual 모두 **INFEASIBLE_CERTIFIED 로 포획**, 독립 oracle(DFS)과 **불일치 0**.
+multi_axis_diagnose 에 exact tier 로 배선(완화 층이 침묵할 때만 호출). 이제
+`test_hard_residual.py` 는 "gap 닫힘"을 단언한다(relaxed joint-N DP 는 여전히 blind =
+frontier DP 가 필요했던 이유를 함께 문서화).
+
+경계: |frontier| 이 cap·전개예산 초과하는 **대형(넓은 separator)** 은 UNKNOWN 반환(무한루프
+아님). 이 경우 **병목 window/간호사 component 로 분해**해 폭을 낮추면 exact 유지 — 다음 단계.

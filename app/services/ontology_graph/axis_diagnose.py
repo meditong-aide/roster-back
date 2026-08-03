@@ -52,13 +52,20 @@ def coverage_certificates(nurses: list, config: dict, year: int, month: int) -> 
 
 def multi_axis_diagnose(nurses: list, config: dict, num_days: int,
                         year: int, month: int) -> AxisDiagnosis:
-    """커버리지(D/E/N) + N-시퀀스 통합 → argmin-surplus 그룹 지목."""
+    """커버리지(D/E/N) + N-시퀀스 + {D,E,N,O} exact frontier DP 통합 → argmin-surplus 지목."""
     certs = coverage_certificates(nurses, config, year, month)
     night = diagnose_night_axis(nurses, config, num_days)
     if night.status == INFEASIBLE and night.certificate is not None:
         certs.append(night.certificate)
+    # exact 결합 tier: 완화 층(위)이 침묵할 때만, 정수-결합 잔여를 frontier DP 로 판정.
+    # (회복=실제 OFF·동시 커버리지·전이 — N/notN 이 놓치는 것. 대형은 예산초과→UNKNOWN.)
+    if not certs:
+        from services.ontology_graph.frontier_dp import diagnose_frontier
+        fr = diagnose_frontier(nurses, config, num_days)
+        if fr.status == INFEASIBLE and fr.certificate is not None:
+            certs.append(fr.certificate)
     if not certs and night.status != INFEASIBLE:
-        # 커버리지 부족 없음 + N축도 원인 아님 → 이 축들로는 못 봄
+        # 모든 층 침묵 → 이 축들로는 못 봄
         return AxisDiagnosis(status=night.status, night=night)
     primary = max(certs, key=lambda c: c.deficit) if certs else None
     return AxisDiagnosis(
