@@ -68,6 +68,11 @@ REGENERATE_ID_TABLES = {
     "nurse_allowed_shift_period",
     "nurse_weekendoff_period",
     "nurse_preceptee_period",
+    # office 102243 전수 마이그에서 실제 충돌(2627) — dev id=2614 를 office 102527 이 점유.
+    #   prod 102243 의 id 범위 2238~2643 과 dev 타 office 행이 3건 겹쳤다.
+    #   ShiftManage.id 를 FK 로 참조하는 코드 없음(확인) · 스코프는
+    #   office_id+group_id+year+month+shift_slot+nurse_class 로 유지되므로 재발번 안전.
+    "shift_manage",
 }
 
 # (table, mode) — FK 부모 → 자식 순서
