@@ -96,3 +96,28 @@ AIDE_DUMP_CASE=tools/infeasible_cases/cases \
 
 → IIS 최소화의 반복 oracle 없이 sound·행동가능 원인. (실서비스 일반축은 oracle=솔버라
   branch-and-check로 확장; N축은 자기완결.)
+
+> ⚠️ 한계(정직): 지금 QuickXplain 의 oracle 이 **우리 진단기 자신**이라 순환이다. "IIS 대비
+> 우수"가 아니라 **내부 PoC 검증**일 뿐. 정식 비교엔 아래 독립 oracle + 실행시간 + 실코퍼스가
+> 필요(`baseline_v2` TODO).
+
+## 독립 exact oracle + hard-residual (VE 엔진의 존재 이유)
+
+```bash
+.venv/bin/python tools/infeasible_cases/exact_oracle.py    # oracle vs 우리 스택
+.venv/bin/python tools/infeasible_cases/make_hard_residual.py  # 반례 생성(자기검증)
+```
+
+`exact_oracle.py` 는 우리 진단기와 **무관한** ground-truth 판정기(소형 인스턴스 backtracking).
+우리 스택과의 결정적 차이 = **회복(recovery)은 실제 OFF** 여야 한다(우리 N/notN 오토마톤은
+notN=D/E 도 회복으로 관대 인정). 그래서 다음을 **모두 통과**(우리 스택 전층 침묵)하는데도
+정수 근무표가 infeasible 인 **hard-residual** 이 존재한다:
+
+| 케이스 | per-nurse | max-flow | aggregate | joint-N DP | oracle | 우리 |
+|---|---|---|---|---|---|---|
+| `hard_residual_recovery_off_starvation` | ✓ | ✓ | ✓ | ✓feasible | **INFEAS** | 침묵 |
+| `hard_residual_night_to_day_ban` | ✓ | ✓ | ✓ | ✓feasible | **INFEAS** | 침묵 |
+
+이 gap(정수-결합 잔여)이 **variable-elimination / frontier DP 엔진**(미니 솔버 대체)의 대상이다.
+VE 엔진이 이 케이스를 잡으면 `tests/test_hard_residual.py` 의 "our stack silent" 단언이
+뒤집힌다(= 진전 신호). oracle 은 소형(≤12일·≤8명) 전용 — 대형은 SKIP.
