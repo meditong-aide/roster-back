@@ -199,7 +199,27 @@ memoize. 재구성 교차검증으로 correctness 유지 확인(불일치 0). **
 날짜 전체 1개로 뒀기에 시간축 분할 boundary=전체 prefix(state 추상화 없음) → **dense 에선 캐시
 무력, UNKNOWN**(9s 내 bounded). 캐시 이득은 sparse·반복 subproblem 한정.
 
-**경계(정직)**: generic conditioning 은 **dense 시간격자에선 비효율**(→UNKNOWN). 밀집 시간축은
-frontier DP 의 temporal sweep(상태 추상화 O)이 적합 → 둘은 **상보적**. 진짜 dense 효율은 (a)
-상태변수 transition factor 분해 또는 (b) hybrid(component 분리→각 component frontier DP sweep)
-필요 — 둘 다 미구현. 그 외 미구현: 부분-교환 그룹 대칭.
+**경계**: generic conditioning 은 dense 시간격자에선 비효율(→UNKNOWN). 아래 hybrid 가 이를 해소.
+
+## Hybrid inference (component conditioning + component frontier DP)
+
+`app/services/ontology_graph/hybrid_solver.py` — 피드백 핵심: 큰 결합을 **separator conditioning
+으로 희소화**하고, 분리된 각 component 내부의 **조밀한 시간·시퀀스 결합은 frontier DP 로 압축**해
+exact 하게 푼다. `solve_hybrid` = factor graph component 분해 → 각 component 를 담당 per-day
+커버리지로 frontier DP sweep → AND.
+
+전제(step0, frontier_dp.py): component 경계로 나르는 건 근무값이 아니라 joint **BoundaryState**
+(r·k·w·prev). `frontier_message(entry_frontier)→exit_frontier` 가 그 계약이고 **합성 정확성**
+(message(0,mid)∘message(mid,D)==message(0,D), 398/0) 로 검증. terminal_ok(lenient|strict).
+최소 rejection trace(day·dead/live·best_cov·binding)를 붕괴 cert 에 처음부터 심음.
+
+**실측(2 seed, 681건 oracle 교차검증): falseINFEASIBLE 0, falseFEASIBLE 0.** payoff:
+- dense 회복 starvation: 1 component → frontier DP → **INFEASIBLE 0.001s**(plain conditioning
+  은 UNKNOWN 이었음. hybrid 가 dense 를 frontier DP 로 귀결시켜 해결).
+- sparse 2그룹: **2 component 분리** 각각 frontier DP(sizes (3,3)).
+버그 2개 교차검증으로 발견·수정: ①component 밖 강제 간호사 기여 누락(falseINF) ②component 안
+강제 간호사 이중차감(falseFEAS). 회귀 테스트로 잠금.
+
+**미구현(재귀)**: component 가 여전히 wide 면 그 안에서 separator conditioning→재분해→frontier DP
+(현재 wide component=UNKNOWN). BoundaryState·message 계약은 준비돼 얹기만 하면 됨. 그 외: 부분-교환
+그룹 대칭, certificate-guided separator(deficit·붕괴일 활용), proof→repair 합성.

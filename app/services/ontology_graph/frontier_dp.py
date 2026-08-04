@@ -225,17 +225,19 @@ class MessageResult:
 
 def frontier_message(prepped: list, config: dict, day_lo: int, day_hi: int,
                      entry: set, *, symmetry: bool | None = None, cap: int = _CAP,
-                     budget: list | None = None, terminal: str = "lenient") -> MessageResult:
+                     budget: list | None = None, terminal: str = "lenient",
+                     day_reqs: dict | None = None) -> MessageResult:
     """[day_lo, day_hi) 를 sweep — **진입 BoundaryState 집합 → 출구 BoundaryState 집합**.
 
     이것이 component 를 잇는 message(M(entry, sep) → exit). 붕괴 시 exit 비고 RejectionStats.
-    budget 은 공유 가능한 mutable([int]) — 여러 component 에 걸쳐 전개예산 공유.
+    budget 은 공유 가능한 mutable([int]). day_reqs: {day: (rD,rE,rN)} per-day 커버리지 override
+    (component 가 담당하는 날만 부과; 없으면 config 균일값). hybrid 에서 component 별로 씀.
     """
     max_run, rec_trig, min_run = _night_rules(config)
     track_w = config.get("max_consecutive_work") is not None
     track_prev = bool(config.get("forbid_night_to_day"))
-    reqD, reqE, reqN = _req(config, "D"), _req(config, "E"), _req(config, "N")
-    reqs = (reqD, reqE, reqN)
+    reqD0, reqE0, reqN0 = _req(config, "D"), _req(config, "E"), _req(config, "N")
+    reqs = (reqD0, reqE0, reqN0)
     k = len(prepped)
     if symmetry is None:
         symmetry = _interchangeable(prepped, day_lo, day_hi)
@@ -245,6 +247,7 @@ def frontier_message(prepped: list, config: dict, day_lo: int, day_hi: int,
     if budget is None:
         budget = [_EXPAND_BUDGET]
     for d in range(day_lo, day_hi):
+        reqD, reqE, reqN = day_reqs[d] if (day_reqs and d in day_reqs) else (reqD0, reqE0, reqN0)
         nxt: set = set()
         dead = live = 0
         maxD = maxE = maxN = 0
@@ -278,8 +281,8 @@ def frontier_message(prepped: list, config: dict, day_lo: int, day_hi: int,
         if not nxt:
             binding = tuple(s for s, mx, rq in (("D", maxD, reqD), ("E", maxE, reqE),
                                                 ("N", maxN, reqN)) if mx < rq)
-            rej = RejectionStats(d, dead, live, (maxD, maxE, maxN), reqs, binding,
-                                 frozenset(frontier))
+            rej = RejectionStats(d, dead, live, (maxD, maxE, maxN), (reqD, reqE, reqN),
+                                 binding, frozenset(frontier))
             return MessageResult(frozenset(), rej, width_max)
         width_max = max(width_max, len(nxt))
         frontier = nxt
