@@ -29,11 +29,23 @@ def test_supported_scope_returns_none():
     assert exact_or_unknown(nu, _cfg()) is None
 
 
-def test_monthly_quota_flags_unmodeled():
-    nu = [{"nurse_id": "n0", "n_exact": 13}, {"nurse_id": "n1"}]
-    assert "nurse.n_exact" in unmodeled_active(nu, _cfg())
-    assert diagnose_frontier(nu, _cfg(), 5).status == "UNKNOWN"
-    assert solve_hybrid(nu, _cfg(), 5).status == "UNKNOWN"
+def test_monthly_quota_gates_feasible_only():
+    """비대칭: 미지원(n_exact) + 지원 subset FEASIBLE → UNKNOWN. subset INFEASIBLE → 그대로."""
+    # 지원 subset 이 feasible 한 넉넉 케이스(6명>3슬롯) → 미지원 제약 때문에 UNKNOWN
+    nu_feas = [{"nurse_id": f"n{i}"} for i in range(6)]
+    nu_feas[0]["n_exact"] = 13
+    assert "nurse.n_exact" in unmodeled_active(nu_feas, _cfg())
+    assert diagnose_frontier(nu_feas, _cfg(), 5).status == "UNKNOWN"
+    assert solve_hybrid(nu_feas, _cfg(), 5).status == "UNKNOWN"
+
+
+def test_infeasible_subset_returned_despite_unmodeled():
+    """지원 subset 이 이미 INFEASIBLE 이면 미지원 제약이 있어도 certificate 그대로(sound)."""
+    # 2명인데 D1E1N1=3슬롯/일 → 지원 subset(커버리지)만으로 infeasible
+    nu = [{"nurse_id": "n0", "n_exact": 13}, {"nurse_id": "n1", "is_weekend_off": True}]
+    assert unmodeled_active(nu, _cfg())              # 미지원 활성
+    assert diagnose_frontier(nu, _cfg(), 5).status == "INFEASIBLE_CERTIFIED"
+    assert solve_hybrid(nu, _cfg(), 5).status == "INFEASIBLE_CERTIFIED"
 
 
 def test_config_level_unmodeled_flags():
@@ -48,8 +60,8 @@ def test_night_only_via_allowed_is_supported():
     assert exact_or_unknown(nu, _cfg()) is None
 
 
-def test_hybrid_out_of_scope_certificate():
-    nu = [{"nurse_id": "n0", "is_weekend_off": True}, {"nurse_id": "n1"}]
-    r = solve_hybrid(nu, _cfg(), 5)
-    assert r.status == "UNKNOWN"
-    assert r.certificate.kind == "out_of_scope"
+def test_hybrid_feasible_subset_with_unmodeled_is_unknown():
+    """지원 subset FEASIBLE + 미지원(주말휴무) → UNKNOWN(feasible 주장 금지)."""
+    nu = [{"nurse_id": f"n{i}"} for i in range(6)]
+    nu[0]["is_weekend_off"] = True
+    assert solve_hybrid(nu, _cfg(), 5).status == "UNKNOWN"

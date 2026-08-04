@@ -85,13 +85,11 @@ def _solve_component(cvars: set, cfacs: list, prep: list, config: dict, num_days
 
 def solve_hybrid(nurses: list, config: dict, num_days: int,
                  budget: int = 6_000_000, cap: int = 200_000) -> HybridResult:
-    """component 분해 → 각 component frontier DP → AND."""
-    from services.ontology_graph.scope_manifest import exact_or_unknown
-    reason = exact_or_unknown(nurses, config)
-    if reason:                                    # 미지원 hard constraint → exact 주장 금지
-        return HybridResult("UNKNOWN", components=0, certificate=Certificate(
-            kind="out_of_scope", group_id="manifest", capacity=0, demand=0, deficit=0,
-            antecedents=[reason], witness={"unmodeled": reason}))
+    """component 분해 → 각 component frontier DP → AND.
+
+    비대칭 scope: INFEASIBLE(지원 subset)은 미지원 제약 있어도 그대로 반환(sound). FEASIBLE 만
+    미지원 제약 있으면 UNKNOWN.
+    """
     prep = _prep(nurses, config)
     fg = build_factor_graph(nurses, config, num_days)
     if any(len(dom) == 0 for dom in fg.variables.values()):
@@ -147,4 +145,6 @@ def solve_hybrid(nurses: list, config: dict, num_days: int,
             unknown = True                          # 이 component 판정 실패(=wide)
     if unknown:
         return HybridResult("UNKNOWN", components=len(comps), component_sizes=sizes)
-    return HybridResult("FEASIBLE_WITNESS", components=len(comps), component_sizes=sizes)
+    from services.ontology_graph.scope_manifest import gate_feasible
+    return HybridResult(gate_feasible("FEASIBLE_WITNESS", nurses, config),
+                        components=len(comps), component_sizes=sizes)

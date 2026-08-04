@@ -336,10 +336,9 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
     """{D,E,N,O} exact frontier DP 판정 + 붕괴 certificate. (frontier_message 의 fresh→end 특수화.)
 
     symmetry: 교환가능 간호사 상태 정렬 축소(None=자동). terminal: lenient(cross-month)|closed(자기완결).
+    비대칭 scope: 지원 subset 의 INFEASIBLE 은 미지원 제약이 있어도 그대로 반환(sound). FEASIBLE 만
+    미지원 제약 있으면 UNKNOWN 으로 강등(아래 마지막 return).
     """
-    from services.ontology_graph.scope_manifest import exact_or_unknown
-    if exact_or_unknown(nurses, config):          # 미지원 hard constraint 활성 → exact 주장 금지
-        return FrontierResult(UNKNOWN, reqs=(_req(config, "D"), _req(config, "E"), _req(config, "N")))
     prepped = _prep(nurses, config)
     max_run, rec_trig, min_run = _night_rules(config)
     reqs = (_req(config, "D"), _req(config, "E"), _req(config, "N"))
@@ -359,7 +358,9 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
         cert.witness["rejection"] = trace
         return FrontierResult(INFEASIBLE, certificate=cert, collapse_day=rej.day,
                               width_max=mr.width_max, reqs=reqs)
-    return FrontierResult(FEASIBLE, width_max=mr.width_max, reqs=reqs)
+    from services.ontology_graph.scope_manifest import gate_feasible
+    return FrontierResult(gate_feasible(FEASIBLE, nurses, config),
+                          width_max=mr.width_max, reqs=reqs)
 
 
 def diagnose_frontier_node(nurses: list, config: dict, num_days: int) -> ProofNode:

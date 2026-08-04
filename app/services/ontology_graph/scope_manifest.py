@@ -71,3 +71,17 @@ def exact_or_unknown(nurses: list, config: dict) -> str | None:
     if um:
         return "미지원 hard constraint 활성: " + ", ".join(sorted(set(um)))
     return None
+
+
+def gate_feasible(status: str, nurses: list, config: dict) -> str:
+    """**비대칭 scope**: 지원 subset 의 INFEASIBLE 은 항상 sound(제약 추가로 feasible 안 됨) →
+    그대로 반환. FEASIBLE 주장만 미지원 제약 있으면 UNKNOWN 으로 강등. UNKNOWN 은 그대로.
+
+    subset ⊆ full 이므로 subset infeasible ⟹ full infeasible(certificate 유효). 반대로 subset
+    feasible 은 미지원 제약이 깰 수 있어 full feasible 을 보장 못 함.
+    """
+    if status == "INFEASIBLE_CERTIFIED":
+        return status
+    if status == "FEASIBLE_WITNESS" and unmodeled_active(nurses, config):
+        return "UNKNOWN"
+    return status
