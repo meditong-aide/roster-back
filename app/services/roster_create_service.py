@@ -5666,6 +5666,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _inbound_assignments=_inbound_assignments,
             _outbound_assignments=_outbound_assignments,
         )
+        # 운영 primary solve 표준 상태를 shadow 로 상관로깅(env 게이팅, 무영향). graph 로그(presolve
+        # 훅)와 input_hash 로 join → production↔graph 비교. 실패해도 운영 무영향.
+        try:
+            from services.ontology_graph.production_adapter import standardize_status
+            from services.ontology_graph.shadow_diagnosis import log_production_status
+            _prod_status = standardize_status(roster_system, generated)
+            log_production_status(_nurses_dict_for_precheck, precheck_config,
+                                  req.year, req.month, _prod_status)
+        except Exception:
+            pass
         # _debug_log(
         #     "cp_sat_end",
         #     {

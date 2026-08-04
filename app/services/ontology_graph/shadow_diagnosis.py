@@ -106,6 +106,28 @@ def run_shadow(nurses: list, config: dict, year: int, month: int, *,
     return rec
 
 
+def log_production_status(nurses: list, config: dict, year: int, month: int, status: str, *,
+                          request_id: str | None = None,
+                          production_model_version: str | None = None) -> dict | None:
+    """운영 solve 표준 상태를 **같은 input_hash 로** 로그 → offline 에서 graph 로그와 join.
+
+    (graph 로그는 run_shadow, production 로그는 이 함수. 둘을 input_hash 로 correlate.)
+    """
+    if not shadow_enabled():
+        return None
+    try:
+        num_days = calendar.monthrange(int(year), int(month))[1]
+    except Exception:
+        return None
+    rec = {"kind": "production", "request_id": request_id, "year": year, "month": month,
+           "num_days": num_days, "input_hash": _input_hash(nurses, config, num_days),
+           "production_status": status,
+           "production_model_version": production_model_version,
+           "graph_version": GRAPH_ENGINE_VERSION, "ir_version": IR_SCHEMA_VERSION}
+    _emit(rec)
+    return rec
+
+
 def _emit(rec: dict) -> None:
     line = "[Shadow] " + json.dumps(rec, ensure_ascii=False, default=str)
     print(line)
