@@ -5605,6 +5605,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         except Exception as _psd_exc:
             print(f"[Presolve] 진단 실패(무시): {_psd_exc}")
             presolve_diag = None
+        # 운영 shadow 진단(env AIDE_SHADOW_DIAGNOSIS 게이팅, 기본 off=no-op). 결과 무영향, 로그만.
+        try:
+            from services.ontology_graph.shadow_diagnosis import run_shadow
+            run_shadow(_nurses_dict_for_precheck, precheck_config, req.year, req.month)
+        except Exception:
+            pass
         if has_blocking_issues(precheck_result):
             payload = build_blocking_payload(precheck_result)
             inf = payload.get("infeasibility", {})

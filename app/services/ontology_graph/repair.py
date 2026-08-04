@@ -15,10 +15,19 @@ import copy
 from dataclasses import dataclass
 
 
+# 변경 비용(피드백): 운영상 큰 변경일수록 높게. 최소 변경 + solver-verified 후보를 우선 제시.
+_COST = {
+    "release_forced_off": 5,     # 희망 OFF/고정배정 해제
+    "release_banned": 3,         # 일반 금지조건 해제
+    "reduce_coverage": 100,      # 필수인원 감소(운영상 매우 큰 변경)
+}
+
+
 @dataclass
 class RepairCandidate:
     action: str
     target: dict
+    cost: int = 0                        # 변경 비용(작을수록 선호)
     domain_status: str = "UNKNOWN"       # graph 재판정 status(FEASIBLE/INFEASIBLE/UNKNOWN)
     domain_verified: bool | None = None  # True=FEASIBLE만, False=INFEASIBLE, None=UNKNOWN
     shadow_cpsat: bool | None = None     # 근사 shadow 결과(≠ solver_verified). production 검증 필요
@@ -87,13 +96,14 @@ def verify_repairs(nurses: list, config: dict, num_days: int, max_candidates: in
         # 비대칭/UNKNOWN 락: FEASIBLE_WITNESS 만 domain_verified=True, UNKNOWN=None
         dv = True if st == "FEASIBLE_WITNESS" else (False if st == "INFEASIBLE_CERTIFIED" else None)
         vr = v.check(nurses, cfg2, num_days)
-        rc = RepairCandidate(c["action"], c["target"], domain_status=st, domain_verified=dv)
+        rc = RepairCandidate(c["action"], c["target"], cost=_COST.get(c["action"], 10),
+                             domain_status=st, domain_verified=dv)
         if vr.exact:                              # 운영 exact verifier → 진짜 solver_verified
             rc.solver_verified = (vr.feasible is True)
         else:                                     # 근사 shadow → shadow_cpsat 만
             rc.shadow_cpsat = (vr.feasible is True) if vr.feasible is not None else None
         out.append(rc)
-    # 확정순: solver_verified → domain_verified → shadow
+    # 확정순 → 최소 변경 비용: solver_verified → domain_verified → shadow → cost 오름차순
     out.sort(key=lambda r: (r.solver_verified is not True, r.domain_verified is not True,
-                            r.shadow_cpsat is not True))
+                            r.shadow_cpsat is not True, r.cost))
     return out
