@@ -175,14 +175,62 @@ def _interchangeable(prepped: list, day_lo: int, day_hi: int) -> bool:
     return len({sig(n) for n in prepped}) <= 1
 
 
-def diagnose_frontier(nurses: list, config: dict, num_days: int,
-                      cap: int = _CAP, symmetry: bool | None = None) -> FrontierResult:
-    """{D,E,N,O} exact frontier DP 판정 + 붕괴 certificate.
+# ── BoundaryState 계약 + relation-form message passing (hybrid 의 전제) ───────────
+#
+# BoundaryState(간호사별) = (r, k, w, prev):
+#   r=연속 야간(consecutive_nights), k=회복 OFF 잔여(recovery_off_debt),
+#   w=연속 근무(consecutive_work), prev=직전 shift(전이 규칙용).
+# joint BoundaryState = 간호사별 상태의 튜플. component 를 자를 때 separator 가 나르는 것은
+# 단순 근무값이 아니라 **이 joint BoundaryState** 다(그래야 양쪽이 이어짐). remaining_quota 는
+# 아직 미모델(월 quota 미구현) — 추가 시 상태에 편입 필요.
+#
+# 월초 진입 = fresh (r=k=w=0). 월말 terminal 은 아래 terminal_ok 로 규정.
 
-    symmetry: 교환가능 간호사의 상태를 정렬(multiset)로 접어 순열 폭발 제거(sound).
-              None=자동 감지(구간 전체 교환가능 시 활성).
+def fresh_joint(k: int) -> tuple:
+    return tuple((0, 0, 0, "") for _ in range(k))
+
+
+def terminal_ok(joint_state: tuple, config: dict) -> bool:
+    """월말(또는 자기완결 구간) 종료 허용 상태? strict 모델: 회복빚 없고 너무 짧은 열린 run 없음."""
+    _, _, min_run = _night_rules(config)
+    for (r, k, w, prev) in joint_state:
+        if k > 0:                       # 회복 OFF 미상환
+            return False
+        if 0 < r < min_run:             # min_run 미만 열린 야간 run
+            return False
+    return True
+
+
+@dataclass
+class RejectionStats:
+    """붕괴 지점 최소 proof trace(처음부터 심음 — 나중에 설명 붙이기 위해)."""
+    day: int
+    dead_states: int          # 시퀀스로 사망한(옵션 0) 진입 상태 수
+    live_states: int
+    best_cov: tuple           # (maxD, maxE, maxN) 그날 달성 가능 최대 커버리지
+    reqs: tuple
+    binding: tuple            # 부족했던 shift 들 (예: ("N",))
+    frontier: frozenset = frozenset()   # 붕괴 직전 생존 joint 상태
+    terminal: bool = False
+
+
+@dataclass
+class MessageResult:
+    """component interface message: 진입 frontier → 출구 frontier 관계(exact)."""
+    exit_frontier: frozenset
+    collapse: RejectionStats | None
+    width_max: int
+    overflow: bool = False
+
+
+def frontier_message(prepped: list, config: dict, day_lo: int, day_hi: int,
+                     entry: set, *, symmetry: bool | None = None, cap: int = _CAP,
+                     budget: list | None = None, terminal: str = "lenient") -> MessageResult:
+    """[day_lo, day_hi) 를 sweep — **진입 BoundaryState 집합 → 출구 BoundaryState 집합**.
+
+    이것이 component 를 잇는 message(M(entry, sep) → exit). 붕괴 시 exit 비고 RejectionStats.
+    budget 은 공유 가능한 mutable([int]) — 여러 component 에 걸쳐 전개예산 공유.
     """
-    prepped = _prep(nurses, config)
     max_run, rec_trig, min_run = _night_rules(config)
     track_w = config.get("max_consecutive_work") is not None
     track_prev = bool(config.get("forbid_night_to_day"))
@@ -190,41 +238,85 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
     reqs = (reqD, reqE, reqN)
     k = len(prepped)
     if symmetry is None:
-        symmetry = _interchangeable(prepped, 0, num_days)
+        symmetry = _interchangeable(prepped, day_lo, day_hi)
     canon = (lambda s: tuple(sorted(s))) if symmetry else (lambda s: s)
-    frontier: set = {canon(tuple((0, 0, 0, "") for _ in range(k)))}
-    width_max = 1
-    spent = 0
-    for d in range(num_days):
+    frontier: set = {canon(s) for s in entry}
+    width_max = len(frontier)
+    if budget is None:
+        budget = [_EXPAND_BUDGET]
+    for d in range(day_lo, day_hi):
         nxt: set = set()
+        dead = live = 0
+        maxD = maxE = maxN = 0
         for js in frontier:
             per = [_options(prepped[i], js[i], d, config, max_run, min_run) for i in range(k)]
             if any(not o for o in per):
-                continue                              # 이 joint 상태 사망
+                dead += 1
+                continue
+            live += 1
             span = 1
             for o in per:
                 span *= len(o)
-            spent += span
-            if spent > _EXPAND_BUDGET:                # 전개 예산 초과(대형) → UNKNOWN
-                return FrontierResult(UNKNOWN, width_max=width_max, reqs=reqs)
+            budget[0] -= span
+            if budget[0] < 0:
+                return MessageResult(frozenset(), None, width_max, overflow=True)
             for combo in product(*per):
-                if sum(c == "D" for c in combo) < reqD:
-                    continue
-                if sum(c == "E" for c in combo) < reqE:
-                    continue
-                if sum(c == "N" for c in combo) < reqN:
-                    continue
-                nxt.add(canon(tuple(_step(js[i], combo[i], config, track_w, track_prev)
-                                    for i in range(k))))
-                if len(nxt) > cap:
-                    return FrontierResult(UNKNOWN, width_max=len(nxt), reqs=reqs)
+                cD = sum(c == "D" for c in combo)
+                cE = sum(c == "E" for c in combo)
+                cN = sum(c == "N" for c in combo)
+                if cD > maxD:
+                    maxD = cD
+                if cE > maxE:
+                    maxE = cE
+                if cN > maxN:
+                    maxN = cN
+                if cD >= reqD and cE >= reqE and cN >= reqN:
+                    nxt.add(canon(tuple(_step(js[i], combo[i], config, track_w, track_prev)
+                                        for i in range(k))))
+                    if len(nxt) > cap:
+                        return MessageResult(frozenset(), None, len(nxt), overflow=True)
         if not nxt:
-            cert = _collapse_cert(frontier, d, config, prepped, reqs, max_run, min_run)
-            return FrontierResult(INFEASIBLE, certificate=cert, collapse_day=d,
-                                  width_max=width_max, reqs=reqs)
+            binding = tuple(s for s, mx, rq in (("D", maxD, reqD), ("E", maxE, reqE),
+                                                ("N", maxN, reqN)) if mx < rq)
+            rej = RejectionStats(d, dead, live, (maxD, maxE, maxN), reqs, binding,
+                                 frozenset(frontier))
+            return MessageResult(frozenset(), rej, width_max)
         width_max = max(width_max, len(nxt))
         frontier = nxt
-    return FrontierResult(FEASIBLE, width_max=width_max, reqs=reqs)
+    if terminal == "strict":
+        filt = {s for s in frontier if terminal_ok(s, config)}
+        if not filt:
+            rej = RejectionStats(day_hi - 1, 0, len(frontier), (0, 0, 0), reqs, (),
+                                 frozenset(frontier), terminal=True)
+            return MessageResult(frozenset(), rej, width_max)
+        frontier = filt
+    return MessageResult(frozenset(frontier), None, width_max)
+
+
+def diagnose_frontier(nurses: list, config: dict, num_days: int,
+                      cap: int = _CAP, symmetry: bool | None = None,
+                      terminal: str = "lenient") -> FrontierResult:
+    """{D,E,N,O} exact frontier DP 판정 + 붕괴 certificate. (frontier_message 의 fresh→end 특수화.)
+
+    symmetry: 교환가능 간호사 상태 정렬 축소(None=자동). terminal: lenient(cross-month)|strict(자기완결).
+    """
+    prepped = _prep(nurses, config)
+    max_run, rec_trig, min_run = _night_rules(config)
+    reqs = (_req(config, "D"), _req(config, "E"), _req(config, "N"))
+    k = len(prepped)
+    mr = frontier_message(prepped, config, 0, num_days, {fresh_joint(k)},
+                          symmetry=symmetry, cap=cap, terminal=terminal)
+    if mr.overflow:
+        return FrontierResult(UNKNOWN, width_max=mr.width_max, reqs=reqs)
+    if mr.collapse is not None:
+        rej = mr.collapse
+        cert = _collapse_cert(rej.frontier, rej.day, config, prepped, reqs, max_run, min_run)
+        cert.witness["rejection"] = {"day": rej.day, "dead_states": rej.dead_states,
+                                     "live_states": rej.live_states, "best_cov": rej.best_cov,
+                                     "binding": list(rej.binding), "terminal": rej.terminal}
+        return FrontierResult(INFEASIBLE, certificate=cert, collapse_day=rej.day,
+                              width_max=mr.width_max, reqs=reqs)
+    return FrontierResult(FEASIBLE, width_max=mr.width_max, reqs=reqs)
 
 
 def diagnose_frontier_node(nurses: list, config: dict, num_days: int) -> ProofNode:
