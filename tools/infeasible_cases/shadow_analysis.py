@@ -35,11 +35,14 @@ def parse_log(lines) -> list[dict]:
 
 
 def join_by_run(records: list[dict]) -> dict:
-    """(request_id, attempt_id) → {"graph": rec, "production": rec}. 실행 단위 join."""
+    """(request_id, attempt_id, attempt_seq) → {graph, production}. 실행·solve 단위 join.
+
+    한 generation 에서 solve 가 여러 번(재시도·probe) 기록돼도 attempt_seq 로 분리(피드백 fix1).
+    """
     j: dict = {}
     for r in records:
-        key = (r.get("request_id"), r.get("attempt_id"))
-        if key == (None, None):
+        key = (r.get("request_id"), r.get("attempt_id"), r.get("attempt_seq", 1))
+        if r.get("request_id") is None:
             continue
         slot = j.setdefault(key, {"graph": None, "production": None})
         if r.get("kind") == "production":
@@ -49,17 +52,24 @@ def join_by_run(records: list[dict]) -> dict:
     return j
 
 
+def _same_model(g: dict, p: dict) -> bool:
+    gs, ps = g.get("model_signature"), p.get("model_signature")
+    return bool(gs and ps and gs == ps)
+
+
 def _classify_mismatch(g: dict, p: dict) -> str:
-    """graph INFEASIBLE ∧ production primary_hard FEASIBLE 일 때 사유."""
+    """graph INFEASIBLE ∧ production primary_hard FEASIBLE 일 때 사유(엄격 순서)."""
     if g.get("unmodeled"):
-        return "MODEL_SCOPE_MISMATCH"
-    if g.get("graph_model_stage") != p.get("attempt_id"):
-        return "FALLBACK_STAGE_MISMATCH"
+        return "MODEL_SCOPE_MISMATCH"                # 미지원 제약(graph 가 볼 수 없는 것 존재)
+    if not _same_model(g, p):
+        return "MODEL_SIGNATURE_MISMATCH"            # 같은 hard model 비교 아님
     if g.get("input_hash") != p.get("input_hash"):
-        return "INPUT_VERSION_MISMATCH"
+        return "INPUT_VERSION_MISMATCH"              # 입력 스냅샷 불일치
     if p.get("status_source") != "raw":
-        return "PRODUCTION_STATUS_INFERRED"          # 확정 못 함(raw 아님)
-    return "GRAPH_FALSE_CERTIFICATE"                 # 진짜 치명
+        return "PRODUCTION_STATUS_INFERRED"          # raw 아님 → 확정 못 함
+    if p.get("production_validator_pass") is not True:
+        return "GRAPH_FALSE_CERTIFICATE_UNVALIDATED"  # validator 미통과/미실행 → 아직 확정 못 함
+    return "GRAPH_FALSE_CERTIFICATE"                 # 동일모델·입력·raw·validator PASS → 진짜 치명
 
 
 def analyze(records: list[dict]) -> dict:
@@ -94,11 +104,11 @@ def analyze(records: list[dict]) -> dict:
             a["prod_primary_status"][p.get("primary_hard_status", "?")] += 1
             if p.get("primary_hard_status") == "INFEASIBLE":
                 a["prod_primary_infeasible"] += 1
-        # 비교 가능한 raw pair: 동일 run·stage·입력·raw status (표본 수의 기준)
+        # 비교 가능한 raw pair: 동일 입력·**동일 model_signature**·raw status (표본 수의 기준)
         comparable = bool(
             g and p
             and g.get("input_hash") == p.get("input_hash")
-            and g.get("graph_model_stage") == p.get("attempt_id")
+            and _same_model(g, p)
             and p.get("status_source") == "raw")
         if g and p:
             a["paired"] += 1
@@ -135,7 +145,13 @@ def report(a: dict) -> None:
     print("\nshort-circuit 자격(2단계 분리):")
     print(f"  structurally_eligible(구조 후보): {a['structurally_eligible']}")
     print(f"  ★ shadow_validated_eligible(검증된 후보=canary 표본): {a['shadow_validated_eligible']}")
-    print("  → GRAPH_FALSE_CERTIFICATE 0 이고 shadow_validated_eligible 충분할 때만 canary")
+    # 실패 0건이어도 표본 부족이면 위험 — rule of three(95% 상한 ≈ 3/N)
+    n = a["shadow_validated_eligible"]
+    if a["graph_false_certificate"] == 0 and n > 0:
+        print(f"  실패 0건 기준 오류율 95% 상한 ≈ {3.0 / n:.1%} (rule of three, N={n})")
+        print("  → 병동·규칙 유형 분포까지 확보 후에만 제한적 canary")
+    elif n == 0:
+        print("  → 검증 표본 0 — canary 불가(더 수집 필요)")
 
 
 def main(path):

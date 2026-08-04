@@ -5606,16 +5606,24 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             print(f"[Presolve] 진단 실패(무시): {_psd_exc}")
             presolve_diag = None
         # 운영 shadow 진단(env AIDE_SHADOW_DIAGNOSIS 게이팅, 기본 off=no-op). 결과 무영향, 로그만.
-        # request_id 는 **생성 요청마다 새 run_id**(schedule_id 아님 — 재생성 오결합 방지, 피드백 fix1).
+        # request_id=새 run_id(fix1). input_hash·model_signature 는 **여기서 한 번 확정**해 graph·
+        # production 로그에 동일 전달(fix2·3 — 재hash·모델차이로 인한 오분류 방지).
+        _gen_run_id = _gen_ih = _gen_sig = _gen_nd = None
         try:
+            import calendar as _cal
             import uuid as _uuid
+            from services.ontology_graph.roster_ir import model_signature as _msig
+            from services.ontology_graph.shadow_diagnosis import _input_hash as _ihf
             from services.ontology_graph.shadow_diagnosis import run_shadow
             _gen_run_id = _uuid.uuid4().hex
-            _sid = getattr(schedule, "schedule_id", None)
+            _gen_nd = _cal.monthrange(req.year, req.month)[1]
+            _gen_ih = _ihf(_nurses_dict_for_precheck, precheck_config, _gen_nd)
+            _gen_sig = _msig(_nurses_dict_for_precheck, precheck_config, _gen_nd)
             run_shadow(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
-                       request_id=_gen_run_id, schedule_id=_sid, attempt_id="primary_hard")
+                       request_id=_gen_run_id, schedule_id=getattr(schedule, "schedule_id", None),
+                       attempt_id="primary_hard", input_hash=_gen_ih, model_signature=_gen_sig)
         except Exception:
-            _gen_run_id = None
+            pass
         if has_blocking_issues(precheck_result):
             payload = build_blocking_payload(precheck_result)
             inf = payload.get("infeasibility", {})
@@ -5672,7 +5680,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _outbound_assignments=_outbound_assignments,
         )
         # 운영 primary_hard solve 상태를 shadow 로 상관로깅(env 게이팅, 무영향). graph 로그와
-        # **같은 generation_run_id**(_gen_run_id)+attempt_id 로 join. raw solver status 우선.
+        # **같은 run_id·input_hash·model_signature** 로 join(fix1·2·3). raw solver status 우선.
         try:
             from services.ontology_graph.production_adapter import standardize_status
             from services.ontology_graph.shadow_diagnosis import log_production_status
@@ -5681,7 +5689,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             log_production_status(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
                                   _prod_status, request_id=_gen_run_id,
                                   schedule_id=getattr(schedule, "schedule_id", None),
-                                  attempt_id="primary_hard", status_source=_src, raw_solver_status=_raw)
+                                  attempt_id="primary_hard", status_source=_src, raw_solver_status=_raw,
+                                  input_hash=_gen_ih, model_signature=_gen_sig,
+                                  production_model_stage="fallback_lex_stage1",
+                                  production_validator_pass=None)  # validator 연결=운영 shift코드 확정 후
         except Exception:
             pass
         # _debug_log(

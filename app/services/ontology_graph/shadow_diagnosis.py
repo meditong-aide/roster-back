@@ -60,8 +60,9 @@ def _sample_gate(request_id: str | None) -> bool:
 
 def run_shadow(nurses: list, config: dict, year: int, month: int, *,
                request_id: str | None = None, schedule_id: str | None = None,
-               attempt_id: str = "primary_hard",
+               attempt_id: str = "primary_hard", attempt_seq: int = 1,
                graph_model_stage: str = "primary_hard",
+               input_hash: str | None = None, model_signature: str | None = None,
                production_model_version: str | None = None,
                budget: int = 1_200_000) -> dict | None:
     """graph 진단을 shadow 로 실행·로그(graph-only; production 비교는 log_production_status 와
@@ -79,9 +80,11 @@ def run_shadow(nurses: list, config: dict, year: int, month: int, *,
         return None
     rec: dict = {
         "request_id": request_id, "schedule_id": schedule_id, "attempt_id": attempt_id,
-        "graph_model_stage": graph_model_stage,
+        "attempt_seq": attempt_seq, "graph_model_stage": graph_model_stage,
         "year": year, "month": month, "num_days": num_days,
-        "input_hash": _input_hash(nurses, config, num_days),
+        # input_hash·model_signature 는 생성 진입서 확정한 snapshot 기준을 그대로 전달(피드백 fix3·2)
+        "input_hash": input_hash or _input_hash(nurses, config, num_days),
+        "model_signature": model_signature,
         "graph_version": GRAPH_ENGINE_VERSION, "ir_version": IR_SCHEMA_VERSION,
         "production_model_version": production_model_version,
         "flags": {"short_circuit": short_circuit_flag(), "repair_verify": repair_verify_flag()},
@@ -123,10 +126,13 @@ def run_shadow(nurses: list, config: dict, year: int, month: int, *,
 def log_production_status(nurses: list, config: dict, year: int, month: int,
                           primary_hard_status: str, *,
                           request_id: str | None = None, schedule_id: str | None = None,
-                          attempt_id: str = "primary_hard",
+                          attempt_id: str = "primary_hard", attempt_seq: int = 1,
+                          production_model_stage: str = "fallback_lex_stage1",
+                          input_hash: str | None = None, model_signature: str | None = None,
                           status_source: str = "raw", raw_solver_status: str | None = None,
                           final_service_status: str | None = None,
                           fallback_applied: str | None = None,
+                          production_validator_pass: bool | None = None,
                           production_model_version: str | None = None) -> dict | None:
     """운영 solve 상태를 로그 → graph 로그와 **request_id+attempt_id** 로 join(피드백 fix1).
 
@@ -140,11 +146,15 @@ def log_production_status(nurses: list, config: dict, year: int, month: int,
     except Exception:
         return None
     rec = {"kind": "production", "request_id": request_id, "schedule_id": schedule_id,
-           "attempt_id": attempt_id, "year": year, "month": month, "num_days": num_days,
-           "input_hash": _input_hash(nurses, config, num_days),
+           "attempt_id": attempt_id, "attempt_seq": attempt_seq,
+           "production_model_stage": production_model_stage,
+           "year": year, "month": month, "num_days": num_days,
+           "input_hash": input_hash or _input_hash(nurses, config, num_days),
+           "model_signature": model_signature,
            "primary_hard_status": primary_hard_status, "status_source": status_source,
            "raw_solver_status": raw_solver_status,
            "final_service_status": final_service_status, "fallback_applied": fallback_applied,
+           "production_validator_pass": production_validator_pass,
            "production_model_version": production_model_version,
            "graph_version": GRAPH_ENGINE_VERSION, "ir_version": IR_SCHEMA_VERSION}
     _emit(rec)

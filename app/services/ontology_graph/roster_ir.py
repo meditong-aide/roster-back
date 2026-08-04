@@ -83,6 +83,25 @@ class RosterConstraintIR:
     unsupported: list = field(default_factory=list)
 
 
+def model_signature(nurses: list, config: dict, num_days: int) -> str:
+    """모델 **구조** 시그니처 — 활성 hard rule 종류+핵심 파라미터+horizon 의 해시.
+
+    CellDomain(개인 셀 제약)은 입력이므로 제외(input_hash 가 담당). 이 시그니처는 "graph 와
+    production 이 같은 hard model 을 비교하는가"를 확인하는 데 쓴다(다르면 false-cert 확정 불가).
+    """
+    import hashlib
+    ir = parse_to_ir(nurses, config, num_days)
+    parts = [f"days={num_days}"]
+    for r in sorted((r for r in ir.rules if not isinstance(r, CellDomainRule)),
+                    key=lambda x: type(x).__name__):
+        fields = {k: v for k, v in vars(r).items()}
+        parts.append(type(r).__name__ + ":" + repr(sorted(fields.items())))
+    # 간호사 work-set 프로필(정렬 멀티셋) — 야간전담 등 공급구조도 모델 일부
+    works = sorted(repr(sorted(s.allowed)) for s in ir.nurses)
+    parts.append("works=" + repr(works))
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
 def parse_to_ir(nurses: list, config: dict, num_days: int) -> RosterConstraintIR:
     """운영 config/nurses → IR. 지원 제약만 Rule 로, 미지원은 unsupported 로 격리."""
     specs = []
