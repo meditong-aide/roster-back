@@ -1,12 +1,17 @@
-"""Shadow 로그 offline 분석 — production↔graph 를 input_hash 로 join, 3층 정확성 리포트.
+"""Shadow 로그 offline 분석 — (request_id, attempt_id) join, mismatch 사유 분류.
 
-피드백 point3·6: "일치율"만 보면 안 된다. 판정 정확성(**false certificate**=production FEASIBLE
-인데 graph INFEASIBLE=치명), UNKNOWN 사유별 분포(재귀 hybrid 는 UNKNOWN_WIDTH 일 때만),
-certificate 종류, short-circuit 자격 건수를 함께 본다. 기간이 아니라 **사례 수·분포**로 판단.
+피드백 fix1·5: input_hash 만으로 join 하면 같은 입력 재실행 시 잘못 붙는다 → (request_id,
+attempt_id) 로 join, input_hash 는 "입력 동일" 검증 보조. 그리고 production FEASIBLE + graph
+INFEASIBLE 을 무조건 false certificate 라 부르지 않는다 → **동일 stage·입력·in-scope·raw status**
+확인된 경우만 GRAPH_FALSE_CERTIFICATE, 아니면 사유별 candidate_mismatch.
 
-사용:
-  AIDE_SHADOW_DIAGNOSIS=1 AIDE_SHADOW_LOG=/path/shadow.jsonl <운영 실행>
-  python tools/infeasible_cases/shadow_analysis.py /path/shadow.jsonl
+  MODEL_SCOPE_MISMATCH     — 미지원 제약 있음
+  FALLBACK_STAGE_MISMATCH  — graph stage ≠ production attempt
+  INPUT_VERSION_MISMATCH   — input_hash 불일치
+  PRODUCTION_STATUS_INFERRED — production status_source≠raw(약한 근거) → 확정 못 함
+  GRAPH_FALSE_CERTIFICATE  — 위 전부 통과했는데도 불일치 = 진짜 치명(반드시 0)
+
+비교는 **primary_hard vs primary_hard**(graph 는 primary_hard 모델 분석)로만.
 """
 
 from __future__ import annotations
@@ -29,14 +34,14 @@ def parse_log(lines) -> list[dict]:
     return out
 
 
-def join_by_input(records: list[dict]) -> dict:
-    """input_hash → {"graph": rec|None, "production": rec|None}."""
+def join_by_run(records: list[dict]) -> dict:
+    """(request_id, attempt_id) → {"graph": rec, "production": rec}. 실행 단위 join."""
     j: dict = {}
     for r in records:
-        h = r.get("input_hash")
-        if not h:
+        key = (r.get("request_id"), r.get("attempt_id"))
+        if key == (None, None):
             continue
-        slot = j.setdefault(h, {"graph": None, "production": None})
+        slot = j.setdefault(key, {"graph": None, "production": None})
         if r.get("kind") == "production":
             slot["production"] = r
         elif "graph_status" in r:
@@ -44,18 +49,31 @@ def join_by_input(records: list[dict]) -> dict:
     return j
 
 
+def _classify_mismatch(g: dict, p: dict) -> str:
+    """graph INFEASIBLE ∧ production primary_hard FEASIBLE 일 때 사유."""
+    if g.get("unmodeled"):
+        return "MODEL_SCOPE_MISMATCH"
+    if g.get("graph_model_stage") != p.get("attempt_id"):
+        return "FALLBACK_STAGE_MISMATCH"
+    if g.get("input_hash") != p.get("input_hash"):
+        return "INPUT_VERSION_MISMATCH"
+    if p.get("status_source") != "raw":
+        return "PRODUCTION_STATUS_INFERRED"          # 확정 못 함(raw 아님)
+    return "GRAPH_FALSE_CERTIFICATE"                 # 진짜 치명
+
+
 def analyze(records: list[dict]) -> dict:
-    joined = join_by_input(records)
+    joined = join_by_run(records)
     from services.ontology_graph.short_circuit import ALLOWED_SHORT_CIRCUIT_CERTS
     a = {
-        "cases": len(joined), "paired": 0,
+        "runs": len(joined), "paired": 0,
         "graph_status": Counter(), "certificate": Counter(), "unknown_reason": Counter(),
-        "false_certificate": 0, "false_certificate_hashes": [],
-        "agree_infeasible": 0, "prod_infeasible": 0, "graph_infeasible": 0,
-        "short_circuit_eligible": 0,
-        "prod_status": Counter(),
+        "prod_primary_status": Counter(), "mismatch_reason": Counter(),
+        "agree_infeasible": 0, "graph_infeasible": 0, "prod_primary_infeasible": 0,
+        "short_circuit_eligible": 0, "graph_false_certificate": 0,
+        "false_certificate_runs": [],
     }
-    for h, slot in joined.items():
+    for key, slot in joined.items():
         g, p = slot["graph"], slot["production"]
         if g:
             gs = g.get("graph_status", "?")
@@ -69,40 +87,41 @@ def analyze(records: list[dict]) -> dict:
                 if g.get("certificate") in ALLOWED_SHORT_CIRCUIT_CERTS and not g.get("unmodeled"):
                     a["short_circuit_eligible"] += 1
         if p:
-            a["prod_status"][p.get("production_status", "?")] += 1
-            if p.get("production_status") == "INFEASIBLE":
-                a["prod_infeasible"] += 1
-        if g and p:
-            a["paired"] += 1
-            gs, ps = g.get("graph_status"), p.get("production_status")
-            if gs == "INFEASIBLE_CERTIFIED":
-                if ps == "INFEASIBLE":
-                    a["agree_infeasible"] += 1
-                elif ps == "FEASIBLE":                    # 치명: false certificate
-                    a["false_certificate"] += 1
-                    a["false_certificate_hashes"].append(h)
+            a["prod_primary_status"][p.get("primary_hard_status", "?")] += 1
+            if p.get("primary_hard_status") == "INFEASIBLE":
+                a["prod_primary_infeasible"] += 1
+        if g and p and g.get("graph_status") == "INFEASIBLE_CERTIFIED":
+            ps = p.get("primary_hard_status")
+            if ps == "INFEASIBLE":
+                a["agree_infeasible"] += 1
+            elif ps == "FEASIBLE":
+                reason = _classify_mismatch(g, p)
+                a["mismatch_reason"][reason] += 1
+                if reason == "GRAPH_FALSE_CERTIFICATE":
+                    a["graph_false_certificate"] += 1
+                    a["false_certificate_runs"].append(key)
     return a
 
 
 def report(a: dict) -> None:
-    print(f"shadow 사례 {a['cases']} (graph+production 페어 {a['paired']})\n")
-    print("판정 정확성:")
-    print(f"  ★ false certificate(prod FEASIBLE인데 graph INFEASIBLE): {a['false_certificate']}  ← 반드시 0")
-    if a["false_certificate_hashes"]:
-        print(f"     반례 input_hash: {a['false_certificate_hashes'][:5]}")
-    print(f"  graph INFEASIBLE ∧ prod INFEASIBLE 일치: {a['agree_infeasible']}/{a['graph_infeasible']}")
+    print(f"shadow 실행 {a['runs']} (graph+production 페어 {a['paired'] or a['graph_infeasible']})\n")
+    print("판정 정확성(동일 primary_hard 기준):")
+    print(f"  ★ GRAPH_FALSE_CERTIFICATE(동일모델·in-scope·raw 인데 불일치): {a['graph_false_certificate']}  ← 반드시 0")
+    if a["false_certificate_runs"]:
+        print(f"     반례 (request_id, attempt): {a['false_certificate_runs'][:5]}")
+    print(f"  mismatch 사유 분류: {dict(a['mismatch_reason'])}")
+    print(f"  graph INFEASIBLE ∧ prod primary INFEASIBLE 일치: {a['agree_infeasible']}/{a['graph_infeasible']}")
     print(f"\ngraph status 분포: {dict(a['graph_status'])}")
-    print(f"UNKNOWN 사유(이분법 금지): {dict(a['unknown_reason'])}  ← 재귀 hybrid 는 UNKNOWN_WIDTH 일 때만")
-    print(f"production status 분포: {dict(a['prod_status'])}")
+    print(f"UNKNOWN 사유: {dict(a['unknown_reason'])}  ← 재귀 hybrid 는 UNKNOWN_WIDTH 일 때만")
+    print(f"production primary_hard 분포: {dict(a['prod_primary_status'])}")
     print(f"certificate 종류: {dict(a['certificate'])}")
-    print(f"\nshort-circuit 자격(허용 cert·in-scope·INFEASIBLE): {a['short_circuit_eligible']}건")
-    print(f"  → false certificate 0 이고 사례 수 충분할 때만 canary 활성 고려")
+    print(f"\nshort-circuit 자격: {a['short_circuit_eligible']}건 "
+          f"→ GRAPH_FALSE_CERTIFICATE 0 이고 사례 충분할 때만 canary")
 
 
 def main(path):
     with open(path) as f:
-        recs = parse_log(f)
-    report(analyze(recs))
+        report(analyze(parse_log(f)))
 
 
 if __name__ == "__main__":

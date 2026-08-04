@@ -5606,9 +5606,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             print(f"[Presolve] 진단 실패(무시): {_psd_exc}")
             presolve_diag = None
         # 운영 shadow 진단(env AIDE_SHADOW_DIAGNOSIS 게이팅, 기본 off=no-op). 결과 무영향, 로그만.
+        # graph 는 primary_hard 모델(config 그대로) 분석. request_id=schedule_id 로 production 로그와 join.
         try:
             from services.ontology_graph.shadow_diagnosis import run_shadow
-            run_shadow(_nurses_dict_for_precheck, precheck_config, req.year, req.month)
+            _sid = getattr(schedule, "schedule_id", None)
+            run_shadow(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
+                       request_id=_sid, attempt_id="primary_hard")
         except Exception:
             pass
         if has_blocking_issues(precheck_result):
@@ -5666,14 +5669,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _inbound_assignments=_inbound_assignments,
             _outbound_assignments=_outbound_assignments,
         )
-        # 운영 primary solve 표준 상태를 shadow 로 상관로깅(env 게이팅, 무영향). graph 로그(presolve
-        # 훅)와 input_hash 로 join → production↔graph 비교. 실패해도 운영 무영향.
+        # 운영 primary_hard solve 상태를 shadow 로 상관로깅(env 게이팅, 무영향). graph 로그와
+        # request_id(schedule_id)+attempt_id 로 join. raw solver status 우선(없으면 약한 추론).
         try:
             from services.ontology_graph.production_adapter import standardize_status
             from services.ontology_graph.shadow_diagnosis import log_production_status
-            _prod_status = standardize_status(roster_system, generated)
-            log_production_status(_nurses_dict_for_precheck, precheck_config,
-                                  req.year, req.month, _prod_status)
+            _raw = getattr(roster_system, "_last_solver_status", None)
+            _prod_status, _src = standardize_status(roster_system, generated, raw_status=_raw)
+            log_production_status(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
+                                  _prod_status, request_id=getattr(schedule, "schedule_id", None),
+                                  attempt_id="primary_hard", status_source=_src, raw_solver_status=_raw)
         except Exception:
             pass
         # _debug_log(

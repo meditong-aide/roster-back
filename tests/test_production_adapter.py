@@ -16,12 +16,12 @@ from services.ontology_graph.shadow_diagnosis import log_production_status, run_
 
 
 def test_standardize_all_states():
-    assert standardize_status(SimpleNamespace(_infeasible_empty=True), {"n": ["D"]}) == "INFEASIBLE"
-    assert standardize_status(SimpleNamespace(_infeasible_empty=False), {"n": ["D"]}) == "FEASIBLE"
-    assert standardize_status(SimpleNamespace(_infeasible_empty=False), {}) == "INFEASIBLE"
-    assert standardize_status(None, {}) == "ERROR"
+    assert standardize_status(SimpleNamespace(_infeasible_empty=True), {"n": ["D"]})[0] == "INFEASIBLE"
+    assert standardize_status(SimpleNamespace(_infeasible_empty=False), {"n": ["D"]})[0] == "FEASIBLE"
+    assert standardize_status(SimpleNamespace(_infeasible_empty=False), {})[0] == "INFEASIBLE"
+    assert standardize_status(None, {})[0] == "ERROR"
     assert standardize_status(SimpleNamespace(_infeasible_empty=False), {"n": ["D"]},
-                              timeout=True) == "TIMEOUT"
+                              timeout=True)[0] == "TIMEOUT"
 
 
 def test_verifier_factory_is_exact():
@@ -46,7 +46,7 @@ def test_graph_and_production_logs_correlate(monkeypatch):
     g = run_shadow(nu, cfg, 2026, 8, request_id="r1")
     p = log_production_status(nu, cfg, 2026, 8, "INFEASIBLE", request_id="r1")
     assert g["input_hash"] == p["input_hash"]
-    assert p["kind"] == "production" and p["production_status"] == "INFEASIBLE"
+    assert p["kind"] == "production" and p["primary_hard_status"] == "INFEASIBLE"
 
 
 def test_production_log_noop_when_disabled(monkeypatch):

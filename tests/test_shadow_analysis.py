@@ -1,4 +1,4 @@
-"""Shadow 로그 offline 분석 — input_hash join + false-certificate 탐지 + UNKNOWN 사유별."""
+"""Shadow 로그 offline 분석 — (request_id, attempt_id) join + mismatch 사유 분류."""
 
 from __future__ import annotations
 
@@ -8,65 +8,65 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools", "infeasible_cases"))
 
-from shadow_analysis import analyze, join_by_input, parse_log  # noqa: E402
+from shadow_analysis import analyze, join_by_run, parse_log  # noqa: E402
 
 
 def _line(rec):
     return "[Shadow] " + json.dumps(rec)
 
 
-def _graph(h, status, cert=None, unmodeled=None):
-    return {"input_hash": h, "graph_status": status, "certificate": cert,
-            "unmodeled": unmodeled or []}
+def _graph(rid, status, cert=None, unmodeled=None, ih="h", stage="primary_hard"):
+    return {"request_id": rid, "attempt_id": "primary_hard", "graph_model_stage": stage,
+            "graph_status": status, "certificate": cert, "unmodeled": unmodeled or [],
+            "input_hash": ih}
 
 
-def _prod(h, status):
-    return {"kind": "production", "input_hash": h, "production_status": status}
+def _prod(rid, primary, ih="h", source="raw"):
+    return {"kind": "production", "request_id": rid, "attempt_id": "primary_hard",
+            "primary_hard_status": primary, "input_hash": ih, "status_source": source}
 
 
-def test_parse_and_join():
-    lines = [_line(_graph("h1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
-             _line(_prod("h1", "INFEASIBLE")),
-             "noise line",
-             _line(_graph("h2", "FEASIBLE_WITNESS"))]
-    recs = parse_log(lines)
-    assert len(recs) == 3
-    j = join_by_input(recs)
-    assert j["h1"]["graph"] and j["h1"]["production"]
-    assert j["h2"]["production"] is None
+def test_join_by_run_not_input_hash():
+    """같은 입력(같은 input_hash) 다른 실행이 request_id 로 분리돼야."""
+    lines = [_line(_graph("r1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation", ih="same")),
+             _line(_prod("r1", "INFEASIBLE", ih="same")),
+             _line(_graph("r2", "FEASIBLE_WITNESS", ih="same")),
+             _line(_prod("r2", "FEASIBLE", ih="same"))]
+    j = join_by_run(parse_log(lines))
+    assert ("r1", "primary_hard") in j and ("r2", "primary_hard") in j
+    assert j[("r1", "primary_hard")]["graph"]["graph_status"] == "INFEASIBLE_CERTIFIED"
 
 
-def test_false_certificate_detected():
-    """prod FEASIBLE 인데 graph INFEASIBLE = 치명 false certificate."""
-    recs = parse_log([
-        _line(_graph("bad", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
-        _line(_prod("bad", "FEASIBLE")),
-        _line(_graph("ok", "INFEASIBLE_CERTIFIED", "sequence_path_empty")),
-        _line(_prod("ok", "INFEASIBLE")),
-    ])
+def test_real_false_certificate():
+    """동일 stage·입력·in-scope·raw 인데 graph INFEASIBLE vs prod FEASIBLE = 진짜 치명."""
+    recs = parse_log([_line(_graph("r1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
+                      _line(_prod("r1", "FEASIBLE"))])
     a = analyze(recs)
-    assert a["false_certificate"] == 1
-    assert "bad" in a["false_certificate_hashes"]
-    assert a["agree_infeasible"] == 1
+    assert a["graph_false_certificate"] == 1
+    assert a["mismatch_reason"]["GRAPH_FALSE_CERTIFICATE"] == 1
 
 
-def test_unknown_reasons_separated():
-    recs = parse_log([
-        _line(_graph("a", "UNKNOWN_WIDTH")),
-        _line(_graph("b", "UNKNOWN_SCOPE", unmodeled=["nurse.n_exact"])),
-        _line(_graph("c", "UNKNOWN_WIDTH")),
-    ])
+def test_inferred_status_not_false_certificate():
+    """production status 가 raw 아니면(추론) 확정 false-cert 아님 → PRODUCTION_STATUS_INFERRED."""
+    recs = parse_log([_line(_graph("r1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
+                      _line(_prod("r1", "FEASIBLE", source="empty"))])
     a = analyze(recs)
-    assert a["unknown_reason"]["UNKNOWN_WIDTH"] == 2      # 재귀 hybrid 대상
-    assert a["unknown_reason"]["UNKNOWN_SCOPE"] == 1      # 재귀 hybrid 무관
+    assert a["graph_false_certificate"] == 0
+    assert a["mismatch_reason"]["PRODUCTION_STATUS_INFERRED"] == 1
 
 
-def test_short_circuit_eligibility():
-    recs = parse_log([
-        _line(_graph("e1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),       # 자격
-        _line(_graph("e2", "INFEASIBLE_CERTIFIED", "joint_sequencing_collapse")),     # cert 제외
-        _line(_graph("e3", "INFEASIBLE_CERTIFIED", "coverage_deficit",
-                     unmodeled=["config.off_days"])),                                  # 범위 밖
-    ])
+def test_scope_mismatch_not_false_certificate():
+    recs = parse_log([_line(_graph("r1", "INFEASIBLE_CERTIFIED", "coverage_deficit",
+                                   unmodeled=["config.off_days"])),
+                      _line(_prod("r1", "FEASIBLE"))])
     a = analyze(recs)
-    assert a["short_circuit_eligible"] == 1              # e1 만
+    assert a["graph_false_certificate"] == 0
+    assert a["mismatch_reason"]["MODEL_SCOPE_MISMATCH"] == 1
+
+
+def test_input_version_mismatch():
+    recs = parse_log([_line(_graph("r1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation", ih="A")),
+                      _line(_prod("r1", "FEASIBLE", ih="B"))])
+    a = analyze(recs)
+    assert a["mismatch_reason"]["INPUT_VERSION_MISMATCH"] == 1
+    assert a["graph_false_certificate"] == 0

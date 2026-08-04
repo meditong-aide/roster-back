@@ -20,24 +20,27 @@ def test_noop_when_disabled(monkeypatch):
 
 
 def test_runs_and_logs_when_enabled(monkeypatch):
+    """graph-only 로그(production 비교는 분석기가 join). 실행단위 키·stage·버전 기록."""
     monkeypatch.setenv("AIDE_SHADOW_DIAGNOSIS", "1")
-    rec = run_shadow(_nu(5), _CFG, 2026, 8, production_status="INFEASIBLE", request_id="r1")
+    rec = run_shadow(_nu(5), _CFG, 2026, 8, request_id="r1")
     assert rec is not None
     assert rec["graph_status"] == "INFEASIBLE_CERTIFIED"
-    assert rec["agree"] is True                     # graph INFEASIBLE cert ↔ production INFEASIBLE
-    assert rec["false_certificate"] is False        # production 도 INFEASIBLE → false cert 아님
     assert "core_days" in rec                        # 범위 축소 데이터
-    # 버전·해시·플래그 기록(피드백 point5)
+    # 실행 단위 join 키 + stage(피드백 fix1·2)
+    assert rec["request_id"] == "r1" and rec["attempt_id"] == "primary_hard"
+    assert rec["graph_model_stage"] == "primary_hard"
+    # 버전·해시·플래그(fix5/point5)
     assert rec["graph_version"] and rec["ir_version"] and rec["input_hash"] != "?"
-    assert "flags" in rec and rec["request_id"] == "r1"
+    assert "flags" in rec
 
 
-def test_false_certificate_flagged(monkeypatch):
-    """production FEASIBLE 인데 graph INFEASIBLE = 치명적 false certificate 표시."""
+def test_sampling_gate(monkeypatch):
+    """샘플링(운영 지연 방지): 0% 면 request_id 있는 실행은 건너뛴다."""
     monkeypatch.setenv("AIDE_SHADOW_DIAGNOSIS", "1")
-    rec = run_shadow(_nu(5), _CFG, 2026, 8, production_status="FEASIBLE")
-    assert rec["graph_status"] == "INFEASIBLE_CERTIFIED"
-    assert rec["false_certificate"] is True         # 이런 게 나오면 short-circuit 즉시 중단 근거
+    monkeypatch.setenv("AIDE_SHADOW_SAMPLE_PCT", "0")
+    assert run_shadow(_nu(5), _CFG, 2026, 8, request_id="r1") is None
+    monkeypatch.setenv("AIDE_SHADOW_SAMPLE_PCT", "100")
+    assert run_shadow(_nu(5), _CFG, 2026, 8, request_id="r1") is not None
 
 
 def test_never_raises_on_bad_input(monkeypatch):

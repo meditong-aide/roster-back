@@ -42,22 +42,42 @@ def _input_hash(nurses, config, num_days) -> str:
         return "?"
 
 
-def run_shadow(nurses: list, config: dict, year: int, month: int, *,
-               production_status: str | None = None, request_id: str | None = None,
-               production_model_version: str | None = None,
-               budget: int = 1_500_000) -> dict | None:
-    """graph/IR 진단을 shadow 로 실행·로그. 운영 결과 무영향. 비활성/실패 시 None.
+def _sample_gate(request_id: str | None) -> bool:
+    """AIDE_SHADOW_SAMPLE_PCT(0~100) — request_id 해시 기반 결정적 샘플링(운영 지연 방지)."""
+    try:
+        pct = int(os.environ.get("AIDE_SHADOW_SAMPLE_PCT", "100"))
+    except ValueError:
+        pct = 100
+    if pct >= 100:
+        return True
+    if pct <= 0 or not request_id:
+        return pct > 0 and not request_id  # request_id 없으면 pct>0 일 때만(보수적)
+    h = 0
+    for ch in str(request_id):
+        h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+    return (h % 100) < pct
 
-    production_status: 운영 CP-SAT 판정(FEASIBLE/INFEASIBLE/TIMEOUT/ERROR). 넘기면 비교도 로그.
+
+def run_shadow(nurses: list, config: dict, year: int, month: int, *,
+               request_id: str | None = None, attempt_id: str = "primary_hard",
+               graph_model_stage: str = "primary_hard",
+               production_model_version: str | None = None,
+               budget: int = 1_200_000) -> dict | None:
+    """graph 진단을 shadow 로 실행·로그(graph-only; production 비교는 log_production_status 와
+    request_id+attempt_id 로 join). 운영 결과 무영향. 비활성/샘플제외/실패 시 None.
+
+    graph 는 **primary_hard 모델**(config 그대로, fallback 전)을 분석 → attempt_id/stage 로 표기.
     """
-    if not shadow_enabled():
+    if not shadow_enabled() or not _sample_gate(request_id):
         return None
     try:
         num_days = calendar.monthrange(int(year), int(month))[1]
     except Exception:
         return None
     rec: dict = {
-        "request_id": request_id, "year": year, "month": month, "num_days": num_days,
+        "request_id": request_id, "attempt_id": attempt_id,
+        "graph_model_stage": graph_model_stage,
+        "year": year, "month": month, "num_days": num_days,
         "input_hash": _input_hash(nurses, config, num_days),
         "graph_version": GRAPH_ENGINE_VERSION, "ir_version": IR_SCHEMA_VERSION,
         "production_model_version": production_model_version,
@@ -93,25 +113,21 @@ def run_shadow(nurses: list, config: dict, year: int, month: int, *,
     except Exception as e:
         rec["graph_status"] = "ERROR"
         rec["graph_error"] = str(e)
-    # production 비교(호출자가 표준화 status 를 넘길 때만)
-    if production_status is not None:
-        rec["production_status"] = production_status
-        gs = rec.get("graph_status")
-        if gs == "INFEASIBLE_CERTIFIED":
-            agree = production_status in ("INFEASIBLE", "INFEASIBLE_CERTIFIED")
-            rec["agree"] = agree
-            # 치명: production FEASIBLE 인데 graph INFEASIBLE = false certificate
-            rec["false_certificate"] = (production_status == "FEASIBLE")
     _emit(rec)
     return rec
 
 
-def log_production_status(nurses: list, config: dict, year: int, month: int, status: str, *,
-                          request_id: str | None = None,
+def log_production_status(nurses: list, config: dict, year: int, month: int,
+                          primary_hard_status: str, *,
+                          request_id: str | None = None, attempt_id: str = "primary_hard",
+                          status_source: str = "raw", raw_solver_status: str | None = None,
+                          final_service_status: str | None = None,
+                          fallback_applied: str | None = None,
                           production_model_version: str | None = None) -> dict | None:
-    """운영 solve 표준 상태를 **같은 input_hash 로** 로그 → offline 에서 graph 로그와 join.
+    """운영 solve 상태를 로그 → graph 로그와 **request_id+attempt_id** 로 join(피드백 fix1).
 
-    (graph 로그는 run_shadow, production 로그는 이 함수. 둘을 input_hash 로 correlate.)
+    primary_hard 와 final(=fallback 후)을 분리(fix2): graph 는 primary_hard 를 분석하므로 비교는
+    primary_hard_status 로. final_service_status/fallback_applied 는 맥락. status_source 로 신뢰도.
     """
     if not shadow_enabled():
         return None
@@ -119,9 +135,12 @@ def log_production_status(nurses: list, config: dict, year: int, month: int, sta
         num_days = calendar.monthrange(int(year), int(month))[1]
     except Exception:
         return None
-    rec = {"kind": "production", "request_id": request_id, "year": year, "month": month,
-           "num_days": num_days, "input_hash": _input_hash(nurses, config, num_days),
-           "production_status": status,
+    rec = {"kind": "production", "request_id": request_id, "attempt_id": attempt_id,
+           "year": year, "month": month, "num_days": num_days,
+           "input_hash": _input_hash(nurses, config, num_days),
+           "primary_hard_status": primary_hard_status, "status_source": status_source,
+           "raw_solver_status": raw_solver_status,
+           "final_service_status": final_service_status, "fallback_applied": fallback_applied,
            "production_model_version": production_model_version,
            "graph_version": GRAPH_ENGINE_VERSION, "ir_version": IR_SCHEMA_VERSION}
     _emit(rec)
