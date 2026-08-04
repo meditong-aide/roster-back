@@ -177,3 +177,24 @@ INFEASIBLE 로 오인 안 함) 테스트로 sound 성 잠금(`tests/test_compone
 정확성의 강한 증거. 대칭 축소는 650건 실발동하고도 오판 0(sound). CP-SAT 17건은 모두
 frontier==oracle 인 쪽이라 CP-SAT 회복규칙 인코딩 근사 때문(엔진 버그 아님). CI 회귀는
 `tests/test_fuzz_crossval.py`(소량).
+
+## 진짜 hypergraph separator conditioning (factor 완전성 audit 포함)
+
+`app/services/ontology_graph/hypergraph_conditioning.py` + `factor_audit.py` — 리뷰어가
+지목한 실제 알고리즘(factor graph→conditioning→component 분리→AND). frontier DP 는 시간축
+separator 만 쓰지만, 이건 **factor 하이퍼그래프의 임의 separator**로 독립 component 를 분리한다.
+
+**factor 완전성 3층 audit**(핵심 — 누락 factor = 조용한 오판):
+1. **구조**: 모든 x 변수·per-nurse 시퀀스 factor(인원수)·수요>0 일마다 커버리지·banned/forced
+   도메인 반영을 체크리스트로 검사.
+2. **규칙 인코딩 프로브**: 활성 규칙마다 위반 배열을 만들어 factor 가 **실제로 거부**하는지.
+3. **의미 재구성**: solver 판정 == 독립 oracle (무작위 소형; 누락 factor 면 반드시 불일치).
+   실측 **133건 불일치 0** = 모든 factor 완비.
+
+**component 분해 실증**: 강제OFF 로 절연된 2그룹 → 최상위 component **2개**로 분리, 각각
+독립 solve 후 AND (0.001s). = 진짜 separator 이득(sparse 결합).
+
+**경계(정직)**: generic min-degree conditioning 은 **dense 시간격자에선 비효율**(→UNKNOWN/느림).
+밀집 시간축은 frontier DP 의 temporal sweep 이 적합 → 둘은 **상보적**. 이상적 통합은
+"conditioning 으로 component 분리 → 각 component 를 frontier DP 로 sweep"(미구현). 미구현:
+context caching(같은 separator boundary 재사용), 부분-교환 그룹 대칭.
