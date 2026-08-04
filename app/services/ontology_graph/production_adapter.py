@@ -30,7 +30,7 @@ def standardize_status(roster_system, generated, *, raw_status: str | None = Non
     출처="raw"|"flag"|"empty"|"inferred" — 분석 시 신뢰도 구분용(추론은 ground truth 아님).
     """
     if raw_status:
-        s = str(raw_status).upper()
+        s = str(raw_status).upper().split("(")[0].strip()   # "UNKNOWN(3)"→"UNKNOWN"
         if s in _RAW_MAP:
             return _RAW_MAP[s], "raw"
     if error or roster_system is None:

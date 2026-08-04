@@ -70,3 +70,43 @@ def test_input_version_mismatch():
     a = analyze(recs)
     assert a["mismatch_reason"]["INPUT_VERSION_MISMATCH"] == 1
     assert a["graph_false_certificate"] == 0
+
+
+def test_eligibility_split_structural_vs_validated():
+    """구조 후보 vs 검증된 후보(canary 표본) 분리. raw+동일모델+prod INFEASIBLE 이어야 validated."""
+    recs = parse_log([
+        # r1: graph INFEASIBLE(허용cert·in-scope) + prod INFEASIBLE raw → structural+validated
+        _line(_graph("r1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
+        _line(_prod("r1", "INFEASIBLE", source="raw")),
+        # r2: graph INFEASIBLE 구조후보이나 prod 없음 → structural만
+        _line(_graph("r2", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
+        # r3: graph INFEASIBLE + prod INFEASIBLE 이나 status_source=empty(추론) → validated 아님
+        _line(_graph("r3", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
+        _line(_prod("r3", "INFEASIBLE", source="empty")),
+    ])
+    a = analyze(recs)
+    assert a["structurally_eligible"] == 3
+    assert a["shadow_validated_eligible"] == 1        # r1 만
+    assert a["comparable_raw_pairs"] == 1             # r1 만(raw)
+    assert a["paired"] == 2                            # r1, r3
+
+
+def test_same_schedule_different_runs_separated():
+    """같은 schedule_id 라도 다른 generation_run_id 면 분리(피드백 fix1)."""
+    from shadow_analysis import join_by_run
+    recs = ([
+        {"request_id": "run-A", "attempt_id": "primary_hard", "graph_model_stage": "primary_hard",
+         "graph_status": "INFEASIBLE_CERTIFIED", "certificate": "recovery_off_starvation",
+         "unmodeled": [], "input_hash": "same", "schedule_id": "sched-1"},
+        {"kind": "production", "request_id": "run-A", "attempt_id": "primary_hard",
+         "primary_hard_status": "INFEASIBLE", "input_hash": "same", "status_source": "raw",
+         "schedule_id": "sched-1"},
+        {"request_id": "run-B", "attempt_id": "primary_hard", "graph_model_stage": "primary_hard",
+         "graph_status": "FEASIBLE_WITNESS", "certificate": None, "unmodeled": [],
+         "input_hash": "same", "schedule_id": "sched-1"},
+    ])
+    j = join_by_run(recs)
+    # 같은 schedule-1 이지만 run-A / run-B 로 분리
+    assert ("run-A", "primary_hard") in j and ("run-B", "primary_hard") in j
+    assert j[("run-A", "primary_hard")]["graph"]["graph_status"] == "INFEASIBLE_CERTIFIED"
+    assert j[("run-B", "primary_hard")]["graph"]["graph_status"] == "FEASIBLE_WITNESS"

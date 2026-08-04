@@ -66,15 +66,16 @@ def analyze(records: list[dict]) -> dict:
     joined = join_by_run(records)
     from services.ontology_graph.short_circuit import ALLOWED_SHORT_CIRCUIT_CERTS
     a = {
-        "runs": len(joined), "paired": 0,
+        "runs": len(joined), "paired": 0, "comparable_raw_pairs": 0,
         "graph_status": Counter(), "certificate": Counter(), "unknown_reason": Counter(),
         "prod_primary_status": Counter(), "mismatch_reason": Counter(),
         "agree_infeasible": 0, "graph_infeasible": 0, "prod_primary_infeasible": 0,
-        "short_circuit_eligible": 0, "graph_false_certificate": 0,
-        "false_certificate_runs": [],
+        "structurally_eligible": 0, "shadow_validated_eligible": 0,
+        "graph_false_certificate": 0, "false_certificate_runs": [],
     }
     for key, slot in joined.items():
         g, p = slot["graph"], slot["production"]
+        struct = False
         if g:
             gs = g.get("graph_status", "?")
             a["graph_status"][gs] += 1
@@ -84,16 +85,32 @@ def analyze(records: list[dict]) -> dict:
                 a["certificate"][g["certificate"]] += 1
             if gs == "INFEASIBLE_CERTIFIED":
                 a["graph_infeasible"] += 1
-                if g.get("certificate") in ALLOWED_SHORT_CIRCUIT_CERTS and not g.get("unmodeled"):
-                    a["short_circuit_eligible"] += 1
+                # structurally eligible: graph 구조상 후보(≠ 실제 검증)
+                struct = (g.get("certificate") in ALLOWED_SHORT_CIRCUIT_CERTS
+                          and not g.get("unmodeled"))
+                if struct:
+                    a["structurally_eligible"] += 1
         if p:
             a["prod_primary_status"][p.get("primary_hard_status", "?")] += 1
             if p.get("primary_hard_status") == "INFEASIBLE":
                 a["prod_primary_infeasible"] += 1
+        # 비교 가능한 raw pair: 동일 run·stage·입력·raw status (표본 수의 기준)
+        comparable = bool(
+            g and p
+            and g.get("input_hash") == p.get("input_hash")
+            and g.get("graph_model_stage") == p.get("attempt_id")
+            and p.get("status_source") == "raw")
+        if g and p:
+            a["paired"] += 1
+        if comparable:
+            a["comparable_raw_pairs"] += 1
         if g and p and g.get("graph_status") == "INFEASIBLE_CERTIFIED":
             ps = p.get("primary_hard_status")
             if ps == "INFEASIBLE":
                 a["agree_infeasible"] += 1
+                # shadow-validated eligible: 실제 검증된 short-circuit 후보(canary 표본 기준)
+                if struct and comparable:
+                    a["shadow_validated_eligible"] += 1
             elif ps == "FEASIBLE":
                 reason = _classify_mismatch(g, p)
                 a["mismatch_reason"][reason] += 1
@@ -104,19 +121,21 @@ def analyze(records: list[dict]) -> dict:
 
 
 def report(a: dict) -> None:
-    print(f"shadow 실행 {a['runs']} (graph+production 페어 {a['paired'] or a['graph_infeasible']})\n")
-    print("판정 정확성(동일 primary_hard 기준):")
+    print(f"shadow 실행 {a['runs']} (페어 {a['paired']}, 비교가능 raw 페어 {a['comparable_raw_pairs']})\n")
+    print("판정 정확성(동일 primary_hard·raw 기준):")
     print(f"  ★ GRAPH_FALSE_CERTIFICATE(동일모델·in-scope·raw 인데 불일치): {a['graph_false_certificate']}  ← 반드시 0")
     if a["false_certificate_runs"]:
-        print(f"     반례 (request_id, attempt): {a['false_certificate_runs'][:5]}")
+        print(f"     반례 (run_id, attempt): {a['false_certificate_runs'][:5]}")
     print(f"  mismatch 사유 분류: {dict(a['mismatch_reason'])}")
     print(f"  graph INFEASIBLE ∧ prod primary INFEASIBLE 일치: {a['agree_infeasible']}/{a['graph_infeasible']}")
     print(f"\ngraph status 분포: {dict(a['graph_status'])}")
     print(f"UNKNOWN 사유: {dict(a['unknown_reason'])}  ← 재귀 hybrid 는 UNKNOWN_WIDTH 일 때만")
     print(f"production primary_hard 분포: {dict(a['prod_primary_status'])}")
     print(f"certificate 종류: {dict(a['certificate'])}")
-    print(f"\nshort-circuit 자격: {a['short_circuit_eligible']}건 "
-          f"→ GRAPH_FALSE_CERTIFICATE 0 이고 사례 충분할 때만 canary")
+    print("\nshort-circuit 자격(2단계 분리):")
+    print(f"  structurally_eligible(구조 후보): {a['structurally_eligible']}")
+    print(f"  ★ shadow_validated_eligible(검증된 후보=canary 표본): {a['shadow_validated_eligible']}")
+    print("  → GRAPH_FALSE_CERTIFICATE 0 이고 shadow_validated_eligible 충분할 때만 canary")
 
 
 def main(path):

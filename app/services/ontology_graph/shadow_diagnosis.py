@@ -59,14 +59,17 @@ def _sample_gate(request_id: str | None) -> bool:
 
 
 def run_shadow(nurses: list, config: dict, year: int, month: int, *,
-               request_id: str | None = None, attempt_id: str = "primary_hard",
+               request_id: str | None = None, schedule_id: str | None = None,
+               attempt_id: str = "primary_hard",
                graph_model_stage: str = "primary_hard",
                production_model_version: str | None = None,
                budget: int = 1_200_000) -> dict | None:
     """graph 진단을 shadow 로 실행·로그(graph-only; production 비교는 log_production_status 와
-    request_id+attempt_id 로 join). 운영 결과 무영향. 비활성/샘플제외/실패 시 None.
+    (request_id, attempt_id) 로 join). 운영 결과 무영향. 비활성/샘플제외/실패 시 None.
 
-    graph 는 **primary_hard 모델**(config 그대로, fallback 전)을 분석 → attempt_id/stage 로 표기.
+    **request_id 는 생성 요청마다 새 generation_run_id 여야 한다**(schedule_id 아님 — 같은 월
+    재생성 시 schedule_id 는 같아 오결합). schedule_id 는 메타데이터. graph 는 primary_hard 모델
+    (config 그대로) 분석 → attempt_id/stage 표기.
     """
     if not shadow_enabled() or not _sample_gate(request_id):
         return None
@@ -75,7 +78,7 @@ def run_shadow(nurses: list, config: dict, year: int, month: int, *,
     except Exception:
         return None
     rec: dict = {
-        "request_id": request_id, "attempt_id": attempt_id,
+        "request_id": request_id, "schedule_id": schedule_id, "attempt_id": attempt_id,
         "graph_model_stage": graph_model_stage,
         "year": year, "month": month, "num_days": num_days,
         "input_hash": _input_hash(nurses, config, num_days),
@@ -119,7 +122,8 @@ def run_shadow(nurses: list, config: dict, year: int, month: int, *,
 
 def log_production_status(nurses: list, config: dict, year: int, month: int,
                           primary_hard_status: str, *,
-                          request_id: str | None = None, attempt_id: str = "primary_hard",
+                          request_id: str | None = None, schedule_id: str | None = None,
+                          attempt_id: str = "primary_hard",
                           status_source: str = "raw", raw_solver_status: str | None = None,
                           final_service_status: str | None = None,
                           fallback_applied: str | None = None,
@@ -135,8 +139,8 @@ def log_production_status(nurses: list, config: dict, year: int, month: int,
         num_days = calendar.monthrange(int(year), int(month))[1]
     except Exception:
         return None
-    rec = {"kind": "production", "request_id": request_id, "attempt_id": attempt_id,
-           "year": year, "month": month, "num_days": num_days,
+    rec = {"kind": "production", "request_id": request_id, "schedule_id": schedule_id,
+           "attempt_id": attempt_id, "year": year, "month": month, "num_days": num_days,
            "input_hash": _input_hash(nurses, config, num_days),
            "primary_hard_status": primary_hard_status, "status_source": status_source,
            "raw_solver_status": raw_solver_status,

@@ -2849,6 +2849,16 @@ def optimize_fallback_lex_hard_first(
             if _reg_s1 is not None:
                 _reg_s1.attach_to_model()
             st = s1.Solve(m1)
+            # shadow ground truth(피드백 fix3): 첫 hard 솔브(=effective primary hard) raw status 저장.
+            try:
+                _st_txt = _cp_sat_status_to_text(st)
+                if not getattr(roster_system, "_primary_solver_status", None):
+                    roster_system._primary_solver_status = _st_txt
+                _sas = getattr(roster_system, "_solver_attempt_statuses", None) or {}
+                _sas.setdefault(str(attempt_label or "primary_hard"), _st_txt)
+                roster_system._solver_attempt_statuses = _sas
+            except Exception:
+                pass
             if st == cp_model.INFEASIBLE and _reg_s1 is not None:
                 try:
                     _fb_cores = _reg_s1.extract_conflict_cores(s1, solver_phase="fallback")
