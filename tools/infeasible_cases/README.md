@@ -194,7 +194,12 @@ separator 만 쓰지만, 이건 **factor 하이퍼그래프의 임의 separator*
 **component 분해 실증**: 강제OFF 로 절연된 2그룹 → 최상위 component **2개**로 분리, 각각
 독립 solve 후 AND (0.001s). = 진짜 separator 이득(sparse 결합).
 
-**경계(정직)**: generic min-degree conditioning 은 **dense 시간격자에선 비효율**(→UNKNOWN/느림).
-밀집 시간축은 frontier DP 의 temporal sweep 이 적합 → 둘은 **상보적**. 이상적 통합은
-"conditioning 으로 component 분리 → 각 component 를 frontier DP 로 sweep"(미구현). 미구현:
-context caching(같은 separator boundary 재사용), 부분-교환 그룹 대칭.
+**context caching(AND/OR, 구현됨)**: component feasibility 는 경계 배정에만 의존 → (cvars, ctx)
+memoize. 재구성 교차검증으로 correctness 유지 확인(불일치 0). **한계(정직)**: per-nurse factor 를
+날짜 전체 1개로 뒀기에 시간축 분할 boundary=전체 prefix(state 추상화 없음) → **dense 에선 캐시
+무력, UNKNOWN**(9s 내 bounded). 캐시 이득은 sparse·반복 subproblem 한정.
+
+**경계(정직)**: generic conditioning 은 **dense 시간격자에선 비효율**(→UNKNOWN). 밀집 시간축은
+frontier DP 의 temporal sweep(상태 추상화 O)이 적합 → 둘은 **상보적**. 진짜 dense 효율은 (a)
+상태변수 transition factor 분해 또는 (b) hybrid(component 분리→각 component frontier DP sweep)
+필요 — 둘 다 미구현. 그 외 미구현: 부분-교환 그룹 대칭.

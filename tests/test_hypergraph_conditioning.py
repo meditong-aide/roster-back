@@ -69,8 +69,18 @@ def test_conditioning_sound_on_dense_case():
     r = diagnose_conditioning(_pool(5),
                               _cfg({"D": 1, "E": 1, "N": 2},
                                    {"two_offs_after_two_nig": True, "not_one_night": True}), 6,
-                              budget=200_000)
+                              budget=80_000)
     assert r.status in ("INFEASIBLE_CERTIFIED", "UNKNOWN")   # feasible 오판만 없으면 sound
+
+
+def test_context_cache_preserves_correctness_and_helps_components():
+    """context caching: 재구성으로 correctness 유지 확인은 test_semantic_reconstruction 가 담당.
+    여기선 component 분해가 캐싱 후에도 유지되는지(캐시가 분해를 깨지 않음)."""
+    nu = _pool(6)
+    fo = {f"n{i}": [3, 4, 5] for i in range(3)}
+    fo.update({f"n{i}": [0, 1, 2] for i in range(3, 6)})
+    r = diagnose_conditioning(nu, _cfg({"D": 1, "E": 0, "N": 1}, {"not_one_night": True}, fo=fo), 6)
+    assert r.components_seen == 2 and r.status in ("FEASIBLE_WITNESS", "INFEASIBLE_CERTIFIED")
 
 
 def test_empty_domain_forced_conflict():

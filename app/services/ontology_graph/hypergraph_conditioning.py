@@ -15,6 +15,13 @@ monolithic DP 보다 이득.
            frontier_dp._options/_step 를 그대로 시뮬레이션 → 검증된 엔진과 동일 semantics.
   · Cf(d): 그날 D/E/N 커버리지.
   (banned/forced 는 x 도메인 정적 제약 + Nf 시뮬레이션에 반영.)
+
+context caching(AND/OR): component feasibility 는 경계(boundary) 배정에만 의존 → (cvars, ctx)
+로 memoize. correctness 는 재구성 교차검증으로 확인(불일치 0). **한계(정직)**: Nf 를 **날짜 전체
+1개 factor**로 뒀기 때문에 시간축 분할의 boundary = 전체 prefix(작은 state 로 추상화 안 됨) →
+**dense 시간격자에선 캐시가 잘 안 먹혀 UNKNOWN**. 그런 dense 는 frontier DP(상태 추상화 O)가
+담당. 캐시 이득은 sparse·반복 subproblem 에서. 진짜 dense 효율은 (a) 상태변수 transition factor
+분해 또는 (b) hybrid(component 분리→각 component 를 frontier DP sweep) 필요 — 미구현.
 """
 
 from __future__ import annotations
@@ -37,9 +44,14 @@ class Factor:
     pred: Callable                    # assign(dict) -> bool (scope 전체 배정됐다고 가정)
     kind: str = ""
     meta: dict = field(default_factory=dict)
+    scope_set: frozenset = field(default_factory=frozenset)
+
+    def __post_init__(self):
+        if not self.scope_set:
+            self.scope_set = frozenset(self.scope)
 
     def fully_assigned(self, assign: dict) -> bool:
-        return all(v in assign for v in self.scope)
+        return self.scope_set <= assign.keys()
 
 
 @dataclass
@@ -121,7 +133,7 @@ def _components(unassigned: set, factors: list) -> list:
         parent[find(a)] = find(b)
 
     for f in factors:
-        us = [v for v in f.scope if v in unassigned]
+        us = [v for v in f.scope_set if v in unassigned]
         for j in range(1, len(us)):
             union(us[0], us[j])
     groups: dict = {}
@@ -130,49 +142,75 @@ def _components(unassigned: set, factors: list) -> list:
     comp_of = {v: find(v) for v in unassigned}
     fac_by: dict = {r: [] for r in groups}
     for f in factors:
-        us = [v for v in f.scope if v in unassigned]
+        us = [v for v in f.scope_set if v in unassigned]
         if us:
             fac_by[comp_of[us[0]]].append(f)      # 미배정 변수는 한 component 에만
     return [(groups[r], fac_by[r]) for r in groups]
 
 
 def _pick(unassigned: set, factors: list, variables: dict):
-    """min-degree: 미배정 이웃이 가장 적은 변수(작은 separator 유도)."""
+    """min-degree(작은 separator) + 도메인/시간축 타이브레이크(temporal sweep 유도로 캐시 적중↑)."""
     deg = {v: 0 for v in unassigned}
     for f in factors:
-        us = [v for v in f.scope if v in unassigned]
+        us = [v for v in f.scope_set if v in unassigned]
         for v in us:
             deg[v] += len(us) - 1
-    # 도메인 작은 것 우선(타이브레이크) → 분기 축소
-    return min(unassigned, key=lambda v: (deg[v], len(variables[v])))
+    # 타이브레이크: 도메인 작은 것 → 이른 날(day) → 낮은 nurse. day-major 순회는 경계상태 재사용↑
+    return min(unassigned, key=lambda v: (deg[v], len(variables[v]), v[2], v[1]))
 
 
-def _solve(unassigned: set, factors: list, assign: dict, variables: dict, budget: list) -> bool:
+def _boundary_ctx(cvars: set, rel: list, assign: dict) -> tuple:
+    """component 의 **context** = rel factor scope 중 이미 배정된 경계변수 (v,val) 집합.
+
+    component 의 feasibility 는 이 context 에만 의존 → (cvars, ctx) 로 memoize 가능(AND/OR 캐싱).
+    """
+    seen = {}
+    for f in rel:
+        for v in f.scope_set:
+            if v not in cvars and v in assign:
+                seen[v] = assign[v]
+    return tuple(sorted(seen.items()))
+
+
+def _solve(cvars: set, factors: list, assign: dict, variables: dict,
+           budget: list, cache: dict) -> bool:
     budget[0] -= 1
     if budget[0] < 0:
         raise _Budget()
-    if not unassigned:
+    # cvars 를 실제로 건드리는 factor 만(캐시 키가 cvars 로 결정론적이도록)
+    rel = [f for f in factors if f.scope_set & cvars]
+    if not cvars:
         return all(f.pred(assign) for f in factors if f.fully_assigned(assign))
-    comps = _components(unassigned, factors)
+    key = (frozenset(cvars), _boundary_ctx(cvars, rel, assign))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    comps = _components(cvars, rel)
     if len(comps) > 1:
-        for cvars, cfacs in comps:                 # 독립 component → AND
-            if not _solve(cvars, cfacs, assign, variables, budget):
-                return False
-        return True
-    v = _pick(unassigned, factors, variables)
-    rest = unassigned - {v}
+        res = True
+        for cv, cf in comps:                       # 독립 component → AND
+            if not _solve(cv, cf, assign, variables, budget, cache):
+                res = False
+                break
+        cache[key] = res
+        return res
+    v = _pick(cvars, rel, variables)
+    rest = cvars - {v}
+    res = False
     for val in variables[v]:
         assign[v] = val
         ok = True
-        for f in factors:                          # v 로 완전배정된 factor 즉시 검사(가지치기)
-            if v in f.scope and f.fully_assigned(assign) and not f.pred(assign):
+        for f in rel:                              # v 로 완전배정된 factor 즉시 검사(가지치기)
+            if v in f.scope_set and f.fully_assigned(assign) and not f.pred(assign):
                 ok = False
                 break
-        if ok and _solve(rest, factors, assign, variables, budget):
-            del assign[v]
-            return True
+        if ok and _solve(rest, rel, assign, variables, budget, cache):
+            res = True
         del assign[v]
-    return False
+        if res:
+            break
+    cache[key] = res
+    return res
 
 
 @dataclass
@@ -203,8 +241,9 @@ def diagnose_conditioning(nurses: list, config: dict, num_days: int,
                                           witness=dict(f.meta)))
     top_comps = len(_components(unassigned, fg.factors))
     bud = [budget]
+    cache: dict = {}
     try:
-        feasible = _solve(unassigned, fg.factors, assign, fg.variables, bud)
+        feasible = _solve(unassigned, fg.factors, assign, fg.variables, bud, cache)
     except _Budget:
         return ConditioningResult("UNKNOWN", components_seen=top_comps)
     if feasible:
