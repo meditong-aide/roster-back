@@ -81,7 +81,9 @@ def _options(n: dict, state: tuple, day: int, config: dict, max_run: int, min_ru
     forced_off = day in n["foff"]
     max_work = config.get("max_consecutive_work")
     if k > 0:
-        return [] if (must_work or forced_off) else ["O"]
+        # 회복빚 중엔 O 만 가능. 강제OFF 도 O 를 원하므로 충족(과거 버그: forced_off 면 [] 반환해
+        # 회복빚+강제OFF 겹칠 때 잘못 사망 판정 → differential test 로 발견). 강제근무만 진짜 충돌.
+        return [] if must_work else ["O"]
     if forced_off:
         if r > 0 and r < min_run:
             return []
@@ -157,6 +159,36 @@ def _collapse_cert(frontier: set, day: int, config: dict, prepped: list,
         antecedents=[f"{day + 1}일: 근무가능 {best_avail}명이나 D{reqD}·E{reqE}·N{reqN} 를 "
                      f"개인 시퀀스/전이 규칙과 **동시**에 만족하는 배정이 없음"],
         witness={"day": day, "req": {"D": reqD, "E": reqE, "N": reqN}})
+
+
+_LABEL = {"D": 0, "E": 1, "N": 2, "O": 3}
+_LABEL_INV = {v: k for k, v in _LABEL.items()}
+
+
+def build_shift_automaton(config: dict):
+    """**공통 shift automaton** — _options/_step(검증된 semantics)에서 명시 transition table 추출.
+
+    두 backend 공유: graph 는 이 전이를 frontier 로, CP-SAT 은 AddAutomaton 으로 컴파일 → 야간
+    규칙(3N2OFF 등)이 두 backend 에서 **정확히 같은 의미**. 반환:
+      (state_id: dict[state->int], triples: [(tail, label, head)], initial=0, finals=list[int])
+    lenient terminal 이므로 finals = 모든 도달 상태. label: D0 E1 N2 O3.
+    """
+    max_run, rec_trig, min_run = _night_rules(config)
+    track_w = config.get("max_consecutive_work") is not None
+    track_prev = bool(config.get("forbid_night_to_day"))
+    dummy = {"work": {"D", "E", "N"}, "banned": {}, "foff": set()}
+    ids: dict = {(0, 0, 0, ""): 0}
+    triples: list = []
+    queue = [(0, 0, 0, "")]
+    while queue:
+        s = queue.pop()
+        for x in _options(dummy, s, 0, config, max_run, min_run):
+            ns = _step(s, x, config, track_w, track_prev)
+            if ns not in ids:
+                ids[ns] = len(ids)
+                queue.append(ns)
+            triples.append((ids[s], _LABEL[x], ids[ns]))
+    return ids, triples, 0, list(ids.values())
 
 
 def _rejection_breakdown(frontier: set, prepped: list, config: dict, day: int,

@@ -67,8 +67,8 @@ def _options(n: dict, state: tuple, day: int, config: dict, max_run: int, min_ru
     must_work = "O" in banned                 # OFF 금지 = 강제 근무
     forced_off = day in n["foff"]
     max_work = config.get("max_consecutive_work")
-    if k > 0:                                 # 회복 OFF 빚 → 반드시 OFF
-        return [] if (must_work or forced_off) else ["O"]
+    if k > 0:                                 # 회복 OFF 빚 → 반드시 OFF (강제OFF 도 O 라 충족)
+        return [] if must_work else ["O"]     # 강제근무만 진짜 충돌(과거: forced_off 도 [] = 버그)
     if forced_off:
         if r > 0 and r < min_run:
             return []                         # 짧은 run 을 OFF 로 강제종료 불가

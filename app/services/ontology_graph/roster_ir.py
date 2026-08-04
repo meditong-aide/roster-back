@@ -13,6 +13,9 @@ compile_graph(ir)            → (nurses, config)  그래프 엔진 입력
 compile_cpsat(ir)            → bool | None        CP-SAT feasibility (독립 backend)
 
 differential test: 같은 IR 에서 graph·CP-SAT·oracle 결과가 일치해야(불일치=인코딩/변환 버그).
+실측(242건): round-trip 0 · graph⟷oracle 0 · **CP-SAT⟷oracle 0**(공통 automaton 으로 야간
+시퀀스 의미 exact 일치). 이 differential 이 실제 코어 버그(회복빚+강제OFF `_options` 오사망)를
+발견·수정하게 함.
 """
 
 from __future__ import annotations
@@ -153,75 +156,63 @@ def compile_graph(ir: RosterConstraintIR):
     return nurses, config
 
 
-# ── Backend 2: IR → CP-SAT (독립 backend, IR 규칙을 직접 해석) ────────────────
+# ── Backend 2: IR → CP-SAT — 공통 shift automaton(AddAutomaton)으로 exact 컴파일 ──
 def compile_cpsat(ir: RosterConstraintIR, time_limit: float = 5.0):
-    """IR → CP-SAT feasibility. 규칙 객체를 직접 읽어 모델 생성(파라미터 재정의 없음)."""
+    """IR → CP-SAT feasibility. 야간 시퀀스는 graph 와 **동일한 공통 automaton**(build_shift_
+    automaton, _options/_step 기반)을 AddAutomaton 으로 컴파일 → 두 backend 의미 exact 일치.
+    커버리지는 label 채널링으로 부과. 미지원 규칙은 IR unsupported 로 이미 격리됨.
+    """
     try:
         from ortools.sat.python import cp_model
     except Exception:
         return None
+    from services.ontology_graph.frontier_dp import build_shift_automaton
+
+    nurses, config = compile_graph(ir)                 # IR → 엔진 config(automaton 유도용)
+    _, triples, start, finals = build_shift_automaton(config)
+    L = {"D": 0, "E": 1, "N": 2, "O": 3}
     days = ir.days
-    ids = [s.nurse_id for s in ir.nurses]
-    work_of = {s.nurse_id: (s.allowed or frozenset({"D", "E", "N"})) for s in ir.nurses}
-    cov = next((r for r in ir.rules if isinstance(r, CoverageRule)), CoverageRule(0, 0, 0))
-    recs = [r for r in ir.rules if isinstance(r, NightRecoveryRule)]
-    # max_run 은 _night_rules 와 동일 유도: 회복규칙 trigger_run + 명시 MaxConsecutiveNights 의 최소
-    caps = [r.trigger_run for r in recs]
-    caps += [r.limit for r in ir.rules if isinstance(r, MaxConsecutiveNightsRule)]
-    max_run = min(caps) if caps else 6
-    min_run = 2 if any(isinstance(r, NotOneNightRule) for r in ir.rules) else 1
-    off_after = max((r.required_off for r in recs), default=1) if recs else 1
-    maxw = next((r.limit for r in ir.rules if isinstance(r, MaxConsecutiveWorkRule)), None)
-    ntod = any(isinstance(r, TransitionBanRule) and (r.from_shift, r.to_shift) == ("N", "D")
-               for r in ir.rules)
+    specs = {s.nurse_id: (s.allowed or frozenset({"D", "E", "N"})) for s in ir.nurses}
     cells = {(r.nurse_id, r.day): r for r in ir.rules if isinstance(r, CellDomainRule)}
+    cov = next((r for r in ir.rules if isinstance(r, CoverageRule)), CoverageRule(0, 0, 0))
 
     m = cp_model.CpModel()
-    x = {}
-    for i in ids:
+    lab: dict = {}
+    isN: dict = {}
+    isD: dict = {}
+    isE: dict = {}
+    for s in ir.nurses:
+        i = s.nurse_id
+        labels = []
         for d in range(days):
-            row = {}
+            lv = m.NewIntVar(0, 3, f"lab_{i}_{d}")
+            # per-cell 허용 label(work·banned·forced_off) 제한
             cell = cells.get((i, d))
             banned = cell.banned if cell else frozenset()
-            for s in ("D", "E", "N", "O"):
-                v = m.NewBoolVar(f"x_{i}_{d}_{s}")
-                row[s] = v
-                if s in ("D", "E", "N") and s not in work_of[i]:
-                    m.Add(v == 0)
-                if s in banned:
-                    m.Add(v == 0)
-                if s == "O" and "O" in banned:
-                    m.Add(v == 0)
             if cell and cell.forced_off:
-                m.Add(row["O"] == 1)
-            m.Add(sum(row.values()) == 1)
-            x[i, d] = row
-    for d in range(days):
-        m.Add(sum(x[i, d]["D"] for i in ids) >= cov.reqD)
-        m.Add(sum(x[i, d]["E"] for i in ids) >= cov.reqE)
-        m.Add(sum(x[i, d]["N"] for i in ids) >= cov.reqN)
-    for i in ids:
-        N = [x[i, d]["N"] for d in range(days)]
-        D = [x[i, d]["D"] for d in range(days)]
-        O = [x[i, d]["O"] for d in range(days)]
-        for d in range(days - max_run):
-            m.Add(sum(N[d:d + max_run + 1]) <= max_run)
-        if min_run >= 2:
-            for d in range(1, days - 1):
-                m.AddBoolOr([N[d].Not(), N[d - 1], N[d + 1]])
-        for d in range(days - 1):
-            end = m.NewBoolVar(f"end_{i}_{d}")
-            m.Add(N[d] - N[d + 1] == 1).OnlyEnforceIf(end)
-            m.Add(N[d] - N[d + 1] <= 0).OnlyEnforceIf(end.Not())
-            for j in range(1, off_after + 1):
-                if d + j < days:
-                    m.Add(O[d + j] == 1).OnlyEnforceIf(end)
-        if ntod:
-            for d in range(days - 1):
-                m.Add(N[d] + D[d + 1] <= 1)
-        if maxw:
-            for d in range(days - maxw):
-                m.Add(sum(1 - O[e] for e in range(d, d + maxw + 1)) <= maxw)
+                allowed = {"O"}
+            else:
+                allowed = {c for c in ("D", "E", "N") if c in specs[i] and c not in banned}
+                if "O" not in banned:
+                    allowed.add("O")
+            for c in ("D", "E", "N", "O"):
+                if c not in allowed:
+                    m.Add(lv != L[c])
+            labels.append(lv)
+            bN = m.NewBoolVar(f"N_{i}_{d}")
+            bD = m.NewBoolVar(f"D_{i}_{d}")
+            bE = m.NewBoolVar(f"E_{i}_{d}")
+            for b, val in ((bN, 2), (bD, 0), (bE, 1)):
+                m.Add(lv == val).OnlyEnforceIf(b)
+                m.Add(lv != val).OnlyEnforceIf(b.Not())
+            isN[i, d], isD[i, d], isE[i, d] = bN, bD, bE
+        m.AddAutomaton(labels, start, finals, triples)   # 공통 automaton = 야간 시퀀스 exact
+        lab[i] = labels
+    for d in range(days):                                # 커버리지
+        m.Add(sum(isD[s.nurse_id, d] for s in ir.nurses) >= cov.reqD)
+        m.Add(sum(isE[s.nurse_id, d] for s in ir.nurses) >= cov.reqE)
+        m.Add(sum(isN[s.nurse_id, d] for s in ir.nurses) >= cov.reqN)
+
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
     solver.parameters.num_search_workers = 1
