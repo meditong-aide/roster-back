@@ -5608,7 +5608,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         # 운영 shadow 진단(env AIDE_SHADOW_DIAGNOSIS 게이팅, 기본 off=no-op). 결과 무영향, 로그만.
         # request_id=새 run_id(fix1). input_hash·model_signature 는 **여기서 한 번 확정**해 graph·
         # production 로그에 동일 전달(fix2·3 — 재hash·모델차이로 인한 오분류 방지).
+        # solve_context: run_id·attempt_seq·input_hash·model_signature 를 **여기서 한 번 확정**해
+        # graph·production 양쪽이 동일 값을 쓴다(fix3·C — 양쪽 drift 방지, 확실히 pair).
         _gen_run_id = _gen_ih = _gen_sig = _gen_nd = None
+        _gen_seq = 0
         try:
             import calendar as _cal
             import uuid as _uuid
@@ -5621,7 +5624,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             _gen_sig = _msig(_nurses_dict_for_precheck, precheck_config, _gen_nd)
             run_shadow(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
                        request_id=_gen_run_id, schedule_id=getattr(schedule, "schedule_id", None),
-                       attempt_id="primary_hard", input_hash=_gen_ih, model_signature=_gen_sig)
+                       attempt_id="primary_hard", attempt_seq=_gen_seq,
+                       input_hash=_gen_ih, model_signature=_gen_sig)
         except Exception:
             pass
         if has_blocking_issues(precheck_result):
@@ -5689,7 +5693,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             log_production_status(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
                                   _prod_status, request_id=_gen_run_id,
                                   schedule_id=getattr(schedule, "schedule_id", None),
-                                  attempt_id="primary_hard", status_source=_src, raw_solver_status=_raw,
+                                  attempt_id="primary_hard", attempt_seq=_gen_seq,
+                                  status_source=_src, raw_solver_status=_raw,
                                   input_hash=_gen_ih, model_signature=_gen_sig,
                                   production_model_stage="fallback_lex_stage1",
                                   production_validator_pass=None)  # validator 연결=운영 shift코드 확정 후

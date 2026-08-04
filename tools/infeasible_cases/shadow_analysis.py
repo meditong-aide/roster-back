@@ -80,8 +80,12 @@ def analyze(records: list[dict]) -> dict:
         "graph_status": Counter(), "certificate": Counter(), "unknown_reason": Counter(),
         "prod_primary_status": Counter(), "mismatch_reason": Counter(),
         "agree_infeasible": 0, "graph_infeasible": 0, "prod_primary_infeasible": 0,
-        "structurally_eligible": 0, "shadow_validated_eligible": 0,
-        "graph_false_certificate": 0, "false_certificate_runs": [],
+        "structurally_eligible": 0,
+        # canary 판단용 3분할(피드백):
+        "validated_infeasible_pairs": 0,       # graph INF ∧ prod raw INF ∧ 허용cert (validator 불필요)
+        "unresolved_feasible_mismatches": 0,   # graph INF ∧ prod raw FEAS ∧ 미확정 → canary 차단
+        "graph_false_certificate": 0,          # 위 + validator PASS = 진짜 치명
+        "false_certificate_runs": [], "unresolved_runs": [],
     }
     for key, slot in joined.items():
         g, p = slot["graph"], slot["production"]
@@ -95,7 +99,6 @@ def analyze(records: list[dict]) -> dict:
                 a["certificate"][g["certificate"]] += 1
             if gs == "INFEASIBLE_CERTIFIED":
                 a["graph_infeasible"] += 1
-                # structurally eligible: graph 구조상 후보(≠ 실제 검증)
                 struct = (g.get("certificate") in ALLOWED_SHORT_CIRCUIT_CERTS
                           and not g.get("unmodeled"))
                 if struct:
@@ -104,7 +107,6 @@ def analyze(records: list[dict]) -> dict:
             a["prod_primary_status"][p.get("primary_hard_status", "?")] += 1
             if p.get("primary_hard_status") == "INFEASIBLE":
                 a["prod_primary_infeasible"] += 1
-        # 비교 가능한 raw pair: 동일 입력·**동일 model_signature**·raw status (표본 수의 기준)
         comparable = bool(
             g and p
             and g.get("input_hash") == p.get("input_hash")
@@ -118,15 +120,21 @@ def analyze(records: list[dict]) -> dict:
             ps = p.get("primary_hard_status")
             if ps == "INFEASIBLE":
                 a["agree_infeasible"] += 1
-                # shadow-validated eligible: 실제 검증된 short-circuit 후보(canary 표본 기준)
-                if struct and comparable:
-                    a["shadow_validated_eligible"] += 1
+                # short-circuit 검증 표본: 둘 다 INFEASIBLE = Validator 불필요.
+                # (선택) certificate_replay_ok 로깅됐으면 True 인 것만.
+                replay = g.get("certificate_replay_ok")
+                if struct and comparable and replay is not False:
+                    a["validated_infeasible_pairs"] += 1
             elif ps == "FEASIBLE":
                 reason = _classify_mismatch(g, p)
                 a["mismatch_reason"][reason] += 1
                 if reason == "GRAPH_FALSE_CERTIFICATE":
                     a["graph_false_certificate"] += 1
                     a["false_certificate_runs"].append(key)
+                else:
+                    # 미확정 FEASIBLE 불일치도 canary 차단(무시 금지) — 원인 미확정이지 안전 아님
+                    a["unresolved_feasible_mismatches"] += 1
+                    a["unresolved_runs"].append((key, reason))
     return a
 
 
@@ -142,16 +150,20 @@ def report(a: dict) -> None:
     print(f"UNKNOWN 사유: {dict(a['unknown_reason'])}  ← 재귀 hybrid 는 UNKNOWN_WIDTH 일 때만")
     print(f"production primary_hard 분포: {dict(a['prod_primary_status'])}")
     print(f"certificate 종류: {dict(a['certificate'])}")
-    print("\nshort-circuit 자격(2단계 분리):")
+    print("\nshort-circuit canary 판단(3분할):")
     print(f"  structurally_eligible(구조 후보): {a['structurally_eligible']}")
-    print(f"  ★ shadow_validated_eligible(검증된 후보=canary 표본): {a['shadow_validated_eligible']}")
-    # 실패 0건이어도 표본 부족이면 위험 — rule of three(95% 상한 ≈ 3/N)
-    n = a["shadow_validated_eligible"]
+    print(f"  validated_infeasible_pairs(둘 다 INFEASIBLE=검증표본): {a['validated_infeasible_pairs']}")
+    print(f"  ★ unresolved_feasible_mismatches(원인 미확정 FEASIBLE 불일치): "
+          f"{a['unresolved_feasible_mismatches']}  ← canary 차단(0 이어야)")
+    if a["unresolved_runs"]:
+        print(f"     미확정 사례: {a['unresolved_runs'][:5]}")
+    n = a["validated_infeasible_pairs"]
+    canary_ok = (a["graph_false_certificate"] == 0
+                 and a["unresolved_feasible_mismatches"] == 0 and n >= 300)
     if a["graph_false_certificate"] == 0 and n > 0:
         print(f"  실패 0건 기준 오류율 95% 상한 ≈ {3.0 / n:.1%} (rule of three, N={n})")
-        print("  → 병동·규칙 유형 분포까지 확보 후에만 제한적 canary")
-    elif n == 0:
-        print("  → 검증 표본 0 — canary 불가(더 수집 필요)")
+    print(f"  canary 착수 가능: {'예' if canary_ok else '아니오'} "
+          f"(false-cert 0 ∧ unresolved 0 ∧ 검증표본≥300 ∧ 병동·규칙 분포 확인)")
 
 
 def main(path):

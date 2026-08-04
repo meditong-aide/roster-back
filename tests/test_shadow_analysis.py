@@ -48,13 +48,14 @@ def test_real_false_certificate_requires_validator_pass():
     assert a["mismatch_reason"]["GRAPH_FALSE_CERTIFICATE"] == 1
 
 
-def test_unvalidated_mismatch_not_confirmed():
-    """validator 미실행(None)이면 GRAPH_FALSE_CERTIFICATE 확정 안 함 → UNVALIDATED."""
+def test_unvalidated_mismatch_blocks_canary():
+    """validator 미실행(None) FEASIBLE 불일치 = 확정 안 하되 **canary 차단**(무시 금지)."""
     recs = parse_log([_line(_graph("r1", "INFEASIBLE_CERTIFIED", "recovery_off_starvation")),
                       _line(_prod("r1", "FEASIBLE", validator=None))])
     a = analyze(recs)
     assert a["graph_false_certificate"] == 0
     assert a["mismatch_reason"]["GRAPH_FALSE_CERTIFICATE_UNVALIDATED"] == 1
+    assert a["unresolved_feasible_mismatches"] == 1     # canary 차단 근거
 
 
 def test_model_signature_mismatch():
@@ -106,9 +107,10 @@ def test_eligibility_split_structural_vs_validated():
     ])
     a = analyze(recs)
     assert a["structurally_eligible"] == 3
-    assert a["shadow_validated_eligible"] == 1        # r1 만
+    assert a["validated_infeasible_pairs"] == 1        # r1 만(둘 다 INFEASIBLE·raw)
     assert a["comparable_raw_pairs"] == 1             # r1 만(raw)
     assert a["paired"] == 2                            # r1, r3
+    assert a["unresolved_feasible_mismatches"] == 0    # FEASIBLE 불일치 없음
 
 
 def test_same_schedule_different_runs_separated():
@@ -130,3 +132,19 @@ def test_same_schedule_different_runs_separated():
     assert ("run-A", "primary_hard", 1) in j and ("run-B", "primary_hard", 1) in j
     assert j[("run-A", "primary_hard", 1)]["graph"]["graph_status"] == "INFEASIBLE_CERTIFIED"
     assert j[("run-B", "primary_hard", 1)]["graph"]["graph_status"] == "FEASIBLE_WITNESS"
+
+
+def test_graph_and_production_pair_by_shared_seq():
+    """동일 run 내에서 graph·production 이 같은 attempt_seq 로 정확히 pair(fix C)."""
+    g = {"request_id": "A", "attempt_id": "primary_hard", "attempt_seq": 0,
+         "graph_model_stage": "primary_hard", "graph_status": "INFEASIBLE_CERTIFIED",
+         "certificate": "recovery_off_starvation", "unmodeled": [], "input_hash": "h",
+         "model_signature": "sig"}
+    p = {"kind": "production", "request_id": "A", "attempt_id": "primary_hard", "attempt_seq": 0,
+         "primary_hard_status": "INFEASIBLE", "input_hash": "h", "status_source": "raw",
+         "model_signature": "sig"}
+    j = join_by_run([g, p])
+    slot = j[("A", "primary_hard", 0)]
+    assert slot["graph"] is not None and slot["production"] is not None   # 정확히 pair
+    a = analyze([g, p])
+    assert a["comparable_raw_pairs"] == 1 and a["validated_infeasible_pairs"] == 1

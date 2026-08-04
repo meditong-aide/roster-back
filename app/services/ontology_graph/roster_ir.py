@@ -83,22 +83,35 @@ class RosterConstraintIR:
     unsupported: list = field(default_factory=list)
 
 
-def model_signature(nurses: list, config: dict, num_days: int) -> str:
-    """모델 **구조** 시그니처 — 활성 hard rule 종류+핵심 파라미터+horizon 의 해시.
+# 월 경계 상태에 영향을 주는 config 키(전월 말 꼬리 등) — 있으면 signature 에 포함.
+_BOUNDARY_KEYS = ("prev_month_n_tail", "prev_month_off_tail", "prev_month_last_is_off",
+                  "prev_month_n_offs_after", "cross_month", "horizon_mode")
 
-    CellDomain(개인 셀 제약)은 입력이므로 제외(input_hash 가 담당). 이 시그니처는 "graph 와
-    production 이 같은 hard model 을 비교하는가"를 확인하는 데 쓴다(다르면 false-cert 확정 불가).
+
+def model_signature(nurses: list, config: dict, num_days: int) -> str:
+    """**graph 가 분석한 hard model** 의 완전 매니페스트 해시 — 규칙+파라미터+horizon+개인 allowed
+    +날짜별 셀 제약(forbidden/forced)+커버리지+경계 상태까지 반영(피드백: 날짜별·개인별·경계 포함).
+
+    이 signature 가 production 의 것과 일치해야(또는 graph ⊆ production) 진짜 false-cert 확정 가능.
+    ※ 현재 production 은 내부 변환 모델을 별도 노출하지 않으므로, 이 값은 **동일 입력 config 로부터
+      graph 가 유도한 모델**을 나타낸다(production-transform 차이는 offline 관찰 대상, 문서화된 한계).
     """
     import hashlib
     ir = parse_to_ir(nurses, config, num_days)
     parts = [f"days={num_days}"]
+    # ① 비셀 규칙(회복·not_one_night·max_run·전이·커버리지) — 파라미터 포함
     for r in sorted((r for r in ir.rules if not isinstance(r, CellDomainRule)),
                     key=lambda x: type(x).__name__):
-        fields = {k: v for k, v in vars(r).items()}
-        parts.append(type(r).__name__ + ":" + repr(sorted(fields.items())))
-    # 간호사 work-set 프로필(정렬 멀티셋) — 야간전담 등 공급구조도 모델 일부
-    works = sorted(repr(sorted(s.allowed)) for s in ir.nurses)
-    parts.append("works=" + repr(works))
+        parts.append(type(r).__name__ + ":" + repr(sorted(vars(r).items())))
+    # ② 개인 allowed(공급구조)
+    parts.append("works=" + repr(sorted(repr(sorted(s.allowed)) for s in ir.nurses)))
+    # ③ 날짜별 셀 제약(개인·날짜별 forbidden/forced)
+    cells = sorted((r.nurse_id, r.day, tuple(sorted(r.banned)), r.forced_off)
+                   for r in ir.rules if isinstance(r, CellDomainRule))
+    parts.append("cells=" + repr(cells))
+    # ④ 월 경계 상태(있으면)
+    boundary = {k: config.get(k) for k in _BOUNDARY_KEYS if k in config}
+    parts.append("boundary=" + repr(sorted(boundary.items())))
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
