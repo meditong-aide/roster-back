@@ -74,3 +74,20 @@ def test_rejection_trace_embedded_in_collapse():
     rej = r.certificate.witness["rejection"]
     assert set(rej) >= {"day", "dead_states", "live_states", "best_cov", "binding"}
     assert isinstance(rej["day"], int)
+    # factor-level: 제거 사유가 factor 종류별로 집계됨(coverage 붕괴)
+    assert "rejected_by" in rej
+    assert sum(rej["rejected_by"].values()) > 0
+
+
+def test_rejection_trace_attributes_personal_sequence_collapse():
+    """N전담 banned 4연속: 모든 상태가 **개인 시퀀스 factor**로 사망(personal_dead)."""
+    nu = [{"nurse_id": "x", "name": "X", "grade": 1, "team_id": "A", "allowed_shifts": ["N"]}]
+    nu += [{"nurse_id": f"n{i}", "name": f"N{i}", "grade": 1, "team_id": "A"} for i in range(4)]
+    cfg = {"two_offs_after_three_nig": True, "not_one_night": True,
+           "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
+           "initial_constraints": {"forbidden": {"x": {2: ["O"], 3: ["O"], 4: ["O"], 5: ["O"]}},
+                                   "forced_off": {}}}
+    r = diagnose_frontier(nu, cfg, 7)
+    rej = r.certificate.witness["rejection"]
+    assert rej["rejected_by"]["personal_dead"] > 0
+    assert rej["rejected_by"]["D_coverage"] == 0    # 커버리지가 아니라 개인 시퀀스가 원인

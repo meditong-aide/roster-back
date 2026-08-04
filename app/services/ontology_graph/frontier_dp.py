@@ -159,6 +159,37 @@ def _collapse_cert(frontier: set, day: int, config: dict, prepped: list,
         witness={"day": day, "req": {"D": reqD, "E": reqE, "N": reqN}})
 
 
+def _rejection_breakdown(frontier: set, prepped: list, config: dict, day: int,
+                         reqs: tuple, max_run: int, min_run: int) -> dict:
+    """붕괴일 factor-level rejection trace — **어떤 이유가 후속을 제거했는가** 집계(proof 근거).
+
+    붕괴 직전 frontier(생존 상태)를 한 번 더 훑어(붕괴시 1회) 각 상태·조합의 제거 사유를
+    factor 종류별로 센다: 개인 시퀀스 사망(회복/전이/금지), D/E/N 커버리지 부족.
+    """
+    reqD, reqE, reqN = reqs
+    by = {"personal_dead": 0, "D_coverage": 0, "E_coverage": 0, "N_coverage": 0}
+    cand = 0
+    for js in frontier:
+        per = [_options(prepped[i], js[i], day, config, max_run, min_run)
+               for i in range(len(prepped))]
+        if any(not o for o in per):
+            by["personal_dead"] += 1               # 이 상태는 시퀀스로 사망(옵션 0)
+            continue
+        for combo in product(*per):
+            cand += 1
+            cD = sum(c == "D" for c in combo)
+            cE = sum(c == "E" for c in combo)
+            cN = sum(c == "N" for c in combo)
+            if cD < reqD:
+                by["D_coverage"] += 1
+            if cE < reqE:
+                by["E_coverage"] += 1
+            if cN < reqN:
+                by["N_coverage"] += 1
+    return {"predecessor_states": len(frontier), "candidate_combinations": cand,
+            "rejected_by": by}
+
+
 def _interchangeable(prepped: list, day_lo: int, day_hi: int) -> bool:
     """[day_lo, day_hi) 구간에서 모든 간호사가 교환가능한가 — **동일 in-window 시그니처**.
 
@@ -320,9 +351,12 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
     if mr.collapse is not None:
         rej = mr.collapse
         cert = _collapse_cert(rej.frontier, rej.day, config, prepped, reqs, max_run, min_run)
-        cert.witness["rejection"] = {"day": rej.day, "dead_states": rej.dead_states,
-                                     "live_states": rej.live_states, "best_cov": rej.best_cov,
-                                     "binding": list(rej.binding), "terminal": rej.terminal}
+        trace = {"day": rej.day, "dead_states": rej.dead_states, "live_states": rej.live_states,
+                 "best_cov": rej.best_cov, "binding": list(rej.binding), "terminal": rej.terminal}
+        if not rej.terminal and rej.frontier:
+            trace.update(_rejection_breakdown(rej.frontier, prepped, config, rej.day,
+                                              rej.reqs, max_run, min_run))
+        cert.witness["rejection"] = trace
         return FrontierResult(INFEASIBLE, certificate=cert, collapse_day=rej.day,
                               width_max=mr.width_max, reqs=reqs)
     return FrontierResult(FEASIBLE, width_max=mr.width_max, reqs=reqs)
