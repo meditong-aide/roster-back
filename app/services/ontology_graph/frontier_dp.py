@@ -191,12 +191,15 @@ def fresh_joint(k: int) -> tuple:
 
 
 def terminal_ok(joint_state: tuple, config: dict) -> bool:
-    """월말(또는 자기완결 구간) 종료 허용 상태? strict 모델: 회복빚 없고 너무 짧은 열린 run 없음."""
-    _, _, min_run = _night_rules(config)
+    """**closed-horizon**(자기완결 월) 종료 허용 상태? — 열린 야간 run 도 회복빚도 없어야 한다.
+
+    두 semantics 를 명확히 구분(피드백): (a) closed = 월 안에서 모든 run·회복을 끝냄 → r==0∧k==0.
+    (b) cross-month = 월말의 열린 상태를 다음 달로 전달 → terminal 강제 안 함(lenient, exit state
+    를 그대로 다음 component/달로 넘김). 여기 terminal_ok 는 (a) 용. 실서비스 기본은 (b)(lenient).
+    과거 r>=min_run 을 terminal 로 인정하던 건 "run 은 끝냈지만 회복 OFF 는 안 함"이라 애매 → 제거.
+    """
     for (r, k, w, prev) in joint_state:
-        if k > 0:                       # 회복 OFF 미상환
-            return False
-        if 0 < r < min_run:             # min_run 미만 열린 야간 run
+        if r != 0 or k != 0:            # 열린 run 또는 회복 OFF 미상환 → closed 종료 불가
             return False
     return True
 
@@ -286,7 +289,7 @@ def frontier_message(prepped: list, config: dict, day_lo: int, day_hi: int,
             return MessageResult(frozenset(), rej, width_max)
         width_max = max(width_max, len(nxt))
         frontier = nxt
-    if terminal == "strict":
+    if terminal in ("closed", "strict"):       # closed-horizon 종료필터(cross-month 는 lenient)
         filt = {s for s in frontier if terminal_ok(s, config)}
         if not filt:
             rej = RejectionStats(day_hi - 1, 0, len(frontier), (0, 0, 0), reqs, (),
@@ -301,8 +304,11 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
                       terminal: str = "lenient") -> FrontierResult:
     """{D,E,N,O} exact frontier DP 판정 + 붕괴 certificate. (frontier_message 의 fresh→end 특수화.)
 
-    symmetry: 교환가능 간호사 상태 정렬 축소(None=자동). terminal: lenient(cross-month)|strict(자기완결).
+    symmetry: 교환가능 간호사 상태 정렬 축소(None=자동). terminal: lenient(cross-month)|closed(자기완결).
     """
+    from services.ontology_graph.scope_manifest import exact_or_unknown
+    if exact_or_unknown(nurses, config):          # 미지원 hard constraint 활성 → exact 주장 금지
+        return FrontierResult(UNKNOWN, reqs=(_req(config, "D"), _req(config, "E"), _req(config, "N")))
     prepped = _prep(nurses, config)
     max_run, rec_trig, min_run = _night_rules(config)
     reqs = (_req(config, "D"), _req(config, "E"), _req(config, "N"))

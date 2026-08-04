@@ -86,6 +86,12 @@ def _solve_component(cvars: set, cfacs: list, prep: list, config: dict, num_days
 def solve_hybrid(nurses: list, config: dict, num_days: int,
                  budget: int = 6_000_000, cap: int = 200_000) -> HybridResult:
     """component 분해 → 각 component frontier DP → AND."""
+    from services.ontology_graph.scope_manifest import exact_or_unknown
+    reason = exact_or_unknown(nurses, config)
+    if reason:                                    # 미지원 hard constraint → exact 주장 금지
+        return HybridResult("UNKNOWN", components=0, certificate=Certificate(
+            kind="out_of_scope", group_id="manifest", capacity=0, demand=0, deficit=0,
+            antecedents=[reason], witness={"unmodeled": reason}))
     prep = _prep(nurses, config)
     fg = build_factor_graph(nurses, config, num_days)
     if any(len(dom) == 0 for dom in fg.variables.values()):
@@ -115,6 +121,20 @@ def solve_hybrid(nurses: list, config: dict, num_days: int,
                     antecedents=[f"{d + 1}일: 전원 강제배정만으로 커버리지 미달"
                                  f"(D{fD}/{rD} E{fE}/{rE} N{fN}/{rN})"], witness={"day": d}))
     comps = _components(unassigned, fg.factors)
+    # component ownership invariants(피드백): 각 미고정 변수·각 간호사가 정확히 한 component 여야
+    # 한다. _solve_component 이 간호사 전체 horizon 을 재sweep 하므로, 한 간호사가 두 component 에
+    # 걸치면 개인 제약을 이중처리 + 독립 오판(false feasible) 위험 → 안전하게 UNKNOWN.
+    nurse_of_comp: dict = {}
+    for idx, (cv, _) in enumerate(comps):
+        for v in cv:
+            prev = nurse_of_comp.setdefault(v[1], idx)
+            if prev != idx:
+                return HybridResult("UNKNOWN", components=len(comps), certificate=Certificate(
+                    kind="component_ownership_violation", group_id="invariant",
+                    capacity=0, demand=0, deficit=0,
+                    antecedents=[f"간호사 {prep[v[1]]['nid']} 가 복수 component 에 걸침 — "
+                                 f"BoundaryState message 연결 필요(미구현) → UNKNOWN"],
+                    witness={"nurse": prep[v[1]]["nid"]}))
     sizes = tuple(sorted(len({v[1] for v in cv}) for cv, _ in comps))
     bud = [budget]
     unknown = False

@@ -45,21 +45,22 @@ def test_message_composition_is_exact():
     assert checked > 30
 
 
-def test_terminal_ok_rules():
+def test_terminal_ok_closed_horizon():
+    """closed-horizon: 열린 run(r>0) 도 회복빚(k>0) 도 없어야 종료 허용(자기완결)."""
     cfg = {"not_one_night": True}
     assert terminal_ok(((0, 0, 0, ""),), cfg) is True
-    assert terminal_ok(((1, 0, 0, ""),), cfg) is False    # 고립 열린 야간 run
+    assert terminal_ok(((1, 0, 0, ""),), cfg) is False    # 열린 야간 run
     assert terminal_ok(((0, 1, 0, ""),), cfg) is False    # 회복 OFF 빚
-    assert terminal_ok(((2, 0, 0, ""),), cfg) is True     # run≥min_run 은 허용
+    assert terminal_ok(((2, 0, 0, ""),), cfg) is False     # run 끝냈어도 회복 미완=애매→불가
 
 
-def test_strict_terminal_rejects_lone_night_end():
-    """1명·1일·N수요1·not_one_night: lenient=feasible(고립 N 허용), strict=infeasible."""
+def test_closed_terminal_rejects_lone_night_end():
+    """1명·1일·N수요1·not_one_night: lenient=feasible(다음달로 전달), closed=infeasible."""
     nu = [{"nurse_id": "n0", "name": "N0", "grade": 1, "team_id": "A", "allowed_shifts": ["N"]}]
     cfg = {"not_one_night": True, "daily_shift_requirements": {"D": 0, "E": 0, "N": 1},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     assert diagnose_frontier(nu, cfg, 1, terminal="lenient").status == "FEASIBLE_WITNESS"
-    assert diagnose_frontier(nu, cfg, 1, terminal="strict").status == "INFEASIBLE_CERTIFIED"
+    assert diagnose_frontier(nu, cfg, 1, terminal="closed").status == "INFEASIBLE_CERTIFIED"
 
 
 def test_rejection_trace_embedded_in_collapse():
