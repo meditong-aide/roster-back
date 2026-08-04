@@ -1,17 +1,15 @@
-"""Solver-guided 파이프라인 — graph precheck → CP-SAT fallback (포지셔닝의 실코드).
+"""Solver-guided 파이프라인 — graph INFEASIBLE presolve → solver (포지셔닝의 실코드).
 
-피드백 커밋5: 그래프 계층을 **두 번째 솔버가 아니라 solver 의 presolve/설명 계층**으로 배선.
-graph 가 짧은 budget 안에 certificate 를 내면 CP-SAT 실행을 **생략**하고, 못 내면(UNKNOWN)
-CP-SAT 로 이관. "중복 계산"이 아니라 "빠른 사례는 solver 생략, 어려운 사례만 solver".
+피드백 교정: 근무표 서비스는 feasibility 판정뿐 아니라 **실제 근무표 생성·최적화**가 필요하다.
+따라서 graph 가 FEASIBLE 이라고 solver 를 생략하면 안 된다(배정 결과·공정성·선호 최적화·미지원
+soft/hard 제약이 남음). **solver 생략은 sound 한 INFEASIBLE certificate 를 얻었을 때만.**
 
-  graph = solve_hybrid(짧은 budget)
-  ├ INFEASIBLE_CERTIFIED → certificate 반환, CP-SAT 생략   (graph 가속)
-  ├ FEASIBLE_WITNESS     → feasible 반환, CP-SAT 생략       (지원범위 확정)
-  └ UNKNOWN(폭 초과/미지원) → CP-SAT fallback
+  graph INFEASIBLE_CERTIFIED → solver 생략, 원인 certificate 반환   (유일한 short-circuit)
+  graph FEASIBLE_WITNESS     → solver 실행(생성·최적화). graph 는 signal/domain reduction/warm-start
+  graph UNKNOWN              → solver 실행
 
-주의: 여기 CP-SAT 은 IR shadow compiler(compile_cpsat, 지원 제약만). 실서비스에선 이 fallback 이
-**운영 CP-SAT(전 제약)**이어야 미지원 제약까지 맞다. in-scope 벤치마크에선 compile_cpsat 가
-전 모델과 동치라 유효.
+주장 주의: "solver 생략률"은 **infeasible 사례 중 graph 가 INFEASIBLE 인증한 비율**로만 말해야
+한다. FEASIBLE 은 생략 대상이 아니다.
 """
 
 from __future__ import annotations
@@ -19,27 +17,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from services.ontology_graph.certificate import Certificate
+from services.ontology_graph.verifier import FeasibilityVerifier, ShadowIRVerifier
 
 
 @dataclass
 class PipelineResult:
     status: str                 # FEASIBLE / INFEASIBLE / UNKNOWN
-    via: str                    # graph / cpsat
+    via: str                    # graph_certificate / solver
     certificate: Certificate | None = None
-    cpsat_skipped: bool = False
+    solver_invoked: bool = False
+    graph_signal: str = ""      # graph 판정(FEASIBLE_WITNESS/UNKNOWN) — solver 실행 시 signal
 
 
 def diagnose_pipeline(nurses: list, config: dict, num_days: int,
-                      graph_budget: int = 2_000_000, cpsat_time: float = 5.0) -> PipelineResult:
-    """graph precheck 후 필요할 때만 CP-SAT."""
+                      graph_budget: int = 2_000_000,
+                      verifier: FeasibilityVerifier | None = None) -> PipelineResult:
+    """graph INFEASIBLE presolve 후, 그 외에는 항상 solver 실행(생성·최적화 위해)."""
     from services.ontology_graph.hybrid_solver import solve_hybrid
     gr = solve_hybrid(nurses, config, num_days, budget=graph_budget)
     if gr.status == "INFEASIBLE_CERTIFIED":
-        return PipelineResult("INFEASIBLE", "graph", certificate=gr.certificate, cpsat_skipped=True)
-    if gr.status == "FEASIBLE_WITNESS":
-        return PipelineResult("FEASIBLE", "graph", cpsat_skipped=True)
-    # UNKNOWN → CP-SAT fallback
-    from services.ontology_graph.roster_ir import compile_cpsat, parse_to_ir
-    cp = compile_cpsat(parse_to_ir(nurses, config, num_days), time_limit=cpsat_time)
-    status = {True: "FEASIBLE", False: "INFEASIBLE", None: "UNKNOWN"}[cp]
-    return PipelineResult(status, "cpsat", cpsat_skipped=False)
+        # 유일한 sound short-circuit: 지원 subset infeasible ⟹ 전체 infeasible
+        return PipelineResult("INFEASIBLE", "graph_certificate", certificate=gr.certificate,
+                              solver_invoked=False)
+    # FEASIBLE/UNKNOWN → solver 로 실제 판정·생성(graph 는 signal). production verifier 주입 권장.
+    v = verifier or ShadowIRVerifier()
+    res = v.check(nurses, config, num_days)
+    status = {True: "FEASIBLE", False: "INFEASIBLE", None: "UNKNOWN"}[res.feasible]
+    return PipelineResult(status, "solver", solver_invoked=True, graph_signal=gr.status)

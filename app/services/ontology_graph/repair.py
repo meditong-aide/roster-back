@@ -1,11 +1,12 @@
 """Graph repair → CP-SAT verify — certificate 기반 복구 후보를 이중 검증.
 
 피드백 커밋6(최고 가치): infeasibility certificate 의 antecedent 로 복구 후보를 만들고,
-**graph 로 domain_verified**, **CP-SAT 로 solver_verified** 로 구분한다. 사용자에게는
-solver_verified 만 확정 해결책으로 노출(3-tier: suggested → domain_verified → solver_verified).
+graph(domain_verified) + verifier 로 이중검증. 3-tier:
+  suggested → domain_verified(graph, FEASIBLE_WITNESS 일 때만) → solver_verified(운영 exact verifier).
 
-주의: 여기 solver_verified 는 IR shadow CP-SAT(지원 제약만). 실서비스는 운영 CP-SAT(전 제약)
-으로 최종 검증해야 미지원 제약까지 반영된 진짜 solver_verified 다.
+교정(피드백): ① domain_verified 는 FEASIBLE_WITNESS 만 True(UNKNOWN=None, INFEASIBLE=False).
+② 근사 shadow CP-SAT 결과는 solver_verified 가 아니라 **shadow_cpsat** 로 분리. solver_verified
+는 운영 exact verifier(FeasibilityVerifier.exact=True)로만 부여.
 """
 
 from __future__ import annotations
@@ -18,8 +19,10 @@ from dataclasses import dataclass
 class RepairCandidate:
     action: str
     target: dict
-    domain_verified: bool = False       # graph 재판정 통과
-    solver_verified: bool | None = None  # CP-SAT 통과(None=미실행/미지원)
+    domain_status: str = "UNKNOWN"       # graph 재판정 status(FEASIBLE/INFEASIBLE/UNKNOWN)
+    domain_verified: bool | None = None  # True=FEASIBLE만, False=INFEASIBLE, None=UNKNOWN
+    shadow_cpsat: bool | None = None     # 근사 shadow 결과(≠ solver_verified). production 검증 필요
+    solver_verified: bool | None = None  # 운영 exact verifier 통과 시에만 True
 
 
 def _apply(config: dict, cand: dict) -> dict:
@@ -63,10 +66,16 @@ def _candidates(config: dict, cert) -> list[dict]:
     return out
 
 
-def verify_repairs(nurses: list, config: dict, num_days: int,
-                   max_candidates: int = 12, use_solver: bool = True) -> list[RepairCandidate]:
-    """infeasible 이면 복구 후보 생성 → graph(domain) + CP-SAT(solver) 이중 검증. 아니면 []."""
+def verify_repairs(nurses: list, config: dict, num_days: int, max_candidates: int = 12,
+                   verifier=None) -> list[RepairCandidate]:
+    """infeasible 이면 복구 후보 → graph(domain_verified: FEASIBLE만) + verifier 이중검증.
+
+    verifier: FeasibilityVerifier. None=ShadowIRVerifier(근사→shadow_cpsat 채움). production
+    exact verifier(exact=True) 주입 시에만 solver_verified 를 채운다.
+    """
     from services.ontology_graph.hybrid_solver import solve_hybrid
+    from services.ontology_graph.verifier import ShadowIRVerifier
+    v = verifier or ShadowIRVerifier()
     base = solve_hybrid(nurses, config, num_days)
     if base.status != "INFEASIBLE_CERTIFIED":
         return []
@@ -74,14 +83,17 @@ def verify_repairs(nurses: list, config: dict, num_days: int,
     out: list[RepairCandidate] = []
     for c in cands:
         cfg2 = _apply(config, c)
-        dv = solve_hybrid(nurses, cfg2, num_days).status != "INFEASIBLE_CERTIFIED"
-        sv: bool | None = None
-        if use_solver:
-            from services.ontology_graph.roster_ir import compile_cpsat, parse_to_ir
-            cp = compile_cpsat(parse_to_ir(nurses, cfg2, num_days))
-            sv = (cp is True) if cp is not None else None
-        out.append(RepairCandidate(c["action"], c["target"], domain_verified=dv,
-                                   solver_verified=sv))
-    # solver_verified 우선, 그다음 domain_verified
-    out.sort(key=lambda r: (r.solver_verified is not True, not r.domain_verified))
+        st = solve_hybrid(nurses, cfg2, num_days).status
+        # 비대칭/UNKNOWN 락: FEASIBLE_WITNESS 만 domain_verified=True, UNKNOWN=None
+        dv = True if st == "FEASIBLE_WITNESS" else (False if st == "INFEASIBLE_CERTIFIED" else None)
+        vr = v.check(nurses, cfg2, num_days)
+        rc = RepairCandidate(c["action"], c["target"], domain_status=st, domain_verified=dv)
+        if vr.exact:                              # 운영 exact verifier → 진짜 solver_verified
+            rc.solver_verified = (vr.feasible is True)
+        else:                                     # 근사 shadow → shadow_cpsat 만
+            rc.shadow_cpsat = (vr.feasible is True) if vr.feasible is not None else None
+        out.append(rc)
+    # 확정순: solver_verified → domain_verified → shadow
+    out.sort(key=lambda r: (r.solver_verified is not True, r.domain_verified is not True,
+                            r.shadow_cpsat is not True))
     return out
