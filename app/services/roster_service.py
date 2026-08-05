@@ -263,6 +263,15 @@ def materialize_generation_config(
     return resolved
 
 
+# 미전송(None) 시 값을 덮어쓰지 않고 보존할 설정 키.
+#   저장 요청은 model_dump() 를 일괄 setattr 하므로, 이 필드를 모르는 화면이 저장하면
+#   기존 설정이 꺼진다. 신규 프리셋에서는 직전 최신 config 값을 승계한다.
+_PRESERVE_IF_NONE = (
+    "health_leave_enabled", "health_leave_weekend",
+    "sleep_off_enabled", "sleep_off_cycle",
+)
+
+
 def save_roster_config_service(
     config_data: RosterConfigCreate,
     user,
@@ -335,6 +344,10 @@ def save_roster_config_service(
             if db_config is None:
                 raise Exception("수정할 설정(config_id)을 찾을 수 없습니다.")
             for _key, _val in config_dict.items():
+                # ★ 미전송(None) 시 기존 값 유지 — 이 필드를 모르는 기존 저장 화면이
+                #   저장할 때마다 설정을 꺼버리는 사고를 막는다(스키마 기본값도 None).
+                if _val is None and _key in _PRESERVE_IF_NONE:
+                    continue
                 setattr(db_config, _key, _val)
             if config_name is not None:
                 db_config.config_name = config_name
@@ -346,6 +359,21 @@ def save_roster_config_service(
                 db_config.version = _next_config_version(db, target_office_id, target_group_id)
         else:
             # 신규 프리셋 — 그룹(office+group)별 version = MAX+1 (0부터)
+            # ★ 미전송 필드는 직전 최신 config 값을 승계 — 생성은 created_at DESC 로 config 를
+            #   고르므로, 승계하지 않으면 새 프리셋을 저장하는 순간 기능이 꺼진 채로 생성된다.
+            if any(config_dict.get(_k) is None for _k in _PRESERVE_IF_NONE):
+                _prev = (
+                    db.query(RosterConfigModel)
+                    .filter(
+                        RosterConfigModel.office_id == target_office_id,
+                        RosterConfigModel.group_id == target_group_id,
+                    )
+                    .order_by(RosterConfigModel.created_at.desc())
+                    .first()
+                )
+                for _k in _PRESERVE_IF_NONE:
+                    if config_dict.get(_k) is None:
+                        config_dict[_k] = getattr(_prev, _k, None) if _prev else None
             db_config = RosterConfigModel(
                 **config_dict,
                 office_id=target_office_id,

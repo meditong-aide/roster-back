@@ -21,9 +21,15 @@ dotenv.load_dotenv()
 
 
 class ShiftItem(BaseModel):
-    """Shift 요청 항목 (텍스트 + 사유)"""
+    """Shift 요청 항목 (텍스트 + 사유 + 극성)"""
     text: str  # 날짜+코드 형태의 요청 텍스트
     comment: str | None  # 사유 (없으면 null)
+    # 극성: 그 근무를 원하는가(want) 피하는가(avoid).
+    #   과거에는 Except 카테고리로 어휘("말고/빼고/제외/안 돼")를 매칭해 갈랐는데,
+    #   한국어 완곡 부정은 열린 집합이라 "부담스러워요"/"피했으면 좋겠어요" 같은 표현이
+    #   Shift 로 새어들어가 기피가 희망으로 뒤집혔다(실측 확인). 어휘 목록이 아니라
+    #   문장 의도를 묻는 독립 축으로 분리한다.
+    polarity: str = "want"
 
 
 class queryAnalyzer(BaseModel):
@@ -175,17 +181,81 @@ class queryAnalyzerPrompt:
             - 예) "주말엔 쉬고 싶다" → `"Shift": [{{"text": "매주 주말은 O로 줘", "comment": null}}]`
             - 예) "수요일은 OFF" → `"Shift": [{{"text": "매주 수요일은 O로 줘", "comment": null}}]`
             - 예) "평일엔 D, 주말엔 O" → `"Shift": [{{"text": "평일은 D로 줘", "comment": null}}, {{"text": "주말은 O로 줘", "comment": null}}]`
-            - 예) "10일은 D 말고" → `"Except": ["10일은 D 말고"]`
-            - 예) "수요일은 E 빼줘" → `"Except": ["수요일은 E 빼줘"]`
+            - 예) "10일은 D 말고" →
+                `"Shift": [{{"text": "10일은 D", "comment": null, "polarity": "avoid"}}]`
+            - 예) "수요일은 E 빼줘" →
+                `"Shift": [{{"text": "매주 수요일은 E", "comment": null, "polarity": "avoid"}}]`
+            - 예) "10일 나이트는 좀 부담스러워요" →
+                `"Shift": [{{"text": "10일은 N", "comment": "부담이 됩니다", "polarity": "avoid"}}]`
+            - 예) "가능하면 15일 나이트는 피했으면 좋겠어요" →
+                `"Shift": [{{"text": "15일은 N", "comment": null, "polarity": "avoid"}}]`
             5. Absolutely no duplication/mixing: do not put OFF and E together in one element.
             6. Final JSON Keys:
                 - Chat ― small talk unrelated to scheduling
-                - Shift ― requests for dates/shifts/OFF (각 항목은 {{"text": "...", "comment": "..."}} 형태)
-                - Preference ― coworker together/avoid preferences
-                - Except ― negative/exclusion requests (e.g., 말고, 빼고, 제외, 안 돼)
+                - Shift ― requests for dates/shifts/OFF
+                  (각 항목은 {{"text": "...", "comment": "...", "polarity": "want"|"avoid"}} 형태)
+                - Preference ― coworker together/avoid preferences (사람 이름이 나오는 경우만)
+                - Except ― (사용 중단) 항상 [] 로 두세요. 부정 요청도 Shift 에 polarity="avoid" 로 넣습니다.
                 - Others ― requests not fitting the above
                 * Empty categories must remain [].
                 * Element order must follow the input sequence.
+
+        ## 1-2. polarity 판정 (가장 중요)
+            근무/날짜 요청은 **전부 Shift 에 넣고**, 그 요청이 그 근무를
+            **원하는 것인지(want) 피하려는 것인지(avoid)** 를 polarity 로 표시합니다.
+
+            - 판정 기준은 **특정 단어가 있느냐가 아니라 문장 전체의 의도**입니다.
+              "말고/빼고/제외" 같은 단어가 없어도 회피 의도면 avoid 입니다.
+            - 완곡하거나 간접적인 표현도 회피 의도면 avoid 입니다.
+              예: "부담스러워요", "힘들 것 같아요", "피했으면 좋겠어요", "가능하면 안 했으면",
+                  "싫어요", "만 아니면", "자신이 없어요", "곤란해요"
+            - text 는 polarity 와 무관하게 **원문에 언급된 근무코드를 그대로** 씁니다.
+              회피 요청이라고 해서 다른 근무나 O 로 바꿔 추론하지 마세요.
+              예) "10일 나이트는 부담스러워요" → text "10일은 N", polarity "avoid" (O 로 바꾸면 오답)
+            - **제외구가 오히려 희망인 문장에 주의**하세요. 문장의 주된 요청이 무엇인지 보세요.
+              예) "10일 빼고는 다 D로 줘" → 주된 요청은 D 희망입니다.
+                  → Shift: [{{"text": "10일 제외 나머지는 D로 줘", "comment": null, "polarity": "want"}}]
+                  (avoid 만들지 마세요)
+            - **"빼달라/제외해달라" 는 두 가지로 갈립니다. 뒤에 다른 요청이 붙었는지 보세요.**
+
+              (가) **뒤에 적용 대상 요청이 있으면** = 그 요청의 적용 범위를 좁히는 말입니다.
+                   빠진 범위는 **언급이 없는 것**으로 두고 **항목을 만들지 마세요.**
+                   없는 요청을 avoid 로 만들면 그 날들이 하드 금지로 굳어집니다.
+                   예) "주말 빼고 평일에 D 위주로" → 요청은 평일 D 하나뿐입니다.
+                       → Shift: [{{"text": "평일은 D로 줘", "comment": null, "polarity": "want"}}]
+                       (주말 항목을 만들지 마세요. "주말은 O", "주말은 D" 어느 쪽도 오답입니다)
+                   예) "주말 제외 전부 N" →
+                       Shift: [{{"text": "주말 제외 나머지는 N로 줘", "comment": null, "polarity": "want"}}]
+                   예) "평일만 근무하고 싶어요" →
+                       Shift: [{{"text": "평일은 근무로 줘", "comment": null, "polarity": "want"}}]
+
+              (나) **뒤에 다른 요청이 없고 근무코드도 안 나오면** = 그 날(범위) 근무에서
+                   빼달라, 즉 **OFF 희망**입니다. want 로 만드세요. avoid 가 아닙니다.
+                   avoid 로 만들면 "쉬고 싶다" 가 "쉬지 마라" 로 뒤집힙니다.
+                   예) "주말은 빼주세요" →
+                       Shift: [{{"text": "매주 주말은 O로 줘", "comment": null, "polarity": "want"}}]
+                   예) "8일은 빼주세요" →
+                       Shift: [{{"text": "8일은 O로 줘", "comment": null, "polarity": "want"}}]
+                   예) "주말 근무는 빼주세요" →
+                       Shift: [{{"text": "매주 주말은 O로 줘", "comment": null, "polarity": "want"}}]
+                   ★ "근무", "스케줄" 같은 일반 명사는 근무코드가 아닙니다. 이것들과 함께
+                     쓰인 "빼달라/제외/안 넣어달라/비워달라" 도 전부 (나)입니다.
+                   ★ **질문·완곡 형태도 요청입니다.** "~가능할까요", "~해주실 수 있나요",
+                     "~하면 안 될까요" 를 Chat 으로 보내지 마세요. 빈 결과가 됩니다.
+                   예) "8일 근무 제외 가능할까요" →
+                       Shift: [{{"text": "8일은 O로 줘", "comment": null, "polarity": "want"}}]
+                   예) "8일은 비워주세요" →
+                       Shift: [{{"text": "8일은 O로 줘", "comment": null, "polarity": "want"}}]
+
+              ★ (나)와 달리 **근무코드가 명시된 회피**는 그 코드로 avoid 입니다.
+                예) "8일 D는 빼주세요" → Shift: [{{"text": "8일은 D", "comment": null, "polarity": "avoid"}}]
+                예) "주말 나이트는 힘들어요" → Shift: [{{"text": "매주 주말은 N", "comment": null, "polarity": "avoid"}}]
+              ★ 그 범위를 **적극적으로 요청**하는 문장은 그대로 want 입니다.
+                예) "주말엔 쉬고 싶어요" → Shift: [{{"text": "매주 주말은 O로 줘", "comment": null, "polarity": "want"}}]
+                예) "평일엔 D, 주말엔 O" → 둘 다 요청이므로 두 항목 모두 polarity "want"
+            - 같은 날짜에 want 와 avoid 를 동시에 만들지 마세요. 대체 근무가 지정되면 want 만 남깁니다.
+              예) "10일은 E 말고 D로 줘" →
+                  Shift: [{{"text": "10일은 D로 줘", "comment": null, "polarity": "want"}}]
 
         ## 2. Mandatory Rules
             {dynamic_shift_examples}
@@ -279,17 +349,18 @@ class queryAnalyzerPrompt:
 
             # OUTPUT:
                 {{
-                "processor": "5/5는 쉬고싶다 했으므로 O, 5/19는 나이트, 그 후 OFF 달라고 했으니 5/20은 O로 처리, 8일 데이 제외는 Except, 정간호사/문지영 관련은 preference로 순화 처리",
+                "processor": "5/5는 쉬고싶다 했으므로 O, 5/19는 나이트, 그 후 OFF 달라고 했으니 5/20은 O로 처리, 8일 데이 제외는 회피 의도라 polarity=avoid, 정간호사/문지영 관련은 preference로 순화 처리",
                 "Chat": [],
                 "Shift": [
-                    {{"text": "5/5은 O로 줘", "comment": "쉬고 싶어서요"}},
-                    {{"text": "5/19는 N로 줘", "comment": null}},
-                    {{"text": "5/20은 O로 줘", "comment": null}}
+                    {{"text": "5/5은 O로 줘", "comment": "쉬고 싶어서요", "polarity": "want"}},
+                    {{"text": "5/19는 N로 줘", "comment": null, "polarity": "want"}},
+                    {{"text": "5/20은 O로 줘", "comment": null, "polarity": "want"}},
+                    {{"text": "8일은 D", "comment": null, "polarity": "avoid"}}
                 ],
                 "Preference": [
                     "정간호사랑은 겹치기 싫어요", "문지영이랑은 겹치기 싫어요"
                 ],
-                "Except": ["8일은 D 빼줘"],
+                "Except": [],
                 "Others": []
                 }}
 
@@ -493,23 +564,35 @@ async def query_analyzer(state):
     pt = _count_messages_tokens([prompt.system, prompt.human], model_name)
 
     # ShiftItem을 dict로 변환하여 JSON 직렬화
-    shift_for_json = [{"text": s.text, "comment": s.comment} for s in shift] if shift else []
+    shift_for_json = [
+        {"text": s.text, "comment": s.comment, "polarity": getattr(s, "polarity", "want")}
+        for s in shift
+    ] if shift else []
     ct_json = json.dumps({"Chat": chat, "Shift": shift_for_json, "Preference": preference, "Except": except_, "Others": others}, ensure_ascii=False)
     ct = _count_tokens(ct_json, model_name)
     cost = _compute_cost(pt, ct, model_name)
     print(f'[토큰] {cost["usage"]} / {cost["cost_krw"]["total"]}원')
 
-    # shift를 {text, comment} 형태로 변환하여 반환
-    # shift_analyzer에 전달할 형태: texts와 comments 분리
-    shift_texts = [s.text for s in shift] if shift else []
-    shift_comments = [s.comment for s in shift] if shift else []
+    # polarity 로 선호(want)/기피(avoid)를 가른다.
+    #   want  → query_shift  → create_shift_analyzer
+    #   avoid → query_except → create_avoid_analyzer
+    # 레거시 Except 카테고리(구 프롬프트/구 모델 응답)는 avoid 로 흡수한다 — 프롬프트는
+    # 이제 Except 를 비우도록 지시하지만, 모델이 옛 습관대로 채워도 유실되지 않게 한다.
+    want_items = [s for s in (shift or []) if str(getattr(s, "polarity", "want")).lower() != "avoid"]
+    avoid_items = [s for s in (shift or []) if str(getattr(s, "polarity", "want")).lower() == "avoid"]
+
+    shift_texts = [s.text for s in want_items]
+    shift_comments = [s.comment for s in want_items]
+    avoid_texts = [s.text for s in avoid_items] + list(except_ or [])
+    print(f"[polarity 분리] want={len(shift_texts)}건, avoid={len(avoid_texts)}건"
+          f"{' (레거시 Except ' + str(len(except_)) + '건 흡수)' if except_ else ''}")
 
     ret = {
         "query_chat": chat,
-        "query_shift": shift_texts,  # 기존 호환성 유지
+        "query_shift": shift_texts,  # 기존 호환성 유지 (want 만)
         "query_shift_comments": shift_comments,  # 새로 추가: 사유 리스트
         "query_preference": preference,
-        "query_except": except_,
+        "query_except": avoid_texts,
         "query_others": others,
         "model": models_to_try[0]
     }

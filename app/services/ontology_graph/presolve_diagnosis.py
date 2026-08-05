@@ -21,6 +21,7 @@ import time
 from typing import Any, Dict, List
 
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
+from services.ontology_graph.blame import score_blame
 from services.ontology_graph.builder import UnifiedGraphInput, build_unified_graph
 from services.ontology_graph.recommender import recommend_actions
 from services.ontology_graph.supply_demand import (
@@ -163,6 +164,25 @@ def presolve_shortage_diagnosis(
     graph = build_unified_graph(gi, supply_demand=per, monthly_supply_demand=mon)
     actions = recommend_actions(graph)
 
+    # 문제 노드 랭킹(blame 전파) — "무엇/누구/어느 그룹이 가장 큰 병목인가" 결정론·설명가능.
+    # advisory: 실패해도 진단 전체를 막지 않는다.
+    problem_ranking: Dict[str, Any] = {}
+    try:
+        blame = score_blame(graph)
+
+        def _sd(s) -> Dict[str, Any]:
+            return {"node_id": s.node_id, "label": s.label, "blame": s.blame,
+                    "reasons": [{"label": lbl, "pct": pct} for _, lbl, _, pct in s.reasons]}
+
+        problem_ranking = {
+            "top_constraints": [_sd(s) for s in blame.top_constraints[:5]],
+            "top_groups": [_sd(s) for s in blame.top_groups[:5]],
+            "top_objects": [_sd(s) for s in blame.top_objects[:5]],
+            "converged": blame.converged,
+        }
+    except Exception as _blame_exc:  # noqa: BLE001
+        print(f"[Presolve] blame 랭킹 실패(무시): {_blame_exc}")
+
     # [관계 → 인원] 주말 요일별 부족의 최댓값 = 주말휴무를 풀어야 하는 최소 인원(각 해제가
     #   주말 매일 +1 공급). 조합 brute-force 없이 max-flow 로 '몇 명'을 직접 산출.
     weekend_release_needed = max((per.day_shortage.get(d, 0) for d in _wk_day_set), default=0)
@@ -260,5 +280,7 @@ def presolve_shortage_diagnosis(
         # 주말 요일별 max-flow 로 산출한, 주말휴무를 풀어야 하는 최소 인원(관계 분석 결과).
         "weekend_release_needed": weekend_release_needed,
         "per_day_bottleneck_cells": len(per.bottleneck_cells),
+        # 문제 노드 blame 랭킹 (무엇/누구/어느 그룹) — 설명 근거(reasons) 포함.
+        "problem_ranking": problem_ranking,
         "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
     }

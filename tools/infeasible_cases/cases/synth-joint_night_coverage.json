@@ -1,0 +1,97 @@
+{
+  "meta": {
+    "group_id": "SYNTH",
+    "source": "synthetic",
+    "name": "joint_night_coverage"
+  },
+  "year": 2026,
+  "month": 8,
+  "num_days": 31,
+  "config": {
+    "daily_shift_requirements": {
+      "D": 2,
+      "E": 1,
+      "N": 2
+    },
+    "off_days": 9,
+    "max_nig_per_month": 15,
+    "two_offs_after_two_nig": false,
+    "two_offs_after_three_nig": true,
+    "not_one_night": true,
+    "use_mid": false,
+    "initial_constraints": {
+      "forbidden": {},
+      "forced_off": {}
+    }
+  },
+  "nurses": [
+    {
+      "nurse_id": "nn1",
+      "name": "야간1",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "N"
+      ]
+    },
+    {
+      "nurse_id": "nn2",
+      "name": "야간2",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "N"
+      ]
+    },
+    {
+      "nurse_id": "de0",
+      "name": "주이브0",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "nurse_id": "de1",
+      "name": "주이브1",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "nurse_id": "de2",
+      "name": "주이브2",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "nurse_id": "de3",
+      "name": "주이브3",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "nurse_id": "de4",
+      "name": "주이브4",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "D",
+        "E"
+      ]
+    }
+  ]
+}

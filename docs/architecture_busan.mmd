@@ -1,0 +1,29 @@
+%% AIDE 간호 근무표 자동생성 서비스 — 시스템 아키텍처
+%% 애플리케이션·연산: AWS 서울 리전 / 데이터베이스: Naver Cloud(국내 CSP) — 전 구간 국내
+%%{init: {'flowchart': {'nodeSpacing': 18, 'rankSpacing': 26}}}%%
+flowchart TB
+    User["간호 관리자"]
+
+    subgraph AWS["AWS 서울 (국내)"]
+        direction TB
+        ALB["ALB · HTTPS/TLS"]
+        EC2["API · EC2/FastAPI<br/>Auto Scaling 2~8"]
+        SQS["SQS 큐"]
+        LAMBDA["엔진 · Lambda<br/>CP-SAT + LNS"]
+        LOG["S3 · CloudWatch"]
+    end
+
+    subgraph NCP["NAVER Cloud (국내 CSP)"]
+        DB[("MSSQL · 고가용성")]
+    end
+
+    User --> ALB --> EC2 --> SQS --> LAMBDA --> DB
+    EC2 --> DB
+    EC2 & LAMBDA -.-> LOG
+
+    classDef app fill:#E8F0FE,stroke:#4285F4,stroke-width:1px;
+    classDef compute fill:#E6F4EA,stroke:#34A853,stroke-width:1px;
+    classDef data fill:#E8EAED,stroke:#1A73E8,stroke-width:1px;
+    class EC2,ALB app;
+    class SQS,LAMBDA compute;
+    class DB data;

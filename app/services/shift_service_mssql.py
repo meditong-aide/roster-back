@@ -202,6 +202,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                     # 추가
                     "show_in_preference": s.show_in_preference, # True/False 또는 1/0
                     "off_swap_target": bool(getattr(s, "off_swap_target", False)),
+                    "health_leave_target": bool(getattr(s, "health_leave_target", False)),
+                    "sleep_off_target": bool(getattr(s, "sleep_off_target", False)),
                     "description": getattr(s, "description", None),
                 }
                 for s in shifts
@@ -287,6 +289,8 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 # 추가
                 "show_in_preference": s.show_in_preference,
                 "off_swap_target": bool(getattr(s, "off_swap_target", False)),
+                "health_leave_target": bool(getattr(s, "health_leave_target", False)),
+                "sleep_off_target": bool(getattr(s, "sleep_off_target", False)),
                 "description": getattr(s, "description", None),
             }
             for s in shifts
@@ -333,6 +337,8 @@ def _shift_row_to_dict(s: Shift) -> Dict[str, Any]:
         "id": getattr(s, "id", None),
         "show_in_preference": s.show_in_preference,
         "off_swap_target": bool(getattr(s, "off_swap_target", False)),
+        "health_leave_target": bool(getattr(s, "health_leave_target", False)),
+        "sleep_off_target": bool(getattr(s, "sleep_off_target", False)),
         "description": getattr(s, "description", None),
     }
 

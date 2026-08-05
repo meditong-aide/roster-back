@@ -1,0 +1,62 @@
+{
+  "meta": {
+    "group_id": "synthetic",
+    "source": "synthetic-hard-residual",
+    "name": "hard_residual_recovery_off_starvation",
+    "why": "N2/일 + run후 2 OFF 회복이 하루 1 OFF 자리와 충돌(회복=실제 OFF). N/notN 모델은 D/E 를 회복으로 관대 인정해 못 봄."
+  },
+  "year": 2026,
+  "month": 8,
+  "num_days": 6,
+  "config": {
+    "two_offs_after_two_nig": true,
+    "not_one_night": true,
+    "daily_shift_requirements": {
+      "D": 1,
+      "E": 1,
+      "N": 2
+    },
+    "initial_constraints": {
+      "forbidden": {},
+      "forced_off": {}
+    }
+  },
+  "nurses": [
+    {
+      "nurse_id": "n0",
+      "name": "N0",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "n1",
+      "name": "N1",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "n2",
+      "name": "N2",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "n3",
+      "name": "N3",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "n4",
+      "name": "N4",
+      "grade": 1,
+      "team_id": "A"
+    }
+  ],
+  "expected": {
+    "oracle": "INFEASIBLE",
+    "our_stack": "SILENT(gap)",
+    "family": "hard_residual",
+    "note": "정수-결합 잔여 — VE/frontier DP 엔진 대상"
+  }
+}

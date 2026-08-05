@@ -316,6 +316,13 @@ def check_grade_min_sum_exceeds_need(inp: PrecheckInput) -> List[Dict]:
             continue
         for d in range(inp.num_days):
             nd = _need(cfg, s, d)
+            # 요구 인원이 0 인 근무는 GRADE_DEFAULT_111(강제 grade-1 floor) 대상이 아니다.
+            #   floor 는 "그 근무를 세울 때 grade-1 을 1명 이상 넣어라"는 뜻이지
+            #   "그 근무를 반드시 세워라"가 아니다. need=0 이면 min_sum>0 이 항상 참이라
+            #   야간을 상시 운영하지 않는 병동(응급구조사 등)은 생성 자체가 막힌다.
+            #   22511fb(2026-06-25)가 check_grade_min_available_shortage 에 적용한 완화와 동일 논리.
+            if nd <= 0:
+                continue
             if min_sum > nd:
                 issues.append(
                     _issue(

@@ -1,0 +1,56 @@
+{
+  "meta": {
+    "group_id": "SYNTH",
+    "source": "synthetic",
+    "name": "weekend_off_bottleneck"
+  },
+  "year": 2026,
+  "month": 8,
+  "num_days": 31,
+  "config": {
+    "daily_shift_requirements": {
+      "D": 2,
+      "E": 1,
+      "N": 1
+    },
+    "off_days": 2,
+    "max_nig_per_month": 15,
+    "two_offs_after_two_nig": false,
+    "two_offs_after_three_nig": true,
+    "not_one_night": true,
+    "use_mid": false,
+    "initial_constraints": {
+      "forbidden": {},
+      "forced_off": {}
+    }
+  },
+  "nurses": [
+    {
+      "nurse_id": "n1",
+      "name": "A",
+      "grade": 1,
+      "team_id": "A",
+      "is_weekend_off": true
+    },
+    {
+      "nurse_id": "n2",
+      "name": "B",
+      "grade": 1,
+      "team_id": "A",
+      "is_weekend_off": true
+    },
+    {
+      "nurse_id": "n3",
+      "name": "C",
+      "grade": 1,
+      "team_id": "A",
+      "is_weekend_off": true
+    },
+    {
+      "nurse_id": "n4",
+      "name": "D",
+      "grade": 1,
+      "team_id": "A"
+    }
+  ]
+}

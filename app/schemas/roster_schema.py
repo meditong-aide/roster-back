@@ -56,6 +56,8 @@ class ShiftUpdateRequest(BaseModel):
     # 추가
     show_in_preference: Optional[bool] = None  # None이면 기존 값 유지
     off_swap_target: Optional[bool] = None  # None이면 기존 값 유지 (초과 OFF 변환 타깃)
+    health_leave_target: Optional[bool] = None  # None이면 기존 값 유지 (보건휴가 부여 대상 코드)
+    sleep_off_target: Optional[bool] = None  # None이면 기존 값 유지 (수면OFF 부여 대상 코드)
     description: Optional[str] = None  # 근무코드 설명. None이면 기존 값 유지
 
 
@@ -80,6 +82,8 @@ class ShiftAddRequest(BaseModel):
         False  # 기본 False, 프론트에서 안 보내면 자동 숨김
     )
     off_swap_target: Optional[bool] = False  # 초과 OFF 변환 타깃 (그룹당 1개)
+    health_leave_target: Optional[bool] = False  # 보건휴가 부여 대상 코드 (그룹당 1개)
+    sleep_off_target: Optional[bool] = False  # 수면OFF 부여 대상 코드 (그룹당 1개)
     description: Optional[str] = None  # 근무코드 설명
 
 
@@ -121,6 +125,12 @@ class RosterRequest(BaseModel):
     # per-nurse 월 야간 한도 하향 옵션 재생성용 — resolution_options[i].monthly_limit_release.
     #   [{nurse_id, field: "n_exact"|"n_max", value}] 를 해당 월 NurseMonthlyLimit 에 write 후 생성.
     monthly_limit_release: Optional[List[Dict[str, Any]]] = None
+    # per-nurse 금지근무 해제 옵션 재생성용 — resolution_options[i].banned_wanted_release.
+    #   [{nurse_id, days: [day_idx...]}] — 해당 셀 BannedWantedEntry.is_applied=False.
+    banned_wanted_release: Optional[List[Dict[str, Any]]] = None
+    # per-nurse 근무유형 추가 옵션 재생성용 — resolution_options[i].allowed_shift_add.
+    #   [{nurse_id, add: ["D","E"]}] — allowed_shifts period 에 합집합 write.
+    allowed_shift_add: Optional[List[Dict[str, Any]]] = None
     grade_strategy: Optional[str] = None  # 미지정 시 DB/서버 해석 전략 사용
     # 고급 추론: True 시 fallback_lex 솔버 시간 60s → 180s. 빡센 케이스(인원 vs demand
     # 비대칭, GRADE 제약 다수)에서 outlier 짜내기. 프론트 옵트인.
@@ -154,12 +164,52 @@ class PreferenceSubmit(BaseModel):
     month: int
 
 
+# 필드명 date 와 타입 date 가 같아 pydantic v2 가 어노테이션을 해석하지 못한다.
+# (CaseItem 은 Field() 대입이 없어 우연히 통과) — 별칭으로 충돌을 피한다.
+_EntryDate = date
+
+
+class WantedEntryItem(BaseModel):
+    """원티드 엔트리 1건. 날짜별 한 건이며 근무코드 1개를 가진다.
+
+    Notes:
+        - shift_id 는 shifts.shift_id(근무코드). 이름/색상은 담지 않으며 프론트가
+          근무코드 룩업과 조인해 표시한다.
+        - intent 는 'wanted'(선호)만 지원한다. 'avoid'(피하고 싶은 근무)는 저장
+          스키마·솔버 제약이 아직 없어 422 로 거절한다(별도 작업).
+    """
+
+    date: _EntryDate = Field(description="대상 날짜 (YYYY-MM-DD). 요청 year/month 와 같은 달이어야 한다.")
+    shift_id: str = Field(description="근무코드(shifts.shift_id). 원티드 노출 대상만 허용.")
+    intent: Literal["wanted", "avoid"] = Field(
+        default="wanted", description="wanted=선호, avoid=기피(미지원)"
+    )
+    comment: Optional[str] = Field(default=None, description="사유")
+
+
 class PreferenceData(BaseModel):
     year: int
     month: int
+    # 대상 그룹. 미지정 시 호출자 home group. 지정 시 home 과 다르면 403.
+    group_id: Optional[str] = Field(default=None)
     # data: dict
     data: Dict[str, Any] = Field(default_factory=dict)
     preference: Optional[List[Dict[str, Any]]] = None
+    # 원티드 엔트리 전량(replace-all). 지정 시 이 목록이 저장·조회·제출의 단일 원본이
+    # 되며 data 는 무시한다. 미지정(None) 이면 기존 data 기반 경로로 동작한다.
+    wanted_entries: Optional[List[WantedEntryItem]] = Field(default=None)
+    #: 자연어 원티드 문장. 지정하면 서버가 AIDE 로 분석해 `wanted_entries` 에 **병합**한다.
+    #: 이 덕분에 프론트는 `/wanted/invoke` 를 따로 부르지 않아도 되고, 저장·제출이
+    #: 호출 1회로 끝난다. 같은 날짜가 겹치면 **캘린더로 찍은 쪽(wanted_entries)이 우선**
+    #: 이다 — 사용자가 직접 고른 것이 문장 해석보다 확실하다.
+    #: 분석이 실패해도 저장은 진행된다(응답 metadata 에 알린다).
+    request: Optional[str] = Field(default=None)
+    #: 이 요청이 기피근무(intent="avoid")까지 **관리**하는가.
+    #: True 일 때만 `banned_wanted_entries`(source='nurse')를 페이로드로 replace 한다.
+    #: 기본 False 인 이유 — 기피근무 UI 가 없는 구 화면·모바일이 캘린더만 저장해도
+    #: 페이로드에 avoid 가 0건이라 **간호사가 낸 기피근무를 전량 삭제**해 버린다.
+    #: 기피를 다루는 화면만 True 를 실어 보낸다(0건 보내 전체 해제하는 것도 가능).
+    manages_avoid: bool = Field(default=False)
 
 
 class PublishRequest(BaseModel):
@@ -272,6 +322,26 @@ class RosterConfigBase(BaseModel):
     off_swap_enabled: bool = Field(
         default=False,
         description="초과 OFF 후처리 — True 시 baseline(off_days) 초과 OFF 를 shifts.off_swap_target=True 인 코드로 변환. 보호: 회복 OFF(1N/2N/3N 직후) / fixed_wanted / '주' / N전담",
+    )
+    # ★ 기본값이 None 인 이유 — 미전송 시 기존 값 유지.
+    #   save_roster_config_service 는 model_dump() 를 일괄 setattr 하므로, 기본값을 False 로
+    #   두면 이 필드를 모르는 기존 저장 화면이 저장할 때마다 설정이 꺼진다.
+    #   저장 루프의 _PRESERVE_IF_NONE 가드와 한 쌍이다.
+    health_leave_enabled: Optional[bool] = Field(
+        default=None,
+        description="보건휴가 자동 부여 — True 시 적격 간호사에게 월 1개를 shifts.health_leave_target=True 인 코드로 사전 주입. off_swap 과 달리 OFF 를 변환하지 않고 근무일을 대체하며 OFF 쿼터를 소비하지 않는다. 적격: 여성 · N전담 아님 · 고정근무 아님 · 임산부 아님. 미전송(None) 시 기존 값 유지",
+    )
+    health_leave_weekend: Optional[bool] = Field(
+        default=None,
+        description="보건휴가 주말 배치 허용 — False 시 평일에만 배치. health_leave_enabled=True 일 때만 의미가 있다. 미전송(None) 시 기존 값 유지",
+    )
+    sleep_off_enabled: Optional[bool] = Field(
+        default=None,
+        description="수면OFF 자동 부여 — True 시 N 연번이 sleep_off_cycle(기본 15)에 도달한 간호사에게 그 N 블록 종료 후 shifts.sleep_off_target=True 인 코드를 1개 부여. 미전송(None) 시 기존 값 유지",
+    )
+    sleep_off_cycle: Optional[int] = Field(
+        default=None,
+        description="수면OFF 트리거 주기(N 연번). 실측 15. sleep_off_enabled=True 일 때만 의미가 있다. 미전송(None) 시 기존 값 유지",
     )
 
 
@@ -777,6 +847,11 @@ class NurseMonthlyLimitItem(BaseModel):
     group_id: str
     year: int = Field(ge=2000, le=2100)
     month: int = Field(ge=1, le=12)
+    # 이 값이 실제로 나온 원본 행의 연/월(as-of 이월 출처).
+    # (year, month)=표시월. applied_from != 표시월 이면 과거 행에서 상속된 값,
+    # applied_from == 표시월 이면 그 달에 명시 저장된 값(모든 한도 null 이면 '명시적 해제').
+    applied_from_year: Optional[int] = Field(default=None)
+    applied_from_month: Optional[int] = Field(default=None)
 
     d_min: Optional[int] = Field(default=None, ge=0)
     d_max: Optional[int] = Field(default=None, ge=0)
@@ -868,12 +943,46 @@ class FixedWantedEntryCreate(BaseModel):
     reason: Optional[str] = None
 
 
+class BannedWantedEntryCreate(BaseModel):
+    """금지 원티드 항목 생성 요청 (셀당 금지 근무코드 배열)"""
+
+    nurse_id: str
+    shift_date: date
+    banned_shift_ids: List[str]  # 금지 근무코드(D/E/N), 1~2개
+    is_applied: bool = True
+    reason: Optional[str] = None
+
+
+class BannedWantedEntryResponse(BaseModel):
+    """금지 원티드 항목"""
+
+    id: int
+    group_id: str
+    year: int
+    month: int
+    nurse_id: str
+    shift_date: date
+    banned_shift_ids: List[str]
+    is_applied: bool
+    #: 출처 — 'hn'=수간호사 조정판, 'nurse'=간호사 본인이 원티드에서 낸 기피근무.
+    #: 조정판은 둘 다 보여주되 **저장(스냅샷 replace)은 hn 만** 건드린다. 프론트는
+    #: 이 값으로 출처를 표시하고, nurse 건은 적용/해제(toggle)만 하면 된다.
+    source: str = "hn"
+    reason: Optional[str] = None
+    created_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class FixedWantedCreate(BaseModel):
     """확정 원티드 저장 요청"""
 
     year: int
     month: int
     entries: List[FixedWantedEntryCreate]
+    # 금지 원티드(선택). None="banned 손대지 않음"(갱신 안 된 프론트 보호), []="전체 해제".
+    banned_entries: Optional[List[BannedWantedEntryCreate]] = None
 
 
 class FixedWantedEntryResponse(BaseModel):
@@ -954,6 +1063,8 @@ class AdjustmentNurse(BaseModel):
     nurse_id: str
     name: str
     entries: List[FixedWantedEntryResponse]
+    # 금지 원티드 항목(셀당 금지 근무코드 배열). fixed 와 시각 구분해 렌더.
+    banned_entries: List[BannedWantedEntryResponse] = Field(default_factory=list)
     monthly_summary: Dict[str, int]  # {"D": 5, "E": 3, "N": 2, "주": 4, ...}
     # 조회 병동 관할 외(파견/병동이동 상대 병동 소유) 일자.
     # 프론트는 이 일자를 저장/편집 불가(blocked)로 표기해야 한다.
@@ -967,16 +1078,21 @@ class AdjustmentResponse(BaseModel):
 
     nurses: List[AdjustmentNurse]
     has_fixed_wanted: bool = False  # 저장된 확정 원티드 존재 여부
+    has_banned_wanted: bool = False  # 저장된 금지 원티드 존재 여부
 
 
 class FixedWantedListResponse(BaseModel):
-    """확정 원티드 목록 조회 응답 (근무표 생성용)"""
+    """확정 원티드 목록 조회 응답 (근무표 생성용 / 저장 응답)"""
 
     group_id: str
     year: int
     month: int
     entries: List[FixedWantedEntryResponse]
     total_count: int
+    # 금지 원티드 저장 결과(저장 응답에서만 채워짐).
+    banned_entries: List[BannedWantedEntryResponse] = Field(default_factory=list)
+    # 비차단 통지: fixed 셀에 가려 무시된 금지(inert_on_fixed_cell), 용량 위험(coverage_risk) 등.
+    warnings: List[Dict[str, Any]] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

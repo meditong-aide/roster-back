@@ -1,0 +1,348 @@
+{
+  "meta": {
+    "group_id": "101358f4ef48",
+    "source": "live-capture"
+  },
+  "year": 2026,
+  "month": 8,
+  "num_days": 31,
+  "config": {
+    "daily_shift_requirements": {
+      "D": 2,
+      "E": 2,
+      "N": 1
+    },
+    "day_req": 2,
+    "eve_req": 2,
+    "nig_req": 1,
+    "off_days": 9.0,
+    "max_nig_per_month": 15,
+    "max_conseq_work": 5,
+    "two_offs_after_two_nig": false,
+    "two_offs_after_three_nig": true,
+    "not_one_night": true,
+    "banned_day_after_eve": true,
+    "use_mid": false,
+    "off_first": true,
+    "preceptee_on": true,
+    "initial_constraints": {
+      "forbidden": {
+        "298699": {
+          "0": [
+            "D",
+            "E",
+            "N"
+          ],
+          "1": [
+            "D",
+            "E"
+          ],
+          "2": [
+            "D",
+            "E"
+          ],
+          "3": [
+            "D",
+            "E"
+          ],
+          "4": [
+            "D",
+            "E"
+          ],
+          "5": [
+            "D",
+            "E"
+          ],
+          "6": [
+            "D",
+            "E"
+          ],
+          "7": [
+            "D",
+            "E"
+          ],
+          "8": [
+            "D",
+            "E"
+          ],
+          "9": [
+            "D",
+            "E"
+          ],
+          "10": [
+            "D",
+            "E",
+            "O"
+          ],
+          "11": [
+            "D",
+            "E",
+            "O"
+          ],
+          "12": [
+            "D",
+            "E",
+            "O"
+          ],
+          "13": [
+            "D",
+            "E",
+            "O"
+          ],
+          "14": [
+            "D",
+            "E"
+          ],
+          "15": [
+            "D",
+            "E"
+          ],
+          "16": [
+            "D",
+            "E"
+          ],
+          "17": [
+            "D",
+            "E"
+          ],
+          "18": [
+            "D",
+            "E"
+          ],
+          "19": [
+            "D",
+            "E"
+          ],
+          "20": [
+            "D",
+            "E"
+          ],
+          "21": [
+            "D",
+            "E"
+          ],
+          "22": [
+            "D",
+            "E"
+          ],
+          "23": [
+            "D",
+            "E"
+          ],
+          "24": [
+            "D",
+            "E"
+          ],
+          "25": [
+            "D",
+            "E"
+          ],
+          "26": [
+            "D",
+            "E"
+          ],
+          "27": [
+            "D",
+            "E"
+          ],
+          "28": [
+            "D",
+            "E"
+          ],
+          "29": [
+            "D",
+            "E"
+          ],
+          "30": [
+            "D",
+            "E"
+          ]
+        },
+        "383440": {
+          "0": [
+            "D"
+          ]
+        },
+        "418623": {
+          "0": [
+            "D",
+            "N"
+          ],
+          "1": [
+            "N"
+          ],
+          "2": [
+            "N"
+          ],
+          "3": [
+            "N"
+          ],
+          "4": [
+            "N"
+          ],
+          "5": [
+            "N"
+          ],
+          "6": [
+            "N"
+          ],
+          "7": [
+            "N"
+          ],
+          "8": [
+            "N"
+          ],
+          "9": [
+            "N"
+          ],
+          "10": [
+            "N"
+          ],
+          "11": [
+            "N"
+          ],
+          "12": [
+            "N"
+          ],
+          "13": [
+            "N"
+          ],
+          "14": [
+            "N"
+          ],
+          "15": [
+            "N"
+          ],
+          "16": [
+            "N"
+          ],
+          "17": [
+            "N"
+          ],
+          "18": [
+            "N"
+          ],
+          "19": [
+            "N"
+          ],
+          "20": [
+            "N"
+          ],
+          "21": [
+            "N"
+          ],
+          "22": [
+            "N"
+          ],
+          "23": [
+            "N"
+          ],
+          "24": [
+            "N"
+          ],
+          "25": [
+            "N"
+          ],
+          "26": [
+            "N"
+          ],
+          "27": [
+            "N"
+          ],
+          "28": [
+            "N"
+          ],
+          "29": [
+            "N"
+          ],
+          "30": [
+            "N"
+          ]
+        }
+      },
+      "forced_off": {
+        "298699": [
+          0,
+          1
+        ],
+        "410251": [
+          0
+        ],
+        "418623": [
+          0
+        ]
+      }
+    }
+  },
+  "nurses": [
+    {
+      "nurse_id": "298699",
+      "name": "장세현",
+      "grade": 1,
+      "allowed_shifts": [
+        "N"
+      ],
+      "is_weekend_off": false,
+      "n_exact": 15,
+      "n_min": 15,
+      "n_max": 15,
+      "joining_date": "2022-02-22T00:00:00"
+    },
+    {
+      "nurse_id": "390658",
+      "name": "표유진",
+      "grade": 1,
+      "allowed_shifts": [],
+      "is_weekend_off": false,
+      "joining_date": "2024-07-24T00:00:00"
+    },
+    {
+      "nurse_id": "410251",
+      "name": "한수아",
+      "grade": 1,
+      "allowed_shifts": [],
+      "is_weekend_off": false,
+      "joining_date": "2025-01-08T00:00:00"
+    },
+    {
+      "nurse_id": "383440",
+      "name": "박지은",
+      "grade": 1,
+      "allowed_shifts": [],
+      "is_weekend_off": false,
+      "joining_date": "2024-05-02T00:00:00"
+    },
+    {
+      "nurse_id": "429090",
+      "name": "유은혜",
+      "grade": 1,
+      "allowed_shifts": [],
+      "is_weekend_off": false,
+      "joining_date": "2025-07-16T00:00:00"
+    },
+    {
+      "nurse_id": "292182",
+      "name": "김원아",
+      "grade": 1,
+      "allowed_shifts": [],
+      "is_weekend_off": false,
+      "joining_date": "2021-12-01T00:00:00"
+    },
+    {
+      "nurse_id": "418623",
+      "name": "김민진",
+      "grade": 1,
+      "allowed_shifts": [
+        "D",
+        "E"
+      ],
+      "is_weekend_off": false,
+      "joining_date": "2025-03-04T00:00:00"
+    }
+  ],
+  "expected": {
+    "classification": "personal_infeasible",
+    "top_family": "banned_wanted",
+    "certificate": "장세현 11일 — N전담 간호사에게 금지된 근무(OFF 금지)가 몰려 야간 회복 규칙을 지킬 배열이 없어요. 그 간호사 금지근무를 풀거나 근무유형(D/E)을 추가하면 돼요."
+  }
+}
