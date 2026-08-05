@@ -16,6 +16,8 @@ feasible 이 난다. 따라서 "지원 제약 목록"을 두고, 목록 밖 hard
 미지원(활성 시 UNKNOWN):
   · 월 N quota(n_exact/n_min/n_max, max/min_nig_per_month) · 월 OFF quota(off_days)
   · 주말휴무(is_weekend_off) · 야간전담 월한도 · Grade/Team 최소인원 · 프리셉터 · 상호배제
+  · 보건휴가(health_leave_enabled → 대상자 OFF 하한 +1 HARD) — 그래프 미모델
+  (수면OFF sleep_off_enabled 은 순수 post-process=솔브 feasibility 무영향 → 여기 불포함)
 """
 
 from __future__ import annotations
@@ -28,9 +30,12 @@ _UNSUPPORTED_CONFIG = (
     "off_days", "min_off_days", "weekend_off", "weekend_off_ids",
     "grade_requirements", "grade_min", "team_requirements", "team_min",
     "preceptor_pairs", "mutual_exclusion", "pairing",
+    # 보건휴가: 활성 시 대상자 OFF 하한 +1(HARD, 솔브 전) — 그래프가 OFF 하한 미모델 → 미지원.
+    "health_leave_enabled",
 )
 # per-nurse 미지원 마커
-_UNSUPPORTED_NURSE = ("n_exact", "n_min", "n_max", "is_weekend_off", "is_night_only")
+_UNSUPPORTED_NURSE = ("n_exact", "n_min", "n_max", "is_weekend_off", "is_night_only",
+                      "health_leave_extra_off")   # 보건휴가 대상자 OFF 하한 가산(HARD)
 
 
 def _active(v) -> bool:

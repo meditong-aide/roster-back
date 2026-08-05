@@ -65,3 +65,15 @@ def test_hybrid_feasible_subset_with_unmodeled_is_unknown():
     nu = [{"nurse_id": f"n{i}"} for i in range(6)]
     nu[0]["is_weekend_off"] = True
     assert solve_hybrid(nu, _cfg(), 5).status == "UNKNOWN"
+
+
+def test_health_leave_flags_unmodeled():
+    """보건휴가(OFF 하한 +1 HARD) 활성 시 그래프 미지원 → FEASIBLE 주장 금지(UNKNOWN)."""
+    from services.ontology_graph.scope_manifest import unmodeled_active
+    nu = [{"nurse_id": f"n{i}"} for i in range(6)]
+    assert "config.health_leave_enabled" in unmodeled_active(nu, _cfg({"health_leave_enabled": True}))
+    nu2 = [dict(n) for n in nu]
+    nu2[0]["health_leave_extra_off"] = True
+    assert "nurse.health_leave_extra_off" in unmodeled_active(nu2, _cfg())
+    # 지원 subset feasible + 보건휴가 → UNKNOWN(비대칭 scope)
+    assert solve_hybrid(nu, _cfg({"health_leave_enabled": True}), 6).status == "UNKNOWN"
