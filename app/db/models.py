@@ -883,6 +883,30 @@ class WantedRequest(Base):
     submitted_at = Column(DATETIME, nullable=True)
 
 
+class WantedMonthlyMemo(Base):
+    """원티드 작성 화면의 월별 메모. 날짜·근무와 무관한 그 달 전체 메모다.
+
+    ★ 왜 별도 테이블인가
+      `wanted_requests` 는 월 헤더가 아니라 요청 단위 행이다(실측: 한 간호사·월에
+      최대 198행). 거기에 컬럼을 붙이면 어느 행에 쓸지가 모호해진다.
+    ★ 왜 별도 엔드포인트인가
+      `POST /preferences` 는 저장 한 번에 BannedWantedEntry · NurseShiftRequest ·
+      NursePairRequest 를 delete-then-insert 한다. 메모는 입력 중 디바운스로 자주
+      저장되므로 그 경로를 타면 원티드가 통째로 지워질 위험이 크다.
+
+    PK 가 (nurse_id, group_id, year, month) 라 월당 1행이고 upsert 가 단순하다.
+    """
+
+    __tablename__ = "wanted_monthly_memo"
+    nurse_id = Column(VARCHAR(50), primary_key=True)
+    group_id = Column(VARCHAR(50), primary_key=True)
+    year = Column(SMALLINT, primary_key=True)
+    month = Column(TINYINT, primary_key=True)
+    # NULL = 메모 없음(삭제된 상태). 빈 문자열도 삭제로 정규화해 저장한다.
+    memo = Column(TEXT, nullable=True)
+    updated_at = Column(DATETIME, nullable=False, default=func.now())
+
+
 class NurseShiftRequest(Base):
     __tablename__ = "nurse_shift_requests"
     nurse_id = Column(VARCHAR(50), primary_key=True)

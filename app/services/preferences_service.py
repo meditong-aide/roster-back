@@ -7,7 +7,7 @@ import json
 import pprint
 from sqlalchemy.orm import Session
 from sqlalchemy import String, cast, extract, inspect as sa_inspect
-from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted
+from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted, WantedMonthlyMemo
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
 from services.group_access import resolve_home_group_id
@@ -1272,3 +1272,118 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             "data": data_json,
         })
     return results
+
+# ──────────────────────────────────────────────────────────────
+# 원티드 월별 메모
+#   ★ 원티드 저장 경로(submit_preferences_service)와 **완전히 분리**한다.
+#     그 경로는 저장 한 번에 BannedWantedEntry · NurseShiftRequest ·
+#     NursePairRequest 를 delete-then-insert 하는데, 메모는 입력 중 디바운스로
+#     자주 저장되므로 같이 태우면 원티드가 통째로 지워질 위험이 크다.
+#   ★ year·month 는 호출자가 항상 명시한다. 서버가 현재 월 등으로 추론하지 않는다.
+# ──────────────────────────────────────────────────────────────
+def _memo_scope(current_user: UserSchema, db: Session, override_group_id=None):
+    """(nurse_id, group_id) 해석.
+
+    ★ 본인 메모이므로 대상 그룹은 **home group 하나뿐**이다. 원티드 저장
+      (_resolve_write_group_id)과 같은 규칙이다. 요청이 다른 group_id 를 보내면
+      403 — 안 막으면 남의 그룹에 자기 메모를 심을 수 있다.
+    """
+    nurse_id = str(getattr(current_user, "nurse_id", "") or "")
+    if not nurse_id:
+        raise PreferenceForbiddenError("간호사 계정이 아닙니다.")
+    home_gid = resolve_home_group_id(db, current_user)
+    if not home_gid:
+        raise PreferenceForbiddenError("소속 그룹을 확인할 수 없습니다.")
+    if override_group_id and str(override_group_id) != str(home_gid):
+        raise PreferenceForbiddenError("본인 소속 그룹의 메모만 다룰 수 있습니다.")
+    return nurse_id, str(home_gid)
+
+
+def get_monthly_memo_service(year: int, month: int, current_user: UserSchema,
+                             db: Session, override_group_id=None) -> dict:
+    """그 달의 메모를 돌려준다. 행이 없으면 monthly_memo=None."""
+    nurse_id, group_id = _memo_scope(current_user, db, override_group_id)
+    row = (
+        db.query(WantedMonthlyMemo)
+        .filter(WantedMonthlyMemo.nurse_id == nurse_id,
+                WantedMonthlyMemo.group_id == group_id,
+                WantedMonthlyMemo.year == int(year),
+                WantedMonthlyMemo.month == int(month))
+        .first()
+    )
+    return {
+        "year": int(year), "month": int(month), "group_id": group_id,
+        "monthly_memo": (row.memo if row else None),
+        "updated_at": (row.updated_at if row else None),
+    }
+
+
+def save_monthly_memo_service(year: int, month: int, memo, current_user: UserSchema,
+                              db: Session, override_group_id=None) -> dict:
+    """메모를 upsert 한다. None 또는 공백만이면 삭제로 처리한다.
+
+    ★ 이 함수는 wanted_monthly_memo 외의 어떤 테이블도 건드리지 않는다.
+    """
+    nurse_id, group_id = _memo_scope(current_user, db, override_group_id)
+    text_value = None if memo is None else str(memo)
+    if text_value is not None and not text_value.strip():
+        text_value = None                      # 빈 문자열도 삭제로 정규화
+
+    row = (
+        db.query(WantedMonthlyMemo)
+        .filter(WantedMonthlyMemo.nurse_id == nurse_id,
+                WantedMonthlyMemo.group_id == group_id,
+                WantedMonthlyMemo.year == int(year),
+                WantedMonthlyMemo.month == int(month))
+        .first()
+    )
+    now = datetime.now()
+    if text_value is None:
+        # 삭제 = 행 제거. 조회는 행 부재를 monthly_memo=None 으로 돌려주므로 동일하다.
+        if row is not None:
+            db.delete(row)
+    elif row is None:
+        db.add(WantedMonthlyMemo(nurse_id=nurse_id, group_id=group_id,
+                                 year=int(year), month=int(month),
+                                 memo=text_value, updated_at=now))
+    else:
+        row.memo = text_value
+        row.updated_at = now
+    db.commit()
+    return {"year": int(year), "month": int(month), "group_id": group_id,
+            "monthly_memo": text_value,
+            "updated_at": (now if text_value is not None else None)}
+
+
+def list_group_monthly_memos_service(year: int, month: int, current_user: UserSchema,
+                                     db: Session, override_group_id=None) -> dict:
+    """관리보드용 — 그룹 안에서 **메모를 쓴 사람만** 모아 돌려준다.
+
+    ★ 메모가 없는 사람은 아예 빼서 보낸다. 관리보드는 이름 위 호버로 보여 주므로
+      "메모가 있는가" 자체가 표시 여부의 조건이고, 인원이 많은 그룹에서 빈 값을
+      전부 실어 보낼 이유가 없다.
+    ★ 개인이 쓴 내용이라 수간호사·관리자만 볼 수 있다(라우터에서 검증).
+    """
+    group_id = str(override_group_id or "") or resolve_home_group_id(db, current_user)
+    if not group_id:
+        raise PreferenceValidationError("group_id 를 확인할 수 없습니다.")
+
+    rows = (
+        db.query(WantedMonthlyMemo, Nurse.name)
+        .join(Nurse, Nurse.nurse_id == WantedMonthlyMemo.nurse_id)
+        .filter(WantedMonthlyMemo.group_id == group_id,
+                WantedMonthlyMemo.year == int(year),
+                WantedMonthlyMemo.month == int(month),
+                WantedMonthlyMemo.memo.isnot(None))
+        .order_by(Nurse.name.asc())
+        .all()
+    )
+    return {
+        "year": int(year), "month": int(month), "group_id": group_id,
+        "count": len(rows),
+        "memos": [
+            {"nurse_id": m.nurse_id, "name": name,
+             "monthly_memo": m.memo, "updated_at": m.updated_at}
+            for m, name in rows
+        ],
+    }

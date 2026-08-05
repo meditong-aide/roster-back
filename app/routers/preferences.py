@@ -1,7 +1,11 @@
 from schemas.roster_schema import PreferenceData, PreferenceSubmit, WantedEntryItem
 from services.wanted_service import WantedAnalysisError, analyze_wanted_text
 from routers.auth import get_current_user_from_cookie
-from services.group_access import resolve_home_group_id
+from services.group_access import (
+    resolve_home_group_id,
+    caller_is_head_nurse,
+    assert_caller_can_access_group,
+)
 from db.client2 import get_db
 from db.models import ShiftPreference, Nurse, Shift
 from schemas.auth_schema import User as UserSchema
@@ -17,8 +21,12 @@ from services.preferences_service import (
     submit_empty_preferences_service,
     retract_submission_service,
     get_latest_preference_service,
-    get_all_preferences_service
+    get_all_preferences_service,
+    get_monthly_memo_service,
+    save_monthly_memo_service,
+    list_group_monthly_memos_service,
 )
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -248,3 +256,110 @@ async def get_all_preferences(
     except Exception as e:
         print('[preferences.py] error', e)
         raise HTTPException(status_code=500, detail=f"전체 선호도 조회 실패: {str(e)}")
+
+
+# ──────────────────────────────────────────────────────────────
+# [Preferences] 원티드 월별 메모
+#   ★ 원티드 저장 경로(POST /preferences)와 **완전히 분리된 통로**다.
+#     그 경로는 저장 한 번에 BannedWantedEntry · NurseShiftRequest ·
+#     NursePairRequest 를 delete-then-insert 한다. 메모는 입력 중 디바운스로 자주
+#     저장되므로 같이 태우면 원티드가 통째로 지워질 위험이 크다.
+#   ★ year·month 는 항상 요청에서 받는다. 서버가 현재 월 등으로 추론하지 않는다.
+# ──────────────────────────────────────────────────────────────
+class MonthlyMemoUpdate(BaseModel):
+    year: int
+    month: int
+    group_id: Optional[str] = None
+    monthly_memo: Optional[str] = Field(
+        default=None,
+        description="월별 메모. null 또는 공백만이면 삭제로 처리한다.",
+    )
+
+
+@router.get("/monthly-memo")
+async def get_monthly_memo(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """본인의 그 달 원티드 메모. 저장된 적 없으면 monthly_memo=null."""
+    try:
+        return get_monthly_memo_service(
+            year, month, current_user, db, override_group_id=group_id
+        )
+    except HTTPException:
+        raise
+    except (PreferenceForbiddenError, PreferenceConflictError, PreferenceValidationError) as e:
+        _raise_domain_error(e)
+    except Exception as e:
+        print('[preferences.py] monthly-memo 조회 실패', e)
+        raise HTTPException(status_code=500, detail=f"월별 메모 조회 실패: {str(e)}")
+
+
+@router.patch("/monthly-memo")
+async def patch_monthly_memo(
+    req: MonthlyMemoUpdate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """월별 메모 저장. wanted_monthly_memo 외의 어떤 테이블도 건드리지 않는다."""
+    # ★ 미전송과 명시적 null 을 가른다. PATCH 이므로 안 보낸 필드는 "그대로 두라"는
+    #   뜻이고, 삭제는 null 을 **명시**해야 한다. 안 가르면 {year, month} 만 보낸
+    #   요청이 메모를 지운다.
+    if "monthly_memo" not in req.model_fields_set:
+        raise HTTPException(
+            status_code=400,
+            detail="monthly_memo 를 명시해야 합니다(삭제는 null).",
+        )
+    try:
+        return save_monthly_memo_service(
+            req.year, req.month, req.monthly_memo, current_user, db,
+            override_group_id=req.group_id,
+        )
+    except HTTPException:
+        raise
+    except (PreferenceForbiddenError, PreferenceConflictError, PreferenceValidationError) as e:
+        db.rollback()
+        _raise_domain_error(e)
+    except Exception as e:
+        db.rollback()
+        print('[preferences.py] monthly-memo 저장 실패', e)
+        raise HTTPException(status_code=500, detail=f"월별 메모 저장 실패: {str(e)}")
+
+
+@router.get("/monthly-memo/group")
+async def list_group_monthly_memos(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """관리보드용 — 그룹에서 메모를 쓴 사람만 모아 돌려준다.
+
+    ★ 개인이 쓴 내용이라 수간호사·관리자만 볼 수 있다.
+    ★ 메모가 없는 사람은 응답에서 제외한다. 화면이 이름 위 호버로 보여 주므로
+      "메모가 있는가" 가 곧 표시 조건이다.
+    """
+    if not (caller_is_head_nurse(db, current_user)
+            or getattr(current_user, "is_master_admin", False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    if group_id:
+        assert_caller_can_access_group(db, current_user, group_id)
+    elif getattr(current_user, "is_master_admin", False):
+        # ★ 관리자는 홈 그룹이 없을 수 있다. 그때 group_id 없이 부르면 대상 그룹을
+        #   정할 수 없으므로 400 으로 명확히 돌려준다(500 방지).
+        raise HTTPException(status_code=400, detail="group_id 가 필요합니다.")
+    try:
+        return list_group_monthly_memos_service(
+            year, month, current_user, db, override_group_id=group_id
+        )
+    except HTTPException:
+        raise
+    except (PreferenceForbiddenError, PreferenceConflictError, PreferenceValidationError) as e:
+        _raise_domain_error(e)
+    except Exception as e:
+        print('[preferences.py] monthly-memo/group 조회 실패', e)
+        raise HTTPException(status_code=500, detail=f"월별 메모 목록 조회 실패: {str(e)}")
