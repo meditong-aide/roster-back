@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from db.models import DailyShift, RosterConfig
 from services.leave.night_cycle_service import (
-    DEFAULT_CYCLE, fetch_anchor, prev_month_fallback, resolve_cycle,
+    DEFAULT_CYCLE, fetch_anchor, has_anchor, prev_month_fallback, resolve_cycle,
     resolve_sleep_off_shift, _prev_ym,
 )
 
@@ -171,13 +171,16 @@ def postprocess_sleep_off(db: Session, schedule, generated: dict,
     # 전월 미마감 시 연번이 리셋되지 않도록 전월 최신 근무표로 폴백한다.
     #   ★ 마감(compute_snapshot)도 같은 함수를 쓴다 — 한쪽만 폴백하면 같은 달인데
     #     생성값과 앵커값이 어긋난다.
-    fallback = prev_month_fallback(db, gid, py, pm)
+    #   ★ 판정은 **그룹 단위**다. 개인별 (0,0) 으로 보면 전월에 나이트를 안 선 사람이
+    #     정상값인데도 폴백을 타 다른 근무표 기준 값이 섞인다.
+    fallback = ({} if has_anchor(db, gid, py, pm)
+                else prev_month_fallback(db, gid, py, pm))
 
     for nid, codes in generated.items():
         if not is_sleep_off_eligible(flags.get(str(nid))):
             continue
         prev_seq, prev_pending, _ = fetch_anchor(db, str(nid), gid, py, pm)
-        if prev_seq == 0 and prev_pending == 0 and str(nid) in fallback:
+        if str(nid) in fallback:
             prev_seq, prev_pending, _ = fallback[str(nid)]
         blocks = trigger_blocks(list(codes), prev_seq=prev_seq, cycle=cycle)
         need = len(blocks) + int(prev_pending or 0)

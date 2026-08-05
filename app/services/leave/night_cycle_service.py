@@ -111,6 +111,23 @@ def advance_cycle(codes_by_day: dict[int, str], *, prev_seq: int, prev_pending: 
     return seq, pending, sleep_count, int(prev_sleep_seq or 0) + sleep_count
 
 
+def has_anchor(db: Session, group_id: str, year: int, month: int) -> bool:
+    """그 달 앵커가 한 행이라도 있으면 True(= 그 달은 마감 스냅샷이 남아 있다).
+
+    ★ 개인별 `fetch_anchor() == (0,0,0)` 으로 "앵커 없음" 을 판정하면 안 된다.
+      전월에 나이트를 한 번도 안 선 사람은 **정상적으로** (0,0,0) 이라 구분이 안 되고,
+      그 사람만 폴백을 타 다른 근무표 기준 값이 섞인다. 판정은 그룹 단위로 한다.
+    """
+    return (
+        db.query(NurseNightCycle.nurse_id)
+        .filter(NurseNightCycle.group_id == str(group_id),
+                NurseNightCycle.year == int(year),
+                NurseNightCycle.month == int(month))
+        .first()
+        is not None
+    )
+
+
 def prev_month_fallback(db: Session, group_id: str, year: int,
                         month: int) -> dict[str, tuple[int, int, int]]:
     """전월 앵커가 없을 때 쓸 대체값 — 전월 최신 근무표에서 즉석 계산한 (seq, pending, sleep_seq).
@@ -126,12 +143,15 @@ def prev_month_fallback(db: Session, group_id: str, year: int,
       한쪽만 폴백하면 같은 달인데 생성값과 앵커값이 어긋난다.
     ★ 재귀하지 않는다 — 한 단계(전월)만 본다. 전전월까지 미마감이면 거기서 멈춘다.
     """
+    # ★ issued 를 draft 보다 우선한다. 확정본이 있는데 그보다 최신 draft 가 있다고
+    #   draft 를 집으면, 폐기될 수 있는 값이 다음 달 연번의 기준이 된다.
+    #   같은 status 안에서는 created_at 최신.
     sch = (
         db.query(Schedule)
         .filter(Schedule.group_id == str(group_id),
                 Schedule.year == int(year), Schedule.month == int(month),
                 Schedule.dropped == False)  # noqa: E712
-        .order_by(Schedule.created_at.desc())
+        .order_by((Schedule.status == "issued").desc(), Schedule.created_at.desc())
         .first()
     )
     if sch is None:
@@ -164,7 +184,10 @@ def _compute_snapshot_raw(db: Session, schedule: Schedule,
     target = resolve_sleep_off_shift(db, gid)
     sleep_code = target.shift_id if target else None
     py, pm = _prev_ym(int(schedule.year), int(schedule.month))
-    fallback = prev_month_fallback(db, gid, py, pm) if use_fallback else {}
+    # 전월 앵커가 **그룹 단위로** 없을 때만 폴백을 만든다. 있으면 계산 자체를 안 해
+    # 불필요한 전월 전체 스냅샷 비용도 들지 않는다.
+    fallback = ({} if not use_fallback or has_anchor(db, gid, py, pm)
+                else prev_month_fallback(db, gid, py, pm))
 
     rows = (
         db.query(ScheduleEntry.nurse_id, ScheduleEntry.work_date, ScheduleEntry.shift_id)
@@ -180,8 +203,8 @@ def _compute_snapshot_raw(db: Session, schedule: Schedule,
     out = []
     for nid, codes in by_nurse.items():
         prev_seq, prev_pending, prev_sleep_seq = fetch_anchor(db, nid, gid, py, pm)
-        if prev_seq == 0 and prev_pending == 0 and nid in fallback:
-            # 전월 앵커가 없다 = 전월 미마감. 그대로 두면 연번이 리셋된다.
+        if nid in fallback:
+            # fallback 은 전월 앵커가 그룹 단위로 없을 때만 채워진다(= 전월 미마감).
             prev_seq, prev_pending, prev_sleep_seq = fallback[nid]
         seq, pending, s_cnt, s_seq = advance_cycle(
             codes, prev_seq=prev_seq, prev_pending=prev_pending,
@@ -235,6 +258,11 @@ def upsert_night_cycle_snapshot(db: Session, schedule: Schedule) -> int:
             row.pending_sleep = s["pending_sleep"]
             row.sleep_off_count = s["sleep_off_count"]
             row.sleep_off_seq = s["sleep_off_seq"]
+    # ★★ flush 가 필수다 — rebuild_night_cycle_from 은 여러 달을 순서대로 돌리고,
+    #   다음 달 fetch_anchor 는 **DB 쿼리**다. autoflush=False 라 여기서 add 한 신규
+    #   앵커가 flush 없이는 DB 에 없어, 다음 달이 (0,0,0) 을 읽고 연번을 0 부터 센다.
+    #   기존 행 UPDATE 는 identity map 덕에 우연히 보이지만 INSERT 는 안 보인다.
+    db.flush()
     print(f"[NightCycle] {gid} {y}-{m:02d} 스냅샷 {len(snap)}명 upsert")
     return len(snap)
 
@@ -277,6 +305,13 @@ def rebuild_night_cycle_from(db: Session, group_id: str, year: int, month: int) 
             per_month[ym] = s
     targets = [per_month[k] for k in sorted(per_month)]
 
+    # ★ upsert 를 **먼저** 한다. 고아 삭제와 upsert 는 서로 다른 달을 다루므로 순서가
+    #   결과를 바꾸지 않는데, 삭제를 먼저 하면 뒤쪽 upsert 가 실패했을 때 호출자가
+    #   예외를 삼키고 commit 하는 경로에서 **삭제만 영구 반영**된다.
+    total = 0
+    for sch in targets:
+        total += upsert_night_cycle_snapshot(db, sch)
+
     # ★★ 고아 앵커 제거 — 마감본이 사라진 달의 앵커는 지운다.
     #   마감취소(/unpublish)와 마감본 삭제(DELETE /{schedule_id})는 status 만 바꾸거나
     #   행만 지우므로, 그대로 두면 **근무표가 없는데 앵커만 남는다**. 다음 달 생성이
@@ -297,11 +332,7 @@ def rebuild_night_cycle_from(db: Session, group_id: str, year: int, month: int) 
         print(f"[NightCycle] group={group_id} 고아 앵커 {removed}행 제거 "
               f"(마감취소·삭제로 근무표가 없어진 달)")
 
-    if not targets:
-        return 0
-    total = 0
-    for sch in targets:
-        total += upsert_night_cycle_snapshot(db, sch)
-    print(f"[NightCycle] group={group_id} {year}-{int(month):02d} 이후 "
-          f"{len(targets)}개월 연쇄 재계산 · {total}행")
+    if targets:
+        print(f"[NightCycle] group={group_id} {year}-{int(month):02d} 이후 "
+              f"{len(targets)}개월 연쇄 재계산 · {total}행")
     return total
