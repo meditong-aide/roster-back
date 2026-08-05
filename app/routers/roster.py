@@ -891,6 +891,19 @@ async def drop_schedule(
     schedule.dropped = True
     schedule.updated_at = datetime.now()
     db.add(schedule)
+
+    # N 연번 앵커 재계산 — 마감본을 지웠으면 그 달 앵커가 고아가 된다.
+    #   ★ flush 가 먼저다(autoflush=False) — dropped=True 가 세션에만 있으면 재계산이
+    #     이 근무표를 여전히 살아있는 것으로 보고 앵커를 남긴다.
+    #   ★ 실패해도 삭제 자체는 막지 않는다.
+    if str(getattr(schedule, "status", "") or "") == "issued":
+        try:
+            db.flush()
+            from services.leave.night_cycle_service import rebuild_night_cycle_from
+            rebuild_night_cycle_from(db, schedule.group_id, schedule.year, schedule.month)
+        except Exception as _nc_exc:
+            print(f"[NightCycle] 삭제 후 앵커 재계산 실패(무시): {_nc_exc}")
+
     db.commit()
     return {"message": "스케줄이 삭제(숨김)되었습니다.", "schedule_id": schedule_id}
 
@@ -1566,6 +1579,17 @@ async def unpublish_roster(
         IssuedRosterSnapshot.schedule_id == schedule_id,
         IssuedRosterSnapshot.group_id == target_group_id,
     ).update({"is_active_issued": False})
+
+    # 4) N 연번 앵커 재계산 — 이 달이 draft 로 내려갔으므로 앵커가 고아가 된다.
+    #    ★ flush 가 먼저다(autoflush=False). 위에서 status='draft' 를 세팅했지만 세션에만
+    #      있어, flush 없이 부르면 재계산이 이 달을 여전히 issued 로 보고 앵커를 남긴다.
+    #    ★ 실패해도 발행취소 자체는 막지 않는다.
+    try:
+        db.flush()
+        from services.leave.night_cycle_service import rebuild_night_cycle_from
+        rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
+    except Exception as _nc_exc:
+        print(f"[NightCycle] 발행취소 후 앵커 재계산 실패(무시): {_nc_exc}")
 
     db.commit()
 

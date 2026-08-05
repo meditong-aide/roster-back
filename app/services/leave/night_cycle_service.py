@@ -111,13 +111,60 @@ def advance_cycle(codes_by_day: dict[int, str], *, prev_seq: int, prev_pending: 
     return seq, pending, sleep_count, int(prev_sleep_seq or 0) + sleep_count
 
 
+def prev_month_fallback(db: Session, group_id: str, year: int,
+                        month: int) -> dict[str, tuple[int, int, int]]:
+    """전월 앵커가 없을 때 쓸 대체값 — 전월 최신 근무표에서 즉석 계산한 (seq, pending, sleep_seq).
+
+    ★★ 왜 필요한가
+      앵커는 마감(issued)분만 저장한다. 전월을 아직 마감하지 않은 채 다음 달을 만들거나
+      마감하면 `fetch_anchor` 가 (0,0,0) 을 돌려주고, **그 달 나이트를 아예 안 센 것처럼**
+      연번이 리셋된다. 수면OFF 가 늦게 나오거나 영영 안 나온다.
+
+    ★ 저장하지는 않는다 — draft 는 폐기될 수 있어 앵커로 굳히면 DB 가 오염된다.
+      읽기 전용 폴백이라 부작용이 없고, 전월을 마감하면 정식 앵커가 이 값을 대체한다.
+    ★ **생성(sleep_off_postprocess)과 마감(compute_snapshot)이 같은 함수를 쓴다.**
+      한쪽만 폴백하면 같은 달인데 생성값과 앵커값이 어긋난다.
+    ★ 재귀하지 않는다 — 한 단계(전월)만 본다. 전전월까지 미마감이면 거기서 멈춘다.
+    """
+    sch = (
+        db.query(Schedule)
+        .filter(Schedule.group_id == str(group_id),
+                Schedule.year == int(year), Schedule.month == int(month),
+                Schedule.dropped == False)  # noqa: E712
+        .order_by(Schedule.created_at.desc())
+        .first()
+    )
+    if sch is None:
+        return {}
+    try:
+        out = {str(r["nurse_id"]): (int(r["seq_at_end"] or 0),
+                                    int(r["pending_sleep"] or 0),
+                                    int(r["sleep_off_seq"] or 0))
+               for r in _compute_snapshot_raw(db, sch, use_fallback=False)}
+    except Exception as exc:
+        logger.warning("[NightCycle] 전월 폴백 계산 실패(무시) group=%s %d-%02d: %s",
+                       group_id, year, month, exc)
+        return {}
+    if out:
+        logger.info("[NightCycle] 전월(%d-%02d) 미마감 — 최신 근무표 %s 로 연번 폴백 %d명",
+                    year, month, sch.schedule_id, len(out))
+    return out
+
+
 def compute_snapshot(db: Session, schedule: Schedule) -> list[dict]:
     """스케줄 1건의 간호사별 (nurse_id, seq_at_end, pending_sleep) 목록을 계산한다."""
+    return _compute_snapshot_raw(db, schedule, use_fallback=True)
+
+
+def _compute_snapshot_raw(db: Session, schedule: Schedule,
+                          *, use_fallback: bool) -> list[dict]:
+    """use_fallback=False 는 폴백 자신이 부르는 경로 — 재귀를 끊는다."""
     gid = str(schedule.group_id)
     cycle = resolve_cycle(db, gid)
     target = resolve_sleep_off_shift(db, gid)
     sleep_code = target.shift_id if target else None
     py, pm = _prev_ym(int(schedule.year), int(schedule.month))
+    fallback = prev_month_fallback(db, gid, py, pm) if use_fallback else {}
 
     rows = (
         db.query(ScheduleEntry.nurse_id, ScheduleEntry.work_date, ScheduleEntry.shift_id)
@@ -133,6 +180,9 @@ def compute_snapshot(db: Session, schedule: Schedule) -> list[dict]:
     out = []
     for nid, codes in by_nurse.items():
         prev_seq, prev_pending, prev_sleep_seq = fetch_anchor(db, nid, gid, py, pm)
+        if prev_seq == 0 and prev_pending == 0 and nid in fallback:
+            # 전월 앵커가 없다 = 전월 미마감. 그대로 두면 연번이 리셋된다.
+            prev_seq, prev_pending, prev_sleep_seq = fallback[nid]
         seq, pending, s_cnt, s_seq = advance_cycle(
             codes, prev_seq=prev_seq, prev_pending=prev_pending,
             sleep_code=sleep_code, cycle=cycle, prev_sleep_seq=prev_sleep_seq,
@@ -205,7 +255,11 @@ def rebuild_night_cycle_from(db: Session, group_id: str, year: int, month: int) 
     rows = (
         db.query(Schedule)
         .filter(Schedule.group_id == str(group_id),
-                Schedule.status == "issued")
+                Schedule.status == "issued",
+                # ★ 삭제(soft delete)된 근무표는 제외한다. drop_schedule 은 dropped=True 만
+                #   세우고 status 는 'issued' 로 남기므로, 안 거르면 **지운 근무표가 계속
+                #   앵커에 반영된다.** 저장소 관행도 조회 시 dropped 를 거른다.
+                Schedule.dropped == False)  # noqa: E712
         .all()
     )
     # (year, month) 이상만, 연월 오름차순 — 앞 달 결과가 뒷 달 입력이 되므로 순서가 중요하다.
@@ -222,6 +276,27 @@ def rebuild_night_cycle_from(db: Session, group_id: str, year: int, month: int) 
         if cur is None or (s.created_at or 0) > (cur.created_at or 0):
             per_month[ym] = s
     targets = [per_month[k] for k in sorted(per_month)]
+
+    # ★★ 고아 앵커 제거 — 마감본이 사라진 달의 앵커는 지운다.
+    #   마감취소(/unpublish)와 마감본 삭제(DELETE /{schedule_id})는 status 만 바꾸거나
+    #   행만 지우므로, 그대로 두면 **근무표가 없는데 앵커만 남는다**. 다음 달 생성이
+    #   그 유령 값을 이어받아 실제와 어긋난 연번으로 수면OFF 를 판정하게 된다.
+    #   재계산 대상(targets)에 없는 (year, month) 이상의 앵커가 그 대상이다.
+    alive = {(int(s.year), int(s.month)) for s in targets}
+    orphan_q = db.query(NurseNightCycle).filter(
+        NurseNightCycle.group_id == str(group_id))
+    removed = 0
+    for row in orphan_q.all():
+        ym = (int(row.year), int(row.month))
+        if ym < (int(year), int(month)) or ym in alive:
+            continue
+        db.delete(row)
+        removed += 1
+    if removed:
+        db.flush()
+        print(f"[NightCycle] group={group_id} 고아 앵커 {removed}행 제거 "
+              f"(마감취소·삭제로 근무표가 없어진 달)")
+
     if not targets:
         return 0
     total = 0
