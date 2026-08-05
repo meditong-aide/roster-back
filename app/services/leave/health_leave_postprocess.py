@@ -79,7 +79,8 @@ def _pick_fixed_work_day(codes: list[str], days_in_month: int,
 def postprocess_health_leave(db: Session, schedule, generated: dict,
                              target_ids: set[str],
                              latest_config: Optional[RosterConfig] = None,
-                             fixed_ids: Optional[set[str]] = None) -> dict:
+                             fixed_ids: Optional[set[str]] = None,
+                             stats: Optional[dict] = None) -> dict:
     """`generated` 를 in-place 수정 후 반환. 대상자가 없으면 아무것도 하지 않는다.
 
     Args:
@@ -132,4 +133,15 @@ def postprocess_health_leave(db: Session, schedule, generated: dict,
             "— extra_min_off 가 반영되지 않았거나 주말 제한으로 후보가 비었다.",
             gid, year, month, len(target_ids), skipped,
         )
+    # 화면이 생성 결과를 검토할 수 있게 수치를 넘긴다. 로그로만 남기면 운영자가
+    # 몇 명에게 줬는지, 못 준 사람이 있는지 알 방법이 없다.
+    if stats is not None:
+        stats.update({
+            "code": target.shift_id,
+            "target_count": len(target_ids),
+            "placed": placed,
+            "placed_fixed": placed_fixed,
+            "skipped": skipped,
+            "weekend_allowed": allow_weekend,
+        })
     return generated

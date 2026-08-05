@@ -141,7 +141,8 @@ def _assigned_count(generated: dict, day: int, main: str) -> int:
 
 
 def postprocess_sleep_off(db: Session, schedule, generated: dict,
-                          latest_config: Optional[RosterConfig] = None) -> dict:
+                          latest_config: Optional[RosterConfig] = None,
+                          stats: Optional[dict] = None) -> dict:
     """수면OFF 부여 후처리. `generated` 를 in-place 수정 후 반환한다.
 
     설정이 꺼져 있거나 타깃 코드가 없으면 아무것도 하지 않는다.
@@ -162,6 +163,9 @@ def postprocess_sleep_off(db: Session, schedule, generated: dict,
     py, pm = _prev_ym(int(schedule.year), int(schedule.month))
     req = _load_requirements(db, schedule)
     placed = skipped = 0
+    # 화면 요약용 — 전월에서 넘어온 이월분과 이번 달 신규 도달을 구분해 센다.
+    carried_in = new_trigger = 0
+    carried_nurses: list[str] = []
 
     # per-nurse 예외(3-state). 테이블이 비어 있으면 {} 라 전원 대상 = 도입 전과 동일.
     from services.leave.leave_eligibility import fetch_leave_flags, is_sleep_off_eligible
@@ -186,6 +190,10 @@ def postprocess_sleep_off(db: Session, schedule, generated: dict,
         need = len(blocks) + int(prev_pending or 0)
         if need <= 0:
             continue
+        if prev_pending:
+            carried_in += int(prev_pending)
+            carried_nurses.append(str(nid))
+        new_trigger += len(blocks)
         spans = blocks or [(0, 0)]          # 이월만 있으면 월초부터 탐색
         for block in spans[:need]:
             day = _pick_day(generated, codes, block, req, target.shift_id)
@@ -197,6 +205,18 @@ def postprocess_sleep_off(db: Session, schedule, generated: dict,
     if placed or skipped:
         print(f"[SleepOff] {gid} {schedule.year}-{int(schedule.month):02d} "
               f"배치 {placed}건 · 스킵 {skipped}건 (code={target.shift_id} cycle={cycle})")
+    # ★ skipped 는 그냥 실패가 아니라 **다음 달로 이월**된다. 화면에 안 보이면
+    #   운영자는 다음 달에 갑자기 늘어난 것으로만 보인다.
+    if stats is not None:
+        stats.update({
+            "code": target.shift_id,
+            "cycle": cycle,
+            "placed": placed,
+            "carried_out": skipped,        # 자리를 못 찾아 다음 달로 넘어간 건수
+            "carried_in": carried_in,      # 전월에서 넘어와 이번 달에 처리 대상이던 건수
+            "carried_in_nurses": carried_nurses,
+            "new_trigger": new_trigger,    # 이번 달에 새로 주기에 도달한 건수
+        })
     return generated
 
 

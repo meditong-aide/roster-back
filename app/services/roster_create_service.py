@@ -6617,17 +6617,28 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     #   off_swap 보다 먼저 — 생성 결과에 더 가까운 상태에서 판정한다.
     # 보건휴가: 대상자의 OFF(고정근무자는 근무일) 하나를 휴가코드로 치환.
     #   커버리지 무관 — 근무를 빼는 게 아니라 OFF 자리의 코드만 바꾼다.
+    # 생성 결과 요약 — 응답에 실어 화면이 "몇 명에게 줬고 몇 건이 이월됐는지" 를
+    # 보여줄 수 있게 한다. 로그로만 남기면 운영자가 확인할 방법이 없다.
+    _leave_summary: dict = {}
     try:
         from services.leave.health_leave_postprocess import postprocess_health_leave
+        _hl_stats: dict = {}
         generated = postprocess_health_leave(
             db, schedule, generated, health_leave_targets, latest_config,
             fixed_ids={str(getattr(_fn, "nurse_id", "")) for _fn in fixed_nurses},
+            stats=_hl_stats,
         )
+        if _hl_stats:
+            _leave_summary["health_leave"] = _hl_stats
     except Exception as _hl_post_exc:
         print(f"[HealthLeave] 후처리 실패 — 미부여 진행: {_hl_post_exc}")
     try:
         from services.leave.sleep_off_postprocess import postprocess_sleep_off
-        generated = postprocess_sleep_off(db, schedule, generated, latest_config)
+        _so_stats: dict = {}
+        generated = postprocess_sleep_off(db, schedule, generated, latest_config,
+                                          stats=_so_stats)
+        if _so_stats:
+            _leave_summary["sleep_off"] = _so_stats
     except Exception as _sleep_exc:
         print(f"[SleepOff] 후처리 실패 — 미부여 진행: {_sleep_exc}")
     try:
@@ -6771,6 +6782,13 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             )
     except Exception as e:
         print(f"[RosterCreate] assignment 생성 알림 실패: {e}")
+
+    # 휴가 자동 부여 요약 — 화면이 생성 결과를 검토할 수 있게 싣는다.
+    #   ★ 기능이 꺼져 있거나 대상 코드가 없으면 후처리가 stats 를 안 채우므로 키 자체가
+    #     없다. 프론트는 키 유무로 "이번 생성에 적용됐는가" 를 판단하면 된다.
+    #   ★ sleep_off.carried_out 은 실패가 아니라 **다음 달 이월**이다.
+    if _leave_summary and isinstance(roster_data, dict):
+        roster_data["leave_summary"] = _leave_summary
 
     return roster_data
 
