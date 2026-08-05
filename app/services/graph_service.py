@@ -27,7 +27,7 @@ class GraphService:
 
         if not cleaned_request.strip():
             print("[GraphService] request가 실질적으로 비어있음 → 그래프 스킵")
-            return [[], []]
+            return [[], [], []]
 
         input_state = {
             "request": cleaned_request,
@@ -57,12 +57,16 @@ class GraphService:
         # 안전하게 키 추출
         shift_results = graph_output.get('shift_results', [])
         preference_results = graph_output.get('preference_results', [])
+        # 기피(Except) 분석 결과. 인덱스 2로 뒤에 붙여 기존 [0]=shift/[1]=preference
+        # 소비 코드를 건드리지 않는다.
+        avoid_results = graph_output.get('avoid_results', [])
 
-        final_response = [shift_results, preference_results]
+        final_response = [shift_results, preference_results, avoid_results]
 
         print("[GraphService] 그래프 실행 완료")
         print(f"  shift_results 개수: {len(shift_results)}")
         print(f"  preference_results 개수: {len(preference_results)}")
+        print(f"  avoid_results 개수: {len(avoid_results)}")
 
         import pprint
         pprint.pprint(final_response)

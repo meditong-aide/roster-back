@@ -3,9 +3,10 @@
 - DB 쿼리, 데이터 가공 등 라우터에서 분리
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
+import json
 import pprint
 from sqlalchemy.orm import Session
-from sqlalchemy import String, cast, extract
+from sqlalchemy import String, cast, extract, inspect as sa_inspect
 from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
@@ -26,9 +27,11 @@ class PreferenceConflictError(Exception):
 class PreferenceValidationError(Exception):
     """원티드 엔트리 검증 실패 (422). code 로 사유를 구분한다."""
 
-    def __init__(self, message: str, code: str = "invalid_entry"):
+    def __init__(self, message: str, code: str = "invalid_entry", detail=None):
         super().__init__(message)
         self.code = code
+        #: 화면이 어디를 짚어 줄지 알 수 있게 하는 부가 정보(위반 날짜 등). 없으면 None.
+        self.detail = detail
 
 
 def _now_kst() -> datetime:
@@ -186,11 +189,11 @@ def _assert_wanted_writable(wanted, year: int, month: int, submitted_wr) -> None
 def _normalize_wanted_entries(entries, year: int, month: int, allowed_shift_ids: set) -> list[dict]:
     """wanted_entries 를 검증·정규화한다(날짜 오름차순, 날짜별 1건).
 
-    intent 는 'wanted'(선호)만 지원한다. 'avoid'(피하고 싶은 근무)는 저장소·솔버 제약이
-    아직 없어 422 로 거절한다(별도 작업).
+    intent 는 'wanted'(선호) 또는 'avoid'(기피). 날짜당 한 건이므로 같은 날 선호와
+    기피를 동시에 낼 수 없다(프론트 편집기도 같은 규칙).
 
     Raises:
-        PreferenceValidationError: 월 불일치 / 날짜 중복 / 미허용 근무코드 / avoid.
+        PreferenceValidationError: 월 불일치 / 날짜 중복 / 미허용 근무코드.
     """
     normalized: dict = {}
     for item in entries or []:
@@ -205,11 +208,6 @@ def _normalize_wanted_entries(entries, year: int, month: int, allowed_shift_ids:
                 f"같은 날짜가 중복되었습니다: {entry_date.isoformat()}",
                 code="duplicate_date",
             )
-        if item.intent != "wanted":
-            raise PreferenceValidationError(
-                "피하고 싶은 근무(avoid)는 아직 지원하지 않습니다.",
-                code="unsupported_intent",
-            )
         shift_id = (item.shift_id or "").strip()
         if shift_id not in allowed_shift_ids:
             raise PreferenceValidationError(
@@ -223,6 +221,235 @@ def _normalize_wanted_entries(entries, year: int, month: int, allowed_shift_ids:
             "comment": item.comment or "",
         }
     return [normalized[key] for key in sorted(normalized)]
+
+
+# ── 기피근무(avoid) — banned_wanted_entries 재사용 ─────────────────────────
+# 저장소·솔버 하드제약(initial_constraints.forbidden → X==0)을 금지 원티드와 공유한다.
+# 구분은 source='nurse'. HN 조정판 저장/리셋은 source='hn' 만 건드리므로 서로 안 지운다.
+
+
+_AVOID_TABLE_READY = False
+
+
+def _avoid_storage_ready(db: Session) -> bool:
+    """banned_wanted_entries 저장소가 쓸 수 있는 상태인지.
+
+    테이블 존재만으로는 부족하다 — source 컬럼(출처 구분)이 없으면 모든 쿼리가
+    'Invalid column name' 으로 깨진다. 실제로 dev 에 컬럼 없는 테이블이 먼저 생겼다.
+    DDL 미적용 환경에서 '기피근무가 없는' 저장까지 깨지지 않도록 미리 확인한다.
+    실패한 문장은 MSSQL 트랜잭션을 오염시켜 이후 문장까지 막으므로, 예외를 삼키는
+    방식으로는 해결되지 않는다(그래서 사후 try/except 가 아니라 사전 확인이다).
+
+    True 는 한 번 확인되면 캐시한다. False 는 캐시하지 않는다 — DDL 적용 후 서버
+    재기동 없이 바로 반영되도록.
+    """
+    global _AVOID_TABLE_READY
+    if _AVOID_TABLE_READY:
+        return True
+    try:
+        inspector = sa_inspect(db.get_bind())
+        if not inspector.has_table("banned_wanted_entries"):
+            return False
+        columns = {c["name"] for c in inspector.get_columns("banned_wanted_entries")}
+        _AVOID_TABLE_READY = "source" in columns
+        if not _AVOID_TABLE_READY:
+            print("[avoid] banned_wanted_entries.source 컬럼 없음 — 기피근무 저장 비활성")
+    except Exception as e:  # 메타데이터 조회 실패 — 기피근무 미사용으로 취급
+        print(f"[avoid] 저장소 확인 실패(미사용 처리): {e}")
+        return False
+    return _AVOID_TABLE_READY
+
+
+def _resolve_main_code(db: Session, group_id: str, shift_id: str) -> str:
+    """근무코드를 솔버가 아는 main code(D/E/N/M/O ...)로 정규화한다.
+
+    shifts.default_shift 가 main code 이고, 없으면 shift_id 자신이 main code 이다.
+    (예: 'D1' → default_shift 'D')
+    """
+    row = (
+        db.query(Shift.default_shift)
+        .filter(Shift.group_id == group_id, Shift.shift_id == shift_id)
+        .first()
+    )
+    main = (row[0] if row and row[0] else shift_id) or ""
+    return str(main).strip().upper()
+
+
+def _validate_avoid_entries(db: Session, nurse_id: str, group_id: str, avoid: list[dict]) -> list[dict]:
+    """기피근무 검증. 반환은 [{date, main_code, shift_id, comment}].
+
+    규칙은 HN 조정판의 금지 원티드와 **같은 소스**를 쓴다
+    (`wanted_service._ward_main_codes` — 병동에 실존하는 근무형, OFF 포함).
+    - 병동에 없는 코드는 거부. 있는 코드는 OFF 도 금지 가능하다.
+    - 금지 + 개인 허용근무(allowed_shifts) 제한 후에도 배정 옵션이 **하나는 남아야** 한다.
+      OFF 는 금지하지 않는 한 항상 옵션이다.
+    """
+    from services.wanted_service import _ward_main_codes
+
+    if not avoid:
+        return []
+    nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    allowed = {
+        str(x).strip().upper()
+        for x in (getattr(nurse_row, "allowed_shifts", None) or [])
+    }
+    ward_mains = _ward_main_codes(db, group_id)
+    work_mains = ward_mains - {"O"}
+    avail_work = (work_mains & allowed) if allowed else set(work_mains)
+
+    resolved: list[dict] = []
+    for entry in avoid:
+        main_code = _resolve_main_code(db, group_id, entry["shift_id"])
+        if main_code not in ward_mains:
+            raise PreferenceValidationError(
+                f"병동에 없는 근무코드입니다: {entry['shift_id']}",
+                code="unknown_shift_code",
+            )
+        # 날짜당 한 건이므로 이 날 금지되는 코드는 이 하나뿐이다.
+        if not ((avail_work | {"O"}) - {main_code}):
+            raise PreferenceValidationError(
+                f"{entry['date'].isoformat()}: 이 근무를 피하면 배정 가능한 근무/OFF 가 없습니다.",
+                code="no_option_left",
+            )
+        resolved.append({**entry, "main_code": main_code})
+    return resolved
+
+
+def _replace_nurse_avoid_entries(
+    db: Session,
+    nurse_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    avoid: list[dict],
+) -> list:
+    """해당 간호사/월의 기피근무를 전량 교체한다(source='nurse' 스코프).
+
+    ★ 한 셀에 hn 행과 nurse 행이 **공존하지 못하게** 막는다. 조정판은 셀당 한 건만
+      그리므로(`wanted_service._banned_by_date` 가 최신 id 하나만 남김), 공존하면
+      둘 중 하나는 화면에 안 뜨는데 솔버는 둘 다 하드로 건다(컨버터가 코드 합집합).
+      즉 **수간호사가 보지도 못하고 지우지도 못하는 금지**가 생긴다.
+      수간호사가 이미 지정한 셀이면 간호사 기피는 만들지 않고 건너뛴다
+      (반대 방향은 `save_banned_wanted_service` 의 nurse 소유 셀 가드가 막는다).
+
+    반환: 수간호사 지정과 겹쳐 반영하지 못한 날짜 목록.
+    """
+    from db.models import BannedWantedEntry
+    from services.wanted_service import (
+        BANNED_SOURCE_HN,
+        BANNED_SOURCE_NURSE,
+        banned_source_filter,
+        precheck_forced_off_runs,
+    )
+
+    hn_rows = db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == year,
+        BannedWantedEntry.month == month,
+        BannedWantedEntry.nurse_id == nurse_id,
+        banned_source_filter(BANNED_SOURCE_HN),
+    ).all()
+    hn_cells = {r.shift_date for r in hn_rows}
+
+    # ── 사전 점검: 저장 후 상태로 본다 ──────────────────────────────────────
+    # 이번 요청분만 보면 기존 3일 구간에 하루 붙이는 경우를 놓친다. 삭제 전에 본다.
+    post_state = {
+        r.shift_date: [str(c).strip().upper() for c in (r.banned_shift_ids or [])]
+        for r in hn_rows if r.is_applied
+    }
+    for entry in avoid:
+        if entry["date"] in hn_cells:
+            continue          # 수간호사 지정 셀은 아래에서 어차피 건너뛴다
+        post_state[entry["date"]] = [str(entry["main_code"]).strip().upper()]
+    # 확정근무가 있는 셀은 금지가 무효(생성에서 확정이 우선)라 휴무로 세면 안 된다.
+    from db.models import FixedWantedEntry
+    fixed_cells = {
+        (str(r[0]), r[1]) for r in db.query(
+            FixedWantedEntry.nurse_id, FixedWantedEntry.shift_date
+        ).filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.nurse_id == nurse_id,
+            FixedWantedEntry.is_applied == True,  # noqa: E712
+        ).all()
+    }
+    violations = precheck_forced_off_runs(
+        db, group_id, year, month, {nurse_id: post_state}, fixed_cells=fixed_cells
+    )
+    if violations:
+        raise PreferenceValidationError(
+            violations[0]["message"],
+            code="forced_off_run",
+            detail={"violations": violations},
+        )
+
+    db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == year,
+        BannedWantedEntry.month == month,
+        BannedWantedEntry.nurse_id == nurse_id,
+        banned_source_filter(BANNED_SOURCE_NURSE),
+    ).delete(synchronize_session=False)
+
+    blocked = []
+    for entry in avoid:
+        if entry["date"] in hn_cells:
+            blocked.append(entry["date"])
+            continue
+        db.add(BannedWantedEntry(
+            group_id=group_id,
+            year=year,
+            month=month,
+            nurse_id=nurse_id,
+            shift_date=entry["date"],
+            banned_shift_ids=[entry["main_code"]],
+            is_applied=True,
+            source=BANNED_SOURCE_NURSE,
+            reason=entry["comment"] or None,
+            created_by=nurse_id,
+        ))
+
+    if blocked:
+        print(f"[wanted_entries] 수간호사 지정과 겹쳐 기피 미반영: "
+              f"{[d.isoformat() for d in blocked]}")
+    return blocked
+
+
+def _load_nurse_avoid_entries(
+    db: Session, nurse_id: str, group_id: str, year: int, month: int
+) -> list[dict]:
+    """저장된 기피근무를 wanted_entries 형태로 되돌린다. 테이블 미생성이면 빈 목록."""
+    from db.models import BannedWantedEntry
+    from services.wanted_service import BANNED_SOURCE_NURSE, banned_source_filter
+
+    if not _avoid_storage_ready(db):
+        return []
+
+    rows = db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == year,
+        BannedWantedEntry.month == month,
+        BannedWantedEntry.nurse_id == nurse_id,
+        banned_source_filter(BANNED_SOURCE_NURSE),
+    ).all()
+
+    entries: list[dict] = []
+    for row in rows:
+        codes = row.banned_shift_ids
+        if isinstance(codes, str):
+            try:
+                codes = json.loads(codes)
+            except (ValueError, TypeError):
+                codes = []
+        for code in (codes or []):
+            entries.append({
+                "date": row.shift_date.isoformat(),
+                "shift_id": str(code),
+                "intent": "avoid",
+                "comment": row.reason or "",
+            })
+    return entries
 
 
 def _assert_off_limit(entries: list[dict], off_shift_ids: set, max_requests) -> None:
@@ -353,7 +580,11 @@ def save_wanted_entries_service(
             print(f"[wanted_entries] 주휴일 엔트리 제외: {sorted(dropped)}")
         normalized = [e for e in normalized if e["date"].day not in weekly_off_days]
 
-    entries = normalized
+    # 선호(wanted)는 nurse_shift_requests, 기피(avoid)는 banned_wanted_entries 로 갈린다.
+    entries = [e for e in normalized if e["intent"] == "wanted"]
+    avoid = _validate_avoid_entries(
+        db, nurse_id, group_id, [e for e in normalized if e["intent"] == "avoid"]
+    )
 
     nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     _assert_off_limit(
@@ -362,11 +593,40 @@ def save_wanted_entries_service(
         nurse_row.wanted_max_requests if nurse_row else None,
     )
 
+    # 기피근무 저장소(banned_wanted_entries)가 없으면 — 기피가 없을 땐 그냥 건너뛰고,
+    # 기피를 실제로 보냈다면 조용히 버리지 않고 명시적으로 거절한다.
+    # 기피를 관리하지 않는 클라이언트가 보낸 avoid 는 애초에 없다(0건). 그런데
+    # 0건을 replace 로 받아들이면 **간호사가 낸 기피근무가 통째로 삭제**된다.
+    # 그래서 관리 의사를 명시한 요청만 기피를 건드린다.
+    manages_avoid = bool(getattr(req, "manages_avoid", False)) or bool(avoid)
+    avoid_ready = _avoid_storage_ready(db)
+    if avoid and not avoid_ready:
+        raise PreferenceValidationError(
+            "피하고 싶은 근무를 저장할 수 없습니다. banned_wanted_entries 저장소가 준비되지 "
+            "않았습니다(테이블 또는 source 컬럼 누락 — 마이그레이션 "
+            "2026_07_28_add_banned_wanted_entries.sql 적용 필요).",
+            code="avoid_storage_unavailable",
+        )
+
     draft = _acquire_draft_request(db, nurse_id, month_str, group_id)
+    # 자연어 원문 보존 — 화면 입력창에 다시 그려지는 값이다(`preference_data.request`).
+    # 예전에는 `/wanted/invoke` 가 채웠는데, 그 호출을 없애고 저장 경로로 합치면서
+    # 여기서 갱신하지 않으면 **새로 쓴 문장이 저장돼도 옛 문장이 계속 보인다**
+    # (실측: '12일 데이 싫어' 가 새 문장 저장 후에도 그대로 남았다).
+    # None 이면 미지정 — 기존 값을 지우지 않는다(캘린더만 고친 저장과 구분).
+    if getattr(req, "request", None) is not None:
+        draft.request = req.request
     _replace_shift_requests(
         db, nurse_id, draft.request_id, entries,
         group_id=group_id, year=year, month=month,
     )
+    avoid_blocked = []
+    if avoid_ready and manages_avoid:
+        avoid_blocked = _replace_nurse_avoid_entries(
+            db, nurse_id, group_id, year, month, avoid
+        )
+    elif avoid_ready:
+        print("[wanted_entries] manages_avoid=False — 기피근무 보존(손대지 않음)")
     if not is_draft:
         draft.is_submitted = True
         draft.submitted_at = datetime.now()
@@ -375,11 +635,20 @@ def save_wanted_entries_service(
     print(
         f"[wanted_entries] {'제출' if not is_draft else '임시저장'} 완료: "
         f"nurse={nurse_id}, {month_str}, request_id={draft.request_id}, "
-        f"{len(entries)}건"
+        f"선호 {len(entries)}건 · 기피 {len(avoid)}건"
+        + ("" if manages_avoid else " (기피 미관리)")
     )
-    return get_latest_preference_service(
+    result = get_latest_preference_service(
         year, month, current_user, db, override_group_id=group_id
     )
+    if avoid_blocked and isinstance(result, dict):
+        # 조용히 버리면 사용자는 반영된 줄 안다.
+        result["avoid_blocked"] = {
+            "dates": [d.isoformat() for d in avoid_blocked],
+            "message": "수간호사가 이미 지정한 날짜라 피하고 싶은 근무로 반영하지 "
+                       "못했습니다.",
+        }
+    return result
 
 
 def submit_preferences_service(
@@ -851,15 +1120,17 @@ def get_latest_preference_service(
         })
     # 6️⃣ wanted_entries — 날짜별 한 건. 저장·조회·제출의 단일 원본.
     #    이름/색상은 담지 않는다(프론트가 shift_id 로 근무코드 룩업과 조인).
+    #    선호는 nurse_shift_requests, 기피는 banned_wanted_entries(source='nurse').
     wanted_entries = [
         {
             "date": s.shift_date.isoformat(),
             "shift_id": s.shift,
-            "intent": "wanted",  # avoid 는 미지원 — 저장 시 422 로 거절된다
+            "intent": "wanted",
             "comment": s.comment or "",
         }
         for s in shift_rows
     ]
+    wanted_entries += _load_nurse_avoid_entries(db, nurse_id, group_id, year, month)
     wanted_entries.sort(key=lambda e: e["date"])
 
     # 7️⃣ 최종 JSON 구성 (Front 기대 형식)

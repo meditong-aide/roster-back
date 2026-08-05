@@ -1066,6 +1066,10 @@ class BannedWantedEntry(Base):
     # 금지 근무코드 배열(main code). 예: ["D","E"]. 1~2개.
     banned_shift_ids = Column(JSON, nullable=False, default=list)
     is_applied = Column(BOOLEAN, default=True)  # 적용/미적용 여부
+    # 출처: 'hn'=수간호사 조정판 저장, 'nurse'=간호사 본인이 원티드 작성에서 넣은 기피근무.
+    #   두 출처가 한 테이블에 섞이므로 스냅샷 replace 삭제 스코프를 이 값으로 가른다
+    #   (안 가르면 HN 저장 1회에 간호사 기피근무가 통째로 삭제된다).
+    source = Column(VARCHAR(10), nullable=False, server_default="hn", default="hn")
     reason = Column(TEXT, nullable=True)
     created_by = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=True)
     created_at = Column(DATETIME, default=func.now())

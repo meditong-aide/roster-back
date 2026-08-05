@@ -198,6 +198,18 @@ class PreferenceData(BaseModel):
     # 원티드 엔트리 전량(replace-all). 지정 시 이 목록이 저장·조회·제출의 단일 원본이
     # 되며 data 는 무시한다. 미지정(None) 이면 기존 data 기반 경로로 동작한다.
     wanted_entries: Optional[List[WantedEntryItem]] = Field(default=None)
+    #: 자연어 원티드 문장. 지정하면 서버가 AIDE 로 분석해 `wanted_entries` 에 **병합**한다.
+    #: 이 덕분에 프론트는 `/wanted/invoke` 를 따로 부르지 않아도 되고, 저장·제출이
+    #: 호출 1회로 끝난다. 같은 날짜가 겹치면 **캘린더로 찍은 쪽(wanted_entries)이 우선**
+    #: 이다 — 사용자가 직접 고른 것이 문장 해석보다 확실하다.
+    #: 분석이 실패해도 저장은 진행된다(응답 metadata 에 알린다).
+    request: Optional[str] = Field(default=None)
+    #: 이 요청이 기피근무(intent="avoid")까지 **관리**하는가.
+    #: True 일 때만 `banned_wanted_entries`(source='nurse')를 페이로드로 replace 한다.
+    #: 기본 False 인 이유 — 기피근무 UI 가 없는 구 화면·모바일이 캘린더만 저장해도
+    #: 페이로드에 avoid 가 0건이라 **간호사가 낸 기피근무를 전량 삭제**해 버린다.
+    #: 기피를 다루는 화면만 True 를 실어 보낸다(0건 보내 전체 해제하는 것도 가능).
+    manages_avoid: bool = Field(default=False)
 
 
 class PublishRequest(BaseModel):
@@ -952,6 +964,10 @@ class BannedWantedEntryResponse(BaseModel):
     shift_date: date
     banned_shift_ids: List[str]
     is_applied: bool
+    #: 출처 — 'hn'=수간호사 조정판, 'nurse'=간호사 본인이 원티드에서 낸 기피근무.
+    #: 조정판은 둘 다 보여주되 **저장(스냅샷 replace)은 hn 만** 건드린다. 프론트는
+    #: 이 값으로 출처를 표시하고, nurse 건은 적용/해제(toggle)만 하면 된다.
+    source: str = "hn"
     reason: Optional[str] = None
     created_by: Optional[str] = None
 

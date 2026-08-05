@@ -3838,6 +3838,29 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
     return roster_data
 
 
+def _preceptee_coverage_skipper(roster_system, cfg):
+    """커버리지 회계에서 제외할 프리셉티 판별기를 만든다.
+
+    preceptee_shift_count=False 면 프리셉티는 커버리지상 '없는 인력'이다. 솔버의
+    need/supply 와 같은 기준으로 세지 않으면 부족 리포트가 솔버와 어긋나 phantom
+    부족·과소보고의 씨앗이 된다.
+    ★ 이 설정은 roster_config 상 preceptee_on=True 일 때만 유효하므로 여기서
+      preceptee_on 을 다시 보지 않는다.
+    ★ 판별 규칙은 cp_sat_basic 의 _is_preceptee_at 과 동일하다
+      (SSOT = nurse_preceptee_period, 설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md §6).
+        맵 있음(권위)  → 그 사람의 follow day 집합에 d 가 있을 때만 프리셉티
+        맵 없음(폴백)  → preceptor_id 보유자를 전체월 프리셉티로(기존 동작 보존)
+    """
+    if bool(getattr(cfg, "preceptee_shift_count", True)):
+        return lambda n, d: False
+    if bool(getattr(roster_system, "preceptee_period_authoritative", False)):
+        follow_days = getattr(roster_system, "preceptee_follow_days", {}) or {}
+        return lambda n, d: d in (follow_days.get(n) or set())
+    fallback = {n for n, nu in enumerate(roster_system.nurses)
+                if getattr(nu, "preceptor_id", None)}
+    return lambda n, d: n in fallback
+
+
 def _compute_coverage_gaps(roster_system) -> list[dict]:
     """현재 roster vs daily_shift_requirements 비교해 부족분 리스트를 반환.
 
@@ -3867,6 +3890,9 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
                 cnt += 1
             return cnt
         _elig_cache: dict[str, int] = {}
+        # 프리셉티 제외 판별(솔버와 같은 기준). eligible 은 day 무관 집계라 그대로 둔다 —
+        # 권위 모드의 프리셉티는 day 별이라 전월 단위 정원에 반영할 수 없다.
+        _skip_pte = _preceptee_coverage_skipper(roster_system, cfg)
 
         gaps: list[dict] = []
         for d in range(roster_system.num_days):
@@ -3883,7 +3909,8 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
                 if req <= 0:
                     continue
                 s_idx = shift_types.index(s_code)
-                assigned = int(sum(int(roster_system.roster[n, d, s_idx]) for n in range(N)))
+                assigned = int(sum(int(roster_system.roster[n, d, s_idx])
+                                   for n in range(N) if not _skip_pte(n, d)))
                 if assigned < req:
                     if s_code not in _elig_cache:
                         _elig_cache[s_code] = _eligible_for(s_code)

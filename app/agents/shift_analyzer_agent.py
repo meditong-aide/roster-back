@@ -398,6 +398,33 @@ async def shift_analyzer(state):
     return {"shift_result": shift_result}
 
 
+async def create_avoid_analyzer(parent_state):
+    """기피(Except) 문장을 (날짜, 근무코드) 쌍으로 분석한다. 분석 전용 — DB 쓰기 없음.
+
+    query_analyzer 가 Except 로 분류한 문장("10일은 E 빼줘")은 Shift 문장과 같은
+    (날짜, 근무코드) 구조라 전용 프롬프트를 새로 만들지 않고 shift 분석기를 그대로
+    재사용한다. 실측(3표현 x 3회)상 원문 근무코드가 보존되고 OFF 로 반전되지 않았다.
+
+    반환 형태는 shift_results 와 동일하다. 의미(선호/기피)는 호출부가 구분한다.
+    """
+    requests = parent_state.get('query_except') or []
+    if not requests:
+        return {"avoid_results": []}
+
+    print(f"[create_avoid_analyzer] 기피 요청 {len(requests)}건 분석")
+    sub_state = {
+        # case 병합 경로를 타지 않도록 명시 — case 는 선호(wanted) 전용이다.
+        "case_results": None,
+        "query_shift": requests,
+        "query_shift_comments": [None] * len(requests),
+        "year": parent_state['year'],
+        "month": parent_state['month'],
+        "allowed_shift_map": parent_state.get('allowed_shift_map', {}),
+    }
+    result = await create_shift_analyzer(sub_state)
+    return {"avoid_results": result.get("shift_results", [])}
+
+
 async def create_shift_analyzer(parent_state):
     """
     Shift 분석기 생성 및 실행 - 최종 버전
