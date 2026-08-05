@@ -269,3 +269,112 @@ async def roll_nurse_cache(
 
     return RollResult(group_id=group_id, as_of=as_of,
                       nurse_count=len(nurses), updated=updated)
+
+
+# ──────────────────────────────────────────────────────────────
+# 휴가 대상 3-state — 보건휴가 · 수면OFF · 임산부
+#   None = 미설정(자동판정에 맡김) / True = 포함 / False = 제외
+#   자동판정: 보건휴가는 여성 · N전담 아님 · 고정근무 아님. 수면OFF 는 전원.
+#   설계: docs/leave_auto_assignment_design.md §6 Step6
+# ──────────────────────────────────────────────────────────────
+class LeaveFlagRow(BaseModel):
+    nurse_id: str
+    name: Optional[str] = None
+    health_leave_eligible: Optional[bool] = None
+    sleep_off_eligible: Optional[bool] = None
+    pregnant: Optional[bool] = None
+
+
+class LeaveFlagsResult(BaseModel):
+    group_id: str
+    year: int
+    month: int
+    rows: list[LeaveFlagRow]
+
+
+@router.get("/leave-flags", response_model=LeaveFlagsResult)
+async def get_leave_flags(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """그룹 전원의 휴가 대상 3-state 를 대상월 기준으로 반환한다.
+
+    행이 없는 간호사는 세 값이 모두 None(= 전부 자동판정)으로 나간다.
+    """
+    gid = group_id or getattr(current_user, "group_id", None)
+    if not gid:
+        raise HTTPException(status_code=400, detail="group_id 가 필요합니다")
+    assert_caller_can_access_group(db, current_user, gid)
+    nurses = db.query(Nurse).filter(Nurse.group_id == gid, Nurse.active == True).all()  # noqa: E712
+    if not nurses:
+        return LeaveFlagsResult(group_id=gid, year=year, month=month, rows=[])
+
+    from services.leave.leave_eligibility import fetch_leave_flags
+
+    ids = [str(n.nurse_id) for n in nurses]
+    flags = fetch_leave_flags(db, ids, int(year), int(month))
+    rows = [
+        LeaveFlagRow(
+            nurse_id=str(n.nurse_id),
+            name=getattr(n, "name", None),
+            **{k: (flags.get(str(n.nurse_id)) or {}).get(k)
+               for k in ("health_leave_eligible", "sleep_off_eligible", "pregnant")},
+        )
+        for n in nurses
+    ]
+    return LeaveFlagsResult(group_id=gid, year=year, month=month, rows=rows)
+
+
+class LeaveFlagUpdate(BaseModel):
+    nurse_id: str
+    group_id: Optional[str] = None
+    valid_from: Optional[date] = None          # 기본=오늘
+    health_leave_eligible: Optional[bool] = None
+    sleep_off_eligible: Optional[bool] = None
+    pregnant: Optional[bool] = None
+
+
+@router.post("/leave-flags", response_model=LeaveFlagRow)
+async def update_leave_flags(
+    payload: LeaveFlagUpdate,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """한 간호사의 휴가 대상 3-state 를 바꾼다(close-before-open).
+
+    ★ 보내지 않은 값 컬럼은 건드리지 않는다 — 명시적으로 null 을 보내야 '미설정'이
+      된다. exclude_unset 으로 둘을 가른다. upsert_leave_period 가 형제 컬럼을
+      직전 구간에서 승계하므로 호출부가 carry 를 신경 쓸 필요는 없다.
+    """
+    nurse = db.query(Nurse).filter(Nurse.nurse_id == str(payload.nurse_id)).first()
+    if nurse is None:
+        raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
+    assert_caller_can_access_group(db, current_user, payload.group_id or nurse.group_id)
+
+    sent = payload.model_dump(exclude_unset=True)
+    values = {k: sent[k] for k in
+              ("health_leave_eligible", "sleep_off_eligible", "pregnant") if k in sent}
+    if not values:
+        raise HTTPException(status_code=400, detail="변경할 값이 없습니다.")
+
+    from services.leave.leave_eligibility import fetch_leave_flags, upsert_leave_period
+
+    valid_from = payload.valid_from or date.today()
+    try:
+        upsert_leave_period(db, str(payload.nurse_id), valid_from,
+                            source="edited", **values)
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"휴가 대상 저장 실패: {exc}") from exc
+
+    cur = fetch_leave_flags(db, [str(payload.nurse_id)],
+                            valid_from.year, valid_from.month).get(str(payload.nurse_id)) or {}
+    return LeaveFlagRow(nurse_id=str(payload.nurse_id), name=getattr(nurse, "name", None),
+                        **{k: cur.get(k) for k in
+                           ("health_leave_eligible", "sleep_off_eligible", "pregnant")})
