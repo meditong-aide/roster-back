@@ -2474,11 +2474,23 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) not in vacation_off_cells
                     )
                     hard_lower = int(min_off_required)
-                    # per-nurse 1일 lower slack (페널티 무거움) — 솔버가 min_off 1일
-                    # 부족한 nurse 만 자동 풀어줌. 글로벌 -1 (구 relax_level=1) 의
-                    # 항상-ON per-nurse 버전. 9B 2026-07 등 min_off=11 hard 가
-                    # combinatorial 로 막히는 케이스 회복.
-                    _lower_slack_max = 1
+                    # ★★ OFF 하한은 HARD 다 — per-nurse 1일 slack 을 쓰지 않는다.
+                    #   이 블록은 off_first=False 일 때만 실행된다(True 면 위에서
+                    #   min_off_required=0 이 되어 건너뛴다). off_first=False 는
+                    #   "근무 oversupply 허용 · OFF tight" 모드이므로 OFF 를 정확히
+                    #   지키는 것이 설계 의도다.
+                    #
+                    #   실측(2026-08-04) — slack=1 이던 시절:
+                    #     중환자실  쉼여력 328 · 필요 260(여유 68)인데 6명이 OFF 9
+                    #     42-AN     여유 50 인데 7명이 OFF 9
+                    #   여력이 남는데도 solver 가 페널티(100000)를 물고 slack 을 사서
+                    #   다른 제약을 맞추는 쪽을 택했다. 실무 근무표는 한 시트 안에서
+                    #   22~29/26~29명이 같은 OFF 수를 갖는다 — 균일이 정상이다.
+                    #
+                    #   ★ 구 주석의 회복 대상(9B 2026-07 min_off=11)은 현재 off_first=1
+                    #     이라 이 블록에 들어오지 않는다. 되살릴 때는 그 그룹의
+                    #     off_first 를 먼저 확인할 것.
+                    _lower_slack_max = 0
                     _lower_slack_weight = 100000
                     if _lower_slack_max > 0:
                         min_off_lower_slack = m.NewIntVar(
@@ -2547,8 +2559,15 @@ def optimize_fallback_lex_hard_first(
                                 _scaled_max_fb = max(min_off_required, int(_fb_auto_max_off * _ratio_fb))
                                 total_cap_effective = min(total_cap_effective, _scaled_max_fb)
                         else:
-                            # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
-                            base_cap = min_off_required + _extra_off_fb
+                            # off_first=False: 근무 oversupply 를 허용하는 모드다(위 분기 주석).
+                            # ★★ 그러므로 OFF 는 **하한으로 고정**한다 — _extra_off_fb 를 더하지 않는다.
+                            #   더하면 상한이 하한+2 로 열려 사람마다 OFF 가 흩어진다.
+                            #   실측(2026-08-04):
+                            #     실무 엑셀   한 시트 안 22~29/26~29명이 동일값 (사실상 전원 균일)
+                            #     우리 issued 992 인원·월 중 하한정확 54.3% · 초과 26.5% · 미달 19.2%
+                            #   실무 기준으로 균일이 정상이고, 남는 인원은 근무로 흘려보내면 된다
+                            #   (커버리지 미달은 HARD 로 막히지만 초과는 무방하다).
+                            base_cap = min_off_required
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
                             # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
