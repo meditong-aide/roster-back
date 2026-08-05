@@ -1011,6 +1011,15 @@ class CPSATBasicEngine:
         # 3. 간호사 객체 생성
         with Timer("간호사 객체 생성"):
             nurses = self.create_nurses_from_db(nurses_data)
+            # ★ create_nurses_from_db 는 명시한 키만 복사해 새 Nurse 를 만든다.
+            #   DB 식별자는 `nurse_id` 가 아니라 **`db_id`** 다(`id` 는 엔진 인덱스).
+            _hl_ids = {str(nd.get('nurse_id')) for nd in nurses_data
+                       if nd.get('health_leave_extra_off')}
+            if _hl_ids:
+                for _nu in nurses:
+                    if str(getattr(_nu, 'db_id', None) or getattr(_nu, 'nurse_id', '') or '') in _hl_ids:
+                        _nu.health_leave_extra_off = True
+                print(f"[HealthLeave] OFF 하한 +1 대상 {len(_hl_ids)}명 엔진 전달")
             for nurse in nurses:
                 nurse.initialize_off_days(config)
         # 4. 근무표 시스템 생성

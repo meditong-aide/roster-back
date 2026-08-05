@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import uuid
@@ -25,6 +26,8 @@ from services.roster_create_service import (
 )
 from services.job_status_service import create_job_record
 from services.group_access import resolve_effective_group
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["roster_create"])
 
@@ -312,7 +315,10 @@ async def generate_roster_endpoint(
         # 구조화된 infeasibility 페이로드 등 의도된 HTTPException은 그대로 전파
         raise
     except Exception as e:
-        print('error', e)
+        # ★ 메시지만 찍으면 원인을 못 찾는다 — 실제로 'Permission denied' 한 줄만 남아
+        #   어디서 난 것인지 추적이 불가능했다(2026-08-04). 규칙대로 스택을 남긴다
+        #   (.claude/rules/coding-standards.md: logger.error 에 exc_info=True).
+        logger.error("근무표 생성 실패: %s", e, exc_info=True)
         payload = _fallback_unrecoverable_from_exception(f"근무표 생성 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=payload)
 

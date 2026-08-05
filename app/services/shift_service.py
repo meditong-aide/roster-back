@@ -25,20 +25,24 @@ from services.group_access import (
 )
 
 
-def _assert_off_swap_target_valid(
+def _assert_single_target_flag(
     db: Session,
     *,
     group_id: str,
+    column,
+    label: str,
     target_value: bool,
     shift_type: Optional[str],
     self_id: Optional[int] = None,
 ) -> None:
-    """off_swap_target=True 저장 전 정책 검증.
+    """'그룹당 1건' 타깃 플래그의 공통 저장 정책 검증.
 
-    1) 변환 대상 shift 의 type 은 '근무' 가 아니어야 한다.
-       (근무 코드를 변환 target 으로 두면 OFF→근무 치환 시 일별 coverage oversupply 발생)
-    2) 동일 group_id 내 off_swap_target=True 인 row 는 단 1건만 허용.
-       (다수면 _resolve_target_shift 가 sequence ASC 첫 번째만 채택해 의도와 다른 결과)
+    off_swap_target / health_leave_target / sleep_off_target 이 같은 규칙을 쓴다.
+
+    1) 대상 shift 의 type 은 '근무' 가 아니어야 한다.
+       (근무 코드를 타깃으로 두면 OFF→근무 치환·휴가 주입 시 일별 coverage 가 어긋난다)
+    2) 동일 group_id 내 True 인 row 는 단 1건만 허용.
+       (다수면 resolver 가 sequence ASC 첫 번째만 채택해 의도와 다른 결과)
 
     target_value=False 면 검증 skip. self_id 는 update 시 본인 row 를 비교 대상에서 제외.
     """
@@ -47,9 +51,9 @@ def _assert_off_swap_target_valid(
     if str(shift_type or "").strip() == "근무":
         raise HTTPException(
             status_code=400,
-            detail="off_swap_target=True 는 type='근무' 인 근무코드에는 설정할 수 없습니다.",
+            detail=f"{label}=True 는 type='근무' 인 근무코드에는 설정할 수 없습니다.",
         )
-    q = db.query(Shift).filter(Shift.group_id == group_id, Shift.off_swap_target == True)  # noqa: E712
+    q = db.query(Shift).filter(Shift.group_id == group_id, column == True)  # noqa: E712
     if self_id is not None:
         q = q.filter(Shift.id != self_id)
     other = q.first()
@@ -57,10 +61,74 @@ def _assert_off_swap_target_valid(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"off_swap_target=True 는 그룹당 1건만 설정 가능합니다. "
+                f"{label}=True 는 그룹당 1건만 설정 가능합니다. "
                 f"기존 설정: shift_id={other.shift_id}, name={other.name}"
             ),
         )
+
+
+def _assert_off_swap_target_valid(
+    db: Session,
+    *,
+    group_id: str,
+    target_value: bool,
+    shift_type: Optional[str],
+    self_id: Optional[int] = None,
+) -> None:
+    """off_swap_target=True 저장 전 정책 검증 (초과 OFF → 연차 변환 타깃)."""
+    _assert_single_target_flag(
+        db,
+        group_id=group_id,
+        column=Shift.off_swap_target,
+        label="off_swap_target",
+        target_value=target_value,
+        shift_type=shift_type,
+        self_id=self_id,
+    )
+
+
+def _assert_health_leave_target_valid(
+    db: Session,
+    *,
+    group_id: str,
+    target_value: bool,
+    shift_type: Optional[str],
+    self_id: Optional[int] = None,
+) -> None:
+    """health_leave_target=True 저장 전 정책 검증 (보건휴가 부여 대상 코드).
+
+    ★ off_swap 과 규칙만 같고 동작은 무관하다 — 보건휴가는 생성 전 사전 주입이며
+      OFF 를 변환하지 않는다. 상세: docs/leave_auto_assignment_design.md §4.1
+    """
+    _assert_single_target_flag(
+        db,
+        group_id=group_id,
+        column=Shift.health_leave_target,
+        label="health_leave_target",
+        target_value=target_value,
+        shift_type=shift_type,
+        self_id=self_id,
+    )
+
+
+def _assert_sleep_off_target_valid(
+    db: Session,
+    *,
+    group_id: str,
+    target_value: bool,
+    shift_type: Optional[str],
+    self_id: Optional[int] = None,
+) -> None:
+    """sleep_off_target=True 저장 전 정책 검증 (수면OFF 부여 대상 코드)."""
+    _assert_single_target_flag(
+        db,
+        group_id=group_id,
+        column=Shift.sleep_off_target,
+        label="sleep_off_target",
+        target_value=target_value,
+        shift_type=shift_type,
+        self_id=self_id,
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -293,6 +361,20 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         shift_type=getattr(req, "type", None),
         self_id=None,
     )
+    _assert_health_leave_target_valid(
+        db,
+        group_id=target_group_id,
+        target_value=bool(getattr(req, "health_leave_target", False) or False),
+        shift_type=getattr(req, "type", None),
+        self_id=None,
+    )
+    _assert_sleep_off_target_valid(
+        db,
+        group_id=target_group_id,
+        target_value=bool(getattr(req, "sleep_off_target", False) or False),
+        shift_type=getattr(req, "type", None),
+        self_id=None,
+    )
     max_sequence = db.query(func.max(Shift.sequence)).filter(Shift.group_id == target_group_id).scalar() or 0
     new_shift = Shift(
         shift_id=req.shift_id,
@@ -311,6 +393,8 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         # 추가
         show_in_preference=getattr(req, "show_in_preference", False), # 프론트 미 전송 시 False
         off_swap_target=bool(getattr(req, "off_swap_target", False) or False),
+        health_leave_target=bool(getattr(req, "health_leave_target", False) or False),
+        sleep_off_target=bool(getattr(req, "sleep_off_target", False) or False),
         description=getattr(req, "description", None),
     )
     db.add(new_shift)
@@ -362,6 +446,32 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
         shift_type=req.type,
         self_id=existing_shift.id,
     )
+    # health_leave_target 정책 검증 — 동일하게 변경 후 조합 기준.
+    _new_health_target = (
+        bool(req.health_leave_target)
+        if (hasattr(req, "health_leave_target") and req.health_leave_target is not None)
+        else bool(existing_shift.health_leave_target or False)
+    )
+    _assert_health_leave_target_valid(
+        db,
+        group_id=target_group_id,
+        target_value=_new_health_target,
+        shift_type=req.type,
+        self_id=existing_shift.id,
+    )
+    # sleep_off_target 정책 검증 — 동일하게 변경 후 조합 기준.
+    _new_sleep_target = (
+        bool(req.sleep_off_target)
+        if (hasattr(req, "sleep_off_target") and req.sleep_off_target is not None)
+        else bool(existing_shift.sleep_off_target or False)
+    )
+    _assert_sleep_off_target_valid(
+        db,
+        group_id=target_group_id,
+        target_value=_new_sleep_target,
+        shift_type=req.type,
+        self_id=existing_shift.id,
+    )
     old_shift_id = existing_shift.shift_id
     old_shift_gb = getattr(existing_shift, "shift_gb", None)
     existing_shift.shift_id = req.shift_id
@@ -380,6 +490,12 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     # 초과 OFF 변환 타깃 업데이트 (None 이면 기존 값 유지)
     if hasattr(req, "off_swap_target") and req.off_swap_target is not None:
         existing_shift.off_swap_target = bool(req.off_swap_target)
+    # 보건휴가 부여 대상 코드 업데이트 (None 이면 기존 값 유지)
+    if hasattr(req, "health_leave_target") and req.health_leave_target is not None:
+        existing_shift.health_leave_target = bool(req.health_leave_target)
+    # 수면OFF 부여 대상 코드 업데이트 (None 이면 기존 값 유지)
+    if hasattr(req, "sleep_off_target") and req.sleep_off_target is not None:
+        existing_shift.sleep_off_target = bool(req.sleep_off_target)
     # 근무코드 설명 업데이트 — 프론트가 빈 값을 null 로 전송하므로 클리어 허용(항상 반영).
     existing_shift.description = getattr(req, "description", None)
     db.commit()

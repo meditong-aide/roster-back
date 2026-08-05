@@ -1,0 +1,232 @@
+"""N 연번 앵커(`nurse_night_cycle`) 계산·갱신.
+
+`schedule_entries.shift_id` 에는 `'N'` 만 저장되고 N1~N15 연번은 없다.
+그래서 "15 에 도달했는가"를 근무표만으로는 알 수 없다 — 전월 앵커가 있어야
+`앵커 + 당월 N` 으로 연번이 복원된다.
+
+이 모듈은 근무표 **확정(발행) 시점**에 그 달 스냅샷 1행을 upsert 해서
+다음 달 앵커가 끊기지 않게 한다. 백필은 tools/leave_analysis/backfill_night_cycle.py.
+
+설계: docs/leave_auto_assignment_design.md §5.2 · §6 Step4
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from sqlalchemy.orm import Session
+
+from db.models import NurseNightCycle, Schedule, ScheduleEntry, RosterConfig, Shift
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_CYCLE = 15
+
+
+def resolve_sleep_off_shift(db: Session, group_id: str) -> Optional[Shift]:
+    """그룹의 `sleep_off_target=True` 인 근무코드. 다수면 sequence ASC 첫 건 + warning."""
+    rows = (
+        db.query(Shift)
+        .filter(Shift.group_id == group_id, Shift.sleep_off_target == True)  # noqa: E712
+        .order_by(Shift.sequence.asc())
+        .all()
+    )
+    if not rows:
+        return None
+    if len(rows) > 1:
+        logger.warning(
+            "[NightCycle] group=%s 타깃 코드 %d건 — sequence 첫 건(%s) 채택",
+            group_id, len(rows), rows[0].shift_id,
+        )
+    return rows[0]
+
+
+def resolve_cycle(db: Session, group_id: str) -> int:
+    """그룹의 수면OFF 트리거 주기. 미설정이면 DEFAULT_CYCLE(15)."""
+    cfg = (
+        db.query(RosterConfig)
+        .filter(RosterConfig.group_id == group_id)
+        .order_by(RosterConfig.created_at.desc())
+        .first()
+    )
+    v = getattr(cfg, "sleep_off_cycle", None)
+    try:
+        return int(v) if v else DEFAULT_CYCLE
+    except (TypeError, ValueError):
+        return DEFAULT_CYCLE
+
+
+def _prev_ym(year: int, month: int) -> tuple[int, int]:
+    return (year - 1, 12) if month == 1 else (year, month - 1)
+
+
+def fetch_anchor(db: Session, nurse_id: str, group_id: str,
+                 year: int, month: int) -> tuple[int, int, int]:
+    """(seq_at_end, pending_sleep, sleep_off_seq) — 해당 월 스냅샷. 없으면 (0, 0, 0)."""
+    row = (
+        db.query(NurseNightCycle)
+        .filter(NurseNightCycle.nurse_id == str(nurse_id),
+                NurseNightCycle.group_id == str(group_id),
+                NurseNightCycle.year == int(year),
+                NurseNightCycle.month == int(month))
+        .first()
+    )
+    if row is None:
+        return 0, 0, 0
+    return (int(row.seq_at_end or 0), int(row.pending_sleep or 0),
+            int(row.sleep_off_seq or 0))
+
+
+def advance_cycle(codes_by_day: dict[int, str], *, prev_seq: int, prev_pending: int,
+                  sleep_code: Optional[str], cycle: int = DEFAULT_CYCLE,
+                  prev_sleep_seq: int = 0) -> tuple[int, int, int, int]:
+    """한 달치 근무코드를 훑어 (seq_at_end, pending_sleep, sleep_off_count, sleep_off_seq) 전진.
+
+    Args:
+        codes_by_day: {일(1-based): 근무코드}
+        prev_seq: 전월 말 연번 (없으면 0)
+        prev_pending: 전월 말 미부여 이월 수
+        sleep_code: 그 그룹의 수면OFF 코드. None 이면 소진 계산을 하지 않는다.
+        cycle: 트리거 주기 (실측 15)
+        prev_sleep_seq: 전월 말 누적 수령 회차
+
+    Returns:
+        (seq_at_end, pending_sleep, sleep_off_count, sleep_off_seq)
+
+    Notes:
+        N 은 1..cycle 을 순환한다(실측: N15 다음이 N1).
+        cycle 에 도달할 때마다 pending 이 1 늘고, 수면OFF 가 나올 때마다 1 줄어든다.
+    """
+    seq, pending = int(prev_seq or 0), int(prev_pending or 0)
+    sleep_count = 0
+    for day in sorted(codes_by_day):
+        code = str(codes_by_day[day] or "").strip()
+        if code == "N":
+            seq = 1 if seq >= cycle else seq + 1
+            if seq >= cycle:
+                pending += 1
+        elif sleep_code and code == sleep_code:
+            pending = max(0, pending - 1)
+            sleep_count += 1
+    return seq, pending, sleep_count, int(prev_sleep_seq or 0) + sleep_count
+
+
+def compute_snapshot(db: Session, schedule: Schedule) -> list[dict]:
+    """스케줄 1건의 간호사별 (nurse_id, seq_at_end, pending_sleep) 목록을 계산한다."""
+    gid = str(schedule.group_id)
+    cycle = resolve_cycle(db, gid)
+    target = resolve_sleep_off_shift(db, gid)
+    sleep_code = target.shift_id if target else None
+    py, pm = _prev_ym(int(schedule.year), int(schedule.month))
+
+    rows = (
+        db.query(ScheduleEntry.nurse_id, ScheduleEntry.work_date, ScheduleEntry.shift_id)
+        .filter(ScheduleEntry.schedule_id == schedule.schedule_id)
+        .all()
+    )
+    by_nurse: dict[str, dict[int, str]] = {}
+    for nid, wdate, code in rows:
+        if not nid or wdate is None:
+            continue
+        by_nurse.setdefault(str(nid), {})[int(wdate.day)] = str(code or "")
+
+    out = []
+    for nid, codes in by_nurse.items():
+        prev_seq, prev_pending, prev_sleep_seq = fetch_anchor(db, nid, gid, py, pm)
+        seq, pending, s_cnt, s_seq = advance_cycle(
+            codes, prev_seq=prev_seq, prev_pending=prev_pending,
+            sleep_code=sleep_code, cycle=cycle, prev_sleep_seq=prev_sleep_seq,
+        )
+        out.append({"nurse_id": nid, "seq_at_end": seq, "pending_sleep": pending,
+                    "sleep_off_count": s_cnt, "sleep_off_seq": s_seq})
+    return out
+
+
+def upsert_night_cycle_snapshot(db: Session, schedule: Schedule) -> int:
+    """확정된 근무표의 월 스냅샷을 upsert 한다. 반영 행수를 돌려준다.
+
+    ★ 커밋은 호출자 책임 — 발행 트랜잭션에 함께 묶는다.
+    ★ 수면OFF 기능이 꺼진 그룹에서도 앵커는 남긴다. 연번은 기능과 무관하게
+      이어져야 하고, 나중에 기능을 켰을 때 과거 앵커가 없으면 판정이 불가능하다.
+    """
+    gid = str(schedule.group_id)
+    y, m = int(schedule.year), int(schedule.month)
+    snap = compute_snapshot(db, schedule)
+    if not snap:
+        # ★ 조용히 넘기지 않는다. 마감 근무표에 entry 가 0건인 것은 비정상이며,
+        #   호출자가 flush 하지 않은 채 부른 경우가 대표적이다(autoflush=False 세션에서
+        #   bulk delete 직후 재삽입분이 아직 DB 에 없는 상태 — 실측된 함정).
+        logger.warning(
+            "[NightCycle] group=%s %s-%02d 스냅샷 0명 — schedule_entries 가 비어 있다. "
+            "bulk delete 후 flush 없이 호출했는지 확인할 것.",
+            gid, y, m,
+        )
+        print(f"[NightCycle][WARN] {gid} {y}-{m:02d} 스냅샷 0명 — entries 없음")
+        return 0
+
+    existing = {
+        str(r.nurse_id): r
+        for r in db.query(NurseNightCycle).filter(
+            NurseNightCycle.group_id == gid,
+            NurseNightCycle.year == y,
+            NurseNightCycle.month == m,
+        ).all()
+    }
+    for s in snap:
+        row = existing.get(s["nurse_id"])
+        if row is None:
+            db.add(NurseNightCycle(
+                nurse_id=s["nurse_id"], group_id=gid, year=y, month=m,
+                seq_at_end=s["seq_at_end"], pending_sleep=s["pending_sleep"],
+                sleep_off_count=s["sleep_off_count"], sleep_off_seq=s["sleep_off_seq"],
+            ))
+        else:
+            row.seq_at_end = s["seq_at_end"]
+            row.pending_sleep = s["pending_sleep"]
+            row.sleep_off_count = s["sleep_off_count"]
+            row.sleep_off_seq = s["sleep_off_seq"]
+    print(f"[NightCycle] {gid} {y}-{m:02d} 스냅샷 {len(snap)}명 upsert")
+    return len(snap)
+
+
+def rebuild_night_cycle_from(db: Session, group_id: str, year: int, month: int) -> int:
+    """(year, month) **부터 이후 모든 마감(issued) 월**의 앵커를 재계산한다.
+
+    ★ 왜 그 달만 갱신하면 안 되는가
+      앵커는 전월 값을 이어받는다(`seq_at_end` · `pending_sleep` · `sleep_off_seq`).
+      과거 달의 근무표가 바뀌면 그 이후 달이 전부 틀어지므로 **연쇄로** 다시 계산해야 한다.
+
+    ★ 대상은 `status='issued'` 뿐이다 — draft 는 확정이 아니므로 앵커에 반영하지 않는다.
+      마감본이 곧 진실이고, 마감본이 바뀌면 이 함수가 다시 불려 정합을 회복한다.
+
+    Returns:
+        재계산한 (월 × 인원) 행수 합계.
+    """
+    rows = (
+        db.query(Schedule)
+        .filter(Schedule.group_id == str(group_id),
+                Schedule.status == "issued")
+        .all()
+    )
+    # (year, month) 이상만, 연월 오름차순 — 앞 달 결과가 뒷 달 입력이 되므로 순서가 중요하다.
+    #   ★ 같은 달에 issued 가 여러 건이면 **최신 1건만** 쓴다. publish_roster 가 발행 시
+    #     같은 달의 기존 issued 를 draft 로 내려 월당 1건을 보장하지만, 과거 데이터나
+    #     직접 수정으로 다건이 될 수 있다. 그대로 두면 같은 달을 두 번 전진시켜
+    #     seq/pending 이 부풀려진다.
+    per_month: dict[tuple[int, int], Schedule] = {}
+    for s in rows:
+        ym = (int(s.year), int(s.month))
+        if ym < (int(year), int(month)):
+            continue
+        cur = per_month.get(ym)
+        if cur is None or (s.created_at or 0) > (cur.created_at or 0):
+            per_month[ym] = s
+    targets = [per_month[k] for k in sorted(per_month)]
+    if not targets:
+        return 0
+    total = 0
+    for sch in targets:
+        total += upsert_night_cycle_snapshot(db, sch)
+    print(f"[NightCycle] group={group_id} {year}-{int(month):02d} 이후 "
+          f"{len(targets)}개월 연쇄 재계산 · {total}행")
+    return total
