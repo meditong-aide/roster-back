@@ -2633,6 +2633,54 @@ def _merge_initial_constraints(base: dict | None, extra: dict | None) -> dict:
     return {"forced_off": merged_forced_off_out, "forbidden": merged_forbidden_out}
 
 
+def _filter_submitted_nurse_banned(db, rows, req):
+    """간호사 제출분(source='nurse') 중 **제출 완료된 것만** 남긴다.
+
+    수간호사 조정판분(source='hn' 또는 NULL)은 제출 개념이 없어 그대로 통과시킨다.
+    판정 기준은 선호(원티드)와 동일하다 — WantedRequest.is_submitted.
+
+    조회 실패 시에는 필터하지 않고 원본을 돌려준다. 기피가 통째로 빠지는 것보다
+    기존 동작을 유지하는 쪽이 안전하다(과반영은 조정판에서 끌 수 있지만,
+    미반영은 수간호사가 알아채기 어렵다).
+    """
+    nurse_rows = [r for r in rows if str(getattr(r, "source", "") or "hn") == "nurse"]
+    if not nurse_rows:
+        return rows
+    month_str = f"{int(req.year)}-{int(req.month):02d}"
+    # ★ 대상 간호사로 좁힌다. 그 달 전체 제출자를 긁으면 병원 규모에 비례해 무거워지고,
+    #   지금 필요한 건 이 기피를 낸 사람들의 제출 여부뿐이다.
+    target_ids = {str(r.nurse_id) for r in nurse_rows}
+    try:
+        submitted = {
+            str(nid) for (nid,) in db.query(WantedRequest.nurse_id)
+            .filter(WantedRequest.month == month_str,
+                    WantedRequest.nurse_id.in_(target_ids),
+                    WantedRequest.is_submitted == True)  # noqa: E712
+            .distinct().all()
+        }
+    except Exception as exc:
+        # ★ rollback 이 없으면 세션이 실패 상태로 남아 이후 쿼리가 전부 죽는다.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print(f"[BannedWanted] 제출여부 조회 실패 — 필터 없이 진행: {exc}")
+        return rows
+
+    kept, dropped = [], 0
+    for r in rows:
+        if str(getattr(r, "source", "") or "hn") != "nurse":
+            kept.append(r)
+        elif str(r.nurse_id) in submitted:
+            kept.append(r)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"[BannedWanted] 미제출 간호사 기피 {dropped}건 제외 "
+              f"(선호와 동일 기준 — 제출해야 반영)")
+    return kept
+
+
 def _build_banned_wanted_constraints(db, current_user, req, nurses_in_group) -> dict:
     """금지 원티드(banned_wanted) → initial_constraints forbidden 맵으로 변환.
 
@@ -2643,6 +2691,14 @@ def _build_banned_wanted_constraints(db, current_user, req, nurses_in_group) -> 
 
     별도 사용 플래그 없이 항상 적용한다 — 저장된 is_applied 금지가 있으면 반영,
     없으면 빈 맵(무효과). 개별 on/off 는 entry 의 is_applied 로 제어.
+
+    ★★ source='nurse'(간호사 본인 제출분)는 **제출된 것만** 반영한다.
+      선호(원티드)는 이미 WantedRequest.is_submitted 게이트가 있어 미제출 draft 가
+      생성에 안 새는데, 기피만 게이트가 없어 **임시저장만 해도 하드 제약으로
+      들어갔다**. 간호사는 제출 안 했으니 반영 안 될 거라 보는데 근무표는 이미
+      그 날 그 근무를 막고 있어, 심하면 infeasible 의 원인이 된다.
+      선호와 같은 기준으로 맞춘다(미제출=미반영).
+    ★ source='hn'(수간호사 조정판)은 제출 개념이 없으므로 그대로 반영한다.
     """
     empty = {"forced_off": {}, "forbidden": {}}
     try:
@@ -2655,6 +2711,10 @@ def _build_banned_wanted_constraints(db, current_user, req, nurses_in_group) -> 
     except Exception as e:
         print(f"[BannedWanted] 조회 실패(무시): {e}")
         return empty
+    if not rows:
+        return empty
+
+    rows = _filter_submitted_nurse_banned(db, rows, req)
     if not rows:
         return empty
 
