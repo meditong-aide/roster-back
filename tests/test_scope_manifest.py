@@ -77,3 +77,16 @@ def test_health_leave_flags_unmodeled():
     assert "nurse.health_leave_extra_off" in unmodeled_active(nu2, _cfg())
     # 지원 subset feasible + 보건휴가 → UNKNOWN(비대칭 scope)
     assert solve_hybrid(nu, _cfg({"health_leave_enabled": True}), 6).status == "UNKNOWN"
+
+
+def test_preceptee_shift_count_false_flags_unmodeled():
+    """프리셉티 커버리지 제외(shift_count=False)만 미지원. 기본 True(일치)면 지원."""
+    from services.ontology_graph.scope_manifest import unmodeled_active
+    nu = [{"nurse_id": f"n{i}"} for i in range(5)]
+    # 기본(둘 다 카운트) = 그래프와 일치 → 지원
+    assert unmodeled_active(nu, _cfg({"preceptee_on": True})) == []
+    # 제외(그래프 과다=낙관) → FEASIBLE 불확실 → 미지원 표시
+    assert "config.preceptee_shift_count=False" in unmodeled_active(
+        nu, _cfg({"preceptee_on": True, "preceptee_shift_count": False}))
+    # preceptee 기능 자체 off → 무관
+    assert unmodeled_active(nu, _cfg({"preceptee_on": False, "preceptee_shift_count": False})) == []

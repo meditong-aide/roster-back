@@ -67,6 +67,11 @@ def unmodeled_active(nurses: list, config: dict) -> list[str]:
             if _active(val):
                 out.append(f"nurse.{key}")
                 seen_nurse.add(key)
+    # 프리셉티 커버리지 제외(preceptee_shift_count=False)는 **negative flag**: 솔버는 프리셉티를
+    # 커버리지에서 빼는데 그래프는 전원 카운트 → 그래프 과다(낙관). INFEASIBLE 은 sound 유지되나
+    # FEASIBLE 은 불확실 → 미지원 표시(FEASIBLE 주장만 차단). 기본 True(둘 다 카운트)면 일치=미표시.
+    if config.get("preceptee_on", False) and config.get("preceptee_shift_count", True) is False:
+        out.append("config.preceptee_shift_count=False")
     return out
 
 
