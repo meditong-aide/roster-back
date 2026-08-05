@@ -4800,6 +4800,38 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         str(getattr(n, "nurse_id", "")),
     ))
 
+    # ── 보건휴가 대상자 선정 (health_leave_enabled=True 인 그룹만) ──
+    #   ★ 날짜는 정하지 않는다. 대상자에게 OFF 하한만 1 올려두고(아래 플래그),
+    #     생성이 끝나면 postprocess_health_leave 가 OFF 하나를 휴가코드로 바꾼다.
+    #     실무는 보건 셀의 86.6% 가 OFF 에 인접해 연휴를 만든다(엑셀 238셀 실측).
+    #   ★ 고정근무자도 후보에 넣는다 — 자동판정은 꺼져 있지만(planner 의 auto)
+    #     health_leave_eligible=1 로 개인별로 켤 수 있어야 한다.
+    health_leave_targets: set[str] = set()
+    try:
+        from services.leave.health_leave_planner import select_health_leave_targets
+        health_leave_targets = select_health_leave_targets(
+            db,
+            group_id=str(current_user.group_id),
+            year=req.year,
+            month=req.month,
+            engine_nurses=list(engine_nurses) + list(fixed_nurses),
+            # active_range_candidates 는 engine_nurses 만 담으므로 고정근무자 몫을 더한다.
+            active_range_map={
+                **active_range_candidates,
+                **{str(_fn.nurse_id): _active_range_in_month(_fn, month_start, days_in_month)
+                   for _fn in fixed_nurses},
+            },
+            existing_requests=special_shift_requests,
+        )
+        # 솔버가 읽는 통로 — fallback_lex 가 nu.health_leave_extra_off 를 보고
+        # compute_off_bounds(extra_min_off=1) + 상한 clamp 를 적용한다.
+        for _n in engine_nurses:
+            if str(getattr(_n, "nurse_id", "")) in health_leave_targets:
+                _n.health_leave_extra_off = True
+    except Exception as _hl_exc:
+        health_leave_targets = set()
+        print(f"[HealthLeave] 대상자 선정 실패(무시): {_hl_exc}")
+
     # 월별 개인 shift/off 제한 오버레이 적용 (group/year/month scope)
     try:
         _limit_map = fetch_effective_monthly_limits_by_nurse(
@@ -6515,6 +6547,28 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r} "
         f"off_days={getattr(latest_config, 'off_days', None)!r}"
     )
+    # ── 수면OFF 부여 후처리 (sleep_off_enabled=True 일 때만) ──
+    #   N 연번이 cycle(15)에 도달한 사람에게 그 N 블록 종료 후 근무일 하나를 수면OFF 로 치환.
+    #   ★ OFF 가 아니라 근무일을 치환한다 — 실측(2026-08)에서 수면 수령자의 OFF 는
+    #     비수령자와 같고(11.00 vs 11.24) 쉼만 늘었다(12.00 vs 11.24).
+    #     OFF 를 치환하면 countable_off 가 줄어 off_days 미달이 된다.
+    #   ★ 근무를 빼면 그날 인원이 1 줄므로 daily_shift 필요 인원을 넘길 때만 뺀다.
+    #   off_swap 보다 먼저 — 생성 결과에 더 가까운 상태에서 판정한다.
+    # 보건휴가: 대상자의 OFF(고정근무자는 근무일) 하나를 휴가코드로 치환.
+    #   커버리지 무관 — 근무를 빼는 게 아니라 OFF 자리의 코드만 바꾼다.
+    try:
+        from services.leave.health_leave_postprocess import postprocess_health_leave
+        generated = postprocess_health_leave(
+            db, schedule, generated, health_leave_targets, latest_config,
+            fixed_ids={str(getattr(_fn, "nurse_id", "")) for _fn in fixed_nurses},
+        )
+    except Exception as _hl_post_exc:
+        print(f"[HealthLeave] 후처리 실패 — 미부여 진행: {_hl_post_exc}")
+    try:
+        from services.leave.sleep_off_postprocess import postprocess_sleep_off
+        generated = postprocess_sleep_off(db, schedule, generated, latest_config)
+    except Exception as _sleep_exc:
+        print(f"[SleepOff] 후처리 실패 — 미부여 진행: {_sleep_exc}")
     try:
         generated = postprocess_off_swap(db, schedule, generated, latest_config, req)
     except Exception as _off_swap_exc:

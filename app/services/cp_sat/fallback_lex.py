@@ -2438,6 +2438,8 @@ def optimize_fallback_lex_hard_first(
                     if (n, d) in structural_off_cells and (n, d) not in vacation_off_cells and (n, d) in active_days
                 )
                 nonvac_active_days = max(0, avail_days - vacation_cnt)
+                # ★ 보건휴가 대상자는 OFF 하한을 1 올린다(후처리가 그중 하나를 휴가코드로 치환).
+                _hl_extra = 1 if getattr(nu, "health_leave_extra_off", False) else 0
                 off_bounds = compute_off_bounds(
                     source=cfg,
                     avail_days=avail_days,
@@ -2449,6 +2451,7 @@ def optimize_fallback_lex_hard_first(
                         for d in weekend_days
                         if T0 <= d <= T1 and (n, d) not in vacation_off_cells
                     ),
+                    extra_min_off=_hl_extra,
                 )
                 min_off_required = int(off_bounds["min_off_required"])
                 # max coverage 자동 조정 적용

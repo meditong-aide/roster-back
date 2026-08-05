@@ -56,6 +56,8 @@ class ShiftUpdateRequest(BaseModel):
     # 추가
     show_in_preference: Optional[bool] = None  # None이면 기존 값 유지
     off_swap_target: Optional[bool] = None  # None이면 기존 값 유지 (초과 OFF 변환 타깃)
+    health_leave_target: Optional[bool] = None  # None이면 기존 값 유지 (보건휴가 부여 대상 코드)
+    sleep_off_target: Optional[bool] = None  # None이면 기존 값 유지 (수면OFF 부여 대상 코드)
     description: Optional[str] = None  # 근무코드 설명. None이면 기존 값 유지
 
 
@@ -80,6 +82,8 @@ class ShiftAddRequest(BaseModel):
         False  # 기본 False, 프론트에서 안 보내면 자동 숨김
     )
     off_swap_target: Optional[bool] = False  # 초과 OFF 변환 타깃 (그룹당 1개)
+    health_leave_target: Optional[bool] = False  # 보건휴가 부여 대상 코드 (그룹당 1개)
+    sleep_off_target: Optional[bool] = False  # 수면OFF 부여 대상 코드 (그룹당 1개)
     description: Optional[str] = None  # 근무코드 설명
 
 
@@ -306,6 +310,26 @@ class RosterConfigBase(BaseModel):
     off_swap_enabled: bool = Field(
         default=False,
         description="초과 OFF 후처리 — True 시 baseline(off_days) 초과 OFF 를 shifts.off_swap_target=True 인 코드로 변환. 보호: 회복 OFF(1N/2N/3N 직후) / fixed_wanted / '주' / N전담",
+    )
+    # ★ 기본값이 None 인 이유 — 미전송 시 기존 값 유지.
+    #   save_roster_config_service 는 model_dump() 를 일괄 setattr 하므로, 기본값을 False 로
+    #   두면 이 필드를 모르는 기존 저장 화면이 저장할 때마다 설정이 꺼진다.
+    #   저장 루프의 _PRESERVE_IF_NONE 가드와 한 쌍이다.
+    health_leave_enabled: Optional[bool] = Field(
+        default=None,
+        description="보건휴가 자동 부여 — True 시 적격 간호사에게 월 1개를 shifts.health_leave_target=True 인 코드로 사전 주입. off_swap 과 달리 OFF 를 변환하지 않고 근무일을 대체하며 OFF 쿼터를 소비하지 않는다. 적격: 여성 · N전담 아님 · 고정근무 아님 · 임산부 아님. 미전송(None) 시 기존 값 유지",
+    )
+    health_leave_weekend: Optional[bool] = Field(
+        default=None,
+        description="보건휴가 주말 배치 허용 — False 시 평일에만 배치. health_leave_enabled=True 일 때만 의미가 있다. 미전송(None) 시 기존 값 유지",
+    )
+    sleep_off_enabled: Optional[bool] = Field(
+        default=None,
+        description="수면OFF 자동 부여 — True 시 N 연번이 sleep_off_cycle(기본 15)에 도달한 간호사에게 그 N 블록 종료 후 shifts.sleep_off_target=True 인 코드를 1개 부여. 미전송(None) 시 기존 값 유지",
+    )
+    sleep_off_cycle: Optional[int] = Field(
+        default=None,
+        description="수면OFF 트리거 주기(N 연번). 실측 15. sleep_off_enabled=True 일 때만 의미가 있다. 미전송(None) 시 기존 값 유지",
     )
 
 
