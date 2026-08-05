@@ -46,6 +46,7 @@ from services.wanted_service import (
     delete_excess_off_requests,
     get_wanted_adjustment_service,
     save_fixed_wanted_service,
+    precheck_adjustment_save,
     save_banned_wanted_service,
     _decode_banned_response,
     toggle_fixed_wanted_entry_service,
@@ -764,6 +765,9 @@ async def save_fixed_wanted(
     target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
+        # ★ 확정 저장이 내부에서 commit 하므로, 금지 점검은 **아무것도 쓰기 전에** 한다.
+        #   안 그러면 금지에서 422 를 내도 확정 조정은 이미 저장된 채로 남는다.
+        precheck_adjustment_save(db, target_group_id, req)
         entries = save_fixed_wanted_service(db, target_group_id, current_user.nurse_id, req)
         # 금지 원티드 저장(같은 요청 바디의 banned_entries). None=미변경, []=전체 해제.
         banned_rows, banned_warnings = save_banned_wanted_service(

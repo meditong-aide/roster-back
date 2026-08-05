@@ -42,3 +42,10 @@ dependencies = [
 #   - app/test_server.py                : dev 실행 스크립트
 # bare `pytest` 가 이들을 테스트로 오수집(async 핸들러→"async 미지원" 등)하던 것을 차단.
 testpaths = ["tests"]
+# 실 LLM·실 DB 를 쓰는 평가셋은 기본 수집에서 뺀다(비용·지연). 프롬프트를 고쳤을 때만
+#   pytest -m aide
+# 로 돌린다. 안 빼면 `pytest` 한 번에 LLM 호출이 수십 건 나간다.
+markers = [
+    "aide: AIDE 자연어 분석 평가셋 (실 LLM + 실 DB 필요)",
+]
+addopts = "-m 'not aide'"
