@@ -141,6 +141,82 @@ def _compose_options(
     return out
 
 
+# 재생성 요청에 그대로 실리는 적용 페이로드 키. 사용자 노출용이 아니라 다음 행동의
+# 재료라 _internal 로 격리한다(apply_hint 와 동일 정책).
+_APPLY_KEYS = (
+    "apply",
+    "banned_wanted_release",
+    "allowed_shift_add",
+    "monthly_limit_release",
+    "weekend_off_release",
+)
+
+
+def _humanize_changes(changes: list | None) -> list[str]:
+    """resolution_options[].changes → 사람이 읽는 한 줄들 ('박지은 금지근무: 해제')."""
+    out: list[str] = []
+    for c in (changes or []):
+        if not isinstance(c, dict):
+            continue
+        label = str(c.get("label_ko") or c.get("config_key") or "").strip()
+        to = c.get("to")
+        frm = c.get("from")
+        if not label:
+            continue
+        if frm not in (None, ""):
+            out.append(f"{label}: {frm} → {to}")
+        else:
+            out.append(f"{label}: {to}")
+    return out
+
+
+def _compose_cards(payload: dict | None) -> tuple[list[dict[str, Any]], dict[str, dict]]:
+    """엔진이 만든 **실행 카드**(infeasibility.resolution_options) → 사용자 옵션 + 적용 페이로드.
+
+    ★ 이게 프론트 모달이 원클릭으로 적용하는 바로 그 목록이다 — per-nurse 로 "누구의
+      무엇을 어떻게" 까지 특정돼 있다(금지근무 해제 / 근무유형 D·E 추가 / 야간한도 완화
+      / 주말휴무 해제). 에이전트는 여태 이걸 안 읽고 family 수준의 action_levers 만 봐서
+      "제약을 완화해 보세요" 같은 답을 냈다 — 화면보다 덜 아는 상태였다.
+    ★ 적용 페이로드(apply/*_release/allowed_shift_add)는 _internal 로 격리한다. 사용자에게
+      보여줄 것은 title/trade-off/변경 요약이고, 페이로드는 다음 행동(재생성)의 재료다.
+    """
+    if not isinstance(payload, dict):
+        return [], {}
+    infeas = payload.get("infeasibility") or {}
+    cards = infeas.get("resolution_options") or []
+    options: list[dict[str, Any]] = []
+    applies: dict[str, dict] = {}
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        oid = str(c.get("option_id") or f"option-{len(options) + 1}")
+        entry: dict[str, Any] = {
+            "option_id": oid,
+            "title_ko": c.get("title_ko"),
+            # 카드는 title 이 곧 행동 설명이라 rationale 자리에 그대로 쓴다
+            # (_compose_message 가 rationale_ko 로 불릿을 만든다).
+            "rationale_ko": c.get("title_ko") or "",
+            "kind": c.get("kind"),
+            "source": c.get("source"),
+            "verified": bool(c.get("verified")),
+            "changes_ko": _humanize_changes(c.get("changes")),
+        }
+        if c.get("trade_off_ko"):
+            entry["trade_off_ko"] = c["trade_off_ko"]
+        fix = c.get("fix") or {}
+        if isinstance(fix, dict) and fix.get("where_label_ko"):
+            entry["where_ko"] = fix["where_label_ko"]
+        if isinstance(fix, dict) and fix.get("mode") == "manual_required":
+            entry["manual_required"] = True
+        options.append(entry)
+
+        payloads = {k: c[k] for k in _APPLY_KEYS if c.get(k)}
+        if payloads:
+            payloads["fix_mode"] = (fix or {}).get("mode")
+            applies[oid] = payloads
+    return options, applies
+
+
 def _partition_options(
     options: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -270,7 +346,14 @@ def resolve_infeasibility(db: Session, params: dict) -> Any:
         if isinstance(payload, dict) else None
     summary_ko = (narrative or {}).get("summary_ko") if isinstance(narrative, dict) else None
 
-    all_options = _compose_options(narrative, _trade_offs_by_treatment(narrative))
+    # ① 엔진 실행 카드가 있으면 그것을 쓴다(per-nurse, 원클릭 적용 가능 — 화면과 동일).
+    # ② 없을 때만 family 수준 action_levers 로 폴백(기존 동작 보존).
+    cards, apply_payloads = _compose_cards(payload)
+    if cards:
+        all_options, options_source = cards, "resolution_options"
+    else:
+        all_options = _compose_options(narrative, _trade_offs_by_treatment(narrative))
+        options_source = "action_levers"
     actionable, auto_resolved = _partition_options(all_options)
     apply_hints = _treatment_apply_hints(payload)
     year = job.get("year")
@@ -279,6 +362,8 @@ def resolve_infeasibility(db: Session, params: dict) -> Any:
     internal: dict[str, Any] = {"job_id": job.get("job_id")}
     if apply_hints:
         internal["apply_hints"] = apply_hints
+    if apply_payloads:
+        internal["apply_payloads"] = apply_payloads
     if payload is not None:
         internal["debug_payload"] = payload
 
@@ -288,6 +373,8 @@ def resolve_infeasibility(db: Session, params: dict) -> Any:
         "year": year,
         "month": month,
         "summary_ko": summary_ko,
+        # 옵션 출처 — resolution_options(엔진 실행카드) 인지 action_levers(family 수준) 인지.
+        "options_source": options_source,
         # 사용자가 직접 누를 수 있는 옵션만 노출. runtime_lever=false 는 분리.
         "options": actionable,
         "auto_resolved_options": auto_resolved,

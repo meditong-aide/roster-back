@@ -339,7 +339,8 @@ class TestSkillDescriptions:
         # + 1 lookup_guide (help-doc RAG) = 23.
         # + 1 manage_daily_shift (시프트별 필요인원) = 24.
         # + 3 publish_schedule / manage_mutual_exclusion / log_feedback = 27.
-        assert len(SKILL_TOOLS) == 27
+        # + 2 manage_leave_targets(휴가 대상 3-state) / manage_banned_wanted(금지 원티드) = 29.
+        assert len(SKILL_TOOLS) == 29
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:

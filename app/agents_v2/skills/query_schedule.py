@@ -15,6 +15,7 @@ from agents_v2.tools import (
     constraint_tools,
     generation_tools,
     nurse_monthly_limit_tools,
+    leave_tools,
 )
 from agents_v2.tools.nurse_tools import normalize_shift_codes as _normalize_shift_codes  # noqa: F401
 
@@ -52,9 +53,62 @@ def query_schedule(db: Session, params: dict) -> Any:
         return generation_tools.get_latest_job(db, group_id)
     elif scope == "monthly_limit":
         return _query_monthly_limits(db, group_id, year, month, params)
+    elif scope == "leave_summary":
+        return _query_leave_summary(db, group_id, year, month)
+    elif scope == "wanted_memo":
+        return _query_wanted_memo(db, group_id, year, month, params)
     else:
         # Fallback: try schedule
         return _query_schedule_entries(db, group_id, year, month, params)
+
+
+def _query_wanted_memo(db, group_id, year, month, params):
+    """원티드 월별 메모 조회 (read-only).
+
+    ★ 개인이 쓴 글이라 범위를 역할로 가른다 — HN/ADM 은 병동 전체(관리보드와 동일),
+      일반 간호사는 **본인 것만**. 이름을 지정해도 남의 메모로 넘어가지 않는다.
+    """
+    if year is None or month is None:
+        return {"error": "year/month required for wanted_memo scope"}
+
+    is_hn = params.get("acting_role") in ("HN", "ADM")
+    nurse_ids = params.get("nurse_ids") or None
+    if not is_hn:
+        me = params.get("acting_user_id")
+        if not me:
+            return {"error": "본인 확인이 되지 않아 메모를 조회할 수 없습니다."}
+        if nurse_ids and [str(n) for n in nurse_ids] != [str(me)]:
+            return {"error": "다른 간호사의 원티드 메모는 볼 수 없습니다."}
+        nurse_ids = [str(me)]
+
+    memos = wanted_tools.read_monthly_memos(
+        db, group_id, int(year), int(month), nurse_ids=nurse_ids
+    )
+    return {
+        "year": int(year),
+        "month": int(month),
+        "scope_kind": "ward" if (is_hn and not nurse_ids) else "nurse",
+        "count": len(memos),
+        "memos": memos,
+        "message": (
+            f"{year}년 {month}월 원티드 메모 {len(memos)}건입니다."
+            if memos
+            else f"{year}년 {month}월에 작성된 원티드 메모가 없어요."
+        ),
+    }
+
+
+def _query_leave_summary(db, group_id, year, month):
+    """휴가 자동부여(보건휴가·수면OFF) 결과 — 확정된 그 달 표에서 되읽는다."""
+    if year is None or month is None:
+        return {"error": "year/month required for leave_summary scope"}
+    result = leave_tools.summarize_leave_grants(db, group_id, int(year), int(month))
+    if result is None:
+        return {
+            "found": False,
+            "message": "이 병동에는 보건휴가·수면OFF 자동부여 코드가 설정돼 있지 않아요.",
+        }
+    return result
 
 
 def _query_monthly_limits(db, group_id, year, month, params):

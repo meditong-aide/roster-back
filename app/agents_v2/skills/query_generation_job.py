@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from agents_v2.skills.registry import register
-from agents_v2.tools import generation_tools
+from agents_v2.tools import generation_tools, leave_tools
 from services.semantics import attach_reason_code_ontology
 
 
@@ -126,4 +126,40 @@ def query_generation_job(db: Session, params: dict) -> Any:
     }
     if infeasibility is not None:
         result["infeasibility"] = infeasibility
+
+    # 성공한 생성이면 휴가 자동부여 결과를 함께 싣는다.
+    #   ★ 에이전트 경로는 비동기(SQS)라 generate_roster_service 가 응답에 실은
+    #     roster_data["leave_summary"] 를 볼 수 없다(roster_jobs 에 결과 payload 컬럼 없음).
+    #     대신 생성된 표를 되읽어 같은 질문에 답한다 — "생성 완료" 만 말하고 몇 명에게
+    #     휴가가 나갔는지 침묵하던 갭을 메운다.
+    if status == "SUCCESS":
+        leave = _leave_summary(db, group_id, job.get("result_roster_id"))
+        if leave and leave.get("found"):
+            result["leave_summary"] = leave
+            # 성공 job 은 payload 가 없어 year/month 가 비어 있다(실패 job 만 _year/_month
+            # 메타를 남긴다). 표에서 알아낸 연·월로 메시지를 다시 지어 "2026년 8월 …" 처럼
+            # 기간이 붙게 한다.
+            result["year"] = leave["year"]
+            result["month"] = leave["month"]
+            head = _compose_message(
+                status, job.get("progress"), leave["year"], leave["month"], None,
+            )
+            result["message"] = f"{head} {leave['message']}"
     return result
+
+
+def _leave_summary(db: Session, group_id: str, schedule_id: str | None) -> dict | None:
+    """result_roster_id → Schedule → 그 달 휴가 부여 요약. 실패는 조용히 생략(부가정보)."""
+    if not schedule_id:
+        return None
+    from db.models import Schedule
+
+    try:
+        sched = db.query(Schedule).filter(Schedule.schedule_id == schedule_id).first()
+        if sched is None:
+            return None
+        return leave_tools.summarize_leave_grants(
+            db, group_id, int(sched.year), int(sched.month), schedule_id=schedule_id
+        )
+    except Exception:  # noqa: BLE001 — 요약은 부가정보라 job 상태 응답을 깨면 안 된다
+        return None

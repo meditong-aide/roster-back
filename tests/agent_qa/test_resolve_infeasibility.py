@@ -293,3 +293,160 @@ def test_failed_job_lists_options_from_payload(db, seed_data):
     assert lower["engine_self_resolves"] is True
     # actionable 옵션(TeamSize)은 ontology 에 없어 constraint 메타 없음 또는 runtime_lever 미지정.
     assert inc.get("engine_self_resolves") is not True
+
+
+# ── 엔진 실행 카드(resolution_options) 배선 ───────────────
+# 갭: 엔진은 per-nurse 로 "누구의 무엇을 어떻게" 까지 특정한 카드를 내는데(프론트 모달이
+# 원클릭 적용하는 그 목록), 에이전트는 family 수준 action_levers 만 읽어 화면보다 덜
+# 아는 답을 냈다. 아래는 그 배선과 폴백 보존을 못 박는다.
+
+
+def _banned_card_payload():
+    """금지근무×강제OFF 개인모순 → 대안 2장 (mcs_trace.cause_to_resolution_options 형태)."""
+    return {
+        "_year": 2026, "_month": 8,
+        "infeasibility": {
+            "severity": "hard",
+            "causes": [{"reason_code": "PERSONAL_INFEASIBLE"}],
+            "resolution_options": [
+                {"option_id": "cause:banned_release", "kind": "relax_constraint",
+                 "source": "cause", "verified": False,
+                 "title_ko": "문제 간호사 2명 금지근무 해제하고 다시 만들기",
+                 "trade_off_ko": "겹치는 날의 금지근무(OFF 금지)를 풀어 필수 휴무가 가능해집니다.",
+                 "changes": [{"nurse_id": "N002", "config_key": "banned_wanted",
+                              "label_ko": "박지은 금지근무", "from": None, "to": "해제"}],
+                 "banned_wanted_release": [{"nurse_id": "N002", "days": [15, 16]}],
+                 "fix": {"mode": "auto_apply", "where": "nurse.banned_wanted",
+                         "where_label_ko": "원티드 조정판 > 금지근무"}},
+                {"option_id": "cause:allowed_add", "kind": "relax_constraint",
+                 "source": "cause", "verified": False,
+                 "title_ko": "문제 간호사 2명 근무유형에 D/E 추가하고 다시 만들기",
+                 "trade_off_ko": "야간 전담 대신 주간/이브닝도 가능해져 병목이 풀립니다(역할 변경).",
+                 "changes": [{"nurse_id": "N002", "config_key": "allowed_shifts",
+                              "label_ko": "박지은 근무유형", "from": "N", "to": "D·E 추가"}],
+                 "allowed_shift_add": [{"nurse_id": "N002", "add": ["D", "E"]}],
+                 "fix": {"mode": "auto_apply", "where": "nurse.allowed_shifts",
+                         "where_label_ko": "간호사 관리 > 근무 유형"}},
+            ],
+            "resolution_narrative": {
+                "summary_ko": "개인 조건이 서로 모순됩니다.",
+                # family 수준 lever 도 함께 있지만 카드가 이긴다.
+                "action_levers": [{"treatment_id": "t9", "target_family": "CoverageMin",
+                                   "config_key": "daily_shift_requirements",
+                                   "direction": "decrease", "rationale_ko": "수요 낮추기",
+                                   "covers_causes": []}],
+                "trade_offs": [], "problem_list": [],
+            },
+            "hard_case": {"is_hard": True},
+        },
+    }
+
+
+def _add_failed_job(db, seed_data, payload, job_id="job-cards"):
+    from db.models import RosterJob
+
+    db.add(RosterJob(
+        job_id=job_id, office_id=seed_data["office_id"], group_id=seed_data["group_id"],
+        nurse_id="N001", status="FAILED", progress=100,
+        error_message=json.dumps(payload, ensure_ascii=False),
+    ))
+    db.flush()
+
+
+def test_resolution_options_win_over_action_levers(db, seed_data):
+    _add_failed_job(db, seed_data, _banned_card_payload())
+    res = run_skill(db, "resolve-infeasibility", {"group_id": seed_data["group_id"]})
+
+    assert res["options_source"] == "resolution_options"
+    assert len(res["options"]) == 2
+    titles = [o["title_ko"] for o in res["options"]]
+    assert "문제 간호사 2명 금지근무 해제하고 다시 만들기" in titles
+    # family 수준 lever 로 떨어지지 않았는지
+    assert all("target_family" not in o for o in res["options"])
+
+
+def test_card_exposes_who_and_what_not_just_family(db, seed_data):
+    """카드의 값어치는 '누구의 무엇' — changes 를 사람이 읽는 줄로 내려야 한다."""
+    _add_failed_job(db, seed_data, _banned_card_payload())
+    res = run_skill(db, "resolve-infeasibility", {"group_id": seed_data["group_id"]})
+
+    first = res["options"][0]
+    assert first["changes_ko"] == ["박지은 금지근무: 해제"]
+    assert first["where_ko"] == "원티드 조정판 > 금지근무"
+    assert "금지근무" in first["trade_off_ko"]
+
+    second = res["options"][1]
+    assert second["changes_ko"] == ["박지은 근무유형: N → D·E 추가"]
+
+
+def test_apply_payloads_isolated_to_internal(db, seed_data):
+    """적용 페이로드는 사용자 노출용이 아니라 다음 행동의 재료 — _internal 격리."""
+    _add_failed_job(db, seed_data, _banned_card_payload())
+    res = run_skill(db, "resolve-infeasibility", {"group_id": seed_data["group_id"]})
+
+    payloads = res["_internal"]["apply_payloads"]
+    assert payloads["cause:banned_release"]["banned_wanted_release"] == [
+        {"nurse_id": "N002", "days": [15, 16]}
+    ]
+    assert payloads["cause:allowed_add"]["allowed_shift_add"] == [
+        {"nurse_id": "N002", "add": ["D", "E"]}
+    ]
+    for opt in res["options"]:
+        assert not set(opt) & {"banned_wanted_release", "allowed_shift_add", "apply"}
+
+
+def test_message_names_the_concrete_action(db, seed_data):
+    _add_failed_job(db, seed_data, _banned_card_payload())
+    res = run_skill(db, "resolve-infeasibility", {"group_id": seed_data["group_id"]})
+    assert "금지근무 해제" in res["message"]
+    assert "해결 옵션 2개" in res["message"]
+
+
+def test_probe_card_apply_delta_captured(db, seed_data):
+    """probe 카드는 apply(config delta) 를 싣는다 — 그것도 _internal 로."""
+    payload = {
+        "_year": 2026, "_month": 8,
+        "infeasibility": {
+            "severity": "hard", "causes": [{"reason_code": "Z"}],
+            "resolution_options": [
+                {"option_id": "probe:relax_night", "kind": "relax_constraint",
+                 "source": "probe", "verified": True, "title_ko": "야간 필요인원 1 낮추기",
+                 "changes": [{"config_key": "max_nig", "label_ko": "야간 최대", "from": 5, "to": 6}],
+                 "trade_off_ko": "야간 부담이 늘어납니다.", "apply": {"max_nig": 6}},
+            ],
+            "resolution_narrative": {"summary_ko": None, "action_levers": [],
+                                     "trade_offs": [], "problem_list": []},
+            "hard_case": {"is_hard": False},
+        },
+    }
+    _add_failed_job(db, seed_data, payload, job_id="job-probe")
+    res = run_skill(db, "resolve-infeasibility", {"group_id": seed_data["group_id"]})
+
+    assert res["options"][0]["verified"] is True
+    assert res["options"][0]["changes_ko"] == ["야간 최대: 5 → 6"]
+    assert res["_internal"]["apply_payloads"]["probe:relax_night"]["apply"] == {"max_nig": 6}
+
+
+def test_falls_back_to_action_levers_when_no_cards(db, seed_data):
+    """카드가 없으면 기존 경로 그대로 — 비회귀."""
+    payload = {
+        "_year": 2026, "_month": 8,
+        "infeasibility": {
+            "severity": "hard", "causes": [{"reason_code": "Y"}],
+            "resolution_narrative": {
+                "summary_ko": "수요 초과",
+                "action_levers": [{"treatment_id": "t1", "target_family": "CoverageMin",
+                                   "config_key": "daily_shift_requirements",
+                                   "direction": "decrease", "rationale_ko": "일별 수요 1 낮추기",
+                                   "covers_causes": ["Y"]}],
+                "trade_offs": [], "problem_list": [],
+            },
+            "hard_case": {"is_hard": False},
+        },
+    }
+    _add_failed_job(db, seed_data, payload, job_id="job-levers")
+    res = run_skill(db, "resolve-infeasibility", {"group_id": seed_data["group_id"]})
+
+    assert res["options_source"] == "action_levers"
+    assert res["options"][0]["target_family"] == "CoverageMin"
+    assert "apply_payloads" not in res["_internal"]

@@ -423,6 +423,10 @@ def _inject_context(args: dict, ctx: SessionContext) -> dict:
     args.setdefault("month", ctx.month)
     # 변경 주체 (audit / updated_by 용). mutation skill 이 참조.
     args.setdefault("acting_user_id", ctx.nurse_id)
+    # 호출자 역할 — 같은 스킬 안에서 read 범위를 갈라야 할 때 쓴다(예: 개인이 쓴
+    # 원티드 메모는 본인 것만, HN 은 병동 전체). 권한 게이트(_check_permission)를
+    # 대체하지 않는다; 스코프 결정용 컨텍스트다.
+    args.setdefault("acting_role", ctx.user_role)
 
     # "나/내/제/본인" → current user
     if args.get("nurse_name") in ("나", "내", "제", "본인"):

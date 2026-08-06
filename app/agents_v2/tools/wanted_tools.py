@@ -695,3 +695,54 @@ def modify_wanted_by_date(
         "total_count": count,
         "status": "submitted",
     }
+
+
+# ── 원티드 월별 메모 (read-only) ─────────────────────────
+# dev 신규(d0e39d8). 간호사가 원티드 작성 화면에서 남긴 그 달 전체 메모다 —
+# "이번 달은 시험이라 나이트 힘들어요" 같은 맥락이 여기 들어오는데, 원티드 신청
+# 내역(wanted_adjustment)에는 안 나타나 HN 이 조정할 때 놓치던 정보다.
+# ★ 쓰기는 열지 않는다 — 개인이 자기 화면에서 쓰는 글이고, 저장 경로가 디바운스
+#   upsert 라 에이전트가 끼어들 이유가 없다(대필은 작성자 표시를 거짓으로 만든다).
+
+
+def read_monthly_memos(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+    *,
+    nurse_ids: list[str] | None = None,
+) -> list[dict]:
+    """그 달 원티드 메모. nurse_ids 를 주면 그 사람들만. 메모 없는 사람은 제외."""
+    from db.models import WantedMonthlyMemo
+
+    q = (
+        db.query(WantedMonthlyMemo, Nurse.name)
+        .outerjoin(Nurse, Nurse.nurse_id == WantedMonthlyMemo.nurse_id)
+        .filter(
+            WantedMonthlyMemo.group_id == group_id,
+            WantedMonthlyMemo.year == int(year),
+            WantedMonthlyMemo.month == int(month),
+            WantedMonthlyMemo.memo.isnot(None),
+        )
+    )
+    if nurse_ids:
+        q = q.filter(WantedMonthlyMemo.nurse_id.in_([str(n) for n in nurse_ids]))
+    try:
+        rows = q.order_by(WantedMonthlyMemo.nurse_id.asc()).all()
+    except Exception as exc:  # noqa: BLE001
+        # 배포 순서가 뒤집혀(코드 먼저·DDL 나중) 테이블이 없을 수 있다. 그때 500 을
+        # 내면 "메모 있어?" 한마디에 대화가 끊긴다 — 없는 것으로 보고 넘어간다.
+        # (leave_eligibility.fetch_leave_flags 의 같은 가드와 동일 정책.)
+        if WantedMonthlyMemo.__tablename__ not in str(exc):
+            raise
+        db.rollback()  # 실패 쿼리로 오염된 트랜잭션이 뒤 쿼리를 연쇄로 죽이지 않게
+        return []
+    return [
+        {
+            "nurse": name or str(m.nurse_id),
+            "memo": m.memo,
+            "updated_at": str(m.updated_at) if m.updated_at else None,
+        }
+        for m, name in rows
+    ]

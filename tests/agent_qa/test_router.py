@@ -50,7 +50,9 @@ def test_all_tools_covered():
     # publish_schedule (2026-07, 근무표 확정/발행) → 25.
     # manage_mutual_exclusion (2026-07, 두 간호사 상호배제) → 26.
     # log_feedback (2026-07, 처리불가 불만/건의/버그 접수 — triage 정책) → 27.
-    assert len(ALL_TOOL_NAMES) == 27
+    # manage_leave_targets (2026-08, 휴가 자동부여 대상 3-state) → 28.
+    # manage_banned_wanted (2026-08, 금지 원티드 조회·추가·해제) → 29.
+    assert len(ALL_TOOL_NAMES) == 29
     missing = set(ALL_TOOL_NAMES) - covered
     assert not missing, f"카테고리 미커버 tool: {missing}"
     # 맵의 tool 이름이 전부 실제 tool 이름인지(오타 방지)

@@ -112,7 +112,9 @@ SKILL_TOOLS: list[dict] = [
             "- '신규 간호사 누구야' → scope=nurse_info (등급 분포 먼저 확인)\n"
             "- '현재 제약 설정' → scope=constraint_config\n"
             "- '자동생성 어디까지 됐어' → scope=generation_job\n"
-            "- '이번 달 시프트 종류' → scope=shift_definitions"
+            "- '이번 달 시프트 종류' → scope=shift_definitions\n"
+            "- '이번 달 보건휴가 누가 받았어' / '수면오프 몇 건 나갔어' → scope=leave_summary\n"
+            "- '이번 달 원티드 메모 남긴 사람 있어' → scope=wanted_memo"
         ),
         "parameters": {
             "type": "object",
@@ -129,6 +131,8 @@ SKILL_TOOLS: list[dict] = [
                         "constraint_config",
                         "generation_job",
                         "monthly_limit",
+                        "leave_summary",
+                        "wanted_memo",
                     ],
                     "description": (
                         "조회 도메인. 사용자가 묻는 정보가 어느 데이터 영역에 속하는지로 결정. "
@@ -138,7 +142,11 @@ SKILL_TOOLS: list[dict] = [
                         "근무표 셀=schedule, 간호사 인사정보=nurse_info, "
                         "시프트 정의=shift_definitions, 제약 설정=constraint_config, "
                         "생성잡 상태=generation_job, "
-                        "개인별 월 한도 (예: '김민지 5월 N 몇 번', '5월 D 정확히 설정한 간호사')=monthly_limit"
+                        "개인별 월 한도 (예: '김민지 5월 N 몇 번', '5월 D 정확히 설정한 간호사')=monthly_limit, "
+                        "휴가 자동부여 **결과** (예: '이번 달 보건휴가 누가 받았어', '수면오프 몇 건 나갔어')=leave_summary "
+                        "— 누구를 대상으로 **설정**할지는 manage_leave_targets 이다(결과 조회와 구분), "
+                        "원티드 작성 화면에 남긴 월별 메모(예: '이번 달 원티드 메모 있어?')=wanted_memo "
+                        "— 신청한 근무(wanted_adjustment)와 다른, 자유 서술 메모다"
                     ),
                 },
                 "operation": {
@@ -1409,6 +1417,9 @@ SKILL_TOOLS: list[dict] = [
             "- 최근 FAILED 생성 job 의 솔버 unrecoverable payload 를 읽어 "
             "해결 옵션(action_levers) + 부작용(trade_offs) 카탈로그를 한국어로 노출.\n"
             "- 각 옵션은 어떤 설정 키(config_key)를 어느 방향(direction)으로 조절할지 명시.\n"
+            "- 엔진이 **개인 단위 실행 카드**를 낸 경우(options_source='resolution_options') "
+            "옵션에 `title_ko`(할 일)·`changes_ko`(누구의 무엇이 어떻게)·`where_ko`(적용 위치)가 붙는다. "
+            "이때는 '제약을 완화해 보세요' 같은 뭉뚱그린 말 대신 **그 문장 그대로** 전달하라.\n"
             "- 적용 자체는 본 스킬이 아니라 후속 mutation 스킬(manage_team_min/manage_grade/"
             "update_constraint 등)에 LLM 이 chain 으로 위임.\n\n"
 
@@ -1418,7 +1429,8 @@ SKILL_TOOLS: list[dict] = [
             "─────────── 인접 스킬과의 경계 ───────────\n"
             "- 진행 상태/실패 사유 한 줄 요약 → query_generation_job.\n"
             "- 옵션 선택 후 실제 변경 → manage_team_min(팀 최소인원) / manage_grade(등급) / "
-            "update_constraint(제약) / update_monthly_limit(월 한도) 등.\n"
+            "update_constraint(제약) / update_monthly_limit(월 한도) / "
+            "manage_banned_wanted(금지근무 해제) / update_person_attr(근무유형 D·E 추가) 등.\n"
             "- 검증/교정 흐름은 validate_schedule / repair_schedule.\n"
             "- 본 스킬은 '실패 → 옵션 카탈로그' 단계에만 한정.\n\n"
 

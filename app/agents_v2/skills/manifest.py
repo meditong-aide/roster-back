@@ -160,6 +160,8 @@ _MANIFEST_MODULES: list[str] = [
     "agents_v2.skills.manage_assignment",
     "agents_v2.skills.lookup_guide",
     "agents_v2.skills.manage_daily_shift",
+    "agents_v2.skills.manage_leave_targets",
+    "agents_v2.skills.manage_banned_wanted",
 ]
 
 _loaded = False
