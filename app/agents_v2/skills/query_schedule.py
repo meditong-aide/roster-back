@@ -63,6 +63,8 @@ def _query_monthly_limits(db, group_id, year, month, params):
         return {"error": "year/month required for monthly_limit scope"}
     nurse_ids = params.get("nurse_ids")
     if nurse_ids and len(nurse_ids) == 1:
+        # as-of 조회(기본): 이 달 미설정이라도 과거 마지막 설정이 이월 적용된 값을 본다
+        # (생성이 실제로 쓰는 값과 일치). carried_over 면 출처 월을 고지한다.
         single = nurse_monthly_limit_tools.get_monthly_limit(
             db, nurse_ids[0], group_id, year, month
         )
@@ -74,7 +76,13 @@ def _query_monthly_limits(db, group_id, year, month, params):
                 "limit_set": False,
                 "message": "해당 간호사의 월 한도 설정 없음.",
             }
-        return {**single, "limit_set": True}
+        out = {**single, "limit_set": True}
+        if single.get("carried_over"):
+            out["message"] = (
+                f"{single['applied_from_year']}년 {single['applied_from_month']}월에 "
+                f"설정된 한도가 {year}년 {month}월에 이월 적용 중입니다."
+            )
+        return out
     return {
         "year": year,
         "month": month,

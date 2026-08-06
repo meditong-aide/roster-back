@@ -965,14 +965,24 @@ SKILL_TOOLS: list[dict] = [
             "  • 'N 최소'/'야간 최소'      → n_min (정수)\n"
             "  • D / E / O 도 동일 패턴 (d_exact, d_min, d_max, e_*, o_*)\n\n"
 
+            "─────────── 해제(설정 안 함) ───────────\n"
+            "  '김민지 5월 월 한도 해제/없애줘/설정 안 함/무제한' → unset=['all'] (전체 해제)\n"
+            "  '김민지 5월 야간 한도만 해제' → unset=['n'] (해당 시프트만; d/e/o 조합 가능)\n"
+            "  ⓘ 해제는 값을 NULL 로 기록하되 '이 달 명시적 한도 없음'을 보존해, 과거 달의\n"
+            "     한도가 다시 상속되는 것을 막습니다(행 삭제 아님).\n\n"
+
             "─────────── 인접 skill 과의 경계 ───────────\n"
             "- '병동 전체 야간 최대 7회' (정책) → update_constraint (max_nig_per_month)\n"
             "- '김민지 야간 전담' (개인 속성) → update_person_attr (allowed_shifts)\n"
             "- '김민지 5월 야간 4번' (개인 월 한도) → update_monthly_limit (n_exact)\n\n"
 
+            "ⓘ 조회 시 이 달에 설정이 없으면 '가장 최근 과거 달' 한도가 이월 적용됩니다\n"
+            "  (생성이 실제로 쓰는 값). 조회 결과의 carried_over/applied_from 로 출처 월 확인.\n\n"
+
             "예시:\n"
             "- '김민지 5월 야간 4번' → nurse_ids=['김민지의 nurse_id'], year=2026, month=5, n_exact=4\n"
-            "- '박혜미 5월 D 최소 8회' → nurse_ids=[...], year=2026, month=5, d_min=8"
+            "- '박혜미 5월 D 최소 8회' → nurse_ids=[...], year=2026, month=5, d_min=8\n"
+            "- '김민지 5월 월 한도 해제' → nurse_ids=[...], year=2026, month=5, unset=['all']"
         ),
         "parameters": {
             "type": "object",
@@ -996,6 +1006,14 @@ SKILL_TOOLS: list[dict] = [
                 "o_exact": {"type": "integer", "description": "오프 정확히 몇 번"},
                 "o_min": {"type": "integer"},
                 "o_max": {"type": "integer"},
+                "unset": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["d", "e", "n", "o", "all"]},
+                    "description": (
+                        "월 한도 '해제(설정 안 함)'. ['all']=전체 해제, ['n']=야간만 해제 등. "
+                        "지정하면 값 설정 필드는 무시되고 해당 시프트 한도가 NULL 로 기록됩니다."
+                    ),
+                },
                 "preview_only": {
                     "type": "boolean",
                     "default": True,

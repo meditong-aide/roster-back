@@ -95,6 +95,146 @@ def test_list_monthly_limits_returns_all(db):
     assert "N002" in nurse_ids
 
 
+# ── as-of 이월 조회 (생성 로더와 정합) ─────────────────────
+
+
+def test_get_monthly_limit_carries_forward_from_past(db):
+    """7월 설정 후 8월 미설정 → 8월 조회 시 7월값 이월(as-of). applied_from=7월."""
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 7, {"n_max": 4}, preview_only=False,
+    )
+    got = nurse_monthly_limit_tools.get_monthly_limit(db, "N001", "GRP001", 2026, 8)
+    assert got is not None
+    assert got["n_max"] == 4
+    assert got["year"] == 2026 and got["month"] == 8         # 표시월=대상월
+    assert got["applied_from_year"] == 2026 and got["applied_from_month"] == 7
+    assert got["carried_over"] is True
+
+
+def test_get_monthly_limit_asof_false_is_exact(db):
+    """as_of=False 는 정확히 그 달 행만 — 8월엔 없음."""
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 7, {"n_max": 4}, preview_only=False,
+    )
+    assert nurse_monthly_limit_tools.get_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, as_of=False
+    ) is None
+
+
+def test_get_monthly_limit_same_month_not_carried(db):
+    """대상월 본인 설정이 있으면 carried_over=False."""
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, {"n_max": 3}, preview_only=False,
+    )
+    got = nurse_monthly_limit_tools.get_monthly_limit(db, "N001", "GRP001", 2026, 8)
+    assert got["carried_over"] is False
+    assert got["applied_from_month"] == 8
+
+
+def test_list_monthly_limits_asof_dedupes_latest(db):
+    """list as-of: 7월·미래 없음 → 8월 조회 시 nurse별 최근 1건, 8월 표시."""
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 7, {"n_max": 4}, preview_only=False,
+    )
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, {"n_max": 2}, preview_only=False,
+    )
+    rows = nurse_monthly_limit_tools.list_monthly_limits(db, "GRP001", 2026, 8)
+    n001 = [r for r in rows if r["nurse_id"] == "N001"]
+    assert len(n001) == 1                    # 7월 행은 8월 행에 가려짐
+    assert n001[0]["n_max"] == 2
+    assert n001[0]["carried_over"] is False
+
+
+def test_query_schedule_carryover_message(db):
+    """query_schedule 단일 조회가 이월 시 안내 메시지를 담는다."""
+    from agents_v2.skills.query_schedule import query_schedule
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 7, {"n_max": 4}, preview_only=False,
+    )
+    res = query_schedule(db, {
+        "scope": "monthly_limit", "group_id": "GRP001",
+        "year": 2026, "month": 9, "nurse_ids": ["N001"],
+    })
+    assert res["limit_set"] is True and res["n_max"] == 4
+    assert "이월" in res.get("message", "")
+    assert res["applied_from_month"] == 7
+
+
+# ── 해제(unset) = tombstone ──────────────────────────────
+
+
+def test_unset_all_writes_tombstone_and_stops_inheritance(db):
+    """전체 해제 → all-null 묘비. 이후 as-of 가 과거값을 재상속하지 않음."""
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 7, {"n_max": 4}, preview_only=False,
+    )
+    res = nurse_monthly_limit_tools.unset_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, preview_only=False,
+    )
+    assert res["preview"] is False and res["unset"] is True
+    # 8월 묘비 행이 존재하고 모든 한도가 NULL
+    row8 = nurse_monthly_limit_tools.get_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, as_of=False
+    )
+    assert row8 is not None
+    assert all(row8[f] is None for f in nurse_monthly_limit_tools.LIMIT_FIELDS)
+    # 9월 as-of 는 8월 묘비에서 멈춰 과거(7월 n_max=4) 재상속 안 함
+    got9 = nurse_monthly_limit_tools.get_monthly_limit(db, "N001", "GRP001", 2026, 9)
+    assert got9 is not None
+    assert got9["n_max"] is None
+    assert got9["applied_from_month"] == 8
+
+
+def test_unset_single_shift_keeps_others(db):
+    """야간만 해제 → n_* NULL, d_* 유지."""
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, {"n_max": 4, "d_min": 6}, preview_only=False,
+    )
+    nurse_monthly_limit_tools.unset_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, shifts=["n"], preview_only=False,
+    )
+    got = nurse_monthly_limit_tools.get_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, as_of=False
+    )
+    assert got["n_max"] is None
+    assert got["d_min"] == 6
+
+
+def test_unset_preview_does_not_persist(db):
+    """해제 preview_only → DB 미기록."""
+    res = nurse_monthly_limit_tools.unset_monthly_limit(
+        db, "N002", "GRP001", 2026, 8, preview_only=True,
+    )
+    assert res["preview"] is True and res["unset"] is True
+    assert nurse_monthly_limit_tools.get_monthly_limit(
+        db, "N002", "GRP001", 2026, 8, as_of=False
+    ) is None
+
+
+def test_unset_unknown_shift_rejected(db):
+    res = nurse_monthly_limit_tools.unset_monthly_limit(
+        db, "N001", "GRP001", 2026, 8, shifts=["z"], preview_only=True,
+    )
+    assert "error" in res
+
+
+def test_skill_unset_dispatch(db):
+    """skill 진입점: unset 파라미터가 해제 경로로 라우팅."""
+    from agents_v2.skills.registry import SKILL_REGISTRY
+    fn = SKILL_REGISTRY.get("update-monthly-limit") or SKILL_REGISTRY["update_monthly_limit"]
+    nurse_monthly_limit_tools.upsert_monthly_limit(
+        db, "N001", "GRP001", 2026, 7, {"n_max": 4}, preview_only=False,
+    )
+    res = fn(db, {
+        "nurse_ids": ["N001"], "group_id": "GRP001",
+        "year": 2026, "month": 8, "unset": ["all"], "preview_only": False,
+    })
+    assert res.get("unset") is True
+    got9 = nurse_monthly_limit_tools.get_monthly_limit(db, "N001", "GRP001", 2026, 9)
+    assert got9["n_max"] is None
+
+
 # ── permission: update_monthly_limit ─────────────────────
 
 
