@@ -1,5 +1,8 @@
 # LLM Tool-Selection / Tool-Calling 최적화 연구 아카이브
 
+> **갱신 2026-08-06**: 본문의 "tool 22개"와 토큰 수치는 **2026-07-10 시점 스냅샷**이다. 현재는 **29개**.
+> 문헌 정리(§3)는 유효하나 §2의 우리 수치는 그 시점 기준으로 읽을 것. 권고 §4-1의 실행 결과도 §4에 반영.
+>
 > 목적: 22개 tool을 가진 우리 에이전트의 tool 정의 토큰 비용(이중 정의)과 2-stage 라우터 스코핑의 한계를
 > 학술·산업 문헌에 비추어 정리한 annotated bibliography. 모든 출처는 arXiv/ACL/공식 블로그 원문을 fetch로
 > 직접 확인함(2026-07-10 검증). 검증 실패한 ID는 제외했다.
@@ -24,11 +27,20 @@ retriever를 그대로 붙이면 오히려 실패율이 올라갈 수 있음을 
 ## 2. 우리 상황 매핑 (crisp statement)
 
 - **tool 개수**: 22개 (query-schedule, bulk-mutation, generate-schedule, ... navigate 계열 포함).
+  → **2026-08-06 현재 29개** (publish_schedule·manage_mutual_exclusion·log_feedback·lookup_guide·
+  manage_daily_shift·manage_leave_targets·manage_banned_wanted 추가). 아래 토큰 수치는 22개 기준이라
+  **현재는 과소추정**이다.
 - **이중 정의 문제**: 각 tool이 요청마다 **두 번** 실린다 —
   (1) `tools` 파라미터의 JSON schema ≈ **21k 토큰**,
   (2) 보조 markdown description ≈ **15k 토큰**. 합 ≈ **36k 토큰/요청**이 tool 정의만으로 소비된다.
-- **현재 완화책**: 2-stage 라우터(LLM 분류 → tool 스코핑)로 쿼리별 tool 섹션을 축소(라이브 recall 100%,
-  tool 섹션 ~75% 절감 실측). 그러나 tool 수가 늘면 스코핑 자체의 한계가 온다는 것을 우리도 인지.
+- **현재 완화책**: 2-stage 라우터(LLM 분류 → tool 스코핑)로 쿼리별 tool 섹션을 축소
+  (tool 섹션 ~75% 절감 실측, 22개 시점). 그러나 tool 수가 늘면 스코핑 자체의 한계가 온다는 것을 우리도 인지.
+  - ⚠️ **"recall 100%" 를 파이프라인 성능으로 읽지 말 것.** recall 자체는 100%가 맞지만
+    (`param_eval` N=24: 73.9% → 100%), **선택(selection)은 91.7%, 전체 PASS 는 89.7%**
+    (65.5 → 89.7)다. 즉 "후보에 넣었다"와 "옳게 골랐다"는 다르다. 또 별도 전코퍼스 스윕에서
+    미스 6건이 남았다(개인 월한도가 mutate/settings_people 로 분류돼 settings_rules 전용
+    배선을 놓친 카테고리 미스매치 — 다중 배선으로 완화). 스코핑은 **완결이 아니라 어휘
+    커버리지에 비례해 새는 구조**다.
 - **문헌 관점에서 본 우리 문제의 정체**:
   (a) 우리는 이미 "retrieval-before-LLM" 계열의 초기 형태(라우터 스코핑)를 하고 있으나,
   (b) tool 정의가 **이중**이라 절감 여지가 문헌 평균보다 크고,
@@ -195,6 +207,12 @@ Timo Schick, Jane Dwivedi-Yu, Roberto Dessì, Roberta Raileanu, Maria Lomeli, Lu
 1. **[최우선·저위험] 이중 정의 통합 → 단일 SSOT에서 파생 (EASYTOOL + ScaleMCP + Skill Manifest)**
    JSON schema(21k)와 markdown(15k)을 하나의 정제된 소스로 통합하고 스키마/설명을 자동 파생. 즉시 토큰 절감 +
    중복 설명으로 인한 tool 혼동 감소. 우리 로드맵의 `@skill` 단일 선언과 정확히 합치 → 가장 빠른 ROI.
+   - ✅ **부분 실행됨(2026-07)**: markdown 설명이 JSON `function.description` 과 글자 그대로 이중이라
+     마크다운 블록을 통째로 제거하는 경로를 넣었다 —
+     `agents_v2/harness/prompt_builder.py:TOOL_DESC_MODE`(env `AIDE_TOOL_DESC_MODE=names`, **기본 full**).
+     라이브 A/B 결과 **입력 토큰 −28.5%**(스코프 6개 쿼리는 −51%), 회귀 없음. 다만 기본값이 아직
+     `full` 이라 **실사용 절감은 0** — 켜는 결정이 남아 있다. `@skill` 매니페스트도 신규 스킬만
+     적용돼 이중 정의 통합은 미완.
 
 2. **[우선] 라우터를 "분류"에서 "retrieval+rerank"로 승격 (RAG-MCP / Toolshed / ToolLLM)**
    tool 설명을 KB에 색인, 쿼리별 top-k만 프롬프트 주입. 우리 2-stage 라우터의 자연스러운 진화. 문헌 공통 결과(토큰

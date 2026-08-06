@@ -2,9 +2,15 @@
 
 **Date:** 2026-05-15
 **Status:** Evaluation
-**Companion documents:**
-- `/tmp/ontology_audit_track_c_or_evaluation.md` — academic literature survey across LP/CO/IP/DP/NF (38 KB, 517 lines, 17 references)
-- `/tmp/ontology_audit_track_d_codebase_or_fit.md` — current codebase OR paradigm mapping + fit analysis
+**Companion documents — ⚠️ LOST (verified missing 2026-08-06):**
+- ~~`/tmp/ontology_audit_track_c_or_evaluation.md`~~ — academic literature survey across LP/CO/IP/DP/NF (38 KB, 517 lines, 17 references)
+- ~~`/tmp/ontology_audit_track_d_codebase_or_fit.md`~~ — current codebase OR paradigm mapping + fit analysis
+
+> Both were written to `/tmp`, which does not survive a reboot — **they are gone and cannot be
+> recovered.** Every "see companion doc for the full bibliography / full file:line catalog"
+> pointer below is therefore a dead reference. What survives is only what this file states
+> inline; treat the referenced 17-reference survey as **unverifiable**, not as backing evidence.
+> Lesson: audit artifacts that a design doc leans on belong in `docs/`, never `/tmp`.
 - `docs/ONTOLOGY_HYPERGRAPH_DESIGN.md` — the design being evaluated
 
 **Question evaluated:** Is the proposed *directed hypergraph + dynamic hitting set + OCUS cost ranking + per-ward preference profile* direction sound under OR scrutiny, or is there a better alternative? Specifically for *our* codebase and goal.

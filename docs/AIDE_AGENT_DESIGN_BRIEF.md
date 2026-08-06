@@ -79,7 +79,7 @@ user input → concept_typer → grounder → canonicalizer → planner → exec
 발화를 처리하려면 **"무엇을 하는 요청인가"를 두 단계로 분류**한다. 둘 다 LLM 의미판단이며
 키워드/regex가 아니다.
 
-**Level-1 — 라우터 카테고리 (coarse, 9개)**: "어떤 종류의 작업인가"로 tool subset을 좁힌다.
+**Level-1 — 라우터 카테고리 (coarse, 10개)**: "어떤 종류의 작업인가"로 tool subset을 좁힌다.
 
 | 카테고리 | 의미 | 대표 tool |
 |---|---|---|
@@ -91,9 +91,14 @@ user input → concept_typer → grounder → canonicalizer → planner → exec
 | `analyze` | 분포·공정성 분석 | analyze_report |
 | `recommend` | 대체/교체 추천 | recommend_candidates |
 | `settings_rules` | 병동 전체 정책 | update_constraint, update_monthly_limit … |
-| `settings_people` | 등급·팀·개인속성·파견 | manage_grade, manage_team_min, manage_assignment … |
+| `settings_people` | 등급·팀·개인속성·파견·휴가대상 | manage_grade, manage_team_min, manage_assignment, manage_leave_targets … |
+| `help` | 사용법·절차 안내 | lookup_guide |
 
 > 왜 coarse: 15+ tool에서 바로 고르면 정확도↓. 카테고리로 좁힘(tool 섹션 −75%, recall 57→100%).
+> ⚠️ 이 두 수치는 **tool 22개·소규모 라이브셋 시점(2026-06~07)** 측정이고 현재 tool 은 29개다.
+> 또 100%는 **recall**(후보에 넣었는가)이지 파이프라인 성능이 아니다 — selection 91.7%,
+> **전체 PASS 89.7%**(param_eval N=24). 인용 전
+> `docs/AIDE_AGENT_RESEARCH_POSITIONING.md` §5.0 증거 등급표를 볼 것.
 > gray-zone(조회 vs 화면이동)은 카테고리에 navigate를 번들 → 미세결정은 메인 프롬프트가.
 
 **Level-2 — 스킬 내부 스코프 (fine)**: 스킬이 top-down으로 "어느 데이터 도메인·어떤 형태"인지 판단.
@@ -163,7 +168,7 @@ user input → concept_typer → grounder → canonicalizer → planner → exec
 
 | 컴포넌트 | 역할 | 왜 이렇게 |
 |---|---|---|
-| **2단계 라우터** (`router.py`) | 발화를 9 카테고리로 분류 → tool 스코핑 | 15+ tool에서 선택 정확도↓ → 좁혀줌. 실패 시 전체 fallback(안전). recall 57→100% 실측 |
+| **2단계 라우터** (`router.py`) | 발화를 10 카테고리로 분류 → tool 스코핑 | 15+ tool에서 선택 정확도↓ → 좁혀줌. 실패 시 전체 fallback(안전). recall 57→100%(소규모 라이브셋)·73.9→100%(param_eval N=24). 단 전체 PASS 는 65.5→89.7% |
 | **하이브리드 루프** (`agent_v3.py`) | 알려진 패턴=Routine, 새 요청=ReAct | 순수 tool-loop는 multi-step에서 실패↑(연구 41%). Routine으로 구조화(96%). 단 프롬프트 레벨(코드 아님) → 유연성 유지 |
 | **미들웨어** (`middleware.py`) | 권한·컨텍스트·그라운딩을 스킬 공통 배관으로 | 모든 스킬이 재사용 → DRY. 각 스텝이 trace |
 | **17 스킬** (`skills/`) | 자기 설명 + 내부 그라운딩 | LLM이 설명 읽고 선택. 이름→ID는 스킬이 자체 해석 → 프롬프트에 데이터 안 넣음 |

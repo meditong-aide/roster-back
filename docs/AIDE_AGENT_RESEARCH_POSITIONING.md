@@ -5,6 +5,10 @@
 > → 실측 근거 → 정직한 novelty → 실험계획 → venue.
 >
 > 작성: 2026-07-08. 기반: E2E 프로브 + recall A/B 실측(본 리포지토리 커밋 6c3126d).
+>
+> **코드 대조 갱신: 2026-08-06.** 재현 불가능한 증거(§5.3 6스킬 A/B)를 철회하고, 낡은 수치를
+> 갱신했다. **어떤 주장이 어느 등급인지는 §5.0 표를 먼저 볼 것.** 🔴 등급 주장은 논문·발표에
+> 인용하지 말 것.
 
 ---
 
@@ -113,8 +117,10 @@ Goal·Data·Permission·Exception·Verification. IC+SF(intent+slot)를 **일반�
 각 요소가 pass/fail 게이트라 태스크별 임계값 조정이 설계의 본체가 된다.
 
 ### 4.2 2단계 라우팅 (IC+SF의 무학습 계층화)
-Level-1 라우터 category(coarse, 9개) → Level-2 스킬 내부 scope(fine). self-describing tool로
-학습 없이 계층 IC+SF를 실현. tool 섹션 −75%, 라우팅 recall 실측(§5).
+Level-1 라우터 category(coarse, **10개** — navigation/read/mutate/generate/validate_repair/
+analyze/recommend/settings_rules/settings_people/help) → Level-2 스킬 내부 scope(fine).
+self-describing tool로 학습 없이 계층 IC+SF를 실현. tool 섹션 −75%(**tool 22개 시점 측정** —
+현재 29개라 재측정 필요), 라우팅 recall 은 §5.
 
 ### 4.3 단일소스 스킬 매니페스트
 `@skill(...)` 하나로 스키마·category·권한·검증을 선언 → 흩어진 배선을 파생. (ToolDescriptor와
@@ -135,12 +141,35 @@ retrieval이 "실패"가 아니라 애초에 후보에 없다. 우리는 라이�
 (a) 분기 기준이 발화 표면이 아니라 **task 의존 구조**(독립·단일→ReAct 병렬배칭, 의존복합→DAG),
 (b) 모든 실패/파싱불가/저신뢰는 ReAct로 **안전 강등**(dead-end 없음). 문헌의 drift 경고에 대한
 우리 대응은 **cross-cutting 게이트(승인/clarify/L2검증) 단일화**(docs/AGENT_SHARED_GATE_REFACTOR.md).
-현 상태는 두 경로가 게이트를 각자 구현해 이미 비대칭(예: staleness 가드는 DAG만, auto-validation은
-ReAct만)이라, 이 통합은 novelty가 아니라 **정합성 부채 상환**으로 위치한다.
+이 통합은 novelty가 아니라 **정합성 부채 상환**으로 위치한다.
+
+> **갱신 (2026-08-06)**: 작성 당시 근거였던 "두 경로가 게이트를 각자 구현해 비대칭(staleness는
+> DAG만, auto-validation은 ReAct만)" 은 **더 이상 사실이 아니다.** staleness 가드는 ReAct 승인에도
+> 대칭 적용됐고(`agent_v3.py` 의 DAG·ReAct 양쪽 승인 경로), `_auto_validate` 도 두 경로가 같은
+> 함수를 호출한다. 즉 이 절이 지적한 drift 는 대부분 해소됐다 — 잔여분은
+> `docs/AGENT_SHARED_GATE_REFACTOR.md` 기준.
 
 ---
 
 ## 5. 실측 근거 (Empirical Evidence)
+
+### 5.0 증거 등급 — 무엇이 재현 가능한가 (2026-08-06 코드 대조)
+
+논문화 전에 **재현 가능한 것과 아닌 것을 먼저 가른다.** 아래 등급을 넘어서는 주장은 본
+문서 어디에도 쓰지 않는다.
+
+| 주장 | 등급 | 근거 / 사유 |
+|---|---|---|
+| 파견 쿼리 recall 7% → 87% (§5.2) | 🟢 **기록됨·재실행 가능** | 수치가 커밋 `6c3126d` 메시지에 남아 있고, 처치 토글 `INJECT_MANIFEST_HINTS` 가 코드에 있어 재실행 가능. 단 **tool 22개 시점** |
+| silent non-retrieval 실패모드 존재 (§4.4) | 🟡 **기록됨·프로브 미보존** | 발견 경위는 `6c3126d` 커밋 메시지에 서술. 다만 **18쿼리 프로브 세트 자체는 레포에 없음** → 그대로는 재현 불가, 위 토글로 재구성해야 함 |
+| 신규 스킬 **전반**의 일반 실패모드 (RQ1) | 🔴 **미검증** | 근거였던 §5.3 표가 재현 불가 → 철회 |
+| tool 섹션 −75% 절감 | 🟡 **낡음** | tool 22개 시점. 현재 29개 → 재측정 필요 |
+| 라우터 recall "100%" | 🟡 **맞지만 오해 소지** | recall 자체는 100%(param_eval N=24, 73.9→100%). 그러나 **선택(selection)까지 포함한 전체 PASS 는 89.7%**(65.5→89.7, selection 91.7%). "100%"를 파이프라인 성능으로 읽으면 과장. 별도 전코퍼스 스윕에서도 미스 6건(개인 월한도 카테고리 미스매치) |
+| category 개수 9개 | 🟡 **낡음** | 현재 **10개**(`help` 추가) |
+| 두 실행 경로의 게이트 비대칭 (§4.5) | 🔴 **해소됨** | staleness·auto_validate 모두 공유로 전환 |
+
+**교훈(문서 운영 규칙)**: 수치를 적을 때는 **① 측정 시점의 tool/스킬 수, ② 재현 명령 또는
+커밋 해시**를 함께 남긴다. 둘 중 하나라도 없으면 실측 칸이 아니라 계획(§7) 칸에 적는다.
 
 ### 5.1 E2E 프로브 (실 LLM, 18 쿼리 × 2런)
 14/18 정상 분해(read/navigate/invoke/generate/validate/analyze/recommend/settings + 부분이름
@@ -157,24 +186,24 @@ grounding + clarification + 권한차단). **재현되는 실패**: 신규 스�
 핵심 그래프: **7% → 87%**. 잔여 실패는 "파견 취소"(취소=mutation 어휘가 강함) → mutate
 category 다중배선으로 추가 완화. 이는 **§4.4 명제의 정량 입증**이다.
 
-### 5.3 일반성 (RQ1) — 6 신규 스킬, category recall A/B (N=4, 부트스트랩 95% CI)
-스크립트 `scratchpad/vocab_generality.py`.
+### 5.3 일반성 (RQ1) — ⛔ 미실행 (증거 없음)
 
-| 신규 스킬 (새 어휘) | 기대 category | baseline | +trigger_hint |
-|---|---|---|---|
-| manage_leave (휴직) | settings_people | **0%** | 100% |
-| manage_preceptor (프리셉터) | settings_people | 33% | 100% |
-| manage_redistribution (재분배) | settings_people | 62% | 100% |
-| export_report (리포트) | read | 75% | 100% |
-| swap_shift (근무교환) | mutate | 100% | 100% |
-| query_audit (감사이력) | read | 100% | 100% |
-| **집계** | | **58% [45%,70%]** | **100% [100%,100%]** |
-| 대조군(회귀확인) | | 100% | 100% |
+> **철회 기록 (2026-08-06).** 이 자리에는 6개 신규 스킬(휴직·프리셉터·재분배·리포트export·
+> 근무교환·감사이력)의 baseline 58% → +trigger_hint 100% (부트스트랩 95% CI) 표가 실려
+> 있었고, 스크립트 `scratchpad/vocab_generality.py` 를 근거로 "6개로 입증(RQ1 충족)"이라고
+> 적었다. **코드베이스 대조 결과 그 6개 스킬은 하나도 존재하지 않고, 그 스크립트도 레포에
+> 없다.** 따라서 이 수치는 제3자가 재현할 수 없고, 시뮬레이션이었는지 유실된 실행이었는지도
+> 문서에 남아 있지 않다. 재현 불가능한 수치를 실측으로 두는 것은 나머지 실측(§5.2)의
+> 신뢰까지 떨어뜨리므로 **표 전체를 삭제하고 RQ1 충족 주장을 철회한다.**
 
-**해석(핵심 뉘앙스)**: silent non-retrieval은 "모든 신규 tool"이 아니라 **기존 category 설명에
-subsume되지 않는 새 어휘를 가진 스킬**(휴직/프리셉터/재분배)에서만 발생 — 어휘가 이미 덮인
-스킬(교환→mutate, 감사→read)은 baseline도 100%. 즉 **실패는 예측 가능(어휘 커버리지로 판별)하고
-trigger_hint로 일반적으로 복구(100%)된다.** 단일 스킬 우연이 아님을 6개로 입증(RQ1 충족).
+**현재 RQ1 상태**: **미검증.** §5.2 는 스킬 **1개**(manage_assignment/파견)에서의 실패·수정만
+보인다. "silent non-retrieval 이 신규 스킬 전반의 일반 실패모드인가"는 **아직 근거가 없다.**
+
+**실행 가능한 대체 증거(권장)**: 가상 스킬을 새로 만들 필요 없이, **이후 실제로 추가된 스킬**로
+같은 A/B 를 돌리면 된다 — `manage_daily_shift`, `publish_schedule`, `manage_mutual_exclusion`,
+`log_feedback`, `lookup_guide`, `manage_leave_targets`, `manage_banned_wanted` 는 모두 `trigger_hint`
+를 가진 실제 스킬이라 토글(`INJECT_MANIFEST_HINTS`) 한 번으로 baseline/처치 대조가 가능하다.
+이쪽이 "논문용 더미 스킬"보다 강한 증거다(실배포 어휘 · 재현 가능). 설계는 §7 Study-1 참조.
 
 ---
 
@@ -186,6 +215,8 @@ trigger_hint로 일반적으로 복구(100%)된다.** 단일 스킬 우연이 �
 - 🟢 **우리 것 (방어 가능)**:
   (a) ★ **측정된 vocabulary-propagation 실패/수정**(silent non-retrieval, 7→87%) — 선행 AOP/NFR·
       가드레일이 다루지 않는 **상류 functional(라우팅) 층**. 핵심 기여.
+      ⚠️ **현재 근거는 스킬 1개(파견)의 사례연구다.** "일반 실패모드"로 쓰려면 Study-1(§7)
+      선행 필요 — 그 전까지는 *existence proof* 이상으로 주장하지 않는다.
   (b) **기능 축(goal/data/routing)과 비기능 축(permission/exception/verification)을 하나의
       런타임-구동 선언(매니페스트)에 통합** + 그 결합을 실측 — AOP/NFR은 core-logic과 aspect를
       분리하나, 우리는 통합 선언이 라우팅 vocabulary까지 co-derive.
@@ -208,9 +239,16 @@ trigger_hint로 일반적으로 복구(100%)된다.** 단일 스킬 우연이 �
 **공통 설정**: 라우터 = gpt-5.4-nano. metric = category recall(expected_cat ∈ route(q).categories,
 tool-level의 상류 격리) + 부트스트랩 95% CI, query당 N회 반복. 토글 `INJECT_MANIFEST_HINTS`.
 
-**Study-1 (RQ1, 본 리포지토리에서 실행)**: 6개 신규 스킬(휴직·프리셉터·리포트export·근무교환·
-병동재분배·감사이력), 각기 다른 새 어휘. baseline vs +trigger_hint category recall 측정.
-스크립트: `scratchpad/vocab_generality.py`. (결과는 §5.3에 반영)
+**Study-1 (RQ1) — ⛔ 미실행.** (과거 이 자리에 "본 리포지토리에서 실행", 스크립트
+`scratchpad/vocab_generality.py` 라고 적혀 있었으나 **스크립트도 대상 스킬 6개도 레포에 없다.**
+§5.3 철회 기록 참조.)
+
+재설계: 가상 스킬을 만들지 말고 **실제로 추가된 스킬**로 돌린다 — `manage_daily_shift`,
+`publish_schedule`, `manage_mutual_exclusion`, `log_feedback`, `lookup_guide`,
+`manage_leave_targets`, `manage_banned_wanted`(7개, 각기 다른 새 어휘). 처치 토글은
+`agents_v2/router.py:INJECT_MANIFEST_HINTS`(False=baseline, True=+trigger_hint), 측정은
+`tests/agent_qa/live_router_eval.py` / `full_scope_eval.py` 재사용. 결과를 §5.3 에 기입할 때
+**측정 시점 tool 수와 커밋 해시를 함께** 남길 것(§5.0 규칙).
 
 **Study-2 (RQ2)**: 동일 스킬셋에 ③ 임베딩 retrieval(스킬 description 임베딩 + top-k) baseline
 추가 → 3자 비교. "분류 어휘 co-derive"가 임베딩 검색 대비 언제 유리한지.
@@ -227,6 +265,9 @@ tool-level의 상류 격리) + 부트스트랩 95% CI, query당 N회 반복. 토
 - 단일 도메인/언어 — 일반화 주장 제한.
 - baseline recall이 fallback(전체 tool)로 부풀 수 있음 — 미검색은 non-fallback 케이스로 한정 측정.
 - 매니페스트/auto-sync는 선행 존재 — 기여를 "실측 실패모드 + 방법론 결합"으로 명확히 한정.
+- **일반성 미검증(N=1)** — 실패모드 근거가 스킬 1개(파견)뿐. Study-1 전에는 일반화 주장 금지(§5.0).
+- **수치 부패(measurement decay)** — tool/스킬이 계속 늘어 절감률·recall이 측정 시점에 묶인다.
+  본 문서의 수치는 tool 22개 시점 기준이며 현재 29개. 인용 전 §5.0 등급 확인 필수.
 
 ---
 
