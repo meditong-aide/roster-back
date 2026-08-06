@@ -199,11 +199,12 @@ category 다중배선으로 추가 완화. 이는 **§4.4 명제의 정량 입�
 **현재 RQ1 상태**: **미검증.** §5.2 는 스킬 **1개**(manage_assignment/파견)에서의 실패·수정만
 보인다. "silent non-retrieval 이 신규 스킬 전반의 일반 실패모드인가"는 **아직 근거가 없다.**
 
-**실행 가능한 대체 증거(권장)**: 가상 스킬을 새로 만들 필요 없이, **이후 실제로 추가된 스킬**로
-같은 A/B 를 돌리면 된다 — `manage_daily_shift`, `publish_schedule`, `manage_mutual_exclusion`,
-`log_feedback`, `lookup_guide`, `manage_leave_targets`, `manage_banned_wanted` 는 모두 `trigger_hint`
-를 가진 실제 스킬이라 토글(`INJECT_MANIFEST_HINTS`) 한 번으로 baseline/처치 대조가 가능하다.
-이쪽이 "논문용 더미 스킬"보다 강한 증거다(실배포 어휘 · 재현 가능). 설계는 §7 Study-1 참조.
+**실행 가능한 대체 증거(권장)**: 가상 스킬을 새로 만들 필요 없이, **이후 실제로 추가된
+매니페스트 스킬**로 같은 A/B 를 돌리면 된다 — `manage_assignment`(원 사례), `lookup_guide`,
+`manage_daily_shift`, `manage_leave_targets`, `manage_banned_wanted` **5개가 `trigger_hint` 를
+가지며**, 토글(`INJECT_MANIFEST_HINTS`) 한 번으로 baseline/처치 대조가 된다(신규 증거는 4개).
+레거시 `@register` 스킬은 hint 자체가 없어 대상이 아니다. 이쪽이 "논문용 더미 스킬"보다 강한
+증거다(실배포 어휘 · 재현 가능). 설계·표는 §7 Study-1 참조.
 
 ---
 
@@ -243,12 +244,25 @@ tool-level의 상류 격리) + 부트스트랩 95% CI, query당 N회 반복. 토
 `scratchpad/vocab_generality.py` 라고 적혀 있었으나 **스크립트도 대상 스킬 6개도 레포에 없다.**
 §5.3 철회 기록 참조.)
 
-재설계: 가상 스킬을 만들지 말고 **실제로 추가된 스킬**로 돌린다 — `manage_daily_shift`,
-`publish_schedule`, `manage_mutual_exclusion`, `log_feedback`, `lookup_guide`,
-`manage_leave_targets`, `manage_banned_wanted`(7개, 각기 다른 새 어휘). 처치 토글은
+재설계: 가상 스킬을 만들지 말고 **실제로 배포된 스킬**로 돌린다. 처치 토글은
 `agents_v2/router.py:INJECT_MANIFEST_HINTS`(False=baseline, True=+trigger_hint), 측정은
-`tests/agent_qa/live_router_eval.py` / `full_scope_eval.py` 재사용. 결과를 §5.3 에 기입할 때
-**측정 시점 tool 수와 커밋 해시를 함께** 남길 것(§5.0 규칙).
+`tests/agent_qa/live_router_eval.py` / `full_scope_eval.py` 재사용.
+
+**대상은 매니페스트(`@skill`) 스킬 5개뿐이다** — 토글이 파생하는 것은 `SkillSpec.trigger_hint`
+라서, 레거시 `@register` 스킬(publish_schedule·manage_mutual_exclusion·log_feedback 등)은
+애초에 hint 가 없어 A/B 대상이 아니다.
+
+| 스킬 | 새 어휘 | 비고 |
+|---|---|---|
+| `manage_assignment` | 파견·병동이동 | §5.2 의 원 사례 (N=1) — 재현 확인용 |
+| `lookup_guide` | 사용법·절차 안내 | `help` 카테고리 단독 |
+| `manage_daily_shift` | 일자별 필요인원 | settings_rules |
+| `manage_leave_targets` | 보건휴가·수면OFF·임신 | settings_people |
+| `manage_banned_wanted` | 금지 원티드 | mutate/read |
+
+즉 **신규 증거는 4개**(원 사례 제외)다. N 을 더 늘리려면 기존 `@register` 스킬을 매니페스트로
+이관해야 하며, 그 이관 자체가 §4.3 의 부수 효과라 실험과 별개로 값어치가 있다.
+결과를 §5.3 에 기입할 때 **측정 시점 tool 수와 커밋 해시를 함께** 남길 것(§5.0 규칙).
 
 **Study-2 (RQ2)**: 동일 스킬셋에 ③ 임베딩 retrieval(스킬 description 임베딩 + top-k) baseline
 추가 → 3자 비교. "분류 어휘 co-derive"가 임베딩 검색 대비 언제 유리한지.
