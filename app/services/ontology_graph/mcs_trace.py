@@ -271,7 +271,13 @@ def cause_to_resolution_options(
         changes: list[dict[str, Any]] = []
         monthly_limit_release: list[dict[str, Any]] = []
         weekend_off_release: list[str] = []
-        for t in ml:
+        apply_cfg: dict[str, Any] = {}
+        # 야간전담(off=일수−나이트)은 상한으로 '내리면' 나머지가 강제 OFF 가 되어 야간 공급이
+        #   오히려 줄어든다(역효과). 그 간호사들은 내리기 대신 **월 야간상한(config max_nig)을
+        #   올려** 정당한 고-야간을 수용한다(night-short 병동의 올바른 레버). 일반(비야간전담)만 내린다.
+        ml_no = [t for t in ml if t.get("is_night_only")]
+        ml_reg = [t for t in ml if not t.get("is_night_only")]
+        for t in ml_reg:
             nm = t.get("name") or t["nurse_id"]
             # n_max(상한)로 완화: 야간을 '정확히 N'이 아니라 '최대 N 까지'로 묶는다.
             # 솔버가 그 아래로 자유롭게 배정 → 근무표 품질 유리. 적용 경로가 하한(n_min)이
@@ -281,23 +287,48 @@ def cause_to_resolution_options(
             changes.append({"nurse_id": t["nurse_id"], "config_key": "n_max",
                             "label_ko": f"{nm} 월 야간 최대",
                             "from": t.get("current"), "to": int(t["cap"])})
+        if ml_no:
+            # 야간전담들이 요구하는 야간수의 최댓값까지 상한을 올려 전원 수용.
+            _needed = max(int(t.get("current") or 0) for t in ml_no)
+            _cur_cap = min((int(t["cap"]) for t in ml_no if t.get("cap") is not None), default=0)
+            if _needed > _cur_cap:
+                apply_cfg["max_nig_per_month"] = _needed
+                _names_no = ", ".join(str(t.get("name") or t["nurse_id"]) for t in ml_no)
+                # ★ max_nig_per_month 는 병동 전체 공통값(개인 설정 아님). 올리면 전 간호사의
+                #   야간 상한이 오른다(min(전역, 개인) 구조라 개인만 올릴 방법이 없음). 라벨을
+                #   '병동 공통'으로 정직하게 표기해 개인 조정으로 오해하지 않게 한다.
+                changes.append({"config_key": "max_nig_per_month",
+                                "label_ko": (f"월 야간 상한(병동 공통, 전 간호사 적용) — "
+                                             f"{_names_no}(야간전담) 수용용"),
+                                "from": _cur_cap, "to": _needed})
         for t in wk:
             nm = t.get("name") or t["nurse_id"]
             weekend_off_release.append(t["nurse_id"])
             changes.append({"nurse_id": t["nurse_id"], "config_key": "weekend_off",
                             "label_ko": f"{nm} 주말 휴무", "from": None, "to": "해제"})
         n_nurses = len({t["nurse_id"] for t in ml + wk})
-        return [{
+        _trade = "해당 간호사들의 야간/주말 설정이 아래대로 바뀝니다."
+        if ml_no:
+            _nm0 = ml_no[0].get("name") or ml_no[0]["nurse_id"]
+            _trade = (f"{_nm0} 등 야간전담이 필요한 야간을 서려면 '월 야간 상한'을 올려야 합니다. "
+                      f"이 값은 병동 전체 공통이라 전 간호사의 상한이 함께 오릅니다 — 다만 '최대'라 "
+                      f"다른 간호사를 더 세우진 않고(솔버가 필요할 때만 사용), 이 병동은 야간이 "
+                      f"부족한 상태라 여력 확보에 도움이 됩니다. 야간 피로 누적에 유의하세요.")
+        card: dict[str, Any] = {
             "option_id": "cause:fix_all_personal",
             "kind": "relax_constraint", "source": "cause", "verified": False,
             "title_ko": f"문제 간호사 {n_nurses}명 설정 조정하고 다시 만들기",
-            "trade_off_ko": "해당 간호사들의 야간/주말 설정이 아래대로 바뀝니다.",
+            "trade_off_ko": _trade,
             "changes": changes,
             "monthly_limit_release": monthly_limit_release,
             "weekend_off_release": weekend_off_release,
             "fix": {"mode": "auto_apply", "where": "nurse.monthly_limit+weekend_off",
                     "where_label_ko": "간호사 관리 > 월 근무 한도 · 주말 휴무"},
-        }]
+        }
+        if apply_cfg:
+            # 야간전담 상한 상향은 config delta → 프론트가 apply 를 config_override 로 재생성.
+            card["apply"] = apply_cfg
+        return [card]
 
     # per-nurse target 없음(coupled/policy/coverage) → family 안내 카드 1장.
     if not top_family:

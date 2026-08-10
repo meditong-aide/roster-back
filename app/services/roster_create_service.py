@@ -5658,6 +5658,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         for n in (nurses_for_engine or []):
             _prof = {f: getattr(n, f, None) for f in _ONTOLOGY_NURSE_FIELDS}
             _prof["db_id"] = _prof.get("nurse_id")
+            # 이름도 실어준다 — 원인 브리지(cause_to_resolution_options)·진단 문구가 nurse_id 가
+            #   아니라 이름으로 표기되도록. _ONTOLOGY_NURSE_FIELDS 엔 name 이 없어 폴백하던 문제.
+            _prof["name"] = getattr(n, "name", None)
             _prof["is_weekend_off"] = str(_prof.get("nurse_id")) in _wk_ids_pre
             _nurses_dict_for_precheck.append(_prof)
         # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
@@ -5749,6 +5752,34 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             pass
         if has_blocking_issues(precheck_result):
             payload = build_blocking_payload(precheck_result)
+            # [원인 브리지] precheck 가 solve 전에 막으면(솔버 호출 생략) post-solve cause 경로가
+            #   안 도므로, 여기서 explain_infeasibility_from_config 로 개인/주말 원인을 진단해 카드를
+            #   payload 에 합류시킨다. 주말휴무 과다·야간전담 상한 등이 일반 capacity 문구로만 뜨고
+            #   해결 카드가 없던 갭을 메운다(정확 카드/문구로 override, 실패내성).
+            try:
+                import calendar as _cal_cb
+                from services.ontology_graph.lagrangian import (
+                    explain_infeasibility_from_config as _explain_cb,
+                )
+                from services.ontology_graph.mcs_trace import (
+                    cause_to_resolution_options as _cards_cb,
+                )
+                _nd_cb = _cal_cb.monthrange(req.year, req.month)[1]
+                _cause_cb = _explain_cb(_nurses_dict_for_precheck, precheck_config, _nd_cb,
+                                        year=req.year, month=req.month)
+                _cards = _cards_cb(_cause_cb.classification, _cause_cb.top_family, _cause_cb.targets)
+                if _cards:
+                    _inf_cb = payload.setdefault("infeasibility", {})
+                    _inf_cb["resolution_options"] = _cards + (_inf_cb.get("resolution_options") or [])
+                    if _cause_cb.classification != "unknown" and _cause_cb.certificate:
+                        _inf_cb["summary_message_ko"] = _cause_cb.certificate
+                        _fx = _inf_cb.get("fix_suggestions_ko") or []
+                        if _cause_cb.certificate not in _fx:
+                            _inf_cb["fix_suggestions_ko"] = [_cause_cb.certificate] + _fx
+                    print(f"[Precheck][CauseBridge] {_cause_cb.classification}/"
+                          f"{_cause_cb.top_family} 카드 {len(_cards)}건 합류")
+            except Exception as _cb_exc:
+                print(f"[Precheck][CauseBridge] 실패(무시): {_cb_exc}")
             inf = payload.get("infeasibility", {})
             issue_codes = sorted({
                 str(i.get("reason_code", "?"))
@@ -6189,6 +6220,26 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                             explain_infeasibility_from_config,
                         )
                         _nd2 = _cal2.monthrange(req.year, req.month)[1]
+                        # [SSOT] 진단도 솔버(2897)와 동일하게 주말휴무를 period 로 재해석해 주입한다.
+                        #   진단(lagrangian)은 is_weekend_off 속성만 신뢰 → 속성 표류 시 원인이
+                        #   'unknown' 으로 뭉개져 "주말휴무자 과다"가 실종되던 갭을 막는다.
+                        try:
+                            from services.nurse_period_resolver import (
+                                weekend_off_ids_asof as _wo_ids_dx,
+                            )
+                            _wo_set_dx = _wo_ids_dx(
+                                db,
+                                [getattr(_n, "nurse_id", None) for _n in nurses_for_engine],
+                                req.year, req.month)
+                            for _n in nurses_for_engine:
+                                _wnid = str(getattr(_n, "nurse_id", "") or "")
+                                if _wnid:
+                                    try:
+                                        _n.__dict__["is_weekend_off"] = _wnid in _wo_set_dx
+                                    except Exception:
+                                        setattr(_n, "is_weekend_off", _wnid in _wo_set_dx)
+                        except Exception as _wo_dx_exc:
+                            print(f"[Cause] 주말휴무 SSOT 주입 실패(무시): {_wo_dx_exc}")
                         _cause = explain_infeasibility_from_config(
                             nurses_for_engine, _probe_base, _nd2,
                             year=req.year, month=req.month)
