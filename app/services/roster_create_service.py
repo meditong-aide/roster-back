@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from db.models import (
     DailyShift,
+    DailyTeamShift,
     FixedWantedEntry,
     BannedWantedEntry,
     Group,
@@ -644,6 +645,128 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
             "ShiftManage.main_code 또는 DailyShift 설정을 확인해주세요."
         )
     return shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day
+
+
+def _build_daily_team_settings(
+    db: Session,
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    days_in_month: int,
+    *,
+    use_mid: bool,
+) -> tuple[list[list[str] | None], list[dict[str, dict[str, int]]]]:
+    """일자별 가동 팀 + 팀별 최소 인원을 daily_team_shift 에서 읽는다.
+
+    반환(둘 다 0-index 리스트):
+        active_by_day[d]   그날 가동 팀 id(str) 목록. **None = 미설정 → 전 팀 가동**.
+        team_min_by_day[d] {team_id: {코드: 최소인원}}. 빈 dict = 인원 미지정.
+
+    ★ 행이 하나도 없는 날은 None 이어야 한다. 빈 리스트로 두면 그날 전원이
+      강제 OFF 가 되어 기존 그룹이 통째로 망가진다.
+
+    테이블이 아직 없거나(마이그레이션 미적용) 조회가 실패하면 전 일자를 미설정으로
+    돌린다 — 코드만 배포돼도 현행 동작이 유지된다.
+    """
+    active_by_day: list[list[str] | None] = [None] * days_in_month
+    team_min_by_day: list[dict[str, dict[str, int]]] = [{} for _ in range(days_in_month)]
+
+    try:
+        rows = (
+            db.query(DailyTeamShift)
+            .filter(
+                DailyTeamShift.office_id == office_id,
+                DailyTeamShift.group_id == group_id,
+                DailyTeamShift.year == year,
+                DailyTeamShift.month == month,
+            )
+            .all()
+        )
+    except Exception as e:
+        print(f"[DailyTeam] daily_team_shift 조회 실패(미설정으로 처리): {e}")
+        return active_by_day, team_min_by_day
+
+    if not rows:
+        return active_by_day, team_min_by_day
+
+    codes = ("D", "E", "N", "M") if use_mid else ("D", "E", "N")
+    for row in rows:
+        d_idx = int(getattr(row, "day", 0) or 0) - 1
+        if d_idx < 0 or d_idx >= days_in_month:
+            continue
+        tid = str(getattr(row, "team_id", "") or "")
+        if not tid:
+            continue
+        if active_by_day[d_idx] is None:
+            active_by_day[d_idx] = []
+        active_by_day[d_idx].append(tid)
+
+        mins = {
+            code: int(getattr(row, f"{code.lower()}_count", 0) or 0)
+            for code in codes
+        }
+        mins = {k: v for k, v in mins.items() if v > 0}
+        if mins:
+            team_min_by_day[d_idx][tid] = mins
+
+    _set_days = sum(1 for x in active_by_day if x is not None)
+    print(f"[DailyTeam] {year}-{month:02d} 설정일 {_set_days}/{days_in_month}일")
+    return active_by_day, team_min_by_day
+
+
+def _off_cap_shortfall_cause(roster_system) -> tuple[dict, list] | None:
+    """폴백이 기록한 'OFF 상한 부족' → (cause_explanation, resolution_options).
+
+    off_first=True 는 근무 초과를 막으므로 남는 인원이 전부 쉬어야 하는데, 월 휴무
+    일수가 그만큼을 못 담으면 해가 없다. 이 판정은 **폴백 안에서만 정확**하다 —
+    일별 활성 인원(입퇴사·차단 제외)을 세기 때문이다. 그래서 산술 진단이 아니라
+    폴백이 남긴 값을 읽는다.
+
+    기록이 없으면 None. 산술 진단이 이미 원인을 짚었으면 호출부가 그쪽을 우선한다.
+    """
+    sf = getattr(roster_system, "_off_cap_shortfall", None)
+    if not isinstance(sf, dict):
+        return None
+    need = int(sf.get("needed_per_nurse") or 0)
+    cur = int(sf.get("configured_off_days") or 0)
+    if need <= cur:
+        return None
+
+    cert = (
+        f"근무를 요구 인원보다 더 배정하지 않는 설정(OFF 우선)이라 남는 인원이 모두 "
+        f"쉬어야 하는데, 월 휴무 일수가 모자라요 "
+        f"(1인당 {need}일 필요, 현재 {cur}일) — "
+        f"월 휴무를 {need}일 이상으로 올리거나, 일별 필요 인원을 늘리세요."
+    )
+    cause = {
+        "classification": "policy_overconstraint",
+        "top_family": "off_budget",
+        "certificate": cert,
+        "arithmetic": {
+            "off_needed_per_nurse": need,
+            "configured_off_days": cur,
+            "off_required_cells": int(sf.get("off_required_cells") or 0),
+            "nurses_counted": int(sf.get("nurses_counted") or 0),
+        },
+    }
+    # ★ 기존 off_budget 카드는 "월 OFF 요구일수 낮추기"라 방향이 정반대다. 여기서는
+    #   올려야 하므로 전용 카드를 만든다.
+    cards = [{
+        "option_id": "cause:off_budget_raise",
+        "kind": "relax_constraint", "source": "cause", "verified": False,
+        "title_ko": f"월 휴무를 {need}일로 올리고 다시 만들기",
+        "trade_off_ko": (
+            f"지금 설정({cur}일)으로는 남는 인원이 쉴 자리가 없습니다. "
+            f"휴무를 늘리는 대신 일별 필요 인원을 늘리는 방법도 있습니다."),
+        "changes": [{"config_key": "off_days", "label_ko": "월 휴무 일수",
+                     "from": cur, "to": need}],
+        "apply": {"off_days": need},
+        "fix": {"mode": "auto_apply", "where": "config.off_days",
+                "where_label_ko": "근무표 설정 > 월 휴무 일수"},
+    }]
+    return cause, cards
+
 
 def _normalize_to_main(code: str, code2main: dict) -> str:
     """세부 근무코드를 메인코드로 정규화한다."""
@@ -2964,6 +3087,27 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                 config_dict["team_handoff_policy_by_team"] = team_handoff_policy_by_team
         except Exception as e:
             print(f"[TeamMin] teams.min_shift/handoff_policy 로딩 실패(무시): {e}")
+
+        # 일자별 가동 팀 + 팀별 인원(daily_team_shift) 주입.
+        #   ★ 전 일자가 미설정이면 키 자체를 넣지 않는다. 소비 측이 None 을 보고
+        #     현행(전 팀 가동) 경로를 타야 하므로, 빈 리스트를 넣으면 안 된다.
+        try:
+            import calendar as _cal_dts
+            _dim_dts = _cal_dts.monthrange(int(req.year), int(req.month))[1]
+            _active_by_day, _team_min_by_day = _build_daily_team_settings(
+                db,
+                current_user.office_id,
+                current_user.group_id,
+                int(req.year),
+                int(req.month),
+                _dim_dts,
+                use_mid=bool(config_dict.get("use_mid", False)),
+            )
+            if any(x is not None for x in _active_by_day):
+                config_dict["daily_active_teams_by_day"] = _active_by_day
+                config_dict["daily_team_min_by_day"] = _team_min_by_day
+        except Exception as e:
+            print(f"[DailyTeam] config 주입 실패(무시): {e}")
 
         try:
             shift_lookup = _load_shift_lookup(db, current_user.office_id, current_user.group_id)
@@ -6251,6 +6395,21 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                             "lambda_by_family": _cause.lambda_by_family,
                         }
                         print(f"[Cause] {_cause.classification}: {_cause.certificate}")
+                        # 산술 진단이 unknown 이면, 폴백이 남긴 OFF 상한 부족을 원인으로 쓴다.
+                        #   (근사 산술로는 활성일이 짧은 병동을 과탐지해 여기서만 정확하다)
+                        if _cause.classification == "unknown":
+                            _sf_pair = _off_cap_shortfall_cause(roster_system)
+                            if _sf_pair:
+                                _sf_cause, _sf_cards = _sf_pair
+                                unrecoverable["infeasibility"]["cause_explanation"] = _sf_cause
+                                unrecoverable["infeasibility"]["fix_suggestions_ko"] = [
+                                    _sf_cause["certificate"]]
+                                unrecoverable["infeasibility"]["resolution_options"] = (
+                                    _sf_cards
+                                    + (unrecoverable["infeasibility"].get("resolution_options") or []))
+                                unrecoverable["infeasibility"]["_sole_option"] = _sf_cards[0]
+                                _skip_probe = True
+                                print(f"[Cause][OffCapShortfall] {_sf_cause['certificate']}")
                         # N축 branch-and-infer: 야간축 원인이면 proof-tree 설명 + 검증된 복구를
                         # payload 에 **추가**(기존 분류·카드 불변, 실패내성). "각자OK 같이X" 를
                         # "어느 배정이든 실패" 서사로 보여주고, 복구 후보를 N축 재판정으로 선별.
@@ -6680,6 +6839,25 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     "지금 인원·설정으로는 근무표를 만들 수 없어요. 간호사 인원을 보강하거나 "
                     "설정 > 날짜별 필요 인원을 줄여 다시 시도해 주세요."
                 )
+            # 어느 경로로 왔든 원인이 비어 있으면 폴백이 남긴 'OFF 상한 부족'으로 채운다.
+            #   ★ UNDIAGNOSED probe 블록을 타지 않는 실패(폴백 stage1 이 hard/broad-soft
+            #     모두 INFEASIBLE 인 경우 등)에서는 여기가 유일한 합류점이다. 그 경로에서는
+            #     원인도 카드도 없이 "설정 조합으로는 만들 수 없습니다" 한 줄만 나가서,
+            #     수간호사가 무엇을 되돌려야 할지 알 수 없었다.
+            if not _fin.get("cause_explanation"):
+                try:
+                    _sf_fin = _off_cap_shortfall_cause(roster_system)
+                    if _sf_fin:
+                        _sf_c, _sf_k = _sf_fin
+                        _fin["cause_explanation"] = _sf_c
+                        _fin["summary_message_ko"] = _sf_c["certificate"]
+                        _fin["fix_suggestions_ko"] = [_sf_c["certificate"]]
+                        _fin["resolution_options"] = _sf_k + (
+                            _fin.get("resolution_options") or [])
+                        print(f"[RosterGenerate][OffCapShortfall] {_sf_c['certificate']}")
+                except Exception as _sf_exc:
+                    print(f"[RosterGenerate][OffCapShortfall] 첨부 실패(무시): {_sf_exc}")
+
             inf = unrecoverable.get("infeasibility", {})
             print(
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
@@ -6818,6 +6996,57 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         )
         if _inf.get("severity") == "warning" and _inf.get("summary_message_ko"):
             print(f"[RosterGenerate][response][message] {_inf['summary_message_ko']}")
+
+        # ── 미달·완화가 있으면 '왜 그렇게 됐는지'를 함께 붙인다 ──────────────────
+        #   원인 진단은 그동안 실패(500) 경로에만 달렸는데, 커버리지가 soft 로 떨어져
+        #   **미달인 채 200 으로 나가는 경우**가 실제로는 더 흔하다. 그때 사용자가 받는
+        #   건 "가용 인원이 제한적" 한 줄뿐이라 무엇을 되돌려야 할지 알 수 없다
+        #   (예: 일자별 가동 팀을 좁혀 놓고도 그 사실이 문구에 안 나온다).
+        #   실패 경로와 **같은 함수·같은 필드**를 써서 프론트가 한 곳만 읽으면 되게 한다.
+        #   unknown 이면 붙이지 않는다 — 뭉뚱그린 문구는 노이즈다.
+        if _inf.get("severity") == "warning":
+            try:
+                import calendar as _cal_sx
+                from services.ontology_graph.lagrangian import (
+                    explain_infeasibility_from_config as _explain_sx,
+                )
+                from services.ontology_graph.mcs_trace import (
+                    cause_to_resolution_options as _cards_sx,
+                )
+                _base_sx = getattr(roster_system, "_effective_config_snapshot", None)
+                if _base_sx:
+                    _nd_sx = _cal_sx.monthrange(req.year, req.month)[1]
+                    _cause_sx = _explain_sx(nurses_for_engine, _base_sx, _nd_sx,
+                                            year=req.year, month=req.month)
+                    # 산술이 못 짚으면 폴백이 남긴 OFF 상한 부족을 쓴다(성공 경로도 동일).
+                    if _cause_sx.classification == "unknown":
+                        _sf_pair_sx = _off_cap_shortfall_cause(roster_system)
+                        if _sf_pair_sx:
+                            _sf_c, _sf_k = _sf_pair_sx
+                            _inf["cause_explanation"] = _sf_c
+                            _inf["summary_message_ko"] = _sf_c["certificate"]
+                            _inf["resolution_options"] = _sf_k + (
+                                _inf.get("resolution_options") or [])
+                            print(f"[RosterGenerate][cause] OffCapShortfall · 카드 {len(_sf_k)}건")
+                    if _cause_sx.classification != "unknown":
+                        _inf["cause_explanation"] = {
+                            "classification": _cause_sx.classification,
+                            "top_family": _cause_sx.top_family,
+                            "certificate": _cause_sx.certificate,
+                            "arithmetic": _cause_sx.arithmetic,
+                        }
+                        # 원인이 확실하면 generic 요약을 그것으로 대체(문구가 둘이면 헷갈린다).
+                        if _cause_sx.certificate:
+                            _inf["summary_message_ko"] = _cause_sx.certificate
+                        _cards_out = _cards_sx(_cause_sx.classification,
+                                               _cause_sx.top_family, _cause_sx.targets)
+                        if _cards_out:
+                            _inf["resolution_options"] = _cards_out + (
+                                _inf.get("resolution_options") or [])
+                        print(f"[RosterGenerate][cause] {_cause_sx.classification}/"
+                              f"{_cause_sx.top_family} · 카드 {len(_cards_out)}건")
+            except Exception as _cx_exc:
+                print(f"[RosterGenerate][cause] 원인 첨부 실패(무시): {_cx_exc}")
     except Exception as _exc:
         print(f"[Infeasibility] payload 빌드 실패(무시): {_exc}")
 

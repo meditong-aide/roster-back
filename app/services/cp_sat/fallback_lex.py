@@ -597,6 +597,11 @@ def optimize_fallback_lex_hard_first(
             join=join,
             leave=leave,
             fixed_non_off_cells=fixed_non_off_cells,
+            # 일자별 비가동 팀 강제 OFF. 폴백에서 빠지면 CP-SAT 이 실패했을 때
+            #   비가동 팀이 그대로 배정된다(지정이 조용히 무시됨).
+            daily_active_teams_by_day=getattr(
+                cfg, "daily_active_teams_by_day", None
+            ),
         )
         structural_off_cells = set(partition["structural_off_cells"])
         vacation_off_cells = set(partition["vacation_off_cells"])
@@ -1021,6 +1026,35 @@ def optimize_fallback_lex_hard_first(
                         if any(ws <= d <= we for (ws, we) in _ow_ranges_fb):
                             continue
                         m.Add(X(n, d, off_idx) == 0)
+
+        # ── 일자별 가동 팀: 그날 안 도는 팀의 인원은 OFF 강제 ──────────────────
+        #   ★ off_policy 가 structural_off_cells 에 넣는 것만으로는 강제되지 않는다.
+        #     그 집합은 목적함수(OFF 페널티 제외)와 capacity 계산에 쓰이는 분류일 뿐이라,
+        #     주말휴무와 똑같이 여기서 m.Add 로 직접 걸어야 실제로 막힌다.
+        #   daily_active_teams_by_day[d] 가 None 이면 미설정 → 전 팀 가동(현행).
+        #   고정 셀이 근무로 지정돼 있으면 주말휴무와 동일하게 고정을 우선한다.
+        _daily_active_fb = getattr(cfg, "daily_active_teams_by_day", None)
+        if _daily_active_fb:
+            _dt_forced = 0
+            for n, nu in enumerate(roster_system.nurses):
+                _tid = getattr(nu, "team_id", None)
+                if _tid in (None, "", 0):
+                    continue  # 팀 미배정은 대상 아님(그날 쓸 인원까지 사라진다)
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                    if d >= len(_daily_active_fb):
+                        break
+                    _active = _daily_active_fb[d]
+                    if _active is None:
+                        continue
+                    if str(_tid) in {str(t) for t in _active}:
+                        continue
+                    if (n, d) in fixed and fixed[(n, d)] != off_idx:
+                        continue  # 고정 근무 우선
+                    m.Add(X(n, d, off_idx) == 1)
+                    _dt_forced += 1
+            if _dt_forced:
+                print(f"{logger_prefix} [DailyTeam] 비가동 팀 OFF 강제 {_dt_forced}셀 "
+                      f"(stage {stage})")
 
         # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
         # if raw_off_placement_mode != 0:
@@ -2319,6 +2353,27 @@ def optimize_fallback_lex_hard_first(
                 f"required={_fb_total_required}, N={_fb_n_full}, "
                 f"auto_min={_fb_auto_min_off}, auto_max={_fb_auto_max_off}"
             )
+            # ── OFF 상한 부족 기록 ────────────────────────────────────────────
+            #   off_first=True 는 근무 초과를 막으므로(assigned <= need) 남는 인원이 전부
+            #   쉬어야 한다. 그 필요량(auto_min)이 설정 OFF 일수보다 크면 놓을 자리가 없다.
+            #   ★ 이 판정은 여기서만 정확하다 — 일별 활성 인원(입퇴사·차단 제외)을 세기
+            #     때문이다. 진단 쪽에서 cells−coverage 로 근사하면 활성일이 짧은 병동을
+            #     과탐지한다(실측: 같은 조건에서 9A required 93 vs 근사 155).
+            #   원인 문구·카드는 이 값을 읽어서 만든다.
+            if (_fb_auto_min_off is not None
+                    and effective_off_days > 0
+                    and _fb_auto_min_off > effective_off_days):
+                try:
+                    setattr(roster_system, "_off_cap_shortfall", {
+                        "needed_per_nurse": int(_fb_auto_min_off),
+                        "configured_off_days": int(effective_off_days),
+                        "off_required_cells": int(_fb_total_required),
+                        "nurses_counted": int(_fb_n_full),
+                    })
+                    print(f"{logger_prefix} [OffCap][Shortfall] 1인당 {_fb_auto_min_off}일 필요 "
+                          f"> 설정 {effective_off_days}일 → 원인 기록")
+                except Exception as _sf_exc:
+                    print(f"{logger_prefix} [OffCap][Shortfall] 기록 실패(무시): {_sf_exc}")
         # N 전일 금지 간호사 집합 (2N2O/3N2O OFF 확장용)
         from services.cp_sat.objective_terms import _n_forbid_n_set
         _fb_n_forbid = _n_forbid_n_set(roster_system, join, leave)

@@ -127,6 +127,16 @@ class NurseRosterConfig:
     team_min_by_team: Dict[str, Dict[str, int]] = field(default_factory=dict)
     team_min_soft_fallback: bool = True  # True면 슬랙 + 패널티로 소프트 처리, False면 하드
     team_min_penalty_weight: int = 80000   # 소프트 모드 팀 미달 슬랙 패널티. grade(160000)의 절반 = 한 단계 아래
+    # ── 일자별 가동 팀 (daily_team_shift) ──
+    # daily_active_teams_by_day[d] = ['1','2','4']  (0-index)
+    #   그날 도는 팀. **None = 미설정 → 전 팀 가동**(현행 동작). 비가동 팀 인원은
+    #   그날 강제 OFF 로 밀린다(off_policy.structural_off_cells 합류).
+    #   ★ 저장 API 가 빈 목록을 거부하므로 리스트면 항상 1개 이상이다. 빈 리스트가
+    #     들어오면 그날 팀 배정자 전원이 OFF 가 되므로 소비 측은 방어만 해 둔다.
+    # daily_team_min_by_day[d] = {'1': {'D': 2, 'E': 1}}
+    #   그날 그 팀이 서야 할 최소 인원. 없으면 min(need, 가동팀수) 규칙에 위임.
+    daily_active_teams_by_day: Optional[List[Optional[List[str]]]] = None
+    daily_team_min_by_day: Optional[List[Dict[str, Dict[str, int]]]] = None
     # ── 팀 내 인계 제한(handoff restrictions) ──
     # team_handoff_policy_by_team[team_id_str] = {
     #   "restrictions": [

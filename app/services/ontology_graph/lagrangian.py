@@ -577,11 +577,23 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
         _avail_wk = len(nurses) - len(wk_nurses)
         if _avail_wk < _daily_req_sum:
             _need = _daily_req_sum - _avail_wk       # 주말 매일 +1 공급 위해 풀 최소 인원
-            _rel_idxs = sorted(wk_nurses)[:_need]    # 과해제 방지: 필요 인원만 카드에 담는다
+            # 과해제 방지로 필요 인원만 담되, 누구를 담을지에 근거를 준다.
+            #   ★ 예전엔 sorted(인덱스)[:n] 이라 **간호사 목록에 실린 순서**로 앞에서
+            #     잘랐다(연차·업무량과 무관). probe 가 재solve 로 culprit 을 찾던 자리를
+            #     대신하는 값이라, 최소한 "주말 커버에 쓸모가 큰 순"으로 정렬한다.
+            #   설 수 있는 근무 코드가 많은 사람 → 해제 효과가 크다. 동률은 nurse_id 로
+            #   고정해 실행마다 답이 흔들리지 않게 한다(결정론).
+            def _wk_rank(i: int) -> tuple:
+                _al = _nurse_attr(nurses[i], "allowed_shifts") or []
+                return (-len(list(_al)), str(_nurse_attr(nurses[i], "nurse_id") or i))
+
+            _rel_idxs = sorted(wk_nurses, key=_wk_rank)[:_need]
             _wk_tgts = [{
                 "nurse_id": _nurse_attr(nurses[i], "nurse_id"),
                 "name": _nurse_attr(nurses[i], "name") or _nurse_attr(nurses[i], "nurse_id") or f"n{i}",
-                "family": "weekend_off"} for i in _rel_idxs]
+                "family": "weekend_off",
+                # 이 선택은 '제안'이다. 실제 누구를 풀지는 수간호사가 정한다.
+                "selection": "suggested"} for i in _rel_idxs]
             cert = (f"주말 휴무자가 많아 주말 근무를 못 채워요 "
                     f"(주말 하루 {_daily_req_sum}명 필요, 가용 {_avail_wk}명) — "
                     f"주말 휴무를 최소 {_need}명 해제하면 돼요.")
@@ -589,6 +601,55 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
                 "coverage_shortage", "weekend_off", {}, cert,
                 {"weekend_demand": _daily_req_sum, "weekend_available": _avail_wk,
                  "release_needed": _need}, targets=_wk_tgts)
+
+    # ── 0d) 일자별 가동 팀 (그날 안 도는 팀을 빼면 가용 < 요구, arithmetic 증명) ──
+    #   비가동 팀 인원은 그날 강제 OFF 다. 그날 쓸 수 있는 사람 = 가동 팀 소속 + 팀 미배정.
+    #   이게 그날 요구 합보다 적으면 그 날은 못 채운다(필요조건, sound).
+    #   주말휴무(0c)와 같은 축이지만 원인·해법이 달라 따로 짚는다 — 여기서 뭉개면
+    #   "주말 휴무를 푸세요" 같은 엉뚱한 안내가 나간다.
+    _daily_active = config.get("daily_active_teams_by_day")
+    if _daily_active:
+        _by_day = config.get("daily_shift_requirements_by_day")
+        for _d in range(int(num_days)):
+            if _d >= len(_daily_active):
+                break
+            _act = _daily_active[_d]
+            if _act is None:
+                continue  # 미설정 = 전 팀 가동
+            _act_set = {str(t) for t in _act}
+            _avail = [
+                i for i, nu in enumerate(nurses)
+                if (lambda t: t in (None, "", 0) or str(t) in _act_set)(
+                    _nurse_attr(nu, "team_id"))
+            ]
+            if isinstance(_by_day, list) and _d < len(_by_day) and _by_day[_d]:
+                _need_d = sum(int(v or 0) for v in (_by_day[_d] or {}).values())
+            else:
+                _need_d = sum(int(v or 0) for v in req.values())
+            if _need_d <= 0 or len(_avail) >= _need_d:
+                continue
+            _off_teams = sorted(
+                {str(_nurse_attr(nurses[i], "team_id"))
+                 for i in range(len(nurses))
+                 if _nurse_attr(nurses[i], "team_id") not in (None, "", 0)
+                 and str(_nurse_attr(nurses[i], "team_id")) not in _act_set}
+            )
+            _tgts = [{
+                "nurse_id": _nurse_attr(nurses[i], "nurse_id"),
+                "name": _nurse_attr(nurses[i], "name") or _nurse_attr(nurses[i], "nurse_id"),
+                "family": "daily_team",
+                "day": _d + 1,
+                "team_id": str(_nurse_attr(nurses[i], "team_id")),
+            } for i in range(len(nurses))
+                if _nurse_attr(nurses[i], "team_id") not in (None, "", 0)
+                and str(_nurse_attr(nurses[i], "team_id")) not in _act_set]
+            cert = (f"{_d + 1}일에 가동하도록 지정한 팀만으로는 근무를 못 채워요 "
+                    f"(필요 {_need_d}명, 그날 근무 가능 {len(_avail)}명) — "
+                    f"쉬게 한 팀({', '.join(_off_teams)}) 중 하나를 그날 다시 가동하면 돼요.")
+            return InfeasibilityExplanation(
+                "coverage_shortage", "daily_team", {}, cert,
+                {"day": _d + 1, "need": _need_d, "available": len(_avail),
+                 "inactive_teams": _off_teams}, targets=_tgts)
 
     # ── 0b) 다인 N-커버리지 결합 (조인트 frontier DP, bounded-treewidth) ──────────
     #   "각자는 되는데 같이는 야간을 못 채움" — 단일 상태DAG 로는 못 보는 결합. N-pool 이

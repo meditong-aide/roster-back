@@ -958,6 +958,39 @@ class DailyShift(Base):
     group = relationship("Group")
 
 
+class DailyTeamShift(Base):
+    """일자별 가동 팀 + 팀별 최소 인원.
+
+    teams.min_shift 는 월 전체 고정이라 "주중엔 4개 팀, 주말엔 4·3·2팀만" 을
+    표현할 수 없다. 이 테이블이 날짜마다 도는 팀을 지정한다.
+
+    읽는 쪽 계약(세 줄이 전부):
+        1) 그 날짜에 행이 하나라도 있으면 → 그 team_id 들만 가동. 나머지 팀
+           인원은 그날 강제 OFF.
+        2) 행이 하나도 없으면 → 미설정으로 보고 **전 팀 가동**(현행 유지).
+           ★ 이 규칙이 없으면 기존 그룹이 매일 전원 OFF 가 된다.
+           ★ 그래서 "그날 아무 팀도 안 돔"은 이 구조로 표현할 수 없다(행 0개가
+             미설정과 같아진다). 저장 API 가 빈 목록을 거부하는 이유다.
+        3) *_count 가 0 이면 인원 미지정 → 기존 min(need, 가동팀수) 규칙에 위임.
+           양수면 그 팀이 그날 그 시프트에 최소 그만큼 서야 한다.
+    """
+
+    __tablename__ = "daily_team_shift"
+
+    office_id = Column(VARCHAR(50), primary_key=True)
+    group_id = Column(VARCHAR(50), primary_key=True)
+    year = Column(SMALLINT, primary_key=True)
+    month = Column(TINYINT, primary_key=True)
+    day = Column(TINYINT, primary_key=True)
+    team_id = Column(INTEGER, primary_key=True)
+    d_count = Column(SMALLINT, nullable=False, default=0)
+    e_count = Column(SMALLINT, nullable=False, default=0)
+    n_count = Column(SMALLINT, nullable=False, default=0)
+    m_count = Column(SMALLINT, nullable=False, default=0)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+
 class DeletedNurseHistory(Base):
     """간호사 삭제 이력 테이블 – 삭제된 간호사의 기초 정보와 삭제 수행자를 기록"""
 

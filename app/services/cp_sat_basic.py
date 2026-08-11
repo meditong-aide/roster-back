@@ -621,6 +621,10 @@ class CPSATBasicEngine:
             team_handoff_policy_by_team=config_data.get("team_handoff_policy_by_team") or {},
             team_handoff_soft_fallback=bool(config_data.get("team_handoff_soft_fallback", True)),
             team_handoff_penalty_weight=int(config_data.get("team_handoff_penalty_weight", 80000) or 0),
+            # 일자별 가동 팀(daily_team_shift). ★ None 유지가 중요하다 — `or {}` 처럼
+            #   빈 값으로 바꾸면 '미설정(전 팀 가동)' 신호가 사라진다.
+            daily_active_teams_by_day=config_data.get("daily_active_teams_by_day"),
+            daily_team_min_by_day=config_data.get("daily_team_min_by_day"),
             # use_max_coverage 폐기 → min/max 범위 모델로 전환 (daily_shift_requirements_max_by_day)
             # off_placement_mode=0,
         )
@@ -2654,6 +2658,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         include_weekend_off_cells=True,
         weekend_within_active_range=False,
         fixed_non_off_cells=fixed_non_off_cells,
+        daily_active_teams_by_day=getattr(
+            rs.config, "daily_active_teams_by_day", None
+        ),
     )
     vacation_off_cells = set(partition["vacation_off_cells"])
     structural_off_cells = set(partition["structural_off_cells"])

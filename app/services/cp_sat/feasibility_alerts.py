@@ -189,6 +189,10 @@ def run_preflight_feasibility_alerts(
             join=join,
             leave=leave,
             fixed_non_off_cells=fixed_non_off_cells,
+            # 일자별 비가동 팀도 강제 OFF 다. 빼면 경보가 실제보다 여유 있게 나온다.
+            daily_active_teams_by_day=(config_dict or {}).get(
+                "daily_active_teams_by_day"
+            ),
         )
         structural_off_cells = set(partition["structural_off_cells"])
         vacation_off_cells = set(partition["vacation_off_cells"])

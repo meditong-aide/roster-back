@@ -178,6 +178,10 @@ def build_family_resolver(
 #   action   : "이 설정 바꾸기 [적용]" (관리자 조정 가능)
 #   tradeoff : "풀리지만 대가 X" 경고 후 선택 (품질·안전 규칙)
 #   advisory : auto-apply 없이 "확인하세요" (환자안전/데이터 — 함부로 안 낮춤)
+# 월 야간 횟수 정책 상한(간호사 1인당 15회). max_nig_per_month 는 병동 공통값이라
+# 한 명을 수용하려고 이 값을 넘기면 전 간호사의 야간 상한이 함께 올라간다.
+_MAX_NIGHT_POLICY_CAP = 15
+
 _FAMILY_KO = {
     "off_budget": "OFF 일수", "night_cap": "야간 상한", "monthly_limit": "월 야간 한도",
     "weekend_off": "주말 휴무", "2n2off": "야간 후 2일 휴식", "night_recovery": "야간 회복 휴무",
@@ -262,6 +266,30 @@ def cause_to_resolution_options(
                      "where_label_ko": "간호사 관리 > 근무 유형"}},
         ]
 
+    # ── 일자별 가동 팀: 그날 쉬게 한 팀을 되살리는 카드 ─────────────────────────
+    #   여기 걸린 사람들은 '설정을 바꿔야 할 대상'이 아니라 '그날 못 쓰게 된 인원'이다.
+    #   그래서 개인 설정을 건드리는 fix_all_personal 과 섞지 않고 따로 낸다.
+    dt = [t for t in targets if t.get("family") == "daily_team" and t.get("day")]
+    if dt:
+        day = int(dt[0]["day"])
+        teams = sorted({str(t.get("team_id")) for t in dt if t.get("team_id")})
+        names = ", ".join(str(t.get("name") or t.get("nurse_id")) for t in dt[:5])
+        more = f" 외 {len(dt) - 5}명" if len(dt) > 5 else ""
+        return [{
+            "option_id": f"cause:daily_team_reactivate:{day}",
+            "kind": "relax_constraint", "source": "cause", "verified": False,
+            "title_ko": f"{day}일에 팀 {', '.join(teams)} 다시 가동하고 만들기",
+            "trade_off_ko": (
+                f"{day}일 근무 인원이 모자라 못 만들었습니다. 쉬게 한 팀을 그날 다시 "
+                f"가동하면 {names}{more} 이(가) 근무할 수 있게 됩니다."),
+            "changes": [{"config_key": "daily_team_shift",
+                         "label_ko": f"{day}일 가동 팀",
+                         "from": "일부 팀 제외", "to": f"팀 {', '.join(teams)} 추가"}],
+            "daily_team_reactivate": [{"day": day, "team_ids": teams}],
+            "fix": {"mode": "manual", "where": "daily_team_shift",
+                    "where_label_ko": "근무표 만들기 > 일자별 가동 팀"},
+        }]
+
     ml = [t for t in targets
           if t.get("family") in ("monthly_limit", "night_cap")
           and t.get("nurse_id") and t.get("cap") is not None]
@@ -277,6 +305,18 @@ def cause_to_resolution_options(
         #   올려** 정당한 고-야간을 수용한다(night-short 병동의 올바른 레버). 일반(비야간전담)만 내린다.
         ml_no = [t for t in ml if t.get("is_night_only")]
         ml_reg = [t for t in ml if not t.get("is_night_only")]
+        # ★ 정책 상한(월 야간 15회) 가드. max_nig_per_month 는 **병동 공통값**이라
+        #   야간전담 한 명을 수용하려고 올리면 전 간호사의 야간 상한이 함께 오른다.
+        #   상한을 넘겨야 수용되는 요구라면 상향이 답이 아니라 그 개인 요구를 낮춰야
+        #   하므로, 일반(내리기) 경로로 넘긴다. ★ 분류 직후에 판단해야 한다 —
+        #   ml_reg 루프가 돈 뒤에 옮기면 그 사람만 카드에서 통째로 빠진다.
+        if ml_no:
+            _need_chk = max(int(t.get("current") or 0) for t in ml_no)
+            if _need_chk > _MAX_NIGHT_POLICY_CAP:
+                print(f"[MCS] 야간전담 월 야간 {_need_chk}회 요구 → 정책 상한 "
+                      f"{_MAX_NIGHT_POLICY_CAP}회 초과라 상향 대신 개인 한도 조정으로 안내")
+                ml_reg = ml_reg + ml_no
+                ml_no = []
         for t in ml_reg:
             nm = t.get("name") or t["nurse_id"]
             # n_max(상한)로 완화: 야간을 '정확히 N'이 아니라 '최대 N 까지'로 묶는다.
@@ -308,6 +348,11 @@ def cause_to_resolution_options(
                             "label_ko": f"{nm} 주말 휴무", "from": None, "to": "해제"})
         n_nurses = len({t["nurse_id"] for t in ml + wk})
         _trade = "해당 간호사들의 야간/주말 설정이 아래대로 바뀝니다."
+        # 주말 해제 대상은 '누가 풀리면 커버가 되는가'로 고른 **제안**이지, 누가 쉬어야
+        #   하는지에 대한 판단이 아니다. 그렇게 읽히면 수간호사가 검토 없이 적용한다.
+        if any(t.get("selection") == "suggested" for t in wk):
+            _trade += (" 주말 휴무 해제 대상은 필요 인원만큼 고른 제안입니다 — "
+                       "다른 간호사로 바꿔도 됩니다.")
         if ml_no:
             _nm0 = ml_no[0].get("name") or ml_no[0]["nurse_id"]
             _trade = (f"{_nm0} 등 야간전담이 필요한 야간을 서려면 '월 야간 상한'을 올려야 합니다. "

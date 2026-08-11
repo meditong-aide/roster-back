@@ -97,6 +97,25 @@ def add_team_min_constraints(
             return int((by_day[d] or {}).get(code, 0) or 0)
         return int(base_need.get(code, 0) or 0)
 
+    # ── 일자별 가동 팀 / 팀별 인원 (daily_team_shift) ──────────────────────────
+    #   daily_active[d] 가 None 이면 **미설정 → 그날 전 팀 가동**(현행 동작).
+    #   비가동 팀 인원은 off_policy 가 이미 강제 OFF 로 밀어놨으므로 여기서는
+    #   커버리지 카운트에서만 빼면 된다.
+    daily_active = getattr(cfg, "daily_active_teams_by_day", None)
+    daily_team_min = getattr(cfg, "daily_team_min_by_day", None)
+
+    def _active_teams_for(d: int) -> set[str] | None:
+        if not daily_active or d >= len(daily_active):
+            return None
+        v = daily_active[d]
+        return None if v is None else {str(t) for t in v}
+
+    def _explicit_min_for(d: int, tid: str, code: str) -> int:
+        """그날 그 팀에 사람이 직접 넣은 최소 인원. 0 = 미지정."""
+        if not daily_team_min or d >= len(daily_team_min):
+            return 0
+        return int(((daily_team_min[d] or {}).get(tid) or {}).get(code, 0) or 0)
+
     # 팀별 min(코드→명수) 정제 + team_min 이 걸리는 시프트 코드 집합
     team_min_clean: dict[str, dict[str, int]] = {}
     codes_with_min: set[str] = set()
@@ -108,6 +127,14 @@ def add_team_min_constraints(
             team_min_clean[tid] = tm
             codes_with_min.update(tm.keys())
 
+    # 일자별 지정에만 등장하는 코드도 커버 대상에 넣는다 — team_min_by_team 에
+    #   없다는 이유로 사람이 직접 넣은 인원이 무시되면 안 된다.
+    for _day_map in (daily_team_min or []):
+        for _mins in (_day_map or {}).values():
+            for _c in (_mins or {}):
+                if _c in shift_types and (_c != "M" or use_mid):
+                    codes_with_min.add(_c)
+
     # ── 핵심 규칙: (일, 시프트)마다 "서로 다른 팀"을 target=min(need, 팀수)개 커버 ──
     #   - need(자리 수) >= 팀수 : 모든 팀 커버 요구(평일 D=3, 3팀 → 3팀 전부 1명씩).
     #   - need < 팀수          : need 개 팀만 커버해도 충분(주말 D=2, 3팀 → 2팀). 남는 1팀 공백은 정상.
@@ -115,11 +142,17 @@ def add_team_min_constraints(
     #   미지정(team_id 없는) 인원은 팀 커버 카운트에서 빠지므로 자연히 잔여 자리(N/OFF)로 밀린다.
     #   present_t=1 ⟺ 팀 t 가 이 시프트에 min_t 명 이상 배치(자기 팀원으로). covered=Σ present_t.
     for d in range(rs.num_days):
+        _active_teams = _active_teams_for(d)
         for code in codes_with_min:
             s_idx = shift_types.index(code)
             present_vars = []
-            for tid, tm in team_min_clean.items():
-                min_t = int(tm.get(code, 0) or 0)
+            # team_min_clean 이 아니라 team_members 를 돈다 — 일자별 지정만 있고
+            #   teams.min_shift 가 없는 팀도 대상이어야 한다.
+            for tid in team_members:
+                if _active_teams is not None and tid not in _active_teams:
+                    continue  # 그날 안 도는 팀
+                _explicit = _explicit_min_for(d, tid, code)
+                min_t = _explicit or int((team_min_clean.get(tid) or {}).get(code, 0) or 0)
                 if min_t <= 0:
                     continue
                 active = [n for n in team_members[tid] if join[n] <= d <= leave[n]]
@@ -132,6 +165,19 @@ def add_team_min_constraints(
                 present = m.NewBoolVar(f"tmin_present_t{tid}_d{d}_s{s_idx}")
                 # present=1 → 이 팀이 이 시프트에 min_t 명 이상 배치. present=0 → 제약 없음.
                 m.Add(member_sum >= min_t * present)
+                if _explicit:
+                    # 사람이 그날 그 팀에 직접 넣은 인원은 '카운트 후보'가 아니라 '반드시'다.
+                    #   target=min(need,팀수) 에 맡기면 다른 팀이 대신 채워도 통과해 버린다.
+                    #   soft 모드에서는 슬랙으로 완화(기존 정책과 동일하게 페널티만 부과).
+                    if allow_soft:
+                        _ex_slack = m.NewIntVar(
+                            0, 1, f"tmin_explicit_slack_t{tid}_d{d}_s{s_idx}")
+                        m.Add(present + _ex_slack >= 1)
+                        cover_slacks.append(_ex_slack)
+                        if penalty_weight > 0:
+                            obj_terms.append(-penalty_weight * _ex_slack)
+                    else:
+                        m.Add(present == 1)
                 present_vars.append(present)
             num_teams = len(present_vars)
             if num_teams == 0:
@@ -166,6 +212,11 @@ def add_team_min_constraints(
     setattr(rs, "_team_min_cover_slacks", cover_slacks)
 
     mode = "soft" if allow_soft else "hard"
-    print(f"[TeamMin] mode={mode} teams={len(team_min_clean)} added={added_cnt} rule=min(need,num_teams)")
+    _daily_days = sum(1 for x in (daily_active or []) if x is not None)
+    _daily_note = f" daily_active_days={_daily_days}" if _daily_days else ""
+    print(
+        f"[TeamMin] mode={mode} teams={len(team_min_clean)} added={added_cnt} "
+        f"rule=min(need,num_teams){_daily_note}"
+    )
 
     return obj_terms

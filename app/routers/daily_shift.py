@@ -4,12 +4,16 @@ from sqlalchemy.orm import Session
 from db.client2 import get_db
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User as UserSchema
-from schemas.daily_shift_schema import DailyShiftReplace
+from schemas.daily_shift_schema import DailyShiftReplace, DailyTeamShiftReplace
 from services.group_access import resolve_effective_group
 from services.daily_shift_service import (
     get_or_init_month,
     replace_month_data,
     apply_bulk_to_days,
+)
+from services.daily_team_shift_service import (
+    get_month_teams,
+    replace_month_teams,
 )
 
 router = APIRouter(prefix="/daily-shift", tags=["daily-shift"])
@@ -99,3 +103,66 @@ async def put_month(
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"월 업데이트 실패: {e}")
+
+
+@router.get("/teams")
+async def get_month_active_teams(
+    office_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """일자별 가동 팀 조회.
+
+    - 반환 date[i].teams 가 **None 이면 미설정 = 전 팀 가동**(현행 동작),
+      리스트면 그 팀들만 가동한다(저장이 빈 목록을 거부하므로 항상 1개 이상).
+    - 팀별 *_count 가 0 이면 인원 미지정 → min(필요인원, 가동팀수) 규칙에 위임.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증 필요")
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+    office_id = current_user.office_id
+    try:
+        return get_month_teams(db, office_id, target_group_id, year, month)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"일자별 가동 팀 조회 실패: {e}")
+
+
+@router.put("/teams")
+async def put_month_active_teams(
+    body: DailyTeamShiftReplace,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """일자별 가동 팀 저장(부분 교체).
+
+    - body.days 에 **없는 날짜는 건드리지 않는다**. 특정 날짜를 미설정으로 되돌리려면
+      그 날짜를 teams=null 로 명시해야 한다.
+    - teams=[] 는 400. 저장하면 행 0개라 미설정과 구분이 안 되기 때문이다.
+    - 비가동 팀 인원은 그날 강제 휴무가 되므로, 인원이 없는 팀을 지정하면 생성이
+      실패할 수 있다. 막지는 않고 응답 warnings 로 알린다.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증 필요")
+    target_group_id = resolve_effective_group(db, current_user, body.group_id)
+    office_id = current_user.office_id
+    try:
+        return replace_month_teams(
+            db,
+            office_id=office_id,
+            group_id=target_group_id,
+            year=body.year,
+            month=body.month,
+            days=[d.model_dump() for d in body.days],
+        )
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"일자별 가동 팀 저장 실패: {e}")

@@ -134,3 +134,33 @@ class CalendarUpdateRequest(BaseModel):
     # d_count_max, e_count_max, n_count_max, m_count_max 키를 모두 수용 (후자는 선택).
     years: Dict[str, Dict[str, List[Dict[str, int]]]]
     comment: str | None = None  # 선택적 필드 추가
+
+
+class DailyTeamEntry(BaseModel):
+    """그날 그 팀의 최소 인원. 0 = 미지정(팀 수 규칙에 위임)."""
+
+    team_id: int
+    d_count: int = 0
+    e_count: int = 0
+    n_count: int = 0
+    m_count: int = 0
+
+
+class DailyTeamDay(BaseModel):
+    """하루치 가동 팀.
+
+    teams=None  미설정 → 전 팀 가동(현행 동작). 그날 설정을 지울 때도 이 값.
+    teams=[]    거부(400). 저장하면 행 0개라 미설정과 구분이 안 된다.
+    """
+
+    day: int
+    teams: Optional[List[DailyTeamEntry]] = None
+
+
+class DailyTeamShiftReplace(BaseModel):
+    """일자별 가동 팀 부분 저장. days 에 없는 날짜는 건드리지 않는다."""
+
+    group_id: str
+    year: int
+    month: int
+    days: List[DailyTeamDay] = Field(default_factory=list)

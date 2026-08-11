@@ -123,6 +123,7 @@ def build_off_partitions(
     join: list[int] | None = None,
     leave: list[int] | None = None,
     fixed_non_off_cells: set[tuple[int, int]] | None = None,
+    daily_active_teams_by_day: list[list[str] | None] | None = None,
 ) -> dict[str, Any]:
     vacation_off_cells: set[tuple[int, int]] = set(off_exception_vacation_cells or set())
     vacation_off_cells.update(fixed_vacation_off_cells)
@@ -153,6 +154,37 @@ def build_off_partitions(
                 if fixed_non_off_cells and (n_idx, d_idx) in fixed_non_off_cells:
                     continue
                 structural_off_cells.add((n_idx, d_idx))
+
+    # ── 일자별 가동 팀: 그날 안 도는 팀의 인원은 강제 OFF ──────────────────────
+    #   daily_active_teams_by_day[d] 가 **None 이면 미설정 → 전 팀 가동**(현행).
+    #   빈 리스트면 팀 배정자 전원이 OFF 가 된다. 저장 API 가 빈 목록을 거부하므로
+    #   정상 경로에서는 오지 않지만, 오더라도 그 의미대로 동작하게 둔다.
+    #   팀 미배정(team_id 없음) 인원은 대상이 아니다. team_min 커버리지 카운트에서
+    #   이미 빠져 있고, 여기서까지 빼면 그날 쓸 수 있는 인원이 사라진다.
+    #   고정근무가 걸린 셀은 주말휴무와 같은 정책으로 제외한다(고정 우선).
+    if daily_active_teams_by_day:
+        _team_off_cnt = 0
+        for d_idx in range(num_days):
+            if d_idx >= len(daily_active_teams_by_day):
+                break
+            active = daily_active_teams_by_day[d_idx]
+            if active is None:
+                continue
+            active_set = {str(t) for t in active}
+            for n_idx, nurse in enumerate(nurses):
+                tid = getattr(nurse, "team_id", None)
+                if tid in (None, "", 0):
+                    continue
+                if str(tid) in active_set:
+                    continue
+                if fixed_non_off_cells and (n_idx, d_idx) in fixed_non_off_cells:
+                    continue
+                if (n_idx, d_idx) in vacation_off_cells:
+                    continue
+                structural_off_cells.add((n_idx, d_idx))
+                _team_off_cnt += 1
+        if _team_off_cnt:
+            print(f"[OffPolicy][DailyTeam] 비가동 팀 강제 OFF 셀 {_team_off_cnt}개")
 
     natural_off_cells = {
         (n, d)

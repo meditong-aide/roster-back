@@ -116,6 +116,24 @@ def presolve_shortage_diagnosis(
     #   주말 커버리지 부족을 구조적으로 계산(누가·몇 명 풀어야 하는지). 월 capacity 는 전역
     #   off_days 로 이미 반영되므로 workdays_by 는 안 건드림(주말은 요일축에서만 뺀다).
     _wk_day_set = {d for d in range(days) if calendar.weekday(year, month, d + 1) >= 5}
+
+    # [관계 모델링] 일자별 가동 팀도 주말휴무와 같은 축이다 — 그날 안 도는 팀의 인원은
+    #   공급 0(강제OFF). 여기에 반영해야 max-flow 가 "그 팀을 뺐더니 이 시프트가 몇 명
+    #   모자란다"를 구조적으로 계산하고, blame·recommend_actions 까지 자동으로 흐른다.
+    #   daily_active_teams_by_day[d] 가 None 이면 미설정 → 전 팀 가동(제약 없음).
+    _daily_active = config_data.get("daily_active_teams_by_day")
+
+    def _team_off_on(day_idx: int, team_id: Any) -> bool:
+        """그날 이 팀이 비가동인가. 팀 미배정(None)은 대상 아님."""
+        if not _daily_active or day_idx >= len(_daily_active):
+            return False
+        active = _daily_active[day_idx]
+        if active is None:
+            return False
+        if team_id in (None, "", 0):
+            return False
+        return str(team_id) not in {str(t) for t in active}
+
     supplies: List[NurseSupply] = []
     workdays_by: Dict[str, int] = {}
     night_cap_by: Dict[str, int] = {}
@@ -125,9 +143,13 @@ def presolve_shortage_diagnosis(
         elig = _eligible(nu, use_mid)
         _is_wko = bool(nu.get("is_weekend_off"))
         _act = _active_day_set(nu, year, month, days)  # 부분월 가용(입퇴사)
-        # 공급 있는 날 = 활성일 AND (주말휴무자면 주말 제외). 나머지 날은 공급 0.
+        # 공급 있는 날 = 활성일 AND (주말휴무자면 주말 제외) AND (그날 팀이 가동).
+        #   나머지 날은 공급 0.
+        _tid = nu.get("team_id")
         _ebd = {d: (set(elig)
-                    if (d in _act and not (_is_wko and d in _wk_day_set))
+                    if (d in _act
+                        and not (_is_wko and d in _wk_day_set)
+                        and not _team_off_on(d, _tid))
                     else set())
                 for d in range(days)}
         supplies.append(NurseSupply(nurse_id=nid, grade=nu.get("grade"),
@@ -185,7 +207,19 @@ def presolve_shortage_diagnosis(
 
     # [관계 → 인원] 주말 요일별 부족의 최댓값 = 주말휴무를 풀어야 하는 최소 인원(각 해제가
     #   주말 매일 +1 공급). 조합 brute-force 없이 max-flow 로 '몇 명'을 직접 산출.
-    weekend_release_needed = max((per.day_shortage.get(d, 0) for d in _wk_day_set), default=0)
+    #   ★ 두 가지를 뺀다. 안 빼면 원인이 다른 부족을 주말휴무 탓으로 돌려 "주말 휴무를
+    #     푸세요" 라는 엉뚱한 안내가 나간다.
+    #     · 주말휴무자가 아예 없으면 풀 대상이 없다 → 0.
+    #     · 일자별 가동 팀이 지정된 날의 부족은 그 지정이 원인이다(별도 family).
+    _wko_exists = any(bool(nu.get("is_weekend_off")) for nu in nurses_data)
+    _wk_pure = {
+        d for d in _wk_day_set
+        if not (_daily_active and d < len(_daily_active) and _daily_active[d] is not None)
+    }
+    weekend_release_needed = (
+        max((per.day_shortage.get(d, 0) for d in _wk_pure), default=0)
+        if _wko_exists else 0
+    )
 
     # ── 개인 제약 압박 감지 (제약모순형 병목: 커버리지 max-flow 의 사각지대) ──
     #   커버리지 부족이 아니어도 개인 제약이 물리적 모순/과부하를 만들면 여기서 잡아
