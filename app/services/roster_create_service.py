@@ -733,38 +733,66 @@ def _off_cap_shortfall_cause(roster_system) -> tuple[dict, list] | None:
     if need <= cur:
         return None
 
+    cells = int(sf.get("off_required_cells") or 0)
+    n = int(sf.get("nurses_counted") or 0) or 1
+    # ★ 균등 휴무로는 맞출 수 없는 경우가 흔하다. 남는 셀이 인원으로 나누어떨어지지
+    #   않으면 내림은 부족, 올림은 초과다(예: 217/15 = 14.47 → 14 면 7 부족,
+    #   15 면 8 초과). off_days 는 전원 공통값이라 그 사이를 표현할 수 없다.
+    #   그래서 "휴무를 N 일로 올리세요"는 성립하지 않는 안내다 — 올려도 실패한다.
+    exact = (cells % n == 0)
+
     cert = (
-        f"근무를 요구 인원보다 더 배정하지 않는 설정(OFF 우선)이라 남는 인원이 모두 "
-        f"쉬어야 하는데, 월 휴무 일수가 모자라요 "
-        f"(1인당 {need}일 필요, 현재 {cur}일) — "
-        f"월 휴무를 {need}일 이상으로 올리거나, 일별 필요 인원을 늘리세요."
+        f"간호사 {n}명에 비해 하루 필요 인원이 적어 남는 인원이 많습니다. "
+        f"'근무를 요구보다 더 배정하지 않음(OFF 우선)' 설정이라 그 인원이 모두 쉬어야 "
+        f"하는데, 1인당 {cells / n:.1f}일 휴무가 필요합니다(현재 {cur}일). "
+        + (
+            "월 휴무는 전원 같은 값이라 이 수치를 정확히 맞출 수 없습니다 — "
+            if not exact else ""
+        )
+        + "하루 필요 인원을 늘리거나, 'OFF 우선' 설정을 꺼서 초과 배정을 허용하세요."
     )
     cause = {
         "classification": "policy_overconstraint",
         "top_family": "off_budget",
         "certificate": cert,
         "arithmetic": {
-            "off_needed_per_nurse": need,
+            "off_needed_per_nurse_exact": round(cells / n, 2),
             "configured_off_days": cur,
-            "off_required_cells": int(sf.get("off_required_cells") or 0),
-            "nurses_counted": int(sf.get("nurses_counted") or 0),
+            "off_required_cells": cells,
+            "nurses_counted": n,
+            "evenly_divisible": exact,
         },
     }
-    # ★ 기존 off_budget 카드는 "월 OFF 요구일수 낮추기"라 방향이 정반대다. 여기서는
-    #   올려야 하므로 전용 카드를 만든다.
-    cards = [{
-        "option_id": "cause:off_budget_raise",
-        "kind": "relax_constraint", "source": "cause", "verified": False,
-        "title_ko": f"월 휴무를 {need}일로 올리고 다시 만들기",
-        "trade_off_ko": (
-            f"지금 설정({cur}일)으로는 남는 인원이 쉴 자리가 없습니다. "
-            f"휴무를 늘리는 대신 일별 필요 인원을 늘리는 방법도 있습니다."),
-        "changes": [{"config_key": "off_days", "label_ko": "월 휴무 일수",
-                     "from": cur, "to": need}],
-        "apply": {"off_days": need},
-        "fix": {"mode": "auto_apply", "where": "config.off_days",
-                "where_label_ko": "근무표 설정 > 월 휴무 일수"},
-    }]
+    # ★ off_days 를 올리는 카드는 내지 않는다. 올려도 초과로 뒤집혀 다시 실패하고,
+    #   월 15일 휴무 같은 비현실적인 값을 사람에게 제시하게 된다.
+    #   실제로 푸는 레버는 둘뿐이다: 요구 인원을 늘리거나, OFF 우선을 끄거나.
+    cards = [
+        {
+            "option_id": "cause:off_first_disable",
+            "kind": "relax_constraint", "source": "cause", "verified": False,
+            "title_ko": "'OFF 우선'을 끄고 다시 만들기",
+            "trade_off_ko": (
+                "요구 인원보다 많이 배정할 수 있게 되어 남는 인원이 근무로 갑니다. "
+                "대신 일부 날짜에 필요 인원보다 많은 사람이 배치됩니다."),
+            "changes": [{"config_key": "off_first", "label_ko": "OFF 우선",
+                         "from": True, "to": False}],
+            "apply": {"off_first": False},
+            "fix": {"mode": "auto_apply", "where": "config.off_first",
+                    "where_label_ko": "근무표 설정 > OFF 우선"},
+        },
+        {
+            "option_id": "cause:raise_daily_requirement",
+            "kind": "relax_constraint", "source": "cause", "verified": False,
+            "title_ko": "하루 필요 인원 늘리기",
+            "trade_off_ko": (
+                f"지금은 {n}명이 하루 필요 인원을 나눠 맡고 있어 남는 인원이 "
+                f"{cells}셀입니다. 필요 인원을 늘리면 그만큼 근무로 흡수됩니다."),
+            "changes": [{"config_key": "daily_shift_requirements",
+                         "label_ko": "날짜별 필요 인원", "from": None, "to": "상향"}],
+            "fix": {"mode": "manual", "where": "daily_shift",
+                    "where_label_ko": "근무표 만들기 > 날짜별 근무 인원 설정"},
+        },
+    ]
     return cause, cards
 
 
@@ -6402,12 +6430,18 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                             if _sf_pair:
                                 _sf_cause, _sf_cards = _sf_pair
                                 unrecoverable["infeasibility"]["cause_explanation"] = _sf_cause
+                                # generic 문구("일부 조건을 완화해 최대한 맞춰 봤지만…")를
+                                #   그대로 두면 사용자는 원인을 못 본다.
+                                unrecoverable["infeasibility"]["summary_message_ko"] = (
+                                    _sf_cause["certificate"])
                                 unrecoverable["infeasibility"]["fix_suggestions_ko"] = [
                                     _sf_cause["certificate"]]
                                 unrecoverable["infeasibility"]["resolution_options"] = (
                                     _sf_cards
                                     + (unrecoverable["infeasibility"].get("resolution_options") or []))
-                                unrecoverable["infeasibility"]["_sole_option"] = _sf_cards[0]
+                                # 카드가 둘이다(OFF 우선 끄기 / 필요 인원 늘리기) — 어느 쪽을
+                                #   고를지는 병동 사정이라 하나로 줄이지 않는다.
+                                unrecoverable["infeasibility"]["_sole_option"] = list(_sf_cards)
                                 _skip_probe = True
                                 print(f"[Cause][OffCapShortfall] {_sf_cause['certificate']}")
                         # N축 branch-and-infer: 야간축 원인이면 proof-tree 설명 + 검증된 복구를
@@ -6472,7 +6506,15 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                         # arithmetic-증명 원인(개인 즉시모순·인원/셀 부족)은 확실 → config
                         # 카탈로그 전수탐색이 무의미. 게이트 무관 **기본 스킵**(377회 회피).
                         # 그 외(정책과제약·coupled)는 추정이라 AIDE_CAUSE_GATE=1 일 때만.
-                        if _cause.classification in ("personal_infeasible", "coverage_shortage"):
+                        if _cause.classification in (
+                            "personal_infeasible", "coverage_shortage",
+                            # ★ policy_overconstraint 도 스킵한다. OFF 예산 모순은 산술로
+                            #   확정된 것이라 완화 조합을 아무리 뒤져도 안 풀린다.
+                            #   실측: 9B 에서 463회 재solve 후 found=False, 427초 소요.
+                            #   그동안 AIDE_CAUSE_GATE=1 일 때만 스킵해서 기본값으로는
+                            #   매번 전수 탐색을 돌고 있었다.
+                            "policy_overconstraint",
+                        ):
                             _skip_probe = True
                             # cause 액션카드(_sole_option)가 있으면 그게 최종 → generic 설명카드 안 붙임.
                             if not unrecoverable["infeasibility"].get("_sole_option"):
