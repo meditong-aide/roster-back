@@ -378,3 +378,143 @@ async def update_leave_flags(
     return LeaveFlagRow(nurse_id=str(payload.nurse_id), name=getattr(nurse, "name", None),
                         **{k: cur.get(k) for k in
                            ("health_leave_eligible", "sleep_off_eligible", "pregnant")})
+
+
+# ──────────────────────────────────────────────────────────────
+# 수면OFF 주기 상태 (nurse_night_cycle)
+#   ★ 왜 별도 조회가 필요한가 — `schedule_entries.shift_id` 에는 'N' 만 있고
+#     N1~N15 연번이 없다. 근무표를 아무리 봐도 "누가 몇 번째 N 인지",
+#     "미부여분이 몇 건 이월됐는지" 를 알 수 없다. 그 상태는 이 테이블에만 있다.
+#   ★ 특히 `pending_sleep`(이월 대기)은 **이번 달 표 어디에도 안 나온다.**
+#     다음 달에 갑자기 나타나므로, 안 보여주면 운영자가 원인을 되짚을 수 없다.
+#   설계: docs/leave_auto_assignment_design.md §5.2 · §6 Step4
+# ──────────────────────────────────────────────────────────────
+class NightCycleRow(BaseModel):
+    nurse_id: str
+    name: Optional[str] = None
+    #: 그 달 마지막 N 의 연번 = 다음 달 시작점. 앵커가 없으면 None.
+    seq_at_end: Optional[int] = None
+    #: 자리를 못 찾아 다음 달로 넘어간 수면OFF 수. 이게 "대기 건수" 다.
+    pending_sleep: Optional[int] = None
+    #: 그 달 실제 부여 횟수(보통 0 또는 1).
+    sleep_off_count: Optional[int] = None
+
+
+class NightCycleResult(BaseModel):
+    group_id: str
+    year: int
+    month: int
+    #: 수면OFF 주기(연속 N 몇 회에 1건). 그룹 설정에서 해석한 값.
+    cycle: Optional[int] = None
+    #: pending_sleep 합계 — 화면 상단 요약용.
+    pending_total: int = 0
+    rows: list[NightCycleRow]
+
+
+@router.get("/night-cycle", response_model=NightCycleResult)
+async def get_night_cycle(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """그룹 전원의 수면OFF 주기 상태를 대상월 기준으로 반환한다.
+
+    앵커 행이 없는 간호사는 세 값이 모두 None 으로 나간다 — "0" 과 구분해야 한다.
+    None 은 "그 달 마감본이 없거나 아직 계산 전", 0 은 "계산했고 대기가 없음" 이다.
+    """
+    from db.models import NurseNightCycle
+    from services.leave.night_cycle_service import resolve_cycle
+
+    gid = group_id or getattr(current_user, "group_id", None)
+    if not gid:
+        raise HTTPException(status_code=400, detail="group_id 가 필요합니다")
+    assert_caller_can_access_group(db, current_user, gid)
+
+    nurses = db.query(Nurse).filter(Nurse.group_id == gid, Nurse.active == True).all()  # noqa: E712
+    if not nurses:
+        return NightCycleResult(group_id=gid, year=year, month=month, rows=[])
+
+    anchors = {
+        str(r.nurse_id): r
+        for r in db.query(NurseNightCycle).filter(
+            NurseNightCycle.group_id == gid,
+            NurseNightCycle.year == int(year),
+            NurseNightCycle.month == int(month),
+        ).all()
+    }
+    rows = [
+        NightCycleRow(
+            nurse_id=str(n.nurse_id),
+            name=getattr(n, "name", None),
+            seq_at_end=getattr(anchors.get(str(n.nurse_id)), "seq_at_end", None),
+            pending_sleep=getattr(anchors.get(str(n.nurse_id)), "pending_sleep", None),
+            sleep_off_count=getattr(anchors.get(str(n.nurse_id)), "sleep_off_count", None),
+        )
+        for n in nurses
+    ]
+    try:
+        cycle = resolve_cycle(db, gid)
+    except Exception:
+        cycle = None
+    return NightCycleResult(
+        group_id=gid, year=year, month=month, cycle=cycle,
+        pending_total=sum(int(r.pending_sleep or 0) for r in rows),
+        rows=rows,
+    )
+
+
+class NightCycleRebuildRequest(BaseModel):
+    year: int
+    month: int
+    group_id: Optional[str] = None
+
+
+@router.post("/night-cycle/rebuild", response_model=NightCycleResult)
+async def rebuild_night_cycle(
+    payload: NightCycleRebuildRequest,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """(year, month) **부터 이후 모든 마감본**의 앵커를 다시 계산한다.
+
+    ★ 앵커는 전월 값을 이어받으므로, 과거 달이 바뀌면 이후가 전부 틀어진다.
+      그래서 그 달만이 아니라 **연쇄로** 재계산한다(`rebuild_night_cycle_from`).
+    ★ 수동 편집 EP 는 두지 않는다 — `pending_sleep` 은 마감본에서 계산되는 값이라,
+      손으로 고치면 다음 재계산에서 덮여 사라진다. 틀렸으면 재계산이 정답이다.
+
+    ★ 조회보다 권한을 높인다. 이 호출은 그룹 전체 앵커를 다시 쓰고 고아 행을
+      지운다 — 같은 파일의 `POST /leave-flags`(간호사 1명 플래그)와 파급이 다르다.
+    """
+    from services.group_access import caller_is_head_nurse
+    from services.leave.night_cycle_service import rebuild_night_cycle_from
+
+    gid = payload.group_id or getattr(current_user, "group_id", None)
+    if not gid:
+        raise HTTPException(status_code=400, detail="group_id 가 필요합니다")
+    if not (caller_is_head_nurse(db, current_user)
+            or getattr(current_user, "is_master_admin", False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    assert_caller_can_access_group(db, current_user, gid)
+    # ★ 범위 검증 — rebuild 는 (year, month) 이상을 튜플 비교로 훑고 고아 앵커를
+    #   지운다. 0·13 같은 값이 들어오면 의도치 않은 범위가 재계산·삭제된다.
+    if not (1 <= int(payload.month) <= 12) or not (2000 <= int(payload.year) <= 2100):
+        raise HTTPException(status_code=400, detail="year/month 범위가 올바르지 않습니다")
+
+    try:
+        touched = rebuild_night_cycle_from(db, gid, int(payload.year), int(payload.month))
+        # ★ 서비스는 flush 만 한다(여러 달을 순서대로 돌리려고). 커밋은 호출자 책임 —
+        #   roster.py 의 기존 호출부도 직후에 db.commit() 한다. 빠뜨리면 응답은
+        #   재계산 값을 보여주는데(같은 세션) DB 는 그대로 폐기된다.
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"수면OFF 앵커 재계산 실패: {exc}") from exc
+
+    print(f"[NightCycle] 앵커 재계산: group={gid} {payload.year}-{payload.month:02d} 이후 "
+          f"{touched}행")
+    return await get_night_cycle(payload.year, payload.month, gid, current_user, db)
