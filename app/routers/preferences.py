@@ -72,6 +72,14 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
 
     **캘린더로 찍은 항목이 우선**이다. 같은 날짜가 겹치면 분석 결과를 버린다 —
     사용자가 직접 고른 것이 문장 해석보다 확실하다.
+
+    ★★ **단, 극성이 반대면 문장이 이긴다.**
+      `wanted_entries` 로 실려오는 캘린더 상태는 "이번에 찍은 것" 이 아니라
+      **이전에 저장돼 다시 실려온 것**이다. 그래서 날짜만 보고 버리면
+      "N 금지" 뒤에 "N 주세요" 라고 말해도 옛 기피가 이겨 **문장이 통째로 무시된다**
+      (실측: 분석은 want 8건을 정확히 뽑았는데 "8건 중 0건 반영"으로 전량 폐기).
+      방금 한 말이 이전 상태보다 최신 의사이므로, 요청↔금지가 뒤집히는 경우에는
+      분석 결과로 교체한다. 같은 극성이면(코드만 다름) 기존대로 캘린더 우선이다.
     분석이 실패하면 저장은 그대로 진행하되 **상태를 돌려준다**(호출자가 응답에 실어
     화면이 "문장 해석에 실패했습니다" 를 띄우게). 조용히 넘기면 사용자는 저장된 줄
     안다. 성공이면 None.
@@ -97,17 +105,27 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
     if not analyzed:
         return None
     picked = list(req.wanted_entries or [])
-    taken = {e.date.isoformat() if hasattr(e.date, "isoformat") else str(e.date)
-             for e in picked}
-    merged = list(picked)
+
+    def _key(d) -> str:
+        return d.isoformat() if hasattr(d, "isoformat") else str(d)
+
+    by_date = {_key(e.date): e for e in picked}
+    added = flipped = 0
     for item in analyzed:
-        if item["date"] in taken:
-            continue
-        taken.add(item["date"])
-        merged.append(WantedEntryItem(**item))
-    req.wanted_entries = merged
+        existing = by_date.get(item["date"])
+        if existing is None:
+            by_date[item["date"]] = WantedEntryItem(**item)
+            added += 1
+        elif getattr(existing, "intent", "wanted") != item.get("intent", "wanted"):
+            # 요청↔금지가 뒤집힌 경우 — 방금 한 말이 이전 저장분보다 최신 의사다.
+            by_date[item["date"]] = WantedEntryItem(**item)
+            flipped += 1
+        # 같은 극성이면 캘린더(직접 선택) 우선 — 기존 규칙 유지.
+
+    req.wanted_entries = [by_date[k] for k in sorted(by_date)]
     print(f"[preferences] 자연어 분석 병합: {len(analyzed)}건 중 "
-          f"{len(merged) - len(picked)}건 반영 (캘린더 {len(picked)}건 우선)")
+          f"신규 {added}건 · 극성전환 {flipped}건 반영 "
+          f"(캘린더 {len(picked)}건 중 {len(picked) - flipped}건 유지)")
     return None
 
 

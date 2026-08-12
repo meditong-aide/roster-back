@@ -14,6 +14,7 @@ from schemas.roster_schema import (
     WantedConfigCreate,
     WantedConfig as WantedConfigSchema,
     FixedWantedCreate,
+    AdjustmentApplyAllRequest,
     AdjustmentResponse,
     FixedWantedListResponse,
     FixedWantedEntryResponse,
@@ -54,6 +55,7 @@ from services.wanted_service import (
     get_fixed_wanted_for_roster_service,
     get_fixed_wanted_entries_service,
     reset_fixed_wanted_service,
+    set_adjustment_applied_service,
     get_shift_requests_service,
 )
 
@@ -910,6 +912,47 @@ async def reset_fixed_wanted(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
+
+
+@router.post("/adjustment/{year}/{month}/apply-all", response_model=AdjustmentResponse)
+async def set_adjustment_applied(
+    year: int,
+    month: int,
+    req: AdjustmentApplyAllRequest,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """조정판 '원티드 전체 반영/미반영' API
+
+    솔버 주입 채널 **둘 다** 를 한 번에 켜고 끈다.
+    - FixedWantedEntry.is_applied  → fixed_cells (하드 고정)
+    - BannedWantedEntry.is_applied → initial_forbidden → X==0   (source='hn' 스코프)
+
+    ★ 클라이언트가 채널별로 따로 끄던 것을 서버로 옮긴 것이다. 한쪽만 꺼지면
+      "전체 미반영" 인데 기피는 하드로 살아 있는 상태가 된다.
+    ★ 반환은 `/reset` 과 동일한 AdjustmentResponse — 호출 측이 재조회 없이
+      캐시를 그대로 갱신할 수 있다.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+
+    try:
+        return set_adjustment_applied_service(
+            db, target_group_id, year, month, req.applied
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"원티드 전체 {'반영' if req.applied else '미반영'} 실패: {str(e)}",
+        )
 
 
 @router.get("/fixed/{year}/{month}")

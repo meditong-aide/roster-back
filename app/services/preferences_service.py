@@ -3,10 +3,11 @@
 - DB 쿼리, 데이터 가공 등 라우터에서 분리
 - 모든 함수는 한글 docstring, 한글 print/logging, PEP8 스타일 적용
 """
+import calendar
 import json
 import pprint
 from sqlalchemy.orm import Session
-from sqlalchemy import String, cast, extract, inspect as sa_inspect
+from sqlalchemy import String, and_, cast, extract, inspect as sa_inspect, or_
 from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted, WantedMonthlyMemo
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
@@ -226,6 +227,16 @@ def _normalize_wanted_entries(entries, year: int, month: int, allowed_shift_ids:
 # ── 기피근무(avoid) — banned_wanted_entries 재사용 ─────────────────────────
 # 저장소·솔버 하드제약(initial_constraints.forbidden → X==0)을 금지 원티드와 공유한다.
 # 구분은 source='nurse'. HN 조정판 저장/리셋은 source='hn' 만 건드리므로 서로 안 지운다.
+#
+# ★★ 간호사 기피는 **요청**이고, 확정 선택자는 수간호사다.
+#   source='nurse' 인 동안에는 **생성에 반영되지 않는다**
+#   (roster_create_service._load_banned_wanted 가 hn 스코프만 읽는다).
+#   수간호사가 조정판에서 저장하면 그 셀이 source='hn' 으로 **승격**되고,
+#   그때부터 솔버에 걸린다. 즉 "조정판 저장" 이 확정 행위다.
+#   ★ 게이트를 is_applied 가 아니라 source 에 건 이유 — 조정판은 출처 구분 없이
+#     전부 노출하고 프론트는 is_applied 로 X 아이콘만 그린다. is_applied 로 막으면
+#     "간호사가 새로 낸 것" 과 "수간호사가 끈 것" 이 같은 X 로 보여 구분이 안 된다.
+#   ★ 승격 후에는 간호사가 그 셀을 못 고친다(hn_cells 스킵 → avoid_blocked 통지).
 
 
 _AVOID_TABLE_READY = False
@@ -325,6 +336,11 @@ def _replace_nurse_avoid_entries(
 ) -> list:
     """해당 간호사/월의 기피근무를 전량 교체한다(source='nurse' 스코프).
 
+    ★ 여기서 만든 행은 아직 **미확정**이다(source='nurse'). 생성에 반영되려면
+      수간호사가 조정판에서 저장해 hn 으로 승격시켜야 한다. is_applied 는 조정판의
+      표시/토글 축이므로 True 로 둔다 — False 로 넣으면 수간호사 화면에서
+      "간호사가 새로 낸 것" 이 "내가 끈 것" 과 같은 X 로 보인다.
+
     ★ 한 셀에 hn 행과 nurse 행이 **공존하지 못하게** 막는다. 조정판은 셀당 한 건만
       그리므로(`wanted_service._banned_by_date` 가 최신 id 하나만 남김), 공존하면
       둘 중 하나는 화면에 안 뜨는데 솔버는 둘 다 하드로 건다(컨버터가 코드 합집합).
@@ -353,6 +369,8 @@ def _replace_nurse_avoid_entries(
 
     # ── 사전 점검: 저장 후 상태로 본다 ──────────────────────────────────────
     # 이번 요청분만 보면 기존 3일 구간에 하루 붙이는 경우를 놓친다. 삭제 전에 본다.
+    # ★ 미확정(승격 전)이라도 센다. 어차피 승격되면 걸릴 조합이라, 여기서 안 막으면
+    #   수간호사가 저장을 누르는 순간 422 가 터지고 "누가 뭘 냈길래" 를 되짚어야 한다.
     post_state = {
         r.shift_date: [str(c).strip().upper() for c in (r.banned_shift_ids or [])]
         for r in hn_rows if r.is_applied
@@ -404,6 +422,7 @@ def _replace_nurse_avoid_entries(
             nurse_id=nurse_id,
             shift_date=entry["date"],
             banned_shift_ids=[entry["main_code"]],
+            # 조정판의 표시/토글 축. 확정 여부는 source 가 가른다(모듈 상단 주석).
             is_applied=True,
             source=BANNED_SOURCE_NURSE,
             reason=entry["comment"] or None,
@@ -419,9 +438,19 @@ def _replace_nurse_avoid_entries(
 def _load_nurse_avoid_entries(
     db: Session, nurse_id: str, group_id: str, year: int, month: int
 ) -> list[dict]:
-    """저장된 기피근무를 wanted_entries 형태로 되돌린다. 테이블 미생성이면 빈 목록."""
+    """저장된 기피근무를 wanted_entries 형태로 되돌린다. 테이블 미생성이면 빈 목록.
+
+    ★ **승격분(source='hn' 이지만 본인이 낸 것)도 함께 읽는다.** 수간호사가 조정판에서
+      저장하면 그 셀은 hn 으로 바뀌는데, nurse 스코프만 읽으면 간호사 화면에서
+      자기가 낸 기피가 **통째로 사라진다**(지운 적 없는데 없어진 것으로 보인다).
+      최초 작성자는 `created_by` 에 남으므로 그걸로 되찾는다.
+
+    ★ `approved` 를 함께 싣는다 — 승격 전에는 생성에 반영되지 않으므로,
+      이걸 안 내려주면 화면엔 "반영됨"으로 보이는데 근무표에는 안 걸려
+      나중에 어긋난 이유를 아무도 못 찾는다(선호에는 없는 축이라 avoid 에만 붙인다).
+    """
     from db.models import BannedWantedEntry
-    from services.wanted_service import BANNED_SOURCE_NURSE, banned_source_filter
+    from services.wanted_service import BANNED_SOURCE_HN, BANNED_SOURCE_NURSE, banned_source_filter
 
     if not _avoid_storage_ready(db):
         return []
@@ -431,7 +460,12 @@ def _load_nurse_avoid_entries(
         BannedWantedEntry.year == year,
         BannedWantedEntry.month == month,
         BannedWantedEntry.nurse_id == nurse_id,
-        banned_source_filter(BANNED_SOURCE_NURSE),
+        or_(
+            banned_source_filter(BANNED_SOURCE_NURSE),
+            # 승격분 — 수간호사가 확정한 내 기피. created_by 로만 가려낸다.
+            and_(banned_source_filter(BANNED_SOURCE_HN),
+                 BannedWantedEntry.created_by == nurse_id),
+        ),
     ).all()
 
     entries: list[dict] = []
@@ -448,6 +482,12 @@ def _load_nurse_avoid_entries(
                 "shift_id": str(code),
                 "intent": "avoid",
                 "comment": row.reason or "",
+                #: 근무표에 실제로 걸리는 상태인가. 조정판 저장으로 hn 승격되고
+                #: 적용까지 켜져 있어야 True — 승격됐어도 수간호사가 껐으면(반려) False.
+                "approved": (
+                    str(row.source or BANNED_SOURCE_HN) == BANNED_SOURCE_HN
+                    and bool(row.is_applied)
+                ),
             })
     return entries
 
@@ -464,24 +504,84 @@ def _assert_off_limit(entries: list[dict], off_shift_ids: set, max_requests) -> 
         )
 
 
-def _acquire_draft_request(db: Session, nurse_id: str, month_str: str, group_id: str):
-    """미제출 draft WantedRequest 를 확보한다. 없으면 새로 만든다.
+#: (간호사, 월) 당 보관할 미제출 draft 수. 초과분은 오래된 것부터 지운다.
+#: 발화마다 스냅샷을 남기면 draft 가 계속 쌓이므로 상한이 필요하다.
+_MAX_DRAFT_HISTORY = 20
 
-    wanted_requests.request_id 는 IDENTITY 가 아니고 복합 PK 라 SQLAlchemy 가
-    자동 채번하지 않는다. 기존 채번기(_next_request_id)를 그대로 쓴다.
+
+def _prune_draft_history(db: Session, nurse_id: str, month_str: str) -> int:
+    """미제출 draft 가 상한을 넘으면 오래된 것부터 자식 행까지 지운다.
+
+    ★ `request_id` 는 (간호사, 월) 스코프로 채번된다 — 다른 달에 같은 번호가 있다.
+      그래서 자식 행을 지울 때 **반드시 월로도 좁힌다.** (nurse_id, request_id) 만
+      보면 다른 달 데이터가 같이 지워진다.
     """
-    draft = (
+    drafts = (
         db.query(WantedRequest)
         .filter(
             WantedRequest.nurse_id == nurse_id,
             WantedRequest.month == month_str,
             WantedRequest.is_submitted == False,
         )
-        .order_by(WantedRequest.created_at.desc())
-        .first()
+        .order_by(WantedRequest.request_id.desc())
+        .all()
     )
-    if draft is not None:
-        return draft
+    stale = drafts[_MAX_DRAFT_HISTORY:]
+    if not stale:
+        return 0
+
+    ids = [d.request_id for d in stale]
+    year, month = int(month_str[:4]), int(month_str[5:7])
+    start = date(year, month, 1)
+    end = date(year, month, calendar.monthrange(year, month)[1])
+    db.query(NurseShiftRequest).filter(
+        NurseShiftRequest.nurse_id == nurse_id,
+        NurseShiftRequest.request_id.in_(ids),
+        NurseShiftRequest.shift_date >= start,
+        NurseShiftRequest.shift_date <= end,
+    ).delete(synchronize_session=False)
+    db.query(NursePairRequest).filter(
+        NursePairRequest.nurse_id == nurse_id,
+        NursePairRequest.request_id.in_(ids),
+        NursePairRequest.month == month_str,
+    ).delete(synchronize_session=False)
+    for d in stale:
+        db.delete(d)
+    print(f"[wanted_entries] draft 이력 정리: {len(stale)}건 삭제 "
+          f"(상한 {_MAX_DRAFT_HISTORY})")
+    return len(stale)
+
+
+def _acquire_draft_request(
+    db: Session, nurse_id: str, month_str: str, group_id: str,
+    *, new_snapshot: bool = False,
+):
+    """미제출 draft WantedRequest 를 확보한다. 없으면 새로 만든다.
+
+    wanted_requests.request_id 는 IDENTITY 가 아니고 복합 PK 라 SQLAlchemy 가
+    자동 채번하지 않는다. 기존 채번기(_next_request_id)를 그대로 쓴다.
+
+    ★ `new_snapshot=True` 면 기존 draft 를 재사용하지 않고 **새 request_id** 를 만든다.
+      자연어 발화마다 스냅샷을 남기기 위한 것이다(예전 `/wanted/invoke` 동작).
+      `/preferences` 로 경로가 합쳐지면서 draft 를 재사용하게 됐고, 그 결과
+      **발화 이력이 사라졌다.** 다만 캘린더 클릭 저장(디바운스)까지 새로 만들면
+      행이 폭증하므로, 호출자가 **자연어가 실려온 경우에만** 켠다.
+      이전 분을 복사할 필요는 없다 — `/preferences` 는 replace-all 계약이라
+      페이로드가 이미 그 달 전체 상태다.
+    """
+    if not new_snapshot:
+        draft = (
+            db.query(WantedRequest)
+            .filter(
+                WantedRequest.nurse_id == nurse_id,
+                WantedRequest.month == month_str,
+                WantedRequest.is_submitted == False,
+            )
+            .order_by(WantedRequest.created_at.desc())
+            .first()
+        )
+        if draft is not None:
+            return draft
 
     from services.wanted_service import _next_request_id
 
@@ -496,6 +596,8 @@ def _acquire_draft_request(db: Session, nurse_id: str, month_str: str, group_id:
     )
     db.add(draft)
     db.flush()
+    if new_snapshot:
+        _prune_draft_history(db, nurse_id, month_str)
     return draft
 
 
@@ -608,7 +710,13 @@ def save_wanted_entries_service(
             code="avoid_storage_unavailable",
         )
 
-    draft = _acquire_draft_request(db, nurse_id, month_str, group_id)
+    # ★ 자연어가 실려온 저장 = **발화 1건**이므로 새 request_id 로 스냅샷을 남긴다.
+    #   캘린더만 조작한 저장(디바운스로 자주 들어온다)은 기존 draft 를 재사용한다 —
+    #   안 그러면 클릭 한 번마다 draft 가 쌓인다.
+    _utterance = (getattr(req, "request", None) or "").strip()
+    draft = _acquire_draft_request(
+        db, nurse_id, month_str, group_id, new_snapshot=bool(_utterance)
+    )
     # 자연어 원문 보존 — 화면 입력창에 다시 그려지는 값이다(`preference_data.request`).
     # 예전에는 `/wanted/invoke` 가 채웠는데, 그 호출을 없애고 저장 경로로 합치면서
     # 여기서 갱신하지 않으면 **새로 쓴 문장이 저장돼도 옛 문장이 계속 보인다**
@@ -627,6 +735,22 @@ def save_wanted_entries_service(
         )
     elif avoid_ready:
         print("[wanted_entries] manages_avoid=False — 기피근무 보존(손대지 않음)")
+
+    # ── 같은 날짜에 선호와 기피가 공존하지 못하게 한다 ──────────────────────
+    # ★ 한 날짜는 요청이거나 금지이거나 **하나**다. `_normalize_wanted_entries` 가
+    #   intent 를 안 보고 날짜만으로 중복을 막으므로(duplicate_date), 둘이 남으면
+    #   다음 저장이 422 로 통째 실패한다. 솔버 관점에서도 기피는 하드,
+    #   선호는 소프트라 하드가 이겨 "요청이 안 먹는" 것으로 보인다.
+    # ★ manages_avoid=False 경로가 특히 위험하다 — 선호만 교체되고 기피는 그대로
+    #   남는다. 그래서 여기서 **저장된 선호 날짜의 기피를 지운다.**
+    #   (manages_avoid=True 면 위 replace 가 이미 payload 기준으로 맞춰 놓아
+    #    이 정리는 대개 no-op 이다.)
+    conflict_resolved = {"cleared": [], "blocked_by_hn": []}
+    if avoid_ready:
+        from services.wanted_service import _clear_nurse_avoid_on_wanted
+        conflict_resolved = _clear_nurse_avoid_on_wanted(
+            db, nurse_id, group_id, year, month, draft.request_id, commit=False
+        )
     if not is_draft:
         draft.is_submitted = True
         draft.submitted_at = datetime.now()
@@ -647,6 +771,20 @@ def save_wanted_entries_service(
             "dates": [d.isoformat() for d in avoid_blocked],
             "message": "수간호사가 이미 지정한 날짜라 피하고 싶은 근무로 반영하지 "
                        "못했습니다.",
+        }
+    # 같은 날짜 상충 해소 결과 — 같은 이유로 조용히 넘기지 않는다.
+    if isinstance(result, dict) and conflict_resolved["cleared"]:
+        result["avoid_cleared"] = {
+            "dates": [c["date"] for c in conflict_resolved["cleared"]],
+            "message": "같은 날짜에 희망 근무를 신청해, 기존에 피하고 싶던 근무를 "
+                       "해제했습니다.",
+        }
+    if isinstance(result, dict) and conflict_resolved["blocked_by_hn"]:
+        # 선호는 저장된다. 다만 수간호사 확정 기피가 하드 제약이라 근무표에는 안 걸린다.
+        result["wanted_blocked_by_hn"] = {
+            "dates": [c["date"] for c in conflict_resolved["blocked_by_hn"]],
+            "message": "수간호사가 피하고 싶은 근무로 확정한 날짜입니다. 신청은 "
+                       "저장했지만 근무표에는 반영되지 않습니다.",
         }
     return result
 
@@ -1130,7 +1268,17 @@ def get_latest_preference_service(
         }
         for s in shift_rows
     ]
-    wanted_entries += _load_nurse_avoid_entries(db, nurse_id, group_id, year, month)
+    # ★ 같은 날짜에 선호가 있으면 기피는 싣지 않는다.
+    #   `_normalize_wanted_entries` 가 intent 를 안 보고 **날짜만으로** 중복을 막으므로,
+    #   둘을 함께 내리면 프론트가 그대로 되보낼 때 `duplicate_date` 422 로 저장이
+    #   통째 실패한다. 저장 경로가 nurse 기피는 지우지만, **수간호사 확정(hn) 기피**는
+    #   남겨 두기 때문에 이 조합이 실제로 생긴다.
+    #   기피 자체는 DB 에 살아 있고 솔버에도 계속 걸린다 — 화면 표시만 양보한다.
+    _wanted_dates = {e["date"] for e in wanted_entries}
+    wanted_entries += [
+        a for a in _load_nurse_avoid_entries(db, nurse_id, group_id, year, month)
+        if a["date"] not in _wanted_dates
+    ]
     wanted_entries.sort(key=lambda e: e["date"])
 
     # 7️⃣ 최종 JSON 구성 (Front 기대 형식)

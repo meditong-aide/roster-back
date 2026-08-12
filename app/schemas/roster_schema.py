@@ -985,6 +985,21 @@ class FixedWantedCreate(BaseModel):
     banned_entries: Optional[List[BannedWantedEntryCreate]] = None
 
 
+class AdjustmentApplyAllRequest(BaseModel):
+    """조정판 '원티드 전체 반영/미반영' 요청.
+
+    ★ 채널을 나누지 않는다 — 확정 원티드와 기피는 **항상 같이** 켜지고 꺼진다.
+      한쪽만 끄면 "전체 미반영" 인데 기피는 하드 제약으로 살아 있는 상태가 된다.
+    """
+
+    applied: bool = Field(
+        description=(
+            "True=전체 반영, False=전체 미반영. "
+            "확정 원티드(fixed_cells)와 기피(initial_forbidden)에 동시에 적용된다."
+        ),
+    )
+
+
 class FixedWantedEntryResponse(BaseModel):
     """확정 원티드 항목"""
 
@@ -1079,6 +1094,9 @@ class AdjustmentResponse(BaseModel):
     nurses: List[AdjustmentNurse]
     has_fixed_wanted: bool = False  # 저장된 확정 원티드 존재 여부
     has_banned_wanted: bool = False  # 저장된 금지 원티드 존재 여부
+    # 비차단 통지. 조회에서는 비어 있고, '전체 반영'(apply-all) 에서 채워진다 —
+    # 일괄로 켠 결과가 강제휴무 연속 상한을 넘으면 여기로 알린다(막지는 않는다).
+    warnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class FixedWantedListResponse(BaseModel):
