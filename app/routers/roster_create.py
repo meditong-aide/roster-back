@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from db.client2 import get_db
 from db.models import RosterConfig
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest, RosterConfigCreate
 from services.roster_create_service import (
@@ -153,7 +153,7 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
 async def roster_create_async(
     req: RosterRequest,
     request: Request,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     _db: Session = Depends(get_db),
     wait_for_result: bool = False,
 ):
@@ -270,7 +270,7 @@ async def roster_create_async(
 @router.post("/roster_create/generate")
 async def generate_roster_endpoint(
     req: RosterRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 
 ):
@@ -321,7 +321,7 @@ class ApplyResolutionRequest(BaseModel):
 @router.post("/roster_create/apply-resolution")
 async def apply_resolution_endpoint(
     req: ApplyResolutionRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """선택한 해결 옵션(설정 delta)을 **이번 생성에만 transient 적용**해 재생성한다.
@@ -413,7 +413,7 @@ async def apply_resolution_endpoint(
 @router.post("/roster/request")
 async def request_schedule(
     req: RosterRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """

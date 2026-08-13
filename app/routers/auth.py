@@ -322,6 +322,32 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         original_group_id=original_group_id,
     )
 
+
+async def require_current_user(
+    current_user: Optional[UserSchema] = Depends(get_current_user_from_cookie),
+) -> UserSchema:
+    """로그인이 반드시 필요한 엔드포인트용 — 미인증이면 401.
+
+    ★ `get_current_user_from_cookie` 는 토큰이 없거나 만료·무효일 때 **401 을 던지지 않고
+      `None` 을 돌려준다**(익명 허용 경로가 있어서다). 그 None 을 가드 없이
+      `current_user.account_id` 처럼 역참조하면 AttributeError → **500** 이 나간다.
+
+      클라이언트는 401 을 못 받으니 재로그인으로 넘어가지 못하고, 모바일에선 그대로
+      화면이 하얗게 뜬다. 게다가 이 500 은 로그에도 안 남는다 —
+      액션 로거가 `call_next` 를 try 밖에서 부르고(main.py), `_LOG_METHODS` 에 GET 이 없다.
+
+      그래서 "미인증이면 401" 이 필요한 핸들러는 이 의존성을 쓴다.
+      익명 접근을 실제로 허용하는 핸들러만 `get_current_user_from_cookie` 를 직접 쓴다.
+    """
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return current_user
+
+
 @router.get("/me", response_model=UserSchema)
 async def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
     if current_user is None:

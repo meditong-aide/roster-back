@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from db.client2 import get_db
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from schemas.team_schema import TeamBulkOpsRequest, TeamWithMembers
 from services.team_service import list_teams_with_members, apply_team_ops
@@ -122,7 +122,7 @@ def _resolve_managed_target(
 
 @router.get("", response_model=list[TeamWithMembers])
 async def get_teams(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     group_id: str | None = None,
     year: int | None = None,
     month: int | None = None,
@@ -203,7 +203,7 @@ async def classify_preview(
 @router.post("/classify/apply")
 async def classify_apply(
     body: TeamClassifyApplyRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """승인된 팀 분류를 permanent_change 이벤트로 발행 (대상월 1일 발효)."""

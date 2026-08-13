@@ -5,7 +5,7 @@ from typing import Literal
 from datalayer.common import Common
 from datalayer.setting import Setting
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 
 
@@ -21,7 +21,7 @@ router = APIRouter(
 )
 
 @router.get("/listcnt", summary="총 게시물수")
-def message_view(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_view(current_user: UserSchema = Depends(require_current_user)):
     """
     * 호출방식 : /push/listcnt
     * 리턴값 : PushCode, PushCnt
@@ -41,7 +41,7 @@ def message_view(current_user: UserSchema = Depends(get_current_user_from_cookie
 
 
 @router.get("/list", summary="메세지 리스트")
-def message_view(listsize: int, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_view(listsize: int, current_user: UserSchema = Depends(require_current_user)):
     """
     * 호출방식 : /push/list?listsize=10
     * 리턴값 :
@@ -86,7 +86,7 @@ def mark_push_read_by_code(
     pushcode: str,
     pushsubcode: str,
     officecode: str,
-    current_user: UserSchema = Depends(get_current_user_from_cookie)
+    current_user: UserSchema = Depends(require_current_user)
 ):
     """
     * 호출방식 : PATCH /push/read?pushcode=P30&pushsubcode=S04&officecode=102560
@@ -104,7 +104,7 @@ def mark_push_read_by_code(
 
 
 @router.patch("/read/one", summary="알림 단건 읽음 처리")
-def mark_one_push_read(req: PushReadRequest, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def mark_one_push_read(req: PushReadRequest, current_user: UserSchema = Depends(require_current_user)):
     """
     * 호출방식 : PATCH /push/read/one
     * 바디 : { "fk_idx": 123 }
@@ -119,7 +119,7 @@ def mark_one_push_read(req: PushReadRequest, current_user: UserSchema = Depends(
 
 
 @router.patch("/read/all", summary="알림 전체 읽음 처리")
-def mark_all_push_read(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def mark_all_push_read(current_user: UserSchema = Depends(require_current_user)):
     """
     * 호출방식 : PATCH /push/read/all
     * 기능 : 알림 모달 진입 시 안읽은 알림 전체를 ReadYN = Y로 일괄 변경
@@ -133,7 +133,7 @@ def mark_all_push_read(current_user: UserSchema = Depends(get_current_user_from_
 
 
 @router.get("/setting", summary="푸시 알림 수신 여부 조회")
-def get_push_setting(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def get_push_setting(current_user: UserSchema = Depends(require_current_user)):
     """
     * 호출방식 : GET /push/setting
     * 리턴값 : push_yn (Y/N)
@@ -142,14 +142,20 @@ def get_push_setting(current_user: UserSchema = Depends(get_current_user_from_co
 
     row = msdb_manager.fetch_all(Setting.get_push_yn(), params=(MemberID,))
 
+    # 설정 행은 직원 엑셀 일괄등록(setting/member.py) 경로에서만 만들어져서, 그 경로를
+    # 안 거친 계정은 행이 없다. 이건 오류가 아니라 "아직 안 만든 상태"이고, 행을 만들 때
+    # 넣는 기본값이 PushYN='Y' 다 → 같은 값을 200 으로 돌려준다.
+    # ★ 404 를 쓰면 안 된다 — CloudFront 가 `/api/*` 의 404 를 `index.html` 200 으로
+    #   바꿔 보내서(CustomErrorResponses 는 배포 전체 적용) 클라이언트의 404 분기가 죽고,
+    #   HTML 을 JSON 으로 파싱하다 모바일 화면이 하얗게 뜬다.
     if not row:
-        raise HTTPException(status_code=404, detail="설정 정보를 찾을 수 없습니다.")
+        return {"push_yn": "Y"}
 
     return {"push_yn": row[0]["PushYN"]}
 
 
 @router.patch("/setting", summary="푸시 알림 수신 여부 변경")
-def update_push_setting(req: PushSettingRequest, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def update_push_setting(req: PushSettingRequest, current_user: UserSchema = Depends(require_current_user)):
     """
     * 호출방식 : PATCH /push/setting
     * 바디 : { "push_yn": "Y" | "N" }

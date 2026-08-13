@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from db.client2 import get_db
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from schemas.message_schema import (
     MessageCountResponse,
@@ -19,7 +19,7 @@ router = APIRouter(prefix="/message", tags=["message"])
 
 @router.get("/groups", summary="메시지 수신자 그룹 목록 (office 내 전체)")
 def get_message_groups(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     return message_service.get_available_groups(db, current_user.office_id)
@@ -28,7 +28,7 @@ def get_message_groups(
 @router.get("/memberlist", summary="메시지 수신자 목록", response_model=List[MessageMemberItem])
 def get_member_list(
     extra_group_ids: Optional[str] = None,  # 콤마 구분 "groupA,groupB"
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     extra = [g.strip() for g in extra_group_ids.split(",")] if extra_group_ids else None
@@ -43,7 +43,7 @@ def get_member_list(
 @router.post("/write", summary="메시지 전송")
 def write_message(
     body: MessageCreateRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     if not body.receiver_nurse_ids:
@@ -65,7 +65,7 @@ def write_message(
 @router.get("/listcnt", summary="메시지 총 건수", response_model=MessageCountResponse)
 def get_message_count(
     list_type: str = "reception",
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     total = message_service.get_message_count(db, current_user.nurse_id, list_type)
@@ -77,7 +77,7 @@ def get_message_list(
     list_type: str = "reception",
     offset: int = 0,
     limit: int = 10,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     return message_service.get_message_list(
@@ -92,7 +92,7 @@ def get_message_list(
 @router.get("/view/{message_id}", summary="메시지 단건 조회", response_model=MessageItem)
 def get_message(
     message_id: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     msg = message_service.get_message(db, message_id)
@@ -106,7 +106,7 @@ def get_message(
 @router.delete("/delete/{message_id}", summary="메시지 삭제")
 def delete_message(
     message_id: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     deleted = message_service.delete_message(db, message_id, current_user.nurse_id)

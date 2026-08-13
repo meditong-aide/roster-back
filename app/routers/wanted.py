@@ -21,7 +21,7 @@ from schemas.roster_schema import (
 )
 from services.graph_service import graph_service
 from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from utils.utils import send_wanted_close_push, send_wanted_deadline_update_push
 from db.client2 import get_db
 from db.models import (
@@ -289,7 +289,7 @@ async def update_wanted_deadline(
 
 # @router.post("/invoke", response_model=WantedInvokeResponse)
 @router.post("/invoke")
-async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = Depends(get_current_user_from_cookie), db: Session = Depends(get_db)):
+async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = Depends(require_current_user), db: Session = Depends(get_db)):
     """
     그래프를 실행하여 로스터 관련 요청을 처리합니다.
     """
@@ -673,7 +673,7 @@ async def get_over_limit_nurses_api(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     # 관리자 권한 체크 (수간호사 여부는 토큰 대신 DB)
@@ -689,7 +689,7 @@ async def delete_excess_off_api(
     nurse_id: str,
     year: int,
     month: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     if current_user.is_master_admin:
