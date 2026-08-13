@@ -408,6 +408,12 @@ class NightCycleResult(BaseModel):
     cycle: Optional[int] = None
     #: pending_sleep 합계 — 화면 상단 요약용.
     pending_total: int = 0
+    #: 값의 출처. 화면이 라벨을 달리해야 한다.
+    #:   anchor    = 그 달 마감본에서 굳힌 앵커. **그 달 끝** 상태다.
+    #:   projected = 앵커가 없어 전월 최신 근무표에서 즉석 계산한 값.
+    #:               **이 달 시작** 상태(= 넘어온 대기)이며 저장되지 않는다.
+    #:   none      = 전월도 근무표가 없어 낼 값이 없다.
+    source: str = "none"
     rows: list[NightCycleRow]
 
 
@@ -430,6 +436,11 @@ async def get_night_cycle(
     gid = group_id or getattr(current_user, "group_id", None)
     if not gid:
         raise HTTPException(status_code=400, detail="group_id 가 필요합니다")
+    # ★ 조회에도 범위 검증이 필요하다. 앵커가 없으면 전월을 계산해 폴백하는데,
+    #   month=13 이면 전월을 12 로 잡아 **엉뚱한 달의 값을 정상 응답처럼** 내고
+    #   month=0 이면 pm=-1 로 조회한다.
+    if not (1 <= int(month) <= 12) or not (2000 <= int(year) <= 2100):
+        raise HTTPException(status_code=400, detail="year/month 범위가 올바르지 않습니다")
     assert_caller_can_access_group(db, current_user, gid)
 
     nurses = db.query(Nurse).filter(Nurse.group_id == gid, Nurse.active == True).all()  # noqa: E712
@@ -444,16 +455,47 @@ async def get_night_cycle(
             NurseNightCycle.month == int(month),
         ).all()
     }
-    rows = [
-        NightCycleRow(
-            nurse_id=str(n.nurse_id),
-            name=getattr(n, "name", None),
-            seq_at_end=getattr(anchors.get(str(n.nurse_id)), "seq_at_end", None),
-            pending_sleep=getattr(anchors.get(str(n.nurse_id)), "pending_sleep", None),
-            sleep_off_count=getattr(anchors.get(str(n.nurse_id)), "sleep_off_count", None),
-        )
-        for n in nurses
-    ]
+
+    if anchors:
+        source = "anchor"
+        rows = [
+            NightCycleRow(
+                nurse_id=str(n.nurse_id),
+                name=getattr(n, "name", None),
+                seq_at_end=getattr(anchors.get(str(n.nurse_id)), "seq_at_end", None),
+                pending_sleep=getattr(anchors.get(str(n.nurse_id)), "pending_sleep", None),
+                sleep_off_count=getattr(anchors.get(str(n.nurse_id)), "sleep_off_count", None),
+            )
+            for n in nurses
+        ]
+    else:
+        # ★ 앵커는 **마감(issued)분만** 저장한다. 아직 안 연 달은 행이 아예 없어
+        #   전원 None 으로 나가는데, 수간호사가 정작 알고 싶은 건 "이 달을 만들 때
+        #   누가 몇 건 넘어오는가" 다. 그건 전월 근무표에서 계산할 수 있다.
+        # ★ 생성기(`sleep_off_postprocess`)가 같은 상황에서 쓰는 폴백을 그대로 쓴다 —
+        #   화면과 솔버가 다른 값을 보면 안 된다.
+        # ★ 저장하지 않는다. draft 는 폐기될 수 있어 앵커로 굳히면 DB 가 오염된다.
+        from services.leave.night_cycle_service import prev_month_fallback
+
+        py, pm = (int(year) - 1, 12) if int(month) == 1 else (int(year), int(month) - 1)
+        try:
+            fb = prev_month_fallback(db, gid, py, pm)
+        except Exception:
+            fb = {}
+        source = "projected" if fb else "none"
+        rows = [
+            NightCycleRow(
+                nurse_id=str(n.nurse_id),
+                name=getattr(n, "name", None),
+                seq_at_end=(fb.get(str(n.nurse_id)) or (None, None, None))[0],
+                pending_sleep=(fb.get(str(n.nurse_id)) or (None, None, None))[1],
+                # 아직 만들지 않은 달이라 "부여 횟수" 는 존재하지 않는다.
+                # 0 으로 채우면 "0건 부여됨" 으로 읽혀 사실과 다르다.
+                sleep_off_count=None,
+            )
+            for n in nurses
+        ]
+
     try:
         cycle = resolve_cycle(db, gid)
     except Exception:
@@ -461,7 +503,7 @@ async def get_night_cycle(
     return NightCycleResult(
         group_id=gid, year=year, month=month, cycle=cycle,
         pending_total=sum(int(r.pending_sleep or 0) for r in rows),
-        rows=rows,
+        source=source, rows=rows,
     )
 
 
