@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from db.client2 import get_db
 from db.models import RosterConfig, Team
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from services.group_access import resolve_home_group_id
 from schemas.auth_schema import User as UserSchema
 from services.constraint_impact.control import (
@@ -183,7 +183,7 @@ def _build_listing_snapshot(
 def get_modules(
     year: int = Query(..., ge=2000, le=3000),
     month: int = Query(..., ge=1, le=12),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """List ontology constraint modules with effective mode + supported actions."""
@@ -216,7 +216,7 @@ class _AdjustmentPreviewBody(BaseModel):
 @router.post("/constraint_impact/preview_adjustments")
 def preview_adjustments(
     body: _AdjustmentPreviewBody,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Dry-run apply adjustments and return the post-apply config diff.
@@ -264,7 +264,7 @@ def get_instances(
     day: int | None = Query(default=None),
     shift: str | None = Query(default=None),
     grade: int | None = Query(default=None),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Search constraint instances by family + scope filter."""

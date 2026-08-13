@@ -23,7 +23,7 @@ from db.models import (
 )
 from db.nurse_config import Nurse as NurseEngine
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from routers.utils import get_days_in_month
 from schemas.auth_schema import User
 from schemas.auth_schema import User as UserSchema
@@ -574,8 +574,14 @@ async def get_issued_roster_snapshot(
             db=db,
             target_group_id=target_group_id,
         )
+        # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
+        #   `index.html` **200(text/html)** 으로 바꿔 보내고, 그 HTML 을 **URL 단위로
+        #   캐시**해 재사용한다(2026-08-13 실측: 이 EP 응답이 `age: 7245`·`server: AmazonS3`).
+        #   모바일 useSnapShot 은 `!response.ok` 로만 거르고 바로 `response.json()` 을 불러서
+        #   "Unexpected token '<'" 로 죽고, ErrorBoundary 가 없어 화면이 하얗게 뜬다.
+        #   200 + null 이면 PC(axios·404→null)·모바일 모두 기존 "발행본 없음" 경로와 동일하다.
         if not snapshot:
-            raise HTTPException(status_code=404, detail="Issued snapshot not found")
+            return None
 
         # 파견/병동이동 assignment 메타데이터 추가 + schedule 치환
         from services.assignment_service import get_roster_assignments
@@ -797,16 +803,21 @@ async def get_issued_roster_snapshot(
 async def get_my_issued_roster(
     year: int,
     month: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
         result = get_my_issued_roster_service(
             year=year, month=month, current_user=current_user, db=db
         )
-        if not result:
-            raise HTTPException(status_code=404, detail="발행된 근무표가 없습니다.")
-        return result
+        # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
+        #   `index.html` **200** 으로 바꿔 보내기 때문이다(CustomErrorResponses 는 배포
+        #   전체 적용이라 /api behavior 만 뺄 수 없다). 그러면 클라이언트의 404 분기가
+        #   통째로 죽고, HTML 을 JSON 으로 파싱하다 모바일 화면이 하얗게 뜬다.
+        #   200 + null 로 내리면 PC(axios·404→null)·모바일(fetch·404→null) 양쪽 모두
+        #   기존 "근무표 없음" 경로와 **똑같이** 동작한다(2026-08-13 실측).
+        #   ※ "없음"은 정상 상태지 오류가 아니라서 의미상으로도 200 이 맞다.
+        return result or None
     except HTTPException:
         raise
     except Exception as e:

@@ -41,7 +41,7 @@ from schemas.roster_schema import (
     NurseMonthlyLimitListResponse,
     NightBulkApplyRequest,
 )
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from services.assignment_service import (
     create_assignment,
@@ -344,7 +344,7 @@ async def get_nurses_in_group(
     nurse_id: Optional[str] = None,  # 신규 파라미터
     year: Optional[int] = None,   # 근무자관리에서만 전달: 주면 nurse_monthly_limits.n_exact 조인
     month: Optional[int] = None,  # year 와 함께 주어질 때만 n_exact 주입
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     _ensure_office_exists(
@@ -609,7 +609,7 @@ async def upload2_confirm_endpoint(
     group_id: str = Query(
         ..., description="대상 병동 group_id (필수)"
     ),  # ← 반드시 URL에 ?group_id=... 포함
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """업로드2 - 검증 통과 후 저장. 오류가 있는 행은 건너뜀."""
@@ -655,7 +655,7 @@ async def get_available_members(
     search_by: str = Query("name", description="Search target: name or affiliation"),
     cursor: Optional[str] = Query(None, description="Pagination cursor"),
     limit: int = Query(20, ge=1, le=100, description="Page size"),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -861,7 +861,7 @@ verification_cache: Dict[
 
 @router.get("/personnel-basic-info")
 async def get_personnel_basic_info(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -988,7 +988,7 @@ async def get_personnel_basic_info(
 @router.patch("/personnel-basic-info")
 async def partial_update_personnel_basic_info(
     update_data: PersonnelUpdate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse = (
@@ -1075,7 +1075,7 @@ async def delete_profile_image(
 @router.put("/change-password")
 async def change_password(
     payload: PasswordChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse_id = current_user.nurse_id
@@ -1124,7 +1124,7 @@ async def change_password(
 @router.post("/change-phone/send-code")
 async def send_phone_verification_code(
     payload: PhoneChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse_id = current_user.nurse_id
@@ -1168,7 +1168,7 @@ async def send_phone_verification_code(
 @router.put("/change-phone/verify")
 async def verify_and_update_phone(
     payload: PhoneChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse_id = current_user.nurse_id
@@ -1337,7 +1337,7 @@ async def get_nurse_by_id(
     group_id: Optional[str] = None,
     year: Optional[int] = None,
     month: Optional[int] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """단일 간호사 프로필 조회.
@@ -1427,7 +1427,7 @@ async def update_nurse_profile(
     group_id: Optional[str] = None,
     year: Optional[int] = None,
     month: Optional[int] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """간호사 프로필 수정.
