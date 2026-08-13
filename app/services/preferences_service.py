@@ -524,7 +524,13 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
         raise Exception("Not authenticated")
     month_str = f"{year}-{month:02d}"
 
-    target_group_id = override_group_id or home_gid
+    # override_group_id 미지정 시 호출자 home group.
+    # ★ 여기서 정의되지 않은 `home_gid` 를 참조해 왔다 → group_id 없이 호출하면
+    #   NameError → 500. `override_group_id` 가 있으면 단축평가로 넘어가므로
+    #   ADM 은 멀쩡하고 **일반 간호사만 100% 실패**해서 오래 안 드러났다.
+    #   클라이언트(req.ts:preferences_all)는 !ok 를 [] 로 삼켜서, 에러 없이
+    #   원티드 화면의 동료 선호 데이터만 조용히 사라졌다.
+    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
     # ✅ 1️⃣ 그룹 내 간호사 목록 가져오기
