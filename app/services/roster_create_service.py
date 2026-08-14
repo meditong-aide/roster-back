@@ -642,7 +642,10 @@ def _select_effective_grade_strategy(
         return "BASE"
     return resolved
 
-def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
+def _build_shift_manage_and_requirements(
+    db: Session, current_user, latest_config, req,
+    *, require_nonzero_requirements: bool = True,
+):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
     shift_manages = (
         db.query(ShiftManage)
@@ -743,7 +746,10 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         for d in range(1, days_in_month + 1)
     ]
     # 안전장치: 요구치가 전부 0이면 엔진은 OFF로 쏠릴 확률이 높다.
-    if sum(daily_shift_requirements.values()) <= 0 and all(
+    # ★ 단, 엔진 대상이 0명이면(전원 fixed_shift) 요구치 0 은 **정상**이다.
+    #   그런 병동은 솔버를 우회해 평일=fixed_shift 로 채워지므로 요구치를 쓰지 않는다.
+    #   (2026-08-14 인천의료원 수술실: 19명 전원 고정근무인데 이 가드에 막혀 생성 불가)
+    if require_nonzero_requirements and sum(daily_shift_requirements.values()) <= 0 and all(
         sum(day_req.values()) <= 0 for day_req in daily_shift_requirements_by_day
     ):
         raise ValueError(
@@ -4716,7 +4722,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day = _build_shift_manage_and_requirements(
-        db, current_user, latest_config, req
+        db, current_user, latest_config, req,
+        # 엔진 대상이 없으면(전원 고정근무) 요구치 0 이 정상이므로 가드를 걸지 않는다.
+        require_nonzero_requirements=bool(nurses_for_engine),
     )
     # daily_shift_requirements를 config에 주입해서 엔진 호출
     config_dict = latest_config.__dict__ if latest_config else {}
@@ -5377,107 +5385,119 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
 
     # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
     precheck_result: dict | None = None
-    try:
-        from services.precheck import (
-            run_runtime_precheck,
-            has_blocking_issues,
-            build_blocking_payload,
-        )
-        _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
-        # `n.__dict__` 은 SQLAlchemy 의 이미 로딩된 attr 만 담아서 team_id /
-        # allowed_shifts 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
-        # 풀에서 사용할 키를 모두 일관되게 채운다.
-        _nurses_dict_for_precheck = [
-            {
-                "nurse_id": getattr(n, "nurse_id", None),
-                "db_id": getattr(n, "nurse_id", None),
-                "team_id": getattr(n, "team_id", None),
-                "grade": getattr(n, "grade", None),
-                "allowed_shifts": getattr(n, "allowed_shifts", None),
-                "work_shifts": getattr(n, "work_shifts", None),
-                "joining_date": getattr(n, "joining_date", None),
-                "resignation_date": getattr(n, "resignation_date", None),
-                "personal_off_adjustment": getattr(n, "personal_off_adjustment", 0),
-                "is_weekend_off": getattr(n, "is_weekend_off", False),
-                "weekly_off_weekday": getattr(n, "weekly_off_weekday", None),
-            }
-            for n in (nurses_for_engine or [])
-        ]
-        # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
-        # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
-        precheck_config = dict(config_dict)
-        if "team_min_by_team" not in precheck_config:
-            try:
-                _team_rows = (
-                    db.query(Team)
-                    .filter(
-                        Team.office_id == current_user.office_id,
-                        Team.group_id == current_user.group_id,
-                        Team.active == 1,
-                    )
-                    .all()
-                )
-                _team_min_by_team: dict[str, dict[str, int]] = {}
-                # teams.min_shift 미사용 — 활성 팀 중 '멤버가 배정된 팀'에만 디폴트 최소
-                # (D:1, E:1, N:0[, use_mid면 M:0]). 인원 0 팀은 솔버가 무시하므로 team_min 에서도
-                # 제외(안 그러면 TEAM_SIZE_INSUFFICIENT 로 오블로킹). 멤버십은 솔버와 동일 기준.
-                _use_mid = bool(precheck_config.get("use_mid", False))
-                _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
-                if _use_mid:
-                    _default_tm["M"] = 0
-                _member_team_ids = {
-                    str(_n.get("team_id"))
-                    for _n in _nurses_dict_for_precheck
-                    if _n.get("team_id") not in (None, "", 0)
-                }
-                for _t in _team_rows:
-                    if str(_t.team_id) not in _member_team_ids:
-                        continue
-                    _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
-                    if _cleaned:
-                        _team_min_by_team[str(_t.team_id)] = _cleaned
-                if _team_min_by_team:
-                    precheck_config["team_min_by_team"] = _team_min_by_team
-            except Exception as _team_exc:
-                print(f"[Precheck] team_min 로딩 실패(무시): {_team_exc}")
-
-        precheck_result = run_runtime_precheck(
-            nurses_dict=_nurses_dict_for_precheck,
-            config_dict=precheck_config,
-            grade_config=_engine_grade_config,
-            fixed_cells=combined_fixed_cells,
-            year=req.year,
-            month=req.month,
-            stop_on_config_error=False,
-        )
-        if has_blocking_issues(precheck_result):
-            payload = build_blocking_payload(precheck_result)
-            inf = payload.get("infeasibility", {})
-            issue_codes = sorted({
-                str(i.get("reason_code", "?"))
-                for i in (precheck_result.get("issues") or [])
-            })
-            print(
-                f"[Precheck][BLOCKING] {len(precheck_result.get('issues', []))}건 — "
-                f"codes={issue_codes}"
-            )
-            print(f"[Precheck][BLOCKING][message] {inf.get('summary_message_ko')}")
-            for s in (inf.get("fix_suggestions_ko") or [])[:5]:
-                print(f"[Precheck][BLOCKING][fix] {s}")
-            print("[Precheck][BLOCKING] 솔버 호출 생략. HTTP 500 응답.")
-            try:
-                db.delete(schedule)
-                db.commit()
-            except Exception:
-                db.rollback()
-            from fastapi import HTTPException
-            raise HTTPException(status_code=500, detail=payload)
-    except HTTPException:
-        raise
-    except Exception as _pre_exc:
-        # precheck 자체가 실패하면 무시하고 솔버 진행
-        print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
+    # ★ 엔진 대상이 0명이면 검사 자체가 성립하지 않는다.
+    #   전원이 fixed_shift 인 병동(수술실 등)은 솔버를 우회해 평일=코드로 채워지므로
+    #   `if nurses_for_engine:`(아래 솔버 호출부)이 이미 엔진을 건너뛴다. 그런데 precheck 는
+    #   그 가드가 없어 **간호사 0명·요구 0** 으로 돌았고, `_ensure_grade1_default` 의
+    #   grade-1 floor(D/E/N 각 1)가 요구 0 을 넘어서 GRADE_MIN_SUM_EXCEEDS_NEED 로 항상 막혔다.
+    #   ★ 그냥 돌게 두면 안 된다 — build_success_payload 가 precheck_result 를 그대로 실어
+    #     생성에 성공해도 의미 없는 인력부족 경고가 응답에 붙는다.
+    #   (2026-08-14 인천의료원 수술실 실측: 19명 전원 고정근무인데 생성이 불가)
+    if not nurses_for_engine:
+        print("[Precheck] 엔진 대상 0명(전원 고정근무) — 검사 건너뜀")
         precheck_result = None
+    else:
+        try:
+            from services.precheck import (
+                run_runtime_precheck,
+                has_blocking_issues,
+                build_blocking_payload,
+            )
+            _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
+            # `n.__dict__` 은 SQLAlchemy 의 이미 로딩된 attr 만 담아서 team_id /
+            # allowed_shifts 가 lazy-load 상태면 빠진다. 명시적으로 attribute 접근해
+            # 풀에서 사용할 키를 모두 일관되게 채운다.
+            _nurses_dict_for_precheck = [
+                {
+                    "nurse_id": getattr(n, "nurse_id", None),
+                    "db_id": getattr(n, "nurse_id", None),
+                    "team_id": getattr(n, "team_id", None),
+                    "grade": getattr(n, "grade", None),
+                    "allowed_shifts": getattr(n, "allowed_shifts", None),
+                    "work_shifts": getattr(n, "work_shifts", None),
+                    "joining_date": getattr(n, "joining_date", None),
+                    "resignation_date": getattr(n, "resignation_date", None),
+                    "personal_off_adjustment": getattr(n, "personal_off_adjustment", 0),
+                    "is_weekend_off": getattr(n, "is_weekend_off", False),
+                    "weekly_off_weekday": getattr(n, "weekly_off_weekday", None),
+                }
+                for n in (nurses_for_engine or [])
+            ]
+            # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
+            # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
+            precheck_config = dict(config_dict)
+            if "team_min_by_team" not in precheck_config:
+                try:
+                    _team_rows = (
+                        db.query(Team)
+                        .filter(
+                            Team.office_id == current_user.office_id,
+                            Team.group_id == current_user.group_id,
+                            Team.active == 1,
+                        )
+                        .all()
+                    )
+                    _team_min_by_team: dict[str, dict[str, int]] = {}
+                    # teams.min_shift 미사용 — 활성 팀 중 '멤버가 배정된 팀'에만 디폴트 최소
+                    # (D:1, E:1, N:0[, use_mid면 M:0]). 인원 0 팀은 솔버가 무시하므로 team_min 에서도
+                    # 제외(안 그러면 TEAM_SIZE_INSUFFICIENT 로 오블로킹). 멤버십은 솔버와 동일 기준.
+                    _use_mid = bool(precheck_config.get("use_mid", False))
+                    _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
+                    if _use_mid:
+                        _default_tm["M"] = 0
+                    _member_team_ids = {
+                        str(_n.get("team_id"))
+                        for _n in _nurses_dict_for_precheck
+                        if _n.get("team_id") not in (None, "", 0)
+                    }
+                    for _t in _team_rows:
+                        if str(_t.team_id) not in _member_team_ids:
+                            continue
+                        _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
+                        if _cleaned:
+                            _team_min_by_team[str(_t.team_id)] = _cleaned
+                    if _team_min_by_team:
+                        precheck_config["team_min_by_team"] = _team_min_by_team
+                except Exception as _team_exc:
+                    print(f"[Precheck] team_min 로딩 실패(무시): {_team_exc}")
+
+            precheck_result = run_runtime_precheck(
+                nurses_dict=_nurses_dict_for_precheck,
+                config_dict=precheck_config,
+                grade_config=_engine_grade_config,
+                fixed_cells=combined_fixed_cells,
+                year=req.year,
+                month=req.month,
+                stop_on_config_error=False,
+            )
+            if has_blocking_issues(precheck_result):
+                payload = build_blocking_payload(precheck_result)
+                inf = payload.get("infeasibility", {})
+                issue_codes = sorted({
+                    str(i.get("reason_code", "?"))
+                    for i in (precheck_result.get("issues") or [])
+                })
+                print(
+                    f"[Precheck][BLOCKING] {len(precheck_result.get('issues', []))}건 — "
+                    f"codes={issue_codes}"
+                )
+                print(f"[Precheck][BLOCKING][message] {inf.get('summary_message_ko')}")
+                for s in (inf.get("fix_suggestions_ko") or [])[:5]:
+                    print(f"[Precheck][BLOCKING][fix] {s}")
+                print("[Precheck][BLOCKING] 솔버 호출 생략. HTTP 500 응답.")
+                try:
+                    db.delete(schedule)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                from fastapi import HTTPException
+                raise HTTPException(status_code=500, detail=payload)
+        except HTTPException:
+            raise
+        except Exception as _pre_exc:
+            # precheck 자체가 실패하면 무시하고 솔버 진행
+            print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
+            precheck_result = None
 
     if nurses_for_engine:
         # _debug_log(
