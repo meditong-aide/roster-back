@@ -535,7 +535,10 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     }
 
 
-def _build_shift_manage_and_requirements(db: Session, current_user, latest_config, req):
+def _build_shift_manage_and_requirements(
+    db: Session, current_user, latest_config, req,
+    *, require_nonzero_requirements: bool = True,
+):
     """ShiftManage에서 인원·코드 정보를 읽어 engine용 데이터와 요구인원을 구성한다."""
     shift_manages = (
         db.query(ShiftManage)
@@ -636,7 +639,10 @@ def _build_shift_manage_and_requirements(db: Session, current_user, latest_confi
         for d in range(1, days_in_month + 1)
     ]
     # 안전장치: 요구치가 전부 0이면 엔진은 OFF로 쏠릴 확률이 높다.
-    if sum(daily_shift_requirements.values()) <= 0 and all(
+    # ★ 단, 엔진 대상이 0명이면(전원 fixed_shift) 요구치 0 은 **정상**이다.
+    #   그런 병동은 솔버를 우회해 평일=fixed_shift 로 채워지므로 요구치를 쓰지 않는다.
+    #   (2026-08-14 인천의료원 수술실: 19명 전원 고정근무인데 이 가드에 막혀 생성 불가)
+    if require_nonzero_requirements and sum(daily_shift_requirements.values()) <= 0 and all(
         sum(day_req.values()) <= 0 for day_req in daily_shift_requirements_by_day
     ):
         raise ValueError(
@@ -4912,7 +4918,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day = _build_shift_manage_and_requirements(
-        db, current_user, latest_config, req
+        db, current_user, latest_config, req,
+        # 엔진 대상이 없으면(전원 고정근무) 요구치 0 이 정상이므로 가드를 걸지 않는다.
+        require_nonzero_requirements=bool(nurses_for_engine),
     )
     # daily_shift_requirements를 config에 주입해서 엔진 호출
     config_dict = latest_config.__dict__ if latest_config else {}
@@ -5574,190 +5582,200 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
     precheck_result: dict | None = None
     presolve_diag: dict | None = None   # 솔버 전 부족 조기진단(advisory) — 응답에 부착
-    try:
-        from services.precheck import (
-            run_runtime_precheck,
-            has_blocking_issues,
-            build_blocking_payload,
-        )
-        _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
-        # 주말휴무(as-of month)를 명시 조회 — 이 시점 엔진 객체엔 아직 미주입일 수 있어
-        # 온톨로지 정찰이 주말 강제OFF 부담을 놓치지 않게 SSOT(period)에서 직접 확정한다.
-        try:
-            from services.nurse_period_resolver import weekend_off_ids_asof as _wo_ids_pre
-            _wk_ids_pre = _wo_ids_pre(
-                db, [getattr(n, "nurse_id", None) for n in (nurses_for_engine or [])],
-                req.year, req.month)
-        except Exception:
-            _wk_ids_pre = set()
-        # [온톨로지 데이터 단일 소스] 정찰/온톨로지에 넘길 nurse 속성은 손으로 고르지 않고
-        # solver 가 보는 전체를 포괄한다. 개별 속성이 누락되면 온톨로지가 그 제약을 못 보는
-        # 사각지대(예: n_exact 누락으로 야간 모순 미검출)가 생기므로, 새 속성 추가 시 아래
-        # 목록 한 곳만 고치면 되게 한다. `getattr` 로 lazy-load 도 강제 로드.
-        #   - 월 한도(d/e/n/o × min/max/exact): 4565 오버레이로 엔진 nurse 에 실림(없으면 None)
-        #   - fixed_shift/allowed_shifts: 대상월 as-of 반영됨
-        #   - is_weekend_off: period SSOT(as-of)로 별도 확정
-        _ONTOLOGY_NURSE_FIELDS = (
-            "nurse_id", "grade", "team_id", "active", "sequence",
-            "joining_date", "resignation_date",
-            "allowed_shifts", "work_shifts", "fixed_shift",
-            "weekly_off_enabled", "weekly_off_weekday", "weekly_off_type",
-            "personal_off_adjustment", "preceptor_id",
-            "d_min", "d_max", "d_exact", "e_min", "e_max", "e_exact",
-            "n_min", "n_max", "n_exact", "o_min", "o_max", "o_exact",
-        )
-        _nurses_dict_for_precheck = []
-        for n in (nurses_for_engine or []):
-            _prof = {f: getattr(n, f, None) for f in _ONTOLOGY_NURSE_FIELDS}
-            _prof["db_id"] = _prof.get("nurse_id")
-            # 이름도 실어준다 — 원인 브리지(cause_to_resolution_options)·진단 문구가 nurse_id 가
-            #   아니라 이름으로 표기되도록. _ONTOLOGY_NURSE_FIELDS 엔 name 이 없어 폴백하던 문제.
-            _prof["name"] = getattr(n, "name", None)
-            _prof["is_weekend_off"] = str(_prof.get("nurse_id")) in _wk_ids_pre
-            _nurses_dict_for_precheck.append(_prof)
-        # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
-        # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
-        precheck_config = dict(config_dict)
-        if "team_min_by_team" not in precheck_config:
-            try:
-                _team_rows = (
-                    db.query(Team)
-                    .filter(
-                        Team.office_id == current_user.office_id,
-                        Team.group_id == current_user.group_id,
-                        Team.active == 1,
-                    )
-                    .all()
-                )
-                _team_min_by_team: dict[str, dict[str, int]] = {}
-                # teams.min_shift 미사용 — 활성 팀 중 '멤버가 배정된 팀'에만 디폴트 최소
-                # (D:1, E:1, N:0[, use_mid면 M:0]). 인원 0 팀은 솔버가 무시하므로 team_min 에서도
-                # 제외(안 그러면 TEAM_SIZE_INSUFFICIENT 로 오블로킹). 멤버십은 솔버와 동일 기준.
-                _use_mid = bool(precheck_config.get("use_mid", False))
-                _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
-                if _use_mid:
-                    _default_tm["M"] = 0
-                _member_team_ids = {
-                    str(_n.get("team_id"))
-                    for _n in _nurses_dict_for_precheck
-                    if _n.get("team_id") not in (None, "", 0)
-                }
-                for _t in _team_rows:
-                    if str(_t.team_id) not in _member_team_ids:
-                        continue
-                    _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
-                    if _cleaned:
-                        _team_min_by_team[str(_t.team_id)] = _cleaned
-                if _team_min_by_team:
-                    precheck_config["team_min_by_team"] = _team_min_by_team
-            except Exception as _team_exc:
-                print(f"[Precheck] team_min 로딩 실패(무시): {_team_exc}")
-
-        precheck_result = run_runtime_precheck(
-            nurses_dict=_nurses_dict_for_precheck,
-            config_dict=precheck_config,
-            grade_config=_engine_grade_config,
-            fixed_cells=combined_fixed_cells,
-            year=req.year,
-            month=req.month,
-            stop_on_config_error=False,
-        )
-        # 솔버 전 부족 조기진단(advisory, non-blocking) — max-flow(per-day+월별) 기반.
-        # 개인 속성(allowed_shifts/max_nig/weekend_off)은 불가침 → 복구 선택지는 관리자 노브만.
-        # 실측 부족 수치는 솔버 후 coverage_gaps 가 담당(여기 값은 증명된 하한).
-        try:
-            from services.ontology_graph.presolve_diagnosis import presolve_shortage_diagnosis
-            presolve_diag = presolve_shortage_diagnosis(
-                _nurses_dict_for_precheck, precheck_config, req.year, req.month)
-            if presolve_diag.get("shortages"):
-                print(
-                    f"[Presolve] 부족 예상 {len(presolve_diag['shortages'])}건 "
-                    f"({presolve_diag['elapsed_ms']}ms): "
-                    + "; ".join(
-                        f"{s['shift']} 월부족≥{s['monthly_shortage_lower_bound']}({s['reason']})"
-                        for s in presolve_diag['shortages']))
-        except Exception as _psd_exc:
-            print(f"[Presolve] 진단 실패(무시): {_psd_exc}")
-            presolve_diag = None
-        # 운영 shadow 진단(env AIDE_SHADOW_DIAGNOSIS 게이팅, 기본 off=no-op). 결과 무영향, 로그만.
-        # request_id=새 run_id(fix1). input_hash·model_signature 는 **여기서 한 번 확정**해 graph·
-        # production 로그에 동일 전달(fix2·3 — 재hash·모델차이로 인한 오분류 방지).
-        # solve_context: run_id·attempt_seq·input_hash·model_signature 를 **여기서 한 번 확정**해
-        # graph·production 양쪽이 동일 값을 쓴다(fix3·C — 양쪽 drift 방지, 확실히 pair).
-        _gen_run_id = _gen_ih = _gen_sig = _gen_nd = None
-        _gen_seq = 0
-        try:
-            import calendar as _cal
-            import uuid as _uuid
-            from services.ontology_graph.roster_ir import model_signature as _msig
-            from services.ontology_graph.shadow_diagnosis import _input_hash as _ihf
-            from services.ontology_graph.shadow_diagnosis import run_shadow
-            _gen_run_id = _uuid.uuid4().hex
-            _gen_nd = _cal.monthrange(req.year, req.month)[1]
-            _gen_ih = _ihf(_nurses_dict_for_precheck, precheck_config, _gen_nd)
-            _gen_sig = _msig(_nurses_dict_for_precheck, precheck_config, _gen_nd)
-            run_shadow(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
-                       request_id=_gen_run_id, schedule_id=getattr(schedule, "schedule_id", None),
-                       attempt_id="primary_hard", attempt_seq=_gen_seq,
-                       input_hash=_gen_ih, model_signature=_gen_sig)
-        except Exception:
-            pass
-        if has_blocking_issues(precheck_result):
-            payload = build_blocking_payload(precheck_result)
-            # [원인 브리지] precheck 가 solve 전에 막으면(솔버 호출 생략) post-solve cause 경로가
-            #   안 도므로, 여기서 explain_infeasibility_from_config 로 개인/주말 원인을 진단해 카드를
-            #   payload 에 합류시킨다. 주말휴무 과다·야간전담 상한 등이 일반 capacity 문구로만 뜨고
-            #   해결 카드가 없던 갭을 메운다(정확 카드/문구로 override, 실패내성).
-            try:
-                import calendar as _cal_cb
-                from services.ontology_graph.lagrangian import (
-                    explain_infeasibility_from_config as _explain_cb,
-                )
-                from services.ontology_graph.mcs_trace import (
-                    cause_to_resolution_options as _cards_cb,
-                )
-                _nd_cb = _cal_cb.monthrange(req.year, req.month)[1]
-                _cause_cb = _explain_cb(_nurses_dict_for_precheck, precheck_config, _nd_cb,
-                                        year=req.year, month=req.month)
-                _cards = _cards_cb(_cause_cb.classification, _cause_cb.top_family, _cause_cb.targets)
-                if _cards:
-                    _inf_cb = payload.setdefault("infeasibility", {})
-                    _inf_cb["resolution_options"] = _cards + (_inf_cb.get("resolution_options") or [])
-                    if _cause_cb.classification != "unknown" and _cause_cb.certificate:
-                        _inf_cb["summary_message_ko"] = _cause_cb.certificate
-                        _fx = _inf_cb.get("fix_suggestions_ko") or []
-                        if _cause_cb.certificate not in _fx:
-                            _inf_cb["fix_suggestions_ko"] = [_cause_cb.certificate] + _fx
-                    print(f"[Precheck][CauseBridge] {_cause_cb.classification}/"
-                          f"{_cause_cb.top_family} 카드 {len(_cards)}건 합류")
-            except Exception as _cb_exc:
-                print(f"[Precheck][CauseBridge] 실패(무시): {_cb_exc}")
-            inf = payload.get("infeasibility", {})
-            issue_codes = sorted({
-                str(i.get("reason_code", "?"))
-                for i in (precheck_result.get("issues") or [])
-            })
-            print(
-                f"[Precheck][BLOCKING] {len(precheck_result.get('issues', []))}건 — "
-                f"codes={issue_codes}"
-            )
-            print(f"[Precheck][BLOCKING][message] {inf.get('summary_message_ko')}")
-            for s in (inf.get("fix_suggestions_ko") or [])[:5]:
-                print(f"[Precheck][BLOCKING][fix] {s}")
-            print("[Precheck][BLOCKING] 솔버 호출 생략. HTTP 500 응답.")
-            try:
-                db.delete(schedule)
-                db.commit()
-            except Exception:
-                db.rollback()
-            from fastapi import HTTPException
-            raise HTTPException(status_code=500, detail=payload)
-    except HTTPException:
-        raise
-    except Exception as _pre_exc:
-        # precheck 자체가 실패하면 무시하고 솔버 진행
-        print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
+    # ★ 엔진 대상이 0명이면 검사 자체가 성립하지 않는다.
+    #   전원이 fixed_shift 인 병동(수술실 등)은 솔버를 우회해 평일=코드로 채워지므로
+    #   `if nurses_for_engine:`(아래 솔버 호출부)이 이미 엔진을 건너뛴다. 그런데 precheck 는
+    #   그 가드가 없어 **간호사 0명·요구 0** 으로 돌았고, `_ensure_grade1_default` 의
+    #   grade-1 floor(D/E/N 각 1)가 요구 0 을 넘어서 GRADE_MIN_SUM_EXCEEDS_NEED 로 항상 막혔다.
+    #   (2026-08-14 인천의료원 수술실 실측: 19명 전원 고정근무인데 생성이 불가)
+    if not nurses_for_engine:
+        print("[Precheck] 엔진 대상 0명(전원 고정근무) — 검사 건너뜀")
         precheck_result = None
+    else:
+        try:
+            from services.precheck import (
+                run_runtime_precheck,
+                has_blocking_issues,
+                build_blocking_payload,
+            )
+            _engine_grade_config = _fetch_grade_config_dict(db, current_user.office_id, current_user.group_id)
+            # 주말휴무(as-of month)를 명시 조회 — 이 시점 엔진 객체엔 아직 미주입일 수 있어
+            # 온톨로지 정찰이 주말 강제OFF 부담을 놓치지 않게 SSOT(period)에서 직접 확정한다.
+            try:
+                from services.nurse_period_resolver import weekend_off_ids_asof as _wo_ids_pre
+                _wk_ids_pre = _wo_ids_pre(
+                    db, [getattr(n, "nurse_id", None) for n in (nurses_for_engine or [])],
+                    req.year, req.month)
+            except Exception:
+                _wk_ids_pre = set()
+            # [온톨로지 데이터 단일 소스] 정찰/온톨로지에 넘길 nurse 속성은 손으로 고르지 않고
+            # solver 가 보는 전체를 포괄한다. 개별 속성이 누락되면 온톨로지가 그 제약을 못 보는
+            # 사각지대(예: n_exact 누락으로 야간 모순 미검출)가 생기므로, 새 속성 추가 시 아래
+            # 목록 한 곳만 고치면 되게 한다. `getattr` 로 lazy-load 도 강제 로드.
+            #   - 월 한도(d/e/n/o × min/max/exact): 4565 오버레이로 엔진 nurse 에 실림(없으면 None)
+            #   - fixed_shift/allowed_shifts: 대상월 as-of 반영됨
+            #   - is_weekend_off: period SSOT(as-of)로 별도 확정
+            _ONTOLOGY_NURSE_FIELDS = (
+                "nurse_id", "grade", "team_id", "active", "sequence",
+                "joining_date", "resignation_date",
+                "allowed_shifts", "work_shifts", "fixed_shift",
+                "weekly_off_enabled", "weekly_off_weekday", "weekly_off_type",
+                "personal_off_adjustment", "preceptor_id",
+                "d_min", "d_max", "d_exact", "e_min", "e_max", "e_exact",
+                "n_min", "n_max", "n_exact", "o_min", "o_max", "o_exact",
+            )
+            _nurses_dict_for_precheck = []
+            for n in (nurses_for_engine or []):
+                _prof = {f: getattr(n, f, None) for f in _ONTOLOGY_NURSE_FIELDS}
+                _prof["db_id"] = _prof.get("nurse_id")
+                # 이름도 실어준다 — 원인 브리지(cause_to_resolution_options)·진단 문구가 nurse_id 가
+                #   아니라 이름으로 표기되도록. _ONTOLOGY_NURSE_FIELDS 엔 name 이 없어 폴백하던 문제.
+                _prof["name"] = getattr(n, "name", None)
+                _prof["is_weekend_off"] = str(_prof.get("nurse_id")) in _wk_ids_pre
+                _nurses_dict_for_precheck.append(_prof)
+            # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
+            # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
+            precheck_config = dict(config_dict)
+            if "team_min_by_team" not in precheck_config:
+                try:
+                    _team_rows = (
+                        db.query(Team)
+                        .filter(
+                            Team.office_id == current_user.office_id,
+                            Team.group_id == current_user.group_id,
+                            Team.active == 1,
+                        )
+                        .all()
+                    )
+                    _team_min_by_team: dict[str, dict[str, int]] = {}
+                    # teams.min_shift 미사용 — 활성 팀 중 '멤버가 배정된 팀'에만 디폴트 최소
+                    # (D:1, E:1, N:0[, use_mid면 M:0]). 인원 0 팀은 솔버가 무시하므로 team_min 에서도
+                    # 제외(안 그러면 TEAM_SIZE_INSUFFICIENT 로 오블로킹). 멤버십은 솔버와 동일 기준.
+                    _use_mid = bool(precheck_config.get("use_mid", False))
+                    _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
+                    if _use_mid:
+                        _default_tm["M"] = 0
+                    _member_team_ids = {
+                        str(_n.get("team_id"))
+                        for _n in _nurses_dict_for_precheck
+                        if _n.get("team_id") not in (None, "", 0)
+                    }
+                    for _t in _team_rows:
+                        if str(_t.team_id) not in _member_team_ids:
+                            continue
+                        _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
+                        if _cleaned:
+                            _team_min_by_team[str(_t.team_id)] = _cleaned
+                    if _team_min_by_team:
+                        precheck_config["team_min_by_team"] = _team_min_by_team
+                except Exception as _team_exc:
+                    print(f"[Precheck] team_min 로딩 실패(무시): {_team_exc}")
+
+            precheck_result = run_runtime_precheck(
+                nurses_dict=_nurses_dict_for_precheck,
+                config_dict=precheck_config,
+                grade_config=_engine_grade_config,
+                fixed_cells=combined_fixed_cells,
+                year=req.year,
+                month=req.month,
+                stop_on_config_error=False,
+            )
+            # 솔버 전 부족 조기진단(advisory, non-blocking) — max-flow(per-day+월별) 기반.
+            # 개인 속성(allowed_shifts/max_nig/weekend_off)은 불가침 → 복구 선택지는 관리자 노브만.
+            # 실측 부족 수치는 솔버 후 coverage_gaps 가 담당(여기 값은 증명된 하한).
+            try:
+                from services.ontology_graph.presolve_diagnosis import presolve_shortage_diagnosis
+                presolve_diag = presolve_shortage_diagnosis(
+                    _nurses_dict_for_precheck, precheck_config, req.year, req.month)
+                if presolve_diag.get("shortages"):
+                    print(
+                        f"[Presolve] 부족 예상 {len(presolve_diag['shortages'])}건 "
+                        f"({presolve_diag['elapsed_ms']}ms): "
+                        + "; ".join(
+                            f"{s['shift']} 월부족≥{s['monthly_shortage_lower_bound']}({s['reason']})"
+                            for s in presolve_diag['shortages']))
+            except Exception as _psd_exc:
+                print(f"[Presolve] 진단 실패(무시): {_psd_exc}")
+                presolve_diag = None
+            # 운영 shadow 진단(env AIDE_SHADOW_DIAGNOSIS 게이팅, 기본 off=no-op). 결과 무영향, 로그만.
+            # request_id=새 run_id(fix1). input_hash·model_signature 는 **여기서 한 번 확정**해 graph·
+            # production 로그에 동일 전달(fix2·3 — 재hash·모델차이로 인한 오분류 방지).
+            # solve_context: run_id·attempt_seq·input_hash·model_signature 를 **여기서 한 번 확정**해
+            # graph·production 양쪽이 동일 값을 쓴다(fix3·C — 양쪽 drift 방지, 확실히 pair).
+            _gen_run_id = _gen_ih = _gen_sig = _gen_nd = None
+            _gen_seq = 0
+            try:
+                import calendar as _cal
+                import uuid as _uuid
+                from services.ontology_graph.roster_ir import model_signature as _msig
+                from services.ontology_graph.shadow_diagnosis import _input_hash as _ihf
+                from services.ontology_graph.shadow_diagnosis import run_shadow
+                _gen_run_id = _uuid.uuid4().hex
+                _gen_nd = _cal.monthrange(req.year, req.month)[1]
+                _gen_ih = _ihf(_nurses_dict_for_precheck, precheck_config, _gen_nd)
+                _gen_sig = _msig(_nurses_dict_for_precheck, precheck_config, _gen_nd)
+                run_shadow(_nurses_dict_for_precheck, precheck_config, req.year, req.month,
+                           request_id=_gen_run_id, schedule_id=getattr(schedule, "schedule_id", None),
+                           attempt_id="primary_hard", attempt_seq=_gen_seq,
+                           input_hash=_gen_ih, model_signature=_gen_sig)
+            except Exception:
+                pass
+            if has_blocking_issues(precheck_result):
+                payload = build_blocking_payload(precheck_result)
+                # [원인 브리지] precheck 가 solve 전에 막으면(솔버 호출 생략) post-solve cause 경로가
+                #   안 도므로, 여기서 explain_infeasibility_from_config 로 개인/주말 원인을 진단해 카드를
+                #   payload 에 합류시킨다. 주말휴무 과다·야간전담 상한 등이 일반 capacity 문구로만 뜨고
+                #   해결 카드가 없던 갭을 메운다(정확 카드/문구로 override, 실패내성).
+                try:
+                    import calendar as _cal_cb
+                    from services.ontology_graph.lagrangian import (
+                        explain_infeasibility_from_config as _explain_cb,
+                    )
+                    from services.ontology_graph.mcs_trace import (
+                        cause_to_resolution_options as _cards_cb,
+                    )
+                    _nd_cb = _cal_cb.monthrange(req.year, req.month)[1]
+                    _cause_cb = _explain_cb(_nurses_dict_for_precheck, precheck_config, _nd_cb,
+                                            year=req.year, month=req.month)
+                    _cards = _cards_cb(_cause_cb.classification, _cause_cb.top_family, _cause_cb.targets)
+                    if _cards:
+                        _inf_cb = payload.setdefault("infeasibility", {})
+                        _inf_cb["resolution_options"] = _cards + (_inf_cb.get("resolution_options") or [])
+                        if _cause_cb.classification != "unknown" and _cause_cb.certificate:
+                            _inf_cb["summary_message_ko"] = _cause_cb.certificate
+                            _fx = _inf_cb.get("fix_suggestions_ko") or []
+                            if _cause_cb.certificate not in _fx:
+                                _inf_cb["fix_suggestions_ko"] = [_cause_cb.certificate] + _fx
+                        print(f"[Precheck][CauseBridge] {_cause_cb.classification}/"
+                              f"{_cause_cb.top_family} 카드 {len(_cards)}건 합류")
+                except Exception as _cb_exc:
+                    print(f"[Precheck][CauseBridge] 실패(무시): {_cb_exc}")
+                inf = payload.get("infeasibility", {})
+                issue_codes = sorted({
+                    str(i.get("reason_code", "?"))
+                    for i in (precheck_result.get("issues") or [])
+                })
+                print(
+                    f"[Precheck][BLOCKING] {len(precheck_result.get('issues', []))}건 — "
+                    f"codes={issue_codes}"
+                )
+                print(f"[Precheck][BLOCKING][message] {inf.get('summary_message_ko')}")
+                for s in (inf.get("fix_suggestions_ko") or [])[:5]:
+                    print(f"[Precheck][BLOCKING][fix] {s}")
+                print("[Precheck][BLOCKING] 솔버 호출 생략. HTTP 500 응답.")
+                try:
+                    db.delete(schedule)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                from fastapi import HTTPException
+                raise HTTPException(status_code=500, detail=payload)
+        except HTTPException:
+            raise
+        except Exception as _pre_exc:
+            # precheck 자체가 실패하면 무시하고 솔버 진행
+            print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
+            precheck_result = None
 
     if nurses_for_engine:
         # _debug_log(
