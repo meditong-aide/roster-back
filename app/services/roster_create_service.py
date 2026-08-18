@@ -3422,6 +3422,16 @@ def _build_validation_shift_main_map(roster_system) -> dict[str, str]:
                     default_shift = "O"
                 if sid and default_shift in {"D", "E", "N", "O", "M", "W"}:
                     shift_main_map[sid] = default_shift
+                    continue
+                # ★ 휴무 계열은 default_shift 가 비어 있어도 OFF 로 센다.
+                #   콜 코드(`오프콜` = 휴일 콜대기)가 여기 해당한다 — 근무로 세면
+                #   연속근무일수가 부풀어 위반 검출이 통째로 어긋난다.
+                #   ★ `default_shift` 에 'O' 를 넣어 해결하면 안 된다. 프론트가 그 값을
+                #     **D/E/N/O 대표 코드 선택**에 쓰기 때문에(nurse-util.ts `getDefaultShifts`
+                #     의 `shifts.find(default_shift === "O")`) 값이 중복되면 대표가
+                #     뒤바뀌어 OFF 행이 `오프콜` 로 표시된다(2026-08-18 실측).
+                if sid and str((row or {}).get("type") or "").strip() == "휴무":
+                    shift_main_map[sid] = "O"
     except Exception:
         pass
     return shift_main_map
@@ -6726,6 +6736,25 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         generated = postprocess_off_swap(db, schedule, generated, latest_config, req)
     except Exception as _off_swap_exc:
         print(f"[OffSwap] 후처리 실패 — 변환 미적용 진행: {_off_swap_exc}")
+    # 휴직 가림막 — `blocked_by_nurse_id`(:4990)는 **솔버 전용**이라 `fixed_shift` 를 가진
+    # 사람에게는 닿지 않는다. `_split_fixed_nurses` 로 갈라져 솔버를 안 타고 고정근무
+    # 전개(평일=fixed_shift·주말=OFF)로 채워지기 때문. 그 구멍만 여기서 막는다.
+    # ★ 콜보다 먼저 — 휴직자가 남아 있으면 콜 후보로 잡힐 수 있다.
+    try:
+        from services.leave_mask_postprocess import postprocess_leave_mask
+        generated = postprocess_leave_mask(db, schedule, generated, current_user, req)
+    except Exception as _leave_mask_exc:
+        print(f"[LeaveMask] 후처리 실패 — 가림 미적용 진행: {_leave_mask_exc}")
+    # 콜 당번 — 근무를 빼지 않고 코드만 갈아끼운다(D1→D1콜 · O→오프콜).
+    # ★ 검증(_validate_generated_roster)·재시도가 모두 끝난 뒤에 얹는다. 앞에 두면
+    #   검증이 모르는 콜 코드를 위반으로 잡을 수 있다.
+    # ★ 사용 여부 스위치는 따로 없다 — `shifts.call_base_id` 미등록 그룹은 안에서
+    #   즉시 원본을 돌려준다.
+    try:
+        from services.oncall_postprocess import postprocess_oncall
+        generated = postprocess_oncall(db, schedule, generated, current_user, req)
+    except Exception as _oncall_exc:
+        print(f"[Oncall] 후처리 실패 — 콜 미부여 진행: {_oncall_exc}")
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
