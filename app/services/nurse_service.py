@@ -455,15 +455,23 @@ def get_nurses_in_group_service(
             "emp_num": nurse.emp_num,
             "account_id": nurse.account_id,
             "name": nurse.name,
-            # ★ NULL 을 그대로 내보내면 근무자관리 폼이 숫자를 기대해 저장이 막힌다
-            #   ("Invalid input: expected number, received null"). 실측 2026-08-18:
-            #   인천의료원 active 258명 중 110명이 NULL. DB 는 미입력 그대로 두고
-            #   응답에서만 0 으로 채운다 — 엔진도 `experience or 0` 으로 읽으므로
-            #   (roster_create_service.py:4844 · cp_sat_basic.py:744) 근무표는 안 바뀐다.
+            # ★ NULL 을 그대로 내보내면 근무자관리 폼이 저장을 막는다
+            #   ("Invalid input: expected number, received null").
+            #   프론트 스키마가 `z.number().min(0).optional()` 인데 **`.optional()` 은
+            #   undefined 만 허용하고 null 은 거부**하는 것이 원인이다
+            #   (roster_front/src/pages/roster-management/schema/nurseBulkSchema.ts).
+            #   실측 2026-08-19 active 기준 — prod 916명 중 1명 · dev 914명 중 90명.
+            #   DB 는 미입력 그대로 두고 응답에서만 채운다. 엔진도 `experience or 0`
+            #   으로 읽으므로(roster_create_service.py:4844 · cp_sat_basic.py:744)
+            #   근무표 결과는 바뀌지 않는다.
             "experience": nurse.experience or 0,
             "role": nurse.role,
-            "level_": nurse.level_,
-            "is_head_nurse": nurse.is_head_nurse,
+            # ★ level_ 도 같은 이유 — `z.string().optional()` 이라 null 이면 막힌다.
+            #   실측 2026-08-19: prod 916명 중 21명 · dev 914명 중 112명이 NULL.
+            "level_": nurse.level_ or "",
+            # ★ boolean 은 `or` 를 쓰면 안 된다 — False 가 기본값으로 뒤집힌다.
+            #   컬럼은 nullable 이고 `default=` 는 INSERT 때만 걸리므로 None 방어만 한다.
+            "is_head_nurse": bool(nurse.is_head_nurse),
             "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
@@ -490,8 +498,13 @@ def get_nurses_in_group_service(
             "work_shifts": nurse.work_shifts
             or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
-            "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
-            "enable_aide": nurse.enable_aide,
+            # ★ 둘 다 `default=True` — None 은 True 로 채운다. `or True` 를 쓰면
+            #   꺼둔 사람(False)이 켜진 것으로 뒤집히므로 `is None` 으로만 판정한다.
+            "enable_nurse_pair_preference": (
+                True if nurse.enable_nurse_pair_preference is None
+                else bool(nurse.enable_nurse_pair_preference)
+            ),
+            "enable_aide": True if nurse.enable_aide is None else bool(nurse.enable_aide),
             "wanted_max_requests": nurse.wanted_max_requests,
             "is_inbound": False,
             # 근무표 설정 메타 플래그
@@ -672,15 +685,23 @@ def get_nurses_filtered_service(
             "emp_num": nurse.emp_num,
             "account_id": nurse.account_id,
             "name": nurse.name,
-            # ★ NULL 을 그대로 내보내면 근무자관리 폼이 숫자를 기대해 저장이 막힌다
-            #   ("Invalid input: expected number, received null"). 실측 2026-08-18:
-            #   인천의료원 active 258명 중 110명이 NULL. DB 는 미입력 그대로 두고
-            #   응답에서만 0 으로 채운다 — 엔진도 `experience or 0` 으로 읽으므로
-            #   (roster_create_service.py:4844 · cp_sat_basic.py:744) 근무표는 안 바뀐다.
+            # ★ NULL 을 그대로 내보내면 근무자관리 폼이 저장을 막는다
+            #   ("Invalid input: expected number, received null").
+            #   프론트 스키마가 `z.number().min(0).optional()` 인데 **`.optional()` 은
+            #   undefined 만 허용하고 null 은 거부**하는 것이 원인이다
+            #   (roster_front/src/pages/roster-management/schema/nurseBulkSchema.ts).
+            #   실측 2026-08-19 active 기준 — prod 916명 중 1명 · dev 914명 중 90명.
+            #   DB 는 미입력 그대로 두고 응답에서만 채운다. 엔진도 `experience or 0`
+            #   으로 읽으므로(roster_create_service.py:4844 · cp_sat_basic.py:744)
+            #   근무표 결과는 바뀌지 않는다.
             "experience": nurse.experience or 0,
             "role": nurse.role,
-            "level_": nurse.level_,
-            "is_head_nurse": nurse.is_head_nurse,
+            # ★ level_ 도 같은 이유 — `z.string().optional()` 이라 null 이면 막힌다.
+            #   실측 2026-08-19: prod 916명 중 21명 · dev 914명 중 112명이 NULL.
+            "level_": nurse.level_ or "",
+            # ★ boolean 은 `or` 를 쓰면 안 된다 — False 가 기본값으로 뒤집힌다.
+            #   컬럼은 nullable 이고 `default=` 는 INSERT 때만 걸리므로 None 방어만 한다.
+            "is_head_nurse": bool(nurse.is_head_nurse),
             "allowed_shifts": allowed_shifts,
             "personal_off_adjustment": nurse.personal_off_adjustment,
             "preceptor_id": nurse.preceptor_id,
@@ -706,8 +727,13 @@ def get_nurses_filtered_service(
             "work_shifts": nurse.work_shifts
             or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
-            "enable_nurse_pair_preference": nurse.enable_nurse_pair_preference,
-            "enable_aide": nurse.enable_aide,
+            # ★ 둘 다 `default=True` — None 은 True 로 채운다. `or True` 를 쓰면
+            #   꺼둔 사람(False)이 켜진 것으로 뒤집히므로 `is None` 으로만 판정한다.
+            "enable_nurse_pair_preference": (
+                True if nurse.enable_nurse_pair_preference is None
+                else bool(nurse.enable_nurse_pair_preference)
+            ),
+            "enable_aide": True if nurse.enable_aide is None else bool(nurse.enable_aide),
             "wanted_max_requests": nurse.wanted_max_requests,
             # 근무표 설정 메타 플래그
             **display_flags,

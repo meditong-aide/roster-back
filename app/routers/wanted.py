@@ -87,6 +87,8 @@ async def request_wanted_shifts(
     try:
         result = request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Wanted 작성 요청 실패: {str(e)}")
 
@@ -313,6 +315,8 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
         
         print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
         return {"response": result}
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f'error', e)
@@ -528,6 +532,8 @@ async def get_wanted_config_endpoint(
     try:
         result = get_wanted_config(db, target_group_id, filters)
         return [WantedConfigSchema.model_validate(r) for r in result]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")
 
@@ -561,6 +567,8 @@ async def upsert_wanted_config_endpoint(
         return [WantedConfigSchema.model_validate(r) for r in results]
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 저장 실패: {str(e)}")
 
@@ -600,6 +608,8 @@ async def delete_wanted_config_endpoint(
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
@@ -633,6 +643,8 @@ async def delete_wanted_config_by_month_endpoint(
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
@@ -669,6 +681,8 @@ async def validate_wanted_limits_endpoint(
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"날짜 형식 오류: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
 
@@ -741,6 +755,8 @@ async def get_wanted_adjustment(
             content=jsonable_encoder(result),
             media_type="application/json; charset=utf-8"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"원티드 조정판 조회 실패: {str(e)}")
 
@@ -909,6 +925,8 @@ async def reset_fixed_wanted(
     try:
         result = reset_fixed_wanted_service(db, target_group_id, year, month)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
@@ -996,6 +1014,8 @@ async def get_fixed_wanted(
             "entries": entries,
             "total_count": len(all_entries),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"확정 원티드 조회 실패: {str(e)}")
 

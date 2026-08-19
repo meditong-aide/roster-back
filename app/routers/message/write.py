@@ -75,5 +75,7 @@ def set_message(current_user: UserSchema = Depends(get_current_user_from_cookie)
             row = msdb_manager.execute(Message.set_message(), params=(OfficeCode, sendempseqno, recipient_id, message, messageimg))
 
         return {"result": "success", "message": "메세지가 전송되었습니다."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing email request: {e}")

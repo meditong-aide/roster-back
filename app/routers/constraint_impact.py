@@ -203,6 +203,8 @@ def get_modules(
             "modules": [asdict(m) for m in modules],
             "grouped_by_parent": grouped,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"list modules failed: {e}")
 
@@ -251,6 +253,8 @@ def preview_adjustments(
         }
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"preview failed: {e}")
 
@@ -294,5 +298,7 @@ def get_instances(
         }
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"find instances failed: {e}")

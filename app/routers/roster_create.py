@@ -144,6 +144,8 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
                 MessageBody=message_body,
             )
         )
+    except HTTPException:
+        raise
     except Exception as exc:  # boto3 예외 타입 다양
         # print('response', response)
         print('exc', exc)
@@ -224,6 +226,8 @@ async def roster_create_async(
                 ),
                 "materialized_config": materialized,
             }
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"근무표 생성 실패: {exc}"
@@ -264,6 +268,8 @@ async def roster_create_async(
             group_id=target_group_id,
             nurse_id=current_user.nurse_id,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Job 생성 실패: {exc}") from exc
 
@@ -474,6 +480,8 @@ async def request_schedule(
     """
     try:
         return request_schedule_service(req, current_user, db)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"스케줄 생성 실패: {str(e)}")
 
@@ -502,6 +510,8 @@ async def hold_generate_roster_endpoint(
     try:
         # 고정된 셀 정보를 포함하여 근무표 생성 서비스 호출
         return generate_roster_service_with_fixed_cells(req, current_user, db)
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"고정 후 근무표 생성 실패: {str(e)}")

@@ -48,6 +48,8 @@ def excelupload_form(request: Request, current_user: UserSchema = Depends(get_cu
 
         filename = 'easysetting_position.xls'
         rows = msdb_manager.fetch_all(Setting.list_position(), params=(OfficeCode, EmpSeqNo))
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"직위 엑셀 업로드 화면을 출력할 수 없습니다.")
@@ -135,6 +137,8 @@ async def create_upload_file(current_user: UserSchema = Depends(get_current_user
                     json_string = '{"result": insert fail}'
             else:
                 json_string = '{"result": delete fail}'
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"직위 엑셀 업로드 실패")

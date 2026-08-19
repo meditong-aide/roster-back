@@ -137,6 +137,8 @@ async def set_message(background_tasks: BackgroundTasks,current_user: UserSchema
                 html_body=html_body,
                 subtype=MessageType.html
             )
+        except HTTPException:
+            raise
         except Exception as e:
             # SMTP 연결 오류 등이 발생하면 500 에러를 반환
             raise HTTPException(status_code=500, detail=f"Error processing email request: {e}")

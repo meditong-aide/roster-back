@@ -201,6 +201,8 @@ async def save_roster_config(
             config_data, user, db, override_group_id=override_gid,
             sync_use_mid_live=True,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Configuration save failed: {str(e)}"
@@ -324,6 +326,8 @@ async def get_config_versions(
                 "last_applied": last_applied.get(p.config_id),
             })
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to get config versions: {str(e)}"
@@ -1027,7 +1031,7 @@ async def get_roster_by_schedule_id(
         nurse_entry = {
             "id": nurse.nurse_id,
             "name": nurse.name,
-            "experience": nurse.experience,
+            "experience": nurse.experience or 0,
             "schedule": nurse_schedule,
             "schedule_ids": schedule_ids,
             "counts": counts,
@@ -1303,7 +1307,7 @@ async def get_roster_for_month(
             {
                 "id": nurse.nurse_id,
                 "name": nurse.name,
-                "experience": nurse.experience,
+                "experience": nurse.experience or 0,
                 "schedule": nurse_schedule,
                 "counts": counts,
             }
@@ -1698,7 +1702,7 @@ async def get_roster_for_month(
             {
                 "id": nurse.nurse_id,
                 "name": nurse.name,
-                "experience": nurse.experience,
+                "experience": nurse.experience or 0,
                 "schedule": nurse_schedule,
                 "counts": counts,
             }
@@ -2482,6 +2486,8 @@ async def copy_schedule_to_new_version(
         print(
             f"[COPY SUCCESS] 새 schedule_id: {new_schedule_id}, version: {new_version}"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f"[COPY ERROR] 커밋 실패: {str(e)}")
@@ -2562,6 +2568,8 @@ async def create_empty_roster(
     try:
         db.commit()
         db.refresh(new_schedule)
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"빈 근무표 생성 실패: {str(e)}")
@@ -2738,6 +2746,8 @@ async def create_roster_with_weekly_off(
         db.commit()
         db.refresh(new_schedule)
         print(f"[DEBUG] 전체 주휴 엔트리 생성 완료: {created_entries}개")
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f"[ERROR] commit 실패: {str(e)}")
@@ -2830,6 +2840,8 @@ async def create_schedule_share_link(
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"공유 링크 생성 실패: {str(e)}")
 
@@ -2874,6 +2886,8 @@ async def create_schedule_share_link_with_upload(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"이미지 업로드/공유 링크 생성 실패: {str(e)}"
@@ -2920,6 +2934,8 @@ async def create_schedule_share_link_auto(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"자동 이미지 생성/공유 링크 생성 실패: {str(e)}"
@@ -2968,6 +2984,8 @@ async def create_schedule_share_link_capture(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"캡처 이미지 공유 링크 생성 실패: {str(e)}"
@@ -2993,6 +3011,8 @@ async def revoke_schedule_share_link(
         raise HTTPException(status_code=403, detail=str(e))
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"공유 링크 해제 실패: {str(e)}")
 
@@ -3107,6 +3127,8 @@ async def render_schedule_share_image(token: str, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Share image load failed: {str(e)}"

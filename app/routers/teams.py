@@ -173,6 +173,8 @@ async def put_teams(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         print('[DEBUG] [teams.py - put_teams] office_id', current_user.office_id)
         print('[DEBUG] [teams.py - put_teams] group_id', current_user.group_id)
