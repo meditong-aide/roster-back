@@ -896,6 +896,52 @@ def _split_fixed_nurses(nurses_in_group: list[Nurse]) -> tuple[list[Nurse], list
 #         pass
 
 
+def _holiday_off_enabled(db: Session, group_id: str) -> bool:
+    """`roster_config.fixed_holiday_off_yn` — 고정근무자를 공휴일에 쉬게 할지.
+
+    ★ ORM 모델에 올리지 않고 raw SQL 로 읽는다
+      `roster_config` 는 dev·prod 스키마가 이미 갈려 있다(2026-08-18 실측: 모델에만
+      있는 컬럼 10개 · dev 에만 있는 컬럼 11개). 모델에 얹으면 컬럼이 없는 환경에서
+      **설정 조회가 통째로 깨진다.** 존재를 먼저 확인하고 없으면 False 로 떨어뜨리면
+      코드를 먼저 배포하고 DDL 을 나중에 넣어도 안전하다(`shifts.call_base_id` 와 동일).
+
+    ★ 켜지 않은 그룹은 종전대로 평일에 `fixed_shift` 가 채워진다.
+    """
+    from sqlalchemy import text
+
+    try:
+        has_col = db.execute(text(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'roster_config' AND COLUMN_NAME = 'fixed_holiday_off_yn'"
+        )).first()
+        if not has_col:
+            return False
+        row = db.execute(text(
+            "SELECT TOP 1 fixed_holiday_off_yn FROM roster_config "
+            "WHERE group_id = :g ORDER BY config_id DESC"
+        ), {"g": group_id}).first()
+        return bool(row and row[0])
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Holiday] 설정 조회 실패 — 미적용으로 진행: {exc}")
+        return False
+
+
+def _kr_holidays_in_month(year: int, month: int) -> set[int]:
+    """그 달의 한국 공휴일(대체공휴일 포함) 일자. 조회 실패 시 빈 집합.
+
+    `holiday_pack` 이 쓰는 `python-holidays` 와 같은 소스다. 패키지가 없거나
+    조회가 실패해도 생성이 멈추면 안 되므로 빈 집합으로 떨어뜨린다 —
+    그 경우 종전처럼 평일로 채워진다(퇴행이지 파손은 아니다).
+    """
+    try:
+        import holidays as _h
+
+        return {d.day for d in _h.KR(years=[year]) if d.year == year and d.month == month}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Holiday] 공휴일 조회 실패 — 평일로 진행: {exc}")
+        return set()
+
+
 def _build_fixed_shift_roster(
     fixed_nurses: list[Nurse],
     year: int,
@@ -904,15 +950,31 @@ def _build_fixed_shift_roster(
     sunday_code: str = "주",
     shift_lookup: dict[str, Shift] | None = None,
     weekly_off_active: bool = True,
+    holiday_off: bool = False,
 ) -> dict[str, list[str]]:
     """고정 근무 간호사의 월간 스케줄을 생성합니다.
 
     - 평일(월~금): fixed_shift 코드 배정
     - 토요일: weekday_off_code
     - 일요일: weekly_off_active이고 간호사 weekly_off_enabled가 1일 때만 sunday_code
+    - **공휴일(대체공휴일 포함): weekday_off_code** — 요일과 무관하게 쉰다.
+
+    ★ 공휴일 규칙의 근거
+      2026-08-17(광복절 대체휴일·월요일) 실측 — office 102243 의 **13개 병동
+      고정근무자 28명 전원이 `O`** 였다(수술실 20명 포함 48명 전수). 즉 특정 병동
+      관행이 아니라 고정근무자 공통이다. 이 처리가 없으면 그날이 평일로 잡혀
+      `fixed_shift` 가 채워지고, 근무표 전체가 하루치 어긋난다(2026-08 실측:
+      전체 셀 불일치 51건 중 20건이 8/17 하루에서 나왔다).
+
+    ★ 솔버를 타는 간호사는 여기 오지 않는다 — `_split_fixed_nurses` 로 갈린
+      고정근무자 전용이다. 3교대 병동은 공휴일에도 24시간 돌아가므로 그쪽에
+      같은 규칙을 밀어 넣으면 안 된다.
     """
     days_in_month = calendar.monthrange(year, month)[1]
     month_start = date(year, month, 1)
+    holiday_days = _kr_holidays_in_month(year, month) if holiday_off else set()
+    if holiday_days:
+        print(f"[Holiday] 공휴일 OFF 적용 — days={sorted(holiday_days)}")
     result: dict[str, list[str]] = {}
     for nurse in fixed_nurses:
         shifts = ["-" for _ in range(days_in_month)]
@@ -940,10 +1002,13 @@ def _build_fixed_shift_roster(
         except Exception as e:
             print(f"[FixedShift] 로그 실패: {e}")
         for day_idx in range(start_idx, end_idx + 1):
-            weekday = (month_start + timedelta(days=day_idx)).weekday()
+            cur = month_start + timedelta(days=day_idx)
+            weekday = cur.weekday()
             if weekday >= 5:
                 is_sunday_weekly_off = weekday == 6 and weekly_off_enabled and not is_weekend_off
                 shifts[day_idx] = sunday_code if is_sunday_weekly_off else weekday_off_code
+            elif cur.day in holiday_days:
+                shifts[day_idx] = weekday_off_code      # 공휴일 — 평일이어도 쉰다
             else:
                 shifts[day_idx] = fixed_code
         result[str(nurse.nurse_id)] = shifts
@@ -5865,6 +5930,7 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         req.month,
         weekday_off_code="O",
         sunday_code="주",
+        holiday_off=_holiday_off_enabled(db, current_user.group_id),
         shift_lookup=_load_shift_lookup(db, current_user.office_id, current_user.group_id),
         weekly_off_active=bool(config_dict.get("weekly_off_settings_activate", False)),
     )
