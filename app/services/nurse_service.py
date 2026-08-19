@@ -455,7 +455,12 @@ def get_nurses_in_group_service(
             "emp_num": nurse.emp_num,
             "account_id": nurse.account_id,
             "name": nurse.name,
-            "experience": nurse.experience,
+            # ★ NULL 을 그대로 내보내면 근무자관리 폼이 숫자를 기대해 저장이 막힌다
+            #   ("Invalid input: expected number, received null"). 실측 2026-08-18:
+            #   인천의료원 active 258명 중 110명이 NULL. DB 는 미입력 그대로 두고
+            #   응답에서만 0 으로 채운다 — 엔진도 `experience or 0` 으로 읽으므로
+            #   (roster_create_service.py:4844 · cp_sat_basic.py:744) 근무표는 안 바뀐다.
+            "experience": nurse.experience or 0,
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
@@ -667,7 +672,12 @@ def get_nurses_filtered_service(
             "emp_num": nurse.emp_num,
             "account_id": nurse.account_id,
             "name": nurse.name,
-            "experience": nurse.experience,
+            # ★ NULL 을 그대로 내보내면 근무자관리 폼이 숫자를 기대해 저장이 막힌다
+            #   ("Invalid input: expected number, received null"). 실측 2026-08-18:
+            #   인천의료원 active 258명 중 110명이 NULL. DB 는 미입력 그대로 두고
+            #   응답에서만 0 으로 채운다 — 엔진도 `experience or 0` 으로 읽으므로
+            #   (roster_create_service.py:4844 · cp_sat_basic.py:744) 근무표는 안 바뀐다.
+            "experience": nurse.experience or 0,
             "role": nurse.role,
             "level_": nurse.level_,
             "is_head_nurse": nurse.is_head_nurse,
