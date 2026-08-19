@@ -267,6 +267,30 @@ def assign_oncall(
         helpers_this_week: list[str] = []
 
         # ── ① 담당 팀 배정 + 결원 수집 ──
+        week_days = [(monday + timedelta(days=o)).day for o in range(7)
+                     if (monday + timedelta(days=o)).month == month
+                     and (monday + timedelta(days=o)).year == year]
+
+        # ★ 담당주가 **2일 이상 끊기면 그 뒤를 통째로 넘긴다.**
+        #   콜은 한 사람이 이어서 서는 것이 원칙이라, 중간에 이틀 넘게 비면 그 주는
+        #   대체자에게 맡기고 담당자는 복귀하지 않는다.
+        #   실측과 맞춘 예외 두 가지 —
+        #     **1일 금지는 끊김이 아니다.** 그날 하루만 콜을 못 서는 사정이지 담당주를
+        #       놓은 것이 아니다: 고수연 8/17~20 콜 → 8/21 노조교육(그날만 불가) →
+        #       8/22~23 복귀.
+        #     **확정 원티드 면제도 끊김이 아니다.** "그날 안 선다" 는 의사표시일 뿐이다:
+        #       윤보라 8/10~13 원티드 → 8/14~16 복귀.
+        handover: dict[str, set[int]] = {}
+        for m in on_duty:
+            blocked = [d for d in week_days if can_take(m.nurse_id, d) is None]
+            for run in _group_consecutive(sorted(blocked)):
+                if len(run) < 2:
+                    continue
+                tail = week_days[week_days.index(run[-1]) + 1:]
+                if tail:
+                    handover[m.nurse_id] = set(tail)
+                break
+
         vacant: dict[int, list[OncallMember]] = {}
         for offset in range(7):
             cur = monday + timedelta(days=offset)
@@ -275,6 +299,8 @@ def assign_oncall(
             day = cur.day
             for m in on_duty:
                 code = can_take(m.nurse_id, day)
+                if code is not None and day in handover.get(m.nurse_id, ()):
+                    code = None            # 2일 이상 끊긴 뒤 — 그 주는 넘긴다
                 # ★ 담당주 중간에 끊겨도 **다시 설 수 있으면 복귀시킨다.** 실측 2026-08
                 #   고수연이 8/17~20 콜 → 8/21 노조교육 → 8/22~23 복귀로 담당주를 쪼갰다.
                 #   끊긴 뒤를 통째로 넘긴 민희원·성해인은 주 끝에 걸린 경우이거나
@@ -560,8 +586,8 @@ def _fill_block(
         sub, window = min(
             cands,
             key=lambda t: (t[0].rank not in want_ranks,
-                           not _repays(t[0].nurse_id),
                            not _adjoins_own(t[0].nurse_id, t[1]),
+                           not _repays(t[0].nurse_id),
                            t[0].nurse_id not in helpers,
                            -_own_gap(t[0].nurse_id, t[1]),
                            -debt.get(t[0].nurse_id, 0),
