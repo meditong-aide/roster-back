@@ -167,6 +167,7 @@ def assign_oncall(
     unavailable: Optional[dict[str, set[int]]] = None,
     max_per_month: Optional[dict[str, int]] = None,
     call_code_map: Optional[dict[str, str]] = None,
+    protected: Optional[dict[str, set[int]]] = None,
 ) -> OncallResult:
     """한 달치 콜을 배정한다.
 
@@ -177,12 +178,18 @@ def assign_oncall(
     - anchor / team_order: 로테이션 기준. 예) `date(2026,7,27)`, `[2,3,4,1]`
     - unavailable: `{nurse_id: {day,...}}` 개인이 등록한 콜 불가일
     - max_per_month: `{nurse_id: n}` 개인별 월 콜 상한(상시 부분 면제용)
+    - protected: `{nurse_id: {day,...}}` 확정 원티드로 굳힌 날. **대체로는 못 쓴다**
+      (담당주는 그대로 선다 — 주말 `O` → `오프콜` 은 정상 로테이션이다)
 
     반환
     - `OncallResult` — 갈아끼울 셀과 채우지 못한 자리
     """
     unavailable = unavailable or {}
     max_per_month = max_per_month or {}
+    #: ★ 확정 원티드로 굳힌 날은 **남의 주간에 끌려올 때만** 막는다.
+    #:   실측 2026-09: 하재욱(t1)이 team4 주간 9/12~13 대체로 투입되면서 본인이
+    #:   확정한 `O` 가 `오프콜` 로 덮였다. 담당주라면 정상이지만 대체는 아니다.
+    protected = protected or {}
     #: 이 표에 없는 코드(휴가·교육 등)는 콜을 설 수 없다 = 결원 판정 근거.
     code_map = call_code_map or {}
     result = OncallResult()
@@ -221,6 +228,27 @@ def assign_oncall(
             return None
         return code_map.get((roster.get(nid) or {}).get(day, ""))
 
+    # ── 결원 예정 일수 사전 스캔 ──
+    # ★ 자기 담당주에서 나중에 빠질 사람을 **앞선 주간의 대체로 먼저 쓴다.**
+    #   실측 8월: 성해인이 8/28~30(휴PM·OFF)에 빠질 예정이라 8/21~23 team1 주간을
+    #   먼저 도왔고, 결과적으로 총량이 담당주 일수와 같아졌다(9일). 미리 갚는 구조다.
+    own_days = _scan_own_days(
+        year=year, month=month, days_in_month=days_in_month,
+        members_asof=_members, anchor=anchor, team_order=team_order,
+        can_take=can_take, protected=protected,
+    )
+    debt = _scan_future_gaps(
+        year=year, month=month, days_in_month=days_in_month, roster=roster,
+        members_asof=_members, anchor=anchor, team_order=team_order,
+        code_map=code_map, unavailable=unavailable, max_per_month=max_per_month,
+    )
+
+    #: 품앗이 장부 `{도운 사람: {대신 서준 결원자, ...}}` — 그 달 안에서만 유효하다.
+    #: 실측 2026-08 에 성해인이 8/21~23 민희원 자리를 받고, 민희원이 8/28~30 성해인
+    #: 자리를 갚았다. 다른 어떤 기준(담당주 인접·간격·누적)으로도 민희원이 뽑히지
+    #: 않는다 — 갚는다는 사실 자체가 선택의 이유다.
+    helped: dict[str, set[str]] = {}
+
     # 주 단위로 순회 — 그 달에 걸치는 모든 주(월~일)를 본다.
     d = date(year, month, 1)
     last = date(year, month, days_in_month)
@@ -234,6 +262,8 @@ def assign_oncall(
         others = [m for m in roster_members if m.team_id != team_id]
         helpers_this_week: list[str] = []
 
+        # ── ① 담당 팀 배정 + 결원 수집 ──
+        vacant: dict[int, list[OncallMember]] = {}
         for offset in range(7):
             cur = monday + timedelta(days=offset)
             if cur.month != month or cur.year != year:
@@ -241,72 +271,305 @@ def assign_oncall(
             day = cur.day
             for m in on_duty:
                 code = can_take(m.nurse_id, day)
-                if code is not None:
-                    result.cells.append(OncallCell(
-                        nurse_id=m.nurse_id, day=day,
-                        before=roster[m.nurse_id][day], after=code, team_id=team_id,
-                    ))
-                    used[m.nurse_id] = used.get(m.nurse_id, 0) + 1
-                    assigned_days.setdefault(day, set()).add(m.nurse_id)
+                # ★ 확정 원티드로 굳힌 근무는 **담당주라도** 콜로 덮지 않는다.
+                #   2026-08 윤보라가 담당주 8/10~13 을 D1 으로만 서고 콜은 임종엽·
+                #   채다솔·윤상준이 나눠 받았다 — 근무를 못 서서 빠진 게 아니라
+                #   콜만 면제된 자리다. 원티드를 존중하면 그 형태가 그대로 나온다.
+                if code is not None and day in protected.get(m.nurse_id, ()):
+                    code = None
+                if code is None:
+                    vacant.setdefault(day, []).append(m)
                     continue
-
-                # ── 결원 → 대체자 탐색 ──
-                sub = _find_substitute(
-                    rank=m.rank, day=day, others=others,
-                    helpers_this_week=helpers_this_week,
-                    can_take=can_take, used=used,
-                )
-                if sub is None:
-                    result.vacancies.append(OncallVacancy(
-                        day=day, team_id=team_id, rank=m.rank,
-                        nurse_id=m.nurse_id, name=m.name,
-                        reason=_vacancy_reason(m.nurse_id, day, roster, unavailable,
-                                               max_per_month, used, code_map),
-                    ))
-                    continue
-                code = can_take(sub.nurse_id, day)
                 result.cells.append(OncallCell(
-                    nurse_id=sub.nurse_id, day=day,
-                    before=roster[sub.nurse_id][day], after=code,
-                    team_id=team_id, substitute=True,
+                    nurse_id=m.nurse_id, day=day,
+                    before=roster[m.nurse_id][day], after=code, team_id=team_id,
                 ))
-                used[sub.nurse_id] = used.get(sub.nurse_id, 0) + 1
-                assigned_days.setdefault(day, set()).add(sub.nurse_id)
-                if sub.nurse_id not in helpers_this_week:
-                    helpers_this_week.append(sub.nurse_id)
+                used[m.nurse_id] = used.get(m.nurse_id, 0) + 1
+                assigned_days.setdefault(day, set()).add(m.nurse_id)
+
+        # ── ② 결원을 인접 블록으로 묶어 한 사람에게 통째로 맡긴다 ──
+        # ★ 날짜별로 빈자리를 메우면 하루짜리 콜이 튀어나온다. 실측(2026-08)은
+        #   블록 단위였다 — 8/21 고수연(t1-4) 하루 결원 + 8/22~23 민희원(t1-2) 이틀
+        #   결원을 **성해인 한 명이 8/21~23 사흘 연속**으로 받았다. 서열도 안 맞는다.
+        #   즉 병원은 "자리별 대체" 가 아니라 "블록 단위 투입" 으로 처리한다.
+        for block in _group_consecutive(sorted(vacant)):
+            _fill_block(
+                block=block, vacant=vacant, others=others, team_id=team_id,
+                roster=roster, can_take=can_take, used=used,
+                assigned_days=assigned_days, helpers=helpers_this_week,
+                result=result, unavailable=unavailable, helped=helped,
+                max_per_month=max_per_month, code_map=code_map,
+                protected=protected, debt=debt, own_days=own_days,
+            )
 
         monday += timedelta(days=7)
 
     return result
 
 
-def _find_substitute(
-    *, rank: int, day: int, others: list[OncallMember],
-    helpers_this_week: list[str], can_take, used: dict[str, int],
-) -> Optional[OncallMember]:
-    """결원 자리를 메울 사람. 꼬리물기 → 같은 서열 → 형평 순.
+#: 담당주와 **떨어진** 대체에서 한 사람이 연속으로 설 수 있는 최대 일수.
+#: 실측: 한승윤 8/11~13(3일) · 민희원 8/28~30(3일) — 담당주와 붙지 않은 대체는 3일까지.
+MAX_SUB_RUN = 3
 
-    ★ 꼬리물기가 서열보다 먼저다 — 실측 8/21 에서 성해인(t2-2)이 고수연(t1-4) 자리를
-      메운 건 서열이 맞아서가 아니라 8/21~23 을 연속으로 섰기 때문이다.
+#: 담당주에 **이어 붙일 때** 허용되는 연속 콜 총 길이.
+#: 실측 2026-08 — 김영민이 담당주 8/03~09(7일)에 8/10 하루를 꼬리로 붙여 **8일 연속**을
+#: 채웠고, 거기서 끊겨 8/11~13 은 한승윤에게 넘어갔다. 성해인도 8/21~27 로 7일 연속이다.
+#: 즉 자기 주에 붙는 연장은 3일 제한이 아니라 이 총량이 상한이다.
+MAX_CALL_RUN = 8
+
+
+def _run_length_with(
+    assigned_days: dict[int, set[str]], nid: str, days: list[int],
+    future_own: set[int] | None = None,
+) -> int:
+    """`days` 를 추가로 맡았을 때 그 사람의 **연속 콜 최대 길이**.
+
+    ★ `future_own` = 앞으로 설 자기 담당주 날짜. 이걸 넣어야 "담당주 직전 블록을
+      받아 담당주와 이어지는" 경우를 미리 잡는다(실측 2026-09 고수연 11일 연속).
     """
-    by_id = {m.nurse_id: m for m in others}
+    mine = ({d for d, who in assigned_days.items() if nid in who}
+            | set(days) | set(future_own or ()))
+    if not mine:
+        return 0
+    best = run = 1
+    prev = None
+    for d in sorted(mine):
+        run = run + 1 if prev is not None and d == prev + 1 else 1
+        best = max(best, run)
+        prev = d
+    return best
 
-    # ① 이 주에 이미 대체 중인 사람이 계속 가능하면 그대로 이어간다
-    for nid in helpers_this_week:
-        m = by_id.get(nid)
-        if m is not None and can_take(nid, day) is not None:
-            return m
 
-    # ② 같은 서열의 타 팀 — 동률이면 누적 콜이 적은 사람
-    same_rank = [m for m in others if m.rank == rank and can_take(m.nurse_id, day) is not None]
-    if same_rank:
-        return min(same_rank, key=lambda m: (used.get(m.nurse_id, 0), m.nurse_id))
+def _group_consecutive(days: list[int]) -> list[list[int]]:
+    """연속된 날짜를 하나의 블록으로 묶는다. `[21,22,23,28]` → `[[21,22,23],[28]]`"""
+    blocks: list[list[int]] = []
+    for d in days:
+        if blocks and d == blocks[-1][-1] + 1:
+            blocks[-1].append(d)
+        else:
+            blocks.append([d])
+    return blocks
 
-    # ③ 서열이 맞는 사람이 없으면 서열 차가 작은 순 → 누적 콜 적은 순
-    pool = [m for m in others if can_take(m.nurse_id, day) is not None]
-    if not pool:
-        return None
-    return min(pool, key=lambda m: (abs(m.rank - rank), used.get(m.nurse_id, 0), m.nurse_id))
+
+def _scan_own_days(
+    *, year: int, month: int, days_in_month: int, members_asof,
+    anchor: date, team_order: list[int], can_take, protected: dict[str, set[int]],
+) -> dict[str, set[int]]:
+    """각자 자기 팀 담당일 중 **실제로 설 수 있는 날**. 연속 길이 상한 계산용.
+
+    ★ 담당주라도 근무가 콜 불가이거나 확정 원티드로 굳힌 날은 서지 않는다. 이걸
+      빼지 않으면 연속 길이를 과대평가해 대체 투입이 잘린다 — 실측 2026-08 성해인은
+      담당주 8/24~30 중 28~30 이 원티드로 빠지는데, 그걸 세는 바람에 8/21~23 이
+      10일 연속으로 계산돼 8/23 하루만 받았다(실제로는 8/21~27 = 7일).
+    """
+    out: dict[str, set[int]] = {}
+    monday = week_start(date(year, month, 1))
+    last = date(year, month, days_in_month)
+    while monday <= last:
+        team_id = team_of_week(monday, anchor, team_order)
+        for m in members_asof(monday):
+            if m.team_id != team_id:
+                continue
+            for off in range(7):
+                cur = monday + timedelta(days=off)
+                if cur.month != month or cur.year != year:
+                    continue
+                if can_take(m.nurse_id, cur.day) is None:
+                    continue
+                if cur.day in protected.get(m.nurse_id, ()):
+                    continue
+                out.setdefault(m.nurse_id, set()).add(cur.day)
+        monday += timedelta(days=7)
+    return out
+
+
+def _scan_future_gaps(
+    *, year: int, month: int, days_in_month: int, roster, members_asof,
+    anchor: date, team_order: list[int], code_map: dict[str, str],
+    unavailable: dict, max_per_month: dict,
+) -> dict[str, int]:
+    """각자 **자기 담당주에서 못 설 날이 며칠인지** 미리 센다.
+
+    배정 전에 계산하므로 `used`(누적) 는 못 보고, 근무 코드·불가일만 본다.
+    상한(`max_per_month`)으로 빠질 몫도 더한다 — 담당주 일수가 상한을 넘으면
+    그 차이만큼은 확정적으로 빈다.
+    """
+    gaps: dict[str, int] = {}
+    own_days: dict[str, int] = {}
+    monday = week_start(date(year, month, 1))
+    last = date(year, month, days_in_month)
+    while monday <= last:
+        team_id = team_of_week(monday, anchor, team_order)
+        for m in members_asof(monday):
+            if m.team_id != team_id:
+                continue
+            for off in range(7):
+                cur = monday + timedelta(days=off)
+                if cur.month != month or cur.year != year:
+                    continue
+                own_days[m.nurse_id] = own_days.get(m.nurse_id, 0) + 1
+                blocked = (cur.day in unavailable.get(m.nurse_id, ())
+                           or code_map.get((roster.get(m.nurse_id) or {}).get(cur.day, "")) is None)
+                if blocked:
+                    gaps[m.nurse_id] = gaps.get(m.nurse_id, 0) + 1
+        monday += timedelta(days=7)
+    for nid, cap in max_per_month.items():
+        spare = own_days.get(nid, 0) - gaps.get(nid, 0) - cap
+        if spare > 0:
+            gaps[nid] = gaps.get(nid, 0) + spare
+    return gaps
+
+
+def _fill_block(
+    *, block: list[int], vacant: dict[int, list[OncallMember]],
+    others: list[OncallMember], team_id: int, roster, can_take, used,
+    assigned_days, helpers: list[str], result: OncallResult,
+    unavailable, max_per_month, code_map, protected: dict[str, set[int]],
+    debt: dict[str, int], own_days: dict[str, set[int]],
+    helped: dict[str, set[str]],
+) -> None:
+    """한 블록의 결원을 대체자에게 맡긴다 — **블록 전체를 덮는 사람이 우선**.
+
+    ★ 이미 그 주에 들어온 대체자(helpers)를 먼저 본다 — 한 사람이 이어서 서는 게
+      여러 명이 하루씩 끼어드는 것보다 낫다(실측 8/21~23 성해인).
+    ★ 전부는 못 덮어도 되는 만큼 맡기고 남은 날은 다음 후보로 넘긴다
+      (실측 8/10~13: 김영민 1일 + 한승윤 3일로 갈렸다).
+    """
+    # ★ 결원이 **아닌** 날까지 대체자에게 넘기는 "같은 서열 자리 교대" 는 넣지 않았다.
+    #   2026-08 에 그렇게 보이는 사례가 있으나(8/21~23 성해인 IN ↔ 민희원 OUT,
+    #   8/24~30 민희원 IN ↔ 성해인 OUT) 둘은 **성해인·민희원 1:1 맞교환 한 건**이고,
+    #   2026-07 은 대체 자체가 0건이다. 표본 1건으로 규칙을 세우면 결원이 하루뿐인
+    #   주에서도 담당팀원을 밀어내 실측 재현율이 91.1%→87.9% 로 떨어진다(실측).
+    #   근거가 쌓이기 전까지는 **결원인 날만** 대체한다.
+    remaining = {d: list(vacant[d]) for d in block}
+    while any(remaining.values()):
+        days = [d for d in block if remaining[d]]
+        def _free(m, d) -> bool:
+            return (can_take(m.nurse_id, d) is not None
+                    and d not in protected.get(m.nurse_id, ()))
+
+        # ★ 자기 담당주에 **이어 붙는** 사람은 MAX_CALL_RUN(8일)까지, 떨어진 대체는
+        #   MAX_SUB_RUN(3일)까지. 실측 8/10~13 이 김영민 1일(8/3~9 꼬리) + 한승윤 3일로
+        #   갈린 것이 이 두 상한의 결과다.
+        def _take_span(m) -> list[int]:
+            """그 사람이 이번에 받을 수 있는 날들.
+
+            ★ 상한은 **그 사람의 전체 연속 콜 길이**로 잰다 — `own_days` 로 앞으로 설
+              담당주까지 포함해야 한다. 이걸 빼먹으면 담당주 직전 블록을 받은 사람이
+              담당주와 이어져 11일 연속이 된다(2026-09 고수연에서 실측).
+            """
+            span = days[-MAX_SUB_RUN:] if len(days) > MAX_SUB_RUN else list(days)
+            span = [d for d in span if _free(m, d)]
+            while span and (
+                _run_length_with(assigned_days, m.nurse_id, span,
+                                 own_days.get(m.nurse_id, set())) > MAX_CALL_RUN
+                or not _sub_run_ok(m.nurse_id, span)
+            ):
+                span = span[1:]
+            return span
+
+        def _sub_run_ok(nid: str, span: list[int]) -> bool:
+            """담당주와 **떨어진** 대체 구간이 MAX_SUB_RUN 을 넘지 않는지.
+
+            ★ 한 번에 3일씩 자르는 것만으로는 부족하다 — 같은 사람이 다음 블록에서
+              또 뽑히면 이어 붙어 5일이 된다(2026-09 한승윤 9~13 실측).
+              그래서 **누적 배정까지 합친 연속 구간**으로 판정한다.
+            """
+            own = own_days.get(nid, set())
+            mine = ({d for d, who in assigned_days.items() if nid in who}
+                    | set(span) | own)
+            for run in _group_consecutive(sorted(mine)):
+                if not set(run) & set(span):
+                    continue
+                if set(run) & own:
+                    continue        # 담당주에 이어붙는 연장 — MAX_CALL_RUN 이 상한
+                if len(run) > MAX_SUB_RUN:
+                    return False
+            return True
+
+        cands = [(m, _take_span(m)) for m in others]
+        cands = [(m, sp) for m, sp in cands if sp]
+        if not cands:
+            break
+        # ★ 서열(rank)은 순번이 아니라 **역할**이다 — 엑셀 주석 "1일 콜 대기 4명
+        #   (마취/소독/순환/전담간호사)". 마취가 빠지면 다른 팀 마취가 와야 한다.
+        #   실측 2026-08 대체 3건이 전부 역할 일치다:
+        #     윤보라 t4-1 ← 김영민 t3-1 · 한승윤 t2-1
+        #     민희원 t1-2 ← 성해인 t2-2 / 성해인 t2-2 ← 민희원 t1-2
+        #   같은 역할이 아무도 못 서면 다른 역할로 내려간다(4명 정원이 우선).
+        want_ranks = {m.rank for d in days for m in remaining[d]}
+
+        def _adjoins_own(nid: str, span: list[int]) -> bool:
+            """그 구간이 자기 담당주에 **바로 이어 붙는가**.
+
+            실측 8/10 은 김영민(t3-1)이 자기 담당주 8/3~9 마지막날 다음을 그대로
+            이어받았다 — 남의 주에 새로 끼어드는 것보다 이쪽이 먼저다.
+            """
+            own = own_days.get(nid, set())
+            return bool(own) and (span[0] - 1 in own or span[-1] + 1 in own)
+
+        def _own_gap(nid: str, span: list[int]) -> int:
+            """그 구간과 자기 담당주 사이의 최단 간격 — **클수록 좋다**.
+
+            콜은 야간 대기라 대체 직후 담당주가 오면 사실상 연속 대기가 된다.
+            실측 8/11~13 이 그 근거다 — 누적 콜이 0회인 하재욱(t1, 담당주까지 4일)
+            대신 2회인 한승윤(t2, 9일)을 불렀다. 하재욱을 부르면 3일 쉬고 담당주
+            7일이라 회복이 안 된다.
+            """
+            own = own_days.get(nid, set())
+            if not own:
+                return 99
+            return min(abs(d - o) for d in (span[0], span[-1]) for o in own)
+
+        def _repays(nid: str) -> bool:
+            """이번 결원자 중 **나를 대신 서준 사람**이 있는가 — 갚을 차례다."""
+            return any(nid in helped.get(v.nurse_id, ())
+                       for d in days for v in remaining[d])
+
+        # 역할 → 갚기 → 담당주 꼬리물기 → 그 주 재사용 → 담당주와 먼 순 → debt → 누적
+        sub, window = min(
+            cands,
+            key=lambda t: (t[0].rank not in want_ranks,
+                           not _repays(t[0].nurse_id),
+                           not _adjoins_own(t[0].nurse_id, t[1]),
+                           t[0].nurse_id not in helpers,
+                           -_own_gap(t[0].nurse_id, t[1]),
+                           -debt.get(t[0].nurse_id, 0),
+                           used.get(t[0].nurse_id, 0), t[0].nurse_id),
+        )
+        took = False
+        for d in window:
+            code = can_take(sub.nurse_id, d)
+            if code is None:
+                continue
+            if d in protected.get(sub.nurse_id, ()):
+                continue                   # 확정 원티드 날 — 대체로 덮지 않는다
+            if not remaining[d]:
+                continue
+            covered = remaining[d].pop(0)
+            helped.setdefault(sub.nurse_id, set()).add(covered.nurse_id)
+            result.cells.append(OncallCell(
+                nurse_id=sub.nurse_id, day=d,
+                before=roster[sub.nurse_id][d], after=code,
+                team_id=team_id, substitute=True,
+            ))
+            used[sub.nurse_id] = used.get(sub.nurse_id, 0) + 1
+            assigned_days.setdefault(d, set()).add(sub.nurse_id)
+            took = True
+        if sub.nurse_id not in helpers:
+            helpers.append(sub.nurse_id)
+        if not took:
+            break
+
+    for d, ms in remaining.items():
+        for m in ms:
+            result.vacancies.append(OncallVacancy(
+                day=d, team_id=team_id, rank=m.rank,
+                nurse_id=m.nurse_id, name=m.name,
+                reason=("확정 원티드(콜 면제)" if d in protected.get(m.nurse_id, ())
+                        else _vacancy_reason(m.nurse_id, d, roster, unavailable,
+                                             max_per_month, used, code_map)),
+            ))
 
 
 def _vacancy_reason(
