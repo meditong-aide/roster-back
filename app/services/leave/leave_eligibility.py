@@ -61,7 +61,7 @@ def fetch_leave_flags(db: Session, nurse_ids, year: int, month: int) -> dict[str
         db.rollback()
         logger.warning(
             "[LeavePeriod] nurse_leave_period 미생성 — 전원 자동판정으로 진행. "
-            "DDL(scripts/leave_auto_assignment_step6_nurse_leave_period.sql) 적용 필요."
+            "DDL(migrations/2026_08_19_add_leave_auto_assignment_tables.sql) 적용 필요."
         )
         return {}
 
