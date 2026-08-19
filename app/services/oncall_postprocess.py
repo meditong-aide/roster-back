@@ -85,17 +85,21 @@ def _pick_schedule(db: Session, group_id: str, year: int, month: int):
     ★ 같은 달에 근무표가 여러 개 쌓인다(실측 2026-08: 7건 · 2026-09: 8건).
       전부 합쳐 읽으면 재생성할 때마다 실적이 뒤섞여 역산도 학습도 망가진다.
       확정된 것이 있으면 그것이 사실이고, 없으면 가장 최근 시도를 본다.
+
+    ★★ **삭제(soft delete)된 근무표는 제외한다.** `drop_schedule` 은 `dropped=True`
+      만 세우고 status 는 'issued' 로 남기므로, 안 거르면 **지운 근무표가 역산·학습
+      기준이 된다.** 같은 파일의 `prev_month_fallback` · `rebuild_night_cycle_from`
+      은 이미 거르고 있어 규약도 여기서만 어긋나 있었다.
     """
     from db.models import Schedule, ScheduleEntry
 
     rows = db.query(Schedule).filter(
         Schedule.group_id == group_id,
-        Schedule.year == year, Schedule.month == month).all()
+        Schedule.year == year, Schedule.month == month,
+        Schedule.dropped == False).all()  # noqa: E712
     if not rows:
         return None
     issued = [r for r in rows if str(r.status or "").strip() == "issued"]
-    for cand in (issued or rows):
-        pass
     pool = issued or rows
     pool = sorted(pool, key=lambda r: (r.created_at or date.min), reverse=True)
     for r in pool:
