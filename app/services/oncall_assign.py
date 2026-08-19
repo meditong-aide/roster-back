@@ -168,6 +168,7 @@ def assign_oncall(
     max_per_month: Optional[dict[str, int]] = None,
     call_code_map: Optional[dict[str, str]] = None,
     protected: Optional[dict[str, set[int]]] = None,
+    carried_helped: Optional[dict[str, set[str]]] = None,
 ) -> OncallResult:
     """한 달치 콜을 배정한다.
 
@@ -243,11 +244,14 @@ def assign_oncall(
         code_map=code_map, unavailable=unavailable, max_per_month=max_per_month,
     )
 
-    #: 품앗이 장부 `{도운 사람: {대신 서준 결원자, ...}}` — 그 달 안에서만 유효하다.
+    #: 품앗이 장부 `{도운 사람: {대신 서준 결원자, ...}}`.
     #: 실측 2026-08 에 성해인이 8/21~23 민희원 자리를 받고, 민희원이 8/28~30 성해인
     #: 자리를 갚았다. 다른 어떤 기준(담당주 인접·간격·누적)으로도 민희원이 뽑히지
     #: 않는다 — 갚는다는 사실 자체가 선택의 이유다.
-    helped: dict[str, set[str]] = {}
+    #: ★ **월 경계를 넘긴다.** 달 안에서 못 갚은 빚이 남기 때문이다 — 실측 2026-08
+    #:   윤보라가 김영민·한승윤에게 8/10~13 을 대신 서게 하고 그 달에 갚지 못했다.
+    #:   `carried_helped` 로 직전 달 장부를 받아 9월 첫 배정부터 반영한다.
+    helped: dict[str, set[str]] = {k: set(v) for k, v in (carried_helped or {}).items()}
 
     # 주 단위로 순회 — 그 달에 걸치는 모든 주(월~일)를 본다.
     d = date(year, month, 1)
@@ -271,6 +275,12 @@ def assign_oncall(
             day = cur.day
             for m in on_duty:
                 code = can_take(m.nurse_id, day)
+                # ★ 담당주 중간에 끊겨도 **다시 설 수 있으면 복귀시킨다.** 실측 2026-08
+                #   고수연이 8/17~20 콜 → 8/21 노조교육 → 8/22~23 복귀로 담당주를 쪼갰다.
+                #   끊긴 뒤를 통째로 넘긴 민희원·성해인은 주 끝에 걸린 경우이거나
+                #   품앗이(helped)로 설명되는 자리다.
+                #   ★ 특히 오프콜은 실제 근무가 없는 대기라(휴일 콜) 며칠 끊겼다가
+                #     돌아와도 부담이 다르다 — 복귀를 막지 않는다.
                 # ★ 확정 원티드로 굳힌 근무는 **담당주라도** 콜로 덮지 않는다.
                 #   2026-08 윤보라가 담당주 8/10~13 을 D1 으로만 서고 콜은 임종엽·
                 #   채다솔·윤상준이 나눠 받았다 — 근무를 못 서서 빠진 게 아니라
@@ -292,15 +302,24 @@ def assign_oncall(
         #   블록 단위였다 — 8/21 고수연(t1-4) 하루 결원 + 8/22~23 민희원(t1-2) 이틀
         #   결원을 **성해인 한 명이 8/21~23 사흘 연속**으로 받았다. 서열도 안 맞는다.
         #   즉 병원은 "자리별 대체" 가 아니라 "블록 단위 투입" 으로 처리한다.
-        for block in _group_consecutive(sorted(vacant)):
-            _fill_block(
-                block=block, vacant=vacant, others=others, team_id=team_id,
-                roster=roster, can_take=can_take, used=used,
-                assigned_days=assigned_days, helpers=helpers_this_week,
-                result=result, unavailable=unavailable, helped=helped,
-                max_per_month=max_per_month, code_map=code_map,
-                protected=protected, debt=debt, own_days=own_days,
-            )
+        # ★ 결원을 **역할(rank)별로** 나눠 채운다. 날짜로만 묶으면 서로 다른 역할의
+        #   결원이 한 덩어리가 되어 조각이 뒤섞인다 — 실측 2026-09: rank1(상한 초과)
+        #   9/10~13 과 rank3(제약·휴가) 9/10~11 이 [10,11,12,13] 한 블록으로 합쳐지면서
+        #   고수진이 9/10 하루만 받는 고립 대체가 나왔다.
+        #   rank 는 순번이 아니라 역할(마취/소독/순환/전담)이라 자리마다 따로 메운다.
+        for rank in sorted({m.rank for ms in vacant.values() for m in ms}):
+            rank_vacant = {d: [m for m in ms if m.rank == rank]
+                           for d, ms in vacant.items()}
+            rank_vacant = {d: ms for d, ms in rank_vacant.items() if ms}
+            for block in _group_consecutive(sorted(rank_vacant)):
+                _fill_block(
+                    block=block, vacant=rank_vacant, others=others, team_id=team_id,
+                    roster=roster, can_take=can_take, used=used,
+                    assigned_days=assigned_days, helpers=helpers_this_week,
+                    result=result, unavailable=unavailable, helped=helped,
+                    max_per_month=max_per_month, code_map=code_map,
+                    protected=protected, debt=debt, own_days=own_days,
+                )
 
         monday += timedelta(days=7)
 
@@ -458,22 +477,33 @@ def _fill_block(
               담당주까지 포함해야 한다. 이걸 빼먹으면 담당주 직전 블록을 받은 사람이
               담당주와 이어져 11일 연속이 된다(2026-09 고수연에서 실측).
             """
-            span = days[-MAX_SUB_RUN:] if len(days) > MAX_SUB_RUN else list(days)
+            # ★ 남는 조각이 1일이 되면 **고립 1일 대체**가 생긴다. 실측 2026-08 에서
+            #   1일 블록은 김영민 8/10 하나뿐이고 그건 자기 담당주 8/3~9 바로 다음날이라
+            #   연속의 연장이었다 — **담당주와 떨어진 1일은 0건**이다.
+            #   그래서 4일을 3+1 로 자르지 않고 한 사람이 통째로 받는다. MAX_SUB_RUN 을
+            #   한 칸 넘기지만, 고립 1일을 만드는 것보다 실측 형태에 가깝다
+            #   (실측 2026-09 생성분에서 고수진·하재욱이 하루씩 끼어들던 자리).
+            limit = MAX_SUB_RUN
+            if len(days) - limit == 1:
+                limit = len(days)      # 3+1 로 갈라 고립을 만들지 말고 통째로 준다
+            span = days[-limit:] if len(days) > limit else list(days)
             span = [d for d in span if _free(m, d)]
             while span and (
                 _run_length_with(assigned_days, m.nurse_id, span,
                                  own_days.get(m.nurse_id, set())) > MAX_CALL_RUN
-                or not _sub_run_ok(m.nurse_id, span)
+                or not _sub_run_ok(m.nurse_id, span, limit)
             ):
                 span = span[1:]
             return span
 
-        def _sub_run_ok(nid: str, span: list[int]) -> bool:
+        def _sub_run_ok(nid: str, span: list[int], allow: int = MAX_SUB_RUN) -> bool:
             """담당주와 **떨어진** 대체 구간이 MAX_SUB_RUN 을 넘지 않는지.
 
             ★ 한 번에 3일씩 자르는 것만으로는 부족하다 — 같은 사람이 다음 블록에서
               또 뽑히면 이어 붙어 5일이 된다(2026-09 한승윤 9~13 실측).
               그래서 **누적 배정까지 합친 연속 구간**으로 판정한다.
+            ★ `allow` 는 호출부가 정한 상한이다. 기본은 MAX_SUB_RUN 이지만, 3+1 로 갈라
+              고립 1일이 생기는 블록에서는 통째로 주려고 4 가 넘어온다.
             """
             own = own_days.get(nid, set())
             mine = ({d for d, who in assigned_days.items() if nid in who}
@@ -483,7 +513,7 @@ def _fill_block(
                     continue
                 if set(run) & own:
                     continue        # 담당주에 이어붙는 연장 — MAX_CALL_RUN 이 상한
-                if len(run) > MAX_SUB_RUN:
+                if len(run) > allow:
                     return False
             return True
 

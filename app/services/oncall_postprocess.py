@@ -229,6 +229,11 @@ def _tally_month(
 
     ★ 그때 팀과 지금 팀이 다른 사람은 건너뛴다 — 담당주가 달라져 수행률을
       나란히 놓을 수 없다.
+
+    ★★ 확정 원티드 날도 **분모에 그대로 둔다.** 원티드를 빼면 "그 달만 빠진 사람" 과
+      "상시 적게 서는 사람" 이 같아져 학습이 무력해진다 — 실측 윤보라는 7월에도 3콜,
+      8월에도 3콜로 **월 3회가 그 사람의 상시 수준**이다(원티드는 그 사실을 기록한
+      것이지 원인이 아니다). 분모에서 빼면 상한이 사라져 9월에 7콜이 배정된다.
     """
     start = _resolve_start_team(db, group_id, y, m, call_codes)
     if start is None:
@@ -329,6 +334,47 @@ def _call_banned_eves(
     return out
 
 
+def _carry_helped(db: Session, group_id: str, year: int, month: int,
+                  code_map: dict[str, str], anchor: date,
+                  team_order: list[int]) -> dict[str, set[str]]:
+    """직전 달 마감본에서 **품앗이 장부**를 역산한다 `{도운 사람: {결원자, ...}}`.
+
+    ★ 빚은 달을 넘긴다. 실측 2026-08 — 성해인↔민희원은 그 달 안에서 상호 완결됐지만
+      윤보라는 김영민·한승윤에게 8/10~13 을 대신 서게 하고 갚지 못했다. 장부를 매달
+      비우면 9월이 그 사실을 모른 채 시작해 같은 사람에게 부담이 계속 쌓인다.
+
+    ★ 판정은 **역할(rank) 일치**로 좁힌다. 같은 날 여러 자리가 비면 누가 누구를 대신
+      섰는지 날짜만으로는 못 가르는데, 콜 4명이 마취/소독/순환/전담 각 1명이라
+      역할이 같은 쌍이 곧 그 자리의 대체다.
+    """
+    calls = set(code_map.values())
+    sid = _pick_schedule(db, group_id, year, month)
+    if not sid:
+        return {}
+    from db.models import ScheduleEntry
+
+    by_day: dict[int, set[str]] = {}
+    for e in db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == sid).all():
+        if str(e.shift_id) in calls:
+            by_day.setdefault(e.work_date.day, set()).add(str(e.nurse_id))
+    if not by_day:
+        return {}
+
+    members = _members_asof(db, group_id, max(anchor, date(year, month, 1)))
+    tm = {m.nurse_id: m.team_id for m in members}
+    rk = {m.nurse_id: m.rank for m in members}
+    out: dict[str, set[str]] = {}
+    for day, who in by_day.items():
+        team = team_of_week(week_start(date(year, month, day)), anchor, team_order)
+        ins = [n for n in who if tm.get(n) != team]
+        outs = [n for n, t in tm.items() if t == team and n not in who]
+        for i in ins:
+            for o in outs:
+                if rk.get(i) is not None and rk.get(i) == rk.get(o):
+                    out.setdefault(i, set()).add(o)
+    return out
+
+
 def postprocess_oncall(
     db: Session, schedule, generated: dict, current_user, req,
 ) -> dict:
@@ -392,11 +438,23 @@ def postprocess_oncall(
         print(f"[Oncall] 원티드 휴가/공가 직전일 콜 금지 "
               f"{sum(len(v) for v in unavailable.values())}건")
 
+    # ★ 직전 달에서 못 갚은 품앗이를 이어받는다(월 경계 유지).
+    py, pm = (year - 1, 12) if month == 1 else (year, month - 1)
+    carried = _carry_helped(db, group_id, py, pm, code_map, anchor, team_order)
+    if carried:
+        from db.models import Nurse as _N
+        _nm = {str(n.nurse_id): n.name for n in
+               db.query(_N).filter(_N.group_id == group_id).all()}
+        print("[Oncall] 전월 품앗이 이월: "
+              + ", ".join(f"{_nm.get(k, k)}→{[_nm.get(x, x) for x in v]}"
+                          for k, v in carried.items()))
+
     res = assign_oncall(
         year=year, month=month, roster=roster,
         members_asof=lambda mon: _members_asof(db, group_id, max(mon, date(year, month, 1))),
         anchor=anchor, team_order=team_order, call_code_map=code_map,
         max_per_month=quota, protected=protected, unavailable=unavailable,
+        carried_helped=carried,
     )
 
     for c in res.cells:

@@ -189,11 +189,40 @@ def run(gid: str, year: int, month: int, rules: dict,
                 allc[n].append(d)
                 if exp and tm.get(n) != exp[d]:
                     subs[n].append(d)
+        # ★ 3+1 로 갈라 고립 1일을 만드는 대신 통째로 주므로 상한은 MAX_SUB_RUN+1.
         over = [(nm.get(n, n), len(r)) for n, ds in subs.items()
-                for r in _runs(ds) if len(r) > MAX_SUB_RUN]
+                for r in _runs(ds) if len(r) > MAX_SUB_RUN + 1]
         rep.add("sub_run_limit", not over, " · ".join(
             f"{nm.get(n, n)}{[f'{r[0]}~{r[-1]}' if len(r) > 1 else r[0] for r in _runs(ds)]}"
             for n, ds in subs.items()) or "대체 없음")
+
+        # ── 블록 분할로 생긴 고립 1일 금지 ──
+        #   실측 2026-08 의 1일 블록은 김영민 8/10 하나이고 담당주에 이어 붙는다.
+        #   ★ 다만 **결원 자체가 1일**이면 대체도 1일일 수밖에 없다(실측 2026-09
+        #     윤보라 9/27 — 한승윤이 휴가 직전일 제약으로 하루만 빠진 자리).
+        #     그건 불가피하므로, **같은 역할 자리가 이틀 이상 비었는데 1일로 쪼개진
+        #     경우**만 잡는다 — 그게 분할 실패다.
+        own_days_by = {n: {d for d in range(1, days + 1) if exp and exp[d] == t}
+                       for n, t in tm.items()} if exp else {}
+        # 역할별로 "대체가 들어간 날"을 모아 연속 구간을 만든다 = 그 자리의 결원 구간
+        by_rank: dict = {}
+        for n, ds in subs.items():
+            by_rank.setdefault(tm_rank.get(n), set()).update(ds)
+        seat_runs = {rk_: _runs(sorted(v)) for rk_, v in by_rank.items()}
+        isolated = []
+        for n, ds in subs.items():
+            for r in _runs(ds):
+                if len(r) != 1:
+                    continue
+                if own_days_by.get(n, set()) & {r[0] - 1, r[0] + 1}:
+                    continue          # 담당주에 이어 붙는 꼬리물기 — 정상
+                seat = next((sr for sr in seat_runs.get(tm_rank.get(n), [])
+                             if r[0] in sr), [r[0]])
+                if len(seat) <= 1:
+                    continue          # 그 자리의 결원 자체가 1일 — 불가피
+                isolated.append((nm.get(n, n), r[0], f"자리 결원 {len(seat)}일"))
+        rep.add("no_isolated_single", not isolated,
+                f"분할 고립 1일 {len(isolated)}건 {isolated or ''}")
         longest = max((max(len(r) for r in _runs(ds)) for ds in allc.values()), default=0)
         rep.add("total_run_limit", longest <= MAX_CALL_RUN, f"최장 {longest}일")
 
