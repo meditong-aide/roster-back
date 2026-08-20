@@ -51,7 +51,13 @@ from schemas.roster_schema import (
     BannedWantedEntryCreate,
     BannedWantedEntryResponse,
 )
-from services.graph_service import graph_service
+# ★ `graph_service` 는 최상위에서 import 하지 않는다 — 그 모듈이
+#   `agents.main_graph` → `langgraph` 를 끌어오는데, **Lambda 솔버 이미지에는
+#   langgraph 가 없다**(`requirements.lambda.txt` 가 LLM 스택을 의도적으로 배제).
+#   근무표 생성이 `_build_banned_wanted_constraints` 에서 이 모듈을 지연 import 하므로,
+#   여기서 최상위 import 를 하면 **생성 전체가 ModuleNotFoundError 로 죽는다**
+#   (실측 2026-08-20 운영: 42병동-RN 10월 생성 실패).
+#   실제 사용처는 LLM 호출 2곳뿐이라 그 안에서만 import 한다.
 from services.weekly_off_service import (
     calc_weekly_off_weekday_by_month,
     calc_weekly_off_weekday_by_week,
@@ -896,6 +902,8 @@ async def analyze_wanted_text(
     ward_mains = _ward_main_codes(db, group_id)
 
     try:
+        from services.graph_service import graph_service  # 지연 import (모듈 상단 주석 참조)
+
         raw = await graph_service.invoke(
             request=text, schema=schema, case=None, year=year, month=month,
             allowed_shifts=", ".join(allowed_shift_map.keys()),
@@ -1459,6 +1467,8 @@ async def invoke_and_persist_wanted_service(
         aide_status = {"code": "skipped_dummy", "ok": True}
     else:
         try:
+            from services.graph_service import graph_service  # 지연 import (모듈 상단 주석 참조)
+
             raw_response = await graph_service.invoke(
                 request=req.request,
                 schema=req.schema,
