@@ -30,6 +30,11 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 
 from services.semantics import attach_reason_code_ontology
 
+# 엔진이 월 야간 상한 0·None 을 이 값으로 floor 한다
+# (cp_sat_basic `max_nig_per_month <= 0 → 15` · fallback_lex `... or 15`).
+# precheck 가 엔진보다 낮은 cap 을 쓰면 없는 부족을 만들어내므로 같은 값을 쓴다.
+_ENGINE_MAX_NIGHT_FLOOR = 15
+
 
 @lru_cache(maxsize=None)
 def _rec_go(remaining: int, run: int, off_rem: int, block: int) -> int:
@@ -86,6 +91,8 @@ class PrecheckNurse:
     sync_window_end: Optional[int] = None
     # per-nurse 야간 상한 (n_exact 우선, 없으면 n_max). None → 전역 상한만 적용.
     night_cap: Optional[int] = None
+    # 표시용 이름. 진단 카드가 사번 대신 이름으로 사람을 지목하도록 evidence 에 함께 싣는다.
+    name: Optional[str] = None
 
 
 @dataclass
@@ -895,6 +902,14 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
         cfg_max_night = int(cfg_max_night) if cfg_max_night is not None else None
     except (TypeError, ValueError):
         cfg_max_night = None
+    # ★ 0 이하 = 미설정(무제한)이다. 그대로 상한으로 쓰면 야간 공급을 0 으로 계산해
+    #   **없는 부족을 만들어낸다** — 실측 2026-08-20: 1병동(1025603d1c2a) 은 config=0 인데
+    #   7월 근무표에 N 이 124건 정상 배정돼 있다(엔진이 15 로 floor 하기 때문).
+    #   runtime_bridge 도 같은 floor 를 적용하지만 그건 **런타임 경로 한 곳**이고,
+    #   이 함수를 직접 부르는 경로(`POST /groups/{id}/roster/precheck`)는 거치지 않는다.
+    #   값을 쓰는 자리에서 막아야 호출 경로가 늘어도 안전하다.
+    if cfg_max_night is not None and cfg_max_night <= 0:
+        cfg_max_night = _ENGINE_MAX_NIGHT_FLOOR
 
     # Fix 3 (recovery): 2N→2OFF / 3N→2OFF 회복 규칙이 hard면 야간 후 강제 OFF 때문에
     # 한 사람이 달성 가능한 N 이 줄어든다. 이를 무시하면 N 공급을 과대계산해 recovery
@@ -913,18 +928,45 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
         span = max(0, n.leave_day - n.join_day + 1)
         return max_nights_under_recovery(span, _rec_block)
 
-    def _night_cap_for_nurse(n: PrecheckNurse) -> int:
-        cap = _working_capacity(n, inp.roster_config)
-        if cfg_max_night is not None and cfg_max_night >= 0:
-            cap = min(cap, cfg_max_night)
+    def _night_cap_detail(n: PrecheckNurse) -> tuple[int, str, List[str], Dict[str, int]]:
+        """(야간 상한, 대표 병목, **동률 포함 병목 전부**, **축별 값 전부**).
+
+        ★ 어느 항이 최소였는지를 함께 돌려준다. 최종값만 넘기면 진단이 원인을 config 로만
+          지목해, 개인 한도(n_exact/n_max)가 병목일 때 config 를 올려도 안 풀리는 해결책을
+          제안하게 된다(실측 2026-08-20: 개인 n_exact=0 인데 max_nig_per_month 상향 카드만 나옴).
+
+        ★★ **동률을 하나로 접지 않는다.** `min` 을 순차 비교로 구현하면 config 와 개인 한도가
+          같은 값일 때(예: 카드 적용으로 둘 다 4가 된 상태) 먼저 본 config 만 병목으로 남고
+          개인 한도는 사라진다. 그러면 다시 config 만 올리는 카드가 나오고, 개인 한도가
+          그대로라 또 안 풀린다. 최소값을 만드는 항을 **전부** 싣는다.
+
+        ★★★ **축별 값 전부**를 함께 돌려준다. 최소인 항만 알면 "개인 한도를 올렸을 때
+          다음으로 만나는 천장"을 알 수 없어, 해결카드가 그 천장을 넘는 값을 제안하고
+          적용해도 거기서 멈춘다(예: personal=1 · config=4 인데 6 을 제안 → 실제는 4).
+        """
         # per-nurse 야간 상한(n_exact/n_max)도 동시에 적용 — 전역 상한만 보면 야간 공급을
         # 과대계산해 shortage 를 놓친다. 상한을 조이는 방향이라 false positive 없음.
+        cands: List[tuple[str, int]] = [("working", _working_capacity(n, inp.roster_config))]
+        if cfg_max_night is not None and cfg_max_night >= 0:
+            cands.append(("config", cfg_max_night))
         if n.night_cap is not None and n.night_cap >= 0:
-            cap = min(cap, n.night_cap)
+            cands.append(("personal", int(n.night_cap)))
         _rc = _recovery_night_cap(n)
         if _rc is not None:
-            cap = min(cap, _rc)
-        return cap
+            cands.append(("recovery", _rc))
+
+        cap = min(v for _, v in cands)
+        binds = [k for k, v in cands if v == cap]
+        # 대표는 **고칠 수 있는 축** 우선 — 사람이 손댈 수 없는 working/recovery 를 앞세우면
+        # 해결책 없는 원인만 표시된다.
+        axis = dict(cands)
+        for pref in ("personal", "config", "recovery", "working"):
+            if pref in binds:
+                return cap, pref, binds, axis
+        return cap, binds[0], binds, axis
+
+    def _night_cap_for_nurse(n: PrecheckNurse) -> int:
+        return _night_cap_detail(n)[0]
 
     cap = sum(_night_cap_for_nurse(n) for n in n_capable)
     monthly_need = sum(_need(inp.roster_config, "N", d) for d in range(inp.num_days))
@@ -943,10 +985,24 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
     )
 
     # N 가능 nurse 별 working capacity — 누가 가장 가용 적은지
-    n_capable_caps = [
-        {"nurse_id": n.nurse_id, "capacity_days": _working_capacity(n, inp.roster_config)}
-        for n in n_capable
-    ]
+    # ★ night_cap/capped_by 를 함께 싣는다 — 해결책이 어느 축을 건드려야 하는지의 근거다.
+    #   capped_by='personal' 이면 config 를 올려도 min() 에서 개인 한도가 이겨 안 풀린다.
+    n_capable_caps = []
+    for n in n_capable:
+        _cap, _by, _binds, _axis = _night_cap_detail(n)
+        n_capable_caps.append({
+            "nurse_id": n.nurse_id,
+            "name": n.name,
+            "capacity_days": _working_capacity(n, inp.roster_config),
+            "night_cap": _cap,
+            "capped_by": _by,
+            # ★ 동률 병목 전부 — config 와 개인 한도가 같은 값이면 둘 다 올려야 풀린다.
+            "capped_by_all": _binds,
+            # ★★ 축별 값 전부 — 개인 한도를 올렸을 때 **다음 천장**이 얼마인지의 근거.
+            #    이게 없으면 해결카드가 config·recovery 를 넘는 값을 제안하고 거기서 멈춘다.
+            "cap_by_axis": _axis,
+            "personal_night_cap": n.night_cap,
+        })
     n_capable_caps.sort(key=lambda x: x["capacity_days"])
 
     return [

@@ -243,6 +243,199 @@ def config_lever_options_from_issues(issues: list[dict[str, Any]]) -> list[dict[
     return attach_fix_to_options(opts)
 
 
+# 사람이 손댈 수 없는 병목 축 — 개인 한도가 이것과 **같은 값**이면 개인 한도만 올려도
+# min() 이 그대로라 결과가 안 바뀐다. working=근무가능일 / recovery=2N·3N→2OFF 하드락.
+_IMMUTABLE_BINDS = ("working", "recovery")
+
+
+def _hard_ceiling(r: dict[str, Any]) -> int | None:
+    """개인 한도를 올려도 **못 넘는** 천장 = min(working, recovery).
+
+    ★ working=근무가능일 / recovery=2N·3N→2OFF 하드락. 둘 다 사람이 못 올린다.
+      `cap_by_axis` 가 없는 구 evidence 는 capacity_days(=working)로 대체한다.
+    """
+    ax = r.get("cap_by_axis")
+    if isinstance(ax, dict) and ax:
+        vals = [int(ax[k]) for k in ("working", "recovery") if ax.get(k) is not None]
+        if vals:
+            return min(vals)
+    cd = r.get("capacity_days")
+    return int(cd) if cd is not None else None
+
+
+def _config_ceiling(r: dict[str, Any]) -> int | None:
+    """설정 축(max_nig_per_month) 천장 — 올릴 수는 있지만 **병동 전체**에 걸린다."""
+    ax = r.get("cap_by_axis")
+    if isinstance(ax, dict) and ax.get("config") is not None:
+        return int(ax["config"])
+    return None
+
+
+def _allocate_night_caps(
+    blocked: list[dict[str, Any]], gap: int,
+) -> list[tuple[dict[str, Any], int]]:
+    """부족분 `gap` 을 각자의 **못 넘는 천장**(room) 안에서 나눈다 — 남은 몫은 재배분.
+
+    ★ 균등 나눗셈 뒤 clip 만 하면 잘려나간 몫이 사라진다. room=[2,10]·gap=10 이면
+      per=5 → [2,5]=7 로 부족분을 못 메워 카드를 눌러도 또 INFEASIBLE 이 난다.
+      room 오름차순으로 돌며 남은 몫을 남은 인원에게 다시 나눈다([2,8]=10).
+
+    ★★ room 은 근무가능일이 아니라 `_hard_ceiling` 이다 — 회복 제약(2N→2OFF)이 더 낮으면
+      근무가능일까지 올려봐야 거기서 멈춘다.
+    """
+    ordered = sorted(blocked, key=lambda r: _hard_ceiling(r) or 0)
+    remain, left = gap, len(ordered)
+    out: list[tuple[dict[str, Any], int]] = []
+    for r in ordered:
+        per = -(-remain // left) if left > 0 else 0            # ceil
+        room = _hard_ceiling(r)
+        val = max(1, min(per, room) if room is not None else per)
+        cur = r.get("personal_night_cap")
+        # 실제 공급량은 **올린 값과 현재 한도 중 큰 쪽** — 상향이 아닌 사람의 기존 공급을
+        # 0 으로 세면 남은 몫을 과대계산해 뒷사람 상한이 불필요하게 높아진다.
+        remain = max(0, remain - max(val, int(cur) if cur is not None else 0))
+        left -= 1
+        out.append((r, val))
+    return out
+
+
+def personal_night_cap_options_from_issues(
+    issues: list[dict[str, Any]],
+    nurse_names: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """야간 월용량 부족의 병목이 **개인 한도**(n_exact/n_max)일 때 그 값을 올리는 카드.
+
+    ★ 없으면 진단이 config 축(max_nig_per_month·2N→2OFF)만 제안하는데, 야간 상한은
+      `min(working, config, 개인한도, 회복)` 이라 개인 한도가 더 작으면 config 를 아무리
+      올려도 안 풀린다(실측 2026-08-20: 개인 n_exact=0 · config 15 → 카드 적용 후 재생성해도
+      같은 INFEASIBLE). precheck 가 evidence 에 남긴 capped_by 로 대상을 지목한다.
+
+    ★★ **동률(tie)도 대상이다.** config 와 개인 한도가 같은 값이면(카드 적용으로 둘 다 4가
+      된 상태가 실제로 나온다) 개인 한도도 똑같이 병목인데 `capped_by` 대표값만 보면
+      config 로만 잡혀 이 카드가 안 만들어진다. `capped_by_all` 로 판정한다.
+      그리고 그 경우엔 **개인 한도만 올려도 config 가 그대로 min 을 잡으므로**
+      config 상향(`apply`)을 같은 카드에 묶는다.
+
+    제안값은 "부족분을 개인 한도로만 메울 때 1인당 필요한 최소치"이고, 그 사람의
+    근무가능일(capacity_days)을 넘지 않게 자른다. verified=False — 클릭 시 재생성으로 실검증.
+    """
+    names = nurse_names or {}
+    opts: list[dict[str, Any]] = []
+
+    def _binds(r: dict[str, Any]) -> list[str]:
+        v = r.get("capped_by_all")
+        if isinstance(v, list) and v:
+            return [str(x) for x in v]
+        return [str(r.get("capped_by") or "")]
+
+    for it in issues or []:
+        if str(it.get("reason_code") or "").upper() != "MONTHLY_NIGHT_CAPACITY_SHORTAGE":
+            continue
+        ev = it.get("evidence")
+        if not isinstance(ev, dict):
+            ev = it.get("details") if isinstance(it.get("details"), dict) else {}
+        rows = [r for r in (ev.get("night_capable_nurses") or []) if isinstance(r, dict)]
+        # ★ 개인 한도가 병목이어도 **못 올리는 축과 동률**이면 대상이 아니다. personal==working
+        #   이거나 personal==recovery 면 개인 한도만 올려도 min 이 그대로라 카드를 눌러
+        #   재생성해도 같은 INFEASIBLE 이 난다(재생성 몇 분이 헛클릭이 된다).
+        blocked = [r for r in rows
+                   if "personal" in _binds(r)
+                   and not any(k in _binds(r) for k in _IMMUTABLE_BINDS)
+                   and str(r.get("nurse_id") or "")]
+        if not blocked:
+            continue
+
+        need = int(ev.get("n_required") or 0)
+        # 조정 대상이 아닌 사람들이 이미 공급하는 양 — 위에서 뺀 동률자도 여기 포함된다
+        # (그들은 이미 자기 최대치를 내고 있으므로 gap 에서 제해야 과대 산정이 안 난다).
+        blocked_ids = {str(r.get("nurse_id")) for r in blocked}
+        others = sum(int(r.get("night_cap") or 0)
+                     for r in rows if str(r.get("nurse_id") or "") not in blocked_ids)
+        gap = need - others
+        if gap <= 0:
+            continue
+
+        alloc = _allocate_night_caps(blocked, gap)
+        # ★ 하드 천장 때문에 산술적으로 부족분을 못 메우면 **카드를 내지 않는다**. 눌러도
+        #   재생성이 또 INFEASIBLE 로 끝나 몇 분이 헛클릭이 된다. 그런 상황은 하드 제약이
+        #   진짜 병목이라 다른 카드(설정 완화 축)가 담당한다.
+        if sum(max(v, int(r.get("personal_night_cap") or 0)) for r, v in alloc) < gap:
+            continue
+
+        rel, changes, shown = [], [], []
+        for r, val in alloc:
+            nid = str(r.get("nurse_id"))
+            cur = r.get("personal_night_cap")
+            # ★ 상향이 아니면 싣지 않는다 — per 가 현재 한도보다 작으면 "올리기" 카드가
+            #   상한을 **내리는** UPDATE 를 내보내 오히려 야간 공급이 준다.
+            if cur is not None and val <= int(cur):
+                continue
+            rel.append({"nurse_id": nid, "field": "n_max", "value": val})
+            # 이름 우선순위: evidence 에 실린 이름 → 호출자가 준 맵 → 사번(최후)
+            nm = (str(r.get("name")).strip() if r.get("name") else "") or names.get(nid) or nid
+            shown.append(nm)
+            changes.append({
+                # ★ config_key 는 사람마다 달라야 한다. 프론트가 목록 key 를
+                #   `${option_id}-${config_key}` 로 만들어(RosterCreateBlockingInfeasibilityAlert)
+                #   전원 "n_max" 면 22명이 같은 key 가 되고 React 가 중복 key 경고를 낸다
+                #   (실측 2026-08-20: 22명 카드에서 경고 21건). 인원이 적을 땐 안 드러났다.
+                #   `_FIX_BY_KEY` 에 "n_max" 매핑이 없어 fix_for_option 은 원래도 None 이므로
+                #   접미사를 붙여도 잃는 동작이 없고, 표시는 label_ko 가 우선한다.
+                "nurse_id": nid, "attr": "n_max", "config_key": f"n_max:{nid}",
+                "label_ko": f"{nm} 월 야간 상한",
+                "from": cur, "to": val,
+            })
+        if not rel:
+            continue
+        # 재배분 때문에 사람마다 값이 다를 수 있다 — 하나로 단정하지 말고 범위로 쓴다
+        _vals = sorted({int(x["value"]) for x in rel})
+        _val_txt = f"{_vals[0]}회" if len(_vals) == 1 else f"{_vals[0]}~{_vals[-1]}회"
+
+        opt: dict[str, Any] = {
+            "option_id": "personal_night_cap:" + "+".join(x["nurse_id"] for x in rel),
+            "kind": "raise_personal_night_cap",
+            "source": "precheck_arith",
+            "verified": False,
+            "title_ko": (f"{shown[0]} 외 {len(shown) - 1}명 월 야간 상한 올리기"
+                         if len(shown) > 1 else f"{shown[0]} 월 야간 상한 올리기"),
+            "trade_off_ko": "그 간호사들의 월 야간 횟수가 늘어납니다. 다음 달 분산으로 균형 회복 권장.",
+            "changes": changes,
+            # 실제 적용 — 그 달 NurseMonthlyLimit 에 write(행이 없으면 만든다).
+            "monthly_limit_release": rel,
+            "fix": {
+                "mode": "auto_apply",
+                "where": "nurse.monthly_limit",
+                "where_label_ko": "근무자 관리 > 해당 근무자 > 나이트 개수",
+                "how_ko": (f"이 방법을 고르면 {len(rel)}명의 월 야간 상한을 각자의 "
+                           f"근무가능일에 맞춰 {_val_txt}로 올린 뒤 다시 만듭니다(이 달)."),
+                "config_key": None,
+                "target": {"nurse_ids": [x["nurse_id"] for x in rel]},
+            },
+        }
+        # ★ 제안값이 config 천장을 **넘으면** 개인 한도만 올려도 거기서 멈춘다
+        #   (personal=1 · config=4 인데 6 을 제안 → 실제 반영은 4). 동률(tie)도 이 조건에
+        #   자연히 포함된다 — 상향값은 언제나 현재 cap 보다 크기 때문이다.
+        # ★★ 반대로 **config 를 낮추는 일은 절대 없어야 한다.** config 는 병동 전역이라
+        #   낮추면 이 카드와 무관한 사람들의 야간 상한까지 깎여 공급이 오히려 준다.
+        #   (동률자가 이미 충분한 한도를 갖고 있어 rel 에서 빠지면 cfg_to 가 현재 천장보다
+        #    작아질 수 있다 — 예: 한도 4·1 에 부족분 6 이면 rel=[2] 뿐이라 cfg_to=2.)
+        #   그래서 **현재 천장을 아는 경우에만, 그것을 넘을 때만** 건드린다.
+        _cfg_ceils = [c for c in (_config_ceiling(r) for r in blocked) if c is not None]
+        _cur_cfg = max(_cfg_ceils) if _cfg_ceils else None
+        cfg_to = max(int(x["value"]) for x in rel)
+        if _cur_cfg is not None and cfg_to > _cur_cfg:
+            opt["apply"] = {"max_nig_per_month": cfg_to}
+            opt["changes"] = changes + [{
+                "config_key": "max_nig_per_month", "label_ko": "월 야간 한도(개인)",
+                "from": None, "to": cfg_to, "suggested_value": cfg_to,
+            }]
+            opt["title_ko"] += " + 월 야간 한도 함께 올리기"
+            opt["fix"]["how_ko"] += (f" 설정의 월 야간 한도도 {cfg_to}회로 함께 올립니다 "
+                                     f"— 개인 한도만 올리면 설정 한도에서 다시 막힙니다.")
+        opts.append(opt)
+    return attach_fix_to_options(opts)
+
+
 def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
     """완화 집합을 base 위에 적용(각 delta 는 base 기준으로 계산 — 누적 드리프트 방지)."""
     cfg = dict(base)

@@ -5843,7 +5843,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     db.commit()
                 except Exception:
                     db.rollback()
-                from fastapi import HTTPException
                 raise HTTPException(status_code=500, detail=payload)
         except HTTPException:
             raise
@@ -6062,7 +6061,6 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             db.rollback()
         try:
             from services.precheck import build_unrecoverable_payload
-            from fastapi import HTTPException
             try:
                 _violated = _extract_unrecoverable_violated_constraints(
                     roster_system, generated, validation_error

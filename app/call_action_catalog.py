@@ -149,6 +149,15 @@ _CATALOG_RAW = [
     {"m": "PUT", "p": "/weekly-off/nurses", "page": "설정", "section": "주휴설정(간호사별)",
      "action": "간호사별 주휴 설정 저장", "shape": "list_in_key:items", "item_id": "nurse_id",
      "fields": {"weekly_off_enabled": "주휴사용", "weekly_off_weekday": "주휴요일"}, "masked": {}},
+    {"m": "POST", "p": "/nurse-period/leave-flags", "page": "근무자관리",
+     "section": "근무자 상세/사이드프로필", "action": "보건휴가·수면오프 대상 지정", "shape": "dict",
+     "fields": {"nurse_id": "대상근무자", "group_id": "병동", "valid_from": "적용시작일",
+                "health_leave_eligible": "보건휴가대상", "sleep_off_eligible": "수면오프대상"},
+     # 임신여부는 건강 관련 정보 — 바꿨다는 사실만 남기고 값은 '***' 로 가린다.
+     "masked": {"pregnant": "임신여부"}},
+    {"m": "POST", "p": "/nurse-period/night-cycle/rebuild", "page": "근무자관리",
+     "section": "나이트 주기", "action": "나이트 주기 재계산", "shape": "dict",
+     "fields": {"year": "연도", "month": "월", "group_id": "병동"}, "masked": {}},
 
     # ────────── 근무표 · 시프트 · 생성 · 선호 (roster/roster_create/shifts/daily-shift/preferences) ──────────
     {"m": "POST", "p": "/roster/config/save", "page": "근무표만들기", "section": "생성 설정 저장",
@@ -254,6 +263,10 @@ _CATALOG_RAW = [
      "action": "빈 희망근무 제출", "shape": "dict", "fields": {"year": "연도", "month": "월"}, "masked": {}},
     {"m": "POST", "p": "/preferences/retract", "page": "희망근무", "section": "선호 제출",
      "action": "희망근무 제출 철회", "shape": "dict", "fields": {"year": "연도", "month": "월"}, "masked": {}},
+    # 경로는 /preferences 아래지만 화면은 원티드 관리보드의 월별 메모다.
+    {"m": "PATCH", "p": "/preferences/monthly-memo", "page": "원티드", "section": "월별 메모",
+     "action": "원티드 월별 메모 저장", "shape": "dict",
+     "fields": {"year": "연도", "month": "월", "group_id": "병동", "monthly_memo": "메모"}, "masked": {}},
 
     # ────────── 원티드 · 멤버 · 설정 · 알림 · 기타 (wanted/member/setting/groups/auth/push/message/contact/sticker) ──────────
     {"m": "POST", "p": "/wanted/request", "page": "원티드", "section": "작성 요청",
@@ -338,6 +351,29 @@ _CATALOG_RAW = [
      "masked": {"PortableTel": "연락처", "Email": "이메일"}},
     {"m": "POST", "p": "/sticker/insert", "page": "홈", "section": "스티커 저장", "action": "근무표 스티커 저장",
      "shape": "dict", "fields": {"stcker_date": "스티커월"}, "masked": {}},
+    {"m": "DELETE", "p": "/contact/{no}", "page": "고객센터", "section": "문의 삭제",
+     "action": "고객문의 삭제", "shape": "none", "fields": {}, "masked": {}},
+    {"m": "POST", "p": "/member/file-upload", "page": "설정", "section": "파일 업로드",
+     "action": "파일 업로드", "shape": "multipart", "fields": {}, "masked": {}},
+    # 본문이 없어 changes 는 안 남지만, target(entry_id)+action 으로 "무엇을 토글했는지"는 남는다.
+    {"m": "PATCH", "p": "/wanted/adjustment/banned/entry/{entry_id}/toggle", "page": "원티드",
+     "section": "기피 근무 조정", "action": "기피 근무 항목 반영 토글", "shape": "none",
+     "fields": {}, "masked": {}},
+    {"m": "POST", "p": "/wanted/adjustment/{year}/{month}/apply-all", "page": "원티드",
+     "section": "기피 근무 조정", "action": "기피 근무 일괄 반영", "shape": "dict",
+     "fields": {"applied": "반영여부"}, "masked": {}},
+    {"m": "POST", "p": "/wanted/close-expired", "page": "원티드", "section": "마감",
+     "action": "기간 만료 원티드 일괄 마감", "shape": "none", "fields": {}, "masked": {}},
+    # ────────── AI 에이전트 (agent) ──────────
+    # 에이전트는 스킬을 통해 실제 데이터를 바꾼다 — 무엇을 시켰는지가 변경 근거다.
+    {"m": "POST", "p": "/api/agent/chat/send", "page": "AI에이전트", "section": "대화",
+     "action": "에이전트 요청 전송", "shape": "dict",
+     "fields": {"conversation_id": "대화ID", "year": "연도", "month": "월"},
+     # ★ 요청문은 자유 텍스트라 실명·환자정보가 그대로 들어온다("김민지 원티드 취소하고
+     #   이영희로 대체해줘"). 값까지 남기면 감사로그가 PII 저장소가 되므로 존재만 남긴다.
+     "masked": {"message": "요청문"}},
+    {"m": "POST", "p": "/api/agent/chat/reset", "page": "AI에이전트", "section": "대화",
+     "action": "에이전트 대화 초기화", "shape": "none", "fields": {}, "masked": {}},
 ]
 
 _CATALOG = [{**e, "_re": _compile(e["p"])} for e in _CATALOG_RAW]
