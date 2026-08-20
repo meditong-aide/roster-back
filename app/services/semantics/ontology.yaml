@@ -807,6 +807,15 @@ causes:
     aliases: [MONTHLY_LIMIT_N_EXACT_UNATTAINABLE, N_EXACT_INCOMPATIBLE]
     problem_template_ko: "간호사 {nurse_id} 의 N 정확({n_exact})이 active 일수 {active_days}일 또는 다른 제약과 양립 불가."
 
+  cause:fixed:per_nurse_sequence_infeasible:
+    label: "개인 시퀀스 완성 불가 (고정셀 × 규칙 충돌)"
+    category: fixed
+    causal_layer: personal
+    tier: T1
+    is_hard: true
+    aliases: [PER_NURSE_SEQUENCE_INFEASIBLE]
+    problem_template_ko: "간호사 {nurse_id} 의 고정근무({fixed_cells}건)와 개인규칙(전이금지/회복/연속)이 맞물려 혼자서 유효한 근무 배열을 만들 수 없습니다."
+
 
 treatments:
   treatment:soft:grade_max:
@@ -945,6 +954,7 @@ treatments:
     applies_to_causes:
       - cause:fixed:over_demand
       - cause:fixed:off_exceeds_span
+      - cause:fixed:per_nurse_sequence_infeasible
 
   treatment:data:add_nurse:
     label: "간호사 추가 배치 또는 demand 영구 하향"

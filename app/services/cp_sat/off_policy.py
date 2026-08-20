@@ -53,6 +53,7 @@ def compute_off_bounds(
     reference_days: int | None = None,
     weekend_only: bool = False,
     weekend_slots_nonvac: int | None = None,
+    extra_min_off: int = 0,
 ) -> dict[str, int | str]:
     effective_off_days, source_key = resolve_effective_off_days(source)
     active_nonvac_days = max(0, avail_days - max(0, vacation_cnt))
@@ -81,6 +82,12 @@ def compute_off_bounds(
         if ratio_enable and effective_off_days > 0 and eligible_off_days > 0:
             scaled_min = int(round(effective_off_days * (eligible_off_days / max(1, ref_days))))
             min_off_required = max(0, min(min_off_required, scaled_min))
+
+    # ★ 보건휴가 대상자 등, 그 사람만 OFF 를 더 확보해야 하는 경우의 per-nurse 가산.
+    #   순증이 아니다 — 후처리가 이 한 칸을 휴가코드로 바꾸면 countable_off 에서 빠져
+    #   OFF 총량은 그대로고 근무일이 1 줄어든다.
+    if not weekend_only and extra_min_off:
+        min_off_required = max(0, min(min_off_required + int(extra_min_off), eligible_off_days))
 
     max_extra_off_days = resolve_max_extra_off_days(source, 0)
     if weekend_only:

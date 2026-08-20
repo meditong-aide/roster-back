@@ -80,7 +80,7 @@ def _seed(db: Session):
         account_id="acc_N001", name="김민지", grade=4, experience=10,
         role="RN", team_id=1, is_head_nurse=True, hn_auth="HN",
         active=1, sequence=1, joining_date=datetime(2025, 1, 1),
-        is_weekend_off=False, work_shifts=["D", "E", "N"],
+        work_shifts=["D", "E", "N"],
         allowed_shifts=[], fixed_shift=None, enable_aide=True,
     ))
     db.flush()
@@ -101,20 +101,19 @@ def _seed(db: Session):
     db.flush()
 
     db.add(RosterConfig(
-        config_id=1, config_version="v1", office_id="OFF001", group_id="GRP001",
+        config_id=1, office_id="OFF001", group_id="GRP001",
         day_req=2, eve_req=2, nig_req=2,
         min_exp_per_shift=2, req_exp_nurses=1,
         two_offs_per_week=True, max_nig_per_month=7,
         three_seq_nig=False, two_offs_after_three_nig=True,
         two_offs_after_two_nig=False, banned_day_after_eve=True,
         max_conseq_work=5, off_days=8,
-        shift_priority=0.5, weekend_shift_ratio=0.5, patient_amount=30,
-        sequential_offs=True, even_nights=True, nod_noe=True,
+        shift_priority=0.5,
+        sequential_offs=True, nod_noe=True,
         not_one_night=False, use_mid=False,
-        preceptor_gauge=5, preceptee_on=True, preceptee_shift_count=True,
+        preceptee_on=True, preceptee_shift_count=True,
         weekly_off_group=False,
-        team_balance_enable=True, team_balance_gauge=5, team_balance_mode="balanced",
-        off_placement_mode=0, fixed_wanted_use_yn=True,
+        fixed_wanted_use_yn=True,
         show_level=True, show_preceptor=True,
     ))
     db.flush()
@@ -154,7 +153,6 @@ def main():
         ("이브닝 다음날 데이 금지 해제해줘", "banned_day_after_eve=false"),
         ("나이트 필요인원 3명으로 늘려줘", "nig_req=3"),
         ("프리셉터 매칭 꺼줘", "preceptee_on=false"),
-        ("팀 밸런스 끄고 싶어", "team_balance_enable=false"),
     ]
 
     print("=" * 70)

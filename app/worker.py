@@ -201,7 +201,15 @@ def process_job(payload: dict) -> dict:
         if not latest_config:
             raise RuntimeError("RosterConfig가 존재하지 않습니다. 먼저 설정을 등록하거나 config_id를 전달하세요.")
 
-        roster_data = generate_roster_service(req, current_user, db)
+        # 해결책 재생성: 유저가 고른 옵션의 delta 를 이번 생성에만 override(DB 미변경) /
+        # ontology 옵션은 treatment_ids 로. 일반 생성이면 둘 다 None → 기존 동작 동일.
+        roster_data = generate_roster_service(
+            req, current_user, db,
+            config_override=getattr(req, "config_override", None) or None,
+            treatment_ids=(getattr(req, "treatment_ids", None) or None),
+            weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
+            monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
+        )
         result_id = None
         if isinstance(roster_data, dict):
             result_id = roster_data.get("schedule_id") or roster_data.get("schedule")

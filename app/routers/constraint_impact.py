@@ -105,6 +105,7 @@ def _build_listing_snapshot(
 
     # Pull active nurses for this group (minimal NurseFact)
     from db.models import Nurse
+    from services.nurse_period_resolver import is_weekend_off_asof
 
     nurse_rows = (
         db.query(Nurse)
@@ -125,7 +126,7 @@ def _build_listing_snapshot(
                 name=str(getattr(n, "name", "") or ""),
                 team_id=str(getattr(n, "team_id", "") or "") or None,
                 grade=int(getattr(n, "grade", 0) or 0) or None,
-                is_weekend_off=bool(getattr(n, "is_weekend_off", 0) or False),
+                is_weekend_off=is_weekend_off_asof(db, nurse_id, date(int(year), int(month), 1)),
                 allowed_shift_codes=set(),
                 preceptor_id=None,
                 is_inbound=False,
@@ -140,7 +141,7 @@ def _build_listing_snapshot(
         year=int(year),
         month=int(month),
         attempt=SolveAttemptMeta(
-            attempt_index=0, label="primary", grade_strategy="BASE",
+            attempt_index=0, label="primary", grade_strategy="COMBINED",
             forced_grade_soft_fallback=False, config_flags={},
         ),
         shift_types=["D", "E", "N", "O", "M"],
@@ -202,6 +203,8 @@ def get_modules(
             "modules": [asdict(m) for m in modules],
             "grouped_by_parent": grouped,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"list modules failed: {e}")
 
@@ -250,6 +253,8 @@ def preview_adjustments(
         }
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"preview failed: {e}")
 
@@ -293,5 +298,7 @@ def get_instances(
         }
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"find instances failed: {e}")

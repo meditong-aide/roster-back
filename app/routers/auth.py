@@ -120,6 +120,8 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
 
         return user_info
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
@@ -571,6 +573,8 @@ async def handle_find_pw_request(
                 html_body=html_body,
                 subtype=MessageType.html
             )
+        except HTTPException:
+            raise
         except Exception as e:
             # SMTP 연결 오류 등이 발생하면 500 에러를 반환
             raise HTTPException(status_code=500, detail=f"Error processing email request: {e}")

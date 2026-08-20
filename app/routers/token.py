@@ -180,6 +180,8 @@ async def login_for_access_token(response: Response,
 
             # return {"result": "succeed", "message": "Login successful", "account_id": MemberID}
 
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Invalid login : {str(e)}")
     else :
@@ -209,6 +211,8 @@ def mworks_access_token (account_id: str, client_ip: str) :
         user_info = msdb_manager.fetch_all(Member.member_view(), params=(account_id))
         return user_info
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 

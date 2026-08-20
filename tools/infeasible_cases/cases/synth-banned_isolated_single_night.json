@@ -1,0 +1,79 @@
+{
+  "meta": {
+    "group_id": "SYNTH",
+    "source": "synthetic",
+    "name": "banned_isolated_single_night"
+  },
+  "year": 2026,
+  "month": 8,
+  "num_days": 31,
+  "config": {
+    "daily_shift_requirements": {
+      "D": 2,
+      "E": 1,
+      "N": 1
+    },
+    "off_days": 9,
+    "max_nig_per_month": 15,
+    "two_offs_after_two_nig": false,
+    "two_offs_after_three_nig": true,
+    "not_one_night": true,
+    "use_mid": false,
+    "initial_constraints": {
+      "forbidden": {
+        "n1": {
+          "11": [
+            "O"
+          ]
+        }
+      },
+      "forced_off": {
+        "n1": [
+          10,
+          12
+        ]
+      }
+    }
+  },
+  "nurses": [
+    {
+      "nurse_id": "n1",
+      "name": "장세현",
+      "grade": 1,
+      "team_id": "A",
+      "allowed_shifts": [
+        "N"
+      ]
+    },
+    {
+      "nurse_id": "g0",
+      "name": "일반0",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "g1",
+      "name": "일반1",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "g2",
+      "name": "일반2",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "g3",
+      "name": "일반3",
+      "grade": 1,
+      "team_id": "A"
+    },
+    {
+      "nurse_id": "g4",
+      "name": "일반4",
+      "grade": 1,
+      "team_id": "A"
+    }
+  ]
+}

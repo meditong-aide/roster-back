@@ -361,6 +361,8 @@ async def get_shift_manage(
         if not current_user:
             print('[/shift-manage/{class_name}]: 유저 없음')
             raise HTTPException(status_code=401, detail="Not authenticated")
+    except HTTPException:
+        raise
     except Exception as e:
         print('[/shift-manage/{class_name}]:', e)
         raise HTTPException(status_code=401, detail="Not authenticated")

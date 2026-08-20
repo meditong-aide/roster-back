@@ -27,6 +27,19 @@ COPY --from=builder /opt/python ${LAMBDA_TASK_ROOT}
 # 소스 코드 (의존성 변경 없이 코드만 바뀔 때 캐시 활용)
 COPY app ${LAMBDA_TASK_ROOT}/app
 
+# ───────── 빌드 게이트: import 스모크 ─────────
+# ★ 여기서 실패하면 이미지가 ECR 로 나가지 못한다. API 쪽(Dockerfile)과 같은 이유다 —
+#   2026-08-12 에 전이 의존이 메이저 업으로 올라와 import 가 깨진 이미지가 그대로
+#   배포됐고, 로그가 꺼져 있어 이틀간 아무도 몰랐다.
+#   Lambda 는 requirements.lambda.txt 로 LLM 스택을 배제해 그 사고는 피했지만,
+#   `langchain-core>=0.3.0` 처럼 상한 없는 핀이 남아 있어 같은 일이 가능하다.
+# ★ import 시점에 DB URL 을 조립하므로 더미 값을 준다. 접속은 하지 않는다.
+RUN MS_DB_HOST=localhost MS_DB_PORT=1433 MS_DB_USER=build MS_DB_PASSWORD=build \
+    MS_DB_NAME=build EUN_DB_NAME=build SECRET_KEY=build ALGORITHM=HS256 \
+    DB_HOST=localhost DB_PORT=3306 DB_USER=build DB_PASSWORD=build DB_NAME=build \
+    python -c "import app.lambda_handler" \
+ && echo "[build-gate] app.lambda_handler import OK"
+
 # Lambda handler: <module>.<function>
 # 실제 위치: ${LAMBDA_TASK_ROOT}/app/lambda_handler.py 의 handler() 함수
 CMD ["app.lambda_handler.handler"]

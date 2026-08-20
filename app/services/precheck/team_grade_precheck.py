@@ -25,9 +25,47 @@ infeasibility 를 감지한다. 결과는 `{reason_code, severity, evidence}` �
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple, Any
 
 from services.semantics import attach_reason_code_ontology
+
+# 엔진이 월 야간 상한 0·None 을 이 값으로 floor 한다
+# (cp_sat_basic `max_nig_per_month <= 0 → 15` · fallback_lex `... or 15`).
+# precheck 가 엔진보다 낮은 cap 을 쓰면 없는 부족을 만들어내므로 같은 값을 쓴다.
+_ENGINE_MAX_NIGHT_FLOOR = 15
+
+
+@lru_cache(maxsize=None)
+def _rec_go(remaining: int, run: int, off_rem: int, block: int) -> int:
+    """회복 규칙(연속 N `block` 개 후 2 OFF 강제) 하에서 남은 일수로 달성 가능한 최대 N.
+
+    상태: (남은 일, 현재 N 연속수, 강제 OFF 잔여). day 대신 remaining 을 써서 전역 캐시.
+    - OFF: run 리셋, off_rem 1 감소
+    - N(강제 OFF 없을 때만): run+1==block 이면 2 OFF 강제 + run 리셋, 아니면 run+1
+    월말(remaining=0)에 block-run 을 두면 회복 불필요 → 경계 자연 처리.
+    """
+    if remaining <= 0:
+        return 0
+    best = _rec_go(remaining - 1, 0, max(0, off_rem - 1), block)  # OFF
+    if off_rem == 0 and run + 1 <= block:
+        if run + 1 == block:
+            best = max(best, 1 + _rec_go(remaining - 1, 0, 2, block))
+        else:
+            best = max(best, 1 + _rec_go(remaining - 1, run + 1, 0, block))
+    return best
+
+
+def max_nights_under_recovery(span: int, block: int) -> int:
+    """span 일 내 회복 규칙(`block`연속 N→2OFF) 하 달성 가능한 **정확한** 최대 N.
+
+    닫힌형 근사(예 2·⌈avail/4⌉, 3·⌈avail/5⌉)는 3N→2OFF 처럼 'NN O' 로 트리거를 피해
+    2/3 비율을 낼 수 있는 경우를 과소추정 → precheck blocking 에 쓰면 false positive.
+    DP 로 정확값을 구해 valid upper bound(=실제 최대)와 tightness 를 동시에 보장한다.
+    """
+    if span <= 0:
+        return 0
+    return _rec_go(int(span), 0, 0, int(block))
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +89,10 @@ class PrecheckNurse:
     # 동기화 기간 (0-based day index). None → [join_day, leave_day] 전체로 간주.
     sync_window_start: Optional[int] = None
     sync_window_end: Optional[int] = None
+    # per-nurse 야간 상한 (n_exact 우선, 없으면 n_max). None → 전역 상한만 적용.
+    night_cap: Optional[int] = None
+    # 표시용 이름. 진단 카드가 사번 대신 이름으로 사람을 지목하도록 evidence 에 함께 싣는다.
+    name: Optional[str] = None
 
 
 @dataclass
@@ -105,14 +147,70 @@ def _active(nurse: PrecheckNurse, d: int) -> bool:
 def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     return (
         int(cfg.get("global_monthly_off_days", 0) or 0)
-        + int(cfg.get("standard_personal_off_days", 0) or 0)
+        + int(cfg.get("off_days", cfg.get("standard_personal_off_days", 0)) or 0)
+        + int(nurse.personal_off_adjustment or 0)
+    )
+
+
+def _hard_off_floor(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
+    """근무가능일을 '하드하게' 줄이는 off 만 합산한다.
+
+    ★ 개인 월 휴무(off_days / standard_personal_off_days)는 엔진에서 **소프트**다
+      (fallback_lex: off_quota_short 슬랙 = 목표 미달 시 벌점만, 강제 아님). 따라서
+      hard capacity 상한을 계산할 때 빼면 안 된다(빼면 false CAPACITY_TOTAL_SHORTAGE).
+      cf. 8d2c2a9 회귀: off_days 를 하드 감산해 연속근무 3/5 로도 capacity 가 갇혔음.
+    여기 포함하는 것은 전사 고정 휴무(global)와 개인 하드 조정(personal_off_adjustment)뿐.
+    """
+    return (
+        int(cfg.get("global_monthly_off_days", 0) or 0)
         + int(nurse.personal_off_adjustment or 0)
     )
 
 
 def _working_capacity(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     span = max(0, nurse.leave_day - nurse.join_day + 1)
-    return max(0, span - _required_off_days(nurse, cfg))
+    cap = max(0, span - _hard_off_floor(nurse, cfg))
+    # 연속근무 상한(max_consecutive_work=C)은 HARD 제약(K+1 창에 ≥1 OFF, fallback_lex:1730):
+    # C일 근무 후 최소 1일 휴식 → span 내 최대 근무일 = span - span//(C+1) (상한).
+    # cap 은 항상 상한이어야 하므로(하한이면 false positive) min 으로 결합한다.
+    mcw = cfg.get("max_conseq_work", cfg.get("max_consecutive_work"))
+    if mcw is not None:
+        try:
+            c = int(mcw)
+            if c >= 1:
+                cap = min(cap, max(0, span - span // (c + 1)))
+        except (TypeError, ValueError):
+            pass
+    return cap
+
+
+def _capacity_with_mcw(nurses, cfg: Dict[str, Any], mcw: Optional[int]) -> int:
+    """연속근무 상한 mcw(None=무제한) 를 가정했을 때의 총 근무가능일.
+
+    _working_capacity 와 동일 공식(하드 off 만 감산)이되 mcw 를 파라미터로 받아
+    '연속근무 상한을 바꾸면 capacity 가 얼마가 되는가' 를 반사실로 계산한다.
+    """
+    total = 0
+    for n in nurses:
+        span = max(0, n.leave_day - n.join_day + 1)
+        cap = max(0, span - _hard_off_floor(n, cfg))
+        if mcw is not None and mcw >= 1:
+            cap = min(cap, max(0, span - span // (mcw + 1)))
+        total += cap
+    return total
+
+
+def _min_mcw_to_meet(nurses, cfg: Dict[str, Any], total_need: int,
+                     cur_mcw: int, num_days: int) -> Optional[int]:
+    """연속근무 상한을 얼마로 올리면 산술적으로 수요를 충족하는가(최소값).
+
+    cur_mcw+1 부터 num_days(=사실상 무제한) 까지 올려보며 capacity>=need 되는 첫 값.
+    무제한으로도 못 채우면(진짜 인원부족) None.
+    """
+    for cand in range(cur_mcw + 1, max(cur_mcw + 1, num_days) + 1):
+        if _capacity_with_mcw(nurses, cfg, cand) >= total_need:
+            return cand
+    return None
 
 
 def _issue(code: str, evidence: Dict[str, Any], severity: str = "hard") -> Dict[str, Any]:
@@ -225,6 +323,13 @@ def check_grade_min_sum_exceeds_need(inp: PrecheckInput) -> List[Dict]:
             continue
         for d in range(inp.num_days):
             nd = _need(cfg, s, d)
+            # 요구 인원이 0 인 근무는 GRADE_DEFAULT_111(강제 grade-1 floor) 대상이 아니다.
+            #   floor 는 "그 근무를 세울 때 grade-1 을 1명 이상 넣어라"는 뜻이지
+            #   "그 근무를 반드시 세워라"가 아니다. need=0 이면 min_sum>0 이 항상 참이라
+            #   야간을 상시 운영하지 않는 병동(응급구조사 등)은 생성 자체가 막힌다.
+            #   22511fb(2026-06-25)가 check_grade_min_available_shortage 에 적용한 완화와 동일 논리.
+            if nd <= 0:
+                continue
             if min_sum > nd:
                 issues.append(
                     _issue(
@@ -412,6 +517,30 @@ def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
     shortage = total_need - total_cap
     avg_daily = total_need / inp.num_days if inp.num_days else 0.0
 
+    # ── 원인 레버 식별: 사용자가 설정한 '연속근무 상한'이 capacity 를 눌러 shortage 를
+    #    만든 경우, 해결책은 '간호사 추가'(수동)가 아니라 '그 값을 올려라'(자동)다.
+    #    상한을 무시(무제한)했을 때 need 를 충족한다면 = 상한이 binding → 최소 완화값 계산.
+    conseq_cap_binding = None
+    _mcw_raw = inp.roster_config.get("max_conseq_work",
+                                     inp.roster_config.get("max_consecutive_work"))
+    try:
+        _cur_mcw = int(_mcw_raw) if _mcw_raw is not None else None
+    except (TypeError, ValueError):
+        _cur_mcw = None
+    if _cur_mcw is not None and _cur_mcw >= 1:
+        cap_uncapped = _capacity_with_mcw(inp.nurses, inp.roster_config, None)
+        if total_need <= cap_uncapped:
+            _star = _min_mcw_to_meet(
+                inp.nurses, inp.roster_config, total_need, _cur_mcw, inp.num_days
+            )
+            if _star is not None:
+                conseq_cap_binding = {
+                    "config_key": "max_conseq_work",
+                    "current": _cur_mcw,
+                    "suggested_value": _star,
+                    "capacity_uncapped": cap_uncapped,
+                }
+
     # 평균 초과 day → bottleneck (동적 임계값)
     bottleneck_days = sorted(
         [dd for dd in daily_demand if dd["demand"] > avg_daily],
@@ -448,6 +577,8 @@ def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
                 "bottleneck_days": bottleneck_days,
                 "lowest_capacity_nurses": lowest_capacity_nurses,
                 "demand_uniform": len(bottleneck_days) == 0,
+                # 연속근무 상한(하드)이 원인이고 그것만 올리면 풀릴 때 자동 완화 근거(없으면 None)
+                "conseq_cap_binding": conseq_cap_binding,
             },
         )
     ]
@@ -766,17 +897,76 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
     """
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     n_capable = [n for n in inp.nurses if "N" in _allowed_set(n, S)]
-    cfg_max_night = inp.roster_config.get("max_night_shifts_per_month")
+    cfg_max_night = inp.roster_config.get("max_nig_per_month", inp.roster_config.get("max_night_shifts_per_month"))
     try:
         cfg_max_night = int(cfg_max_night) if cfg_max_night is not None else None
     except (TypeError, ValueError):
         cfg_max_night = None
+    # ★ 0 이하 = 미설정(무제한)이다. 그대로 상한으로 쓰면 야간 공급을 0 으로 계산해
+    #   **없는 부족을 만들어낸다** — 실측 2026-08-20: 1병동(1025603d1c2a) 은 config=0 인데
+    #   7월 근무표에 N 이 124건 정상 배정돼 있다(엔진이 15 로 floor 하기 때문).
+    #   runtime_bridge 도 같은 floor 를 적용하지만 그건 **런타임 경로 한 곳**이고,
+    #   이 함수를 직접 부르는 경로(`POST /groups/{id}/roster/precheck`)는 거치지 않는다.
+    #   값을 쓰는 자리에서 막아야 호출 경로가 늘어도 안전하다.
+    if cfg_max_night is not None and cfg_max_night <= 0:
+        cfg_max_night = _ENGINE_MAX_NIGHT_FLOOR
+
+    # Fix 3 (recovery): 2N→2OFF / 3N→2OFF 회복 규칙이 hard면 야간 후 강제 OFF 때문에
+    # 한 사람이 달성 가능한 N 이 줄어든다. 이를 무시하면 N 공급을 과대계산해 recovery
+    # 유발 infeasible 을 solve 후에야 알게 된다. max_nights_under_recovery(DP)로 정확한
+    # 실효 상한을 구해 min 결합(상한만 조이므로 false positive 없음).
+    # 2N→2OFF(block=2)가 3N→2OFF(block=3)보다 빡빡 → 둘 다 켜지면 2N 이 지배.
+    _rec_block: Optional[int] = None
+    if bool(inp.roster_config.get("two_offs_after_two_nig")):
+        _rec_block = 2
+    elif bool(inp.roster_config.get("two_offs_after_three_nig")):
+        _rec_block = 3
+
+    def _recovery_night_cap(n: PrecheckNurse) -> Optional[int]:
+        if _rec_block is None:
+            return None
+        span = max(0, n.leave_day - n.join_day + 1)
+        return max_nights_under_recovery(span, _rec_block)
+
+    def _night_cap_detail(n: PrecheckNurse) -> tuple[int, str, List[str], Dict[str, int]]:
+        """(야간 상한, 대표 병목, **동률 포함 병목 전부**, **축별 값 전부**).
+
+        ★ 어느 항이 최소였는지를 함께 돌려준다. 최종값만 넘기면 진단이 원인을 config 로만
+          지목해, 개인 한도(n_exact/n_max)가 병목일 때 config 를 올려도 안 풀리는 해결책을
+          제안하게 된다(실측 2026-08-20: 개인 n_exact=0 인데 max_nig_per_month 상향 카드만 나옴).
+
+        ★★ **동률을 하나로 접지 않는다.** `min` 을 순차 비교로 구현하면 config 와 개인 한도가
+          같은 값일 때(예: 카드 적용으로 둘 다 4가 된 상태) 먼저 본 config 만 병목으로 남고
+          개인 한도는 사라진다. 그러면 다시 config 만 올리는 카드가 나오고, 개인 한도가
+          그대로라 또 안 풀린다. 최소값을 만드는 항을 **전부** 싣는다.
+
+        ★★★ **축별 값 전부**를 함께 돌려준다. 최소인 항만 알면 "개인 한도를 올렸을 때
+          다음으로 만나는 천장"을 알 수 없어, 해결카드가 그 천장을 넘는 값을 제안하고
+          적용해도 거기서 멈춘다(예: personal=1 · config=4 인데 6 을 제안 → 실제는 4).
+        """
+        # per-nurse 야간 상한(n_exact/n_max)도 동시에 적용 — 전역 상한만 보면 야간 공급을
+        # 과대계산해 shortage 를 놓친다. 상한을 조이는 방향이라 false positive 없음.
+        cands: List[tuple[str, int]] = [("working", _working_capacity(n, inp.roster_config))]
+        if cfg_max_night is not None and cfg_max_night >= 0:
+            cands.append(("config", cfg_max_night))
+        if n.night_cap is not None and n.night_cap >= 0:
+            cands.append(("personal", int(n.night_cap)))
+        _rc = _recovery_night_cap(n)
+        if _rc is not None:
+            cands.append(("recovery", _rc))
+
+        cap = min(v for _, v in cands)
+        binds = [k for k, v in cands if v == cap]
+        # 대표는 **고칠 수 있는 축** 우선 — 사람이 손댈 수 없는 working/recovery 를 앞세우면
+        # 해결책 없는 원인만 표시된다.
+        axis = dict(cands)
+        for pref in ("personal", "config", "recovery", "working"):
+            if pref in binds:
+                return cap, pref, binds, axis
+        return cap, binds[0], binds, axis
 
     def _night_cap_for_nurse(n: PrecheckNurse) -> int:
-        wc = _working_capacity(n, inp.roster_config)
-        if cfg_max_night is not None and cfg_max_night >= 0:
-            return min(wc, cfg_max_night)
-        return wc
+        return _night_cap_detail(n)[0]
 
     cap = sum(_night_cap_for_nurse(n) for n in n_capable)
     monthly_need = sum(_need(inp.roster_config, "N", d) for d in range(inp.num_days))
@@ -795,10 +985,24 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
     )
 
     # N 가능 nurse 별 working capacity — 누가 가장 가용 적은지
-    n_capable_caps = [
-        {"nurse_id": n.nurse_id, "capacity_days": _working_capacity(n, inp.roster_config)}
-        for n in n_capable
-    ]
+    # ★ night_cap/capped_by 를 함께 싣는다 — 해결책이 어느 축을 건드려야 하는지의 근거다.
+    #   capped_by='personal' 이면 config 를 올려도 min() 에서 개인 한도가 이겨 안 풀린다.
+    n_capable_caps = []
+    for n in n_capable:
+        _cap, _by, _binds, _axis = _night_cap_detail(n)
+        n_capable_caps.append({
+            "nurse_id": n.nurse_id,
+            "name": n.name,
+            "capacity_days": _working_capacity(n, inp.roster_config),
+            "night_cap": _cap,
+            "capped_by": _by,
+            # ★ 동률 병목 전부 — config 와 개인 한도가 같은 값이면 둘 다 올려야 풀린다.
+            "capped_by_all": _binds,
+            # ★★ 축별 값 전부 — 개인 한도를 올렸을 때 **다음 천장**이 얼마인지의 근거.
+            #    이게 없으면 해결카드가 config·recovery 를 넘는 값을 제안하고 거기서 멈춘다.
+            "cap_by_axis": _axis,
+            "personal_night_cap": n.night_cap,
+        })
     n_capable_caps.sort(key=lambda x: x["capacity_days"])
 
     return [
@@ -893,6 +1097,18 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
     """
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     by_id: Dict[str, PrecheckNurse] = {n.nurse_id: n for n in inp.nurses}
+    # 상호배제(배반) 맵 — preceptor-preceptee 페어가 동시에 mutex 로 걸리면 '함께근무 + 배반'
+    # 직접 모순(데이터-리딩성 상태 오염 포함). shift/team 이 호환이어도 이건 표현돼야 한다.
+    _mutex_map = inp.roster_config.get("mutual_exclusion_by_nurse_id") or {}
+
+    def _pair_has_mutex(a_id: str, b_id: str) -> bool:
+        for k in (a_id, b_id):
+            info = _mutex_map.get(str(k))
+            if isinstance(info, dict) and info.get("days") \
+                    and str(info.get("partner_id")) in (str(a_id), str(b_id)):
+                return True
+        return False
+
     issues: List[Dict] = []
     for n in inp.nurses:
         if not n.preceptor_id:
@@ -924,6 +1140,9 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
             reasons.append("team_mismatch")
         if effective_days <= 0:
             reasons.append("window_empty")
+        # 함께근무(preceptee) 인데 동시에 상호배제(배반) → 직접 모순. shift/team 호환 여부와 무관.
+        if _pair_has_mutex(ptor.nurse_id, n.nurse_id):
+            reasons.append("mutual_exclusion_conflict")
 
         if not reasons:
             continue
@@ -948,6 +1167,58 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
                 },
             )
         )
+    return issues
+
+
+def check_per_nurse_sequence(inp: PrecheckInput) -> List[Dict]:
+    """개인축: 각 간호사가 혼자서 고정셀 + 시퀀스 규칙(전이금지/연속근무/연속야간/회복/1N)을
+    다 지키는 유효한 근무 배열을 만들 수 있는가. 혼자 불가능 = 전체 불가능(증명).
+
+    aggregate/max-flow 가 못 보는 '고정셀 × 시퀀스' 배치 충돌(예: 고정 N 다음날 고정 D +
+    N→D 금지)을 solve 전에 잡는다. DP 는 '증명된 불가능'만 반환 → false positive 없음.
+    """
+    from services.precheck.per_nurse_sequence_feasibility import nurse_sequence_infeasible
+
+    cfg = inp.roster_config
+    S = _apply_shifts(bool(cfg.get("use_mid", False)))
+    ban_n_to_d = bool(cfg.get("ban_n_to_d", True))
+    ban_e_to_d = bool(cfg.get("banned_day_after_eve", True))
+    ban_n_to_e = bool(cfg.get("ban_n_to_e", True))
+    two2 = bool(cfg.get("two_offs_after_two_nig"))
+    two3 = bool(cfg.get("two_offs_after_three_nig"))
+    not_one = bool(cfg.get("not_one_night"))
+    max_k = cfg.get("max_conseq_work")
+    max_l = 3 if cfg.get("three_seq_nig") else 2
+
+    issues: List[Dict] = []
+    for n in inp.nurses:
+        span = n.leave_day - n.join_day + 1
+        if span <= 0:
+            continue
+        # 고정 근무 + 고정 OFF 를 active span 0-based 로 remap
+        fixed: Dict[int, str] = {}
+        for d, sh in (n.fixed_shift_assignments or {}).items():
+            if n.join_day <= d <= n.leave_day:
+                fixed[d - n.join_day] = str(sh).upper()
+        for d in (n.fixed_off_days or set()):
+            if n.join_day <= d <= n.leave_day and (d - n.join_day) not in fixed:
+                fixed[d - n.join_day] = "O"
+        # 고정셀이 없으면 all-OFF 완성이 항상 가능 → 개인 단독 불가능 없음(스킵, 비용 절약)
+        if not fixed:
+            continue
+        allowed_work = {c for c in _allowed_set(n, S) if c in ("D", "E", "N")}
+        if nurse_sequence_infeasible(
+            num_days=span, allowed=allowed_work, fixed=fixed,
+            max_consecutive_work=max_k, max_consecutive_nights=max_l,
+            ban_n_to_d=ban_n_to_d, ban_e_to_d=ban_e_to_d, ban_n_to_e=ban_n_to_e,
+            two_offs_after_two_nig=two2, two_offs_after_three_nig=two3,
+            not_one_night=not_one,
+            n_min=0, n_max=(n.night_cap if n.night_cap is not None else None),
+        ):
+            issues.append(_issue(
+                "PER_NURSE_SEQUENCE_INFEASIBLE",
+                {"nurse_id": n.nurse_id, "active_days": span, "fixed_cells": len(fixed)},
+            ))
     return issues
 
 
@@ -1039,6 +1310,7 @@ def run_precheck(
         check_monthly_night_capacity,  # Fix 1 (renamed from check_common_pool_night_capacity)
         check_daily_night_shortage,
         check_preceptee_sync_mismatch,
+        check_per_nurse_sequence,  # 개인축: 고정셀 × 시퀀스 배치 충돌 (증명된 불가능)
     ]
     for fn in day_phase:
         issues.extend(fn(inp))

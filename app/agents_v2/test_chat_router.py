@@ -187,19 +187,17 @@ def _seed_test_db(db: Session):
 
     # Roster Config
     db.add(RosterConfig(
-        config_id=1, config_version="v1", office_id="OFF001", group_id="GRP001",
+        config_id=1, office_id="OFF001", group_id="GRP001",
         day_req=2, eve_req=2, nig_req=2, min_exp_per_shift=2,
         req_exp_nurses=1, two_offs_per_week=True, max_nig_per_month=7,
         three_seq_nig=False, two_offs_after_three_nig=True,
         two_offs_after_two_nig=False, banned_day_after_eve=True,
         max_conseq_work=5, off_days=8, shift_priority=0.5,
-        weekend_shift_ratio=0.5, patient_amount=30,
-        sequential_offs=True, even_nights=True, nod_noe=True,
-        not_one_night=False, use_mid=False, preceptor_gauge=5,
+        sequential_offs=True, nod_noe=True,
+        not_one_night=False, use_mid=False,
         preceptee_on=True, preceptee_shift_count=True,
-        weekly_off_group=False, team_balance_enable=True,
-        team_balance_gauge=5, team_balance_mode="balanced",
-        off_placement_mode=0, fixed_wanted_use_yn=True,
+        weekly_off_group=False,
+        fixed_wanted_use_yn=True,
         show_level=True, show_preceptor=True,
     ))
     db.flush()

@@ -1,0 +1,160 @@
+# 수술실 온콜(콜 당번) 검증 체크리스트
+#
+# 근거는 전부 2026-07/08 인천의료원 수술실 근무일정표 실측이다.
+# 규칙을 바꾸려면 먼저 실측에서 반례를 찾을 것.
+#
+# severity:
+#   blocking — 하나라도 깨지면 생성 결과를 신뢰할 수 없다
+#   warning  — 데이터 사정으로 흔들릴 수 있어 값만 남긴다
+
+meta:
+  name: oncall_core
+  target: "수술실 콜 당번"
+  source: "2026-07/08 근무일정표 실측"
+
+checks:
+  # ── 구조 ──
+  - id: headcount
+    title: "인원 = active 전원"
+    severity: blocking
+    why: "근무표에서 통째로 빠지는 인원이 있으면 콜 자리도 함께 빈다(고수연 실측)"
+
+  - id: cell_count
+    title: "셀 수 = 인원 × 일수"
+    severity: blocking
+
+  - id: daily_headcount
+    title: "하루 콜 인원 = 4명 (전 일자)"
+    severity: blocking
+    expect: 4
+    why: "엑셀 주석 '1일 콜 대기 근무 4명 (마취/소독/순환/전담간호사)'"
+
+  # ── 윈도우 ──
+  - id: team_rotation
+    title: "주(월~일) 단위 팀 로테이션"
+    severity: blocking
+    why: "실측 7/27~8/02 t2 · 8/03~09 t3 · 8/10~16 t4 · 8/17~23 t1 · 8/24~30 t2"
+
+  - id: chain_from_prev
+    title: "직전 달에서 시작 팀 역산 (앵커 미저장)"
+    severity: blocking
+    why: "월 경계 꼬리물기. 8월 마지막 주가 t3 면 9월 첫 주도 t3"
+
+  # ── 코드 ──
+  - id: code_switch
+    title: "평일 D1콜 / 휴일·공휴일 오프콜"
+    severity: blocking
+    why: |
+      근무를 빼지 않고 코드만 갈아끼운다(schedule_entries 는 셀당 코드 하나).
+      fixed_holiday_off_yn 이 켜진 그룹은 공휴일도 OFF 계열이라 오프콜이 맞다 —
+      요일만으로 판정하면 추석 같은 평일 공휴일에서 오탐이 난다.
+
+  - id: unregistered_group_untouched
+    title: "call_base_id 미등록 그룹은 콜 0"
+    severity: blocking
+    why: "기본값을 두면 모든 병동에 있는 O 가 걸려 미사용 병동까지 콜이 붙는다"
+
+  - id: role_coverage
+    title: "하루 콜 4명 = 역할(rank) 1·2·3·4 각 1명"
+    severity: warning
+    why: |
+      rank 는 순번이 아니라 역할이다 — 엑셀 주석 "1일 콜 대기 근무 4명
+      (마취/소독/순환/전담간호사)". 실측 2026-08 은 31일 중 30일이 {1,2,3,4} 이고,
+      유일한 예외 8/21 은 rank4(고수연)가 노조교육으로 빠져 못 채운 날이다.
+      그래서 blocking 이 아니라 warning — 같은 역할이 아무도 못 서면 정원 4명이
+      우선이고, 그때만 중복이 허용된다.
+
+  # ── 대체 ──
+  - id: sub_run_limit
+    title: "담당주와 떨어진 대체 ≤ 3일 (고립 회피 시 4일)"
+    severity: blocking
+    expect: 4
+    why: |
+      실측 한승윤 8/11~13 · 민희원 8/28~30 · 성해인 8/21~23 — 전부 3일이다.
+      ★ 다만 4일 결원을 3+1 로 자르면 **담당주와 떨어진 1일**이 남는다. 실측에서
+        1일 블록은 김영민 8/10 하나뿐이고 그건 자기 담당주 8/3~9 바로 다음날이라
+        연속의 연장이었다 — 고립 1일은 0건이다. 그래서 3+1 대신 통째로 4일을
+        주고, 상한을 4 로 둔다(2026-09 생성분에서 고수진·하재욱이 하루씩
+        끼어들던 자리가 이 규칙으로 사라졌다).
+
+  - id: no_isolated_single
+    title: "블록 분할로 생긴 고립 1일 금지"
+    severity: blocking
+    why: |
+      실측 2026-08 대체 4건 중 1일짜리는 김영민 8/10 하나이고, 자기 담당주
+      8/3~9 에 바로 이어 붙는다. **떨어진 1일은 0건**이다.
+      ★ 다만 **결원 자체가 1일**이면 대체도 1일일 수밖에 없다 — 실측 2026-09
+        윤보라 9/27 은 한승윤이 휴가 직전일 제약으로 하루만 빠진 자리이고,
+        품앗이(8월에 한승윤이 윤보라를 대신 섰다)로 윤보라가 갚은 것이다.
+        불가피한 1일과 분할 실패를 가르기 위해, **그 역할 자리가 이틀 이상 비었는데
+        1일로 쪼개진 경우**만 위반으로 본다(2026-09 고수진 9/10 이 그 사례).
+
+  - id: total_run_limit
+    title: "본인 연속 콜 ≤ 8일"
+    severity: blocking
+    expect: 8
+    why: "실측 김영민 8/03~10 = 8일에서 끊기고 8/11 부터 한승윤에게 넘어감"
+
+  - id: fixed_wanted_not_overwritten
+    title: "확정 원티드 날을 대체로 덮지 않음"
+    severity: blocking
+    why: "담당주 주말 O→오프콜 은 정상이지만, 남의 주간에 끌려오며 덮으면 안 된다"
+
+  - id: no_call_before_wanted_off
+    title: "확정 원티드 휴가/공가 직전일 콜 금지"
+    severity: blocking
+    why: |
+      콜은 야간 대기라 N 과 같은 판정을 받는다 — 쉬기로 굳힌 날 바로 앞에 N 을
+      못 두는 것과 같은 이유로 콜도 둘 수 없다. CP-SAT 의
+      ban_night_before_fixed_off 와 대상(type ∈ 휴가·공가)·면제(1일 전날=전월)를
+      맞춘다. 2026-08 실측 근무표는 이 규칙을 2건 어겼다
+      (김다해 8/9 OFF(콜)→8/10 보건 · 성해인 8/27 D1콜→8/28 휴PM).
+
+  # ── 제외·보호 ──
+  - id: unassigned_excluded
+    title: "팀 미배정자 콜 진입 0"
+    severity: blocking
+    why: "실측 강민정·이아현·한주영·이선미는 7·8월 콜 명단에 한 번도 없다"
+
+  - id: leave_masked
+    title: "휴직자가 휴직 코드로 가려짐"
+    severity: blocking
+    why: "blocked_by_nurse_id 는 솔버 전용이라 fixed_shift 보유자에게 닿지 않는다"
+
+  - id: fixed_wanted_applied
+    title: "확정 원티드 100% 반영"
+    severity: blocking
+
+  # ── 학습 ──
+  - id: quota_learned
+    title: "개인 콜 상한 자동 학습"
+    severity: warning
+    why: "담당주 수행률 70% 미만이 계속되면 최대 실적을 상한으로. 설정 입력 없음"
+
+  - id: quota_respected
+    title: "학습된 상한 준수"
+    severity: blocking
+
+  - id: single_schedule_per_month
+    title: "월별 대표 근무표 1건만 참조"
+    severity: blocking
+    why: "같은 달에 근무표가 여러 개 쌓인다(실측 8월 7건). 합쳐 읽으면 역산·학습이 망가진다"
+
+  # ── 실측 대조 ──
+  - id: reproduce_calls
+    title: "실측 대비 콜 재현율"
+    severity: warning
+    threshold: 88.0
+    why: |
+      ★ 재현율은 정확도가 아니다 — 실측은 정답이 아니라 비교 대상이다.
+      2026-08 대조에서 남은 차이 3건은 전부 **실측 쪽 규칙 위반**이었다
+      (김다해 8/9 · 한승윤 8/13 · 성해인 8/27 — 휴가/공가 직전일에 콜).
+      제약을 끄면 619셀 100% 재현되므로, 이 항목이 100% 가 아닌 것 자체는
+      결함이 아니다. 떨어졌을 때 보아야 할 것은 수치가 아니라 **차이의 사유**다.
+      같은 기준으로 채점하면 실측이 앞서는 항목은 없다
+      (휴가/공가 직전일 콜 3:0 · 개인 편차 3~12 vs 3~11 · 나머지 동률).
+
+  - id: reproduce_cells
+    title: "실측 대비 전체 셀 일치율"
+    severity: warning
+    threshold: 90.0

@@ -47,9 +47,13 @@ def _is_active_day(nurse: PrecheckNurse, d: int) -> bool:
 
 
 def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
+    """근무가능일을 하드하게 줄이는 off 만. 개인 월 휴무(off_days)는 엔진 소프트라 제외.
+
+    cf. team_grade_precheck._hard_off_floor — off_days 를 하드 감산하면 capacity 를
+    과소계산해 false CoverageMin/CAPACITY shortage 를 만든다(8d2c2a9 회귀 트윈).
+    """
     return (
         int(cfg.get("global_monthly_off_days", 0) or 0)
-        + int(cfg.get("standard_personal_off_days", 0) or 0)
         + int(nurse.personal_off_adjustment or 0)
     )
 

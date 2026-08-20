@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from db.models import Nurse, NurseAssignment, NurseMonthlyLimit, RosterConfig
+from db.models import Nurse, NurseAssignment, NurseMonthlyLimit
 from schemas.auth_schema import User as UserSchema
 from services.group_access import (
     assert_caller_can_access_group,
@@ -235,6 +235,9 @@ def _row_to_item(
         group_id=str(r.group_id),
         year=int(as_of_year if as_of_year is not None else r.year),
         month=int(as_of_month if as_of_month is not None else r.month),
+        # 값의 실제 출처 = 원본 행의 연/월(이월이면 표시월과 다르다).
+        applied_from_year=int(r.year),
+        applied_from_month=int(r.month),
         d_min=r.d_min,
         d_max=r.d_max,
         d_exact=r.d_exact,
@@ -418,21 +421,12 @@ def upsert_nurse_monthly_limits_service(
             "fix_suggestions_ko": fixes,
         })
 
-    # 그룹별 월간 N 상한(roster_config.max_nig_per_month) lazy 캐시.
-    # 0/None은 솔버 런타임 보정(cp_sat_basic: <=0 → 15)과 동일하게 15로 본다.
-    _max_night_cache: Dict[str, int] = {}
-
-    def _group_max_night(gid: str) -> int:
-        if gid not in _max_night_cache:
-            _cfg = (
-                db.query(RosterConfig)
-                .filter(RosterConfig.group_id == gid)
-                .order_by(RosterConfig.config_id.desc())
-                .first()
-            )
-            _raw = int(getattr(_cfg, "max_nig_per_month", 0) or 0) if _cfg is not None else 0
-            _max_night_cache[gid] = _raw if _raw > 0 else 15
-        return _max_night_cache[gid]
+    # [저장↔config 분리] 간호사 월 근무한도 저장은 roster_config(max_nig_per_month)와 완전히
+    # 독립이어야 한다. 과거엔 N전담+n_exact>config max_night 조합을 저장 시점에 하드 차단했으나,
+    # 이는 (a) 개인 속성 저장을 transient config 에 종속시키고 (b) config 는 언제든 바뀌므로
+    # 결정론적 모순이 아니며 (c) 이 충돌은 이제 생성 시점에 per-nurse MCS 가 해결책 2개
+    # (config 상한 올리기 / 그 간호사 한도 낮추기)로 안내한다. 따라서 저장 검증에 config 를
+    # 주입하지 않는다(max_night=None → 해당 검사 skip). 저장은 항상 개인 의도대로 통과.
 
     for nurse_id, rows in by_nurse.items():
         nurse = pf_nurses.get(str(nurse_id))
@@ -470,19 +464,21 @@ def upsert_nurse_monthly_limits_service(
             )
             total_active_est += cap_days
 
-            # 파견 인바운드 행은 대상 그룹 capability 오버레이(target_shift_types)를 반영한
-            # effective nurse 로 검증한다. base nurses.allowed_shifts 만 보면 파견지에서
-            # 가능해진 N 을 불가로 오판해 MONTHLY_LIMIT_NOT_IN_WORK_SHIFTS 로 오차단된다.
-            eff_nurse = (
-                _effective_nurse_for_group(db, nurse, str(rr.get("group_id")), year, month)
-                if inbound else nurse
+            # [as-of 정합] 파견 인바운드뿐 아니라 home 도 allowed_shifts 를 period as-of 로
+            # 해석해야 한다. 과거엔 home 을 raw nurse(캐시 컬럼)로 검증해, 미래발효 변경
+            # (예: 8월 N전담 해제 []를 7월에 저장→컬럼은 as-of-today ['N'] stale)이 8월 저장
+            # 검증에 반영 안 돼 'N전담' 으로 오판(MONTHLY_LIMIT_NIGHT_DEDICATED_* / NOT_IN_WORK_SHIFTS
+            # 오차단)했다. _effective_nurse_for_group 는 home 도 _period_asof_overrides(대상월
+            # as-of)로 처리하고, 구간 없으면 캐시 폴백(무회귀). 인바운드는 기존대로 target_* 오버레이.
+            eff_nurse = _effective_nurse_for_group(
+                db, nurse, str(rr.get("group_id")), year, month
             )
 
             # 새 산술 모순 검사 (nurse 특성 + 강제 OFF + sum coverage 등)
             issues_all.extend(
                 validate_monthly_limit_row(
                     row=rr, nurse=eff_nurse, cap_days=cap_days, year=year, month=month,
-                    max_night=_group_max_night(str(rr.get("group_id"))),
+                    # max_night 미주입: 저장은 config 와 독립(위 주석). config 충돌은 생성 시점 처리.
                 )
             )
             # soft 경고: N전담 + 낮은 N 한도(커버리지 의존이라 차단 대신 안내)
@@ -533,104 +529,11 @@ def upsert_nurse_monthly_limits_service(
                 ["월 전체 그룹의 min 합을 줄이세요."],
             )
 
-    # ── 그룹 단위 N pool 산술 검사 (cross-nurse) ──
-    from services.precheck.monthly_limit_validator import (
-        check_group_n_pool,
-        _allowed_work_shifts,  # private이지만 같은 패키지 활용
-    )
-
-    group_ids_in_request = {str(r["group_id"]) for r in normalized}
-    days_in_month_full = monthrange(year, month)[1]
-
-    for gid in group_ids_in_request:
-        try:
-            # RosterConfig → daily N 요구치
-            roster_cfg = (
-                db.query(RosterConfig)
-                .filter(RosterConfig.group_id == gid)
-                .order_by(RosterConfig.config_id.desc())
-                .first()
-            )
-            if roster_cfg is None:
-                continue
-            n_daily = int(getattr(roster_cfg, "nig_req", 0) or 0)
-            if n_daily <= 0:
-                continue  # N 요구 없으면 검사 skip
-            monthly_n_demand = n_daily * days_in_month_full
-            # daily N max는 RosterConfig에 직접 저장 안 됨; 보수적으로 None.
-            daily_n_max_total = None
-
-            # group의 모든 nurse + N 가능 여부
-            group_nurses = (
-                db.query(Nurse)
-                .filter(Nurse.group_id == gid, Nurse.active == 1)
-                .all()
-            )
-            n_capable_nurses = [
-                nu for nu in group_nurses
-                if "N" in (_allowed_work_shifts(nu) or {"D", "E", "N"})
-            ]
-            total_n_capable = len(n_capable_nurses)
-
-            # 요청 + 기존 limit 병합 (nurse_id 단위)
-            request_by_nurse: Dict[str, Dict[str, Any]] = {
-                str(r["nurse_id"]): r for r in normalized if str(r["group_id"]) == gid
-            }
-            existing_limits = (
-                db.query(NurseMonthlyLimit)
-                .filter(
-                    NurseMonthlyLimit.group_id == gid,
-                    NurseMonthlyLimit.year == year,
-                    NurseMonthlyLimit.month == month,
-                )
-                .all()
-            )
-            existing_by_nurse = {str(e.nurse_id): e for e in existing_limits}
-
-            forced_n_sum = 0
-            nurses_with_n_forced = 0
-            free_capacity_sum = 0
-
-            for nu in n_capable_nurses:
-                nid = str(nu.nurse_id)
-                # request 우선, 없으면 기존, 없으면 free
-                if nid in request_by_nurse:
-                    rr = request_by_nurse[nid]
-                    n_exact = rr.get("n_exact")
-                    n_max = rr.get("n_max")
-                else:
-                    e = existing_by_nurse.get(nid)
-                    n_exact = getattr(e, "n_exact", None) if e else None
-                    n_max = getattr(e, "n_max", None) if e else None
-
-                # 가용일 (그룹 active)
-                inbound = False
-                cap = _group_active_capacity_days(
-                    db, nurse_id=nid, group_id=gid, year=year, month=month, inbound=inbound,
-                    assignments=_cap_assignments(nid),
-                )
-
-                if n_exact is not None:
-                    forced_n_sum += int(n_exact)
-                    nurses_with_n_forced += 1
-                elif n_max is not None:
-                    free_capacity_sum += min(int(n_max), cap)
-                else:
-                    free_capacity_sum += cap
-
-            pool_issues = check_group_n_pool(
-                group_id=gid,
-                monthly_n_demand=monthly_n_demand,
-                forced_n_sum=forced_n_sum,
-                free_capacity_sum=free_capacity_sum,
-                nurses_with_n_forced=nurses_with_n_forced,
-                total_n_capable_nurses=total_n_capable,
-                daily_n_max_total=daily_n_max_total,
-                days_in_month=days_in_month_full,
-            )
-            issues_all.extend(pool_issues)
-        except Exception as _pool_exc:
-            print(f"[MonthlyLimit] group N pool 검사 실패(무시) gid={gid}: {_pool_exc}")
+    # [저장↔config 분리] 그룹 N pool 검사(nig_req vs N가용)는 최신 RosterConfig 를 읽어
+    # 저장을 차단하던 config-결합 검사였다. 저장은 config 와 독립이어야 하고(위 max_night 주석
+    # 참조), 이 그룹 N 수급 부족은 생성 precheck(team_grade_precheck 의 야간 capacity 분석 →
+    # cause:capacity:monthly_night_shortage)에서 이미 더 정확히 잡는다. 조합·config 확정 전
+    # 개인 속성 저장 시점에 막을 일이 아니므로 저장 경로에서 제거한다.
 
     if issues_all:
         payload = build_validation_payload(issues_all)
@@ -652,10 +555,11 @@ def upsert_nurse_monthly_limits_service(
             "n_min": row.get("n_min"), "n_max": row.get("n_max"), "n_exact": row.get("n_exact"),
             "o_min": row.get("o_min"), "o_max": row.get("o_max"), "o_exact": row.get("o_exact"),
         }
-        if _is_all_bounds_empty(payload):
-            if rec is not None:
-                db.delete(rec)
-            continue
+        # all-null 이라도 행을 삭제하지 않는다 — 그 달 '명시적 한도 없음'(묘비)을 보존한다.
+        # 삭제하면 as-of 조회("대상월 이하 최근 행")가 과거 non-null 을 재상속하므로,
+        # 사용자가 이번 달 '설정 안 함'을 저장해도 표현·구분이 불가능해진다.
+        # (묘비 = all-null 행. as-of 가 이 행에서 멈춰 null=해제를 반환하고 과거로 새지 않는다.)
+        # 실제 행 제거(= 상속으로 되돌리기)가 필요하면 '설정 안 함'과 혼동되지 않는 별도 계약으로 제공한다.
         if rec is None:
             rec = NurseMonthlyLimit(
                 nurse_id=row["nurse_id"],

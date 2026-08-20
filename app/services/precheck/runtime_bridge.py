@@ -124,6 +124,12 @@ def _weekend_off_count(year: int, month: int) -> int:
     )
 
 
+def _weekend_day_indices(year: int, month: int) -> Set[int]:
+    """주말(토/일)의 0-based day index 집합."""
+    dim = calendar.monthrange(year, month)[1]
+    return {d - 1 for d in range(1, dim + 1) if date(year, month, d).weekday() >= 5}
+
+
 def _collect_fixed_assignments(
     fixed_cells: Optional[Iterable[dict]],
     nurse_id_lookup: Dict[str, str],
@@ -203,6 +209,9 @@ def build_precheck_input(
     days_in_month = calendar.monthrange(year, month)[1]
     use_mid = bool(config_dict.get("use_mid", False))
     weekend_off_days = _weekend_off_count(year, month)
+    # weekend_off_only_enable(엔진 기본 True) 일 때만 주말 강제휴무를 per-day 로 반영.
+    _weekend_off_enabled = bool(config_dict.get("weekend_off_only_enable", True))
+    _weekend_idx = _weekend_day_indices(year, month) if _weekend_off_enabled else set()
 
     # nurse_id 표기 alias 매핑 (some 데이터는 db_id를 키로 씀)
     nurse_id_lookup: Dict[str, str] = {}
@@ -217,6 +226,14 @@ def build_precheck_input(
     fixed_assignments_by_nurse = _collect_fixed_assignments(
         fixed_cells, nurse_id_lookup, year, month, days_in_month
     )
+
+    # period SSOT preceptee → preceptor_id overlay.
+    # 엔진(cp_sat_basic)은 preceptee_period_by_nurse_id(월 authoritative)를 우선 SSOT 로 쓰지만,
+    # precheck 는 그동안 nurse.preceptor_id(캐시) 만 읽어 period 경로의 preceptee 관계에 눈이 멀어
+    # 있었다 → 데이터-리딩성 모순(예: 8월에 period 로 preceptee 가 되살아나며 상호배제 공존)을
+    # 못 봤다. 여기서 엔진과 동일 규칙으로 매핑을 주입한다(authoritative 우선, 아니면 캐시 폴백).
+    _pte_period = config_dict.get("preceptee_period_by_nurse_id") or {}
+    _pte_authoritative = bool(config_dict.get("preceptee_period_authoritative"))
 
     nurses: List[PrecheckNurse] = []
     for nd in nurses_dict:
@@ -237,18 +254,45 @@ def build_precheck_input(
 
         fixed_map = fixed_assignments_by_nurse.get(nid, {})
         fixed_off_days: Set[int] = {d for d, code in fixed_map.items() if code in {"O", "OFF"}}
+        # weekend-off 간호사는 주말에만 휴무 강제(weekend_off_only_enable) → 주말 = per-day 미가용.
+        # 주말 날짜를 fixed_off 로 표시해 per-day 커버리지 체크가 주말 공급부족을 잡게 한다.
+        if _weekend_idx and bool(nd.get("is_weekend_off", False)):
+            fixed_off_days = fixed_off_days | _weekend_idx
         fixed_shift_assignments: Dict[int, str] = {
             d: code for d, code in fixed_map.items() if code not in {"O", "OFF"}
         }
 
-        # preceptor 페어링 — preceptor_id 가 있으면 본인이 preceptee
+        # preceptor 페어링 — preceptor_id 가 있으면 본인이 preceptee.
+        # 캐시(nurses.preceptor_id)는 폐지 예정 전환기 투영이라 엔진과 '동일 규칙'으로 해석한다
+        # (roster_create_service._pte_authoritative 참조):
+        #   authoritative(그룹 백필됨) → period 가 유일 SSOT. 미포함(종료월)=관계 해제 → 캐시 무시.
+        #   비authoritative(pre-backfill·period row 전무) → 캐시 폴백(무회귀).
+        # 과거엔 캐시를 base 로 깔고 period 를 '있을 때만' 덧칠해, 종료월(빈 맵)에 stale 캐시가
+        # 살아남아 precheck 만 엔진(active=0)과 갈리며 PRECEPTEE_SYNC_MISMATCH false-positive 를 냈다.
         raw_ptor = nd.get("preceptor_id")
+        _pinfo = _pte_period.get(nid) or _pte_period.get(str(nid))
+        _period_ptor = _pinfo.get("preceptor_id") if isinstance(_pinfo, dict) else None
+        if _pte_authoritative:
+            raw_ptor = _period_ptor  # period 유일 SSOT — 종료월엔 None(해제)
+        elif _period_ptor is not None and raw_ptor in (None, "", 0):
+            raw_ptor = _period_ptor  # 캐시 비었을 때만 period 폴백
         preceptor_id = str(raw_ptor).strip() if raw_ptor not in (None, "", 0) else None
         # 동기 window 는 nurse data 에 명시되지 않으면 None → check 함수가 join/leave 로 채움
         ws_start = nd.get("sync_window_start")
         ws_end = nd.get("sync_window_end")
         sync_start = _to_day_index(ws_start, year, month, days_in_month) if ws_start else None
         sync_end = _to_day_index(ws_end, year, month, days_in_month) if ws_end else None
+
+        # per-nurse 야간 상한: n_exact(정확값) 우선, 없으면 n_max. 엔진과 동일하게 야간 공급을
+        # per-nurse 로 제약해 check_monthly_night_capacity 가 과대계산하지 않게 한다.
+        _nx, _nm = nd.get("n_exact"), nd.get("n_max")
+        night_cap = None
+        for _v in (_nx, _nm):
+            if _v is not None:
+                _iv = _safe_int(_v, -1)
+                if _iv >= 0:
+                    night_cap = _iv
+                    break
 
         nurses.append(
             PrecheckNurse(
@@ -264,6 +308,9 @@ def build_precheck_input(
                 preceptor_id=preceptor_id,
                 sync_window_start=sync_start,
                 sync_window_end=sync_end,
+                night_cap=night_cap,
+                # 진단 카드가 사번 대신 이름으로 사람을 지목하도록 실어 보낸다.
+                name=(str(nd.get("name")).strip() or None) if nd.get("name") else None,
             )
         )
 
@@ -288,16 +335,36 @@ def build_precheck_input(
         "daily_shift_requirements": dict(config_dict.get("daily_shift_requirements") or {}),
         "daily_shift_requirements_by_day": list(config_dict.get("daily_shift_requirements_by_day") or []),
         "global_monthly_off_days": _safe_int(config_dict.get("global_monthly_off_days"), 0),
-        "standard_personal_off_days": _safe_int(config_dict.get("standard_personal_off_days"), 0),
+        # off 예산: DB/엔진 키는 off_days. (구 dataclass 키 standard_personal_off_days 는 fallback)
+        "off_days": _safe_int(
+            config_dict.get("off_days", config_dict.get("standard_personal_off_days")), 0),
     }
-    # closed-loop apply target keys — 명시되어 있을 때만 forward (precheck 가 cfg 한도 추가 활용)
-    for k in ("max_night_shifts_per_month", "max_consecutive_work"):
-        v = config_dict.get(k)
-        if v is not None:
-            try:
-                roster_config[k] = int(v)
-            except (TypeError, ValueError):
-                pass
+    # 키 정규화(2026-07-21): precheck config dict 키를 **DB/엔진 canonical(max_nig_per_month /
+    # max_conseq_work / off_days)** 로 통일한다. 과거 precheck 는 max_night_shifts_per_month /
+    # max_consecutive_work 를 dict 키로 읽어 실 config(DB 키)와 불일치 → 상한 로직이 조용히
+    # 죽던 버그가 있었다. 이제 DB 키를 우선, 구 키는 fallback 으로만 읽고 DB 키로 output.
+    #
+    # 야간 한도는 엔진(create_config_from_db)과 동일 semantics 로 정규화:
+    #   None / <=0  → 15 (엔진이 0·None garbage 를 15로 floor). precheck 가 엔진보다
+    #   더 낮은 cap 을 쓰면 false positive 가 나므로, 반드시 동일 floor 를 적용한다.
+    _raw_max_nig = config_dict.get("max_nig_per_month",
+                                   config_dict.get("max_night_shifts_per_month"))
+    _mn = _safe_int(_raw_max_nig, 0) if _raw_max_nig is not None else None
+    if _mn is not None:
+        roster_config["max_nig_per_month"] = _mn if _mn > 0 else 15
+
+    _raw_mcw = config_dict.get("max_conseq_work",
+                               config_dict.get("max_consecutive_work"))
+    if _raw_mcw is not None:
+        _mcw = _safe_int(_raw_mcw, 0)
+        if _mcw > 0:
+            roster_config["max_conseq_work"] = _mcw
+
+    # 상호배제(배반) 맵 forward — check_preceptee_sync_mismatch 가 preceptor-preceptee 페어가
+    # 동시에 상호배제로 걸린 모순(함께근무 + 배반)을 탐지하는 데 쓴다.
+    _mx = config_dict.get("mutual_exclusion_by_nurse_id")
+    if _mx:
+        roster_config["mutual_exclusion_by_nurse_id"] = _mx
 
     return PrecheckInput(
         num_days=days_in_month,

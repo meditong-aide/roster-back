@@ -114,7 +114,9 @@ class Nurse(Base):
     gender = Column(NVARCHAR(3), nullable=True)
     profile_image_key = Column(VARCHAR(1000), nullable=True)
     profile_image_updated_at = Column(DATETIME, nullable=True)
-    is_weekend_off = Column(BOOLEAN, default=False)
+    # is_weekend_off: ORM 매핑 제거(2026-07-22). SSOT = nurse_weekendoff_period.
+    #   물리 컬럼은 당분간 DROP 하지 않되(요청), ORM 이 SELECT/read 하지 않도록 언매핑.
+    #   읽기는 services.nurse_period_resolver.is_weekend_off_asof / weekend_off_ids_asof 사용.
     # 추가
     work_shifts = Column(JSON, nullable=True, default=list, server_default="[]")
     # 원티드 설정 (간호사별 개별 설정)
@@ -235,6 +237,55 @@ class NurseMonthlyLimit(Base):
     )
 
 
+class NurseNightCycle(Base):
+    """수면OFF 판정을 위한 N 연번 앵커 — **월별 스냅샷**.
+
+    ★ effective-dated period 가 **아니다.** valid_from~valid_to · close-before-open ·
+      as-of 같은 개념이 없다. 위 `NurseMonthlyLimit` 과 같은 per-nurse × 월 스코프이며
+      근무표 확정 시 그 달 1행을 upsert 한다.
+
+    ★ 왜 저장이 필요한가 — `schedule_entries.shift_id` 에는 'N' 만 저장되고
+      N1~N15 연번은 없다. 근무표만으로는 "15 에 도달했는가"를 알 수 없다
+      (실측: 연번 없이 판정하면 중환자실 20명 전원이 후보로 나온다).
+
+    ★ `night_count` / `sleep_off_given` 같은 집계 컬럼은 두지 않는다 —
+      schedule_entries 에서 언제든 계산되므로 중복 저장할 이유가 없다.
+
+    설계: docs/leave_auto_assignment_design.md §5.2
+    """
+
+    __tablename__ = "nurse_night_cycle"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    nurse_id = Column(VARCHAR(50), nullable=False)
+    group_id = Column(VARCHAR(50), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    # 그 달 마지막 N 의 연번 = 다음 달 시작점.
+    seq_at_end = Column(INTEGER, nullable=True)
+    # 이월된 미부여 수면OFF 수.
+    #   ★ seq_at_end 만으로는 이월을 표현할 수 없다 (중환자실 유희주·이재영 실증):
+    #     8/30 N15 → 8/31 N1 시작 → seq_at_end=1 이지만 pending_sleep=1
+    pending_sleep = Column(INTEGER, nullable=True)
+    # 그 달 수면OFF 부여 횟수 (보통 0 또는 1).
+    sleep_off_count = Column(INTEGER, nullable=True)
+    # 그 달 말 기준 **누적 회차** = 전월 sleep_off_seq + sleep_off_count.
+    #   ★ 집계 컬럼 금지 원칙의 예외다. night_count 는 그 달만 세면 나오지만
+    #     누적 회차는 전 기간을 훑어야 하므로 seq_at_end 와 같은 층위의 상태값이다.
+    #   ★ 근무환경 지표로 쓴다 — 실측(2026-07~08): 수면 1회 수령자의 2개월 N 평균
+    #     10.6회 vs 미수령자 5.8회. 수령 빈도가 곧 나이트 부담이다.
+    sleep_off_seq = Column(INTEGER, nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    # ★ FK 는 걸지 않는다(DDL 최소화 방침). 정합은 앱단에서 유지.
+    __table_args__ = (
+        UniqueConstraint(
+            "nurse_id", "group_id", "year", "month", name="ux_nurse_night_cycle_scope"
+        ),
+    )
+
+
 class EffectiveDatedPeriodMixin:
     """시점 속성(effective-dated) 공통 컬럼.
 
@@ -290,6 +341,32 @@ class NurseWeekendOffPeriod(Base, EffectiveDatedPeriodMixin):
     __tablename__ = "nurse_weekendoff_period"
     weekend_off = Column(TINYINT, nullable=True)
     __table_args__ = (Index("ix_nwop_nurse", "nurse_id", "valid_from"),)
+
+
+class NurseLeavePeriod(Base, EffectiveDatedPeriodMixin):
+    """휴가 자동부여 대상 시점 구간 (간호사귀속). 보건휴가 · 수면OFF.
+
+    ★ 3-state 다 — `NULL`=자동판정 · `0`=제외 · `1`=강제포함. **NULL 이 유효값**이므로
+      NOT NULL/DEFAULT 0 을 걸면 안 된다(전원 제외가 된다).
+    ★ **행이 없으면 전부 자동판정 = 도입 전 동작 그대로**라 백필하지 않는다. 예외만 넣는다.
+    ★ `pregnant` 는 정책이 아니라 사실이다. 보건휴가 자동판정의 입력값
+      (엑셀 실측: 산전 17건 중 보건 수령 0건 / 산전 없음 521건 중 413건 79%).
+
+    ★★ `nurse_allowed_shift_period` 에 컬럼을 더하지 않고 분리한 이유 —
+      그 테이블은 "설 수 있는 근무형"만 담고 두 컬럼이 **같이 변해서** 한 행에 있다.
+      휴가 대상 여부는 인사이동과 무관하게 바뀌므로 결합 근거가 없고, 합치면
+      `upsert_period(carry_attrs=...)` 호출부 10곳이 전부 승계 목록을 갱신해야 한다
+      (누락 시 근무형만 바꿔도 휴가설정이 조용히 NULL 로 덮인다 — 이 테이블에서
+       실제로 났던 사고: 응급실-RN 송혜영·윤나리 fixed_shift 소실).
+    """
+
+    __tablename__ = "nurse_leave_period"
+    # DB 는 BIT · 매핑은 BOOLEAN (이 파일의 기존 관행, Shift.health_leave_target 과 동일).
+    # nullable=True 가 핵심 — 3-state 의 NULL 을 살린다.
+    health_leave_eligible = Column(BOOLEAN, nullable=True)
+    sleep_off_eligible = Column(BOOLEAN, nullable=True)
+    pregnant = Column(BOOLEAN, nullable=True)
+    __table_args__ = (Index("ix_nlp_nurse", "nurse_id", "valid_from"),)
 
 
 class NursePrecepteePeriod(Base, EffectiveDatedPeriodMixin):
@@ -460,6 +537,15 @@ class Shift(Base):
         default=False,
     )
     off_swap_target = Column(BOOLEAN, nullable=False, default=False)
+    # 보건휴가 부여 대상 코드 표식. 그룹당 1건만 True (앱단 검증).
+    #   ★ off_swap_target 과 컬럼 관례만 같고 동작은 무관하다.
+    #     off_swap  = 생성 후 후처리로 초과 OFF 를 연차로 변환 (OFF 총량 유지)
+    #     보건휴가   = 생성 전 사전 주입으로 근무일을 대체 (OFF 쿼터 미소비)
+    #   코드명이 병동마다 '보건'/'보건휴가' 로 갈려 name 매칭이 불가해 표식으로 지목한다.
+    health_leave_target = Column(BOOLEAN, nullable=False, default=False)
+    # 수면OFF 부여 대상 코드 표식. 그룹당 1건만 True (앱단 검증).
+    #   보건휴가와 같은 관례. 코드가 없는 그룹(응급실-AN)은 켤 행이 없어 자동 미사용.
+    sleep_off_target = Column(BOOLEAN, nullable=False, default=False)
     # 근무코드 설명(자유 텍스트). MSSQL NVARCHAR(MAX) = NVARCHAR(-1).
     description = Column(NVARCHAR(None), nullable=True)
 
@@ -542,7 +628,6 @@ class ShiftPreference(Base):
 class RosterConfig(Base):
     __tablename__ = "roster_config"
     config_id = Column(INTEGER, primary_key=True, autoincrement=True)
-    config_version = Column(VARCHAR(20))
     office_id = Column(VARCHAR(50), ForeignKey("offices.office_id"))
     group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"))
     day_req = Column(INTEGER)
@@ -561,28 +646,34 @@ class RosterConfig(Base):
     # 연속 OFF 최대 개수(soft 상한). NULL=앱 기본 3 적용. (k+1)연속 OFF 고weight 벌점, 불가피 시 양보.
     max_conseq_off = Column(INTEGER, nullable=True)
     shift_priority = Column(FLOAT)
-    weekend_shift_ratio = Column(FLOAT)
-    patient_amount = Column(INTEGER)
     sequential_offs = Column(BOOLEAN)
-    even_nights = Column(BOOLEAN)
     nod_noe = Column(BOOLEAN)
     not_one_night = Column(BOOLEAN, nullable=False, default=False)
     use_mid = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
-    preceptor_gauge = Column(INTEGER, nullable=False, default=5)
     preceptee_on = Column(BOOLEAN, nullable=False, default=False)
     preceptee_shift_count = Column(BOOLEAN, nullable=False, default=True)
     weekly_off_group = Column(BOOLEAN)
-    team_balance_enable = Column(BOOLEAN, nullable=False, default=False)
-    team_balance_gauge = Column(INTEGER, nullable=False, default=0)
-    team_balance_mode = Column(VARCHAR(20), nullable=False, default="balanced")
-    off_placement_mode = Column(INTEGER, nullable=False, default=0)
     fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
-    ban_night_before_fixed_off = Column(BOOLEAN, nullable=False, default=True)
+    # ban_night_before_fixed_off: ORM 매핑 제거(DDL DROP 대상). 컬럼이 아니라 solver 기본값으로 존속 —
+    #   roster_config.py 의 dataclass 기본값(True) + cp_sat_basic create_config_from_db 의
+    #   config_data.get('ban_night_before_fixed_off', True) 가 컬럼 부재 시 동일 동작 보장(prod 전량 True).
+    #   재추가 금지: FE 미노출·probe/ontology 전용 상수-live 레버라 컬럼 저장 불필요.
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
     off_swap_enabled = Column(BOOLEAN, nullable=False, default=False)
+    # ── 보건휴가 자동 부여 ──
+    #   NULL = 미설정(= 꺼짐). 기존 row 를 건드리지 않으려 nullable 로 둔다.
+    #   판정은 항상 bool(getattr(cfg, ..., False)) — None 이 False 로 떨어져야 한다.
+    health_leave_enabled = Column(BOOLEAN, nullable=True, default=None)
+    # 주말 배치 허용. NULL/False = 평일만.
+    #   2026-08 실측 주말 비율: 41-RN 34% · 별관1 25% · 52-AN 22% / 그 외 0~5%
+    health_leave_weekend = Column(BOOLEAN, nullable=True, default=None)
+    # ── 수면OFF 자동 부여 ── (보건휴가와 동일한 NULL=미설정 규약)
+    sleep_off_enabled = Column(BOOLEAN, nullable=True, default=None)
+    # 트리거 주기(N 연번). 실측 15. NULL 이면 코드 기본값을 쓴다.
+    sleep_off_cycle = Column(INTEGER, nullable=True, default=None)
     # ── 설정 프리셋 (저장한 설정 모달) ──
     # version: 그룹(office+group)별 0부터 시작하는 프리셋 버전.
     #   기능 이전(legacy) row 는 NULL → 프리셋 아님(목록 비노출). 신규 저장 및
@@ -792,6 +883,30 @@ class WantedRequest(Base):
     submitted_at = Column(DATETIME, nullable=True)
 
 
+class WantedMonthlyMemo(Base):
+    """원티드 작성 화면의 월별 메모. 날짜·근무와 무관한 그 달 전체 메모다.
+
+    ★ 왜 별도 테이블인가
+      `wanted_requests` 는 월 헤더가 아니라 요청 단위 행이다(실측: 한 간호사·월에
+      최대 198행). 거기에 컬럼을 붙이면 어느 행에 쓸지가 모호해진다.
+    ★ 왜 별도 엔드포인트인가
+      `POST /preferences` 는 저장 한 번에 BannedWantedEntry · NurseShiftRequest ·
+      NursePairRequest 를 delete-then-insert 한다. 메모는 입력 중 디바운스로 자주
+      저장되므로 그 경로를 타면 원티드가 통째로 지워질 위험이 크다.
+
+    PK 가 (nurse_id, group_id, year, month) 라 월당 1행이고 upsert 가 단순하다.
+    """
+
+    __tablename__ = "wanted_monthly_memo"
+    nurse_id = Column(VARCHAR(50), primary_key=True)
+    group_id = Column(VARCHAR(50), primary_key=True)
+    year = Column(SMALLINT, primary_key=True)
+    month = Column(TINYINT, primary_key=True)
+    # NULL = 메모 없음(삭제된 상태). 빈 문자열도 삭제로 정규화해 저장한다.
+    memo = Column(TEXT, nullable=True)
+    updated_at = Column(DATETIME, nullable=False, default=func.now())
+
+
 class NurseShiftRequest(Base):
     __tablename__ = "nurse_shift_requests"
     nurse_id = Column(VARCHAR(50), primary_key=True)
@@ -933,9 +1048,6 @@ class FixedWantedEntry(Base):
         NVARCHAR(10), nullable=True
     )  # 원본 근무코드 (수정된 경우)
     reason = Column(TEXT, nullable=True)  # 사유 (원본에서 복사 또는 신규 입력)
-    head_nurse_memo = Column(
-        TEXT, nullable=True
-    )  # 수간호사 메모 (반려 사유, 조정 코멘트 등)
     created_by = Column(
         VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=True
     )  # 생성자
@@ -950,6 +1062,51 @@ class FixedWantedEntry(Base):
         Index("idx_fixed_entry_group_ym", "group_id", "year", "month"),
         Index(
             "idx_fixed_entry_nurse_date",
+            "group_id",
+            "year",
+            "month",
+            "nurse_id",
+            "shift_date",
+        ),
+    )
+
+
+# Banned Wanted (금지 원티드) — fixed_wanted 의 배반. 셀 단위로 배정 불가 근무(복수)를 배열로 저장.
+class BannedWantedEntry(Base):
+    """금지 원티드 테이블 — 셀(간호사·날짜)당 금지 근무코드 배열(D/E/N, 최대 2개).
+
+    솔버에서는 initial_forbidden 으로 반영되어 해당 셀에 그 근무 배정이 금지된다.
+    fixed_wanted 와 같은 셀에서 충돌 시 fixed 가 우선(솔버가 fixed 셀의 forbidden 을 skip).
+    """
+
+    __tablename__ = "banned_wanted_entries"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    nurse_id = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=False)
+    shift_date = Column(DATE, nullable=False)
+    # 금지 근무코드 배열(main code). 예: ["D","E"]. 1~2개.
+    banned_shift_ids = Column(JSON, nullable=False, default=list)
+    is_applied = Column(BOOLEAN, default=True)  # 적용/미적용 여부
+    # 출처: 'hn'=수간호사 조정판 저장, 'nurse'=간호사 본인이 원티드 작성에서 넣은 기피근무.
+    #   두 출처가 한 테이블에 섞이므로 스냅샷 replace 삭제 스코프를 이 값으로 가른다
+    #   (안 가르면 HN 저장 1회에 간호사 기피근무가 통째로 삭제된다).
+    source = Column(VARCHAR(10), nullable=False, server_default="hn", default="hn")
+    reason = Column(TEXT, nullable=True)
+    created_by = Column(VARCHAR(50), ForeignKey("nurses.nurse_id"), nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    group = relationship("Group")
+    nurse = relationship("Nurse", foreign_keys=[nurse_id])
+    creator = relationship("Nurse", foreign_keys=[created_by])
+
+    __table_args__ = (
+        Index("idx_banned_entry_group_ym", "group_id", "year", "month"),
+        Index(
+            "idx_banned_entry_nurse_date",
             "group_id",
             "year",
             "month",

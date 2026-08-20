@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import uuid
@@ -25,6 +26,8 @@ from services.roster_create_service import (
 )
 from services.job_status_service import create_job_record
 from services.group_access import resolve_effective_group
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["roster_create"])
 
@@ -141,6 +144,8 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
                 MessageBody=message_body,
             )
         )
+    except HTTPException:
+        raise
     except Exception as exc:  # boto3 예외 타입 다양
         # print('response', response)
         print('exc', exc)
@@ -210,9 +215,19 @@ async def roster_create_async(
         try:
             return {
                 "mode": "sync",
-                "result": generate_roster_service(req, current_user, _db),
+                "result": generate_roster_service(
+                    req, current_user, _db,
+                    config_override=(getattr(req, "config_override", None) or None),
+                    treatment_ids=(getattr(req, "treatment_ids", None) or None),
+                    weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
+                    monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
+                    banned_wanted_release=(getattr(req, "banned_wanted_release", None) or None),
+                    allowed_shift_add=(getattr(req, "allowed_shift_add", None) or None),
+                ),
                 "materialized_config": materialized,
             }
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"근무표 생성 실패: {exc}"
@@ -253,6 +268,8 @@ async def roster_create_async(
             group_id=target_group_id,
             nurse_id=current_user.nurse_id,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Job 생성 실패: {exc}") from exc
 
@@ -289,12 +306,25 @@ async def generate_roster_endpoint(
         year=2025, month=3 요청 시 동기 생성 결과 반환.
     """
     try:
-        return generate_roster_service(req, current_user, db)
+        # 해결책 재생성 파라미터를 서비스로 전달(누락 시 config_override 의 비-DB 솔버키
+        # (예: weekend_off_only_enable)와 weekend_off_release/monthly_limit_release 가 반영 안 됨).
+        return generate_roster_service(
+            req, current_user, db,
+            treatment_ids=(getattr(req, "treatment_ids", None) or None),
+            config_override=(getattr(req, "config_override", None) or None),
+            weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
+            monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
+            banned_wanted_release=(getattr(req, "banned_wanted_release", None) or None),
+            allowed_shift_add=(getattr(req, "allowed_shift_add", None) or None),
+        )
     except HTTPException:
         # 구조화된 infeasibility 페이로드 등 의도된 HTTPException은 그대로 전파
         raise
     except Exception as e:
-        print('error', e)
+        # ★ 메시지만 찍으면 원인을 못 찾는다 — 실제로 'Permission denied' 한 줄만 남아
+        #   어디서 난 것인지 추적이 불가능했다(2026-08-04). 규칙대로 스택을 남긴다
+        #   (.claude/rules/coding-standards.md: logger.error 에 exc_info=True).
+        logger.error("근무표 생성 실패: %s", e, exc_info=True)
         payload = _fallback_unrecoverable_from_exception(f"근무표 생성 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=payload)
 
@@ -356,45 +386,61 @@ async def apply_resolution_endpoint(
             payload = _fallback_unrecoverable_from_exception(f"treatment 적용 재생성 실패: {str(e)}")
             raise HTTPException(status_code=500, detail=payload)
 
-    # ── 컬럼 delta 경로(probe 옵션): snapshot → 적용 → 재생성 → persist/원복 ──
-    allowed = {c.name for c in RosterConfig.__table__.columns}
-    bad = [k for k in delta if k not in allowed]
+    # ── 설정 delta 경로: 컬럼 키는 DB(persist 가능), 비-컬럼 solver 키는 config_override(이번 생성만) ──
+    # probe 옵션의 apply 키 중 DB 컬럼이 아닌 solver 파라미터(weekend_off_only_enable, ban_n_to_d,
+    # team_min_soft_fallback, max_consecutive_nights 등)는 컬럼 검증에서 400 나던 것을,
+    # RosterConfig(dataclass) 필드면 허용하고 config_override 로 라우팅해 적용한다.
+    import dataclasses as _dc
+    from db.roster_config import NurseRosterConfig as _NRC
+    allowed_cols = {c.name for c in RosterConfig.__table__.columns}
+    _valid_override = {f.name for f in _dc.fields(_NRC)}
+    bad = [k for k in delta if k not in allowed_cols and k not in _valid_override]
     if bad:
         raise HTTPException(status_code=400, detail=f"적용 불가한 설정 키: {bad}")
-    rc = (
-        db.query(RosterConfig)
-        .filter(RosterConfig.group_id == current_user.group_id)
-        .order_by(RosterConfig.config_id.desc())
-        .first()
-    )
-    if rc is None:
-        raise HTTPException(status_code=404, detail="roster_config 를 찾을 수 없습니다.")
-    cid = rc.config_id
-    snapshot = {k: getattr(rc, k) for k in delta}
-    _keep = False  # persist 요청 + 재생성 성공 시에만 True → 원복 생략(영구 반영)
+    col_delta = {k: v for k, v in delta.items() if k in allowed_cols}
+    override_delta = {k: v for k, v in delta.items() if k not in allowed_cols}
+
+    rc = None
+    cid = None
+    snapshot: dict = {}
+    if col_delta:
+        rc = (
+            db.query(RosterConfig)
+            .filter(RosterConfig.group_id == current_user.group_id)
+            .order_by(RosterConfig.config_id.desc())
+            .first()
+        )
+        if rc is None:
+            raise HTTPException(status_code=404, detail="roster_config 를 찾을 수 없습니다.")
+        cid = rc.config_id
+        snapshot = {k: getattr(rc, k) for k in col_delta}
+    _keep = False  # persist + 성공 시에만 True → 컬럼 변경 원복 생략(영구 반영)
     try:
-        for k, v in delta.items():
-            setattr(rc, k, v)
-        db.commit()
-        result = generate_roster_service(gen_req, current_user, db)
+        if col_delta:
+            for k, v in col_delta.items():
+                setattr(rc, k, v)
+            db.commit()
+        # 비-컬럼 키는 DB 미변경 → config_override 로 이번 생성에만 주입
+        result = generate_roster_service(
+            gen_req, current_user, db, config_override=(override_delta or None)
+        )
         if bool(getattr(req, "persist", False)):
-            _keep = True  # 성공 후에만 도달 → 영구 유지
+            _keep = True  # 성공 후에만 도달 → 컬럼 변경 영구 유지
         if isinstance(result, dict):
             result["applied_resolution"] = {
                 "option_id": req.option_id, "changes": delta, "persisted": _keep,
+                # 비-컬럼 키는 DB 컬럼이 없어 영구저장 불가 → persist 여부와 무관하게 이번 생성만 적용
+                "transient_keys": (list(override_delta.keys()) or None),
             }
         return result
     except HTTPException:
-        raise  # 여전히 infeasible → _keep=False → finally 원복, 새 옵션 payload 전파
+        raise  # 여전히 infeasible → _keep=False → finally 컬럼 원복, 새 옵션 payload 전파
     except Exception as e:
         print("apply-resolution error", e)
         payload = _fallback_unrecoverable_from_exception(f"해결책 적용 재생성 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=payload)
     finally:
-        if _keep:
-            # persist: 원복 생략(영구 반영). 변경은 이미 commit 됨.
-            print(f"[apply-resolution] persisted: config_id={cid} delta={delta}")
-        else:
+        if col_delta and not _keep:
             try:
                 rc2 = db.query(RosterConfig).filter(RosterConfig.config_id == cid).first()
                 if rc2 is not None:
@@ -407,6 +453,8 @@ async def apply_resolution_endpoint(
                 except Exception:
                     pass
                 print("apply-resolution restore failed", _re)
+        elif _keep:
+            print(f"[apply-resolution] persisted: config_id={cid} col_delta={col_delta} transient={override_delta}")
 
 
     # [Schedules] - 수간호사가 근무표 생성 요청
@@ -432,6 +480,8 @@ async def request_schedule(
     """
     try:
         return request_schedule_service(req, current_user, db)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"스케줄 생성 실패: {str(e)}")
 
@@ -460,6 +510,8 @@ async def hold_generate_roster_endpoint(
     try:
         # 고정된 셀 정보를 포함하여 근무표 생성 서비스 호출
         return generate_roster_service_with_fixed_cells(req, current_user, db)
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"고정 후 근무표 생성 실패: {str(e)}")

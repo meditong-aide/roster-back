@@ -13,7 +13,6 @@ from collections import defaultdict
 from services.day_windows import iter_nurse_days, build_active_days
 import random
 from services.constraints.grade_constraints import add_grade_constraints
-from services.objectives.team_objective import add_team_balance_objective_terms
 from services.cp_sat.shift_normalizer import (
     build_shift_normalizer as build_shift_normalizer_impl,
     normalize_shift_code as normalize_shift_code_impl,
@@ -482,7 +481,6 @@ class CPSATBasicEngine:
         req_exp_nurses = config_data.get('req_exp_nurses', 1)
         two_offs_per_week = config_data.get('two_offs_per_week', True)
         sequential_offs = config_data.get('sequential_offs', True)
-        even_nights = config_data.get('even_nights', True)
         enforce_clustered_offs = bool(config_data.get("enforce_clustered_offs", False))
         isolated_off_slack_penalty = int(config_data.get("isolated_off_slack_penalty", 300000) or 0)
         # if int(config_data.get('off_placement_mode', 0) or 0) != 0:
@@ -496,13 +494,6 @@ class CPSATBasicEngine:
             'N': 7.0,  # Night Keep은 더 높은 가중치
             'O': 10.0
         })
-        team_balance_enable = bool(config_data.get('team_balance_enable', False))
-        team_balance_gauge = int(config_data.get('team_balance_gauge', 0) or 0)
-        # team_balance_weight = int(config_data.get('team_balance_weight', 0) or 0)
-        # team_balance_top_days = int(config_data.get('team_balance_top_days', 0) or 0)
-        team_balance_focus = config_data.get('team_balance_focus_shifts')
-        team_balance_mode = config_data.get('team_balance_mode', 'balanced')
-        team_balance_shift_weights = config_data.get('team_balance_shift_weights') or {}
 
         def _normalize_requirements(req_map: dict | None) -> dict[str, int]:
             """요구 인력 맵을 D/E/N 기준으로 정규화한다.
@@ -570,7 +561,6 @@ class CPSATBasicEngine:
             two_offs_after_three_nig=two_offs_after_three_nig,
             two_offs_after_two_nig=two_offs_after_two_nig,
             sequential_offs=sequential_offs,
-            even_nights=even_nights,
             nod_noe=config_data.get('nod_noe', True),
             enforce_clustered_offs=enforce_clustered_offs,
             isolated_off_slack_penalty=isolated_off_slack_penalty,
@@ -592,13 +582,6 @@ class CPSATBasicEngine:
             preceptee_on=bool(config_data.get('preceptee_on', True)),
             preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
             use_mid=bool(config_data.get('use_mid', False)),
-            # team_balance_* 는 DB 의 team_balance_enable / team_balance_gauge 를 그대로 따른다.
-            # team_balance_top_days, weight 는 __post_init__ 가 gauge 로부터 자동 산출한다.
-            team_balance_enable=team_balance_enable,
-            team_balance_gauge=team_balance_gauge,
-            team_balance_focus_shifts=team_balance_focus,
-            team_balance_mode=team_balance_mode,
-            team_balance_shift_weights=team_balance_shift_weights,
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
             # - 빡빡하게 off_days에 맞추다 보면 연속근무가 길어지는 현상이 생길 수 있어,
             #   기본값은 +1 정도의 여유를 두고(필요하면 0으로 낮출 수 있음),
@@ -911,11 +894,13 @@ class CPSATBasicEngine:
         year: int, 
         month: int,
         grouped: List[dict],
-        grade_strategy: str = "BASE",
+        grade_strategy: str = "COMBINED",
         grade_config: dict | None = None,
         time_limit_seconds: int = 60,
         randomize: bool = True,           # ← 추가
-        seed: int | None = None           # ← 추가 (재현 원하면 지정)
+        seed: int | None = None,          # ← 추가 (재현 원하면 지정)
+        probe_only: bool = False,         # ← [Probe] True면 clean CP-SAT 1회 solve 후 status/objective/runtime dict 반환
+        probe_fallback: bool = False      # ← [Probe] probe_only와 함께 True면 프로덕션 fallback_lex 경로로 solve해 MUS conflict_cores 반환
     ) -> Dict[str, List[str]]:
         """
         DB 데이터를 기반으로 CP-SAT를 사용해 근무표를 생성
@@ -1026,6 +1011,15 @@ class CPSATBasicEngine:
         # 3. 간호사 객체 생성
         with Timer("간호사 객체 생성"):
             nurses = self.create_nurses_from_db(nurses_data)
+            # ★ create_nurses_from_db 는 명시한 키만 복사해 새 Nurse 를 만든다.
+            #   DB 식별자는 `nurse_id` 가 아니라 **`db_id`** 다(`id` 는 엔진 인덱스).
+            _hl_ids = {str(nd.get('nurse_id')) for nd in nurses_data
+                       if nd.get('health_leave_extra_off')}
+            if _hl_ids:
+                for _nu in nurses:
+                    if str(getattr(_nu, 'db_id', None) or getattr(_nu, 'nurse_id', '') or '') in _hl_ids:
+                        _nu.health_leave_extra_off = True
+                print(f"[HealthLeave] OFF 하한 +1 대상 {len(_hl_ids)}명 엔진 전달")
             for nurse in nurses:
                 nurse.initialize_off_days(config)
         # 4. 근무표 시스템 생성
@@ -1096,7 +1090,7 @@ class CPSATBasicEngine:
                 pass
             # Grade/Team/BASE 전략(모델 빌더에서 참조)
             # - 상위 서비스(roster_create_service)에서 roster_config 기반으로 결정된 값을 전달받는다.
-            setattr(roster_system, "grade_strategy", str(grade_strategy or "BASE").upper())
+            setattr(roster_system, "grade_strategy", "COMBINED")  # [ALWAYS_COMBINED] 전략 단일화(수행모드 폐기)
             setattr(roster_system, "grade_config", grade_config)
             # 고정된 셀 정보 처리
             fixed_cells = list(config_data.get('fixed_cells', []) or [])
@@ -1414,52 +1408,6 @@ class CPSATBasicEngine:
             shift_preferences, off_requests, pair_preferences = self.parse_preferences_from_db(
                 prefs_data, shift_id_to_main
             )
-        # ────────────────────────────── 프리셉터 페어링 반영 ──────────────────────────────
-        # nurses_data 내 preceptor_id 를 사용해 자동으로 함께 근무 선호를 추가한다.
-        try:
-            valid_ids = {row.get('nurse_id') for row in nurses_data}
-            seen_pairs = set()  # 중복 방지 (무방향)
-            added_cnt = 0
-            # 멤버십: nurse_preceptee_period 맵 있으면 그 달 active 프리셉티만 페어링(종료자 제외),
-            # 없으면(백필 전) 캐시 기반 전체 — 무회귀. 설계 §6.
-            _pte_auth_pair = bool(config_data.get("preceptee_period_authoritative")) if isinstance(config_data, dict) else False
-            _pte_map = config_data.get("preceptee_period_by_nurse_id") if isinstance(config_data, dict) else None
-            _active_pte_ids = None
-            if _pte_auth_pair:  # 권위 모드: 그 달 active 만(빈 맵이면 전부 제외). 폴백이면 None(캐시 전체).
-                _active_pte_ids = {
-                    str(k) for k, v in (_pte_map or {}).items()
-                    if (v.get("days") if isinstance(v, dict) else v)
-                }
-            # 프리셉터-멘티 함께 근무 가중치: 기본 페어링 대비 강화
-            preceptor_pair_weight = float(getattr(config, 'pair_preference_weight', 3.0)) * 2.5
-            for row in nurses_data:
-                mentee_id = row.get('nurse_id')
-                # period SSOT(그 달 preceptor) 우선 — 캐시 preceptor_id 는 폴백(authoritative 아닐 때만).
-                _pinfo = (_pte_map or {}).get(str(mentee_id)) if _pte_map else None
-                preceptor_id = (_pinfo.get("preceptor_id") if isinstance(_pinfo, dict) else None) or row.get('preceptor_id')
-                if not mentee_id or not preceptor_id:
-                    continue
-                if _active_pte_ids is not None and str(mentee_id) not in _active_pte_ids:
-                    continue  # 권위 모드: 그 달 프리셉티 아님 → 페어링 제외
-                if preceptor_id not in valid_ids or preceptor_id == mentee_id:
-                    continue
-                key = frozenset((mentee_id, preceptor_id))
-                if key in seen_pairs:
-                    continue
-                pair_preferences.setdefault('work_together', [])
-                pair_preferences['work_together'].append({
-                    'nurse_1': mentee_id,
-                    'nurse_2': preceptor_id,
-                    'weight': preceptor_pair_weight,
-                    'source': 'preceptor'
-                })
-                seen_pairs.add(key)
-                added_cnt += 1
-            if added_cnt:
-                print(f"[CP-SAT-Basic] 프리셉터 페어링 {added_cnt}건 추가 적용")
-        except Exception as e:
-            print(f"[CP-SAT-Basic] 프리셉터 페어링 반영 중 오류: {e}")
-        # ────────────────────────────────────────────────────────────────────────
         # 6. 휴무 요청 적용
         if off_requests:
             with Timer("휴무 요청 적용"):
@@ -1486,6 +1434,44 @@ class CPSATBasicEngine:
             print(f"{self.logger_prefix} 페어링 선호도 적용 중...")
             # 기본값으로 빈 페어링 선호도 설정
             roster_system.apply_pair_preferences(pair_preferences)
+        # [Probe] DS feasibility-probe 모드: fallback/후처리 없이 clean CP-SAT full-model 1회 solve.
+        # SKIP_PRIMARY와 무관하게 primary를 강제한다. _quick_initial_solve가 status/objective/runtime을
+        # roster_system에 stash → 여기서 읽어 dict로 반환. rs/grouped 구성은 위에서 전부 재사용.
+        if probe_only:
+            _probe_seed = seed if seed is not None else 42
+            if probe_fallback:
+                # 프로덕션 fallback_lex 경로로 solve → add_hard 로 감싼 하드 제약의 MUS
+                # conflict_cores 를 roster_system 에 stash. 진단 배선 검증/온톨로지 소비용.
+                try:
+                    self._optimize_fallback_lex_hard_first(
+                        roster_system, time_limit_seconds=max(1, int(time_limit_seconds)),
+                        grouped=grouped, shift_type_map=shift_id_to_type)
+                except Exception as _fbe:
+                    print(f"[Probe-fallback] fallback solve 실패: {_fbe}")
+                _cores = list(getattr(roster_system, "_cpsat_conflict_cores", []) or [])
+                return {"__probe__": {
+                    "status": "FALLBACK",  # fallback 은 soft coverage 라 항상 표 생성 — status 는 clean 아님
+                    "objective": None, "best_bound": None, "wall_time_s": None,
+                    "conflict_cores": _cores,
+                    "nurse_count": len(getattr(roster_system, "nurses", []) or []),
+                    "num_days": int(getattr(roster_system, "num_days", 0) or 0),
+                }}
+            roster_system.is_quick_phase = True
+            try:
+                self._quick_initial_solve(
+                    roster_system, max(1, int(time_limit_seconds)), grouped, _probe_seed)
+            finally:
+                roster_system.is_quick_phase = False
+            return {"__probe__": {
+                "status": getattr(roster_system, "_probe_status", "UNKNOWN"),
+                "objective": getattr(roster_system, "_probe_objective", None),
+                "best_bound": getattr(roster_system, "_probe_best_bound", None),
+                "wall_time_s": getattr(roster_system, "_probe_wall_time_s", None),
+                "conflict_cores": list(getattr(roster_system, "_cpsat_conflict_cores", []) or []),
+                "nurse_count": len(getattr(roster_system, "nurses", []) or []),
+                "num_days": int(getattr(roster_system, "num_days", 0) or 0),
+            }}
+
         # 9. CP-SAT으로 최적화 (새로운 제약사항 포함)
         with Timer("CP-SAT으로 최적화"):
             print(f"{self.logger_prefix} CP-SAT 최적화 시작 (시간 제한: {time_limit_seconds}초)...")
@@ -1756,10 +1742,9 @@ class CPSATBasicEngine:
         
         print(f"{self.logger_prefix} 근무표 생성 완료")
 
-        # Grade 배치 요약 출력/CSV 저장 및 로그 (GRADE/COMBINED 전략일 때만)
+        # Grade 배치 요약 출력/CSV 저장 및 로그
         try:
-            grade_strategy_norm = str(grade_strategy or "BASE").upper()
-            if grade_strategy_norm in ("GRADE", "COMBINED") and grade_config:
+            if grade_config:
                 _dump_grade_summary(roster_system, nurses, grade_config, self.logger_prefix)
                 _log_grade_result(
                     roster_system, nurses, grade_config, self.logger_prefix, label="solve 직후"
@@ -2192,7 +2177,6 @@ class CPSATBasicEngine:
             logger_prefix=self.logger_prefix,
             timer_cls=Timer,
             add_preceptor_terms_fn=_add_preceptor_objective_terms,
-            add_team_balance_terms_fn=add_team_balance_objective_terms,
             add_grade_constraints_fn=add_grade_constraints,
             postprocess_rebalance_off_fn=(lambda *_args, **_kwargs: None),
             blocked_by_nurse=getattr(roster_system, 'blocked_by_nurse', None),
@@ -2226,6 +2210,16 @@ class CPSATBasicEngine:
             solver.parameters.relative_gap_limit = 0.1
             stat=solver.Solve(model)
             print('stat', stat)
+            # [ProbeInstrument] clean CP-SAT full-model 결과를 rs에 stash (additive, 솔버 무영향).
+            # DS feasibility-probe (probe_feasibility)가 이 값을 읽어 status/objective/runtime을 반환한다.
+            try:
+                _feasible_stat = stat in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                rs._probe_status = solver.StatusName(stat)
+                rs._probe_wall_time_s = float(solver.WallTime())
+                rs._probe_objective = float(solver.ObjectiveValue()) if _feasible_stat else None
+                rs._probe_best_bound = float(solver.BestObjectiveBound()) if _feasible_stat else None
+            except Exception as _probe_exc:
+                print(f"[CP-SAT-Basic] probe stash 실패(무시): {_probe_exc}")
             if stat not in (cp_model.OPTIMAL,cp_model.FEASIBLE):
                 # CP-SAT INFEASIBLE → assumption registry MUS 추출해서 roster_system에 stash
                 if stat == cp_model.INFEASIBLE:
@@ -5276,7 +5270,7 @@ def generate_roster_cp_sat(
     time_limit_seconds=60,
     randomize=True,
     seed=None,
-    grade_strategy: str = "BASE",
+    grade_strategy: str = "COMBINED",
     grade_config: dict | None = None,
 ):
     """
@@ -5305,4 +5299,52 @@ def generate_roster_cp_sat(
         time_limit_seconds=time_limit_seconds,
         randomize=randomize,
         seed=seed,
-    ) 
+    )
+
+
+def probe_feasibility(
+    nurses_data,
+    prefs_data,
+    config_data,
+    year,
+    month,
+    shift_manage_data,
+    time_limit_seconds: int = 30,
+    seed: int | None = 42,
+    grade_strategy: str = "BASE",
+    grade_config: dict | None = None,
+    fallback: bool = False,
+) -> dict:
+    """DS feasibility-probe: fallback/후처리 없이 clean CP-SAT full-model 1회 solve.
+
+    generate_roster_cp_sat 와 동일한 입력(plain dict)을 받되, probe_only=True 로
+    호출하여 solver 상태를 그대로 반환한다. Controlled-perturbation 실험의 라벨 소스.
+
+    Returns dict:
+        status:       "OPTIMAL" | "FEASIBLE" | "INFEASIBLE" | "UNKNOWN" | "MODEL_INVALID"
+        objective:    float | None   (feasible 일 때 목적값; soft coverage shortage 포함)
+        best_bound:   float | None
+        wall_time_s:  float | None   (CP-SAT WallTime)
+        conflict_cores: list         (INFEASIBLE 시 MUS assumption cores, 있으면)
+        nurse_count / num_days: 구성된 인스턴스 규모
+    """
+    result = cp_sat_engine.generate_roster(
+        nurses_data,
+        prefs_data,
+        config_data,
+        year,
+        month,
+        shift_manage_data,
+        grade_strategy=grade_strategy,
+        grade_config=grade_config,
+        time_limit_seconds=time_limit_seconds,
+        randomize=(seed is None),
+        seed=seed,
+        probe_only=True,
+        probe_fallback=fallback,
+    )
+    if isinstance(result, dict) and "__probe__" in result:
+        return result["__probe__"]
+    # 방어: probe_only 경로가 우회된 경우
+    return {"status": "UNKNOWN", "objective": None, "best_bound": None,
+            "wall_time_s": None, "conflict_cores": [], "nurse_count": None, "num_days": None}

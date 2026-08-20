@@ -398,6 +398,8 @@ async def get_nurses_in_group(
         if year is not None and month is not None:
             attach_n_exact_to_nurses(db, response, year, month, view_group_id=_group)
         return response
+    except HTTPException:
+        raise
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)
         print("[DEBUG] [nurses.py - get_nurses_in_group] group_id", group_id)
@@ -507,6 +509,8 @@ async def download_template(
             filename="간호사_정보_템플릿.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"템플릿 생성 실패: {str(e)}")
 
@@ -525,6 +529,8 @@ async def download_template2(
             filename="간호사_업로드2_템플릿.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         print("error", e)
         raise HTTPException(status_code=500, detail=f"템플릿2 생성 실패: {str(e)}")
@@ -582,6 +588,8 @@ async def upload2_validate_endpoint(
             return result
         finally:
             os.unlink(tmp_file_path)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
 
@@ -642,6 +650,8 @@ async def upload2_confirm_endpoint(
         result = upload2_confirm(payload.rows, current_user, db, target_group_id)
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERROR] upload2-confirm 엔드포인트 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
@@ -798,6 +808,8 @@ async def validate_excel_data_endpoint(
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         result = validate_excel_data(request.data, current_user, db)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 검증 실패: {str(e)}")
 
@@ -824,6 +836,8 @@ async def confirm_upload(
         else:
             result = save_excel_data(filtered_data, current_user, db)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 저장 실패: {str(e)}")
 
@@ -848,6 +862,8 @@ async def integrated_register(
             payload.group_id,  # 프론트에서 반드시 보내야 함
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"통합 등록 실패: {str(e)}")
 
@@ -914,7 +930,9 @@ async def get_personnel_basic_info(
                     "age": _age,
                     "gender": _gw.get("gender"),
                     "joining_date": str(_join)[:10] if _join else None,
-                    "experience": int(_gw.get("career") or 0) if _gw.get("career") else None,
+                    # ★ 같은 폼이 받는 값이라 None 대신 0 — 그룹웨어에 경력이
+                    #   없는 관리자도 마이페이지 저장이 막히지 않게 한다.
+                    "experience": int(_gw.get("career") or 0),
                     "tenure": _tenure,
                     "tenure_display": _tenure,
                     "work_place": _gw.get("office_name", ""),
@@ -969,16 +987,23 @@ async def get_personnel_basic_info(
             "joining_date": nurse.joining_date.isoformat()
             if nurse.joining_date
             else None,
-            "experience": nurse.experience,
+            # ★ 마이페이지 폼이 `z.number().min(0)` 로 검증한다 — null 이면
+            #   "Invalid input: expected number, received null" 로 저장이 막힌다
+            #   (roster_front/src/pages/myPage/components/UserForm.tsx
+            #    basicInfoFormSchema). DB 는 그대로 두고 응답에서만 채운다.
+            "experience": nurse.experience or 0,
             "phone_number": nurse.phone_number,
             "email": nurse.email or "",
             "role": nurse.role,
-            "level_": nurse.level_,
-            "is_head_nurse": nurse.is_head_nurse,
+            "level_": nurse.level_ or "",
+            # boolean 은 `or` 금지 — False 가 뒤집힌다
+            "is_head_nurse": bool(nurse.is_head_nurse),
             "tenure": tenure_display,
             "work_place": work_place,
             "profile_image_url": get_profile_image_url(nurse.profile_image_key),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"간호사 기본 정보 조회 실패: {str(e)}"
@@ -1460,5 +1485,7 @@ async def delete_nurse(
     try:
         result = delete_nurse_service(nurse_id, current_user, db)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")

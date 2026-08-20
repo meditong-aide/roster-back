@@ -25,9 +25,11 @@ from services.ontology_graph.schema import (
     OntologyGraph,
 )
 from services.ontology_graph.supply_demand import (
+    MonthlySupplyDemandResult,
     NurseSupply,
     SupplyDemandResult,
     compute_supply_demand,
+    to_monthly_state_nodes,
     to_state_nodes,
 )
 
@@ -77,6 +79,7 @@ def build_unified_graph(
     *,
     ontology=None,
     supply_demand: SupplyDemandResult | None = None,
+    monthly_supply_demand: MonthlySupplyDemandResult | None = None,
 ) -> OntologyGraph:
     """UnifiedGraphInput → 4-노드 통합 그래프."""
     from services.semantics.ontology import ConstraintOntology
@@ -209,6 +212,26 @@ def build_unified_graph(
                 sc = g.nodes[cid].attrs.get("scope", {})
                 if sc.get("day") == c.day_index and sc.get("shift") == c.shift_code:
                     g.add_edge("pressures", cell, cid)
+
+    # 월별 shortage state (per-day flow 가 못 본 월 총량·야간cap) → 해당 shift 의 모든
+    # CoverageMin 에 pressures + requires(=수요정의자→primary). recommender 가 월별 원인도
+    # 일수요 감축으로 랭킹한다. shortage 는 per-day 등가로 이미 환산돼 있다.
+    if monthly_supply_demand is not None:
+        for msn in to_monthly_state_nodes(monthly_supply_demand, inp.num_days):
+            g.add_node(msn)
+            s = msn.attrs["shift_code"]
+            for day, req in inp.requirements_by_day.items():
+                if s in (req or {}) and int(req.get(s, 0) or 0) > 0:
+                    cid = f"cov_min:{day}:{s}"
+                    if cid in g.nodes:
+                        g.add_edge("pressures", msn.node_id, cid)
+                        g.add_edge("requires", cid, msn.node_id)
+                    # 월별 capacity 가 실제 병목(shortage>0)일 때만, 그 shift 의 일별
+                    # 부족 state 를 '월별 근본'에서 파생으로 잇는다(derived_from). blame 이
+                    # 일별 증상 → 월별 root 로 흘러 근본원인이 상위로 뜬다(다중홉의 척추).
+                    daily_cell = state_by_cell.get((day, s))
+                    if daily_cell and int(msn.evidence.get("shortage", 0) or 0) > 0:
+                        g.add_edge("derived_from", daily_cell, msn.node_id)
 
     # ── 4. soft constraint nodes (US-002) ───────────────────────────────────
     for sid, sc in ont.soft_constraints.items():

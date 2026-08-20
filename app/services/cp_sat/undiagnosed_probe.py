@@ -17,20 +17,25 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+from services.cp_sat.fix_location import attach_fix_to_options
+
 
 # 결합제약 완화 카탈로그. apply(cfg)->delta(config_dict 키 기준, DB 컬럼명).
 # label_ko 는 사용자 노출용, family 는 그룹핑용. 침습도 낮은(=현실적인) 순서로.
 RELAX_CATALOG: list[dict[str, Any]] = [
     {"id": "raise_max_night_cap", "family": "night_cap", "label_ko": "월 야간 상한 완화",
-     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8}},
+     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8},
+     "search": {"key": "max_nig_per_month", "dir": "up", "hi": 31}},
     {"id": "disable_2n2off", "family": "night_recovery", "label_ko": "2N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_two_nig": False}},
     {"id": "disable_3n2off", "family": "night_recovery", "label_ko": "3N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_three_nig": False}},
     {"id": "raise_max_consec_work", "family": "consecutive", "label_ko": "연속근무 상한 완화",
-     "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3}},
+     "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3},
+     "search": {"key": "max_conseq_work", "dir": "up", "hi": 14}},
     {"id": "relax_consecutive_nights", "family": "night_consecutive", "label_ko": "연속 야간 상한 완화(+1)",
-     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1}},
+     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1},
+     "search": {"key": "max_consecutive_nights", "dir": "up", "hi": 7}},
     {"id": "disable_not_one_night", "family": "night_pattern", "label_ko": "단일 야간 금지 해제",
      "apply": lambda c: {"not_one_night": False}},
     {"id": "disable_ban_n_before_fixed_off", "family": "night_pattern", "label_ko": "고정OFF 직전 야간 금지 해제",
@@ -38,9 +43,22 @@ RELAX_CATALOG: list[dict[str, Any]] = [
     {"id": "disable_banned_day_after_eve", "family": "transition", "label_ko": "E→D 전이 금지 해제",
      "apply": lambda c: {"banned_day_after_eve": False}},
     {"id": "lower_off_days", "family": "off_budget", "label_ko": "월 OFF 요구일수 완화(-3)",
-     "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)}},
+     "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)},
+     "search": {"key": "off_days", "dir": "down", "lo": 0}},
     {"id": "disable_preceptee_sync", "family": "coupling", "label_ko": "프리셉티 동반(팔로우) 해제",
      "apply": lambda c: {"preceptee_on": False}},
+    # ── verified 승격(2026-07-20): 기존엔 온톨로지 treatment(verified:false)만 있던 완화들.
+    # probe로 추가해 "재solve로 feasible 확인됨"(verified:true) 승격. apply 키는 비-DB-컬럼
+    # (솔버 config)이라 apply-resolution이 config_override 경로로 라우팅해야 클릭 적용됨.
+    # [주말휴무는 config 플래그로 끄지 않는다] weekend_off_only_enable 은 주말휴무자 '전원'의
+    # 주말 강제OFF 를 켜고 끄는 global 정책 플래그다. 주말휴무는 개인 속성이므로 완화는
+    # per-nurse(그 간호사만 해제, weekend_off_release)로만 제시한다 → 이 config 레버는 catalog 제외.
+    {"id": "disable_ban_n_to_d", "family": "transition", "label_ko": "야간→주간 전이 금지 해제",
+     "apply": lambda c: {"ban_n_to_d": False}},
+    {"id": "disable_ban_n_to_e", "family": "transition", "label_ko": "야간→저녁 전이 금지 해제",
+     "apply": lambda c: {"ban_n_to_e": False}},
+    {"id": "soften_team_min", "family": "team", "label_ko": "팀 최소 인원 soft 완화",
+     "apply": lambda c: {"team_min_soft_fallback": True}},
 ]
 
 
@@ -56,6 +74,9 @@ TRADEOFF_KO: dict[str, str] = {
     "disable_banned_day_after_eve": "이브닝 다음날 데이 전이가 생길 수 있습니다.",
     "lower_off_days": "월 휴무일이 줄어듭니다.",
     "disable_preceptee_sync": "프리셉티가 프리셉터와 동반(팔로우)하지 않게 됩니다(교육 동반 약화).",
+    "disable_ban_n_to_d": "야간 다음날 주간 전이가 생길 수 있습니다.",
+    "disable_ban_n_to_e": "야간 다음날 저녁 전이가 생길 수 있습니다.",
+    "soften_team_min": "특정 시프트에서 팀 인원이 최소치보다 1~2명 부족할 수 있습니다(인계 시 주의).",
 }
 COL_LABEL_KO: dict[str, str] = {
     "max_nig_per_month": "월 야간 상한", "two_offs_after_two_nig": "2N→2OFF 회복",
@@ -63,6 +84,8 @@ COL_LABEL_KO: dict[str, str] = {
     "not_one_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
     "banned_day_after_eve": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
     "max_consecutive_nights": "연속 야간 상한", "preceptee_on": "프리셉티 동반(팔로우)",
+    "weekend_off_only_enable": "주말휴무 전용", "ban_n_to_d": "N→D 전이 금지",
+    "ban_n_to_e": "N→E 전이 금지", "team_min_soft_fallback": "팀 최소 soft 완화",
 }
 
 
@@ -104,7 +127,7 @@ def to_resolution_options(probe_result: dict[str, Any], base_config: dict[str, A
             "title_ko": cb.get("label_ko"), "changes": changes,
             "trade_off_ko": " / ".join(tradeoffs), "apply": merged,
         })
-    return opts
+    return attach_fix_to_options(opts)
 
 
 def treatments_to_resolution_options(treatment_recommendations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -126,19 +149,291 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
         if not auto:
             continue  # 전부 수동(data_correction_required)이면 자동 적용 불가 → 옵션 제외
         _bid = str(b.get("bundle_id") or "?")
+        # magnitude sizing: enricher 가 단일축 precheck 숫자로 실효 목표값을 계산해
+        # t["suggested_value"] 에 담았으면 changes 에 노출 + apply(직접적용 델타)로 승격.
+        # 값이 없으면(조합/미지원) 기존처럼 방향만 제시 + treatment_ids 로 적용.
+        _apply: dict[str, Any] = {}
+        _changes = []
+        for t in auto:
+            ck = t.get("config_key")
+            sv = t.get("suggested_value")
+            ch = {"config_key": ck, "label_ko": _lbl(t),
+                  "direction": t.get("direction_label_ko") or t.get("direction"),
+                  "rationale_ko": t.get("rationale_ko")}
+            if sv is not None:
+                ch["suggested_value"] = sv
+                ch["sizing_ko"] = t.get("sizing_ko")
+                if ck:
+                    _apply[ck] = sv
+            elif t.get("sizing_insufficient"):
+                ch["sizing_ko"] = t.get("sizing_ko")
+                ch["sizing_insufficient"] = True
+            elif t.get("sizing_ko"):
+                # message-only sizing (nested/수요 노브 — 자동 apply 없이 정확한 숫자만)
+                ch["sizing_ko"] = t.get("sizing_ko")
+            _changes.append(ch)
         opts.append({
             "option_id": _bid if _bid.startswith("bundle") else "bundle:" + _bid,
-            "kind": "treatment_bundle", "source": "ontology", "verified": False,
+            "kind": "treatment_bundle", "source": "ontology",
+            # sized 목표값이 있으면 apply 로 바로 적용 가능(수치 확정) → 반쯤 검증된 셈.
+            "verified": False,
             "title_ko": " + ".join(_lbl(t) for t in auto),
-            "changes": [{"config_key": t.get("config_key"), "label_ko": _lbl(t),
-                         "direction": t.get("direction_label_ko") or t.get("direction"),
-                         "rationale_ko": t.get("rationale_ko")} for t in auto],
+            "changes": _changes,
             "trade_off_ko": " / ".join([t.get("trade_off_ko") for t in auto if t.get("trade_off_ko")]),
             "treatment_ids": [t.get("treatment_id") for t in auto],
             "manual_required": [t.get("treatment_id") for t in manual],
-            "apply": {},
+            "apply": _apply,
         })
-    return opts
+    return attach_fix_to_options(opts)
+
+
+# 사용자가 설정한 생성 옵션(연속근무 상한 등)이 precheck 산술 차단의 binding 원인일 때,
+# 그 옵션을 직접 조정하는 auto_apply 해결 옵션을 만든다.
+#   evidence key → (config_key, 제목, 트레이드오프)
+_LEVER_BY_EVIDENCE_KEY: dict[str, tuple[str, str, str]] = {
+    "conseq_cap_binding": (
+        "max_conseq_work",
+        "연속근무 상한 완화",
+        "한 사람이 최대 며칠까지 연달아 근무할 수 있는지가 늘어납니다.",
+    ),
+}
+
+
+def config_lever_options_from_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Precheck 차단이 '사용자가 설정한 하드 생성 옵션(연속근무 상한)' 때문일 때 그 값을
+    올리는 auto_apply 옵션 카드.
+
+    capacity 부족을 '간호사 추가'(수동)로만 안내하던 오분류를 보완한다. precheck 가
+    evidence(conseq_cap_binding)에 남긴 값으로 옵션을 만든다(verified=False, 클릭 시
+    재생성으로 실검증). suggested_value 없으면(무제한으로도 미충족 = 진짜 인원부족) 생성
+    안 함. ※ 개인 월 휴무(off_days)는 엔진에서 소프트라 capacity 를 못 바꾼다 → 레버 아님.
+    """
+    opts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for it in issues or []:
+        ev = it.get("evidence")
+        if not isinstance(ev, dict):
+            ev = it.get("details") if isinstance(it.get("details"), dict) else {}
+
+        for ev_key, (config_key, title_ko, trade_off_ko) in _LEVER_BY_EVIDENCE_KEY.items():
+            b = ev.get(ev_key)
+            if not isinstance(b, dict):
+                continue
+            sv = b.get("suggested_value")
+            if sv is None or config_key in seen:
+                continue
+            seen.add(config_key)
+            opts.append({
+                "option_id": "lever:" + config_key,
+                "kind": "config_relax",
+                "source": "precheck_arith",
+                "verified": False,
+                "title_ko": title_ko,
+                "changes": [{
+                    "config_key": config_key,
+                    "label_ko": title_ko,
+                    "from": b.get("current"),
+                    "to": sv,
+                    "suggested_value": sv,
+                }],
+                "trade_off_ko": trade_off_ko,
+                "apply": {config_key: sv},
+            })
+
+    return attach_fix_to_options(opts)
+
+
+# 사람이 손댈 수 없는 병목 축 — 개인 한도가 이것과 **같은 값**이면 개인 한도만 올려도
+# min() 이 그대로라 결과가 안 바뀐다. working=근무가능일 / recovery=2N·3N→2OFF 하드락.
+_IMMUTABLE_BINDS = ("working", "recovery")
+
+
+def _hard_ceiling(r: dict[str, Any]) -> int | None:
+    """개인 한도를 올려도 **못 넘는** 천장 = min(working, recovery).
+
+    ★ working=근무가능일 / recovery=2N·3N→2OFF 하드락. 둘 다 사람이 못 올린다.
+      `cap_by_axis` 가 없는 구 evidence 는 capacity_days(=working)로 대체한다.
+    """
+    ax = r.get("cap_by_axis")
+    if isinstance(ax, dict) and ax:
+        vals = [int(ax[k]) for k in ("working", "recovery") if ax.get(k) is not None]
+        if vals:
+            return min(vals)
+    cd = r.get("capacity_days")
+    return int(cd) if cd is not None else None
+
+
+def _config_ceiling(r: dict[str, Any]) -> int | None:
+    """설정 축(max_nig_per_month) 천장 — 올릴 수는 있지만 **병동 전체**에 걸린다."""
+    ax = r.get("cap_by_axis")
+    if isinstance(ax, dict) and ax.get("config") is not None:
+        return int(ax["config"])
+    return None
+
+
+def _allocate_night_caps(
+    blocked: list[dict[str, Any]], gap: int,
+) -> list[tuple[dict[str, Any], int]]:
+    """부족분 `gap` 을 각자의 **못 넘는 천장**(room) 안에서 나눈다 — 남은 몫은 재배분.
+
+    ★ 균등 나눗셈 뒤 clip 만 하면 잘려나간 몫이 사라진다. room=[2,10]·gap=10 이면
+      per=5 → [2,5]=7 로 부족분을 못 메워 카드를 눌러도 또 INFEASIBLE 이 난다.
+      room 오름차순으로 돌며 남은 몫을 남은 인원에게 다시 나눈다([2,8]=10).
+
+    ★★ room 은 근무가능일이 아니라 `_hard_ceiling` 이다 — 회복 제약(2N→2OFF)이 더 낮으면
+      근무가능일까지 올려봐야 거기서 멈춘다.
+    """
+    ordered = sorted(blocked, key=lambda r: _hard_ceiling(r) or 0)
+    remain, left = gap, len(ordered)
+    out: list[tuple[dict[str, Any], int]] = []
+    for r in ordered:
+        per = -(-remain // left) if left > 0 else 0            # ceil
+        room = _hard_ceiling(r)
+        val = max(1, min(per, room) if room is not None else per)
+        cur = r.get("personal_night_cap")
+        # 실제 공급량은 **올린 값과 현재 한도 중 큰 쪽** — 상향이 아닌 사람의 기존 공급을
+        # 0 으로 세면 남은 몫을 과대계산해 뒷사람 상한이 불필요하게 높아진다.
+        remain = max(0, remain - max(val, int(cur) if cur is not None else 0))
+        left -= 1
+        out.append((r, val))
+    return out
+
+
+def personal_night_cap_options_from_issues(
+    issues: list[dict[str, Any]],
+    nurse_names: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """야간 월용량 부족의 병목이 **개인 한도**(n_exact/n_max)일 때 그 값을 올리는 카드.
+
+    ★ 없으면 진단이 config 축(max_nig_per_month·2N→2OFF)만 제안하는데, 야간 상한은
+      `min(working, config, 개인한도, 회복)` 이라 개인 한도가 더 작으면 config 를 아무리
+      올려도 안 풀린다(실측 2026-08-20: 개인 n_exact=0 · config 15 → 카드 적용 후 재생성해도
+      같은 INFEASIBLE). precheck 가 evidence 에 남긴 capped_by 로 대상을 지목한다.
+
+    ★★ **동률(tie)도 대상이다.** config 와 개인 한도가 같은 값이면(카드 적용으로 둘 다 4가
+      된 상태가 실제로 나온다) 개인 한도도 똑같이 병목인데 `capped_by` 대표값만 보면
+      config 로만 잡혀 이 카드가 안 만들어진다. `capped_by_all` 로 판정한다.
+      그리고 그 경우엔 **개인 한도만 올려도 config 가 그대로 min 을 잡으므로**
+      config 상향(`apply`)을 같은 카드에 묶는다.
+
+    제안값은 "부족분을 개인 한도로만 메울 때 1인당 필요한 최소치"이고, 그 사람의
+    근무가능일(capacity_days)을 넘지 않게 자른다. verified=False — 클릭 시 재생성으로 실검증.
+    """
+    names = nurse_names or {}
+    opts: list[dict[str, Any]] = []
+
+    def _binds(r: dict[str, Any]) -> list[str]:
+        v = r.get("capped_by_all")
+        if isinstance(v, list) and v:
+            return [str(x) for x in v]
+        return [str(r.get("capped_by") or "")]
+
+    for it in issues or []:
+        if str(it.get("reason_code") or "").upper() != "MONTHLY_NIGHT_CAPACITY_SHORTAGE":
+            continue
+        ev = it.get("evidence")
+        if not isinstance(ev, dict):
+            ev = it.get("details") if isinstance(it.get("details"), dict) else {}
+        rows = [r for r in (ev.get("night_capable_nurses") or []) if isinstance(r, dict)]
+        # ★ 개인 한도가 병목이어도 **못 올리는 축과 동률**이면 대상이 아니다. personal==working
+        #   이거나 personal==recovery 면 개인 한도만 올려도 min 이 그대로라 카드를 눌러
+        #   재생성해도 같은 INFEASIBLE 이 난다(재생성 몇 분이 헛클릭이 된다).
+        blocked = [r for r in rows
+                   if "personal" in _binds(r)
+                   and not any(k in _binds(r) for k in _IMMUTABLE_BINDS)
+                   and str(r.get("nurse_id") or "")]
+        if not blocked:
+            continue
+
+        need = int(ev.get("n_required") or 0)
+        # 조정 대상이 아닌 사람들이 이미 공급하는 양 — 위에서 뺀 동률자도 여기 포함된다
+        # (그들은 이미 자기 최대치를 내고 있으므로 gap 에서 제해야 과대 산정이 안 난다).
+        blocked_ids = {str(r.get("nurse_id")) for r in blocked}
+        others = sum(int(r.get("night_cap") or 0)
+                     for r in rows if str(r.get("nurse_id") or "") not in blocked_ids)
+        gap = need - others
+        if gap <= 0:
+            continue
+
+        alloc = _allocate_night_caps(blocked, gap)
+        # ★ 하드 천장 때문에 산술적으로 부족분을 못 메우면 **카드를 내지 않는다**. 눌러도
+        #   재생성이 또 INFEASIBLE 로 끝나 몇 분이 헛클릭이 된다. 그런 상황은 하드 제약이
+        #   진짜 병목이라 다른 카드(설정 완화 축)가 담당한다.
+        if sum(max(v, int(r.get("personal_night_cap") or 0)) for r, v in alloc) < gap:
+            continue
+
+        rel, changes, shown = [], [], []
+        for r, val in alloc:
+            nid = str(r.get("nurse_id"))
+            cur = r.get("personal_night_cap")
+            # ★ 상향이 아니면 싣지 않는다 — per 가 현재 한도보다 작으면 "올리기" 카드가
+            #   상한을 **내리는** UPDATE 를 내보내 오히려 야간 공급이 준다.
+            if cur is not None and val <= int(cur):
+                continue
+            rel.append({"nurse_id": nid, "field": "n_max", "value": val})
+            # 이름 우선순위: evidence 에 실린 이름 → 호출자가 준 맵 → 사번(최후)
+            nm = (str(r.get("name")).strip() if r.get("name") else "") or names.get(nid) or nid
+            shown.append(nm)
+            changes.append({
+                # ★ config_key 는 사람마다 달라야 한다. 프론트가 목록 key 를
+                #   `${option_id}-${config_key}` 로 만들어(RosterCreateBlockingInfeasibilityAlert)
+                #   전원 "n_max" 면 22명이 같은 key 가 되고 React 가 중복 key 경고를 낸다
+                #   (실측 2026-08-20: 22명 카드에서 경고 21건). 인원이 적을 땐 안 드러났다.
+                #   `_FIX_BY_KEY` 에 "n_max" 매핑이 없어 fix_for_option 은 원래도 None 이므로
+                #   접미사를 붙여도 잃는 동작이 없고, 표시는 label_ko 가 우선한다.
+                "nurse_id": nid, "attr": "n_max", "config_key": f"n_max:{nid}",
+                "label_ko": f"{nm} 월 야간 상한",
+                "from": cur, "to": val,
+            })
+        if not rel:
+            continue
+        # 재배분 때문에 사람마다 값이 다를 수 있다 — 하나로 단정하지 말고 범위로 쓴다
+        _vals = sorted({int(x["value"]) for x in rel})
+        _val_txt = f"{_vals[0]}회" if len(_vals) == 1 else f"{_vals[0]}~{_vals[-1]}회"
+
+        opt: dict[str, Any] = {
+            "option_id": "personal_night_cap:" + "+".join(x["nurse_id"] for x in rel),
+            "kind": "raise_personal_night_cap",
+            "source": "precheck_arith",
+            "verified": False,
+            "title_ko": (f"{shown[0]} 외 {len(shown) - 1}명 월 야간 상한 올리기"
+                         if len(shown) > 1 else f"{shown[0]} 월 야간 상한 올리기"),
+            "trade_off_ko": "그 간호사들의 월 야간 횟수가 늘어납니다. 다음 달 분산으로 균형 회복 권장.",
+            "changes": changes,
+            # 실제 적용 — 그 달 NurseMonthlyLimit 에 write(행이 없으면 만든다).
+            "monthly_limit_release": rel,
+            "fix": {
+                "mode": "auto_apply",
+                "where": "nurse.monthly_limit",
+                "where_label_ko": "근무자 관리 > 해당 근무자 > 나이트 개수",
+                "how_ko": (f"이 방법을 고르면 {len(rel)}명의 월 야간 상한을 각자의 "
+                           f"근무가능일에 맞춰 {_val_txt}로 올린 뒤 다시 만듭니다(이 달)."),
+                "config_key": None,
+                "target": {"nurse_ids": [x["nurse_id"] for x in rel]},
+            },
+        }
+        # ★ 제안값이 config 천장을 **넘으면** 개인 한도만 올려도 거기서 멈춘다
+        #   (personal=1 · config=4 인데 6 을 제안 → 실제 반영은 4). 동률(tie)도 이 조건에
+        #   자연히 포함된다 — 상향값은 언제나 현재 cap 보다 크기 때문이다.
+        # ★★ 반대로 **config 를 낮추는 일은 절대 없어야 한다.** config 는 병동 전역이라
+        #   낮추면 이 카드와 무관한 사람들의 야간 상한까지 깎여 공급이 오히려 준다.
+        #   (동률자가 이미 충분한 한도를 갖고 있어 rel 에서 빠지면 cfg_to 가 현재 천장보다
+        #    작아질 수 있다 — 예: 한도 4·1 에 부족분 6 이면 rel=[2] 뿐이라 cfg_to=2.)
+        #   그래서 **현재 천장을 아는 경우에만, 그것을 넘을 때만** 건드린다.
+        _cfg_ceils = [c for c in (_config_ceiling(r) for r in blocked) if c is not None]
+        _cur_cfg = max(_cfg_ceils) if _cfg_ceils else None
+        cfg_to = max(int(x["value"]) for x in rel)
+        if _cur_cfg is not None and cfg_to > _cur_cfg:
+            opt["apply"] = {"max_nig_per_month": cfg_to}
+            opt["changes"] = changes + [{
+                "config_key": "max_nig_per_month", "label_ko": "월 야간 한도(개인)",
+                "from": None, "to": cfg_to, "suggested_value": cfg_to,
+            }]
+            opt["title_ko"] += " + 월 야간 한도 함께 올리기"
+            opt["fix"]["how_ko"] += (f" 설정의 월 야간 한도도 {cfg_to}회로 함께 올립니다 "
+                                     f"— 개인 한도만 올리면 설정 한도에서 다시 막힙니다.")
+        opts.append(opt)
+    return attach_fix_to_options(opts)
 
 
 def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -152,6 +447,19 @@ def _apply_set(base: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, A
     return cfg
 
 
+def _mk_combo(members: list[dict[str, Any]], base: dict[str, Any]) -> dict[str, Any]:
+    """콤보 members → 결과 dict(id/label_ko/members[delta])."""
+    return {
+        "id": "combo:" + "+".join(m["id"] for m in members),
+        "label_ko": " + ".join(m["label_ko"] for m in members),
+        "members": [
+            {"id": m["id"], "family": m["family"], "label_ko": m["label_ko"],
+             "delta": m["apply"](base)}
+            for m in members
+        ],
+    }
+
+
 def _find_combo(
     base: dict[str, Any],
     resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
@@ -159,28 +467,101 @@ def _find_combo(
     *,
     max_size: int,
     logger: Callable[[str], None],
+    priority_families: list[str] | None = None,
+    first_hit: bool = True,
 ) -> list[dict[str, Any]] | None:
-    """단일완화로 못 풀 때: 크기 2부터 max_size 까지 **전수(combinations)** 로 탐색.
+    """단일완화로 못 풀 때: 크기 2부터 max_size 까지 조합 탐색.
     단일이 모두 실패했으므로, 가장 작은 크기에서 feasible 한 조합은 자동으로 irreducible
-    최소조합이다(black-box MCS). 같은 크기에서 여럿이면 침습도(카탈로그 순서) 합이 가장
-    낮은 것을 고른다. greedy-순서 누적은 뒤쪽 레버가 필요한 조합을 놓치므로 쓰지 않는다."""
+    최소조합이다(black-box MCS).
+
+    속도: priority_families(온톨로지 병목)로 후보를 앞으로 정렬하고, first_hit 이면 첫 feasible
+    조합에서 즉시 종료한다(전수 C(n,2)=수십~백회 → 대개 수회). 정렬로 관련 레버가 앞이라
+    첫 hit 이 곧 최소침습에 가깝다. first_hit=False 면 기존 전수+최소침습 선택.
+    """
     import itertools
 
     # 실제 변화가 있는(non-noop) 후보만
     cands = [it for it in catalog
              if not all(base.get(k) == v for k, v in it["apply"](base).items())]
-    idx = {id(it): i for i, it in enumerate(cands)}  # 침습도 proxy = 카탈로그 순서
+    idx = {id(it): i for i, it in enumerate(cands)}  # 침습도 proxy = 원래 카탈로그 순서
+    if priority_families:
+        _fr = {f: i for i, f in enumerate(priority_families)}
+        # 우선군 먼저, 그 안에선 원래(침습도) 순서
+        cands = sorted(cands, key=lambda it: (_fr.get(it.get("family"), 10**6), idx[id(it)]))
     for size in range(2, max(2, max_size) + 1):
         feasible_combos: list[tuple[int, tuple]] = []
         for combo in itertools.combinations(cands, size):
             ok, _ = resolve_fn(_apply_set(base, list(combo)))
             logger(f"[UndiagProbe][combo-{size}] {[c['id'] for c in combo]} feasible={ok}")
             if ok:
+                if first_hit:
+                    logger(f"[UndiagProbe][combo-{size}] 첫 해결 조합 확보 → 조기 종료")
+                    return list(combo)
                 feasible_combos.append((sum(idx[id(c)] for c in combo), combo))
         if feasible_combos:
             feasible_combos.sort(key=lambda x: x[0])  # 최소 침습 조합
             return list(feasible_combos[0][1])
     return None
+
+
+def _search_boundary(
+    base: dict[str, Any],
+    spec: dict[str, Any],
+    resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
+    *,
+    budget: int,
+    logger: Callable[[str], None],
+) -> tuple[int | None, int]:
+    """단조 노브의 **최소 침습 feasible 경계값**을 이분탐색.
+
+    고정 델타(+8 등) 대신 "실제로 풀리는 최소값"을 재solve 로 찾는다. 단조성:
+    up(max_nig↑ 등)=값↑→feasible 유지, down(off_days↓)=값↓→feasible 유지.
+    → 이분탐색이 정당하고 log(범위)회에 종료. budget(재solve 상한) 소진 시 현재까지의
+    feasible 경계(항상 유효한 값)를 반환 → graceful. (value, 사용 solves) 반환,
+    상/하한서도 불가면 (None, solves).
+    """
+    key = spec["key"]
+    _cur = base.get(key)
+    try:
+        cur = int(_cur) if _cur is not None else 0
+    except (TypeError, ValueError):
+        cur = 0
+    solves = 0
+
+    def feasible_at(v: int) -> bool:
+        nonlocal solves
+        cfg = dict(base)
+        cfg[key] = v
+        solves += 1
+        try:
+            ok, _ = resolve_fn(cfg)
+        except Exception:
+            ok = False
+        logger(f"[UndiagProbe][search] {key}={v} feasible={ok}")
+        return bool(ok)
+
+    if spec["dir"] == "up":
+        lo, hi = cur + 1, int(spec.get("hi", cur + 20))
+        if lo > hi or not feasible_at(hi):
+            return None, solves            # 상한서도 불가 → 이 노브 단독으로 못 풂
+        while lo < hi and solves < budget:  # hi 는 항상 feasible 유지(불변식)
+            mid = (lo + hi) // 2
+            if feasible_at(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return hi, solves                   # 최소 feasible 값
+    else:  # down
+        lo, hi = int(spec.get("lo", 0)), cur - 1
+        if lo > hi or not feasible_at(lo):
+            return None, solves            # 하한서도 불가
+        while lo < hi and solves < budget:  # lo 는 항상 feasible 유지
+            mid = (lo + hi + 1) // 2
+            if feasible_at(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, solves                   # 최소 침습(최대) feasible 값
 
 
 def probe_relaxations(
@@ -191,6 +572,10 @@ def probe_relaxations(
     verify: bool = True,
     try_combo: bool = True,
     max_combo: int = 3,
+    search_budget: int = 12,
+    priority_families: list[str] | None = None,
+    stop_after: int | None = None,
+    hard_filter: bool = False,
     logger: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """결합제약을 하나씩 완화해 resolve_fn 으로 feasible 여부를 실측.
@@ -204,14 +589,89 @@ def probe_relaxations(
         }
     """
     cat = catalog if catalog is not None else RELAX_CATALOG
+    # ── 온톨로지 소프트정렬 ──
+    #   presolve(max-flow) 가 지목한 병목 완화군(priority_families)을 앞으로 당겨 먼저 검증하고,
+    #   거기서 해결책이 나오면 나머지는 생략(soft early-stop). 못 찾으면 나머지도 폴백 검증
+    #   → 완결성은 오늘과 동일, 흔한 케이스는 재solve 수↓. priority 없으면 기존 순서 그대로.
+    _n_prio = 0
+    if priority_families:
+        _fam_rank = {f: i for i, f in enumerate(priority_families)}
+        _prio = [it for it in cat if it.get("family") in _fam_rank]
+        _prio.sort(key=lambda it: _fam_rank.get(it.get("family"), 999))
+        _rest = [it for it in cat if it.get("family") not in _fam_rank]
+        cat = _prio + _rest
+        _n_prio = len(_prio)
+        if _prio:
+            logger(f"[UndiagProbe] 온톨로지 우선 완화군 {[it['id'] for it in _prio]} 먼저 검증(soft)")
     prev_env = os.environ.get("FB_VERIFY_SKIP_STAGE3")
     if verify:
         os.environ["FB_VERIFY_SKIP_STAGE3"] = "1"
     all_probed: list[dict[str, Any]] = []
     resolutions: list[dict[str, Any]] = []
     combo: dict[str, Any] | None = None
+    _remaining = int(search_budget)
+    _hard_combo_done = False
     try:
-        for item in cat:
+        for _idx, item in enumerate(cat):
+            _feas_so_far = sum(1 for r in all_probed if r.get("feasible"))
+            # stop_after: 검증된 해결책이 목표치만큼 모이면 즉시 종료(필요한 만큼만 probe).
+            if stop_after and _feas_so_far >= stop_after:
+                logger(f"[UndiagProbe] 해결책 {_feas_so_far}건 확보(stop_after={stop_after}) → 조기 종료")
+                break
+            # 우선 완화군을 다 검증한 경계(_idx == _n_prio).
+            if _n_prio and _idx == _n_prio:
+                if _feas_so_far:
+                    # soft: 우선군 단일 중 하나라도 풀리면 나머지 생략(resolutions 는 루프 후 집계라
+                    # 여기선 all_probed 의 feasible 로 판정).
+                    logger(f"[UndiagProbe] 우선군에서 해결책 {_feas_so_far}건 확보 "
+                           f"→ 나머지 {len(cat) - _n_prio}개 완화 생략(soft)")
+                    break
+                if hard_filter and not _hard_combo_done:
+                    # hard-filter(온톨로지 압박 신뢰): 우선군 단일이 다 실패해도, 나머지 단일로
+                    # 가기 전에 우선군끼리의 콤보를 먼저 시도. 성공하면 종료(나머지 전부 생략),
+                    # 실패해야만 나머지 단일+전체 콤보로 전수 폴백(완결성 보존).
+                    _hard_combo_done = True
+                    _pm = _find_combo(
+                        base_config, resolve_fn, cat[:_n_prio], max_size=max_combo,
+                        logger=logger, priority_families=priority_families, first_hit=True)
+                    if _pm:
+                        combo = _mk_combo(_pm, base_config)
+                        logger("[UndiagProbe] 압박군 콤보로 해결 "
+                               "→ 나머지 단일/전체콤보 생략(hard-filter)")
+                        break
+                    logger("[UndiagProbe] 압박군(단일+콤보) 미해결 "
+                           "→ 나머지 완화 전수 폴백(hard-filter)")
+            spec = item.get("search")
+            # ── 단조 노브: 고정 델타 대신 최소침습 feasible 값 이분탐색 ──
+            if spec and _remaining > 0:
+                val, used = _search_boundary(
+                    base_config, spec, resolve_fn,
+                    budget=min(6, _remaining), logger=logger,
+                )
+                _remaining -= used
+                if val is not None:
+                    delta = {spec["key"]: val}
+                    if all(base_config.get(k) == v for k, v in delta.items()):
+                        continue  # 이미 그 값(noop)
+                    logger(f"[UndiagProbe] {item['id']:30s} SEARCH→{spec['key']}={val} (solves={used})")
+                    all_probed.append({
+                        "id": item["id"], "family": item["family"], "label_ko": item["label_ko"],
+                        "delta": delta, "feasible": True,
+                        "info": {"searched": True, "value": val, "solves": used},
+                    })
+                else:
+                    # 상/하한서도 못 풂 → 이 노브 단독 불가(참고용 fixed delta 로 기록)
+                    try:
+                        delta = item["apply"](base_config)
+                    except Exception:
+                        continue
+                    all_probed.append({
+                        "id": item["id"], "family": item["family"], "label_ko": item["label_ko"],
+                        "delta": delta, "feasible": False,
+                        "info": {"searched": True, "found": False, "solves": used},
+                    })
+                continue
+            # ── (search 없음 또는 예산 소진) 기존 고정 델타 경로 ──
             try:
                 delta = item["apply"](base_config)
             except Exception as exc:  # 카탈로그 항목 자체 오류는 건너뜀
@@ -235,19 +695,15 @@ def probe_relaxations(
             {k: r[k] for k in ("id", "family", "label_ko", "delta", "info")}
             for r in all_probed if r["feasible"]
         ]
-        # 단일완화로 못 풀면 최소조합(black-box MCS) 탐색
-        if not resolutions and try_combo:
-            members = _find_combo(base_config, resolve_fn, cat, max_size=max_combo, logger=logger)
+        # 단일완화로 못 풀면 최소조합(black-box MCS) 탐색.
+        # combo 가 이미 있으면(hard-filter 우선군 콤보로 해결) 재탐색 생략.
+        if not resolutions and try_combo and combo is None:
+            members = _find_combo(
+                base_config, resolve_fn, cat, max_size=max_combo, logger=logger,
+                priority_families=priority_families, first_hit=True,
+            )
             if members:
-                combo = {
-                    "id": "combo:" + "+".join(m["id"] for m in members),
-                    "label_ko": " + ".join(m["label_ko"] for m in members),
-                    "members": [
-                        {"id": m["id"], "family": m["family"], "label_ko": m["label_ko"],
-                         "delta": m["apply"](base_config)}
-                        for m in members
-                    ],
-                }
+                combo = _mk_combo(members, base_config)
     finally:
         if verify:
             if prev_env is None:

@@ -22,7 +22,7 @@ def seeded(db):
     db.add(Office(office_id="o1", office_name="병원"))
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="a1", group_id="A", office_id="o1", name="n1",
-                 active=1, grade=1, allowed_shifts=[], is_weekend_off=False, fixed_shift=None))
+                 active=1, grade=1, allowed_shifts=[], fixed_shift=None))
     db.flush()
     return db
 
@@ -36,7 +36,7 @@ def test_overlay_applies_target_month_period(seeded):
                   carry_attrs=["allowed_shifts"])
     db.flush()
     n = db.query(Nurse).filter_by(nurse_id="n1").first()
-    assert (n.grade, bool(n.is_weekend_off), n.fixed_shift) == (1, False, None)  # 캐시
+    assert (n.grade, n.fixed_shift) == (1, None)  # 캐시(주말휴무는 컬럼 언매핑 → overlay가 채움)
     _overlay_home_profile_asof(db, [n], "A", date(2026, 8, 1))
     assert n.grade == 3
     assert bool(n.is_weekend_off) is True

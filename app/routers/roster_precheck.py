@@ -99,5 +99,7 @@ def precheck_roster(
         inp = _to_input(req)
         result = run_precheck(inp, stop_on_config_error=bool(req.stop_on_config_error))
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"precheck failed: {e}")

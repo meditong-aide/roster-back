@@ -26,6 +26,86 @@ from typing import Any, Dict, List, Optional
 _NURSE_IDX_RE = re.compile(r"nurse_(\d+)")
 
 
+# ── Treatment magnitude sizing ────────────────────────────────────────────
+# aggregate precheck 는 원인을 잡을 때 이미 정확한 숫자(요구/공급/가용인원)를
+# 계산해 cause.details(=issue evidence)에 담는다. ontology treatment 는 방향
+# ("상향")만 알 뿐 *얼마나* 는 정적으로 모른다 → 여기서 그 숫자로 실효 목표값을
+# 계산해 treatment 에 붙인다. 단일축(산술로 증명된) 케이스에서만 성립 —
+# 조합(coupled) 케이스는 값 None 을 두고 probe 재solve 검증에 맡긴다.
+
+
+def _needed_max_nig(need: int, caps: List[int]) -> Optional[int]:
+    """월 N 요구(need)를 충족하는 최소 개인 월-야간 상한 m.
+
+    공급 = Σ_n min(working_cap[n], m). m 에 대해 단조증가하므로 최소 m 을 스캔.
+    최대 working_cap 로도 need 미달이면 None(= 상한 조정만으로 불가, 증원 필요).
+    """
+    caps = [int(c) for c in caps if c is not None and int(c) >= 0]
+    if need is None or need <= 0 or not caps:
+        return None
+    max_cap = max(caps)
+    for m in range(1, max_cap + 1):
+        if sum(min(c, m) for c in caps) >= need:
+            return m
+    return None
+
+
+def _size_from_cause_details(
+    config_key: Optional[str], details: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """config_key + precheck 숫자(details)로 treatment 목표값 계산.
+
+    Returns None 이면 사이징 불가(방향만 유지). insufficient=True 면 그 노브
+    단독으로는 해소 불가(예: 인원 부족) → 잘못된 값 대신 명시.
+    """
+    if not config_key or not isinstance(details, dict):
+        return None
+    if config_key == "max_nig_per_month":
+        need = details.get("n_required") or details.get("monthly_N_need")
+        caps = [
+            c.get("capacity_days")
+            for c in (details.get("night_capable_nurses") or [])
+            if isinstance(c, dict)
+        ]
+        m = _needed_max_nig(int(need) if need else 0, caps)
+        n_capable = len([c for c in caps if c is not None])
+        if m is None:
+            return {
+                "config_key": config_key, "target_value": None, "insufficient": True,
+                "reason_ko": (
+                    f"개인 월 야간 상한을 최대로 올려도 월 요구 {need} 를 채울 수 없습니다 "
+                    f"(야간 가능 {n_capable}명). 야간 가능 인원 증원이 필요합니다."
+                ),
+            }
+        return {
+            "config_key": config_key, "target_value": m, "insufficient": False,
+            "reason_ko": (
+                f"야간 가능 {n_capable}명 기준 월 요구 {need} 충족에 필요한 "
+                f"개인 월 야간 상한 = {m} (현재값 기준 상향)."
+            ),
+        }
+    if config_key == "daily_shift_requirements":
+        # 특정 일자 총 시프트 수요 > 그 날 가용 간호사. 수요는 DailyShift(일자·시프트별
+        # 중첩)에서 오므로 스칼라 자동 apply 는 위험 → 정확한 초과 숫자만 안내(message-only).
+        req = details.get("required_total") or details.get("required")
+        avail = details.get("available_nurses")
+        day = details.get("day")
+        if req is None or avail is None:
+            return None
+        over = int(req) - int(avail)
+        if over <= 0:
+            return None
+        _day_ko = f"{int(day) + 1}일차 " if isinstance(day, int) else ""
+        return {
+            "config_key": config_key, "target_value": None, "insufficient": False,
+            "reason_ko": (
+                f"{_day_ko}총 시프트 수요 {req} > 가용 간호사 {avail}명 — "
+                f"그 날 총 수요를 {avail}명 이하로 {over}명 감축해야 합니다."
+            ),
+        }
+    return None
+
+
 def _extract_nurse_idx(node_id: Optional[str]) -> Optional[int]:
     """node_id (예: 'off_cap:nurse_5') 에서 nurse 인덱스 정수 추출."""
     if not node_id:
@@ -310,6 +390,15 @@ def enrich_treatment_recommendations(
     # cause 의 식별자는 `node_id` (예: "cause:eligibility:role_only_oversupply").
     # treatment.covers 가 이 형식이라 node_id 로 매핑. fallback 으로 reason_code 도 등록.
     cause_by_id: Dict[str, Dict[str, Any]] = {}
+    # treatment.covers 는 ontology 정식 cause_id(예: "cause:capacity:monthly_night_shortage").
+    # precheck cause 는 reason_code alias(예: "MONTHLY_NIGHT_CAPACITY_SHORTAGE")/node_id=None 이라
+    # 그대로면 매칭 실패 → resolve_cause_alias 로 정식 id 도 등록해 covers 와 맞춘다.
+    _resolve = None
+    try:
+        from services.semantics.ontology import get_default_ontology
+        _resolve = get_default_ontology().resolve_cause_alias
+    except Exception:
+        _resolve = None
     for c in (causes or []):
         nid = c.get("node_id")
         if nid:
@@ -317,6 +406,16 @@ def enrich_treatment_recommendations(
         rc = c.get("reason_code")
         if rc and rc not in cause_by_id:
             cause_by_id[rc] = c
+        if _resolve:
+            for _key in (nid, rc):
+                if not _key:
+                    continue
+                try:
+                    _cid = _resolve(_key)
+                except Exception:
+                    _cid = None
+                if _cid and _cid not in cause_by_id:
+                    cause_by_id[_cid] = c
 
     for bundle in treatments:
         if not isinstance(bundle, dict):
@@ -326,6 +425,24 @@ def enrich_treatment_recommendations(
         for t in (bundle.get("treatments") or []):
             covered = t.get("covers") or []
             t_evidence: List[Dict[str, Any]] = []
+            # magnitude sizing: 단일축 precheck 숫자로 실효 목표값 계산(가능한 경우).
+            # 가장 먼저 사이징 가능한 cause 를 채택. 조합/미지원이면 None(방향만 유지).
+            if t.get("suggested_value") is None and not t.get("sizing_insufficient"):
+                for cause_id in covered:
+                    cause = cause_by_id.get(cause_id)
+                    if not cause:
+                        continue
+                    sized = _size_from_cause_details(
+                        t.get("config_key"), cause.get("details")
+                    )
+                    if sized is None:
+                        continue
+                    t["sizing_ko"] = sized.get("reason_ko")
+                    if sized.get("insufficient"):
+                        t["sizing_insufficient"] = True
+                    elif sized.get("target_value") is not None:
+                        t["suggested_value"] = sized.get("target_value")
+                    break
             for cause_id in covered:
                 cause = cause_by_id.get(cause_id)
                 if not cause:

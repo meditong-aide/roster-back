@@ -140,7 +140,6 @@ def optimize_fallback_lex_hard_first(
     logger_prefix: str,
     timer_cls,
     add_preceptor_terms_fn,
-    add_team_balance_terms_fn,
     add_grade_constraints_fn,
     postprocess_rebalance_off_fn,
     blocked_by_nurse: dict[int, set[int]] | None = None,
@@ -160,7 +159,6 @@ def optimize_fallback_lex_hard_first(
         logger_prefix: 로그 접두사
         timer_cls: with 구문에 사용할 Timer 클래스
         add_preceptor_terms_fn: 프리셉터 목적함수 항 생성 함수
-        add_team_balance_terms_fn: 팀 밸런스 목적함수 항 생성 함수
         add_grade_constraints_fn: Grade 제약 추가 함수
         postprocess_rebalance_off_fn: 후처리(OFF 재배치) 함수
 
@@ -2440,6 +2438,8 @@ def optimize_fallback_lex_hard_first(
                     if (n, d) in structural_off_cells and (n, d) not in vacation_off_cells and (n, d) in active_days
                 )
                 nonvac_active_days = max(0, avail_days - vacation_cnt)
+                # ★ 보건휴가 대상자는 OFF 하한을 1 올린다(후처리가 그중 하나를 휴가코드로 치환).
+                _hl_extra = 1 if getattr(nu, "health_leave_extra_off", False) else 0
                 off_bounds = compute_off_bounds(
                     source=cfg,
                     avail_days=avail_days,
@@ -2451,6 +2451,7 @@ def optimize_fallback_lex_hard_first(
                         for d in weekend_days
                         if T0 <= d <= T1 and (n, d) not in vacation_off_cells
                     ),
+                    extra_min_off=_hl_extra,
                 )
                 min_off_required = int(off_bounds["min_off_required"])
                 # max coverage 자동 조정 적용
@@ -2476,11 +2477,23 @@ def optimize_fallback_lex_hard_first(
                         if (n, d) not in vacation_off_cells
                     )
                     hard_lower = int(min_off_required)
-                    # per-nurse 1일 lower slack (페널티 무거움) — 솔버가 min_off 1일
-                    # 부족한 nurse 만 자동 풀어줌. 글로벌 -1 (구 relax_level=1) 의
-                    # 항상-ON per-nurse 버전. 9B 2026-07 등 min_off=11 hard 가
-                    # combinatorial 로 막히는 케이스 회복.
-                    _lower_slack_max = 1
+                    # ★★ OFF 하한은 HARD 다 — per-nurse 1일 slack 을 쓰지 않는다.
+                    #   이 블록은 off_first=False 일 때만 실행된다(True 면 위에서
+                    #   min_off_required=0 이 되어 건너뛴다). off_first=False 는
+                    #   "근무 oversupply 허용 · OFF tight" 모드이므로 OFF 를 정확히
+                    #   지키는 것이 설계 의도다.
+                    #
+                    #   실측(2026-08-04) — slack=1 이던 시절:
+                    #     중환자실  쉼여력 328 · 필요 260(여유 68)인데 6명이 OFF 9
+                    #     42-AN     여유 50 인데 7명이 OFF 9
+                    #   여력이 남는데도 solver 가 페널티(100000)를 물고 slack 을 사서
+                    #   다른 제약을 맞추는 쪽을 택했다. 실무 근무표는 한 시트 안에서
+                    #   22~29/26~29명이 같은 OFF 수를 갖는다 — 균일이 정상이다.
+                    #
+                    #   ★ 구 주석의 회복 대상(9B 2026-07 min_off=11)은 현재 off_first=1
+                    #     이라 이 블록에 들어오지 않는다. 되살릴 때는 그 그룹의
+                    #     off_first 를 먼저 확인할 것.
+                    _lower_slack_max = 0
                     _lower_slack_weight = 100000
                     if _lower_slack_max > 0:
                         min_off_lower_slack = m.NewIntVar(
@@ -2533,16 +2546,11 @@ def optimize_fallback_lex_hard_first(
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected_fb:
                             _extra_off_fb += 1
-                        # GRADE/coverage 충족을 위해 cap을 풀어주는 여유 일수.
-                        # extra_off_penalty_weight 때문에 솔버는 필요할 때만 이 여유를 사용.
-                        # baseline(off_days) 초과분은 후처리 OffSwap이 연차로 라벨링.
-                        _off_cap_relax_extra = max(0, int(getattr(cfg, "off_cap_relax_extra", 0) or 0))
                         # off_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
                         _off_first_fb = bool(getattr(cfg, "off_first", False))
                         if _off_first_fb:
                             base_cap = max_off_allowed_from_policy
                             base_cap += _extra_off_fb
-                            base_cap += _off_cap_relax_extra
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
                             # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
@@ -2554,8 +2562,15 @@ def optimize_fallback_lex_hard_first(
                                 _scaled_max_fb = max(min_off_required, int(_fb_auto_max_off * _ratio_fb))
                                 total_cap_effective = min(total_cap_effective, _scaled_max_fb)
                         else:
-                            # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
-                            base_cap = min_off_required + _extra_off_fb + _off_cap_relax_extra
+                            # off_first=False: 근무 oversupply 를 허용하는 모드다(위 분기 주석).
+                            # ★★ 그러므로 OFF 는 **하한으로 고정**한다 — _extra_off_fb 를 더하지 않는다.
+                            #   더하면 상한이 하한+2 로 열려 사람마다 OFF 가 흩어진다.
+                            #   실측(2026-08-04):
+                            #     실무 엑셀   한 시트 안 22~29/26~29명이 동일값 (사실상 전원 균일)
+                            #     우리 issued 992 인원·월 중 하한정확 54.3% · 초과 26.5% · 미달 19.2%
+                            #   실무 기준으로 균일이 정상이고, 남는 인원은 근무로 흘려보내면 된다
+                            #   (커버리지 미달은 HARD 로 막히지만 초과는 무방하다).
+                            base_cap = min_off_required
                             if n in per_nurse_off_cap_override:
                                 base_cap = max(base_cap, per_nurse_off_cap_override[n])
                             # 글로벌 relax 증가 없음 — per-nurse cap override 만 반영
@@ -2634,7 +2649,7 @@ def optimize_fallback_lex_hard_first(
         _tm_cover_slacks: list = []
         if stage in (1, 2):
             try:
-                _gs_tm = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+                _gs_tm = "COMBINED"
                 add_team_min_constraints(
                     m, roster_system, X, join, leave,
                     grade_strategy=_gs_tm,
@@ -2648,7 +2663,7 @@ def optimize_fallback_lex_hard_first(
         # (기존에는 stage3 objective 경로에서만 add_grade_constraints가 호출되어,
         #  stage3 infeasible 시 stage2/1 해로 내려가며 grade hard가 빠질 수 있었다.)
         try:
-            _gs_fb = str(getattr(roster_system, "grade_strategy", "BASE") or "BASE").upper()
+            _gs_fb = "COMBINED"
             _gc_fb = getattr(roster_system, "grade_config", None)
             _allow_soft_fb = True
             if isinstance(_gc_fb, dict):
@@ -2732,7 +2747,6 @@ def optimize_fallback_lex_hard_first(
                 weekly_off_by_idx=weekly_off_by_idx,
                 logger_prefix=logger_prefix,
                 add_preceptor_terms_fn=add_preceptor_terms_fn,
-                add_team_balance_terms_fn=add_team_balance_terms_fn,
                 add_grade_constraints_fn=add_grade_constraints_fn,
                 blocked_by_nurse=blocked_by_nurse,
             )
@@ -2857,6 +2871,16 @@ def optimize_fallback_lex_hard_first(
             if _reg_s1 is not None:
                 _reg_s1.attach_to_model()
             st = s1.Solve(m1)
+            # shadow ground truth(피드백 fix3): 첫 hard 솔브(=effective primary hard) raw status 저장.
+            try:
+                _st_txt = _cp_sat_status_to_text(st)
+                if not getattr(roster_system, "_primary_solver_status", None):
+                    roster_system._primary_solver_status = _st_txt
+                _sas = getattr(roster_system, "_solver_attempt_statuses", None) or {}
+                _sas.setdefault(str(attempt_label or "primary_hard"), _st_txt)
+                roster_system._solver_attempt_statuses = _sas
+            except Exception:
+                pass
             if st == cp_model.INFEASIBLE and _reg_s1 is not None:
                 try:
                     _fb_cores = _reg_s1.extract_conflict_cores(s1, solver_phase="fallback")

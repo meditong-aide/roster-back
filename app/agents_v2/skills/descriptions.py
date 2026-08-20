@@ -327,8 +327,7 @@ SKILL_TOOLS: list[dict] = [
             "검사 항목 (config 기반 자동 적용):\n"
             "- consecutive_night_exceeded — 야간 연속 한도(2 또는 3) 초과\n"
             "- max_consecutive_work_exceeded — 연속 근무일(max_conseq_work) 초과\n"
-            "- grade_coverage_missing — 시프트별 최소 경력자(min_exp_per_shift) 미충족\n"
-            "- night_distribution_uneven — 야간 균등 배분(even_nights) 위반 (variance>2.0)\n\n"
+            "- grade_coverage_missing — 시프트별 최소 경력자(min_exp_per_shift) 미충족\n\n"
 
             "출력: violation_count, violations 배열, status('pass'|'fail'). "
             "각 위반에는 nurse_id/nurse_name·shift_id·날짜 정보 포함.\n\n"
@@ -527,8 +526,7 @@ SKILL_TOOLS: list[dict] = [
             "결정 기준: **'한 사람의 속성'인가 / '병동 전체 규칙'인가**.\n"
             "- '박춘일 야간 전담' / '김민지 데이 고정근무' → 개인 속성 → update_person_attr\n"
             "- '야간 최대 7회' / '연속 근무 5일 제한' / '데이 필요인원 3명' → 병동 정책 → update_constraint\n"
-            "- '김민지 원티드 한도 5건' → 개인 한도 → update_person_attr (wanted_max_requests)\n"
-            "- '병동 전체 야간 균등 배분 켜줘' → 병동 정책 → update_constraint\n\n"
+            "- '김민지 원티드 한도 5건' → 개인 한도 → update_person_attr (wanted_max_requests)\n\n"
 
             "─────────── 정책 영역 (의미적 그룹) ───────────\n"
             "[A] **시프트별 필요인원 (RosterConfig)**\n"
@@ -541,11 +539,9 @@ SKILL_TOOLS: list[dict] = [
             "  • two_offs_after_three_nig / two_offs_after_two_nig — 야간 후 2일 휴무 (bool)\n"
             "  • two_offs_per_week — 주 2회 오프 보장 (bool)\n"
             "  • banned_day_after_eve — 이브닝 다음날 데이 금지 (bool)\n"
-            "  • sequential_offs — 오프 연속 배치 선호 (bool)\n"
-            "  • even_nights — 야간 균등 배분 (bool)\n\n"
+            "  • sequential_offs — 오프 연속 배치 선호 (bool)\n\n"
             "[C] **구조 정책**\n"
-            "  • preceptee_on — 프리셉터-프리셉티 매칭 활성 (bool)\n"
-            "  • team_balance_enable / team_balance_gauge — 팀 밸런스 활성/강도(0~10)\n\n"
+            "  • preceptee_on — 프리셉터-프리셉티 매칭 활성 (bool)\n\n"
             "[D] **시프트 슬롯별 인원 (ShiftManage)** — 슬롯 단위 미세 조정\n"
             "  • field='manpower' + nurse_class('RN'/'AN') + shift_slot(정수) + value=정수\n"
             "  • 사용자가 'RN 데이 슬롯 인원 4명으로'처럼 슬롯을 특정할 때.\n\n"
@@ -561,8 +557,6 @@ SKILL_TOOLS: list[dict] = [
             "- '야간 최대 7회로' → field='max_nig_per_month', value=7\n"
             "- '연속 근무 5일 제한' → field='max_conseq_work', value=5\n"
             "- '이브닝 다음날 데이 금지 해제' → field='banned_day_after_eve', value=false\n"
-            "- '팀 밸런스 켜줘' → field='team_balance_enable', value=true\n"
-            "- '팀 밸런스 강도 7' → field='team_balance_gauge', value=7\n"
             "- '데이 필요인원 4명' → field='day_req', value=4\n"
             "- 'RN 데이 1슬롯 인원 5명' → field='manpower', nurse_class='RN', shift_slot=1, value=5\n\n"
 
@@ -577,7 +571,7 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "description": (
                         "변경 대상 정책 필드. RosterConfig 필드명(예: max_nig_per_month, "
-                        "max_conseq_work, banned_day_after_eve, day_req, team_balance_enable 등) "
+                        "max_conseq_work, banned_day_after_eve, day_req 등) "
                         "또는 'manpower'(ShiftManage 갱신용)."
                     ),
                 },

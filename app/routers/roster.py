@@ -134,20 +134,15 @@ def _roster_config_to_dict(config) -> dict:
         if config.max_conseq_off is not None
         else 3,
         "shift_priority": config.shift_priority,
-        "weekend_shift_ratio": config.weekend_shift_ratio,
-        "patient_amount": config.patient_amount,
         "sequential_offs": config.sequential_offs,
-        "even_nights": config.even_nights,
         "created_at": config.created_at.isoformat() if config.created_at else None,
         "updated_at": config.updated_at.isoformat()
         if getattr(config, "updated_at", None)
         else None,
         "nod_noe": config.nod_noe,
-        "preceptor_gauge": config.preceptor_gauge,
         "preceptee_on": config.preceptee_on,
         "preceptee_shift_count": config.preceptee_shift_count,
         "weekly_off_group": config.weekly_off_group,
-        "off_placement_mode": config.off_placement_mode,
         "not_one_night": config.not_one_night,
         "use_mid": bool(getattr(config, "use_mid", False)),
         "fixed_wanted_use_yn": config.fixed_wanted_use_yn,
@@ -155,10 +150,12 @@ def _roster_config_to_dict(config) -> dict:
         "show_preceptor": config.show_preceptor,
         "off_first": bool(getattr(config, "off_first", False)),
         "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
-        "team_balance_enable": bool(getattr(config, "team_balance_enable", False)),
-        "team_balance_gauge": getattr(config, "team_balance_gauge", 0),
-        "team_balance_mode": getattr(config, "team_balance_mode", "balanced"),
-        "config_version": config.config_version,
+        # 보건휴가 자동 부여 — NULL(미설정)은 False 로 떨어져야 한다.
+        "health_leave_enabled": bool(getattr(config, "health_leave_enabled", False)),
+        "health_leave_weekend": bool(getattr(config, "health_leave_weekend", False)),
+        # 수면OFF 자동 부여 — NULL(미설정)은 False / cycle 은 값 그대로(미설정 None).
+        "sleep_off_enabled": bool(getattr(config, "sleep_off_enabled", False)),
+        "sleep_off_cycle": getattr(config, "sleep_off_cycle", None),
     }
 
 
@@ -204,6 +201,8 @@ async def save_roster_config(
             config_data, user, db, override_group_id=override_gid,
             sync_use_mid_live=True,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Configuration save failed: {str(e)}"
@@ -327,6 +326,8 @@ async def get_config_versions(
                 "last_applied": last_applied.get(p.config_id),
             })
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to get config versions: {str(e)}"
@@ -452,16 +453,11 @@ async def get_config_by_version(
                 max_conseq_work=getattr(cfg, "max_consecutive_work_days", 6),
                 off_days=cfg.calculate_total_off_days(0),
                 shift_priority=getattr(cfg, "shift_requirement_priority", 0.8),
-                weekend_shift_ratio=getattr(cfg, "weekend_shift_ratio", 1.0),
-                patient_amount=getattr(cfg, "patient_amount", 0),
                 sequential_offs=getattr(cfg, "sequential_offs", True),
-                even_nights=getattr(cfg, "even_nights", True),
                 nod_noe=False,
-                preceptor_gauge=getattr(cfg, "preceptor_gauge", 5),
                 preceptee_on=getattr(cfg, "preceptee_on", False),
                 preceptee_shift_count=getattr(cfg, "preceptee_shift_count", True),
                 weekly_off_group=getattr(cfg, "weekly_off_group", False),
-                off_placement_mode=getattr(cfg, "off_placement_mode", 0),
                 not_one_night=getattr(cfg, "not_one_night", False),
                 use_mid=False,
                 fixed_wanted_use_yn=getattr(cfg, "fixed_wanted_use_yn", False),
@@ -910,6 +906,19 @@ async def drop_schedule(
     schedule.dropped = True
     schedule.updated_at = datetime.now()
     db.add(schedule)
+
+    # N 연번 앵커 재계산 — 마감본을 지웠으면 그 달 앵커가 고아가 된다.
+    #   ★ flush 가 먼저다(autoflush=False) — dropped=True 가 세션에만 있으면 재계산이
+    #     이 근무표를 여전히 살아있는 것으로 보고 앵커를 남긴다.
+    #   ★ 실패해도 삭제 자체는 막지 않는다.
+    if str(getattr(schedule, "status", "") or "") == "issued":
+        try:
+            db.flush()
+            from services.leave.night_cycle_service import rebuild_night_cycle_from
+            rebuild_night_cycle_from(db, schedule.group_id, schedule.year, schedule.month)
+        except Exception as _nc_exc:
+            print(f"[NightCycle] 삭제 후 앵커 재계산 실패(무시): {_nc_exc}")
+
     db.commit()
     return {"message": "스케줄이 삭제(숨김)되었습니다.", "schedule_id": schedule_id}
 
@@ -1022,7 +1031,7 @@ async def get_roster_by_schedule_id(
         nurse_entry = {
             "id": nurse.nurse_id,
             "name": nurse.name,
-            "experience": nurse.experience,
+            "experience": nurse.experience or 0,
             "schedule": nurse_schedule,
             "schedule_ids": schedule_ids,
             "counts": counts,
@@ -1298,7 +1307,7 @@ async def get_roster_for_month(
             {
                 "id": nurse.nurse_id,
                 "name": nurse.name,
-                "experience": nurse.experience,
+                "experience": nurse.experience or 0,
                 "schedule": nurse_schedule,
                 "counts": counts,
             }
@@ -1448,6 +1457,24 @@ async def publish_roster(
 
     db.add(issued_roster)
     db.add(snapshot)
+    # ── N 연번 앵커 스냅샷 (수면OFF 판정용) ──
+    #   schedule_entries 에는 'N' 만 저장되고 N1~N15 연번이 없어, 확정 시점에 그 달
+    #   말 연번(seq_at_end)과 미부여 이월(pending_sleep)을 남겨야 다음 달 판정이 된다.
+    #   ★ 수면OFF 기능이 꺼진 그룹에서도 남긴다 — 연번은 기능과 무관하게 이어져야 하고,
+    #     나중에 켰을 때 과거 앵커가 없으면 판정 자체가 불가능하다.
+    #   커밋 전에 호출해 발행 트랜잭션에 함께 묶는다. 실패해도 발행은 막지 않는다.
+    #   ★ 그 달만이 아니라 **이후 모든 마감월을 연쇄 재계산**한다 — 앵커는 전월 값을
+    #     이어받으므로 과거가 바뀌면 뒤가 전부 틀어진다(재발행이 대표적인 경우).
+    try:
+        # ★★ flush 가 반드시 먼저다 (autoflush=False 세션).
+        #   바로 위에서 `schedule.status = "issued"` 를 세팅했지만 flush 전까지 세션에만 있다.
+        #   rebuild 는 `status='issued'` 로 대상 월을 고르므로, flush 없이 부르면 DB 의
+        #   옛 draft 를 읽어 **대상 0건**이 된다(실측: publish 13건 전부 200 인데 앵커 미생성).
+        db.flush()
+        from services.leave.night_cycle_service import rebuild_night_cycle_from
+        rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
+    except Exception as _nc_exc:
+        print(f"[NightCycle] 앵커 스냅샷 실패(무시): {_nc_exc}")
     # NOTE: ShiftTransferLog 기반 전달은 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     db.commit()
     nurses_in_group = (
@@ -1568,6 +1595,17 @@ async def unpublish_roster(
         IssuedRosterSnapshot.group_id == target_group_id,
     ).update({"is_active_issued": False})
 
+    # 4) N 연번 앵커 재계산 — 이 달이 draft 로 내려갔으므로 앵커가 고아가 된다.
+    #    ★ flush 가 먼저다(autoflush=False). 위에서 status='draft' 를 세팅했지만 세션에만
+    #      있어, flush 없이 부르면 재계산이 이 달을 여전히 issued 로 보고 앵커를 남긴다.
+    #    ★ 실패해도 발행취소 자체는 막지 않는다.
+    try:
+        db.flush()
+        from services.leave.night_cycle_service import rebuild_night_cycle_from
+        rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
+    except Exception as _nc_exc:
+        print(f"[NightCycle] 발행취소 후 앵커 재계산 실패(무시): {_nc_exc}")
+
     db.commit()
 
     return {
@@ -1664,7 +1702,7 @@ async def get_roster_for_month(
             {
                 "id": nurse.nurse_id,
                 "name": nurse.name,
-                "experience": nurse.experience,
+                "experience": nurse.experience or 0,
                 "schedule": nurse_schedule,
                 "counts": counts,
             }
@@ -1761,6 +1799,23 @@ async def save_roster(
                 )
                 db.add(entry)
 
+    # ── N 연번 앵커 재계산 (마감본이 수정된 경우만) ──
+    #   ★ 이 엔드포인트는 ScheduleEntry 를 전량 삭제 후 재삽입한다. 마감(issued) 근무표를
+    #     고치면 그 달 N 배치가 바뀌므로 앵커도 다시 잡아야 하고, 앵커는 전월을 이어받으니
+    #     **이후 달까지 연쇄로** 재계산해야 정합이 유지된다.
+    #   ★ draft 저장은 대상이 아니다 — 확정이 아닌 것을 앵커에 반영하면 안 된다.
+    if str(getattr(schedule, "status", "") or "") == "issued":
+        try:
+            # ★★ flush 가 반드시 먼저다 (autoflush=False 세션).
+            #   위 `query(...).delete()` 는 bulk 라 **즉시 DB 에서 지워지지만**,
+            #   재삽입한 `db.add()` 는 flush 전까지 세션에만 있다. 그 상태로 재계산하면
+            #   compute_snapshot 이 "근무표가 텅 빈" DB 를 읽어 조용히 0행을 돌려준다
+            #   (실측: 훅은 정상 진입·무예외인데 앵커가 안 생겼다).
+            db.flush()
+            from services.leave.night_cycle_service import rebuild_night_cycle_from
+            rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
+        except Exception as _nc_exc:
+            print(f"[NightCycle] 마감본 수정 후 재계산 실패(무시): {_nc_exc}")
     db.commit()
     return {"message": "Roster saved successfully"}
 
@@ -2431,6 +2486,8 @@ async def copy_schedule_to_new_version(
         print(
             f"[COPY SUCCESS] 새 schedule_id: {new_schedule_id}, version: {new_version}"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f"[COPY ERROR] 커밋 실패: {str(e)}")
@@ -2511,6 +2568,8 @@ async def create_empty_roster(
     try:
         db.commit()
         db.refresh(new_schedule)
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"빈 근무표 생성 실패: {str(e)}")
@@ -2597,12 +2656,18 @@ async def create_roster_with_weekly_off(
     )
     weekly_off_shift_int_id = weekly_off_shift.id if weekly_off_shift else None
 
-    weekend_off_by_nurse_id = {
-        str(r.nurse_id): bool(getattr(r, "is_weekend_off", False))
-        for r in db.query(Nurse.nurse_id, Nurse.is_weekend_off)
+    # 주말휴무 SSOT = nurse_weekendoff_period (as-of today). nurses.is_weekend_off 컬럼 미조회.
+    from services.nurse_period_resolver import weekend_off_ids_asof
+    from datetime import date as _date
+    _today = _date.today()
+    _active_ids = [
+        str(r.nurse_id)
+        for r in db.query(Nurse.nurse_id)
         .filter(Nurse.group_id == target_group_id, Nurse.active == 1)
         .all()
-    }
+    ]
+    _wids = weekend_off_ids_asof(db, _active_ids, _today.year, _today.month)
+    weekend_off_by_nurse_id = {nid: (nid in _wids) for nid in _active_ids}
 
     nurses = []
     if isinstance(weekly_off_data, dict):
@@ -2681,6 +2746,8 @@ async def create_roster_with_weekly_off(
         db.commit()
         db.refresh(new_schedule)
         print(f"[DEBUG] 전체 주휴 엔트리 생성 완료: {created_entries}개")
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f"[ERROR] commit 실패: {str(e)}")
@@ -2773,6 +2840,8 @@ async def create_schedule_share_link(
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"공유 링크 생성 실패: {str(e)}")
 
@@ -2817,6 +2886,8 @@ async def create_schedule_share_link_with_upload(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"이미지 업로드/공유 링크 생성 실패: {str(e)}"
@@ -2863,6 +2934,8 @@ async def create_schedule_share_link_auto(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"자동 이미지 생성/공유 링크 생성 실패: {str(e)}"
@@ -2911,6 +2984,8 @@ async def create_schedule_share_link_capture(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"캡처 이미지 공유 링크 생성 실패: {str(e)}"
@@ -2936,6 +3011,8 @@ async def revoke_schedule_share_link(
         raise HTTPException(status_code=403, detail=str(e))
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"공유 링크 해제 실패: {str(e)}")
 
@@ -3050,6 +3127,8 @@ async def render_schedule_share_image(token: str, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Share image load failed: {str(e)}"

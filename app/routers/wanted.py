@@ -14,6 +14,7 @@ from schemas.roster_schema import (
     WantedConfigCreate,
     WantedConfig as WantedConfigSchema,
     FixedWantedCreate,
+    AdjustmentApplyAllRequest,
     AdjustmentResponse,
     FixedWantedListResponse,
     FixedWantedEntryResponse,
@@ -46,10 +47,15 @@ from services.wanted_service import (
     delete_excess_off_requests,
     get_wanted_adjustment_service,
     save_fixed_wanted_service,
+    precheck_adjustment_save,
+    save_banned_wanted_service,
+    _decode_banned_response,
     toggle_fixed_wanted_entry_service,
+    toggle_banned_wanted_entry_service,
     get_fixed_wanted_for_roster_service,
     get_fixed_wanted_entries_service,
     reset_fixed_wanted_service,
+    set_adjustment_applied_service,
     get_shift_requests_service,
 )
 
@@ -81,6 +87,8 @@ async def request_wanted_shifts(
     try:
         result = request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Wanted 작성 요청 실패: {str(e)}")
 
@@ -307,6 +315,8 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
         
         print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
         return {"response": result}
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f'error', e)
@@ -522,6 +532,8 @@ async def get_wanted_config_endpoint(
     try:
         result = get_wanted_config(db, target_group_id, filters)
         return [WantedConfigSchema.model_validate(r) for r in result]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")
 
@@ -555,6 +567,8 @@ async def upsert_wanted_config_endpoint(
         return [WantedConfigSchema.model_validate(r) for r in results]
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 저장 실패: {str(e)}")
 
@@ -594,6 +608,8 @@ async def delete_wanted_config_endpoint(
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
@@ -627,6 +643,8 @@ async def delete_wanted_config_by_month_endpoint(
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
@@ -663,6 +681,8 @@ async def validate_wanted_limits_endpoint(
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"날짜 형식 오류: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
 
@@ -735,6 +755,8 @@ async def get_wanted_adjustment(
             content=jsonable_encoder(result),
             media_type="application/json; charset=utf-8"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"원티드 조정판 조회 실패: {str(e)}")
 
@@ -761,7 +783,14 @@ async def save_fixed_wanted(
     target_group_id = resolve_effective_group(db, current_user, group_id)
 
     try:
+        # ★ 확정 저장이 내부에서 commit 하므로, 금지 점검은 **아무것도 쓰기 전에** 한다.
+        #   안 그러면 금지에서 422 를 내도 확정 조정은 이미 저장된 채로 남는다.
+        precheck_adjustment_save(db, target_group_id, req)
         entries = save_fixed_wanted_service(db, target_group_id, current_user.nurse_id, req)
+        # 금지 원티드 저장(같은 요청 바디의 banned_entries). None=미변경, []=전체 해제.
+        banned_rows, banned_warnings = save_banned_wanted_service(
+            db, target_group_id, current_user.nurse_id, req
+        )
         return FixedWantedListResponse(
             group_id=target_group_id,
             year=req.year,
@@ -780,11 +809,14 @@ async def save_fixed_wanted(
                     source_type=e.source_type,
                     original_shift_id=e.original_shift_id,
                     reason=e.reason,
-                    head_nurse_memo=e.head_nurse_memo,
                     created_by=e.created_by,
                 ) for e in entries
             ],
             total_count=len(entries),
+            banned_entries=[
+                _decode_banned_response(b, req.year, req.month) for b in banned_rows
+            ],
+            warnings=banned_warnings,
         )
     except HTTPException:
         db.rollback()
@@ -831,6 +863,43 @@ async def toggle_fixed_wanted_entry(
         raise HTTPException(status_code=500, detail=f"토글 실패: {str(e)}")
 
 
+@router.patch("/adjustment/banned/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
+async def toggle_banned_wanted_entry(
+    entry_id: int,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """
+    금지 원티드 개별 항목 적용/미적용(반려) 토글 API
+    - fixed 토글과 동일 정책. 별도 테이블이라 entry_id 충돌 방지 위해 경로 분리(/banned/).
+    - 수간호사는 본인 병동 entries만 토글 가능. master_admin은 office 범위로 허용.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    caller_group_id: Optional[str] = None
+    if caller_is_head_nurse(db, current_user):
+        caller_group_id = resolve_home_group_id(db, current_user)
+
+    try:
+        entry = toggle_banned_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)
+        return ToggleEntryResponse(
+            id=entry.id,
+            is_applied=entry.is_applied,
+            message=f"금지 항목이 {'적용' if entry.is_applied else '미적용'}으로 변경되었습니다."
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"토글 실패: {str(e)}")
+
+
 @router.post("/adjustment/{year}/{month}/reset", response_model=AdjustmentResponse)
 async def reset_fixed_wanted(
     year: int,
@@ -856,9 +925,52 @@ async def reset_fixed_wanted(
     try:
         result = reset_fixed_wanted_service(db, target_group_id, year, month)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
+
+
+@router.post("/adjustment/{year}/{month}/apply-all", response_model=AdjustmentResponse)
+async def set_adjustment_applied(
+    year: int,
+    month: int,
+    req: AdjustmentApplyAllRequest,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """조정판 '원티드 전체 반영/미반영' API
+
+    솔버 주입 채널 **둘 다** 를 한 번에 켜고 끈다.
+    - FixedWantedEntry.is_applied  → fixed_cells (하드 고정)
+    - BannedWantedEntry.is_applied → initial_forbidden → X==0   (source='hn' 스코프)
+
+    ★ 클라이언트가 채널별로 따로 끄던 것을 서버로 옮긴 것이다. 한쪽만 꺼지면
+      "전체 미반영" 인데 기피는 하드로 살아 있는 상태가 된다.
+    ★ 반환은 `/reset` 과 동일한 AdjustmentResponse — 호출 측이 재조회 없이
+      캐시를 그대로 갱신할 수 있다.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+
+    try:
+        return set_adjustment_applied_service(
+            db, target_group_id, year, month, req.applied
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"원티드 전체 {'반영' if req.applied else '미반영'} 실패: {str(e)}",
+        )
 
 
 @router.get("/fixed/{year}/{month}")
@@ -902,6 +1014,8 @@ async def get_fixed_wanted(
             "entries": entries,
             "total_count": len(all_entries),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"확정 원티드 조회 실패: {str(e)}")
 

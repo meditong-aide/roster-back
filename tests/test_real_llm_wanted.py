@@ -94,7 +94,7 @@ def _seed(db: Session):
             role="RN", team_id=tid, is_head_nurse=(hn == "HN"), hn_auth=hn,
             active=1, sequence=int(nid[1:]),
             joining_date=datetime(2025, 1, 1) if not is_new else datetime(2026, 3, 1),
-            is_weekend_off=False, work_shifts=["D", "E", "N"],
+            work_shifts=["D", "E", "N"],
             allowed_shifts=[], fixed_shift=None, enable_aide=True,
         ))
     db.flush()
