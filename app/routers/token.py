@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, status, Response, Request, Form, Depends
 from sqlalchemy.orm import Session
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from starlette.status import HTTP_301_MOVED_PERMANENTLY
 from datalayer.member import Member
 from datalayer.token import Token
@@ -120,6 +120,40 @@ async def login_for_access_token(response: Response,
             is_master_admin = True if str(EmpAuthGbn).upper() == 'ADM' else False
 
             access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+            # ── AI근무표 대상자 게이트 ────────────────────────────────
+            # SSO 진입 조건인 `aiuseyn`(=M_Office.ade_sch)은 **병원 단위** 플래그라
+            # AI근무표를 쓰는 병원의 의사·행정직까지 전부 통과한다. `/auth/login` 은
+            # nurses 미등록을 501 로 막는데(auth.py) 여기엔 같은 검사가 없어
+            # 비대상 직원이 "로그인은 됐는데 전부 빈 화면" 상태로 들어왔다.
+            #
+            # ★ 쿠키를 **주지 않고 기존 쿠키도 지운다.** 모바일 `tokenlogin()` 이
+            #   상태코드를 보지 않고 `response.json()` 을 그대로 돌려주기 때문에
+            #   501 만으로는 호출부가 성공으로 오인한다. 로그인 상태 자체를 없애야
+            #   화면이 비로그인 흐름으로 떨어진다.
+            # ★ ADM(마스터 관리자)은 nurses 에 없어도 통과 — auth.py 와 같은 규약.
+            if not is_master_admin:
+                _nurse_row = db.query(Nurse).filter(Nurse.account_id == account_id).first()
+                if _nurse_row is None:
+                    print(
+                        f"[TokenLogin][blocked] AI근무표 미대상 — account_id={account_id} "
+                        f"office_id={office_id} office_name={office_name!r} "
+                        f"EmpSeqNo={EmpSeqNo} EmpAuthGbn={EmpAuthGbn} "
+                        f"name={name!r} ip={client_ip}"
+                    )
+                    # ★ HTTPException 을 던지면 FastAPI 가 **별도 에러 응답을 새로 만들어**
+                    #   주입된 `response` 의 delete_cookie 헤더가 클라이언트에 닿지 않는다.
+                    #   그러면 이전 계정으로 로그인해 둔 단말은 쿠키가 살아남아 차단이 무의미해진다.
+                    #   삭제 헤더를 실어 보내려면 응답 객체를 직접 반환해야 한다.
+                    _blocked = JSONResponse(
+                        status_code=501,
+                        content={
+                            "detail": "AI근무표 이용 대상이 아닙니다. 병동 수간호사에게 등록을 요청하세요."
+                        },
+                    )
+                    # set_cookie 와 같은 path 로 지워야 실제로 제거된다(기본 "/").
+                    _blocked.delete_cookie(key="access_token", path="/")
+                    return _blocked
 
             # nurses 테이블의 값으로 보강/덮어쓰기
             extra_data = get_extra_data_from_nurses(db, account_id)
