@@ -603,10 +603,11 @@ def night_bulk_apply_service(
     year: int,
     month: int,
     kind: str,
-    value: int,
+    value: Optional[int] = None,
 ) -> Tuple[List[NurseMonthlyLimitItem], Optional[NurseMonthlyLimitMeta], List[NurseMonthlyLimitWarning]]:
     """현재 병동(group_id)·현재월(year/month)의 야간 가능 active 근무자 '전체'에
-    동일한 나이트 한도를 일괄 적용한다(kind=fixed→n_exact 고정, max→n_max 최대).
+    동일한 나이트 한도를 일괄 적용한다(kind=fixed→n_exact 고정, max→n_max 최대,
+    clear→나이트 고정·최대만 초기화. clear 일 때 value 는 None).
 
     검증(필드별)·조합 에러(_ko)·upsert 는 upsert_nurse_monthly_limits_service 를
     그대로 재사용한다(단일 진실원천). 여기서는 명단 resolve + 균일 limits 조립만 한다.
@@ -614,8 +615,6 @@ def night_bulk_apply_service(
     N 가능 근무자만 대상으로 한다.
     """
     from services.precheck.monthly_limit_validator import _allowed_work_shifts
-
-    field = "n_exact" if kind == "fixed" else "n_max"
 
     nurses = (
         db.query(Nurse)
@@ -631,16 +630,43 @@ def night_bulk_apply_service(
             status_code=400, detail="해당 병동에 야간 가능 근무자가 없습니다."
         )
 
-    limits = [
-        {
-            "nurse_id": str(nu.nurse_id),
-            "group_id": group_id,
-            "year": year,
-            "month": month,
-            field: value,
-        }
-        for nu in n_capable
-    ]
+    if kind == "clear":
+        # ★ upsert 는 **12개 한도 필드를 통째로 덮어쓴다**(payload 에 없는 키는 None).
+        #   초기화가 나이트만 지우고 "데이·이브닝·오프 제한은 유지"(화면 안내)하려면
+        #   나머지 값을 **명시적으로 실어 보내야** 한다. 안 그러면 같이 날아간다.
+        # ★★ 그 달 행이 없어도 **이전 달에서 상속(as-of)** 받는 값이 있다. exact-month 로
+        #   찾으면 빈손이라, 초기화가 상속 중이던 데이·이브닝·오프 한도까지 묘비로 덮어
+        #   지워버린다. 반드시 as-of 로 읽는다.
+        _eff = fetch_effective_monthly_limits_by_nurse(
+            db, year, month, [str(nu.nurse_id) for nu in n_capable], group_id
+        )
+        # ★★★ `n_min` 도 함께 지운다. `_normalize_row` 가 `n_exact=X` 를 저장할 때
+        #   **`n_min=X`·`n_max=X` 로 펼치므로**, n_min 을 남기면 "최소 X회 나이트"가
+        #   그대로 강제돼 초기화가 반쪽이 된다(화면은 "고정·최대를 모두 지움"이라고 한다).
+        #   보존 대상은 **다른 근무 종류(D/E/O)** 뿐이다.
+        _keep = ("d_min", "d_max", "d_exact", "e_min", "e_max", "e_exact",
+                 "o_min", "o_max", "o_exact")
+        limits = []
+        for nu in n_capable:
+            nid = str(nu.nurse_id)
+            prev = _eff.get(nid) or {}
+            row = {"nurse_id": nid, "group_id": group_id, "year": year, "month": month,
+                   "n_exact": None, "n_max": None, "n_min": None}
+            for f in _keep:
+                row[f] = prev.get(f)
+            limits.append(row)
+    else:
+        field = "n_exact" if kind == "fixed" else "n_max"
+        limits = [
+            {
+                "nurse_id": str(nu.nurse_id),
+                "group_id": group_id,
+                "year": year,
+                "month": month,
+                field: value,
+            }
+            for nu in n_capable
+        ]
     return upsert_nurse_monthly_limits_service(db, current_user, year, month, limits)
 
 
