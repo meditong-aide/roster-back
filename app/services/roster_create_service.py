@@ -3072,6 +3072,11 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     prev_month_last_is_off = cross_month_constraints.get("prev_month_last_is_off") or {}
     if prev_month_last_is_off:
         config_dict["prev_month_last_is_off"] = prev_month_last_is_off
+    # 전월 마지막 근무코드: 월 경계 N-O-D / N-O-E / E-O-D 판정에 쓰인다.
+    #   `last_is_off` 는 OFF 여부만 알려줘 "전월 마지막이 E 였다"를 복원할 수 없다.
+    prev_month_last_main = cross_month_constraints.get("prev_month_last_main") or {}
+    if prev_month_last_main:
+        config_dict["prev_month_last_main"] = prev_month_last_main
     prev_month_n_tail = cross_month_constraints.get("prev_month_n_tail") or {}
     if prev_month_n_tail:
         config_dict["prev_month_n_tail"] = prev_month_n_tail
