@@ -1291,6 +1291,17 @@ class CPSATBasicEngine:
                     continue
                 prev_last_off_by_idx[n_idx] = bool(flag)
             roster_system.prev_month_last_is_off = prev_last_off_by_idx
+            # 전월 마지막 근무코드(D/E/N/O) — 월 경계 N-O-D / N-O-E / E-O-D 지표용.
+            prev_last_main_raw = config_data.get("prev_month_last_main") or {}
+            prev_last_main_by_idx: dict[int, str] = {}
+            for dbid, code in (prev_last_main_raw or {}).items():
+                n_idx = _get_nurse_idx(dbid)
+                if n_idx is None:
+                    continue
+                code_s = str(code or "").strip().upper()
+                if code_s:
+                    prev_last_main_by_idx[n_idx] = code_s
+            roster_system.prev_month_last_main = prev_last_main_by_idx
             prev_n_tail_raw = config_data.get("prev_month_n_tail") or {}
             prev_n_tail_by_idx: dict[int, int] = {}
             for dbid, tail_cnt in (prev_n_tail_raw or {}).items():

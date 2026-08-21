@@ -2259,6 +2259,20 @@ def optimize_fallback_lex_hard_first(
                         - 2
                     )
                     safety["pattern_eod"].append(v3)
+            # 월 경계(전월 마지막 → day0/day1). 위 루프는 세 칸이 다 당월에 있어야 돌아
+            # d=0 이전을 못 본다 — 같은 safety 계층에 넣어 강도를 맞춘다.
+            from services.cp_sat.objective_terms import build_cross_month_pattern_vars
+            _xm_vars = build_cross_month_pattern_vars(
+                m, roster_system, X, join, leave,
+                off_idx=off_idx, day_idx=day_idx, eve_idx=eve_idx, prefix="fb_",
+            )
+            for _kind, _var in _xm_vars:
+                safety[f"pattern_{_kind}"].append(_var)
+            if stage == 1:
+                _xm_cnt: dict[str, int] = {}
+                for _kind, _ in _xm_vars:
+                    _xm_cnt[_kind] = _xm_cnt.get(_kind, 0) + 1
+                print(f"{logger_prefix} [CrossMonth-Pattern] 경계 패턴 지표 {len(_xm_vars)}건 {_xm_cnt}")
 
         # 월 최소 OFF 부족량(가능일수 클램프)
         # max coverage 설정 시: min/max coverage 기반 OFF cap 자동 조정

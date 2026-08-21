@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field, field_validator, ValidationInfo, EmailStr
+from pydantic import (
+    BaseModel, Field, field_validator, model_validator, ValidationInfo, EmailStr,
+)
 from typing import List, Dict, Any, Optional, Literal
 from datetime import date, datetime
 from enum import StrEnum
@@ -883,10 +885,26 @@ class NightBulkApplyRequest(BaseModel):
     group_id: str
     year: int = Field(ge=2000, le=2100)
     month: int = Field(ge=1, le=12)
-    kind: Literal["fixed", "max"] = Field(
-        description="fixed=고정(n_exact), max=최대(n_max)"
+    kind: Literal["fixed", "max", "clear"] = Field(
+        description="fixed=고정(n_exact), max=최대(n_max), clear=나이트 설정 초기화"
     )
-    value: int = Field(ge=0, description="전 야간가능 근무자에 적용할 나이트 개수")
+    # ★ clear 는 값이 없다(null). `value: int` 로 두면 프론트의 {kind:'clear', value:null}
+    #   이 **422 로 막혀 초기화가 아예 동작하지 않는다**(실측 2026-08-21 운영).
+    value: Optional[int] = Field(
+        default=None, ge=0, description="적용할 나이트 개수. clear 면 null"
+    )
+
+    @model_validator(mode="after")
+    def _value_required_unless_clear(self):
+        """★ Optional 로 푼 대가를 여기서 막는다.
+
+        `{kind:'fixed', value:null}` 을 그대로 통과시키면 서비스가 선택 필드에 None 을
+        넣고, upsert 가 **12개 한도 필드를 통째로 덮어쓰므로** 대상 병동 전원의 월 한도가
+        조용히 지워진다. 값이 필요한 모드에서는 None 을 거절한다.
+        """
+        if self.kind != "clear" and self.value is None:
+            raise ValueError("fixed/max 는 value 가 필요합니다.")
+        return self
 
 
 class NurseMonthlyLimitWarning(BaseModel):

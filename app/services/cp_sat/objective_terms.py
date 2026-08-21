@@ -27,6 +27,66 @@ from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes, i
 from services.day_windows import iter_nurse_days, build_active_days
 
 
+def build_cross_month_pattern_vars(
+    m: cp_model.CpModel,
+    rs,
+    X,
+    join: list[int],
+    leave: list[int],
+    *,
+    off_idx: int,
+    day_idx: int | None,
+    eve_idx: int | None,
+    prefix: str = "",
+    active_days: set | None = None,
+) -> list[tuple[str, cp_model.IntVar]]:
+    """월 경계 N-O-D / N-O-E / E-O-D 지표 변수를 만든다.
+
+    당월 내부 패턴 루프는 (d, d+1, d+2) 세 칸이 모두 당월에 있어야 성립하므로 d=0 이전을
+    보지 못한다. 그래서 전월 마지막이 N/E 여도 day0=OFF, day1=D 조합이 그대로 통과했다
+    (2026-08-21 실측: 당월 내부 0건, 경계에서만 3건).
+
+    전월 마지막 코드는 이미 확정된 상수이므로 남은 두 칸(day0, day1)만 변수로 세운다.
+    `prev_month_n_tail` 과 같은 경계 캐리오버 경로를 그대로 쓰며, 하드로 막지 않고
+    당월 내부와 **같은 강도**(호출부의 safety/penalty)로 최소화한다.
+
+    인자:
+        rs: RosterSystem. `prev_month_last_main`(간호사 idx → 'D'/'E'/'N'/'O') 을 읽는다.
+        off_idx/day_idx/eve_idx: 교대 인덱스. None 이면 해당 패턴을 건너뛴다.
+        active_days: (n, d) 유효 셀 집합. 주어지면 day0/day1 이 모두 들어 있을 때만 만든다.
+    반환:
+        [(패턴명, 0/1 지표변수)] 목록. 위반이면 1이 된다.
+    예외:
+        없음.
+    예시:
+        전월 마지막 E + day0=OFF + day1=D → ('eod', v) 의 v 가 1.
+    """
+    out: list[tuple[str, cp_model.IntVar]] = []
+    prev_main = getattr(rs, "prev_month_last_main", None)
+    if not isinstance(prev_main, dict) or not prev_main:
+        return out
+    for n in range(len(getattr(rs, "nurses", []) or [])):
+        # 월 중 입사자는 전월 꼬리가 의미 없고, day1 이 없으면 패턴이 성립하지 않는다.
+        if join[n] > 0 or leave[n] < 1:
+            continue
+        if active_days is not None and any((n, d) not in active_days for d in (0, 1)):
+            continue
+        last = str(prev_main.get(n) or "").strip().upper()
+        if last == "N":
+            targets = (("nod", day_idx), ("noe", eve_idx))
+        elif last == "E":
+            targets = (("eod", day_idx),)
+        else:
+            continue
+        for kind, tgt_idx in targets:
+            if tgt_idx is None:
+                continue
+            v = m.NewIntVar(0, 1, f"{prefix}xmonth_{kind}_{n}")
+            m.Add(v >= X(n, 0, off_idx) + X(n, 1, tgt_idx) - 1)
+            out.append((kind, v))
+    return out
+
+
 def _n_forbid_n_set(rs, join: list[int], leave: list[int]) -> set[int]:
     """N 전일 금지 간호사 인덱스 집합. initial_forbidden에서 모든 근무일에 N이 금지된 n만 반환."""
     n_forbid_n: set[int] = set()
@@ -995,6 +1055,13 @@ def build_main_objective_terms(
                 pat3 = m.NewIntVar(0, 1, f"EOD_{n}_{d}")
                 m.Add(pat3 >= X(n, d, eve) + X(n, d + 1, off) + X(n, d + 2, day) - 2)
                 obj.append(-NOD_NOE_PENALTY * pat3)
+        # 월 경계(전월 마지막 → day0/day1): 위 루프는 세 칸이 다 당월에 있어야 돌아 d=0 이전을 못 본다.
+        for _kind, _var in build_cross_month_pattern_vars(
+            m, rs, X, join, leave,
+            off_idx=off, day_idx=day, eve_idx=eve,
+            prefix="obj_", active_days=active_days,
+        ):
+            obj.append(-NOD_NOE_PENALTY * _var)
 
     # (4-5) 고립 OFF (sequential_offs ON일 때만, fallback과 동일)
     if getattr(cfg, "sequential_offs", True):
