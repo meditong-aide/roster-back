@@ -170,9 +170,11 @@ async def login_for_access_token(
                     Nurse.account_id == account_id
                 ).first()
                 if nurse_record is None:
+                    # ★ SSO(/token/login)와 같은 판정·같은 문구를 쓴다. 사유가 동일한데
+                    #   경로마다 문구가 다르면 사용자가 다른 문제로 오해한다.
                     raise HTTPException(
                         status_code=501,
-                        detail="등록되지 않은 사용자입니다.",
+                        detail="AI근무표 이용 대상이 아닙니다. 병동 수간호사에게 등록을 요청하세요.",
                     )
             except HTTPException:
                 raise
