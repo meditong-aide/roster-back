@@ -41,6 +41,9 @@ PARENT_FK_MAP = {
     "nurse_preceptee_period": ("nurses", "nurse_id"),
     "nurse_allowed_shift_period": ("nurses", "nurse_id"),
     "nurse_weekendoff_period": ("nurses", "nurse_id"),
+    # 2026-08 신규 — group_id 가 없어(nurse_id 만) group 모드에서 스코프를 잡을 수단이
+    # 이것뿐이다. 없으면 전체 미러로 빠져 다른 group 의 dev 행까지 지운다.
+    "nurse_leave_period": ("nurses", "nurse_id"),
 }
 
 # group_id 컬럼이 없지만 다른 컬럼(들)으로 group 스코프가 가능한 테이블.
@@ -73,6 +76,20 @@ REGENERATE_ID_TABLES = {
     #   ShiftManage.id 를 FK 로 참조하는 코드 없음(확인) · 스코프는
     #   office_id+group_id+year+month+shift_slot+nurse_class 로 유지되므로 재발번 안전.
     "shift_manage",
+    # ★ office 102243 마이그에서 PK 2627 로 **삽입이 통째로 실패**했다(2026-08-21 실측:
+    #   fixed_wanted_entries id=15484 · nurse_monthly_limits id=348 를 dev 타 office 가 점유).
+    #   dev 행은 이미 지워진 뒤라 그 office 데이터가 **비어버린다.**
+    #   `nurse_monthly_limits` 는 CONFLICT_DELETE_KEYS 에 있지만 그 키는
+    #   (nurse_id,group_id,year,month) **UNIQUE 기준**이라 surrogate id 충돌은 못 막는다.
+    #   두 테이블 모두 id 를 FK 로 참조하는 곳이 없고(확인) 스코프는
+    #   nurse_id/group_id+year+month 로 유지되므로 재발번이 안전하다.
+    "fixed_wanted_entries",
+    "nurse_monthly_limits",
+    # 2026-08 신규 — surrogate id 를 가진 3종. 같은 이유로 재발번한다
+    # (`wanted_monthly_memo` 는 PK 가 nurse_id+group_id+year+month 복합이라 대상 아님).
+    "banned_wanted_entries",
+    "nurse_leave_period",
+    "nurse_night_cycle",
 }
 
 # (table, mode) — FK 부모 → 자식 순서
@@ -113,6 +130,15 @@ SYNC_TABLES: List[tuple] = [
     ("nurse_weekendoff_period", "upsert"),
     ("nurse_preceptee_period", "upsert"),
     ("nurse_monthly_limits", "upsert"),
+    # ── 2026-08 배포 신규 4종 (기피근무 · 보건휴가/수면OFF · 나이트주기 · 월별메모) ──
+    # ★ 이 목록에 없으면 **조용히 복사에서 빠진다**(실측 2026-08-21: office 102243 마이그
+    #   직후 dev nurse_night_cycle 이 옛 1350행 그대로, prod 227 과 불일치).
+    #   신규 테이블을 만들면 여기에 반드시 등록한다. 컬럼 추가는 INSERT 문을 스키마에서
+    #   동적으로 만들므로 별도 등록이 필요 없다.
+    ("banned_wanted_entries", "upsert"),
+    ("nurse_leave_period", "upsert"),
+    ("nurse_night_cycle", "upsert"),
+    ("wanted_monthly_memo", "upsert"),
     ("messages", "upsert"),
     ("deleted_nurse_history", "upsert"),
     ("share_links", "upsert"),
@@ -451,25 +477,51 @@ def _wipe_by_parent_fk(
     return {"table": table, "mode": "wipe_by_parent", "deleted": deleted, "inserted": inserted}
 
 
-def _full_mirror_regen(db: Session, table: str) -> dict:
-    """REGENERATE_ID_TABLES 전체 미러: dev 전체 DELETE + prod 전체 INSERT(id 제외 재발번).
-    group_id 없는 leaf satellite → full-sync/exclude 모드에서 스코프 대상 아님(전체 교체).
+def _full_mirror_regen(
+    db: Session,
+    table: str,
+    include_group_ids: Optional[List[str]] = None,
+    exclude_group_ids: Optional[List[str]] = None,
+) -> dict:
+    """REGENERATE_ID_TABLES 미러: dev DELETE + prod INSERT(id 제외 재발번).
+
+    group_id 없는 leaf satellite → 스코프 수단이 없어 전체 교체(호출부가 PARENT_FK 로 우회).
+    ★ 테이블에 group_id 가 있으면 **스코프를 그대로 적용**한다 — include 면 그 group 만,
+      exclude 면 그 group 을 건드리지 않는다. 전체 교체는 스코프 밖 dev 데이터를 파괴한다.
     id 를 보존하지 않으므로 IDENTITY_INSERT 불필요(dev auto-gen), cross-dev/prod PK 충돌 없음."""
     dev_cols = _get_columns(db, DEV_DB, table)
     prod_cols = set(_get_columns(db, PROD_DB, table))
     common = [c for c in dev_cols if c in prod_cols and c.lower() != "id"]
     if not common:
         return {"table": table, "skipped": "no_common_cols", "mode": "full_regen"}
-    deleted = db.execute(text(f"DELETE FROM {DEV_DB}.dbo.[{table}]")).rowcount or 0
+    # ★ group 스코프 요청인데 이 테이블에 group_id 가 있으면 **전체 교체를 하지 않는다.**
+    #   전체 DELETE 는 문서화된 계약을 깨고 스코프 밖 dev 데이터를 통째로 날린다.
+    #     include → 그 group 만 교체(다른 group 보존)
+    #     exclude → 그 group 만 건드리지 않음(dev 기존 행 보존)
+    #   두 경우 모두 DELETE 와 SELECT 에 같은 조건을 건다.
+    scoped = "group_id" in prod_cols and bool(include_group_ids or exclude_group_ids)
+    where_dev = where_src = ""
+    params: dict = {}
+    if scoped:
+        where_dev, params = _group_filter_clause(include_group_ids, exclude_group_ids)
+        where_src, _ = _group_filter_clause(
+            include_group_ids, exclude_group_ids, alias="src"
+        )
+
+    deleted = db.execute(
+        text(f"DELETE FROM {DEV_DB}.dbo.[{table}]{where_dev}"), params
+    ).rowcount or 0
     col_list = ", ".join(f"[{c}]" for c in common)
     sel_list = ", ".join(f"src.[{c}]" for c in common)
     inserted = db.execute(
         text(
             f"INSERT INTO {DEV_DB}.dbo.[{table}] ({col_list}) "
-            f"SELECT {sel_list} FROM {PROD_DB}.dbo.[{table}] AS src"
-        )
+            f"SELECT {sel_list} FROM {PROD_DB}.dbo.[{table}] AS src{where_src}"
+        ),
+        params,
     ).rowcount or 0
-    return {"table": table, "mode": "full_regen", "deleted": deleted, "inserted": inserted}
+    return {"table": table, "mode": "group_regen" if scoped else "full_regen",
+            "deleted": deleted, "inserted": inserted}
 
 
 def _merge_upsert(
@@ -506,7 +558,7 @@ def _merge_upsert(
         parent_info = PARENT_FK_MAP.get(table)
         if include_group_ids and parent_info:
             return _wipe_by_parent_fk(db, table, parent_info, include_group_ids)
-        return _full_mirror_regen(db, table)
+        return _full_mirror_regen(db, table, include_group_ids, exclude_group_ids)
 
     # include_group_ids 지정 시 group_id 컬럼 없는 테이블 처리:
     # - PARENT_FK_MAP 매핑 있으면 부모 group_id 기반 wipe-by-parent 강제 (자식 overwrite)
