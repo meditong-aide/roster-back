@@ -4,28 +4,43 @@
   "targets": {
     "config": {
       "subs": [
-        "shift_codes"
+        "shift_codes",
+        "wanted_setting"
       ],
-      "hn_only": true
+      "hn_only": true,
+      "adm_only": false
     },
     "dashboard": {
       "subs": [],
-      "hn_only": false
+      "hn_only": false,
+      "adm_only": false
     },
     "home": {
       "subs": [],
-      "hn_only": false
+      "hn_only": false,
+      "adm_only": false
+    },
+    "mworks_register": {
+      "subs": [
+        "division",
+        "member",
+        "position"
+      ],
+      "hn_only": true,
+      "adm_only": true
     },
     "mypage": {
       "subs": [],
-      "hn_only": false
+      "hn_only": false,
+      "adm_only": false
     },
     "nurse_management": {
       "subs": [
         "grade_setting",
         "team_setting"
       ],
-      "hn_only": true
+      "hn_only": true,
+      "adm_only": false
     },
     "roster_create": {
       "subs": [
@@ -37,23 +52,35 @@
         "version",
         "wanted_config"
       ],
-      "hn_only": true
+      "hn_only": true,
+      "adm_only": false
     },
     "roster_view": {
       "subs": [],
-      "hn_only": false
+      "hn_only": false,
+      "adm_only": false
     },
     "roster_view_my": {
       "subs": [],
-      "hn_only": false
+      "hn_only": false,
+      "adm_only": false
     },
     "support": {
-      "subs": [],
-      "hn_only": false
+      "subs": [
+        "inquiry"
+      ],
+      "hn_only": false,
+      "adm_only": false
     },
     "wanted": {
       "subs": [],
-      "hn_only": false
+      "hn_only": false,
+      "adm_only": false
+    },
+    "wanted_board": {
+      "subs": [],
+      "hn_only": true,
+      "adm_only": false
     }
   }
 }

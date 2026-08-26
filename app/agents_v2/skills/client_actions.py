@@ -46,9 +46,22 @@ NAVIGATE_TARGETS: dict[str, dict[str, Any]] = {
     # 단일 뷰로 평탄화됨(탭 제거). weekoff/wanted_setting/month_off 는 roster_create 모달
     # 등으로 이동 → config 서브에서 제거(잘못 도착 방지). 원티드 설정은 roster_create 의
     # wanted_config 서브로 안내. (주휴/월오프의 새 위치는 확인 후 remap — 후속)
-    "config": {"subs": {"shift_codes"}, "hn_only": True},
+    "config": {"subs": {"shift_codes", "wanted_setting"}, "hn_only": True},
+    # 원티드 조정판(관리보드) — 수간호사가 확정/금지 원티드를 조정하는 화면.
+    #   ★ 프론트에서 dev/LOCAL 로만 노출되는 route 다(featureVisibility.isWantedBackVisible).
+    #     백엔드는 그 게이팅을 모르므로 emit 은 하고, 화면이 없으면 프론트 resolver 가
+    #     null 을 돌려 텍스트 안내로 폴백한다(잘못된 이동보다 안내가 낫다).
+    "wanted_board": {"subs": set(), "hn_only": True},
+    # mWorks 등록(엑셀 업로드) — 직위/부서/직원 등록. 신규 병원 온보딩의 진입점.
+    #   ★ **마스터 관리자 전용**이다(Nav 가 is_master_admin 으로 게이팅). HN 은 못 본다 —
+    #     hn_only 로 두면 HN 도 통과하므로 adm_only 를 따로 둔다.
+    "mworks_register": {
+        "subs": {"position", "division", "member"},
+        "hn_only": True,
+        "adm_only": True,
+    },
     "mypage": {"subs": set(), "hn_only": False},
-    "support": {"subs": set(), "hn_only": False},
+    "support": {"subs": {"inquiry"}, "hn_only": False},
 }
 
 # invoke 안전 명령 레지스트리 — 화면의 '버튼 클릭'을 에이전트가 대행하는 client-action.
@@ -90,6 +103,9 @@ def target_permission_error(target: Any, ctx: Any) -> str | None:
     meta = NAVIGATE_TARGETS.get(target)
     if not meta:
         return None
+    # adm_only 가 hn_only 보다 좁다 — HN 도 막는다(프론트 Nav 의 is_master_admin 게이팅과 일치).
+    if meta.get("adm_only") and getattr(ctx, "user_role", "") != "ADM":
+        return "해당 화면은 마스터 관리자(ADM) 전용입니다."
     if meta["hn_only"] and not _is_hn(ctx):
         return "해당 화면은 수간호사(HN) 또는 관리자(ADM) 전용입니다."
     return None

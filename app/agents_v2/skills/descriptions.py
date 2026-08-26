@@ -1525,7 +1525,16 @@ SKILL_TOOLS: list[dict] = [
             "근무표에 쓰는 코드·시간·원티드 반영 여부를 관리.\n"
             "  ⚠️ '원티드 반영 설정'은 roster_create 의 `wanted_config` 로, '월 오프수/주휴' 등 생성 "
             "관련 정책은 roster_create 모달로 안내하세요(config 에 더는 그 탭이 없음).\n"
-            "- `mypage` — 마이페이지 / `support` — 고객센터\n\n"
+            "- `wanted_board` — 원티드 조정판/관리보드(HN/ADM 전용). 확정 원티드·금지 근무를 "
+            "간호사×날짜 격자에서 조정하는 화면. '원티드 조정하러 가자', '금지근무 어디서 걸어?' 등.\n"
+            "  ⚠️ 실제 조정(승인/금지 걸기)은 화면 없이도 되는 게 많다 — bulk_mutation·"
+            "manage_banned_wanted 로 처리 가능하면 그쪽을 쓰고, 화면을 원할 때만 navigate.\n"
+            "- `mworks_register` — mWorks 등록/엑셀 업로드 화면(**마스터 관리자 전용**). "
+            "sub=`position`(직위 등록)·`division`(부서 등록)·`member`(직원 등록). "
+            "신규 병원 온보딩에서 사람을 처음 들여오는 진입점이다. "
+            "'직원 등록 어디서 해?', '엑셀 업로드 화면' 등.\n"
+            "  ⚠️ 병동 명단에 이미 있는 사람의 속성 변경은 여기가 아니라 nurse_management 다.\n"
+            "- `mypage` — 마이페이지 / `support` — 고객센터(sub=`inquiry` 문의내역)\n\n"
 
             "예) '팀 어디서 바꿔?' → target=nurse_management, sub=team_setting\n"
             # [NAV_FIRST_TEAMS 2026-06-19] 무필터 목록도 화면 이동 의도로 본다. 원복 시 이 줄 제거.
@@ -1534,6 +1543,8 @@ SKILL_TOOLS: list[dict] = [
             "예) '퇴사자 명단에서 삭제하려고' / '근무자 삭제' → target=nurse_management (sub 없이) + 수정 버튼 안내\n"
             "예) '김민지 8월 31일자로 퇴사 처리해줘' → navigate 아님. update_person_attr(field=resignation_date)\n"
             "예) '원티드 보러 가자' → target=wanted\n"
+            "예) '원티드 조정판 열어줘' / '금지근무 어디서 걸어?' → target=wanted_board\n"
+            "예) '직원 등록 어디서 해?' / '엑셀 업로드 화면' → target=mworks_register, sub=member\n"
             # [NAV_FIRST 2026-05-29] 아래 roster_view 예시 추가. 원복 시 이 줄 제거.
             "예) '근무표 보여줘' / '5월 근무표 보여줘' → target=roster_view\n"
             "예) '내 근무표 보여줘' → target=roster_view_my\n"
@@ -1553,7 +1564,8 @@ SKILL_TOOLS: list[dict] = [
                     "enum": [
                         "home", "dashboard", "wanted", "roster_view",
                         "roster_view_my", "nurse_management", "roster_create",
-                        "config", "mypage", "support",
+                        "config", "wanted_board", "mworks_register",
+                        "mypage", "support",
                     ],
                     "description": "이동할 화면 (closed enum). 목록에 없는 화면은 호출 금지.",
                 },
@@ -1561,9 +1573,10 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "enum": [
                         "team_setting", "grade_setting",
-                        "shift_codes",
+                        "shift_codes", "wanted_setting",
                         "manpower", "wanted_config", "deadline", "off_request",
                         "quick_config", "emergency", "version",
+                        "position", "division", "member", "inquiry",
                     ],
                     "description": (
                         "화면 내 섹션/탭/모달. "
@@ -1596,7 +1609,8 @@ SKILL_TOOLS: list[dict] = [
                     "enum": [
                         "home", "dashboard", "wanted", "roster_view",
                         "roster_view_my", "nurse_management", "roster_create",
-                        "config", "mypage", "support",
+                        "config", "wanted_board", "mworks_register",
+                        "mypage", "support",
                     ],
                     "description": "폼이 있는 화면 (closed enum).",
                 },
@@ -1604,9 +1618,10 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "enum": [
                         "team_setting", "grade_setting",
-                        "shift_codes",
+                        "shift_codes", "wanted_setting",
                         "manpower", "wanted_config", "deadline", "off_request",
                         "quick_config", "emergency", "version",
+                        "position", "division", "member", "inquiry",
                     ],
                     "description": "화면 내 섹션/탭/모달.",
                 },

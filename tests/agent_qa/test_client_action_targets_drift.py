@@ -18,7 +18,11 @@ _BACKEND_JSON = (
 
 def _expected_targets() -> dict:
     return {
-        name: {"subs": sorted(meta["subs"]), "hn_only": bool(meta["hn_only"])}
+        name: {
+            "subs": sorted(meta["subs"]),
+            "hn_only": bool(meta["hn_only"]),
+            "adm_only": bool(meta.get("adm_only", False)),
+        }
         for name, meta in NAVIGATE_TARGETS.items()
     }
 
@@ -43,3 +47,30 @@ def test_all_targets_have_canonical_metadata():
         assert "subs" in meta, f"{name}: 'subs' 키 누락"
         assert "hn_only" in meta, f"{name}: 'hn_only' 키 누락"
         assert isinstance(meta["subs"], (set, frozenset)), f"{name}: subs 가 set 이 아님"
+
+
+def test_adm_only_is_narrower_than_hn_only():
+    """adm_only 타깃은 hn_only 도 True 여야 한다 — 게이트가 역전되면 HN 이 통과한다."""
+    for name, meta in NAVIGATE_TARGETS.items():
+        if meta.get("adm_only"):
+            assert meta["hn_only"], f"{name}: adm_only 인데 hn_only=False (게이트 역전)"
+
+
+def test_mworks_register_blocks_head_nurse():
+    """mWorks 등록 화면은 마스터 관리자 전용 — 프론트 Nav 의 is_master_admin 게이팅과 일치.
+
+    hn_only 만으로는 HN 이 통과하므로 adm_only 가 실제로 막는지 확인한다.
+    """
+    from types import SimpleNamespace
+
+    from agents_v2.skills.client_actions import target_permission_error
+
+    hn = SimpleNamespace(user_role="HN")
+    adm = SimpleNamespace(user_role="ADM")
+    rn = SimpleNamespace(user_role="RN")
+
+    assert target_permission_error("mworks_register", hn) is not None
+    assert target_permission_error("mworks_register", rn) is not None
+    assert target_permission_error("mworks_register", adm) is None
+    # 대조군: 일반 HN 전용 화면은 HN 이 통과해야 한다(과차단 방지).
+    assert target_permission_error("nurse_management", hn) is None
