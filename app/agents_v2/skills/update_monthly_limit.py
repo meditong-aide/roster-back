@@ -20,11 +20,6 @@ def update_monthly_limit(db: Session, params: dict) -> Any:
         n_exact / n_min / n_max / d_exact / d_min / d_max / e_* / o_* 중 1개 이상.
         preview_only: bool — 기본 True (sensitive mutation).
     """
-    nurse_ids = params.get("nurse_ids") or []
-    if not nurse_ids:
-        return {"error": "nurse_id required (nurse_ids list 첫 entry 사용)"}
-    nurse_id = nurse_ids[0]
-
     group_id = params["group_id"]
     year = params.get("year")
     month = params.get("month")
@@ -32,6 +27,28 @@ def update_monthly_limit(db: Session, params: dict) -> Any:
         return {"error": "year/month required"}
 
     preview_only = params.get("preview_only", True)
+
+    # 병동 전체 일괄(나이트 개수) — 기존 서비스(night_bulk_apply_service)를 그대로 재사용.
+    # 대상자 선정·검증·조합에러가 그쪽 SSOT 이므로 에이전트가 루프를 돌면 규칙이 갈라진다.
+    if str(params.get("scope") or "").strip() in ("전체", "ward", "all"):
+        kind = params.get("bulk_kind") or ("고정" if params.get("n_exact") is not None else "최대")
+        value = params.get("n_exact") if params.get("n_exact") is not None else params.get("n_max")
+        if value is None:
+            return {
+                "error": "일괄 적용할 나이트 개수를 지정해 주세요.",
+                "hint": "예: n_exact=4(정확히 4번) 또는 n_max=4(최대 4번)",
+            }
+        return nurse_monthly_limit_tools.bulk_night_limit(
+            db, group_id, year, month,
+            kind=kind, value=value,
+            acting_user_id=params.get("acting_user_id"),
+            preview_only=preview_only,
+        )
+
+    nurse_ids = params.get("nurse_ids") or []
+    if not nurse_ids:
+        return {"error": "nurse_id required (nurse_ids list 첫 entry 사용)"}
+    nurse_id = nurse_ids[0]
 
     # 해제(설정 안 함) — unset 이 오면 지정 시프트(없으면 전체)의 한도를 NULL 로 기록.
     # 값 설정(updates)보다 우선 판정 — '월 한도 해제/없애줘/무제한' 의도.

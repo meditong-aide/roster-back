@@ -138,3 +138,105 @@ def _compose(summary: dict, codes: dict[str, dict]) -> str:
     return (
         f"{summary['year']}년 {summary['month']}월 자동 부여 결과 — " + ", ".join(parts) + "."
     )
+
+
+# ── 수면OFF 적용 상태 (읽기 전용) ─────────────────────────
+# 사용자 방침: **적용 여부 확인만** 열고 수치 조작은 열지 않는다.
+#   - 주기(sleep_off_cycle)·on/off(sleep_off_enabled) 는 생성 설정에 속하고,
+#   - nurse_night_cycle 의 연번/이월은 근무표 확정이 만들어내는 **파생 상태**다.
+# 둘 다 사람이 손으로 고칠 값이 아니라, 잘못 만지면 다음 달 판정이 통째로 어긋난다.
+# 그래서 이 모듈에는 쓰기 함수를 두지 않는다(추가 요청이 와도 여기 두지 말 것).
+
+
+def read_sleep_off_status(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+    *,
+    nurse_ids: list[str] | None = None,
+) -> dict:
+    """수면OFF 자동부여 설정 + 간호사별 주기 상태. **읽기 전용.**"""
+    from db.models import NurseNightCycle, RosterConfig
+    from services.leave.night_cycle_service import (
+        DEFAULT_CYCLE,
+        resolve_cycle,
+        resolve_sleep_off_shift,
+    )
+
+    cfg = (
+        db.query(RosterConfig)
+        .filter(RosterConfig.group_id == group_id)
+        .order_by(RosterConfig.created_at.desc())
+        .first()
+    )
+    raw_enabled = getattr(cfg, "sleep_off_enabled", None) if cfg else None
+    raw_cycle = getattr(cfg, "sleep_off_cycle", None) if cfg else None
+
+    try:
+        shift = resolve_sleep_off_shift(db, group_id)
+    except Exception:  # noqa: BLE001
+        shift = None
+
+    cycle = resolve_cycle(db, group_id)
+    # 코드가 없으면 설정이 켜져 있어도 후처리가 아무것도 못 한다 — 그 함정을 드러낸다.
+    effective = bool(raw_enabled) and shift is not None
+
+    q = (
+        db.query(NurseNightCycle, Nurse.name)
+        .outerjoin(Nurse, Nurse.nurse_id == NurseNightCycle.nurse_id)
+        .filter(
+            NurseNightCycle.group_id == group_id,
+            NurseNightCycle.year == int(year),
+            NurseNightCycle.month == int(month),
+        )
+    )
+    if nurse_ids:
+        q = q.filter(NurseNightCycle.nurse_id.in_([str(n) for n in nurse_ids]))
+    try:
+        rows = q.all()
+    except Exception as exc:  # noqa: BLE001 — 테이블 미생성 시 조회만 비운다
+        if NurseNightCycle.__tablename__ not in str(exc):
+            raise
+        db.rollback()
+        rows = []
+
+    nurses = [
+        {
+            "nurse": name or str(r.nurse_id),
+            "월말_N연번": r.seq_at_end,
+            "이월_미부여": r.pending_sleep,
+            "이번달_부여": r.sleep_off_count,
+            "누적_회차": r.sleep_off_seq,
+        }
+        for r, name in sorted(rows, key=lambda x: (x[1] or ""))
+    ]
+
+    if not effective:
+        why = ("설정이 꺼져 있습니다" if not raw_enabled
+               else "수면OFF 근무코드가 지정돼 있지 않습니다")
+        msg = f"{year}년 {month}월 수면OFF 자동 부여는 **적용되지 않습니다** — {why}."
+    else:
+        given = sum(int(n["이번달_부여"] or 0) for n in nurses)
+        pend = sum(int(n["이월_미부여"] or 0) for n in nurses)
+        msg = (f"{year}년 {month}월 수면OFF 자동 부여 **적용 중**"
+               f"(주기 N{cycle}, 코드 {shift.shift_id}). "
+               f"이 달 부여 {given}건, 다음 달 이월 {pend}건.")
+
+    return {
+        "read_only": True,
+        "year": int(year),
+        "month": int(month),
+        "적용": effective,
+        "설정_on": raw_enabled,
+        "주기": cycle,
+        "주기_출처": "설정값" if raw_cycle else f"코드 기본값({DEFAULT_CYCLE})",
+        "코드": {"code": shift.shift_id, "name": getattr(shift, "name", None)} if shift else None,
+        "간호사수": len(nurses),
+        "nurses": nurses,
+        "message": msg,
+        "note": (
+            "주기·on/off 는 근무표 생성 설정에 속하고, 연번·이월은 근무표 확정이 만드는 "
+            "파생 상태입니다. 에이전트로는 조회만 가능하며 값 변경은 지원하지 않습니다."
+        ),
+    }

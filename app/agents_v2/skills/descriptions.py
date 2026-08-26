@@ -114,7 +114,8 @@ SKILL_TOOLS: list[dict] = [
             "- '자동생성 어디까지 됐어' → scope=generation_job\n"
             "- '이번 달 시프트 종류' → scope=shift_definitions\n"
             "- '이번 달 보건휴가 누가 받았어' / '수면오프 몇 건 나갔어' → scope=leave_summary\n"
-            "- '이번 달 원티드 메모 남긴 사람 있어' → scope=wanted_memo"
+            "- '이번 달 원티드 메모 남긴 사람 있어' → scope=wanted_memo\n"
+            "- '수면오프 적용되고 있어?' / '수면오프 주기 몇이야' → scope=sleep_off_status"
         ),
         "parameters": {
             "type": "object",
@@ -133,6 +134,7 @@ SKILL_TOOLS: list[dict] = [
                         "monthly_limit",
                         "leave_summary",
                         "wanted_memo",
+                        "sleep_off_status",
                     ],
                     "description": (
                         "조회 도메인. 사용자가 묻는 정보가 어느 데이터 영역에 속하는지로 결정. "
@@ -146,7 +148,10 @@ SKILL_TOOLS: list[dict] = [
                         "휴가 자동부여 **결과** (예: '이번 달 보건휴가 누가 받았어', '수면오프 몇 건 나갔어')=leave_summary "
                         "— 누구를 대상으로 **설정**할지는 manage_leave_targets 이다(결과 조회와 구분), "
                         "원티드 작성 화면에 남긴 월별 메모(예: '이번 달 원티드 메모 있어?')=wanted_memo "
-                        "— 신청한 근무(wanted_adjustment)와 다른, 자유 서술 메모다"
+                        "— 신청한 근무(wanted_adjustment)와 다른, 자유 서술 메모다, "
+                        "수면OFF 자동부여 **적용 여부·주기 상태** (예: '수면오프 적용되고 있어?', "
+                        "'김민지 나이트 연번 어디까지야')=sleep_off_status "
+                        "— 조회 전용이다. 주기·연번 값 변경은 지원하지 않으니 요청받으면 안 된다고 답하라"
                     ),
                 },
                 "operation": {
@@ -979,8 +984,20 @@ SKILL_TOOLS: list[dict] = [
             "  ⓘ 해제는 값을 NULL 로 기록하되 '이 달 명시적 한도 없음'을 보존해, 과거 달의\n"
             "     한도가 다시 상속되는 것을 막습니다(행 삭제 아님).\n\n"
 
+            "─────────── 병동 전체 일괄 (나이트만) ───────────\n"
+            "  scope='전체' → 병동의 **야간 가능 근무자 전원**에게 같은 나이트 개수를 각자의\n"
+            "  월 한도로 써 넣는다(간호사 이름 불필요). 대상은 서버가 자동 선정.\n"
+            "  '고정'(n_exact=정확히) 과 '최대'(n_max=그 이하)를 반드시 구분할 것.\n"
+            "  ⚠️ 나이트(N)만 지원 — D/E/OFF 일괄은 없다(개인별로 처리).\n"
+            "  ⚠️ **update_constraint 와 혼동 금지** — 아래 경계 참조. 애매하면 되물어라.\n\n"
+
             "─────────── 인접 skill 과의 경계 ───────────\n"
-            "- '병동 전체 야간 최대 7회' (정책) → update_constraint (max_nig_per_month)\n"
+            "- '병동 전체 야간 최대 7회' (**정책/제약** — 솔버가 지키는 병동 규칙 1개)\n"
+            "    → update_constraint (max_nig_per_month)\n"
+            "- '전원 나이트 5번으로 맞춰줘' (**개인 월 한도를 전원에게 동일 기입** — 간호사 수만큼 행 생성)\n"
+            "    → update_monthly_limit (scope='전체')\n"
+            "  ⓘ 둘은 저장 위치가 다르다(config vs NurseMonthlyLimit). 발화가 '규칙/제한을 건다'에\n"
+            "     가까우면 전자, '사람들 값을 채운다'에 가까우면 후자. 판단이 안 서면 사용자에게 물어라.\n"
             "- '김민지 야간 전담' (개인 속성) → update_person_attr (allowed_shifts)\n"
             "- '김민지 5월 야간 4번' (개인 월 한도) → update_monthly_limit (n_exact)\n\n"
 
@@ -990,7 +1007,9 @@ SKILL_TOOLS: list[dict] = [
             "예시:\n"
             "- '김민지 5월 야간 4번' → nurse_ids=['김민지의 nurse_id'], year=2026, month=5, n_exact=4\n"
             "- '박혜미 5월 D 최소 8회' → nurse_ids=[...], year=2026, month=5, d_min=8\n"
-            "- '김민지 5월 월 한도 해제' → nurse_ids=[...], year=2026, month=5, unset=['all']"
+            "- '김민지 5월 월 한도 해제' → nurse_ids=[...], year=2026, month=5, unset=['all']\n"
+            "- '이번 달 전원 나이트 5번으로' → scope='전체', n_exact=5 (bulk_kind='고정')\n"
+            "- '다들 나이트 최대 4회 넘지 않게' → scope='전체', n_max=4 (bulk_kind='최대')"
         ),
         "parameters": {
             "type": "object",

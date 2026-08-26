@@ -57,6 +57,8 @@ def query_schedule(db: Session, params: dict) -> Any:
         return _query_leave_summary(db, group_id, year, month)
     elif scope == "wanted_memo":
         return _query_wanted_memo(db, group_id, year, month, params)
+    elif scope == "sleep_off_status":
+        return _query_sleep_off_status(db, group_id, year, month, params)
     else:
         # Fallback: try schedule
         return _query_schedule_entries(db, group_id, year, month, params)
@@ -96,6 +98,19 @@ def _query_wanted_memo(db, group_id, year, month, params):
             else f"{year}년 {month}월에 작성된 원티드 메모가 없어요."
         ),
     }
+
+
+def _query_sleep_off_status(db, group_id, year, month, params):
+    """수면OFF 자동부여 적용 여부 + 간호사별 주기 상태 (읽기 전용).
+
+    ★ 조회만 연다 — 주기/on-off 는 생성 설정이고 연번·이월은 근무표 확정이 만드는
+      파생 상태라, 에이전트가 값을 고치면 다음 달 판정이 통째로 어긋난다.
+    """
+    if year is None or month is None:
+        return {"error": "year/month required for sleep_off_status scope"}
+    return leave_tools.read_sleep_off_status(
+        db, group_id, int(year), int(month), nurse_ids=params.get("nurse_ids") or None
+    )
 
 
 def _query_leave_summary(db, group_id, year, month):

@@ -286,3 +286,110 @@ def _to_dict(
     for f in LIMIT_FIELDS:
         d[f] = getattr(row, f)
     return d
+
+
+# ── 병동 전체 일괄 (나이트 개수) ──────────────────────────
+# 단일 간호사 upsert 와 달리 **기존 서비스(night_bulk_apply_service)를 그대로 재사용**한다.
+# 그 서비스가 대상자 선정(야간 가능자만)·검증·조합 에러(_ko)·upsert 를 이미 SSOT 로
+# 갖고 있어, 에이전트가 자체 루프를 돌면 규칙이 갈라진다(월한도 검증이 두 벌이 됨).
+
+_BULK_KIND = {"고정": "fixed", "최대": "max", "fixed": "fixed", "max": "max"}
+
+
+def _n_capable_nurses(db: Session, group_id: str) -> list:
+    """야간 가능 active 근무자 — night_bulk_apply_service 와 동일 기준(미리보기용)."""
+    from services.precheck.monthly_limit_validator import _allowed_work_shifts
+
+    rows = db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.active == 1).all()
+    return [n for n in rows if "N" in (_allowed_work_shifts(n) or {"D", "E", "N"})]
+
+
+def _acting_user(db: Session, acting_user_id: str | None):
+    """SessionContext 의 nurse_id → 권한 검사용 UserSchema.
+
+    ★ 우회가 아니다 — 서비스의 권한 판정은 `account_id` 로 **DB(nurses)를 다시 읽어**
+      수간호사 여부를 확인한다. 여기서는 실제 간호사 행의 account_id 를 실어 보낼 뿐이라
+      판정 권위는 그대로 DB 에 있다. 표시용 필드는 검사에 쓰이지 않아 빈 값으로 채운다.
+    """
+    from schemas.auth_schema import User as UserSchema
+
+    n = db.query(Nurse).filter(Nurse.nurse_id == str(acting_user_id or "")).first()
+    if n is None:
+        return None
+    return UserSchema(
+        nurse_id=str(n.nurse_id),
+        account_id=str(getattr(n, "account_id", "") or ""),
+        office_id=str(getattr(n, "office_id", "") or ""),
+        group_id=str(getattr(n, "group_id", "") or ""),
+        is_head_nurse=bool(getattr(n, "is_head_nurse", False)),
+        name=str(getattr(n, "name", "") or ""),
+        mb_part="", office_name="", mb_part_name="",
+        gw_useYN="", qpis_useYN="", official_title_name=None,
+        hn_auth=getattr(n, "hn_auth", None),
+    )
+
+
+def bulk_night_limit(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+    *,
+    kind: str,
+    value: int,
+    acting_user_id: str | None = None,
+    preview_only: bool = True,
+) -> dict:
+    """병동 전체(야간 가능자)에 나이트 개수를 일괄 적용. kind='고정'|'최대'.
+
+    preview_only=True 면 DB 를 건드리지 않고 대상 인원만 세어 돌려준다.
+    """
+    resolved = _BULK_KIND.get(str(kind).strip().lower())
+    if resolved is None:
+        return {"error": f"kind 는 '고정'(n_exact) 또는 '최대'(n_max) 여야 합니다: {kind}"}
+    if value is None or int(value) < 0:
+        return {"error": "나이트 개수를 0 이상으로 지정해 주세요."}
+
+    targets = _n_capable_nurses(db, group_id)
+    if not targets:
+        return {"error": "이 병동에 야간 가능 근무자가 없습니다."}
+
+    label = "고정(정확히)" if resolved == "fixed" else "최대"
+    summary = {
+        "scope": "ward",
+        "year": year,
+        "month": month,
+        "kind": label,
+        "value": int(value),
+        "대상_인원": len(targets),
+        "대상": sorted(str(getattr(n, "name", n.nurse_id)) for n in targets),
+    }
+    if preview_only:
+        return {"preview": True, "operation": "bulk_night", "summary": summary}
+
+    user = _acting_user(db, acting_user_id)
+    if user is None:
+        return {"error": "요청자 정보를 확인할 수 없어 일괄 적용을 할 수 없습니다."}
+
+    from services.nurse_monthly_limit_service import night_bulk_apply_service
+
+    try:
+        items, _meta, warnings = night_bulk_apply_service(
+            db, user, group_id=group_id, year=year, month=month,
+            kind=resolved, value=int(value),
+        )
+    except Exception as exc:  # noqa: BLE001 — 422 조합 에러를 문장으로 전달
+        detail = getattr(exc, "detail", None)
+        return {"error": str(detail) if detail else str(exc)}
+
+    return {
+        "ok": True,
+        "operation": "bulk_night",
+        "summary": summary,
+        "applied_count": len(items or []),
+        "warnings": [getattr(w, "message_ko", None) or str(w) for w in (warnings or [])],
+        "message": (
+            f"{year}년 {month}월 야간 가능 근무자 {len(targets)}명의 나이트 개수를 "
+            f"{label} {value}회로 일괄 적용했습니다."
+        ),
+    }
