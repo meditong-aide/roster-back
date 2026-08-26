@@ -256,6 +256,13 @@ async def send_message(
     ctx.variable_memory = conv.variable_memory or {}
     ctx.pending_approval = conv.pending_approval
     ctx.ui_metadata = req.ui_metadata
+    # 직전 턴 라우팅 스코프 + "되물었는가" — 후속 턴 스코프 재사용의 입력.
+    _lr = conv.last_route or {}
+    ctx.last_route = (
+        {"categories": _lr.get("categories") or [], "tool_names": _lr.get("tool_names") or []}
+        if _lr.get("tool_names") else None
+    )
+    ctx.awaited_reply = bool(_lr.get("awaited_reply"))
 
     # Agent run
     try:
@@ -284,6 +291,16 @@ async def send_message(
         pending = result.preview if result.awaiting_approval else None
         store.set_pending_approval(
             db, conv_id, pending,
+            user_id=current_user.nurse_id,
+            group_id=current_user.group_id,
+        )
+        # 라우팅 스코프 + 되물음 여부 — 다음 턴이 그 답이면 라우터를 건너뛴다.
+        # 스코프가 없으면(fallback 턴) 저장하지 않는다 — 전체 tool 을 재사용해봐야 의미 없음.
+        _scope = ctx.last_route or {}
+        store.set_last_route(
+            db, conv_id,
+            {**_scope, "awaited_reply": bool(result.needs_clarification)}
+            if _scope.get("tool_names") else None,
             user_id=current_user.nurse_id,
             group_id=current_user.group_id,
         )

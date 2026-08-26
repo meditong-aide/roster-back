@@ -522,6 +522,10 @@ class SchedulingAgent:
         # 이번 턴의 모든 OK 조회 결과 — L2 는 (마지막 하나가 아니라) 턴 전체 데이터로 대조해야
         # 복합쿼리("A랑 B 각각")에서 오탐이 안 난다.
         turn_query_data: list = []
+        # 이번 턴이 사용자에게 되물었는가(스킬이 CLARIFICATION 을 냈는가).
+        # DAG 경로는 AgentResult(needs_clarification=True) 를 이미 세팅하는데 ReAct 경로는
+        # 안 해서 비대칭이었다 — 다음 턴이 "그 물음의 답"인지 알 수 없었다.
+        turn_clarified = False
 
         # Restore VM from previous turns
         if ctx.variable_memory:
@@ -531,7 +535,45 @@ class SchedulingAgent:
         # 질의를 LLM이 카테고리로 분류 → scoped tool subset 으로 (a) system prompt 의
         # '## 사용 가능한 도구' 섹션, (b) chat(tools=) 둘 다 스코핑. fallback(분류 실패/
         # 저신뢰)이면 전체 tool 유지(턴 안 깨짐). pending_approval 턴은 tools= 를 안 쓰므로 스킵.
-        if self.router_llm is not None and not ctx.pending_approval:
+        # ── 후속 턴 스코프 재사용 (라우터 호출 0회) ──────────────────────
+        # 직전 턴이 사용자에게 되물었으면(awaited_reply) 이번 발화는 그 답이다 —
+        # "아무거나" / "그래" / "1" 처럼 단독으로는 분류 불가라 라우터가 fallback 하고
+        # tool 전체(29개)를 싣던 구간(실측 703턴 중 108턴, 15%). 직전 스코프를 그대로
+        # 재사용해 호출과 토큰을 둘 다 없앤다.
+        #
+        # ★ 안전 방향: 판단 근거는 발화 길이가 아니라 **직전 턴의 구조적 상태**다.
+        #   틀려도 "정상 라우팅"으로만 떨어지도록, 재사용 조건이 아니면 기존 경로를 탄다.
+        #   메인 에이전트는 어차피 대화 이력 전체를 보므로 답변 맥락은 손실되지 않는다.
+        reused_route: dict | None = None
+        if (
+            self.router_llm is not None
+            and not ctx.pending_approval
+            and getattr(ctx, "awaited_reply", False)
+            and getattr(ctx, "last_route", None)
+        ):
+            reused_route = ctx.last_route
+            allowed = list(reused_route.get("tool_names") or [])
+            if allowed:
+                scoped_prompt = build_system_prompt(ctx, allowed_tools=allowed)
+                if self.enable_user_memory:
+                    _mb = self._format_memory_block(current_user_facts)
+                    if _mb:
+                        scoped_prompt = f"{scoped_prompt}\n\n---\n\n{_mb}"
+                if messages and messages[0].get("role") == "system":
+                    messages[0] = {"role": "system", "content": scoped_prompt}
+                _allowed_set = set(allowed)
+                tools = [t for t in SKILL_TOOLS if t["name"] in _allowed_set] or SKILL_TOOLS
+                trace.append(Stage(
+                    "router_reuse", "ok",
+                    {"categories": reused_route.get("categories"), "tools": len(allowed)}, 0,
+                ))
+                log_dev_query(
+                    reused_route.get("categories"), user_message, ctx.conversation_id
+                )
+            else:
+                reused_route = None
+
+        if self.router_llm is not None and not ctx.pending_approval and reused_route is None:
             t_route = time.time()
             with obs.purpose("router"):
                 router_result = route(self.router_llm, user_message)
@@ -550,6 +592,12 @@ class SchedulingAgent:
                     messages[0] = {"role": "system", "content": scoped_prompt}
                 allowed_set = set(allowed)
                 tools = [t for t in SKILL_TOOLS if t["name"] in allowed_set]
+                # 다음 턴이 "이 물음의 답"이면 재사용할 스코프로 기억한다.
+                # fallback(분류 실패) 스코프는 전체 tool 이라 기억할 값어치가 없다.
+                ctx.last_route = {
+                    "categories": list(router_result.categories),
+                    "tool_names": list(allowed),
+                }
             trace.append(
                 Stage("routing", "ok", router_result.to_dict(), route_ms)
             )
@@ -629,6 +677,7 @@ class SchedulingAgent:
                     messages=messages,
                     variable_memory=vm.to_dict(),
                     data=last_query_data,
+                    needs_clarification=turn_clarified,
                 )
 
             # ── Tool call(s) → middleware pipeline ──
@@ -741,12 +790,13 @@ class SchedulingAgent:
                     # B7: 인라인 렌더용 데이터 누적 — 마지막 성공 조회 결과가 이긴다.
                     # error / needs_clarification / preview 는 데이터 의미가 없어 제외.
                     # §3.C: 3개 판별식을 outcome taxonomy 단일 분류(OK)로 통합.
-                    if (
-                        result.data is not None
-                        and _classify_outcome(result.data) is ErrorType.OK
-                    ):
+                    _outcome = _classify_outcome(result.data)
+                    if result.data is not None and _outcome is ErrorType.OK:
                         last_query_data = result.data
                         turn_query_data.append(result.data)
+                    elif _outcome is ErrorType.CLARIFICATION:
+                        # 되물음으로 끝난 턴 — 다음 발화는 그 답이다(라우터 스코프 재사용 근거).
+                        turn_clarified = True
 
                     # ── Auto-learn abbreviation tracking ──
                     _track_shift_learning(

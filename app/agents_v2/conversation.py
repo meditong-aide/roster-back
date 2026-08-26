@@ -23,6 +23,14 @@ from services.memory.session_repo import SessionMemoryRepo, _is_missing_table_er
 # AgentConversation 스키마에 별도 컬럼 없이 vm_json 에 함께 직렬화한다.
 _PENDING_APPROVAL_VM_KEY = "__pending_approval__"
 
+# 직전 턴의 라우팅 스코프 + "되물었는가" 플래그. pending_approval 과 같은 방식으로
+# vm_json 안에 예약키로 실어 보관한다(스키마 변경 없이 턴 간 유지).
+#   {"categories": [...], "tool_names": [...], "awaited_reply": bool}
+_LAST_ROUTE_VM_KEY = "__last_route__"
+
+# 호출자에게 노출되지 않는 내부 예약키 전체 — vm_clean 에서 걸러낸다.
+_RESERVED_VM_KEYS = (_PENDING_APPROVAL_VM_KEY, _LAST_ROUTE_VM_KEY)
+
 
 @dataclass
 class Conversation:
@@ -32,6 +40,8 @@ class Conversation:
     messages: list[dict] = field(default_factory=list)
     pending_approval: dict | None = None
     variable_memory: dict[str, Any] = field(default_factory=dict)
+    #: 직전 턴 라우팅 스코프 + awaited_reply. 없으면 None.
+    last_route: dict | None = None
 
 
 def _split_pending(vm: dict[str, Any]) -> tuple[dict[str, Any], dict | None]:
@@ -43,6 +53,17 @@ def _split_pending(vm: dict[str, Any]) -> tuple[dict[str, Any], dict | None]:
         return dict(vm), None
     clean = {k: v for k, v in vm.items() if k != _PENDING_APPROVAL_VM_KEY}
     return clean, pending
+
+
+def _split_reserved(vm: dict[str, Any]) -> tuple[dict[str, Any], dict | None, dict | None]:
+    """vm dict → (호출자용 clean vm, pending_approval, last_route).
+
+    예약키는 전부 걸러낸다 — 안 걸러내면 스킬 파라미터로 흘러들어간다.
+    """
+    if not vm:
+        return {}, None, None
+    clean = {k: v for k, v in vm.items() if k not in _RESERVED_VM_KEYS}
+    return clean, vm.get(_PENDING_APPROVAL_VM_KEY), vm.get(_LAST_ROUTE_VM_KEY)
 
 
 class ConversationStore:
@@ -139,7 +160,7 @@ class ConversationStore:
             if group_id is not None and conv_row.group_id != group_id:
                 return None
 
-        vm_clean, pending = _split_pending(vm_full)
+        vm_clean, pending, last_route = _split_reserved(vm_full)
         # TTL 갱신 — 활성 세션 표시
         repo.touch_ttl(conv_id, group_id=gid_filter)
         return Conversation(
@@ -147,6 +168,7 @@ class ConversationStore:
             messages=messages,
             pending_approval=pending,
             variable_memory=vm_clean,
+            last_route=last_route,
         )
 
     def get_or_create(
@@ -182,16 +204,37 @@ class ConversationStore:
         user_id: str | None = None,
         group_id: str | None = None,
     ) -> None:
-        """variable_memory 저장. 기존 pending_approval 은 그대로 유지."""
+        """variable_memory 저장. 기존 예약키(pending_approval·last_route)는 그대로 유지."""
         uid = self._resolve_user_id(user_id)
         gid = self._resolve_group_id(group_id)
         repo = self._repo(db)
-        # 기존 vm 의 pending_approval 보존
+        # 기존 vm 의 예약키 보존 — 호출자는 clean vm 만 넘기므로 여기서 되살린다.
         prev = repo.load_variable_memory(conv_id, group_id=gid)
-        merged: dict[str, Any] = dict(vm_data)
-        prev_pending = prev.get(_PENDING_APPROVAL_VM_KEY)
-        if prev_pending is not None:
-            merged[_PENDING_APPROVAL_VM_KEY] = prev_pending
+        merged: dict[str, Any] = {
+            k: v for k, v in dict(vm_data).items() if k not in _RESERVED_VM_KEYS
+        }
+        for key in _RESERVED_VM_KEYS:
+            prev_val = prev.get(key)
+            if prev_val is not None:
+                merged[key] = prev_val
+        repo.save_variable_memory(conv_id, uid, gid, merged)
+
+    def set_last_route(
+        self,
+        db: Session,
+        conv_id: str,
+        last_route: dict | None,
+        user_id: str | None = None,
+        group_id: str | None = None,
+    ) -> None:
+        """직전 턴 라우팅 스코프 저장(None 이면 제거). pending_approval 과 독립."""
+        uid = self._resolve_user_id(user_id)
+        gid = self._resolve_group_id(group_id)
+        repo = self._repo(db)
+        prev = repo.load_variable_memory(conv_id, group_id=gid)
+        merged = {k: v for k, v in prev.items() if k != _LAST_ROUTE_VM_KEY}
+        if last_route is not None:
+            merged[_LAST_ROUTE_VM_KEY] = last_route
         repo.save_variable_memory(conv_id, uid, gid, merged)
 
     def set_pending_approval(

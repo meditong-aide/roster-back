@@ -42,6 +42,15 @@ class SessionContext:
     pending_clarify: dict | None = None
     clarify_answers: list[dict] | None = None
 
+    # 직전 턴의 라우팅 결과 — 후속 턴 스코프 재사용용.
+    #   {"categories": [...], "tool_names": [...]}
+    # 직전 턴이 사용자에게 되물었다면(awaited_reply) 이번 발화는 그 답이므로 주제가
+    # 같다. 라우터를 다시 부르지 않고 이 스코프를 그대로 쓴다(LLM 호출 0회).
+    last_route: dict | None = None
+    # 직전 턴이 clarification 으로 끝났는가(= 사용자에게 되물었는가).
+    # 승인대기(pending_approval)는 별도 필드가 이미 담당한다.
+    awaited_reply: bool = False
+
     # 자율성 모드 (HITL 3-tier). mutation 승인 정책을 고른다.
     #   "manual"      — 모든 mutation 은 preview→사용자 승인 (현행, 안전 기본)
     #   "auto"        — read/navigate 자동, mutation 은 여전히 승인 (추후)
