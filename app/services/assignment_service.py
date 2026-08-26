@@ -391,6 +391,54 @@ def _validate_assignment_team_grade_or_raise(
         )
 
 
+
+def _assert_no_active_issued_roster(db: Session, group_id: str, start_date: date) -> None:
+    """발효월 이후에 **활성 발행본**이 있으면 병동이동을 거부한다.
+
+    ★ 왜 막는가 — 발행본은 간호사들에게 이미 배포된 확정 근무표다. 그 달 표는 옛 병동
+      기준으로 만들어졌는데 원장(`nurse_assignments`)만 바꾸면, 재생성·이관 이력 계산이
+      배포본과 어긋난다. 표는 그대로인데 "그 달 소속"만 달라지는 상태가 된다.
+
+    ★ 과거월 자체는 막지 않는다(사용자 결정 2026-08-26). 입력 누락을 뒤늦게 발견해
+      소급 정정하는 경우가 실제로 있어, 차단하면 복구 수단이 사라진다. 막는 것은
+      **발행된 달**뿐이다 — 발행을 취소하면 다시 이동할 수 있다.
+
+    ★ 판정 스코프는 **source 그룹**이다. 그 달 그 간호사가 실린 표가 source 것이므로.
+    """
+    from db.models import IssuedRosterSnapshot
+
+    if not group_id:
+        return
+    ym = start_date.year * 12 + start_date.month
+    try:
+        rows = (
+            db.query(IssuedRosterSnapshot.year, IssuedRosterSnapshot.month)
+            .filter(
+                IssuedRosterSnapshot.group_id == group_id,
+                IssuedRosterSnapshot.is_active_issued == True,  # noqa: E712
+                IssuedRosterSnapshot.year.isnot(None),
+                IssuedRosterSnapshot.month.isnot(None),
+            )
+            .all()
+        )
+    except Exception:  # noqa: BLE001 — 판정 불가 시 기존 동작 유지(막지 않음)
+        return
+
+    blocked = sorted(
+        {(int(y), int(m)) for y, m in rows if int(y) * 12 + int(m) >= ym}
+    )
+    if not blocked:
+        return
+    shown = ", ".join(f"{y}년 {m}월" for y, m in blocked[:3])
+    more = f" 외 {len(blocked) - 3}건" if len(blocked) > 3 else ""
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"이미 발행된 근무표가 있어 병동이동을 적용할 수 없습니다 ({shown}{more}). "
+            "발행을 취소한 뒤 다시 시도하거나, 발행본이 없는 달부터 이동해 주세요."
+        ),
+    )
+
 def create_assignment(
     req: NurseAssignmentCreate,
     db: Session,
@@ -420,6 +468,7 @@ def create_assignment(
     # 병동이동 체인 검증 (source가 직전 target 또는 현재 group_id 와 일치)
     if req.reason == "병동이동":
         _assert_transfer_chain_source(db, req.nurse_id, req.source_group_id)
+        _assert_no_active_issued_roster(db, req.source_group_id, req.start_date)
 
     # 파견/병동이동: target_group_id 필수 + source != target 검증
     _assert_valid_inbound_target(req.reason, req.source_group_id, req.target_group_id)
