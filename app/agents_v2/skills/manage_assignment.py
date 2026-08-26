@@ -47,6 +47,18 @@ MANAGE_ASSIGNMENT_SCHEMA: dict = {
         "- `create` — 등록. nurse_name + target_ward + start_date 필요. (파견은 end_date 도 가능)\n"
         "- `cancel` — 활성 배정 취소. nurse_name 으로 대상을 찾습니다.\n\n"
 
+        "─────────── ★ '다시 원래대로' 는 둘 중 하나다 ───────────\n"
+        "같은 말처럼 들려도 남는 기록이 정반대다. 반드시 어느 쪽인지 가려서 처리하라.\n"
+        "- **입력 실수를 무르기** → `cancel`. 애초에 일어나지 않았어야 할 배정을 지운다.\n"
+        "    예) '아까 잘못 눌렀어', '그거 취소해줘', '잘못 등록했어'\n"
+        "- **실제로 되돌아온 것** → `create` 로 **반대 방향 병동이동을 새로 등록**.\n"
+        "    예) '김민지 10월에 원래 병동으로 복귀해', '다시 9A로 돌아와'\n"
+        "    8월엔 B, 10월엔 A였던 것이 **사실**이므로 이력에 남아야 한다. cancel 하면\n"
+        "    그 기간이 통째로 사라져 과거 월 조회가 틀린다.\n"
+        "  ⓘ 되돌아오는 이동은 특별한 연산이 아니다 — 그냥 반대 방향 create 다\n"
+        "    (이동 체인이 직전 target 을 새 source 로 받으므로 자연히 이어진다).\n"
+        "  ⚠️ 애매하면 **되물어라**. '취소'와 '복귀'는 되돌리기 비용이 다르다.\n\n"
+
         "─────────── 파라미터 ───────────\n"
         "- `kind` — '파견' 또는 '병동이동'. 기본 '파견'.\n"
         "- `nurse_name` — 간호사 이름(그대로). 내부에서 id 로 해석.\n"
@@ -67,7 +79,10 @@ MANAGE_ASSIGNMENT_SCHEMA: dict = {
             "operation": {
                 "type": "string",
                 "enum": ["list", "create", "cancel"],
-                "description": "list=조회, create=등록, cancel=취소. 기본 list",
+                "description": (
+                    "list=조회, create=등록, cancel=취소. 기본 list. "
+                    "★ '원래대로'는 입력 실수 무르기면 cancel, 실제 복귀면 반대 방향 create."
+                ),
             },
             "kind": {
                 "type": "string",
