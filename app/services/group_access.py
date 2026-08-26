@@ -318,3 +318,23 @@ def assert_caller_can_access_group(
             f"(caller={caller_gid})"
         ),
     )
+
+
+def assert_master_admin(current_user: UserSchema) -> None:
+    """마스터 관리자(ADM) 전용 게이트. 아니면 403.
+
+    ★ ADM 판정은 **토큰**을 권위로 쓴다(이 모듈 위쪽 caller_is_manager 와 동일 규약) —
+      권위가 외부 mWorks 이고 인앱 그룹전환으로 stale 되지 않기 때문이다. DB 조회 불필요.
+
+    ★ 용도: 그룹웨어 인사 마스터를 갈아끼우는 엑셀 업로드(setting/*_upload) 같은
+      **office 전체 파괴적 작업**. 이 연산들은 delete-then-insert 후 외부 그룹웨어로
+      역전파까지 하므로 병동 단위 권한(HN)으로 열 수 없다.
+      (2026-08-26 실측: 세 업로드 모두 권한 검사가 없어 로그인만 하면 통과했다.
+       프론트가 메뉴를 숨기고 있었을 뿐이라 URL 을 알면 누구나 실행 가능했다.)
+    """
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not bool(getattr(current_user, "is_master_admin", False)):
+        raise HTTPException(
+            status_code=403, detail="마스터 관리자(ADM)만 사용할 수 있습니다."
+        )

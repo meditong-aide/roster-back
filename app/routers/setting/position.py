@@ -10,6 +10,7 @@ from starlette.responses import FileResponse
 from datalayer.setting import Setting
 from db.client2 import msdb_manager
 from routers.auth import get_current_user_from_cookie
+from services.group_access import assert_master_admin
 from schemas.auth_schema import User as UserSchema
 from utils import utils
 from utils.security import create_access_token
@@ -24,6 +25,8 @@ DOWNLOAD_FOLDER = "downloads"
 # 메세지 리스트 조회 : mariadb_manager
 @router.get("/position_upload", summary="직위 엑셀 업로드 화면을 출력합니다.")
 def excelupload_form(request: Request, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+    # ADM 전용 — office 전체 인사 마스터를 갈아끼우고 그룹웨어로 역전파한다.
+    assert_master_admin(current_user)
     try:
         OfficeCode = current_user.office_id
         EmpSeqNo = current_user.EmpSeqNo
@@ -63,6 +66,8 @@ async def create_upload_file(current_user: UserSchema = Depends(get_current_user
     - 중복체크 하여 첫번째 내용을 제외하고 나머지는 제거
     - 회원 아이디 중복체크 하여 첫번째 내용을 제외하고 나머지는 제거
     """
+    # ADM 전용 — office 전체 인사 마스터를 갈아끼우고 그룹웨어로 역전파한다.
+    assert_master_admin(current_user)
     print('시작')
     try:
         # 쿠키값에서 가져오도록 수정
