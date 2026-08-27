@@ -1,13 +1,15 @@
 import os
 
 
-def _roster_db() -> str:
+def roster_db() -> str:
     """환경별 roster DB명: 운영=eun_roster, 개발=eun_roster_dev.
 
-    ★ 하드코딩하면 dev 백엔드가 **운영 데이터**를 본다.
-      (sticker.py·message.py 는 `eun_roster.dbo.*` 로 박혀 있어 지금 그 상태다 — 별건)
-    ★ 모듈 상수로 두지 않고 **호출 시점**에 읽는다. 상수로 두면 이 모듈이 `.env` 로딩보다
-      먼저 import 될 때 기본값이 박혀 버리고, 그러면 dev 가 운영 nurses 를 조인한다.
+    ★ 이 파일의 쿼리는 `msdb_manager`(=`MS_DB_NAME`, 그룹웨어 `eun_gw`)로 실행된다.
+      접속 DB 가 roster 가 아니므로 roster 테이블은 **3-part 이름이 필수**이고,
+      그 DB명을 하드코딩하면 dev 백엔드가 **운영 데이터**를 읽고 쓴다.
+    ★ 모듈 상수로 두지 않고 **호출 시점**에 읽는다. `main.py` 에는 `load_dotenv()` 가 없고
+      `db/client.py` 가 import 부수효과로 `.env` 를 읽으므로, 로딩 시점이 import 순서에
+      좌우된다. 상수로 두면 먼저 import 되는 경로에서 기본값이 박혀 dev 가 운영을 본다.
     """
     return os.getenv("EUN_DB_NAME", "eun_roster")
 
@@ -190,7 +192,7 @@ class Common:
         #   실측상 발신자 중 nurses 에 없는 사람이 있다(근무표 알림을 보내는 사람이 반드시
         #   간호 인력으로 등록돼 있지는 않다). 그 경우 senderduty 는 null 이 된다.
         # ★ 값이 없으면 **빈 문자열이 아니라 null** 로 내려보낸다(프론트 계약).
-        # ★ DB명은 `_roster_db()` 로 호출 시점에 주입한다(모듈 상수면 import 순서에 취약).
+        # ★ DB명은 `roster_db()` 로 호출 시점에 주입한다(모듈 상수면 import 순서에 취약).
         # ★ `nurses.nurse_id` 는 중복이 없어(실측) 조인으로 행이 늘지 않는다.
         _queryString = f"""
         WITH Base AS (
@@ -205,7 +207,7 @@ class Common:
               From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
              Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
              Inner Join bizwiz20db.Member c WITH(NOLOCK) On a.officeCode = c.officeCode and a.EmpSeqNo=c.EmpSeqNo
-              Left Join {_roster_db()}.dbo.nurses d WITH(NOLOCK) On d.office_id = a.officecode and d.nurse_id = a.EmpSeqNo
+              Left Join {roster_db()}.dbo.nurses d WITH(NOLOCK) On d.office_id = a.officecode and d.nurse_id = a.EmpSeqNo
              Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N'
                And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
         ),
