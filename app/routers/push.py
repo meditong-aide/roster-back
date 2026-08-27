@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Literal
@@ -165,7 +167,24 @@ def update_push_setting(req: PushSettingRequest, current_user: UserSchema = Depe
 
     result = msdb_manager.execute(Setting.update_push_yn(), params=(req.push_yn, MemberID))
 
+    # UPDATE 0건 = 설정 행이 아직 없는 계정이다. 행은 직원 엑셀 일괄등록
+    # (setting/member.py) 경로에서만 만들어지므로, 그 경로를 안 거친 계정은
+    # **첫 토글이 항상 실패**했다. GET 은 같은 상황을 기본값 'Y' 로 200 처리하는데
+    # PATCH 만 404 를 내던 비대칭이었다.
+    #
+    # ★ 404 를 쓰면 안 되는 이유는 GET 쪽 주석과 같다 — CloudFront 가 `/api/*` 의
+    #   404 를 `index.html` 200 으로 바꿔 보내서 클라이언트가 HTML 을 JSON 으로
+    #   파싱하다 죽는다. 그러나 여기서는 코드만 바꾸는 게 아니라 **행을 만들어**
+    #   요청을 실제로 이행한다. 조회(GET)가 이미 '없으면 Y' 로 동작하므로
+    #   쓰기도 같은 전제로 맞추는 것이 정합적이다.
     if result == 0:
-        raise HTTPException(status_code=404, detail="설정 정보를 찾을 수 없습니다.")
+        msdb_manager.execute(
+            Setting.insert_push_yn_if_absent(),
+            params=(MemberID, req.push_yn, datetime.now(), MemberID),
+        )
+        # 경합이 나면 INSERT 쪽 `UPDLOCK, HOLDLOCK` 이 두 번째 요청을 대기시키고,
+        # 그 요청은 NOT EXISTS 에 걸려 0건이 된다(= 행은 하나만 생긴다).
+        # 그 경우 값은 먼저 들어간 쪽이므로 여기서 한 번 더 UPDATE 해 요청값을 반영한다.
+        msdb_manager.execute(Setting.update_push_yn(), params=(req.push_yn, MemberID))
 
     return {"message": "푸시 설정이 변경되었습니다.", "push_yn": req.push_yn}
