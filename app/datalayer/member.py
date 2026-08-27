@@ -66,8 +66,25 @@ class Member:
     def login_check_token():
         _queryString = """
         select a.EmpSeqNo, a.OfficeCode, a.EmpAuthGbn, isnull(mo.ade_sch,'N') as aiuseyn
-          from bizwiz20db.Member_Login a inner join bizwiz20db.M_Office mo on a.OfficeCode = mo.OfficeCode 
+          from bizwiz20db.Member_Login a inner join bizwiz20db.M_Office mo on a.OfficeCode = mo.OfficeCode
          where a.MemberID = %s and a.EmpAuthGbn in ('ADM', 'MEM', 'NMM')
+        """
+        return _queryString
+
+    def office_member_check():
+        """지정 office 소속의 **재직** 계정인지 — 시연 계정 진입 허용 판정용.
+
+        ★ `IN ('ADM','MEM')` 화이트리스트다. `NOT IN ('NMM','DEL')` 로 쓰면 그룹웨어에
+          새 구분값이 생겼을 때 자동으로 통과해 버린다. NMM(탈퇴)·DEL(삭제)은 이 목록에
+          없으므로 자연히 빠진다.
+        ★ `login_check_token()` 과 달리 **NMM 을 넣지 않는다.** 로그인 자체는 NMM 도
+          통과하지만(그 쿼리), 시연 계정 진입은 재직자에게만 연다.
+
+        params: (MemberID, OfficeCode)
+        """
+        _queryString = """
+        select 1 from bizwiz20db.Member_Login
+         where MemberID = %s and OfficeCode = %s and EmpAuthGbn in ('ADM', 'MEM')
         """
         return _queryString
 
