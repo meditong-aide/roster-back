@@ -52,6 +52,17 @@ def message_view(listsize: int, current_user: UserSchema = Depends(require_curre
       - officecode: 병원코드
       - senderEmpSeqNo: 푸시 전송자 EmpSeqNo
       - sendername: 푸시 전송자명
+      - senderduty: 푸시 전송자 직함 (string | null)
+          · roster 의 `nurses.level_` 을 조회 시점에 조인한다.
+            예) 수간호사 · 책임간호사 · 주임간호사 · 간호사 · 간호조무사 · 일반
+          · 값이 없거나 **발신자가 roster 에 등록돼 있지 않으면** 필드를 생략하지 않고
+            null 을 준다. 근무표 알림을 보내는 사람이 반드시 간호 인력으로 등록돼 있지는 않다.
+          · 발행 시점 스냅샷이 아니라 **현재 값**이다. 푸시 이력은 그룹웨어 테이블이라
+            컬럼 추가가 곧 그룹웨어 스키마 변경이고, 조인 방식은 과거 알림까지 직함이
+            채워진다는 이점이 있다(스냅샷은 신규만 값이 생긴다).
+          · 그룹웨어 `Member.duty` 는 쓰지 않는다 — 실측상 거의 비어 있다
+            (재직 1,796명 중 NULL 1,792). 그룹웨어 직위(`T_Part`)도 후보였으나,
+            직함을 우리가 직접 고칠 수 있는 roster 컬럼으로 가기로 했다.
       - Message: 푸시 메세지
       - regdate: 등록일 ex) 2025-11-06
       - ReadYN : 읽음 여부 (Y,N)
@@ -74,6 +85,8 @@ def message_view(listsize: int, current_user: UserSchema = Depends(require_curre
         "officecode": row['officecode'],
         "senderEmpSeqNo": row['senderEmpSeqNo'],
         "sendername": row['sendername'],
+        # 값이 없으면 None → JSON null. 프론트 계약상 필드를 생략하지 않는다.
+        "senderduty": row['senderduty'],
         "Message": row['Message'],
         "regdate": row['regdate'],
         "ReadYN": row['ReadYN'],
