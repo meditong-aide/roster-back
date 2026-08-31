@@ -1458,6 +1458,116 @@ def get_my_issued_roster_service(
     }
 
 
+#: 주 시작 요일 = 일요일. `date.weekday()` 는 월=0…일=6 이므로 +1 후 7 로 나눈 나머지가
+#: '그 주 일요일로부터 며칠째' 가 된다(일→0, 월→1, … 토→6).
+_WEEK_START_SUNDAY_OFFSET = 1
+
+
+def get_my_issued_week_service(
+    current_user,
+    db: Session,
+    base_date: date | None = None,
+) -> dict:
+    """본인의 **발행(마감)** 근무표 중 기준일이 속한 주(일~토) 7일을 돌려준다.
+
+    ★ 주는 달을 넘는다. 8/30(일)~9/5(토) 처럼 걸치면 8월·9월 **두 발행본**을 각각 읽어
+      이어붙여야 한다. 한 달만 읽으면 주의 절반이 조용히 빈다.
+    ★ 월별 조회는 `get_my_issued_roster_service` 를 그대로 쓴다. 파견/병동이동 overlay,
+      shift_colors, home group 해석이 전부 그 안에 있어 여기서 다시 구현하면 갈린다.
+    ★ 발행 안 된 달은 `code=None, issued=False` 로 채운다. 빼버리면 프론트가 7칸
+      요일 격자를 못 그린다. "미발행" 은 오류가 아니라 정상 상태다.
+
+    Args:
+        base_date: 기준일(기본=오늘). 프론트가 주를 앞뒤로 넘길 때 쓴다.
+
+    Returns:
+        days 는 **항상 7개**(일→토). 조회 가능한 발행본이 하나도 없어도 형태는 유지된다.
+        ★ `issued` 는 "그 달이 발행됐는가" 가 아니라 **"그 날 내가 조회 가능한 근무표가
+          있는가"** 다. 그 달이 미발행이어도, 발행됐지만 내가 그 달 소속이 아니어도
+          똑같이 False 다. 간호사 화면에서는 두 경우 모두 "내 근무 없음" 으로 같게
+          표시되므로 굳이 가르지 않는다(가르려면 스냅샷 존재 여부를 따로 조회해야 해
+          왕복이 는다).
+
+    Raises:
+        ValueError: 기준일이 `date` 표현 범위의 양 끝 6일 안쪽일 때. 라우터가 400 으로 옮긴다.
+    """
+    today = date.today()
+    anchor = base_date or today
+    # 주 계산은 기준일에서 앞뒤로 최대 6일 움직인다. date.min/max 코앞에서는 그 이동이
+    # 표현 범위를 넘어 OverflowError 가 나고, 라우터의 포괄 except 가 그것을 **500** 으로
+    # 바꾼다 — 클라이언트 입력 오류인데 서버 장애로 보고되는 셈이다.
+    # 실측(2026-08-31): 0001-01-01~06 은 week_start 에서, 9999-12-26~31 은 week_end 에서 터진다.
+    _span = timedelta(days=6)
+    if not (date.min + _span <= anchor <= date.max - _span):
+        raise ValueError(
+            f"기준일이 주 계산 가능 범위를 벗어났습니다: {anchor.isoformat()} "
+            f"(허용 {(date.min + _span).isoformat()} ~ {(date.max - _span).isoformat()})"
+        )
+    week_start = anchor - timedelta(days=(anchor.weekday() + _WEEK_START_SUNDAY_OFFSET) % 7)
+    week_days = [week_start + timedelta(days=i) for i in range(7)]
+
+    # 주가 걸친 달만 조회한다(최대 2개). 같은 달을 두 번 읽지 않는다.
+    months = list(dict.fromkeys((d.year, d.month) for d in week_days))
+    by_month: dict[tuple[int, int], dict | None] = {}
+    for y, m in months:
+        # ★ 예외를 삼키지 않는다. 조회 실패(인가·DB·스냅샷 파싱)를 `None` 으로 눕히면
+        #   "아직 발행 안 됨" 과 구분이 사라져, 장애 중에도 200 으로 **빈 주**가 나간다.
+        #   간호사는 근무표가 안 나온 줄 알지만 실제로는 시스템이 고장난 것이다.
+        #   진짜 미발행은 이 함수가 이미 `None` 을 돌려주므로 따로 감쌀 이유가 없다.
+        by_month[(y, m)] = get_my_issued_roster_service(
+            year=y, month=m, current_user=current_user, db=db
+        )
+
+    _WD = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+    days_out: list[dict] = []
+    for i, d in enumerate(week_days):
+        data = by_month.get((d.year, d.month))
+        # ★ 색 폴백은 **그 날이 속한 달**의 색표로만 본다. 두 달 색표를 하나로 합치면
+        #   같은 코드가 달마다 다른 색일 때 뒤 달이 앞 달을 덮어써 2월 칸이 3월 색으로
+        #   칠해진다(주중 병동이동이면 실제로 갈린다). 그래서 병합하지 않는다.
+        colors_m = (data or {}).get("shift_colors") or {}
+        cell = None
+        if data:
+            cell = next(
+                (c for c in (data.get("schedule") or []) if int(c.get("day") or 0) == d.day),
+                None,
+            )
+        code = str((cell or {}).get("code") or "") or None
+        days_out.append({
+            "date": d.isoformat(),
+            "weekday": _WD[i],
+            "day": d.day,
+            "code": code,
+            # ★ 코드가 없으면 색도 없다. 근무가 없는 칸에 색만 남으면 화면에는 '무언가
+            #   배정된 칸'으로 보인다. 실측(발행본 12건·셀 5,653개)에 그런 셀은 없지만,
+            #   code 와 color 가 따로 놀 수 있는 구조라 여기서 묶어 둔다.
+            "color": ((cell or {}).get("color") or colors_m.get(code) or None) if code else None,
+            "group_id": (cell or {}).get("group_id"),
+            "group_name": (cell or {}).get("group_name"),
+            "is_today": d == today,
+            "issued": data is not None,
+        })
+
+    today_cell = next((c for c in days_out if c["is_today"]), None)
+    me = next((v for v in by_month.values() if v), None) or {}
+    return {
+        "week_start": week_start.isoformat(),
+        "week_end": week_days[-1].isoformat(),
+        "today": today.isoformat(),
+        # 기준일이 이번 주 밖이면(프론트가 다른 주를 조회) today_* 는 비운다.
+        "today_code": (today_cell or {}).get("code"),
+        "today_color": (today_cell or {}).get("color"),
+        "nurse_id": me.get("nurse_id") or getattr(current_user, "nurse_id", None),
+        # ★ 한 달도 발행본이 없으면 `me` 가 비어 이름이 통째로 null 이 된다. 신원 표시는
+        #   근무표 유무와 무관하므로 로그인 사용자에서 채운다(nurse_id 와 같은 규칙).
+        "name": me.get("name") or getattr(current_user, "name", None),
+        # ★ 응답에 통합 `shift_colors` 를 두지 않는다. 주가 두 달에 걸치면 같은 코드가
+        #   서로 다른 색일 수 있어 하나로 합치는 순간 한쪽이 틀린다. 칠할 색은
+        #   `days[].color` 에 칸마다 이미 정확히 들어 있으므로 그것이 정본이다.
+        "days": days_out,
+    }
+
+
 def create_issued_roster_snapshot(
     schedule: Schedule,
     current_user,

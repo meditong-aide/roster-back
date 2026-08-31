@@ -95,6 +95,7 @@ from services.roster_service import (
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
     get_my_issued_roster_service,
+    get_my_issued_week_service,
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
@@ -827,6 +828,65 @@ async def get_my_issued_roster(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"개인 근무표 조회 실패: {str(e)}"
+        )
+
+
+# [Roster] - 본인 발행 근무표 · 기준일이 속한 주(일~토)
+@router.get("/issued_roster/me/week")
+def get_my_issued_week(
+    date: Optional[str] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """모바일 대시보드 최상단용 — 본인의 **발행(마감)** 근무표에서 이번 주 7일.
+
+    ★ `async def` 가 아니라 **동기 `def`** 다. 안에서 도는 SQLAlchemy 는 동기라
+      `async` 핸들러에 두면 DB I/O 동안 이벤트 루프가 통째로 막힌다. 이 엔드포인트는
+      대시보드 최상단이라 **폴링**되므로 그 영향이 다른 요청까지 번진다.
+      동기 `def` 로 두면 FastAPI 가 threadpool 에서 실행해 루프를 붙잡지 않는다.
+      (의존성 `require_current_user` 가 async 인 것은 무관 — FastAPI 가 알아서 처리한다.)
+
+    ★ 주는 달을 넘는다(8/30 일 ~ 9/5 토). 서비스가 걸친 달을 각각 읽어 이어붙인다.
+    ★ 발행 안 된 달은 그 날들이 `code=null, issued=false` 로 내려간다. 빼지 않는 이유는
+      프론트가 요일 7칸 격자를 그리기 때문이다.
+    ★ 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 404 를 `index.html` **200** 으로
+      바꿔 보내 모바일이 HTML 을 JSON 으로 파싱하다 하얗게 뜬다(`/issued_roster/me` 주석 참조).
+      여기서는 한 발 더 나아가 **null 도 반환하지 않는다** — 주 단위는 '일부 달만 발행' 이
+      정상 상태라, 형태를 항상 유지하는 편이 프론트 분기를 단순하게 만든다.
+
+    Args:
+        date: 기준일(선택, 기본=오늘). 프론트가 주를 앞뒤로 넘길 때 쓴다.
+            `YYYY-MM-DD` 이며 월·일의 0 패딩은 없어도 된다(`2026-2-3` 허용).
+            ★ 빈 문자열(`?date=`)은 **거부**한다. 값을 주지 않을 거면 파라미터 자체를
+              빼야 한다 — 빈 값을 오늘로 눕히면 잘못 만든 요청이 성공으로 보인다.
+    """
+    base_date = None
+    if date is not None:
+        _raw = date.strip()
+        if not _raw:
+            raise HTTPException(
+                status_code=400,
+                detail="date 가 비어 있습니다. 생략하거나 YYYY-MM-DD 로 주세요.",
+            )
+        try:
+            base_date = datetime.strptime(_raw, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="date 는 YYYY-MM-DD 형식이어야 합니다."
+            )
+    try:
+        return get_my_issued_week_service(
+            current_user=current_user, db=db, base_date=base_date
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # 서비스가 기준일 범위를 거른다(date.min/max 코앞은 주 계산이 표현 범위를 넘는다).
+        # 입력 오류이므로 아래 500 으로 새지 않게 여기서 400 으로 낸다.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"주간 근무표 조회 실패: {str(e)}"
         )
 
 
