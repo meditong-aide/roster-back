@@ -27,6 +27,11 @@ def sticker_list(stcker_date: str, current_user: UserSchema = Depends(get_curren
     ]
     """
 
+    # get_current_user_from_cookie 는 미인증이면 예외가 아니라 None 을 준다.
+    # 가드가 없으면 아래 역참조에서 AttributeError → 401 이어야 할 자리에 500 이 나간다.
+    if not current_user:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
     EmpSeqNo = current_user.nurse_id
     OfficeCode = current_user.office_id
 
