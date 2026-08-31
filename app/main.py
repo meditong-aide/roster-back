@@ -283,6 +283,12 @@ async def _trace_roster_create_callers(request: Request, call_next):
 # PII 최소화: 본문 미저장(path+query 만), 민감 경로는 아래 prefix 로 제외.
 _LOG_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _LOG_EXCLUDE_PREFIX = ("/static", "/health", "/docs", "/openapi", "/favicon", "/redoc")
+# ★ 위 methods 는 "성공 요청" 기준이다. **실패(4xx/5xx·예외)는 method 무관하게 남긴다** —
+#   GET 을 전량 남기면 이 로그의 목적(액션 분석)에 비해 양이 압도적이고 Firehose·S3 비용이
+#   따라 붙는데, 정작 조사에 필요한 건 실패분이다.
+#   2026-08-27 실측: 미인증 GET 7종이 401 아닌 **500** 으로 나가는데(가드 누락) 전부 기록이
+#   없었다 — GET 미포함 + `call_next` 가 try 밖이라는 두 겹 때문이었다.
+_LOG_FAILURE_FROM = 400
 
 # 경로→(page/section/action) 라벨 + 요청본문 화이트리스트 카탈로그(의미 보강용).
 import call_action_catalog as _catalog
@@ -329,17 +335,39 @@ def _firehose_put(line: str) -> None:
 @app.middleware("http")
 async def _call_action_logger(request: Request, call_next):
     start = time.perf_counter()
-    response = await call_next(request)
+    # ★ `call_next` 를 try 안에 둔다. 밖에 두면 핸들러가 예외를 던졌을 때 **아래 기록 코드에
+    #   도달조차 못 해** 정작 봐야 할 500 이 흔적 없이 사라진다(2026-08-27 실측).
+    #   잡은 예외는 기록만 하고 **반드시 그대로 재전파**한다 — 여기서 삼키면 FastAPI 의
+    #   예외 핸들러가 돌지 않아 응답 모양이 바뀐다.
+    response = None
+    exc: BaseException | None = None
+    try:
+        response = await call_next(request)
+    except asyncio.CancelledError:
+        raise  # 클라이언트 중단. 노이즈라 기록하지 않고 즉시 전파.
+    except BaseException as e:
+        exc = e
     try:
         method = request.method
         path = request.url.path
-        if method in _LOG_METHODS and not path.startswith(_LOG_EXCLUDE_PREFIX):
+        status = getattr(response, "status_code", None) if response is not None else 500
+        # 예외로 빠졌으면 아직 응답이 없다 — 실제로 나갈 값(500)으로 기록한다.
+        failed = exc is not None or (status is not None and status >= _LOG_FAILURE_FROM)
+        if ((method in _LOG_METHODS or failed)
+                and not path.startswith(_LOG_EXCLUDE_PREFIX)):
             xff = request.headers.get("x-forwarded-for", "")
             ip = xff.split(",")[0].strip() if xff else (
                 request.client.host if request.client else None
             )
             u = _log_user_from_cookie(request)
             qs = str(request.url.query) or None
+            # ★ 이번 변경으로 **새로** 기록되는 요청(GET 등 비변경 메서드의 실패)은
+            #   값을 버리고 **키 이름만** 남긴다. 정의되지 않은 경로도 404 로 여기 걸리므로
+            #   `/foo?password=...` 처럼 **임의로 붙인 query 가 그대로 S3 에 쌓일 수 있다.**
+            #   진단에는 "어떤 파라미터가 왔나" 로 충분하다(누락·오타는 키만으로 잡힌다).
+            #   기존 변경 메서드(POST 등)는 손대지 않는다 — 동작이 바뀌면 회귀다.
+            if qs and method not in _LOG_METHODS:
+                qs = "&".join(sorted({p.split("=", 1)[0] for p in qs.split("&") if p})) or None
             # 단일 이벤트 형식(JSON 1줄) — Firehose 가 그대로 S3(→Athena)로 전달.
             #   log="call_history" 는 CloudWatch 구독필터 {$.log="call_history"} 매칭용 태그.
             event = {
@@ -348,8 +376,14 @@ async def _call_action_logger(request: Request, call_next):
                 "method": method,
                 "path": path[:500],
                 "query": (qs[:1000] if qs else None),
-                "status": getattr(response, "status_code", None),
+                "status": status,
                 "dur_ms": int((time.perf_counter() - start) * 1000),
+                # 예외로 끝난 요청만 채워진다. ★**타입만** 남긴다 —
+                # 예외 메시지에는 쿼리 바인딩 값·요청 데이터가 그대로 실릴 수 있어(pymssql 등)
+                # 이 로그의 "본문 미저장" 원칙과 충돌한다. 길이 제한은 방어가 못 된다.
+                # 타입만으로도 분류는 된다(AttributeError=인증 가드 누락 등).
+                # 원문은 같은 시각 stdout 의 traceback 에서 본다.
+                "error": (type(exc).__name__ if exc is not None else None),
                 "account_id": u.get("account_id"),
                 "nurse_id": u.get("nurse_id"),
                 "name": u.get("name"),
@@ -383,6 +417,8 @@ async def _call_action_logger(request: Request, call_next):
                 print(line, flush=True)
     except Exception as e:
         print(f"[call_history][WARN] 로거 예외(무시): {e}", flush=True)
+    if exc is not None:
+        raise exc  # 기록만 하고 원래 예외를 그대로 올린다(응답 모양 무변경).
     return response
 
 
