@@ -10,7 +10,7 @@ from starlette.responses import FileResponse
 
 from datalayer.setting import Setting
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from utils import utils
 from utils.security import create_access_token
@@ -22,7 +22,7 @@ DOWNLOAD_FOLDER = "downloads"
 
 
 @router.get("/member_upload", summary="회원 엑셀 업로드 화면을 출력합니다.")
-def excelupload_form(request: Request, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def excelupload_form(request: Request, current_user: UserSchema = Depends(require_current_user)):
     OfficeCode = current_user.office_id
     EmpSeqNo = current_user.EmpSeqNo
 
@@ -34,7 +34,7 @@ def excelupload_form(request: Request, current_user: UserSchema = Depends(get_cu
 
 @router.post("/member_upload", summary="회원 엑셀을 DB에 저장합니다.")
 async def create_upload_file(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     file: UploadFile = File(...)
 ):
     OfficeCode = current_user.office_id

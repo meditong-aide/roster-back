@@ -9,7 +9,7 @@ from starlette.responses import FileResponse
 
 from datalayer.setting import Setting
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from utils import utils
 from utils.security import create_access_token
@@ -23,7 +23,7 @@ DOWNLOAD_FOLDER = "downloads"
 
 # 메세지 리스트 조회 : mariadb_manager
 @router.get("/position_upload", summary="직위 엑셀 업로드 화면을 출력합니다.")
-def excelupload_form(request: Request, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def excelupload_form(request: Request, current_user: UserSchema = Depends(require_current_user)):
     try:
         OfficeCode = current_user.office_id
         EmpSeqNo = current_user.EmpSeqNo
@@ -57,7 +57,7 @@ def excelupload_form(request: Request, current_user: UserSchema = Depends(get_cu
 
 
 @router.post("/position_upload", summary="직위 엑셀을 DB에 저장합니다.")
-async def create_upload_file(current_user: UserSchema = Depends(get_current_user_from_cookie), file: UploadFile = File(...)):
+async def create_upload_file(current_user: UserSchema = Depends(require_current_user), file: UploadFile = File(...)):
     """
     **회원 엑셀파일을 업로드 하여 DB에 저장합니다.**
     - 양식 엑셀파일 : easysetting_member.xls

@@ -10,7 +10,7 @@ from starlette.responses import FileResponse
 
 from datalayer.setting import Setting
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from utils import utils
 from utils.security import create_access_token
@@ -29,7 +29,7 @@ def excelupload_form(request: Request):
 
 @router.post("/division_upload", summary="부서 엑셀을 DB에 저장합니다.")
 async def division_upload(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     file: UploadFile = File(...)
 ):
     OfficeCode = current_user.office_id

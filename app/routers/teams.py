@@ -150,7 +150,7 @@ async def get_teams(
 @router.put("", response_model=list[TeamWithMembers])
 async def put_teams(
     body: TeamBulkOpsRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     group_id: str | None = None,
     db: Session = Depends(get_db),
 ):

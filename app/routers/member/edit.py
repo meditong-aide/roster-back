@@ -11,7 +11,7 @@ from starlette.responses import JSONResponse
 
 from datalayer.member import Member
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 # EmailSender 클래스 인스턴스를 import
 from utils.email import email_sender, EmailSchema
@@ -23,7 +23,7 @@ templates = Jinja2Templates(directory="templates")
 DOWNLOAD_FOLDER = "downloads"
 
 @router.get("/edit", summary="회원정보 수정")
-def member_edit_view(request: Request, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def member_edit_view(request: Request, current_user: UserSchema = Depends(require_current_user)):
     EmpAuthGbn = current_user.EmpAuthGbn
     account_id = current_user.account_id
 
@@ -209,7 +209,7 @@ async def get_upload_form(request: Request):
 @router.post("/file-upload", response_class=HTMLResponse)
 async def handle_file_upload(
         request: Request,
-        current_user: UserSchema = Depends(get_current_user_from_cookie),
+        current_user: UserSchema = Depends(require_current_user),
         files: Optional[List[UploadFile]] = File(None)
 ):
     """

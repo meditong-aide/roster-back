@@ -11,7 +11,7 @@ from datalayer.contact import Contact
 from datalayer.member import Member
 from db.client2 import msdb_manager, get_db
 from db.models import Notice
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from utils.email import email_sender, EmailSchema
 from utils.utils import save_uploaded_files
@@ -21,7 +21,7 @@ templates = Jinja2Templates(directory="templates")
 
 # 메세지 화면 출력
 @router.get("/write", summary="고객문의 화면처리", description="고객문의 화면처리")
-def message_write_form(request: Request,current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_write_form(request: Request,current_user: UserSchema = Depends(require_current_user)):
     OfficeCode = current_user.office_id
     account_id = current_user.account_id
 
@@ -30,7 +30,7 @@ def message_write_form(request: Request,current_user: UserSchema = Depends(get_c
     return templates.TemplateResponse("contact_write.html", {"request": request, "user_data" : rows[0]})
 
 @router.post("/write", summary="고객문의 등록")
-async def set_message(background_tasks: BackgroundTasks,current_user: UserSchema = Depends(get_current_user_from_cookie),
+async def set_message(background_tasks: BackgroundTasks,current_user: UserSchema = Depends(require_current_user),
         # 기본 정보 (읽기 전용 포함)
         username: str = Form(...),
         PortableTel: str = Form(...),

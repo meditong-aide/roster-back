@@ -8,14 +8,14 @@ from sqlalchemy.orm import Session
 from datalayer.contact import Contact
 from db.client2 import msdb_manager, get_db
 from db.models import Notice
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from utils.utils import download_file
 
 router = APIRouter()
 
 @router.get("/listcnt", summary="총 게시물수")
-def message_view(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_view(current_user: UserSchema = Depends(require_current_user)):
     """
     * 호출방식 : /contact/listcnt
     * 리턴값 : total_count
@@ -32,7 +32,7 @@ def message_view(current_user: UserSchema = Depends(get_current_user_from_cookie
     } for row in rows]
 
 @router.get("/list", summary="메세지 리스트")
-def message_view(page: int, pagesize: int, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_view(page: int, pagesize: int, current_user: UserSchema = Depends(require_current_user)):
     """
     * page, pagesize -> get방식으로 전달
     * 호출방식 : /contact/list?page=1&pagesize=10
@@ -74,7 +74,7 @@ def message_view(page: int, pagesize: int, current_user: UserSchema = Depends(ge
     } for row in rows]
 
 @router.delete("/{no}", summary="문의내역 삭제")
-def delete_contact(no: int, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def delete_contact(no: int, current_user: UserSchema = Depends(require_current_user)):
     """
     * 나의 문의내역 삭제
     * 호출방식 : DELETE /contact/{no}
@@ -91,7 +91,7 @@ def delete_contact(no: int, current_user: UserSchema = Depends(get_current_user_
 
 
 @router.get("/download", summary="파일 다운로드")
-def message_view(filename: str, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_view(filename: str, current_user: UserSchema = Depends(require_current_user)):
     """
     * filename -> get방식으로 전달
     * 호출방식 : /contact/download?filename=easysetting_division (1)_1762755447223.xls
