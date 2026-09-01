@@ -337,6 +337,10 @@ class RosterConfigBase(BaseModel):
         default=None,
         description="보건휴가 주말 배치 허용 — False 시 평일에만 배치. health_leave_enabled=True 일 때만 의미가 있다. 미전송(None) 시 기존 값 유지",
     )
+    ban_night_before_fixed_wanted_off: Optional[bool] = Field(
+        default=None,
+        description="확정 원티드로 굳힌 OFF 직전일에 N 배치 금지 — 신청해서 받은 휴일이 직전 N 의 회복 OFF 시작점으로 소비되면 실질적으로 쉰 것이 아니므로 휴가·공가와 같은 취급을 한다. 대상은 확정 원티드로 굳힌 **O** 셀이다(주휴 코드로 신청한 셀도 대표코드가 O 로 접혀 포함). 자동으로 배정된 OFF 는 대상이 아니고, 휴가·공가 계열은 기존 설정이 담당한다. 당월 1일이 확정 OFF 인 경우는 전월 N 마감의 회복분이라 면제. 미전송(None) 시 기존 값 유지",
+    )
     sleep_off_enabled: Optional[bool] = Field(
         default=None,
         description="수면OFF 자동 부여 — True 시 N 연번이 sleep_off_cycle(기본 15)에 도달한 간호사에게 그 N 블록 종료 후 shifts.sleep_off_target=True 인 코드를 1개 부여. 미전송(None) 시 기존 값 유지",

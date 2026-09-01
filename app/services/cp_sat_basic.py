@@ -459,6 +459,11 @@ class CPSATBasicEngine:
         two_offs_after_two_nig = config_data.get('two_offs_after_two_nig', False)
         not_one_night = config_data.get('not_one_night', False)
         ban_night_before_fixed_off = bool(config_data.get('ban_night_before_fixed_off', True))
+        # ★ 기본값이 위와 **반대(False)** 다 — 컬럼이 없거나 NULL 인 병동은 꺼진 채로 둔다.
+        #   dev 는 이 컬럼이 뒤늦게 추가돼(prod→dev 마이그가 DDL 을 안 옮긴다) 없을 수 있다.
+        ban_night_before_fixed_wanted_off = bool(
+            config_data.get('ban_night_before_fixed_wanted_off', False)
+        )
         off_first = bool(config_data.get('off_first', False))
         # config.max_nig_per_month 를 그대로 사용. 2026-01-15 hotfix (d095cc6d)
         # `if != 15: = 17` override 는 제거 — DB/payload 값을 신뢰.
@@ -554,6 +559,7 @@ class CPSATBasicEngine:
             max_consecutive_nights=3 if three_seq_nig else 2,
             not_one_night=not_one_night,
             ban_night_before_fixed_off=ban_night_before_fixed_off,
+            ban_night_before_fixed_wanted_off=ban_night_before_fixed_wanted_off,
             off_first=off_first,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
@@ -1862,6 +1868,18 @@ class CPSATBasicEngine:
             _id2i_final = {nu.db_id: n for n, nu in enumerate(nurses)}
             _synced_final = 0
             _synced_final_fw = 0
+            # 고정 OFF 직전 N 금지가 실제로 건 셀 — 미러가 프리셉터 N 을 덮어쓰지 못하게 한다.
+            # ★ 설정이 꺼져 있으면 목록을 쓰지 않는다. 같은 roster_system 으로 다시 build 하면
+            #   지난 회차 목록이 남아, 제약이 없는데도 그 칸을 OFF 로 눕힐 수 있다.
+            _ban_active_final = bool(
+                getattr(roster_system.config, 'ban_night_before_fixed_off', False)
+                or getattr(roster_system.config, 'ban_night_before_fixed_wanted_off', False)
+            )
+            _ban_prev_final = (
+                (getattr(roster_system, "_ban_n_prev_cells", set()) or set())
+                if _ban_active_final else set()
+            )
+            _ban_kept_final = 0
             _pte_fw_raw_final = _preceptee_fixed_wanted_map_raw
             _pte_fw_norm_final = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
             _pp_fw_final = getattr(roster_system, 'preceptee_follow_days', {}) or {}
@@ -1907,6 +1925,23 @@ class CPSATBasicEngine:
                             changed = True
                             _synced_final_fw += 1
                         continue
+                    # ★ 고정 OFF 직전 N 금지가 건 셀은 프리셉터를 따르지 않는다. 모델 제약은
+                    #   미러 **이전** 값에만 걸리므로, 그대로 복사하면 신청해 받은 휴일이
+                    #   도로 회복 OFF 자리가 된다. 교육 연속성보다 휴일 보호가 우선이다.
+                    # ★ 대표코드로 판정한다. 이 경로는 **원본 shift_id 문자열**을 다루므로
+                    #   'N' 정확 일치로 보면 N 하위코드(N1 등)를 놓친다 — 실측상 N1 은
+                    #   3개 병동에서 172건 배정돼 있다. fallback 은 roster 가 대표코드
+                    #   one-hot 이라 이 문제가 없지만, 여기는 문자열이라 정규화가 필요하다.
+                    _ptr_raw = str(ptr_sched[d_i]).strip().upper()
+                    _ptr_main = shift_id_to_main.get(_ptr_raw, _ptr_raw)
+                    if (_n_idx_final is not None
+                            and (_n_idx_final, d_i) in _ban_prev_final
+                            and _ptr_main == 'N'):
+                        if str(pte_sched[d_i]).upper() != _off_code.upper():
+                            pte_sched[d_i] = _off_code
+                            changed = True
+                            _ban_kept_final += 1
+                        continue
                     ptr_code = str(ptr_sched[d_i]).strip()
                     ptr_u = ptr_code.upper()
                     if ptr_u in {'D', 'E', 'N', 'O'} or ptr_u in _work_sub_ids:
@@ -1926,6 +1961,8 @@ class CPSATBasicEngine:
                 _msg = f"{self.logger_prefix} [PrecepteeSync] 최종 result 동기화: {_synced_final}명"
                 if _synced_final_fw:
                     _msg += f", fixed_wanted 재적용: {_synced_final_fw}건"
+                if _ban_kept_final:
+                    _msg += f", 고정OFF직전N 보호: {_ban_kept_final}건"
                 print(_msg)
         # 디버그: 최종 결과에서 O/휴가/주휴가 OFF로 어떻게 카운트되는지 확인
         try:
@@ -3952,18 +3989,52 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         related_atom_keys=[(n, dd) for dd in (d - 1, d, d + 1) if T0 <= dd <= T1],
                     )
 
-            # 휴가/공가 fixed 셀의 직전일 N 금지 (하드, 휴가/공가 보호 정책).
-            # fixed_wanted O / 휴무 / 주휴 등은 사용자 자발 OFF 또는 자동 OFF 라 대상 외.
-            # 단 prev_d == T0(day 0) 자체는 cross-month 면제.
+            # 고정 셀의 직전일 N 금지 (하드). 대상을 고르는 축이 **둘**이다.
+            #   ① type  : 휴가·공가        → ban_night_before_fixed_off      (기본 True)
+            #   ② 출처  : 확정 원티드 O    → ban_night_before_fixed_wanted_off (기본 False)
+            # ②의 근거 — 신청해서 받은 휴일이 직전 N 의 **회복 OFF 시작점**으로 소비되면
+            #   실질적으로 쉰 것이 아니다. 휴가·공가와 같은 취급을 받아야 한다.
+            #   ★ 대상은 `fixed_wanted_cells`(출처가 fixed_wanted)로 한정한다 —
+            #     솔버·주휴 규칙이 **자동으로** 넣은 OFF 는 걸리지 않는다.
+            #   ★ 판정은 대표코드 O 로 한다. `주`(주휴) 코드로 신청한 셀도 여기 든다 —
+            #     `_load_special_shift_map` 이 `type ∈ {근무,휴가,공가}` 로 거르는데
+            #     `O`·`주` 는 실측상 둘 다 `type='휴무'` 라 special 로 안 빠지고
+            #     `fixed_wanted_cells` 에 남는다. 반면 휴가·공가 계열 특수 코드는
+            #     `special_fixed_cells` 로 먼저 잡혀 ②가 아니라 ① 축이 담당한다.
+            # 월 경계: **당월 1일(d == T0)이 고정 OFF 면 대상 밖**이다(루프가 T0+1 부터 돈다).
+            #   전월이 N 으로 끝나 그 회복 OFF 가 넘어오는 건 막을 수 없고 막아서도 안 된다.
+            #   반면 2일(d == T0+1)이 고정 OFF 면 prev_d == T0(1일) 이므로 **금지가 걸린다**.
             _BAN_N_TYPES = {"휴가", "공가"}
-            if bool(getattr(cfg, "ban_night_before_fixed_off", False)):
+            _ban_by_type = bool(getattr(cfg, "ban_night_before_fixed_off", False))
+            _ban_by_wanted = bool(getattr(cfg, "ban_night_before_fixed_wanted_off", False))
+            if _ban_by_type or _ban_by_wanted:
+                # 간호사 루프 안이므로 rs 에 붙여 **누적**한다(여기서 새로 만들면 매번 리셋).
+                _ban_n_prev_cells = getattr(rs, "_ban_n_prev_cells", None)
+                if _ban_n_prev_cells is None:
+                    _ban_n_prev_cells = set()
+                    rs._ban_n_prev_cells = _ban_n_prev_cells
                 _ban_n_cnt = 0
+                _ban_n_wanted = 0
                 for d in range(T0 + 1, T1 + 1):
                     if (n, d) not in fixed:
                         continue
                     _fw_type = fixed_type_by_cell.get((n, d))
-                    if _fw_type not in _BAN_N_TYPES:
-                        continue  # 휴가/휴무/공가 외 type 은 BanN 대상 아님
+                    _hit_type = _ban_by_type and _fw_type in _BAN_N_TYPES
+                    _hit_wanted = (
+                        _ban_by_wanted
+                        and (n, d) in fixed_wanted_cells
+                        and off_idx_full is not None
+                        and fixed.get((n, d)) == off_idx_full
+                    )
+                    if not (_hit_type or _hit_wanted):
+                        continue  # 어느 축에도 안 걸리는 셀
+                    # ★ 두 축에 모두 걸리는 셀(확정 원티드인데 type 도 휴가·공가)은 "both".
+                    #   한쪽만 적으면 완화가 그 설정만 끄고 **다른 축이 같은 제약을 계속 걸어**
+                    #   재시도가 같은 이유로 또 infeasible 이 된다.
+                    #   "both" 는 control._apply_ban_night_before_fixed_off 의 else 로 떨어져
+                    #   둘 다 꺼진다.
+                    _axis = ("both" if (_hit_type and _hit_wanted)
+                             else ("type" if _hit_type else "fixed_wanted"))
                     prev_d = d - 1
                     if prev_d < T0:
                         continue
@@ -3972,7 +4043,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if (n, prev_d) in fixed:
                         _emit_rec.emit(
                             family="BanNightBeforeFixedOff",
-                            scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type},
+                            scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type,
+                                   "axis": _axis},
                             target="forbid_prev_day_night",
                             mode="bypassed_by_fixed",
                             related_atom_keys=[(n, prev_d), (n, d)],
@@ -3980,16 +4052,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         )
                         continue  # 이미 고정된 셀은 변경 불가
                     m.Add(X(n, prev_d, night) == 0)
+                    # ★ 프리셉티 미러가 프리셉터 셀을 그대로 덮어써 이 N 금지를 되살리므로,
+                    #   실제로 건 셀을 남겨 미러 단계에서 존중하게 한다(fallback 과 같은 규약).
+                    _ban_n_prev_cells.add((n, prev_d))
+                    # ★ axis 를 빠뜨리면 완화(control._apply_ban_night_before_fixed_off)가
+                    #   어느 축이 원인인지 몰라 **둘 다** 끈다 — 무관한 휴가·공가 보호까지 사라진다.
                     _emit_rec.emit(
                         family="BanNightBeforeFixedOff",
-                        scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type},
+                        scope={"nurse_index": n, "day": d + 1, "fixed_type": _fw_type,
+                               "axis": _axis},
                         target="forbid_prev_day_night",
                         mode="enforced",
                         related_atom_keys=[(n, prev_d), (n, d)],
                     )
                     _ban_n_cnt += 1
+                    if _hit_wanted and not _hit_type:
+                        _ban_n_wanted += 1  # 확정 원티드 축**만**으로 걸린 건수
                 if _ban_n_cnt > 0:
-                    print(f"[CP-SAT-Basic] [BanNBeforeFixedOff] nurse_idx={n}: {_ban_n_cnt}건 N 금지")
+                    print(f"[CP-SAT-Basic] [BanNBeforeFixedOff] nurse_idx={n}: "
+                          f"{_ban_n_cnt}건 N 금지 (그중 확정원티드 O {_ban_n_wanted}건)")
 
             # # 주말 휴무자 N 요일 제한: forbid_n 아니고 2N/3N 2O 켜진 경우 2O가 주말에 자연 달성되도록 제한
             # # 2N→2O만: 목금만 N 허용. 3N→2O도 켜진 경우: 수목금 N 허용 (3N 블록이 금요일 끝나면 2O=토일)

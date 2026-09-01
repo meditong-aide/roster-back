@@ -1640,20 +1640,48 @@ def optimize_fallback_lex_hard_first(
                         continue
                     m.Add(X(n, d, night_idx) <= sum(neighbors))
 
-        # 휴가/공가 fixed 셀의 직전일 N 금지 (하드, 휴가/공가 보호 정책).
-        # fixed_wanted O / 휴무 / 주휴 등은 사용자 자발 OFF 또는 자동 OFF 라 대상 외.
-        # 단 prev_d == T0(day 0) 자체는 cross-month 면제.
+        # 고정 셀의 직전일 N 금지 (하드). 대상을 고르는 축이 **둘**이다.
+        #   ① type  : 휴가·공가        → ban_night_before_fixed_off      (기본 True)
+        #   ② 출처  : 확정 원티드 O    → ban_night_before_fixed_wanted_off (기본 False)
+        # ②의 근거 — 신청해서 받은 휴일이 직전 N 의 **회복 OFF 시작점**으로 소비되면
+        #   실질적으로 쉰 것이 아니다. 휴가·공가와 같은 취급을 받아야 한다.
+        #   ★ 대상은 `fixed_wanted_cells`(출처가 fixed_wanted)로 한정한다 —
+        #     솔버·주휴 규칙이 **자동으로** 넣은 OFF 는 걸리지 않는다.
+        #   ★ 판정은 대표코드 O 로 한다. `주`(주휴) 코드로 신청한 셀도 여기 든다 —
+        #     `_load_special_shift_map` 이 `type ∈ {근무,휴가,공가}` 로 거르는데
+        #     `O`·`주` 는 실측상 둘 다 `type='휴무'` 라 special 로 안 빠지고
+        #     `fixed_wanted_cells` 에 남는다. 반면 휴가·공가 계열 특수 코드는
+        #     `special_fixed_cells` 로 먼저 잡혀 ②가 아니라 ① 축이 담당한다.
+        # 월 경계: **당월 1일(d == T0)이 고정 OFF 면 대상 밖**이다(루프가 T0+1 부터 돈다).
+        #   전월이 N 으로 끝나 그 회복 OFF 가 넘어오는 건 막을 수 없고 막아서도 안 된다.
+        #   반면 2일(d == T0+1)이 고정 OFF 면 prev_d == T0(1일) 이므로 **금지가 걸린다**.
+        # ★ SKIP_PRIMARY 기본값이 "1" 이라 **이 경로가 실제로 도는 곳**이다.
+        #   cp_sat_basic 에만 넣으면 걸리지 않는다.
         _BAN_N_TYPES = {"휴가", "공가"}
-        if bool(getattr(cfg, "ban_night_before_fixed_off", False)):
+        _ban_by_type = bool(getattr(cfg, "ban_night_before_fixed_off", False))
+        _ban_by_wanted = bool(getattr(cfg, "ban_night_before_fixed_wanted_off", False))
+        if _ban_by_type or _ban_by_wanted:
+            # ★ 금지한 (nurse, day) 를 남긴다. 프리셉티 미러링이 프리셉터 셀을 그대로
+            #   덮어써 여기서 막은 N 을 되살리기 때문이다(모델 제약은 미러 이전 값에만 걸린다).
+            #   미러 쪽에서 조건을 다시 판정하면 두 곳이 갈리므로 **실제로 건 셀**을 넘긴다.
+            _ban_n_prev_cells: set[tuple[int, int]] = set()
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 _ban_n_cnt = 0
+                _ban_n_wanted = 0
                 for d in range(T0 + 1, T1 + 1):
                     if (n, d) not in fixed:
                         continue
                     _fw_type = fixed_type_by_cell.get((n, d))
-                    if _fw_type not in _BAN_N_TYPES:
-                        continue  # 휴가/휴무/공가 외 type 은 BanN 대상 아님
+                    _hit_type = _ban_by_type and _fw_type in _BAN_N_TYPES
+                    _hit_wanted = (
+                        _ban_by_wanted
+                        and (n, d) in fixed_wanted_cells
+                        and off_idx is not None
+                        and fixed.get((n, d)) == off_idx
+                    )
+                    if not (_hit_type or _hit_wanted):
+                        continue  # 어느 축에도 안 걸리는 셀
                     prev_d = d - 1
                     if prev_d < T0:
                         continue
@@ -1662,9 +1690,18 @@ def optimize_fallback_lex_hard_first(
                     if (n, prev_d) in fixed:
                         continue  # 이미 고정된 셀은 변경 불가
                     m.Add(X(n, prev_d, night_idx) == 0)
+                    _ban_n_prev_cells.add((n, prev_d))
                     _ban_n_cnt += 1
+                    if _hit_wanted and not _hit_type:
+                        _ban_n_wanted += 1
                 if _ban_n_cnt > 0:
-                    print(f"{logger_prefix} [BanNBeforeFixedOff] nurse_idx={n}: {_ban_n_cnt}건 N 금지")
+                    print(f"{logger_prefix} [BanNBeforeFixedOff] nurse_idx={n}: "
+                          f"{_ban_n_cnt}건 N 금지 (그중 확정원티드 O {_ban_n_wanted}건)")
+            roster_system._ban_n_prev_cells = _ban_n_prev_cells
+        else:
+            # ★ 두 축이 모두 꺼졌으면 **비워 둔다**. 같은 roster_system 으로 다시 build 할 때
+            #   지난 회차의 목록이 남아 있으면, 제약이 없는데도 미러가 그 칸을 OFF 로 눕힌다.
+            roster_system._ban_n_prev_cells = set()
 
         # # 주말 휴무자 N 요일 제한: 2N 2O 켜진 경우 목금만 N 허용 (2O가 주말에 자연 달성)
         # if bool(getattr(cfg, "two_offs_after_two_nig", False)):
@@ -3539,9 +3576,13 @@ def optimize_fallback_lex_hard_first(
         if bool(getattr(cfg, 'use_mid', False)):
             _fb_standard.add('M')
         _fb_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
+        # 고정 OFF 직전 N 금지가 실제로 건 셀. 미러가 프리셉터 N 을 덮어쓰지 못하게 한다.
+        _fb_ban_prev = getattr(roster_system, '_ban_n_prev_cells', set()) or set()
+        _fb_n_idx = _fb_shift_types.index('N') if 'N' in _fb_shift_types else None
         synced = 0
         special_converted = 0
         _fb_fw_restored = 0
+        _fb_ban_kept = 0
         _fb_pre_ptr_idx2 = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
         for pte_idx in preceptee_indices:
             # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티 누락 방지).
@@ -3574,6 +3615,17 @@ def optimize_fallback_lex_hard_first(
                             roster_system.roster[pte_idx, d, _fb_shift_types.index(_fw_code)] = 1
                             _fb_fw_restored += 1
                         continue
+                    # ★ 고정 OFF 직전 N 금지가 건 셀이면, 프리셉터를 따라 N 이 복사되는 것을
+                    #   막는다. 모델 제약은 미러 **이전** 값에만 걸리므로 여기서 다시 막지
+                    #   않으면 신청해 받은 휴일이 도로 회복 OFF 자리로 돌아간다.
+                    #   교육 연속성보다 휴일 보호를 우선한다(2026-08-31 결정).
+                    if (pte_idx, d) in _fb_ban_prev and _fb_n_idx is not None:
+                        if roster_system.roster[pte_idx, d, _fb_n_idx] == 1:
+                            roster_system.roster[pte_idx, d, :] = 0
+                            if _fb_off_idx is not None:
+                                roster_system.roster[pte_idx, d, _fb_off_idx] = 1
+                            _fb_ban_kept += 1
+                            continue
                     _fb_need = False
                     _fb_orig = _fb_orig_map.get((ptr_idx, d))
                     if _fb_orig:
@@ -3597,6 +3649,8 @@ def optimize_fallback_lex_hard_first(
                 msg += f" (특수코드→OFF 전환: {special_converted}건)"
             if _fb_fw_restored:
                 msg += f", fixed_wanted 재적용: {_fb_fw_restored}건"
+            if _fb_ban_kept:
+                msg += f", 고정OFF직전N 보호: {_fb_ban_kept}건"
             print(msg)
         # if bool(getattr(cfg, "ban_e_to_d", True)) and _fb_off_idx is not None:
         #     _fb_eve_idx = _fb_shift_types.index('E') if 'E' in _fb_shift_types else None

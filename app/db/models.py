@@ -659,6 +659,13 @@ class RosterConfig(Base):
     #   roster_config.py 의 dataclass 기본값(True) + cp_sat_basic create_config_from_db 의
     #   config_data.get('ban_night_before_fixed_off', True) 가 컬럼 부재 시 동일 동작 보장(prod 전량 True).
     #   재추가 금지: FE 미노출·probe/ontology 전용 상수-live 레버라 컬럼 저장 불필요.
+    # ── 확정 원티드 O 직전일 N 금지 ──
+    #   위 ban_night_before_fixed_off 와 축이 다르다. 저쪽은 type(휴가·공가)으로 대상을 고르고
+    #   전 병동 True 라 저장이 불필요하지만, 이쪽은 **병동이 켜고 끄는 설정**이라 저장이 필수다.
+    #   NULL = 미설정(= 꺼짐). 기존 row 를 건드리지 않으려 nullable 로 둔다.
+    #   판정은 항상 bool(getattr(cfg, ..., False)) — None 이 False 로 떨어져야 한다.
+    #   ★ 이 매핑이 없으면 `latest_config.__dict__` 에 안 실려 DB 값을 켜도 영원히 꺼진 채 돈다.
+    ban_night_before_fixed_wanted_off = Column(BOOLEAN, nullable=True, default=None)
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)

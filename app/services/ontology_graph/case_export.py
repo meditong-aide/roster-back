@@ -21,6 +21,7 @@ _CONFIG_KEYS = (
     "max_consecutive_nights", "max_consec_nights", "max_conseq_work",
     "two_offs_after_two_nig", "two_offs_after_three_nig", "not_one_night",
     "ban_n_to_d", "ban_n_to_e", "banned_day_after_eve", "ban_night_before_fixed_off",
+    "ban_night_before_fixed_wanted_off",
     "use_mid", "off_first", "preceptee_on",
 )
 # per-nurse 속성(진단이 읽는 것).

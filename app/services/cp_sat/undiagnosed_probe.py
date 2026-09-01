@@ -40,6 +40,12 @@ RELAX_CATALOG: list[dict[str, Any]] = [
      "apply": lambda c: {"not_one_night": False}},
     {"id": "disable_ban_n_before_fixed_off", "family": "night_pattern", "label_ko": "고정OFF 직전 야간 금지 해제",
      "apply": lambda c: {"ban_night_before_fixed_off": False}},
+    # ★ 위와 축이 다른 별개 설정이다(휴가·공가 type vs 확정 원티드 출처).
+    #   빠뜨리면 이 제약이 원인인 infeasible 이 UNDIAGNOSED 로 남아, 블랙박스 폴백이
+    #   해법을 못 찾는다 — 기본값이 False 라 켠 병동에서만 후보가 된다.
+    {"id": "disable_ban_n_before_fixed_wanted_off", "family": "night_pattern",
+     "label_ko": "신청 휴무 직전 야간 금지 해제",
+     "apply": lambda c: {"ban_night_before_fixed_wanted_off": False}},
     {"id": "disable_banned_day_after_eve", "family": "transition", "label_ko": "E→D 전이 금지 해제",
      "apply": lambda c: {"banned_day_after_eve": False}},
     {"id": "lower_off_days", "family": "off_budget", "label_ko": "월 OFF 요구일수 완화(-3)",
@@ -71,6 +77,7 @@ TRADEOFF_KO: dict[str, str] = {
     "relax_consecutive_nights": "야간을 더 길게 연속으로 서게 될 수 있습니다.",
     "disable_not_one_night": "단일 야간(1N) 근무가 생길 수 있습니다.",
     "disable_ban_n_before_fixed_off": "고정 휴무 직전에 야간이 배치될 수 있습니다.",
+    "disable_ban_n_before_fixed_wanted_off": "신청해 받은 휴무 직전에 야간이 배치되어, 그 휴무가 야간 회복분으로 소비될 수 있습니다.",
     "disable_banned_day_after_eve": "이브닝 다음날 데이 전이가 생길 수 있습니다.",
     "lower_off_days": "월 휴무일이 줄어듭니다.",
     "disable_preceptee_sync": "프리셉티가 프리셉터와 동반(팔로우)하지 않게 됩니다(교육 동반 약화).",
@@ -82,6 +89,7 @@ COL_LABEL_KO: dict[str, str] = {
     "max_nig_per_month": "월 야간 상한", "two_offs_after_two_nig": "2N→2OFF 회복",
     "two_offs_after_three_nig": "3N→2OFF 회복", "max_conseq_work": "연속근무 상한",
     "not_one_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
+    "ban_night_before_fixed_wanted_off": "신청 휴무 전 야간 금지",
     "banned_day_after_eve": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
     "max_consecutive_nights": "연속 야간 상한", "preceptee_on": "프리셉티 동반(팔로우)",
     "weekend_off_only_enable": "주말휴무 전용", "ban_n_to_d": "N→D 전이 금지",

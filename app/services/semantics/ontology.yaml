@@ -172,15 +172,19 @@ constraints:
   BanNightBeforeFixedOff:
     label: Ban Night Before Fixed Off
     parent: NurseLocalConstraint
-    scope: [nurse, day]
-    effective_modes: [enforced, inactive]
+    # axis 는 emit scope 에 실제로 실린다(type / fixed_wanted / both) — 선언에서 빠지면
+    # 온톨로지 메타데이터로 레코드를 해석하는 쪽이 유효한 축 값을 모르는 키로 본다.
+    scope: [nurse, day, axis]
+    # 전날이 이미 fixed 면 제약을 걸지 않고 bypassed_by_fixed 로 emit 한다.
+    # 같은 mode 를 쓰는 다른 5개 family 와 선언을 맞춘다.
+    effective_modes: [enforced, bypassed_by_fixed, inactive]
     connects: [AssignmentAtom, Nurse, Day]
-    explanation_template: "{nurse}의 휴가/공가 fixed 셀 직전일에는 N 시프트 금지 (휴가/공가 보호)."
+    explanation_template: "{nurse}의 쉬기로 굳힌 셀 직전일에는 N 시프트 금지 (휴가·공가 보호 / 확정 원티드 OFF 보호)."
     default_severity: hard
     relaxation_priority: 4
     tier: T2
     scope_explosion: low
-    notes: "Trigger 한정: (n, d) 의 fixed_type ∈ {휴가, 공가}. fixed_wanted O / 휴무 / 주휴 등은 trigger 안 함. Bypass: (n, d-1) 이 이미 fixed (fixed_wanted 포함) 이면 ban 룰 스킵 — 사용자가 명시적으로 N 직후 휴가/공가 fixed 조합을 둔 것은 의도로 간주. config flag: ban_night_before_fixed_off (default True)."
+    notes: "Trigger 축이 둘이다. ① type: (n, d) 의 fixed_type ∈ {휴가, 공가} — config flag ban_night_before_fixed_off (default True). ② 출처: (n, d) 가 확정 원티드이고 대표코드가 O — config flag ban_night_before_fixed_wanted_off (default False). ②는 신청해 받은 휴일이 직전 N 의 회복 OFF 시작점으로 소비되는 것을 막는다. 대상은 출처가 fixed_wanted 이고 대표코드가 O 인 셀(주휴 코드 포함 — OFF·주 는 O 로 접힌다). 자동으로 배정된 OFF 는 trigger 안 함. 휴가·공가 계열 특수 코드는 special_fixed 로 빠져 ②가 아니라 ①이 담당한다. emit scope 의 axis 로 두 축을 구분하며 완화도 그 값을 따른다. Bypass: (n, d-1) 이 이미 fixed (fixed_wanted 포함) 이면 ban 룰 스킵 — 사용자가 명시적으로 N 직후 휴무 fixed 조합을 둔 것은 의도로 간주. 월 경계: d 가 당월 1일이면 전월 N 마감의 회복분이라 대상 밖."
 
   WeekendOffOnly:
     label: Weekend Off Only

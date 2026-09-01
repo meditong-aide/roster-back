@@ -152,6 +152,10 @@ def _roster_config_to_dict(config) -> dict:
         "off_first": bool(getattr(config, "off_first", False)),
         "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
         # 보건휴가 자동 부여 — NULL(미설정)은 False 로 떨어져야 한다.
+        # NULL(미설정) = 꺼짐. 기존 ban_night_before_fixed_off 와 규약이 반대다.
+        "ban_night_before_fixed_wanted_off": bool(
+            getattr(config, "ban_night_before_fixed_wanted_off", False)
+        ),
         "health_leave_enabled": bool(getattr(config, "health_leave_enabled", False)),
         "health_leave_weekend": bool(getattr(config, "health_leave_weekend", False)),
         # 수면OFF 자동 부여 — NULL(미설정)은 False / cycle 은 값 그대로(미설정 None).

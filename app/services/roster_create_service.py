@@ -6821,7 +6821,12 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     #   즉시 원본을 돌려준다.
     try:
         from services.oncall_postprocess import postprocess_oncall
-        generated = postprocess_oncall(db, schedule, generated, current_user, req)
+        # ★ 솔버가 쓴 그 프리셋을 넘긴다. 안 넘기면 후처리가 **최신** config 를 읽어
+        #   옛 프리셋으로 생성했을 때 솔버와 다른 판정을 한다(콜 금지일이 어긋난다).
+        generated = postprocess_oncall(
+            db, schedule, generated, current_user, req,
+            config_id=getattr(latest_config, "config_id", None),
+        )
     except Exception as _oncall_exc:
         print(f"[Oncall] 후처리 실패 — 콜 미부여 진행: {_oncall_exc}")
     _persist_entries(db, schedule, generated, req)

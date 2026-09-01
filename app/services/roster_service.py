@@ -230,6 +230,16 @@ def materialize_generation_config(
     pdict = {
         k: v for k, v in payload.model_dump().items() if k not in _COMPARE_EXCLUDE
     }
+    # 미전송(None) 보존 필드는 **baseline 값으로 정규화한 뒤** 비교한다.
+    #   이 필드를 모르는 화면은 None 을 보내는데, 그걸 baseline 의 True/False 와 그대로
+    #   견주면 "바뀌었다" 로 읽혀 매 생성마다 프리셋이 포크된다. docstring 이 명시한
+    #   "동일하면 기존 row 재사용" 과 어긋나고, 포크된 row 는 save 경로에서 **직전 최신**
+    #   config 값을 승계하므로 사용자가 고른 baseline 과 다른 값이 실릴 수 있다.
+    #   저장 루프의 _PRESERVE_IF_NONE 가드와 같은 규약을 비교에도 적용하는 것이다.
+    if baseline is not None:
+        for _k in _PRESERVE_IF_NONE:
+            if _k in pdict and pdict[_k] is None:
+                pdict[_k] = getattr(baseline, _k, None)
     differs = True
     if baseline is not None:
         differs = any(getattr(baseline, k, None) != v for k, v in pdict.items())
@@ -238,11 +248,18 @@ def materialize_generation_config(
         resolved = baseline
     else:
         auto_name = _next_auto_config_name(db, office_id, group_id)
+        # ★ 포크에도 **정규화한 값**을 실어야 한다. None 인 채로 넘기면
+        #   save_roster_config_service 의 _PRESERVE_IF_NONE 승계가 **직전 최신** config 에서
+        #   값을 가져오므로, 사용자가 고른 baseline 이 오래된 프리셋일 때 엉뚱한 값이 실린다.
+        #   baseline 이 없으면 pdict 도 정규화되지 않아 None 그대로다(승계할 기준이 없으니 정상).
+        _preserved = {k: pdict[k] for k in _PRESERVE_IF_NONE if k in pdict}
         new_payload = payload.model_copy(
-            update={'config_id': None, 'config_name': auto_name}
+            update={'config_id': None, 'config_name': auto_name, **_preserved}
         )
+        # ★ 승계 기준을 baseline 으로 못박는다. 안 넘기면 save 가 **직전 최신** 프리셋에서
+        #   미전송 필드를 승계해, 오래된 baseline 을 고른 사용자가 최신의 값을 얻는다.
         res = save_roster_config_service(
-            new_payload, user, db, override_group_id=group_id
+            new_payload, user, db, override_group_id=group_id, inherit_from=baseline
         )
         resolved = db.query(RosterConfigModel).filter(
             RosterConfigModel.config_id == res['config_id']
@@ -269,6 +286,9 @@ def materialize_generation_config(
 _PRESERVE_IF_NONE = (
     "health_leave_enabled", "health_leave_weekend",
     "sleep_off_enabled", "sleep_off_cycle",
+    # 확정 원티드 O 직전일 N 금지. 켜 둔 병동이 이 필드를 모르는 화면에서 저장하면
+    # 조용히 꺼지므로 보존 대상이다.
+    "ban_night_before_fixed_wanted_off",
 )
 
 
@@ -278,6 +298,7 @@ def save_roster_config_service(
     db: Session,
     override_group_id: str | None = None,
     sync_use_mid_live: bool = False,
+    inherit_from=None,
 ):
     """근무표 설정 저장 (프리셋 upsert).
 
@@ -359,10 +380,14 @@ def save_roster_config_service(
                 db_config.version = _next_config_version(db, target_office_id, target_group_id)
         else:
             # 신규 프리셋 — 그룹(office+group)별 version = MAX+1 (0부터)
-            # ★ 미전송 필드는 직전 최신 config 값을 승계 — 생성은 created_at DESC 로 config 를
+            # ★ 미전송 필드는 기준 config 값을 승계 — 생성은 created_at DESC 로 config 를
             #   고르므로, 승계하지 않으면 새 프리셋을 저장하는 순간 기능이 꺼진 채로 생성된다.
+            # ★★ 기준은 `inherit_from` 이 있으면 그것, 없으면 직전 최신이다.
+            #   생성 시 포크(materialize_generation_config)는 **사용자가 고른 baseline** 을 넘긴다.
+            #   안 넘기면 오래된 프리셋을 골라 다른 설정만 바꿔도 최신 프리셋의 값이 딸려 들어와,
+            #   baseline 이 NULL(꺼짐)인 설정이 조용히 켜진 채로 생성된다.
             if any(config_dict.get(_k) is None for _k in _PRESERVE_IF_NONE):
-                _prev = (
+                _prev = inherit_from or (
                     db.query(RosterConfigModel)
                     .filter(
                         RosterConfigModel.office_id == target_office_id,
