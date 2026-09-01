@@ -1449,12 +1449,13 @@ async def publish_roster(
     office_id = current_user.office_id
 
     # Check if this is the first publication
+    #   ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 office 를 확정하는데
+    #     호출자 office 를 겹쳐 걸면 타 병원 그룹일 때 0건이 되어 **발행 이력이 없는 것처럼
+    #     보인다.** 아래 is_first_issue·max_seq·is_republish 가 전부 그 결과에 의존한다.
+    #     그룹 접근 권한은 _load_schedule_for_caller 가 이미 검증했다.
     existing_issued = (
         db.query(IssuedRoster)
-        .filter(
-            IssuedRoster.group_id == target_group_id,
-            IssuedRoster.office_id == office_id,
-        )
+        .filter(IssuedRoster.group_id == target_group_id)
         .first()
     )
 
@@ -1462,12 +1463,11 @@ async def publish_roster(
 
     # Get next sequence number
 
+    #   ★★ office_id 제거 — 여기서 0건이 나면 max_seq=0 이 되어 **이미 쓰인 seq_no 를
+    #     다시 부여한다**(중복). 위 existing_issued 와 같은 이유.
     max_seq = (
         db.query(func.max(IssuedRoster.seq_no))
-        .filter(
-            IssuedRoster.group_id == target_group_id,
-            IssuedRoster.office_id == office_id,
-        )
+        .filter(IssuedRoster.group_id == target_group_id)
         .scalar()
         or 0
     )
@@ -1510,8 +1510,8 @@ async def publish_roster(
         db.query(IssuedRoster)
         .join(Schedule, IssuedRoster.schedule_id == Schedule.schedule_id)
         .filter(
+            #   ★ office_id 제거 — 0건이면 is_republish 가 False 로 잘못 잡힌다.
             IssuedRoster.group_id == target_group_id,
-            IssuedRoster.office_id == office_id,
             Schedule.year == schedule.year,
             Schedule.month == schedule.month,
         )
@@ -1778,6 +1778,17 @@ async def get_roster_for_month(
 
 # [Roster] - 근무표 저장
 @router.post("/save")
+#   ★ 동기 def 로 바꾸지 말 것 (2026-09-01 되돌림).
+#     이 핸들러는 안이 전부 동기 SQLAlchemy 라 def 로 두면 threadpool 에서 도는데,
+#     그러면 **이벤트 루프에서 도는 다른 핸들러와 진짜 병렬로 실행된다.** 아래 N 연번
+#     재계산(`rebuild_night_cycle_from`)은 **그룹 전체** 범위라, 같은 그룹의 다른 근무표를
+#     고치는 publish/unpublish/drop 과 겹치면 서로의 낡은 상태를 읽어 공유 앵커
+#     (`NurseNightCycle`)를 덮어쓴다. 이 엔드포인트가 ScheduleEntry 를 전량 삭제 후
+#     재삽입하는 탓에, 그 중간을 읽은 쪽은 "근무표가 텅 빈" 스냅샷(0행)을 만든다.
+#     예외는 아래에서 삼켜지므로 **조용히 어긋난 채 커밋된다.**
+#     운영은 uvicorn 워커 1개(EC2 단일 프로세스, ECS 는 미사용)라 호출자 5곳이 전부
+#     async 인 동안에는 루프 하나에서 직렬화돼 이 결함에 도달하지 않는다.
+#     성능 때문에 def 로 돌리려면 **먼저** 5곳 전부에 그룹 단위 잠금을 넣어야 한다.
 async def save_roster(
     roster_data: dict,
     group_id: Optional[str] = None,
@@ -1810,22 +1821,72 @@ async def save_roster(
     )
     target_group_id = schedule.group_id
     schedule.memo = memo
+    # ★★ 같은 근무표에 대한 저장을 **직렬화**한다.
+    #   이 엔드포인트는 근무표를 전량 교체하므로, 두 사람이 동시에 저장하면 뒤늦은 쪽이
+    #   앞선 저장을 통째로 덮어쓴다(lost update). 이력도 덩달아 "무엇에서 무엇으로" 를
+    #   잘못 기록한다 — 둘 다 같은 옛 상태를 스냅샷으로 잡기 때문이다.
+    #   여기서 schedule 행을 갱신하고 flush 하면 그 행에 배타 잠금이 걸려, 두 번째 저장은
+    #   첫 번째가 커밋한 뒤에야 진행하고 **최신 상태를 스냅샷으로 본다**(실측: 대기 1.8초).
+    #   ★ updated_at 을 함께 건드리는 이유 — memo 가 그대로면 SQLAlchemy 가 UPDATE 를
+    #     생략해 잠금이 안 걸린다. 저장 시각 갱신은 의미상으로도 맞다.
+    schedule.updated_at = datetime.now()
+    db.flush()
+
+    # ── 수정 이력용 스냅샷 ──
+    #   ★ 이 엔드포인트는 근무표 **전체**를 받아 전량 교체한다. 즉 서버는 무엇이 바뀌었는지
+    #     모른다. 그래서 지우기 **직전에** 현재 상태를 찍어 두고, 재삽입 후 비교해 바뀐 칸만
+    #     로그로 남긴다. 실패해도 저장 자체는 막지 않는다(이력은 부가 기능).
+    #   ★★ 스냅샷은 **저장 트랜잭션 안**에서 도는 읽기다. 여기서 DB 예외가 나면 세션이
+    #     깨진 채로 남아 이후 delete/insert/commit 이 통째로 실패한다 — "부가 기능이라
+    #     감쌌다" 는 방어가 오히려 저장을 죽인다. 그래서 예외를 삼키기 전에 반드시
+    #     rollback 해서 세션을 되살린다(뒤 작업이 깨끗한 트랜잭션에서 시작하도록).
+    try:
+        from services.schedule_history_service import (
+            snapshot_entries, log_manual_changes,
+        )
+        _hist_before = snapshot_entries(db, schedule.schedule_id)
+    except Exception as _hist_exc:
+        print(f"[ScheduleHistory] 스냅샷 실패(이력 생략): {_hist_exc}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _hist_before = None
+        # rollback 으로 위에서 읽은 schedule 객체가 만료되므로 다시 붙인다.
+        schedule = _load_schedule_for_caller(
+            db, current_user, schedule_id,
+            not_found_detail="No schedule found for this month",
+        )
+        schedule.memo = memo
+        # ★ rollback 이 **직렬화 잠금까지 풀어 버린다.** 다시 잡지 않으면 이 저장만
+        #   잠금 없이 진행해 동시 저장 시 lost update 가 그대로 난다(이력이 없는 것과
+        #   근무표를 잃는 것은 다른 문제다). 위와 같은 방식으로 재획득한다.
+        schedule.updated_at = datetime.now()
+        db.flush()
+    _hist_after: dict = {}
+
     # Clear existing roster entries
     db.query(ScheduleEntry).filter(
         ScheduleEntry.schedule_id == schedule.schedule_id
     ).delete()
 
     # Save new roster entries (케이스 보존을 위해 유효 shift_id 기반 정규화)
+    #   ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 이미 office 를 확정하므로
+    #     중복 조건인데, **호출자의** office 를 겹쳐 걸면 대상 그룹이 다른 병원일 때
+    #     조회가 0건이 된다. 그러면 아래 valid_* 가 전부 비어 클라이언트가 보낸 정상
+    #     `schedule_ids` 가 무효 판정을 받고 **셀의 id 가 전량 NULL 로 저장된다** —
+    #     에러 없이 200 이라 조용히 망가진다(실측: 589칸 소실).
+    #     ADM 은 assert_caller_can_access_group 에서 office 무관하게 통과하므로 실제로
+    #     도달 가능한 경로다. 그룹 접근 권한은 위 `_load_schedule_for_caller` 가 이미 본다.
     shifts_for_group = (
         db.query(Shift)
-        .filter(
-            Shift.group_id == target_group_id,
-            Shift.office_id == getattr(current_user, "office_id", None),
-        )
+        .filter(Shift.group_id == target_group_id)
         .all()
     )
     valid_shift_ids = {s.shift_id for s in shifts_for_group}
     shift_id_to_int_id = {s.shift_id: s.id for s in shifts_for_group}
+    # 클라이언트가 보낸 schedule_ids 검증용 — 그 그룹에 실재하는 shifts.id 만 허용한다.
+    valid_int_ids = {s.id for s in shifts_for_group if s.id is not None}
 
     def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
         if raw_shift in valid_shift_ids:
@@ -1851,6 +1912,11 @@ async def save_roster(
                 norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
                 # 기존 schedule_ids 값 우선 사용, 없으면(수동 수정 셀) shift_id로 lookup
                 int_id = schedule_ids[day_index] if day_index < len(schedule_ids) else None
+                # ★ 클라이언트가 보낸 값이므로 **그 그룹의 유효한 shifts.id 인지** 확인한다.
+                #   낡거나 조작된 값을 그대로 쓰면 근무표에 남을 뿐 아니라 이력에도
+                #   그대로 박혀 나중에 "그때 무슨 근무였나" 를 영원히 잘못 가리킨다.
+                if int_id is not None and int_id not in valid_int_ids:
+                    int_id = None
                 if int_id is None:
                     int_id = shift_id_to_int_id.get(norm_shift)
                 entry = ScheduleEntry(
@@ -1862,6 +1928,36 @@ async def save_roster(
                     id=int_id,
                 )
                 db.add(entry)
+                if _hist_before is not None:
+                    _hist_after[(str(nurse_id), work_date)] = (norm_shift, int_id)
+
+    # ── 수정 이력 적재 ──
+    #   ★ 같은 트랜잭션에 넣는다. 따로 커밋하면 근무표는 바뀌었는데 이력이 없거나
+    #     그 반대인 상태가 생긴다.
+    #   ★★ **savepoint 안에서** 적재한다. `db.add()` 는 예외를 내지 않고 실제 오류는
+    #     flush/commit 에서 터지므로, 단순 try 로 감싸면 방어가 통째로 헛돈다 —
+    #     로그가 실패했는데 근무표 저장까지 같이 죽는다. 중첩 트랜잭션으로 묶어
+    #     여기서 flush 까지 끝내고, 실패하면 **로그만** 되돌린 뒤 저장을 이어간다.
+    if _hist_before is not None:
+        # ★★ savepoint 를 잡기 **전에** 근무표 변경을 먼저 확정한다.
+        #   `begin_nested()` 는 savepoint 를 만들기 앞서 pending 을 flush 하는데, 그 flush 가
+        #   실패하면 세션이 깨진 채로 아래 except 에 들어간다 — 이력 실패로 오인해 삼키고
+        #   나중 commit 에서 PendingRollbackError 로 터진다. 여기서 먼저 flush 해 두면
+        #   근무표 자체의 오류는 이력 방어에 걸리지 않고 정상적으로 위로 전파된다.
+        db.flush()
+        try:
+            with db.begin_nested():
+                _n = log_manual_changes(
+                    db, schedule_id=schedule.schedule_id, group_id=target_group_id,
+                    before=_hist_before, after=_hist_after,
+                    changed_by=getattr(current_user, "nurse_id", None),
+                )
+                db.flush()      # 오류를 savepoint 안에서 확정시킨다
+            if _n:
+                print(f"[ScheduleHistory] {schedule.schedule_id} 변경 {_n}칸 기록")
+        except Exception as _hist_exc:
+            # savepoint 만 롤백됐고 바깥 트랜잭션(근무표 저장)은 살아 있다.
+            print(f"[ScheduleHistory] 적재 실패(저장은 계속): {_hist_exc}")
 
     # ── N 연번 앵커 재계산 (마감본이 수정된 경우만) ──
     #   ★ 이 엔드포인트는 ScheduleEntry 를 전량 삭제 후 재삽입한다. 마감(issued) 근무표를
@@ -1882,6 +1978,49 @@ async def save_roster(
             print(f"[NightCycle] 마감본 수정 후 재계산 실패(무시): {_nc_exc}")
     db.commit()
     return {"message": "Roster saved successfully"}
+
+
+# [Roster] - 근무표 수정 이력
+@router.get("/schedule/{schedule_id}/history")
+def get_schedule_history(
+    schedule_id: str,
+    limit: int = 500,
+    latest_only: bool = False,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """선택한 근무표의 셀 수정 이력 — 최신순.
+
+    Args:
+        latest_only: True 면 칸마다 마지막 변경 한 건씩만. 같은 칸을 여러 번 고쳤을 때
+            중간 단계를 빼고 "손댄 칸들의 최종 모습" 을 본다.
+
+    ★ 사람이 화면에서 고친 것만 남는다. 생성·재생성은 기록하지 않는다.
+    ★ `current` 는 로그의 `after` 가 아니라 **근무표의 현재값**이다. 로그에는 바뀐 칸만
+      있어 마지막 after 를 현재값으로 쓰면 어긋날 수 있다(재생성 등).
+    ★ 동기 `def` 다 — 안의 SQLAlchemy 가 동기라 async 로 두면 이벤트 루프를 붙잡는다.
+    ★ 관리자 전용이다. `_load_schedule_for_caller` 만으로는 같은 그룹의 **일반 간호사도**
+      통과해 동료의 수정 이력과 수정자(changed_by)까지 보게 된다. 수정을 할 수 있는
+      사람과 같은 기준(`/roster/save`)으로 막는다.
+    """
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    _load_schedule_for_caller(
+        db, current_user, schedule_id,
+        not_found_detail="근무표를 찾을 수 없습니다.",
+    )
+    try:
+        from services.schedule_history_service import list_schedule_history
+        return list_schedule_history(
+            db, schedule_id=schedule_id, limit=limit, latest_only=latest_only,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"수정 이력 조회 실패: {str(e)}")
 
 
 # [Schedules] - 특정 스케줄의 모든 간호사 원티드 제출 현황 확인

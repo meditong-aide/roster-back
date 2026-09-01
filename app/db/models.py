@@ -508,6 +508,49 @@ class ScheduleEntry(Base):
     id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
 
 
+class ScheduleEntryLog(Base):
+    """근무표 셀 **수동 수정** 이력. `schedule_entries` 는 현재 상태만 유지하고 이력은 여기 쌓인다.
+
+    ★ 대상은 `/roster/save`(사람이 화면에서 고친 것)뿐이다. 생성·재생성은 남기지 않는다 —
+      한 번에 수백 행이 바뀌어 로그가 금세 커지고, 사용자가 보려는 "내가 고친 이력"과 성격이 다르다.
+      나중에 방침이 바뀌어도 `source` 로 구분만 하면 되도록 컬럼은 미리 뒀다.
+
+    ★★ 왜 id 와 코드 문자열을 **둘 다** 남기는가
+      `shifts` 는 PK·인덱스가 없고 `shift_id` 코드가 실제로 교체된다(실측: 같은 shifts.id 에
+      N→N1, O→OFF, D→Dㅇ 등 5건). 그렇다고 id 만으로도 부족하다 — shifts.id 는 1643행 중
+      3건이 **다른 병동에서 중복**된다(id=1874 가 동탄시티 'OFF' 와 시화 '반반반' 양쪽).
+      그래서 안정 참조(id) + 그 시점 표시값(코드·색) + 병동(group_id)을 함께 남겨야
+      나중에 코드나 색이 바뀌어도 이력을 그대로 재현할 수 있다.
+    """
+
+    __tablename__ = "schedule_entry_log"
+
+    log_id = Column(BIGINT, primary_key=True, autoincrement=True)
+    schedule_id = Column(VARCHAR(50), nullable=False)
+    nurse_id = Column(VARCHAR(50), nullable=False)
+    work_date = Column(DATE, nullable=False)
+    #: 그 셀의 몇 번째 변경인지(1부터). DB 가 아니라 앱이 채운다 — 이 프로젝트엔 트리거/시퀀스 관행이 없다.
+    seq = Column(INTEGER, nullable=False)
+
+    before_id = Column(INTEGER, nullable=True)          # shifts.id (신규 배정이면 NULL)
+    before_shift_id = Column(NVARCHAR(10), nullable=True)
+    before_color = Column(VARCHAR(10), nullable=True)
+
+    after_id = Column(INTEGER, nullable=True)           # 삭제면 NULL
+    after_shift_id = Column(NVARCHAR(10), nullable=True)
+    after_color = Column(VARCHAR(10), nullable=True)
+
+    group_id = Column(VARCHAR(50), nullable=True)       # (group_id, shifts.id) 라야 shift 가 유일
+    action = Column(VARCHAR(10), nullable=False)        # 'update' | 'insert' | 'delete'
+    source = Column(VARCHAR(10), nullable=False)        # 'manual' | 'generate'
+    changed_by = Column(VARCHAR(50), nullable=True)
+    changed_at = Column(DATETIME, nullable=False)
+    #: 그 셀의 **마지막 변경 기록**인가. 셀당 1행만 True 여야 한다.
+    #: ★ "현재값" 과 다르다 — 재생성되면 근무표는 바뀌지만 이 로그는 그대로다.
+    #:   현재값의 정본은 언제나 `schedule_entries` 다.
+    is_latest = Column(BOOLEAN, nullable=False, default=True)
+
+
 class Shift(Base):
     __tablename__ = "shifts"
     shift_id = Column(VARCHAR(10), primary_key=True)
