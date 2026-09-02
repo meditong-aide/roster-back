@@ -33,6 +33,12 @@ from services.day_windows import iter_nurse_days, build_active_days
 # lex Stage 2 에서 team_min 커버 부족(slack) 1건당 패널티. safety(off-quota 10~30만) 위에
 # 두어 팀 커버를 상위 co-priority 로 만든다(단, 커버리지/안전은 이미 상위 stage 에서 고정).
 TEAM_COVER_LEX_WEIGHT = 300_000
+# Stage 2 에서 "요구 등급 미달"(cascade off=0) 을 최소화할 때의 가중치.
+#   team(30만) 아래, safety off-quota 하한(10만) 위에 둔다. grade 는 team 과 같은
+#   성격(고정된 커버리지 안에서의 재배치)이라 같은 층이되 team 을 앞세운다.
+#   ★ cascade 의 대체 단계(off≥1) 는 2M/6M 이라 여기에 넣지 않는다 — 넣으면 team 과
+#     safety 를 압도해 lex 우선순위가 뒤집힌다. 그 단계는 Stage 3 목적함수가 맡는다.
+GRADE_OFF0_LEX_WEIGHT = 150_000
 
 
 def _cp_sat_status_to_text(status: int) -> str:
@@ -2732,6 +2738,15 @@ def optimize_fallback_lex_hard_first(
         except Exception as _grade_hard_exc:
             print(f"{logger_prefix} [GradeHard] fallback stage 공통 제약 추가 실패: {_grade_hard_exc}")
 
+        # grade cascade 는 `short >= target - 누적` 형태의 **soft** 다. 페널티가 목적함수에
+        #   없으면 solver 가 short 를 최대로 써도 손해가 없어 제약이 사실상 사라진다.
+        #   기존에는 Stage 3 objective 에서만 반영되어, Stage 3 가 시간 내(기본 tl3=12초)
+        #   못 끝내거나 실패하면 grade 가 통째로 빠진 Stage 2 해가 commit 됐다.
+        #   (실측: 운영 8월 3건 모두 월 총합은 초과 달성인데 일별 20~25% 가 0명,
+        #    재생성마다 19/22/23 으로 흔들림)
+        #   ★ off=0(요구 등급 미달)만 가져온다. 대체 단계는 위 상수 주석 참조.
+        _grade_off0 = list(getattr(m, "_grade_off0_shorts", []) or [])
+
         # nurse-level 월간 D/E/N/O 한도 hard (모든 stage 공통).
         # primary cp_sat_basic이 INFEASIBLE 되어 fallback 진입 시 사용자 입력 한도가
         # 무시되던 회귀 fix. 같은 모듈을 primary와 공유하여 동작 일치성 확보.
@@ -2775,6 +2790,7 @@ def optimize_fallback_lex_hard_first(
             m.Minimize(
                 sum(safety_sum)
                 + TEAM_COVER_LEX_WEIGHT * sum(_tm_cover_slacks)
+                + GRADE_OFF0_LEX_WEIGHT * sum(_grade_off0)
             )
         else:
             if coverage_eq is not None:
@@ -3039,6 +3055,9 @@ def optimize_fallback_lex_hard_first(
             # 직전 feasible 해를 주입해 빈 해 반환 자체를 막는다.
             lex_x2_val: dict = {}
             lex_safety_val: dict = {}
+            # 6-pass(grade 재배치)가 달성한 미달 칸 수. stage3 가 이 값을 상한으로
+            #   물려받지 않으면 재배치 결과가 흩어진다(실측: lex short=4 인데 최종 14~20).
+            lex_grade_short: Optional[int] = None
 
             def _capture_lex_solution() -> None:
                 for _n in range(N):
@@ -3232,10 +3251,53 @@ def optimize_fallback_lex_hard_first(
                                                     st2_de = s2.Solve(m2)
                                                     if st2_de in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                                                         _capture_lex_solution()
+                                                        _de_best = int(s2.ObjectiveValue())
                                                         print(
                                                             f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
-                                                            f"status={_cp_sat_status_to_text(st2_de)} excess={int(s2.ObjectiveValue())}"
+                                                            f"status={_cp_sat_status_to_text(st2_de)} excess={_de_best}"
                                                         )
+                                                        # ── 6-pass: grade 미달 칸 재배치 ──
+                                                        #   총량은 그대로 두고 **날짜만 옮겨** 미달 칸을 줄인다.
+                                                        #   목적함수에 항을 더하는 방식(초과 페널티·가중치 증가)은
+                                                        #   둘 다 실측에서 실패했다. 여기서는 앞 패스 품질을 전부
+                                                        #   동결한 뒤 미달 칸 수만 최소화하므로, "뭉치지 않으려
+                                                        #   미달을 감수" 하는 왜곡이 구조적으로 생기지 않는다.
+                                                        #   (실측 근거: 같은 제약에서 회피가능 미달이 8까지 내려간
+                                                        #    적이 있는데 평균은 15.6 — 해의 산포가 문제였다)
+                                                        try:
+                                                            # ★ spec 은 stage2 모델에 붙어 있다. build_model 안의
+                                                            #   `m` 은 그 함수의 지역 변수라 여기서는 보이지 않는다.
+                                                            _g_spec = list(getattr(m2, "_grade_cell_spec", []) or [])
+                                                            if _g_spec:
+                                                                m2.Add(sum(_de_excs) <= _de_best)
+                                                                _g_shorts = []
+                                                                for _gd, _gs, _gt, _gmem in _g_spec:
+                                                                    _cum = sum(
+                                                                        X2(_n, _gd, _gs) for _n in _gmem
+                                                                        if join[_n] <= _gd <= leave[_n]
+                                                                    )
+                                                                    _sh = m2.NewIntVar(0, int(_gt), f"lex_g_short_d{_gd}_s{_gs}")
+                                                                    m2.Add(_sh >= int(_gt) - _cum)
+                                                                    _g_shorts.append(_sh)
+                                                                m2.Minimize(sum(_g_shorts))
+                                                                s2.parameters.max_time_in_seconds = max(3.0, float(tl2) * 0.3)
+                                                                _hint_lex_solution()
+                                                                st2_g = s2.Solve(m2)
+                                                                if st2_g in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                                                    _capture_lex_solution()
+                                                                    lex_grade_short = int(s2.ObjectiveValue())
+                                                                    print(
+                                                                        f"{logger_prefix} 폴백2 lex 6-pass (grade 재배치): "
+                                                                        f"status={_cp_sat_status_to_text(st2_g)} "
+                                                                        f"short={lex_grade_short} cells={len(_g_shorts)}"
+                                                                    )
+                                                                else:
+                                                                    print(
+                                                                        f"{logger_prefix} 폴백2 lex 6-pass (grade 재배치): "
+                                                                        f"status={_cp_sat_status_to_text(st2_g)} — 5th 결과 유지"
+                                                                    )
+                                                        except Exception as _g_e:
+                                                            print(f"{logger_prefix} 폴백2 lex 6-pass 예외: {_g_e}")
                                                     else:
                                                         print(
                                                             f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
@@ -3348,6 +3410,25 @@ def optimize_fallback_lex_hard_first(
         )
         for k in safety3.keys():
             m3.Add(sum(safety3[k]) == sum(safety2[k]))
+        # grade 도 같이 동결한다. lex 6-pass 가 재배치로 미달을 낮춰 놔도 stage3 는
+        #   배치를 새로 계산하므로 그대로 두면 흩어진다(실측: lex short=4 → 최종 14~20).
+        #   safety 와 달리 등호가 아니라 상한이다 — stage3 가 더 좋게 만드는 것은 막지 않는다.
+        #   ★ 이 제약으로 stage3 가 INFEASIBLE 이 되면 아래 실패 경로가 stage2 해(=lex 로
+        #     이미 개선된 해)로 되돌아가므로 grade 품질은 보존된다.
+        _g3_spec = list(getattr(m3, "_grade_cell_spec", []) or [])
+        if lex_grade_short is not None and _g3_spec:
+            _g3_shorts = []
+            for _gd, _gs, _gt, _gmem in _g3_spec:
+                _cum3 = sum(
+                    X3(_n, _gd, _gs) for _n in _gmem
+                    if join[_n] <= _gd <= leave[_n]
+                )
+                _sh3 = m3.NewIntVar(0, int(_gt), f"s3_g_short_d{_gd}_s{_gs}")
+                m3.Add(_sh3 >= int(_gt) - _cum3)
+                _g3_shorts.append(_sh3)
+            m3.Add(sum(_g3_shorts) <= int(lex_grade_short))
+            print(f"{logger_prefix} 폴백3 grade 동결: short <= {lex_grade_short} "
+                  f"(cells={len(_g3_shorts)})")
         for n in range(N):
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
