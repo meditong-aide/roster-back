@@ -96,6 +96,7 @@ from services.roster_service import (
     get_issued_roster_snapshot_service,
     get_my_issued_roster_service,
     get_my_issued_week_service,
+    get_my_today_service,
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
@@ -892,6 +893,68 @@ def get_my_issued_week(
         raise HTTPException(
             status_code=500, detail=f"주간 근무표 조회 실패: {str(e)}"
         )
+
+
+# [Roster] - 본인 당일 근무 + 같은 시간대 동료 + 다음 OFF (모바일)
+@router.get("/me/today")
+def get_my_today(
+    date: Optional[str] = None,
+    include: Optional[str] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """모바일 '오늘 근무' 화면용 — 본인 근무 + 같이 일하는 동료 + 다음 OFF.
+
+    셋을 한 응답에 담는 이유는 **같은 발행 스냅샷 하나로 전부 계산되기 때문**이다.
+    나누면 같은 스냅샷을 2~3번 로드한다.
+
+    Args:
+        date: 기준일(선택, 기본=오늘). `YYYY-MM-DD`. 빈 문자열(`?date=`)은 거부한다 —
+            값을 안 줄 거면 파라미터 자체를 빼야 한다(`/issued_roster/me/week` 와 동일 규칙).
+        include: 쉼표 구분(`coworkers`,`next_off`). 생략하면 둘 다 포함.
+
+    ★ `async def` 가 아니라 **동기 `def`** 다. SQLAlchemy 가 동기라 `async` 핸들러에
+      두면 DB I/O 동안 이벤트 루프가 막힌다. 대시보드 상단이라 폴링된다.
+    ★ 미발행은 오류가 아니다 — `issued: false` + `my_shift: null` 로 200 을 낸다.
+      404 는 CloudFront 가 `index.html` 200 으로 바꿔 보내 모바일이 하얗게 뜬다.
+    """
+    base_date = None
+    if date is not None:
+        raw = date.strip()
+        if not raw:
+            raise HTTPException(
+                status_code=400,
+                detail="date 가 비어 있습니다. 생략하거나 YYYY-MM-DD 로 주세요.",
+            )
+        try:
+            base_date = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="date 는 YYYY-MM-DD 형식이어야 합니다."
+            )
+
+    parts = None
+    if include is not None:
+        parts = {p.strip() for p in include.split(",") if p.strip()}
+        unknown = parts - {"coworkers", "next_off"}
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"include 에 알 수 없는 값: {', '.join(sorted(unknown))}",
+            )
+
+    try:
+        return get_my_today_service(
+            current_user=current_user,
+            db=db,
+            base_date=base_date,
+            include_coworkers=parts is None or "coworkers" in parts,
+            include_next_off=parts is None or "next_off" in parts,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"당일 근무 조회 실패: {str(e)}")
 
 
 # [Schedules] - 현재 그룹의 특정 월에 대한 스케줄 상태 확인
