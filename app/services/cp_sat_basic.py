@@ -2520,15 +2520,22 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             j = 0
 
         # leave: 당월 물리 마지막일(inclusive) 기준
+        # ★ resignation_date 는 **퇴사일 그 자체**이고 그날부터는 소속이 아니다.
+        #   따라서 마지막 근무일은 resignation_date - 1 일이다.
+        #   (기존에는 l = (resignation_date - first_day).days 라 퇴사일 당일까지
+        #    배정됐다. 실측: 이애진 2026-07-20 퇴사인데 20일에 N → 18·19·20 3연속 N,
+        #    이윤지는 17일 퇴사인데 17일에 N → 퇴사일을 빼면 16일 1N 단독만 남아
+        #    하드락 7번(1N 금지) 위반이 된다.)
         if nu.resignation_date:
-            if nu.resignation_date < first_day:
+            last_work_date = nu.resignation_date - timedelta(days=1)
+            if last_work_date < first_day:
                 join.append(1)
                 leave.append(0)
                 continue
-            elif nu.resignation_date > last_day_phys:
+            elif last_work_date > last_day_phys:
                 l = D_phys - 1
             else:
-                l = (nu.resignation_date - first_day).days
+                l = (last_work_date - first_day).days
         else:
             l = D_phys - 1
 
