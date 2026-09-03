@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os as _os_lex
+
 import calendar
 from datetime import timedelta
 from typing import Dict, Optional
@@ -33,6 +35,19 @@ from services.day_windows import iter_nurse_days, build_active_days
 # lex Stage 2 에서 team_min 커버 부족(slack) 1건당 패널티. safety(off-quota 10~30만) 위에
 # 두어 팀 커버를 상위 co-priority 로 만든다(단, 커버리지/안전은 이미 상위 stage 에서 고정).
 TEAM_COVER_LEX_WEIGHT = 300_000
+# stage3 에 grade 미달 상한을 물려 lex 6-pass 재배치 결과를 지킬지 여부.
+#   끄면 stage3 가 배치를 새로 계산해 재배치 결과가 흩어진다. 상세는 '폴백3 grade 동결' 주석.
+#   문제가 생기면 이 값만 False 로 되돌리면 기존 동작으로 복귀한다.
+GRADE_FREEZE_STAGE3 = True
+# lex 패스 기본 순서. 앞일수록 우선(사전식) — 뒤 패스는 앞 결과를 동결한 채 움직인다.
+#   env LEX_PASS_ORDER 로 덮어써 순열을 실측할 수 있다.
+# 1순위 grade · 2순위 team — 실측 근거:
+#   · grade 를 앞에 두면 7병동 중 6곳 개선·1곳 동일·악화 0 (9병동 13.7→5.7, 2병동 36.3→25.3)
+#   · team 은 마지막(45.0) → 3번째(22.8/22.0/23.6) 로 절반. 위치에 강하게 반응한다.
+#   · 1번 자리는 하나뿐이라 grade 와 team 은 맞교환이다(team1 이면 grade 11.0 으로 2배 악화).
+#     운영 판단으로 grade 를 앞에 둔다.
+#   설정이 없는 병동에서는 각 prep 이 None 을 돌려 자동으로 건너뛴다.
+LEX_PASS_ORDER_DEFAULT = "grade,team,off_range,n_range,n2n,de"
 # Stage 2 에서 "요구 등급 미달"(cascade off=0) 을 최소화할 때의 가중치.
 #   team(30만) 아래, safety off-quota 하한(10만) 위에 둔다. grade 는 team 과 같은
 #   성격(고정된 커버리지 안에서의 재배치)이라 같은 층이되 team 을 앞세운다.
@@ -2767,6 +2782,52 @@ def optimize_fallback_lex_hard_first(
         if stage == 1:
             # m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))
             OFF_PENALTY=30
+            # ── OFF 개인별 baseline 편차 ──
+            #   ★ 기존엔 OFF '총량' 만 최소화해 "누구에게 몰리는지" 기준이 없었다.
+            #     그래서 근무 자리가 남을 때 잔여 OFF 가 임의로 쏠린다
+            #     (실측: 같은 설정·같은 요구인데 range 0(중환자실1) vs 6(2병동)).
+            #   ★ baseline 은 설정값이 아니라 '이론 균등값' 이다 — off_days 는 대개
+            #     달성 불가다(설정 8~11 인데 이론 14.7~15.9). 달성 못 할 값을 목표로
+            #     주면 전원이 미달해 편차가 무의미해진다.
+            #   ★ 가중치는 커버(10만)보다 훨씬 작게 둔다. 커버를 밀면 coverage_eq 로
+            #     고정되어 이후 단계에서 되돌릴 수 없다.
+            _s1_dev_w = int(_os_lex.getenv("S1_OFF_DEV_WEIGHT", "300") or 0)
+            _s1_devs = []
+            if _s1_dev_w > 0:
+                # 월 총 요구칸 = Σ(일자별 D/E/N/M 요구). 커버리지 루프와 같은 소스를 쓴다
+                #   (daily_shift_requirements_by_day 가 있으면 그것, 없으면 공통값).
+                _s1_req = 0
+                try:
+                    _by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
+                    for _dd in range(D):
+                        _nm = (_by_day[_dd] if isinstance(_by_day, list) and _dd < len(_by_day)
+                               else cfg.daily_shift_requirements)
+                        for _cc, _rq in (_nm or {}).items():
+                            if _cc == "O" or _cc not in cfg.shift_types:
+                                continue
+                            _s1_req += max(0, int(_rq or 0))
+                except Exception as _s1_e:
+                    print(f"{logger_prefix} [S1OffBaseline] 요구 합 계산 실패(건너뜀): {_s1_e}")
+                    _s1_req = 0
+                # 요구 합을 못 구하면 baseline 을 세우지 않는다(조용히 건너뜀).
+                _s1_pool = [
+                    _n for _n in range(N)
+                    if leave[_n] >= join[_n]
+                    and len(list(iter_nurse_days(_n, join, leave, blocked_by_nurse))) >= D
+                ]
+                if _s1_req > 0 and _s1_pool:
+                    _s1_base = max(0, round(D - _s1_req / len(_s1_pool)))
+                    print(f"{logger_prefix} [S1OffBaseline] base={_s1_base} "
+                          f"pool={len(_s1_pool)} req={_s1_req} w={_s1_dev_w}")
+                    for _n in _s1_pool:
+                        _cnt = sum(
+                            X(_n, _d, off_idx)
+                            for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
+                        )
+                        _dv = m.NewIntVar(0, D, f"s1_off_dev_{_n}")
+                        m.Add(_dv >= _cnt - _s1_base)
+                        m.Add(_dv >= _s1_base - _cnt)
+                        _s1_devs.append(_dv)
             m.Minimize(
             FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms)
             + sum(over_terms)
@@ -2777,6 +2838,7 @@ def optimize_fallback_lex_hard_first(
                 if (n, d) not in structural_off_cells
                 and (n, d) not in vacation_off_cells
                 )
+            + (_s1_dev_w * sum(_s1_devs) if _s1_devs else 0)
             )
         elif stage == 2:
             if coverage_eq is not None:
@@ -3059,7 +3121,7 @@ def optimize_fallback_lex_hard_first(
             lex_x2_val: dict = {}
             lex_safety_val: dict = {}
             # 6-pass(grade 재배치)가 달성한 미달 칸 수. stage3 가 이 값을 상한으로
-            #   물려받지 않으면 재배치 결과가 흩어진다(실측: lex short=4 인데 최종 14~20).
+            #   물려받아 재배치 결과를 지킨다(아래 '폴백3 grade 동결' 참조).
             lex_grade_short: Optional[int] = None
 
             def _capture_lex_solution() -> None:
@@ -3087,8 +3149,17 @@ def optimize_fallback_lex_hard_first(
                     best_sum2 = sum(int(s2.Value(v)) for v in flat_safety)
                     m2.Add(sum(flat_safety) <= best_sum2)
                     use_mid_h1 = bool(getattr(cfg, "use_mid", False))
-                    off_count_vars = []
-                    nightonly_excluded_idx: set[int] = set()
+                    # ── 공통 준비: 순서와 무관하게 한 번만 계산한다 ──
+                    #   원래는 OFF range 패스 루프 안에서 채워졌고 N range·D/E 가 그걸
+                    #   물려 썼다. 순서를 바꾸려면 이 계산이 패스와 분리돼 있어야 한다.
+                    #   ★ 제외 집합은 **용도가 둘**이다. 하나로 쓰면 안 된다.
+                    #     · nightonly_idx      = N전담. D/E 가 없으니 어떤 패스에서도 대상 아님.
+                    #     · range_excluded_idx = N전담 + 월 전체를 일하지 않는 사람.
+                    #       range(max-min) 패스에서만 뺀다 — 특이값 하나에 무력화되므로.
+                    #     D/E 균등은 개인별 |D-E| 초과분의 **합**이라 특이값에 무너지지 않는다.
+                    #     여기에 부분근무자를 빼면 그들의 D/E 가 방치된다(실제로 그랬다).
+                    nightonly_idx: set[int] = set()
+                    range_excluded_idx: set[int] = set()
                     for n_lex in range(N):
                         if leave[n_lex] < join[n_lex]:
                             continue
@@ -3100,223 +3171,330 @@ def optimize_fallback_lex_hard_first(
                         except Exception:
                             is_n_only_lex = False
                         if is_n_only_lex:
-                            nightonly_excluded_idx.add(n_lex)
+                            nightonly_idx.add(n_lex)
+                            range_excluded_idx.add(n_lex)
                             continue
-                        cnt = sum(
-                            X2(n_lex, d, off_idx)
-                            for d in iter_nurse_days(n_lex, join, leave, blocked_by_nurse)
+                        # ★ 주말휴무자(평일만 근무)도 range 에서 뺀다.
+                        #   위 [WeekendOff] 블록이 주말=OFF 강제·평일=OFF 금지를 **하드로**
+                        #   걸므로 그들의 월 OFF 수는 주말 일수로 완전히 결정된다. solver 가
+                        #   못 바꾸는 값이 max-min 안에 있으면 목적식이 그 바닥에 눌려,
+                        #   조절 가능한 사람들을 고르게 만들어도 range 가 줄지 않는다.
+                        #   (실측: 주말휴무자 있는 20개 병동 중 8곳에서 경계를 점유.
+                        #    51병동-RN 은 주휴무 OFF 8 이 min 을 잡아 일반 10~11 인데 range 3,
+                        #    빼면 1. 중환자실은 21 → 4.)
+                        #   ★ 빼도 통제를 잃지 않는다 — 이미 하드로 고정돼 있다.
+                        if bool(getattr(nu, "is_weekend_off", False)) and \
+                                _os_lex.getenv("WEEKOFF_RANGE_EXCLUDE", "1") != "0":
+                            range_excluded_idx.add(n_lex)
+                            continue
+                        # ★ 활동 기간이 그 달 전체가 아닌 사람(중도 입퇴사·전입)도 뺀다.
+                        #   range 는 max-min 이라 **특이값 하나에 무력화**된다. 9일만 활동해
+                        #   OFF 가 3 인 사람이 섞이면 min 이 3 에 고정되고, 그러면 전체 활동자가
+                        #   7 이든 10 이든 range 가 같아져 그들 사이를 고르게 만들 유인이 사라진다.
+                        #   (실측: OFF range OPTIMAL=7 인데 31일 활동자끼리 7~10 으로 벌어짐)
+                        #   ★ join/leave 는 전체 범위이고 실제 비활동은 blocked_by_nurse 로
+                        #     표현된다. leave-join+1 로 재면 전원 31 이 나와 걸러지지 않는다.
+                        _act_days = sum(
+                            1 for _ in iter_nurse_days(n_lex, join, leave, blocked_by_nurse)
                         )
-                        off_count_vars.append((n_lex, cnt))
-                    if off_count_vars:
-                        max_off_lex = m2.NewIntVar(0, D, "lex_max_off")
-                        min_off_lex = m2.NewIntVar(0, D, "lex_min_off")
-                        for _, cnt in off_count_vars:
-                            m2.Add(cnt <= max_off_lex)
-                            m2.Add(cnt >= min_off_lex)
-                        m2.Minimize(max_off_lex - min_off_lex)
-                        s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
-                        _hint_lex_solution()
-                        st2_off = s2.Solve(m2)
-                        if st2_off in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                            _capture_lex_solution()
-                            best_off_range = int(s2.Value(max_off_lex) - s2.Value(min_off_lex))
-                            print(
-                                f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
-                                f"status={_cp_sat_status_to_text(st2_off)} range={best_off_range}"
+                        if _act_days < D:
+                            range_excluded_idx.add(n_lex)   # range 패스에서만 제외
+                    night_idx_h1 = (
+                        cfg.shift_types.index("N") if "N" in cfg.shift_types else None
+                    )
+
+                    # ── 패스 정의 ──
+                    #   각 prep 은 (목적식, 동결콜백, 최소초, 시간비율) 또는 None(대상 없음).
+                    #   동결콜백은 그 패스가 달성한 값을 상한으로 걸어 뒤 패스가 깨지 못하게 한다.
+                    #   ★ 변수 생성이 prep 안에 있는 것이 중요하다 — 그 패스 차례가 와야
+                    #     모델에 변수가 붙으므로, 쓰이지 않는 순서에서는 모델이 커지지 않는다.
+                    def _prep_off():
+                        _cnts = []
+                        for _n in range(N):
+                            if leave[_n] < join[_n] or _n in range_excluded_idx:
+                                continue
+                            _cnts.append(sum(
+                                X2(_n, _d, off_idx)
+                                for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
+                            ))
+                        if not _cnts:
+                            return None
+                        _mx = m2.NewIntVar(0, D, "lex_max_off")
+                        _mn = m2.NewIntVar(0, D, "lex_min_off")
+                        for _c in _cnts:
+                            m2.Add(_c <= _mx)
+                            m2.Add(_c >= _mn)
+                        return (_mx - _mn, lambda v: m2.Add(_mx - _mn <= v), 2.0, 0.2)
+
+                    def _prep_grade():
+                        # 총량은 그대로 두고 날짜만 옮겨 미달 칸을 줄인다. 목적함수에 항을
+                        # 더하는 방식(초과 페널티·가중치 증가)은 둘 다 실측에서 실패했다.
+                        _spec = list(getattr(m2, "_grade_cell_spec", []) or [])
+                        if not _spec:
+                            return None
+                        _shorts = []
+                        for _gd, _gs, _gt, _gmem in _spec:
+                            _cum = sum(
+                                X2(_n, _gd, _gs) for _n in _gmem
+                                if join[_n] <= _gd <= leave[_n]
                             )
-                            m2.Add(max_off_lex - min_off_lex <= best_off_range)
-                            night_idx_h1 = (
-                                cfg.shift_types.index("N") if "N" in cfg.shift_types else None
-                            )
-                            if night_idx_h1 is not None:
-                                n_count_vars = []
-                                for n_lex in range(N):
-                                    if leave[n_lex] < join[n_lex]:
+                            _sh = m2.NewIntVar(0, int(_gt), f"lex_g_short_d{_gd}_s{_gs}")
+                            m2.Add(_sh >= int(_gt) - _cum)
+                            _shorts.append(_sh)
+
+                        def _freeze_grade(v):
+                            # stage3 가 이 값을 상한으로 물려받아 재배치 결과를 지킨다.
+                            nonlocal lex_grade_short
+                            lex_grade_short = int(v)
+                            m2.Add(sum(_shorts) <= int(v))
+
+                        # ★ 설정된 등급이 전부 반영됐는지는 이 개수로만 사후 확인된다.
+                        #   (일수 x 값>0 인 (등급,시프트) 쌍 수) 와 일치해야 한다.
+                        print(f"{logger_prefix} [GradeSpec] cells={len(_shorts)}")
+                        return (sum(_shorts), _freeze_grade, 3.0, 0.3)
+
+                    def _prep_n_range():
+                        if night_idx_h1 is None:
+                            return None
+                        _cnts = []
+                        for _n in range(N):
+                            if leave[_n] < join[_n] or _n in range_excluded_idx:
+                                continue
+                            _cnts.append(sum(
+                                X2(_n, _d, night_idx_h1)
+                                for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
+                            ))
+                        if not _cnts:
+                            return None
+                        _mx = m2.NewIntVar(0, D, "lex_max_n")
+                        _mn = m2.NewIntVar(0, D, "lex_min_n")
+                        for _c in _cnts:
+                            m2.Add(_c <= _mx)
+                            m2.Add(_c >= _mn)
+                        return (_mx - _mn, lambda v: m2.Add(_mx - _mn <= v), 2.0, 0.2)
+
+                    def _prep_n2n():
+                        # 야간 블록 간 간격(target 미만)을 벌린다. soft 항은 KLD 에 눌려
+                        # 무시되므로 lex 우선순위로 끌어올린다.
+                        if night_idx_h1 is None:
+                            return None
+                        _tgt = int(getattr(cfg, "n_to_n_interval_target", 0) or 0)
+                        if _tgt < 2:
+                            return None
+                        _terms = []
+                        for _n in range(N):
+                            if leave[_n] < join[_n]:
+                                continue
+                            # N전담(N-only)은 야간 강제 → n2n 간격 벌점 제외(유령 페널티 방지).
+                            if is_n_only_profile(
+                                getattr(roster_system.nurses[_n], "allowed_shifts", None),
+                                use_mid=use_mid_h1,
+                            ):
+                                continue
+                            _aset = set(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                            for _d1 in sorted(_aset):
+                                for _gap in range(2, _tgt):
+                                    _d2 = _d1 + _gap
+                                    if _d2 not in _aset:
                                         continue
-                                    if n_lex in nightonly_excluded_idx:
+                                    _btw = [_d1 + _k for _k in range(1, _gap)]
+                                    if any(_b not in _aset for _b in _btw):
                                         continue
-                                    cnt_n = sum(
-                                        X2(n_lex, d, night_idx_h1)
-                                        for d in iter_nurse_days(n_lex, join, leave, blocked_by_nurse)
+                                    _pair = m2.NewBoolVar(f"lex_n2n_{_n}_{_d1}_{_d2}")
+                                    m2.Add(_pair <= X2(_n, _d1, night_idx_h1))
+                                    m2.Add(_pair <= X2(_n, _d2, night_idx_h1))
+                                    for _b in _btw:
+                                        m2.Add(_pair <= 1 - X2(_n, _b, night_idx_h1))
+                                    _btw_sum = sum(X2(_n, _b, night_idx_h1) for _b in _btw)
+                                    m2.Add(
+                                        _pair >= X2(_n, _d1, night_idx_h1)
+                                        + X2(_n, _d2, night_idx_h1) - 1 - _btw_sum
                                     )
-                                    n_count_vars.append(cnt_n)
-                                if n_count_vars:
-                                    max_n_lex = m2.NewIntVar(0, D, "lex_max_n")
-                                    min_n_lex = m2.NewIntVar(0, D, "lex_min_n")
-                                    for cnt in n_count_vars:
-                                        m2.Add(cnt <= max_n_lex)
-                                        m2.Add(cnt >= min_n_lex)
-                                    m2.Minimize(max_n_lex - min_n_lex)
-                                    s2.parameters.max_time_in_seconds = max(2.0, float(tl2) * 0.2)
-                                    _hint_lex_solution()
-                                    st2_n = s2.Solve(m2)
-                                    if st2_n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                                        _capture_lex_solution()
-                                        best_n_range = int(
-                                            s2.Value(max_n_lex) - s2.Value(min_n_lex)
-                                        )
-                                        print(
-                                            f"{logger_prefix} 폴백2 lex 3-pass (N range): "
-                                            f"status={_cp_sat_status_to_text(st2_n)} "
-                                            f"range={best_n_range}"
-                                        )
-                                        # H1 4-pass: N 블록 간 간격(n2n) deficit 최소화.
-                                        # 안전·OFF range·N range 를 동결한 뒤, 그 품질을 깨지 않는
-                                        # 범위에서만 야간 간격(target 미만)을 벌린다. soft 항은 KLD에
-                                        # 눌려 무시되므로 lex 우선순위로 끌어올린다.
-                                        _n2n_tgt = int(getattr(cfg, "n_to_n_interval_target", 0) or 0)
-                                        if _n2n_tgt >= 2:
-                                            try:
-                                                m2.Add(max_n_lex - min_n_lex <= best_n_range)
-                                                _n2n_terms = []
-                                                for _n in range(N):
-                                                    if leave[_n] < join[_n]:
-                                                        continue
-                                                    # N전담(N-only)은 야간 강제 → n2n 간격 벌점 제외
-                                                    # (같은 시프트 연속 벌점과 동일 논리, 유령 페널티 방지).
-                                                    if is_n_only_profile(
-                                                        getattr(roster_system.nurses[_n], "allowed_shifts", None),
-                                                        use_mid=bool(getattr(cfg, "use_mid", False)),
-                                                    ):
-                                                        continue
-                                                    _aset = set(iter_nurse_days(_n, join, leave, blocked_by_nurse))
-                                                    for _d1 in sorted(_aset):
-                                                        for _gap in range(2, _n2n_tgt):
-                                                            _d2 = _d1 + _gap
-                                                            if _d2 not in _aset:
-                                                                continue
-                                                            _btw = [_d1 + _k for _k in range(1, _gap)]
-                                                            if any(_b not in _aset for _b in _btw):
-                                                                continue
-                                                            _pair = m2.NewBoolVar(f"lex_n2n_{_n}_{_d1}_{_d2}")
-                                                            m2.Add(_pair <= X2(_n, _d1, night_idx_h1))
-                                                            m2.Add(_pair <= X2(_n, _d2, night_idx_h1))
-                                                            for _b in _btw:
-                                                                m2.Add(_pair <= 1 - X2(_n, _b, night_idx_h1))
-                                                            _btw_sum = sum(X2(_n, _b, night_idx_h1) for _b in _btw)
-                                                            m2.Add(_pair >= X2(_n, _d1, night_idx_h1) + X2(_n, _d2, night_idx_h1) - 1 - _btw_sum)
-                                                            _n2n_terms.append((_n2n_tgt - _gap) * _pair)
-                                                if _n2n_terms:
-                                                    m2.Minimize(sum(_n2n_terms))
-                                                    import os as _os
-                                                    _n2n_frac = float(_os.getenv("N2N_LEX_TIME_FRAC", "0.5"))
-                                                    s2.parameters.max_time_in_seconds = max(8.0, float(tl2) * _n2n_frac)
-                                                    _hint_lex_solution()
-                                                    st2_n2n = s2.Solve(m2)
-                                                    if st2_n2n in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                                                        _capture_lex_solution()
-                                                        print(
-                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
-                                                            f"status={_cp_sat_status_to_text(st2_n2n)} "
-                                                            f"deficit={int(s2.ObjectiveValue())}"
-                                                        )
-                                                        # n2n 동결: 후속 D/E 패스가 n2n을 망가뜨리지 않도록 lex 잠금
-                                                        try:
-                                                            m2.Add(sum(_n2n_terms) <= int(s2.ObjectiveValue()))
-                                                        except Exception:
-                                                            pass
-                                                    else:
-                                                        print(
-                                                            f"{logger_prefix} 폴백2 lex 4-pass (n2n deficit): "
-                                                            f"status={_cp_sat_status_to_text(st2_n2n)} — 3rd 결과 유지"
-                                                        )
-                                            except Exception as _n2n_e:
-                                                print(f"{logger_prefix} 폴백2 lex 4-pass 예외: {_n2n_e}")
-                                        # H1 5-pass: D/E per-nurse 균등(X축). OFF/N/n2n 동결 후 잔여 자유도로만.
-                                        # lex_x2_val(stage3 warm-start hint)이 D/E까지 균등해져 stage3가 균등 hint 상속.
-                                        # config de_balance_enable(기본 ON)을 따르며, env DE_LEX_ENABLE 로 override 가능.
-                                        # tol 초과분만 벌해 "완전동일" 아님(밴드).
-                                        try:
-                                            import os as _os_de
-                                            _de_env = _os_de.getenv("DE_LEX_ENABLE")
-                                            _de_on = (_de_env == "1") if _de_env is not None else bool(getattr(cfg, "de_balance_enable", True))
-                                            if _de_on and "E" in cfg.shift_types:
-                                                _de_tol = int(_os_de.getenv("DE_BALANCE_TOL", str(getattr(cfg, "de_balance_tolerance", 2))) or 0)
-                                                _de_d_idx = cfg.shift_types.index("D")
-                                                _de_e_idx = cfg.shift_types.index("E")
-                                                _de_excs = []
-                                                for _n in range(N):
-                                                    if leave[_n] < join[_n] or _n in nightonly_excluded_idx:
-                                                        continue
-                                                    _ad = list(iter_nurse_days(_n, join, leave, blocked_by_nurse))
-                                                    _td = sum(X2(_n, d, _de_d_idx) for d in _ad)
-                                                    _te = sum(X2(_n, d, _de_e_idx) for d in _ad)
-                                                    _df = m2.NewIntVar(0, D, f"lex_de_diff_{_n}")
-                                                    m2.Add(_df >= _td - _te)
-                                                    m2.Add(_df >= _te - _td)
-                                                    _ex = m2.NewIntVar(0, D, f"lex_de_exc_{_n}")
-                                                    m2.Add(_ex >= _df - _de_tol)
-                                                    _de_excs.append(_ex)
-                                                if _de_excs:
-                                                    m2.Minimize(sum(_de_excs))
-                                                    s2.parameters.max_time_in_seconds = max(5.0, float(tl2) * 0.3)
-                                                    _hint_lex_solution()
-                                                    st2_de = s2.Solve(m2)
-                                                    if st2_de in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                                                        _capture_lex_solution()
-                                                        _de_best = int(s2.ObjectiveValue())
-                                                        print(
-                                                            f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
-                                                            f"status={_cp_sat_status_to_text(st2_de)} excess={_de_best}"
-                                                        )
-                                                        # ── 6-pass: grade 미달 칸 재배치 ──
-                                                        #   총량은 그대로 두고 **날짜만 옮겨** 미달 칸을 줄인다.
-                                                        #   목적함수에 항을 더하는 방식(초과 페널티·가중치 증가)은
-                                                        #   둘 다 실측에서 실패했다. 여기서는 앞 패스 품질을 전부
-                                                        #   동결한 뒤 미달 칸 수만 최소화하므로, "뭉치지 않으려
-                                                        #   미달을 감수" 하는 왜곡이 구조적으로 생기지 않는다.
-                                                        #   (실측 근거: 같은 제약에서 회피가능 미달이 8까지 내려간
-                                                        #    적이 있는데 평균은 15.6 — 해의 산포가 문제였다)
-                                                        try:
-                                                            # ★ spec 은 stage2 모델에 붙어 있다. build_model 안의
-                                                            #   `m` 은 그 함수의 지역 변수라 여기서는 보이지 않는다.
-                                                            _g_spec = list(getattr(m2, "_grade_cell_spec", []) or [])
-                                                            if _g_spec:
-                                                                m2.Add(sum(_de_excs) <= _de_best)
-                                                                _g_shorts = []
-                                                                for _gd, _gs, _gt, _gmem in _g_spec:
-                                                                    _cum = sum(
-                                                                        X2(_n, _gd, _gs) for _n in _gmem
-                                                                        if join[_n] <= _gd <= leave[_n]
-                                                                    )
-                                                                    _sh = m2.NewIntVar(0, int(_gt), f"lex_g_short_d{_gd}_s{_gs}")
-                                                                    m2.Add(_sh >= int(_gt) - _cum)
-                                                                    _g_shorts.append(_sh)
-                                                                m2.Minimize(sum(_g_shorts))
-                                                                s2.parameters.max_time_in_seconds = max(3.0, float(tl2) * 0.3)
-                                                                _hint_lex_solution()
-                                                                st2_g = s2.Solve(m2)
-                                                                if st2_g in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                                                                    _capture_lex_solution()
-                                                                    lex_grade_short = int(s2.ObjectiveValue())
-                                                                    print(
-                                                                        f"{logger_prefix} 폴백2 lex 6-pass (grade 재배치): "
-                                                                        f"status={_cp_sat_status_to_text(st2_g)} "
-                                                                        f"short={lex_grade_short} cells={len(_g_shorts)}"
-                                                                    )
-                                                                else:
-                                                                    print(
-                                                                        f"{logger_prefix} 폴백2 lex 6-pass (grade 재배치): "
-                                                                        f"status={_cp_sat_status_to_text(st2_g)} — 5th 결과 유지"
-                                                                    )
-                                                        except Exception as _g_e:
-                                                            print(f"{logger_prefix} 폴백2 lex 6-pass 예외: {_g_e}")
-                                                    else:
-                                                        print(
-                                                            f"{logger_prefix} 폴백2 lex 5-pass (D/E balance): "
-                                                            f"status={_cp_sat_status_to_text(st2_de)} — 4th 결과 유지"
-                                                        )
-                                        except Exception as _de_e:
-                                            print(f"{logger_prefix} 폴백2 lex 5-pass 예외: {_de_e}")
-                                    else:
-                                        print(
-                                            f"{logger_prefix} 폴백2 lex 3-pass (N range): "
-                                            f"status={_cp_sat_status_to_text(st2_n)} — 2nd 결과 유지"
-                                        )
-                        else:
+                                    _terms.append((_tgt - _gap) * _pair)
+                        # ── 월 경계: 전월 말 N 블록 → 현월 첫 N 블록 간격 ──
+                        #   ★ 위 루프는 현월 활동일(_aset) 안에서만 쌍을 만든다. 그래서 전월
+                        #     말일에 N 을 끝낸 사람이 현월 1일부터 다시 N 을 받아도 벌점이 0 이었다.
+                        #     회복 간격을 벌리라는 제약이 가장 위험한 구간에서 놀고 있었다.
+                        #   전월 꼬리는 확정 상수라 "현월 d 일이 첫 N 이고 그 앞은 전부 N 아님"만
+                        #     변수로 세우면 된다. gap = d - (전월 마지막 N 날짜) 인데, 전월
+                        #     마지막 날을 0 으로 두면 현월 d(1-based)의 gap 은 그대로 d 다.
+                        _n_tail = int((getattr(roster_system, "prev_month_n_tail_by_idx", {})
+                                       or {}).get(_n, 0) or 0)
+                        if _n_tail >= 1:
+                            _days_sorted = sorted(_aset)
+                            for _d in _days_sorted:
+                                _gap_x = _d + 1        # 전월 마지막 N=0일, 현월 인덱스 d → gap
+                                if _gap_x >= _tgt:
+                                    break              # 이후는 전부 무벌점
+                                _before = [_b for _b in _days_sorted if _b < _d]
+                                _pair_x = m2.NewBoolVar(f"lex_n2n_cross_{_n}_{_d}")
+                                m2.Add(_pair_x <= X2(_n, _d, night_idx_h1))
+                                for _b in _before:
+                                    m2.Add(_pair_x <= 1 - X2(_n, _b, night_idx_h1))
+                                _bsum = sum(X2(_n, _b, night_idx_h1) for _b in _before)
+                                m2.Add(_pair_x >= X2(_n, _d, night_idx_h1) - _bsum)
+                                _terms.append((_tgt - _gap_x) * _pair_x)
+                        if not _terms:
+                            return None
+                        _frac = float(_os_lex.getenv("N2N_LEX_TIME_FRAC", "0.5"))
+                        return (sum(_terms), lambda v: m2.Add(sum(_terms) <= v), 8.0, _frac)
+
+                    def _prep_de():
+                        # D/E per-nurse 균등(X축). tol 초과분만 벌해 "완전동일" 아님(밴드).
+                        _env = _os_lex.getenv("DE_LEX_ENABLE")
+                        _on = (
+                            (_env == "1") if _env is not None
+                            else bool(getattr(cfg, "de_balance_enable", True))
+                        )
+                        if not _on or "E" not in cfg.shift_types:
+                            return None
+                        _tol = int(_os_lex.getenv(
+                            "DE_BALANCE_TOL", str(getattr(cfg, "de_balance_tolerance", 2))
+                        ) or 0)
+                        _di = cfg.shift_types.index("D")
+                        _ei = cfg.shift_types.index("E")
+                        _excs = []
+                        for _n in range(N):
+                            # ★ 부분근무자는 제외하지 않는다 — |D-E| 는 개인 내 차이의
+                            #   **합산**이라 특이값에 무너지지 않고, 빼면 그들의 D/E 가
+                            #   방치된다(실제로 그랬다).
+                            #   ★ 다만 D/E 중 한쪽만 가능한 사람은 빼야 한다. D전담은
+                            #     |D-E| = D 라 줄일 방법이 없는데 목적식에는 잡혀,
+                            #     solver 가 못 없애는 페널티가 상수로 깔린다.
+                            #     (실측: 김유정 allowed=["D"] → D22/E0 로 유령 페널티 20.
+                            #      N전담만 걸러서 D전담·E전담이 그대로 샜다.)
+                            if leave[_n] < join[_n] or _n in nightonly_idx:
+                                continue
+                            _al = normalize_allowed_shift_codes(
+                                getattr(roster_system.nurses[_n], "allowed_shifts", None),
+                                use_mid=use_mid_h1,
+                            )
+                            # 빈 집합은 "제한 없음"이다(is_code_blocked_by_profile 과 같은 해석).
+                            if _al and not {"D", "E"} <= _al:
+                                continue
+                            _ad = list(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                            _td = sum(X2(_n, _d, _di) for _d in _ad)
+                            _te = sum(X2(_n, _d, _ei) for _d in _ad)
+                            _df = m2.NewIntVar(0, D, f"lex_de_diff_{_n}")
+                            m2.Add(_df >= _td - _te)
+                            m2.Add(_df >= _te - _td)
+                            _ex = m2.NewIntVar(0, D, f"lex_de_exc_{_n}")
+                            m2.Add(_ex >= _df - _tol)
+                            _excs.append(_ex)
+                        if not _excs:
+                            return None
+                        return (sum(_excs), lambda v: m2.Add(sum(_excs) <= v), 5.0, 0.3)
+
+                    def _prep_iso_off():
+                        """고립 OFF(앞뒤가 근무인 하루짜리 OFF) 최소화.
+
+                        이 슬랙은 safety 묶음의 한 항목이라 lex 진입 전에 '전체 합'으로만
+                        동결된다. 합 안에서 다른 safety 항목과 교환되므로 따로 최소화하지
+                        않으면 밀린다 — 실측에서 grade 를 6번째→1번째로 옮겨도 고립OFF 는
+                        27 근처에서 꿈쩍하지 않았다(순서 문제가 아니라 대상이 아니었던 것).
+                        ★ 값은 slack * isolated_off_slack_penalty(기본 30만) 라 크다.
+                          건수로 읽으려면 그 값으로 나눈다.
+                        """
+                        _sl = list(safety2.get("isolated_off_slack") or [])
+                        if not _sl:
+                            return None
+                        return (sum(_sl), lambda v: m2.Add(sum(_sl) <= v), 3.0, 0.3)
+
+                    def _prep_team():
+                        """팀 최소 커버 부족(slack) 최소화.
+
+                        ★ 팀 슬랙은 stage2 '본 목적함수'에만 TEAM_COVER_LEX_WEIGHT(30만)로
+                          들어가고, lex 진입 시 동결되지 않는다 — 동결되는 건 safety 뿐이다.
+                          그래서 이후 패스들이 재배치하는 동안 팀 커버가 자유롭게 나빠진다.
+                        ★ 슬랙 자체가 없으면(team_min 이 hard 로 풀렸거나 설정이 없으면)
+                          None 을 돌려 건너뛴다.
+                        """
+                        _tm = list(getattr(roster_system, "_team_min_cover_slacks", []) or [])
+                        if not _tm:
+                            return None
+                        print(f"{logger_prefix} [TeamSpec] slacks={len(_tm)}")
+                        return (sum(_tm), lambda v: m2.Add(sum(_tm) <= v), 3.0, 0.3)
+
+                    def _prep_off_quota():
+                        """개인별 OFF 가 설정값(target)을 넘은 초과분 최소화.
+
+                        ★ off_days 는 하한만 지켜지고 상한은 흐른다 — 실측: off_days=8 인
+                          병동에서 OFF 가 8~19 로 드리프트했다. off_quota_excess 슬랙이
+                          safety 묶음 안에 있어 다른 항목(고립OFF 30만·최소OFF 10만)과
+                          교환되기 때문이다. 코드 주석도 '하드 고정 아님' 이라 자인한다.
+                        ★ off_range 와 역할이 다르다 — off_range 는 사람 간 격차라 전원이
+                          균등하게 초과해도 만족하지만, 이 패스는 설정값으로 끌어내린다.
+                        ★ off_first=True 는 근무 상한이 하드(assigned <= need)라 남는 셀이
+                          OFF 로 갈 수밖에 없다 — 초과가 구조적이라 줄일 여지가 없다.
+                          다만 그 판단은 실측으로 확인한다(지금은 대상에 넣어 둔다).
+                        """
+                        _ex = list(safety2.get("off_quota_excess") or [])
+                        if not _ex:
+                            return None
+                        print(f"{logger_prefix} [OffQuotaSpec] slacks={len(_ex)}")
+                        return (sum(_ex), lambda v: m2.Add(sum(_ex) <= v), 3.0, 0.3)
+
+                    # ── 순서는 데이터다 ──
+                    #   lex 는 사전식이라 앞 순위가 절대 우선이다. 즉 이 순서가 곧
+                    #   "무엇을 더 중요하게 볼 것인가" 라는 정책이다. env 로 주입해
+                    #   순열을 실측할 수 있게 둔다.
+                    _PASS_PREP = {
+                        "off_range": _prep_off,
+                        "grade": _prep_grade,
+                        "n_range": _prep_n_range,
+                        "n2n": _prep_n2n,
+                        "de": _prep_de,
+                        "iso_off": _prep_iso_off,
+                        "team": _prep_team,
+                        "off_quota": _prep_off_quota,
+                    }
+                    _lex_order = [
+                        _t.strip()
+                        for _t in _os_lex.getenv("LEX_PASS_ORDER", LEX_PASS_ORDER_DEFAULT).split(",")
+                        if _t.strip()
+                    ]
+                    for _i, _pname in enumerate(_lex_order, start=1):
+                        _prep = _PASS_PREP.get(_pname)
+                        if _prep is None:
                             print(
-                                f"{logger_prefix} 폴백2 lex 2-pass (OFF range): "
-                                f"status={_cp_sat_status_to_text(st2_off)} — 1st 결과 유지"
+                                f"{logger_prefix} 폴백2 lex {_i}-pass ({_pname}): "
+                                f"알 수 없는 패스 — 건너뜀"
+                            )
+                            continue
+                        try:
+                            _spec = _prep()
+                        except Exception as _prep_e:
+                            print(
+                                f"{logger_prefix} 폴백2 lex {_i}-pass ({_pname}) 준비 예외: {_prep_e}"
+                            )
+                            continue
+                        if _spec is None:
+                            print(
+                                f"{logger_prefix} 폴백2 lex {_i}-pass ({_pname}): 대상 없음 — 건너뜀"
+                            )
+                            continue
+                        _obj, _freeze, _min_t, _frac = _spec
+                        try:
+                            m2.Minimize(_obj)
+                            s2.parameters.max_time_in_seconds = max(_min_t, float(tl2) * _frac)
+                            _hint_lex_solution()
+                            _st_p = s2.Solve(m2)
+                            if _st_p in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                                _capture_lex_solution()
+                                _val = int(s2.ObjectiveValue())
+                                _freeze(_val)
+                                print(
+                                    f"{logger_prefix} 폴백2 lex {_i}-pass ({_pname}): "
+                                    f"status={_cp_sat_status_to_text(_st_p)} value={_val}"
+                                )
+                            else:
+                                print(
+                                    f"{logger_prefix} 폴백2 lex {_i}-pass ({_pname}): "
+                                    f"status={_cp_sat_status_to_text(_st_p)} — 직전 결과 유지"
+                                )
+                        except Exception as _pass_e:
+                            print(
+                                f"{logger_prefix} 폴백2 lex {_i}-pass ({_pname}) 예외: {_pass_e}"
                             )
             except Exception as _h1_e:
                 print(f"{logger_prefix} 폴백2 lex H1 예외: {_h1_e}")
@@ -3413,13 +3591,22 @@ def optimize_fallback_lex_hard_first(
         )
         for k in safety3.keys():
             m3.Add(sum(safety3[k]) == sum(safety2[k]))
-        # grade 도 같이 동결한다. lex 6-pass 가 재배치로 미달을 낮춰 놔도 stage3 는
-        #   배치를 새로 계산하므로 그대로 두면 흩어진다(실측: lex short=4 → 최종 14~20).
-        #   safety 와 달리 등호가 아니라 상한이다 — stage3 가 더 좋게 만드는 것은 막지 않는다.
-        #   ★ 이 제약으로 stage3 가 INFEASIBLE 이 되면 아래 실패 경로가 stage2 해(=lex 로
-        #     이미 개선된 해)로 되돌아가므로 grade 품질은 보존된다.
+        # grade 도 동결한다. lex 6-pass 가 재배치로 미달을 낮춰 놔도 stage3 는 배치를
+        #   새로 계산하므로, 안 걸면 흩어진다(실측: lex short=4 → 최종 14~20).
+        #   safety 와 달리 등호가 아니라 상한이다 — 더 좋게 만드는 것은 막지 않는다.
+        #
+        # ★★ 이 제약이 걸리면 stage3 는 **거의 매번 INFEASIBLE** 이 된다. 버그가 아니다.
+        #    grade 목표와 stage3 의 KLD·선호를 동시에 만족시키는 해가 없기 때문이고,
+        #    그때 아래 실패 경로가 stage2 해(=lex 2~6-pass 로 이미 최적화된 해)를 쓴다.
+        #    실측(시화 6병동 2026-08, 각 5회):
+        #      동결 O : grade 미달 0.0 · 21초 · bidir 위반 0 · 커버초과 72
+        #      동결 X : grade 미달 13.8 · 44초 · stage3 가 OPTIMAL 이 아닌 FEASIBLE 로 열화
+        #      6-pass 자체를 뺌 : 미달 15.62 · 33초 · stage3 OPTIMAL
+        #    즉 동결이 시간·grade·다른 품질 지표 모두에서 우세해 채택했다.
+        #    ※ grade_config 가 없는 그룹은 _grade_cell_spec 이 비어 이 블록을 건너뛰므로
+        #      기존 동작(stage3 정상 수행)이 그대로 유지된다.
         _g3_spec = list(getattr(m3, "_grade_cell_spec", []) or [])
-        if lex_grade_short is not None and _g3_spec:
+        if GRADE_FREEZE_STAGE3 and lex_grade_short is not None and _g3_spec:
             _g3_shorts = []
             for _gd, _gs, _gt, _gmem in _g3_spec:
                 _cum3 = sum(
