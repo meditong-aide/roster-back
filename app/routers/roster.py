@@ -1009,8 +1009,12 @@ async def get_roster_by_schedule_id(
     target_group_id = schedule.group_id
 
     # Get all nurses in the group
+    # ★ active / resignation_date 를 함께 읽는다 — 아래에서 그 달 명단 규칙으로 거른다.
     nurses_in_group = list(
-        db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
+        db.query(
+            Nurse.nurse_id, Nurse.name, Nurse.experience,
+            Nurse.active, Nurse.resignation_date,
+        )
         .filter(Nurse.group_id == target_group_id)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
@@ -1042,11 +1046,50 @@ async def get_roster_by_schedule_id(
     _inbound_ids = _inbound_ids | _assign_inbound_ids
     if _inbound_ids:
         _inbound_nurses = (
-            db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
+            db.query(
+                Nurse.nurse_id, Nurse.name, Nurse.experience,
+                Nurse.active, Nurse.resignation_date,
+            )
             .filter(Nurse.nurse_id.in_(_inbound_ids))
             .all()
         )
         nurses_in_group.extend(_inbound_nurses)
+
+    # ★ 그 달에 속하지 않는 인원(퇴사·비활성)을 명단에서 제외한다.
+    #   증상: 화면에 유령 행이 뜨고, 다른 사람 셀을 고치면 그 행이 드러났다.
+    #   실측(9병동-9A 2026-09): 응답 16명 = entries 11명 + 5명(전 칸 '-'),
+    #     그중 이윤지·이애진은 2026-07 퇴사자였다.
+    #   원인: 위 쿼리가 group_id 만 보고 active·resignation_date 를 보지 않았다.
+    #   판정은 group_members_in_month(assignment_service) 와 **같은 규칙**으로 맞춘다:
+    #     · resign < 월초                 → 제외 (퇴사 다음 달부터 안 보인다)
+    #     · 월초 <= resign <= 월말        → 퇴사月이라 표시
+    #     · active != 1 이고 그 달 퇴사자도 아님 → 제외
+    #   ★ 단 ScheduleEntry 에 기록이 있으면 무조건 남긴다 — 이미 배정된 근무를
+    #     명단 규칙으로 숨기면 근무표가 사실과 달라진다.
+    _sch_year = int(getattr(schedule, "year", 0) or 0)
+    _sch_month = int(getattr(schedule, "month", 0) or 0)
+    if _sch_year and _sch_month:
+        from calendar import monthrange as _mr_member   # 이 파일의 기존 관례(로컬 import)
+        _m_start = date(_sch_year, _sch_month, 1)
+        _m_end = date(_sch_year, _sch_month, _mr_member(_sch_year, _sch_month)[1])
+
+        def _visible_in_month(n) -> bool:
+            if n.nurse_id in _all_entry_nurse_ids:
+                return True                      # 근무 기록이 있으면 항상 표시
+            _rd = getattr(n, "resignation_date", None)
+            _rd = _rd.date() if hasattr(_rd, "date") else _rd
+            if _rd is not None and _rd < _m_start:
+                return False
+            _resigned_this_month = _rd is not None and _rd <= _m_end
+            if getattr(n, "active", None) != 1 and not _resigned_this_month:
+                return False
+            return True
+
+        _before = len(nurses_in_group)
+        nurses_in_group = [n for n in nurses_in_group if _visible_in_month(n)]
+        if _before != len(nurses_in_group):
+            print(f"[Roster][MemberFilter] schedule={schedule_id} "
+                  f"{_sch_year}-{_sch_month:02d} 명단 {_before} → {len(nurses_in_group)}")
 
     # Get shift manage data
     # Get shift colors
