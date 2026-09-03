@@ -93,10 +93,13 @@ def _active_range(nurse, first_day: date, last_day: date) -> tuple[int, int] | N
     raw_leave = getattr(nurse, "resignation_date", None)
     join_src = raw_join.date() if isinstance(raw_join, datetime) else raw_join
     leave_src = raw_leave.date() if isinstance(raw_leave, datetime) else raw_leave
-    if leave_src and leave_src < first_day:
+    # ★ resignation_date 는 퇴사일 그 자체 — 마지막 근무일은 그 전날이다
+    #   (cp_sat_basic / fallback_lex 와 동일 규약).
+    last_work_src = leave_src - timedelta(days=1) if leave_src else None
+    if last_work_src and last_work_src < first_day:
         return None
     join_date = max(first_day, join_src or first_day)
-    leave_date = min(last_day, leave_src or last_day)
+    leave_date = min(last_day, last_work_src or last_day)
     if join_date > leave_date:
         return None
     return (join_date - first_day).days, (leave_date - first_day).days

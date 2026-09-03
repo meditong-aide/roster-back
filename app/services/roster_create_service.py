@@ -794,14 +794,24 @@ def _active_range_in_month(nurse: Nurse, month_start: date, days_in_month: int) 
     join = getattr(nurse, "joining_date", None)
     join_date = join.date() if join else None
     resign_date = resign.date() if resign else None
+    # ★ resignation_date 는 **퇴사일 그 자체**이고 그날부터는 소속이 아니다.
+    #   따라서 마지막 근무일은 resign_date - 1 일이다.
+    #   (기존에는 min(resign_date, month_end) 라 퇴사일 당일까지 배정됐다.
+    #    실측: 이애진 resignation_date=2026-07-20 인데 20일에 N 배정 →
+    #    18·19·20 3연속 N. 이윤지는 퇴사일을 빼면 1N 단독만 남아
+    #    하드락 7번(1N 금지) 위반이 된다.)
+    #   ※ wanted_service._compute_leave_blocked_days_in_month 는 이미
+    #     `cur = max(_resign_d, m_start)` 로 퇴사일 당일부터 막고 있었다 —
+    #     두 경로의 해석이 어긋나 있었고 이쪽을 그에 맞춘다.
+    last_work_date = resign_date - timedelta(days=1) if resign_date else None
     # ❌ 월과 겹치지 않으면 바로 제외
-    if resign_date and resign_date < month_start:
+    if last_work_date and last_work_date < month_start:
         return None
     if join_date and join_date > month_end:
         return None
     # ✅ 실제 근무 가능 날짜 범위
     start_date = max(join_date, month_start) if join_date else month_start
-    end_date = min(resign_date, month_end) if resign_date else month_end
+    end_date = min(last_work_date, month_end) if last_work_date else month_end
 
     if start_date > end_date:
         return None

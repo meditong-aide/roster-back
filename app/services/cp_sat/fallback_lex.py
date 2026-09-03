@@ -224,13 +224,16 @@ def optimize_fallback_lex_hard_first(
     for nu in roster_system.nurses:
         j = (nu.joining_date - first_day).days if nu.joining_date else 0
         if nu.resignation_date:
-            if nu.resignation_date < first_day:
+            # ★ resignation_date 는 퇴사일 그 자체 — 그날부터 소속이 아니므로
+            #   마지막 근무일은 resignation_date - 1 일이다(cp_sat_basic 과 동일 규약).
+            _last_work = nu.resignation_date - timedelta(days=1)
+            if _last_work < first_day:
                 # 이번 달에 근무하지 않는 인원은 범위 밖으로 설정하여 변수 생성을 건너뛴다.
                 join.append(1)
                 leave.append(0)
                 continue
-            l = (nu.resignation_date - first_day).days
-            if nu.resignation_date > last_day:
+            l = (_last_work - first_day).days
+            if _last_work > last_day:
                 l = D - 1
         else:
             l = D - 1
