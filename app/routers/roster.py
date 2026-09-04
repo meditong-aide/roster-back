@@ -82,7 +82,7 @@ from db.models import (
     DailyShift,
     NurseAssignment,
 )
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, or_
 from routers.utils import get_days_in_month
 from db.nurse_config import Nurse as NurseEngine
 from services.roster_system import RosterSystem
@@ -270,6 +270,11 @@ async def get_config_versions(
 
     version 이 부여된 row(=프리셋)만 반환. legacy/ad-hoc(version NULL) 은 제외.
     각 프리셋의 요약(D/E/N·OFF), 메모, 마지막 저장, 최근 적용 근무표를 포함.
+
+    생성에 실패한 프리셋은 목록에서 뺀다 — 다시 선택돼 같은 실패를 반복하기 때문.
+    월 구분 없이 숨기고, 편집해 저장해도 되살리지 않는다 — 저장은 검증이 아니다.
+    그 설정으로 다시 생성해 **성공하면** success 로 덮여 복귀한다(검증된 것이므로).
+    새로 쓰려면 config_id 없이 저장하면 된다(신규 행 → NULL 에서 시작).
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -280,12 +285,33 @@ async def get_config_versions(
     target_office_id = current_user.office_id
 
     try:
+        # ★ 생성에 실패한 설정은 목록에서 뺀다 — 프리셋으로 남으면 다시 선택돼
+        #   같은 실패를 반복한다(2026-09-04 남촌 중환자실1: max_nig_per_month=1 과
+        #   not_one_night=True 가 양립 불가인 설정이 프리셋으로 계속 노출).
+        #   **편집 저장으로는 되살리지 않는다** — 저장은 검증이 아니기 때문이다.
+        #   다시 생성해서 성공하면 그때 success 로 덮여 복귀한다(검증된 것이므로).
+        #   새로 쓰려면 config_id 없이 저장하면 신규 행이라 NULL 에서 시작한다.
+        #   당시 입력은 roster_config_attempt.snapshot 으로 분석한다.
+        #   NULL 은 "아직 안 써본 설정" 이라 반드시 살려둔다.
+        #   ★ MSSQL 은 NULL 비교가 dialect 를 타므로 `== None` 이 아니라 `.is_(None)`.
         presets = (
             db.query(RosterConfigModel)
             .filter(
                 RosterConfigModel.office_id == target_office_id,
                 RosterConfigModel.group_id == target_group_id,
                 RosterConfigModel.version.isnot(None),
+                #   ★ 'error' 는 여기서 안 뺀다. 낙인 3지점을 안 거치고 빠져나간
+                #     예외를 담는 값인데, 설정 탓이 아닌 것(일시적 DB 오류·구현 버그)도
+                #     섞인다. 그걸로 프리셋을 영구히 지우면 운영 사고 한 번에 멀쩡한
+                #     설정이 사라진다 — 숨기는 것보다 나쁜 실패다. attempt 에는 남는다.
+                #     설정이 원인임이 증명된 blocked/infeasible 만 목록에서 뺀다.
+                #   ★★ MSSQL 의 NOT IN 은 NULL 을 제외한다 — `.is_(None)` 을 반드시
+                #     OR 로 함께 걸어야 "아직 안 써본 프리셋"이 통째로 사라지지 않는다.
+                or_(
+                    RosterConfigModel.last_generate_status.is_(None),
+                    RosterConfigModel.last_generate_status.notin_(
+                        ("blocked", "infeasible")),
+                ),
             )
             .order_by(RosterConfigModel.version.desc())
             .all()

@@ -733,11 +733,81 @@ class RosterConfig(Base):
     config_memo = Column(NVARCHAR(500), nullable=True)  # 간단 메모
     # 마지막 저장 시각 — upsert(in-place 수정) 시 갱신. created_at 은 최초 생성 고정.
     updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+    # 이 설정으로 근무표 생성을 시도한 마지막 결과.
+    #   NULL         아직 생성에 써본 적 없음(저장만 한 프리셋) — 목록에 **보여야 한다**
+    #   'success'    생성 성공
+    #   'blocked'    precheck 차단 — solver 주입 전에 막힘
+    #   'infeasible' solver 가 못 품(완화 탐색까지 소진)
+    #   'error'      낙인 3지점을 안 거치고 빠져나간 예외. 설정 탓이 증명되지 않아
+    #                목록에서 빼지 않으며, **이미 판정이 있으면 덮지도 않는다**
+    #                (덮으면 숨겨 둔 blocked/infeasible 이 지워져 되살아난다).
+    # 실패한 설정을 /roster/config/versions 목록에서 빼는 데 쓴다 — 프리셋으로 남으면
+    # 다시 선택돼 같은 실패를 반복한다.
+    #   ★ **편집 저장으로는 되살리지 않는다.** 그 설정을 고쳐 저장해도(같은 config_id
+    #     in-place) 목록에 다시 내보내지 않는다 — 저장은 검증이 아니고, 실패한 설정까지
+    #     보이면 프리셋(검증된 설정 모음)의 의미가 퇴색된다. 새로 쓰려면 config_id 없이
+    #     저장해 신규 행을 만든다(NULL 에서 시작).
+    #   ★ 다만 그 설정으로 **다시 생성해서 성공하면** success 로 덮여 복귀한다.
+    #     실제로 근무표가 만들어졌으므로 검증된 것이고, 프리셋의 정의에 부합한다.
+    #     (편집 탭은 /roster/config/version/latest 로 채워지므로, 숨겨진 설정도
+    #      그 값이 그룹 최신이면 실려 와 재생성할 수 있다.)
+    #   ★ 개입(config_override·treatment·완화·임시 컬럼델타)이 낀 런은 기록하지 않는다.
+    #     저장된 값 그대로의 성패가 아니기 때문. 그런 시도도 attempt 에는 남는다.
+    #   ★ 당시 입력이 무엇이었는지는 RosterConfigAttempt.snapshot 으로 분석한다.
+    last_generate_status = Column(VARCHAR(20), nullable=True)
     office = relationship("Office")
     group = relationship("Group")
     # NOTE: 그룹별 version 유일성 인덱스(ux_roster_config_group_version,
     #   WHERE version IS NOT NULL 필터드 유니크)는 개발 마무리 후 추가 예정.
     #   현재는 version 할당이 MAX+1(앱) 단독 — 동시 저장 충돌은 실무상 희박해 보류.
+
+
+class RosterConfigAttempt(Base):
+    """근무표 생성을 시도한 **시점의 입력 전체**. 성공·실패 모두 남긴다.
+
+    왜 roster_config 가 아니라 별도 테이블인가 —
+      roster_config 는 "지금 유효한 설정" 을 담는 곳이고, 코드베이스 26곳이
+      그 전제로 "이 병동의 최신 config" 를 찾는다. 시도 기록을 같은 테이블에
+      행으로 넣으면 config_id 가 항상 최댓값이 되어 config_id DESC 로 고르는
+      8곳이 기록 행을 현재 설정으로 집는다. 기록 행은 생성 시점 값에 고정되고
+      화면에 안 보여 고칠 수도 없으므로, 이후 프리셋을 수정해도 그 8곳은
+      낡은 값을 계속 읽는다(2026-09-04 실측: use_mid 를 뒤집어도 옛 값 반환).
+      테이블을 나누면 config_id 가 늘지 않아 이 경로가 아예 생기지 않는다.
+
+    왜 스냅샷이 필요한가 —
+      생성 성패는 roster_config 혼자 정하지 않는다. 같은 설정이라도 명단·
+      daily_shift·원티드가 바뀌면 결과가 달라진다. 기존 input_hash
+      (shadow_diagnosis._input_hash)는 같은 입력을 묶는 지문일 뿐 되돌릴 수 없어
+      "무엇이 문제였나" 를 못 보고, 그 해시에는 **원티드가 빠져 있다**.
+
+    성공도 남기는 이유 — 실패만 모으면 비교 대상이 없다.
+      "직전엔 됐는데 왜 안 되지" 는 직전 성공 입력과 대조해야 답이 나온다.
+    """
+
+    __tablename__ = "roster_config_attempt"
+
+    attempt_id = Column(BIGINT, primary_key=True, autoincrement=True)
+    # 어느 프리셋으로 시도했나. 프리셋이 지워져도 기록은 남아야 하므로 FK 를 걸지 않는다.
+    source_config_id = Column(INTEGER, nullable=True)
+    office_id = Column(VARCHAR(50), nullable=True)
+    group_id = Column(VARCHAR(50), nullable=False)
+    # 비동기(SQS→worker) 경로의 roster_jobs.job_id.
+    #   실패는 schedules 에 행이 남지 않아(result_roster_id=None) FAILED 건과
+    #   "그때 무슨 설정이었나" 를 잇는 고리가 이것뿐이다. 동기 호출은 NULL.
+    job_id = Column(VARCHAR(100), nullable=True)
+    year = Column(INTEGER, nullable=True)
+    month = Column(INTEGER, nullable=True)
+    # success | blocked(precheck 차단) | infeasible(solver 가 못 품)
+    status = Column(VARCHAR(20), nullable=False)
+    # 이 런에 개입이 있었나(config_override · treatment_ids · applied_relaxations).
+    #   개입이 낀 성패는 저장된 프리셋 값의 성패가 아니라 프리셋에 낙인하지 않는다.
+    #   ★ 조회에서 `intervened == False` 로 거르면 NULL 행(구 기록)을 놓친다 —
+    #     `or_(intervened.is_(None), intervened == False)` 를 쓸 것.
+    intervened = Column(BOOLEAN, nullable=True)
+    # nurses(등급·팀·허용시프트·고정근무·개인 상하한·주휴) · config(roster_config +
+    #   daily_shift 요구 + team_min + 선호 가중치) · wanted · grade_config 전부.
+    snapshot = Column(NVARCHAR(None), nullable=True)   # DDL 은 NVARCHAR(MAX)
+    created_at = Column(DATETIME, default=func.now())
 
 
 class RosterGradeConfig(Base):

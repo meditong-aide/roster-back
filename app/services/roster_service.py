@@ -166,6 +166,7 @@ def _propagate_use_mid_all_configs(db, office_id, group_id, use_mid) -> None:
 
     use_mid 는 병동 단위 설정이므로 per-config 로 갈리면 안 된다. 어떤 config 를
     조회·포크·생성하더라도 동일 값이 되도록 그룹 전체를 한 번에 맞춘다.
+
     """
     db.query(RosterConfigModel).filter(
         RosterConfigModel.office_id == office_id,
@@ -366,6 +367,12 @@ def save_roster_config_service(
             ).first()
             if db_config is None:
                 raise Exception("수정할 설정(config_id)을 찾을 수 없습니다.")
+            # ★ 생성 결과 기록(last_generate_status)을 리셋하지 않는다 — 그게 방침이다.
+            #   한 번 실패로 기록된 설정은 **편집해 저장해도 되살리지 않는다** —
+            #   저장은 검증이 아니기 때문이다(재생성해서 성공하면 그때 복귀한다).
+            #   새로 쓰려면 config_id 없이 저장해 신규 행을 만든다
+            #   (신규 행은 NULL 에서 시작하므로 목록에 보인다).
+            #   ※ 여기에 db_config.last_generate_status = None 을 넣지 말 것.
             for _key, _val in config_dict.items():
                 # ★ 미전송(None) 시 기존 값 유지 — 이 필드를 모르는 기존 저장 화면이
                 #   저장할 때마다 설정을 꺼버리는 사고를 막는다(스키마 기본값도 None).

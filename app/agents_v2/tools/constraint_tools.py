@@ -103,6 +103,11 @@ def update_roster_config(
 
     for field, delta in changes.items():
         setattr(row, field, delta["new"])
+    # ★ 생성 결과 기록(last_generate_status)을 리셋하지 않는다 — 그게 방침이다.
+    #   한 번 실패로 기록된 설정은 편집해도 되살리지 않는다 — 저장은 검증이 아니다
+    #   (재생성해서 성공하면 그때 success 로 덮여 복귀한다).
+    #   새로 쓰려면 config_id 없이 저장해 신규 행을 만든다.
+    #   ※ 여기에 row.last_generate_status = None 을 넣지 말 것.
     db.commit()
     db.refresh(row)
     return {"preview": False, "config_id": row.config_id, "changes": changes}

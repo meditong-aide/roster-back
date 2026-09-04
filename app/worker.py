@@ -209,6 +209,14 @@ def process_job(payload: dict) -> dict:
             treatment_ids=(getattr(req, "treatment_ids", None) or None),
             weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
             monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
+            # ★ 이 둘도 명시 전달한다 — 서비스가 req 폴백으로 적용은 하지만,
+            #   동기 엔드포인트(roster_create.py)와 인자 구성이 달라지면
+            #   "왜 여기만 안 넘기지" 를 매번 되짚어야 한다.
+            banned_wanted_release=(getattr(req, "banned_wanted_release", None) or None),
+            allowed_shift_add=(getattr(req, "allowed_shift_add", None) or None),
+            # 실패는 schedules 에 행이 남지 않으므로(roster_jobs.result_roster_id=None)
+            #   설정 스냅샷에 job_id 를 실어 FAILED 건과 이어 붙일 수 있게 한다.
+            job_id=job_id,
         )
         result_id = None
         if isinstance(roster_data, dict):
