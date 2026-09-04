@@ -2800,52 +2800,14 @@ def optimize_fallback_lex_hard_first(
         if stage == 1:
             # m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + sum(over_terms))
             OFF_PENALTY=30
-            # ── OFF 개인별 baseline 편차 ──
-            #   ★ 기존엔 OFF '총량' 만 최소화해 "누구에게 몰리는지" 기준이 없었다.
-            #     그래서 근무 자리가 남을 때 잔여 OFF 가 임의로 쏠린다
-            #     (실측: 같은 설정·같은 요구인데 range 0(중환자실1) vs 6(2병동)).
-            #   ★ baseline 은 설정값이 아니라 '이론 균등값' 이다 — off_days 는 대개
-            #     달성 불가다(설정 8~11 인데 이론 14.7~15.9). 달성 못 할 값을 목표로
-            #     주면 전원이 미달해 편차가 무의미해진다.
-            #   ★ 가중치는 커버(10만)보다 훨씬 작게 둔다. 커버를 밀면 coverage_eq 로
-            #     고정되어 이후 단계에서 되돌릴 수 없다.
-            _s1_dev_w = int(_os_lex.getenv("S1_OFF_DEV_WEIGHT", "300") or 0)
-            _s1_devs = []
-            if _s1_dev_w > 0:
-                # 월 총 요구칸 = Σ(일자별 D/E/N/M 요구). 커버리지 루프와 같은 소스를 쓴다
-                #   (daily_shift_requirements_by_day 가 있으면 그것, 없으면 공통값).
-                _s1_req = 0
-                try:
-                    _by_day = getattr(cfg, "daily_shift_requirements_by_day", None)
-                    for _dd in range(D):
-                        _nm = (_by_day[_dd] if isinstance(_by_day, list) and _dd < len(_by_day)
-                               else cfg.daily_shift_requirements)
-                        for _cc, _rq in (_nm or {}).items():
-                            if _cc == "O" or _cc not in cfg.shift_types:
-                                continue
-                            _s1_req += max(0, int(_rq or 0))
-                except Exception as _s1_e:
-                    print(f"{logger_prefix} [S1OffBaseline] 요구 합 계산 실패(건너뜀): {_s1_e}")
-                    _s1_req = 0
-                # 요구 합을 못 구하면 baseline 을 세우지 않는다(조용히 건너뜀).
-                _s1_pool = [
-                    _n for _n in range(N)
-                    if leave[_n] >= join[_n]
-                    and len(list(iter_nurse_days(_n, join, leave, blocked_by_nurse))) >= D
-                ]
-                if _s1_req > 0 and _s1_pool:
-                    _s1_base = max(0, round(D - _s1_req / len(_s1_pool)))
-                    print(f"{logger_prefix} [S1OffBaseline] base={_s1_base} "
-                          f"pool={len(_s1_pool)} req={_s1_req} w={_s1_dev_w}")
-                    for _n in _s1_pool:
-                        _cnt = sum(
-                            X(_n, _d, off_idx)
-                            for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
-                        )
-                        _dv = m.NewIntVar(0, D, f"s1_off_dev_{_n}")
-                        m.Add(_dv >= _cnt - _s1_base)
-                        m.Add(_dv >= _s1_base - _cnt)
-                        _s1_devs.append(_dv)
+            # ※ stage1 에 'OFF 개인별 baseline 편차' 항을 얹어 본 적이 있다(가중치 300).
+            #   OFF 총량만 최소화하면 잔여 OFF 가 임의로 쏠린다는 가설이었으나,
+            #   실측(7병동 × 5회)에서 목적 지표가 나아지지 않았다:
+            #     OFF폭 20.40 → 20.00 · OFF편차 5.97 → 5.82 (둘 다 **끄는 쪽**이 좋음,
+            #     OFF폭 은 켜서 이긴 병동이 0곳)
+            #   반면 생성 시간은 303.8s → 268.6s 로 **11.6% 느려졌다**(7병동 중 6곳).
+            #   목적을 달성하지 못하면서 모델만 키우므로 제거했다. 다시 시도한다면
+            #   stage1(커버리지 확정) 이 아니라 lex off_range 패스 쪽을 손대는 게 맞다.
             m.Minimize(
             FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms)
             + sum(over_terms)
@@ -2856,7 +2818,6 @@ def optimize_fallback_lex_hard_first(
                 if (n, d) not in structural_off_cells
                 and (n, d) not in vacation_off_cells
                 )
-            + (_s1_dev_w * sum(_s1_devs) if _s1_devs else 0)
             )
         elif stage == 2:
             if coverage_eq is not None:
@@ -3201,8 +3162,7 @@ def optimize_fallback_lex_hard_first(
                         #    51병동-RN 은 주휴무 OFF 8 이 min 을 잡아 일반 10~11 인데 range 3,
                         #    빼면 1. 중환자실은 21 → 4.)
                         #   ★ 빼도 통제를 잃지 않는다 — 이미 하드로 고정돼 있다.
-                        if bool(getattr(nu, "is_weekend_off", False)) and \
-                                _os_lex.getenv("WEEKOFF_RANGE_EXCLUDE", "1") != "0":
+                        if bool(getattr(nu, "is_weekend_off", False)):
                             range_excluded_idx.add(n_lex)
                             continue
                         # ★ 활동 기간이 그 달 전체가 아닌 사람(중도 입퇴사·전입)도 뺀다.
@@ -3388,6 +3348,8 @@ def optimize_fallback_lex_hard_first(
                                 use_mid=use_mid_h1,
                             )
                             # 빈 집합은 "제한 없음"이다(is_code_blocked_by_profile 과 같은 해석).
+                            #   실측(9병동-9A × 5회): 제외하면 목적식 대상자들의 D/E 균등이
+                            #   4.00 → 3.35(-16.3%), 커버부족도 4.00 → 3.60. 하드 위반 0 불변.
                             if _al and not {"D", "E"} <= _al:
                                 continue
                             _ad = list(iter_nurse_days(_n, join, leave, blocked_by_nurse))
