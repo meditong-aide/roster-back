@@ -48,7 +48,7 @@ async def update_weekly_off_settings(
     return update_weekly_off_settings_service(payload, current_user, db, group_id)
 
 @router.get("/nurses", response_model=WeeklyOffNurseListResponse)
-async def get_nurses_weekly_off(
+def get_nurses_weekly_off(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -61,7 +61,7 @@ async def get_nurses_weekly_off(
     return get_nurses_weekly_off_service(year, month, current_user, db, group_id)
 
 @router.put("/nurses")
-async def update_nurses_weekly_off(
+def update_nurses_weekly_off(
     payload: WeeklyOffNurseUpdatePayload,
     group_id: Optional[str] = Query(None),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -75,7 +75,7 @@ async def update_nurses_weekly_off(
 
 
 @router.get("/my")
-async def get_my_weekly_off(
+def get_my_weekly_off(
     year: int,
     month: int,
     nurse_id: Optional[str] = None, # 추가: 옵션 파라미터

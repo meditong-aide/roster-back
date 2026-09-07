@@ -69,7 +69,7 @@ async def get_token(response: Response,
     return {"token" : token}
 
 @router.post("/login", summary="Token, 회원아이디로 sso")
-async def login_for_access_token(response: Response,
+def login_for_access_token(response: Response,
                                  request: Request,
                                  token: str = Form(...),
                                  MemberID: str = Form(...),

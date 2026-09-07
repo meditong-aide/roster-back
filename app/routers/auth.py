@@ -126,7 +126,7 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 @router.post("/login", response_model=UserSchema)
-async def login_for_access_token(
+def login_for_access_token(
     request: Request,
     response: Response, 
     form_data: OAuth2PasswordRequestForm = Depends(), 
@@ -257,7 +257,7 @@ async def login_for_access_token(
 
 
 @router.post("/logout")
-async def logout(response: Response, redirectUrl: str | None = None):
+def logout(response: Response, redirectUrl: str | None = None):
     """
         redirectUrl이 있는 경우 처리하고 값이 없는 경우 결과값 반환
     """
@@ -353,7 +353,7 @@ async def require_current_user(
 
 
 @router.get("/me", response_model=UserSchema)
-async def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
     if current_user is None:
         print('[/me]: 유저 없음')
         raise HTTPException(

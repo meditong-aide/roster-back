@@ -233,7 +233,7 @@ async def retract_submission(
 
 # [Preferences] - 최신 선호도 데이터 조회
 @router.get("/latest")
-async def get_latest_preference(
+def get_latest_preference(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -260,7 +260,7 @@ async def get_latest_preference(
 
 # [Preferences] - 모든 간호사의 희망사항 현황 조회
 @router.get("/all")
-async def get_all_preferences(
+def get_all_preferences(
     year: int,
     month: int,
     group_id: Optional[str] = None,
