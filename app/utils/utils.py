@@ -174,6 +174,26 @@ def push_enabled() -> bool:
     return os.getenv("ENVIRONMENT", "dev").strip().lower() in _PUSH_PRODUCTION_ENVS
 
 
+def groupware_write_enabled() -> bool:
+    """그룹웨어(eun_gw) **쓰기** 허용 여부. 읽기는 이 게이트와 무관하다.
+
+    `push_enabled()` 와 같은 [db-gate] 를 쓰되 [env-gate] 는 두지 않는다.
+    - 판정 기준이 `EUN_DB_NAME`(실제 접속 중인 roster DB) 하나뿐이라, 값을 못 읽으면
+      `"" != "eun_roster"` 로 **False(=쓰기 차단)** 가 되어 fail-closed 다.
+    - `ENVIRONMENT` 까지 요구하면 운영에서 그 변수를 못 읽는 순간 로그인 이력이 조용히
+      끊긴다. 그룹웨어 오염 방지에는 db-gate 만으로 충분하다.
+
+    ★ 도입 배경(2026-09-07): dev 백엔드가 로그인마다 운영 그룹웨어에
+      `INSERT bizwiz20db.Member_LoginLog` · `UPDATE bizwiz20db.Member_Login` 을 실행했다.
+      운영 데이터 오염이자, `eun_gw` 가 락 경합으로 느려지면 dev 로그인이 그 대기에 물려
+      **서버 전체가 멈추는**(uvicorn 워커 1 + async 핸들러) 장애의 방아쇠였다.
+      08-27 `b1c4459` 가 roster DB 에 대해 고친 것과 같은 유형이 gw 쪽에 남아 있었다.
+    ★ 인증 조회(`Member.login_check`·`member_view`)는 **막지 않는다** — dev 에서도 실제
+      사번으로 로그인해야 하므로 운영 gw 를 읽는 것은 설계상 정상이다.
+    """
+    return os.getenv("EUN_DB_NAME", "").strip().lower() == _PUSH_PRODUCTION_ROSTER_DB
+
+
 def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
                  sendEmpSeqNo: str, sendMemberId: str, receiveEmpSeqNo: str,
                  pushMessage: str, orgPushMessage: str, linkUrl: str, linkCode: str):
