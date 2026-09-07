@@ -179,7 +179,7 @@ class Common:
         return _queryString
 
     @staticmethod
-    def get_push_list():
+    def get_push_list(linked_only: bool = False):
         # LinkCode 기준 최신 1건만 노출 (동일 year/month 재마감 시 중복 제거)
         # LinkCode가 빈값인 기존 데이터는 Message에서 year/month 파싱하여 파티션 키 생성
         # params 순서: (OfficeCode, EmpSeqNo, listsize)
@@ -194,6 +194,19 @@ class Common:
         # ★ 값이 없으면 **빈 문자열이 아니라 null** 로 내려보낸다(프론트 계약).
         # ★ DB명은 `roster_db()` 로 호출 시점에 주입한다(모듈 상수면 import 순서에 취약).
         # ★ `nurses.nurse_id` 는 중복이 없어(실측) 조인으로 행이 늘지 않는다.
+        #
+        # ★ linked_only — '페이지 이동이 되는 알림'만. 판별자는 **LinkUrl 이 아니다**.
+        #   실측(2026-09-07 · TOP 15): `LinkUrl` 은 전 행이 빈값이고 `LinkCode` 도 대부분 비어
+        #   있다. 실제로 이동 대상을 가진 것은 위 `DerivedLinkCode` 가 `ROSTER:YYYY:MM` ·
+        #   `WANTED:YYYY:MM` 처럼 **파생 키를 만든 행**이고, 만들지 못한 행은 `Idx`(숫자)로
+        #   떨어진다. 그래서 `:` 유무로 가른다 — 새 유형이 `XXX:...` 로 추가돼도 자동 포함된다.
+        #   원본 `LinkCode` 가 채워진 행은 형식과 무관하게 이동 대상이므로 함께 통과시킨다.
+        #   ★ 필터는 `TOP` **앞**(Ranked)에 둔다. 뒤에서 파이썬으로 거르면 listsize 가
+        #     '최근 N건 중 공지'가 되어 목록이 비는 일이 생긴다. 여기선 '공지 N건'이다.
+        linked_filter = (
+            "\n               And (NULLIF(LinkCode, '') IS NOT NULL "
+            "Or CHARINDEX(':', DerivedLinkCode) > 0)"
+        ) if linked_only else ""
         _queryString = f"""
         WITH Base AS (
             Select
@@ -256,7 +269,7 @@ class Common:
                Message, regdate, ReadYN, Fk_Idx, LinkUrl,
                DerivedLinkCode AS LinkCode
           From Ranked
-         Where rn = 1
+         Where rn = 1{linked_filter}
          Order By Idx desc
         """
         return _queryString

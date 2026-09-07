@@ -43,9 +43,24 @@ def message_view(current_user: UserSchema = Depends(require_current_user)):
 
 
 @router.get("/list", summary="메세지 리스트")
-def message_view(listsize: int, current_user: UserSchema = Depends(require_current_user)):
+def message_view(
+    listsize: int,
+    scope: Literal["linked"] | None = None,
+    current_user: UserSchema = Depends(require_current_user),
+):
     """
-    * 호출방식 : /push/list?listsize=10
+    * 호출방식 : /push/list?listsize=10 · /push/list?listsize=10&scope=linked
+
+    * scope (선택)
+      - 생략: 전체 알림(기존 동작 그대로)
+      - `linked`: **페이지 이동이 되는 알림만**. 원티드 요청·근무표 마감처럼 눌렀을 때
+        갈 곳이 있는 것들이다. 프리셉티 종료·병동이동 배정 같은 통보성 알림은 빠진다.
+
+      ★ 판별자는 `linkUrl` 이 **아니다**. 실측(2026-09-07)상 그 컬럼은 전 행이 비어 있다.
+        실제 기준은 `linkCode` — 서버가 `pushsubcode` 와 메시지에서 `ROSTER:YYYY:MM` ·
+        `WANTED:YYYY:MM` 을 파생시키고, 파생하지 못한 행은 `Idx`(숫자)가 된다.
+      ★ 필터는 `TOP` 앞에서 걸린다. 즉 `listsize` 는 '최근 N건 중 공지'가 아니라
+        **'공지 N건'** 을 뜻한다.
     * 리턴값 :
       - pushcode: 푸시 구분코드 (AI근무표 P30)
       - pushsubcode: 푸시 서브코드
@@ -74,7 +89,11 @@ def message_view(listsize: int, current_user: UserSchema = Depends(require_curre
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="리스트수값이 필요합니다.")
 
     # params 순서 변경: CTE로 인해 (OfficeCode, EmpSeqNo, listsize) 순서
-    rows = msdb_manager.fetch_all(Common.get_push_list(), params=(OfficeCode, EmpSeqNo, listsize))
+    # scope 는 Literal 이라 FastAPI 가 422 로 막는다 — 여기서 다시 검증하지 않는다.
+    rows = msdb_manager.fetch_all(
+        Common.get_push_list(linked_only=(scope == "linked")),
+        params=(OfficeCode, EmpSeqNo, listsize),
+    )
 
     if rows is None:
         raise HTTPException(status_code=500, detail="요청을 찾을 수 없습니다.")
