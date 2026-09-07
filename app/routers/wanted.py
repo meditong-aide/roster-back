@@ -172,7 +172,7 @@ async def get_submission_statuses(
 
 # [Wanted] - 현재 그룹의 모든 wanted 데이터 조회
 @router.get("/all")
-async def get_all_wanted(
+def get_all_wanted(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -501,7 +501,7 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
 
 # WantedConfig 관련 엔드포인트
 @router.get("/config")
-async def get_wanted_config_endpoint(
+def get_wanted_config_endpoint(
     year: Optional[int] = None,
     month: Optional[int] = None,
     target_date: Optional[str] = None,
@@ -539,7 +539,7 @@ async def get_wanted_config_endpoint(
 
 
 @router.post("/config")
-async def upsert_wanted_config_endpoint(
+def upsert_wanted_config_endpoint(
     config_data: List[WantedConfigCreate],
     group_id: Optional[str] = None,
     year: Optional[int] = None,
@@ -574,7 +574,7 @@ async def upsert_wanted_config_endpoint(
 
 
 @router.delete("/config")
-async def delete_wanted_config_endpoint(
+def delete_wanted_config_endpoint(
     target_date: Optional[str] = None,
     shift_type: Optional[str] = None,
     group_id: Optional[str] = None,

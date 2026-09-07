@@ -154,7 +154,7 @@ async def get_sso_mode(token: str = Form(...), MemberID: str = Form(...)):
 
 
 @router.post("/login", summary="Token, 회원아이디로 sso")
-async def login_for_access_token(response: Response,
+def login_for_access_token(response: Response,
                                  request: Request,
                                  token: str = Form(...),
                                  MemberID: str = Form(...),

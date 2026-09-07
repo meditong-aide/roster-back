@@ -260,7 +260,7 @@ async def unsave_roster_config(
 
 
 @router.get("/config/versions")
-async def get_config_versions(
+def get_config_versions(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -489,7 +489,7 @@ async def get_config_by_version(
 
 # [Schedules] - 최신 월과 버전의 스케줄 정보 조회 (수간호사용)
 @router.get("/latest")
-async def get_latest_schedule(
+def get_latest_schedule(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -809,7 +809,7 @@ async def get_issued_roster_snapshot(
 
 # [Roster] - 본인 발행 근무표 조회
 @router.get("/issued_roster/me")
-async def get_my_issued_roster(
+def get_my_issued_roster(
     year: int,
     month: int,
     current_user: UserSchema = Depends(require_current_user),
@@ -1288,7 +1288,7 @@ async def get_roster_by_schedule_id(
 
 # [Schedules] - 특정 월의 모든 버전 목록 조회 (수간호사용)
 @router.get("/{year:int}/{month:int}/versions")
-async def get_schedule_versions(
+def get_schedule_versions(
     year: int,
     month: int,
     group_id: Optional[str] = None,
