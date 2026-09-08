@@ -261,7 +261,7 @@ async def unsave_roster_config(
 
 
 @router.get("/config/versions")
-async def get_config_versions(
+def get_config_versions(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -516,7 +516,7 @@ async def get_config_by_version(
 
 # [Schedules] - 최신 월과 버전의 스케줄 정보 조회 (수간호사용)
 @router.get("/latest")
-async def get_latest_schedule(
+def get_latest_schedule(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -836,7 +836,7 @@ async def get_issued_roster_snapshot(
 
 # [Roster] - 본인 발행 근무표 조회
 @router.get("/issued_roster/me")
-async def get_my_issued_roster(
+def get_my_issued_roster(
     year: int,
     month: int,
     current_user: UserSchema = Depends(require_current_user),
@@ -929,7 +929,11 @@ def get_my_today(
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    """모바일 '오늘 근무' 화면용 — 본인 근무 + 같이 일하는 동료 + 다음 OFF.
+    """모바일 '오늘 근무' 화면용 — 본인 근무 + 같은 상태 동료 + 다음 OFF.
+
+    `coworkers` 는 본인이 **근무면 같은 시간대 근무자**, **비근무(OFF·주휴·휴가)면
+    그 날 쉬는 사람 전부**다. 본인 근무를 모르는 날(`shift_unknown`)은 빈 목록이다 —
+    "동료 없음"(빈 배열 + `shift_unknown:false`)과 구분해서 읽으면 된다.
 
     셋을 한 응답에 담는 이유는 **같은 발행 스냅샷 하나로 전부 계산되기 때문**이다.
     나누면 같은 스냅샷을 2~3번 로드한다.
@@ -1377,7 +1381,7 @@ async def get_roster_by_schedule_id(
 
 # [Schedules] - 특정 월의 모든 버전 목록 조회 (수간호사용)
 @router.get("/{year:int}/{month:int}/versions")
-async def get_schedule_versions(
+def get_schedule_versions(
     year: int,
     month: int,
     group_id: Optional[str] = None,

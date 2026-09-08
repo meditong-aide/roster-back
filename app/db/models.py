@@ -1284,6 +1284,12 @@ class Message(Base):
     is_read = Column(BOOLEAN, default=False, nullable=False)
     created_at = Column(DATETIME, default=func.now(), nullable=False)
     read_at = Column(DATETIME, nullable=True)
+    # 발송 묶음 식별자 — 한 번의 발송(수신자 N명)이 같은 값을 갖는다.
+    # 값은 **그 발송 첫 행의 `id`** 다(`message_service.create_message` 참조).
+    #   · PK 에서 오므로 유일하고 불변이며, 정수라 정렬·커서 키로 쓸 수 있다.
+    #   · nullable — 컬럼 도입 전 데이터가 있고, 그 행들은 `batch_id = id` 로
+    #     백필해 각각 단건 묶음이 된다. 읽는 쪽은 NULL 이면 `id` 로 대신 읽는다.
+    batch_id = Column(INTEGER, nullable=True)
 
     sender = relationship("Nurse", foreign_keys=[sender_nurse_id])
     receiver = relationship("Nurse", foreign_keys=[receiver_nurse_id])

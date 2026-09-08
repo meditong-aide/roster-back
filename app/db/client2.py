@@ -20,36 +20,56 @@ class MssqlDatabasemanager:
         self.user = os.getenv("MS_DB_USER")
         self.password = os.getenv("MS_DB_PASSWORD")
 
-    def get_connection(self, database: str | None = None, charset: str | None = 'EUC-KR') -> pymssql.Connection:
-        """데이터베이스 연결을 생성합니다. 선택적으로 데이터베이스명을 지정할 수 있습니다."""
-        try:
-            connection = pymssql.connect(
-                server=self.host,
-                port=self.port,
-                database=(database or self.database),
-                user=self.user,
-                password=self.password,
-                #charset='EUC-KR'
-                charset= charset
+    def get_connection(self, database: str | None = None, charset: str | None = 'EUC-KR',
+                       timeout: int | None = None) -> pymssql.Connection:
+        """데이터베이스 연결을 생성합니다. 선택적으로 데이터베이스명을 지정할 수 있습니다.
 
-            )
+        Args:
+            timeout: 쿼리 실행 대기 상한(초). None 이면 **무한 대기**(pymssql 기본 0).
+
+        ★ 기본을 무한으로 남겨 둔 이유: 여기는 근무표 생성 배치도 함께 쓰는 통로다.
+          전역으로 상한을 걸면 오래 걸리는 배치 쿼리가 조용히 끊긴다. 그래서
+          **호출부가 필요할 때만** 건다 — 특히 그룹웨어(`bizwiz20db`) 를 보는 경로.
+          그쪽은 21개 DB 가 한 인스턴스에 얹힌 공용 서버라, 남의 락 경합에 물리면
+          이 프로세스가 함께 멈춘다(uvicorn 워커가 그 대기에 잡힌다).
+        """
+        try:
+            kwargs = {
+                "server": self.host,
+                "port": self.port,
+                "database": (database or self.database),
+                "user": self.user,
+                "password": self.password,
+                "charset": charset,
+            }
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+                # 로그인 자체가 물리는 것도 막는다 — 쿼리 상한만 걸면 핸드셰이크에서 샌다.
+                kwargs["login_timeout"] = min(int(timeout), 15)
+            connection = pymssql.connect(**kwargs)
             return connection
         except Exception as e:
             logger.error(f"데이터베이스 연결 실패: {e}")
             raise
 
     @contextmanager
-    def connection(self, database: str | None = None, charset: str | None = 'EUC-KR') -> Generator[pymssql.Connection, None, None]:
+    def connection(self, database: str | None = None, charset: str | None = 'EUC-KR',
+                   timeout: int | None = None) -> Generator[pymssql.Connection, None, None]:
         """컨텍스트 매니저로 연결을 열고 자동으로 닫습니다."""
-        conn = self.get_connection(database, charset)
+        conn = self.get_connection(database, charset, timeout=timeout)
         try:
             yield conn
         finally:
             conn.close()
 
-    def fetch_all(self, query: str, params: tuple | None = None, database: str | None = None, charset: str | None = 'EUC-KR') -> list[dict]:
-        """SELECT 쿼리를 실행하고 결과를 리스트[dict]로 반환합니다."""
-        with self.connection(database, charset=charset) as conn:
+    def fetch_all(self, query: str, params: tuple | None = None, database: str | None = None,
+                  charset: str | None = 'EUC-KR', timeout: int | None = None) -> list[dict]:
+        """SELECT 쿼리를 실행하고 결과를 리스트[dict]로 반환합니다.
+
+        `timeout` 을 주면 그 초를 넘길 때 예외가 난다. 안 주면 무한 대기다
+        (`get_connection` 도크스트링 참조).
+        """
+        with self.connection(database, charset=charset, timeout=timeout) as conn:
             cursor = conn.cursor()
             cursor.execute(query, params or ())
             rows = cursor.fetchall()

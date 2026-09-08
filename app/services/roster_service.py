@@ -2039,16 +2039,26 @@ def _coworkers_of_day(
     day: int,
     my_code: str,
 ) -> list[dict]:
-    """같은 날 **같은 시간대**(`default_shift`)로 배정된 동료. 본인 제외.
+    """같은 날 **같은 상태**인 동료. 본인 제외.
 
-    ★ 정확일치가 아니라 시간대로 묶는다. 병동마다 `D`/`D1`/`반반` 같은 파생코드가
-      있어 코드로 묶으면 실제로 붙어 일하는 사람이 목록에서 빠진다.
-    ★ 본인이 OFF·휴가·미배정이면 빈 목록이다 — 같이 일하는 사람이 없다.
+    · 본인이 근무면 → 같은 시간대(`default_shift`) 근무자
+    · 본인이 비근무면 → 그 날 **근무하지 않는 사람 전부**(OFF·주휴·휴가·공가)
+
+    ★ 근무 쪽은 정확일치가 아니라 시간대로 묶는다. 병동마다 `D`/`D1`/`반반` 같은
+      파생코드가 있어 코드로 묶으면 실제로 붙어 일하는 사람이 목록에서 빠진다.
+    ★ 비근무 쪽은 코드를 나누지 않는다 — 화면 개념이 '오늘 나처럼 쉬는 사람'이다.
+      OFF 와 주휴를 가르고 싶으면 프론트가 각 항목의 `shift_code` 로 하면 된다.
+    ★★ 메타가 **비어 있으면 어느 쪽에도 넣지 않는다.** `is_work` 는 3상태라
+      (True/False/None) `None` 은 'OFF' 가 아니라 '그 코드의 정의를 모른다' 이다
+      (`_code_detail` 의 같은 주석 참조). 눕혀서 세면 정의 없는 코드가 전부
+      '쉬는 동료' 로 나간다. 본인 셀이 unknown(파견지 미발행 → 메타 없음)일 때도
+      같은 이유로 빈 목록이다 — 본인 근무를 모르는데 동료를 단정할 수 없다.
     """
     my_meta = meta.get(my_code) or {}
-    if not my_code or not my_meta.get("is_work"):
+    if not my_code or not my_meta:
         return []
-    my_slot = my_meta.get("default_shift") or my_code
+    my_is_work = bool(my_meta.get("is_work"))
+    my_slot = (my_meta.get("default_shift") or my_code) if my_is_work else None
 
     profiles = _nurse_profiles(db, snapshot)
     out: list[dict] = []
@@ -2059,9 +2069,15 @@ def _coworkers_of_day(
         cells = row.get("schedule") or []
         code = _raw_cell_code(cells[day - 1] if 0 < day <= len(cells) else None)
         cell_meta = meta.get(code) or {}
-        if not code or not cell_meta.get("is_work"):
+        if not code or not cell_meta:
             continue
-        if (cell_meta.get("default_shift") or code) != my_slot:
+        cw_is_work = bool(cell_meta.get("is_work"))
+        if my_is_work:
+            if not cw_is_work:
+                continue
+            if (cell_meta.get("default_shift") or code) != my_slot:
+                continue
+        elif cw_is_work:
             continue
         profile = profiles.get(nurse_id, {})
         out.append({
@@ -2137,7 +2153,10 @@ def get_my_today_service(
     include_coworkers: bool = True,
     include_next_off: bool = True,
 ) -> dict:
-    """오늘(또는 지정일) 본인 근무 + 같은 시간대 동료 + 다음 OFF 까지 남은 일수.
+    """오늘(또는 지정일) 본인 근무 + 같은 상태 동료 + 다음 OFF 까지 남은 일수.
+
+    `coworkers` 는 본인이 근무면 같은 시간대 근무자, 비근무면 그 날 쉬는 사람 전부다
+    (`_coworkers_of_day` 참조).
 
     ★ 그 날 소속 병동은 토큰이 아니라 **본인 근무표 셀의 `group_id`** 로 정한다.
       파견/병동이동 중이면 그 날은 다른 병동이고 동료도 그쪽에서 찾아야 한다.

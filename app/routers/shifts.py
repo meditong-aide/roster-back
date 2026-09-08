@@ -60,7 +60,7 @@ load_dotenv()
 
 # [Shifts] - 모든 시프트 정보 조회
 @router.get("/shifts")
-async def get_shifts(
+def get_shifts(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)   

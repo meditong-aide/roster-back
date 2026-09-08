@@ -179,10 +179,19 @@ class Common:
         return _queryString
 
     @staticmethod
-    def get_push_list():
+    def get_push_list(linked_only: bool = False):
         # LinkCode 기준 최신 1건만 노출 (동일 year/month 재마감 시 중복 제거)
         # LinkCode가 빈값인 기존 데이터는 Message에서 year/month 파싱하여 파티션 키 생성
         # params 순서: (OfficeCode, EmpSeqNo, listsize)
+        #
+        # ★ linked_only — '페이지 이동이 되는 알림'만. 판별자는 **LinkUrl 이 아니다**.
+        #   실측상 `LinkUrl` 은 전 행이 빈값이고 `LinkCode` 도 대부분 비어 있다. 실제로
+        #   이동 대상을 가진 것은 아래 `DerivedLinkCode` 가 `ROSTER:YYYY:MM` ·
+        #   `WANTED:YYYY:MM` 처럼 **파생 키를 만든 행**이고, 만들지 못한 행은 `Idx`(숫자)로
+        #   떨어진다. 그래서 `:` 유무로 가른다 — 새 유형이 `XXX:...` 로 추가돼도 자동 포함된다.
+        #   원본 `LinkCode` 가 채워진 행은 형식과 무관하게 이동 대상이므로 함께 통과시킨다.
+        #   ★ 필터는 `TOP` **앞**(Ranked)에 둔다. 뒤에서 파이썬으로 거르면 listsize 가
+        #     '최근 N건 중 공지'가 되어 목록이 비는 일이 생긴다. 여기선 '공지 N건'이다.
         #
         # ★ senderduty(발신자 직함) — roster 의 `nurses.level_` 을 쓴다.
         #   그룹웨어 `Member.duty` 는 실측상 거의 비어 있어(재직 1,796명 중 NULL 1,792) 못 쓴다.
@@ -194,6 +203,10 @@ class Common:
         # ★ 값이 없으면 **빈 문자열이 아니라 null** 로 내려보낸다(프론트 계약).
         # ★ DB명은 `roster_db()` 로 호출 시점에 주입한다(모듈 상수면 import 순서에 취약).
         # ★ `nurses.nurse_id` 는 중복이 없어(실측) 조인으로 행이 늘지 않는다.
+        linked_filter = (
+            "\n               And (NULLIF(LinkCode, '') IS NOT NULL "
+            "Or CHARINDEX(':', DerivedLinkCode) > 0)"
+        ) if linked_only else ""
         _queryString = f"""
         WITH Base AS (
             Select
@@ -256,10 +269,157 @@ class Common:
                Message, regdate, ReadYN, Fk_Idx, LinkUrl,
                DerivedLinkCode AS LinkCode
           From Ranked
-         Where rn = 1
+         Where rn = 1{linked_filter}
          Order By Idx desc
         """
         return _queryString
+
+    # ────────────────────────── /push/inbox (커서 페이징) ──────────────────────────
+    #
+    # ★ `get_push_list` 를 고치지 않고 **따로 둔다.** 그쪽은 PC 가 쓰는 계약이고,
+    #   여기는 커서·필터·건수를 얹은 다른 계약이다. 한 함수에 넣으면 파라미터가
+    #   listsize/cursor 두 갈래로 갈려 어느 쪽이 무슨 뜻인지 흐려진다.
+    #
+    # ★★ 부하: `Base` 가 **내 알림 전부**를 읽고 `TOP` 은 맨 마지막에 걸린다.
+    #   즉 커서를 붙여도 스캔량이 새로 늘지 않는다 — 지금도 매 호출이 전수 스캔이다.
+    #   `listsize=50` 고정을 커서로 바꾸는 것이 부하 면에서 손해가 아닌 이유다.
+    #
+    # ★ 대표 알림과 unread 판정 순서(프론트 계약):
+    #   1) `DerivedLinkCode` 로 묶고 `Idx DESC` 로 **최신 1건**을 대표로 남긴다.
+    #   2) unread 는 그 **대표 행의 ReadYN** 이다. 같은 linkCode 의 옛 알림을 읽었어도
+    #      새로 온 알림이 안 읽혔으면 unread 다. 반대로 대표를 읽었으면 그 묶음은 read 다.
+    #   목록·total·unreadTotal 이 모두 이 순서를 쓴다 — 한 곳만 달라지면 건수가 어긋난다.
+
+    @staticmethod
+    def _push_inbox_cte() -> str:
+        """`/push/inbox` 계열이 공유하는 CTE. 대표 1건까지 추린 상태.
+
+        `rn = 1` 과 scope 필터는 **소비처가 건다** — 그 자리가 곧 건수를 세는 자리라
+        여기서 걸어 버리면 소비처가 세는 집합을 못 고른다.
+        `get_push_list` 와 같은 파생·중복제거 규칙을 쓴다. 규칙이 갈리면 목록과 건수가
+        서로 다른 집합을 세게 된다.
+        """
+        return f"""
+        WITH Base AS (
+            Select
+                   a.Idx, a.pushcode, a.pushsubcode, a.officecode,
+                   a.EmpSeqNo as senderEmpSeqNo, c.EmployeeName as sendername,
+                   NULLIF(d.level_, '') as senderduty,
+                   a.Message, Convert(VarChar(10), b.RegDate, 120) as regdate,
+                   b.ReadYN, b.Fk_Idx,
+                   ISNULL(a.LinkUrl, '') as LinkUrl,
+                   ISNULL(a.LinkCode, '') as LinkCode
+              From bizwiz20db.TB_Mobile_Push_History_Master a WITH(NOLOCK)
+             Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
+             Inner Join bizwiz20db.Member c WITH(NOLOCK) On a.officeCode = c.officeCode and a.EmpSeqNo=c.EmpSeqNo
+              Left Join {roster_db()}.dbo.nurses d WITH(NOLOCK) On d.office_id = a.officecode and d.nurse_id = a.EmpSeqNo
+             Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N'
+               And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
+        ),
+        WithKey AS (
+            Select *,
+                   CASE
+                       WHEN LinkCode <> '' THEN LinkCode
+                       WHEN pushsubcode IN ('S01','S04') AND CHARINDEX(N'년', Message) > 0 AND CHARINDEX(N'월', Message) > 0
+                       THEN CONCAT(
+                           'ROSTER:',
+                           LEFT(Message, CHARINDEX(N'년', Message) - 1),
+                           ':',
+                           RIGHT('0' + LTRIM(RTRIM(SUBSTRING(
+                               Message,
+                               CHARINDEX(N'년 ', Message) + 2,
+                               CHARINDEX(N'월', Message) - CHARINDEX(N'년 ', Message) - 2
+                           ))), 2)
+                       )
+                       WHEN pushsubcode = 'S02' AND CHARINDEX(N'년', Message) > 0 AND CHARINDEX(N'월', Message) > 0
+                       THEN CONCAT(
+                           'WANTED:',
+                           LEFT(Message, CHARINDEX(N'년', Message) - 1),
+                           ':',
+                           RIGHT('0' + LTRIM(RTRIM(SUBSTRING(
+                               Message,
+                               CHARINDEX(N'년 ', Message) + 2,
+                               CHARINDEX(N'월', Message) - CHARINDEX(N'년 ', Message) - 2
+                           ))), 2)
+                       )
+                       ELSE CAST(Idx AS VARCHAR(20))
+                   END AS DerivedLinkCode
+              From Base
+        ),
+        Ranked AS (
+            Select *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY DerivedLinkCode
+                       ORDER BY Idx DESC
+                   ) AS rn
+              From WithKey
+        )"""
+
+    @staticmethod
+    def get_push_inbox(linked_only: bool = False, unread_only: bool = False,
+                       use_cursor: bool = False):
+        """알림 목록 한 페이지 **+ 건수 두 개를 한 쿼리로**.
+        params: (OfficeCode, EmpSeqNo, limit, [cursor_idx])
+
+        ★★ 목록과 건수를 **따로 던지지 않는다.** 위 `Base` 는 내 알림 전수를 훑으므로
+          두 번 던지면 그 무거운 스캔을 두 번 한다. 공용 DB(그룹웨어와 한 인스턴스)라
+          그대로 남의 부하가 된다. 모바일이 폴링하는 경로라 왕복 수가 곧 부하다.
+
+        ★ 합칠 수 있는 근거는 **평가 순서**다. SQL Server 는 WHERE 를 먼저 적용하고
+          그 결과 위에서 윈도우 함수를 계산한 뒤, 마지막에 TOP 을 자른다. 그래서
+          `COUNT(*) OVER ()` 는 **TOP 에 잘리기 전 전체 행 수**가 된다.
+        ★ 다만 그 전체는 '그 SELECT 의 WHERE 를 통과한 것'이라, scope 만 걸린 자리에서
+          세야 한다. `Repr` 단계에 scope(linked)만 두고 **cursor·unread 는 바깥으로**
+          뺀 이유다. 안 그러면 total 이 '커서 이후의 수'가 되어 스크롤할수록 줄어든다.
+
+        ★ 커서는 대표 행의 `Idx` 다. 불변이고 정렬 키와 같아 keyset 이 성립한다.
+          OFFSET 을 쓰면 앞쪽에 알림이 추가·삭제될 때 밀려서 중복·누락이 난다.
+        ★ `%s` 순서는 **SQL 텍스트에 나오는 순서**다(pymssql 은 위치 기반).
+          `Top %s` 가 `Idx < %s` 보다 앞이므로 limit 이 먼저다. 뒤집으면
+          `Top <커서Idx>` 가 되어 에러 없이 조용히 이상한 결과가 나간다.
+        """
+        cursor_filter = "\n           And Idx < %s" if use_cursor else ""
+        unread_filter = "\n           And ReadYN = 'N'" if unread_only else ""
+        linked_filter = (
+            "\n               And (NULLIF(LinkCode, '') IS NOT NULL "
+            "Or CHARINDEX(':', DerivedLinkCode) > 0)"
+        ) if linked_only else ""
+        return f"""{Common._push_inbox_cte()},
+        Repr AS (
+            Select *,
+                   COUNT(*) OVER () As total_all,
+                   SUM(CASE WHEN ReadYN = 'N' THEN 1 ELSE 0 END) OVER () As unread_all
+              From Ranked
+             Where rn = 1{linked_filter}
+        )
+        Select Top %s
+               Idx, pushcode, pushsubcode, officecode, senderEmpSeqNo, sendername, senderduty,
+               Message, regdate, ReadYN, Fk_Idx, LinkUrl,
+               DerivedLinkCode AS LinkCode,
+               total_all, unread_all
+          From Repr
+         Where 1 = 1{cursor_filter}{unread_filter}
+         Order By Idx desc
+        """
+
+    @staticmethod
+    def get_push_inbox_counts(linked_only: bool = False):
+        """건수만. params: (OfficeCode, EmpSeqNo)
+
+        ★ 평시에는 쓰지 않는다 — 건수는 `get_push_inbox` 가 함께 낸다.
+          **결과가 0행일 때만** 부른다. 그때는 얹어 올 행이 없어 건수를 못 받는데,
+          커서가 끝을 넘은 경우가 그렇다(알림이 아예 없으면 0 이 정답이라 부를 일도 없다).
+        """
+        linked_filter = (
+            "\n               And (NULLIF(LinkCode, '') IS NOT NULL "
+            "Or CHARINDEX(':', DerivedLinkCode) > 0)"
+        ) if linked_only else ""
+        return f"""{Common._push_inbox_cte()}
+        Select COUNT(*) As total,
+               SUM(CASE WHEN ReadYN = 'N' THEN 1 ELSE 0 END) As unreadTotal
+          From Ranked
+         Where rn = 1{linked_filter}
+        """
 
     @staticmethod
     def update_push_read_one():

@@ -14,6 +14,7 @@ from db.models import Nurse, Group
 from schemas.auth_schema import User as UserSchema
 from utils.security import create_access_token
 from utils.security import create_login_token
+from utils.utils import groupware_write_enabled
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
 
@@ -153,7 +154,7 @@ async def get_sso_mode(token: str = Form(...), MemberID: str = Form(...)):
 
 
 @router.post("/login", summary="Token, 회원아이디로 sso")
-async def login_for_access_token(response: Response,
+def login_for_access_token(response: Response,
                                  request: Request,
                                  token: str = Form(...),
                                  MemberID: str = Form(...),
@@ -390,10 +391,14 @@ def mworks_access_token (account_id: str, client_ip: str) :
 
     params = (account_id, RegDate, client_ip, EmpSeqNo, OfficeCode, LogType)
 
-    new_id = msdb_manager.execute(Member.login_log(), params=params)
+    # [gw-write-gate] SSO 로그인 이력도 운영 roster DB 일 때만 그룹웨어에 남긴다.
+    # 근거·배경은 `utils.utils.groupware_write_enabled()` 도크스트링 참조.
+    # (`new_id` 는 이 블록 밖에서 쓰이지 않아 게이트로 감싸도 이후 흐름에 영향이 없다.)
+    if groupware_write_enabled():
+        new_id = msdb_manager.execute(Member.login_log(), params=params)
 
-    if new_id is None:
-        new_id = msdb_manager.execute(Member.login_update(), params=(EmpSeqNo))
+        if new_id is None:
+            new_id = msdb_manager.execute(Member.login_update(), params=(EmpSeqNo))
 
     try :
         user_info = msdb_manager.fetch_all(Member.member_view(), params=(account_id))

@@ -876,7 +876,7 @@ verification_cache: Dict[
 
 
 @router.get("/personnel-basic-info")
-async def get_personnel_basic_info(
+def get_personnel_basic_info(
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):

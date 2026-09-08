@@ -20,7 +20,7 @@ from db.models import Nurse, Group
 from schemas.auth_schema import User as UserSchema, TokenData
 from utils.email import email_sender, EmailSchema
 from utils.security import create_login_token
-from utils.utils import set_sms
+from utils.utils import set_sms, groupware_write_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +105,23 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
     if not IsPWCorrect :
         raise HTTPException(status_code=500, detail=f"Login failed")
 
-    new_id = msdb_manager.execute(Member.login_log(), params=params)
+    # [gw-write-gate] 로그인 이력은 **운영 roster DB 로 붙었을 때만** 그룹웨어에 남긴다.
+    # dev/localhost 는 인증(읽기)만 운영 gw 로 하고 쓰기는 건너뛴다. 이유 2가지:
+    #   ① 운영 그룹웨어 데이터 오염 방지 — dev 로그인이 운영 Member_LoginLog 에 쌓였다.
+    #   ② eun_gw 는 21개 DB 공용이라 락 경합이 잦다. 여기서 대기가 걸리면
+    #      async 핸들러 + uvicorn 워커 1개 구조상 **dev 서버 전체가 멈춘다**(2026-09-07 장애).
+    # ★ 쓰기와 그 None 검사를 **함께** 게이트 안에 둔다 — 쓰기만 건너뛰면 new_id/rows 가
+    #   None 이 되어 아래 검사에 걸려 dev 로그인이 500 으로 죽는다.
+    if groupware_write_enabled():
+        new_id = msdb_manager.execute(Member.login_log(), params=params)
 
-    if new_id is None:
-        raise HTTPException(status_code=500, detail=f"Login failed")
+        if new_id is None:
+            raise HTTPException(status_code=500, detail=f"Login failed")
 
-    rows = msdb_manager.execute(Member.login_update(), params=str(EmpSeqNo))
+        rows = msdb_manager.execute(Member.login_update(), params=str(EmpSeqNo))
 
-    if rows is None:
-        raise HTTPException(status_code=500, detail=f"Login failed")
+        if rows is None:
+            raise HTTPException(status_code=500, detail=f"Login failed")
 
     try :
         user_info = msdb_manager.fetch_all(Member.member_view(), params=(account_id))
@@ -126,7 +134,7 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 @router.post("/login", response_model=UserSchema)
-async def login_for_access_token(
+def login_for_access_token(
     request: Request,
     response: Response, 
     form_data: OAuth2PasswordRequestForm = Depends(), 
@@ -257,7 +265,7 @@ async def login_for_access_token(
 
 
 @router.post("/logout")
-async def logout(response: Response, redirectUrl: str | None = None):
+def logout(response: Response, redirectUrl: str | None = None):
     """
         redirectUrl이 있는 경우 처리하고 값이 없는 경우 결과값 반환
     """
@@ -353,7 +361,7 @@ async def require_current_user(
 
 
 @router.get("/me", response_model=UserSchema)
-async def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
     if current_user is None:
         print('[/me]: 유저 없음')
         raise HTTPException(

@@ -36,6 +36,7 @@ from db.models import (
 )
 from schemas.auth_schema import User as UserSchema
 from services.wanted_service import (
+    get_my_wanted_dashboard_service,
     request_wanted_shifts_service,
     invoke_and_persist_wanted_service,
     get_wanted_config,
@@ -130,6 +131,34 @@ async def get_wanted_status(
 
 
 # [Wanted] - 본인이 제출한 원티드의 반영률 (모바일)
+@router.get("/me/dashboard")
+def get_my_wanted_dashboard(
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """모바일 대시보드 — 내가 작성할 원티드 + 각각의 작성 상태를 한 번에.
+
+    * 호출방식 : /wanted/me/dashboard  (파라미터 없음 — 대상 선정은 서버가 한다)
+    * 리턴값 : `{"items": [{year, month, exp_date, submission_status}]}`
+      - submission_status : `not_started` | `draft` | `submitted`
+      - exp_date : 마감일 없으면 null. 대상이 없으면 items 는 빈 배열이다.
+      - 정렬 : 마감일 오름차순, **없는 것은 뒤로**
+      - 상세 `preference_data` 는 넣지 않는다 — 목록 화면이 쓰지 않는데 응답만 커진다.
+
+    ★ `/wanted/all` + 월별 `/preferences/latest` 를 대체한다. 월 수만큼 왕복하던 것이
+      2쿼리로 끝난다.
+    ★ 노출 기준·정렬·재오픈 처리는 `get_my_wanted_dashboard_service` 도크스트링이 정본이다.
+    ★ 대상이 없어도 404 가 아니라 200 + 빈 배열이다 — CloudFront 가 `/api/*` 404 를
+      `index.html` 200 으로 바꿔 보내 모바일이 하얗게 뜬다.
+    """
+    try:
+        return get_my_wanted_dashboard_service(current_user=current_user, db=db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"원티드 대시보드 조회 실패: {str(e)}")
+
+
 @router.get("/me/reflection")
 def get_my_wanted_reflection(
     year: Optional[int] = None,
@@ -217,7 +246,7 @@ async def get_submission_statuses(
 
 # [Wanted] - 현재 그룹의 모든 wanted 데이터 조회
 @router.get("/all")
-async def get_all_wanted(
+def get_all_wanted(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -546,7 +575,7 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
 
 # WantedConfig 관련 엔드포인트
 @router.get("/config")
-async def get_wanted_config_endpoint(
+def get_wanted_config_endpoint(
     year: Optional[int] = None,
     month: Optional[int] = None,
     target_date: Optional[str] = None,
@@ -584,7 +613,7 @@ async def get_wanted_config_endpoint(
 
 
 @router.post("/config")
-async def upsert_wanted_config_endpoint(
+def upsert_wanted_config_endpoint(
     config_data: List[WantedConfigCreate],
     group_id: Optional[str] = None,
     year: Optional[int] = None,
@@ -619,7 +648,7 @@ async def upsert_wanted_config_endpoint(
 
 
 @router.delete("/config")
-async def delete_wanted_config_endpoint(
+def delete_wanted_config_endpoint(
     target_date: Optional[str] = None,
     shift_type: Optional[str] = None,
     group_id: Optional[str] = None,

@@ -4317,3 +4317,117 @@ def get_shift_requests_service(
         })
 
     return results
+
+
+def get_my_wanted_dashboard_service(current_user: UserSchema, db: Session) -> dict:
+    """모바일 대시보드용 — 내가 작성할 원티드와 각각의 작성 상태를 한 번에.
+
+    프론트가 `/wanted/all` 로 목록을 받고 월마다 `/preferences/latest` 를 따로 부르던
+    것을 하나로 합친다. 월 수만큼 왕복하던 것이 2쿼리로 끝난다.
+
+    노출 대상 — 닫히지 않았고(`status != 'closed'`) **지금 작성할 의미가 있는 것**.
+      · 현재 월 이후는 전부 노출한다(마감일 유무와 무관).
+      · **과거 월은 마감일이 아직 남아 있을 때만** 노출한다.
+      · 재오픈은 자동으로 처리된다 — 닫힌 월을 다시 열 때 새 마감일을 주면
+        그 시점에 다시 뜬다. 별도 플래그가 필요 없다.
+
+      ★ 처음에는 '닫히지 않았으면 전부'로 뒀다가 실데이터에서 뒤집었다. 개발 DB 한
+        계정에서 16건이 나왔는데 그중 15건이 **2025년 1~12월** 이었다. 마감일 없이
+        `requested` 로 남은 과거 원티드는 `/wanted/close-expired` 가 닫지 못한다 —
+        그쪽 판정 기준이 마감일이라, 마감일이 없으면 영영 열린 채로 남는다.
+        그 상태를 그대로 내보내면 모바일 대시보드가 몇 년치 빈 카드로 덮인다.
+      ★ 그래서 '닫는 책임은 close-expired 에 있으니 여기서 거르지 않는다' 는 원칙을
+        버렸다. 그 원칙은 close-expired 가 모든 행을 닫을 수 있을 때만 성립한다.
+
+    정렬 — `exp_date` 오름차순, **없는 것은 뒤로**. 급한 것부터 위에 온다.
+      마감일이 같거나 없으면 (year, month) 오름차순으로 안정 정렬한다.
+
+    제출 상태 — `shift_preferences` 는 PK 에 `created_at` 이 있는 **이력 테이블**이라
+      한 사람·월에 행이 여러 개다. **월별 최신 행 하나**가 현재 상태다.
+        행 없음            → not_started
+        최신 is_submitted  → submitted
+        그 외              → draft
+    """
+    nurse_id = getattr(current_user, "nurse_id", None)
+    if not nurse_id:
+        raise HTTPException(status_code=400, detail="nurse_id 를 확인할 수 없습니다.")
+
+    group_id = resolve_home_group_id(db, current_user)
+    if not group_id:
+        return {"items": []}
+
+    # ★ `status != 'closed'` 만 쓰면 **NULL 행이 통째로 사라진다.** SQL 의 3값 논리에서
+    #   `NULL != 'closed'` 는 참이 아니라 UNKNOWN 이고, WHERE 는 UNKNOWN 을 버린다.
+    #   `Wanted.status` 는 nullable 이라(기본값이 있을 뿐 NOT NULL 이 아니다) 실제로
+    #   비어 있는 행이 있으면 '닫히지 않은 원티드는 전부 보인다' 는 이 함수의 계약이 깨진다.
+    #   부정 조건에는 `IS NULL OR` 를 항상 함께 건다.
+    rows = (
+        db.query(Wanted)
+        .filter(
+            Wanted.group_id == group_id,
+            or_(Wanted.status.is_(None), Wanted.status != "closed"),
+        )
+        .all()
+    )
+    # 과거 월은 마감일이 아직 남아 있는 것만 남긴다(재오픈 케이스).
+    _now = datetime.now()
+    _cur_ym = _now.year * 100 + _now.month
+    rows = [
+        w for w in rows
+        if (w.year * 100 + w.month) >= _cur_ym
+        or (w.exp_date is not None and w.exp_date >= _now)
+    ]
+    if not rows:
+        return {"items": []}
+
+    # 대상 월의 내 작성 이력만 읽는다. 한 사람분이라 가볍고, 월별 최신 선택은
+    # 파이썬에서 한다(window 함수를 쓰면 dialect 를 타고 읽기도 어렵다).
+    targets = {(w.year, w.month) for w in rows}
+    prefs = (
+        db.query(
+            ShiftPreference.year,
+            ShiftPreference.month,
+            ShiftPreference.created_at,
+            ShiftPreference.is_submitted,
+        )
+        .filter(
+            ShiftPreference.nurse_id == nurse_id,
+            ShiftPreference.year.in_({y for y, _ in targets}),
+        )
+        .all()
+    )
+    latest: dict[tuple[int, int], tuple] = {}
+    for p in prefs:
+        key = (p.year, p.month)
+        if key not in targets:
+            continue                      # year 로만 좁혔으니 month 는 여기서 건다
+        cur = latest.get(key)
+        if cur is None or (p.created_at and cur[0] and p.created_at > cur[0]):
+            latest[key] = (p.created_at, p.is_submitted)
+
+    items = []
+    for w in rows:
+        hit = latest.get((w.year, w.month))
+        if hit is None:
+            state = "not_started"
+        elif bool(hit[1]):
+            state = "submitted"
+        else:
+            state = "draft"
+        items.append({
+            "year": w.year,
+            "month": w.month,
+            "exp_date": w.exp_date.isoformat() if w.exp_date else None,
+            "submission_status": state,
+        })
+
+    # 마감일 없는 항목을 뒤로 보내려면 정렬 키를 (없음 여부, 마감일) 로 잡는다.
+    items.sort(
+        key=lambda it: (
+            it["exp_date"] is None,
+            it["exp_date"] or "",
+            it["year"],
+            it["month"],
+        )
+    )
+    return {"items": items}
