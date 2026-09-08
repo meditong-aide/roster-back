@@ -1,7 +1,22 @@
-"""폴백(서열) 최적화 로직 모듈.
+"""렉시코그래피(사전식) 근무표 최적화 엔진 — **이것이 프로덕션 정식 경로다.**
 
-이 모듈은 `cp_sat_basic.py`의 폴백(lexicographic) 최적화 블록을 분리한 것입니다.
-동작/가중치/순서는 기존과 동일하게 유지합니다.
+이름이 `fallback` 이라 임시 우회로 보이지만 실제로 도는 것은 이 모듈이다.
+`cp_sat_basic.py:1498` 의 `SKIP_PRIMARY` 기본값이 `"1"` 이라 primary(가중합 단일
+Maximize) 를 건너뛰고 곧장 여기로 온다. 2026-05-28(3a0fc53)에 10런 검증에서
+시간 -54~61% · coverage 0/10 · 품질 동급↑ 로 우세해 기본을 스킵으로 승격한 결과다.
+
+★ 성능·파라미터를 논할 때 `cp_sat_basic.py` 의 값(workers=4/10, `random_seed`,
+  `solution_pool_size`)을 근거로 삼으면 틀린다. 그 경로는 기본값에서 실행되지 않는다.
+  이 파일의 솔버 5개는 전부 `num_search_workers=8` 이다.
+
+구조 (순차 풀이 · CP-SAT 에 네이티브 렉시코가 없어 목적 교체 + 비회귀 제약으로 구현):
+    stage1  커버리지 부족·과잉·OFF 총량        Minimize
+    stage2  safety 합 + team 슬랙 + grade 미달   Minimize
+      └ lex 6패스(`LEX_PASS_ORDER_DEFAULT`)를 같은 모델에 Minimize 교체로 순차 적용
+    stage3  선호·공정성                        Maximize  ← grade 동결 탓에 자주 INFEASIBLE
+
+계측(S0): `AIDE_LEX_TRACE=1` 로 단계·패스별 wall/status/objective/bound,
+          `AIDE_LEX_LOG=1` 로 CP-SAT 탐색 로그. 둘 다 기본 off 라 동작은 불변이다.
 """
 
 from __future__ import annotations
@@ -117,13 +132,71 @@ GRADE_FREEZE_STAGE3 = True
 #   ★ off_quota 를 **단독으로** 켜는 것은 어느 경우에도 안 된다 — 7B 실측에서
 #     off_quota_excess 12→1 로 누른 대가로 pattern_eod 가 5→211 로 폭증했고
 #     합계도 300만→340만으로 나빠졌다. 한 항목만 누르면 압력이 다른 데로 간다.
-LEX_PASS_ORDER_DEFAULT = "off_range,grade,team,n_range,n2n,de"
+# ★ `pref` 를 맨 뒤에 둔다(2026-09-08 추가).
+#   선호는 지금까지 stage3 목적에만 있었는데 그 stage3 가 실측 11곳 중 6곳에서
+#   INFEASIBLE 이라, 그때 커밋되는 stage2 해에는 선호가 반영되지 않았다.
+#   같은 병동 5회에서 반영이 1/1·0/1·1/1·0/1·0/1 로 흔들린 것이 그 증거다.
+#   패스로 넣으면 stage3 성패와 무관하게 stage2 최종 해가 이 패스를 거친다(5/5 → 1/1).
+#   ★ 맨 뒤인 것이 중요하다 — 앞의 safety·grade·team·n_range·n2n·de 가 모두 동결된
+#     뒤에 돌므로 선호가 그것들을 이길 수 없다. 정책상 그게 맞다.
+LEX_PASS_ORDER_DEFAULT = "off_range,grade,team,n_range,n2n,de,pref"
 # Stage 2 에서 "요구 등급 미달"(cascade off=0) 을 최소화할 때의 가중치.
 #   team(30만) 아래, safety off-quota 하한(10만) 위에 둔다. grade 는 team 과 같은
 #   성격(고정된 커버리지 안에서의 재배치)이라 같은 층이되 team 을 앞세운다.
 #   ★ cascade 의 대체 단계(off≥1) 는 2M/6M 이라 여기에 넣지 않는다 — 넣으면 team 과
 #     safety 를 압도해 lex 우선순위가 뒤집힌다. 그 단계는 Stage 3 목적함수가 맡는다.
 GRADE_OFF0_LEX_WEIGHT = 150_000
+
+
+# ── 계측(S0) ────────────────────────────────────────────────────────────────
+# 전환 설계 S0 단계. **기본 off 라 프로덕션 동작은 불변**이다.
+#   AIDE_LEX_TRACE=1  단계·패스별 wall time / status / objective / bound 를 [LexTrace] 로 출력
+#   AIDE_LEX_LOG=1    CP-SAT log_search_progress 활성(그 자체로 오버헤드가 있어 별도 플래그)
+# 왜 필요한가: 같은 조건 재실행에서 소요가 2.4배(9A 28~66초) 흔들리는데, 어느 단계가
+#   시간을 쓰는지 몰라 원인을 추측만 하고 있다. 가설은 "어떤 패스가 어느 실행에선
+#   최적을 증명해 즉시 끊기고 다른 실행에선 리밋까지 도는 이중분포" 인데, 패스별
+#   wall/status/bound 없이는 확인할 수 없다.
+def _trace_on() -> bool:
+    import os as _os_t
+    return _os_t.environ.get("AIDE_LEX_TRACE") == "1"
+
+
+def _trace(logger_prefix: str, phase: str, **kv) -> None:
+    """계측 한 줄. 기본 off."""
+    if not _trace_on():
+        return
+    body = " ".join(f"{k}={v}" for k, v in kv.items() if v is not None)
+    print(f"{logger_prefix} [LexTrace] {phase} {body}")
+
+
+def _apply_trace_params(solver) -> None:
+    """log_search_progress 는 오버헤드가 있어 AIDE_LEX_LOG=1 일 때만 켠다."""
+    import os as _os_t
+    if _os_t.environ.get("AIDE_LEX_LOG") == "1":
+        solver.parameters.log_search_progress = True
+
+
+def _solve_traced(solver, model, logger_prefix: str, phase: str):
+    """Solve 를 감싸 wall time·status·objective·bound 를 남긴다.
+
+    ★ BestObjectiveBound 는 지금 이 파일 어디서도 안 쓴다. 최적 증명 실패 시
+      하한 정보가 버려지고 있어, 갭이 큰 패스를 식별하려면 먼저 기록해야 한다.
+    """
+    from time import perf_counter as _pc
+    _apply_trace_params(solver)
+    _t0 = _pc()
+    st = solver.Solve(model)
+    _dt = _pc() - _t0
+    if _trace_on():
+        _obj = _bnd = None
+        try:
+            _obj = solver.ObjectiveValue()
+            _bnd = solver.BestObjectiveBound()
+        except Exception:
+            pass
+        _trace(logger_prefix, phase, sec=f"{_dt:.2f}",
+               status=_cp_sat_status_to_text(st), obj=_obj, bound=_bnd)
+    return st
 
 
 def _cp_sat_status_to_text(status: int) -> str:
@@ -266,6 +339,68 @@ def optimize_fallback_lex_hard_first(
     _tl3_override = int(_os_tl3.environ.get("AIDE_FB_TL3", 0) or 0)
     if _tl3_override > 0:
         tl3 = _tl3_override
+
+    # ── [기각] 전역 데드라인 · 2026-09-08 제거 (AIDE_LEX_S1 / _CARRY / _SKIP0) ──
+    # 착상: 단계마다 예산을 새로 주므로 lex 6패스의 tl2 비율 합 1.8 까지 얹혀
+    #   60초 요청이 실제 121초까지 간다. 시작 시각 기준으로 각 solve 를 조이려 했다.
+    #
+    # ★ 기각 근거 ― 시간 이득이 0 이었다. 11곳 × 5회에서 현행 430s 대 S1 432s.
+    #   앞서 보이던 15% 단축은 함께 켜져 있던 '이미 0 인 패스는 solve 를 건너뛴다'
+    #   (SKIP0)가 패스를 **죽여서** 생긴 착시였다.
+    # ★ SKIP0 의 오류: **아직 풀지 않은 패스의 목적값을 직전 해에서 읽으려 한 것**이다.
+    #   각 패스의 변수는 `_prep()` 안에서 그때 생성된다(아래 `_prep_*` 참조).
+    #   그래서 `s2.Value(_obj)` 는 그 변수가 없던 시점의 해를 읽어 0 을 돌려주고,
+    #   0 이 아닌 패스를 0 으로 오판해 동결한다. `off_range` 라면 `max-min <= 0`,
+    #   곧 "전원의 OFF 수가 완전히 같아야 한다" 가 되어 뒤 패스가 전부 무너진다.
+    #   실측: 스킵 16회에 패스 실패 12회가 딸렸고 pass_team 은 33→0.
+    #   ★ `_freeze` 자체는 문제가 아니다 — 그걸 빼면 뒤 패스가 앞 패스 결과를
+    #     희생시켜 lex 가 성립하지 않는다. 문제는 '풀지 않고 값을 안다고 가정한 것'.
+    #
+    # ★ 시간을 줄일 자리는 여기가 아니다. 실측(중환자실2) solver 59.1s / 전체 96.8s 로,
+    #   차 ~29초는 서비스 계층(간호사 수집·선호 파싱·constraint_impact·presolve 진단)이다.
+    #   solve 를 조여도 그쪽은 줄지 않는다.
+    # ★ 대신 재고 있는 것은 S4(safety 항목별 동결)다. 예산을 깎는 대신 탐색 공간을
+    #   좁혀, 같은 품질을 더 빨리 낸다(별관1 38s→10s · 회차 편차도 소멸).
+
+    # ── [S4] safety 동결 — 성격이 다른 둘이라 플래그를 나눈다 ────────────────
+    #   ① stage2: 총합 동결 → **항목별** 동결. 설계 변경이다.
+    #      총합만 묶으면 30만·15만 가중 항목이 합계의 99.99% 라, 한 자릿수 항목
+    #      (week_off_missing·off_quota_short·pattern_eod)이 사실상 무제약이 된다.
+    #   ② stage3: `sum(safety3[k]) == sum(safety2[k])` 를 **값 기준**으로 고친다.
+    #      양변이 변수식이라 계수가 상쇄돼 `0 == 0` 이던 **빈 제약**이었다.
+    #      즉 stage3 내내 safety 방어가 없었다 — 이건 개선이 아니라 **버그 수정**이다.
+    #
+    #   ★ 나눈 이유: 둘은 근거의 성격이 다르다. 묶어 두면 ② 를 올리려고 ① 까지 끌고 간다.
+    #
+    #   ── 판정 (2026-09-08) ────────────────────────────────────────────────
+    #   ① **보류.** 11곳 × 3회 + 2곳 × 8회(98회)로도 개선이 입증되지 않았다.
+    #      변화가 전부 노이즈 폭 안이었고 부호검정 p=1.000.
+    #      한때 시간이 10% 줄어 보였으나 표본을 바꾸면 방향이 뒤집혔다(-10.2% ↔ +13%).
+    #   ② **채택(기본 on).** 11곳 × 5회(110회) 결과가 품질 중립이다 —
+    #      `_s3_ok` 5=5(stage3 성공률 유지) · `_pass_fail` 0 · 소요 462→470s.
+    #      safety 합계가 2,440만→2,790만이지만 노이즈 폭이 360만이고 그 증가분이
+    #      **중환자실2 한 곳**(iso 폭 870만~1230만)에 몰려 있어 판정 근거가 못 된다.
+    #      개선도 악화도 입증되지 않았다는 것이 정확한 요약이다.
+    #      ★ 그런데도 켜는 이유: 이건 A/B 우위를 다투는 개선이 아니라 **버그 수정**이다.
+    #        고친 제약은 원래 `0 == 0` 이라 stage3 내내 safety 방어가 없었다.
+    #        방치하면 stage3 가 safety 를 망칠 여지가 열려 있고, 망가져도 드러나지 않는다.
+    #        측정이 요구한 것은 '고쳐도 안 죽는다' 하나였고 그것이 확인됐다.
+    #   ★ 되돌리려면 `AIDE_LEX_S4_STAGE3=0`. `AIDE_LEX_S4=1` 은 둘 다 켠다(측정 재현용).
+    _s4_all = _os_tl3.environ.get("AIDE_LEX_S4") == "1"
+    _s4_stage2 = _s4_all or _os_tl3.environ.get("AIDE_LEX_S4_STAGE2") == "1"
+    _s4_stage3 = _s4_all or _os_tl3.environ.get("AIDE_LEX_S4_STAGE3", "1") != "0"
+
+    # [S0 계측] 구간 타이머. solve+build 를 다 합쳐도 총 소요의 절반뿐이라
+    #   (실측 39.6s / 70.2s) 나머지가 어디에 쓰이는지 본다.
+    from time import perf_counter as _pc_seg0
+    _seg_t = [_pc_seg0()]
+
+    def _mark(name: str) -> None:
+        from time import perf_counter as _pc_m
+        _now = _pc_m()
+        if _seg_t[0] is not None and _trace_on():
+            _trace(logger_prefix, "seg:" + name, sec=f"{_now - _seg_t[0]:.2f}")
+        _seg_t[0] = _now
 
     N, D, S = len(roster_system.nurses), roster_system.num_days, roster_system.config.num_shifts
     cfg = roster_system.config
@@ -602,6 +737,12 @@ def optimize_fallback_lex_hard_first(
         stage2_zero_locks: Optional[Dict[str, list]] = None,
         broad_soft: bool = False,
     ):
+        # [S0 계측] 재빌드 비용. 단계마다 CpModel 을 새로 만들고 전 제약을 다시 쌓으므로
+        #   (stage1 은 2회 시도라 한 생성에서 최대 4벌) 그 파이썬 시간이 얼마인지를
+        #   S6(단일 모델 체인)의 기대 이득 판단에 쓴다. ★ 프리솔브는 매 solve 다시 도므로
+        #   단일 모델화로 줄일 수 있는 것은 이 빌드 시간뿐이다.
+        from time import perf_counter as _pc_bm
+        _bm_t0 = _pc_bm()
         m = cp_model.CpModel()
         # per-nurse OFF cap slack 추적: post-solve 시 어느 nurse 가 슬랙을 실제로
         # 사용했는지 로그하기 위함.
@@ -2951,6 +3092,8 @@ def optimize_fallback_lex_hard_first(
                 pass
             m.Maximize(sum(obj))
 
+        _trace(logger_prefix, "build_model", stage=stage,
+               sec=f"{_pc_bm() - _bm_t0:.3f}", broad_soft=broad_soft)
         return (
             m,
             X,
@@ -3000,6 +3143,7 @@ def optimize_fallback_lex_hard_first(
 
     # ───── 1단계: 커버리지 (hard 1회 → broad soft 1회) ─────
     m1, X1, short1, over1, safety1 = None, None, None, None, None
+    _mark("init")
     short_map1 = {}
     over_map1 = {}
     s1 = None
@@ -3007,6 +3151,150 @@ def optimize_fallback_lex_hard_first(
     used_broad_soft = False
     attempt_specs = [(False, "hard"), (True, "broad_soft")]
     time_per_attempt = max(5, tl1 // len(attempt_specs))
+
+    def _sync_preceptee_rosters():
+        """프리셉티 roster 를 프리셉터와 동기화한다.
+
+        ★ 함수로 뽑은 이유: stage2/stage3 실패 경로가 각자 `return` 으로 끝나는데,
+          그 경로들도 이 동기화를 반드시 거쳐야 한다. 예전에는 건너뛰어
+          preceptee_follow 병동에서 미러링이 빠진 근무표가 그대로 나갔다.
+          중첩 함수라 바깥 지역 변수(cfg·roster_system·preceptee_* 등)를 그대로 쓴다.
+        """
+        if preceptee_follow and preceptee_indices:
+            _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
+            _fb_shift_types = cfg.shift_types
+            _fb_off_idx = _fb_shift_types.index('O') if 'O' in _fb_shift_types else None
+            _fb_standard = {'D', 'E', 'N', 'O'}
+            if bool(getattr(cfg, 'use_mid', False)):
+                _fb_standard.add('M')
+            _fb_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
+            # 고정 OFF 직전 N 금지가 실제로 건 셀. 미러가 프리셉터 N 을 덮어쓰지 못하게 한다.
+            _fb_ban_prev = getattr(roster_system, '_ban_n_prev_cells', set()) or set()
+            _fb_n_idx = _fb_shift_types.index('N') if 'N' in _fb_shift_types else None
+            synced = 0
+            special_converted = 0
+            _fb_fw_restored = 0
+            _fb_ban_kept = 0
+            _fb_pre_ptr_idx2 = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
+            for pte_idx in preceptee_indices:
+                # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티 누락 방지).
+                if _has_preceptee_period:
+                    ptr_idx = _fb_pre_ptr_idx2.get(pte_idx)
+                    if ptr_idx is None:
+                        continue
+                else:
+                    pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
+                    if not pid or pid not in _fb_id_to_idx:
+                        continue
+                    ptr_idx = _fb_id_to_idx[pid]
+                # 권위 모드면 nurse_preceptee_period 기간 내 day만, 폴백이면 전체월 복사.
+                _fb_follow = preceptee_follow_days.get(pte_idx)
+                _fb_days_iter = (sorted(_fb_follow) if (_has_preceptee_period and _fb_follow)
+                                 else list(range(roster_system.num_days)))
+                for _cd in _fb_days_iter:
+                    roster_system.roster[pte_idx, _cd, :] = roster_system.roster[ptr_idx, _cd, :]
+                # 특수코드 일자는 프리셉티를 OFF로 전환 (복사한 day 한정)
+                # 단, type=근무 + shift_gb=D/E/N 계열 하위코드는 근무이므로 그대로 유지
+                _fb_work_sub = getattr(roster_system, '_work_sub_ids', set())
+                _fb_orig_map = getattr(roster_system, '_fixed_original_shift_map', {})
+                if _fb_off_idx is not None:
+                    for d in _fb_days_iter:
+                        # 프리셉티 fixed_wanted 일자는 프리셉터 복사 대신 본인 값 적용
+                        if (pte_idx, d) in _fb_pte_fw:
+                            _fw_code = _fb_pte_fw[(pte_idx, d)].strip().upper()
+                            if _fw_code in _fb_shift_types:
+                                roster_system.roster[pte_idx, d, :] = 0
+                                roster_system.roster[pte_idx, d, _fb_shift_types.index(_fw_code)] = 1
+                                _fb_fw_restored += 1
+                            continue
+                        # ★ 고정 OFF 직전 N 금지가 건 셀이면, 프리셉터를 따라 N 이 복사되는 것을
+                        #   막는다. 모델 제약은 미러 **이전** 값에만 걸리므로 여기서 다시 막지
+                        #   않으면 신청해 받은 휴일이 도로 회복 OFF 자리로 돌아간다.
+                        #   교육 연속성보다 휴일 보호를 우선한다(2026-08-31 결정).
+                        if (pte_idx, d) in _fb_ban_prev and _fb_n_idx is not None:
+                            if roster_system.roster[pte_idx, d, _fb_n_idx] == 1:
+                                roster_system.roster[pte_idx, d, :] = 0
+                                if _fb_off_idx is not None:
+                                    roster_system.roster[pte_idx, d, _fb_off_idx] = 1
+                                _fb_ban_kept += 1
+                                continue
+                        _fb_need = False
+                        _fb_orig = _fb_orig_map.get((ptr_idx, d))
+                        if _fb_orig:
+                            _fb_ou = _fb_orig.upper()
+                            if _fb_ou not in _fb_standard and _fb_ou not in _fb_work_sub:
+                                _fb_need = True
+                        else:
+                            _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
+                            if len(_idx_arr) > 0:
+                                _fb_sc = _fb_shift_types[int(_idx_arr[0])]
+                                if _fb_sc not in _fb_standard and _fb_sc.upper() not in _fb_work_sub:
+                                    _fb_need = True
+                        if _fb_need:
+                            roster_system.roster[pte_idx, d, :] = 0
+                            roster_system.roster[pte_idx, d, _fb_off_idx] = 1
+                            special_converted += 1
+                synced += 1
+            if synced:
+                msg = f"{logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
+                if special_converted:
+                    msg += f" (특수코드→OFF 전환: {special_converted}건)"
+                if _fb_fw_restored:
+                    msg += f", fixed_wanted 재적용: {_fb_fw_restored}건"
+                if _fb_ban_kept:
+                    msg += f", 고정OFF직전N 보호: {_fb_ban_kept}건"
+                print(msg)
+            # if bool(getattr(cfg, "ban_e_to_d", True)) and _fb_off_idx is not None:
+            #     _fb_eve_idx = _fb_shift_types.index('E') if 'E' in _fb_shift_types else None
+            #     _fb_day_idx = _fb_shift_types.index('D') if 'D' in _fb_shift_types else None
+            #     _fixed_blocked = 0
+            #     _repaired = 0
+            #     if _fb_eve_idx is not None and _fb_day_idx is not None:
+            #         for pte_idx in preceptee_indices:
+            #             for d in range(1, roster_system.num_days):
+            #                 if int(roster_system.roster[pte_idx, d - 1, _fb_eve_idx]) != 1:
+            #                     continue
+            #                 if int(roster_system.roster[pte_idx, d, _fb_day_idx]) != 1:
+            #                     continue
+            #                 cur_fixed = (pte_idx, d) in _fb_pte_fw
+            #                 prev_fixed = (pte_idx, d - 1) in _fb_pte_fw
+            #                 if not cur_fixed:
+            #                     roster_system.roster[pte_idx, d, :] = 0
+            #                     roster_system.roster[pte_idx, d, _fb_off_idx] = 1
+            #                     _repaired += 1
+            #                 elif not prev_fixed:
+            #                     roster_system.roster[pte_idx, d - 1, :] = 0
+            #                     roster_system.roster[pte_idx, d - 1, _fb_off_idx] = 1
+            #                     _repaired += 1
+            #                 else:
+            #                     _fixed_blocked += 1
+            #     if _repaired or _fixed_blocked:
+            #         print(
+            #             f"{logger_prefix} [PrecepteeSync][Repair-E->D] repaired={_repaired}, blocked_fixed={_fixed_blocked}"
+            #         )
+
+        _log_weekend_work_assignments(
+            roster_system=roster_system,
+            weekend_days=weekend_days,
+            off_idx=off_idx,
+            logger_prefix=logger_prefix,
+        )
+        # ── 후처리 완료 후 최종 커버리지 상태 로깅 ──
+        try:
+            final_viols = roster_system._find_violations()
+            final_cov_viols = [v for v in final_viols if v.get('type') == 'shift_requirement']
+            if final_cov_viols:
+                print(f"{logger_prefix} [최종 커버리지 부족] 후처리 후 {len(final_cov_viols)}건 부족:")
+                for v in sorted(final_cov_viols, key=lambda x: (x['day'], x['shift'])):
+                    print(
+                        f"  day={v['day']+1}, shift={v['shift']}, "
+                        f"required={v['required']}, actual={v['actual']}, "
+                        f"gap={v['required'] - v['actual']}"
+                    )
+            else:
+                print(f"{logger_prefix} [최종 커버리지] 후처리 후 커버리지 부족 없음 ✓")
+        except Exception as exc:
+            print(f"{logger_prefix} [최종 커버리지 로깅 실패]: {exc}")
 
     for broad_soft, attempt_label in attempt_specs:
         with timer_cls(f"폴백 1단계: 커버리지 부족 최소화 ({attempt_label})"):
@@ -3033,7 +3321,7 @@ def optimize_fallback_lex_hard_first(
             _reg_s1 = getattr(m1, "_cpsat_assumption_registry", None)
             if _reg_s1 is not None:
                 _reg_s1.attach_to_model()
-            st = s1.Solve(m1)
+            st = _solve_traced(s1, m1, logger_prefix, f"stage1[{attempt_label}]")
             # shadow ground truth(피드백 fix3): 첫 hard 솔브(=effective primary hard) raw status 저장.
             try:
                 _st_txt = _cp_sat_status_to_text(st)
@@ -3097,6 +3385,7 @@ def optimize_fallback_lex_hard_first(
             else:
                 print(f"{logger_prefix} 폴백1 최종 실패: hard/broad soft 모두 실패")
 
+    _mark("stage1_all")
     if best_short is None or best_over is None:
         print(f"{logger_prefix} 폴백 중단: 1단계 해를 찾지 못함")
         return False
@@ -3128,7 +3417,7 @@ def optimize_fallback_lex_hard_first(
         _reg_s2 = getattr(m2, "_cpsat_assumption_registry", None)
         if _reg_s2 is not None:
             _reg_s2.attach_to_model()
-        st2 = s2.Solve(m2)
+        st2 = _solve_traced(s2, m2, logger_prefix, "stage2")
         if st2 == cp_model.INFEASIBLE and _reg_s2 is not None:
             try:
                 _fb_cores = _reg_s2.extract_conflict_cores(s2, solver_phase="fallback")
@@ -3178,7 +3467,17 @@ def optimize_fallback_lex_hard_first(
                     flat_safety.extend(arr)
                 if flat_safety:
                     best_sum2 = sum(int(s2.Value(v)) for v in flat_safety)
-                    m2.Add(sum(flat_safety) <= best_sum2)
+                    # [S4-①] 항목별 동결 (AIDE_LEX_S4_STAGE2 · 기본 off · 파일 상단 참조)
+                    if _s4_stage2:
+                        _s4_n = 0
+                        for _k4, _arr4 in safety2.items():
+                            if not _arr4:
+                                continue
+                            m2.Add(sum(_arr4) <= sum(int(s2.Value(_v4)) for _v4 in _arr4))
+                            _s4_n += 1
+                        print(f"{logger_prefix} [S4-1] stage2 safety 항목별 동결 {_s4_n}개")
+                    else:
+                        m2.Add(sum(flat_safety) <= best_sum2)
                     use_mid_h1 = bool(getattr(cfg, "use_mid", False))
                     # ── 공통 준비: 순서와 무관하게 한 번만 계산한다 ──
                     #   원래는 OFF range 패스 루프 안에서 채워졌고 N range·D/E 가 그걸
@@ -3469,6 +3768,51 @@ def optimize_fallback_lex_hard_first(
                         print(f"{logger_prefix} [OffQuotaSpec] slacks={len(_ex)}")
                         return (sum(_ex), lambda v: m2.Add(sum(_ex) <= v), 3.0, 0.3)
 
+                    def _prep_pref():
+                        """소프트 선호 반영 — 사용자가 낸 요청·기피를 lex 패스로 다룬다.
+
+                        왜 패스인가:
+                          선호는 지금 **stage3 목적에만** 있는데(fallback_objectives.py:68-78)
+                          그 stage3 가 실측 11곳 중 6곳에서 INFEASIBLE 이다. 그때 stage2 해가
+                          커밋되므로 선호가 목적에서 빠진 채 우연에 맡겨진다
+                          (같은 병동 재실행에서 PrefRate 0.0000 ↔ 1.0000).
+                          lex 패스로 넣으면 stage3 성패와 무관하게 stage2 최종 해가
+                          이 패스를 거친다.
+
+                        왜 가중치(목적항 co-priority)가 아닌가:
+                          stage2 본 solve 는 relative_gap_limit=0.15 이고 목적값이 6~9M 이라
+                          솔버가 bound 대비 90만~140만 남기고 멈춘다. safety 최하위보다 작은
+                          가중치는 그 gap 안에 묻혀 **최적화될 기회 자체가 없다**.
+                          패스로 넣으면 동결 체계 안에서 확실히 돌고, safety·grade·team 을
+                          절대 못 이긴다(그 위 패스들이 이미 동결돼 있으므로).
+
+                        ★ 대상은 `_pref_cells`(사용자 선호가 실제로 덮어쓴 칸)뿐이다.
+                          `preference_matrix` 전체를 쓰면 기본값 1 이 전 칸에 깔려 있어
+                          (nurse_config.py:98 `np.ones(...)`) 목적이 사실상 '총 근무 최대화'
+                          로 왜곡된다.
+                        ★ Minimize 체계라 부호를 뒤집는다. 요청(delta>0)을 받으면 목적이
+                          내려가고, 기피(delta<0)를 받으면 올라간다.
+                        """
+                        _cells = getattr(roster_system, "_pref_cells", None)
+                        if not _cells:
+                            return None
+                        _P = getattr(roster_system, "preference_matrix", None)
+                        if _P is None:
+                            return None
+                        _terms = []
+                        for (_pn, _pd, _ps), _delta in _cells.items():
+                            if not (0 <= _pn < N and 0 <= _pd < D and 0 <= _ps < S):
+                                continue
+                            if _pd < join[_pn] or _pd > leave[_pn]:
+                                continue
+                            _sc = int(round(float(_delta) * PREFERENCE_SCORE_SCALE))
+                            if _sc:
+                                _terms.append(-_sc * X2(_pn, _pd, _ps))
+                        if not _terms:
+                            return None
+                        print(f"{logger_prefix} [PrefSpec] cells={len(_terms)}")
+                        return (sum(_terms), lambda v: m2.Add(sum(_terms) <= v), 3.0, 0.2)
+
                     # ── 순서는 데이터다 ──
                     #   lex 는 사전식이라 앞 순위가 절대 우선이다. 즉 이 순서가 곧
                     #   "무엇을 더 중요하게 볼 것인가" 라는 정책이다. env 로 주입해
@@ -3482,12 +3826,14 @@ def optimize_fallback_lex_hard_first(
                         "iso_off": _prep_iso_off,
                         "team": _prep_team,
                         "off_quota": _prep_off_quota,
+                        "pref": _prep_pref,
                     }
                     _lex_order = [
                         _t.strip()
                         for _t in _os_lex.getenv("LEX_PASS_ORDER", LEX_PASS_ORDER_DEFAULT).split(",")
                         if _t.strip()
                     ]
+                    _mark("pre_lex")
                     for _i, _pname in enumerate(_lex_order, start=1):
                         _prep = _PASS_PREP.get(_pname)
                         if _prep is None:
@@ -3513,7 +3859,7 @@ def optimize_fallback_lex_hard_first(
                             m2.Minimize(_obj)
                             s2.parameters.max_time_in_seconds = max(_min_t, float(tl2) * _frac)
                             _hint_lex_solution()
-                            _st_p = s2.Solve(m2)
+                            _st_p = _solve_traced(s2, m2, logger_prefix, f"lex{_i}:{_pname}")
                             if _st_p in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                                 _capture_lex_solution()
                                 _val = int(s2.ObjectiveValue())
@@ -3534,6 +3880,14 @@ def optimize_fallback_lex_hard_first(
             except Exception as _h1_e:
                 print(f"{logger_prefix} 폴백2 lex H1 예외: {_h1_e}")
         if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            # ★ 알려진 한계: 이 경로도 아래 `return` 으로 끝나 함수 끝의 프리셉티 동기화를
+            #   건너뛴다(stage3 실패 경로에서 고친 것과 같은 문제). 여기서 같은 방식으로
+            #   고치지 못하는 이유는, 이어지는 코드가 stage2 산출물(safety2·lex_x2_log·
+            #   stage2_zero_locks·m2/X2)을 전제로 하기 때문이다. stage2 가 해를 못 냈으면
+            #   그것들이 비어 있어 흘려보내면 오히려 깨진다.
+            #   ★ 다만 stage2 실패는 stage3 실패(실측 55%)와 달리 드물다 —
+            #     stage1 이 풀렸는데 stage2 가 UNKNOWN 인 경우이고, 표본 11곳 5회에서 0건이었다.
+            #   구조적 해결은 S6(단일 모델 체인)에서 단계 경계를 없애는 것이다.
             print(f"{logger_prefix} 폴백2 실패: 단계 불가능 → 1단계 해 사용")
             roster_system.roster.fill(0)
             for n in range(N):
@@ -3547,6 +3901,9 @@ def optimize_fallback_lex_hard_first(
                 off_idx=off_idx,
                 logger_prefix=logger_prefix,
             )
+            # ★ 이 경로도 프리셉티 동기화를 거쳐야 한다. 예전에는 그냥 return 해서
+            #   preceptee_follow 병동이 미러링 없이 나갔다.
+            _sync_preceptee_rosters()
             return best_short == 0
         stage2_zero_locks = {}
         best_safe_sum = 0
@@ -3584,6 +3941,11 @@ def optimize_fallback_lex_hard_first(
     # 검증에는 stage2 해로 충분하다. 가장 무거운 stage3 를 건너뛰어 지연을 제거한다.
     # 기본 OFF(env gate). 일반 생성 경로는 영향 없음.
     import os as _os_vfb
+    # ★ 앞으로 stage3 를 건너뛰는 장치를 더할 때 이 블록에 태우지 말 것 — 여기는
+    #   **검증 전용 early return** 이라 이후 프리셉티/프리셉터 동기화를 건너뛴다.
+    #   검증 경로에서는 그래도 되지만, 정상 생성에서 발동하면 preceptee_follow 를 켠
+    #   병동에서 미러링이 빠진 근무표가 그대로 나간다. stage3 를 '풀지 않기'만 하고,
+    #   기존 INFEASIBLE 경로가 stage2 해를 커밋한 뒤 공용 마무리까지 잇게 해야 한다.
     if _os_vfb.getenv("FB_VERIFY_SKIP_STAGE3") == "1":
         roster_system.roster.fill(0)
         for n in range(N):
@@ -3604,6 +3966,8 @@ def optimize_fallback_lex_hard_first(
         return best_short == 0 and best_safe_sum == 0
 
     # ───── 3단계: 선호/공정성 ─────
+    # 아래 with 블록 안에서 대입되지만, 함수 끝(4154)에서도 읽으므로 미리 잡아 둔다.
+    _stage3_failed = False
     with timer_cls("폴백 3단계: 선호/공정성 최대화"):
         (
             m3,
@@ -3624,8 +3988,28 @@ def optimize_fallback_lex_hard_first(
             stage2_zero_locks=stage2_zero_locks,
             broad_soft=used_broad_soft,
         )
-        for k in safety3.keys():
-            m3.Add(sum(safety3[k]) == sum(safety2[k]))
+        # ★ 아래 else 의 `sum(safety3[k]) == sum(safety2[k])` 는 오래 **빈 제약**이었다
+        #   (2026-09-07 proto 로 확정). 양변이 모두 변수식이고 m2·m3 가 같은 순서로
+        #   빌드돼 인덱스가 같으므로 계수가 상쇄돼 `0 == 0` 이 된다. 즉 stage3 가 도는
+        #   동안 safety 항목별 방어가 없었다(실제 방어는 `stage2_zero_locks` 뿐).
+        #   ★ 그래서 `_s4_stage3` 를 기본 on 으로 두고 **값 기준**으로 건다(파일 상단 판정).
+        #     else 가지는 되돌림용으로만 남는다 — 그쪽을 타면 방어가 다시 사라진다.
+        if _s4_stage3:
+            # ★ `s2.Value()` 를 여기서 직접 읽으면 안 된다 — s2 의 마지막 solve 는
+            #   lex 패스이고, 그 패스가 실패했으면 실패한 solve 의 값을 읽는다.
+            #   `lex_safety_val` 은 성공한 패스에서만 갱신되므로(3943) 그쪽이 정확하다.
+            _s4n3 = 0
+            for k in safety3.keys():
+                _lhs3 = safety3.get(k) or []
+                _vals2 = lex_safety_val.get(k)
+                if not _lhs3 or _vals2 is None:
+                    continue
+                m3.Add(sum(_lhs3) <= sum(int(_v) for _v in _vals2))
+                _s4n3 += 1
+            print(f"{logger_prefix} [S4-2] stage3 safety 동결 {_s4n3}개 (값 기준)")
+        else:
+            for k in safety3.keys():
+                m3.Add(sum(safety3[k]) == sum(safety2[k]))
         # grade 도 동결한다. lex 6-pass 가 재배치로 미달을 낮춰 놔도 stage3 는 배치를
         #   새로 계산하므로, 안 걸면 흩어진다(실측: lex short=4 → 최종 14~20).
         #   safety 와 달리 등호가 아니라 상한이다 — 더 좋게 만드는 것은 막지 않는다.
@@ -3665,10 +4049,16 @@ def optimize_fallback_lex_hard_first(
         s3.parameters.max_time_in_seconds = tl3
         s3.parameters.num_search_workers = 8
         s3.parameters.relative_gap_limit = 0.05
+        _mark("pre_stage3_solve")
         _reg_s3 = getattr(m3, "_cpsat_assumption_registry", None)
         if _reg_s3 is not None:
             _reg_s3.attach_to_model()
-        st3 = s3.Solve(m3)
+        # ★ stage3 진입 자체를 조건부로 막고 싶어도 **여기서는 이미 늦다** —
+        #   `build_model(stage=3)` 이 실측 1~4초를 쓰고 위에서 끝나 있다. 빌드를
+        #   건너뛰려면 m3·X3·s3 를 미정의로 두게 되는데 같은 `with` 블록 안에서
+        #   그것들을 참조하는 코드가 여럿이라 NameError 가 된다. 구조적으로 풀려면
+        #   S6(단일 모델 체인)에서 stage3 빌드 자체를 없애야 한다.
+        st3 = _solve_traced(s3, m3, logger_prefix, "stage3")
         if st3 == cp_model.INFEASIBLE and _reg_s3 is not None:
             try:
                 _fb_cores = _reg_s3.extract_conflict_cores(s3, solver_phase="fallback")
@@ -3680,9 +4070,53 @@ def optimize_fallback_lex_hard_first(
             except Exception as _mus_exc:
                 print(f"[FallbackLex][stage3] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백3 결과: status={_cp_sat_status_to_text(st3)}")
+        # [S0 계측] stage3 상태를 남긴다 — 선호 반영률을 INFEASIBLE/FEASIBLE 로 갈라 보려면
+        #   필요하다. 선호는 stage3 목적에만 있어 INFEASIBLE 이면 그 회차 선호가 소실된다.
+        try:
+            setattr(roster_system, "_lex_stage3_status", _cp_sat_status_to_text(st3))
+        except Exception:
+            pass
         if st3 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             _log_off_slack_used("stage3", s3, m3)
-        if st3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # [S0-7 진단] stage3 가 왜 INFEASIBLE 인가. **기본 off**(AIDE_LEX_DIAG_S3=1).
+        #   논리: stage2 최종 해는 grade 동결·zero_locks·커버리지 동결을 전부 만족한다.
+        #   m3 가 m2 와 같은 제약 집합이면 그 해가 m3 에서도 feasible 이어야 하므로
+        #   INFEASIBLE(=증명됨)이 나올 수 없다. 그런데 실측 11곳 중 6곳이 INFEASIBLE 이다.
+        #   → m3 의 제약이 m2 와 다르거나, 동결값들이 서로 다른 시점의 해에서 왔다는 뜻이다.
+        #   여기서 stage2 해를 m3 에 그대로 박아 그것을 확정하고, MUS 로 어느 제약이
+        #   그 해를 거부하는지 이름을 뽑는다.
+        if (st3 == cp_model.INFEASIBLE
+                and _os_lex.environ.get("AIDE_LEX_DIAG_S3") == "1"):
+            try:
+                # ★ 진단도 데드라인 안에서 돈다. 여기서 무조건 15초를 더 쓰면
+                #   S1 이 보장한다는 시간 상한이 진단 켤 때만 깨진다(stage3 가 예산을
+                #   다 쓴 경우가 특히 그렇다).
+                _sd = cp_model.CpSolver()
+                _sd.parameters.max_time_in_seconds = 15.0
+                _sd.parameters.num_search_workers = 8
+                # m3 에는 이미 stage2 해가 힌트로 들어가 있다(위 AddHint 루프).
+                # 그 힌트를 값으로 고정하면 "stage2 해가 m3 에서 성립하는가" 를 직접 묻는다.
+                _sd.parameters.fix_variables_to_their_hinted_value = True
+                _std = _sd.Solve(m3)
+                print(f"{logger_prefix} [DiagS3] stage2해 고정 재solve: "
+                      f"{_cp_sat_status_to_text(_std)} "
+                      f"→ {'m3 가 stage2 해를 거부한다(m3≠m2 확정)' if _std == cp_model.INFEASIBLE else 'stage2 해는 m3 에서 성립 — 원인은 목적/시간 쪽'}")
+                # 어느 제약이 거부하는지까지 보려면 registry 가 있어야 한다.
+                #   `AIDE_ENABLE_MUS_REGISTRY=1` 을 함께 켜면 위 3746 의 기존 core 추출이
+                #   돈다(그쪽이 정본이므로 여기서 MUS 를 중복 추출하지 않는다).
+                if _std == cp_model.INFEASIBLE and _reg_s3 is None:
+                    print(f"{logger_prefix} [DiagS3] 거부 제약 이름을 보려면 "
+                          "AIDE_ENABLE_MUS_REGISTRY=1 을 함께 켤 것")
+            except Exception as _dg_e:
+                print(f"{logger_prefix} [DiagS3] 진단 실패(무시): {_dg_e}")
+        # ★ 여기서 `return` 하면 안 된다 — 함수 끝의 **프리셉티 동기화**를
+        #   건너뛴다. `preceptee_follow` 병동에서 프리셉터의 DEN/O 미러링이 빠진
+        #   근무표가 그대로 나간다. stage3 INFEASIBLE 은 예외가 아니라 **설계상 흔한
+        #   경로**여서(실측 11곳 중 6곳) 이 누락이 상시 발생하고 있었다.
+        #   반환값도 최종 `return` 과 같으므로, stage3 전용 후속 블록만 건너뛰고
+        #   공용 마무리로 흘려보낸다.
+        _stage3_failed = st3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        if _stage3_failed:
             print(f"{logger_prefix} 폴백3 실패: 선호 단계 불가능 → 2단계 해 사용")
             roster_system.roster.fill(0)
             for n in range(N):
@@ -3696,167 +4130,180 @@ def optimize_fallback_lex_hard_first(
                 off_idx=off_idx,
                 logger_prefix=logger_prefix,
             )
-            return best_short == 0 and best_safe_sum == 0
-        # ── 최종 lex 패스: DDDDD 보장 강화 (기본 자동 ON, AIDE_D5_LEX=0 으로 끔) ──
-        # stage3 목적값을 동결(무회귀)한 뒤 D5 viol 합만 최소화하는 별도 solve.
-        # 자기-게이트: 잔여 D5=0 이면 스킵(무비용) → DDDDD 남은 병동에서만 자동 재-solve.
-        # payload/사용자 입력 불필요. (주의) postprocess/preceptee 경로 재유입은 별도.
-        #
-        # 인원수 게이트: 대형 병동은 freeze 재-solve 가 시간 내 못 풀고(UNKNOWN) 헛돎 →
-        # lex 가 실제로 잘 듣고 빠른 소인원 병동(기본 N<=15)에서만 자동 실행.
-        # AIDE_D5_LEX_MAXN 으로 임계 조절, AIDE_D5_LEX=0 으로 완전 비활성.
-        _lex_maxn = int(_os_tl3.environ.get("AIDE_D5_LEX_MAXN", 15) or 15)
-        # ── mutex lex 패스(D5-lex 앞=상위 우선): "grade/team 바로 밑" ──
-        # grade/team 소프트 품질을 동결(무회귀)한 뒤 상호배제 위반합만 최소화 →
-        # mutex 가 선호/야간분포보다 위, grade/team·하드보다 아래. 동결 부등식이라 infeasible 불가(soft).
-        # 자기게이트(mutex=0 skip)·인원게이트(N<=_lex_maxn)는 D5-lex 와 동일.
-        # mutex-lex 는 grade/team 만 동결(총품질 아님)해 D5 보다 가벼움 + 자기게이트(위반 0 skip)
-        # + 타임리밋(초과 시 원해 유지)이라, D5(15)보다 높은 40 을 기본으로 실병동(19·35명 등) 커버.
-        _mx_lex_maxn = int(_os_tl3.environ.get("AIDE_MUTEX_LEX_MAXN", 40) or 40)
-        _mx_lex_on = (_os_tl3.environ.get("AIDE_MUTEX_LEX", "1") != "0") and (N <= _mx_lex_maxn)
-        if _mx_lex_on:
-            _mx_vars = getattr(m3, "_mutex_lex_vars", None) or []
-            _gt_terms = getattr(m3, "_grade_team_lex_terms", None)
-            if _mx_vars and _gt_terms:
-                class _MxSkipLex(Exception):
-                    pass
-                try:
-                    _mx_before = sum(int(s3.Value(v)) for v in _mx_vars)
-                    print(f"{logger_prefix} 폴백3 mutex-lex 진입: stage3 위반 {_mx_before}건 "
-                          f"(페어변수 {len(_mx_vars)}개)")
-                    if _mx_before == 0:
-                        raise _MxSkipLex  # 위반 0 → 재-solve 불필요(무비용)
-                    _gt_val = int(round(s3.Value(sum(_gt_terms))))
-                    m3.Add(sum(_gt_terms) >= _gt_val)   # grade/team 무회귀(penalty=음수 → >= 로 최소보장)
-                    m3.Minimize(sum(_mx_vars))
-                    m3.ClearHints()
-                    for _hn in range(N):
-                        for _hd in iter_nurse_days(_hn, join, leave, blocked_by_nurse):
-                            for _hs in range(S):
-                                try:
-                                    m3.AddHint(X3(_hn, _hd, _hs), int(s3.Value(X3(_hn, _hd, _hs))))
-                                except Exception:
-                                    pass
-                    _s3m = cp_model.CpSolver()
-                    _s3m.parameters.max_time_in_seconds = max(8, int(tl3))
-                    _s3m.parameters.num_search_workers = 8
-                    _st3m = _s3m.Solve(m3)
-                    if _st3m in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                        _mx_after = sum(int(_s3m.Value(v)) for v in _mx_vars)
-                        if _mx_after <= _mx_before:
-                            m3.Add(sum(_mx_vars) <= _mx_after)  # 이후 D5 패스가 mutex 되돌리지 못하게 락
-                            s3 = _s3m
-                            print(f"{logger_prefix} 폴백3 mutex-lex 패스: "
-                                  f"status={_cp_sat_status_to_text(_st3m)} mutex {_mx_before}→{_mx_after}")
+        # ★ 아래는 stage3 가 성공했을 때만 의미가 있는 후속 처리다(D5 lex · mutex lex ·
+        #   stage3 상세로그). 실패했으면 건너뛴다 — 예전에는 여기서 `return` 했는데,
+        #   그러면 함수 끝의 프리셉티 동기화까지 건너뛰어 미러링이 빠진 근무표가 나갔다.
+        if not _stage3_failed:
+            # ── 최종 lex 패스: DDDDD 보장 강화 (기본 자동 ON, AIDE_D5_LEX=0 으로 끔) ──
+            # stage3 목적값을 동결(무회귀)한 뒤 D5 viol 합만 최소화하는 별도 solve.
+            # 자기-게이트: 잔여 D5=0 이면 스킵(무비용) → DDDDD 남은 병동에서만 자동 재-solve.
+            # payload/사용자 입력 불필요. (주의) postprocess/preceptee 경로 재유입은 별도.
+            #
+            # 인원수 게이트: 대형 병동은 freeze 재-solve 가 시간 내 못 풀고(UNKNOWN) 헛돎 →
+            # lex 가 실제로 잘 듣고 빠른 소인원 병동(기본 N<=15)에서만 자동 실행.
+            # AIDE_D5_LEX_MAXN 으로 임계 조절, AIDE_D5_LEX=0 으로 완전 비활성.
+            _lex_maxn = int(_os_tl3.environ.get("AIDE_D5_LEX_MAXN", 15) or 15)
+            # ── mutex lex 패스(D5-lex 앞=상위 우선): "grade/team 바로 밑" ──
+            # grade/team 소프트 품질을 동결(무회귀)한 뒤 상호배제 위반합만 최소화 →
+            # mutex 가 선호/야간분포보다 위, grade/team·하드보다 아래. 동결 부등식이라 infeasible 불가(soft).
+            # 자기게이트(mutex=0 skip)·인원게이트(N<=_lex_maxn)는 D5-lex 와 동일.
+            # mutex-lex 는 grade/team 만 동결(총품질 아님)해 D5 보다 가벼움 + 자기게이트(위반 0 skip)
+            # + 타임리밋(초과 시 원해 유지)이라, D5(15)보다 높은 40 을 기본으로 실병동(19·35명 등) 커버.
+            _mx_lex_maxn = int(_os_tl3.environ.get("AIDE_MUTEX_LEX_MAXN", 40) or 40)
+            _mx_lex_on = (_os_tl3.environ.get("AIDE_MUTEX_LEX", "1") != "0") and (N <= _mx_lex_maxn)
+            if _mx_lex_on:
+                _mx_vars = getattr(m3, "_mutex_lex_vars", None) or []
+                _gt_terms = getattr(m3, "_grade_team_lex_terms", None)
+                if _mx_vars and _gt_terms:
+                    class _MxSkipLex(Exception):
+                        pass
+                    try:
+                        _mx_before = sum(int(s3.Value(v)) for v in _mx_vars)
+                        print(f"{logger_prefix} 폴백3 mutex-lex 진입: stage3 위반 {_mx_before}건 "
+                              f"(페어변수 {len(_mx_vars)}개)")
+                        if _mx_before == 0:
+                            raise _MxSkipLex  # 위반 0 → 재-solve 불필요(무비용)
+                        _gt_val = int(round(s3.Value(sum(_gt_terms))))
+                        m3.Add(sum(_gt_terms) >= _gt_val)   # grade/team 무회귀(penalty=음수 → >= 로 최소보장)
+                        m3.Minimize(sum(_mx_vars))
+                        m3.ClearHints()
+                        for _hn in range(N):
+                            for _hd in iter_nurse_days(_hn, join, leave, blocked_by_nurse):
+                                for _hs in range(S):
+                                    try:
+                                        m3.AddHint(X3(_hn, _hd, _hs), int(s3.Value(X3(_hn, _hd, _hs))))
+                                    except Exception:
+                                        pass
+                        _s3m = cp_model.CpSolver()
+                        _s3m.parameters.max_time_in_seconds = max(8, int(tl3))
+                        _s3m.parameters.num_search_workers = 8
+                        # ★ 미검증 착상: 앞 단계는 0.15/0.05 로 느슨히 끊는데 후속 패스
+                        #   (mutex-lex · D5-lex)만 `relative_gap_limit` 기본 0.0 이라
+                        #   **완전 최적 증명까지 돈다**. 뒤로 갈수록 느슨해야 할 것이
+                        #   역전돼 있다. s3 와 같은 0.05 로 맞추는 안은 품질 영향을
+                        #   재지 않아 보류한다 — 손대려면 A/B 로 함께 측정할 것.
+                        _st3m = _solve_traced(_s3m, m3, logger_prefix, "stage3:mutex-lex")
+                        if _st3m in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                            _mx_after = sum(int(_s3m.Value(v)) for v in _mx_vars)
+                            if _mx_after <= _mx_before:
+                                m3.Add(sum(_mx_vars) <= _mx_after)  # 이후 D5 패스가 mutex 되돌리지 못하게 락
+                                s3 = _s3m
+                                print(f"{logger_prefix} 폴백3 mutex-lex 패스: "
+                                      f"status={_cp_sat_status_to_text(_st3m)} mutex {_mx_before}→{_mx_after}")
+                            else:
+                                print(f"{logger_prefix} 폴백3 mutex-lex 패스 미개선 → 원 해 유지")
                         else:
-                            print(f"{logger_prefix} 폴백3 mutex-lex 패스 미개선 → 원 해 유지")
-                    else:
-                        print(f"{logger_prefix} 폴백3 mutex-lex 패스 실패("
-                              f"{_cp_sat_status_to_text(_st3m)}) → 원 해 유지")
-                except _MxSkipLex:
-                    pass  # 위반 0 → 스킵
-                except Exception as _mx_lex_e:
-                    print(f"{logger_prefix} 폴백3 mutex-lex 패스 예외: {_mx_lex_e}")
-        _lex_on = (_os_tl3.environ.get("AIDE_D5_LEX", "1") != "0") and (N <= _lex_maxn)
-        if _lex_on:
-            _d5_vars = getattr(m3, "_ms_d5_lex_vars", None) or []
-            _obj_terms = getattr(m3, "_stage3_obj_terms", None)
-            if _d5_vars and _obj_terms is not None:
-                class _SkipLex(Exception):
-                    pass
-                try:
-                    # mutex-lex 패스가 앞서 m3 목적을 바꿨을 수 있으므로 ObjectiveValue 대신 항 합으로 총품질 계산
-                    _obj_val = int(round(s3.Value(sum(_obj_terms))))
-                    _d5_before = sum(int(s3.Value(v)) for v in _d5_vars)
-                    if _d5_before == 0:
-                        raise _SkipLex  # 잔여 DDDDD 없음 → 재-solve 불필요(대형병동 비용 0)
-                    m3.Add(sum(_obj_terms) >= _obj_val)  # maximize 라 품질 무회귀
-                    m3.Minimize(sum(_d5_vars))
-                    # 직전 stage3 해를 hint 로 seed → 재solve 가 feasible incumbent 에서 출발
-                    # (없으면 tight freeze 로 짧은 시간에 UNKNOWN → 개선 실패).
-                    m3.ClearHints()
-                    for _hn in range(N):
-                        for _hd in iter_nurse_days(_hn, join, leave, blocked_by_nurse):
-                            for _hs in range(S):
-                                try:
-                                    m3.AddHint(X3(_hn, _hd, _hs), int(s3.Value(X3(_hn, _hd, _hs))))
-                                except Exception:
-                                    pass
-                    _s3b = cp_model.CpSolver()
-                    _s3b.parameters.max_time_in_seconds = max(8, int(tl3))
-                    _s3b.parameters.num_search_workers = 8
-                    _st3b = _s3b.Solve(m3)
-                    if _st3b in (cp_model.OPTIMAL, cp_model.FEASIBLE) and \
-                            sum(int(_s3b.Value(v)) for v in _d5_vars) <= _d5_before:
-                        s3 = _s3b  # 개선(또는 동률)일 때만 채택
-                        print(f"{logger_prefix} 폴백3 D5-lex 패스: "
-                              f"status={_cp_sat_status_to_text(_st3b)} "
-                              f"D5 {_d5_before}→{int(round(_s3b.ObjectiveValue()))}")
-                    else:
-                        print(f"{logger_prefix} 폴백3 D5-lex 패스 실패("
-                              f"{_cp_sat_status_to_text(_st3b)}) → 원 해 유지")
-                except _SkipLex:
-                    pass  # 잔여 D5=0 → 스킵(무비용)
-                except Exception as _lex_e:
-                    print(f"{logger_prefix} 폴백3 D5-lex 패스 예외: {_lex_e}")
-        try:
-            short_items = [
-                (d, code, int(s3.Value(var)))
-                for (d, code), var in short_map3.items()
-                if int(s3.Value(var)) > 0
-            ]
-            over_items = [
-                (d, code, int(s3.Value(var)))
-                for (d, code), var in over_map3.items()
-                if int(s3.Value(var)) > 0
-            ]
-            if short_items:
-                print(f"{logger_prefix} [Stage3 부족 참고] day,shift,shortage =", sorted(short_items))
-            if over_items:
-                print(f"{logger_prefix} [Stage3 과잉 참고] day,shift,over =", sorted(over_items))
-            for k, arr in safety3.items():
-                total_k = sum(int(s3.Value(v)) for v in arr)
-                if total_k > 0:
-                    print(f"{logger_prefix} [Stage3 위반] {k} = {total_k}")
-            # 실제 배정된 휴무 카운트(O/주휴/휴가) 요약
-            if off_idx is not None:
-                for n, nu in enumerate(roster_system.nurses):
-                    assigned_off = sum(
-                        int(s3.Value(X3(n, d, off_idx))) for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
-                    )
-                    vac_cnt = sum(
-                        1
-                        for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
-                        if (n, d) in off_exception_vacation_cells
-                    )
-                    weekly_target = len(weekly_off_by_idx.get(n, []) if isinstance(weekly_off_by_idx, dict) else [])
-                    target_o = target_o_by_n.get(n)
-                    slack_short_val = (
-                        s3.Value(off_quota_short_by_n[n]) if n in off_quota_short_by_n else None
-                    )
-                    slack_excess_val = (
-                        s3.Value(off_quota_excess_by_n[n]) if n in off_quota_excess_by_n else None
-                    )
-                    min_off_miss_val = (
-                        s3.Value(min_off_miss_by_n[n]) if n in min_off_miss_by_n else None
-                    )
-                    print(
-                        f"{logger_prefix} [OffCount][final] n={n}, "
-                        f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
-                        f"cap_semantics={off_cap_semantics}, "
-                        f"assigned_O={assigned_off}, vacation={vac_cnt}, weekly_off_target={weekly_target}, "
-                        f"target_O={target_o}, slack_short={slack_short_val}, slack_excess={slack_excess_val}, "
-                        f"min_off_miss={min_off_miss_val}"
-                    )
-        except Exception as exc:
-            print(f"{logger_prefix} [Stage3 상세로그 실패]: {exc}")
+                            print(f"{logger_prefix} 폴백3 mutex-lex 패스 실패("
+                                  f"{_cp_sat_status_to_text(_st3m)}) → 원 해 유지")
+                    except _MxSkipLex:
+                        pass  # 위반 0 → 스킵
+                    except Exception as _mx_lex_e:
+                        print(f"{logger_prefix} 폴백3 mutex-lex 패스 예외: {_mx_lex_e}")
+            _lex_on = (_os_tl3.environ.get("AIDE_D5_LEX", "1") != "0") and (N <= _lex_maxn)
+            if _lex_on:
+                _d5_vars = getattr(m3, "_ms_d5_lex_vars", None) or []
+                _obj_terms = getattr(m3, "_stage3_obj_terms", None)
+                if _d5_vars and _obj_terms is not None:
+                    class _SkipLex(Exception):
+                        pass
+                    try:
+                        # mutex-lex 패스가 앞서 m3 목적을 바꿨을 수 있으므로 ObjectiveValue 대신 항 합으로 총품질 계산
+                        _obj_val = int(round(s3.Value(sum(_obj_terms))))
+                        _d5_before = sum(int(s3.Value(v)) for v in _d5_vars)
+                        if _d5_before == 0:
+                            raise _SkipLex  # 잔여 DDDDD 없음 → 재-solve 불필요(대형병동 비용 0)
+                        m3.Add(sum(_obj_terms) >= _obj_val)  # maximize 라 품질 무회귀
+                        m3.Minimize(sum(_d5_vars))
+                        # 직전 stage3 해를 hint 로 seed → 재solve 가 feasible incumbent 에서 출발
+                        # (없으면 tight freeze 로 짧은 시간에 UNKNOWN → 개선 실패).
+                        m3.ClearHints()
+                        for _hn in range(N):
+                            for _hd in iter_nurse_days(_hn, join, leave, blocked_by_nurse):
+                                for _hs in range(S):
+                                    try:
+                                        m3.AddHint(X3(_hn, _hd, _hs), int(s3.Value(X3(_hn, _hd, _hs))))
+                                    except Exception:
+                                        pass
+                        _s3b = cp_model.CpSolver()
+                        _s3b.parameters.max_time_in_seconds = max(8, int(tl3))
+                        _s3b.parameters.num_search_workers = 8
+                        # (위 mutex-lex 의 gap_limit 주석과 같은 사안)
+                        _st3b = _solve_traced(_s3b, m3, logger_prefix, "stage3:d5-lex")
+                        if _st3b in (cp_model.OPTIMAL, cp_model.FEASIBLE) and \
+                                sum(int(_s3b.Value(v)) for v in _d5_vars) <= _d5_before:
+                            s3 = _s3b  # 개선(또는 동률)일 때만 채택
+                            print(f"{logger_prefix} 폴백3 D5-lex 패스: "
+                                  f"status={_cp_sat_status_to_text(_st3b)} "
+                                  f"D5 {_d5_before}→{int(round(_s3b.ObjectiveValue()))}")
+                        else:
+                            print(f"{logger_prefix} 폴백3 D5-lex 패스 실패("
+                                  f"{_cp_sat_status_to_text(_st3b)}) → 원 해 유지")
+                    except _SkipLex:
+                        pass  # 잔여 D5=0 → 스킵(무비용)
+                    except Exception as _lex_e:
+                        print(f"{logger_prefix} 폴백3 D5-lex 패스 예외: {_lex_e}")
+            try:
+                short_items = [
+                    (d, code, int(s3.Value(var)))
+                    for (d, code), var in short_map3.items()
+                    if int(s3.Value(var)) > 0
+                ]
+                over_items = [
+                    (d, code, int(s3.Value(var)))
+                    for (d, code), var in over_map3.items()
+                    if int(s3.Value(var)) > 0
+                ]
+                if short_items:
+                    print(f"{logger_prefix} [Stage3 부족 참고] day,shift,shortage =", sorted(short_items))
+                if over_items:
+                    print(f"{logger_prefix} [Stage3 과잉 참고] day,shift,over =", sorted(over_items))
+                for k, arr in safety3.items():
+                    total_k = sum(int(s3.Value(v)) for v in arr)
+                    if total_k > 0:
+                        print(f"{logger_prefix} [Stage3 위반] {k} = {total_k}")
+                # 실제 배정된 휴무 카운트(O/주휴/휴가) 요약
+                if off_idx is not None:
+                    for n, nu in enumerate(roster_system.nurses):
+                        assigned_off = sum(
+                            int(s3.Value(X3(n, d, off_idx))) for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
+                        )
+                        vac_cnt = sum(
+                            1
+                            for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
+                            if (n, d) in off_exception_vacation_cells
+                        )
+                        weekly_target = len(weekly_off_by_idx.get(n, []) if isinstance(weekly_off_by_idx, dict) else [])
+                        target_o = target_o_by_n.get(n)
+                        slack_short_val = (
+                            s3.Value(off_quota_short_by_n[n]) if n in off_quota_short_by_n else None
+                        )
+                        slack_excess_val = (
+                            s3.Value(off_quota_excess_by_n[n]) if n in off_quota_excess_by_n else None
+                        )
+                        min_off_miss_val = (
+                            s3.Value(min_off_miss_by_n[n]) if n in min_off_miss_by_n else None
+                        )
+                        print(
+                            f"{logger_prefix} [OffCount][final] n={n}, "
+                            f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
+                            f"cap_semantics={off_cap_semantics}, "
+                            f"assigned_O={assigned_off}, vacation={vac_cnt}, weekly_off_target={weekly_target}, "
+                            f"target_O={target_o}, slack_short={slack_short_val}, slack_excess={slack_excess_val}, "
+                            f"min_off_miss={min_off_miss_val}"
+                        )
+            except Exception as exc:
+                print(f"{logger_prefix} [Stage3 상세로그 실패]: {exc}")
 
-    roster_system.roster.fill(0)
-    for n in range(N):
-        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
-            for s in range(S):
-                if s3.Value(X3(n, d, s)):
-                    roster_system.roster[n, d, s] = 1
+    # ★ stage3 가 실패했으면 s3 에 해가 없다. 여기서 무조건 추출하면 위에서 채워 둔
+    #   stage2 해를 지우고 빈 값(또는 예외)으로 덮는다. 실패 시에는 이미 채워진
+    #   roster 를 그대로 두고, 아래 공용 마무리(프리셉티 동기화 등)만 이어간다.
+    if not _stage3_failed:
+        roster_system.roster.fill(0)
+        for n in range(N):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                for s in range(S):
+                    if s3.Value(X3(n, d, s)):
+                        roster_system.roster[n, d, s] = 1
     log_n_even_distribution(roster_system, logger_prefix, join=join, leave=leave)
     # NOTE: rebalance_off 후처리 비활성화(호출 무시)
     # try:
@@ -3874,140 +4321,9 @@ def optimize_fallback_lex_hard_first(
     # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
     # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
     #       프리셉터의 특수코드(W 등) → 프리셉티는 OFF
-    if preceptee_follow and preceptee_indices:
-        _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
-        _fb_shift_types = cfg.shift_types
-        _fb_off_idx = _fb_shift_types.index('O') if 'O' in _fb_shift_types else None
-        _fb_standard = {'D', 'E', 'N', 'O'}
-        if bool(getattr(cfg, 'use_mid', False)):
-            _fb_standard.add('M')
-        _fb_pte_fw = getattr(roster_system, '_preceptee_fixed_wanted_map', {})
-        # 고정 OFF 직전 N 금지가 실제로 건 셀. 미러가 프리셉터 N 을 덮어쓰지 못하게 한다.
-        _fb_ban_prev = getattr(roster_system, '_ban_n_prev_cells', set()) or set()
-        _fb_n_idx = _fb_shift_types.index('N') if 'N' in _fb_shift_types else None
-        synced = 0
-        special_converted = 0
-        _fb_fw_restored = 0
-        _fb_ban_kept = 0
-        _fb_pre_ptr_idx2 = getattr(roster_system, 'preceptee_preceptor_idx', {}) or {}  # period SSOT
-        for pte_idx in preceptee_indices:
-            # 권위 모드: period SSOT 로 프리셉터 결정(캐시 미사용 — NULL 캐시 프리셉티 누락 방지).
-            if _has_preceptee_period:
-                ptr_idx = _fb_pre_ptr_idx2.get(pte_idx)
-                if ptr_idx is None:
-                    continue
-            else:
-                pid = getattr(roster_system.nurses[pte_idx], 'preceptor_id', None)
-                if not pid or pid not in _fb_id_to_idx:
-                    continue
-                ptr_idx = _fb_id_to_idx[pid]
-            # 권위 모드면 nurse_preceptee_period 기간 내 day만, 폴백이면 전체월 복사.
-            _fb_follow = preceptee_follow_days.get(pte_idx)
-            _fb_days_iter = (sorted(_fb_follow) if (_has_preceptee_period and _fb_follow)
-                             else list(range(roster_system.num_days)))
-            for _cd in _fb_days_iter:
-                roster_system.roster[pte_idx, _cd, :] = roster_system.roster[ptr_idx, _cd, :]
-            # 특수코드 일자는 프리셉티를 OFF로 전환 (복사한 day 한정)
-            # 단, type=근무 + shift_gb=D/E/N 계열 하위코드는 근무이므로 그대로 유지
-            _fb_work_sub = getattr(roster_system, '_work_sub_ids', set())
-            _fb_orig_map = getattr(roster_system, '_fixed_original_shift_map', {})
-            if _fb_off_idx is not None:
-                for d in _fb_days_iter:
-                    # 프리셉티 fixed_wanted 일자는 프리셉터 복사 대신 본인 값 적용
-                    if (pte_idx, d) in _fb_pte_fw:
-                        _fw_code = _fb_pte_fw[(pte_idx, d)].strip().upper()
-                        if _fw_code in _fb_shift_types:
-                            roster_system.roster[pte_idx, d, :] = 0
-                            roster_system.roster[pte_idx, d, _fb_shift_types.index(_fw_code)] = 1
-                            _fb_fw_restored += 1
-                        continue
-                    # ★ 고정 OFF 직전 N 금지가 건 셀이면, 프리셉터를 따라 N 이 복사되는 것을
-                    #   막는다. 모델 제약은 미러 **이전** 값에만 걸리므로 여기서 다시 막지
-                    #   않으면 신청해 받은 휴일이 도로 회복 OFF 자리로 돌아간다.
-                    #   교육 연속성보다 휴일 보호를 우선한다(2026-08-31 결정).
-                    if (pte_idx, d) in _fb_ban_prev and _fb_n_idx is not None:
-                        if roster_system.roster[pte_idx, d, _fb_n_idx] == 1:
-                            roster_system.roster[pte_idx, d, :] = 0
-                            if _fb_off_idx is not None:
-                                roster_system.roster[pte_idx, d, _fb_off_idx] = 1
-                            _fb_ban_kept += 1
-                            continue
-                    _fb_need = False
-                    _fb_orig = _fb_orig_map.get((ptr_idx, d))
-                    if _fb_orig:
-                        _fb_ou = _fb_orig.upper()
-                        if _fb_ou not in _fb_standard and _fb_ou not in _fb_work_sub:
-                            _fb_need = True
-                    else:
-                        _idx_arr = np.where(roster_system.roster[ptr_idx, d] == 1)[0]
-                        if len(_idx_arr) > 0:
-                            _fb_sc = _fb_shift_types[int(_idx_arr[0])]
-                            if _fb_sc not in _fb_standard and _fb_sc.upper() not in _fb_work_sub:
-                                _fb_need = True
-                    if _fb_need:
-                        roster_system.roster[pte_idx, d, :] = 0
-                        roster_system.roster[pte_idx, d, _fb_off_idx] = 1
-                        special_converted += 1
-            synced += 1
-        if synced:
-            msg = f"{logger_prefix} [PrecepteeSync] 후처리 후 프리셉티 roster 동기화: {synced}명"
-            if special_converted:
-                msg += f" (특수코드→OFF 전환: {special_converted}건)"
-            if _fb_fw_restored:
-                msg += f", fixed_wanted 재적용: {_fb_fw_restored}건"
-            if _fb_ban_kept:
-                msg += f", 고정OFF직전N 보호: {_fb_ban_kept}건"
-            print(msg)
-        # if bool(getattr(cfg, "ban_e_to_d", True)) and _fb_off_idx is not None:
-        #     _fb_eve_idx = _fb_shift_types.index('E') if 'E' in _fb_shift_types else None
-        #     _fb_day_idx = _fb_shift_types.index('D') if 'D' in _fb_shift_types else None
-        #     _fixed_blocked = 0
-        #     _repaired = 0
-        #     if _fb_eve_idx is not None and _fb_day_idx is not None:
-        #         for pte_idx in preceptee_indices:
-        #             for d in range(1, roster_system.num_days):
-        #                 if int(roster_system.roster[pte_idx, d - 1, _fb_eve_idx]) != 1:
-        #                     continue
-        #                 if int(roster_system.roster[pte_idx, d, _fb_day_idx]) != 1:
-        #                     continue
-        #                 cur_fixed = (pte_idx, d) in _fb_pte_fw
-        #                 prev_fixed = (pte_idx, d - 1) in _fb_pte_fw
-        #                 if not cur_fixed:
-        #                     roster_system.roster[pte_idx, d, :] = 0
-        #                     roster_system.roster[pte_idx, d, _fb_off_idx] = 1
-        #                     _repaired += 1
-        #                 elif not prev_fixed:
-        #                     roster_system.roster[pte_idx, d - 1, :] = 0
-        #                     roster_system.roster[pte_idx, d - 1, _fb_off_idx] = 1
-        #                     _repaired += 1
-        #                 else:
-        #                     _fixed_blocked += 1
-        #     if _repaired or _fixed_blocked:
-        #         print(
-        #             f"{logger_prefix} [PrecepteeSync][Repair-E->D] repaired={_repaired}, blocked_fixed={_fixed_blocked}"
-        #         )
-
-    _log_weekend_work_assignments(
-        roster_system=roster_system,
-        weekend_days=weekend_days,
-        off_idx=off_idx,
-        logger_prefix=logger_prefix,
-    )
-    # ── 후처리 완료 후 최종 커버리지 상태 로깅 ──
-    try:
-        final_viols = roster_system._find_violations()
-        final_cov_viols = [v for v in final_viols if v.get('type') == 'shift_requirement']
-        if final_cov_viols:
-            print(f"{logger_prefix} [최종 커버리지 부족] 후처리 후 {len(final_cov_viols)}건 부족:")
-            for v in sorted(final_cov_viols, key=lambda x: (x['day'], x['shift'])):
-                print(
-                    f"  day={v['day']+1}, shift={v['shift']}, "
-                    f"required={v['required']}, actual={v['actual']}, "
-                    f"gap={v['required'] - v['actual']}"
-                )
-        else:
-            print(f"{logger_prefix} [최종 커버리지] 후처리 후 커버리지 부족 없음 ✓")
-    except Exception as exc:
-        print(f"{logger_prefix} [최종 커버리지 로깅 실패]: {exc}")
+    _sync_preceptee_rosters()
+    # ★ 완료 로그는 동기화 함수 밖이어야 한다. best_safe_sum 은 stage2 이후에야
+    #   대입되는데, 함수 안에 두면 stage2 실패 경로에서 부르는 순간 UnboundLocalError 가 난다.
+    _mark("post_stage3")
     print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
     return best_short == 0 and best_safe_sum == 0
