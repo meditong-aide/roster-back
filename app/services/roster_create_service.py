@@ -407,6 +407,269 @@ def _load_shift_lookup(db: Session, office_id: str, group_id: str) -> dict[str, 
     return lookup
 
 
+def _build_generate_snapshot(db: Session, config, status: str, year: int, month: int,
+                             nurses_dict=None, config_dict=None,
+                             job_id: str | None = None,
+                             persistent_fix: dict | None = None) -> str | None:
+    """생성 시도 시점의 **입력 전체**를 JSON 으로 만든다.
+
+    왜 본문인가: input_hash(shadow_diagnosis._input_hash)는 같은 입력을 묶는 지문일 뿐
+    되돌릴 수 없어서 "무엇이 문제였나" 를 못 본다. 모순 분석이 목적이면 본문이 필요하다.
+    또 그 해시에는 **원티드가 빠져 있어** 원티드만 바뀐 경우를 구분하지 못한다.
+
+    담는 것 — 생성 성패를 가르는 입력을 한자리에:
+      nurses  간호사별 프로파일(등급·팀·허용시프트·고정근무·개인 상하한·주휴 등)
+      config  roster_config + daily_shift 요구 + team_min + 선호 가중치
+      wanted  원티드 신청(해시가 놓치던 축)
+      grade   등급 요구(roster_grade_config)
+    """
+    try:
+        gid = str(getattr(config, "group_id", "") or "")
+        if not gid:
+            return None
+        if nurses_dict is None:
+            # 폴백 — 엔진이 만든 상세 프로파일이 없을 때만(precheck 전에 실패한 경우).
+            #   ★ nurses.is_weekend_off 는 담지 않는다. 2026-07-22 언매핑된 캐시 컬럼이고
+            #     SSOT 는 nurse_weekendoff_period 라, 여기서 읽으면 **솔버가 본 값과 다른**
+            #     낡은 값이 기록으로 남는다(빠진 것보다 나쁘다 — 분석을 오도한다).
+            #     그래서 이 경로의 스냅샷은 얇다는 사실 자체를 _partial 로 표시한다.
+            nurses_dict = [
+                dict(r._mapping) for r in db.execute(text(
+                    "SELECT nurse_id, name, grade, team_id, active, sequence, "
+                    "joining_date, resignation_date "
+                    "FROM nurses WHERE group_id = :g"), {"g": gid})
+            ]
+        # 원티드는 세 테이블로 나뉜다 — solver 입력이 되는 두 개를 담는다.
+        #   fixed_wanted_entries  희망 근무(고정 배정)
+        #   banned_wanted_entries 기피 근무(금지)
+        #   ※ `wanted` 는 그룹 단위 신청 **기간** 설정이라 개별 신청이 아니다.
+        _p = {"g": gid, "y": int(year), "m": int(month)}
+        wanted_fixed = [
+            dict(r._mapping) for r in db.execute(text(
+                "SELECT nurse_id, shift_date, shift_id, is_applied "
+                "FROM fixed_wanted_entries "
+                "WHERE group_id = :g AND year = :y AND month = :m"), _p)
+        ]
+        wanted_banned = [
+            dict(r._mapping) for r in db.execute(text(
+                "SELECT nurse_id, shift_date, banned_shift_ids, is_applied "
+                "FROM banned_wanted_entries "
+                "WHERE group_id = :g AND year = :y AND month = :m"), _p)
+        ]
+        # ★ 엔진이 실제로 본 값을 담아야 한다. constraints_json 은 JSON 문자열로
+        #   저장돼 있어 그대로 실으면 payload 안에서 **이중 인코딩**된 문자열이 된다.
+        #   또 엔진은 _ensure_grade1_default 로 grade-1 floor 를 얹은 뒤 쓰므로,
+        #   가공 전 원본만 남기면 "왜 grade1 이 저렇게 잡혔지" 를 못 푼다. 둘 다 담는다.
+        grade_raw = db.execute(text(
+            "SELECT TOP 1 constraints_json FROM roster_grade_config "
+            "WHERE group_id = :g ORDER BY config_id DESC"), {"g": gid}).scalar()
+        grade_cfg = grade_raw
+        if isinstance(grade_raw, str):
+            try:
+                grade_cfg = json.loads(grade_raw)
+            except (ValueError, TypeError):
+                grade_cfg = grade_raw
+        grade_effective = None
+        try:
+            grade_effective = _fetch_grade_config_dict(
+                db, str(getattr(config, "office_id", "") or ""), gid)
+        except Exception:
+            pass
+        payload = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "status": status,
+            # ★ 실패는 schedules 에 행이 남지 않는다(roster_jobs.result_roster_id=None).
+            #   추적 고리는 roster_jobs.job_id 뿐이라 스냅샷에 실어 둔다.
+            #   roster_jobs 에 config_id 컬럼이 없어 반대 방향(job→config)은 못 잇는다.
+            "job_id": job_id,
+            # 어느 프리셋에서 파생됐는지 — 실패 기록이 별도 행으로 갈 때 원본을 가리킨다.
+            "source_config_id": getattr(config, "config_id", None),
+            "year": int(year), "month": int(month),
+            "nurses": nurses_dict,
+            # ★ `_` 접두 키를 통째로 버리면 **실제 솔버 입력도 같이 버린다**
+            #   (_inbound_source_map · _2n2off_pre_injected 등). 진단용 임시 키만
+            #   골라 빼는 대신, 담고 나서 크기 문제가 생기면 그때 좁힌다 —
+            #   분석 기록에서 입력 누락은 되돌릴 수 없지만 용량은 나중에 줄일 수 있다.
+            "config": dict(config_dict or {}),
+            "wanted_fixed": wanted_fixed,
+            "wanted_banned": wanted_banned,
+            "grade_config": grade_cfg,
+            "grade_config_effective": grade_effective,
+            # 이 스냅샷이 얇은지(엔진 상세 프로파일 없이 DB 폴백으로 채웠는지).
+            #   precheck 전에 실패하면 nurses 가 8필드짜리라 등급·허용시프트가 없다.
+            "_partial": bool(config_dict is None),
+            # 이번 런에서 **데이터를 실제로 고친** 옵션들(주말휴무 해제 · 월 한도 하향 ·
+            #   금지근무 해제 · 근무유형 추가). nurses/wanted 는 이미 고쳐진 뒤의 값이라
+            #   이 키가 없으면 "원래 그랬던 것" 과 구분되지 않는다.
+            "persistent_fix": persistent_fix or None,
+        }
+        # ★ config_dict 에는 튜플을 키로 쓰는 dict 가 섞인다(fixed_cells 의 (nurse, day) 등).
+        #   json 은 str/int/float/bool/None 키만 받으므로 default=str 로는 못 막고
+        #   통째로 실패한다(실측: 나사렛 7B 두 건이 스냅샷 0B 로 유실).
+        #   키를 문자열로 눌러 담는다 — 분석용 기록이므로 원형 복원보다 보존이 우선이다.
+        #   ★ set 도 처리한다. default=str 로 넘어가면 "{'a', 'b'}" 같은 repr 문자열이
+        #     박제돼 파싱이 안 된다(lookahead_weekly_off_cells 등이 set 이다).
+        #     정렬해 리스트로 — 같은 입력이 같은 JSON 이 되어 스냅샷 간 대조가 된다.
+        def _key_safe(o):
+            if isinstance(o, dict):
+                return {(k if isinstance(k, (str, int, float, bool)) or k is None
+                         else str(k)): _key_safe(v) for k, v in o.items()}
+            if isinstance(o, (set, frozenset)):
+                return sorted((_key_safe(v) for v in o), key=str)
+            if isinstance(o, (list, tuple)):
+                return [_key_safe(v) for v in o]
+            return o
+
+        return json.dumps(_key_safe(payload), ensure_ascii=False, default=str)
+    except Exception as _sn_exc:
+        # ★ rollback 을 반드시 한다. 위 SELECT 중 하나가 DB 오류로 죽으면 세션이
+        #   비활성 상태로 남아, 이어지는 status UPDATE 가 PendingRollbackError 로
+        #   같이 죽는다(스냅샷만 없는 게 아니라 상태 기록까지 유실된다).
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print(f"[ConfigGenerateStatus] 스냅샷 생성 실패(무시): {_sn_exc}")
+        return None
+
+
+def _mark_config_generate_status(db: Session, config, status: str,
+                                 snapshot: str | None = None,
+                                 year: int | None = None, month: int | None = None,
+                                 job_id: str | None = None,
+                                 intervened: bool = False) -> None:
+    """생성 시도 결과를 두 곳에 남긴다 — 역할이 다르다.
+
+    roster_config.last_generate_status   "목록에 보일까"
+      실패하면 숨긴다 — 월 구분도, 되살림도 없다. 그 설정을 편집해 저장해도
+      다시 노출하지 않는다(실패한 설정까지 보이면 프리셋의 의미가 퇴색된다).
+      다시 쓰려면 새로 저장하면 신규 행이라 NULL 에서 시작한다.
+
+    roster_config_attempt   "그때 입력이 무엇이었나" (분석 전용)
+
+    status  success | blocked(precheck 차단) | infeasible(solver 가 못 품)
+    성공·실패 모두 남긴다 — 실패만 모으면 비교 대상이 없어
+      "직전엔 됐는데 왜 안 되지" 를 못 푼다.
+
+    intervened  이 런에 개입이 있었나.
+      일시적 — config_override(해결책 카드) · treatment_ids(온톨로지 처방) ·
+        applied_relaxations(team_min hard→soft 자동 완화) ·
+        column_delta_mode(apply-resolution 이 컬럼을 임시 commit 했다 되돌리는 것).
+        저장된 프리셋 값의 성패가 아니므로 True.
+      영구 — weekend_off_release · monthly_limit_release · banned_wanted_release ·
+        allowed_shift_add 는 간호사·원티드 데이터를 실제로 고치고 commit 한다.
+        조건 자체가 바뀐 뒤의 유효한 결과이므로 False(스냅샷의 persistent_fix 로 추적).
+
+    ★ 월별로 판정하지 않는다. 실패한 설정은 다음 달에도 숨긴다 — 다시 쓰려면
+      새로 저장하면 되므로 굳이 노출할 이유가 없다. 월별로 가르려던 설계는
+      컬럼이 마지막 시도만 담아 오판이 났고(실측 2건), 판정 기준을 단순화하면서
+      그 문제 자체가 사라졌다.
+
+    ★ 기록 실패가 생성 자체를 막으면 안 된다 — 예외는 삼키고 로그만 남긴다.
+      두 기록을 각각 try 로 감싸는 이유 — 한쪽이 실패해도 다른 쪽은 남겨야 한다.
+    ★★ 마이그레이션은 코드보다 먼저 들어가야 한다. 이 try/except 로는 못 막는다 —
+      매핑 컬럼이라 db.query(RosterConfig) 하는 곳들이 먼저 죽는다.
+    """
+    # ★ getattr 을 try 안에 둔다. SessionLocal 은 expire_on_commit 기본값(True)이라
+    #   앞선 commit 이 인스턴스를 만료시켜 이 접근이 refresh SELECT 를 유발한다.
+    #   그 SELECT 가 실패하면 예외가 이 함수 밖으로 나가고, 성공 지점에서는
+    #   _ctx["recorded"] 가 아직 False 라 래퍼가 error 를 찍고 재던진다 —
+    #   **이미 커밋된 정상 근무표가 HTTP 500 으로 나간다.**
+    try:
+        cid = getattr(config, "config_id", None)
+    except Exception as _cid_exc:
+        print(f"[ConfigGenerateStatus] config_id 조회 실패(기록 생략): {_cid_exc}")
+        return
+    if cid is None:
+        return
+    # ── ① 목록 필터용 상태 (roster_config) ──
+    #   개입이 낀 런은 저장된 값 그대로의 성패가 아니므로 기록하지 않는다.
+    #   한 번 실패로 기록되면 편집 저장으로도 되살리지 않는다 — 방침이다.
+    if intervened:
+        print(f"[ConfigGenerateStatus] config_id={cid} 는 개입이 있던 런 — "
+              f"{status} 를 프리셋에 기록하지 않는다. 분석 기록은 attempt 로.")
+    else:
+        try:
+            # ★ 'error' 는 **이전 판정을 지우면 안 된다.** 목록 필터가 error 를
+            #   통과시키므로(설정 탓이 증명 안 된 실패라서), 조건 없이 덮으면
+            #   앞서 blocked/infeasible 로 숨겨 둔 프리셋이 되살아난다.
+            #   (config X 가 infeasible → 다음 달 재시도 중 MID 검증 예외 →
+            #    error 가 infeasible 을 지움 → 목록에 복귀. 방침 위반)
+            #   그래서 error 는 **아직 판정이 없을 때만** 쓴다.
+            if status == "error":
+                _sql = ("UPDATE roster_config SET last_generate_status = :s "
+                        " WHERE config_id = :c AND last_generate_status IS NULL")
+            else:
+                _sql = ("UPDATE roster_config SET last_generate_status = :s "
+                        " WHERE config_id = :c")
+            _r = db.execute(text(_sql), {"s": status, "c": int(cid)})
+            db.commit()
+            if status == "error" and getattr(_r, "rowcount", 1) == 0:
+                print(f"[ConfigGenerateStatus] config_id={cid} 는 이미 판정이 있어 "
+                      f"error 로 덮지 않는다. 기록은 attempt 로.")
+            else:
+                print(f"[ConfigGenerateStatus] config_id={cid} → {status}")
+        except Exception as _mk_exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[ConfigGenerateStatus] 상태 기록 실패(무시): "
+                  f"config_id={cid} {_mk_exc}")
+
+    # ── ② 분석용 스냅샷 (roster_config_attempt) ──
+    try:
+        db.execute(
+            text("INSERT INTO roster_config_attempt "
+                 "(source_config_id, office_id, group_id, job_id, "
+                 " year, month, status, intervened, snapshot, created_at) "
+                 "VALUES (:c, :o, :g, :j, :y, :m, :s, :iv, :snap, GETDATE())"),
+            {"c": int(cid),
+             "o": str(getattr(config, "office_id", "") or "") or None,
+             "g": str(getattr(config, "group_id", "") or ""),
+             "j": job_id, "y": year, "m": month,
+             "s": status, "iv": bool(intervened), "snap": snapshot},
+        )
+        # ★ 프리셋당 보존량을 묶는다. 스냅샷이 건당 30KB 대라 상한이 없으면
+        #   단조 증가한다(71병동 × 월 5회 = 연 130MB, 공용 온프렘 서버라 무시 못 함).
+        #   스냅샷에 간호사 실명이 들어가므로 보존량 자체를 제한하는 편이 낫다.
+        #
+        #   ★★ 단 **월별 최신 순수 기록은 지우지 않는다.** 목록 판정에 쓰는 게 아니라
+        #     (그건 roster_config.last_generate_status 가 한다) **분석 때문**이다 —
+        #     "9월엔 됐는데 10월엔 왜 안 되지" 는 달별 마지막 결과를 대조해야 답이
+        #     나온다. 최근 20건만 남기면 나중 달을 몇 번 돌린 순간 예전 달 기록이
+        #     통째로 사라져 그 대조가 불가능해진다.
+        #   실제 보존량은 20건 + (24개월 내 서로 다른 year·month 수) 다.
+        #     intervened 건은 판정에 안 쓰이므로 이 보호 대상이 아니다.
+        #     24개월을 넘긴 것도 제외한다 — 무한 누적을 막는다.
+        db.execute(
+            text("DELETE FROM roster_config_attempt "
+                 "WHERE source_config_id = :c AND group_id = :g "
+                 "  AND attempt_id NOT IN ("
+                 "      SELECT TOP 20 attempt_id FROM roster_config_attempt "
+                 "      WHERE source_config_id = :c AND group_id = :g "
+                 "      ORDER BY attempt_id DESC) "
+                 "  AND attempt_id NOT IN ("
+                 "      SELECT MAX(attempt_id) FROM roster_config_attempt "
+                 "      WHERE source_config_id = :c AND group_id = :g "
+                 "        AND (intervened IS NULL OR intervened = 0) "
+                 "        AND created_at >= DATEADD(month, -24, GETDATE()) "
+                 "      GROUP BY year, month)"),
+            {"c": int(cid), "g": str(getattr(config, "group_id", "") or "")},
+        )
+        db.commit()
+        _sz = f" snapshot={len(snapshot)}B" if snapshot else " snapshot=없음"
+        _iv = " intervened" if intervened else ""
+        print(f"[ConfigGenerateAttempt] config_id={cid} {year}-{month} "
+              f"{status}{_iv}{_sz} job_id={job_id}")
+    except Exception as _at_exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print(f"[ConfigGenerateAttempt] 기록 실패(무시): config_id={cid} {_at_exc}")
+
+
 def _fetch_latest_config(db: Session, req: RosterRequest, current_user):
     """요청의 config_id 우선, 없으면 그룹 최신 config을 가져온다.
 
@@ -4535,7 +4798,91 @@ def _apply_distribution_policy_from_req(config_dict: dict, req) -> None:
 
 # ───────────────────────────── 서비스 함수 ─────────────────────────────
 
-def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None, banned_wanted_release=None, allowed_shift_add=None):
+def _record_unclassified_failure(db: Session, req, job_id, ctx: dict) -> None:
+    """낙인 지점을 안 거치고 빠져나간 실패를 'error' 로 남긴다.
+
+    latest_config 를 얻기 전에 난 것(권한 오류 등)은 기록하지 않는다 —
+    그건 "이 설정으로 생성이 안 된다" 가 아니라 요청 자체의 문제다.
+    """
+    # ★ 실패로 끝난 생성의 draft 근무표를 지운다 — blocked(:db.delete)·
+    #   infeasible 과 대칭. 이게 없으면 예외마다 병동 근무표 목록에 draft 가 쌓인다.
+    _sch = ctx.get("schedule")
+    if _sch is not None:
+        try:
+            _sid = getattr(_sch, "schedule_id", None)
+            if _sid is not None:
+                db.execute(text("DELETE FROM schedule_entries WHERE schedule_id = :s"),
+                           {"s": _sid})
+                db.execute(text("DELETE FROM schedules WHERE schedule_id = :s"),
+                           {"s": _sid})
+                db.commit()
+                print(f"[RosterGenerate] 미분류 실패 — draft 근무표 정리: {_sid}")
+        except Exception as _del_exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[RosterGenerate] draft 정리 실패(무시): {_del_exc}")
+
+    cfg = ctx.get("config")
+    if cfg is None:
+        return
+    try:
+        _mark_config_generate_status(
+            db, cfg, "error",
+            _build_generate_snapshot(
+                db, cfg, "error", req.year, req.month,
+                ctx.get("nurses"), ctx.get("config_dict"), job_id,
+                ctx.get("persistent_fix")),
+            req.year, req.month, job_id,
+            bool(ctx.get("intervened")) or bool(ctx.get("relaxed")),
+        )
+    except Exception as _exc:
+        print(f"[ConfigGenerateStatus] 예외 경로 기록 실패(무시): {_exc}")
+
+
+def generate_roster_service(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None, banned_wanted_release=None, allowed_shift_add=None, job_id: str | None = None, column_delta_mode: str | None = None):
+    """근무표 생성 — 실패 기록을 빠짐없이 남기기 위한 얇은 래퍼.
+
+    본체(_generate_roster_service_impl)는 precheck 차단(blocked)과 solver 실패
+    (infeasible) 두 지점에서만 기록한다. 그런데 그 둘을 안 거치고 빠져나가는
+    실패가 있다 — `_validate_mid_hard_feasibility` 의 `raise Exception(...)`
+    (MID 하드 검증), 솔버 예외 등. 그대로 두면 실패한 설정이 프리셋 목록에
+    계속 남아 이 기능이 그 입력에서만 무력해진다.
+
+    HTTPException 도 그냥 통과시키면 안 된다 — blocked/infeasible 은 낙인 후 던지지만,
+    MID 하드 검증 실패처럼 **기록 없이 나가는 HTTPException 도 있다**(실측:
+    use_mid=False 인데 fixed_shift='MID' 인 간호사가 있으면 그 경로로 빠진다).
+    그래서 "이미 기록했는가"(_ctx["recorded"])로 판단한다.
+    권한 오류처럼 latest_config 를 얻기 전에 나는 것은 _ctx["config"] 가 없어
+    자연히 걸러진다 — 그건 "이 설정으로 생성이 안 된다" 가 아니기 때문이다.
+    """
+    _ctx: dict = {}
+    try:
+        return _generate_roster_service_impl(
+            req, current_user, db, treatment_ids, config_override,
+            weekend_off_release, monthly_limit_release, banned_wanted_release,
+            allowed_shift_add, job_id, column_delta_mode, _ctx,
+        )
+    except HTTPException:
+        # ★ HTTPException 이라고 다 기록된 건 아니다. blocked/infeasible 은 낙인 후
+        #   던지지만, MID 하드 검증 실패 같은 다른 HTTPException 은 기록 없이 나간다
+        #   (실측: use_mid=False 인데 fixed_shift='MID' 인 간호사가 있으면 여기로 빠진다).
+        #   기록 여부를 _ctx 로 확인해, 안 남았으면 여기서 남긴다.
+        #   권한 오류처럼 latest_config 를 얻기 전에 나는 것은 _ctx["config"] 가 없어
+        #   자연히 걸러진다 — 그건 "이 설정으로 생성이 안 된다" 가 아니다.
+        if not _ctx.get("recorded"):
+            _record_unclassified_failure(db, req, job_id, _ctx)
+        raise
+    except Exception as _gen_exc:
+        print(f"[RosterGenerate] 미분류 실패 — {type(_gen_exc).__name__}: {_gen_exc}")
+        if not _ctx.get("recorded"):
+            _record_unclassified_failure(db, req, job_id, _ctx)
+        raise
+
+
+
+def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session, treatment_ids=None, config_override: dict | None = None, weekend_off_release=None, monthly_limit_release=None, banned_wanted_release=None, allowed_shift_add=None, job_id: str | None = None, column_delta_mode: str | None = None, _ctx: dict | None = None):
     """
     근무표 생성 서비스 함수 (cp_sat_basic 엔진만 사용)
     """
@@ -4663,6 +5010,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     if not wanted:
         raise Exception("해당 월의 wanted 작성을 먼저 요청해주세요.")
     schedule = request_schedule_service(req, current_user, db)
+    if _ctx is not None:
+        # 예외 경로에서 draft 를 정리하기 위해 넘긴다(blocked/infeasible 과 대칭).
+        _ctx["schedule"] = schedule
     (
         nurses_in_group,
         preferences,
@@ -5007,6 +5357,32 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
 
     nurses_for_engine = engine_nurses
     latest_config = _fetch_latest_config(db, req, current_user)
+    # ★ 래퍼가 미분류 실패를 기록할 수 있게 컨텍스트를 넘긴다(로컬 변수는 밖에서 못 본다).
+    #   schedule 도 담는다 — blocked/infeasible 은 각각 db.delete(schedule) 로 draft 를
+    #   지우는데 예외 경로에는 그게 없어, 실패할 때마다 병동 근무표 목록에 draft 가
+    #   쌓인다(실측: dev 에 고아 54건 · schedule_entries 6,750행).
+    #   ★★ 개입 판정을 **여기서 함께** 세운다. 아래 정식 계산부(_persistent_fix /
+    #     _base_intervened)는 700줄 넘게 뒤라, 그 사이에 예외가 나면 래퍼가
+    #     intervened=False 로 읽어 **개입 런을 프리셋에 낙인한다**(방침 4 위반).
+    #     apply-resolution 의 임시 컬럼 델타가 그 구간에서 터지면, 원복될 값이
+    #     "프리셋의 설정" 으로 스냅샷에 박제되기까지 한다.
+    #     여기 쓰는 값은 전부 함수 인자·req 라 이 시점에 이미 확정돼 있다.
+    if _ctx is not None:
+        _ctx["config"] = latest_config
+        _ctx["intervened"] = bool(
+            config_override or treatment_ids or column_delta_mode)
+        _ctx["persistent_fix"] = {
+            k: v for k, v in (
+                ("weekend_off_release",
+                 weekend_off_release or getattr(req, "weekend_off_release", None)),
+                ("monthly_limit_release",
+                 monthly_limit_release or getattr(req, "monthly_limit_release", None)),
+                ("banned_wanted_release",
+                 banned_wanted_release or getattr(req, "banned_wanted_release", None)),
+                ("allowed_shift_add",
+                 allowed_shift_add or getattr(req, "allowed_shift_add", None)),
+            ) if v
+        }
     shift_manage_data, daily_shift_requirements, daily_shift_requirements_by_day, daily_shift_requirements_max_by_day = _build_shift_manage_and_requirements(
         db, current_user, latest_config, req,
         # 엔진 대상이 없으면(전원 고정근무) 요구치 0 이 정상이므로 가드를 걸지 않는다.
@@ -5672,6 +6048,71 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     # ── Precheck: 솔버 호출 전 산술적 infeasibility 검사 ──
     precheck_result: dict | None = None
     presolve_diag: dict | None = None   # 솔버 전 부족 조기진단(advisory) — 응답에 부착
+    # ★ 실패 스냅샷용 — 아래 precheck 블록에서 채워진다. 여기서 미리 잡아두는 이유는
+    #   solver 실패(infeasible) 지점이 그 블록 밖이라 스코프를 못 타기 때문이다.
+    #   초기화가 없으면 infeasible 스냅샷이 DB 기본 조회로 떨어져 얇아진다
+    #   (실측: blocked 32KB vs infeasible 15KB — 정작 분석이 더 필요한 쪽이 부실했다).
+    _nurses_dict_for_precheck: list | None = None
+    precheck_config: dict | None = None
+    # ★ 개입에는 두 종류가 있고 **낙인 규칙이 반대**다.
+    #
+    #   일시적(transient) — 이번 런에만 적용되고 DB 는 그대로다.
+    #     config_override(해결책 카드의 config 델타) · treatment_ids(온톨로지 처방) ·
+    #     applied_relaxations(team_min hard→soft 자동 완화, solver 단계에서 정해져
+    #     각 낙인 지점에서 더한다).
+    #     → 다음 생성 때는 원래 설정으로 돌아가므로 이 성패는 프리셋 값의 성패가
+    #       아니다. **낙인하지 않는다.**
+    #
+    #   영구(persistent) — 간호사·원티드 데이터를 실제로 고치고 commit 한다.
+    #     weekend_off_release(NurseWeekendOffPeriod) · monthly_limit_release
+    #     (NurseMonthlyLimit) · banned_wanted_release(BannedWantedEntry.is_applied) ·
+    #     allowed_shift_add(NurseAllowedShiftPeriod).
+    #     → 조건 자체가 바뀌었고 그 상태가 유지된다. 그 뒤의 성패는 "고쳐진 조건에서
+    #       이 프리셋이 되는가" 라는 유효한 답이므로 **낙인한다.**
+    #       특히 성공했는데 낙인을 생략하면, 사용자가 화면에서 문제를 고쳐 생성에
+    #       성공했는데도 이전 실패 기록이 남아 프리셋이 계속 숨겨진다.
+    #   ★ 판정은 **적용부와 같은 소스**를 봐야 한다. 네 옵션 모두 위에서
+    #     `인자 or getattr(req, ..., None)` 으로 읽어 적용하므로, 여기서 명시 인자만
+    #     보면 호출자가 req 에만 실어 보낸 경우를 놓친다 — 데이터를 실제로 고쳤는데
+    #     스냅샷에는 persistent_fix=null 로 남아 "아무것도 안 고쳤다" 로 읽힌다
+    #     (worker 가 banned_wanted_release·allowed_shift_add 를 명시 전달하지 않아
+    #      비동기 경로에서 실제로 발생하던 문제).
+    _persistent_fix = {
+        k: v for k, v in (
+            ("weekend_off_release",
+             weekend_off_release or getattr(req, "weekend_off_release", None)),
+            ("monthly_limit_release",
+             monthly_limit_release or getattr(req, "monthly_limit_release", None)),
+            ("banned_wanted_release",
+             banned_wanted_release or getattr(req, "banned_wanted_release", None)),
+            ("allowed_shift_add",
+             allowed_shift_add or getattr(req, "allowed_shift_add", None)),
+        ) if v
+    }
+    #   ★ apply-resolution 의 컬럼 델타(column_delta_mode)는 **DB 컬럼을 임시로
+    #     commit 했다가 finally 에서 되돌린다**. config_override 로는 안 넘어오므로
+    #     따로 받아야 한다. 안 그러면 원복될 값의 성패가 프리셋에 찍혀,
+    #     · 임시 값으로 성공 → 검증 안 된 원본이 success 로 보호되고
+    #     · 임시 값으로 실패 → 멀쩡한 원본이 목록에서 사라진다.
+    #     'persist' 는 **성공 시에만** 값이 유지되므로(실패는 원복) 성공만 낙인한다.
+    _base_intervened = bool(config_override or treatment_ids or column_delta_mode)
+    # 성공 지점용 — persist 요청은 성공하면 값이 유지되니 그 성공은 프리셋의 진짜 결과다.
+    _success_intervened_base = bool(
+        config_override or treatment_ids or column_delta_mode == "temporary"
+    )
+    if _base_intervened:
+        print(f"[ConfigGenerateStatus] 일시적 개입 — override={bool(config_override)} "
+              f"treatment={bool(treatment_ids)} column_delta={column_delta_mode!r} "
+              f"→ 실패는 낙인 생략"
+              + ("" if column_delta_mode == "persist"
+                 else " · 성공도 낙인 생략"))
+    if _persistent_fix:
+        print(f"[ConfigGenerateStatus] 영구 수정 — {list(_persistent_fix)} "
+              f"→ 조건이 바뀌었으므로 기록은 유지(성공하면 프리셋 복귀)")
+    if _ctx is not None:
+        # 위(latest_config 자리)에서 선반영한 값을 정식 계산 결과로 확정한다.
+        _ctx["intervened"] = _base_intervened
+        _ctx["persistent_fix"] = _persistent_fix
     # ★ 엔진 대상이 0명이면 검사 자체가 성립하지 않는다.
     #   전원이 fixed_shift 인 병동(수술실 등)은 솔버를 우회해 평일=코드로 채워지므로
     #   `if nurses_for_engine:`(아래 솔버 호출부)이 이미 엔진을 건너뛴다. 그런데 precheck 는
@@ -5681,6 +6122,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     if not nurses_for_engine:
         print("[Precheck] 엔진 대상 0명(전원 고정근무) — 검사 건너뜀")
         precheck_result = None
+        # ★ 이 경로에서도 스냅샷 config 는 채운다. 안 채우면 `config` 가 통째로 {} 인
+        #   기록이 남아 "그때 설정이 뭐였나" 를 못 본다 — 정작 이런 특수 병동
+        #   (전원 고정근무)이 분석이 더 필요한 쪽이다. team_min 보강은 precheck
+        #   블록에서만 하므로 여기 값은 그만큼 얇지만, 비는 것보다 낫다.
+        precheck_config = dict(config_dict)
+        if _ctx is not None:
+            # ★ 이 분기에서도 채운다. 안 채우면 미분류 실패 시 스냅샷이 8필드짜리
+            #   DB 폴백으로 떨어지는데, 정작 이런 특수 병동이 분석이 더 필요하다.
+            _ctx["nurses"] = _nurses_dict_for_precheck
+            _ctx["config_dict"] = precheck_config
     else:
         try:
             from services.precheck import (
@@ -5726,6 +6177,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             # team_min_by_team은 _run_cp_sat_basic 내부에서 주입되므로 precheck 시점엔 누락된다.
             # precheck용으로 미리 한 번 더 로드해서 config_dict에 임시 주입한다.
             precheck_config = dict(config_dict)
+            if _ctx is not None:
+                _ctx["nurses"] = _nurses_dict_for_precheck
+                _ctx["config_dict"] = precheck_config
             if "team_min_by_team" not in precheck_config:
                 try:
                     _team_rows = (
@@ -5811,6 +6265,17 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
             except Exception:
                 pass
             if has_blocking_issues(precheck_result):
+                # 이 설정은 solver 에 넣기도 전에 막혔다 — 프리셋 목록에서 빼기 위해 기록.
+                #   스냅샷도 남긴다: 어떤 인원·요구·원티드에서 막혔는지 사후 분석용.
+                _mark_config_generate_status(
+                    db, latest_config, "blocked",
+                    _build_generate_snapshot(db, latest_config, "blocked",
+                                             req.year, req.month,
+                                             _nurses_dict_for_precheck, precheck_config,
+                                             job_id, _persistent_fix),
+                    req.year, req.month, job_id, _base_intervened)
+                if _ctx is not None:
+                    _ctx["recorded"] = True
                 payload = build_blocking_payload(precheck_result)
                 # [원인 브리지] precheck 가 solve 전에 막으면(솔버 호출 생략) post-solve cause 경로가
                 #   안 도므로, 여기서 explain_infeasibility_from_config 로 개인/주말 원인을 진단해 카드를
@@ -6045,8 +6510,16 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                 # 정책: AUTO-SOFT는 team_min만 풀고 grade는 끝까지 hard 유지 (2026-05-23).
                 # agent-qa-harness의 grade flip 패턴은 의도적으로 폐기됨.
                 applied_relaxations.append("team_min_hard_to_soft")
+                if _ctx is not None:
+                    # ★ 완화도 일시적 개입이다(방침 4). 성공 낙인 전에 예외가 나면
+                    #   래퍼가 이 사실을 몰라 개입 아닌 것으로 기록해 버린다.
+                    _ctx["relaxed"] = True
                 # Ontology treatment 어휘로도 노출 (agent-qa-harness의 dispatch 카탈로그 호환).
                 applied_relaxations.append("treatment:soft:team_min")
+                if _ctx is not None:
+                    # ★ 완화도 일시적 개입이다(방침 4). 성공 낙인 전에 예외가 나면
+                    #   래퍼가 이 사실을 몰라 개입 아닌 것으로 기록해 버린다.
+                    _ctx["relaxed"] = True
                 weekly_off_warnings.append(
                     {
                         "type": "team_min_hard_to_soft_applied",
@@ -6740,6 +7213,19 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
                     "설정 > 날짜별 필요 인원을 줄여 다시 시도해 주세요."
                 )
             inf = unrecoverable.get("infeasibility", {})
+            # solver 까지 갔으나 못 풀었다 — blocked 와 구분해 기록한다.
+            #   이쪽은 인원·요구가 늘거나 줄면 결과가 달라지므로 스냅샷이 특히 중요하다.
+            #   precheck 블록에서 만든 상세 입력을 그대로 넘긴다(없으면 헬퍼가 DB 로 폴백).
+            _mark_config_generate_status(
+                db, latest_config, "infeasible",
+                _build_generate_snapshot(db, latest_config, "infeasible",
+                                         req.year, req.month,
+                                         _nurses_dict_for_precheck, precheck_config,
+                                         job_id, _persistent_fix),
+                req.year, req.month, job_id,
+                _base_intervened or bool(applied_relaxations))
+            if _ctx is not None:
+                _ctx["recorded"] = True
             print(
                 f"[RosterGenerate][UNRECOVERABLE][response] HTTP 500, severity={inf.get('severity')}, "
                 f"message={inf.get('summary_message_ko')}"
@@ -6984,6 +7470,20 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     if _leave_summary and isinstance(roster_data, dict):
         roster_data["leave_summary"] = _leave_summary
 
+    # 여기까지 왔으면 이 설정으로 근무표가 만들어졌다 — 프리셋 목록에 남겨도 된다.
+    #   ★ 성공에도 스냅샷을 남긴다. 실패 스냅샷만 있으면 **비교 대상이 없어** 분석이 안 된다.
+    #     "1월엔 됐는데 2월엔 왜 안 되지" 는 직전 성공 조건과 대조해야 답이 나온다
+    #     (명단이 줄었는지 · daily_shift 요구가 늘었는지 · 원티드가 몰렸는지).
+    #     attempt 에 한 행씩 누적되므로 성공/실패를 시간순으로 대조할 수 있다.
+    _mark_config_generate_status(
+        db, latest_config, "success",
+        _build_generate_snapshot(db, latest_config, "success", req.year, req.month,
+                                 _nurses_dict_for_precheck, precheck_config, job_id,
+                                 _persistent_fix),
+        req.year, req.month, job_id,
+        _success_intervened_base or bool(applied_relaxations))
+    if _ctx is not None:
+        _ctx["recorded"] = True
     return roster_data
 
 

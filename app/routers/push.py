@@ -1,3 +1,6 @@
+import base64 as _b64
+import logging
+import os
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -21,6 +24,14 @@ router = APIRouter(
     prefix="/push",
     tags=["push"]
 )
+
+logger = logging.getLogger(__name__)
+
+# `/push/inbox` 조회 상한(초). 이 경로만 건다 — 그룹웨어(bizwiz20db)를 보는데
+# 그쪽은 21개 DB 가 한 인스턴스에 얹힌 공용 서버라 남의 락 경합에 물릴 수 있다.
+# 모바일이 폴링하는 화면이라 물리면 워커가 차례로 잡힌다.
+# ★ 전역이 아니라 여기만인 이유는 `MsDbManager.get_connection` 도크스트링 참조.
+_INBOX_QUERY_TIMEOUT = int(os.getenv("PUSH_INBOX_QUERY_TIMEOUT", "20"))
 
 @router.get("/listcnt", summary="총 게시물수")
 def message_view(current_user: UserSchema = Depends(require_current_user)):
@@ -56,7 +67,7 @@ def message_view(
       - `linked`: **페이지 이동이 되는 알림만**. 원티드 요청·근무표 마감처럼 눌렀을 때
         갈 곳이 있는 것들이다. 프리셉티 종료·병동이동 배정 같은 통보성 알림은 빠진다.
 
-      ★ 판별자는 `linkUrl` 이 **아니다**. 실측(2026-09-07)상 그 컬럼은 전 행이 비어 있다.
+      ★ 판별자는 `linkUrl` 이 **아니다**. 실측상 그 컬럼은 전 행이 비어 있다.
         실제 기준은 `linkCode` — 서버가 `pushsubcode` 와 메시지에서 `ROSTER:YYYY:MM` ·
         `WANTED:YYYY:MM` 을 파생시키고, 파생하지 못한 행은 `Idx`(숫자)가 된다.
       ★ 필터는 `TOP` 앞에서 걸린다. 즉 `listsize` 는 '최근 N건 중 공지'가 아니라
@@ -113,6 +124,135 @@ def message_view(
         "linkUrl": row['LinkUrl'],
         "linkCode": row['LinkCode'],
     } for row in rows]
+
+
+def _inbox_cursor_encode(idx: int) -> str:
+    return _b64.urlsafe_b64encode(str(idx).encode("ascii")).decode("ascii")
+
+
+def _inbox_cursor_decode(cursor: str | None) -> int | None:
+    """커서 → Idx. 없거나 깨졌으면 None(= 처음부터).
+
+    ★ 깨진 커서를 400 으로 막지 않는다. 서버가 커서 형식을 바꾼 뒤 남아 있던 옛 커서
+      하나로 목록이 통째로 안 열리면 안 된다. 처음부터 주는 편이 안전하다.
+    """
+    if not cursor:
+        return None
+    try:
+        return int(_b64.urlsafe_b64decode(cursor.encode("ascii")).decode("ascii"))
+    except Exception:
+        return None
+
+
+@router.get("/inbox", summary="알림 목록 (커서 무한스크롤)")
+def push_inbox(
+    filter: Literal["all", "unread"] = "all",
+    limit: int = 20,
+    cursor: str | None = None,
+    scope: Literal["linked"] | None = None,
+    current_user: UserSchema = Depends(require_current_user),
+):
+    """알림을 최신순 커서로. PC·모바일 공용.
+
+    * 호출방식 : /push/inbox?filter=all&limit=20
+                 /push/inbox?filter=unread&limit=20&cursor=...
+                 /push/inbox?filter=all&scope=linked
+    * filter : `all` | `unread`. 서버가 **전체에서** 거른 뒤 페이지를 낸다 —
+      기존 `/list` 처럼 '최근 50개 안에서' 세지 않으므로 오래된 미확인도 잡힌다.
+    * scope=linked : 페이지 이동이 되는 알림만(`/push/list?scope=linked` 와 같은 기준).
+    * 리턴값 : `{"result": {items, nextCursor, total, unreadTotal}}`
+      - items[] 필드는 기존 `/push/list` 와 **동일**하다(pushcode·Message·ReadYN·fk_idx…).
+      - total : 현재 `scope` 의 전체 표시 항목 수. `filter=unread` 면 `unreadTotal` 과 같다.
+      - unreadTotal : filter 와 무관한, 현재 scope 안의 안 읽은 전체 수.
+        읽음 버튼 활성 여부를 이 값으로 판단하면 된다.
+      - 둘 다 페이지 길이가 아니다. 프론트가 페이지별로 더하면 안 된다.
+      - nextCursor 가 null 이면 끝이다.
+
+    ★ 기존 `/list`·`/listcnt` 는 그대로 둔다 — PC 가 쓰고 있어 지금 지우면 깨진다.
+    ★ 대표 알림·unread 판정 순서는 `Common._push_inbox_cte` 도크스트링이 정본이다.
+      목록·total·unreadTotal 이 같은 규칙을 써야 건수가 어긋나지 않는다.
+    """
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit 은 1~100 이어야 합니다.")
+
+    OfficeCode = current_user.office_id
+    EmpSeqNo = current_user.EmpSeqNo
+    linked = scope == "linked"
+    cursor_idx = _inbox_cursor_decode(cursor)
+
+    # 한 건 더 떠서 다음 페이지 유무를 판정한다(총건수와 비교하면 그 사이 추가·삭제에 어긋난다).
+    #
+    # ★ params 순서는 **SQL 텍스트에 `%s` 가 나오는 순서**다(pymssql 은 위치 기반).
+    #   `Top %s` 가 `Where ... Idx < %s` 보다 **앞**에 있으므로 limit 이 cursor 보다 먼저다.
+    #   뒤집으면 `Top <커서Idx>` · `Idx < 21` 이 되어 목록이 거의 비는데,
+    #   에러가 아니라 '결과가 적은' 형태라 조용히 잘못 나간다.
+    params = (OfficeCode, EmpSeqNo, limit + 1) + (
+        (cursor_idx,) if cursor_idx is not None else ()
+    )
+    try:
+        rows = msdb_manager.fetch_all(
+            Common.get_push_inbox(
+                linked_only=linked,
+                unread_only=(filter == "unread"),
+                use_cursor=cursor_idx is not None,
+            ),
+            params=params,
+            timeout=_INBOX_QUERY_TIMEOUT,
+        )
+        # 건수는 목록 행에 얹혀 온다(같은 무거운 스캔을 두 번 돌지 않으려고).
+        # 0행일 때만 따로 부른다 — 알림이 없거나 커서가 끝을 넘은 경우다.
+        # ★ 이 조회도 **반드시 같은 try 안에서 같은 상한**을 받아야 한다. 밖으로 빼면
+        #   알림이 없는 계정이 매번 타는 흔한 경로가 상한 없이 공용 DB 를 훑게 되어
+        #   위에 건 보호가 그대로 무력해진다.
+        if rows:
+            total_all = int(rows[0]['total_all'] or 0)
+            unread_total = int(rows[0]['unread_all'] or 0)
+        else:
+            cnt = msdb_manager.fetch_all(
+                Common.get_push_inbox_counts(linked_only=linked),
+                params=(OfficeCode, EmpSeqNo),
+                timeout=_INBOX_QUERY_TIMEOUT,
+            )
+            total_all = int((cnt[0]['total'] if cnt else 0) or 0)
+            unread_total = int((cnt[0]['unreadTotal'] if cnt else 0) or 0)
+    except Exception as exc:
+        # ★ 상한에 걸리면 **504** 로 끊는다. 여기서 무한정 기다리면 uvicorn 워커가
+        #   그 대기에 잡히고, 모바일이 폴링하는 경로라 워커가 차례로 물려 서버 전체가
+        #   느려진다. 조회 하나 실패는 화면 한 곳이 비는 일이지만, 워커가 물리면
+        #   로그인까지 멈춘다 — 후자가 훨씬 나쁘다.
+        logger.warning("[push/inbox] 조회 실패(또는 시간 초과): %s", exc)
+        raise HTTPException(
+            status_code=504,
+            detail="알림을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if rows is None:
+        raise HTTPException(status_code=500, detail="요청을 찾을 수 없습니다.")
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    return {
+        "result": {
+            "items": [{
+                "pushcode": row['pushcode'],
+                "pushsubcode": row['pushsubcode'],
+                "officecode": row['officecode'],
+                "senderEmpSeqNo": row['senderEmpSeqNo'],
+                "sendername": row['sendername'],
+                "senderduty": row['senderduty'],
+                "Message": row['Message'],
+                "regdate": row['regdate'],
+                "ReadYN": row['ReadYN'],
+                "fk_idx": row['Fk_Idx'],
+                "linkUrl": row['LinkUrl'],
+                "linkCode": row['LinkCode'],
+            } for row in rows],
+            "nextCursor": _inbox_cursor_encode(rows[-1]['Idx']) if (has_more and rows) else None,
+            # unread 필터일 때의 total 은 '표시 중인 집합의 전체'라 unreadTotal 과 같다.
+            "total": unread_total if filter == "unread" else total_all,
+            "unreadTotal": unread_total,
+        }
+    }
 
 
 @router.patch("/read", summary="알림 단건 읽음 처리 (웹 - pushcode 기준)")

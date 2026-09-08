@@ -420,9 +420,16 @@ async def apply_resolution_endpoint(
             for k, v in col_delta.items():
                 setattr(rc, k, v)
             db.commit()
-        # 비-컬럼 키는 DB 미변경 → config_override 로 이번 생성에만 주입
+        # 비-컬럼 키는 DB 미변경 → config_override 로 이번 생성에만 주입.
+        # ★ 컬럼 델타는 위에서 **임시 commit** 했고 실패하거나 persist 가 아니면
+        #   finally 에서 되돌린다. 그 사실을 생성 쪽에 알려야 원복될 값의 성패가
+        #   프리셋에 낙인되지 않는다(persist 는 성공 시 유지되므로 성공만 낙인).
+        _cd_mode = None
+        if col_delta:
+            _cd_mode = "persist" if bool(getattr(req, "persist", False)) else "temporary"
         result = generate_roster_service(
-            gen_req, current_user, db, config_override=(override_delta or None)
+            gen_req, current_user, db, config_override=(override_delta or None),
+            column_delta_mode=_cd_mode
         )
         if bool(getattr(req, "persist", False)):
             _keep = True  # 성공 후에만 도달 → 컬럼 변경 영구 유지

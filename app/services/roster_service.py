@@ -166,6 +166,7 @@ def _propagate_use_mid_all_configs(db, office_id, group_id, use_mid) -> None:
 
     use_mid 는 병동 단위 설정이므로 per-config 로 갈리면 안 된다. 어떤 config 를
     조회·포크·생성하더라도 동일 값이 되도록 그룹 전체를 한 번에 맞춘다.
+
     """
     db.query(RosterConfigModel).filter(
         RosterConfigModel.office_id == office_id,
@@ -366,6 +367,12 @@ def save_roster_config_service(
             ).first()
             if db_config is None:
                 raise Exception("수정할 설정(config_id)을 찾을 수 없습니다.")
+            # ★ 생성 결과 기록(last_generate_status)을 리셋하지 않는다 — 그게 방침이다.
+            #   한 번 실패로 기록된 설정은 **편집해 저장해도 되살리지 않는다** —
+            #   저장은 검증이 아니기 때문이다(재생성해서 성공하면 그때 복귀한다).
+            #   새로 쓰려면 config_id 없이 저장해 신규 행을 만든다
+            #   (신규 행은 NULL 에서 시작하므로 목록에 보인다).
+            #   ※ 여기에 db_config.last_generate_status = None 을 넣지 말 것.
             for _key, _val in config_dict.items():
                 # ★ 미전송(None) 시 기존 값 유지 — 이 필드를 모르는 기존 저장 화면이
                 #   저장할 때마다 설정을 꺼버리는 사고를 막는다(스키마 기본값도 None).
@@ -2032,16 +2039,26 @@ def _coworkers_of_day(
     day: int,
     my_code: str,
 ) -> list[dict]:
-    """같은 날 **같은 시간대**(`default_shift`)로 배정된 동료. 본인 제외.
+    """같은 날 **같은 상태**인 동료. 본인 제외.
 
-    ★ 정확일치가 아니라 시간대로 묶는다. 병동마다 `D`/`D1`/`반반` 같은 파생코드가
-      있어 코드로 묶으면 실제로 붙어 일하는 사람이 목록에서 빠진다.
-    ★ 본인이 OFF·휴가·미배정이면 빈 목록이다 — 같이 일하는 사람이 없다.
+    · 본인이 근무면 → 같은 시간대(`default_shift`) 근무자
+    · 본인이 비근무면 → 그 날 **근무하지 않는 사람 전부**(OFF·주휴·휴가·공가)
+
+    ★ 근무 쪽은 정확일치가 아니라 시간대로 묶는다. 병동마다 `D`/`D1`/`반반` 같은
+      파생코드가 있어 코드로 묶으면 실제로 붙어 일하는 사람이 목록에서 빠진다.
+    ★ 비근무 쪽은 코드를 나누지 않는다 — 화면 개념이 '오늘 나처럼 쉬는 사람'이다.
+      OFF 와 주휴를 가르고 싶으면 프론트가 각 항목의 `shift_code` 로 하면 된다.
+    ★★ 메타가 **비어 있으면 어느 쪽에도 넣지 않는다.** `is_work` 는 3상태라
+      (True/False/None) `None` 은 'OFF' 가 아니라 '그 코드의 정의를 모른다' 이다
+      (`_code_detail` 의 같은 주석 참조). 눕혀서 세면 정의 없는 코드가 전부
+      '쉬는 동료' 로 나간다. 본인 셀이 unknown(파견지 미발행 → 메타 없음)일 때도
+      같은 이유로 빈 목록이다 — 본인 근무를 모르는데 동료를 단정할 수 없다.
     """
     my_meta = meta.get(my_code) or {}
-    if not my_code or not my_meta.get("is_work"):
+    if not my_code or not my_meta:
         return []
-    my_slot = my_meta.get("default_shift") or my_code
+    my_is_work = bool(my_meta.get("is_work"))
+    my_slot = (my_meta.get("default_shift") or my_code) if my_is_work else None
 
     profiles = _nurse_profiles(db, snapshot)
     out: list[dict] = []
@@ -2052,9 +2069,15 @@ def _coworkers_of_day(
         cells = row.get("schedule") or []
         code = _raw_cell_code(cells[day - 1] if 0 < day <= len(cells) else None)
         cell_meta = meta.get(code) or {}
-        if not code or not cell_meta.get("is_work"):
+        if not code or not cell_meta:
             continue
-        if (cell_meta.get("default_shift") or code) != my_slot:
+        cw_is_work = bool(cell_meta.get("is_work"))
+        if my_is_work:
+            if not cw_is_work:
+                continue
+            if (cell_meta.get("default_shift") or code) != my_slot:
+                continue
+        elif cw_is_work:
             continue
         profile = profiles.get(nurse_id, {})
         out.append({
@@ -2130,7 +2153,10 @@ def get_my_today_service(
     include_coworkers: bool = True,
     include_next_off: bool = True,
 ) -> dict:
-    """오늘(또는 지정일) 본인 근무 + 같은 시간대 동료 + 다음 OFF 까지 남은 일수.
+    """오늘(또는 지정일) 본인 근무 + 같은 상태 동료 + 다음 OFF 까지 남은 일수.
+
+    `coworkers` 는 본인이 근무면 같은 시간대 근무자, 비근무면 그 날 쉬는 사람 전부다
+    (`_coworkers_of_day` 참조).
 
     ★ 그 날 소속 병동은 토큰이 아니라 **본인 근무표 셀의 `group_id`** 로 정한다.
       파견/병동이동 중이면 그 날은 다른 병동이고 동료도 그쪽에서 찾아야 한다.
